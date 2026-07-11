@@ -34,6 +34,11 @@ use super::*;
 const MAX_MERGED_SUGGESTIONS: usize = 100;
 const KEYUP_INTELLISENSE_DEBOUNCE_MS: u64 = 120;
 const COLUMN_LOAD_WORKER_COUNT: usize = 4;
+const COLUMN_LOAD_CONTEXT_RETRY_DELAYS: [Duration; 3] = [
+    Duration::from_millis(5),
+    Duration::from_millis(10),
+    Duration::from_millis(20),
+];
 const INTELLISENSE_PARSE_POLL_INTERVAL_SECONDS: f64 = 0.01;
 const INTELLISENSE_DEFERRED_HIDE_RETRIES: u8 = 3;
 const SIGNATURE_POPUP_DEFERRED_HIDE_RETRIES: u8 = 3;

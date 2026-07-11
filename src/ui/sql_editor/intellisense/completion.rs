@@ -2190,6 +2190,7 @@ impl SqlEditorWidget {
         let intellisense_data_for_thread = intellisense_data.clone();
         let column_sender_for_thread = column_sender.clone();
         let connection_for_thread = connection.clone();
+        let runtime_for_thread = runtime.clone();
         let routine_symbol_cache_for_thread = runtime.routine_symbol_cache_handle();
         let cancellation = runtime.cancellation_for(snapshot.request_generation);
         let submitted = runtime.submit_latest_parse_task(Box::new(move || {
@@ -2271,6 +2272,7 @@ impl SqlEditorWidget {
                     &intellisense_data_for_thread,
                     &column_sender_for_thread,
                     &connection_for_thread,
+                    runtime_for_thread.as_ref(),
                     snapshot_for_thread.as_ref(),
                     &analysis,
                     &completion_scan_text,
@@ -2519,6 +2521,7 @@ impl SqlEditorWidget {
         intellisense_data: &Arc<Mutex<IntellisenseData>>,
         column_sender: &mpsc::Sender<ColumnLoadUpdate>,
         connection: &SharedConnection,
+        runtime: &IntellisenseRuntimeState,
         snapshot: &IntellisenseTriggerSnapshot,
         analysis: &IntellisenseAnalysis,
         expanded_statement_text: &str,
@@ -3479,7 +3482,7 @@ impl SqlEditorWidget {
             source_policy.allowance(context, qualifier, effective_expr_keyword_ctx);
         let signature_argument_suggestions = early_signature_argument_suggestions;
         let session_bind_names = if source_allowance.session_bind_names {
-            Self::session_bind_names(connection)
+            Self::session_bind_names(runtime)
         } else {
             Vec::new()
         };
@@ -4048,13 +4051,14 @@ impl SqlEditorWidget {
         if include_columns {
             let mut virtual_table_columns: HashMap<String, Vec<String>> = HashMap::new();
             for cte in &deep_ctx.ctes {
-                let (columns, wildcard_tables) = Self::collect_cte_virtual_columns_for_completion(
+                let (columns, wildcard_tables) = Self::collect_cte_virtual_columns_for_completion_for_db(
                     deep_ctx,
                     cte,
                     &virtual_table_columns,
                     intellisense_data,
                     column_sender,
                     connection,
+                    Some(snapshot.preferred_db_type),
                 );
                 if !wildcard_tables.is_empty() {
                     virtual_wildcard_dependencies.insert(cte.name.to_uppercase(), wildcard_tables);
@@ -4087,13 +4091,14 @@ impl SqlEditorWidget {
                     intellisense_context::analyze_cursor_context(body_tokens, body_tokens.len());
                 let mut body_virtual_table_columns = virtual_table_columns.clone();
                 for cte in &body_ctx.ctes {
-                    let (nested_columns, _) = Self::collect_cte_virtual_columns_for_completion(
+                    let (nested_columns, _) = Self::collect_cte_virtual_columns_for_completion_for_db(
                         &body_ctx,
                         cte,
                         &body_virtual_table_columns,
                         intellisense_data,
                         column_sender,
                         connection,
+                        Some(snapshot.preferred_db_type),
                     );
                     if !nested_columns.is_empty() {
                         Self::insert_virtual_table_columns(
@@ -4106,7 +4111,7 @@ impl SqlEditorWidget {
                 let body_local_tables =
                     intellisense_context::collect_tables_in_statement(body_tokens);
                 let (columns, wildcard_tables) =
-                    Self::collect_virtual_relation_columns_for_completion(
+                    Self::collect_virtual_relation_columns_for_completion_for_db(
                         body_tokens,
                         &body_local_tables,
                         &deep_ctx.tables_in_scope,
@@ -4114,6 +4119,7 @@ impl SqlEditorWidget {
                         intellisense_data,
                         column_sender,
                         connection,
+                        Some(snapshot.preferred_db_type),
                     );
                 if !wildcard_tables.is_empty() {
                     virtual_wildcard_dependencies
@@ -4548,6 +4554,7 @@ impl SqlEditorWidget {
                             intellisense_data,
                             column_sender,
                             connection,
+                            Some(snapshot.preferred_db_type),
                         );
                     }
                     let data = intellisense_data
@@ -54018,13 +54025,14 @@ impl SqlEditorWidget {
         ))
     }
 
-    fn expand_virtual_table_wildcards(
+    fn expand_virtual_table_wildcards_for_db(
         body_tokens: &[SqlToken],
         body_tables_in_scope: &[intellisense_context::ScopedTableRef],
         virtual_table_columns: &HashMap<String, Vec<String>>,
         intellisense_data: &Arc<Mutex<IntellisenseData>>,
         column_sender: &mpsc::Sender<ColumnLoadUpdate>,
         connection: &SharedConnection,
+        db_type: Option<crate::db::DatabaseType>,
     ) -> (Vec<String>, Vec<String>) {
         let wildcard_tables = intellisense_context::extract_select_list_wildcard_scopes(
             body_tokens,
@@ -54042,7 +54050,13 @@ impl SqlEditorWidget {
         let mut wildcard_columns = Vec::new();
         for table in &wildcard_tables {
             if Self::virtual_table_columns_for_lookup(virtual_table_columns, table).is_none() {
-                Self::request_table_columns(table, intellisense_data, column_sender, connection);
+                Self::request_table_columns_for_db(
+                    table,
+                    intellisense_data,
+                    column_sender,
+                    connection,
+                    db_type,
+                );
             }
             let columns = Self::columns_for_virtual_or_cached_table(
                 table,
@@ -54053,6 +54067,26 @@ impl SqlEditorWidget {
         }
         Self::dedup_column_names_case_insensitive(&mut wildcard_columns);
         (wildcard_columns, wildcard_tables)
+    }
+
+    #[cfg(test)]
+    fn expand_virtual_table_wildcards(
+        body_tokens: &[SqlToken],
+        body_tables_in_scope: &[intellisense_context::ScopedTableRef],
+        virtual_table_columns: &HashMap<String, Vec<String>>,
+        intellisense_data: &Arc<Mutex<IntellisenseData>>,
+        column_sender: &mpsc::Sender<ColumnLoadUpdate>,
+        connection: &SharedConnection,
+    ) -> (Vec<String>, Vec<String>) {
+        Self::expand_virtual_table_wildcards_for_db(
+            body_tokens,
+            body_tables_in_scope,
+            virtual_table_columns,
+            intellisense_data,
+            column_sender,
+            connection,
+            None,
+        )
     }
 
     fn effective_wildcard_column_tables(
@@ -55314,7 +55348,7 @@ impl SqlEditorWidget {
         Self::merge_suggestions_with_context_aliases(base, aliases, prefer_aliases)
     }
 
-    fn infer_columns_from_partial_select_qualifiers(
+    fn infer_columns_from_partial_select_qualifiers_for_db(
         body_tokens: &[SqlToken],
         body_tables_in_scope: &[intellisense_context::ScopedTableRef],
         outer_tables_in_scope: &[intellisense_context::ScopedTableRef],
@@ -55322,6 +55356,7 @@ impl SqlEditorWidget {
         intellisense_data: &Arc<Mutex<IntellisenseData>>,
         column_sender: &mpsc::Sender<ColumnLoadUpdate>,
         connection: &SharedConnection,
+        db_type: Option<crate::db::DatabaseType>,
     ) -> Vec<String> {
         let qualifiers = intellisense_context::extract_select_list_leading_qualifiers(body_tokens);
         if qualifiers.is_empty() {
@@ -55354,11 +55389,12 @@ impl SqlEditorWidget {
                     data.get_columns_for_table(&table)
                 };
                 if table_columns.is_empty() {
-                    Self::request_table_columns(
+                    Self::request_table_columns_for_db(
                         &table,
                         intellisense_data,
                         column_sender,
                         connection,
+                        db_type,
                     );
                     table_columns = {
                         let data = intellisense_data
@@ -55375,12 +55411,35 @@ impl SqlEditorWidget {
         columns
     }
 
+    #[cfg(test)]
+    fn infer_columns_from_partial_select_qualifiers(
+        body_tokens: &[SqlToken],
+        body_tables_in_scope: &[intellisense_context::ScopedTableRef],
+        outer_tables_in_scope: &[intellisense_context::ScopedTableRef],
+        virtual_table_columns: &HashMap<String, Vec<String>>,
+        intellisense_data: &Arc<Mutex<IntellisenseData>>,
+        column_sender: &mpsc::Sender<ColumnLoadUpdate>,
+        connection: &SharedConnection,
+    ) -> Vec<String> {
+        Self::infer_columns_from_partial_select_qualifiers_for_db(
+            body_tokens,
+            body_tables_in_scope,
+            outer_tables_in_scope,
+            virtual_table_columns,
+            intellisense_data,
+            column_sender,
+            connection,
+            None,
+        )
+    }
+
     fn build_virtual_table_columns_for_query_body(
         body_tokens: &[SqlToken],
         seed_virtual_table_columns: &HashMap<String, Vec<String>>,
         intellisense_data: &Arc<Mutex<IntellisenseData>>,
         column_sender: &mpsc::Sender<ColumnLoadUpdate>,
         connection: &SharedConnection,
+        db_type: Option<crate::db::DatabaseType>,
     ) -> HashMap<String, Vec<String>> {
         let Some(_recursion_guard) = IntellisenseRecursionGuard::try_enter() else {
             return seed_virtual_table_columns.clone();
@@ -55389,13 +55448,14 @@ impl SqlEditorWidget {
         let mut virtual_table_columns = seed_virtual_table_columns.clone();
 
         for cte in &body_ctx.ctes {
-            let (columns, _) = Self::collect_cte_virtual_columns_for_completion(
+            let (columns, _) = Self::collect_cte_virtual_columns_for_completion_for_db(
                 &body_ctx,
                 cte,
                 &virtual_table_columns,
                 intellisense_data,
                 column_sender,
                 connection,
+                db_type,
             );
             if !columns.is_empty() {
                 Self::insert_virtual_table_columns(&mut virtual_table_columns, &cte.name, columns);
@@ -55422,13 +55482,14 @@ impl SqlEditorWidget {
             let mut relation_virtual_table_columns = virtual_table_columns.clone();
 
             for cte in &relation_ctx.ctes {
-                let (columns, _) = Self::collect_cte_virtual_columns_for_completion(
+                let (columns, _) = Self::collect_cte_virtual_columns_for_completion_for_db(
                     &relation_ctx,
                     cte,
                     &relation_virtual_table_columns,
                     intellisense_data,
                     column_sender,
                     connection,
+                    db_type,
                 );
                 if !columns.is_empty() {
                     Self::insert_virtual_table_columns(
@@ -55441,7 +55502,7 @@ impl SqlEditorWidget {
 
             let relation_local_tables =
                 intellisense_context::collect_tables_in_statement(relation_tokens);
-            let (columns, _) = Self::collect_virtual_relation_columns_for_completion(
+            let (columns, _) = Self::collect_virtual_relation_columns_for_completion_for_db(
                 relation_tokens,
                 &relation_local_tables,
                 &body_ctx.tables_in_scope,
@@ -55449,6 +55510,7 @@ impl SqlEditorWidget {
                 intellisense_data,
                 column_sender,
                 connection,
+                db_type,
             );
             if !columns.is_empty() {
                 Self::insert_virtual_table_columns(
@@ -55470,6 +55532,7 @@ impl SqlEditorWidget {
         intellisense_data: &Arc<Mutex<IntellisenseData>>,
         column_sender: &mpsc::Sender<ColumnLoadUpdate>,
         connection: &SharedConnection,
+        db_type: Option<crate::db::DatabaseType>,
     ) -> (Vec<String>, Vec<String>) {
         let available_virtual_table_columns = Self::build_virtual_table_columns_for_query_body(
             body_tokens,
@@ -55477,6 +55540,7 @@ impl SqlEditorWidget {
             intellisense_data,
             column_sender,
             connection,
+            db_type,
         );
         let pivot_unpivot_columns =
             intellisense_context::extract_oracle_pivot_unpivot_projection_columns(body_tokens);
@@ -55496,7 +55560,7 @@ impl SqlEditorWidget {
         if columns.is_empty() {
             columns = intellisense_context::extract_table_function_columns(body_tokens);
         }
-        columns.extend(Self::infer_columns_from_partial_select_qualifiers(
+        columns.extend(Self::infer_columns_from_partial_select_qualifiers_for_db(
             body_tokens,
             body_tables_in_scope,
             outer_tables_in_scope,
@@ -55504,15 +55568,17 @@ impl SqlEditorWidget {
             intellisense_data,
             column_sender,
             connection,
+            db_type,
         ));
 
-        let (wildcard_columns, wildcard_tables) = Self::expand_virtual_table_wildcards(
+        let (wildcard_columns, wildcard_tables) = Self::expand_virtual_table_wildcards_for_db(
             body_tokens,
             body_tables_in_scope,
             &available_virtual_table_columns,
             intellisense_data,
             column_sender,
             connection,
+            db_type,
         );
         columns.extend(wildcard_columns);
         if use_pivot_unpivot_projection {
@@ -55525,7 +55591,7 @@ impl SqlEditorWidget {
         (columns, wildcard_tables)
     }
 
-    fn collect_virtual_relation_columns_for_completion(
+    fn collect_virtual_relation_columns_for_completion_for_db(
         body_tokens: &[SqlToken],
         body_tables_in_scope: &[intellisense_context::ScopedTableRef],
         outer_tables_in_scope: &[intellisense_context::ScopedTableRef],
@@ -55533,6 +55599,7 @@ impl SqlEditorWidget {
         intellisense_data: &Arc<Mutex<IntellisenseData>>,
         column_sender: &mpsc::Sender<ColumnLoadUpdate>,
         connection: &SharedConnection,
+        db_type: Option<crate::db::DatabaseType>,
     ) -> (Vec<String>, Vec<String>) {
         Self::collect_virtual_query_projection_columns(
             body_tokens,
@@ -55542,6 +55609,29 @@ impl SqlEditorWidget {
             intellisense_data,
             column_sender,
             connection,
+            db_type,
+        )
+    }
+
+    #[cfg(test)]
+    fn collect_virtual_relation_columns_for_completion(
+        body_tokens: &[SqlToken],
+        body_tables_in_scope: &[intellisense_context::ScopedTableRef],
+        outer_tables_in_scope: &[intellisense_context::ScopedTableRef],
+        virtual_table_columns: &HashMap<String, Vec<String>>,
+        intellisense_data: &Arc<Mutex<IntellisenseData>>,
+        column_sender: &mpsc::Sender<ColumnLoadUpdate>,
+        connection: &SharedConnection,
+    ) -> (Vec<String>, Vec<String>) {
+        Self::collect_virtual_relation_columns_for_completion_for_db(
+            body_tokens,
+            body_tables_in_scope,
+            outer_tables_in_scope,
+            virtual_table_columns,
+            intellisense_data,
+            column_sender,
+            connection,
+            None,
         )
     }
 
@@ -57516,12 +57606,15 @@ impl SqlEditorWidget {
         intellisense_data: &Arc<Mutex<IntellisenseData>>,
         column_sender: &mpsc::Sender<ColumnLoadUpdate>,
         connection: &SharedConnection,
+        db_type: Option<crate::db::DatabaseType>,
     ) {
         let table_key = {
             let mut data = intellisense_data
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
-            let Some(selected) = Self::resolve_table_column_load_key(&data, table_name) else {
+            let Some(selected) =
+                Self::resolve_table_column_load_key_for_db(&data, table_name, db_type)
+            else {
                 return;
             };
             if !data.mark_foreign_keys_loading(&selected) {

@@ -219,6 +219,7 @@ pub(crate) struct IntellisenseRuntimeState {
     keyup_debounce_generation: Arc<Mutex<u64>>,
     keyup_debounce_handle: Arc<Mutex<Option<crate::ui::ui_timeout::TimeoutHandle>>>,
     cached_db_type: Arc<AtomicU8>,
+    session_state: Arc<Mutex<crate::db::SessionState>>,
     parse_worker: Arc<LatestTaskWorker>,
 }
 
@@ -242,6 +243,7 @@ impl IntellisenseRuntimeState {
             cached_db_type: Arc::new(AtomicU8::new(
                 crate::db::connection::DatabaseType::default().cache_key(),
             )),
+            session_state: Arc::new(Mutex::new(crate::db::SessionState::default())),
             parse_worker: Arc::new(LatestTaskWorker::new()),
         }
     }
@@ -250,6 +252,19 @@ impl IntellisenseRuntimeState {
         let state = Self::new();
         state.update_cached_db_type(db_type);
         state
+    }
+
+    pub(crate) fn new_for_connection(
+        db_type: crate::db::connection::DatabaseType,
+        session_state: Arc<Mutex<crate::db::SessionState>>,
+    ) -> Self {
+        let mut state = Self::new_for_db_type(db_type);
+        state.session_state = session_state;
+        state
+    }
+
+    pub(crate) fn session_state(&self) -> Arc<Mutex<crate::db::SessionState>> {
+        self.session_state.clone()
     }
 
     pub(crate) fn completion_range(&self) -> Option<IntellisenseCompletionRange> {

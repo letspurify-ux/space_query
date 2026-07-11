@@ -2409,12 +2409,17 @@ impl SqlEditorWidget {
             Arc::new(Mutex::new(None));
         let object_context_callback: ObjectContextCallback = Arc::new(Mutex::new(None));
         let context_action_callback: SqlEditorContextActionCallback = Arc::new(Mutex::new(None));
-        let initial_db_type = match connection.lock() {
-            Ok(conn_guard) => conn_guard.db_type(),
-            Err(poisoned) => poisoned.into_inner().db_type(),
+        let (initial_db_type, session_state) = match connection.lock() {
+            Ok(conn_guard) => (conn_guard.db_type(), conn_guard.session_state()),
+            Err(poisoned) => {
+                let conn_guard = poisoned.into_inner();
+                (conn_guard.db_type(), conn_guard.session_state())
+            }
         };
-        let intellisense_runtime =
-            Arc::new(IntellisenseRuntimeState::new_for_db_type(initial_db_type));
+        let intellisense_runtime = Arc::new(IntellisenseRuntimeState::new_for_connection(
+            initial_db_type,
+            session_state,
+        ));
         let history_cursor = Arc::new(Mutex::new(None::<usize>));
         let history_original = Arc::new(Mutex::new(None::<String>));
         let history_navigation_entries = Arc::new(Mutex::new(None::<Vec<QueryHistoryEntry>>));

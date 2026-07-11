@@ -613,26 +613,18 @@ impl SqlEditorWidget {
         }
     }
 
-    fn session_bind_names(connection: &SharedConnection) -> Vec<String> {
-        // Bind names are an optional enrichment. If the connection mutex is
-        // busy (schema refresh or an executing query), skip rather than
-        // blocking the UI thread; the next keystroke will retry.
-        let session = match connection.try_lock() {
-            Ok(guard) => guard.session_state(),
-            Err(std::sync::TryLockError::Poisoned(poisoned)) => {
-                poisoned.into_inner().session_state()
-            }
-            Err(std::sync::TryLockError::WouldBlock) => return Vec::new(),
-        };
-
-        let names = session
+    fn session_bind_names(runtime: &IntellisenseRuntimeState) -> Vec<String> {
+        // The session state has its own mutex and outlives connection activity.
+        // Reading it directly avoids silently dropping binds while a query or
+        // metadata worker owns the outer connection mutex.
+        runtime
+            .session_state()
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .binds
             .keys()
             .cloned()
-            .collect();
-        names
+            .collect()
     }
 
     #[allow(dead_code)]

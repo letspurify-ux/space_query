@@ -9720,6 +9720,38 @@ fn request_table_columns_releases_loading_when_connection_busy() {
 }
 
 #[test]
+fn mysql_virtual_wildcard_column_request_preserves_case_while_connection_busy() {
+    let data = Arc::new(Mutex::new(IntellisenseData::new()));
+    {
+        let mut guard = lock_or_recover(&data);
+        guard.tables = vec!["cfb_user".to_string()];
+        guard.rebuild_indices();
+    }
+    let sql = "SELECT u.* FROM cfb_user u";
+    let tokens = SqlEditorWidget::tokenize_sql(sql);
+    let context = intellisense_context::analyze_cursor_context(&tokens, tokens.len());
+    let (sender, receiver) = mpsc::channel::<ColumnLoadUpdate>();
+    let connection = create_shared_connection();
+    let _connection_guard = connection.lock().ok();
+
+    SqlEditorWidget::expand_virtual_table_wildcards_for_db(
+        &tokens,
+        &context.tables_in_scope,
+        &HashMap::new(),
+        &data,
+        &sender,
+        &connection,
+        Some(crate::db::DatabaseType::MySQL),
+    );
+
+    let update = receiver
+        .recv_timeout(Duration::from_secs(1))
+        .expect("busy MySQL wildcard load should complete without losing catalog case");
+    assert_eq!(update.table, "cfb_user");
+    assert!(!update.cache_columns);
+}
+
+#[test]
 fn request_table_columns_handles_quoted_schema_and_table_names() {
     let data = Arc::new(Mutex::new(IntellisenseData::new()));
     {
@@ -14795,6 +14827,37 @@ fn local_symbol_suggestions_merge_session_binds_without_duplicates() {
 
     assert_eq!(v_text_count, 1);
     assert_has_case_insensitive(&suggestions, "V_SESSION");
+}
+
+#[test]
+fn session_bind_names_do_not_depend_on_connection_lock() {
+    let connection = create_shared_connection();
+    let session = connection
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .session_state();
+    session
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .binds
+        .insert(
+            "V_SESSION".to_string(),
+            crate::db::BindVar {
+                data_type: crate::db::BindDataType::Number,
+                value: crate::db::BindValue::Scalar(Some("1".to_string())),
+            },
+        );
+    let runtime = IntellisenseRuntimeState::new_for_connection(
+        crate::db::DatabaseType::Oracle,
+        session,
+    );
+    let _connection_guard = connection
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+
+    let names = SqlEditorWidget::session_bind_names(&runtime);
+
+    assert_has_case_insensitive(&names, "V_SESSION");
 }
 
 fn print_command_bind_suggestions_for_test(
@@ -47455,6 +47518,7 @@ fn query_completion_suggestions_with_data(
     let shared_data = Arc::new(Mutex::new(std::mem::take(data)));
     let (sender, _receiver) = mpsc::channel::<ColumnLoadUpdate>();
     let connection = create_shared_connection();
+    let runtime = IntellisenseRuntimeState::new();
     // The production async-parse path hands `expanded_statement_text` (the
     // current statement window) to the shared computation; do the same here so
     // the sweep/regression harness follows the exact production flow.
@@ -47462,6 +47526,7 @@ fn query_completion_suggestions_with_data(
         &shared_data,
         &sender,
         &connection,
+        &runtime,
         &snapshot,
         &analysis,
         &expanded.text,

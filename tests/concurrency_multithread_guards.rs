@@ -2404,6 +2404,28 @@ fn connection_success_clears_schema_snapshot_before_set_db_type() {
 }
 
 #[test]
+fn schema_poll_preserves_dequeued_update_across_state_contention() {
+    let main_window = read_source("src/ui/main_window.rs");
+    let start = main_window
+        .find("fn schedule_poll(")
+        .expect("main-window channel poll should exist");
+    let end = main_window[start..]
+        .find("// Start polling")
+        .map(|offset| start + offset)
+        .expect("channel poll setup should follow the poll function");
+    let poll = &main_window[start..end];
+
+    assert!(
+        poll.contains("pending_schema_update: Option<SchemaUpdate>")
+            && poll.contains("pending_schema_update = Some(update);")
+            && poll.contains(
+                "idle_poll_cycles.clone(),\n                        pending_schema_update,"
+            ),
+        "a dequeued schema update must be carried into the next timer poll when AppState is busy"
+    );
+}
+
+#[test]
 fn schema_metadata_load_aborts_on_object_query_errors_instead_of_emptying() {
     // load_schema_update_from_pool_context used to fall back to
     // unwrap_or_default() when the table/view/column queries failed, which then

@@ -262,13 +262,14 @@ impl SqlEditorWidget {
             .is_some_and(|range| cursor_token_idx >= range.start && cursor_token_idx <= range.end)
     }
 
-    fn collect_cte_virtual_columns_for_completion(
+    fn collect_cte_virtual_columns_for_completion_for_db(
         deep_ctx: &intellisense_context::CursorContext,
         cte: &intellisense_context::CteDefinition,
         virtual_table_columns: &HashMap<String, Vec<String>>,
         intellisense_data: &Arc<Mutex<IntellisenseData>>,
         column_sender: &mpsc::Sender<ColumnLoadUpdate>,
         connection: &SharedConnection,
+        db_type: Option<crate::db::DatabaseType>,
     ) -> (Vec<String>, Vec<String>) {
         let body_tokens = intellisense_context::token_range_slice(
             deep_ctx.statement_tokens.as_ref(),
@@ -296,6 +297,7 @@ impl SqlEditorWidget {
                 intellisense_data,
                 column_sender,
                 connection,
+                db_type,
             );
             for column in Self::recursive_cte_anchor_columns_from_body_tokens(body_tokens) {
                 Self::push_unique_completion_name(&mut columns, &column);
@@ -313,6 +315,26 @@ impl SqlEditorWidget {
         }
 
         (recursive_generated_columns, Vec::new())
+    }
+
+    #[cfg(test)]
+    fn collect_cte_virtual_columns_for_completion(
+        deep_ctx: &intellisense_context::CursorContext,
+        cte: &intellisense_context::CteDefinition,
+        virtual_table_columns: &HashMap<String, Vec<String>>,
+        intellisense_data: &Arc<Mutex<IntellisenseData>>,
+        column_sender: &mpsc::Sender<ColumnLoadUpdate>,
+        connection: &SharedConnection,
+    ) -> (Vec<String>, Vec<String>) {
+        Self::collect_cte_virtual_columns_for_completion_for_db(
+            deep_ctx,
+            cte,
+            virtual_table_columns,
+            intellisense_data,
+            column_sender,
+            connection,
+            None,
+        )
     }
 
     fn classify_intellisense_context(
@@ -412,6 +434,30 @@ impl SqlEditorWidget {
         }
     }
 
+    fn pool_session_context_for_column_load(
+        connection: &SharedConnection,
+        activity: &str,
+    ) -> Result<crate::db::DbPoolSessionContext, String> {
+        let mut result = crate::db::pool_session_context_for_shared_connection(
+            connection,
+            Some(activity),
+        );
+        for delay in COLUMN_LOAD_CONTEXT_RETRY_DELAYS {
+            if result.is_ok() {
+                break;
+            }
+            // This is a dedicated metadata worker and owns no mutex here. A
+            // bounded sleep handles short connection hand-offs without UI
+            // blocking, recursive retries, or an unbounded retry loop.
+            thread::sleep(delay);
+            result = crate::db::pool_session_context_for_shared_connection(
+                connection,
+                Some(activity),
+            );
+        }
+        result
+    }
+
     fn process_column_load_task(task: ColumnLoadTask) {
         let ColumnLoadTask {
             table_key,
@@ -432,10 +478,7 @@ impl SqlEditorWidget {
             format!("Loading columns for {}", table_key)
         };
 
-        let context = match crate::db::pool_session_context_for_shared_connection(
-            &connection,
-            Some(&activity),
-        ) {
+        let context = match Self::pool_session_context_for_column_load(&connection, &activity) {
             Ok(context) => context,
             Err(_) => {
                 Self::send_empty_column_load_update(&sender, &table_key, foreign_keys);

@@ -8686,6 +8686,7 @@ impl MainWindow {
             schema_sender: std::sync::mpsc::Sender<SchemaUpdate>,
             file_sender: std::sync::mpsc::Sender<FileActionResult>,
             idle_poll_cycles: Arc<AtomicUsize>,
+            pending_schema_update: Option<SchemaUpdate>,
         ) {
             let Some(state) = state_weak.upgrade() else {
                 return;
@@ -8695,6 +8696,7 @@ impl MainWindow {
             let mut file_disconnected = false;
             let mut deferred_by_borrow_conflict = false;
             let mut processed_message = false;
+            let mut pending_schema_update = pending_schema_update;
 
             // Check for schema updates
             {
@@ -8725,7 +8727,15 @@ impl MainWindow {
                 };
 
                 if !deferred_by_borrow_conflict {
-                    let mut latest_update: Option<SchemaUpdate> = None;
+                    let mut latest_update = pending_schema_update.take().filter(|update| {
+                        update.connection_generation == current_generation
+                            && MainWindow::schema_update_scope_matches(
+                                update.db_type,
+                                update.selected_scope.as_deref(),
+                                current_scope.as_deref(),
+                                &update.data.users,
+                            )
+                    });
                     loop {
                         match r.try_recv() {
                             Ok(update) => {
@@ -8761,6 +8771,7 @@ impl MainWindow {
                                 );
                             }
                             Err(_) => {
+                                pending_schema_update = Some(update);
                                 deferred_by_borrow_conflict = true;
                             }
                         }
@@ -9022,6 +9033,7 @@ impl MainWindow {
                         schema_sender.clone(),
                         file_sender.clone(),
                         idle_poll_cycles.clone(),
+                        pending_schema_update,
                     );
                 });
                 return;
@@ -9056,6 +9068,7 @@ impl MainWindow {
                     schema_sender.clone(),
                     file_sender.clone(),
                     idle_poll_cycles.clone(),
+                    pending_schema_update,
                 );
             });
         }
@@ -9078,6 +9091,7 @@ impl MainWindow {
             schema_sender_for_poll,
             file_sender.clone(),
             idle_poll_cycles,
+            None,
         );
 
         let tab_ids_for_drop: Vec<QueryTabId> = state
