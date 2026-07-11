@@ -22437,6 +22437,37 @@ fn invoke_void_callback_keeps_replaced_callback_when_original_panics() {
 }
 
 #[test]
+fn invoke_context_action_callback_can_run_again_after_panic() {
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let calls_for_cb = calls.clone();
+    let callback_slot: SqlEditorContextActionCallback =
+        Arc::new(Mutex::new(Some(Box::new(move |action| {
+            let mut events = lock_or_recover(&calls_for_cb);
+            let should_panic = events.is_empty();
+            events.push(action);
+            if should_panic {
+                panic!("expected first callback panic");
+            }
+        }))));
+
+    SqlEditorWidget::invoke_context_action_callback(
+        &callback_slot,
+        SqlEditorContextAction::Close,
+    );
+    assert!(lock_or_recover(&callback_slot).is_some());
+
+    SqlEditorWidget::invoke_context_action_callback(
+        &callback_slot,
+        SqlEditorContextAction::CloseAll,
+    );
+    assert_eq!(
+        lock_or_recover(&calls).as_slice(),
+        &[SqlEditorContextAction::Close, SqlEditorContextAction::CloseAll]
+    );
+    assert!(lock_or_recover(&callback_slot).is_some());
+}
+
+#[test]
 fn invoke_file_drop_callback_restores_slot_even_when_callback_panics() {
     let calls = Arc::new(Mutex::new(Vec::<PathBuf>::new()));
     let calls_for_cb = calls.clone();

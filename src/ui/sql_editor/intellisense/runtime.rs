@@ -320,19 +320,9 @@ impl SqlEditorWidget {
         callback: &SqlEditorContextActionCallback,
         action: SqlEditorContextAction,
     ) {
-        let mut callback_fn = callback
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .take();
-        if let Some(callback_fn) = callback_fn.as_mut() {
-            callback_fn(action);
-        }
-        let mut callback_guard = callback
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if callback_guard.is_none() {
-            *callback_guard = callback_fn;
-        }
+        Self::invoke_callback(callback, "editor context action callback", move |callback_fn| {
+            callback_fn(action)
+        });
     }
 
     fn schedule_context_action_callback(
