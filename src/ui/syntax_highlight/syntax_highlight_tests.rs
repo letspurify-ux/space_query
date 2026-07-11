@@ -2253,6 +2253,25 @@ fn test_entry_state_in_q_quote_continues() {
 }
 
 #[test]
+fn test_zero_depth_q_quote_entry_state_closes_safely() {
+    let highlighter = SqlHighlighter::new();
+    let text = "still in q-string]' FROM dual";
+    let (styles, exit) = highlighter.generate_styles_with_state(
+        text,
+        LexerState::InQQuote {
+            closing: ']',
+            depth: 0,
+        },
+    );
+    assert_eq!(exit, LexerState::Normal);
+    let q_end = text.find("]'").unwrap() + 2;
+    assert!(
+        styles[..q_end].chars().all(|c| c == STYLE_Q_QUOTE_STRING),
+        "zero-depth Q-quote state should be treated as the outermost level"
+    );
+}
+
+#[test]
 fn test_entry_state_in_double_quote_continues() {
     let highlighter = SqlHighlighter::new();
     let text = r#"continued_ident" FROM dual"#;

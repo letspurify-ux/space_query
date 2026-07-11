@@ -1634,7 +1634,7 @@ fn scan_until_q_quote_end(
             && bytes.get(idx + closing_bytes.len()) == Some(&b'\'')
         {
             idx += closing_bytes.len() + 1;
-            if depth == 1 {
+            if depth <= 1 {
                 return ScanResult::Closed { next_idx: idx };
             }
             depth -= 1;

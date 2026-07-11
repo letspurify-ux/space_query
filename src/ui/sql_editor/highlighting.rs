@@ -445,10 +445,6 @@ impl SqlEditorWidget {
         self.schedule_deferred_visible_semantic_rehighlight();
     }
 
-    pub fn get_highlighter(&self) -> Arc<Mutex<SqlHighlighter>> {
-        self.highlighter.clone()
-    }
-
     pub fn set_db_type(&self, db_type: crate::db::connection::DatabaseType) {
         self.intellisense_runtime.update_cached_db_type(db_type);
         match self.highlighter.lock() {

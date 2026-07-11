@@ -5553,11 +5553,7 @@ impl MainWindow {
         } else {
             editor.mark_display_metrics_pending();
         }
-        editor
-            .get_highlighter()
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .set_highlight_data(state.schema_highlight_data.clone());
+        editor.update_highlight_data(state.schema_highlight_data.clone());
         let buffer = editor.get_buffer();
         state.editor_tabs.push(QueryEditorTab {
             tab_id,
