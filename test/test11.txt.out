@@ -1020,7 +1020,7 @@ FROM qt_audit_log;
 -- source: test/test11.txt
 -- db: Oracle
 -- metadata: test Oracle inferred catalog (file-scoped overlay) + Oracle built-ins
--- checked: 1517
+-- checked: 1512
 -- missing: 0
 -- marker: [[word]] means not suggested for the tested prefix
 -- missing tokens: none

@@ -3937,6 +3937,18 @@ fn lateral_subquery_can_see_outer_table_scope() {
 }
 
 #[test]
+fn non_lateral_derived_table_does_not_inherit_outer_query_scope() {
+    let ctx = analyze(
+        "SELECT (SELECT * FROM (SELECT e.id FROM emp e WHERE e.dept_id = d.d|) x) FROM dept d",
+    );
+    assert!(
+        resolve_qualifier_tables("d", &ctx.tables_in_scope).is_empty(),
+        "a non-LATERAL derived table must not inherit an outer query alias: {:?}",
+        ctx.tables_in_scope
+    );
+}
+
+#[test]
 fn lateral_subquery_with_comment_before_open_paren_keeps_outer_scope() {
     let ctx = analyze("SELECT * FROM t1 a, LATERAL /* keep */ (SELECT a.| FROM t2 b) l");
     let names = table_names(&ctx);
@@ -9714,10 +9726,13 @@ fn subquery_alias_with_expressions() {
 }
 
 #[test]
-fn malformed_subquery_parentheses_do_not_panic() {
+fn malformed_subquery_parentheses_do_not_promote_a_cross_scope_alias() {
     let ctx = analyze("SELECT * FROM (SELECT * FROM emp)) broken_alias |");
     let names = table_names(&ctx);
-    assert!(names.contains(&"BROKEN_ALIAS".to_string()));
+    assert!(
+        !names.contains(&"BROKEN_ALIAS".to_string()),
+        "a word after the parent scope closes must not become the inner derived-table alias: {names:?}"
+    );
 }
 
 // ─── EXTRACT / TRIM function-internal FROM ───────────────────────────────

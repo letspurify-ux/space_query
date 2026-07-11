@@ -1020,7 +1020,7 @@ SELECT
 -- source: test_mariadb/test7.txt
 -- db: MariaDB
 -- metadata: test_mariadb/test7.txt inferred catalog
--- checked: 1469
+-- checked: 1466
 -- missing: 0
 -- marker: [[word]] means not suggested for the tested prefix
 -- missing tokens: none

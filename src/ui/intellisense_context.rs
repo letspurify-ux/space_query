@@ -3050,8 +3050,11 @@ fn scan_cursor_context(tokens: &[SqlToken], cursor_token_len: usize) -> CursorSc
                     .get(depth)
                     .and_then(|frame| frame.paren_func.as_deref())
                     .is_some_and(is_implicitly_lateral_table_function);
+                let entering_relation_subquery = matches!(parent_phase, SqlPhase::FromClause)
+                    && relation_state.is_expect_table()
+                    && is_query_expression_start(tokens, idx + 1);
                 let inherited_visible_parent = if entering_cte_body
-                    || (matches!(parent_phase, SqlPhase::FromClause)
+                    || (entering_relation_subquery
                         && !relation_modifier_state.blocks_outer_scope_cutoff()
                         && !is_from_lateral_function)
                 {
@@ -3066,9 +3069,7 @@ fn scan_cursor_context(tokens: &[SqlToken], cursor_token_len: usize) -> CursorSc
                 relation_modifier_state.clear();
                 relation_state.clear();
 
-                if matches!(parent_phase, SqlPhase::FromClause)
-                    && is_query_expression_start(tokens, idx + 1)
-                {
+                if entering_relation_subquery {
                     subquery_tracks.push((depth, idx + 1));
                 }
 
@@ -3532,6 +3533,7 @@ fn scan_cursor_context(tokens: &[SqlToken], cursor_token_len: usize) -> CursorSc
 
                 if upper == "LATERAL" && matches!(current_phase, SqlPhase::FromClause) {
                     relation_modifier_state.mark_lateral_like();
+                    relation_state.expect_table();
                     idx += 1;
                     continue;
                 }
@@ -6970,19 +6972,14 @@ fn parse_subquery_alias(
     start: usize,
 ) -> Option<(String, usize, usize, Vec<String>, Option<TokenRange>)> {
     let mut idx = start;
-    // Skip comments and stray closing parens to recover from malformed SQL like:
-    // `FROM (SELECT ...) ) alias`
+    // An alias belongs to this derived relation only when it follows the closing
+    // parenthesis in the same scope. Never step across another `)`: that token
+    // closes a parent expression/query, and treating a later word as this alias
+    // corrupts both scope depth and outer-clause parsing.
     while idx < tokens.len() {
-        match &tokens[idx] {
-            SqlToken::Comment(_) => {
-                idx += 1;
-                continue;
-            }
-            SqlToken::Symbol(sym) if sym == ")" => {
-                idx += 1;
-                continue;
-            }
-            _ => {}
+        if matches!(&tokens[idx], SqlToken::Comment(_)) {
+            idx += 1;
+            continue;
         }
         break;
     }

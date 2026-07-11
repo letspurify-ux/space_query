@@ -3588,6 +3588,16 @@ fn production_sources_have_no_contextless_catalog_widening_hooks() {
         "expected_object_kind_allows_unknown_member_fallback",
         "suggestion_matches_expected_object_kind_for_db",
         "oracle_bounded_text_structural_keyword_prefix_fallback",
+        "oracle_forward_visible_relation_tables_for_qualifier",
+        "oracle_visible_relation_tables_from_statement_text",
+        "oracle_visible_relation_tables_from_bounded_text",
+        "oracle_statement_relation_alias_suggestions",
+        "exact_catalog_keyword_for_prefix",
+        "should_append_expected_catalog_keyword_after_context_filters",
+        "append_catalog_keyword_suggestion",
+        "should_append_exact_catalog_keyword_in_base_context",
+        "append_exact_catalog_keyword_suggestion",
+        "has_early_oracle_builtin_package_members",
     ] {
         assert!(
             !completion.contains(removed),
@@ -4105,6 +4115,19 @@ fn audit_final_suggestions_impl(
         trigger_has_identifier,
         Some(db),
     );
+    let early_oracle_language_member_suggestions = qualifier.as_deref().and_then(|qualifier| {
+        (!crate::sql_text::mysql_compatibility_for_sql("", Some(db)))
+            .then(|| {
+                SqlEditorWidget::oracle_plsql_bulk_exceptions_member_suggestions(
+                    qualifier,
+                    &prefix,
+                )
+                .or_else(|| {
+                    SqlEditorWidget::oracle_builtin_package_member_suggestions(qualifier, &prefix)
+                })
+            })
+            .flatten()
+    });
     let suppresses_existing_identifier_completion = SqlEditorWidget::context_suppresses_completion(context)
         || (ctx.ddl_new_name_position
             && !in_plsql_executable_block
@@ -4173,6 +4196,9 @@ fn audit_final_suggestions_impl(
         );
     if suppresses_existing_identifier_completion
         && early_signature_argument_suggestions.is_empty()
+        && early_oracle_language_member_suggestions
+            .as_ref()
+            .is_none_or(Vec::is_empty)
         && mysql_named_value_suggestions.is_empty()
     {
         return (None, Vec::new(), Vec::new());
@@ -4298,7 +4324,12 @@ fn audit_final_suggestions_impl(
             has,
             Some(db),
         );
-    let qualified_member_suggestions = match (qualifier.as_deref(), qualified_completion_mode) {
+    let qualified_member_suggestions = if let Some(suggestions) =
+        early_oracle_language_member_suggestions
+    {
+        suggestions
+    } else {
+        match (qualifier.as_deref(), qualified_completion_mode) {
         (Some(_), Some(QualifiedCompletionMode::SequencePseudocolumns)) => ["NEXTVAL", "CURRVAL"]
             .into_iter()
             .filter(|pseudo| {
@@ -4324,15 +4355,8 @@ fn audit_final_suggestions_impl(
                 Some(db),
             )
         }
-        (Some(qualifier), _) if !crate::sql_text::mysql_compatibility_for_sql("", Some(db)) => {
-            // Mirrors the production builtin-package member branch; the
-            // own-package (same-buffer) member source needs the analysis
-            // pipeline this harness does not build, so it is covered by its
-            // own helper-level tests instead.
-            SqlEditorWidget::oracle_builtin_package_member_suggestions(qualifier, &prefix)
-                .unwrap_or_default()
+            _ => Vec::new(),
         }
-        _ => Vec::new(),
     };
     let replace_table_context_with_expected_objects =
         qualifier.is_none() && expected_object_kind.is_some();
@@ -4660,7 +4684,6 @@ fn audit_final_suggestions_impl(
             suppress_select_modifier_keywords:
                 suppress_select_modifier_keywords_in_prefixed_projection,
             at_data_type_position: at_data_type,
-            at_tool_no_sql_argument_slot: false,
             force_prepend_local_symbol_suggestions: false,
             prefix_is_followed_by_call_paren:
                 SqlEditorWidget::cursor_prefix_is_followed_by_call_paren_for_context(
@@ -7979,6 +8002,43 @@ fn qualifier_before_word_supports_multi_part_qualifier_chain() {
     let sql = sql_with_cursor.replace('|', "");
     let qualifier = SqlEditorWidget::qualifier_before_word_in_text(&sql, cursor);
     assert_eq!(qualifier.as_deref(), Some("schema_a.emp"));
+}
+
+#[test]
+fn qualifier_before_word_limits_sql_bulk_exceptions_to_the_member_owner() {
+    let sql = "BEGIN n := SQL%BULK_EXCEPTIONS.COUNT; END;";
+    let word_start = sql.find("COUNT").expect("COUNT");
+    assert_eq!(
+        SqlEditorWidget::qualifier_before_word_in_text(sql, word_start).as_deref(),
+        Some("BULK_EXCEPTIONS")
+    );
+}
+
+#[test]
+fn sql_bulk_exceptions_members_use_exact_language_source_in_production_and_audit() {
+    use crate::db::DatabaseType::Oracle;
+
+    let sql = "BEGIN n := SQL%BULK_EXCEPTIONS.COUN|; END;";
+    let plain = sql.replace('|', "");
+    let cursor = sql.find('|').expect("cursor");
+    let (_, word_start, _) = crate::ui::intellisense::get_word_at_cursor(&plain, cursor);
+    let qualifier = SqlEditorWidget::qualifier_before_word_in_text(&plain, word_start)
+        .expect("bulk exception qualifier");
+    assert_eq!(qualifier, "BULK_EXCEPTIONS");
+    assert_eq!(
+        SqlEditorWidget::oracle_plsql_bulk_exceptions_member_suggestions(&qualifier, "COUN"),
+        Some(vec!["COUNT".to_string()])
+    );
+    let production = query_completion_suggestions_with_locals(sql, Oracle);
+    let (_, _, audit) = audit_final_suggestions_for(sql, Oracle);
+    for (path, suggestions) in [("production", production), ("audit", audit)] {
+        assert!(
+            suggestions
+                .iter()
+                .any(|suggestion| suggestion.eq_ignore_ascii_case("COUNT")),
+            "{path} did not dispatch the exact PL/SQL language member source: {suggestions:?}"
+        );
+    }
 }
 
 #[test]
@@ -47338,11 +47398,11 @@ fn query_completion_suggestions_with_data(
     }
     let qualifier = SqlEditorWidget::qualifier_before_word_in_text(&sql, word_start);
     let raw_qualifier = SqlEditorWidget::raw_qualifier_before_word_in_text(&sql, word_start);
-    // Mirror production's bounded text_after_cursor window (4000 bytes, clamped
+    // Mirror production's bounded text_after_cursor window (128 bytes, clamped
     // to a char boundary) so suffix-sensitive gates behave identically.
     let text_after_cursor = {
         let tail = sql.get(cursor..).unwrap_or("");
-        let mut end = tail.len().min(4000);
+        let mut end = tail.len().min(128);
         while end < tail.len() && !tail.is_char_boundary(end) {
             end += 1;
         }
@@ -47809,6 +47869,13 @@ fn oracle_test6_to_test9_production_completion_covers_plsql_sweep_cases() {
             "LOOP",
             "LOO",
             "LOOP",
+        ),
+        (
+            "test9.txt",
+            "SQL%BULK_EXCEPTIONS.COUNT LOOP",
+            "COUNT",
+            "COUN",
+            "COUNT",
         ),
         (
             "test9.txt",
@@ -48474,6 +48541,13 @@ fn oracle_test11_sweep_report_advanced_query_regressions() {
             "score_fn",
             "scor",
             "score_fn",
+        ),
+        (
+            "test11.txt",
+            "CYCLE dept_id SET is_cycle",
+            "CYCLE",
+            "CYCL",
+            "CYCLE",
         ),
         (
             "test11.txt",
@@ -50311,6 +50385,47 @@ fn intellisense_sweep_is_definition_slot(
     intellisense_sweep_next_meaningful_word(sql, cursor).is_some()
 }
 
+fn intellisense_sweep_is_out_of_scope_relation_qualifier(
+    sql: &str,
+    cursor: usize,
+    word_start: usize,
+    original_word: &str,
+    deep_ctx: &intellisense_context::CursorContext,
+) -> bool {
+    let qualifier = if sql.get(cursor..).is_some_and(|tail| tail.starts_with('.')) {
+        original_word
+            .trim_matches(|ch| matches!(ch, '"' | '`' | '[' | ']'))
+            .to_string()
+    } else {
+        let Some(qualifier) =
+            SqlEditorWidget::qualifier_before_word_in_text(sql, word_start)
+        else {
+            return false;
+        };
+        qualifier
+    };
+    if !intellisense_context::resolve_qualifier_tables(
+        &qualifier,
+        &deep_ctx.tables_in_scope,
+    )
+    .is_empty()
+    {
+        return false;
+    }
+
+    intellisense_context::collect_tables_in_statement_declared_before_cursor(
+        deep_ctx.statement_tokens.as_ref(),
+        deep_ctx.statement_tokens.len(),
+    )
+    .iter()
+    .any(|table| {
+        table
+            .alias
+            .as_deref()
+            .is_some_and(|alias| alias.eq_ignore_ascii_case(&qualifier))
+    })
+}
+
 fn intellisense_sweep_word_skip_context(
     script_with_cursor: &str,
     db_type: crate::db::DatabaseType,
@@ -50336,6 +50451,13 @@ fn intellisense_sweep_word_skip_context(
 
     analysis.cursor_in_alias_declaration
         || deep_ctx.ddl_new_name_position
+        || intellisense_sweep_is_out_of_scope_relation_qualifier(
+            &sql,
+            cursor,
+            word_start,
+            original_word,
+            &deep_ctx,
+        )
         || SqlEditorWidget::cursor_is_at_create_object_new_name(
             &deep_ctx,
             true,
@@ -51560,13 +51682,39 @@ fn query_completion_suggestions_from_context_with_data(
         )
     };
 
-    let expected_keywords =
+    let mut expected_keywords =
         SqlEditorWidget::collect_expected_keyword_suggestions_with_expression_context(
             &prefix,
             deep_ctx,
             Some(db_type),
             Some(expr_kw),
         );
+    let expected_keyword_before_current_identifier =
+        SqlEditorWidget::expected_keyword_before_current_identifier(
+            &prefix,
+            deep_ctx,
+            Some(db_type),
+            expr_kw,
+        );
+    if SqlEditorWidget::context_allows_expected_keyword_before_current_identifier(
+        context,
+        qualifier.as_deref(),
+        expr_kw,
+        at_data_type_position,
+        false,
+        expected_object_kind.is_some(),
+        SqlEditorWidget::cursor_prefix_starts_relation_name_slot(deep_ctx),
+        expected_keyword_before_current_identifier.as_deref(),
+    ) {
+        if let Some(keyword) = expected_keyword_before_current_identifier {
+            if expected_keywords
+                .iter()
+                .all(|existing| !existing.eq_ignore_ascii_case(&keyword))
+            {
+                expected_keywords.insert(0, keyword);
+            }
+        }
+    }
     if !expected_keywords.is_empty() {
         suggestions = SqlEditorWidget::merge_suggestions_with_context_aliases(
             suggestions,
@@ -51643,33 +51791,11 @@ fn query_completion_suggestions_from_context_with_data(
             );
         }
     }
-    let expected_keyword_before_current_identifier =
-        SqlEditorWidget::expected_catalog_keyword_before_current_identifier(
-            &prefix,
-            deep_ctx,
-            Some(db_type),
-            expr_kw,
-        );
-    if SqlEditorWidget::should_append_expected_catalog_keyword_after_context_filters(
-        context,
-        None,
-        source_allowance,
-        expr_kw,
-        at_data_type_position,
-        false,
-        false,
-        SqlEditorWidget::cursor_prefix_starts_relation_name_slot(deep_ctx),
-        expected_keyword_before_current_identifier.as_deref(),
-    ) {
-        if let Some(keyword) = expected_keyword_before_current_identifier {
-            SqlEditorWidget::append_catalog_keyword_suggestion(&mut suggestions, &keyword);
-        }
-    }
     suggestions
 }
 
 #[test]
-fn exact_catalog_keyword_is_not_reintroduced_after_context_filters() {
+fn unrelated_keyword_is_not_reintroduced_after_context_filters() {
     use crate::db::DatabaseType::{MySQL, Oracle};
 
     for (sql, db_type) in [
@@ -85678,7 +85804,7 @@ fn mysql_family_fixture_completion_case_failures(
                     Some(db_type),
                     None,
                 );
-            let debug_before = SqlEditorWidget::expected_catalog_keyword_before_current_identifier(
+            let debug_before = SqlEditorWidget::expected_keyword_before_current_identifier(
                 &debug_prefix,
                 &deep_ctx,
                 Some(db_type),
@@ -85765,7 +85891,7 @@ fn oracle_fixture_completion_case_failures(
                     Some(crate::db::DatabaseType::Oracle),
                     None,
                 );
-            let debug_before = SqlEditorWidget::expected_catalog_keyword_before_current_identifier(
+            let debug_before = SqlEditorWidget::expected_keyword_before_current_identifier(
                 &debug_prefix,
                 &deep_ctx,
                 Some(crate::db::DatabaseType::Oracle),
@@ -88746,6 +88872,34 @@ fn sweep_report_skips_new_identifier_definition_slots_but_not_keywords() {
 }
 
 #[test]
+fn sweep_report_skips_only_scope_invalid_non_lateral_outer_references() {
+    use crate::db::DatabaseType::Oracle;
+
+    for (marked, word) in [
+        (
+            "SELECT (SELECT * FROM (SELECT e.id FROM emp e WHERE e.dept_id = d__CODEX_CURSOR__.dept_id) x) FROM dept d",
+            "d",
+        ),
+        (
+            "SELECT (SELECT * FROM (SELECT e.id FROM emp e WHERE e.dept_id = d.dept__CODEX_CURSOR__) x) FROM dept d",
+            "dept_id",
+        ),
+    ] {
+        assert!(
+            intellisense_sweep_word_skip_context(marked, Oracle, word),
+            "scope-invalid non-LATERAL reference `{word}` remained a sweep completion requirement"
+        );
+    }
+
+    let valid_correlated =
+        "SELECT (SELECT 1 FROM emp e WHERE e.dept_id = d.dept__CODEX_CURSOR__) FROM dept d";
+    assert!(
+        !intellisense_sweep_word_skip_context(valid_correlated, Oracle, "dept_id"),
+        "a valid scalar-subquery correlation was incorrectly skipped"
+    );
+}
+
+#[test]
 fn sweep_fixture_metadata_preserves_typed_members_and_result_columns() {
     let oracle = oracle_test_file_scoped_intellisense_data("test1.txt");
     assert_eq!(
@@ -88919,7 +89073,121 @@ fn sweep_remaining_fixture_misses_reproduce_at_the_exact_token() {
 }
 
 #[test]
-fn bounded_outer_qualifier_fallback_does_not_leak_a_sibling_subquery_alias() {
+fn cursor_context_resolves_forward_outer_alias_inside_correlated_subquery() {
+    for sql in [
+        "SELECT (SELECT 1 FROM child c WHERE c.parent_id = p.i|) FROM parent p",
+        "SELECT * FROM (SELECT CASE WHEN EXISTS (SELECT 1 FROM child c WHERE c.parent_id = p.i|) THEN 1 END FROM parent p) q",
+    ] {
+        let context = analyze_inline_cursor_sql(sql);
+        assert_eq!(
+            intellisense_context::resolve_qualifier_tables("p", &context.tables_in_scope),
+            vec!["parent".to_string()],
+            "the primary cursor context must carry the visible outer relation scope at `{sql}`; tables={:?}",
+            context.tables_in_scope,
+        );
+    }
+}
+
+#[test]
+fn production_analysis_carries_fixture_outer_alias_without_completion_reparse() {
+    let script = load_intellisense_test_file("test11.txt");
+    let marked = script.replacen(
+        "WHERE sx.emp_id = e.emp_id",
+        "WHERE sx.emp_id = e.emp___CODEX_CURSOR__",
+        1,
+    );
+    assert_ne!(marked, script, "fixture cursor setup failed");
+    let cursor = marked.find("__CODEX_CURSOR__").expect("fixture cursor");
+    let sql = marked.replacen("__CODEX_CURSOR__", "", 1);
+    let (routine_cache, expanded) =
+        SqlEditorWidget::build_routine_symbol_cache_bundle_for_test_for_db_type(
+            &sql,
+            cursor,
+            Some(crate::db::DatabaseType::Oracle),
+        );
+    let analysis = SqlEditorWidget::build_intellisense_analysis_from_routine_cache(
+        &routine_cache,
+        expanded.cursor_in_statement,
+    );
+    assert!(
+        expanded.text.contains("FROM qt_employees e"),
+        "expanded production statement omitted the outer row source: {}",
+        expanded.text
+    );
+    assert_eq!(
+        intellisense_context::resolve_qualifier_tables(
+            "e",
+            &analysis.context.tables_in_scope,
+        ),
+        vec!["qt_employees".to_string()],
+        "production analysis must resolve the outer alias before completion source merging"
+    );
+}
+
+#[test]
+fn production_analysis_carries_test11_derived_relation_scopes() {
+    let script = load_intellisense_test_file("test11.txt");
+    for (needle, marked, qualifier) in [
+        (
+            "            e.emp_id,\n            e.emp_name,\n            d.dept_name,\n            x.total_amount,",
+            "            e.emp___CODEX_CURSOR__,\n            e.emp_name,\n            d.dept_name,\n            x.total_amount,",
+            "e",
+        ),
+        (
+            "            x.total_amount,\n            x.avg_amount,",
+            "            x.total___CODEX_CURSOR__,\n            x.avg_amount,",
+            "x",
+        ),
+        (
+            "                WHEN x.sale_cnt = 0 THEN",
+            "                WHEN x.sale___CODEX_CURSOR__ = 0 THEN",
+            "x",
+        ),
+        (
+            "WHERE q.rn <= 3",
+            "WHERE q.r___CODEX_CURSOR__ <= 3",
+            "q",
+        ),
+    ] {
+        let with_cursor = script.replacen(needle, marked, 1);
+        assert_ne!(with_cursor, script, "fixture cursor setup failed for {needle}");
+        let cursor = with_cursor
+            .find("__CODEX_CURSOR__")
+            .expect("fixture cursor");
+        let sql = with_cursor.replacen("__CODEX_CURSOR__", "", 1);
+        let (routine_cache, expanded) =
+            SqlEditorWidget::build_routine_symbol_cache_bundle_for_test_for_db_type(
+                &sql,
+                cursor,
+                Some(crate::db::DatabaseType::Oracle),
+            );
+        let analysis = SqlEditorWidget::build_intellisense_analysis_from_routine_cache(
+            &routine_cache,
+            expanded.cursor_in_statement,
+        );
+        let has_relation = !intellisense_context::resolve_qualifier_tables(
+            qualifier,
+            &analysis.context.tables_in_scope,
+        )
+        .is_empty()
+            || analysis
+                .context
+                .subqueries
+                .iter()
+                .any(|subquery| subquery.alias.eq_ignore_ascii_case(qualifier));
+        assert!(
+            has_relation,
+            "production scope lost `{qualifier}` at `{needle}`; phase={:?}, tables={:?}, subqueries={:?}, expanded={}",
+            analysis.context.phase,
+            analysis.context.tables_in_scope,
+            analysis.context.subqueries,
+            expanded.text,
+        );
+    }
+}
+
+#[test]
+fn bounded_outer_qualifier_scope_does_not_leak_a_sibling_subquery_alias() {
     let mut data = IntellisenseData::new();
     data.tables = vec!["FIRST_T".to_string(), "SECOND_T".to_string()];
     data.set_columns_for_table("FIRST_T", vec!["ID".to_string()]);
