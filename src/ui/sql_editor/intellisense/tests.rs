@@ -49284,6 +49284,12 @@ fn oracle_test_file_scoped_intellisense_data(file_name: &str) -> IntellisenseDat
     for table in &own.tables {
         push_unique_case_insensitive(&mut data.tables, table);
     }
+    for view in &own.views {
+        push_unique_case_insensitive(&mut data.views, view);
+    }
+    for materialized_view in &own.materialized_views {
+        push_unique_case_insensitive(&mut data.materialized_views, materialized_view);
+    }
     for (table, columns) in &own.columns {
         if !columns.is_empty() {
             data.set_columns_for_table(table, columns.clone());
@@ -51410,6 +51416,18 @@ fn oracle_test10_words_generate_out_report() {
 #[ignore = "generates IntelliSense sweep .out report files; run explicitly when refreshing reports"]
 fn oracle_test11_words_generate_out_report() {
     oracle_test_words_generate_out_report("test11.txt", true);
+}
+
+#[test]
+#[ignore = "generates IntelliSense sweep .out report files; run explicitly when refreshing reports"]
+fn oracle_test12_words_generate_out_report() {
+    oracle_test_words_generate_out_report("test12.sql", true);
+}
+
+#[test]
+#[ignore = "generates IntelliSense sweep .out report files; run explicitly when refreshing reports"]
+fn oracle_test13_words_generate_out_report() {
+    oracle_test_words_generate_out_report("test13.sql", true);
 }
 
 #[test]
@@ -86373,6 +86391,87 @@ fn oracle_test1_to_test11_actual_completion_regressions() {
                 "BEGIN",
             ),
         ],
+    );
+}
+
+#[test]
+fn oracle_test12_and_test13_actual_completion_regressions() {
+    assert_oracle_fixture_completion_cases(
+        "test12.sql",
+        &[
+            (
+                "WHEN IF.flag = 'Y' THEN 'YES'\n        ELSE 'NO'",
+                "WHEN IF.flag = 'Y' THEN 'YES'\n        ELS| 'NO'",
+                "ELSE",
+            ),
+            (
+                "GROUP BY IF.grp\nHAVING SUM (IF.c) >= 30",
+                "GROUP BY IF.grp\nHAVI| SUM (IF.c) >= 30",
+                "HAVING",
+            ),
+            (
+                "WHEN IF.flag = 'Y' THEN (\n            SELECT MAX (ch.metric)",
+                "WHEN IF.flag = 'Y' THEN (\n            SELE| MAX (ch.metric)",
+                "SELECT",
+            ),
+            (
+                "WHERE ch.ref_a = IF.a\n        )\n        ELSE (\n            SELECT MIN",
+                "WHERE ch.ref_a = IF.a\n        )\n        ELS| (\n            SELECT MIN",
+                "ELSE",
+            ),
+            (
+                "ELSE (\n            SELECT MIN (ch.metric)",
+                "ELSE (\n            SELE| MIN (ch.metric)",
+                "SELECT",
+            ),
+            (
+                "WHERE ch.ref_a = IF.a\n        )\n    END AS metric_pick",
+                "WHERE ch.ref_a = IF.a\n        )\n    EN| AS metric_pick",
+                "END",
+            ),
+        ],
+    );
+    assert_oracle_fixture_completion_cases(
+        "test13.sql",
+        &[
+            (
+                ") THEN 'HAS_BIG'\n        ELSE 'SMALL_ONLY'",
+                ") THEN 'HAS_BIG'\n        ELS| 'SMALL_ONLY'",
+                "ELSE",
+            ),
+            (
+                "FROM qt_kw_mix_v trim\nORDER BY trim.a",
+                "FROM qt_k| trim\nORDER BY trim.a",
+                "qt_kw_mix_v",
+            ),
+            (
+                "WHEN IF.flag = 'Y' THEN 'G1Y'\n            ELSE 'G1N'",
+                "WHEN IF.flag = 'Y' THEN 'G1Y'\n            ELS| 'G1N'",
+                "ELSE",
+            ),
+            (
+                "WHEN IF.c >= 35 THEN 'G2BIG'\n            ELSE 'G2SMALL'",
+                "WHEN IF.c >= 35 THEN 'G2BIG'\n            ELS| 'G2SMALL'",
+                "ELSE",
+            ),
+            (
+                "        END\n        ELSE 'OTHER'\n    END AS complex_case_result",
+                "        END\n        ELS| 'OTHER'\n    END AS complex_case_result",
+                "ELSE",
+            ),
+        ],
+    );
+}
+
+#[test]
+fn oracle_file_scoped_sweep_catalog_includes_views_declared_by_the_file() {
+    let data = oracle_test_file_scoped_intellisense_data("test13.sql");
+
+    assert!(
+        data.views
+            .iter()
+            .any(|view| view.eq_ignore_ascii_case("qt_kw_mix_v")),
+        "test13.sql CREATE VIEW must be present in the file-scoped sweep catalog"
     );
 }
 

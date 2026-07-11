@@ -390,6 +390,18 @@ ORDER BY trim.a;";
 }
 
 #[test]
+fn test_oracle_lengthb_is_function_highlighted() {
+    let highlighter = SqlHighlighter::new();
+    let text = r#"SELECT
+    CAST (REPLACE (RPAD ('x', 1333, 'x'), 'x', UNISTR ('\D55C')) AS VARCHAR2 (4000)) AS payload_ko,
+    LENGTHB (CAST (REPLACE (RPAD ('x', 1333, 'x'), 'x', UNISTR ('\D55C')) AS VARCHAR2 (4000))) AS payload_bytes
+FROM dual;"#;
+    let styles = highlighter.generate_styles(text);
+
+    assert_token_has_style(text, &styles, "LENGTHB", STYLE_FUNCTION);
+}
+
+#[test]
 fn test_predefined_plsql_exceptions_are_highlighted() {
     let highlighter = SqlHighlighter::new();
     let text = "BEGIN\n\

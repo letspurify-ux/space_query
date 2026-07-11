@@ -8536,7 +8536,7 @@ impl SqlEditorWidget {
         let mut prev_is_stmt_boundary = true;
         let mut last_word_upper: Option<String> = None;
 
-        for token in toks {
+        for (idx, token) in toks.iter().enumerate() {
             let word = match token {
                 SqlToken::Word(word) => word,
                 SqlToken::Comment(_) => continue,
@@ -8559,6 +8559,12 @@ impl SqlEditorWidget {
                 continue;
             }
             let upper = word.to_ascii_uppercase();
+
+            if Self::token_word_is_part_of_qualified_identifier(toks, idx) {
+                prev_is_stmt_boundary = false;
+                last_word_upper = None;
+                continue;
+            }
 
             if skip_end_qualifier {
                 skip_end_qualifier = false;
@@ -14965,6 +14971,11 @@ impl SqlEditorWidget {
                 }
             };
 
+            if Self::token_word_is_part_of_qualified_identifier(toks, idx) {
+                prev_is_stmt_boundary = false;
+                continue;
+            }
+
             if skip_end_qualifier {
                 skip_end_qualifier = false;
                 if matches!(upper.as_str(), "IF" | "LOOP" | "CASE") {
@@ -15170,6 +15181,13 @@ impl SqlEditorWidget {
             Self::meaningful_tokens_before(tokens, end).last(),
             Some(SqlToken::Word(word)) if word.eq_ignore_ascii_case("CASE")
         );
+        let sql_value_statement = toks.iter().find_map(|token| match token {
+            SqlToken::Word(word) => Some(matches!(
+                word.to_ascii_uppercase().as_str(),
+                "SELECT" | "WITH" | "INSERT" | "UPDATE" | "DELETE" | "MERGE"
+            )),
+            _ => None,
+        }) == Some(true);
         let mut depth = 0i32;
         let mut stack: Vec<Frame> = Vec::new();
         let mut idx = 0;
@@ -15183,6 +15201,8 @@ impl SqlEditorWidget {
                         stack.pop();
                     }
                 }
+                SqlToken::Word(_)
+                    if Self::token_word_is_part_of_qualified_identifier(toks, idx) => {}
                 SqlToken::Word(word) => match word.to_ascii_uppercase().as_str() {
                     "BETWEEN" => stack.push(Frame::Between { depth }),
                     "AND" => {
@@ -15199,7 +15219,9 @@ impl SqlEditorWidget {
                     "WHEN" => set_innermost_case(&mut stack, CaseState::AwaitingThen),
                     "THEN" => set_innermost_case(&mut stack, CaseState::InArm),
                     "ELSE" => set_innermost_case(&mut stack, CaseState::InElse),
-                    "IF" | "LOOP" | "BEGIN" => stack.push(Frame::OtherBlock),
+                    "IF" | "LOOP" | "BEGIN" if !sql_value_statement => {
+                        stack.push(Frame::OtherBlock)
+                    }
                     "END" => {
                         // Drop markers up to and including the innermost block.
                         while let Some(frame) = stack.pop() {
@@ -21616,6 +21638,9 @@ impl SqlEditorWidget {
         }
 
         let upper = word.to_ascii_uppercase();
+        if matches!(upper.as_str(), "THEN" | "ELSE") {
+            return Some(SUBQUERY_START_KEYWORDS);
+        }
         let prev_before_introducer = open_pos
             .checked_sub(2)
             .and_then(|pos| meaningful.get(pos))
@@ -24305,7 +24330,8 @@ impl SqlEditorWidget {
     /// (`ASC`/`DESC`/`NULLS`/`FIRST`/`LAST`) are part of the item, not boundaries.
     fn cursor_is_in_order_by_item_list(tokens: &[SqlToken], end: usize) -> bool {
         let mut paren_depth: i32 = 0;
-        for token in tokens.get(..end).unwrap_or(tokens).iter().rev() {
+        let visible = tokens.get(..end).unwrap_or(tokens);
+        for (idx, token) in visible.iter().enumerate().rev() {
             match token {
                 SqlToken::Comment(_) => {}
                 SqlToken::Symbol(sym) if sym == ")" => paren_depth += 1,
@@ -24320,6 +24346,9 @@ impl SqlEditorWidget {
                 }
                 SqlToken::Symbol(sym) if sym == "," && paren_depth == 0 => return true,
                 SqlToken::Word(word) if paren_depth == 0 => {
+                    if Self::token_word_is_part_of_qualified_identifier(visible, idx) {
+                        continue;
+                    }
                     let upper = word.to_ascii_uppercase();
                     match upper.as_str() {
                         "BY" => return true,
@@ -47615,6 +47644,10 @@ impl SqlEditorWidget {
         let mut idx = 0;
         while idx < toks.len() {
             if let SqlToken::Word(word) = &toks[idx] {
+                if Self::token_word_is_part_of_qualified_identifier(toks, idx) {
+                    idx += 1;
+                    continue;
+                }
                 match word.to_ascii_uppercase().as_str() {
                     "CASE" => stack.push(Block::Case),
                     "IF" | "LOOP" | "BEGIN" => stack.push(Block::Other),
@@ -52868,6 +52901,19 @@ impl SqlEditorWidget {
             .rev()
             .find(|(_, token)| !matches!(token, SqlToken::Comment(_)))
             .map(|(idx, _)| idx)
+    }
+
+    fn token_word_is_part_of_qualified_identifier(tokens: &[SqlToken], idx: usize) -> bool {
+        matches!(tokens.get(idx), Some(SqlToken::Word(_)))
+            && (matches!(
+                Self::previous_non_comment_token_index(tokens, idx)
+                    .and_then(|prev_idx| tokens.get(prev_idx)),
+                Some(SqlToken::Symbol(sym)) if sym == "."
+            ) || matches!(
+                Self::next_non_comment_token_index(tokens, idx.saturating_add(1))
+                    .and_then(|next_idx| tokens.get(next_idx)),
+                Some(SqlToken::Symbol(sym)) if sym == "."
+            ))
     }
 
     fn next_non_comment_token_index(tokens: &[SqlToken], start: usize) -> Option<usize> {

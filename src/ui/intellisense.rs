@@ -103,6 +103,7 @@ pub const ORACLE_FUNCTIONS: &[&str] = &[
     "LEAD",
     "LEAST",
     "LENGTH",
+    "LENGTHB",
     "LISTAGG",
     "LN",
     "LNNVL",
@@ -4993,6 +4994,22 @@ mod intellisense_tests {
         assert!(
             !suggestions.iter().any(|s| s == "MAX()"),
             "MAX() must not appear when MAX is also a keyword in {suggestions:?}"
+        );
+    }
+
+    #[test]
+    fn oracle_lengthb_is_suggested_as_a_builtin_function() {
+        let suggestions = language_catalog_suggestions_for_db(
+            "lengthb",
+            true,
+            Some(crate::db::DatabaseType::Oracle),
+        );
+
+        assert!(
+            suggestions
+                .iter()
+                .any(|suggestion| suggestion == "LENGTHB()"),
+            "expected LENGTHB() in {suggestions:?}"
         );
     }
 
