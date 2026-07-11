@@ -43,7 +43,7 @@ jobs:
           licenses_dir="$package_dir/licenses"
           mkdir -p "$licenses_dir/tns-thin" "$licenses_dir/go-ora" "$licenses_dir/python-oracledb"
 
-          cp target/release/space_query "$package_dir/"
+          cp target/release/space_query DISCLAIMER.md "$package_dir/"
           cp LICENSE-MIT LICENSE-APACHE NOTICE THIRD_PARTY_NOTICES.md THIRD_PARTY_DEPENDENCIES.md "$licenses_dir/"
           cp crates/tns-thin/THIRD_PARTY_NOTICES.md "$licenses_dir/tns-thin/"
           cp vendor/go-ora/LICENSE "$licenses_dir/go-ora/"
@@ -69,7 +69,10 @@ jobs:
             "$licensesDir/python-oracledb"
           ) | Out-Null
 
-          Copy-Item target/release/space_query.exe -Destination $packageDir
+          Copy-Item -Path @(
+            "target/release/space_query.exe"
+            "DISCLAIMER.md"
+          ) -Destination $packageDir
           Copy-Item -Path @(
             "LICENSE-MIT"
             "LICENSE-APACHE"

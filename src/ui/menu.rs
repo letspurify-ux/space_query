@@ -108,6 +108,11 @@ Third-Party Software\n\
   See THIRD_PARTY_NOTICES.md.\n\
 - Rust dependency licenses: see THIRD_PARTY_DEPENDENCIES.md.\n\
 \n\
+Disclaimer\n\
+- SPACE Query is provided \"AS IS\", without warranties.\n\
+- Review SQL before execution, maintain backups, and use least-privilege accounts.\n\
+- See DISCLAIMER.md for the full terms.\n\
+\n\
 Runtime\n\
 - Build: {build_profile}\n\
 - Platform: {platform}"
@@ -597,7 +602,16 @@ impl MenuBarBuilder {
 
 #[cfg(test)]
 mod tests {
-    use super::MenuBarBuilder;
+    use super::{build_about_dialog_content, MenuBarBuilder};
+
+    #[test]
+    fn about_dialog_includes_disclaimer_summary() {
+        let content = build_about_dialog_content();
+
+        assert!(content.contains("SPACE Query is provided \"AS IS\", without warranties."));
+        assert!(content.contains("Review SQL before execution, maintain backups"));
+        assert!(content.contains("See DISCLAIMER.md for the full terms."));
+    }
 
     #[test]
     fn recent_sql_file_choice_index_reads_numbered_file_menu_items() {

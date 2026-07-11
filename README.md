@@ -184,10 +184,10 @@ cargo build --release --bin space_query
 
 The output is created at `target/release/space_query` (`space_query.exe` on Windows).
 
-GitHub Release archives contain the executable and a `licenses/` directory
-with the SPACE Query licenses, third-party notices and dependency license
-texts, referenced upstream notices, and the copyright information for the
-exact Rust toolchain used to build the executable.
+GitHub Release archives contain the executable, `DISCLAIMER.md`, and a
+`licenses/` directory with the SPACE Query licenses, third-party notices and
+dependency license texts, referenced upstream notices, and the copyright
+information for the exact Rust toolchain used to build the executable.
 
 ## Testing
 
@@ -257,6 +257,9 @@ Notes:
 ## License and Trademarks
 
 This project is distributed under `MIT OR Apache-2.0`. See `LICENSE-MIT` and `LICENSE-APACHE` for the full licenses.
+
+The software is provided without warranty and is subject to the limitations
+described in `DISCLAIMER.md`.
 
 The TNS thin implementation references the permissive-licensed implementations of `python-oracledb` and `go-ora`. The relevant notices are maintained in `THIRD_PARTY_NOTICES.md` and `crates/tns-thin/THIRD_PARTY_NOTICES.md`.
 
