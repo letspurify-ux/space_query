@@ -39,15 +39,59 @@ jobs:
         if: runner.os == 'macOS'
         shell: bash
         run: |
-          mkdir -p dist
-          zip -j "dist/${{ matrix.archive }}" target/release/space_query
+          package_dir="dist/package"
+          licenses_dir="$package_dir/licenses"
+          mkdir -p "$licenses_dir/tns-thin" "$licenses_dir/go-ora" "$licenses_dir/python-oracledb"
+
+          cp target/release/space_query "$package_dir/"
+          cp LICENSE-MIT LICENSE-APACHE NOTICE THIRD_PARTY_NOTICES.md THIRD_PARTY_DEPENDENCIES.md "$licenses_dir/"
+          cp crates/tns-thin/THIRD_PARTY_NOTICES.md "$licenses_dir/tns-thin/"
+          cp vendor/go-ora/LICENSE "$licenses_dir/go-ora/"
+          cp vendor/python-oracledb/LICENSE.txt vendor/python-oracledb/NOTICE.txt \
+            vendor/python-oracledb/THIRD_PARTY_LICENSES.txt "$licenses_dir/python-oracledb/"
+
+          rust_copyright="$(rustc --print sysroot)/share/doc/rust/COPYRIGHT.html"
+          test -f "$rust_copyright"
+          cp "$rust_copyright" "$licenses_dir/RUST_COPYRIGHT.html"
+
+          (cd "$package_dir" && zip -r "../${{ matrix.archive }}" space_query licenses)
 
       - name: Package Windows binary
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
-          New-Item -ItemType Directory -Force -Path dist
-          Compress-Archive -Path target/release/space_query.exe -DestinationPath "dist/${{ matrix.archive }}"
+          $packageDir = "dist/package"
+          $licensesDir = "$packageDir/licenses"
+          New-Item -ItemType Directory -Force -Path @(
+            $licensesDir
+            "$licensesDir/tns-thin"
+            "$licensesDir/go-ora"
+            "$licensesDir/python-oracledb"
+          ) | Out-Null
+
+          Copy-Item target/release/space_query.exe -Destination $packageDir
+          Copy-Item -Path @(
+            "LICENSE-MIT"
+            "LICENSE-APACHE"
+            "NOTICE"
+            "THIRD_PARTY_NOTICES.md"
+            "THIRD_PARTY_DEPENDENCIES.md"
+          ) -Destination $licensesDir
+          Copy-Item crates/tns-thin/THIRD_PARTY_NOTICES.md -Destination "$licensesDir/tns-thin/"
+          Copy-Item vendor/go-ora/LICENSE -Destination "$licensesDir/go-ora/"
+          Copy-Item -Path @(
+            "vendor/python-oracledb/LICENSE.txt"
+            "vendor/python-oracledb/NOTICE.txt"
+            "vendor/python-oracledb/THIRD_PARTY_LICENSES.txt"
+          ) -Destination "$licensesDir/python-oracledb/"
+
+          $rustCopyright = Join-Path (rustc --print sysroot) "share/doc/rust/COPYRIGHT.html"
+          if (-not (Test-Path $rustCopyright)) {
+            throw "Rust copyright file not found: $rustCopyright"
+          }
+          Copy-Item $rustCopyright -Destination "$licensesDir/RUST_COPYRIGHT.html"
+
+          Compress-Archive -Path "$packageDir/*" -DestinationPath "dist/${{ matrix.archive }}"
 
       - name: Upload build artifact
         uses: actions/upload-artifact@v4

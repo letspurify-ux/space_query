@@ -55,6 +55,40 @@ LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 
+## Native Libraries Bundled by FLTK
+
+The release binaries statically link native libraries built by `fltk-sys`.
+
+SPACE Query is based in part on the work of the FLTK project
+(https://www.fltk.org). FLTK is distributed under the GNU Library General
+Public License, Version 2, with the FLTK exceptions, including its static
+linking exception.
+
+The FLTK image libraries include code from the Independent JPEG Group. The
+following acknowledgment is required for executable distributions:
+
+> This software is based in part on the work of the Independent JPEG Group.
+
+FLTK also builds bundled libpng and zlib code. Their source licenses preserve
+the upstream copyright and license notices and are available with the exact
+`fltk-sys` source selected by `Cargo.lock`.
+
+## MPL Source Availability
+
+`option-ext` 0.2.0 is included under the Mozilla Public License, Version 2.0.
+Its corresponding source code is available at:
+
+https://crates.io/api/v1/crates/option-ext/0.2.0/download
+
+The complete MPL-2.0 text is included in `THIRD_PARTY_DEPENDENCIES.md`.
+
+## Rust Standard Library
+
+The binaries include portions of the Rust standard library, which is generally
+distributed under `MIT OR Apache-2.0` with additional third-party notices. Each
+release archive includes `RUST_COPYRIGHT.html` copied from the exact Rust
+toolchain used for that build.
+
 ## Rust Dependencies
 
 Rust dependency licenses are recorded in package metadata and locked in

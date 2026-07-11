@@ -184,6 +184,11 @@ cargo build --release --bin space_query
 
 The output is created at `target/release/space_query` (`space_query.exe` on Windows).
 
+GitHub Release archives contain the executable and a `licenses/` directory
+with the SPACE Query licenses, third-party notices and dependency license
+texts, referenced upstream notices, and the copyright information for the
+exact Rust toolchain used to build the executable.
+
 ## Testing
 
 Full test suite:
