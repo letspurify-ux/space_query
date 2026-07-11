@@ -1,3 +1,11 @@
+#![allow(
+    clippy::cargo,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::pedantic,
+    clippy::unwrap_used
+)]
+
 //! Guards the DB-backend dispatch convention: `DatabaseBackendKind` and
 //! `SqlDialect` decisions in non-test source must use exhaustive `match`
 //! expressions, never `==`/`!=` comparisons, `matches!`, `if let`, or wildcard

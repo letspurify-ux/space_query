@@ -115,6 +115,9 @@ fn start_platform_dnd() {
         fn fl_cocoa_screen_driver_dnd(driver: *mut c_void, use_selection: c_int) -> c_int;
     }
 
+    // SAFETY: Both symbols are provided by the linked FLTK Cocoa backend.
+    // `fl_screen_driver` returns either null or FLTK's live screen-driver
+    // singleton; the latter is the required receiver for its `dnd` method.
     unsafe {
         let driver = fl_screen_driver();
         if driver.is_null() {

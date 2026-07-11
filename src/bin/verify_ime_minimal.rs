@@ -1,3 +1,5 @@
+#![allow(clippy::cargo, clippy::pedantic)]
+
 // Minimal IME composition probe for the macOS first-syllable decomposition
 // issue: a bare FLTK `TextEditor` with no custom handlers, no intellisense,
 // no undo system and no syntax highlighting.
@@ -62,6 +64,8 @@ mod macos {
         let Ok(name) = std::ffi::CString::new(name) else {
             return std::ptr::null_mut();
         };
+        // SAFETY: The caller supplies a live Objective-C receiver and every
+        // selector passed to this zero-argument helper has that signature.
         unsafe { objc_msgSend(receiver, sel_registerName(name.as_ptr())) }
     }
 
@@ -69,10 +73,16 @@ mod macos {
         let Ok(name) = std::ffi::CString::new(name) else {
             return std::ptr::null_mut();
         };
+        // SAFETY: The caller supplies a live receiver and a valid object (or
+        // null) argument for selectors with exactly one object parameter.
         unsafe { objc_msgSend(receiver, sel_registerName(name.as_ptr()), arg) }
     }
 
     pub fn current_input_source_id() -> String {
+        // SAFETY: TIS returns a retained input-source object or null. The
+        // property is borrowed from that live source, the output buffer is
+        // writable for its declared length, and the retained source is
+        // released exactly once after the conversion attempt.
         unsafe {
             let source = TISCopyCurrentKeyboardInputSource();
             if source.is_null() {
@@ -99,6 +109,9 @@ mod macos {
 
     /// `deactivate` + `activate` on the content view's NSTextInputContext.
     pub fn cycle_input_context(ns_window: *mut c_void) {
+        // SAFETY: The caller obtains `ns_window` from FLTK on the macOS main
+        // thread. Null intermediate Objective-C objects are checked before use,
+        // and all messages match the helper signatures.
         unsafe {
             let view = msg0(ns_window, "contentView");
             if view.is_null() {
@@ -116,6 +129,9 @@ mod macos {
 
     /// Drop and re-establish first-responder status of the content view.
     pub fn refocus_first_responder(ns_window: *mut c_void) {
+        // SAFETY: The caller obtains `ns_window` from FLTK on the macOS main
+        // thread. `view` is checked for null, and `makeFirstResponder:` accepts
+        // either null or the live content-view object.
         unsafe {
             let view = msg0(ns_window, "contentView");
             if view.is_null() {

@@ -1,3 +1,5 @@
+#![allow(clippy::cargo, clippy::pedantic)]
+
 use chrono::NaiveDateTime;
 use fltk::{app, input::IntInput};
 use serde::{Deserialize, Serialize};

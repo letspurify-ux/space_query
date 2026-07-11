@@ -1,3 +1,5 @@
+#![allow(clippy::cargo, clippy::pedantic)]
+
 // UI-path verification for two result-grid fixes:
 //   (1) Ctrl+C / Ctrl+Shift+C copy escapes multiline / tab / quote cells so a
 //       spreadsheet (Excel) keeps each value in a single cell.

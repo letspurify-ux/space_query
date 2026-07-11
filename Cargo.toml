@@ -6,6 +6,8 @@ description = "SPACE Query: a Toad-like SQL Query Tool built with Rust and FLTK 
 authors = ["Developer"]
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/letspurify-ux/space_query"
+keywords = ["database", "sql", "oracle", "mysql", "gui"]
+categories = ["database", "gui"]
 build = "build.rs"
 
 [[bin]]

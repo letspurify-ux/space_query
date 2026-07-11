@@ -1,3 +1,5 @@
+#![allow(clippy::cargo, clippy::pedantic)]
+
 // Live verification for the result-grid "Save" UI execution path across all
 // supported databases (Oracle OCI/Thin, MySQL, MariaDB).
 //

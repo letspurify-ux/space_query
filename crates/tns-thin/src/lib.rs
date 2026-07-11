@@ -1,3 +1,5 @@
+#![allow(clippy::cargo, clippy::pedantic)]
+
 pub mod connect;
 pub mod exec;
 mod oracle_zones;

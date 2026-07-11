@@ -1,3 +1,5 @@
+#![allow(clippy::cargo, clippy::pedantic)]
+
 // UI-path verification for result-grid Ctrl/Cmd + Arrow selection handling.
 //
 // Drives the real `ResultTableWidget` in an FLTK window, clicks an actual cell
@@ -158,6 +160,9 @@ fn post_event(event: CGEventRef, target: PostTarget) -> Result<(), String> {
     if event.is_null() {
         return Err("CGEventCreate* returned null".into());
     }
+    // SAFETY: `event` was returned by a CoreGraphics create function and was
+    // checked for null. Posting borrows it, after which this function releases
+    // its single owned CoreFoundation reference exactly once.
     unsafe {
         match target {
             PostTarget::Pid => CGEventPostToPid(std::process::id() as c_int, event),
@@ -180,6 +185,8 @@ fn click_at(x: i32, y: i32, target: PostTarget) -> Result<(), String> {
         x: x as f64,
         y: y as f64,
     };
+    // SAFETY: CoreGraphics accepts a null event source to use the default
+    // source; the remaining enum values and point are initialized constants.
     let down = unsafe {
         CGEventCreateMouseEvent(
             std::ptr::null_mut(),
@@ -189,6 +196,8 @@ fn click_at(x: i32, y: i32, target: PostTarget) -> Result<(), String> {
         )
     };
     post_event(down, target)?;
+    // SAFETY: Same preconditions as the mouse-down event above, with the
+    // matching mouse-up event type.
     let up = unsafe {
         CGEventCreateMouseEvent(
             std::ptr::null_mut(),
@@ -203,18 +212,24 @@ fn click_at(x: i32, y: i32, target: PostTarget) -> Result<(), String> {
 
 #[cfg(target_os = "macos")]
 fn key_code(code: u16, flags: u64) -> Result<(), String> {
+    // SAFETY: A null source requests CoreGraphics' default event source, and
+    // `code` is passed through as the documented virtual-key field.
     let down = unsafe { CGEventCreateKeyboardEvent(std::ptr::null_mut(), code, KEY_DOWN) };
     if down.is_null() {
         return Err("CGEventCreateKeyboardEvent returned null for key down".into());
     }
+    // SAFETY: `down` was checked for null and remains owned until `post_event`.
     unsafe {
         CGEventSetFlags(down, flags);
     }
     post_event(down, PostTarget::Pid)?;
+    // SAFETY: Same preconditions as the key-down event above, with the
+    // matching key-up state.
     let up = unsafe { CGEventCreateKeyboardEvent(std::ptr::null_mut(), code, KEY_UP) };
     if up.is_null() {
         return Err("CGEventCreateKeyboardEvent returned null for key up".into());
     }
+    // SAFETY: `up` was checked for null and remains owned until `post_event`.
     unsafe {
         CGEventSetFlags(up, flags);
     }
@@ -395,6 +410,8 @@ fn run_mode_scenarios(mode: KeyMode, win: &Window, table: &mut fltk::table::Tabl
 #[cfg(target_os = "macos")]
 fn main() {
     let app = app::App::default();
+    // SAFETY: `AXIsProcessTrusted` takes no arguments, returns a plain boolean,
+    // and is provided by the linked ApplicationServices framework.
     println!("AXIsProcessTrusted = {}", unsafe { AXIsProcessTrusted() });
     let mut win = Window::new(240, 180, 720, 460, "verify_grid_keyboard_selection");
     let mut grid = ResultTableWidget::with_size(10, 10, 700, 440);

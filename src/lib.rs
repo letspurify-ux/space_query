@@ -1,5 +1,7 @@
 #![allow(
     clippy::arc_with_non_send_sync,
+    clippy::cargo,
+    clippy::pedantic,
     clippy::too_many_arguments,
     clippy::type_complexity
 )]

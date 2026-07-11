@@ -1,3 +1,5 @@
+#![allow(clippy::cargo, clippy::pedantic)]
+
 use std::env;
 use std::fs;
 use std::path::Path;
@@ -15,7 +17,7 @@ fn has_system_lib_via_pkg_config(name: &str) -> bool {
 }
 
 fn build_empty_stub(out_dir: &Path, lib_name: &str) -> std::io::Result<()> {
-    let src = out_dir.join(format!("{}_stub.c", lib_name));
+    let src = out_dir.join(format!("{lib_name}_stub.c"));
     std::fs::write(&src, "void space_query_x11_stub(void) {}\n")?;
 
     let mut build = cc::Build::new();
@@ -300,15 +302,31 @@ fn write_ico_file(path: &Path) -> std::io::Result<()> {
         .iter()
         .zip(SIZES.iter())
         .map(|(rgba, &sz)| encode_bmp_dib(rgba, sz))
-        .collect();
+        .collect::<std::io::Result<_>>()?;
 
     // Compute image offsets within the ICO file.
     let header_size = 6 + SIZES.len() * 16;
-    let mut offset = header_size as u32;
+    let mut offset = u32::try_from(header_size).map_err(|_| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "ICO header size exceeds u32",
+        )
+    })?;
     let mut offsets = Vec::with_capacity(SIZES.len());
     for dib in &dibs {
         offsets.push(offset);
-        offset += dib.len() as u32;
+        let dib_len = u32::try_from(dib.len()).map_err(|_| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "ICO image size exceeds u32",
+            )
+        })?;
+        offset = offset.checked_add(dib_len).ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "ICO file offset exceeds u32",
+            )
+        })?;
     }
 
     let mut f = std::fs::File::create(path)?;
@@ -316,16 +334,35 @@ fn write_ico_file(path: &Path) -> std::io::Result<()> {
     // ICO header: reserved=0, type=1 (icon), count=N
     f.write_all(&0u16.to_le_bytes())?;
     f.write_all(&1u16.to_le_bytes())?;
-    f.write_all(&(SIZES.len() as u16).to_le_bytes())?;
+    let image_count = u16::try_from(SIZES.len()).map_err(|_| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "ICO image count exceeds u16",
+        )
+    })?;
+    f.write_all(&image_count.to_le_bytes())?;
 
     // ICONDIRENTRY × N
     for (i, &sz) in SIZES.iter().enumerate() {
-        let w = if sz == 256 { 0u8 } else { sz as u8 };
-        let h = if sz == 256 { 0u8 } else { sz as u8 };
+        let dimension = if sz == 256 {
+            0
+        } else {
+            u8::try_from(sz).map_err(|_| {
+                std::io::Error::new(std::io::ErrorKind::InvalidInput, "ICO dimension exceeds u8")
+            })?
+        };
+        let w = dimension;
+        let h = dimension;
         f.write_all(&[w, h, 0u8, 0u8])?; // width, height, colorCount, reserved
         f.write_all(&1u16.to_le_bytes())?; // planes
         f.write_all(&32u16.to_le_bytes())?; // bitCount
-        f.write_all(&(dibs[i].len() as u32).to_le_bytes())?; // bytesInRes
+        let bytes_in_resource = u32::try_from(dibs[i].len()).map_err(|_| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "ICO image size exceeds u32",
+            )
+        })?;
+        f.write_all(&bytes_in_resource.to_le_bytes())?; // bytesInRes
         f.write_all(&offsets[i].to_le_bytes())?; // imageOffset
     }
 
@@ -339,18 +376,30 @@ fn write_ico_file(path: &Path) -> std::io::Result<()> {
 
 /// Encode RGBA pixel data as a 32-bit BMP DIB suitable for embedding in an ICO.
 /// Rows are written bottom-to-top (BMP convention) and channels are reordered to BGRA.
-fn encode_bmp_dib(rgba: &[u8], size: usize) -> Vec<u8> {
+fn encode_bmp_dib(rgba: &[u8], size: usize) -> std::io::Result<Vec<u8>> {
     // AND mask: 1-bit per pixel, padded to DWORD rows.  All zeros = fully opaque
     // at the legacy mask level; real transparency is carried by the alpha channel.
     let and_row_stride = size.div_ceil(32) * 4;
     let and_size = and_row_stride * size;
     let total = 40 + size * size * 4 + and_size;
     let mut out = Vec::with_capacity(total);
+    let width = i32::try_from(size).map_err(|_| {
+        std::io::Error::new(std::io::ErrorKind::InvalidInput, "BMP width exceeds i32")
+    })?;
+    let doubled_height = size.checked_mul(2).ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "BMP height multiplication overflow",
+        )
+    })?;
+    let height = i32::try_from(doubled_height).map_err(|_| {
+        std::io::Error::new(std::io::ErrorKind::InvalidInput, "BMP height exceeds i32")
+    })?;
 
     // BITMAPINFOHEADER (40 bytes)
     out.extend_from_slice(&40u32.to_le_bytes()); // biSize
-    out.extend_from_slice(&(size as i32).to_le_bytes()); // biWidth
-    out.extend_from_slice(&((size * 2) as i32).to_le_bytes()); // biHeight (*2 = BMP-in-ICO)
+    out.extend_from_slice(&width.to_le_bytes()); // biWidth
+    out.extend_from_slice(&height.to_le_bytes()); // biHeight (*2 = BMP-in-ICO)
     out.extend_from_slice(&1u16.to_le_bytes()); // biPlanes
     out.extend_from_slice(&32u16.to_le_bytes()); // biBitCount
     out.extend_from_slice(&0u32.to_le_bytes()); // biCompression (BI_RGB, BGRA in practice)
@@ -374,7 +423,7 @@ fn encode_bmp_dib(rgba: &[u8], size: usize) -> Vec<u8> {
     // AND mask (all zeros)
     out.extend(std::iter::repeat_n(0u8, and_size));
 
-    out
+    Ok(out)
 }
 
 // ── Icon pixel generation (shared with src/app_icon.rs via icon_fill.rs) ──

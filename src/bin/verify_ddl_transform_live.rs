@@ -1,3 +1,5 @@
+#![allow(clippy::cargo, clippy::pedantic)]
+
 // Live verification for the DBMS_METADATA session-transform fix.
 //
 // Generating CREATE DDL via `DBMS_METADATA.GET_DDL` used to emit physical

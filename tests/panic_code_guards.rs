@@ -1,3 +1,11 @@
+#![allow(
+    clippy::cargo,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::pedantic,
+    clippy::unwrap_used
+)]
+
 use std::ffi::OsStr;
 use std::fs;
 use std::path::{Path, PathBuf};

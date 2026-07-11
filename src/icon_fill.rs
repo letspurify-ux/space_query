@@ -24,6 +24,11 @@ const S_PATH: [(f32, f32); 16] = [
     (-0.28, 0.48),
 ];
 
+#[allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_precision_loss,
+    clippy::cast_sign_loss
+)]
 fn fill_icon(buffer: &mut [u8], size: usize) {
     let pixel_count = size.saturating_mul(size);
     if buffer.len() != pixel_count.saturating_mul(4) || size == 0 {

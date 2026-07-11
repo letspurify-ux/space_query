@@ -375,6 +375,9 @@ fn style_bytes_to_string(styles: Vec<u8>) -> String {
         styles.iter().all(|&byte| byte.is_ascii()),
         "logical style bytes must remain ASCII"
     );
+    // SAFETY: Every style byte is produced from the ASCII style constants;
+    // the assertion above verifies that invariant in debug builds. ASCII is
+    // valid UTF-8, so the vector satisfies `String`'s encoding requirement.
     unsafe { String::from_utf8_unchecked(styles) }
 }
 

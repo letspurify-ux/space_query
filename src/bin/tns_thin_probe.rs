@@ -1,3 +1,5 @@
+#![allow(clippy::cargo, clippy::pedantic)]
+
 use std::env;
 use std::fmt::Display;
 use std::str::FromStr;

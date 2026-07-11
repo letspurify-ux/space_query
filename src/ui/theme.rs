@@ -152,6 +152,9 @@ pub fn style_tree_scrollbars(tree: &mut Tree) {
             continue;
         };
         if tree.is_scrollbar(&child) {
+            // SAFETY: `child` is owned by the live FLTK group and
+            // `tree.is_scrollbar` verifies its runtime widget type before the
+            // pointer is wrapped as a `Scrollbar`.
             unsafe {
                 let mut scrollbar = Scrollbar::from_widget_ptr(child.as_widget_ptr());
                 style_scrollbar(&mut scrollbar);
@@ -169,6 +172,9 @@ fn style_group_children_as_scrollbars<W: WidgetExt>(widget: &W) {
         let Some(child) = group.child(idx) else {
             continue;
         };
+        // SAFETY: FLTK text display/editor groups contain scrollbar children;
+        // `child` is owned by the live group for the duration of this wrapper,
+        // and this helper is called only for those FLTK widget types.
         unsafe {
             let mut scrollbar = Scrollbar::from_widget_ptr(child.as_widget_ptr());
             style_scrollbar(&mut scrollbar);

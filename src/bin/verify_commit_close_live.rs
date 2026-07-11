@@ -1,3 +1,5 @@
+#![allow(clippy::cargo, clippy::pedantic)]
+
 // Live reproduction for: "after pressing the toolbar COMMIT/ROLLBACK button,
 // closing the query tab still pops the discard/commit/rollback prompt".
 //

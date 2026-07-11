@@ -898,7 +898,9 @@ impl ConnectionInfo {
         // Vec to release the underlying allocation that held the secret.
         let vec = unsafe { secret.as_mut_vec() };
         for b in vec.iter_mut() {
-            // write_volatile prevents the compiler from optimizing away the zeroing.
+            // SAFETY: `b` is a unique mutable reference to one initialized byte
+            // in `vec`; its derived pointer is valid and aligned for a `u8`
+            // volatile write for the duration of this iteration.
             unsafe { std::ptr::write_volatile(b as *mut u8, 0) };
         }
         vec.clear();

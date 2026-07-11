@@ -1,3 +1,5 @@
+#![allow(clippy::cargo, clippy::pedantic)]
+
 // Live reproduction for the "procedure/function leaves session in
 // decision-required / cancelled state" bug.
 //

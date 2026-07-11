@@ -318,6 +318,9 @@ impl<T: PoolableConnection> Drop for PooledThinConnection<T> {
             return;
         }
         self.returned = true;
+        // SAFETY: `returned` is set before extraction and prevents this path
+        // from taking `conn` more than once. The extracted value is then either
+        // returned to the pool or dropped exactly once.
         let mut conn = unsafe { ManuallyDrop::take(&mut self.conn) };
         let healthy = conn.is_healthy();
         if !self.discard_on_drop && healthy && conn.reset_before_reuse().is_ok() {

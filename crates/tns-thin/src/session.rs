@@ -3320,6 +3320,9 @@ impl Drop for OracleThinSession {
 #[cfg(unix)]
 fn stream_is_idle_and_alive(stream: &TcpStream) -> bool {
     let mut probe = [0u8; 1];
+    // SAFETY: The raw descriptor is borrowed from a live `TcpStream`, and
+    // `probe` is writable for the exact length passed to `recv`. `MSG_PEEK`
+    // leaves the socket data untouched and `MSG_DONTWAIT` prevents blocking.
     let received = unsafe {
         libc::recv(
             stream.as_raw_fd(),
@@ -3369,6 +3372,8 @@ fn normalize_cursor_ids(mut cursor_ids: Vec<u32>) -> Vec<u32> {
 #[cfg(unix)]
 fn send_oob_break(stream: &TcpStream) -> Result<bool, OracleThinError> {
     let value = b"!";
+    // SAFETY: The descriptor is borrowed from a live `TcpStream`; `value`
+    // points to one initialized byte and remains alive for the whole `send`.
     let written = unsafe {
         libc::send(
             stream.as_raw_fd(),
@@ -9772,6 +9777,8 @@ fn transcode_with_iconv(
         .map_err(|_| OracleThinError::new("iconv target encoding contains a NUL byte"))?;
     let from_encoding = CString::new(from_encoding)
         .map_err(|_| OracleThinError::new("iconv source encoding contains a NUL byte"))?;
+    // SAFETY: Both encoding names are live, NUL-terminated C strings for the
+    // duration of the call. The returned descriptor is checked before use.
     let cd = unsafe { libc::iconv_open(to_encoding.as_ptr(), from_encoding.as_ptr()) };
     if cd == (-1isize as libc::iconv_t) {
         return Err(OracleThinError::new(format!(
@@ -9787,8 +9794,15 @@ fn transcode_with_iconv(
     let mut output_len = 0usize;
 
     loop {
+        // SAFETY: `output_len` is derived from `output.len() - output_left` and
+        // is therefore at most `output.len()`. Adding it yields a pointer at or
+        // within the allocation, which iconv may write through only when the
+        // separately supplied `output_left` is nonzero.
         let mut output_ptr = unsafe { output.as_mut_ptr().add(output_len) as *mut libc::c_char };
         let mut output_left = (output.len() - output_len) as libc::size_t;
+        // SAFETY: `input_ptr` and `input_left` describe the unconsumed suffix
+        // of the live `input` allocation. `output_ptr` and `output_left`
+        // describe the writable suffix of `output`. `cd` was validated above.
         let result = unsafe {
             libc::iconv(
                 cd,
@@ -9800,6 +9814,8 @@ fn transcode_with_iconv(
         };
         output_len = output.len() - output_left as usize;
         if result != usize::MAX as libc::size_t {
+            // SAFETY: `cd` is a valid open descriptor and this success branch
+            // returns immediately, so it is closed exactly once.
             unsafe {
                 libc::iconv_close(cd);
             }
@@ -9813,6 +9829,8 @@ fn transcode_with_iconv(
             continue;
         }
 
+        // SAFETY: `cd` is still open and this terminal error branch returns
+        // immediately after closing it, preventing any subsequent reuse.
         unsafe {
             libc::iconv_close(cd);
         }

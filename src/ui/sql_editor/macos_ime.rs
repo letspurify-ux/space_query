@@ -22,6 +22,9 @@ unsafe fn msg0(receiver: *mut c_void, name: &str) -> *mut c_void {
     let Ok(name) = CString::new(name) else {
         return std::ptr::null_mut();
     };
+    // SAFETY: The caller supplies a live Objective-C receiver. `name` is a
+    // NUL-terminated selector spelling that remains alive for registration,
+    // and every selector used here takes no explicit arguments.
     unsafe { objc_msgSend(receiver, sel_registerName(name.as_ptr())) }
 }
 
@@ -31,6 +34,9 @@ pub(crate) fn discard_marked_text(ns_window: *mut c_void) {
     if ns_window.is_null() {
         return;
     }
+    // SAFETY: FLTK provides `ns_window` as a live NSWindow pointer on the main
+    // thread. Each zero-argument Objective-C message is guarded against a null
+    // result before that result is used as the next receiver.
     unsafe {
         let view = msg0(ns_window, "contentView");
         if view.is_null() {

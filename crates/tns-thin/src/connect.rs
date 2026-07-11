@@ -445,6 +445,9 @@ fn set_sockopt_int(
     name: libc::c_int,
     value: libc::c_int,
 ) -> Result<(), OracleThinError> {
+    // SAFETY: `fd` is borrowed from a live socket. `value` remains initialized
+    // and immovable for the duration of the call, and the supplied byte length
+    // exactly matches the pointed-to `c_int`.
     let result = unsafe {
         libc::setsockopt(
             fd,

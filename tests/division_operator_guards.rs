@@ -1,3 +1,11 @@
+#![allow(
+    clippy::cargo,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::pedantic,
+    clippy::unwrap_used
+)]
+
 use quote::ToTokens;
 use std::collections::BTreeSet;
 use std::ffi::OsStr;
