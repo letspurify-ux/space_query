@@ -47,8 +47,8 @@ PROMPT [1] Create tables
 
 CREATE TABLE oqt_t_dept (
   deptno     NUMBER       CONSTRAINT pk_oqt_dept PRIMARY KEY,
-  [[dname]]      VARCHAR2(30)  NOT NULL,
-  [[loc]]        VARCHAR2(30)
+  dname      VARCHAR2(30)  NOT NULL,
+  loc        VARCHAR2(30)
 );
 
 CREATE TABLE oqt_t_emp (
@@ -236,7 +236,7 @@ ORDER BY v.amt DESC, v.order_dt;
 PROMPT [5] Analytic/window functions: rank/dense_rank/percentile/listagg over window
 --------------------------------------------------------------------------------
 
-WITH [[base]] AS (
+WITH base AS (
   SELECT e.empno, e.ename, e.deptno, e.sal, e.hiredate
   FROM oqt_t_emp e
 )
@@ -279,19 +279,19 @@ ORDER BY deptno NULLS LAST, job NULLS LAST, gid;
 PROMPT [7] PIVOT / UNPIVOT (sales by dept/job)
 --------------------------------------------------------------------------------
 
-WITH [[s]] AS (
+WITH s AS (
   SELECT deptno, job, sal
   FROM oqt_t_emp
 )
 SELECT *
 FROM s
 PIVOT (
-  SUM(sal) AS [[sum_sal]]
+  SUM(sal) AS sum_sal
   FOR deptno IN (10 AS D10, 20 AS D20, 30 AS D30, 40 AS D40)
 )
 ORDER BY job;
 
-WITH [[p]] AS (
+WITH p AS (
   SELECT *
   FROM (
     SELECT deptno, job, sal FROM oqt_t_emp
@@ -326,7 +326,7 @@ ORDER SIBLINGS BY node_id;
 PROMPT [9] Recursive WITH (subquery factoring) to traverse hierarchy
 --------------------------------------------------------------------------------
 
-WITH [[r]] (node_id, parent_id, node_name, lvl, path) AS (
+WITH r (node_id, parent_id, node_name, lvl, path) AS (
   SELECT node_id, parent_id, node_name, 1 AS lvl, '/'||node_name AS path
   FROM oqt_t_tree
   WHERE parent_id IS NULL
@@ -372,7 +372,7 @@ MATCH_RECOGNIZE (
   MEASURES
     FIRST(ename) AS start_name,
     LAST(ename)  AS end_name,
-    COUNT(*)     AS [[run_len]]
+    COUNT(*)     AS run_len
   ONE ROW PER MATCH
   PATTERN (a b+)
   DEFINE
@@ -396,17 +396,17 @@ CROSS JOIN JSON_TABLE(
   j.payload,
   '$'
   COLUMNS (
-    [[order_id]]   NUMBER       PATH '$.order_id',
-    [[cust_name]]  VARCHAR2(50) PATH '$.customer.name',
-    [[tier]]       VARCHAR2(20) PATH '$.customer.tier',
+    order_id   NUMBER       PATH '$.order_id',
+    cust_name  VARCHAR2(50) PATH '$.customer.name',
+    tier       VARCHAR2(20) PATH '$.customer.tier',
     NESTED PATH '$.items[*]'
     COLUMNS (
-      [[sku]]   VARCHAR2(30) PATH '$.sku',
-      [[qty]]   NUMBER       PATH '$.qty',
-      [[price]] NUMBER       PATH '$.price'
+      sku   VARCHAR2(30) PATH '$.sku',
+      qty   NUMBER       PATH '$.qty',
+      price NUMBER       PATH '$.price'
     )
   )
-) [[jt]]
+) jt
 CROSS APPLY (
   SELECT jt.sku, jt.qty, jt.price FROM dual
 ) it
@@ -425,9 +425,9 @@ FROM oqt_t_xml t,
        '/root/dept'
        PASSING t.payload
        COLUMNS
-         [[deptno]] NUMBER       PATH '@deptno',
-         [[name]]   VARCHAR2(30) PATH 'name/text()',
-         [[loc]]    VARCHAR2(30) PATH 'loc/text()'
+         deptno NUMBER       PATH '@deptno',
+         name   VARCHAR2(30) PATH 'name/text()',
+         loc    VARCHAR2(30) PATH 'loc/text()'
      ) x
 ORDER BY x.deptno;
 
@@ -435,7 +435,7 @@ ORDER BY x.deptno;
 PROMPT [14] MODEL clause (advanced): compute derived metrics per dept
 --------------------------------------------------------------------------------
 
-WITH [[m]] AS (
+WITH m AS (
   SELECT deptno, SUM(sal) AS sum_sal, COUNT(*) AS cnt
   FROM oqt_t_emp
   GROUP BY deptno
@@ -511,7 +511,7 @@ FETCH FIRST 3 ROWS ONLY;
 PROMPT [17] UNION/INTERSECT/MINUS + WITH
 --------------------------------------------------------------------------------
 
-WITH [[a]] AS (
+WITH a AS (
   SELECT empno, ename, deptno FROM oqt_t_emp WHERE deptno IN (10,20)
 ),
 b AS (
@@ -522,7 +522,7 @@ UNION
 SELECT * FROM b
 ORDER BY deptno, empno;
 
-WITH [[a]] AS (
+WITH a AS (
   SELECT empno FROM oqt_t_emp WHERE job = 'MANAGER'
 ),
 b AS (
@@ -533,7 +533,7 @@ INTERSECT
 SELECT empno FROM b
 ORDER BY empno;
 
-WITH [[a]] AS (
+WITH a AS (
   SELECT empno FROM oqt_t_emp WHERE deptno = 30
 ),
 b AS (
@@ -552,30 +552,8 @@ PROMPT [DONE] Hardcore SELECT tests finished.
 -- source: test/test7.txt
 -- db: Oracle
 -- metadata: test Oracle inferred catalog (file-scoped overlay) + Oracle built-ins
--- checked: 1224
--- missing: 22
+-- checked: 1191
+-- missing: 0
 -- marker: [[word]] means not suggested for the tested prefix
--- missing tokens:
---   50:3 word=dname prefix=dnam suggestions=[] total=0 line=dname      VARCHAR2(30)  NOT NULL,
---   51:3 word=loc prefix=lo suggestions=[] total=0 line=loc        VARCHAR2(30)
---   239:6 word=base prefix=bas suggestions=[] total=0 line=WITH base AS (
---   282:6 word=s prefix=s suggestions=[] total=0 line=WITH s AS (
---   289:15 word=sum_sal prefix=sum_ suggestions=[] total=0 line=SUM(sal) AS sum_sal
---   294:6 word=p prefix=p suggestions=[] total=0 line=WITH p AS (
---   329:6 word=r prefix=r suggestions=[RANK, REF, REPLACE, REVERSE, ROW_NUMBER, RATIO_TO_REPORT(), RAWTOHEX(), REFTOHEX(), REGEXP_COUNT(), REGEXP_INSTR(), REGEXP_REPLACE(), REGEXP_SUBSTR(), REGR_AVGX(), REGR_AVGY(), REGR_COUNT(), REGR_INTERCEPT()] total=26 line=WITH r (node_id, parent_id, node_name, lvl, path) AS (
---   375:21 word=run_len prefix=run_ suggestions=[run_, oqt_run_log, run_id, run_ts, final_running_amt] total=5 line=COUNT(*)     AS run_len
---   399:5 word=order_id prefix=orde suggestions=[oqt_t_order_hdr, oqt_t_order_item] total=2 line=order_id   NUMBER       PATH '$.order_id',
---   400:5 word=cust_name prefix=cust suggestions=[] total=0 line=cust_name  VARCHAR2(50) PATH '$.customer.name',
---   401:5 word=tier prefix=tie suggestions=[] total=0 line=tier       VARCHAR2(20) PATH '$.customer.tier',
---   404:7 word=sku prefix=sk suggestions=[] total=0 line=sku   VARCHAR2(30) PATH '$.sku',
---   405:7 word=qty prefix=qt suggestions=[qt_audit_log, qt_boss_audit, qt_boss_cfg, qt_boss_dept, qt_boss_emp, qt_departments, qt_dept, qt_emp, qt_employees, qt_sales, qt_split_logs, qt_split_users, qt_boss_emp_v, qt_complex_v, qt_emp_sales_v, qt_emp_summary_v] total=34 line=qty   NUMBER       PATH '$.qty',
---   406:7 word=price prefix=pric suggestions=[] total=0 line=price NUMBER       PATH '$.price'
---   409:3 word=jt prefix=j suggestions=[JOIN] total=1 line=) jt
---   428:10 word=deptno prefix=dept suggestions=[qt_dept, oqt_t_dept, oqt_t_depth, qt_boss_dept, qt_departments] total=5 line=deptno NUMBER       PATH '@deptno',
---   429:10 word=name prefix=nam suggestions=[] total=0 line=name   VARCHAR2(30) PATH 'name/text()',
---   430:10 word=loc prefix=lo suggestions=[LOCALTIMESTAMP, LOG(), LOWER(), oqt_t_log, OQT_CLOB_FIX_T, oqt_run_log, qt_employees, qt_audit_log] total=8 line=loc    VARCHAR2(30) PATH 'loc/text()'
---   438:6 word=m prefix=m suggestions=[] total=0 line=WITH m AS (
---   514:6 word=a prefix=a suggestions=[AS, AND] total=2 line=WITH a AS (
---   525:6 word=a prefix=a suggestions=[AS, AND] total=2 line=WITH a AS (
---   536:6 word=a prefix=a suggestions=[AS, AND] total=2 line=WITH a AS (
+-- missing tokens: none
 -- =========================================================

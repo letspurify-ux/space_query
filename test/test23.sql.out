@@ -154,7 +154,7 @@ FROM DUAL;
 --------------------------------------------------------------------------------
 
 CREATE OR REPLACE VIEW qt_boss_emp_v AS
-WITH [[dept_base]] AS (
+WITH dept_base AS (
     SELECT
         d.dept_id,
         d.dept_name,
@@ -215,7 +215,7 @@ JOIN dept_base db
 --------------------------------------------------------------------------------
 
 CREATE OR REPLACE TYPE qt_boss_pair_obj AS
-    OBJECT ([[key_txt]] VARCHAR2 (100), [[val_txt]] VARCHAR2 (4000), MEMBER FUNCTION render RETURN VARCHAR2);
+    OBJECT (key_txt VARCHAR2 (100), val_txt VARCHAR2 (4000), MEMBER FUNCTION render RETURN VARCHAR2);
 /
 
 --------------------------------------------------------------------------------
@@ -271,7 +271,7 @@ CREATE OR REPLACE PACKAGE qt_boss_pkg IS
     FUNCTION build_note (p_emp_name VARCHAR2, p_dept_id NUMBER, p_status VARCHAR2) RETURN VARCHAR2;
     PROCEDURE mutate_emp (p_emp_id NUMBER, p_new_salary NUMBER, p_status VARCHAR2 DEFAULT NULL, p_append_text VARCHAR2 DEFAULT NULL);
     FUNCTION checksum_for_emp (p_emp_id NUMBER) RETURN NUMBER;
-    PROCEDURE run_extreme ([[p_dept_id]] NUMBER);
+    PROCEDURE run_extreme (p_dept_id NUMBER);
 END qt_boss_pkg;
 /
 
@@ -358,7 +358,7 @@ UPDATE qt_boss_emp
             RETURN - 1;
     END checksum_for_emp;
 
-    PROCEDURE run_extreme ([[p_dept_id]] NUMBER) IS
+    PROCEDURE run_extreme (p_dept_id NUMBER) IS
         v_names t_vc_tab;
         v_note VARCHAR2 (4000);
         v_plsql VARCHAR2 (32767);
@@ -619,13 +619,8 @@ WHERE v.emp_id IN (1, 2, 3, 101);
 -- source: test/test23.sql
 -- db: Oracle
 -- metadata: test Oracle inferred catalog (file-scoped overlay) + Oracle built-ins
--- checked: 866
--- missing: 5
+-- checked: 827
+-- missing: 0
 -- marker: [[word]] means not suggested for the tested prefix
--- missing tokens:
---   157:6 word=dept_base prefix=dept suggestions=[DEPTH, dept, qt_dept, oqt_t_dept, oqt_t_depth, qt_boss_dept, qt_departments, oqt_deep_tab, deptno, dept_code, dept_id, dept_name, dept_total, cnt_in_dept, parent_dept_id, direct_report_cnt] total=16 line=WITH dept_base AS (
---   218:13 word=key_txt prefix=key_ suggestions=[] total=0 line=OBJECT (key_txt VARCHAR2 (100), val_txt VARCHAR2 (4000), MEMBER FUNCTION render RETURN VARCHAR2);
---   218:37 word=val_txt prefix=val_ suggestions=[] total=0 line=OBJECT (key_txt VARCHAR2 (100), val_txt VARCHAR2 (4000), MEMBER FUNCTION render RETURN VARCHAR2);
---   274:28 word=p_dept_id prefix=p_de suggestions=[] total=0 line=PROCEDURE run_extreme (p_dept_id NUMBER);
---   361:28 word=p_dept_id prefix=p_de suggestions=[] total=0 line=PROCEDURE run_extreme (p_dept_id NUMBER) IS
+-- missing tokens: none
 -- =========================================================

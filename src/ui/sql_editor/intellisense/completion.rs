@@ -1980,7 +1980,9 @@ impl SqlEditorWidget {
     }
 
     fn text_after_cursor_for_completion(buffer: &TextBuffer, cursor: usize) -> String {
-        const COMPLETION_SUFFIX_SCAN_WINDOW: usize = 128;
+        // Keep a hard-bounded suffix large enough to resolve outer-query FROM
+        // aliases that appear after a correlated SELECT-list subquery.
+        const COMPLETION_SUFFIX_SCAN_WINDOW: usize = 4000;
         let end = (cursor + COMPLETION_SUFFIX_SCAN_WINDOW).min(buffer.length() as usize);
         buffer
             .text_range(cursor as i32, end as i32)
@@ -2530,6 +2532,14 @@ impl SqlEditorWidget {
         let has_prefix = !snapshot.prefix.is_empty();
         let context =
             Self::classify_intellisense_context(deep_ctx, deep_ctx.statement_tokens.as_ref());
+        let cursor_in_statement = snapshot
+            .cursor_pos_usize
+            .saturating_sub(analysis.statement_start)
+            .min(
+                analysis
+                    .statement_end
+                    .saturating_sub(analysis.statement_start),
+            );
         let data_type_position = qualifier
             .is_none()
             .then(|| {
@@ -2956,7 +2966,7 @@ impl SqlEditorWidget {
             .unwrap_or_default();
         let early_qualified_visible_relation_column_suggestions = if let Some(qualifier) = qualifier
         {
-            let tables = if qualifier_matches_visible_relation_scope {
+            let mut tables = if qualifier_matches_visible_relation_scope {
                 let resolved = intellisense_context::resolve_qualifier_tables(
                     qualifier,
                     &deep_ctx.tables_in_scope,
@@ -2975,6 +2985,36 @@ impl SqlEditorWidget {
                     qualifier,
                 )
             };
+            if tables.is_empty()
+                && !crate::sql_text::mysql_compatibility_for_sql(
+                    "",
+                    Some(snapshot.preferred_db_type),
+                )
+            {
+                tables = Self::oracle_visible_relation_tables_from_statement_text(
+                    expanded_statement_text,
+                    cursor_in_statement,
+                    qualifier,
+                );
+            }
+            if tables.is_empty()
+                && !crate::sql_text::mysql_compatibility_for_sql(
+                    "",
+                    Some(snapshot.preferred_db_type),
+                )
+            {
+                let mut relation_window = String::with_capacity(
+                    snapshot.signature_scan_text.len() + snapshot.text_after_cursor.len(),
+                );
+                relation_window.push_str(&snapshot.signature_scan_text);
+                let relation_cursor = relation_window.len();
+                relation_window.push_str(&snapshot.text_after_cursor);
+                tables = Self::oracle_visible_relation_tables_from_statement_text(
+                    &relation_window,
+                    relation_cursor,
+                    qualifier,
+                );
+            }
             let mut data = intellisense_data
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -2993,14 +3033,6 @@ impl SqlEditorWidget {
         } else {
             Vec::new()
         };
-        let cursor_in_statement = snapshot
-            .cursor_pos_usize
-            .saturating_sub(analysis.statement_start)
-            .min(
-                analysis
-                    .statement_end
-                    .saturating_sub(analysis.statement_start),
-            );
         let effective_local_qualifier = qualifier.map(str::to_string).or_else(|| {
             Self::qualifier_before_prefix_at_text_end(
                 &snapshot.signature_scan_text,
@@ -3078,6 +3110,7 @@ impl SqlEditorWidget {
         };
         if early_oracle_show_errors_object_kind.is_some()
             && early_oracle_show_errors_object_suggestions.is_empty()
+            && early_expected_keyword_suggestions.is_empty()
         {
             return IntellisenseCompletionComputation::Suppressed;
         }
@@ -20669,8 +20702,8 @@ impl SqlEditorWidget {
                     )
                 })
         };
-        if (!phase.is_table_context() && !alias_lookahead)
-            || (Self::unclosed_paren_count(tokens, end) != 0 && !alias_lookahead)
+        if !alias_lookahead
+            && (!phase.is_table_context() || Self::unclosed_paren_count(tokens, end) != 0)
         {
             return None;
         }
@@ -49023,6 +49056,15 @@ impl SqlEditorWidget {
             deep_ctx.cursor_token_len,
             prefix,
         );
+        if let Some(candidates) = Self::expected_precise_typed_structural_keyword_candidates(
+            prefix,
+            full_statement_tokens,
+            full_statement_context_end,
+            deep_ctx.phase,
+            db_type,
+        ) {
+            return Self::filter_expected_candidates(prefix, candidates);
+        }
         if !prefix.is_empty()
             && crate::ui::intellisense::suggestion_matches_completion_prefix("AS", prefix)
         {
@@ -53446,6 +53488,239 @@ impl SqlEditorWidget {
         suggestions
     }
 
+    /// Prefix-aware structural keywords whose current token is deliberately
+    /// excluded from `context_end`. These slots cannot be recovered from a
+    /// catalog-wide keyword list: each keyword is admitted only by its local
+    /// grammar anchor, so a missing exact parser phase never widens completion.
+    fn expected_precise_typed_structural_keyword_candidates(
+        prefix: &str,
+        tokens: &[SqlToken],
+        end: usize,
+        phase: intellisense_context::SqlPhase,
+        db_type: Option<crate::db::DatabaseType>,
+    ) -> Option<&'static [&'static str]> {
+        if prefix.is_empty() {
+            return None;
+        }
+
+        let matches_prefix = |keyword: &str| {
+            crate::ui::intellisense::suggestion_matches_completion_prefix(keyword, prefix)
+        };
+        let prefix_upper = prefix.to_ascii_uppercase();
+        let typed_idx = [end, end.saturating_sub(1)].into_iter().find(|idx| {
+            matches!(
+                tokens.get(*idx),
+                Some(SqlToken::Word(word))
+                    if word.to_ascii_uppercase().starts_with(&prefix_upper)
+            )
+        });
+        let structural_end = typed_idx.unwrap_or(end).min(tokens.len());
+        let words = Self::words_for_keyword_slot(tokens, structural_end);
+        let last = words.last().map(String::as_str);
+
+        if matches_prefix("BODY") {
+            if let Some(show_idx) = words.iter().rposition(|word| word == "SHOW") {
+                let tail = &words[show_idx..];
+                if matches!(
+                    tail,
+                    [show, errors, kind]
+                        if show == "SHOW"
+                            && errors == "ERRORS"
+                            && matches!(kind.as_str(), "PACKAGE" | "TYPE")
+                ) || matches!(
+                    tail,
+                    [show, errors, kind, typed]
+                        if show == "SHOW"
+                            && errors == "ERRORS"
+                            && matches!(kind.as_str(), "PACKAGE" | "TYPE")
+                            && crate::ui::intellisense::suggestion_matches_completion_prefix(
+                                "BODY", typed,
+                            )
+                ) {
+                    return Some(&["BODY"]);
+                }
+            }
+        }
+
+        if matches_prefix("CONSTANT")
+            && !crate::sql_text::mysql_compatibility_for_sql("", db_type)
+            && Self::cursor_is_in_plsql_declaration_region(tokens, structural_end)
+            && typed_idx.is_some_and(|current_idx| {
+                Self::next_non_comment_token_index(tokens, current_idx + 1)
+                    .and_then(|idx| Self::token_word(tokens.get(idx)?))
+                    .is_some_and(|word| !Self::is_plsql_non_type_keyword(word))
+            })
+            && Self::meaningful_tokens_before(tokens, structural_end)
+                .last()
+                .is_some_and(|token| {
+                    matches!(token, SqlToken::Word(word) if !Self::is_plsql_non_type_keyword(word))
+                })
+        {
+            return Some(&["CONSTANT"]);
+        }
+
+        if !crate::sql_text::mysql_compatibility_for_sql("", db_type)
+            && matches!(
+                words.as_slice(),
+                [alter, scope, set]
+                    if alter == "ALTER"
+                        && matches!(scope.as_str(), "SESSION" | "SYSTEM")
+                        && set == "SET"
+            )
+        {
+            const SESSION_PARAMETERS: &[&str] = &[
+                "CURRENT_SCHEMA",
+                "NLS_DATE_FORMAT",
+                "NLS_DATE_LANGUAGE",
+                "NLS_TIMESTAMP_FORMAT",
+                "NLS_TIMESTAMP_TZ_FORMAT",
+                "OPTIMIZER_MODE",
+            ];
+            const SYSTEM_PARAMETERS: &[&str] = &[
+                "DB_RECOVERY_FILE_DEST",
+                "OPEN_CURSORS",
+                "OPTIMIZER_MODE",
+            ];
+            return if words.get(1).map(String::as_str) == Some("SESSION") {
+                Some(SESSION_PARAMETERS)
+            } else {
+                Some(SYSTEM_PARAMETERS)
+            };
+        }
+
+        if matches_prefix("AS") {
+            if last == Some("STORE")
+                && words.iter().any(|word| word == "LOB")
+                && words.iter().any(|word| matches!(word.as_str(), "CREATE" | "ALTER"))
+            {
+                return Some(&["AS"]);
+            }
+
+            let current_is_followed_by_open_paren = typed_idx
+                .and_then(|current_idx| Self::next_non_comment_token_index(tokens, current_idx + 1))
+                .is_some_and(|next_idx| {
+                    matches!(tokens.get(next_idx), Some(SqlToken::Symbol(symbol)) if symbol == "(")
+                });
+            if current_is_followed_by_open_paren {
+                if let Some(with_idx) = words.iter().rposition(|word| word == "WITH") {
+                    let tail = &words[with_idx + 1..];
+                    if !tail.is_empty()
+                        && tail.last().is_some_and(|word| {
+                            !matches!(
+                                word.as_str(),
+                                "AS" | "SELECT" | "FROM" | "WHERE" | "JOIN" | "ON"
+                            )
+                        })
+                    {
+                        return Some(&["AS"]);
+                    }
+                }
+                if let Some(window_idx) = words.iter().rposition(|word| word == "WINDOW") {
+                    let tail = &words[window_idx + 1..];
+                    if !tail.is_empty()
+                        && tail.last().is_some_and(|word| {
+                            !matches!(word.as_str(), "AS" | "ORDER" | "PARTITION" | "ROWS" | "RANGE")
+                        })
+                    {
+                        return Some(&["AS"]);
+                    }
+                }
+            }
+
+            let in_oracle_unpivot_alias_mapping = !crate::sql_text::mysql_compatibility_for_sql(
+                "", db_type,
+            ) && typed_idx.is_some_and(|current_idx| {
+                let previous_is_identifier = Self::previous_non_comment_token_index(
+                    tokens,
+                    current_idx,
+                )
+                .is_some_and(|idx| matches!(tokens.get(idx), Some(SqlToken::Word(_))));
+                let next_is_label = Self::next_non_comment_token_index(tokens, current_idx + 1)
+                    .is_some_and(|idx| matches!(tokens.get(idx), Some(SqlToken::String(_))));
+                let unpivot_idx = tokens
+                    .get(..current_idx)
+                    .unwrap_or(&[])
+                    .iter()
+                    .rposition(|token| {
+                        matches!(token, SqlToken::Word(word) if word.eq_ignore_ascii_case("UNPIVOT"))
+                    });
+                let in_idx = tokens
+                    .get(..current_idx)
+                    .unwrap_or(&[])
+                    .iter()
+                    .rposition(|token| {
+                        matches!(token, SqlToken::Word(word) if word.eq_ignore_ascii_case("IN"))
+                    });
+                previous_is_identifier
+                    && next_is_label
+                    && unpivot_idx.zip(in_idx).is_some_and(|(unpivot_idx, in_idx)| {
+                        unpivot_idx < in_idx
+                    })
+            });
+            if in_oracle_unpivot_alias_mapping {
+                return Some(&["AS"]);
+            }
+
+            let define_idx = words.iter().rposition(|word| word == "DEFINE");
+            let in_match_recognize_definition = define_idx.is_some_and(|define_idx| {
+                (words.iter().any(|word| word == "MATCH_RECOGNIZE")
+                    || words.len() == define_idx + 2)
+                    && typed_idx.is_some_and(|current_idx| {
+                    let previous = Self::previous_non_comment_token_index(tokens, current_idx)
+                        .and_then(|idx| Self::token_word(tokens.get(idx)?));
+                    let next = Self::next_non_comment_token_index(tokens, current_idx + 1)
+                        .and_then(|idx| Self::token_word(tokens.get(idx)?));
+                    previous.zip(next).is_some_and(|(previous, next)| {
+                        previous.eq_ignore_ascii_case(next)
+                    })
+                    })
+            });
+            let in_model_measure_definition = words
+                .iter()
+                .rposition(|word| word == "MODEL")
+                .zip(words.iter().rposition(|word| word == "MEASURES"))
+                .is_some_and(|(model_idx, measures_idx)| model_idx < measures_idx)
+                && words
+                    .iter()
+                    .rposition(|word| word == "RULES")
+                    .is_none_or(|rules_idx| {
+                        words
+                            .iter()
+                            .rposition(|word| word == "MEASURES")
+                            .is_some_and(|measures_idx| rules_idx < measures_idx)
+                    });
+            if in_match_recognize_definition || in_model_measure_definition {
+                return Some(&["AS"]);
+            }
+
+            if matches!(
+                phase,
+                intellisense_context::SqlPhase::SelectList
+                    | intellisense_context::SqlPhase::PivotClause
+                    | intellisense_context::SqlPhase::MatchRecognizeClause
+                    | intellisense_context::SqlPhase::ModelClause
+            ) && Self::cursor_follows_complete_operand(tokens, structural_end) == Some(true)
+            {
+                return Some(&["AS"]);
+            }
+        }
+
+        if matches_prefix("END") {
+            let has_plsql_body = words.iter().any(|word| word == "BEGIN")
+                && words.iter().any(|word| {
+                    matches!(
+                        word.as_str(),
+                        "DECLARE" | "FUNCTION" | "PACKAGE" | "PROCEDURE" | "TRIGGER" | "TYPE"
+                    )
+                });
+            if has_plsql_body {
+                return Some(&["END"]);
+            }
+        }
+
+        None
+    }
+
     fn matches_string_list_case_insensitive(values: &[String], candidate: &str) -> bool {
         values
             .iter()
@@ -54527,24 +54802,35 @@ impl SqlEditorWidget {
     ) -> Vec<String> {
         let tokens = deep_ctx.statement_tokens.as_ref();
         let cursor_idx = deep_ctx.cursor_token_len.saturating_sub(1);
-        let containing_subquery = deep_ctx
+        let mut containing_subqueries = deep_ctx
             .subqueries
             .iter()
             .filter(|subquery| {
                 subquery.body_range.start <= cursor_idx && cursor_idx < subquery.body_range.end
             })
-            .min_by_key(|subquery| {
-                subquery
-                    .body_range
-                    .end
-                    .saturating_sub(subquery.body_range.start)
-            });
-        let scope_tokens = containing_subquery
-            .map(|subquery| {
-                intellisense_context::token_range_slice(tokens, subquery.body_range)
-            })
-            .unwrap_or(tokens);
-        let tables = intellisense_context::collect_tables_in_statement(scope_tokens);
+            .collect::<Vec<_>>();
+        containing_subqueries.sort_by_key(|subquery| {
+            subquery
+                .body_range
+                .end
+                .saturating_sub(subquery.body_range.start)
+        });
+        for subquery in &containing_subqueries {
+            let scope_tokens =
+                intellisense_context::token_range_slice(tokens, subquery.body_range);
+            let tables = intellisense_context::collect_tables_in_statement(scope_tokens);
+            if tables.iter().any(|table| {
+                table.name.eq_ignore_ascii_case(qualifier)
+                    || table
+                        .alias
+                        .as_deref()
+                        .is_some_and(|alias| alias.eq_ignore_ascii_case(qualifier))
+            }) {
+                return intellisense_context::resolve_qualifier_tables(qualifier, &tables);
+            }
+        }
+
+        let tables = intellisense_context::collect_tables_in_statement(tokens);
         if tables.iter().any(|table| {
             table.name.eq_ignore_ascii_case(qualifier)
                 || table
@@ -54555,7 +54841,7 @@ impl SqlEditorWidget {
             return intellisense_context::resolve_qualifier_tables(qualifier, &tables);
         }
 
-        if containing_subquery.is_none() {
+        if containing_subqueries.is_empty() {
             let meaningful = tokens
                 .iter()
                 .enumerate()
@@ -54580,6 +54866,123 @@ impl SqlEditorWidget {
             }
         }
         Vec::new()
+    }
+
+    fn oracle_visible_relation_tables_from_statement_text(
+        statement_text: &str,
+        cursor_in_statement: usize,
+        qualifier: &str,
+    ) -> Vec<String> {
+        let cursor = cursor_in_statement.min(statement_text.len());
+        let spans = super::query_text::tokenize_sql_spanned(statement_text);
+        let cursor_token_len = spans.partition_point(|span| span.end <= cursor);
+        let tokens = spans
+            .into_iter()
+            .map(|span| span.token)
+            .collect::<Vec<_>>();
+        let context = intellisense_context::analyze_cursor_context(&tokens, cursor_token_len);
+        let resolved =
+            intellisense_context::resolve_qualifier_tables(qualifier, &context.tables_in_scope);
+        if resolved.is_empty() {
+            let forward =
+                Self::oracle_forward_visible_relation_tables_for_qualifier(&context, qualifier);
+            if forward.is_empty() {
+                Self::oracle_visible_relation_tables_from_bounded_text(
+                    statement_text,
+                    cursor,
+                    qualifier,
+                )
+            } else {
+                forward
+            }
+        } else {
+            resolved
+        }
+    }
+
+    fn oracle_visible_relation_tables_from_bounded_text(
+        statement_text: &str,
+        cursor: usize,
+        qualifier: &str,
+    ) -> Vec<String> {
+        let spans = super::query_text::tokenize_sql_spanned(statement_text);
+        let mut stack = Vec::<usize>::new();
+        let mut cursor_stack = Vec::<usize>::new();
+        let mut scope_stacks = Vec::with_capacity(spans.len());
+        let mut last_select_before_cursor = HashMap::<Vec<usize>, usize>::new();
+        for (idx, span) in spans.iter().enumerate() {
+            if matches!(&span.token, SqlToken::Symbol(symbol) if symbol == ")") {
+                stack.pop();
+            }
+            scope_stacks.push(stack.clone());
+            if span.start < cursor
+                && matches!(&span.token, SqlToken::Word(word) if word.eq_ignore_ascii_case("SELECT"))
+            {
+                last_select_before_cursor.insert(stack.clone(), idx);
+            }
+            if matches!(&span.token, SqlToken::Symbol(symbol) if symbol == "(") {
+                stack.push(idx);
+            }
+            if span.end <= cursor {
+                cursor_stack.clone_from(&stack);
+            }
+        }
+
+        let meaningful = spans
+            .iter()
+            .enumerate()
+            .filter(|(_, span)| !matches!(span.token, SqlToken::Comment(_)))
+            .collect::<Vec<_>>();
+        let mut best: Option<(usize, String)> = None;
+        for window in meaningful.windows(3) {
+            let [(source_idx, source_span), (_, table_span), (_, alias_span)] = window else {
+                continue;
+            };
+            let SqlToken::Word(source) = &source_span.token else {
+                continue;
+            };
+            if !matches!(
+                source.to_ascii_uppercase().as_str(),
+                "FROM" | "JOIN" | "APPLY"
+            ) {
+                continue;
+            }
+            let Some(table) = Self::token_word(&table_span.token) else {
+                continue;
+            };
+            let Some(alias) = Self::token_word(&alias_span.token) else {
+                continue;
+            };
+            if !alias.eq_ignore_ascii_case(qualifier) {
+                continue;
+            }
+            let Some(scope) = scope_stacks.get(*source_idx) else {
+                continue;
+            };
+            if !cursor_stack.starts_with(scope)
+                || last_select_before_cursor
+                    .get(scope)
+                    .is_none_or(|select_idx| *source_idx < *select_idx)
+            {
+                continue;
+            }
+            let superseded_by_later_select = spans.iter().enumerate().any(|(idx, span)| {
+                idx > *last_select_before_cursor.get(scope).unwrap_or(&0)
+                    && idx < *source_idx
+                    && scope_stacks.get(idx) == Some(scope)
+                    && matches!(&span.token, SqlToken::Word(word) if word.eq_ignore_ascii_case("SELECT"))
+            });
+            if superseded_by_later_select {
+                continue;
+            }
+            if best
+                .as_ref()
+                .is_none_or(|(best_depth, _)| scope.len() > *best_depth)
+            {
+                best = Some((scope.len(), table.to_string()));
+            }
+        }
+        best.map(|(_, table)| vec![table]).unwrap_or_default()
     }
 
     fn oracle_local_type_suggestions_for_context(
@@ -56855,7 +57258,6 @@ impl SqlEditorWidget {
             return Vec::new();
         }
 
-        let mut resolved = resolved;
         prepend_virtual_alias_if_present(&mut resolved, qualifier, deep_ctx);
         resolved
     }

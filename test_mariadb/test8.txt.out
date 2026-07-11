@@ -713,7 +713,7 @@ SELECT 'FINAL_STATUS' AS section_name,
 -- source: test_mariadb/test8.txt
 -- db: MariaDB
 -- metadata: test_mariadb/test8.txt inferred catalog
--- checked: 1002
+-- checked: 1001
 -- missing: 0
 -- marker: [[word]] means not suggested for the tested prefix
 -- missing tokens: none

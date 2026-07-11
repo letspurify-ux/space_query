@@ -117,7 +117,7 @@ BEGIN
             NULL THEN
             :NEW.sale_id := qt_sales_seq.NEXTVAL;
         END IF;
-    END [[qt_bi_sales]];
+    END qt_bi_sales;
 /
 
 ------------------------------------------------------------------------
@@ -191,7 +191,7 @@ COMMIT;
 ------------------------------------------------------------------------
 
 CREATE OR REPLACE VIEW qt_emp_sales_v AS
-WITH [[sale_base]] AS (
+WITH sale_base AS (
     SELECT
         e.emp_id,
         e.emp_name,
@@ -202,7 +202,7 @@ WITH [[sale_base]] AS (
         s.status,
         TRUNC (s.sale_dt, 'MM') AS sale_month,
         SUM (s.amount) OVER (PARTITION BY e.emp_id) AS total_amount_by_emp,
-        ROW_NUMBER () OVER (PARTITION BY e.emp_id ORDER BY s.sale_dt DESC, s.amount DESC) AS [[rn]]
+        ROW_NUMBER () OVER (PARTITION BY e.emp_id ORDER BY s.sale_dt DESC, s.amount DESC) AS rn
     FROM qt_emp e
     JOIN qt_dept d
         ON d.dept_id = e.dept_id
@@ -217,7 +217,7 @@ FROM sale_base;
 ------------------------------------------------------------------------
 
 CREATE OR REPLACE TYPE qt_obj_emp AS
-    OBJECT ([[emp_id]] NUMBER, [[emp_name]] VARCHAR2 (100), [[dept_name]] VARCHAR2 (100), [[total_sales]] NUMBER);
+    OBJECT (emp_id NUMBER, emp_name VARCHAR2 (100), dept_name VARCHAR2 (100), total_sales NUMBER);
 /
 
 CREATE OR REPLACE TYPE qt_obj_emp_tab AS
@@ -256,8 +256,8 @@ END qt_pipe_emp;
 CREATE OR REPLACE TRIGGER qt_sales_ct
     FOR INSERT OR UPDATE OR DELETE ON qt_sales COMPOUND TRIGGER TYPE t_num_tab IS
     TABLE OF NUMBER INDEX BY PLS_INTEGER;
-    [[g_emp_ids]] t_num_tab;
-    [[g_idx]] PLS_INTEGER := 0;
+    g_emp_ids t_num_tab;
+    g_idx PLS_INTEGER := 0;
     BEFORE STATEMENT IS
     BEGIN
         g_idx := 0;
@@ -304,9 +304,9 @@ Parser torture test:
   - double quote "
   - pseudo comment text: / * ... * / and --
 ]';
-    FUNCTION normalize_name ([[p_name]] VARCHAR2) RETURN VARCHAR2 DETERMINISTIC;
-    FUNCTION json_like_report ([[p_emp_id]] NUMBER) RETURN CLOB;
-    PROCEDURE load_bonus_sales ([[p_year]] NUMBER, p_debug BOOLEAN DEFAULT FALSE);
+    FUNCTION normalize_name (p_name VARCHAR2) RETURN VARCHAR2 DETERMINISTIC;
+    FUNCTION json_like_report (p_emp_id NUMBER) RETURN CLOB;
+    PROCEDURE load_bonus_sales (p_year NUMBER, p_debug BOOLEAN DEFAULT FALSE);
     PROCEDURE open_emp_cursor (p_dept_id IN NUMBER, p_min_amount IN NUMBER DEFAULT 0, p_rc OUT SYS_REFCURSOR);
 END qt_pkg_extreme;
 /
@@ -317,7 +317,7 @@ END qt_pkg_extreme;
 
 CREATE OR REPLACE PACKAGE BODY qt_pkg_extreme IS
     g_run_mode VARCHAR2 (30);
-    PROCEDURE log_msg ([[p_module]] VARCHAR2, [[p_action]] VARCHAR2, [[p_text]] CLOB) IS
+    PROCEDURE log_msg (p_module VARCHAR2, p_action VARCHAR2, p_text CLOB) IS
         PRAGMA AUTONOMOUS_TRANSACTION;
     BEGIN
         INSERT INTO qt_audit_log (module_name, action_name, log_text)
@@ -329,12 +329,12 @@ CREATE OR REPLACE PACKAGE BODY qt_pkg_extreme IS
             RAISE;
     END log_msg;
 
-    FUNCTION normalize_name ([[p_name]] VARCHAR2) RETURN VARCHAR2 DETERMINISTIC IS
+    FUNCTION normalize_name (p_name VARCHAR2) RETURN VARCHAR2 DETERMINISTIC IS
     BEGIN
         RETURN REGEXP_REPLACE (UPPER (TRIM (p_name)), '\s+', ' ');
     END normalize_name;
 
-    FUNCTION json_like_report ([[p_emp_id]] NUMBER) RETURN CLOB IS
+    FUNCTION json_like_report (p_emp_id NUMBER) RETURN CLOB IS
         v_report CLOB;
         v_name qt_emp.emp_name%TYPE;
         v_dept qt_dept.dept_name%TYPE;
@@ -361,8 +361,8 @@ CREATE OR REPLACE PACKAGE BODY qt_pkg_extreme IS
             RETURN '{"empId":null,"error":"NO_DATA_FOUND"}';
     END json_like_report;
 
-    PROCEDURE load_bonus_sales ([[p_year]] NUMBER, p_debug BOOLEAN DEFAULT FALSE) IS
-        TYPE t_sales_src_rec IS RECORD ([[emp_id]] qt_emp.emp_id%TYPE, sale_dt DATE, [[amount]] NUMBER (12, 2), [[tax]] NUMBER (12, 2), 
+    PROCEDURE load_bonus_sales (p_year NUMBER, p_debug BOOLEAN DEFAULT FALSE) IS
+        TYPE t_sales_src_rec IS RECORD (emp_id qt_emp.emp_id%TYPE, sale_dt DATE, amount NUMBER (12, 2), tax NUMBER (12, 2),
         remark   VARCHAR2(4000)
         );
         TYPE t_sales_src_tab IS TABLE OF t_sales_src_rec;
@@ -379,7 +379,7 @@ CREATE OR REPLACE PACKAGE BODY qt_pkg_extreme IS
         WHERE EXTRACT (YEAR
         FROM e.hired_at) <= p_year
             AND e.active_yn = 'Y';
-        PROCEDURE DEBUG ([[p_text]] VARCHAR2) IS
+        PROCEDURE DEBUG (p_text VARCHAR2) IS
         BEGIN
             IF p_debug THEN
                 DBMS_OUTPUT.PUT_LINE ('[DEBUG] ' || p_text);
@@ -391,7 +391,7 @@ CREATE OR REPLACE PACKAGE BODY qt_pkg_extreme IS
         INTO l_rows;
         CLOSE c_src;
         DEBUG ('Rows to insert=' || l_rows.COUNT);
-        FORALL [[i]] IN INDICES OF l_rows SAVE EXCEPTIONS
+        FORALL i IN INDICES OF l_rows SAVE EXCEPTIONS
         INSERT INTO qt_sales (sale_id, emp_id, sale_dt, amount, tax, status, 
         remark
         )
@@ -468,7 +468,7 @@ END qt_pkg_extreme;
 ------------------------------------------------------------------------
 
 MERGE INTO qt_sales dst USING (
-    WITH [[bonus_src]] AS (
+    WITH bonus_src AS (
         SELECT
             e.emp_id,
             TRUNC (SYSDATE, 'MM') AS sale_dt,
@@ -487,7 +487,7 @@ MERGE INTO qt_sales dst USING (
 ) src
     ON (dst.emp_id = src.emp_id
         AND dst.sale_dt = src.sale_dt
-        AND dst.[[REMARK]] = src.REMARK)
+        AND dst.REMARK = src.REMARK)
     WHEN MATCHED THEN
 UPDATE
 SET dst.amount = src.amount,
@@ -574,7 +574,7 @@ END;
 -- 11. WITH FUNCTION (Oracle-specific SQL)
 ------------------------------------------------------------------------
 
-WITH FUNCTION [[calc_bonus]] ([[p_amount]] NUMBER) RETURN NUMBER IS
+WITH FUNCTION calc_bonus (p_amount NUMBER) RETURN NUMBER IS
     BEGIN
         RETURN ROUND (p_amount * 0.10, 2);
     END;
@@ -590,7 +590,7 @@ ORDER BY e.emp_id;
 -- 12. RECURSIVE WITH + ANALYTIC + EXISTS
 ------------------------------------------------------------------------
 
-WITH [[dept_tree]] (dept_id, dept_name, parent_dept_id, lvl, path_txt) AS (
+WITH dept_tree (dept_id, dept_name, parent_dept_id, lvl, path_txt) AS (
     SELECT
         d.dept_id,
         d.dept_name,
@@ -676,7 +676,7 @@ FROM (
             salary,
             NVL (commission_pct, 0) AS commission_pct
         FROM qt_emp
-    ) UNPIVOT INCLUDE NULLS ([[metric_value]]
+    ) UNPIVOT INCLUDE NULLS (metric_value
 FOR metric_name IN (salary AS 'SALARY', commission_pct AS 'COMMISSION'))
 ORDER BY emp_id,
     metric_name;
@@ -766,7 +766,7 @@ DECLARE
     END safe_div;
 
 BEGIN
-    SAVEPOINT [[before_bonus]];
+    SAVEPOINT before_bonus;
     qt_pkg_extreme.load_bonus_sales (p_year => 2025, p_debug => TRUE);
     qt_pkg_extreme.open_emp_cursor (p_dept_id => 20, p_min_amount => 0, p_rc => l_rc);
     LOOP
@@ -850,43 +850,14 @@ SELECT log_id,
 FROM qt_audit_log
 ORDER BY log_id;
 
+
 -- =========================================================
 -- IntelliSense sweep report generated by intellisense sweep
 -- source: test/test10.txt
 -- db: Oracle
 -- metadata: test Oracle inferred catalog (file-scoped overlay) + Oracle built-ins
--- checked: 1588
--- missing: 30
+-- checked: 1537
+-- missing: 0
 -- marker: [[word]] means not suggested for the tested prefix
--- missing tokens:
---   120:9 word=qt_bi_sales prefix=qt_b suggestions=[] total=0 line=END qt_bi_sales;
---   194:6 word=sale_base prefix=sale suggestions=[sale, qt_sales, qt_sales_seq, qt_emp_sales_v, qt_seq_sales, qt_sale_obj, qt_sale_obj_tab, sales_rank, sale_dt, sale_id, sale_year, total_sales] total=12 line=WITH sale_base AS (
---   205:94 word=rn prefix=r suggestions=[] total=0 line=ROW_NUMBER () OVER (PARTITION BY e.emp_id ORDER BY s.sale_dt DESC, s.amount DESC) AS rn
---   220:13 word=emp_id prefix=emp_ suggestions=[] total=0 line=OBJECT (emp_id NUMBER, emp_name VARCHAR2 (100), dept_name VARCHAR2 (100), total_sales NUMBER);
---   220:28 word=emp_name prefix=emp_ suggestions=[] total=0 line=OBJECT (emp_id NUMBER, emp_name VARCHAR2 (100), dept_name VARCHAR2 (100), total_sales NUMBER);
---   220:53 word=dept_name prefix=dept suggestions=[] total=0 line=OBJECT (emp_id NUMBER, emp_name VARCHAR2 (100), dept_name VARCHAR2 (100), total_sales NUMBER);
---   220:79 word=total_sales prefix=tota suggestions=[] total=0 line=OBJECT (emp_id NUMBER, emp_name VARCHAR2 (100), dept_name VARCHAR2 (100), total_sales NUMBER);
---   259:5 word=g_emp_ids prefix=g_em suggestions=[] total=0 line=g_emp_ids t_num_tab;
---   260:5 word=g_idx prefix=g_id suggestions=[] total=0 line=g_idx PLS_INTEGER := 0;
---   307:30 word=p_name prefix=p_na suggestions=[] total=0 line=FUNCTION normalize_name (p_name VARCHAR2) RETURN VARCHAR2 DETERMINISTIC;
---   308:32 word=p_emp_id prefix=p_em suggestions=[] total=0 line=FUNCTION json_like_report (p_emp_id NUMBER) RETURN CLOB;
---   309:33 word=p_year prefix=p_ye suggestions=[] total=0 line=PROCEDURE load_bonus_sales (p_year NUMBER, p_debug BOOLEAN DEFAULT FALSE);
---   320:24 word=p_module prefix=p_mo suggestions=[] total=0 line=PROCEDURE log_msg (p_module VARCHAR2, p_action VARCHAR2, p_text CLOB) IS
---   320:43 word=p_action prefix=p_ac suggestions=[] total=0 line=PROCEDURE log_msg (p_module VARCHAR2, p_action VARCHAR2, p_text CLOB) IS
---   320:62 word=p_text prefix=p_te suggestions=[] total=0 line=PROCEDURE log_msg (p_module VARCHAR2, p_action VARCHAR2, p_text CLOB) IS
---   332:30 word=p_name prefix=p_na suggestions=[] total=0 line=FUNCTION normalize_name (p_name VARCHAR2) RETURN VARCHAR2 DETERMINISTIC IS
---   337:32 word=p_emp_id prefix=p_em suggestions=[] total=0 line=FUNCTION json_like_report (p_emp_id NUMBER) RETURN CLOB IS
---   364:33 word=p_year prefix=p_ye suggestions=[] total=0 line=PROCEDURE load_bonus_sales (p_year NUMBER, p_debug BOOLEAN DEFAULT FALSE) IS
---   365:41 word=emp_id prefix=emp_ suggestions=[] total=0 line=TYPE t_sales_src_rec IS RECORD (emp_id qt_emp.emp_id%TYPE, sale_dt DATE, amount NUMBER (12, 2), tax NUMBER (12, 2),
---   365:82 word=amount prefix=amou suggestions=[] total=0 line=TYPE t_sales_src_rec IS RECORD (emp_id qt_emp.emp_id%TYPE, sale_dt DATE, amount NUMBER (12, 2), tax NUMBER (12, 2),
---   365:105 word=tax prefix=ta suggestions=[TAN(), TANH()] total=2 line=TYPE t_sales_src_rec IS RECORD (emp_id qt_emp.emp_id%TYPE, sale_dt DATE, amount NUMBER (12, 2), tax NUMBER (12, 2),
---   382:26 word=p_text prefix=p_te suggestions=[] total=0 line=PROCEDURE DEBUG (p_text VARCHAR2) IS
---   394:16 word=i prefix=i suggestions=[IF, IN, INTERVAL, IS, INITCAP(), INSERTCHILDXML(), INSERTCHILDXMLAFTER(), INSERTCHILDXMLBEFORE(), INSERTXMLBEFORE(), INSTR(), id] total=11 line=FORALL i IN INDICES OF l_rows SAVE EXCEPTIONS
---   471:10 word=bonus_src prefix=bonu suggestions=[bonu, bonus_pct] total=2 line=WITH bonus_src AS (
---   490:17 word=REMARK prefix=REMA suggestions=[] total=0 line=AND dst.REMARK = src.REMARK)
---   577:15 word=calc_bonus prefix=calc suggestions=[] total=0 line=WITH FUNCTION calc_bonus (p_amount NUMBER) RETURN NUMBER IS
---   577:27 word=p_amount prefix=p_am suggestions=[] total=0 line=WITH FUNCTION calc_bonus (p_amount NUMBER) RETURN NUMBER IS
---   593:6 word=dept_tree prefix=dept suggestions=[DEPTH, dept, qt_dept, oqt_t_dept, oqt_t_depth, qt_boss_dept, qt_departments, oqt_deep_tab, deptno, dept_code, dept_id, dept_name, dept_total, cnt_in_dept, parent_dept_id, direct_report_cnt] total=16 line=WITH dept_tree (dept_id, dept_name, parent_dept_id, lvl, path_txt) AS (
---   679:30 word=metric_value prefix=metr suggestions=[metr, metric_name] total=2 line=) UNPIVOT INCLUDE NULLS (metric_value
---   769:15 word=before_bonus prefix=befo suggestions=[] total=0 line=SAVEPOINT before_bonus;
+-- missing tokens: none
 -- =========================================================

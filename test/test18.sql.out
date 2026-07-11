@@ -16,10 +16,10 @@
 
 BEGIN
     FOR r IN (
-        SELECT [[object_name]],
-            [[object_type]]
-        FROM [[user_objects]]
-        WHERE [[object_name]] IN ('QT_EMP', 'QT_DEPT', 'QT_SALES', 'QT_AUDIT_LOG', 'QT_EMP_BIUD', 'QT_EMP_SUMMARY_V', 'QT_PKG_EXTREME', 'QT_SEQ_EMP', 'QT_SEQ_SALES')
+        SELECT object_name,
+            object_type
+        FROM user_objects
+        WHERE object_name IN ('QT_EMP', 'QT_DEPT', 'QT_SALES', 'QT_AUDIT_LOG', 'QT_EMP_BIUD', 'QT_EMP_SUMMARY_V', 'QT_PKG_EXTREME', 'QT_SEQ_EMP', 'QT_SEQ_SALES')
     ) LOOP
         BEGIN
             IF r.object_type = 'TABLE' THEN
@@ -230,7 +230,7 @@ SHOW ERRORS
 --------------------------------------------------------------------------------
 
 CREATE OR REPLACE VIEW qt_emp_summary_v AS
-WITH [[base_sales]] AS (
+WITH base_sales AS (
     SELECT
         s.emp_id,
         s.dept_id,
@@ -484,7 +484,7 @@ CREATE OR REPLACE PACKAGE BODY qt_pkg_extreme IS
             RETURN;
         END IF;
         BEGIN
-            FORALL [[i]] IN INDICES OF v_emp_ids SAVE EXCEPTIONS
+            FORALL i IN INDICES OF v_emp_ids SAVE EXCEPTIONS
             UPDATE qt_emp
             SET salary = ROUND (salary * (
                     CASE
@@ -594,7 +594,7 @@ END;
 -- EXTREME QUERY 1: VERY DEEP WITH + CORRELATED + ANALYTIC + CASE
 --------------------------------------------------------------------------------
 
-WITH [[dept_tree]] AS (
+WITH dept_tree AS (
     SELECT
         d.dept_id,
         d.parent_dept_id,
@@ -713,7 +713,7 @@ ORDER BY j.sale_year,
 -- EXTREME QUERY 2: PIVOT + UNPIVOT + INLINE VIEWS
 --------------------------------------------------------------------------------
 
-WITH [[src]] AS (
+WITH src AS (
     SELECT
         s.emp_id,
         s.sale_year,
@@ -1057,16 +1057,8 @@ ORDER BY sale_year,
 -- source: test/test18.sql
 -- db: Oracle
 -- metadata: test Oracle inferred catalog (file-scoped overlay) + Oracle built-ins
--- checked: 1867
--- missing: 8
+-- checked: 1810
+-- missing: 0
 -- marker: [[word]] means not suggested for the tested prefix
--- missing tokens:
---   19:16 word=object_name prefix=obje suggestions=[qt_obj_emp, qt_obj_emp_tab] total=2 line=SELECT object_name,
---   20:13 word=object_type prefix=obje suggestions=[qt_obj_emp, qt_obj_emp_tab] total=2 line=object_type
---   21:14 word=user_objects prefix=user suggestions=[qt_split_users] total=1 line=FROM user_objects
---   22:15 word=object_name prefix=obje suggestions=[qt_obj_emp, qt_obj_emp_tab] total=2 line=WHERE object_name IN ('QT_EMP', 'QT_DEPT', 'QT_SALES', 'QT_AUDIT_LOG', 'QT_EMP_BIUD', 'QT_EMP_SUMMARY_V', 'QT_PKG_EXTREME', 'QT_SEQ_EMP', 'QT_SEQ_SALES')
---   233:6 word=base_sales prefix=base suggestions=[base, qt_boss_audit_seq] total=2 line=WITH base_sales AS (
---   487:20 word=i prefix=i suggestions=[IF, INDEX, IN, INTERVAL, IS, INITCAP(), INSERTCHILDXML(), INSERTCHILDXMLAFTER(), INSERTCHILDXMLBEFORE(), INSERTXMLBEFORE(), INSTR(), id] total=12 line=FORALL i IN INDICES OF v_emp_ids SAVE EXCEPTIONS
---   597:6 word=dept_tree prefix=dept suggestions=[] total=0 line=WITH dept_tree AS (
---   716:6 word=src prefix=sr suggestions=[] total=0 line=WITH src AS (
+-- missing tokens: none
 -- =========================================================

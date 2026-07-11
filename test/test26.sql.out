@@ -1,4 +1,4 @@
-CREATE TABLE OQT_CLOB_FIX_T (id NUMBER PRIMARY KEY, [[doc]] CLOB, [[ndoc]] NCLOB, [[xdoc]] XMLTYPE)
+CREATE TABLE OQT_CLOB_FIX_T (id NUMBER PRIMARY KEY, doc CLOB, ndoc NCLOB, xdoc XMLTYPE)
 LOB (doc) STORE AS BASICFILE
 LOB (ndoc) STORE AS BASICFILE
 XMLTYPE COLUMN xdoc STORE AS BASICFILE CLOB;
@@ -33,11 +33,8 @@ DROP TABLE OQT_CLOB_FIX_T PURGE;
 -- source: test/test26.sql
 -- db: Oracle
 -- metadata: test Oracle inferred catalog (file-scoped overlay) + Oracle built-ins
--- checked: 92
--- missing: 3
+-- checked: 88
+-- missing: 0
 -- marker: [[word]] means not suggested for the tested prefix
--- missing tokens:
---   1:53 word=doc prefix=do suggestions=[] total=0 line=CREATE TABLE OQT_CLOB_FIX_T (id NUMBER PRIMARY KEY, doc CLOB, ndoc NCLOB, xdoc XMLTYPE)
---   1:63 word=ndoc prefix=ndo suggestions=[] total=0 line=CREATE TABLE OQT_CLOB_FIX_T (id NUMBER PRIMARY KEY, doc CLOB, ndoc NCLOB, xdoc XMLTYPE)
---   1:75 word=xdoc prefix=xdo suggestions=[] total=0 line=CREATE TABLE OQT_CLOB_FIX_T (id NUMBER PRIMARY KEY, doc CLOB, ndoc NCLOB, xdoc XMLTYPE)
+-- missing tokens: none
 -- =========================================================

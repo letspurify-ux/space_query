@@ -1259,7 +1259,7 @@ ORDER BY m.ym,
 -- source: test_mariadb/test5.txt
 -- db: MariaDB
 -- metadata: test_mariadb/test5.txt inferred catalog
--- checked: 2171
+-- checked: 2167
 -- missing: 0
 -- marker: [[word]] means not suggested for the tested prefix
 -- missing tokens: none

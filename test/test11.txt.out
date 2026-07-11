@@ -221,7 +221,7 @@ COMMIT;
    --------------------------------------------------------------------- */
 
 CREATE OR REPLACE TYPE qt_sale_obj AS
-    OBJECT ([[sale_id]] NUMBER, [[emp_id]] NUMBER, [[amount]] NUMBER, [[tag]] VARCHAR2 (200));
+    OBJECT (sale_id NUMBER, emp_id NUMBER, amount NUMBER, tag VARCHAR2 (200));
 /
 
 CREATE OR REPLACE TYPE qt_sale_obj_tab AS
@@ -238,10 +238,10 @@ CREATE OR REPLACE PACKAGE qt_torture_pkg AUTHID DEFINER IS
     TYPE t_num_nt IS TABLE OF NUMBER;
     TYPE t_name_aat IS TABLE OF t_name INDEX BY PLS_INTEGER;
     g_run_id NUMBER := 0;
-    PROCEDURE AUDIT ([[p_module]] VARCHAR2, [[p_action]] VARCHAR2, [[p_detail]] CLOB);
-    FUNCTION get_employee_report ([[p_dept_id]] NUMBER, [[p_min_salary]] NUMBER DEFAULT 0) RETURN t_refcur;
-    FUNCTION pipe_sales ([[p_emp_id]] NUMBER DEFAULT NULL) RETURN qt_sale_obj_tab PIPELINED;
-    PROCEDURE complex_block ([[p_dept_id]] NUMBER, [[p_raise_pct]] NUMBER DEFAULT 1.5, [[p_mode]] VARCHAR2 DEFAULT 'DEEP');
+    PROCEDURE AUDIT (p_module VARCHAR2, p_action VARCHAR2, p_detail CLOB);
+    FUNCTION get_employee_report (p_dept_id NUMBER, p_min_salary NUMBER DEFAULT 0) RETURN t_refcur;
+    FUNCTION pipe_sales (p_emp_id NUMBER DEFAULT NULL) RETURN qt_sale_obj_tab PIPELINED;
+    PROCEDURE complex_block (p_dept_id NUMBER, p_raise_pct NUMBER DEFAULT 1.5, p_mode VARCHAR2 DEFAULT 'DEEP');
 END qt_torture_pkg;
 /
 
@@ -250,7 +250,7 @@ END qt_torture_pkg;
    --------------------------------------------------------------------- */
 
 CREATE OR REPLACE PACKAGE BODY qt_torture_pkg IS
-    PROCEDURE AUDIT ([[p_module]] VARCHAR2, [[p_action]] VARCHAR2, [[p_detail]] CLOB) IS
+    PROCEDURE AUDIT (p_module VARCHAR2, p_action VARCHAR2, p_detail CLOB) IS
         PRAGMA AUTONOMOUS_TRANSACTION;
     BEGIN
         INSERT INTO qt_audit_log (module_name, action_name, detail_text)
@@ -265,7 +265,7 @@ CREATE OR REPLACE PACKAGE BODY qt_torture_pkg IS
         l_rc t_refcur;
     BEGIN
         OPEN l_rc FOR
-            WITH [[base]] AS (
+            WITH base AS (
                 SELECT e.emp_id,
                     e.emp_name,
                     e.salary,
@@ -335,7 +335,7 @@ CREATE OR REPLACE PACKAGE BODY qt_torture_pkg IS
         e_bulk
     EXCEPTION;
         PRAGMA EXCEPTION_INIT (e_bulk, - 24381);
-        CURSOR c_emp ([[cp_dept_id]] NUMBER) IS
+        CURSOR c_emp (cp_dept_id NUMBER) IS
             SELECT emp_id,
                 emp_name,
                 salary
@@ -352,7 +352,7 @@ CREATE OR REPLACE PACKAGE BODY qt_torture_pkg IS
             WHERE dept_id = p_dept_id
             ORDER BY emp_id;
             IF l_ids.COUNT > 0 THEN
-                FORALL [[i]] IN 1..l_ids.COUNT SAVE EXCEPTIONS
+                FORALL i IN 1..l_ids.COUNT SAVE EXCEPTIONS
                     UPDATE qt_employees
                     SET salary = ROUND (NVL (salary, 0) * (1 + p_raise_pct / 100), 2),
                         remarks = NVL (remarks, '') ||
@@ -493,7 +493,7 @@ CREATE OR REPLACE VIEW qt_complex_v AS
             PARTITION BY d.dept_id
             ORDER BY NVL (s.amount, 0) DESC,
             e.emp_id
-        ) AS [[rn]]
+        ) AS rn
     FROM qt_departments d
     JOIN qt_employees e
         ON e.dept_id = d.dept_id
@@ -518,7 +518,7 @@ END;
 /* 09-01. WITH FUNCTION: SQL 안에 로컬 함수 */
 
 WITH
-    FUNCTION [[score_fn]] (p_salary NUMBER, p_bonus NUMBER) RETURN NUMBER IS
+    FUNCTION score_fn (p_salary NUMBER, p_bonus NUMBER) RETURN NUMBER IS
     BEGIN
         RETURN ROUND (NVL (p_salary, 0) * (1 + NVL (p_bonus, 0) / 100), 2);
     END;
@@ -531,7 +531,7 @@ ORDER BY e.emp_id;
 
 /* 09-02. Recursive subquery factoring + SEARCH + CYCLE */
 
-WITH [[dept_tree]] (dept_id, parent_dept_id, dept_name, lvl, path_txt) AS (
+WITH dept_tree (dept_id, parent_dept_id, dept_name, lvl, path_txt) AS (
     SELECT
         d.dept_id,
         d.parent_dept_id,
@@ -551,8 +551,8 @@ WITH [[dept_tree]] (dept_id, parent_dept_id, dept_name, lvl, path_txt) AS (
     JOIN dept_tree p
         ON p.dept_id = c.parent_dept_id
 )
-SEARCH DEPTH FIRST BY dept_id SET [[dfs_ord]]
-CYCLE dept_id SET [[is_cycle]] TO 'Y' DEFAULT 'N'
+SEARCH DEPTH FIRST BY dept_id SET dfs_ord
+CYCLE dept_id SET is_cycle TO 'Y' DEFAULT 'N'
 SELECT
     dept_id,
     parent_dept_id,
@@ -570,7 +570,7 @@ ORDER BY dfs_ord;
 SELECT LPAD (' ', 2 * (LEVEL - 1)) || dept_name AS dept_tree,
     dept_id,
     parent_dept_id,
-    SYS_CONNECT_BY_PATH (dept_name, '/') AS [[full_path]]
+    SYS_CONNECT_BY_PATH (dept_name, '/') AS full_path
 FROM qt_departments
 START WITH parent_dept_id IS NULL
 CONNECT BY NOCYCLE PRIOR dept_id = parent_dept_id
@@ -633,7 +633,7 @@ FROM (
                 PARTITION BY d.dept_id
                 ORDER BY x.total_amount DESC NULLS LAST,
                 e.emp_id
-            ) AS [[rn]]
+            ) AS rn
         FROM qt_employees e
         JOIN qt_departments d
             ON d.dept_id = e.dept_id
@@ -701,7 +701,7 @@ FROM (
         FROM qt_sales
     )
 PIVOT (
-    SUM (amount) AS [[amt]]
+    SUM (amount) AS amt
     FOR status IN ('NEW' AS NEW, 'PAID' AS PAID, 'PENDING' AS PENDING, 'CANCELLED' AS CANCELLED)
 )
 ORDER BY ym;
@@ -717,7 +717,7 @@ FROM (
         FROM qt_employees
     )
 UNPIVOT INCLUDE NULLS (
-    [[metric_value]]
+    metric_value
     FOR metric_name IN (base_salary AS 'BASE_SALARY', bonus_amount AS 'BONUS_AMOUNT')
 )
 ORDER BY emp_id,
@@ -738,7 +738,7 @@ MATCH_RECOGNIZE (
         LAST (sale_date) AS end_dt,
         SUM (amount) AS total_amt
     ALL ROWS PER MATCH
-    PATTERN ([[low]] + [[mid]] * high)
+    PATTERN (low + mid * high)
     DEFINE low AS low.amount < 100,
         mid AS mid.amount BETWEEN 100 AND 500,
         high AS high.amount > 500
@@ -780,9 +780,9 @@ FROM JSON_TABLE (q'![
         {"emp_id":2,"skills":["Rust","FLTK"]},
         {"emp_id":3,"skills":["ETL","JSON"]}
     ]!', '$[*]' COLUMNS (
-        [[emp_id]] NUMBER PATH '$.emp_id',
+        emp_id NUMBER PATH '$.emp_id',
         NESTED PATH '$.skills[*]' COLUMNS (
-            [[skill]] VARCHAR2 (30) PATH '$'
+            skill VARCHAR2 (30) PATH '$'
         )
     )) jt
 ORDER BY jt.emp_id,
@@ -797,7 +797,7 @@ FROM XMLTABLE ('/root/item' PASSING XMLTYPE ('<root>
             <item><emp_id>1</emp_id><tag>A</tag></item>
             <item><emp_id>2</emp_id><tag>B</tag></item>
             <item><emp_id>3</emp_id><tag>C</tag></item>
-         </root>') COLUMNS [[emp_id]] NUMBER PATH 'emp_id', [[tag]] VARCHAR2 (10) PATH 'tag') x
+         </root>') COLUMNS emp_id NUMBER PATH 'emp_id', tag VARCHAR2 (10) PATH 'tag') x
 ORDER BY x.emp_id;
 /
 
@@ -1020,42 +1020,8 @@ FROM qt_audit_log;
 -- source: test/test11.txt
 -- db: Oracle
 -- metadata: test Oracle inferred catalog (file-scoped overlay) + Oracle built-ins
--- checked: 1570
--- missing: 34
+-- checked: 1517
+-- missing: 0
 -- marker: [[word]] means not suggested for the tested prefix
--- missing tokens:
---   224:13 word=sale_id prefix=sale suggestions=[] total=0 line=OBJECT (sale_id NUMBER, emp_id NUMBER, amount NUMBER, tag VARCHAR2 (200));
---   224:29 word=emp_id prefix=emp_ suggestions=[] total=0 line=OBJECT (sale_id NUMBER, emp_id NUMBER, amount NUMBER, tag VARCHAR2 (200));
---   224:44 word=amount prefix=amou suggestions=[] total=0 line=OBJECT (sale_id NUMBER, emp_id NUMBER, amount NUMBER, tag VARCHAR2 (200));
---   224:59 word=tag prefix=ta suggestions=[] total=0 line=OBJECT (sale_id NUMBER, emp_id NUMBER, amount NUMBER, tag VARCHAR2 (200));
---   241:22 word=p_module prefix=p_mo suggestions=[] total=0 line=PROCEDURE AUDIT (p_module VARCHAR2, p_action VARCHAR2, p_detail CLOB);
---   241:41 word=p_action prefix=p_ac suggestions=[] total=0 line=PROCEDURE AUDIT (p_module VARCHAR2, p_action VARCHAR2, p_detail CLOB);
---   241:60 word=p_detail prefix=p_de suggestions=[] total=0 line=PROCEDURE AUDIT (p_module VARCHAR2, p_action VARCHAR2, p_detail CLOB);
---   242:35 word=p_dept_id prefix=p_de suggestions=[] total=0 line=FUNCTION get_employee_report (p_dept_id NUMBER, p_min_salary NUMBER DEFAULT 0) RETURN t_refcur;
---   242:53 word=p_min_salary prefix=p_mi suggestions=[] total=0 line=FUNCTION get_employee_report (p_dept_id NUMBER, p_min_salary NUMBER DEFAULT 0) RETURN t_refcur;
---   243:26 word=p_emp_id prefix=p_em suggestions=[] total=0 line=FUNCTION pipe_sales (p_emp_id NUMBER DEFAULT NULL) RETURN qt_sale_obj_tab PIPELINED;
---   244:30 word=p_dept_id prefix=p_de suggestions=[] total=0 line=PROCEDURE complex_block (p_dept_id NUMBER, p_raise_pct NUMBER DEFAULT 1.5, p_mode VARCHAR2 DEFAULT 'DEEP');
---   244:48 word=p_raise_pct prefix=p_ra suggestions=[] total=0 line=PROCEDURE complex_block (p_dept_id NUMBER, p_raise_pct NUMBER DEFAULT 1.5, p_mode VARCHAR2 DEFAULT 'DEEP');
---   244:80 word=p_mode prefix=p_mo suggestions=[] total=0 line=PROCEDURE complex_block (p_dept_id NUMBER, p_raise_pct NUMBER DEFAULT 1.5, p_mode VARCHAR2 DEFAULT 'DEEP');
---   253:22 word=p_module prefix=p_mo suggestions=[] total=0 line=PROCEDURE AUDIT (p_module VARCHAR2, p_action VARCHAR2, p_detail CLOB) IS
---   253:41 word=p_action prefix=p_ac suggestions=[] total=0 line=PROCEDURE AUDIT (p_module VARCHAR2, p_action VARCHAR2, p_detail CLOB) IS
---   253:60 word=p_detail prefix=p_de suggestions=[] total=0 line=PROCEDURE AUDIT (p_module VARCHAR2, p_action VARCHAR2, p_detail CLOB) IS
---   268:18 word=base prefix=bas suggestions=[bas, qt_boss_audit_seq, qt_boss_pairs] total=3 line=WITH base AS (
---   338:23 word=cp_dept_id prefix=cp_d suggestions=[] total=0 line=CURSOR c_emp (cp_dept_id NUMBER) IS
---   355:24 word=i prefix=i suggestions=[IF, IN, INTERVAL, IS, INITCAP(), INSERTCHILDXML(), INSERTCHILDXMLAFTER(), INSERTCHILDXMLBEFORE(), INSERTXMLBEFORE(), INSTR(), id] total=11 line=FORALL i IN 1..l_ids.COUNT SAVE EXCEPTIONS
---   496:14 word=rn prefix=r suggestions=[] total=0 line=) AS rn
---   521:14 word=score_fn prefix=scor suggestions=[SYS_REFCURSOR] total=1 line=FUNCTION score_fn (p_salary NUMBER, p_bonus NUMBER) RETURN NUMBER IS
---   534:6 word=dept_tree prefix=dept suggestions=[] total=0 line=WITH dept_tree (dept_id, parent_dept_id, dept_name, lvl, path_txt) AS (
---   554:35 word=dfs_ord prefix=dfs_ suggestions=[] total=0 line=SEARCH DEPTH FIRST BY dept_id SET dfs_ord
---   555:19 word=is_cycle prefix=is_c suggestions=[is_c] total=1 line=CYCLE dept_id SET is_cycle TO 'Y' DEFAULT 'N'
---   573:45 word=full_path prefix=full suggestions=[] total=0 line=SYS_CONNECT_BY_PATH (dept_name, '/') AS full_path
---   636:18 word=rn prefix=r suggestions=[] total=0 line=) AS rn
---   704:21 word=amt prefix=am suggestions=[amount] total=1 line=SUM (amount) AS amt
---   720:5 word=metric_value prefix=metr suggestions=[metr, metric_name] total=2 line=metric_value
---   741:14 word=low prefix=lo suggestions=[LOCALTIMESTAMP, LOG(), LOWER(), lo, oqt_t_log, OQT_CLOB_FIX_T, oqt_run_log, oqt_seq_log, qt_employees, qt_audit_log, loc, login_name, log_id, log_ts, payload, has_semicolon] total=17 line=PATTERN (low + mid * high)
---   741:20 word=mid prefix=mi suggestions=[MIN, mi, has_semicolon, manager_id, mgr_emp_id] total=5 line=PATTERN (low + mid * high)
---   783:9 word=emp_id prefix=emp_ suggestions=[qt_emp_sales_v, qt_emp_summary_v, qt_boss_emp_v] total=3 line=emp_id NUMBER PATH '$.emp_id',
---   785:13 word=skill prefix=skil suggestions=[] total=0 line=skill VARCHAR2 (30) PATH '$'
---   800:28 word=emp_id prefix=emp_ suggestions=[qt_emp_sales_v, qt_emp_summary_v, qt_boss_emp_v] total=3 line=</root>') COLUMNS emp_id NUMBER PATH 'emp_id', tag VARCHAR2 (10) PATH 'tag') x
---   800:57 word=tag prefix=ta suggestions=[TAN(), TANH()] total=2 line=</root>') COLUMNS emp_id NUMBER PATH 'emp_id', tag VARCHAR2 (10) PATH 'tag') x
+-- missing tokens: none
 -- =========================================================

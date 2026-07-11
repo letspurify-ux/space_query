@@ -12,7 +12,7 @@
 --------------------------------------------------------------------------------
 -- UNIT 01 : 일반 SQL 종료는 세미콜론
 --------------------------------------------------------------------------------
-ALTER SESSION SET [[NLS_DATE_FORMAT]] = 'YYYY-MM-DD HH24:MI:SS';
+ALTER SESSION SET NLS_DATE_FORMAT = 'YYYY-MM-DD HH24:MI:SS';
 
 --------------------------------------------------------------------------------
 -- UNIT 02 : 익명 블록 + 동적 DROP + 문자열 안의 ; / BEGIN END
@@ -372,7 +372,7 @@ BEGIN END;
         v_audit_msg,
         SYSDATE
     );
-END [[qt_split_trg]];
+END qt_split_trg;
 /
 
 --------------------------------------------------------------------------------
@@ -380,7 +380,7 @@ END [[qt_split_trg]];
 --------------------------------------------------------------------------------
 CREATE OR REPLACE VIEW qt_split_v
 AS
-WITH [[base]] AS
+WITH base AS
 (
     SELECT
         u.user_id,
@@ -649,11 +649,8 @@ PROMPT END
 -- source: test/test22.sql
 -- db: Oracle
 -- metadata: test Oracle inferred catalog (file-scoped overlay) + Oracle built-ins
--- checked: 684
--- missing: 3
+-- checked: 651
+-- missing: 0
 -- marker: [[word]] means not suggested for the tested prefix
--- missing tokens:
---   15:19 word=NLS_DATE_FORMAT prefix=NLS_ suggestions=[] total=0 line=ALTER SESSION SET NLS_DATE_FORMAT = 'YYYY-MM-DD HH24:MI:SS';
---   375:5 word=qt_split_trg prefix=qt_s suggestions=[] total=0 line=END qt_split_trg;
---   383:6 word=base prefix=bas suggestions=[BASICFILE, bas, qt_boss_audit_seq, qt_boss_pairs] total=4 line=WITH base AS
+-- missing tokens: none
 -- =========================================================

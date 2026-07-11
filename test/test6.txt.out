@@ -226,7 +226,7 @@ CREATE OR REPLACE PACKAGE BODY oqt_mega_pkg AS
           v_flag := 'G0_'||f_expr_case(p_n);
           IF p_n BETWEEN 3 AND 7 THEN
             DECLARE
-              [[inner]] NUMBER := p_n * 11;
+              inner NUMBER := p_n * 11;
             BEGIN
               log_msg('RUN','inner0',v_depth+1,'inner='||inner||q'[ | inside: END; / ; ]');
             END;
@@ -264,7 +264,7 @@ CREATE OR REPLACE PACKAGE BODY oqt_mega_pkg AS
        q'[ |q-quote: END; / ; /* */ -- ]');
 
     -- SAVEPOINT + 예외 처리 분기
-    SAVEPOINT [[sp1]];
+    SAVEPOINT sp1;
     BEGIN
       -- 일부러 0으로 나누기 유발(조건부) -> 예외 테스트
       IF p_n = 0 THEN
@@ -405,10 +405,8 @@ PROMPT [DONE]
 -- source: test/test6.txt
 -- db: Oracle
 -- metadata: test Oracle inferred catalog (file-scoped overlay) + Oracle built-ins
--- checked: 757
--- missing: 2
+-- checked: 726
+-- missing: 0
 -- marker: [[word]] means not suggested for the tested prefix
--- missing tokens:
---   229:15 word=inner prefix=inne suggestions=[] total=0 line=inner NUMBER := p_n * 11;
---   267:15 word=sp1 prefix=sp suggestions=[] total=0 line=SAVEPOINT sp1;
+-- missing tokens: none
 -- =========================================================

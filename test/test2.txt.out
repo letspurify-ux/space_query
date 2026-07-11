@@ -113,7 +113,7 @@ CREATE OR REPLACE PACKAGE BODY oqt_pkg AS
   PROCEDURE p_raise(p_mode IN VARCHAR2) IS
   BEGIN
     IF p_mode = 'NO_DATA_FOUND' THEN
-      DECLARE [[v]] NUMBER;
+      DECLARE v NUMBER;
       BEGIN
         SELECT n1 INTO v FROM oqt_call_log WHERE id = -9999;
       END;
@@ -290,9 +290,8 @@ PROMPT === DONE ===
 -- source: test/test2.txt
 -- db: Oracle
 -- metadata: test Oracle inferred catalog (file-scoped overlay) + Oracle built-ins
--- checked: 449
--- missing: 1
+-- checked: 410
+-- missing: 0
 -- marker: [[word]] means not suggested for the tested prefix
--- missing tokens:
---   116:15 word=v prefix=v suggestions=[] total=0 line=DECLARE v NUMBER;
+-- missing tokens: none
 -- =========================================================

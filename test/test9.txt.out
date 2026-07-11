@@ -251,7 +251,7 @@ CREATE OR REPLACE PACKAGE BODY fmt_pkg_extreme AS
     -- main processor
     ----------------------------------------------------------------------------
     PROCEDURE validate_and_process (p_root_id IN NUMBER, p_mode IN VARCHAR2 DEFAULT 'NORMAL') IS
-        CURSOR c_units ([[cp_root_id]] NUMBER) IS
+        CURSOR c_units (cp_root_id NUMBER) IS
         SELECT id,
             parent_id,
             code,
@@ -284,7 +284,7 @@ CREATE OR REPLACE PACKAGE BODY fmt_pkg_extreme AS
                 RAISE e_bad_mode;
             END IF;
         END ensure_mode;
-        FUNCTION [[decorate_note]] (p_old IN VARCHAR2, p_score IN NUMBER, p_seq IN PLS_INTEGER) RETURN VARCHAR2 IS
+        FUNCTION decorate_note (p_old IN VARCHAR2, p_score IN NUMBER, p_seq IN PLS_INTEGER) RETURN VARCHAR2 IS
         BEGIN
             RETURN SUBSTR (NVL (p_old, '') ||
             CASE
@@ -297,11 +297,11 @@ quotes: 'single', "double", q'[inner]'
 purpose: formatter stress test
 ]~'                 || 'seq=' || p_seq || ', score=' || TO_CHAR (p_score, 'FM9999990.00') || CHR (10) || q'~[fmt-end]~', 1, 4000);
         END decorate_note;
-        PROCEDURE [[apply_one]] (p_row IN c_units%ROWTYPE, p_pos IN PLS_INTEGER) IS
+        PROCEDURE apply_one (p_row IN c_units%ROWTYPE, p_pos IN PLS_INTEGER) IS
             l_score NUMBER := 0;
             l_new_status VARCHAR2 (10);
         BEGIN
-            SAVEPOINT [[sp_apply_one]];
+            SAVEPOINT sp_apply_one;
             IF l_mode = 'STRICT'
                     AND p_row.qty IS NULL THEN
                 RAISE_APPLICATION_ERROR (- 20001, 'qty is required for id=' || p_row.id);
@@ -416,7 +416,7 @@ USING (
         IF l_mode <> 'DRYRUN'
                 AND l_ids.COUNT > 0 THEN
             BEGIN
-                FORALL [[i]] IN INDICES OF l_ids SAVE EXCEPTIONS
+                FORALL i IN INDICES OF l_ids SAVE EXCEPTIONS
                 UPDATE fmtx_unit
                 SET note = SUBSTR (NVL (note, '') ||
                         CASE
@@ -570,13 +570,8 @@ ORDER BY audit_id;
 -- source: test/test9.txt
 -- db: Oracle
 -- metadata: test Oracle inferred catalog (file-scoped overlay) + Oracle built-ins
--- checked: 947
--- missing: 5
+-- checked: 905
+-- missing: 0
 -- marker: [[word]] means not suggested for the tested prefix
--- missing tokens:
---   254:25 word=cp_root_id prefix=cp_r suggestions=[] total=0 line=CURSOR c_units (cp_root_id NUMBER) IS
---   287:18 word=decorate_note prefix=deco suggestions=[deco, DECODE, DECOMPOSE(), dept_code, direct_report_cnt] total=5 line=FUNCTION decorate_note (p_old IN VARCHAR2, p_score IN NUMBER, p_seq IN PLS_INTEGER) RETURN VARCHAR2 IS
---   300:19 word=apply_one prefix=appl suggestions=[appl] total=1 line=PROCEDURE apply_one (p_row IN c_units%ROWTYPE, p_pos IN PLS_INTEGER) IS
---   304:23 word=sp_apply_one prefix=sp_a suggestions=[] total=0 line=SAVEPOINT sp_apply_one;
---   419:24 word=i prefix=i suggestions=[IF, IN, INTERVAL, IS, INITCAP(), INSERTCHILDXML(), INSERTCHILDXMLAFTER(), INSERTCHILDXMLBEFORE(), INSERTXMLBEFORE(), INSTR(), id] total=11 line=FORALL i IN INDICES OF l_ids SAVE EXCEPTIONS
+-- missing tokens: none
 -- =========================================================

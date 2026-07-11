@@ -832,7 +832,7 @@ ORDER BY log_id;
 -- source: test_mysql/test2.txt
 -- db: MySQL
 -- metadata: test_mysql/test2.txt inferred catalog
--- checked: 725
+-- checked: 721
 -- missing: 0
 -- marker: [[word]] means not suggested for the tested prefix
 -- missing tokens: none

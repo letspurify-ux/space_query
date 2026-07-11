@@ -7183,7 +7183,11 @@ pub fn resolve_qualifier_tables(
         deepest.dedup_by(|left, right| {
             normalize_identifier_for_lookup(left) == normalize_identifier_for_lookup(right)
         });
-        (deepest.len() == 1).then_some(deepest).unwrap_or_default()
+        if deepest.len() == 1 {
+            deepest
+        } else {
+            Vec::new()
+        }
     }
 
     let qualifier_upper = normalize_identifier_for_lookup(qualifier);

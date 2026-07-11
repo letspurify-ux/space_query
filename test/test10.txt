@@ -362,7 +362,7 @@ CREATE OR REPLACE PACKAGE BODY qt_pkg_extreme IS
     END json_like_report;
 
     PROCEDURE load_bonus_sales (p_year NUMBER, p_debug BOOLEAN DEFAULT FALSE) IS
-        TYPE t_sales_src_rec IS RECORD (emp_id qt_emp.emp_id%TYPE, sale_dt DATE, amount NUMBER (12, 2), tax NUMBER (12, 2), 
+        TYPE t_sales_src_rec IS RECORD (emp_id qt_emp.emp_id%TYPE, sale_dt DATE, amount NUMBER (12, 2), tax NUMBER (12, 2),
         remark   VARCHAR2(4000)
         );
         TYPE t_sales_src_tab IS TABLE OF t_sales_src_rec;
