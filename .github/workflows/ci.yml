@@ -66,7 +66,7 @@ jobs:
           --all-targets -- -D warnings
 
       - name: Test main package
-        run: xvfb-run -a cargo test --locked
+        run: xvfb-run -a cargo test --locked -- --test-threads=1
 
       - name: Test Oracle Thin package
         run: cargo test --locked --manifest-path crates/tns-thin/Cargo.toml
