@@ -7,8 +7,8 @@ are maintained separately in `THIRD_PARTY_NOTICES.md`.
 
 ## Overview
 
-- Apache License 2.0 (208)
-- MIT License (46)
+- Apache License 2.0 (207)
+- MIT License (47)
 - Unicode License v3 (19)
 - BSD 3-Clause "New" or "Revised" License (2)
 - ISC License (1)
@@ -1530,7 +1530,7 @@ Used by:
 - foreign-types 0.3.2
 - native-tls 0.2.18
 - openssl-macros 0.1.1
-- openssl 0.10.76
+- openssl 0.10.81
 - toml_datetime 1.0.0+spec-1.1.0
 - toml_edit 0.25.4+spec-1.1.0
 - toml_parser 1.0.9+spec-1.1.0
@@ -1744,7 +1744,7 @@ Used by:
 ### Apache License 2.0
 
 Used by:
-- typenum 1.19.0
+- typenum 1.20.1
 
 ```
                               Apache License
@@ -3425,7 +3425,7 @@ limitations under the License.
 ### Apache License 2.0
 
 Used by:
-- arrayvec 0.7.6
+- arrayvec 0.7.8
 - autocfg 1.5.0
 - base64 0.21.7
 - base64 0.22.1
@@ -3433,21 +3433,21 @@ Used by:
 - btoi 0.4.3
 - bufstream 0.1.4
 - bumpalo 3.20.2
-- cc 1.2.57
+- cc 1.2.67
 - cexpr 0.6.0
 - cfg-if 1.0.4
-- cmake 0.1.57
+- cmake 0.1.58
 - core-foundation-sys 0.8.7
 - core-foundation 0.10.1
 - core-foundation 0.9.4
 - crossbeam-channel 0.5.15
-- crossbeam-deque 0.8.6
-- crossbeam-epoch 0.9.18
+- crossbeam-deque 0.8.7
+- crossbeam-epoch 0.9.20
 - crossbeam-queue 0.3.12
 - crossbeam-utils 0.8.21
 - dbus-secret-service 4.1.0
 - displaydoc 0.2.5
-- either 1.15.0
+- either 1.16.0
 - equivalent 1.0.2
 - errno 0.3.14
 - fastrand 2.3.0
@@ -3463,7 +3463,7 @@ Used by:
 - idna_adapter 1.2.1
 - indexmap 2.13.0
 - itertools 0.13.0
-- jobserver 0.1.34
+- jobserver 0.1.35
 - js-sys 0.3.91
 - lazy_static 1.5.0
 - libz-sys 1.1.28
@@ -4553,7 +4553,6 @@ APPENDIX: How to apply the Apache License to your work.
 
 Used by:
 - getrandom 0.2.17
-- getrandom 0.3.4
 - getrandom 0.4.2
 - rand_chacha 0.3.1
 
@@ -5811,31 +5810,31 @@ Used by:
 - ident_case 1.0.1
 - io-enum 1.2.1
 - itoa 1.0.17
-- libc 0.2.183
+- libc 0.2.186
 - miniz_oxide 0.8.9
 - mysql-common-derive 0.31.2
-- num-conv 0.2.1
+- num-conv 0.2.2
 - oracle_procmacro 0.1.2
 - paste 1.0.15
 - proc-macro2 1.0.106
-- quote 1.0.45
-- r-efi 5.3.0
+- quote 1.0.46
 - r-efi 6.0.0
 - rand 0.8.5
-- rustc-hash 2.1.2
+- rustc-hash 2.1.3
 - rustversion 1.0.22
 - serde 1.0.228
 - serde_core 1.0.228
 - serde_derive 1.0.228
-- serde_json 1.0.149
+- serde_json 1.0.150
 - shlex 1.3.0
-- syn 2.0.117
+- shlex 2.0.1
+- syn 2.0.118
 - thiserror-impl 1.0.69
 - thiserror-impl 2.0.18
 - thiserror 1.0.69
 - thiserror 2.0.18
-- time-core 0.1.8
-- time 0.3.47
+- time-core 0.1.9
+- time 0.3.53
 - unicode-ident 1.0.24
 - wasip2 1.0.2+wasi-0.2.9
 - wasip3 0.4.0+wasi-0.3.0-rc-2026-01-06
@@ -6375,7 +6374,7 @@ END OF TERMS AND CONDITIONS
 ### Apache License 2.0
 
 Used by:
-- chrono 0.4.44
+- chrono 0.4.45
 
 ```
 Rust-chrono is dual-licensed under The MIT License [1] and
@@ -6721,7 +6720,7 @@ THIS SOFTWARE.
 ### MIT License
 
 Used by:
-- openssl-sys 0.9.112
+- openssl-sys 0.9.117
 
 ```
 Copyright (c) 2014 Alex Crichton
@@ -6913,7 +6912,7 @@ SOFTWARE.
 ### MIT License
 
 Used by:
-- rust_decimal 1.41.0
+- rust_decimal 1.42.1
 
 ```
 MIT License
@@ -7008,7 +7007,7 @@ SOFTWARE.
 ### MIT License
 
 Used by:
-- bitvec 1.0.1
+- bitvec 1.1.1
 - wyz 0.5.1
 
 ```
@@ -7190,9 +7189,10 @@ SOFTWARE.
 
 Used by:
 - frunk_core 0.4.4
+- frunk_core 0.5.0
 - frunk_derives 0.4.4
-- frunk_proc_macro_helpers 0.1.4
-- frunk_proc_macros 0.1.4
+- frunk_proc_macro_helpers 0.1.5
+- frunk_proc_macros 0.1.5
 - libm 0.2.16
 
 ```
@@ -7250,8 +7250,8 @@ SOFTWARE.
 ### MIT License
 
 Used by:
-- fltk-sys 1.5.22
-- fltk 1.5.22
+- fltk-sys 1.5.23
+- fltk 1.5.23
 
 ```
 MIT License

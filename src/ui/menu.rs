@@ -88,7 +88,7 @@ fn build_about_dialog_content() -> String {
         "SPACE Query\n\
 Version {version}\n\
 \n\
-Desktop SQL client for Oracle and MySQL/MariaDB built with Rust and FLTK.\n\
+Desktop SQL client for Oracle® Database and MySQL/MariaDB built with Rust and FLTK.\n\
 \n\
 Highlights\n\
 - Multi-tab SQL editor with execution history and result/message tabs\n\
@@ -98,10 +98,13 @@ Highlights\n\
 - Saved connections, OS keyring password storage, and application log viewer\n\
 \n\
 Copyright (c) 2026 SPACE Query contributors\n\
-Licensed under MIT OR Apache-2.0\n\
+Original SPACE Query code: MIT OR Apache-2.0\n\
+Bundled tns-thin component: Apache-2.0\n\
+The included MIT license applies only to identified go-ora-derived material.\n\
 \n\
-Oracle and MySQL are trademarks of Oracle and/or its affiliates.\n\
-This project is not affiliated with or endorsed by Oracle.\n\
+Oracle, Java, MySQL, and NetSuite are registered trademarks of Oracle and/or its affiliates.\n\
+Other names may be trademarks of their respective owners.\n\
+This project is independent and is not affiliated with, endorsed by, or sponsored by Oracle.\n\
 \n\
 Third-Party Software\n\
 - TNS thin client: based on python-oracledb (Apache-2.0) and go-ora (MIT).\n\
@@ -611,6 +614,23 @@ mod tests {
         assert!(content.contains("SPACE Query is provided \"AS IS\", without warranties."));
         assert!(content.contains("Review SQL before execution, maintain backups"));
         assert!(content.contains("See DISCLAIMER.md for the full terms."));
+    }
+
+    #[test]
+    fn about_dialog_distinguishes_component_licenses_and_trademarks() {
+        let content = build_about_dialog_content();
+
+        assert!(content.contains("Original SPACE Query code: MIT OR Apache-2.0"));
+        assert!(content.contains("Bundled tns-thin component: Apache-2.0"));
+        assert!(content.contains(
+            "The included MIT license applies only to identified go-ora-derived material."
+        ));
+        assert!(content.contains(
+            "Oracle, Java, MySQL, and NetSuite are registered trademarks of Oracle and/or its affiliates."
+        ));
+        assert!(content.contains(
+            "This project is independent and is not affiliated with, endorsed by, or sponsored by Oracle."
+        ));
     }
 
     #[test]
