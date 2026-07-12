@@ -7,7 +7,7 @@ use space_query::{
         log_viewer::LogViewerDialog, profile_by_name, show_settings_dialog, theme,
         ConnectionDialog, IntellisensePopup, MainWindow, QueryHistoryDialog,
     },
-    utils::{logging, AppConfig},
+    utils::{arithmetic::safe_div, logging, AppConfig},
 };
 use std::{
     fs::File,
@@ -18,26 +18,35 @@ use std::{
 };
 
 fn pump(milliseconds: u64) {
-    for _ in 0..(milliseconds / 20).max(1) {
+    for _ in 0..safe_div(milliseconds, 20).max(1) {
         app::check();
         thread::sleep(Duration::from_millis(20));
     }
 }
 
+fn fail(message: impl std::fmt::Display) -> ! {
+    eprintln!("{message}");
+    std::process::exit(1);
+}
+
 fn capture_rgb<W: WindowExt>(window: &mut W) -> (Vec<u8>, i32, i32) {
     app::flush();
-    let image = draw::capture_window(window).expect("capture window");
+    let image =
+        draw::capture_window(window).unwrap_or_else(|err| fail(format!("capture window: {err}")));
     (image.to_rgb_data(), image.data_w(), image.data_h())
 }
 
 fn save_ppm(path: &str, data: &[u8], width: i32, height: i32) {
-    let mut file = File::create(path).expect("create capture");
-    write!(file, "P6\n{width} {height}\n255\n").expect("write PPM header");
-    file.write_all(data).expect("write PPM pixels");
+    let mut file = File::create(path).unwrap_or_else(|err| fail(format!("create capture: {err}")));
+    write!(file, "P6\n{width} {height}\n255\n")
+        .unwrap_or_else(|err| fail(format!("write PPM header: {err}")));
+    file.write_all(data)
+        .unwrap_or_else(|err| fail(format!("write PPM pixels: {err}")));
 }
 
 fn save_main(path: &str) {
-    let mut window = app::widget_from_id::<Window>("main_window").expect("main window");
+    let mut window =
+        app::widget_from_id::<Window>("main_window").unwrap_or_else(|| fail("main window"));
     window.hide();
     app::flush();
     window.show();
@@ -52,13 +61,16 @@ fn save_main(path: &str) {
 }
 
 fn save_main_part(path: &str, x: i32, y: i32, width: i32, height: i32) {
-    let mut window = app::widget_from_id::<Window>("main_window").expect("main window");
+    let mut window =
+        app::widget_from_id::<Window>("main_window").unwrap_or_else(|| fail("main window"));
     window.set_damage(true);
     window.redraw();
     app::redraw();
     pump(400);
     let (data, full_width, full_height) = capture_rgb(&mut window);
-    assert!(x >= 0 && y >= 0 && x + width <= full_width && y + height <= full_height);
+    if !(x >= 0 && y >= 0 && x + width <= full_width && y + height <= full_height) {
+        fail("capture rectangle is outside the main window");
+    }
     let mut cropped = vec![0_u8; (width * height * 3) as usize];
     for row in 0..height {
         let source = (((y + row) * full_width + x) * 3) as usize;
@@ -82,7 +94,7 @@ fn window_by_label(label: &str) -> Option<Window> {
 
 fn capture_active_dialog(expected_label: &str, path: &str) {
     let mut window = window_by_label(expected_label)
-        .unwrap_or_else(|| panic!("missing dialog: {expected_label}"));
+        .unwrap_or_else(|| fail(format!("missing dialog: {expected_label}")));
     let (data, width, height) = capture_rgb(&mut window);
     save_ppm(path, &data, width, height);
     window.hide();
@@ -138,11 +150,15 @@ fn make_result(columns: &[(&str, &str)], rows: &[&[&str]], sql: &str) -> QueryRe
 
 fn capture_intellisense(main_window: &mut MainWindow) {
     let sql = "SELECT e.empno,\n       e.ename,\n       e.\nFROM emp e\nWHERE e.sal > 2000;";
-    let cursor = sql.find("e.\nFROM").expect("completion cursor") as i32 + 2;
+    let cursor = sql
+        .find("e.\nFROM")
+        .unwrap_or_else(|| fail("completion cursor")) as i32
+        + 2;
     let editor = main_window.capture_tour_set_sql(sql, Some(cursor));
     pump(300);
 
-    let mut main = app::widget_from_id::<Window>("main_window").expect("main window");
+    let mut main =
+        app::widget_from_id::<Window>("main_window").unwrap_or_else(|| fail("main window"));
     let main_x = main.x_root();
     let main_y = main.y_root();
     main.set_damage(true);
@@ -157,7 +173,7 @@ fn capture_intellisense(main_window: &mut MainWindow) {
     let popup_width = 320;
     let popup_height = 8 * (16 + 6) + 10;
     let (cursor_x, cursor_y) = editor.position_to_xy(cursor);
-    let editor_window = editor.window().expect("editor window");
+    let editor_window = editor.window().unwrap_or_else(|| fail("editor window"));
     let win_x = editor_window.x_root();
     let win_y = editor_window.y_root();
     let max_x = (win_x + editor_window.w() - popup_width).max(win_x);
@@ -179,7 +195,7 @@ fn capture_intellisense(main_window: &mut MainWindow) {
         popup_y,
     );
     pump(300);
-    let mut popup_window = app::first_window().expect("intellisense popup");
+    let mut popup_window = app::first_window().unwrap_or_else(|| fail("intellisense popup"));
     let offset_x = popup_window.x_root() - main_x;
     let offset_y = popup_window.y_root() - main_y;
     let (popup_data, popup_width, popup_height) = capture_rgb(&mut popup_window);
@@ -249,7 +265,7 @@ fn capture_result_grid(main_window: &mut MainWindow) {
             make_result(&columns, rows, "SELECT * FROM EMP ORDER BY EMPNO"),
             false,
         )
-        .expect("show result");
+        .unwrap_or_else(|err| fail(format!("show result: {err}")));
     pump(350);
     save_main("/tmp/space-query-result-grid.ppm");
 }
@@ -308,7 +324,7 @@ fn capture_result_editing(main_window: &mut MainWindow) {
             ),
             true,
         )
-        .expect("show editable result");
+        .unwrap_or_else(|err| fail(format!("show editable result: {err}")));
     pump(350);
     save_main("/tmp/space-query-result-editing.ppm");
 }
@@ -366,7 +382,7 @@ fn capture_session_activity(main_window: &mut MainWindow) {
             make_result(&columns, rows, "SESSION ACTIVITY"),
             false,
         )
-        .expect("show session activity");
+        .unwrap_or_else(|err| fail(format!("show session activity: {err}")));
     pump(350);
     save_main("/tmp/space-query-session-activity.ppm");
 }
@@ -428,16 +444,17 @@ fn capture_dialogs(config: &AppConfig) {
 }
 
 fn main() {
-    let mut config = AppConfig::default();
-    config.editor_font = "D2Coding".to_string();
-    config.result_font = "D2Coding".to_string();
-    config.ui_font_size = 16;
-    config.editor_font_size = 16;
-    config.result_font_size = 16;
-    config.recent_connections.clear();
-    config.recent_sql_files.clear();
-    config.last_connection = None;
-    config.save().expect("save isolated capture config");
+    let config = AppConfig {
+        editor_font: "D2Coding".to_string(),
+        result_font: "D2Coding".to_string(),
+        ui_font_size: 16,
+        editor_font_size: 16,
+        result_font_size: 16,
+        ..AppConfig::default()
+    };
+    config
+        .save()
+        .unwrap_or_else(|err| fail(format!("save isolated capture config: {err}")));
 
     let _app = app::App::default()
         .with_scheme(app::Scheme::Gtk)

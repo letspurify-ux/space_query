@@ -1469,7 +1469,7 @@ impl ResultTableWidget {
         ))
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, not(target_os = "linux")))]
     fn extended_selection_bounds_to_edge(
         selection: (i32, i32, i32, i32),
         max_rows: usize,
@@ -5154,7 +5154,7 @@ impl ResultTableWidget {
         Ok(Self::sql_string_literal(input))
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, not(target_os = "linux")))]
     fn sql_literal_from_input(input: &str) -> Result<String, String> {
         Self::sql_literal_from_input_with_null_text(input, "NULL")
     }
