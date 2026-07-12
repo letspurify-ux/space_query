@@ -18,7 +18,7 @@ test = false
 [dependencies]
 fltk = { version = "1.5", features = ["no-pango"] }
 oracle = "0.6"
-mysql = "28"
+mysql = "25"
 tns_thin = { package = "tns-thin", path = "crates/tns-thin" }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
