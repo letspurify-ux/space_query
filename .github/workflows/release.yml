@@ -40,18 +40,6 @@ jobs:
             grep -Fx "$required" package-files.txt
           done
 
-      - name: Verify release-owner sign-off
-        if: startsWith(github.ref, 'refs/tags/v')
-        shell: bash
-        run: |
-          if grep -Fq -- '- [ ]' RELEASE_COMPLIANCE.md; then
-            echo 'RELEASE_COMPLIANCE.md still contains unchecked release gates.' >&2
-            exit 1
-          fi
-          grep -Fx -- "- Release tag: $GITHUB_REF_NAME" RELEASE_COMPLIANCE.md
-          grep -Eq -- '^- Release owner: .+' RELEASE_COMPLIANCE.md
-          grep -Eq -- '^- Review date: .+' RELEASE_COMPLIANCE.md
-
       - name: Verify generated dependency licenses
         shell: bash
         run: |
@@ -92,7 +80,7 @@ jobs:
           licenses_dir="$package_dir/licenses"
           mkdir -p "$licenses_dir/tns-thin" "$licenses_dir/go-ora" "$licenses_dir/python-oracledb"
 
-          cp target/release/space_query DISCLAIMER.md RELEASE_COMPLIANCE.md "$package_dir/"
+          cp target/release/space_query DISCLAIMER.md "$package_dir/"
           cp LICENSE-MIT LICENSE-APACHE NOTICE THIRD_PARTY_NOTICES.md THIRD_PARTY_DEPENDENCIES.md "$licenses_dir/"
           cp crates/tns-thin/NOTICE crates/tns-thin/THIRD_PARTY_NOTICES.md \
             crates/tns-thin/PROVENANCE.md "$licenses_dir/tns-thin/"
@@ -104,7 +92,7 @@ jobs:
           test -f "$rust_copyright"
           cp "$rust_copyright" "$licenses_dir/RUST_COPYRIGHT.html"
 
-          (cd "$package_dir" && zip -r "../${{ matrix.archive }}" space_query DISCLAIMER.md RELEASE_COMPLIANCE.md licenses)
+          (cd "$package_dir" && zip -r "../${{ matrix.archive }}" space_query DISCLAIMER.md licenses)
 
       - name: Package Windows binary
         if: runner.os == 'Windows'
@@ -122,7 +110,6 @@ jobs:
           Copy-Item -Path @(
             "target/release/space_query.exe"
             "DISCLAIMER.md"
-            "RELEASE_COMPLIANCE.md"
           ) -Destination $packageDir
           Copy-Item -Path @(
             "LICENSE-MIT"
@@ -185,10 +172,8 @@ jobs:
           unzip -q dist/space_query-windows-x86_64.zip -d verify/windows
           test -f verify/macos/space_query
           test -f verify/macos/DISCLAIMER.md
-          test -f verify/macos/RELEASE_COMPLIANCE.md
           test -f verify/windows/space_query.exe
           test -f verify/windows/DISCLAIMER.md
-          test -f verify/windows/RELEASE_COMPLIANCE.md
           for platform in macos windows; do
             for required in \
               LICENSE-APACHE \

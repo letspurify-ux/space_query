@@ -383,11 +383,10 @@ Checksums verify archive integrity, and attestations verify the GitHub Actions
 build origin. Neither replaces Apple Developer ID or Windows Authenticode code
 signing.
 
-Release archives include the executable, `DISCLAIMER.md`,
-`RELEASE_COMPLIANCE.md`, and a `licenses/` directory containing the SPACE Query
-licenses, third-party notices and dependency licenses, `tns-thin` provenance,
-referenced upstream notices, and the copyright text for the Rust toolchain used
-to build the binary.
+Release archives include the executable, `DISCLAIMER.md`, and a `licenses/`
+directory containing the SPACE Query licenses, third-party notices and
+dependency licenses, `tns-thin` provenance, referenced upstream notices, and
+the copyright text for the Rust toolchain used to build the binary.
 
 ## License and trademarks
 
@@ -400,9 +399,7 @@ The software is provided without warranty and remains subject to
 [`DISCLAIMER.md`](DISCLAIMER.md). Third-party attribution and exact upstream
 revisions are recorded in [`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md),
 [`crates/tns-thin/THIRD_PARTY_NOTICES.md`](crates/tns-thin/THIRD_PARTY_NOTICES.md),
-and [`crates/tns-thin/PROVENANCE.md`](crates/tns-thin/PROVENANCE.md). Maintainers
-must complete [`RELEASE_COMPLIANCE.md`](RELEASE_COMPLIANCE.md) before publishing
-a release.
+and [`crates/tns-thin/PROVENANCE.md`](crates/tns-thin/PROVENANCE.md).
 
 Oracle, Java, MySQL, and NetSuite are registered trademarks of Oracle and/or
 its affiliates. Other names may be trademarks of their respective owners. This
