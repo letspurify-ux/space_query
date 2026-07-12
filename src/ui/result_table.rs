@@ -9451,8 +9451,8 @@ mod row_edit_sql_tests {
 
     #[test]
     #[cfg_attr(
-        target_os = "macos",
-        ignore = "FLTK widget tests require the process main thread on macOS"
+        any(target_os = "macos", target_os = "linux"),
+        ignore = "FLTK widget tests require a native UI test environment"
     )]
     fn set_null_text_updates_case_variant_explicit_null_cells() {
         let mut widget = ResultTableWidget::new();
@@ -9503,8 +9503,8 @@ mod row_edit_sql_tests {
 
     #[test]
     #[cfg_attr(
-        target_os = "macos",
-        ignore = "FLTK widget tests require the process main thread on macOS"
+        any(target_os = "macos", target_os = "linux"),
+        ignore = "FLTK widget tests require a native UI test environment"
     )]
     fn set_null_text_updates_original_db_null_cells() {
         let mut widget = ResultTableWidget::new();
@@ -10168,8 +10168,8 @@ mod row_edit_sql_tests {
 
     #[test]
     #[cfg_attr(
-        target_os = "macos",
-        ignore = "FLTK widget tests require the process main thread on macOS"
+        any(target_os = "macos", target_os = "linux"),
+        ignore = "FLTK widget tests require a native UI test environment"
     )]
     fn display_result_keeps_staged_edits_when_save_request_fails() {
         let mut widget = ResultTableWidget::new();
@@ -10231,8 +10231,8 @@ UPDATE EMP SET ENAME = 'X' WHERE ROWID = 'AAABBB';"
 
     #[test]
     #[cfg_attr(
-        target_os = "macos",
-        ignore = "FLTK widget tests require the process main thread on macOS"
+        any(target_os = "macos", target_os = "linux"),
+        ignore = "FLTK widget tests require a native UI test environment"
     )]
     fn display_result_restores_backup_when_matching_save_fails_without_live_session() {
         let mut widget = ResultTableWidget::new();
@@ -10326,8 +10326,8 @@ UPDATE EMP SET ENAME = 'MILLER' WHERE ROWID = 'AAABBB';"
 
     #[test]
     #[cfg_attr(
-        target_os = "macos",
-        ignore = "FLTK widget tests require the process main thread on macOS"
+        any(target_os = "macos", target_os = "linux"),
+        ignore = "FLTK widget tests require a native UI test environment"
     )]
     fn display_result_keeps_grid_rows_after_matching_save_success() {
         let mut widget = ResultTableWidget::new();
@@ -10421,8 +10421,8 @@ UPDATE EMP SET ENAME = 'MILLER' WHERE ROWID = 'AAABBB';"
 
     #[test]
     #[cfg_attr(
-        target_os = "macos",
-        ignore = "FLTK widget tests require the process main thread on macOS"
+        any(target_os = "macos", target_os = "linux"),
+        ignore = "FLTK widget tests require a native UI test environment"
     )]
     fn display_result_keeps_save_pending_for_non_matching_failure() {
         let mut widget = ResultTableWidget::new();
@@ -10490,8 +10490,8 @@ UPDATE EMP SET ENAME = 'MILLER' WHERE ROWID = 'AAABBB';"
 
     #[test]
     #[cfg_attr(
-        target_os = "macos",
-        ignore = "FLTK widget tests require the process main thread on macOS"
+        any(target_os = "macos", target_os = "linux"),
+        ignore = "FLTK widget tests require a native UI test environment"
     )]
     fn display_result_clears_save_pending_for_terminal_failure_with_empty_sql() {
         let mut widget = ResultTableWidget::new();
@@ -10561,8 +10561,8 @@ UPDATE EMP SET ENAME = 'MILLER' WHERE ROWID = 'AAABBB';"
 
     #[test]
     #[cfg_attr(
-        target_os = "macos",
-        ignore = "FLTK widget tests require the process main thread on macOS"
+        any(target_os = "macos", target_os = "linux"),
+        ignore = "FLTK widget tests require a native UI test environment"
     )]
     fn display_result_clears_save_pending_for_terminal_success_with_empty_sql() {
         let mut widget = ResultTableWidget::new();
@@ -10661,8 +10661,8 @@ UPDATE EMP SET ENAME = 'MILLER' WHERE ROWID = 'AAABBB';"
 
     #[test]
     #[cfg_attr(
-        target_os = "macos",
-        ignore = "FLTK widget tests require the process main thread on macOS"
+        any(target_os = "macos", target_os = "linux"),
+        ignore = "FLTK widget tests require a native UI test environment"
     )]
     fn display_result_clears_save_pending_when_request_tag_is_only_in_message() {
         let mut widget = ResultTableWidget::new();
@@ -10732,8 +10732,8 @@ UPDATE EMP SET ENAME = 'MILLER' WHERE ROWID = 'AAABBB';"
 
     #[test]
     #[cfg_attr(
-        target_os = "macos",
-        ignore = "FLTK widget tests require the process main thread on macOS"
+        any(target_os = "macos", target_os = "linux"),
+        ignore = "FLTK widget tests require a native UI test environment"
     )]
     fn display_result_clears_save_pending_when_statement_signature_matches() {
         let mut widget = ResultTableWidget::new();
@@ -10804,8 +10804,8 @@ UPDATE EMP SET ENAME = 'MILLER' WHERE ROWID = 'AAABBB';"
 
     #[test]
     #[cfg_attr(
-        target_os = "macos",
-        ignore = "FLTK widget tests require the process main thread on macOS"
+        any(target_os = "macos", target_os = "linux"),
+        ignore = "FLTK widget tests require a native UI test environment"
     )]
     fn display_result_ignores_non_matching_result_while_save_is_pending() {
         let mut widget = ResultTableWidget::new();
@@ -10887,8 +10887,8 @@ UPDATE EMP SET ENAME = 'MILLER' WHERE ROWID = 'AAABBB';"
 
     #[test]
     #[cfg_attr(
-        target_os = "macos",
-        ignore = "FLTK widget tests require the process main thread on macOS"
+        any(target_os = "macos", target_os = "linux"),
+        ignore = "FLTK widget tests require a native UI test environment"
     )]
     fn display_result_keeps_staged_edits_when_non_save_query_fails() {
         let mut widget = ResultTableWidget::new();
@@ -10954,8 +10954,8 @@ UPDATE EMP SET ENAME = 'MILLER' WHERE ROWID = 'AAABBB';"
 
     #[test]
     #[cfg_attr(
-        target_os = "macos",
-        ignore = "FLTK widget tests require the process main thread on macOS"
+        any(target_os = "macos", target_os = "linux"),
+        ignore = "FLTK widget tests require a native UI test environment"
     )]
     fn display_result_keeps_staged_edits_when_non_save_non_select_query_succeeds() {
         let mut widget = ResultTableWidget::new();
@@ -11034,8 +11034,8 @@ UPDATE EMP SET ENAME = 'MILLER' WHERE ROWID = 'AAABBB';"
 
     #[test]
     #[cfg_attr(
-        target_os = "macos",
-        ignore = "FLTK widget tests require the process main thread on macOS"
+        any(target_os = "macos", target_os = "linux"),
+        ignore = "FLTK widget tests require a native UI test environment"
     )]
     fn display_result_restores_staged_edits_after_select_failure_during_streaming() {
         let mut widget = ResultTableWidget::new();
@@ -11131,8 +11131,8 @@ UPDATE EMP SET ENAME = 'MILLER' WHERE ROWID = 'AAABBB';"
 
     #[test]
     #[cfg_attr(
-        target_os = "macos",
-        ignore = "FLTK widget tests require the process main thread on macOS"
+        any(target_os = "macos", target_os = "linux"),
+        ignore = "FLTK widget tests require a native UI test environment"
     )]
     fn commit_active_inline_edit_ignores_stale_editor_when_edit_mode_is_inactive() {
         let widget = ResultTableWidget::new();
@@ -11177,8 +11177,8 @@ UPDATE EMP SET ENAME = 'MILLER' WHERE ROWID = 'AAABBB';"
 
     #[test]
     #[cfg_attr(
-        target_os = "macos",
-        ignore = "FLTK widget tests require the process main thread on macOS"
+        any(target_os = "macos", target_os = "linux"),
+        ignore = "FLTK widget tests require a native UI test environment"
     )]
     fn clear_orphaned_query_edit_backup_recovers_select_start_interruption() {
         let mut widget = ResultTableWidget::new();
@@ -11234,8 +11234,8 @@ UPDATE EMP SET ENAME = 'MILLER' WHERE ROWID = 'AAABBB';"
 
     #[test]
     #[cfg_attr(
-        target_os = "macos",
-        ignore = "FLTK widget tests require the process main thread on macOS"
+        any(target_os = "macos", target_os = "linux"),
+        ignore = "FLTK widget tests require a native UI test environment"
     )]
     fn clear_orphaned_query_edit_backup_does_not_override_active_edit_session() {
         let mut widget = ResultTableWidget::new();
@@ -11317,8 +11317,8 @@ UPDATE EMP SET ENAME = 'MILLER' WHERE ROWID = 'AAABBB';"
 
     #[test]
     #[cfg_attr(
-        target_os = "macos",
-        ignore = "FLTK widget tests require the process main thread on macOS"
+        any(target_os = "macos", target_os = "linux"),
+        ignore = "FLTK widget tests require a native UI test environment"
     )]
     fn clear_orphaned_save_request_recovers_interrupted_save_state() {
         let mut widget = ResultTableWidget::new();
@@ -11365,8 +11365,8 @@ UPDATE EMP SET ENAME = 'MILLER' WHERE ROWID = 'AAABBB';"
 
     #[test]
     #[cfg_attr(
-        target_os = "macos",
-        ignore = "FLTK widget tests require the process main thread on macOS"
+        any(target_os = "macos", target_os = "linux"),
+        ignore = "FLTK widget tests require a native UI test environment"
     )]
     fn save_edit_mode_executes_only_dml_without_replaying_source_select() {
         let mut widget = ResultTableWidget::new();
@@ -11440,8 +11440,8 @@ UPDATE EMP SET ENAME = 'MILLER' WHERE ROWID = 'AAABBB';"
 
     #[test]
     #[cfg_attr(
-        target_os = "macos",
-        ignore = "FLTK widget tests require the process main thread on macOS"
+        any(target_os = "macos", target_os = "linux"),
+        ignore = "FLTK widget tests require a native UI test environment"
     )]
     #[cfg_attr(
         target_os = "linux",
@@ -11521,8 +11521,8 @@ UPDATE EMP SET ENAME = 'MILLER' WHERE ROWID = 'AAABBB';"
 
     #[test]
     #[cfg_attr(
-        target_os = "macos",
-        ignore = "FLTK widget tests require the process main thread on macOS"
+        any(target_os = "macos", target_os = "linux"),
+        ignore = "FLTK widget tests require a native UI test environment"
     )]
     #[cfg_attr(
         target_os = "linux",
@@ -11734,8 +11734,8 @@ UPDATE EMP SET ENAME = 'MILLER' WHERE ROWID = 'AAABBB';"
 
     #[test]
     #[cfg_attr(
-        target_os = "macos",
-        ignore = "FLTK widget tests require the process main thread on macOS"
+        any(target_os = "macos", target_os = "linux"),
+        ignore = "FLTK widget tests require a native UI test environment"
     )]
     fn start_streaming_keeps_existing_rows_while_save_is_pending() {
         let mut widget = ResultTableWidget::new();
@@ -11765,8 +11765,8 @@ UPDATE EMP SET ENAME = 'MILLER' WHERE ROWID = 'AAABBB';"
 
     #[test]
     #[cfg_attr(
-        target_os = "macos",
-        ignore = "FLTK widget tests require the process main thread on macOS"
+        any(target_os = "macos", target_os = "linux"),
+        ignore = "FLTK widget tests require a native UI test environment"
     )]
     fn start_streaming_commits_active_inline_edit_while_save_is_pending() {
         let mut widget = ResultTableWidget::new();
@@ -11830,8 +11830,8 @@ UPDATE EMP SET ENAME = 'MILLER' WHERE ROWID = 'AAABBB';"
 
     #[test]
     #[cfg_attr(
-        target_os = "macos",
-        ignore = "FLTK widget tests require the process main thread on macOS"
+        any(target_os = "macos", target_os = "linux"),
+        ignore = "FLTK widget tests require a native UI test environment"
     )]
     fn start_streaming_backup_captures_inline_edit_null_flags() {
         let mut widget = ResultTableWidget::new();
@@ -11929,8 +11929,8 @@ UPDATE EMP SET ENAME = 'MILLER' WHERE ROWID = 'AAABBB';"
 
     #[test]
     #[cfg_attr(
-        target_os = "macos",
-        ignore = "FLTK widget tests require the process main thread on macOS"
+        any(target_os = "macos", target_os = "linux"),
+        ignore = "FLTK widget tests require a native UI test environment"
     )]
     fn display_result_keeps_streamed_rows_when_select_is_cancelled() {
         let mut widget = ResultTableWidget::new();
@@ -11972,8 +11972,8 @@ UPDATE EMP SET ENAME = 'MILLER' WHERE ROWID = 'AAABBB';"
 
     #[test]
     #[cfg_attr(
-        target_os = "macos",
-        ignore = "FLTK widget tests require the process main thread on macOS"
+        any(target_os = "macos", target_os = "linux"),
+        ignore = "FLTK widget tests require a native UI test environment"
     )]
     fn streamed_rows_keep_font_height_without_post_render_metric_pass() {
         let mut widget = ResultTableWidget::new();
@@ -12007,8 +12007,8 @@ UPDATE EMP SET ENAME = 'MILLER' WHERE ROWID = 'AAABBB';"
 
     #[test]
     #[cfg_attr(
-        target_os = "macos",
-        ignore = "FLTK widget tests require the process main thread on macOS"
+        any(target_os = "macos", target_os = "linux"),
+        ignore = "FLTK widget tests require a native UI test environment"
     )]
     fn append_rows_applies_widths_when_batch_reaches_sample_limit() {
         let mut widget = ResultTableWidget::new();
@@ -12035,8 +12035,8 @@ UPDATE EMP SET ENAME = 'MILLER' WHERE ROWID = 'AAABBB';"
 
     #[test]
     #[cfg_attr(
-        target_os = "macos",
-        ignore = "FLTK widget tests require the process main thread on macOS"
+        any(target_os = "macos", target_os = "linux"),
+        ignore = "FLTK widget tests require a native UI test environment"
     )]
     fn append_rows_applies_widths_for_first_small_lazy_batch() {
         let mut widget = ResultTableWidget::new();
@@ -12058,8 +12058,8 @@ UPDATE EMP SET ENAME = 'MILLER' WHERE ROWID = 'AAABBB';"
 
     #[test]
     #[cfg_attr(
-        target_os = "macos",
-        ignore = "FLTK widget tests require the process main thread on macOS"
+        any(target_os = "macos", target_os = "linux"),
+        ignore = "FLTK widget tests require a native UI test environment"
     )]
     fn font_change_does_not_retouch_existing_rows_but_updates_new_rows() {
         let mut widget = ResultTableWidget::new();
@@ -12086,8 +12086,8 @@ UPDATE EMP SET ENAME = 'MILLER' WHERE ROWID = 'AAABBB';"
 
     #[test]
     #[cfg_attr(
-        target_os = "macos",
-        ignore = "FLTK widget tests require the process main thread on macOS"
+        any(target_os = "macos", target_os = "linux"),
+        ignore = "FLTK widget tests require a native UI test environment"
     )]
     fn start_streaming_without_edit_session_clears_stale_backup_before_failure_result() {
         let mut widget = ResultTableWidget::new();
@@ -12158,8 +12158,8 @@ UPDATE EMP SET ENAME = 'MILLER' WHERE ROWID = 'AAABBB';"
 
     #[test]
     #[cfg_attr(
-        target_os = "macos",
-        ignore = "FLTK widget tests require the process main thread on macOS"
+        any(target_os = "macos", target_os = "linux"),
+        ignore = "FLTK widget tests require a native UI test environment"
     )]
     fn save_edit_mode_returns_error_when_save_is_already_pending() {
         let mut widget = ResultTableWidget::new();
@@ -12187,8 +12187,8 @@ UPDATE EMP SET ENAME = 'MILLER' WHERE ROWID = 'AAABBB';"
 
     #[test]
     #[cfg_attr(
-        target_os = "macos",
-        ignore = "FLTK widget tests require the process main thread on macOS"
+        any(target_os = "macos", target_os = "linux"),
+        ignore = "FLTK widget tests require a native UI test environment"
     )]
     fn insert_and_delete_are_blocked_while_save_is_pending() {
         let mut widget = ResultTableWidget::new();
@@ -12227,8 +12227,8 @@ UPDATE EMP SET ENAME = 'MILLER' WHERE ROWID = 'AAABBB';"
 
     #[test]
     #[cfg_attr(
-        target_os = "macos",
-        ignore = "FLTK widget tests require the process main thread on macOS"
+        any(target_os = "macos", target_os = "linux"),
+        ignore = "FLTK widget tests require a native UI test environment"
     )]
     fn insert_and_delete_are_blocked_while_streaming_is_in_progress() {
         let mut widget = ResultTableWidget::new();
@@ -12264,8 +12264,8 @@ UPDATE EMP SET ENAME = 'MILLER' WHERE ROWID = 'AAABBB';"
 
     #[test]
     #[cfg_attr(
-        target_os = "macos",
-        ignore = "FLTK widget tests require the process main thread on macOS"
+        any(target_os = "macos", target_os = "linux"),
+        ignore = "FLTK widget tests require a native UI test environment"
     )]
     fn save_edit_mode_returns_error_while_streaming_is_in_progress() {
         let mut widget = ResultTableWidget::new();
@@ -12293,8 +12293,8 @@ UPDATE EMP SET ENAME = 'MILLER' WHERE ROWID = 'AAABBB';"
 
     #[test]
     #[cfg_attr(
-        target_os = "macos",
-        ignore = "FLTK widget tests require the process main thread on macOS"
+        any(target_os = "macos", target_os = "linux"),
+        ignore = "FLTK widget tests require a native UI test environment"
     )]
     fn delete_selected_rows_returns_error_when_selection_has_no_staged_rows() {
         let mut widget = ResultTableWidget::new();
@@ -12323,8 +12323,8 @@ UPDATE EMP SET ENAME = 'MILLER' WHERE ROWID = 'AAABBB';"
 
     #[test]
     #[cfg_attr(
-        target_os = "macos",
-        ignore = "FLTK widget tests require the process main thread on macOS"
+        any(target_os = "macos", target_os = "linux"),
+        ignore = "FLTK widget tests require a native UI test environment"
     )]
     fn delete_selected_rows_returns_error_when_selection_is_outside_staged_rows() {
         let mut widget = ResultTableWidget::new();
@@ -12362,8 +12362,8 @@ UPDATE EMP SET ENAME = 'MILLER' WHERE ROWID = 'AAABBB';"
 
     #[test]
     #[cfg_attr(
-        target_os = "macos",
-        ignore = "FLTK widget tests require the process main thread on macOS"
+        any(target_os = "macos", target_os = "linux"),
+        ignore = "FLTK widget tests require a native UI test environment"
     )]
     fn set_null_commits_active_inline_edit_before_applying_selection() {
         let mut widget = ResultTableWidget::new();
@@ -12437,8 +12437,8 @@ UPDATE EMP SET ENAME = 'MILLER' WHERE ROWID = 'AAABBB';"
 
     #[test]
     #[cfg_attr(
-        target_os = "macos",
-        ignore = "FLTK widget tests require the process main thread on macOS"
+        any(target_os = "macos", target_os = "linux"),
+        ignore = "FLTK widget tests require a native UI test environment"
     )]
     fn set_null_returns_edit_mode_error_when_session_is_missing() {
         let mut widget = ResultTableWidget::new();
@@ -12464,8 +12464,8 @@ UPDATE EMP SET ENAME = 'MILLER' WHERE ROWID = 'AAABBB';"
 
     #[test]
     #[cfg_attr(
-        target_os = "macos",
-        ignore = "FLTK widget tests require the process main thread on macOS"
+        any(target_os = "macos", target_os = "linux"),
+        ignore = "FLTK widget tests require a native UI test environment"
     )]
     fn set_null_returns_error_when_no_staged_rows_exist() {
         let mut widget = ResultTableWidget::new();
@@ -12502,8 +12502,8 @@ UPDATE EMP SET ENAME = 'MILLER' WHERE ROWID = 'AAABBB';"
 
     #[test]
     #[cfg_attr(
-        target_os = "macos",
-        ignore = "FLTK widget tests require the process main thread on macOS"
+        any(target_os = "macos", target_os = "linux"),
+        ignore = "FLTK widget tests require a native UI test environment"
     )]
     fn cancel_edit_mode_returns_error_while_save_is_pending() {
         let mut widget = ResultTableWidget::new();
@@ -12539,8 +12539,8 @@ UPDATE EMP SET ENAME = 'MILLER' WHERE ROWID = 'AAABBB';"
 
     #[test]
     #[cfg_attr(
-        target_os = "macos",
-        ignore = "FLTK widget tests require the process main thread on macOS"
+        any(target_os = "macos", target_os = "linux"),
+        ignore = "FLTK widget tests require a native UI test environment"
     )]
     fn cancel_edit_mode_returns_error_while_streaming_is_in_progress() {
         let mut widget = ResultTableWidget::new();
@@ -12573,8 +12573,8 @@ UPDATE EMP SET ENAME = 'MILLER' WHERE ROWID = 'AAABBB';"
 
     #[test]
     #[cfg_attr(
-        target_os = "macos",
-        ignore = "FLTK widget tests require the process main thread on macOS"
+        any(target_os = "macos", target_os = "linux"),
+        ignore = "FLTK widget tests require a native UI test environment"
     )]
     fn cancel_edit_mode_clears_stale_query_edit_backup() {
         let mut widget = ResultTableWidget::new();
@@ -12615,8 +12615,8 @@ UPDATE EMP SET ENAME = 'MILLER' WHERE ROWID = 'AAABBB';"
 
     #[test]
     #[cfg_attr(
-        target_os = "macos",
-        ignore = "FLTK widget tests require the process main thread on macOS"
+        any(target_os = "macos", target_os = "linux"),
+        ignore = "FLTK widget tests require a native UI test environment"
     )]
     fn cancel_edit_mode_error_without_session_keeps_existing_query_edit_backup() {
         let mut widget = ResultTableWidget::new();
@@ -12677,8 +12677,8 @@ UPDATE EMP SET ENAME = 'MILLER' WHERE ROWID = 'AAABBB';"
 
     #[test]
     #[cfg_attr(
-        target_os = "macos",
-        ignore = "FLTK widget tests require the process main thread on macOS"
+        any(target_os = "macos", target_os = "linux"),
+        ignore = "FLTK widget tests require a native UI test environment"
     )]
     fn paste_returns_error_when_no_staged_rows_exist() {
         let mut widget = ResultTableWidget::new();
@@ -12716,8 +12716,8 @@ UPDATE EMP SET ENAME = 'MILLER' WHERE ROWID = 'AAABBB';"
 
     #[test]
     #[cfg_attr(
-        target_os = "macos",
-        ignore = "FLTK widget tests require the process main thread on macOS"
+        any(target_os = "macos", target_os = "linux"),
+        ignore = "FLTK widget tests require a native UI test environment"
     )]
     fn clear_resets_pending_save_request_tag() {
         let mut widget = ResultTableWidget::new();
@@ -13015,8 +13015,8 @@ mod tests {
 
     #[test]
     #[cfg_attr(
-        target_os = "macos",
-        ignore = "FLTK widget tests require the process main thread on macOS"
+        any(target_os = "macos", target_os = "linux"),
+        ignore = "FLTK widget tests require a native UI test environment"
     )]
     fn scrollbar_sequence_rearms_when_in_flight_suppresses_request() {
         let mut widget = ResultTableWidget::new();
@@ -13070,8 +13070,8 @@ mod tests {
 
     #[test]
     #[cfg_attr(
-        target_os = "macos",
-        ignore = "FLTK widget tests require the process main thread on macOS"
+        any(target_os = "macos", target_os = "linux"),
+        ignore = "FLTK widget tests require a native UI test environment"
     )]
     fn append_rows_continues_lazy_fetch_when_appended_view_stays_near_bottom() {
         let mut widget = ResultTableWidget::new();
@@ -13120,8 +13120,8 @@ mod tests {
 
     #[test]
     #[cfg_attr(
-        target_os = "macos",
-        ignore = "FLTK widget tests require the process main thread on macOS"
+        any(target_os = "macos", target_os = "linux"),
+        ignore = "FLTK widget tests require a native UI test environment"
     )]
     fn append_rows_stops_lazy_fetch_when_appended_view_drops_below_threshold() {
         let mut widget = ResultTableWidget::new();
@@ -13171,8 +13171,8 @@ mod tests {
 
     #[test]
     #[cfg_attr(
-        target_os = "macos",
-        ignore = "FLTK widget tests require the process main thread on macOS"
+        any(target_os = "macos", target_os = "linux"),
+        ignore = "FLTK widget tests require a native UI test environment"
     )]
     fn append_rows_below_threshold_rearms_scrollbar_sequence() {
         let mut widget = ResultTableWidget::new();
@@ -13213,8 +13213,8 @@ mod tests {
 
     #[test]
     #[cfg_attr(
-        target_os = "macos",
-        ignore = "FLTK widget tests require the process main thread on macOS"
+        any(target_os = "macos", target_os = "linux"),
+        ignore = "FLTK widget tests require a native UI test environment"
     )]
     fn lazy_fetch_finish_keeps_pending_export_until_close() {
         let mut widget = ResultTableWidget::new();
@@ -13294,8 +13294,8 @@ mod tests {
 
     #[test]
     #[cfg_attr(
-        target_os = "macos",
-        ignore = "FLTK widget tests require the process main thread on macOS"
+        any(target_os = "macos", target_os = "linux"),
+        ignore = "FLTK widget tests require a native UI test environment"
     )]
     fn lazy_fetch_copy_does_not_request_fetch_all() {
         let mut widget = ResultTableWidget::new();
@@ -13337,8 +13337,8 @@ mod tests {
 
     #[test]
     #[cfg_attr(
-        target_os = "macos",
-        ignore = "FLTK widget tests require the process main thread on macOS"
+        any(target_os = "macos", target_os = "linux"),
+        ignore = "FLTK widget tests require a native UI test environment"
     )]
     fn lazy_fetch_abort_drops_pending_export_action() {
         let mut widget = ResultTableWidget::new();
@@ -13938,12 +13938,8 @@ mod tests {
 
     #[test]
     #[cfg_attr(
-        target_os = "macos",
-        ignore = "FLTK widget tests require the process main thread on macOS"
-    )]
-    #[cfg_attr(
-        target_os = "linux",
-        ignore = "FLTK widget lifecycle requires UI-thread-bound integration harness"
+        any(target_os = "macos", target_os = "linux"),
+        ignore = "FLTK widget tests require a native UI test environment"
     )]
     fn clear_orphaned_save_request_also_clears_pending_stream_buffers() {
         let mut widget = ResultTableWidget::new();
@@ -13979,12 +13975,8 @@ mod tests {
 
     #[test]
     #[cfg_attr(
-        target_os = "macos",
-        ignore = "FLTK widget tests require the process main thread on macOS"
-    )]
-    #[cfg_attr(
-        target_os = "linux",
-        ignore = "FLTK widget lifecycle requires UI-thread-bound integration harness"
+        any(target_os = "macos", target_os = "linux"),
+        ignore = "FLTK widget tests require a native UI test environment"
     )]
     fn cancel_edit_mode_clears_pending_stream_buffers() {
         let mut widget = ResultTableWidget::new();
@@ -14039,12 +14031,8 @@ mod tests {
 
     #[test]
     #[cfg_attr(
-        target_os = "macos",
-        ignore = "FLTK widget tests require the process main thread on macOS"
-    )]
-    #[cfg_attr(
-        target_os = "linux",
-        ignore = "FLTK widget lifecycle requires UI-thread-bound integration harness"
+        any(target_os = "macos", target_os = "linux"),
+        ignore = "FLTK widget tests require a native UI test environment"
     )]
     fn display_result_select_clears_stale_pending_buffers() {
         let mut widget = ResultTableWidget::new();
