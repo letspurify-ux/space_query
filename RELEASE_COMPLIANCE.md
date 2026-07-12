@@ -56,7 +56,7 @@ obligations.
 
 ## Approval
 
-- Release tag: v0.1.6718
+- Release tag: v0.1.6719
 - Release owner: letspurify-ux
 - Review date: 2026-07-12
 - Counsel/export reviewer, if required:
