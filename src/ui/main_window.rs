@@ -10972,8 +10972,8 @@ mod tests {
 
     #[test]
     #[cfg_attr(
-        target_os = "macos",
-        ignore = "FLTK widget tests require the process main thread on macOS"
+        any(target_os = "macos", target_os = "linux"),
+        ignore = "FLTK widget tests require a native UI test environment"
     )]
     fn prepare_result_export_releases_app_state_lock_before_lazy_fetch_request() {
         let _app = fltk::app::App::default();
