@@ -1,5 +1,7 @@
 # MySQL 접속 및 테스트 정리
 
+> 구현 및 로컬 환경 대조: 2026-07-12
+
 ## 로컬 MySQL 8 접속 정보
 
 - Container: `space-query-mysql80`
@@ -10,7 +12,7 @@
 - Database: `query_tool_mysql8`
 - Username: `root`
 - Password: `spacequery`
-- 앱 DB 타입: `MySQL or MariaDB` (`DatabaseType::MySQL`)
+- 앱 DB 타입: `MySQL` (`DatabaseType::MySQL`)
 
 클라이언트 접속 확인:
 
@@ -105,7 +107,8 @@ mysql --protocol=TCP -h 127.0.0.1 -P 3307 -uroot -pspacequery \
   -e "SET SESSION time_zone = '+14:00'; SELECT @@SESSION.time_zone;"
 ```
 
-앱은 `MySQL or MariaDB` 공통 backend를 사용한다. 따라서 MySQL에서는 `+14:00` 같은 MySQL 전용 offset도 허용하되, MariaDB에서만 거부되는 범위는 실제 서버 버전 확인 후 더 명확한 오류를 반환한다.
+MySQL과 MariaDB는 실행 family를 공유하지만 시간대 범위는 구체 DB 타입별
+backend metadata로 검증한다. MySQL은 `-13:59`부터 `+14:00`까지 허용한다.
 
 ## 문자셋과 Collation 주의사항
 
@@ -167,4 +170,5 @@ mysql --protocol=TCP -h 127.0.0.1 -P 3307 -uroot -pspacequery \
 
 - MySQL 범위를 `-13:59`부터 `+14:00`까지로 제한했다.
 - Oracle은 별도 범위를 유지한다.
-- MariaDB에서만 좁은 범위는 실제 서버가 MariaDB일 때 별도 오류로 안내한다.
+- MariaDB backend는 저장 전부터 별도의 좁은 범위를 적용하고, 연결 후 서버 버전
+  기반 방어 검증에서도 같은 범위를 확인한다.

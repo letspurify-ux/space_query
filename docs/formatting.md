@@ -1,6 +1,6 @@
 # SQL Auto Formatting Depth Principles
 
-> 최종 업데이트: 2026-04-13 (runtime formatter structural frame 단일 stack 계약을 명시하고 query/condition/block owner 복원 경로를 통합)
+> 구현 대조: 2026-07-12 (`src/db/query/script.rs`, `src/sql_text.rs`, `src/ui/sql_editor/formatter.rs`, `src/sql_format.rs`)
 
 ## 0. 이 문서의 역할
 
@@ -174,7 +174,8 @@ depth는 현재 시점에 활성화된 syntactic owner stack의 높이다.
 - `auto_depth`: analyzer가 계산한 현재 code line의 structural depth
 - `query_base_depth`: 현재 query frame의 base depth
 - `next_query_head_depth`: 현재 owner가 여는 다음 child query head depth
-- `final_depth`: formatter phase 2가 정규화를 마친 최종 structural depth
+- `render_depth`: analyzer가 정규화를 마친 최종 structural depth. 이 문서에서
+  개념적으로 부르는 `final depth`에 해당한다.
 
 ### 2.3 owner align depth와 owner base depth는 다르다
 
@@ -340,12 +341,17 @@ owner를 열지도 닫지도 않는 line은 활성 stack과 explicit continuatio
 
 현재 렌더링 정책:
 
-- non-verbatim code line: `render indent = final_depth * 4`
+- analyzer의 `AutoFormatLineContext`는 최종 구조 깊이를 `render_depth`에 저장한다.
+- 실제 formatter phase 2는 이 필드를 직접 소비하지 않고 자체 `FormatFrameStack`과
+  `line_indent`/`indent_level`로 같은 구조 의미를 재현한다.
+- non-verbatim code line의 출력 공백은 phase 2의 최종 line depth에 `4`를 곱한다.
 - comment-only / comma-only line: 빌린 structural depth를 같은 폭으로 직렬화
-- mixed leading-close code line도 line-level render indent는 `final_depth * 4`를 사용한다.
+- mixed leading-close code line도 phase 2가 close를 소비한 뒤 계산한 최종 line
+  depth에 같은 폭을 적용한다.
 - raw/verbatim line만 원문 공백을 유지할 수 있다.
 
-`4`는 현재 policy이며, 근본 원칙은 "render indent는 final depth와 configured indent width의 함수여야 한다"이다.
+`4`는 현재 고정 policy이며 사용자 설정값은 아니다. 근본 원칙은 "render indent는
+final depth와 한 곳에서 정의한 indent-width policy의 함수여야 한다"이다.
 
 ## 4. 구현 및 유지보수 규칙
 

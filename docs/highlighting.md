@@ -1,5 +1,7 @@
 # SQL Highlighting 동작 원리
 
+> 구현 대조: 2026-07-12 (`src/ui/syntax_highlight.rs`, `src/ui/sql_editor/highlighting.rs`)
+
 이 문서는 현재 코드베이스 기준으로 SQL 하이라이팅이 어떻게 동작하는지 정리한 구현 문서다.
 목표는 다음 2가지다.
 
@@ -34,7 +36,7 @@
 
 - `A`: 기본 텍스트
 - `B`: SQL keyword
-- `C`: Oracle built-in function
+- `C`: 현재 DB 타입의 built-in function
 - `D`: single quote string
 - `E`: line comment 또는 한 줄 block comment
 - `F`: number
@@ -63,7 +65,7 @@ FLTK `TextBuffer`에 넣을 때는 이 논리 스타일 문자열을 그대로 �
 
 - `text`: 현재 편집기 텍스트 shadow
 - `styles`: 현재 논리 스타일 shadow
-- `newline_positions`: 줄 끝 바이트 위치 캐시
+- `text` 내부 `ChunkedText` chunk별 line-break index: 줄 시작/끝 조회용 캐시
 - `line_exit_states`: 각 줄을 스캔한 뒤 lexer가 어떤 상태로 끝났는지 저장
 
 여기서 핵심은 `line_exit_states`다.
@@ -117,7 +119,8 @@ callback은 `SqlEditorWidget::handle_buffer_highlight_update(...)`를 호출한�
 
 1. 수정 직후 버퍼에서 실제 inserted text를 읽는다.
 2. `style_buffer`에는 우선 default 스타일 placeholder를 같은 길이로 반영한다.
-3. `HighlightShadowState::apply_edit(...)`로 shadow text/styles/newline cache/line state 길이를 먼저 맞춘다.
+3. `HighlightShadowState::apply_edit(...)`로 chunked shadow text/styles와 line state
+   길이를 먼저 맞춘다. 줄 경계 index는 `ChunkedText` edit 과정에서 함께 갱신된다.
 4. 재하이라이팅 시작 위치는 `incremental_rehighlight_start(...)`로 계산한다.
    - 현재 구현은 항상 "수정된 위치가 속한 현재 줄의 시작"이다.
 5. 강제로 덮어야 하는 최소 범위는 `incremental_direct_rehighlight_end(...)`로 계산한다.
@@ -145,7 +148,7 @@ callback은 `SqlEditorWidget::handle_buffer_highlight_update(...)`를 호출한�
    - hint comment
    - single quote string
    - q-quote string
-   - quoted identifier
+   - double-quote/backtick quoted identifier
 2. 줄 시작 special command 처리
    - `PROMPT`: 해당 줄 전체를 comment 스타일
    - `CONNECT`: SQL*Plus `CONNECT` 문맥이면 keyword만 스타일링하고 그 줄 나머지는 일반 SQL lexing 대상에서 제외
@@ -155,7 +158,7 @@ callback은 `SqlEditorWidget::handle_buffer_highlight_update(...)`를 호출한�
    - 여러 줄에 걸친 일반 block comment는 내부적으로 `STYLE_BLOCK_COMMENT`를 사용
 5. q-quote / prefixed single quote literal
 6. 일반 single quote string
-7. double quote identifier
+7. double quote 또는 MySQL/MariaDB backtick identifier
 8. number
 9. identifier / keyword / function / relation / column
 10. operator
@@ -164,8 +167,8 @@ callback은 `SqlEditorWidget::handle_buffer_highlight_update(...)`를 호출한�
 
 identifier 계열은 다음 데이터를 조합해 분류한다.
 
-- Oracle keyword 집합
-- Oracle built-in function 집합
+- 현재 DB 타입의 keyword 집합
+- 현재 DB 타입의 built-in function 집합
 - 현재 스키마 relation lookup
 - 현재 로딩된 column lookup
 - alias/member access 문맥 휴리스틱
@@ -181,7 +184,7 @@ identifier 계열은 다음 데이터를 조합해 분류한다.
 
 ## 7. UTF-8 / 바이트 오프셋 처리 방식
 
-현재 구현은 하이라이팅 경로에서도 AGENTS 규칙과 맞게 바이트 오프셋 기준을 일관되게 유지한다.
+현재 구현은 하이라이팅 경로에서 바이트 오프셋 기준을 일관되게 유지한다.
 
 - 모든 range 계산은 `usize` 바이트 오프셋으로 수행
 - mid-byte 위치는 `clamp_boundary()` 또는 `clamp_to_utf8_boundary()`로 뒤로 보정
@@ -279,6 +282,7 @@ alias, member access, relation context를 많이 보정하고 있지만, 완전�
 - single quote string
 - q-quote string
 - quoted identifier
+- backtick quoted identifier
 
 만약 앞으로 다른 multi-line lexical construct를 추가하면, 증분 하이라이팅의 정합성은 `LexerState`와 `line_exit_states`에 그 상태를 함께 반영하는지에 달려 있다.
 즉, 이 설계의 핵심 불변식은 "다음 줄 해석에 필요한 lexical state는 반드시 line exit state에 보존된다"이다.
@@ -309,7 +313,7 @@ alias, member access, relation context를 많이 보정하고 있지만, 완전�
    - 현재 scope의 컬럼 후보
    - CTE / 서브쿼리 / generated column
    - 로컬 심볼 / 텍스트 bind / 세션 bind
-   - SQL keyword / Oracle function
+- 현재 DB 타입의 SQL keyword / built-in function
 
 추천 결과는 이 문맥별 소스의 합으로 끝난다. 결과가 비었을 때 전체 catalog를 뒤에 붙이거나, 기대한 object 종류가 없다는 이유로 다른 object/keyword/column 종류로 넓히지 않는다. 컬럼 조회도 명시적인 non-empty relation scope가 있어야 하며, `None` 또는 빈 scope는 전체 컬럼이 아니라 추천 없음으로 해석한다. `SCOTT.EMP` 같은 명시적 relation/qualifier 키는 정확히 일치해야 하며 `EMP` 캐시나 dotted suffix 캐시로 축약하지 않는다. qualifier 멤버 종류도 qualifier별 메타데이터나 qualifier별 relation 캐시로만 판정하고, 현재 사용자의 전역 object-kind 캐시로 재분류하지 않는다. qualifier는 현재 보이는 row source에서만 해석하고, `COMMENT ON COLUMN`이나 `ASSOCIATE STATISTICS ... COLUMNS`처럼 문법이 직접 relation owner를 요구하는 자리에만 scope 밖 owner 이름을 명시적으로 허용한다.
 

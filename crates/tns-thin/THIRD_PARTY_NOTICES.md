@@ -1,14 +1,15 @@
 # Third Party Notices
 
-This crate (`tns-thin`) is licensed under `MIT OR Apache-2.0`. Some
+This crate (`tns-thin`) is licensed under the Apache License, Version 2.0. Some
 implementation details were developed with reference to, and reimplemented in
 Rust from, permissively licensed upstream projects. This crate is an
 independent, modified work and contains none of the original upstream source
 files. Keep this file with source and binary redistributions.
 
-The complete text of the licenses referenced below is included with this crate:
-the Apache License, Version 2.0 in `LICENSE-APACHE`, and the MIT License in
-`LICENSE-MIT`.
+The complete text of the crate license is included in `LICENSE-APACHE`. The MIT
+license in `LICENSE-MIT` applies to the identified `go-ora` material. Exact
+upstream revisions and the reference scope are recorded in `PROVENANCE.md`.
+The Apache attribution notice is also provided in `NOTICE`.
 
 ## python-oracledb
 
@@ -37,6 +38,11 @@ preserved in the source repository under `vendor/python-oracledb/`:
 
 https://github.com/letspurify-ux/space_query
 
+The reference snapshot is upstream commit
+`a7b40f112949875a2bb1449ffcb068953cd88999`. Its package version file reports
+`4.0.1`; the commit SHA, rather than that mutable version string, identifies
+the snapshot used by this project.
+
 ## go-ora
 
 The TNS thin implementation was also checked against `go-ora` behavior and
@@ -46,6 +52,9 @@ go-ora source files. The unmodified upstream license file is additionally
 preserved in the source repository under `vendor/go-ora/LICENSE`:
 
 https://github.com/letspurify-ux/space_query
+
+The reference snapshot is upstream commit
+`ef646cf075eb78b91ddb842b0f3c49cd1a3b6a88`.
 
 MIT License
 

@@ -10,13 +10,16 @@ not affiliated with, endorsed by, or sponsored by Oracle.
 
 ## License and notices
 
-This crate is distributed under `MIT OR Apache-2.0`.
+This crate is distributed under the Apache License, Version 2.0. The MIT
+license text included in the package applies to the identified `go-ora`
+material, not as an alternative license for the crate as a whole.
 
 No Oracle proprietary client library is bundled with this crate, and consumers
 do not need to download or redistribute Oracle Instant Client to use the Rust
 code in this package. Some implementation details were developed with reference
-to permissively licensed upstream projects. Keep `THIRD_PARTY_NOTICES.md` with
-source and binary redistributions.
+to permissively licensed upstream projects. Keep `NOTICE` and
+`THIRD_PARTY_NOTICES.md` with source and binary redistributions. Exact upstream
+revisions and the reference scope are recorded in `PROVENANCE.md`.
 
 Oracle, Java, MySQL, and NetSuite are registered trademarks of Oracle and/or
 its affiliates. Other names may be trademarks of their respective owners.

@@ -2,13 +2,184 @@
 
 SPACE Query is a desktop SQL client built with Rust and FLTK. It supports Oracle, MySQL, and MariaDB connections, and bundles a SQL editor, script execution, an object browser, a result grid, query history, a session activity view, and log/crash diagnostics into a single app.
 
+## Quick Start
+
+![SPACE Query main window](docs/images/main-window.png)
+
+| Area | What it is for |
+| --- | --- |
+| Left panel | Browse and filter database objects such as tables, views, and routines |
+| Top toolbar | Execute or cancel SQL, explain a statement, and commit or roll back |
+| Upper-right panel | Write SQL and manage multiple query tabs |
+| Lower-right panel | Review data, script output, DBMS output, and execution messages |
+| Bottom status bar | Check the current connection and execution status |
+
+### 1. Connect to a database
+
+Open **File > Connect** (`Ctrl+N`), select the database type, and enter the
+connection details. You can test the settings, save them for later, or connect
+immediately. Saved passwords are kept in the OS Keyring, not in the config
+file.
+
+![Database connection dialog](docs/images/connection-dialog.png)
+
+- **Oracle:** choose OCI or Thin. Thin works without Oracle Instant Client and
+  uses Host, Port, and Service.
+- **MySQL / MariaDB:** enter Host, Port, Username, Password, and the optional
+  database name, then adjust SSL or session options if needed.
+
+### 2. Write and run SQL
+
+Enter SQL in the active query tab, then use the toolbar or a shortcut:
+
+On macOS, use `Cmd` where `Ctrl` is shown.
+
+- `Ctrl+Enter` or `F9`: run the statement at the cursor
+- Select text and press `Ctrl+Enter`: run only the selection
+- `F5`: run the entire script
+- `F6`: show Explain Plan / EXPLAIN
+- `F7` / `F8`: commit / roll back
+
+### 3. Review the result
+
+- **Data Grid:** query rows, selection/copy, CSV export, and lazy fetch controls
+- **Script Output / DBMS Output:** script transcripts and server output
+- **Messages:** execution information, affected-row counts, and errors
+- **Tools > Session Activity:** active connection, pool, query, and result-tab state
+
+Use **File > Disconnect** (`Ctrl+D`) when you are finished. If a query, lazy
+fetch, or pending edit is still active, SPACE Query asks how to resolve it
+before changing the connection.
+
+## Feature Tour
+
+### IntelliSense and object-aware editing
+
+![SQL IntelliSense suggestions](docs/images/intellisense.png)
+
+Press `Ctrl+Space` (`Cmd+Space` on macOS) to open suggestions at the cursor.
+The list adapts to the SQL context and can include keywords, tables, views,
+aliases, columns, routines, packages, and other objects loaded from database
+metadata. Use the arrow keys to move, `Enter` or `Tab` to insert, and `Esc` to
+close the list.
+
+The editor also provides syntax highlighting, quick describe (`F4`), find and
+replace, comment toggling, case conversion, SQL block selection, and multiple
+query tabs.
+
+### Automatic SQL formatting
+
+Before formatting:
+
+![SQL before automatic formatting](docs/images/sql-formatting-before.png)
+
+After `Ctrl+Shift+F`:
+
+![SQL after automatic formatting](docs/images/sql-formatting-after.png)
+
+Select SQL or place the cursor inside a statement and press `Ctrl+Shift+F`
+(`Cmd+Shift+F` on macOS). The formatter applies SQL-aware line breaks and
+indentation while keeping the statement editable in place. It supports the
+Oracle and MySQL/MariaDB dialect paths used by the active connection.
+
+### Result grid selection, copy, and export
+
+![Result grid with a multi-cell selection](docs/images/result-grid.png)
+
+- Drag or use the keyboard to select a cell range.
+- `Ctrl+C` copies selected cells; `Ctrl+Shift+C` includes column headers.
+- `Ctrl+A` selects the grid and `Ctrl+E` exports the result as CSV.
+- Column widths can be resized and column headers can be used for grid sorting.
+- Large result sets use lazy fetch. Scrolling near the end requests more rows;
+  actions that need the complete result can request the remaining rows first.
+- Right-click the grid for close, copy, copy-all, CSV, and edit-related actions.
+
+The result area separates **Data Grid**, **Script Output**, **DBMS Output**, and
+**Messages**, so tabular rows, script transcripts, server output, and errors do
+not overwrite one another.
+
+### Staged Oracle result editing
+
+![Oracle result grid in staged edit mode](docs/images/result-grid-editing.png)
+
+For a safely identifiable Oracle single-table result containing a usable
+`ROWID`, enable **Edit** to stage cell changes. You can insert or delete rows,
+set selected cells to `NULL`, save all staged changes, or cancel them. The
+database is not changed until **Save** is selected.
+
+JOIN results, multi-table queries, and results without a reliable `ROWID` stay
+read-only to avoid updating the wrong rows.
+
+### Object browser and workspace layout
+
+![Object browser with example Oracle metadata](docs/images/object-browser.png)
+
+The left panel groups objects by database type and supports filtering, refresh,
+data queries, structure/index/constraint views, DDL generation, and package
+routine browsing. The center workspace keeps SQL files in separate tabs, while
+the lower panel keeps each result and message stream available independently.
+
+### Appearance, result, and connection settings
+
+![Application settings](docs/images/settings.png)
+
+Open **Settings > Preferences** to select the editor/result font and sizes,
+change the global UI size, configure result preview and lazy-fetch limits, and
+set connection-pool and cancellation options. Settings are persisted for the
+next application run.
+
+### Query history
+
+![Query history with SQL and error preview](docs/images/query-history.png)
+
+Open **Tools > Query History** to search previously executed SQL, filter failed
+statements, inspect the SQL and error details, and place a selected statement
+back into the editor with **Use Query**. History belongs to the current running
+app process.
+
+### Session activity
+
+![Session activity result](docs/images/session-activity.png)
+
+Open **Tools > Session Activity** to see how the active connection pool is being
+used across query and result tabs. The view reports running SQL, lazy fetches,
+retained sessions, fetched-row counts, and elapsed time, which is useful when a
+connection switch or pool resize is waiting for active work to finish.
+
+### Application logs and recovery
+
+![Application log viewer](docs/images/application-log.png)
+
+Open **Tools > Application Log** to filter entries by level, inspect a selected
+entry, export the visible log, or clear it. SPACE Query also records panic
+details in `crash.log` and shows the previous crash report on the next launch.
+
+### Regenerating the screenshots
+
+The capture source is kept in `src/bin/capture_feature_tour.rs`. On macOS, run:
+
+```bash
+./scripts/capture_feature_tour.sh
+```
+
+To regenerate only the object-browser image:
+
+```bash
+./scripts/capture_feature_tour.sh object-browser
+```
+
+The helper builds the capture binary using the normal Cargo environment, runs
+it with isolated application settings, and updates the PNG files under
+`docs/images`.
+
 ## Supported Databases
 
 - Oracle
   - Supports a choice between Thin mode (built-in TNS client) and OCI (thick) mode
   - Thin mode connects without Oracle Instant Client; OCI mode requires the Instant Client or Full Client
-  - Supports Host/Port/Service connections and TNS alias connections
-  - Supports TCP/TCPS, NLS date/timestamp format, session time zone, and default transaction option settings
+  - Both modes support Host/Port/Service connections; TNS alias connections are available only in OCI mode
+  - Thin mode supports TCP; OCI mode supports TCP/TCPS
+  - Supports NLS date/timestamp format, session time zone, and default transaction option settings
 - MySQL
   - Supports database selection, SSL options, SQL mode, charset/collation, and session time zone settings
 - MariaDB
@@ -72,7 +243,9 @@ Oracle / SQL*Plus family:
 - `DESC`, `DESCRIBE`
 - `PROMPT`, `PAUSE`, `ACCEPT`
 - `DEFINE`, `UNDEFINE`, `COLUMN ... NEW_VALUE`
-- `BREAK`, `COMPUTE`, `CLEAR BREAKS`, `CLEAR COMPUTES`
+- `BREAK ON <column>`, `BREAK OFF`
+- `COMPUTE SUM`, `COMPUTE COUNT`, `COMPUTE OFF`, with optional `OF <column> ON <group_column>`
+- `CLEAR BREAKS`, `CLEAR COMPUTES`
 - `SPOOL`
 - `WHENEVER SQLERROR`, `WHENEVER OSERROR`
 - `@`, `@@`, `START`
@@ -156,7 +329,8 @@ Result grid editing is not available for every SELECT. The current implementatio
 ## Requirements
 
 - Rust toolchain (stable) — required when building from source.
-- Supported platforms: macOS, Linux, Windows.
+- Source builds support macOS, Linux, and Windows.
+- Prebuilt GitHub Release archives are currently produced for macOS arm64 and Windows x86_64.
 
 ## Running
 
@@ -184,17 +358,26 @@ cargo build --release --bin space_query
 
 The output is created at `target/release/space_query` (`space_query.exe` on Windows).
 
-GitHub Release archives contain the executable, `DISCLAIMER.md`, and a
-`licenses/` directory with the SPACE Query licenses, third-party notices and
-dependency license texts, referenced upstream notices, and the copyright
-information for the exact Rust toolchain used to build the executable.
+GitHub Release archives contain the executable, `DISCLAIMER.md`, the release
+owner checklist in `RELEASE_COMPLIANCE.md`, and a `licenses/` directory with
+the SPACE Query licenses, third-party notices and dependency license texts,
+the `tns-thin` provenance record, referenced upstream notices, and the
+copyright information for the exact Rust toolchain used to build the
+executable.
 
 ## Testing
 
-Full test suite:
+Default non-live test suite for the main package:
 
 ```bash
 cargo test
+```
+
+The built-in `tns-thin` package has a separate test suite because it is a path
+dependency rather than a workspace member:
+
+```bash
+cargo test --manifest-path crates/tns-thin/Cargo.toml
 ```
 
 Build check:
@@ -203,7 +386,46 @@ Build check:
 cargo check
 ```
 
-Some tests may require an external DB or environment variables. When running real Oracle/MySQL/MariaDB connection tests, you must first set up a local DB, account, and client library configuration.
+Live database tests are ignored by the default commands. When running real
+Oracle/MySQL/MariaDB connection tests, you must first set up a local DB,
+account, and client library configuration. The Oracle Thin live and comparison
+tests can be run with:
+
+```bash
+./test_tns_thin.sh
+```
+
+Pull requests and pushes to `main` run formatting, Clippy, non-live tests, and
+Linux/macOS/Windows build checks in GitHub Actions. The Rust version used by
+local builds and CI is pinned in `rust-toolchain.toml`.
+
+## Release Verification
+
+Tag releases are created only after the CI quality gates pass. Every GitHub
+Release includes a `SHA256SUMS` file for the macOS and Windows archives:
+
+```bash
+sha256sum --check SHA256SUMS
+```
+
+On macOS, the equivalent command is:
+
+```bash
+shasum -a 256 --check SHA256SUMS
+```
+
+Release archives also have GitHub artifact provenance attestations. After
+installing and authenticating the GitHub CLI, verify an archive with:
+
+```bash
+gh attestation verify space_query-macos-arm64.zip \
+  --repo letspurify-ux/space_query
+```
+
+The checksum and provenance establish archive integrity and build origin. They
+do not replace operating-system code signing; the current ZIP distributions
+remain unsigned until Apple Developer ID and Windows Authenticode credentials
+are configured for the release workflow.
 
 ## Oracle Client (OCI mode)
 
@@ -256,11 +478,18 @@ Notes:
 
 ## License and Trademarks
 
-This project is distributed under `MIT OR Apache-2.0`. See `LICENSE-MIT` and `LICENSE-APACHE` for the full licenses.
+Original SPACE Query code is distributed under `MIT OR Apache-2.0`. See
+`LICENSE-MIT` and `LICENSE-APACHE` for the full licenses. The bundled
+`tns-thin` crate is Apache-2.0 licensed; its MIT license file applies only to
+the identified `go-ora` material.
 
 The software is provided without warranty and is subject to the limitations
 described in `DISCLAIMER.md`.
 
-The TNS thin implementation references the permissive-licensed implementations of `python-oracledb` and `go-ora`. The relevant notices are maintained in `THIRD_PARTY_NOTICES.md` and `crates/tns-thin/THIRD_PARTY_NOTICES.md`.
+The TNS thin implementation references the permissive-licensed implementations
+of `python-oracledb` and `go-ora`. The relevant notices are maintained in
+`THIRD_PARTY_NOTICES.md` and `crates/tns-thin/THIRD_PARTY_NOTICES.md`; exact
+upstream revisions are recorded in `crates/tns-thin/PROVENANCE.md`. Maintainers
+must complete `RELEASE_COMPLIANCE.md` before publishing a release.
 
 Oracle, Java, MySQL, and NetSuite are registered trademarks of Oracle and/or its affiliates. Other names may be trademarks of their respective owners. This project is not affiliated with, endorsed by, or sponsored by Oracle.

@@ -9271,6 +9271,81 @@ impl MainWindow {
         }
     }
 
+    #[doc(hidden)]
+    pub fn capture_tour_set_sql(
+        &mut self,
+        sql: &str,
+        cursor: Option<i32>,
+    ) -> fltk::text::TextEditor {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        state.sql_editor.set_text(sql);
+        let mut editor = state.sql_editor.get_editor();
+        let position = cursor.unwrap_or_else(|| state.sql_buffer.length());
+        editor.set_insert_position(position.clamp(0, state.sql_buffer.length()));
+        editor.show_insert_position();
+        state.sql_editor.focus();
+        state.window.redraw();
+        editor
+    }
+
+    #[doc(hidden)]
+    pub fn capture_tour_format_sql(&mut self) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut buffer = state.sql_editor.get_buffer();
+        buffer.select(0, buffer.length());
+        state.sql_editor.format_selected_sql();
+        buffer.unselect();
+        let mut editor = state.sql_editor.get_editor();
+        editor.set_insert_position(0);
+        editor.show_insert_position();
+        state.window.redraw();
+    }
+
+    #[doc(hidden)]
+    pub fn capture_tour_show_object_browser(&mut self) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        state.object_browser.capture_tour_set_example_metadata();
+        state
+            .status_bar
+            .set_label("Connected | Local Oracle (Oracle)");
+        state.window.redraw();
+    }
+
+    #[doc(hidden)]
+    pub fn capture_tour_show_result(
+        &mut self,
+        label: &str,
+        result: crate::db::QueryResult,
+        enable_editing: bool,
+    ) -> Result<(), String> {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        state.result_tabs.clear();
+        state.append_result_tab_request(ResultTabRequest {
+            label: label.to_string(),
+            result,
+        });
+        if enable_editing {
+            let mut result_tabs = state.result_tabs.clone();
+            result_tabs.begin_current_edit_mode()?;
+            result_tabs.insert_row_in_current_edit_mode()?;
+        }
+        state.refresh_result_edit_controls();
+        state.window.redraw();
+        Ok(())
+    }
+
     pub fn show_previous_crash_report(crash_report: &str) {
         crate::utils::logging::log_warning(
             "app",

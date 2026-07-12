@@ -1,53 +1,41 @@
-# Oracle Instant Client 접속 및 테스트 정리
+# Oracle 접속 및 테스트 정리
 
-## 설치된 클라이언트
+> 구현 및 로컬 환경 대조: 2026-07-12
 
-- 다운로드 출처: Oracle Instant Client Downloads for macOS ARM64
-  - https://www.oracle.com/database/technologies/instant-client/macos-arm64-downloads.html
-- Codex/sandbox 테스트용 설치 경로:
-  - `/tmp/oqt_instantclient_23_26`
-- 다운로드 파일:
-  - `/tmp/instantclient-basic-macos.arm64-23.26.1.0.0.dmg`
-  - SHA256: `5dc67a7e1cccd0a01d5bf53d7cf13b56f00999e3c2c1a309d8600cd766d80b41`
-- 설치 패키지:
-  - Basic Package `23.26.1.0.0`
-  - SQL*Plus Package는 `/tmp/oqt_instantclient_23_26`에 기본 설치되어 있지 않다. 필요하면 같은 버전 SQL*Plus DMG를 추가 설치한다.
+## 현재 확인된 OCI 클라이언트
+
+Thin 모드는 Oracle Client를 사용하지 않는다. 아래 클라이언트는 OCI(thick)
+모드와 OCI 비교 테스트에만 필요하다.
+
+- `ORACLE_CLIENT_LIB_DIR`: `$HOME/.local/share/oracle/instantclient_23_26`
+- Client version: `23.26.1.0.0`
+- Architecture: macOS arm64
+- `/opt/homebrew/lib/libclntsh.dylib`에도 19.8 x86_64 클라이언트가 있지만,
+  arm64 앱에서는 사용할 수 없다.
+- 다운로드 출처:
+  https://www.oracle.com/database/technologies/instant-client/macos-arm64-downloads.html
 
 설치 확인:
 
 ```sh
-file /tmp/oqt_instantclient_23_26/libclntsh.dylib.23.1
-/tmp/oqt_instantclient_23_26/genezi -v
+export ORACLE_CLIENT_LIB_DIR="$HOME/.local/share/oracle/instantclient_23_26"
+file "$ORACLE_CLIENT_LIB_DIR/libclntsh.dylib"
+"$ORACLE_CLIENT_LIB_DIR/genezi" -v
 ```
 
 정상 결과:
 
-- `libclntsh.dylib.23.1`이 `Mach-O 64-bit ... arm64`로 표시된다.
+- `libclntsh.dylib`이 `Mach-O 64-bit ... arm64`로 표시된다.
 - `genezi -v`가 `Client Shared Library 64-bit - 23.26.1.0.0`를 표시한다.
-
-재설치가 필요하면 다음 순서로 `/tmp` 안에 설치한다.
-
-```sh
-curl -L -o /tmp/instantclient-basic-macos.arm64-23.26.1.0.0.dmg \
-  https://download.oracle.com/otn_software/mac/instantclient/2326100/instantclient-basic-macos.arm64-23.26.1.0.0.dmg
-shasum -a 256 /tmp/instantclient-basic-macos.arm64-23.26.1.0.0.dmg
-hdiutil attach /tmp/instantclient-basic-macos.arm64-23.26.1.0.0.dmg
-mkdir -p /tmp/oqt_instantclient_23_26
-cp -R -P /Volumes/instantclient-basic-macos.arm64-23.26.1.0.0/instantclient_23_26/. /tmp/oqt_instantclient_23_26/
-```
-
-설치 후 DMG는 필요할 때 분리한다.
-
-```sh
-hdiutil detach /Volumes/instantclient-basic-macos.arm64-23.26.1.0.0
-```
 
 ## 앱 접속 설정
 
-앱은 `oracle-rs`/ODPI-C를 통해 Oracle Client를 초기화한다. macOS에서는 자동 탐색이 다른 아키텍처의 클라이언트를 잡을 수 있으므로, 테스트나 터미널 실행에서는 sandbox 안에 설치한 `/tmp` 경로를 명시한다.
+OCI 모드는 `oracle-rs`/ODPI-C를 통해 Oracle Client를 초기화한다. macOS에서는
+자동 탐색이 다른 아키텍처의 클라이언트를 잡을 수 있으므로 테스트나 터미널
+실행에서는 arm64 경로를 명시한다. Thin 모드는 이 설정을 사용하지 않는다.
 
 ```sh
-export ORACLE_CLIENT_LIB_DIR=/tmp/oqt_instantclient_23_26
+export ORACLE_CLIENT_LIB_DIR="$HOME/.local/share/oracle/instantclient_23_26"
 ```
 
 현재 로컬 Docker Oracle 테스트 DB 기준 직접 접속 정보:
@@ -63,12 +51,16 @@ export ORACLE_CLIENT_LIB_DIR=/tmp/oqt_instantclient_23_26
 - Password: `password`
 - 앱 DB 타입: `Oracle`
 
-TNS alias 모드에서는 `Host`와 `Port`를 비우고 `Service Name` 자리에 TNS alias를 입력한다. 이 경우 SSL/protocol은 앱의 직접 접속 옵션이 아니라 Oracle Net 설정(`tnsnames.ora`, `sqlnet.ora`)을 따른다.
+TNS alias 모드는 OCI에서만 사용할 수 있다. 이 모드에서는 `Host`와 `Port`를
+비우고 `Service Name` 자리에 TNS alias를 입력한다. SSL/protocol은 앱의 직접
+접속 옵션이 아니라 Oracle Net 설정(`tnsnames.ora`, `sqlnet.ora`)을 따른다.
+Thin 모드는 Host/Port/Service와 TCP만 지원한다.
 
-SQL*Plus 접속 확인은 SQL*Plus 패키지를 추가 설치한 경우에만 실행한다. Basic Package만 설치한 `/tmp/oqt_instantclient_23_26`에는 `sqlplus`가 없다.
+현재 위 Instant Client 경로에는 `sqlplus`가 없다. SQL*Plus 접속 확인은 같은
+아키텍처의 SQL*Plus 패키지를 추가 설치한 경우에만 다음 명령으로 실행한다.
 
 ```sh
-/tmp/oqt_instantclient_23_26/sqlplus -L 'system/password@//127.0.0.1:1521/FREE'
+"$ORACLE_CLIENT_LIB_DIR/sqlplus" -L 'system/password@//127.0.0.1:1521/FREE'
 ```
 
 Docker listener는 `FREE`, `freepdb1` 서비스가 `READY`로 보여야 한다.
@@ -142,7 +134,10 @@ printf '%s\n' \
 
 ## 로컬 live 테스트 실행 가이드
 
-현재 Docker Oracle 기본 listener는 `1521/tcp`만 열려 있다. 그래서 로컬 TCP live 테스트의 성공 기준은 `oracle_tcps_connection_uses_advanced_ssl_protocol`만 제외한 Oracle ignored 테스트 12개 통과다. TCPS listener를 따로 구성한 환경에서만 TCPS 테스트까지 포함해 13개를 실행한다.
+현재 Docker Oracle 기본 listener는 `1521/tcp`만 열려 있다. 따라서 기본 로컬
+실행에서는 `oracle_tcps_connection_uses_advanced_ssl_protocol`을 제외한다.
+테스트 수는 구현과 함께 변하므로 고정하지 않는다. TCPS listener를 따로 구성한
+환경에서만 TCPS 테스트를 포함한다.
 
 다음 블록을 먼저 실행한다. 환경 준비와 사전 점검을 한 번에 끝내고, 조건이 맞지 않으면 테스트 전에 실패한다.
 
@@ -150,7 +145,7 @@ printf '%s\n' \
 set -e
 
 export TNS_ADMIN=/tmp/oracle_net_admin
-export ORACLE_CLIENT_LIB_DIR=/tmp/oqt_instantclient_23_26
+export ORACLE_CLIENT_LIB_DIR="$HOME/.local/share/oracle/instantclient_23_26"
 export ORACLE_TEST_USERNAME=system
 export ORACLE_TEST_PASSWORD=password
 export ORACLE_TEST_HOST=127.0.0.1
@@ -213,12 +208,6 @@ oracle_cargo_test() {
 oracle_cargo_test oracle --lib -- --ignored --nocapture --skip oracle_tcps_connection_uses_advanced_ssl_protocol
 ```
 
-기대 결과:
-
-```text
-test result: ok. 12 passed; 0 failed; 0 ignored
-```
-
 기존 Homebrew x86_64 Instant Client를 일부러 검증할 때만 다음처럼 바꾼다.
 
 ```sh
@@ -250,7 +239,14 @@ oracle_cargo_test oracle_test_connection_supports_direct_local_xe --lib -- --ign
 
 ## 고급 옵션 적용 테스트
 
-Oracle ignored 통합 테스트는 로컬 Docker listener와 OCI 네트워크 접속을 사용하므로, Codex에서는 같은 `/tmp` Instant Client 경로를 유지한 채 escalated command로 실행한다.
+Oracle OCI ignored 통합 테스트는 로컬 Docker listener와 OCI 네트워크 접속을
+사용한다. 제한된 sandbox가 로컬 listener 접속을 차단하면 동일 명령을 sandbox
+밖에서 실행한다. Thin 전용 회귀 및 live 비교는 저장소의 통합 스크립트로 실행할
+수 있다.
+
+```sh
+./test_tns_thin.sh
+```
 
 메인 연결의 고급 옵션 적용 확인:
 
@@ -273,15 +269,15 @@ oracle_cargo_test oracle_pool_session_applies_advanced_session_settings_from_loc
 
 ## Session Time Zone 범위
 
-Oracle 로컬 서버에서 offset 경계값을 확인했다.
+현재 앱 검증 범위는 Oracle이 문서화한 offset 범위에 맞춘다.
 
-- 허용: `-14:59`, `+14:59`
-- 거부 대상으로 앱에서 막는 값: `+15:00` 이상
+- 허용: `-12:00`부터 `+14:00`
+- 거부: `-12:01` 이하, `+14:01` 이상
 
 직접 확인:
 
 ```sh
-docker exec oracle bash -lc "printf \"ALTER SESSION SET TIME_ZONE = '+14:59';\nSELECT SESSIONTIMEZONE FROM dual;\nEXIT\n\" | sqlplus -s system/password@localhost:1521/FREE"
+docker exec oracle bash -lc "printf \"ALTER SESSION SET TIME_ZONE = '+14:00';\nSELECT SESSIONTIMEZONE FROM dual;\nEXIT\n\" | sqlplus -s system/password@localhost:1521/FREE"
 ```
 
 MySQL/MariaDB와 허용 범위가 다르므로 앱 검증도 DB 타입별로 분리한다.
@@ -308,7 +304,8 @@ incompatible architecture (have 'x86_64', need 'arm64')
 
 ### Codex sandbox 내부 ORA-12560
 
-sandbox 안에서 `/tmp/oqt_instantclient_23_26`의 arm64 OCI 라이브러리 로딩은 성공하지만, OCI 네트워크 접속은 다음 오류가 발생할 수 있다.
+sandbox 안에서 arm64 OCI 라이브러리 로딩은 성공하지만, OCI 네트워크 접속은
+다음 오류가 발생할 수 있다.
 
 ```text
 ORA-12560: Database communication protocol error
@@ -316,26 +313,28 @@ ORA-12560: Database communication protocol error
 
 확인 결과:
 
-- 같은 `/tmp/oqt_instantclient_23_26` 경로를 사용한 OCI child 실행은 sandbox 밖에서 정상 접속된다.
+- 같은 `ORACLE_CLIENT_LIB_DIR`를 사용한 OCI child 실행은 sandbox 밖에서 정상 접속된다.
 - Docker Oracle listener와 컨테이너 내부 SQL*Plus 접속은 정상이다.
 - 따라서 이 문제는 앱 코드나 Instant Client 아키텍처 문제가 아니라, sandbox 안 프로세스가 로컬 Docker listener로 정상 Oracle Net 연결을 만들지 못한 문제였다.
 
 해결 또는 우회:
 
-- `ORACLE_CLIENT_LIB_DIR=/tmp/oqt_instantclient_23_26`는 유지한다.
+- `ORACLE_CLIENT_LIB_DIR="$HOME/.local/share/oracle/instantclient_23_26"`는 유지한다.
 - Codex에서는 로컬 Docker listener 접속이 필요한 OCI 테스트를 escalated command로 실행한다.
 
 ### 호스트명 해석은 최종 원인이 아니었음
 
 macOS 호스트명 `iceblueui-noteubug.local`이 `dscacheutil`에서 해석되지 않고 `/etc/hosts`에도 없어서 원인 후보로 보였다. Oracle client connect data에 로컬 호스트명이 포함되기 때문이다.
 
-하지만 같은 `/tmp/oqt_instantclient_23_26` OCI 경로를 사용한 테스트가 sandbox 밖에서는 `/etc/hosts` 수정 없이 성공했다. 동일 문제가 sandbox 밖에서도 재현될 때만 `/etc/hosts` 수정을 검토한다.
+하지만 같은 OCI 경로를 사용한 테스트가 sandbox 밖에서는 `/etc/hosts` 수정 없이
+성공했다. 동일 문제가 sandbox 밖에서도 재현될 때만 `/etc/hosts` 수정을 검토한다.
 
 ### Session Time Zone 범위가 MySQL/MariaDB와 다름
 
-Oracle은 `+14:59`, `-14:59`를 허용했지만 MySQL/MariaDB는 같은 값을 거부했다. 기존의 공통 형식 검증만으로는 DB별 차이를 반영할 수 없었다.
+Oracle, MySQL, MariaDB는 허용하는 offset 경계가 서로 다르다. 공통 형식
+검증만으로는 이 차이를 반영할 수 없다.
 
 해결:
 
 - Oracle, MySQL/MariaDB 시간대 offset 검증 범위를 분리했다.
-- Oracle은 `-14:59`부터 `+14:59`까지 허용한다.
+- Oracle은 `-12:00`부터 `+14:00`까지 허용한다.

@@ -1,5 +1,7 @@
 # MariaDB 접속 및 테스트 정리
 
+> 구현 및 로컬 환경 대조: 2026-07-12
+
 ## 앱에서의 처리 방식
 
 현재 앱은 MariaDB를 `DatabaseType::MariaDB`로 구분한다. 실행 구현은 MySQL 계열 backend를 공유하지만, timeout provider, 세션 time zone 검증, `SET STATEMENT ... FOR` 분류처럼 MariaDB 전용 차이가 필요한 지점에서는 구체 DB 타입을 유지한다.
@@ -17,7 +19,9 @@
 
 현재 로컬 MariaDB 테스트 DB 접속 정보:
 
-- Server version: `12.2.2-MariaDB`
+- Container: `space-query-mariadb122`
+- Image: `mariadb:12.2.2`
+- Server version: `12.2.2-MariaDB-ubu2404`
 - Host: `127.0.0.1`
 - Port: `3306`
 - Database: `query_tool_test`
@@ -52,7 +56,7 @@ env \
   SPACE_QUERY_TEST_MYSQL_DATABASE=query_tool_test \
   SPACE_QUERY_TEST_MYSQL_USER=root \
   SPACE_QUERY_TEST_MYSQL_PASSWORD='password' \
-  cargo test mysql_connect_applies_advanced_session_settings --lib -- --ignored --nocapture
+  cargo test mariadb_connect_applies_advanced_session_settings --lib -- --ignored --nocapture
 ```
 
 ## 고급 옵션 적용 테스트
@@ -66,7 +70,7 @@ env \
   SPACE_QUERY_TEST_MYSQL_DATABASE=query_tool_test \
   SPACE_QUERY_TEST_MYSQL_USER=root \
   SPACE_QUERY_TEST_MYSQL_PASSWORD='password' \
-  cargo test mysql_connect_applies_advanced_session_settings --lib -- --ignored --nocapture
+  cargo test mariadb_connect_applies_advanced_session_settings --lib -- --ignored --nocapture
 ```
 
 쿼리 실행에서 사용하는 풀 세션의 고급 옵션 적용 확인:
@@ -78,7 +82,7 @@ env \
   SPACE_QUERY_TEST_MYSQL_DATABASE=query_tool_test \
   SPACE_QUERY_TEST_MYSQL_USER=root \
   SPACE_QUERY_TEST_MYSQL_PASSWORD='password' \
-  cargo test mysql_pool_session_applies_advanced_session_settings --lib -- --ignored --nocapture
+  cargo test mariadb_pool_session_applies_advanced_session_settings --lib -- --ignored --nocapture
 ```
 
 기본 풀 세션 설정 확인:
@@ -115,7 +119,9 @@ mariadb -h 127.0.0.1 -P 3306 -uroot -p'password' \
   -e "SET SESSION time_zone = '+13:00'; SELECT @@SESSION.time_zone;"
 ```
 
-앱의 저장 전 검증은 `MySQL or MariaDB` 공통 backend 때문에 MySQL이 허용하는 넓은 범위까지 통과시킨다. 대신 실제 연결 후 서버 버전이 MariaDB이고 offset이 MariaDB 범위를 벗어나면 `SET SESSION time_zone` 실행 전에 명확한 오류를 반환한다.
+앱은 `DatabaseType::MariaDB`의 backend metadata에서 이 범위를 저장 전에
+검증한다. 연결 후에도 서버 버전이 MariaDB인지 확인하는 방어 검증을 거쳐,
+범위를 벗어난 값은 `SET SESSION time_zone` 실행 전에 명확한 오류로 반환한다.
 
 ## 문자셋과 Collation 주의사항
 
@@ -155,7 +161,7 @@ mariadb -h 127.0.0.1 -P 3306 -uroot -p'password' \
 해결:
 
 - `DbConnectionPool::acquire_session()`에서 MySQL/MariaDB 세션을 얻을 때 `apply_mysql_session_settings()`를 다시 호출한다.
-- `mysql_pool_session_applies_advanced_session_settings` 테스트로 풀 세션에도 옵션이 적용되는지 검증한다.
+- `mariadb_pool_session_applies_advanced_session_settings` 테스트로 풀 세션에도 옵션이 적용되는지 검증한다.
 
 ### Collation 검증이 너무 엄격할 수 있음
 
@@ -186,5 +192,5 @@ MySQL 8은 `+14:00`, `-13:59`를 허용하지만 MariaDB 12.2.2는 각각 `+13:0
 
 해결:
 
-- MySQL/MariaDB 공통 검증은 MySQL 범위를 기준으로 유지한다.
-- 실제 연결 대상이 MariaDB이고 MariaDB 범위를 벗어나면 `MariaDB session time zone ... is outside MariaDB's supported offset range` 오류를 반환한다.
+- MariaDB backend의 저장 전 검증부터 MariaDB 범위를 적용한다.
+- 서버 버전 기반 방어 검증에서도 범위를 벗어나면 `MariaDB session time zone ... is outside MariaDB's supported offset range` 오류를 반환한다.

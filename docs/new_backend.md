@@ -1,5 +1,7 @@
 # 신규 DB 백엔드 추가 체크리스트
 
+> 구현 대조: 2026-07-12
+
 이 문서는 새로운 DB 종류를 추가할 때 개발 누락을 막기 위한 체크리스트다.
 세션/트랜잭션/커밋/롤백 동작의 일관성 원칙은 `docs/session.md`,
 `docs/transaction.md`를 따른다.
@@ -207,7 +209,7 @@ helper만 허용된다. backend별 효과 산출(`effects_for_sql`)은 반드시
 
 ### 3.7 테스트
 
-- `tests/db_dispatch_guards.rs`가 통과하는지 확인 (boolean 분기 금지)
+- `cargo test --test db_dispatch_guards`가 통과하는지 확인 (boolean 분기 금지)
 - `src/db/query/query_tests.rs`에 새 db_type 분류/정책 테스트 추가
 - 라이브 테스트 가능하면 docker 기반 라이브 테스트 추가
   (`tests/oracle_compare_test_all_live.rs` 참고)

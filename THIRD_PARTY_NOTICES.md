@@ -1,6 +1,8 @@
 # Third Party Notices
 
-This repository is licensed under `MIT OR Apache-2.0`. Some implementation
+Original SPACE Query code is offered under `MIT OR Apache-2.0`. The bundled
+`tns-thin` component is licensed under Apache-2.0 because portions are modified
+works based on Apache-2.0 material from `python-oracledb`. Other implementation
 details in the TNS thin client were developed with reference to permissively
 licensed upstream projects. Keep this file with source and binary
 redistributions.
@@ -25,6 +27,10 @@ The upstream license, notice, and third-party license files are preserved in:
 - `vendor/python-oracledb/NOTICE.txt`
 - `vendor/python-oracledb/THIRD_PARTY_LICENSES.txt`
 
+The exact reference snapshot is upstream commit
+`a7b40f112949875a2bb1449ffcb068953cd88999`. See
+`crates/tns-thin/PROVENANCE.md` for the reference scope and verification record.
+
 ## go-ora
 
 Portions of the TNS thin implementation are based on or derived from
@@ -32,6 +38,10 @@ Portions of the TNS thin implementation are based on or derived from
 The upstream license file is preserved in:
 
 - `vendor/go-ora/LICENSE`
+
+The exact reference snapshot is upstream commit
+`ef646cf075eb78b91ddb842b0f3c49cd1a3b6a88`. See
+`crates/tns-thin/PROVENANCE.md` for the reference scope and verification record.
 
 MIT License
 

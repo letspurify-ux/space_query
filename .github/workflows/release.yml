@@ -2,8 +2,6 @@ name: Build and release
 
 on:
   push:
-    branches:
-      - main
     tags:
       - "v*"
   workflow_dispatch:
@@ -11,10 +9,61 @@ on:
 permissions:
   contents: read
 
+env:
+  CARGO_TERM_COLOR: always
+  RUST_VERSION: "1.93.1"
+
 jobs:
+  verify:
+    name: Verify release source
+    uses: ./.github/workflows/ci.yml
+    permissions:
+      contents: read
+
+  compliance:
+    name: Verify release compliance files
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Install pinned Rust toolchain
+        run: rustup toolchain install ${{ env.RUST_VERSION }} --profile minimal
+
+      - name: Verify tns-thin package metadata and contents
+        shell: bash
+        run: |
+          grep -Fx 'license = "Apache-2.0"' crates/tns-thin/Cargo.toml
+          cargo package --manifest-path crates/tns-thin/Cargo.toml --locked --list > package-files.txt
+          for required in LICENSE-APACHE LICENSE-MIT NOTICE PROVENANCE.md THIRD_PARTY_NOTICES.md; do
+            grep -Fx "$required" package-files.txt
+          done
+
+      - name: Verify release-owner sign-off
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: bash
+        run: |
+          if grep -Fq -- '- [ ]' RELEASE_COMPLIANCE.md; then
+            echo 'RELEASE_COMPLIANCE.md still contains unchecked release gates.' >&2
+            exit 1
+          fi
+          grep -Fx -- "- Release tag: $GITHUB_REF_NAME" RELEASE_COMPLIANCE.md
+          grep -Eq -- '^- Release owner: .+' RELEASE_COMPLIANCE.md
+          grep -Eq -- '^- Review date: .+' RELEASE_COMPLIANCE.md
+
+      - name: Verify generated dependency licenses
+        shell: bash
+        run: |
+          cargo install cargo-about --locked --version 0.9.0
+          cargo about generate about.hbs -o generated-third-party-dependencies.md
+          cmp THIRD_PARTY_DEPENDENCIES.md generated-third-party-dependencies.md
+
   build:
     name: Build ${{ matrix.name }}
+    needs: [verify, compliance]
     strategy:
+      fail-fast: false
       matrix:
         include:
           - name: macOS arm64
@@ -27,10 +76,10 @@ jobs:
 
     steps:
       - name: Check out repository
-        uses: actions/checkout@v6
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
 
-      - name: Install stable Rust
-        run: rustup update stable --no-self-update
+      - name: Install pinned Rust toolchain
+        run: rustup toolchain install ${{ env.RUST_VERSION }} --profile minimal
 
       - name: Build release binary
         run: cargo build --release --locked --bin space_query
@@ -43,9 +92,10 @@ jobs:
           licenses_dir="$package_dir/licenses"
           mkdir -p "$licenses_dir/tns-thin" "$licenses_dir/go-ora" "$licenses_dir/python-oracledb"
 
-          cp target/release/space_query DISCLAIMER.md "$package_dir/"
+          cp target/release/space_query DISCLAIMER.md RELEASE_COMPLIANCE.md "$package_dir/"
           cp LICENSE-MIT LICENSE-APACHE NOTICE THIRD_PARTY_NOTICES.md THIRD_PARTY_DEPENDENCIES.md "$licenses_dir/"
-          cp crates/tns-thin/THIRD_PARTY_NOTICES.md "$licenses_dir/tns-thin/"
+          cp crates/tns-thin/NOTICE crates/tns-thin/THIRD_PARTY_NOTICES.md \
+            crates/tns-thin/PROVENANCE.md "$licenses_dir/tns-thin/"
           cp vendor/go-ora/LICENSE "$licenses_dir/go-ora/"
           cp vendor/python-oracledb/LICENSE.txt vendor/python-oracledb/NOTICE.txt \
             vendor/python-oracledb/THIRD_PARTY_LICENSES.txt "$licenses_dir/python-oracledb/"
@@ -54,7 +104,7 @@ jobs:
           test -f "$rust_copyright"
           cp "$rust_copyright" "$licenses_dir/RUST_COPYRIGHT.html"
 
-          (cd "$package_dir" && zip -r "../${{ matrix.archive }}" space_query licenses)
+          (cd "$package_dir" && zip -r "../${{ matrix.archive }}" space_query DISCLAIMER.md RELEASE_COMPLIANCE.md licenses)
 
       - name: Package Windows binary
         if: runner.os == 'Windows'
@@ -72,6 +122,7 @@ jobs:
           Copy-Item -Path @(
             "target/release/space_query.exe"
             "DISCLAIMER.md"
+            "RELEASE_COMPLIANCE.md"
           ) -Destination $packageDir
           Copy-Item -Path @(
             "LICENSE-MIT"
@@ -80,7 +131,11 @@ jobs:
             "THIRD_PARTY_NOTICES.md"
             "THIRD_PARTY_DEPENDENCIES.md"
           ) -Destination $licensesDir
-          Copy-Item crates/tns-thin/THIRD_PARTY_NOTICES.md -Destination "$licensesDir/tns-thin/"
+          Copy-Item -Path @(
+            "crates/tns-thin/NOTICE"
+            "crates/tns-thin/THIRD_PARTY_NOTICES.md"
+            "crates/tns-thin/PROVENANCE.md"
+          ) -Destination "$licensesDir/tns-thin/"
           Copy-Item vendor/go-ora/LICENSE -Destination "$licensesDir/go-ora/"
           Copy-Item -Path @(
             "vendor/python-oracledb/LICENSE.txt"
@@ -97,7 +152,7 @@ jobs:
           Compress-Archive -Path "$packageDir/*" -DestinationPath "dist/${{ matrix.archive }}"
 
       - name: Upload build artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: ${{ matrix.archive }}
           path: dist/${{ matrix.archive }}
@@ -110,14 +165,62 @@ jobs:
     needs: build
     runs-on: ubuntu-latest
     permissions:
+      attestations: write
       contents: write
+      id-token: write
 
     steps:
       - name: Download build artifacts
-        uses: actions/download-artifact@v5
+        uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5.0.0
         with:
           path: dist
           merge-multiple: true
+
+      - name: Verify release archive contents
+        shell: bash
+        run: |
+          rm -rf verify
+          mkdir -p verify/macos verify/windows
+          unzip -q dist/space_query-macos-arm64.zip -d verify/macos
+          unzip -q dist/space_query-windows-x86_64.zip -d verify/windows
+          test -f verify/macos/space_query
+          test -f verify/macos/DISCLAIMER.md
+          test -f verify/macos/RELEASE_COMPLIANCE.md
+          test -f verify/windows/space_query.exe
+          test -f verify/windows/DISCLAIMER.md
+          test -f verify/windows/RELEASE_COMPLIANCE.md
+          for platform in macos windows; do
+            for required in \
+              LICENSE-APACHE \
+              LICENSE-MIT \
+              NOTICE \
+              THIRD_PARTY_NOTICES.md \
+              THIRD_PARTY_DEPENDENCIES.md \
+              tns-thin/NOTICE \
+              tns-thin/THIRD_PARTY_NOTICES.md \
+              tns-thin/PROVENANCE.md \
+              go-ora/LICENSE \
+              python-oracledb/LICENSE.txt \
+              python-oracledb/NOTICE.txt \
+              python-oracledb/THIRD_PARTY_LICENSES.txt \
+              RUST_COPYRIGHT.html; do
+              test -f "verify/$platform/licenses/$required"
+            done
+          done
+
+      - name: Generate and verify SHA-256 checksums
+        working-directory: dist
+        shell: bash
+        run: |
+          sha256sum \
+            space_query-macos-arm64.zip \
+            space_query-windows-x86_64.zip > SHA256SUMS
+          sha256sum --check SHA256SUMS
+
+      - name: Attest release archives
+        uses: actions/attest@59d89421af93a897026c735860bf21b6eb4f7b26 # v4.1.0
+        with:
+          subject-checksums: dist/SHA256SUMS
 
       - name: Create GitHub release
         env:

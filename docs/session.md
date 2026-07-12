@@ -1,5 +1,7 @@
 # DB 세션 관리 원칙
 
+> 구현 대조: 2026-07-12 (`src/db/session_policy.rs`, `src/db/transaction.rs`, `src/ui/sql_editor/execution.rs`, `src/ui/sql_editor/mod.rs`)
+
 이 문서는 쿼리 탭과 DB 세션의 소유권, `cancel`, `timeout`, `lazy fetch`, transaction, 세션 재사용 정책을 정의한다.
 
 이 문서의 목적은 cancel 로직을 개선할 때 다음 요구사항을 일관되게 구현하도록 하는 것이다.
@@ -114,12 +116,12 @@ Current schema/database는 connection-level logical state로 본다.
 
 Cancel 버튼을 누르면 즉시 cancel 대상 snapshot을 만든다.
 
-snapshot에는 가능한 한 다음 정보를 포함한다.
+현재 snapshot은 다음 정보를 포함한다.
 
 ```rust
 struct CancelTargetSnapshot {
-    tab_id: TabId,
-    editor_id: EditorId,
+    tab_id: u64,
+    editor_id: u64,
     operation_id: u64,
     connection_generation: u64,
     db_type: DatabaseType,
@@ -175,6 +177,7 @@ enum SqlKind {
     SelectLike,
     Dml,
     Ddl,
+    SessionControl,
     PlsqlOrProcedure,
     Script,
     TransactionControl,
@@ -213,7 +216,17 @@ enum SqlKind {
 - `TRUNCATE`
 - `RENAME`
 
-### 6.4 PL/SQL 또는 procedure
+### 6.4 SessionControl
+
+다음처럼 물리 세션의 상태나 연결 범위를 바꾸는 명령을 분류한다.
+
+- MySQL/MariaDB `USE`, `RESET CONNECTION`, `LOCK/UNLOCK TABLES`, `SET ROLE`
+- Oracle `ALTER SESSION`, `ALTER SYSTEM`, `SET ROLE`
+
+interrupt 뒤에는 이전 세션 상태를 보존해야 하는지 먼저 판단하고, 보존할 상태가
+없으면 물리 세션을 교체한다.
+
+### 6.5 PL/SQL 또는 procedure
 
 다음은 실행 범위가 불명확할 수 있으므로 보수적으로 본다.
 
@@ -223,18 +236,24 @@ enum SqlKind {
 - stored procedure 실행
 - side effect를 가질 수 있는 function 실행
 
-### 6.5 Script
+### 6.6 Script
 
 여러 statement를 순차 실행하는 경우 script로 본다.
 
-script는 일부 statement만 실행됐을 수 있으므로 cancel / timeout 후 같은 물리 세션 재사용을 기본 금지한다.
+script는 일부 statement만 실행됐을 수 있으므로 statement별 효과와 이전 retained
+state를 합쳐 보수적으로 판단한다. interrupt 후에는 같은 물리 세션을 일반 SELECT
+세션처럼 재사용하지 않는다. 보존할 작업이 있으면 사용자 결정을 요구하고,
+그렇지 않으면 물리 세션을 교체한다.
 
-### 6.6 Unknown
+### 6.7 Unknown
 
-분류할 수 없는 SQL은 안전하지 않은 것으로 본다.
+분류할 수 없는 SQL은 안전하지 않은 것으로 본다. 이전 retained state가 없고
+auto-commit 상태에서 보존할 작업도 없다면 물리 세션을 교체한다. auto-commit이
+꺼져 있거나 이전 세션을 보존해야 하면 commit/rollback 또는 physical-session
+resolution을 요구한다.
 
 ```text
-SqlKind::Unknown → 물리 세션 교체
+SqlKind::Unknown → 재사용 금지; 상태에 따라 물리 세션 교체 또는 사용자 해결 요구
 ```
 
 ---
@@ -347,9 +366,9 @@ LazyFetchState::Unknown → 물리 세션 교체
 
 ## 8. Lazy Fetch command 정책
 
-기존 cancel과 별도로 lazy fetch 정리 명령을 분리한다.
+현재 일반 실행 cancel과 별도로 lazy fetch 정리 명령을 분리한다.
 
-권장 command:
+현재 command:
 
 ```rust
 enum LazyFetchCommand {
@@ -441,6 +460,7 @@ MySQL:
 - max_execution_time
 
 MariaDB:
+- error 1969
 - max_statement_time
 - maximum statement execution time exceeded
 ```
@@ -524,18 +544,20 @@ InterruptKind::UnsafeOrUnknown → 물리 세션 교체
 
 ## 10. Error classification 규칙
 
-error classification은 다음 순서를 지킨다.
+error classification은 구조화된 DB 오류 코드와 fatal marker를 함께 본다.
 
 ```text
-1. 명시적인 fatal connection marker 확인
-2. recoverable timeout marker 확인
-3. non-recoverable timeout marker 확인
-4. cancel marker 확인
-5. 일반 SQL error인지 확인
+1. lock wait timeout을 일반 recoverable timeout과 분리
+2. MySQL 3024 / MariaDB 1969 같은 구조화된 timeout 코드 확인
+3. 구조화된 코드가 없으면 fatal connection marker 우선 확인
+4. DB별 recoverable timeout marker 확인
+5. cancel marker와 일반 SQL error 구분
 6. 판단 불가 시 UnsafeOrUnknown
 ```
 
-단, 실제 구현에서 cancel marker와 fatal marker가 동시에 보이는 경우 fatal marker를 우선한다.
+구조화된 3024/1969 코드는 일반 timeout 문구보다 강한 근거다. 반대로 구조화된
+코드가 없는 메시지에서 cancel/recoverable 문구와 fatal marker가 함께 보이면
+fatal marker를 우선한다.
 
 `has_connection_error`는 다음처럼 판단한다.
 
@@ -590,7 +612,8 @@ elapsed time은 로그나 진단 정보로만 사용한다.
 
 ## 12. Recoverable timeout 정책
 
-timeout도 살릴 수 있는 것은 살린다.
+timeout도 살릴 수 있는 것은 살린다. 현재 중앙 함수는 SQL 종류와 lazy fetch
+상태를 먼저 확인한 뒤 DB별 message classifier에 위임한다.
 
 ```rust
 fn is_recoverable_timeout(
@@ -607,27 +630,14 @@ fn is_recoverable_timeout(
         return false;
     }
 
-    let msg = err_msg.to_ascii_lowercase();
-
-    match db_type {
-        DatabaseType::Oracle => {
-            err_msg.contains("DPI-1067")
-        }
-
-        DatabaseType::MySQL => {
-            err_msg.contains("3024")
-                || msg.contains("er_query_timeout")
-                || msg.contains("maximum statement execution time exceeded")
-                || msg.contains("max_execution_time")
-        }
-
-        DatabaseType::MariaDB => {
-            msg.contains("max_statement_time")
-                || msg.contains("maximum statement execution time exceeded")
-        }
-    }
+    is_recoverable_timeout_message(db_type, err_msg)
 }
 ```
+
+message classifier는 lock wait timeout을 먼저 제외한다. MySQL/MariaDB의 구조화된
+`ERROR 3024`/`ERROR 1969`는 recoverable 근거로 사용하고, 구조화된 코드가 없으면
+fatal connection marker를 먼저 제외한 뒤 Oracle `DPI-1067` 또는 backend별 timeout
+문구를 확인한다.
 
 다음 timeout은 recoverable로 보지 않는다.
 
@@ -653,14 +663,14 @@ lock wait timeout은 connection 자체는 살아있을 수 있지만 transaction
 
 따라서 자동 재사용 대상으로 보지 않는다.
 
-권장 처리:
+현재 처리 원칙:
 
 ```text
-DML + autocommit off + lock wait timeout
-→ RequireCommitOrRollback 또는 MarkDirtyAndBlockNextExecution
+DML + autocommit off + 보존할 transaction 있음
+→ RequireCommitOrRollback
 
 그 외 lock wait timeout
-→ 기본적으로 ReplacePhysicalSessionKeepUiConnected
+→ 기본적으로 물리 세션 폐기
 ```
 
 ---
@@ -677,9 +687,10 @@ SELECT 1 FROM dual;
 SELECT 1;
 ```
 
-Oracle은 가능하면 `Connection::ping()`도 함께 사용할 수 있다.
+OCI Oracle은 `Connection::ping()`과 `SELECT 1 FROM dual`을 사용한다. Thin은
+`OracleThinSession::ping()`과 thin query 경로를 사용하는 별도 health check를 둔다.
 
-권장 순서:
+현재 재사용 판단 순서:
 
 ```text
 Oracle:
@@ -739,7 +750,7 @@ operation_id 또는 connection_generation이 맞지 않는 stale event는 무시
 
 ## 15. 세션 결정 enum
 
-구현 시 다음 결정을 사용한다.
+현재 다음 결정을 사용한다.
 
 ```rust
 enum SessionDecision {
@@ -747,6 +758,7 @@ enum SessionDecision {
     ReuseSamePhysicalSession,
     ReplacePhysicalSessionKeepUiConnected,
     RequireCommitOrRollback,
+    RequirePhysicalSessionResolution,
     MarkDirtyAndBlockNextExecution,
 }
 ```
@@ -788,7 +800,13 @@ enum SessionDecision {
 - Rollback
 - 물리 세션 폐기
 
-### 15.5 MarkDirtyAndBlockNextExecution
+### 15.5 RequirePhysicalSessionResolution
+
+temporary table, prepared statement, user variable, table/named lock, transaction mode
+override처럼 물리 세션 보존은 필요하지만 commit/rollback으로 해결할 수 없는 상태다.
+사용자에게 명시적 cleanup 또는 물리 세션 폐기를 요구한다.
+
+### 15.6 MarkDirtyAndBlockNextExecution
 
 transaction 상태를 신뢰할 수 없고 자동 폐기도 위험한 경우 사용한다.
 
@@ -798,94 +816,25 @@ transaction 상태를 신뢰할 수 없고 자동 폐기도 위험한 경우 사
 
 ## 16. 최종 decision 함수
 
-cancel / timeout 후처리는 다음 의사코드에 맞춰 구현한다.
+현재 `decide_session_after_interrupt()`는 다음 순서로 판단한다.
 
-```rust
-fn decide_session_after_interrupt(ctx: ExecContext) -> SessionDecision {
-    // 1. stale event 방지
-    if !ctx.operation_matches || !ctx.connection_generation_matches {
-        return SessionDecision::IgnoreStaleEvent;
-    }
+1. `operation_id`/`connection_generation`이 stale이면 이벤트를 무시한다.
+2. worker가 끝나지 않았거나 실행 상태가 `Unknown`이면 물리 세션을 교체한다.
+3. connection error이면 물리 세션을 교체한다.
+4. 이전 retained session이 `InvalidSession`이면 physical-session resolution을
+   요구한다.
+5. DDL/SessionControl, script, DML/PLSQL, TransactionControl, Unknown 순서로 SQL
+   효과와 이전 retained state를 합쳐 commit/rollback, physical-session resolution,
+   dirty block 또는 물리 세션 교체를 선택한다.
+6. syntactic SELECT라도 locking read나 session-bound effect가 있으면 일반 SELECT
+   재사용 경로에서 제외한다.
+7. lazy fetch는 Waiting/Fetching/Closed별 cursor close와 worker 종료 flag를 다시
+   검증한다.
+8. cancel 또는 recoverable timeout인지, timeout 설정 복구가 성공했는지 확인한다.
+9. 마지막 health check까지 성공한 경우에만 같은 물리 세션을 재사용한다.
 
-    // 2. 연결 자체가 깨졌으면 같은 물리 세션 재사용 금지
-    if ctx.has_connection_error {
-        return SessionDecision::ReplacePhysicalSessionKeepUiConnected;
-    }
-
-    // 3. DDL/SessionControl interrupt는 rollback 가능성보다 물리 세션
-    //    신뢰성이 더 애매하다. 이전에 보존해야 할 dirty/session-bound
-    //    상태가 없으면 새 물리 세션으로 교체한다.
-    if matches!(ctx.sql_kind, SqlKind::Ddl | SqlKind::SessionControl) {
-        if ctx.prior_retained_state.requires_physical_session_preservation() {
-            if ctx.prior_retained_state.may_have_uncommitted_work() {
-                return SessionDecision::RequireCommitOrRollback;
-            }
-            return SessionDecision::RequirePhysicalSessionResolution;
-        }
-        return SessionDecision::ReplacePhysicalSessionKeepUiConnected;
-    }
-
-    // 4. DML/PLSQL/script는 실행 범위와 transaction 상태가 애매함
-    if matches!(ctx.sql_kind, SqlKind::Dml | SqlKind::PlsqlOrProcedure | SqlKind::Script) {
-        if !ctx.autocommit {
-            return SessionDecision::RequireCommitOrRollback;
-        }
-
-        return SessionDecision::ReplacePhysicalSessionKeepUiConnected;
-    }
-
-    // 5. SELECT 계열만 세션 재사용 후보
-    if !ctx.sql_kind.is_select_like() {
-        return SessionDecision::ReplacePhysicalSessionKeepUiConnected;
-    }
-
-    // 6. lazy fetch 상태 검증
-    match ctx.lazy_state {
-        LazyFetchState::None => {
-            // 일반 SELECT
-        }
-
-        LazyFetchState::Waiting => {
-            if !ctx.lazy_close_requested || !ctx.cursor_closed {
-                return SessionDecision::ReplacePhysicalSessionKeepUiConnected;
-            }
-        }
-
-        LazyFetchState::Fetching => {
-            if !ctx.lazy_cancel_requested || !ctx.fetch_worker_done || !ctx.cursor_closed {
-                return SessionDecision::ReplacePhysicalSessionKeepUiConnected;
-            }
-        }
-
-        LazyFetchState::Closed => {
-            // OK
-        }
-
-        LazyFetchState::CloseRequested
-        | LazyFetchState::CancelRequested
-        | LazyFetchState::Unknown => {
-            return SessionDecision::ReplacePhysicalSessionKeepUiConnected;
-        }
-    }
-
-    // 7. timeout은 recoverable인 경우만 살림
-    if ctx.timed_out && !ctx.recoverable_timeout {
-        return SessionDecision::ReplacePhysicalSessionKeepUiConnected;
-    }
-
-    // 8. timeout 설정 복구 실패 시 세션 재사용 금지
-    if !ctx.timeout_settings_restored {
-        return SessionDecision::ReplacePhysicalSessionKeepUiConnected;
-    }
-
-    // 9. 최종 health check
-    if ctx.health_check_ok {
-        SessionDecision::ReuseSamePhysicalSession
-    } else {
-        SessionDecision::ReplacePhysicalSessionKeepUiConnected
-    }
-}
-```
+이 함수는 `prior_retained_state`와 `TransactionStatementStateHint`를 함께 사용한다.
+따라서 SQL kind 하나만으로 미커밋 작업이나 session residue/lock을 폐기하지 않는다.
 
 ---
 
@@ -918,6 +867,9 @@ worker 종료 확인 전에는 같은 물리 세션으로 새 쿼리를 실행�
 ## 18. Oracle cancel 처리
 
 Oracle 일반 실행 cancel은 실행 중 connection에 대해 `break_execution()`을 사용한다.
+OCI와 Thin 모두 cancel handle을 제공하지만 wire-level 정리 방식은 다르다. OCI는
+OCIBreak 계열 경로를 사용하고 Thin은 TNS break/reset handshake를 완료한 뒤에만
+세션 재사용 여부를 판단한다.
 
 처리 흐름:
 
@@ -949,7 +901,9 @@ ORA-3114 / ORA-03113 / ORA-03114
 
 ## 19. MySQL / MariaDB cancel 처리
 
-MySQL / MariaDB 일반 실행 cancel은 별도 cancel connection에서 `KILL QUERY <connection_id>`를 사용한다.
+MySQL / MariaDB 일반 실행 cancel은 별도 cancel connection에서
+`KILL QUERY <connection_id>`를 사용한다. 강제 cancel 단계에서는 필요하면
+`KILL CONNECTION <connection_id>`까지 실행해 물리 세션을 포기한다.
 
 처리 흐름:
 
@@ -974,7 +928,8 @@ Cancel 클릭
 MySQL / MariaDB timeout 처리:
 
 ```text
-error 3024 / ER_QUERY_TIMEOUT / max_execution_time
+MySQL error 3024 / ER_QUERY_TIMEOUT / max_execution_time
+MariaDB error 1969 / max_statement_time
 → SELECT 계열이면 health check 후 재사용 가능
 
 server has gone away / lost connection / commands out of sync / error 2006 / error 2013
@@ -1145,11 +1100,12 @@ Cancel 후 물리 세션이 교체 대상으로 표시된 상태에서 사용자
 
 ---
 
-## 27. 구현 변경 지침
+## 27. 현재 구현 매핑 및 변경 지침
 
 ### 27.1 Cancel 후 무조건 세션 폐기 금지
 
-기존 로직에 다음 형태가 있다면 제거하거나 decision 기반으로 변경한다.
+현재 구현은 `decide_session_after_interrupt()`와 DB별 worker cleanup을 사용한다.
+새 경로에서 다음처럼 cancel flag만 보고 무조건 폐기하는 로직을 추가하면 안 된다.
 
 ```rust
 if cancel_flag {
@@ -1181,12 +1137,12 @@ CancelFetch
 ForceCancel + 물리 세션 교체
 ```
 
-### 27.3 완료 이벤트 확장
+### 27.3 Lazy fetch 완료 이벤트
 
-`LazyFetchClosed` 이벤트는 가능하면 다음 정보를 포함하도록 확장한다.
+현재 `QueryProgress::LazyFetchClosed` 이벤트는 다음 정보를 포함한다.
 
 ```rust
-struct LazyFetchClosedEvent {
+QueryProgress::LazyFetchClosed {
     index: usize,
     session_id: u64,
     operation_id: u64,
@@ -1198,13 +1154,14 @@ struct LazyFetchClosedEvent {
 }
 ```
 
-### 27.4 실행 완료 이벤트 확장
+### 27.4 실행 완료 이벤트
 
 일반 실행 완료 이벤트도 세션 결정에 필요한 정보를 포함한다.
 
 ```rust
 struct ExecutionFinishedEvent {
-    tab_id: TabId,
+    tab_id: u64,
+    editor_id: u64,
     operation_id: u64,
     connection_generation: u64,
     db_type: DatabaseType,
@@ -1217,63 +1174,56 @@ struct ExecutionFinishedEvent {
 }
 ```
 
-### 27.5 Health check 함수 추가
+### 27.5 Health check 함수
 
-공통 health check 함수를 추가한다.
+현재 공통 진입점은 `PhysicalSession`을 받아 DB별 health check로 분기한다. Oracle은
+OCI 연결의 `ping`과 `SELECT 1 FROM dual`을, MySQL/MariaDB는 `ping`과 `SELECT 1`을
+모두 통과해야 재사용 가능하다고 판단한다. Thin Oracle 연결은 실행 경로에서 별도
+wire health check를 수행한다.
 
 ```rust
-fn health_check_session(
-    db_type: DatabaseType,
-    session: &mut PhysicalSession,
-) -> Result<bool, String> {
-    match db_type {
-        DatabaseType::Oracle => {
-            // Prefer ping if available, then SELECT 1 FROM dual.
-            // Return false on any error.
-        }
-
-        DatabaseType::MySQL | DatabaseType::MariaDB => {
-            // Prefer ping if available, then SELECT 1.
-            // Return false on any error.
-        }
+fn health_check_session(session: PhysicalSession<'_>, log_context: &str) -> bool {
+    match session {
+        PhysicalSession::Oracle(conn) => health_check_oracle_session(conn, log_context),
+        PhysicalSession::MySql(conn) => health_check_mysql_session(conn, log_context),
     }
 }
 ```
 
-### 27.6 Decision 적용 함수 추가
+### 27.6 Decision 적용 함수
 
 ```rust
-fn apply_session_decision(
+fn apply_session_decision<A: SessionDecisionApplier>(
     decision: SessionDecision,
-    logical_session: &mut LogicalSession,
-    physical_session: Option<&mut PhysicalSession>,
+    applier: &mut A,
 ) {
     match decision {
         SessionDecision::IgnoreStaleEvent => {}
 
         SessionDecision::ReuseSamePhysicalSession => {
-            logical_session.mark_connected();
-            logical_session.clear_replace_pending();
+            applier.mark_connected();
+            applier.clear_replace_pending();
         }
 
         SessionDecision::ReplacePhysicalSessionKeepUiConnected => {
-            if let Some(session) = physical_session {
-                session.discard();
-            }
-
-            logical_session.mark_connected();
-            logical_session.mark_replace_pending();
+            applier.discard_physical_session();
+            applier.mark_connected();
+            applier.mark_replace_pending();
         }
 
         SessionDecision::RequireCommitOrRollback => {
-            logical_session.mark_connected();
-            logical_session.mark_transaction_decision_required();
+            applier.mark_connected();
+            applier.mark_transaction_decision_required();
+        }
+
+        SessionDecision::RequirePhysicalSessionResolution => {
+            applier.mark_connected();
+            applier.mark_physical_session_resolution_required();
         }
 
         SessionDecision::MarkDirtyAndBlockNextExecution => {
-            logical_session.mark_connected();
-            logical_session.mark_dirty();
-            logical_session.block_next_execution();
+            applier.mark_connected();
+            applier.mark_dirty_and_block_next_execution();
         }
     }
 }
@@ -1339,11 +1289,11 @@ Oracle timeout
 → 물리 세션 교체
 ```
 
-### 28.6 MySQL recoverable timeout
+### 28.6 MySQL / MariaDB recoverable timeout
 
 ```text
-MySQL SELECT timeout
-→ error 3024 / ER_QUERY_TIMEOUT
+MySQL/MariaDB SELECT timeout
+→ MySQL error 3024 / ER_QUERY_TIMEOUT 또는 MariaDB error 1969
 → worker 종료
 → health check 성공
 → 같은 물리 세션 재사용
@@ -1371,9 +1321,10 @@ UPDATE 실행 중 Cancel
 
 ```text
 script 실행 중 Cancel
-→ 일부 statement 실행 가능성 있음
-→ 같은 물리 세션 재사용 금지
-→ 필요 시 dirty-session 처리
+→ 완료된 statement 효과와 중단된 statement 분류 확인
+→ 미커밋 작업/session residue 가능성이 있으면 사용자 결정 요구
+→ 보존할 상태가 없으면 물리 세션 교체
+→ 같은 물리 세션을 일반 SELECT처럼 재사용하지 않음
 ```
 
 ### 28.10 다중 탭
@@ -1411,7 +1362,7 @@ script 실행 중 Cancel
 
 - `SELECT SLEEP(30)` cancel 후 `SELECT 1`
 - `KILL QUERY` 후 worker 종료 전 재사용하지 않는지 확인
-- error 3024 timeout 후 health check
+- MySQL error 3024 / MariaDB error 1969 timeout 후 health check
 - `server has gone away` 후 물리 세션 교체
 - lazy fetch waiting close 후 재사용
 - lazy fetch fetching cancel 후 재사용

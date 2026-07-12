@@ -729,6 +729,62 @@ impl ObjectBrowserWidget {
         }
     }
 
+    #[doc(hidden)]
+    pub fn capture_tour_set_example_metadata(&mut self) {
+        let cache = ObjectCache {
+            tables: vec![
+                "DEPT".to_string(),
+                "EMP".to_string(),
+                "SALGRADE".to_string(),
+                "SQ_CUSTOMERS".to_string(),
+                "SQ_ORDERS".to_string(),
+            ],
+            views: vec![
+                "EMP_DETAILS_VIEW".to_string(),
+                "SQ_ORDER_SUMMARY".to_string(),
+            ],
+            procedures: vec!["RAISE_SALARY".to_string()],
+            functions: vec!["ANNUAL_SALARY".to_string()],
+            sequences: vec!["SQ_ORDER_SEQ".to_string()],
+            triggers: vec!["EMP_AUDIT_TRG".to_string()],
+            packages: vec!["EMP_API".to_string()],
+            ..Default::default()
+        };
+        *self
+            .current_db_type
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = crate::db::DatabaseType::Oracle;
+        *self
+            .object_cache
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = cache.clone();
+        *self
+            .scope_options
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) =
+            vec!["SYSTEM".to_string(), "SYS".to_string()];
+        *self
+            .selected_scope
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some("SYSTEM".to_string());
+        self.scope_choice.clear();
+        self.scope_choice.add_choice("SYSTEM|SYS");
+        self.scope_choice.set_value(0);
+        self.scope_choice.activate();
+        Self::rebuild_root_categories_for_db_type(
+            &mut self.tree,
+            crate::db::DatabaseType::Oracle,
+            &cache,
+        );
+        Self::populate_tree(&mut self.tree, &cache, "");
+        let _ = self.tree.open("Tables", false);
+        let _ = self.tree.open("Views", false);
+        let _ = self.tree.select("Tables/EMP", false);
+        self.flex.layout();
+        self.scope_choice.redraw();
+        self.tree.redraw();
+    }
+
     pub fn selected_scope(&self) -> Option<String> {
         self.selected_scope
             .lock()
