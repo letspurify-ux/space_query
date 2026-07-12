@@ -11,7 +11,7 @@ categories = ["database"]
 
 [dependencies]
 aes = "0.8"
-cbc = "0.1"
+cbc = "0.2"
 chrono = "0.4"
 hmac = "0.12"
 libc = "0.2"
