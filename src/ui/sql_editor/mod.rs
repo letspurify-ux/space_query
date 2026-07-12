@@ -5069,8 +5069,8 @@ mod execution_state_tests {
 
     #[test]
     #[cfg_attr(
-        target_os = "macos",
-        ignore = "FLTK TextBuffer tests require the process main thread on macOS"
+        any(target_os = "macos", target_os = "linux"),
+        ignore = "FLTK TextBuffer tests require a native UI test environment"
     )]
     fn block_bounds_fallback_stops_at_last_line() {
         let text = "SELECT 1;\nSELECT 2";
@@ -5091,8 +5091,8 @@ mod execution_state_tests {
 
     #[test]
     #[cfg_attr(
-        target_os = "macos",
-        ignore = "FLTK TextBuffer tests require the process main thread on macOS"
+        any(target_os = "macos", target_os = "linux"),
+        ignore = "FLTK TextBuffer tests require a native UI test environment"
     )]
     fn block_bounds_fallback_stops_at_first_line() {
         let text = "SELECT 1\n\nSELECT 2";
@@ -5414,8 +5414,8 @@ mod execution_state_tests {
 
     #[test]
     #[cfg_attr(
-        target_os = "macos",
-        ignore = "FLTK TextBuffer tests require the process main thread on macOS"
+        any(target_os = "macos", target_os = "linux"),
+        ignore = "FLTK TextBuffer tests require a native UI test environment"
     )]
     fn inserted_text_reads_live_buffer_for_same_length_replacement() {
         let original = "SELECT a FROM dual";
