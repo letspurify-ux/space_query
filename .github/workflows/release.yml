@@ -43,6 +43,13 @@ jobs:
       - name: Verify generated dependency licenses
         shell: bash
         run: |
+          for required in \
+            licenses/cfltk/LICENSE \
+            licenses/zstd/LICENSE \
+            licenses/odpi-c/LICENSE.txt \
+            licenses/odpi-c/NOTICE.txt; do
+            test -f "$required"
+          done
           cargo install cargo-about --locked --version 0.9.0 --features cli
           cargo about generate about.hbs -o generated-third-party-dependencies.md
           cmp THIRD_PARTY_DEPENDENCIES.md generated-third-party-dependencies.md
@@ -78,7 +85,8 @@ jobs:
         run: |
           package_dir="dist/package"
           licenses_dir="$package_dir/licenses"
-          mkdir -p "$licenses_dir/tns-thin" "$licenses_dir/go-ora" "$licenses_dir/python-oracledb"
+          mkdir -p "$licenses_dir/tns-thin" "$licenses_dir/go-ora" "$licenses_dir/python-oracledb" \
+            "$licenses_dir/cfltk" "$licenses_dir/zstd" "$licenses_dir/odpi-c"
 
           cp target/release/space_query DISCLAIMER.md "$package_dir/"
           cp LICENSE-MIT LICENSE-APACHE NOTICE THIRD_PARTY_NOTICES.md THIRD_PARTY_DEPENDENCIES.md "$licenses_dir/"
@@ -87,6 +95,9 @@ jobs:
           cp vendor/go-ora/LICENSE "$licenses_dir/go-ora/"
           cp vendor/python-oracledb/LICENSE.txt vendor/python-oracledb/NOTICE.txt \
             vendor/python-oracledb/THIRD_PARTY_LICENSES.txt "$licenses_dir/python-oracledb/"
+          cp licenses/cfltk/LICENSE "$licenses_dir/cfltk/"
+          cp licenses/zstd/LICENSE "$licenses_dir/zstd/"
+          cp licenses/odpi-c/LICENSE.txt licenses/odpi-c/NOTICE.txt "$licenses_dir/odpi-c/"
 
           rust_copyright="$(rustc --print sysroot)/share/doc/rust/COPYRIGHT.html"
           test -f "$rust_copyright"
@@ -105,6 +116,9 @@ jobs:
             "$licensesDir/tns-thin"
             "$licensesDir/go-ora"
             "$licensesDir/python-oracledb"
+            "$licensesDir/cfltk"
+            "$licensesDir/zstd"
+            "$licensesDir/odpi-c"
           ) | Out-Null
 
           Copy-Item -Path @(
@@ -129,6 +143,12 @@ jobs:
             "vendor/python-oracledb/NOTICE.txt"
             "vendor/python-oracledb/THIRD_PARTY_LICENSES.txt"
           ) -Destination "$licensesDir/python-oracledb/"
+          Copy-Item licenses/cfltk/LICENSE -Destination "$licensesDir/cfltk/"
+          Copy-Item licenses/zstd/LICENSE -Destination "$licensesDir/zstd/"
+          Copy-Item -Path @(
+            "licenses/odpi-c/LICENSE.txt"
+            "licenses/odpi-c/NOTICE.txt"
+          ) -Destination "$licensesDir/odpi-c/"
 
           $rustCopyright = Join-Path (rustc --print sysroot) "share/doc/rust/COPYRIGHT.html"
           if (-not (Test-Path $rustCopyright)) {
@@ -188,6 +208,10 @@ jobs:
               python-oracledb/LICENSE.txt \
               python-oracledb/NOTICE.txt \
               python-oracledb/THIRD_PARTY_LICENSES.txt \
+              cfltk/LICENSE \
+              zstd/LICENSE \
+              odpi-c/LICENSE.txt \
+              odpi-c/NOTICE.txt \
               RUST_COPYRIGHT.html; do
               test -f "verify/$platform/licenses/$required"
             done

@@ -9326,6 +9326,7 @@ impl MainWindow {
         label: &str,
         result: crate::db::QueryResult,
         enable_editing: bool,
+        selection: Option<(i32, i32, i32, i32)>,
     ) -> Result<(), String> {
         let mut state = self
             .state
@@ -9339,7 +9340,11 @@ impl MainWindow {
         if enable_editing {
             let mut result_tabs = state.result_tabs.clone();
             result_tabs.begin_current_edit_mode()?;
-            result_tabs.insert_row_in_current_edit_mode()?;
+        }
+        if let Some((row_start, col_start, row_end, col_end)) = selection {
+            state
+                .result_tabs
+                .capture_tour_select_range(row_start, col_start, row_end, col_end);
         }
         state.refresh_result_edit_controls();
         state.window.redraw();

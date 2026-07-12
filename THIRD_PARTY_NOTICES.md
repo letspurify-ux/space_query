@@ -65,6 +65,19 @@ LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 
+## ODPI-C
+
+Oracle OCI support includes ODPI-C through `oracle` 0.6.3 and `odpic-sys`
+0.1.1. SPACE Query elects the Universal Permissive License, Version 1.0 option
+for this component.
+
+Copyright (c) 2016, 2024 Oracle and/or its affiliates.
+
+The upstream license and notice are included in:
+
+- `licenses/odpi-c/LICENSE.txt`
+- `licenses/odpi-c/NOTICE.txt`
+
 ## Native Libraries Bundled by FLTK
 
 The release binaries statically link native libraries built by `fltk-sys`.
@@ -82,6 +95,24 @@ following acknowledgment is required for executable distributions:
 FLTK also builds bundled libpng and zlib code. Their source licenses preserve
 the upstream copyright and license notices and are available with the exact
 `fltk-sys` source selected by `Cargo.lock`.
+
+### cfltk
+
+The statically linked FLTK support code includes `cfltk` from `fltk-sys`
+1.5.23 under the MIT License.
+
+Copyright (c) 2019 Mohammed Alyousef
+
+The complete license is included in `licenses/cfltk/LICENSE`.
+
+### Zstandard
+
+MySQL support statically links Zstandard 1.5.7 through `zstd-sys`
+2.0.16+zstd.1.5.7. SPACE Query elects Zstandard's BSD License option.
+
+Copyright (c) Meta Platforms, Inc. and affiliates. All rights reserved.
+
+The complete BSD license is included in `licenses/zstd/LICENSE`.
 
 ## MPL Source Availability
 

@@ -2,7 +2,7 @@
 name = "space_query"
 version = "0.1.0"
 edition = "2021"
-description = "SPACE Query: a Toad-like SQL Query Tool built with Rust and FLTK (Oracle, MySQL, MariaDB)"
+description = "SPACE Query: a desktop SQL query tool built with Rust and FLTK (Oracle, MySQL, MariaDB)"
 authors = ["Developer"]
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/letspurify-ux/space_query"

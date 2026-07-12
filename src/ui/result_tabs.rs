@@ -1989,6 +1989,19 @@ impl ResultTabsWidget {
         }
     }
 
+    #[doc(hidden)]
+    pub(crate) fn capture_tour_select_range(
+        &self,
+        row_start: i32,
+        col_start: i32,
+        row_end: i32,
+        col_end: i32,
+    ) {
+        if let Some(mut table) = self.current_table() {
+            table.capture_tour_select_range(row_start, col_start, row_end, col_end);
+        }
+    }
+
     pub fn paste_from_clipboard(&self) -> bool {
         if let Some(mut table) = self.current_table() {
             table.paste_from_clipboard();

@@ -12,7 +12,7 @@ use space_query::{
 use std::{
     fs::File,
     io::Write,
-    sync::{Arc, Mutex},
+    sync::{Arc, Mutex, OnceLock},
     thread,
     time::Duration,
 };
@@ -31,10 +31,40 @@ fn fail(message: impl std::fmt::Display) -> ! {
 
 fn capture_rgb<W: WindowExt>(window: &mut W) -> (Vec<u8>, i32, i32) {
     app::flush();
+    window.make_current();
     let image =
         draw::capture_window(window).unwrap_or_else(|err| fail(format!("capture window: {err}")));
     (image.to_rgb_data(), image.data_w(), image.data_h())
 }
+
+fn fill_missing_pixels(canvas: &mut [u8], fallback: &[u8]) {
+    for (target, source) in canvas.chunks_exact_mut(3).zip(fallback.chunks_exact(3)) {
+        if target == [0, 0, 0] && source != [0, 0, 0] {
+            target.copy_from_slice(source);
+        }
+    }
+}
+
+fn capture_complete_rgb<W: WindowExt>(window: &mut W) -> (Vec<u8>, i32, i32) {
+    let (mut canvas, width, height) = capture_rgb(window);
+    for _ in 0..2 {
+        window.set_damage(true);
+        window.redraw();
+        app::redraw();
+        pump(120);
+        let (frame, frame_width, frame_height) = capture_rgb(window);
+        if frame_width != width || frame_height != height {
+            fail("capture dimensions changed while redrawing");
+        }
+        fill_missing_pixels(&mut canvas, &frame);
+    }
+    (canvas, width, height)
+}
+
+type MainCapture = (Vec<u8>, i32, i32);
+// macOS FLTK captures can contain only the regions redrawn in the current frame.
+// Keep the last complete main-window frame to fill unchanged pixels.
+static LAST_MAIN_CAPTURE: OnceLock<Mutex<Option<MainCapture>>> = OnceLock::new();
 
 fn save_ppm(path: &str, data: &[u8], width: i32, height: i32) {
     let mut file = File::create(path).unwrap_or_else(|err| fail(format!("create capture: {err}")));
@@ -47,16 +77,21 @@ fn save_ppm(path: &str, data: &[u8], width: i32, height: i32) {
 fn save_main(path: &str) {
     let mut window =
         app::widget_from_id::<Window>("main_window").unwrap_or_else(|| fail("main window"));
-    window.hide();
-    app::flush();
-    window.show();
     window.set_damage(true);
     window.redraw();
     app::redraw();
     pump(250);
-    let _ = capture_rgb(&mut window);
-    pump(150);
-    let (data, width, height) = capture_rgb(&mut window);
+    let (mut data, width, height) = capture_complete_rgb(&mut window);
+    let mut previous = LAST_MAIN_CAPTURE
+        .get_or_init(|| Mutex::new(None))
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if let Some((previous_data, previous_width, previous_height)) = previous.as_ref() {
+        if *previous_width == width && *previous_height == height {
+            fill_missing_pixels(&mut data, previous_data);
+        }
+    }
+    *previous = Some((data.clone(), width, height));
     save_ppm(path, &data, width, height);
 }
 
@@ -67,7 +102,7 @@ fn save_main_part(path: &str, x: i32, y: i32, width: i32, height: i32) {
     window.redraw();
     app::redraw();
     pump(400);
-    let (data, full_width, full_height) = capture_rgb(&mut window);
+    let (data, full_width, full_height) = capture_complete_rgb(&mut window);
     if !(x >= 0 && y >= 0 && x + width <= full_width && y + height <= full_height) {
         fail("capture rectangle is outside the main window");
     }
@@ -95,7 +130,7 @@ fn window_by_label(label: &str) -> Option<Window> {
 fn capture_active_dialog(expected_label: &str, path: &str) {
     let mut window = window_by_label(expected_label)
         .unwrap_or_else(|| fail(format!("missing dialog: {expected_label}")));
-    let (data, width, height) = capture_rgb(&mut window);
+    let (data, width, height) = capture_complete_rgb(&mut window);
     save_ppm(path, &data, width, height);
     window.hide();
 }
@@ -165,9 +200,7 @@ fn capture_intellisense(main_window: &mut MainWindow) {
     main.redraw();
     app::redraw();
     pump(200);
-    let _ = capture_rgb(&mut main);
-    pump(120);
-    let (mut canvas, width, height) = capture_rgb(&mut main);
+    let (mut canvas, width, height) = capture_complete_rgb(&mut main);
 
     let mut popup = IntellisensePopup::new();
     let popup_width = 320;
@@ -198,7 +231,7 @@ fn capture_intellisense(main_window: &mut MainWindow) {
     let mut popup_window = app::first_window().unwrap_or_else(|| fail("intellisense popup"));
     let offset_x = popup_window.x_root() - main_x;
     let offset_y = popup_window.y_root() - main_y;
-    let (popup_data, popup_width, popup_height) = capture_rgb(&mut popup_window);
+    let (popup_data, popup_width, popup_height) = capture_complete_rgb(&mut popup_window);
     for y in 0..popup_height {
         let target_y = offset_y + y;
         if !(0..height).contains(&target_y) {
@@ -261,9 +294,10 @@ fn capture_result_grid(main_window: &mut MainWindow) {
     ];
     main_window
         .capture_tour_show_result(
-            "EMP rows",
+            "Result",
             make_result(&columns, rows, "SELECT * FROM EMP ORDER BY EMPNO"),
             false,
+            Some((1, 1, 3, 2)),
         )
         .unwrap_or_else(|err| fail(format!("show result: {err}")));
     pump(350);
@@ -316,13 +350,14 @@ fn capture_result_editing(main_window: &mut MainWindow) {
     ];
     main_window
         .capture_tour_show_result(
-            "Editable EMP",
+            "Result",
             make_result(
                 &columns,
                 rows,
                 "SELECT ROWID, EMPNO, ENAME, JOB, SAL, DEPTNO FROM EMP",
             ),
             true,
+            None,
         )
         .unwrap_or_else(|err| fail(format!("show editable result: {err}")));
     pump(350);
@@ -338,6 +373,7 @@ fn capture_session_activity(main_window: &mut MainWindow) {
         ("RESULT TAB", "VARCHAR2"),
         ("STATE", "VARCHAR2"),
         ("CURRENT ACTIVITY", "VARCHAR2"),
+        ("SQL PREVIEW", "VARCHAR2"),
         ("FETCHED ROWS", "NUMBER"),
         ("ELAPSED", "VARCHAR2"),
     ];
@@ -347,11 +383,12 @@ fn capture_session_activity(main_window: &mut MainWindow) {
             "Oracle",
             "12",
             "Query 1",
-            "Result 1",
+            "1",
             "Fetching",
-            "Lazy fetch",
+            "Fetching query rows",
+            "SELECT * FROM EMP",
             "2,000",
-            "00:04",
+            "4s",
         ],
         &[
             "Local Oracle",
@@ -360,20 +397,22 @@ fn capture_session_activity(main_window: &mut MainWindow) {
             "Query 2",
             "—",
             "Executing",
-            "SELECT",
-            "—",
-            "00:01",
+            "Fetching query rows",
+            "SELECT * FROM DEPT",
+            "0",
+            "1s",
         ],
         &[
             "Local Oracle",
             "Oracle",
             "12",
             "Query 3",
-            "Result 2",
+            "2",
             "Idle",
-            "Retained session",
+            "Fetching query rows",
+            "SELECT * FROM SALGRADE",
             "120",
-            "02:18",
+            "2m 18s",
         ],
     ];
     main_window
@@ -381,6 +420,7 @@ fn capture_session_activity(main_window: &mut MainWindow) {
             "Session Activity",
             make_result(&columns, rows, "SESSION ACTIVITY"),
             false,
+            None,
         )
         .unwrap_or_else(|err| fail(format!("show session activity: {err}")));
     pump(350);

@@ -8091,6 +8091,20 @@ impl ResultTableWidget {
         }
     }
 
+    #[doc(hidden)]
+    pub(crate) fn capture_tour_select_range(
+        &mut self,
+        row_start: i32,
+        col_start: i32,
+        row_end: i32,
+        col_end: i32,
+    ) {
+        self.table
+            .set_selection(row_start, col_start, row_end, col_end);
+        Self::sync_drag_selection_snapshot(&self.table, &self.drag_state);
+        self.table.redraw();
+    }
+
     pub fn paste_from_clipboard(&mut self) {
         let _ = self.table.take_focus();
         app::paste_text(&self.table);
