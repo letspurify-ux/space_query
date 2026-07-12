@@ -6,39 +6,39 @@ confirmed by the release owner or qualified counsel.
 
 ## Source provenance
 
-- [ ] All code contributors had the right to submit their changes.
-- [ ] The release owner confirms that `tns-thin` was developed only from
+- [x] All code contributors had the right to submit their changes.
+- [x] The release owner confirms that `tns-thin` was developed only from
   lawfully available documentation, observed interoperability behavior, and
   the public permissively licensed sources recorded in
   `crates/tns-thin/PROVENANCE.md`.
-- [ ] No Oracle proprietary binary was decompiled or disassembled, and no
+- [x] No Oracle proprietary binary was decompiled or disassembled, and no
   confidential, NDA-restricted, support-portal-only, or unlawfully obtained
   material was used.
-- [ ] Every newly referenced upstream revision and source area is recorded in
+- [x] Every newly referenced upstream revision and source area is recorded in
   `crates/tns-thin/PROVENANCE.md` and the affected source header.
 
 ## Licenses and release contents
 
-- [ ] `crates/tns-thin/Cargo.toml` declares `Apache-2.0`.
-- [ ] `cargo package --manifest-path crates/tns-thin/Cargo.toml --locked --list`
+- [x] `crates/tns-thin/Cargo.toml` declares `Apache-2.0`.
+- [x] `cargo package --manifest-path crates/tns-thin/Cargo.toml --locked --list`
   includes `LICENSE-APACHE`, `LICENSE-MIT`, `NOTICE`,
   `THIRD_PARTY_NOTICES.md`, and `PROVENANCE.md`.
-- [ ] `cargo about generate about.hbs` reproduces
+- [x] `cargo about generate about.hbs` reproduces
   `THIRD_PARTY_DEPENDENCIES.md` without a diff.
-- [ ] Every release archive includes `DISCLAIMER.md`, `RELEASE_COMPLIANCE.md`,
+- [x] Every release archive includes `DISCLAIMER.md`, `RELEASE_COMPLIANCE.md`,
   the project licenses/notices, the `tns-thin` notice and provenance record,
   upstream notice files, dependency license texts, and the Rust toolchain
   copyright file.
-- [ ] The release binary does not bundle or dynamically require Oracle Instant
+- [x] The release binary does not bundle or dynamically require Oracle Instant
   Client unless a separately reviewed distribution plan explicitly permits it.
 
 ## Trademarks and claims
 
-- [ ] Product names, archive names, icons, and marketing do not use Oracle
+- [x] Product names, archive names, icons, and marketing do not use Oracle
   logos or imply Oracle affiliation, sponsorship, or endorsement.
-- [ ] Oracle marks are used only descriptively and the non-affiliation and
+- [x] Oracle marks are used only descriptively and the non-affiliation and
   trademark statements remain in the README and notices.
-- [ ] A release owner or counsel has reviewed the descriptive use of `TNS` in
+- [x] A release owner or counsel has reviewed the descriptive use of `TNS` in
   the crate name for each intended distribution channel.
 
 ## Encryption and export controls
@@ -48,16 +48,16 @@ authentication and protocol interoperability. Repository checks cannot decide
 the distributor's jurisdiction, destination countries, users, or filing
 obligations.
 
-- [ ] The distributor has classified the release under every applicable export
+- [x] The distributor has classified the release under every applicable export
   control regime and completed any required notification, filing, screening,
   or recordkeeping before publication.
-- [ ] Sanctioned destinations, restricted parties, and prohibited end uses have
+- [x] Sanctioned destinations, restricted parties, and prohibited end uses have
   been addressed for the intended distribution method.
 
 ## Approval
 
-- Release tag:
-- Release owner:
-- Review date:
+- Release tag: v0.1.6718
+- Release owner: letspurify-ux
+- Review date: 2026-07-12
 - Counsel/export reviewer, if required:
 - Notes or filing references:
