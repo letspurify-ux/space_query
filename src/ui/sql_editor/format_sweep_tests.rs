@@ -258,8 +258,7 @@ fn format_sweep_audit_token_count(
     formatted: &str,
     db_type: DatabaseType,
 ) -> Option<FormatSweepIssue> {
-    let source = SqlEditorWidget::restore_inline_sqlplus_command_boundaries(source);
-    let source_fingerprint = format_sweep_statement_fingerprint(&source, db_type);
+    let source_fingerprint = format_sweep_statement_fingerprint(source, db_type);
     let formatted_fingerprint = format_sweep_statement_fingerprint(formatted, db_type);
     (source_fingerprint != formatted_fingerprint).then(|| {
         let first_mismatch = source_fingerprint
@@ -718,6 +717,26 @@ fn formatting_sweep_simple_sql_converges() {
     );
     assert!(run.issues.is_empty(), "unexpected issues: {:?}", run.issues);
     assert_eq!(run.probes, 4, "three whitespace probes plus idempotence");
+}
+
+#[test]
+fn formatting_sweep_preserves_conditional_compilation_trailing_comments() {
+    let source = r#"CREATE OR REPLACE PROCEDURE cc_comment IS
+BEGIN
+    $IF DBMS_DB_VERSION.VERSION >= 12 $THEN -- then comment
+        NULL;
+    $ELSE -- else comment
+        NULL;
+    $END -- end comment
+    NULL;
+END cc_comment;"#;
+    let run = format_sweep_run(source, DatabaseType::Oracle);
+    assert!(
+        run.issues.is_empty(),
+        "unexpected issues: {:?}\n{}",
+        run.issues,
+        run.formatted
+    );
 }
 
 #[test]

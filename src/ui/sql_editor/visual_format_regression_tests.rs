@@ -1326,3 +1326,246 @@ INTO (
 
     assert_eq!(formatted, expected);
 }
+
+#[test]
+fn visual_oracle_splits_conditional_compilation_directives_from_branch_bodies() {
+    let formatted = format_stable(
+        r#"CREATE OR REPLACE PROCEDURE visual_cc IS
+BEGIN
+    $IF DBMS_DB_VERSION.VERSION >= 12 $THEN AUDIT ('cc', 'enabled');
+    SELECT $ERROR INTO v_marker FROM dual;
+    AUDIT ('cc', 'outer-tail');
+    $IF $$debug_mode $THEN AUDIT ('cc', 'nested-enabled');
+    $ELSE AUDIT ('cc', 'nested-disabled');
+    $END AUDIT ('cc', 'after-inner');
+    $ELSE AUDIT ('cc', 'disabled');
+    $END AUDIT ('cc', 'done');
+END visual_cc;"#,
+        DatabaseType::Oracle,
+    );
+
+    let if_directives: Vec<&str> = formatted
+        .lines()
+        .filter(|line| line.trim_start().starts_with("$IF"))
+        .collect();
+    let else_directives: Vec<&str> = formatted
+        .lines()
+        .filter(|line| line.trim() == "$ELSE")
+        .collect();
+    let end_directives: Vec<&str> = formatted
+        .lines()
+        .filter(|line| line.trim() == "$END")
+        .collect();
+    let enabled = line_starting_with(&formatted, "AUDIT ('cc', 'enabled')");
+    let error_identifier = line_starting_with(&formatted, "SELECT $ERROR");
+    let outer_tail = line_starting_with(&formatted, "AUDIT ('cc', 'outer-tail')");
+    let nested_enabled = line_starting_with(&formatted, "AUDIT ('cc', 'nested-enabled')");
+    let nested_disabled = line_starting_with(&formatted, "AUDIT ('cc', 'nested-disabled')");
+    let after_inner = line_starting_with(&formatted, "AUDIT ('cc', 'after-inner')");
+    let disabled = line_starting_with(&formatted, "AUDIT ('cc', 'disabled')");
+    let done = line_starting_with(&formatted, "AUDIT ('cc', 'done')");
+
+    assert_eq!(if_directives.len(), 2, "{formatted}");
+    assert_eq!(else_directives.len(), 2, "{formatted}");
+    assert_eq!(end_directives.len(), 2, "{formatted}");
+    assert_eq!(indent(if_directives[0]), 4, "{formatted}");
+    assert_eq!(indent(if_directives[1]), 8, "{formatted}");
+    assert_eq!(indent(else_directives[0]), 8, "{formatted}");
+    assert_eq!(indent(end_directives[0]), 8, "{formatted}");
+    assert_eq!(indent(else_directives[1]), 4, "{formatted}");
+    assert_eq!(indent(end_directives[1]), 4, "{formatted}");
+    assert_eq!(indent(enabled), 8, "{formatted}");
+    assert_eq!(error_identifier.trim(), "SELECT $ERROR", "{formatted}");
+    assert_eq!(indent(outer_tail), 8, "{formatted}");
+    assert_eq!(indent(nested_enabled), 12, "{formatted}");
+    assert_eq!(indent(nested_disabled), 12, "{formatted}");
+    assert_eq!(indent(after_inner), 8, "{formatted}");
+    assert_eq!(indent(disabled), 8, "{formatted}");
+    assert_eq!(indent(done), 4, "{formatted}");
+
+    let identifier = format_stable(
+        "SELECT $IF AS if_col, $THEN AS then_col FROM dual;",
+        DatabaseType::Oracle,
+    );
+    assert!(
+        line_starting_with(&identifier, "SELECT").contains("$IF AS if_col"),
+        "{identifier}"
+    );
+    assert_eq!(
+        line_starting_with(&identifier, "$THEN AS then_col").trim(),
+        "$THEN AS then_col",
+        "{identifier}"
+    );
+}
+
+#[test]
+fn visual_oracle_expands_multiline_xmltable_and_json_table_clauses() {
+    let formatted = format_stable(
+        r#"SELECT x.emp_id, x.emp_name
+FROM XMLTABLE (
+    '/rows/row'
+    PASSING XMLTYPE (
+        '<rows>
+            <row><emp_id>1</emp_id><emp_name>ALICE</emp_name></row>
+         </rows>'
+    )
+    COLUMNS
+        emp_id NUMBER PATH 'emp_id',
+        emp_name VARCHAR2(100) PATH 'emp_name'
+) x;
+
+SELECT j.emp_id, j.emp_name
+FROM JSON_TABLE (
+    '{
+       "employees": [{ "id": 1, "name": "ALICE" }]
+     }',
+    '$.employees[*]'
+    COLUMNS
+        emp_id NUMBER PATH '$.id',
+        emp_name VARCHAR2(100) PATH '$.name'
+) j;"#,
+        DatabaseType::Oracle,
+    );
+
+    let xml_owner = line_starting_with(&formatted, "FROM XMLTABLE (");
+    let passing = line_starting_with(&formatted, "PASSING XMLTYPE (");
+    let json_owner = line_starting_with(&formatted, "FROM JSON_TABLE (");
+    let lines: Vec<&str> = formatted.lines().collect();
+    let columns: Vec<&str> = formatted
+        .lines()
+        .filter(|line| line.trim() == "COLUMNS")
+        .collect();
+    let emp_id_lines: Vec<&str> = formatted
+        .lines()
+        .filter(|line| line.trim_start().starts_with("emp_id NUMBER PATH"))
+        .collect();
+    let emp_name_lines: Vec<&str> = formatted
+        .lines()
+        .filter(|line| line.trim_start().starts_with("emp_name VARCHAR2"))
+        .collect();
+    assert_eq!(columns.len(), 2, "{formatted}");
+    assert_eq!(emp_id_lines.len(), 2, "{formatted}");
+    assert_eq!(emp_name_lines.len(), 2, "{formatted}");
+
+    let passing_idx = lines
+        .iter()
+        .position(|line| *line == passing)
+        .expect("XMLTYPE PASSING line");
+    let first_columns_idx = lines
+        .iter()
+        .position(|line| *line == columns[0])
+        .expect("XMLTABLE COLUMNS line");
+    let xmltype_close = lines[passing_idx + 1..first_columns_idx]
+        .iter()
+        .rev()
+        .find(|line| line.trim() == ")")
+        .expect("standalone XMLTYPE close");
+
+    assert_eq!(xml_owner.trim(), "FROM XMLTABLE (");
+    assert_eq!(passing.trim(), "PASSING XMLTYPE (");
+    assert_eq!(json_owner.trim(), "FROM JSON_TABLE (");
+    assert!(indent(passing) > indent(xml_owner), "{formatted}");
+    assert_eq!(indent(xmltype_close), indent(passing), "{formatted}");
+    assert!(indent(columns[0]) > indent(xml_owner), "{formatted}");
+    assert!(indent(columns[1]) > indent(json_owner), "{formatted}");
+    assert_eq!(
+        indent(emp_id_lines[0]),
+        indent(columns[0]) + 4,
+        "{formatted}"
+    );
+    assert_eq!(
+        indent(emp_name_lines[0]),
+        indent(columns[0]) + 4,
+        "{formatted}"
+    );
+    assert_eq!(
+        indent(emp_id_lines[1]),
+        indent(columns[1]) + 4,
+        "{formatted}"
+    );
+    assert_eq!(
+        indent(emp_name_lines[1]),
+        indent(columns[1]) + 4,
+        "{formatted}"
+    );
+    assert!(!formatted.contains("COLUMNS emp_id"), "{formatted}");
+
+    let compact = format_stable(
+        "SELECT x.id FROM XMLTABLE ('/r' PASSING payload COLUMNS id NUMBER PATH 'id') x;",
+        DatabaseType::Oracle,
+    );
+    assert!(
+        compact.contains("FROM XMLTABLE ('/r' PASSING payload COLUMNS id NUMBER PATH 'id') x;"),
+        "{compact}"
+    );
+
+    let qualified = format_stable(
+        r#"SELECT x.val
+FROM XMLTABLE (
+    t.passing
+    PASSING XMLTYPE ('<r>
+        <v>ok</v>
+    </r>')
+    COLUMNS val VARCHAR2(10) PATH 'v'
+) x;
+
+SELECT x.val
+FROM XMLTABLE (
+    '<r>
+        <v>ok</v>
+    </r>'
+    PASSING t.columns
+    COLUMNS val VARCHAR2(10) PATH 'v'
+) x;
+
+SELECT *
+FROM XMLTABLE (
+    '<r>
+        <columns>ok</columns>
+        <passing>ok</passing>
+    </r>'
+    PASSING :columns
+    COLUMNS
+        columns VARCHAR2(10) PATH 'columns',
+        passing VARCHAR2(10) PATH 'passing'
+) x;"#,
+        DatabaseType::Oracle,
+    );
+    assert_eq!(
+        line_starting_with(&qualified, "t.passing").trim(),
+        "t.passing"
+    );
+    assert_eq!(
+        line_starting_with(&qualified, "PASSING t.columns").trim(),
+        "PASSING t.columns"
+    );
+    assert_eq!(
+        line_starting_with(&qualified, "PASSING :columns").trim(),
+        "PASSING :columns"
+    );
+    assert_eq!(
+        line_starting_with(&qualified, "columns VARCHAR2").trim(),
+        "columns VARCHAR2 (10) PATH 'columns',"
+    );
+    assert_eq!(
+        line_starting_with(&qualified, "passing VARCHAR2").trim(),
+        "passing VARCHAR2 (10) PATH 'passing'"
+    );
+    assert_eq!(
+        qualified
+            .lines()
+            .filter(|line| line.trim() == "COLUMNS")
+            .count(),
+        3,
+        "{qualified}"
+    );
+
+    let general_grouping = format_stable(
+        "SELECT JSON_TABLE + ('a\nb') AS payload FROM dual;",
+        DatabaseType::Oracle,
+    );
+    assert!(
+        !general_grouping.contains("JSON_TABLE + (\n"),
+        "{general_grouping}"
+    );
+}

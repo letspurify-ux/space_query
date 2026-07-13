@@ -9033,6 +9033,22 @@ impl QueryExecutor {
         on_tool_command: &mut impl FnMut(ToolCommand, &str, &mut Vec<T>),
         on_slash: &mut impl FnMut(&mut Vec<T>, &SqlParserEngine),
     ) {
+        if let Some(segments) = Self::recover_concatenated_script_line(line, builder) {
+            for segment in segments {
+                Self::process_split_line(
+                    segment,
+                    segment.trim(),
+                    builder,
+                    sqlblanklines_enabled,
+                    items,
+                    add_statement,
+                    on_tool_command,
+                    on_slash,
+                );
+            }
+            return;
+        }
+
         let mut parser_is_top_level = builder.block_depth() == 0 && builder.paren_depth() == 0;
 
         builder.prepare_splitter_line_boundary(line);
@@ -9144,6 +9160,205 @@ impl QueryExecutor {
         for stmt in builder.process_splitter_line_and_take_statements(line) {
             add_statement(stmt, items);
         }
+    }
+
+    fn recover_concatenated_script_line<'a>(
+        line: &'a str,
+        builder: &SqlParserEngine,
+    ) -> Option<Vec<&'a str>> {
+        if line.contains('\n') || builder.mysql_mode() {
+            return None;
+        }
+
+        let line_start = line.len().saturating_sub(line.trim_start().len());
+        let mut cursor = line_start;
+        let mut segments = Vec::new();
+        let mut recovered_prefixes = 0usize;
+        let slash_tail = line
+            .get(cursor.saturating_add(1)..)
+            .unwrap_or_default()
+            .trim_start();
+        let starts_with_slash = line.as_bytes().get(cursor) == Some(&b'/')
+            && line
+                .as_bytes()
+                .get(cursor.saturating_add(1))
+                .is_some_and(|byte| byte.is_ascii_whitespace())
+            && Self::looks_like_tool_command_candidate(slash_tail);
+        if !(starts_with_slash || builder.is_idle() && builder.current_is_empty()) {
+            return None;
+        }
+
+        if starts_with_slash {
+            segments.push(line.get(cursor..cursor + 1)?);
+            recovered_prefixes = recovered_prefixes.saturating_add(1);
+            cursor = cursor.saturating_add(1);
+            while line
+                .as_bytes()
+                .get(cursor)
+                .is_some_and(|byte| byte.is_ascii_whitespace())
+            {
+                cursor = cursor.saturating_add(1);
+            }
+        }
+
+        let word_starts = Self::inline_recovery_word_starts(line);
+        while cursor < line.len() {
+            let suffix = line.get(cursor..)?.trim_end();
+            if suffix.is_empty() {
+                break;
+            }
+            if !Self::looks_like_tool_command_candidate(suffix) {
+                segments.push(suffix);
+                break;
+            }
+
+            let current_head = sql_text::first_meaningful_word(suffix)?.to_ascii_uppercase();
+            let mut boundary = None;
+            for candidate_start in word_starts.iter().copied().filter(|start| *start > cursor) {
+                let candidate_suffix = line.get(candidate_start..)?.trim_end();
+                let candidate_head = sql_text::first_meaningful_word(candidate_suffix)?;
+                let candidate_is_tool = Self::looks_like_tool_command_candidate(candidate_suffix);
+                let candidate_is_sql = sql_text::is_statement_head_keyword(candidate_head);
+                if !candidate_is_tool && !candidate_is_sql {
+                    continue;
+                }
+                if current_head == "WHENEVER"
+                    && matches!(
+                        candidate_head.to_ascii_uppercase().as_str(),
+                        "COMMIT" | "ROLLBACK"
+                    )
+                {
+                    continue;
+                }
+                let current_words = line
+                    .get(cursor..candidate_start)?
+                    .split_whitespace()
+                    .collect::<Vec<_>>();
+                let candidate_words = candidate_suffix.split_whitespace().collect::<Vec<_>>();
+                let is_combined_clear_command = matches!(
+                    (current_words.as_slice(), candidate_words.as_slice()),
+                    ([clear, first], [next_clear, second, ..])
+                        if clear.eq_ignore_ascii_case("CLEAR")
+                            && next_clear.eq_ignore_ascii_case("CLEAR")
+                            && ((first.eq_ignore_ascii_case("BREAKS")
+                                && second.eq_ignore_ascii_case("COMPUTES"))
+                                || (first.eq_ignore_ascii_case("COMPUTES")
+                                    && second.eq_ignore_ascii_case("BREAKS")))
+                );
+                if is_combined_clear_command {
+                    continue;
+                }
+                if current_head == "PROMPT" && recovered_prefixes == 0 {
+                    continue;
+                }
+
+                let prefix = line.get(cursor..candidate_start)?.trim();
+                if Self::inline_tool_command_prefix_is_complete(prefix) {
+                    boundary = Some(candidate_start);
+                    break;
+                }
+            }
+
+            let Some(boundary) = boundary else {
+                segments.push(suffix);
+                break;
+            };
+            segments.push(line.get(cursor..boundary)?.trim());
+            recovered_prefixes = recovered_prefixes.saturating_add(1);
+            cursor = boundary;
+        }
+
+        (segments.len() > 1).then_some(segments)
+    }
+
+    fn inline_tool_command_prefix_is_complete(prefix: &str) -> bool {
+        let Some(command) = Self::parse_tool_command_if_candidate(prefix) else {
+            return false;
+        };
+        if !matches!(command, ToolCommand::Unsupported { .. }) {
+            return !Self::tool_command_can_continue(prefix, &command);
+        }
+
+        let words = prefix.split_whitespace().collect::<Vec<_>>();
+        matches!(
+            words.as_slice(),
+            [column, _, format, _, ..]
+                if column.eq_ignore_ascii_case("COLUMN")
+                    && format.eq_ignore_ascii_case("FORMAT")
+        )
+    }
+
+    fn inline_recovery_word_starts(line: &str) -> Vec<usize> {
+        let bytes = line.as_bytes();
+        let mut starts = Vec::new();
+        let mut idx = 0usize;
+        let mut in_single_quote = false;
+        let mut in_double_quote = false;
+
+        while idx < bytes.len() {
+            let byte = bytes[idx];
+            if in_single_quote {
+                if byte == b'\'' {
+                    if bytes.get(idx + 1) == Some(&b'\'') {
+                        idx = idx.saturating_add(2);
+                        continue;
+                    }
+                    in_single_quote = false;
+                }
+                idx = idx.saturating_add(1);
+                continue;
+            }
+            if in_double_quote {
+                if byte == b'"' {
+                    if bytes.get(idx + 1) == Some(&b'"') {
+                        idx = idx.saturating_add(2);
+                        continue;
+                    }
+                    in_double_quote = false;
+                }
+                idx = idx.saturating_add(1);
+                continue;
+            }
+            if byte == b'\'' {
+                in_single_quote = true;
+                idx = idx.saturating_add(1);
+                continue;
+            }
+            if byte == b'"' {
+                in_double_quote = true;
+                idx = idx.saturating_add(1);
+                continue;
+            }
+            if byte == b'-' && bytes.get(idx + 1) == Some(&b'-') {
+                break;
+            }
+            if byte == b'/' && bytes.get(idx + 1) == Some(&b'*') {
+                idx = idx.saturating_add(2);
+                while idx + 1 < bytes.len() && !(bytes[idx] == b'*' && bytes[idx + 1] == b'/') {
+                    idx = idx.saturating_add(1);
+                }
+                idx = idx.saturating_add(2).min(bytes.len());
+                continue;
+            }
+            if byte.is_ascii_alphabetic()
+                && (idx == 0
+                    || bytes
+                        .get(idx.saturating_sub(1))
+                        .is_some_and(|previous| previous.is_ascii_whitespace()))
+            {
+                starts.push(idx);
+                while bytes
+                    .get(idx)
+                    .is_some_and(|current| current.is_ascii_alphanumeric() || *current == b'_')
+                {
+                    idx = idx.saturating_add(1);
+                }
+                continue;
+            }
+            idx = idx.saturating_add(1);
+        }
+
+        starts
     }
 
     fn sync_mysql_delimiter_from_tool_command(command: &ToolCommand, mysql_delimiter: &mut String) {
@@ -11604,6 +11819,71 @@ FROM recursive_tree";
             QueryExecutor::parse_tool_command("DEFINE DOWN AS price < PREV(price)").is_none(),
             "MATCH_RECOGNIZE DEFINE clause must remain SQL instead of SQL*Plus DEFINE command"
         );
+    }
+
+    #[test]
+    fn split_format_items_recovers_concatenated_sqlplus_commands_by_command_grammar() {
+        let items = QueryExecutor::split_format_items(
+            "SET LINESIZE 120 WHENEVER SQLERROR CONTINUE ROLLBACK PROMPT loading INSERT INTO recovery_log VALUES (1);",
+        );
+
+        assert_eq!(items.len(), 4, "unexpected format items: {items:?}");
+        assert!(matches!(
+            &items[0],
+            FormatItem::ToolCommand(super::ToolCommand::SetLineSize { size: 120 })
+        ));
+        assert!(matches!(
+            &items[1],
+            FormatItem::ToolCommand(super::ToolCommand::WheneverSqlError {
+                exit: false,
+                action: Some(action),
+            }) if action.eq_ignore_ascii_case("ROLLBACK")
+        ));
+        assert!(matches!(&items[2], FormatItem::Verbatim(prompt) if prompt == "PROMPT loading"));
+        assert!(
+            matches!(&items[3], FormatItem::Statement(statement) if statement.starts_with("INSERT INTO recovery_log"))
+        );
+    }
+
+    #[test]
+    fn split_format_items_does_not_split_sql_words_inside_standalone_prompt_payload() {
+        let items = QueryExecutor::split_format_items("PROMPT example CREATE TABLE text only");
+
+        assert_eq!(items.len(), 1, "unexpected format items: {items:?}");
+        assert!(matches!(
+            &items[0],
+            FormatItem::Verbatim(prompt) if prompt == "PROMPT example CREATE TABLE text only"
+        ));
+    }
+
+    #[test]
+    fn split_format_items_does_not_recover_slash_text_inside_q_quote() {
+        let source = "SELECT q'[\n/ <- this is text\n]' AS payload FROM dual;";
+        let items = QueryExecutor::split_format_items(source);
+
+        assert_eq!(items.len(), 1, "unexpected format items: {items:?}");
+        assert!(matches!(
+            &items[0],
+            FormatItem::Statement(statement) if statement.contains("/ <- this is text")
+        ));
+        assert!(!items.iter().any(|item| matches!(item, FormatItem::Slash)));
+    }
+
+    #[test]
+    fn split_format_items_keeps_compound_clear_command_before_following_sql() {
+        let items = QueryExecutor::split_format_items(
+            "CLEAR BREAKS CLEAR COMPUTES SELECT 1 AS value FROM dual;",
+        );
+
+        assert_eq!(items.len(), 2, "unexpected format items: {items:?}");
+        assert!(matches!(
+            &items[0],
+            FormatItem::ToolCommand(super::ToolCommand::ClearBreaksComputes)
+        ));
+        assert!(matches!(
+            &items[1],
+            FormatItem::Statement(statement) if statement.starts_with("SELECT 1 AS value")
+        ));
     }
 
     #[test]

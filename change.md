@@ -201,11 +201,16 @@ CREATE TABLE test_table (
 );
 ```
 
-일반 SQL 문맥을 분석하는 복잡한 규칙 대신 다음 순서가 한 줄에 붙은 경우만 보수적으로 경계를 복원한다.
+포맷터에서 위 문자열 조합만 다시 쓰던 후처리를 제거했다. 대신 format/script 양쪽이 함께 사용하는 `process_split_line` 앞에서 실제 tool command parser가 완결된 명령 prefix를 소비하고, 다음 SQL*Plus 명령 또는 SQL statement head에서 경계를 여는 방식으로 수정했다. 따라서 `SET` 옵션, `WHENEVER` action, `PROMPT` payload, 뒤따르는 SQL의 구체적인 문자열 조합에 의존하지 않는다.
 
-```text
-SET PAGESIZE/LINESIZE -> WHENEVER SQLERROR -> PROMPT -> CREATE TABLE
-```
+독립 `PROMPT example CREATE TABLE text only`의 payload는 분리하지 않으며, q-quoted literal 내부의 `/`도 실행 경계로 오인하지 않는다.
+
+추가 회귀 테스트:
+
+- `split_format_items_recovers_concatenated_sqlplus_commands_by_command_grammar`
+- `split_format_items_does_not_split_sql_words_inside_standalone_prompt_payload`
+- `split_format_items_does_not_recover_slash_text_inside_q_quote`
+- `split_format_items_keeps_compound_clear_command_before_following_sql`
 
 ### 4.3 Slash와 여러 `COLUMN` 명령이 한 줄에 붙은 경우
 
@@ -407,7 +412,7 @@ EXECUTE IMMEDIATE
     END;
 ```
 
-동적 SQL 표현식의 CASE를 `EXECUTE IMMEDIATE` 소유자보다 한 단계 깊게 배치했다.
+`EXECUTE IMMEDIATE` 구문 frame을 열고 그 frame의 owner scope를 기준으로 CASE를 한 단계 깊게 배치했다. `USING` phase와 괄호 깊이도 같은 frame에 저장해 바깥 실행문의 상태와 섞이지 않게 했다.
 
 추가 회귀 테스트: `visual_oracle_indents_execute_immediate_case_expression_from_its_owner`
 
@@ -435,7 +440,7 @@ SELECT id
 FROM visual_emp
 ```
 
-분기 조건의 `AND`는 `WHEN`보다 한 단계 깊게 유지하고, 분기들이 끝난 뒤 driving `SELECT`/`FROM`은 `INSERT ALL` 소유 깊이로 복귀시켰다.
+`INSERT ALL/FIRST`에서 owner frame을 열고 `WHEN/ELSE`, 조건, branch body를 각각 owner +1, +2, +2의 상대 깊이로 계산한다. 분기들이 끝나는 driving `SELECT`에서 해당 frame만 닫아 `SELECT`/`FROM`을 바깥 소유 깊이로 복귀시켰다.
 
 추가 회귀 테스트: `visual_oracle_aligns_conditional_insert_all_and_driving_select`
 
@@ -502,7 +507,7 @@ FOR r IN (
 END LOOP;
 ```
 
-FOR/WHILE 헤더의 최종 렌더링 깊이를 LOOP 종결자까지 보존했다. 범위식의 CASE `END`와 루프 시작 `LOOP`는 서로 다른 줄에 두어 종결 대상의 모호성을 없앴다. 커서 쿼리 안의 `FOR UPDATE`는 새 루프 헤더가 아니므로 바깥 루프 소유 깊이를 덮어쓰지 않게 했다.
+FOR/WHILE 헤더의 최종 렌더링 깊이를 구문 frame으로 열어 LOOP 종결자까지 보존했다. 특히 `FOR`의 종료자 owner frame과 `IF/WHILE` 조건식 frame을 분리하여, 커서 서브쿼리가 조건식 레이아웃을 상속하지 않게 했다. 범위식의 CASE `END`와 루프 시작 `LOOP`는 서로 다른 줄에 두어 종결 대상의 모호성을 없앴고, 커서 쿼리 안의 `FOR UPDATE`는 바깥 `FOR` frame 안의 SQL 절로 유지한다.
 
 추가 회귀 테스트:
 
@@ -856,7 +861,7 @@ EXECUTE IMMEDIATE v_sql USING visual_seq.NEXTVAL,
     v_note;
 ```
 
-`USING` bind 중 CASE가 하나라도 여러 줄로 렌더링되면 그 CASE와 이후 bind를 실행문 소유자보다 한 단계 깊은 형제 목록으로 분리한다. 짧은 `EXECUTE IMMEDIATE ... USING v1, v2`는 기존처럼 한 줄을 유지한다.
+`EXECUTE IMMEDIATE` frame의 `USING` phase에서 CASE가 하나라도 여러 줄로 렌더링되면 그 CASE와 이후 bind를 실행문 소유자보다 한 단계 깊은 형제 목록으로 분리한다. frame은 현재 scope와 괄호 깊이를 함께 보유하고 문장 경계에서 닫히므로, 내부 CASE/괄호가 바깥 실행문의 bind 정렬을 오염시키지 않는다. 짧은 `EXECUTE IMMEDIATE ... USING v1, v2`는 기존처럼 한 줄을 유지한다.
 
 추가 회귀 테스트: `visual_oracle_splits_multiline_execute_immediate_using_bind_arguments`
 
@@ -1237,12 +1242,113 @@ FROM visual_t;
 
 추가 회귀 테스트: `visual_all_profiles_trim_line_ends_and_distinguish_unary_minus`
 
+### 4.39 Oracle 조건부 컴파일 directive와 branch body 경계
+
+AS-IS:
+
+```sql
+        $IF DBMS_DB_VERSION.VERSION >= 12 $THEN AUDIT ('qt_torture_pkg', 'complex_block.ccflag', 'conditional-compilation=true');
+        $ELSE AUDIT ('qt_torture_pkg', 'complex_block.ccflag', 'conditional-compilation=false');
+        $END AUDIT ('qt_torture_pkg', 'complex_block.end', 'updated=' || l_rows || '; aggregate=' || l_count);
+```
+
+TO-BE:
+
+```sql
+        $IF DBMS_DB_VERSION.VERSION >= 12 $THEN
+            AUDIT ('qt_torture_pkg', 'complex_block.ccflag', 'conditional-compilation=true');
+        $ELSE
+            AUDIT ('qt_torture_pkg', 'complex_block.ccflag', 'conditional-compilation=false');
+        $END
+        AUDIT ('qt_torture_pkg', 'complex_block.end', 'updated=' || l_rows || '; aggregate=' || l_count);
+```
+
+일반 PL/SQL block stack과 분리된 조건부 컴파일 frame stack을 사용한다. `$IF`에서 owner/body 상대 깊이를 가진 frame을 열고 `$END`에서 닫는다. directive는 owner 깊이, 활성 branch body는 owner +1에 두며, 내부 `$IF`를 닫으면 바깥 branch의 body 깊이가 복원된다. 이 frame은 일반 문장 frame과 달리 세미콜론 경계에서 유지되므로 여러 문장과 중첩 `$IF`도 같은 상대 기준을 유지한다.
+
+추가 회귀 테스트: `visual_oracle_splits_conditional_compilation_directives_from_branch_bodies`
+
+### 4.40 Multiline `XMLTABLE`/`JSON_TABLE` 구조
+
+AS-IS:
+
+```sql
+FROM XMLTABLE ('/rows/row' PASSING XMLTYPE ('<rows>
+...
+</rows>') COLUMNS emp_id NUMBER PATH 'emp_id', emp_name VARCHAR2 (100) PATH 'emp_name') x
+
+FROM JSON_TABLE ('{
+...
+}', '$.employees[*]' COLUMNS emp_id NUMBER PATH '$.id', emp_name VARCHAR2 (100) PATH '$.name') j
+```
+
+TO-BE:
+
+```sql
+FROM XMLTABLE (
+    '/rows/row'
+    PASSING XMLTYPE (
+        '<rows>
+...
+</rows>'
+    )
+    COLUMNS
+        emp_id NUMBER PATH 'emp_id',
+        emp_name VARCHAR2 (100) PATH 'emp_name'
+) x
+
+FROM JSON_TABLE (
+    '{
+...
+}',
+    '$.employees[*]'
+    COLUMNS
+        emp_id NUMBER PATH '$.id',
+        emp_name VARCHAR2 (100) PATH '$.name'
+) j
+```
+
+멀티라인 문자열 literal을 포함한 table function만 구조형 괄호 frame으로 승격한다. `PASSING`, `COLUMNS`, 괄호 없는 column 목록을 각각 구조 깊이에 맞춰 분리하고, 단일행 호출과 기존 `COLUMNS (...)` compact/nested 정책은 유지한다. `t.passing`, `t.columns`, `:columns` 및 projection column 이름은 frame phase 전환 키워드로 보지 않으며, `JSON_TABLE + (...)` 같은 grouping 괄호도 table-function frame으로 오인하지 않는다.
+
+추가 회귀 테스트: `visual_oracle_expands_multiline_xmltable_and_json_table_clauses`
+
+### 4.41 어제·오늘 변경분의 구문 frame 원칙 재감사
+
+AS-IS:
+
+```rust
+let mut pending_for_while_owner_indent = None;
+let mut insert_all_owner_indent = None;
+let mut insert_all_branch_body_indent = None;
+let mut execute_immediate_using_paren_depth = None;
+let mut oracle_error_directive_depth = 0;
+```
+
+TO-BE:
+
+```text
+$IF                 -> OracleConditionalCompilationFrame(owner, body, branch/error phase)
+INSERT ALL/FIRST    -> InsertAllFormatFrame(scope, owner, branch phase)
+EXECUTE IMMEDIATE   -> ExecuteImmediateFormatFrame(scope, USING paren/phase)
+FOR                 -> LoopHeader condition-owner frame
+XML/JSON_TABLE (...) -> ParenStackFrame(owner/body, COLUMNS phase)
+```
+
+일회성 토큰 판단을 제외한 장기 레이아웃 상태를 `FormatFrameStack`의 구문 frame으로 이동했다. 각 자식 들여쓰기는 현재 출력의 절대값이나 별도 전역 변수에서 누적하지 않고 frame owner의 상대 깊이로 계산한다. 문장 단위 frame은 세미콜론에서 닫고, 조건부 컴파일 frame은 실제 `$END`에서 닫아 서로 다른 수명을 섞지 않는다.
+
+중첩 `FOR (SELECT ... FOR UPDATE) LOOP`, 중첩 조건부 컴파일, 괄호 안/밖 `INSERT ALL` frame을 검증했고, 내부 frame을 닫은 뒤 바깥 상대 깊이가 복원되는 단위 테스트를 추가했다.
+
+추가 회귀 테스트:
+
+- `syntax_frames_restore_outer_relative_indent_after_nested_close`
+- `statement_boundary_closes_statement_syntax_frames_but_keeps_conditional_owner`
+
 ## 5. 그 외 개선 범위
 
 - Oracle/PLSQL 중첩 블록, `EXCEPTION`, `CASE`, `INSERT ALL`, `PIVOT`, `APPLY` 정렬
 - `DELETE WHERE`, PL/SQL collection `.DELETE` 구분
 - 분석 함수 `OVER`, `WITHIN GROUP`, `MATCH_RECOGNIZE` 줄바꿈
 - MySQL/MariaDB `CASE`, `REPEAT` 함수/루프, 중첩 `ORDER BY` 구분
+- Oracle 조건부 컴파일 branch와 multiline `XMLTABLE`/`JSON_TABLE` 구조 정렬
 - 코드 줄의 trailing whitespace 제거
 - 포맷 전후 SQL 토큰 보존 검사
 
@@ -1250,17 +1356,23 @@ FROM visual_t;
 
 SQL*Plus `PROMPT`는 화면에 출력되는 payload이므로 기존 정책대로 원본 대소문자와 선행 공백을 verbatim으로 보존한다. 따라서 `PROMPT`의 선행 공백 자체는 자동 포맷 오류로 분류하지 않는다.
 
+일반 표현식의 최대 행 길이 정책은 새로 추가하지 않았다. 따라서 `oracle_format_final_boss_v2.sql`의 496자 dynamic SQL 문자열 결합은 기존 compact 정책대로 유지한다.
+
+`oracle splitter final boss test.sql`의 `ORDER BY salary /`는 slash가 독립 행 terminator가 아닌 원본 fixture 경계 문제이며 formatter가 복구하지 않는다. 같은 파일에서 외부 block comment 안에 들어간 TEST-024/025와 요약 수치의 불일치도 formatter 변경 범위에서 제외했다.
+
 ## 7. 검증 결과
 
 | 검증 | 결과 |
 | --- | --- |
-| 최종 `.format.out` 수동 검토 | 47개, 28,567줄, 확정 오류 0건 |
+| 초기 `.format.out` 전수 수동 검토 | 47개, 28,567줄, formatter 오류 2종 확인 |
+| 최종 `.format.out` 검증 | 47개, 28,599줄, 변경 2개 전수 재검토 + 미변경 45개 byte 동일, 오류 0건 |
 | 지정 ignored 포맷 스윕 테스트 | 1/1 통과 |
 | 실제 SQL 파일 자동 포맷 스윕 집계 | 47/47 통과, 실패 0건 |
-| 수정 전후 `.format.out` delta 검토 | 46개 동일, scalar subquery 수정 대상 1개만 변경 |
-| 최종 반복 재생성 해시 비교 | 47개 모두 동일 |
-| 시각 회귀 테스트 | 47/47 통과 |
-| 전체 라이브러리 테스트 | 6,414 통과, 실패 0, ignored 212 |
+| 수정 전후 `.format.out` delta 검토 | 45개 동일, `test11.txt`와 `test25.sql`만 변경 |
+| 최종 반복 재생성 byte 비교 | 47개 모두 동일 |
+| `visual_` 회귀 테스트 필터 | 50/50 통과 |
+| 중첩 구문 frame 수명/복원 단위 테스트 | 2/2 통과 |
+| 전체 라이브러리 테스트 | 6,424 통과, 실패 0, ignored 212 |
 | `cargo fmt -- --check` | 통과 |
 | `git diff --check` | 통과 |
 
@@ -1277,3 +1389,4 @@ SQL*Plus `PROMPT`는 화면에 출력되는 payload이므로 기존 정책대로
 - `src/ui/sql_editor/execution.rs`: 수정된 정상 출력에 맞춘 기존 회귀 기대값
 - `src/ui/sql_editor/sql_editor_tests.rs`: 수정된 정상 출력에 맞춘 기존 회귀 기대값
 - `src/ui/sql_editor/mod.rs`: 포맷 스윕 및 시각 회귀 테스트 모듈 등록
+- `change.md`: 수동 검토에서 확인한 AS-IS/TO-BE와 최종 검증 수치 기록

@@ -971,14 +971,24 @@ pub(crate) fn tokenize_sql_spanned_with_mysql_compat(
         }
 
         if let Some(tag) = parse_dollar_quote_tag(sql, idx) {
-            flush_word(&mut current, &mut current_start, idx, &mut tokens);
-            current_start = idx;
-            current.push_str(&tag);
-            dollar_quote_state.activate(tag.clone());
-            for _ in 0..tag.len().saturating_sub(1) {
-                let _ = iter.next();
+            let is_oracle_conditional_flag = !mysql_compatible
+                && tag == "$$"
+                && sql
+                    .get(idx.saturating_add(2)..)
+                    .and_then(|tail| tail.chars().next())
+                    .is_some_and(sql_text::is_identifier_start_char)
+                && oracle_conditional_header_is_open(&tokens, &current)
+                && oracle_conditional_header_has_then(sql, idx);
+            if !is_oracle_conditional_flag {
+                flush_word(&mut current, &mut current_start, idx, &mut tokens);
+                current_start = idx;
+                current.push_str(&tag);
+                dollar_quote_state.activate(tag.clone());
+                for _ in 0..tag.len().saturating_sub(1) {
+                    let _ = iter.next();
+                }
+                continue;
             }
-            continue;
         }
 
         if sql_text::is_identifier_char(c) {
@@ -1094,6 +1104,38 @@ fn parse_dollar_quote_tag(sql: &str, start: usize) -> Option<String> {
     }
 
     None
+}
+
+fn oracle_conditional_header_is_open(tokens: &[SqlTokenSpan], current: &str) -> bool {
+    if matches!(
+        current.to_ascii_uppercase().as_str(),
+        "$IF" | "$ELSIF" | "IF" | "ELSIF"
+    ) {
+        return true;
+    }
+
+    for span in tokens.iter().rev() {
+        match &span.token {
+            SqlToken::Symbol(symbol) if symbol == ";" => return false,
+            SqlToken::Word(word) => match word.to_ascii_uppercase().as_str() {
+                "$IF" | "$ELSIF" | "IF" | "ELSIF" => return true,
+                "$THEN" | "$ELSE" | "$END" | "THEN" | "ELSE" | "END" => return false,
+                _ => {}
+            },
+            _ => {}
+        }
+    }
+    false
+}
+
+fn oracle_conditional_header_has_then(sql: &str, start: usize) -> bool {
+    sql.get(start..)
+        .unwrap_or_default()
+        .split(';')
+        .next()
+        .unwrap_or_default()
+        .split(|ch: char| !sql_text::is_identifier_char(ch))
+        .any(|word| word.eq_ignore_ascii_case("$THEN") || word.eq_ignore_ascii_case("THEN"))
 }
 
 #[inline]
@@ -2230,6 +2272,25 @@ END$$"#;
         assert!(tokens
             .iter()
             .any(|t| matches!(t, SqlToken::String(s) if s == "$$a,(b)$$")));
+    }
+
+    #[test]
+    fn tokenize_sql_treats_oracle_conditional_flag_as_word() {
+        for sql in ["$IF $$debug_mode $THEN", "IF $$PLSQL_UNIT IS NOT NULL THEN"] {
+            let tokens = tokenize_sql_with_mysql_compat(sql, false);
+            assert!(
+                tokens
+                    .iter()
+                    .any(|token| matches!(token, SqlToken::Word(word) if word.starts_with("$$"))),
+                "{sql}: {tokens:?}"
+            );
+            assert!(
+                !tokens
+                    .iter()
+                    .any(|token| matches!(token, SqlToken::String(_))),
+                "{sql}: {tokens:?}"
+            );
+        }
     }
 
     #[test]
