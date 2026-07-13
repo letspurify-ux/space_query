@@ -1421,8 +1421,8 @@ fn format_sql_keeps_mariadb_test1_function_case_and_window_definition_depths() {
     let formatted = SqlEditorWidget::format_sql_basic(&input);
     let lines: Vec<&str> = formatted.lines().collect();
 
-    let case_idx =
-        find_line_starting_with(&lines, "CASE UPPER(TRIM(p_currency_code))").expect("CASE line");
+    let case_idx = find_line_starting_with(&lines, "RETURN CASE UPPER(TRIM(p_currency_code))")
+        .expect("RETURN CASE line");
     let when_idx = lines
         .iter()
         .enumerate()
@@ -4923,7 +4923,7 @@ END torture_pkg;
         "nested DECLARE/WHILE block inside ELSE should keep procedure-body depth, got: {formatted}"
     );
     assert!(
-        formatted.contains("EXIT outer_loop WHEN v_inner = - 1;"),
+        formatted.contains("EXIT outer_loop WHEN v_inner = -1;"),
         "labeled EXIT WHEN should stay on one line inside the nested loop, got: {formatted}"
     );
     assert!(
@@ -5778,7 +5778,7 @@ END fmt_pkg_extreme;"#;
     );
     assert!(
         formatted.contains(
-            "EXCEPTION\n        WHEN e_bad_mode THEN\n            AUDIT ('BAD_MODE', 'unsupported mode=' || l_mode);\n            RAISE_APPLICATION_ERROR (- 20002, 'unsupported mode: ' || l_mode);"
+            "EXCEPTION\n        WHEN e_bad_mode THEN\n            AUDIT ('BAD_MODE', 'unsupported mode=' || l_mode);\n            RAISE_APPLICATION_ERROR (-20002, 'unsupported mode: ' || l_mode);"
         ),
         "package member exception handlers should expand inline THEN bodies into the exception block, got: {formatted}"
     );
@@ -6105,7 +6105,7 @@ SELECT
     ROW_NUMBER () OVER (
         PARTITION BY deptno
         ORDER BY hiredate,
-        empno
+            empno
     ) AS rn,
     SUM (sal) OVER (
         PARTITION BY deptno
@@ -6126,8 +6126,7 @@ SELECT
         ORDER BY hiredate
         ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
     ) AS running_sal, -- windowed listagg
-    LISTAGG (ename, ',') WITHIN
-    GROUP (ORDER BY ename) OVER (
+    LISTAGG (ename, ',') WITHIN GROUP (ORDER BY ename) OVER (
         PARTITION BY deptno
     ) AS names_in_dept
 FROM base b
@@ -6558,8 +6557,7 @@ END;"#;
 BEGIN
     IF INSERTING THEN
         :NEW.updated_at := NULL;
-        IF :NEW.note IS
-        NULL THEN
+        IF :NEW.note IS NULL THEN
             :NEW.note := 'auto-note:' || :NEW.sku;
         END IF;
     ELSIF UPDATING THEN
@@ -6583,7 +6581,7 @@ END;"#;
     let expected = r#"BEGIN
     IF (i = 2
         AND b = 2) THEN
-        RAISE_APPLICATION_ERROR (- 20002, 'forced nested error i=2 b=2');
+        RAISE_APPLICATION_ERROR (-20002, 'forced nested error i=2 b=2');
     END IF;
 END;"#;
 

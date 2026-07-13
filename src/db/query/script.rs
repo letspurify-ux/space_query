@@ -11000,6 +11000,14 @@ impl QueryExecutor {
             };
         };
 
+        if tokens.len() > 3 {
+            return ToolCommand::Unsupported {
+                raw: raw.to_string(),
+                message: format!("{command_name} accepts exactly one number."),
+                is_error: true,
+            };
+        }
+
         match raw_value.parse::<u32>() {
             Ok(value) => value_to_command(value),
             Err(_) => ToolCommand::Unsupported {

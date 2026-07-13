@@ -6733,3 +6733,9 @@ mod cancel_watchdog_tests {
 
 #[cfg(test)]
 mod sql_editor_tests;
+
+#[cfg(test)]
+mod format_sweep_tests;
+
+#[cfg(test)]
+mod visual_format_regression_tests;

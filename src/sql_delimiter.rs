@@ -61,6 +61,14 @@ impl DelimiterFrameState {
         self.stack.len()
     }
 
+    pub(crate) fn is_inside_bracket(&self) -> bool {
+        self.stack.contains(&DelimiterFrameKind::Bracket)
+    }
+
+    pub(crate) fn innermost_is_bracket(&self) -> bool {
+        self.stack.last() == Some(&DelimiterFrameKind::Bracket)
+    }
+
     pub(crate) fn apply_token(&mut self, token: &SqlToken) {
         let SqlToken::Symbol(symbol) = token else {
             return;

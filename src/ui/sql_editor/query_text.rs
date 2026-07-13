@@ -561,6 +561,7 @@ pub(crate) fn tokenize_sql_spanned_with_mysql_compat(
     let mut current_start = 0usize;
     let mut scan_state = SplitState::default();
     let mut pending_newline = true;
+    let mut paren_depth = 0usize;
     let mut dollar_quote_state = DollarQuoteState::default();
 
     let flush_word = |current: &mut String,
@@ -810,6 +811,7 @@ pub(crate) fn tokenize_sql_spanned_with_mysql_compat(
         }
 
         if pending_newline
+            && paren_depth == 0
             && (is_sqlplus_line_comment(sql, idx, "REMARK")
                 || is_sqlplus_line_comment(sql, idx, "REM"))
         {
@@ -1047,6 +1049,11 @@ pub(crate) fn tokenize_sql_spanned_with_mysql_compat(
             continue;
         }
 
+        if c == '(' {
+            paren_depth = paren_depth.saturating_add(1);
+        } else if c == ')' {
+            paren_depth = paren_depth.saturating_sub(1);
+        }
         tokens.push(SqlTokenSpan {
             token: SqlToken::Symbol(c.to_string()),
             start: idx,
@@ -1795,6 +1802,7 @@ END$$"#;
         let mut current = String::new();
         let mut scan_state = SplitState::default();
         let mut pending_newline = true;
+        let mut paren_depth = 0usize;
         let mysql_compatible = sql_text::mysql_compatibility_for_sql(sql, None);
 
         let flush_word = |current: &mut String, tokens: &mut Vec<SqlToken>| {
@@ -1944,6 +1952,7 @@ END$$"#;
             }
 
             if pending_newline
+                && paren_depth == 0
                 && (is_sqlplus_line_comment(&chars, i, "REMARK")
                     || is_sqlplus_line_comment(&chars, i, "REM"))
             {
@@ -2095,6 +2104,11 @@ END$$"#;
                 continue;
             }
 
+            if c == '(' {
+                paren_depth = paren_depth.saturating_add(1);
+            } else if c == ')' {
+                paren_depth = paren_depth.saturating_sub(1);
+            }
             tokens.push(SqlToken::Symbol(c.to_string()));
             i += 1;
         }

@@ -31171,8 +31171,7 @@ END"
             formatted.contains(
                 "SET abcd = edfg
             -- comment
-            ,
-            ghij = klmo"
+            , ghij = klmo"
             ),
             "SET-list inline comment and comma should follow SET depth indentation, got:
 {}",
@@ -31204,8 +31203,7 @@ END;";
                 "SET a = 1,
         b = 2
         -- comment
-        ,
-        c = 3"
+        , c = 3"
             ),
             "SET-list comment/comma should reuse active multiline SET depth indentation, got:
 {}",
@@ -31255,8 +31253,7 @@ WHEN MATCHED THEN UPDATE SET
         assert!(
             formatted.contains(
                 "SET trg.a = src.a -- comment
-    ,
-    trg.b = src.b;"
+    , trg.b = src.b;"
             ),
             "line comment/comma after MERGE USING UPDATE SET should keep active list depth, got:
 {}",
