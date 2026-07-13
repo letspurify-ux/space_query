@@ -220,6 +220,47 @@ impl SqlParserEngine {
         upper.contains("ORDER BY") || upper.contains("ORDER SIBLINGS BY")
     }
 
+    /// Returns `true` when the accumulated statement text ends with a list
+    /// continuation comma, ignoring trailing whitespace and trailing `--`
+    /// line comments. The next line is then a syntactic continuation of the
+    /// open statement (e.g. a MySQL `@user_variable` select item after an
+    /// inline comment) and must not be re-interpreted as a line-leading
+    /// script include command.
+    pub(crate) fn current_ends_with_list_continuation_comma(&self) -> bool {
+        let mut tail = self.current.trim_end();
+        loop {
+            // Strip a trailing complete block comment. The caller only asks
+            // this at an idle line boundary, so a trailing `*/` here closes
+            // a real comment rather than string payload.
+            if tail.ends_with("*/") {
+                if let Some(open_idx) = tail.rfind("/*") {
+                    tail = tail[..open_idx].trim_end();
+                    continue;
+                }
+                break;
+            }
+            // Strip a trailing comment-only `--` line.
+            if let Some(last_line_start) = tail.rfind('\n').map(|idx| idx + 1) {
+                if tail[last_line_start..].trim_start().starts_with("--") {
+                    tail = tail[..last_line_start].trim_end();
+                    continue;
+                }
+            }
+            break;
+        }
+        let last_line_start = tail.rfind('\n').map_or(0, |idx| idx + 1);
+        let last_line = &tail[last_line_start..];
+        let code_part = match last_line.find("--") {
+            Some(idx) => &last_line[..idx],
+            None => last_line,
+        };
+        let code_trimmed = code_part.trim_end();
+        if code_trimmed.is_empty() {
+            return tail[..last_line_start].trim_end().ends_with(',');
+        }
+        code_trimmed.ends_with(',')
+    }
+
     pub(crate) fn in_create_plsql(&self) -> bool {
         self.state.in_create_plsql()
     }

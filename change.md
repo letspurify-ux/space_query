@@ -1390,3 +1390,219 @@ SQL*Plus `PROMPT`는 화면에 출력되는 payload이므로 기존 정책대로
 - `src/ui/sql_editor/sql_editor_tests.rs`: 수정된 정상 출력에 맞춘 기존 회귀 기대값
 - `src/ui/sql_editor/mod.rs`: 포맷 스윕 및 시각 회귀 테스트 모듈 등록
 - `change.md`: 수동 검토에서 확인한 AS-IS/TO-BE와 최종 검증 수치 기록
+
+---
+
+# 2차 검토 회차 (2026-07-13, MySQL/MariaDB `@` 변수 · PREPARE)
+
+스윕 47개 파일(28,599줄) 재검토와 최소 재현 프로브에서 formatter 결함 3건을 추가로
+발견해 수정했다. 세 건 모두 frame(직전 토큰 인접성, 괄호/블록 depth, 문장 경계)을
+참조하지 않고 절대 규칙으로 동작하던 지점이다. 수정은 전부
+`src/ui/sql_editor/formatter.rs`에 적용했다.
+
+## 9-1. `@` 사용자 변수 이름이 키워드 대문자화로 훼손
+
+`@` 심볼 바로 뒤의 단어가 키워드 목록에 있으면(예: `sql`) 식별자임에도
+대문자화되었다. 직전 토큰이 `@` 심볼이면 식별자로 취급하도록 수정
+(`follows_at_sign_variable` → `keyword_preserves_original_case`).
+
+AS-IS (원본 입력):
+```sql
+SET @sql = 'select 1';
+```
+
+AS-IS (수정 전 포맷 결과 — 변수명 훼손):
+```sql
+SET @SQL = 'select 1';
+```
+
+TO-BE (수정 후 포맷 결과):
+```sql
+SET @sql = 'select 1';
+```
+
+발견 위치: `test_mysql/test1.txt`(원본 628행), `test_mysql/test2.txt`(원본 607행).
+`test_mariadb/test4.txt`는 과거 훼손 결과(`SET @SQL`)가 원본에 굳어진 상태로,
+수정 후에는 원본 표기가 그대로 보존된다.
+
+같은 원인의 파생 결함 — 절 키워드 이름의 변수에서 구조 줄바꿈 발생:
+
+AS-IS (원본 입력):
+```sql
+SET @from = 1;
+```
+
+AS-IS (수정 전 포맷 결과 — 변수 내부에서 절 줄바꿈, 토큰 구조 파괴):
+```sql
+SET @
+FROM = 1;
+```
+
+TO-BE (수정 후 포맷 결과):
+```sql
+SET @from = 1;
+```
+
+## 9-2. top-level 행이 `@`로 시작하면 실행단위 분리기가 문장을 절단
+
+분리기는 paren/block depth 0에서 `@`/`@@`로 시작하는 라인을 스크립트 include
+tool command로 취급해 열린 문장을 강제 종료한다(`script.rs` 9124행 부근의
+`should_try_tool_command_with_open_statement`). 포맷터가 SELECT 리스트 줄바꿈으로
+`@@var`를 행 첫머리에 놓으면 문장이 절단되었다. `@` 심볼을 top-level
+(괄호 frame 0 && 블록 frame 없음) 행 첫머리에 그리려는 순간 직전 행으로
+되붙이는 join-back을 추가했다. 괄호/블록 frame 내부에서는 분리기가 문장을
+유지하므로 기존 레이아웃을 건드리지 않는다(1차 시도에서 무조건 join했다가
+`CALL f(\n    @a ...)` 케이스의 idempotence가 깨져 조건을 frame depth로 좁혔다).
+
+AS-IS (원본 입력):
+```sql
+SELECT @sql, @@sql_mode;
+```
+
+AS-IS (수정 전 포맷 결과 — 2행이 include 지시어로 오인되어 문장 절단):
+```sql
+SELECT @sql,
+    @@sql_mode;
+```
+
+TO-BE (수정 후 포맷 결과):
+```sql
+SELECT @sql, @@sql_mode;
+```
+
+블록 내부(BEGIN..END, 분리기 안전 구간)는 기존 줄바꿈 유지:
+```sql
+    SELECT @a,
+        @b,
+        @@global.sql_mode,
+        c
+    INTO @r1,
+        @r2
+```
+
+## 9-3. `PREPARE <name> FROM <source>`의 FROM을 쿼리 절로 오인
+
+문장 컨텍스트를 보지 않고 FROM을 항상 쿼리 절로 취급해 줄바꿈했다.
+`suppresses_clause_break`에 "문장 경계(`;` 초기화 / BEGIN/THEN/ELSE/DO/LOOP)
+직후의 `PREPARE <name>` 다음 FROM이면 줄바꿈 억제" 규칙을 추가했다.
+
+AS-IS (원본 입력):
+```sql
+PREPARE stmt_flat FROM @sql;
+```
+
+AS-IS (수정 전 포맷 결과):
+```sql
+PREPARE stmt_flat
+FROM @sql;
+```
+
+TO-BE (수정 후 포맷 결과):
+```sql
+PREPARE stmt_flat FROM @sql;
+```
+
+발견 위치(총 8곳): `test_mysql/test1.txt`, `test_mysql/test2.txt`,
+`test_mysql/test3.txt`(2), `test_mariadb/test4.txt`, `test_mariadb/test6.txt`,
+`test_mariadb/test7.txt`(2). `SELECT prepare_col, x FROM t2;`처럼 `prepare`가
+일반 식별자인 경우 FROM 줄바꿈이 정상 유지됨을 확인했다.
+
+## 9-4. 검토했으나 수정하지 않은 항목 (의도된 설계로 확인)
+
+- `@TRANSACTION` → `SET AUTOCOMMIT OFF` 렌더링(`test_mariadb/test7.txt`):
+  `script.rs:9968`의 별칭 정규화 설계.
+- mid-line CASE의 frame 앵커(`p_status => CASE` 뒤 WHEN이 소유 라인 +4):
+  "CASE opened mid-line" 회귀 테스트로 보호되는 의도된 상대 규칙.
+- FROM-서브쿼리(내용 +8/닫기 +4) vs JOIN-서브쿼리(내용 +4/닫기 +0) 비대칭:
+  각각 opener 라인 기준 상대 규칙으로 일관, 회귀 테스트로 고정된 스타일.
+- Oracle `emp@dblink` → `emp @dblink`(@ 앞 공백): 이번 수정과 무관한 기존
+  동작이며 Oracle 문법상 유효. 추후 개선 후보로만 기록.
+- `EXECUTE stmt USING ...`의 USING 줄바꿈: Oracle `OPEN ... FOR ... USING`과
+  동일 계열 절 취급으로 유지.
+
+## 9-5. 추가된 회귀 테스트 (`formatter_regression_tests`)
+
+| 테스트 | 검증 내용 |
+| --- | --- |
+| `mysql_user_variable_word_after_at_sign_preserves_case` | `@sql` 케이스 보존 |
+| `mysql_user_variable_named_clause_keyword_stays_inline` | `SET @from = 1;` 한 줄 유지 |
+| `mysql_top_level_statement_line_never_starts_with_at_sign` | top-level 행이 `@`로 시작 금지 |
+| `mysql_prepare_from_stays_on_one_line` | PREPARE FROM 한 줄 유지 (top-level·프로시저 본문) |
+
+## 9-6. 2차 회차 검증 결과
+
+| 검증 | 결과 |
+| --- | --- |
+| `.format.out` 전수 눈검토 | 47개, 28,599줄 |
+| 최소 재현 프로브 3종 (mysql 2, oracle 1) | 전부 PASS (수정 전 mysql 프로브는 FAIL 2건) |
+| 실제 SQL 파일 자동 포맷 스윕 집계 | 47/47 통과, 실패 0건 |
+| 전체 라이브러리 테스트 | 6,428 통과, 실패 0, ignored 212 |
+
+---
+
+# 3차 정밀 검토 회차 (2026-07-13, 주석 뒤 `@` 변수 continuation 절단)
+
+2차 회차에서 요약 검토에 그쳤던 대형 파일 9개(test11, test18, test21,
+oracle_format_ultimate_boss, oracle_format_final_boss, oracle_format_final_boss_v2,
+test_mariadb/test5·test8, oracle splitter final boss test — 약 10,700줄)를 추가로
+전량 정독했고(전부 이상 없음, splitter final boss의 함정 구간은 1차 §6 문서화 유지),
+적대적 프로브에서 결함 1건을 추가 발견해 수정했다.
+
+## 10-1. 주석 뒤 `@` 변수 continuation을 스플리터가 include로 오인해 문장 절단
+
+`SELECT a, -- 주석` 다음 줄이 `@x, b FROM t;`처럼 `@` 사용자 변수로 시작하면,
+행 첫머리 `@`는 join-back이 불가능(주석을 삼키게 됨)해 그대로 남고, 스플리터가
+열린 문장을 tool command(@ include)로 강제 종료해 문장이 파괴되었다. 이는
+포맷터 출력뿐 아니라 **사용자가 직접 입력한 SQL 실행 경로에서도 동일하게
+발생하던 기존 결함**이다(블록 주석 `/* */` 뒤에서도 동일).
+
+AS-IS (원본 입력):
+```sql
+SELECT a, -- comment before var
+@x, b FROM t;
+```
+
+AS-IS (수정 전 — 2행이 include로 오인되어 문장 절단, 포맷 결과도 미종결):
+```sql
+SELECT a,
+-- comment before var
+
+@x, b FROM t
+```
+
+TO-BE (수정 후 포맷 결과 — 한 문장 유지):
+```sql
+SELECT a, -- comment before var
+    @x,
+    b
+FROM t;
+```
+
+수정 내용:
+- `sql_parser_engine/engine.rs`: `current_ends_with_list_continuation_comma()` 추가 —
+  누적 문장의 끝이 (후행 라인/블록 주석을 걷어낸 뒤) 콤마이면 다음 줄은 문법적
+  continuation으로 판단.
+- `db/query/script.rs`: 열린 문장 중 tool command 판정 gate 2곳
+  (slash-terminable 경로, with-open-statement 경로)에서 `@` 후보 + 콤마
+  continuation이면 절단하지 않고 문장에 이어붙임. 완결된 문장 뒤의
+  `@script.sql` include는 기존대로 tool command로 인식(회귀 테스트로 고정).
+- `ui/sql_editor/formatter.rs`: join-back을 모든 주석 뒤에서 건너뛰도록 단순화
+  (블록 주석 뒤 join 시 1·2차 패스 간 주석 배치가 달라지는 비멱등 발견분 해소;
+  주석+콤마 케이스는 위 스플리터 가드가 보호).
+
+## 10-2. 추가된 회귀 테스트
+
+| 테스트 | 검증 내용 |
+| --- | --- |
+| `split_script_items_keeps_at_sign_variable_after_trailing_comma_in_open_statement` | 주석 뒤 `@x` continuation이 한 문장으로 유지 |
+| `split_script_items_still_treats_include_after_complete_statement_as_command` | 문장 경계의 `@path`는 여전히 include 명령 |
+
+## 10-3. 3차 회차 검증 결과
+
+| 검증 | 결과 |
+| --- | --- |
+| 대형 9개 파일 추가 정독 | 약 10,700줄, 신규 이상 없음 |
+| 적대적 프로브 6종 (할당식·backtick 변수·시스템 변수·CASE+@·prepare 동명 식별자·주석/공백행+@) | 전부 PASS |
+| 실제 SQL 파일 자동 포맷 스윕 집계 | 47/47 통과, 실패 0건 |
+| 전체 라이브러리 테스트 | 6,430 통과, 실패 0, ignored 212 |
+| `cargo fmt -- --check` | 통과 |

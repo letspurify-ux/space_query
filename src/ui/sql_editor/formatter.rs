@@ -5197,6 +5197,37 @@ impl SqlEditorWidget {
         if keyword == "FROM" && matches!(prev_word_upper, Some("DELETE")) {
             return true;
         }
+        if keyword == "FROM" {
+            // MySQL `PREPARE <name> FROM <source>`: FROM is part of the PREPARE
+            // statement, not a query clause. PREPARE must be the word right
+            // before the statement name and sit at a statement boundary.
+            let mut recent = recent_statement_word_indices.iter().rev();
+            let _statement_name = recent.next();
+            let prepare_word = recent.next();
+            let before_prepare = recent.next();
+            if prepare_word
+                .and_then(|&word_idx| tokens.get(word_idx))
+                .is_some_and(|token| {
+                    matches!(
+                        token,
+                        SqlToken::Word(word) if word.eq_ignore_ascii_case("PREPARE")
+                    )
+                })
+                && before_prepare.is_none_or(|&word_idx| {
+                    tokens.get(word_idx).is_some_and(|token| {
+                        matches!(
+                            token,
+                            SqlToken::Word(word) if matches!(
+                                word.to_ascii_uppercase().as_str(),
+                                "BEGIN" | "THEN" | "ELSE" | "DO" | "LOOP"
+                            )
+                        )
+                    })
+                })
+            {
+                return true;
+            }
+        }
         if keyword == "WITH" && matches!(prev_word_upper, Some("START" | "ROW" | "ROWS")) {
             return true;
         }
@@ -9500,9 +9531,14 @@ impl SqlEditorWidget {
                     let follows_alias_control_keyword = follows_alias_keyword
                         && sql_text::is_plsql_control_keyword(upper)
                         && !next_word_is("THEN");
+                    let follows_at_sign_variable = matches!(
+                        immediate_prev_token,
+                        Some(SqlToken::Symbol(sym)) if sym == "@"
+                    );
                     let keyword_preserves_original_case = mysql_keyword_identifier
                         || formatter_keyword_identifier
-                        || structured_table_function_keyword_identifier;
+                        || structured_table_function_keyword_identifier
+                        || follows_at_sign_variable;
                     let keyword_suppresses_structural_handling = keyword_preserves_original_case
                         || treat_control_keyword_as_identifier
                         || follows_alias_control_keyword;
@@ -14824,6 +14860,34 @@ impl SqlEditorWidget {
                             needs_space = false;
                         }
                         _ => {
+                            // A top-level rendered line must never begin with `@`:
+                            // the script splitter treats a line-leading `@`/`@@` as
+                            // a script include tool command while a statement is
+                            // open at paren/block depth zero, which would cut the
+                            // statement short. Join the variable back onto the
+                            // previous line instead. Inside parens or BEGIN..END
+                            // blocks the splitter keeps the statement intact, so
+                            // the layout is left untouched there. After a comment
+                            // the join is skipped: the line then keeps its trailing
+                            // comma before the comment, which the splitter accepts
+                            // as an open list continuation.
+                            let joins_line_start_at_sign = sym == "@"
+                                && at_line_start
+                                && out.ends_with('\n')
+                                && format_stack.paren_depth() == 0
+                                && format_stack.last_block_frame().is_none()
+                                && !out.trim_end_matches('\n').is_empty()
+                                && !matches!(immediate_prev_token, Some(SqlToken::Comment(_)));
+                            if joins_line_start_at_sign {
+                                while out.ends_with('\n') {
+                                    out.pop();
+                                }
+                                rendered_line_tracker.invalidate();
+                                at_line_start = false;
+                                needs_space = true;
+                                line_indent =
+                                    rendered_line_indent(out.rsplit('\n').next().unwrap_or(""));
+                            }
                             ensure_indent(&mut out, &mut at_line_start, line_indent);
                             let is_mysql_block_label_colon = sym == ":"
                                 && immediate_prev_token
@@ -17000,6 +17064,75 @@ mod formatter_regression_tests {
             !formatted.contains("SELECT\n    x,\n    y\nFROM DUAL;"),
             "Malformed prior statement must not force legacy recovery layout on next statement, got: {}",
             formatted
+        );
+    }
+
+    #[test]
+    fn mysql_user_variable_word_after_at_sign_preserves_case() {
+        let formatted = SqlEditorWidget::format_for_auto_formatting_with_db_type(
+            "set @sql = 'select 1';\nprepare stmt from @sql;",
+            false,
+            Some(crate::db::connection::DatabaseType::MySQL),
+        );
+        assert!(
+            formatted.contains("@sql"),
+            "user variable name after @ must keep its original case, got:\n{formatted}"
+        );
+        assert!(
+            !formatted.contains("@SQL"),
+            "user variable name after @ must not be keyword-uppercased, got:\n{formatted}"
+        );
+    }
+
+    #[test]
+    fn mysql_user_variable_named_clause_keyword_stays_inline() {
+        let formatted = SqlEditorWidget::format_for_auto_formatting_with_db_type(
+            "SET @from = 1;",
+            false,
+            Some(crate::db::connection::DatabaseType::MySQL),
+        );
+        assert!(
+            formatted.contains("SET @from = 1;"),
+            "clause keyword after @ must not open a clause line break, got:\n{formatted}"
+        );
+    }
+
+    #[test]
+    fn mysql_top_level_statement_line_never_starts_with_at_sign() {
+        let formatted = SqlEditorWidget::format_for_auto_formatting_with_db_type(
+            "SELECT @sql, @@sql_mode;",
+            false,
+            Some(crate::db::connection::DatabaseType::MySQL),
+        );
+        assert!(
+            !formatted
+                .lines()
+                .any(|line| line.trim_start().starts_with('@')),
+            "a top-level line starting with @ would be split as a script include, got:\n{formatted}"
+        );
+    }
+
+    #[test]
+    fn mysql_prepare_from_stays_on_one_line() {
+        let formatted = SqlEditorWidget::format_for_auto_formatting_with_db_type(
+            "PREPARE stmt FROM @sql;",
+            false,
+            Some(crate::db::connection::DatabaseType::MySQL),
+        );
+        assert!(
+            formatted.contains("PREPARE stmt FROM @sql;"),
+            "PREPARE ... FROM is one statement head, not a query FROM clause, got:\n{formatted}"
+        );
+
+        let body = "DELIMITER $$\nCREATE PROCEDURE p1()\nBEGIN\n    PREPARE stmt FROM @sql;\nEND$$\nDELIMITER ;";
+        let formatted_body = SqlEditorWidget::format_for_auto_formatting_with_db_type(
+            body,
+            false,
+            Some(crate::db::connection::DatabaseType::MySQL),
+        );
+        assert!(
+            formatted_body.contains("PREPARE stmt FROM @sql;"),
+            "PREPARE ... FROM inside a routine body must stay on one line, got:\n{formatted_body}"
         );
     }
 

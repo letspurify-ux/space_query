@@ -9105,6 +9105,14 @@ impl QueryExecutor {
             && !builder.current_is_empty()
             && builder.current_has_order_by_context();
 
+        // A line-leading `@`/`@@` include candidate must not cut an open
+        // statement that is mid-list (trailing comma): e.g. a MySQL user
+        // variable `@x` select item after an inline `--` comment is a
+        // continuation of the open statement, not a script command.
+        let is_include_continuation_line = trimmed.starts_with('@')
+            && !builder.current_is_empty()
+            && builder.current_ends_with_list_continuation_comma();
+
         // Tool command appearing after a slash-terminable open statement
         if builder.is_idle()
             && !builder.current_is_empty()
@@ -9112,6 +9120,7 @@ impl QueryExecutor {
             && builder.can_terminate_on_slash()
             && !is_sql_set_clause_context
             && !is_order_by_modifier_line
+            && !is_include_continuation_line
             && Self::parse_tool_command_if_candidate(trimmed).is_some()
         {
             for stmt in builder.force_terminate_and_take_statements() {
@@ -9127,6 +9136,7 @@ impl QueryExecutor {
             parser_is_top_level,
             is_sql_set_clause_context,
         ) && !is_order_by_modifier_line
+            && !is_include_continuation_line
         {
             if let Some(command) = Self::parse_tool_command_if_candidate(trimmed) {
                 for stmt in builder.force_terminate_and_take_statements() {
@@ -11884,6 +11894,41 @@ FROM recursive_tree";
             &items[1],
             FormatItem::Statement(statement) if statement.starts_with("SELECT 1 AS value")
         ));
+    }
+
+    #[test]
+    fn split_script_items_keeps_at_sign_variable_after_trailing_comma_in_open_statement() {
+        let sql = "SELECT a, -- comment before var\n@x, b FROM t;";
+        let items = QueryExecutor::split_script_items_for_db_type(
+            sql,
+            Some(crate::db::connection::DatabaseType::MySQL),
+        );
+
+        assert_eq!(
+            items.len(),
+            1,
+            "line-leading @variable after a trailing comma must stay inside the open statement, got: {items:?}"
+        );
+        let statement = match items.first() {
+            Some(super::ScriptItem::Statement(statement)) => statement,
+            other => panic!("expected single statement item, got: {other:?}"),
+        };
+        assert!(
+            statement.contains("@x") && statement.contains("FROM t"),
+            "statement should keep the @variable continuation, got:\n{statement}"
+        );
+    }
+
+    #[test]
+    fn split_script_items_still_treats_include_after_complete_statement_as_command() {
+        let sql = "SELECT 1 FROM dual;\n@run_me.sql";
+        let items = QueryExecutor::split_script_items(sql);
+
+        assert_eq!(items.len(), 2, "unexpected items: {items:?}");
+        assert!(
+            matches!(items.last(), Some(super::ScriptItem::ToolCommand(_))),
+            "line-leading @path at a statement boundary must stay a script command, got: {items:?}"
+        );
     }
 
     #[test]
