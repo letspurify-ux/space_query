@@ -588,7 +588,7 @@ impl SqlEditorWidget {
             &expanded_statement.text,
             &token_spans,
             mysql_compatible,
-            preferred_db_type == Some(crate::db::DatabaseType::MariaDB),
+            completion_db_type_is_mariadb(preferred_db_type),
             package_spec_symbols,
         );
         let alias_context =

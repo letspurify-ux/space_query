@@ -37277,10 +37277,7 @@ impl SqlEditorWidget {
                         .is_some_and(|word| {
                             mysql_data_type_keywords(
                                 DataTypePosition::ColumnDef,
-                                matches!(
-                                    db_type,
-                                    Some(crate::db::DatabaseType::MariaDB)
-                                ),
+                                completion_db_type_is_mariadb(db_type),
                             )
                             .iter()
                             .any(|data_type| data_type.eq_ignore_ascii_case(word))
