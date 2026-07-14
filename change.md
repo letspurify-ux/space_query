@@ -2066,3 +2066,143 @@ MATCH_RECOGNIZE (
 | 포매터·테스트 코드 수정 | 없음 |
 | 문서 변경 | 본 7차 독립 검증 기록 추가 |
 | 최종 상태 | 스윕·집중 회귀·전체 테스트·fmt 전부 성공 |
+
+# 15. 8차 검증 회차 (2026-07-14): 전수 육안 재검토 및 frame depth 결함 2건 수정
+
+## 15-1. 수행 내용
+
+1. `cargo test --lib formatting_sweep_all_files_generate_out_report -- --ignored --nocapture` 1차 실행
+   → checked_files=53, failed_files=0 (자동 검사 전건 PASS)
+2. `target/format-sweep` 아래 53개 `.format.out` 전체(32,141줄)를 처음부터 끝까지 육안 검토.
+   자동 PASS를 신뢰하지 않고 frame open/close 상대 depth 일관성(목표3) 기준으로 전 라인 대조.
+   보조로 인덴트 급증(±2레벨 이상)·4배수 위반 지점을 스캐너로 표시하고 전 지점을 원문 대조로 판정.
+3. 육안 검토에서 자동 검사(토큰 보존·4배수·멱등성)가 잡지 못하는 상대 depth 결함 2건 + 의도 설계 확인 1건 발견.
+4. 결함 2건을 최소 SQL로 재현 → `formatter.rs` 수정 → 회귀 테스트 2건 추가 → 스윕 재실행 후 산출물 재검토.
+
+## 15-2. 오류 1: 여러 줄 서브쿼리 인자 닫힘 후 후속 인자 depth 이탈
+
+- 발견 위치: `target/format-sweep/test_mariadb/test10.txt.format.out` 211~218행
+  (`sq_mariadb_format_cert_2`의 `mb_run_gauntlet_2` 내 INSERT … JSON_OBJECT)
+- 증상: 같은 줄에서 여러 괄호 프레임이 열린 상태(`VALUES ( … JSON_OBJECT ( … (`)에서
+  인라인 서브쿼리가 여러 줄로 펼쳐진 뒤, 닫는 `)` 줄에 이어지는 인자는 프레임 depth를 유지하지만
+  줄바꿈된 후속 인자(`v_forward` 등)는 "여는 줄 indent+1"로 계산되어 한 프레임 바깥 depth로 떨어짐.
+  같은 JSON_OBJECT 인자 목록의 형제끼리 depth가 어긋나는 frame 계약 위반.
+- 원인: `ParenFormatFrame::sibling_body_indent()`가 `body_indent` 미기록 시
+  `open_line_indent + 1`을 기본값으로 사용. 여는 줄에서 프레임이 2개 이상 열리면
+  실제 프레임 depth(닫는 줄 depth)보다 얕게 계산됨.
+- 수정: `formatter.rs`의 `)` 처리에서 여러 줄 자식 프레임이 닫힐 때
+  (`contributes_multiline_close && closes_indented`) 닫는 줄 indent를 부모 프레임의
+  `record_body_indent`로 기록. 이후 콤마 줄바꿈 형제는 닫는 줄과 같은 depth로 정렬.
+
+AS-IS (수정 전 포맷 결과):
+
+```sql
+        VALUES (summary_rec.asset_id, ..., JSON_OBJECT('uuid', (
+                    SELECT CAST(asset_uuid AS CHAR)
+                    FROM mb_asset
+                    WHERE asset_id = summary_rec.asset_id
+                ), 'forward_sum',
+            v_forward,
+            'reverse_sum',
+            v_reverse))
+```
+
+TO-BE (수정 후 포맷 결과):
+
+```sql
+        VALUES (summary_rec.asset_id, ..., JSON_OBJECT('uuid', (
+                    SELECT CAST(asset_uuid AS CHAR)
+                    FROM mb_asset
+                    WHERE asset_id = summary_rec.asset_id
+                ), 'forward_sum',
+                v_forward,
+                'reverse_sum',
+                v_reverse))
+```
+
+- 회귀 테스트: `format_for_auto_formatting_aligns_wrapped_siblings_with_multiline_subquery_close_line`
+  (정렬 + 멱등성 고정)
+
+## 15-3. 오류 2: 서브쿼리가 CASE…END로 끝나면 `) LOOP` 가 두 줄로 분리
+
+- 발견 위치: `test/test21.sql.format.out` 46~47행, `test/oracle_format_ultimate_boss.sql.format.out` 32~33행
+  (커서 FOR 루프의 IN 서브쿼리가 `ORDER BY CASE … END`로 끝나는 경우)
+- 증상: 전 파일에서 `) LOOP`는 한 줄이 규범(기존 테스트
+  `plsql_for_split_in_subquery_keeps_child_query_on_for_depth`로 고정)인데,
+  서브쿼리 마지막 단어가 `END`이면 `)`와 `LOOP`가 줄 분리됨.
+- 원인: `FOR i IN 1..CASE … END LOOP`(범위식이 CASE로 끝나는 경우)용
+  `follows_for_range_case_end` 판정이 "직전 단어 == END"만 확인해서,
+  END와 LOOP 사이에 `)`가 있는 경우까지 오탐.
+- 수정: 직전 비주석 토큰이 실제 `END` 단어일 때만 줄 분리하도록 조건 강화.
+  (`)` 뒤의 LOOP는 기존 규범대로 같은 줄 유지, 범위식 CASE END 직후의 LOOP는 기존대로 분리)
+
+AS-IS (수정 전 포맷 결과):
+
+```sql
+    FOR r IN (
+        SELECT object_name
+        FROM user_objects
+        ORDER BY
+            CASE object_type
+                WHEN 'VIEW' THEN
+                    1
+                ELSE
+                    2
+            END
+    )
+    LOOP
+```
+
+TO-BE (수정 후 포맷 결과):
+
+```sql
+    FOR r IN (
+        SELECT object_name
+        FROM user_objects
+        ORDER BY
+            CASE object_type
+                WHEN 'VIEW' THEN
+                    1
+                ELSE
+                    2
+            END
+    ) LOOP
+```
+
+- 회귀 테스트: `plsql_for_in_subquery_ending_with_case_end_keeps_loop_on_close_paren_line`
+  (`) LOOP` 결합 + 멱등성 고정)
+
+## 15-4. 의도 설계 확인 (수정하지 않음)
+
+- Oracle `JSON_OBJECT (… 'k' VALUE ( 서브쿼리 ), …)`에서 닫는 `)` 줄이 서브쿼리 본문과
+  같은 depth에 놓이는 레이아웃(`test/oracle_format_ultimate_boss.sql` QUERY 8,
+  `test/oracle splitter final boss test.sql` TEST-038)은 결함이 아니라
+  `query_like_paren_layout`의 `ends_with_value` 분기(`close_depth = child_head_depth`)로
+  구현된 의도된 설계이며, 회귀 테스트
+  `format_for_auto_formatting_keeps_json_object_value_scalar_subquery_on_paren_frame_depth`가
+  해당 레이아웃(후속 `'k' VALUE …` 인자가 닫는 괄호 줄에서 프레임 depth로 이어지는 형태)을 고정하고 있어 유지.
+- WITH 절에서 인라인 `FUNCTION`/`PROCEDURE` 선언은 +1 depth, CTE 이름은 `WITH`와 동일 depth로
+  정렬되는 형제 depth 차이는 전 파일에서 일관 적용되는 스타일로 확인(오류 아님).
+- 문자열/주석/q-quote 내부 보호 구간(멀티라인 리터럴의 비정형 indent)은 전부 원문 보존으로 정상.
+
+## 15-5. 반복 및 최종 검증 결과
+
+| 검증 | 결과 |
+| --- | --- |
+| 스윕 1차(수정 전) | checked_files=53, failed_files=0 |
+| 육안 전수 검토 | 53개 파일 / 32,141줄, 결함 2건·설계 확인 1건 |
+| 수정 후 스윕 재실행 | checked_files=53, failed_files=0 |
+| 수정 전후 산출물 diff | 의도한 3개 지점(test_mariadb/test10, test/test21, test/oracle_format_ultimate_boss)만 변경, 그 외 50개 파일 diff 0 |
+| 재검토(변경 지점 육안 확인) | 형제 인자 depth 정렬·`) LOOP` 결합 정상, 잔여 오류 0건 |
+| `cargo test --lib` | 6,468 통과(신규 회귀 2건 포함), 실패 0, ignored 218 |
+| `cargo fmt -- --check` | 통과 |
+
+## 15-6. 8차 회차 결론
+
+| 항목 | 결과 |
+| --- | --- |
+| 전수 확인 파일/라인 | 53개 / 32,141줄 |
+| 새로 발견한 오류 | 2건 (전건 수정 완료) |
+| 포매터 수정 | `formatter.rs` 2곳 (`)` 닫힘 시 부모 body indent 기록, LOOP 줄바꿈 판정 강화) |
+| 회귀 테스트 추가 | 2건 |
+| 최종 상태 | 스윕·전체 테스트·fmt 전부 성공, 잔여 오류 0건 |

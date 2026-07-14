@@ -11105,8 +11105,14 @@ impl SqlEditorWidget {
                                 closed_control_header_body_indent =
                                     closed_control_header_owner_indent.map(|indent| indent + 1);
                             }
-                            let follows_for_range_case_end =
-                                follows_for_while && matches!(prev_word_upper, Some("END"));
+                            let follows_for_range_case_end = follows_for_while
+                                && matches!(prev_word_upper, Some("END"))
+                                && loop_previous_non_comment_token.is_some_and(|token| {
+                                    matches!(
+                                        token,
+                                        SqlToken::Word(word) if word.eq_ignore_ascii_case("END")
+                                    )
+                                });
                             let mysql_labeled_loop = mysql_compatible
                                 && matches!(
                                     immediate_prev_token,
@@ -15030,6 +15036,12 @@ impl SqlEditorWidget {
                                     && !close_compact_before_parent_close
                                 {
                                     parent_frame.mark_multiline_child_closed();
+                                    // Sibling arguments wrapped after this close must
+                                    // align with the close line, not fall back to the
+                                    // opener line +1 when extra frames opened inline.
+                                    if paren_frame_kind.closes_indented() {
+                                        parent_frame.record_body_indent(line_indent);
+                                    }
                                 }
                             }
                             needs_space = true;
@@ -19081,6 +19093,37 @@ END;"#;
             indent(lines[end_loop_idx]),
             indent(lines[for_idx]),
             "END LOOP should stay aligned with FOR after split IN subquery, got:\n{}",
+            formatted
+        );
+    }
+
+    #[test]
+    fn plsql_for_in_subquery_ending_with_case_end_keeps_loop_on_close_paren_line() {
+        let input = r#"BEGIN
+    FOR r IN (
+        SELECT object_name
+        FROM user_objects
+        ORDER BY
+            CASE object_type
+                WHEN 'VIEW' THEN
+                    1
+                ELSE
+                    2
+            END
+    ) LOOP
+        NULL;
+    END LOOP;
+END;"#;
+        let formatted = SqlEditorWidget::format_sql_basic(input);
+        assert!(
+            formatted.contains(") LOOP"),
+            "LOOP must stay joined to the subquery close paren even when the subquery ends with CASE END, got:\n{}",
+            formatted
+        );
+        assert_eq!(
+            SqlEditorWidget::format_sql_basic(&formatted),
+            formatted,
+            "close-paren LOOP join must stay idempotent, got:\n{}",
             formatted
         );
     }
@@ -26132,6 +26175,35 @@ LIMIT 10;"#;
             leading_spaces(lines[region_where_idx]),
             leading_spaces(lines[region_select_idx]),
             "scalar subquery WHERE should stay aligned with SELECT under nested JSON_OBJECT paren frames, got:\n{formatted}"
+        );
+    }
+
+    #[test]
+    fn format_for_auto_formatting_aligns_wrapped_siblings_with_multiline_subquery_close_line() {
+        let source = r#"INSERT INTO mb_rollup (asset_id, evidence)
+VALUES (summary_rec.asset_id, JSON_OBJECT('uuid', (SELECT CAST(asset_uuid AS CHAR) FROM mb_asset WHERE asset_id = summary_rec.asset_id), 'forward_sum',
+v_forward,
+'reverse_sum',
+v_reverse));"#;
+        let formatted = SqlEditorWidget::format_for_auto_formatting(source, true);
+        let lines: Vec<&str> = formatted.lines().collect();
+        let close_idx = lines
+            .iter()
+            .position(|line| line.trim_start().starts_with("), 'forward_sum',"))
+            .expect("subquery close line with trailing argument");
+        let sibling_idx = lines
+            .iter()
+            .position(|line| line.trim_start() == "v_forward,")
+            .expect("wrapped sibling argument line");
+        assert_eq!(
+            leading_spaces(lines[sibling_idx]),
+            leading_spaces(lines[close_idx]),
+            "arguments wrapped after a multiline subquery close must align with the close line, got:\n{formatted}"
+        );
+        assert_eq!(
+            SqlEditorWidget::format_for_auto_formatting(&formatted, true),
+            formatted,
+            "wrapped sibling alignment must stay idempotent, got:\n{formatted}"
         );
     }
 
