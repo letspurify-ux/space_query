@@ -9768,8 +9768,10 @@ fn mysql_virtual_wildcard_column_request_preserves_case_while_connection_busy() 
         Some(crate::db::DatabaseType::MySQL),
     );
 
+    // The full library suite starts many background loader tests concurrently;
+    // keep the assertion bounded while allowing scheduler headroom.
     let update = receiver
-        .recv_timeout(Duration::from_secs(1))
+        .recv_timeout(Duration::from_secs(5))
         .expect("busy MySQL wildcard load should complete without losing catalog case");
     assert_eq!(update.table, "cfb_user");
     assert!(!update.cache_columns);
