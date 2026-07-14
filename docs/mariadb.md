@@ -27,10 +27,32 @@ family is shared.
 `mariadb_session_time_zone_in_range()` accepts `-12:59` through `+13:00`. The
 MariaDB `MysqlBackend` instance uses this function and its own error message.
 
+## Local test database
+
+These development-only credentials connect to the repository's local MariaDB
+test container:
+
+| Setting | Value |
+| --- | --- |
+| Container | `space-query-mariadb122` |
+| Host | `127.0.0.1` |
+| Port | `3306` |
+| Database | `query_tool_test` |
+| Username | `root` |
+| Password | `password` |
+
 ## Live tests
 
 MariaDB tests read the `SPACE_QUERY_TEST_MYSQL_*` variables documented under
 [MySQL live tests](mysql.md#live-tests). Point them at the MariaDB instance.
+
+```sh
+export SPACE_QUERY_TEST_MYSQL_HOST=127.0.0.1
+export SPACE_QUERY_TEST_MYSQL_PORT=3306
+export SPACE_QUERY_TEST_MYSQL_DATABASE=query_tool_test
+export SPACE_QUERY_TEST_MYSQL_USER=root
+export SPACE_QUERY_TEST_MYSQL_PASSWORD=password
+```
 
 ```sh
 cargo test mariadb_connect_applies_advanced_session_settings --lib -- --ignored --nocapture

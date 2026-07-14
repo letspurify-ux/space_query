@@ -51,6 +51,20 @@ tracked through `ALTER SESSION SET CURRENT_SCHEMA` and reapplied to acquired or
 reused sessions. Transaction mode is not a session flag; `SET TRANSACTION` is
 issued as the first statement of each transaction.
 
+## Local test database
+
+These development-only credentials connect to the repository's local Oracle
+test container:
+
+| Setting | Value |
+| --- | --- |
+| Container | `oracle` |
+| Host | `127.0.0.1` |
+| Port | `1521` |
+| Service name | `FREE` |
+| Username | `system` |
+| Password | `password` |
+
 ## Live tests
 
 Ignored tests in the main crate read:
@@ -59,7 +73,7 @@ Ignored tests in the main crate read:
 export ORACLE_TEST_HOST=127.0.0.1
 export ORACLE_TEST_PORT=1521
 export ORACLE_TEST_SERVICE_NAME=FREE
-export ORACLE_TEST_USERNAME=user_name
+export ORACLE_TEST_USERNAME=system
 export ORACLE_TEST_PASSWORD=password
 ```
 

@@ -55,16 +55,30 @@ The authoritative implementations are `mysql_session_time_zone_in_range()`,
 `ConnectionAdvancedSettings::validate_mysql()`, and
 `mysql_collation_matches_charset()`.
 
+## Local test database
+
+These development-only credentials connect to the repository's local MySQL
+test container:
+
+| Setting | Value |
+| --- | --- |
+| Container | `space-query-mysql80` |
+| Host | `127.0.0.1` |
+| Port | `3307` |
+| Database | `query_tool_mysql8` |
+| Username | `root` |
+| Password | `spacequery` |
+
 ## Live tests
 
 Connection tests read these variables:
 
 ```sh
 export SPACE_QUERY_TEST_MYSQL_HOST=127.0.0.1
-export SPACE_QUERY_TEST_MYSQL_PORT=3306
-export SPACE_QUERY_TEST_MYSQL_DATABASE=database_name
-export SPACE_QUERY_TEST_MYSQL_USER=user_name
-export SPACE_QUERY_TEST_MYSQL_PASSWORD=password
+export SPACE_QUERY_TEST_MYSQL_PORT=3307
+export SPACE_QUERY_TEST_MYSQL_DATABASE=query_tool_mysql8
+export SPACE_QUERY_TEST_MYSQL_USER=root
+export SPACE_QUERY_TEST_MYSQL_PASSWORD=spacequery
 ```
 
 Verify the primary connection and pool session independently:

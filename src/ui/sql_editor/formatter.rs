@@ -14,6 +14,8 @@ use crate::ui::sql_depth::{
     apply_paren_token, split_top_level_keyword_groups, split_top_level_symbol_groups,
     ParenDepthState,
 };
+#[cfg(test)]
+use crate::utils::arithmetic::safe_div;
 use std::borrow::Cow;
 use std::cell::Cell;
 use std::collections::VecDeque;
@@ -473,6 +475,30 @@ struct FormatterStatementRenderResult {
     ends_with_semicolon: bool,
     should_append_missing_terminator: bool,
     is_create_trigger_statement: bool,
+    #[cfg(test)]
+    frame_alignment_audit: FormatFrameAlignmentAuditSummary,
+}
+
+#[cfg(test)]
+#[derive(Clone, Debug)]
+pub(super) struct FormatFrameAlignmentIssue {
+    pub(super) offset: usize,
+    pub(super) message: String,
+}
+
+#[cfg(test)]
+#[derive(Clone, Debug, Default)]
+pub(super) struct FormatFrameAlignmentAuditSummary {
+    pub(super) checked_frames: usize,
+    pub(super) checked_body_items: usize,
+    pub(super) checked_closes: usize,
+    pub(super) issues: Vec<FormatFrameAlignmentIssue>,
+}
+
+struct FormatterDocumentRenderResult {
+    formatted: String,
+    #[cfg(test)]
+    frame_alignment_audit: FormatFrameAlignmentAuditSummary,
 }
 
 struct FormatterTokenLineCursor<'a> {
@@ -1907,6 +1933,210 @@ struct PoppedParenFrame {
 
 #[cfg(test)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum FormatFrameAlignmentBodyEventKind {
+    FirstItem,
+    SiblingAfterComma,
+    MultilineChildClose,
+}
+
+#[cfg(test)]
+#[derive(Clone, Debug)]
+enum FormatFrameAlignmentEvent {
+    BodyItem {
+        frame_id: SqlFormatFrameId,
+        token_idx: usize,
+        kind: FormatFrameAlignmentBodyEventKind,
+    },
+    Close {
+        frame_id: SqlFormatFrameId,
+        token_idx: usize,
+        expected_indent: usize,
+    },
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy, Debug)]
+struct FormatFrameAlignmentFrame {
+    id: SqlFormatFrameId,
+    parent_id: Option<SqlFormatFrameId>,
+    open_token_idx: usize,
+    direct_list_body: bool,
+}
+
+#[cfg(test)]
+#[derive(Default)]
+struct FormatFrameAlignmentAudit {
+    frames: Vec<FormatFrameAlignmentFrame>,
+    events: Vec<FormatFrameAlignmentEvent>,
+}
+
+#[cfg(test)]
+impl FormatFrameAlignmentAudit {
+    fn frame(&self, frame_id: SqlFormatFrameId) -> Option<FormatFrameAlignmentFrame> {
+        self.frames
+            .iter()
+            .find(|frame| frame.id == frame_id)
+            .copied()
+    }
+
+    fn register_open(
+        &mut self,
+        frame_id: SqlFormatFrameId,
+        parent_id: Option<SqlFormatFrameId>,
+        open_token_idx: usize,
+        first_body_token_idx: Option<usize>,
+        direct_list_body: bool,
+    ) {
+        self.frames.push(FormatFrameAlignmentFrame {
+            id: frame_id,
+            parent_id,
+            open_token_idx,
+            direct_list_body,
+        });
+        if direct_list_body {
+            if let Some(token_idx) = first_body_token_idx {
+                self.events.push(FormatFrameAlignmentEvent::BodyItem {
+                    frame_id,
+                    token_idx,
+                    kind: FormatFrameAlignmentBodyEventKind::FirstItem,
+                });
+            }
+        }
+    }
+
+    fn record_sibling_after_comma(&mut self, frame_id: SqlFormatFrameId, token_idx: Option<usize>) {
+        if !self
+            .frame(frame_id)
+            .is_some_and(|frame| frame.direct_list_body)
+        {
+            return;
+        }
+        if let Some(token_idx) = token_idx {
+            self.events.push(FormatFrameAlignmentEvent::BodyItem {
+                frame_id,
+                token_idx,
+                kind: FormatFrameAlignmentBodyEventKind::SiblingAfterComma,
+            });
+        }
+    }
+
+    fn record_close(
+        &mut self,
+        frame_id: SqlFormatFrameId,
+        parent_id: Option<SqlFormatFrameId>,
+        token_idx: usize,
+        next_token_is_parent_comma: bool,
+        expected_close_indent: Option<usize>,
+    ) {
+        if let Some(expected_indent) = expected_close_indent {
+            self.events.push(FormatFrameAlignmentEvent::Close {
+                frame_id,
+                token_idx,
+                expected_indent,
+            });
+        }
+
+        if next_token_is_parent_comma {
+            if let Some(parent_id) = parent_id.filter(|parent_id| {
+                self.frame(*parent_id)
+                    .is_some_and(|frame| frame.direct_list_body)
+            }) {
+                self.events.push(FormatFrameAlignmentEvent::BodyItem {
+                    frame_id: parent_id,
+                    token_idx,
+                    kind: FormatFrameAlignmentBodyEventKind::MultilineChildClose,
+                });
+            }
+        }
+    }
+
+    fn line_start_indent(formatted: &str, offset: usize) -> Option<usize> {
+        let line_start = formatted
+            .get(..offset)?
+            .rfind('\n')
+            .map_or(0, |idx| idx.saturating_add(1));
+        let leading = formatted.get(line_start..offset)?;
+        if leading.bytes().all(|byte| byte == b' ') {
+            Some(safe_div(leading.len(), 4))
+        } else {
+            None
+        }
+    }
+
+    fn resolve(&self, formatted: &str, mysql_compatible: bool) -> FormatFrameAlignmentAuditSummary {
+        let spans = query_text::tokenize_sql_spanned_with_mysql_compat(formatted, mysql_compatible);
+        let mut summary = FormatFrameAlignmentAuditSummary {
+            checked_frames: self.frames.len(),
+            ..FormatFrameAlignmentAuditSummary::default()
+        };
+        let mut body_anchors: Vec<(SqlFormatFrameId, usize)> = Vec::new();
+
+        for event in &self.events {
+            match *event {
+                FormatFrameAlignmentEvent::BodyItem {
+                    frame_id,
+                    token_idx,
+                    kind,
+                } => {
+                    let Some(span) = spans.get(token_idx) else {
+                        continue;
+                    };
+                    let Some(actual_indent) = Self::line_start_indent(formatted, span.start) else {
+                        continue;
+                    };
+                    summary.checked_body_items = summary.checked_body_items.saturating_add(1);
+                    if let Some((_, expected_indent)) = body_anchors
+                        .iter()
+                        .find(|(candidate_id, _)| *candidate_id == frame_id)
+                    {
+                        if *expected_indent != actual_indent {
+                            let frame = self.frame(frame_id);
+                            summary.issues.push(FormatFrameAlignmentIssue {
+                                offset: span.start,
+                                message: format!(
+                                    "paren frame {frame_id} body indent drift after {kind:?}: expected level {expected_indent}, actual level {actual_indent}, parent={:?}, opener_token={}",
+                                    frame.and_then(|frame| frame.parent_id),
+                                    frame.map_or(0, |frame| frame.open_token_idx),
+                                ),
+                            });
+                        }
+                    } else {
+                        body_anchors.push((frame_id, actual_indent));
+                    }
+                }
+                FormatFrameAlignmentEvent::Close {
+                    frame_id,
+                    token_idx,
+                    expected_indent,
+                } => {
+                    let Some(span) = spans.get(token_idx) else {
+                        continue;
+                    };
+                    let Some(actual_indent) = Self::line_start_indent(formatted, span.start) else {
+                        continue;
+                    };
+                    summary.checked_closes = summary.checked_closes.saturating_add(1);
+                    if expected_indent != actual_indent {
+                        let frame = self.frame(frame_id);
+                        summary.issues.push(FormatFrameAlignmentIssue {
+                            offset: span.start,
+                            message: format!(
+                                "paren frame {frame_id} close indent drift: expected level {expected_indent}, actual level {actual_indent}, parent={:?}, opener_token={}",
+                                frame.and_then(|frame| frame.parent_id),
+                                frame.map_or(0, |frame| frame.open_token_idx),
+                            ),
+                        });
+                    }
+                }
+            }
+        }
+
+        summary
+    }
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum FormatFrameTransitionKind {
     TokenEntrySync,
     StatementBoundaryReset,
@@ -1966,6 +2196,8 @@ struct FormatFrameStack {
     frame_id_allocator: SqlFormatFrameIdAllocator,
     #[cfg(test)]
     transition_trace: Vec<FormatFrameTransitionEvent>,
+    #[cfg(test)]
+    frame_alignment_audit: FormatFrameAlignmentAudit,
 }
 
 impl Default for FormatFrameStack {
@@ -2001,6 +2233,8 @@ impl Default for FormatFrameStack {
             frame_id_allocator: SqlFormatFrameIdAllocator::default(),
             #[cfg(test)]
             transition_trace: Vec::new(),
+            #[cfg(test)]
+            frame_alignment_audit: FormatFrameAlignmentAudit::default(),
         }
     }
 }
@@ -2088,6 +2322,67 @@ impl FormatFrameStack {
     #[cfg(test)]
     fn transition_trace(&self) -> &[FormatFrameTransitionEvent] {
         self.transition_trace.as_slice()
+    }
+
+    #[cfg(test)]
+    fn audit_open_paren(
+        &mut self,
+        open_token_idx: usize,
+        first_body_token_idx: Option<usize>,
+        direct_list_body: bool,
+    ) {
+        let Some(frame) = self.last_paren_stack_frame() else {
+            return;
+        };
+        let frame_id = frame.id;
+        let parent_id = frame.previous_paren_frame_id;
+        self.frame_alignment_audit.register_open(
+            frame_id,
+            parent_id,
+            open_token_idx,
+            first_body_token_idx,
+            direct_list_body,
+        );
+    }
+
+    #[cfg(test)]
+    fn audit_comma(&mut self, next_body_token_idx: Option<usize>) {
+        let Some(frame_id) = self.last_paren_frame_id() else {
+            return;
+        };
+        self.frame_alignment_audit
+            .record_sibling_after_comma(frame_id, next_body_token_idx);
+    }
+
+    #[cfg(test)]
+    fn audit_close_paren(
+        &mut self,
+        frame_id: Option<SqlFormatFrameId>,
+        parent_id: Option<SqlFormatFrameId>,
+        close_token_idx: usize,
+        next_token_is_parent_comma: bool,
+        expected_close_indent: Option<usize>,
+    ) {
+        let Some(frame_id) = frame_id else {
+            return;
+        };
+        self.frame_alignment_audit.record_close(
+            frame_id,
+            parent_id,
+            close_token_idx,
+            next_token_is_parent_comma,
+            expected_close_indent,
+        );
+    }
+
+    #[cfg(test)]
+    fn frame_alignment_audit_summary(
+        &self,
+        formatted: &str,
+        mysql_compatible: bool,
+    ) -> FormatFrameAlignmentAuditSummary {
+        self.frame_alignment_audit
+            .resolve(formatted, mysql_compatible)
     }
 
     fn token_entry_cleanup_scope(current_scope: FormatScope) -> FormatScope {
@@ -5528,6 +5823,20 @@ impl SqlEditorWidget {
         }
     }
 
+    #[cfg(test)]
+    pub(super) fn format_for_auto_formatting_with_frame_alignment_audit(
+        source: &str,
+        preferred_db_type: Option<DatabaseType>,
+    ) -> (String, FormatFrameAlignmentAuditSummary) {
+        let preferred_db_type = Self::resolve_format_preferred_db_type(source, preferred_db_type);
+        let items = Self::normalize_format_items(
+            super::query_text::split_format_items_for_db_type(source, preferred_db_type),
+        );
+        let result =
+            Self::format_sql_basic_core_from_normalized_items(&items, true, preferred_db_type);
+        (result.formatted, result.frame_alignment_audit)
+    }
+
     fn format_items_have_statement(items: &[FormatItem]) -> bool {
         items.iter().any(Self::format_item_has_statement)
     }
@@ -6533,13 +6842,14 @@ impl SqlEditorWidget {
             append_missing_terminator,
             preferred_db_type,
         )
+        .formatted
     }
 
     fn format_sql_basic_core_from_normalized_items(
         items: &[FormatItem],
         append_missing_terminator: bool,
         preferred_db_type: Option<DatabaseType>,
-    ) -> String {
+    ) -> FormatterDocumentRenderResult {
         let estimated_input_len: usize = items
             .iter()
             .map(|item| match item {
@@ -6552,8 +6862,15 @@ impl SqlEditorWidget {
             .sum();
         let mut formatted = String::with_capacity(estimated_input_len.saturating_add(64));
         if items.is_empty() {
-            return String::new();
+            return FormatterDocumentRenderResult {
+                formatted: String::new(),
+                #[cfg(test)]
+                frame_alignment_audit: FormatFrameAlignmentAuditSummary::default(),
+            };
         }
+
+        #[cfg(test)]
+        let mut frame_alignment_audit = FormatFrameAlignmentAuditSummary::default();
 
         let mut select_list_break_state = SelectListBreakState::None;
         let mut active_mysql_delimiter: Option<String> = None;
@@ -6583,13 +6900,12 @@ impl SqlEditorWidget {
                         mysql_profile,
                         || Self::format_statement(&statement_input, select_list_break_state),
                     );
-                    let FormatterStatementRenderResult {
-                        formatted: mut formatted_statement,
-                        has_code,
-                        ends_with_semicolon,
-                        should_append_missing_terminator,
-                        is_create_trigger_statement,
-                    } = formatted_result;
+                    let mut formatted_statement = formatted_result.formatted;
+                    let has_code = formatted_result.has_code;
+                    let ends_with_semicolon = formatted_result.ends_with_semicolon;
+                    let should_append_missing_terminator =
+                        formatted_result.should_append_missing_terminator;
+                    let is_create_trigger_statement = formatted_result.is_create_trigger_statement;
                     if let Some(delimiter) = active_mysql_delimiter.as_deref() {
                         Self::append_statement_terminator(
                             &mut formatted_statement,
@@ -6608,6 +6924,30 @@ impl SqlEditorWidget {
                         && should_append_missing_terminator
                     {
                         Self::append_missing_statement_terminator(&mut formatted_statement);
+                    }
+                    #[cfg(test)]
+                    {
+                        let statement_offset = formatted.len();
+                        frame_alignment_audit.checked_frames = frame_alignment_audit
+                            .checked_frames
+                            .saturating_add(formatted_result.frame_alignment_audit.checked_frames);
+                        frame_alignment_audit.checked_body_items =
+                            frame_alignment_audit.checked_body_items.saturating_add(
+                                formatted_result.frame_alignment_audit.checked_body_items,
+                            );
+                        frame_alignment_audit.checked_closes = frame_alignment_audit
+                            .checked_closes
+                            .saturating_add(formatted_result.frame_alignment_audit.checked_closes);
+                        frame_alignment_audit.issues.extend(
+                            formatted_result
+                                .frame_alignment_audit
+                                .issues
+                                .into_iter()
+                                .map(|mut issue| {
+                                    issue.offset = issue.offset.saturating_add(statement_offset);
+                                    issue
+                                }),
+                        );
                     }
                     formatted.push_str(&formatted_statement);
                 }
@@ -6644,10 +6984,15 @@ impl SqlEditorWidget {
             current_item_analysis = next_item_analysis;
         }
 
-        if has_create_table_statement {
+        let formatted = if has_create_table_statement {
             Self::normalize_create_table_storage_clause_lines(formatted)
         } else {
             formatted
+        };
+        FormatterDocumentRenderResult {
+            formatted,
+            #[cfg(test)]
+            frame_alignment_audit,
         }
     }
 
@@ -8812,6 +9157,8 @@ impl SqlEditorWidget {
                 ends_with_semicolon: false,
                 should_append_missing_terminator: false,
                 is_create_trigger_statement: input.is_create_trigger_statement,
+                #[cfg(test)]
+                frame_alignment_audit: FormatFrameAlignmentAuditSummary::default(),
             };
         }
 
@@ -8824,6 +9171,8 @@ impl SqlEditorWidget {
                     tokens,
                 ),
                 is_create_trigger_statement: input.is_create_trigger_statement,
+                #[cfg(test)]
+                frame_alignment_audit: FormatFrameAlignmentAuditSummary::default(),
             };
         }
 
@@ -14075,6 +14424,10 @@ impl SqlEditorWidget {
                                     needs_space = false;
                                 }
                             }
+                            #[cfg(test)]
+                            if !delimiter_frame_state.is_inside_bracket() {
+                                format_stack.audit_comma(next_non_comment_idx);
+                            }
                         }
                         ";" => {
                             format_stack.with_cte_on_separator();
@@ -14754,6 +15107,15 @@ impl SqlEditorWidget {
                                 keep: is_keep_paren,
                                 structured_table_function: is_structured_multiline_table_function,
                             };
+                            #[cfg(test)]
+                            let audits_direct_list_body = paren_has_top_level_comma
+                                && !paren_frame_kind.is_query_like()
+                                && !is_query_paren
+                                && multiline_clause_owner_kind.is_none()
+                                && wrapped_owner_kind.is_none()
+                                && forced_wrapped_owner_kind.is_none()
+                                && !is_model_rules_paren
+                                && !is_structured_multiline_table_function;
                             format_stack.push_paren(
                                 ParenFormatFrame::new(
                                     paren_frame_kind,
@@ -14779,6 +15141,12 @@ impl SqlEditorWidget {
                                     }),
                                 None,
                                 &mut indent_level,
+                            );
+                            #[cfg(test)]
+                            format_stack.audit_open_paren(
+                                idx,
+                                next_non_comment_idx,
+                                audits_direct_list_body,
                             );
                             if paren_frame_kind.opens_indented() {
                                 // `indent_level` was already updated atomically
@@ -14831,6 +15199,8 @@ impl SqlEditorWidget {
                         ")" => {
                             format_stack.with_cte_on_close_paren();
                             trim_trailing_space(&mut out);
+                            #[cfg(test)]
+                            let audit_paren_frame_id = format_stack.last_paren_frame_id();
                             let popped_paren = format_stack.pop_paren(&mut indent_level);
                             let (
                                 paren_frame_kind,
@@ -15044,6 +15414,30 @@ impl SqlEditorWidget {
                                     }
                                 }
                             }
+                            #[cfg(test)]
+                            {
+                                let expected_close_indent =
+                                    paren_frame_kind.closes_indented().then(|| {
+                                        if paren_frame_kind.close_indent() > 0 {
+                                            paren_frame_kind.close_indent()
+                                        } else {
+                                            base_indent!(indent_level)
+                                        }
+                                    });
+                                let next_token_is_parent_comma = paren_frame_kind.closes_indented()
+                                    && matches!(
+                                        next_non_comment,
+                                        Some(SqlToken::Symbol(sym)) if sym == ","
+                                    );
+                                let audit_parent_frame_id = format_stack.last_paren_frame_id();
+                                format_stack.audit_close_paren(
+                                    audit_paren_frame_id,
+                                    audit_parent_frame_id,
+                                    idx,
+                                    next_token_is_parent_comma,
+                                    expected_close_indent,
+                                );
+                            }
                             needs_space = true;
                         }
                         "." => {
@@ -15206,6 +15600,9 @@ impl SqlEditorWidget {
 
         let formatted = Self::split_inline_statement_separators(out);
         let formatted = Self::trim_code_line_trailing_whitespace(formatted, mysql_compatible);
+        #[cfg(test)]
+        let frame_alignment_audit =
+            format_stack.frame_alignment_audit_summary(&formatted, mysql_compatible);
         FormatterStatementRenderResult {
             formatted,
             has_code: statement_tail_state.has_code(statement),
@@ -15213,6 +15610,8 @@ impl SqlEditorWidget {
             should_append_missing_terminator: statement_tail_state
                 .should_append_missing_terminator(),
             is_create_trigger_statement: input.is_create_trigger_statement,
+            #[cfg(test)]
+            frame_alignment_audit,
         }
     }
 
@@ -16978,6 +17377,35 @@ mod inline_statement_separator_tests {
             SqlEditorWidget::split_inline_statement_separators_for_test("SELECT 1; SELECT 2;"),
             "SELECT 1;\n SELECT 2;"
         );
+    }
+}
+
+#[cfg(test)]
+mod frame_alignment_audit_tests {
+    use super::FormatFrameAlignmentAudit;
+
+    #[test]
+    fn frame_alignment_audit_reports_body_and_close_indent_drift() {
+        let formatted = "fn(\n    first,\n        second\n    )";
+        let mut audit = FormatFrameAlignmentAudit::default();
+        audit.register_open(1, None, 1, Some(2), true);
+        audit.record_sibling_after_comma(1, Some(4));
+        audit.record_close(1, None, 5, false, Some(0));
+
+        let summary = audit.resolve(formatted, false);
+
+        assert_eq!(summary.checked_frames, 1);
+        assert_eq!(summary.checked_body_items, 2);
+        assert_eq!(summary.checked_closes, 1);
+        assert_eq!(summary.issues.len(), 2, "{:#?}", summary.issues);
+        assert!(summary
+            .issues
+            .iter()
+            .any(|issue| issue.message.contains("body indent drift")));
+        assert!(summary
+            .issues
+            .iter()
+            .any(|issue| issue.message.contains("close indent drift")));
     }
 }
 

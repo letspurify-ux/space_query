@@ -15,6 +15,7 @@ enum FormatSweepIssueKind {
     FormatPanic,
     ItemOrTokenChanged,
     Indentation,
+    FrameAlignment,
     LineBreak,
     WhitespaceDependency,
     NonIdempotent,
@@ -34,6 +35,9 @@ struct FormatSweepRun {
     formatted: String,
     checked_lines: usize,
     checked_gaps: usize,
+    checked_frames: usize,
+    checked_frame_body_items: usize,
+    checked_frame_closes: usize,
     probes: usize,
     issues: Vec<FormatSweepIssue>,
 }
@@ -438,15 +442,21 @@ fn whitespace_kind_between_equal_tokens(
 
 fn format_sweep_run(source: &str, db_type: DatabaseType) -> FormatSweepRun {
     let first = catch_unwind(AssertUnwindSafe(|| {
-        SqlEditorWidget::format_for_auto_formatting_with_db_type(source, false, Some(db_type))
+        SqlEditorWidget::format_for_auto_formatting_with_frame_alignment_audit(
+            source,
+            Some(db_type),
+        )
     }));
-    let formatted = match first {
-        Ok(formatted) => formatted,
+    let (formatted, frame_alignment_audit) = match first {
+        Ok(result) => result,
         Err(payload) => {
             return FormatSweepRun {
                 formatted: source.to_string(),
                 checked_lines: 0,
                 checked_gaps: 0,
+                checked_frames: 0,
+                checked_frame_body_items: 0,
+                checked_frame_closes: 0,
                 probes: 0,
                 issues: vec![FormatSweepIssue::new(
                     FormatSweepIssueKind::FormatPanic,
@@ -463,6 +473,14 @@ fn format_sweep_run(source: &str, db_type: DatabaseType) -> FormatSweepRun {
 
     let (checked_lines, checked_gaps, mut issues) =
         format_sweep_audit_first_pass(&formatted, db_type);
+    issues.extend(frame_alignment_audit.issues.into_iter().map(|issue| {
+        FormatSweepIssue::new(
+            FormatSweepIssueKind::FrameAlignment,
+            &formatted,
+            issue.offset,
+            issue.message,
+        )
+    }));
     if let Some(issue) = format_sweep_audit_token_count(source, &formatted, db_type) {
         issues.push(issue);
     }
@@ -533,6 +551,9 @@ fn format_sweep_run(source: &str, db_type: DatabaseType) -> FormatSweepRun {
         formatted,
         checked_lines,
         checked_gaps,
+        checked_frames: frame_alignment_audit.checked_frames,
+        checked_frame_body_items: frame_alignment_audit.checked_body_items,
+        checked_frame_closes: frame_alignment_audit.checked_closes,
         probes,
         issues,
     }
@@ -582,8 +603,13 @@ fn format_sweep_render_out(
         }
     ));
     annotated.push_str(&format!(
-        "-- checked: lines={} token_gaps={} probes={}\n",
-        run.checked_lines, run.checked_gaps, run.probes
+        "-- checked: lines={} token_gaps={} frames={} frame_body_items={} frame_closes={} probes={}\n",
+        run.checked_lines,
+        run.checked_gaps,
+        run.checked_frames,
+        run.checked_frame_body_items,
+        run.checked_frame_closes,
+        run.probes
     ));
     annotated.push_str(&format!("-- issues: total={}\n", run.issues.len()));
     annotated.push_str("-- marker: [[FMT:E...]] marks an invariant error\n");
@@ -720,6 +746,52 @@ fn formatting_sweep_simple_sql_converges() {
 }
 
 #[test]
+fn formatting_sweep_audits_nested_parenthesized_list_alignment() {
+    let source = r#"CALL sp_assert(
+    (
+        SELECT COUNT(*)
+        FROM task_log
+    ),
+    expected_count,
+    'count mismatch'
+);"#;
+    let run = format_sweep_run(source, DatabaseType::MariaDB);
+
+    assert!(
+        run.issues.is_empty(),
+        "unexpected issues: {:?}\n{}",
+        run.issues,
+        run.formatted
+    );
+    assert!(run.checked_frames >= 2, "{run:#?}");
+    assert!(run.checked_frame_body_items >= 3, "{run:#?}");
+    assert!(run.checked_frame_closes >= 1, "{run:#?}");
+}
+
+#[test]
+fn formatting_sweep_keeps_query_order_keys_out_of_direct_paren_body_audit() {
+    let source = r#"CALL mb_assert_2(
+    (
+        SELECT asset_id
+        FROM mb_asset
+        ORDER BY VEC_DISTANCE_COSINE(embedding, VEC_FromText('[1,1,1]')),
+            asset_id
+        LIMIT 1
+    ) = 2,
+    'nearest vector asset'
+);"#;
+    let run = format_sweep_run(source, DatabaseType::MariaDB);
+
+    assert!(
+        run.issues.is_empty(),
+        "query clauses inside a parenthesized CALL argument are not direct paren siblings: {:?}\n{}",
+        run.issues,
+        run.formatted
+    );
+    assert!(run.checked_frames >= 4, "{run:#?}");
+}
+
+#[test]
 fn formatting_sweep_preserves_conditional_compilation_trailing_comments() {
     let source = r#"CREATE OR REPLACE PROCEDURE cc_comment IS
 BEGIN
@@ -754,6 +826,9 @@ fn formatting_sweep_report_marks_first_pass_issue() {
         formatted: "SELECT 1 FROM DUAL;".to_string(),
         checked_lines: 1,
         checked_gaps: 1,
+        checked_frames: 0,
+        checked_frame_body_items: 0,
+        checked_frame_closes: 0,
         probes: 0,
         issues: vec![FormatSweepIssue::new(
             FormatSweepIssueKind::LineBreak,
@@ -800,6 +875,9 @@ fn formatting_sweep_all_files_generate_out_report() {
     let output_root = manifest.join("target/format-sweep");
     let mut failures = Vec::new();
     let mut checked_files = 0usize;
+    let mut checked_frames = 0usize;
+    let mut checked_frame_body_items = 0usize;
+    let mut checked_frame_closes = 0usize;
 
     for (dir, db_type) in [
         ("test", DatabaseType::Oracle),
@@ -830,6 +908,10 @@ fn formatting_sweep_all_files_generate_out_report() {
                 .join(relative.parent().unwrap_or(Path::new("")))
                 .join(format!("{file_name}.format.out"));
             let run = format_sweep_generate_report_for_file(&input_path, db_type, &out_path, false);
+            checked_frames = checked_frames.saturating_add(run.checked_frames);
+            checked_frame_body_items =
+                checked_frame_body_items.saturating_add(run.checked_frame_body_items);
+            checked_frame_closes = checked_frame_closes.saturating_add(run.checked_frame_closes);
             if !run.issues.is_empty() {
                 failures.push(format!(
                     "{} issues={} report={}",
@@ -842,7 +924,7 @@ fn formatting_sweep_all_files_generate_out_report() {
     }
 
     let mut aggregate = format!(
-        "Auto-format sweep aggregate\nchecked_files={checked_files}\nfailed_files={}\n",
+        "Auto-format sweep aggregate\nchecked_files={checked_files}\nchecked_frames={checked_frames}\nchecked_frame_body_items={checked_frame_body_items}\nchecked_frame_closes={checked_frame_closes}\nfailed_files={}\n",
         failures.len()
     );
     for failure in &failures {

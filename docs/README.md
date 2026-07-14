@@ -28,8 +28,9 @@ This directory documents the current implementation. Start with the repository
 - Source code is authoritative for formatter and highlighter keyword catalogs.
   The documents identify the classifiers and invariants instead of copying long
   lists.
-- Local container names, personal installation paths, server patch versions,
-  and passwords are not implementation contracts and do not belong here.
+- Local test container coordinates and development-only credentials documented
+  by each database guide are fixtures, not implementation contracts. Never
+  record production credentials here.
 
 ## Verification standard
 
