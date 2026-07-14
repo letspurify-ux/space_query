@@ -947,3 +947,71 @@ fn match_recognize_define_condition_continuation_anchors_to_item_line() {
         "DEFINE condition continuation must sit one level deeper than its item line, got:\n{formatted}"
     );
 }
+
+#[test]
+fn adversarial_frame_probes_stay_idempotent() {
+    let probes: Vec<(&str, &str, DatabaseType)> = vec![
+        (
+            "P1 nested call inline CASE arg",
+            "BEGIN\nouter_call (a => inner_call (x => 1, y => CASE WHEN v = 1 THEN 'p' ELSE 'q' END,\nz => 2), b => CASE WHEN w = 2 THEN 'r' ELSE 's' END,\nc => 3);\nEND;",
+            DatabaseType::Oracle,
+        ),
+        (
+            "P2 inline CASE arg deep in package body IF",
+            "CREATE OR REPLACE PACKAGE BODY pkg AS\nPROCEDURE p IS\nBEGIN\nIF x = 1 THEN\nFOR i IN 1..3 LOOP\nlog_call (p_tag => 'T', p_val => CASE WHEN MOD (i, 2) = 0 THEN 'E' ELSE 'O' END,\np_extra => i);\nEND LOOP;\nEND IF;\nEND p;\nEND pkg;\n/",
+            DatabaseType::Oracle,
+        ),
+        (
+            "P3 CASE as first arg after open paren",
+            "BEGIN\nfoo (CASE WHEN a = 1 THEN 'x' ELSE 'y' END,\n2, 3);\nEND;",
+            DatabaseType::Oracle,
+        ),
+        (
+            "P4 SQL select-list call with => CASE",
+            "SELECT pkg.fn (p_a => CASE WHEN t.c = 1 THEN 'a' ELSE 'b' END,\np_b => 2) AS v FROM t;",
+            DatabaseType::Oracle,
+        ),
+        (
+            "P5 MariaDB CONDITION FOR error code nested",
+            "CREATE PROCEDURE sp()\nBEGIN\nDECLARE dup_key CONDITION FOR 1062;\nDECLARE CONTINUE HANDLER FOR dup_key\nBEGIN\nSET @x = 1;\nEND;\nBEGIN\nDECLARE bad_state CONDITION FOR SQLSTATE '45000';\nSET @y = 2;\nEND;\nEND",
+            DatabaseType::MariaDB,
+        ),
+        (
+            "P6 FETCH comment continuation after PIVOT close",
+            "SELECT * FROM (SELECT deptno, job, sal FROM emp) PIVOT (SUM (sal) FOR job IN ('A' AS a, 'B' AS b)) ORDER BY deptno FETCH FIRST /* top */ 5 ROWS ONLY;",
+            DatabaseType::Oracle,
+        ),
+        (
+            "P7 FETCH comment continuation nested in OPEN FOR + UNPIVOT",
+            "CREATE OR REPLACE PROCEDURE p IS r SYS_REFCURSOR; BEGIN OPEN r FOR SELECT * FROM (SELECT a, b FROM t) UNPIVOT (v FOR k IN (a AS 'A', b AS 'B')) ORDER BY k FETCH FIRST /* top */ 3 ROWS ONLY; END p;",
+            DatabaseType::Oracle,
+        ),
+        (
+            "P8 MR DEFINE multi-item with comment and AND",
+            "SELECT * FROM e MATCH_RECOGNIZE (PARTITION BY d ORDER BY rn PATTERN (L+ H) DEFINE\n-- low band\nL AS L.v < 10 AND L.w > 2,\n-- high band\nH AS H.v > 50 AND H.w < 9);",
+            DatabaseType::Oracle,
+        ),
+        (
+            "P9 MR DEFINE with subquery WHERE AND inside",
+            "SELECT * FROM e MATCH_RECOGNIZE (PARTITION BY d ORDER BY rn PATTERN (A B+) DEFINE B AS B.sal > (SELECT AVG (x.sal) FROM e x WHERE x.d = B.d AND x.flag = 'Y'));",
+            DatabaseType::Oracle,
+        ),
+        (
+            "P10 MR inside MERGE USING subquery with DEFINE AND",
+            "MERGE INTO tgt t USING (SELECT * FROM e MATCH_RECOGNIZE (PARTITION BY d ORDER BY rn PATTERN (A B+) DEFINE\n-- cond\nB AS B.sal > PREV (B.sal) AND B.sal < 99)) s ON (t.id = s.id) WHEN MATCHED THEN UPDATE SET t.v = s.v;",
+            DatabaseType::Oracle,
+        ),
+    ];
+    let mut failures = Vec::new();
+    for (name, src, db) in probes {
+        let once = SqlEditorWidget::format_sql_basic_no_cache_for_db_type(src, db);
+        let twice = SqlEditorWidget::format_sql_basic_no_cache_for_db_type(&once, db);
+        let idempotent = once == twice;
+        println!("===== {name} (idempotent={idempotent}) =====\n{once}\n");
+        if !idempotent {
+            println!("----- SECOND PASS DIFFERS -----\n{twice}\n");
+            failures.push(name);
+        }
+    }
+    assert!(failures.is_empty(), "non-idempotent probes: {failures:?}");
+}

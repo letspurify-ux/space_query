@@ -1787,3 +1787,58 @@ DEFINE 조건의 `AND`/`OR` 연속행 indent가 DEFINE 절 기준 절대 +1로 �
 | 수정 후 스윕 before/after diff | 의도한 4개 파일·4개 지점만 변경 (test22, test23, test_open_with, test_mariadb/test5) |
 | 실제 SQL 파일 자동 포맷 스윕 집계 | checked_files=47, failed_files=0 (전 파일 PASS, 비멱등·불변식 위반 0) |
 | 전체 라이브러리 테스트 | 6,434 통과, 실패 0, ignored 212 |
+
+---
+
+# 5차 정밀 검증 회차 (2026-07-14, 4차 수정분 심층 재검증)
+
+4차 수정(frame 상대 구조 4건) 이후 스윕을 재실행하고 `.format.out` 재검토 +
+시그니처 스캔 + 적대적 프로브로 심층 검증했다. **신규 결함 0건, 포맷터 코드
+변경 없음.** 회귀 방지용 멱등성 프로브 테스트 1건을 추가했다.
+
+## 12-1. 1차 자동 검사
+
+`formatting_sweep_all_files_generate_out_report`: checked_files=47, failed_files=0
+(전 파일 PASS — 토큰 불변식·들여쓰기 단위·멱등성·재들여쓰기/붕괴/전개 프로브 포함).
+
+## 12-2. 출력 재검토 및 시그니처 스캔 (47개 파일 / 28,588줄)
+
+| 검사 | 대상 | 결과 |
+| --- | --- | --- |
+| 4차 변경 4개 파일 전체 재정독 (test22, test23, test_open_with, test_mariadb/test5) | 4 파일 | frame 정합 확인, 이상 없음 |
+| inline `=> CASE` / `, CASE` / `(CASE` 발생 지점 전수 확인 | 47 파일 | 2건(test22·test23) 모두 괄호 frame +1로 정렬됨 |
+| 인라인 블록주석 뒤 연속행 붕괴(+0) 스캔 | 47 파일 | 7건 검출 → 문자열 내부 2건, `WITH /* */`·`ON /* */` 5건은 CTE 이름 레벨·ON 동일깊이 명시 분기(의도된 상대 규칙) |
+| AND/OR가 직전 코드행과 같은 indent인 지점 스캔 | 47 파일 | 9건 → 전부 `EXISTS(...)` 닫힘 뒤 형제 조건(확립 규칙) 또는 블록주석/문자열 내부 |
+| 단독 `FOR` 행(선언 오절단 의심) 스캔 | 47 파일 | 2건 → 모두 문자열 내부 원문 |
+| 3레벨 이상 indent 점프 스캔 | 47 파일 | 20건 → 전부 q-quote 문자열 경계 또는 같은 줄 다중 미닫힘 괄호 가산 규칙 |
+| 단독 라인주석 anchoring 드리프트 스캔 | 47 파일 | 4건 → 블록 dedent 직전 본문 주석(표준) 2건, 문자열 내부 2건 |
+| `END`/`END IF` 등 owner 정렬 스캔 | 47 파일 | 50건 → TYPE BODY의 CREATE 정렬, 문자열 내 가짜 END, MySQL `UNTIL`/`END REPEAT` 규약으로 전부 정상 |
+
+## 12-3. 적대적 프로브 10종 (전부 PASS + 멱등)
+
+4차 수정 경로를 더 깊은 중첩으로 공격:
+
+1. 중첩 호출 안 inline CASE 인자 2개 (`outer_call(a => inner_call(..., y => CASE...), b => CASE...)`)
+2. PACKAGE BODY → PROCEDURE → IF → FOR LOOP 내부의 inline CASE 인자 (깊은 블록 중첩)
+3. 여는 괄호 직후 첫 인자 CASE
+4. SQL SELECT 목록 함수 호출의 `=> CASE`
+5. MariaDB `CONDITION FOR 1062`(에러코드형) + 중첩 BEGIN 내 `CONDITION FOR SQLSTATE`
+6. PIVOT 닫힘 뒤 `FETCH FIRST /* 주석 */` 연속행
+7. OPEN FOR + UNPIVOT 닫힘 뒤 FETCH 주석 연속행
+8. MR DEFINE 다중 항목 + 항목별 주석 + AND (항목 라인 +1, 콤마 후 다음 항목 복귀)
+9. MR DEFINE 조건 내부 서브쿼리의 WHERE AND (WHERE owner가 MR 규칙보다 우선함 확인)
+10. MERGE USING 서브쿼리 안의 MR DEFINE AND (2중 중첩)
+
+10종 모두 frame 상대 구조 유지 + 2회 포맷 결과 동일(멱등).
+프로브는 `adversarial_frame_probes_stay_idempotent` 테스트로 영구 고정.
+
+## 12-4. 5차 회차 검증 결과
+
+| 검증 | 결과 |
+| --- | --- |
+| 스윕 자동 검사 | 47/47 PASS, 실패 0 |
+| 출력 재검토·시그니처 스캔 8종 | 신규 결함 0건 |
+| 적대적 프로브 10종 | 전부 PASS, 멱등 |
+| 전체 라이브러리 테스트 | 6,435 통과, 실패 0, ignored 212 |
+| `cargo fmt -- --check` | 통과 |
+| 포맷터 코드 변경 | 없음 (검증 전용 회차) |
