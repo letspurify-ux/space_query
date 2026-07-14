@@ -8866,7 +8866,7 @@ impl SqlEditorWidget {
             FormatterTokenLineCursor::new(statement.as_bytes(), token_spans);
         let mut token_context_cursor = FormatterTokenContextCursor::new(tokens);
         let mut rendered_line_tracker = RenderedLineTracker::default();
-        let comment_prefix_text = std::cell::RefCell::new(String::new());
+        let comment_prefix_text = std::sync::Mutex::new(String::new());
         let newline_with = |out: &mut String,
                             indent_level: usize,
                             extra: usize,
@@ -8892,7 +8892,10 @@ impl SqlEditorWidget {
             *at_line_start = true;
             *needs_space = false;
             current_rendered_line_paren_depth.set(0);
-            comment_prefix_text.borrow_mut().clear();
+            comment_prefix_text
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .clear();
         };
         macro_rules! oracle_conditional_body_indent {
             () => {
@@ -9104,7 +9107,10 @@ impl SqlEditorWidget {
         let mut previous_token_end_newline_count = 0usize;
         while idx < tokens.len() {
             if at_line_start {
-                comment_prefix_text.borrow_mut().clear();
+                comment_prefix_text
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .clear();
             }
             let rendered_token_idx = idx;
             let current_token_paren_depth = lexical_paren_depth_state.depth();
@@ -12621,7 +12627,10 @@ impl SqlEditorWidget {
                         && suppress_comma_break_depth == 0
                         && format_stack.paren_is_empty();
                     let active_list_layout = select_list_layout_state!().has_active_indent();
-                    let comment_structural_prefix_snapshot = comment_prefix_text.borrow().clone();
+                    let comment_structural_prefix_snapshot = comment_prefix_text
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .clone();
                     let comment_structural_prefix = comment_structural_prefix_snapshot.as_str();
                     let previous_non_comment_token = loop_previous_non_comment_token;
                     let second_previous_non_comment_token = loop_second_previous_non_comment_token;
@@ -15068,7 +15077,12 @@ impl SqlEditorWidget {
             }
             for consumed_idx in rendered_token_idx..=idx {
                 if let Some(token) = tokens.get(consumed_idx) {
-                    append_comment_prefix_token(&mut comment_prefix_text.borrow_mut(), token);
+                    append_comment_prefix_token(
+                        &mut comment_prefix_text
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner()),
+                        token,
+                    );
                 }
             }
             previous_token_end_newline_count = current_token_profile.end_newline_count;
