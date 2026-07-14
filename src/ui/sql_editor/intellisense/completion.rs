@@ -7424,7 +7424,7 @@ impl SqlEditorWidget {
                 })
                 .is_some_and(|for_idx| statement_words.len() > for_idx + 1);
             if matches_prefix("WITH")
-                && following_words.get(0).is_some_and(|word| word == "SYSTEM")
+                && following_words.first().is_some_and(|word| word == "SYSTEM")
                 && following_words.get(1).is_some_and(|word| word == "VERSIONING")
             {
                 return Some("WITH".to_string());
@@ -7460,7 +7460,7 @@ impl SqlEditorWidget {
             }
             if matches_prefix("ROW")
                 && statement_has("DECLARE")
-                && following_words.get(0).is_some_and(|word| word == "TYPE")
+                && following_words.first().is_some_and(|word| word == "TYPE")
                 && following_words.get(1).is_some_and(|word| word == "OF")
             {
                 return Some("ROW".to_string());

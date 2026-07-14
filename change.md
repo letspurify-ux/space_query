@@ -1942,3 +1942,127 @@ frame 누수나 형제 scope 오인이 발견되지 않았다.
 | 포맷터·테스트 코드 수정 | 없음 |
 | 문서 변경 | 본 6차 독립 검증 기록 추가 |
 | 최종 상태 | 스윕·집중 회귀·전체 테스트·fmt 전부 성공 |
+
+---
+
+# 7차 최신 fixture 독립 검증 회차 (2026-07-14, 53개 전수 정독)
+
+6차 기록의 47개 결과를 결론으로 재사용하지 않고 지정 스윕을 다시 실행했다.
+그 사이 추가된 MySQL 3개·MariaDB 3개 fixture를 포함해 생성된 모든
+`.format.out`을 1행부터 EOF까지 직접 정독하고, frame open/close 상대 depth
+구현과 실제 토큰 처리 경로를 다시 감사했다. **신규 포맷 결함 0건, 포매터·테스트
+코드 수정 0건**이다.
+
+## 14-1. 지정 스윕 및 출력 전수 육안 검토
+
+실행 명령:
+
+```text
+cargo test --lib formatting_sweep_all_files_generate_out_report -- --ignored --nocapture
+```
+
+| 대상 | 파일 수 | 처음부터 끝까지 확인한 줄 수 | 결과 |
+| --- | ---: | ---: | --- |
+| `target/format-sweep/test/*.format.out` (Oracle) | 39 | 22,089 | 신규 결함 0 |
+| `target/format-sweep/test_mysql/*.format.out` (MySQL) | 6 | 3,689 | 신규 결함 0 |
+| `target/format-sweep/test_mariadb/*.format.out` (MariaDB) | 8 | 6,363 | 신규 결함 0 |
+| **합계** | **53** | **32,141** | **53/53 PASS, 실패 0** |
+
+PASS 표시는 결론의 근거로 대신하지 않고, 실제 출력에서 괄호·블록·CASE·CTE·
+서브쿼리·JSON/XML table function·MATCH_RECOGNIZE·루틴/handler의 시작 frame,
+중첩 종료, 부모와 다음 형제 depth 복귀를 확인했다. 주석·일반 문자열·Oracle
+q-quote·동적 SQL 안의 가짜 괄호/세미콜론/END가 바깥 frame을 변경하지 않는지도
+함께 확인했다.
+
+보조 검사에서는 실제 `[[FMT:E숫자...]]` 오류 마커 0개, `status: PASS` 53개,
+`issues: total=0` 53개, 집계 `checked_files=53 / failed_files=0`이었다. 최종
+스윕 재생성 후 육안 정독 직전 보관본과 `diff -qr`로 비교했으며 파일 추가·삭제·
+내용 차이가 모두 0이었다. 따라서 최종 53개·32,141줄은 정독한 산출물과 바이트
+단위로 동일하다.
+
+## 14-2. frame open/close 상대 depth 구현 재감사
+
+- `FormatFrameStack`이 Paren·Block·QueryRuntime·ScopedIndent·ConditionOwner를
+  한 스택에서 관리하고, 괄호와 블록 시작마다 고유 frame ID와 부모 frame ID를
+  기록한다.
+- 실제 토큰 루프는 토큰 진입마다 현재 frame ID를 포함한 scope를 동기화한다.
+  `(`는 `push_paren`에서 상대 indent delta와 runtime을 함께 열고, `)`는
+  `pop_paren`에서 같은 frame의 delta를 되돌린 뒤 부모 상태를 복원한다.
+- 블록은 owner/body depth를 `FormatBlockDepthFrame`에 저장하며, `pop_block`은
+  닫힌 뒤 살아남은 frame stack에서 기준 indent를 재구성한다.
+- `FormatScope::contains`는 depth뿐 아니라 frame ID도 대조하므로 동일 depth의
+  형제 frame을 부모/자식으로 오인하지 않는다. debug invariant와 statement
+  boundary 정리도 stack의 기대 indent 및 최근 frame ID를 검증한다.
+
+이번 53개 전수 출력과 집중 테스트에서 frame 누수, 중첩 close 후 외부 depth
+손실, 동일 depth 형제 scope 오인은 재현되지 않았다. 따라서 단순 depth 보정
+코드를 추가하는 것보다 현재 frame 기반 구현을 그대로 유지하는 것이 최소·정확한
+조치라고 판단했다.
+
+## 14-3. AS-IS / TO-BE query
+
+이번 회차에는 수정할 결함이 없으므로 AS-IS와 TO-BE의 SQL 및 출력이 동일하다.
+아래 중첩 query는 바깥 `MATCH_RECOGNIZE` frame 안에서 서브쿼리 frame이 열리고
+닫힌 뒤 바깥 `DEFINE`과 괄호 depth로 정확히 복귀하는 대표 확인 사례다.
+
+### AS-IS
+
+```sql
+SELECT *
+FROM e
+MATCH_RECOGNIZE (
+    PARTITION BY d
+    ORDER BY rn
+    PATTERN (A B+)
+    DEFINE B AS B.sal > (
+        SELECT AVG (x.sal)
+        FROM e x
+        WHERE x.d = B.d
+            AND x.flag = 'Y'
+    )
+);
+```
+
+### TO-BE
+
+```sql
+SELECT *
+FROM e
+MATCH_RECOGNIZE (
+    PARTITION BY d
+    ORDER BY rn
+    PATTERN (A B+)
+    DEFINE B AS B.sal > (
+        SELECT AVG (x.sal)
+        FROM e x
+        WHERE x.d = B.d
+            AND x.flag = 'Y'
+    )
+);
+```
+
+즉, 이번 회차의 변경 내역은 `AS-IS = TO-BE`이며 프로덕션 SQL 포매터 diff는
+없다. 실제 과거 수정 쿼리의 차이는 11-1~11-4에 계속 보존한다.
+
+## 14-4. 회귀 및 전체 검증 결과
+
+| 검증 | 결과 |
+| --- | --- |
+| `cargo test --lib format_frame_stack -- --nocapture` | 33 통과, 실패 0 |
+| `cargo test --lib sql_format_ -- --nocapture` | 8 통과, 실패 0 |
+| 인라인 CASE 후속 인자 frame 회귀 | 1 통과, 실패 0 |
+| 적대적 frame query 10종 | 전부 2회 포맷 동일(멱등), 실패 0 |
+| `cargo test --lib` | 6,466 통과, 실패 0, ignored 218 |
+| `cargo fmt -- --check` | 통과 |
+| 지정 ignored 스윕 최초·최종 실행 | 각 1 통과, checked_files=53, failed_files=0 |
+| 최초 산출물 vs 최종 산출물 `diff -qr` | 차이 0 |
+
+## 14-5. 7차 회차 결론
+
+| 항목 | 결과 |
+| --- | --- |
+| 전수 확인 파일/라인 | 53개 / 32,141줄 |
+| 새로 발견한 오류 | 0건 |
+| 포매터·테스트 코드 수정 | 없음 |
+| 문서 변경 | 본 7차 독립 검증 기록 추가 |
+| 최종 상태 | 스윕·집중 회귀·전체 테스트·fmt 전부 성공 |
