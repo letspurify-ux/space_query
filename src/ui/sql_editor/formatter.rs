@@ -7830,6 +7830,28 @@ impl SqlEditorWidget {
         has_declare && has_handler
     }
 
+    fn is_mysql_declare_condition_for_clause_from_indices(
+        tokens: &[SqlToken],
+        recent_statement_word_indices: &VecDeque<usize>,
+    ) -> bool {
+        let mut has_declare = false;
+        let mut has_condition = false;
+        Self::scan_recent_statement_words_from_indices(
+            tokens,
+            recent_statement_word_indices,
+            6,
+            |word, _| {
+                if word.eq_ignore_ascii_case("DECLARE") {
+                    has_declare = true;
+                } else if word.eq_ignore_ascii_case("CONDITION") {
+                    has_condition = true;
+                }
+                !(has_declare && has_condition)
+            },
+        );
+        has_declare && has_condition
+    }
+
     fn is_mysql_if_exists_modifier_from_indices(
         tokens: &[SqlToken],
         next_word: Option<&str>,
@@ -8844,7 +8866,7 @@ impl SqlEditorWidget {
             FormatterTokenLineCursor::new(statement.as_bytes(), token_spans);
         let mut token_context_cursor = FormatterTokenContextCursor::new(tokens);
         let mut rendered_line_tracker = RenderedLineTracker::default();
-        let mut comment_prefix_text = String::new();
+        let comment_prefix_text = std::cell::RefCell::new(String::new());
         let newline_with = |out: &mut String,
                             indent_level: usize,
                             extra: usize,
@@ -8870,6 +8892,7 @@ impl SqlEditorWidget {
             *at_line_start = true;
             *needs_space = false;
             current_rendered_line_paren_depth.set(0);
+            comment_prefix_text.borrow_mut().clear();
         };
         macro_rules! oracle_conditional_body_indent {
             () => {
@@ -9081,7 +9104,7 @@ impl SqlEditorWidget {
         let mut previous_token_end_newline_count = 0usize;
         while idx < tokens.len() {
             if at_line_start {
-                comment_prefix_text.clear();
+                comment_prefix_text.borrow_mut().clear();
             }
             let rendered_token_idx = idx;
             let current_token_paren_depth = lexical_paren_depth_state.depth();
@@ -9416,12 +9439,19 @@ impl SqlEditorWidget {
                             tokens,
                             &recent_statement_word_indices,
                         );
+                    let mysql_declare_condition_for_clause = mysql_compatible
+                        && upper == "FOR"
+                        && Self::is_mysql_declare_condition_for_clause_from_indices(
+                            tokens,
+                            &recent_statement_word_indices,
+                        );
                     let mysql_handler_body_line_pending = mysql_handler_state.body_line_pending();
                     let mysql_handler_block_begin = mysql_handler_body_line_pending
                         && upper == "BEGIN"
                         && !mysql_declare_handler_for_clause;
-                    let mysql_declare_for_clause =
-                        mysql_declare_cursor_for_clause || mysql_declare_handler_for_clause;
+                    let mysql_declare_for_clause = mysql_declare_cursor_for_clause
+                        || mysql_declare_handler_for_clause
+                        || mysql_declare_condition_for_clause;
                     let mysql_if_exists_modifier = upper == "IF"
                         && Self::is_mysql_if_exists_modifier_from_indices(
                             tokens,
@@ -10525,6 +10555,23 @@ impl SqlEditorWidget {
                                     &mut needs_space,
                                     &mut line_indent,
                                 );
+                            } else if matches!(upper, "AND" | "OR")
+                                && format_stack.in_match_recognize_paren()
+                            {
+                                // MATCH_RECOGNIZE DEFINE conditions continue one level
+                                // deeper than the line that started the condition item,
+                                // so comment-split items keep their own frame.
+                                let define_condition_indent = rendered_line_tracker
+                                    .current_line_indent(&out, line_indent)
+                                    .saturating_add(1);
+                                newline_with(
+                                    &mut out,
+                                    define_condition_indent,
+                                    0,
+                                    &mut at_line_start,
+                                    &mut needs_space,
+                                    &mut line_indent,
+                                );
                             } else {
                                 let condition_extra = if in_control_header_condition
                                     && matches!(upper, "AND" | "OR")
@@ -10928,6 +10975,9 @@ impl SqlEditorWidget {
                         } else if upper == "FOR" && mysql_declare_handler_for_clause {
                             mysql_handler_state.start();
                             let _ = format_stack.clear_mysql_handler_pending_body_indent();
+                        } else if upper == "FOR" && mysql_declare_condition_for_clause {
+                            // DECLARE <name> CONDITION FOR <condition> stays inline
+                            // with its declaration line.
                         } else if upper == "FOR"
                             && next_word_is("UPDATE")
                             && !mysql_declare_for_clause
@@ -12165,10 +12215,27 @@ impl SqlEditorWidget {
                         format_stack.push_plsql_context(format_stack.current_scope());
                         set_current_clause!(None);
                     } else if upper == "CASE" {
-                        let new_indent_level = indent_level.max(line_indent).saturating_add(1);
+                        // A CASE that stays inline inside a compact call paren
+                        // (e.g. `foo (p => CASE ... END, q => ...)`) must anchor to
+                        // the paren frame's sibling indent, not the statement line,
+                        // so END and following arguments stay inside the paren frame.
+                        let case_starts_call_argument = matches!(
+                            loop_previous_non_comment_token,
+                            Some(SqlToken::Symbol(sym)) if sym == "=>" || sym == "," || sym == "("
+                        );
+                        let compact_paren_case_owner_indent = (!at_line_start
+                            && case_starts_call_argument)
+                            .then(|| format_stack.last_paren())
+                            .flatten()
+                            .filter(|frame| frame.suppresses_comma_breaks())
+                            .and_then(|frame| frame.sibling_body_indent());
+                        let case_owner_indent = compact_paren_case_owner_indent
+                            .map_or(line_indent, |sibling| line_indent.max(sibling));
+                        let new_indent_level =
+                            indent_level.max(case_owner_indent).saturating_add(1);
                         format_stack.push_block(
                             BlockKind::Case,
-                            line_indent,
+                            case_owner_indent,
                             new_indent_level,
                             &mut indent_level,
                         );
@@ -12554,7 +12621,8 @@ impl SqlEditorWidget {
                         && suppress_comma_break_depth == 0
                         && format_stack.paren_is_empty();
                     let active_list_layout = select_list_layout_state!().has_active_indent();
-                    let comment_structural_prefix = comment_prefix_text.as_str();
+                    let comment_structural_prefix_snapshot = comment_prefix_text.borrow().clone();
+                    let comment_structural_prefix = comment_structural_prefix_snapshot.as_str();
                     let previous_non_comment_token = loop_previous_non_comment_token;
                     let second_previous_non_comment_token = loop_second_previous_non_comment_token;
                     let previous_token_requires_same_depth = previous_non_comment_token
@@ -15000,7 +15068,7 @@ impl SqlEditorWidget {
             }
             for consumed_idx in rendered_token_idx..=idx {
                 if let Some(token) = tokens.get(consumed_idx) {
-                    append_comment_prefix_token(&mut comment_prefix_text, token);
+                    append_comment_prefix_token(&mut comment_prefix_text.borrow_mut(), token);
                 }
             }
             previous_token_end_newline_count = current_token_profile.end_newline_count;

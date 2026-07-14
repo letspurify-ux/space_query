@@ -860,3 +860,90 @@ fn formatting_sweep_all_files_generate_out_report() {
         output_root.join("format-sweep.out").display()
     );
 }
+
+#[test]
+fn inline_case_call_argument_keeps_paren_frame_for_following_arguments() {
+    let source = "BEGIN\nqt_split_pkg.complex_upsert (p_user_id => v_ids (i), p_status => CASE WHEN MOD (v_ids (i), 2) = 0 THEN 'A' ELSE 'I' END,\np_note => 'generated');\nEND;";
+    let formatted = SqlEditorWidget::format_sql_basic(source);
+    let lines: Vec<&str> = formatted.lines().collect();
+    let indent_of = |needle: &str| {
+        lines
+            .iter()
+            .find(|line| line.trim_start().starts_with(needle))
+            .map(|line| line.len() - line.trim_start().len())
+            .unwrap_or_else(|| panic!("line starting with {needle:?} not found in:\n{formatted}"))
+    };
+    let call_indent = indent_of("qt_split_pkg.complex_upsert");
+    let end_indent = indent_of("END,");
+    let next_arg_indent = indent_of("p_note =>");
+    let when_indent = indent_of("WHEN MOD");
+    assert_eq!(
+        end_indent,
+        call_indent + FORMAT_SWEEP_INDENT_WIDTH,
+        "inline CASE END inside a call paren must sit one level inside the call frame, got:\n{formatted}"
+    );
+    assert_eq!(
+        next_arg_indent, end_indent,
+        "argument following the inline CASE must stay at the paren frame level, got:\n{formatted}"
+    );
+    assert_eq!(
+        when_indent,
+        end_indent + FORMAT_SWEEP_INDENT_WIDTH,
+        "CASE branches must sit one level deeper than the CASE frame, got:\n{formatted}"
+    );
+}
+
+#[test]
+fn mysql_declare_condition_for_clause_stays_inline() {
+    let source = "DECLARE user_error CONDITION FOR SQLSTATE '45000';";
+    let formatted =
+        SqlEditorWidget::format_sql_basic_no_cache_for_db_type(source, DatabaseType::MariaDB);
+    assert!(
+        formatted.contains("user_error CONDITION FOR SQLSTATE '45000';"),
+        "DECLARE ... CONDITION FOR must stay on one line, got:\n{formatted}"
+    );
+}
+
+#[test]
+fn fetch_first_comment_continuation_stays_one_deeper_after_match_recognize_close() {
+    let source = "CREATE OR REPLACE PROCEDURE p IS r SYS_REFCURSOR; BEGIN OPEN r FOR SELECT * FROM e MATCH_RECOGNIZE (PARTITION BY d ORDER BY rn MEASURES FIRST (n) AS s ONE ROW PER MATCH PATTERN (A B+) DEFINE B AS B.sal > PREV (B.sal)) FETCH FIRST /* BV */ 20 ROWS ONLY; END p;";
+    let formatted = SqlEditorWidget::format_sql_basic(source);
+    let lines: Vec<&str> = formatted.lines().collect();
+    let fetch_indent = lines
+        .iter()
+        .find(|line| line.trim_start().starts_with("FETCH FIRST"))
+        .map(|line| line.len() - line.trim_start().len())
+        .expect("FETCH FIRST line");
+    let operand_indent = lines
+        .iter()
+        .find(|line| line.trim_start().starts_with("20 ROWS ONLY"))
+        .map(|line| line.len() - line.trim_start().len())
+        .expect("FETCH operand line");
+    assert_eq!(
+        operand_indent,
+        fetch_indent + FORMAT_SWEEP_INDENT_WIDTH,
+        "comment-split FETCH operand must stay one level deeper than the FETCH line, got:\n{formatted}"
+    );
+}
+
+#[test]
+fn match_recognize_define_condition_continuation_anchors_to_item_line() {
+    let source = "CREATE OR REPLACE PROCEDURE p IS r SYS_REFCURSOR; BEGIN OPEN r FOR SELECT * FROM e MATCH_RECOGNIZE (PARTITION BY d ORDER BY rn MEASURES FIRST (n) AS s ONE ROW PER MATCH PATTERN (A B+) DEFINE\n-- c\nB AS B.sal > PREV (B.sal) AND B.sal < 10) FETCH FIRST 20 ROWS ONLY; END p;";
+    let formatted = SqlEditorWidget::format_sql_basic(source);
+    let lines: Vec<&str> = formatted.lines().collect();
+    let item_indent = lines
+        .iter()
+        .find(|line| line.trim_start().starts_with("B AS B.sal"))
+        .map(|line| line.len() - line.trim_start().len())
+        .expect("DEFINE item line");
+    let and_indent = lines
+        .iter()
+        .find(|line| line.trim_start().starts_with("AND B.sal"))
+        .map(|line| line.len() - line.trim_start().len())
+        .expect("DEFINE condition continuation line");
+    assert_eq!(
+        and_indent,
+        item_indent + FORMAT_SWEEP_INDENT_WIDTH,
+        "DEFINE condition continuation must sit one level deeper than its item line, got:\n{formatted}"
+    );
+}

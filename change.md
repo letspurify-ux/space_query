@@ -1606,3 +1606,184 @@ FROM t;
 | 실제 SQL 파일 자동 포맷 스윕 집계 | 47/47 통과, 실패 0건 |
 | 전체 라이브러리 테스트 | 6,430 통과, 실패 0, ignored 212 |
 | `cargo fmt -- --check` | 통과 |
+
+---
+
+# 4차 정밀 검토 회차 (2026-07-14, frame 상대 구조 정합성)
+
+`formatting_sweep_all_files_generate_out_report` 1차 검사(47개 파일 자동검사 PASS) 후,
+생성된 `.format.out` 47개(총 28,589줄)를 전량 육안 정독했다. 자동검사 PASS와
+무관하게 "구문에 따라 frame이 열리고 닫히는 상대적 구조" 원칙에 어긋나는 지점
+4건을 발견해 모두 수정했다. (검토: Oracle 39 · MySQL 3 · MariaDB 5 파일)
+
+## 11-1. 호출 괄호 안 inline `CASE ... END` 뒤 인자가 괄호 frame을 이탈
+
+인자 위치(`=>` / `,` / `(` 직후)에서 줄 중간에 시작한 CASE의 owner depth가
+문장 라인 기준으로 고정되어, `END`와 그 뒤 인자가 괄호 frame(+1)이 아닌
+문장 레벨(+0)로 떨어졌다. CASE owner를 compact 괄호 frame의
+`sibling_body_indent` 기준으로 상향해 END·후속 인자가 모두 괄호 내부 레벨에
+정렬되도록 수정했다. (`||` 등 연산자 뒤에 줄바꿈되는 CASE는 기존 동작 유지)
+
+- 발견 위치: `test/test22.sql.format.out` 378~384행, `test/test23.sql.format.out` 400~406행
+- 수정 코드: `ui/sql_editor/formatter.rs` — CASE push 시 `case_starts_call_argument`
+  판정 + `suppresses_comma_breaks` 괄호의 `sibling_body_indent`로 owner 상향
+
+### AS-IS (test22.sql)
+
+```sql
+            qt_split_pkg.complex_upsert (p_user_id => v_ids (i), p_status => CASE
+                WHEN MOD (v_ids (i), 2) = 0 THEN
+                    'A'
+                ELSE
+                    'I'
+            END,
+            p_note => 'generated in anon block; idx=' || i || ' / id=' || v_ids (i));
+```
+
+`END,`/`p_note =>`가 호출문과 같은 레벨로 떨어져 괄호 내부임이 드러나지 않음.
+
+### TO-BE
+
+```sql
+            qt_split_pkg.complex_upsert (p_user_id => v_ids (i), p_status => CASE
+                    WHEN MOD (v_ids (i), 2) = 0 THEN
+                        'A'
+                    ELSE
+                        'I'
+                END,
+                p_note => 'generated in anon block; idx=' || i || ' / id=' || v_ids (i));
+```
+
+`END,`와 `p_note =>`가 호출 괄호 frame +1 레벨에 정렬. test23의
+`p_append_text => ...`도 동일하게 교정됨.
+
+## 11-2. MySQL/MariaDB `DECLARE ... CONDITION FOR`가 FOR에서 잘못 줄바꿈
+
+`FOR`가 루프 키워드 규칙에 걸려 선언문 중간에서 +0 레벨로 줄바꿈됐다.
+`DECLARE <name> CONDITION FOR <condition>`을 커서/핸들러 선언과 같은
+declare-for 계열로 인식해 인라인 유지하도록 수정했다.
+
+- 발견 위치: `test_mariadb/test5.txt.format.out` 531~532행
+- 수정 코드: `ui/sql_editor/formatter.rs` —
+  `is_mysql_declare_condition_for_clause_from_indices` 추가,
+  `mysql_declare_for_clause`에 포함
+
+### AS-IS (test_mariadb/test5.txt)
+
+```sql
+    DECLARE user_error CONDITION
+    FOR SQLSTATE '45000';
+```
+
+### TO-BE
+
+```sql
+    DECLARE user_error CONDITION FOR SQLSTATE '45000';
+```
+
+## 11-3. 주석으로 끊긴 절 연속행이 앞선 frame 닫힘 후 +1을 잃음
+
+주석 연속행 판정에 쓰는 `comment_prefix_text`(현재 줄의 구조 prefix)가
+"실제 렌더된 현재 줄"이 아니라 "마지막 line-start 이후 누적 토큰"이어서,
+MATCH_RECOGNIZE 닫는 괄호처럼 한 토큰 처리 중 줄바꿈이 여러 번 일어나는
+문맥에서는 `... ) FETCH FIRST` 같은 오염된 prefix로 구조 헤더 매칭이
+실패했고, 주석 뒤 연속 피연산자가 +0으로 떨어졌다. `newline_with`에서
+prefix를 비워 prefix가 항상 현재 렌더 라인과 일치하도록 수정했다.
+
+- 발견 위치: `test/test_open_with.sql.format.out` 472~473행
+  (`OPEN ... FOR` + MATCH_RECOGNIZE 문맥)
+- 수정 코드: `ui/sql_editor/formatter.rs` — `comment_prefix_text`를
+  `RefCell<String>`으로 전환하고 `newline_with`에서 clear
+
+### AS-IS (test_open_with.sql)
+
+```sql
+        )
+        FETCH FIRST /* BV: 상위 20건 */
+        20 ROWS ONLY;
+```
+
+### TO-BE
+
+```sql
+        )
+        FETCH FIRST /* BV: 상위 20건 */
+            20 ROWS ONLY;
+```
+
+## 11-4. MATCH_RECOGNIZE DEFINE 조건 연속행(AND/OR)이 항목 라인 frame을 무시
+
+DEFINE 조건의 `AND`/`OR` 연속행 indent가 DEFINE 절 기준 절대 +1로 계산되어,
+주석 때문에 조건 항목(`B AS ...`)이 새 줄로 밀린 경우 연속행이 항목과 같은
+레벨로 충돌했다. MATCH_RECOGNIZE 괄호 안에서는 조건 항목이 시작된 현재 렌더
+라인 기준 +1로 anchor하도록 수정했다(항목이 DEFINE과 같은 줄이면 기존 출력과
+동일).
+
+- 발견 위치: `test/test_open_with.sql.format.out` 460~470행
+- 수정 코드: `ui/sql_editor/formatter.rs` — 조건 break fallback 앞에
+  `in_match_recognize_paren()` 분기 추가(현재 라인 indent +1)
+
+### AS-IS (test_open_with.sql)
+
+```sql
+            DEFINE
+                -- [BR] B 조건: 이전보다 높고 부서 평균의 1.5배 미만
+                B AS B.sal > PREV (B.sal)
+                AND B.sal < (
+                    /* BS: 부서 평균 서브쿼리 */
+                    SELECT AVG (sal) * /* BT: 상한 배율 */
+                        1.5
+                    FROM emp
+                    WHERE deptno = /* BU: correlated */
+                        B.deptno
+                )
+```
+
+`AND`가 조건 항목 `B AS ...`와 같은 레벨 → 별개 항목처럼 보임.
+
+### TO-BE
+
+```sql
+            DEFINE
+                -- [BR] B 조건: 이전보다 높고 부서 평균의 1.5배 미만
+                B AS B.sal > PREV (B.sal)
+                    AND B.sal < (
+                        /* BS: 부서 평균 서브쿼리 */
+                        SELECT AVG (sal) * /* BT: 상한 배율 */
+                            1.5
+                        FROM emp
+                        WHERE deptno = /* BU: correlated */
+                            B.deptno
+                    )
+```
+
+연속 조건과 그 서브쿼리 전체가 항목 라인 기준 상대 frame으로 이동.
+
+## 11-5. 검토했으나 수정하지 않은 항목 (의도된 상대 규칙으로 확인)
+
+- `FROM (` / `USING (` / `WHERE EXISTS (` 서브쿼리 본문 +2·닫힘 +1 vs
+  `JOIN (` / `AND EXISTS (` 본문 +1·닫힘 +0: 소유 키워드의 연속행 레벨을
+  보정하는 일관된 상대 규칙으로 47개 파일 전체에서 동일하게 적용됨.
+- `WHERE 식 <비교연산자> (` 서브쿼리 본문 +1: 전 파일 일관.
+- `CAST(ROUND(` 등 같은 줄 다중 미닫힘 괄호의 연속행 가산 indent: 일관.
+- `oracle splitter final boss test.sql`의 `PROMPT = = =`, `' 2024 - 07 - 01 '`,
+  8칸 들여쓰기된 PROMPT 등은 원본 입력 자체가 그런 형태이며 포맷터는
+  보존만 함(결함 아님, 원본 대조로 확인).
+
+## 11-6. 추가된 회귀 테스트 (`format_sweep_tests`)
+
+| 테스트 | 검증 내용 |
+| --- | --- |
+| `inline_case_call_argument_keeps_paren_frame_for_following_arguments` | inline CASE 인자 뒤 END/후속 인자가 괄호 frame +1 유지 |
+| `mysql_declare_condition_for_clause_stays_inline` | DECLARE ... CONDITION FOR 인라인 유지 |
+| `fetch_first_comment_continuation_stays_one_deeper_after_match_recognize_close` | MR 닫힘 뒤 FETCH 주석 연속행 +1 유지 |
+| `match_recognize_define_condition_continuation_anchors_to_item_line` | DEFINE 조건 연속행이 항목 라인 +1에 anchor |
+
+## 11-7. 4차 회차 검증 결과
+
+| 검증 | 결과 |
+| --- | --- |
+| `.format.out` 47개 파일 / 28,589줄 전량 육안 정독 | 결함 4건 발견·수정 |
+| 수정 후 스윕 before/after diff | 의도한 4개 파일·4개 지점만 변경 (test22, test23, test_open_with, test_mariadb/test5) |
+| 실제 SQL 파일 자동 포맷 스윕 집계 | checked_files=47, failed_files=0 (전 파일 PASS, 비멱등·불변식 위반 0) |
+| 전체 라이브러리 테스트 | 6,434 통과, 실패 0, ignored 212 |
