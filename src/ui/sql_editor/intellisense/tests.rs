@@ -88,6 +88,30 @@ fn load_mariadb_intellisense_test_file(name: &str) -> &'static str {
     }
 }
 
+fn load_mysql_intellisense_test_file(name: &str) -> &'static str {
+    static FILES: OnceLock<Mutex<HashMap<String, &'static str>>> = OnceLock::new();
+    let cache = FILES.get_or_init(|| Mutex::new(HashMap::new()));
+    if let Some(script) = lock_or_recover(cache).get(name).copied() {
+        return script;
+    }
+
+    let mut path = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    path.push("test_mysql");
+    path.push(name);
+    let script = Box::leak(
+        std::fs::read_to_string(&path)
+            .unwrap_or_else(|err| {
+                panic!(
+                    "failed to load MySQL intellisense test script `{}`: {err}",
+                    path.display()
+                )
+            })
+            .into_boxed_str(),
+    );
+    lock_or_recover(cache).insert(name.to_string(), script);
+    script
+}
+
 #[derive(Default)]
 struct MysqlFamilyScriptCatalog {
     tables: Vec<String>,
@@ -49340,10 +49364,18 @@ fn oracle_intellisense_data_from_catalog(catalog: &MysqlFamilyScriptCatalog) -> 
     data
 }
 
-fn mysql_test_intellisense_data(file_name: &str) -> IntellisenseData {
-    let catalog = mysql_family_catalog_from_script(load_mariadb_intellisense_test_file(file_name));
+fn mysql_family_test_intellisense_data(
+    file_name: &str,
+    db_type: crate::db::DatabaseType,
+) -> IntellisenseData {
+    let script = match db_type {
+        crate::db::DatabaseType::MySQL => load_mysql_intellisense_test_file(file_name),
+        crate::db::DatabaseType::MariaDB => load_mariadb_intellisense_test_file(file_name),
+        crate::db::DatabaseType::Oracle => panic!("MySQL-family fixture requires MySQL or MariaDB"),
+    };
+    let catalog = mysql_family_catalog_from_script(script);
     let mut data = intellisense_data_from_mysql_family_catalog(&catalog);
-    if file_name == "test4.txt" {
+    if db_type == crate::db::DatabaseType::MariaDB && file_name == "test4.txt" {
         push_unique_case_insensitive(&mut data.tables, "tmp_rollup");
         data.set_columns_for_table(
             "tmp_rollup",
@@ -51457,55 +51489,54 @@ fn oracle_test26_words_generate_out_report() {
 #[test]
 #[ignore = "generates IntelliSense sweep .out report files; run explicitly when refreshing reports"]
 fn mysql_test1_words_generate_out_report() {
+    mysql_test_words_generate_out_report("test1.txt", true);
+}
+
+fn mysql_test_words_generate_out_report(file_name: &str, fail_on_missing: bool) {
     use crate::db::DatabaseType::MySQL;
 
-    let input_path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("test_mysql/test1.txt");
-    let base_data = mysql_test_intellisense_data("test1.txt");
+    let relative_path = format!("test_mysql/{file_name}");
+    let input_path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(&relative_path);
+    let base_data = mysql_family_test_intellisense_data(file_name, MySQL);
     let out_path = intellisense_sweep_out_path(&input_path);
     intellisense_sweep_generate_report_for_file(
         &input_path,
         MySQL,
         &base_data,
-        Some("test_mysql/test1.txt inferred catalog"),
+        Some(&format!("{relative_path} inferred catalog")),
         &out_path,
-        true,
+        fail_on_missing,
     );
 }
 
 #[test]
 #[ignore = "generates IntelliSense sweep .out report files; run explicitly when refreshing reports"]
 fn mysql_test2_words_generate_out_report() {
-    use crate::db::DatabaseType::MySQL;
-
-    let input_path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("test_mysql/test2.txt");
-    let base_data = mysql_test_intellisense_data("test2.txt");
-    let out_path = intellisense_sweep_out_path(&input_path);
-    intellisense_sweep_generate_report_for_file(
-        &input_path,
-        MySQL,
-        &base_data,
-        Some("test_mysql/test2.txt inferred catalog"),
-        &out_path,
-        true,
-    );
+    mysql_test_words_generate_out_report("test2.txt", true);
 }
 
 #[test]
 #[ignore = "generates IntelliSense sweep .out report files; run explicitly when refreshing reports"]
 fn mysql_test3_words_generate_out_report() {
-    use crate::db::DatabaseType::MySQL;
+    mysql_test_words_generate_out_report("test3.txt", true);
+}
 
-    let input_path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("test_mysql/test3.txt");
-    let base_data = mysql_test_intellisense_data("test3.txt");
-    let out_path = intellisense_sweep_out_path(&input_path);
-    intellisense_sweep_generate_report_for_file(
-        &input_path,
-        MySQL,
-        &base_data,
-        Some("test_mysql/test3.txt inferred catalog"),
-        &out_path,
-        true,
-    );
+#[test]
+#[ignore = "generates IntelliSense sweep .out report files; run explicitly when refreshing reports"]
+fn mysql_test4_words_generate_out_report() {
+    mysql_test_words_generate_out_report("test4.txt", true);
+}
+
+#[test]
+#[ignore = "generates IntelliSense sweep .out report files; run explicitly when refreshing reports"]
+fn mysql_test5_words_generate_out_report() {
+    mysql_test_words_generate_out_report("test5.txt", true);
+}
+
+#[test]
+#[ignore = "generates IntelliSense sweep .out report files; run explicitly when refreshing reports"]
+fn mysql_test6_words_generate_out_report() {
+    mysql_test_words_generate_out_report("test6.txt", true);
 }
 
 fn mariadb_test_words_generate_out_report(file_name: &str, fail_on_missing: bool) {
@@ -51513,7 +51544,7 @@ fn mariadb_test_words_generate_out_report(file_name: &str, fail_on_missing: bool
 
     let relative_path = format!("test_mariadb/{file_name}");
     let input_path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(&relative_path);
-    let base_data = mysql_test_intellisense_data(file_name);
+    let base_data = mysql_family_test_intellisense_data(file_name, MariaDB);
     let out_path = intellisense_sweep_out_path(&input_path);
     intellisense_sweep_generate_report_for_file(
         &input_path,
@@ -51553,6 +51584,24 @@ fn mariadb_test7_words_generate_out_report() {
 #[ignore = "generates IntelliSense sweep .out report files; run explicitly when refreshing reports"]
 fn mariadb_test8_words_generate_out_report() {
     mariadb_test_words_generate_out_report("test8.txt", true);
+}
+
+#[test]
+#[ignore = "generates IntelliSense sweep .out report files; run explicitly when refreshing reports"]
+fn mariadb_test9_words_generate_out_report() {
+    mariadb_test_words_generate_out_report("test9.txt", true);
+}
+
+#[test]
+#[ignore = "generates IntelliSense sweep .out report files; run explicitly when refreshing reports"]
+fn mariadb_test10_words_generate_out_report() {
+    mariadb_test_words_generate_out_report("test10.txt", true);
+}
+
+#[test]
+#[ignore = "generates IntelliSense sweep .out report files; run explicitly when refreshing reports"]
+fn mariadb_test11_words_generate_out_report() {
+    mariadb_test_words_generate_out_report("test11.txt", true);
 }
 
 #[test]
@@ -85893,7 +85942,7 @@ fn mysql_family_fixture_completion_case_failures(
             continue;
         }
 
-        let mut data = mysql_test_intellisense_data(file_name);
+        let mut data = mysql_family_test_intellisense_data(file_name, db_type);
         let suggestions = query_completion_suggestions_with_data(&marked, db_type, true, &mut data);
         if !has(&suggestions, expected) {
             let debug_cursor = marked.find("__CODEX_CURSOR__").unwrap_or_default();
@@ -89146,7 +89195,10 @@ fn sweep_fixture_metadata_preserves_typed_members_and_result_columns() {
         "outer correlated-table fixture metadata is incomplete"
     );
 
-    let mariadb = mysql_test_intellisense_data("test4.txt");
+    let mariadb = mysql_family_test_intellisense_data(
+        "test4.txt",
+        crate::db::DatabaseType::MariaDB,
+    );
     assert!(
         mariadb
             .get_columns_for_table("tmp_rollup")

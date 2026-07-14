@@ -1038,6 +1038,21 @@ pub(crate) fn tokenize_sql_spanned_with_mysql_compat(
             continue;
         }
 
+        if mysql_compatible && c == '-' && next == Some('>') {
+            let has_unquoted_arrow = sql_bytes.get(idx + 2) == Some(&b'>');
+            let symbol = if has_unquoted_arrow { "->>" } else { "->" };
+            tokens.push(SqlTokenSpan {
+                token: SqlToken::Symbol(symbol.to_string()),
+                start: idx,
+                end: idx + symbol.len(),
+            });
+            let _ = iter.next();
+            if has_unquoted_arrow {
+                let _ = iter.next();
+            }
+            continue;
+        }
+
         let sym = match (c, next) {
             ('<', Some('=')) => Some("<=".to_string()),
             ('>', Some('=')) => Some(">=".to_string()),
@@ -2129,6 +2144,17 @@ END$$"#;
                 continue;
             }
 
+            if mysql_compatible && c == '-' && next == Some('>') {
+                if chars.get(i + 2) == Some(&'>') {
+                    tokens.push(SqlToken::Symbol("->>".to_string()));
+                    i += 3;
+                } else {
+                    tokens.push(SqlToken::Symbol("->".to_string()));
+                    i += 2;
+                }
+                continue;
+            }
+
             let sym = match (c, next) {
                 ('<', Some('=')) => Some("<=".to_string()),
                 ('>', Some('=')) => Some(">=".to_string()),
@@ -2365,6 +2391,21 @@ END$$"#;
                 .any(|token| matches!(token, SqlToken::Symbol(symbol) if symbol == "<=>")),
             "mysql null-safe equality should stay a single symbol token: {tokens:?}"
         );
+    }
+
+    #[test]
+    fn tokenize_sql_treats_mysql_json_arrows_as_single_symbols() {
+        let sql = "SELECT payload->'$.tags', payload->>'$.kind' FROM docs";
+        let tokens = tokenize_sql_with_mysql_compat(sql, true);
+
+        for expected in ["->", "->>"] {
+            assert!(
+                tokens
+                    .iter()
+                    .any(|token| matches!(token, SqlToken::Symbol(symbol) if symbol == expected)),
+                "MySQL JSON operator {expected} should stay a single symbol: {tokens:?}"
+            );
+        }
     }
 
     #[test]

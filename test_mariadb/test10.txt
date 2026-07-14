@@ -1,0 +1,259 @@
+-- ============================================================================
+-- SPACE QUERY MARIADB AUTO-FORMAT CERTIFICATION GAUNTLET II
+-- Target: MariaDB 12.2+
+--
+-- Complementary boss: VECTOR data/indexes, UUID v7, INET6, application-time
+-- PERIODs and WITHOUT OVERLAPS, FOR PORTION OF DML, anchored row types, explicit
+-- and implicit cursor FOR loops, reverse ranges, EXECUTE IMMEDIATE USING,
+-- EXCEPT ALL, FETCH WITH TIES, and rollback-only RETURNING result sets.
+-- ============================================================================
+
+DELIMITER ;
+DROP DATABASE IF EXISTS sq_mariadb_format_cert_2;
+CREATE DATABASE sq_mariadb_format_cert_2 CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
+USE sq_mariadb_format_cert_2;
+SET NAMES utf8mb4;
+SET SESSION sql_mode='STRICT_TRANS_TABLES,ERROR_FOR_DIVISION_BY_ZERO,NO_ENGINE_SUBSTITUTION';
+SET @lexical_trap='VECTOR(3) PERIOD FOR x(a,b) WITHOUT OVERLAPS // UUID_v7() -- inert';
+
+# comment trap: FOR rec IN(cur()) DO END FOR; DELETE FOR PORTION OF //
+/* Strings below may contain '[1,2,3]', '$.tags[*]', '?', and delimiter text. */
+
+CREATE TABLE mb_asset(
+asset_id INT NOT NULL,
+asset_uuid UUID NOT NULL DEFAULT(UUID_v7()),
+asset_code VARCHAR(40)NOT NULL,
+embedding VECTOR(3)NOT NULL,
+metadata JSON NOT NULL,
+created_at TIMESTAMP(6)NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+PRIMARY KEY(asset_id),
+UNIQUE KEY uk_mb_asset_uuid(asset_uuid),
+UNIQUE KEY uk_mb_asset_code(asset_code),
+VECTOR INDEX ix_mb_asset_embedding(embedding)M=4 DISTANCE=cosine,
+CONSTRAINT chk_mb_asset_metadata CHECK(JSON_VALID(metadata))
+)ENGINE=InnoDB;
+
+CREATE TABLE mb_price(
+asset_id INT NOT NULL,
+valid_from DATE NOT NULL,
+valid_to DATE NOT NULL,
+price DECIMAL(14,2)NOT NULL,
+currency CHAR(3)NOT NULL,
+source_doc JSON NOT NULL,
+PERIOD FOR validity(valid_from,valid_to),
+PRIMARY KEY(asset_id,validity WITHOUT OVERLAPS),
+KEY ix_mb_price_currency(currency),
+CONSTRAINT chk_mb_price_positive CHECK(price>0),
+CONSTRAINT chk_mb_price_source CHECK(JSON_VALID(source_doc))
+)ENGINE=InnoDB;
+
+CREATE TABLE mb_observation(
+observation_id BIGINT NOT NULL AUTO_INCREMENT,
+asset_id INT NOT NULL,
+observed_at DATETIME(6)NOT NULL,
+source_ip INET6 NOT NULL,
+metrics JSON NOT NULL,
+temperature DECIMAL(8,3)AS(JSON_VALUE(metrics,'$.temperature'))PERSISTENT,
+PRIMARY KEY(observation_id),
+KEY ix_mb_observation_asset_time(asset_id,observed_at),
+KEY ix_mb_observation_temperature(temperature),
+CONSTRAINT chk_mb_observation_metrics CHECK(JSON_VALID(metrics))
+)ENGINE=InnoDB;
+
+CREATE TABLE mb_rollup(
+asset_id INT NOT NULL,
+observation_count BIGINT NOT NULL,
+price_version_count BIGINT NOT NULL,
+average_temperature DECIMAL(12,3),
+evidence JSON NOT NULL,
+PRIMARY KEY(asset_id)
+)ENGINE=InnoDB;
+
+CREATE TABLE mb_error_log(
+log_id BIGINT NOT NULL AUTO_INCREMENT,
+phase_name VARCHAR(80)NOT NULL,
+sql_state CHAR(5),
+error_no INT,
+message_text TEXT,
+PRIMARY KEY(log_id)
+)ENGINE=InnoDB;
+
+INSERT INTO mb_asset(asset_id,asset_code,embedding,metadata)VALUES
+(1,'alpha',VEC_FromText('[1,2,3]'),JSON_OBJECT('region','KR','tags',JSON_ARRAY('edge','vip'))),
+(2,'beta',VEC_FromText('[2,2,2]'),JSON_OBJECT('region','US','tags',JSON_ARRAY('core'))),
+(3,'gamma',VEC_FromText('[0,1,0]'),JSON_OBJECT('region','DE','tags',JSON_ARRAY('edge','archive')));
+
+INSERT INTO mb_price(asset_id,valid_from,valid_to,price,currency,source_doc)VALUES
+(1,'2026-01-01','2026-12-31',100,'USD',JSON_OBJECT('source','initial','revision',1)),
+(2,'2026-01-01','2026-06-01',80,'USD',JSON_OBJECT('source','initial','revision',1)),
+(2,'2026-06-01','2026-12-31',90,'USD',JSON_OBJECT('source','renewal','revision',2)),
+(3,'2026-01-01','2026-12-31',200,'EUR',JSON_OBJECT('source','initial','revision',1));
+
+UPDATE mb_price FOR PORTION OF validity FROM'2026-03-01'TO'2026-06-01'
+SET price=125,source_doc=JSON_SET(source_doc,'$.source','campaign','$.revision',2)
+WHERE asset_id=1;
+
+INSERT INTO mb_observation(asset_id,observed_at,source_ip,metrics)VALUES
+(1,'2026-01-10 09:00:00.000001','2001:db8::1',JSON_OBJECT('temperature',21.5,'load',0.40,'samples',JSON_ARRAY(1,2,3))),
+(1,'2026-03-10 10:00:00.000002','10.0.0.1',JSON_OBJECT('temperature',22.5,'load',0.50,'samples',JSON_ARRAY(4,5))),
+(2,'2026-02-10 11:00:00.000003','2001:db8::2',JSON_OBJECT('temperature',19.0,'load',0.30,'samples',JSON_ARRAY(6))),
+(2,'2026-07-10 12:00:00.000004','10.0.0.2',JSON_OBJECT('temperature',20.0,'load',0.35,'samples',JSON_ARRAY(7,8))),
+(3,'2026-04-10 13:00:00.000005','2001:db8::3',JSON_OBJECT('temperature',25.0,'load',0.70,'samples',JSON_ARRAY(9,10,11)));
+
+DELIMITER //
+
+CREATE OR REPLACE PROCEDURE mb_assert_2(IN p_condition BOOLEAN,IN p_message VARCHAR(255))
+BEGIN
+IF IFNULL(p_condition,FALSE)=FALSE THEN SIGNAL SQLSTATE'45000'SET MESSAGE_TEXT=p_message;END IF;
+END//
+
+CREATE OR REPLACE PROCEDURE mb_run_gauntlet_2()
+outer_block:BEGIN
+DECLARE v_asset ROW TYPE OF mb_asset;
+DECLARE v_price_total TYPE OF mb_price.price DEFAULT 0;
+DECLARE v_forward INT DEFAULT 0;
+DECLARE v_reverse INT DEFAULT 0;
+DECLARE v_state CHAR(5);
+DECLARE v_errno INT;
+DECLARE v_message TEXT;
+DECLARE cur_prices CURSOR(p_asset_id INT)FOR
+SELECT valid_from,valid_to,price,currency FROM mb_price WHERE asset_id=p_asset_id ORDER BY valid_from;
+DECLARE EXIT HANDLER FOR SQLEXCEPTION
+BEGIN
+GET DIAGNOSTICS CONDITION 1 v_state=RETURNED_SQLSTATE,v_errno=MYSQL_ERRNO,v_message=MESSAGE_TEXT;
+ROLLBACK;
+INSERT INTO mb_error_log(phase_name,sql_state,error_no,message_text)VALUES('UNEXPECTED',v_state,v_errno,v_message);
+RESIGNAL;
+END;
+
+START TRANSACTION;
+SELECT*INTO v_asset FROM mb_asset WHERE asset_id=1;
+
+FOR price_rec IN cur_prices(v_asset.asset_id)DO
+SET v_price_total=v_price_total+price_rec.price;
+END FOR;
+
+FOR i IN 1..3 DO
+SET v_forward=v_forward+i;
+UPDATE mb_asset SET metadata=JSON_SET(metadata,CONCAT('$.forward_',i),i)WHERE asset_id=i;
+END FOR;
+
+FOR j IN REVERSE 1..3 DO
+SET v_reverse=v_reverse+j;
+UPDATE mb_asset SET metadata=JSON_SET(metadata,CONCAT('$.reverse_',j),j)WHERE asset_id=j;
+END FOR;
+
+overlap_probe:BEGIN
+DECLARE CONTINUE HANDLER FOR SQLEXCEPTION
+BEGIN
+GET DIAGNOSTICS CONDITION 1 v_state=RETURNED_SQLSTATE,v_errno=MYSQL_ERRNO,v_message=MESSAGE_TEXT;
+INSERT INTO mb_error_log(phase_name,sql_state,error_no,message_text)VALUES('EXPECTED_OVERLAP',v_state,v_errno,v_message);
+END;
+INSERT INTO mb_price(asset_id,valid_from,valid_to,price,currency,source_doc)
+VALUES(1,'2026-04-01','2026-05-01',999,'USD',JSON_OBJECT('source','overlap'));
+END overlap_probe;
+
+SET @mb_asset_id=2;
+SET @mb_observed_at='2026-08-10 14:00:00.000006';
+SET @mb_source_ip='2001:db8::22';
+SET @mb_metrics=JSON_OBJECT('temperature',20.5,'load',0.45,'samples',JSON_ARRAY(12,13));
+EXECUTE IMMEDIATE'INSERT INTO mb_observation(asset_id,observed_at,source_ip,metrics) VALUES(?,?,?,?)'
+USING @mb_asset_id,@mb_observed_at,@mb_source_ip,@mb_metrics;
+
+FOR summary_rec IN(
+SELECT a.asset_id,
+(SELECT COUNT(*)FROM mb_observation o WHERE o.asset_id=a.asset_id)AS observation_count,
+(SELECT COUNT(*)FROM mb_price p WHERE p.asset_id=a.asset_id)AS price_version_count,
+(SELECT AVG(o2.temperature)FROM mb_observation o2 WHERE o2.asset_id=a.asset_id)AS average_temperature
+FROM mb_asset a
+)DO
+INSERT INTO mb_rollup(asset_id,observation_count,price_version_count,average_temperature,evidence)
+VALUES(summary_rec.asset_id,summary_rec.observation_count,summary_rec.price_version_count,summary_rec.average_temperature,
+JSON_OBJECT('uuid',(SELECT CAST(asset_uuid AS CHAR)FROM mb_asset WHERE asset_id=summary_rec.asset_id),'forward_sum',v_forward,'reverse_sum',v_reverse))
+ON DUPLICATE KEY UPDATE observation_count=VALUES(observation_count),price_version_count=VALUES(price_version_count),average_temperature=VALUES(average_temperature),evidence=VALUES(evidence);
+END FOR;
+
+CALL mb_assert_2(v_price_total=325,'anchored price total');
+CALL mb_assert_2(v_forward=6 AND v_reverse=6,'FOR loop totals');
+COMMIT;
+END outer_block//
+
+DELIMITER ;
+
+CALL mb_run_gauntlet_2();
+
+-- Vector distance owners + window frames + FETCH WITH TIES.
+WITH distances AS(
+SELECT a.asset_id,a.asset_code,CAST(a.asset_uuid AS CHAR)AS uuid_text,VEC_ToText(a.embedding)AS vector_text,
+VEC_DISTANCE_COSINE(a.embedding,VEC_FromText('[1,1,1]'))AS cosine_distance,
+VEC_DISTANCE_EUCLIDEAN(a.embedding,VEC_FromText('[1,1,1]'))AS euclidean_distance
+FROM mb_asset a
+),analytic AS(
+SELECT d.*,
+ROW_NUMBER()OVER(ORDER BY d.cosine_distance,d.asset_id)AS distance_row,
+CUME_DIST()OVER(ORDER BY d.cosine_distance)AS distance_cume,
+NTILE(2)OVER(ORDER BY d.cosine_distance,d.asset_id)AS distance_bucket,
+COALESCE(LAG(d.cosine_distance,1)OVER(ORDER BY d.cosine_distance,d.asset_id),0)AS previous_distance
+FROM distances d
+)
+SELECT asset_id,asset_code,uuid_text,vector_text,cosine_distance,euclidean_distance,distance_row,distance_cume,distance_bucket,previous_distance
+FROM analytic
+ORDER BY cosine_distance,asset_id
+FETCH FIRST 2 ROWS WITH TIES;
+
+-- Application-time fragments created by FOR PORTION OF remain gap-free.
+SELECT p.asset_id,p.valid_from,p.valid_to,p.price,p.currency,
+LAG(p.valid_to)OVER(PARTITION BY p.asset_id ORDER BY p.valid_from)AS previous_valid_to,
+LEAD(p.valid_from)OVER(PARTITION BY p.asset_id ORDER BY p.valid_from)AS next_valid_from,
+SUM(p.price)OVER(PARTITION BY p.asset_id ORDER BY p.valid_from ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW)AS running_price,
+JSON_VALUE(p.source_doc,'$.source')AS source_name
+FROM mb_price p
+ORDER BY p.asset_id,p.valid_from;
+
+-- JSON_TABLE over vector-asset metadata and INET6 values.
+SELECT a.asset_id,a.asset_code,t.tag_no,t.tag_name,
+(SELECT COUNT(*)FROM mb_observation o WHERE o.asset_id=a.asset_id AND CAST(o.source_ip AS CHAR)LIKE'%:%')AS ipv6_form_count
+FROM mb_asset a
+JOIN JSON_TABLE(a.metadata,'$.tags[*]'COLUMNS(tag_no FOR ORDINALITY,tag_name VARCHAR(30)PATH'$'))t ON TRUE
+ORDER BY a.asset_id,t.tag_no;
+
+-- EXCEPT ALL preserves duplicate multiplicity before subtraction.
+(
+SELECT asset_id,'OBS'AS source_name FROM mb_observation
+UNION ALL
+SELECT asset_id,'PRICE'FROM mb_price
+)
+EXCEPT ALL(
+SELECT asset_id,'NEVER'FROM mb_asset
+)
+ORDER BY asset_id,source_name;
+
+-- Application-time DELETE and RETURNING DML are rollback-only.
+START TRANSACTION;
+DELETE FROM mb_price FOR PORTION OF validity FROM'2026-04-01'TO'2026-05-01'WHERE asset_id=1;
+ROLLBACK;
+
+START TRANSACTION;
+REPLACE INTO mb_observation(observation_id,asset_id,observed_at,source_ip,metrics)
+VALUES(999,3,NOW(6),'2001:db8::99',JSON_OBJECT('temperature',99,'load',0,'samples',JSON_ARRAY()))
+RETURNING observation_id,asset_id,source_ip,temperature;
+DELETE FROM mb_observation WHERE observation_id=999
+RETURNING observation_id,asset_id,source_ip,temperature;
+ROLLBACK;
+
+CALL mb_assert_2((SELECT COUNT(*)FROM mb_asset)=3,'asset count');
+CALL mb_assert_2((SELECT COUNT(DISTINCT asset_uuid)FROM mb_asset)=3,'UUID v7 count');
+CALL mb_assert_2((SELECT COUNT(*)FROM mb_price)=6,'application-time fragment count');
+CALL mb_assert_2((SELECT COUNT(*)FROM mb_observation)=6,'dynamic observation count');
+CALL mb_assert_2((SELECT COUNT(*)FROM mb_rollup)=3,'rollup count');
+CALL mb_assert_2((SELECT asset_id FROM mb_asset ORDER BY VEC_DISTANCE_COSINE(embedding,VEC_FromText('[1,1,1]')),asset_id LIMIT 1)=2,'nearest vector asset');
+CALL mb_assert_2((SELECT COUNT(*)FROM mb_error_log WHERE phase_name='EXPECTED_OVERLAP')=1,'overlap handler count');
+CALL mb_assert_2((SELECT COUNT(*)FROM mb_error_log WHERE phase_name='UNEXPECTED')=0,'unexpected errors');
+
+SELECT'PASS'AS status,
+(SELECT COUNT(*)FROM mb_asset)AS asset_rows,
+(SELECT COUNT(*)FROM mb_price)AS price_fragments,
+(SELECT COUNT(*)FROM mb_observation)AS observation_rows,
+(SELECT COUNT(*)FROM mb_rollup)AS rollup_rows,
+(SELECT COUNT(*)FROM mb_error_log)AS expected_errors,
+JSON_OBJECT('trap',@lexical_trap,'nearest_asset',(SELECT asset_code FROM mb_asset ORDER BY VEC_DISTANCE_COSINE(embedding,VEC_FromText('[1,1,1]')),asset_id LIMIT 1),'alpha_vector',(SELECT VEC_ToText(embedding)FROM mb_asset WHERE asset_id=1),'uuid_version',(SELECT SUBSTRING(CAST(asset_uuid AS CHAR),15,1)FROM mb_asset WHERE asset_id=1))AS evidence;

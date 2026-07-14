@@ -2283,9 +2283,140 @@ fn line_ends_with_mysql_vertical_terminator_candidate(line: &str) -> bool {
         && matches!(bytes[bytes.len() - 1], b'g' | b'G')
 }
 
+fn sql_contains_mysql_only_operator(sql: &str) -> bool {
+    let bytes = sql.as_bytes();
+    let mut idx = 0usize;
+    let mut in_line_comment = false;
+    let mut in_block_comment = false;
+    let mut in_single_quote = false;
+    let mut in_double_quote = false;
+    let mut in_backtick_quote = false;
+    let mut q_quote_end: Option<u8> = None;
+
+    while idx < bytes.len() {
+        let current = bytes[idx];
+        let next = bytes.get(idx.saturating_add(1)).copied();
+
+        if in_line_comment {
+            if current == b'\n' {
+                in_line_comment = false;
+            }
+            idx = idx.saturating_add(1);
+            continue;
+        }
+
+        if in_block_comment {
+            if current == b'*' && next == Some(b'/') {
+                in_block_comment = false;
+                idx = idx.saturating_add(2);
+                continue;
+            }
+            idx = idx.saturating_add(1);
+            continue;
+        }
+
+        if let Some(closing) = q_quote_end {
+            if current == closing && next == Some(b'\'') {
+                q_quote_end = None;
+                idx = idx.saturating_add(2);
+                continue;
+            }
+            idx = idx.saturating_add(1);
+            continue;
+        }
+
+        if in_single_quote {
+            if current == b'\\' && next.is_some() {
+                idx = idx.saturating_add(2);
+                continue;
+            }
+            if current == b'\'' {
+                if next == Some(b'\'') {
+                    idx = idx.saturating_add(2);
+                    continue;
+                }
+                in_single_quote = false;
+            }
+            idx = idx.saturating_add(1);
+            continue;
+        }
+
+        if in_double_quote {
+            if current == b'\\' && next.is_some() {
+                idx = idx.saturating_add(2);
+                continue;
+            }
+            if current == b'"' {
+                if next == Some(b'"') {
+                    idx = idx.saturating_add(2);
+                    continue;
+                }
+                in_double_quote = false;
+            }
+            idx = idx.saturating_add(1);
+            continue;
+        }
+
+        if in_backtick_quote {
+            if current == b'`' {
+                if next == Some(b'`') {
+                    idx = idx.saturating_add(2);
+                    continue;
+                }
+                in_backtick_quote = false;
+            }
+            idx = idx.saturating_add(1);
+            continue;
+        }
+
+        if let Some(prefix_len) = sql_line_comment_prefix_len(bytes, idx) {
+            in_line_comment = true;
+            idx = idx.saturating_add(prefix_len);
+            continue;
+        }
+        if current == b'/' && next == Some(b'*') {
+            in_block_comment = true;
+            idx = idx.saturating_add(2);
+            continue;
+        }
+        if let Some(q_quote_start) = q_quote_prefix_at(bytes, idx) {
+            q_quote_end = Some(q_quote_start.closing_delimiter);
+            idx = idx.saturating_add(q_quote_start.prefix_len);
+            continue;
+        }
+        if current == b'\'' {
+            in_single_quote = true;
+            idx = idx.saturating_add(1);
+            continue;
+        }
+        if current == b'"' {
+            in_double_quote = true;
+            idx = idx.saturating_add(1);
+            continue;
+        }
+        if current == b'`' {
+            in_backtick_quote = true;
+            idx = idx.saturating_add(1);
+            continue;
+        }
+
+        if current == b'-' && next == Some(b'>')
+            || current == b'<'
+                && next == Some(b'=')
+                && bytes.get(idx.saturating_add(2)) == Some(&b'>')
+        {
+            return true;
+        }
+
+        idx = idx.saturating_add(1);
+    }
+
+    false
+}
+
 pub(crate) fn sql_uses_mysql_compatible_syntax(sql: &str) -> bool {
     sql.as_bytes().contains(&b'`')
-        || sql.contains("<=>")
+        || sql_contains_mysql_only_operator(sql)
         || sql.contains("/*!")
         || sql.contains("/*M!")
         || sql.lines().any(|line| {
@@ -8999,6 +9130,21 @@ mod tests {
             Some(crate::db::connection::DatabaseType::Oracle)
         ));
         assert!(sql_uses_mysql_compatible_syntax("SELECT OLD.c <=> NEW.c"));
+    }
+
+    #[test]
+    fn mysql_compatibility_operator_detection_ignores_comments_and_literals() {
+        assert!(sql_uses_mysql_compatible_syntax(
+            "SELECT payload->'$.tags', payload->>'$.kind' FROM docs"
+        ));
+        assert!(sql_uses_mysql_compatible_syntax("SELECT OLD.c <=> NEW.c"));
+
+        assert!(!sql_uses_mysql_compatible_syntax(
+            "-- Load stage -> emp via package\nSELECT q'[-> and <=>]' FROM dual"
+        ));
+        assert!(!sql_uses_mysql_compatible_syntax(
+            "SELECT '->', \"<=>\", nq'{->}', uq'!<=>!' FROM dual /* -> */"
+        ));
     }
 
     #[test]

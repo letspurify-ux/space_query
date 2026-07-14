@@ -1014,9 +1014,10 @@ CREATE OR REPLACE PACKAGE BODY conditional_pkg AS
             ) AS salary_ratio
                 FROM employees
                 WHERE department_id = 50
-                ORDER BY salary /
-                SELECT 1 / 2 AS half
-                FROM DUAL;
+                ORDER BY salary
+        /
+        SELECT 1 / 2 AS half
+        FROM DUAL;
 
         -- [TEST-027] 줄 시작의 슬래시만 종결자 (예상: 3 실행단위)
         -- 난이도: ★★★★☆

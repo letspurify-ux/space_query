@@ -5191,11 +5191,24 @@ impl SqlEditorWidget {
         ) {
             return true;
         }
-        if keyword == "INTO" && matches!(prev_word_upper, Some("INSERT" | "MERGE")) {
+        if keyword == "INTO" && matches!(prev_word_upper, Some("INSERT" | "MERGE" | "REPLACE")) {
             return true;
         }
         if keyword == "FROM" && matches!(prev_word_upper, Some("DELETE")) {
             return true;
+        }
+        if keyword == "FROM" && matches!(prev_word_upper, Some("HISTORY")) {
+            let recent = Self::recent_statement_words_before_from_indices(
+                tokens,
+                recent_statement_word_indices,
+                2,
+            );
+            if matches!(recent.as_slice(), [history, delete]
+                if history.eq_ignore_ascii_case("HISTORY")
+                    && delete.eq_ignore_ascii_case("DELETE"))
+            {
+                return true;
+            }
         }
         if keyword == "FROM" {
             // MySQL `PREPARE <name> FROM <source>`: FROM is part of the PREPARE
@@ -7326,54 +7339,62 @@ impl SqlEditorWidget {
     }
 
     fn mysql_keyword_prefers_space_before_paren(word: &str) -> bool {
-        matches!(
-            word,
-            "ALL"
-                | "AND"
-                | "AS"
-                | "BEGIN"
-                | "BETWEEN"
-                | "BY"
-                | "CASE"
-                | "CHECK"
-                | "ELSE"
-                | "ELSEIF"
-                | "ELSIF"
-                | "EXISTS"
-                | "FOR"
-                | "FROM"
-                | "GROUP"
-                | "HAVING"
-                | "IF"
-                | "IN"
-                | "INTO"
-                | "JOIN"
-                | "KEY"
-                | "LIMIT"
-                | "NOT"
-                | "ON"
-                | "OR"
-                | "ORDER"
-                | "OVER"
-                | "PARTITION"
-                | "PRIMARY"
-                | "REFERENCES"
-                | "REPEAT"
-                | "RETURN"
-                | "RETURNS"
-                | "SELECT"
-                | "SET"
-                | "TABLE"
-                | "THEN"
-                | "UNIQUE"
-                | "UNTIL"
-                | "USING"
-                | "VALUES"
-                | "WHEN"
-                | "WHERE"
-                | "WHILE"
-                | "WINDOW"
-        )
+        crate::sql_text::is_format_set_operator_keyword(word)
+            || matches!(
+                word,
+                "ALL"
+                    | "AND"
+                    | "AS"
+                    | "BEGIN"
+                    | "BETWEEN"
+                    | "BY"
+                    | "CASE"
+                    | "CHECK"
+                    | "COLUMNS"
+                    | "CURSOR"
+                    | "DEFAULT"
+                    | "ELSE"
+                    | "ELSEIF"
+                    | "ELSIF"
+                    | "EXISTS"
+                    | "FOR"
+                    | "FROM"
+                    | "GROUP"
+                    | "HAVING"
+                    | "IF"
+                    | "IN"
+                    | "INTO"
+                    | "JOIN"
+                    | "KEY"
+                    | "LATERAL"
+                    | "LIMIT"
+                    | "NOT"
+                    | "OF"
+                    | "ON"
+                    | "OR"
+                    | "ORDER"
+                    | "OVER"
+                    | "PARTITION"
+                    | "PRIMARY"
+                    | "REFERENCES"
+                    | "REPEAT"
+                    | "RETURN"
+                    | "RETURNS"
+                    | "SELECT"
+                    | "SET"
+                    | "SYSTEM_TIME"
+                    | "TABLE"
+                    | "THAN"
+                    | "THEN"
+                    | "UNIQUE"
+                    | "UNTIL"
+                    | "USING"
+                    | "VALUES"
+                    | "WHEN"
+                    | "WHERE"
+                    | "WHILE"
+                    | "WINDOW"
+            )
     }
 
     fn mysql_paren_belongs_to_insert_target_column_list(
@@ -7428,7 +7449,7 @@ impl SqlEditorWidget {
         has_into && has_insert_or_replace
     }
 
-    fn mysql_paren_follows_named_key_definition(
+    fn mysql_paren_follows_named_ddl_definition(
         tokens: &[SqlToken],
         open_paren_idx: usize,
         meaningful_token_links: Option<&MeaningfulTokenLinks>,
@@ -7449,10 +7470,22 @@ impl SqlEditorWidget {
         let Some(SqlToken::Word(key_word)) = tokens.get(key_idx) else {
             return false;
         };
-        if !key_word.eq_ignore_ascii_case("KEY") && !key_word.eq_ignore_ascii_case("INDEX") {
+        if key_word.eq_ignore_ascii_case("KEY")
+            || key_word.eq_ignore_ascii_case("INDEX")
+            || key_word.eq_ignore_ascii_case("REFERENCES")
+        {
+            return true;
+        }
+        if !key_word.eq_ignore_ascii_case("FOR") {
             return false;
         }
-        true
+        meaningful_token_links
+            .and_then(|links| links.prev_index(key_idx))
+            .or_else(|| Self::previous_meaningful_token_index(tokens, key_idx))
+            .and_then(|period_idx| tokens.get(period_idx))
+            .is_some_and(
+                |token| matches!(token, SqlToken::Word(word) if word.eq_ignore_ascii_case("PERIOD")),
+            )
     }
 
     fn mysql_word_paren_should_stay_tight(
@@ -7520,7 +7553,7 @@ impl SqlEditorWidget {
             open_paren_idx,
             statement_word_links,
         );
-        if Self::mysql_paren_follows_named_key_definition(
+        if Self::mysql_paren_follows_named_ddl_definition(
             tokens,
             open_paren_idx,
             meaningful_token_links,
@@ -7579,12 +7612,24 @@ impl SqlEditorWidget {
                 tokens,
                 recent_statement_word_indices,
             );
-        let follows_named_key_definition = matches!(
+        let follows_named_ddl_definition = matches!(
             second_previous_non_comment_token,
             Some(SqlToken::Word(word))
-                if word.eq_ignore_ascii_case("KEY") || word.eq_ignore_ascii_case("INDEX")
-        );
-        if follows_named_key_definition {
+                if word.eq_ignore_ascii_case("KEY")
+                    || word.eq_ignore_ascii_case("INDEX")
+                    || word.eq_ignore_ascii_case("REFERENCES")
+        ) || (matches!(
+            second_previous_non_comment_token,
+            Some(SqlToken::Word(word)) if word.eq_ignore_ascii_case("FOR")
+        ) && recent_statement_word_indices
+            .iter()
+            .rev()
+            .nth(2)
+            .and_then(|word_idx| tokens.get(*word_idx))
+            .is_some_and(
+                |token| matches!(token, SqlToken::Word(word) if word.eq_ignore_ascii_case("PERIOD")),
+            ));
+        if follows_named_ddl_definition {
             return false;
         }
 
@@ -7784,28 +7829,6 @@ impl SqlEditorWidget {
             },
         );
         second_recent_is_call
-    }
-
-    fn is_mysql_declare_cursor_for_clause_from_indices(
-        tokens: &[SqlToken],
-        recent_statement_word_indices: &VecDeque<usize>,
-    ) -> bool {
-        let mut has_declare = false;
-        let mut has_cursor = false;
-        Self::scan_recent_statement_words_from_indices(
-            tokens,
-            recent_statement_word_indices,
-            6,
-            |word, _| {
-                if word.eq_ignore_ascii_case("DECLARE") {
-                    has_declare = true;
-                } else if word.eq_ignore_ascii_case("CURSOR") {
-                    has_cursor = true;
-                }
-                !(has_declare && has_cursor)
-            },
-        );
-        has_declare && has_cursor
     }
 
     fn is_mysql_declare_handler_for_clause_from_indices(
@@ -8018,22 +8041,21 @@ impl SqlEditorWidget {
         words
     }
 
-    fn is_mysql_declare_cursor_for_clause(
-        tokens: &[SqlToken],
-        idx: usize,
-        statement_word_links: Option<&StatementWordLinks>,
-    ) -> bool {
-        let mut has_declare = false;
+    fn is_mysql_declare_cursor_for_clause(tokens: &[SqlToken], idx: usize) -> bool {
         let mut has_cursor = false;
-        Self::scan_recent_statement_words(tokens, idx, 6, statement_word_links, |word, _| {
-            if word.eq_ignore_ascii_case("DECLARE") {
-                has_declare = true;
-            } else if word.eq_ignore_ascii_case("CURSOR") {
-                has_cursor = true;
+        for token in tokens[..idx.min(tokens.len())].iter().rev() {
+            match token {
+                SqlToken::Symbol(symbol) if symbol == ";" => break,
+                SqlToken::Word(word) if word.eq_ignore_ascii_case("DECLARE") => {
+                    return has_cursor;
+                }
+                SqlToken::Word(word) if word.eq_ignore_ascii_case("CURSOR") => {
+                    has_cursor = true;
+                }
+                _ => {}
             }
-            !(has_declare && has_cursor)
-        });
-        has_declare && has_cursor
+        }
+        false
     }
 
     fn is_mysql_declare_handler_for_clause(
@@ -9327,8 +9349,10 @@ impl SqlEditorWidget {
                         && upper == "BEGIN"
                         && next_word_is("NOT")
                         && third_word.is_some_and(|word| word.eq_ignore_ascii_case("ATOMIC"));
-                    let with_cte_keyword_inside_function_local =
-                        upper == "WITH" && inside_function_local_non_query_paren;
+                    let mysql_with_rollup_clause =
+                        mysql_compatible && upper == "WITH" && next_word_is("ROLLUP");
+                    let with_cte_keyword_inside_function_local = upper == "WITH"
+                        && (inside_function_local_non_query_paren || mysql_with_rollup_clause);
                     let with_plsql_body_starts_here = matches!(upper, "AS" | "IS")
                         && !as_belongs_to_constructor_result_clause
                         && format_stack.with_cte_collecting_routine_declaration_body_start();
@@ -9417,9 +9441,26 @@ impl SqlEditorWidget {
                     let between_pending = format_stack.between_pending_matches(current_scope);
                     let is_between_and = upper == "AND" && between_pending;
                     let is_exit_when = exit_condition_state.is_exit_when(upper);
+                    let mysql_analyze_histogram_on = mysql_compatible
+                        && upper == "ON"
+                        && matches!(prev_word_upper, Some("HISTOGRAM"))
+                        && {
+                            let recent = Self::recent_statement_words_before_from_indices(
+                                tokens,
+                                &recent_statement_word_indices,
+                                8,
+                            );
+                            recent
+                                .get(1)
+                                .is_some_and(|word| word.eq_ignore_ascii_case("UPDATE"))
+                                && recent
+                                    .iter()
+                                    .any(|word| word.eq_ignore_ascii_case("ANALYZE"))
+                        };
                     let should_break_condition = condition_keywords.contains(&upper)
                         && !(is_between_and
                             || is_exit_when
+                            || mysql_analyze_histogram_on
                             || Self::suppresses_condition_break(
                                 &format_stack,
                                 upper,
@@ -9435,10 +9476,7 @@ impl SqlEditorWidget {
                         .unwrap_or_else(|| base_indent!(indent_level));
                     let mysql_declare_cursor_for_clause = mysql_compatible
                         && upper == "FOR"
-                        && Self::is_mysql_declare_cursor_for_clause_from_indices(
-                            tokens,
-                            &recent_statement_word_indices,
-                        );
+                        && Self::is_mysql_declare_cursor_for_clause(tokens, idx);
                     let mysql_declare_handler_for_clause = mysql_compatible
                         && upper == "FOR"
                         && Self::is_mysql_declare_handler_for_clause_from_indices(
@@ -10300,7 +10338,7 @@ impl SqlEditorWidget {
                                 next_open_cursor_state.set_select_depth(current_paren_depth);
                                 format_stack.set_open_cursor_state(next_open_cursor_state);
                             }
-                            if upper == "WITH" {
+                            if upper == "WITH" && !mysql_with_rollup_clause {
                                 set_statement_has_with_clause!(true);
                             }
                             if upper == "MODEL"
@@ -11146,6 +11184,32 @@ impl SqlEditorWidget {
                                 BlockKind::While,
                                 while_owner_indent,
                                 while_owner_indent.saturating_add(1),
+                                &mut indent_level,
+                            );
+                            format_stack.push_plsql_context(format_stack.current_scope());
+                            newline_after_keyword = true;
+                        } else if upper == "DO"
+                            && mysql_compatible
+                            && format_stack
+                                .last_condition_owner(ConditionOwnerKind::ControlHeader)
+                                .is_none()
+                            && format_stack
+                                .last_condition_owner(ConditionOwnerKind::LoopHeader)
+                                .is_some()
+                        {
+                            // MariaDB cursor/range FOR loops terminate their header with DO
+                            // rather than LOOP. Use the regular loop body frame so END FOR
+                            // restores the owning depth.
+                            let loop_owner_indent = format_stack
+                                .pop_last_condition_owner(ConditionOwnerKind::LoopHeader)
+                                .map(|frame| frame.indent)
+                                .unwrap_or(line_indent);
+                            closed_control_header_body_indent =
+                                Some(loop_owner_indent.saturating_add(1));
+                            format_stack.push_block(
+                                BlockKind::Loop,
+                                loop_owner_indent,
+                                loop_owner_indent.saturating_add(1),
                                 &mut indent_level,
                             );
                             format_stack.push_plsql_context(format_stack.current_scope());
@@ -13509,10 +13573,40 @@ impl SqlEditorWidget {
                                 let parent_frame_sibling_indent = format_stack
                                     .last_paren()
                                     .and_then(|frame| frame.sibling_body_indent());
+                                let current_clause_line = rendered_line_tracker.current_line(&out);
+                                let current_clause_line_trimmed = current_clause_line.trim_start();
+                                let current_line_is_clause_header = matches!(
+                                    format_stack.current_clause(),
+                                    Some("FROM")
+                                        if current_clause_line_trimmed.starts_with("FROM ")
+                                ) || matches!(
+                                    format_stack.current_clause(),
+                                    Some("GROUP")
+                                        if current_clause_line_trimmed.starts_with("GROUP BY ")
+                                ) || matches!(
+                                    format_stack.current_clause(),
+                                    Some("HAVING")
+                                        if current_clause_line_trimmed.starts_with("HAVING ")
+                                ) || matches!(
+                                    format_stack.current_clause(),
+                                    Some("ORDER")
+                                        if current_clause_line_trimmed.starts_with("ORDER BY ")
+                                            || current_clause_line_trimmed
+                                                .starts_with("ORDER SIBLINGS BY ")
+                                ) || matches!(
+                                    format_stack.current_clause(),
+                                    Some("WINDOW")
+                                        if current_clause_line_trimmed.starts_with("WINDOW ")
+                                ) || matches!(
+                                    format_stack.current_clause(),
+                                    Some("INTO")
+                                        if current_clause_line_trimmed.starts_with("INTO ")
+                                );
                                 let clause_list_indent_follows_current_query_frame =
-                                    format_stack.last_paren().is_none_or(|frame| {
-                                        frame.is_query_like() || frame.is_column_list()
-                                    });
+                                    current_line_is_clause_header
+                                        || format_stack.last_paren().is_none_or(|frame| {
+                                            frame.is_query_like() || frame.is_column_list()
+                                        });
                                 let next_starts_parenthesized_sibling = matches!(next_non_comment, Some(SqlToken::Symbol(sym)) if sym == "(");
                                 let keeps_mixed_close_key_subquery_inline =
                                     follows_multiline_child_close
@@ -13666,6 +13760,12 @@ impl SqlEditorWidget {
                                             construct_flag_active!(MergeActive),
                                             false,
                                         );
+                                        if current_line_is_clause_header {
+                                            list_indent = list_indent.max(
+                                                rendered_line_indent(current_clause_line)
+                                                    .saturating_add(1),
+                                            );
+                                        }
                                         if format_stack.paren_is_empty() {
                                             if let Some(base_depth) =
                                                 query_body_clause_base_depth!()
@@ -13889,6 +13989,18 @@ impl SqlEditorWidget {
                                             &mut needs_space,
                                             &mut line_indent,
                                         );
+                                    } else if let Some(list_indent) = clause_list_indent {
+                                        // Query-clause lists retain their own continuation depth
+                                        // after a function call closes (for example ORDER BY
+                                        // distance_fn(...), id inside a scalar subquery).
+                                        newline_with(
+                                            &mut out,
+                                            list_indent,
+                                            0,
+                                            &mut at_line_start,
+                                            &mut needs_space,
+                                            &mut line_indent,
+                                        );
                                     } else if let Some(sibling_indent) =
                                         owner_relative_parent_sibling_indent
                                     {
@@ -13898,15 +14010,6 @@ impl SqlEditorWidget {
                                         newline_with(
                                             &mut out,
                                             sibling_indent,
-                                            0,
-                                            &mut at_line_start,
-                                            &mut needs_space,
-                                            &mut line_indent,
-                                        );
-                                    } else if let Some(list_indent) = clause_list_indent {
-                                        newline_with(
-                                            &mut out,
-                                            list_indent,
                                             0,
                                             &mut at_line_start,
                                             &mut needs_space,
@@ -14192,7 +14295,7 @@ impl SqlEditorWidget {
                                 Self::paren_opens_call_argument_list_from_indices(
                                     tokens,
                                     &recent_statement_word_indices,
-                                ) && paren_body_has_newline;
+                                ) && (paren_body_has_newline || body_contains_query_like_child);
                             let has_nested_analytic_clause_owner_child =
                                 paren_body_analysis.contains_analytic_clause_owner_child;
                             let wraps_function_call_child = wraps_subquery_or_case_head
@@ -16152,6 +16255,7 @@ impl SqlEditorWidget {
         for column in &columns {
             let mut iter = column.iter().filter(|t| !matches!(t, SqlToken::Comment(_)));
             let first = iter.next();
+            let second = iter.next();
             let is_constraint = match first {
                 Some(SqlToken::Word(word)) => {
                     word.eq_ignore_ascii_case("CONSTRAINT")
@@ -16159,6 +16263,18 @@ impl SqlEditorWidget {
                         || word.eq_ignore_ascii_case("UNIQUE")
                         || word.eq_ignore_ascii_case("FOREIGN")
                         || word.eq_ignore_ascii_case("CHECK")
+                        || (mysql_compatible
+                            && (word.eq_ignore_ascii_case("KEY")
+                                || word.eq_ignore_ascii_case("INDEX")
+                                || word.eq_ignore_ascii_case("FULLTEXT")
+                                || word.eq_ignore_ascii_case("SPATIAL")
+                                || word.eq_ignore_ascii_case("PERIOD")
+                                || (word.eq_ignore_ascii_case("VECTOR")
+                                    && matches!(
+                                        second,
+                                        Some(SqlToken::Word(next))
+                                            if next.eq_ignore_ascii_case("INDEX")
+                                    ))))
                 }
                 _ => false,
             };
@@ -16615,6 +16731,10 @@ impl SqlEditorWidget {
                 out.push('\n');
             }
             if let Some(formatted) =
+                Self::format_create_partition_definitions(part, mysql_compatible)
+            {
+                out.push_str(&formatted);
+            } else if let Some(formatted) =
                 Self::format_create_subpartition_template(part, mysql_compatible)
             {
                 out.push_str(&formatted);
@@ -16627,6 +16747,100 @@ impl SqlEditorWidget {
             }
         }
         out.trim().to_string()
+    }
+
+    fn format_create_partition_definitions(
+        tokens: &[SqlToken],
+        mysql_compatible: bool,
+    ) -> Option<String> {
+        let leading_words: Vec<&str> = tokens
+            .iter()
+            .filter_map(|token| match token {
+                SqlToken::Word(word) => Some(word.as_str()),
+                _ => None,
+            })
+            .take(2)
+            .collect();
+        if !matches!(
+            leading_words.as_slice(),
+            [partition, by]
+                if partition.eq_ignore_ascii_case("PARTITION")
+                    && by.eq_ignore_ascii_case("BY")
+        ) {
+            return None;
+        }
+
+        let mut depth = 0usize;
+        let mut definition_list = None;
+        for (open_idx, token) in tokens.iter().enumerate() {
+            match token {
+                SqlToken::Symbol(symbol) if symbol == "(" => {
+                    if depth == 0 {
+                        let close_idx = Self::matching_paren_close_index(tokens, open_idx, None)?;
+                        let items = split_top_level_symbol_groups(
+                            &tokens[open_idx.saturating_add(1)..close_idx],
+                            ",",
+                        );
+                        let all_partition_items = !items.is_empty()
+                            && items.iter().all(|item| {
+                                item.iter()
+                                    .find_map(|token| match token {
+                                        SqlToken::Comment(_) => None,
+                                        SqlToken::Word(word) => Some(word.as_str()),
+                                        _ => Some(""),
+                                    })
+                                    .is_some_and(|word| {
+                                        word.eq_ignore_ascii_case("PARTITION")
+                                            || word.eq_ignore_ascii_case("SUBPARTITION")
+                                    })
+                            });
+                        if all_partition_items {
+                            definition_list = Some((open_idx, close_idx, items));
+                        }
+                    }
+                    depth = depth.saturating_add(1);
+                }
+                SqlToken::Symbol(symbol) if symbol == ")" => {
+                    depth = depth.saturating_sub(1);
+                }
+                _ => {}
+            }
+        }
+
+        let (open_idx, close_idx, items) = definition_list?;
+        if !tokens[close_idx.saturating_add(1)..].iter().all(|token| {
+            matches!(token, SqlToken::Comment(_))
+                || matches!(token, SqlToken::Symbol(symbol) if symbol == ";")
+        }) {
+            return None;
+        }
+
+        let mut out =
+            Self::join_tokens_spaced_for_create_table(&tokens[..=open_idx], 0, mysql_compatible);
+        for (idx, item) in items.iter().enumerate() {
+            let item: Vec<SqlToken> = item.iter().map(|token| (*token).clone()).collect();
+            out.push_str("\n    ");
+            out.push_str(&Self::join_tokens_spaced_for_create_table(
+                &item,
+                0,
+                mysql_compatible,
+            ));
+            if idx + 1 < items.len() {
+                out.push(',');
+            }
+        }
+        out.push_str("\n)");
+        for token in &tokens[close_idx.saturating_add(1)..] {
+            match token {
+                SqlToken::Symbol(symbol) if symbol == ";" => out.push(';'),
+                SqlToken::Comment(comment) => {
+                    out.push(' ');
+                    out.push_str(comment);
+                }
+                _ => {}
+            }
+        }
+        Some(out)
     }
 
     fn format_create_subpartition_template(
@@ -31853,6 +32067,51 @@ FROM emp_json e;"#;
     }
 
     #[test]
+    fn format_sql_basic_for_mariadb_keeps_delete_history_from_inline() {
+        let source =
+            "DELETE HISTORY FROM mb3_contract BEFORE SYSTEM_TIME TIMESTAMP '2000-01-01 00:00:00';";
+        let formatted = SqlEditorWidget::format_sql_basic_for_db_type(
+            source,
+            crate::db::connection::DatabaseType::MariaDB,
+        );
+
+        assert!(
+            formatted.contains("DELETE HISTORY FROM mb3_contract"),
+            "DELETE HISTORY FROM should stay on one line, got:\n{formatted}"
+        );
+        assert_eq!(
+            SqlEditorWidget::format_sql_basic_for_db_type(
+                &formatted,
+                crate::db::connection::DatabaseType::MariaDB,
+            ),
+            formatted,
+            "MariaDB DELETE HISTORY formatting should be idempotent"
+        );
+    }
+
+    #[test]
+    fn format_sql_basic_for_mysql_keeps_histogram_on_attached() {
+        let source = "ANALYZE TABLE gx_visit UPDATE HISTOGRAM ON duration_ms WITH 8 BUCKETS;";
+        let formatted = SqlEditorWidget::format_sql_basic_for_db_type(
+            source,
+            crate::db::connection::DatabaseType::MySQL,
+        );
+
+        assert!(
+            formatted.contains("UPDATE HISTOGRAM ON duration_ms"),
+            "ANALYZE UPDATE HISTOGRAM ON should keep ON attached, got:\n{formatted}"
+        );
+        assert_eq!(
+            SqlEditorWidget::format_sql_basic_for_db_type(
+                &formatted,
+                crate::db::connection::DatabaseType::MySQL,
+            ),
+            formatted,
+            "MySQL histogram formatting should be idempotent"
+        );
+    }
+
+    #[test]
     fn format_sql_with_insert_cte_keeps_values_indent() {
         let source = "WITH src AS (\nSELECT 1 AS c1, 2 AS c2 FROM dual\n)\nINSERT INTO tgt (c1, c2)\nSELECT c1, c2 FROM src;";
         let formatted = SqlEditorWidget::format_sql_basic(source);
@@ -36504,6 +36763,269 @@ END;"#;
                 "formatted CREATE TABLE should not regress to `{snippet}`:\n{formatted}"
             );
         }
+    }
+
+    #[test]
+    fn format_sql_basic_for_mysql_db_type_spaces_named_table_indexes_and_period_columns() {
+        let source = "create table t (a int, b text, g geometry not null, seq_id bigint default(next value for seq), row_start timestamp(6) generated always as row start, row_end timestamp(6) generated always as row end, key ix_a(a), index ix_b(b), fulltext key ft_b(b), spatial index sp_g(g), PERIOD FOR SYSTEM_TIME(row_start,row_end), constraint fk_t_parent foreign key(a) references parent(id));";
+        let formatted = SqlEditorWidget::format_sql_basic_for_db_type(
+            source,
+            crate::db::connection::DatabaseType::MySQL,
+        );
+
+        for snippet in [
+            "KEY ix_a (a),",
+            "INDEX ix_b (b),",
+            "FULLTEXT KEY ft_b (b),",
+            "SPATIAL INDEX sp_g (g),",
+            "DEFAULT (NEXT VALUE FOR seq),",
+            "PERIOD FOR SYSTEM_TIME (row_start, row_end),",
+            "CONSTRAINT fk_t_parent FOREIGN KEY (a) REFERENCES parent (id)",
+        ] {
+            assert!(
+                formatted.contains(snippet),
+                "named table index/period syntax should keep a space before its column list for `{snippet}`:\n{formatted}"
+            );
+        }
+        assert_eq!(
+            SqlEditorWidget::format_sql_basic_for_db_type(
+                &formatted,
+                crate::db::connection::DatabaseType::MySQL,
+            ),
+            formatted
+        );
+    }
+
+    #[test]
+    fn format_sql_basic_for_mariadb_spaces_cursor_and_json_table_columns() {
+        let source = "create procedure p() begin declare c cursor(p_min decimal(14,2),p_kind varchar(20)) for select id from t where id >= p_min and kind = p_kind; open c(1,'x'); close c; end; select * from json_table(doc,'$' columns(id int path '$.id',nested path '$.items[*]' columns(v int path '$'))) jt;";
+        let formatted = SqlEditorWidget::format_sql_basic_for_db_type(
+            source,
+            crate::db::connection::DatabaseType::MariaDB,
+        );
+
+        for snippet in [
+            "DECLARE c CURSOR (p_min DECIMAL(14, 2), p_kind VARCHAR(20))",
+            "OPEN c(1, 'x');",
+            "'$' COLUMNS (",
+            "NESTED PATH '$.items[*]' COLUMNS (",
+        ] {
+            assert!(
+                formatted.contains(snippet),
+                "MariaDB cursor/JSON_TABLE syntax should use contextual parenthesis spacing for `{snippet}`:\n{formatted}"
+            );
+        }
+        let lines = formatted.lines().collect::<Vec<_>>();
+        let cursor_idx = find_line_starting_with(
+            &lines,
+            "DECLARE c CURSOR (p_min DECIMAL(14, 2), p_kind VARCHAR(20))",
+        )
+        .expect("parameterized cursor declaration");
+        let select_idx = lines
+            .iter()
+            .enumerate()
+            .skip(cursor_idx + 1)
+            .find(|(_, line)| line.trim_start() == "SELECT id")
+            .map(|(idx, _)| idx)
+            .expect("parameterized cursor SELECT");
+        assert_eq!(
+            leading_spaces(lines[select_idx]),
+            leading_spaces(lines[cursor_idx]).saturating_add(4),
+            "parameterized cursor query should stay one level deeper than its declaration:\n{formatted}"
+        );
+        assert_eq!(
+            SqlEditorWidget::format_sql_basic_for_db_type(
+                &formatted,
+                crate::db::connection::DatabaseType::MariaDB,
+            ),
+            formatted
+        );
+    }
+
+    #[test]
+    fn format_sql_basic_for_mariadb_keeps_vector_index_as_table_constraint() {
+        let source = "create table t (id int not null, valid_from date not null, valid_to date not null, embedding vector(3) not null, PERIOD FOR validity(valid_from,valid_to), vector index ix_embedding(embedding) M=4 DISTANCE=cosine, primary key(id));";
+        let formatted = SqlEditorWidget::format_sql_basic_for_db_type(
+            source,
+            crate::db::connection::DatabaseType::MariaDB,
+        );
+
+        assert!(
+            formatted.contains("VECTOR INDEX ix_embedding (embedding) M = 4 DISTANCE = cosine,"),
+            "VECTOR INDEX should remain a table constraint without alignment padding:\n{formatted}"
+        );
+        assert!(
+            !formatted.contains("VECTOR     INDEX"),
+            "VECTOR INDEX must not be parsed as a column name and type:\n{formatted}"
+        );
+        assert!(
+            formatted.contains("PERIOD FOR validity (valid_from, valid_to),"),
+            "a named application-time PERIOD should use DDL-list spacing:\n{formatted}"
+        );
+        assert_eq!(
+            SqlEditorWidget::format_sql_basic_for_db_type(
+                &formatted,
+                crate::db::connection::DatabaseType::MariaDB,
+            ),
+            formatted
+        );
+    }
+
+    #[test]
+    fn format_sql_basic_for_mariadb_indents_for_do_bodies_and_keeps_replace_into_inline() {
+        let source = r#"CREATE PROCEDURE p()
+BEGIN
+FOR rec IN (SELECT id FROM t) DO
+SET @total = @total + rec.id;
+END FOR;
+FOR i IN 1..3 DO
+REPLACE INTO t(id) VALUES(i);
+END FOR;
+END;"#;
+        let formatted = SqlEditorWidget::format_sql_basic_for_db_type(
+            source,
+            crate::db::connection::DatabaseType::MariaDB,
+        );
+        let lines: Vec<&str> = formatted.lines().collect();
+        let cursor_for_idx =
+            find_line_starting_with(&lines, "FOR rec IN (").expect("cursor FOR header");
+        let set_idx = find_line_starting_with(&lines, "SET @total = @total + rec.id;")
+            .expect("cursor FOR body");
+        let first_end_for_idx = find_line_starting_with(&lines, "END FOR;").expect("first END FOR");
+        let range_for_idx =
+            find_line_starting_with(&lines, "FOR i IN 1..3 DO").expect("range FOR header");
+        let replace_idx =
+            find_line_starting_with(&lines, "REPLACE INTO t (id)").expect("REPLACE INTO body");
+        let second_end_for_idx = lines
+            .iter()
+            .enumerate()
+            .skip(first_end_for_idx + 1)
+            .find(|(_, line)| line.trim_start() == "END FOR;")
+            .map(|(idx, _)| idx)
+            .expect("second END FOR");
+
+        assert_eq!(
+            leading_spaces(lines[set_idx]),
+            leading_spaces(lines[cursor_for_idx]).saturating_add(4),
+            "cursor FOR body should be one level deeper than its header:\n{formatted}"
+        );
+        assert_eq!(
+            leading_spaces(lines[first_end_for_idx]),
+            leading_spaces(lines[cursor_for_idx]),
+            "cursor END FOR should realign with its header:\n{formatted}"
+        );
+        assert_eq!(
+            leading_spaces(lines[replace_idx]),
+            leading_spaces(lines[range_for_idx]).saturating_add(4),
+            "range FOR body should be one level deeper than its header:\n{formatted}"
+        );
+        assert_eq!(
+            leading_spaces(lines[second_end_for_idx]),
+            leading_spaces(lines[range_for_idx]),
+            "range END FOR should realign with its header:\n{formatted}"
+        );
+        assert!(
+            formatted.contains("REPLACE INTO t (id)"),
+            "REPLACE INTO should stay on one DML header line:\n{formatted}"
+        );
+        assert_eq!(
+            SqlEditorWidget::format_sql_basic_for_db_type(
+                &formatted,
+                crate::db::connection::DatabaseType::MariaDB,
+            ),
+            formatted
+        );
+    }
+
+    #[test]
+    fn format_sql_basic_for_mysql_expands_range_partition_definition_list() {
+        let source = "create table readings (captured_on date not null, value decimal(10,2)) engine=innodb partition by range columns(captured_on) (partition p0 values LESS than ('2026-01-01'), partition p1 values LESS than ('2027-01-01'), partition pmax values LESS than (MAXVALUE));";
+        let formatted = SqlEditorWidget::format_sql_basic_for_db_type(
+            source,
+            crate::db::connection::DatabaseType::MySQL,
+        );
+
+        assert!(
+            formatted.contains(
+                "PARTITION BY RANGE COLUMNS (captured_on) (\n    PARTITION p0 VALUES LESS THAN ('2026-01-01'),\n    PARTITION p1 VALUES LESS THAN ('2027-01-01'),\n    PARTITION pmax VALUES LESS THAN (MAXVALUE)\n);"
+            ),
+            "range partition definitions should be expanded as a readable list:\n{formatted}"
+        );
+        assert_eq!(
+            SqlEditorWidget::format_sql_basic_for_db_type(
+                &formatted,
+                crate::db::connection::DatabaseType::MySQL,
+            ),
+            formatted
+        );
+    }
+
+    #[test]
+    fn format_sql_basic_indents_order_by_siblings_after_function_item() {
+        let source = "select region_code, kind_code from t group by region_code, kind_code with rollup order by grouping(region_code), region_code, grouping(kind_code), kind_code;";
+        let formatted = SqlEditorWidget::format_sql_basic_for_db_type(
+            source,
+            crate::db::connection::DatabaseType::MySQL,
+        );
+
+        assert!(
+            formatted.contains(
+                "ORDER BY GROUPING(region_code),\n    region_code,\n    GROUPING(kind_code),\n    kind_code;"
+            ),
+            "ORDER BY siblings after a function expression should retain list indentation:\n{formatted}"
+        );
+        assert_eq!(
+            SqlEditorWidget::format_sql_basic_for_db_type(
+                &formatted,
+                crate::db::connection::DatabaseType::MySQL,
+            ),
+            formatted
+        );
+    }
+
+    #[test]
+    fn format_sql_basic_indents_nested_order_by_sibling_after_function_item() {
+        let source = "call assert_ok((select id from t order by distance_fn(vector_col, query_vector()), id limit 1) = 2, 'nearest');";
+        let formatted = SqlEditorWidget::format_sql_basic_for_db_type(
+            source,
+            crate::db::connection::DatabaseType::MariaDB,
+        );
+        let lines: Vec<&str> = formatted.lines().collect();
+        let order_idx =
+            find_line_starting_with(&lines, "ORDER BY distance_fn(vector_col, query_vector()),")
+                .expect("nested ORDER BY");
+        let id_idx = lines
+            .iter()
+            .enumerate()
+            .skip(order_idx + 1)
+            .find(|(_, line)| line.trim_start() == "id")
+            .map(|(idx, _)| idx)
+            .expect("nested ORDER BY sibling");
+        let limit_idx = lines
+            .iter()
+            .enumerate()
+            .skip(id_idx + 1)
+            .find(|(_, line)| line.trim_start() == "LIMIT 1")
+            .map(|(idx, _)| idx)
+            .expect("nested LIMIT");
+
+        assert_eq!(
+            leading_spaces(lines[id_idx]),
+            leading_spaces(lines[order_idx]).saturating_add(4),
+            "nested ORDER BY sibling should remain one list level below its clause:\n{formatted}"
+        );
+        assert_eq!(
+            leading_spaces(lines[limit_idx]),
+            leading_spaces(lines[order_idx]),
+            "nested LIMIT should return to the ORDER BY clause depth:\n{formatted}"
+        );
+        assert_eq!(
+            SqlEditorWidget::format_sql_basic_for_db_type(
+                &formatted,
+                crate::db::connection::DatabaseType::MariaDB,
+            ),
+            formatted
+        );
     }
 
     #[test]

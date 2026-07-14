@@ -22,7 +22,7 @@ fn load_query_test_file(name: &str) -> String {
 
 fn load_mariadb_query_test_file(name: &str) -> String {
     let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    for dir in ["test_mysql", "test_mariadb"] {
+    for dir in ["test_mariadb", "test_mysql"] {
         let path = manifest_dir.join(dir).join(name);
         if let Ok(contents) = fs::read_to_string(path) {
             return contents;

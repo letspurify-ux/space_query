@@ -9105,13 +9105,11 @@ impl QueryExecutor {
             && !builder.current_is_empty()
             && builder.current_has_order_by_context();
 
-        // A line-leading `@`/`@@` include candidate must not cut an open
-        // statement that is mid-list (trailing comma): e.g. a MySQL user
-        // variable `@x` select item after an inline `--` comment is a
-        // continuation of the open statement, not a script command.
-        let is_include_continuation_line = trimmed.starts_with('@')
-            && !builder.current_is_empty()
-            && builder.current_ends_with_list_continuation_comma();
+        // No tool-command-shaped line may cut an open statement that is
+        // mid-list. This covers both MySQL `@x` variables and one-letter SQL
+        // aliases such as `r`, which otherwise resembles SQL*Plus RUN.
+        let is_list_continuation_line =
+            !builder.current_is_empty() && builder.current_ends_with_list_continuation_comma();
 
         // Tool command appearing after a slash-terminable open statement
         if builder.is_idle()
@@ -9120,7 +9118,7 @@ impl QueryExecutor {
             && builder.can_terminate_on_slash()
             && !is_sql_set_clause_context
             && !is_order_by_modifier_line
-            && !is_include_continuation_line
+            && !is_list_continuation_line
             && Self::parse_tool_command_if_candidate(trimmed).is_some()
         {
             for stmt in builder.force_terminate_and_take_statements() {
@@ -9136,7 +9134,7 @@ impl QueryExecutor {
             parser_is_top_level,
             is_sql_set_clause_context,
         ) && !is_order_by_modifier_line
-            && !is_include_continuation_line
+            && !is_list_continuation_line
         {
             if let Some(command) = Self::parse_tool_command_if_candidate(trimmed) {
                 for stmt in builder.force_terminate_and_take_statements() {
@@ -9157,7 +9155,12 @@ impl QueryExecutor {
             parser_is_top_level,
         ) && !is_sql_set_statement
         {
-            if let Some(command) = Self::parse_tool_command_if_candidate(trimmed) {
+            // `START WITH` is an Oracle hierarchical-query clause in the general
+            // parser. At a fresh statement boundary, however, the exact two-token
+            // line can still be SQL*Plus `START <path>` with a file named `with`.
+            if let Some(command) = Self::parse_tool_command_if_candidate(trimmed)
+                .or_else(|| Self::parse_boundary_start_with_script_command(trimmed))
+            {
                 if let ToolCommand::SetSqlBlankLines { enabled } = &command {
                     *sqlblanklines_enabled = *enabled;
                 }
@@ -11435,13 +11438,34 @@ impl QueryExecutor {
             return true;
         }
 
-        if second_word.is_some_and(|word| word == "WITH") {
+        if second_word.is_some_and(|word| {
+            word.eq_ignore_ascii_case("TRANSACTION")
+                || word.eq_ignore_ascii_case("WORK")
+                || word.eq_ignore_ascii_case("WITH")
+        }) {
             return false;
         }
 
-        // Hierarchical query clause `START WITH <expr>` must stay as SQL.
-        let third_word = Self::next_meaningful_word(trimmed, 2);
-        !(second_word.is_some_and(|word| word.eq_ignore_ascii_case("WITH")) && third_word.is_some())
+        true
+    }
+
+    fn parse_boundary_start_with_script_command(line: &str) -> Option<ToolCommand> {
+        let trimmed = line.trim().trim_end_matches(';').trim();
+        let mut words = trimmed.split_whitespace();
+        let command = words.next()?;
+        let path = words.next()?;
+
+        if !command.eq_ignore_ascii_case("START")
+            || !path.eq_ignore_ascii_case("WITH")
+            || words.next().is_some()
+        {
+            return None;
+        }
+
+        Some(ToolCommand::RunScript {
+            path: path.to_string(),
+            relative_to_caller: false,
+        })
     }
 
     fn is_connect_command(trimmed: &str) -> bool {
@@ -11824,6 +11848,20 @@ FROM recursive_tree";
     }
 
     #[test]
+    fn parse_tool_command_mysql_start_transaction_is_not_script_command() {
+        for sql in [
+            "START TRANSACTION",
+            "START /* transaction mode */ TRANSACTION READ ONLY",
+            "START WORK",
+        ] {
+            assert!(
+                QueryExecutor::parse_tool_command(sql).is_none(),
+                "MySQL/MariaDB transaction statement must remain SQL: {sql}"
+            );
+        }
+    }
+
+    #[test]
     fn parse_tool_command_match_recognize_define_clause_is_not_script_define() {
         assert!(
             QueryExecutor::parse_tool_command("DEFINE DOWN AS price < PREV(price)").is_none(),
@@ -11916,6 +11954,28 @@ FROM recursive_tree";
         assert!(
             statement.contains("@x") && statement.contains("FROM t"),
             "statement should keep the @variable continuation, got:\n{statement}"
+        );
+    }
+
+    #[test]
+    fn split_items_keep_one_letter_alias_after_multitable_delete_comma() {
+        let sql = "DELETE d,\n    r\nFROM mx_document d\nJOIN mx_reading r ON r.account_id = d.account_id\nWHERE d.doc_id = 1;";
+        let script_items = QueryExecutor::split_script_items_for_db_type(
+            sql,
+            Some(crate::db::connection::DatabaseType::MySQL),
+        );
+        let format_items = QueryExecutor::split_format_items_for_db_type(
+            sql,
+            Some(crate::db::connection::DatabaseType::MySQL),
+        );
+
+        assert!(
+            matches!(script_items.as_slice(), [super::ScriptItem::Statement(statement)] if statement.contains("DELETE d") && statement.contains("mx_reading r")),
+            "multi-table DELETE aliases should remain one script statement: {script_items:?}"
+        );
+        assert!(
+            matches!(format_items.as_slice(), [FormatItem::Statement(statement)] if statement.contains("DELETE d") && statement.contains("mx_reading r")),
+            "multi-table DELETE aliases should remain one format statement: {format_items:?}"
         );
     }
 

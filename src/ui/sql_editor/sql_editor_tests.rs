@@ -17,7 +17,7 @@ fn load_test_file(name: &str) -> String {
 
 fn load_mariadb_test_file(name: &str) -> String {
     let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    for dir in ["test_mysql", "test_mariadb"] {
+    for dir in ["test_mariadb", "test_mysql"] {
         let path = manifest_dir.join(dir).join(name);
         if let Ok(contents) = fs::read_to_string(path) {
             return contents;
@@ -818,6 +818,217 @@ fn format_sql_preserves_test19_execution_unit_splitter_final_boss_script() {
     assert_eq!(
         formatted, formatted_again,
         "Formatting should be idempotent for test19.sql"
+    );
+}
+
+fn assert_mysql_family_format_certification_gauntlet(
+    label: &str,
+    input: &str,
+    db_type: crate::db::connection::DatabaseType,
+    required_snippets: &[&str],
+) {
+    assert!(!input.is_empty(), "{label} should not be empty");
+
+    let formatted =
+        SqlEditorWidget::format_for_auto_formatting_with_db_type(input, false, Some(db_type));
+    assert_ne!(
+        input, formatted,
+        "{label} intentionally hostile layout should require formatting"
+    );
+
+    let original_items = QueryExecutor::split_script_items_for_db_type(input, Some(db_type));
+    let formatted_items = QueryExecutor::split_script_items_for_db_type(&formatted, Some(db_type));
+    assert_eq!(
+        count_script_statements(&formatted_items),
+        count_script_statements(&original_items),
+        "Formatting changed execution statement count for {label}"
+    );
+    assert_eq!(
+        count_script_tool_commands(&formatted_items),
+        count_script_tool_commands(&original_items),
+        "Formatting changed tool-command count for {label}"
+    );
+    assert!(
+        !formatted
+            .lines()
+            .any(|line| matches!(line.trim(), "@TRANSACTION" | "SET AUTOCOMMIT OFF")),
+        "{label} START TRANSACTION statements must not become tool commands"
+    );
+    assert_contains_all(&formatted, required_snippets);
+
+    let mut in_block_comment = false;
+    for (line_no, line) in formatted.lines().enumerate() {
+        assert_eq!(
+            line.trim_end(),
+            line,
+            "{label}:{} contains trailing whitespace",
+            line_no + 1
+        );
+        assert!(
+            !line.contains('\t'),
+            "{label}:{} contains a tab",
+            line_no + 1
+        );
+
+        let trimmed = line.trim_start();
+        if in_block_comment {
+            in_block_comment = !trimmed.contains("*/");
+            continue;
+        }
+        if trimmed.starts_with("/*") {
+            in_block_comment = !trimmed.contains("*/");
+            continue;
+        }
+        if trimmed.is_empty()
+            || trimmed.starts_with("--")
+            || trimmed.starts_with('#')
+            || trimmed.starts_with('*')
+        {
+            continue;
+        }
+        assert_eq!(
+            leading_spaces(line) % 4,
+            0,
+            "{label}:{} does not use four-space indentation: {line:?}",
+            line_no + 1
+        );
+    }
+
+    let formatted_again =
+        SqlEditorWidget::format_for_auto_formatting_with_db_type(&formatted, false, Some(db_type));
+    assert_eq!(
+        formatted, formatted_again,
+        "Formatting should be idempotent for {label}"
+    );
+}
+
+#[test]
+fn format_sql_certifies_mysql_test4_gauntlet() {
+    assert_mysql_family_format_certification_gauntlet(
+        "test_mysql/test4.txt",
+        include_str!("../../../test_mysql/test4.txt"),
+        crate::db::connection::DatabaseType::MySQL,
+        &[
+            "DELIMITER $$",
+            "CREATE PROCEDURE af_run_gauntlet()",
+            "JOIN JSON_TABLE(",
+            "w_user AS (",
+            "INTERSECT",
+            "EXCEPT",
+            "FOR UPDATE SKIP LOCKED;",
+            "'PASS' AS status",
+        ],
+    );
+}
+
+#[test]
+fn format_sql_certifies_mysql_test5_gauntlet() {
+    assert_mysql_family_format_certification_gauntlet(
+        "test_mysql/test5.txt",
+        include_str!("../../../test_mysql/test5.txt"),
+        crate::db::connection::DatabaseType::MySQL,
+        &[
+            "VARBINARY(32) INVISIBLE",
+            "CAST(payload -> '$.tags' AS CHAR(24) ARRAY)",
+            "PARTITION BY RANGE COLUMNS (captured_on) (",
+            "JOIN LATERAL (",
+            "VALUES ROW('vip', 5)",
+            "MEMBER OF (",
+            "GROUPING(region_code)",
+            "FOR UPDATE NOWAIT;",
+            "'PASS' AS status",
+        ],
+    );
+}
+
+#[test]
+fn format_sql_certifies_mysql_test6_gauntlet() {
+    assert_mysql_family_format_certification_gauntlet(
+        "test_mysql/test6.txt",
+        include_str!("../../../test_mysql/test6.txt"),
+        crate::db::connection::DatabaseType::MySQL,
+        &[
+            "POINT SRID 4326 NOT NULL",
+            "FULLTEXT KEY ft_gx_place_text",
+            "SPATIAL KEY sx_gx_place_location",
+            "PARTITION BY LIST COLUMNS (region_code) (",
+            "AS incoming",
+            "MATCH(p.place_name, p.description)",
+            "ST_Distance_Sphere(",
+            "ANALYZE TABLE gx_visit",
+            "UPDATE HISTOGRAM",
+            "TABLE gx_search_rollup",
+            "FOR SHARE SKIP LOCKED;",
+            "'PASS' AS status",
+        ],
+    );
+}
+
+#[test]
+fn format_sql_certifies_mariadb_test9_gauntlet() {
+    assert_mysql_family_format_certification_gauntlet(
+        "test_mariadb/test9.txt",
+        include_str!("../../../test_mariadb/test9.txt"),
+        crate::db::connection::DatabaseType::MariaDB,
+        &[
+            "CREATE SEQUENCE mf_event_seq",
+            "WITH SYSTEM VERSIONING",
+            "DECLARE cur_events CURSOR",
+            "EXECUTE IMMEDIATE CONCAT(",
+            "CYCLE dept_id RESTRICT",
+            "FOR SYSTEM_TIME ALL",
+            "INTERSECT ALL",
+            "RETURNING event_id",
+            "SET STATEMENT max_statement_time",
+            "'PASS' AS status",
+        ],
+    );
+}
+
+#[test]
+fn format_sql_certifies_mariadb_test10_gauntlet() {
+    assert_mysql_family_format_certification_gauntlet(
+        "test_mariadb/test10.txt",
+        include_str!("../../../test_mariadb/test10.txt"),
+        crate::db::connection::DatabaseType::MariaDB,
+        &[
+            "VECTOR(3)",
+            "VECTOR INDEX ix_mb_asset_embedding",
+            "PERIOD FOR validity (valid_from, valid_to)",
+            "validity WITHOUT OVERLAPS",
+            "ROW TYPE OF mb_asset",
+            "FOR price_rec IN cur_prices(v_asset.asset_id) DO",
+            "FOR j IN REVERSE 1..3 DO",
+            "EXECUTE IMMEDIATE 'INSERT INTO mb_observation",
+            "FOR PORTION OF validity",
+            "FETCH FIRST 2 ROWS WITH TIES;",
+            "EXCEPT ALL (",
+            "RETURNING observation_id,",
+            "'PASS' AS status",
+        ],
+    );
+}
+
+#[test]
+fn format_sql_certifies_mariadb_test11_gauntlet() {
+    assert_mysql_family_format_certification_gauntlet(
+        "test_mariadb/test11.txt",
+        include_str!("../../../test_mariadb/test11.txt"),
+        crate::db::connection::DatabaseType::MariaDB,
+        &[
+            "PERIOD FOR validity (valid_from, valid_to)",
+            "PERIOD FOR SYSTEM_TIME (row_start, row_end)",
+            "WITH SYSTEM VERSIONING",
+            "BEGIN NOT ATOMIC",
+            "FOR SYSTEM_TIME AS OF @history_cutover",
+            "FOR SYSTEM_TIME BETWEEN (",
+            "HANDLER mb3_direct READ `PRIMARY` FIRST;",
+            "RETURNING direct_id,",
+            "MINUS",
+            "DELETE HISTORY FROM mb3_contract BEFORE SYSTEM_TIME",
+            "LIMIT 3 ROWS EXAMINED 1000;",
+            "'PASS' AS status",
+        ],
     );
 }
 
@@ -2006,6 +2217,43 @@ fn format_sql_preserves_test_045_execution_unit_inside_oracle_splitter_final_bos
     assert!(
         matched.is_some(),
         "formatted splitter should keep TEST-045 DBMS_SQL block as one statement, got: {formatted_statements:?}"
+    );
+}
+
+#[test]
+fn format_sql_preserves_test_026_slash_delimited_selects_as_two_execution_units() {
+    let input = load_test_file("oracle splitter final boss test.sql");
+    let formatted = SqlEditorWidget::format_sql_basic(&input);
+    let formatted_items = QueryExecutor::split_script_items(&formatted);
+    let formatted_statements: Vec<&str> = formatted_items
+        .iter()
+        .filter_map(|item| match item {
+            ScriptItem::Statement(stmt) => Some(stmt.as_str()),
+            _ => None,
+        })
+        .collect();
+
+    let salary_query = formatted_statements.iter().find(|stmt| {
+        stmt.contains("salary / 12 AS monthly_salary")
+            && stmt.contains("ORDER BY salary")
+            && !stmt.contains("SELECT 1 / 2 AS half")
+    });
+    let division_query = formatted_statements
+        .iter()
+        .find(|stmt| stmt.contains("SELECT 1 / 2 AS half") && stmt.contains("FROM DUAL"));
+
+    assert!(
+        salary_query.is_some(),
+        "TEST-026 salary query should end at its standalone slash terminator, got: {formatted_statements:?}"
+    );
+    assert!(
+        division_query.is_some(),
+        "TEST-026 division query should remain a separate execution unit, got: {formatted_statements:?}"
+    );
+    assert_eq!(
+        SqlEditorWidget::format_sql_basic(&formatted),
+        formatted,
+        "TEST-026 slash-delimited formatting should be idempotent"
     );
 }
 
@@ -9353,5 +9601,57 @@ fn format_sql_keeps_mariadb_call_scalar_subquery_arguments_on_shared_call_depth(
         ),
         expected,
         "MariaDB CALL scalar-subquery argument formatting should remain idempotent"
+    );
+}
+
+#[test]
+fn format_sql_expands_compact_mariadb_call_with_scalar_subquery_idempotently() {
+    let input = "CALL mf_assert((SELECT COUNT(*) FROM mf_event) = 6, 'event count');";
+    let formatted = SqlEditorWidget::format_for_auto_formatting_with_db_type(
+        input,
+        false,
+        Some(crate::db::connection::DatabaseType::MariaDB),
+    );
+
+    assert!(
+        formatted.contains("\n    'event count'\n);"),
+        "CALL literal sibling should expand with the generated multiline scalar query, got:\n{formatted}"
+    );
+    assert_eq!(
+        SqlEditorWidget::format_for_auto_formatting_with_db_type(
+            &formatted,
+            false,
+            Some(crate::db::connection::DatabaseType::MariaDB),
+        ),
+        formatted,
+        "compact CALL with a scalar subquery should converge in one pass"
+    );
+}
+
+#[test]
+fn format_sql_mysql_parenthesized_set_rhs_keeps_operator_space() {
+    let input = "(SELECT 1) INTERSECT(SELECT 1) EXCEPT(SELECT 2);";
+    let formatted = SqlEditorWidget::format_for_auto_formatting_with_db_type(
+        input,
+        false,
+        Some(crate::db::connection::DatabaseType::MySQL),
+    );
+
+    assert!(
+        formatted.contains("INTERSECT ("),
+        "INTERSECT should retain a separating space before a parenthesized right-hand query, got:\n{formatted}"
+    );
+    assert!(
+        formatted.contains("EXCEPT ("),
+        "EXCEPT should retain a separating space before a parenthesized right-hand query, got:\n{formatted}"
+    );
+    assert_eq!(
+        SqlEditorWidget::format_for_auto_formatting_with_db_type(
+            &formatted,
+            false,
+            Some(crate::db::connection::DatabaseType::MySQL),
+        ),
+        formatted,
+        "parenthesized MySQL set operands should remain idempotent"
     );
 }

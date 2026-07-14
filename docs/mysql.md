@@ -74,6 +74,66 @@ cargo test mysql_connect_applies_advanced_session_settings --lib -- --ignored --
 cargo test mysql_pool_session_applies_advanced_session_settings --lib -- --ignored --nocapture
 ```
 
+## Local formatter certification database
+
+The repository has three destructive, self-contained formatter certification
+fixtures:
+
+- [`test_mysql/test4.txt`](../test_mysql/test4.txt) drops/recreates only
+  `sq_mysql_format_cert`.
+- [`test_mysql/test5.txt`](../test_mysql/test5.txt) drops/recreates only
+  `sq_mysql_format_cert_2`.
+- [`test_mysql/test6.txt`](../test_mysql/test6.txt) drops/recreates only
+  `sq_mysql_format_cert_3`.
+
+All require MySQL 8.0.31 or newer.
+
+The fixtures were verified against this local test instance:
+
+| Setting | Value |
+| --- | --- |
+| Server | MySQL 8.0.46 |
+| Container | `space-query-mysql80` |
+| Address | `127.0.0.1:3307` |
+| Certification databases | `sq_mysql_format_cert`, `sq_mysql_format_cert_2`, `sq_mysql_format_cert_3` |
+| Credentials | Container `root`; password read from `MYSQL_ROOT_PASSWORD` inside the container |
+
+Run the SQL exactly as the client receives it:
+
+```sh
+docker exec -i space-query-mysql80 sh -lc \
+  'mysql -uroot -p"$MYSQL_ROOT_PASSWORD" --show-warnings --binary-mode' \
+  < test_mysql/test4.txt
+
+docker exec -i space-query-mysql80 sh -lc \
+  'mysql -uroot -p"$MYSQL_ROOT_PASSWORD" --show-warnings --binary-mode' \
+  < test_mysql/test5.txt
+
+docker exec -i space-query-mysql80 sh -lc \
+  'mysql -uroot -p"$MYSQL_ROOT_PASSWORD" --show-warnings --binary-mode' \
+  < test_mysql/test6.txt
+```
+
+Success requires exit status 0 and the final result row of each fixture to
+report `PASS`. Together they cover routines and handlers, generated JSON
+columns, recursive CTEs, `JSON_TABLE`, windows, set operators, CTE and
+multi-table DML, transaction rollback, locking clauses, invisible
+columns/indexes, functional and multi-valued JSON indexes, RANGE partitions,
+`LATERAL`, `VALUES ROW`, `GROUPING`/`ROLLUP`, JSON schema checks, delimiter
+traps, SRID-aware spatial data and indexes, full-text indexes and all three
+search modes, row-alias upserts, LIST partitioning, optimizer histograms,
+prepared spatial queries, standalone `TABLE`, `FOR SHARE SKIP LOCKED`, and SQL
+assertions.
+
+The formatter-side certification and full report sweep are:
+
+```sh
+cargo test format_sql_certifies_mysql_test4_gauntlet --lib
+cargo test format_sql_certifies_mysql_test5_gauntlet --lib
+cargo test format_sql_certifies_mysql_test6_gauntlet --lib
+cargo test formatting_sweep_all_files_generate_out_report --lib -- --ignored --nocapture
+```
+
 Unit regressions do not require an external server:
 
 ```sh

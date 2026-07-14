@@ -38,6 +38,68 @@ cargo test mariadb_pool_session_applies_advanced_session_settings --lib -- --ign
 cargo test mysql_pool_session_applies_default_session_settings_from_local_mariadb --lib -- --ignored --nocapture
 ```
 
+## Local formatter certification database
+
+The repository has three destructive, self-contained formatter certification
+fixtures:
+
+- [`test_mariadb/test9.txt`](../test_mariadb/test9.txt) drops/recreates only
+  `sq_mariadb_format_cert`.
+- [`test_mariadb/test10.txt`](../test_mariadb/test10.txt) drops/recreates only
+  `sq_mariadb_format_cert_2`.
+- [`test_mariadb/test11.txt`](../test_mariadb/test11.txt) drops/recreates only
+  `sq_mariadb_format_cert_3`.
+
+All target MariaDB 12.2+.
+
+The fixtures were verified against this local test instance:
+
+| Setting | Value |
+| --- | --- |
+| Server | MariaDB 12.2.2 (`12.2.2-MariaDB-ubu2404`) |
+| Container | `space-query-mariadb122` |
+| Address | `127.0.0.1:3306` |
+| Certification databases | `sq_mariadb_format_cert`, `sq_mariadb_format_cert_2`, `sq_mariadb_format_cert_3` |
+| Credentials | Container `root`; password read from `MARIADB_ROOT_PASSWORD` inside the container |
+
+Run the SQL exactly as the client receives it:
+
+```sh
+docker exec -i space-query-mariadb122 sh -lc \
+  'mariadb -uroot -p"$MARIADB_ROOT_PASSWORD" --show-warnings --binary-mode' \
+  < test_mariadb/test9.txt
+
+docker exec -i space-query-mariadb122 sh -lc \
+  'mariadb -uroot -p"$MARIADB_ROOT_PASSWORD" --show-warnings --binary-mode' \
+  < test_mariadb/test10.txt
+
+docker exec -i space-query-mariadb122 sh -lc \
+  'mariadb -uroot -p"$MARIADB_ROOT_PASSWORD" --show-warnings --binary-mode' \
+  < test_mariadb/test11.txt
+```
+
+Success requires exit status 0 and the final result row of each fixture to
+report `PASS`. Together they cover sequences, system-versioned and
+application-time tables, dynamic columns, parameterized and implicit cursor
+`FOR` loops, anchored row types, reverse range loops, diagnostics,
+`EXECUTE IMMEDIATE`, recursive `CYCLE`, `JSON_TABLE`, VECTOR data/indexes and
+distance functions, UUID v7, INET6, `WITHOUT OVERLAPS`, `FOR PORTION OF` DML,
+windows, temporal queries, `INTERSECT ALL`/`EXCEPT ALL`, `FETCH ... WITH TIES`,
+DML `RETURNING`, simultaneous application/system-time tables, anonymous
+`BEGIN NOT ATOMIC` blocks, temporal snapshot/range queries, direct `HANDLER`
+reads, upsert `RETURNING`, Oracle-mode `MINUS`, `DELETE HISTORY`,
+`LIMIT ... ROWS EXAMINED`, JSON normalization, `SET STATEMENT`, delimiter traps,
+rollback behavior, and SQL assertions.
+
+The formatter-side certification and full report sweep are:
+
+```sh
+cargo test format_sql_certifies_mariadb_test9_gauntlet --lib
+cargo test format_sql_certifies_mariadb_test10_gauntlet --lib
+cargo test format_sql_certifies_mariadb_test11_gauntlet --lib
+cargo test formatting_sweep_all_files_generate_out_report --lib -- --ignored --nocapture
+```
+
 These regressions run without an external server:
 
 ```sh

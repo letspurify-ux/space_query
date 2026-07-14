@@ -1842,3 +1842,103 @@ DEFINE 조건의 `AND`/`OR` 연속행 indent가 DEFINE 절 기준 절대 +1로 �
 | 전체 라이브러리 테스트 | 6,435 통과, 실패 0, ignored 212 |
 | `cargo fmt -- --check` | 통과 |
 | 포맷터 코드 변경 | 없음 (검증 전용 회차) |
+
+---
+
+# 6차 독립 정밀 검증 회차 (2026-07-14, 전수 육안 정독 + frame 구조 감사)
+
+기존 PASS 보고나 5차 기록을 결론의 근거로 재사용하지 않고, 지정 스윕을 새로
+실행한 뒤 생성된 모든 `.format.out`을 1행부터 EOF까지 직접 정독했다. 이어서
+포맷터의 frame open/close 및 상대 depth 복원 구현과 관련 회귀 테스트를 다시
+감사했다. **신규 포맷 결함 0건, 포맷터 코드 수정 0건**이다.
+
+## 13-1. 지정 스윕 및 출력 전수 육안 검토
+
+실행 명령:
+
+```text
+cargo test --lib formatting_sweep_all_files_generate_out_report -- --ignored --nocapture
+```
+
+| 대상 | 파일 수 | 처음부터 끝까지 확인한 줄 수 | 결과 |
+| --- | ---: | ---: | --- |
+| `target/format-sweep/test/*.format.out` (Oracle) | 39 | 22,087 | 신규 결함 0 |
+| `target/format-sweep/test_mysql/*.format.out` (MySQL) | 3 | 1,827 | 신규 결함 0 |
+| `target/format-sweep/test_mariadb/*.format.out` (MariaDB) | 5 | 4,674 | 신규 결함 0 |
+| **합계** | **47** | **28,588** | **47/47 PASS, 실패 0** |
+
+PASS/`issues=0` 표시는 참고만 하고 다음 항목을 실제 출력 줄에서 확인했다.
+
+- 괄호·CASE·CTE·인라인 뷰·분석 함수·MODEL·MATCH_RECOGNIZE·JSON_TABLE의
+  소유 frame 시작, 중첩 frame 종료, 부모/형제 절 depth 복귀
+- PL/SQL 및 MySQL/MariaDB 루틴의 BEGIN/END, IF/CASE/LOOP, handler,
+  `DELIMITER` 경계와 statement boundary 복귀
+- 주석, 일반 문자열, Oracle q-quote, 동적 SQL 내부의 가짜 괄호·세미콜론·END가
+  외부 frame을 열거나 닫지 않는지
+- 괄호 닫힘 뒤 후속 인자, `FETCH FIRST` 주석 연속행, DEFINE 조건의 AND/OR,
+  `DECLARE ... CONDITION FOR` 등 기존 결함 지점
+
+최종 스윕 재생성 후 47개 파일의 SHA-256을 육안 검토 직전 결과와 비교했으며
+`BASELINE=47 CURRENT=47 HASH_DIFFS=0`이었다. 따라서 최종 산출물은 전수 정독한
+산출물과 바이트 단위로 동일하다.
+
+## 13-2. frame open/close 및 상대 depth 구현 감사
+
+구현은 전역 depth를 문맥 없이 재계산하는 방식이 아니라 다음 frame stack을
+단일 구조 상태로 사용한다.
+
+- `FormatFrameStack`은 Paren, Block, QueryRuntime, ScopedIndent,
+  ConditionOwner 등 구문 frame을 한 스택에서 관리한다.
+- 괄호 시작은 `push_paren`에서 고유 frame ID, 부모 frame ID, 상대 indent delta,
+  쿼리 runtime 상태를 함께 저장한다. 종료는 `pop_paren`에서 정확히 해당 frame을
+  제거하고 부모 frame의 metrics/runtime/indent를 복원한다.
+- 블록 시작은 owner depth와 body indent를 `FormatBlockDepthFrame`에 저장하고,
+  종료는 `pop_block`이 남아 있는 frame stack에서 기대 indent를 재구성한다.
+- `FormatScope`는 depth뿐 아니라 frame ID까지 비교하므로 같은 depth의 형제
+  구문을 부모/자식으로 오인하지 않는다. scope를 벗어난 보조 frame은 token 진입
+  및 statement boundary에서 만료된다.
+- debug invariant는 paren/block depth, 최근 frame ID, `indent_level`과 stack의
+  기대값이 어긋나면 즉시 실패시킨다.
+
+확인한 핵심 구현 위치:
+
+- `src/ui/sql_editor/formatter.rs`: frame 종류/stack(1883~2006), 공통 push/pop
+  (2106~2377), 괄호 push/pop(2754~2861), 블록 push/pop(3140~3224), statement
+  boundary 및 invariant(3835~4018)
+- `src/sql_format.rs`: frame ID를 포함한 동일-depth scope 판정(103~127)
+
+결론: 구문 시작이 frame을 만들고 구문 종료가 그 frame을 닫으며, 중첩 종료 후
+부모 기준 상대 depth로 복귀하는 요구 구조가 구현되어 있고 이번 전수 출력에서도
+frame 누수나 형제 scope 오인이 발견되지 않았다.
+
+## 13-3. 회귀 및 전체 검증 결과
+
+| 검증 | 결과 |
+| --- | --- |
+| `cargo test --lib format_frame_stack -- --nocapture` | 33 통과, 실패 0 |
+| `cargo test --lib ui::sql_editor::format_sweep_tests:: -- --nocapture` | 13 통과, 실패 0, 스윕용 ignored 2 |
+| 적대적 frame 프로브 10종 | 전부 2회 포맷 동일(멱등), 실패 0 |
+| `cargo test --lib` | 6,435 통과, 실패 0, ignored 212 |
+| `cargo fmt -- --check` | 통과 |
+| 지정 ignored 스윕 최종 재실행 | 1 통과, checked_files=47, failed_files=0 |
+| 최종 출력 vs 전수 정독본 SHA-256 | 47/47 동일, diff 0 |
+
+## 13-4. AS-IS / TO-BE
+
+이번 회차에는 새 포맷 결함과 코드 수정이 없으므로 신규 AS-IS/TO-BE 쿼리
+차이는 없다.
+
+- **AS-IS:** 5차 검증 완료 상태의 47개 포맷 출력
+- **TO-BE:** 6차 최종 스윕 출력 — AS-IS와 SHA-256 47/47 동일
+- 실제 수정이 있었던 4개 쿼리의 AS-IS/TO-BE는 11-1~11-4에 각각 보존되어
+  있으며, 이번 회차에서 해당 TO-BE 지점과 그 주변 중첩 frame을 다시 정독했다.
+
+## 13-5. 6차 회차 결론
+
+| 항목 | 결과 |
+| --- | --- |
+| 전수 확인 파일/라인 | 47개 / 28,588줄 |
+| 새로 발견한 오류 | 0건 |
+| 포맷터·테스트 코드 수정 | 없음 |
+| 문서 변경 | 본 6차 독립 검증 기록 추가 |
+| 최종 상태 | 스윕·집중 회귀·전체 테스트·fmt 전부 성공 |

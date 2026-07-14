@@ -1,0 +1,349 @@
+-- ============================================================================
+-- SPACE QUERY MYSQL AUTO-FORMAT CERTIFICATION GAUNTLET
+-- Target: MySQL 8.0.31+
+--
+-- This source is intentionally laid out badly. Do not hand-format it: the odd
+-- whitespace, split owners, comments, and delimiter-looking literals are test
+-- inputs. The script is self-contained and ends with status = PASS.
+-- ============================================================================
+
+DROP DATABASE IF EXISTS sq_mysql_format_cert;
+CREATE DATABASE sq_mysql_format_cert CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_ai_ci;
+USE sq_mysql_format_cert;
+
+SET NAMES utf8mb4;
+SET SESSION sql_mode='STRICT_TRANS_TABLES,ERROR_FOR_DIVISION_BY_ZERO,NO_ENGINE_SUBSTITUTION';
+SET @delimiter_trap='BEGIN; END$$ DELIMITER // # not a comment';
+/*!80031 SET @version_gate = 'mysql-8.0.31+' */;
+
+# hash-comment trap: SELECT ';'; DELIMITER $$ BEGIN END
+/* block-comment trap:
+   SELECT 1; DELIMITER // CREATE PROCEDURE fake() BEGIN END//
+   apparent close token is written as '* /' here; quoted END and `END` are inert
+*/
+
+CREATE TABLE af_node(
+node_id BIGINT NOT NULL,
+parent_node_id BIGINT NULL,
+node_name VARCHAR(80) NOT NULL,
+attributes JSON NOT NULL,
+path_hint VARCHAR(200) GENERATED ALWAYS AS(JSON_UNQUOTE(JSON_EXTRACT(attributes,'$.path'))) STORED,
+PRIMARY KEY(node_id),
+UNIQUE KEY uk_af_node_name(node_name),
+KEY ix_af_node_parent(parent_node_id),
+CONSTRAINT fk_af_node_parent FOREIGN KEY(parent_node_id) REFERENCES af_node(node_id),
+CONSTRAINT chk_af_node_not_self CHECK(parent_node_id IS NULL OR parent_node_id<>node_id)
+)ENGINE=InnoDB;
+
+CREATE TABLE af_user(
+user_id BIGINT NOT NULL,
+user_code VARCHAR(30) NOT NULL,
+display_name VARCHAR(100) NOT NULL,
+profile JSON NOT NULL,
+country_code VARCHAR(8) GENERATED ALWAYS AS(JSON_UNQUOTE(JSON_EXTRACT(profile,'$.country'))) STORED,
+created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+PRIMARY KEY(user_id),
+UNIQUE KEY uk_af_user_code(user_code),
+KEY ix_af_user_country(country_code),
+CONSTRAINT chk_af_user_profile CHECK(JSON_VALID(profile))
+)ENGINE=InnoDB;
+
+CREATE TABLE af_event(
+event_id BIGINT NOT NULL,
+natural_key VARCHAR(50) NOT NULL,
+user_id BIGINT NOT NULL,
+node_id BIGINT NOT NULL,
+event_kind VARCHAR(20) NOT NULL,
+amount DECIMAL(14,2) NOT NULL,
+payload JSON NOT NULL,
+occurred_at DATETIME(6) NOT NULL,
+device_code VARCHAR(20) GENERATED ALWAYS AS(JSON_UNQUOTE(JSON_EXTRACT(payload,'$.device'))) VIRTUAL,
+PRIMARY KEY(event_id),
+UNIQUE KEY uk_af_event_natural(natural_key),
+KEY ix_af_event_user_time(user_id,occurred_at DESC),
+KEY ix_af_event_node_kind(node_id,event_kind),
+CONSTRAINT fk_af_event_user FOREIGN KEY(user_id) REFERENCES af_user(user_id),
+CONSTRAINT fk_af_event_node FOREIGN KEY(node_id) REFERENCES af_node(node_id),
+CONSTRAINT chk_af_event_amount CHECK(amount>=0),
+CONSTRAINT chk_af_event_payload CHECK(JSON_VALID(payload))
+)ENGINE=InnoDB;
+
+CREATE TABLE af_rollup(
+rollup_day DATE NOT NULL,
+user_id BIGINT NOT NULL,
+event_count BIGINT NOT NULL,
+weighted_amount DECIMAL(18,2) NOT NULL,
+detail_json JSON NOT NULL,
+PRIMARY KEY(rollup_day,user_id),
+CONSTRAINT fk_af_rollup_user FOREIGN KEY(user_id) REFERENCES af_user(user_id)
+)ENGINE=InnoDB;
+
+CREATE TABLE af_error_log(
+log_id BIGINT NOT NULL AUTO_INCREMENT,
+phase_name VARCHAR(80) NOT NULL,
+sql_state CHAR(5) NULL,
+error_no INT NULL,
+message_text VARCHAR(512) NULL,
+PRIMARY KEY(log_id)
+)ENGINE=InnoDB;
+
+INSERT INTO af_node(node_id,parent_node_id,node_name,attributes)VALUES
+(1,NULL,'root',JSON_OBJECT('path','/','flags',JSON_ARRAY('root','visible'))),
+(2,1,'commerce',JSON_OBJECT('path','/commerce','flags',JSON_ARRAY('sales'))),
+(3,1,'platform',JSON_OBJECT('path','/platform','flags',JSON_ARRAY('infra'))),
+(4,2,'checkout',JSON_OBJECT('path','/commerce/checkout','flags',JSON_ARRAY('critical','sales'))),
+(5,3,'observability',JSON_OBJECT('path','/platform/observability','flags',JSON_ARRAY('metrics')));
+
+INSERT INTO af_user(user_id,user_code,display_name,profile)
+VALUES(1,'alice','Alice',JSON_OBJECT('country','KR','roles',JSON_ARRAY('admin','buyer'))),
+(2,'bob','Bob',JSON_OBJECT('country','US','roles',JSON_ARRAY('buyer'))),
+(3,'carol','Carol',JSON_OBJECT('country','DE','roles',JSON_ARRAY('analyst')))
+ON DUPLICATE KEY UPDATE display_name=VALUES(display_name),profile=VALUES(profile);
+
+INSERT INTO af_event(event_id,natural_key,user_id,node_id,event_kind,amount,payload,occurred_at)VALUES
+(101,'evt-101',1,4,'sale',120.00,JSON_OBJECT('device','web','tags',JSON_ARRAY('new','vip'),'metrics',JSON_ARRAY(JSON_OBJECT('name','latency','value',18),JSON_OBJECT('name','items','value',3))),'2026-01-01 09:00:00.000001'),
+(102,'evt-102',1,4,'refund',20.00,JSON_OBJECT('device','app','tags',JSON_ARRAY('vip'),'metrics',JSON_ARRAY(JSON_OBJECT('name','latency','value',25))),'2026-01-01 10:00:00.000002'),
+(103,'evt-103',2,2,'sale',80.00,JSON_OBJECT('device','web','tags',JSON_ARRAY('new'),'metrics',JSON_ARRAY(JSON_OBJECT('name','latency','value',31),JSON_OBJECT('name','items','value',1))),'2026-01-02 11:00:00.000003'),
+(104,'evt-104',2,5,'view',0.00,JSON_OBJECT('device','bot','tags',JSON_ARRAY(),'metrics',JSON_ARRAY(JSON_OBJECT('name','latency','value',5))),'2026-01-02 12:00:00.000004'),
+(105,'evt-105',3,5,'sale',200.00,JSON_OBJECT('device','app','tags',JSON_ARRAY('returning','vip'),'metrics',JSON_ARRAY(JSON_OBJECT('name','latency','value',12),JSON_OBJECT('name','items','value',5))),'2026-01-03 13:00:00.000005'),
+(106,'evt-106',3,3,'sale',50.00,JSON_OBJECT('device','web','tags',JSON_ARRAY('returning'),'metrics',JSON_ARRAY(JSON_OBJECT('name','latency','value',9))),'2026-01-04 14:00:00.000006');
+
+CREATE VIEW af_event_v AS
+SELECT e.event_id,e.natural_key,u.user_code,n.node_name,e.event_kind,e.amount,e.device_code,e.occurred_at,
+CASE WHEN e.amount>=150 THEN 'HIGH' WHEN e.amount>=50 THEN 'MEDIUM' ELSE 'LOW' END AS amount_band
+FROM af_event e JOIN af_user u ON u.user_id=e.user_id JOIN af_node n ON n.node_id=e.node_id;
+
+DELIMITER $$
+
+CREATE FUNCTION af_weight(p_kind VARCHAR(20),p_amount DECIMAL(14,2))
+RETURNS DECIMAL(18,2)
+DETERMINISTIC
+BEGIN
+RETURN CASE UPPER(TRIM(p_kind))
+WHEN 'SALE' THEN p_amount*1.25
+WHEN 'REFUND' THEN p_amount*-1.00
+WHEN 'VIEW' THEN 0
+ELSE p_amount
+END;
+END$$
+
+CREATE PROCEDURE af_assert(IN p_condition BOOLEAN,IN p_message VARCHAR(255))
+BEGIN
+IF COALESCE(p_condition,FALSE)=FALSE THEN
+SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT=p_message;
+END IF;
+END$$
+
+CREATE TRIGGER af_event_bi BEFORE INSERT ON af_event FOR EACH ROW
+BEGIN
+SET NEW.event_kind=UPPER(TRIM(NEW.event_kind));
+IF NEW.amount<0 OR JSON_VALID(NEW.payload)=0 THEN
+SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT='invalid event payload or amount';
+END IF;
+END$$
+
+CREATE PROCEDURE af_run_gauntlet()
+main_block:BEGIN
+DECLARE v_done BOOLEAN DEFAULT FALSE;
+DECLARE v_event_id BIGINT;
+DECLARE v_amount DECIMAL(14,2);
+DECLARE v_running DECIMAL(18,2) DEFAULT 0;
+DECLARE v_state CHAR(5);
+DECLARE v_errno INT;
+DECLARE v_message VARCHAR(512);
+DECLARE cur_events CURSOR FOR
+SELECT event_id,amount FROM af_event WHERE event_kind IN('SALE','REFUND') ORDER BY occurred_at,event_id;
+DECLARE CONTINUE HANDLER FOR NOT FOUND SET v_done=TRUE;
+DECLARE EXIT HANDLER FOR SQLEXCEPTION
+BEGIN
+GET STACKED DIAGNOSTICS CONDITION 1 v_state=RETURNED_SQLSTATE,v_errno=MYSQL_ERRNO,v_message=MESSAGE_TEXT;
+ROLLBACK;
+INSERT INTO af_error_log(phase_name,sql_state,error_no,message_text)VALUES('UNEXPECTED',v_state,v_errno,v_message);
+RESIGNAL;
+END;
+
+START TRANSACTION;
+SAVEPOINT before_cursor;
+OPEN cur_events;
+read_loop:LOOP
+FETCH cur_events INTO v_event_id,v_amount;
+IF v_done THEN LEAVE read_loop;END IF;
+CASE
+WHEN v_amount>=150 THEN SET v_running=v_running+v_amount*2;
+WHEN v_amount>=50 THEN
+nested_branch:BEGIN
+SET v_running=v_running+v_amount;
+IF MOD(v_event_id,2)=0 THEN SET v_running=v_running+0.50;
+ELSEIF MOD(v_event_id,3)=0 THEN SET v_running=v_running+0.25;
+ELSE SET v_running=v_running+0.10;
+END IF;
+END nested_branch;
+ELSE SET v_running=v_running-v_amount;
+END CASE;
+END LOOP read_loop;
+CLOSE cur_events;
+
+duplicate_probe:BEGIN
+DECLARE CONTINUE HANDLER FOR 1062
+BEGIN
+GET DIAGNOSTICS CONDITION 1 v_state=RETURNED_SQLSTATE,v_errno=MYSQL_ERRNO,v_message=MESSAGE_TEXT;
+INSERT INTO af_error_log(phase_name,sql_state,error_no,message_text)VALUES('EXPECTED_DUPLICATE',v_state,v_errno,v_message);
+END;
+INSERT INTO af_event(event_id,natural_key,user_id,node_id,event_kind,amount,payload,occurred_at)
+VALUES(999,'evt-101',1,4,'sale',1,JSON_OBJECT('device','trap','tags',JSON_ARRAY('duplicate'),'metrics',JSON_ARRAY()),NOW(6));
+END duplicate_probe;
+
+INSERT INTO af_rollup(rollup_day,user_id,event_count,weighted_amount,detail_json)
+SELECT DATE(e.occurred_at),e.user_id,COUNT(*),ROUND(SUM(af_weight(e.event_kind,e.amount)),2),
+JSON_OBJECT('min',MIN(e.amount),'max',MAX(e.amount),'kinds',COUNT(DISTINCT e.event_kind))
+FROM af_event e GROUP BY DATE(e.occurred_at),e.user_id
+ON DUPLICATE KEY UPDATE event_count=VALUES(event_count),weighted_amount=VALUES(weighted_amount),detail_json=VALUES(detail_json);
+
+SET @dynamic_sql=CONCAT('CREATE TEMPORARY TABLE af_top_event AS ',
+'SELECT user_id,event_id,amount FROM (SELECT user_id,event_id,amount,',
+'ROW_NUMBER() OVER(PARTITION BY user_id ORDER BY amount DESC,event_id) AS rn FROM af_event) ranked ',
+'WHERE rn=1');
+PREPARE af_stmt FROM @dynamic_sql;
+EXECUTE af_stmt;
+DEALLOCATE PREPARE af_stmt;
+
+CALL af_assert((SELECT COUNT(*) FROM af_top_event)=3,'dynamic top-event row count');
+CALL af_assert(v_running>0,'cursor accumulator must be positive');
+COMMIT;
+END main_block$$
+
+DELIMITER ;
+
+CALL af_run_gauntlet();
+
+-- Recursive CTE + JSON_TABLE sibling NESTED PATH clauses + named windows.
+WITH RECURSIVE
+calendar(day_no,calendar_day)AS(
+SELECT 1,DATE('2026-01-01')
+UNION ALL
+SELECT day_no+1,calendar_day+INTERVAL 1 DAY FROM calendar WHERE day_no<5
+),
+node_tree(node_id,parent_node_id,node_name,depth_no,path_text)AS(
+SELECT n.node_id,n.parent_node_id,n.node_name,0,CAST(CONCAT('/',n.node_name)AS CHAR(500)) FROM af_node n WHERE n.parent_node_id IS NULL
+UNION ALL
+SELECT c.node_id,c.parent_node_id,c.node_name,p.depth_no+1,CONCAT(p.path_text,'/',c.node_name)
+FROM af_node c JOIN node_tree p ON p.node_id=c.parent_node_id WHERE p.depth_no<20
+),
+json_rows AS(
+SELECT e.event_id,e.user_id,e.node_id,e.event_kind,e.amount,e.occurred_at,j.device,j.has_debug,j.tag_ordinal,j.tag_name,j.metric_name,j.metric_value
+FROM af_event e
+JOIN JSON_TABLE(
+e.payload,
+'$' COLUMNS(
+device VARCHAR(20) PATH '$.device' NULL ON EMPTY,
+has_debug INT EXISTS PATH '$.debug',
+NESTED PATH '$.tags[*]' COLUMNS(tag_ordinal FOR ORDINALITY,tag_name VARCHAR(40) PATH '$' NULL ON EMPTY),
+NESTED PATH '$.metrics[*]' COLUMNS(metric_name VARCHAR(40) PATH '$.name' NULL ON EMPTY,metric_value DECIMAL(12,2) PATH '$.value' DEFAULT '0' ON EMPTY)
+)
+)AS j ON TRUE
+),
+daily AS(
+SELECT c.calendar_day,u.user_id,u.user_code,
+COALESCE(SUM(CASE WHEN e.event_kind='SALE' THEN e.amount WHEN e.event_kind='REFUND' THEN-e.amount ELSE 0 END),0)AS net_amount,
+COUNT(DISTINCT e.event_id)AS event_count,
+COALESCE((SELECT MAX(jr.metric_value) FROM json_rows jr WHERE jr.user_id=u.user_id AND DATE(jr.occurred_at)=c.calendar_day AND jr.metric_name='latency'),0)AS max_latency
+FROM calendar c CROSS JOIN af_user u LEFT JOIN af_event e ON e.user_id=u.user_id AND e.occurred_at>=c.calendar_day AND e.occurred_at<c.calendar_day+INTERVAL 1 DAY
+GROUP BY c.calendar_day,u.user_id,u.user_code
+),
+windowed AS(
+SELECT d.*,
+SUM(d.net_amount)OVER w_running AS running_net,
+LAG(d.net_amount,1,0)OVER w_ordered AS previous_net,
+DENSE_RANK()OVER(PARTITION BY d.calendar_day ORDER BY d.net_amount DESC)AS daily_rank,
+JSON_OBJECT('day',d.calendar_day,'net',d.net_amount,'events',d.event_count,'latency',d.max_latency)AS day_json
+FROM daily d
+WINDOW w_user AS(PARTITION BY d.user_id),
+w_ordered AS(w_user ORDER BY d.calendar_day),
+w_running AS(w_ordered ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW)
+)
+SELECT /*+ SET_VAR(sort_buffer_size=262144) */
+w.calendar_day,w.user_code,w.net_amount,w.running_net,w.previous_net,w.daily_rank,
+CASE WHEN w.net_amount>COALESCE((SELECT AVG(x.net_amount) FROM daily x WHERE x.calendar_day=w.calendar_day),0)
+THEN JSON_OBJECT('band','ABOVE_AVERAGE','data',w.day_json)
+WHEN w.event_count=0 THEN JSON_OBJECT('band','EMPTY','data',w.day_json)
+ELSE JSON_OBJECT('band','NORMAL','data',w.day_json)END AS nested_case_json,
+COALESCE((SELECT JSON_ARRAYAGG(tags.tag_name) FROM(SELECT DISTINCT jr.tag_name FROM json_rows jr WHERE jr.user_id=w.user_id AND jr.tag_name IS NOT NULL ORDER BY jr.tag_name)tags),JSON_ARRAY())AS tags_json,
+(SELECT MAX(nt.depth_no)FROM node_tree nt WHERE EXISTS(SELECT 1 FROM af_event ex WHERE ex.user_id=w.user_id AND ex.node_id=nt.node_id))AS deepest_touched_node
+FROM windowed w
+WHERE(w.event_count>0 OR EXISTS(SELECT 1 FROM af_rollup r WHERE r.user_id=w.user_id AND r.rollup_day=w.calendar_day))
+AND NOT EXISTS(SELECT 1 FROM af_error_log bad WHERE bad.phase_name='UNEXPECTED')
+ORDER BY w.calendar_day,w.daily_rank,w.user_code;
+
+-- Close/open chains, quantified predicates, correlated layers, and ROLLUP.
+SELECT q.country_code,q.event_kind,q.device_code,q.weighted_total,q.country_rank,
+JSON_OBJECT('country',q.country_code,'kind',q.event_kind,'top_user',
+(SELECT z.user_code FROM(SELECT u2.user_code,SUM(af_weight(e2.event_kind,e2.amount))AS score FROM af_user u2 JOIN af_event e2 ON e2.user_id=u2.user_id WHERE u2.country_code=q.country_code GROUP BY u2.user_code ORDER BY score DESC,u2.user_code LIMIT 1)z),
+'amounts',(SELECT JSON_ARRAYAGG(a.amount)FROM(SELECT e3.amount FROM af_event e3 JOIN af_user u3 ON u3.user_id=e3.user_id WHERE u3.country_code=q.country_code ORDER BY e3.amount DESC)a))AS country_payload
+FROM(
+SELECT u.country_code,e.event_kind,e.device_code,ROUND(SUM(af_weight(e.event_kind,e.amount)),2)AS weighted_total,
+RANK()OVER(PARTITION BY u.country_code ORDER BY SUM(af_weight(e.event_kind,e.amount))DESC)AS country_rank
+FROM af_event e JOIN af_user u ON u.user_id=e.user_id
+WHERE e.amount>=ALL(SELECT COALESCE(MIN(x.amount),0)FROM af_event x WHERE x.user_id=e.user_id GROUP BY x.user_id)
+GROUP BY u.country_code,e.event_kind,e.device_code WITH ROLLUP
+)q
+WHERE q.country_code IS NOT NULL AND q.event_kind IS NOT NULL AND q.device_code IS NOT NULL
+ORDER BY q.country_code,q.country_rank,q.event_kind;
+
+-- Set-operator precedence and parenthesized query owners (MySQL 8.0.31+).
+(
+SELECT user_id,'ACTIVE'AS source_name FROM af_event WHERE amount>0
+UNION ALL
+SELECT user_id,'ROLLED'FROM af_rollup WHERE weighted_amount<>0
+)
+INTERSECT
+(
+SELECT user_id,'ACTIVE'FROM af_user
+UNION ALL
+SELECT user_id,'ROLLED'FROM af_user
+)
+EXCEPT
+SELECT user_id,'NEVER_MATCHES'FROM af_user
+ORDER BY user_id,source_name;
+
+-- CTE-owned UPDATE/DELETE inside a rollback-only transaction.
+START TRANSACTION;
+WITH ranked AS(
+SELECT event_id,ROW_NUMBER()OVER(PARTITION BY user_id ORDER BY amount DESC,event_id)AS rn FROM af_event
+)
+UPDATE af_event e JOIN ranked r ON r.event_id=e.event_id
+SET e.payload=JSON_SET(e.payload,'$.temporary_rank',r.rn)
+WHERE r.rn<=2;
+
+WITH disposable AS(
+SELECT event_id FROM af_event WHERE amount=0 AND event_kind='VIEW'
+)
+DELETE e FROM af_event e JOIN disposable d ON d.event_id=e.event_id;
+ROLLBACK;
+
+-- Locking clause formatting; no rows remain locked after the following COMMIT.
+START TRANSACTION;
+SELECT event_id,user_id,amount FROM af_event
+WHERE event_id IN(SELECT event_id FROM af_top_event)
+ORDER BY event_id
+FOR UPDATE SKIP LOCKED;
+COMMIT;
+
+CALL af_assert((SELECT COUNT(*)FROM af_node)=5,'node count');
+CALL af_assert((SELECT COUNT(*)FROM af_user)=3,'user count');
+CALL af_assert((SELECT COUNT(*)FROM af_event)=6,'event count after rollback');
+CALL af_assert((SELECT COUNT(*)FROM af_error_log WHERE phase_name='EXPECTED_DUPLICATE')=1,'expected duplicate handler');
+CALL af_assert((SELECT COUNT(*)FROM af_error_log WHERE phase_name='UNEXPECTED')=0,'unexpected error log');
+CALL af_assert((SELECT COUNT(*)FROM af_rollup)=4,'rollup group count');
+
+SELECT 'PASS'AS status,
+(SELECT COUNT(*)FROM af_event)AS event_rows,
+(SELECT COUNT(*)FROM af_rollup)AS rollup_rows,
+(SELECT MAX(depth_no)FROM(
+WITH RECURSIVE tree(node_id,depth_no)AS(
+SELECT node_id,0 FROM af_node WHERE parent_node_id IS NULL
+UNION ALL
+SELECT n.node_id,t.depth_no+1 FROM af_node n JOIN tree t ON t.node_id=n.parent_node_id
+)
+SELECT depth_no FROM tree
+)depths)AS max_tree_depth,
+JSON_OBJECT('delimiter_trap',@delimiter_trap,'version_gate',@version_gate,'errors',(SELECT COUNT(*)FROM af_error_log))AS evidence;
