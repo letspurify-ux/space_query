@@ -545,6 +545,69 @@ fn token_is_word(token: &SqlToken, keyword: &str) -> bool {
     matches!(token, SqlToken::Word(word) if word.eq_ignore_ascii_case(keyword))
 }
 
+/// Returns whether a top-level comma follows a complete Oracle recursive-CTE
+/// `SEARCH` or `CYCLE` option. Commas inside `SEARCH ... BY a, b` and
+/// `CYCLE a, b SET ...` are intentionally rejected until the generated-column
+/// tail is complete.
+fn recursive_cte_option_is_complete_before_separator(
+    tokens: &[SqlToken],
+    separator_idx: usize,
+) -> bool {
+    let prefix = tokens.get(..separator_idx).unwrap_or(tokens);
+    let option_tail_start = prefix
+        .iter()
+        .rposition(|token| matches!(token, SqlToken::Symbol(symbol) if symbol == ")"))
+        .map_or(0, |idx| idx + 1);
+    let option_tail = prefix
+        .get(option_tail_start..)
+        .unwrap_or_default()
+        .iter()
+        .filter(|token| !matches!(token, SqlToken::Comment(_)))
+        .collect::<Vec<_>>();
+
+    let Some((option_idx, option_kind)) =
+        option_tail
+            .iter()
+            .enumerate()
+            .rev()
+            .find_map(|(idx, token)| {
+                if token_is_word(token, "CYCLE") {
+                    Some((idx, "CYCLE"))
+                } else if token_is_word(token, "SEARCH") {
+                    Some((idx, "SEARCH"))
+                } else {
+                    None
+                }
+            })
+    else {
+        return false;
+    };
+
+    let word_position_after = |keyword: &str, after: usize| {
+        option_tail
+            .iter()
+            .enumerate()
+            .skip(after.saturating_add(1))
+            .find_map(|(idx, token)| token_is_word(token, keyword).then_some(idx))
+    };
+
+    if option_kind == "SEARCH" {
+        return word_position_after("SET", option_idx)
+            .is_some_and(|set_idx| option_tail.get(set_idx.saturating_add(1)).is_some());
+    }
+
+    let Some(set_idx) = word_position_after("SET", option_idx) else {
+        return false;
+    };
+    let Some(to_idx) = word_position_after("TO", set_idx) else {
+        return false;
+    };
+    let Some(default_idx) = word_position_after("DEFAULT", to_idx) else {
+        return false;
+    };
+    option_tail.get(default_idx.saturating_add(1)).is_some()
+}
+
 fn token_is_symbol(token: &SqlToken, symbol: &str) -> bool {
     matches!(token, SqlToken::Symbol(sym) if sym == symbol)
 }
@@ -3268,12 +3331,13 @@ fn scan_cursor_context(tokens: &[SqlToken], cursor_token_len: usize) -> CursorSc
                     depth_frames[depth].phase = SqlPhase::IntoClause;
                     relation_state.expect_table();
                 }
-                let after_mariadb_cycle_restrict =
-                    matches!(current_phase, SqlPhase::RecursiveCteColumnList)
-                        && last_word.as_deref() == Some("RESTRICT");
+                let after_recursive_cte_option = matches!(
+                    current_phase,
+                    SqlPhase::RecursiveCteColumnList | SqlPhase::RecursiveCteGeneratedColumnName
+                ) && (last_word.as_deref() == Some("RESTRICT")
+                    || recursive_cte_option_is_complete_before_separator(tokens, idx));
                 if matches!(cte_state, CteState::Inactive)
-                    && (matches!(current_phase, SqlPhase::WithClause)
-                        || after_mariadb_cycle_restrict)
+                    && (matches!(current_phase, SqlPhase::WithClause) || after_recursive_cte_option)
                 {
                     depth_frames[depth].phase = SqlPhase::WithClause;
                     cte_state = CteState::ExpectName;

@@ -6252,6 +6252,45 @@ fn recursive_cte_cycle_keyword_is_not_parsed_as_alias_without_explicit_alias() {
 }
 
 #[test]
+fn oracle_recursive_cte_search_and_cycle_tails_keep_following_cte_visible() {
+    for sql in [
+        "WITH t(n) AS (SELECT 1 FROM dual UNION ALL SELECT n + 1 FROM t WHERE n < 3) \
+         CYCLE n SET cycle_yn TO 'Y' DEFAULT 'N', \
+         later(id, value_col) AS (SELECT n, n * 2 FROM t) \
+         SELECT l.| FROM later l",
+        "WITH t(n) AS (SELECT 1 FROM dual UNION ALL SELECT n + 1 FROM t WHERE n < 3) \
+         SEARCH DEPTH FIRST BY n SET search_order, \
+         later(id, value_col) AS (SELECT n, n * 2 FROM t) \
+         SELECT l.| FROM later l",
+    ] {
+        let ctx = analyze(sql);
+        assert!(
+            has_name(&cte_names(&ctx), "LATER"),
+            "CTEs: {:?}",
+            cte_names(&ctx)
+        );
+        let later = ctx
+            .ctes
+            .iter()
+            .find(|cte| cte.name.eq_ignore_ascii_case("later"))
+            .expect("following CTE must remain visible after Oracle SEARCH/CYCLE tail");
+        assert_eq!(later.explicit_columns, vec!["id", "value_col"]);
+    }
+}
+
+#[test]
+fn oracle_recursive_cte_option_internal_commas_do_not_start_a_new_cte() {
+    for sql in [
+        "WITH t(a, b) AS (SELECT 1, 2 FROM dual) CYCLE a, | b SET cycle_yn TO 'Y' DEFAULT 'N' SELECT * FROM t",
+        "WITH t(a, b) AS (SELECT 1, 2 FROM dual) SEARCH DEPTH FIRST BY a, | b SET search_order SELECT * FROM t",
+    ] {
+        let ctx = analyze(sql);
+        assert_eq!(ctx.phase, SqlPhase::RecursiveCteColumnList, "SQL: {sql}");
+        assert_eq!(cte_names(&ctx), vec!["T"], "SQL: {sql}");
+    }
+}
+
+#[test]
 fn with_plsql_function_declaration_is_not_parsed_as_cte() {
     let ctx = analyze("WITH FUNCTION f RETURN NUMBER IS BEGIN RETURN 1; END; SELECT | FROM dual");
 

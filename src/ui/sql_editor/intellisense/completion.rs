@@ -6076,6 +6076,27 @@ impl SqlEditorWidget {
                     matches!(token, SqlToken::Word(word) if word.eq_ignore_ascii_case(keyword))
                 })
         };
+        // Prefer suffix-anchored exact keywords before broader prefix matches
+        // such as `ON` for `ONE` and `INTO` for `IS`.
+        if matches_prefix("ONE")
+            && full_has("MATCH_RECOGNIZE")
+            && Self::current_meaningful_word_is_followed_by_word(
+                statement_tokens,
+                full_end,
+                &["ROW"],
+            )
+        {
+            return Some("ONE".to_string());
+        }
+        if matches_prefix("IS")
+            && Self::current_meaningful_word_is_followed_by_word(
+                statement_tokens,
+                full_end,
+                &["NOT", "NULL", "TRUE", "FALSE", "UNKNOWN", "A"],
+            )
+        {
+            return Some("IS".to_string());
+        }
         let in_compound_trigger = (full_has("COMPOUND") && full_has("TRIGGER"))
             || (matches_prefix("COMPOUND")
                 && next_word == Some("TRIGGER")
@@ -6514,6 +6535,12 @@ impl SqlEditorWidget {
         if matches_prefix("WITH") && full_previous_word.as_deref() == Some("START") {
             return Some("WITH".to_string());
         }
+        if matches_prefix("UNION") && next_word == Some("ALL") {
+            return Some("UNION".to_string());
+        }
+        if matches_prefix("CROSS") && matches!(next_word, Some("JOIN" | "APPLY")) {
+            return Some("CROSS".to_string());
+        }
         if matches_prefix("BY")
             && matches!(
                 full_previous_word.as_deref(),
@@ -6557,9 +6584,19 @@ impl SqlEditorWidget {
                 full_end,
                 &["APPLY"],
             )
-            && deep_ctx.phase.is_table_context()
+            && (deep_ctx.phase.is_table_context() || query_has("FROM"))
         {
             return Some("OUTER APPLY".to_string());
+        }
+        if matches_prefix("APPLY")
+            && full_previous_word.as_deref() == Some("OUTER")
+            && Self::current_meaningful_word_is_followed_by_symbol(
+                statement_tokens,
+                full_end,
+                "(",
+            )
+        {
+            return Some("APPLY".to_string());
         }
         if matches_prefix("JOIN")
             && deep_ctx.phase.is_table_context()
@@ -6603,15 +6640,12 @@ impl SqlEditorWidget {
             return Some("MODEL".to_string());
         }
 
-        let in_match_recognize = Self::table_clause_construct_is_open(
-            statement_tokens,
-            full_end,
-            "MATCH_RECOGNIZE",
-        ) && Self::table_clause_construct_has_table_source_anchor(
-            statement_tokens,
-            full_end,
-            "MATCH_RECOGNIZE",
-        );
+        let in_match_recognize = in_match_recognize_clause
+            && Self::table_clause_construct_is_open(
+                statement_tokens,
+                full_end,
+                "MATCH_RECOGNIZE",
+            );
         if in_match_recognize {
             if matches_prefix("PARTITION BY")
                 && Self::current_meaningful_word_is_followed_by_word(
@@ -6643,7 +6677,48 @@ impl SqlEditorWidget {
             {
                 return Some("LAST".to_string());
             }
+            if matches_prefix("ONE")
+                && Self::current_meaningful_word_is_followed_by_word(
+                    statement_tokens,
+                    full_end,
+                    &["ROW"],
+                )
+            {
+                return Some("ONE".to_string());
+            }
             if matches_prefix("ROW") && full_previous_word.as_deref() == Some("ONE") {
+                return Some("ROW".to_string());
+            }
+            if matches_prefix("AFTER") && next_word == Some("MATCH") {
+                return Some("AFTER".to_string());
+            }
+            if matches_prefix("MATCH")
+                && full_previous_word.as_deref() == Some("AFTER")
+                && next_word == Some("SKIP")
+            {
+                return Some("MATCH".to_string());
+            }
+            if matches_prefix("SKIP")
+                && full_previous_word.as_deref() == Some("MATCH")
+                && matches!(next_word, Some("PAST" | "TO"))
+            {
+                return Some("SKIP".to_string());
+            }
+            if matches_prefix("PAST")
+                && full_previous_word.as_deref() == Some("SKIP")
+                && next_word == Some("LAST")
+            {
+                return Some("PAST".to_string());
+            }
+            if matches_prefix("LAST")
+                && full_previous_word.as_deref() == Some("PAST")
+                && next_word == Some("ROW")
+            {
+                return Some("LAST".to_string());
+            }
+            if matches_prefix("ROW")
+                && matches!(full_previous_word.as_deref(), Some("LAST" | "NEXT"))
+            {
                 return Some("ROW".to_string());
             }
             if matches_prefix("PER") && full_previous_word.as_deref() == Some("ROW") {
@@ -6690,6 +6765,34 @@ impl SqlEditorWidget {
             )
         {
             return Some("NESTED".to_string());
+        }
+        if matches_prefix("CONTENT")
+            && Self::innermost_open_paren_preceding_word(statement_tokens, full_end)
+                .is_some_and(|word| word.eq_ignore_ascii_case("XMLSERIALIZE"))
+        {
+            return Some("CONTENT".to_string());
+        }
+        if matches_prefix("VALUE")
+            && matches!(full_previous_token, Some(SqlToken::String(_)))
+            && full_has("JSON_OBJECT")
+        {
+            return Some("VALUE".to_string());
+        }
+        if matches_prefix("FORMAT")
+            && full_has("JSON_OBJECT")
+            && Self::current_meaningful_word_is_followed_by_word(
+                statement_tokens,
+                full_end,
+                &["JSON"],
+            )
+        {
+            return Some("FORMAT".to_string());
+        }
+        if matches_prefix("AS")
+            && matches!(deep_ctx.phase, intellisense_context::SqlPhase::SelectList)
+            && Self::next_meaningful_word_after(statement_tokens, full_end).is_some()
+        {
+            return Some("AS".to_string());
         }
 
         if matches_prefix("SELECT")
@@ -7410,6 +7513,40 @@ impl SqlEditorWidget {
         {
             return Some("WITH".to_string());
         }
+        if matches_prefix("NESTED")
+            && full_has("JSON_TABLE")
+            && full_has("COLUMNS")
+            && Self::current_meaningful_word_is_followed_by_word(
+                statement_tokens,
+                full_end,
+                &["PATH"],
+            )
+        {
+            return Some("NESTED".to_string());
+        }
+        if matches_prefix("WITH")
+            && matches!(deep_ctx.phase, intellisense_context::SqlPhase::GroupByClause)
+            && following_words.first().is_some_and(|word| word == "ROLLUP")
+        {
+            return Some("WITH".to_string());
+        }
+        if !mariadb
+            && matches_prefix("LATERAL")
+            && Self::current_meaningful_word_is_followed_by_symbol(
+                statement_tokens,
+                full_end,
+                "(",
+            )
+        {
+            return Some("LATERAL".to_string());
+        }
+        if matches_prefix("IS")
+            && following_words
+                .first()
+                .is_some_and(|word| matches!(word.as_str(), "NOT" | "NULL" | "TRUE" | "FALSE"))
+        {
+            return Some("IS".to_string());
+        }
 
         if mariadb {
             let handler_for_has_condition = statement_words
@@ -7529,12 +7666,6 @@ impl SqlEditorWidget {
             {
                 return Some("FETCH".to_string());
             }
-            if matches_prefix("WITH")
-                && matches!(deep_ctx.phase, intellisense_context::SqlPhase::GroupByClause)
-                && following_words.first().is_some_and(|word| word == "ROLLUP")
-            {
-                return Some("WITH".to_string());
-            }
             if matches_prefix("YEAR") && recent_full_has("INTERVAL", 4) {
                 return Some("YEAR".to_string());
             }
@@ -7622,12 +7753,6 @@ impl SqlEditorWidget {
             }
             if matches_prefix("RESTRICT") && statement_has("CYCLE") {
                 return Some("RESTRICT".to_string());
-            }
-            if matches_prefix("NESTED")
-                && statement_has("JSON_TABLE")
-                && statement_has("COLUMNS")
-            {
-                return Some("NESTED".to_string());
             }
             if matches_prefix("GROUP") && matches!(last, Some("WITHIN")) {
                 return Some("GROUP".to_string());

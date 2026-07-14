@@ -1,0 +1,198 @@
+-- ==========================================================================
+-- SPACE QUERY MYSQL SINGLE-STATEMENT FORMATTER FINAL BOSS IV
+-- Target: MySQL 8.0.31+ (live-certified on MySQL 8.0.46)
+-- One repeatable statement: recursive CTEs, JSON_TABLE, LATERAL, set operators,
+-- ROLLUP/GROUPING, named windows, correlated aggregates, and deep JSON frames.
+-- ==========================================================================
+WITH RECURSIVE
+params AS(
+SELECT DATE'2026-02-01'AS start_day,6 AS day_count
+),
+customers(customer_id,parent_customer_id,customer_name,segment_code,active_flag)AS(
+SELECT 1,NULL,'Aurora Market','ENTERPRISE',TRUE UNION ALL
+SELECT 2,1,'Bluebird Shop','GROWTH',TRUE UNION ALL
+SELECT 3,1,'Cobalt Studio','GROWTH',TRUE UNION ALL
+SELECT 4,2,'Dormant Outlet','STARTER',FALSE
+),
+category_seed(category_id,parent_category_id,category_name)AS(
+SELECT 10,NULL,'CATALOG'UNION ALL
+SELECT 20,10,'HARDWARE'UNION ALL
+SELECT 30,10,'SOFTWARE'UNION ALL
+SELECT 40,10,'SERVICE'UNION ALL
+SELECT 41,40,'SUPPORT'
+),
+category_tree(category_id,parent_category_id,category_path,tree_depth)AS(
+SELECT category_id,parent_category_id,CAST(category_name AS CHAR(200)),0
+FROM category_seed WHERE parent_category_id IS NULL
+UNION ALL
+SELECT s.category_id,s.parent_category_id,CONCAT(t.category_path,' / ',s.category_name),t.tree_depth+1
+FROM category_seed s JOIN category_tree t ON t.category_id=s.parent_category_id
+),
+orders(order_id,customer_id,order_day,order_status,payload)AS(
+SELECT 101,1,DATE'2026-02-01','PAID',JSON_OBJECT('channel','web','items',JSON_ARRAY(
+JSON_OBJECT('sku','A-RED','category','HARDWARE','qty',2,'price',25,'discount',0,'tags',JSON_ARRAY('priority','red')),
+JSON_OBJECT('sku','B-BLUE','category','SERVICE','qty',1,'price',70,'discount',0,'tags',JSON_ARRAY('install'))
+))UNION ALL
+SELECT 102,1,DATE'2026-02-03','PENDING',JSON_OBJECT('channel','partner','items',JSON_ARRAY(
+JSON_OBJECT('sku','C-GREEN','category','SOFTWARE','qty',1,'price',20,'discount',0,'tags',JSON_ARRAY('trial')),
+JSON_OBJECT('sku','D-GOLD','category','SERVICE','qty',1,'price',40,'discount',0,'tags',JSON_ARRAY('renewal','gold'))
+))UNION ALL
+SELECT 201,2,DATE'2026-02-02','PAID',JSON_OBJECT('channel','store','items',JSON_ARRAY(
+JSON_OBJECT('sku','E-WHITE','category','HARDWARE','qty',2,'price',50,'discount',0,'tags',JSON_ARRAY('bundle')),
+JSON_OBJECT('sku','F-BLACK','category','SOFTWARE','qty',1,'price',50,'discount',0,'tags',JSON_ARRAY('license'))
+))UNION ALL
+SELECT 202,2,DATE'2026-02-04','REFUNDED',JSON_OBJECT('channel','web','items',JSON_ARRAY(
+JSON_OBJECT('sku','G-SILVER','category','SERVICE','qty',1,'price',35,'discount',0,'tags',JSON_ARRAY('refund'))
+))UNION ALL
+SELECT 301,3,DATE'2026-02-02','PAID',JSON_OBJECT('channel','direct','items',JSON_ARRAY(
+JSON_OBJECT('sku','H-ORANGE','category','HARDWARE','qty',3,'price',40,'discount',0,'tags',JSON_ARRAY('bulk','orange')),
+JSON_OBJECT('sku','I-PURPLE','category','SOFTWARE','qty',2,'price',40,'discount',0,'tags',JSON_ARRAY('analytics'))
+))UNION ALL
+SELECT 302,3,DATE'2026-02-05','PAID',JSON_OBJECT('channel','partner','items',JSON_ARRAY(
+JSON_OBJECT('sku','J-CYAN','category','SERVICE','qty',1,'price',50,'discount',0,'tags',JSON_ARRAY('support')),
+JSON_OBJECT('sku','K-LIME','category','SOFTWARE','qty',1,'price',30,'discount',0,'tags',JSON_ARRAY('addon','lime'))
+))
+),
+days(day_no,day_value)AS(
+SELECT 0,start_day FROM params
+UNION ALL
+SELECT day_no+1,day_value+INTERVAL 1 DAY
+FROM days JOIN params ON TRUE
+WHERE day_no+1<day_count
+),
+line_items AS(
+SELECT o.order_id,o.customer_id,o.order_day,o.order_status,
+j.line_no,j.sku,j.category_code,j.qty,j.unit_price,j.discount_rate,
+ROUND(j.qty*j.unit_price*(1-j.discount_rate),2)AS net_amount
+FROM orders o
+JOIN JSON_TABLE(
+o.payload,'$.items[*]'
+COLUMNS(
+line_no FOR ORDINALITY,
+sku VARCHAR(30)PATH'$.sku',
+category_code VARCHAR(30)PATH'$.category',
+qty DECIMAL(10,2)PATH'$.qty',
+unit_price DECIMAL(10,2)PATH'$.price',
+discount_rate DECIMAL(10,4)PATH'$.discount'
+)
+)j ON TRUE
+),
+line_tags AS(
+SELECT o.order_id,o.customer_id,j.line_no,j.tag_no,j.tag_value
+FROM orders o
+JOIN JSON_TABLE(
+o.payload,'$.items[*]'
+COLUMNS(
+line_no FOR ORDINALITY,
+NESTED PATH'$.tags[*]'
+COLUMNS(tag_no FOR ORDINALITY,tag_value VARCHAR(30)PATH'$')
+)
+)j ON TRUE
+),
+order_facts AS(
+SELECT order_id,customer_id,order_day,order_status,
+SUM(net_amount)AS order_total,COUNT(*)AS line_count,
+GROUP_CONCAT(sku ORDER BY line_no SEPARATOR',')AS sku_list
+FROM line_items
+GROUP BY order_id,customer_id,order_day,order_status
+),
+windowed_orders AS(
+SELECT f.*,
+ROW_NUMBER()OVER w_amount AS amount_rank,
+SUM(f.order_total)OVER w_running AS running_total,
+LAG(f.order_total,1,0)OVER w_order AS previous_total,
+PERCENT_RANK()OVER w_amount AS amount_percent_rank
+FROM order_facts f
+WINDOW
+w_order AS(PARTITION BY customer_id ORDER BY order_day,order_id),
+w_amount AS(PARTITION BY customer_id ORDER BY order_total DESC,order_id),
+w_running AS(PARTITION BY customer_id ORDER BY order_day,order_id ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW)
+),
+daily AS(
+SELECT c.customer_id,d.day_value,COALESCE(SUM(f.order_total),0)AS day_amount,COUNT(f.order_id)AS order_count
+FROM customers c CROSS JOIN days d
+LEFT JOIN order_facts f ON f.customer_id=c.customer_id AND f.order_day=d.day_value
+GROUP BY c.customer_id,d.day_value
+),
+daily_windows AS(
+SELECT d.*,
+SUM(day_amount)OVER(PARTITION BY customer_id ORDER BY day_value ROWS BETWEEN 2 PRECEDING AND CURRENT ROW)AS rolling_three_day,
+LAG(day_amount,1,0)OVER(PARTITION BY customer_id ORDER BY day_value)AS previous_day_amount
+FROM daily d
+),
+rollup_rows AS(
+SELECT customer_id,category_code,SUM(net_amount)AS category_amount,
+GROUPING(customer_id)AS customer_grouped,GROUPING(category_code)AS category_grouped
+FROM line_items
+GROUP BY customer_id,category_code WITH ROLLUP
+),
+customer_rollup AS(
+SELECT customer_id,COUNT(DISTINCT order_id)AS order_count,COUNT(*)AS line_count,
+SUM(net_amount)AS gross_amount,ROUND(AVG(net_amount),2)AS average_line_amount,
+JSON_ARRAYAGG(sku)AS sku_json
+FROM line_items
+GROUP BY customer_id
+),
+eligible(customer_id)AS(
+(SELECT customer_id FROM customers WHERE active_flag=TRUE)
+INTERSECT
+(SELECT customer_id FROM order_facts WHERE order_status='PAID')
+EXCEPT
+(SELECT customer_id FROM order_facts WHERE order_total<0)
+),
+final_rows AS(
+SELECT c.customer_id,c.customer_name,c.segment_code,c.active_flag,
+COALESCE(r.order_count,0)AS order_count,COALESCE(r.line_count,0)AS line_count,
+COALESCE(r.gross_amount,0)AS gross_amount,COALESCE(r.average_line_amount,0)AS average_line_amount,
+r.sku_json,CASE WHEN e.customer_id IS NULL THEN'INELIGIBLE'ELSE'ELIGIBLE'END AS eligibility,
+top_line.sku AS top_sku,top_line.net_amount AS top_amount,
+(SELECT JSON_ARRAYAGG(lt.tag_value)FROM line_tags lt WHERE lt.customer_id=c.customer_id)AS tag_json,
+(SELECT MAX(ct.category_path)FROM category_tree ct JOIN line_items li ON li.category_code=SUBSTRING_INDEX(ct.category_path,' / ',-1)WHERE li.customer_id=c.customer_id)AS deepest_category_path,
+(SELECT MAX(dw.rolling_three_day)FROM daily_windows dw WHERE dw.customer_id=c.customer_id)AS peak_three_day
+FROM customers c
+LEFT JOIN customer_rollup r ON r.customer_id=c.customer_id
+LEFT JOIN eligible e ON e.customer_id=c.customer_id
+LEFT JOIN LATERAL(
+SELECT li.sku,li.net_amount
+FROM line_items li
+WHERE li.customer_id=c.customer_id
+ORDER BY li.net_amount DESC,li.order_id,li.line_no
+LIMIT 1
+)AS top_line ON TRUE
+)
+SELECT
+CASE
+WHEN(SELECT COUNT(*)FROM orders)=6
+AND(SELECT COUNT(*)FROM line_items)=11
+AND(SELECT SUM(order_total)FROM order_facts)=645
+AND(SELECT COUNT(*)FROM eligible)=3
+AND(SELECT COUNT(*)FROM category_tree)=5
+AND(SELECT COUNT(*)FROM rollup_rows WHERE customer_grouped=1 AND category_grouped=1)=1
+THEN'PASS'ELSE'FAIL'END AS status,
+f.customer_id,f.customer_name,f.segment_code,f.active_flag,
+f.order_count,f.line_count,f.gross_amount,f.average_line_amount,
+f.eligibility,f.top_sku,f.top_amount,f.deepest_category_path,f.peak_three_day,
+JSON_OBJECT(
+'skus',f.sku_json,
+'tags',f.tag_json,
+'top',JSON_OBJECT('sku',f.top_sku,'amount',f.top_amount),
+'totals',JSON_OBJECT(
+'gross',f.gross_amount,
+'all_customers',(SELECT SUM(category_amount)FROM rollup_rows WHERE customer_grouped=1 AND category_grouped=1),
+'customer_categories',(SELECT JSON_OBJECTAGG(category_code,category_amount)FROM rollup_rows rr WHERE rr.customer_id=f.customer_id AND rr.category_grouped=0)
+)
+)AS evidence
+FROM final_rows f
+ORDER BY f.customer_id;
+
+
+-- =========================================================
+-- IntelliSense sweep report generated by intellisense sweep
+-- source: test_mysql/test7.txt
+-- db: MySQL
+-- metadata: test_mysql/test7.txt inferred catalog
+-- checked: 530
+-- missing: 0
+-- marker: [[word]] means not suggested for the tested prefix
+-- missing tokens: none
+-- =========================================================

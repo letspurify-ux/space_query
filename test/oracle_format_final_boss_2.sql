@@ -1,0 +1,209 @@
+--------------------------------------------------------------------------------
+-- SPACE QUERY ORACLE SINGLE-STATEMENT FORMATTER FINAL BOSS II
+-- Target: Oracle Database 19c+ (live-certified on Oracle Database Free 26ai)
+--
+-- One repeatable, side-effect-free statement covering recursive subquery
+-- factoring, hierarchy traversal, JSON_TABLE (including NESTED PATH), APPLY,
+-- MATCH_RECOGNIZE, PIVOT, set operators, analytics, ordered aggregates,
+-- correlated scalar subqueries, XML/JSON construction, and deep frame recovery.
+--------------------------------------------------------------------------------
+WITH
+params AS(
+SELECT DATE'2026-01-01'AS start_day,6 AS day_count FROM dual
+),
+customers(customer_id,parent_customer_id,customer_name,segment_code,active_yn)AS(
+SELECT 1,NULL,'Aurora Holdings','ENTERPRISE','Y'FROM dual UNION ALL
+SELECT 2,1,'Bluebird Retail','GROWTH','Y'FROM dual UNION ALL
+SELECT 3,1,'Cobalt Labs','GROWTH','Y'FROM dual UNION ALL
+SELECT 4,2,'Dormant Corner','STARTER','N'FROM dual
+),
+orders(order_id,customer_id,order_day,order_status,declared_total,payload)AS(
+SELECT 101,1,DATE'2026-01-01','PAID',120,
+q'~{"channel":"web","items":[{"sku":"A-RED","category":"HARDWARE","qty":2,"price":25,"discount":0,"tags":["priority","red"]},{"sku":"B-BLUE","category":"SERVICE","qty":1,"price":70,"discount":0,"tags":["install"]}]}~'FROM dual UNION ALL
+SELECT 102,1,DATE'2026-01-03','PENDING',60,
+q'~{"channel":"partner","items":[{"sku":"C-GREEN","category":"SOFTWARE","qty":1,"price":20,"discount":0,"tags":["trial"]},{"sku":"D-GOLD","category":"SERVICE","qty":1,"price":40,"discount":0,"tags":["renewal","gold"]}]}~'FROM dual UNION ALL
+SELECT 201,2,DATE'2026-01-02','PAID',150,
+q'~{"channel":"store","items":[{"sku":"E-WHITE","category":"HARDWARE","qty":2,"price":50,"discount":0,"tags":["bundle"]},{"sku":"F-BLACK","category":"SOFTWARE","qty":1,"price":50,"discount":0,"tags":["license"]}]}~'FROM dual UNION ALL
+SELECT 202,2,DATE'2026-01-04','REFUNDED',35,
+q'~{"channel":"web","items":[{"sku":"G-SILVER","category":"SERVICE","qty":1,"price":35,"discount":0,"tags":["refund"]}]}~'FROM dual UNION ALL
+SELECT 301,3,DATE'2026-01-02','PAID',200,
+q'~{"channel":"direct","items":[{"sku":"H-ORANGE","category":"HARDWARE","qty":3,"price":40,"discount":0,"tags":["bulk","orange"]},{"sku":"I-PURPLE","category":"SOFTWARE","qty":2,"price":40,"discount":0,"tags":["analytics"]}]}~'FROM dual UNION ALL
+SELECT 302,3,DATE'2026-01-05','PAID',80,
+q'~{"channel":"partner","items":[{"sku":"J-CYAN","category":"SERVICE","qty":1,"price":50,"discount":0,"tags":["support"]},{"sku":"K-LIME","category":"SOFTWARE","qty":1,"price":30,"discount":0,"tags":["addon","lime"]}]}~'FROM dual
+),
+days(day_no,day_value)AS(
+SELECT 0,p.start_day FROM params p
+UNION ALL
+SELECT d.day_no+1,d.day_value+1
+FROM days d CROSS JOIN params p
+WHERE d.day_no+1<p.day_count
+)
+CYCLE day_no SET cycle_yn TO'Y'DEFAULT'N',
+customer_tree(customer_id,parent_customer_id,customer_name,segment_code,tree_depth,is_leaf,customer_path)AS(
+SELECT c.customer_id,c.parent_customer_id,c.customer_name,c.segment_code,
+LEVEL AS tree_depth,CONNECT_BY_ISLEAF AS is_leaf,
+SYS_CONNECT_BY_PATH(c.customer_name,' / ')AS customer_path
+FROM customers c
+START WITH c.parent_customer_id IS NULL
+CONNECT BY NOCYCLE PRIOR c.customer_id=c.parent_customer_id
+),
+line_items(order_id,customer_id,order_day,order_status,declared_total,line_no,sku,category_code,qty,unit_price,discount_rate,net_amount)AS(
+SELECT o.order_id,o.customer_id,o.order_day,o.order_status,o.declared_total,
+jt.line_no,jt.sku,jt.category_code,jt.qty,jt.unit_price,jt.discount_rate,
+ROUND(jt.qty*jt.unit_price*(1-NVL(jt.discount_rate,0)),2)AS net_amount
+FROM orders o
+CROSS APPLY JSON_TABLE(
+o.payload,'$.items[*]'
+COLUMNS(
+line_no FOR ORDINALITY,
+sku VARCHAR2(30)PATH'$.sku',
+category_code VARCHAR2(30)PATH'$.category',
+qty NUMBER PATH'$.qty',
+unit_price NUMBER PATH'$.price',
+discount_rate NUMBER PATH'$.discount'DEFAULT 0 ON ERROR
+)
+)jt
+),
+line_tags(order_id,customer_id,line_no,tag_no,tag_value)AS(
+SELECT o.order_id,o.customer_id,j.line_no,j.tag_no,j.tag_value
+FROM orders o
+CROSS APPLY JSON_TABLE(
+o.payload,'$.items[*]'
+COLUMNS(
+line_no FOR ORDINALITY,
+NESTED PATH'$.tags[*]'
+COLUMNS(
+tag_no FOR ORDINALITY,
+tag_value VARCHAR2(30)PATH'$'
+)
+)
+)j
+),
+order_facts(order_id,customer_id,order_day,order_status,order_total,line_count,sku_list)AS(
+SELECT li.order_id,li.customer_id,li.order_day,li.order_status,
+SUM(li.net_amount)AS order_total,COUNT(*)AS line_count,
+LISTAGG(li.sku,',')WITHIN GROUP(ORDER BY li.line_no)AS sku_list
+FROM line_items li
+GROUP BY li.order_id,li.customer_id,li.order_day,li.order_status
+),
+ranked_orders(order_id,customer_id,order_day,order_status,order_total,line_count,sku_list,amount_rank,running_total,previous_total,order_ratio)AS(
+SELECT f.*,
+ROW_NUMBER()OVER(PARTITION BY f.customer_id ORDER BY f.order_total DESC,f.order_id)AS amount_rank,
+SUM(f.order_total)OVER(PARTITION BY f.customer_id ORDER BY f.order_day,f.order_id ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW)AS running_total,
+LAG(f.order_total,1,0)OVER(PARTITION BY f.customer_id ORDER BY f.order_day,f.order_id)AS previous_total,
+RATIO_TO_REPORT(f.order_total)OVER(PARTITION BY f.customer_id)AS order_ratio
+FROM order_facts f
+),
+daily(customer_id,day_value,day_amount,order_count)AS(
+SELECT c.customer_id,d.day_value,
+NVL(SUM(f.order_total),0)AS day_amount,
+COUNT(f.order_id)AS order_count
+FROM customers c CROSS JOIN days d
+LEFT JOIN order_facts f
+ON f.customer_id=c.customer_id
+AND f.order_day=d.day_value
+GROUP BY c.customer_id,d.day_value
+),
+streaks(customer_id,match_no,first_day,last_day,matched_days)AS(
+SELECT customer_id,match_no,first_day,last_day,matched_days
+FROM daily
+MATCH_RECOGNIZE(
+PARTITION BY customer_id
+ORDER BY day_value
+MEASURES
+MATCH_NUMBER()AS match_no,
+FIRST(seed.day_value)AS first_day,
+LAST(rise.day_value)AS last_day,
+COUNT(*)AS matched_days
+ONE ROW PER MATCH
+AFTER MATCH SKIP PAST LAST ROW
+PATTERN(seed rise*)
+DEFINE rise AS rise.day_amount>=PREV(rise.day_amount)
+)
+),
+customer_rollup(customer_id,order_count,line_count,gross_amount,average_line_amount,categories,sku_json)AS(
+SELECT li.customer_id,
+COUNT(DISTINCT li.order_id)AS order_count,
+COUNT(*)AS line_count,
+SUM(li.net_amount)AS gross_amount,
+ROUND(AVG(li.net_amount),2)AS average_line_amount,
+LISTAGG(DISTINCT li.category_code,',')WITHIN GROUP(ORDER BY li.category_code)AS categories,
+JSON_ARRAYAGG(li.sku ORDER BY li.order_id,li.line_no RETURNING CLOB)AS sku_json
+FROM line_items li
+GROUP BY li.customer_id
+),
+status_pivot(customer_id,paid,pending,refunded)AS(
+SELECT *
+FROM(
+SELECT customer_id,order_status,order_total FROM order_facts
+)
+PIVOT(
+SUM(order_total)FOR order_status IN(
+'PAID'AS paid,
+'PENDING'AS pending,
+'REFUNDED'AS refunded
+)
+)
+),
+eligible(customer_id)AS(
+SELECT customer_id FROM customer_rollup WHERE gross_amount>=100
+INTERSECT
+SELECT customer_id FROM order_facts WHERE order_status='PAID'
+MINUS
+SELECT customer_id FROM customers WHERE active_yn='N'
+),
+final_rows(customer_id,customer_name,segment_code,active_yn,tree_depth,is_leaf,customer_path,order_count,line_count,gross_amount,average_line_amount,categories,sku_json,paid_amount,pending_amount,refunded_amount,eligibility,top_sku,top_amount,nondecreasing_streaks,tag_list,customer_xml)AS(
+SELECT c.customer_id,c.customer_name,c.segment_code,c.active_yn,
+t.tree_depth,t.is_leaf,t.customer_path,
+NVL(r.order_count,0)AS order_count,NVL(r.line_count,0)AS line_count,
+NVL(r.gross_amount,0)AS gross_amount,NVL(r.average_line_amount,0)AS average_line_amount,
+r.categories,r.sku_json,
+NVL(p.paid,0)AS paid_amount,NVL(p.pending,0)AS pending_amount,NVL(p.refunded,0)AS refunded_amount,
+CASE WHEN e.customer_id IS NOT NULL THEN'ELIGIBLE'ELSE'INELIGIBLE'END AS eligibility,
+top_line.top_sku,top_line.top_amount,
+(SELECT COUNT(*)FROM streaks s WHERE s.customer_id=c.customer_id AND s.matched_days>=2)AS nondecreasing_streaks,
+(SELECT LISTAGG(lt.tag_value,',')WITHIN GROUP(ORDER BY lt.order_id,lt.line_no,lt.tag_no)FROM line_tags lt WHERE lt.customer_id=c.customer_id)AS tag_list,
+XMLSERIALIZE(CONTENT XMLELEMENT("customer",c.customer_name)AS VARCHAR2(200))AS customer_xml
+FROM customers c
+JOIN customer_tree t ON t.customer_id=c.customer_id
+LEFT JOIN customer_rollup r ON r.customer_id=c.customer_id
+LEFT JOIN status_pivot p ON p.customer_id=c.customer_id
+LEFT JOIN eligible e ON e.customer_id=c.customer_id
+OUTER APPLY(
+SELECT
+MAX(li.sku)KEEP(DENSE_RANK FIRST ORDER BY li.net_amount DESC,li.order_id,li.line_no)AS top_sku,
+MAX(li.net_amount)AS top_amount
+FROM line_items li
+WHERE li.customer_id=c.customer_id
+)top_line
+)
+SELECT
+CASE
+WHEN(SELECT COUNT(*)FROM orders)=6
+AND(SELECT COUNT(*)FROM line_items)=11
+AND(SELECT SUM(order_total)FROM order_facts)=645
+AND(SELECT COUNT(*)FROM eligible)=3
+AND(SELECT COUNT(*)FROM customer_tree)=4
+THEN'PASS'
+ELSE'FAIL'
+END AS status,
+f.customer_id,f.customer_name,f.segment_code,f.active_yn,f.tree_depth,f.is_leaf,
+f.order_count,f.line_count,f.gross_amount,f.average_line_amount,
+f.paid_amount,f.pending_amount,f.refunded_amount,f.eligibility,
+f.top_sku,f.top_amount,f.nondecreasing_streaks,f.categories,f.tag_list,
+JSON_OBJECT(
+'path'VALUE f.customer_path,
+'skus'VALUE f.sku_json FORMAT JSON,
+'xml'VALUE f.customer_xml,
+'metrics'VALUE JSON_OBJECT(
+'gross'VALUE f.gross_amount,
+'paid'VALUE f.paid_amount,
+'top'VALUE JSON_OBJECT(
+'sku'VALUE f.top_sku,
+'amount'VALUE f.top_amount
+)
+)
+RETURNING CLOB
+)AS evidence
+FROM final_rows f
+ORDER BY f.customer_id;

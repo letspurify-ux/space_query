@@ -50512,25 +50512,35 @@ fn intellisense_sweep_is_definition_slot(
             return true;
         }
     }
+    let before_upper = sql.get(..word_start).unwrap_or("").to_ascii_uppercase();
+    let statement_start = before_upper
+        .rfind(';')
+        .map_or(0, |idx| idx.saturating_add(1));
+    let statement_tail = before_upper.get(statement_start..).unwrap_or("");
+    if statement_tail.rfind("PATTERN").is_some_and(|pattern_idx| {
+        statement_tail
+            .rfind("DEFINE")
+            .is_none_or(|define_idx| pattern_idx > define_idx)
+    }) && statement_tail.matches('(').count() > statement_tail.matches(')').count()
+    {
+        return true;
+    }
     if !crate::sql_text::is_sql_keyword_for_db(&original_upper, db_type) {
-        let before_upper = sql.get(..word_start).unwrap_or("").to_ascii_uppercase();
-        let statement_start = before_upper
-            .rfind(';')
-            .map_or(0, |idx| idx.saturating_add(1));
-        let statement_tail = before_upper.get(statement_start..).unwrap_or("");
         if statement_tail.rfind("UNPIVOT").is_some()
             && statement_tail.matches('(').count() > statement_tail.matches(')').count()
         {
             return true;
         }
-        if statement_tail.rfind("PATTERN").is_some_and(|pattern_idx| {
-            statement_tail
-                .rfind("DEFINE")
-                .is_none_or(|define_idx| pattern_idx > define_idx)
-        }) && statement_tail.matches('(').count() > statement_tail.matches(')').count()
-        {
-            return true;
-        }
+    }
+    if original_word.starts_with('"')
+        && original_word.ends_with('"')
+        && SqlEditorWidget::innermost_open_paren_preceding_word(
+            &tokens_before_word,
+            tokens_before_word.len(),
+        )
+        .is_some_and(|word| word.eq_ignore_ascii_case("XMLELEMENT"))
+    {
+        return true;
     }
     if !crate::sql_text::mysql_compatibility_for_sql("", Some(db_type))
         && !crate::sql_text::is_sql_keyword_for_db(&original_upper, db_type)
@@ -51852,6 +51862,88 @@ fn mariadb_test10_words_generate_out_report() {
 #[ignore = "generates IntelliSense sweep .out report files; run explicitly when refreshing reports"]
 fn mariadb_test11_words_generate_out_report() {
     mariadb_test_words_generate_out_report("test11.txt", true);
+}
+
+#[test]
+#[ignore = "generates IntelliSense sweep reports for the three single-statement final-boss fixtures"]
+fn intellisense_sweep_generate_report_for_file_certifies_new_final_boss_queries() {
+    oracle_test_words_generate_out_report("oracle_format_final_boss_2.sql", true);
+    mysql_test_words_generate_out_report("test7.txt", true);
+    mariadb_test_words_generate_out_report("test12.txt", true);
+}
+
+#[test]
+#[ignore = "generates the Oracle final-boss II IntelliSense sweep report"]
+fn oracle_final_boss_2_words_generate_out_report() {
+    oracle_test_words_generate_out_report("oracle_format_final_boss_2.sql", true);
+}
+
+#[test]
+#[ignore = "generates the MySQL final-boss IV IntelliSense sweep report"]
+fn mysql_test7_words_generate_out_report() {
+    mysql_test_words_generate_out_report("test7.txt", true);
+}
+
+#[test]
+#[ignore = "generates the MariaDB final-boss IV IntelliSense sweep report"]
+fn mariadb_test12_words_generate_out_report() {
+    mariadb_test_words_generate_out_report("test12.txt", true);
+}
+
+#[test]
+fn final_boss_structural_keywords_use_production_completion() {
+    use crate::db::DatabaseType::{MariaDB, MySQL, Oracle};
+
+    for (db_type, sql, expected) in [
+        (
+            Oracle,
+            "WITH x AS (SELECT 1 a FROM dual UNIO| ALL SELECT 2 FROM dual) SELECT * FROM x",
+            "UNION",
+        ),
+        (
+            Oracle,
+            "SELECT * FROM (SELECT 1 customer_id, DATE '2026-01-01' day_value, 1 day_amount FROM dual) MATCH_RECOGNIZE (PARTITION BY customer_id ORDER BY day_value MEASURES COUNT(*) AS matched_days ON| ROW PER MATCH PATTERN (seed rise*) DEFINE rise AS rise.day_amount >= PREV(rise.day_amount))",
+            "ONE",
+        ),
+        (
+            Oracle,
+            "SELECT JSON_OBJECT('x' VALU| 1 RETURNING CLOB) FROM dual",
+            "VALUE",
+        ),
+        (
+            Oracle,
+            "SELECT XMLSERIALIZE(CONTEN| XMLELEMENT(\"x\", 'y') AS VARCHAR2(20)) FROM dual",
+            "CONTENT",
+        ),
+        (
+            MySQL,
+            "SELECT * FROM JSON_TABLE('[1]', '$[*]' COLUMNS(NESTE| PATH '$' COLUMNS(v INT PATH '$'))) jt",
+            "NESTED",
+        ),
+        (
+            MySQL,
+            "SELECT customer_id FROM emp GROUP BY customer_id WIT| ROLLUP",
+            "WITH",
+        ),
+        (
+            MySQL,
+            "SELECT * FROM emp e LEFT JOIN LATERA| (SELECT 1 AS x) top_line ON TRUE",
+            "LATERAL",
+        ),
+        (
+            MariaDB,
+            "SELECT CASE WHEN 1 I| NULL THEN 0 ELSE 1 END",
+            "IS",
+        ),
+    ] {
+        let suggestions = query_keyword_completion_suggestions(sql, db_type);
+        assert!(
+            suggestions
+                .iter()
+                .any(|suggestion| suggestion.eq_ignore_ascii_case(expected)),
+            "{db_type:?} `{expected}` missing for `{sql}`: {suggestions:?}"
+        );
+    }
 }
 
 #[test]

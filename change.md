@@ -2206,3 +2206,141 @@ TO-BE (수정 후 포맷 결과):
 | 포매터 수정 | `formatter.rs` 2곳 (`)` 닫힘 시 부모 body indent 기록, LOOP 줄바꿈 판정 강화) |
 | 회귀 테스트 추가 | 2건 |
 | 최종 상태 | 스윕·전체 테스트·fmt 전부 성공, 잔여 오류 0건 |
+
+# 16. 9차 검증 회차 (2026-07-15): 3개 DB 최종 보스 실실행·포맷·IntelliSense 판매 게이트
+
+## 16-1. 신규 단일 문장 fixture
+
+자동 포맷터가 단순 예제뿐 아니라 실제 판매 전 품질 게이트로 사용할 수 있도록,
+부작용 없이 반복 실행 가능한 `WITH ... SELECT` 한 문장을 DB별로 추가했다.
+
+| DB | 파일 | 원본 줄 수 | 주요 문법 |
+| --- | --- | ---: | --- |
+| Oracle | `test/oracle_format_final_boss_2.sql` | 209 | 재귀 CTE `CYCLE`, 계층 질의, `JSON_TABLE`/`NESTED PATH`, `APPLY`, `MATCH_RECOGNIZE`, `PIVOT`, 집합 연산, 분석 함수, JSON/XML 생성 |
+| MySQL | `test_mysql/test7.txt` | 186 | 재귀 CTE, `JSON_TABLE`/`NESTED PATH`, `LATERAL`, `INTERSECT`/`EXCEPT`, `WITH ROLLUP`/`GROUPING`, named window, 중첩 JSON |
+| MariaDB | `test_mariadb/test12.txt` | 174 | 재귀 CTE, `JSON_TABLE`, dynamic column, vector 함수, `PERCENTILE_DISC`, `INTERSECT ALL`/`EXCEPT ALL`, 중첩 JSON |
+
+각 쿼리는 내부 데이터 집합의 건수·합계·트리 노드·집합 연산 결과를 최종
+`CASE`에서 다시 검산한다. 성공 조건은 결과 4행의 `status`가 모두 `PASS`인
+것이며, DDL/DML이나 세션 상태 변경은 포함하지 않는다.
+
+## 16-2. 실제 DB 원본·포맷 결과 실행
+
+원본뿐 아니라 `target/format-sweep`에 생성된 `.format.out` 파일 자체(후미의
+SQL 주석 보고서 포함)를 컨테이너로 복사해 동일 엔진에서 다시 실행했다.
+
+| 엔진 | 원본 | 포맷 결과 | 판정 |
+| --- | --- | --- | --- |
+| Oracle Database Free 26ai | exit 0, `PASS` 4행 | exit 0, `PASS` 4행 | 성공 |
+| MySQL 8.0.46 | exit 0, `PASS` 4행 | exit 0, `PASS` 4행 | 성공 |
+| MariaDB 12.2.2 | exit 0, `PASS` 4행 | exit 0, `PASS` 4행 | 성공 |
+
+따라서 이번 fixture에서 자동 포맷 전후의 실행 의미와 자체 검산 결과는 같다.
+각 엔진의 원본/포맷 stdout 전체를 별도 파일로 저장해 `diff -u`한 결과도 세 DB
+모두 차이 0이었다.
+
+## 16-3. 포맷 스윕·육안 검토·결정성
+
+| 항목 | 결과 |
+| --- | --- |
+| 전체 스윕 | 56개 파일, failed_files=0 |
+| frame 검사 | checked_frames=8,103, body_items=565, closes=1,393 |
+| 전체 `.format.out` | 33,330줄 |
+| 신규 3개 결과 | 1,191줄(Oracle 394, MySQL 410, MariaDB 387), 처음부터 끝까지 육안 검토 완료 |
+| 기존 53개 결과 | 직전 전수 육안 검토 최종 스냅샷과 개별 파일 byte diff 0 |
+| 최종 재생성 결정성 | 재실행 전후 `diff -rq` 차이 0 |
+
+신규 결과에서 토큰 손실, frame 누수, 비정상 close depth, 절 경계 오인 또는
+실행 불가능한 SQL은 발견되지 않았다. 포매터 구현 자체에는 추가 결함이 없어
+이번 회차의 프로덕션 포매터 코드는 수정하지 않았다.
+
+## 16-4. IntelliSense AS-IS / TO-BE
+
+신규 파일을 실제 `intellisense_sweep_generate_report_for_file` 경로로 검사했을 때
+최초 누락은 Oracle 53개, MySQL 7개, MariaDB 2개였다. 대부분은 새 문법의 구조
+키워드였고, Oracle의 다수 누락은 아래 하나의 CTE 상태 전이 결함에서 파생됐다.
+
+### AS-IS: Oracle `CYCLE` 뒤의 다음 CTE를 잃음
+
+```sql
+WITH days (day_no, day_value) AS (
+    SELECT 0, DATE '2026-01-01' FROM dual
+)
+CYCLE day_no SET cycle_yn TO 'Y' DEFAULT 'N',
+customer_tree (customer_id) AS (
+    SELECT 1 FROM dual
+)
+SELECT t.customer_id
+FROM customer_tree t;
+```
+
+기존 단일 패스 CTE 상태기는 MariaDB의 `CYCLE ... RESTRICT,`만 다음 CTE
+구분자로 복구했다. Oracle의 `SEARCH ... SET ... ,` 또는
+`CYCLE ... SET ... TO ... DEFAULT ... ,` 뒤 쉼표는 처리하지 않아
+`customer_tree` 이후 CTE 정의와 명시적 컬럼을 전부 잃었다.
+
+### TO-BE: 완결된 재귀 CTE 옵션의 쉼표만 구분자로 인식
+
+`recursive_cte_option_is_complete_before_separator`가 다음을 구분한다.
+
+- `SEARCH ... SET generated_column`이 완결된 뒤의 쉼표
+- `CYCLE ... SET marker TO value DEFAULT value`가 완결된 뒤의 쉼표
+- `SEARCH ... BY a, b`와 `CYCLE a, b SET ...` 내부 쉼표(CTE 구분자가 아님)
+
+Oracle의 후속 CTE가 다시 scope에 등록되어 명시적 컬럼과 qualified column
+완성이 복원됐다. 내부 쉼표 오탐 방지까지 비무시 회귀 테스트로 고정했다.
+
+구조 키워드 추론도 다음 실제 구문에 맞게 보강했다.
+
+- Oracle: `UNION ALL`, `CROSS JOIN/APPLY`, `OUTER APPLY`,
+  `MATCH_RECOGNIZE`의 `ONE ROW`, `AFTER MATCH SKIP PAST LAST ROW`,
+  `XMLSERIALIZE CONTENT`, JSON `VALUE`/`FORMAT JSON`, select-list `AS`
+- MySQL/MariaDB 공통: `JSON_TABLE ... NESTED PATH`, `WITH ROLLUP`,
+  `IS [NOT] NULL/TRUE/FALSE`
+- MySQL: `LATERAL (subquery)`
+- prefix 충돌: `ONE`을 `ON`보다, `IS`를 `INTO`보다 먼저 suffix 구조로 판정
+- 스윕 분류: `PATTERN` 변수와 quoted `XMLELEMENT` 태그는 참조 키워드가 아닌
+  사용자 정의 이름 슬롯으로 제외
+
+## 16-5. 파일별 IntelliSense 인증
+
+세 보고서는 입력 파일 옆에 저장하며 누락이 있으면 테스트가 실패한다.
+
+| 보고서 | checked | missing |
+| --- | ---: | ---: |
+| `test/oracle_format_final_boss_2.sql.out` | 576 | 0 |
+| `test_mysql/test7.txt.out` | 530 | 0 |
+| `test_mariadb/test12.txt.out` | 523 | 0 |
+
+개별 ignored 테스트 3개와 통합 테스트
+`intellisense_sweep_generate_report_for_file_certifies_new_final_boss_queries`를 추가했다.
+통합 테스트는 세 파일 모두에 `fail_on_missing=true`를 전달하며 최종 실행에서
+1건 통과, 실패 0이었다. 대표 구조 키워드 8종은 별도 비무시 테스트
+`final_boss_structural_keywords_use_production_completion`으로도 고정했다.
+
+## 16-6. 최종 회귀 결과
+
+| 검증 | 결과 |
+| --- | --- |
+| `cargo check --lib` | 통과 |
+| Oracle 재귀 CTE 경계 회귀 | 2 통과, 실패 0 |
+| 신규 구조 키워드 production completion 회귀 | 1 통과(8 case), 실패 0 |
+| `cargo test --lib format_frame_stack -- --nocapture` | 33 통과, 실패 0 |
+| `cargo test --lib sql_format_ -- --nocapture` | 8 통과, 실패 0 |
+| 통합 IntelliSense 파일 스윕 | 1 통과, Oracle/MySQL/MariaDB 모두 missing 0 |
+| 전체 포맷 스윕 | 1 통과, 56개 파일·failed_files=0 |
+| `cargo test --lib -- --test-threads=1` 최종 재실행 | 6,474 통과, 실패 0, ignored 222 |
+| `cargo fmt -- --check` | 통과 |
+
+병렬 전체 실행에서는 기존 비동기 wildcard 테스트 1건이 스케줄링 부하에 따라
+간헐적으로 `Timeout`을 냈다. 해당 테스트 단독 실행은 0.05초에 통과했고 병렬
+전체 재실행도 한 차례 실패 0으로 통과했다. 최종 판정은 스케줄링 영향을 제거한
+단일 테스트 스레드로 전체 6,696개를 다시 실행해 실패 0을 확인했다.
+
+## 16-7. 결론
+
+세 DB의 새 최종 보스 쿼리는 원본·자동 포맷 결과 모두 실제 엔진에서 실행되며,
+자체 검산 4행이 모두 `PASS`다. 56개 전체 포맷 스윕, 신규 결과 육안 검토,
+결정성 비교, 파일별 IntelliSense 전수 검사, 전체 Rust 회귀를 모두 통과했다.
+이번 회차에서 발견된 IntelliSense scope/구조 키워드 결함은 회귀 테스트와 함께
+수정됐고, 포매터의 잔여 오류는 발견되지 않았다.
