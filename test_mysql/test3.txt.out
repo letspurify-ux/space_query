@@ -1141,7 +1141,7 @@ ORDER BY audit_id;
 -- source: test_mysql/test3.txt
 -- db: MySQL
 -- metadata: test_mysql/test3.txt inferred catalog
--- checked: 1058
+-- checked: 1063
 -- missing: 0
 -- marker: [[word]] means not suggested for the tested prefix
 -- missing tokens: none

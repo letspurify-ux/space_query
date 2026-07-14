@@ -370,7 +370,7 @@ PROMPT === DONE ===
 -- source: test/test3.txt
 -- db: Oracle
 -- metadata: test Oracle inferred catalog (file-scoped overlay) + Oracle built-ins
--- checked: 510
+-- checked: 506
 -- missing: 0
 -- marker: [[word]] means not suggested for the tested prefix
 -- missing tokens: none

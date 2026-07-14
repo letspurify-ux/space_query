@@ -50119,26 +50119,34 @@ fn intellisense_sweep_is_select_alias_definition(
         || matches!(previous, Some(SqlToken::Word(word)) if !crate::sql_text::is_sql_keyword_for_db(&word.to_ascii_uppercase(), db_type))
 }
 
-fn intellisense_sweep_is_mysql_json_table_column_definition(
+fn intellisense_sweep_is_table_function_column_definition(
     sql: &str,
     cursor: usize,
     db_type: crate::db::DatabaseType,
 ) -> bool {
-    if !crate::sql_text::mysql_compatibility_for_sql("", Some(db_type))
-        || !intellisense_sweep_next_meaningful_word(sql, cursor).is_some_and(|word| {
+    if !intellisense_sweep_next_meaningful_word(sql, cursor).is_some_and(|word| {
             intellisense_sweep_is_mysql_type_lead(&word)
                 || word.eq_ignore_ascii_case("FOR")
         })
     {
         return false;
     }
-    let before = sql.get(..cursor).unwrap_or("").to_ascii_uppercase();
-    [before.rfind("JSON_TABLE"), before.rfind("XMLTABLE")]
-        .into_iter()
-        .flatten()
-        .max()
-        .zip(before.rfind("COLUMNS"))
-        .is_some_and(|(table_function_idx, columns_idx)| table_function_idx < columns_idx)
+    let tokens = match db_type {
+        crate::db::DatabaseType::MySQL | crate::db::DatabaseType::MariaDB => {
+            super::query_text::tokenize_sql_with_mysql_compat(
+                sql.get(..cursor).unwrap_or(""),
+                true,
+            )
+        }
+        crate::db::DatabaseType::Oracle => {
+            super::query_text::tokenize_sql(sql.get(..cursor).unwrap_or(""))
+        }
+    };
+    SqlEditorWidget::cursor_is_in_table_function_columns_type(
+        &tokens,
+        tokens.len(),
+        Some(db_type),
+    )
 }
 
 fn intellisense_sweep_is_mysql_label_definition(
@@ -50641,7 +50649,7 @@ fn intellisense_sweep_is_definition_slot(
     ) {
         return true;
     }
-    if intellisense_sweep_is_mysql_json_table_column_definition(sql, cursor, db_type) {
+    if intellisense_sweep_is_table_function_column_definition(sql, cursor, db_type) {
         return true;
     }
     if intellisense_sweep_is_mysql_label_definition(sql, cursor, db_type) {
@@ -89716,6 +89724,10 @@ fn sweep_remaining_definition_tokens_are_skipped_at_the_exact_slot() {
             "jt",
         ),
         (
+            "SELECT * FROM XMLTABLE('/root/item' COLUMNS emp___CODEX_CURSOR__ NUMBER PATH 'emp_id') x",
+            "emp_id",
+        ),
+        (
             "CREATE OR REPLACE TRIGGER qt_split_trg BEFORE INSERT ON t FOR EACH ROW BEGIN NULL; END qt_s__CODEX_CURSOR__;",
             "qt_split_trg",
         ),
@@ -90286,6 +90298,15 @@ fn mysql_family_remaining_fixture_name_scope_regressions() {
             "INFORMATION_SCHEMA.PARTITIONS",
             "INFORMATION_SCHEMA.PART|",
             "PARTITIONS",
+        )],
+    ));
+    failures.extend(mysql_family_fixture_completion_case_failures(
+        "test3.txt",
+        MySQL,
+        &[(
+            "ORDER BY `rank`, summary_key;",
+            "ORDER BY `ran__CODEX_CURSOR__`, summary_key;",
+            "`rank`",
         )],
     ));
 

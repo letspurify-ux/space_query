@@ -1057,7 +1057,7 @@ ORDER BY sale_year,
 -- source: test/test18.sql
 -- db: Oracle
 -- metadata: test Oracle inferred catalog (file-scoped overlay) + Oracle built-ins
--- checked: 1805
+-- checked: 1777
 -- missing: 0
 -- marker: [[word]] means not suggested for the tested prefix
 -- missing tokens: none

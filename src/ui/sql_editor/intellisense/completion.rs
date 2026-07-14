@@ -3329,11 +3329,39 @@ impl SqlEditorWidget {
         // emitting slots are also folded into `at_keyword_only_slot` (via the
         // shared `cursor_is_at_column_suppressing_keyword_slot` chokepoint) so
         // column-gated paths stay consistent.
+        let current_token_continues_after_cursor = has_prefix
+            && Self::current_query_tokens(deep_ctx)
+                .get(Self::cursor_token_len_in_current_query(deep_ctx))
+                .is_some_and(|token| {
+                    matches!(
+                        token,
+                        SqlToken::Word(word)
+                            if Self::completion_suggestion_matches_prefix(
+                                word,
+                                &snapshot.prefix,
+                            ) && (snapshot
+                                .text_after_cursor
+                                .chars()
+                                .next()
+                                .is_some_and(|ch| {
+                                    crate::sql_text::is_identifier_char(ch)
+                                        || matches!(ch, '`' | '"' | ']')
+                                })
+                                || (matches!(
+                                    snapshot.prefix.chars().next(),
+                                    Some('`' | '"' | '[')
+                                ) && !crate::sql_text::is_quoted_identifier(
+                                    &snapshot.prefix,
+                                )))
+                    )
+                });
+        let exclude_current_identifier_chain =
+            has_prefix && !current_token_continues_after_cursor;
         let at_keyword_only_identifier_slot = qualifier.is_none()
             && !at_package_declaration_default_value
             && Self::cursor_is_at_identifier_suppressing_keyword_slot_for_context(
                 deep_ctx,
-                has_prefix,
+                exclude_current_identifier_chain,
                 Some(snapshot.preferred_db_type),
             );
         let at_table_alias_name_slot =
@@ -3349,7 +3377,7 @@ impl SqlEditorWidget {
             && !at_package_declaration_default_value
             && Self::cursor_is_at_column_suppressing_keyword_slot_for_db(
                 deep_ctx,
-                !snapshot.prefix.is_empty(),
+                exclude_current_identifier_chain,
                 Some(snapshot.preferred_db_type),
             );
         let at_value_only_no_expected_keyword_slot = qualifier.is_none()
@@ -7209,7 +7237,13 @@ impl SqlEditorWidget {
                 intellisense_context::SqlPhase::FromClause
                     | intellisense_context::SqlPhase::JoinCondition
             ) || (matches!(deep_ctx.phase, intellisense_context::SqlPhase::SetClause)
-                && full_has("UPDATE")))
+                && full_has("UPDATE")
+                && !full_words.windows(4).any(|words| {
+                    words[0] == "ON"
+                        && words[1] == "DUPLICATE"
+                        && words[2] == "KEY"
+                        && words[3] == "UPDATE"
+                })))
         {
             return Some("WHERE".to_string());
         }
@@ -58670,12 +58704,17 @@ impl SqlEditorWidget {
             derived_columns.extend(intellisense_context::extract_select_list_columns(
                 current_query_tokens,
             ));
-            let enclosing_statement_tokens = Self::current_routine_body_statement_range(deep_ctx)
-                .map(|range| intellisense_context::token_range_slice(statement_tokens, range))
-                .unwrap_or(statement_tokens);
-            derived_columns.extend(Self::first_set_operand_projection_columns(
-                enclosing_statement_tokens,
-            ));
+            if deep_ctx.in_set_operation_query_branch {
+                let enclosing_statement_tokens =
+                    Self::current_routine_body_statement_range(deep_ctx)
+                        .map(|range| {
+                            intellisense_context::token_range_slice(statement_tokens, range)
+                        })
+                        .unwrap_or(statement_tokens);
+                derived_columns.extend(Self::first_set_operand_projection_columns(
+                    enclosing_statement_tokens,
+                ));
+            }
         }
 
         Self::dedup_column_names_case_insensitive(&mut derived_columns);
