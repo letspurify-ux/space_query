@@ -143,7 +143,7 @@ END IF;
 END$$
 
 CREATE PROCEDURE af_run_gauntlet()
-[[main_block]]:BEGIN
+main_block:BEGIN
 DECLARE v_done BOOLEAN DEFAULT FALSE;
 DECLARE v_event_id BIGINT;
 DECLARE v_amount DECIMAL(14,2);
@@ -156,7 +156,7 @@ SELECT event_id,amount FROM af_event WHERE event_kind IN('SALE','REFUND') ORDER 
 DECLARE CONTINUE HANDLER FOR NOT FOUND SET v_done=TRUE;
 DECLARE EXIT HANDLER FOR SQLEXCEPTION
 BEGIN
-GET STACKED DIAGNOSTICS CONDITION 1 v_state=[[RETURNED_SQLSTATE]],v_errno=[[MYSQL_ERRNO]],v_message=[[MESSAGE_TEXT]];
+GET STACKED DIAGNOSTICS CONDITION 1 v_state=RETURNED_SQLSTATE,v_errno=MYSQL_ERRNO,v_message=MESSAGE_TEXT;
 ROLLBACK;
 INSERT INTO af_error_log(phase_name,sql_state,error_no,message_text)VALUES('UNEXPECTED',v_state,v_errno,v_message);
 RESIGNAL;
@@ -174,13 +174,13 @@ WHEN v_amount>=50 THEN
 nested_branch:BEGIN
 SET v_running=v_running+v_amount;
 IF MOD(v_event_id,2)=0 THEN SET v_running=v_running+0.50;
-[[ELSEIF]] MOD(v_event_id,3)=0 THEN SET v_running=v_running+0.25;
+ELSEIF MOD(v_event_id,3)=0 THEN SET v_running=v_running+0.25;
 ELSE SET v_running=v_running+0.10;
 END IF;
-END [[nested_branch]];
+END nested_branch;
 ELSE SET v_running=v_running-v_amount;
 END CASE;
-END LOOP [[read_loop]];
+END LOOP read_loop;
 CLOSE cur_events;
 
 duplicate_probe:BEGIN
@@ -191,7 +191,7 @@ INSERT INTO af_error_log(phase_name,sql_state,error_no,message_text)VALUES('EXPE
 END;
 INSERT INTO af_event(event_id,natural_key,user_id,node_id,event_kind,amount,payload,occurred_at)
 VALUES(999,'evt-101',1,4,'sale',1,JSON_OBJECT('device','trap','tags',JSON_ARRAY('duplicate'),'metrics',JSON_ARRAY()),NOW(6));
-END [[duplicate_probe]];
+END duplicate_probe;
 
 INSERT INTO af_rollup(rollup_day,user_id,event_count,weighted_amount,detail_json)
 SELECT DATE(e.occurred_at),e.user_id,COUNT(*),ROUND(SUM(af_weight(e.event_kind,e.amount)),2),
@@ -210,7 +210,7 @@ DEALLOCATE PREPARE af_stmt;
 CALL af_assert((SELECT COUNT(*) FROM af_top_event)=3,'dynamic top-event row count');
 CALL af_assert(v_running>0,'cursor accumulator must be positive');
 COMMIT;
-END [[main_block]]$$
+END main_block$$
 
 DELIMITER ;
 
@@ -354,17 +354,8 @@ JSON_OBJECT('delimiter_trap',@delimiter_trap,'version_gate',@version_gate,'error
 -- source: test_mysql/test4.txt
 -- db: MySQL
 -- metadata: test_mysql/test4.txt inferred catalog
--- checked: 567
--- missing: 9
+-- checked: 566
+-- missing: 0
 -- marker: [[word]] means not suggested for the tested prefix
--- missing tokens:
---   146:1 word=main_block prefix=main suggestions=[] total=0 line=main_block:BEGIN
---   159:45 word=RETURNED_SQLSTATE prefix=RETU suggestions=[] total=0 line=GET STACKED DIAGNOSTICS CONDITION 1 v_state=RETURNED_SQLSTATE,v_errno=MYSQL_ERRNO,v_message=MESSAGE_TEXT;
---   159:71 word=MYSQL_ERRNO prefix=MYSQ suggestions=[] total=0 line=GET STACKED DIAGNOSTICS CONDITION 1 v_state=RETURNED_SQLSTATE,v_errno=MYSQL_ERRNO,v_message=MESSAGE_TEXT;
---   159:93 word=MESSAGE_TEXT prefix=MESS suggestions=[] total=0 line=GET STACKED DIAGNOSTICS CONDITION 1 v_state=RETURNED_SQLSTATE,v_errno=MYSQL_ERRNO,v_message=MESSAGE_TEXT;
---   177:1 word=ELSEIF prefix=ELSE suggestions=[ELSE] total=1 line=ELSEIF MOD(v_event_id,3)=0 THEN SET v_running=v_running+0.25;
---   180:5 word=nested_branch prefix=nest suggestions=[NESTED] total=1 line=END nested_branch;
---   183:10 word=read_loop prefix=read suggestions=[READ, READS, READ_WRITE] total=3 line=END LOOP read_loop;
---   194:5 word=duplicate_probe prefix=dupl suggestions=[DUPLICATE] total=1 line=END duplicate_probe;
---   213:5 word=main_block prefix=main suggestions=[] total=0 line=END main_block$$
+-- missing tokens: none
 -- =========================================================

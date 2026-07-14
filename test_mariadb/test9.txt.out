@@ -1,0 +1,357 @@
+-- ============================================================================
+-- SPACE QUERY MARIADB AUTO-FORMAT CERTIFICATION GAUNTLET
+-- Target: MariaDB 12.2+
+--
+-- Deliberately hostile layout: keep the strange spacing and split structural
+-- owners in this source. The formatter, not a human, must normalize it. The
+-- script is self-contained and its last result reports status = PASS.
+-- ============================================================================
+
+DELIMITER ;
+DROP DATABASE IF EXISTS sq_mariadb_format_cert;
+CREATE DATABASE sq_mariadb_format_cert CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
+USE sq_mariadb_format_cert;
+SET NAMES utf8mb4;
+SET SESSION sql_mode='STRICT_TRANS_TABLES,ERROR_FOR_DIVISION_BY_ZERO,NO_ENGINE_SUBSTITUTION';
+SET @delimiter_trap='BEGIN; END// DELIMITER $$ -- still a string';
+
+# comment trap: ; // $$ CREATE PROCEDURE imaginary() BEGIN END
+/* nested-looking text is inert: SELECT '('; BEGIN IF x THEN END IF; END // */
+
+CREATE SEQUENCE mf_event_seq START WITH 100 INCREMENT BY 1 MINVALUE 100 CACHE 20;
+
+CREATE TABLE mf_department(
+dept_id INT NOT NULL,
+parent_dept_id INT NULL,
+dept_name VARCHAR(80) NOT NULL,
+properties BLOB NOT NULL,
+PRIMARY KEY(dept_id),
+UNIQUE KEY uk_mf_department_name(dept_name),
+KEY ix_mf_department_parent(parent_dept_id),
+CONSTRAINT fk_mf_department_parent FOREIGN KEY(parent_dept_id)REFERENCES mf_department(dept_id),
+CONSTRAINT chk_mf_department_self CHECK(parent_dept_id IS NULL OR parent_dept_id<>dept_id)
+)ENGINE=InnoDB;
+
+CREATE TABLE mf_account(
+account_id INT NOT NULL,
+dept_id INT NOT NULL,
+account_code VARCHAR(30) NOT NULL,
+display_name VARCHAR(100) NOT NULL,
+settings JSON NOT NULL,
+row_start TIMESTAMP(6)GENERATED ALWAYS AS ROW START,
+row_end TIMESTAMP(6)GENERATED ALWAYS AS ROW END,
+PERIOD FOR SYSTEM_TIME(row_start,row_end),
+PRIMARY KEY(account_id),
+UNIQUE KEY uk_mf_account_code(account_code),
+KEY ix_mf_account_dept(dept_id),
+CONSTRAINT fk_mf_account_dept FOREIGN KEY(dept_id)REFERENCES mf_department(dept_id),
+CONSTRAINT chk_mf_account_settings CHECK(JSON_VALID(settings))
+)ENGINE=InnoDB WITH SYSTEM VERSIONING;
+
+CREATE TABLE mf_event(
+event_id BIGINT NOT NULL DEFAULT(NEXT VALUE FOR mf_event_seq),
+event_key VARCHAR(40) NOT NULL,
+account_id INT NOT NULL,
+event_type VARCHAR(20) NOT NULL,
+amount DECIMAL(14,2)NOT NULL,
+payload JSON NOT NULL,
+occurred_at DATETIME(6)NOT NULL,
+channel_code VARCHAR(20)AS(JSON_VALUE(payload,'$.channel'))PERSISTENT,
+PRIMARY KEY(event_id),
+UNIQUE KEY uk_mf_event_key(event_key),
+KEY ix_mf_event_account_time(account_id,occurred_at),
+KEY ix_mf_event_channel(channel_code),
+CONSTRAINT fk_mf_event_account FOREIGN KEY(account_id)REFERENCES mf_account(account_id),
+CONSTRAINT chk_mf_event_amount CHECK(amount>=0),
+CONSTRAINT chk_mf_event_payload CHECK(JSON_VALID(payload))
+)ENGINE=InnoDB;
+
+CREATE TABLE mf_summary(
+summary_day DATE NOT NULL,
+account_id INT NOT NULL,
+event_count BIGINT NOT NULL,
+net_amount DECIMAL(18,2)NOT NULL,
+detail_json JSON NOT NULL,
+PRIMARY KEY(summary_day,account_id),
+CONSTRAINT fk_mf_summary_account FOREIGN KEY(account_id)REFERENCES mf_account(account_id)
+)ENGINE=InnoDB;
+
+CREATE TABLE mf_error_log(
+log_id BIGINT NOT NULL AUTO_INCREMENT,
+phase_name VARCHAR(80)NOT NULL,
+sql_state CHAR(5)NULL,
+error_no INT NULL,
+message_text TEXT NULL,
+PRIMARY KEY(log_id)
+)ENGINE=InnoDB;
+
+INSERT INTO mf_department(dept_id,parent_dept_id,dept_name,properties)VALUES
+(1,NULL,'root',COLUMN_CREATE('tier','root','weight',1)),
+(2,1,'commerce',COLUMN_CREATE('tier','gold','weight',10)),
+(3,1,'platform',COLUMN_CREATE('tier','silver','weight',7)),
+(4,2,'checkout',COLUMN_CREATE('tier','platinum','weight',20)),
+(5,3,'observability',COLUMN_CREATE('tier','gold','weight',12));
+
+INSERT INTO mf_account(account_id,dept_id,account_code,display_name,settings)VALUES
+(1,4,'alice','Alice',JSON_OBJECT('country','KR','roles',JSON_ARRAY('admin','buyer'))),
+(2,2,'bob','Bob',JSON_OBJECT('country','US','roles',JSON_ARRAY('buyer'))),
+(3,5,'carol','Carol',JSON_OBJECT('country','DE','roles',JSON_ARRAY('analyst')));
+
+UPDATE mf_account SET display_name=CONCAT(display_name,' v2')WHERE account_id=1;
+
+INSERT INTO mf_event(event_key,account_id,event_type,amount,payload,occurred_at)VALUES
+('me-100',1,'sale',120.00,JSON_OBJECT('channel','web','tags',JSON_ARRAY('new','vip'),'lines',JSON_ARRAY(JSON_OBJECT('sku','A','qty',2,'price',50),JSON_OBJECT('sku','B','qty',1,'price',20))),'2026-02-01 09:00:00.000001'),
+('me-101',1,'refund',20.00,JSON_OBJECT('channel','app','tags',JSON_ARRAY('vip'),'lines',JSON_ARRAY(JSON_OBJECT('sku','B','qty',1,'price',20))),'2026-02-01 10:00:00.000002'),
+('me-102',2,'sale',80.00,JSON_OBJECT('channel','web','tags',JSON_ARRAY('new'),'lines',JSON_ARRAY(JSON_OBJECT('sku','C','qty',4,'price',20))),'2026-02-02 11:00:00.000003'),
+('me-103',2,'view',0.00,JSON_OBJECT('channel','bot','tags',JSON_ARRAY(),'lines',JSON_ARRAY()),'2026-02-02 12:00:00.000004'),
+('me-104',3,'sale',200.00,JSON_OBJECT('channel','app','tags',JSON_ARRAY('returning','vip'),'lines',JSON_ARRAY(JSON_OBJECT('sku','D','qty',5,'price',40))),'2026-02-03 13:00:00.000005'),
+('me-105',3,'sale',50.00,JSON_OBJECT('channel','web','tags',JSON_ARRAY('returning'),'lines',JSON_ARRAY(JSON_OBJECT('sku','E','qty',2,'price',25))),'2026-02-04 14:00:00.000006');
+
+CREATE OR REPLACE VIEW mf_event_v AS
+SELECT e.event_id,e.event_key,a.account_code,d.dept_name,e.event_type,e.amount,e.channel_code,e.occurred_at,
+CASE e.event_type WHEN 'SALE'THEN 'POSITIVE' WHEN 'REFUND'THEN 'NEGATIVE' ELSE 'NEUTRAL' END AS polarity
+FROM mf_event e JOIN mf_account a ON a.account_id=e.account_id JOIN mf_department d ON d.dept_id=a.dept_id;
+
+DELIMITER //
+
+CREATE OR REPLACE FUNCTION mf_weight(p_type VARCHAR(20),p_amount DECIMAL(14,2))
+RETURNS DECIMAL(18,2)
+DETERMINISTIC
+BEGIN
+RETURN CASE UPPER(TRIM(p_type))
+WHEN 'SALE'THEN p_amount*1.20
+WHEN 'REFUND'THEN-p_amount
+WHEN 'VIEW'THEN 0
+ELSE p_amount END;
+END//
+
+CREATE OR REPLACE PROCEDURE mf_assert(IN p_condition BOOLEAN,IN p_message VARCHAR(255))
+BEGIN
+IF IFNULL(p_condition,FALSE)=FALSE THEN
+SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT=p_message;
+END IF;
+END//
+
+CREATE OR REPLACE TRIGGER mf_event_bi BEFORE INSERT ON mf_event FOR EACH ROW
+BEGIN
+SET NEW.event_type=UPPER(TRIM(NEW.event_type));
+IF NEW.amount<0 OR JSON_VALID(NEW.payload)=0 THEN
+SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT='invalid MariaDB event';
+END IF;
+END//
+
+CREATE OR REPLACE PROCEDURE mf_run_gauntlet()
+outer_block:BEGIN
+DECLARE v_done BOOLEAN DEFAULT FALSE;
+DECLARE v_event_id BIGINT;
+DECLARE v_amount TYPE OF mf_event.amount;
+DECLARE v_running DECIMAL(18,2)DEFAULT 0;
+DECLARE v_state CHAR(5);
+DECLARE v_errno INT;
+DECLARE v_message TEXT;
+DECLARE cur_events CURSOR(p_floor DECIMAL(14,2))FOR
+SELECT event_id,amount FROM mf_event WHERE amount>=p_floor ORDER BY occurred_at,event_id;
+DECLARE CONTINUE HANDLER FOR NOT FOUND SET v_done=TRUE;
+DECLARE EXIT HANDLER FOR SQLEXCEPTION
+BEGIN
+GET DIAGNOSTICS CONDITION 1 v_state=RETURNED_SQLSTATE,v_errno=MYSQL_ERRNO,v_message=MESSAGE_TEXT;
+ROLLBACK;
+INSERT INTO mf_error_log(phase_name,sql_state,error_no,message_text)VALUES('UNEXPECTED',v_state,v_errno,v_message);
+RESIGNAL;
+END;
+
+START TRANSACTION;
+SAVEPOINT before_cursor;
+OPEN cur_events(0);
+event_loop:LOOP
+FETCH cur_events INTO v_event_id,v_amount;
+IF v_done THEN LEAVE event_loop;END IF;
+CASE
+WHEN v_amount>=150 THEN SET v_running=v_running+v_amount*2;
+WHEN v_amount>=50 THEN
+branch_block:BEGIN
+SET v_running=v_running+v_amount;
+IF MOD(v_event_id,2)=0 THEN SET v_running=v_running+0.50;
+ELSEIF MOD(v_event_id,3)=0 THEN SET v_running=v_running+0.25;
+ELSE SET v_running=v_running+0.10;
+END IF;
+END branch_block;
+ELSE SET v_running=v_running-v_amount;
+END CASE;
+END LOOP event_loop;
+CLOSE cur_events;
+
+duplicate_probe:BEGIN
+DECLARE CONTINUE HANDLER FOR 1062
+BEGIN
+GET DIAGNOSTICS CONDITION 1 v_state=RETURNED_SQLSTATE,v_errno=MYSQL_ERRNO,v_message=MESSAGE_TEXT;
+INSERT INTO mf_error_log(phase_name,sql_state,error_no,message_text)VALUES('EXPECTED_DUPLICATE',v_state,v_errno,v_message);
+END;
+INSERT INTO mf_event(event_key,account_id,event_type,amount,payload,occurred_at)
+VALUES('me-100',1,'sale',1,JSON_OBJECT('channel','trap','tags',JSON_ARRAY('duplicate'),'lines',JSON_ARRAY()),NOW(6));
+END duplicate_probe;
+
+INSERT INTO mf_summary(summary_day,account_id,event_count,net_amount,detail_json)
+SELECT DATE(occurred_at),account_id,COUNT(*),ROUND(SUM(mf_weight(event_type,amount)),2),
+JSON_OBJECT('minimum',MIN(amount),'maximum',MAX(amount),'types',COUNT(DISTINCT event_type))
+FROM mf_event GROUP BY DATE(occurred_at),account_id
+ON DUPLICATE KEY UPDATE event_count=VALUES(event_count),net_amount=VALUES(net_amount),detail_json=VALUES(detail_json);
+
+EXECUTE IMMEDIATE CONCAT('CREATE TEMPORARY TABLE mf_top_event AS ',
+'SELECT account_id,event_id,amount FROM (SELECT account_id,event_id,amount,',
+'ROW_NUMBER() OVER(PARTITION BY account_id ORDER BY amount DESC,event_id) rn FROM mf_event) ranked ',
+'WHERE rn=1');
+
+CALL mf_assert((SELECT COUNT(*)FROM mf_top_event)=3,'dynamic top-event count');
+CALL mf_assert(v_running>0,'cursor accumulator');
+COMMIT;
+END outer_block//
+
+DELIMITER ;
+
+CALL mf_run_gauntlet();
+
+-- Recursive CTE cycle clause + dynamic columns + JSON_TABLE nested paths.
+WITH RECURSIVE
+calendar(day_no,calendar_day)AS(
+SELECT 1,DATE('2026-02-01')
+UNION ALL
+SELECT day_no+1,calendar_day+INTERVAL 1 DAY FROM calendar WHERE day_no<5
+),
+org(dept_id,parent_dept_id,dept_name,depth_no,path_text)AS(
+SELECT d.dept_id,d.parent_dept_id,d.dept_name,0,CAST(CONCAT('/',d.dept_name)AS CHAR(500))FROM mf_department d WHERE d.parent_dept_id IS NULL
+UNION ALL
+SELECT c.dept_id,c.parent_dept_id,c.dept_name,p.depth_no+1,CONCAT(p.path_text,'/',c.dept_name)
+FROM mf_department c JOIN org p ON p.dept_id=c.parent_dept_id WHERE p.depth_no<20
+)
+CYCLE dept_id RESTRICT,
+json_rows AS(
+SELECT e.event_id,e.account_id,e.event_type,e.amount,e.occurred_at,j.channel_name,j.tag_no,j.tag_name,j.line_no,j.sku,j.qty,j.price
+FROM mf_event e
+JOIN JSON_TABLE(e.payload,'$'COLUMNS(
+channel_name VARCHAR(20)PATH '$.channel' NULL ON EMPTY,
+NESTED PATH '$.tags[*]'COLUMNS(tag_no FOR ORDINALITY,tag_name VARCHAR(40)PATH '$' NULL ON EMPTY),
+NESTED PATH '$.lines[*]'COLUMNS(line_no FOR ORDINALITY,sku VARCHAR(30)PATH '$.sku',qty INT PATH '$.qty' DEFAULT 0 ON EMPTY,price DECIMAL(12,2)PATH '$.price' DEFAULT 0 ON ERROR)
+))j ON TRUE
+),
+daily AS(
+SELECT c.calendar_day,a.account_id,a.account_code,
+COALESCE(SUM(CASE WHEN e.event_type='SALE'THEN e.amount WHEN e.event_type='REFUND'THEN-e.amount ELSE 0 END),0)net_amount,
+COUNT(DISTINCT e.event_id)event_count,
+COALESCE((SELECT SUM(jr.qty*jr.price)FROM json_rows jr WHERE jr.account_id=a.account_id AND DATE(jr.occurred_at)=c.calendar_day),0)line_total
+FROM calendar c CROSS JOIN mf_account a LEFT JOIN mf_event e ON e.account_id=a.account_id AND e.occurred_at>=c.calendar_day AND e.occurred_at<c.calendar_day+INTERVAL 1 DAY
+GROUP BY c.calendar_day,a.account_id,a.account_code
+),
+analytic AS(
+SELECT d.*,
+SUM(d.net_amount)OVER w_running running_net,
+COALESCE(LAG(d.net_amount,1)OVER w_ordered,0)previous_net,
+DENSE_RANK()OVER(PARTITION BY d.calendar_day ORDER BY d.net_amount DESC)daily_rank,
+MEDIAN(d.net_amount)OVER(PARTITION BY d.calendar_day)daily_median,
+PERCENTILE_CONT(0.5)WITHIN GROUP(ORDER BY d.net_amount)OVER(PARTITION BY d.account_id)account_p50
+FROM daily d
+WINDOW w_account AS(PARTITION BY d.account_id),
+w_ordered AS(w_account ORDER BY d.calendar_day),
+w_running AS(w_ordered ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW)
+)
+SELECT a.calendar_day,a.account_code,a.net_amount,a.running_net,a.previous_net,a.daily_rank,a.daily_median,a.account_p50,
+CASE WHEN a.net_amount>a.daily_median THEN JSON_OBJECT('band','ABOVE_MEDIAN','line_total',a.line_total)
+WHEN a.event_count=0 THEN JSON_OBJECT('band','EMPTY','line_total',a.line_total)
+ELSE JSON_OBJECT('band','NORMAL','line_total',a.line_total)END nested_case_json,
+COALESCE((SELECT JSON_ARRAYAGG(DISTINCT jr.tag_name ORDER BY jr.tag_name)FROM json_rows jr WHERE jr.account_id=a.account_id AND jr.tag_name IS NOT NULL),JSON_ARRAY())tag_json,
+(SELECT MAX(o.depth_no)FROM org o WHERE EXISTS(SELECT 1 FROM mf_event e2 JOIN mf_account a2 ON a2.account_id=e2.account_id WHERE a2.account_id=a.account_id AND a2.dept_id=o.dept_id))deepest_department
+FROM analytic a
+WHERE(a.event_count>0 OR EXISTS(SELECT 1 FROM mf_summary s WHERE s.account_id=a.account_id AND s.summary_day=a.calendar_day))
+AND NOT EXISTS(SELECT 1 FROM mf_error_log x WHERE x.phase_name='UNEXPECTED')
+ORDER BY a.calendar_day,a.daily_rank,a.account_code;
+
+-- System-versioned rows and dynamic-column extraction.
+SELECT h.account_id,h.account_code,h.display_name,h.row_start,h.row_end,
+COLUMN_GET(d.properties,'tier'AS CHAR(20))AS dept_tier,
+COLUMN_GET(d.properties,'weight'AS UNSIGNED)AS dept_weight,
+CASE WHEN h.row_end>CURRENT_TIMESTAMP+INTERVAL 10 YEAR THEN 'CURRENT' ELSE 'HISTORY' END AS version_kind
+FROM mf_account FOR SYSTEM_TIME ALL AS h
+JOIN mf_department d ON d.dept_id=h.dept_id
+ORDER BY h.account_id,h.row_start;
+
+-- ROLLUP, ordered JSON aggregation, and correlated subquery nesting.
+SELECT q.country_code,q.event_type,q.channel_code,q.weighted_total,q.country_rank,
+JSON_OBJECT('country',q.country_code,'top_account',
+(SELECT a2.account_code FROM mf_account a2 JOIN mf_event e2 ON e2.account_id=a2.account_id WHERE JSON_VALUE(a2.settings,'$.country')=q.country_code GROUP BY a2.account_code ORDER BY SUM(mf_weight(e2.event_type,e2.amount))DESC,a2.account_code LIMIT 1),
+'amounts',(SELECT JSON_ARRAYAGG(e3.amount ORDER BY e3.amount DESC LIMIT 10)FROM mf_event e3 JOIN mf_account a3 ON a3.account_id=e3.account_id WHERE JSON_VALUE(a3.settings,'$.country')=q.country_code))country_payload
+FROM(
+SELECT JSON_VALUE(a.settings,'$.country')country_code,e.event_type,e.channel_code,
+ROUND(SUM(mf_weight(e.event_type,e.amount)),2)weighted_total,
+RANK()OVER(PARTITION BY JSON_VALUE(a.settings,'$.country')ORDER BY SUM(mf_weight(e.event_type,e.amount))DESC)country_rank
+FROM mf_event e STRAIGHT_JOIN mf_account a ON a.account_id=e.account_id
+GROUP BY JSON_VALUE(a.settings,'$.country'),e.event_type,e.channel_code WITH ROLLUP
+)q
+WHERE q.country_code IS NOT NULL AND q.event_type IS NOT NULL AND q.channel_code IS NOT NULL
+ORDER BY q.country_code,q.country_rank,q.event_type;
+
+-- MariaDB set operators retain duplicates before the final EXCEPT.
+(
+SELECT account_id,'ACTIVE'AS source_name FROM mf_event WHERE amount>0
+UNION ALL
+SELECT account_id,'SUMMARY'FROM mf_summary WHERE net_amount<>0
+)
+INTERSECT ALL
+(
+SELECT account_id,'ACTIVE'FROM mf_account
+UNION ALL
+SELECT account_id,'SUMMARY'FROM mf_account
+)
+EXCEPT
+SELECT account_id,'NEVER_MATCHES'FROM mf_account
+ORDER BY account_id,source_name;
+
+-- RETURNING result sets are rollback-only so validation counts remain stable.
+START TRANSACTION;
+INSERT INTO mf_event(event_key,account_id,event_type,amount,payload,occurred_at)
+VALUES('me-returning',1,'sale',1,JSON_OBJECT('channel','returning','tags',JSON_ARRAY(),'lines',JSON_ARRAY()),NOW(6))
+RETURNING event_id,event_key,event_type,amount;
+DELETE FROM mf_event WHERE event_key='me-returning'
+RETURNING event_id,event_key,event_type,amount;
+ROLLBACK;
+
+SET STATEMENT max_statement_time=5 FOR
+SELECT account_id,COUNT(*)event_count,ROUND(SUM(amount),2)total_amount
+FROM mf_event
+GROUP BY account_id
+HAVING COUNT(*)>=1
+ORDER BY total_amount DESC,account_id;
+
+CALL mf_assert((SELECT COUNT(*)FROM mf_department)=5,'department count');
+CALL mf_assert((SELECT COUNT(*)FROM mf_account)=3,'current account count');
+CALL mf_assert((SELECT COUNT(*)FROM mf_account FOR SYSTEM_TIME ALL)>=4,'system-version history count');
+CALL mf_assert((SELECT COUNT(*)FROM mf_event)=6,'event count after RETURNING rollback');
+CALL mf_assert((SELECT COUNT(*)FROM mf_summary)=4,'summary group count');
+CALL mf_assert((SELECT COUNT(*)FROM mf_error_log WHERE phase_name='EXPECTED_DUPLICATE')=1,'expected duplicate handler');
+CALL mf_assert((SELECT COUNT(*)FROM mf_error_log WHERE phase_name='UNEXPECTED')=0,'unexpected handler');
+
+SELECT 'PASS'AS status,
+(SELECT COUNT(*)FROM mf_event)AS event_rows,
+(SELECT COUNT(*)FROM mf_summary)AS summary_rows,
+(SELECT COUNT(*)FROM mf_account FOR SYSTEM_TIME ALL)AS account_versions,
+(SELECT MAX(depth_no)FROM(
+WITH RECURSIVE tree(dept_id,depth_no)AS(
+SELECT dept_id,0 FROM mf_department WHERE parent_dept_id IS NULL
+UNION ALL
+SELECT d.dept_id,t.depth_no+1 FROM mf_department d JOIN tree t ON t.dept_id=d.parent_dept_id
+)
+CYCLE dept_id RESTRICT
+SELECT depth_no FROM tree
+)depths)AS max_tree_depth,
+JSON_OBJECT('delimiter_trap',@delimiter_trap,'sequence_next',NEXT VALUE FOR mf_event_seq,'errors',(SELECT COUNT(*)FROM mf_error_log))AS evidence;
+
+
+-- =========================================================
+-- IntelliSense sweep report generated by intellisense sweep
+-- source: test_mariadb/test9.txt
+-- db: MariaDB
+-- metadata: test_mariadb/test9.txt inferred catalog
+-- checked: 1142
+-- missing: 0
+-- marker: [[word]] means not suggested for the tested prefix
+-- missing tokens: none
+-- =========================================================

@@ -49375,6 +49375,33 @@ fn mysql_family_test_intellisense_data(
     };
     let catalog = mysql_family_catalog_from_script(script);
     let mut data = intellisense_data_from_mysql_family_catalog(&catalog);
+    push_unique_case_insensitive(&mut data.schemas, "INFORMATION_SCHEMA");
+    for (table, columns) in [
+        (
+            "INFORMATION_SCHEMA.COLUMN_STATISTICS",
+            vec!["SCHEMA_NAME", "TABLE_NAME", "COLUMN_NAME", "HISTOGRAM"],
+        ),
+        (
+            "INFORMATION_SCHEMA.PARTITIONS",
+            vec!["TABLE_SCHEMA", "TABLE_NAME", "PARTITION_NAME"],
+        ),
+    ] {
+        push_unique_case_insensitive(&mut data.tables, table);
+        data.set_columns_for_table(
+            table,
+            columns.into_iter().map(str::to_string).collect(),
+        );
+    }
+    data.set_members_for_qualifier_with_kinds(
+        "INFORMATION_SCHEMA",
+        vec![
+            (
+                "COLUMN_STATISTICS".to_string(),
+                Some(QualifiedMemberKind::Table),
+            ),
+            ("PARTITIONS".to_string(), Some(QualifiedMemberKind::Table)),
+        ],
+    );
     if db_type == crate::db::DatabaseType::MariaDB && file_name == "test4.txt" {
         push_unique_case_insensitive(&mut data.tables, "tmp_rollup");
         data.set_columns_for_table(
@@ -50095,15 +50122,14 @@ fn intellisense_sweep_is_select_alias_definition(
 fn intellisense_sweep_is_mysql_json_table_column_definition(
     sql: &str,
     cursor: usize,
-    _db_type: crate::db::DatabaseType,
+    db_type: crate::db::DatabaseType,
 ) -> bool {
-    if !intellisense_sweep_next_meaningful_word(sql, cursor)
-            .is_some_and(|word| intellisense_sweep_is_mysql_type_lead(&word))
+    if !crate::sql_text::mysql_compatibility_for_sql("", Some(db_type))
+        || !intellisense_sweep_next_meaningful_word(sql, cursor).is_some_and(|word| {
+            intellisense_sweep_is_mysql_type_lead(&word)
+                || word.eq_ignore_ascii_case("FOR")
+        })
     {
-        return false;
-    }
-    let line = intellisense_sweep_line_text(sql, cursor);
-    if !line.to_ascii_uppercase().contains(" PATH ") {
         return false;
     }
     let before = sql.get(..cursor).unwrap_or("").to_ascii_uppercase();
@@ -50113,6 +50139,190 @@ fn intellisense_sweep_is_mysql_json_table_column_definition(
         .max()
         .zip(before.rfind("COLUMNS"))
         .is_some_and(|(table_function_idx, columns_idx)| table_function_idx < columns_idx)
+}
+
+fn intellisense_sweep_is_mysql_label_definition(
+    sql: &str,
+    cursor: usize,
+    db_type: crate::db::DatabaseType,
+) -> bool {
+    crate::sql_text::mysql_compatibility_for_sql("", Some(db_type))
+        && sql
+            .get(cursor..)
+            .unwrap_or("")
+            .trim_start()
+            .starts_with(':')
+        && intellisense_sweep_next_meaningful_word(sql, cursor)
+            .is_some_and(|word| matches!(word.to_ascii_uppercase().as_str(), "BEGIN" | "LOOP" | "WHILE" | "REPEAT"))
+}
+
+fn intellisense_sweep_is_mysql_period_name(
+    sql: &str,
+    cursor: usize,
+    original_word: &str,
+    db_type: crate::db::DatabaseType,
+) -> bool {
+    if !crate::sql_text::mysql_compatibility_for_sql("", Some(db_type)) {
+        return false;
+    }
+    let original = original_word.trim_matches('`');
+    let tokens = super::query_text::tokenize_sql(sql);
+    let declared_elsewhere = tokens.windows(4).any(|window| {
+        token_word_eq(window.first(), "PERIOD")
+            && token_word_eq(window.get(1), "FOR")
+            && token_word_text(window.get(2))
+                .is_some_and(|word| word.eq_ignore_ascii_case(original))
+            && matches!(window.get(3), Some(SqlToken::Symbol(symbol)) if symbol == "(")
+    });
+    if declared_elsewhere {
+        return true;
+    }
+
+    let before = super::query_text::tokenize_sql(sql.get(..cursor).unwrap_or(""));
+    let words = before
+        .iter()
+        .filter_map(|token| token_word_text(Some(token)).map(str::to_ascii_uppercase))
+        .collect::<Vec<_>>();
+    words.len() >= 3
+        && words.get(words.len() - 3).is_some_and(|word| word == "PERIOD")
+        && words.get(words.len() - 2).is_some_and(|word| word == "FOR")
+        && words.last().is_some_and(|word| {
+            original
+                .to_ascii_uppercase()
+                .starts_with(word.as_str())
+        })
+        && sql
+            .get(cursor..)
+            .unwrap_or("")
+            .trim_start()
+            .starts_with('(')
+}
+
+fn intellisense_sweep_is_mysql_index_name_definition(
+    sql: &str,
+    cursor: usize,
+    db_type: crate::db::DatabaseType,
+) -> bool {
+    if !crate::sql_text::mysql_compatibility_for_sql("", Some(db_type))
+        || !sql
+            .get(cursor..)
+            .unwrap_or("")
+            .trim_start()
+            .starts_with('(')
+    {
+        return false;
+    }
+    let tokens = super::query_text::tokenize_sql(sql.get(..cursor).unwrap_or(""));
+    let words = tokens
+        .iter()
+        .filter_map(|token| token_word_text(Some(token)).map(str::to_ascii_uppercase))
+        .collect::<Vec<_>>();
+    words.len() >= 2
+        && words.last().is_some_and(|word| {
+            !crate::sql_text::is_sql_keyword_for_db(word, db_type)
+        })
+        && words
+            .get(words.len().saturating_sub(2))
+            .is_some_and(|word| matches!(word.as_str(), "INDEX" | "KEY"))
+}
+
+fn intellisense_sweep_is_mysql_window_name_definition(
+    sql: &str,
+    cursor: usize,
+    db_type: crate::db::DatabaseType,
+) -> bool {
+    if !crate::sql_text::mysql_compatibility_for_sql("", Some(db_type))
+        || !intellisense_sweep_next_meaningful_word(sql, cursor)
+            .is_some_and(|word| word.eq_ignore_ascii_case("AS"))
+    {
+        return false;
+    }
+    let before = sql.get(..cursor).unwrap_or("").to_ascii_uppercase();
+    before.rfind("WINDOW").is_some_and(|window_idx| {
+        before
+            .rfind("SELECT")
+            .is_some_and(|select_idx| select_idx < window_idx)
+    })
+}
+
+fn intellisense_sweep_is_mysql_handler_index_reference(
+    sql: &str,
+    cursor: usize,
+    original_word: &str,
+    db_type: crate::db::DatabaseType,
+) -> bool {
+    let following = sql
+        .get(cursor..)
+        .unwrap_or("")
+        .trim_start_matches(|ch: char| ch.is_whitespace() || matches!(ch, '`' | '"' | ']'))
+        .split(|ch: char| !crate::sql_text::is_identifier_char(ch))
+        .next()
+        .unwrap_or("");
+    if !crate::sql_text::mysql_compatibility_for_sql("", Some(db_type))
+        || !matches!(
+            following.to_ascii_uppercase().as_str(),
+            "FIRST" | "LAST" | "NEXT" | "PREV"
+        )
+    {
+        return false;
+    }
+    let words = sql
+        .get(..cursor)
+        .unwrap_or("")
+        .split(|ch: char| !crate::sql_text::is_identifier_char(ch))
+        .filter(|word| !word.is_empty())
+        .map(str::to_ascii_uppercase)
+        .collect::<Vec<_>>();
+    matches!(
+        words.as_slice(),
+        [.., handler, _table, read, partial]
+            if handler == "HANDLER"
+                && read == "READ"
+                && original_word
+                    .trim_matches(|ch| matches!(ch, '`' | '"' | '[' | ']'))
+                    .to_ascii_uppercase()
+                    .starts_with(partial.as_str())
+    )
+}
+
+fn intellisense_sweep_is_cte_name_with_column_list_definition(
+    sql: &str,
+    cursor: usize,
+) -> bool {
+    let tail_tokens = super::query_text::tokenize_sql(sql.get(cursor..).unwrap_or(""));
+    if !matches!(tail_tokens.first(), Some(SqlToken::Symbol(symbol)) if symbol == "(") {
+        return false;
+    }
+    let mut depth = 0usize;
+    let mut close_idx = None;
+    for (idx, token) in tail_tokens.iter().enumerate() {
+        match token {
+            SqlToken::Symbol(symbol) if symbol == "(" => depth = depth.saturating_add(1),
+            SqlToken::Symbol(symbol) if symbol == ")" => {
+                depth = depth.saturating_sub(1);
+                if depth == 0 {
+                    close_idx = Some(idx);
+                    break;
+                }
+            }
+            _ => {}
+        }
+    }
+    let Some(close_idx) = close_idx else {
+        return false;
+    };
+    let followed_by_as = tail_tokens
+        .get(close_idx + 1..)
+        .unwrap_or(&[])
+        .iter()
+        .find_map(|token| token_word_text(Some(token)))
+        .is_some_and(|word| word.eq_ignore_ascii_case("AS"));
+    followed_by_as
+        && sql
+            .get(..cursor)
+            .unwrap_or("")
+            .to_ascii_uppercase()
+            .contains("WITH")
 }
 
 fn intellisense_sweep_is_relation_alias_definition(
@@ -50434,6 +50644,29 @@ fn intellisense_sweep_is_definition_slot(
     if intellisense_sweep_is_mysql_json_table_column_definition(sql, cursor, db_type) {
         return true;
     }
+    if intellisense_sweep_is_mysql_label_definition(sql, cursor, db_type) {
+        return true;
+    }
+    if intellisense_sweep_is_mysql_period_name(sql, cursor, original_word, db_type) {
+        return true;
+    }
+    if intellisense_sweep_is_mysql_index_name_definition(sql, cursor, db_type) {
+        return true;
+    }
+    if intellisense_sweep_is_mysql_window_name_definition(sql, cursor, db_type) {
+        return true;
+    }
+    if intellisense_sweep_is_mysql_handler_index_reference(
+        sql,
+        cursor,
+        original_word,
+        db_type,
+    ) {
+        return true;
+    }
+    if intellisense_sweep_is_cte_name_with_column_list_definition(sql, cursor) {
+        return true;
+    }
     if intellisense_sweep_is_relation_alias_definition(&tokens, current_idx, original_word, db_type) {
         return true;
     }
@@ -50721,11 +50954,20 @@ fn intellisense_sweep_run(
             continue;
         }
 
+        let identifier_quote = if (word.starts_with('`') && word.ends_with('`'))
+            || (word.starts_with('"') && word.ends_with('"'))
+        {
+            word.get(..1).unwrap_or("")
+        } else {
+            ""
+        };
         let marked = format!(
-            "{}{}{}{}",
+            "{}{}{}{}{}{}",
             script.get(..span.start).unwrap_or(""),
+            identifier_quote,
             prefix,
             MARKER,
+            identifier_quote,
             script.get(span.end..).unwrap_or("")
         );
         let skip = panic::catch_unwind(AssertUnwindSafe(|| {
@@ -85922,7 +86164,11 @@ fn mysql_family_fixture_completion_case_failures(
     db_type: crate::db::DatabaseType,
     cases: &[(&str, &str, &str)],
 ) -> Vec<String> {
-    let script = load_mariadb_intellisense_test_file(file_name);
+    let script = match db_type {
+        crate::db::DatabaseType::MySQL => load_mysql_intellisense_test_file(file_name),
+        crate::db::DatabaseType::MariaDB => load_mariadb_intellisense_test_file(file_name),
+        crate::db::DatabaseType::Oracle => panic!("MySQL-family fixture requires MySQL or MariaDB"),
+    };
     let has = |suggestions: &[String], expected: &str| {
         suggestions
             .iter()
@@ -89519,5 +89765,578 @@ fn sweep_fixture_delimiter_and_window_keywords_use_the_production_main_path() {
         failures.is_empty(),
         "fixture delimiter/window keyword gaps:\n{}",
         failures.join("\n")
+    );
+}
+
+#[test]
+fn sweep_mysql_family_new_fixture_definition_slots_are_skipped() {
+    use crate::db::DatabaseType::{MariaDB, MySQL};
+
+    for (marked, word, db_type) in [
+        (
+            "CREATE PROCEDURE p() main__CODEX_CURSOR__:BEGIN END",
+            "main_block",
+            MySQL,
+        ),
+        (
+            "CREATE TABLE t(a DATE,b DATE,PERIOD FOR vali__CODEX_CURSOR__(a,b))",
+            "validity",
+            MariaDB,
+        ),
+        (
+            "CREATE TABLE t(v VECTOR(3),VECTOR INDEX ix_m__CODEX_CURSOR__(v) M=4 DISTANCE=cosine)",
+            "ix_mb_asset_embedding",
+            MariaDB,
+        ),
+        (
+            "SELECT * FROM JSON_TABLE(doc,'$[*]' COLUMNS(tag___CODEX_CURSOR__ FOR ORDINALITY,tag_name VARCHAR(20)PATH'$'))j",
+            "tag_no",
+            MySQL,
+        ),
+        (
+            "SELECT ROW_NUMBER()OVER(w_place) FROM t WINDOW w_pl__CODEX_CURSOR__ AS(PARTITION BY id)",
+            "w_place",
+            MySQL,
+        ),
+        (
+            "WITH RECURSIVE or__CODEX_CURSOR__(id,parent_id)AS(SELECT id,parent_id FROM t) SELECT * FROM org",
+            "org",
+            MariaDB,
+        ),
+    ] {
+        assert!(
+            intellisense_sweep_word_skip_context(marked, db_type, word),
+            "definition token `{word}` was treated as a completion miss at `{marked}`"
+        );
+    }
+}
+
+#[test]
+fn mysql_family_new_fixture_type_and_builtin_completion_regressions() {
+    use crate::db::DatabaseType::{MariaDB, MySQL};
+
+    let cases = [
+        ("CREATE TABLE t(c UU| NOT NULL)", MariaDB, "UUID"),
+        ("CREATE TABLE t(c VEC| (3))", MariaDB, "VECTOR"),
+        ("CREATE TABLE t(c INE| NOT NULL)", MariaDB, "INET6"),
+        ("CREATE TABLE t(c POI| SRID 4326)", MySQL, "POINT"),
+        ("CREATE TABLE t(c POLY| SRID 4326)", MySQL, "POLYGON"),
+        ("CREATE TABLE t(c LINE| SRID 4326)", MySQL, "LINESTRING"),
+        ("SELECT COLUMN_CREA|('k','v')", MariaDB, "COLUMN_CREATE"),
+        ("SELECT COLUMN_G|(doc,'k' AS CHAR)", MariaDB, "COLUMN_GET"),
+        ("SELECT MEDI|(amount) FROM t", MariaDB, "MEDIAN"),
+        ("SELECT PERCENTILE_CO|(0.5) FROM t", MariaDB, "PERCENTILE_CONT"),
+        ("SELECT PERCENTILE_DI|(0.5) FROM t", MariaDB, "PERCENTILE_DISC"),
+        ("SELECT VEC_FromT|('[1,2,3]')", MariaDB, "VEC_FromText"),
+        ("SELECT VEC_ToT|(embedding) FROM t", MariaDB, "VEC_ToText"),
+        (
+            "SELECT VEC_DISTANCE_COS|(a,b) FROM t",
+            MariaDB,
+            "VEC_DISTANCE_COSINE",
+        ),
+        ("SELECT JSON_NORM|(doc) FROM t", MariaDB, "JSON_NORMALIZE"),
+        ("SELECT NATURAL_SORT_|(name) FROM t", MariaDB, "NATURAL_SORT_KEY"),
+        ("SELECT ST_AsGeoJ|(g) FROM t", MySQL, "ST_AsGeoJSON"),
+        ("SELECT MBRCon|(a,b) FROM t", MySQL, "MBRContains"),
+    ];
+
+    let mut failures = Vec::new();
+    for (sql, db_type, expected) in cases {
+        let suggestions = query_keyword_completion_suggestions(sql, db_type);
+        if !suggestions
+            .iter()
+            .any(|suggestion| intellisense_sweep_suggestion_matches_word(suggestion, expected))
+        {
+            failures.push(format!(
+                "`{expected}` missing at {db_type:?} `{sql}`: {suggestions:?}"
+            ));
+        }
+    }
+    assert!(
+        failures.is_empty(),
+        "new fixture type/function completion gaps:\n{}",
+        failures.join("\n")
+    );
+}
+
+#[test]
+fn mysql_family_new_fixture_structural_keyword_regressions() {
+    use crate::db::DatabaseType::{MariaDB, MySQL};
+
+    let cases = [
+        (
+            "CREATE TABLE t(a TIMESTAMP,b TIMESTAMP,PERIOD FOR SYST| (a,b))",
+            MariaDB,
+            "SYSTEM_TIME",
+        ),
+        (
+            "CREATE TABLE t(a INT) ENGINE=InnoDB WITH SYSTEM VER|",
+            MariaDB,
+            "VERSIONING",
+        ),
+        (
+            "CREATE PROCEDURE p() BEGIN DECLARE v CHAR(5); GET STACKED DIAGNOSTICS CONDITION 1 v=RETU|; END",
+            MySQL,
+            "RETURNED_SQLSTATE",
+        ),
+        (
+            "CREATE PROCEDURE p() BEGIN IF 1 THEN SELECT 1; ELSE| 1 THEN SELECT 2; END IF; END",
+            MySQL,
+            "ELSEIF",
+        ),
+        (
+            "CREATE TABLE t(d DATE) PARTITION BY RAN| COLUMNS(d)(PARTITION p VALUES LESS THAN(MAXVALUE))",
+            MySQL,
+            "RANGE",
+        ),
+        (
+            "CREATE TABLE t(d DATE) PARTITION BY RANGE COLU|(d)(PARTITION p VALUES LESS THAN(MAXVALUE))",
+            MySQL,
+            "COLUMNS",
+        ),
+        (
+            "CREATE TABLE t(d DATE) PARTITION BY RANGE COLUMNS(d)(PARTITION p VAL| LESS THAN(MAXVALUE))",
+            MySQL,
+            "VALUES",
+        ),
+        (
+            "CREATE TABLE t(d DATE) PARTITION BY RANGE COLUMNS(d)(PARTITION p VALUES LE| THAN(MAXVALUE))",
+            MySQL,
+            "LESS",
+        ),
+        (
+            "SELECT 1 FROM t WHERE 'vip' MEM| OF(tags)",
+            MySQL,
+            "MEMBER",
+        ),
+        (
+            "SELECT MATCH(name)AGAINST('x' IN NAT| LANGUAGE MODE) FROM t",
+            MySQL,
+            "NATURAL",
+        ),
+        (
+            "SELECT MATCH(name)AGAINST('x' IN BOOLEAN MO|) FROM t",
+            MySQL,
+            "MODE",
+        ),
+        (
+            "UPDATE t FOR POR| OF validity FROM '2026-01-01' TO '2026-02-01' SET c=1",
+            MariaDB,
+            "PORTION",
+        ),
+        (
+            "SELECT * FROM t FOR SYST| ALL",
+            MariaDB,
+            "SYSTEM_TIME",
+        ),
+        (
+            "INSERT INTO t(c) VALUES(1) RETU| c",
+            MariaDB,
+            "RETURNING",
+        ),
+        (
+            "DELETE HIST| FROM t BEFORE SYSTEM_TIME TIMESTAMP '2000-01-01'",
+            MariaDB,
+            "HISTORY",
+        ),
+        (
+            "SELECT * FROM t LIMIT 3 ROWS EXA| 1000",
+            MariaDB,
+            "EXAMINED",
+        ),
+        (
+            "SELECT * FROM t FETCH FI| 2 ROWS WITH TIES",
+            MariaDB,
+            "FIRST",
+        ),
+    ];
+
+    let mut failures = Vec::new();
+    for (sql, db_type, expected) in cases {
+        let suggestions = query_keyword_completion_suggestions(sql, db_type);
+        if !suggestions
+            .iter()
+            .any(|suggestion| intellisense_sweep_suggestion_matches_word(suggestion, expected))
+        {
+            failures.push(format!(
+                "`{expected}` missing at {db_type:?} `{sql}`: {suggestions:?}"
+            ));
+        }
+    }
+    assert!(
+        failures.is_empty(),
+        "new fixture structural completion gaps:\n{}",
+        failures.join("\n")
+    );
+}
+
+#[test]
+fn mysql_family_new_fixture_local_scope_regressions() {
+    let mut failures = Vec::new();
+    failures.extend(mysql_family_fixture_completion_case_failures(
+        "test4.txt",
+        crate::db::DatabaseType::MySQL,
+        &[
+            (
+                "ELSEIF MOD(v_event_id,3)=0 THEN",
+                "ELSE| MOD(v_event_id,3)=0 THEN",
+                "ELSEIF",
+            ),
+            ("END nested_branch;", "END nest|;", "nested_branch"),
+            ("END LOOP read_loop;", "END LOOP read|;", "read_loop"),
+            ("END main_block$$", "END main|$$", "main_block"),
+        ],
+    ));
+    failures.extend(mysql_family_fixture_completion_case_failures(
+        "test10.txt",
+        crate::db::DatabaseType::MariaDB,
+        &[
+            (
+                "SET v_price_total=v_price_total+price_rec.price;",
+                "SET v_price_total=v_price_total+price_rec.pri|;",
+                "price",
+            ),
+            ("SET v_forward=v_forward+i;", "SET v_forward=v_forward+i|;", "i"),
+            ("SET v_reverse=v_reverse+j;", "SET v_reverse=v_reverse+j|;", "j"),
+            (
+                "VALUES(summary_rec.asset_id,summary_rec.observation_count",
+                "VALUES(summary_rec.asset_id,summary_rec.obser|",
+                "observation_count",
+            ),
+            (
+                "SET v_price_total=v_price_total+price_rec.price;\nEND FOR;",
+                "SET v_price_total=v_price_total+price_rec.price;\nEND F|;",
+                "FOR",
+            ),
+        ],
+    ));
+    failures.extend(mysql_family_fixture_completion_case_failures(
+        "test11.txt",
+        crate::db::DatabaseType::MariaDB,
+        &[
+            (
+                "SET v_contract_count=v_contract_count+1;",
+                "SET v_contract_count=v_contract_|;",
+                "v_contract_count",
+            ),
+            (
+                "contract_rec.fragment_amount",
+                "contract_rec.frag|",
+                "fragment_amount",
+            ),
+            (
+                "CALL mb3_assert(v_event_total>0",
+                "CALL mb3_assert(v_event_|>0",
+                "v_event_total",
+            ),
+        ],
+    ));
+    assert!(
+        failures.is_empty(),
+        "new fixture local-scope completion gaps:\n{}",
+        failures.join("\n")
+    );
+}
+
+#[test]
+fn mysql_family_new_fixture_query_scope_regressions() {
+    let mut failures = Vec::new();
+    failures.extend(mysql_family_fixture_completion_case_failures(
+        "test9.txt",
+        crate::db::DatabaseType::MariaDB,
+        &[
+            (
+                "DENSE_RANK()OVER(PARTITION BY d.calendar_day ORDER BY d.net_amount DESC)",
+                "DENSE_RANK()OVER(PARTITION BY d.calendar_day ORDER BY d.net_| DESC)",
+                "net_amount",
+            ),
+            (
+                "CASE WHEN a.net_amount>a.daily_median THEN",
+                "CASE WHEN a.net_amount>a.daily_| THEN",
+                "daily_median",
+            ),
+            (
+                "jr.tag_name ORDER BY jr.tag_name",
+                "jr.tag_| ORDER BY jr.tag_name",
+                "tag_name",
+            ),
+            (
+                "ORDER BY account_id,source_name;",
+                "ORDER BY account_id,sour|;",
+                "source_name",
+            ),
+        ],
+    ));
+    failures.extend(mysql_family_fixture_completion_case_failures(
+        "test6.txt",
+        crate::db::DatabaseType::MySQL,
+        &[
+            (
+                "TABLE gx_search_rollup ORDER BY place_id LIMIT 4;",
+                "TABLE gx_search_rollup ORDER BY pla| LIMIT 4;",
+                "place_id",
+            ),
+            (
+                "FROM INFORMATION_SCHEMA.COLUMN_STATISTICS WHERE SCHEMA_NAME",
+                "FROM INFORMATION_SCHEMA.COLUMN_STATISTICS WHERE SCHEMA_|",
+                "SCHEMA_NAME",
+            ),
+        ],
+    ));
+    assert!(
+        failures.is_empty(),
+        "new fixture query-scope completion gaps:\n{}",
+        failures.join("\n")
+    );
+}
+
+#[test]
+fn mysql_family_remaining_fixture_structural_keyword_regressions() {
+    use crate::db::DatabaseType::{MariaDB, MySQL};
+
+    let mut failures = Vec::new();
+    failures.extend(mysql_family_fixture_completion_case_failures(
+        "test9.txt",
+        MariaDB,
+        &[
+            (
+                ")ENGINE=InnoDB WITH SYSTEM VERSIONING;",
+                ")ENGINE=InnoDB WI| SYSTEM VERSIONING;",
+                "WITH",
+            ),
+            (
+                "FROM mf_department c JOIN org p ON p.dept_id=c.parent_dept_id WHERE p.depth_no<20",
+                "FROM mf_department c JOIN org p ON p.dept_id=c.parent_dept_id WHE| p.depth_no<20",
+                "WHERE",
+            ),
+            (
+                ")\nSELECT a.calendar_day,a.account_code,a.net_amount",
+                ")\nSE| a.calendar_day,a.account_code,a.net_amount",
+                "SELECT",
+            ),
+            ("INTERVAL 10 YEAR", "INTERVAL 10 YE|", "YEAR"),
+            (
+                "ORDER BY e3.amount DESC LIMIT 10",
+                "ORDER BY e3.amount DESC LIM| 10",
+                "LIMIT",
+            ),
+            (
+                "GROUP BY JSON_VALUE(a.settings,'$.country'),e.event_type,e.channel_code WITH ROLLUP",
+                "GROUP BY JSON_VALUE(a.settings,'$.country'),e.event_type,e.channel_code WI| ROLLUP",
+                "WITH",
+            ),
+            (
+                "SELECT account_id,'SUMMARY'FROM mf_summary WHERE net_amount<>0",
+                "SELECT account_id,'SUMMARY'FROM mf_summary WHE| net_amount<>0",
+                "WHERE",
+            ),
+            (
+                "(\nSELECT account_id,'ACTIVE'FROM mf_account",
+                "(\nSE| account_id,'ACTIVE'FROM mf_account",
+                "SELECT",
+            ),
+            (
+                "SET STATEMENT max_statement_time=5 FOR\nSELECT account_id",
+                "SET STATEMENT max_statement_time=5 FOR\nSE| account_id",
+                "SELECT",
+            ),
+            ("FROM mf_event\nGROUP BY account_id", "FROM mf_event\nGRO| BY account_id", "GROUP"),
+            ("GROUP BY account_id\nHAVING COUNT", "GROUP BY account_id\nHAV| COUNT", "HAVING"),
+            (
+                "CYCLE dept_id RESTRICT\nSELECT depth_no FROM tree",
+                "CYCLE dept_id RESTRICT\nSE| depth_no FROM tree",
+                "SELECT",
+            ),
+            ("'sequence_next',NEXT VALUE", "'sequence_next',NE| VALUE", "NEXT"),
+        ],
+    ));
+    failures.extend(mysql_family_fixture_completion_case_failures(
+        "test10.txt",
+        MariaDB,
+        &[
+            ("VECTOR INDEX ix_mb_asset_embedding", "VECTOR IN| ix_mb_asset_embedding", "INDEX"),
+            ("(embedding)M=4", "(embedding)M|=4", "M"),
+            ("M=4 DISTANCE=cosine", "M=4 DIS|=cosine", "DISTANCE"),
+            ("DISTANCE=cosine", "DISTANCE=cos|", "cosine"),
+            ("UPDATE mb_price FOR PORTION", "UPDATE mb_price F| PORTION", "FOR"),
+            ("DECLARE v_asset ROW TYPE", "DECLARE v_asset RO| TYPE", "ROW"),
+            ("ORDER BY cosine_distance,asset_id\nFETCH FIRST", "ORDER BY cosine_distance,asset_id\nFET| FIRST", "FETCH"),
+            (
+                "EXCEPT ALL(\nSELECT asset_id,'NEVER'",
+                "EXCEPT ALL(\nSE| asset_id,'NEVER'",
+                "SELECT",
+            ),
+            (
+                "DELETE FROM mb_price FOR PORTION",
+                "DELETE FROM mb_price F| PORTION",
+                "FOR",
+            ),
+            (
+                "VALUES(999,3,NOW(6),'2001:db8::99',JSON_OBJECT('temperature',99,'load',0,'samples',JSON_ARRAY()))\nRETURNING",
+                "VALUES(999,3,NOW(6),'2001:db8::99',JSON_OBJECT('temperature',99,'load',0,'samples',JSON_ARRAY()))\nRET|",
+                "RETURNING",
+            ),
+        ],
+    ));
+    failures.extend(mysql_family_fixture_completion_case_failures(
+        "test11.txt",
+        MariaDB,
+        &[
+            ("GENERATED ALWAYS AS ROW START", "GENERATED ALWAYS AS ROW STA|", "START"),
+            ("GENERATED ALWAYS AS ROW END", "GENERATED ALWAYS AS ROW EN|", "END"),
+            ("DETERMINISTIC\nRETURN CASE", "DETERMINISTIC\nRET| CASE", "RETURN"),
+            ("DECLARE duplicate_key CONDITION", "DECLARE duplicate_key CON|", "CONDITION"),
+            ("BEGIN\nGET DIAGNOSTICS CONDITION 1", "BEGIN\nGE| DIAGNOSTICS CONDITION 1", "GET"),
+            ("INSERT INTO mb3_error_log", "INSERT IN| mb3_error_log", "INTO"),
+            ("v_errno,v_message);\nRESIGNAL;", "v_errno,v_message);\nRES|;", "RESIGNAL"),
+            ("duplicate_probe:BEGIN", "duplicate_probe:BEG|", "BEGIN"),
+            ("BEGIN\nDECLARE CONTINUE HANDLER", "BEGIN\nDEC| CONTINUE HANDLER", "DECLARE"),
+            ("CONTINUE HANDLER FOR duplicate_key", "CONTINUE HANDLER F| duplicate_key", "FOR"),
+            (
+                "DECLARE CONTINUE HANDLER FOR duplicate_key\nBEGIN",
+                "DECLARE CONTINUE HANDLER FOR duplicate_key\nBEGI__CODEX_CURSOR__",
+                "BEGIN",
+            ),
+            ("FROM mb3_contract c GROUP BY", "FROM mb3_contract c GRO| BY", "GROUP"),
+            (";\nCALL mb3_assert(v_contract_count", ";\nCAL| mb3_assert(v_contract_count", "CALL"),
+            ("FOR SYSTEM_TIME AS OF", "FOR SYSTEM_TIME A| OF", "AS"),
+            (
+                "FROM mb3_contract FOR SYSTEM_TIME AS OF @history_cutover",
+                "FROM mb3_contract FOR SYSTEM_TIME A__CODEX_CURSOR__ OF @history_cutover",
+                "AS",
+            ),
+            (
+                "))AS evidence;",
+                "))A__CODEX_CURSOR__ evidence;",
+                "AS",
+            ),
+            ("@history_cutover-INTERVAL 1", "@history_cutover-INT| 1", "INTERVAL"),
+            (")AND NOW(6)\nWHERE contract_id", ")AND NOW(6)\nWHE| contract_id", "WHERE"),
+            ("LIMIT 3 ROWS EXAMINED", "LIMIT 3 RO| EXAMINED", "ROWS"),
+        ],
+    ));
+    failures.extend(mysql_family_fixture_completion_case_failures(
+        "test6.txt",
+        MySQL,
+        &[
+            (")\nUPDATE gx_visit v JOIN ranked_visits", ")\nUPD| gx_visit v JOIN ranked_visits", "UPDATE"),
+            ("SET v.signals=JSON_ARRAY_APPEND(v.signals,'$',JSON_OBJECT('name','temporary','value',r.rn))\nWHERE r.rn=1", "SET v.signals=JSON_ARRAY_APPEND(v.signals,'$',JSON_OBJECT('name','temporary','value',r.rn))\nWHE| r.rn=1", "WHERE"),
+            (")\nDELETE v FROM gx_visit", ")\nDEL| v FROM gx_visit", "DELETE"),
+            ("DELETE v FROM gx_visit", "DELETE v FR| gx_visit", "FROM"),
+            ("TABLE gx_search_rollup ORDER BY place_id LIMIT 4", "TABLE gx_search_rollup ORDER BY place_id LIM| 4", "LIMIT"),
+            ("ORDER BY visit_id LIMIT 2 FOR SHARE", "ORDER BY visit_id LIMIT 2 F| SHARE", "FOR"),
+        ],
+    ));
+
+    assert!(
+        failures.is_empty(),
+        "remaining fixture structural completion gaps:\n{}",
+        failures.join("\n")
+    );
+}
+
+#[test]
+fn mysql_family_remaining_fixture_name_scope_regressions() {
+    use crate::db::DatabaseType::{MariaDB, MySQL};
+
+    let mut failures = Vec::new();
+    failures.extend(mysql_family_fixture_completion_case_failures(
+        "test9.txt",
+        MariaDB,
+        &[
+            ("TYPE OF mf_event.amount", "TYPE OF mf_|", "mf_event"),
+            ("TYPE OF mf_event.amount", "TYPE OF mf_event.am|", "amount"),
+            ("amount>=p_floor", "amount>=p_fl|", "p_floor"),
+            ("CYCLE dept_id RESTRICT", "CYCLE dept_| RESTRICT", "dept_id"),
+            ("SET STATEMENT max_statement_time", "SET STATEMENT max_|", "max_statement_time"),
+        ],
+    ));
+    failures.extend(mysql_family_fixture_completion_case_failures(
+        "test10.txt",
+        MariaDB,
+        &[
+            ("TYPE OF mb_price.price", "TYPE OF mb_|", "mb_price"),
+            ("TYPE OF mb_price.price", "TYPE OF mb_price.pr|", "price"),
+            ("asset_id=p_asset_id", "asset_id=p_asset_|", "p_asset_id"),
+            ("cur_prices(v_asset.asset_id)", "cur_prices(v_asset.asset_|)", "asset_id"),
+            ("END outer_block//", "END outer_|//", "outer_block"),
+        ],
+    ));
+    failures.extend(mysql_family_fixture_completion_case_failures(
+        "test11.txt",
+        MariaDB,
+        &[
+            ("CALL mb3_assert(v_contract_count", "CALL mb3_|(v_contract_count", "mb3_assert"),
+            ("@@SESSION.sql_mode", "@@SESSION.sql_|", "sql_mode"),
+            ("@@SESSION.sql_mode", "@@SES|.sql_mode", "SESSION"),
+        ],
+    ));
+    failures.extend(mysql_family_fixture_completion_case_failures(
+        "test5.txt",
+        MySQL,
+        &[
+            ("END LOOP scan_loop;", "END LOOP scan_|;", "scan_loop"),
+            ("END main_block$$", "END main_|$$", "main_block"),
+        ],
+    ));
+    failures.extend(mysql_family_fixture_completion_case_failures(
+        "test6.txt",
+        MySQL,
+        &[(
+            "INFORMATION_SCHEMA.PARTITIONS",
+            "INFORMATION_SCHEMA.PART|",
+            "PARTITIONS",
+        )],
+    ));
+
+    assert!(
+        failures.is_empty(),
+        "remaining fixture name/scope completion gaps:\n{}",
+        failures.join("\n")
+    );
+}
+
+#[test]
+fn sweep_mysql_family_handler_index_references_are_skipped() {
+    for (marked, original_word) in [
+        (
+            "HANDLER mb3_direct READ `PRI__CODEX_CURSOR__` FIRST",
+            "PRIMARY",
+        ),
+        (
+            "HANDLER mb3_direct READ`PRI__CODEX_CURSOR__`FIRST",
+            "`PRIMARY`",
+        ),
+    ] {
+        assert!(
+            intellisense_sweep_word_skip_context(
+                marked,
+                crate::db::DatabaseType::MariaDB,
+                original_word,
+            ),
+            "HANDLER READ index names are references not represented by completion metadata: {marked}"
+        );
+    }
+}
+
+#[test]
+fn sweep_preserves_quotes_around_quoted_identifier_prefixes() {
+    let mut data = IntellisenseData::new();
+    data.tables.push("mb3_direct".to_string());
+    data.rebuild_indices();
+
+    let run = intellisense_sweep_run(
+        "HANDLER mb3_direct READ`PRIMARY`FIRST;",
+        crate::db::DatabaseType::MariaDB,
+        &data,
+    );
+    assert!(
+        run.missing.iter().all(|missing| {
+            !missing
+                .word
+                .trim_matches(|ch| matches!(ch, '`' | '"'))
+                .eq_ignore_ascii_case("PRIMARY")
+        }),
+        "quoted HANDLER index reference should remain lexically separated during the sweep"
     );
 }

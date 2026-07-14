@@ -1567,8 +1567,8 @@ fn data_type_keywords_for(
     match db_type {
         None => oracle_data_type_keywords(position),
         Some(DatabaseType::Oracle) => oracle_data_type_keywords(position),
-        Some(DatabaseType::MySQL) => mysql_data_type_keywords(position),
-        Some(DatabaseType::MariaDB) => mysql_data_type_keywords(position),
+        Some(DatabaseType::MySQL) => mysql_data_type_keywords(position, false),
+        Some(DatabaseType::MariaDB) => mysql_data_type_keywords(position, true),
     }
 }
 
@@ -1665,7 +1665,10 @@ fn oracle_data_type_keywords(position: DataTypePosition) -> &'static [&'static s
     }
 }
 
-fn mysql_data_type_keywords(position: DataTypePosition) -> &'static [&'static str] {
+fn mysql_data_type_keywords(
+    position: DataTypePosition,
+    mariadb: bool,
+) -> &'static [&'static str] {
     const MYSQL_COLUMN_TYPES: &[&str] = &[
         "TINYINT",
         "SMALLINT",
@@ -1699,6 +1702,60 @@ fn mysql_data_type_keywords(position: DataTypePosition) -> &'static [&'static st
         "TIME",
         "YEAR",
         "JSON",
+        "GEOMETRY",
+        "GEOMETRYCOLLECTION",
+        "LINESTRING",
+        "MULTILINESTRING",
+        "MULTIPOINT",
+        "MULTIPOLYGON",
+        "POINT",
+        "POLYGON",
+    ];
+    const MARIADB_COLUMN_TYPES: &[&str] = &[
+        "TINYINT",
+        "SMALLINT",
+        "MEDIUMINT",
+        "INT",
+        "INTEGER",
+        "BIGINT",
+        "DECIMAL",
+        "NUMERIC",
+        "FLOAT",
+        "DOUBLE",
+        "BIT",
+        "BOOLEAN",
+        "CHAR",
+        "VARCHAR",
+        "BINARY",
+        "VARBINARY",
+        "TINYBLOB",
+        "BLOB",
+        "MEDIUMBLOB",
+        "LONGBLOB",
+        "TINYTEXT",
+        "TEXT",
+        "MEDIUMTEXT",
+        "LONGTEXT",
+        "ENUM",
+        "SET",
+        "DATE",
+        "DATETIME",
+        "TIMESTAMP",
+        "TIME",
+        "YEAR",
+        "JSON",
+        "GEOMETRY",
+        "GEOMETRYCOLLECTION",
+        "LINESTRING",
+        "MULTILINESTRING",
+        "MULTIPOINT",
+        "MULTIPOLYGON",
+        "POINT",
+        "POLYGON",
+        "INET4",
+        "INET6",
+        "UUID",
+        "VECTOR",
     ];
     // The grammar that `CAST(expr AS type)` accepts in MySQL/MariaDB.
     const MYSQL_CAST_TYPES: &[&str] = &[
@@ -1710,7 +1767,13 @@ fn mysql_data_type_keywords(position: DataTypePosition) -> &'static [&'static st
         DataTypePosition::Cast => MYSQL_CAST_TYPES,
         DataTypePosition::TypeObject => &[],
         DataTypePosition::ToolVariable => &[],
-        DataTypePosition::ColumnDef | DataTypePosition::Plsql => MYSQL_COLUMN_TYPES,
+        DataTypePosition::ColumnDef | DataTypePosition::Plsql => {
+            if mariadb {
+                MARIADB_COLUMN_TYPES
+            } else {
+                MYSQL_COLUMN_TYPES
+            }
+        }
     }
 }
 
@@ -2713,6 +2776,25 @@ impl SqlEditorWidget {
         } else {
             Vec::new()
         };
+        let early_mysql_call_target_suggestions = if qualifier.is_none()
+            && crate::sql_text::mysql_compatibility_for_sql(
+                "",
+                Some(snapshot.preferred_db_type),
+            )
+            && prefix_is_followed_by_call_paren
+            && Self::text_before_cursor_preceding_word_is(
+                &snapshot.signature_scan_text,
+                &snapshot.prefix,
+                "CALL",
+            )
+        {
+            let mut data = intellisense_data
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            data.get_procedure_object_suggestions(&snapshot.prefix)
+        } else {
+            Vec::new()
+        };
         let early_oracle_language_member_suggestions = qualifier.and_then(|qualifier| {
             (!crate::sql_text::mysql_compatibility_for_sql(
                 "",
@@ -2773,7 +2855,7 @@ impl SqlEditorWidget {
                 Some(snapshot.preferred_db_type),
                 None,
             );
-        let early_structural_keyword_before_current_identifier =
+        let mut early_structural_keyword_before_current_identifier =
             if crate::sql_text::mysql_compatibility_for_sql(
                 "",
                 Some(snapshot.preferred_db_type),
@@ -2790,7 +2872,21 @@ impl SqlEditorWidget {
                     Some(snapshot.preferred_db_type),
                 )
             };
-        let mysql_named_value_suggestions = if qualifier.is_none() {
+        if completion_db_type_is_mariadb(Some(snapshot.preferred_db_type))
+            && crate::ui::intellisense::suggestion_matches_completion_prefix(
+                "AS",
+                &snapshot.prefix,
+            )
+            && snapshot
+                .text_after_cursor
+                .trim_start()
+                .split(|ch: char| !crate::sql_text::is_identifier_char(ch))
+                .next()
+                .is_some_and(|word| word.eq_ignore_ascii_case("OF"))
+        {
+            early_structural_keyword_before_current_identifier = Some("AS".to_string());
+        }
+        let mut mysql_named_value_suggestions = if qualifier.is_none() {
             let mut data = intellisense_data
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -2804,6 +2900,18 @@ impl SqlEditorWidget {
         } else {
             Vec::new()
         };
+        for suggestion in Self::mysql_system_variable_reference_suggestions_from_text(
+            &snapshot.signature_scan_text,
+            &snapshot.prefix,
+            Some(snapshot.preferred_db_type),
+        ) {
+            if mysql_named_value_suggestions
+                .iter()
+                .all(|existing| !existing.eq_ignore_ascii_case(&suggestion))
+            {
+                mysql_named_value_suggestions.push(suggestion);
+            }
+        }
         let at_mysql_user_variable_name_slot = qualifier.is_none()
             && Self::cursor_is_at_mysql_user_variable_name_slot_for_context(
                 deep_ctx,
@@ -2836,6 +2944,25 @@ impl SqlEditorWidget {
                 statement_keyword_end,
                 &["SET"],
             );
+        let at_mariadb_cycle_reference = qualifier.is_none()
+            && completion_db_type_is_mariadb(Some(snapshot.preferred_db_type))
+            && matches!(
+                deep_ctx.phase,
+                intellisense_context::SqlPhase::RecursiveCteColumnList
+            )
+            && deep_ctx
+                .statement_tokens
+                .get(..statement_keyword_end.min(deep_ctx.statement_tokens.len()))
+                .unwrap_or(deep_ctx.statement_tokens.as_ref())
+                .iter()
+                .any(
+                    |token| matches!(token, SqlToken::Word(word) if word.eq_ignore_ascii_case("CYCLE")),
+                )
+            && Self::current_meaningful_word_is_followed_by_word(
+                deep_ctx.statement_tokens.as_ref(),
+                statement_keyword_end,
+                &["RESTRICT"],
+            );
         let early_transform_source_column_suggestions = if qualifier.is_none()
             && !crate::sql_text::mysql_compatibility_for_sql(
                 "",
@@ -2866,11 +2993,12 @@ impl SqlEditorWidget {
                 intellisense_context::SqlPhase::ModelClause
                     | intellisense_context::SqlPhase::PivotClause
             ) || at_oracle_cycle_reference
+                || at_mariadb_cycle_reference
                 || !early_transform_source_column_suggestions.is_empty()
                 || !early_text_model_identifier_suggestions.is_empty())
         {
             let mut candidates = Self::collect_derived_columns_for_context(deep_ctx);
-            if at_oracle_cycle_reference {
+            if at_oracle_cycle_reference || at_mariadb_cycle_reference {
                 for cte in &deep_ctx.ctes {
                     candidates.extend(cte.explicit_columns.iter().cloned());
                 }
@@ -2910,6 +3038,20 @@ impl SqlEditorWidget {
         } else {
             Vec::new()
         };
+        let early_mariadb_type_of_target_suggestions =
+            if completion_db_type_is_mariadb(Some(snapshot.preferred_db_type)) {
+                let mut data = intellisense_data
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                Self::mariadb_type_of_target_suggestions(
+                    &mut data,
+                    &snapshot.prefix,
+                    qualifier,
+                    deep_ctx,
+                )
+            } else {
+                Vec::new()
+            };
         let early_relation_alias_suggestions = if qualifier.is_none()
             && snapshot.text_after_cursor.trim_start().starts_with('.')
         {
@@ -3135,6 +3277,7 @@ impl SqlEditorWidget {
         if suppresses_existing_identifier_completion
             && early_signature_argument_suggestions.is_empty()
             && early_builtin_function_call_suggestions.is_empty()
+            && early_mysql_call_target_suggestions.is_empty()
             && early_oracle_language_member_suggestions
                 .as_ref()
                 .is_none_or(Vec::is_empty)
@@ -3143,6 +3286,7 @@ impl SqlEditorWidget {
             && early_model_identifier_suggestions.is_empty()
             && early_inline_function_suggestions.is_empty()
             && early_local_type_suggestions.is_empty()
+            && early_mariadb_type_of_target_suggestions.is_empty()
             && early_relation_alias_suggestions.is_empty()
             && early_qualified_subquery_column_suggestions.is_empty()
             && early_qualified_visible_relation_column_suggestions.is_empty()
@@ -3162,7 +3306,8 @@ impl SqlEditorWidget {
         if Self::cursor_is_in_invalid_set_operation_branch_for_context(
             deep_ctx,
             has_prefix || qualifier.is_some(),
-        ) {
+        ) && early_structural_keyword_before_current_identifier.is_none()
+        {
             return IntellisenseCompletionComputation::Suppressed;
         }
         let completion_policy =
@@ -3324,6 +3469,14 @@ impl SqlEditorWidget {
                 let data = intellisense_data
                     .lock()
                     .unwrap_or_else(|poisoned| poisoned.into_inner());
+                if deep_ctx.phase.is_table_context()
+                    && data
+                        .schemas
+                        .iter()
+                        .any(|schema| schema.eq_ignore_ascii_case(qualifier))
+                {
+                    return Some(QualifiedCompletionMode::RelationMembers);
+                }
                 Self::resolve_qualified_completion_mode_for_db(
                     qualifier,
                     context,
@@ -3375,6 +3528,14 @@ impl SqlEditorWidget {
         } else {
             None
         };
+        let mysql_table_statement_column_scope = if qualifier.is_none() && mysql_compatible {
+            Self::mysql_table_statement_column_scope_for_context(
+                deep_ctx,
+                !snapshot.prefix.is_empty(),
+            )
+        } else {
+            None
+        };
         let alter_table_check_expression_column_scope = if qualifier.is_none() {
             Self::alter_table_check_expression_column_scope_for_context(
                 deep_ctx,
@@ -3406,6 +3567,8 @@ impl SqlEditorWidget {
         } else if let Some(scope) = mysql_alter_table_index_column_scope.as_ref() {
             scope.clone()
         } else if let Some(scope) = mysql_handler_read_where_column_scope.as_ref() {
+            scope.clone()
+        } else if let Some(scope) = mysql_table_statement_column_scope.as_ref() {
             scope.clone()
         } else if let Some(scope) = alter_table_check_expression_column_scope.as_ref() {
             scope.clone()
@@ -3508,15 +3671,42 @@ impl SqlEditorWidget {
         } else {
             Vec::new()
         };
-        let plsql_cursor_parameter_suggestions = if qualifier.is_none()
-            && !crate::sql_text::mysql_compatibility_for_sql("", Some(snapshot.preferred_db_type))
+        let mysql_end_label_suggestions_by_text = if qualifier.is_none()
+            && crate::sql_text::mysql_compatibility_for_sql(
+                "",
+                Some(snapshot.preferred_db_type),
+            )
         {
-            Self::plsql_cursor_parameter_suggestions_from_statement_text(
-                expanded_statement_text,
-                cursor_in_statement,
+            Self::mysql_expected_end_label_suggestions_from_statement_text(
+                &snapshot.signature_scan_text,
+                snapshot.signature_scan_text.len(),
                 &snapshot.prefix,
                 Some(snapshot.preferred_db_type),
             )
+        } else {
+            Vec::new()
+        };
+        let cursor_parameter_suggestions = if qualifier.is_none() {
+            if completion_db_type_is_mariadb(Some(snapshot.preferred_db_type)) {
+                Self::mariadb_cursor_parameter_suggestions_from_statement_text(
+                    expanded_statement_text,
+                    cursor_in_statement,
+                    &snapshot.prefix,
+                    Some(snapshot.preferred_db_type),
+                )
+            } else if !crate::sql_text::mysql_compatibility_for_sql(
+                "",
+                Some(snapshot.preferred_db_type),
+            ) {
+                Self::plsql_cursor_parameter_suggestions_from_statement_text(
+                    expanded_statement_text,
+                    cursor_in_statement,
+                    &snapshot.prefix,
+                    Some(snapshot.preferred_db_type),
+                )
+            } else {
+                Vec::new()
+            }
         } else {
             Vec::new()
         };
@@ -3535,6 +3725,7 @@ impl SqlEditorWidget {
                 Some(snapshot.preferred_db_type),
             ) || at_plsql_end_label_slot_by_text
             || !plsql_named_end_target_suggestions_by_text.is_empty()
+            || !mysql_end_label_suggestions_by_text.is_empty()
             || Self::cursor_is_at_plsql_named_end_target_slot_for_context(
                 deep_ctx,
                 !snapshot.prefix.is_empty(),
@@ -3607,7 +3798,7 @@ impl SqlEditorWidget {
                 || at_plsql_statement_start_local_symbol_slot
                 || at_mysql_set_local_assignment_target_slot
                 || at_prefixed_routine_local_symbol_slot
-                || !plsql_cursor_parameter_suggestions.is_empty()
+                || !cursor_parameter_suggestions.is_empty()
             {
                 Self::collect_local_symbol_suggestions_for_db(
                     &snapshot.prefix,
@@ -3652,10 +3843,16 @@ impl SqlEditorWidget {
                     plsql_named_end_target_suggestions_by_text,
                 );
             }
-            if !plsql_cursor_parameter_suggestions.is_empty() {
+            if !mysql_end_label_suggestions_by_text.is_empty() {
                 local_suggestions = Self::prepend_local_symbol_suggestions(
                     local_suggestions,
-                    plsql_cursor_parameter_suggestions,
+                    mysql_end_label_suggestions_by_text,
+                );
+            }
+            if !cursor_parameter_suggestions.is_empty() {
+                local_suggestions = Self::prepend_local_symbol_suggestions(
+                    local_suggestions,
+                    cursor_parameter_suggestions,
                 );
             }
         }
@@ -3727,6 +3924,8 @@ impl SqlEditorWidget {
             qualifier.is_none() && mysql_alter_table_index_column_scope.is_some();
         let at_mysql_handler_read_where_column_slot =
             qualifier.is_none() && mysql_handler_read_where_column_scope.is_some();
+        let at_mysql_table_statement_column_slot =
+            qualifier.is_none() && mysql_table_statement_column_scope.is_some();
         let at_reference_column_slot = qualifier.is_none() && reference_column_scope.is_some();
         let at_oracle_trigger_update_of_column_slot =
             qualifier.is_none() && oracle_trigger_update_of_column_scope.is_some();
@@ -3757,6 +3956,7 @@ impl SqlEditorWidget {
             || at_mysql_analyze_histogram_column_slot
             || at_mysql_alter_table_index_column_slot
             || at_mysql_handler_read_where_column_slot
+            || at_mysql_table_statement_column_slot
             || at_reference_column_slot
             || at_oracle_trigger_update_of_column_slot
             || at_alter_table_check_expression_column_slot
@@ -4441,6 +4641,15 @@ impl SqlEditorWidget {
                 true,
             )
         };
+        let suggestions = if early_mariadb_type_of_target_suggestions.is_empty() {
+            suggestions
+        } else {
+            Self::merge_suggestions_with_context_aliases(
+                suggestions,
+                early_mariadb_type_of_target_suggestions,
+                true,
+            )
+        };
         let suggestions = if early_qualified_subquery_column_suggestions.is_empty() {
             suggestions
         } else {
@@ -4501,6 +4710,15 @@ impl SqlEditorWidget {
             Self::merge_suggestions_with_context_aliases(
                 suggestions,
                 early_oracle_show_errors_object_suggestions,
+                true,
+            )
+        };
+        let suggestions = if early_mysql_call_target_suggestions.is_empty() {
+            suggestions
+        } else {
+            Self::merge_suggestions_with_context_aliases(
+                suggestions,
+                early_mysql_call_target_suggestions,
                 true,
             )
         };
@@ -6948,8 +7166,20 @@ impl SqlEditorWidget {
             })
             .take(4)
             .collect::<Vec<_>>();
+        let following_words = if lookahead_words.first().is_some_and(|word| {
+            crate::ui::intellisense::suggestion_matches_completion_prefix(word, prefix)
+        }) {
+            lookahead_words.get(1..).unwrap_or(&[])
+        } else {
+            lookahead_words.as_slice()
+        };
         let meaningful_before = Self::meaningful_tokens_before(tokens, end);
         let full_meaningful_before = Self::meaningful_tokens_before(statement_tokens, full_end);
+        let full_words = Self::words_for_keyword_slot(statement_tokens, full_end);
+        let full_last_word = full_meaningful_before
+            .last()
+            .and_then(|token| Self::token_word(token))
+            .map(str::to_ascii_uppercase);
         let last_token_is = |symbol: &str| {
             matches!(
                 meaningful_before.last(),
@@ -6961,7 +7191,535 @@ impl SqlEditorWidget {
         };
         let statement_words = current_statement_words();
         let statement_has = |keyword: &str| statement_words.iter().any(|word| word == keyword);
+        let full_has = |keyword: &str| full_words.iter().any(|word| word == keyword);
+        let recent_full_has = |keyword: &str, limit: usize| {
+            full_words
+                .iter()
+                .rev()
+                .take(limit)
+                .any(|word| word == keyword)
+        };
         let inside_routine = Self::cursor_is_inside_mysql_routine_body_for_context(deep_ctx, db_type);
+        let mariadb = completion_db_type_is_mariadb(db_type);
+        let inside_mariadb_anonymous_block = mariadb && full_has("BEGIN") && full_has("ATOMIC");
+
+        if matches_prefix("WHERE")
+            && (matches!(
+                deep_ctx.phase,
+                intellisense_context::SqlPhase::FromClause
+                    | intellisense_context::SqlPhase::JoinCondition
+            ) || (matches!(deep_ctx.phase, intellisense_context::SqlPhase::SetClause)
+                && full_has("UPDATE")))
+        {
+            return Some("WHERE".to_string());
+        }
+        if matches_prefix("GROUP")
+            && matches!(deep_ctx.phase, intellisense_context::SqlPhase::FromClause)
+        {
+            return Some("GROUP".to_string());
+        }
+        if matches_prefix("HAVING")
+            && matches!(deep_ctx.phase, intellisense_context::SqlPhase::GroupByClause)
+        {
+            return Some("HAVING".to_string());
+        }
+        if matches_prefix("LIMIT")
+            && matches!(deep_ctx.phase, intellisense_context::SqlPhase::OrderByClause)
+        {
+            return Some("LIMIT".to_string());
+        }
+        if matches_prefix("FOR")
+            && matches!(deep_ctx.phase, intellisense_context::SqlPhase::OrderByClause)
+            && following_words
+                .first()
+                .is_some_and(|word| matches!(word.as_str(), "SHARE" | "UPDATE"))
+        {
+            return Some("FOR".to_string());
+        }
+        if matches_prefix("FROM")
+            && matches!(deep_ctx.phase, intellisense_context::SqlPhase::DeleteTarget)
+        {
+            return Some("FROM".to_string());
+        }
+        if matches_prefix("SELECT")
+            && ((matches!(
+                deep_ctx.phase,
+                intellisense_context::SqlPhase::WithClause
+                    | intellisense_context::SqlPhase::RecursiveCteColumnList
+            ) && (last_token_is(")") || full_last_word.as_deref() == Some("RESTRICT")))
+                || (mariadb
+                    && matches!(deep_ctx.phase, intellisense_context::SqlPhase::SetClause)
+                    && recent_full_has("FOR", 2))
+                || Self::active_query_range_starts_after_set_operator(deep_ctx))
+        {
+            return Some("SELECT".to_string());
+        }
+        if matches_prefix("UPDATE")
+            && matches!(deep_ctx.phase, intellisense_context::SqlPhase::WithClause)
+            && last_token_is(")")
+        {
+            return Some("UPDATE".to_string());
+        }
+        if matches_prefix("DELETE")
+            && matches!(deep_ctx.phase, intellisense_context::SqlPhase::WithClause)
+            && last_token_is(")")
+        {
+            return Some("DELETE".to_string());
+        }
+
+        if matches_prefix("RETURNED_SQLSTATE")
+            && statement_has("DIAGNOSTICS")
+            && statement_has("CONDITION")
+        {
+            return Some("RETURNED_SQLSTATE".to_string());
+        }
+        if matches_prefix("MYSQL_ERRNO")
+            && statement_has("DIAGNOSTICS")
+            && statement_has("CONDITION")
+        {
+            return Some("MYSQL_ERRNO".to_string());
+        }
+        if matches_prefix("MESSAGE_TEXT")
+            && statement_has("DIAGNOSTICS")
+            && statement_has("CONDITION")
+        {
+            return Some("MESSAGE_TEXT".to_string());
+        }
+        if matches_prefix("ELSEIF")
+            && inside_routine
+            && (statement_has("IF")
+                || (prefix.eq_ignore_ascii_case("ELSE") && statement_words.is_empty()))
+        {
+            return Some("ELSEIF".to_string());
+        }
+        if matches_prefix("SRID")
+            && matches!(last, Some("POINT" | "POLYGON" | "LINESTRING"))
+        {
+            return Some("SRID".to_string());
+        }
+        if matches_prefix("RANGE")
+            && statement_has("CREATE")
+            && statement_has("TABLE")
+            && statement_has("PARTITION")
+            && matches!(last, Some("BY"))
+        {
+            return Some("RANGE".to_string());
+        }
+        if matches_prefix("LIST")
+            && statement_has("CREATE")
+            && statement_has("TABLE")
+            && statement_has("PARTITION")
+            && matches!(last, Some("BY"))
+        {
+            return Some("LIST".to_string());
+        }
+        if matches_prefix("COLUMNS")
+            && statement_has("PARTITION")
+            && matches!(last, Some("RANGE" | "LIST"))
+        {
+            return Some("COLUMNS".to_string());
+        }
+        if matches_prefix("VALUES")
+            && statement_has("PARTITION")
+            && lookahead_words
+                .iter()
+                .any(|word| matches!(word.as_str(), "LESS" | "IN"))
+        {
+            return Some("VALUES".to_string());
+        }
+        if matches_prefix("LESS")
+            && matches!(last, Some("VALUES"))
+            && lookahead_words.iter().any(|word| word == "THAN")
+        {
+            return Some("LESS".to_string());
+        }
+        if matches_prefix("THAN") && matches!(last, Some("LESS")) {
+            return Some("THAN".to_string());
+        }
+        if matches_prefix("IN")
+            && statement_has("PARTITION")
+            && matches!(last, Some("VALUES"))
+        {
+            return Some("IN".to_string());
+        }
+        if matches_prefix("MEMBER") && lookahead_words.iter().any(|word| word == "OF") {
+            return Some("MEMBER".to_string());
+        }
+        if matches_prefix("NATURAL")
+            && statement_has("AGAINST")
+            && matches!(last, Some("IN"))
+            && lookahead_words.iter().any(|word| word == "LANGUAGE")
+        {
+            return Some("NATURAL".to_string());
+        }
+        if matches_prefix("BOOLEAN")
+            && statement_has("AGAINST")
+            && matches!(last, Some("IN"))
+        {
+            return Some("BOOLEAN".to_string());
+        }
+        if matches_prefix("LANGUAGE")
+            && statement_has("AGAINST")
+            && matches!(last, Some("NATURAL"))
+        {
+            return Some("LANGUAGE".to_string());
+        }
+        if matches_prefix("MODE")
+            && statement_has("AGAINST")
+            && matches!(last, Some("BOOLEAN" | "LANGUAGE"))
+        {
+            return Some("MODE".to_string());
+        }
+        if matches_prefix("WITH")
+            && statement_has("AGAINST")
+            && lookahead_words.iter().any(|word| word == "QUERY")
+        {
+            return Some("WITH".to_string());
+        }
+
+        if mariadb {
+            let handler_for_has_condition = statement_words
+                .iter()
+                .rposition(|word| word == "HANDLER")
+                .and_then(|handler_idx| {
+                    statement_words
+                        .iter()
+                        .enumerate()
+                        .skip(handler_idx + 1)
+                        .find_map(|(idx, word)| (word == "FOR").then_some(idx))
+                })
+                .is_some_and(|for_idx| statement_words.len() > for_idx + 1);
+            if matches_prefix("WITH")
+                && following_words.get(0).is_some_and(|word| word == "SYSTEM")
+                && following_words.get(1).is_some_and(|word| word == "VERSIONING")
+            {
+                return Some("WITH".to_string());
+            }
+            if matches_prefix("FOR")
+                && following_words.first().is_some_and(|word| word == "PORTION")
+                && (full_has("UPDATE") || full_has("DELETE"))
+            {
+                return Some("FOR".to_string());
+            }
+            if matches_prefix("INDEX")
+                && (matches!(last, Some("VECTOR"))
+                    || full_last_word.as_deref() == Some("VECTOR"))
+            {
+                return Some("INDEX".to_string());
+            }
+            if matches_prefix("M")
+                && full_has("VECTOR")
+                && full_has("INDEX")
+                && last_token_is(")")
+            {
+                return Some("M".to_string());
+            }
+            if matches_prefix("DISTANCE") && full_has("VECTOR") && full_has("INDEX") {
+                return Some("DISTANCE".to_string());
+            }
+            if matches_prefix("cosine")
+                && full_has("VECTOR")
+                && recent_full_has("DISTANCE", 2)
+                && last_token_is("=")
+            {
+                return Some("cosine".to_string());
+            }
+            if matches_prefix("ROW")
+                && statement_has("DECLARE")
+                && following_words.get(0).is_some_and(|word| word == "TYPE")
+                && following_words.get(1).is_some_and(|word| word == "OF")
+            {
+                return Some("ROW".to_string());
+            }
+            if matches_prefix("START")
+                && recent_full_has("GENERATED", 5)
+                && recent_full_has("ALWAYS", 4)
+                && full_last_word.as_deref() == Some("ROW")
+            {
+                return Some("START".to_string());
+            }
+            if matches_prefix("END")
+                && recent_full_has("GENERATED", 5)
+                && recent_full_has("ALWAYS", 4)
+                && full_last_word.as_deref() == Some("ROW")
+            {
+                return Some("END".to_string());
+            }
+            if matches_prefix("RETURN")
+                && full_has("CREATE")
+                && full_has("FUNCTION")
+                && full_has("RETURNS")
+            {
+                return Some("RETURN".to_string());
+            }
+            if matches_prefix("CONDITION")
+                && statement_has("DECLARE")
+                && following_words.first().is_some_and(|word| word == "FOR")
+            {
+                return Some("CONDITION".to_string());
+            }
+            if matches_prefix("GET")
+                && inside_mariadb_anonymous_block
+                && following_words
+                    .first()
+                    .is_some_and(|word| matches!(word.as_str(), "DIAGNOSTICS" | "CURRENT" | "STACKED"))
+            {
+                return Some("GET".to_string());
+            }
+            if matches_prefix("RESIGNAL") && inside_mariadb_anonymous_block {
+                return Some("RESIGNAL".to_string());
+            }
+            if matches_prefix("BEGIN")
+                && inside_mariadb_anonymous_block
+                && last_token_is(":")
+            {
+                return Some("BEGIN".to_string());
+            }
+            if matches_prefix("BEGIN") && handler_for_has_condition {
+                return Some("BEGIN".to_string());
+            }
+            if matches_prefix("DECLARE") && inside_mariadb_anonymous_block {
+                return Some("DECLARE".to_string());
+            }
+            if matches_prefix("FOR")
+                && inside_mariadb_anonymous_block
+                && statement_has("HANDLER")
+            {
+                return Some("FOR".to_string());
+            }
+            if matches_prefix("INTO") && statement_has("INSERT") {
+                return Some("INTO".to_string());
+            }
+            if matches_prefix("FETCH")
+                && matches!(deep_ctx.phase, intellisense_context::SqlPhase::OrderByClause)
+            {
+                return Some("FETCH".to_string());
+            }
+            if matches_prefix("WITH")
+                && matches!(deep_ctx.phase, intellisense_context::SqlPhase::GroupByClause)
+                && following_words.first().is_some_and(|word| word == "ROLLUP")
+            {
+                return Some("WITH".to_string());
+            }
+            if matches_prefix("YEAR") && recent_full_has("INTERVAL", 4) {
+                return Some("YEAR".to_string());
+            }
+            if matches_prefix("INTERVAL") && last_token_is("-") {
+                return Some("INTERVAL".to_string());
+            }
+            if matches_prefix("ROWS")
+                && recent_full_has("LIMIT", 4)
+                && following_words.first().is_some_and(|word| word == "EXAMINED")
+            {
+                return Some("ROWS".to_string());
+            }
+            if matches_prefix("NEXT")
+                && following_words.first().is_some_and(|word| word == "VALUE")
+            {
+                return Some("NEXT".to_string());
+            }
+            if matches_prefix("max_statement_time")
+                && statement_has("SET")
+                && statement_has("STATEMENT")
+            {
+                return Some("max_statement_time".to_string());
+            }
+            if matches_prefix("SYSTEM_TIME")
+                && (matches!(last, Some("FOR")) || statement_has("PERIOD"))
+            {
+                return Some("SYSTEM_TIME".to_string());
+            }
+            if matches_prefix("VERSIONING")
+                && statement_has("WITH")
+                && matches!(last, Some("SYSTEM"))
+            {
+                return Some("VERSIONING".to_string());
+            }
+            if matches_prefix("ROW")
+                && matches!(last, Some("DECLARE"))
+                && lookahead_words.iter().any(|word| word == "TYPE")
+            {
+                return Some("ROW".to_string());
+            }
+            if matches_prefix("TYPE")
+                && statement_has("DECLARE")
+                && lookahead_words.iter().any(|word| word == "OF")
+            {
+                return Some("TYPE".to_string());
+            }
+            if matches_prefix("OF")
+                && statement_has("DECLARE")
+                && matches!(last, Some("TYPE"))
+            {
+                return Some("OF".to_string());
+            }
+            if matches_prefix("PORTION")
+                && matches!(last, Some("FOR"))
+                && (statement_has("UPDATE") || statement_has("DELETE"))
+            {
+                return Some("PORTION".to_string());
+            }
+            if matches_prefix("OF")
+                && statement_has("PORTION")
+                && matches!(last, Some("PORTION"))
+            {
+                return Some("OF".to_string());
+            }
+            if matches_prefix("FROM")
+                && statement_has("PORTION")
+                && statement_has("OF")
+            {
+                return Some("FROM".to_string());
+            }
+            if matches_prefix("TO")
+                && statement_has("PORTION")
+                && statement_has("FROM")
+            {
+                return Some("TO".to_string());
+            }
+            if matches_prefix("IMMEDIATE") && matches!(last, Some("EXECUTE")) {
+                return Some("IMMEDIATE".to_string());
+            }
+            if matches_prefix("CYCLE")
+                && statement_has("WITH")
+                && statement_has("RECURSIVE")
+            {
+                return Some("CYCLE".to_string());
+            }
+            if matches_prefix("RESTRICT") && statement_has("CYCLE") {
+                return Some("RESTRICT".to_string());
+            }
+            if matches_prefix("NESTED")
+                && statement_has("JSON_TABLE")
+                && statement_has("COLUMNS")
+            {
+                return Some("NESTED".to_string());
+            }
+            if matches_prefix("GROUP") && matches!(last, Some("WITHIN")) {
+                return Some("GROUP".to_string());
+            }
+            if matches_prefix("OVER")
+                && statement_has("WITHIN")
+                && statement_has("GROUP")
+            {
+                return Some("OVER".to_string());
+            }
+            if matches_prefix("ALL")
+                && statement_has("SYSTEM_TIME")
+                && matches!(last, Some("SYSTEM_TIME"))
+            {
+                return Some("ALL".to_string());
+            }
+            if matches_prefix("AS")
+                && (following_words.first().is_some_and(|word| word == "OF")
+                    || ((statement_has("SYSTEM_TIME") || full_has("SYSTEM_TIME"))
+                        && (matches!(last, Some("SYSTEM_TIME"))
+                            || full_last_word.as_deref() == Some("SYSTEM_TIME"))))
+            {
+                return Some("AS".to_string());
+            }
+            if matches_prefix("RETURNING")
+                && (statement_has("INSERT")
+                    || statement_has("UPDATE")
+                    || statement_has("DELETE")
+                    || statement_has("REPLACE")
+                    || full_has("REPLACE"))
+            {
+                return Some("RETURNING".to_string());
+            }
+            if matches_prefix("STATEMENT") && matches!(last, Some("SET")) {
+                return Some("STATEMENT".to_string());
+            }
+            if matches_prefix("FOR")
+                && statement_has("SET")
+                && statement_has("STATEMENT")
+            {
+                return Some("FOR".to_string());
+            }
+            if matches_prefix("VALUE") && matches!(last, Some("NEXT")) {
+                return Some("VALUE".to_string());
+            }
+            if matches_prefix("FOR")
+                && statement_has("NEXT")
+                && matches!(last, Some("VALUE"))
+            {
+                return Some("FOR".to_string());
+            }
+            if matches_prefix("DO") && statement_has("FOR") && statement_has("IN") {
+                return Some("DO".to_string());
+            }
+            if matches_prefix("FOR")
+                && (matches!(last, Some("END")) || full_last_word.as_deref() == Some("END"))
+            {
+                return Some("FOR".to_string());
+            }
+            if matches_prefix("FIRST") && matches!(last, Some("FETCH")) {
+                return Some("FIRST".to_string());
+            }
+            if matches_prefix("ROWS")
+                && statement_has("FETCH")
+                && statement_has("FIRST")
+            {
+                return Some("ROWS".to_string());
+            }
+            if matches_prefix("WITH")
+                && statement_has("FETCH")
+                && statement_has("ROWS")
+            {
+                return Some("WITH".to_string());
+            }
+            if matches_prefix("RETURN") && inside_routine && statement_words.is_empty() {
+                return Some("RETURN".to_string());
+            }
+            if matches_prefix("CASE") && statement_has("RETURN") {
+                return Some("CASE".to_string());
+            }
+            if matches_prefix("NOT") && matches!(last, Some("BEGIN")) {
+                return Some("NOT".to_string());
+            }
+            if matches_prefix("DECLARE") && inside_routine && statement_words.is_empty() {
+                return Some("DECLARE".to_string());
+            }
+            if matches_prefix("HANDLER")
+                && statement_has("DECLARE")
+                && matches!(last, Some("EXIT" | "CONTINUE" | "UNDO"))
+            {
+                return Some("HANDLER".to_string());
+            }
+            if matches_prefix("GET") && inside_routine && statement_words.is_empty() {
+                return Some("GET".to_string());
+            }
+            if matches_prefix("DIAGNOSTICS") && matches!(last, Some("GET")) {
+                return Some("DIAGNOSTICS".to_string());
+            }
+            if matches_prefix("CONDITION") && statement_has("DIAGNOSTICS") {
+                return Some("CONDITION".to_string());
+            }
+            if matches_prefix("RESIGNAL") && inside_routine && statement_words.is_empty() {
+                return Some("RESIGNAL".to_string());
+            }
+            if matches_prefix("HISTORY") && matches!(last, Some("DELETE")) {
+                return Some("HISTORY".to_string());
+            }
+            if matches_prefix("BEFORE") && statement_has("HISTORY") {
+                return Some("BEFORE".to_string());
+            }
+            if matches_prefix("SYSTEM_TIME") && statement_has("HISTORY") {
+                return Some("SYSTEM_TIME".to_string());
+            }
+            if matches_prefix("TIMESTAMP")
+                && statement_has("HISTORY")
+                && statement_has("SYSTEM_TIME")
+            {
+                return Some("TIMESTAMP".to_string());
+            }
+            if matches_prefix("EXAMINED")
+                && statement_has("LIMIT")
+                && matches!(last, Some("ROWS"))
+            {
+                return Some("EXAMINED".to_string());
+            }
+        }
 
         if matches_prefix("FLUSH")
             && matches!(
@@ -30052,6 +30810,44 @@ impl SqlEditorWidget {
         Vec::new()
     }
 
+    fn mysql_system_variable_reference_suggestions_from_text(
+        text_before_cursor: &str,
+        prefix: &str,
+        db_type: Option<crate::db::DatabaseType>,
+    ) -> Vec<String> {
+        if !crate::sql_text::mysql_compatibility_for_sql("", db_type)
+            || !text_before_cursor.ends_with(prefix)
+        {
+            return Vec::new();
+        }
+        let head = text_before_cursor
+            .get(..text_before_cursor.len().saturating_sub(prefix.len()))
+            .unwrap_or("")
+            .trim_end();
+        if head.ends_with("@@") {
+            let mut suggestions = Self::filter_expected_candidates(
+                prefix,
+                &["GLOBAL", "LOCAL", "SESSION"],
+            );
+            suggestions.extend(Self::filter_expected_candidates(
+                prefix,
+                MYSQL_SYSTEM_VARIABLE_NAME_SUGGESTIONS,
+            ));
+            return suggestions;
+        }
+        let upper = head.to_ascii_uppercase();
+        if ["@@GLOBAL.", "@@LOCAL.", "@@SESSION."]
+            .iter()
+            .any(|scope| upper.ends_with(scope))
+        {
+            return Self::filter_expected_candidates(
+                prefix,
+                MYSQL_SYSTEM_VARIABLE_NAME_SUGGESTIONS,
+            );
+        }
+        Vec::new()
+    }
+
     fn cursor_is_at_mysql_set_system_variable_name_slot_for_context(
         deep_ctx: &intellisense_context::CursorContext,
         exclude_current_identifier_chain: bool,
@@ -30702,6 +31498,45 @@ impl SqlEditorWidget {
         }
 
         saw_where.then_some(vec![table])
+    }
+
+    fn mysql_table_statement_column_scope_for_context(
+        deep_ctx: &intellisense_context::CursorContext,
+        exclude_current_identifier_chain: bool,
+    ) -> Option<Vec<String>> {
+        if !matches!(
+            deep_ctx.phase,
+            intellisense_context::SqlPhase::OrderByClause
+        ) {
+            return None;
+        }
+        let tokens = Self::current_query_tokens(deep_ctx);
+        let cursor_token_len = Self::cursor_token_len_in_current_query(deep_ctx);
+        let end = Self::expected_suggestion_context_end(
+            tokens,
+            cursor_token_len,
+            exclude_current_identifier_chain,
+        );
+        let toks = Self::meaningful_tokens_before(tokens, end);
+        if !matches!(
+            toks.first(),
+            Some(SqlToken::Word(word)) if word.eq_ignore_ascii_case("TABLE")
+        ) {
+            return None;
+        }
+        let (table, after_table) = Self::mysql_identifier_chain(&toks, 1)?;
+        toks.get(after_table..)
+            .unwrap_or(&[])
+            .windows(2)
+            .any(|window| {
+                matches!(
+                    window,
+                    [SqlToken::Word(order), SqlToken::Word(by)]
+                        if order.eq_ignore_ascii_case("ORDER")
+                            && by.eq_ignore_ascii_case("BY")
+                )
+            })
+            .then_some(vec![table])
     }
 
     fn references_column_scope_for_context(
@@ -34200,6 +35035,186 @@ impl SqlEditorWidget {
         Self::cursor_is_at_mysql_leave_iterate_label_slot(tokens, end, db_type)
     }
 
+    fn cursor_is_at_mysql_end_label_slot_for_context(
+        deep_ctx: &intellisense_context::CursorContext,
+        exclude_current_identifier_chain: bool,
+        db_type: Option<crate::db::DatabaseType>,
+    ) -> bool {
+        if !crate::sql_text::mysql_compatibility_for_sql("", db_type) {
+            return false;
+        }
+        let tokens = deep_ctx.statement_tokens.as_ref();
+        let end = Self::expected_suggestion_context_end(
+            tokens,
+            deep_ctx.cursor_token_len,
+            exclude_current_identifier_chain,
+        );
+        let words = Self::previous_meaningful_words_upper(tokens, end, 2);
+        matches!(words.as_slice(), [.., end_kw] if end_kw == "END")
+            || matches!(words.as_slice(), [.., end_kw, loop_kw] if end_kw == "END" && loop_kw == "LOOP")
+    }
+
+    fn mysql_expected_end_label_suggestions(
+        deep_ctx: &intellisense_context::CursorContext,
+        prefix: &str,
+    ) -> Vec<String> {
+        let tokens = deep_ctx.statement_tokens.as_ref();
+        let end = Self::expected_suggestion_context_end(
+            tokens,
+            deep_ctx.cursor_token_len,
+            !prefix.is_empty(),
+        );
+        Self::mysql_expected_end_label_suggestions_from_tokens(tokens, end, prefix)
+    }
+
+    fn mysql_expected_end_label_suggestions_from_tokens(
+        tokens: &[SqlToken],
+        end: usize,
+        prefix: &str,
+    ) -> Vec<String> {
+        #[derive(Clone, Copy, PartialEq, Eq)]
+        enum FrameKind {
+            Begin,
+            Loop,
+            While,
+            Repeat,
+            If,
+            Case,
+        }
+
+        let end = end.min(tokens.len());
+        let meaningful = tokens
+            .get(..end)
+            .unwrap_or(&[])
+            .iter()
+            .enumerate()
+            .filter(|(_, token)| !matches!(token, SqlToken::Comment(_)))
+            .collect::<Vec<_>>();
+        let closes_loop = matches!(
+            meaningful.as_slice(),
+            [.., (_, SqlToken::Word(end_kw)), (_, SqlToken::Word(loop_kw))]
+                if end_kw.eq_ignore_ascii_case("END") && loop_kw.eq_ignore_ascii_case("LOOP")
+        );
+        let closing_token_count = if closes_loop { 2 } else { 1 };
+        let scan_len = meaningful.len().saturating_sub(closing_token_count);
+        let mut frames = Vec::<(FrameKind, Option<String>)>::new();
+        let mut pending_label = None::<String>;
+        let mut idx = 0usize;
+
+        while idx < scan_len {
+            let (_, token) = meaningful[idx];
+            if let SqlToken::Word(word) = token {
+                if idx + 1 < scan_len
+                    && matches!(meaningful[idx + 1].1, SqlToken::Symbol(symbol) if symbol == ":")
+                {
+                    pending_label = Self::local_identifier_suggestion_from_word(word);
+                    idx += 2;
+                    continue;
+                }
+
+                let upper = word.to_ascii_uppercase();
+                let previous_is_end = idx > 0
+                    && matches!(meaningful[idx - 1].1, SqlToken::Word(previous) if previous.eq_ignore_ascii_case("END"));
+                match upper.as_str() {
+                    "BEGIN" if !previous_is_end => {
+                        frames.push((FrameKind::Begin, pending_label.take()));
+                    }
+                    "LOOP" if !previous_is_end => {
+                        frames.push((FrameKind::Loop, pending_label.take()));
+                    }
+                    "WHILE" if !previous_is_end => {
+                        frames.push((FrameKind::While, pending_label.take()));
+                    }
+                    "REPEAT" if !previous_is_end => {
+                        frames.push((FrameKind::Repeat, pending_label.take()));
+                    }
+                    "IF" if !previous_is_end => frames.push((FrameKind::If, None)),
+                    "CASE" if !previous_is_end => frames.push((FrameKind::Case, None)),
+                    "END" => {
+                        let suffix = meaningful.get(idx + 1).and_then(|(_, token)| {
+                            Self::token_word(token).map(str::to_ascii_uppercase)
+                        });
+                        let kind = match suffix.as_deref() {
+                            Some("LOOP") => Some(FrameKind::Loop),
+                            Some("FOR") => Some(FrameKind::Loop),
+                            Some("WHILE") => Some(FrameKind::While),
+                            Some("REPEAT") => Some(FrameKind::Repeat),
+                            Some("IF") => Some(FrameKind::If),
+                            Some("CASE") => Some(FrameKind::Case),
+                            _ if frames
+                                .last()
+                                .is_some_and(|(kind, _)| *kind == FrameKind::Case) =>
+                            {
+                                Some(FrameKind::Case)
+                            }
+                            _ => Some(FrameKind::Begin),
+                        };
+                        if let Some(kind) = kind {
+                            if let Some(frame_idx) = frames
+                                .iter()
+                                .rposition(|(frame_kind, _)| *frame_kind == kind)
+                            {
+                                frames.truncate(frame_idx);
+                            }
+                        }
+                        if suffix.is_some() {
+                            idx += 1;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            idx += 1;
+        }
+
+        let expected_kind = if closes_loop {
+            FrameKind::Loop
+        } else {
+            FrameKind::Begin
+        };
+        let prefix_upper = Self::local_identifier_lookup_upper(prefix);
+        let Some(label) = frames
+            .iter()
+            .rev()
+            .find(|(kind, _)| *kind == expected_kind)
+            .and_then(|(_, label)| label.as_ref())
+        else {
+            return Vec::new();
+        };
+        let upper = Self::local_identifier_lookup_upper(label);
+        if Self::local_symbol_matches_prefix(label, &upper, &prefix_upper) {
+            vec![label.clone()]
+        } else {
+            Vec::new()
+        }
+    }
+
+    fn mysql_expected_end_label_suggestions_from_statement_text(
+        statement_text: &str,
+        cursor_in_statement: usize,
+        prefix: &str,
+        db_type: Option<crate::db::DatabaseType>,
+    ) -> Vec<String> {
+        if !crate::sql_text::mysql_compatibility_for_sql("", db_type) {
+            return Vec::new();
+        }
+        let cursor = cursor_in_statement.min(statement_text.len());
+        let prefix_start = cursor.saturating_sub(prefix.len());
+        if !Self::text_before_cursor_ends_with_plsql_end_label_slot(
+            statement_text.get(..cursor).unwrap_or(statement_text),
+            prefix,
+        ) {
+            return Vec::new();
+        }
+        let spans = super::query_text::tokenize_sql_spanned(statement_text);
+        let end = spans.partition_point(|span| span.end <= prefix_start);
+        let tokens = spans
+            .into_iter()
+            .map(|span| span.token)
+            .collect::<Vec<_>>();
+        Self::mysql_expected_end_label_suggestions_from_tokens(&tokens, end, prefix)
+    }
+
     fn mysql_block_label_suggestions(
         deep_ctx: &intellisense_context::CursorContext,
         prefix: &str,
@@ -34840,6 +35855,69 @@ impl SqlEditorWidget {
         }
 
         data.get_member_suggestions(&type_name, prefix, false)
+    }
+
+    fn mariadb_cursor_parameter_suggestions_from_statement_text(
+        statement_text: &str,
+        cursor_in_statement: usize,
+        prefix: &str,
+        db_type: Option<crate::db::DatabaseType>,
+    ) -> Vec<String> {
+        if !completion_db_type_is_mariadb(db_type) {
+            return Vec::new();
+        }
+
+        let cursor = cursor_in_statement.min(statement_text.len());
+        let spans = super::query_text::tokenize_sql_spanned(statement_text);
+        let tokens: Vec<SqlToken> = spans.iter().map(|span| span.token.clone()).collect();
+        let prefix_upper = prefix.to_ascii_uppercase();
+        let mut suggestions = Vec::new();
+        let mut seen = HashSet::new();
+
+        for cursor_keyword_idx in 0..tokens.len() {
+            if !matches!(
+                tokens.get(cursor_keyword_idx),
+                Some(SqlToken::Word(word)) if word.eq_ignore_ascii_case("CURSOR")
+            ) {
+                continue;
+            }
+            let Some(open_idx) =
+                Self::next_non_comment_token_index(&tokens, cursor_keyword_idx + 1)
+            else {
+                continue;
+            };
+            if !matches!(tokens.get(open_idx), Some(SqlToken::Symbol(symbol)) if symbol == "(") {
+                continue;
+            }
+            let Some(close_idx) = Self::matching_symbol_token_index(&tokens, open_idx, "(", ")")
+            else {
+                continue;
+            };
+            let Some(for_idx) = Self::next_non_comment_token_index(&tokens, close_idx + 1) else {
+                continue;
+            };
+            if !matches!(tokens.get(for_idx), Some(SqlToken::Word(word)) if word.eq_ignore_ascii_case("FOR"))
+            {
+                continue;
+            }
+            let item_end_idx = Self::cursor_declaration_item_end_token_index(&tokens, for_idx + 1);
+            let item_end = item_end_idx
+                .and_then(|idx| spans.get(idx).map(|span| span.start))
+                .unwrap_or(statement_text.len());
+            if cursor <= spans.get(for_idx).map_or(0, |span| span.end) || cursor > item_end {
+                continue;
+            }
+            Self::append_plsql_cursor_parameter_suggestions(
+                &tokens,
+                open_idx + 1,
+                close_idx,
+                &prefix_upper,
+                &mut suggestions,
+                &mut seen,
+            );
+        }
+
+        suggestions
     }
 
     fn plsql_cursor_parameter_suggestions_from_statement_text(
@@ -36162,9 +37240,17 @@ impl SqlEditorWidget {
                 tail
                     if tail
                         .last()
-                        .is_some_and(|word| mysql_data_type_keywords(DataTypePosition::ColumnDef)
+                        .is_some_and(|word| {
+                            mysql_data_type_keywords(
+                                DataTypePosition::ColumnDef,
+                                matches!(
+                                    db_type,
+                                    Some(crate::db::DatabaseType::MariaDB)
+                                ),
+                            )
                             .iter()
-                            .any(|data_type| data_type.eq_ignore_ascii_case(word))) =>
+                            .any(|data_type| data_type.eq_ignore_ascii_case(word))
+                        }) =>
                 {
                     return Some(DECLARE_VAR_TAIL)
                 }
@@ -51344,6 +52430,14 @@ impl SqlEditorWidget {
             return Some(kind);
         }
 
+        if crate::sql_text::mysql_compatibility_for_sql("", db_type)
+            && Self::words_for_plsql_statement_slot(tokens, context_end)
+                .last()
+                .is_some_and(|word| word == "CALL")
+        {
+            return Some(ExpectedObjectSuggestionKind::Routine);
+        }
+
         if Self::cursor_is_in_object_command_head(tokens, context_end) {
             match words.as_slice() {
                 [.., last]
@@ -54693,6 +55787,58 @@ impl SqlEditorWidget {
         suggestions
     }
 
+    fn mariadb_type_of_target_suggestions(
+        data: &mut IntellisenseData,
+        prefix: &str,
+        qualifier: Option<&str>,
+        deep_ctx: &intellisense_context::CursorContext,
+    ) -> Vec<String> {
+        let tokens = deep_ctx.statement_tokens.as_ref();
+        let end = Self::expected_suggestion_context_end(
+            tokens,
+            deep_ctx.cursor_token_len,
+            !prefix.is_empty(),
+        );
+        let meaningful = Self::meaningful_tokens_before(tokens, end);
+        let Some(type_idx) = meaningful.windows(2).rposition(|window| {
+            matches!(
+                window,
+                [SqlToken::Word(type_kw), SqlToken::Word(of_kw)]
+                    if type_kw.eq_ignore_ascii_case("TYPE")
+                        && of_kw.eq_ignore_ascii_case("OF")
+            )
+        }) else {
+            return Vec::new();
+        };
+        let tail = meaningful.get(type_idx + 2..).unwrap_or(&[]);
+
+        if let Some(qualifier) = qualifier {
+            let tail_matches_qualifier = tail.is_empty()
+                || matches!(
+                    tail,
+                    [SqlToken::Word(name)] if name.eq_ignore_ascii_case(qualifier)
+                )
+                || matches!(
+                    tail,
+                    [SqlToken::Word(name), SqlToken::Symbol(dot)]
+                        if name.eq_ignore_ascii_case(qualifier) && dot == "."
+                );
+            if !tail_matches_qualifier {
+                return Vec::new();
+            }
+            return data.get_column_suggestions(prefix, Some(&[qualifier.to_string()]));
+        }
+
+        if !tail.is_empty() {
+            return Vec::new();
+        }
+        Self::merge_suggestions_with_context_aliases(
+            data.get_table_object_suggestions(prefix),
+            data.get_view_object_suggestions(prefix),
+            false,
+        )
+    }
+
     fn qualified_subquery_column_suggestions_for_context(
         deep_ctx: &intellisense_context::CursorContext,
         qualifier: &str,
@@ -55949,6 +57095,29 @@ impl SqlEditorWidget {
 
     fn text_after_cursor_starts_with_qualifier_dot(text_after_cursor: &str) -> bool {
         text_after_cursor.trim_start().starts_with('.')
+    }
+
+    fn text_before_cursor_preceding_word_is(
+        text_before_cursor: &str,
+        prefix: &str,
+        expected: &str,
+    ) -> bool {
+        if !text_before_cursor.ends_with(prefix) {
+            return false;
+        }
+        let head = text_before_cursor
+            .get(..text_before_cursor.len().saturating_sub(prefix.len()))
+            .unwrap_or("");
+        let trimmed = head.trim_end();
+        let start = trimmed
+            .char_indices()
+            .rev()
+            .take_while(|(_, ch)| crate::sql_text::is_identifier_char(*ch))
+            .last()
+            .map_or(trimmed.len(), |(idx, _)| idx);
+        trimmed
+            .get(start..)
+            .is_some_and(|word| word.eq_ignore_ascii_case(expected))
     }
 
     fn text_before_cursor_ends_with_plsql_end_label_slot(
@@ -57501,10 +58670,66 @@ impl SqlEditorWidget {
             derived_columns.extend(intellisense_context::extract_select_list_columns(
                 current_query_tokens,
             ));
+            let enclosing_statement_tokens = Self::current_routine_body_statement_range(deep_ctx)
+                .map(|range| intellisense_context::token_range_slice(statement_tokens, range))
+                .unwrap_or(statement_tokens);
+            derived_columns.extend(Self::first_set_operand_projection_columns(
+                enclosing_statement_tokens,
+            ));
         }
 
         Self::dedup_column_names_case_insensitive(&mut derived_columns);
         derived_columns
+    }
+
+    fn first_set_operand_projection_columns(tokens: &[SqlToken]) -> Vec<String> {
+        let mut start = 0usize;
+        let mut end = tokens.len();
+        loop {
+            while start < end && matches!(tokens.get(start), Some(SqlToken::Comment(_))) {
+                start += 1;
+            }
+            while start < end
+                && (matches!(tokens.get(end - 1), Some(SqlToken::Comment(_)))
+                    || matches!(
+                        tokens.get(end - 1),
+                        Some(SqlToken::Symbol(symbol)) if symbol == ";"
+                    ))
+            {
+                end -= 1;
+            }
+            if start >= end {
+                return Vec::new();
+            }
+
+            if matches!(tokens.get(start), Some(SqlToken::Symbol(symbol)) if symbol == "(")
+                && Self::matching_close_paren_index_before(tokens, start, end)
+                    == Some(end.saturating_sub(1))
+            {
+                start += 1;
+                end -= 1;
+                continue;
+            }
+
+            let range = tokens.get(start..end).unwrap_or(&[]);
+            let depths = crate::ui::sql_depth::paren_depths(range);
+            let set_operator = range.iter().enumerate().find_map(|(idx, token)| {
+                (crate::ui::sql_depth::is_top_level_depth(&depths, idx)
+                    && matches!(
+                        token,
+                        SqlToken::Word(word)
+                            if matches!(
+                                word.to_ascii_uppercase().as_str(),
+                                "UNION" | "INTERSECT" | "EXCEPT" | "MINUS"
+                            )
+                    ))
+                .then_some(idx)
+            });
+            let Some(set_operator) = set_operator else {
+                return intellisense_context::extract_select_list_columns(range);
+            };
+            end = start + set_operator;
+        }
     }
 
     fn maybe_prefetch_columns_for_word(

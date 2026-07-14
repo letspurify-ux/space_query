@@ -1,0 +1,310 @@
+-- ============================================================================
+-- SPACE QUERY MYSQL AUTO-FORMAT CERTIFICATION GAUNTLET III
+-- Target: MySQL 8.0.31+
+--
+-- Spatial + full-text boss: SRID axis options, SPATIAL/FULLTEXT indexes,
+-- modern row-alias upsert, LIST partitions, histograms, TABLE, prepared GIS,
+-- JSON_TABLE, CTE DML, named windows, diagnostics, and rollback-only locks.
+-- ============================================================================
+
+DROP DATABASE IF EXISTS sq_mysql_format_cert_3;
+CREATE DATABASE sq_mysql_format_cert_3 CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_ai_ci;
+USE sq_mysql_format_cert_3;
+SET NAMES utf8mb4;
+SET SESSION sql_mode='ONLY_FULL_GROUP_BY,STRICT_TRANS_TABLES,NO_ZERO_IN_DATE,NO_ZERO_DATE,ERROR_FOR_DIVISION_BY_ZERO,NO_ENGINE_SUBSTITUTION';
+SET @lexical_trap='POINT SRID 4326 FULLTEXT MATCH(a) AGAINST("x") TABLE fake; ->> # inert';
+
+/* Comment trap: ST_GeomFromText('POINT(0 0)'); DELIMITER // TABLE x; */
+
+CREATE TABLE gx_place(
+place_id INT NOT NULL,
+place_code VARCHAR(30)NOT NULL,
+place_name VARCHAR(100)NOT NULL,
+description TEXT NOT NULL,
+location POINT SRID 4326 NOT NULL,
+attributes JSON NOT NULL,
+created_at TIMESTAMP(6)NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+PRIMARY KEY(place_id),
+UNIQUE KEY uk_gx_place_code(place_code),
+FULLTEXT KEY ft_gx_place_text(place_name,description),
+SPATIAL KEY sx_gx_place_location(location),
+CONSTRAINT chk_gx_place_attributes CHECK(JSON_VALID(attributes))
+)ENGINE=InnoDB;
+
+CREATE TABLE gx_zone(
+zone_id INT NOT NULL,
+zone_name VARCHAR(80)NOT NULL,
+boundary POLYGON SRID 4326 NOT NULL,
+rules_doc JSON NOT NULL,
+PRIMARY KEY(zone_id),
+UNIQUE KEY uk_gx_zone_name(zone_name),
+SPATIAL KEY sx_gx_zone_boundary(boundary),
+CONSTRAINT chk_gx_zone_rules CHECK(JSON_VALID(rules_doc))
+)ENGINE=InnoDB;
+
+CREATE TABLE gx_route(
+route_id INT NOT NULL,
+from_place_id INT NOT NULL,
+to_place_id INT NOT NULL,
+route_path LINESTRING SRID 4326 NOT NULL,
+route_meta JSON NOT NULL,
+PRIMARY KEY(route_id),
+SPATIAL KEY sx_gx_route_path(route_path),
+KEY ix_gx_route_endpoints(from_place_id,to_place_id),
+CONSTRAINT fk_gx_route_from FOREIGN KEY(from_place_id)REFERENCES gx_place(place_id),
+CONSTRAINT fk_gx_route_to FOREIGN KEY(to_place_id)REFERENCES gx_place(place_id),
+CONSTRAINT chk_gx_route_meta CHECK(JSON_VALID(route_meta))
+)ENGINE=InnoDB;
+
+CREATE TABLE gx_visit(
+visit_id BIGINT NOT NULL,
+place_id INT NOT NULL,
+region_code CHAR(2)NOT NULL,
+visited_on DATE NOT NULL,
+duration_ms INT NOT NULL,
+signals JSON NOT NULL,
+signal_count INT GENERATED ALWAYS AS(JSON_LENGTH(signals))STORED,
+PRIMARY KEY(visit_id,region_code),
+KEY ix_gx_visit_place_day(place_id,visited_on),
+KEY ix_gx_visit_duration(duration_ms),
+CONSTRAINT chk_gx_visit_duration CHECK(duration_ms BETWEEN 1 AND 60000),
+CONSTRAINT chk_gx_visit_signals CHECK(JSON_VALID(signals))
+)ENGINE=InnoDB
+PARTITION BY LIST COLUMNS(region_code)(
+PARTITION p_asia VALUES IN('KR','JP'),
+PARTITION p_west VALUES IN('US','DE')
+);
+
+CREATE TABLE gx_search_rollup(
+place_id INT NOT NULL,
+visit_count BIGINT NOT NULL,
+average_duration DECIMAL(14,3)NOT NULL,
+boolean_relevance DOUBLE NOT NULL,
+evidence JSON NOT NULL,
+PRIMARY KEY(place_id),
+CONSTRAINT fk_gx_rollup_place FOREIGN KEY(place_id)REFERENCES gx_place(place_id)
+)ENGINE=InnoDB;
+
+CREATE TABLE gx_error_log(
+log_id BIGINT NOT NULL AUTO_INCREMENT,
+phase_name VARCHAR(80)NOT NULL,
+sql_state CHAR(5),
+error_no INT,
+message_text VARCHAR(512),
+PRIMARY KEY(log_id)
+)ENGINE=InnoDB;
+
+DELIMITER $$
+
+CREATE FUNCTION gx_distance_band(p_metres DOUBLE)
+RETURNS VARCHAR(20)
+DETERMINISTIC
+RETURN CASE WHEN p_metres<10000 THEN'LOCAL'WHEN p_metres<400000 THEN'REGIONAL'WHEN p_metres<2000000 THEN'LONG_HAUL'ELSE'GLOBAL'END$$
+
+CREATE PROCEDURE gx_assert_3(IN p_condition BOOLEAN,IN p_message VARCHAR(255))
+BEGIN
+IF COALESCE(p_condition,FALSE)=FALSE THEN SIGNAL SQLSTATE'45000'SET MESSAGE_TEXT=p_message;END IF;
+END$$
+
+CREATE TRIGGER gx_place_bi BEFORE INSERT ON gx_place FOR EACH ROW
+BEGIN
+SET NEW.place_code=UPPER(TRIM(NEW.place_code));
+IF ST_SRID(NEW.location)<>4326 OR JSON_VALID(NEW.attributes)=0 THEN
+SIGNAL SQLSTATE'45000'SET MESSAGE_TEXT='invalid geospatial place';
+END IF;
+END$$
+
+CREATE TRIGGER gx_visit_bi BEFORE INSERT ON gx_visit FOR EACH ROW
+BEGIN
+IF NEW.duration_ms<1 OR NEW.duration_ms>60000 OR JSON_VALID(NEW.signals)=0 THEN
+SIGNAL SQLSTATE'45000'SET MESSAGE_TEXT='invalid visit payload';
+END IF;
+END$$
+
+CREATE PROCEDURE gx_run_gauntlet_3()
+outer_block:BEGIN
+DECLARE v_done BOOLEAN DEFAULT FALSE;
+DECLARE v_place_id INT;
+DECLARE v_distance DOUBLE;
+DECLARE v_near_count INT DEFAULT 0;
+DECLARE v_state CHAR(5);
+DECLARE v_errno INT;
+DECLARE v_message VARCHAR(512);
+DECLARE cur_distance CURSOR FOR
+SELECT p.place_id,ST_Distance_Sphere(p.location,ST_GeomFromText('POINT(127 37.5)',4326,'axis-order=long-lat'))
+FROM gx_place p ORDER BY p.place_id;
+DECLARE CONTINUE HANDLER FOR NOT FOUND SET v_done=TRUE;
+DECLARE EXIT HANDLER FOR SQLEXCEPTION
+BEGIN
+GET STACKED DIAGNOSTICS CONDITION 1 v_state=RETURNED_SQLSTATE,v_errno=MYSQL_ERRNO,v_message=MESSAGE_TEXT;
+ROLLBACK;
+INSERT INTO gx_error_log(phase_name,sql_state,error_no,message_text)VALUES('UNEXPECTED',v_state,v_errno,v_message);
+RESIGNAL;
+END;
+START TRANSACTION;
+OPEN cur_distance;
+distance_loop:LOOP
+FETCH cur_distance INTO v_place_id,v_distance;
+IF v_done THEN LEAVE distance_loop;END IF;
+IF v_distance<400000 THEN SET v_near_count=v_near_count+1;END IF;
+END LOOP distance_loop;
+CLOSE cur_distance;
+
+invalid_visit_probe:BEGIN
+DECLARE CONTINUE HANDLER FOR SQLEXCEPTION
+BEGIN
+GET DIAGNOSTICS CONDITION 1 v_state=RETURNED_SQLSTATE,v_errno=MYSQL_ERRNO,v_message=MESSAGE_TEXT;
+INSERT INTO gx_error_log(phase_name,sql_state,error_no,message_text)VALUES('EXPECTED_INVALID_VISIT',v_state,v_errno,v_message);
+END;
+INSERT INTO gx_visit(visit_id,place_id,region_code,visited_on,duration_ms,signals)
+VALUES(999,1,'KR','2026-01-01',-1,JSON_ARRAY(JSON_OBJECT('name','trap','value',0)));
+END invalid_visit_probe;
+
+INSERT INTO gx_place(place_id,place_code,place_name,description,location,attributes)
+VALUES(1,'seoul','Seoul Query Citadel v2','geospatial formatter database certification search updated',ST_GeomFromText('POINT(127.0276 37.4979)',4326,'axis-order=long-lat'),JSON_OBJECT('region','KR','tags',JSON_ARRAY('spatial','search','updated')))AS incoming
+ON DUPLICATE KEY UPDATE place_name=incoming.place_name,description=incoming.description,location=incoming.location,attributes=incoming.attributes;
+
+INSERT INTO gx_search_rollup(place_id,visit_count,average_duration,boolean_relevance,evidence)
+SELECT p.place_id,(SELECT COUNT(*)FROM gx_visit v WHERE v.place_id=p.place_id),
+COALESCE((SELECT AVG(v2.duration_ms)FROM gx_visit v2 WHERE v2.place_id=p.place_id),0),
+MATCH(p.place_name,p.description)AGAINST('+geospatial +formatter'IN BOOLEAN MODE),
+JSON_OBJECT('geojson',ST_AsGeoJSON(p.location),'zone',(SELECT z.zone_name FROM gx_zone z WHERE ST_Contains(z.boundary,p.location)ORDER BY z.zone_id LIMIT 1))
+FROM gx_place p;
+
+SET @gx_origin=ST_GeomFromText('POINT(127 37.5)',4326,'axis-order=long-lat');
+SET @gx_radius=400000;
+SET @gx_sql='CREATE TEMPORARY TABLE gx_nearest AS SELECT place_id,place_code,ST_Distance_Sphere(location,?) distance_m FROM gx_place WHERE ST_Distance_Sphere(location,?)<?';
+PREPARE gx_nearest_stmt FROM @gx_sql;
+EXECUTE gx_nearest_stmt USING @gx_origin,@gx_origin,@gx_radius;
+DEALLOCATE PREPARE gx_nearest_stmt;
+CALL gx_assert_3(v_near_count=2,'cursor near-place count');
+CALL gx_assert_3((SELECT COUNT(*)FROM gx_nearest)=2,'prepared spatial count');
+COMMIT;
+END outer_block$$
+
+DELIMITER ;
+
+INSERT INTO gx_place(place_id,place_code,place_name,description,location,attributes)VALUES
+(1,'seoul','Seoul Query Citadel','geospatial formatter database certification search',ST_GeomFromText('POINT(127.0276 37.4979)',4326,'axis-order=long-lat'),JSON_OBJECT('region','KR','tags',JSON_ARRAY('spatial','search'))),
+(2,'busan','Busan Data Port','harbor analytics database routing',ST_GeomFromText('POINT(129.0756 35.1796)',4326,'axis-order=long-lat'),JSON_OBJECT('region','KR','tags',JSON_ARRAY('harbor','analytics'))),
+(3,'tokyo','Tokyo Parser Observatory','geospatial formatter parser certification',ST_GeomFromText('POINT(139.6917 35.6895)',4326,'axis-order=long-lat'),JSON_OBJECT('region','JP','tags',JSON_ARRAY('parser','spatial'))),
+(4,'berlin','Berlin Search Archive','fulltext database archive legacy',ST_GeomFromText('POINT(13.4050 52.5200)',4326,'axis-order=long-lat'),JSON_OBJECT('region','DE','tags',JSON_ARRAY('archive','search')));
+
+INSERT INTO gx_zone(zone_id,zone_name,boundary,rules_doc)VALUES
+(1,'ASIA_LAB',ST_GeomFromText('POLYGON((124 33,142 33,142 39,124 39,124 33))',4326,'axis-order=long-lat'),JSON_OBJECT('regions',JSON_ARRAY('KR','JP'),'priority',1)),
+(2,'EUROPE_LAB',ST_GeomFromText('POLYGON((10 50,16 50,16 55,10 55,10 50))',4326,'axis-order=long-lat'),JSON_OBJECT('regions',JSON_ARRAY('DE'),'priority',2));
+
+INSERT INTO gx_route(route_id,from_place_id,to_place_id,route_path,route_meta)VALUES
+(1,1,2,ST_GeomFromText('LINESTRING(127.0276 37.4979,128 36.5,129.0756 35.1796)',4326,'axis-order=long-lat'),JSON_OBJECT('mode','rail','waypoints',3)),
+(2,1,3,ST_GeomFromText('LINESTRING(127.0276 37.4979,133 36,139.6917 35.6895)',4326,'axis-order=long-lat'),JSON_OBJECT('mode','air','waypoints',3)),
+(3,3,4,ST_GeomFromText('LINESTRING(139.6917 35.6895,80 45,13.4050 52.5200)',4326,'axis-order=long-lat'),JSON_OBJECT('mode','air','waypoints',3));
+
+INSERT INTO gx_visit(visit_id,place_id,region_code,visited_on,duration_ms,signals)VALUES
+(1,1,'KR','2026-01-01',120,JSON_ARRAY(JSON_OBJECT('name','cpu','value',31),JSON_OBJECT('name','io','value',12))),
+(2,1,'KR','2026-01-02',240,JSON_ARRAY(JSON_OBJECT('name','cpu','value',45))),
+(3,2,'KR','2026-01-03',360,JSON_ARRAY(JSON_OBJECT('name','cpu','value',28),JSON_OBJECT('name','net','value',17))),
+(4,2,'KR','2026-01-04',480,JSON_ARRAY(JSON_OBJECT('name','io','value',25))),
+(5,3,'JP','2026-01-05',600,JSON_ARRAY(JSON_OBJECT('name','cpu','value',52),JSON_OBJECT('name','parser','value',90))),
+(6,3,'JP','2026-01-06',720,JSON_ARRAY(JSON_OBJECT('name','parser','value',95))),
+(7,4,'DE','2026-01-07',840,JSON_ARRAY(JSON_OBJECT('name','search','value',77))),
+(8,4,'DE','2026-01-08',960,JSON_ARRAY(JSON_OBJECT('name','archive','value',81),JSON_OBJECT('name','io','value',33)));
+
+CALL gx_run_gauntlet_3();
+
+ANALYZE TABLE gx_visit UPDATE HISTOGRAM ON duration_ms WITH 8 BUCKETS;
+
+-- Full-text + spatial + JSON_TABLE + named-window nesting.
+WITH origin AS(
+SELECT ST_GeomFromText('POINT(127 37.5)',4326,'axis-order=long-lat')AS location
+),expanded AS(
+SELECT p.place_id,p.place_code,p.place_name,v.visit_id,v.visited_on,v.duration_ms,
+ST_Distance_Sphere(p.location,o.location)AS distance_m,
+MATCH(p.place_name,p.description)AGAINST('geospatial formatter'IN NATURAL LANGUAGE MODE)AS relevance,
+j.signal_no,j.signal_name,j.signal_value
+FROM gx_place p CROSS JOIN origin o JOIN gx_visit v ON v.place_id=p.place_id
+JOIN JSON_TABLE(v.signals,'$[*]'COLUMNS(signal_no FOR ORDINALITY,signal_name VARCHAR(30)PATH'$.name',signal_value DECIMAL(12,3)PATH'$.value'DEFAULT'0'ON EMPTY))j ON TRUE
+),analytic AS(
+SELECT e.*,
+ROW_NUMBER()OVER w_place AS visit_rank,
+SUM(e.duration_ms)OVER w_running AS running_duration,
+FIRST_VALUE(e.signal_name)OVER w_full AS first_signal,
+LAST_VALUE(e.signal_name)OVER w_full AS last_signal,
+JSON_ARRAYAGG(e.signal_name)OVER(PARTITION BY e.place_id)AS signal_window
+FROM expanded e
+WINDOW w_place AS(PARTITION BY e.place_id ORDER BY e.visited_on,e.visit_id,e.signal_no),
+w_running AS(PARTITION BY e.place_id ORDER BY e.visited_on,e.visit_id,e.signal_no ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW),
+w_full AS(PARTITION BY e.place_id ORDER BY e.visited_on,e.visit_id,e.signal_no ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING)
+)
+SELECT a.place_code,a.place_name,a.distance_m,gx_distance_band(a.distance_m)AS distance_band,
+a.relevance,a.visit_rank,a.running_duration,a.first_signal,a.last_signal,a.signal_window,
+(SELECT JSON_ARRAYAGG(z.zone_name)FROM gx_zone z JOIN gx_place p2 ON p2.place_id=a.place_id WHERE ST_Contains(z.boundary,p2.location))AS zones
+FROM analytic a WHERE a.visit_rank<=2
+ORDER BY a.distance_m,a.place_code,a.visit_rank;
+
+-- Exact polygon containment and route geometry inspection.
+SELECT z.zone_name,p.place_code,ST_Contains(z.boundary,p.location)AS exact_contains,
+ST_AsGeoJSON(p.location,6)AS point_geojson,
+(SELECT JSON_ARRAYAGG(JSON_OBJECT('route',r.route_id,'points',ST_NumPoints(r.route_path)))FROM gx_route r WHERE r.from_place_id=p.place_id OR r.to_place_id=p.place_id)AS routes
+FROM gx_zone z JOIN gx_place p ON MBRContains(z.boundary,p.location)AND ST_Contains(z.boundary,p.location)
+ORDER BY z.zone_id,p.place_id;
+
+-- Three full-text modes must remain syntactically distinct.
+SELECT place_id,place_code,
+MATCH(place_name,description)AGAINST('+geospatial +formatter'IN BOOLEAN MODE)AS boolean_score,
+MATCH(place_name,description)AGAINST('database search'IN NATURAL LANGUAGE MODE)AS natural_score,
+MATCH(place_name,description)AGAINST('database search'WITH QUERY EXPANSION)AS expansion_score
+FROM gx_place
+WHERE MATCH(place_name,description)AGAINST('+geospatial +formatter'IN BOOLEAN MODE)>0
+ORDER BY boolean_score DESC,place_id;
+
+-- CTE-owned UPDATE and DELETE are rollback-only.
+START TRANSACTION;
+WITH ranked_visits AS(
+SELECT visit_id,region_code,ROW_NUMBER()OVER(PARTITION BY place_id ORDER BY duration_ms DESC,visit_id)AS rn FROM gx_visit
+)
+UPDATE gx_visit v JOIN ranked_visits r ON r.visit_id=v.visit_id AND r.region_code=v.region_code
+SET v.signals=JSON_ARRAY_APPEND(v.signals,'$',JSON_OBJECT('name','temporary','value',r.rn))
+WHERE r.rn=1;
+WITH disposable AS(
+SELECT visit_id,region_code FROM gx_visit WHERE duration_ms>=900
+)
+DELETE v FROM gx_visit v JOIN disposable d ON d.visit_id=v.visit_id AND d.region_code=v.region_code;
+ROLLBACK;
+
+TABLE gx_search_rollup ORDER BY place_id LIMIT 4;
+
+START TRANSACTION;
+SELECT visit_id,place_id,duration_ms FROM gx_visit WHERE region_code='KR'ORDER BY visit_id LIMIT 2 FOR SHARE SKIP LOCKED;
+COMMIT;
+
+CALL gx_assert_3((SELECT COUNT(*)FROM gx_place)=4,'place count');
+CALL gx_assert_3((SELECT COUNT(*)FROM gx_zone)=2,'zone count');
+CALL gx_assert_3((SELECT COUNT(*)FROM gx_route)=3,'route count');
+CALL gx_assert_3((SELECT COUNT(*)FROM gx_visit)=8,'visit count after rollback');
+CALL gx_assert_3((SELECT COUNT(*)FROM gx_place p JOIN gx_zone z ON ST_Contains(z.boundary,p.location))=4,'zone membership count');
+CALL gx_assert_3((SELECT COUNT(*)FROM gx_place WHERE MATCH(place_name,description)AGAINST('+geospatial +formatter'IN BOOLEAN MODE)>0)=2,'boolean fulltext count');
+CALL gx_assert_3((SELECT COUNT(*)FROM gx_nearest)=2,'nearest temp count');
+CALL gx_assert_3((SELECT COUNT(*)FROM gx_search_rollup)=4,'rollup count');
+CALL gx_assert_3((SELECT COUNT(*)FROM gx_error_log WHERE phase_name='EXPECTED_INVALID_VISIT')=1,'expected invalid visit');
+CALL gx_assert_3((SELECT COUNT(*)FROM gx_error_log WHERE phase_name='UNEXPECTED')=0,'unexpected errors');
+CALL gx_assert_3((SELECT COUNT(*)FROM INFORMATION_SCHEMA.COLUMN_STATISTICS WHERE SCHEMA_NAME=DATABASE()AND TABLE_NAME='gx_visit'AND COLUMN_NAME='duration_ms')=1,'histogram count');
+
+SELECT'PASS'AS status,
+(SELECT COUNT(*)FROM gx_place)AS place_rows,
+(SELECT COUNT(*)FROM gx_visit)AS visit_rows,
+(SELECT COUNT(*)FROM INFORMATION_SCHEMA.PARTITIONS WHERE TABLE_SCHEMA=DATABASE()AND TABLE_NAME='gx_visit'AND PARTITION_NAME IS NOT NULL)AS partition_rows,
+(SELECT COUNT(*)FROM gx_nearest)AS nearby_rows,
+(SELECT COUNT(*)FROM gx_error_log)AS expected_errors,
+JSON_OBJECT('trap',@lexical_trap,'seoul',(SELECT ST_AsGeoJSON(location,6)FROM gx_place WHERE place_id=1),'fulltext_hits',(SELECT COUNT(*)FROM gx_place WHERE MATCH(place_name,description)AGAINST('+geospatial +formatter'IN BOOLEAN MODE)>0),'histograms',(SELECT COUNT(*)FROM INFORMATION_SCHEMA.COLUMN_STATISTICS WHERE SCHEMA_NAME=DATABASE()AND TABLE_NAME='gx_visit'))AS evidence;
+
+
+-- =========================================================
+-- IntelliSense sweep report generated by intellisense sweep
+-- source: test_mysql/test6.txt
+-- db: MySQL
+-- metadata: test_mysql/test6.txt inferred catalog
+-- checked: 753
+-- missing: 0
+-- marker: [[word]] means not suggested for the tested prefix
+-- missing tokens: none
+-- =========================================================

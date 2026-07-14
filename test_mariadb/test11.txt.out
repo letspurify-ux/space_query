@@ -27,15 +27,15 @@ customer_code VARCHAR(30)NOT NULL,
 contract_status VARCHAR(20)NOT NULL,
 amount DECIMAL(14,2)NOT NULL,
 terms_doc JSON NOT NULL,
-row_start TIMESTAMP(6)GENERATED ALWAYS AS ROW [[START]],
-row_end TIMESTAMP(6)GENERATED ALWAYS AS ROW [[END]],
-PERIOD FOR [[validity]](valid_from,valid_to),
-PERIOD FOR [[SYSTEM_TIME]](row_start,row_end),
+row_start TIMESTAMP(6)GENERATED ALWAYS AS ROW START,
+row_end TIMESTAMP(6)GENERATED ALWAYS AS ROW END,
+PERIOD FOR validity(valid_from,valid_to),
+PERIOD FOR SYSTEM_TIME(row_start,row_end),
 PRIMARY KEY(contract_id,validity WITHOUT OVERLAPS),
 KEY ix_mb3_contract_customer(customer_code),
 CONSTRAINT chk_mb3_contract_amount CHECK(amount>0),
 CONSTRAINT chk_mb3_contract_terms CHECK(JSON_VALID(terms_doc))
-)ENGINE=InnoDB [[WITH]] SYSTEM [[VERSIONING]];
+)ENGINE=InnoDB WITH SYSTEM VERSIONING;
 
 CREATE TABLE mb3_event(
 event_id BIGINT NOT NULL AUTO_INCREMENT,
@@ -86,7 +86,7 @@ END//
 CREATE OR REPLACE FUNCTION mb3_contract_band(p_amount DECIMAL(14,2))
 RETURNS VARCHAR(20)
 DETERMINISTIC
-[[RETURN]] [[CASE]] WHEN p_amount>=200 THEN'PLATINUM'WHEN p_amount>=100 THEN'GOLD'WHEN p_amount>=50 THEN'SILVER'ELSE'BRONZE'END//
+RETURN CASE WHEN p_amount>=200 THEN'PLATINUM'WHEN p_amount>=100 THEN'GOLD'WHEN p_amount>=50 THEN'SILVER'ELSE'BRONZE'END//
 
 CREATE OR REPLACE TRIGGER mb3_event_bi BEFORE INSERT ON mb3_event FOR EACH ROW
 BEGIN
@@ -104,7 +104,7 @@ INSERT INTO mb3_contract(contract_id,valid_from,valid_to,customer_code,contract_
 (2,'2026-07-01','2027-01-01','beta','ACTIVE',90,JSON_OBJECT('plan','renewal','features',JSON_ARRAY('snapshot','renewal'))),
 (3,'2026-01-01','2027-01-01','gamma','ACTIVE',220,JSON_OBJECT('plan','enterprise','features',JSON_ARRAY('history','analytics')));
 
-UPDATE mb3_contract [[FOR]] [[PORTION]] [[OF]] validity [[FROM]]'2026-03-01'[[TO]]'2026-06-01'
+UPDATE mb3_contract FOR PORTION OF validity FROM'2026-03-01'TO'2026-06-01'
 SET amount=125,terms_doc=JSON_SET(terms_doc,'$.campaign','spring','$.revision',2)
 WHERE contract_id=1;
 
@@ -125,19 +125,19 @@ INSERT INTO mb3_direct(direct_id,payload,score)VALUES(1,'one',10),(2,'two',30),(
 
 DELIMITER //
 
-BEGIN [[NOT]] ATOMIC
+BEGIN NOT ATOMIC
 DECLARE v_contract_count INT DEFAULT 0;
 DECLARE v_event_total DECIMAL(18,2)DEFAULT 0;
 DECLARE v_state CHAR(5);
 DECLARE v_errno INT;
 DECLARE v_message TEXT;
-DECLARE duplicate_key [[CONDITION]] FOR 1062;
-DECLARE EXIT [[HANDLER]] FOR SQLEXCEPTION
+DECLARE duplicate_key CONDITION FOR 1062;
+DECLARE EXIT HANDLER FOR SQLEXCEPTION
 BEGIN
-[[GET]] DIAGNOSTICS CONDITION 1 v_state=RETURNED_SQLSTATE,v_errno=MYSQL_ERRNO,v_message=MESSAGE_TEXT;
+GET DIAGNOSTICS CONDITION 1 v_state=RETURNED_SQLSTATE,v_errno=MYSQL_ERRNO,v_message=MESSAGE_TEXT;
 ROLLBACK;
 INSERT INTO mb3_error_log(phase_name,sql_state,error_no,message_text)VALUES('UNEXPECTED',v_state,v_errno,v_message);
-[[RESIGNAL]];
+RESIGNAL;
 END;
 START TRANSACTION;
 FOR contract_rec IN(
@@ -145,27 +145,27 @@ SELECT contract_id,COUNT(*)AS fragment_count,SUM(amount)AS fragment_amount
 FROM mb3_contract GROUP BY contract_id ORDER BY contract_id
 )DO
 SET v_contract_count=v_contract_count+1;
-SET v_event_total=v_event_total+[[contract_rec]].[[fragment_amount]];
+SET v_event_total=v_event_total+contract_rec.fragment_amount;
 END FOR;
 
-duplicate_probe:[[BEGIN]]
-[[DECLARE]] CONTINUE [[HANDLER]] [[FOR]] [[duplicate_key]]
-[[BEGIN]]
-[[GET]] [[DIAGNOSTICS]] [[CONDITION]] 1 [[v_state]]=RETURNED_SQLSTATE,[[v_errno]]=MYSQL_ERRNO,[[v_message]]=[[MESSAGE_TEXT]];
-INSERT [[INTO]] mb3_error_log(phase_name,sql_state,error_no,message_text)VALUES('EXPECTED_DUPLICATE',v_state,v_errno,v_message);
+duplicate_probe:BEGIN
+DECLARE CONTINUE HANDLER FOR duplicate_key
+BEGIN
+GET DIAGNOSTICS CONDITION 1 v_state=RETURNED_SQLSTATE,v_errno=MYSQL_ERRNO,v_message=MESSAGE_TEXT;
+INSERT INTO mb3_error_log(phase_name,sql_state,error_no,message_text)VALUES('EXPECTED_DUPLICATE',v_state,v_errno,v_message);
 END;
 INSERT INTO mb3_direct(direct_id,payload,score)VALUES(1,'duplicate',999);
 END duplicate_probe;
 
 INSERT INTO mb3_rollup(contract_id,current_fragments,history_versions,event_count,event_total,evidence)
 SELECT c.contract_id,COUNT(*),
-(SELECT COUNT(*)FROM mb3_contract FOR [[SYSTEM_TIME]] [[ALL]] AS h WHERE h.contract_id=c.contract_id),
+(SELECT COUNT(*)FROM mb3_contract FOR SYSTEM_TIME ALL AS h WHERE h.contract_id=c.contract_id),
 (SELECT COUNT(*)FROM mb3_event e WHERE e.contract_id=c.contract_id),
 COALESCE((SELECT SUM(e2.event_amount)FROM mb3_event e2 WHERE e2.contract_id=c.contract_id),0),
 JSON_NORMALIZE(JSON_OBJECT('customer',MAX(c.customer_code),'band',mb3_contract_band(MAX(c.amount)),'statuses',JSON_ARRAYAGG(c.contract_status)))
-FROM mb3_contract c [[GROUP]] BY c.contract_id;
-CALL [[mb3_assert]]([[v_contract_count]]=3,'anonymous cursor contract count');
-CALL [[mb3_assert]]([[v_event_total]]>0,'anonymous accumulator');
+FROM mb3_contract c GROUP BY c.contract_id;
+CALL mb3_assert(v_contract_count=3,'anonymous cursor contract count');
+CALL mb3_assert(v_event_total>0,'anonymous accumulator');
 COMMIT;
 END//
 
@@ -173,13 +173,13 @@ DELIMITER ;
 
 -- Bitemporal snapshot before the ordinary system-versioned update.
 SELECT contract_id,valid_from,valid_to,contract_status,amount,row_start,row_end
-FROM mb3_contract FOR [[SYSTEM_TIME]] [[AS]] OF @history_cutover
+FROM mb3_contract FOR SYSTEM_TIME AS OF @history_cutover
 ORDER BY contract_id,valid_from;
 
 -- System-time range keeps both the old and current version of the changed slice.
 SELECT contract_id,valid_from,valid_to,contract_status,amount,row_start,row_end
-FROM mb3_contract FOR [[SYSTEM_TIME]] BETWEEN(@history_cutover-[[INTERVAL]] 1 SECOND)AND NOW(6)
-[[WHERE]] contract_id=1
+FROM mb3_contract FOR SYSTEM_TIME BETWEEN(@history_cutover-INTERVAL 1 SECOND)AND NOW(6)
+WHERE contract_id=1
 ORDER BY row_start,valid_from;
 
 -- Current application fragments + analytics + JSON aggregation.
@@ -189,7 +189,7 @@ FROM mb3_event GROUP BY contract_id,DATE(event_at)
 ),analytic AS(
 SELECT e.*,
 SUM(e.day_amount)OVER(PARTITION BY e.contract_id ORDER BY e.event_day ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW)AS running_amount,
-[[PERCENTILE_DISC]](0.5)WITHIN [[GROUP]](ORDER BY e.day_amount)[[OVER]](PARTITION BY e.contract_id)AS median_amount,
+PERCENTILE_DISC(0.5)WITHIN GROUP(ORDER BY e.day_amount)OVER(PARTITION BY e.contract_id)AS median_amount,
 LAG(e.day_amount)OVER(PARTITION BY e.contract_id ORDER BY e.event_day)AS previous_amount
 FROM event_daily e
 )
@@ -201,20 +201,20 @@ ORDER BY a.contract_id,a.event_day;
 
 -- Direct table access syntax is deliberately outside SELECT ownership.
 HANDLER mb3_direct OPEN;
-HANDLER mb3_direct READ[[`PRIMARY`]]FIRST;
-HANDLER mb3_direct READ[[`PRIMARY`]]NEXT;
+HANDLER mb3_direct READ`PRIMARY`FIRST;
+HANDLER mb3_direct READ`PRIMARY`NEXT;
 HANDLER mb3_direct CLOSE;
 
 -- MariaDB upsert RETURNING and standalone VALUES are separate result sets.
 INSERT INTO mb3_direct(direct_id,payload,score)VALUES(1,'returning-upsert',25)
 ON DUPLICATE KEY UPDATE payload=VALUES(payload),score=VALUES(score)
-[[RETURNING]] direct_id,payload,score;
+RETURNING direct_id,payload,score;
 
 VALUES(1,'one'),(2,'two'),(3,'three');
 
 -- Oracle compatibility changes EXCEPT's spelling without changing the data.
-SET @saved_sql_mode=@@SESSION.[[sql_mode]];
-SET SESSION sql_mode=CONCAT(@@[[SESSION]].sql_mode,',ORACLE');
+SET @saved_sql_mode=@@SESSION.sql_mode;
+SET SESSION sql_mode=CONCAT(@@SESSION.sql_mode,',ORACLE');
 SELECT contract_id FROM mb3_contract
 MINUS
 SELECT contract_id FROM mb3_contract WHERE contract_id=2
@@ -222,23 +222,23 @@ ORDER BY contract_id;
 SET SESSION sql_mode=@saved_sql_mode;
 
 -- No-op purge syntax and MariaDB-specific execution ceiling.
-DELETE [[HISTORY]] FROM mb3_contract [[BEFORE]] [[SYSTEM_TIME]] [[TIMESTAMP]]'2000-01-01 00:00:00';
+DELETE HISTORY FROM mb3_contract BEFORE SYSTEM_TIME TIMESTAMP'2000-01-01 00:00:00';
 
-SELECT direct_id,payload,score,[[NATURAL_SORT_KEY]](payload)AS natural_key
+SELECT direct_id,payload,score,NATURAL_SORT_KEY(payload)AS natural_key
 FROM mb3_direct
 ORDER BY score DESC,direct_id
-LIMIT 3 [[ROWS]] [[EXAMINED]] 1000;
+LIMIT 3 ROWS EXAMINED 1000;
 
 -- Rollback-only application-time update must leave fragment counts unchanged.
 START TRANSACTION;
-UPDATE mb3_contract [[FOR]] [[PORTION]] [[OF]] validity [[FROM]]'2026-04-01'[[TO]]'2026-05-01'
+UPDATE mb3_contract FOR PORTION OF validity FROM'2026-04-01'TO'2026-05-01'
 SET amount=amount+999,contract_status='TEMPORARY'
 WHERE contract_id=1;
 ROLLBACK;
 
 CALL mb3_assert((SELECT COUNT(*)FROM mb3_contract)=6,'current bitemporal fragments');
-CALL mb3_assert((SELECT COUNT(*)FROM mb3_contract FOR [[SYSTEM_TIME]] [[AS]] OF @history_cutover)=6,'snapshot fragment count');
-CALL mb3_assert((SELECT COUNT(*)FROM mb3_contract FOR [[SYSTEM_TIME]] ALL)>=8,'system history count');
+CALL mb3_assert((SELECT COUNT(*)FROM mb3_contract FOR SYSTEM_TIME AS OF @history_cutover)=6,'snapshot fragment count');
+CALL mb3_assert((SELECT COUNT(*)FROM mb3_contract FOR SYSTEM_TIME ALL)>=8,'system history count');
 CALL mb3_assert((SELECT COUNT(*)FROM mb3_contract WHERE contract_status='REVIEWED')=1,'reviewed current version');
 CALL mb3_assert((SELECT COUNT(*)FROM mb3_event)=6,'event count');
 CALL mb3_assert((SELECT COUNT(*)FROM mb3_rollup)=3,'rollup count');
@@ -248,11 +248,11 @@ CALL mb3_assert((SELECT COUNT(*)FROM mb3_error_log WHERE phase_name='UNEXPECTED'
 
 SELECT'PASS'AS status,
 (SELECT COUNT(*)FROM mb3_contract)AS current_fragments,
-(SELECT COUNT(*)FROM mb3_contract FOR [[SYSTEM_TIME]] ALL)AS all_versions,
+(SELECT COUNT(*)FROM mb3_contract FOR SYSTEM_TIME ALL)AS all_versions,
 (SELECT COUNT(*)FROM mb3_event)AS event_rows,
 (SELECT COUNT(*)FROM mb3_rollup)AS rollup_rows,
 (SELECT COUNT(*)FROM mb3_error_log)AS expected_errors,
-[[JSON_NORMALIZE]](JSON_OBJECT('trap',@lexical_trap,'as_of_count',(SELECT COUNT(*)FROM mb3_contract FOR [[SYSTEM_TIME]] [[AS]] OF @history_cutover),'reviewed',(SELECT COUNT(*)FROM mb3_contract WHERE contract_status='REVIEWED'),'direct_payload',(SELECT payload FROM mb3_direct WHERE direct_id=1)))AS evidence;
+JSON_NORMALIZE(JSON_OBJECT('trap',@lexical_trap,'as_of_count',(SELECT COUNT(*)FROM mb3_contract FOR SYSTEM_TIME AS OF @history_cutover),'reviewed',(SELECT COUNT(*)FROM mb3_contract WHERE contract_status='REVIEWED'),'direct_payload',(SELECT payload FROM mb3_direct WHERE direct_id=1)))AS evidence;
 
 
 -- =========================================================
@@ -260,81 +260,8 @@ SELECT'PASS'AS status,
 -- source: test_mariadb/test11.txt
 -- db: MariaDB
 -- metadata: test_mariadb/test11.txt inferred catalog
--- checked: 724
--- missing: 73
+-- checked: 702
+-- missing: 0
 -- marker: [[word]] means not suggested for the tested prefix
--- missing tokens:
---   30:47 word=START prefix=STAR suggestions=[] total=0 line=row_start TIMESTAMP(6)GENERATED ALWAYS AS ROW START,
---   31:45 word=END prefix=EN suggestions=[] total=0 line=row_end TIMESTAMP(6)GENERATED ALWAYS AS ROW END,
---   32:12 word=validity prefix=vali suggestions=[VALIDATE_PASSWORD_STRENGTH()] total=1 line=PERIOD FOR validity(valid_from,valid_to),
---   33:12 word=SYSTEM_TIME prefix=SYST suggestions=[SYSTEM_USER()] total=1 line=PERIOD FOR SYSTEM_TIME(row_start,row_end),
---   38:16 word=WITH prefix=WIT suggestions=[] total=0 line=)ENGINE=InnoDB WITH SYSTEM VERSIONING;
---   38:28 word=VERSIONING prefix=VERS suggestions=[VERSION()] total=1 line=)ENGINE=InnoDB WITH SYSTEM VERSIONING;
---   89:1 word=RETURN prefix=RETU suggestions=[] total=0 line=RETURN CASE WHEN p_amount>=200 THEN'PLATINUM'WHEN p_amount>=100 THEN'GOLD'WHEN p_amount>=50 THEN'SILVER'ELSE'BRONZE'END//
---   89:8 word=CASE prefix=CAS suggestions=[] total=0 line=RETURN CASE WHEN p_amount>=200 THEN'PLATINUM'WHEN p_amount>=100 THEN'GOLD'WHEN p_amount>=50 THEN'SILVER'ELSE'BRONZE'END//
---   107:21 word=FOR prefix=FO suggestions=[] total=0 line=UPDATE mb3_contract FOR PORTION OF validity FROM'2026-03-01'TO'2026-06-01'
---   107:25 word=PORTION prefix=PORT suggestions=[] total=0 line=UPDATE mb3_contract FOR PORTION OF validity FROM'2026-03-01'TO'2026-06-01'
---   107:33 word=OF prefix=O suggestions=[] total=0 line=UPDATE mb3_contract FOR PORTION OF validity FROM'2026-03-01'TO'2026-06-01'
---   107:45 word=FROM prefix=FRO suggestions=[] total=0 line=UPDATE mb3_contract FOR PORTION OF validity FROM'2026-03-01'TO'2026-06-01'
---   107:61 word=TO prefix=T suggestions=[] total=0 line=UPDATE mb3_contract FOR PORTION OF validity FROM'2026-03-01'TO'2026-06-01'
---   128:7 word=NOT prefix=NO suggestions=[] total=0 line=BEGIN NOT ATOMIC
---   134:23 word=CONDITION prefix=COND suggestions=[] total=0 line=DECLARE duplicate_key CONDITION FOR 1062;
---   135:14 word=HANDLER prefix=HAND suggestions=[] total=0 line=DECLARE EXIT HANDLER FOR SQLEXCEPTION
---   137:1 word=GET prefix=GE suggestions=[] total=0 line=GET DIAGNOSTICS CONDITION 1 v_state=RETURNED_SQLSTATE,v_errno=MYSQL_ERRNO,v_message=MESSAGE_TEXT;
---   140:1 word=RESIGNAL prefix=RESI suggestions=[] total=0 line=RESIGNAL;
---   148:33 word=contract_rec prefix=cont suggestions=[] total=0 line=SET v_event_total=v_event_total+contract_rec.fragment_amount;
---   148:46 word=fragment_amount prefix=frag suggestions=[] total=0 line=SET v_event_total=v_event_total+contract_rec.fragment_amount;
---   151:17 word=BEGIN prefix=BEGI suggestions=[] total=0 line=duplicate_probe:BEGIN
---   152:1 word=DECLARE prefix=DECL suggestions=[] total=0 line=DECLARE CONTINUE HANDLER FOR duplicate_key
---   152:18 word=HANDLER prefix=HAND suggestions=[] total=0 line=DECLARE CONTINUE HANDLER FOR duplicate_key
---   152:26 word=FOR prefix=FO suggestions=[FORMAT, FOUND_ROWS()] total=2 line=DECLARE CONTINUE HANDLER FOR duplicate_key
---   152:30 word=duplicate_key prefix=dupl suggestions=[] total=0 line=DECLARE CONTINUE HANDLER FOR duplicate_key
---   153:1 word=BEGIN prefix=BEGI suggestions=[] total=0 line=BEGIN
---   154:1 word=GET prefix=GE suggestions=[] total=0 line=GET DIAGNOSTICS CONDITION 1 v_state=RETURNED_SQLSTATE,v_errno=MYSQL_ERRNO,v_message=MESSAGE_TEXT;
---   154:5 word=DIAGNOSTICS prefix=DIAG suggestions=[] total=0 line=GET DIAGNOSTICS CONDITION 1 v_state=RETURNED_SQLSTATE,v_errno=MYSQL_ERRNO,v_message=MESSAGE_TEXT;
---   154:17 word=CONDITION prefix=COND suggestions=[] total=0 line=GET DIAGNOSTICS CONDITION 1 v_state=RETURNED_SQLSTATE,v_errno=MYSQL_ERRNO,v_message=MESSAGE_TEXT;
---   154:29 word=v_state prefix=v_st suggestions=[] total=0 line=GET DIAGNOSTICS CONDITION 1 v_state=RETURNED_SQLSTATE,v_errno=MYSQL_ERRNO,v_message=MESSAGE_TEXT;
---   154:55 word=v_errno prefix=v_er suggestions=[] total=0 line=GET DIAGNOSTICS CONDITION 1 v_state=RETURNED_SQLSTATE,v_errno=MYSQL_ERRNO,v_message=MESSAGE_TEXT;
---   154:75 word=v_message prefix=v_me suggestions=[] total=0 line=GET DIAGNOSTICS CONDITION 1 v_state=RETURNED_SQLSTATE,v_errno=MYSQL_ERRNO,v_message=MESSAGE_TEXT;
---   154:85 word=MESSAGE_TEXT prefix=MESS suggestions=[] total=0 line=GET DIAGNOSTICS CONDITION 1 v_state=RETURNED_SQLSTATE,v_errno=MYSQL_ERRNO,v_message=MESSAGE_TEXT;
---   155:8 word=INTO prefix=INT suggestions=[INTERVAL] total=1 line=INSERT INTO mb3_error_log(phase_name,sql_state,error_no,message_text)VALUES('EXPECTED_DUPLICATE',v_state,v_errno,v_message);
---   162:39 word=SYSTEM_TIME prefix=SYST suggestions=[] total=0 line=(SELECT COUNT(*)FROM mb3_contract FOR SYSTEM_TIME ALL AS h WHERE h.contract_id=c.contract_id),
---   162:51 word=ALL prefix=AL suggestions=[] total=0 line=(SELECT COUNT(*)FROM mb3_contract FOR SYSTEM_TIME ALL AS h WHERE h.contract_id=c.contract_id),
---   166:21 word=GROUP prefix=GROU suggestions=[] total=0 line=FROM mb3_contract c GROUP BY c.contract_id;
---   167:6 word=mb3_assert prefix=mb3_ suggestions=[] total=0 line=CALL mb3_assert(v_contract_count=3,'anonymous cursor contract count');
---   167:17 word=v_contract_count prefix=v_co suggestions=[] total=0 line=CALL mb3_assert(v_contract_count=3,'anonymous cursor contract count');
---   168:6 word=mb3_assert prefix=mb3_ suggestions=[] total=0 line=CALL mb3_assert(v_event_total>0,'anonymous accumulator');
---   168:17 word=v_event_total prefix=v_ev suggestions=[] total=0 line=CALL mb3_assert(v_event_total>0,'anonymous accumulator');
---   176:23 word=SYSTEM_TIME prefix=SYST suggestions=[] total=0 line=FROM mb3_contract FOR SYSTEM_TIME AS OF @history_cutover
---   176:35 word=AS prefix=A suggestions=[AND, ASC] total=2 line=FROM mb3_contract FOR SYSTEM_TIME AS OF @history_cutover
---   181:23 word=SYSTEM_TIME prefix=SYST suggestions=[] total=0 line=FROM mb3_contract FOR SYSTEM_TIME BETWEEN(@history_cutover-INTERVAL 1 SECOND)AND NOW(6)
---   181:60 word=INTERVAL prefix=INTE suggestions=[] total=0 line=FROM mb3_contract FOR SYSTEM_TIME BETWEEN(@history_cutover-INTERVAL 1 SECOND)AND NOW(6)
---   182:1 word=WHERE prefix=WHER suggestions=[] total=0 line=WHERE contract_id=1
---   192:1 word=PERCENTILE_DISC prefix=PERC suggestions=[PERCENT_RANK()] total=1 line=PERCENTILE_DISC(0.5)WITHIN GROUP(ORDER BY e.day_amount)OVER(PARTITION BY e.contract_id)AS median_amount,
---   192:28 word=GROUP prefix=GROU suggestions=[GROUP_CONCAT()] total=1 line=PERCENTILE_DISC(0.5)WITHIN GROUP(ORDER BY e.day_amount)OVER(PARTITION BY e.contract_id)AS median_amount,
---   192:56 word=OVER prefix=OVE suggestions=[] total=0 line=PERCENTILE_DISC(0.5)WITHIN GROUP(ORDER BY e.day_amount)OVER(PARTITION BY e.contract_id)AS median_amount,
---   204:24 word=`PRIMARY` prefix=PRIM suggestions=[] total=0 line=HANDLER mb3_direct READ`PRIMARY`FIRST;
---   205:24 word=`PRIMARY` prefix=PRIM suggestions=[] total=0 line=HANDLER mb3_direct READ`PRIMARY`NEXT;
---   211:1 word=RETURNING prefix=RETU suggestions=[] total=0 line=RETURNING direct_id,payload,score;
---   216:31 word=sql_mode prefix=sql_ suggestions=[] total=0 line=SET @saved_sql_mode=@@SESSION.sql_mode;
---   217:31 word=SESSION prefix=SESS suggestions=[] total=0 line=SET SESSION sql_mode=CONCAT(@@SESSION.sql_mode,',ORACLE');
---   225:8 word=HISTORY prefix=HIST suggestions=[history_cutover, HIST] total=2 line=DELETE HISTORY FROM mb3_contract BEFORE SYSTEM_TIME TIMESTAMP'2000-01-01 00:00:00';
---   225:34 word=BEFORE prefix=BEFO suggestions=[] total=0 line=DELETE HISTORY FROM mb3_contract BEFORE SYSTEM_TIME TIMESTAMP'2000-01-01 00:00:00';
---   225:41 word=SYSTEM_TIME prefix=SYST suggestions=[] total=0 line=DELETE HISTORY FROM mb3_contract BEFORE SYSTEM_TIME TIMESTAMP'2000-01-01 00:00:00';
---   225:53 word=TIMESTAMP prefix=TIME suggestions=[] total=0 line=DELETE HISTORY FROM mb3_contract BEFORE SYSTEM_TIME TIMESTAMP'2000-01-01 00:00:00';
---   227:32 word=NATURAL_SORT_KEY prefix=NATU suggestions=[] total=0 line=SELECT direct_id,payload,score,NATURAL_SORT_KEY(payload)AS natural_key
---   230:9 word=ROWS prefix=ROW suggestions=[] total=0 line=LIMIT 3 ROWS EXAMINED 1000;
---   230:14 word=EXAMINED prefix=EXAM suggestions=[] total=0 line=LIMIT 3 ROWS EXAMINED 1000;
---   234:21 word=FOR prefix=FO suggestions=[] total=0 line=UPDATE mb3_contract FOR PORTION OF validity FROM'2026-04-01'TO'2026-05-01'
---   234:25 word=PORTION prefix=PORT suggestions=[] total=0 line=UPDATE mb3_contract FOR PORTION OF validity FROM'2026-04-01'TO'2026-05-01'
---   234:33 word=OF prefix=O suggestions=[] total=0 line=UPDATE mb3_contract FOR PORTION OF validity FROM'2026-04-01'TO'2026-05-01'
---   234:45 word=FROM prefix=FRO suggestions=[] total=0 line=UPDATE mb3_contract FOR PORTION OF validity FROM'2026-04-01'TO'2026-05-01'
---   234:61 word=TO prefix=T suggestions=[] total=0 line=UPDATE mb3_contract FOR PORTION OF validity FROM'2026-04-01'TO'2026-05-01'
---   240:55 word=SYSTEM_TIME prefix=SYST suggestions=[] total=0 line=CALL mb3_assert((SELECT COUNT(*)FROM mb3_contract FOR SYSTEM_TIME AS OF @history_cutover)=6,'snapshot fragment count');
---   240:67 word=AS prefix=A suggestions=[AND, ASC] total=2 line=CALL mb3_assert((SELECT COUNT(*)FROM mb3_contract FOR SYSTEM_TIME AS OF @history_cutover)=6,'snapshot fragment count');
---   241:55 word=SYSTEM_TIME prefix=SYST suggestions=[] total=0 line=CALL mb3_assert((SELECT COUNT(*)FROM mb3_contract FOR SYSTEM_TIME ALL)>=8,'system history count');
---   251:39 word=SYSTEM_TIME prefix=SYST suggestions=[] total=0 line=(SELECT COUNT(*)FROM mb3_contract FOR SYSTEM_TIME ALL)AS all_versions,
---   255:1 word=JSON_NORMALIZE prefix=JSON suggestions=[JSON_ARRAY(), JSON_ARRAYAGG(), JSON_ARRAY_APPEND(), JSON_ARRAY_INSERT(), JSON_CONTAINS(), JSON_CONTAINS_PATH(), JSON_DEPTH(), JSON_EXTRACT(), JSON_INSERT(), JSON_KEYS(), JSON_LENGTH(), JSON_MERGE(), JSON_MERGE_PATCH(), JSON_MERGE_PRESERVE(), JSON_OBJECT(), JSON_OBJECTAGG()] total=32 line=JSON_NORMALIZE(JSON_OBJECT('trap',@lexical_trap,'as_of_count',(SELECT COUNT(*)FROM mb3_contract FOR SYSTEM_TIME AS OF @history_cutover),'reviewed',(SELECT COUNT(*)FROM mb3_contract WHERE contract_status='REVIEWED'),'direct_payload',(SELECT payload FROM mb3_direct WHERE direct_id=1)))AS evidence;
---   255:101 word=SYSTEM_TIME prefix=SYST suggestions=[] total=0 line=JSON_NORMALIZE(JSON_OBJECT('trap',@lexical_trap,'as_of_count',(SELECT COUNT(*)FROM mb3_contract FOR SYSTEM_TIME AS OF @history_cutover),'reviewed',(SELECT COUNT(*)FROM mb3_contract WHERE contract_status='REVIEWED'),'direct_payload',(SELECT payload FROM mb3_direct WHERE direct_id=1)))AS evidence;
---   255:113 word=AS prefix=A suggestions=[AND, ASC] total=2 line=JSON_NORMALIZE(JSON_OBJECT('trap',@lexical_trap,'as_of_count',(SELECT COUNT(*)FROM mb3_contract FOR SYSTEM_TIME AS OF @history_cutover),'reviewed',(SELECT COUNT(*)FROM mb3_contract WHERE contract_status='REVIEWED'),'direct_payload',(SELECT payload FROM mb3_direct WHERE direct_id=1)))AS evidence;
+-- missing tokens: none
 -- =========================================================

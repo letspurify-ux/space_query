@@ -3268,11 +3268,14 @@ fn scan_cursor_context(tokens: &[SqlToken], cursor_token_len: usize) -> CursorSc
                     depth_frames[depth].phase = SqlPhase::IntoClause;
                     relation_state.expect_table();
                 }
+                let after_mariadb_cycle_restrict =
+                    matches!(current_phase, SqlPhase::RecursiveCteColumnList)
+                        && last_word.as_deref() == Some("RESTRICT");
                 if matches!(cte_state, CteState::Inactive)
-                    && depth_frames
-                        .get(depth)
-                        .is_some_and(|frame| matches!(frame.phase, SqlPhase::WithClause))
+                    && (matches!(current_phase, SqlPhase::WithClause)
+                        || after_mariadb_cycle_restrict)
                 {
+                    depth_frames[depth].phase = SqlPhase::WithClause;
                     cte_state = CteState::ExpectName;
                 }
                 idx += 1;

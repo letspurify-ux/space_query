@@ -588,6 +588,7 @@ impl SqlEditorWidget {
             &expanded_statement.text,
             &token_spans,
             mysql_compatible,
+            preferred_db_type == Some(crate::db::DatabaseType::MariaDB),
             package_spec_symbols,
         );
         let alias_context =
@@ -717,6 +718,16 @@ impl SqlEditorWidget {
             db_type,
         ) {
             return Self::mysql_block_label_suggestions(analysis.context.as_ref(), prefix);
+        }
+        if Self::cursor_is_at_mysql_end_label_slot_for_context(
+            analysis.context.as_ref(),
+            !prefix.is_empty(),
+            db_type,
+        ) {
+            return Self::mysql_expected_end_label_suggestions(
+                analysis.context.as_ref(),
+                prefix,
+            );
         }
         if Self::cursor_is_at_mysql_prepared_statement_handle_reference_slot_for_context(
             analysis.context.as_ref(),
@@ -1723,6 +1734,7 @@ impl SqlEditorWidget {
         statement_text: &str,
         token_spans: &[SqlTokenSpan],
         mysql_compatible: bool,
+        mariadb: bool,
         extra_root_symbols: &[ParsedDeclarationSymbol],
     ) -> (Vec<LocalScope>, Vec<LocalSymbolEntry>) {
         let statement_len = statement_text.len();
@@ -2021,8 +2033,10 @@ impl SqlEditorWidget {
                                 pending_loop_var = Self::parse_for_loop_record(token_spans, idx);
                             }
                         }
-                        "LOOP" => {
-                            if prev_is_end {
+                        "LOOP" | "DO"
+                            if upper == "LOOP" || (mariadb && pending_loop_var.is_some()) =>
+                        {
+                            if upper == "LOOP" && prev_is_end {
                                 idx += 1;
                                 continue;
                             }
@@ -2198,6 +2212,17 @@ impl SqlEditorWidget {
                                     skip_token_idx = suffix_idx;
                                 }
                                 Some("LOOP") => {
+                                    Self::pop_local_block_kind(
+                                        &mut block_stack,
+                                        &mut scopes,
+                                        LocalBlockKind::Loop,
+                                        token.start,
+                                        idx.saturating_add(1),
+                                    );
+                                    skip_token_idx = suffix_idx;
+                                    pending_loop_var = None;
+                                }
+                                Some("FOR") if mariadb => {
                                     Self::pop_local_block_kind(
                                         &mut block_stack,
                                         &mut scopes,
@@ -3002,7 +3027,9 @@ impl SqlEditorWidget {
                 SqlToken::Symbol(sym) if sym == ")" => depth = depth.saturating_sub(1),
                 SqlToken::Word(word)
                     if depth == 0
-                        && (word.eq_ignore_ascii_case("IS") || word.eq_ignore_ascii_case("AS")) =>
+                        && (word.eq_ignore_ascii_case("IS")
+                            || word.eq_ignore_ascii_case("AS")
+                            || word.eq_ignore_ascii_case("FOR")) =>
                 {
                     let body_tokens: Vec<SqlToken> = item[idx + 1..]
                         .iter()
@@ -3048,6 +3075,72 @@ impl SqlEditorWidget {
             "CONTINUE" | "EXIT" | "UNDO" | "HANDLER"
         ) {
             return Vec::new();
+        }
+
+        let Some(name_idx) = Self::next_meaningful_token_idx(item, first_idx + 1) else {
+            return Vec::new();
+        };
+        let Some(name) = Self::token_word(&item[name_idx].token)
+            .and_then(Self::local_identifier_suggestion_from_word)
+        else {
+            return Vec::new();
+        };
+        let kind_idx = Self::next_meaningful_token_idx(item, name_idx + 1);
+        if kind_idx
+            .and_then(|idx| Self::token_word(&item[idx].token))
+            .is_some_and(|word| word.eq_ignore_ascii_case("CURSOR"))
+        {
+            let cursor_idx = kind_idx.unwrap_or(name_idx + 1);
+            let (members, member_source_uppers) =
+                Self::extract_cursor_projection_members_and_source_from_item(item, cursor_idx);
+            let member_source_upper = member_source_uppers.first().cloned();
+            return vec![ParsedDeclarationSymbol {
+                name,
+                type_display: Some("CURSOR".to_string()),
+                members,
+                member_entries: Vec::new(),
+                member_source_upper,
+                member_source_uppers,
+                member_source_is_rowtype: true,
+                member_source_is_collection_like: false,
+                member_source_allows_visible_members: true,
+                suggest_name: true,
+                is_type_symbol: false,
+            }];
+        }
+        if let Some(row_idx) = kind_idx.filter(|idx| {
+            Self::token_word(&item[*idx].token)
+                .is_some_and(|word| word.eq_ignore_ascii_case("ROW"))
+        }) {
+            let type_idx = Self::next_meaningful_token_idx(item, row_idx + 1);
+            let of_idx = type_idx.and_then(|idx| Self::next_meaningful_token_idx(item, idx + 1));
+            let source_idx = of_idx.and_then(|idx| Self::next_meaningful_token_idx(item, idx + 1));
+            if type_idx.is_some_and(|idx| {
+                Self::token_word(&item[idx].token)
+                    .is_some_and(|word| word.eq_ignore_ascii_case("TYPE"))
+            }) && of_idx.is_some_and(|idx| {
+                Self::token_word(&item[idx].token)
+                    .is_some_and(|word| word.eq_ignore_ascii_case("OF"))
+            }) {
+                if let Some((source, _)) = source_idx
+                    .and_then(|idx| Self::extract_declaration_type_source_name(item, idx))
+                {
+                    let source_upper = source.to_ascii_uppercase();
+                    return vec![ParsedDeclarationSymbol {
+                        name,
+                        type_display: Some(format!("ROW TYPE OF {source}")),
+                        members: Vec::new(),
+                        member_entries: Vec::new(),
+                        member_source_upper: Some(source_upper.clone()),
+                        member_source_uppers: vec![source_upper],
+                        member_source_is_rowtype: true,
+                        member_source_is_collection_like: false,
+                        member_source_allows_visible_members: true,
+                        suggest_name: true,
+                        is_type_symbol: false,
+                    }];
+                }
+            }
         }
 
         let mut names = Vec::new();
