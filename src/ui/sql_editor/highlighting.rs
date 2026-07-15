@@ -1,7 +1,7 @@
 use crate::ui::syntax_highlight::{
     encode_fltk_style_bytes, encode_repeated_fltk_style_bytes, replace_text_buffer_with_raw_bytes,
     set_text_buffer_raw_bytes, LexerState, STYLE_BLOCK_COMMENT, STYLE_COMMENT,
-    STYLE_DATETIME_LITERAL, STYLE_Q_QUOTE_STRING,
+    STYLE_DATETIME_LITERAL, STYLE_HINT, STYLE_Q_QUOTE_STRING, STYLE_QUOTED_IDENTIFIER,
 };
 
 const DEFERRED_REHIGHLIGHT_IDLE_DELAY_SECONDS: f64 = 0.15;
@@ -124,6 +124,81 @@ impl HighlightShadowState {
             .copied()
             .or_else(|| self.line_exit_states.last().copied())
             .unwrap_or_default()
+    }
+
+    pub(crate) fn parser_lex_mode_at_line_start(
+        &self,
+        line_start: usize,
+    ) -> crate::sql_parser_engine::LexMode {
+        match self.entry_state_for_line(self.line_index_for_position(line_start)) {
+            LexerState::Normal => crate::sql_parser_engine::LexMode::Idle,
+            LexerState::InBlockComment | LexerState::InHintComment => {
+                crate::sql_parser_engine::LexMode::BlockComment
+            }
+            LexerState::InSingleQuote => crate::sql_parser_engine::LexMode::SingleQuote,
+            LexerState::InQQuote { closing, depth } => {
+                crate::sql_parser_engine::LexMode::QQuote {
+                    end_char: closing,
+                    depth,
+                }
+            }
+            LexerState::InDoubleQuote => crate::sql_parser_engine::LexMode::DoubleQuote,
+            LexerState::InBacktickQuote => crate::sql_parser_engine::LexMode::BacktickQuote,
+        }
+    }
+
+    pub(crate) fn parser_lex_mode_at(
+        &self,
+        pos: usize,
+        mysql_compatible: bool,
+    ) -> crate::sql_parser_engine::LexMode {
+        let pos = self.text.clamp_boundary(pos.min(self.text.len()));
+        let line_start = self.line_start(pos);
+        let initial_mode = self.parser_lex_mode_at_line_start(line_start);
+        if pos == line_start {
+            return initial_mode;
+        }
+        // The overwhelmingly common case is a bounded window beginning in
+        // ordinary code. The aligned style shadow proves that immediately,
+        // avoiding a scan from the start of a pathologically long line.
+        if self.styles.len() == self.text.len()
+            && pos < self.text.len()
+            && self.parser_lexical_kind_at(pos).is_none()
+        {
+            return crate::sql_parser_engine::LexMode::Idle;
+        }
+        let prefix = self
+            .text
+            .range_string(line_start, pos)
+            .unwrap_or_default();
+        crate::sql_parser_engine::lexical_spans_with_initial_mode(
+            &prefix,
+            mysql_compatible,
+            initial_mode,
+        )
+        .1
+    }
+
+    pub(crate) fn parser_lexical_kind_at(
+        &self,
+        pos: usize,
+    ) -> Option<crate::sql_parser_engine::LexicalKind> {
+        if self.styles.len() != self.text.len() || pos >= self.text.len() {
+            return None;
+        }
+        match char::from(*self.styles.get(pos)?) {
+            STYLE_STRING | STYLE_Q_QUOTE_STRING | STYLE_DATETIME_LITERAL => {
+                Some(crate::sql_parser_engine::LexicalKind::String)
+            }
+            STYLE_COMMENT => Some(crate::sql_parser_engine::LexicalKind::LineComment),
+            STYLE_BLOCK_COMMENT | STYLE_HINT => {
+                Some(crate::sql_parser_engine::LexicalKind::BlockComment)
+            }
+            STYLE_QUOTED_IDENTIFIER => {
+                Some(crate::sql_parser_engine::LexicalKind::QuotedIdentifier)
+            }
+            _ => None,
+        }
     }
 
     fn line_exit_state(&self, line_index: usize) -> Option<LexerState> {
@@ -900,6 +975,42 @@ mod tests {
         let sql = "SELECT * FROM emp WHERE name = 'AND";
         let shadow = shadow_for(sql);
         assert!(shadow.cursor_in_string_or_comment(sql.len()));
+    }
+
+    #[test]
+    fn parser_lex_mode_at_preserves_multiline_q_quote_context() {
+        let sql = "SELECT nq'[first\nq'[nested]' tail ]' AS txt, \"quoted\" FROM dual";
+        let shadow = shadow_for(sql);
+        let second_line = sql.find("q'[nested]").unwrap();
+        assert_eq!(
+            shadow.parser_lex_mode_at(second_line, false),
+            crate::sql_parser_engine::LexMode::QQuote {
+                end_char: ']',
+                depth: 1,
+            }
+        );
+
+        let after_nested = second_line + "q'[nested]'".len();
+        assert_eq!(
+            shadow.parser_lex_mode_at(after_nested, false),
+            crate::sql_parser_engine::LexMode::QQuote {
+                end_char: ']',
+                depth: 1,
+            }
+        );
+        let after_outer = sql.find("]' AS txt").unwrap() + 2;
+        assert_eq!(
+            shadow.parser_lex_mode_at(after_outer, false),
+            crate::sql_parser_engine::LexMode::Idle
+        );
+        assert_eq!(
+            shadow.parser_lexical_kind_at(second_line),
+            Some(crate::sql_parser_engine::LexicalKind::String)
+        );
+        assert_eq!(
+            shadow.parser_lexical_kind_at(sql.find("\"quoted\"").unwrap()),
+            Some(crate::sql_parser_engine::LexicalKind::QuotedIdentifier)
+        );
     }
 
     #[test]

@@ -4089,10 +4089,18 @@ fn audit_final_suggestions_impl(
         Some(db),
     )
     {
+        let signature_scan = signature_scan_text_before_cursor_for_test(&s, cursor);
+        let signature_initial_mode = intellisense_test_lex_mode_at(
+            &s,
+            cursor.saturating_sub(signature_scan.len()),
+            db.is_mysql_or_mariadb(),
+        );
         SqlEditorWidget::cached_signature_named_argument_suggestions(
             &data,
-            signature_scan_text_before_cursor_for_test(&s, cursor),
+            signature_scan,
             &prefix,
+            signature_initial_mode,
+            db.is_mysql_or_mariadb(),
         )
     } else {
         Vec::new()
@@ -6430,6 +6438,42 @@ fn bounded_statement_window_for_mysql_db_type_keeps_double_dash_arithmetic_as_co
             "local symbol statement window must keep MySQL-family `--<non-space>` arithmetic inside the active statement"
         );
     }
+}
+
+#[test]
+fn oracle_plsql_recovery_does_not_cross_a_with_function_statement() {
+    let sql = r#"WITH
+    FUNCTION fmt_mask(p_txt VARCHAR2) RETURN VARCHAR2 IS
+    BEGIN
+        RETURN p_txt;
+    END fmt_mask;
+    PROCEDURE noop(p_msg VARCHAR2) IS
+    BEGIN
+        NULL;
+    END noop;
+    base_emp AS (SELECT empno FROM emp)
+SELECT empno FROM base_emp;
+
+MERGE INTO bonus b
+USING (SELECT empno FROM emp) s
+ON (b.empno = s.empno
+    AND (b.empno IS NOT NULL));"#;
+    let cursor = sql.find("AND (").expect("MERGE predicate") + "AN".len();
+    let bounded = SqlEditorWidget::bounded_intellisense_parse_text_from_text(sql, cursor);
+    let expanded = SqlEditorWidget::expanded_statement_window_in_bounded_text_for_db_type(
+        &bounded,
+        Some(crate::db::connection::DatabaseType::Oracle),
+    );
+
+    assert!(
+        expanded.text.trim_start().starts_with("MERGE INTO bonus"),
+        "PL/SQL recovery crossed the completed WITH statement: {:?}",
+        expanded.text
+    );
+    assert!(
+        !expanded.text.contains("FUNCTION fmt_mask"),
+        "WITH FUNCTION body leaked into the MERGE statement window"
+    );
 }
 
 #[test]
@@ -9154,6 +9198,30 @@ fn qualifier_before_word_in_text_supports_quoted_identifier_at_text_start() {
     let sql = sql_with_cursor.replace('|', "");
     let qualifier = SqlEditorWidget::qualifier_before_word_in_text(&sql, cursor);
     assert_eq!(qualifier.as_deref(), Some("e"));
+}
+
+#[test]
+fn qualifier_before_word_ignores_identifier_quotes_inside_comments_and_strings() {
+    for sql_with_cursor in [
+        "-- 설명에 닫히지 않은 \" 문자가 있음\nBEGIN DBMS_OUTPUT.PUT_|; END;",
+        "/* 설명에 닫히지 않은 \" 문자가 있음 */ BEGIN DBMS_OUTPUT.PUT_|; END;",
+        "BEGIN v_message := '문자열 안의 \" 문자'; DBMS_OUTPUT.PUT_|; END;",
+    ] {
+        let cursor = sql_with_cursor.find('|').unwrap_or(0);
+        let sql = sql_with_cursor.replace('|', "");
+        let word_start = cursor.saturating_sub("PUT_".len());
+        let spans = crate::sql_parser_engine::lexical_spans(&sql, false);
+        assert_eq!(
+            crate::sql_parser_engine::lexical_kind_at(&spans, word_start.saturating_sub(1)),
+            None,
+            "qualifier dot must remain code: sql={sql} spans={spans:?}"
+        );
+        let qualifier = SqlEditorWidget::qualifier_before_word_in_text(&sql, word_start);
+        let raw_qualifier = SqlEditorWidget::raw_qualifier_before_word_in_text(&sql, word_start);
+
+        assert_eq!(qualifier.as_deref(), Some("DBMS_OUTPUT"), "sql={sql}");
+        assert_eq!(raw_qualifier.as_deref(), Some("DBMS_OUTPUT"), "sql={sql}");
+    }
 }
 
 #[test]
@@ -16433,6 +16501,51 @@ fn million_line_production_completion_index_uses_the_bounded_fast_path() {
     assert!(
         elapsed < Duration::from_secs(5),
         "bounded production completion path took {elapsed:?}"
+    );
+}
+
+#[test]
+fn million_line_snapshot_edit_and_actual_completion_stay_bounded() {
+    use std::time::{Duration, Instant};
+
+    const LINE: &str = "SELECT 1;\n";
+    const LINES: usize = 1_000_001;
+    let sql = LINE.repeat(LINES);
+    let base_snapshot = ChunkedText::from_str(&sql);
+    let word_start = 500_000usize.saturating_mul(LINE.len());
+    let mut edited_snapshot = base_snapshot.clone();
+
+    let started = Instant::now();
+    assert!(edited_snapshot.replace_range(
+        word_start,
+        word_start.saturating_add("SELECT".len()),
+        "SELE",
+    ));
+    let mut data = IntellisenseData::new();
+    data.rebuild_indices();
+    let suggestions = query_completion_suggestions_from_snapshot_with_data(
+        &edited_snapshot,
+        word_start.saturating_add("SELE".len()),
+        crate::db::DatabaseType::Oracle,
+        true,
+        &mut data,
+    );
+    let elapsed = started.elapsed();
+
+    assert!(
+        suggestions
+            .iter()
+            .any(|suggestion| suggestion.eq_ignore_ascii_case("SELECT")),
+        "million-line production completion lost SELECT: {suggestions:?}"
+    );
+    assert!(
+        edited_snapshot.shared_chunk_count(&base_snapshot)
+            >= base_snapshot.chunk_count().saturating_sub(2),
+        "a four-byte completion edit should share all untouched document chunks"
+    );
+    assert!(
+        elapsed < Duration::from_secs(5),
+        "million-line snapshot edit + actual completion took {elapsed:?}"
     );
 }
 
@@ -47494,19 +47607,156 @@ fn query_completion_suggestions_with_data(
             sql_with_cursor.replace('|', ""),
         )
     };
-    let (routine_cache, expanded) =
-        SqlEditorWidget::build_routine_symbol_cache_bundle_for_test_for_db_type(
-            &sql,
+    let snapshot = ChunkedText::from_str(&sql);
+    query_completion_suggestions_from_snapshot_with_data(
+        &snapshot,
+        cursor,
+        db_type,
+        include_locals,
+        data,
+    )
+}
+
+fn intellisense_analysis_from_snapshot_for_test(
+    snapshot: &ChunkedText,
+    cursor: usize,
+    db_type: crate::db::DatabaseType,
+) -> (ExpandedStatementWindow, IntellisenseAnalysis) {
+    let (expanded, text_bind_names, package_spec_symbols) =
+        SqlEditorWidget::expanded_statement_window_and_text_binds_from_snapshot(
+            snapshot,
             cursor,
             Some(db_type),
         );
+    let routine_cache = SqlEditorWidget::build_routine_symbol_cache_entry(
+        0,
+        &expanded,
+        text_bind_names,
+        &package_spec_symbols,
+        Some(db_type),
+    );
     let analysis = SqlEditorWidget::build_intellisense_analysis_from_routine_cache(
         &routine_cache,
         expanded.cursor_in_statement,
     );
-    let (mut prefix, mut word_start, _) =
-        crate::ui::intellisense::get_word_at_cursor(&sql, cursor);
-    let signature_scan_text = signature_scan_text_before_cursor_for_test(&sql, cursor).to_string();
+    (expanded, analysis)
+}
+
+fn signature_scan_text_before_cursor_from_snapshot_for_test(
+    snapshot: &ChunkedText,
+    cursor: usize,
+) -> String {
+    const SIGNATURE_SCAN_WINDOW: usize = 4000;
+    let cursor = snapshot.clamp_boundary(cursor.min(snapshot.len()));
+    let mut window_start = cursor.saturating_sub(SIGNATURE_SCAN_WINDOW);
+    while window_start < cursor && !snapshot.is_char_boundary(window_start) {
+        window_start += 1;
+    }
+    let raw = snapshot
+        .range_string(window_start, cursor)
+        .unwrap_or_default();
+    if window_start > 0 {
+        if let Some(newline) = raw.find('\n') {
+            return raw.get(newline + 1..).unwrap_or("").to_string();
+        }
+    }
+    raw
+}
+
+fn intellisense_test_lex_mode_at(
+    text: &str,
+    byte_offset: usize,
+    mysql_compatible: bool,
+) -> crate::sql_parser_engine::LexMode {
+    let mut byte_offset = byte_offset.min(text.len());
+    while byte_offset > 0 && !text.is_char_boundary(byte_offset) {
+        byte_offset -= 1;
+    }
+    crate::sql_parser_engine::lexical_spans_with_initial_mode(
+        text.get(..byte_offset).unwrap_or(""),
+        mysql_compatible,
+        crate::sql_parser_engine::LexMode::Idle,
+    )
+    .1
+}
+
+fn query_completion_suggestions_from_snapshot_with_data(
+    snapshot: &ChunkedText,
+    cursor: usize,
+    db_type: crate::db::DatabaseType,
+    include_locals: bool,
+    data: &mut IntellisenseData,
+) -> Vec<String> {
+    let (expanded, analysis) =
+        intellisense_analysis_from_snapshot_for_test(snapshot, cursor, db_type);
+    query_completion_suggestions_from_prepared_snapshot_with_data(
+        snapshot,
+        cursor,
+        db_type,
+        include_locals,
+        data,
+        &expanded,
+        &analysis,
+    )
+}
+
+fn query_completion_suggestions_from_prepared_snapshot_with_data(
+    snapshot: &ChunkedText,
+    cursor: usize,
+    db_type: crate::db::DatabaseType,
+    include_locals: bool,
+    data: &mut IntellisenseData,
+    expanded: &ExpandedStatementWindow,
+    analysis: &IntellisenseAnalysis,
+) -> Vec<String> {
+    let signature_scan_text =
+        signature_scan_text_before_cursor_from_snapshot_for_test(snapshot, cursor);
+    let mysql_compatible = db_type.is_mysql_or_mariadb();
+    let signature_scan_start = cursor.saturating_sub(signature_scan_text.len());
+    let signature_scan_initial_lex_mode = if signature_scan_start >= expanded.statement_start {
+        intellisense_test_lex_mode_at(
+            &expanded.text,
+            signature_scan_start.saturating_sub(expanded.statement_start),
+            mysql_compatible,
+        )
+    } else {
+        crate::sql_parser_engine::LexMode::Idle
+    };
+    // Production derives the typed prefix from a small editor-buffer window,
+    // independently from the wider signature scan. Keeping those windows
+    // separate matters when the signature scan begins inside an earlier
+    // string literal containing an identifier quote.
+    const WORD_WINDOW: usize = 256;
+    let cursor = snapshot.clamp_boundary(cursor.min(snapshot.len()));
+    let mut word_window_start = cursor.saturating_sub(WORD_WINDOW);
+    while word_window_start < cursor && !snapshot.is_char_boundary(word_window_start) {
+        word_window_start += 1;
+    }
+    let mut word_window_end = cursor.saturating_add(WORD_WINDOW).min(snapshot.len());
+    while word_window_end < snapshot.len() && !snapshot.is_char_boundary(word_window_end) {
+        word_window_end += 1;
+    }
+    let word_window = snapshot
+        .range_string(word_window_start, word_window_end)
+        .unwrap_or_default();
+    let relative_cursor = cursor.saturating_sub(word_window_start);
+    let word_initial_lex_mode = if word_window_start >= expanded.statement_start {
+        intellisense_test_lex_mode_at(
+            &expanded.text,
+            word_window_start.saturating_sub(expanded.statement_start),
+            mysql_compatible,
+        )
+    } else {
+        crate::sql_parser_engine::LexMode::Idle
+    };
+    let (mut prefix, relative_word_start, _) =
+        crate::ui::intellisense::get_word_at_cursor_with_lexical_mode(
+            &word_window,
+            relative_cursor,
+            mysql_compatible,
+            word_initial_lex_mode,
+        );
+    let mut word_start = word_window_start.saturating_add(relative_word_start);
     if db_type == crate::db::DatabaseType::Oracle {
         if let Some(model_prefix) = SqlEditorWidget::oracle_model_bracket_completion_prefix(
             &prefix,
@@ -47516,17 +47766,48 @@ fn query_completion_suggestions_with_data(
             word_start = cursor.saturating_sub(prefix.len());
         }
     }
-    let qualifier = SqlEditorWidget::qualifier_before_word_in_text(&sql, word_start);
-    let raw_qualifier = SqlEditorWidget::raw_qualifier_before_word_in_text(&sql, word_start);
-    // Mirror production's bounded text_after_cursor window (128 bytes, clamped
+    // The production editor obtains the lexical state at a bounded window's
+    // first byte from HighlightShadowState. The snapshot harness has no style
+    // shadow, so clamp to the parser-proven statement boundary instead of
+    // guessing Idle in the middle of a preceding comment or string.
+    let mut qualifier_window_start = word_start
+        .saturating_sub(WORD_WINDOW)
+        .max(expanded.statement_start.min(word_start));
+    while qualifier_window_start < word_start
+        && !snapshot.is_char_boundary(qualifier_window_start)
+    {
+        qualifier_window_start += 1;
+    }
+    let qualifier_window = snapshot
+        .range_string(qualifier_window_start, word_start)
+        .unwrap_or_default();
+    let qualifier_initial_lex_mode = if qualifier_window_start >= expanded.statement_start {
+        intellisense_test_lex_mode_at(
+            &expanded.text,
+            qualifier_window_start.saturating_sub(expanded.statement_start),
+            mysql_compatible,
+        )
+    } else {
+        crate::sql_parser_engine::LexMode::Idle
+    };
+    let (qualifier, raw_qualifier) = match
+        SqlEditorWidget::qualifier_parts_before_word_in_text_with_lexical_mode(
+        &qualifier_window,
+        qualifier_window.len(),
+        mysql_compatible,
+        qualifier_initial_lex_mode,
+    ) {
+        Some((qualifier, raw_qualifier)) => (Some(qualifier), Some(raw_qualifier)),
+        None => (None, None),
+    };
+    // Mirror production's bounded text_after_cursor window (2 KiB, clamped
     // to a char boundary) so suffix-sensitive gates behave identically.
     let text_after_cursor = {
-        let tail = sql.get(cursor..).unwrap_or("");
-        let mut end = tail.len().min(128);
-        while end < tail.len() && !tail.is_char_boundary(end) {
+        let mut end = cursor.saturating_add(2048).min(snapshot.len());
+        while end < snapshot.len() && !snapshot.is_char_boundary(end) {
             end += 1;
         }
-        tail[..end].to_string()
+        snapshot.range_string(cursor, end).unwrap_or_default()
     };
     let snapshot = IntellisenseTriggerSnapshot {
         request_generation: 0,
@@ -47539,6 +47820,7 @@ fn query_completion_suggestions_with_data(
         qualifier,
         raw_qualifier,
         signature_scan_text,
+        signature_scan_initial_lex_mode,
         text_after_cursor,
     };
     let shared_data = Arc::new(Mutex::new(std::mem::take(data)));
@@ -47554,7 +47836,7 @@ fn query_completion_suggestions_with_data(
         &connection,
         &runtime,
         &snapshot,
-        &analysis,
+        analysis,
         &expanded.text,
         include_locals,
     );
@@ -47850,8 +48132,77 @@ fn assert_oracle_sweep_fixture_completion_cases(
             .iter()
             .any(|suggestion| suggestion.eq_ignore_ascii_case(expected))
         {
+            let script = load_intellisense_test_file(file_name);
+            let context_start = script.find(context).expect("fixture context");
+            let word_start = context_start + context.find(word).expect("word in fixture context");
+            let marked = format!(
+                "{}{}__CODEX_CURSOR__{}",
+                script.get(..word_start).unwrap_or(""),
+                prefix,
+                script.get(word_start + word.len()..).unwrap_or("")
+            );
+            let cursor = marked.find("__CODEX_CURSOR__").expect("cursor marker");
+            let partial_script = marked.replacen("__CODEX_CURSOR__", "", 1);
+            let partial_snapshot = ChunkedText::from_str(&partial_script);
+            let (_, analysis) = intellisense_analysis_from_snapshot_for_test(
+                &partial_snapshot,
+                cursor,
+                crate::db::DatabaseType::Oracle,
+            );
+            let local_names = analysis
+                .local_symbols
+                .iter()
+                .filter(|symbol| symbol.upper.starts_with(&prefix.to_ascii_uppercase()))
+                .map(|symbol| symbol.name.clone())
+                .collect::<Vec<_>>();
+            let typed_qualifier = SqlEditorWidget::qualifier_before_word_in_text(
+                partial_script.get(..word_start).unwrap_or(""),
+                word_start,
+            );
+            let builtin_members = typed_qualifier
+                .as_deref()
+                .and_then(|qualifier| {
+                    SqlEditorWidget::oracle_builtin_package_member_suggestions(qualifier, prefix)
+                })
+                .unwrap_or_default();
+            let (normalized, normalized_cursor, deep_ctx) = analyze_full_script_marker_for_db(
+                &marked,
+                Some(crate::db::DatabaseType::Oracle),
+            );
+            let normalized_head = normalized.chars().take(120).collect::<String>();
+            let tables = deep_ctx
+                .tables_in_scope
+                .iter()
+                .map(|table| format!("{}={:?}", table.name, table.alias))
+                .collect::<Vec<_>>();
+            let current_tokens = SqlEditorWidget::current_query_tokens(&deep_ctx);
+            let current_end = SqlEditorWidget::cursor_token_len_in_current_query(&deep_ctx)
+                .min(current_tokens.len());
+            let keyword_end = SqlEditorWidget::expected_keyword_suggestion_context_end(
+                current_tokens,
+                current_end,
+                prefix,
+            );
+            let plsql_executable =
+                SqlEditorWidget::cursor_in_plsql_executable_block(current_tokens, keyword_end);
+            let statement_start =
+                SqlEditorWidget::cursor_statement_start_context(current_tokens, keyword_end);
+            let plsql_candidates = SqlEditorWidget::expected_plsql_block_statement_keyword_candidates(
+                current_tokens,
+                keyword_end,
+                Some(crate::db::DatabaseType::Oracle),
+            );
+            let token_tail = current_tokens[current_end.saturating_sub(14)..current_end]
+                .iter()
+                .map(|token| format!("{token:?}"))
+                .collect::<Vec<_>>();
             failures.push(format!(
-                "{file_name} `{context}` lost `{expected}`: {suggestions:?}"
+                "{file_name} `{context}` lost `{expected}`: phase={:?}, depth={}, active={:?}, cursor={normalized_cursor}/{}, head={normalized_head:?}, qualifier={typed_qualifier:?}/{:?}, builtin={builtin_members:?}, locals={local_names:?}, plsql={plsql_executable}/{statement_start:?}/{plsql_candidates:?}, tables={tables:?}, tail={token_tail:?}, suggestions={suggestions:?}",
+                deep_ctx.phase,
+                deep_ctx.depth,
+                deep_ctx.active_query_range,
+                normalized.len(),
+                deep_ctx.qualifier,
             ));
         }
     }
@@ -49271,6 +49622,331 @@ fn oracle_test23_and_test26_production_completion_covers_sweep_cases() {
     ]);
 }
 
+#[test]
+fn oracle_all_fixture_sweep_literal_and_builtin_gaps_use_production_completion() {
+    assert_oracle_sweep_fixture_completion_cases(&[
+        (
+            "oracle_format_final_boss.sql",
+            "CONNECT_BY_ROOT o.node_name AS root_name,",
+            "CONNECT_BY_ROOT",
+            "CONN",
+            "CONNECT_BY_ROOT",
+        ),
+        (
+            "oracle_format_final_boss.sql",
+            "CONNECT_BY_ISLEAF AS is_leaf,",
+            "CONNECT_BY_ISLEAF",
+            "CONN",
+            "CONNECT_BY_ISLEAF",
+        ),
+        (
+            "oracle_format_final_boss.sql",
+            "CAST(NULL AS NUMBER) AS forecast,",
+            "NULL",
+            "NUL",
+            "NULL",
+        ),
+        (
+            "test18.sql",
+            "p_commit IN BOOLEAN DEFAULT FALSE) IS",
+            "FALSE",
+            "FALS",
+            "FALSE",
+        ),
+        (
+            "test18.sql",
+            "USING qt_seq_emp.NEXTVAL,",
+            "NEXTVAL",
+            "NEXT",
+            "NEXTVAL",
+        ),
+        (
+            "test11.txt",
+            "200 CHAR);",
+            "CHAR",
+            "CHA",
+            "CHAR",
+        ),
+        (
+            "test11.txt",
+            "CLASSIFIER () AS cls,",
+            "CLASSIFIER",
+            "CLAS",
+            "CLASSIFIER()",
+        ),
+        (
+            "test17.sql",
+            "WHEN REGEXP_LIKE(b.txt, '[/]') THEN 'HAS_SLASH'",
+            "REGEXP_LIKE",
+            "REGE",
+            "REGEXP_LIKE()",
+        ),
+        (
+            "test25.sql",
+            "SYSTIMESTAMP\n            );",
+            "SYSTIMESTAMP",
+            "SYST",
+            "SYSTIMESTAMP",
+        ),
+    ]);
+}
+
+#[test]
+fn oracle_all_fixture_sweep_structural_gaps_use_production_completion() {
+    assert_oracle_sweep_fixture_completion_cases(&[
+        (
+            "test20.sql",
+            "XMLTYPE COLUMN xml_payload STORE AS BASICFILE CLOB;",
+            "COLUMN",
+            "COLU",
+            "COLUMN",
+        ),
+        (
+            "test20.sql",
+            "XMLTYPE COLUMN xml_payload STORE AS BASICFILE CLOB;",
+            "STORE",
+            "STOR",
+            "STORE",
+        ),
+        (
+            "test20.sql",
+            "XMLTYPE COLUMN xml_payload STORE AS BASICFILE CLOB;",
+            "AS",
+            "A",
+            "AS",
+        ),
+        (
+            "test20.sql",
+            "BULK COLLECT INTO v_stage_tab",
+            "BULK",
+            "BUL",
+            "BULK",
+        ),
+        (
+            "test21.sql",
+            "BULK COLLECT INTO v_emp_ids, v_bonus",
+            "INTO",
+            "INT",
+            "INTO",
+        ),
+        (
+            "test25.sql",
+            "OR e.job IN (\n",
+            "OR",
+            "O",
+            "OR",
+        ),
+        (
+            "test25.sql",
+            "OR e.job IN (\n",
+            "IN",
+            "I",
+            "IN",
+        ),
+        (
+            "test25.sql",
+            "START WITH\n    e.mgr IS NULL",
+            "START",
+            "STAR",
+            "START WITH",
+        ),
+        (
+            "test25.sql",
+            "RULES UPSERT SEQUENTIAL ORDER",
+            "SEQUENTIAL",
+            "SEQU",
+            "SEQUENTIAL",
+        ),
+        (
+            "test25.sql",
+            "INTERSECT\n\n        SELECT\n            'B' AS src",
+            "INTERSECT",
+            "INTE",
+            "INTERSECT",
+        ),
+        (
+            "test25.sql",
+            "    DELETE\n     WHERE\n         s.sal < 500",
+            "DELETE",
+            "DELE",
+            "DELETE",
+        ),
+        (
+            "test25.sql",
+            "ELSE\n        INTO qt25_emp_grade_low",
+            "ELSE",
+            "ELS",
+            "ELSE",
+        ),
+        (
+            "test_open_with.sql",
+            "FETCH FIRST /* BV: 상위 20건 */",
+            "FIRST",
+            "FIRS",
+            "FIRST",
+        ),
+    ]);
+}
+
+#[test]
+fn oracle_all_fixture_sweep_scope_gaps_use_production_completion() {
+    assert_oracle_sweep_fixture_completion_cases(&[
+        (
+            "test6.txt",
+            "WHEN MOD(:NEW.n,2)=0 THEN v_tag := 'TRG_EVEN';",
+            "n",
+            "n",
+            "n",
+        ),
+        (
+            "test6.txt",
+            "INSERT INTO oqt_t_log(log_id, tag, step, depth, msg)\n  VALUES (oqt_seq_log.NEXTVAL, v_tag",
+            "tag",
+            "ta",
+            "tag",
+        ),
+        (
+            "test10.txt",
+            "l_rows (i).emp_id, l_rows (i).sale_dt",
+            "i",
+            "i",
+            "i",
+        ),
+        (
+            "test15.sql",
+            "p_id     => 2,",
+            "p_id",
+            "p_i",
+            "p_id",
+        ),
+        (
+            "test15.sql",
+            "' | proc_cnt=' || v_cnt, 1, 4000)",
+            "v_cnt",
+            "v_cn",
+            "v_cnt",
+        ),
+        (
+            "test17.sql",
+            "'ID=' || p_id\n            || ' | TXT='",
+            "p_id",
+            "p_i",
+            "p_id",
+        ),
+        (
+            "test21.sql",
+            "dept_id, dept_name, parent_dept_id, dept_code, meta_json, note_text\n)\nVALUES\n(\n    10,",
+            "dept_id",
+            "dept",
+            "dept_id",
+        ),
+        (
+            "test11.txt",
+            "SELECT AVG(dept_sum)\n",
+            "dept_sum",
+            "dept",
+            "dept_sum",
+        ),
+        (
+            "test25.sql",
+            "calc_sal[ANY, ANY] =",
+            "calc_sal",
+            "calc",
+            "calc_sal",
+        ),
+    ]);
+}
+
+fn mysql_family_fixture_word_completion_suggestions(
+    file_name: &str,
+    db_type: crate::db::DatabaseType,
+    context: &str,
+    word: &str,
+    prefix: &str,
+) -> Vec<String> {
+    let script = match db_type {
+        crate::db::DatabaseType::MySQL => load_mysql_intellisense_test_file(file_name),
+        crate::db::DatabaseType::MariaDB => load_mariadb_intellisense_test_file(file_name),
+        crate::db::DatabaseType::Oracle => panic!("MySQL-family fixture helper received Oracle"),
+    };
+    assert_eq!(
+        script.matches(context).count(),
+        1,
+        "fixture context must be unique in {file_name}: `{context}`"
+    );
+    let context_start = script.find(context).expect("fixture context");
+    let word_in_context = context.find(word).expect("word in fixture context");
+    let word_start = context_start + word_in_context;
+    let marked = format!(
+        "{}{}__CODEX_CURSOR__{}",
+        script.get(..word_start).unwrap_or(""),
+        prefix,
+        script.get(word_start + word.len()..).unwrap_or("")
+    );
+    let mut data = mysql_family_test_intellisense_data(file_name, db_type);
+    query_completion_suggestions_with_data(&marked, db_type, true, &mut data)
+}
+
+#[test]
+fn mysql_family_all_fixture_sweep_gaps_use_production_completion() {
+    use crate::db::DatabaseType::{MariaDB, MySQL};
+
+    let cases = [
+        (
+            "test10.txt",
+            MariaDB,
+            "END outer_block//\n\nDELIMITER ;\n\nCALL mb_run_gauntlet_2();",
+            "DELIMITER",
+            "DELI",
+            "DELIMITER",
+        ),
+        (
+            "test11.txt",
+            MariaDB,
+            "FROM mb3_contract FOR SYSTEM_TIME BETWEEN(@history_cutover-INTERVAL 1 SECOND)AND NOW(6)",
+            "SECOND",
+            "SECO",
+            "SECOND",
+        ),
+        (
+            "test6.txt",
+            MySQL,
+            "END outer_block$$\n\nDELIMITER ;\n\nINSERT INTO gx_place",
+            "DELIMITER",
+            "DELI",
+            "DELIMITER",
+        ),
+        (
+            "test6.txt",
+            MySQL,
+            "AGAINST('database search'WITH QUERY EXPANSION)AS expansion_score",
+            "EXPANSION",
+            "EXPA",
+            "EXPANSION",
+        ),
+    ];
+
+    let mut failures = Vec::new();
+    for (file_name, db_type, context, word, prefix, expected) in cases {
+        let suggestions = mysql_family_fixture_word_completion_suggestions(
+            file_name, db_type, context, word, prefix,
+        );
+        if !suggestions
+            .iter()
+            .any(|suggestion| suggestion.eq_ignore_ascii_case(expected))
+        {
+            failures.push(format!(
+                "{db_type:?} {file_name} `{context}` lost `{expected}`: {suggestions:?}"
+            ));
+        }
+    }
+    assert!(
+        failures.is_empty(),
+        "MySQL-family fixture production-path gaps:\n{}",
+        failures.join("\n")
+    );
+}
+
 #[derive(Debug)]
 struct IntellisenseSweepMissing {
     start: usize,
@@ -49286,6 +49962,20 @@ struct IntellisenseSweepMissing {
 struct IntellisenseSweepRun {
     checked: usize,
     missing: Vec<IntellisenseSweepMissing>,
+}
+
+struct IntellisenseSweepCandidate {
+    start: usize,
+    end: usize,
+    word: String,
+    prefix: String,
+    replacement: String,
+    cursor: usize,
+}
+
+struct IntellisenseSweepCandidateResult {
+    checked: bool,
+    missing: Option<IntellisenseSweepMissing>,
 }
 
 fn oracle_test1_intellisense_data() -> IntellisenseData {
@@ -49304,25 +49994,28 @@ fn oracle_test_all_intellisense_data() -> IntellisenseData {
 /// reports misses that are metadata artifacts rather than completion bugs.
 /// Overlay the file-local catalog on top of the shared one.
 fn oracle_test_file_scoped_intellisense_data(file_name: &str) -> IntellisenseData {
-    let mut data = oracle_test_all_intellisense_data();
-    let mut own = MysqlFamilyScriptCatalog::default();
-    oracle_collect_script_catalog_entries(load_intellisense_test_file(file_name), &mut own);
-    for table in &own.tables {
-        push_unique_case_insensitive(&mut data.tables, table);
-    }
-    for view in &own.views {
-        push_unique_case_insensitive(&mut data.views, view);
-    }
-    for materialized_view in &own.materialized_views {
-        push_unique_case_insensitive(&mut data.materialized_views, materialized_view);
-    }
-    for (table, columns) in &own.columns {
-        if !columns.is_empty() {
-            data.set_columns_for_table(table, columns.clone());
-        }
-    }
-    data.rebuild_indices();
-    data
+    let mut catalog = oracle_catalog_from_test_all_scripts();
+    oracle_collect_script_catalog_entries(load_intellisense_test_file(file_name), &mut catalog);
+    oracle_intellisense_data_from_catalog(&catalog)
+}
+
+#[test]
+fn oracle_file_scoped_sweep_metadata_includes_file_local_non_relation_objects() {
+    let mut data = oracle_test_file_scoped_intellisense_data("test15.sql");
+
+    assert!(
+        data.packages
+            .iter()
+            .any(|name| name.eq_ignore_ascii_case("QT_SPLITTER_PKG")),
+        "file-local package was not included in sweep metadata"
+    );
+    let members = data.get_member_suggestions("QT_SPLITTER_PKG", "norm", false);
+    assert!(
+        members
+            .iter()
+            .any(|name| name.eq_ignore_ascii_case("NORMALIZE_NAME")),
+        "file-local package member was not included in sweep metadata: {members:?}"
+    );
 }
 
 fn oracle_intellisense_data_from_catalog(catalog: &MysqlFamilyScriptCatalog) -> IntellisenseData {
@@ -49524,122 +50217,43 @@ fn intellisense_sweep_word_is_prompt_body(script: &str, span: &SqlTokenSpan) -> 
     span.start >= first_word_end
 }
 
-fn intellisense_sweep_word_is_literal_or_comment_body(script: &str, offset: usize) -> bool {
-    let bytes = script.as_bytes();
-    let mut idx = 0usize;
-    let end = offset.min(bytes.len());
-    let mut in_single = false;
-    let mut in_double = false;
-    let mut in_line_comment = false;
-    let mut in_block_comment = false;
+fn intellisense_sweep_word_is_sqlplus_include_path(script: &str, span: &SqlTokenSpan) -> bool {
+    let line_start = script
+        .get(..span.start)
+        .and_then(|text| text.rfind('\n'))
+        .map_or(0, |idx| idx + 1);
+    let line_end = script
+        .get(span.start..)
+        .and_then(|text| text.find('\n'))
+        .map_or(script.len(), |idx| span.start + idx);
+    script
+        .get(line_start..line_end)
+        .unwrap_or("")
+        .trim_start()
+        .starts_with('@')
+}
 
-    while idx < end {
-        let byte = bytes[idx];
-        let next = bytes.get(idx + 1).copied();
+fn intellisense_sweep_literal_or_comment_ranges(
+    script: &str,
+    mysql_compatible: bool,
+) -> Vec<(usize, usize)> {
+    crate::sql_parser_engine::lexical_spans(script, mysql_compatible)
+        .into_iter()
+        .filter(|span| {
+            span.kind != crate::sql_parser_engine::LexicalKind::QuotedIdentifier
+        })
+        .map(|span| (span.start, span.end))
+        .collect()
+}
 
-        if in_line_comment {
-            if byte == b'\n' {
-                in_line_comment = false;
-            }
-            idx += 1;
-            continue;
-        }
-        if in_block_comment {
-            if byte == b'*' && next == Some(b'/') {
-                in_block_comment = false;
-                idx += 2;
-            } else {
-                idx += 1;
-            }
-            continue;
-        }
-        if in_single {
-            if byte == b'\\' {
-                idx = idx.saturating_add(2);
-            } else if byte == b'\'' && next == Some(b'\'') {
-                idx += 2;
-            } else if byte == b'\'' {
-                in_single = false;
-                idx += 1;
-            } else {
-                idx += 1;
-            }
-            continue;
-        }
-        if in_double {
-            if byte == b'\\' {
-                idx = idx.saturating_add(2);
-            } else if byte == b'"' && next == Some(b'"') {
-                idx += 2;
-            } else if byte == b'"' {
-                in_double = false;
-                idx += 1;
-            } else {
-                idx += 1;
-            }
-            continue;
-        }
-
-        match (byte, next) {
-            (b'-', Some(b'-')) => {
-                in_line_comment = true;
-                idx += 2;
-            }
-            (b'#', _) => {
-                in_line_comment = true;
-                idx += 1;
-            }
-            (b'/', Some(b'*')) => {
-                in_block_comment = true;
-                idx += 2;
-            }
-            // Oracle q-quoted literal `q'[ … ]'` (any delimiter): scan to its
-            // closer so internal apostrophes/semicolons don't derail the naive
-            // single-quote tracking. Only when the `q` starts a fresh word.
-            (b'q' | b'Q', Some(b'\''))
-                if idx == 0
-                    || (!bytes[idx - 1].is_ascii_alphanumeric()
-                        && !matches!(bytes[idx - 1], b'_' | b'$' | b'#')) =>
-            {
-                let Some(open) = bytes.get(idx + 2).copied() else {
-                    return true;
-                };
-                let close = match open {
-                    b'[' => b']',
-                    b'{' => b'}',
-                    b'(' => b')',
-                    b'<' => b'>',
-                    other => other,
-                };
-                let mut scan = idx + 3;
-                loop {
-                    if scan >= end {
-                        // The offset sits inside the (possibly unterminated)
-                        // q-quoted literal body.
-                        return true;
-                    }
-                    if bytes[scan] == close && bytes.get(scan + 1) == Some(&b'\'') {
-                        idx = scan + 2;
-                        break;
-                    }
-                    scan += 1;
-                }
-            }
-            (b'\'', _) => {
-                in_single = true;
-                idx += 1;
-            }
-            (b'"', _) => {
-                in_double = true;
-                idx += 1;
-            }
-            _ => {
-                idx += 1;
-            }
-        }
-    }
-
-    in_single || in_double || in_line_comment || in_block_comment
+fn intellisense_sweep_offset_is_literal_or_comment(
+    ranges: &[(usize, usize)],
+    offset: usize,
+) -> bool {
+    let idx = ranges.partition_point(|(_, end)| *end <= offset);
+    ranges
+        .get(idx)
+        .is_some_and(|(start, end)| *start <= offset && offset < *end)
 }
 
 /// The sweep's literal/comment scanner must treat the body of an Oracle
@@ -49650,15 +50264,701 @@ fn sweep_literal_scanner_understands_q_quoted_literals() {
     let script =
         "BEGIN l_sql := q'[ SELECT 'x' FROM t; EXIT WHEN l_rc%NOTFOUND; ]'; call_proc; END;";
     let inside = script.find("NOTFOUND").unwrap();
+    let ranges = intellisense_sweep_literal_or_comment_ranges(script, false);
     assert!(
-        intellisense_sweep_word_is_literal_or_comment_body(script, inside),
+        intellisense_sweep_offset_is_literal_or_comment(&ranges, inside),
         "q-quote body must be treated as literal"
     );
     let after = script.find("call_proc").unwrap();
     assert!(
-        !intellisense_sweep_word_is_literal_or_comment_body(script, after),
+        !intellisense_sweep_offset_is_literal_or_comment(&ranges, after),
         "code after a closed q-quote literal must not be treated as literal"
     );
+}
+
+#[test]
+fn sweep_literal_comment_ranges_match_parser_engine_and_tokenizer() {
+    let script = concat!(
+        "SELECT \"quoted name\", 'it''s -- text', nq'[outer q'[ SELECT 'x' ]' tail]' FROM dual;\n",
+        "-- line comment SELECT foo\n",
+        "SELECT 1 /* block ' comment SELECT bar */ FROM dual;\n",
+        "SELECT uq'{unterminated SELECT qux'"
+    );
+    let ranges = intellisense_sweep_literal_or_comment_ranges(script, false);
+
+    for span in super::query_text::tokenize_sql_spanned_with_mysql_compat(script, false) {
+        if matches!(span.token, SqlToken::Word(_)) {
+            assert!(
+                !intellisense_sweep_offset_is_literal_or_comment(&ranges, span.start),
+                "tokenizer emitted a word inside an engine literal/comment span: {span:?}"
+            );
+        }
+    }
+    assert!(intellisense_sweep_offset_is_literal_or_comment(
+        &ranges,
+        script.find("SELECT 'x'").unwrap()
+    ));
+    assert!(!intellisense_sweep_offset_is_literal_or_comment(
+        &ranges,
+        script.find("FROM dual").unwrap()
+    ));
+}
+
+#[test]
+fn bounded_block_comment_recovery_ignores_delimiters_inside_all_quoted_forms() {
+    let starts_inside = |text: &str| {
+        SqlEditorWidget::expanded_statement_starts_inside_block_comment(
+            &ExpandedStatementWindow {
+                dependency_start: 0,
+                statement_start: 0,
+                statement_end: text.len(),
+                text: text.to_string(),
+                cursor_in_statement: text.len(),
+            },
+        )
+    };
+
+    for text in [
+        "SELECT '^\\s*/\\s*$' AS pattern /* later comment */",
+        r#"SELECT "quoted */ name" FROM dual /* later comment */"#,
+        "SELECT nq'[payload */ q'[nested]' tail]' FROM dual /* later comment */",
+        "SELECT 'plain /* opener */ text' FROM dual",
+    ] {
+        assert!(
+            !starts_inside(text),
+            "quoted delimiter was mistaken for a clipped block-comment closer: {text}"
+        );
+    }
+    assert!(starts_inside(
+        "clipped block comment payload */ SELECT value FROM dual"
+    ));
+}
+
+#[test]
+fn sweep_snapshot_edit_matches_marker_completion_and_skip_paths() {
+    use crate::db::DatabaseType::{MySQL, Oracle};
+
+    let mut base_data = IntellisenseData::new();
+    base_data.tables = vec!["EMP".to_string(), "ORDERS".to_string()];
+    base_data.set_columns_for_table(
+        "EMP",
+        vec!["EMPNO".to_string(), "ENAME".to_string()],
+    );
+    base_data.set_columns_for_table(
+        "ORDERS",
+        vec!["ORDER_ID".to_string(), "CUSTOMER_ID".to_string()],
+    );
+    base_data.rebuild_indices();
+
+    for (script, word, word_start, db_type) in [
+        (
+            "SELECT ename FROM emp",
+            "ename",
+            "SELECT ".len(),
+            Oracle,
+        ),
+        (
+            "SELECT e.ename FROM emp e",
+            "ename",
+            "SELECT e.".len(),
+            Oracle,
+        ),
+        (
+            "BEGIN v_total := 1; v_total := v_total + 1; END;",
+            "v_total",
+            "BEGIN v_total := 1; ".len(),
+            Oracle,
+        ),
+        (
+            "SELECT `order_id` FROM orders",
+            "`order_id`",
+            "SELECT ".len(),
+            MySQL,
+        ),
+    ] {
+        let prefix = intellisense_sweep_completion_prefix(word).unwrap();
+        let quote = if (word.starts_with('`') && word.ends_with('`'))
+            || (word.starts_with('"') && word.ends_with('"'))
+        {
+            word.get(..1).unwrap_or("")
+        } else {
+            ""
+        };
+        let word_end = word_start.saturating_add(word.len());
+        let marked = format!(
+            "{}{}{}__CODEX_CURSOR__{}{}",
+            script.get(..word_start).unwrap_or(""),
+            quote,
+            prefix,
+            quote,
+            script.get(word_end..).unwrap_or("")
+        );
+        let mut marker_data = base_data.clone();
+        let marker_suggestions =
+            query_completion_suggestions_with_data(&marked, db_type, true, &mut marker_data);
+        let marker_skip = intellisense_sweep_word_skip_context(&marked, db_type, word);
+
+        let replacement = format!("{quote}{prefix}{quote}");
+        let mut snapshot = ChunkedText::from_str(script);
+        assert!(snapshot.replace_range(word_start, word_end, &replacement));
+        let cursor = word_start
+            .saturating_add(quote.len())
+            .saturating_add(prefix.len());
+        let (expanded, analysis) =
+            intellisense_analysis_from_snapshot_for_test(&snapshot, cursor, db_type);
+        let mut snapshot_data = base_data.clone();
+        let snapshot_suggestions =
+            query_completion_suggestions_from_prepared_snapshot_with_data(
+                &snapshot,
+                cursor,
+                db_type,
+                true,
+                &mut snapshot_data,
+                &expanded,
+                &analysis,
+            );
+        let snapshot_skip = intellisense_sweep_word_skip_context_from_analysis(
+            &expanded.text,
+            expanded.cursor_in_statement,
+            db_type,
+            word,
+            &analysis,
+        );
+
+        assert_eq!(
+            snapshot_suggestions, marker_suggestions,
+            "snapshot completion drifted for `{marked}`"
+        );
+        assert_eq!(
+            snapshot_skip, marker_skip,
+            "snapshot skip classification drifted for `{marked}`"
+        );
+    }
+}
+
+#[test]
+fn sweep_snapshot_candidate_matches_large_fixture_marker_production_path() {
+    let file_name = "test21.sql";
+    let script = load_intellisense_test_file(file_name);
+    let context = concat!(
+        "dept_id, dept_name, parent_dept_id, dept_code, meta_json, note_text\n",
+        ")\nVALUES\n(\n    20,"
+    );
+    assert_eq!(script.matches(context).count(), 1);
+    let start = script.find(context).expect("fixture context");
+    let word = "dept_id";
+    let prefix = intellisense_sweep_completion_prefix(word).expect("completion prefix");
+    let candidate = IntellisenseSweepCandidate {
+        start,
+        end: start + word.len(),
+        word: word.to_string(),
+        prefix: prefix.clone(),
+        replacement: prefix.clone(),
+        cursor: start + prefix.len(),
+    };
+    let data = oracle_test_file_scoped_intellisense_data(file_name);
+    let mut edited_snapshot = ChunkedText::from_str(script);
+    assert!(edited_snapshot.replace_range(candidate.start, candidate.end, &candidate.replacement));
+    let (expanded, analysis) = intellisense_analysis_from_snapshot_for_test(
+        &edited_snapshot,
+        candidate.cursor,
+        crate::db::DatabaseType::Oracle,
+    );
+    assert!(
+        matches!(
+            analysis.context.phase,
+            intellisense_context::SqlPhase::InsertColumnList
+        ),
+        "later q-quoted INSERT lost its column-list phase: phase={:?}, expanded={:?}",
+        analysis.context.phase,
+        expanded.text
+    );
+    let mut completion_data = data.clone();
+    let suggestions = query_completion_suggestions_from_prepared_snapshot_with_data(
+        &edited_snapshot,
+        candidate.cursor,
+        crate::db::DatabaseType::Oracle,
+        true,
+        &mut completion_data,
+        &expanded,
+        &analysis,
+    );
+    assert!(
+        suggestions
+            .iter()
+            .any(|suggestion| suggestion.eq_ignore_ascii_case(word)),
+        "large-fixture snapshot path lost `{word}`: {suggestions:?}"
+    );
+    let result = intellisense_sweep_check_candidate(
+        script,
+        &ChunkedText::from_str(script),
+        crate::db::DatabaseType::Oracle,
+        &data,
+        &candidate,
+    );
+
+    assert!(
+        result.missing.is_none(),
+        "large-fixture snapshot path lost `{word}`: {:?}",
+        result.missing.as_ref().map(|missing| (
+            &missing.suggestion_sample,
+            missing.suggestion_count
+        ))
+    );
+}
+
+#[test]
+fn oracle_cursor_declaration_tail_uses_the_full_plsql_window() {
+    let file_name = "test10.txt";
+    let script = load_intellisense_test_file(file_name);
+    let context = concat!(
+        "CURSOR c_emp IS\n",
+        "    SELECT *\n",
+        "    FROM qt_emp\n",
+        "    WHERE active_yn = 'Y'"
+    );
+    assert_eq!(script.matches(context).count(), 1);
+    let context_start = script.find(context).expect("fixture context");
+    let word_in_context = context.find("FROM").expect("FROM in fixture context");
+    let word_start = context_start + word_in_context;
+    let prefix = "FRO";
+    let mut snapshot = ChunkedText::from_str(script);
+    assert!(snapshot.replace_range(word_start, word_start + "FROM".len(), prefix));
+    let cursor = word_start + prefix.len();
+    let (expanded, analysis) = intellisense_analysis_from_snapshot_for_test(
+        &snapshot,
+        cursor,
+        crate::db::DatabaseType::Oracle,
+    );
+    let mut data = oracle_test_file_scoped_intellisense_data(file_name);
+    let structural = SqlEditorWidget::oracle_structural_keyword_inference(
+        prefix,
+        analysis.context.as_ref(),
+        Some(crate::db::DatabaseType::Oracle),
+    );
+    let suggestions = query_completion_suggestions_from_prepared_snapshot_with_data(
+        &snapshot,
+        cursor,
+        crate::db::DatabaseType::Oracle,
+        true,
+        &mut data,
+        &expanded,
+        &analysis,
+    );
+
+    assert!(
+        suggestions
+            .iter()
+            .any(|suggestion| suggestion.eq_ignore_ascii_case("FROM")),
+        "cursor declaration lost FROM: phase={:?}, structural={structural:?}, expanded={:?}, suggestions={suggestions:?}",
+        analysis.context.phase,
+        expanded.text
+    );
+}
+
+#[test]
+fn oracle_qquoted_package_body_keeps_routine_and_merge_scope_in_production_completion() {
+    let file_name = "test17.sql";
+    let context = "RETURN v_note;\n    END make_note;";
+    let script = load_intellisense_test_file(file_name);
+    let package_body_start = script
+        .find("CREATE OR REPLACE PACKAGE BODY qt_split_pkg")
+        .expect("package body");
+    let covering_package_body = super::query_text::tokenize_sql_spanned(script)
+        .into_iter()
+        .find(|span| span.start <= package_body_start && package_body_start < span.end);
+    assert!(
+        covering_package_body
+            .as_ref()
+            .is_some_and(|span| !matches!(span.token, SqlToken::String(_) | SqlToken::Comment(_))),
+        "package body root was swallowed by a literal/comment token: {covering_package_body:?}"
+    );
+    let context_start = script.find(context).expect("fixture context");
+    let word_start = context_start + context.find("RETURN").expect("RETURN in context");
+    let mut snapshot = ChunkedText::from_str(script);
+    assert!(snapshot.replace_range(word_start, word_start + "RETURN".len(), "RETU"));
+    let cursor = word_start + "RETU".len();
+    let (expanded, analysis) = intellisense_analysis_from_snapshot_for_test(
+        &snapshot,
+        cursor,
+        crate::db::DatabaseType::Oracle,
+    );
+    let mut data = oracle_test_file_scoped_intellisense_data(file_name);
+    let suggestions = query_completion_suggestions_from_prepared_snapshot_with_data(
+        &snapshot,
+        cursor,
+        crate::db::DatabaseType::Oracle,
+        true,
+        &mut data,
+        &expanded,
+        &analysis,
+    );
+    assert!(
+        suggestions
+            .iter()
+            .any(|suggestion| suggestion.eq_ignore_ascii_case("RETURN")),
+        "{file_name} lost RETURN: phase={:?}, expanded={:?}, suggestions={suggestions:?}",
+        analysis.context.phase,
+        expanded.text
+    );
+
+    let file_name = "test20.sql";
+    let context = concat!(
+        "WHEN e_custom THEN\n",
+        "                    qt_fb_log_proc(\n",
+        "                        p_module => 'qt_fb_pkg.test_nested_everything',"
+    );
+    let script = load_intellisense_test_file(file_name);
+    let context_start = script.find(context).expect("fixture context");
+    let word_start = context_start + context.find("p_module").expect("p_module in context");
+    let mut snapshot = ChunkedText::from_str(script);
+    assert!(snapshot.replace_range(word_start, word_start + "p_module".len(), "p_mo"));
+    let cursor = word_start + "p_mo".len();
+    let (expanded, analysis) = intellisense_analysis_from_snapshot_for_test(
+        &snapshot,
+        cursor,
+        crate::db::DatabaseType::Oracle,
+    );
+    let mut data = oracle_test_file_scoped_intellisense_data(file_name);
+    assert!(
+        data.cached_signature("QT_FB_LOG_PROC")
+            .is_some_and(Option::is_some),
+        "fixture metadata lost QT_FB_LOG_PROC signature"
+    );
+    let signature_scan =
+        signature_scan_text_before_cursor_from_snapshot_for_test(&snapshot, cursor);
+    let signature_scan_start = cursor.saturating_sub(signature_scan.len());
+    let signature_prefix = snapshot
+        .range_string(0, signature_scan_start)
+        .unwrap_or_default();
+    let signature_initial_mode = intellisense_test_lex_mode_at(
+        &signature_prefix,
+        signature_prefix.len(),
+        false,
+    );
+    let enclosing_call = crate::ui::intellisense::enclosing_call_at_cursor_with_lexical_mode(
+        &signature_scan,
+        signature_scan.len(),
+        false,
+        signature_initial_mode.clone(),
+    );
+    let named_context = SqlEditorWidget::named_argument_call_context(
+        &signature_scan,
+        "p_mo",
+        signature_initial_mode.clone(),
+        false,
+    )
+    .map(|(_, call)| call);
+    let named_arguments = SqlEditorWidget::cached_signature_named_argument_suggestions(
+        &data,
+        &signature_scan,
+        "p_mo",
+        signature_initial_mode,
+        false,
+    );
+    assert!(
+        named_arguments
+            .iter()
+            .any(|suggestion| suggestion.eq_ignore_ascii_case("p_module")),
+        "signature path lost p_module: call={enclosing_call:?}, named_context={named_context:?}, scan={signature_scan:?}, suggestions={named_arguments:?}"
+    );
+    let suggestions = query_completion_suggestions_from_prepared_snapshot_with_data(
+        &snapshot,
+        cursor,
+        crate::db::DatabaseType::Oracle,
+        true,
+        &mut data,
+        &expanded,
+        &analysis,
+    );
+    assert!(
+        suggestions
+            .iter()
+            .any(|suggestion| suggestion.eq_ignore_ascii_case("p_module")),
+        "{file_name} lost p_module: phase={:?}, expanded={:?}, suggestions={suggestions:?}",
+        analysis.context.phase,
+        expanded.text
+    );
+
+    let (file_name, context, word, prefix, expected) = (
+        "test21.sql",
+        "ON (t.emp_id = s.emp_id)\nWHEN MATCHED THEN",
+        "s",
+        "s",
+        "s",
+    );
+    let suggestions = oracle_fixture_word_completion_suggestions(file_name, context, word, prefix);
+    assert!(
+        suggestions
+            .iter()
+            .any(|suggestion| suggestion.eq_ignore_ascii_case(expected)),
+        "{file_name} lost `{expected}` at `{context}`: {suggestions:?}"
+    );
+}
+
+#[test]
+fn oracle_remaining_structural_fixture_words_use_production_completion() {
+    assert_oracle_sweep_fixture_completion_cases(&[
+        (
+            "test10.txt",
+            "p_dept_id NUMBER DEFAULT NULL) RETURN",
+            "NULL",
+            "NUL",
+            "NULL",
+        ),
+        (
+            "test10.txt",
+            "NVL (SUM (s.amount), 0) AS total_sales\n        FROM qt_emp e\n        JOIN qt_dept d\n            ON d.dept_id",
+            "ON",
+            "O",
+            "ON",
+        ),
+        (
+            "test10.txt",
+            "TABLE OF NUMBER INDEX BY PLS_INTEGER;",
+            "OF",
+            "O",
+            "OF",
+        ),
+        (
+            "test10.txt",
+            "PROCEDURE load_bonus_sales (p_year NUMBER, p_debug BOOLEAN DEFAULT FALSE);",
+            "BOOLEAN",
+            "BOOL",
+            "BOOLEAN",
+        ),
+        (
+            "test10.txt",
+            "PROCEDURE load_bonus_sales (p_year NUMBER, p_debug BOOLEAN DEFAULT FALSE);",
+            "DEFAULT",
+            "DEFA",
+            "DEFAULT",
+        ),
+        (
+            "test21.sql",
+            "FROM dual\nUNION ALL\nSELECT\n    102,",
+            "UNION",
+            "UNIO",
+            "UNION",
+        ),
+        (
+            "test21.sql",
+            "RULES SEQUENTIAL ORDER\n  (",
+            "SEQUENTIAL",
+            "SEQU",
+            "SEQUENTIAL",
+        ),
+        (
+            "test21.sql",
+            "DEFINE\n         A AS salary",
+            "AS",
+            "A",
+            "AS",
+        ),
+        (
+            "test25.sql",
+            "MODEL\n        PARTITION BY (deptno)\n        DIMENSION BY",
+            "DIMENSION",
+            "DIME",
+            "DIMENSION",
+        ),
+        (
+            "test25.sql",
+            ")\n        COLUMNS\n            emp_id",
+            "COLUMNS",
+            "COLU",
+            "COLUMNS",
+        ),
+        (
+            "test25.sql",
+            "CASE\n                    WHEN base_sal[CV ()",
+            "WHEN",
+            "WHE",
+            "WHEN",
+        ),
+        (
+            "test25.sql",
+            "calc_sal[ANY, ANY] =\n                base_sal[CV (), CV (empno)]\n                + NVL",
+            "CV",
+            "C",
+            "CV",
+        ),
+        (
+            "test25.sql",
+            "qt25_emp_audit_seq.NEXTVAL,",
+            "NEXTVAL",
+            "NEXT",
+            "NEXTVAL",
+        ),
+    ]);
+}
+
+#[test]
+fn oracle_final_sweep_gap_families_use_production_completion() {
+    assert_oracle_sweep_fixture_completion_cases(&[
+        (
+            "oracle_format_ultimate_boss.sql",
+            ") LOOP\n        BEGIN\n            EXECUTE IMMEDIATE",
+            "BEGIN",
+            "BEGI",
+            "BEGIN",
+        ),
+        (
+            "oracle_format_ultimate_boss.sql",
+            "'sales' VALUE (\n                SELECT NVL(SUM((s.qty",
+            "SELECT",
+            "SELE",
+            "SELECT",
+        ),
+        (
+            "oracle_format_final_boss_2.sql",
+            "JOIN customer_tree t ON t.customer_id=c.customer_id",
+            "ON",
+            "O",
+            "ON",
+        ),
+        (
+            "oracle_format_final_boss_3.sql",
+            "LISTAGG(DISTINCT p.channel_code,','ON OVERFLOW TRUNCATE'...'WITHOUT COUNT)",
+            "ON",
+            "O",
+            "ON",
+        ),
+        (
+            "oracle_format_final_boss_v2.sql",
+            "RETURN SYS_REFCURSOR\n    AS\n        l_rc",
+            "AS",
+            "A",
+            "AS",
+        ),
+        (
+            "oracle_format_final_boss_v2.sql",
+            "ON j.emp_id = e.emp_id\n        LEFT JOIN ex x",
+            "emp_id",
+            "emp_",
+            "emp_id",
+        ),
+        (
+            "test25.sql",
+            "END fmt_mask;\n    PROCEDURE noop (",
+            "PROCEDURE",
+            "PROC",
+            "PROCEDURE",
+        ),
+        (
+            "test25.sql",
+            "WHEN e.sal >= 2500 THEN ROUND (e.sal * 0.10, 2)",
+            "WHEN",
+            "WHE",
+            "WHEN",
+        ),
+        (
+            "test25.sql",
+            "b.empno = s.empno\n    AND (",
+            "AND",
+            "AN",
+            "AND",
+        ),
+        (
+            "test25.sql",
+            "INSERT ALL\n    WHEN sal >= 4000 THEN",
+            "WHEN",
+            "WHE",
+            "WHEN",
+        ),
+        (
+            "test25.sql",
+            "FORALL idx IN INDICES OF v_tab\n            INSERT INTO qt25_emp_audit_log",
+            "qt25_emp_audit_log",
+            "qt25",
+            "qt25_emp_audit_log",
+        ),
+        (
+            "test1.txt",
+            "DBMS_OUTPUT.PUT_LINE('filled result table with run_id='||v_run_id);",
+            "PUT_LINE",
+            "PUT_",
+            "PUT_LINE",
+        ),
+        (
+            "test10.txt",
+            "INSERT INTO qt_audit_log (module_name, action_name, log_text)\n            VALUES ('qt_sales_ct'",
+            "action_name",
+            "acti",
+            "action_name",
+        ),
+        (
+            "test11.txt",
+            "UPDATE OF salary SKIP LOCKED;",
+            "OF",
+            "O",
+            "OF",
+        ),
+        (
+            "test16.sql",
+            "'ID=' || p_id\n                || ';NAME='",
+            "p_id",
+            "p_i",
+            "p_id",
+        ),
+        (
+            "test18.sql",
+            "adjust_salary (30, 0.08, FALSE);",
+            "FALSE",
+            "FALS",
+            "FALSE",
+        ),
+        (
+            "test20.sql",
+            "TYPE t_stage_tab IS TABLE OF qt_fb_stage%ROWTYPE INDEX BY PLS_INTEGER;",
+            "qt_fb_stage",
+            "qt_f",
+            "qt_fb_stage",
+        ),
+        (
+            "test20.sql",
+            "WHERE e.dept_id IN (SELECT COLUMN_VALUE FROM TABLE(sys.odcinumberlist(20,30)))",
+            "COLUMN_VALUE",
+            "COLU",
+            "COLUMN_VALUE",
+        ),
+        (
+            "test_open_with.sql",
+            "LPAD (' ', (lvl - 1) * 2) || node_name AS tree_display",
+            "lvl",
+            "lv",
+            "lvl",
+        ),
+        (
+            "test_open_with.sql",
+            "'$' COLUMNS (\n                -- [AO] 최상위 컬럼",
+            "COLUMNS",
+            "COLU",
+            "COLUMNS",
+        ),
+    ]);
+}
+
+#[test]
+fn sweep_skips_include_paths_and_routine_or_cursor_parameter_definitions() {
+    use crate::db::DatabaseType::{MariaDB, Oracle};
+
+    let data = IntellisenseData::new();
+    let include_run = intellisense_sweep_run("@test/test1.txt;\n", Oracle, &data);
+    assert_eq!(
+        include_run.checked, 0,
+        "SQL*Plus include paths are not completion reference slots"
+    );
+    assert!(intellisense_sweep_word_skip_context(
+        "CREATE TYPE BODY demo_t AS MEMBER FUNCTION rend__CODEX_CURSOR__ RETURN VARCHAR2 IS BEGIN RETURN NULL; END; END;",
+        Oracle,
+        "render",
+    ));
+    assert!(intellisense_sweep_word_skip_context(
+        "BEGIN NOT ATOMIC DECLARE cur_prices CURSOR(p_as__CODEX_CURSOR__ INT) FOR SELECT 1; END",
+        MariaDB,
+        "p_asset_id",
+    ));
 }
 
 fn intellisense_sweep_word_starts_line(sql: &str, word_start: usize) -> bool {
@@ -50464,7 +51764,13 @@ fn intellisense_sweep_is_definition_slot(
             || SqlEditorWidget::cursor_is_inside_routine_param_list(
                 &tokens_before_word,
                 tokens_before_word.len(),
-            ))
+            )
+            || (crate::sql_text::mysql_compatibility_for_sql("", Some(db_type))
+                && SqlEditorWidget::innermost_open_paren_preceding_word(
+                    &tokens_before_word,
+                    tokens_before_word.len(),
+                )
+                .is_some_and(|word| word.eq_ignore_ascii_case("CURSOR"))))
     {
         return true;
     }
@@ -50527,12 +51833,11 @@ fn intellisense_sweep_is_definition_slot(
     {
         return true;
     }
-    if !crate::sql_text::is_sql_keyword_for_db(&original_upper, db_type) {
-        if statement_tail.rfind("UNPIVOT").is_some()
-            && statement_tail.matches('(').count() > statement_tail.matches(')').count()
-        {
-            return true;
-        }
+    if !crate::sql_text::is_sql_keyword_for_db(&original_upper, db_type)
+        && statement_tail.rfind("UNPIVOT").is_some()
+        && statement_tail.matches('(').count() > statement_tail.matches(')').count()
+    {
+        return true;
     }
     if original_word.starts_with('"')
         && original_word.ends_with('"')
@@ -50601,7 +51906,10 @@ fn intellisense_sweep_is_definition_slot(
         if previous_word
             .as_deref()
             .is_some_and(|word| matches!(word, "FUNCTION" | "PROCEDURE"))
-            && next_is_open_paren
+            && (next_is_open_paren
+                || next_word.as_deref().is_some_and(|word| {
+                    matches!(word.to_ascii_uppercase().as_str(), "RETURN" | "IS" | "AS")
+                }))
         {
             return true;
         }
@@ -50823,59 +52131,67 @@ fn intellisense_sweep_word_skip_context(
         return true;
     };
     let sql = script_with_cursor.replacen(MARKER, "", 1);
-    let (routine_cache, expanded) =
-        SqlEditorWidget::build_routine_symbol_cache_bundle_for_test_for_db_type(
-            &sql,
-            cursor,
-            Some(db_type),
-        );
-    let analysis = SqlEditorWidget::build_intellisense_analysis_from_routine_cache(
-        &routine_cache,
-        expanded.cursor_in_statement,
-    );
-    let deep_ctx = analysis.context.clone();
-    let (_, word_start, _) = crate::ui::intellisense::get_word_at_cursor(&sql, cursor);
+    let snapshot = ChunkedText::from_str(&sql);
+    let (_, analysis) = intellisense_analysis_from_snapshot_for_test(&snapshot, cursor, db_type);
+    intellisense_sweep_word_skip_context_from_analysis(
+        &sql,
+        cursor,
+        db_type,
+        original_word,
+        &analysis,
+    )
+}
+
+fn intellisense_sweep_word_skip_context_from_analysis(
+    sql: &str,
+    cursor: usize,
+    db_type: crate::db::DatabaseType,
+    original_word: &str,
+    analysis: &IntellisenseAnalysis,
+) -> bool {
+    let deep_ctx = analysis.context.as_ref();
+    let (_, word_start, _) = crate::ui::intellisense::get_word_at_cursor(sql, cursor);
 
     analysis.cursor_in_alias_declaration
         || deep_ctx.ddl_new_name_position
         || intellisense_sweep_is_out_of_scope_relation_qualifier(
-            &sql,
+            sql,
             cursor,
             word_start,
             original_word,
-            &deep_ctx,
+            deep_ctx,
         )
         || SqlEditorWidget::cursor_is_at_create_object_new_name(
-            &deep_ctx,
+            deep_ctx,
             true,
             Some(db_type),
         )
-        || SqlEditorWidget::cursor_is_at_rename_target_new_name_slot_for_context(&deep_ctx, true)
-        || SqlEditorWidget::cursor_is_at_ddl_partition_new_name_slot_for_context(&deep_ctx, true)
-        || SqlEditorWidget::cursor_is_at_ddl_table_index_new_name_slot_for_context(&deep_ctx, true)
-        || SqlEditorWidget::cursor_is_inside_post_table_modifier_value_slot_for_context(&deep_ctx, true)
+        || SqlEditorWidget::cursor_is_at_rename_target_new_name_slot_for_context(deep_ctx, true)
+        || SqlEditorWidget::cursor_is_at_ddl_partition_new_name_slot_for_context(deep_ctx, true)
+        || SqlEditorWidget::cursor_is_at_ddl_table_index_new_name_slot_for_context(deep_ctx, true)
+        || SqlEditorWidget::cursor_is_inside_post_table_modifier_value_slot_for_context(deep_ctx, true)
         || SqlEditorWidget::cursor_is_at_mysql_oracle_only_ddl_value_slot_for_context(
-            &deep_ctx,
+            deep_ctx,
             true,
             Some(db_type),
         )
         || SqlEditorWidget::cursor_is_at_plsql_named_end_target_slot_for_context(
-            &deep_ctx,
+            deep_ctx,
             true,
             Some(db_type),
         )
         || SqlEditorWidget::cursor_is_at_plsql_declaration_object_name_slot_for_context(
-            &deep_ctx,
+            deep_ctx,
             true,
             Some(db_type),
         )
         || intellisense_sweep_is_definition_slot(
-            &sql,
+            sql,
             cursor,
             word_start,
             original_word,
             db_type,
-            &deep_ctx,
+            deep_ctx,
         )
 }
 
@@ -50944,22 +52260,129 @@ fn intellisense_sweep_panic_payload_text(err: &(dyn std::any::Any + Send)) -> St
     "panic".to_string()
 }
 
+fn intellisense_sweep_check_candidate(
+    script: &str,
+    base_snapshot: &ChunkedText,
+    db_type: crate::db::DatabaseType,
+    base_data: &IntellisenseData,
+    candidate: &IntellisenseSweepCandidate,
+) -> IntellisenseSweepCandidateResult {
+    let mut snapshot = base_snapshot.clone();
+    assert!(snapshot.replace_range(
+        candidate.start,
+        candidate.end,
+        &candidate.replacement,
+    ));
+    let prepared = panic::catch_unwind(AssertUnwindSafe(|| {
+        intellisense_analysis_from_snapshot_for_test(&snapshot, candidate.cursor, db_type)
+    }));
+    let (expanded, analysis) = match prepared {
+        Ok(prepared) => prepared,
+        Err(err) => {
+            let (line, column) = intellisense_sweep_line_column(script, candidate.start);
+            return IntellisenseSweepCandidateResult {
+                checked: true,
+                missing: Some(IntellisenseSweepMissing {
+                    start: candidate.start,
+                    end: candidate.end,
+                    line,
+                    column,
+                    word: candidate.word.clone(),
+                    prefix: candidate.prefix.clone(),
+                    suggestion_sample: vec![format!(
+                        "<panic: {}>",
+                        intellisense_sweep_panic_payload_text(err.as_ref())
+                    )],
+                    suggestion_count: 0,
+                }),
+            };
+        }
+    };
+    let skip = panic::catch_unwind(AssertUnwindSafe(|| {
+        intellisense_sweep_word_skip_context_from_analysis(
+            &expanded.text,
+            expanded.cursor_in_statement,
+            db_type,
+            &candidate.word,
+            &analysis,
+        )
+    }))
+    .unwrap_or(false);
+    if skip {
+        return IntellisenseSweepCandidateResult {
+            checked: false,
+            missing: None,
+        };
+    }
+
+    let result = panic::catch_unwind(AssertUnwindSafe(|| {
+        let mut data = base_data.clone();
+        query_completion_suggestions_from_prepared_snapshot_with_data(
+            &snapshot,
+            candidate.cursor,
+            db_type,
+            true,
+            &mut data,
+            &expanded,
+            &analysis,
+        )
+    }));
+    let (matched, suggestion_sample, suggestion_count) = match result {
+        Ok(suggestions) => {
+            let matched = suggestions.iter().any(|suggestion| {
+                intellisense_sweep_suggestion_matches_word(suggestion, &candidate.word)
+            });
+            let count = suggestions.len();
+            let sample = suggestions.into_iter().take(16).collect::<Vec<_>>();
+            (matched, sample, count)
+        }
+        Err(err) => (
+            false,
+            vec![format!(
+                "<panic: {}>",
+                intellisense_sweep_panic_payload_text(err.as_ref())
+            )],
+            0,
+        ),
+    };
+    let missing = (!matched).then(|| {
+        let (line, column) = intellisense_sweep_line_column(script, candidate.start);
+        IntellisenseSweepMissing {
+            start: candidate.start,
+            end: candidate.end,
+            line,
+            column,
+            word: candidate.word.clone(),
+            prefix: candidate.prefix.clone(),
+            suggestion_sample,
+            suggestion_count,
+        }
+    });
+    IntellisenseSweepCandidateResult {
+        checked: true,
+        missing,
+    }
+}
+
 fn intellisense_sweep_run(
     script: &str,
     db_type: crate::db::DatabaseType,
     base_data: &IntellisenseData,
 ) -> IntellisenseSweepRun {
-    const MARKER: &str = "__CODEX_CURSOR__";
-
+    let mysql_compatible = matches!(
+        db_type,
+        crate::db::DatabaseType::MySQL | crate::db::DatabaseType::MariaDB
+    );
     let spans = match db_type {
         crate::db::DatabaseType::MySQL | crate::db::DatabaseType::MariaDB => {
             super::query_text::tokenize_sql_spanned_with_mysql_compat(script, true)
         }
         crate::db::DatabaseType::Oracle => super::query_text::tokenize_sql_spanned(script),
     };
-    let mut missing = Vec::new();
-    let mut checked = 0usize;
-
+    let literal_or_comment_ranges =
+        intellisense_sweep_literal_or_comment_ranges(script, mysql_compatible);
+    let base_snapshot = ChunkedText::from_str(script);
+    let mut candidates = Vec::new();
     for span in spans {
         let SqlToken::Word(word) = &span.token else {
             continue;
@@ -50967,10 +52390,15 @@ fn intellisense_sweep_run(
         let Some(prefix) = intellisense_sweep_completion_prefix(word) else {
             continue;
         };
-        if intellisense_sweep_word_is_prompt_body(script, &span) {
+        if intellisense_sweep_word_is_prompt_body(script, &span)
+            || intellisense_sweep_word_is_sqlplus_include_path(script, &span)
+        {
             continue;
         }
-        if intellisense_sweep_word_is_literal_or_comment_body(script, span.start) {
+        if intellisense_sweep_offset_is_literal_or_comment(
+            &literal_or_comment_ranges,
+            span.start,
+        ) {
             continue;
         }
 
@@ -50981,63 +52409,59 @@ fn intellisense_sweep_run(
         } else {
             ""
         };
-        let marked = format!(
-            "{}{}{}{}{}{}",
-            script.get(..span.start).unwrap_or(""),
-            identifier_quote,
+        let replacement = format!("{identifier_quote}{prefix}{identifier_quote}");
+        let cursor = span
+            .start
+            .saturating_add(identifier_quote.len())
+            .saturating_add(prefix.len());
+        candidates.push(IntellisenseSweepCandidate {
+            start: span.start,
+            end: span.end,
+            word: word.clone(),
             prefix,
-            MARKER,
-            identifier_quote,
-            script.get(span.end..).unwrap_or("")
-        );
-        let skip = panic::catch_unwind(AssertUnwindSafe(|| {
-            intellisense_sweep_word_skip_context(&marked, db_type, word)
-        }))
-        .unwrap_or(false);
-        if skip {
-            continue;
-        }
-
-        checked += 1;
-        let result = panic::catch_unwind(AssertUnwindSafe(|| {
-            let mut data = base_data.clone();
-            query_completion_suggestions_with_data(&marked, db_type, true, &mut data)
-        }));
-
-        let (matched, suggestion_sample, suggestion_count) = match result {
-            Ok(suggestions) => {
-                let matched = suggestions
-                    .iter()
-                    .any(|suggestion| intellisense_sweep_suggestion_matches_word(suggestion, word));
-                let count = suggestions.len();
-                let sample = suggestions.into_iter().take(16).collect::<Vec<_>>();
-                (matched, sample, count)
-            }
-            Err(err) => (
-                false,
-                vec![format!(
-                    "<panic: {}>",
-                    intellisense_sweep_panic_payload_text(err.as_ref())
-                )],
-                0,
-            ),
-        };
-
-        if !matched {
-            let (line, column) = intellisense_sweep_line_column(script, span.start);
-            missing.push(IntellisenseSweepMissing {
-                start: span.start,
-                end: span.end,
-                line,
-                column,
-                word: word.clone(),
-                prefix,
-                suggestion_sample,
-                suggestion_count,
-            });
-        }
+            replacement,
+            cursor,
+        });
     }
 
+    let worker_count = std::thread::available_parallelism()
+        .map(|count| count.get())
+        .unwrap_or(1)
+        .min(8)
+        .min(candidates.len().max(1));
+    let next = AtomicUsize::new(0);
+    let results = Mutex::new(Vec::with_capacity(candidates.len()));
+    std::thread::scope(|scope| {
+        for _ in 0..worker_count {
+            let next = &next;
+            let results = &results;
+            let candidates = &candidates;
+            let base_snapshot = &base_snapshot;
+            scope.spawn(move || loop {
+                let idx = next.fetch_add(1, Ordering::Relaxed);
+                let Some(candidate) = candidates.get(idx) else {
+                    break;
+                };
+                let result = intellisense_sweep_check_candidate(
+                    script,
+                    base_snapshot,
+                    db_type,
+                    base_data,
+                    candidate,
+                );
+                lock_or_recover(results).push(result);
+            });
+        }
+    });
+    let results = results
+        .into_inner()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let checked = results.iter().filter(|result| result.checked).count();
+    let mut missing = results
+        .into_iter()
+        .filter_map(|result| result.missing)
+        .collect::<Vec<_>>();
+    missing.sort_by_key(|item| item.start);
     IntellisenseSweepRun { checked, missing }
 }
 
@@ -51613,8 +53037,14 @@ fn intellisense_sweep_generate_report_for_file(
     std::fs::write(out_path, out)
         .unwrap_or_else(|err| panic!("failed to write `{}`: {err}", out_path.display()));
 
+    let contains_sql_statement = super::query_text::split_script_items_for_db_type(
+        &script,
+        Some(db_type),
+    )
+    .iter()
+    .any(|item| matches!(item, crate::db::ScriptItem::Statement(statement) if !statement.trim().is_empty()));
     assert!(
-        run.checked > 0,
+        run.checked > 0 || !contains_sql_statement,
         "IntelliSense sweep did not check any tokens for `{}`",
         input_path.display()
     );
@@ -51627,6 +53057,102 @@ fn intellisense_sweep_generate_report_for_file(
         );
     }
     run
+}
+
+fn intellisense_sweep_fixture_paths(
+    directory: &str,
+    extensions: &[&str],
+) -> Vec<PathBuf> {
+    let directory = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(directory);
+    let mut paths = std::fs::read_dir(&directory)
+        .unwrap_or_else(|err| panic!("failed to read `{}`: {err}", directory.display()))
+        .map(|entry| {
+            entry
+                .unwrap_or_else(|err| {
+                    panic!("failed to read entry under `{}`: {err}", directory.display())
+                })
+                .path()
+        })
+        .filter(|path| {
+            path.is_file()
+                && path
+                    .extension()
+                    .and_then(|extension| extension.to_str())
+                    .is_some_and(|extension| extensions.contains(&extension))
+        })
+        .collect::<Vec<_>>();
+    paths.sort();
+    paths
+}
+
+#[test]
+#[ignore = "generates IntelliSense sweep reports for every Oracle/MySQL/MariaDB fixture"]
+fn intellisense_sweep_generate_reports_for_all_fixture_files() {
+    use crate::db::DatabaseType::{MariaDB, MySQL, Oracle};
+
+    let requested_path = std::env::var_os("SPACE_QUERY_INTELLISENSE_SWEEP_FILE")
+        .map(PathBuf::from)
+        .map(|path| {
+            if path.is_absolute() {
+                path
+            } else {
+                PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(path)
+            }
+        });
+    let mut failures = Vec::new();
+    for (directory, extensions, db_type) in [
+        ("test", &["txt", "sql"][..], Oracle),
+        ("test_mariadb", &["txt"][..], MariaDB),
+        ("test_mysql", &["txt"][..], MySQL),
+    ] {
+        for input_path in intellisense_sweep_fixture_paths(directory, extensions) {
+            if requested_path
+                .as_ref()
+                .is_some_and(|requested_path| requested_path != &input_path)
+            {
+                continue;
+            }
+            let file_name = input_path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or_else(|| panic!("non-UTF8 fixture path `{}`", input_path.display()));
+            let data = match db_type {
+                Oracle => oracle_test_file_scoped_intellisense_data(file_name),
+                MySQL | MariaDB => mysql_family_test_intellisense_data(file_name, db_type),
+            };
+            let relative_path = format!("{directory}/{file_name}");
+            let metadata_label = match db_type {
+                Oracle => {
+                    "test Oracle inferred catalog (file-scoped overlay) + Oracle built-ins"
+                        .to_string()
+                }
+                MySQL | MariaDB => format!("{relative_path} inferred catalog"),
+            };
+            let out_path = intellisense_sweep_out_path(&input_path);
+            let run = intellisense_sweep_generate_report_for_file(
+                &input_path,
+                db_type,
+                &data,
+                Some(&metadata_label),
+                &out_path,
+                false,
+            );
+            eprintln!(
+                "IntelliSense sweep: {relative_path}: checked={} missing={}",
+                run.checked,
+                run.missing.len()
+            );
+            if !run.missing.is_empty() {
+                failures.push(format!("{relative_path}: {}", run.missing.len()));
+            }
+        }
+    }
+
+    assert!(
+        failures.is_empty(),
+        "IntelliSense sweep found missing tokens:\n{}",
+        failures.join("\n")
+    );
 }
 
 #[test]
@@ -52255,6 +53781,7 @@ fn query_completion_suggestions_from_context_with_data(
             &prefix,
             Some(db_type),
             prefix_is_followed_by_call_paren,
+            deep_ctx,
         )
     } else {
         Vec::new()
@@ -52305,11 +53832,19 @@ fn query_completion_suggestions_from_context_with_data(
     );
     if !crate::sql_text::mysql_compatibility_for_sql("", Some(db_type))
     {
+        let signature_scan = signature_scan_text_before_cursor_for_test(statement, cursor);
+        let signature_initial_mode = intellisense_test_lex_mode_at(
+            statement,
+            cursor.saturating_sub(signature_scan.len()),
+            db_type.is_mysql_or_mariadb(),
+        );
         let signature_argument_suggestions =
             SqlEditorWidget::cached_signature_named_argument_suggestions(
                 data,
-                signature_scan_text_before_cursor_for_test(statement, cursor),
+                signature_scan,
                 &prefix,
+                signature_initial_mode,
+                db_type.is_mysql_or_mariadb(),
             );
         if !signature_argument_suggestions.is_empty() {
             suggestions = SqlEditorWidget::merge_suggestions_with_context_aliases(
@@ -89487,6 +91022,10 @@ fn oracle_listagg_overflow_keyword_chain_uses_production_completion() {
 
     for (sql, expected) in [
         (
+            "SELECT LISTAGG(DISTINCT deptno, ',' o|) FROM emp",
+            "ON",
+        ),
+        (
             "SELECT LISTAGG(DISTINCT deptno, ',' ON over|) FROM emp",
             "OVERFLOW",
         ),
@@ -89521,6 +91060,10 @@ fn oracle_listagg_overflow_keyword_chain_uses_production_completion() {
     assert!(
         !has("SELECT COALESCE(ename, 'x' ON over|) FROM emp", "OVERFLOW"),
         "LISTAGG overflow keywords leaked into a different function call"
+    );
+    assert!(
+        !has("SELECT LISTAGG(o|) FROM emp", "ON"),
+        "LISTAGG ON OVERFLOW leaked into the value-expression argument"
     );
 }
 

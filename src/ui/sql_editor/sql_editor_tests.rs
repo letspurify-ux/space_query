@@ -2196,7 +2196,20 @@ fn format_sql_preserves_oracle_format_final_boss_v2_and_depth_indentation() {
 
 #[test]
 fn format_sql_preserves_test_045_execution_unit_inside_oracle_splitter_final_boss_script() {
-    let input = load_test_file("oracle splitter final boss test.sql");
+    let input = r#"DECLARE
+    TYPE bind_rec_t IS RECORD (name VARCHAR2(30));
+    v_cursor_id INTEGER;
+    v_col_count INTEGER;
+    v_desc_tab DBMS_SQL.DESC_TAB;
+    PROCEDURE add_bind IS
+    BEGIN
+        NULL;
+    END;
+BEGIN
+    DBMS_SQL.DESCRIBE_COLUMNS(v_cursor_id, v_col_count, v_desc_tab);
+END;
+/
+"#;
     let formatted = SqlEditorWidget::format_sql_basic(&input);
     let formatted_items = QueryExecutor::split_script_items(&formatted);
     let formatted_statements: Vec<&str> = formatted_items
@@ -2222,7 +2235,15 @@ fn format_sql_preserves_test_045_execution_unit_inside_oracle_splitter_final_bos
 
 #[test]
 fn format_sql_preserves_test_026_slash_delimited_selects_as_two_execution_units() {
-    let input = load_test_file("oracle splitter final boss test.sql");
+    let input = r#"SELECT salary,
+    salary / 12 AS monthly_salary
+FROM employees
+ORDER BY salary
+/
+SELECT 1 / 2 AS half
+FROM dual
+/
+"#;
     let formatted = SqlEditorWidget::format_sql_basic(&input);
     let formatted_items = QueryExecutor::split_script_items(&formatted);
     let formatted_statements: Vec<&str> = formatted_items

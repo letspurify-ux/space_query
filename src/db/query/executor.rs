@@ -1641,7 +1641,6 @@ impl QueryExecutor {
         engine.is_idle()
     }
 
-    #[cfg(test)]
     pub(crate) fn statement_spans_for_db_type_with_mysql_delimiter(
         sql: &str,
         preferred_db_type: Option<crate::db::connection::DatabaseType>,
@@ -2097,6 +2096,7 @@ impl QueryExecutor {
                 && !collector.builder.current_is_empty()
                 && collector.builder.paren_depth() == 0
                 && collector.builder.can_terminate_on_slash()
+                && !collector.builder.has_pending_standard_cte_header()
                 && Self::parse_tool_command(parser_trimmed).is_some()
                 && !collector.force_terminate_current(sql, &mut on_span)
             {
@@ -2108,7 +2108,8 @@ impl QueryExecutor {
                 collector.current_is_empty(),
                 collector.builder.block_depth() == 0 && collector.builder.paren_depth() == 0,
                 is_alter_session_set_clause,
-            ) && Self::line_might_be_tool_command_for_bounds(parser_trimmed)
+            ) && !collector.builder.has_pending_standard_cte_header()
+                && Self::line_might_be_tool_command_for_bounds(parser_trimmed)
             {
                 if let Some(command) = Self::parse_tool_command(parser_trimmed) {
                     if !collector.force_terminate_current(sql, &mut on_span) {

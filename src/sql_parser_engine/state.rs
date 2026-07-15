@@ -526,6 +526,10 @@ impl SplitState {
         )
     }
 
+    pub(crate) fn has_pending_standard_cte_header(&self) -> bool {
+        self.with_clause_state == WithClauseState::PendingClause
+    }
+
     fn with_clause_waiting_main_query(&self) -> bool {
         matches!(
             self.with_clause_state,

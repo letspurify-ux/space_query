@@ -563,7 +563,7 @@ FROM qt_if_child;
 -- source: test/test12.sql
 -- db: Oracle
 -- metadata: test Oracle inferred catalog (file-scoped overlay) + Oracle built-ins
--- checked: 802
+-- checked: 885
 -- missing: 0
 -- marker: [[word]] means not suggested for the tested prefix
 -- missing tokens: none

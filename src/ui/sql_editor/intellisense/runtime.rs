@@ -426,15 +426,17 @@ impl SqlEditorWidget {
                     ));
                 let context = detect_sql_context(&context_text, context_text.len());
                 if matches!(context, SqlContext::TableName) {
-                    let (_, word_start, _) = Self::word_at_cursor(
+                    let (_, word_start, _) = Self::word_at_cursor_for_db(
                         &buffer_for_insert,
                         &text_shadow_for_insert,
                         cursor_pos,
+                        preferred_db_type,
                     );
                     let qualifier = Self::qualifier_before_word(
                         &buffer_for_insert,
                         &text_shadow_for_insert,
                         word_start,
+                        preferred_db_type,
                     );
                     let table_lookup = qualifier
                         .as_deref()
@@ -1431,10 +1433,13 @@ impl SqlEditorWidget {
                     }
 
                     // Handle typing - update intellisense filter
-                    let (word, word_start, _) = Self::word_at_cursor(
+                    let preferred_db_type = intellisense_runtime_for_handle
+                        .db_type_without_blocking(&connection_for_handle);
+                    let (word, word_start, _) = Self::word_at_cursor_for_db(
                         &buffer_for_handle,
                         &text_shadow_for_handle,
                         cursor_pos,
+                        Some(preferred_db_type),
                     );
                     let buffer_len = buffer_for_handle.length();
 
@@ -1445,6 +1450,7 @@ impl SqlEditorWidget {
                             &text_shadow_for_handle,
                             &intellisense_popup_for_handle,
                             &intellisense_runtime_for_handle,
+                            Some(preferred_db_type),
                             cursor_pos,
                             key,
                             typed_char,
@@ -1502,6 +1508,7 @@ impl SqlEditorWidget {
                                 &buffer_for_handle,
                                 &text_shadow_for_handle,
                                 word_start,
+                                Some(preferred_db_type),
                             );
                             // A space right after `END` auto-opens the popup when
                             // the slot has a known completion (the enclosing
@@ -1574,6 +1581,7 @@ impl SqlEditorWidget {
                                 &buffer_for_handle,
                                 &text_shadow_for_handle,
                                 word_start,
+                                Some(preferred_db_type),
                             );
                             if Self::should_auto_trigger_intellisense_for_identifier_char(
                                 &word,

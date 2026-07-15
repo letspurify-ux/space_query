@@ -1,9 +1,72 @@
 use super::{
-    BlockKind, CreatePlsqlKind, CreateState, EndTokenRole, ExternalClauseState, IfState,
-    IfSymbolEvent, LineBoundaryAction, LineLeadingMarker, PendingDo, PendingEnd, PendingEndSuffix,
-    RoutineFrame, SemicolonAction, SemicolonPolicy, SlashLineKind, SplitState, SqlParserEngine,
-    SymbolRole, TimingPointState, TriggerKind, WithClauseState, WithDeclarationState,
+    lexical_spans, BlockKind, CreatePlsqlKind, CreateState, EndTokenRole, ExternalClauseState,
+    IfState, IfSymbolEvent, LexicalKind, LineBoundaryAction, LineLeadingMarker, PendingDo,
+    PendingEnd, PendingEndSuffix, RoutineFrame, SemicolonAction, SemicolonPolicy, SlashLineKind,
+    SplitState, SqlParserEngine, SymbolRole, TimingPointState, TriggerKind, WithClauseState,
+    WithDeclarationState,
 };
+
+#[test]
+fn lexical_spans_share_engine_quote_and_comment_rules() {
+    let sql = concat!(
+        "SELECT nq'[outer q'[nested ), (]' tail]', ",
+        "uq'\u{2603}unicode\u{2603}', N'it''s', U&'unicode', ",
+        "$tag$dollar ), ( -- /* payload$tag$, ",
+        "\"quoted\"\"), (\" FROM dual ",
+        "-- line ), (\n",
+        "WHERE note = 'plain /* text */' /* block ' ), ( */"
+    );
+    let spans = lexical_spans(sql, false);
+
+    let covered = |needle: &str, expected: LexicalKind| {
+        let start = sql.find(needle).expect("test needle");
+        spans.iter().any(|span| {
+            span.kind == expected && span.start <= start && start + needle.len() <= span.end
+        })
+    };
+
+    assert!(covered("nq'[outer", LexicalKind::String));
+    assert!(covered("q'[nested ), (]'", LexicalKind::String));
+    assert!(covered("uq'\u{2603}unicode", LexicalKind::String));
+    assert!(covered("N'it''s'", LexicalKind::String));
+    assert!(covered("U&'unicode'", LexicalKind::String));
+    assert!(covered(
+        "$tag$dollar ), ( -- /* payload$tag$",
+        LexicalKind::String
+    ));
+    assert!(covered("\"quoted\"\"), (\"", LexicalKind::QuotedIdentifier));
+    assert!(covered("-- line ), (", LexicalKind::LineComment));
+    assert!(covered("/* block ' ), ( */", LexicalKind::BlockComment));
+
+    let from = sql.find("FROM dual").expect("code after quoted identifier");
+    assert!(spans
+        .iter()
+        .all(|span| !(span.start <= from && from < span.end)));
+}
+
+#[test]
+fn lexical_spans_apply_mysql_escape_and_dash_comment_rules() {
+    let sql = "SELECT 'it\\'s ), (' AS s, `odd``), (name` FROM t --not-comment\n# comment\n";
+    let spans = lexical_spans(sql, true);
+
+    let string_start = sql.find("'it").unwrap();
+    let string_end = sql.find(" AS s").unwrap();
+    assert!(spans.iter().any(|span| {
+        span.kind == LexicalKind::String && span.start == string_start && span.end == string_end
+    }));
+    assert!(spans.iter().any(|span| {
+        span.kind == LexicalKind::QuotedIdentifier
+            && sql.get(span.start..span.end) == Some("`odd``), (name`")
+    }));
+    assert!(spans.iter().any(|span| {
+        span.kind == LexicalKind::LineComment
+            && sql.get(span.start..span.end) == Some("# comment\n")
+    }));
+    assert!(spans.iter().all(|span| {
+        span.kind != LexicalKind::LineComment
+            || sql.get(span.start..span.end) != Some("--not-comment")
+    }));
+}
 
 #[test]
 fn pending_subprogram_begin_counter_does_not_underflow_on_malformed_nested_end() {
@@ -1212,7 +1275,12 @@ fn semicolon_split_resets_transient_state_at_top_level() {
     engine.state.if_state = IfState::AwaitingThen;
     engine.state.clear_paren_stack();
 
-    engine.process_chars_with_observer(&[';'], &mut |_, _, _, _| {}, &mut |_, _| {});
+    engine.process_chars_with_observer(
+        &[';'],
+        &mut |_, _, _, _| {},
+        &mut |_, _| {},
+        &mut |_, _, _, _| {},
+    );
 
     assert_eq!(engine.take_statements(), vec!["SELECT 1".to_string()]);
     assert!(engine.current.is_empty());
@@ -1293,7 +1361,12 @@ fn semicolon_split_for_external_routine_resets_transient_state() {
     engine.state.if_state = IfState::AwaitingThen;
     engine.state.clear_paren_stack();
 
-    engine.process_chars_with_observer(&[';'], &mut |_, _, _, _| {}, &mut |_, _| {});
+    engine.process_chars_with_observer(
+        &[';'],
+        &mut |_, _, _, _| {},
+        &mut |_, _| {},
+        &mut |_, _, _, _| {},
+    );
 
     assert_eq!(engine.take_statements(), vec!["LANGUAGE C".to_string()]);
     assert!(engine.current.is_empty());

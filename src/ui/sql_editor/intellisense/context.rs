@@ -13,6 +13,15 @@ impl SqlEditorWidget {
         text_shadow: &Arc<Mutex<HighlightShadowState>>,
         cursor_pos: i32,
     ) -> (String, usize, usize) {
+        Self::word_at_cursor_for_db(buffer, text_shadow, cursor_pos, None)
+    }
+
+    fn word_at_cursor_for_db(
+        buffer: &TextBuffer,
+        text_shadow: &Arc<Mutex<HighlightShadowState>>,
+        cursor_pos: i32,
+        preferred_db_type: Option<crate::db::connection::DatabaseType>,
+    ) -> (String, usize, usize) {
         let buffer_len = buffer.length().max(0);
         if buffer_len == 0 {
             return (String::new(), 0, 0);
@@ -27,7 +36,36 @@ impl SqlEditorWidget {
         }
         let rel_cursor =
             Self::clamp_to_char_boundary_local(&text, (cursor_pos - start).max(0) as usize);
-        let (word, rel_start, rel_end) = get_word_at_cursor(&text, rel_cursor);
+        let mysql_compatible =
+            sql_text::mysql_compatibility_for_sql(&text, preferred_db_type);
+        let initial_lex_mode = text_shadow
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .parser_lex_mode_at(start.max(0) as usize, mysql_compatible);
+        let (mut word, mut rel_start, mut rel_end) =
+            crate::ui::intellisense::get_word_at_cursor_with_lexical_mode(
+                &text,
+                rel_cursor,
+                mysql_compatible,
+                initial_lex_mode,
+            );
+        if word
+            .chars()
+            .next()
+            .is_some_and(|ch| matches!(ch, '"' | '`' | '['))
+        {
+            let abs_start = start.max(0) as usize + rel_start;
+            let lexical_kind = text_shadow
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .parser_lexical_kind_at(abs_start);
+            if lexical_kind.is_some_and(|kind| {
+                kind != crate::sql_parser_engine::LexicalKind::QuotedIdentifier
+            }) {
+                (word, rel_start, rel_end) =
+                    crate::ui::intellisense::get_unquoted_word_at_cursor(&text, rel_cursor);
+            }
+        }
         let abs_start = start as usize + rel_start;
         let abs_end = start as usize + rel_end;
         (word, abs_start, abs_end)
@@ -73,40 +111,6 @@ impl SqlEditorWidget {
 
             if idx >= text.len() {
                 return None;
-            }
-        }
-
-        None
-    }
-
-    fn find_quoted_segment_start(
-        text: &str,
-        segment_end: usize,
-        delimiter: char,
-    ) -> Option<usize> {
-        if segment_end == 0 {
-            return None;
-        }
-        let prefix = text.get(..segment_end)?;
-        let mut active_start: Option<usize> = None;
-        let mut iter = prefix.char_indices().peekable();
-
-        while let Some((idx, ch)) = iter.next() {
-            if ch != delimiter {
-                continue;
-            }
-
-            if let Some(start_idx) = active_start {
-                if iter.peek().is_some_and(|(_, next)| *next == delimiter) {
-                    iter.next();
-                    continue;
-                }
-                if idx + ch.len_utf8() == segment_end {
-                    return Some(start_idx);
-                }
-                active_start = None;
-            } else {
-                active_start = Some(idx);
             }
         }
 
@@ -1228,42 +1232,23 @@ impl SqlEditorWidget {
         buffer: &TextBuffer,
         text_shadow: &Arc<Mutex<HighlightShadowState>>,
         word_start: usize,
+        preferred_db_type: Option<crate::db::connection::DatabaseType>,
     ) -> Option<String> {
-        if word_start == 0 {
-            return None;
-        }
-        let buffer_len = buffer.length().max(0) as usize;
-        if word_start > buffer_len {
-            return None;
-        }
-        let start = word_start
-            .saturating_sub(INTELLISENSE_QUALIFIER_WINDOW as usize)
-            .min(word_start);
-        let (text, start) = Self::bounded_text_window(
-            buffer,
-            text_shadow,
-            start as i32,
-            (word_start as i32).max(0),
-        );
-        let mut rel_word_start = (word_start as i32 - start).max(0) as usize;
-        if rel_word_start > text.len() {
-            rel_word_start = text.len();
-        }
-        rel_word_start = Self::clamp_to_char_boundary_local(&text, rel_word_start);
-        Self::qualifier_before_word_in_text(&text, rel_word_start)
+        Self::qualifiers_before_word(buffer, text_shadow, word_start, preferred_db_type).0
     }
 
-    fn raw_qualifier_before_word(
+    fn qualifiers_before_word(
         buffer: &TextBuffer,
         text_shadow: &Arc<Mutex<HighlightShadowState>>,
         word_start: usize,
-    ) -> Option<String> {
+        preferred_db_type: Option<crate::db::connection::DatabaseType>,
+    ) -> (Option<String>, Option<String>) {
         if word_start == 0 {
-            return None;
+            return (None, None);
         }
         let buffer_len = buffer.length().max(0) as usize;
         if word_start > buffer_len {
-            return None;
+            return (None, None);
         }
         let start = word_start
             .saturating_sub(INTELLISENSE_QUALIFIER_WINDOW as usize)
@@ -1279,10 +1264,50 @@ impl SqlEditorWidget {
             rel_word_start = text.len();
         }
         rel_word_start = Self::clamp_to_char_boundary_local(&text, rel_word_start);
-        Self::raw_qualifier_before_word_in_text(&text, rel_word_start)
+        let mysql_compatible = sql_text::mysql_compatibility_for_sql(&text, preferred_db_type);
+        let initial_lex_mode = text_shadow
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .parser_lex_mode_at(start.max(0) as usize, mysql_compatible);
+        match Self::qualifier_parts_before_word_in_text_with_lexical_mode(
+            &text,
+            rel_word_start,
+            mysql_compatible,
+            initial_lex_mode,
+        ) {
+            Some((qualifier, raw_qualifier)) => {
+                (Some(qualifier), Some(raw_qualifier))
+            }
+            None => (None, None),
+        }
     }
 
     fn qualifier_before_word_in_text(text: &str, rel_word_start: usize) -> Option<String> {
+        Self::qualifier_parts_before_word_in_text_with_lexical_mode(
+            text,
+            rel_word_start,
+            false,
+            crate::sql_parser_engine::LexMode::Idle,
+        )
+        .map(|(qualifier, _)| qualifier)
+    }
+
+    fn raw_qualifier_before_word_in_text(text: &str, rel_word_start: usize) -> Option<String> {
+        Self::qualifier_parts_before_word_in_text_with_lexical_mode(
+            text,
+            rel_word_start,
+            false,
+            crate::sql_parser_engine::LexMode::Idle,
+        )
+        .map(|(_, raw_qualifier)| raw_qualifier)
+    }
+
+    fn qualifier_parts_before_word_in_text_with_lexical_mode(
+        text: &str,
+        rel_word_start: usize,
+        mysql_compatible: bool,
+        initial_lex_mode: crate::sql_parser_engine::LexMode,
+    ) -> Option<(String, String)> {
         if rel_word_start == 0 {
             return None;
         }
@@ -1296,26 +1321,39 @@ impl SqlEditorWidget {
         }
         let idx = rel_word_start - 1;
 
-        let qualifier_candidate = text.get(..idx)?;
-        if Self::has_unbalanced_identifier_quotes(qualifier_candidate) {
+        let lexical_text = text.get(..rel_word_start)?;
+        let lexical_kinds = Self::qualifier_lexical_kinds(
+            lexical_text,
+            mysql_compatible,
+            initial_lex_mode,
+        );
+        if lexical_kinds.get(idx).copied().flatten().is_some()
+            || Self::dot_is_inside_bracket_quoted_identifier(lexical_text, idx, &lexical_kinds)
+        {
             return None;
         }
 
         let mut segments = Vec::new();
         let mut segment_end = idx;
+        let first_segment_start;
 
         loop {
-            let (segment, segment_start) =
-                Self::parse_qualifier_segment_before_dot(text, segment_end)?;
+            let (segment, segment_start) = Self::parse_qualifier_segment_before_dot(
+                text,
+                segment_end,
+                &lexical_kinds,
+            )?;
             if segment.is_empty() {
                 return None;
             }
             segments.push(segment);
 
             if segment_start == 0 {
+                first_segment_start = segment_start;
                 break;
             }
             if bytes.get(segment_start - 1) != Some(&b'.') {
+                first_segment_start = segment_start;
                 break;
             }
             segment_end = segment_start - 1;
@@ -1329,65 +1367,67 @@ impl SqlEditorWidget {
         }
 
         segments.reverse();
-        Some(segments.join("."))
+        let raw_qualifier = text.get(first_segment_start..idx)?.to_string();
+        (!raw_qualifier.is_empty()).then(|| (segments.join("."), raw_qualifier))
     }
 
-    fn raw_qualifier_before_word_in_text(text: &str, rel_word_start: usize) -> Option<String> {
-        if rel_word_start == 0 {
-            return None;
-        }
-        let bytes = text.as_bytes();
-        if bytes.get(rel_word_start.saturating_sub(1)) != Some(&b'.') {
-            return None;
-        }
-        let idx = rel_word_start - 1;
-
-        let qualifier_candidate = text.get(..idx)?;
-        if Self::has_unbalanced_identifier_quotes(qualifier_candidate) {
-            return None;
-        }
-
-        let mut segment_end = idx;
-
-        let first_segment_start = loop {
-            let (_, segment_start) = Self::parse_qualifier_segment_before_dot(text, segment_end)?;
-
-            if segment_start == 0 {
-                break segment_start;
+    fn qualifier_lexical_kinds(
+        text: &str,
+        mysql_compatible: bool,
+        initial_lex_mode: crate::sql_parser_engine::LexMode,
+    ) -> Vec<Option<crate::sql_parser_engine::LexicalKind>> {
+        let (lexical_spans, _) = crate::sql_parser_engine::lexical_spans_with_initial_mode(
+            text,
+            mysql_compatible,
+            initial_lex_mode,
+        );
+        let mut lexical_kinds = vec![None; text.len()];
+        for span in lexical_spans {
+            let end = span.end.min(lexical_kinds.len());
+            if span.start < end {
+                lexical_kinds[span.start..end].fill(Some(span.kind));
             }
-            if bytes.get(segment_start - 1) != Some(&b'.') {
-                break segment_start;
-            }
-            segment_end = segment_start - 1;
-            if segment_end == 0 {
-                return None;
-            }
-        };
-
-        text.get(first_segment_start..idx)
-            .filter(|qualifier| !qualifier.is_empty())
-            .map(ToString::to_string)
+        }
+        lexical_kinds
     }
 
     fn parse_qualifier_segment_before_dot(
         text: &str,
         segment_end: usize,
+        lexical_kinds: &[Option<crate::sql_parser_engine::LexicalKind>],
     ) -> Option<(String, usize)> {
         if segment_end == 0 {
             return None;
         }
 
-        let last_char = text.get(..segment_end)?.chars().next_back();
-        if matches!(last_char, Some(')')) {
-            let open_idx = Self::find_open_paren_for_qualifier_expression(text, segment_end)?;
+        let (last_pos, last_char) = text.get(..segment_end)?.char_indices().next_back()?;
+        let last_kind = lexical_kinds.get(last_pos).copied().flatten();
+        if last_char == ')' && last_kind.is_none() {
+            let open_idx = Self::find_open_paren_for_qualifier_expression(
+                text,
+                segment_end,
+                lexical_kinds,
+            )?;
             let trimmed_open_idx = text
                 .get(..open_idx)?
                 .trim_end()
                 .len();
-            return Self::parse_qualifier_segment_before_dot(text, trimmed_open_idx);
+            return Self::parse_qualifier_segment_before_dot(
+                text,
+                trimmed_open_idx,
+                lexical_kinds,
+            );
         }
-        if let Some(delimiter) = last_char.filter(|ch| matches!(ch, '"' | '`')) {
-            let start = Self::find_quoted_segment_start(text, segment_end, delimiter)?;
+        if matches!(last_char, '"' | '`')
+            && last_kind == Some(crate::sql_parser_engine::LexicalKind::QuotedIdentifier)
+        {
+            let mut start = last_pos;
+            while start > 0
+                && lexical_kinds.get(start - 1).copied().flatten()
+                    == Some(crate::sql_parser_engine::LexicalKind::QuotedIdentifier)
+            {
+                start -= 1;
+            }
             let quoted = text.get(start..segment_end)?;
             let qualifier = Self::strip_identifier_quotes(quoted);
             if qualifier.is_empty() {
@@ -1395,7 +1435,7 @@ impl SqlEditorWidget {
             }
             return Some((qualifier, start));
         }
-        if matches!(last_char, Some(']')) {
+        if last_char == ']' {
             let start = Self::find_bracket_segment_start(text, segment_end)?;
             let bracketed = text.get(start..segment_end)?;
             let qualifier = Self::strip_identifier_quotes(bracketed);
@@ -1407,7 +1447,9 @@ impl SqlEditorWidget {
 
         let mut start = segment_end;
         for (pos, ch) in text.get(..segment_end)?.char_indices().rev() {
-            if sql_text::is_identifier_char(ch) {
+            if lexical_kinds.get(pos).copied().flatten().is_none()
+                && sql_text::is_identifier_char(ch)
+            {
                 start = pos;
             } else {
                 break;
@@ -1427,6 +1469,31 @@ impl SqlEditorWidget {
         }
 
         Some((segment.to_string(), start))
+    }
+
+    fn dot_is_inside_bracket_quoted_identifier(
+        text: &str,
+        dot_idx: usize,
+        lexical_kinds: &[Option<crate::sql_parser_engine::LexicalKind>],
+    ) -> bool {
+        let mut in_bracket = false;
+        let mut chars = text.get(..=dot_idx).unwrap_or(text).char_indices().peekable();
+        while let Some((idx, ch)) = chars.next() {
+            if in_bracket {
+                if ch == ']' {
+                    if chars.peek().is_some_and(|(_, next)| *next == ']') {
+                        chars.next();
+                    } else {
+                        in_bracket = false;
+                    }
+                }
+                continue;
+            }
+            if lexical_kinds.get(idx).copied().flatten().is_none() && ch == '[' {
+                in_bracket = true;
+            }
+        }
+        in_bracket
     }
 
     fn find_bracket_segment_start(text: &str, segment_end: usize) -> Option<usize> {
@@ -1459,9 +1526,16 @@ impl SqlEditorWidget {
         None
     }
 
-    fn find_open_paren_for_qualifier_expression(text: &str, segment_end: usize) -> Option<usize> {
+    fn find_open_paren_for_qualifier_expression(
+        text: &str,
+        segment_end: usize,
+        lexical_kinds: &[Option<crate::sql_parser_engine::LexicalKind>],
+    ) -> Option<usize> {
         let mut depth = 0usize;
         for (pos, ch) in text.get(..segment_end)?.char_indices().rev() {
+            if lexical_kinds.get(pos).copied().flatten().is_some() {
+                continue;
+            }
             match ch {
                 ')' => depth = depth.saturating_add(1),
                 '(' => {
@@ -1516,6 +1590,7 @@ impl SqlEditorWidget {
         text_shadow: &Arc<Mutex<HighlightShadowState>>,
         intellisense_popup: &Arc<Mutex<IntellisensePopup>>,
         runtime: &Arc<IntellisenseRuntimeState>,
+        preferred_db_type: Option<crate::db::connection::DatabaseType>,
         cursor_pos: i32,
         key: Key,
         typed_char: Option<char>,
@@ -1555,7 +1630,8 @@ impl SqlEditorWidget {
         // Fast path: keep existing suggestions and just filter by the current in-range prefix.
         // This avoids re-tokenizing/re-analyzing SQL on each extra identifier keystroke.
         let prefix = Self::completion_prefix_from_range_text(&range_text);
-        let qualifier = Self::qualifier_before_word(buffer, text_shadow, start);
+        let qualifier =
+            Self::qualifier_before_word(buffer, text_shadow, start, preferred_db_type);
         if Self::should_hide_fast_path_after_delete(&prefix, qualifier.as_deref(), key) {
             intellisense_popup
                 .lock()

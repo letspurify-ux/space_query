@@ -223,6 +223,10 @@ pub struct CursorContext {
     /// relations/columns/keywords are all irrelevant. Drives completion
     /// suppression, independent of `phase`.
     pub(crate) ddl_new_name_position: bool,
+    /// The top-level Oracle `WITH FUNCTION/PROCEDURE` state immediately before
+    /// the token at the cursor. Completion excludes that partial token, so this
+    /// preserves the already-computed parser state without a second token scan.
+    pub(crate) with_plsql_awaiting_main_query_before_cursor_token: bool,
 }
 
 /// CTE parsing state machine
@@ -486,6 +490,8 @@ pub(crate) fn analyze_cursor_context_arc(
         qualifier: None,
         qualifier_tables: Vec::new(),
         ddl_new_name_position,
+        with_plsql_awaiting_main_query_before_cursor_token: parse_result
+            .with_plsql_awaiting_main_query_before_cursor_token,
     }
 }
 
@@ -1954,6 +1960,7 @@ struct OpenCteDefinition {
 struct CursorScanResult {
     phase: SqlPhase,
     depth: usize,
+    with_plsql_awaiting_main_query_before_cursor_token: bool,
     visible_scope_chain: Vec<usize>,
     visible_cte_scope_chain: Vec<usize>,
     parsed_tables: Vec<ParsedTableEntry>,
@@ -2959,6 +2966,7 @@ fn scan_cursor_context(tokens: &[SqlToken], cursor_token_len: usize) -> CursorSc
         Vec<String>,
         Option<String>,
     )> = None;
+    let mut with_plsql_awaiting_main_query_before_cursor_token = false;
     let mut idx = 0;
 
     let mark_query_scope =
@@ -2976,6 +2984,12 @@ fn scan_cursor_context(tokens: &[SqlToken], cursor_token_len: usize) -> CursorSc
         };
 
     while idx < tokens.len() {
+        if cursor_token_len > 0 && idx == cursor_token_len - 1 {
+            with_plsql_awaiting_main_query_before_cursor_token =
+                depth_frames.get(depth).is_some_and(|frame| {
+                    matches!(frame.with_plsql_state, WithPlsqlState::AwaitingMainQuery)
+                });
+        }
         // Snapshot at the first token index that reaches or passes the cursor.
         // A relation reference can consume its trailing alias in one step (`he a`
         // parsed together), advancing `idx` from before the cursor to past it; an
@@ -5004,6 +5018,7 @@ fn scan_cursor_context(tokens: &[SqlToken], cursor_token_len: usize) -> CursorSc
     CursorScanResult {
         phase,
         depth: cursor_query_depth,
+        with_plsql_awaiting_main_query_before_cursor_token,
         visible_scope_chain: cursor_visible_scope_chain,
         visible_cte_scope_chain: cursor_visible_cte_scope_chain,
         parsed_tables: all_tables,

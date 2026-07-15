@@ -1307,7 +1307,6 @@ pub(crate) fn statement_bounds_in_text_for_db_type_with_mysql_delimiter(
     .unwrap_or((0, sql.len()))
 }
 
-#[cfg(test)]
 pub(crate) fn statement_spans_in_text_for_db_type(
     sql: &str,
     preferred_db_type: Option<crate::db::connection::DatabaseType>,
@@ -1728,6 +1727,19 @@ mod tests {
             Some("SELECT 5--2"),
             "query_text statement extraction must honor MySQL `--<non-space>` arithmetic when DB type is known"
         );
+    }
+
+    #[test]
+    fn oracle_statement_bounds_do_not_treat_single_letter_cte_as_sqlplus_run() {
+        let sql = "WITH\n    r\n    AS\n    (SELECT 1 AS id FROM dual),\n    next_cte AS\n    (SELECT r.id FROM r)\nSELECT next_cte.id FROM next_cte;";
+        let cursor = sql.find("r.id").unwrap_or(0);
+        let (start, end) = statement_bounds_in_text_for_db_type(
+            sql,
+            cursor,
+            Some(crate::db::connection::DatabaseType::Oracle),
+        );
+
+        assert_eq!(sql.get(start..end).unwrap_or(""), sql.trim_end_matches(';'));
     }
 
     #[test]

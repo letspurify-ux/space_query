@@ -1,6 +1,97 @@
 // Free functions (unchanged)
 // ---------------------------------------------------------------------------
 
+/// Coarse lexical classification emitted by the parser engine while it walks
+/// SQL text.  Keeping this next to the engine's `LexMode` transition loop is
+/// intentional: statement splitting, IntelliSense and test sweeps must not
+/// maintain independent ideas of where strings and comments end.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum LexicalKind {
+    String,
+    QuotedIdentifier,
+    LineComment,
+    BlockComment,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct LexicalSpan {
+    pub(crate) start: usize,
+    pub(crate) end: usize,
+    pub(crate) kind: LexicalKind,
+}
+
+impl LexicalSpan {
+    #[inline]
+    pub(crate) fn contains(self, byte_offset: usize) -> bool {
+        self.start <= byte_offset && byte_offset < self.end
+    }
+}
+
+#[inline]
+fn push_lexical_span(
+    spans: &mut Vec<LexicalSpan>,
+    start: usize,
+    end: usize,
+    kind: LexicalKind,
+) {
+    if start >= end {
+        return;
+    }
+    if let Some(last) = spans.last_mut() {
+        if last.end == start && last.kind == kind {
+            last.end = end;
+            return;
+        }
+    }
+    spans.push(LexicalSpan { start, end, kind });
+}
+
+/// Returns parser-engine lexical spans for `text`, starting in normal code.
+pub(crate) fn lexical_spans(text: &str, mysql_mode: bool) -> Vec<LexicalSpan> {
+    lexical_spans_with_initial_mode(text, mysql_mode, LexMode::Idle).0
+}
+
+/// State-aware variant for a bounded window whose first byte may continue a
+/// multiline token opened before the window.  The returned mode is the exact
+/// parser-engine mode at the end of the window.
+pub(crate) fn lexical_spans_with_initial_mode(
+    text: &str,
+    mysql_mode: bool,
+    initial_mode: LexMode,
+) -> (Vec<LexicalSpan>, LexMode) {
+    let mut engine = SqlParserEngine::new();
+    engine.set_mysql_mode(mysql_mode);
+    engine.state.lex_mode = initial_mode;
+
+    let mut char_to_byte = Vec::with_capacity(text.chars().count().saturating_add(1));
+    char_to_byte.extend(text.char_indices().map(|(byte_idx, _)| byte_idx));
+    char_to_byte.push(text.len());
+
+    let mut spans = Vec::new();
+    engine.process_text_with_lexical_observer(text, |_, char_start, char_end, kind| {
+        let Some(&start) = char_to_byte.get(char_start) else {
+            return;
+        };
+        let Some(&end) = char_to_byte.get(char_end) else {
+            return;
+        };
+        push_lexical_span(&mut spans, start, end, kind);
+    });
+    (spans, engine.state.lex_mode.clone())
+}
+
+pub(crate) fn lexical_kind_at(
+    spans: &[LexicalSpan],
+    byte_offset: usize,
+) -> Option<LexicalKind> {
+    let idx = spans.partition_point(|span| span.end <= byte_offset);
+    spans
+        .get(idx)
+        .copied()
+        .filter(|span| span.contains(byte_offset))
+        .map(|span| span.kind)
+}
+
 #[inline]
 fn is_dollar_quote_tag_char(ch: char) -> bool {
     ch.is_ascii_alphanumeric() || ch == '_'
@@ -277,6 +368,10 @@ impl SqlParserEngine {
         self.state.can_terminate_on_slash()
     }
 
+    pub(crate) fn has_pending_standard_cte_header(&self) -> bool {
+        self.state.has_pending_standard_cte_header()
+    }
+
     pub(crate) fn prepare_splitter_line_boundary(&mut self, line: &str) {
         if self.is_idle() && line_starts_with_consumed_slash_terminator(line) {
             self.state.flush_token();
@@ -504,15 +599,17 @@ impl SqlParserEngine {
         self.process_line_with_observers_after_boundary(line, |_, _, _, _| {}, |_, _| {});
     }
 
-    fn process_chars_with_observer<F, G>(
+    fn process_chars_with_observer<F, G, H>(
         &mut self,
         chars: &[char],
         on_symbol: &mut F,
         on_statement_boundary: &mut G,
+        on_lexical_span: &mut H,
     )
     where
         F: FnMut(&[char], usize, char, Option<char>),
         G: FnMut(&[char], usize),
+        H: FnMut(&[char], usize, usize, LexicalKind),
     {
         let len = chars.len();
         let mut i = 0usize;
@@ -533,6 +630,7 @@ impl SqlParserEngine {
             // ---- Dispatch on LexMode (replaces 6 if-chains) ----
             match &self.state.lex_mode {
                 LexMode::LineComment => {
+                    on_lexical_span(chars, i, i + 1, LexicalKind::LineComment);
                     self.append_current_char(c);
                     if c == '\n' {
                         self.state.lex_mode = LexMode::Idle;
@@ -541,6 +639,12 @@ impl SqlParserEngine {
                     continue;
                 }
                 LexMode::BlockComment => {
+                    let lexical_end = if c == '*' && next == Some('/') {
+                        i + 2
+                    } else {
+                        i + 1
+                    };
+                    on_lexical_span(chars, i, lexical_end, LexicalKind::BlockComment);
                     self.append_current_char(c);
                     if c == '*' && next == Some('/') {
                         self.append_current_char('/');
@@ -558,6 +662,12 @@ impl SqlParserEngine {
                         if let Some((prefix_len, nested_end_char)) = detect_q_quote_start(chars, i)
                         {
                             if nested_end_char == end_char {
+                                on_lexical_span(
+                                    chars,
+                                    i,
+                                    i + prefix_len,
+                                    LexicalKind::String,
+                                );
                                 for k in 0..prefix_len {
                                     self.append_current_char(chars[i + k]);
                                 }
@@ -571,6 +681,12 @@ impl SqlParserEngine {
                         }
                     }
 
+                    let lexical_end = if c == end_char && next == Some('\'') {
+                        i + 2
+                    } else {
+                        i + 1
+                    };
+                    on_lexical_span(chars, i, lexical_end, LexicalKind::String);
                     self.append_current_char(c);
                     if c == end_char && next == Some('\'') {
                         self.append_current_char('\'');
@@ -591,18 +707,30 @@ impl SqlParserEngine {
                 LexMode::DollarQuote { tag } => {
                     if c == '$' && chars_starts_with(chars, i, tag) {
                         let tag_len = tag.len();
+                        on_lexical_span(chars, i, i + tag_len, LexicalKind::String);
                         for k in 0..tag_len {
                             self.append_current_char(chars[i + k]);
                         }
                         self.state.lex_mode = LexMode::Idle;
                         i += tag_len;
                     } else {
+                        on_lexical_span(chars, i, i + 1, LexicalKind::String);
                         self.append_current_char(c);
                         i += 1;
                     }
                     continue;
                 }
                 LexMode::SingleQuote => {
+                    let lexical_end = if (self.state.mysql_mode
+                        && c == '\\'
+                        && next.is_some())
+                        || (c == '\'' && next == Some('\''))
+                    {
+                        i + 2
+                    } else {
+                        i + 1
+                    };
+                    on_lexical_span(chars, i, lexical_end, LexicalKind::String);
                     self.append_current_char(c);
                     if self.state.mysql_mode {
                         if let Some(escaped) = next.filter(|_| c == '\\') {
@@ -623,6 +751,16 @@ impl SqlParserEngine {
                     continue;
                 }
                 LexMode::DoubleQuote => {
+                    let lexical_end = if (self.state.mysql_mode
+                        && c == '\\'
+                        && next.is_some())
+                        || (c == '"' && next == Some('"'))
+                    {
+                        i + 2
+                    } else {
+                        i + 1
+                    };
+                    on_lexical_span(chars, i, lexical_end, LexicalKind::QuotedIdentifier);
                     self.append_current_char(c);
                     if self.state.mysql_mode {
                         if let Some(escaped) = next.filter(|_| c == '\\') {
@@ -653,6 +791,12 @@ impl SqlParserEngine {
                     continue;
                 }
                 LexMode::BacktickQuote => {
+                    let lexical_end = if c == '`' && next == Some('`') {
+                        i + 2
+                    } else {
+                        i + 1
+                    };
+                    on_lexical_span(chars, i, lexical_end, LexicalKind::QuotedIdentifier);
                     self.append_current_char(c);
                     if c == '`' {
                         if next == Some('`') {
@@ -684,6 +828,7 @@ impl SqlParserEngine {
             };
 
             if c == '-' && next == Some('-') && dash_comment_start {
+                on_lexical_span(chars, i, i + 2, LexicalKind::LineComment);
                 self.state.flush_token();
                 if self.state.pending_implicit_external_top_level_split
                     && self.state.block_depth() == 1
@@ -701,6 +846,7 @@ impl SqlParserEngine {
 
             // MySQL: # starts a line comment
             if c == '#' && self.state.mysql_mode {
+                on_lexical_span(chars, i, i + 1, LexicalKind::LineComment);
                 self.state.flush_token();
                 self.state.lex_mode = LexMode::LineComment;
                 self.append_current_char('#');
@@ -709,6 +855,7 @@ impl SqlParserEngine {
             }
 
             if c == '/' && next == Some('*') {
+                on_lexical_span(chars, i, i + 2, LexicalKind::BlockComment);
                 self.state.flush_token();
                 if self.state.pending_implicit_external_top_level_split
                     && self.state.block_depth() == 1
@@ -736,6 +883,12 @@ impl SqlParserEngine {
                         self.state
                             .observe_external_clause_literal_target(allow_implicit_target);
                         self.state.start_q_quote(delimiter);
+                        on_lexical_span(
+                            chars,
+                            i,
+                            i + q_prefix_len,
+                            LexicalKind::String,
+                        );
                         for k in 0..q_prefix_len {
                             self.append_current_char(chars[i + k]);
                         }
@@ -765,6 +918,7 @@ impl SqlParserEngine {
                     self.state
                         .observe_external_clause_literal_target(allow_implicit_target);
                     self.state.lex_mode = LexMode::SingleQuote;
+                    on_lexical_span(chars, i, i + prefix_len, LexicalKind::String);
                     for k in 0..prefix_len {
                         self.append_current_char(chars[i + k]);
                     }
@@ -789,6 +943,7 @@ impl SqlParserEngine {
                     for k in 0..tag_len {
                         self.append_current_char(chars[i + k]);
                     }
+                    on_lexical_span(chars, i, i + tag_len, LexicalKind::String);
                     self.state.lex_mode = LexMode::DollarQuote { tag };
                     i += tag_len;
                     continue;
@@ -796,6 +951,7 @@ impl SqlParserEngine {
             }
 
             if c == '\'' {
+                on_lexical_span(chars, i, i + 1, LexicalKind::String);
                 self.state.flush_token();
                 let allow_implicit_target = self.state.allow_implicit_external_literal_target();
                 self.state
@@ -807,6 +963,7 @@ impl SqlParserEngine {
             }
 
             if c == '"' {
+                on_lexical_span(chars, i, i + 1, LexicalKind::QuotedIdentifier);
                 self.state.flush_token();
                 self.state
                     .consume_trigger_alias_subject_on_quoted_identifier();
@@ -818,6 +975,7 @@ impl SqlParserEngine {
             }
 
             if c == '`' {
+                on_lexical_span(chars, i, i + 1, LexicalKind::QuotedIdentifier);
                 self.state.flush_token();
                 self.state.lex_mode = LexMode::BacktickQuote;
                 self.append_current_char(c);
@@ -988,6 +1146,7 @@ impl SqlParserEngine {
     {
         let mut on_symbol = on_symbol;
         let mut on_statement_boundary = on_statement_boundary;
+        let mut on_lexical_span = |_: &[char], _: usize, _: usize, _: LexicalKind| {};
         let mut scratch_chars = std::mem::take(&mut self.scratch_chars);
         scratch_chars.clear();
         scratch_chars.extend(line.chars());
@@ -997,6 +1156,7 @@ impl SqlParserEngine {
             &scratch_chars,
             &mut on_symbol,
             &mut on_statement_boundary,
+            &mut on_lexical_span,
         );
         self.state.clear_skip_next_end_label_token();
         self.scratch_chars = scratch_chars;
@@ -1018,6 +1178,7 @@ impl SqlParserEngine {
             && self.state.paren_depth() == 0;
         let mut on_symbol = on_symbol;
         let mut on_statement_boundary = on_statement_boundary;
+        let mut on_lexical_span = |_: &[char], _: usize, _: usize, _: LexicalKind| {};
         let mut scratch_chars = std::mem::take(&mut self.scratch_chars);
         scratch_chars.clear();
         scratch_chars.extend(line.chars());
@@ -1067,6 +1228,7 @@ impl SqlParserEngine {
             &scratch_chars,
             &mut on_symbol,
             &mut on_statement_boundary,
+            &mut on_lexical_span,
         );
         self.state.clear_skip_next_end_label_token();
 
@@ -1079,6 +1241,24 @@ impl SqlParserEngine {
             self.finish_current_statement();
         }
 
+        self.scratch_chars = scratch_chars;
+    }
+
+    fn process_text_with_lexical_observer<F>(&mut self, text: &str, mut on_lexical_span: F)
+    where
+        F: FnMut(&[char], usize, usize, LexicalKind),
+    {
+        let mut scratch_chars = std::mem::take(&mut self.scratch_chars);
+        scratch_chars.clear();
+        scratch_chars.extend(text.chars());
+        let mut on_symbol = |_: &[char], _: usize, _: char, _: Option<char>| {};
+        let mut on_statement_boundary = |_: &[char], _: usize| {};
+        self.process_chars_with_observer(
+            &scratch_chars,
+            &mut on_symbol,
+            &mut on_statement_boundary,
+            &mut on_lexical_span,
+        );
         self.scratch_chars = scratch_chars;
     }
 

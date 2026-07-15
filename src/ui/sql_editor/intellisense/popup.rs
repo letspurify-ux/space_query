@@ -315,8 +315,22 @@ impl SqlEditorWidget {
             _ => (window_start, raw),
         };
 
-        let Some(mut call) =
-            crate::ui::intellisense::enclosing_call_at_cursor(&scan_text, scan_text.len())
+        let mysql_compatible = self
+            .intellisense_runtime
+            .db_type_without_blocking(&self.connection)
+            .is_mysql_or_mariadb();
+        let initial_lex_mode = self
+            .highlight_shadow
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .parser_lex_mode_at(scan_offset, mysql_compatible);
+
+        let Some(mut call) = crate::ui::intellisense::enclosing_call_at_cursor_with_lexical_mode(
+            &scan_text,
+            scan_text.len(),
+            mysql_compatible,
+            initial_lex_mode,
+        )
         else {
             self.hide_signature_popup();
             return;
@@ -568,10 +582,16 @@ impl SqlEditorWidget {
         else {
             return;
         };
-        let qualifier =
-            Self::qualifier_before_word(&self.buffer, &self.highlight_shadow, start as usize);
-        let raw_qualifier =
-            Self::raw_qualifier_before_word(&self.buffer, &self.highlight_shadow, start as usize);
+        let preferred_db_type = Some(
+            self.intellisense_runtime
+                .db_type_without_blocking(&self.connection),
+        );
+        let (qualifier, raw_qualifier) = Self::qualifiers_before_word(
+            &self.buffer,
+            &self.highlight_shadow,
+            start as usize,
+            preferred_db_type,
+        );
         let object_name = if let Some(ref qualifier) = raw_qualifier {
             format!("{}.{}", qualifier, raw_word)
         } else {

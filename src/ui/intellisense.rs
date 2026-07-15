@@ -152,6 +152,7 @@ pub const ORACLE_FUNCTIONS: &[&str] = &[
     "REFTOHEX",
     "REGEXP_COUNT",
     "REGEXP_INSTR",
+    "REGEXP_LIKE",
     "REGEXP_REPLACE",
     "REGEXP_SUBSTR",
     "REGR_AVGX",
@@ -4072,6 +4073,21 @@ fn normalize_cursor_pos(text: &str, cursor_pos: usize) -> usize {
 }
 
 pub fn get_word_at_cursor(text: &str, cursor_pos: usize) -> (String, usize, usize) {
+    let mysql_compatible = sql_text::mysql_compatibility_for_sql(text, None);
+    get_word_at_cursor_with_lexical_mode(
+        text,
+        cursor_pos,
+        mysql_compatible,
+        crate::sql_parser_engine::LexMode::Idle,
+    )
+}
+
+pub(crate) fn get_word_at_cursor_with_lexical_mode(
+    text: &str,
+    cursor_pos: usize,
+    mysql_compatible: bool,
+    initial_mode: crate::sql_parser_engine::LexMode,
+) -> (String, usize, usize) {
     if text.is_empty() || cursor_pos == 0 {
         return (String::new(), 0, 0);
     }
@@ -4098,8 +4114,14 @@ pub fn get_word_at_cursor(text: &str, cursor_pos: usize) -> (String, usize, usiz
         pos
     };
 
+    let lexical_spans = crate::sql_parser_engine::lexical_spans_with_initial_mode(
+        text,
+        mysql_compatible,
+        initial_mode,
+    )
+    .0;
     if let Some((start, delimiter)) =
-        incomplete_quoted_identifier_start_before_cursor(text, effective_pos)
+        incomplete_quoted_identifier_start_before_cursor(text, effective_pos, &lexical_spans)
     {
         let end = quoted_identifier_end_from_cursor(text, effective_pos, delimiter)
             .unwrap_or(effective_pos);
@@ -4107,6 +4129,13 @@ pub fn get_word_at_cursor(text: &str, cursor_pos: usize) -> (String, usize, usiz
         return (word, start, end);
     }
 
+    get_unquoted_word_at_cursor(text, effective_pos)
+}
+
+pub(crate) fn get_unquoted_word_at_cursor(
+    text: &str,
+    effective_pos: usize,
+) -> (String, usize, usize) {
     // Find word start by scanning backwards over identifier characters.
     let mut start = effective_pos;
     while start > 0 {
@@ -4140,149 +4169,39 @@ pub fn get_word_at_cursor(text: &str, cursor_pos: usize) -> (String, usize, usiz
 fn incomplete_quoted_identifier_start_before_cursor(
     text: &str,
     cursor_pos: usize,
+    lexical_spans: &[crate::sql_parser_engine::LexicalSpan],
 ) -> Option<(usize, char)> {
     let mut idx = cursor_pos;
     while idx > 0 {
         let (prev_idx, ch) = text.get(..idx)?.char_indices().next_back()?;
-        if matches!(ch, '"' | '`' | '[')
-            && quoted_identifier_start_context(text, prev_idx)
-            && !inside_single_quoted_literal(text, prev_idx)
-            && !inside_sql_comment(text, prev_idx)
-            && !has_unescaped_identifier_delimiter(
-                text,
-                prev_idx + ch.len_utf8(),
-                cursor_pos,
-                identifier_closing_delimiter(ch),
-            )
-        {
-            return Some((prev_idx, ch));
+        if matches!(ch, '\n' | '\r') {
+            break;
+        }
+        if matches!(ch, '"' | '`' | '[') && quoted_identifier_start_context(text, prev_idx) {
+            let lexical_idx = lexical_spans.partition_point(|span| span.end <= prev_idx);
+            let lexical_span = lexical_spans
+                .get(lexical_idx)
+                .filter(|span| span.contains(prev_idx));
+            let is_parser_quoted_identifier_start = lexical_span.is_some_and(|span| {
+                span.kind == crate::sql_parser_engine::LexicalKind::QuotedIdentifier
+                    && span.start == prev_idx
+            });
+            let bracket_starts_in_code = ch == '[' && lexical_span.is_none();
+            if (is_parser_quoted_identifier_start || bracket_starts_in_code)
+                && !has_unescaped_identifier_delimiter(
+                    text,
+                    prev_idx + ch.len_utf8(),
+                    cursor_pos,
+                    identifier_closing_delimiter(ch),
+                )
+            {
+                return Some((prev_idx, ch));
+            }
         }
         idx = prev_idx;
     }
 
     None
-}
-
-fn inside_single_quoted_literal(text: &str, pos: usize) -> bool {
-    let mut idx = 0usize;
-    let mut in_string = false;
-    let limit = pos.min(text.len());
-    while idx < limit {
-        let Some(ch) = text[idx..].chars().next() else {
-            break;
-        };
-        if !in_string {
-            if let Some(end) = oracle_q_quote_end(text, idx) {
-                if limit < end {
-                    return true;
-                }
-                idx = end;
-                continue;
-            }
-        }
-        if ch == '\'' {
-            let next_idx = idx + ch.len_utf8();
-            if in_string && text[next_idx..].starts_with('\'') {
-                idx = next_idx + 1;
-                continue;
-            }
-            in_string = !in_string;
-        }
-        idx += ch.len_utf8();
-    }
-    in_string
-}
-
-fn oracle_q_quote_end(text: &str, start_idx: usize) -> Option<usize> {
-    let mut iter = text.get(start_idx..)?.char_indices();
-    let (_, q) = iter.next()?;
-    if !matches!(q, 'q' | 'Q') {
-        return None;
-    }
-    let (_, quote) = iter.next()?;
-    if quote != '\'' {
-        return None;
-    }
-    let (open_rel, open) = iter.next()?;
-    let close = match open {
-        '[' => ']',
-        '(' => ')',
-        '{' => '}',
-        '<' => '>',
-        other => other,
-    };
-    let body_start = start_idx + open_rel + open.len_utf8();
-    for (rel, ch) in text.get(body_start..)?.char_indices() {
-        if ch != close {
-            continue;
-        }
-        let close_idx = body_start + rel;
-        let after_close = close_idx + ch.len_utf8();
-        if text.get(after_close..)?.starts_with('\'') {
-            return Some(after_close + 1);
-        }
-    }
-    Some(text.len())
-}
-
-fn inside_sql_comment(text: &str, pos: usize) -> bool {
-    let mut iter = text.char_indices().peekable();
-    let mut in_single = false;
-    let mut in_line_comment = false;
-    let mut in_block_comment = false;
-
-    while let Some((idx, ch)) = iter.next() {
-        if idx >= pos {
-            break;
-        }
-
-        if in_line_comment {
-            if ch == '\n' || ch == '\r' {
-                in_line_comment = false;
-            }
-            continue;
-        }
-        if in_block_comment {
-            if ch == '*' && iter.peek().is_some_and(|(_, next)| *next == '/') {
-                iter.next();
-                in_block_comment = false;
-            }
-            continue;
-        }
-        if in_single {
-            if ch == '\'' {
-                if iter.peek().is_some_and(|(_, next)| *next == '\'') {
-                    iter.next();
-                } else {
-                    in_single = false;
-                }
-            }
-            continue;
-        }
-
-        if !in_single {
-            if let Some(end) = oracle_q_quote_end(text, idx) {
-                while iter.peek().is_some_and(|(next_idx, _)| *next_idx < end) {
-                    iter.next();
-                }
-                continue;
-            }
-        }
-
-        if ch == '\'' {
-            in_single = true;
-        } else if ch == '-' && iter.peek().is_some_and(|(_, next)| *next == '-') {
-            iter.next();
-            in_line_comment = true;
-        } else if ch == '#' {
-            in_line_comment = true;
-        } else if ch == '/' && iter.peek().is_some_and(|(_, next)| *next == '*') {
-            iter.next();
-            in_block_comment = true;
-        }
-    }
-
-    in_line_comment || in_block_comment
 }
 
 fn quoted_identifier_start_context(text: &str, quote_idx: usize) -> bool {
@@ -4388,6 +4307,22 @@ pub fn signature_key_for_call(call: &EnclosingCall) -> String {
 /// cursor is not inside a `name(...)` call (e.g. a bare grouping parenthesis).
 pub fn enclosing_call_at_cursor(text: &str, cursor_pos: usize) -> Option<EnclosingCall> {
     let end = normalize_cursor_pos(text, cursor_pos.min(text.len()));
+    let mysql_compatible = sql_text::mysql_compatibility_for_sql(&text[..end], None);
+    enclosing_call_at_cursor_with_lexical_mode(
+        text,
+        cursor_pos,
+        mysql_compatible,
+        crate::sql_parser_engine::LexMode::Idle,
+    )
+}
+
+pub(crate) fn enclosing_call_at_cursor_with_lexical_mode(
+    text: &str,
+    cursor_pos: usize,
+    mysql_compatible: bool,
+    initial_mode: crate::sql_parser_engine::LexMode,
+) -> Option<EnclosingCall> {
+    let end = normalize_cursor_pos(text, cursor_pos.min(text.len()));
     let slice = &text[..end];
 
     struct Frame {
@@ -4395,60 +4330,46 @@ pub fn enclosing_call_at_cursor(text: &str, cursor_pos: usize) -> Option<Enclosi
         commas: usize,
     }
     let mut stack: Vec<Frame> = Vec::new();
-    let mut iter = slice.char_indices().peekable();
+    let lexical_spans = crate::sql_parser_engine::lexical_spans_with_initial_mode(
+        slice,
+        mysql_compatible,
+        initial_mode,
+    )
+    .0;
+    let bytes = slice.as_bytes();
+    let mut idx = 0usize;
+    let mut lexical_idx = 0usize;
 
-    while let Some((idx, ch)) = iter.next() {
-        match ch {
-            '\'' => {
-                // String literal; '' is an escaped quote, not a terminator.
-                while let Some((_, c)) = iter.next() {
-                    if c == '\'' {
-                        if matches!(iter.peek(), Some((_, '\''))) {
-                            iter.next();
-                            continue;
-                        }
-                        break;
-                    }
-                }
+    while idx < bytes.len() {
+        while lexical_spans
+            .get(lexical_idx)
+            .is_some_and(|span| span.end <= idx)
+        {
+            lexical_idx += 1;
+        }
+        if let Some(span) = lexical_spans.get(lexical_idx) {
+            if span.start <= idx && idx < span.end {
+                idx = span.end;
+                continue;
             }
-            '"' => {
-                for (_, c) in iter.by_ref() {
-                    if c == '"' {
-                        break;
-                    }
-                }
-            }
-            '-' if matches!(iter.peek(), Some((_, '-'))) => {
-                for (_, c) in iter.by_ref() {
-                    if c == '\n' {
-                        break;
-                    }
-                }
-            }
-            '/' if matches!(iter.peek(), Some((_, '*'))) => {
-                iter.next();
-                let mut prev_star = false;
-                for (_, c) in iter.by_ref() {
-                    if prev_star && c == '/' {
-                        break;
-                    }
-                    prev_star = c == '*';
-                }
-            }
-            '(' => stack.push(Frame {
+        }
+
+        match bytes[idx] {
+            b'(' => stack.push(Frame {
                 open: idx,
                 commas: 0,
             }),
-            ')' => {
+            b')' => {
                 stack.pop();
             }
-            ',' => {
+            b',' => {
                 if let Some(frame) = stack.last_mut() {
                     frame.commas += 1;
                 }
             }
             _ => {}
         }
+        idx += 1;
     }
 
     let frame = stack.pop()?;
@@ -4935,6 +4856,54 @@ mod intellisense_tests {
         let call = call_at("SELECT DECODE(x, 'a,b,c', |) FROM t").expect("inside call");
         assert_eq!(call.name, "DECODE");
         assert_eq!(call.arg_index, 2);
+    }
+
+    #[test]
+    fn enclosing_call_ignores_oracle_q_quoted_delimiters_before_call() {
+        let call = call_at("BEGIN v := q'[payload with (,)]'; qt_splitter_pkg.upsert_row(p_i|")
+            .expect("inside call after q-quoted literal");
+        assert_eq!(call.name, "upsert_row");
+        assert_eq!(call.qualifier.as_deref(), Some("qt_splitter_pkg"));
+        assert_eq!(call.arg_index, 0);
+    }
+
+    #[test]
+    fn enclosing_call_uses_parser_engine_for_nested_prefixed_q_quotes() {
+        let call =
+            call_at("BEGIN v := nq'[outer q'[nested]' fake ), ( tail]'; qt_pkg.write_row(a, |")
+                .expect("inside call after nested prefixed q-quote");
+        assert_eq!(call.name, "write_row");
+        assert_eq!(call.qualifier.as_deref(), Some("qt_pkg"));
+        assert_eq!(call.arg_index, 1);
+    }
+
+    #[test]
+    fn enclosing_call_uses_parser_engine_for_escaped_quoted_identifiers() {
+        let call =
+            call_at(r#"SELECT "payload""), (" AS value_text, qt_pkg.write_row(a, | FROM dual"#)
+                .expect("inside call after escaped quoted identifier");
+        assert_eq!(call.name, "write_row");
+        assert_eq!(call.qualifier.as_deref(), Some("qt_pkg"));
+        assert_eq!(call.arg_index, 1);
+    }
+
+    #[test]
+    fn enclosing_call_accepts_bounded_window_entry_lex_mode() {
+        let text = "q'[nested]' fake ), ( tail]'; qt_pkg.write_row(a, ";
+        let call = enclosing_call_at_cursor_with_lexical_mode(
+            text,
+            text.len(),
+            false,
+            crate::sql_parser_engine::LexMode::QQuote {
+                end_char: ']',
+                depth: 1,
+            },
+        )
+        .expect("inside call after q-quote continuation");
+
+        assert_eq!(call.name, "write_row");
+        assert_eq!(call.qualifier.as_deref(), Some("qt_pkg"));
+        assert_eq!(call.arg_index, 1);
     }
 
     #[test]
@@ -5519,6 +5488,48 @@ BEGIN
 
         assert_eq!(word, "p_");
         assert_eq!(sql.get(start..cursor), Some("p_"));
+    }
+
+    #[test]
+    fn get_word_at_cursor_uses_parser_engine_for_prefixed_nested_q_literals() {
+        let sql =
+            r#"SELECT nq'[outer q'[nested]' fake " ), ( tail]' AS txt, rec."Street N FROM dual"#;
+        let cursor = sql.find(" FROM").expect("expected cursor anchor");
+        let (word, start, end) = get_word_at_cursor(sql, cursor);
+
+        assert_eq!(word, r#""Street N"#);
+        assert_eq!(sql.get(start..cursor), Some(r#""Street N"#));
+        assert_eq!(end, cursor);
+    }
+
+    #[test]
+    fn get_word_at_cursor_accepts_bounded_window_entry_lex_mode() {
+        let text = r#"payload " ), ( ]'; rec."Street N FROM dual"#;
+        let cursor = text.find(" FROM").expect("expected cursor anchor");
+        let (word, start, end) = get_word_at_cursor_with_lexical_mode(
+            text,
+            cursor,
+            false,
+            crate::sql_parser_engine::LexMode::QQuote {
+                end_char: ']',
+                depth: 1,
+            },
+        );
+
+        assert_eq!(word, r#""Street N"#);
+        assert_eq!(text.get(start..cursor), Some(r#""Street N"#));
+        assert_eq!(end, cursor);
+    }
+
+    #[test]
+    fn get_word_at_cursor_does_not_extend_quoted_identifier_across_a_previous_line() {
+        // Mirrors a bounded editor window that begins in the middle of a
+        // multiline q-quoted literal: the earlier `"` has no bearing on the
+        // plain identifier being typed on the current line.
+        let text = "q-quote fragment with a double quote \"\n]';\nPROCEDURE p(x BOOL";
+        let (word, start, end) = get_word_at_cursor(text, text.len());
+        assert_eq!(word, "BOOL");
+        assert_eq!(text.get(start..end), Some("BOOL"));
     }
 
     #[test]

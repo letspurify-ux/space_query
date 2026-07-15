@@ -570,7 +570,7 @@ ORDER BY audit_id;
 -- source: test/test9.txt
 -- db: Oracle
 -- metadata: test Oracle inferred catalog (file-scoped overlay) + Oracle built-ins
--- checked: 905
+-- checked: 993
 -- missing: 0
 -- marker: [[word]] means not suggested for the tested prefix
 -- missing tokens: none

@@ -989,7 +989,8 @@ fn test_split_format_items_test15_nested_q_quote_package_body_regression() {
         .filter(|item| matches!(item, FormatItem::Slash))
         .count();
 
-    assert_eq!(slash_count, 6, "unexpected slash split: {items:?}");
+    // UNIT 02, 05, 06, 07, 08, 14 and 15 are independently slash-terminated.
+    assert_eq!(slash_count, 7, "unexpected slash split: {items:?}");
 
     let statements: Vec<&str> = items
         .iter()

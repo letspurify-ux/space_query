@@ -124,8 +124,36 @@ impl SqlEditorWidget {
             .unwrap_or("");
         let first_open = prefix.find("/*");
         let first_close = prefix.find("*/");
-        matches!((first_open, first_close), (None, Some(_)))
-            || matches!((first_open, first_close), (Some(open), Some(close)) if close < open)
+        let raw_close_precedes_open = matches!((first_open, first_close), (None, Some(_)))
+            || matches!((first_open, first_close), (Some(open), Some(close)) if close < open);
+        if !raw_close_precedes_open {
+            return false;
+        }
+
+        // A string, quoted identifier, or line comment can legitimately
+        // contain `*/` before a later `/*` (for example `'^\s*/\s*$'`). Use
+        // the parser engine's lexical spans for this ambiguous ordering.
+        let lexical_spans = crate::sql_parser_engine::lexical_spans(prefix, false);
+        let bytes = prefix.as_bytes();
+        let mut idx = 0usize;
+        while idx + 1 < bytes.len() {
+            if let Some(kind) = crate::sql_parser_engine::lexical_kind_at(&lexical_spans, idx) {
+                let span_idx = lexical_spans.partition_point(|span| span.end <= idx);
+                if let Some(span) = lexical_spans.get(span_idx) {
+                    if kind == crate::sql_parser_engine::LexicalKind::BlockComment {
+                        return false;
+                    }
+                    idx = span.end;
+                    continue;
+                }
+            }
+            match (bytes[idx], bytes[idx + 1]) {
+                (b'*', b'/') => return true,
+                (b'/', b'*') => return false,
+                _ => idx += 1,
+            }
+        }
+        false
     }
 
     fn bounded_intellisense_parse_text_from_chunked(
@@ -305,12 +333,52 @@ impl SqlEditorWidget {
         let mut region_end = text.len();
         let mut root_start = None;
         let mut offset = 0usize;
+        // Only roots before the cursor can enclose it. Trim a whitespace-only
+        // clipped prefix before asking the shared parser for spans; this keeps
+        // sparse/million-line buffers on the bounded fast path without changing
+        // any lexical or statement-boundary rules.
+        let root_scan_end = cursor.min(text.len());
+        let root_scan_start = text
+            .get(..root_scan_end)
+            .and_then(|prefix| {
+                prefix
+                    .char_indices()
+                    .find_map(|(idx, ch)| (!ch.is_whitespace()).then_some(idx))
+            })
+            .unwrap_or(root_scan_end);
+        let statement_starts = super::query_text::statement_spans_in_text_for_db_type(
+            text.get(root_scan_start..root_scan_end).unwrap_or(""),
+            Some(crate::db::connection::DatabaseType::Oracle),
+        )
+        .into_iter()
+        .map(|(start, _)| root_scan_start.saturating_add(start))
+        .collect::<HashSet<_>>();
+        let literal_or_comment_ranges = super::query_text::tokenize_sql_spanned(text)
+            .into_iter()
+            .filter_map(|span| {
+                matches!(span.token, SqlToken::String(_) | SqlToken::Comment(_))
+                    .then_some((span.start, span.end))
+            })
+            .collect::<Vec<_>>();
+        let offset_is_literal_or_comment = |candidate_offset: usize| {
+            let idx = literal_or_comment_ranges
+                .partition_point(|(_, end)| *end <= candidate_offset);
+            literal_or_comment_ranges
+                .get(idx)
+                .is_some_and(|(start, end)| {
+                    *start <= candidate_offset && candidate_offset < *end
+                })
+        };
 
         for line_with_newline in text.split_inclusive('\n') {
             let line_end = offset.saturating_add(line_with_newline.len()).min(text.len());
             let line = line_with_newline.strip_suffix('\n').unwrap_or(line_with_newline);
             let trimmed = line.trim();
-            if trimmed == "/" {
+            let leading = line.len().saturating_sub(line.trim_start().len());
+            let candidate_start = offset.saturating_add(leading);
+            let line_starts_in_literal_or_comment =
+                offset_is_literal_or_comment(candidate_start);
+            if trimmed == "/" && !line_starts_in_literal_or_comment {
                 if line_end <= cursor {
                     region_start = line_end;
                     root_start = None;
@@ -323,10 +391,13 @@ impl SqlEditorWidget {
             }
 
             if offset >= region_start && offset < cursor && root_start.is_none() {
-                let leading = line.len().saturating_sub(line.trim_start().len());
                 let candidate = line.get(leading..).unwrap_or("");
-                if is_plsql_root(candidate) {
-                    root_start = Some(offset.saturating_add(leading));
+                if !line_starts_in_literal_or_comment && is_plsql_root(candidate) {
+                    let candidate_statement_start =
+                        Self::statement_start_with_leading_plsql_label(text, candidate_start);
+                    if statement_starts.contains(&candidate_statement_start) {
+                        root_start = Some(candidate_start);
+                    }
                 }
             }
             offset = line_end;
@@ -886,6 +957,54 @@ impl SqlEditorWidget {
         }
 
         suggestions
+    }
+
+    fn collect_bounded_oracle_routine_symbol_suggestions(
+        prefix: &str,
+        scan_text: &str,
+        db_type: Option<crate::db::DatabaseType>,
+    ) -> Vec<String> {
+        if prefix.is_empty()
+            || crate::sql_text::mysql_compatibility_for_sql("", db_type)
+            || !scan_text
+                .split(|ch: char| !crate::sql_text::is_identifier_char(ch))
+                .any(|word| {
+                    word.eq_ignore_ascii_case("FUNCTION")
+                        || word.eq_ignore_ascii_case("PROCEDURE")
+                })
+        {
+            return Vec::new();
+        }
+
+        // The main statement splitter can intentionally start after a slash
+        // delimiter. If a slash-looking sequence occurred inside a literal,
+        // recover only from the already-bounded 4 KiB signature window; this
+        // keeps the fallback independent of full document size.
+        let expanded = ExpandedStatementWindow {
+            dependency_start: 0,
+            statement_start: 0,
+            statement_end: scan_text.len(),
+            text: scan_text.to_string(),
+            cursor_in_statement: scan_text.len(),
+        };
+        let cache = Self::build_routine_symbol_cache_entry(
+            0,
+            &expanded,
+            Vec::new(),
+            &[],
+            db_type,
+        );
+        let analysis = Self::build_intellisense_analysis_from_routine_cache(
+            &cache,
+            scan_text.len(),
+        );
+        Self::collect_local_symbol_suggestions_for_db(
+            prefix,
+            scan_text.len(),
+            &analysis,
+            &[],
+            db_type,
+        )
     }
 
     fn collect_local_record_member_suggestions(
@@ -1493,12 +1612,24 @@ impl SqlEditorWidget {
             return None;
         }
 
+        let lexical_kinds = Self::qualifier_lexical_kinds(
+            raw_segment,
+            false,
+            crate::sql_parser_engine::LexMode::Idle,
+        );
         let mut segment_end = raw_segment.len();
         if raw_segment.get(..segment_end)?.trim_end().ends_with(')') {
-            segment_end = Self::find_open_paren_for_qualifier_expression(raw_segment, segment_end)?;
+            segment_end = Self::find_open_paren_for_qualifier_expression(
+                raw_segment,
+                segment_end,
+                &lexical_kinds,
+            )?;
         }
-        let (segment, segment_start) =
-            Self::parse_qualifier_segment_before_dot(raw_segment, segment_end)?;
+        let (segment, segment_start) = Self::parse_qualifier_segment_before_dot(
+            raw_segment,
+            segment_end,
+            &lexical_kinds,
+        )?;
         if segment_start != 0 {
             return None;
         }

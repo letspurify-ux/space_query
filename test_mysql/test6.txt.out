@@ -303,7 +303,7 @@ JSON_OBJECT('trap',@lexical_trap,'seoul',(SELECT ST_AsGeoJSON(location,6)FROM gx
 -- source: test_mysql/test6.txt
 -- db: MySQL
 -- metadata: test_mysql/test6.txt inferred catalog
--- checked: 753
+-- checked: 813
 -- missing: 0
 -- marker: [[word]] means not suggested for the tested prefix
 -- missing tokens: none

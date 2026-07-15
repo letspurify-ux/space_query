@@ -554,7 +554,7 @@ FROM qt_kw_mix_v;
 -- source: test/test13.sql
 -- db: Oracle
 -- metadata: test Oracle inferred catalog (file-scoped overlay) + Oracle built-ins
--- checked: 752
+-- checked: 815
 -- missing: 0
 -- marker: [[word]] means not suggested for the tested prefix
 -- missing tokens: none

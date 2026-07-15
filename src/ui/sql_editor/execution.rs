@@ -31169,16 +31169,16 @@ END"
 
         assert!(
             formatted.contains(
-                "SET abcd = edfg
-            -- comment
-            , ghij = klmo"
+                ")
+            -- comment between assignments
+            , ghij = ("
             ),
             "SET-list inline comment and comma should follow SET depth indentation, got:
 {}",
             formatted
         );
         assert!(
-            formatted.contains("FROM qwer;"),
+            formatted.contains("FROM qt_depth_source source_row"),
             "formatted package body should keep the complete UPDATE statement, got:
 {}",
             formatted
