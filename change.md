@@ -2700,6 +2700,7 @@ token slice만 사용한다. 100만 줄 초과 회귀 5종이 0.28초에 통과�
 | 100만 줄 초과 production 성능 회귀 | 5 통과, 실패 0, 0.28초 |
 | 정확한 전체 포맷 스윕 | 1 통과, 실패 0, 61개·33,220줄 |
 | 최종 전체 IntelliSense 스윕 | 1 통과, 61개·49,742 checked·missing 0 |
+| 8개 final-boss `intellisense_sweep_generate_report_for_file` 통합 인증 | 1 통과, 실패 0, 52.99초 |
 | 정확한 `cargo test` | lib 6,513 통과·228 ignored, 모든 binary/integration/guard/doc-test 실패 0 |
 | `cargo clippy --locked --all-targets -- -D warnings -W clippy::perf -W clippy::complexity` | 통과, 오류·경고 0 |
 | `cargo fmt --all -- --check` | 통과 |
