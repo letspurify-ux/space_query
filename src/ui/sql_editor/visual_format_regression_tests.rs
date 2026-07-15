@@ -208,8 +208,12 @@ END;"#;
     let lines: Vec<&str> = formatted.lines().collect();
     let if_idx = lines
         .iter()
-        .position(|line| line.trim_start().starts_with("IF l_mode = 'STRICT'"))
+        .position(|line| line.trim() == "IF")
         .unwrap_or_else(|| panic!("IF header:\n{formatted}"));
+    let first_condition_idx = lines
+        .iter()
+        .position(|line| line.trim_start().starts_with("l_mode = 'STRICT'"))
+        .unwrap_or_else(|| panic!("IF first condition:\n{formatted}"));
     let and_idx = lines
         .iter()
         .position(|line| line.trim_start().starts_with("AND l_count > 0 THEN"))
@@ -230,8 +234,13 @@ END;"#;
         .unwrap_or_else(|| panic!("nested IF body statement:\n{formatted}"));
 
     assert_eq!(
-        indent(lines[and_idx]),
+        indent(lines[first_condition_idx]),
         indent(lines[if_idx]) + 4,
+        "{formatted}"
+    );
+    assert_eq!(
+        indent(lines[and_idx]),
+        indent(lines[first_condition_idx]),
         "{formatted}"
     );
     assert_eq!(
@@ -728,15 +737,25 @@ SELECT id, dept_id, salary FROM visual_emp;"#,
     );
     let when_lines: Vec<&str> = formatted
         .lines()
-        .filter(|line| line.trim_start().starts_with("WHEN dept_id"))
+        .filter(|line| line.trim() == "WHEN")
+        .collect();
+    let condition_lines: Vec<&str> = formatted
+        .lines()
+        .filter(|line| line.trim_start().starts_with("dept_id = 10"))
         .collect();
     let into_lines: Vec<&str> = formatted
         .lines()
         .filter(|line| line.trim_start().starts_with("INTO visual_"))
         .collect();
     assert_eq!(when_lines.len(), 2, "{formatted}");
+    assert_eq!(condition_lines.len(), 2, "{formatted}");
     assert_eq!(into_lines.len(), 2, "{formatted}");
     assert_eq!(indent(when_lines[0]), indent(when_lines[1]), "{formatted}");
+    assert_eq!(
+        indent(condition_lines[0]),
+        indent(when_lines[0]) + 4,
+        "{formatted}"
+    );
     assert_eq!(indent(into_lines[0]), indent(into_lines[1]), "{formatted}");
     assert_eq!(
         indent(into_lines[0]),
@@ -937,11 +956,16 @@ FROM visual_emp;"#,
     );
 
     let insert_all = line_starting_with(&formatted, "INSERT ALL");
-    let when = line_starting_with(&formatted, "WHEN dept_id");
+    let when = formatted
+        .lines()
+        .find(|line| line.trim() == "WHEN")
+        .expect("conditional INSERT WHEN header");
+    let first_condition = line_starting_with(&formatted, "dept_id = 30");
     let and = line_starting_with(&formatted, "AND salary");
     let select = line_starting_with(&formatted, "SELECT id");
     let from = line_starting_with(&formatted, "FROM visual_emp");
-    assert_eq!(indent(and), indent(when) + 4, "{formatted}");
+    assert_eq!(indent(first_condition), indent(when) + 4, "{formatted}");
+    assert_eq!(indent(and), indent(first_condition), "{formatted}");
     assert_eq!(indent(select), indent(insert_all), "{formatted}");
     assert_eq!(indent(from), indent(insert_all), "{formatted}");
 }
@@ -1115,12 +1139,17 @@ END;"#,
         DatabaseType::MariaDB,
     );
 
-    let if_line = line_starting_with(&formatted, "IF v_orders_cnt > 0");
+    let if_line = formatted
+        .lines()
+        .find(|line| line.trim() == "IF")
+        .expect("procedure IF header");
+    let first_condition = line_starting_with(&formatted, "v_orders_cnt > 0");
     let and_line = line_starting_with(&formatted, "AND (v_top_category IS NULL");
     let or_line = line_starting_with(&formatted, "OR v_top_category = '') THEN");
     let body = line_starting_with(&formatted, "SET v_message = 'missing category';");
 
-    assert_eq!(indent(and_line), indent(if_line) + 4, "{formatted}");
+    assert_eq!(indent(first_condition), indent(if_line) + 4, "{formatted}");
+    assert_eq!(indent(and_line), indent(first_condition), "{formatted}");
     assert_eq!(indent(or_line), indent(and_line) + 4, "{formatted}");
     assert_eq!(indent(body), indent(and_line), "{formatted}");
 }

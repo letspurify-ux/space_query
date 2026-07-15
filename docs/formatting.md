@@ -8,6 +8,9 @@ Auto-formatting rebuilds a canonical layout from tokens and structural state; it
 does not merely adjust existing whitespace. Indentation is currently fixed at
 four spaces.
 
+The normative frame ownership, child-depth, and close-boundary contract is
+defined in [Auto-Formatting Frame and Depth Rules](auto_format_rule.md).
+
 ## Runtime flow
 
 1. The script/parser layer separates SQL and tool commands into `FormatItem`

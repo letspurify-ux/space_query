@@ -1,3 +1,4 @@
+use super::formatter::{FormatManagedFrameKind, ListOwnerKind};
 use super::{query_text, SqlEditorWidget, SqlToken};
 use crate::db::connection::DatabaseType;
 use crate::db::{FormatItem, QueryExecutor, ScriptItem};
@@ -38,6 +39,8 @@ struct FormatSweepRun {
     checked_frames: usize,
     checked_frame_body_items: usize,
     checked_frame_closes: usize,
+    managed_frame_kinds: Vec<FormatManagedFrameKind>,
+    managed_list_owner_kinds: Vec<ListOwnerKind>,
     probes: usize,
     issues: Vec<FormatSweepIssue>,
 }
@@ -457,6 +460,8 @@ fn format_sweep_run(source: &str, db_type: DatabaseType) -> FormatSweepRun {
                 checked_frames: 0,
                 checked_frame_body_items: 0,
                 checked_frame_closes: 0,
+                managed_frame_kinds: Vec::new(),
+                managed_list_owner_kinds: Vec::new(),
                 probes: 0,
                 issues: vec![FormatSweepIssue::new(
                     FormatSweepIssueKind::FormatPanic,
@@ -554,6 +559,8 @@ fn format_sweep_run(source: &str, db_type: DatabaseType) -> FormatSweepRun {
         checked_frames: frame_alignment_audit.checked_frames,
         checked_frame_body_items: frame_alignment_audit.checked_body_items,
         checked_frame_closes: frame_alignment_audit.checked_closes,
+        managed_frame_kinds: frame_alignment_audit.managed_frame_kinds,
+        managed_list_owner_kinds: frame_alignment_audit.managed_list_owner_kinds,
         probes,
         issues,
     }
@@ -610,6 +617,14 @@ fn format_sweep_render_out(
         run.checked_frame_body_items,
         run.checked_frame_closes,
         run.probes
+    ));
+    annotated.push_str(&format!(
+        "-- managed_frame_kinds: {:?}\n",
+        run.managed_frame_kinds
+    ));
+    annotated.push_str(&format!(
+        "-- managed_list_owner_kinds: {:?}\n",
+        run.managed_list_owner_kinds
     ));
     annotated.push_str(&format!("-- issues: total={}\n", run.issues.len()));
     annotated.push_str("-- marker: [[FMT:E...]] marks an invariant error\n");
@@ -742,7 +757,625 @@ fn formatting_sweep_simple_sql_converges() {
         DatabaseType::Oracle,
     );
     assert!(run.issues.is_empty(), "unexpected issues: {:?}", run.issues);
+    assert!(
+        run.formatted.contains("WHERE\n    a = 1\n    AND b = 2"),
+        "multiline condition children should share one depth:\n{}",
+        run.formatted
+    );
     assert_eq!(run.probes, 4, "three whitespace probes plus idempotence");
+}
+
+#[test]
+fn formatting_sweep_condition_frame_depth_invariant_covers_db_clause_families() {
+    for (db_type, source) in [
+        (
+            DatabaseType::Oracle,
+            "SELECT * FROM emp START WITH manager_id IS NULL AND active = 1 CONNECT BY PRIOR emp_id = manager_id AND active = 1;",
+        ),
+        (
+            DatabaseType::Oracle,
+            "SELECT CASE WHEN t.a = 1 AND t.b = 2 THEN 1 ELSE 0 END, COUNT(*) FROM t JOIN u ON u.id = t.id OR u.alt_id = t.id WHERE t.active = 1 AND u.active = 1 GROUP BY t.a, t.b HAVING COUNT(*) > 1 OR SUM(t.a) > 10;",
+        ),
+        (
+            DatabaseType::Oracle,
+            "SELECT dept_id, COUNT(*) FROM emp GROUP BY dept_id HAVING COUNT(*) > 1 OR SUM(sal) > 10 QUALIFY ROW_NUMBER() OVER (PARTITION BY dept_id ORDER BY emp_id) = 1 AND active = 1;",
+        ),
+        (
+            DatabaseType::Oracle,
+            "SELECT * FROM emp MATCH_RECOGNIZE (PARTITION BY dept_id ORDER BY emp_id PATTERN (A B+) DEFINE A AS A.sal > 10 AND A.active = 1 OR A.flag = 'Y');",
+        ),
+        (
+            DatabaseType::Oracle,
+            "BEGIN IF a = 1 AND b = 2 THEN NULL; END IF; LOOP EXIT WHEN a = 1 OR b = 2; END LOOP; EXCEPTION WHEN NO_DATA_FOUND OR TOO_MANY_ROWS THEN NULL; END;",
+        ),
+        (
+            DatabaseType::Oracle,
+            "CREATE OR REPLACE TRIGGER trg BEFORE INSERT OR UPDATE ON t FOR EACH ROW WHEN (NEW.a = 1 OR NEW.b = 2) BEGIN NULL; END;",
+        ),
+        (
+            DatabaseType::MySQL,
+            "SELECT IF(a = 1 AND b = 2 OR c = 3, 'Y', 'N') FROM t;",
+        ),
+        (
+            DatabaseType::MySQL,
+            "SELECT CASE WHEN t.a = 1 AND t.b = 2 THEN 1 ELSE 0 END, COUNT(*) FROM t JOIN u ON u.id = t.id OR u.alt_id = t.id WHERE t.active = 1 AND u.active = 1 GROUP BY t.a, t.b HAVING COUNT(*) > 1 OR SUM(t.a) > 10;",
+        ),
+        (
+            DatabaseType::MySQL,
+            "CREATE PROCEDURE p() BEGIN IF a = 1 AND b = 2 THEN SET a = 2; END IF; WHILE a = 2 OR b = 3 DO SET a = 3; END WHILE; REPEAT SET a = a + 1; UNTIL a = 4 AND b = 5; END REPEAT; END;",
+        ),
+        (
+            DatabaseType::MariaDB,
+            "SELECT IF(a = 1 AND b = 2 OR c = 3, 'Y', 'N') FROM t;",
+        ),
+        (
+            DatabaseType::MariaDB,
+            "SELECT CASE WHEN t.a = 1 AND t.b = 2 THEN 1 ELSE 0 END, COUNT(*) FROM t JOIN u ON u.id = t.id OR u.alt_id = t.id WHERE t.active = 1 AND u.active = 1 GROUP BY t.a, t.b HAVING COUNT(*) > 1 OR SUM(t.a) > 10;",
+        ),
+        (
+            DatabaseType::MariaDB,
+            "CREATE PROCEDURE p() BEGIN IF a = 1 AND b = 2 THEN SET a = 2; END IF; WHILE a = 2 OR b = 3 DO SET a = 3; END WHILE; REPEAT SET a = a + 1; UNTIL a = 4 AND b = 5; END REPEAT; END;",
+        ),
+    ] {
+        let run = format_sweep_run(source, db_type);
+        let invariant_issues: Vec<&FormatSweepIssue> = run
+            .issues
+            .iter()
+            .filter(|issue| {
+                matches!(
+                    issue.kind,
+                    FormatSweepIssueKind::FrameAlignment | FormatSweepIssueKind::NonIdempotent
+                )
+            })
+            .collect();
+        assert!(
+            invariant_issues.is_empty(),
+            "{db_type:?} condition-frame issues: {:#?}\n{}",
+            invariant_issues,
+            run.formatted
+        );
+    }
+}
+
+#[test]
+fn formatting_sweep_comma_list_frame_depth_invariant_covers_db_clause_families() {
+    for (db_type, source, minimum_body_items) in [
+        (
+            DatabaseType::Oracle,
+            r#"SELECT
+    CASE WHEN e.active = 1 THEN e.emp_id ELSE 0 END AS active_emp,
+    e.dept_id,
+    SUM(e.sal) AS total_sal
+FROM
+    (SELECT emp_id, dept_id, sal, active FROM emp) e,
+    dept d
+GROUP BY
+    e.dept_id,
+    d.dept_name
+ORDER BY
+    SUM(e.sal),
+    e.dept_id;"#,
+            8,
+        ),
+        (
+            DatabaseType::MySQL,
+            r#"UPDATE employee
+SET
+    salary = salary + 1,
+    updated_at = CURRENT_TIMESTAMP,
+    active = 1
+WHERE employee_id = 1;
+INSERT INTO audit_log (employee_id, action_name, created_at)
+VALUES
+    (1, 'A', CURRENT_TIMESTAMP),
+    (2, 'B', CURRENT_TIMESTAMP);"#,
+            3,
+        ),
+        (
+            DatabaseType::MariaDB,
+            r#"SELECT
+    IF(active = 1, employee_id, 0) AS active_emp,
+    department_id,
+    COUNT(*) AS employee_count
+FROM employee
+GROUP BY
+    department_id,
+    active
+ORDER BY
+    employee_count,
+    department_id;"#,
+            4,
+        ),
+    ] {
+        let run = format_sweep_run(source, db_type);
+        let frame_issues: Vec<&FormatSweepIssue> = run
+            .issues
+            .iter()
+            .filter(|issue| issue.kind == FormatSweepIssueKind::FrameAlignment)
+            .collect();
+        assert!(
+            frame_issues.is_empty(),
+            "{db_type:?} comma-list frame issues: {frame_issues:#?}\n{}",
+            run.formatted
+        );
+        assert!(
+            run.checked_frame_body_items >= minimum_body_items,
+            "{db_type:?} comma-list frames were not fully audited: {run:#?}"
+        );
+    }
+}
+
+#[test]
+fn formatting_sweep_syntax_inventory_is_owned_by_typed_frames() {
+    let cases: &[(
+        &str,
+        DatabaseType,
+        &str,
+        &[FormatManagedFrameKind],
+    )] = &[
+        (
+            "query clauses, comma lists, and conditions",
+            DatabaseType::Oracle,
+            "SELECT a, b FROM t1, t2 WHERE t1.id = t2.id AND t1.active = 1 ORDER BY a, b;",
+            &[
+                FormatManagedFrameKind::Query,
+                FormatManagedFrameKind::List,
+                FormatManagedFrameKind::Condition,
+            ],
+        ),
+        (
+            "CTE siblings and set operands",
+            DatabaseType::Oracle,
+            "WITH a AS (SELECT id, v FROM t1), b AS (SELECT id, v FROM t2) SELECT id, v FROM a UNION ALL SELECT id, v FROM b;",
+            &[
+                FormatManagedFrameKind::WithCte,
+                FormatManagedFrameKind::Parenthesized,
+                FormatManagedFrameKind::Query,
+                FormatManagedFrameKind::List,
+            ],
+        ),
+        (
+            "MERGE branches, conditions, and assignment lists",
+            DatabaseType::Oracle,
+            "MERGE INTO t USING (SELECT id, a, b FROM s) x ON (t.id = x.id AND t.active = 1) WHEN MATCHED THEN UPDATE SET t.a = x.a, t.b = x.b WHEN NOT MATCHED THEN INSERT (id, a, b) VALUES (x.id, x.a, x.b);",
+            &[
+                FormatManagedFrameKind::MergeBranch,
+                FormatManagedFrameKind::Condition,
+                FormatManagedFrameKind::List,
+                FormatManagedFrameKind::Parenthesized,
+            ],
+        ),
+        (
+            "INSERT ALL branches and row-value lists",
+            DatabaseType::Oracle,
+            "INSERT ALL WHEN active = 1 AND kind = 'A' THEN INTO ta (id, v) VALUES (id, v) WHEN active = 1 AND kind = 'B' THEN INTO tb (id, v) VALUES (id, v) SELECT id, v, active, kind FROM src;",
+            &[
+                FormatManagedFrameKind::InsertAll,
+                FormatManagedFrameKind::Condition,
+                FormatManagedFrameKind::List,
+                FormatManagedFrameKind::Parenthesized,
+            ],
+        ),
+        (
+            "MATCH_RECOGNIZE section lists and DEFINE conditions",
+            DatabaseType::Oracle,
+            "SELECT * FROM sales MATCH_RECOGNIZE (PARTITION BY dept_id, region_id ORDER BY sale_date, sale_id MEASURES FIRST(sale_date) AS first_date, LAST(sale_date) AS last_date PATTERN (A B+) DEFINE A AS A.amount > 10 AND A.active = 1, B AS B.amount > A.amount);",
+            &[
+                FormatManagedFrameKind::Parenthesized,
+                FormatManagedFrameKind::List,
+                FormatManagedFrameKind::Condition,
+            ],
+        ),
+        (
+            "MODEL dimensions, measures, and rules",
+            DatabaseType::Oracle,
+            "SELECT dept_id, month_id, amount, projected FROM sales MODEL PARTITION BY (dept_id) DIMENSION BY (month_id) MEASURES (amount, projected) RULES (projected[ANY] = amount[CV(month_id)] * 1.1, amount[ANY] = amount[CV(month_id)]);",
+            &[
+                FormatManagedFrameKind::Parenthesized,
+                FormatManagedFrameKind::List,
+            ],
+        ),
+        (
+            "Oracle conditional-compilation boundaries",
+            DatabaseType::Oracle,
+            "CREATE OR REPLACE PROCEDURE p IS BEGIN $IF DBMS_DB_VERSION.VERSION >= 19 $THEN NULL; $ELSIF DBMS_DB_VERSION.VERSION >= 12 $THEN NULL; $ELSE NULL; $END NULL; END;",
+            &[
+                FormatManagedFrameKind::OracleConditionalCompilation,
+                FormatManagedFrameKind::Block,
+                FormatManagedFrameKind::PlsqlContext,
+            ],
+        ),
+        (
+            "cursor SQL and FORALL body",
+            DatabaseType::Oracle,
+            "DECLARE CURSOR c IS SELECT id FROM src; BEGIN FORALL i IN 1 .. 3 INSERT INTO dst (id) VALUES (i); FOR r IN (SELECT id FROM src) LOOP BEGIN IF r.id = 1 THEN NULL; ELSIF r.id = 2 THEN NULL; ELSE NULL; END IF; END; END LOOP; END;",
+            &[
+                FormatManagedFrameKind::CursorSql,
+                FormatManagedFrameKind::ForallBody,
+                FormatManagedFrameKind::Block,
+                FormatManagedFrameKind::Condition,
+            ],
+        ),
+        (
+            "CASE expression split control body",
+            DatabaseType::Oracle,
+            "SELECT CASE WHEN a = 1 AND b = 2 THEN CASE WHEN c = 3 THEN 1 ELSE 2 END ELSE 0 END AS flag_value FROM t;",
+            &[
+                FormatManagedFrameKind::SplitControlBody,
+                FormatManagedFrameKind::Block,
+                FormatManagedFrameKind::Condition,
+            ],
+        ),
+        (
+            "compound-trigger sections and event alternatives",
+            DatabaseType::Oracle,
+            "CREATE OR REPLACE TRIGGER trg FOR INSERT OR UPDATE OR DELETE ON t COMPOUND TRIGGER BEFORE STATEMENT IS BEGIN NULL; END BEFORE STATEMENT; AFTER EACH ROW IS BEGIN NULL; END AFTER EACH ROW; END trg;",
+            &[
+                FormatManagedFrameKind::TriggerHeader,
+                FormatManagedFrameKind::CompoundTrigger,
+                FormatManagedFrameKind::Block,
+                FormatManagedFrameKind::PlsqlContext,
+            ],
+        ),
+        (
+            "dynamic SQL USING and INTO bind lists",
+            DatabaseType::Oracle,
+            "DECLARE a NUMBER; b NUMBER; c NUMBER; BEGIN EXECUTE IMMEDIATE 'SELECT x, y FROM t WHERE id = :1' INTO a, b USING c; END;",
+            &[
+                FormatManagedFrameKind::ExecuteImmediate,
+                FormatManagedFrameKind::List,
+                FormatManagedFrameKind::Block,
+                FormatManagedFrameKind::PlsqlContext,
+            ],
+        ),
+        (
+            "MySQL handler conditions and compound body",
+            DatabaseType::MySQL,
+            "CREATE PROCEDURE p() BEGIN DECLARE CONTINUE HANDLER FOR SQLWARNING, SQLEXCEPTION BEGIN SET @a = 1; SET @b = 2; END; SELECT a, b FROM t WHERE a = 1 OR b = 2; END;",
+            &[
+                FormatManagedFrameKind::MySqlHandlerBody,
+                FormatManagedFrameKind::List,
+                FormatManagedFrameKind::Block,
+                FormatManagedFrameKind::Condition,
+            ],
+        ),
+        (
+            "MariaDB routine control conditions",
+            DatabaseType::MariaDB,
+            "CREATE PROCEDURE p() BEGIN IF a = 1 AND b = 2 THEN SET a = 2; ELSE SET b = 3; END IF; WHILE a < 10 OR b < 10 DO SET a = a + 1; END WHILE; REPEAT SET b = b + 1; UNTIL b > 10 AND a > 5; END REPEAT; END;",
+            &[
+                FormatManagedFrameKind::Block,
+                FormatManagedFrameKind::Condition,
+            ],
+        ),
+        (
+            "DDL structured columns and privilege lists",
+            DatabaseType::Oracle,
+            "SELECT jt.id, jt.name FROM JSON_TABLE(doc, '$[*]' COLUMNS (id NUMBER PATH '$.id', name VARCHAR2(30) PATH '$.name')) jt; GRANT SELECT, INSERT, UPDATE ON t TO app;",
+            &[
+                FormatManagedFrameKind::Parenthesized,
+                FormatManagedFrameKind::List,
+            ],
+        ),
+    ];
+
+    let mut actual_kinds = Vec::new();
+    for (label, db_type, source, expected_kinds) in cases {
+        let run = format_sweep_run(source, *db_type);
+        let frame_issues: Vec<&FormatSweepIssue> = run
+            .issues
+            .iter()
+            .filter(|issue| issue.kind == FormatSweepIssueKind::FrameAlignment)
+            .collect();
+        assert!(
+            frame_issues.is_empty(),
+            "{label} produced frame invariant errors: {frame_issues:#?}\n{}",
+            run.formatted
+        );
+        for expected_kind in *expected_kinds {
+            assert!(
+                run.managed_frame_kinds.contains(expected_kind),
+                "{label} did not create {expected_kind:?}; actual={:?}\n{}",
+                run.managed_frame_kinds,
+                run.formatted
+            );
+        }
+        for kind in run.managed_frame_kinds {
+            if !actual_kinds.contains(&kind) {
+                actual_kinds.push(kind);
+            }
+        }
+    }
+    actual_kinds.sort_unstable();
+
+    let mut expected_kinds = FormatManagedFrameKind::ALL.to_vec();
+    expected_kinds.sort_unstable();
+    assert_eq!(
+        actual_kinds, expected_kinds,
+        "every production frame kind must be exercised by an invariant-checked syntax sample"
+    );
+}
+
+#[test]
+fn formatting_sweep_search_cycle_comma_children_have_dedicated_list_frames() {
+    let source = "WITH r (id, parent_id) AS (SELECT 1, 0 FROM DUAL UNION ALL SELECT id + 1, id FROM r WHERE id < 3) SEARCH DEPTH FIRST BY id, parent_id SET traversal_no CYCLE id, parent_id SET cycle_yn TO 'Y' DEFAULT 'N' SELECT id, parent_id FROM r;";
+    let run = format_sweep_run(source, DatabaseType::Oracle);
+
+    assert!(
+        run.issues.is_empty(),
+        "SEARCH/CYCLE frame issues: {:#?}\n{}",
+        run.issues,
+        run.formatted
+    );
+    for kind in [ListOwnerKind::SearchBy, ListOwnerKind::CycleColumns] {
+        assert!(
+            run.managed_list_owner_kinds.contains(&kind),
+            "SEARCH/CYCLE did not create {kind:?}: {:?}\n{}",
+            run.managed_list_owner_kinds,
+            run.formatted
+        );
+    }
+    assert!(
+        run.formatted
+            .contains("SEARCH DEPTH FIRST BY id,\n    parent_id SET traversal_no"),
+        "SEARCH siblings should use one list-body depth:\n{}",
+        run.formatted
+    );
+    assert!(
+        run.formatted
+            .contains("CYCLE id,\n    parent_id SET cycle_yn"),
+        "CYCLE siblings should use one list-body depth:\n{}",
+        run.formatted
+    );
+}
+
+#[test]
+fn formatting_sweep_mysql_non_parenthesized_lists_have_dedicated_frames() {
+    let source = "CREATE PROCEDURE p() BEGIN DECLARE v_state CHAR(5); DECLARE v_errno INT; DECLARE v_message TEXT; GET STACKED DIAGNOSTICS CONDITION 1 v_state = RETURNED_SQLSTATE, v_errno = MYSQL_ERRNO, v_message = MESSAGE_TEXT; END; DELETE d, r FROM document d JOIN reading r ON r.id = d.id;";
+    let run = format_sweep_run(source, DatabaseType::MySQL);
+
+    assert!(
+        run.issues.is_empty(),
+        "MySQL non-parenthesized list issues: {:#?}\n{}",
+        run.issues,
+        run.formatted
+    );
+    for kind in [
+        ListOwnerKind::DiagnosticsItems,
+        ListOwnerKind::DeleteTargets,
+    ] {
+        assert!(
+            run.managed_list_owner_kinds.contains(&kind),
+            "MySQL syntax did not create {kind:?}: {:?}\n{}",
+            run.managed_list_owner_kinds,
+            run.formatted
+        );
+    }
+}
+
+#[test]
+fn formatting_sweep_additional_non_parenthesized_child_lists_have_typed_frames() {
+    let cases: &[(DatabaseType, &str, &[ListOwnerKind])] = &[
+        (
+            DatabaseType::Oracle,
+            "SELECT * FROM sales MATCH_RECOGNIZE (ORDER BY sale_id SUBSET ab = (A, B), cd = (C, D) PATTERN (A B C D) DEFINE A AS amount > 0); SELECT a, b FROM t FOR UPDATE OF a, b; CREATE OR REPLACE TRIGGER trg BEFORE UPDATE OF a, b ON t FOLLOWS trg_a, trg_b BEGIN NULL; END; GRANT SELECT, UPDATE ON t TO app_a, app_b; ALTER TABLE t ADD c NUMBER, ADD d NUMBER; LOCK TABLE t_a, t_b IN EXCLUSIVE MODE; FLASHBACK TABLE t_a, t_b TO SCN 1;",
+            &[
+                ListOwnerKind::Subset,
+                ListOwnerKind::ForUpdateColumns,
+                ListOwnerKind::TriggerUpdateColumns,
+                ListOwnerKind::TriggerOrdering,
+                ListOwnerKind::GrantPrivileges,
+                ListOwnerKind::GrantGrantees,
+                ListOwnerKind::AlterActions,
+                ListOwnerKind::LockTables,
+                ListOwnerKind::FlashbackTargets,
+            ],
+        ),
+        (
+            DatabaseType::MySQL,
+            "UPDATE t1, t2 SET t1.v = 1, t2.v = 2; ALTER TABLE t1 ADD a INT, ADD b INT; DROP TABLE IF EXISTS old_a, old_b; RENAME TABLE old_c TO new_c, old_d TO new_d; LOCK TABLES new_c READ, new_d WRITE; ANALYZE TABLE new_c, new_d; CREATE USER user_a IDENTIFIED BY 'x', user_b IDENTIFIED BY 'y'; CREATE PROCEDURE p() BEGIN DECLARE v_a, v_b INT; DO v_a, v_b; END;",
+            &[
+                ListOwnerKind::UpdateTargets,
+                ListOwnerKind::AlterActions,
+                ListOwnerKind::DropTargets,
+                ListOwnerKind::RenamePairs,
+                ListOwnerKind::LockTables,
+                ListOwnerKind::MaintenanceTables,
+                ListOwnerKind::AccountTargets,
+                ListOwnerKind::DeclarationNames,
+                ListOwnerKind::DoExpressions,
+            ],
+        ),
+        (
+            DatabaseType::MariaDB,
+            "UPDATE t1, t2 SET t1.v = 1, t2.v = 2; ALTER TABLE t1 ADD a INT, ADD b INT; CHECK TABLE t1, t2; REPAIR TABLE t1, t2; GRANT role_a, role_b TO user_a, user_b; CREATE PROCEDURE p() BEGIN DECLARE v_a, v_b INT; DO v_a, v_b; END;",
+            &[
+                ListOwnerKind::UpdateTargets,
+                ListOwnerKind::AlterActions,
+                ListOwnerKind::MaintenanceTables,
+                ListOwnerKind::GrantPrivileges,
+                ListOwnerKind::GrantGrantees,
+                ListOwnerKind::DeclarationNames,
+                ListOwnerKind::DoExpressions,
+            ],
+        ),
+    ];
+
+    for (db_type, source, expected_kinds) in cases {
+        let run = format_sweep_run(source, *db_type);
+        assert!(
+            run.issues.is_empty(),
+            "{db_type:?} additional list-frame issues: {:#?}\n{}",
+            run.issues,
+            run.formatted
+        );
+        for expected_kind in *expected_kinds {
+            assert!(
+                run.managed_list_owner_kinds.contains(expected_kind),
+                "{db_type:?} syntax did not create {expected_kind:?}: {:?}\n{}",
+                run.managed_list_owner_kinds,
+                run.formatted
+            );
+        }
+    }
+}
+
+#[test]
+fn formatting_sweep_parenthesized_semantic_child_lists_have_typed_frames() {
+    let cases: &[(DatabaseType, &str, &[ListOwnerKind])] = &[
+        (
+            DatabaseType::Oracle,
+            "SELECT jt.id, jt.name FROM JSON_TABLE(doc, '$[*]' COLUMNS (id NUMBER PATH '$.id', name VARCHAR2(30) PATH '$.name')) jt; SELECT LISTAGG(name, ',') WITHIN GROUP (ORDER BY name, id) FROM t; SELECT MAX(name) KEEP (DENSE_RANK FIRST ORDER BY score, id) FROM t; SELECT * FROM sales PIVOT (SUM(amount) AS total, COUNT(*) AS row_count FOR quarter IN (1 AS q1, 2 AS q2)); SELECT dept_id, month_id, amount, projected FROM sales MODEL PARTITION BY (dept_id, region_id) DIMENSION BY (month_id, channel_id) MEASURES (amount, projected) RULES (projected[ANY] = amount[CV(month_id)] * 1.1, amount[ANY] = amount[CV(month_id)]);",
+            &[
+                ListOwnerKind::StructuredTableArguments,
+                ListOwnerKind::StructuredColumns,
+                ListOwnerKind::Order,
+                ListOwnerKind::PivotAggregates,
+                ListOwnerKind::Partition,
+                ListOwnerKind::Dimension,
+                ListOwnerKind::Measures,
+                ListOwnerKind::ModelRules,
+            ],
+        ),
+        (
+            DatabaseType::MySQL,
+            "SELECT jt.id, jt.name FROM JSON_TABLE(doc, '$[*]' COLUMNS (id INT PATH '$.id', name VARCHAR(30) PATH '$.name')) AS jt;",
+            &[
+                ListOwnerKind::StructuredTableArguments,
+                ListOwnerKind::StructuredColumns,
+            ],
+        ),
+        (
+            DatabaseType::MariaDB,
+            "SELECT jt.id, jt.name FROM JSON_TABLE(doc, '$[*]' COLUMNS (id INT PATH '$.id', name VARCHAR(30) PATH '$.name')) AS jt;",
+            &[
+                ListOwnerKind::StructuredTableArguments,
+                ListOwnerKind::StructuredColumns,
+            ],
+        ),
+    ];
+
+    for (db_type, source, expected_kinds) in cases {
+        let run = format_sweep_run(source, *db_type);
+        assert!(
+            run.issues.is_empty(),
+            "{db_type:?} parenthesized semantic list-frame issues: {:#?}\n{}",
+            run.issues,
+            run.formatted
+        );
+        for expected_kind in *expected_kinds {
+            assert!(
+                run.managed_list_owner_kinds.contains(expected_kind),
+                "{db_type:?} syntax did not create {expected_kind:?}: {:?}\n{}",
+                run.managed_list_owner_kinds,
+                run.formatted
+            );
+        }
+    }
+}
+
+#[test]
+fn formatting_sweep_list_owner_inventory_covers_every_typed_variant() {
+    let cases = [
+        (
+            DatabaseType::Oracle,
+            "WITH a AS (SELECT id, dept_id FROM t), b AS (SELECT id, dept_id FROM a) SELECT a.id, b.id INTO v_a, v_b FROM a, b GROUP BY a.id, b.id ORDER BY a.id, b.id FOR UPDATE OF a.id, b.id;",
+        ),
+        (
+            DatabaseType::Oracle,
+            "SELECT id, SUM(amount) OVER w FROM sales WINDOW w AS (PARTITION BY dept_id, region_id ORDER BY sale_day, id); UPDATE t SET a = 1, b = 2 RETURNING a, b INTO v_a, v_b; INSERT INTO t (a, b) VALUES (1, 2), (3, 4);",
+        ),
+        (
+            DatabaseType::Oracle,
+            "MERGE INTO t USING (SELECT id, a, b FROM s) x ON (t.id = x.id) WHEN MATCHED THEN UPDATE SET t.a = x.a, t.b = x.b;",
+        ),
+        (
+            DatabaseType::Oracle,
+            "SELECT * FROM sales MATCH_RECOGNIZE (PARTITION BY dept_id, region_id ORDER BY sale_id MEASURES FIRST(amount) AS first_amount, LAST(amount) AS last_amount SUBSET ab = (A, B), cd = (C, D) PATTERN (A B C D) DEFINE A AS A.amount > 0, B AS B.amount > A.amount);",
+        ),
+        (
+            DatabaseType::Oracle,
+            "SELECT dept_id, month_id, amount, projected FROM sales MODEL PARTITION BY (dept_id, region_id) DIMENSION BY (month_id, channel_id) MEASURES (amount, projected) RULES (projected[ANY] = amount[CV(month_id)], amount[ANY] = projected[CV(month_id)]); SELECT * FROM sales PIVOT (SUM(amount) AS total, COUNT(*) AS row_count FOR quarter IN (1 AS q1, 2 AS q2));",
+        ),
+        (
+            DatabaseType::Oracle,
+            "SELECT jt.id, jt.name FROM JSON_TABLE(doc, '$[*]' COLUMNS (id NUMBER PATH '$.id', name VARCHAR2(30) PATH '$.name')) jt; GRANT SELECT, UPDATE ON t TO app_a, app_b; CREATE OR REPLACE TRIGGER trg BEFORE UPDATE OF a, b ON t BEGIN NULL; END;",
+        ),
+        (
+            DatabaseType::Oracle,
+            "ALTER TABLE t ADD a NUMBER, ADD b NUMBER; LOCK TABLE t_a, t_b IN EXCLUSIVE MODE; FLASHBACK TABLE t_a, t_b TO SCN 1; CREATE OR REPLACE TRIGGER trg_order BEFORE INSERT ON t FOLLOWS trg_a, trg_b BEGIN NULL; END;",
+        ),
+        (
+            DatabaseType::Oracle,
+            "WITH r (id, parent_id) AS (SELECT 1, 0 FROM DUAL UNION ALL SELECT id + 1, id FROM r WHERE id < 3) SEARCH DEPTH FIRST BY id, parent_id SET traversal_no CYCLE id, parent_id SET cycle_yn TO 'Y' DEFAULT 'N' SELECT id, parent_id FROM r;",
+        ),
+        (
+            DatabaseType::MySQL,
+            "CREATE PROCEDURE p() BEGIN DECLARE v_state CHAR(5); DECLARE v_errno INT; DECLARE v_a, v_b INT; DECLARE CONTINUE HANDLER FOR SQLWARNING, SQLEXCEPTION SET @handled = 1; GET STACKED DIAGNOSTICS CONDITION 1 v_state = RETURNED_SQLSTATE, v_errno = MYSQL_ERRNO; DO v_a, v_b; END; DELETE d, r FROM document d JOIN reading r ON r.id = d.id;",
+        ),
+        (
+            DatabaseType::MySQL,
+            "UPDATE t1, t2 SET t1.v = 1, t2.v = 2; ALTER TABLE t1 ADD a INT, ADD b INT; DROP TABLE IF EXISTS old_a, old_b; RENAME TABLE old_c TO new_c, old_d TO new_d; LOCK TABLES new_c READ, new_d WRITE; ANALYZE TABLE new_c, new_d; CREATE USER user_a IDENTIFIED BY 'x', user_b IDENTIFIED BY 'y';",
+        ),
+    ];
+
+    let mut actual_kinds = Vec::new();
+    for (db_type, source) in cases {
+        let run = format_sweep_run(source, db_type);
+        assert!(
+            run.issues.is_empty(),
+            "{db_type:?} complete list-owner inventory issues: {:#?}\nmanaged={:?}\n{}",
+            run.issues,
+            run.managed_list_owner_kinds,
+            run.formatted
+        );
+        for kind in run.managed_list_owner_kinds {
+            if !actual_kinds.contains(&kind) {
+                actual_kinds.push(kind);
+            }
+        }
+    }
+    actual_kinds.sort_unstable();
+
+    let mut expected_kinds = ListOwnerKind::ALL.to_vec();
+    expected_kinds.sort_unstable();
+    assert_eq!(
+        actual_kinds, expected_kinds,
+        "every production list-owner variant must be exercised by an invariant-checked syntax sample"
+    );
+}
+
+#[test]
+fn formatting_sweep_with_line_start_children_use_owner_plus_one_depth() {
+    for db_type in [
+        DatabaseType::Oracle,
+        DatabaseType::MySQL,
+        DatabaseType::MariaDB,
+    ] {
+        let source = r#"WITH first_cte AS (SELECT 1 AS id),
+    /* sibling */
+    second_cte AS (SELECT id FROM first_cte),
+    third_cte AS (SELECT id FROM second_cte)
+SELECT id FROM third_cte;"#;
+        let run = format_sweep_run(source, db_type);
+        assert!(
+            run.issues.is_empty(),
+            "{db_type:?} WITH child-depth issues: {:#?}\n{}",
+            run.issues,
+            run.formatted
+        );
+        assert!(
+            run.formatted
+                .contains("),\n    /* sibling */\n    second_cte AS ("),
+            "{db_type:?} comment and second CTE should share WITH owner+1 depth:\n{}",
+            run.formatted
+        );
+        assert!(
+            run.formatted.contains("),\n    third_cte AS ("),
+            "{db_type:?} later CTE siblings should remain on WITH owner+1 depth:\n{}",
+            run.formatted
+        );
+    }
 }
 
 #[test]
@@ -812,6 +1445,24 @@ END cc_comment;"#;
 }
 
 #[test]
+fn formatting_sweep_reports_unclosed_conditional_compilation_frame() {
+    let source = r#"CREATE OR REPLACE PROCEDURE cc_unclosed IS
+BEGIN
+    $IF DBMS_DB_VERSION.VERSION >= 19 $THEN
+        NULL;
+END cc_unclosed;"#;
+    let run = format_sweep_run(source, DatabaseType::Oracle);
+
+    assert!(
+        run.issues.iter().any(|issue| {
+            issue.kind == FormatSweepIssueKind::FrameAlignment
+                && issue.message.contains("without a matching close boundary")
+        }),
+        "missing conditional-compilation close should be reported: {run:#?}"
+    );
+}
+
+#[test]
 fn formatting_sweep_report_uses_distinct_format_out_suffix() {
     let input = PathBuf::from("test/test1.txt");
     assert_eq!(
@@ -829,6 +1480,8 @@ fn formatting_sweep_report_marks_first_pass_issue() {
         checked_frames: 0,
         checked_frame_body_items: 0,
         checked_frame_closes: 0,
+        managed_frame_kinds: Vec::new(),
+        managed_list_owner_kinds: Vec::new(),
         probes: 0,
         issues: vec![FormatSweepIssue::new(
             FormatSweepIssueKind::LineBreak,
@@ -878,6 +1531,8 @@ fn formatting_sweep_all_files_generate_out_report() {
     let mut checked_frames = 0usize;
     let mut checked_frame_body_items = 0usize;
     let mut checked_frame_closes = 0usize;
+    let mut managed_frame_kinds = Vec::new();
+    let mut managed_list_owner_kinds = Vec::new();
 
     for (dir, db_type) in [
         ("test", DatabaseType::Oracle),
@@ -912,6 +1567,16 @@ fn formatting_sweep_all_files_generate_out_report() {
             checked_frame_body_items =
                 checked_frame_body_items.saturating_add(run.checked_frame_body_items);
             checked_frame_closes = checked_frame_closes.saturating_add(run.checked_frame_closes);
+            for kind in &run.managed_frame_kinds {
+                if !managed_frame_kinds.contains(kind) {
+                    managed_frame_kinds.push(*kind);
+                }
+            }
+            for kind in &run.managed_list_owner_kinds {
+                if !managed_list_owner_kinds.contains(kind) {
+                    managed_list_owner_kinds.push(*kind);
+                }
+            }
             if !run.issues.is_empty() {
                 failures.push(format!(
                     "{} issues={} report={}",
@@ -923,8 +1588,10 @@ fn formatting_sweep_all_files_generate_out_report() {
         }
     }
 
+    managed_frame_kinds.sort_unstable();
+    managed_list_owner_kinds.sort_unstable();
     let mut aggregate = format!(
-        "Auto-format sweep aggregate\nchecked_files={checked_files}\nchecked_frames={checked_frames}\nchecked_frame_body_items={checked_frame_body_items}\nchecked_frame_closes={checked_frame_closes}\nfailed_files={}\n",
+        "Auto-format sweep aggregate\nchecked_files={checked_files}\nchecked_frames={checked_frames}\nchecked_frame_body_items={checked_frame_body_items}\nchecked_frame_closes={checked_frame_closes}\nmanaged_frame_kinds={managed_frame_kinds:?}\nmanaged_list_owner_kinds={managed_list_owner_kinds:?}\nfailed_files={}\n",
         failures.len()
     );
     for failure in &failures {
@@ -940,6 +1607,12 @@ fn formatting_sweep_all_files_generate_out_report() {
         failures.len(),
         checked_files,
         output_root.join("format-sweep.out").display()
+    );
+    let mut expected_frame_kinds = FormatManagedFrameKind::ALL.to_vec();
+    expected_frame_kinds.sort_unstable();
+    assert_eq!(
+        managed_frame_kinds, expected_frame_kinds,
+        "the complete fixture sweep must exercise every production frame kind"
     );
 }
 
@@ -1015,18 +1688,27 @@ fn match_recognize_define_condition_continuation_anchors_to_item_line() {
     let lines: Vec<&str> = formatted.lines().collect();
     let item_indent = lines
         .iter()
-        .find(|line| line.trim_start().starts_with("B AS B.sal"))
+        .find(|line| line.trim_start() == "B AS")
         .map(|line| line.len() - line.trim_start().len())
         .expect("DEFINE item line");
+    let first_condition_indent = lines
+        .iter()
+        .find(|line| line.trim_start().starts_with("B.sal > PREV"))
+        .map(|line| line.len() - line.trim_start().len())
+        .expect("DEFINE first condition line");
     let and_indent = lines
         .iter()
         .find(|line| line.trim_start().starts_with("AND B.sal"))
         .map(|line| line.len() - line.trim_start().len())
         .expect("DEFINE condition continuation line");
     assert_eq!(
-        and_indent,
+        first_condition_indent,
         item_indent + FORMAT_SWEEP_INDENT_WIDTH,
-        "DEFINE condition continuation must sit one level deeper than its item line, got:\n{formatted}"
+        "DEFINE first condition must sit one level deeper than its item line, got:\n{formatted}"
+    );
+    assert_eq!(
+        and_indent, first_condition_indent,
+        "DEFINE condition siblings must share one depth, got:\n{formatted}"
     );
 }
 

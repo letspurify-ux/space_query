@@ -2712,3 +2712,143 @@ token slice만 사용한다. 100만 줄 초과 회귀 5종이 0.28초에 통과�
 audit 계약으로 고쳤으며, IntelliSense는 production과 같은 snapshot/analysis/completion
 경로 및 같은 literal/comment 억제 규칙으로 검사한다. 전체 리포트 수동 판독, 100만 줄
 성능 회귀, 전체 Rust 테스트와 엄격한 Clippy까지 최종 오류와 경고가 남지 않았다.
+
+# 19. 12차 검증 회차 (2026-07-15): 동일 frame 자식 owner+1 및 frame 완전성 감사
+
+## 19-1. 자동 포맷 depth 계약
+
+이번 수정은 첫 자식의 기존 출력에서 나머지 자식의 depth를 소급해 정하는 방식이 아니다.
+frame을 만드는 시점에 다음 계약을 먼저 고정한다.
+
+- owner가 depth `d`이면 frame body는 처음부터 `d + 1`이다.
+- 첫 자식이 owner와 같은 줄에 남는 compact 표현은 허용한다.
+- 첫 자식이 줄 시작 위치로 내려가면 첫 자식과 모든 직접 sibling은 `d + 1`이다.
+- `AND`/`OR`와 쉼표 뒤의 직접 자식도 같은 body depth를 사용한다.
+- 괄호와 블록처럼 명시적인 시작/종료가 있는 frame의 종료 구문은 시작 owner와 같은
+  depth `d`다. 한 줄 안에서 닫히는 compact frame에는 줄 시작 close 규칙을 적용하지 않는다.
+- `CREATE OR REPLACE`, `BETWEEN ... AND ...`, trigger event의 `OR`처럼 문법상 하나인 고정
+  구문은 sibling 목록으로 해석하지 않는다.
+
+따라서 다음과 같이 첫 조건까지 개행되는 경우에도 자식 정렬이 일관된다.
+
+AS-IS:
+
+```sql
+WHERE
+condition_a
+    AND condition_b
+    OR condition_c
+```
+
+TO-BE:
+
+```sql
+WHERE
+    condition_a
+    AND condition_b
+    OR condition_c
+```
+
+자식 전체가 owner와 같은 줄에 유지되는 다음 compact 표현은 그대로 허용한다.
+
+```sql
+WHERE condition_a
+LISTAGG(value, ',') WITHIN GROUP (ORDER BY key_a, key_b)
+```
+
+## 19-2. 조건 frame 전수 범위
+
+Oracle, MySQL, MariaDB별 fixture와 독립 syntax inventory에서 다음 조건 owner를 typed
+condition frame으로 검사한다.
+
+- 공통 query 조건: `WHERE`, `JOIN ... ON`, `HAVING`, non-CASE `WHEN`
+- 제어/반복 조건: `IF`, `ELSIF`, `WHILE`, `UNTIL`
+- Oracle 계열: `START WITH`, `CONNECT BY`, `QUALIFY`, `MATCH_RECOGNIZE ... DEFINE`,
+  conditional compilation의 `$IF`/`$ELSIF`
+- CASE 조건은 기존 CASE branch frame과 결합하고, `BETWEEN ... AND ...` 및 고정 phrase는
+  조건 sibling audit에서 제외한다.
+
+멀티라인 condition frame의 첫 줄 시작 자식과 이후 `AND`/`OR` sibling은 모두 frame을
+생성할 때 정한 owner+1을 사용한다.
+
+## 19-3. 여러 자식을 갖는 list frame 전수 범위
+
+쉼표가 나타나는 위치만 사후 보정하지 않고, 여러 직접 자식을 소유하는 구문을 다음 typed
+list frame 40종으로 분류했다.
+
+- query/list: `SELECT`, `FROM`, `SET`, `VALUES`, `GROUP BY`, `ORDER BY`, `WINDOW`,
+  `INTO`, `WITH`, `USING`, `RETURNING`
+- analytic/model/pattern: `PARTITION`, `DIMENSION`, `MEASURES`, model rules, `DEFINE`,
+  `SUBSET`, `SEARCH BY`, `CYCLE` columns
+- 괄호형 semantic list: 일반 직접 인자/식 목록, structured table arguments,
+  `JSON_TABLE`/`XMLTABLE` columns, `PIVOT` aggregates, structured column declarations
+- DML/DDL: delete/update targets, `FOR UPDATE OF`, trigger `UPDATE OF`, drop targets,
+  rename pairs, `ALTER` actions
+- 권한/관리: grant/revoke privileges와 grantees, lock tables, maintenance tables,
+  account targets, flashback targets
+- routine/vendor: handler conditions, diagnostics items, `DECLARE` names, `DO` expressions,
+  trigger `FOLLOWS`/`PRECEDES`
+
+예를 들어 compact 표현은 유지하되, 실제 줄 시작 자식은 owner+1로 정렬한다.
+
+```sql
+LISTAGG(value, ',') WITHIN GROUP (ORDER BY key_a, key_b)
+
+MAX(value) KEEP (
+    DENSE_RANK LAST ORDER BY (
+        SELECT sort_key
+        FROM source_table
+    ),
+        second_sort_key
+)
+```
+
+`WITH`의 sibling CTE, `COLUMNS`의 column 정의, MODEL/MATCH_RECOGNIZE section의 항목도
+같은 규칙을 사용한다. 세미콜론으로 연결되는 block statement, query set branch,
+`MERGE` branch, cursor SQL, `FORALL`, handler/control body, `INSERT ALL` 등은 쉼표 list가
+아니므로 기존 structural frame으로 관리하고 frame-kind inventory와 각 전용 레이아웃
+회귀로 검증한다.
+
+## 19-4. frame lifecycle 및 자동 이상 감지
+
+`formatting_sweep_all_files_generate_out_report`를 단순 멱등성/토큰 보존 검사에서 frame
+구조 감사까지 확장했다.
+
+- frame ID 중복, opener 없는 close, 중복 close, close-before-open, 명시적 frame 미종료
+- parent 누락/비포함, parent보다 늦게 닫히는 child
+- 줄 시작 첫 자식과 모든 직접 sibling의 body-depth 불일치
+- `AND`/`OR` 조건 sibling 및 쉼표 sibling의 owner 누락
+- semantic list와 일반 parenthesis direct-list의 typed ownership 누락
+- 줄 시작 괄호 close와 block/conditional-compilation 종료의 owner-depth 불일치
+- leading comment가 있는 첫 list item, multiline 첫 condition, nested frame 복귀 시 depth drift
+- production managed-frame enum 17종과 typed-list enum 40종이 테스트 inventory에서 모두
+  실제 생성되는지 확인
+
+이 감사의 핵심은 “모든 토큰을 list frame으로 만든다”가 아니다. 여러 직접 자식의 경계를
+가진 구문은 list/condition/structural frame 중 하나가 반드시 소유하고, `OR REPLACE` 같은
+단일 문법 phrase와 scalar token은 잘못된 자식 frame으로 만들지 않는 것이다.
+
+## 19-5. 전체 sweep 및 품질 게이트
+
+Oracle `test`, MySQL `test_mysql`, MariaDB `test_mariadb` 아래 모든 SQL/TXT fixture를
+다시 생성하고 감사했다.
+
+| 항목 | 결과 |
+| --- | ---: |
+| 전체 fixture | 61개 |
+| 검사 frame | 18,346개 |
+| 줄 시작 body item/sibling | 7,190개 |
+| 검사 close | 9,660개 |
+| production managed-frame kind | 17 / 17 |
+| typed list-owner kind 독립 inventory | 40 / 40 |
+| 실패 파일 / frame issue | 0 / 0 |
+
+최종 검증 결과는 다음과 같다.
+
+| 검증 | 결과 |
+| --- | --- |
+| `formatting_sweep_all_files_generate_out_report` | 1 통과, 61개 파일·issue 0 |
+| `cargo test --lib` | 6,532 통과·228 ignored·실패 0 |
+| 전체 `cargo test` | 모든 lib/binary/integration/guard/doc-test 실패 0 |
+| `cargo clippy --locked --all-targets -- -D warnings -W clippy::perf -W clippy::complexity` | 통과, 경고 0 |
+| `cargo fmt --all -- --check` | 통과 |

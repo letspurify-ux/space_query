@@ -3273,16 +3273,19 @@ fn format_sql_where_exists_and_not_exists_layout_regression() {
     let expected = [
         "SELECT *",
         "FROM asdf",
-        "WHERE EXISTS (",
+        "WHERE",
+        "    EXISTS (",
         "        SELECT 1",
         "        FROM oqt_t_order_item oi",
-        "        WHERE oi.order_id = v.order_id",
+        "        WHERE",
+        "            oi.order_id = v.order_id",
         "            AND oi.sku LIKE 'SKU-%'",
         "    )",
         "    AND NOT EXISTS (",
         "        SELECT 1",
         "        FROM oqt_t_order_item oi",
-        "        WHERE oi.order_id = v.order_id",
+        "        WHERE",
+        "            oi.order_id = v.order_id",
         "            AND oi.qty <= 0",
         "    );",
     ]
@@ -6145,14 +6148,14 @@ fn format_sql_formats_multi_cte_join_subquery_depth_consistently() {
     FROM emp e
     WHERE e.hiredate >= DATE '2010-01-01'
 ),
-dept_agg AS (
-    SELECT
-        eb.deptno,
-        COUNT(*) AS emp_cnt,
-        AVG (eb.sal) AS avg_sal
-    FROM emp_base eb
-    GROUP BY eb.deptno
-)
+    dept_agg AS (
+        SELECT
+            eb.deptno,
+            COUNT(*) AS emp_cnt,
+            AVG (eb.sal) AS avg_sal
+        FROM emp_base eb
+        GROUP BY eb.deptno
+    )
 SELECT
     d.deptno,
     d.dname,
@@ -6167,7 +6170,8 @@ SELECT
 FROM dept d
 JOIN dept_agg c
     ON c.deptno = d.deptno
-WHERE d.loc = 'SEOUL'
+WHERE
+    d.loc = 'SEOUL'
     AND c.emp_cnt > 3
 ORDER BY c.avg_sal DESC;"#;
 
@@ -6191,22 +6195,22 @@ fn format_sql_formats_multi_cte_with_comments_and_scalar_subquery_exactly() {
         deptno
     FROM oqt_t_emp
 ),
-d AS (
-    SELECT
-        deptno,
-        dname,
-        loc
-    FROM oqt_t_dept
-),
-stats AS (
-    SELECT
-        deptno,
-        COUNT(*) cnt,
-        AVG (sal) avg_sal,
-        SUM (NVL (comm, 0)) sum_comm
-    FROM e
-    GROUP BY deptno
-)
+    d AS (
+        SELECT
+            deptno,
+            dname,
+            loc
+        FROM oqt_t_dept
+    ),
+    stats AS (
+        SELECT
+            deptno,
+            COUNT(*) cnt,
+            AVG (sal) avg_sal,
+            SUM (NVL (comm, 0)) sum_comm
+        FROM e
+        GROUP BY deptno
+    )
 SELECT
     d.deptno,
     d.dname,
@@ -6246,22 +6250,22 @@ fn format_sql_cte_comment_layout_is_idempotent() {
         deptno
     FROM oqt_t_emp
 ),
-d AS (
-    SELECT
-        deptno,
-        dname,
-        loc
-    FROM oqt_t_dept
-),
-stats AS (
-    SELECT
-        deptno,
-        COUNT(*) cnt,
-        AVG (sal) avg_sal,
-        SUM (NVL (comm, 0)) sum_comm
-    FROM e
-    GROUP BY deptno
-)
+    d AS (
+        SELECT
+            deptno,
+            dname,
+            loc
+        FROM oqt_t_dept
+    ),
+    stats AS (
+        SELECT
+            deptno,
+            COUNT(*) cnt,
+            AVG (sal) avg_sal,
+            SUM (NVL (comm, 0)) sum_comm
+        FROM e
+        GROUP BY deptno
+    )
 SELECT
     d.deptno,
     d.dname,
@@ -6318,7 +6322,8 @@ fn format_sql_filtered_cte_with_window_function_exact_layout() {
     let expected = r#"filtered AS (
     SELECT *
     FROM enriched
-    WHERE (sal > (
+    WHERE
+        (sal > (
             SELECT AVG (sal)
             FROM oqt_t_emp
             WHERE deptno = enriched.deptno
@@ -8639,8 +8644,8 @@ FROM base_emp b
 
     assert_eq!(
         indent(lines[cte_idx]),
-        indent(lines[with_idx]),
-        "WITH FUNCTION CTE header should stay aligned with the WITH owner depth, got:\n{formatted}"
+        indent(lines[with_idx]).saturating_add(4),
+        "WITH FUNCTION CTE header should use the WITH owner+1 child depth, got:\n{formatted}"
     );
     assert_eq!(
         indent(lines[cte_select_idx]),
@@ -8901,11 +8906,13 @@ FROM a;"#;
         FROM (
                 SELECT 1
                 FROM employees e5
-                WHERE e5.manager_id = e.employee_id
+                WHERE
+                    e5.manager_id = e.employee_id
                     AND EXISTS (
                         SELECT 1
                         FROM employees e6
-                        WHERE e6.manager_id = e5.employee_id
+                        WHERE
+                            e6.manager_id = e5.employee_id
                             AND e6.salary > (
                                 SELECT PERCENTILE_CONT (0.75) WITHIN GROUP (ORDER BY salary)
                                 FROM employees e7
@@ -9160,7 +9167,8 @@ FROM a
 WHERE b IN (
         SELECT 1
         FROM a
-        WHERE b IN (
+        WHERE
+            b IN (
                 SELECT 1
                 FROM a
             )

@@ -8,6 +8,7 @@ This directory documents the current implementation. Start with the repository
 | Area | Document | Scope |
 | --- | --- | --- |
 | Editor | [Syntax highlighting](highlighting.md) | Lexer, incremental rehighlighting, UTF-8/style buffer |
+| Editor | [Auto-format rules](auto_format_rule.md) | Normative frame ownership, child depth, close, and audit contract |
 | Editor | [SQL formatting](formatting.md) | Structural depth, formatter state, verification principles |
 | Results | [Result UI](result_ui.md) | Result tabs, support panes, selection and close rules |
 | Sessions | [Session lifecycle](session.md) | Execution, cancellation, timeout, lazy fetch, physical-session decisions |

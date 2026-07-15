@@ -31275,7 +31275,8 @@ join b
         assert!(
             formatted.contains(
                 "JOIN b
-    ON ((1 = 1
+    ON
+        ((1 = 1
                 AND 2 = 2))
         AND 3 = 3;"
             ),
