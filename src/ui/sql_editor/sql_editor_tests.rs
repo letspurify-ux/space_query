@@ -2210,7 +2210,7 @@ BEGIN
 END;
 /
 "#;
-    let formatted = SqlEditorWidget::format_sql_basic(&input);
+    let formatted = SqlEditorWidget::format_sql_basic(input);
     let formatted_items = QueryExecutor::split_script_items(&formatted);
     let formatted_statements: Vec<&str> = formatted_items
         .iter()
@@ -2244,7 +2244,7 @@ SELECT 1 / 2 AS half
 FROM dual
 /
 "#;
-    let formatted = SqlEditorWidget::format_sql_basic(&input);
+    let formatted = SqlEditorWidget::format_sql_basic(input);
     let formatted_items = QueryExecutor::split_script_items(&formatted);
     let formatted_statements: Vec<&str> = formatted_items
         .iter()
