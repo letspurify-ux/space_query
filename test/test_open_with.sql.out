@@ -276,7 +276,7 @@ BEGIN
                     0
         )
         SELECT node_id,
-            LPAD (' ', ([[lvl]] - 1) * 2) || node_name AS tree_display,
+            LPAD (' ', (lvl - 1) * 2) || node_name AS tree_display,
             lvl,
             path_txt
         FROM r
@@ -345,7 +345,7 @@ BEGIN
         FROM jdocs jd
         CROSS JOIN JSON_TABLE (jd.payload,
             /* AN: root path */
-            '$' [[COLUMNS]] (
+            '$' COLUMNS (
                 -- [AO] 최상위 컬럼
                 order_id NUMBER PATH '$.order_id',
                 cust_name VARCHAR2 (100) PATH '$.customer.name',
@@ -360,7 +360,7 @@ BEGIN
         ) jt
         CROSS APPLY (
             -- [AS] item alias
-            [[SELECT]] jt.sku,
+            SELECT jt.sku,
                 jt.qty,
                 jt.price
             FROM DUAL
@@ -401,7 +401,7 @@ BEGIN
         FROM recent_orders o
         OUTER APPLY (
             /* AX: 주문별 집계 */
-            [[SELECT]] COUNT(*) AS item_cnt,
+            SELECT COUNT(*) AS item_cnt,
                 SUM (qty * unit_price) AS total_amt,
                 MAX(unit_price) AS max_price
             FROM qt_open_order_item oi
@@ -443,7 +443,7 @@ BEGIN
                         'MANAGER', 'ANALYST') THEN
                             CASE
                                 WHEN b.sal >= 3000 THEN 'HIGH'
-                                [[WHEN]] b.sal >= /* BD: mid 기준 */
+                                WHEN b.sal >= /* BD: mid 기준 */
                                     2000 THEN 'MID'
                                 ELSE 'LOW'
                             END
@@ -573,12 +573,7 @@ END;
 -- db: Oracle
 -- metadata: test Oracle inferred catalog (file-scoped overlay) + Oracle built-ins
 -- checked: 771
--- missing: 5
+-- missing: 0
 -- marker: [[word]] means not suggested for the tested prefix
--- missing tokens:
---   279:25 word=lvl prefix=lv suggestions=[] total=0 line=LPAD (' ', (lvl - 1) * 2) || node_name AS tree_display,
---   348:17 word=COLUMNS prefix=COLU suggestions=[] total=0 line='$' COLUMNS (
---   363:13 word=SELECT prefix=SELE suggestions=[] total=0 line=SELECT jt.sku,
---   404:13 word=SELECT prefix=SELE suggestions=[] total=0 line=SELECT COUNT(*) AS item_cnt,
---   446:33 word=WHEN prefix=WHE suggestions=[WHERE] total=1 line=WHEN b.sal >= /* BD: mid 기준 */
+-- missing tokens: none
 -- =========================================================

@@ -8,15 +8,25 @@ FROM (
         SELECT e.deptno,
             e.job
         FROM (
-                SELECT 10 AS deptno, 'CLERK' AS job FROM dual
+                SELECT 10 AS deptno,
+                    'CLERK' AS job
+                FROM DUAL
                 UNION ALL
-                SELECT 10, 'MANAGER' FROM dual
+                SELECT 10,
+                    'MANAGER'
+                FROM DUAL
                 UNION ALL
-                SELECT 20, 'ANALYST' FROM dual
+                SELECT 20,
+                    'ANALYST'
+                FROM DUAL
                 UNION ALL
-                SELECT 30, 'SALESMAN' FROM dual
+                SELECT 30,
+                    'SALESMAN'
+                FROM DUAL
                 UNION ALL
-                SELECT 10, 'PRESIDENT' FROM dual
+                SELECT 10,
+                    'PRESIDENT'
+                FROM DUAL
             ) e
     )
 PIVOT (

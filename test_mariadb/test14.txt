@@ -1,0 +1,213 @@
+-- ==========================================================================
+-- SPACE QUERY MARIADB SINGLE-STATEMENT FORMATTER FINAL BOSS VI
+-- Target: MariaDB 12.2+ (live certification uses MariaDB 12.2.2)
+-- A repeatable, side-effect-free statement covering recursive CYCLE, nested
+-- JSON_TABLE paths, dynamic columns, percentile windows, ordered/limited
+-- aggregates, INTERSECT ALL/EXCEPT ALL, INET6, and deep frame recovery.
+-- ==========================================================================
+WITH RECURSIVE
+policies AS(
+SELECT JSON_OBJECT(
+'range',JSON_OBJECT('start','2026-07-10','days',5),
+'limits',JSON_OBJECT('duration',35,'failures',4),
+'required',JSON_ARRAY('critical','quality')
+)AS config
+),
+params AS(
+SELECT
+CAST(JSON_VALUE(config,'$.range.start')AS DATE)AS start_day,
+CAST(JSON_VALUE(config,'$.range.days')AS UNSIGNED)AS day_count,
+CAST(JSON_VALUE(config,'$.limits.duration')AS DECIMAL(10,2))AS duration_limit,
+CAST(JSON_VALUE(config,'$.limits.failures')AS UNSIGNED)AS failure_limit,
+config
+FROM policies
+),
+calendar(day_no,day_value)AS(
+SELECT 0,start_day FROM params
+UNION ALL
+SELECT c.day_no+1,c.day_value+INTERVAL 1 DAY
+FROM calendar c JOIN params p ON TRUE
+WHERE c.day_no+1<p.day_count
+),
+agents(agent_id,parent_agent_id,agent_name,active_flag,properties,host_addr)AS(
+SELECT 1,NULL,'Aurora Router',TRUE,COLUMN_CREATE('tier','gold','weight',10),INET6_ATON('2001:db8:1::1')UNION ALL
+SELECT 2,1,'Bluebird Worker',TRUE,COLUMN_CREATE('tier','silver','weight',7),INET6_ATON('2001:db8:1::2')UNION ALL
+SELECT 3,1,'Cobalt Auditor',TRUE,COLUMN_CREATE('tier','gold','weight',9),INET6_ATON('2001:db8:1::3')UNION ALL
+SELECT 4,2,'Dormant Probe',FALSE,COLUMN_CREATE('tier','bronze','weight',3),INET6_ATON('2001:db8:1::4')
+),
+agent_tree(agent_id,parent_agent_id,agent_path,tree_depth)AS(
+SELECT agent_id,parent_agent_id,CAST(REGEXP_REPLACE(UPPER(agent_name),'[^A-Z0-9]+','_')AS CHAR(400)),0
+FROM agents
+WHERE parent_agent_id IS NULL
+UNION ALL
+SELECT a.agent_id,a.parent_agent_id,
+CONCAT(t.agent_path,'/',REGEXP_REPLACE(UPPER(a.agent_name),'[^A-Z0-9]+','_')),
+t.tree_depth+1
+FROM agents a
+JOIN agent_tree t ON t.agent_id=a.parent_agent_id
+)
+CYCLE agent_id RESTRICT,
+executions(execution_id,agent_id,executed_on,payload)AS(
+SELECT 101,1,DATE'2026-07-10',JSON_OBJECT('source','api','measures',JSON_ARRAY(
+JSON_OBJECT('name','duration','value',11,'unit','ms','labels',JSON_ARRAY('critical','fast')),
+JSON_OBJECT('name','failures','value',1,'unit','count','labels',JSON_ARRAY('quality'))
+))UNION ALL
+SELECT 102,1,DATE'2026-07-13',JSON_OBJECT('source','batch','measures',JSON_ARRAY(
+JSON_OBJECT('name','duration','value',17,'unit','ms','labels',JSON_ARRAY('stable')),
+JSON_OBJECT('name','failures','value',0,'unit','count','labels',JSON_ARRAY('critical','quality'))
+))UNION ALL
+SELECT 201,2,DATE'2026-07-11',JSON_OBJECT('source','edge','measures',JSON_ARRAY(
+JSON_OBJECT('name','duration','value',27,'unit','ms','labels',JSON_ARRAY('critical')),
+JSON_OBJECT('name','failures','value',2,'unit','count','labels',JSON_ARRAY('quality'))
+))UNION ALL
+SELECT 301,3,DATE'2026-07-12',JSON_OBJECT('source','stream','measures',JSON_ARRAY(
+JSON_OBJECT('name','duration','value',41,'unit','ms','labels',JSON_ARRAY('incident')),
+JSON_OBJECT('name','failures','value',5,'unit','count','labels',JSON_ARRAY('critical','quality'))
+))UNION ALL
+SELECT 302,3,DATE'2026-07-14',JSON_OBJECT('source','replay','measures',JSON_ARRAY(
+JSON_OBJECT('name','duration','value',19,'unit','ms','labels',JSON_ARRAY('recovery')),
+JSON_OBJECT('name','failures','value',1,'unit','count','labels',JSON_ARRAY('quality'))
+))
+),
+measure_rows AS(
+SELECT e.execution_id,e.agent_id,e.executed_on,j.source_code,j.measure_no,
+j.measure_name,j.measure_value,j.measure_unit,j.has_labels,j.label_no,j.label_value
+FROM executions e
+JOIN JSON_TABLE(
+e.payload,'$'
+COLUMNS(
+source_code VARCHAR(30)PATH'$.source'DEFAULT'unknown'ON EMPTY,
+NESTED PATH'$.measures[*]'
+COLUMNS(
+measure_no FOR ORDINALITY,
+measure_name VARCHAR(30)PATH'$.name'ERROR ON ERROR,
+measure_value DECIMAL(12,2)PATH'$.value'DEFAULT 0 ON EMPTY DEFAULT 0 ON ERROR,
+measure_unit VARCHAR(20)PATH'$.unit'NULL ON EMPTY,
+has_labels INT EXISTS PATH'$.labels',
+NESTED PATH'$.labels[*]'
+COLUMNS(
+label_no FOR ORDINALITY,
+label_value VARCHAR(30)PATH'$'NULL ON ERROR
+)
+)
+)
+)AS j ON TRUE
+),
+measure_base AS(
+SELECT execution_id,agent_id,executed_on,MAX(source_code)AS source_code,
+measure_name,MAX(measure_value)AS measure_value,MAX(measure_unit)AS measure_unit,
+MAX(has_labels)AS has_labels
+FROM measure_rows
+GROUP BY execution_id,agent_id,executed_on,measure_name
+),
+execution_facts AS(
+SELECT execution_id,agent_id,executed_on,MAX(source_code)AS source_code,
+MAX(IF(measure_name='duration',measure_value,NULL))AS duration_ms,
+MAX(IF(measure_name='failures',measure_value,NULL))AS failure_count,
+SUM(has_labels)AS labeled_measure_count
+FROM measure_base
+GROUP BY execution_id,agent_id,executed_on
+),
+daily AS(
+SELECT a.agent_id,c.day_no,c.day_value,
+IFNULL(AVG(f.duration_ms),0)AS average_duration,
+IFNULL(SUM(f.failure_count),0)AS failure_count,
+COUNT(f.execution_id)AS execution_count
+FROM agents a
+CROSS JOIN calendar c
+LEFT JOIN execution_facts f
+ON f.agent_id=a.agent_id
+AND f.executed_on=c.day_value
+GROUP BY a.agent_id,c.day_no,c.day_value
+),
+analytic_daily AS(
+SELECT d.*,
+SUM(failure_count)OVER w_running AS running_failures,
+FIRST_VALUE(average_duration)OVER w_full AS first_duration,
+LAST_VALUE(average_duration)OVER w_full AS last_duration,
+NTH_VALUE(average_duration,2)OVER w_full AS second_duration,
+PERCENT_RANK()OVER w_rank AS duration_percent_rank
+FROM daily d
+WINDOW
+w_partition AS(PARTITION BY agent_id),
+w_order AS(w_partition ORDER BY day_no),
+w_running AS(w_order ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW),
+w_full AS(w_order ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING),
+w_rank AS(w_partition ORDER BY average_duration,day_no)
+),
+percentiles AS(
+SELECT DISTINCT agent_id,
+PERCENTILE_CONT(0.5)WITHIN GROUP(ORDER BY duration_ms)OVER(PARTITION BY agent_id)AS median_duration,
+PERCENTILE_DISC(0.5)WITHIN GROUP(ORDER BY duration_ms)OVER(PARTITION BY agent_id)AS discrete_duration
+FROM execution_facts
+),
+eligible(agent_id)AS(
+(SELECT agent_id FROM agents WHERE active_flag IS TRUE)
+INTERSECT ALL
+(SELECT agent_id FROM execution_facts WHERE duration_ms<50)
+EXCEPT ALL
+(SELECT f.agent_id FROM execution_facts f JOIN params p ON f.failure_count>p.failure_limit*3)
+),
+agent_rollup AS(
+SELECT f.agent_id,COUNT(*)AS execution_count,SUM(f.failure_count)AS total_failures,
+ROUND(AVG(f.duration_ms),2)AS average_duration,
+GROUP_CONCAT(DISTINCT f.source_code ORDER BY f.source_code SEPARATOR','LIMIT 4)AS source_list,
+JSON_ARRAYAGG(JSON_OBJECT(
+'execution',f.execution_id,
+'day',DATE_FORMAT(f.executed_on,'%Y-%m-%d'),
+'source',f.source_code,
+'duration',f.duration_ms,
+'failures',f.failure_count
+)ORDER BY f.executed_on,f.execution_id LIMIT 10)AS execution_json
+FROM execution_facts f
+GROUP BY f.agent_id
+),
+final_rows AS(
+SELECT a.agent_id,a.agent_name,a.active_flag,t.agent_path,t.tree_depth,
+COLUMN_GET(a.properties,'tier'AS CHAR)AS tier_code,
+COLUMN_GET(a.properties,'weight'AS UNSIGNED)AS weight_value,
+INET6_NTOA(a.host_addr)AS host_text,
+IFNULL(r.execution_count,0)AS execution_count,
+IFNULL(r.total_failures,0)AS total_failures,
+IFNULL(r.average_duration,0)AS average_duration,r.source_list,r.execution_json,
+CASE WHEN e.agent_id IS NULL THEN'INELIGIBLE'ELSE'ELIGIBLE'END AS eligibility,
+p.median_duration,p.discrete_duration,
+(SELECT MAX(d.running_failures)FROM analytic_daily d WHERE d.agent_id=a.agent_id)AS peak_running_failures,
+(SELECT JSON_ARRAYAGG(m.label_value ORDER BY m.execution_id,m.measure_no,m.label_no LIMIT 30)FROM measure_rows m WHERE m.agent_id=a.agent_id)AS labels_json
+FROM agents a
+JOIN agent_tree t ON t.agent_id=a.agent_id
+LEFT JOIN agent_rollup r ON r.agent_id=a.agent_id
+LEFT JOIN(SELECT DISTINCT agent_id FROM eligible)AS e ON e.agent_id=a.agent_id
+LEFT JOIN percentiles p ON p.agent_id=a.agent_id
+)
+SELECT
+CASE
+WHEN(SELECT COUNT(*)FROM calendar)=5
+AND(SELECT COUNT(*)FROM agent_tree)=4
+AND(SELECT COUNT(*)FROM executions)=5
+AND(SELECT COUNT(*)FROM measure_base)=10
+AND(SELECT SUM(failure_count)FROM execution_facts)=9
+AND(SELECT COUNT(*)FROM agents WHERE COLUMN_CHECK(properties)=1)=4
+AND JSON_EXISTS((SELECT config FROM policies),'$.required[1]')=1
+THEN'PASS'ELSE'FAIL'END AS status,
+f.agent_id,f.agent_name,f.active_flag,f.tree_depth,f.tier_code,f.weight_value,
+f.host_text,f.execution_count,f.total_failures,f.average_duration,f.eligibility,
+f.median_duration,f.discrete_duration,f.peak_running_failures,f.source_list,
+JSON_NORMALIZE(JSON_OBJECT(
+'path',f.agent_path,
+'executions',f.execution_json,
+'labels',f.labels_json,
+'properties',COLUMN_JSON((SELECT properties FROM agents a WHERE a.agent_id=f.agent_id)),
+'checks',JSON_OBJECT(
+'host_ok',f.host_text LIKE'2001:db8:1:%',
+'name_fragment',REGEXP_SUBSTR(f.agent_name,'^[A-Za-z]+'),
+'has_critical',JSON_OVERLAPS(IFNULL(f.labels_json,JSON_ARRAY()),JSON_ARRAY('critical')),
+'within_duration',f.average_duration<=(SELECT duration_limit FROM params)
+),
+'all_labels',(
+SELECT COUNT(*)
+FROM measure_rows
+)
+))AS evidence
+FROM final_rows f
+ORDER BY f.agent_id;

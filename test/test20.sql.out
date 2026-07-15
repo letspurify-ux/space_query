@@ -407,7 +407,7 @@ IS
         p_commit_each  NUMBER DEFAULT 0
     )
     IS
-        TYPE t_stage_tab IS TABLE OF [[qt_fb_stage]]%ROWTYPE INDEX BY PLS_INTEGER;
+        TYPE t_stage_tab IS TABLE OF qt_fb_stage%ROWTYPE INDEX BY PLS_INTEGER;
 
         v_stage_tab      t_stage_tab;
         v_sql            CLOB;
@@ -493,7 +493,7 @@ IS
     PROCEDURE run_dynamic_report
     (
         p_dept_id       NUMBER,
-        p_status        VARCHAR2 DEFAULT [[NULL]],
+        p_status        VARCHAR2 DEFAULT NULL,
         p_result_count  OUT NUMBER
     )
     IS
@@ -586,7 +586,7 @@ IS
                        e.salary,
                        ROW_NUMBER() OVER (ORDER BY e.salary DESC, e.emp_id) AS rn
                   FROM qt_fb_emp e
-                 WHERE e.dept_id IN (SELECT [[COLUMN_VALUE]] FROM TABLE([[sys]].odcinumberlist(20,30)))
+                 WHERE e.dept_id IN (SELECT COLUMN_VALUE FROM TABLE(sys.odcinumberlist(20,30)))
             )
             SELECT emp_id, emp_name, salary
               FROM x
@@ -1096,11 +1096,7 @@ SELECT audit_id, module_name, action_name, SUBSTR(message_text, 1, 120) AS msg_p
 -- db: Oracle
 -- metadata: test Oracle inferred catalog (file-scoped overlay) + Oracle built-ins
 -- checked: 1424
--- missing: 4
+-- missing: 0
 -- marker: [[word]] means not suggested for the tested prefix
--- missing tokens:
---   410:38 word=qt_fb_stage prefix=qt_f suggestions=[qt_fb_obj, qt_fb_obj_tab] total=2 line=TYPE t_stage_tab IS TABLE OF qt_fb_stage%ROWTYPE INDEX BY PLS_INTEGER;
---   496:42 word=NULL prefix=NUL suggestions=[] total=0 line=p_status        VARCHAR2 DEFAULT NULL,
---   589:45 word=COLUMN_VALUE prefix=COLU suggestions=[COLUMN] total=1 line=WHERE e.dept_id IN (SELECT COLUMN_VALUE FROM TABLE(sys.odcinumberlist(20,30)))
---   589:69 word=sys prefix=sy suggestions=[SYS_REFCURSOR, SYSDATE, SYSTIMESTAMP, SYS_CONNECT_BY_PATH, SYS_CONTEXT(), SYS_GUID(), SYS_TYPEID()] total=7 line=WHERE e.dept_id IN (SELECT COLUMN_VALUE FROM TABLE(sys.odcinumberlist(20,30)))
+-- missing tokens: none
 -- =========================================================

@@ -165,10 +165,10 @@ top_line.top_sku,top_line.top_amount,
 (SELECT LISTAGG(lt.tag_value,',')WITHIN GROUP(ORDER BY lt.order_id,lt.line_no,lt.tag_no)FROM line_tags lt WHERE lt.customer_id=c.customer_id)AS tag_list,
 XMLSERIALIZE(CONTENT XMLELEMENT("customer",c.customer_name)AS VARCHAR2(200))AS customer_xml
 FROM customers c
-JOIN customer_tree t [[ON]] t.customer_id=c.customer_id
-LEFT JOIN customer_rollup r [[ON]] r.customer_id=c.customer_id
-LEFT JOIN status_pivot p [[ON]] p.customer_id=c.customer_id
-LEFT JOIN eligible e [[ON]] e.customer_id=c.customer_id
+JOIN customer_tree t ON t.customer_id=c.customer_id
+LEFT JOIN customer_rollup r ON r.customer_id=c.customer_id
+LEFT JOIN status_pivot p ON p.customer_id=c.customer_id
+LEFT JOIN eligible e ON e.customer_id=c.customer_id
 OUTER APPLY(
 SELECT
 MAX(li.sku)KEEP(DENSE_RANK FIRST ORDER BY li.net_amount DESC,li.order_id,li.line_no)AS top_sku,
@@ -215,11 +215,7 @@ ORDER BY f.customer_id;
 -- db: Oracle
 -- metadata: test Oracle inferred catalog (file-scoped overlay) + Oracle built-ins
 -- checked: 576
--- missing: 4
+-- missing: 0
 -- marker: [[word]] means not suggested for the tested prefix
--- missing tokens:
---   168:22 word=ON prefix=O suggestions=[OR, orders, order_facts, order_count, order_status, order_total] total=6 line=JOIN customer_tree t ON t.customer_id=c.customer_id
---   169:29 word=ON prefix=O suggestions=[OR, orders, order_facts, order_count, order_status, order_total] total=6 line=LEFT JOIN customer_rollup r ON r.customer_id=c.customer_id
---   170:26 word=ON prefix=O suggestions=[OR, orders, order_facts, order_count, order_status, order_total] total=6 line=LEFT JOIN status_pivot p ON p.customer_id=c.customer_id
---   171:22 word=ON prefix=O suggestions=[OR, orders, order_facts, order_count, order_status, order_total] total=6 line=LEFT JOIN eligible e ON e.customer_id=c.customer_id
+-- missing tokens: none
 -- =========================================================

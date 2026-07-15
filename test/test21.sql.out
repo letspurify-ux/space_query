@@ -55,7 +55,7 @@ BEGIN
              END
     )
     LOOP
-        [[BEGIN]]
+        BEGIN
             IF r.object_type = 'TRIGGER' THEN
                 EXECUTE IMMEDIATE 'DROP TRIGGER ' || r.object_name;
             ELSIF r.object_type = 'VIEW' THEN
@@ -78,7 +78,7 @@ BEGIN
                 NULL;
         END;
     END LOOP;
-[[END]];
+END;
 /
 --------------------------------------------------------------------------------
 -- 1. BASE TABLES
@@ -554,7 +554,7 @@ IS
         p_commit_interval NUMBER DEFAULT 0
     )
     IS
-        TYPE t_stage_tab IS TABLE OF [[qt_x_stage]]%ROWTYPE INDEX BY PLS_INTEGER;
+        TYPE t_stage_tab IS TABLE OF qt_x_stage%ROWTYPE INDEX BY PLS_INTEGER;
         v_stage_tab        t_stage_tab;
         v_sql              CLOB;
         v_i                PLS_INTEGER;
@@ -849,8 +849,8 @@ END;
                   FROM qt_x_emp e
                  WHERE e.dept_id IN
                  (
-                     SELECT [[COLUMN_VALUE]]
-                       FROM TABLE([[sys]].odcinumberlist(20, 30))
+                     SELECT COLUMN_VALUE
+                       FROM TABLE(sys.odcinumberlist(20, 30))
                  )
             )
             SELECT emp_id, emp_name, salary, bonus
@@ -1537,12 +1537,7 @@ SELECT err_id,
 -- db: Oracle
 -- metadata: test Oracle inferred catalog (file-scoped overlay) + Oracle built-ins
 -- checked: 1782
--- missing: 5
+-- missing: 0
 -- marker: [[word]] means not suggested for the tested prefix
--- missing tokens:
---   58:9 word=BEGIN prefix=BEGI suggestions=[] total=0 line=BEGIN
---   81:1 word=END prefix=EN suggestions=[] total=0 line=END;
---   557:38 word=qt_x_stage prefix=qt_x suggestions=[qt_x_nested_tab, qt_x_obj, qt_x_obj_tab] total=3 line=TYPE t_stage_tab IS TABLE OF qt_x_stage%ROWTYPE INDEX BY PLS_INTEGER;
---   852:29 word=COLUMN_VALUE prefix=COLU suggestions=[COLUMN] total=1 line=SELECT COLUMN_VALUE
---   853:35 word=sys prefix=sy suggestions=[SYS_REFCURSOR, SYSDATE, SYSTIMESTAMP, SYS_CONNECT_BY_PATH, SYS_CONTEXT(), SYS_GUID(), SYS_TYPEID()] total=7 line=FROM TABLE(sys.odcinumberlist(20, 30))
+-- missing tokens: none
 -- =========================================================

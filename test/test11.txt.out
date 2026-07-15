@@ -343,7 +343,7 @@ CREATE OR REPLACE PACKAGE BODY qt_torture_pkg IS
             WHERE dept_id = cp_dept_id
             ORDER BY emp_id
             FOR
-            UPDATE [[OF]] salary SKIP LOCKED;
+            UPDATE OF salary SKIP LOCKED;
         BEGIN
             g_run_id := g_run_id + 1;
             AUDIT ('qt_torture_pkg', 'complex_block.begin', 'run=' || g_run_id || '; dept=' || p_dept_id || '; mode=' || l_mode);
@@ -1021,8 +1021,7 @@ FROM qt_audit_log;
 -- db: Oracle
 -- metadata: test Oracle inferred catalog (file-scoped overlay) + Oracle built-ins
 -- checked: 1758
--- missing: 1
+-- missing: 0
 -- marker: [[word]] means not suggested for the tested prefix
--- missing tokens:
---   346:20 word=OF prefix=O suggestions=[OR] total=1 line=UPDATE OF salary SKIP LOCKED;
+-- missing tokens: none
 -- =========================================================

@@ -454,7 +454,7 @@ AS
         p_region_cd  IN VARCHAR2
     )
         RETURN SYS_REFCURSOR
-    [[AS]]
+    AS
         l_rc   SYS_REFCURSOR;
     BEGIN
         OPEN l_rc FOR
@@ -484,7 +484,7 @@ AS
                                                (
                                                    SELECT COUNT(*)
                                                    FROM qt_fmt_bonus b
-                                                   WHERE b.emp_id = [[e]].emp_id
+                                                   WHERE b.emp_id = e.emp_id
                                                )
                                 ) depth_row
                             ) AS bonus_depth,
@@ -588,7 +588,7 @@ AS
     (
         p_bonus_year IN NUMBER
     )
-    [[AS]]
+    AS
         l_sql   CLOB;
     BEGIN
         l_sql :=
@@ -634,7 +634,7 @@ WHEN NOT MATCHED THEN
 
         EXECUTE IMMEDIATE l_sql USING p_bonus_year;
     END run_dynamic_merge;
-END [[qt_fmt_pkg]];
+END qt_fmt_pkg;
 /
 
 --------------------------------------------------------------------------------
@@ -712,7 +712,7 @@ WITH
              XMLTABLE
              (
                  '/emp/flags/flag'
-                 PASSING e.[[xml_doc]]
+                 PASSING e.xml_doc
                  COLUMNS flag_txt VARCHAR2(100) PATH '.'
              ) xt
     ),
@@ -726,9 +726,9 @@ WITH
                MAX(j.remote_yn) AS remote_yn
         FROM ebase e
         LEFT JOIN ej j
-          ON j.[[emp_id]] = e.[[emp_id]]
+          ON j.emp_id = e.emp_id
         LEFT JOIN ex x
-          ON x.[[emp_id]] = e.[[emp_id]]
+          ON x.emp_id = e.emp_id
         GROUP BY e.emp_id
     )
 SELECT
@@ -762,12 +762,12 @@ FROM
            (
                SELECT SUM(b.amount)
                FROM qt_fmt_bonus b
-               WHERE b.emp_id = e.[[emp_id]]
+               WHERE b.emp_id = e.emp_id
                  AND b.bonus_year = 2024
            ) AS bonus_sum,
            DENSE_RANK() OVER
            (
-               PARTITION BY e.[[dept_id]]
+               PARTITION BY e.dept_id
                ORDER BY
                    (
                        SELECT SUM(b2.amount)
@@ -799,23 +799,23 @@ FROM
                FROM TABLE(qt_fmt_pkg.get_pairs(e.emp_id)) t
            ) AS pair_payload,
            CASE
-               WHEN e.[[salary]] >= 100000
+               WHEN e.salary >= 100000
                     AND EXISTS
                         (
                             SELECT 1
                             FROM qt_fmt_bonus bx
-                            WHERE bx.emp_id = e.[[emp_id]]
+                            WHERE bx.emp_id = e.emp_id
                               AND bx.amount >= 10000
                         ) THEN
                    CASE
-                       WHEN a.[[grade]] = 'A' THEN 'ELITE_A'
-                       WHEN a.[[grade]] = 'B' THEN 'ELITE_B'
+                       WHEN a.grade = 'A' THEN 'ELITE_A'
+                       WHEN a.grade = 'B' THEN 'ELITE_B'
                        ELSE 'ELITE_OTHER'
                    END
-               WHEN e.[[salary]] >= 80000 THEN
+               WHEN e.salary >= 80000 THEN
                    CASE
-                       WHEN a.[[remote_yn]] = 'true' THEN 'MID_REMOTE'
-                       WHEN a.[[remote_yn]] = 'false' THEN 'MID_OFFICE'
+                       WHEN a.remote_yn = 'true' THEN 'MID_REMOTE'
+                       WHEN a.remote_yn = 'false' THEN 'MID_OFFICE'
                        ELSE 'MID_UNKNOWN'
                    END
                ELSE
@@ -824,7 +824,7 @@ FROM
                             (
                                 SELECT 1
                                 FROM qt_fmt_bonus byy
-                                WHERE byy.emp_id = e.[[emp_id]]
+                                WHERE byy.emp_id = e.emp_id
                                   AND byy.bonus_type IN ('SPOT', 'STOCK')
                             ) THEN 'LOW_SPECIAL'
                        ELSE 'LOW_BASIC'
@@ -832,11 +832,11 @@ FROM
            END AS deep_case_label
     FROM ebase e
     JOIN qt_fmt_dept d
-      ON d.dept_id = e.[[dept_id]]
-    LEFT JOIN [[r]]
-      ON [[r]].[[dept_id]] = d.dept_id
+      ON d.dept_id = e.dept_id
+    LEFT JOIN r
+      ON r.dept_id = d.dept_id
     LEFT JOIN agg a
-      ON a.[[emp_id]] = e.emp_id
+      ON a.emp_id = e.emp_id
 ) q
 ORDER BY
        CASE
@@ -927,7 +927,7 @@ SELECT
        MAX(CASE WHEN bu.metric_name = 'BASE_AMT'  THEN bu.metric_value END) AS max_base_amt,
        MAX(CASE WHEN bu.metric_name = 'SPOT_AMT'  THEN bu.metric_value END) AS max_spot_amt,
        MAX(CASE WHEN bu.metric_name = 'STOCK_AMT' THEN bu.metric_value END) AS max_stock_amt
-FROM [[qt_fmt_emp]] e
+FROM qt_fmt_emp e
 LEFT JOIN salary_model sm
   ON sm.emp_id = e.emp_id
 LEFT JOIN bonus_unpivoted bu
@@ -964,7 +964,7 @@ FROM qt_fmt_emp e
          WHERE b.emp_id = e.emp_id
          ORDER BY b.amount DESC NULLS LAST, b.bonus_type
          FETCH FIRST 1 ROW ONLY
-     ) [[x]]
+     ) x
      OUTER APPLY
      (
          SELECT COUNT(*)      AS skill_cnt,
@@ -1079,7 +1079,7 @@ UPDATE qt_fmt_emp e
        e.job_title =
        CASE
            WHEN e.job_title LIKE '%Engineer%' AND e.status_cd = 'ACTIVE' THEN e.job_title || ' / Core'
-           [[WHEN]] e.status_cd = 'LEAVE' THEN e.job_title || ' / On Leave'
+           WHEN e.status_cd = 'LEAVE' THEN e.job_title || ' / On Leave'
            ELSE e.job_title
        END
  WHERE e.emp_id IN
@@ -1291,8 +1291,8 @@ SELECT
                     WHERE b.emp_id = v.emp_id
                       AND b.bonus_year IN
                           (
-                              SELECT y.[[column_value]]
-                              FROM TABLE([[sys]].odcinumberlist(2024, 2025)) y
+                              SELECT y.column_value
+                              FROM TABLE(sys.odcinumberlist(2024, 2025)) y
                           )
                 ) THEN
                (
@@ -1342,37 +1342,8 @@ ORDER BY a.audit_id;
 -- source: test/oracle_format_final_boss_v2.sql
 -- db: Oracle
 -- metadata: test Oracle inferred catalog (file-scoped overlay) + Oracle built-ins
--- checked: 1935
--- missing: 29
+-- checked: 1927
+-- missing: 0
 -- marker: [[word]] means not suggested for the tested prefix
--- missing tokens:
---   457:5 word=AS prefix=A suggestions=[AND] total=1 line=AS
---   487:69 word=e prefix=e suggestions=[END, emp_id, EXISTS, EMPTY_BLOB(), EMPTY_CLOB(), EXISTSNODE(), EXP(), EXTRACT(), EXTRACTVALUE()] total=9 line=WHERE b.emp_id = e.emp_id
---   591:5 word=AS prefix=A suggestions=[AND, AT] total=2 line=AS
---   637:5 word=qt_fmt_pkg prefix=qt_f suggestions=[] total=0 line=END qt_fmt_pkg;
---   715:28 word=xml_doc prefix=xml_ suggestions=[] total=0 line=PASSING e.xml_doc
---   729:16 word=emp_id prefix=emp_ suggestions=[] total=0 line=ON j.emp_id = e.emp_id
---   729:27 word=emp_id prefix=emp_ suggestions=[] total=0 line=ON j.emp_id = e.emp_id
---   731:16 word=emp_id prefix=emp_ suggestions=[] total=0 line=ON x.emp_id = e.emp_id
---   731:27 word=emp_id prefix=emp_ suggestions=[] total=0 line=ON x.emp_id = e.emp_id
---   765:35 word=emp_id prefix=emp_ suggestions=[] total=0 line=WHERE b.emp_id = e.emp_id
---   770:31 word=dept_id prefix=dept suggestions=[] total=0 line=PARTITION BY e.dept_id
---   802:23 word=salary prefix=sala suggestions=[] total=0 line=WHEN e.salary >= 100000
---   807:49 word=emp_id prefix=emp_ suggestions=[] total=0 line=WHERE bx.emp_id = e.emp_id
---   811:31 word=grade prefix=grad suggestions=[] total=0 line=WHEN a.grade = 'A' THEN 'ELITE_A'
---   812:31 word=grade prefix=grad suggestions=[] total=0 line=WHEN a.grade = 'B' THEN 'ELITE_B'
---   815:23 word=salary prefix=sala suggestions=[] total=0 line=WHEN e.salary >= 80000 THEN
---   817:31 word=remote_yn prefix=remo suggestions=[] total=0 line=WHEN a.remote_yn = 'true' THEN 'MID_REMOTE'
---   818:31 word=remote_yn prefix=remo suggestions=[] total=0 line=WHEN a.remote_yn = 'false' THEN 'MID_OFFICE'
---   827:54 word=emp_id prefix=emp_ suggestions=[] total=0 line=WHERE byy.emp_id = e.emp_id
---   835:24 word=dept_id prefix=dept suggestions=[] total=0 line=ON d.dept_id = e.dept_id
---   836:15 word=r prefix=r suggestions=[] total=0 line=LEFT JOIN r
---   837:10 word=r prefix=r suggestions=[region_cd, RANK, REF, REPLACE, REVERSE, ROWID, ROWNUM, ROW_NUMBER, RATIO_TO_REPORT(), RAWTOHEX(), REFTOHEX(), REGEXP_COUNT(), REGEXP_INSTR(), REGEXP_LIKE(), REGEXP_REPLACE(), REGEXP_SUBSTR()] total=30 line=ON r.dept_id = d.dept_id
---   837:12 word=dept_id prefix=dept suggestions=[] total=0 line=ON r.dept_id = d.dept_id
---   839:12 word=emp_id prefix=emp_ suggestions=[] total=0 line=ON a.emp_id = e.emp_id
---   930:6 word=qt_fmt_emp prefix=qt_f suggestions=[] total=0 line=FROM qt_fmt_emp e
---   967:8 word=x prefix=x suggestions=[] total=0 line=) x
---   1082:12 word=WHEN prefix=WHE suggestions=[WHERE] total=1 line=WHEN e.status_cd = 'LEAVE' THEN e.job_title || ' / On Leave'
---   1294:40 word=column_value prefix=colu suggestions=[] total=0 line=SELECT y.column_value
---   1295:42 word=sys prefix=sy suggestions=[SYS_REFCURSOR, SYSDATE, SYSTIMESTAMP, SYS_CONNECT_BY_PATH, SYS_CONTEXT(), SYS_GUID(), SYS_TYPEID()] total=7 line=FROM TABLE(sys.odcinumberlist(2024, 2025)) y
+-- missing tokens: none
 -- =========================================================

@@ -134,7 +134,7 @@ GROUP BY GROUPING SETS(
 account_rollup(account_id,event_count,revenue_amount,cost_amount,margin_amount,channel_list,top_tag,tag_json)AS(
 SELECT p.account_id,COUNT(*)AS event_count,SUM(p.revenue_amount),SUM(p.cost_amount),
 SUM(p.revenue_amount-p.cost_amount),
-LISTAGG(DISTINCT p.channel_code,','[[ON]] OVERFLOW TRUNCATE'...'WITHOUT COUNT)
+LISTAGG(DISTINCT p.channel_code,','ON OVERFLOW TRUNCATE'...'WITHOUT COUNT)
 WITHIN GROUP(ORDER BY p.channel_code),
 (SELECT MAX(r.tag_value)KEEP(DENSE_RANK FIRST ORDER BY r.metric_value DESC,r.event_id,r.tag_no)
 FROM metric_rows r
@@ -156,8 +156,8 @@ XMLELEMENT("name",a.account_name),
 XMLELEMENT("path",t.account_path)
 )AS VARCHAR2(1000))
 FROM accounts a
-JOIN account_tree t [[ON]] t.account_id=a.account_id
-LEFT JOIN account_rollup r [[ON]] r.account_id=a.account_id
+JOIN account_tree t ON t.account_id=a.account_id
+LEFT JOIN account_rollup r ON r.account_id=a.account_id
 )
 SELECT
 CASE
@@ -198,10 +198,7 @@ ORDER BY f.account_id
 -- db: Oracle
 -- metadata: test Oracle inferred catalog (file-scoped overlay) + Oracle built-ins
 -- checked: 377
--- missing: 3
+-- missing: 0
 -- marker: [[word]] means not suggested for the tested prefix
--- missing tokens:
---   137:36 word=ON prefix=O suggestions=[OR] total=1 line=LISTAGG(DISTINCT p.channel_code,','ON OVERFLOW TRUNCATE'...'WITHOUT COUNT)
---   159:21 word=ON prefix=O suggestions=[OR] total=1 line=JOIN account_tree t ON t.account_id=a.account_id
---   160:28 word=ON prefix=O suggestions=[OR] total=1 line=LEFT JOIN account_rollup r ON r.account_id=a.account_id
+-- missing tokens: none
 -- =========================================================

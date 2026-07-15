@@ -277,7 +277,7 @@ CREATE OR REPLACE TRIGGER qt_sales_ct
     AFTER STATEMENT IS
     BEGIN
         IF g_idx > 0 THEN
-            INSERT INTO qt_audit_log (module_name, [[action_name]], [[log_text]])
+            INSERT INTO qt_audit_log (module_name, action_name, log_text)
             VALUES ('qt_sales_ct', 'AFTER STATEMENT', 'Rows affected=' || g_idx || ', sample emp_id=' || g_emp_ids (1));
         END IF;
     END AFTER STATEMENT;
@@ -395,7 +395,7 @@ CREATE OR REPLACE PACKAGE BODY qt_pkg_extreme IS
         INSERT INTO qt_sales (sale_id, emp_id, sale_dt, amount, tax, status, 
         remark
         )
-        VALUES (NULL, l_rows (i).emp_id, l_rows (i).sale_dt, l_rows (i).amount, l_rows (i).tax, 'NEW', l_rows (i).[[REMARK]]);
+        VALUES (NULL, l_rows (i).emp_id, l_rows (i).sale_dt, l_rows (i).amount, l_rows (i).tax, 'NEW', l_rows (i).REMARK);
         l_inserted := SQL%ROWCOUNT;
         log_msg ('qt_pkg_extreme', 'load_bonus_sales', 'Inserted rows=' || l_inserted);
     EXCEPTION
@@ -856,11 +856,8 @@ ORDER BY log_id;
 -- source: test/test10.txt
 -- db: Oracle
 -- metadata: test Oracle inferred catalog (file-scoped overlay) + Oracle built-ins
--- checked: 1782
--- missing: 3
+-- checked: 1811
+-- missing: 0
 -- marker: [[word]] means not suggested for the tested prefix
--- missing tokens:
---   280:52 word=action_name prefix=acti suggestions=[] total=0 line=INSERT INTO qt_audit_log (module_name, action_name, log_text)
---   280:65 word=log_text prefix=log_ suggestions=[] total=0 line=INSERT INTO qt_audit_log (module_name, action_name, log_text)
---   398:115 word=REMARK prefix=REMA suggestions=[] total=0 line=VALUES (NULL, l_rows (i).emp_id, l_rows (i).sale_dt, l_rows (i).amount, l_rows (i).tax, 'NEW', l_rows (i).REMARK);
+-- missing tokens: none
 -- =========================================================

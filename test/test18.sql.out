@@ -545,8 +545,8 @@ CREATE OR REPLACE PACKAGE BODY qt_pkg_extreme IS
         v_ratio NUMBER;
     BEGIN
         seed_extra_rows (7);
-        adjust_salary (30, 0.08, [[FALSE]]);
-        adjust_salary (40, 0.05, [[FALSE]]);
+        adjust_salary (30, 0.08, FALSE);
+        adjust_salary (40, 0.05, FALSE);
         v_ratio := calc_comp_ratio (1, 300000);
         write_log ('INFO', 'run_all', 'Comp ratio for emp_id=1 => ' || TO_CHAR (v_ratio));
         v_rc := get_emp_cursor (30, 'ACTIVE');
@@ -1058,9 +1058,7 @@ ORDER BY sale_year,
 -- db: Oracle
 -- metadata: test Oracle inferred catalog (file-scoped overlay) + Oracle built-ins
 -- checked: 2132
--- missing: 2
+-- missing: 0
 -- marker: [[word]] means not suggested for the tested prefix
--- missing tokens:
---   548:34 word=FALSE prefix=FALS suggestions=[] total=0 line=adjust_salary (30, 0.08, FALSE);
---   549:34 word=FALSE prefix=FALS suggestions=[] total=0 line=adjust_salary (40, 0.05, FALSE);
+-- missing tokens: none
 -- =========================================================

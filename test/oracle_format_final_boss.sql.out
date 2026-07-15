@@ -565,7 +565,7 @@ SELECT
                 ) = 1
                 AND
                 (
-                    [[SELECT]] COUNT(*)
+                    SELECT COUNT(*)
                     FROM dual
                     WHERE c.n > b.n
                 ) IN (0, 1)
@@ -874,8 +874,7 @@ ORDER BY
 -- db: Oracle
 -- metadata: test Oracle inferred catalog (file-scoped overlay) + Oracle built-ins
 -- checked: 1487
--- missing: 1
+-- missing: 0
 -- marker: [[word]] means not suggested for the tested prefix
--- missing tokens:
---   568:21 word=SELECT prefix=SELE suggestions=[] total=0 line=SELECT COUNT(*)
+-- missing tokens: none
 -- =========================================================

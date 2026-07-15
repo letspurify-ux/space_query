@@ -3105,7 +3105,7 @@ impl SqlEditorWidget {
             .position(|span| !matches!(span.token, SqlToken::Comment(_)))?;
         let name_idx = start_idx + relative_name_idx;
         let raw_name = Self::token_word(&item[name_idx].token)?;
-        let normalized_name = Self::local_identifier_from_word(raw_name)?;
+        let normalized_name = Self::local_declaration_identifier_from_word(raw_name)?;
         let name = if sql_text::is_quoted_identifier(raw_name.trim()) {
             raw_name.trim().to_string()
         } else {

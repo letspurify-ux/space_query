@@ -15,7 +15,7 @@ BEGIN
         WHERE object_name LIKE 'QT25_%'
         ORDER BY CASE object_type WHEN 'VIEW' THEN 1 WHEN 'TABLE' THEN 2 ELSE 3 END
     ) LOOP
-        [[BEGIN]]
+        BEGIN
             IF obj.object_type = 'VIEW' THEN
                 EXECUTE IMMEDIATE 'DROP VIEW ' || obj.object_name;
             ELSIF obj.object_type = 'TABLE' THEN
@@ -27,7 +27,7 @@ BEGIN
             WHEN OTHERS THEN NULL;
         END;
     END LOOP;
-[[END]];
+END;
 /
 
 CREATE TABLE qt25_dept
@@ -102,7 +102,7 @@ WITH
                    '*'
                );
     END fmt_mask;
-    [[PROCEDURE]] noop (
+    PROCEDURE noop (
         p_msg IN VARCHAR2
     )
     IS
@@ -604,7 +604,7 @@ USING
         e.sal,
         CASE
             WHEN e.sal >= 4000 THEN ROUND (e.sal * 0.20, 2)
-            [[WHEN]] e.sal >= 2500 THEN ROUND (e.sal * 0.10, 2)
+            WHEN e.sal >= 2500 THEN ROUND (e.sal * 0.10, 2)
             ELSE ROUND (e.sal * 0.05, 2)
         END AS calc_bonus
     FROM
@@ -625,11 +625,11 @@ USING
 ON
 (
         b.empno = s.empno
-    [[AND]] (
+    AND (
             b.deptno = s.deptno
             OR (
                    b.deptno IS NULL
-               [[AND]] s.deptno IS NOT NULL
+               AND s.deptno IS NOT NULL
                )
         )
 )
@@ -652,7 +652,7 @@ WHEN MATCHED THEN
     DELETE
      WHERE
          s.sal < 500
-[[WHEN]] NOT MATCHED THEN
+WHEN NOT MATCHED THEN
     INSERT
     (
         empno,
@@ -678,7 +678,7 @@ WHEN MATCHED THEN
 -- 9. INSERT ALL / FIRST / 서브쿼리 조건 분기
 --------------------------------------------------------------------------------
 INSERT ALL
-    WHEN [[sal]] >= 4000 THEN
+    WHEN sal >= 4000 THEN
         INTO qt25_emp_grade_high (
             empno,
             ename,
@@ -693,8 +693,8 @@ INSERT ALL
             deptno,
             'HIGH'
         )
-    [[WHEN]] [[sal]] >= 2000 THEN
-        [[INTO]] qt25_emp_grade_mid (
+    WHEN sal >= 2000 THEN
+        INTO qt25_emp_grade_mid (
             empno,
             ename,
             sal,
@@ -709,7 +709,7 @@ INSERT ALL
             'MID'
         )
     ELSE
-        [[INTO]] qt25_emp_grade_low (
+        INTO qt25_emp_grade_low (
             empno,
             ename,
             sal,
@@ -729,7 +729,7 @@ SELECT
     e.sal,
     e.deptno
 FROM
-    [[qt25_emp]] e
+    qt25_emp e
 WHERE
     e.deptno IN (
         SELECT
@@ -744,16 +744,16 @@ WHERE
 INSERT FIRST
     WHEN deptno = 10 THEN
         INTO qt25_emp_bucket_a (empno, ename, deptno) VALUES (empno, ename, deptno)
-    [[WHEN]] deptno = 20 THEN
-        [[INTO]] qt25_emp_bucket_b (empno, ename, deptno) VALUES (empno, ename, deptno)
+    WHEN deptno = 20 THEN
+        INTO qt25_emp_bucket_b (empno, ename, deptno) VALUES (empno, ename, deptno)
     ELSE
-        [[INTO]] qt25_emp_bucket_c (empno, ename, deptno) VALUES (empno, ename, deptno)
+        INTO qt25_emp_bucket_c (empno, ename, deptno) VALUES (empno, ename, deptno)
 SELECT
     e.empno,
     e.ename,
     e.deptno
 FROM
-    [[qt25_emp]] e
+    qt25_emp e
 ;
 
 --------------------------------------------------------------------------------
@@ -767,7 +767,7 @@ UPDATE qt25_emp e
                        SELECT
                            CASE
                                WHEN AVG (x.sal) > 3000 THEN 300
-                               [[WHEN]] AVG (x.sal) > 2000 THEN 200
+                               WHEN AVG (x.sal) > 2000 THEN 200
                                ELSE 100
                            END
                        FROM
@@ -813,7 +813,7 @@ DELETE FROM qt25_emp_bonus b
                            qt25_dept d
                        WHERE
                                d.loc IS NOT NULL
-                           [[AND]] NOT EXISTS
+                           AND NOT EXISTS
                                    (
                                        SELECT
                                            1
@@ -1018,7 +1018,7 @@ BEGIN
 
     BEGIN
         FORALL idx IN INDICES OF v_tab
-            INSERT INTO [[qt25_emp_audit_log]] (
+            INSERT INTO qt25_emp_audit_log (
                 log_id,
                 empno,
                 deptno,
@@ -1046,11 +1046,11 @@ BEGIN
                 WHEN COUNT (*) > 0 THEN 'OK'
                 ELSE 'EMPTY'
             END
-        [[INTO]] v_dummy
+        INTO v_dummy
         FROM
-            [[qt25_emp]]
+            qt25_emp
         WHERE
-            [[deptno]] = 10;
+            deptno = 10;
 
         IF v_dummy = 'OK' THEN
             NULL;
@@ -1313,31 +1313,8 @@ ORDER BY
 -- source: test/test25.sql
 -- db: Oracle
 -- metadata: test Oracle inferred catalog (file-scoped overlay) + Oracle built-ins
--- checked: 1728
--- missing: 23
+-- checked: 1855
+-- missing: 0
 -- marker: [[word]] means not suggested for the tested prefix
--- missing tokens:
---   18:9 word=BEGIN prefix=BEGI suggestions=[] total=0 line=BEGIN
---   30:1 word=END prefix=EN suggestions=[] total=0 line=END;
---   105:5 word=PROCEDURE prefix=PROC suggestions=[] total=0 line=PROCEDURE noop (
---   607:13 word=WHEN prefix=WHE suggestions=[WHERE] total=1 line=WHEN e.sal >= 2500 THEN ROUND (e.sal * 0.10, 2)
---   628:5 word=AND prefix=AN suggestions=[ANY_VALUE(), ANY] total=2 line=AND (
---   632:16 word=AND prefix=AN suggestions=[ANY] total=1 line=AND s.deptno IS NOT NULL
---   655:1 word=WHEN prefix=WHE suggestions=[WHERE] total=1 line=WHEN NOT MATCHED THEN
---   681:10 word=sal prefix=sa suggestions=[] total=0 line=WHEN sal >= 4000 THEN
---   696:5 word=WHEN prefix=WHE suggestions=[WHERE] total=1 line=WHEN sal >= 2000 THEN
---   696:10 word=sal prefix=sa suggestions=[] total=0 line=WHEN sal >= 2000 THEN
---   697:9 word=INTO prefix=INT suggestions=[INTERVAL] total=1 line=INTO qt25_emp_grade_mid (
---   712:9 word=INTO prefix=INT suggestions=[INTERVAL] total=1 line=INTO qt25_emp_grade_low (
---   732:5 word=qt25_emp prefix=qt25 suggestions=[] total=0 line=qt25_emp e
---   747:5 word=WHEN prefix=WHE suggestions=[WHERE] total=1 line=WHEN deptno = 20 THEN
---   748:9 word=INTO prefix=INT suggestions=[INTERVAL] total=1 line=INTO qt25_emp_bucket_b (empno, ename, deptno) VALUES (empno, ename, deptno)
---   750:9 word=INTO prefix=INT suggestions=[INTERVAL] total=1 line=INTO qt25_emp_bucket_c (empno, ename, deptno) VALUES (empno, ename, deptno)
---   756:5 word=qt25_emp prefix=qt25 suggestions=[] total=0 line=qt25_emp e
---   770:32 word=WHEN prefix=WHE suggestions=[WHERE] total=1 line=WHEN AVG (x.sal) > 2000 THEN 200
---   816:28 word=AND prefix=AN suggestions=[ANY] total=1 line=AND NOT EXISTS
---   1021:25 word=qt25_emp_audit_log prefix=qt25 suggestions=[] total=0 line=INSERT INTO qt25_emp_audit_log (
---   1049:9 word=INTO prefix=INT suggestions=[] total=0 line=INTO v_dummy
---   1051:13 word=qt25_emp prefix=qt25 suggestions=[] total=0 line=qt25_emp
---   1053:13 word=deptno prefix=dept suggestions=[] total=0 line=deptno = 10;
+-- missing tokens: none
 -- =========================================================

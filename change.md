@@ -2548,3 +2548,166 @@ bounded fast path를 유지하는지 함께 검증한다.
 재생성본이 byte-level aggregate hash까지 같다. IntelliSense 스윕은 production
 completion 흐름에서 신규 세 파일 총 1,336개 토큰을 검사해 누락 0이며, 전체 테스트와
 엄격한 clippy에도 오류나 경고가 남지 않았다.
+
+
+# 18. 11차 검증 회차 (2026-07-15): MySQL/MariaDB Final Boss VI와 재발 방지
+
+## 18-1. 신규 실행 가능 단일 문장 fixture
+
+기존 final-boss가 지나지 않던 문법을 한 문장 안에서 함께 검증하도록, 반복 실행해도
+부작용이 없는 `WITH ... SELECT` fixture를 MySQL과 MariaDB에 각각 추가했다.
+
+| DB | 파일 | 원본 줄 수 | 핵심 조합 |
+| --- | --- | ---: | --- |
+| MySQL 8.0 | `test_mysql/test9.txt` | 221 | 재귀 CTE, 중첩 `JSON_TABLE`, `JSON_VALUE ... RETURNING/DEFAULT`, `LATERAL`, inherited named window, `ROLLUP`, `INTERSECT`/`EXCEPT`, `MEMBER OF`, 다중 scalar/list frame |
+| MariaDB 12.2 | `test_mariadb/test14.txt` | 213 | 재귀 `CYCLE`, 중첩 `JSON_TABLE`, dynamic column, `INET6`, percentile window, ordered/limited aggregate, `INTERSECT ALL`/`EXCEPT ALL`, 다중 scalar/list frame |
+
+두 문장은 마지막 `CASE`가 중간 집계와 집합 연산 결과를 다시 검산한다. 원본과 자동
+포맷 결과를 MySQL 8.0.46 및 MariaDB 12.2.2 컨테이너에서 각각 실행했으며 모두
+exit code 0, 반환 4행의 `status = 'PASS'`를 확인했다.
+
+파일별 IntelliSense 보고서도 함께 추가했다.
+
+| 보고서 | checked | missing |
+| --- | ---: | ---: |
+| `test_mysql/test9.txt.out` | 566 | 0 |
+| `test_mariadb/test14.txt.out` | 572 | 0 |
+
+## 18-2. 포매터 AS-IS / TO-BE: aggregate 내부 `LIMIT`의 owning frame
+
+전체 포맷 결과를 직접 읽는 과정에서 자동 PASS가 놓친 MariaDB aggregate 내부 절의
+상대 깊이 오류를 발견했다. 일반 query의 `LIMIT` clause depth를 그대로 적용해 함수
+호출 괄호가 소유한 body보다 바깥으로 빠지는 문제였다.
+
+AS-IS:
+
+```sql
+GROUP_CONCAT(DISTINCT f.source_code ORDER BY f.source_code SEPARATOR ','
+LIMIT 4) AS source_list,
+JSON_ARRAYAGG(JSON_OBJECT('execution', f.execution_id) ORDER BY f.execution_id
+LIMIT 10) AS execution_json
+```
+
+TO-BE:
+
+```sql
+GROUP_CONCAT(DISTINCT f.source_code ORDER BY f.source_code SEPARATOR ','
+    LIMIT 4) AS source_list,
+JSON_ARRAYAGG(JSON_OBJECT('execution', f.execution_id) ORDER BY f.execution_id
+    LIMIT 10) AS execution_json
+```
+
+근본 수정은 키워드별 보정이 아니라 frame 계약으로 구현했다.
+
+- ordinary expression/call paren 안의 clause header는 기존 clause depth와 소유 frame의
+  고정 `body_indent` 중 더 깊은 값을 사용한다.
+- query-like paren과 column-list paren은 기존 전용 layout을 유지한다.
+- frame audit에 `ContainedClause` 이벤트를 추가해, 괄호 내부 clause가 소유 frame의
+  body보다 얕아지면 스윕이 실패하도록 했다.
+- `format_for_auto_formatting_mariadb_keeps_aggregate_limit_inside_owner_frame`가
+  `GROUP_CONCAT`/`JSON_ARRAYAGG`와 두 번 포맷한 멱등성을 고정한다.
+
+이 수정으로 바뀐 포맷 SQL은 MariaDB `test9.txt`, `test13.txt`, `test14.txt`의 aggregate
+`LIMIT` 7곳뿐이다. 나머지 58개 결과의 SQL body는 이전 검토본과 byte 단위로 같았다.
+변경된 `test13.txt` 포맷본도 MariaDB 12.2.2에서 재실행해 4행 모두 `PASS`를 확인했다.
+
+## 18-3. IntelliSense AS-IS / TO-BE와 production 경로 일치
+
+최초 전체 스윕에서 실제 추천 가능한 누락을 정확한 fixture 위치의 회귀 테스트로 먼저
+고정했다. 대표 사례는 다음과 같다.
+
+AS-IS:
+
+```sql
+-- MySQL: 고정 연산자 tail 누락
+COALESCE('critical' MEMBER O| (JSON_ARRAY('critical')), FALSE)
+-- suggestions: []
+
+-- Oracle: indexed collection의 record field scope 소실
+l_rows(i).REMA|;
+-- REMARK 없음
+
+-- Oracle: 먼 이전 SELECT가 현재 cursor 선언을 오염
+CURSOR c_src I| SELECT ...
+-- suggestions: INTERSECT, INTO
+
+-- Oracle: 실행 MERGE의 typed keyword 누락
+WHEN MATC| THEN
+-- suggestions: []
+```
+
+TO-BE:
+
+```sql
+COALESCE('critical' MEMBER OF (JSON_ARRAY('critical')), FALSE)
+l_rows(i).REMARK;
+CURSOR c_src IS SELECT ...
+WHEN MATCHED THEN
+```
+
+production `completion.rs`와 local symbol 경로를 다음 범위에서 수정했다.
+
+- MySQL에만 `MEMBER -> OF`를 열고 MariaDB와 Oracle의 기존 문법을 분리했다.
+- nested `WITH`/`SELECT`, `CASE`/exception `WHEN`, `FORALL`, `GOTO`, `SELECT INTO`,
+  `REPLACE INTO`, `CONNECT_BY_ISCYCLE`, named `END`의 typed structural anchor를 보강했다.
+- indexed qualifier `l_rows(i).field`, 앞쪽에서 선언되는 outer relation alias,
+  `SYS.ODCINUMBERLIST`의 `COLUMN_VALUE`, quoted `COMMENT ON COLUMN`을 bounded text와
+  file-scoped metadata로 복원했다.
+- record field 이름에서는 문맥 키워드인 `REMARK`도 declaration identifier로 인정하되,
+  PL/SQL 비타입 키워드는 계속 제외한다.
+- 관계/컬럼 후보 merge는 typed table/column 문맥으로 제한하고 MySQL maintenance
+  statement, Oracle privilege list, `EXTRACT(` argument frame에는 누출하지 않는다.
+
+스윕 테스트도 production과 같은 흐름으로 바꿨다. 파일 전체 문자열을 매번 새로 만드는
+대신 실제 편집과 같은 최소 `ChunkedText` splice를 적용하고, production worker가 쓰는
+`compute_intellisense_suggestions`에 동일한 expanded statement와 analysis를 전달한다.
+또한 production UI가 팝업을 억제하는 string/q-quote/comment 위치는 스윕도 같은 lexical
+mode로 제외한다. 따라서 동적 SQL 문자열의 `WHEN MATCHED`는 false miss가 아니며, 실제
+실행 SQL의 같은 토큰은 계속 검사된다.
+
+모든 새 fallback은 4 KiB look-behind와 2 KiB look-ahead 또는 이미 bounded된 statement
+token slice만 사용한다. 100만 줄 초과 회귀 5종이 0.28초에 통과해 전체 문서 길이에
+비례하는 completion 후보별 재스캔이 없음을 확인했다.
+
+## 18-4. 전체 스윕 및 수동 판독 결과
+
+정확한 명령
+`cargo test --lib formatting_sweep_all_files_generate_out_report -- --ignored --nocapture`로
+최종 산출물을 만든 뒤 `target/format-sweep`의 모든 `.format.out`을 자동 PASS와 무관하게
+처음부터 끝까지 다시 읽었다.
+
+| 항목 | 결과 |
+| --- | ---: |
+| 전체 `.format.out` | 61개 |
+| 직접 검토한 전체 report 줄 | 33,220줄 |
+| footer 제외 포맷 SQL 줄 | 23,319줄 |
+| PASS / issues 0 | 61 / 61 |
+| 검사 frame / body item / close | 8,385 / 715 / 1,519 |
+| 실제 상대 depth 수정 | aggregate `LIMIT` 7곳 |
+| comma sibling body-depth 위반 | 0건 |
+| same-paren top-level body-depth 위반 | 0건 |
+| close-indent 및 parent body 복귀 위반 | 0건 |
+
+최종 production 경로 IntelliSense 전수 스윕은 Oracle/MySQL/MariaDB 61파일에서
+49,742개 토큰을 검사했으며 missing 0이었다. 최종 재실행 시간은 477.44초다.
+
+## 18-5. 최종 품질 게이트
+
+| 검증 | 결과 |
+| --- | --- |
+| 신규 MySQL/MariaDB 원본·포맷본 실서버 실행 | 각각 4행 PASS, exit code 0 |
+| 기존 MariaDB `test13` 수정 포맷본 실서버 재실행 | 4행 PASS, exit code 0 |
+| 100만 줄 초과 production 성능 회귀 | 5 통과, 실패 0, 0.28초 |
+| 정확한 전체 포맷 스윕 | 1 통과, 실패 0, 61개·33,220줄 |
+| 최종 전체 IntelliSense 스윕 | 1 통과, 61개·49,742 checked·missing 0 |
+| 정확한 `cargo test` | lib 6,513 통과·228 ignored, 모든 binary/integration/guard/doc-test 실패 0 |
+| `cargo clippy --locked --all-targets -- -D warnings -W clippy::perf -W clippy::complexity` | 통과, 오류·경고 0 |
+| `cargo fmt --all -- --check` | 통과 |
+
+## 18-6. 결론
+
+신규 두 final-boss 쿼리와 포맷본은 실제 대상 DB에서 실행 가능하고 자체 검산을
+통과했다. 포매터 문제는 특정 `LIMIT` 예외가 아니라 owning frame의 최소 body depth와
+audit 계약으로 고쳤으며, IntelliSense는 production과 같은 snapshot/analysis/completion
+경로 및 같은 literal/comment 억제 규칙으로 검사한다. 전체 리포트 수동 판독, 100만 줄
+성능 회귀, 전체 Rust 테스트와 엄격한 Clippy까지 최종 오류와 경고가 남지 않았다.

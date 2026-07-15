@@ -1,0 +1,233 @@
+-- ==========================================================================
+-- SPACE QUERY MYSQL SINGLE-STATEMENT FORMATTER FINAL BOSS VI
+-- Target: MySQL 8.0.31+ (live certification uses MySQL 8.0.46)
+-- A repeatable, side-effect-free statement covering recursive CTEs, nested
+-- JSON_TABLE paths, JSON_VALUE fallbacks, inherited named windows, ROLLUP,
+-- LATERAL, set operators, MEMBER OF, and deep scalar/list frame recovery.
+-- ==========================================================================
+WITH RECURSIVE
+settings AS(
+SELECT JSON_OBJECT(
+'range',JSON_OBJECT('start','2026-07-01','days',6),
+'thresholds',JSON_OBJECT('latency',30,'errors',3),
+'required',JSON_ARRAY('critical','quality')
+)AS config
+),
+params AS(
+SELECT
+CAST(JSON_VALUE(config,'$.range.start'RETURNING CHAR(10)DEFAULT'2026-01-01'ON EMPTY DEFAULT'2026-01-01'ON ERROR)AS DATE)AS start_day,
+JSON_VALUE(config,'$.range.days'RETURNING UNSIGNED DEFAULT 1 ON EMPTY DEFAULT 1 ON ERROR)AS day_count,
+JSON_VALUE(config,'$.thresholds.latency'RETURNING DECIMAL(10,2)DEFAULT 99 ON EMPTY DEFAULT 99 ON ERROR)AS latency_limit,
+JSON_VALUE(config,'$.thresholds.errors'RETURNING UNSIGNED DEFAULT 99 ON EMPTY DEFAULT 99 ON ERROR)AS error_limit,
+config
+FROM settings
+),
+calendar(day_no,day_value)AS(
+SELECT 0,start_day FROM params
+UNION ALL
+SELECT c.day_no+1,c.day_value+INTERVAL 1 DAY
+FROM calendar c JOIN params p ON TRUE
+WHERE c.day_no+1<p.day_count
+),
+services(service_id,parent_service_id,service_name,owner_code,active_flag)AS(
+SELECT 1,NULL,'Gateway Core','PLATFORM',TRUE UNION ALL
+SELECT 2,1,'Identity Edge','SECURITY',TRUE UNION ALL
+SELECT 3,1,'Ledger Stream','DATA',TRUE UNION ALL
+SELECT 4,2,'Legacy Sandbox','LABS',FALSE
+),
+service_tree(service_id,parent_service_id,service_path,tree_depth)AS(
+SELECT service_id,parent_service_id,CAST(REGEXP_REPLACE(UPPER(service_name),'[^A-Z0-9]+','_')AS CHAR(400)),0
+FROM services
+WHERE parent_service_id IS NULL
+UNION ALL
+SELECT s.service_id,s.parent_service_id,
+CONCAT(t.service_path,'/',REGEXP_REPLACE(UPPER(s.service_name),'[^A-Z0-9]+','_')),
+t.tree_depth+1
+FROM services s
+JOIN service_tree t ON t.service_id=s.parent_service_id
+),
+observations(observation_id,service_id,observed_on,payload)AS(
+SELECT 101,1,DATE'2026-07-01',JSON_OBJECT('channel','api','metrics',JSON_ARRAY(
+JSON_OBJECT('name','latency','value',12,'unit','ms','tags',JSON_ARRAY('critical','fast')),
+JSON_OBJECT('name','errors','value',1,'unit','count','tags',JSON_ARRAY('quality'))
+))UNION ALL
+SELECT 102,1,DATE'2026-07-04',JSON_OBJECT('channel','batch','metrics',JSON_ARRAY(
+JSON_OBJECT('name','latency','value',18,'unit','ms','tags',JSON_ARRAY('stable')),
+JSON_OBJECT('name','errors','value',0,'unit','count','tags',JSON_ARRAY('quality','critical'))
+))UNION ALL
+SELECT 201,2,DATE'2026-07-02',JSON_OBJECT('channel','edge','metrics',JSON_ARRAY(
+JSON_OBJECT('name','latency','value',28,'unit','ms','tags',JSON_ARRAY('critical')),
+JSON_OBJECT('name','errors','value',2,'unit','count','tags',JSON_ARRAY('quality'))
+))UNION ALL
+SELECT 301,3,DATE'2026-07-03',JSON_OBJECT('channel','stream','metrics',JSON_ARRAY(
+JSON_OBJECT('name','latency','value',42,'unit','ms','tags',JSON_ARRAY('incident')),
+JSON_OBJECT('name','errors','value',6,'unit','count','tags',JSON_ARRAY('critical','quality'))
+))UNION ALL
+SELECT 302,3,DATE'2026-07-06',JSON_OBJECT('channel','replay','metrics',JSON_ARRAY(
+JSON_OBJECT('name','latency','value',20,'unit','ms','tags',JSON_ARRAY('recovery')),
+JSON_OBJECT('name','errors','value',1,'unit','count','tags',JSON_ARRAY('quality'))
+))
+),
+metric_rows AS(
+SELECT o.observation_id,o.service_id,o.observed_on,j.channel_code,j.metric_no,
+j.metric_name,j.metric_value,j.metric_unit,j.has_tags,j.tag_no,j.tag_value
+FROM observations o
+JOIN JSON_TABLE(
+o.payload,'$'
+COLUMNS(
+channel_code VARCHAR(30)PATH'$.channel'DEFAULT'"unknown"'ON EMPTY,
+NESTED PATH'$.metrics[*]'
+COLUMNS(
+metric_no FOR ORDINALITY,
+metric_name VARCHAR(30)PATH'$.name'ERROR ON ERROR,
+metric_value DECIMAL(12,2)PATH'$.value'DEFAULT'0'ON EMPTY DEFAULT'0'ON ERROR,
+metric_unit VARCHAR(20)PATH'$.unit'NULL ON EMPTY,
+has_tags INT EXISTS PATH'$.tags',
+NESTED PATH'$.tags[*]'
+COLUMNS(
+tag_no FOR ORDINALITY,
+tag_value VARCHAR(30)PATH'$'NULL ON ERROR
+)
+)
+)
+)AS j ON TRUE
+),
+metric_base AS(
+SELECT observation_id,service_id,observed_on,MAX(channel_code)AS channel_code,
+metric_name,MAX(metric_value)AS metric_value,MAX(metric_unit)AS metric_unit,
+MAX(has_tags)AS has_tags
+FROM metric_rows
+GROUP BY observation_id,service_id,observed_on,metric_name
+),
+observation_facts AS(
+SELECT observation_id,service_id,observed_on,MAX(channel_code)AS channel_code,
+MAX(CASE WHEN metric_name='latency'THEN metric_value END)AS latency_ms,
+MAX(CASE WHEN metric_name='errors'THEN metric_value END)AS error_count,
+SUM(has_tags)AS tagged_metric_count
+FROM metric_base
+GROUP BY observation_id,service_id,observed_on
+),
+daily AS(
+SELECT s.service_id,c.day_no,c.day_value,
+COALESCE(AVG(f.latency_ms),0)AS average_latency,
+COALESCE(SUM(f.error_count),0)AS error_count,
+COUNT(f.observation_id)AS observation_count
+FROM services s
+CROSS JOIN calendar c
+LEFT JOIN observation_facts f
+ON f.service_id=s.service_id
+AND f.observed_on=c.day_value
+GROUP BY s.service_id,c.day_no,c.day_value
+),
+analytic_daily AS(
+SELECT d.*,
+SUM(error_count)OVER w_running AS running_errors,
+FIRST_VALUE(average_latency)OVER w_full AS first_latency,
+LAST_VALUE(average_latency)OVER w_full AS last_latency,
+NTILE(3)OVER w_rank AS latency_band,
+PERCENT_RANK()OVER w_rank AS latency_percent_rank
+FROM daily d
+WINDOW
+w_partition AS(PARTITION BY service_id),
+w_order AS(w_partition ORDER BY day_no),
+w_running AS(w_order ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW),
+w_full AS(w_order ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING),
+w_rank AS(w_partition ORDER BY average_latency,day_no)
+),
+rollup_rows AS(
+SELECT service_id,channel_code,SUM(error_count)AS total_errors,
+GROUPING(service_id)AS service_grouped,GROUPING(channel_code)AS channel_grouped
+FROM observation_facts
+GROUP BY service_id,channel_code WITH ROLLUP
+),
+eligible(service_id)AS(
+(SELECT service_id FROM services WHERE active_flag IS TRUE)
+INTERSECT
+(SELECT service_id FROM observation_facts WHERE latency_ms<50)
+EXCEPT
+(SELECT service_id FROM observation_facts f JOIN params p ON f.error_count>p.error_limit*3)
+),
+service_rollup AS(
+SELECT f.service_id,COUNT(*)AS observation_count,SUM(f.error_count)AS total_errors,
+ROUND(AVG(f.latency_ms),2)AS average_latency,
+GROUP_CONCAT(DISTINCT f.channel_code ORDER BY f.channel_code SEPARATOR',')AS channel_list,
+JSON_ARRAYAGG(JSON_OBJECT(
+'observation',f.observation_id,
+'day',DATE_FORMAT(f.observed_on,'%Y-%m-%d'),
+'channel',f.channel_code,
+'latency',f.latency_ms,
+'errors',f.error_count
+))AS observation_json
+FROM observation_facts f
+GROUP BY f.service_id
+),
+final_rows AS(
+SELECT s.service_id,s.service_name,s.owner_code,s.active_flag,t.service_path,t.tree_depth,
+COALESCE(r.observation_count,0)AS observation_count,
+COALESCE(r.total_errors,0)AS total_errors,
+COALESCE(r.average_latency,0)AS average_latency,r.channel_list,r.observation_json,
+CASE WHEN e.service_id IS NULL THEN'INELIGIBLE'ELSE'ELIGIBLE'END AS eligibility,
+top_observation.observation_id AS top_observation_id,
+top_observation.latency_ms AS top_latency,
+(SELECT MAX(a.running_errors)FROM analytic_daily a WHERE a.service_id=s.service_id)AS peak_running_errors,
+(SELECT JSON_ARRAYAGG(m.tag_value)FROM metric_rows m WHERE m.service_id=s.service_id)AS tags_json
+FROM services s
+JOIN service_tree t ON t.service_id=s.service_id
+LEFT JOIN service_rollup r ON r.service_id=s.service_id
+LEFT JOIN(SELECT DISTINCT service_id FROM eligible)AS e ON e.service_id=s.service_id
+LEFT JOIN LATERAL(
+SELECT f.observation_id,f.latency_ms
+FROM observation_facts f
+WHERE f.service_id=s.service_id
+ORDER BY f.latency_ms DESC,f.observation_id
+LIMIT 1
+)AS top_observation ON TRUE
+)
+SELECT
+CASE
+WHEN(SELECT COUNT(*)FROM calendar)=6
+AND(SELECT COUNT(*)FROM service_tree)=4
+AND(SELECT COUNT(*)FROM observations)=5
+AND(SELECT COUNT(*)FROM metric_base)=10
+AND(SELECT SUM(error_count)FROM observation_facts)=10
+AND(SELECT COUNT(*)FROM rollup_rows WHERE service_grouped=1 AND channel_grouped=1)=1
+AND(SELECT JSON_VALUE(config,'$.required[0]'RETURNING CHAR(20))FROM settings)='critical'
+THEN'PASS'ELSE'FAIL'END AS status,
+f.service_id,f.service_name,f.owner_code,f.active_flag,f.tree_depth,
+f.observation_count,f.total_errors,f.average_latency,f.eligibility,
+f.top_observation_id,f.top_latency,f.peak_running_errors,f.channel_list,
+JSON_MERGE_PATCH(
+JSON_OBJECT(
+'path',f.service_path,
+'observations',f.observation_json,
+'tags',f.tags_json
+),
+JSON_OBJECT(
+'checks',JSON_OBJECT(
+'name_fragment',REGEXP_SUBSTR(f.service_name,'^[A-Za-z]+'),
+'has_critical',COALESCE('critical'MEMBER OF(f.tags_json),FALSE),
+'within_latency',f.average_latency<=(SELECT latency_limit FROM params),
+'path_present',JSON_CONTAINS_PATH(JSON_OBJECT('path',f.service_path),'one','$.path')
+),
+'grand_errors',(
+SELECT total_errors
+FROM rollup_rows rr
+WHERE rr.service_grouped=1
+AND rr.channel_grouped=1
+)
+)
+)AS evidence
+FROM final_rows f
+ORDER BY f.service_id;
+
+
+-- =========================================================
+-- IntelliSense sweep report generated by intellisense sweep
+-- source: test_mysql/test9.txt
+-- db: MySQL
+-- metadata: test_mysql/test9.txt inferred catalog
+-- checked: 566
+-- missing: 0
+-- marker: [[word]] means not suggested for the tested prefix
+-- missing tokens: none
+-- =========================================================

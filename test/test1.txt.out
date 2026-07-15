@@ -361,7 +361,7 @@ DECLARE
   v_run_id NUMBER := 20260127; -- 원하는 run_id로 바꿔도 됨
 BEGIN
   oqt_demo_pkg.proc_fill_result_table(p_run_id => v_run_id, p_min_sal => 7000);
-  DBMS_OUTPUT.[[PUT_LINE]]('filled result table with run_id='||v_run_id);
+  DBMS_OUTPUT.PUT_LINE('filled result table with run_id='||v_run_id);
 END;
 /
 
@@ -379,8 +379,7 @@ SELECT * FROM oqt_run_log WHERE run_id = 20260127 ORDER BY run_ts DESC;
 -- db: Oracle
 -- metadata: test Oracle inferred catalog (file-scoped overlay) + Oracle built-ins
 -- checked: 584
--- missing: 1
+-- missing: 0
 -- marker: [[word]] means not suggested for the tested prefix
--- missing tokens:
---   364:15 word=PUT_LINE prefix=PUT_ suggestions=[] total=0 line=DBMS_OUTPUT.PUT_LINE('filled result table with run_id='||v_run_id);
+-- missing tokens: none
 -- =========================================================

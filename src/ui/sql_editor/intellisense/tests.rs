@@ -50028,6 +50028,12 @@ fn oracle_intellisense_data_from_catalog(catalog: &MysqlFamilyScriptCatalog) -> 
         "USER_OBJECTS",
         vec!["OBJECT_NAME".to_string(), "OBJECT_TYPE".to_string()],
     );
+    push_unique_case_insensitive(&mut data.views, "V$SQL");
+    data.set_columns_for_table(
+        "V$SQL",
+        vec!["SQL_ID".to_string(), "SQL_TEXT".to_string()],
+    );
+    push_unique_case_insensitive(&mut data.users, "SYS");
     push_unique_case_insensitive(&mut data.tables, "EMP");
     data.set_columns_for_table(
         "EMP",
@@ -51669,7 +51675,7 @@ fn intellisense_sweep_is_relation_alias_definition(
             }
             _ => false,
         });
-        if open_idx
+        let table_function_alias = open_idx
             .and_then(|idx| {
                 tokens
                     .get(..idx)
@@ -51683,8 +51689,15 @@ fn intellisense_sweep_is_relation_alias_definition(
                     token_word_text(Some(token)).map(str::to_ascii_uppercase).as_deref(),
                     Some("JSON_TABLE" | "XMLTABLE" | "TABLE")
                 )
-            })
-        {
+            });
+        let derived_query_alias = open_idx.is_some_and(|open_idx| {
+            tokens
+                .get(open_idx.saturating_add(1)..close_idx)
+                .unwrap_or(&[])
+                .iter()
+                .any(|token| token_word_eq(Some(token), "SELECT"))
+        });
+        if table_function_alias || derived_query_alias {
             return true;
         }
     }
@@ -52151,8 +52164,19 @@ fn intellisense_sweep_word_skip_context_from_analysis(
 ) -> bool {
     let deep_ctx = analysis.context.as_ref();
     let (_, word_start, _) = crate::ui::intellisense::get_word_at_cursor(sql, cursor);
+    let cursor_lex_mode =
+        intellisense_test_lex_mode_at(sql, cursor, db_type.is_mysql_or_mariadb());
+    let cursor_in_literal_or_comment = matches!(
+        cursor_lex_mode,
+        crate::sql_parser_engine::LexMode::SingleQuote
+            | crate::sql_parser_engine::LexMode::LineComment
+            | crate::sql_parser_engine::LexMode::BlockComment
+            | crate::sql_parser_engine::LexMode::QQuote { .. }
+            | crate::sql_parser_engine::LexMode::DollarQuote { .. }
+    );
 
-    analysis.cursor_in_alias_declaration
+    cursor_in_literal_or_comment
+        || analysis.cursor_in_alias_declaration
         || deep_ctx.ddl_new_name_position
         || intellisense_sweep_is_out_of_scope_relation_qualifier(
             sql,
@@ -53393,7 +53417,7 @@ fn mariadb_test11_words_generate_out_report() {
 }
 
 #[test]
-#[ignore = "generates IntelliSense sweep reports for the three single-statement final-boss fixtures"]
+#[ignore = "generates IntelliSense sweep reports for the single-statement final-boss fixtures"]
 fn intellisense_sweep_generate_report_for_file_certifies_new_final_boss_queries() {
     oracle_test_words_generate_out_report("oracle_format_final_boss_2.sql", true);
     mysql_test_words_generate_out_report("test7.txt", true);
@@ -53401,6 +53425,8 @@ fn intellisense_sweep_generate_report_for_file_certifies_new_final_boss_queries(
     oracle_test_words_generate_out_report("oracle_format_final_boss_3.sql", true);
     mysql_test_words_generate_out_report("test8.txt", true);
     mariadb_test_words_generate_out_report("test13.txt", true);
+    mysql_test_words_generate_out_report("test9.txt", true);
+    mariadb_test_words_generate_out_report("test14.txt", true);
 }
 
 #[test]
@@ -53437,6 +53463,45 @@ fn mysql_test8_words_generate_out_report() {
 #[ignore = "generates the MariaDB final-boss V IntelliSense sweep report"]
 fn mariadb_test13_words_generate_out_report() {
     mariadb_test_words_generate_out_report("test13.txt", true);
+}
+
+#[test]
+#[ignore = "generates the MySQL final-boss VI IntelliSense sweep report"]
+fn mysql_test9_words_generate_out_report() {
+    mysql_test_words_generate_out_report("test9.txt", true);
+}
+
+#[test]
+#[ignore = "generates the MariaDB final-boss VI IntelliSense sweep report"]
+fn mariadb_test14_words_generate_out_report() {
+    mariadb_test_words_generate_out_report("test14.txt", true);
+}
+
+#[test]
+fn mysql_member_of_continuation_uses_production_completion() {
+    use crate::db::DatabaseType::{MariaDB, MySQL};
+
+    let suggestions = query_keyword_completion_suggestions(
+        "SELECT COALESCE('critical' MEMBER O| (JSON_ARRAY('critical')), FALSE)",
+        MySQL,
+    );
+    assert!(
+        suggestions
+            .iter()
+            .any(|suggestion| suggestion.eq_ignore_ascii_case("OF")),
+        "MySQL MEMBER OF continuation missing from production completion: {suggestions:?}"
+    );
+
+    let mariadb_suggestions = query_keyword_completion_suggestions(
+        "SELECT COALESCE('critical' MEMBER O| (JSON_ARRAY('critical')), FALSE)",
+        MariaDB,
+    );
+    assert!(
+        mariadb_suggestions
+            .iter()
+            .all(|suggestion| !suggestion.eq_ignore_ascii_case("OF")),
+        "MySQL-only MEMBER OF continuation leaked into MariaDB: {mariadb_suggestions:?}"
+    );
 }
 
 #[test]
@@ -87817,6 +87882,50 @@ fn assert_mysql_family_fixture_completion_cases(
     );
 }
 
+fn fixture_spliced_snapshot_with_cursor(
+    script: &str,
+    needle: &str,
+    replacement: &str,
+) -> Option<(ChunkedText, usize)> {
+    const MARKER: &str = "__CODEX_CURSOR__";
+    let marked_replacement = if replacement.contains(MARKER) {
+        replacement.to_string()
+    } else {
+        replacement.replacen('|', MARKER, 1)
+    };
+    let cursor_in_replacement = marked_replacement.find(MARKER)?;
+    let edited_replacement = marked_replacement.replacen(MARKER, "", 1);
+    let needle_start = script.find(needle)?;
+
+    let common_prefix = needle
+        .bytes()
+        .zip(edited_replacement.bytes())
+        .take_while(|(left, right)| left == right)
+        .count();
+    let suffix_limit = needle
+        .len()
+        .saturating_sub(common_prefix)
+        .min(edited_replacement.len().saturating_sub(common_prefix));
+    let common_suffix = needle
+        .as_bytes()
+        .iter()
+        .rev()
+        .zip(edited_replacement.as_bytes().iter().rev())
+        .take(suffix_limit)
+        .take_while(|(left, right)| left == right)
+        .count();
+    let edit_start = needle_start.saturating_add(common_prefix);
+    let edit_end = needle_start.saturating_add(needle.len().saturating_sub(common_suffix));
+    let replacement_end = edited_replacement.len().saturating_sub(common_suffix);
+    let replacement_slice = edited_replacement.get(common_prefix..replacement_end)?;
+
+    let mut snapshot = ChunkedText::from_str(script);
+    if !snapshot.replace_range(edit_start, edit_end, replacement_slice) {
+        return None;
+    }
+    Some((snapshot, needle_start.saturating_add(cursor_in_replacement)))
+}
+
 fn mysql_family_fixture_completion_case_failures(
     file_name: &str,
     db_type: crate::db::DatabaseType,
@@ -87835,35 +87944,28 @@ fn mysql_family_fixture_completion_case_failures(
 
     let mut failures = Vec::new();
     for (needle, replacement, expected) in cases {
-        let marked_replacement = if replacement.contains("__CODEX_CURSOR__") {
-            (*replacement).to_string()
-        } else {
-            replacement.replacen('|', "__CODEX_CURSOR__", 1)
-        };
-        let marked = script.replacen(needle, &marked_replacement, 1);
-        if marked == script {
+        let Some((snapshot, cursor)) =
+            fixture_spliced_snapshot_with_cursor(script, needle, replacement)
+        else {
             failures.push(format!("test setup failed to replace `{needle}`"));
             continue;
-        }
+        };
 
         let mut data = mysql_family_test_intellisense_data(file_name, db_type);
-        let suggestions = query_completion_suggestions_with_data(&marked, db_type, true, &mut data);
+        let suggestions = query_completion_suggestions_from_snapshot_with_data(
+            &snapshot,
+            cursor,
+            db_type,
+            true,
+            &mut data,
+        );
         if !has(&suggestions, expected) {
-            let debug_cursor = marked.find("__CODEX_CURSOR__").unwrap_or_default();
-            let debug_sql = marked.replacen("__CODEX_CURSOR__", "", 1);
-            let (routine_cache, expanded) =
-                SqlEditorWidget::build_routine_symbol_cache_bundle_for_test_for_db_type(
-                    &debug_sql,
-                    debug_cursor,
-                    Some(db_type),
-                );
-            let analysis = SqlEditorWidget::build_intellisense_analysis_from_routine_cache(
-                &routine_cache,
-                expanded.cursor_in_statement,
-            );
+            let (_expanded, analysis) =
+                intellisense_analysis_from_snapshot_for_test(&snapshot, cursor, db_type);
             let deep_ctx = analysis.context.clone();
+            let debug_sql = snapshot.range_string(0, snapshot.len()).unwrap_or_default();
             let (debug_prefix, _, _) =
-                crate::ui::intellisense::get_word_at_cursor(&debug_sql, debug_cursor);
+                crate::ui::intellisense::get_word_at_cursor(&debug_sql, cursor);
             let debug_keywords =
                 SqlEditorWidget::collect_expected_keyword_suggestions_with_expression_context(
                     &debug_prefix,
@@ -87912,45 +88014,31 @@ fn oracle_fixture_completion_case_failures(
 
     let mut failures = Vec::new();
     for (needle, replacement, expected) in cases {
-        let marked_replacement = if replacement.contains("__CODEX_CURSOR__") {
-            (*replacement).to_string()
-        } else {
-            replacement.replacen('|', "__CODEX_CURSOR__", 1)
-        };
-        let marked = script.replacen(needle, &marked_replacement, 1);
-        if marked == script {
+        let Some((snapshot, cursor)) =
+            fixture_spliced_snapshot_with_cursor(script, needle, replacement)
+        else {
             failures.push(format!("test setup failed to replace `{needle}`"));
             continue;
-        }
+        };
 
         let mut data = oracle_test_file_scoped_intellisense_data(file_name);
-        let suggestions = query_completion_suggestions_with_data(
-            &marked,
+        let suggestions = query_completion_suggestions_from_snapshot_with_data(
+            &snapshot,
+            cursor,
             crate::db::DatabaseType::Oracle,
             true,
             &mut data,
         );
         if !has(&suggestions, expected) {
-            let (debug_cursor, debug_sql) =
-                if let Some(pos) = marked.find("__CODEX_CURSOR__") {
-                    (pos, marked.replacen("__CODEX_CURSOR__", "", 1))
-                } else {
-                    let pos = marked.find('|').unwrap_or_default();
-                    (pos, marked.replace('|', ""))
-                };
-            let (routine_cache, expanded) =
-                SqlEditorWidget::build_routine_symbol_cache_bundle_for_test_for_db_type(
-                    &debug_sql,
-                    debug_cursor,
-                    Some(crate::db::DatabaseType::Oracle),
-                );
-            let analysis = SqlEditorWidget::build_intellisense_analysis_from_routine_cache(
-                &routine_cache,
-                expanded.cursor_in_statement,
+            let debug_sql = snapshot.range_string(0, snapshot.len()).unwrap_or_default();
+            let (_expanded, analysis) = intellisense_analysis_from_snapshot_for_test(
+                &snapshot,
+                cursor,
+                crate::db::DatabaseType::Oracle,
             );
             let deep_ctx = analysis.context.clone();
             let (debug_prefix, _, _) =
-                crate::ui::intellisense::get_word_at_cursor(&debug_sql, debug_cursor);
+                crate::ui::intellisense::get_word_at_cursor(&debug_sql, cursor);
             let debug_keywords =
                 SqlEditorWidget::collect_expected_keyword_suggestions_with_expression_context(
                     &debug_prefix,
@@ -91130,6 +91218,42 @@ fn sweep_report_skips_new_identifier_definition_slots_but_not_keywords() {
 }
 
 #[test]
+fn sweep_report_suppresses_the_same_literal_and_comment_positions_as_production() {
+    use crate::db::DatabaseType::Oracle;
+
+    for (marked, word) in [
+        ("BEGIN v_sql := q'[WHEN MATC__CODEX_CURSOR__ THEN]'; END;", "MATCHED"),
+        ("SELECT 'EMP__CODEX_CURSOR__' FROM dual", "EMPLOYEE"),
+        ("SELECT 1 -- MATC__CODEX_CURSOR__", "MATCHED"),
+        ("SELECT /* MATC__CODEX_CURSOR__ */ 1 FROM dual", "MATCHED"),
+    ] {
+        assert!(
+            intellisense_sweep_word_skip_context(marked, Oracle, word),
+            "production-suppressed token `{word}` was treated as a sweep completion requirement"
+        );
+    }
+
+    assert!(
+        !intellisense_sweep_word_skip_context(
+            "MERGE INTO t USING s ON (t.id = s.id) WHEN MATC__CODEX_CURSOR__ THEN UPDATE SET t.v = s.v",
+            Oracle,
+            "MATCHED",
+        ),
+        "an executable MERGE keyword was incorrectly skipped"
+    );
+    let suggestions = query_keyword_completion_suggestions(
+        "MERGE INTO t USING s ON (t.id = s.id) WHEN MATC| THEN UPDATE SET t.v = s.v",
+        Oracle,
+    );
+    assert!(
+        suggestions
+            .iter()
+            .any(|suggestion| suggestion.eq_ignore_ascii_case("MATCHED")),
+        "MATCHED missing at an executable MERGE keyword slot: {suggestions:?}"
+    );
+}
+
+#[test]
 fn sweep_report_skips_only_scope_invalid_non_lateral_outer_references() {
     use crate::db::DatabaseType::Oracle;
 
@@ -91208,6 +91332,26 @@ fn sweep_fixture_metadata_preserves_typed_members_and_result_columns() {
             .any(|column| column.eq_ignore_ascii_case("EMP_ID")),
         "outer correlated-table fixture metadata is incomplete"
     );
+
+    for (file_name, table, column) in [
+        ("oracle_format_final_boss_v2.sql", "QT_FMT_EMP", "EMP_ID"),
+        ("test16.sql", "QT_SPLITTER_ULTIMATE", "COMMENT"),
+        ("test25.sql", "QT25_EMP", "DEPTNO"),
+    ] {
+        let data = oracle_test_file_scoped_intellisense_data(file_name);
+        assert!(
+            data.tables
+                .iter()
+                .any(|candidate| candidate.eq_ignore_ascii_case(table)),
+            "{file_name} metadata lost table {table}"
+        );
+        assert!(
+            data.get_columns_for_table(table)
+                .iter()
+                .any(|candidate| candidate.eq_ignore_ascii_case(column)),
+            "{file_name} metadata lost {table}.{column}"
+        );
+    }
 
     let mariadb = mysql_family_test_intellisense_data(
         "test4.txt",
@@ -91330,6 +91474,221 @@ fn sweep_remaining_fixture_misses_reproduce_at_the_exact_token() {
         failures.is_empty(),
         "exact sweep-token completion gaps:\n{}",
         failures.join("\n")
+    );
+}
+
+#[test]
+fn full_sweep_remaining_actionable_tokens_use_the_production_main_path() {
+    let mut failures = Vec::new();
+    failures.extend(oracle_fixture_completion_case_failures(
+        "oracle_format_final_boss.sql",
+        &[
+            ("        WITH cat_stat AS", "        WIT| cat_stat AS", "WITH"),
+            (
+                "                    SELECT COUNT(*)\n                    FROM dual\n                    WHERE c.n > b.n",
+                "                    SELE| COUNT(*)\n                    FROM dual\n                    WHERE c.n > b.n",
+                "SELECT",
+            ),
+        ],
+    ));
+    failures.extend(oracle_fixture_completion_case_failures(
+        "oracle_format_final_boss_v2.sql",
+        &[
+            (
+                "SELECT COUNT(*)\n                                                   FROM qt_fmt_bonus b\n                                                   WHERE b.emp_id = e.emp_id",
+                "SELECT COUNT(*)\n                                                   FROM qt_fmt_bonus b\n                                                   WHERE b.emp_id = e|.emp_id",
+                "e",
+            ),
+            (
+                "    END run_dynamic_merge;\nEND qt_fmt_pkg;",
+                "    END run_dynamic_merge;\nEND qt_f|;",
+                "qt_fmt_pkg",
+            ),
+            (
+                "FROM qt_fmt_emp e\nLEFT JOIN salary_model sm",
+                "FROM qt_f| e\nLEFT JOIN salary_model sm",
+                "qt_fmt_emp",
+            ),
+            (
+                "           WHEN e.status_cd = 'LEAVE' THEN e.job_title || ' / On Leave'",
+                "           WHE| e.status_cd = 'LEAVE' THEN e.job_title || ' / On Leave'",
+                "WHEN",
+            ),
+            ("SELECT y.column_value", "SELECT y.colu|", "column_value"),
+            (
+                "FROM TABLE(sys.odcinumberlist(2024, 2025)) y",
+                "FROM TABLE(sy|.odcinumberlist(2024, 2025)) y",
+                "sys",
+            ),
+        ],
+    ));
+    failures.extend(oracle_fixture_completion_case_failures(
+        "oracle_format_ultimate_boss.sql",
+        &[
+            (
+                "                    WHEN r.object_type = 'VIEW' THEN",
+                "                    WHE| r.object_type = 'VIEW' THEN",
+                "WHEN",
+            ),
+            (
+                "                DBMS_OUTPUT.PUT_LINE(\n                    'EMP_ID='",
+                "                DBMS_OUTPUT.PUT_|(\n                    'EMP_ID='",
+                "PUT_LINE",
+            ),
+        ],
+    ));
+    failures.extend(oracle_fixture_completion_case_failures(
+        "repro_sqlid_6brq8ayq9s8ay.sql",
+        &[
+            ("SELECT sql_id, sql_text", "SELECT sql_|, sql_text", "sql_id"),
+            ("SELECT sql_id, sql_text", "SELECT sql_id, sql_|", "sql_text"),
+            ("FROM v$sql", "FROM v$sq|", "v$sql"),
+            ("WHERE sql_id =", "WHERE sql_| =", "sql_id"),
+        ],
+    ));
+    failures.extend(oracle_fixture_completion_case_failures(
+        "test10.txt",
+        &[
+            (
+                "l_rows (i).REMARK);",
+                "l_rows (i).REMA|);",
+                "REMARK",
+            ),
+            ("CURSOR c_src IS", "CURSOR c_src I|", "IS"),
+        ],
+    ));
+    failures.extend(oracle_fixture_completion_case_failures(
+        "test16.sql",
+        &[(
+            "qt_splitter_ultimate.\"COMMENT\" IS",
+            "qt_splitter_ultimate.\"COMM|\" IS",
+            "COMMENT",
+        )],
+    ));
+    for file_name in ["test20.sql", "test21.sql"] {
+        failures.extend(oracle_fixture_completion_case_failures(
+            file_name,
+            &[("TABLE(sys.odcinumberlist", "TABLE(sy|.odcinumberlist", "sys")],
+        ));
+    }
+    failures.extend(oracle_fixture_completion_case_failures(
+        "test25.sql",
+        &[
+            ("CONNECT_BY_ISCYCLE AS", "CONN| AS", "CONNECT_BY_ISCYCLE"),
+            ("        FORALL idx IN", "        FORA| idx IN", "FORALL"),
+            ("        WHEN DUP_VAL_ON_INDEX THEN", "        WHE| DUP_VAL_ON_INDEX THEN", "WHEN"),
+            ("WHEN DUP_VAL_ON_INDEX THEN", "WHEN DUP_| THEN", "DUP_VAL_ON_INDEX"),
+            ("        SELECT\n            CASE", "        SELE|\n            CASE", "SELECT"),
+            ("                WHEN COUNT (*) > 0", "                WHE| COUNT (*) > 0", "WHEN"),
+            ("        INTO v_dummy", "        INT| v_dummy", "INTO"),
+            (
+                "        INTO v_dummy\n        FROM\n            qt25_emp\n        WHERE",
+                "        INTO v_dummy\n        FROM\n            qt25|\n        WHERE",
+                "qt25_emp",
+            ),
+            ("            deptno = 10;", "            dept| = 10;", "deptno"),
+            ("            GOTO final_label;", "            GOT| final_label;", "GOTO"),
+            ("    WHEN NO_DATA_FOUND THEN", "    WHE| NO_DATA_FOUND THEN", "WHEN"),
+            ("WHEN NO_DATA_FOUND THEN", "WHEN NO_D| THEN", "NO_DATA_FOUND"),
+            ("WHEN TOO_MANY_ROWS THEN", "WHEN TOO_| THEN", "TOO_MANY_ROWS"),
+        ],
+    ));
+    failures.extend(oracle_fixture_completion_case_failures(
+        "test_open_with.sql",
+        &[
+            ("            SELECT jt.sku,", "            SELE| jt.sku,", "SELECT"),
+            ("            SELECT COUNT(*) AS item_cnt,", "            SELE| COUNT(*) AS item_cnt,", "SELECT"),
+        ],
+    ));
+    failures.extend(mysql_family_fixture_completion_case_failures(
+        "test10.txt",
+        crate::db::DatabaseType::MariaDB,
+        &[(
+            "REPLACE INTO mb_observation",
+            "REPLACE INT| mb_observation",
+            "INTO",
+        )],
+    ));
+
+    assert!(
+        failures.is_empty(),
+        "current full-sweep production completion gaps:\n{}",
+        failures.join("\n")
+    );
+}
+
+#[test]
+fn full_sweep_skips_apply_alias_definition_at_the_exact_slot() {
+    let script = load_intellisense_test_file("oracle_format_final_boss_v2.sql");
+    let marked = script.replacen(
+        "         FETCH FIRST 1 ROW ONLY\n     ) x\n     OUTER APPLY",
+        "         FETCH FIRST 1 ROW ONLY\n     ) x__CODEX_CURSOR__\n     OUTER APPLY",
+        1,
+    );
+    assert_ne!(marked, script, "fixture cursor setup failed");
+    assert!(intellisense_sweep_word_skip_context(
+        &marked,
+        crate::db::DatabaseType::Oracle,
+        "x",
+    ));
+}
+
+#[test]
+fn full_sweep_indexed_collection_member_scope_is_preserved_at_the_exact_slot() {
+    let script = load_intellisense_test_file("test10.txt");
+    let marked = script.replacen(
+        "l_rows (i).REMARK);",
+        "l_rows (i).REMA__CODEX_CURSOR__);",
+        1,
+    );
+    assert_ne!(marked, script, "fixture cursor setup failed");
+    let cursor = marked.find("__CODEX_CURSOR__").expect("cursor");
+    let sql = marked.replacen("__CODEX_CURSOR__", "", 1);
+    let qualifier = SqlEditorWidget::qualifier_before_prefix_at_text_end(
+        sql.get(..cursor).unwrap_or(""),
+        "REMA",
+    )
+    .expect("indexed collection qualifier");
+    assert_eq!(qualifier.to_ascii_lowercase(), "l_rows");
+    let (routine_cache, expanded) =
+        SqlEditorWidget::build_routine_symbol_cache_bundle_for_test(&sql, cursor);
+    let analysis = SqlEditorWidget::build_intellisense_analysis_from_routine_cache(
+        &routine_cache,
+        expanded.cursor_in_statement,
+    );
+    let local_names = analysis
+        .local_symbols
+        .iter()
+        .filter(|symbol| {
+            matches!(
+                symbol.upper.as_str(),
+                "T_SALES_SRC_REC" | "T_SALES_SRC_TAB" | "L_ROWS"
+            )
+        })
+        .map(|symbol| {
+            (
+                symbol.name.clone(),
+                symbol.members.clone(),
+                symbol.member_source_upper.clone(),
+                symbol.member_source_is_collection_like,
+                symbol.is_type_symbol,
+            )
+        })
+        .collect::<Vec<_>>();
+    let suggestions = SqlEditorWidget::collect_local_record_member_suggestions_for_test(
+        &marked,
+        &qualifier,
+        "REMA",
+    )
+    .unwrap_or_default();
+    assert!(
+        suggestions
+            .iter()
+            .any(|suggestion| suggestion.eq_ignore_ascii_case("REMARK")),
+        "fixture local-symbol analysis lost l_rows(i).REMARK: qualifier={qualifier:?} suggestions={suggestions:?} expanded_start={} cursor={} locals={:?}",
+        expanded.statement_start,
+        expanded.cursor_in_statement,
+        local_names,
     );
 }
 

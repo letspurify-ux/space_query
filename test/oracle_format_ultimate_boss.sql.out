@@ -31,7 +31,7 @@ BEGIN
                 ELSE 5
             END
     ) LOOP
-        [[BEGIN]]
+        BEGIN
             EXECUTE IMMEDIATE
                 CASE
                     WHEN r.object_type = 'VIEW' THEN
@@ -50,7 +50,7 @@ BEGIN
                 NULL;
         END;
     END LOOP;
-[[END]];
+END;
 /
 
 --------------------------------------------------------------------------------
@@ -667,13 +667,13 @@ MATCH_RECOGNIZE (
         CLASSIFIER()                                                       AS cls,
         FIRST(sale_date)                                                   AS first_sale_date,
         LAST(sale_date)                                                    AS last_sale_date,
-        SUM(([[qty]] * unit_price) - discount_amt + tax_amt)                   AS pattern_sales
+        SUM((qty * unit_price) - discount_amt + tax_amt)                   AS pattern_sales
     ALL ROWS PER MATCH
     PATTERN (low+ mid* high)
     DEFINE
-        low  AS (([[qty]] * unit_price) - discount_amt + tax_amt) < 10000,
-        mid  AS (([[qty]] * unit_price) - discount_amt + tax_amt) BETWEEN 10000 AND 30000,
-        high AS (([[qty]] * unit_price) - discount_amt + tax_amt) > 30000
+        low  AS ((qty * unit_price) - discount_amt + tax_amt) < 10000,
+        mid  AS ((qty * unit_price) - discount_amt + tax_amt) BETWEEN 10000 AND 30000,
+        high AS ((qty * unit_price) - discount_amt + tax_amt) > 30000
 )
 ORDER BY emp_id, sale_date, sale_id;
 
@@ -731,7 +731,7 @@ SELECT
             'job' VALUE e.job_title,
             'salary' VALUE e.salary,
             'sales' VALUE (
-                [[SELECT]] NVL(SUM((s.qty * s.unit_price) - s.discount_amt + s.tax_amt), 0)
+                SELECT NVL(SUM((s.qty * s.unit_price) - s.discount_amt + s.tax_amt), 0)
                 FROM qt_fmt_sales s
                 WHERE s.emp_id = e.emp_id
             ),
@@ -1269,14 +1269,7 @@ ORDER BY e.emp_id;
 -- db: Oracle
 -- metadata: test Oracle inferred catalog (file-scoped overlay) + Oracle built-ins
 -- checked: 2460
--- missing: 7
+-- missing: 0
 -- marker: [[word]] means not suggested for the tested prefix
--- missing tokens:
---   34:9 word=BEGIN prefix=BEGI suggestions=[] total=0 line=BEGIN
---   53:1 word=END prefix=EN suggestions=[] total=0 line=END;
---   670:14 word=qty prefix=qt suggestions=[] total=0 line=SUM((qty * unit_price) - discount_amt + tax_amt)                   AS pattern_sales
---   674:19 word=qty prefix=qt suggestions=[] total=0 line=low  AS ((qty * unit_price) - discount_amt + tax_amt) < 10000,
---   675:19 word=qty prefix=qt suggestions=[] total=0 line=mid  AS ((qty * unit_price) - discount_amt + tax_amt) BETWEEN 10000 AND 30000,
---   676:19 word=qty prefix=qt suggestions=[] total=0 line=high AS ((qty * unit_price) - discount_amt + tax_amt) > 30000
---   734:17 word=SELECT prefix=SELE suggestions=[] total=0 line=SELECT NVL(SUM((s.qty * s.unit_price) - s.discount_amt + s.tax_amt), 0)
+-- missing tokens: none
 -- =========================================================

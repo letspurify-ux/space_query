@@ -259,7 +259,7 @@ BEGIN
             WHEN p_id IS NULL THEN q'[NULL-ID ; / ]'
             WHEN p_id < 0 THEN 'NEGATIVE;ID'
             ELSE
-                'ID=' || [[p_id]]
+                'ID=' || p_id
                 || ';NAME=' || REPLACE(v_name, ';', ':')
                 || ';COMMENT=' || REPLACE(v_comment, '/', '|')
         END;
@@ -833,7 +833,7 @@ COMMENT ON TABLE qt_splitter_ultimate IS 'ultimate splitter boss ; / table comme
 --------------------------------------------------------------------------------
 -- UNIT 034
 --------------------------------------------------------------------------------
-COMMENT ON COLUMN qt_splitter_ultimate.[["COMMENT"]] IS 'column comment ; / tricky';
+COMMENT ON COLUMN qt_splitter_ultimate."COMMENT" IS 'column comment ; / tricky';
 
 --------------------------------------------------------------------------------
 -- UNIT 035
@@ -903,9 +903,7 @@ PROMPT === QT SPLITTER FINAL ULTIMATE BOSS END ===
 -- db: Oracle
 -- metadata: test Oracle inferred catalog (file-scoped overlay) + Oracle built-ins
 -- checked: 1106
--- missing: 2
+-- missing: 0
 -- marker: [[word]] means not suggested for the tested prefix
--- missing tokens:
---   262:26 word=p_id prefix=p_i suggestions=[] total=0 line='ID=' || p_id
---   836:40 word="COMMENT" prefix=COMM suggestions=[] total=0 line=COMMENT ON COLUMN qt_splitter_ultimate."COMMENT" IS 'column comment ; / tricky';
+-- missing tokens: none
 -- =========================================================

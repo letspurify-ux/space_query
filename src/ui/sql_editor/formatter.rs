@@ -1952,6 +1952,11 @@ enum FormatFrameAlignmentEvent {
         token_idx: usize,
         expected_indent: usize,
     },
+    ContainedClause {
+        frame_id: SqlFormatFrameId,
+        token_idx: usize,
+        minimum_indent: usize,
+    },
 }
 
 #[cfg(test)]
@@ -2050,6 +2055,20 @@ impl FormatFrameAlignmentAudit {
         }
     }
 
+    fn record_contained_clause(
+        &mut self,
+        frame_id: SqlFormatFrameId,
+        token_idx: usize,
+        minimum_indent: usize,
+    ) {
+        self.events
+            .push(FormatFrameAlignmentEvent::ContainedClause {
+                frame_id,
+                token_idx,
+                minimum_indent,
+            });
+    }
+
     fn line_start_indent(formatted: &str, offset: usize) -> Option<usize> {
         let line_start = formatted
             .get(..offset)?
@@ -2122,6 +2141,30 @@ impl FormatFrameAlignmentAudit {
                             offset: span.start,
                             message: format!(
                                 "paren frame {frame_id} close indent drift: expected level {expected_indent}, actual level {actual_indent}, parent={:?}, opener_token={}",
+                                frame.and_then(|frame| frame.parent_id),
+                                frame.map_or(0, |frame| frame.open_token_idx),
+                            ),
+                        });
+                    }
+                }
+                FormatFrameAlignmentEvent::ContainedClause {
+                    frame_id,
+                    token_idx,
+                    minimum_indent,
+                } => {
+                    let Some(span) = spans.get(token_idx) else {
+                        continue;
+                    };
+                    let Some(actual_indent) = Self::line_start_indent(formatted, span.start) else {
+                        continue;
+                    };
+                    summary.checked_body_items = summary.checked_body_items.saturating_add(1);
+                    if actual_indent < minimum_indent {
+                        let frame = self.frame(frame_id);
+                        summary.issues.push(FormatFrameAlignmentIssue {
+                            offset: span.start,
+                            message: format!(
+                                "paren frame {frame_id} contained clause escaped its body: minimum level {minimum_indent}, actual level {actual_indent}, parent={:?}, opener_token={}",
                                 frame.and_then(|frame| frame.parent_id),
                                 frame.map_or(0, |frame| frame.open_token_idx),
                             ),
@@ -2373,6 +2416,15 @@ impl FormatFrameStack {
             next_token_is_parent_comma,
             expected_close_indent,
         );
+    }
+
+    #[cfg(test)]
+    fn audit_contained_clause(&mut self, token_idx: usize, minimum_indent: usize) {
+        let Some(frame_id) = self.last_paren_frame_id() else {
+            return;
+        };
+        self.frame_alignment_audit
+            .record_contained_clause(frame_id, token_idx, minimum_indent);
     }
 
     #[cfg(test)]
@@ -10683,6 +10735,22 @@ impl SqlEditorWidget {
                                     })
                                     .map(|dml_base| clause_header_indent.max(dml_base))
                                     .unwrap_or(clause_header_indent);
+                                // A clause-like keyword that is grammatical inside an
+                                // ordinary expression/call frame (for example MariaDB
+                                // aggregate `LIMIT`) must never escape to a shallower
+                                // query-clause depth. Query-like and column-list parens
+                                // intentionally return no sibling body indent and keep
+                                // their dedicated layout rules.
+                                let owner_frame_body_indent = format_stack
+                                    .last_paren()
+                                    .and_then(|frame| frame.sibling_body_indent());
+                                let clause_header_indent = owner_frame_body_indent
+                                    .map(|body_indent| clause_header_indent.max(body_indent))
+                                    .unwrap_or(clause_header_indent);
+                                #[cfg(test)]
+                                if let Some(body_indent) = owner_frame_body_indent {
+                                    format_stack.audit_contained_clause(idx, body_indent);
+                                }
                                 newline_with(
                                     &mut out,
                                     plsql_statement_body_indent
@@ -43054,6 +43122,50 @@ FROM dept d;"#;
                 &formatted,
                 false,
                 Some(crate::db::connection::DatabaseType::MySQL),
+            ),
+            formatted
+        );
+    }
+
+    #[test]
+    fn format_for_auto_formatting_mariadb_keeps_aggregate_limit_inside_owner_frame() {
+        let source = r#"SELECT
+    tenant_id,
+    GROUP_CONCAT(DISTINCT source_code ORDER BY source_code SEPARATOR ',' LIMIT 4) AS source_list,
+    JSON_ARRAYAGG(JSON_OBJECT('run', run_id) ORDER BY run_id LIMIT 10) AS run_json
+FROM run_facts
+GROUP BY tenant_id;"#;
+        let formatted = SqlEditorWidget::format_for_auto_formatting_with_db_type(
+            source,
+            false,
+            Some(crate::db::connection::DatabaseType::MariaDB),
+        );
+        let lines: Vec<&str> = formatted.lines().collect();
+
+        let group_concat_idx =
+            find_line_starting_with(&lines, "GROUP_CONCAT(").expect("GROUP_CONCAT select item");
+        let group_limit_idx =
+            find_line_starting_with(&lines, "LIMIT 4)").expect("GROUP_CONCAT LIMIT clause");
+        let json_agg_idx =
+            find_line_starting_with(&lines, "JSON_ARRAYAGG(").expect("JSON_ARRAYAGG select item");
+        let json_limit_idx =
+            find_line_starting_with(&lines, "LIMIT 10)").expect("JSON_ARRAYAGG LIMIT clause");
+
+        assert_eq!(
+            leading_spaces(lines[group_limit_idx]),
+            leading_spaces(lines[group_concat_idx]).saturating_add(4),
+            "GROUP_CONCAT LIMIT escaped its owning aggregate frame:\n{formatted}"
+        );
+        assert_eq!(
+            leading_spaces(lines[json_limit_idx]),
+            leading_spaces(lines[json_agg_idx]).saturating_add(4),
+            "JSON_ARRAYAGG LIMIT escaped its owning aggregate frame:\n{formatted}"
+        );
+        assert_eq!(
+            SqlEditorWidget::format_for_auto_formatting_with_db_type(
+                &formatted,
+                false,
+                Some(crate::db::connection::DatabaseType::MariaDB),
             ),
             formatted
         );
