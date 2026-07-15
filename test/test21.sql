@@ -111,7 +111,8 @@ CREATE TABLE qt_x_emp
     created_at         TIMESTAMP DEFAULT SYSTIMESTAMP,
     updated_at         TIMESTAMP,
     CONSTRAINT qt_x_emp_fk1 FOREIGN KEY (dept_id) REFERENCES qt_x_dept(dept_id)
-);
+)
+XMLTYPE COLUMN xml_payload STORE AS BASICFILE CLOB;
 /
 
 CREATE TABLE qt_x_stage
@@ -152,7 +153,8 @@ CREATE TABLE qt_x_xml
     doc_id             NUMBER PRIMARY KEY,
     doc_body           XMLTYPE,
     created_at         TIMESTAMP DEFAULT SYSTIMESTAMP
-);
+)
+XMLTYPE COLUMN doc_body STORE AS BASICFILE CLOB;
 /
 
 CREATE TABLE qt_x_err_log
@@ -717,7 +719,7 @@ SELECT COUNT(*)
         v_block2 CLOB;
         v_x      NUMBER;
     BEGIN
-        v_block1 := q'[
+        v_block1 := q'~
 DECLARE
     v_txt   CLOB;
     v_cnt   NUMBER;
@@ -742,7 +744,7 @@ BEGIN
         SYSTIMESTAMP
     );
 END;
-]';
+~';
 
         v_block2 := q'~
 DECLARE
@@ -762,7 +764,7 @@ BEGIN
         'dynamic-2',
         'JSON_READ',
         v_val,
-        q'[contains q''[abc;def/]'' and slash / and semicolon ;]',
+        q'!contains q''[abc;def/]'' and slash / and semicolon ;!',
         SYSTIMESTAMP
     );
 END;
@@ -864,7 +866,7 @@ END;
 
             BEGIN
                 IF v_grade = 'S' THEN
-                    v_dynamic_sql := q'[
+                    v_dynamic_sql := q'~
                         BEGIN
                             INSERT INTO qt_x_audit
                             (
@@ -880,7 +882,7 @@ END;
                                 SYSTIMESTAMP
                             );
                         END;
-                    ]';
+                    ~';
 
                     EXECUTE IMMEDIATE v_dynamic_sql USING 'emp=' || v_emp_id || ', grade=' || v_grade;
                 ELSIF v_salary IS NULL THEN
@@ -1128,7 +1130,7 @@ SELECT
     g.*,
     CURSOR
     (
-        SELECT a.audit_id, a.action_name, a.created_at
+        SELECT a.audit_id, a.action_name
           FROM qt_x_audit a
          WHERE a.created_at >= SYSTIMESTAMP - INTERVAL '1' DAY
     ) AS audit_cur
@@ -1190,16 +1192,16 @@ SELECT dept_id, seq_no, calc_value
   (
       SELECT dept_id,
              ROW_NUMBER() OVER (PARTITION BY dept_id ORDER BY emp_id) AS seq_no,
-             NVL(salary,0) AS calc_value
+             NVL(salary,0) AS base_value
         FROM qt_x_emp
   )
   MODEL
   PARTITION BY (dept_id)
   DIMENSION BY (seq_no)
-  MEASURES (calc_value)
-  RULES
+  MEASURES (base_value, 0 AS calc_value)
+  RULES SEQUENTIAL ORDER
   (
-      calc_value[ANY] = calc_value[CV()] + NVL(calc_value[CV()-1], 0)
+      calc_value[ANY] = base_value[CV()] + NVL(calc_value[CV()-1], 0)
   )
  ORDER BY dept_id, seq_no;
 /
@@ -1349,7 +1351,7 @@ BEGIN
         FORALL i IN INDICES OF v_emp_ids SAVE EXCEPTIONS
             UPDATE qt_x_emp
                SET bonus = v_bonus(i),
-                   note_text = NVL(note_text, EMPTY_CLOB()) || CHR(10) || 'bulk idx=' || i || '; /'
+                   note_text = NVL(note_text, EMPTY_CLOB()) || CHR(10) || 'bulk emp_id=' || v_emp_ids(i) || '; /'
              WHERE emp_id = v_emp_ids(i);
     EXCEPTION
         WHEN bulk_errors THEN
@@ -1373,7 +1375,7 @@ DECLARE
     v_stmt1 CLOB;
     v_stmt2 CLOB;
 BEGIN
-    v_stmt1 := q'[
+    v_stmt1 := q'~
         DECLARE
             v_x NUMBER := 1;
             v_t CLOB := q'[inner dynamic ; / BEGIN END]';
@@ -1392,9 +1394,9 @@ BEGIN
                 SYSTIMESTAMP
             );
         END;
-    ]';
+    ~';
 
-    v_stmt2 := q'[
+    v_stmt2 := q'~
         BEGIN
             INSERT INTO qt_x_audit
             (
@@ -1410,7 +1412,7 @@ BEGIN
                 SYSTIMESTAMP
             );
         END;
-    ]';
+    ~';
 
     EXECUTE IMMEDIATE v_stmt1;
     EXECUTE IMMEDIATE v_stmt2;

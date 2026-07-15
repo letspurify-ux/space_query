@@ -8,6 +8,85 @@
      - 일부 구문은 DB 버전/권한/객체 유무에 따라 실행보다 포맷팅 검증에 의미가 있음
    ===================================================================== */
 
+BEGIN
+    FOR obj IN (
+        SELECT object_name, object_type
+        FROM user_objects
+        WHERE object_name LIKE 'QT25_%'
+        ORDER BY CASE object_type WHEN 'VIEW' THEN 1 WHEN 'TABLE' THEN 2 ELSE 3 END
+    ) LOOP
+        BEGIN
+            IF obj.object_type = 'VIEW' THEN
+                EXECUTE IMMEDIATE 'DROP VIEW ' || obj.object_name;
+            ELSIF obj.object_type = 'TABLE' THEN
+                EXECUTE IMMEDIATE 'DROP TABLE ' || obj.object_name || ' PURGE';
+            ELSIF obj.object_type = 'SEQUENCE' THEN
+                EXECUTE IMMEDIATE 'DROP SEQUENCE ' || obj.object_name;
+            END IF;
+        EXCEPTION
+            WHEN OTHERS THEN NULL;
+        END;
+    END LOOP;
+END;
+/
+
+CREATE TABLE qt25_dept
+(
+    deptno NUMBER PRIMARY KEY,
+    dname  VARCHAR2(30),
+    loc    VARCHAR2(30)
+);
+
+CREATE TABLE qt25_emp
+(
+    empno    NUMBER PRIMARY KEY,
+    ename    VARCHAR2(30),
+    job      VARCHAR2(30),
+    mgr      NUMBER,
+    hiredate DATE,
+    sal      NUMBER,
+    comm     NUMBER,
+    deptno   NUMBER
+);
+
+CREATE TABLE qt25_emp_bonus
+(
+    empno        NUMBER PRIMARY KEY,
+    deptno       NUMBER,
+    bonus_amount NUMBER,
+    created_at   TIMESTAMP,
+    updated_at   TIMESTAMP,
+    note_text    VARCHAR2(4000)
+);
+
+CREATE TABLE qt25_emp_grade_high (empno NUMBER, ename VARCHAR2(30), sal NUMBER, deptno NUMBER, grade_text VARCHAR2(10));
+CREATE TABLE qt25_emp_grade_mid  (empno NUMBER, ename VARCHAR2(30), sal NUMBER, deptno NUMBER, grade_text VARCHAR2(10));
+CREATE TABLE qt25_emp_grade_low  (empno NUMBER, ename VARCHAR2(30), sal NUMBER, deptno NUMBER, grade_text VARCHAR2(10));
+CREATE TABLE qt25_emp_bucket_a (empno NUMBER, ename VARCHAR2(30), deptno NUMBER);
+CREATE TABLE qt25_emp_bucket_b (empno NUMBER, ename VARCHAR2(30), deptno NUMBER);
+CREATE TABLE qt25_emp_bucket_c (empno NUMBER, ename VARCHAR2(30), deptno NUMBER);
+CREATE TABLE qt25_emp_keep_list (empno NUMBER PRIMARY KEY);
+CREATE TABLE qt25_emp_audit_log (log_id NUMBER PRIMARY KEY, empno NUMBER, deptno NUMBER, log_text VARCHAR2(4000), created_at TIMESTAMP);
+CREATE SEQUENCE qt25_emp_audit_seq START WITH 1 INCREMENT BY 1 NOCACHE;
+
+INSERT ALL
+    INTO qt25_dept VALUES (10, 'ACCOUNTING', 'NEW YORK')
+    INTO qt25_dept VALUES (20, 'RESEARCH', 'DALLAS')
+    INTO qt25_dept VALUES (30, 'SALES', 'CHICAGO')
+SELECT 1 FROM dual;
+
+INSERT ALL
+    INTO qt25_emp VALUES (7839, 'KING',   'PRESIDENT', NULL, DATE '1981-11-17', 5000, NULL, 10)
+    INTO qt25_emp VALUES (7566, 'JONES',  'MANAGER',   7839, DATE '1981-04-02', 2975, NULL, 20)
+    INTO qt25_emp VALUES (7902, 'FORD',   'ANALYST',   7566, DATE '1981-12-03', 3000, NULL, 20)
+    INTO qt25_emp VALUES (7369, 'SMITH',  'CLERK',     7902, DATE '1980-12-17', 800, NULL, 20)
+    INTO qt25_emp VALUES (7698, 'BLAKE',  'MANAGER',   7839, DATE '1981-05-01', 2850, NULL, 30)
+    INTO qt25_emp VALUES (7499, 'ALLEN',  'SALESMAN',  7698, DATE '1981-02-20', 1600, 300, 30)
+    INTO qt25_emp VALUES (7782, 'CLARK',  'MANAGER',   7839, DATE '1981-06-09', 2450, NULL, 10)
+SELECT 1 FROM dual;
+
+INSERT INTO qt25_emp_keep_list VALUES (7839);
+
 --------------------------------------------------------------------------------
 -- 1. WITH FUNCTION / PROCEDURE / 다단계 CTE / analytic / scalar subquery / EXISTS
 --------------------------------------------------------------------------------
@@ -22,14 +101,14 @@ WITH
                    '([[:alnum:]])',
                    '*'
                );
-    END fmt_mask,
+    END fmt_mask;
     PROCEDURE noop (
         p_msg IN VARCHAR2
     )
     IS
     BEGIN
         NULL;
-    END noop,
+    END noop;
     base_emp
     AS
         (
@@ -59,13 +138,13 @@ WITH
                     SELECT
                         MAX (x.sal)
                     FROM
-                        emp x
+                        qt25_emp x
                     WHERE
                             x.deptno = e.deptno
                         AND x.hiredate <= e.hiredate
                 ) AS max_sal_until_now
             FROM
-                emp e
+                qt25_emp e
             WHERE
                     e.sal > 0
                 AND EXISTS
@@ -73,7 +152,7 @@ WITH
                             SELECT
                                 1
                             FROM
-                                dept d
+                                qt25_dept d
                             WHERE
                                     d.deptno = e.deptno
                                 AND d.loc IS NOT NULL
@@ -106,7 +185,7 @@ WITH
                             SELECT
                                 d.deptno
                             FROM
-                                dept d
+                                qt25_dept d
                             WHERE
                                     d.loc IN ('NEW YORK', 'DALLAS', 'CHICAGO')
                                 OR (
@@ -122,7 +201,7 @@ WITH
                                SELECT
                                    1
                                FROM
-                                   emp z
+                                   qt25_emp z
                                WHERE
                                        z.mgr = b.empno
                                    AND z.sal > b.sal
@@ -169,7 +248,7 @@ SELECT
         SELECT
             COUNT (*)
         FROM
-            emp c
+            qt25_emp c
         WHERE
                 c.deptno = f.deptno
             AND c.sal > f.sal
@@ -237,7 +316,7 @@ SELECT
                 SELECT
                     MAX (x.hiredate)
                 FROM
-                    emp x
+                    qt25_emp x
                 WHERE
                     x.mgr = e.empno
             ),
@@ -253,7 +332,7 @@ SELECT
                     SELECT
                         COUNT (*)
                     FROM
-                        emp y
+                        qt25_emp y
                     WHERE
                             y.deptno = e.deptno
                         AND y.sal > e.sal
@@ -264,7 +343,7 @@ SELECT
         'NONE'
     ) AS comm_or_rankinfo
 FROM
-    emp e
+    qt25_emp e
 WHERE
         (
             e.ename LIKE 'A%'
@@ -294,7 +373,7 @@ SELECT
     CONNECT_BY_ISLEAF AS is_leaf,
     CONNECT_BY_ISCYCLE AS is_cycle
 FROM
-    emp e
+    qt25_emp e
 START WITH
     e.mgr IS NULL
 CONNECT BY NOCYCLE
@@ -320,7 +399,7 @@ FROM
             e.deptno,
             e.job
         FROM
-            emp e
+            qt25_emp e
     )
     PIVOT
     (
@@ -349,7 +428,7 @@ FROM
             NVL (e.comm, 0) AS comm,
             e.deptno
         FROM
-            emp e
+            qt25_emp e
     )
     UNPIVOT INCLUDE NULLS
     (
@@ -378,27 +457,27 @@ FROM
         SELECT
             deptno,
             empno,
-            sal AS calc_sal,
-            NVL (comm, 0) AS calc_bonus
+            sal AS base_sal,
+            NVL (comm, 0) AS base_bonus
         FROM
-            emp
+            qt25_emp
         WHERE
             deptno IN (10, 20, 30)
     )
     MODEL
         PARTITION BY (deptno)
         DIMENSION BY (ROW_NUMBER () OVER (PARTITION BY deptno ORDER BY empno) AS seq, empno)
-        MEASURES (calc_sal, calc_bonus)
+        MEASURES (base_sal, base_bonus, 0 AS calc_sal, 0 AS calc_bonus)
         RULES UPSERT SEQUENTIAL ORDER
         (
             calc_bonus[ANY, ANY] =
                 CASE
-                    WHEN calc_sal[CV (), CV (empno)] > 3000 THEN calc_sal[CV (), CV (empno)] * 0.20
-                    WHEN calc_sal[CV (), CV (empno)] > 1500 THEN calc_sal[CV (), CV (empno)] * 0.10
-                    ELSE calc_sal[CV (), CV (empno)] * 0.05
+                    WHEN base_sal[CV (), CV (empno)] > 3000 THEN base_sal[CV (), CV (empno)] * 0.20
+                    WHEN base_sal[CV (), CV (empno)] > 1500 THEN base_sal[CV (), CV (empno)] * 0.10
+                    ELSE base_sal[CV (), CV (empno)] * 0.05
                 END,
             calc_sal[ANY, ANY] =
-                calc_sal[CV (), CV (empno)]
+                base_sal[CV (), CV (empno)]
                 + NVL (calc_bonus[CV (), CV (empno)], 0)
         )
 ORDER BY
@@ -471,7 +550,7 @@ FROM
             e.empno,
             e.ename
         FROM
-            emp e
+            qt25_emp e
         WHERE
             e.deptno = 10
 
@@ -482,7 +561,7 @@ FROM
             e.empno,
             e.ename
         FROM
-            emp e
+            qt25_emp e
         WHERE
             e.job = 'ANALYST'
 
@@ -493,7 +572,7 @@ FROM
             e.empno,
             e.ename
         FROM
-            emp e
+            qt25_emp e
         WHERE
             e.sal >= 2000
 
@@ -504,7 +583,7 @@ FROM
             e.empno,
             e.ename
         FROM
-            emp e
+            qt25_emp e
         WHERE
             e.ename LIKE 'S%'
     ) z
@@ -516,7 +595,7 @@ ORDER BY
 --------------------------------------------------------------------------------
 -- 8. MERGE / 복잡한 ON / UPDATE CASE / DELETE WHERE / INSERT VALUES
 --------------------------------------------------------------------------------
-MERGE INTO emp_bonus b
+MERGE INTO qt25_emp_bonus b
 USING
 (
     SELECT
@@ -529,7 +608,7 @@ USING
             ELSE ROUND (e.sal * 0.05, 2)
         END AS calc_bonus
     FROM
-        emp e
+        qt25_emp e
     WHERE
             e.deptno IN (10, 20, 30)
         AND EXISTS
@@ -537,7 +616,7 @@ USING
                     SELECT
                         1
                     FROM
-                        dept d
+                        qt25_dept d
                     WHERE
                             d.deptno = e.deptno
                         AND d.loc IS NOT NULL
@@ -576,11 +655,11 @@ WHEN MATCHED THEN
 WHEN NOT MATCHED THEN
     INSERT
     (
-        b.empno,
-        b.deptno,
-        b.bonus_amount,
-        b.created_at,
-        b.note_text
+        empno,
+        deptno,
+        bonus_amount,
+        created_at,
+        note_text
     )
     VALUES
     (
@@ -600,7 +679,7 @@ WHEN NOT MATCHED THEN
 --------------------------------------------------------------------------------
 INSERT ALL
     WHEN sal >= 4000 THEN
-        INTO emp_grade_high (
+        INTO qt25_emp_grade_high (
             empno,
             ename,
             sal,
@@ -615,7 +694,7 @@ INSERT ALL
             'HIGH'
         )
     WHEN sal >= 2000 THEN
-        INTO emp_grade_mid (
+        INTO qt25_emp_grade_mid (
             empno,
             ename,
             sal,
@@ -630,7 +709,7 @@ INSERT ALL
             'MID'
         )
     ELSE
-        INTO emp_grade_low (
+        INTO qt25_emp_grade_low (
             empno,
             ename,
             sal,
@@ -650,13 +729,13 @@ SELECT
     e.sal,
     e.deptno
 FROM
-    emp e
+    qt25_emp e
 WHERE
     e.deptno IN (
         SELECT
             d.deptno
         FROM
-            dept d
+            qt25_dept d
         WHERE
             d.loc IS NOT NULL
     )
@@ -664,24 +743,24 @@ WHERE
 
 INSERT FIRST
     WHEN deptno = 10 THEN
-        INTO emp_bucket_a (empno, ename, deptno) VALUES (empno, ename, deptno)
+        INTO qt25_emp_bucket_a (empno, ename, deptno) VALUES (empno, ename, deptno)
     WHEN deptno = 20 THEN
-        INTO emp_bucket_b (empno, ename, deptno) VALUES (empno, ename, deptno)
+        INTO qt25_emp_bucket_b (empno, ename, deptno) VALUES (empno, ename, deptno)
     ELSE
-        INTO emp_bucket_c (empno, ename, deptno) VALUES (empno, ename, deptno)
+        INTO qt25_emp_bucket_c (empno, ename, deptno) VALUES (empno, ename, deptno)
 SELECT
     e.empno,
     e.ename,
     e.deptno
 FROM
-    emp e
+    qt25_emp e
 ;
 
 --------------------------------------------------------------------------------
 -- 10. UPDATE / correlated subquery / EXISTS / nested CASE
 --------------------------------------------------------------------------------
-UPDATE emp e
-   SET e.comm =
+UPDATE qt25_emp e
+   SET comm =
            CASE
                WHEN e.comm IS NULL THEN
                    (
@@ -692,13 +771,13 @@ UPDATE emp e
                                ELSE 100
                            END
                        FROM
-                           emp x
+                           qt25_emp x
                        WHERE
                            x.deptno = e.deptno
                    )
                ELSE e.comm + 10
            END,
-       e.job  =
+       job  =
            CASE
                WHEN e.job = 'CLERK' AND e.sal > 1500 THEN 'SENIOR_CLERK'
                ELSE e.job
@@ -708,7 +787,7 @@ UPDATE emp e
                SELECT
                    1
                FROM
-                   dept d
+                   qt25_dept d
                WHERE
                        d.deptno = e.deptno
                    AND d.loc IS NOT NULL
@@ -718,20 +797,20 @@ UPDATE emp e
 --------------------------------------------------------------------------------
 -- 11. DELETE / nested EXISTS / NOT EXISTS / IN with subquery
 --------------------------------------------------------------------------------
-DELETE FROM emp_bonus b
+DELETE FROM qt25_emp_bonus b
  WHERE EXISTS
            (
                SELECT
                    1
                FROM
-                   emp e
+                   qt25_emp e
                WHERE
                        e.empno = b.empno
                    AND e.deptno IN (
                        SELECT
                            d.deptno
                        FROM
-                           dept d
+                           qt25_dept d
                        WHERE
                                d.loc IS NOT NULL
                            AND NOT EXISTS
@@ -739,7 +818,7 @@ DELETE FROM emp_bonus b
                                        SELECT
                                            1
                                        FROM
-                                           dept x
+                                           qt25_dept x
                                        WHERE
                                                x.deptno = d.deptno
                                            AND x.loc LIKE 'X%'
@@ -751,7 +830,7 @@ DELETE FROM emp_bonus b
                SELECT
                    1
                FROM
-                   emp_keep_list k
+                   qt25_emp_keep_list k
                WHERE
                    k.empno = b.empno
            )
@@ -771,7 +850,7 @@ WITH
                 e.deptno,
                 1 AS lvl
             FROM
-                emp e
+                qt25_emp e
             WHERE
                 e.mgr IS NULL
         ),
@@ -785,7 +864,7 @@ WITH
                 c.deptno,
                 p.lvl + 1 AS lvl
             FROM
-                emp c
+                qt25_emp c
                 JOIN t1 p
                     ON p.empno = c.mgr
         )
@@ -797,7 +876,7 @@ SELECT
         SELECT
             LISTAGG (x.ename, ' / ') WITHIN GROUP (ORDER BY x.empno)
         FROM
-            emp x
+            qt25_emp x
         WHERE
             x.mgr = q.empno
     ) AS children_names,
@@ -805,7 +884,7 @@ SELECT
         SELECT
             MAX (y.sal)
         FROM
-            emp y
+            qt25_emp y
         WHERE
             y.deptno = q.deptno
     ) AS dept_max_sal
@@ -826,10 +905,10 @@ ORDER BY
 DECLARE
     TYPE t_emp_rec IS RECORD
     (
-        empno  emp.empno%TYPE,
-        ename  emp.ename%TYPE,
-        deptno emp.deptno%TYPE,
-        sal    emp.sal%TYPE
+        empno  qt25_emp.empno%TYPE,
+        ename  qt25_emp.ename%TYPE,
+        deptno qt25_emp.deptno%TYPE,
+        sal    qt25_emp.sal%TYPE
     );
 
     TYPE t_emp_tab IS TABLE OF t_emp_rec INDEX BY PLS_INTEGER;
@@ -851,14 +930,14 @@ DECLARE
             e.deptno,
             e.sal
         FROM
-            emp e
+            qt25_emp e
         WHERE
                 e.deptno = p_deptno
             AND e.sal >= (
                 SELECT
                     AVG (x.sal)
                 FROM
-                    emp x
+                    qt25_emp x
                 WHERE
                     x.deptno = e.deptno
             )
@@ -893,8 +972,8 @@ DECLARE
 BEGIN
     v_sql :=
            'SELECT MAX(sal), MIN(sal) '
-        || 'FROM emp '
-        || 'WHERE deptno IN (SELECT deptno FROM dept WHERE loc IS NOT NULL)';
+        || 'FROM qt25_emp '
+        || 'WHERE deptno IN (SELECT deptno FROM qt25_dept WHERE loc IS NOT NULL)';
 
     EXECUTE IMMEDIATE v_sql
         INTO v_max_sal, v_min_sal;
@@ -939,7 +1018,7 @@ BEGIN
 
     BEGIN
         FORALL idx IN INDICES OF v_tab
-            INSERT INTO emp_audit_log (
+            INSERT INTO qt25_emp_audit_log (
                 log_id,
                 empno,
                 deptno,
@@ -947,7 +1026,7 @@ BEGIN
                 created_at
             )
             VALUES (
-                emp_audit_seq.NEXTVAL,
+                qt25_emp_audit_seq.NEXTVAL,
                 v_tab (idx).empno,
                 v_tab (idx).deptno,
                 'AUDIT-' || v_tab (idx).ename,
@@ -969,7 +1048,7 @@ BEGIN
             END
         INTO v_dummy
         FROM
-            emp
+            qt25_emp
         WHERE
             deptno = 10;
 
@@ -1015,29 +1094,21 @@ DECLARE
     IS
         SELECT
             d.deptno,
-            CURSOR (
-                SELECT
-                    e.empno,
-                    e.ename,
-                    e.sal
-                FROM
-                    emp e
-                WHERE
-                    e.deptno = d.deptno
-                ORDER BY
-                    e.sal DESC,
-                    e.empno
-            ) AS emp_cur
+            (
+                SELECT COUNT (*)
+                FROM qt25_emp e
+                WHERE e.deptno = d.deptno
+            ) AS emp_count
         FROM
-            dept d
+            qt25_dept d
         WHERE
-            d.deptno MEMBER OF v_nums;
+            d.deptno IN (10, 20, 30);
 BEGIN
     v_stmt := q'[
         SELECT
             COUNT(*)
         FROM
-            emp e
+            qt25_emp e
         WHERE
                 e.deptno = :b1
             AND EXISTS
@@ -1045,7 +1116,7 @@ BEGIN
                         SELECT
                             1
                         FROM
-                            dept d
+                            qt25_dept d
                         WHERE
                                 d.deptno = e.deptno
                             AND d.loc IS NOT NULL
@@ -1070,26 +1141,26 @@ BEGIN
 
     FOR r IN c_mix
     LOOP
-        DBMS_OUTPUT.PUT_LINE ('DEPT=' || r.deptno);
+        DBMS_OUTPUT.PUT_LINE ('DEPT=' || r.deptno || ', COUNT=' || r.emp_count);
     END LOOP;
 
     BEGIN
         EXECUTE IMMEDIATE q'[
-            UPDATE emp
+            UPDATE qt25_emp
                SET sal = sal
              WHERE deptno = :x
                AND empno IN (
                        SELECT
                            z.empno
                        FROM
-                           emp z
+                           qt25_emp z
                        WHERE
                                z.deptno = :x
                            AND z.sal >= (
                                SELECT
                                    AVG(y.sal)
                                FROM
-                                   emp y
+                                   qt25_emp y
                                WHERE
                                    y.deptno = z.deptno
                            )
@@ -1106,7 +1177,7 @@ END;
 --------------------------------------------------------------------------------
 -- 15. CREATE VIEW with nested SELECT / CASE / aggregation / outer join style
 --------------------------------------------------------------------------------
-CREATE OR REPLACE VIEW v_emp_formatter_boss
+CREATE OR REPLACE VIEW qt25_emp_formatter_boss
 AS
     SELECT
         d.deptno,
@@ -1121,7 +1192,7 @@ AS
                     SELECT
                         MAX (x.sal)
                     FROM
-                        emp x
+                        qt25_emp x
                     WHERE
                         x.deptno = d.deptno
                 ) THEN e.ename
@@ -1145,8 +1216,8 @@ AS
                 e.empno
         ) AS emp_desc
     FROM
-        dept d
-        LEFT JOIN emp e
+        qt25_dept d
+        LEFT JOIN qt25_emp e
             ON e.deptno = d.deptno
     GROUP BY
         d.deptno,
@@ -1175,7 +1246,7 @@ WITH
                     ELSE 'SMALL'
                 END AS dept_class
             FROM
-                v_emp_formatter_boss v
+                qt25_emp_formatter_boss v
         )
 SELECT
     s.deptno,
@@ -1190,7 +1261,7 @@ SELECT
         SELECT
             COUNT (*)
         FROM
-            emp e
+            qt25_emp e
         WHERE
                 e.deptno = s.deptno
             AND e.sal > s.avg_sal
@@ -1203,7 +1274,7 @@ SELECT
                 SELECT DISTINCT
                     e.job
                 FROM
-                    emp e
+                    qt25_emp e
                 WHERE
                     e.deptno = s.deptno
             ) x

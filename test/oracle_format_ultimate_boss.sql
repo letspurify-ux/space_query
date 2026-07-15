@@ -1200,8 +1200,7 @@ ORDER BY e.emp_id;
 --------------------------------------------------------------------------------
 -- QUERY 12: correlated subquery + HAVING + set operators
 --------------------------------------------------------------------------------
-(
-    SELECT
+SELECT
         e.dept_id,
         'HIGH'                                                               AS bucket,
         COUNT(*)                                                             AS cnt
@@ -1213,10 +1212,8 @@ ORDER BY e.emp_id;
     )
     GROUP BY e.dept_id
     HAVING COUNT(*) > 0
-)
 UNION ALL
-(
-    SELECT
+SELECT
         e.dept_id,
         'LOW'                                                                AS bucket,
         COUNT(*)                                                             AS cnt
@@ -1228,15 +1225,12 @@ UNION ALL
     )
     GROUP BY e.dept_id
     HAVING COUNT(*) > 0
-)
 MINUS
-(
-    SELECT
+SELECT
         9999                                                                 AS dept_id,
         'LOW'                                                                AS bucket,
         0                                                                    AS cnt
     FROM dual
-)
 ORDER BY 1, 2;
 
 --------------------------------------------------------------------------------

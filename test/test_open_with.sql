@@ -4,7 +4,99 @@
 -- 각 쿼리에 가상 주석(-- / /* */) 삽입 포인트를 표기
 --------------------------------------------------------------------------------
 
-CREATE OR REPLACE PROCEDURE test_open_with_proc IS
+BEGIN
+    FOR obj IN (
+        SELECT object_name, object_type
+        FROM user_objects
+        WHERE object_name LIKE 'QT_OPEN_%'
+    ) LOOP
+        BEGIN
+            IF obj.object_type = 'TABLE' THEN
+                EXECUTE IMMEDIATE 'DROP TABLE ' || obj.object_name || ' PURGE';
+            ELSIF obj.object_type = 'PROCEDURE' THEN
+                EXECUTE IMMEDIATE 'DROP PROCEDURE ' || obj.object_name;
+            END IF;
+        EXCEPTION
+            WHEN OTHERS THEN NULL;
+        END;
+    END LOOP;
+END;
+/
+
+CREATE TABLE qt_open_dept
+(
+    deptno NUMBER PRIMARY KEY,
+    dname  VARCHAR2(30),
+    loc    VARCHAR2(30)
+);
+
+CREATE TABLE qt_open_emp
+(
+    empno    NUMBER PRIMARY KEY,
+    ename    VARCHAR2(30),
+    job      VARCHAR2(30),
+    mgr      NUMBER,
+    hiredate DATE,
+    sal      NUMBER,
+    comm     NUMBER,
+    deptno   NUMBER
+);
+
+CREATE TABLE qt_open_order_hdr
+(
+    order_id  NUMBER PRIMARY KEY,
+    cust_name VARCHAR2(100),
+    order_dt  DATE,
+    status    VARCHAR2(20)
+);
+
+CREATE TABLE qt_open_order_item
+(
+    item_id    NUMBER PRIMARY KEY,
+    order_id   NUMBER,
+    qty        NUMBER,
+    unit_price NUMBER,
+    sku        VARCHAR2(30)
+);
+
+CREATE TABLE qt_open_tree_nodes
+(
+    node_id   NUMBER PRIMARY KEY,
+    parent_id NUMBER,
+    node_name VARCHAR2(100)
+);
+
+CREATE TABLE qt_open_json_docs
+(
+    id          NUMBER PRIMARY KEY,
+    payload     VARCHAR2(4000) CHECK (payload IS JSON),
+    active_flag NUMBER
+);
+
+INSERT ALL
+    INTO qt_open_dept VALUES (10, 'ACCOUNTING', 'NEW YORK')
+    INTO qt_open_dept VALUES (20, 'RESEARCH', 'DALLAS')
+    INTO qt_open_dept VALUES (30, 'SALES', 'CHICAGO')
+SELECT 1 FROM dual;
+
+INSERT ALL
+    INTO qt_open_emp VALUES (7839, 'KING',  'PRESIDENT', NULL, DATE '1981-11-17', 5000, NULL, 10)
+    INTO qt_open_emp VALUES (7566, 'JONES', 'MANAGER',   7839, DATE '1981-04-02', 2975, NULL, 20)
+    INTO qt_open_emp VALUES (7902, 'FORD',  'ANALYST',   7566, DATE '1981-12-03', 3000, NULL, 20)
+    INTO qt_open_emp VALUES (7369, 'SMITH', 'CLERK',     7902, DATE '1980-12-17',  800,  100, 20)
+SELECT 1 FROM dual;
+
+INSERT INTO qt_open_order_hdr VALUES (1, 'ACME', SYSDATE - 1, 'PAID');
+INSERT INTO qt_open_order_item VALUES (1, 1, 2, 40, 'SKU-A');
+INSERT INTO qt_open_order_item VALUES (2, 1, 1, 30, 'SKU-B');
+
+INSERT INTO qt_open_tree_nodes VALUES (1, NULL, 'ROOT');
+INSERT INTO qt_open_tree_nodes VALUES (2, 1, 'CHILD');
+
+INSERT INTO qt_open_json_docs
+VALUES (1, '{"order_id":1,"customer":{"name":"ACME","tier":"GOLD"},"items":[{"sku":"SKU-A","qty":2,"price":40}]}', 1);
+
+CREATE OR REPLACE PROCEDURE qt_open_with_proc IS
     p_rc SYS_REFCURSOR;
 BEGIN
     --------------------------------------------------------------------------
@@ -13,15 +105,15 @@ BEGIN
     --------------------------------------------------------------------------
     OPEN p_rc FOR
         -- [CW1] 기본 CTE
-        WITH /* A: dept 집계 CTE */
+        WITH /* A: qt_open_dept 집계 CTE */
         dept_stats AS (
-            SELECT /* B: dept 집계 */
+            SELECT /* B: qt_open_dept 집계 */
                 deptno,
                 COUNT(*) AS cnt,
                 AVG(sal) AS avg_sal,
                 SUM (NVL (comm, /* C: NULL→0 */
                         0)) AS sum_comm
-            FROM emp
+            FROM qt_open_emp
             GROUP BY deptno
         )
         SELECT d.deptno,
@@ -30,12 +122,12 @@ BEGIN
             (
                 /* E: correlated max */
                 SELECT MAX(e2.sal)
-                FROM emp e2
+                FROM qt_open_emp e2
                 WHERE e2.deptno = d.deptno -- [F] correlated
             ) AS max_sal,
             ds.cnt,
             ROUND (ds.avg_sal, 2) AS avg_sal
-        FROM dept d
+        FROM qt_open_dept d
         LEFT JOIN dept_stats ds
             ON /* G: join 조건 */
             ds.deptno = d.deptno
@@ -58,7 +150,7 @@ BEGIN
                     PARTITION BY e.deptno
                     ORDER BY e.sal DESC
                 ) AS rnk
-            FROM emp e
+            FROM qt_open_emp e
         ),
         grp_base AS ( -- [K] 집계 CTE
             SELECT deptno,
@@ -77,8 +169,8 @@ BEGIN
         )
         SELECT deptno,
             job,
-            cnt,
-            top_sal,
+            SUM (cnt) AS cnt,
+            SUM (top_sal) AS top_sal,
             /* M: GROUPING_ID */
             GROUPING_ID (deptno, job) AS gid
         FROM grp_base
@@ -96,13 +188,13 @@ BEGIN
             SELECT oh.order_id,
                 oh.cust_name,
                 oh.order_dt
-            FROM order_hdr oh
+            FROM qt_open_order_hdr oh
             WHERE oh.status = 'PAID' -- [P] paid filter
         ),
         amounts AS (
             SELECT oi.order_id,
                 SUM (oi.qty * oi.unit_price) AS amt
-            FROM order_item oi
+            FROM qt_open_order_item oi
             GROUP BY oi.order_id
         )
         SELECT *
@@ -124,7 +216,7 @@ BEGIN
                     (
                         -- [T] 라인수 서브쿼리
                         SELECT COUNT(*)
-                        FROM order_item oi
+                        FROM qt_open_order_item oi
                         WHERE oi.order_id = x.order_id
                     ) AS line_cnt
                 FROM x
@@ -132,14 +224,14 @@ BEGIN
         WHERE EXISTS (
                 /* U: SKU 존재 조건 */
                 SELECT 1
-                FROM order_item oi
+                FROM qt_open_order_item oi
                 WHERE oi.order_id = v.order_id
                     AND oi.sku LIKE 'SKU-%' -- [V] SKU 패턴
             )
             AND NOT EXISTS (
                 -- [W] 음수 수량 배제
                 SELECT 1
-                FROM order_item oi
+                FROM qt_open_order_item oi
                 WHERE oi.order_id = v.order_id
                     AND oi.qty <= /* X: 0 이하 */
                         0
@@ -151,16 +243,16 @@ BEGIN
     --             UNION ALL 이후 SELECT depth1, JOIN ON depth1
     --------------------------------------------------------------------------
     OPEN p_rc FOR
-        WITH r (node_id, parent_id, node_name, lvl, PATH, cycle_flag) AS (
+        WITH r (node_id, parent_id, node_name, lvl, path_txt, cycle_flag) AS (
             -- [Y] anchor member
             SELECT node_id,
                 parent_id,
                 node_name,
                 1 AS lvl,
                 CAST ( /* Z: 초기 경로 */
-                    node_name AS VARCHAR2 (4000)) AS PATH,
+                    node_name AS VARCHAR2 (4000)) AS path_txt,
                 0 AS cycle_flag
-            FROM tree_nodes
+            FROM qt_open_tree_nodes
             WHERE parent_id IS NULL
             UNION ALL
             -- [AA] recursive member
@@ -168,15 +260,15 @@ BEGIN
                 t.parent_id,
                 t.node_name,
                 r.lvl + 1,
-                r.PATH || '/' || t.node_name,
+                r.path_txt || '/' || t.node_name,
                 /* AB: 사이클 감지 */
                 CASE
                     WHEN INSTR (
                             /* AC: 경로 검색 */
-                            r.PATH, t.node_name) > 0 THEN 1
+                            r.path_txt, t.node_name) > 0 THEN 1
                     ELSE 0
                 END AS cycle_flag
-            FROM tree_nodes t
+            FROM qt_open_tree_nodes t
             JOIN r
                 ON /* AD: 부모-자식 */
                 t.parent_id = r.node_id
@@ -186,7 +278,7 @@ BEGIN
         SELECT node_id,
             LPAD (' ', (lvl - 1) * 2) || node_name AS tree_display,
             lvl,
-            PATH
+            path_txt
         FROM r
         WHERE cycle_flag = 0
         ORDER BY lvl,
@@ -201,14 +293,14 @@ BEGIN
             SELECT deptno,
                 job,
                 sal
-            FROM emp
+            FROM qt_open_emp
         ),
         pivoted AS (
             SELECT *
             FROM src
             PIVOT (
                 /* AF: SUM 집계 */
-                SUM (sal) AS sum_sal
+                SUM (sal)
                 FOR deptno IN (
                     /* AG: 피벗 값 목록 */
                     10 AS D10, 20 AS D20, 30 AS D30)
@@ -237,7 +329,7 @@ BEGIN
         WITH jdocs AS (
             SELECT id,
                 payload
-            FROM json_docs
+            FROM qt_open_json_docs
             WHERE /* AL: 활성 문서만 */
                 active_flag = 1
         )
@@ -285,7 +377,7 @@ BEGIN
             SELECT order_id,
                 cust_name,
                 order_dt
-            FROM order_hdr
+            FROM qt_open_order_hdr
             WHERE order_dt >= SYSDATE - /* AT: 기간 */
                     90
         )
@@ -312,7 +404,7 @@ BEGIN
             SELECT COUNT(*) AS item_cnt,
                 SUM (qty * unit_price) AS total_amt,
                 MAX(unit_price) AS max_price
-            FROM order_item oi
+            FROM qt_open_order_item oi
             WHERE oi.order_id = /* AY: correlated */
                     o.order_id
         ) x
@@ -332,7 +424,7 @@ BEGIN
                 e.sal,
                 e.comm,
                 e.mgr
-            FROM emp e
+            FROM qt_open_emp e
         ),
         enriched AS (
             SELECT b.*,
@@ -373,7 +465,7 @@ BEGIN
             /* BG: 부서명 스칼라서브쿼리 */
             (
                 SELECT d.dname
-                FROM dept d
+                FROM qt_open_dept d
                 WHERE d.deptno = e.deptno -- [BH] correlated
             ) AS dname
         FROM enriched e
@@ -381,7 +473,7 @@ BEGIN
             /* BI: 인원수 기준 정렬 */
             (
                 SELECT COUNT(*)
-                FROM emp e2
+                FROM qt_open_emp e2
                 WHERE e2.deptno = e.deptno
             ) DESC,
             e.sal DESC NULLS LAST;
@@ -396,7 +488,7 @@ BEGIN
                 SUM (sal) AS sum_sal,
                 COUNT(*) AS cnt,
                 MAX(sal) AS max_sal
-            FROM emp
+            FROM qt_open_emp
             GROUP BY deptno
         )
         SELECT deptno,
@@ -438,8 +530,9 @@ BEGIN
                     PARTITION BY deptno
                     ORDER BY hiredate,
                     empno
-                ) AS rn
-            FROM emp
+                ) AS rn,
+                AVG (sal) OVER (PARTITION BY deptno) AS dept_avg
+            FROM qt_open_emp
         )
         SELECT *
         FROM ordered_emp
@@ -457,16 +550,18 @@ BEGIN
             DEFINE
             -- [BR] B 조건: 이전보다 높고 부서 평균의 1.5배 미만
             B AS B.sal > PREV (B.sal)
-            AND B.sal < (
-                /* BS: 부서 평균 서브쿼리 */
-                SELECT AVG(sal) * /* BT: 상한 배율 */
-                        1.5
-                FROM emp
-                WHERE deptno = /* BU: correlated */
-                        B.deptno
-            )
+            AND B.sal < B.dept_avg * /* BT: 상한 배율 */ 1.5
         )
         FETCH FIRST /* BV: 상위 20건 */
         20 ROWS ONLY;
-END test_open_with_proc;
+
+    IF p_rc%ISOPEN THEN
+        CLOSE p_rc;
+    END IF;
+END qt_open_with_proc;
+/
+
+BEGIN
+    qt_open_with_proc;
+END;
 /

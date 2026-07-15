@@ -2344,3 +2344,207 @@ Oracle의 후속 CTE가 다시 scope에 등록되어 명시적 컬럼과 qualifi
 결정성 비교, 파일별 IntelliSense 전수 검사, 전체 Rust 회귀를 모두 통과했다.
 이번 회차에서 발견된 IntelliSense scope/구조 키워드 결함은 회귀 테스트와 함께
 수정됐고, 포매터의 잔여 오류는 발견되지 않았다.
+
+# 17. 10차 검증 회차 (2026-07-15): Final Boss III/V와 frame-relative 상용 품질 재인증
+
+## 17-1. 신규 DB별 단일 문장 fixture
+
+기존 final-boss 세트에서 상대적으로 약했던 문법을 실제 엔진에서 함께 조합하기 위해
+DB별로 반복 실행 가능하고 부작용이 없는 `WITH ... SELECT` 한 문장을 더 추가했다.
+상호 배타적인 문법까지 한 문장에 억지로 섞는 대신, 기존 전체 fixture와 이번 3개를
+합친 스윕이 현재 제품이 지원하는 구조·키워드 조합을 모두 지나도록 구성했다.
+
+| DB | 파일 | 원본 줄 수 | 이번 문장의 핵심 조합 |
+| --- | --- | ---: | --- |
+| Oracle | `test/oracle_format_final_boss_3.sql` | 192 | `WITH FUNCTION`, 복수 재귀 CTE, 연속 `SEARCH`/`CYCLE`, 중첩 `JSON_TABLE`, `GROUPING SETS`, `PIVOT`/`UNPIVOT`, 분석 window/frame, `KEEP`, `LISTAGG ... ON OVERFLOW`, XML/JSON 생성 |
+| MySQL | `test_mysql/test8.txt` | 195 | 재귀 CTE, 중첩 `JSON_TABLE`, JSON schema/predicate, `LATERAL`, `INTERSECT`/`EXCEPT`, `ROLLUP`, named window, 정규식, 다중 중첩 JSON |
+| MariaDB | `test_mariadb/test13.txt` | 153 | 재귀 `CYCLE ... RESTRICT`, 중첩 `JSON_TABLE`, dynamic column, `INET6`, percentile 분석, `INTERSECT ALL`/`EXCEPT ALL`, ordered/limited JSON aggregate |
+
+세 파일 모두 내부 fixture의 트리·집계·집합 연산·JSON 결과를 마지막 `CASE`에서
+재검산한다. 원본과 자동 포맷 결과를 각각 Oracle Database Free 26ai,
+MySQL 8.0.46, MariaDB 12.2.2 컨테이너에서 실행했으며 모두 exit code 0,
+모든 반환 행의 `status = 'PASS'`를 확인했다.
+
+## 17-2. 포매터 AS-IS / TO-BE: `SEARCH/CYCLE` 뒤 CTE body indent 복귀
+
+이번 Oracle 문장을 최소화한 회귀 테스트에서, `WITH FUNCTION` 뒤 재귀 CTE의
+`SEARCH`/`CYCLE` option tail이 끝난 쉼표를 일반 절 내부 쉼표로 취급하면 다음 CTE가
+직전 option clause의 continuation depth를 물려받을 수 있음을 재현했다. 이는
+"쉼표 다음 항목은 쉼표를 소유한 목록 frame의 고정 `body_indent`로 복귀"한다는
+계약과 같은 `WITH` frame 최상위 CTE 형제의 depth 계약을 동시에 위반한다.
+
+AS-IS (수정 전의 잘못된 상대 depth):
+
+```sql
+WITH
+    FUNCTION f(p NUMBER) RETURN NUMBER IS
+    BEGIN
+        RETURN p;
+    END;
+first_r (n) AS (
+    ...
+)
+CYCLE n SET first_cycle TO 'Y' DEFAULT 'N',
+    second_r (n) AS (          -- 잘못: CYCLE continuation depth 상속
+        ...
+    )
+    CYCLE n SET second_cycle TO 'Y' DEFAULT 'N',
+        tail_cte (n) AS (      -- 잘못: 다음 형제에서 다시 depth 누적
+            ...
+        )
+SELECT n FROM tail_cte;
+```
+
+TO-BE (수정 후 owning `WITH` frame의 고정 body depth):
+
+```sql
+WITH
+    FUNCTION f(p NUMBER) RETURN NUMBER IS
+    BEGIN
+        RETURN p;
+    END;
+first_r (n) AS (
+    ...
+)
+CYCLE n SET first_cycle TO 'Y' DEFAULT 'N',
+second_r (n) AS (
+    ...
+)
+CYCLE n SET second_cycle TO 'Y' DEFAULT 'N',
+tail_cte (n) AS (
+    ...
+)
+SELECT n FROM tail_cte;
+```
+
+수정 내용:
+
+- 쉼표 뒤 토큰을 bounded look-ahead하여 `name [(column-list)] AS (` 형태의 완전한
+  다음 CTE 정의인지 확인한다.
+- 같은 괄호 depth의 활성 `SEARCH/CYCLE` tail 뒤에서만 현재 `WITH` body indent를
+  캡처하고 option construct를 닫은 뒤 그 고정 indent로 개행한다.
+- `SEARCH ... BY a, b`, `CYCLE a, b SET ...` 내부 쉼표나 일반 함수/목록 쉼표에는
+  적용하지 않는다.
+- 회귀 테스트
+  `format_sql_recursive_cte_cycle_separator_restores_with_body_indent`가 첫째·둘째·마지막
+  CTE 이름의 indent 동일성과 두 번 포맷한 결과의 멱등성을 함께 고정한다.
+
+## 17-3. 전체 `.format.out` 수동 판독
+
+정확한 명령
+`cargo test --lib formatting_sweep_all_files_generate_out_report -- --ignored --nocapture`로
+산출물을 다시 만든 뒤, `target/format-sweep` 아래 모든 `.format.out`을 파일별 line
+number와 함께 처음부터 끝까지 직접 판독했다. 자동 PASS나 통계만으로 판정하지 않았다.
+
+| 항목 | 결과 |
+| --- | ---: |
+| 전체 `.format.out` | 59개 |
+| 직접 읽은 전체 줄 | 34,382줄 |
+| 신규 3개 포맷 결과 | 1,051줄(Oracle 354, MySQL 374, MariaDB 323) |
+| comma sibling body-depth 위반 | 0건 |
+| 동일 paren frame 최상위 항목 depth 위반 | 0건 |
+| close-indent 및 닫힘 뒤 parent body 복귀 위반 | 0건 |
+
+판독 중 별도 표시했던 두 패턴도 구현과 전용 회귀 테스트까지 대조했다.
+
+- `test/test24.sql`의 주석 다음 선행 쉼표는 쉼표 문자와 첫 `SET` 항목이 모두 같은
+  column 12의 고정 SET-list body indent이므로 정상이다.
+- Oracle `JSON_OBJECT ('k' VALUE (subquery))`의 긴 inline frame은
+  `query_like_paren_layout`의 의도된 close-depth이며
+  `format_for_auto_formatting_keeps_json_object_value_scalar_subquery_on_paren_frame_depth`가
+  해당 계약을 고정한다.
+
+따라서 위 `SEARCH/CYCLE` 결함 수정 이후에는 추가 production formatter 변경이
+필요한 실제 위반이 남지 않았다.
+
+## 17-4. IntelliSense AS-IS / TO-BE와 production 경로 일치
+
+`intellisense_sweep_generate_report_for_file`의 신규 세 파일을 최초 실행했을 때
+실제로 추천 가능한 누락을 최소 재현으로 분리한 뒤 production main path를 수정했다.
+
+AS-IS:
+
+```sql
+-- SEARCH가 생성한 column 뒤 바로 CYCLE이 오면 recursive-column phase를 잃음
+WITH r(n) AS (...)
+SEARCH DEPTH FIRST BY n SET search_order
+CYCLE n SET cycle_yn TO 'Y' DEFAULT 'N'
+SELECT * FROM r;
+
+-- 큰 WITH 문장의 중첩 grammar에서 broad classifier가 exact continuation보다 먼저 종료
+SELECT LISTAGG(name, ',' ON OVER|) FROM emp;
+SELECT SUM(amount) OVER (ORDER BY day_no ROW| BETWEEN ...) FROM sales;
+
+-- WITH FUNCTION 뒤 CTE 이름을 로컬 declaration으로 분류하지 못함
+WITH FUNCTION f RETURN NUMBER IS BEGIN RETURN 1; END;
+base AS (SELECT 1 id FROM dual)
+SELECT * FROM base;
+```
+
+TO-BE:
+
+- 완결된 Oracle `SEARCH ... SET generated_column` 다음의 `CYCLE`이 recursive CTE
+  column phase를 다시 열어, 연속 `SEARCH -> CYCLE -> 다음 CTE` scope를 유지한다.
+- `completion.rs` production 경로에서 bounded statement token을 사용한 exact
+  window/LISTAGG grammar를 broad statement/CTE classifier보다 먼저 판정한다.
+- `LISTAGG`의 `ON -> OVERFLOW -> ERROR|TRUNCATE -> WITH|WITHOUT -> COUNT` 전 체인을
+  열린 `LISTAGG(` frame 안에서만 추천하며 다른 함수로 누출하지 않는다.
+- token span을 한 번 순회해 괄호 짝을 O(n)에 만들고, `name [(columns)] AS (` 형태의
+  CTE/window declaration을 수집하여 `WITH FUNCTION` 뒤 CTE 이름도 정의로 분류한다.
+- MariaDB 전용 `COLUMN_CHECK`, `COLUMN_JSON`, `JSON_EXISTS`를 별도 catalog로 추가해
+  MariaDB에는 추천하되 MySQL에는 누출하지 않는다.
+
+스윕은 별도 축약 추천기를 쓰지 않는다. 각 단어 위치에 실제 cursor marker를 넣고
+프로덕션과 같은 `query_completion_suggestions_with_data(..., true, ...)` 진입점을
+DB 종류와 file-scoped metadata로 호출한다. 따라서 테스트 흐름을 따로 수정할 필요가
+없었고, 실패를 재현한 개별 테스트도 같은 production completion helper를 사용한다.
+
+## 17-5. IntelliSense 보고서 결과
+
+| 보고서 | checked | missing |
+| --- | ---: | ---: |
+| `test/oracle_format_final_boss_3.sql.out` | 375 | 0 |
+| `test_mysql/test8.txt.out` | 512 | 0 |
+| `test_mariadb/test13.txt.out` | 449 | 0 |
+
+통합 ignored 테스트
+`intellisense_sweep_generate_report_for_file_certifies_new_final_boss_queries`는 이전
+final-boss 3개와 이번 3개, 총 6개 모두를 `fail_on_missing=true`로 검사한다.
+실제 추천 가능한 누락은 0건이다.
+
+## 17-6. 100만 줄 성능 계약
+
+새 로직은 full document 재스캔을 completion 후보별로 반복하지 않는다. CTE/window
+declaration용 괄호 짝은 token span당 한 번 O(n)으로 만들고, exact nested grammar는
+이미 bounded된 local/statement token slice만 본다. 다음 100만 줄 초과 production
+회귀 4종으로 parse window, completion index, edit/undo delta, highlighting refresh가
+bounded fast path를 유지하는지 함께 검증한다.
+
+- `million_line_oracle_plsql_completion_window_stays_hard_capped`
+- `million_line_production_completion_index_uses_the_bounded_fast_path`
+- `million_line_production_undo_records_a_small_delta_and_shares_untouched_chunks`
+- `million_line_production_shadow_edit_and_semantic_refresh_stay_bounded`
+
+## 17-7. 최종 품질 게이트 결과
+
+| 검증 | 결과 |
+| --- | --- |
+| formatter CTE body-indent 최소 회귀 | 1 통과, 실패 0 |
+| 6개 final-boss 통합 IntelliSense 스윕 | 1 통과, 실패 0, 198.81초 |
+| 100만 줄 초과 production 성능 회귀 | 4 통과, 실패 0, 0.14초 |
+| 최종 전체 포맷 스윕 | 1 통과, 실패 0, 59개·34,382줄 |
+| 수동 판독본/최종 재생성본 aggregate SHA-1 | 양쪽 모두 `14dfa65cbfef6ab813e92b995d83472c505783eb` |
+| formatter error marker 검색 | 0건 |
+| 정확한 `cargo test` | lib 6,479 통과·225 ignored, 모든 binary/integration/guard/doc-test 포함 실패 0 |
+| 정확한 `cargo clippy -- -D warnings -W clippy::perf -W clippy::complexity` | 통과, 오류·경고 0 |
+| `cargo fmt --all -- --check` | 통과 |
+| `git diff --check` | 통과 |
+
+## 17-8. 결론
+
+신규 세 쿼리는 원본과 자동 포맷 결과가 모두 실제 대상 DB에서 실행되고 자체 검산을
+통과했다. 신규 formatter 결함은 재현 테스트를 먼저 추가한 뒤 owning frame의 고정
+`body_indent` 복귀로 수정했고, 59개 산출물 34,382줄을 직접 전수 판독한 최종본과
+재생성본이 byte-level aggregate hash까지 같다. IntelliSense 스윕은 production
+completion 흐름에서 신규 세 파일 총 1,336개 토큰을 검사해 누락 0이며, 전체 테스트와
+엄격한 clippy에도 오류나 경고가 남지 않았다.

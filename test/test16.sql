@@ -281,13 +281,13 @@ IS
     v_cnt         NUMBER;
     v_rendered    VARCHAR2(4000);
 BEGIN
-    v_sql := q'[
+    v_sql := q'~
         SELECT COUNT(*)
           FROM qt_splitter_ultimate t
          WHERE t.grp = :x
            AND t."COMMENT" IS NOT NULL
            AND t."COMMENT" LIKE q'[%;%]'
-    ]';
+    ~';
 
     EXECUTE IMMEDIATE v_sql INTO v_cnt USING p_grp;
 
@@ -390,7 +390,7 @@ IS
     IS
         v_dyn CLOB;
     BEGIN
-        v_dyn := q'[
+        v_dyn := q'~
             UPDATE qt_splitter_ultimate
                SET "COMMENT" =
                    SUBSTR(
@@ -404,7 +404,7 @@ IS
                    ),
                    updated_at = SYSTIMESTAMP
              WHERE id = :y
-        ]';
+        ~';
 
         EXECUTE IMMEDIATE v_dyn USING p_note, p_id;
     END touch_row;
@@ -566,7 +566,7 @@ END;
 DECLARE
     v_sql   CLOB;
 BEGIN
-    v_sql := q'[
+    v_sql := q'~
         INSERT INTO qt_splitter_ultimate
         (
             id, parent_id, grp, "DATE", "COMMENT", name, status_cd, amount, calc_text, payload, json_text, updated_at
@@ -586,7 +586,7 @@ BEGIN
             q'!{"anon":"yes","txt":"; /"}!',
             SYSTIMESTAMP
         )
-    ]';
+    ~';
 
     EXECUTE IMMEDIATE v_sql
         USING 10, 3, 30, 'delta/name', 'NEW', 444;

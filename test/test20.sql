@@ -90,7 +90,8 @@ CREATE TABLE qt_fb_emp
     created_at      TIMESTAMP DEFAULT SYSTIMESTAMP,
     updated_at      TIMESTAMP,
     CONSTRAINT qt_fb_emp_fk1 FOREIGN KEY (dept_id) REFERENCES qt_fb_dept(dept_id)
-);
+)
+XMLTYPE COLUMN xml_payload STORE AS BASICFILE CLOB;
 /
 
 CREATE TABLE qt_fb_stage
@@ -753,7 +754,7 @@ graded AS
 SELECT g.*,
        CURSOR
        (
-           SELECT a.audit_id, a.action_name, a.created_at
+           SELECT a.audit_id, a.action_name
              FROM qt_fb_audit a
             WHERE a.module_name LIKE 'qt_fb_pkg%'
               AND a.created_at >= SYSTIMESTAMP - INTERVAL '1' DAY
@@ -811,16 +812,16 @@ SELECT dept_id, seq_no, calc_value
   (
       SELECT dept_id,
              ROW_NUMBER() OVER (PARTITION BY dept_id ORDER BY emp_id) AS seq_no,
-             NVL(salary,0) AS calc_value
+             NVL(salary,0) AS base_value
         FROM qt_fb_emp
   )
   MODEL
   PARTITION BY (dept_id)
   DIMENSION BY (seq_no)
-  MEASURES (calc_value)
-  RULES
+  MEASURES (base_value, 0 AS calc_value)
+  RULES SEQUENTIAL ORDER
   (
-      calc_value[ANY] = calc_value[CV()] + NVL(calc_value[CV()-1], 0)
+      calc_value[ANY] = base_value[CV()] + NVL(calc_value[CV()-1], 0)
   )
  ORDER BY dept_id, seq_no;
 /
@@ -934,7 +935,7 @@ BEGIN
         FORALL i IN INDICES OF v_emp_ids SAVE EXCEPTIONS
             UPDATE qt_fb_emp
                SET bonus = v_bonus(i),
-                   remarks = NVL(remarks, EMPTY_CLOB()) || CHR(10) || 'bulk updated; index=' || i || '; /'
+                   remarks = NVL(remarks, EMPTY_CLOB()) || CHR(10) || 'bulk updated; emp_id=' || v_emp_ids(i) || '; /'
              WHERE emp_id = v_emp_ids(i);
     EXCEPTION
         WHEN bulk_errors THEN
@@ -957,7 +958,7 @@ END;
 DECLARE
     v_sql CLOB;
 BEGIN
-    v_sql := q'[
+    v_sql := q'~
         DECLARE
             v_x NUMBER := 1;
         BEGIN
@@ -973,7 +974,7 @@ BEGIN
                 SYSTIMESTAMP
             );
         END;
-    ]';
+    ~';
 
     EXECUTE IMMEDIATE v_sql;
 END;

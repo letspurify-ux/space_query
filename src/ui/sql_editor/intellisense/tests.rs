@@ -51872,6 +51872,9 @@ fn intellisense_sweep_generate_report_for_file_certifies_new_final_boss_queries(
     oracle_test_words_generate_out_report("oracle_format_final_boss_2.sql", true);
     mysql_test_words_generate_out_report("test7.txt", true);
     mariadb_test_words_generate_out_report("test12.txt", true);
+    oracle_test_words_generate_out_report("oracle_format_final_boss_3.sql", true);
+    mysql_test_words_generate_out_report("test8.txt", true);
+    mariadb_test_words_generate_out_report("test13.txt", true);
 }
 
 #[test]
@@ -51890,6 +51893,24 @@ fn mysql_test7_words_generate_out_report() {
 #[ignore = "generates the MariaDB final-boss IV IntelliSense sweep report"]
 fn mariadb_test12_words_generate_out_report() {
     mariadb_test_words_generate_out_report("test12.txt", true);
+}
+
+#[test]
+#[ignore = "generates the Oracle final-boss III IntelliSense sweep report"]
+fn oracle_final_boss_3_words_generate_out_report() {
+    oracle_test_words_generate_out_report("oracle_format_final_boss_3.sql", true);
+}
+
+#[test]
+#[ignore = "generates the MySQL final-boss V IntelliSense sweep report"]
+fn mysql_test8_words_generate_out_report() {
+    mysql_test_words_generate_out_report("test8.txt", true);
+}
+
+#[test]
+#[ignore = "generates the MariaDB final-boss V IntelliSense sweep report"]
+fn mariadb_test13_words_generate_out_report() {
+    mariadb_test_words_generate_out_report("test13.txt", true);
 }
 
 #[test]
@@ -89406,6 +89427,104 @@ fn sweep_missing_scoped_names_reproduce_through_production_completion() {
 }
 
 #[test]
+fn oracle_final_boss_3_missing_tokens_reproduce_through_production_completion() {
+    assert_oracle_fixture_completion_cases(
+        "oracle_format_final_boss_3.sql",
+        &[
+            (
+                "SELECT c.day_no+1,c.day_value+1",
+                "SELECT c.day_|+1,c.day_value+1",
+                "day_no",
+            ),
+            (
+                "SELECT c.day_no+1,c.day_value+1",
+                "SELECT c.day_no+1,c.day_v|+1",
+                "day_value",
+            ),
+            (
+                "CYCLE day_no SET calendar_cycle_yn",
+                "CYCL| day_no SET calendar_cycle_yn",
+                "CYCLE",
+            ),
+            (
+                "SUM(d.margin_amount)OVER(PARTITION BY d.account_id ORDER BY d.day_no ROWS BETWEEN",
+                "SUM(d.margin_amount)OVER(PARTITION BY d.account_id ORDER BY d.day_no ROW| BETWEEN",
+                "ROWS",
+            ),
+            (
+                "ON OVERFLOW TRUNCATE'...'WITHOUT COUNT",
+                "ON OVER| TRUNCATE'...'WITHOUT COUNT",
+                "OVERFLOW",
+            ),
+            (
+                "ON OVERFLOW TRUNCATE'...'WITHOUT COUNT",
+                "ON OVERFLOW TRUN| '...'WITHOUT COUNT",
+                "TRUNCATE",
+            ),
+            (
+                "ON OVERFLOW TRUNCATE'...'WITHOUT COUNT",
+                "ON OVERFLOW TRUNCATE'...'WITH| COUNT",
+                "WITHOUT",
+            ),
+            (
+                "ORDER BY f.account_id\n/",
+                "ORDER BY f.acco|\n/",
+                "account_id",
+            ),
+        ],
+    );
+}
+
+#[test]
+fn oracle_listagg_overflow_keyword_chain_uses_production_completion() {
+    use crate::db::DatabaseType::Oracle;
+
+    let has = |sql: &str, expected: &str| {
+        query_keyword_completion_suggestions(sql, Oracle)
+            .iter()
+            .any(|suggestion| suggestion.eq_ignore_ascii_case(expected))
+    };
+
+    for (sql, expected) in [
+        (
+            "SELECT LISTAGG(DISTINCT deptno, ',' ON over|) FROM emp",
+            "OVERFLOW",
+        ),
+        (
+            "SELECT LISTAGG(DISTINCT deptno, ',' ON OVERFLOW |) FROM emp",
+            "ERROR",
+        ),
+        (
+            "SELECT LISTAGG(DISTINCT deptno, ',' ON OVERFLOW |) FROM emp",
+            "TRUNCATE",
+        ),
+        (
+            "SELECT LISTAGG(DISTINCT deptno, ',' ON OVERFLOW TRUNCATE |) FROM emp",
+            "WITH",
+        ),
+        (
+            "SELECT LISTAGG(DISTINCT deptno, ',' ON OVERFLOW TRUNCATE |) FROM emp",
+            "WITHOUT",
+        ),
+        (
+            "SELECT LISTAGG(DISTINCT deptno, ',' ON OVERFLOW TRUNCATE '...' WITH |) FROM emp",
+            "COUNT",
+        ),
+        (
+            "SELECT LISTAGG(DISTINCT deptno, ',' ON OVERFLOW TRUNCATE '...' WITHOUT |) FROM emp",
+            "COUNT",
+        ),
+    ] {
+        assert!(has(sql, expected), "`{expected}` missing for `{sql}`");
+    }
+
+    assert!(
+        !has("SELECT COALESCE(ename, 'x' ON over|) FROM emp", "OVERFLOW"),
+        "LISTAGG overflow keywords leaked into a different function call"
+    );
+}
+
+#[test]
 fn sweep_report_skips_new_identifier_definition_slots_but_not_keywords() {
     use crate::db::DatabaseType::Oracle;
 
@@ -89430,6 +89549,10 @@ fn sweep_report_skips_new_identifier_definition_slots_but_not_keywords() {
         ),
         (
             "WITH bas__CODEX_CURSOR__ AS (SELECT 1 FROM dual) SELECT * FROM base",
+            "base",
+        ),
+        (
+            "WITH FUNCTION f RETURN NUMBER IS BEGIN RETURN 1; END; bas__CODEX_CURSOR__ AS (SELECT 1 FROM dual) SELECT * FROM base",
             "base",
         ),
         ("SELECT empno AS sum___CODEX_CURSOR__ FROM emp", "sum_sal"),
@@ -89930,6 +90053,9 @@ fn mysql_family_new_fixture_type_and_builtin_completion_regressions() {
         ("CREATE TABLE t(c LINE| SRID 4326)", MySQL, "LINESTRING"),
         ("SELECT COLUMN_CREA|('k','v')", MariaDB, "COLUMN_CREATE"),
         ("SELECT COLUMN_G|(doc,'k' AS CHAR)", MariaDB, "COLUMN_GET"),
+        ("SELECT COLUMN_CH|(doc)", MariaDB, "COLUMN_CHECK"),
+        ("SELECT COLUMN_JS|(doc)", MariaDB, "COLUMN_JSON"),
+        ("SELECT JSON_EXI|(doc,'$.x')", MariaDB, "JSON_EXISTS"),
         ("SELECT MEDI|(amount) FROM t", MariaDB, "MEDIAN"),
         ("SELECT PERCENTILE_CO|(0.5) FROM t", MariaDB, "PERCENTILE_CONT"),
         ("SELECT PERCENTILE_DI|(0.5) FROM t", MariaDB, "PERCENTILE_DISC"),
@@ -89963,6 +90089,20 @@ fn mysql_family_new_fixture_type_and_builtin_completion_regressions() {
         "new fixture type/function completion gaps:\n{}",
         failures.join("\n")
     );
+
+    for (sql, maria_only) in [
+        ("SELECT COLUMN_CH|(doc)", "COLUMN_CHECK"),
+        ("SELECT COLUMN_JS|(doc)", "COLUMN_JSON"),
+        ("SELECT JSON_EXI|(doc,'$.x')", "JSON_EXISTS"),
+    ] {
+        let mysql = query_keyword_completion_suggestions(sql, MySQL);
+        assert!(
+            !mysql.iter().any(|suggestion| {
+                intellisense_sweep_suggestion_matches_word(suggestion, maria_only)
+            }),
+            "MariaDB-only `{maria_only}` leaked into MySQL completion: {mysql:?}"
+        );
+    }
 }
 
 #[test]

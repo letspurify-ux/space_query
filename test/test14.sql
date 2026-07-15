@@ -102,53 +102,53 @@ WITH
 s1_base AS
 (
     SELECT
-        if.a,
-        if.b,
-        if.c,
-        if.grp,
-        if.flag,
-        if.dt,
-        if.category,
-        if.subcat
-    FROM qt_depth_base if
+        if_row.a,
+        if_row.b,
+        if_row.c,
+        if_row.grp,
+        if_row.flag,
+        if_row.dt,
+        if_row.category,
+        if_row.subcat
+    FROM qt_depth_base if_row
 ),
 s2_child_rollup AS
 (
     SELECT
-        date.ref_a AS a,
+        date_row.ref_a AS a,
         COUNT(*) AS cnt_child,
-        SUM(date.metric) AS sum_metric,
-        MAX(date.metric) AS max_metric,
-        MIN(date.metric) AS min_metric
+        SUM(date_row.metric) AS sum_metric,
+        MAX(date_row.metric) AS max_metric,
+        MIN(date_row.metric) AS min_metric
     FROM
     (
         SELECT
-            date.ref_a,
-            date.metric
-        FROM qt_depth_child date
-        WHERE date.kind IN ('X', 'Y')
+            date_row.ref_a,
+            date_row.metric
+        FROM qt_depth_child date_row
+        WHERE date_row.kind IN ('X', 'Y')
 
         UNION ALL
 
         SELECT
-            date.ref_a,
-            date.metric
-        FROM qt_depth_child date
-        WHERE date.kind NOT IN ('X', 'Y')
-    ) date
-    GROUP BY date.ref_a
+            date_row.ref_a,
+            date_row.metric
+        FROM qt_depth_child date_row
+        WHERE date_row.kind NOT IN ('X', 'Y')
+    ) date_row
+    GROUP BY date_row.ref_a
 ),
 s3_nested AS
 (
     SELECT
-        level.a,
-        level.b,
-        level.c,
-        level.grp,
-        level.flag,
-        level.dt,
-        level.category,
-        level.subcat,
+        level_row.a,
+        level_row.b,
+        level_row.c,
+        level_row.grp,
+        level_row.flag,
+        level_row.dt,
+        level_row.category,
+        level_row.subcat,
         NVL(roll.cnt_child, 0) AS cnt_child,
         NVL(roll.sum_metric, 0) AS sum_metric,
         NVL(roll.max_metric, 0) AS max_metric,
@@ -159,23 +159,23 @@ s3_nested AS
             FROM
             (
                 SELECT 1
-                FROM qt_depth_child trim
-                WHERE trim.ref_a = level.a
+                FROM qt_depth_child trim_row
+                WHERE trim_row.ref_a = level_row.a
                   AND EXISTS
                   (
                       SELECT 1
                       FROM
                       (
                           SELECT
-                              rank.child_id,
-                              rank.metric
-                          FROM qt_depth_child rank
-                          WHERE rank.ref_a = trim.ref_a
-                      ) rank
-                      WHERE rank.child_id = trim.child_id
-                        AND rank.metric >= trim.metric
+                              rank_row.child_id,
+                              rank_row.metric
+                          FROM qt_depth_child rank_row
+                          WHERE rank_row.ref_a = trim_row.ref_a
+                      ) rank_row
+                      WHERE rank_row.child_id = trim_row.child_id
+                        AND rank_row.metric >= trim_row.metric
                   )
-            ) count
+            ) count_row
         ) AS stable_cnt,
 
         (
@@ -185,18 +185,18 @@ s3_nested AS
                 SELECT x.metric
                 FROM
                 (
-                    SELECT count.metric
-                    FROM qt_depth_child count
-                    WHERE count.ref_a = level.a
-                      AND count.metric >=
+                    SELECT count_row.metric
+                    FROM qt_depth_child count_row
+                    WHERE count_row.ref_a = level_row.a
+                      AND count_row.metric >=
                           (
-                              SELECT NVL(MIN(date.metric), 0)
+                              SELECT NVL(MIN(date_row.metric), 0)
                               FROM
                               (
-                                  SELECT date.metric
-                                  FROM qt_depth_child date
-                                  WHERE date.ref_a = level.a
-                              ) date
+                                  SELECT date_row.metric
+                                  FROM qt_depth_child date_row
+                                  WHERE date_row.ref_a = level_row.a
+                              ) date_row
                           )
                 ) x
             ) x
@@ -209,91 +209,91 @@ s3_nested AS
                      FROM
                      (
                          SELECT
-                             trim.ref_a,
-                             SUM(trim.metric) AS sum_metric
-                         FROM qt_depth_child trim
-                         GROUP BY trim.ref_a
-                     ) trim
-                     WHERE trim.ref_a = level.a
-                       AND trim.sum_metric >
+                             trim_row.ref_a,
+                             SUM(trim_row.metric) AS sum_metric
+                         FROM qt_depth_child trim_row
+                         GROUP BY trim_row.ref_a
+                     ) trim_row
+                     WHERE trim_row.ref_a = level_row.a
+                       AND trim_row.sum_metric >
                            (
-                               SELECT AVG(count.sum_metric)
+                               SELECT AVG(count_row.sum_metric)
                                FROM
                                (
                                    SELECT
-                                       count.ref_a,
-                                       SUM(count.metric) AS sum_metric
-                                   FROM qt_depth_child count
-                                   GROUP BY count.ref_a
-                               ) count
+                                       count_row.ref_a,
+                                       SUM(count_row.metric) AS sum_metric
+                                   FROM qt_depth_child count_row
+                                   GROUP BY count_row.ref_a
+                               ) count_row
                            )
                  )
                 THEN 'ABOVE_AVG'
             ELSE 'NOT_ABOVE_AVG'
         END AS bucket
-    FROM s1_base level
+    FROM s1_base level_row
     LEFT JOIN s2_child_rollup roll
-        ON roll.a = level.a
+        ON roll.a = level_row.a
 ),
 s4_analytic AS
 (
     SELECT
-        rank.a,
-        rank.b,
-        rank.c,
-        rank.grp,
-        rank.flag,
-        rank.dt,
-        rank.category,
-        rank.subcat,
-        rank.cnt_child,
-        rank.sum_metric,
-        rank.max_metric,
-        rank.min_metric,
-        rank.stable_cnt,
-        rank.sum_of_ge_min,
-        rank.bucket,
+        rank_row.a,
+        rank_row.b,
+        rank_row.c,
+        rank_row.grp,
+        rank_row.flag,
+        rank_row.dt,
+        rank_row.category,
+        rank_row.subcat,
+        rank_row.cnt_child,
+        rank_row.sum_metric,
+        rank_row.max_metric,
+        rank_row.min_metric,
+        rank_row.stable_cnt,
+        rank_row.sum_of_ge_min,
+        rank_row.bucket,
         ROW_NUMBER() OVER
         (
-            PARTITION BY rank.grp
-            ORDER BY rank.max_metric DESC, rank.a
+            PARTITION BY rank_row.grp
+            ORDER BY rank_row.max_metric DESC, rank_row.a
         ) AS rn,
         DENSE_RANK() OVER
         (
-            ORDER BY rank.sum_metric DESC, rank.a
+            ORDER BY rank_row.sum_metric DESC, rank_row.a
         ) AS dr,
-        SUM(rank.c) OVER
+        SUM(rank_row.c) OVER
         (
-            PARTITION BY rank.grp
-            ORDER BY rank.a
+            PARTITION BY rank_row.grp
+            ORDER BY rank_row.a
             ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
         ) AS running_c
-    FROM s3_nested rank
+    FROM s3_nested rank_row
 ),
 s5_case AS
 (
     SELECT
-        count.a,
-        count.b,
-        count.c,
-        count.grp,
-        count.flag,
-        count.dt,
-        count.category,
-        count.subcat,
-        count.cnt_child,
-        count.sum_metric,
-        count.max_metric,
-        count.min_metric,
-        count.stable_cnt,
-        count.sum_of_ge_min,
-        count.bucket,
-        count.rn,
-        count.dr,
-        count.running_c,
+        count_row.a,
+        count_row.b,
+        count_row.c,
+        count_row.grp,
+        count_row.flag,
+        count_row.dt,
+        count_row.category,
+        count_row.subcat,
+        count_row.cnt_child,
+        count_row.sum_metric,
+        count_row.max_metric,
+        count_row.min_metric,
+        count_row.stable_cnt,
+        count_row.sum_of_ge_min,
+        count_row.bucket,
+        count_row.rn,
+        count_row.dr,
+        count_row.running_c,
 
         CASE
-            WHEN count.flag = 'Y'
+            WHEN count_row.flag = 'Y'
                 THEN
                     (
                         SELECT NVL(MAX(x.metric), 0)
@@ -302,9 +302,9 @@ s5_case AS
                             SELECT x.metric
                             FROM
                             (
-                                SELECT rank.metric
-                                FROM qt_depth_child rank
-                                WHERE rank.ref_a = count.a
+                                SELECT rank_row.metric
+                                FROM qt_depth_child rank_row
+                                WHERE rank_row.ref_a = count_row.a
                             ) x
                         ) x
                     )
@@ -316,65 +316,65 @@ s5_case AS
                             SELECT x.metric
                             FROM
                             (
-                                SELECT level.metric
-                                FROM qt_depth_child level
-                                WHERE level.ref_a = count.a
+                                SELECT level_row.metric
+                                FROM qt_depth_child level_row
+                                WHERE level_row.ref_a = count_row.a
                             ) x
                         ) x
                     )
         END AS case_metric,
 
         CASE
-            WHEN count.cnt_child > 0
+            WHEN count_row.cnt_child > 0
                 THEN
                     (
-                        SELECT NVL(MAX(last.metric_val), 0)
+                        SELECT NVL(MAX(last_row.metric_val), 0)
                         FROM
                         (
-                            SELECT last.metric_val
+                            SELECT last_row.metric_val
                             FROM
                             (
-                                SELECT trim.metric AS metric_val
-                                FROM qt_depth_child trim
-                                WHERE trim.ref_a = count.a
+                                SELECT trim_row.metric AS metric_val
+                                FROM qt_depth_child trim_row
+                                WHERE trim_row.ref_a = count_row.a
 
                                 UNION ALL
 
                                 SELECT 0 AS metric_val
                                 FROM dual
-                            ) last
-                        ) last
+                            ) last_row
+                        ) last_row
                     )
             ELSE 0
         END AS final_max_metric
-    FROM s4_analytic count
+    FROM s4_analytic count_row
 ),
 s6_final AS
 (
     SELECT
-        trim.a,
-        trim.b,
-        trim.c,
-        trim.grp,
-        trim.flag,
-        trim.dt,
-        trim.category,
-        trim.subcat,
-        trim.cnt_child,
-        trim.sum_metric,
-        trim.max_metric,
-        trim.min_metric,
-        trim.stable_cnt,
-        trim.sum_of_ge_min,
-        trim.bucket,
-        trim.rn,
-        trim.dr,
-        trim.running_c,
-        trim.case_metric,
-        trim.final_max_metric,
+        trim_row.a,
+        trim_row.b,
+        trim_row.c,
+        trim_row.grp,
+        trim_row.flag,
+        trim_row.dt,
+        trim_row.category,
+        trim_row.subcat,
+        trim_row.cnt_child,
+        trim_row.sum_metric,
+        trim_row.max_metric,
+        trim_row.min_metric,
+        trim_row.stable_cnt,
+        trim_row.sum_of_ge_min,
+        trim_row.bucket,
+        trim_row.rn,
+        trim_row.dr,
+        trim_row.running_c,
+        trim_row.case_metric,
+        trim_row.final_max_metric,
 
         CASE
-            WHEN trim.case_metric >
+            WHEN trim_row.case_metric >
                  (
                      SELECT AVG(z.case_metric)
                      FROM
@@ -382,9 +382,9 @@ s6_final AS
                          SELECT z.case_metric
                          FROM
                          (
-                             SELECT date.case_metric
-                             FROM s5_case date
-                             WHERE date.grp = trim.grp
+                             SELECT date_row.case_metric
+                             FROM s5_case date_row
+                             WHERE date_row.grp = trim_row.grp
                          ) z
                      ) z
                  )
@@ -400,83 +400,83 @@ s6_final AS
                 FROM
                 (
                     SELECT
-                        if.ref_a,
-                        if.kind
-                    FROM qt_depth_child if
-                    WHERE if.ref_a = trim.a
-                ) if
-                WHERE if.kind IN ('X', 'Y', 'Z')
-            ) count
+                        if_row.ref_a,
+                        if_row.kind
+                    FROM qt_depth_child if_row
+                    WHERE if_row.ref_a = trim_row.a
+                ) if_row
+                WHERE if_row.kind IN ('X', 'Y', 'Z')
+            ) count_row
         ) AS final_kind_cnt
-    FROM s5_case trim
+    FROM s5_case trim_row
 )
 SELECT
-    if.a,
-    if.b,
-    if.c,
-    if.grp,
-    if.flag,
-    if.dt,
-    if.category,
-    if.subcat,
-    if.cnt_child,
-    if.sum_metric,
-    if.max_metric,
-    if.min_metric,
-    if.stable_cnt,
-    if.sum_of_ge_min,
-    if.bucket,
-    if.rn,
-    if.dr,
-    if.running_c,
-    if.case_metric,
-    if.final_max_metric,
-    if.case_vs_group,
-    if.final_kind_cnt,
+    if_row.a,
+    if_row.b,
+    if_row.c,
+    if_row.grp,
+    if_row.flag,
+    if_row.dt,
+    if_row.category,
+    if_row.subcat,
+    if_row.cnt_child,
+    if_row.sum_metric,
+    if_row.max_metric,
+    if_row.min_metric,
+    if_row.stable_cnt,
+    if_row.sum_of_ge_min,
+    if_row.bucket,
+    if_row.rn,
+    if_row.dr,
+    if_row.running_c,
+    if_row.case_metric,
+    if_row.final_max_metric,
+    if_row.case_vs_group,
+    if_row.final_kind_cnt,
 
     (
         SELECT COUNT(*)
         FROM
         (
             SELECT 1
-            FROM s6_final level
-            WHERE level.grp = if.grp
-              AND level.a <= if.a
+            FROM s6_final level_row
+            WHERE level_row.grp = if_row.grp
+              AND level_row.a <= if_row.a
               AND EXISTS
                   (
                       SELECT 1
                       FROM
                       (
-                          SELECT date.a
-                          FROM s6_final date
-                          WHERE date.a = level.a
-                      ) date
-                      WHERE date.a = level.a
+                          SELECT date_row.a
+                          FROM s6_final date_row
+                          WHERE date_row.a = level_row.a
+                      ) date_row
+                      WHERE date_row.a = level_row.a
                   )
-        ) count
+        ) count_row
     ) AS grp_prefix_cnt
 
-FROM s6_final if
-WHERE if.a IN
+FROM s6_final if_row
+WHERE if_row.a IN
 (
-    SELECT level.a
+    SELECT level_row.a
     FROM
     (
-        SELECT level.a
-        FROM s6_final level
-        WHERE level.dr <= 999
-          AND level.a IN
+        SELECT level_row.a
+        FROM s6_final level_row
+        WHERE level_row.dr <= 999
+          AND level_row.a IN
               (
-                  SELECT date.ref_a
+                  SELECT date_row.ref_a
                   FROM
                   (
-                      SELECT date.ref_a
-                      FROM qt_depth_child date
-                      GROUP BY date.ref_a
+                      SELECT date_row.ref_a
+                      FROM qt_depth_child date_row
+                      GROUP BY date_row.ref_a
                       HAVING COUNT(*) >= 1
-                  ) date
+                  ) date_row
               )
-    ) level
+    ) level_row
 );
 /
 
@@ -484,36 +484,36 @@ WHERE if.a IN
 -- FINAL EXECUTION
 --------------------------------------------------------------------------------
 SELECT
-    trim.a,
-    trim.b,
-    trim.grp,
-    trim.cnt_child,
-    trim.sum_metric,
-    trim.max_metric,
-    trim.min_metric,
-    trim.stable_cnt,
-    trim.sum_of_ge_min,
-    trim.bucket,
-    trim.rn,
-    trim.dr,
-    trim.running_c,
-    trim.case_metric,
-    trim.final_max_metric,
-    trim.case_vs_group,
-    trim.final_kind_cnt,
-    trim.grp_prefix_cnt
+    trim_row.a,
+    trim_row.b,
+    trim_row.grp,
+    trim_row.cnt_child,
+    trim_row.sum_metric,
+    trim_row.max_metric,
+    trim_row.min_metric,
+    trim_row.stable_cnt,
+    trim_row.sum_of_ge_min,
+    trim_row.bucket,
+    trim_row.rn,
+    trim_row.dr,
+    trim_row.running_c,
+    trim_row.case_metric,
+    trim_row.final_max_metric,
+    trim_row.case_vs_group,
+    trim_row.final_kind_cnt,
+    trim_row.grp_prefix_cnt
 FROM
 (
     SELECT
-        trim.*
+        trim_row.*
     FROM
     (
         SELECT
-            trim.*
-        FROM qt_depth_monster_v trim
-    ) trim
-) trim
-ORDER BY trim.grp, trim.a;
+            trim_row.*
+        FROM qt_depth_monster_v trim_row
+    ) trim_row
+) trim_row
+ORDER BY trim_row.grp, trim_row.a;
 /
 
 --------------------------------------------------------------------------------

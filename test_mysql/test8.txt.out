@@ -1,0 +1,207 @@
+-- ==========================================================================
+-- SPACE QUERY MYSQL SINGLE-STATEMENT FORMATTER FINAL BOSS V
+-- Target: MySQL 8.0.31+ (live certification uses MySQL 8.0.46)
+-- A repeatable, side-effect-free statement covering recursive CTEs, nested
+-- JSON_TABLE, JSON schema/predicate functions, named windows, ROLLUP, set
+-- operators, LATERAL, regexp predicates, and deep parent-frame recovery.
+-- ==========================================================================
+WITH RECURSIVE
+params AS(
+SELECT DATE'2026-05-01'AS start_day,5 AS day_count
+),
+teams(team_id,parent_team_id,team_name,active_flag)AS(
+SELECT 1,NULL,'Aurora Platform',TRUE UNION ALL
+SELECT 2,1,'Bluebird Edge',TRUE UNION ALL
+SELECT 3,1,'Cobalt Data',TRUE UNION ALL
+SELECT 4,2,'Dormant Sandbox',FALSE
+),
+team_tree(team_id,parent_team_id,team_path,tree_depth)AS(
+SELECT team_id,parent_team_id,CAST(REGEXP_REPLACE(UPPER(team_name),'[^A-Z0-9]+','_')AS CHAR(300)),0
+FROM teams WHERE parent_team_id IS NULL
+UNION ALL
+SELECT t.team_id,t.parent_team_id,CONCAT(p.team_path,'/',REGEXP_REPLACE(UPPER(t.team_name),'[^A-Z0-9]+','_')),p.tree_depth+1
+FROM teams t JOIN team_tree p ON p.team_id=t.parent_team_id
+),
+calendar(day_no,day_value)AS(
+SELECT 0,start_day FROM params
+UNION ALL
+SELECT day_no+1,day_value+INTERVAL 1 DAY
+FROM calendar JOIN params ON TRUE
+WHERE day_no+1<day_count
+),
+deployments(deployment_id,team_id,deployed_on,deployment_status,payload)AS(
+SELECT 101,1,DATE'2026-05-01','SUCCESS',JSON_OBJECT('channel','web','checks',JSON_ARRAY(
+JSON_OBJECT('name','latency','value',12,'unit','ms','labels',JSON_ARRAY('critical','edge')),
+JSON_OBJECT('name','errors','value',2,'unit','count','labels',JSON_ARRAY('quality'))
+))UNION ALL
+SELECT 102,1,DATE'2026-05-03','SUCCESS',JSON_OBJECT('channel','partner','checks',JSON_ARRAY(
+JSON_OBJECT('name','latency','value',18,'unit','ms','labels',JSON_ARRAY('renewal')),
+JSON_OBJECT('name','errors','value',1,'unit','count','labels',JSON_ARRAY('critical','quality'))
+))UNION ALL
+SELECT 201,2,DATE'2026-05-02','SUCCESS',JSON_OBJECT('channel','store','checks',JSON_ARRAY(
+JSON_OBJECT('name','latency','value',25,'unit','ms','labels',JSON_ARRAY('edge')),
+JSON_OBJECT('name','errors','value',3,'unit','count','labels',JSON_ARRAY('quality'))
+))UNION ALL
+SELECT 301,3,DATE'2026-05-02','FAILED',JSON_OBJECT('channel','direct','checks',JSON_ARRAY(
+JSON_OBJECT('name','latency','value',40,'unit','ms','labels',JSON_ARRAY('critical','bulk')),
+JSON_OBJECT('name','errors','value',7,'unit','count','labels',JSON_ARRAY('incident'))
+))UNION ALL
+SELECT 302,3,DATE'2026-05-05','SUCCESS',JSON_OBJECT('channel','partner','checks',JSON_ARRAY(
+JSON_OBJECT('name','latency','value',20,'unit','ms','labels',JSON_ARRAY('recovery')),
+JSON_OBJECT('name','errors','value',0,'unit','count','labels',JSON_ARRAY('quality'))
+))
+),
+check_rows AS(
+SELECT d.deployment_id,d.team_id,d.deployed_on,d.deployment_status,j.channel_code,
+j.check_no,j.check_name,j.check_value,j.check_unit,j.label_no,j.label_value
+FROM deployments d
+JOIN JSON_TABLE(
+d.payload,'$'
+COLUMNS(
+channel_code VARCHAR(30)PATH'$.channel'DEFAULT'"unknown"'ON EMPTY,
+NESTED PATH'$.checks[*]'
+COLUMNS(
+check_no FOR ORDINALITY,
+check_name VARCHAR(30)PATH'$.name',
+check_value DECIMAL(12,2)PATH'$.value'DEFAULT'0'ON ERROR,
+check_unit VARCHAR(20)PATH'$.unit',
+NESTED PATH'$.labels[*]'
+COLUMNS(
+label_no FOR ORDINALITY,
+label_value VARCHAR(30)PATH'$'
+)
+)
+)
+)j ON TRUE
+),
+check_base AS(
+SELECT deployment_id,team_id,deployed_on,deployment_status,MAX(channel_code)AS channel_code,
+check_name,MAX(check_value)AS check_value,MAX(check_unit)AS check_unit
+FROM check_rows
+GROUP BY deployment_id,team_id,deployed_on,deployment_status,check_name
+),
+deployment_facts AS(
+SELECT deployment_id,team_id,deployed_on,deployment_status,MAX(channel_code)AS channel_code,
+MAX(CASE WHEN check_name='latency'THEN check_value END)AS latency_ms,
+MAX(CASE WHEN check_name='errors'THEN check_value END)AS error_count,
+COUNT(*)AS check_count
+FROM check_base
+GROUP BY deployment_id,team_id,deployed_on,deployment_status
+),
+daily AS(
+SELECT t.team_id,c.day_no,c.day_value,
+COALESCE(AVG(f.latency_ms),0)AS average_latency,
+COALESCE(SUM(f.error_count),0)AS error_count,
+COUNT(f.deployment_id)AS deployment_count
+FROM teams t CROSS JOIN calendar c
+LEFT JOIN deployment_facts f ON f.team_id=t.team_id AND f.deployed_on=c.day_value
+GROUP BY t.team_id,c.day_no,c.day_value
+),
+analytic_daily AS(
+SELECT d.*,
+SUM(error_count)OVER w_running AS running_errors,
+LAG(average_latency,1,0)OVER w_order AS previous_latency,
+CUME_DIST()OVER w_rank AS latency_cume_dist,
+NTH_VALUE(average_latency,2)OVER w_full AS second_latency
+FROM daily d
+WINDOW
+w_base AS(PARTITION BY team_id),
+w_order AS(w_base ORDER BY day_no),
+w_running AS(w_order ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW),
+w_rank AS(w_base ORDER BY average_latency),
+w_full AS(w_order ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING)
+),
+rollup_rows AS(
+SELECT team_id,deployment_status,SUM(error_count)AS total_errors,
+GROUPING(team_id)AS team_grouped,GROUPING(deployment_status)AS status_grouped
+FROM deployment_facts
+GROUP BY team_id,deployment_status WITH ROLLUP
+),
+eligible(team_id)AS(
+(SELECT team_id FROM teams WHERE active_flag IS TRUE)
+INTERSECT
+(SELECT team_id FROM deployment_facts WHERE deployment_status='SUCCESS')
+EXCEPT
+(SELECT team_id FROM deployment_facts WHERE error_count>10)
+),
+team_rollup AS(
+SELECT f.team_id,COUNT(*)AS deployment_count,SUM(f.error_count)AS total_errors,
+ROUND(AVG(f.latency_ms),2)AS average_latency,
+GROUP_CONCAT(DISTINCT f.channel_code ORDER BY f.channel_code SEPARATOR',')AS channel_list,
+JSON_ARRAYAGG(JSON_OBJECT(
+'deployment',f.deployment_id,
+'status',f.deployment_status,
+'latency',f.latency_ms,
+'errors',f.error_count
+))AS deployment_json
+FROM deployment_facts f
+GROUP BY f.team_id
+),
+final_rows AS(
+SELECT t.team_id,t.team_name,t.active_flag,p.team_path,p.tree_depth,
+COALESCE(r.deployment_count,0)AS deployment_count,
+COALESCE(r.total_errors,0)AS total_errors,
+COALESCE(r.average_latency,0)AS average_latency,r.channel_list,r.deployment_json,
+CASE WHEN e.team_id IS NULL THEN'INELIGIBLE'ELSE'ELIGIBLE'END AS eligibility,
+top_deployment.deployment_id AS top_deployment_id,
+top_deployment.latency_ms AS top_latency,
+(SELECT MAX(a.running_errors)FROM analytic_daily a WHERE a.team_id=t.team_id)AS peak_running_errors,
+(SELECT JSON_ARRAYAGG(c.label_value)FROM check_rows c WHERE c.team_id=t.team_id)AS labels_json
+FROM teams t
+JOIN team_tree p ON p.team_id=t.team_id
+LEFT JOIN team_rollup r ON r.team_id=t.team_id
+LEFT JOIN eligible e ON e.team_id=t.team_id
+LEFT JOIN LATERAL(
+SELECT f.deployment_id,f.latency_ms
+FROM deployment_facts f
+WHERE f.team_id=t.team_id
+ORDER BY f.latency_ms DESC,f.deployment_id
+LIMIT 1
+)AS top_deployment ON TRUE
+)
+SELECT
+CASE
+WHEN(SELECT COUNT(*)FROM deployments)=5
+AND(SELECT COUNT(*)FROM check_base)=10
+AND(SELECT SUM(error_count)FROM deployment_facts)=13
+AND(SELECT COUNT(*)FROM calendar)=5
+AND(SELECT COUNT(*)FROM team_tree)=4
+AND(SELECT COUNT(*)FROM rollup_rows WHERE team_grouped=1 AND status_grouped=1)=1
+AND JSON_SCHEMA_VALID(
+JSON_OBJECT('type','object','required',JSON_ARRAY('channel','checks')),
+(SELECT payload FROM deployments WHERE deployment_id=101)
+)=1
+THEN'PASS'ELSE'FAIL'END AS status,
+f.team_id,f.team_name,f.active_flag,f.tree_depth,f.deployment_count,
+f.total_errors,f.average_latency,f.eligibility,f.top_deployment_id,f.top_latency,
+f.peak_running_errors,f.channel_list,
+JSON_OBJECT(
+'path',f.team_path,
+'deployments',f.deployment_json,
+'labels',f.labels_json,
+'predicates',JSON_OBJECT(
+'name_ok',REGEXP_LIKE(f.team_name,'^[A-Z]','c'),
+'has_critical',JSON_OVERLAPS(COALESCE(f.labels_json,JSON_ARRAY()),JSON_ARRAY('critical')),
+'valid_path',JSON_CONTAINS_PATH(JSON_OBJECT('path',f.team_path),'one','$.path')
+),
+'grand_errors',(
+SELECT total_errors
+FROM rollup_rows rr
+WHERE rr.team_grouped=1
+AND rr.status_grouped=1
+)
+)AS evidence
+FROM final_rows f
+ORDER BY f.team_id;
+
+
+-- =========================================================
+-- IntelliSense sweep report generated by intellisense sweep
+-- source: test_mysql/test8.txt
+-- db: MySQL
+-- metadata: test_mysql/test8.txt inferred catalog
+-- checked: 512
+-- missing: 0
+-- marker: [[word]] means not suggested for the tested prefix
+-- missing tokens: none
+-- =========================================================

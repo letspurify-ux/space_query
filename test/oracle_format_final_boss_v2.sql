@@ -125,7 +125,8 @@ CREATE TABLE qt_fmt_emp
     created_at      TIMESTAMP      DEFAULT SYSTIMESTAMP,
     updated_at      TIMESTAMP,
     CONSTRAINT qt_fmt_emp_fk1 FOREIGN KEY (dept_id) REFERENCES qt_fmt_dept (dept_id)
-);
+)
+XMLTYPE COLUMN xml_doc STORE AS BASICFILE CLOB;
 /
 
 CREATE TABLE qt_fmt_bonus
@@ -204,7 +205,7 @@ INSERT ALL
     (
         1002, 40, 1001, 'BOB', 'bob', 'bob@example.com', 90000, 15,
         DATE '2019-06-15', 'ACTIVE', 'Senior Engineer',
-        TO_CLOB(q'[Bob's note has quotes: 'single', "double", and q-quote looking text: q'[abc]']'),
+        TO_CLOB(q'~Bob's note has quotes: 'single', "double", and q-quote looking text: q'[abc]'~'),
         TO_CLOB('{
             "skills": ["oracle", "rust", "fltk"],
             "meta": {"grade": "B", "remote": false, "tags": ["backend", "parser"]},
@@ -474,10 +475,10 @@ AS
                                 FROM TABLE(qt_fmt_pkg.get_pairs(e.emp_id)) p
                             ) AS pair_text,
                             (
-                                SELECT MAX(level)
+                                SELECT MAX(depth_row.bonus_level)
                                 FROM
                                 (
-                                    SELECT level
+                                    SELECT LEVEL AS bonus_level
                                     FROM dual
                                     CONNECT BY level <=
                                                (
@@ -485,7 +486,7 @@ AS
                                                    FROM qt_fmt_bonus b
                                                    WHERE b.emp_id = e.emp_id
                                                )
-                                )
+                                ) depth_row
                             ) AS bonus_depth,
                             CASE
                                 WHEN e.salary >= 100000 THEN
@@ -901,12 +902,12 @@ AS
     SELECT dept_id,
            emp_id,
            salary,
-           0 AS projected_salary
+           projected_salary
     FROM qt_fmt_emp
     MODEL
         PARTITION BY (dept_id)
         DIMENSION BY (emp_id)
-        MEASURES (salary, projected_salary)
+        MEASURES (salary, 0 AS projected_salary)
         RULES
         (
             projected_salary[ANY] =

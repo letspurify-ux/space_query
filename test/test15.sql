@@ -8,7 +8,15 @@ ALTER SESSION SET NLS_DATE_FORMAT = 'YYYY-MM-DD HH24:MI:SS';
 -- UNIT 02
 --------------------------------------------------------------------------------
 
-drop table qt_splitter_boss;
+BEGIN
+    EXECUTE IMMEDIATE 'DROP TABLE qt_splitter_boss PURGE';
+EXCEPTION
+    WHEN OTHERS THEN
+        IF SQLCODE != -942 THEN
+            RAISE;
+        END IF;
+END;
+/
 
 CREATE TABLE qt_splitter_boss
 (
@@ -20,7 +28,8 @@ CREATE TABLE qt_splitter_boss
     amount       NUMBER(18,2),
     status_cd    VARCHAR2(30),
     payload      CLOB
-);
+)
+LOB (payload) STORE AS BASICFILE;
 
 --------------------------------------------------------------------------------
 -- UNIT 03
@@ -125,7 +134,7 @@ IS
                 q'[inserted;payload/with tricky tokens]'
             );
         ELSE
-            v_sql := q'[
+            v_sql := q'~
                 UPDATE qt_splitter_boss
                    SET grp = :1,
                        name = :2,
@@ -134,7 +143,7 @@ IS
                        status_cd = :5,
                        payload = q'[dynamic ; payload / still string]'
                  WHERE id = :6
-            ]';
+            ~';
 
             EXECUTE IMMEDIATE v_sql
                 USING p_grp, normalize_name(p_name), p_note, p_amount, p_status, p_id;
@@ -188,7 +197,7 @@ DECLARE
     v_sql   CLOB;
     v_id    NUMBER := 4;
 BEGIN
-    v_sql := q'[
+    v_sql := q'~
         INSERT INTO qt_splitter_boss
         (
             id, grp, name, note_text, created_at, amount, status_cd, payload
@@ -204,7 +213,7 @@ BEGIN
             'NEW',
             q'[payload with ; and / and ''quotes'']'
         )
-    ]';
+    ~';
 
     EXECUTE IMMEDIATE v_sql USING v_id;
 
@@ -372,12 +381,12 @@ IS
     v_sql   CLOB;
     v_cnt   NUMBER;
 BEGIN
-    v_sql := q'[
+    v_sql := q'~
         SELECT COUNT(*)
           FROM qt_splitter_boss
          WHERE grp = :x
            AND note_text LIKE q'[%;%]'
-    ]';
+    ~';
 
     EXECUTE IMMEDIATE v_sql INTO v_cnt USING p_grp;
 

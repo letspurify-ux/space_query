@@ -4378,10 +4378,17 @@ fn scan_cursor_context(tokens: &[SqlToken], cursor_token_len: usize) -> CursorSc
                         relation_state.clear();
                     }
                     "SEARCH" | "CYCLE" => {
-                        if matches!(current_phase, SqlPhase::WithClause) {
+                        let continues_recursive_cte_options = upper == "CYCLE"
+                            && matches!(current_phase, SqlPhase::RecursiveCteGeneratedColumnName)
+                            && recursive_cte_option_is_complete_before_separator(tokens, idx);
+                        if matches!(current_phase, SqlPhase::WithClause)
+                            || continues_recursive_cte_options
+                        {
                             // Recursive CTE SEARCH/CYCLE clauses operate on the recursive CTE
-                            // output instead of the full visible scope. SEARCH becomes column
-                            // context at BY; CYCLE becomes column context immediately.
+                            // output instead of the full visible scope. Oracle may chain CYCLE
+                            // directly after SEARCH's generated column, without a comma; that
+                            // transition must reopen the recursive-column phase before CYCLE's
+                            // own SET tail is parsed.
                             depth_frames[depth].phase = if upper == "CYCLE" {
                                 SqlPhase::RecursiveCteColumnList
                             } else {

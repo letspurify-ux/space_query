@@ -7092,6 +7092,45 @@ impl SqlEditorWidget {
         None
     }
 
+    fn separator_starts_cte_definition(
+        tokens: &[SqlToken],
+        separator_idx: usize,
+        matching_paren_close_indices: &[Option<usize>],
+    ) -> bool {
+        let Some(name_idx) = Self::next_meaningful_token_index(tokens, separator_idx) else {
+            return false;
+        };
+        if !matches!(tokens.get(name_idx), Some(SqlToken::Word(_))) {
+            return false;
+        }
+
+        let Some(mut next_idx) = Self::next_meaningful_token_index(tokens, name_idx) else {
+            return false;
+        };
+        if matches!(tokens.get(next_idx), Some(SqlToken::Symbol(symbol)) if symbol == "(") {
+            let Some(close_idx) = matching_paren_close_indices
+                .get(next_idx)
+                .copied()
+                .flatten()
+            else {
+                return false;
+            };
+            let Some(after_columns_idx) = Self::next_meaningful_token_index(tokens, close_idx)
+            else {
+                return false;
+            };
+            next_idx = after_columns_idx;
+        }
+
+        if !matches!(tokens.get(next_idx), Some(SqlToken::Word(word)) if word.eq_ignore_ascii_case("AS"))
+        {
+            return false;
+        }
+        Self::next_meaningful_token_index(tokens, next_idx).is_some_and(|open_idx| {
+            matches!(tokens.get(open_idx), Some(SqlToken::Symbol(symbol)) if symbol == "(")
+        })
+    }
+
     fn previous_meaningful_token_index(tokens: &[SqlToken], start_idx: usize) -> Option<usize> {
         let mut idx = start_idx;
         while idx > 0 {
@@ -13796,6 +13835,18 @@ impl SqlEditorWidget {
                     }
                     match sym.as_str() {
                         "," => {
+                            let search_cycle_cte_separator_indent =
+                                (construct_flag_active_at_paren_depth!(
+                                    SearchCycleClauseActive,
+                                    current_scope.paren_depth
+                                ) && Self::separator_starts_cte_definition(
+                                    tokens,
+                                    idx,
+                                    matching_paren_close_indices,
+                                ))
+                                .then(|| {
+                                    rendered_line_indent(rendered_line_tracker.current_line(&out))
+                                });
                             format_stack.with_cte_on_separator();
                             let next_is_inline_comment = matches!(
                                 immediate_next_token,
@@ -13873,6 +13924,16 @@ impl SqlEditorWidget {
                                     );
                             if comma_follows_set_comment {
                                 needs_space = true;
+                            } else if let Some(cte_indent) = search_cycle_cte_separator_indent {
+                                deactivate_construct_flag!(SearchCycleClauseActive);
+                                newline_with(
+                                    &mut out,
+                                    cte_indent,
+                                    0,
+                                    &mut at_line_start,
+                                    &mut needs_space,
+                                    &mut line_indent,
+                                );
                             } else if format_stack
                                 .last_paren()
                                 .is_some_and(|frame| frame.is_column_list())
@@ -33511,6 +33572,37 @@ FROM emp_json e;"#;
             formatted, formatted_again,
             "Recursive CTE SEARCH/CYCLE formatting should be idempotent, got:\n{}",
             formatted_again
+        );
+    }
+
+    #[test]
+    fn format_sql_recursive_cte_cycle_separator_restores_with_body_indent() {
+        let source = "WITH FUNCTION f(p NUMBER) RETURN NUMBER IS BEGIN RETURN p; END; first_r (n) AS (SELECT 1 FROM dual UNION ALL SELECT n + 1 FROM first_r WHERE n < 2) CYCLE n SET first_cycle TO 'Y' DEFAULT 'N', second_r (n) AS (SELECT 1 FROM dual UNION ALL SELECT n + 1 FROM second_r WHERE n < 2) CYCLE n SET second_cycle TO 'Y' DEFAULT 'N', tail_cte (n) AS (SELECT 1 FROM dual) SELECT n FROM tail_cte;";
+        let formatted = SqlEditorWidget::format_sql_basic(source);
+        let lines: Vec<&str> = formatted.lines().collect();
+        let indent_of = |prefix: &str| {
+            lines
+                .iter()
+                .find(|line| line.trim_start().starts_with(prefix))
+                .map(|line| leading_spaces(line))
+                .unwrap_or_else(|| panic!("line starting with {prefix:?}, got:\n{formatted}"))
+        };
+
+        let first_cte_indent = indent_of("first_r");
+        assert_eq!(
+            indent_of("second_r"),
+            first_cte_indent,
+            "a CYCLE separator must restore the owning WITH body indent, got:\n{formatted}"
+        );
+        assert_eq!(
+            indent_of("tail_cte"),
+            first_cte_indent,
+            "a second CYCLE separator must not inherit the previous recursive body depth, got:\n{formatted}"
+        );
+        assert_eq!(
+            SqlEditorWidget::format_sql_basic(&formatted),
+            formatted,
+            "CYCLE separator recovery must be idempotent"
         );
     }
 

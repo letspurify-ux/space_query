@@ -622,8 +622,15 @@ pub const MYSQL_FUNCTIONS: &[&str] = &[
     "YEARWEEK",
 ];
 
+/// MariaDB built-ins that are not available in MySQL. Keep this separate from
+/// the shared MySQL-family catalog so dialect-specific completion never offers
+/// executable-looking functions to the wrong server.
+pub const MARIADB_FUNCTIONS: &[&str] = &["COLUMN_CHECK", "COLUMN_JSON", "JSON_EXISTS"];
+
 pub static MYSQL_FUNCTIONS_SET: once_cell::sync::Lazy<std::collections::HashSet<&'static str>> =
     once_cell::sync::Lazy::new(|| MYSQL_FUNCTIONS.iter().copied().collect());
+pub static MARIADB_FUNCTIONS_SET: once_cell::sync::Lazy<std::collections::HashSet<&'static str>> =
+    once_cell::sync::Lazy::new(|| MARIADB_FUNCTIONS.iter().copied().collect());
 
 const FUNCTION_SUFFIX: &str = "()";
 const ORACLE_BUILTIN_PACKAGES: &[&str] = &[
@@ -653,18 +660,26 @@ const ORACLE_BUILTIN_PACKAGES: &[&str] = &[
 ];
 
 pub(crate) const MAX_SUGGESTIONS: usize = 80;
-type LanguageCatalog = (&'static [&'static str], &'static [&'static str]);
-const ORACLE_LANGUAGE_CATALOG: LanguageCatalog = (SQL_KEYWORDS, ORACLE_FUNCTIONS);
-const MYSQL_LANGUAGE_CATALOG: LanguageCatalog = (sql_text::MYSQL_SQL_KEYWORDS, MYSQL_FUNCTIONS);
+type LanguageCatalog = (
+    &'static [&'static str],
+    &'static [&'static str],
+    &'static [&'static str],
+);
+const ORACLE_LANGUAGE_CATALOG: LanguageCatalog = (SQL_KEYWORDS, ORACLE_FUNCTIONS, &[]);
+const MYSQL_LANGUAGE_CATALOG: LanguageCatalog =
+    (sql_text::MYSQL_SQL_KEYWORDS, MYSQL_FUNCTIONS, &[]);
+const MARIADB_LANGUAGE_CATALOG: LanguageCatalog = (
+    sql_text::MYSQL_SQL_KEYWORDS,
+    MYSQL_FUNCTIONS,
+    MARIADB_FUNCTIONS,
+);
 
-fn language_catalog_for_db_type(
-    db_type: Option<crate::db::DatabaseType>,
-) -> (&'static [&'static str], &'static [&'static str]) {
+fn language_catalog_for_db_type(db_type: Option<crate::db::DatabaseType>) -> LanguageCatalog {
     match db_type {
         None => ORACLE_LANGUAGE_CATALOG,
         Some(crate::db::DatabaseType::Oracle) => ORACLE_LANGUAGE_CATALOG,
         Some(crate::db::DatabaseType::MySQL) => MYSQL_LANGUAGE_CATALOG,
-        Some(crate::db::DatabaseType::MariaDB) => MYSQL_LANGUAGE_CATALOG,
+        Some(crate::db::DatabaseType::MariaDB) => MARIADB_LANGUAGE_CATALOG,
     }
 }
 
@@ -1038,7 +1053,7 @@ impl IntellisenseData {
             return;
         }
 
-        let (keywords, functions) = language_catalog_for_db_type(db_type);
+        let (keywords, functions, dialect_functions) = language_catalog_for_db_type(db_type);
         let start = keywords.partition_point(|kw| *kw < prefix_upper.as_str());
         for keyword in &keywords[start..] {
             if !keyword.starts_with(prefix_upper.as_str()) {
@@ -1080,6 +1095,24 @@ impl IntellisenseData {
             }
             if suggestions.len() >= MAX_SUGGESTIONS {
                 break;
+            }
+        }
+
+        if suggestions.len() < MAX_SUGGESTIONS {
+            let start = dialect_functions.partition_point(|f| *f < prefix_upper.as_str());
+            for func in &dialect_functions[start..] {
+                if !func.starts_with(prefix_upper.as_str()) {
+                    break;
+                }
+                let rendered = format!("{func}{FUNCTION_SUFFIX}");
+                if suggestion_matches_completion_prefix(&rendered, prefix)
+                    && seen.insert(rendered.to_uppercase())
+                {
+                    suggestions.push(rendered);
+                }
+                if suggestions.len() >= MAX_SUGGESTIONS {
+                    break;
+                }
             }
         }
     }
@@ -2617,7 +2650,7 @@ impl IntellisenseData {
     }
 
     fn is_catalog_keyword(&self, upper: &str, db_type: Option<crate::db::DatabaseType>) -> bool {
-        let (keywords, _functions) = language_catalog_for_db_type(db_type);
+        let (keywords, _functions, _dialect_functions) = language_catalog_for_db_type(db_type);
         keywords.binary_search(&upper).is_ok()
     }
 
@@ -2639,8 +2672,8 @@ impl IntellisenseData {
         upper: &str,
         db_type: Option<crate::db::DatabaseType>,
     ) -> bool {
-        let (_keywords, functions) = language_catalog_for_db_type(db_type);
-        functions.binary_search(&upper).is_ok()
+        let (_keywords, functions, dialect_functions) = language_catalog_for_db_type(db_type);
+        functions.binary_search(&upper).is_ok() || dialect_functions.binary_search(&upper).is_ok()
     }
 
     /// Cached signature for a routine key: `Some(Some(label))` when resolved to
@@ -4317,13 +4350,14 @@ pub struct SignatureLabel {
     pub arg_spans: Vec<(usize, usize)>,
 }
 
-/// Whether `name` is a known built-in SQL function (Oracle or MySQL). Used to
+/// Whether `name` is a known built-in SQL function (Oracle/MySQL/MariaDB). Used to
 /// skip a futile routine-argument DB lookup for built-ins, which never appear
 /// in the data-dictionary argument views.
 pub fn is_builtin_function(name: &str) -> bool {
     ORACLE_FUNCTIONS
         .iter()
         .chain(MYSQL_FUNCTIONS.iter())
+        .chain(MARIADB_FUNCTIONS.iter())
         .any(|candidate| candidate.eq_ignore_ascii_case(name))
 }
 

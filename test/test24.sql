@@ -1,11 +1,70 @@
-CREATE OR REPLACE PACKAGE BODY pkg_depth AS
+BEGIN
+  EXECUTE IMMEDIATE 'DROP PACKAGE qt_depth_pkg';
+EXCEPTION
+  WHEN OTHERS THEN
+    IF SQLCODE != -4043 THEN
+      RAISE;
+    END IF;
+END;
+/
+
+BEGIN
+  EXECUTE IMMEDIATE 'DROP TABLE qt_depth_sample PURGE';
+EXCEPTION
+  WHEN OTHERS THEN
+    IF SQLCODE != -942 THEN
+      RAISE;
+    END IF;
+END;
+/
+
+BEGIN
+  EXECUTE IMMEDIATE 'DROP TABLE qt_depth_source PURGE';
+EXCEPTION
+  WHEN OTHERS THEN
+    IF SQLCODE != -942 THEN
+      RAISE;
+    END IF;
+END;
+/
+
+CREATE TABLE qt_depth_sample
+(
+  id NUMBER PRIMARY KEY,
+  abcd VARCHAR2(30),
+  ghij VARCHAR2(30)
+);
+
+CREATE TABLE qt_depth_source
+(
+  id NUMBER PRIMARY KEY,
+  edfg VARCHAR2(30),
+  klmo VARCHAR2(30)
+);
+
+INSERT INTO qt_depth_sample (id, abcd, ghij) VALUES (1, 'old-a', 'old-b');
+INSERT INTO qt_depth_source (id, edfg, klmo) VALUES (1, 'new-a', 'new-b');
+
+CREATE OR REPLACE PACKAGE qt_depth_pkg AS
+  PROCEDURE sync_data;
+END qt_depth_pkg;
+/
+
+CREATE OR REPLACE PACKAGE BODY qt_depth_pkg AS
   PROCEDURE sync_data IS
   BEGIN
-    UPDATE sample_table
-    SET abcd = edfg
-    -- comment
-    , ghij = klmo
-    FROM qwer;
-  END;
-END pkg_depth;
+    UPDATE qt_depth_sample target_row
+    SET abcd = (SELECT source_row.edfg FROM qt_depth_source source_row WHERE source_row.id = target_row.id)
+    -- comment between assignments
+    , ghij = (SELECT source_row.klmo FROM qt_depth_source source_row WHERE source_row.id = target_row.id)
+    WHERE EXISTS (SELECT 1 FROM qt_depth_source source_row WHERE source_row.id = target_row.id);
+  END sync_data;
+END qt_depth_pkg;
 /
+
+BEGIN
+  qt_depth_pkg.sync_data;
+END;
+/
+
+SELECT id, abcd, ghij FROM qt_depth_sample ORDER BY id;

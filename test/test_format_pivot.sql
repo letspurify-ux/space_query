@@ -7,7 +7,17 @@ SELECT pvt.deptno,
 FROM (
         SELECT e.deptno,
             e.job
-        FROM emp e
+        FROM (
+                SELECT 10 AS deptno, 'CLERK' AS job FROM dual
+                UNION ALL
+                SELECT 10, 'MANAGER' FROM dual
+                UNION ALL
+                SELECT 20, 'ANALYST' FROM dual
+                UNION ALL
+                SELECT 30, 'SALESMAN' FROM dual
+                UNION ALL
+                SELECT 10, 'PRESIDENT' FROM dual
+            ) e
     )
 PIVOT (
     COUNT(*)

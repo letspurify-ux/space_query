@@ -736,7 +736,7 @@ BEGIN
 
             EXECUTE IMMEDIATE v_sql
                 INTO v_result
-                USING v_nums(i), v_names(i), v_nums(i), v_names(i);
+                USING v_nums(i), v_names(i), v_nums(i), v_names(i), v_names(i);
 
             v_local_msg :=
                    'IDX=' || i

@@ -1155,6 +1155,22 @@ enum WithinGroupSlot {
     AfterGroup,
 }
 
+/// Keyword position in Oracle's `LISTAGG(... ON OVERFLOW ...)` argument tail.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[allow(clippy::enum_variant_names)]
+enum ListaggOverflowSlot {
+    /// `LISTAGG(... ON |)` - only `OVERFLOW`.
+    AfterOn,
+    /// `LISTAGG(... ON OVERFLOW |)` - `ERROR` or `TRUNCATE`.
+    AfterOverflow,
+    /// `LISTAGG(... ON OVERFLOW TRUNCATE [indicator] |)` - count policy.
+    AfterTruncate,
+    /// `... WITH|WITHOUT |` - only `COUNT`.
+    AfterCountPolicy,
+    /// A terminal `ERROR` or `[WITH|WITHOUT] COUNT` tail.
+    Complete,
+}
+
 /// Keyword position in an analytic null-treatment tail:
 /// `FIRST_VALUE(...) IGNORE NULLS OVER (...)`,
 /// `NTH_VALUE(...) FROM LAST RESPECT NULLS OVER (...)`, etc.
@@ -1534,6 +1550,16 @@ fn within_group_keywords(slot: WithinGroupSlot) -> &'static [&'static str] {
     match slot {
         WithinGroupSlot::AfterWithin => &["GROUP"],
         WithinGroupSlot::AfterGroup => &[],
+    }
+}
+
+fn listagg_overflow_keywords(slot: ListaggOverflowSlot) -> &'static [&'static str] {
+    match slot {
+        ListaggOverflowSlot::AfterOn => &["OVERFLOW"],
+        ListaggOverflowSlot::AfterOverflow => &["ERROR", "TRUNCATE"],
+        ListaggOverflowSlot::AfterTruncate => &["WITH", "WITHOUT"],
+        ListaggOverflowSlot::AfterCountPolicy => &["COUNT"],
+        ListaggOverflowSlot::Complete => &[],
     }
 }
 
@@ -18017,6 +18043,91 @@ impl SqlEditorWidget {
     ) -> Option<&'static [&'static str]> {
         Self::window_frame_keyword_slot(tokens, end, db_type)
             .map(|slot| window_frame_keywords_for(slot, db_type))
+    }
+
+    /// Oracle `LISTAGG` overflow control is part of the still-open function
+    /// argument frame, not a query-level `ON` clause. Classify only the
+    /// innermost open `LISTAGG(` frame so join predicates and other function
+    /// calls cannot receive these keywords.
+    fn listagg_overflow_slot(
+        tokens: &[SqlToken],
+        end: usize,
+        db_type: Option<crate::db::DatabaseType>,
+    ) -> Option<ListaggOverflowSlot> {
+        if crate::sql_text::mysql_compatibility_for_sql("", db_type) {
+            return None;
+        }
+
+        let (function, open_idx) =
+            Self::innermost_open_paren_preceding_word_and_index(tokens, end)?;
+        if !function.eq_ignore_ascii_case("LISTAGG") {
+            return None;
+        }
+
+        let top_level = Self::top_level_tokens_after_open_paren(tokens, open_idx, end);
+        let on_idx = top_level.iter().rposition(
+            |token| matches!(token, SqlToken::Word(word) if word.eq_ignore_ascii_case("ON")),
+        )?;
+        let tail = &top_level[on_idx + 1..];
+        let word_is = |idx: usize, expected: &str| {
+            matches!(tail.get(idx), Some(SqlToken::Word(word)) if word.eq_ignore_ascii_case(expected))
+        };
+
+        if tail.is_empty() {
+            return Some(ListaggOverflowSlot::AfterOn);
+        }
+        if !word_is(0, "OVERFLOW") {
+            return None;
+        }
+        if tail.len() == 1 {
+            return Some(ListaggOverflowSlot::AfterOverflow);
+        }
+        if word_is(1, "ERROR") {
+            return (tail.len() == 2).then_some(ListaggOverflowSlot::Complete);
+        }
+        if !word_is(1, "TRUNCATE") {
+            return None;
+        }
+
+        let truncate_tail = &tail[2..];
+        match truncate_tail {
+            [] | [SqlToken::String(_)] => Some(ListaggOverflowSlot::AfterTruncate),
+            [SqlToken::Word(policy)]
+                if policy.eq_ignore_ascii_case("WITH")
+                    || policy.eq_ignore_ascii_case("WITHOUT") =>
+            {
+                Some(ListaggOverflowSlot::AfterCountPolicy)
+            }
+            [SqlToken::String(_), SqlToken::Word(policy)]
+                if policy.eq_ignore_ascii_case("WITH")
+                    || policy.eq_ignore_ascii_case("WITHOUT") =>
+            {
+                Some(ListaggOverflowSlot::AfterCountPolicy)
+            }
+            [SqlToken::Word(policy), SqlToken::Word(count)]
+                if (policy.eq_ignore_ascii_case("WITH")
+                    || policy.eq_ignore_ascii_case("WITHOUT"))
+                    && count.eq_ignore_ascii_case("COUNT") =>
+            {
+                Some(ListaggOverflowSlot::Complete)
+            }
+            [SqlToken::String(_), SqlToken::Word(policy), SqlToken::Word(count)]
+                if (policy.eq_ignore_ascii_case("WITH")
+                    || policy.eq_ignore_ascii_case("WITHOUT"))
+                    && count.eq_ignore_ascii_case("COUNT") =>
+            {
+                Some(ListaggOverflowSlot::Complete)
+            }
+            _ => None,
+        }
+    }
+
+    fn expected_listagg_overflow_keyword_candidates(
+        tokens: &[SqlToken],
+        end: usize,
+        db_type: Option<crate::db::DatabaseType>,
+    ) -> Option<&'static [&'static str]> {
+        Self::listagg_overflow_slot(tokens, end, db_type).map(listagg_overflow_keywords)
     }
 
     /// True when the cursor is at a window-frame slot that accepts only a fixed
@@ -50153,6 +50264,46 @@ impl SqlEditorWidget {
             deep_ctx.cursor_token_len,
             prefix,
         );
+
+        // Nested, fixed grammar frames must win before broad statement/CTE
+        // classifiers. In a large WITH statement those broader classifiers can
+        // validly return a different keyword set for the containing query; an
+        // early empty prefix-filtered return would otherwise hide the exact
+        // window/LISTAGG continuation at the cursor. Both sources are bounded
+        // production statement slices, preserving linear work independent of
+        // the full editor buffer size.
+        for (source_tokens, source_end) in [
+            (tokens, context_end),
+            (statement_tokens, statement_context_end),
+        ] {
+            if let Some(candidates) =
+                Self::expected_listagg_overflow_keyword_candidates(source_tokens, source_end, db_type)
+            {
+                return Self::filter_expected_candidates(prefix, candidates);
+            }
+            if let Some(slot) = Self::window_order_by_sort_modifier_slot(source_tokens, source_end) {
+                return Self::filter_expected_candidates(
+                    prefix,
+                    window_order_by_sort_modifier_keywords(slot, db_type),
+                );
+            }
+            if let Some(candidates) =
+                Self::expected_window_frame_keyword_candidates(source_tokens, source_end, db_type)
+            {
+                return Self::filter_expected_candidates(prefix, candidates);
+            }
+            if let Some(candidates) =
+                Self::expected_window_spec_start_keyword_candidates(source_tokens, source_end, db_type)
+            {
+                return Self::filter_expected_candidates(prefix, candidates);
+            }
+            if let Some(candidates) =
+                Self::expected_window_spec_clause_transition_candidates(source_tokens, source_end)
+            {
+                return Self::filter_expected_candidates(prefix, candidates);
+            }
+        }
+
         if let Some(candidates) = Self::expected_precise_typed_structural_keyword_candidates(
             prefix,
             full_statement_tokens,
@@ -57335,6 +57486,9 @@ impl SqlEditorWidget {
         let upper = name.to_ascii_uppercase();
         if crate::sql_text::mysql_compatibility_for_sql("", db_type) {
             crate::ui::intellisense::MYSQL_FUNCTIONS_SET.contains(upper.as_str())
+                || (completion_db_type_is_mariadb(db_type)
+                    && crate::ui::intellisense::MARIADB_FUNCTIONS_SET
+                        .contains(upper.as_str()))
         } else {
             crate::ui::intellisense::ORACLE_FUNCTIONS
                 .binary_search(&upper.as_str())

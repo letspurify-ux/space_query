@@ -6279,6 +6279,32 @@ fn oracle_recursive_cte_search_and_cycle_tails_keep_following_cte_visible() {
 }
 
 #[test]
+fn oracle_recursive_cte_combined_search_cycle_tail_keeps_following_recursive_cte_visible() {
+    let ctx = analyze(
+        "WITH first_r(n) AS (SELECT 1 FROM dual UNION ALL SELECT n + 1 FROM first_r WHERE n < 2) \
+         SEARCH DEPTH FIRST BY n SET search_order \
+         CYCLE n SET first_cycle TO 'Y' DEFAULT 'N', \
+         second_r(day_no, day_value) AS (SELECT 0, 1 FROM dual UNION ALL \
+         SELECT s.day_no + 1, s.day_value + 1 FROM second_r s WHERE s.day_no < 2) \
+         CYCLE day_no SET second_cycle TO 'Y' DEFAULT 'N', \
+         tail_cte(id) AS (SELECT day_no FROM second_r) \
+         SELECT t.| FROM tail_cte t",
+    );
+
+    assert!(
+        has_name(&cte_names(&ctx), "SECOND_R"),
+        "CTEs: {:?}",
+        cte_names(&ctx)
+    );
+    let tail = ctx
+        .ctes
+        .iter()
+        .find(|cte| cte.name.eq_ignore_ascii_case("tail_cte"))
+        .expect("CTE after repeated SEARCH/CYCLE tails must remain visible");
+    assert_eq!(tail.explicit_columns, vec!["id"]);
+}
+
+#[test]
 fn oracle_recursive_cte_option_internal_commas_do_not_start_a_new_cte() {
     for sql in [
         "WITH t(a, b) AS (SELECT 1, 2 FROM dual) CYCLE a, | b SET cycle_yn TO 'Y' DEFAULT 'N' SELECT * FROM t",

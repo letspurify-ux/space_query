@@ -173,10 +173,21 @@ pub(crate) fn tokenize_sql_with_mysql_compat(sql: &str, mysql_compatible: bool) 
 
 pub(crate) fn collect_local_alias_context_from_spans(spans: &[SqlTokenSpan]) -> LocalAliasContext {
     let mut context = LocalAliasContext::default();
+    let matching_parens = matching_close_paren_indices(spans);
     for idx in 0..spans.len() {
         if let Some((alias, start, end)) = bracket_alias_declaration_at(spans, idx) {
             context.names.insert(alias);
             context.declaration_ranges.insert((start, end));
+            continue;
+        }
+
+        if span_is_cte_or_window_name_declaration(spans, idx, &matching_parens) {
+            if let Some(alias) = span_alias_lookup_name(&spans[idx]) {
+                context.names.insert(alias);
+                context
+                    .declaration_ranges
+                    .insert((spans[idx].start, spans[idx].end));
+            }
             continue;
         }
 
@@ -191,6 +202,50 @@ pub(crate) fn collect_local_alias_context_from_spans(spans: &[SqlTokenSpan]) -> 
         }
     }
     context
+}
+
+fn matching_close_paren_indices(spans: &[SqlTokenSpan]) -> Vec<Option<usize>> {
+    let mut matching = vec![None; spans.len()];
+    let mut stack = Vec::new();
+    for (idx, span) in spans.iter().enumerate() {
+        match &span.token {
+            SqlToken::Symbol(symbol) if symbol == "(" => stack.push(idx),
+            SqlToken::Symbol(symbol) if symbol == ")" => {
+                if let Some(open_idx) = stack.pop() {
+                    matching[open_idx] = Some(idx);
+                }
+            }
+            _ => {}
+        }
+    }
+    matching
+}
+
+fn span_is_cte_or_window_name_declaration(
+    spans: &[SqlTokenSpan],
+    idx: usize,
+    matching_parens: &[Option<usize>],
+) -> bool {
+    if !span_is_word(&spans[idx]) {
+        return false;
+    }
+    let Some(mut next_idx) = next_significant_idx(spans, idx) else {
+        return false;
+    };
+    if span_is_symbol(spans.get(next_idx), "(") {
+        let Some(close_idx) = matching_parens.get(next_idx).copied().flatten() else {
+            return false;
+        };
+        let Some(after_columns_idx) = next_significant_idx(spans, close_idx) else {
+            return false;
+        };
+        next_idx = after_columns_idx;
+    }
+    if span_word_upper(spans.get(next_idx)).is_none_or(|word| word != "AS") {
+        return false;
+    }
+    next_significant_idx(spans, next_idx)
+        .is_some_and(|open_idx| span_is_symbol(spans.get(open_idx), "("))
 }
 
 fn bracket_alias_declaration_at(
@@ -2587,6 +2642,16 @@ END$$"#;
         assert!(aliases.contains_name("B"));
         assert!(aliases.is_declaration_range(a_start, a_start + 1));
         assert!(aliases.is_declaration_range(b_start, b_start + 1));
+    }
+
+    #[test]
+    fn local_alias_context_collects_cte_name_after_with_function() {
+        let sql = "WITH FUNCTION f RETURN NUMBER IS BEGIN RETURN 1; END; params AS (SELECT 1 AS id FROM dual) SELECT * FROM params";
+        let aliases = collect_local_alias_context(sql);
+        let start = sql.find("params AS").expect("params CTE");
+
+        assert!(aliases.contains_name("params"));
+        assert!(aliases.is_declaration_range(start, start + "params".len()));
     }
 
     #[test]
