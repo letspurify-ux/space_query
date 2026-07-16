@@ -2019,6 +2019,153 @@ END cc_comment;"#;
 }
 
 #[test]
+fn formatting_sweep_audits_function_local_returning_option_depth() {
+    let cases = [
+        (
+            DatabaseType::Oracle,
+            "WITH base_emp AS (SELECT e.emp_id, JSON_VALUE(e.json_profile, '$.level' RETURNING VARCHAR2(30)) AS profile_level FROM qt_fmt_emp e) SELECT * FROM base_emp;",
+        ),
+        (
+            DatabaseType::MySQL,
+            "WITH settings AS (SELECT JSON_OBJECT('start', '2026-07-01') AS config), params AS (SELECT CAST(JSON_VALUE(config, '$.start' RETURNING CHAR(10) DEFAULT '2026-01-01' ON EMPTY) AS DATE) AS start_day FROM settings) SELECT * FROM params;",
+        ),
+    ];
+
+    for (db_type, source) in cases {
+        let run = format_sweep_run(source, db_type);
+        assert!(
+            run.issues.is_empty(),
+            "unexpected {db_type:?} issues: {:?}\n{}",
+            run.issues,
+            run.formatted
+        );
+        let lines: Vec<&str> = run.formatted.lines().collect();
+        let path_idx = lines
+            .iter()
+            .position(|line| line.contains("'$.") && !line.contains("RETURNING"))
+            .unwrap_or_else(|| panic!("split JSON path line missing:\n{}", run.formatted));
+        let returning_idx = lines
+            .iter()
+            .position(|line| line.trim_start().starts_with("RETURNING"))
+            .unwrap_or_else(|| panic!("RETURNING option line missing:\n{}", run.formatted));
+        assert_eq!(
+            leading_spaces(lines[path_idx]),
+            leading_spaces(lines[returning_idx]),
+            "function-local RETURNING must stay at its paren sibling depth:\n{}",
+            run.formatted
+        );
+    }
+}
+
+#[test]
+fn formatting_sweep_audits_conditional_branch_call_argument_depth() {
+    let source = "CREATE OR REPLACE PROCEDURE p IS BEGIN $IF DBMS_DB_VERSION.VERSION >= 12 $THEN AUDIT('m', 'then', 'yes'); $ELSE AUDIT('m', 'else', 'no'); $END AUDIT('m', 'done', 'done'); END;";
+    let run = format_sweep_run(source, DatabaseType::Oracle);
+    assert!(
+        run.issues.is_empty(),
+        "unexpected issues: {:?}\n{}",
+        run.issues,
+        run.formatted
+    );
+    let lines: Vec<&str> = run.formatted.lines().collect();
+    let else_idx = lines
+        .iter()
+        .position(|line| line.trim_start() == "$ELSE")
+        .expect("$ELSE line");
+    let else_call_idx = lines
+        .iter()
+        .enumerate()
+        .skip(else_idx + 1)
+        .find_map(|(idx, line)| line.trim_start().starts_with("AUDIT ('m',").then_some(idx))
+        .unwrap_or_else(|| panic!("$ELSE call missing:\n{}", run.formatted));
+    let else_arg_idx = lines
+        .iter()
+        .enumerate()
+        .skip(else_call_idx + 1)
+        .find_map(|(idx, line)| line.trim_start().starts_with("'else',").then_some(idx))
+        .unwrap_or_else(|| panic!("$ELSE call argument missing:\n{}", run.formatted));
+    assert_eq!(
+        leading_spaces(lines[else_arg_idx]),
+        leading_spaces(lines[else_call_idx]) + FORMAT_SWEEP_INDENT_WIDTH,
+        "$ELSE call arguments must remain inside the call paren frame:\n{}",
+        run.formatted
+    );
+}
+
+#[test]
+fn formatting_sweep_audits_statement_sibling_after_trailing_comment() {
+    let source = "BEGIN\n  p(7, p_out => v_out, p_n => v_n); -- omitted\n  DBMS_OUTPUT.PUT_LINE(v_out);\nEND;\n/";
+    let (formatted, audit) = SqlEditorWidget::format_for_auto_formatting_with_frame_alignment_audit(
+        source,
+        Some(DatabaseType::Oracle),
+    );
+    assert!(
+        audit.issues.is_empty(),
+        "unexpected issues: {:?}\n{}",
+        audit.issues,
+        formatted
+    );
+    let lines: Vec<&str> = formatted.lines().collect();
+    let call_idx = lines
+        .iter()
+        .position(|line| line.trim_start().starts_with("p (7,"))
+        .expect("first call line");
+    let sibling_idx = lines
+        .iter()
+        .position(|line| line.trim_start().starts_with("DBMS_OUTPUT.PUT_LINE"))
+        .expect("statement sibling line");
+    assert_eq!(
+        leading_spaces(lines[sibling_idx]),
+        leading_spaces(lines[call_idx]),
+        "a trailing comment must not carry the closed call frame into the next statement:\n{}",
+        formatted
+    );
+}
+
+#[test]
+fn formatting_sweep_audits_multiline_standalone_routine_header_close() {
+    let source = "CREATE OR REPLACE PROCEDURE p(p_a IN NUMBER, p_b IN VARCHAR2, p_c IN CLOB) IS PRAGMA AUTONOMOUS_TRANSACTION; BEGIN NULL; END;";
+    let run = format_sweep_run(source, DatabaseType::Oracle);
+    assert!(
+        run.issues.is_empty(),
+        "unexpected issues: {:?}\n{}",
+        run.issues,
+        run.formatted
+    );
+    let lines: Vec<&str> = run.formatted.lines().collect();
+    let header_idx = lines
+        .iter()
+        .position(|line| line.starts_with("CREATE OR REPLACE PROCEDURE"))
+        .expect("routine header");
+    let pragma_idx = lines
+        .iter()
+        .position(|line| line.trim_start().starts_with("PRAGMA"))
+        .expect("routine declaration");
+    let begin_idx = lines
+        .iter()
+        .position(|line| line.trim_start() == "BEGIN")
+        .expect("routine BEGIN");
+    let end_idx = lines
+        .iter()
+        .position(|line| line.trim_start() == "END;")
+        .expect("routine END");
+    assert_eq!(
+        leading_spaces(lines[pragma_idx]),
+        leading_spaces(lines[header_idx]) + FORMAT_SWEEP_INDENT_WIDTH,
+        "routine declarations must be one frame below the header:\n{}",
+        run.formatted
+    );
+    assert_eq!(
+        leading_spaces(lines[begin_idx]),
+        leading_spaces(lines[header_idx])
+    );
+    assert_eq!(
+        leading_spaces(lines[end_idx]),
+        leading_spaces(lines[header_idx])
+    );
+}
+
+#[test]
 fn formatting_sweep_reports_unclosed_conditional_compilation_frame() {
     let source = r#"CREATE OR REPLACE PROCEDURE cc_unclosed IS
 BEGIN

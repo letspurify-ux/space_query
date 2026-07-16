@@ -2538,6 +2538,7 @@ bounded fast path를 유지하는지 함께 검증한다.
 | 정확한 `cargo test` | lib 6,479 통과·225 ignored, 모든 binary/integration/guard/doc-test 포함 실패 0 |
 | 정확한 `cargo clippy -- -D warnings -W clippy::perf -W clippy::complexity` | 통과, 오류·경고 0 |
 | `cargo fmt --all -- --check` | 통과 |
+
 | `git diff --check` | 통과 |
 
 ## 17-8. 결론
@@ -3027,5 +3028,222 @@ modifier 뒤로 미룬다. 첫 item은 그대로 select-list body depth를 사�
 | `formatting_sweep_all_files_generate_out_report` | 통과, 61개 파일·issue 0 |
 | `cargo test --lib` | 6,547 통과·228 ignored·실패 0 (회귀 테스트 4건 추가) |
 | 전체 `cargo test` | 모든 lib/binary/integration/guard 실패 0 |
+| `cargo clippy --locked --all-targets -- -D warnings -W clippy::perf -W clippy::complexity` | 통과, 경고 0 |
+| `cargo fmt --all -- --check` | 통과 |
+
+# 21. PASS 출력 43,695줄 전수 검토와 frame 자동 감사 사각지대 4건 보강
+
+## 21-1. 검토 범위와 판정 기준
+
+- `cargo test --lib formatting_sweep_all_files_generate_out_report -- --ignored --nocapture`로
+  Oracle 41개, MySQL 9개, MariaDB 11개 등 `.format.out` 61개를 생성했다.
+- 자동 PASS를 판정 근거로 사용하지 않고 리포트 footer를 포함한 43,695줄을 처음부터 끝까지
+  육안 검토했다. 각 줄은 `docs/auto_format_rule.md`의 문법 소유권, owner+1 body depth,
+  sibling 동일 depth, close 후 외부 depth 복구, 주석 비구조 규칙과 대조했다.
+- 1차 육안 검토에서 PASS가 놓친 4개 원인을 찾았다. 수정 후 전체 sweep을 다시 생성하고,
+  네 변경 계열의 모든 출력 지점(함수-local `RETURNING`, 조건부 컴파일, 세미콜론 후행 주석,
+  standalone routine header/body)을 재검토했다.
+
+## 21-2. `JSON_VALUE` 함수-local `RETURNING` option depth
+
+중첩 함수 또는 CTE SELECT item의 `JSON_VALUE`에서 path 다음 줄의 `RETURNING`이 활성 함수
+괄호 body가 아니라 현재 렌더링 줄에서 한 단계 더 내려가는 경우가 있었다.
+
+AS-IS:
+
+```sql
+JSON_VALUE (e.json_profile,
+    '$.level'
+        RETURNING VARCHAR2 (30)) AS profile_level,
+JSON_VALUE (e.json_profile,
+    '$.flags.remote'
+    RETURNING VARCHAR2 (10)) AS remote_flag
+```
+
+TO-BE:
+
+```sql
+JSON_VALUE (e.json_profile,
+    '$.level'
+    RETURNING VARCHAR2 (30)) AS profile_level,
+JSON_VALUE (e.json_profile,
+    '$.flags.remote'
+    RETURNING VARCHAR2 (10)) AS remote_flag
+```
+
+원인은 SELECT 안 함수-local `RETURNING` depth를 `현재 렌더링 줄 depth + 1`로 계산한 것이다.
+이 값을 활성 non-query paren frame의 `sibling_body_indent()`로 바꿨다. 따라서 바깥 `CAST`,
+CTE, SELECT depth와 무관하게 path/option sibling이 같은 함수 body depth를 사용한다.
+
+자동 감사에는 `parenthesized RETURNING option` 문법 예상 depth 이벤트를 추가했다. 기존에는
+괄호의 comma sibling과 close만 검사했으므로 comma가 없는 option line은 검사 대상이 아니었다.
+
+추가 회귀 테스트:
+
+- `formatting_sweep_audits_function_local_returning_option_depth` (Oracle/MySQL)
+
+## 21-3. Oracle conditional compilation `$ELSE` branch의 call frame
+
+`$THEN` branch의 다중 인자 호출은 정상이나 `$ELSE` branch에서 같은 호출의 두 번째 이후
+인자가 call paren depth를 잃었다.
+
+AS-IS:
+
+```sql
+$ELSE
+    AUDIT ('qt_torture_pkg',
+    'complex_block.ccflag',
+    'conditional-compilation=false');
+```
+
+TO-BE:
+
+```sql
+$ELSE
+    AUDIT ('qt_torture_pkg',
+        'complex_block.ccflag',
+        'conditional-compilation=false');
+```
+
+conditional-compilation frame은 별도 vector에서 branch body depth를 제공했지만, 자식 frame의
+문법 parent를 고르는 `nearest_child_owner_frame()`은 주 `FormatFrameStack::frames`만 검색했다.
+`$THEN` 직후에는 우연히 condition-owner frame이 남아 정상 depth를 제공했지만 `$ELSE`에서는
+그 frame이 없어 바깥 PL/SQL block을 parent로 선택했다.
+
+활성 conditional branch를 자식 owner 후보에 포함하고, 같은 depth에서는 더 구체적인 주 stack
+frame을 우선하도록 했다. 테스트 감사에서는 conditional body 직계 호출 paren의 예상 depth를
+branch body+1로 독립 기록하므로, 잘못된 parent를 다시 선택하면 frame 자체가 내부적으로
+일관돼도 검출된다.
+
+추가 회귀 테스트:
+
+- `formatting_sweep_audits_conditional_branch_call_argument_depth`
+
+## 21-4. 닫힌 호출의 후행 주석 뒤 statement sibling depth
+
+세미콜론 뒤에 `--` 후행 주석이 있으면 newline 처리를 주석 token에 미루면서, 닫힌 호출의
+마지막 인자 depth가 다음 PL/SQL statement에 남았다.
+
+AS-IS:
+
+```sql
+BEGIN
+    oqt_pkg.p_basic (7,
+        p_out_txt => v_out,
+        p_inout_n => v_inout); -- p_in_txt omitted
+        DBMS_OUTPUT.PUT_LINE ('[default] ...');
+END;
+```
+
+TO-BE:
+
+```sql
+BEGIN
+    oqt_pkg.p_basic (7,
+        p_out_txt => v_out,
+        p_inout_n => v_inout); -- p_in_txt omitted
+    DBMS_OUTPUT.PUT_LINE ('[default] ...');
+END;
+```
+
+세미콜론에서 다음 token이 inline comment이면 물리 newline을 즉시 출력하지 않는 기존 동작은
+유지하되, 논리 `line_indent`는 닫힌 frame이 제거된 `base_indent`로 즉시 복구한다. 다음 token이
+`BEGIN`, `END`, `ELSE`, `EXCEPTION`, `$ELSE`, `$END` 같은 구조 경계이면 각 경계 전용 로직이
+소유 depth를 정하도록 이 sibling 복구에서 제외했다.
+
+자동 감사에는 후행 주석 다음 일반 statement token의 예상 sibling depth를 기록했다. 기존
+감사는 block의 첫 자식만 검사하고 세미콜론으로 연결된 이후 statement sibling은 기록하지
+않았으므로 이 drift를 보지 못했다.
+
+추가 회귀 테스트:
+
+- `formatting_sweep_audits_statement_sibling_after_trailing_comment`
+
+## 21-5. 여러 줄 standalone routine parameter header 뒤 body depth
+
+Oracle standalone function/procedure의 parameter header가 여러 줄로 확장되면 `) IS` 줄의
+parameter continuation depth가 routine body owner로 사용돼 선언부와 실행부 전체가 한 단계
+깊어졌다.
+
+AS-IS:
+
+```sql
+CREATE OR REPLACE PROCEDURE qt_fb_log_proc (p_module IN VARCHAR2,
+    p_action IN VARCHAR2,
+    p_msg IN CLOB,
+    p_extra IN CLOB DEFAULT NULL) IS
+        PRAGMA AUTONOMOUS_TRANSACTION;
+    BEGIN
+        INSERT INTO qt_fb_audit ...
+    END;
+```
+
+TO-BE:
+
+```sql
+CREATE OR REPLACE PROCEDURE qt_fb_log_proc (p_module IN VARCHAR2,
+    p_action IN VARCHAR2,
+    p_msg IN CLOB,
+    p_extra IN CLOB DEFAULT NULL) IS
+    PRAGMA AUTONOMOUS_TRANSACTION;
+BEGIN
+    INSERT INTO qt_fb_audit ...
+END;
+```
+
+`AS`/`IS`가 standalone `CREATE PROCEDURE/FUNCTION` body를 열 때 렌더링 중인 `line_indent`가
+아니라 현재 구조 stack의 statement base를 routine owner로 사용하도록 했다. package member와
+WITH PL/SQL 선언은 기존 전용 owner 계산을 유지한다.
+
+자동 감사에는 standalone routine의 첫 선언 token은 owner+1, 즉시 `BEGIN`이면 owner depth라는
+문법 예상 이벤트를 추가했다. 기존 block 감사는 잘못된 owner=1, body=2를 함께 등록했으므로
+서로 일관된 잘못을 정상으로 판정했다.
+
+추가 회귀 테스트:
+
+- `formatting_sweep_audits_multiline_standalone_routine_header_close`
+
+## 21-6. 기존 frame 구조 판단 테스트가 네 오류를 검출하지 못한 이유
+
+기존 자동화의 각 계층은 다음 이유로 모두 PASS를 반환했다.
+
+1. first-pass line 감사는 tab, trailing whitespace, 4-space 배수만 검사했다. 네 오류 모두
+   4-space 단위였으므로 통과했다.
+2. idempotence와 whitespace mutation probe는 “같은 token이 같은 canonical 출력으로
+   수렴하는가”를 검사한다. 잘못된 depth도 안정적으로 재생성됐으므로 통과했다.
+3. frame alignment 감사는 등록된 opener, comma/condition sibling, direct body item, close만
+   검사했다. 함수 option과 세미콜론 뒤 statement sibling은 이벤트가 없었다.
+4. conditional call과 routine body는 frame 이벤트가 있었지만, 잘못 계산한 owner depth를
+   expected와 actual 양쪽에 같은 값으로 기록했다. 즉 내부 일관성만 확인하고 문법 parent와의
+   독립 교차 검증이 없었다.
+
+이를 보완하기 위해 `ExpectedIndent` 감사 이벤트를 추가했다. renderer가 선택한 물리 indent와
+별도로 문법 경계에서 예상 depth를 기록해 다음 네 계열을 sweep에서 자동 검출한다.
+
+- parenthesized function option
+- conditional branch의 직계 child paren
+- trailing comment 뒤 statement sibling
+- standalone routine body boundary
+
+`frame_alignment_audit_reports_grammatical_expected_indent_drift`는 인위적인 잘못된 출력이 새
+이벤트에서 실제 `FrameAlignment` issue가 되는지 검증한다.
+
+## 21-7. 전체 sweep 및 품질 게이트
+
+| 항목 | 결과 |
+| --- | ---: |
+| 전체 fixture / 육안 검토 줄 수 | 61개 / 43,695줄 |
+| Oracle / MySQL / MariaDB fixture | 41 / 9 / 11 |
+| 수정한 독립 원인 | 4건 |
+| 검사 frame / 문법·body item / close | 21,071 / 22,780 / 9,709 |
+| managed frame / list-owner kind | 22 / 31 |
+| built-in sweep regression | 26개 |
+| 실패 파일 / frame issue | 0 / 0 |
+
+| 검증 | 결과 |
+| --- | --- |
+| `formatting_sweep_all_files_generate_out_report` | 1 통과, 61개 파일·failure 0 |
+| 추가 frame/format 회귀 테스트 | 5 통과·실패 0 |
+| `cargo test` | lib 6,555 통과·228 ignored, 전체 binary/integration/guard/doc-test 실패 0 |
 | `cargo clippy --locked --all-targets -- -D warnings -W clippy::perf -W clippy::complexity` | 통과, 경고 0 |
 | `cargo fmt --all -- --check` | 통과 |
