@@ -49,6 +49,22 @@ const FORMAT_SWEEP_STRUCTURAL_REGRESSION_CASES: &[(DatabaseType, &str)] = &[
         DatabaseType::Oracle,
         "MERGE INTO t trg USING src ON (trg.id = src.id) WHEN MATCHED THEN UPDATE SET trg.a = src.a -- comment\n, trg.b = src.b;",
     ),
+    (
+        DatabaseType::Oracle,
+        "WITH a (n) AS (SELECT 1 FROM DUAL UNION ALL SELECT n + 1 FROM a WHERE n < 3) SEARCH DEPTH FIRST BY n SET ord CYCLE n SET cyc TO 'Y' DEFAULT 'N', b AS (SELECT n FROM a) SELECT n FROM b;",
+    ),
+    (
+        DatabaseType::Oracle,
+        "BEGIN v := (SELECT COUNT(*) FROM t WHERE t.id = 1); END;",
+    ),
+    (
+        DatabaseType::Oracle,
+        "UPDATE t SET a = (SELECT MAX(x) FROM s WHERE s.id = t.id), b = (SELECT MIN(x) FROM s WHERE s.id = t.id) WHERE t.id = 1;",
+    ),
+    (
+        DatabaseType::MariaDB,
+        "CREATE FUNCTION f(a DECIMAL(12, 2), b DECIMAL(14, 2)) RETURNS DECIMAL(18, 2) DETERMINISTIC BEGIN RETURN a + b; END;",
+    ),
 ];
 const FORMAT_SWEEP_INLINE_QUERY_FRAME_REGRESSION: &str =
     "SELECT JSON_OBJECT ('grand' VALUE (SELECT SUM(amount) FROM orders) RETURNING CLOB) AS payload FROM DUAL;";
@@ -1615,16 +1631,117 @@ fn formatting_sweep_search_cycle_comma_children_have_dedicated_list_frames() {
     }
     assert!(
         run.formatted
-            .contains("SEARCH DEPTH FIRST BY id,\n    parent_id SET traversal_no"),
+            .contains("    SEARCH DEPTH FIRST BY id,\n        parent_id SET traversal_no"),
         "SEARCH siblings should use one list-body depth:\n{}",
         run.formatted
     );
     assert!(
         run.formatted
-            .contains("CYCLE id,\n    parent_id SET cycle_yn"),
+            .contains("    CYCLE id,\n        parent_id SET cycle_yn"),
         "CYCLE siblings should use one list-body depth:\n{}",
         run.formatted
     );
+}
+
+#[test]
+fn formatting_sweep_with_search_cycle_clauses_continue_the_with_list_child_depth() {
+    let source = "WITH a (n) AS (SELECT 1 FROM DUAL UNION ALL SELECT n + 1 FROM a WHERE n < 3) SEARCH DEPTH FIRST BY n SET ord CYCLE n SET cyc TO 'Y' DEFAULT 'N', b AS (SELECT n FROM a) SELECT n FROM b;";
+    let run = format_sweep_run(source, DatabaseType::Oracle);
+    assert!(
+        run.issues.is_empty(),
+        "SEARCH/CYCLE continuation issues: {:#?}\n{}",
+        run.issues,
+        run.formatted
+    );
+    assert!(
+        run.formatted
+            .contains("    SEARCH DEPTH FIRST BY n SET ord\n    CYCLE n SET cyc TO 'Y' DEFAULT 'N',\n    b AS ("),
+        "SEARCH/CYCLE must continue the recursive CTE at the WITH-list child depth:\n{}",
+        run.formatted
+    );
+}
+
+#[test]
+fn formatting_sweep_assignment_value_paren_shares_the_owner_edge() {
+    let plsql = format_sweep_run(
+        "BEGIN v := (SELECT COUNT(*) FROM t WHERE t.id = 1); END;",
+        DatabaseType::Oracle,
+    );
+    assert!(
+        plsql.issues.is_empty(),
+        "assignment-value paren issues: {:#?}\n{}",
+        plsql.issues,
+        plsql.formatted
+    );
+    assert!(
+        plsql.formatted.contains(
+            "    v := (\n        SELECT COUNT(*)\n        FROM t\n        WHERE t.id = 1\n    );"
+        ),
+        "a value that is exactly one paren must share the assignment-value depth:\n{}",
+        plsql.formatted
+    );
+
+    let update = format_sweep_run(
+        "UPDATE t SET a = (SELECT MAX(x) FROM s WHERE s.id = t.id), b = 2 WHERE t.id = 1;",
+        DatabaseType::Oracle,
+    );
+    assert!(
+        update.issues.is_empty(),
+        "SET assignment-value paren issues: {:#?}\n{}",
+        update.issues,
+        update.formatted
+    );
+    assert!(
+        update
+            .formatted
+            .contains("SET a = (\n        SELECT MAX (x)\n        FROM s\n        WHERE s.id = t.id\n    ),\n    b = 2"),
+        "a SET value that is exactly one paren must share the assignment-value depth:\n{}",
+        update.formatted
+    );
+
+    let operand = format_sweep_run(
+        "CREATE PROCEDURE p() BEGIN SET @v = ((@a + @b) MOD 3) + 1; END;",
+        DatabaseType::MariaDB,
+    );
+    assert!(
+        operand.issues.is_empty(),
+        "operand paren issues: {:#?}\n{}",
+        operand.issues,
+        operand.formatted
+    );
+    assert!(
+        operand
+            .formatted
+            .contains("SET @v = ((@a + @b) MOD 3) + 1;"),
+        "a paren that is only the first operand keeps its own edge:\n{}",
+        operand.formatted
+    );
+}
+
+#[test]
+fn formatting_sweep_mysql_routine_parameter_type_arguments_close_inline() {
+    for db_type in [DatabaseType::MySQL, DatabaseType::MariaDB] {
+        let run = format_sweep_run(
+            "CREATE FUNCTION f(a DECIMAL(12, 2), b DECIMAL(14, 2)) RETURNS DECIMAL(18, 2) DETERMINISTIC BEGIN RETURN a + b; END;",
+            db_type,
+        );
+        assert!(
+            run.issues.is_empty(),
+            "{db_type:?} routine parameter issues: {:#?}\n{}",
+            run.issues,
+            run.formatted
+        );
+        assert!(
+            run.formatted.contains("a DECIMAL(12,\n        2),"),
+            "{db_type:?}: a non-last parameter's type-argument paren must close inline like the last one:\n{}",
+            run.formatted
+        );
+        assert!(
+            !run.formatted.contains("2\n    ),"),
+            "{db_type:?}: type-argument close must not detach from its last argument:\n{}",
+            run.formatted
+        );
+    }
 }
 
 #[test]

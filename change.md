@@ -3411,3 +3411,147 @@ red/green 확인에서 PIVOT 회귀 테스트는 수정 전 body depth 8, 기대
 | `cargo test` | lib 6,559 통과·228 ignored, 전체 binary/integration/guard/doc-test 실패 0 |
 | `cargo clippy --locked --all-targets -- -D warnings -W clippy::perf -W clippy::complexity` | 통과, 경고 0 |
 | `cargo fmt --all -- --check` | 통과 |
+| `git diff --check` | 통과 |
+
+## 23-1. 검토 범위 (23차: 전체 .format.out 육안 재검토)
+
+`formatting_sweep_all_files_generate_out_report`로 61개 fixture(Oracle 41 / MySQL 9 / MariaDB 11)의
+`.format.out` 43,695줄을 전부 다시 읽고, PASS 여부와 무관하게
+`docs/auto_format_rule.md`의 frame 원칙과 관례 위반을 점검했다.
+frame 깊이 위반 2건과 닫는 괄호 배치 비일관 1건을 발견해 모두 수정했다.
+
+## 23-2. SEARCH/CYCLE 절이 WITH-list 자식 깊이를 무시 (규칙 2 위반)
+
+재귀 CTE 뒤의 `SEARCH`/`CYCLE` 절은 문법상 직전 CTE의 연속인데, 문장 최상위 깊이(0)로
+렌더링됐다. WITH 목록 중간에서는 `CYCLE ...,` 다음 CTE가 깊이 1로 이어져 목록이 어긋나 보였다.
+(`test/oracle_format_final_boss_2.sql`, `final_boss_3.sql`, `test11.txt` 등에서 재현)
+
+AS-IS:
+
+```sql
+WITH days (day_no, day_value) AS (
+        ...
+    )
+CYCLE day_no SET cycle_yn TO 'Y' DEFAULT 'N',
+    customer_tree (customer_id,
+```
+
+TO-BE:
+
+```sql
+WITH days (day_no, day_value) AS (
+        ...
+    )
+    CYCLE day_no SET cycle_yn TO 'Y' DEFAULT 'N',
+    customer_tree (customer_id,
+```
+
+수정: `formatter.rs`의 SEARCH/CYCLE 분기가 `statement_base_depth()` 대신
+`with_cte_separator_indent()`(WITH-list owner frame 깊이)를 사용한다.
+일반 검출: 같은 지점에서 `audit_expected_indent(...)`로 "SEARCH/CYCLE는 WITH-list 자식 깊이"
+불변식을 기록해, 이후 어떤 fixture에서든 어긋나면 sweep이 FrameAlignment 오류로 잡는다.
+
+## 23-3. 대입 값이 괄호 하나일 때 frame edge 이중 계산 (규칙 5·6 위반)
+
+`x := (...)` 또는 `SET a = (...)`처럼 값 전체가 괄호 하나이면 AssignmentValue frame과
+괄호 delimiter는 같은 owner edge라 한 깊이를 공유해야 하는데(문서 규칙 5 예제, 규칙 6),
+두 edge로 계산돼 한 단계 더 깊게 렌더링됐다. (`test/test24.sql`, `test12.sql`, `test13.sql` 재현)
+
+AS-IS:
+
+```sql
+SET abcd = (
+            SELECT source_row.edfg
+            FROM qt_depth_source source_row
+            WHERE source_row.id = target_row.id
+        )
+```
+
+TO-BE:
+
+```sql
+SET abcd = (
+        SELECT source_row.edfg
+        FROM qt_depth_source source_row
+        WHERE source_row.id = target_row.id
+    )
+```
+
+수정: `(`가 대입 연산자(`:=`/SET의 `=`) 바로 뒤이고 매칭 닫괄호 뒤 토큰이 값의 끝
+(`;`/`,`/절 키워드)일 때만 괄호 frame 깊이를 AssignmentValue 깊이와 공유한다.
+`SET v = ((a + b) MOD 3) + 1`처럼 괄호가 값의 첫 피연산자일 뿐이면 기존대로 별도 edge를 유지한다.
+일반 검출: 공유가 적용된 괄호는 `audit_last_paren_expected_depth` + attached 관계로 기록되어
+깊이가 어긋나면 모든 sweep 실행에서 parent-depth drift로 검출된다.
+
+## 23-4. MySQL/MariaDB 루틴 파라미터의 타입 괄호 닫힘 분리
+
+`CREATE FUNCTION f(a DECIMAL(12, 2), b ...)`처럼 모드 키워드(IN/OUT) 없는 첫 파라미터의
+타입 괄호가 "최근 4단어 안에 PROCEDURE/FUNCTION" 휴리스틱에 걸려 ColumnList로 오분류되어,
+마지막 인자와 닫는 괄호가 분리됐다. 같은 문장의 마지막 파라미터는 인라인으로 닫혀 비일관했다.
+(`test_mariadb/test4.txt`, `test_mariadb/test7.txt` 재현)
+
+AS-IS:
+
+```sql
+CREATE FUNCTION fn_efficiency_band(p_hours DECIMAL(12,
+        2
+    ),
+    p_budget DECIMAL(14,
+        2)
+)
+```
+
+TO-BE:
+
+```sql
+CREATE FUNCTION fn_efficiency_band(p_hours DECIMAL(12,
+        2),
+    p_budget DECIMAL(14,
+        2)
+)
+```
+
+수정: 오분류 조건을 기존의 정밀 판정 함수 `paren_opens_routine_parameter_list`
+(식별자 → PROCEDURE/FUNCTION 직접 연결만 인정)로 교체했다.
+
+## 23-5. 육안 검토에서 확인한 의도된 동작 (수정하지 않음)
+
+- 식별자 대문자화: `seed`/`remark`/`depth`/`name`/`path` 등 키워드 테이블에 있는 단어는
+  식별자 위치에서도 대문자화된다. Oracle 비인용 식별자는 대소문자 무관이라 의미 보존이며
+  기존 정책(키워드 대문자화)의 일부다.
+- 구조 frame(서브쿼리/OVER/CASE)을 포함한 함수 괄호는 닫괄호를 단독 줄에 두는 관례가
+  전 파일에서 일관 적용된다. (`NVL((SELECT ...), 0\n)` 등)
+- `@TRANSACTION` → `SET AUTOCOMMIT OFF`: 포매터가 아니라 ToolCommand 파서의 의도된
+  정규화(`script.rs`의 별칭, 파서 테스트로 고정)다.
+
+## 23-6. 회귀 고정과 최종 게이트
+
+built-in sweep 회귀 코퍼스에 5개 케이스(SEARCH/CYCLE 중간 목록, `:= (subquery)`,
+`SET a = (subquery), b = (subquery)`, MariaDB modeless DECIMAL 파라미터)를 추가했고,
+전용 테스트 3개를 신설했다.
+
+- `formatting_sweep_with_search_cycle_clauses_continue_the_with_list_child_depth`
+- `formatting_sweep_assignment_value_paren_shares_the_owner_edge`
+- `formatting_sweep_mysql_routine_parameter_type_arguments_close_inline`
+
+기존 기대값 갱신: `formatting_sweep_search_cycle_comma_children_have_dedicated_list_frames`,
+`format_sql_basic_recursive_cte_search_cycle_inline`,
+`paren_case_expression_tracks_end_case_terminator`,
+`paren_case_expression_tracks_searched_case_headers`,
+`format_sql_paren_case_start_with_inline_comment_keeps_case_indented`,
+`format_sql_paren_case_end_with_comment_does_not_leak_depth_to_next_line`
+(모두 입력 SQL은 유지, 문서 규칙에 맞는 새 깊이로 교정).
+
+| 항목 | 결과 |
+| --- | ---: |
+| 재검토 fixture / 출력 줄 | 61개 / 43,695줄 (수정 후 43,691줄) |
+| 검사 frame / body item / close | 21,113 / 22,839 / 9,724 |
+| built-in sweep regression | 30개 |
+| 실패 파일 / frame issue | 0 / 0 |
+
+| 검증 | 결과 |
+| --- | --- |
+| `formatting_sweep_all_files_generate_out_report` | 통과, 61개 파일·failure 0 |
+| `cargo test` (전체) | 6,711 통과·실패 0 |
+| `cargo clippy --locked --all-targets -- -D warnings -W clippy::perf -W clippy::complexity` | 통과, 경고 0 |
+| `cargo fmt --all -- --check` / `git diff --check` | 통과 |

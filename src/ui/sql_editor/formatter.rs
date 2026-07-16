@@ -3693,6 +3693,14 @@ impl FormatFrameStack {
     }
 
     #[cfg(test)]
+    fn audit_mark_last_paren_attached(&mut self) {
+        let Some(frame_id) = self.last_paren_frame_id() else {
+            return;
+        };
+        self.frame_alignment_audit.mark_attached_to_parent(frame_id);
+    }
+
+    #[cfg(test)]
     fn frame_alignment_audit_summary(
         &self,
         formatted: &str,
@@ -13383,15 +13391,25 @@ impl SqlEditorWidget {
                         && !keyword_suppresses_structural_handling
                     {
                         activate_construct_flag!(SearchCycleClauseActive, current_scope);
-                        // SEARCH/CYCLE after recursive CTE should start on a
-                        // new line at the WITH-clause level.
+                        // SEARCH/CYCLE grammatically continue the recursive CTE
+                        // they follow, so they render at the WITH-list child
+                        // depth rather than the statement clause depth.
+                        let search_cycle_indent = format_stack.with_cte_separator_indent(
+                            base_indent!(format_stack.statement_base_depth()),
+                        );
                         newline_with(
                             &mut out,
-                            base_indent!(format_stack.statement_base_depth()),
+                            search_cycle_indent,
                             0,
                             &mut at_line_start,
                             &mut needs_space,
                             &mut line_indent,
+                        );
+                        #[cfg(test)]
+                        format_stack.audit_expected_indent(
+                            idx,
+                            search_cycle_indent,
+                            "SEARCH/CYCLE continues the recursive WITH-list child",
                         );
                         format_stack.push_list_owner_kind_for_render(
                             current_scope,
@@ -17484,16 +17502,11 @@ impl SqlEditorWidget {
                                 && paren_has_top_level_comma;
                             let is_multiline_routine_parameter_list = mysql_compatible
                                 && paren_has_top_level_comma
-                                && Self::recent_statement_words_before_from_indices(
+                                && Self::paren_opens_routine_parameter_list(
                                     tokens,
-                                    &recent_statement_word_indices,
-                                    4,
-                                )
-                                .iter()
-                                .any(|word| {
-                                    word.eq_ignore_ascii_case("PROCEDURE")
-                                        || word.eq_ignore_ascii_case("FUNCTION")
-                                });
+                                    idx,
+                                    Some(_meaningful_token_links),
+                                );
                             let is_call_argument_list =
                                 Self::paren_opens_call_argument_list_from_indices(
                                     tokens,
@@ -17954,6 +17967,55 @@ impl SqlEditorWidget {
                                         semantic_open_line_indent.saturating_add(1)
                                     }
                                 });
+                            // An assignment value that is exactly this paren is
+                            // one owner edge: the AssignmentValue frame and the
+                            // paren delimiter must share one depth instead of
+                            // double-counting the edge. A paren that is only the
+                            // first operand of a longer value keeps its own edge.
+                            let paren_spans_entire_assignment_value = matches!(
+                                loop_previous_non_comment_token,
+                                Some(SqlToken::Symbol(symbol)) if symbol == ":=" || symbol == "="
+                            )
+                                && matching_paren_close_indices
+                                    .get(idx)
+                                    .copied()
+                                    .flatten()
+                                    .map(|close_idx| {
+                                        let mut cursor = close_idx.saturating_add(1);
+                                        loop {
+                                            match tokens.get(cursor) {
+                                                Some(SqlToken::Comment(_)) => {
+                                                    cursor = cursor.saturating_add(1);
+                                                }
+                                                Some(SqlToken::Symbol(symbol)) => {
+                                                    return matches!(symbol.as_str(), ";" | ",");
+                                                }
+                                                Some(SqlToken::Word(word)) => {
+                                                    return matches!(
+                                                        word.to_ascii_uppercase().as_str(),
+                                                        "WHERE"
+                                                            | "RETURNING"
+                                                            | "LIMIT"
+                                                            | "ORDER"
+                                                            | "GROUP"
+                                                            | "HAVING"
+                                                    );
+                                                }
+                                                Some(SqlToken::String(_)) => return false,
+                                                None => return true,
+                                            }
+                                        }
+                                    })
+                                    .unwrap_or(false);
+                            let assignment_value_paren_shared_depth =
+                                paren_spans_entire_assignment_value
+                                    .then(|| {
+                                        format_stack.assignment_value_depth_at_scope(current_scope)
+                                    })
+                                    .flatten()
+                                    .filter(|av_depth| frame_depth == av_depth.saturating_add(1));
+                            let frame_depth =
+                                assignment_value_paren_shared_depth.unwrap_or(frame_depth);
                             let frame_owner_depth = frame_depth.saturating_sub(1);
                             if paren_started_at_line_start {
                                 line_indent = frame_owner_depth;
@@ -18054,6 +18116,11 @@ impl SqlEditorWidget {
                             #[cfg(test)]
                             if let Some(expected_depth) = audit_conditional_child_paren_depth {
                                 format_stack.audit_last_paren_expected_depth(expected_depth);
+                            }
+                            #[cfg(test)]
+                            if let Some(shared_depth) = assignment_value_paren_shared_depth {
+                                format_stack.audit_last_paren_expected_depth(shared_depth);
+                                format_stack.audit_mark_last_paren_attached();
                             }
                             let parenthesized_list_owner_kind = if multiline_clause_owner_kind
                                 == Some(FormatIndentedParenOwnerKind::StructuredColumns)
@@ -23111,8 +23178,8 @@ END;"#;
             .expect("END line");
 
         assert!(
-            formatted.contains("v_val := (CASE v_mode\n                WHEN 1 THEN"),
-            "CASE <expr> should include assignment-value and parenthesized-body frame edges, got:\n{}",
+            formatted.contains("v_val := (CASE v_mode\n            WHEN 1 THEN"),
+            "CASE <expr> shares the assignment-value edge with the parenthesized body, got:\n{}",
             formatted
         );
         assert_eq!(
@@ -23186,8 +23253,8 @@ END;"#;
             .expect("END CASE line");
 
         assert!(
-            formatted.contains("CASE\n                WHEN v_mode = 1 THEN"),
-            "Parenthesized CASE should include the assignment-value frame before branch depth, got:\n{}",
+            formatted.contains("CASE\n            WHEN v_mode = 1 THEN"),
+            "Parenthesized CASE shares the assignment-value edge with the paren before branch depth, got:\n{}",
             formatted
         );
         assert_eq!(
@@ -37805,13 +37872,13 @@ WHEN MATCHED THEN
         let source = "with r as (select 1 as id, cast(null as number) as parent_id from dual union all select t.id, t.parent_id from tree t join r on t.parent_id = r.id) search depth first by id set ord cycle id set is_cycle to 'Y' default 'N' select * from r;";
         let formatted = SqlEditorWidget::format_sql_basic(source);
         assert!(
-            formatted.contains("\nSEARCH DEPTH FIRST BY id SET ord"),
-            "SEARCH should start on its own line with SET inline, got:\n{}",
+            formatted.contains("\n    SEARCH DEPTH FIRST BY id SET ord"),
+            "SEARCH should start on its own line at the WITH-list child depth with SET inline, got:\n{}",
             formatted
         );
         assert!(
-            formatted.contains("\nCYCLE id SET is_cycle TO 'Y' DEFAULT 'N'"),
-            "CYCLE should start on its own line with SET inline, got:\n{}",
+            formatted.contains("\n    CYCLE id SET is_cycle TO 'Y' DEFAULT 'N'"),
+            "CYCLE should start on its own line at the WITH-list child depth with SET inline, got:\n{}",
             formatted
         );
         let formatted_again = SqlEditorWidget::format_sql_basic(&formatted);

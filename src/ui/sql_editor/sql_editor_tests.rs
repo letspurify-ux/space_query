@@ -6672,7 +6672,7 @@ END;"#;
 
     let formatted = SqlEditorWidget::format_sql_basic(input);
     assert!(
-        formatted.contains("END -- close case\n        );\n    v_next := 2;"),
+        formatted.contains("END -- close case\n    );\n    v_next := 2;"),
         "parenthesized CASE depth should be closed before the next statement, got: {formatted}"
     );
 }
@@ -6692,11 +6692,11 @@ END;"#;
 
     let formatted = SqlEditorWidget::format_sql_basic(input);
     assert!(
-        formatted.contains("v_num := ( -- keep this comment\n            CASE\n                WHEN 1 = 1 THEN"),
+        formatted.contains("v_num := ( -- keep this comment\n        CASE\n            WHEN 1 = 1 THEN"),
         "CASE block after parenthesis+comment should stay indented as expression depth, got: {formatted}"
     );
     assert!(
-        formatted.contains("END\n        );"),
+        formatted.contains("END\n    );"),
         "closing parenthesis should realign with the parenthesized expression owner depth, got: {formatted}"
     );
 }
