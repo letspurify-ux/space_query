@@ -642,7 +642,7 @@ PIVOT (
     let pivot_comment = line_starting_with(&pivot, "/* aggregate */");
     let pivot_sum = line_starting_with(&pivot, "SUM (amount)");
     let pivot_for = line_starting_with(&pivot, "FOR category IN");
-    assert_eq!(indent(pivot_comment), indent(pivot_owner) + 8, "{pivot}");
+    assert_eq!(indent(pivot_comment), indent(pivot_owner) + 4, "{pivot}");
     assert_eq!(indent(pivot_sum), indent(pivot_comment), "{pivot}");
     assert_eq!(indent(pivot_for), indent(pivot_comment), "{pivot}");
 

@@ -2539,6 +2539,7 @@ bounded fast path를 유지하는지 함께 검증한다.
 | 정확한 `cargo clippy -- -D warnings -W clippy::perf -W clippy::complexity` | 통과, 오류·경고 0 |
 | `cargo fmt --all -- --check` | 통과 |
 
+
 | `git diff --check` | 통과 |
 
 ## 17-8. 결론
@@ -3245,5 +3246,168 @@ WITH PL/SQL 선언은 기존 전용 owner 계산을 유지한다.
 | `formatting_sweep_all_files_generate_out_report` | 1 통과, 61개 파일·failure 0 |
 | 추가 frame/format 회귀 테스트 | 5 통과·실패 0 |
 | `cargo test` | lib 6,555 통과·228 ignored, 전체 binary/integration/guard/doc-test 실패 0 |
+| `cargo clippy --locked --all-targets -- -D warnings -W clippy::perf -W clippy::complexity` | 통과, 경고 0 |
+| `cargo fmt --all -- --check` | 통과 |
+
+# 22. 소속 frame 기준 복구와 frame 감사 독립성 보강 (2026-07-16)
+
+## 22-1. 검토 범위와 추가 발견
+
+`cargo test --lib formatting_sweep_all_files_generate_out_report -- --ignored --nocapture`가
+PASS인 상태에서 `target/format-sweep/**/*.format.out` 61개, 43,695줄을 처음부터 끝까지
+수동 판독했다. DB별 범위는 Oracle 41개, MySQL 9개, MariaDB 11개다.
+
+PASS를 신뢰하지 않고 `docs/auto_format_rule.md`의 다음 계약을 직접 대조했다.
+
+- direct child는 소속 frame owner보다 정확히 한 단계 깊어야 한다.
+- 닫힘은 해당 owner와 같은 깊이여야 한다.
+- 렌더링 중 잠시 활성화된 sibling/list 상태를 문법 parent로 사용하지 않는다.
+- typed view/delimiter는 같은 owner edge를 두 번 세지 않는다.
+- 주석은 구조를 바꾸지 않는다.
+
+그 결과 기존 자동 감사에서 놓친 독립 오류 두 계열을 확인했다.
+
+1. Oracle `PIVOT`/`UNPIVOT` body와 닫힘이 소속 owner보다 한 frame 더 깊었다.
+2. `test/test9.txt`의 닫힌 `NVL(...) || CASE`에서 CASE opener만 소속 call frame보다
+   두 단계 깊었고, `WHEN`/`ELSE`/`END`는 서로 다른 기준으로 복구됐다.
+
+수정 후 초기 결과와 바이트 단위로 비교해 실제 출력이 바뀐 15개 리포트, 15,420줄을
+최종본 기준으로 다시 처음부터 끝까지 판독했다. 나머지 46개 리포트는 초기 수동 판독본과
+바이트가 동일하다. 최종 추가 오류는 0건이다.
+
+## 22-2. PIVOT/UNPIVOT의 잘못된 parent 선택
+
+AS-IS:
+
+```sql
+PIVOT (SUM (amount)
+        FOR status IN ('NEW' AS new_amt,
+            'PAID' AS paid_amt)
+    )
+```
+
+TO-BE:
+
+```sql
+PIVOT (SUM (amount)
+    FOR status IN ('NEW' AS new_amt,
+        'PAID' AS paid_amt)
+)
+```
+
+근본 원인은 semantic delimiter를 열 때 stack에서 가장 깊은 활성 frame을 parent로 선택한
+것이다. 그 시점의 `FROM` list는 렌더링 진행 상태로 남은 sibling이지 `PIVOT`의 문법 parent가
+아니다. 하지만 기존 코드는 이 더 깊은 list를 선택해 PIVOT paren을 owner+2에 등록했다.
+
+이를 semantic owner 종류별 parent 정책으로 분리했다.
+
+- `PIVOT`, `UNPIVOT`, `MATCH_RECOGNIZE`: owner가 출력된 줄의 문법 parent만 사용한다.
+- analytic `OVER`, `WINDOW` 등 표현식 owner: 실제로 활성 expression frame에 속할 수 있으므로
+  기존 enclosing-frame 정책을 유지한다.
+
+표 절 owner는 `nearest_semantic_owner_parent_frame(owner_depth)`로 정확히 owner depth에서
+소속 frame을 고른다. 따라서 더 깊은 render-time sibling이 활성 상태여도 parent 후보가 될 수
+없다. 이 정책 분류 자체를 회귀 테스트로 고정해 analytic `OVER`를 잘못 끌어올리는 것도 막았다.
+
+## 22-3. CASE opener의 소속 frame 복구
+
+AS-IS:
+
+```sql
+RETURN SUBSTR (NVL (p_old,
+        '') ||
+            CASE
+        WHEN p_old IS NULL THEN
+            ''
+        ELSE
+            CHR (10)
+    END || ...);
+```
+
+TO-BE:
+
+```sql
+RETURN SUBSTR (NVL (p_old,
+        '') ||
+    CASE
+        WHEN p_old IS NULL THEN
+            ''
+        ELSE
+            CHR (10)
+    END || ...);
+```
+
+`NVL`을 닫은 뒤 연결 연산자 `||`를 거쳐 CASE를 열 때, 출력 줄에는 닫힌 nested call의
+continuation depth가 남아 있었다. 이후 CASE block frame은 `nearest_child_owner_frame()`으로
+정상 owner에 등록됐지만 opener는 이미 더 깊게 렌더링됐다. 즉 opener와 그 frame의 body/close가
+서로 다른 depth source를 사용했다.
+
+CASE 앞 token이 `||`이고 현재 출력 줄 depth가 문법 child-owner depth보다 실제로 깊을 때만
+CASE opener를 그 문법 owner로 복구한다. 일반 `* CASE`, named argument `=> CASE`, `= CASE`는
+이번 오류와 소속 관계가 다르므로 출력 변경 대상에서 제외했다. 이 제한으로 MODEL 식의
+`0) * CASE` 등 무관한 줄바꿈 회귀를 방지했다.
+
+## 22-4. 기존 frame 구조 판단 테스트가 놓친 이유
+
+기존 감사도 frame을 기록했지만 예상값이 renderer의 잘못된 선택과 독립적이지 않았다.
+
+1. PIVOT/UNPIVOT은 renderer가 고른 잘못된 parent/depth를 감사의 expected에도 그대로
+   등록했다. actual과 expected가 같은 잘못을 공유해 내부 일관성 검사만 통과했다.
+2. CASE frame은 뒤늦게 정상 owner depth로 등록됐으나 감사가 body child와 close만 확인했다.
+   owner opener token의 실제 줄 depth를 frame의 owner depth와 비교하지 않아 opener 단독 drift를
+   보지 못했다.
+3. first-pass whitespace 검사, token 보존, idempotence는 모두 만족했다. 4-space 단위의 잘못된
+   출력도 안정적으로 재생성되므로 이 검사들만으로는 문법 소속 오류를 알 수 없다.
+4. 별도의 PIVOT/UNPIVOT 회귀 테스트 4개는 typed semantic view와 delimiter를 각각 독립
+   들여쓰기 edge로 해석해 owner+2를 기대했다. 이는 문서의 “같은 owner edge를 두 번 세지
+   않는다”는 계약과 반대였고, 자동 검출을 못 한 수준을 넘어 잘못된 출력을 정답으로 보호했다.
+
+즉 문제는 “frame 정보가 없음”이 아니라 “renderer가 만든 잘못된 기준을 expected로 재사용”하고
+“opener 실제 위치를 교차 검증하지 않음”이었다.
+
+## 22-5. 자동 frame 감사의 근본 개선
+
+다음 독립 검사를 추가했다.
+
+- `same_depth_boundary`에 등록된 모든 frame opener token의 실제 줄 indent를 계산해 저장된
+  owner depth와 직접 비교한다. 이제 CASE처럼 opener만 잘못된 경우도
+  `opener indent drift`로 실패한다.
+- PIVOT/UNPIVOT/MATCH_RECOGNIZE body header를 문법 이벤트로 별도 기록해 semantic paren의
+  direct child가 paren frame depth에 있는지 검사한다. 최종 sweep의 검사 body item은
+  22,780개에서 22,807개로 27개 늘었다.
+- table-clause semantic owner의 parent는 renderer stack의 최심부가 아니라 owner-line 문법
+  depth에서 선택한다. 예상 기준과 출력 기준이 같은 잘못을 공유하지 않도록 기준점을 분리했다.
+
+추가 회귀 테스트:
+
+- `frame_alignment_audit_reports_owner_opener_indent_drift`
+- `table_clause_semantic_owners_use_their_owner_line_parent`
+- `format_for_auto_formatting_keeps_pivot_body_one_frame_below_owner`
+- `plsql_case_after_concatenation_stays_inside_call_owner_frame`
+
+red/green 확인에서 PIVOT 회귀 테스트는 수정 전 body depth 8, 기대 depth 4로 실패했고, opener
+감사를 연결한 전체 sweep은 기존 출력의 `test/test9.txt` CASE를 실제 failure로 검출했다.
+수정 후 네 회귀 테스트와 전체 sweep이 모두 통과했다.
+
+전체 테스트에서 드러난 기존 PIVOT/UNPIVOT 기대값 4개도 owner+1 계약으로 교정했다.
+`test/test_format_pivot.sql` 기준 fixture, typed PIVOT/UNPIVOT depth 검사, 주석 포함 visual 검사는
+이제 모두 같은 소속 frame 기준을 사용한다.
+
+## 22-6. 최종 sweep 결과
+
+| 항목 | 결과 |
+| --- | ---: |
+| 전체 fixture / 전체 출력 줄 | 61개 / 43,695줄 |
+| Oracle / MySQL / MariaDB fixture | 41 / 9 / 11 |
+| 최종 재판독한 변경 리포트 / 줄 | 15개 / 15,420줄 |
+| 검사 frame / 문법·body item / close | 21,071 / 22,807 / 9,709 |
+| built-in sweep regression | 26개 |
+| 실패 파일 / frame issue | 0 / 0 |
+
+| 검증 | 결과 |
+| --- | --- |
+| `formatting_sweep_all_files_generate_out_report` | 1 통과, 61개 파일·failure 0 |
+| 추가 frame/format 회귀 테스트 | 4 통과·실패 0 |
+| `cargo test` | lib 6,559 통과·228 ignored, 전체 binary/integration/guard/doc-test 실패 0 |
 | `cargo clippy --locked --all-targets -- -D warnings -W clippy::perf -W clippy::complexity` | 통과, 경고 0 |
 | `cargo fmt --all -- --check` | 통과 |

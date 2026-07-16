@@ -2674,6 +2674,26 @@ impl FormatFrameAlignmentAudit {
             .filter_map(|frame| frame.depth.map(|depth| (frame.id, depth)))
             .collect();
 
+        for (frame_id, expected_indent) in &self.same_depth_boundaries {
+            let Some(frame) = self.frame(*frame_id) else {
+                continue;
+            };
+            let Some(span) = spans.get(frame.open_token_idx) else {
+                continue;
+            };
+            let Some(actual_indent) = Self::line_start_indent(formatted, span.start) else {
+                continue;
+            };
+            if actual_indent != *expected_indent {
+                summary.issues.push(FormatFrameAlignmentIssue {
+                    offset: span.start,
+                    message: format!(
+                        "format frame {frame_id} opener indent drift: expected owner level {expected_indent}, actual opener level {actual_indent}"
+                    ),
+                });
+            }
+        }
+
         for (idx, frame) in self.frames.iter().enumerate() {
             if self.frames[..idx]
                 .iter()
@@ -13472,6 +13492,16 @@ impl SqlEditorWidget {
                         } else if active_phase1_wrapped_owner_kind.is_some_and(|kind| {
                             kind.starts_phase1_body_header_words(upper, next_word, third_word)
                         }) {
+                            #[cfg(test)]
+                            if let Some(expected_indent) =
+                                format_stack.last_paren().map(|frame| frame.depth())
+                            {
+                                format_stack.audit_expected_indent(
+                                    idx,
+                                    expected_indent,
+                                    "semantic parenthesized-clause body header",
+                                );
+                            }
                             newline_with(
                                 &mut out,
                                 base_indent!(format_stack.statement_base_depth()),
@@ -13761,12 +13791,52 @@ impl SqlEditorWidget {
                                     loop_second_previous_non_comment_token,
                                     Some(SqlToken::Symbol(symbol)) if symbol == "."
                                 );
+                            let follows_trailing_operator = loop_previous_non_comment_token
+                                .and_then(Self::format_trailing_meaningful_token_from_sql_token)
+                                .is_some_and(|last| {
+                                    let previous = loop_second_previous_non_comment_token.and_then(
+                                        Self::format_trailing_meaningful_token_from_sql_token,
+                                    );
+                                    crate::sql_text::format_trailing_continuation_operator_kind_from_token_pair(
+                                        previous,
+                                        last,
+                                    )
+                                    .is_some()
+                                });
+                            let follows_concatenation_operator = matches!(
+                                loop_previous_non_comment_token,
+                                Some(SqlToken::Symbol(symbol)) if symbol == "||"
+                            );
+                            let concatenation_case_owner_depth = (follows_concatenation_operator
+                                && !matches!(prev_word_upper, Some("END")))
+                            .then(|| {
+                                let owner_depth = format_stack
+                                    .nearest_child_owner_frame(current_scope)
+                                    .map(|(_, depth)| depth)?;
+                                let operator_line_depth =
+                                    rendered_line_tracker.current_line_indent(&out, line_indent);
+                                (operator_line_depth > owner_depth).then_some(owner_depth)
+                            })
+                            .flatten();
                             let is_first_paren_child = format_stack.last_paren_first_body_is(idx);
                             if is_first_paren_child {
                                 line_indent = format_stack
                                     .last_paren()
                                     .map(|frame| frame.depth())
                                     .unwrap_or(line_indent);
+                            } else if let Some(case_owner_depth) = concatenation_case_owner_depth {
+                                // The block frame is owned by this grammatical parent.
+                                // Render the CASE header from that same source instead of
+                                // inheriting a deeper continuation indent left by a nested
+                                // call that just closed before the operator.
+                                newline_with(
+                                    &mut out,
+                                    case_owner_depth,
+                                    0,
+                                    &mut at_line_start,
+                                    &mut needs_space,
+                                    &mut line_indent,
+                                );
                             } else if return_case_expression || named_argument_case_expression {
                                 // RETURN CASE is one expression phrase. Source whitespace must
                                 // not split CASE away from its owner in Oracle PL/SQL. The same
@@ -13946,20 +14016,6 @@ impl SqlEditorWidget {
                                 let paren_extra = Self::paren_extra_depth(&format_stack);
                                 let in_case_branch_body = format_stack.last_block_kind_is("CASE")
                                     && format_stack.last_case_branch_started();
-                                let previous_non_comment_token = loop_previous_non_comment_token;
-                                let second_previous_non_comment_token =
-                                    loop_second_previous_non_comment_token;
-                                let follows_trailing_operator = previous_non_comment_token
-                                    .and_then(Self::format_trailing_meaningful_token_from_sql_token)
-                                    .is_some_and(|last| {
-                                        let previous = second_previous_non_comment_token
-                                            .and_then(Self::format_trailing_meaningful_token_from_sql_token);
-                                        crate::sql_text::format_trailing_continuation_operator_kind_from_token_pair(
-                                            previous,
-                                            last,
-                                        )
-                                        .is_some()
-                                    });
                                 let parenthesized_case_indent = if in_case_branch_body {
                                     format_stack.innermost_scoped_or_paren_body_depth(
                                         ScopedIndentKind::CaseBranch,
@@ -17847,8 +17903,23 @@ impl SqlEditorWidget {
                             }
                             let first_body_list_parent =
                                 format_stack.list_owner_frame_for_first_body_token(idx);
+                            let semantic_owner_uses_owner_line_parent = multiline_clause_owner_kind
+                                .is_some_and(Self::semantic_owner_uses_owner_line_parent);
                             let parent_frame = if let Some(parent) = first_body_list_parent {
                                 Some(parent)
+                            } else if delimiter_belongs_to_semantic_owner
+                                && semantic_owner_uses_owner_line_parent
+                            {
+                                // Semantic clause owners own their delimiter directly. A
+                                // deeper active list is a render-time sibling, not a
+                                // grammatical parent. Only a frame whose body is exactly at
+                                // the rendered owner depth may contain this owner.
+                                let owner_depth = if paren_frame_kind.is_query_like() {
+                                    query_like_owner_depth
+                                } else {
+                                    semantic_open_line_indent
+                                };
+                                format_stack.nearest_semantic_owner_parent_frame(owner_depth)
                             } else if delimiter_belongs_to_semantic_owner
                                 || query_owner_uses_enclosing_frame
                             {
@@ -18956,6 +19027,15 @@ impl SqlEditorWidget {
         (format_stack.paren_depth() == paren_depth)
             .then(|| format_stack.last_paren_wrapped_owner_kind())
             .flatten()
+    }
+
+    fn semantic_owner_uses_owner_line_parent(kind: FormatIndentedParenOwnerKind) -> bool {
+        matches!(
+            kind,
+            FormatIndentedParenOwnerKind::MatchRecognize
+                | FormatIndentedParenOwnerKind::Pivot
+                | FormatIndentedParenOwnerKind::Unpivot
+        )
     }
 
     fn paren_extra_depth(format_stack: &FormatFrameStack) -> usize {
@@ -20389,6 +20469,21 @@ mod frame_alignment_audit_tests {
     }
 
     #[test]
+    fn frame_alignment_audit_reports_owner_opener_indent_drift() {
+        let formatted = "        CASE\n    END";
+        let mut audit = FormatFrameAlignmentAudit::default();
+        audit.register_same_depth_boundary(1, None, 0, 1);
+        audit.record_close(1, None, 1, false, Some(1));
+
+        let summary = audit.resolve(formatted, false);
+
+        assert!(summary
+            .issues
+            .iter()
+            .any(|issue| issue.message.contains("opener indent drift")));
+    }
+
+    #[test]
     fn frame_alignment_audit_uses_owner_plus_one_when_first_list_child_is_inline() {
         let formatted = "WITH first,\nsecond";
         let mut audit = FormatFrameAlignmentAudit::default();
@@ -21330,6 +21425,56 @@ END oqt_mega_pkg;"#;
             formatted, formatted_again,
             "Formatting should be idempotent for nested CASE expressions"
         );
+    }
+
+    #[test]
+    fn plsql_case_after_concatenation_stays_inside_call_owner_frame() {
+        let source = r#"CREATE OR REPLACE FUNCTION decorate_note(
+    p_old IN VARCHAR2,
+    p_score IN NUMBER,
+    p_seq IN PLS_INTEGER
+) RETURN VARCHAR2 IS
+BEGIN
+    RETURN SUBSTR(NVL(p_old, '') ||
+        CASE
+            WHEN p_old IS NULL THEN ''
+            ELSE CHR(10)
+        END || q'~[fmt-begin
+quotes: 'single', "double", q'[inner]'
+purpose: formatter stress test
+]~' || 'seq=' || p_seq || ', score=' || TO_CHAR(p_score, 'FM9999990.00') || CHR(10) || q'~[fmt-end]~', 1, 4000);
+END decorate_note;"#;
+        let (formatted, audit) =
+            SqlEditorWidget::format_for_auto_formatting_with_frame_alignment_audit(
+                source,
+                Some(crate::db::connection::DatabaseType::Oracle),
+            );
+        let lines: Vec<&str> = formatted.lines().collect();
+        let indent = |line: &str| line.len().saturating_sub(line.trim_start().len());
+        let case_idx = lines
+            .iter()
+            .position(|line| line.trim() == "CASE")
+            .expect("CASE owner line");
+        let when_idx = lines
+            .iter()
+            .position(|line| line.trim_start().starts_with("WHEN p_old IS NULL THEN"))
+            .expect("CASE WHEN line");
+        let end_idx = lines
+            .iter()
+            .position(|line| line.trim_start().starts_with("END || q'~[fmt-begin"))
+            .expect("CASE END line");
+
+        assert_eq!(
+            indent(lines[case_idx]),
+            indent(lines[end_idx]),
+            "CASE owner and END should share a frame depth, got:\n{formatted}"
+        );
+        assert_eq!(
+            indent(lines[when_idx]),
+            indent(lines[case_idx]).saturating_add(4),
+            "CASE branch should be exactly one frame below CASE, got:\n{formatted}"
+        );
+        assert!(audit.issues.is_empty(), "{:#?}\n{formatted}", audit.issues);
     }
 
     #[test]
@@ -27569,6 +27714,7 @@ ORDER BY v.amt DESC;"#;
 
 #[cfg(test)]
 mod format_indent_gap_tests {
+    use super::FormatIndentedParenOwnerKind;
     use crate::sql_delimiter::line_start_snapshot_before_token;
     use crate::ui::sql_editor::SqlEditorWidget;
     use crate::ui::SqlToken;
@@ -31010,6 +31156,62 @@ ORDER BY u.dept_id,
 {}",
             unpivot_formatted
         );
+    }
+
+    #[test]
+    fn table_clause_semantic_owners_use_their_owner_line_parent() {
+        assert!(SqlEditorWidget::semantic_owner_uses_owner_line_parent(
+            FormatIndentedParenOwnerKind::Pivot
+        ));
+        assert!(SqlEditorWidget::semantic_owner_uses_owner_line_parent(
+            FormatIndentedParenOwnerKind::Unpivot
+        ));
+        assert!(SqlEditorWidget::semantic_owner_uses_owner_line_parent(
+            FormatIndentedParenOwnerKind::MatchRecognize
+        ));
+        assert!(!SqlEditorWidget::semantic_owner_uses_owner_line_parent(
+            FormatIndentedParenOwnerKind::AnalyticOver
+        ));
+    }
+
+    #[test]
+    fn format_for_auto_formatting_keeps_pivot_body_one_frame_below_owner() {
+        let source = r#"SELECT *
+FROM sales
+PIVOT (SUM(amount)
+FOR category IN ('A' AS a, 'B' AS b)
+) p;"#;
+        let (formatted, audit) =
+            SqlEditorWidget::format_for_auto_formatting_with_frame_alignment_audit(
+                source,
+                Some(crate::db::connection::DatabaseType::Oracle),
+            );
+        let lines: Vec<&str> = formatted.lines().collect();
+        let indent = |line: &str| line.len().saturating_sub(line.trim_start().len());
+        let pivot_idx = lines
+            .iter()
+            .position(|line| line.trim_start().starts_with("PIVOT ("))
+            .expect("PIVOT owner line");
+        let for_idx = lines
+            .iter()
+            .position(|line| line.trim_start().starts_with("FOR category IN"))
+            .expect("PIVOT FOR sibling");
+        let close_idx = lines
+            .iter()
+            .position(|line| line.trim_start().starts_with(") p"))
+            .expect("PIVOT close line");
+
+        assert_eq!(
+            indent(lines[for_idx]),
+            indent(lines[pivot_idx]).saturating_add(4),
+            "PIVOT body siblings should be exactly one frame below the owner, got:\n{formatted}"
+        );
+        assert_eq!(
+            indent(lines[close_idx]),
+            indent(lines[pivot_idx]),
+            "PIVOT close should align with its owner, got:\n{formatted}"
+        );
+        assert!(audit.issues.is_empty(), "{:#?}\n{formatted}", audit.issues);
     }
 
     #[test]
@@ -36880,8 +37082,8 @@ FROM emp_json e;"#;
         );
         assert_eq!(
             indent(lines[for_idx]),
-            indent(lines[pivot_idx]).saturating_add(8),
-            "PIVOT XML should include parenthesis and typed-list frame edges, got:\n{}",
+            indent(lines[pivot_idx]).saturating_add(4),
+            "PIVOT XML body should be one frame below its owner, got:\n{}",
             formatted
         );
         assert_eq!(
@@ -36911,8 +37113,8 @@ FROM emp_json e;"#;
         );
         assert_eq!(
             indent(lines[for_idx]),
-            indent(lines[unpivot_idx]).saturating_add(8),
-            "UNPIVOT INCLUDE NULLS should include parenthesis and typed-list frame edges, got:\n{}",
+            indent(lines[unpivot_idx]).saturating_add(4),
+            "UNPIVOT INCLUDE NULLS body should be one frame below its owner, got:\n{}",
             formatted
         );
         assert_eq!(
