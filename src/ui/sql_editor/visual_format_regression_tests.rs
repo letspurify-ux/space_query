@@ -331,7 +331,7 @@ END;"#,
     let cte_select = line_starting_with(&formatted, "SELECT id");
     assert_eq!(indent(comment), indent(main_select), "{formatted}");
     assert_eq!(indent(with), indent(main_select), "{formatted}");
-    assert_eq!(indent(cte_select), indent(with) + 4, "{formatted}");
+    assert_eq!(indent(cte_select), indent(with) + 8, "{formatted}");
 }
 
 #[test]
@@ -452,7 +452,7 @@ END visual_ct;"#,
         DatabaseType::Oracle,
     );
     assert!(
-        trigger.contains("ON visual_t\n    COMPOUND TRIGGER\n    TYPE id_tab"),
+        trigger.contains("ON visual_t\n    COMPOUND TRIGGER\n        TYPE id_tab"),
         "{trigger}"
     );
 
@@ -1204,7 +1204,7 @@ FROM base;"#,
 
     let from = line_starting_with(&formatted, "FROM visual_data d");
     let comment = line_starting_with(&formatted, "/* trailing query comment */");
-    assert_eq!(indent(comment), indent(from), "{formatted}");
+    assert_eq!(indent(comment), indent(from) + 4, "{formatted}");
 }
 
 #[test]
@@ -1347,11 +1347,11 @@ fn visual_oracle_expands_alter_table_split_partition_destination_list() {
     );
     let expected = r#"ALTER TABLE orders SPLIT PARTITION orders_2024
 INTO (
-    PARTITION orders_2024_h1
-    VALUES LESS THAN (TO_DATE ('2024-07-01', 'YYYY-MM-DD')),
-    PARTITION orders_2024_h2
-    VALUES LESS THAN (TO_DATE ('2025-01-01', 'YYYY-MM-DD'))
-);"#;
+        PARTITION orders_2024_h1
+        VALUES LESS THAN (TO_DATE ('2024-07-01', 'YYYY-MM-DD')),
+        PARTITION orders_2024_h2
+        VALUES LESS THAN (TO_DATE ('2025-01-01', 'YYYY-MM-DD'))
+    );"#;
 
     assert_eq!(formatted, expected);
 }

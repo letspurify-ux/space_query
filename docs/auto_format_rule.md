@@ -13,20 +13,43 @@ depth rules.
 
 - **Owner**: the clause header, opening delimiter, or block header that owns a
   group of direct children.
-- **Frame**: the formatter state that records an owner's scope, body depth,
-  parent, and lifetime.
+- **Frame**: the formatter state that records one child `depth`, together with
+  the owner's scope, parent, and lifetime.
 - **Direct child**: an item immediately contained by a frame. Content inside a
   nested frame is not a direct child of the outer frame.
 - **Sibling**: direct children owned by the same frame.
-- **Depth**: the logical indentation level. One depth level is currently
-  rendered as four spaces.
+- **Depth**: the indentation level used whenever a token owned by the frame
+  starts a rendered line. One depth level is currently four spaces.
 
 ## Core contract
 
 ### 1. Depth is fixed when the frame is created
 
-If an owner is at depth `d`, its body depth is `d + 1`. This value is derived
-from the owner and parent frame when the frame is created.
+If an owner is at depth `d`, its frame stores exactly one child depth,
+`d + 1`. This rule also applies when there is only one child and when that
+child remains inline. The formatter does not keep separate logical and
+physical depth states.
+
+The live frame stack is the single source of structural depth. The formatter
+must not add a cached active depth, a previous-frame depth, an `indent_level`
+hierarchy, or any equivalent parallel state. A renderer variable that records
+the current output cursor is not a structural hierarchy: it may consume a
+frame's stored depth when starting a line, but it must not invent a parent-child
+edge or add an unowned `+1`/`+2` correction.
+
+Consequently, every visible `d + 2` relationship must be explainable by two
+simultaneously live frame edges. For example, a query inside `WITH a AS (` is
+one level below the WITH child and one level below the parenthesis owner. If
+only one frame edge exists, rendering at `d + 2` is an invariant violation.
+
+A delimiter frame and a syntax-specific typed view may share the same opening
+token. They describe one owner edge and therefore store the same `d + 1` child
+depth; the typed view is not a second nested owner and must not create `d + 2`.
+
+An inline child does not need an indentation write because no new rendered
+line starts there. If that same child continues on another line, every direct
+continuation line uses the frame's stored depth. A nested frame uses its own
+depth, one level below its owner.
 
 The formatter must not infer a frame's body depth retrospectively from:
 
@@ -34,6 +57,17 @@ The formatter must not infer a frame's body depth retrospectively from:
 - the first child after it has been rendered;
 - the previous sibling's final line;
 - the indentation of a nested child's closing token.
+
+Whether a frame is expanded must be decided before its first child is
+rendered. A later separator must not trigger insertion of a line break into
+already-rendered output or move only the first token of an existing child.
+When lookahead is required, classification skips nested frames and excludes
+fixed phrases such as `BETWEEN ... AND ...` before rendering begins.
+
+Once a frame is classified as expanded, its first direct child must start on
+a new line at `d + 1`; expansion must not affect only the second and later
+children. Owner modifiers remain part of the owner header. For example,
+`WITH RECURSIVE` stays at depth `d`, and the first CTE starts at `d + 1`.
 
 ### 2. Line-start siblings have one body depth
 
@@ -77,7 +111,9 @@ LISTAGG(value, ',') WITHIN GROUP (ORDER BY key_a, key_b)
 ```
 
 If formatting makes the condition multiline, the line-start children use the
-frame body depth consistently.
+frame body depth consistently. This compact exception does not apply after the
+frame has been classified as expanded; an expanded frame starts with its first
+direct child at `d + 1`.
 
 ### 4. Nesting composes one frame at a time
 
@@ -219,9 +255,13 @@ of the following:
 - an explicit frame without a close;
 - a child frame closing after its parent;
 - a line-start first child or sibling at a depth different from its frame body;
+- a frame whose stored depth is not its owner depth plus one, including a
+  single inline child;
+- an expanded frame whose first direct child remains inline;
 - an `AND`/`OR` or comma-connected sibling without an owning frame;
 - a line-start close at a depth different from its opener/owner;
 - body-depth drift after a nested frame or leading comment;
+- a parallel structural-depth cache or output-only indentation hierarchy;
 - a production managed-frame or typed-list kind missing from the independent
   syntax inventory.
 

@@ -5252,24 +5252,6 @@ impl FormatQueryOwnerKind {
             Self::Clause | Self::FromItem | Self::Operator | Self::DdlBody => resolved_owner_depth,
         }
     }
-
-    /// Returns the structural formatter depth for the next nested query head
-    /// relative to this owner line and the surrounding resolved query base.
-    pub(crate) fn formatter_child_query_head_depth(
-        self,
-        resolved_owner_depth: usize,
-        query_base_depth: Option<usize>,
-    ) -> usize {
-        match self {
-            Self::Clause | Self::Condition => query_base_depth
-                .map(|depth| depth.saturating_add(2))
-                .map(|depth| depth.max(resolved_owner_depth.saturating_add(1)))
-                .unwrap_or(resolved_owner_depth.saturating_add(1)),
-            Self::FromItem | Self::Operator | Self::DdlBody => {
-                resolved_owner_depth.saturating_add(1)
-            }
-        }
-    }
 }
 
 fn is_format_operator_query_owner_symbol(symbol: &str) -> bool {
@@ -11725,30 +11707,6 @@ mod tests {
         assert_eq!(
             FormatQueryOwnerKind::DdlBody.auto_format_child_query_owner_base_depth(3, None),
             3
-        );
-        assert_eq!(
-            FormatQueryOwnerKind::Clause.formatter_child_query_head_depth(2, Some(2)),
-            4
-        );
-        assert_eq!(
-            FormatQueryOwnerKind::FromItem.formatter_child_query_head_depth(3, Some(2)),
-            4
-        );
-        assert_eq!(
-            FormatQueryOwnerKind::Condition.formatter_child_query_head_depth(2, Some(2)),
-            4
-        );
-        assert_eq!(
-            FormatQueryOwnerKind::Condition.formatter_child_query_head_depth(4, Some(2)),
-            5
-        );
-        assert_eq!(
-            FormatQueryOwnerKind::Operator.formatter_child_query_head_depth(4, Some(2)),
-            5
-        );
-        assert_eq!(
-            FormatQueryOwnerKind::DdlBody.formatter_child_query_head_depth(3, None),
-            4
         );
     }
 

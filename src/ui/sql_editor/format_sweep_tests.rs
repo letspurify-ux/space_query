@@ -10,6 +10,58 @@ use std::path::{Path, PathBuf};
 
 const FORMAT_SWEEP_DETAIL_LIMIT: usize = 200;
 const FORMAT_SWEEP_INDENT_WIDTH: usize = 4;
+const FORMAT_SWEEP_FRAME_REGRESSION_CASES: &[(DatabaseType, &str)] = &[
+    (
+        DatabaseType::Oracle,
+        "SELECT CASE WHEN (SELECT COUNT(*) FROM orders) = 6 AND (SELECT COUNT(*) FROM orders) = 7 THEN 1 ELSE 0 END AS flag FROM t LEFT JOIN u ON /* join child */ u.id = t.id;",
+    ),
+    (
+        DatabaseType::MySQL,
+        "SELECT CASE WHEN (SELECT COUNT(*) FROM orders) = 6 AND (SELECT COUNT(*) FROM orders) = 7 THEN 1 ELSE 0 END AS flag FROM t LEFT JOIN u ON /* join child */ u.id = t.id;",
+    ),
+    (
+        DatabaseType::MariaDB,
+        "SELECT CASE WHEN (SELECT COUNT(*) FROM orders) = 6 AND (SELECT COUNT(*) FROM orders) = 7 THEN 1 ELSE 0 END AS flag FROM t LEFT JOIN u ON /* join child */ u.id = t.id;",
+    ),
+];
+const FORMAT_SWEEP_STRUCTURAL_REGRESSION_CASES: &[(DatabaseType, &str)] = &[
+    (
+        DatabaseType::Oracle,
+        "WITH x AS (SELECT LAG(v) OVER (PARTITION BY g ORDER BY id) AS previous_v, v FROM t) SELECT previous_v FROM x;",
+    ),
+    (
+        DatabaseType::Oracle,
+        "MERGE INTO dst d USING (SELECT s.id, u.v FROM src s JOIN aux u ON u.id = s.id) x ON (d.id = x.id AND d.v <> x.v) WHEN MATCHED THEN UPDATE SET d.v = x.v WHEN NOT MATCHED THEN INSERT (id, v) VALUES (x.id, x.v);",
+    ),
+    (
+        DatabaseType::Oracle,
+        "BEGIN EXECUTE IMMEDIATE 'BEGIN p(:1,:2,:3); END;' USING 1, CASE WHEN a = 1 AND b = 2 THEN 2 ELSE 3 END, 4; END;",
+    ),
+    (
+        DatabaseType::MySQL,
+        "CREATE PROCEDURE p() BEGIN CALL assert_fn(a = 1 AND b = 2, 'x'); END;",
+    ),
+    (
+        DatabaseType::MariaDB,
+        "UPDATE t JOIN u ON u.id = t.id SET t.v = CASE WHEN IFNULL(u.v, 0) > 0 AND u.flag = 'Y' THEN u.v ELSE 0 END WHERE t.active = 1 AND u.active = 1;",
+    ),
+    (
+        DatabaseType::Oracle,
+        "MERGE INTO t trg USING src ON (trg.id = src.id) WHEN MATCHED THEN UPDATE SET trg.a = src.a -- comment\n, trg.b = src.b;",
+    ),
+];
+const FORMAT_SWEEP_INLINE_QUERY_FRAME_REGRESSION: &str =
+    "SELECT JSON_OBJECT ('grand' VALUE (SELECT SUM(amount) FROM orders) RETURNING CLOB) AS payload FROM DUAL;";
+const FORMAT_SWEEP_INLINE_SELECT_COMMENT_REGRESSION: &str =
+    "WITH x AS (SELECT /* first child */ a, b FROM t) SELECT a, b FROM x;";
+const FORMAT_SWEEP_WITH_FRAME_REGRESSION: &str =
+    "WITH first_cte AS (SELECT 1 AS id), second_cte AS (SELECT id FROM first_cte), third_cte AS (SELECT id FROM second_cte) SELECT id FROM third_cte;";
+const FORMAT_SWEEP_INLINE_CONTINUATION_REGRESSIONS: &[&str] = &[
+    "SELECT first_value + -- continuation\nsecond_value AS total, third_value FROM sample_table;",
+    "SELECT * FROM sample_table WHERE first_value = -- continuation\nsecond_value AND third_value = 3;",
+    "SELECT calculate(first_value + -- continuation\nsecond_value, third_value) AS total FROM sample_table;",
+    "WITH only_cte AS (SELECT first_value + -- continuation\nsecond_value AS total FROM sample_table) SELECT total FROM only_cte;",
+];
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum FormatSweepIssueKind {
@@ -273,19 +325,45 @@ fn format_sweep_audit_token_count(
             .zip(formatted_fingerprint.iter())
             .position(|(left, right)| left != right)
             .unwrap_or_else(|| source_fingerprint.len().min(formatted_fingerprint.len()));
+        let first_token_mismatch = source_fingerprint
+            .get(first_mismatch)
+            .zip(formatted_fingerprint.get(first_mismatch))
+            .map(|(source_tokens, formatted_tokens)| {
+                source_tokens
+                    .iter()
+                    .zip(formatted_tokens.iter())
+                    .position(|(left, right)| left != right)
+                    .unwrap_or_else(|| source_tokens.len().min(formatted_tokens.len()))
+            });
+        let preview_start = first_token_mismatch.unwrap_or(0).saturating_sub(3);
         let source_preview = source_fingerprint
             .get(first_mismatch)
-            .map(|tokens| tokens.iter().take(6).cloned().collect::<Vec<_>>());
+            .map(|tokens| {
+                tokens
+                    .iter()
+                    .skip(preview_start)
+                    .take(7)
+                    .cloned()
+                    .collect::<Vec<_>>()
+            });
         let formatted_preview = formatted_fingerprint
             .get(first_mismatch)
-            .map(|tokens| tokens.iter().take(6).cloned().collect::<Vec<_>>());
+            .map(|tokens| {
+                tokens
+                    .iter()
+                    .skip(preview_start)
+                    .take(7)
+                    .cloned()
+                    .collect::<Vec<_>>()
+            });
         FormatSweepIssue::new(
             FormatSweepIssueKind::ItemOrTokenChanged,
             formatted,
             0,
             format!(
-                "first formatting pass changed SQL statement items or tokens at item {}; item counts {} -> {}; source={source_preview:?} formatted={formatted_preview:?}",
+                "first formatting pass changed SQL statement items or tokens at item {}, token {:?}; item counts {} -> {}; source={source_preview:?} formatted={formatted_preview:?}",
                 first_mismatch + 1,
+                first_token_mismatch.map(|idx| idx + 1),
                 source_fingerprint.len(),
                 formatted_fingerprint.len()
             ),
@@ -838,6 +916,225 @@ fn formatting_sweep_condition_frame_depth_invariant_covers_db_clause_families() 
 }
 
 #[test]
+fn formatting_sweep_expanded_frames_start_first_child_at_final_depth() {
+    let indent = |line: &str| line.len().saturating_sub(line.trim_start().len());
+
+    for (db_type, source) in FORMAT_SWEEP_FRAME_REGRESSION_CASES {
+        let run = format_sweep_run(source, *db_type);
+        assert!(
+            run.issues.is_empty(),
+            "{db_type:?} expanded-frame issues: {:#?}\n{}",
+            run.issues,
+            run.formatted
+        );
+
+        let lines: Vec<&str> = run.formatted.lines().collect();
+        let when_idx = lines
+            .iter()
+            .position(|line| line.trim() == "WHEN")
+            .unwrap_or_else(|| panic!("WHEN owner not found:\n{}", run.formatted));
+        let first_child = lines
+            .get(when_idx + 1)
+            .copied()
+            .unwrap_or_else(|| panic!("WHEN first child not found:\n{}", run.formatted));
+        let nested_select = lines
+            .get(when_idx + 2)
+            .copied()
+            .unwrap_or_else(|| panic!("nested SELECT not found:\n{}", run.formatted));
+        let first_close = lines
+            .iter()
+            .skip(when_idx + 3)
+            .find(|line| line.trim_start().starts_with(") = 6"))
+            .copied()
+            .unwrap_or_else(|| panic!("first nested close not found:\n{}", run.formatted));
+        let and_child = lines
+            .iter()
+            .skip(when_idx + 1)
+            .find(|line| line.trim_start().starts_with("AND ("))
+            .copied()
+            .unwrap_or_else(|| panic!("AND child not found:\n{}", run.formatted));
+
+        assert_eq!(
+            indent(first_child),
+            indent(lines[when_idx]) + FORMAT_SWEEP_INDENT_WIDTH,
+            "first condition child must start at owner + 1:\n{}",
+            run.formatted
+        );
+        assert_eq!(
+            indent(nested_select),
+            indent(first_child) + FORMAT_SWEEP_INDENT_WIDTH,
+            "nested frame body must start at its owner + 1:\n{}",
+            run.formatted
+        );
+        assert_eq!(
+            indent(first_close),
+            indent(first_child),
+            "nested frame start and end must share one depth:\n{}",
+            run.formatted
+        );
+        assert_eq!(
+            indent(and_child),
+            indent(first_child),
+            "condition siblings must share one depth:\n{}",
+            run.formatted
+        );
+
+        let on_idx = lines
+            .iter()
+            .position(|line| line.trim_start().starts_with("ON /* join child */"))
+            .unwrap_or_else(|| panic!("ON owner not found:\n{}", run.formatted));
+        let join_child = lines
+            .get(on_idx + 1)
+            .copied()
+            .unwrap_or_else(|| panic!("ON child not found:\n{}", run.formatted));
+        assert_eq!(
+            indent(join_child),
+            indent(lines[on_idx]) + FORMAT_SWEEP_INDENT_WIDTH,
+            "single line-start condition child must start at owner + 1:\n{}",
+            run.formatted
+        );
+    }
+}
+
+#[test]
+fn formatting_sweep_structural_regressions_remain_frame_managed() {
+    let mut managed_frame_kinds = Vec::new();
+
+    for (db_type, source) in FORMAT_SWEEP_STRUCTURAL_REGRESSION_CASES {
+        let run = format_sweep_run(source, *db_type);
+        assert!(
+            run.issues.is_empty(),
+            "{db_type:?} structural-frame issues: {:#?}\n{}",
+            run.issues,
+            run.formatted
+        );
+        for kind in run.managed_frame_kinds {
+            if !managed_frame_kinds.contains(&kind) {
+                managed_frame_kinds.push(kind);
+            }
+        }
+    }
+
+    for expected in [
+        FormatManagedFrameKind::WithCte,
+        FormatManagedFrameKind::JoinBody,
+        FormatManagedFrameKind::MergeOn,
+        FormatManagedFrameKind::AssignmentValue,
+        FormatManagedFrameKind::ExecuteImmediate,
+    ] {
+        assert!(
+            managed_frame_kinds.contains(&expected),
+            "structural regression cases must exercise {expected:?}: {managed_frame_kinds:?}"
+        );
+    }
+}
+
+#[test]
+fn formatting_sweep_inline_query_frame_body_is_one_deeper_than_close() {
+    let run = format_sweep_run(
+        FORMAT_SWEEP_INLINE_QUERY_FRAME_REGRESSION,
+        DatabaseType::Oracle,
+    );
+    assert!(
+        run.issues.is_empty(),
+        "inline query-frame issues: {:#?}\n{}",
+        run.issues,
+        run.formatted
+    );
+
+    let lines: Vec<&str> = run.formatted.lines().collect();
+    let indent = |line: &str| line.len().saturating_sub(line.trim_start().len());
+    let query_body = lines
+        .iter()
+        .find(|line| line.trim_start().starts_with("SELECT SUM"))
+        .copied()
+        .unwrap_or_else(|| panic!("inline query body not found:\n{}", run.formatted));
+    let close = lines
+        .iter()
+        .find(|line| line.trim_start().starts_with(") RETURNING CLOB"))
+        .copied()
+        .unwrap_or_else(|| panic!("inline query close not found:\n{}", run.formatted));
+    assert_eq!(
+        indent(query_body),
+        indent(close) + FORMAT_SWEEP_INDENT_WIDTH,
+        "query-frame body must be one level deeper than its close:\n{}",
+        run.formatted
+    );
+}
+
+#[test]
+fn formatting_sweep_select_inline_comment_is_not_moved_to_expand_its_frame() {
+    let run = format_sweep_run(
+        FORMAT_SWEEP_INLINE_SELECT_COMMENT_REGRESSION,
+        DatabaseType::Oracle,
+    );
+    assert!(
+        run.issues.is_empty(),
+        "inline SELECT-comment issues: {:#?}\n{}",
+        run.issues,
+        run.formatted
+    );
+    assert!(
+        run.formatted.contains("SELECT /* first child */\n"),
+        "SELECT's first-child comment must stay inline:\n{}",
+        run.formatted
+    );
+}
+
+#[test]
+fn formatting_sweep_inline_child_continuations_use_the_same_frame_depth() {
+    let indent = |line: &str| line.len().saturating_sub(line.trim_start().len());
+
+    for db_type in [
+        DatabaseType::Oracle,
+        DatabaseType::MySQL,
+        DatabaseType::MariaDB,
+    ] {
+        for source in FORMAT_SWEEP_INLINE_CONTINUATION_REGRESSIONS {
+            let run = format_sweep_run(source, db_type);
+            assert!(
+                run.issues.is_empty(),
+                "{db_type:?} continuation-frame issues: {:#?}\n{}",
+                run.issues,
+                run.formatted
+            );
+            if source.starts_with("WITH ") {
+                assert!(
+                    run.managed_list_owner_kinds.contains(&ListOwnerKind::With),
+                    "a single inline WITH child must still have a managed frame:\n{}",
+                    run.formatted
+                );
+            }
+
+            let lines: Vec<&str> = run.formatted.lines().collect();
+            let owner_idx = lines
+                .iter()
+                .position(|line| {
+                    let lower = line.to_ascii_lowercase();
+                    lower.contains("first_value + -- continuation")
+                        || lower.contains("first_value = -- continuation")
+                })
+                .unwrap_or_else(|| panic!("continuation owner not found:\n{}", run.formatted));
+            let continuation = lines
+                .get(owner_idx.saturating_add(1))
+                .copied()
+                .unwrap_or_else(|| panic!("continuation line not found:\n{}", run.formatted));
+            assert!(
+                continuation.trim_start().starts_with("second_value"),
+                "unexpected continuation line:\n{}",
+                run.formatted
+            );
+            assert_eq!(
+                indent(continuation),
+                indent(lines[owner_idx]) + FORMAT_SWEEP_INDENT_WIDTH,
+                "an inline child's first rendered continuation must use owner + 1 frame depth:\n{}",
+                run.formatted
+            );
+        }
+    }
+}
+
+#[test]
 fn formatting_sweep_comma_list_frame_depth_invariant_covers_db_clause_families() {
     for (db_type, source, minimum_body_items) in [
         (
@@ -924,6 +1221,16 @@ fn formatting_sweep_syntax_inventory_is_owned_by_typed_frames() {
             ],
         ),
         (
+            "JOIN body and ON-condition children",
+            DatabaseType::Oracle,
+            "SELECT t1.a, t2.b FROM t1 LEFT JOIN t2 ON t2.id = t1.id AND t2.active = 1;",
+            &[
+                FormatManagedFrameKind::JoinBody,
+                FormatManagedFrameKind::Condition,
+                FormatManagedFrameKind::List,
+            ],
+        ),
+        (
             "CTE siblings and set operands",
             DatabaseType::Oracle,
             "WITH a AS (SELECT id, v FROM t1), b AS (SELECT id, v FROM t2) SELECT id, v FROM a UNION ALL SELECT id, v FROM b;",
@@ -940,6 +1247,7 @@ fn formatting_sweep_syntax_inventory_is_owned_by_typed_frames() {
             "MERGE INTO t USING (SELECT id, a, b FROM s) x ON (t.id = x.id AND t.active = 1) WHEN MATCHED THEN UPDATE SET t.a = x.a, t.b = x.b WHEN NOT MATCHED THEN INSERT (id, a, b) VALUES (x.id, x.a, x.b);",
             &[
                 FormatManagedFrameKind::MergeBranch,
+                FormatManagedFrameKind::MergeOn,
                 FormatManagedFrameKind::Condition,
                 FormatManagedFrameKind::List,
                 FormatManagedFrameKind::Parenthesized,
@@ -971,6 +1279,7 @@ fn formatting_sweep_syntax_inventory_is_owned_by_typed_frames() {
             DatabaseType::Oracle,
             "SELECT dept_id, month_id, amount, projected FROM sales MODEL PARTITION BY (dept_id) DIMENSION BY (month_id) MEASURES (amount, projected) RULES (projected[ANY] = amount[CV(month_id)] * 1.1, amount[ANY] = amount[CV(month_id)]);",
             &[
+                FormatManagedFrameKind::ModelBody,
                 FormatManagedFrameKind::Parenthesized,
                 FormatManagedFrameKind::List,
             ],
@@ -997,11 +1306,21 @@ fn formatting_sweep_syntax_inventory_is_owned_by_typed_frames() {
             ],
         ),
         (
-            "CASE expression split control body",
+            "CASE expression branch bodies",
             DatabaseType::Oracle,
             "SELECT CASE WHEN a = 1 AND b = 2 THEN CASE WHEN c = 3 THEN 1 ELSE 2 END ELSE 0 END AS flag_value FROM t;",
             &[
-                FormatManagedFrameKind::SplitControlBody,
+                FormatManagedFrameKind::CaseBranch,
+                FormatManagedFrameKind::Block,
+                FormatManagedFrameKind::Condition,
+            ],
+        ),
+        (
+            "PL/SQL exception branch bodies",
+            DatabaseType::Oracle,
+            "BEGIN NULL; EXCEPTION WHEN NO_DATA_FOUND OR TOO_MANY_ROWS THEN NULL; WHEN OTHERS THEN RAISE; END;",
+            &[
+                FormatManagedFrameKind::ExceptionBranch,
                 FormatManagedFrameKind::Block,
                 FormatManagedFrameKind::Condition,
             ],
@@ -1365,6 +1684,11 @@ SELECT id FROM third_cte;"#;
             run.formatted
         );
         assert!(
+            run.formatted.starts_with("WITH\n    first_cte AS ("),
+            "{db_type:?} first CTE should start at WITH owner+1 depth:\n{}",
+            run.formatted
+        );
+        assert!(
             run.formatted
                 .contains("),\n    /* sibling */\n    second_cte AS ("),
             "{db_type:?} comment and second CTE should share WITH owner+1 depth:\n{}",
@@ -1373,6 +1697,76 @@ SELECT id FROM third_cte;"#;
         assert!(
             run.formatted.contains("),\n    third_cte AS ("),
             "{db_type:?} later CTE siblings should remain on WITH owner+1 depth:\n{}",
+            run.formatted
+        );
+    }
+}
+
+#[test]
+fn formatting_sweep_single_inline_with_child_keeps_both_frame_edges() {
+    let indent = |line: &str| line.len().saturating_sub(line.trim_start().len());
+
+    for db_type in [
+        DatabaseType::Oracle,
+        DatabaseType::MySQL,
+        DatabaseType::MariaDB,
+    ] {
+        let run = format_sweep_run("WITH a AS (SELECT 1 FROM dual) SELECT * FROM a;", db_type);
+        assert!(
+            run.issues.is_empty(),
+            "{db_type:?} single-CTE frame issues: {:#?}\n{}",
+            run.issues,
+            run.formatted
+        );
+        assert!(
+            run.managed_list_owner_kinds.contains(&ListOwnerKind::With),
+            "{db_type:?} single inline CTE must still create a WITH list frame:\n{}",
+            run.formatted
+        );
+
+        let lines: Vec<&str> = run.formatted.lines().collect();
+        let with_idx = lines
+            .iter()
+            .position(|line| line.trim_start().starts_with("WITH a AS ("))
+            .unwrap_or_else(|| panic!("WITH owner not found:\n{}", run.formatted));
+        let cte_select_idx = lines
+            .iter()
+            .enumerate()
+            .skip(with_idx.saturating_add(1))
+            .find(|(_, line)| line.trim_start().starts_with("SELECT 1"))
+            .map(|(idx, _)| idx)
+            .unwrap_or_else(|| panic!("CTE SELECT not found:\n{}", run.formatted));
+        let close_idx = lines
+            .iter()
+            .enumerate()
+            .skip(cte_select_idx.saturating_add(1))
+            .find(|(_, line)| line.trim_start() == ")")
+            .map(|(idx, _)| idx)
+            .unwrap_or_else(|| panic!("CTE close not found:\n{}", run.formatted));
+        let outer_select_idx = lines
+            .iter()
+            .enumerate()
+            .skip(close_idx.saturating_add(1))
+            .find(|(_, line)| line.trim_start().starts_with("SELECT *"))
+            .map(|(idx, _)| idx)
+            .unwrap_or_else(|| panic!("outer SELECT not found:\n{}", run.formatted));
+
+        assert_eq!(
+            indent(lines[cte_select_idx]),
+            indent(lines[with_idx]) + 2 * FORMAT_SWEEP_INDENT_WIDTH,
+            "{db_type:?} CTE query must traverse WITH and paren frame edges:\n{}",
+            run.formatted
+        );
+        assert_eq!(
+            indent(lines[close_idx]),
+            indent(lines[with_idx]) + FORMAT_SWEEP_INDENT_WIDTH,
+            "{db_type:?} CTE close must align with the CTE child owner depth:\n{}",
+            run.formatted
+        );
+        assert_eq!(
+            indent(lines[outer_select_idx]),
+            indent(lines[with_idx]),
+            "{db_type:?} main query must return to the WITH owner depth:\n{}",
             run.formatted
         );
     }
@@ -1496,6 +1890,23 @@ fn formatting_sweep_report_marks_first_pass_issue() {
 }
 
 #[test]
+fn formatter_structural_depth_has_no_parallel_named_state() {
+    let formatter_source = include_str!("formatter.rs");
+    let forbidden_names = [
+        ["indent", "level"].join("_"),
+        ["active", "frame", "depth"].join("_"),
+        ["previous", "frame", "depth"].join("_"),
+    ];
+
+    for forbidden_name in forbidden_names {
+        assert!(
+            !formatter_source.contains(&forbidden_name),
+            "formatter structural depth must come from live frames, not parallel state `{forbidden_name}`"
+        );
+    }
+}
+
+#[test]
 #[ignore = "generates an auto-format sweep report; run explicitly"]
 fn formatting_sweep_generate_out_report_from_env() {
     let Some(input) = std::env::var_os("SPACE_QUERY_FORMAT_SWEEP_FILE") else {
@@ -1528,11 +1939,67 @@ fn formatting_sweep_all_files_generate_out_report() {
     let output_root = manifest.join("target/format-sweep");
     let mut failures = Vec::new();
     let mut checked_files = 0usize;
+    let mut checked_regressions = 0usize;
     let mut checked_frames = 0usize;
     let mut checked_frame_body_items = 0usize;
     let mut checked_frame_closes = 0usize;
     let mut managed_frame_kinds = Vec::new();
     let mut managed_list_owner_kinds = Vec::new();
+
+    let built_in_regressions = FORMAT_SWEEP_FRAME_REGRESSION_CASES
+        .iter()
+        .copied()
+        .chain(FORMAT_SWEEP_STRUCTURAL_REGRESSION_CASES.iter().copied())
+        .chain([
+            (
+                DatabaseType::Oracle,
+                FORMAT_SWEEP_INLINE_QUERY_FRAME_REGRESSION,
+            ),
+            (
+                DatabaseType::Oracle,
+                FORMAT_SWEEP_INLINE_SELECT_COMMENT_REGRESSION,
+            ),
+            (DatabaseType::Oracle, FORMAT_SWEEP_WITH_FRAME_REGRESSION),
+            (DatabaseType::MySQL, FORMAT_SWEEP_WITH_FRAME_REGRESSION),
+            (DatabaseType::MariaDB, FORMAT_SWEEP_WITH_FRAME_REGRESSION),
+        ])
+        .chain(
+            FORMAT_SWEEP_INLINE_CONTINUATION_REGRESSIONS
+                .iter()
+                .copied()
+                .flat_map(|source| {
+                    [
+                        (DatabaseType::Oracle, source),
+                        (DatabaseType::MySQL, source),
+                        (DatabaseType::MariaDB, source),
+                    ]
+                }),
+        );
+
+    for (db_type, source) in built_in_regressions {
+        checked_regressions = checked_regressions.saturating_add(1);
+        let run = format_sweep_run(source, db_type);
+        checked_frames = checked_frames.saturating_add(run.checked_frames);
+        checked_frame_body_items =
+            checked_frame_body_items.saturating_add(run.checked_frame_body_items);
+        checked_frame_closes = checked_frame_closes.saturating_add(run.checked_frame_closes);
+        for kind in &run.managed_frame_kinds {
+            if !managed_frame_kinds.contains(kind) {
+                managed_frame_kinds.push(*kind);
+            }
+        }
+        for kind in &run.managed_list_owner_kinds {
+            if !managed_list_owner_kinds.contains(kind) {
+                managed_list_owner_kinds.push(*kind);
+            }
+        }
+        if !run.issues.is_empty() {
+            failures.push(format!(
+                "built-in expanded-frame regression db={db_type:?} issues={}",
+                run.issues.len()
+            ));
+        }
+    }
 
     for (dir, db_type) in [
         ("test", DatabaseType::Oracle),
@@ -1591,7 +2058,7 @@ fn formatting_sweep_all_files_generate_out_report() {
     managed_frame_kinds.sort_unstable();
     managed_list_owner_kinds.sort_unstable();
     let mut aggregate = format!(
-        "Auto-format sweep aggregate\nchecked_files={checked_files}\nchecked_frames={checked_frames}\nchecked_frame_body_items={checked_frame_body_items}\nchecked_frame_closes={checked_frame_closes}\nmanaged_frame_kinds={managed_frame_kinds:?}\nmanaged_list_owner_kinds={managed_list_owner_kinds:?}\nfailed_files={}\n",
+        "Auto-format sweep aggregate\nchecked_files={checked_files}\nchecked_regressions={checked_regressions}\nchecked_frames={checked_frames}\nchecked_frame_body_items={checked_frame_body_items}\nchecked_frame_closes={checked_frame_closes}\nmanaged_frame_kinds={managed_frame_kinds:?}\nmanaged_list_owner_kinds={managed_list_owner_kinds:?}\nfailures={}\n",
         failures.len()
     );
     for failure in &failures {
@@ -1603,9 +2070,10 @@ fn formatting_sweep_all_files_generate_out_report() {
         .expect("write format sweep aggregate");
     assert!(
         failures.is_empty(),
-        "auto-format sweep found issues in {} of {} files; see `{}`",
+        "auto-format sweep found {} failures across {} files and {} built-in regressions; see `{}`",
         failures.len(),
         checked_files,
+        checked_regressions,
         output_root.join("format-sweep.out").display()
     );
     let mut expected_frame_kinds = FormatManagedFrameKind::ALL.to_vec();

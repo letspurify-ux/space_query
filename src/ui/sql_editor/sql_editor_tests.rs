@@ -542,7 +542,7 @@ FROM sales_ranked;"#;
     let formatted = SqlEditorWidget::format_sql_basic(input);
 
     assert!(
-        formatted.contains("    SELECT /*+ MATERIALIZE */\n        e.emp_id,"),
+        formatted.contains("        SELECT /*+ MATERIALIZE */\n            e.emp_id,"),
         "CTE SELECT hint should preserve select-list indentation, got:\n{}",
         formatted
     );
@@ -599,7 +599,7 @@ fn format_sql_preserves_test15_nested_q_quote_script() {
         "payload = q'[dynamic ; payload / still string]'",
         "END qt_splitter_pkg;",
         "CREATE OR REPLACE TRIGGER qt_splitter_biu",
-        "WITH base_data AS",
+        "base_data AS (",
     ];
 
     assert_contains_all(&formatted, &expected_lines);
@@ -1575,7 +1575,7 @@ fn format_sql_preserves_mariadb_final_boss_v3_script() {
             "CREATE PROCEDURE sp_dynamic_month_pivot(IN p_from DATE, IN p_to DATE)",
             "END$$",
             "DELIMITER ;",
-            "WITH RECURSIVE region_tree AS (",
+            "region_tree AS (",
             "JSON_OBJECTAGG(x.segment, x.net_sales) AS segment_to_net_sales",
         ],
     );
@@ -2127,7 +2127,7 @@ fn format_sql_preserves_oracle_format_final_boss_v2_and_depth_indentation() {
         "-- FORMATTER FINAL BOSS : Oracle SQL / PL-SQL One-Script Stress Set",
         "CREATE OR REPLACE PACKAGE BODY qt_fmt_pkg",
         "OPEN l_rc FOR",
-        "WITH base",
+        "base AS (",
         "OUTER APPLY",
         "MODEL",
         "q'[TOP_IN_DEPT]'",
@@ -2160,10 +2160,19 @@ fn format_sql_preserves_oracle_format_final_boss_v2_and_depth_indentation() {
     };
 
     let open_idx = find_line("OPEN l_rc FOR").unwrap_or(0);
-    let with_idx = find_line("WITH base").unwrap_or(0);
+    let base_idx = find_line("base AS (").expect("OPEN FOR first CTE");
+    let with_idx = lines[..base_idx]
+        .iter()
+        .rposition(|line| line.trim() == "WITH")
+        .expect("OPEN FOR WITH owner");
     assert!(
         indent(lines[with_idx]) > indent(lines[open_idx]),
         "WITH inside OPEN FOR should be indented deeper than OPEN l_rc FOR, got:\n{formatted}"
+    );
+    assert_eq!(
+        indent(lines[base_idx]),
+        indent(lines[with_idx]).saturating_add(4),
+        "the first CTE must start at the OPEN FOR WITH frame's child depth, got:\n{formatted}"
     );
 
     let case_idx = find_line("CASE").unwrap_or(0);
@@ -4338,14 +4347,14 @@ fn format_sql_package_body_case_inside_parentheses_keeps_newlines() {
 
     assert!(
         formatted.contains(
-            "v_val := fn_calc ((\n                CASE\n                    WHEN v_mode = 1 THEN"
+            "v_val := fn_calc ((\n                    CASE\n                        WHEN v_mode = 1 THEN"
         ),
         "CASE expression inside (( should expand with progressive depth, got: {}",
         formatted
     );
     assert!(
         formatted.contains(
-            "WHEN v_flag = 'Y' THEN\n                                100\n                            ELSE\n                                200\n                        END"
+            "WHEN v_flag = 'Y' THEN\n                                    100\n                                ELSE\n                                    200\n                            END"
         ),
         "Nested CASE branches inside parenthesis should stay on separate lines, got: {}",
         formatted
@@ -4369,7 +4378,7 @@ fn format_sql_package_body_type_table_is_not_misdetected_as_create_table() {
         formatted
     );
     assert!(
-        formatted.contains("BEGIN\n        v_out := fn_calc ((\n                CASE"),
+        formatted.contains("BEGIN\n        v_out := fn_calc ((\n                    CASE"),
         "Nested CASE inside function body with (( should use progressive depth, got: {}",
         formatted
     );
@@ -6126,8 +6135,9 @@ SELECT * FROM cte;"#;
         formatted
     );
     assert!(
-        formatted
-            .contains("WITH cte AS (\n    SELECT 1 AS n\n    FROM DUAL\n)\nSELECT *\nFROM cte;"),
+        formatted.contains(
+            "WITH cte AS (\n        SELECT 1 AS n\n        FROM DUAL\n    )\nSELECT *\nFROM cte;"
+        ),
         "WITH CTE block should increase depth and restore on main SELECT, got: {}",
         formatted
     );
@@ -6138,16 +6148,17 @@ fn format_sql_formats_multi_cte_join_subquery_depth_consistently() {
     let input = "WITH emp_base AS (SELECT e.empno, e.ename, e.deptno, e.sal, e.hiredate FROM emp e WHERE e.hiredate >= DATE '2010-01-01'), dept_agg AS (SELECT eb.deptno, COUNT(*) AS emp_cnt, AVG(eb.sal) AS avg_sal FROM emp_base eb GROUP BY eb.deptno) SELECT d.deptno, d.dname, d.loc, c.emp_cnt, c.avg_sal, (SELECT MAX(eb2.sal) FROM emp_base eb2 WHERE eb2.deptno = c.deptno) AS max_sal_in_dept FROM dept d JOIN dept_agg c ON c.deptno = d.deptno WHERE d.loc = 'SEOUL' AND c.emp_cnt > 3 ORDER BY c.avg_sal DESC;";
 
     let formatted = SqlEditorWidget::format_sql_basic(input);
-    let expected = r#"WITH emp_base AS (
-    SELECT
-        e.empno,
-        e.ename,
-        e.deptno,
-        e.sal,
-        e.hiredate
-    FROM emp e
-    WHERE e.hiredate >= DATE '2010-01-01'
-),
+    let expected = r#"WITH
+    emp_base AS (
+        SELECT
+            e.empno,
+            e.ename,
+            e.deptno,
+            e.sal,
+            e.hiredate
+        FROM emp e
+        WHERE e.hiredate >= DATE '2010-01-01'
+    ),
     dept_agg AS (
         SELECT
             eb.deptno,
@@ -6183,18 +6194,19 @@ fn format_sql_formats_multi_cte_with_comments_and_scalar_subquery_exactly() {
     let input = "WITH e AS (SELECT empno, ename, job, mgr, hiredate, sal, comm, deptno FROM oqt_t_emp), d AS (SELECT deptno, dname, loc FROM oqt_t_dept), stats AS (SELECT deptno, COUNT(*) cnt, AVG(sal) avg_sal, SUM(NVL(comm, 0)) sum_comm FROM e GROUP BY deptno) SELECT d.deptno, d.dname, d.loc, s.cnt, ROUND(s.avg_sal, 2) AS avg_sal, s.sum_comm, -- scalar subquery (correlated)\n(SELECT MAX(e2.sal) FROM e e2 WHERE e2.deptno = d.deptno) AS max_sal_in_dept, -- case + analytic in select list via scalar subquery\nCASE WHEN s.cnt = 0 THEN 'EMPTY' WHEN s.avg_sal >= 2500 THEN 'HIGH' ELSE 'NORMAL' END AS dept_grade FROM d LEFT JOIN stats s ON s.deptno = d.deptno ORDER BY d.deptno;";
 
     let formatted = SqlEditorWidget::format_sql_basic(input);
-    let expected = r#"WITH e AS (
-    SELECT
-        empno,
-        ename,
-        job,
-        mgr,
-        hiredate,
-        sal,
-        comm,
-        deptno
-    FROM oqt_t_emp
-),
+    let expected = r#"WITH
+    e AS (
+        SELECT
+            empno,
+            ename,
+            job,
+            mgr,
+            hiredate,
+            sal,
+            comm,
+            deptno
+        FROM oqt_t_emp
+    ),
     d AS (
         SELECT
             deptno,
@@ -6238,18 +6250,19 @@ ORDER BY d.deptno;"#;
 
 #[test]
 fn format_sql_cte_comment_layout_is_idempotent() {
-    let input = r#"WITH e AS (
-    SELECT
-        empno,
-        ename,
-        job,
-        mgr,
-        hiredate,
-        sal,
-        comm,
-        deptno
-    FROM oqt_t_emp
-),
+    let input = r#"WITH
+    e AS (
+        SELECT
+            empno,
+            ename,
+            job,
+            mgr,
+            hiredate,
+            sal,
+            comm,
+            deptno
+        FROM oqt_t_emp
+    ),
     d AS (
         SELECT
             deptno,
@@ -6324,10 +6337,10 @@ fn format_sql_filtered_cte_with_window_function_exact_layout() {
     FROM enriched
     WHERE
         (sal > (
-            SELECT AVG (sal)
-            FROM oqt_t_emp
-            WHERE deptno = enriched.deptno
-        ))
+                SELECT AVG (sal)
+                FROM oqt_t_emp
+                WHERE deptno = enriched.deptno
+            ))
         OR (job IN ('MANAGER', 'ANALYST')
             AND sal >= 2500)
 )
@@ -6358,14 +6371,14 @@ fn format_sql_window_functions_and_listagg_exact_layout() {
 
     let formatted = SqlEditorWidget::format_sql_basic(input);
     let expected = r#"WITH base AS (
-    SELECT
-        e.empno,
-        e.ename,
-        e.deptno,
-        e.sal,
-        e.hiredate
-    FROM oqt_t_emp e
-)
+        SELECT
+            e.empno,
+            e.ename,
+            e.deptno,
+            e.sal,
+            e.hiredate
+        FROM oqt_t_emp e
+    )
 SELECT
     b.*,
     RANK () OVER (
@@ -6610,13 +6623,13 @@ END;"#;
     let formatted = SqlEditorWidget::format_sql_basic(input);
     assert!(
         formatted.contains(
-            "v_sum := v_sum + (\n            CASE\n                WHEN MOD (i, 2) = 0 THEN"
+            "v_sum := v_sum + (\n                CASE\n                    WHEN MOD (i, 2) = 0 THEN"
         ),
         "CASE block inside parenthesized expression should be one depth deeper, got: {}",
         formatted
     );
     assert!(
-        formatted.contains("END\n        );"),
+        formatted.contains("END\n            );"),
         "CASE END and closing parenthesis should be split across lines and the pure close should return to the paren owner depth, got: {}",
         formatted
     );
@@ -6643,7 +6656,7 @@ END;"#;
 
     let formatted = SqlEditorWidget::format_sql_basic(input);
     assert!(
-        formatted.contains("END -- close case\n    );\n    v_next := 2;"),
+        formatted.contains("END -- close case\n        );\n    v_next := 2;"),
         "parenthesized CASE depth should be closed before the next statement, got: {formatted}"
     );
 }
@@ -6663,11 +6676,11 @@ END;"#;
 
     let formatted = SqlEditorWidget::format_sql_basic(input);
     assert!(
-        formatted.contains("v_num := ( -- keep this comment\n        CASE\n            WHEN 1 = 1 THEN"),
+        formatted.contains("v_num := ( -- keep this comment\n            CASE\n                WHEN 1 = 1 THEN"),
         "CASE block after parenthesis+comment should stay indented as expression depth, got: {formatted}"
     );
     assert!(
-        formatted.contains("END\n    );"),
+        formatted.contains("END\n        );"),
         "closing parenthesis should realign with the parenthesized expression owner depth, got: {formatted}"
     );
 }
@@ -6793,8 +6806,8 @@ END;"#;
     );
     assert_eq!(
         indent(lines[inner_close_idx]),
-        indent(lines[else_idx]),
-        "inner close-paren should return to the surrounding branch depth, got:\n{}",
+        indent(lines[else_idx]).saturating_add(4),
+        "inner close-paren should return to its parenthesized owner depth inside the branch, got:\n{}",
         formatted
     );
     assert_eq!(
@@ -6854,7 +6867,7 @@ END;"#;
     let formatted = SqlEditorWidget::format_sql_basic(input);
     let expected = r#"BEGIN
     IF (i = 2
-        AND b = 2) THEN
+            AND b = 2) THEN
         RAISE_APPLICATION_ERROR (-20002, 'forced nested error i=2 b=2');
     END IF;
 END;"#;
@@ -8871,8 +8884,8 @@ LEFT JOIN emp e
     );
     assert_eq!(
         indent(lines[close_idx]),
-        indent(lines[when_idx]),
-        "closing parenthesis should realign with the CASE WHEN owner line, got:\n{formatted}"
+        indent(lines[when_idx]).saturating_add(4),
+        "closing parenthesis should realign with the inline condition child's owner depth, got:\n{formatted}"
     );
 }
 
@@ -8974,8 +8987,8 @@ FROM dept_path;"#;
     );
     assert_eq!(
         indent(lines[cte_select_idx]),
-        8,
-        "CTE body SELECT should be one level deeper than the WITH header under CREATE VIEW, got:\n{}",
+        12,
+        "CTE body SELECT should traverse the WITH-child and parenthesized-query frame edges under CREATE VIEW, got:\n{}",
         formatted
     );
     assert_eq!(
@@ -9058,8 +9071,8 @@ FROM dept_path;"#;
     );
     assert_eq!(
         indent(lines[cte_select_idx]),
-        8,
-        "CTE body SELECT should be one level deeper than the WITH header under CTAS, got:\n{}",
+        12,
+        "CTE body SELECT should traverse the WITH-child and parenthesized-query frame edges under CTAS, got:\n{}",
         formatted
     );
     assert_eq!(
@@ -9238,8 +9251,8 @@ fn format_mariadb_test1_keeps_inline_over_body_and_on_duplicate_function_args_ne
     );
     assert_eq!(
         leading_spaces(lines[concat_close_idx]),
-        leading_spaces(lines[on_duplicate_idx]),
-        "CONCAT close line should realign with the ON DUPLICATE KEY UPDATE owner depth, got:\n{}",
+        leading_spaces(lines[on_duplicate_idx]).saturating_add(8),
+        "CONCAT close line should realign with the assignment-value owner depth inside the update list, got:\n{}",
         formatted
     );
     assert_eq!(

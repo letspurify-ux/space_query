@@ -31253,9 +31253,9 @@ WHEN MATCHED THEN UPDATE SET
         assert!(
             formatted.contains(
                 "SET trg.a = src.a -- comment
-    , trg.b = src.b;"
+        , trg.b = src.b;"
             ),
-            "line comment/comma after MERGE USING UPDATE SET should keep active list depth, got:
+            "line comment/comma after MERGE USING UPDATE SET should use the SET child depth, got:
 {}",
             formatted
         );
