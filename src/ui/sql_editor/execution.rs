@@ -2017,6 +2017,7 @@ impl SqlEditorWidget {
         let mut buffer = self.buffer.clone();
         let selection = buffer.selection_position();
         let preferred_db_type = Some(self.current_db_type());
+        let format_config = AppConfig::load();
         if let Some((start, end)) = selection {
             if start != end {
                 let buffer_len = buffer.length().max(0);
@@ -2033,8 +2034,12 @@ impl SqlEditorWidget {
                     start,
                     end,
                 );
-                let formatted =
-                    Self::format_for_auto_formatting_with_db_type(&source, true, preferred_db_type);
+                let formatted = Self::format_for_auto_formatting_with_config(
+                    &source,
+                    true,
+                    preferred_db_type,
+                    &format_config,
+                );
                 if formatted == source {
                     return;
                 }
@@ -2078,8 +2083,12 @@ impl SqlEditorWidget {
         }
 
         let full_text = buffer.text();
-        let formatted =
-            Self::format_for_auto_formatting_with_db_type(&full_text, false, preferred_db_type);
+        let formatted = Self::format_for_auto_formatting_with_config(
+            &full_text,
+            false,
+            preferred_db_type,
+            &format_config,
+        );
         if formatted == full_text {
             return;
         }

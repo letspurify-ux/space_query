@@ -24,6 +24,17 @@ pub const MAX_LAZY_FETCH_BATCH_SIZE: u32 = 10_000;
 pub const DEFAULT_CANCEL_TIMEOUT_SECONDS: u32 = 60;
 pub const MIN_CANCEL_TIMEOUT_SECONDS: u32 = 1;
 pub const MAX_CANCEL_TIMEOUT_SECONDS: u32 = 120;
+pub const DEFAULT_SQL_FORMAT_RIGHT_MARGIN: u32 = 120;
+pub const MIN_SQL_FORMAT_RIGHT_MARGIN: u32 = 60;
+pub const MAX_SQL_FORMAT_RIGHT_MARGIN: u32 = 300;
+
+#[derive(Debug, Serialize, Deserialize, Clone, Copy, Default, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum SqlCommaListLayout {
+    #[default]
+    Stacked,
+    Wrapped,
+}
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 #[serde(default)]
@@ -42,6 +53,8 @@ pub struct AppConfig {
     pub auto_commit: bool,
     pub connection_pool_size: u32,
     pub cancel_timeout_seconds: u32,
+    pub sql_comma_list_layout: SqlCommaListLayout,
+    pub sql_format_right_margin: u32,
 }
 
 impl AppConfig {
@@ -77,6 +90,8 @@ impl AppConfig {
             auto_commit: false,
             connection_pool_size: DEFAULT_CONNECTION_POOL_SIZE,
             cancel_timeout_seconds: DEFAULT_CANCEL_TIMEOUT_SECONDS,
+            sql_comma_list_layout: SqlCommaListLayout::Stacked,
+            sql_format_right_margin: DEFAULT_SQL_FORMAT_RIGHT_MARGIN,
         }
     }
 
@@ -102,6 +117,14 @@ impl AppConfig {
 
     pub fn normalized_cancel_timeout_seconds(&self) -> u32 {
         Self::clamp_cancel_timeout_seconds(self.cancel_timeout_seconds)
+    }
+
+    pub fn clamp_sql_format_right_margin(margin: u32) -> u32 {
+        margin.clamp(MIN_SQL_FORMAT_RIGHT_MARGIN, MAX_SQL_FORMAT_RIGHT_MARGIN)
+    }
+
+    pub fn normalized_sql_format_right_margin(&self) -> u32 {
+        Self::clamp_sql_format_right_margin(self.sql_format_right_margin)
     }
 
     pub fn config_path() -> Option<PathBuf> {
@@ -471,6 +494,38 @@ mod tests {
     }
 
     #[test]
+    fn app_config_defaults_sql_comma_lists_to_stacked_with_120_column_margin() {
+        let config = AppConfig::new();
+
+        assert_eq!(
+            config.sql_comma_list_layout,
+            super::SqlCommaListLayout::Stacked
+        );
+        assert_eq!(
+            config.sql_format_right_margin,
+            super::DEFAULT_SQL_FORMAT_RIGHT_MARGIN
+        );
+    }
+
+    #[test]
+    fn app_config_round_trips_wrapped_sql_comma_list_layout() {
+        let mut config = AppConfig::new();
+        config.sql_comma_list_layout = super::SqlCommaListLayout::Wrapped;
+        config.sql_format_right_margin = 140;
+
+        let serialized = serde_json::to_string(&config).expect("config should serialize");
+        let restored: AppConfig =
+            serde_json::from_str(&serialized).expect("config should deserialize");
+
+        assert!(serialized.contains("\"sql_comma_list_layout\":\"wrapped\""));
+        assert_eq!(
+            restored.sql_comma_list_layout,
+            super::SqlCommaListLayout::Wrapped
+        );
+        assert_eq!(restored.sql_format_right_margin, 140);
+    }
+
+    #[test]
     fn app_config_clamps_connection_pool_size_to_supported_range() {
         assert_eq!(AppConfig::clamp_connection_pool_size(0), 1);
         assert_eq!(AppConfig::clamp_connection_pool_size(4), 4);
@@ -489,6 +544,13 @@ mod tests {
         assert_eq!(AppConfig::clamp_cancel_timeout_seconds(0), 1);
         assert_eq!(AppConfig::clamp_cancel_timeout_seconds(30), 30);
         assert_eq!(AppConfig::clamp_cancel_timeout_seconds(999), 120);
+    }
+
+    #[test]
+    fn app_config_clamps_sql_format_right_margin_to_supported_range() {
+        assert_eq!(AppConfig::clamp_sql_format_right_margin(0), 60);
+        assert_eq!(AppConfig::clamp_sql_format_right_margin(120), 120);
+        assert_eq!(AppConfig::clamp_sql_format_right_margin(999), 300);
     }
 
     #[test]
@@ -520,6 +582,14 @@ mod tests {
         assert_eq!(
             restored.cancel_timeout_seconds,
             super::DEFAULT_CANCEL_TIMEOUT_SECONDS
+        );
+        assert_eq!(
+            restored.sql_comma_list_layout,
+            super::SqlCommaListLayout::Stacked
+        );
+        assert_eq!(
+            restored.sql_format_right_margin,
+            super::DEFAULT_SQL_FORMAT_RIGHT_MARGIN
         );
     }
 

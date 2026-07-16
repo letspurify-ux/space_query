@@ -76,7 +76,7 @@ Never derive structural depth from:
 
 ## 4. Sibling frames keep the first child inline
 
-For list and condition frames:
+The default `Stacked` layout for list and condition frames is:
 
 - the first direct child remains on the owner line;
 - the second and later children start new lines at the frame depth;
@@ -98,6 +98,34 @@ operator advances only its innermost owning frame.
 
 A later separator must not retrospectively move or partially rewrite the first
 child.
+
+The `Wrapped` comma-list preference changes only eligible comma separators in
+ordinary lists. The formatter keeps the next child inline when its canonical
+single-line width fits the configured right margin; otherwise that child starts
+a new line at the same frame depth. Structural separators, CTE siblings,
+multiline children, comments, and dedicated `CREATE TABLE` column/partition
+layouts keep their required line breaks in both modes.
+
+### 4.1 Comma-list preferences
+
+The Preferences dialog exposes these settings under `SQL Formatting`:
+
+| Setting | Values | Default | Contract |
+| --- | --- | --- | --- |
+| `Comma Lists` | `Stacked`, `Wrapped` | `Stacked` | `Stacked` always breaks before the second and later eligible children. `Wrapped` keeps adding children while they fit the right margin. |
+| `Right Margin` | `60` through `300` columns | `120` | Used only by `Wrapped`. It is a comma-break target, not a hard text-splitting boundary. |
+
+The right-margin calculation includes the existing line prefix, indentation,
+comma, following space, and the next child's inline width. A child that cannot
+be split safely may exceed the margin. Changing the editor window width does
+not change formatting output.
+
+The comma-list preference applies to ordinary `SELECT`, `FROM`, `SET`,
+`VALUES`, `GROUP BY`, `ORDER BY`, `WINDOW`, `INTO`, `USING`, `RETURNING`, and
+direct parenthesized lists such as function arguments, `IN (...)`, insert
+columns, and row values. It does not override grammar-required line breaks,
+CTE separators, comments, multiline `CASE` or subqueries, trigger/grant syntax,
+or dedicated `CREATE TABLE` column and partition formatting.
 
 ## 5. Structural body boundaries are separate frames
 

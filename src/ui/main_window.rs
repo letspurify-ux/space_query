@@ -8096,6 +8096,8 @@ impl MainWindow {
                             config.lazy_fetch_batch_size = settings.lazy_fetch_batch_size;
                             config.connection_pool_size = settings.connection_pool_size;
                             config.cancel_timeout_seconds = settings.cancel_timeout_seconds;
+                            config.sql_comma_list_layout = settings.sql_comma_list_layout;
+                            config.sql_format_right_margin = settings.sql_format_right_margin;
                             config.save()
                         };
                         if pool_size_changed {

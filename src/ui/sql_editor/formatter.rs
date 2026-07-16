@@ -15,6 +15,9 @@ use crate::ui::sql_depth::{
 };
 #[cfg(test)]
 use crate::utils::arithmetic::safe_div;
+use crate::utils::{AppConfig, SqlCommaListLayout, DEFAULT_SQL_FORMAT_RIGHT_MARGIN};
+#[cfg(test)]
+use crate::utils::{MAX_SQL_FORMAT_RIGHT_MARGIN, MIN_SQL_FORMAT_RIGHT_MARGIN};
 use std::borrow::Cow;
 use std::cell::Cell;
 use std::collections::VecDeque;
@@ -23,6 +26,41 @@ use super::query_text;
 use super::SqlEditorWidget;
 use super::SqlToken;
 use super::SqlTokenSpan;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct SqlFormatOptions {
+    comma_list_layout: SqlCommaListLayout,
+    right_margin: usize,
+}
+
+impl SqlFormatOptions {
+    fn from_config(config: &AppConfig) -> Self {
+        Self {
+            comma_list_layout: config.sql_comma_list_layout,
+            right_margin: config.normalized_sql_format_right_margin() as usize,
+        }
+    }
+
+    #[cfg(test)]
+    fn wrapped(right_margin: usize) -> Self {
+        Self {
+            comma_list_layout: SqlCommaListLayout::Wrapped,
+            right_margin: right_margin.clamp(
+                MIN_SQL_FORMAT_RIGHT_MARGIN as usize,
+                MAX_SQL_FORMAT_RIGHT_MARGIN as usize,
+            ),
+        }
+    }
+}
+
+impl Default for SqlFormatOptions {
+    fn default() -> Self {
+        Self {
+            comma_list_layout: SqlCommaListLayout::Stacked,
+            right_margin: DEFAULT_SQL_FORMAT_RIGHT_MARGIN as usize,
+        }
+    }
+}
 
 struct MeaningfulTokenLinks {
     prev: Vec<Option<usize>>,
@@ -2109,6 +2147,23 @@ pub(super) enum ListOwnerKind {
 }
 
 impl ListOwnerKind {
+    fn supports_wrapped_comma_layout(self) -> bool {
+        matches!(
+            self,
+            Self::Select
+                | Self::From
+                | Self::Set
+                | Self::Values
+                | Self::Group
+                | Self::Order
+                | Self::Window
+                | Self::Into
+                | Self::Using
+                | Self::Returning
+                | Self::StructuredTableArguments
+        )
+    }
+
     #[cfg(test)]
     pub(super) const ALL: &'static [Self] = &[
         Self::Select,
@@ -7556,6 +7611,111 @@ impl SqlEditorWidget {
         crate::sql_text::line_ends_with_semicolon_before_inline_comment(line)
     }
 
+    fn wrapped_comma_next_item_width(tokens: &[SqlToken], start_idx: usize) -> Option<usize> {
+        let mut width = 0usize;
+        let mut saw_token = false;
+        let mut paren_depth = 0usize;
+        let mut bracket_depth = 0usize;
+        let mut previous: Option<&SqlToken> = None;
+
+        for (idx, token) in tokens.iter().enumerate().skip(start_idx) {
+            let at_item_depth = paren_depth == 0 && bracket_depth == 0;
+            if at_item_depth {
+                if matches!(token, SqlToken::Symbol(symbol) if matches!(symbol.as_str(), "," | ")" | "]" | ";"))
+                {
+                    break;
+                }
+                if idx > start_idx
+                    && matches!(token, SqlToken::Word(word)
+                        if FORMAT_CLAUSE_KEYWORDS
+                            .iter()
+                            .any(|keyword| word.eq_ignore_ascii_case(keyword)))
+                {
+                    break;
+                }
+            }
+
+            match token {
+                SqlToken::Comment(_) => return None,
+                SqlToken::String(literal) if literal.contains('\n') => return None,
+                SqlToken::Word(word)
+                    if word.eq_ignore_ascii_case("CASE")
+                        || word.eq_ignore_ascii_case("OVER")
+                        || word.eq_ignore_ascii_case("KEEP")
+                        || crate::sql_text::is_subquery_head_keyword(word) =>
+                {
+                    return None;
+                }
+                _ => {}
+            }
+
+            let needs_space = previous.is_some_and(|previous| {
+                let previous_suppresses_space = matches!(
+                    previous,
+                    SqlToken::Symbol(symbol)
+                        if matches!(symbol.as_str(), "(" | "[" | "." | ":" | "%")
+                );
+                let current_suppresses_space = matches!(
+                    token,
+                    SqlToken::Symbol(symbol)
+                        if matches!(symbol.as_str(), ")" | "]" | "," | ";" | ".")
+                );
+                !previous_suppresses_space && !current_suppresses_space
+            });
+            if needs_space {
+                width = width.saturating_add(1);
+            }
+            width = width.saturating_add(match token {
+                SqlToken::Word(word) | SqlToken::String(word) | SqlToken::Symbol(word) => {
+                    word.chars().count()
+                }
+                SqlToken::Comment(_) => return None,
+            });
+            saw_token = true;
+            previous = Some(token);
+
+            match token {
+                SqlToken::Symbol(symbol) if symbol == "(" => {
+                    paren_depth = paren_depth.saturating_add(1);
+                }
+                SqlToken::Symbol(symbol) if symbol == ")" => {
+                    paren_depth = paren_depth.saturating_sub(1);
+                }
+                SqlToken::Symbol(symbol) if symbol == "[" => {
+                    bracket_depth = bracket_depth.saturating_add(1);
+                }
+                SqlToken::Symbol(symbol) if symbol == "]" => {
+                    bracket_depth = bracket_depth.saturating_sub(1);
+                }
+                _ => {}
+            }
+        }
+
+        saw_token.then_some(width)
+    }
+
+    fn wrapped_comma_fits_current_line(
+        out: &str,
+        tokens: &[SqlToken],
+        next_item_idx: Option<usize>,
+        right_margin: usize,
+    ) -> bool {
+        let Some(next_item_width) =
+            next_item_idx.and_then(|idx| Self::wrapped_comma_next_item_width(tokens, idx))
+        else {
+            return false;
+        };
+        let current_width = out
+            .rsplit_once('\n')
+            .map_or(out, |(_, current_line)| current_line)
+            .chars()
+            .count();
+        current_width
+            .saturating_add(1)
+            .saturating_add(next_item_width)
+            <= right_margin
+    }
+
     fn resolve_format_preferred_db_type(
         source: &str,
         preferred_db_type: Option<DatabaseType>,
@@ -7581,6 +7741,34 @@ impl SqlEditorWidget {
         selected_only: bool,
         preferred_db_type: Option<DatabaseType>,
     ) -> String {
+        Self::format_for_auto_formatting_with_options(
+            source,
+            selected_only,
+            preferred_db_type,
+            SqlFormatOptions::default(),
+        )
+    }
+
+    pub(super) fn format_for_auto_formatting_with_config(
+        source: &str,
+        selected_only: bool,
+        preferred_db_type: Option<DatabaseType>,
+        config: &AppConfig,
+    ) -> String {
+        Self::format_for_auto_formatting_with_options(
+            source,
+            selected_only,
+            preferred_db_type,
+            SqlFormatOptions::from_config(config),
+        )
+    }
+
+    fn format_for_auto_formatting_with_options(
+        source: &str,
+        selected_only: bool,
+        preferred_db_type: Option<DatabaseType>,
+        options: SqlFormatOptions,
+    ) -> String {
         let preferred_db_type = Self::resolve_format_preferred_db_type(source, preferred_db_type);
         let items = Self::normalize_format_items(
             super::query_text::split_format_items_for_db_type(source, preferred_db_type),
@@ -7592,6 +7780,7 @@ impl SqlEditorWidget {
             &items,
             append_missing_terminator,
             preferred_db_type,
+            options,
         );
 
         if preserve_missing_selection_terminator {
@@ -7610,8 +7799,12 @@ impl SqlEditorWidget {
         let items = Self::normalize_format_items(
             super::query_text::split_format_items_for_db_type(source, preferred_db_type),
         );
-        let result =
-            Self::format_sql_basic_core_from_normalized_items(&items, true, preferred_db_type);
+        let result = Self::format_sql_basic_core_from_normalized_items(
+            &items,
+            true,
+            preferred_db_type,
+            SqlFormatOptions::default(),
+        );
         (result.formatted, result.frame_alignment_audit)
     }
 
@@ -8607,6 +8800,7 @@ impl SqlEditorWidget {
             &normalized_items,
             append_missing_terminator,
             preferred_db_type,
+            SqlFormatOptions::default(),
         )
     }
 
@@ -8614,11 +8808,13 @@ impl SqlEditorWidget {
         items: &[FormatItem],
         append_missing_terminator: bool,
         preferred_db_type: Option<DatabaseType>,
+        options: SqlFormatOptions,
     ) -> String {
         Self::format_sql_basic_core_from_normalized_items(
             items,
             append_missing_terminator,
             preferred_db_type,
+            options,
         )
         .formatted
     }
@@ -8627,6 +8823,7 @@ impl SqlEditorWidget {
         items: &[FormatItem],
         append_missing_terminator: bool,
         preferred_db_type: Option<DatabaseType>,
+        options: SqlFormatOptions,
     ) -> FormatterDocumentRenderResult {
         let estimated_input_len: usize = items
             .iter()
@@ -8676,7 +8873,13 @@ impl SqlEditorWidget {
                         "format_statement",
                         statement.len(),
                         mysql_profile,
-                        || Self::format_statement(&statement_input, select_list_break_state),
+                        || {
+                            Self::format_statement(
+                                &statement_input,
+                                select_list_break_state,
+                                options,
+                            )
+                        },
                     );
                     let mut formatted_statement = formatted_result.formatted;
                     let has_code = formatted_result.has_code;
@@ -11003,6 +11206,7 @@ impl SqlEditorWidget {
     fn format_statement(
         input: &FormatterStatementInput<'_>,
         select_list_break_state_on_start: SelectListBreakState,
+        options: SqlFormatOptions,
     ) -> FormatterStatementRenderResult {
         let statement = input.statement;
         let tokens = input.tokens.as_slice();
@@ -16718,7 +16922,62 @@ impl SqlEditorWidget {
                                         Some(SqlToken::Comment(comment))
                                             if comment.trim_start().starts_with("--")
                                     );
-                            if comma_follows_set_comment {
+                            let wrapped_context_is_supported = active_list_owner_kind
+                                .is_some_and(ListOwnerKind::supports_wrapped_comma_layout)
+                                || format_stack.last_paren_stack_frame().is_some_and(|frame| {
+                                    frame.direct_list_body && !frame.frame.is_query_like()
+                                });
+                            let comma_touches_comment =
+                                matches!(immediate_prev_token, Some(SqlToken::Comment(_)))
+                                    || matches!(immediate_next_token, Some(SqlToken::Comment(_)));
+                            let follows_multiline_child_close =
+                                format_stack.last_paren().is_some_and(|frame| {
+                                    frame.has_pending_multiline_child_continuation()
+                                });
+                            let previous_item_ends_case = loop_previous_non_comment_token
+                                .is_some_and(|token| {
+                                    matches!(
+                                        token,
+                                        SqlToken::Word(word) if word.eq_ignore_ascii_case("END")
+                                    )
+                                });
+                            let current_line_trimmed = out
+                                .rsplit_once('\n')
+                                .map_or(out.as_str(), |(_, current_line)| current_line)
+                                .trim_start();
+                            let current_line_starts_structural_close = current_line_trimmed
+                                .starts_with(')')
+                                || current_line_trimmed
+                                    .split_ascii_whitespace()
+                                    .next()
+                                    .is_some_and(|word| {
+                                        word.trim_end_matches(',').eq_ignore_ascii_case("END")
+                                    });
+                            let wrapped_comma_stays_inline = options.comma_list_layout
+                                == SqlCommaListLayout::Wrapped
+                                && wrapped_context_is_supported
+                                && !is_with_cte_separator
+                                && search_cycle_cte_separator_indent.is_none()
+                                && !mysql_handler_condition_separator
+                                && !comma_touches_comment
+                                && !follows_multiline_child_close
+                                && !previous_item_ends_case
+                                && !current_line_starts_structural_close
+                                && current_token_paren_depth >= line_start_token_paren_depth
+                                && !line_closes_delimiter_frame_below_start
+                                && !format_stack.execute_immediate_is_active()
+                                && !construct_flag_active!(GrantRevokeActive)
+                                && !format_stack.trigger_header_is_active()
+                                && Self::wrapped_comma_fits_current_line(
+                                    &out,
+                                    tokens,
+                                    next_non_comment_idx,
+                                    options.right_margin,
+                                );
+                            if wrapped_comma_stays_inline {
+                                out.push(' ');
+                                needs_space = false;
+                            } else if comma_follows_set_comment {
                                 needs_space = true;
                             } else if let Some(cte_indent) = search_cycle_cte_separator_indent {
                                 deactivate_construct_flag!(SearchCycleClauseActive);
@@ -16776,10 +17035,6 @@ impl SqlEditorWidget {
                                     );
                                 }
                             } else {
-                                let follows_multiline_child_close =
-                                    format_stack.last_paren().is_some_and(|frame| {
-                                        frame.has_pending_multiline_child_continuation()
-                                    });
                                 let active_phase1_wrapped_owner_kind =
                                     Self::active_phase1_wrapped_owner_kind_at_depth(
                                         &format_stack,
@@ -20579,6 +20834,214 @@ mod inline_statement_separator_tests {
             SqlEditorWidget::split_inline_statement_separators_for_test("SELECT 1; SELECT 2;"),
             "SELECT 1;\n SELECT 2;"
         );
+    }
+}
+
+#[cfg(test)]
+mod comma_list_layout_tests {
+    use super::{SqlEditorWidget, SqlFormatOptions};
+    use crate::db::DatabaseType;
+    use crate::utils::{AppConfig, SqlCommaListLayout};
+
+    fn format_wrapped(source: &str, right_margin: usize) -> String {
+        format_wrapped_for(source, right_margin, DatabaseType::Oracle)
+    }
+
+    fn format_wrapped_for(source: &str, right_margin: usize, db_type: DatabaseType) -> String {
+        SqlEditorWidget::format_for_auto_formatting_with_options(
+            source,
+            false,
+            Some(db_type),
+            SqlFormatOptions::wrapped(right_margin),
+        )
+    }
+
+    #[test]
+    fn stacked_default_keeps_existing_comma_list_layout() {
+        let formatted = SqlEditorWidget::format_for_auto_formatting_with_db_type(
+            "select id, name, created_at from employee;",
+            false,
+            Some(DatabaseType::Oracle),
+        );
+
+        assert!(
+            formatted.contains("SELECT id,\n    NAME,\n    created_at"),
+            "{formatted}"
+        );
+    }
+
+    #[test]
+    fn formatter_config_path_applies_wrapped_layout() {
+        let mut config = AppConfig::new();
+        config.sql_comma_list_layout = SqlCommaListLayout::Wrapped;
+        config.sql_format_right_margin = 120;
+
+        let formatted = SqlEditorWidget::format_for_auto_formatting_with_config(
+            "select id, employee_name, created_at from employee;",
+            false,
+            Some(DatabaseType::Oracle),
+            &config,
+        );
+
+        assert!(
+            formatted.contains("SELECT id, employee_name, created_at"),
+            "{formatted}"
+        );
+    }
+
+    #[test]
+    fn wrapped_keeps_short_select_and_in_lists_inline() {
+        let formatted = format_wrapped(
+            "select id, name, created_at from employee where status in ('READY', 'RUNNING', 'DONE');",
+            120,
+        );
+
+        assert!(
+            formatted.contains("SELECT id, NAME, created_at"),
+            "{formatted}"
+        );
+        assert!(
+            formatted.contains("IN ('READY', 'RUNNING', 'DONE')"),
+            "{formatted}"
+        );
+    }
+
+    #[test]
+    fn wrapped_keeps_short_from_group_and_order_lists_inline() {
+        let formatted = format_wrapped(
+            "select e.department_id, e.status, count(*) from employee e, department d where e.department_id = d.department_id group by e.department_id, e.status order by e.department_id, e.status;",
+            120,
+        );
+
+        assert!(
+            formatted.contains("FROM employee e, department d"),
+            "{formatted}"
+        );
+        assert!(
+            formatted.contains("GROUP BY e.department_id, e.status"),
+            "{formatted}"
+        );
+        assert!(
+            formatted.contains("ORDER BY e.department_id, e.status"),
+            "{formatted}"
+        );
+    }
+
+    #[test]
+    fn wrapped_breaks_before_the_next_item_when_margin_would_be_exceeded() {
+        let formatted = format_wrapped(
+            "select customer_transaction_identifier, customer_transaction_status, customer_transaction_created_at from customer_transaction;",
+            60,
+        );
+
+        assert!(
+            formatted.contains(
+                "SELECT customer_transaction_identifier,\n    customer_transaction_status,\n    customer_transaction_created_at"
+            ),
+            "{formatted}"
+        );
+    }
+
+    #[test]
+    fn wrapped_measures_nested_function_arguments_as_one_outer_item() {
+        let formatted = format_wrapped(
+            "select calculate_total(order_id, customer_id, order_date), created_at from orders;",
+            120,
+        );
+
+        assert!(
+            formatted.contains("order_id, customer_id, order_date"),
+            "{formatted}"
+        );
+        assert!(formatted.contains("), created_at"), "{formatted}");
+    }
+
+    #[test]
+    fn wrapped_keeps_short_insert_columns_and_values_inline() {
+        let formatted = format_wrapped(
+            "insert into employee (id, employee_name, created_at) values (1, 'Alice', sysdate);",
+            120,
+        );
+
+        assert!(
+            formatted.contains("employee (id, employee_name, created_at)"),
+            "{formatted}"
+        );
+        assert!(
+            formatted.contains("VALUES (1, 'Alice', SYSDATE)"),
+            "{formatted}"
+        );
+    }
+
+    #[test]
+    fn wrapped_keeps_case_and_comment_boundaries_multiline() {
+        let case_formatted = format_wrapped(
+            "select case when flag = 1 then value_a else value_b end as selected_value, id from employee;",
+            120,
+        );
+        let comment_formatted = format_wrapped(
+            "select id, -- keep name\nname, created_at from employee;",
+            120,
+        );
+
+        assert!(
+            case_formatted.contains("END AS selected_value,\n    id"),
+            "{case_formatted}"
+        );
+        assert!(
+            comment_formatted.contains("-- keep name\n    NAME,"),
+            "{comment_formatted}"
+        );
+    }
+
+    #[test]
+    fn wrapped_short_lists_work_for_mysql_and_mariadb() {
+        for db_type in [DatabaseType::MySQL, DatabaseType::MariaDB] {
+            let formatted = format_wrapped_for(
+                "select id, json_object('a', a, 'b', b), created_at from employee;",
+                120,
+                db_type,
+            );
+
+            assert!(formatted.contains("SELECT id, JSON_OBJECT("), "{formatted}");
+            assert!(formatted.contains("), created_at"), "{formatted}");
+            assert_eq!(
+                format_wrapped_for(&formatted, 120, db_type),
+                formatted,
+                "{db_type:?} wrapped output must be idempotent"
+            );
+        }
+    }
+
+    #[test]
+    fn wrapped_keeps_structural_subquery_and_cte_boundaries_multiline() {
+        let source = "with first_cte as (select id from employee), second_cte as (select id from first_cte) select (select max(id) from second_cte) as max_id, id from second_cte;";
+        let formatted = format_wrapped(source, 120);
+
+        assert!(formatted.contains("),\n    second_cte AS ("), "{formatted}");
+        assert!(formatted.contains(") AS max_id,\n    id"), "{formatted}");
+    }
+
+    #[test]
+    fn wrapped_does_not_change_create_table_tabular_layout() {
+        let source = "create table employee (id number primary key, employee_name varchar2(100) not null, created_at date default sysdate);";
+        let stacked = SqlEditorWidget::format_for_auto_formatting_with_db_type(
+            source,
+            false,
+            Some(DatabaseType::Oracle),
+        );
+        let wrapped = format_wrapped(source, 120);
+
+        assert_eq!(wrapped, stacked);
+        assert!(wrapped.contains("CREATE TABLE employee (\n    id"));
+    }
+
+    #[test]
+    fn wrapped_layout_is_idempotent() {
+        let source = "select id, calculate_total(order_id, customer_id, order_date), created_at from orders where status in ('READY', 'RUNNING', 'DONE');";
+        let formatted = format_wrapped(source, 80);
+
+        assert_eq!(format_wrapped(&formatted, 80), formatted);
     }
 }
 

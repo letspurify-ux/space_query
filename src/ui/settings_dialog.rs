@@ -6,6 +6,7 @@ use fltk::{
     frame::Frame,
     group::{Flex, FlexType, Group, Tabs},
     input::{Input, IntInput},
+    menu::Choice,
     prelude::*,
     window::Window,
 };
@@ -18,8 +19,9 @@ fn fold_for_case_insensitive(value: &str) -> String {
 use crate::ui::constants::*;
 use crate::ui::{available_font_names, center_on_main, theme};
 use crate::utils::{
-    AppConfig, MAX_CANCEL_TIMEOUT_SECONDS, MAX_CONNECTION_POOL_SIZE, MAX_LAZY_FETCH_BATCH_SIZE,
-    MIN_CANCEL_TIMEOUT_SECONDS, MIN_CONNECTION_POOL_SIZE, MIN_LAZY_FETCH_BATCH_SIZE,
+    AppConfig, SqlCommaListLayout, MAX_CANCEL_TIMEOUT_SECONDS, MAX_CONNECTION_POOL_SIZE,
+    MAX_LAZY_FETCH_BATCH_SIZE, MAX_SQL_FORMAT_RIGHT_MARGIN, MIN_CANCEL_TIMEOUT_SECONDS,
+    MIN_CONNECTION_POOL_SIZE, MIN_LAZY_FETCH_BATCH_SIZE, MIN_SQL_FORMAT_RIGHT_MARGIN,
 };
 
 pub struct FontSettings {
@@ -31,6 +33,8 @@ pub struct FontSettings {
     pub lazy_fetch_batch_size: u32,
     pub connection_pool_size: u32,
     pub cancel_timeout_seconds: u32,
+    pub sql_comma_list_layout: SqlCommaListLayout,
+    pub sql_format_right_margin: u32,
 }
 
 fn validate_size(label: &str, value: &str) -> Option<u32> {
@@ -115,6 +119,23 @@ fn validate_cancel_timeout_seconds(value: &str) -> Option<u32> {
             crate::ui::alert_on_main(&format!(
                 "Cancel timeout must be a number between {} and {} seconds.",
                 MIN_CANCEL_TIMEOUT_SECONDS, MAX_CANCEL_TIMEOUT_SECONDS
+            ));
+            None
+        }
+    }
+}
+
+fn validate_sql_format_right_margin(value: &str) -> Option<u32> {
+    match value.trim().parse::<u32>() {
+        Ok(margin)
+            if (MIN_SQL_FORMAT_RIGHT_MARGIN..=MAX_SQL_FORMAT_RIGHT_MARGIN).contains(&margin) =>
+        {
+            Some(margin)
+        }
+        _ => {
+            crate::ui::alert_on_main(&format!(
+                "SQL format right margin must be a number between {} and {}.",
+                MIN_SQL_FORMAT_RIGHT_MARGIN, MAX_SQL_FORMAT_RIGHT_MARGIN
             ));
             None
         }
@@ -423,6 +444,68 @@ pub fn show_settings_dialog(config: &AppConfig) -> Option<FontSettings> {
     connection_group.resizable(&connection_flex);
     connection_group.end();
 
+    let mut formatting_group = Group::new(content_x, tab_body_y, content_w, tab_body_h, None);
+    formatting_group.set_label("SQL Formatting");
+    formatting_group.set_color(theme::panel_bg());
+    formatting_group.set_label_color(theme::text_secondary());
+    formatting_group.begin();
+
+    let mut formatting_flex = Flex::new(
+        content_x + DIALOG_MARGIN,
+        tab_body_y + DIALOG_MARGIN,
+        content_w - DIALOG_MARGIN * 2,
+        tab_body_h - DIALOG_MARGIN * 2,
+        None,
+    );
+    formatting_flex.set_type(FlexType::Column);
+    formatting_flex.set_spacing(DIALOG_SPACING);
+
+    let mut comma_layout_row = Flex::default().with_size(0, INPUT_ROW_HEIGHT);
+    comma_layout_row.set_type(FlexType::Row);
+    comma_layout_row.set_spacing(DIALOG_SPACING);
+    let mut comma_layout_label = Frame::default().with_label("Comma Lists:");
+    comma_layout_label.set_label_color(theme::text_primary());
+    comma_layout_row.fixed(&comma_layout_label, FORM_LABEL_WIDTH);
+    let mut comma_layout_choice = Choice::default();
+    comma_layout_choice.add_choice("Stacked|Wrapped");
+    comma_layout_choice.set_value(match config.sql_comma_list_layout {
+        SqlCommaListLayout::Stacked => 0,
+        SqlCommaListLayout::Wrapped => 1,
+    });
+    comma_layout_choice.set_color(theme::input_bg());
+    comma_layout_choice.set_text_color(theme::text_primary());
+    comma_layout_row.end();
+    formatting_flex.fixed(&comma_layout_row, INPUT_ROW_HEIGHT);
+
+    let mut right_margin_row = Flex::default().with_size(0, INPUT_ROW_HEIGHT);
+    right_margin_row.set_type(FlexType::Row);
+    right_margin_row.set_spacing(DIALOG_SPACING);
+    let mut right_margin_label = Frame::default().with_label("Right Margin:");
+    right_margin_label.set_label_color(theme::text_primary());
+    right_margin_row.fixed(&right_margin_label, FORM_LABEL_WIDTH);
+    let mut right_margin_input = IntInput::default();
+    right_margin_input.set_value(&config.normalized_sql_format_right_margin().to_string());
+    right_margin_input.set_color(theme::input_bg());
+    right_margin_input.set_text_color(theme::text_primary());
+    if config.sql_comma_list_layout == SqlCommaListLayout::Stacked {
+        right_margin_input.deactivate();
+    }
+    right_margin_row.end();
+    formatting_flex.fixed(&right_margin_row, INPUT_ROW_HEIGHT);
+
+    let mut formatting_hint = Frame::default().with_label(&format!(
+        "Wrapped margin: {} ~ {} columns",
+        MIN_SQL_FORMAT_RIGHT_MARGIN, MAX_SQL_FORMAT_RIGHT_MARGIN
+    ));
+    formatting_hint.set_label_color(theme::text_secondary());
+    formatting_flex.fixed(&formatting_hint, LABEL_ROW_HEIGHT);
+
+    let formatting_filler = Frame::default();
+    formatting_flex.resizable(&formatting_filler);
+    formatting_flex.end();
+    formatting_group.resizable(&formatting_flex);
+    formatting_group.end();
+
     tabs.end();
 
     let mut button_row = Flex::new(
@@ -510,6 +593,15 @@ pub fn show_settings_dialog(config: &AppConfig) -> Option<FontSettings> {
         }
     });
 
+    let mut right_margin_input_for_layout = right_margin_input.clone();
+    comma_layout_choice.set_callback(move |choice| {
+        if choice.value() == 1 {
+            right_margin_input_for_layout.activate();
+        } else {
+            right_margin_input_for_layout.deactivate();
+        }
+    });
+
     let result = Arc::new(Mutex::new(None::<FontSettings>));
     let result_for_ok = result.clone();
     let mut dialog_handle = dialog.clone();
@@ -520,6 +612,8 @@ pub fn show_settings_dialog(config: &AppConfig) -> Option<FontSettings> {
     let lazy_fetch_batch_input_ok = lazy_fetch_batch_input.clone();
     let pool_size_input_ok = pool_size_input.clone();
     let cancel_timeout_input_ok = cancel_timeout_input.clone();
+    let comma_layout_choice_ok = comma_layout_choice.clone();
+    let right_margin_input_ok = right_margin_input.clone();
     let selected_font_ok = selected_font.clone();
     ok_btn.set_callback(move |_| {
         let ui_size = match validate_ui_size(&global_size_input_ok.value()) {
@@ -554,6 +648,16 @@ pub fn show_settings_dialog(config: &AppConfig) -> Option<FontSettings> {
                 Some(seconds) => seconds,
                 None => return,
             };
+        let sql_comma_list_layout = if comma_layout_choice_ok.value() == 1 {
+            SqlCommaListLayout::Wrapped
+        } else {
+            SqlCommaListLayout::Stacked
+        };
+        let sql_format_right_margin =
+            match validate_sql_format_right_margin(&right_margin_input_ok.value()) {
+                Some(margin) => margin,
+                None => return,
+            };
         let font = selected_font_ok
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -574,6 +678,8 @@ pub fn show_settings_dialog(config: &AppConfig) -> Option<FontSettings> {
             lazy_fetch_batch_size,
             connection_pool_size,
             cancel_timeout_seconds,
+            sql_comma_list_layout,
+            sql_format_right_margin,
         });
         dialog_handle.hide();
         app::awake();

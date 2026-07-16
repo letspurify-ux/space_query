@@ -52,7 +52,31 @@ jobs:
           done
           cargo install cargo-about --locked --version 0.9.0 --features cli
           cargo about generate --locked about.hbs -o generated-third-party-dependencies.md
-          cmp THIRD_PARTY_DEPENDENCIES.md generated-third-party-dependencies.md
+          # cargo-about can order crates in Used-by lists differently by host.
+          python3 - <<'PY'
+          import re
+          from pathlib import Path
+
+          used_by_block = re.compile(r"(?m)(?<=^Used by:\n)(?:^- .*\n)+")
+
+          def normalize_used_by(source: str, destination: str) -> None:
+              text = Path(source).read_text(encoding="utf-8")
+              normalized = used_by_block.sub(
+                  lambda match: "".join(sorted(match.group().splitlines(keepends=True))),
+                  text,
+              )
+              Path(destination).write_text(normalized, encoding="utf-8")
+
+          normalize_used_by(
+              "THIRD_PARTY_DEPENDENCIES.md",
+              "normalized-third-party-dependencies.md",
+          )
+          normalize_used_by(
+              "generated-third-party-dependencies.md",
+              "normalized-generated-third-party-dependencies.md",
+          )
+          PY
+          cmp normalized-third-party-dependencies.md normalized-generated-third-party-dependencies.md
 
   build:
     name: Build ${{ matrix.name }}
