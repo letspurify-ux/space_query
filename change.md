@@ -3764,3 +3764,47 @@ built-in regression을 포함하면 frame 21,113건, boundary 46,677건, depth s
 | `cargo test --locked` | 6,720 통과·232 ignored·실패 0 |
 | `cargo clippy --locked --all-targets -- -D warnings -W clippy::perf -W clippy::complexity` | 통과, 경고 0 |
 | `cargo fmt --all -- --check` / `git diff --check` | 통과 |
+
+## 26-1. 후속 전수 육안 재감사 (구현 변경 없음)
+
+AS-IS: aggregate report의 `failures=0`과 각 파일의 `status: PASS`는 자동 불변식 통과를
+보여 주지만, 포맷 결과가 실제 SQL 문법 소유 관계와 사람이 읽는 관례를 처음부터 끝까지
+만족한다는 증거를 대신하지 않는다.
+
+TO-BE: `formatting_sweep_all_files_generate_out_report`를 다시 실행하고 생성된 `.format.out`
+61개, 43,691줄을 PASS 표시에 의존하지 않고 모두 직접 읽었다. 검토 기준은
+`docs/auto_format_rule.md`의 frame-only depth, 문법 부모 관계, 첫 직접 자식 inline,
+후속 형제 동일 깊이, 본문 경계 분리, 닫힘 owner 깊이, 주석·리터럴 비구조화 규칙이다.
+
+| DB | 파일 | 출력 줄 |
+| --- | ---: | ---: |
+| Oracle | 41 | 25,970 |
+| MySQL | 9 | 7,090 |
+| MariaDB | 11 | 10,631 |
+| 합계 | 61 | 43,691 |
+
+CTE `SEARCH`/`CYCLE`, PIVOT/UNPIVOT, CASE, JOIN 조건, assignment-value 괄호,
+루틴·핸들러·루프, 사용자 delimiter, JSON_TABLE/COLUMNS, 윈도우 상속, 집합 연산,
+RETURNING과 시스템/애플리케이션 시간 구문까지 open/body/sibling/close 깊이를 확인했다.
+새 frame-depth 또는 가독성 결함은 없었으므로 포맷터와 회귀 테스트 구현은 변경하지 않았다.
+
+## 26-2. sweep 재검증과 품질 게이트
+
+요청한 sweep는 최초 검사와 전수 검토 후 재검사에서 모두 통과했다. 최종 재검사는
+1개 테스트 통과, 실패 0, 6,798개 filtered out이며 14.46초가 걸렸다. 실제 본문 오류
+마커와 `issues: total>0`도 별도 검색에서 0건이었다.
+
+| sweep 감사 항목 | 결과 |
+| --- | ---: |
+| fixture / built-in regression | 61 / 30 |
+| frame / frame boundary | 21,113 / 46,677 |
+| body-close depth symmetry | 2,719 |
+| body item / close | 22,839 / 9,724 |
+| 실패 파일 / issue | 0 / 0 |
+
+| 검증 | 결과 |
+| --- | --- |
+| `cargo test --lib formatting_sweep_all_files_generate_out_report -- --ignored --nocapture` | 통과, 61개 파일·failure 0 |
+| `cargo test` | 6,720 통과·232 ignored·실패 0, doc-test 실패 0 |
+| `cargo clippy --locked --all-targets -- -D warnings -W clippy::perf -W clippy::complexity` | 통과, 경고 0 |
+| `cargo fmt --all -- --check` / `git diff --check` | 통과 |
