@@ -4460,7 +4460,6 @@ pub(crate) fn line_is_bare_parenthesized_condition_header(line: &str) -> bool {
         || line_has_exact_identifier_sequence_then_open_paren_before_inline_comment(line, &["WHEN"])
 }
 
-#[cfg(test)]
 pub(crate) fn is_format_block_end_qualifier_keyword(word: &str) -> bool {
     matches_keyword(word, FORMAT_BLOCK_END_QUALIFIER_KEYWORDS)
 }
@@ -7542,8 +7541,16 @@ fn trailing_meaningful_tokens_before_inline_comment(
     (previous, last)
 }
 
-fn is_format_expression_continuation_keyword(word: &str) -> bool {
+pub(crate) fn is_format_expression_continuation_keyword(word: &str) -> bool {
     matches_keyword(word, FORMAT_EXPRESSION_CONTINUATION_KEYWORDS)
+}
+
+pub(crate) fn format_source_gap_is_canonical_inline(
+    previous_word: Option<&str>,
+    current_word: &str,
+) -> bool {
+    is_format_expression_continuation_keyword(current_word)
+        || previous_word.is_some_and(is_format_expression_continuation_keyword)
 }
 
 fn is_format_comment_header_keyword(word: &str) -> bool {
@@ -9181,6 +9188,20 @@ mod tests {
         assert!(starts_with_format_named_plain_end("END /* gap */ trg_pkg;"));
         assert!(!starts_with_format_named_plain_end("END AFTER STATEMENT"));
         assert!(!starts_with_format_named_plain_end("END /* gap */ IF;"));
+    }
+
+    #[test]
+    fn format_source_gap_policy_tracks_both_sides_of_expression_continuations() {
+        assert!(format_source_gap_is_canonical_inline(Some("NOT"), "value"));
+        assert!(format_source_gap_is_canonical_inline(
+            Some("value"),
+            "BETWEEN"
+        ));
+        assert!(format_source_gap_is_canonical_inline(Some("IS"), "NULL"));
+        assert!(!format_source_gap_is_canonical_inline(
+            Some("SELECT"),
+            "value"
+        ));
     }
 
     #[test]

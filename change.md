@@ -3555,3 +3555,212 @@ built-in sweep 회귀 코퍼스에 5개 케이스(SEARCH/CYCLE 중간 목록, `:
 | `cargo test` (전체) | 6,711 통과·실패 0 |
 | `cargo clippy --locked --all-targets -- -D warnings -W clippy::perf -W clippy::complexity` | 통과, 경고 0 |
 | `cargo fmt --all -- --check` / `git diff --check` | 통과 |
+
+## 24-1. 검토 범위 (24차: delimiter-aware sweep 감사)
+
+요청한 `formatting_sweep_all_files_generate_out_report`를 실행한 뒤 Oracle 41개,
+MySQL 9개, MariaDB 11개의 `.format.out` 61개(총 43,691줄)를 PASS 표시에 의존하지 않고
+모두 직접 읽었다. `docs/auto_format_rule.md`의 parent/child frame, 첫 자식 inline,
+닫힘 owner 깊이, 주석·리터럴 보호 규칙을 기준으로 SQL 본문을 확인했다.
+
+출력 본문 자체에서 새 frame-depth 오류는 없었지만, MySQL/MariaDB `DELIMITER $$`
+루틴을 sweep이 dollar-quoted string으로 오인해 line/token-gap/probe 검사를 건너뛰는
+감사 사각지대를 발견했다. 감사기를 delimiter-aware하게 바꾸자 그동안 실행되지 않던
+공백 probe가 실제 고정 구문 개행 의존성 11건을 검출했고, 이를 일반 규칙으로 수정했다.
+
+## 24-2. `DELIMITER $$` 루틴 본문이 line audit에서 제외되던 문제
+
+AS-IS 입력(수정 전에는 `$$ ... $$` 전체를 문자열 payload로 보호해 들여쓰기 오류 0건):
+
+```sql
+DELIMITER $$
+CREATE PROCEDURE p()
+BEGIN
+  SELECT 1;
+END$$
+DELIMITER ;
+```
+
+TO-BE 입력/검출(같은 SQL의 `SELECT` 2칸 들여쓰기를 `Indentation` 오류로 검출):
+
+```sql
+DELIMITER $$
+CREATE PROCEDURE p()
+BEGIN
+    SELECT 1;
+END$$
+DELIMITER ;
+```
+
+수정:
+
+- MySQL/MariaDB는 script 전체를 한 번에 토큰화하지 않고
+  `statement_spans_for_db_type_with_mysql_delimiter`가 반환한 실제 statement 범위별로
+  문자열·주석 보호선과 token gap을 계산한다.
+- 루틴 안의 실제 여러 줄 문자열은 기존처럼 보호한다.
+- line audit 실측 예: MySQL test1 `147 -> 789`, test4 `430 -> 859`, test5
+  `224 -> 708`; MariaDB test4 `220 -> 839`, test6 `512 -> 1,412`.
+
+## 24-3. 사용자 지정 delimiter에서 공백 probe가 생략되던 문제
+
+AS-IS에서는 `FormatItem::Statement`를 이어 붙일 때 루틴 종결자 `$$`를 잃어 statement
+fingerprint가 달라졌고, `Reindent`/`CollapseBreaks`/`ExpandInline` probe를 조용히
+건너뛰어 해당 파일이 `probes=1`이어도 PASS가 됐다.
+
+TO-BE에서는 원본 document의 statement span만 제자리에서 변형하므로 `DELIMITER`, `$$`,
+도구 명령, statement 사이 텍스트가 그대로 유지된다. MySQL/MariaDB 20개 fixture는 모두
+공백 probe 3개와 idempotence 1개(`probes=4`)를 실행한다. probe가 statement fingerprint를
+보존하지 못하면 더 이상 생략하지 않고 sweep 오류로 보고한다. 행 시작 `@변수`와 단독
+SQL*Plus `R`처럼 도구 명령으로 의미가 바뀌는 변형, 이름 있는 `END label`의 보존 공백은
+안전한 probe 대상에서 제외한다.
+
+| 감사 항목 | AS-IS | TO-BE |
+| --- | ---: | ---: |
+| 전체 report `token_gaps` | 68,892 | 74,782 |
+| 전체 report `probes` | 120 | 163 |
+| MySQL/MariaDB fixture별 probe | 일부 1 | 전부 4 |
+
+## 24-4. probe가 찾아낸 고정 구문 개행 의존성
+
+AS-IS(공백 probe가 아래 위치에 원본 개행을 넣으면 포매터가 그대로 보존):
+
+```sql
+IF NOT
+        p_condition THEN
+    SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = p_message;
+END
+IF;
+
+IF NEW.priority
+        NOT
+        BETWEEN 1 AND 9 THEN
+    SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'invalid priority';
+END IF;
+```
+
+TO-BE:
+
+```sql
+IF NOT p_condition THEN
+    SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = p_message;
+END IF;
+
+IF NEW.priority NOT BETWEEN 1 AND 9 THEN
+    SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'invalid priority';
+END IF;
+```
+
+같은 일반화로 `FALSE) = FALSE`, `amount < 0`, `quantity IS NULL`, `END FOR`,
+`END WHILE`, `END LOOP`, `END CASE`도 원본 개행과 무관하게 고정 구문으로 수렴한다.
+
+- 조건 owner의 `first_body_token_idx`를 사용해 IF/ELSIF/WHILE 첫 자식은 항상 owner와
+  inline으로 유지한다. 깊이 판단은 출력 행이 아니라 live condition frame에서 가져온다.
+- RHS 연산자와 `NOT BETWEEN`/`IS` 등은 `sql_text`의 공유 expression-continuation
+  taxonomy를 사용한다.
+- 주석 없이 바로 이어지는 `END IF/LOOP/CASE/REPEAT/FOR/WHILE`만 한 줄로 정규화한다.
+  주석으로 분리된 suffix와 이름 있는 `END label`의 기존 보존/깊이 계약은 유지한다.
+
+추가 회귀 테스트:
+
+- `formatting_sweep_first_pass_audits_mysql_custom_delimiter_body`
+- `formatting_sweep_first_pass_protects_multiline_string_in_mysql_routine`
+- `formatting_sweep_whitespace_probes_preserve_mysql_custom_delimiters`
+- `formatting_sweep_mysql_fixed_phrases_ignore_source_line_breaks`
+
+## 24-5. 최종 sweep 및 품질 게이트
+
+| 항목 | 결과 |
+| --- | ---: |
+| 직접 검토 fixture / 출력 줄 | 61개 / 43,691줄 |
+| Oracle / MySQL / MariaDB fixture | 41 / 9 / 11 |
+| auditable code line / token gap | 35,935 / 74,782 |
+| fixture frame / body item / close | 20,878 / 22,731 / 9,660 |
+| built-in 포함 frame / body item / close | 21,113 / 22,839 / 9,724 |
+| built-in sweep regression | 30개 |
+| 실패 파일 / issue | 0 / 0 |
+
+| 검증 | 결과 |
+| --- | --- |
+| `formatting_sweep_all_files_generate_out_report` | 통과, 61개 파일·failure 0 |
+| `cargo test` | lib 6,566 통과·228 ignored, 전체 binary/integration/guard/doc-test 실패 0 |
+| `cargo clippy --locked --all-targets -- -D warnings -W clippy::perf -W clippy::complexity` | 통과, 경고 0 |
+| `cargo fmt --all -- --check` / `git diff --check` | 통과 |
+
+## 25-1. 후속 구조 리팩터링: 하나의 delimiter-aware 문서 모델
+
+24차 수정에서 statement span, token span, 보호 payload, 공백 probe가 각각 delimiter를
+해석하던 경로를 `FormatSweepDocument`로 통합했다. 다만 물리 토큰과 논리 실행 단위는
+용도가 다르므로 하나로 억지 통합하지 않았다.
+
+- 물리 statement/token span: 원문 offset, 보호선, statement 내부 token gap, whitespace
+  probe 렌더링과 결과 diff에 사용한다.
+- 논리 `ScriptItem` fingerprint: SQL*Plus 명령과 Oracle `/`, MySQL `DELIMITER`를 포함한
+  script 의미 보존 검사에 사용한다.
+- probe는 statement span만 제자리에서 변형하고 나머지 delimiter·도구 명령·statement
+  사이 텍스트를 그대로 보존한다.
+- Oracle도 MySQL/MariaDB와 동일하게 3개 whitespace probe와 idempotence를 모두 실행한다.
+  fixture 61개에서 `probes=244`로, 모든 파일이 정확히 4개 probe를 통과한다.
+- `token_gaps=72,824`는 statement 경계를 가로지르는 공백을 제외한 실제 변형 가능
+  statement 내부 gap만 집계한다.
+
+## 25-2. source-break와 `END` 정책의 단일화
+
+formatter의 여러 boolean 조건을 `FormatterSourceBreakPolicy`로 묶고, 고정 구문이 원본
+개행과 무관하게 inline으로 수렴하는 조건을 명시했다.
+
+- 문법상 inline, live frame의 첫 자식, 연산자 직후, 공유 expression-continuation
+  taxonomy 중 하나면 `CanonicalInline`, 아니면 `Preserve`다.
+- `AND`/`OR`/`IS`/`NOT`만 따로 나열하던 formatter 로컬 분기를 제거하고
+  `sql_text::format_source_gap_is_canonical_inline`을 Oracle/MySQL/MariaDB가 공유한다.
+- `END IF/LOOP/CASE/REPEAT/FOR/WHILE` 판정도 formatter 로컬 상수 대신
+  `sql_text::is_format_block_end_qualifier_keyword` 하나를 사용한다.
+- 이름 있는 `END label`과 주석으로 분리된 suffix는 기존 보존 계약을 유지한다.
+
+직접 회귀 테스트:
+
+- `format_source_gap_policy_tracks_both_sides_of_expression_continuations`
+- `formatting_sweep_oracle_fixed_phrases_ignore_source_line_breaks`
+- `formatting_sweep_mysql_fixed_phrases_ignore_source_line_breaks`
+
+## 25-3. 전체 sweep에 구조적 depth 대칭 감사 추가
+
+기존 감사는 frame의 저장 depth, 부모-자식 depth, body/close의 개별 indent를 확인했지만
+open-body-close가 하나의 구조 구간을 이루는지와 body/close의 직접 대칭은 확인하지
+않았다. 다음 불변식을 추가했다.
+
+1. 자식 frame opener는 부모 close보다 앞에 있어야 한다.
+2. body item은 자기 frame의 open/close 경계 밖에 있을 수 없다.
+3. 줄 시작 body와 줄 시작 close가 모두 있는 child frame은
+   `body depth = close depth + 1`이어야 한다.
+
+빈 괄호의 `first body candidate == close`와 phase frame의 `body start == opener`는 실제
+body가 경계를 벗어난 것이 아니므로 허용하고, 엄격하게 경계 밖인 경우만 오류로 본다.
+보고서에는 `frame_boundaries`, `frame_depth_symmetries` 실측치를 추가했다.
+
+추가 감사 단위 테스트:
+
+- `frame_alignment_audit_reports_child_opened_after_parent_close`
+- `frame_alignment_audit_reports_body_outside_own_boundary`
+- `frame_alignment_audit_reports_body_close_depth_asymmetry`
+
+| 전체 fixture 감사 항목 | 결과 |
+| --- | ---: |
+| 파일 / built-in regression | 61 / 30 |
+| code line / statement 내부 token gap | 35,935 / 72,824 |
+| frame / frame boundary | 20,878 / 46,350 |
+| body-close depth symmetry | 2,682 |
+| body item / close | 22,731 / 9,660 |
+| whitespace + idempotence probe | 244 |
+| 실패 파일 / issue | 0 / 0 |
+
+built-in regression을 포함하면 frame 21,113건, boundary 46,677건, depth symmetry
+2,719건, body item 22,839건, close 9,724건을 검사했고 실패는 0건이다.
+
+## 25-4. 최종 품질 게이트
+
+| 검증 | 결과 |
+| --- | --- |
+| `formatting_sweep_all_files_generate_out_report` | 통과, 61개 파일·30개 built-in·failure 0 |
+| `cargo test --locked` | 6,720 통과·232 ignored·실패 0 |
+| `cargo clippy --locked --all-targets -- -D warnings -W clippy::perf -W clippy::complexity` | 통과, 경고 0 |
+| `cargo fmt --all -- --check` / `git diff --check` | 통과 |

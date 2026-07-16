@@ -1,7 +1,7 @@
 use super::formatter::{FormatManagedFrameKind, ListOwnerKind};
 use super::{query_text, SqlEditorWidget, SqlToken};
 use crate::db::connection::DatabaseType;
-use crate::db::{FormatItem, QueryExecutor, ScriptItem};
+use crate::db::{QueryExecutor, ScriptItem};
 use crate::sql_text;
 use std::any::Any;
 use std::fs;
@@ -105,6 +105,8 @@ struct FormatSweepRun {
     checked_lines: usize,
     checked_gaps: usize,
     checked_frames: usize,
+    checked_frame_boundaries: usize,
+    checked_frame_depth_symmetries: usize,
     checked_frame_body_items: usize,
     checked_frame_closes: usize,
     managed_frame_kinds: Vec<FormatManagedFrameKind>,
@@ -121,7 +123,7 @@ enum FormatSweepToken {
     Symbol(String),
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 enum FormatSweepProbeKind {
     Reindent,
     CollapseBreaks,
@@ -182,43 +184,308 @@ fn mysql_compatible(db_type: DatabaseType) -> bool {
     matches!(db_type, DatabaseType::MySQL | DatabaseType::MariaDB)
 }
 
-fn format_sweep_tokens(statement: &str, db_type: DatabaseType) -> Vec<FormatSweepToken> {
-    query_text::tokenize_sql_spanned_with_mysql_compat(statement, mysql_compatible(db_type))
-        .into_iter()
-        .map(|span| match span.token {
-            SqlToken::Word(word) => FormatSweepToken::Word(word.to_ascii_uppercase()),
-            SqlToken::String(value) => FormatSweepToken::String(value),
-            SqlToken::Comment(value) => FormatSweepToken::Comment(value.trim_end().to_string()),
-            SqlToken::Symbol(value) => FormatSweepToken::Symbol(value),
-        })
-        .collect()
+#[derive(Clone, Debug)]
+struct FormatSweepScriptTokenSpan {
+    statement_index: usize,
+    token: SqlToken,
+    start: usize,
+    end: usize,
 }
 
-fn format_sweep_statement_fingerprint(
-    text: &str,
+#[derive(Clone, Debug)]
+struct FormatSweepStatementSpan {
+    start: usize,
+    end: usize,
+    token_start: usize,
+    token_end: usize,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum FormatSweepGapMutationPolicy {
+    All,
+    PreserveLineBreak,
+    Preserve,
+}
+
+impl FormatSweepGapMutationPolicy {
+    fn allows(self, kind: FormatSweepProbeKind) -> bool {
+        match self {
+            Self::All => true,
+            Self::PreserveLineBreak => !matches!(kind, FormatSweepProbeKind::CollapseBreaks),
+            Self::Preserve => false,
+        }
+    }
+}
+
+struct FormatSweepDocument<'a> {
+    text: &'a str,
     db_type: DatabaseType,
-) -> Vec<Vec<FormatSweepToken>> {
-    QueryExecutor::split_script_items_for_db_type(text, Some(db_type))
+    statements: Vec<FormatSweepStatementSpan>,
+    tokens: Vec<FormatSweepScriptTokenSpan>,
+}
+
+impl<'a> FormatSweepDocument<'a> {
+    fn new(text: &'a str, db_type: DatabaseType) -> Self {
+        let mut tokens = Vec::new();
+        let statements = QueryExecutor::statement_spans_for_db_type_with_mysql_delimiter(
+            text,
+            Some(db_type),
+            None,
+        )
         .into_iter()
-        .filter_map(|item| match item {
-            ScriptItem::Statement(statement) => {
-                let tokens = format_sweep_tokens(&statement, db_type);
-                let is_tool_option_continuation = matches!(
-                    tokens.as_slice(),
-                    [FormatSweepToken::Word(on)] if on == "ON" || on == "OFF"
-                ) || matches!(
-                    tokens.as_slice(),
-                    [
-                        FormatSweepToken::Word(on),
-                        FormatSweepToken::Word(size),
-                        FormatSweepToken::Word(unlimited)
-                    ] if on == "ON" && size == "SIZE" && unlimited == "UNLIMITED"
-                );
-                (!is_tool_option_continuation).then_some(tokens)
-            }
-            ScriptItem::ToolCommand(_) => None,
+        .enumerate()
+        .filter_map(|(statement_index, (start, end))| {
+            let statement = text.get(start..end)?;
+            let token_start = tokens.len();
+            tokens.extend(
+                query_text::tokenize_sql_spanned_with_mysql_compat(
+                    statement,
+                    mysql_compatible(db_type),
+                )
+                .into_iter()
+                .map(|span| FormatSweepScriptTokenSpan {
+                    statement_index,
+                    token: span.token,
+                    start: start.saturating_add(span.start),
+                    end: start.saturating_add(span.end),
+                }),
+            );
+            Some(FormatSweepStatementSpan {
+                start,
+                end,
+                token_start,
+                token_end: tokens.len(),
+            })
         })
-        .collect()
+        .collect();
+        Self {
+            text,
+            db_type,
+            statements,
+            tokens,
+        }
+    }
+
+    fn statement_fingerprint(&self) -> Vec<Vec<FormatSweepToken>> {
+        QueryExecutor::split_script_items_for_db_type(self.text, Some(self.db_type))
+            .into_iter()
+            .filter_map(|item| match item {
+                ScriptItem::Statement(statement) => {
+                    let tokens = query_text::tokenize_sql_spanned_with_mysql_compat(
+                        &statement,
+                        mysql_compatible(self.db_type),
+                    )
+                    .into_iter()
+                    .map(|span| match span.token {
+                        SqlToken::Word(word) => FormatSweepToken::Word(word.to_ascii_uppercase()),
+                        SqlToken::String(value) => FormatSweepToken::String(value),
+                        SqlToken::Comment(value) => {
+                            FormatSweepToken::Comment(value.trim_end().to_string())
+                        }
+                        SqlToken::Symbol(value) => FormatSweepToken::Symbol(value),
+                    })
+                    .collect::<Vec<_>>();
+                    let is_tool_option_continuation = matches!(
+                        tokens.as_slice(),
+                        [FormatSweepToken::Word(on)] if on == "ON" || on == "OFF"
+                    ) || matches!(
+                        tokens.as_slice(),
+                        [
+                            FormatSweepToken::Word(on),
+                            FormatSweepToken::Word(size),
+                            FormatSweepToken::Word(unlimited)
+                        ] if on == "ON" && size == "SIZE" && unlimited == "UNLIMITED"
+                    );
+                    (!is_tool_option_continuation).then_some(tokens)
+                }
+                ScriptItem::ToolCommand(_) => None,
+            })
+            .collect()
+    }
+
+    fn protected_payload_lines(&self, line_count: usize) -> Vec<bool> {
+        let mut protected = vec![false; line_count];
+        let line_starts = line_start_offsets(self.text);
+        for span in &self.tokens {
+            if !token_is_comment_or_string(&span.token)
+                || !self
+                    .text
+                    .get(span.start..span.end)
+                    .is_some_and(|token| token.contains('\n'))
+            {
+                continue;
+            }
+            let start_line = line_starts
+                .partition_point(|line_start| *line_start <= span.start)
+                .saturating_sub(1);
+            let end_line = line_starts
+                .partition_point(|line_start| *line_start < span.end)
+                .saturating_sub(1);
+            for line in start_line..=end_line.min(protected.len().saturating_sub(1)) {
+                protected[line] = true;
+            }
+        }
+        protected
+    }
+
+    fn safe_gap_count(&self) -> usize {
+        self.tokens
+            .windows(2)
+            .filter(|pair| {
+                let [left, right] = pair else {
+                    return false;
+                };
+                left.statement_index == right.statement_index
+                    && !token_is_comment_or_string(&left.token)
+                    && !token_is_comment_or_string(&right.token)
+                    && self.text.get(left.end..right.start).is_some_and(|gap| {
+                        !gap.is_empty() && gap.bytes().all(|byte| byte.is_ascii_whitespace())
+                    })
+            })
+            .count()
+    }
+
+    fn gap_mutation_policy(
+        &self,
+        previous: Option<&FormatSweepScriptTokenSpan>,
+        current: &FormatSweepScriptTokenSpan,
+        gap: &str,
+    ) -> FormatSweepGapMutationPolicy {
+        if gap.is_empty()
+            || !gap.bytes().all(|byte| byte.is_ascii_whitespace())
+            || previous.is_some_and(|span| token_is_comment_or_string(&span.token))
+            || token_is_comment_or_string(&current.token)
+        {
+            return FormatSweepGapMutationPolicy::Preserve;
+        }
+
+        let split_line = self
+            .text
+            .get(current.start..)
+            .unwrap_or_default()
+            .split('\n')
+            .next()
+            .unwrap_or_default()
+            .trim();
+        let would_start_script_command = query_text::is_sqlplus_command_line(split_line);
+        let would_leave_script_command = previous.is_some_and(|previous| {
+            let line_start = self
+                .text
+                .get(..previous.end)
+                .and_then(|prefix| prefix.rfind('\n'))
+                .map_or(0, |idx| idx.saturating_add(1));
+            self.text
+                .get(line_start..previous.end)
+                .is_some_and(|line| query_text::is_sqlplus_command_line(line.trim()))
+        });
+        let line_break_is_safe_to_collapse = !gap.contains('\n')
+            || previous.is_some_and(|span| token_keeps_following_gap_inline(&span.token))
+            || token_keeps_preceding_gap_inline(&current.token);
+        let preserves_named_end_suffix = matches!(
+            (previous.map(|span| &span.token), &current.token),
+            (Some(SqlToken::Word(previous_word)), SqlToken::Word(word))
+                if previous_word.eq_ignore_ascii_case("END")
+                    && !sql_text::is_format_block_end_qualifier_keyword(word)
+        );
+        if would_start_script_command || would_leave_script_command || preserves_named_end_suffix {
+            FormatSweepGapMutationPolicy::Preserve
+        } else if !line_break_is_safe_to_collapse {
+            FormatSweepGapMutationPolicy::PreserveLineBreak
+        } else {
+            FormatSweepGapMutationPolicy::All
+        }
+    }
+
+    fn render_probe(&self, kind: FormatSweepProbeKind) -> String {
+        let mut probe = String::with_capacity(self.text.len().saturating_add(128));
+        let mut document_cursor = 0usize;
+        for statement in &self.statements {
+            probe.push_str(
+                self.text
+                    .get(document_cursor..statement.start)
+                    .unwrap_or_default(),
+            );
+            let spans = &self.tokens[statement.token_start..statement.token_end];
+            let mut statement_cursor = statement.start;
+            for (idx, span) in spans.iter().enumerate() {
+                let gap = self
+                    .text
+                    .get(statement_cursor..span.start)
+                    .unwrap_or_default();
+                if self
+                    .gap_mutation_policy(idx.checked_sub(1).and_then(|i| spans.get(i)), span, gap)
+                    .allows(kind)
+                {
+                    match kind {
+                        FormatSweepProbeKind::Reindent if gap.contains('\n') => {
+                            for _ in 0..gap.bytes().filter(|byte| *byte == b'\n').count() {
+                                probe.push('\n');
+                            }
+                            probe.push_str("       ");
+                        }
+                        FormatSweepProbeKind::CollapseBreaks if gap.contains('\n') => {
+                            probe.push(' ');
+                        }
+                        FormatSweepProbeKind::ExpandInline
+                            if !gap.contains('\n') && idx % 3 == 0 =>
+                        {
+                            probe.push_str("\n       ");
+                        }
+                        _ => probe.push_str(gap),
+                    }
+                } else {
+                    probe.push_str(gap);
+                }
+                probe.push_str(self.text.get(span.start..span.end).unwrap_or_default());
+                statement_cursor = span.end;
+            }
+            probe.push_str(
+                self.text
+                    .get(statement_cursor..statement.end)
+                    .unwrap_or_default(),
+            );
+            document_cursor = statement.end;
+        }
+        probe.push_str(self.text.get(document_cursor..).unwrap_or_default());
+        probe
+    }
+}
+
+fn token_keeps_following_gap_inline(token: &SqlToken) -> bool {
+    match token {
+        SqlToken::Word(word) => sql_text::is_format_expression_continuation_keyword(word),
+        SqlToken::Symbol(symbol) => matches!(
+            symbol.as_str(),
+            "(" | ","
+                | ":="
+                | "=>"
+                | "="
+                | "<"
+                | ">"
+                | "<="
+                | ">="
+                | "<>"
+                | "!="
+                | "<=>"
+                | "+"
+                | "-"
+                | "*"
+                | "/"
+                | "%"
+                | "||"
+                | "|"
+                | "^"
+        ),
+        SqlToken::String(_) | SqlToken::Comment(_) => false,
+    }
+}
+
+fn token_keeps_preceding_gap_inline(token: &SqlToken) -> bool {
+    match token {
+        SqlToken::Word(word) => sql_text::is_format_expression_continuation_keyword(word),
+        SqlToken::Symbol(symbol) => matches!(symbol.as_str(), ")" | ","),
+        SqlToken::String(_) | SqlToken::Comment(_) => false,
+    }
 }
 
 fn panic_text(payload: &(dyn Any + Send)) -> String {
@@ -247,31 +514,6 @@ fn line_is_auditable_code(
     true
 }
 
-fn protected_payload_lines(text: &str, db_type: DatabaseType, line_count: usize) -> Vec<bool> {
-    let mut protected = vec![false; line_count];
-    let line_starts = line_start_offsets(text);
-    let spans = query_text::tokenize_sql_spanned_with_mysql_compat(text, mysql_compatible(db_type));
-    for span in spans {
-        if !token_is_comment_or_string(&span.token)
-            || !text
-                .get(span.start..span.end)
-                .is_some_and(|token| token.contains('\n'))
-        {
-            continue;
-        }
-        let start_line = line_starts
-            .partition_point(|start| *start <= span.start)
-            .saturating_sub(1);
-        let end_line = line_starts
-            .partition_point(|start| *start < span.end)
-            .saturating_sub(1);
-        for line in start_line..=end_line.min(protected.len().saturating_sub(1)) {
-            protected[line] = true;
-        }
-    }
-    protected
-}
-
 fn format_sweep_audit_first_pass(
     formatted: &str,
     db_type: DatabaseType,
@@ -279,7 +521,8 @@ fn format_sweep_audit_first_pass(
     let mut issues = Vec::new();
     let lines: Vec<&str> = formatted.lines().collect();
     let line_starts = line_start_offsets(formatted);
-    let protected_lines = protected_payload_lines(formatted, db_type, lines.len());
+    let document = FormatSweepDocument::new(formatted, db_type);
+    let protected_lines = document.protected_payload_lines(lines.len());
     let mut in_block_comment = false;
     let mut checked_lines = 0usize;
 
@@ -325,11 +568,7 @@ fn format_sweep_audit_first_pass(
         }
     }
 
-    (
-        checked_lines,
-        format_sweep_safe_gap_count(formatted, db_type),
-        issues,
-    )
+    (checked_lines, document.safe_gap_count(), issues)
 }
 
 fn format_sweep_audit_token_count(
@@ -337,8 +576,9 @@ fn format_sweep_audit_token_count(
     formatted: &str,
     db_type: DatabaseType,
 ) -> Option<FormatSweepIssue> {
-    let source_fingerprint = format_sweep_statement_fingerprint(source, db_type);
-    let formatted_fingerprint = format_sweep_statement_fingerprint(formatted, db_type);
+    let source_fingerprint = FormatSweepDocument::new(source, db_type).statement_fingerprint();
+    let formatted_fingerprint =
+        FormatSweepDocument::new(formatted, db_type).statement_fingerprint();
     (source_fingerprint != formatted_fingerprint).then(|| {
         let first_mismatch = source_fingerprint
             .iter()
@@ -404,98 +644,15 @@ fn token_label(token: &SqlToken) -> &str {
     }
 }
 
-fn format_sweep_safe_gap_count(text: &str, db_type: DatabaseType) -> usize {
-    let spans = query_text::tokenize_sql_spanned_with_mysql_compat(text, mysql_compatible(db_type));
-    spans
-        .windows(2)
-        .filter(|pair| {
-            let [left, right] = pair else {
-                return false;
-            };
-            !token_is_comment_or_string(&left.token)
-                && !token_is_comment_or_string(&right.token)
-                && text.get(left.end..right.start).is_some_and(|gap| {
-                    !gap.is_empty() && gap.bytes().all(|byte| byte.is_ascii_whitespace())
-                })
-        })
-        .count()
-}
-
-fn mutate_format_gaps(text: &str, db_type: DatabaseType, kind: FormatSweepProbeKind) -> String {
-    let spans = query_text::tokenize_sql_spanned_with_mysql_compat(text, mysql_compatible(db_type));
-    if spans.is_empty() {
-        return text.to_string();
-    }
-    let mut out = String::with_capacity(text.len().saturating_add(64));
-    let mut cursor = 0usize;
-    for (idx, span) in spans.iter().enumerate() {
-        let gap = text.get(cursor..span.start).unwrap_or_default();
-        let previous = idx.checked_sub(1).and_then(|prev| spans.get(prev));
-        let safe = !gap.is_empty()
-            && gap.bytes().all(|byte| byte.is_ascii_whitespace())
-            && previous.is_none_or(|prev| !token_is_comment_or_string(&prev.token))
-            && !token_is_comment_or_string(&span.token);
-        if safe {
-            match kind {
-                FormatSweepProbeKind::Reindent if gap.contains('\n') => {
-                    let newline_count = gap.bytes().filter(|byte| *byte == b'\n').count();
-                    for _ in 0..newline_count {
-                        out.push('\n');
-                    }
-                    out.push_str("       ");
-                }
-                FormatSweepProbeKind::CollapseBreaks if gap.contains('\n') => out.push(' '),
-                FormatSweepProbeKind::ExpandInline if !gap.contains('\n') && idx % 3 == 0 => {
-                    out.push_str("\n       ")
-                }
-                _ => out.push_str(gap),
-            }
-        } else {
-            out.push_str(gap);
-        }
-        out.push_str(text.get(span.start..span.end).unwrap_or_default());
-        cursor = span.end;
-    }
-    out.push_str(text.get(cursor..).unwrap_or_default());
-    out
-}
-
-fn format_probe_text(
-    formatted: &str,
-    db_type: DatabaseType,
-    kind: FormatSweepProbeKind,
-) -> Option<String> {
-    let items = query_text::split_format_items_for_db_type(formatted, Some(db_type));
-    let mut probe = String::with_capacity(formatted.len().saturating_add(128));
-    for (idx, item) in items.iter().enumerate() {
-        if idx > 0 {
-            probe.push_str("\n\n");
-        }
-        match item {
-            FormatItem::Statement(statement) => {
-                probe.push_str(&mutate_format_gaps(statement, db_type, kind));
-            }
-            FormatItem::ToolCommand(command) => {
-                probe.push_str(&SqlEditorWidget::format_tool_command(command));
-            }
-            FormatItem::Verbatim(value) => probe.push_str(value),
-            FormatItem::Slash => probe.push('/'),
-        }
-    }
-    (format_sweep_statement_fingerprint(&probe, db_type)
-        == format_sweep_statement_fingerprint(formatted, db_type))
-    .then_some(probe)
-}
-
 fn whitespace_kind_between_equal_tokens(
     baseline: &str,
     comparison: &str,
     db_type: DatabaseType,
 ) -> (FormatSweepIssueKind, usize, String) {
-    let left =
-        query_text::tokenize_sql_spanned_with_mysql_compat(baseline, mysql_compatible(db_type));
-    let right =
-        query_text::tokenize_sql_spanned_with_mysql_compat(comparison, mysql_compatible(db_type));
+    let left_document = FormatSweepDocument::new(baseline, db_type);
+    let right_document = FormatSweepDocument::new(comparison, db_type);
+    let left = &left_document.tokens;
+    let right = &right_document.tokens;
     if left.len() != right.len() {
         return (
             FormatSweepIssueKind::ItemOrTokenChanged,
@@ -531,13 +688,34 @@ fn whitespace_kind_between_equal_tokens(
                 ),
             );
         }
+        let left_token_text = baseline
+            .get(left_span.start..left_span.end)
+            .unwrap_or_default();
+        let right_token_text = comparison
+            .get(right_span.start..right_span.end)
+            .unwrap_or_default();
+        if left_token_text != right_token_text {
+            return (
+                FormatSweepIssueKind::WhitespaceDependency,
+                left_span.start,
+                format!(
+                    "rendered token text differs: baseline {:?}, comparison {:?}",
+                    left_token_text.chars().take(80).collect::<String>(),
+                    right_token_text.chars().take(80).collect::<String>()
+                ),
+            );
+        }
         left_cursor = left_span.end;
         right_cursor = right_span.end;
     }
+    let left_tail = baseline.get(left_cursor..).unwrap_or_default();
+    let right_tail = comparison.get(right_cursor..).unwrap_or_default();
     (
         FormatSweepIssueKind::WhitespaceDependency,
         baseline.len(),
-        "formatted outputs differ after the final token".to_string(),
+        format!(
+            "formatted outputs differ after the final token: baseline trailing {left_tail:?}, comparison trailing {right_tail:?}"
+        ),
     )
 }
 
@@ -556,6 +734,8 @@ fn format_sweep_run(source: &str, db_type: DatabaseType) -> FormatSweepRun {
                 checked_lines: 0,
                 checked_gaps: 0,
                 checked_frames: 0,
+                checked_frame_boundaries: 0,
+                checked_frame_depth_symmetries: 0,
                 checked_frame_body_items: 0,
                 checked_frame_closes: 0,
                 managed_frame_kinds: Vec::new(),
@@ -588,14 +768,18 @@ fn format_sweep_run(source: &str, db_type: DatabaseType) -> FormatSweepRun {
         issues.push(issue);
     }
     let mut probes = 0usize;
+    let formatted_document = FormatSweepDocument::new(&formatted, db_type);
     for kind in [
         FormatSweepProbeKind::Reindent,
         FormatSweepProbeKind::CollapseBreaks,
         FormatSweepProbeKind::ExpandInline,
     ] {
-        let Some(probe) = format_probe_text(&formatted, db_type, kind) else {
+        let probe = formatted_document.render_probe(kind);
+        if let Some(mut issue) = format_sweep_audit_token_count(&formatted, &probe, db_type) {
+            issue.message = format!("{kind:?} whitespace probe: {}", issue.message);
+            issues.push(issue);
             continue;
-        };
+        }
         probes += 1;
         let result = catch_unwind(AssertUnwindSafe(|| {
             SqlEditorWidget::format_for_auto_formatting_with_db_type(&probe, false, Some(db_type))
@@ -608,7 +792,7 @@ fn format_sweep_run(source: &str, db_type: DatabaseType) -> FormatSweepRun {
                     FormatSweepIssueKind::WhitespaceDependency,
                     &formatted,
                     offset,
-                    format!("{layout_kind:?}: {message}"),
+                    format!("{kind:?} whitespace probe: {layout_kind:?}: {message}"),
                 ));
             }
             Ok(_) => {}
@@ -655,6 +839,8 @@ fn format_sweep_run(source: &str, db_type: DatabaseType) -> FormatSweepRun {
         checked_lines,
         checked_gaps,
         checked_frames: frame_alignment_audit.checked_frames,
+        checked_frame_boundaries: frame_alignment_audit.checked_frame_boundaries,
+        checked_frame_depth_symmetries: frame_alignment_audit.checked_frame_depth_symmetries,
         checked_frame_body_items: frame_alignment_audit.checked_body_items,
         checked_frame_closes: frame_alignment_audit.checked_closes,
         managed_frame_kinds: frame_alignment_audit.managed_frame_kinds,
@@ -708,10 +894,12 @@ fn format_sweep_render_out(
         }
     ));
     annotated.push_str(&format!(
-        "-- checked: lines={} token_gaps={} frames={} frame_body_items={} frame_closes={} probes={}\n",
+        "-- checked: lines={} token_gaps={} frames={} frame_boundaries={} frame_depth_symmetries={} frame_body_items={} frame_closes={} probes={}\n",
         run.checked_lines,
         run.checked_gaps,
         run.checked_frames,
+        run.checked_frame_boundaries,
+        run.checked_frame_depth_symmetries,
         run.checked_frame_body_items,
         run.checked_frame_closes,
         run.probes
@@ -828,6 +1016,136 @@ fn formatting_sweep_first_pass_detects_trailing_whitespace() {
     assert!(issues
         .iter()
         .any(|issue| issue.message == "code line has trailing whitespace"));
+}
+
+#[test]
+fn formatting_sweep_first_pass_audits_mysql_custom_delimiter_body() {
+    let bad = r#"DELIMITER $$
+CREATE PROCEDURE p()
+BEGIN
+  SELECT 1;
+END$$
+DELIMITER ;"#;
+
+    for db_type in [DatabaseType::MySQL, DatabaseType::MariaDB] {
+        let (_, _, issues) = format_sweep_audit_first_pass(bad, db_type);
+        assert!(
+            issues.iter().any(|issue| {
+                issue.kind == FormatSweepIssueKind::Indentation
+                    && issue.message.contains("2 leading spaces")
+            }),
+            "{db_type:?} custom-delimiter routine body must remain auditable: {issues:#?}"
+        );
+    }
+}
+
+#[test]
+fn formatting_sweep_first_pass_protects_multiline_string_in_mysql_routine() {
+    let source = r#"DELIMITER $$
+CREATE PROCEDURE p()
+BEGIN
+    SET @message = 'first line
+  literal payload';
+END$$
+DELIMITER ;"#;
+
+    for db_type in [DatabaseType::MySQL, DatabaseType::MariaDB] {
+        let (_, _, issues) = format_sweep_audit_first_pass(source, db_type);
+        assert!(
+            issues.is_empty(),
+            "{db_type:?} multiline string payload must remain protected: {issues:#?}"
+        );
+    }
+}
+
+#[test]
+fn formatting_sweep_whitespace_probes_preserve_mysql_custom_delimiters() {
+    let source = r#"DELIMITER $$
+CREATE PROCEDURE p()
+BEGIN
+    SELECT 1;
+END$$
+DELIMITER ;"#;
+
+    for db_type in [DatabaseType::MySQL, DatabaseType::MariaDB] {
+        let run = format_sweep_run(source, db_type);
+        assert!(
+            run.issues.is_empty(),
+            "{db_type:?} custom-delimiter probe issues: {:#?}",
+            run.issues
+        );
+        assert_eq!(
+            run.probes, 4,
+            "{db_type:?} must run all three whitespace probes plus idempotence"
+        );
+    }
+}
+
+#[test]
+fn formatting_sweep_mysql_fixed_phrases_ignore_source_line_breaks() {
+    let source = r#"DELIMITER $$
+CREATE PROCEDURE p(IN p_condition BOOLEAN, IN p_priority INT)
+BEGIN
+    IF
+        NOT
+        p_condition THEN
+        SELECT 1;
+    END
+    IF;
+    IF p_priority
+        NOT
+        BETWEEN 1 AND 9 THEN
+        SELECT 2;
+    END IF;
+END$$
+DELIMITER ;"#;
+
+    for db_type in [DatabaseType::MySQL, DatabaseType::MariaDB] {
+        let run = format_sweep_run(source, db_type);
+        assert!(
+            run.issues.is_empty(),
+            "{db_type:?} fixed-phrase issues: {:#?}\n{}",
+            run.issues,
+            run.formatted
+        );
+        assert!(
+            run.formatted.contains("IF NOT p_condition THEN")
+                && run
+                    .formatted
+                    .contains("IF p_priority NOT BETWEEN 1 AND 9 THEN")
+                && run.formatted.contains("END IF;"),
+            "{db_type:?} fixed phrases must be independent of source line breaks:\n{}",
+            run.formatted
+        );
+        assert_eq!(run.probes, 4);
+    }
+}
+
+#[test]
+fn formatting_sweep_oracle_fixed_phrases_ignore_source_line_breaks() {
+    let source = r#"BEGIN
+    IF
+        NOT
+        p_condition THEN
+        NULL;
+    END
+    IF;
+END;"#;
+
+    let run = format_sweep_run(source, DatabaseType::Oracle);
+
+    assert!(
+        run.issues.is_empty(),
+        "Oracle fixed-phrase issues: {:#?}\n{}",
+        run.issues,
+        run.formatted
+    );
+    assert!(
+        run.formatted.contains("IF NOT p_condition THEN") && run.formatted.contains("END IF;"),
+        "Oracle fixed phrases must be independent of source line breaks:\n{}",
+        run.formatted
+    );
+    assert_eq!(run.probes, 4);
 }
 
 #[test]
@@ -2316,6 +2634,8 @@ fn formatting_sweep_report_marks_first_pass_issue() {
         checked_lines: 1,
         checked_gaps: 1,
         checked_frames: 0,
+        checked_frame_boundaries: 0,
+        checked_frame_depth_symmetries: 0,
         checked_frame_body_items: 0,
         checked_frame_closes: 0,
         managed_frame_kinds: Vec::new(),
@@ -2385,6 +2705,8 @@ fn formatting_sweep_all_files_generate_out_report() {
     let mut checked_files = 0usize;
     let mut checked_regressions = 0usize;
     let mut checked_frames = 0usize;
+    let mut checked_frame_boundaries = 0usize;
+    let mut checked_frame_depth_symmetries = 0usize;
     let mut checked_frame_body_items = 0usize;
     let mut checked_frame_closes = 0usize;
     let mut managed_frame_kinds = Vec::new();
@@ -2424,6 +2746,10 @@ fn formatting_sweep_all_files_generate_out_report() {
         checked_regressions = checked_regressions.saturating_add(1);
         let run = format_sweep_run(source, db_type);
         checked_frames = checked_frames.saturating_add(run.checked_frames);
+        checked_frame_boundaries =
+            checked_frame_boundaries.saturating_add(run.checked_frame_boundaries);
+        checked_frame_depth_symmetries =
+            checked_frame_depth_symmetries.saturating_add(run.checked_frame_depth_symmetries);
         checked_frame_body_items =
             checked_frame_body_items.saturating_add(run.checked_frame_body_items);
         checked_frame_closes = checked_frame_closes.saturating_add(run.checked_frame_closes);
@@ -2475,6 +2801,10 @@ fn formatting_sweep_all_files_generate_out_report() {
                 .join(format!("{file_name}.format.out"));
             let run = format_sweep_generate_report_for_file(&input_path, db_type, &out_path, false);
             checked_frames = checked_frames.saturating_add(run.checked_frames);
+            checked_frame_boundaries =
+                checked_frame_boundaries.saturating_add(run.checked_frame_boundaries);
+            checked_frame_depth_symmetries =
+                checked_frame_depth_symmetries.saturating_add(run.checked_frame_depth_symmetries);
             checked_frame_body_items =
                 checked_frame_body_items.saturating_add(run.checked_frame_body_items);
             checked_frame_closes = checked_frame_closes.saturating_add(run.checked_frame_closes);
@@ -2502,7 +2832,7 @@ fn formatting_sweep_all_files_generate_out_report() {
     managed_frame_kinds.sort_unstable();
     managed_list_owner_kinds.sort_unstable();
     let mut aggregate = format!(
-        "Auto-format sweep aggregate\nchecked_files={checked_files}\nchecked_regressions={checked_regressions}\nchecked_frames={checked_frames}\nchecked_frame_body_items={checked_frame_body_items}\nchecked_frame_closes={checked_frame_closes}\nmanaged_frame_kinds={managed_frame_kinds:?}\nmanaged_list_owner_kinds={managed_list_owner_kinds:?}\nfailures={}\n",
+        "Auto-format sweep aggregate\nchecked_files={checked_files}\nchecked_regressions={checked_regressions}\nchecked_frames={checked_frames}\nchecked_frame_boundaries={checked_frame_boundaries}\nchecked_frame_depth_symmetries={checked_frame_depth_symmetries}\nchecked_frame_body_items={checked_frame_body_items}\nchecked_frame_closes={checked_frame_closes}\nmanaged_frame_kinds={managed_frame_kinds:?}\nmanaged_list_owner_kinds={managed_list_owner_kinds:?}\nfailures={}\n",
         failures.len()
     );
     for failure in &failures {

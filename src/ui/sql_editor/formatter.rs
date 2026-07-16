@@ -6,9 +6,8 @@ use crate::sql_delimiter::{
 };
 use crate::sql_format::{SqlFormatFrameId, SqlFormatFrameIdAllocator, SqlFormatScopedFrame};
 use crate::sql_text::{
-    self, FormatIndentedParenOwnerKind, FORMAT_BLOCK_END_QUALIFIER_KEYWORDS,
-    FORMAT_BLOCK_START_KEYWORDS, FORMAT_CLAUSE_KEYWORDS, FORMAT_CONDITION_KEYWORDS,
-    FORMAT_CREATE_SUFFIX_BREAK_KEYWORDS, FORMAT_JOIN_MODIFIER_KEYWORDS,
+    self, FormatIndentedParenOwnerKind, FORMAT_BLOCK_START_KEYWORDS, FORMAT_CLAUSE_KEYWORDS,
+    FORMAT_CONDITION_KEYWORDS, FORMAT_CREATE_SUFFIX_BREAK_KEYWORDS, FORMAT_JOIN_MODIFIER_KEYWORDS,
 };
 use crate::ui::sql_depth::{
     apply_paren_token, split_top_level_keyword_groups, split_top_level_symbol_groups,
@@ -165,6 +164,32 @@ impl FormatItemStaticAnalysis {
 struct FormatterTokenLineProfile {
     start_newline_count: usize,
     end_newline_count: usize,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum FormatterSourceBreakPolicy {
+    CanonicalInline,
+    Preserve,
+}
+
+impl FormatterSourceBreakPolicy {
+    fn classify(
+        grammar_requires_inline: bool,
+        is_first_frame_child: bool,
+        follows_expression_operator: bool,
+        previous_word: Option<&str>,
+        current_word: &str,
+    ) -> Self {
+        if grammar_requires_inline
+            || is_first_frame_child
+            || follows_expression_operator
+            || crate::sql_text::format_source_gap_is_canonical_inline(previous_word, current_word)
+        {
+            Self::CanonicalInline
+        } else {
+            Self::Preserve
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -490,6 +515,8 @@ pub(super) struct FormatFrameAlignmentIssue {
 #[derive(Clone, Debug, Default)]
 pub(super) struct FormatFrameAlignmentAuditSummary {
     pub(super) checked_frames: usize,
+    pub(super) checked_frame_boundaries: usize,
+    pub(super) checked_frame_depth_symmetries: usize,
     pub(super) checked_body_items: usize,
     pub(super) checked_closes: usize,
     pub(super) managed_frame_kinds: Vec<FormatManagedFrameKind>,
@@ -2822,6 +2849,20 @@ impl FormatFrameAlignmentAudit {
                 } if *frame_id == parent_id => Some(*token_idx),
                 _ => None,
             });
+            if let Some(parent_close) = parent_close {
+                summary.checked_frame_boundaries =
+                    summary.checked_frame_boundaries.saturating_add(1);
+                if frame.open_token_idx >= parent_close {
+                    let offset = spans.get(frame.open_token_idx).map_or(0, |span| span.start);
+                    summary.issues.push(FormatFrameAlignmentIssue {
+                        offset,
+                        message: format!(
+                            "format frame {} opens outside containing parent {parent_id} boundary",
+                            frame.id
+                        ),
+                    });
+                }
+            }
             if let (Some(child_close), Some(parent_close)) = (child_close, parent_close) {
                 if child_close > parent_close {
                     let offset = spans.get(child_close).map_or(0, |span| span.start);
@@ -2846,11 +2887,54 @@ impl FormatFrameAlignmentAudit {
                     let Some(span) = spans.get(token_idx) else {
                         continue;
                     };
+                    let frame = self.frame(frame_id);
+                    let close_token_idx = self.events.iter().find_map(|event| match event {
+                        FormatFrameAlignmentEvent::Close {
+                            frame_id: close_frame_id,
+                            token_idx,
+                            ..
+                        } if *close_frame_id == frame_id => Some(*token_idx),
+                        _ => None,
+                    });
+                    if let Some(frame) = frame {
+                        summary.checked_frame_boundaries =
+                            summary.checked_frame_boundaries.saturating_add(1);
+                        if token_idx < frame.open_token_idx
+                            || close_token_idx.is_some_and(|close_idx| token_idx > close_idx)
+                        {
+                            summary.issues.push(FormatFrameAlignmentIssue {
+                                offset: span.start,
+                                message: format!(
+                                    "format frame {frame_id} body item at token {token_idx} falls outside open/close boundary"
+                                ),
+                            });
+                        }
+                    }
                     let Some(actual_indent) = Self::line_start_indent(formatted, span.start) else {
                         continue;
                     };
                     summary.checked_body_items = summary.checked_body_items.saturating_add(1);
-                    let frame = self.frame(frame_id);
+                    if frame.is_some_and(|frame| {
+                        frame.depth_relation == FormatFrameDepthRelation::Child
+                    }) {
+                        let close_indent = close_token_idx
+                            .filter(|close_idx| token_idx < *close_idx)
+                            .and_then(|close_idx| spans.get(close_idx))
+                            .and_then(|span| Self::line_start_indent(formatted, span.start));
+                        if let Some(close_indent) = close_indent {
+                            summary.checked_frame_depth_symmetries =
+                                summary.checked_frame_depth_symmetries.saturating_add(1);
+                            let expected_body_indent = close_indent.saturating_add(1);
+                            if actual_indent != expected_body_indent {
+                                summary.issues.push(FormatFrameAlignmentIssue {
+                                    offset: span.start,
+                                    message: format!(
+                                        "format frame {frame_id} body/close depth asymmetry: expected body level {expected_body_indent} from close level {close_indent}, actual body level {actual_indent}"
+                                    ),
+                                });
+                            }
+                        }
+                    }
                     if kind == FormatFrameAlignmentBodyEventKind::FirstItem
                         && (frame.is_some_and(|frame| frame.direct_list_body)
                             || matches!(
@@ -8625,6 +8709,21 @@ impl SqlEditorWidget {
                         frame_alignment_audit.checked_frames = frame_alignment_audit
                             .checked_frames
                             .saturating_add(formatted_result.frame_alignment_audit.checked_frames);
+                        frame_alignment_audit.checked_frame_boundaries = frame_alignment_audit
+                            .checked_frame_boundaries
+                            .saturating_add(
+                                formatted_result
+                                    .frame_alignment_audit
+                                    .checked_frame_boundaries,
+                            );
+                        frame_alignment_audit.checked_frame_depth_symmetries =
+                            frame_alignment_audit
+                                .checked_frame_depth_symmetries
+                                .saturating_add(
+                                    formatted_result
+                                        .frame_alignment_audit
+                                        .checked_frame_depth_symmetries,
+                                );
                         frame_alignment_audit.checked_body_items =
                             frame_alignment_audit.checked_body_items.saturating_add(
                                 formatted_result.frame_alignment_audit.checked_body_items,
@@ -10945,7 +11044,6 @@ impl SqlEditorWidget {
                                                             // CASE is handled separately for SELECT vs PL/SQL context
                                                             // LOOP is handled separately for FOR ... LOOP on same line
         let block_start_keywords = FORMAT_BLOCK_START_KEYWORDS;
-        let block_end_qualifiers = FORMAT_BLOCK_END_QUALIFIER_KEYWORDS; // END LOOP, END IF, END CASE, END REPEAT
         let owned_metadata;
         let metadata = if let Some(metadata) = input.metadata.as_ref() {
             metadata
@@ -11921,8 +12019,13 @@ impl SqlEditorWidget {
                         let mut last_rendered_end_word_idx = end_word_idx;
                         let active_end_block = format_stack.last_block_kind();
                         let end_qualifier_idx = next_non_comment_idx.filter(|lookahead_idx| {
-                            matches!(tokens.get(*lookahead_idx), Some(SqlToken::Word(_)))
-                                && token_starts_on_same_line_after(idx, *lookahead_idx)
+                            let Some(SqlToken::Word(qualifier)) = tokens.get(*lookahead_idx) else {
+                                return false;
+                            };
+                            token_starts_on_same_line_after(idx, *lookahead_idx)
+                                || (*lookahead_idx == idx.saturating_add(1)
+                                    && token_gap_contains_newline(idx, *lookahead_idx)
+                                    && sql_text::is_format_block_end_qualifier_keyword(qualifier))
                         });
                         let end_qualifier = end_qualifier_idx.and_then(word_upper_at);
                         let split_end_qualifier = if end_qualifier.is_none() {
@@ -12025,7 +12128,7 @@ impl SqlEditorWidget {
                             // END LOOP, END IF, END CASE - pop matching block
                             if let Some(top) = format_stack.last_block_kind() {
                                 if top.supports_qualified_end()
-                                    && block_end_qualifiers.contains(&top.as_str())
+                                    && sql_text::is_format_block_end_qualifier_keyword(top.as_str())
                                 {
                                     if let Some(popped_block) = format_stack.pop_block() {
                                         closed_mysql_handler_begin |=
@@ -14311,16 +14414,33 @@ impl SqlEditorWidget {
                         .then_some(
                             matches!(next_non_comment, Some(SqlToken::Symbol(sym)) if sym == "("),
                         );
-                    let fixed_phrase_continuation = is_any_within_group
-                        || is_merge_delete_where
-                        || format_stack.last_paren_first_body_is(idx)
-                        || matches!(prev_word_upper, Some("AND" | "OR"))
-                        || (!mysql_compatible
-                            && matches!(
-                                (prev_word_upper, upper),
-                                (Some("IS"), "NULL" | "NOT") | (Some("NOT"), "NULL")
-                            ));
-                    if !at_line_start && token_gap_has_newline && !fixed_phrase_continuation {
+                    let previous_expression_token = loop_second_previous_non_comment_token
+                        .and_then(Self::format_trailing_meaningful_token_from_sql_token);
+                    let trailing_expression_token = loop_previous_non_comment_token
+                        .and_then(Self::format_trailing_meaningful_token_from_sql_token);
+                    let follows_expression_operator =
+                        trailing_expression_token.is_some_and(|last| {
+                            crate::sql_text::format_trailing_continuation_operator_kind_from_token_pair(
+                                previous_expression_token,
+                                last,
+                            )
+                            .is_some()
+                        });
+                    let source_break_policy = FormatterSourceBreakPolicy::classify(
+                        is_any_within_group
+                            || is_merge_delete_where
+                            || format_stack.last_paren_first_body_is(idx),
+                        format_stack
+                            .first_condition_body_indent_for_token(current_scope, idx)
+                            .is_some(),
+                        follows_expression_operator,
+                        prev_word_upper,
+                        upper,
+                    );
+                    if !at_line_start
+                        && token_gap_has_newline
+                        && source_break_policy == FormatterSourceBreakPolicy::Preserve
+                    {
                         if let Some(split_end_indent) =
                             format_stack.pending_split_end_suffix_indent()
                         {
@@ -20727,6 +20847,60 @@ mod frame_alignment_audit_tests {
             "{:#?}",
             summary.issues
         );
+    }
+
+    #[test]
+    fn frame_alignment_audit_reports_child_opened_after_parent_close() {
+        let formatted = "BEGIN\nEND;\n    CHILD";
+        let mut audit = FormatFrameAlignmentAudit::default();
+        audit.register_open(1, None, 0, None, false, None);
+        audit.register_open(2, Some(1), 3, None, false, None);
+        audit.record_close(1, None, 1, false, None);
+
+        let summary = audit.resolve(formatted, false);
+
+        assert_eq!(summary.checked_frame_boundaries, 1);
+        assert!(summary.issues.iter().any(|issue| {
+            issue
+                .message
+                .contains("opens outside containing parent 1 boundary")
+        }));
+    }
+
+    #[test]
+    fn frame_alignment_audit_reports_body_outside_own_boundary() {
+        let formatted = "OPEN CLOSE\n    BODY";
+        let mut audit = FormatFrameAlignmentAudit::default();
+        audit.register_open(1, None, 0, None, false, None);
+        audit.record_first_body_item(1, Some(2));
+        audit.record_close(1, None, 1, false, None);
+
+        let summary = audit.resolve(formatted, false);
+
+        assert_eq!(summary.checked_frame_boundaries, 1);
+        assert!(summary.issues.iter().any(|issue| {
+            issue
+                .message
+                .contains("body item at token 2 falls outside open/close boundary")
+        }));
+    }
+
+    #[test]
+    fn frame_alignment_audit_reports_body_close_depth_asymmetry() {
+        let formatted = "OPEN\n        BODY\nCLOSE";
+        let mut audit = FormatFrameAlignmentAudit::default();
+        audit.register_open(1, None, 0, None, false, None);
+        audit.record_first_body_item(1, Some(1));
+        audit.record_close(1, None, 2, false, None);
+
+        let summary = audit.resolve(formatted, false);
+
+        assert_eq!(summary.checked_frame_depth_symmetries, 1);
+        assert!(summary.issues.iter().any(|issue| {
+            issue.message.contains(
+                "body/close depth asymmetry: expected body level 1 from close level 0, actual body level 2",
+            )
+        }));
     }
 }
 
