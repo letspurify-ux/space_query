@@ -226,7 +226,7 @@ fn span_is_cte_or_window_name_declaration(
     idx: usize,
     matching_parens: &[Option<usize>],
 ) -> bool {
-    if !span_is_word(&spans[idx]) {
+    if !span_is_word(&spans[idx]) || !span_can_start_cte_or_window_name(spans, idx) {
         return false;
     }
     let Some(mut next_idx) = next_significant_idx(spans, idx) else {
@@ -246,6 +246,92 @@ fn span_is_cte_or_window_name_declaration(
     }
     next_significant_idx(spans, next_idx)
         .is_some_and(|open_idx| span_is_symbol(spans.get(open_idx), "("))
+}
+
+fn span_can_start_cte_or_window_name(spans: &[SqlTokenSpan], idx: usize) -> bool {
+    let Some(prev_idx) = previous_significant_idx(spans, idx) else {
+        return true;
+    };
+    if span_word_upper(spans.get(prev_idx))
+        .is_some_and(|word| matches!(word.as_str(), "WITH" | "WINDOW"))
+    {
+        return true;
+    }
+    if span_word_upper(spans.get(prev_idx)).is_some_and(|word| word == "RECURSIVE") {
+        return previous_significant_idx(spans, prev_idx)
+            .and_then(|before| span_word_upper(spans.get(before)))
+            .is_some_and(|word| word == "WITH");
+    }
+    if !span_is_symbol(spans.get(prev_idx), ",") {
+        return span_is_symbol(spans.get(prev_idx), ";")
+            && has_open_with_declaration_before(spans, prev_idx);
+    }
+
+    preceding_same_level_clause_word(spans, prev_idx)
+        .is_some_and(|word| matches!(word.as_str(), "WITH" | "WINDOW"))
+        || has_open_same_level_clause_before(spans, prev_idx, "WITH")
+}
+
+fn has_open_with_declaration_before(spans: &[SqlTokenSpan], before_idx: usize) -> bool {
+    let mut pos = before_idx;
+    while pos > 0 {
+        pos -= 1;
+        let Some(word) = span_word_upper(spans.get(pos)) else {
+            continue;
+        };
+        if word == "WITH" {
+            return true;
+        }
+        if matches!(
+            word.as_str(),
+            "SELECT" | "INSERT" | "UPDATE" | "DELETE" | "MERGE" | "CREATE" | "ALTER" | "DROP"
+        ) {
+            return false;
+        }
+    }
+    false
+}
+
+fn has_open_same_level_clause_before(
+    spans: &[SqlTokenSpan],
+    before_idx: usize,
+    clause: &str,
+) -> bool {
+    let mut depth = 0usize;
+    let mut pos = before_idx;
+    while pos > 0 {
+        pos -= 1;
+        let Some(span) = spans.get(pos) else {
+            break;
+        };
+        if matches!(span.token, SqlToken::Comment(_)) {
+            continue;
+        }
+        if span_is_symbol(Some(span), ")") {
+            depth = depth.saturating_add(1);
+            continue;
+        }
+        if span_is_symbol(Some(span), "(") {
+            depth = depth.saturating_sub(1);
+            continue;
+        }
+        if depth != 0 {
+            continue;
+        }
+        let Some(word) = span_word_upper(Some(span)) else {
+            continue;
+        };
+        if word == clause {
+            return true;
+        }
+        if matches!(
+            word.as_str(),
+            "SELECT" | "INSERT" | "UPDATE" | "DELETE" | "MERGE" | "CREATE" | "ALTER" | "DROP"
+        ) {
+            return false;
+        }
+    }
+    false
 }
 
 fn bracket_alias_declaration_at(
@@ -316,7 +402,7 @@ fn bracket_span_is_alias_declaration(
     if let Some(as_idx) = previous_significant_idx(spans, start_idx)
         .filter(|prev| span_word_upper(spans.get(*prev)).is_some_and(|word| word == "AS"))
     {
-        if as_belongs_to_type_cast_clause(spans, as_idx) {
+        if as_belongs_to_non_alias_clause(spans, as_idx) {
             return false;
         }
         return next_significant_idx(spans, end_idx)
@@ -344,7 +430,7 @@ fn span_is_alias_declaration(spans: &[SqlTokenSpan], idx: usize) -> bool {
     if let Some(as_idx) = previous_significant_idx(spans, idx)
         .filter(|prev| span_word_upper(spans.get(*prev)).is_some_and(|word| word == "AS"))
     {
-        if as_belongs_to_type_cast_clause(spans, as_idx) {
+        if as_belongs_to_non_alias_clause(spans, as_idx) {
             return false;
         }
         let next_can_end_alias = next_significant_idx(spans, idx)
@@ -409,7 +495,23 @@ fn next_significant_idx(spans: &[SqlTokenSpan], idx: usize) -> Option<usize> {
     None
 }
 
-fn as_belongs_to_type_cast_clause(spans: &[SqlTokenSpan], as_idx: usize) -> bool {
+fn as_belongs_to_non_alias_clause(spans: &[SqlTokenSpan], as_idx: usize) -> bool {
+    if previous_significant_idx(spans, as_idx)
+        .and_then(|idx| span_word_upper(spans.get(idx)))
+        .is_some_and(|word| matches!(word.as_str(), "ALWAYS" | "STORE"))
+    {
+        return true;
+    }
+    let statement_words = same_level_words_before(spans, as_idx);
+    if statement_words.iter().any(|word| word == "GENERATED") {
+        return true;
+    }
+    if statement_words.iter().any(|word| word == "CREATE")
+        && statement_words.iter().any(|word| word == "TYPE")
+    {
+        return true;
+    }
+
     let mut depth = 0usize;
     let mut pos = as_idx;
     while pos > 0 {
@@ -431,10 +533,59 @@ fn as_belongs_to_type_cast_clause(spans: &[SqlTokenSpan], as_idx: usize) -> bool
             }
             return previous_significant_idx(spans, pos)
                 .and_then(|func_idx| span_word_upper(spans.get(func_idx)))
-                .is_some_and(|word| matches!(word.as_str(), "CAST" | "CONVERT" | "TREAT"));
+                .is_some_and(|word| {
+                    matches!(
+                        word.as_str(),
+                        "CAST"
+                            | "COLUMN_GET"
+                            | "CONVERT"
+                            | "JSON_SERIALIZE"
+                            | "TREAT"
+                            | "XMLCAST"
+                            | "XMLSERIALIZE"
+                    )
+                });
         }
     }
     false
+}
+
+fn same_level_words_before(spans: &[SqlTokenSpan], before_idx: usize) -> Vec<String> {
+    let mut words = Vec::new();
+    let mut depth = 0usize;
+    let mut pos = before_idx;
+    while pos > 0 {
+        pos -= 1;
+        let Some(span) = spans.get(pos) else {
+            break;
+        };
+        if matches!(span.token, SqlToken::Comment(_)) {
+            continue;
+        }
+        if span_is_symbol(Some(span), ")") {
+            depth = depth.saturating_add(1);
+            continue;
+        }
+        if span_is_symbol(Some(span), "(") {
+            if depth == 0 {
+                break;
+            }
+            depth -= 1;
+            continue;
+        }
+        if depth == 0 && span_is_symbol(Some(span), ",") {
+            break;
+        }
+        if depth == 0 && span_is_symbol(Some(span), ";") {
+            break;
+        }
+        if depth == 0 {
+            if let Some(word) = span_word_upper(Some(span)) {
+                words.push(word);
+            }
+        }
+    }
+    words
 }
 
 fn span_alias_lookup_name(span: &SqlTokenSpan) -> Option<String> {
@@ -457,6 +608,11 @@ fn span_before_alias_is_relation_reference(spans: &[SqlTokenSpan], prev_idx: usi
     else {
         return false;
     };
+    if span_word_upper(spans.get(prev_idx)).is_some_and(|word| {
+        sql_text::is_oracle_sql_keyword(&word) || sql_text::is_mysql_sql_keyword(&word)
+    }) {
+        return false;
+    }
 
     let mut cursor = prev_idx;
     loop {
@@ -474,7 +630,8 @@ fn span_before_alias_is_relation_reference(spans: &[SqlTokenSpan], prev_idx: usi
             continue;
         }
         if span_is_symbol(spans.get(before_idx), ",") {
-            return true;
+            return preceding_same_level_clause_word(spans, before_idx)
+                .is_some_and(|word| is_relation_alias_introducer(word.as_str()));
         }
         return span_word_upper(spans.get(before_idx))
             .is_some_and(|word| is_relation_alias_introducer(word.as_str()));
@@ -493,13 +650,53 @@ fn closing_paren_before_alias_is_relation_reference(
     };
 
     if span_is_symbol(spans.get(before_open_idx), ",") {
-        return true;
+        return preceding_same_level_clause_word(spans, before_open_idx)
+            .is_some_and(|word| is_relation_alias_introducer(word.as_str()));
     }
 
     span_word_upper(spans.get(before_open_idx)).is_some_and(|word| {
         is_relation_alias_introducer(word.as_str())
             || matches!(word.as_str(), "PIVOT" | "UNPIVOT" | "MATCH_RECOGNIZE")
     })
+}
+
+fn preceding_same_level_clause_word(spans: &[SqlTokenSpan], before_idx: usize) -> Option<String> {
+    let mut depth = 0usize;
+    let mut pos = before_idx;
+    while pos > 0 {
+        pos -= 1;
+        let span = spans.get(pos)?;
+        if matches!(span.token, SqlToken::Comment(_)) {
+            continue;
+        }
+        if span_is_symbol(Some(span), ")") {
+            depth = depth.saturating_add(1);
+            continue;
+        }
+        if span_is_symbol(Some(span), "(") {
+            if depth == 0 {
+                return None;
+            }
+            depth -= 1;
+            continue;
+        }
+        if depth != 0 {
+            continue;
+        }
+        if span_is_symbol(Some(span), ";") {
+            return None;
+        }
+        let Some(word) = span_word_upper(Some(span)) else {
+            continue;
+        };
+        if matches!(word.as_str(), "WITH" | "WINDOW") || is_relation_alias_introducer(&word) {
+            return Some(word);
+        }
+        if sql_text::is_statement_head_keyword(&word) || is_alias_following_clause_word(&word) {
+            return None;
+        }
+    }
+    None
 }
 
 fn matching_left_paren_idx(spans: &[SqlTokenSpan], close_idx: usize) -> Option<usize> {
@@ -2724,5 +2921,61 @@ END$$"#;
         let aliases = collect_local_alias_context(sql);
 
         assert!(!aliases.contains_name("MULTISET"));
+    }
+
+    #[test]
+    fn local_alias_context_rejects_non_alias_as_and_comma_grammar() {
+        let sql = r#"
+CREATE OR REPLACE TYPE pair_t AS OBJECT (k VARCHAR2(30), v CLOB);
+CREATE TABLE t (
+    id NUMBER GENERATED BY DEFAULT AS IDENTITY,
+    name VARCHAR2(30) GENERATED ALWAYS AS (UPPER(name)) VIRTUAL
+) XMLTYPE COLUMN payload STORE AS BASICFILE CLOB;
+CREATE PROCEDURE p(p_text CLOB, p_count NUMBER) AS
+BEGIN
+    SELECT XMLSERIALIZE(CONTENT payload AS CLOB),
+           COLUMN_GET(attrs, 'region' AS CHAR)
+    FROM t
+    FOR UPDATE SKIP LOCKED;
+END;
+"#;
+        let aliases = collect_local_alias_context(sql);
+
+        for non_alias in [
+            "OBJECT",
+            "CLOB",
+            "IDENTITY",
+            "ALWAYS",
+            "BASICFILE",
+            "CHAR",
+            "LOCKED",
+        ] {
+            assert!(
+                !aliases.contains_name(non_alias),
+                "`{non_alias}` is grammar, not an alias"
+            );
+        }
+    }
+
+    #[test]
+    fn local_alias_context_keeps_real_cte_and_keyword_aliases() {
+        let sql = r#"
+WITH events AS (
+    SELECT amount AS status
+    FROM sales IF
+), calendar(day_no) AS (
+    SELECT 1 FROM dual
+)
+CYCLE day_no SET cycle_yn TO 'Y' DEFAULT 'N',
+events_after_cycle(event_id) AS (
+    SELECT 1 FROM dual
+)
+SELECT IF.status FROM events IF;
+"#;
+        let aliases = collect_local_alias_context(sql);
+
+        for alias in ["EVENTS", "STATUS", "IF", "EVENTS_AFTER_CYCLE"] {
+            assert!(aliases.contains_name(alias), "missing real alias `{alias}`");
+        }
     }
 }

@@ -3,6 +3,8 @@ use crate::ui::syntax_highlight::{
     set_text_buffer_raw_bytes, LexerState, STYLE_BLOCK_COMMENT, STYLE_COMMENT,
     STYLE_DATETIME_LITERAL, STYLE_HINT, STYLE_Q_QUOTE_STRING, STYLE_QUOTED_IDENTIFIER,
 };
+#[cfg(test)]
+use crate::ui::syntax_highlight::HighlightWordAudit;
 
 const DEFERRED_REHIGHLIGHT_IDLE_DELAY_SECONDS: f64 = 0.15;
 const SEMANTIC_REHIGHLIGHT_OVERSCAN_LINES: usize = 100;
@@ -12,6 +14,7 @@ pub(crate) struct HighlightShadowState {
     text: ChunkedText,
     styles: ChunkedValues<u8>,
     line_exit_states: ChunkedValues<LexerState>,
+    alias_context: super::query_text::LocalAliasContext,
 }
 
 impl HighlightShadowState {
@@ -21,6 +24,7 @@ impl HighlightShadowState {
         styles: &str,
         line_exit_states: Vec<LexerState>,
     ) {
+        self.alias_context = super::query_text::collect_local_alias_context(&text);
         self.text = ChunkedText::from_string(text);
         self.styles = ChunkedValues::from_vec(styles.as_bytes().to_vec());
         self.line_exit_states = ChunkedValues::from_vec(line_exit_states);
@@ -375,6 +379,8 @@ impl HighlightShadowState {
             start,
             inserted_text.len(),
         );
+        self.alias_context =
+            super::query_text::collect_local_alias_context(&self.text.to_flat_string());
         true
     }
 }
@@ -386,10 +392,56 @@ fn text_ends_with_line_break(text: &str) -> bool {
         .is_some_and(|byte| byte == b'\n' || byte == b'\r')
 }
 
-fn build_logical_styles_and_line_states(
+pub(crate) fn build_logical_styles_and_line_states(
     highlighter: &SqlHighlighter,
     text: &str,
 ) -> (String, Vec<LexerState>) {
+    let alias_context = super::query_text::collect_local_alias_context(text);
+    build_logical_styles_and_line_states_with(text, |line_text, entry_state, line_start| {
+        highlighter.generate_styles_for_window_with_alias_context(
+            line_text,
+            entry_state,
+            &alias_context,
+            line_start,
+        )
+    })
+}
+
+#[cfg(test)]
+pub(crate) fn build_logical_styles_and_line_states_with_word_audit(
+    highlighter: &SqlHighlighter,
+    text: &str,
+) -> (String, Vec<LexerState>, Vec<HighlightWordAudit>) {
+    let mut audits = Vec::new();
+    let alias_context = super::query_text::collect_local_alias_context(text);
+    let (styles, states) = build_logical_styles_and_line_states_with(
+        text,
+        |line_text, entry_state, line_start| {
+            let (line_styles, exit_state, mut line_audits) = highlighter
+                .generate_styles_for_window_with_word_audit(
+                    line_text,
+                    entry_state,
+                    &alias_context,
+                    line_start,
+                );
+            for audit in &mut line_audits {
+                audit.start = audit.start.saturating_add(line_start);
+                audit.end = audit.end.saturating_add(line_start);
+            }
+            audits.extend(line_audits);
+            (line_styles, exit_state)
+        },
+    );
+    (styles, states, audits)
+}
+
+fn build_logical_styles_and_line_states_with<F>(
+    text: &str,
+    mut highlight_line: F,
+) -> (String, Vec<LexerState>)
+where
+    F: FnMut(&str, LexerState, usize) -> (String, LexerState),
+{
     if text.is_empty() {
         return (String::new(), Vec::new());
     }
@@ -402,8 +454,7 @@ fn build_logical_styles_and_line_states(
     while line_start < text.len() {
         let line_end = inclusive_line_end_for_text(text, line_start);
         let line_text = text.get(line_start..line_end).unwrap_or_default();
-        let (line_styles, exit_state) =
-            highlighter.generate_styles_for_window(line_text, entry_state);
+        let (line_styles, exit_state) = highlight_line(line_text, entry_state, line_start);
         styles.extend_from_slice(line_styles.as_bytes());
         line_exit_states.push(exit_state);
 
@@ -675,8 +726,13 @@ impl SqlEditorWidget {
             let range_text = shadow.text_range_string(current_start, current_end)?;
             let previous_styles = shadow.style_range_string(current_start, current_end)?;
             let old_exit_state = shadow.line_exit_state(current_line_idx);
-            let (new_styles, new_exit_state) =
-                highlighter.generate_styles_for_window(&range_text, entry_state);
+            let (new_styles, new_exit_state) = highlighter
+                .generate_styles_for_window_with_alias_context(
+                    &range_text,
+                    entry_state,
+                    &shadow.alias_context,
+                    current_start,
+                );
             if new_styles.len() != range_text.len() {
                 return None;
             }
@@ -795,7 +851,12 @@ impl SqlEditorWidget {
                 .highlighter
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
-            let (styles, _) = highlighter.generate_styles_for_window(&text, entry_state);
+            let (styles, _) = highlighter.generate_styles_for_window_with_alias_context(
+                &text,
+                entry_state,
+                &shadow.alias_context,
+                start,
+            );
             if styles.len() != text.len() {
                 return;
             }

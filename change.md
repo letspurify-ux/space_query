@@ -3808,3 +3808,51 @@ RETURNING과 시스템/애플리케이션 시간 구문까지 open/body/sibling/
 | `cargo test` | 6,720 통과·232 ignored·실패 0, doc-test 실패 0 |
 | `cargo clippy --locked --all-targets -- -D warnings -W clippy::perf -W clippy::complexity` | 통과, 경고 0 |
 | `cargo fmt --all -- --check` / `git diff --check` | 통과 |
+
+## 27-1. 생산 경로 하이라이팅 양방향 전수 감사
+
+AS-IS: 하이라이터가 `AS` 다음 단어를 자체 상태로 별칭 추정하고, SQL editor의 별칭
+수집기는 별도의 휴리스틱을 사용했다. 이중 판정 때문에 `GENERATED ALWAYS`, `AS CLOB`,
+`STORE AS BASICFILE`, `FOR UPDATE`, CASE의 `END` 같은 문법 토큰이 별칭으로 오인될 수
+있었다. 또한 기존 단위 테스트는 등록된 키워드와 오브젝트 종류별 예시는 검사했지만,
+fixture 전체 단어·오브젝트·문자열/주석 영역을 한 보고서에서 양방향 감사하지 않았다.
+
+TO-BE: `collect_local_alias_context`가 실제 별칭 선언 범위를 한 번 계산하고 최초 전체
+렌더링, 증분 줄 재하이라이팅, visible semantic refresh가 같은 문맥을 공유하도록 생산
+경로를 통합했다. 타입 변환, 생성 컬럼, XML/LOB storage, Oracle object type, CTE/window,
+relation alias 문맥은 토큰 깊이와 절 소유자를 기준으로 구분한다. 하이라이터 내부의
+`AS` 다음 단어 추정 상태는 제거했다.
+
+`syntax_highlighting_sweep_all_files_generate_out_report`는 다음을 수행한다.
+
+- Oracle/MySQL/MariaDB 61개 원본 fixture를 실제 줄별 상태 전파 경로로 렌더링한다.
+- lexer가 코드로 판정한 모든 단어의 기대/실제 스타일을 비교한다.
+- fixture DDL에서 table/view/materialized view/function/procedure/package/sequence/trigger/
+  event/type/index/synonym/schema를 수집해 생산 `HighlightData` 경로로 주입한다.
+- 등록되지 않은 일반 단어가 keyword/function/object/column으로 잘못 칠해지는 경우도
+  실패시킨다.
+- parser lexical span의 문자열·주석·인용 영역에 semantic highlight가 침범하는 경우도
+  실패시킨다.
+- 파일별 `target/highlight-sweep/**.highlight.out`과 aggregate 보고서를 생성한다.
+
+전수 감사에서 확인한 dialect 누락은 공용 카탈로그에 반영했다. Oracle PL/SQL cursor/
+SQL 속성, GROUPING 문법, object/member built-in과 MySQL/MariaDB ARRAY/SRID, temporal,
+application-time, vector index, ROWS EXAMINED, UUID v7 문법/함수가 포함된다.
+
+| 하이라이팅 전수 감사 항목 | 결과 |
+| --- | ---: |
+| fixture / 코드 단어 | 61 / 70,087 |
+| catalog 단어 / 정상 강조 / 문맥 식별자 | 37,892 / 37,377 / 515 |
+| 오브젝트 단어 / 정상 강조 / 문맥 식별자 | 2,927 / 2,927 / 0 |
+| 보호 lexical span / byte | 8,763 / 251,967 |
+| 잘못 강조된 일반 단어 / 실패 | 0 / 0 |
+
+## 27-2. 최종 품질 게이트
+
+| 검증 | 결과 |
+| --- | --- |
+| `syntax_highlighting_sweep_all_files_generate_out_report` | 통과, 61개 파일·70,087단어·failure 0 |
+| `formatting_sweep_all_files_generate_out_report` | 통과, 61개 파일·failure 0 |
+| `cargo test --lib` | 6,575 통과·229 ignored·실패 0 |
+| `cargo clippy --locked --all-targets -- -D warnings -W clippy::perf -W clippy::complexity` | 통과, 경고 0 |
+| `cargo fmt --all -- --check` / `git diff --check` | 통과 |

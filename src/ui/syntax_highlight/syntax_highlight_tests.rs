@@ -1,4 +1,5 @@
 use super::*;
+use std::collections::{BTreeMap, HashSet};
 use std::fs;
 use std::path::PathBuf;
 
@@ -22,6 +23,522 @@ fn assert_token_has_style(text: &str, styles: &str, token: &str, expected_style:
             .all(|style| style == expected_style),
         "{token} should use style {expected_style}"
     );
+}
+
+#[test]
+#[ignore = "audits every SQL fixture word through the production full-highlight path"]
+fn syntax_highlighting_sweep_all_files_generate_out_report() {
+    let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let output_root = manifest.join("target/highlight-sweep");
+    let mut failures = Vec::new();
+    let mut checked_files = 0usize;
+    let mut checked_words = 0usize;
+    let mut checked_catalog_words = 0usize;
+    let mut highlighted_catalog_words = 0usize;
+    let mut contextual_catalog_words = 0usize;
+    let mut checked_object_words = 0usize;
+    let mut highlighted_object_words = 0usize;
+    let mut contextual_object_words = 0usize;
+    let mut unexpected_highlights = 0usize;
+    let mut protected_lexical_spans = 0usize;
+    let mut protected_lexical_bytes = 0usize;
+    let mut ordinary_default_words = BTreeMap::<String, (usize, String)>::new();
+    let mut ordinary_default_call_words = BTreeMap::<String, (usize, String)>::new();
+    let mut ordinary_default_percent_words = BTreeMap::<String, (usize, String)>::new();
+    let mut contextual_catalog_word_counts = BTreeMap::<String, (usize, String)>::new();
+
+    for (dir, db_type) in [
+        ("test", DatabaseType::Oracle),
+        ("test_mysql", DatabaseType::MySQL),
+        ("test_mariadb", DatabaseType::MariaDB),
+    ] {
+        let input_dir = manifest.join(dir);
+        let mut entries: Vec<PathBuf> = fs::read_dir(&input_dir)
+            .unwrap_or_else(|err| panic!("failed to read `{}`: {err}", input_dir.display()))
+            .filter_map(Result::ok)
+            .map(|entry| entry.path())
+            .filter(|path| {
+                path.extension()
+                    .and_then(|ext| ext.to_str())
+                    .is_some_and(|ext| matches!(ext, "sql" | "txt"))
+            })
+            .collect();
+        entries.sort();
+
+        for input_path in entries {
+            checked_files = checked_files.saturating_add(1);
+            let source = fs::read_to_string(&input_path)
+                .unwrap_or_else(|err| panic!("failed to read `{}`: {err}", input_path.display()));
+            let (highlight_data, object_names) = highlight_sweep_fixture_objects(&source);
+            let mut highlighter = SqlHighlighter::new();
+            highlighter.set_db_type(db_type);
+            highlighter.set_highlight_data(highlight_data);
+            let (styles, _line_states, word_audits) =
+                crate::ui::sql_editor::build_logical_styles_and_line_states_with_word_audit(
+                    &highlighter,
+                    &source,
+                );
+            assert_eq!(
+                styles.len(),
+                source.len(),
+                "style/source byte length mismatch"
+            );
+            let relative = input_path.strip_prefix(&manifest).unwrap_or(&input_path);
+            let file_checked_words = word_audits.len();
+            let mut file_issues = Vec::new();
+            let mut file_catalog_words = 0usize;
+            let mut file_contextual_words = 0usize;
+            let mut file_object_words = 0usize;
+            let mut file_unexpected_highlights = 0usize;
+
+            for span in crate::sql_parser_engine::lexical_spans(
+                &source,
+                !matches!(db_type, DatabaseType::Oracle),
+            ) {
+                if !matches!(db_type, DatabaseType::Oracle)
+                    && span.kind == crate::sql_parser_engine::LexicalKind::String
+                    && source[span.start..span.end].starts_with('$')
+                {
+                    // MySQL/MariaDB fixture `DELIMITER $$` markers are not
+                    // PostgreSQL dollar-quoted strings.
+                    continue;
+                }
+                protected_lexical_spans = protected_lexical_spans.saturating_add(1);
+                protected_lexical_bytes =
+                    protected_lexical_bytes.saturating_add(span.end.saturating_sub(span.start));
+                let has_semantic_highlight = styles[span.start..span.end].bytes().any(|style| {
+                    matches!(
+                        char::from(style),
+                        STYLE_KEYWORD | STYLE_FUNCTION | STYLE_IDENTIFIER | STYLE_COLUMN
+                    )
+                });
+                if has_semantic_highlight {
+                    let (line, column) = highlight_sweep_line_column(&source, span.start);
+                    let issue = format!(
+                        "{}:{line}:{column}: {:?} span contains semantic highlight",
+                        relative.display(),
+                        span.kind
+                    );
+                    unexpected_highlights = unexpected_highlights.saturating_add(1);
+                    file_unexpected_highlights = file_unexpected_highlights.saturating_add(1);
+                    file_issues.push(issue.clone());
+                    failures.push(issue);
+                }
+            }
+
+            for audit in word_audits {
+                checked_words = checked_words.saturating_add(1);
+                let word = source.get(audit.start..audit.end).unwrap_or("");
+                let upper = ascii_upper_cow(word).into_owned();
+                let is_object_word = object_names.contains(&upper);
+                let expected_style = audit
+                    .expected_style
+                    .or(is_object_word.then_some(STYLE_IDENTIFIER));
+                let Some(expected_style) = expected_style else {
+                    if audit.actual_style == STYLE_DEFAULT {
+                        let (line, column) = highlight_sweep_line_column(&source, audit.start);
+                        let location = format!("{}:{line}:{column}", relative.display());
+                        ordinary_default_words
+                            .entry(upper.clone())
+                            .and_modify(|(count, _)| *count = count.saturating_add(1))
+                            .or_insert((1, location.clone()));
+                        if source[audit.end..]
+                            .trim_start_matches(char::is_whitespace)
+                            .starts_with('(')
+                        {
+                            ordinary_default_call_words
+                                .entry(upper.clone())
+                                .and_modify(|(count, _)| *count = count.saturating_add(1))
+                                .or_insert((1, location.clone()));
+                        }
+                        if source[..audit.start].ends_with('%') {
+                            ordinary_default_percent_words
+                                .entry(upper)
+                                .and_modify(|(count, _)| *count = count.saturating_add(1))
+                                .or_insert((1, location));
+                        }
+                    } else {
+                        let (line, column) = highlight_sweep_line_column(&source, audit.start);
+                        let issue = format!(
+                            "{}:{line}:{column}: `{word}` expected={} actual={} disposition={:?} unexpected-highlight",
+                            relative.display(),
+                            STYLE_DEFAULT,
+                            audit.actual_style,
+                            audit.disposition
+                        );
+                        unexpected_highlights = unexpected_highlights.saturating_add(1);
+                        file_unexpected_highlights = file_unexpected_highlights.saturating_add(1);
+                        file_issues.push(issue.clone());
+                        failures.push(issue);
+                    }
+                    continue;
+                };
+
+                if is_object_word && audit.expected_style.is_none() {
+                    checked_object_words = checked_object_words.saturating_add(1);
+                    file_object_words = file_object_words.saturating_add(1);
+                } else {
+                    checked_catalog_words = checked_catalog_words.saturating_add(1);
+                    file_catalog_words = file_catalog_words.saturating_add(1);
+                }
+
+                if audit.actual_style == expected_style
+                    || (audit.disposition == HighlightWordDisposition::DateTimeLiteral
+                        && audit.actual_style == STYLE_DATETIME_LITERAL)
+                {
+                    if is_object_word && audit.expected_style.is_none() {
+                        highlighted_object_words = highlighted_object_words.saturating_add(1);
+                    } else {
+                        highlighted_catalog_words = highlighted_catalog_words.saturating_add(1);
+                    }
+                    continue;
+                }
+                if matches!(
+                    audit.disposition,
+                    HighlightWordDisposition::ControlAlias
+                        | HighlightWordDisposition::LocalAlias
+                        | HighlightWordDisposition::IdentifierContext
+                        | HighlightWordDisposition::PathIdentifier
+                ) && matches!(
+                    audit.actual_style,
+                    STYLE_DEFAULT | STYLE_IDENTIFIER | STYLE_COLUMN | STYLE_FUNCTION
+                ) {
+                    if is_object_word && audit.expected_style.is_none() {
+                        contextual_object_words = contextual_object_words.saturating_add(1);
+                    } else {
+                        contextual_catalog_words = contextual_catalog_words.saturating_add(1);
+                        file_contextual_words = file_contextual_words.saturating_add(1);
+                    }
+                    let upper = ascii_upper_cow(word);
+                    let key = format!(
+                        "{upper} actual={} disposition={:?}",
+                        audit.actual_style, audit.disposition
+                    );
+                    let (line, column) = highlight_sweep_line_column(&source, audit.start);
+                    let location = format!("{}:{line}:{column}", relative.display());
+                    contextual_catalog_word_counts
+                        .entry(key)
+                        .and_modify(|(count, _)| *count = count.saturating_add(1))
+                        .or_insert((1, location));
+                    continue;
+                }
+
+                let (line, column) = highlight_sweep_line_column(&source, audit.start);
+                let issue = format!(
+                    "{}:{line}:{column}: `{word}` expected={expected_style} actual={} disposition={:?}",
+                    relative.display(),
+                    audit.actual_style,
+                    audit.disposition
+                );
+                file_issues.push(issue.clone());
+                failures.push(issue);
+            }
+
+            let file_name = relative
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or("highlight.sql");
+            let out_path = output_root
+                .join(relative.parent().unwrap_or(std::path::Path::new("")))
+                .join(format!("{file_name}.highlight.out"));
+            if let Some(parent) = out_path.parent() {
+                fs::create_dir_all(parent).expect("create highlight sweep output directory");
+            }
+            let mut report = format!(
+                "Syntax-highlight sweep report\nsource={}\ndb={db_type:?}\nchecked_words={}\nchecked_catalog_words={file_catalog_words}\ncontextual_catalog_words={file_contextual_words}\nchecked_object_words={file_object_words}\nunexpected_highlights={file_unexpected_highlights}\nissues={}\n",
+                relative.display(),
+                file_checked_words,
+                file_issues.len()
+            );
+            for issue in file_issues {
+                report.push_str(&issue);
+                report.push('\n');
+            }
+            fs::write(&out_path, report)
+                .unwrap_or_else(|err| panic!("failed to write `{}`: {err}", out_path.display()));
+        }
+    }
+
+    let mut aggregate = format!(
+        "Syntax-highlight sweep aggregate\nchecked_files={checked_files}\nchecked_words={checked_words}\nchecked_catalog_words={checked_catalog_words}\nhighlighted_catalog_words={highlighted_catalog_words}\ncontextual_catalog_words={contextual_catalog_words}\nchecked_object_words={checked_object_words}\nhighlighted_object_words={highlighted_object_words}\ncontextual_object_words={contextual_object_words}\nprotected_lexical_spans={protected_lexical_spans}\nprotected_lexical_bytes={protected_lexical_bytes}\nunexpected_highlights={unexpected_highlights}\nordinary_default_distinct_words={}\nfailures={}\n",
+        ordinary_default_words.len(),
+        failures.len()
+    );
+    aggregate.push_str("ordinary_default_words:\n");
+    for (word, (count, location)) in ordinary_default_words {
+        aggregate.push_str(&format!("{word}={count} first={location}\n"));
+    }
+    aggregate.push_str("ordinary_default_call_words:\n");
+    for (word, (count, location)) in ordinary_default_call_words {
+        aggregate.push_str(&format!("{word}={count} first={location}\n"));
+    }
+    aggregate.push_str("ordinary_default_percent_words:\n");
+    for (word, (count, location)) in ordinary_default_percent_words {
+        aggregate.push_str(&format!("{word}={count} first={location}\n"));
+    }
+    aggregate.push_str("contextual_catalog_words:\n");
+    for (word, (count, location)) in contextual_catalog_word_counts {
+        aggregate.push_str(&format!("{word}={count} first={location}\n"));
+    }
+    for failure in &failures {
+        aggregate.push_str(failure);
+        aggregate.push('\n');
+    }
+    fs::create_dir_all(&output_root).expect("create highlight sweep output directory");
+    fs::write(output_root.join("highlight-sweep.out"), aggregate)
+        .expect("write highlight sweep aggregate");
+    assert!(
+        failures.is_empty(),
+        "syntax highlight sweep found {} style mismatches across {checked_files} files ({checked_words} words, {checked_catalog_words} catalog words, {checked_object_words} object words, {unexpected_highlights} unexpected highlights); see `{}`:\n{}",
+        failures.len(),
+        output_root.join("highlight-sweep.out").display(),
+        failures.join("\n")
+    );
+}
+
+fn highlight_sweep_line_column(source: &str, start: usize) -> (usize, usize) {
+    let line = source[..start]
+        .bytes()
+        .filter(|byte| *byte == b'\n')
+        .count()
+        + 1;
+    let line_start = source[..start].rfind('\n').map_or(0, |pos| pos + 1);
+    let column = source[line_start..start].chars().count() + 1;
+    (line, column)
+}
+
+fn highlight_sweep_fixture_objects(source: &str) -> (HighlightData, HashSet<String>) {
+    use crate::ui::sql_editor::SqlToken;
+
+    let spans = crate::ui::sql_editor::query_text::tokenize_sql_spanned(source);
+    let mut data = HighlightData::new();
+    let mut object_names = HashSet::new();
+    let mut idx = 0usize;
+    while idx < spans.len() {
+        let SqlToken::Word(word) = &spans[idx].token else {
+            idx += 1;
+            continue;
+        };
+        if !word.eq_ignore_ascii_case("CREATE") {
+            idx += 1;
+            continue;
+        }
+
+        let mut scan = idx.saturating_add(1);
+        let mut is_public = false;
+        let mut is_materialized = false;
+        let mut object_kind = None;
+        while scan < spans.len() {
+            match &spans[scan].token {
+                SqlToken::Symbol(symbol) if symbol == ";" => break,
+                SqlToken::Word(candidate) => {
+                    let upper = candidate.to_ascii_uppercase();
+                    match upper.as_str() {
+                        "PUBLIC" => is_public = true,
+                        "MATERIALIZED" => is_materialized = true,
+                        "TABLE" | "VIEW" | "FUNCTION" | "PROCEDURE" | "PACKAGE" | "SEQUENCE"
+                        | "TRIGGER" | "EVENT" | "TYPE" | "INDEX" | "SYNONYM" | "SCHEMA"
+                        | "DATABASE" => {
+                            object_kind = Some(upper);
+                            break;
+                        }
+                        _ => {}
+                    }
+                }
+                _ => {}
+            }
+            scan += 1;
+        }
+        let Some(object_kind) = object_kind else {
+            idx += 1;
+            continue;
+        };
+
+        scan = scan.saturating_add(1);
+        let mut parts = Vec::new();
+        while scan < spans.len() {
+            match &spans[scan].token {
+                SqlToken::Word(candidate)
+                    if matches!(
+                        candidate.to_ascii_uppercase().as_str(),
+                        "BODY" | "IF" | "NOT" | "EXISTS"
+                    ) => {}
+                SqlToken::Word(candidate) => {
+                    parts.push(candidate.to_ascii_uppercase());
+                    if !spans.get(scan + 1).is_some_and(
+                        |span| matches!(&span.token, SqlToken::Symbol(symbol) if symbol == "."),
+                    ) {
+                        break;
+                    }
+                }
+                SqlToken::Symbol(symbol) if symbol == "." => {}
+                SqlToken::Comment(_) => {}
+                _ => break,
+            }
+            scan += 1;
+        }
+        let Some(name) = parts.last().cloned() else {
+            idx += 1;
+            continue;
+        };
+        if parts.len() > 1 {
+            for schema in &parts[..parts.len() - 1] {
+                push_highlight_sweep_name(&mut data.schemas, schema, &mut object_names);
+            }
+        }
+        let target = match object_kind.as_str() {
+            "TABLE" => &mut data.tables,
+            "VIEW" if is_materialized => &mut data.materialized_views,
+            "VIEW" => &mut data.views,
+            "FUNCTION" => &mut data.functions,
+            "PROCEDURE" => &mut data.procedures,
+            "PACKAGE" => &mut data.packages,
+            "SEQUENCE" => &mut data.sequences,
+            "TRIGGER" => &mut data.triggers,
+            "EVENT" => &mut data.events,
+            "TYPE" => &mut data.types,
+            "INDEX" => &mut data.indexes,
+            "SYNONYM" if is_public => &mut data.public_synonyms,
+            "SYNONYM" => &mut data.synonyms,
+            "SCHEMA" | "DATABASE" => &mut data.schemas,
+            _ => {
+                idx += 1;
+                continue;
+            }
+        };
+        push_highlight_sweep_name(target, &name, &mut object_names);
+        idx = scan.saturating_add(1);
+    }
+
+    (data, object_names)
+}
+
+fn push_highlight_sweep_name(
+    target: &mut Vec<String>,
+    name: &str,
+    object_names: &mut HashSet<String>,
+) {
+    if object_names.insert(name.to_string()) {
+        target.push(name.to_string());
+    }
+}
+
+#[test]
+fn production_full_highlight_keeps_oracle_grammar_out_of_alias_path() {
+    let text = r#"
+CREATE OR REPLACE TYPE pair_t AS OBJECT (k VARCHAR2(30), v CLOB);
+CREATE TABLE t (
+    id NUMBER GENERATED BY DEFAULT AS IDENTITY,
+    upper_name VARCHAR2(30) GENERATED ALWAYS AS (UPPER(name)) VIRTUAL
+) XMLTYPE COLUMN payload STORE AS BASICFILE CLOB;
+DECLARE
+    c_name CONSTANT VARCHAR2(30) := 'x';
+    r t%ROWTYPE;
+BEGIN
+    SELECT COUNT(*) FROM t GROUP BY CUBE(status) GROUPING SETS ((status), ());
+    x := seq.NEXTVAL;
+    y := DBMS_UTILITY.FORMAT_ERROR_STACK;
+    y := MATCH_NUMBER() + PREV(x) + SYS.ODCINUMBERLIST(1).COUNT;
+    n := SQL%ROWCOUNT;
+    n := SQL%BULK_EXCEPTIONS.COUNT;
+    EXIT WHEN c%NOTFOUND;
+    IF c%ISOPEN THEN NULL; END IF;
+    SELECT CASE WHEN 1 = 1 THEN 1 ELSE 0 END, id FROM t FOR UPDATE;
+END;
+"#;
+    let highlighter = SqlHighlighter::new();
+    let (styles, _) =
+        crate::ui::sql_editor::build_logical_styles_and_line_states(&highlighter, text);
+
+    for keyword in [
+        "OBJECT",
+        "CLOB",
+        "IDENTITY",
+        "ALWAYS",
+        "VIRTUAL",
+        "BASICFILE",
+        "CONSTANT",
+        "ROWTYPE",
+        "CUBE",
+        "SETS",
+        "NEXTVAL",
+        "ROWCOUNT",
+        "BULK_EXCEPTIONS",
+        "NOTFOUND",
+        "ISOPEN",
+    ] {
+        assert_token_has_style(text, &styles, keyword, STYLE_KEYWORD);
+    }
+    assert_token_has_style(text, &styles, "FORMAT_ERROR_STACK", STYLE_FUNCTION);
+    for function in ["MATCH_NUMBER", "PREV", "ODCINUMBERLIST"] {
+        assert_token_has_style(text, &styles, function, STYLE_FUNCTION);
+    }
+    let case_end = text.find("END, id").expect("CASE END");
+    assert!(
+        styles[case_end..case_end + 3]
+            .chars()
+            .all(|style| style == STYLE_KEYWORD),
+        "CASE END must not be treated as an implicit alias"
+    );
+}
+
+#[test]
+fn production_full_highlight_covers_mysql_family_fixture_grammar() {
+    let text = r#"
+CREATE SEQUENCE s START WITH 1 INCREMENT BY 1 MINVALUE 1;
+CREATE TABLE t (
+    id INT,
+    ip INET6,
+    p POINT SRID 4326,
+    tags JSON,
+    generated_col INT AS (id + 1) PERSISTENT,
+    PERIOD FOR SYSTEM_TIME(row_start, row_end),
+    PRIMARY KEY(id, validity WITHOUT OVERLAPS),
+    KEY tags_idx ((CAST(tags AS CHAR(24) ARRAY))),
+    VECTOR INDEX vector_idx(embedding) M=4 DISTANCE=COSINE
+) WITH SYSTEM VERSIONING;
+UPDATE t FOR PORTION OF validity FROM '2026-01-01' TO '2026-02-01' SET id=1;
+SELECT UUID_V7(), COLUMN_CHECK(attrs), COLUMN_JSON(attrs),
+       'vip' MEMBER OF(tags), PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY id)
+FROM t LIMIT 3 ROWS EXAMINED 1000;
+EXECUTE IMMEDIATE 'SELECT 1';
+SELECT id FROM t MINUS SELECT id FROM t;
+CYCLE id RESTRICT;
+"#;
+    let mut highlighter = SqlHighlighter::new();
+    highlighter.set_db_type(DatabaseType::MariaDB);
+    let (styles, _) =
+        crate::ui::sql_editor::build_logical_styles_and_line_states(&highlighter, text);
+
+    for keyword in [
+        "SEQUENCE",
+        "INCREMENT",
+        "MINVALUE",
+        "INET6",
+        "SRID",
+        "PERSISTENT",
+        "PERIOD",
+        "SYSTEM_TIME",
+        "WITHOUT",
+        "OVERLAPS",
+        "ARRAY",
+        "DISTANCE",
+        "COSINE",
+        "VERSIONING",
+        "PORTION",
+        "MEMBER",
+        "OF",
+        "WITHIN",
+        "EXAMINED",
+        "IMMEDIATE",
+        "MINUS",
+        "CYCLE",
+    ] {
+        assert_token_has_style(text, &styles, keyword, STYLE_KEYWORD);
+    }
+    for function in ["UUID_V7", "COLUMN_CHECK", "COLUMN_JSON"] {
+        assert_token_has_style(text, &styles, function, STYLE_FUNCTION);
+    }
 }
 
 #[test]

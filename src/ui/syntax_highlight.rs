@@ -6,7 +6,8 @@ use once_cell::sync::Lazy;
 use std::borrow::Cow;
 use std::collections::HashSet;
 
-use super::intellisense::{MYSQL_FUNCTIONS_SET, ORACLE_FUNCTIONS};
+use super::intellisense::{MARIADB_FUNCTIONS_SET, MYSQL_FUNCTIONS_SET, ORACLE_FUNCTIONS};
+use super::sql_editor::query_text::LocalAliasContext;
 use crate::db::connection::DatabaseType;
 use crate::sql_text;
 use crate::ui::font_settings::FontProfile;
@@ -60,24 +61,38 @@ const ORACLE_PLSQL_PREDEFINED_EXCEPTIONS: &[&str] = &[
     "ZERO_DIVIDE",
 ];
 
+const ORACLE_BUILTIN_MEMBER_CALLS: &[&str] = &[
+    "CREATETEMPORARY",
+    "EXTEND",
+    "FORMAT_CALL_STACK",
+    "FORMAT_ERROR_BACKTRACE",
+    "FORMAT_ERROR_STACK",
+    "FREETEMPORARY",
+    "PUT_LINE",
+    "WRITEAPPEND",
+];
+
+fn is_oracle_builtin_member_call(upper: &str) -> bool {
+    ORACLE_BUILTIN_MEMBER_CALLS.contains(&upper)
+}
+
 static ORACLE_FUNCTIONS_SET: Lazy<HashSet<&'static str>> = Lazy::new(|| {
     ORACLE_FUNCTIONS
         .iter()
         .chain(ORACLE_PLSQL_PREDEFINED_EXCEPTIONS.iter())
+        .chain(ORACLE_BUILTIN_MEMBER_CALLS.iter())
         .copied()
         .collect()
 });
 
-fn function_catalog_for_db_type(db_type: DatabaseType) -> &'static HashSet<&'static str> {
-    match db_type {
-        DatabaseType::Oracle => &ORACLE_FUNCTIONS_SET,
-        DatabaseType::MySQL => &MYSQL_FUNCTIONS_SET,
-        DatabaseType::MariaDB => &MYSQL_FUNCTIONS_SET,
-    }
-}
-
 fn is_builtin_highlight_word(upper: &str, db_type: DatabaseType) -> bool {
-    function_catalog_for_db_type(db_type).contains(upper)
+    match db_type {
+        DatabaseType::Oracle => ORACLE_FUNCTIONS_SET.contains(upper),
+        DatabaseType::MySQL => MYSQL_FUNCTIONS_SET.contains(upper),
+        DatabaseType::MariaDB => {
+            MYSQL_FUNCTIONS_SET.contains(upper) || MARIADB_FUNCTIONS_SET.contains(upper)
+        }
+    }
 }
 
 fn mysql_compatible_highlight_mode(db_type: DatabaseType) -> bool {
@@ -190,6 +205,27 @@ enum TokenType {
     Operator,
     Identifier,
     Column,
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum HighlightWordDisposition {
+    Normal,
+    ControlAlias,
+    LocalAlias,
+    IdentifierContext,
+    PathIdentifier,
+    DateTimeLiteral,
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct HighlightWordAudit {
+    pub start: usize,
+    pub end: usize,
+    pub expected_style: Option<char>,
+    pub actual_style: char,
+    pub disposition: HighlightWordDisposition,
 }
 
 impl TokenType {
@@ -480,12 +516,47 @@ impl SqlHighlighter {
         })
     }
 
+    #[cfg(test)]
     pub(crate) fn generate_styles_for_window(
         &self,
         text: &str,
         entry_state: LexerState,
     ) -> (String, LexerState) {
         self.generate_styles_with_state(text, entry_state)
+    }
+
+    pub(crate) fn generate_styles_for_window_with_alias_context(
+        &self,
+        text: &str,
+        entry_state: LexerState,
+        alias_context: &LocalAliasContext,
+        window_start: usize,
+    ) -> (String, LexerState) {
+        self.generate_styles_with_state_impl(
+            text,
+            entry_state,
+            Some((alias_context, window_start)),
+            #[cfg(test)]
+            None,
+        )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn generate_styles_for_window_with_word_audit(
+        &self,
+        text: &str,
+        entry_state: LexerState,
+        alias_context: &LocalAliasContext,
+        window_start: usize,
+    ) -> (String, LexerState, Vec<HighlightWordAudit>) {
+        let mut word_audits = Vec::new();
+        let (styles, exit_state) = self.generate_styles_with_state_impl(
+            text,
+            entry_state,
+            Some((alias_context, window_start)),
+            Some(&mut word_audits),
+        );
+        (styles, exit_state, word_audits)
     }
 
     fn resolve_entry_state_by_probe(&self, source_text: &str, pos: usize) -> LexerState {
@@ -622,6 +693,22 @@ impl SqlHighlighter {
         text: &str,
         initial_state: LexerState,
     ) -> (String, LexerState) {
+        self.generate_styles_with_state_impl(
+            text,
+            initial_state,
+            None,
+            #[cfg(test)]
+            None,
+        )
+    }
+
+    fn generate_styles_with_state_impl(
+        &self,
+        text: &str,
+        initial_state: LexerState,
+        alias_context: Option<(&LocalAliasContext, usize)>,
+        #[cfg(test)] mut word_audits: Option<&mut Vec<HighlightWordAudit>>,
+    ) -> (String, LexerState) {
         let len = text.len();
         if len == 0 {
             return (String::new(), initial_state);
@@ -629,11 +716,18 @@ impl SqlHighlighter {
         let mut styles: Vec<u8> = vec![STYLE_DEFAULT as u8; len];
         let bytes = text.as_bytes();
         let mut idx = 0usize;
-        let mut expect_alias_identifier = false;
         let mut exit_state = LexerState::Normal;
         let mut scan_context = HighlightScanContext::default();
         let mysql_compatible = mysql_compatible_highlight_mode(self.db_type);
-        let local_aliases = crate::ui::sql_editor::query_text::collect_local_alias_context(text);
+        let owned_alias_context;
+        let (local_aliases, alias_offset) = match alias_context {
+            Some(context) => context,
+            None => {
+                owned_alias_context =
+                    crate::ui::sql_editor::query_text::collect_local_alias_context(text);
+                (&owned_alias_context, 0)
+            }
+        };
 
         // ── Handle continuation of unclosed multi-line tokens ──────────
         match initial_state {
@@ -761,7 +855,6 @@ impl SqlHighlighter {
                     idx += 1;
                 }
                 styles[start..idx].fill(STYLE_COMMENT as u8);
-                expect_alias_identifier = false;
                 continue;
             }
 
@@ -775,7 +868,6 @@ impl SqlHighlighter {
                     idx += 1;
                 }
                 styles[start..idx].fill(STYLE_COMMENT as u8);
-                expect_alias_identifier = false;
                 continue;
             }
 
@@ -808,7 +900,6 @@ impl SqlHighlighter {
                     .get(start..idx)
                     .is_some_and(|comment| comment.bytes().any(is_line_terminator));
                 if comment_has_line_break {
-                    expect_alias_identifier = false;
                     scan_context.note_line_break();
                 }
                 continue;
@@ -828,7 +919,6 @@ impl SqlHighlighter {
                     if let ScanResult::Unterminated { state, .. } = scan_result {
                         exit_state = state;
                     }
-                    expect_alias_identifier = false;
                     scan_context.record_token(SignificantTokenKind::String, false);
                     continue;
                 }
@@ -845,7 +935,6 @@ impl SqlHighlighter {
                     if let ScanResult::Unterminated { state, .. } = scan_result {
                         exit_state = state;
                     }
-                    expect_alias_identifier = false;
                     scan_context.record_token(SignificantTokenKind::String, false);
                     continue;
                 }
@@ -865,7 +954,6 @@ impl SqlHighlighter {
                 if let ScanResult::Unterminated { state, .. } = scan_result {
                     exit_state = state;
                 }
-                expect_alias_identifier = false;
                 scan_context.record_token(SignificantTokenKind::String, false);
                 continue;
             }
@@ -884,9 +972,6 @@ impl SqlHighlighter {
                 if let ScanResult::Unterminated { state, .. } = scan_result {
                     exit_state = state;
                 }
-                if expect_alias_identifier {
-                    expect_alias_identifier = false;
-                }
                 scan_context.record_token(SignificantTokenKind::String, false);
                 continue;
             }
@@ -904,9 +989,6 @@ impl SqlHighlighter {
                 if let ScanResult::Unterminated { state, .. } = scan_result {
                     exit_state = state;
                 }
-                if expect_alias_identifier {
-                    expect_alias_identifier = false;
-                }
                 scan_context.record_token(SignificantTokenKind::String, false);
                 continue;
             }
@@ -918,7 +1000,6 @@ impl SqlHighlighter {
                 let start = idx;
                 idx = scan_number_end(bytes, idx);
                 styles[start..idx].fill(STYLE_NUMBER as u8);
-                expect_alias_identifier = false;
                 scan_context.record_token(SignificantTokenKind::Number, false);
                 continue;
             }
@@ -948,18 +1029,7 @@ impl SqlHighlighter {
                 idx = word_end;
                 let word = text.get(start..idx).unwrap_or("");
                 let folded_word = FoldedWord::new(word, self.db_type);
-                let metadata_or_alias_candidate =
-                    self.relation_lookup.contains(folded_word.upper())
-                        || self.column_lookup.contains(folded_word.upper())
-                        || local_aliases.contains_name(folded_word.upper());
-                let next_token = if expect_alias_identifier
-                    || folded_word.needs_lookahead()
-                    || metadata_or_alias_candidate
-                {
-                    next_significant_token(text, bytes, idx)
-                } else {
-                    None
-                };
+                let next_token = next_significant_token(text, bytes, idx);
 
                 // DATE / TIMESTAMP / INTERVAL literals
                 if matches!(folded_word.upper(), "DATE" | "TIMESTAMP" | "INTERVAL") {
@@ -979,6 +1049,15 @@ impl SqlHighlighter {
                             | ScanResult::Unterminated { next_idx, .. } => next_idx,
                         };
                         styles[start..look_ahead].fill(STYLE_DATETIME_LITERAL as u8);
+                        #[cfg(test)]
+                        record_highlight_word_audit(
+                            word_audits.as_deref_mut(),
+                            start,
+                            idx,
+                            &folded_word,
+                            STYLE_DATETIME_LITERAL,
+                            HighlightWordDisposition::DateTimeLiteral,
+                        );
                         idx = look_ahead;
                         if let ScanResult::Unterminated { state, .. } = scan_result {
                             exit_state = state;
@@ -989,32 +1068,39 @@ impl SqlHighlighter {
                     }
                 }
 
-                let treat_control_keyword_as_alias = (expect_alias_identifier
-                    && folded_word.is_alias_eligible_control_keyword
-                    && !should_keep_keyword_highlighting_after_as(folded_word.upper()))
-                    || should_treat_control_keyword_as_implicit_alias(
-                        folded_word.upper(),
-                        next_token,
-                        &scan_context,
-                    );
+                let treat_control_keyword_as_alias = should_treat_control_keyword_as_implicit_alias(
+                    folded_word.upper(),
+                    next_token,
+                    &scan_context,
+                );
                 let treat_keyword_as_identifier = should_treat_keyword_as_identifier_context(
                     &folded_word,
                     next_token,
                     &scan_context,
                 )
                     && !should_keep_keyword_highlighting_around_member_access(folded_word.upper());
-                let treat_alias_as_identifier = expect_alias_identifier
-                    && !should_keep_keyword_highlighting_after_as(folded_word.upper());
-                let local_alias_reference = local_aliases.is_declaration_range(start, idx)
-                    || (local_aliases.contains_name(folded_word.upper())
-                        && next_token.is_some_and(|token| {
-                            token.kind == SignificantTokenKind::Dot && token.is_member_access_dot
-                        }));
-                let token_type = if treat_alias_as_identifier
-                    || treat_control_keyword_as_alias
-                    || local_alias_reference
-                {
-                    TokenType::Default
+                let local_alias_reference = local_aliases.is_declaration_range(
+                    start.saturating_add(alias_offset),
+                    idx.saturating_add(alias_offset),
+                ) || (local_aliases.contains_name(folded_word.upper())
+                    && next_token.is_some_and(|token| {
+                        token.kind == SignificantTokenKind::Dot && token.is_member_access_dot
+                    }));
+                let token_type;
+                #[cfg(test)]
+                let disposition;
+                if treat_control_keyword_as_alias {
+                    token_type = TokenType::Default;
+                    #[cfg(test)]
+                    {
+                        disposition = HighlightWordDisposition::ControlAlias;
+                    }
+                } else if local_alias_reference {
+                    token_type = TokenType::Default;
+                    #[cfg(test)]
+                    {
+                        disposition = HighlightWordDisposition::LocalAlias;
+                    }
                 } else if treat_keyword_as_identifier
                     || should_treat_function_name_as_identifier(
                         &folded_word,
@@ -1022,23 +1108,45 @@ impl SqlHighlighter {
                         &scan_context,
                     )
                 {
-                    self.classify_identifier_like_word(folded_word.upper())
+                    token_type = self.classify_identifier_like_word(folded_word.upper());
+                    #[cfg(test)]
+                    {
+                        disposition = HighlightWordDisposition::IdentifierContext;
+                    }
                 } else if folded_word.upper() == "PATH" && !is_path_keyword_usage(bytes, idx) {
-                    self.classify_non_keyword_word(&folded_word)
+                    token_type = self.classify_non_keyword_word(&folded_word);
+                    #[cfg(test)]
+                    {
+                        disposition = HighlightWordDisposition::PathIdentifier;
+                    }
                 } else {
-                    self.classify_word(&folded_word, treat_control_keyword_as_alias)
-                };
+                    token_type = self.classify_word(&folded_word, treat_control_keyword_as_alias);
+                    #[cfg(test)]
+                    {
+                        disposition = HighlightWordDisposition::Normal;
+                    }
+                }
                 styles[start..idx].fill(token_type.to_style_byte());
+                #[cfg(test)]
+                record_highlight_word_audit(
+                    word_audits.as_deref_mut(),
+                    start,
+                    idx,
+                    &folded_word,
+                    token_type.to_style_char(),
+                    disposition,
+                );
+                let identifier_context = treat_control_keyword_as_alias
+                    || local_alias_reference
+                    || treat_keyword_as_identifier;
                 scan_context.record_word(
-                    if folded_word.is_sql_keyword {
+                    if folded_word.is_sql_keyword && !identifier_context {
                         SignificantTokenKind::ClauseWord
                     } else {
                         SignificantTokenKind::Identifier
                     },
                     word,
                 );
-                expect_alias_identifier =
-                    should_expect_alias_identifier_after_keyword(folded_word.upper(), next_token);
                 continue;
             }
 
@@ -1047,7 +1155,6 @@ impl SqlHighlighter {
                 styles[idx] = STYLE_OPERATOR as u8;
                 let operator_idx = idx;
                 idx += 1;
-                expect_alias_identifier = false;
                 match byte {
                     b'(' => scan_context.record_token(SignificantTokenKind::LeftParen, false),
                     b')' => scan_context.record_token(SignificantTokenKind::RightParen, false),
@@ -1062,7 +1169,6 @@ impl SqlHighlighter {
             }
 
             if is_line_terminator(byte) {
-                expect_alias_identifier = false;
                 scan_context.note_line_break();
             }
             idx += 1;
@@ -1130,36 +1236,11 @@ impl SqlHighlighter {
     }
 }
 
-fn should_expect_alias_identifier_after_keyword(
-    upper_word: &str,
-    next_token: Option<SignificantToken<'_>>,
-) -> bool {
-    if upper_word != "AS" {
-        return false;
-    }
-
-    match next_token {
-        Some(token)
-            if matches!(
-                token.kind,
-                SignificantTokenKind::Identifier | SignificantTokenKind::QuotedIdentifier
-            ) =>
-        {
-            true
-        }
-        Some(token) if token.kind == SignificantTokenKind::ClauseWord => token
-            .word
-            .is_some_and(|next_word| !is_non_alias_structural_keyword(next_word)),
-        _ => false,
-    }
-}
-
-fn should_keep_keyword_highlighting_after_as(upper_word: &str) -> bool {
-    matches!(upper_word, "SIGNED" | "UNSIGNED")
-}
-
 fn should_keep_keyword_highlighting_around_member_access(upper_word: &str) -> bool {
-    matches!(upper_word, "OLD" | "NEW")
+    matches!(
+        upper_word,
+        "BULK_EXCEPTIONS" | "CURRVAL" | "NEXTVAL" | "OLD" | "NEW" | "SQL" | "SQLCODE"
+    )
 }
 
 fn should_treat_control_keyword_as_implicit_alias(
@@ -1177,6 +1258,16 @@ fn should_treat_control_keyword_as_implicit_alias(
     let Some(next_token) = next_token else {
         return false;
     };
+    if upper_word == "END" && scan_context.case_depth > 0 {
+        return false;
+    }
+    if upper_word == "FOR"
+        && next_token
+            .word
+            .is_some_and(|word| matches!(ascii_upper_cow(word).as_ref(), "UPDATE" | "SHARE"))
+    {
+        return false;
+    }
     match next_token.kind {
         SignificantTokenKind::Comma | SignificantTokenKind::RightParen => {}
         SignificantTokenKind::Dot if next_token.is_member_access_dot => {}
@@ -1220,19 +1311,6 @@ fn is_implicit_alias_following_clause_word(word: &str) -> bool {
         || matches!(upper, "JOIN" | "ON" | "APPLY" | "PIVOT" | "UNPIVOT")
 }
 
-fn is_non_alias_structural_keyword(word: &str) -> bool {
-    let upper = ascii_upper_cow(word);
-    let upper = upper.as_ref();
-
-    sql_text::is_statement_head_keyword(upper)
-        || sql_text::is_with_main_query_keyword(upper)
-        || sql_text::is_with_plsql_declaration_keyword(upper)
-        || matches!(
-            upper,
-            "LOOP" | "THEN" | "EXCEPTION" | "CURSOR" | "PRAGMA" | "BODY"
-        )
-}
-
 fn should_treat_function_name_as_identifier(
     word: &FoldedWord<'_>,
     next_token: Option<SignificantToken<'_>>,
@@ -1242,9 +1320,11 @@ fn should_treat_function_name_as_identifier(
         return false;
     }
 
-    if word.is_sql_keyword
-        && next_token.map(|token| token.kind) == Some(SignificantTokenKind::LeftParen)
-    {
+    if is_oracle_builtin_member_call(word.upper()) {
+        return false;
+    }
+
+    if next_token.map(|token| token.kind) == Some(SignificantTokenKind::LeftParen) {
         return false;
     }
 
@@ -1331,25 +1411,18 @@ struct FoldedWord<'a> {
     is_sql_keyword: bool,
     is_keyword_for_db: bool,
     is_builtin_function: bool,
-    is_alias_eligible_control_keyword: bool,
 }
 
 impl<'a> FoldedWord<'a> {
     fn new(word: &'a str, db_type: DatabaseType) -> Self {
         let upper = ascii_upper_cow(word);
-        let (
-            is_sql_keyword,
-            is_keyword_for_db,
-            is_builtin_function,
-            is_alias_eligible_control_keyword,
-        ) = {
+        let (is_sql_keyword, is_keyword_for_db, is_builtin_function) = {
             let upper_ref = upper.as_ref();
             (
                 sql_text::is_oracle_sql_keyword(upper_ref)
                     || sql_text::is_mysql_sql_keyword(upper_ref),
                 sql_text::is_sql_keyword_for_db(upper_ref, db_type),
                 is_builtin_highlight_word(upper_ref, db_type),
-                is_alias_eligible_plsql_control_keyword(upper_ref),
             )
         };
         Self {
@@ -1357,17 +1430,40 @@ impl<'a> FoldedWord<'a> {
             is_sql_keyword,
             is_keyword_for_db,
             is_builtin_function,
-            is_alias_eligible_control_keyword,
         }
     }
 
     fn upper(&self) -> &str {
         self.upper.as_ref()
     }
+}
 
-    fn needs_lookahead(&self) -> bool {
-        self.is_sql_keyword || self.is_builtin_function || self.is_alias_eligible_control_keyword
-    }
+#[cfg(test)]
+fn record_highlight_word_audit(
+    audits: Option<&mut Vec<HighlightWordAudit>>,
+    start: usize,
+    end: usize,
+    word: &FoldedWord<'_>,
+    actual_style: char,
+    disposition: HighlightWordDisposition,
+) {
+    let Some(audits) = audits else {
+        return;
+    };
+    let expected_style = if word.is_keyword_for_db {
+        Some(STYLE_KEYWORD)
+    } else if word.is_builtin_function {
+        Some(STYLE_FUNCTION)
+    } else {
+        None
+    };
+    audits.push(HighlightWordAudit {
+        start,
+        end,
+        expected_style,
+        actual_style,
+        disposition,
+    });
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1398,6 +1494,7 @@ struct HighlightScanContext<'a> {
     previous_word: Option<&'a str>,
     prev_token_is_member_access_dot: bool,
     saw_line_break_since_prev_token: bool,
+    case_depth: usize,
 }
 
 impl<'a> HighlightScanContext<'a> {
@@ -1406,6 +1503,17 @@ impl<'a> HighlightScanContext<'a> {
     }
 
     fn record_word(&mut self, kind: SignificantTokenKind, word: &'a str) {
+        if kind == SignificantTokenKind::ClauseWord {
+            if word.eq_ignore_ascii_case("END") {
+                self.case_depth = self.case_depth.saturating_sub(1);
+            } else if word.eq_ignore_ascii_case("CASE")
+                && !self
+                    .last_word
+                    .is_some_and(|last| last.eq_ignore_ascii_case("END"))
+            {
+                self.case_depth = self.case_depth.saturating_add(1);
+            }
+        }
         self.previous_word = self.last_word;
         self.last_word = Some(word);
         self.prev_token_kind = Some(kind);

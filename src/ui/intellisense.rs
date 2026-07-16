@@ -53,6 +53,7 @@ pub const ORACLE_FUNCTIONS: &[&str] = &[
     "CUME_DIST",
     "CURRENT_DATE",
     "CURRENT_TIMESTAMP",
+    "CV",
     "DBTIMEZONE",
     "DECODE",
     "DECOMPOSE",
@@ -113,6 +114,7 @@ pub const ORACLE_FUNCTIONS: &[&str] = &[
     "LPAD",
     "LTRIM",
     "MAKE_REF",
+    "MATCH_NUMBER",
     "MAX",
     "MEDIAN",
     "MIN",
@@ -132,6 +134,7 @@ pub const ORACLE_FUNCTIONS: &[&str] = &[
     "NUMTOYMINTERVAL",
     "NVL",
     "NVL2",
+    "ODCINUMBERLIST",
     "ORA_HASH",
     "ORA_INVOKING_USER",
     "ORA_INVOKING_USERID",
@@ -145,6 +148,7 @@ pub const ORACLE_FUNCTIONS: &[&str] = &[
     "PREDICTION_DETAILS",
     "PREDICTION_PROBABILITY",
     "PREDICTION_SET",
+    "PREV",
     "RANK",
     "RATIO_TO_REPORT",
     "RAWTOHEX",
@@ -626,7 +630,7 @@ pub const MYSQL_FUNCTIONS: &[&str] = &[
 /// MariaDB built-ins that are not available in MySQL. Keep this separate from
 /// the shared MySQL-family catalog so dialect-specific completion never offers
 /// executable-looking functions to the wrong server.
-pub const MARIADB_FUNCTIONS: &[&str] = &["COLUMN_CHECK", "COLUMN_JSON", "JSON_EXISTS"];
+pub const MARIADB_FUNCTIONS: &[&str] = &["COLUMN_CHECK", "COLUMN_JSON", "JSON_EXISTS", "UUID_V7"];
 
 pub static MYSQL_FUNCTIONS_SET: once_cell::sync::Lazy<std::collections::HashSet<&'static str>> =
     once_cell::sync::Lazy::new(|| MYSQL_FUNCTIONS.iter().copied().collect());
