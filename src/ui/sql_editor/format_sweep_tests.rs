@@ -148,6 +148,10 @@ fn line_column(text: &str, offset: usize) -> (usize, usize) {
     (line, column)
 }
 
+fn leading_spaces(line: &str) -> usize {
+    line.len().saturating_sub(line.trim_start().len())
+}
+
 fn line_start_offsets(text: &str) -> Vec<usize> {
     let mut starts = vec![0];
     for (idx, byte) in text.bytes().enumerate() {
@@ -830,17 +834,167 @@ fn formatting_sweep_classifies_layout_divergence_without_keyword_rules() {
 
 #[test]
 fn formatting_sweep_simple_sql_converges() {
-    let run = format_sweep_run(
-        "SELECT a, b FROM t WHERE a = 1 AND b = 2;",
+    for db_type in [
+        DatabaseType::Oracle,
+        DatabaseType::MySQL,
+        DatabaseType::MariaDB,
+    ] {
+        let run = format_sweep_run("SELECT a, b FROM t WHERE a = 1 AND b = 2;", db_type);
+        assert!(run.issues.is_empty(), "unexpected issues: {:?}", run.issues);
+        assert!(
+            run.formatted
+                .contains("SELECT a,\n    b\nFROM t\nWHERE a = 1\n    AND b = 2"),
+            "SELECT and WHERE should both keep the first child inline and render later siblings at frame depth:\n{}",
+            run.formatted
+        );
+        assert_eq!(run.probes, 4, "three whitespace probes plus idempotence");
+    }
+}
+
+#[test]
+fn formatting_sweep_distinguishes_from_list_children_from_attached_join_frames() {
+    let source = "SELECT * FROM first_table a, second_table b JOIN third_table c ON c.id = b.id AND c.active = 1;";
+
+    for db_type in [
+        DatabaseType::Oracle,
+        DatabaseType::MySQL,
+        DatabaseType::MariaDB,
+    ] {
+        let run = format_sweep_run(source, db_type);
+        assert!(
+            run.issues.is_empty(),
+            "{db_type:?} FROM/JOIN frame issues: {:#?}\n{}",
+            run.issues,
+            run.formatted
+        );
+        let lines: Vec<&str> = run.formatted.lines().collect();
+        let from_idx = lines
+            .iter()
+            .position(|line| line.trim_start().starts_with("FROM first_table a,"))
+            .expect("FROM owner and first child");
+        let second_from_child_idx = lines
+            .iter()
+            .position(|line| line.trim_start() == "second_table b")
+            .expect("second FROM-list child");
+        let join_idx = lines
+            .iter()
+            .position(|line| line.trim_start() == "JOIN third_table c")
+            .expect("attached JOIN frame");
+        let on_idx = lines
+            .iter()
+            .position(|line| line.trim_start().starts_with("ON c.id = b.id"))
+            .expect("JOIN ON child");
+        let and_idx = lines
+            .iter()
+            .position(|line| line.trim_start() == "AND c.active = 1;")
+            .expect("second ON-condition child");
+
+        assert_eq!(
+            leading_spaces(lines[second_from_child_idx]),
+            leading_spaces(lines[from_idx]).saturating_add(FORMAT_SWEEP_INDENT_WIDTH),
+            "the second comma-separated FROM child must use the FROM-list body depth:\n{}",
+            run.formatted
+        );
+        assert_eq!(
+            leading_spaces(lines[join_idx]),
+            leading_spaces(lines[from_idx]),
+            "JOIN must start an attached frame at the FROM clause-boundary depth:\n{}",
+            run.formatted
+        );
+        assert_eq!(
+            leading_spaces(lines[on_idx]),
+            leading_spaces(lines[join_idx]).saturating_add(FORMAT_SWEEP_INDENT_WIDTH),
+            "ON must use the JOIN-frame body depth:\n{}",
+            run.formatted
+        );
+        assert_eq!(
+            leading_spaces(lines[and_idx]),
+            leading_spaces(lines[on_idx]).saturating_add(FORMAT_SWEEP_INDENT_WIDTH),
+            "the second ON-condition child must use the condition-frame body depth:\n{}",
+            run.formatted
+        );
+    }
+}
+
+#[test]
+fn formatting_sweep_all_child_frames_keep_first_inline_and_break_later_siblings() {
+    let source = "WITH first_cte AS (SELECT COALESCE(a, b) AS value FROM t WHERE a = 1 AND b = 2), second_cte AS (SELECT value FROM first_cte) SELECT value, value + 1 FROM second_cte;";
+
+    for db_type in [
+        DatabaseType::Oracle,
+        DatabaseType::MySQL,
+        DatabaseType::MariaDB,
+    ] {
+        let run = format_sweep_run(source, db_type);
+        assert!(
+            run.issues.is_empty(),
+            "{db_type:?} frame issues: {:#?}\n{}",
+            run.issues,
+            run.formatted
+        );
+
+        assert!(
+            run.formatted.starts_with("WITH first_cte AS ("),
+            "the first WITH child should remain inline:\n{}",
+            run.formatted
+        );
+        assert!(
+            run.formatted
+                .lines()
+                .any(|line| line.trim_start().starts_with("SELECT COALESCE")),
+            "the nested SELECT should keep the query-boundary depth and its first list item inline:\n{}",
+            run.formatted
+        );
+        assert!(
+            run.formatted.contains("a,\n")
+                && run.formatted.lines().any(|line| {
+                    line.trim_start().starts_with('b') && line.trim_end().ends_with(") AS value")
+                }),
+            "the second function argument should start on its parenthesis-frame depth:\n{}",
+            run.formatted
+        );
+        assert!(
+            run.formatted.contains("WHERE a = 1\n")
+                && run
+                    .formatted
+                    .lines()
+                    .any(|line| line.trim_start().starts_with("AND b = 2")),
+            "the second condition child should start on its condition-frame depth:\n{}",
+            run.formatted
+        );
+        assert!(
+            run.formatted
+                .lines()
+                .any(|line| line.trim_start().starts_with("second_cte AS (")),
+            "the second WITH child should start on its WITH-frame depth:\n{}",
+            run.formatted
+        );
+        assert!(
+            run.formatted.contains("SELECT value,\n")
+                && run
+                    .formatted
+                    .lines()
+                    .any(|line| line.trim_start().starts_with("value + 1")),
+            "the second SELECT child should start on its SELECT-frame depth:\n{}",
+            run.formatted
+        );
+    }
+
+    let plsql = format_sweep_run(
+        "BEGIN v_total := v_total + (CASE WHEN n = 1 THEN 10 ELSE 0 END); END;",
         DatabaseType::Oracle,
     );
-    assert!(run.issues.is_empty(), "unexpected issues: {:?}", run.issues);
     assert!(
-        run.formatted.contains("WHERE\n    a = 1\n    AND b = 2"),
-        "multiline condition children should share one depth:\n{}",
-        run.formatted
+        plsql.issues.is_empty(),
+        "PL/SQL parenthesized CASE frame issues: {:#?}\n{}",
+        plsql.issues,
+        plsql.formatted
     );
-    assert_eq!(run.probes, 4, "three whitespace probes plus idempotence");
+    assert!(
+        plsql.formatted.contains("+ (CASE\n"),
+        "a PL/SQL CASE that is the first parenthesis child must remain inline:\n{}",
+        plsql.formatted
+    );
 }
 
 #[test]
@@ -916,7 +1070,7 @@ fn formatting_sweep_condition_frame_depth_invariant_covers_db_clause_families() 
 }
 
 #[test]
-fn formatting_sweep_expanded_frames_start_first_child_at_final_depth() {
+fn formatting_sweep_condition_frames_keep_inline_first_child_and_depth_aligned_siblings() {
     let indent = |line: &str| line.len().saturating_sub(line.trim_start().len());
 
     for (db_type, source) in FORMAT_SWEEP_FRAME_REGRESSION_CASES {
@@ -931,19 +1085,17 @@ fn formatting_sweep_expanded_frames_start_first_child_at_final_depth() {
         let lines: Vec<&str> = run.formatted.lines().collect();
         let when_idx = lines
             .iter()
-            .position(|line| line.trim() == "WHEN")
+            .position(|line| line.trim_start().starts_with("WHEN ("))
             .unwrap_or_else(|| panic!("WHEN owner not found:\n{}", run.formatted));
-        let first_child = lines
-            .get(when_idx + 1)
-            .copied()
-            .unwrap_or_else(|| panic!("WHEN first child not found:\n{}", run.formatted));
         let nested_select = lines
-            .get(when_idx + 2)
+            .iter()
+            .skip(when_idx + 1)
+            .find(|line| line.trim_start().starts_with("SELECT COUNT(*)"))
             .copied()
             .unwrap_or_else(|| panic!("nested SELECT not found:\n{}", run.formatted));
         let first_close = lines
             .iter()
-            .skip(when_idx + 3)
+            .skip(when_idx + 1)
             .find(|line| line.trim_start().starts_with(") = 6"))
             .copied()
             .unwrap_or_else(|| panic!("first nested close not found:\n{}", run.formatted));
@@ -955,27 +1107,22 @@ fn formatting_sweep_expanded_frames_start_first_child_at_final_depth() {
             .unwrap_or_else(|| panic!("AND child not found:\n{}", run.formatted));
 
         assert_eq!(
-            indent(first_child),
-            indent(lines[when_idx]) + FORMAT_SWEEP_INDENT_WIDTH,
-            "first condition child must start at owner + 1:\n{}",
-            run.formatted
-        );
-        assert_eq!(
             indent(nested_select),
-            indent(first_child) + FORMAT_SWEEP_INDENT_WIDTH,
-            "nested frame body must start at its owner + 1:\n{}",
+            indent(lines[when_idx]) + 2 * FORMAT_SWEEP_INDENT_WIDTH,
+            "the nested query must traverse the condition and parenthesis frame edges:\n{}",
             run.formatted
         );
+
         assert_eq!(
             indent(first_close),
-            indent(first_child),
-            "nested frame start and end must share one depth:\n{}",
+            indent(lines[when_idx]) + FORMAT_SWEEP_INDENT_WIDTH,
+            "the nested close must return to the inline condition child's stored frame depth:\n{}",
             run.formatted
         );
         assert_eq!(
             indent(and_child),
-            indent(first_child),
-            "condition siblings must share one depth:\n{}",
+            indent(lines[when_idx]) + FORMAT_SWEEP_INDENT_WIDTH,
+            "later condition siblings must use the condition frame depth even when the first child is inline:\n{}",
             run.formatted
         );
 
@@ -1079,6 +1226,38 @@ fn formatting_sweep_select_inline_comment_is_not_moved_to_expand_its_frame() {
         "SELECT's first-child comment must stay inline:\n{}",
         run.formatted
     );
+}
+
+#[test]
+fn formatting_sweep_comment_forced_first_child_uses_frame_body_depth() {
+    let indent = |line: &str| line.len().saturating_sub(line.trim_start().len());
+
+    for source in [
+        "SELECT * FROM sales MODEL MEASURES -- metrics\n(amt) RULES (amt[1] = 1);",
+        "INSERT INTO t_log (id, msg) VALUES -- tuple\n(1, 'x');",
+    ] {
+        let run = format_sweep_run(source, DatabaseType::Oracle);
+        assert!(
+            run.issues.is_empty(),
+            "comment-forced first-child issues: {:#?}\n{}",
+            run.issues,
+            run.formatted
+        );
+        let lines: Vec<&str> = run.formatted.lines().collect();
+        let owner_idx = lines
+            .iter()
+            .position(|line| line.contains("--"))
+            .expect("comment-bearing frame owner");
+        let child = lines
+            .get(owner_idx + 1)
+            .expect("first child after the owner comment");
+        assert_eq!(
+            indent(child),
+            indent(lines[owner_idx]) + FORMAT_SWEEP_INDENT_WIDTH,
+            "a comment-forced line-start first child must use frame body depth:\n{}",
+            run.formatted
+        );
+    }
 }
 
 #[test]
@@ -1684,8 +1863,8 @@ SELECT id FROM third_cte;"#;
             run.formatted
         );
         assert!(
-            run.formatted.starts_with("WITH\n    first_cte AS ("),
-            "{db_type:?} first CTE should start at WITH owner+1 depth:\n{}",
+            run.formatted.starts_with("WITH first_cte AS ("),
+            "{db_type:?} first CTE should remain inline with WITH:\n{}",
             run.formatted
         );
         assert!(
@@ -1757,6 +1936,7 @@ fn formatting_sweep_single_inline_with_child_keeps_both_frame_edges() {
             "{db_type:?} CTE query must traverse WITH and paren frame edges:\n{}",
             run.formatted
         );
+
         assert_eq!(
             indent(lines[close_idx]),
             indent(lines[with_idx]) + FORMAT_SWEEP_INDENT_WIDTH,
@@ -2156,27 +2336,18 @@ fn match_recognize_define_condition_continuation_anchors_to_item_line() {
     let lines: Vec<&str> = formatted.lines().collect();
     let item_indent = lines
         .iter()
-        .find(|line| line.trim_start() == "B AS")
+        .find(|line| line.trim_start().starts_with("B AS B.sal > PREV"))
         .map(|line| line.len() - line.trim_start().len())
         .expect("DEFINE item line");
-    let first_condition_indent = lines
-        .iter()
-        .find(|line| line.trim_start().starts_with("B.sal > PREV"))
-        .map(|line| line.len() - line.trim_start().len())
-        .expect("DEFINE first condition line");
     let and_indent = lines
         .iter()
         .find(|line| line.trim_start().starts_with("AND B.sal"))
         .map(|line| line.len() - line.trim_start().len())
         .expect("DEFINE condition continuation line");
     assert_eq!(
-        first_condition_indent,
+        and_indent,
         item_indent + FORMAT_SWEEP_INDENT_WIDTH,
-        "DEFINE first condition must sit one level deeper than its item line, got:\n{formatted}"
-    );
-    assert_eq!(
-        and_indent, first_condition_indent,
-        "DEFINE condition siblings must share one depth, got:\n{formatted}"
+        "DEFINE's later condition sibling must use the condition-frame depth, got:\n{formatted}"
     );
 }
 

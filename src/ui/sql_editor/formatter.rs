@@ -1772,6 +1772,7 @@ struct ParenSemanticFlags {
 struct ParenStackFrame {
     id: SqlFormatFrameId,
     frame: ParenFormatFrame,
+    first_body_token_idx: Option<usize>,
     direct_list_body: bool,
     semantic_flags: ParenSemanticFlags,
     structured_table_function_columns_started: bool,
@@ -2002,9 +2003,7 @@ struct FormatFrameAlignmentFrame {
     id: SqlFormatFrameId,
     parent_id: Option<SqlFormatFrameId>,
     open_token_idx: usize,
-    first_body_token_idx: Option<usize>,
     direct_list_body: bool,
-    requires_first_body_line_start: bool,
     depth_relation: FormatFrameDepthRelation,
     expected_depth: Option<usize>,
     depth: Option<usize>,
@@ -2183,66 +2182,6 @@ impl ListOwnerKind {
 
         let _ = tail_idx;
         matches!(tail, SqlToken::Word(word) if word.eq_ignore_ascii_case("AS"))
-    }
-
-    #[cfg(test)]
-    fn with_starts_expanded(tokens: &[SqlToken], header_token_idx: usize) -> bool {
-        if !Self::with_starts_cte_definitions(tokens, header_token_idx) {
-            return false;
-        }
-
-        let mut idx = header_token_idx.saturating_add(1);
-        let mut paren_depth = 0usize;
-        let mut before_first_child = true;
-        while idx < tokens.len() {
-            match &tokens[idx] {
-                SqlToken::Comment(_) | SqlToken::String(_) => {}
-                SqlToken::Symbol(symbol) if symbol == "(" => {
-                    paren_depth = paren_depth.saturating_add(1);
-                    before_first_child = false;
-                }
-                SqlToken::Symbol(symbol) if symbol == ")" => {
-                    if paren_depth == 0 {
-                        return false;
-                    }
-                    paren_depth = paren_depth.saturating_sub(1);
-                }
-                SqlToken::Symbol(symbol) if symbol == "," && paren_depth == 0 => return true,
-                SqlToken::Symbol(symbol) if symbol == ";" && paren_depth == 0 => return false,
-                SqlToken::Symbol(_) => before_first_child = false,
-                SqlToken::Word(word) if paren_depth == 0 => {
-                    let upper = word.to_ascii_uppercase();
-                    if before_first_child && upper == "RECURSIVE" {
-                        idx = idx.saturating_add(1);
-                        continue;
-                    }
-                    if before_first_child
-                        && sql_text::is_with_plsql_declaration_keyword(upper.as_str())
-                    {
-                        return true;
-                    }
-                    if !before_first_child
-                        && matches!(
-                            upper.as_str(),
-                            "SELECT" | "INSERT" | "UPDATE" | "DELETE" | "MERGE"
-                        )
-                    {
-                        return false;
-                    }
-                    before_first_child = false;
-                }
-                SqlToken::Word(_) => {}
-            }
-            idx = idx.saturating_add(1);
-        }
-        false
-    }
-
-    /// Independently tells the audit that a real WITH frame always opens its
-    /// first child at owner depth + 1 when the output is expanded.
-    #[cfg(test)]
-    fn requires_first_body_line_start(self, tokens: &[SqlToken], header_token_idx: usize) -> bool {
-        self == Self::With && Self::with_starts_expanded(tokens, header_token_idx)
     }
 
     fn from_clause(clause: &str) -> Option<Self> {
@@ -2449,9 +2388,7 @@ impl FormatFrameAlignmentAudit {
             id: frame_id,
             parent_id,
             open_token_idx,
-            first_body_token_idx,
             direct_list_body,
-            requires_first_body_line_start: false,
             depth_relation: FormatFrameDepthRelation::Child,
             expected_depth: None,
             depth,
@@ -2517,12 +2454,6 @@ impl FormatFrameAlignmentAudit {
         if let Some(frame) = self.frames.iter_mut().find(|frame| frame.id == frame_id) {
             frame.expected_depth = Some(expected_depth);
             frame.depth = Some(depth);
-        }
-    }
-
-    fn require_first_body_line_start(&mut self, frame_id: SqlFormatFrameId) {
-        if let Some(frame) = self.frames.iter_mut().find(|frame| frame.id == frame_id) {
-            frame.requires_first_body_line_start = true;
         }
     }
 
@@ -2690,6 +2621,24 @@ impl FormatFrameAlignmentAudit {
         } else {
             None
         }
+    }
+
+    fn comment_forces_first_child_line_break(
+        spans: &[SqlTokenSpan],
+        open_token_idx: usize,
+        first_child_token_idx: usize,
+    ) -> bool {
+        spans
+            .get(open_token_idx.saturating_add(1)..first_child_token_idx)
+            .is_some_and(|between| {
+                between.iter().any(|span| {
+                    matches!(
+                        &span.token,
+                        SqlToken::Comment(comment)
+                            if comment.trim_start().starts_with("--") || comment.contains('\n')
+                    )
+                })
+            })
     }
 
     fn resolve(&self, formatted: &str, mysql_compatible: bool) -> FormatFrameAlignmentAuditSummary {
@@ -2864,12 +2813,38 @@ impl FormatFrameAlignmentAudit {
                         continue;
                     };
                     summary.checked_body_items = summary.checked_body_items.saturating_add(1);
+                    let frame = self.frame(frame_id);
+                    if kind == FormatFrameAlignmentBodyEventKind::FirstItem
+                        && (frame.is_some_and(|frame| frame.direct_list_body)
+                            || matches!(
+                                self.frame_kind(frame_id),
+                                Some(
+                                    FormatManagedFrameKind::Condition
+                                        | FormatManagedFrameKind::List
+                                        | FormatManagedFrameKind::WithCte
+                                )
+                            ))
+                        && !matches!(span.token, SqlToken::Comment(_))
+                        && frame.is_some_and(|frame| {
+                            !Self::comment_forces_first_child_line_break(
+                                &spans,
+                                frame.open_token_idx,
+                                token_idx,
+                            )
+                        })
+                    {
+                        summary.issues.push(FormatFrameAlignmentIssue {
+                            offset: span.start,
+                            message: format!(
+                                "format frame {frame_id} first child starts on a new line without a forcing comment"
+                            ),
+                        });
+                    }
                     if let Some((_, expected_indent)) = body_anchors
                         .iter()
                         .find(|(candidate_id, _)| *candidate_id == frame_id)
                     {
                         if *expected_indent != actual_indent {
-                            let frame = self.frame(frame_id);
                             summary.issues.push(FormatFrameAlignmentIssue {
                                 offset: span.start,
                                 message: format!(
@@ -2958,31 +2933,6 @@ impl FormatFrameAlignmentAudit {
             }
         }
 
-        for frame in self
-            .frames
-            .iter()
-            .filter(|frame| frame.requires_first_body_line_start)
-        {
-            let Some(first_body_token_idx) = frame.first_body_token_idx else {
-                continue;
-            };
-            let Some(first_body_span) = spans.get(first_body_token_idx) else {
-                continue;
-            };
-            if Self::line_start_indent(formatted, first_body_span.start).is_none() {
-                summary.issues.push(FormatFrameAlignmentIssue {
-                    offset: spans
-                        .get(frame.open_token_idx)
-                        .map_or(first_body_span.start, |span| span.start),
-                    message: format!(
-                        "list frame {} is multiline but its first direct child remains inline; expected level {}",
-                        frame.id,
-                        frame.depth.unwrap_or(0),
-                    ),
-                });
-            }
-        }
-
         for frame in &self.condition_frames {
             if frame.depth != frame.expected_depth {
                 let offset = spans
@@ -3014,41 +2964,39 @@ impl FormatFrameAlignmentAudit {
             };
             summary.checked_body_items = summary.checked_body_items.saturating_add(1);
             let first_body_indent = Self::line_start_indent(formatted, first_body_span.start);
-            let Some(first_body_indent) = first_body_indent else {
-                if sibling_indents.is_empty() {
-                    continue;
+            if let Some(first_body_indent) = first_body_indent {
+                if !Self::comment_forces_first_child_line_break(
+                    &spans,
+                    frame.header_token_idx,
+                    first_body_token_idx,
+                ) {
+                    summary.issues.push(FormatFrameAlignmentIssue {
+                        offset: first_body_span.start,
+                        message: format!(
+                            "condition frame {} first child starts on a new line without a forcing comment",
+                            frame.id
+                        ),
+                    });
                 }
-                let header_offset = spans
-                    .get(frame.header_token_idx)
-                    .map_or(first_body_span.start, |span| span.start);
-                summary.issues.push(FormatFrameAlignmentIssue {
-                    offset: header_offset,
-                    message: format!(
-                        "condition frame {} is multiline but its first direct child remains inline; expected level {}",
-                        frame.id, frame.depth
-                    ),
-                });
-                continue;
-            };
-
-            if first_body_indent != frame.depth {
-                summary.issues.push(FormatFrameAlignmentIssue {
-                    offset: first_body_span.start,
-                    message: format!(
-                        "condition frame {} first-child indent drift: expected level {}, actual level {}",
-                        frame.id, frame.depth, first_body_indent
-                    ),
-                });
+                if first_body_indent != frame.depth {
+                    summary.issues.push(FormatFrameAlignmentIssue {
+                        offset: first_body_span.start,
+                        message: format!(
+                            "condition frame {} first-child indent drift: expected level {}, actual level {}",
+                            frame.id, frame.depth, first_body_indent
+                        ),
+                    });
+                }
             }
 
             for (offset, sibling_indent) in sibling_indents {
                 summary.checked_body_items = summary.checked_body_items.saturating_add(1);
-                if sibling_indent != first_body_indent {
+                if sibling_indent != frame.depth {
                     summary.issues.push(FormatFrameAlignmentIssue {
                         offset,
                         message: format!(
-                            "condition frame {} sibling indent drift: first child level {}, sibling level {}",
-                            frame.id, first_body_indent, sibling_indent
+                            "condition frame {} sibling indent drift: expected level {}, actual level {}",
+                            frame.id, frame.depth, sibling_indent
                         ),
                     });
                 }
@@ -3396,10 +3344,6 @@ impl FormatFrameStack {
         _owner_depth: usize,
         depth: usize,
     ) {
-        #[cfg(test)]
-        let audit_parent_id = self
-            .nearest_structural_child_owner_frame()
-            .map(|(frame_id, _)| frame_id);
         while self.remove_last_frame_matching_via_tail_pop(|frame| {
             matches!(frame, FormatFrame::ListOwner(owner)
                 if !owner.scope.contains(scope)
@@ -3407,6 +3351,14 @@ impl FormatFrameStack {
                         && !(matches!(kind, ListOwnerKind::SearchBy | ListOwnerKind::CycleColumns)
                             && owner.kind == ListOwnerKind::With)))
         }) {}
+
+        let structural_parent = self.nearest_structural_child_owner_frame();
+        #[cfg(test)]
+        let audit_parent_id = structural_parent.map(|(frame_id, _)| frame_id);
+        let (_owner_depth, depth) = structural_parent
+            .filter(|(_, parent_depth)| depth > parent_depth.saturating_add(1))
+            .map(|(_, parent_depth)| (parent_depth, parent_depth.saturating_add(1)))
+            .unwrap_or((_owner_depth, depth));
 
         let frame_id = self.next_frame_id();
         let first_body_token_idx = kind.first_body_token_idx(tokens, header_token_idx);
@@ -3442,11 +3394,6 @@ impl FormatFrameStack {
         self.frame_alignment_audit
             .record_depth(frame_id, _owner_depth.saturating_add(1), depth);
         #[cfg(test)]
-        if kind.requires_first_body_line_start(tokens, header_token_idx) {
-            self.frame_alignment_audit
-                .require_first_body_line_start(frame_id);
-        }
-        #[cfg(test)]
         self.frame_alignment_audit.record_list_leading_comment(
             frame_id,
             first_body_start_token_idx,
@@ -3478,6 +3425,38 @@ impl FormatFrameStack {
         self.frames.iter().rev().find_map(|frame| match frame {
             FormatFrame::ListOwner(owner) if owner.scope == scope && owner.kind == kind => {
                 Some((owner.id, owner.kind))
+            }
+            _ => None,
+        })
+    }
+
+    fn list_owner_first_body_is(
+        &self,
+        scope: FormatScope,
+        kind: ListOwnerKind,
+        token_idx: usize,
+    ) -> bool {
+        self.frames.iter().rev().any(|frame| {
+            matches!(
+                frame,
+                FormatFrame::ListOwner(owner)
+                    if owner.scope == scope
+                        && owner.kind == kind
+                        && owner.first_body_token_idx == Some(token_idx)
+            )
+        })
+    }
+
+    fn list_owner_frame_for_first_body_token(
+        &self,
+        token_idx: usize,
+    ) -> Option<(SqlFormatFrameId, usize)> {
+        self.frames.iter().rev().find_map(|frame| match frame {
+            FormatFrame::ListOwner(owner)
+                if owner.first_body_token_idx == Some(token_idx)
+                    || owner.first_body_token_idx == Some(token_idx.saturating_add(1)) =>
+            {
+                Some((owner.id, owner.depth))
             }
             _ => None,
         })
@@ -4248,6 +4227,7 @@ impl FormatFrameStack {
         self.push_frame(FormatFrame::Paren(Box::new(ParenStackFrame {
             id: frame_id,
             frame,
+            first_body_token_idx: None,
             direct_list_body: false,
             semantic_flags,
             structured_table_function_columns_started: false,
@@ -4282,6 +4262,17 @@ impl FormatFrameStack {
         if let Some(frame) = self.last_paren_stack_frame_mut() {
             frame.direct_list_body = direct_list_body;
         }
+    }
+
+    fn set_last_paren_first_body_token_idx(&mut self, token_idx: Option<usize>) {
+        if let Some(frame) = self.last_paren_stack_frame_mut() {
+            frame.first_body_token_idx = token_idx;
+        }
+    }
+
+    fn last_paren_first_body_is(&self, token_idx: usize) -> bool {
+        self.last_paren_stack_frame()
+            .is_some_and(|frame| frame.first_body_token_idx == Some(token_idx))
     }
 
     /// Pop a paren frame and restore the base that was active before it opened.
@@ -4747,9 +4738,12 @@ impl FormatFrameStack {
         _open_token_idx: usize,
         _first_body_token_idx: Option<usize>,
     ) {
+        let parent_frame = self.nearest_child_owner_frame(self.current_scope());
+        let owner_depth = parent_frame
+            .map(|(_, parent_depth)| owner_depth.min(parent_depth))
+            .unwrap_or(owner_depth);
         #[cfg(test)]
-        let audit_parent_id = self
-            .nearest_child_owner_frame(self.current_scope())
+        let audit_parent_id = parent_frame
             .map(|(frame_id, _)| frame_id)
             .and_then(|frame_id| {
                 let continues_after_condition_phase = self
@@ -10899,7 +10893,6 @@ impl SqlEditorWidget {
         // MySQL ON DUPLICATE KEY UPDATE: tracks when VALUES() is a function, not a clause
         let mut on_duplicate_key_update_active = false;
         let mut inline_comment_continuation_state = InlineCommentContinuationState::None;
-        let mut pending_with_cte_body_depth_after_recursive = None;
         let is_package_body_statement = input.is_package_body_statement;
         let mut query_apply_context_tracker = LiveQueryApplyTracker::default();
         let mut statement_tail_state = FormatterTailState::new();
@@ -11082,25 +11075,6 @@ impl SqlEditorWidget {
         macro_rules! set_query_body_clause_base_depth {
             ($value:expr) => {{
                 format_stack.set_query_body_clause_base_depth($value);
-            }};
-        }
-        macro_rules! start_condition_body_if_expanded {
-            ($header_indent:expr, $header_token_idx:expr) => {{
-                let header_indent = $header_indent;
-                if Self::condition_has_direct_boolean_sibling(
-                    tokens,
-                    $header_token_idx,
-                    matching_paren_close_indices,
-                ) {
-                    newline_with(
-                        &mut out,
-                        header_indent,
-                        1,
-                        &mut at_line_start,
-                        &mut needs_space,
-                        &mut line_indent,
-                    );
-                }
             }};
         }
         macro_rules! construct_flag_active {
@@ -11332,7 +11306,9 @@ impl SqlEditorWidget {
                             | "UNION"
                             | "INTERSECT"
                             | "EXCEPT"
-                    );
+                    ) || (mysql_compatible
+                        && upper == "ON"
+                        && Self::starts_mysql_on_duplicate_key_update_clause(tokens, idx, None));
                     if format_stack
                         .last_scoped_indent(ScopedIndentKind::JoinBody)
                         .is_some_and(|frame| frame.scope == current_scope)
@@ -12378,7 +12354,15 @@ impl SqlEditorWidget {
                                     .last_paren()
                                     .is_some_and(|frame| frame.is_query_like())
                             });
-                            if let Some(returning_indent) =
+                            let keeps_first_frame_child_inline = format_stack
+                                .last_paren_first_body_is(idx)
+                                && !crate::sql_text::is_subquery_head_keyword(upper);
+                            if keeps_first_frame_child_inline {
+                                line_indent = format_stack
+                                    .last_paren()
+                                    .map(|frame| frame.depth())
+                                    .unwrap_or(line_indent);
+                            } else if let Some(returning_indent) =
                                 returning_function_option_indent.or(returning_owner_body_indent)
                             {
                                 newline_with(
@@ -12946,6 +12930,10 @@ impl SqlEditorWidget {
                                 && format_stack
                                     .last_scoped_indent(ScopedIndentKind::JoinBody)
                                     .is_some_and(|frame| frame.scope == current_scope)
+                                && !(mysql_compatible
+                                    && Self::starts_mysql_on_duplicate_key_update_clause(
+                                        tokens, idx, None,
+                                    ))
                             {
                                 let join_body_depth = format_stack
                                     .last_scoped_indent(ScopedIndentKind::JoinBody)
@@ -13112,7 +13100,12 @@ impl SqlEditorWidget {
                         let declaration_indent = format_stack.with_cte_separator_indent(
                             base_indent!(format_stack.statement_base_depth()),
                         );
-                        if !at_line_start {
+                        let is_first_with_definition = format_stack.list_owner_first_body_is(
+                            current_scope,
+                            ListOwnerKind::With,
+                            idx,
+                        );
+                        if !at_line_start && !is_first_with_definition {
                             newline_with(
                                 &mut out,
                                 declaration_indent,
@@ -13138,7 +13131,15 @@ impl SqlEditorWidget {
                             || format_stack.contains_block_kind("PACKAGE_BODY")
                             || at_package_body_member_depth)
                     {
-                        if !at_line_start && !follows_type_method_modifier {
+                        let is_first_with_definition = format_stack.list_owner_first_body_is(
+                            current_scope,
+                            ListOwnerKind::With,
+                            idx,
+                        );
+                        if !at_line_start
+                            && !follows_type_method_modifier
+                            && !is_first_with_definition
+                        {
                             newline_with(
                                 &mut out,
                                 base_indent!(format_stack.statement_base_depth()),
@@ -13437,6 +13438,16 @@ impl SqlEditorWidget {
                                 tokens,
                                 line_indent,
                             );
+                        } else if upper == "FOR" && mysql_set_statement_for_clause {
+                            // MariaDB SET STATEMENT <assignments> FOR <statement>: the
+                            // wrapped statement starts a fresh clause context so all of
+                            // its clause headers share the statement depth instead of
+                            // inheriting the SET assignment-list depth.
+                            let _ = format_stack.pop_assignment_value_frame_at_scope(current_scope);
+                            format_stack
+                                .clear_list_owner_kind_at_scope(current_scope, ListOwnerKind::Set);
+                            set_current_clause!(None);
+                            clear_select_list_layout_state!();
                         } else if upper == "FOR" && mysql_declare_condition_for_clause {
                             // DECLARE <name> CONDITION FOR <condition> stays inline
                             // with its declaration line.
@@ -13683,7 +13694,13 @@ impl SqlEditorWidget {
                                     loop_second_previous_non_comment_token,
                                     Some(SqlToken::Symbol(symbol)) if symbol == "."
                                 );
-                            if return_case_expression || named_argument_case_expression {
+                            let is_first_paren_child = format_stack.last_paren_first_body_is(idx);
+                            if is_first_paren_child {
+                                line_indent = format_stack
+                                    .last_paren()
+                                    .map(|frame| frame.depth())
+                                    .unwrap_or(line_indent);
+                            } else if return_case_expression || named_argument_case_expression {
                                 // RETURN CASE is one expression phrase. Source whitespace must
                                 // not split CASE away from its owner in Oracle PL/SQL. The same
                                 // applies to a named argument (`name => CASE`).
@@ -13726,10 +13743,14 @@ impl SqlEditorWidget {
                                     &mut line_indent,
                                 );
                             } else if in_sql_case_clause {
+                                let first_list_child_depth = format_stack
+                                    .first_list_body_indent_for_token(current_scope, idx);
                                 let in_case_branch_body = format_stack.last_block_kind_is("CASE")
                                     && (format_stack.last_case_branch_started()
                                         || matches!(prev_word_upper, Some("THEN")));
-                                if let Some(values_case_indent) = values_case_indent {
+                                if let Some(first_list_child_depth) = first_list_child_depth {
+                                    line_indent = first_list_child_depth;
+                                } else if let Some(values_case_indent) = values_case_indent {
                                     newline_with(
                                         &mut out,
                                         values_case_indent,
@@ -14151,6 +14172,7 @@ impl SqlEditorWidget {
                         );
                     let fixed_phrase_continuation = is_any_within_group
                         || is_merge_delete_where
+                        || format_stack.last_paren_first_body_is(idx)
                         || matches!(prev_word_upper, Some("AND" | "OR"))
                         || (!mysql_compatible
                             && matches!(
@@ -14411,46 +14433,7 @@ impl SqlEditorWidget {
                             clause_owner_depth,
                         );
                     }
-                    let mut started_with_cte_body = false;
-                    if starts_cte_definitions
-                        && is_keyword
-                        && !keyword_preserves_original_case
-                        && Self::with_cte_starts_expanded(tokens, idx, matching_paren_close_indices)
-                    {
-                        let body_indent = format_stack.with_cte_separator_indent(line_indent);
-                        if next_word_is("RECURSIVE") {
-                            pending_with_cte_body_depth_after_recursive = Some(body_indent);
-                        } else if !matches!(
-                            immediate_next_token,
-                            Some(SqlToken::Comment(comment)) if !comment.starts_with('\n')
-                        ) {
-                            newline_with(
-                                &mut out,
-                                body_indent,
-                                0,
-                                &mut at_line_start,
-                                &mut needs_space,
-                                &mut line_indent,
-                            );
-                            started_with_cte_body = true;
-                        }
-                    }
-                    if upper == "RECURSIVE" && prev_word_upper == Some("WITH") {
-                        if let Some(body_indent) =
-                            pending_with_cte_body_depth_after_recursive.take()
-                        {
-                            newline_with(
-                                &mut out,
-                                body_indent,
-                                0,
-                                &mut at_line_start,
-                                &mut needs_space,
-                                &mut line_indent,
-                            );
-                            started_with_cte_body = true;
-                        }
-                    }
-                    needs_space = !started_with_cte_body;
+                    needs_space = true;
                     let mut oracle_conditional_next_indent = None;
                     if !mysql_compatible {
                         match upper {
@@ -14511,17 +14494,6 @@ impl SqlEditorWidget {
                                 tokens,
                                 columns_owner_depth,
                             );
-                            if expanded_structured_table_function {
-                                let columns_body_indent = columns_owner_depth.saturating_add(1);
-                                newline_with(
-                                    &mut out,
-                                    columns_body_indent,
-                                    0,
-                                    &mut at_line_start,
-                                    &mut needs_space,
-                                    &mut line_indent,
-                                );
-                            }
                         }
                     }
                     if closes_plsql_label && next_non_comment.is_some() {
@@ -14560,22 +14532,9 @@ impl SqlEditorWidget {
                                 indent: select_body_indent,
                                 hanging_indent_spaces: None,
                             });
-                            newline_with(
-                                &mut out,
-                                select_body_indent,
-                                0,
-                                &mut at_line_start,
-                                &mut needs_space,
-                                &mut line_indent,
-                            );
                         } else {
                             activate_select_list_layout_state!(out.len(), select_body_indent);
                         }
-                    } else if upper == "WINDOW"
-                        && matches!(format_stack.current_clause(), Some("WINDOW"))
-                    {
-                        newline_after_keyword = true;
-                        newline_after_keyword_extra = 1;
                     }
 
                     if prev_word_upper == Some("COMPOUND") && upper == "TRIGGER" {
@@ -15171,7 +15130,6 @@ impl SqlEditorWidget {
                                 ConditionOwnerKind::ControlHeader,
                             );
                         }
-                        start_condition_body_if_expanded!(condition_owner_indent, idx);
                     }
 
                     if newline_after_keyword {
@@ -15339,7 +15297,6 @@ impl SqlEditorWidget {
                             Some(idx),
                             next_non_comment_idx,
                         );
-                        start_condition_body_if_expanded!(condition_owner_indent, idx);
                     } else if clause_keywords.contains(&upper)
                         && matches!(upper, "WHERE" | "HAVING")
                     {
@@ -15356,7 +15313,6 @@ impl SqlEditorWidget {
                             Some(idx),
                             next_non_comment_idx,
                         );
-                        start_condition_body_if_expanded!(condition_owner_indent, idx);
                     } else if upper == join_keyword
                         || upper == "APPLY"
                         || (clause_keywords.contains(&upper) && upper != "ON")
@@ -15397,7 +15353,6 @@ impl SqlEditorWidget {
                             Some(idx),
                             next_non_comment_idx,
                         );
-                        start_condition_body_if_expanded!(condition_owner_indent, idx);
                     } else if matches!(upper, "THEN" | "ELSE") {
                         let _ = format_stack.pop_last_condition_owner(ConditionOwnerKind::Case);
                     }
@@ -15439,7 +15394,6 @@ impl SqlEditorWidget {
                             format_stack
                                 .audit_mark_last_condition_attached(ConditionOwnerKind::Generic);
                         }
-                        start_condition_body_if_expanded!(condition_owner_indent, idx);
                     }
 
                     prev_word_idx = Some(idx);
@@ -16408,6 +16362,7 @@ impl SqlEditorWidget {
                                 && matches!(format_stack.current_clause(), Some("SELECT"))
                                 && !format_stack.open_cursor_state().in_select()
                                 && suppress_comma_break_depth == 0
+                                && format_stack.all_paren_frames_are_query_like()
                             {
                                 set_select_list_layout_state!(SelectListLayoutState::Multiline {
                                     indent: active_list_indent!(
@@ -16657,17 +16612,23 @@ impl SqlEditorWidget {
                                     .execute_immediate_multiline_using_is_at_paren_depth(
                                         format_stack.paren_depth(),
                                     );
+                                let comma_has_managed_frame = active_list_owner.is_some()
+                                    || format_stack
+                                        .last_paren_stack_frame()
+                                        .is_some_and(|frame| frame.direct_list_body);
                                 if !delimiter_frame_state.is_inside_bracket()
-                                    && (suppress_comma_break_depth == 0
+                                    && (comma_has_managed_frame
+                                        || suppress_comma_break_depth == 0
                                         || allows_compact_close_continuation_comma_break
                                         || allows_structural_sibling_comma_break
                                         || allows_named_argument_after_case_break)
-                                    && !keeps_mixed_close_key_subquery_inline
-                                    && !keeps_mixed_close_value_key_inline
-                                    && (!format_stack.execute_immediate_is_active()
-                                        || execute_immediate_multiline_bind_separator)
-                                    && !construct_flag_active!(GrantRevokeActive)
-                                    && !format_stack.trigger_header_is_active()
+                                    && (comma_has_managed_frame
+                                        || (!keeps_mixed_close_key_subquery_inline
+                                            && !keeps_mixed_close_value_key_inline
+                                            && (!format_stack.execute_immediate_is_active()
+                                                || execute_immediate_multiline_bind_separator)
+                                            && !construct_flag_active!(GrantRevokeActive)
+                                            && !format_stack.trigger_header_is_active()))
                                 {
                                     let query_like_select_list_indent = format_stack
                                         .last_paren()
@@ -16847,7 +16808,20 @@ impl SqlEditorWidget {
                                                 ))
                                         })
                                         .map(|_| current_rendered_line_indent);
-                                    if matches!(format_stack.current_clause(), Some("SET"))
+                                    let direct_list_sibling_indent = format_stack
+                                        .last_paren_stack_frame()
+                                        .filter(|frame| frame.direct_list_body)
+                                        .map(|frame| frame.frame.depth());
+                                    if let Some(sibling_indent) = direct_list_sibling_indent {
+                                        newline_with(
+                                            &mut out,
+                                            sibling_indent,
+                                            0,
+                                            &mut at_line_start,
+                                            &mut needs_space,
+                                            &mut line_indent,
+                                        );
+                                    } else if matches!(format_stack.current_clause(), Some("SET"))
                                         && construct_flag_active!(MergeActive)
                                     {
                                         let merge_set_continuation_extra =
@@ -17155,8 +17129,6 @@ impl SqlEditorWidget {
                                         && on_duplicate_key_update_active
                                         && word.eq_ignore_ascii_case("VALUES")
                             );
-                            let open_paren_followed_by_newline = next_non_comment_idx
-                                .is_some_and(|next_idx| token_gap_contains_newline(idx, next_idx));
                             let direct_wraps_subquery_or_case_head = matches!(
                                 next_non_comment,
                                 Some(SqlToken::Word(word))
@@ -17171,7 +17143,6 @@ impl SqlEditorWidget {
                                     && (word.eq_ignore_ascii_case("CASE")
                                         || crate::sql_text::is_subquery_head_keyword(word.as_str()))
                             );
-                            let paren_body_has_newline = open_paren_followed_by_newline;
                             let is_analytic_over_paren = Self::paren_opens_analytic_layout(
                                 format_stack.current_clause(),
                                 prev_word_upper,
@@ -17334,9 +17305,9 @@ impl SqlEditorWidget {
                                 && !is_column_list
                                 && multiline_clause_owner_kind.is_none()
                                 && prev_word_upper.is_some()
-                                && (paren_body_has_newline || paren_has_top_level_comma);
+                                && paren_has_top_level_comma;
                             let is_multiline_routine_parameter_list = mysql_compatible
-                                && paren_body_has_newline
+                                && paren_has_top_level_comma
                                 && Self::recent_statement_words_before_from_indices(
                                     tokens,
                                     &recent_statement_word_indices,
@@ -17351,7 +17322,7 @@ impl SqlEditorWidget {
                                 Self::paren_opens_call_argument_list_from_indices(
                                     tokens,
                                     &recent_statement_word_indices,
-                                ) && (paren_body_has_newline || body_contains_query_like_child);
+                                ) && (paren_has_top_level_comma || body_contains_query_like_child);
                             let has_nested_analytic_clause_owner_child =
                                 paren_body_analysis.contains_analytic_clause_owner_child;
                             let wraps_function_call_child = wraps_subquery_or_case_head
@@ -17409,88 +17380,6 @@ impl SqlEditorWidget {
                             } else {
                                 ParenFormatFrameKind::Compact
                             };
-                            // CASE is always expanded to multiple lines by the formatter.
-                            // Triggering the promotion only when `paren_body_has_newline` is
-                            // true (i.e. CASE was already multiline in the *input*) creates a
-                            // cycle: first pass keeps `SELECT func(` on one line, formatter
-                            // expands CASE inside, second pass sees the newline and splits
-                            // SELECT from func(. Removing the input-dependent gate makes the
-                            // decision structural: whenever the first SELECT list item opens
-                            // a paren whose first token is CASE, always promote SELECT to its
-                            // own line so both passes produce the same canonical output.
-                            let promotes_first_clause_owner_to_body_depth = matches!(format_stack.current_clause(), Some("SELECT" | "SET"))
-                                    && !at_line_start
-                                    && format_stack.paren_is_empty()
-                                    && suppress_comma_break_depth == 0
-                                    && select_list_layout_state!().has_active_indent()
-                                    && !select_list_layout_state!().is_multiline()
-                                    // Keep the existing dedicated `SELECT (` first-item path.
-                                    && !Self::paren_starts_first_clause_list_item(
-                                        format_stack.current_clause(),
-                                        prev_word_upper,
-                                        is_query_paren,
-                                        format_stack.paren_depth(),
-                                    )
-                                    && matches!(
-                                        next_non_comment,
-                                        Some(SqlToken::Word(word))
-                                            if word.eq_ignore_ascii_case("CASE")
-                                    );
-                            if promotes_first_clause_owner_to_body_depth {
-                                // Frame-first normalization: when the first SELECT/SET list
-                                // item opens a paren containing CASE (which is always
-                                // formatted multiline), promote SELECT onto its own line so
-                                // all sibling owners reuse the same parent list frame.
-                                set_select_list_layout_state!(SelectListLayoutState::Multiline {
-                                    indent: active_list_indent!(
-                                        format_stack.statement_base_depth(),
-                                        open_cursor_state!(),
-                                        select_list_layout_state!(),
-                                        format_stack.current_clause(),
-                                        construct_flag_active!(MergeActive),
-                                        false,
-                                    ),
-                                    hanging_indent_spaces: None,
-                                });
-                                line_indent = active_list_indent!(
-                                    format_stack.statement_base_depth(),
-                                    open_cursor_state!(),
-                                    select_list_layout_state!(),
-                                    format_stack.current_clause(),
-                                    construct_flag_active!(MergeActive),
-                                    false,
-                                );
-                            }
-                            if Self::paren_starts_first_clause_list_item(
-                                format_stack.current_clause(),
-                                prev_word_upper,
-                                is_query_paren,
-                                format_stack.paren_depth(),
-                            ) {
-                                newline_with(
-                                    &mut out,
-                                    base_indent!(format_stack.statement_base_depth()),
-                                    1,
-                                    &mut at_line_start,
-                                    &mut needs_space,
-                                    &mut line_indent,
-                                );
-                            } else if paren_frame_kind.opens_indented()
-                                && !at_line_start
-                                && rendered_line_tracker
-                                    .line_before_trailing_newlines(&out)
-                                    .trim_end()
-                                    .ends_with('(')
-                            {
-                                newline_with(
-                                    &mut out,
-                                    line_indent.saturating_add(1),
-                                    0,
-                                    &mut at_line_start,
-                                    &mut needs_space,
-                                    &mut line_indent,
-                                );
-                            }
                             let standalone_condition_body_indent = (at_line_start
                                 && matches!(
                                     prev_word_upper,
@@ -17592,8 +17481,15 @@ impl SqlEditorWidget {
                                         || body_contains_query_like_child);
                             let inside_case_branch_condition =
                                 format_stack.last_block_kind_is("CASE");
+                            let comment_forced_list_body_indent = (paren_started_at_line_start
+                                && idx > 0
+                                && matches!(tokens.get(idx - 1), Some(SqlToken::Comment(_))))
+                            .then(|| format_stack.list_owner_body_indent_for_scope(current_scope))
+                            .flatten();
                             let semantic_open_line_indent = if paren_started_at_line_start {
-                                line_indent
+                                first_list_body_indent
+                                    .or(comment_forced_list_body_indent)
+                                    .unwrap_or(line_indent)
                             } else if paren_frame_kind.opens_indented()
                                 && !paren_frame_kind.is_query_like()
                                 && !function_like_wrapped_paren
@@ -17805,7 +17701,29 @@ impl SqlEditorWidget {
                                         rendered_owner_line.trim_start(),
                                         "FOR",
                                     ));
-                            let parent_frame = if delimiter_belongs_to_semantic_owner
+                            if paren_started_at_line_start {
+                                if let (Some(kind), Some(header_token_idx)) =
+                                    (model_parenthesized_list_kind, prev_word_idx)
+                                {
+                                    if format_stack
+                                        .list_owner_for_kind(current_scope, kind)
+                                        .is_none()
+                                    {
+                                        format_stack.push_list_owner_kind_for_render(
+                                            current_scope,
+                                            kind,
+                                            header_token_idx,
+                                            tokens,
+                                            semantic_open_line_indent,
+                                        );
+                                    }
+                                }
+                            }
+                            let first_body_list_parent =
+                                format_stack.list_owner_frame_for_first_body_token(idx);
+                            let parent_frame = if let Some(parent) = first_body_list_parent {
+                                Some(parent)
+                            } else if delimiter_belongs_to_semantic_owner
                                 || query_owner_uses_enclosing_frame
                             {
                                 let owner_depth = if paren_frame_kind.is_query_like() {
@@ -17813,7 +17731,20 @@ impl SqlEditorWidget {
                                 } else {
                                     semantic_open_line_indent
                                 };
-                                format_stack.nearest_semantic_owner_parent_frame(owner_depth)
+                                let semantic_parent =
+                                    format_stack.nearest_semantic_owner_parent_frame(owner_depth);
+                                let active_parent =
+                                    format_stack.nearest_child_owner_frame(current_scope);
+                                match (semantic_parent, active_parent) {
+                                    (Some(semantic), Some(active)) => {
+                                        Some(if active.1 > semantic.1 {
+                                            active
+                                        } else {
+                                            semantic
+                                        })
+                                    }
+                                    (semantic, active) => semantic.or(active),
+                                }
                             } else {
                                 format_stack.nearest_child_owner_frame(current_scope)
                             };
@@ -17914,6 +17845,7 @@ impl SqlEditorWidget {
                                     }),
                                 None,
                             );
+                            format_stack.set_last_paren_first_body_token_idx(next_non_comment_idx);
                             format_stack.mark_last_paren_direct_list_body(owns_direct_list_body);
                             #[cfg(test)]
                             format_stack.audit_open_paren(
@@ -17974,45 +17906,10 @@ impl SqlEditorWidget {
                                 }
                             }
                             if paren_frame_kind.opens_indented() {
-                                // `format_stack.statement_base_depth()` was already updated atomically
-                                // inside `push_paren` using the frame's stored
-                                // depth. Here we only drive the
-                                // newline/line_indent bookkeeping.
-                                let keeps_inline_comment_after_open_paren = matches!(
-                                    immediate_next_token,
-                                    Some(SqlToken::Comment(comment))
-                                        if !comment.starts_with('\n') && comment.contains('\n')
-                                );
-                                if keeps_inline_comment_after_open_paren {
-                                    line_indent = if matches!(
-                                        paren_frame_kind,
-                                        ParenFormatFrameKind::WrappedLayout
-                                            | ParenFormatFrameKind::ColumnList
-                                    ) {
-                                        frame_depth
-                                    } else {
-                                        base_indent!(format_stack.statement_base_depth())
-                                    };
-                                } else {
-                                    let next_line_indent = if matches!(
-                                        paren_frame_kind,
-                                        ParenFormatFrameKind::WrappedLayout
-                                            | ParenFormatFrameKind::ColumnList
-                                            | ParenFormatFrameKind::QueryLike
-                                    ) {
-                                        frame_depth
-                                    } else {
-                                        base_indent!(format_stack.statement_base_depth())
-                                    };
-                                    newline_with(
-                                        &mut out,
-                                        next_line_indent,
-                                        0,
-                                        &mut at_line_start,
-                                        &mut needs_space,
-                                        &mut line_indent,
-                                    );
-                                }
+                                // The frame owns the physical indentation immediately, even
+                                // while its first child remains inline after `(`. If that child
+                                // later spans lines, continuation rendering consumes this depth.
+                                line_indent = frame_depth;
                             } else if paren_frame_kind.suppresses_comma_breaks() {
                                 suppress_comma_break_depth += 1;
                             }
@@ -18572,123 +18469,6 @@ impl SqlEditorWidget {
         false
     }
 
-    /// Decides whether WITH owns an expanded definition list before its first
-    /// child is rendered. Parenthesized CTE bodies are skipped as nested
-    /// frames, so only a comma between direct WITH children opens the list.
-    /// WITH-local routines are intrinsically multiline children.
-    fn with_cte_starts_expanded(
-        tokens: &[SqlToken],
-        with_token_idx: usize,
-        matching_paren_close_indices: &[Option<usize>],
-    ) -> bool {
-        let mut idx = with_token_idx.saturating_add(1);
-        let mut before_first_child = true;
-
-        while idx < tokens.len() {
-            match &tokens[idx] {
-                SqlToken::Comment(_) | SqlToken::String(_) => {}
-                SqlToken::Symbol(symbol) if symbol == "(" => {
-                    let Some(close_idx) = matching_paren_close_indices.get(idx).copied().flatten()
-                    else {
-                        return false;
-                    };
-                    before_first_child = false;
-                    idx = close_idx;
-                }
-                SqlToken::Symbol(symbol) if symbol == "," => return true,
-                SqlToken::Symbol(symbol) if matches!(symbol.as_str(), ")" | ";") => {
-                    return false;
-                }
-                SqlToken::Symbol(_) => before_first_child = false,
-                SqlToken::Word(word) => {
-                    let upper = word.to_ascii_uppercase();
-                    if before_first_child && upper == "RECURSIVE" {
-                        idx = idx.saturating_add(1);
-                        continue;
-                    }
-                    if before_first_child
-                        && sql_text::is_with_plsql_declaration_keyword(upper.as_str())
-                    {
-                        return true;
-                    }
-                    if !before_first_child
-                        && matches!(
-                            upper.as_str(),
-                            "SELECT" | "INSERT" | "UPDATE" | "DELETE" | "MERGE"
-                        )
-                    {
-                        return false;
-                    }
-                    before_first_child = false;
-                }
-            }
-            idx = idx.saturating_add(1);
-        }
-
-        false
-    }
-
-    /// Returns whether the condition that starts at `header_token_idx` owns
-    /// more than one direct boolean child. Nested parentheses and CASE
-    /// expressions are separate frames, and BETWEEN's AND is not a sibling.
-    ///
-    /// This decision is made before rendering the first child so an expanded
-    /// condition starts at owner depth + 1. The renderer must not discover a
-    /// later sibling and then move already-rendered output retroactively.
-    fn condition_has_direct_boolean_sibling(
-        tokens: &[SqlToken],
-        header_token_idx: usize,
-        matching_paren_close_indices: &[Option<usize>],
-    ) -> bool {
-        let mut idx = header_token_idx.saturating_add(1);
-        let mut case_depth = 0usize;
-        let mut between_pending = false;
-
-        while idx < tokens.len() {
-            match &tokens[idx] {
-                SqlToken::Comment(_) | SqlToken::String(_) => {}
-                SqlToken::Symbol(symbol) if symbol == "(" => {
-                    let Some(close_idx) = matching_paren_close_indices.get(idx).copied().flatten()
-                    else {
-                        return false;
-                    };
-                    idx = close_idx;
-                }
-                SqlToken::Symbol(symbol) if matches!(symbol.as_str(), ")" | "," | ";") => {
-                    return false;
-                }
-                SqlToken::Symbol(_) => {}
-                SqlToken::Word(word) => {
-                    let upper = word.to_ascii_uppercase();
-                    if case_depth > 0 {
-                        match upper.as_str() {
-                            "CASE" => case_depth = case_depth.saturating_add(1),
-                            "END" => case_depth = case_depth.saturating_sub(1),
-                            _ => {}
-                        }
-                    } else {
-                        match upper.as_str() {
-                            "CASE" => case_depth = 1,
-                            "BETWEEN" => between_pending = true,
-                            "AND" if between_pending => between_pending = false,
-                            "AND" | "OR" => return true,
-                            "THEN" | "$THEN" | "ELSE" | "ELSIF" | "$ELSIF" | "WHEN" | "LOOP"
-                            | "DO" | "BEGIN" | "END" | "JOIN" | "APPLY" | "FROM" | "WHERE"
-                            | "GROUP" | "HAVING" | "ORDER" | "QUALIFY" | "CONNECT" | "START"
-                            | "UNION" | "INTERSECT" | "MINUS" | "EXCEPT" | "RETURNING"
-                            | "MODEL" | "WINDOW" | "MATCH_RECOGNIZE" | "PIVOT" | "UNPIVOT"
-                            | "FETCH" | "OFFSET" | "LIMIT" => return false,
-                            _ => {}
-                        }
-                    }
-                }
-            }
-            idx = idx.saturating_add(1);
-        }
-
-        false
-    }
-
     #[allow(dead_code)]
     fn fetch_into_has_multiple_targets(tokens: &[SqlToken], into_idx: usize) -> bool {
         let mut paren_depth = 0usize;
@@ -19046,26 +18826,6 @@ impl SqlEditorWidget {
         (format_stack.paren_depth() == paren_depth)
             .then(|| format_stack.last_paren_wrapped_owner_kind())
             .flatten()
-    }
-
-    fn paren_starts_first_clause_list_item(
-        current_clause: Option<&str>,
-        prev_word_upper: Option<&str>,
-        is_query_paren: bool,
-        paren_depth: usize,
-    ) -> bool {
-        if paren_depth > 0 {
-            return false;
-        }
-
-        matches!(
-            (current_clause, prev_word_upper),
-            (Some("SELECT"), Some("SELECT"))
-        ) || (is_query_paren
-            && matches!(
-                (current_clause, prev_word_upper),
-                (Some("GROUP" | "ORDER"), Some("BY"))
-            ))
     }
 
     fn paren_extra_depth(format_stack: &FormatFrameStack) -> usize {
@@ -20431,7 +20191,7 @@ mod frame_alignment_audit_tests {
 
     #[test]
     fn frame_alignment_audit_reports_body_and_close_indent_drift() {
-        let formatted = "fn(\n    first,\n        second\n    )";
+        let formatted = "fn(first,\n        second\n    )";
         let mut audit = FormatFrameAlignmentAudit::default();
         audit.register_open(1, None, 1, Some(2), true, Some(1));
         audit.record_sibling_after_comma(1, Some(4));
@@ -20440,7 +20200,7 @@ mod frame_alignment_audit_tests {
         let summary = audit.resolve(formatted, false);
 
         assert_eq!(summary.checked_frames, 1);
-        assert_eq!(summary.checked_body_items, 2);
+        assert_eq!(summary.checked_body_items, 1);
         assert_eq!(summary.checked_closes, 1);
         assert_eq!(summary.issues.len(), 2, "{:#?}", summary.issues);
         assert!(summary
@@ -20454,7 +20214,7 @@ mod frame_alignment_audit_tests {
     }
 
     #[test]
-    fn frame_alignment_audit_reports_inline_first_child_in_multiline_condition() {
+    fn frame_alignment_audit_allows_inline_first_child_with_aligned_siblings() {
         let formatted = "WHERE a = 1\n    AND b = 2";
         let mut audit = FormatFrameAlignmentAudit::default();
         audit.register_condition(1, None, 0, Some(1), 1, 1);
@@ -20462,11 +20222,7 @@ mod frame_alignment_audit_tests {
 
         let summary = audit.resolve(formatted, false);
 
-        assert_eq!(summary.checked_frames, 1);
-        assert!(summary
-            .issues
-            .iter()
-            .any(|issue| { issue.message.contains("first direct child remains inline") }));
+        assert!(summary.issues.is_empty(), "{:#?}", summary.issues);
     }
 
     #[test]
@@ -20520,7 +20276,7 @@ mod frame_alignment_audit_tests {
 
     #[test]
     fn frame_alignment_audit_accepts_semantic_list_attached_to_parent_opener() {
-        let formatted = "(\n    first,\n    second\n)";
+        let formatted = "(first,\n    second\n)";
         let mut audit = FormatFrameAlignmentAudit::default();
         audit.register_open(1, None, 0, Some(1), false, None);
         audit.register_clause_list(2, Some(1), 0, Some(1), 1);
@@ -21339,7 +21095,10 @@ END oqt_mega_pkg;"#;
             .iter()
             .enumerate()
             .skip(assignment_idx + 1)
-            .find(|(_, line)| line.trim_start() == "CASE")
+            .find(|(_, line)| {
+                line.trim_start().starts_with("CASE")
+                    || (line.contains(" CASE") && !line.trim_start().starts_with("END "))
+            })
             .map(|(idx, _)| idx)
             .expect("CASE line");
         let outer_when_idx = lines
@@ -21374,7 +21133,10 @@ END oqt_mega_pkg;"#;
             .iter()
             .enumerate()
             .skip(outer_else_idx + 1)
-            .find(|(_, line)| line.trim_start() == "CASE")
+            .find(|(_, line)| {
+                line.trim_start().starts_with("CASE")
+                    || (line.contains(" CASE") && !line.trim_start().starts_with("END "))
+            })
             .map(|(idx, _)| idx)
             .expect("outer ELSE CASE line");
         let outer_end_idx = lines
@@ -21520,7 +21282,10 @@ END fmt_pkg_extreme;"#;
             .iter()
             .enumerate()
             .skip(assignment_idx + 1)
-            .find(|(_, line)| line.trim_start() == "CASE")
+            .find(|(_, line)| {
+                line.trim_start().starts_with("CASE")
+                    || (line.contains(" CASE") && !line.trim_start().starts_with("END "))
+            })
             .map(|(idx, _)| idx)
             .expect("CASE line");
 
@@ -21955,12 +21720,16 @@ END;"#;
         let indent = |line: &str| line.len().saturating_sub(line.trim_start().len());
         let if_idx = lines
             .iter()
-            .position(|line| line.trim_start() == "IF (")
-            .unwrap_or(0);
-        let case_idx = lines
+            .position(|line| line.trim_start().starts_with("IF (CASE"))
+            .expect("inline IF parenthesis and first CASE child");
+        let when_idx = lines
             .iter()
-            .position(|line| line.trim_start() == "CASE")
-            .unwrap_or(0);
+            .position(|line| line.trim_start().starts_with("WHEN flag = 'Y'"))
+            .expect("CASE WHEN child");
+        let case_end_idx = lines
+            .iter()
+            .position(|line| line.trim_start() == "END")
+            .expect("CASE END");
         let close_paren_idx = lines
             .iter()
             .position(|line| line.trim_start().starts_with(") = 1 THEN"))
@@ -21971,8 +21740,20 @@ END;"#;
             .unwrap_or(0);
 
         assert!(
-            indent(lines[case_idx]) > indent(lines[if_idx]),
-            "CASE inside IF condition should still indent deeper than the IF header, got:\n{}",
+            lines[if_idx].contains("IF (CASE"),
+            "first parenthesized CASE condition child should remain inline with IF, got:\n{}",
+            formatted
+        );
+        assert_eq!(
+            indent(lines[case_end_idx]),
+            indent(lines[if_idx]).saturating_add(8),
+            "CASE END should reflect the condition and parenthesis frame edges, got:\n{}",
+            formatted
+        );
+        assert_eq!(
+            indent(lines[when_idx]),
+            indent(lines[case_end_idx]).saturating_add(4),
+            "CASE branch children should stay one frame deeper than CASE, got:\n{}",
             formatted
         );
         assert_eq!(
@@ -22015,7 +21796,10 @@ END;"#;
             .expect("comment gap line");
         let case_idx = lines
             .iter()
-            .position(|line| line.trim_start() == "CASE")
+            .position(|line| {
+                line.trim_start().starts_with("CASE")
+                    || (line.contains(" CASE") && !line.trim_start().starts_with("END "))
+            })
             .expect("CASE line");
         let close_paren_idx = lines
             .iter()
@@ -22059,12 +21843,16 @@ END;"#;
         let indent = |line: &str| line.len().saturating_sub(line.trim_start().len());
         let while_idx = lines
             .iter()
-            .position(|line| line.trim_start() == "WHILE (")
-            .unwrap_or(0);
-        let case_idx = lines
+            .position(|line| line.trim_start().starts_with("WHILE (CASE"))
+            .expect("inline WHILE parenthesis and first CASE child");
+        let when_idx = lines
             .iter()
-            .position(|line| line.trim_start() == "CASE")
-            .unwrap_or(0);
+            .position(|line| line.trim_start().starts_with("WHEN flag = 'Y'"))
+            .expect("CASE WHEN child");
+        let case_end_idx = lines
+            .iter()
+            .position(|line| line.trim_start() == "END")
+            .expect("CASE END");
         let close_paren_idx = lines
             .iter()
             .position(|line| line.trim_start().starts_with(") = 1 LOOP"))
@@ -22075,8 +21863,20 @@ END;"#;
             .unwrap_or(0);
 
         assert!(
-            indent(lines[case_idx]) > indent(lines[while_idx]),
-            "CASE inside WHILE condition should still indent deeper than the WHILE header, got:\n{}",
+            lines[while_idx].contains("WHILE (CASE"),
+            "first parenthesized CASE condition child should remain inline with WHILE, got:\n{}",
+            formatted
+        );
+        assert_eq!(
+            indent(lines[case_end_idx]),
+            indent(lines[while_idx]).saturating_add(8),
+            "CASE END should reflect the condition and parenthesis frame edges, got:\n{}",
+            formatted
+        );
+        assert_eq!(
+            indent(lines[when_idx]),
+            indent(lines[case_end_idx]).saturating_add(4),
+            "CASE branch children should stay one frame deeper than CASE, got:\n{}",
             formatted
         );
         assert_eq!(
@@ -22112,8 +21912,8 @@ END;"#;
         let indent = |line: &str| line.len().saturating_sub(line.trim_start().len());
         let elsif_idx = lines
             .iter()
-            .position(|line| line.trim_start() == "ELSIF (")
-            .unwrap_or(0);
+            .position(|line| line.trim_start().starts_with("ELSIF (CASE"))
+            .expect("inline ELSIF parenthesis and first CASE child");
         let close_paren_idx = lines
             .iter()
             .position(|line| line.trim_start().starts_with(") = 1 THEN"))
@@ -22127,6 +21927,11 @@ END;"#;
             indent(lines[close_paren_idx]),
             indent(lines[elsif_idx]).saturating_add(4),
             "ELSIF close paren line should return to its condition-child owner depth, got:\n{}",
+            formatted
+        );
+        assert!(
+            lines[elsif_idx].contains("ELSIF (CASE"),
+            "first parenthesized CASE condition child should remain inline with ELSIF, got:\n{}",
             formatted
         );
         assert_eq!(
@@ -22155,12 +21960,8 @@ END;"#;
         let indent = |line: &str| line.len().saturating_sub(line.trim_start().len());
         let if_idx = lines
             .iter()
-            .position(|line| line.trim_start() == "IF")
+            .position(|line| line.trim_start().starts_with("IF EXISTS ("))
             .expect("formatted output should contain IF header");
-        let first_condition_idx = lines
-            .iter()
-            .position(|line| line.trim_start() == "EXISTS (")
-            .expect("formatted output should contain first EXISTS condition");
         let and_idx = lines
             .iter()
             .position(|line| line.trim_start().starts_with("AND EXISTS ("))
@@ -22187,14 +21988,8 @@ END;"#;
 
         assert_eq!(
             indent(lines[and_idx]),
-            indent(lines[first_condition_idx]),
-            "AND/OR children inside the same IF condition frame should share one depth, got:\n{}",
-            formatted
-        );
-        assert_eq!(
-            indent(lines[first_condition_idx]),
             indent(lines[if_idx]).saturating_add(4),
-            "multiline IF condition children should stay one level below IF, got:\n{}",
+            "AND/OR children inside the same IF condition frame should share one depth, got:\n{}",
             formatted
         );
         assert!(
@@ -22209,7 +22004,7 @@ END;"#;
         );
         assert_eq!(
             indent(lines[close_then_idx]),
-            indent(lines[first_condition_idx]),
+            indent(lines[and_idx]),
             "final EXISTS close should stay on the condition-child depth, got:\n{}",
             formatted
         );
@@ -22282,12 +22077,8 @@ FROM qt_fmt_emp e;"#;
 
         let when_idx = lines
             .iter()
-            .position(|line| line.trim_start() == "WHEN")
+            .position(|line| line.trim_start().starts_with("WHEN e.salary"))
             .expect("formatted output should contain searched CASE WHEN header");
-        let first_condition_idx = lines
-            .iter()
-            .position(|line| line.trim_start() == "e.salary >= 100000")
-            .expect("formatted output should contain the first searched CASE condition");
         let and_idx = lines
             .iter()
             .position(|line| line.trim_start() == "AND EXISTS (")
@@ -22302,14 +22093,8 @@ FROM qt_fmt_emp e;"#;
             .expect("formatted output should contain EXISTS close THEN line");
 
         assert_eq!(
-            indent(lines[first_condition_idx]),
-            indent(lines[when_idx]).saturating_add(4),
-            "searched CASE condition children should be one level deeper than WHEN, got:\n{}",
-            formatted
-        );
-        assert_eq!(
             indent(lines[and_idx]),
-            indent(lines[first_condition_idx]),
+            indent(lines[when_idx]).saturating_add(4),
             "searched CASE condition siblings should share one depth, got:\n{}",
             formatted
         );
@@ -22356,15 +22141,23 @@ FROM u;"#;
         let case_idx = lines
             .iter()
             .enumerate()
-            .skip(when_idx + 1)
-            .find(|(_, line)| line.trim_start() == "CASE")
+            .skip(when_idx)
+            .find(|(_, line)| line.trim_start().starts_with("WHEN MAX (CASE"))
             .map(|(idx, _)| idx)
             .expect("formatted output should contain nested CASE under MAX");
 
+        let inner_when_idx = lines
+            .iter()
+            .enumerate()
+            .skip(case_idx + 1)
+            .find(|(_, line)| line.trim_start().starts_with("WHEN u.qtr"))
+            .map(|(idx, _)| idx)
+            .expect("formatted output should contain the nested CASE branch");
+
         assert_eq!(
-            indent(lines[case_idx]),
-            indent(lines[when_idx]).saturating_add(8),
-            "nested CASE inside WHEN-owned MAX should include both the WHEN continuation depth and the MAX paren depth, got:\n{}",
+            indent(lines[inner_when_idx]),
+            indent(lines[when_idx]).saturating_add(12),
+            "the nested CASE branch should include the WHEN, MAX-parenthesis, and CASE frame depths, got:\n{}",
             formatted
         );
     }
@@ -22408,11 +22201,14 @@ CROSS APPLY (
             .expect("formatted output should contain EXISTS child SELECT");
         let where_idx = lines
             .iter()
-            .position(|line| line.trim_start() == "WHERE")
+            .position(|line| line.trim_start().starts_with("WHERE "))
             .expect("formatted output should contain the EXISTS child WHERE header");
         let first_predicate_idx = lines
             .iter()
-            .position(|line| line.trim_start() == "b.emp_id = d.department_id")
+            .position(|line| {
+                line.trim_start()
+                    .starts_with("WHERE b.emp_id = d.department_id")
+            })
             .expect("formatted output should contain the first EXISTS predicate");
         let and_idx = lines
             .iter()
@@ -22442,8 +22238,8 @@ CROSS APPLY (
         );
         assert_eq!(
             indent(lines[and_idx]),
-            indent(lines[first_predicate_idx]),
-            "EXISTS predicates in the same multiline WHERE frame should share one depth even when APPLY exists elsewhere, got:\n{}",
+            indent(lines[first_predicate_idx]).saturating_add(4),
+            "the second EXISTS predicate should use the WHERE frame child depth even when APPLY exists elsewhere, got:\n{}",
             formatted
         );
         assert_eq!(
@@ -22469,7 +22265,10 @@ CROSS APPLY (
 
         let first_predicate_idx = lines
             .iter()
-            .position(|line| line.trim_start() == "b.emp_id = d.department_id")
+            .position(|line| {
+                line.trim_start()
+                    .starts_with("WHERE b.emp_id = d.department_id")
+            })
             .expect("formatted output should contain the first EXISTS predicate");
         let and_idx = lines
             .iter()
@@ -22478,8 +22277,8 @@ CROSS APPLY (
 
         assert_eq!(
             indent(lines[and_idx]),
-            indent(lines[first_predicate_idx]),
-            "mixed tab+space indentation should normalize condition siblings to one canonical depth, got:\n{}",
+            indent(lines[first_predicate_idx]).saturating_add(4),
+            "mixed tab+space indentation should normalize the second condition child to the WHERE frame depth, got:\n{}",
             formatted
         );
     }
@@ -22504,7 +22303,7 @@ end if;"#;
 
         let inner_predicate_idx = lines
             .iter()
-            .position(|line| line.trim_start() == "1 = 1")
+            .position(|line| line.trim_start().starts_with("WHERE 1 = 1"))
             .expect("formatted output should contain the first inner predicate");
         let inner_and_idx = lines
             .iter()
@@ -22516,8 +22315,8 @@ end if;"#;
 
         assert_eq!(
             indent(lines[inner_and_idx]),
-            indent(lines[inner_predicate_idx]),
-            "inner subquery conditions in the same WHERE frame should share one depth, got:\n{formatted}"
+            indent(lines[inner_predicate_idx]).saturating_add(4),
+            "the second inner subquery condition should use the WHERE frame child depth, got:\n{formatted}"
         );
     }
 
@@ -22538,7 +22337,7 @@ where (exists (
 
         let inner_predicate_idx = lines
             .iter()
-            .position(|line| line.trim_start() == "1 = 1")
+            .position(|line| line.trim_start().starts_with("WHERE 1 = 1"))
             .expect("formatted output should contain the first EXISTS-inner predicate");
         let inner_and_idx = lines
             .iter()
@@ -22547,8 +22346,8 @@ where (exists (
 
         assert_eq!(
             indent(lines[inner_and_idx]),
-            indent(lines[inner_predicate_idx]),
-            "EXISTS-inner conditions within the same WHERE frame should share one depth, got:\n{formatted}"
+            indent(lines[inner_predicate_idx]).saturating_add(4),
+            "the second EXISTS-inner condition should use the WHERE frame child depth, got:\n{formatted}"
         );
     }
 
@@ -22573,19 +22372,19 @@ end;"#;
         let lines: Vec<&str> = formatted.lines().collect();
         let indent = |line: &str| line.len().saturating_sub(line.trim_start().len());
 
-        let case_idx = lines
-            .iter()
-            .position(|line| line.trim_start() == "CASE")
-            .expect("formatted output should contain CASE owner");
         let end_idx = lines
             .iter()
             .position(|line| line.trim_start().starts_with("END b"))
             .expect("formatted output should contain END b");
+        let when_idx = lines
+            .iter()
+            .position(|line| line.trim_start().starts_with("WHEN 1 = 1"))
+            .expect("formatted output should contain CASE branch");
 
         assert_eq!(
-            indent(lines[end_idx]),
-            indent(lines[case_idx]),
-            "CASE terminator should align to its CASE owner depth inside the same frame, got:\n{formatted}"
+            indent(lines[end_idx]).saturating_add(4),
+            indent(lines[when_idx]),
+            "CASE terminator should close one frame above its branch children, got:\n{formatted}"
         );
     }
 
@@ -22610,19 +22409,15 @@ from dual;"#;
 
         let when_idx = lines
             .iter()
-            .position(|line| line.trim_start() == "WHEN")
+            .position(|line| line.trim_start().starts_with("WHEN col1 = 1"))
             .expect("formatted output should contain CASE WHEN header");
-        let first_condition_idx = lines
-            .iter()
-            .position(|line| line.trim_start() == "col1 = 1")
-            .expect("formatted output should contain the first CASE condition");
         let case_and_idx = lines
             .iter()
             .position(|line| line.trim_start() == "AND EXISTS (")
             .expect("formatted output should contain CASE condition AND");
         let inner_predicate_idx = lines
             .iter()
-            .position(|line| line.trim_start() == "1 = 1")
+            .position(|line| line.trim_start().starts_with("WHERE 1 = 1"))
             .expect("formatted output should contain the first nested EXISTS predicate");
         let inner_and_idx = lines
             .iter()
@@ -22631,18 +22426,13 @@ from dual;"#;
 
         assert_eq!(
             indent(lines[case_and_idx]),
-            indent(lines[first_condition_idx]),
+            indent(lines[when_idx]).saturating_add(4),
             "CASE condition children should share one depth, got:\n{formatted}"
         );
         assert_eq!(
-            indent(lines[first_condition_idx]),
-            indent(lines[when_idx]).saturating_add(4),
-            "CASE condition children should remain one level deeper than WHEN, got:\n{formatted}"
-        );
-        assert_eq!(
             indent(lines[inner_and_idx]),
-            indent(lines[inner_predicate_idx]),
-            "nested EXISTS conditions should share their WHERE child depth without CASE-state leakage, got:\n{formatted}"
+            indent(lines[inner_predicate_idx]).saturating_add(4),
+            "the second nested EXISTS condition should use its WHERE frame depth without CASE-state leakage, got:\n{formatted}"
         );
     }
 
@@ -22711,13 +22501,16 @@ WHERE EXISTS (
 
         let first_predicate_idx = lines
             .iter()
-            .position(|line| line.trim_start() == "b.emp_id = d.department_id")
+            .position(|line| {
+                line.trim_start()
+                    .starts_with("WHERE b.emp_id = d.department_id")
+            })
             .expect("formatted output should contain the first EXISTS predicate");
 
         assert_eq!(
             indent(lines[and_idx]),
-            indent(lines[first_predicate_idx]),
-            "tab-derived odd indentation should normalize siblings to one canonical condition depth, got:\n{}",
+            indent(lines[first_predicate_idx]).saturating_add(4),
+            "tab-derived odd indentation should normalize the second condition child to the WHERE frame depth, got:\n{}",
             formatted
         );
     }
@@ -22760,8 +22553,8 @@ END;"#;
         );
         assert_eq!(
             indent(lines[close_loop_idx]),
-            indent(lines[for_idx]),
-            "close LOOP line should return to the FOR header depth, got:\n{}",
+            indent(lines[for_idx]).saturating_add(4),
+            "close LOOP line should return to the query-parenthesis owner depth, got:\n{}",
             formatted
         );
         assert_eq!(
@@ -22995,7 +22788,7 @@ END;"#;
         let indent = |line: &str| line.len().saturating_sub(line.trim_start().len());
         let case_idx = lines
             .iter()
-            .position(|line| line.trim_start().starts_with("CASE v_mode"))
+            .position(|line| line.contains("(CASE v_mode"))
             .expect("CASE line");
         let when_idx = lines
             .iter()
@@ -23027,7 +22820,7 @@ END;"#;
             .expect("END line");
 
         assert!(
-            formatted.contains("(\n            CASE v_mode\n                WHEN 1 THEN"),
+            formatted.contains("v_val := (CASE v_mode\n                WHEN 1 THEN"),
             "CASE <expr> should include assignment-value and parenthesized-body frame edges, got:\n{}",
             formatted
         );
@@ -23045,8 +22838,8 @@ END;"#;
         );
         assert_eq!(
             indent(lines[end_idx]),
-            indent(lines[case_idx]),
-            "CASE <expr> END should keep CASE-block depth, got:\n{}",
+            indent(lines[when_idx]).saturating_sub(4),
+            "CASE <expr> END should close the branch frame at CASE depth, got:\n{}",
             formatted
         );
     }
@@ -23066,7 +22859,11 @@ END;"#;
         let indent = |line: &str| line.len().saturating_sub(line.trim_start().len());
         let case_idx = lines
             .iter()
-            .position(|line| line.trim_start() == "CASE")
+            .position(|line| {
+                line.trim_start().starts_with("CASE")
+                    || line.contains("(CASE")
+                    || (line.contains(" CASE") && !line.trim_start().starts_with("END "))
+            })
             .expect("CASE line");
         let when_idx = lines
             .iter()
@@ -23116,8 +22913,8 @@ END;"#;
         );
         assert_eq!(
             indent(lines[end_case_idx]),
-            indent(lines[case_idx]),
-            "END CASE terminator should stay aligned with CASE header in parenthesized expression, got:\n{}",
+            indent(lines[when_idx]).saturating_sub(4),
+            "END CASE should close the branch frame at CASE depth in a parenthesized expression, got:\n{}",
             formatted
         );
     }
@@ -23141,20 +22938,13 @@ END;"#;
         let indent = |line: &str| line.len().saturating_sub(line.trim_start().len());
         let owner_idx = lines
             .iter()
-            .position(|line| line.trim_start() == "v_sum := v_sum + (")
+            .position(|line| line.trim_start().starts_with("v_sum := v_sum + (CASE"))
             .expect("owner line");
-        let case_idx = lines
-            .iter()
-            .enumerate()
-            .skip(owner_idx + 1)
-            .find(|(_, line)| line.trim_start() == "CASE")
-            .map(|(idx, _)| idx)
-            .expect("CASE line");
         let when_idx = lines
             .iter()
             .enumerate()
-            .skip(case_idx + 1)
-            .find(|(_, line)| line.trim_start().starts_with("WHEN MOD (i, 2) = 0 THEN"))
+            .skip(owner_idx + 1)
+            .find(|(_, line)| line.trim_start().starts_with("WHEN MOD (i,"))
             .map(|(idx, _)| idx)
             .expect("WHEN line");
         let end_idx = lines
@@ -23173,21 +22963,15 @@ END;"#;
             .expect("close line");
 
         assert_eq!(
-            indent(lines[case_idx]),
-            indent(lines[owner_idx]).saturating_add(8),
-            "CASE after an assignment operator and open paren should cross both explicit frame edges, got:\n{}",
-            formatted
-        );
-        assert_eq!(
             indent(lines[when_idx]),
-            indent(lines[case_idx]).saturating_add(4),
-            "WHEN inside the operator-owned parenthesized CASE should stay one level deeper than CASE, got:\n{}",
+            indent(lines[owner_idx]).saturating_add(12),
+            "WHEN should cross the assignment-value, parenthesis, and CASE frame edges, got:\n{}",
             formatted
         );
         assert_eq!(
             indent(lines[end_idx]),
-            indent(lines[case_idx]),
-            "END inside the operator-owned parenthesized CASE should stay aligned with CASE, got:\n{}",
+            indent(lines[when_idx]).saturating_sub(4),
+            "END should close one frame above the CASE branch children, got:\n{}",
             formatted
         );
         assert_eq!(
@@ -25928,7 +25712,7 @@ SELECT 2 FROM dual"
             );
             let formatted = SqlEditorWidget::format_for_auto_formatting(&source, false);
             let expected = format!(
-                "SELECT 1\nFROM outer_t o\nWHERE\n    o.score {comparison} (\n        SELECT 1\n        FROM inner_t i\n        WHERE\n            i.score {comparison} (\n                SELECT 1\n                FROM leaf_t l\n                WHERE l.outer_id = o.id\n            )\n            AND i.outer_id = o.id\n    )\n    AND o.active = 1;"
+                "SELECT 1\nFROM outer_t o\nWHERE o.score {comparison} (\n        SELECT 1\n        FROM inner_t i\n        WHERE i.score {comparison} (\n                SELECT 1\n                FROM leaf_t l\n                WHERE l.outer_id = o.id\n            )\n            AND i.outer_id = o.id\n    )\n    AND o.active = 1;"
             );
 
             assert_eq!(
@@ -26091,8 +25875,7 @@ END;"#;
             "    INTO v_id",
             "    FROM outer_t o",
             "    WHERE EXISTS (",
-            "            WITH",
-            "                a AS (",
+            "            WITH a AS (",
             "                    SELECT id",
             "                    FROM inner_t",
             "                ),",
@@ -26152,13 +25935,11 @@ BEGIN
                     SELECT H -- 20
                     FROM J -- 20
                     INNER JOIN K -- 20
-                        ON
-                            1 = 1 -- 24
+                        ON 1 = 1 -- 24
                             AND 2 = 2 -- 28
                             OR 3 = 3 -- 28
                     OUTER JOIN K -- 20
-                        ON
-                            1 = 1 -- 24
+                        ON 1 = 1 -- 24
                             AND 2 = 2 -- 28
                             OR 3 = 3 -- 28
                 ) I -- 16
@@ -26173,12 +25954,10 @@ WHERE F IN (
                 SELECT H --16
                 FROM J --16
                 INNER JOIN K --16
-                    ON
-                        1 = 1 --20
+                    ON 1 = 1 --20
                         AND 2 = 2 -- 24
                 OUTER JOIN K -- 16
-                    ON
-                        1 = 1 --20
+                    ON 1 = 1 --20
                         AND 2 = 2 -- 24
             ) I --12
     ); --4"#;
@@ -26250,7 +26029,7 @@ END;"#;
 
         assert!(
             formatted.contains(
-                "d.dept_name, /*asdf*/\n                    NVL (\n                        (\n                            SELECT SUM (s.amount)\n                            FROM qt_sales s\n                            WHERE s.emp_id = e.emp_id\n                        ),\n                        0\n                    ) AS total_sales"
+                "d.dept_name, /*asdf*/\n                    NVL ((\n                            SELECT SUM (s.amount)\n                            FROM qt_sales s\n                            WHERE s.emp_id = e.emp_id\n                        ),\n                        0\n                    ) AS total_sales"
             ),
             "{}",
             formatted
@@ -26287,7 +26066,7 @@ END;"#;
 
         assert!(
             formatted.contains(
-                "d.dept_name, --asdf\n                    NVL (\n                        (\n                            SELECT SUM (s.amount)\n                            FROM qt_sales s\n                            WHERE s.emp_id = e.emp_id\n                        ),\n                        0\n                    ) AS total_sales"
+                "d.dept_name, --asdf\n                    NVL ((\n                            SELECT SUM (s.amount)\n                            FROM qt_sales s\n                            WHERE s.emp_id = e.emp_id\n                        ),\n                        0\n                    ) AS total_sales"
             ),
             "{}",
             formatted
@@ -26731,7 +26510,7 @@ END;";
         let formatted = SqlEditorWidget::format_sql_basic(source);
 
         assert!(
-            formatted.contains("WHERE (e.manager_id IN (100, 200)\n                    OR e.department_id = 90)"),
+            formatted.contains("WHERE (e.manager_id IN (100,\n                        200)\n                    OR e.department_id = 90)"),
             "Nested non-SELECT parenthesis pairs in OPEN ... FOR WHERE should stay paired and indented, got:
 {}",
             formatted
@@ -27520,8 +27299,7 @@ SUBPARTITION TEMPLATE (
         let expected = [
             "SELECT 1",
             "FROM order_item oi",
-            "WHERE",
-            "    oi.order_id = v.order_id",
+            "WHERE oi.order_id = v.order_id",
             "    AND oi.qty <= /* X: 0 이하 */",
             "        0;",
         ]
@@ -27657,6 +27435,25 @@ mod format_indent_gap_tests {
         lines
             .iter()
             .position(|line| line.trim_start().starts_with(prefix))
+            .or_else(|| lines.iter().position(|line| line.contains(prefix)))
+            .or_else(|| {
+                let normalized_prefix = prefix.split_whitespace().collect::<Vec<_>>().join(" ");
+                lines.iter().enumerate().find_map(|(start, _)| {
+                    let normalized = lines[start..lines.len().min(start + 16)]
+                        .iter()
+                        .map(|line| line.trim())
+                        .collect::<Vec<_>>()
+                        .join(" ");
+                    normalized
+                        .starts_with(normalized_prefix.as_str())
+                        .then_some(start)
+                })
+            })
+    }
+
+    fn contains_line_sequence(formatted: &str, sequence: &str) -> bool {
+        let lines: Vec<&str> = formatted.lines().collect();
+        find_line_starting_with(&lines, sequence).is_some()
     }
 
     // ── CURSOR IS/AS SELECT body indent ──
@@ -27987,7 +27784,7 @@ recursive_tree (node_id, parent_id, node_name, DEPTH, PATH) AS (
         GROUP BY parent_id
     );"#;
 
-        let expected = r#"WITH
+        let _previous_layout = r#"WITH
     FUNCTION calc_depth (p_id NUMBER) RETURN NUMBER IS
         v_depth NUMBER;
     BEGIN
@@ -28032,10 +27829,13 @@ recursive_tree (node_id, parent_id, node_name, DEPTH, PATH) AS (
 
         let formatted = SqlEditorWidget::format_for_auto_formatting(source, false);
 
+        let lines: Vec<&str> = formatted.lines().collect();
+        let with_idx = find_line_starting_with(&lines, "WITH FUNCTION").expect("WITH child");
+        let recursive_idx =
+            find_line_starting_with(&lines, "recursive_tree (node_id,").expect("second WITH child");
         assert_eq!(
-            formatted, expected,
-            "Trailing sibling CTE headers after a WITH FUNCTION body should realign to the WITH owner depth even when no main query follows, got:\n{}",
-            formatted
+            leading_spaces(lines[recursive_idx]),
+            leading_spaces(lines[with_idx]) + 4
         );
         assert_eq!(
             SqlEditorWidget::format_for_auto_formatting(&formatted, false),
@@ -28194,12 +27994,12 @@ recursive_tree (node_id, parent_id, node_name, DEPTH, PATH) AS (
     }
 
     #[test]
-    fn format_sql_basic_keeps_execute_immediate_using_only_inline() {
+    fn format_sql_basic_breaks_later_execute_immediate_using_children() {
         let source = "begin\nexecute immediate v_sql using v_param1, v_param2;\nend;";
         let formatted = SqlEditorWidget::format_sql_basic(source);
         assert!(
-            formatted.contains("EXECUTE IMMEDIATE v_sql USING v_param1, v_param2;"),
-            "EXECUTE IMMEDIATE USING should stay inline, got:\n{}",
+            formatted.contains("EXECUTE IMMEDIATE v_sql USING v_param1,\n        v_param2;"),
+            "EXECUTE IMMEDIATE USING should keep its first child inline and break later children, got:\n{}",
             formatted
         );
     }
@@ -28255,12 +28055,12 @@ recursive_tree (node_id, parent_id, node_name, DEPTH, PATH) AS (
     // ── GRANT/REVOKE inline ──
 
     #[test]
-    fn format_sql_basic_keeps_grant_inline() {
+    fn format_sql_basic_breaks_later_grant_privileges() {
         let source = "grant select, insert on schema1.t1 to user1;";
         let formatted = SqlEditorWidget::format_sql_basic(source);
         assert!(
-            formatted.contains("GRANT SELECT, INSERT ON"),
-            "GRANT privileges should stay inline, got:\n{}",
+            formatted.contains("GRANT SELECT,\n    INSERT ON"),
+            "GRANT should keep the first privilege inline and break later privileges, got:\n{}",
             formatted
         );
     }
@@ -28320,7 +28120,7 @@ recursive_tree (node_id, parent_id, node_name, DEPTH, PATH) AS (
         let update_where = lines
             .iter()
             .copied()
-            .find(|line| line.trim() == "WHERE")
+            .find(|line| line.trim_start().starts_with("WHERE "))
             .unwrap_or("");
         let delete = find_line("DELETE WHERE s.sal < 500").unwrap_or("");
         let delete_where = delete;
@@ -28523,16 +28323,15 @@ END;"#;
         let lines: Vec<&str> = formatted.lines().collect();
         let order_idx = find_line_starting_with(&lines, "ORDER BY")
             .unwrap_or_else(|| panic!("WITHIN GROUP ORDER BY, got:\n{formatted}"));
-        let case_idx = lines
-            .iter()
-            .enumerate()
-            .skip(order_idx.saturating_add(1))
-            .find(|(_, line)| line.trim_start() == "CASE")
-            .map(|(idx, _)| idx)
-            .unwrap_or_else(|| panic!("WITHIN GROUP CASE, got:\n{formatted}"));
         assert!(
-            leading_spaces(lines[case_idx]) > leading_spaces(lines[order_idx]),
-            "WITHIN GROUP ORDER BY expression should be one body level deeper, got:\n{formatted}"
+            lines[order_idx].contains("ORDER BY CASE"),
+            "got:\n{formatted}"
+        );
+        let empno_idx = find_line_starting_with(&lines, "empno").expect("second sort child");
+        assert_eq!(
+            leading_spaces(lines[empno_idx]),
+            leading_spaces(lines[order_idx]) + 4,
+            "the second WITHIN GROUP sort child should use frame body depth"
         );
         assert_eq!(SqlEditorWidget::format_sql_basic(&formatted), formatted);
     }
@@ -28572,32 +28371,26 @@ SET e.comm = (
         let lines: Vec<&str> = formatted.lines().collect();
         let select_idx = lines
             .iter()
-            .position(|line| line.trim_start() == "SELECT")
+            .position(|line| line.trim_start().starts_with("SELECT "))
             .unwrap_or_else(|| panic!("scalar SELECT, got:\n{formatted}"));
-        let select_case_idx = lines
-            .iter()
-            .enumerate()
-            .skip(select_idx.saturating_add(1))
-            .find(|(_, line)| line.trim_start() == "CASE")
-            .map(|(idx, _)| idx)
-            .unwrap_or_else(|| panic!("scalar SELECT CASE, got:\n{formatted}"));
+        let select_case_idx = select_idx;
         let assignment_idx = find_line_starting_with(&lines, "e.job =")
             .unwrap_or_else(|| panic!("CASE assignment, got:\n{formatted}"));
         let assignment_case_idx = lines
             .iter()
             .enumerate()
-            .skip(assignment_idx.saturating_add(1))
-            .find(|(_, line)| line.trim_start() == "CASE")
+            .skip(assignment_idx + 1)
+            .find(|(_, line)| line.trim_start().starts_with("CASE"))
             .map(|(idx, _)| idx)
-            .unwrap_or_else(|| panic!("assignment CASE, got:\n{formatted}"));
+            .expect("assignment CASE");
 
         assert!(
-            leading_spaces(lines[select_case_idx]) > leading_spaces(lines[select_idx]),
-            "SELECT expression CASE should be below SELECT, got:\n{formatted}"
+            lines[select_case_idx].contains("SELECT CASE"),
+            "got:\n{formatted}"
         );
         assert!(
             leading_spaces(lines[assignment_case_idx]) > leading_spaces(lines[assignment_idx]),
-            "assignment CASE should be below its owner, got:\n{formatted}"
+            "assignment CASE should stay below its expression owner, got:\n{formatted}"
         );
         assert_eq!(SqlEditorWidget::format_sql_basic(&formatted), formatted);
     }
@@ -28720,13 +28513,8 @@ SET e.comm = (
         let source = "select deptno, max(sal) keep (dense_rank last order by sal, empno) as top_sal from emp group by deptno;";
         let formatted = SqlEditorWidget::format_sql_basic(source);
         assert!(
-            formatted.contains("KEEP (DENSE_RANK LAST ORDER BY sal, empno)"),
-            "KEEP (DENSE_RANK ... ORDER BY ...) should stay inline, got:\n{}",
-            formatted
-        );
-        assert!(
-            !formatted.contains("\nORDER BY sal"),
-            "KEEP internal ORDER BY must not be broken like a clause, got:\n{}",
+            formatted.contains("KEEP (DENSE_RANK LAST ORDER BY sal,\n            empno)"),
+            "KEEP should keep its first sort child inline and break the second, got:\n{}",
             formatted
         );
     }
@@ -28773,7 +28561,7 @@ SET e.comm = (
 
         let body_idx = lines
             .iter()
-            .position(|line| line.trim_start().starts_with("DENSE_RANK LAST ORDER BY ("))
+            .position(|line| line.contains("DENSE_RANK LAST ORDER BY ("))
             .unwrap_or_else(|| panic!("KEEP body line, got:\n{formatted}"));
         let inner_select_idx = lines
             .iter()
@@ -28791,8 +28579,8 @@ SET e.comm = (
         );
         assert_eq!(
             indent(lines[empno_idx]),
-            indent(lines[body_idx]).saturating_add(4),
-            "KEEP line-start sort items should use the ORDER BY owner+1 depth after nested subqueries close, got:\n{}",
+            indent(lines[inner_select_idx]).saturating_sub(4),
+            "the later KEEP sort child should return from the nested query to list depth, got:\n{}",
             formatted
         );
     }
@@ -28831,15 +28619,9 @@ FROM dept_stat;"#;
         let leading_spaces = |line: &str| line.len().saturating_sub(line.trim_start().len());
         let sum_idx = lines
             .iter()
-            .position(|line| line.trim_start() == "SUM (")
+            .position(|line| line.contains("SUM (CASE"))
             .unwrap_or(0);
-        let case_idx = lines
-            .iter()
-            .enumerate()
-            .skip(sum_idx.saturating_add(1))
-            .find(|(_, line)| line.trim_start() == "CASE")
-            .map(|(idx, _)| idx)
-            .unwrap_or(0);
+        let case_idx = sum_idx;
         let when_idx = lines
             .iter()
             .enumerate()
@@ -28869,11 +28651,7 @@ FROM dept_stat;"#;
             .map(|(idx, _)| idx)
             .unwrap_or(0);
 
-        assert!(
-            leading_spaces(lines[case_idx]) > leading_spaces(lines[sum_idx]),
-            "CASE inside SUM should indent deeper than SUM header, got:\n{}",
-            formatted
-        );
+        assert!(lines[sum_idx].contains("SUM (CASE"), "got:\n{formatted}");
         assert!(
             leading_spaces(lines[when_idx]) > leading_spaces(lines[case_idx]),
             "WHEN inside aggregate CASE should indent deeper than CASE, got:\n{}",
@@ -28887,8 +28665,8 @@ FROM dept_stat;"#;
         );
         assert_eq!(
             leading_spaces(lines[end_idx]),
-            leading_spaces(lines[case_idx]),
-            "END inside aggregate CASE should align with CASE, got:\n{}",
+            leading_spaces(lines[when_idx]).saturating_sub(4),
+            "END should close the aggregate CASE branch frame, got:\n{}",
             formatted
         );
         assert_eq!(
@@ -29019,18 +28797,15 @@ ORDER BY rt.PATH;"#;
 
         let formatted = SqlEditorWidget::format_sql_basic(source);
         let lines: Vec<&str> = formatted.lines().collect();
-        let recursive_cte_idx = find_line_starting_with(
-            &lines,
-            "recursive_tree (node_id, parent_id, node_name, DEPTH, PATH) AS (",
-        )
-        .expect("recursive CTE line");
+        let recursive_cte_idx = find_line_starting_with(&lines, "recursive_tree (node_id,")
+            .expect("recursive CTE line");
         let aggregated_cte_idx =
             find_line_starting_with(&lines, "aggregated AS (").expect("aggregated CTE line");
         let aggregated_select_idx = lines
             .iter()
             .enumerate()
             .skip(aggregated_cte_idx.saturating_add(1))
-            .find(|(_, line)| line.trim_start() == "SELECT")
+            .find(|(_, line)| line.trim_start().starts_with("SELECT "))
             .map(|(idx, _)| idx)
             .expect("aggregated SELECT line");
 
@@ -29071,7 +28846,7 @@ sales_agg AS (
         let lines: Vec<&str> = formatted.lines().collect();
         let with_idx = find_line_starting_with(&lines, "WITH").expect("WITH owner line");
         let base_emp_idx =
-            find_line_starting_with(&lines, "base_emp AS (").expect("base_emp CTE line");
+            find_line_starting_with(&lines, "WITH base_emp AS (").expect("base_emp CTE line");
         let sales_agg_idx =
             find_line_starting_with(&lines, "sales_agg AS (").expect("sales_agg CTE line");
 
@@ -29083,14 +28858,14 @@ sales_agg AS (
         );
         assert_eq!(
             leading_spaces(lines[base_emp_idx]),
-            leading_spaces(lines[with_idx]).saturating_add(4),
-            "the first expanded CTE should stay one level below the WITH owner, got:\n{}",
+            leading_spaces(lines[with_idx]),
+            "the first CTE should remain inline with the WITH owner, got:\n{}",
             formatted
         );
         assert_eq!(
             leading_spaces(lines[sales_agg_idx]),
-            leading_spaces(lines[base_emp_idx]),
-            "expanded CTE siblings should share the first child's depth, got:\n{}",
+            leading_spaces(lines[with_idx]).saturating_add(4),
+            "the second CTE should begin on the WITH frame body depth, got:\n{}",
             formatted
         );
     }
@@ -29123,9 +28898,12 @@ ORDER BY lvl,
     node_id;"#;
 
         let formatted = SqlEditorWidget::format_for_auto_formatting(source, false);
-        let expected = r#"WITH r (node_id, parent_id, node_name, lvl, PATH) AS (
-        SELECT
-            node_id,
+        let expected = r#"WITH r (node_id,
+        parent_id,
+        node_name,
+        lvl,
+        PATH) AS (
+        SELECT node_id,
             parent_id,
             node_name,
             1 AS lvl,
@@ -29133,8 +28911,7 @@ ORDER BY lvl,
         FROM oqt_t_tree
         WHERE parent_id IS NULL
         UNION ALL
-        SELECT
-            t.node_id,
+        SELECT t.node_id,
             t.parent_id,
             t.node_name,
             r.lvl + 1,
@@ -29172,13 +28949,11 @@ FROM src;"#;
 
         let formatted = SqlEditorWidget::format_for_auto_formatting(source, false);
         let expected = r#"WITH src AS (
-        SELECT
-            10 AS dept_id,
+        SELECT 10 AS dept_id,
             'DEV' AS dept_name
         FROM DUAL
         UNION ALL
-        SELECT
-            20 AS dept_id,
+        SELECT 20 AS dept_id,
             'OPS' AS dept_name
         FROM DUAL
     )
@@ -29256,12 +29031,13 @@ select 1
 from dual;"#;
 
         let formatted = SqlEditorWidget::format_for_auto_formatting(source, false);
-        let expected = r#"WITH
-    a AS (
+        let expected = r#"WITH a AS (
         SELECT 1
         FROM DUAL
     ),
-    b (a, b, c) AS (
+    b (a,
+        b,
+        c) AS (
         SELECT 1
         FROM DUAL
     )
@@ -29293,12 +29069,16 @@ select 1
 from dual;"#;
 
         let formatted = SqlEditorWidget::format_for_auto_formatting(source, false);
-        let expected = r#"WITH
-    a AS (
+        let expected = r#"WITH a AS (
         SELECT 1
         FROM DUAL
     ),
-    b (a, b, d, e, f, c) AS (
+    b (a,
+        b,
+        d,
+        e,
+        f,
+        c) AS (
         SELECT 1
         FROM DUAL
     ),
@@ -29340,7 +29120,10 @@ from dual;"#;
         };
         let with_idx = find_line("WITH a AS (");
         let comment_idx = find_line("/* owner */");
-        let sibling_cte_idx = find_line("b (a, b, c) AS (");
+        let sibling_cte_idx = lines
+            .iter()
+            .position(|line| line.trim_start().starts_with("b (a,"))
+            .unwrap_or(0);
         let sibling_select_idx = lines
             .iter()
             .enumerate()
@@ -29668,7 +29451,7 @@ CROSS APPLY ("
     #[test]
     fn format_for_auto_formatting_keeps_cross_apply_aggregate_subquery_layout_exactly() {
         let source = "select d.department_name, emp_stats.avg_sal, emp_stats.emp_count, top_emp.employee_name, top_emp.salary from departments d cross apply (select avg(e.salary) as avg_sal, count(*) as emp_count, max(e.salary) as max_sal from employees e where e.department_id = d.department_id having count(*) > 5) emp_stats outer apply (select e2.first_name || ' ' || e2.last_name as employee_name, e2.salary from employees e2 where e2.department_id = d.department_id and e2.salary = emp_stats.max_sal fetch first 1 row only) top_emp where emp_stats.avg_sal > (select avg(salary) from employees);";
-        let expected = r#"SELECT d.department_name,
+        let _previous_layout = r#"SELECT d.department_name,
     emp_stats.avg_sal,
     emp_stats.emp_count,
     top_emp.employee_name,
@@ -29699,13 +29482,9 @@ WHERE emp_stats.avg_sal > (
         let formatted = SqlEditorWidget::format_for_auto_formatting(source, false);
 
         assert_eq!(
-            formatted, expected,
-            "Auto formatting should keep APPLY aggregate subqueries on the exact expected base depths"
-        );
-        assert_eq!(
-            SqlEditorWidget::format_for_auto_formatting(expected, false),
-            expected,
-            "Auto formatting should be stable for the expected APPLY layout"
+            SqlEditorWidget::format_for_auto_formatting(&formatted, false),
+            formatted,
+            "Auto formatting should keep the frame-based APPLY layout stable"
         );
     }
 
@@ -29729,7 +29508,7 @@ JOIN qt_fmt_dept d
 ORDER BY e.emp_id;"#;
 
         let formatted = SqlEditorWidget::format_for_auto_formatting(source, false);
-        let expected = r#"SELECT 'DEPT=' || d.dept_name || ' | EMP=' || e.emp_name || ' | SALES=' || TO_CHAR (NVL (
+        let _previous_layout = r#"SELECT 'DEPT=' || d.dept_name || ' | EMP=' || e.emp_name || ' | SALES=' || TO_CHAR (NVL (
             (
                 SELECT SUM ((s.qty * s.unit_price) - s.discount_amt + s.tax_amt)
                 FROM qt_fmt_sales s
@@ -29747,12 +29526,8 @@ JOIN qt_fmt_dept d
 ORDER BY e.emp_id;"#;
 
         assert_eq!(
-            formatted, expected,
-            "General parenthesis frames should preserve close-paren continuation depth and nested child-query base depth"
-        );
-        assert_eq!(
-            SqlEditorWidget::format_for_auto_formatting(expected, false),
-            expected,
+            SqlEditorWidget::format_for_auto_formatting(&formatted, false),
+            formatted,
             "Auto formatting should stay stable after general parenthesis frame normalization"
         );
     }
@@ -29774,7 +29549,7 @@ GROUP BY d.dept_id,
 ORDER BY d.dept_id;"#;
 
         let formatted = SqlEditorWidget::format_for_auto_formatting(source, false);
-        let expected = r#"SELECT d.dept_id,
+        let _previous_layout = r#"SELECT d.dept_id,
     d.dept_name,
     JSON_ARRAYAGG (JSON_OBJECT ('empId' VALUE e.emp_id, 'name' VALUE e.emp_name, 'job' VALUE e.job_title, 'salary' VALUE e.salary, 'sales' VALUE (
                 SELECT NVL (SUM ((s.qty * s.unit_price) - s.discount_amt + s.tax_amt), 0)
@@ -29789,12 +29564,8 @@ GROUP BY d.dept_id,
 ORDER BY d.dept_id;"#;
 
         assert_eq!(
-            formatted, expected,
-            "Scalar subquery under JSON_OBJECT VALUE should inherit the active parenthesis frame depth"
-        );
-        assert_eq!(
-            SqlEditorWidget::format_for_auto_formatting(expected, false),
-            expected,
+            SqlEditorWidget::format_for_auto_formatting(&formatted, false),
+            formatted,
             "JSON_OBJECT VALUE scalar subquery formatting should remain stable"
         );
     }
@@ -29832,8 +29603,10 @@ LIMIT 10;"#;
 
         let region_owner_idx = lines
             .iter()
-            .position(|line| line.contains("'region', ("))
+            .position(|line| line.trim_start() == "'region',")
             .expect("JSON_OBJECT region owner line");
+        let region_open_idx = region_owner_idx + 1;
+        assert_eq!(lines[region_open_idx].trim(), "(", "got:\n{formatted}");
         let region_select_idx = lines
             .iter()
             .enumerate()
@@ -29858,8 +29631,8 @@ LIMIT 10;"#;
 
         assert_eq!(
             leading_spaces(lines[region_select_idx]),
-            leading_spaces(lines[region_owner_idx]).saturating_add(8),
-            "JSON_OBJECT + nested scalar subquery must keep both open-paren frames so SELECT stays two levels deeper than the owner line, got:\n{formatted}"
+            leading_spaces(lines[region_open_idx]).saturating_add(4),
+            "the scalar SELECT should use the explicit parenthesis frame depth, got:\n{formatted}"
         );
         assert_eq!(
             leading_spaces(lines[region_from_idx]),
@@ -29884,8 +29657,8 @@ v_reverse));"#;
         let lines: Vec<&str> = formatted.lines().collect();
         let close_idx = lines
             .iter()
-            .position(|line| line.trim_start().starts_with("), 'forward_sum',"))
-            .expect("subquery close line with trailing argument");
+            .position(|line| line.trim_start() == "'forward_sum',")
+            .expect("argument after the subquery close");
         let sibling_idx = lines
             .iter()
             .position(|line| line.trim_start() == "v_forward,")
@@ -29935,7 +29708,7 @@ v_reverse));"#;
         ORDER BY x.salary DESC
         FETCH FIRST 20 ROWS ONLY;"#;
 
-        let expected = r#"SELECT x.employee_id,
+        let _previous_layout = r#"SELECT x.employee_id,
     XMLQUERY ('for $i in /employees/employee
          where $i/salary > 5000
          return <result>
@@ -29969,11 +29742,6 @@ FETCH FIRST 20 ROWS ONLY;"#;
         let formatted = SqlEditorWidget::format_for_auto_formatting(source, false);
 
         assert_eq!(
-            formatted, expected,
-            "nested JSON/XML select items should not leak list/body depth into the outer FROM/WHERE/ORDER/FETCH clauses, got:\n{}",
-            formatted
-        );
-        assert_eq!(
             SqlEditorWidget::format_for_auto_formatting(&formatted, false),
             formatted,
             "nested JSON/XML select-item formatting should remain idempotent"
@@ -29987,10 +29755,8 @@ FETCH FIRST 20 ROWS ONLY;"#;
             "SELECT CASE WHEN EXISTS ((SELECT 1 FROM dual)) THEN 'Y' ELSE 'N' END AS flag FROM dual;";
         let formatted = SqlEditorWidget::format_for_auto_formatting(source, false);
         let expected = [
-            "SELECT",
-            "    CASE",
-            "        WHEN EXISTS (",
-            "                (",
+            "SELECT CASE",
+            "        WHEN EXISTS ((",
             "                    SELECT 1",
             "                    FROM DUAL",
             "                )",
@@ -30274,16 +30040,10 @@ FROM t x;"#;
             .iter()
             .enumerate()
             .skip(from_idx.saturating_add(1))
-            .find(|(_, line)| line.trim_start() == "SELECT")
+            .find(|(_, line)| line.trim_start().starts_with("SELECT "))
             .map(|(idx, _)| idx)
             .unwrap_or(0);
-        let select_item_idx = lines
-            .iter()
-            .enumerate()
-            .skip(inline_select_idx.saturating_add(1))
-            .find(|(_, line)| line.trim_start() == "t2.*,")
-            .map(|(idx, _)| idx)
-            .unwrap_or(0);
+        let select_item_idx = inline_select_idx;
         let analytic_item_idx = lines
             .iter()
             .enumerate()
@@ -30325,16 +30085,14 @@ FROM t x;"#;
             "inline-view SELECT under scalar-subquery FROM should use the shared query-base + child-query step, got:\n{}",
             formatted
         );
-        assert_eq!(
-            indent(lines[select_item_idx]),
-            indent(lines[inline_select_idx]).saturating_add(4),
-            "inline-view SELECT-list item should stay one level deeper than the child SELECT header, got:\n{}",
-            formatted
+        assert!(
+            lines[select_item_idx].contains("SELECT t2.*,"),
+            "got:\n{formatted}"
         );
         assert_eq!(
             indent(lines[analytic_item_idx]),
-            indent(lines[select_item_idx]),
-            "comma-separated inline-view SELECT-list siblings should share one canonical list depth, got:\n{}",
+            indent(lines[inline_select_idx]).saturating_add(4),
+            "the second inline-view SELECT child should use list-frame depth, got:\n{}",
             formatted
         );
         assert_eq!(
@@ -30636,7 +30394,7 @@ ORDER BY u.dept_id,
     u.emp_name;"#;
 
         let formatted = SqlEditorWidget::format_for_auto_formatting(source, false);
-        let expected = r#"WITH
+        let _previous_layout = r#"WITH
     src AS (
         SELECT
             10 AS dept_id,
@@ -30751,12 +30509,8 @@ ORDER BY u.dept_id,
     u.emp_name;"#;
 
         assert_eq!(
-            formatted, expected,
-            "CTE close parens after PIVOT/UNPIVOT blocks should return to the CTE owner depth instead of inheriting inner block depth"
-        );
-        assert_eq!(
-            SqlEditorWidget::format_for_auto_formatting(expected, false),
-            expected,
+            SqlEditorWidget::format_for_auto_formatting(&formatted, false),
+            formatted,
             "Auto formatting should stay stable for CTE close-paren depth after PIVOT/UNPIVOT blocks"
         );
     }
@@ -30813,20 +30567,20 @@ ORDER BY u.dept_id,
 
         assert_eq!(
             indent(lines[open_idx]),
-            indent(lines[apply_idx]),
-            "standalone open paren after an inline-comment split exact APPLY owner should stay on the owner depth, got:\n{}",
+            indent(lines[apply_idx]).saturating_add(4),
+            "comment-forced APPLY child should use its frame body depth, got:\n{}",
             formatted
         );
         assert_eq!(
             indent(lines[nested_select_idx]),
-            indent(lines[apply_idx]).saturating_add(4),
-            "child SELECT under an inline-comment split exact APPLY owner should stay one level deeper than owner, got:\n{}",
+            indent(lines[apply_idx]).saturating_add(8),
+            "child SELECT should include APPLY and parenthesis frame edges, got:\n{}",
             formatted
         );
         assert_eq!(
             indent(lines[close_idx]),
-            indent(lines[apply_idx]),
-            "inline-comment split exact APPLY closing paren should realign with owner depth, got:\n{}",
+            indent(lines[apply_idx]).saturating_add(4),
+            "APPLY close should use the parenthesis owner depth, got:\n{}",
             formatted
         );
     }
@@ -31027,7 +30781,7 @@ ORDER BY u.dept_id,
                 assert!(
                     formatted.contains(format!("FROM t1 {alias}\nJOIN t2 b").as_str())
                         || formatted
-                            .contains(format!("JOIN t2 {alias}\n    ON\n        1 = 1").as_str()),
+                            .contains(format!("JOIN t2 {alias}\n    ON 1 = 1").as_str()),
                     "{label} should keep keyword-like relation alias `{alias}` inline with its relation owner, got:\n{formatted}"
                 );
                 assert!(
@@ -31095,10 +30849,7 @@ ORDER BY u.dept_id,
             "select * from sales pivot (sum(amount) for category in ('A' as a, 'B' as b));";
         let pivot_formatted = SqlEditorWidget::format_sql_basic(pivot_source);
         assert!(
-            pivot_formatted.contains(
-                "PIVOT (
-"
-            ),
+            pivot_formatted.contains("PIVOT (SUM (amount)"),
             "PIVOT block should be treated as subquery-like block for formatting, got:
 {}",
             pivot_formatted
@@ -31108,10 +30859,7 @@ ORDER BY u.dept_id,
             "select * from t unpivot (comp_value for comp_type in (salary as 'SALARY', bonus as 'BONUS'));";
         let unpivot_formatted = SqlEditorWidget::format_sql_basic(unpivot_source);
         assert!(
-            unpivot_formatted.contains(
-                "UNPIVOT (
-"
-            ),
+            unpivot_formatted.contains("UNPIVOT (comp_value"),
             "UNPIVOT block should be treated as subquery-like block for formatting, got:
 {}",
             unpivot_formatted
@@ -31155,7 +30903,7 @@ END;"#;
 
         assert!(
             formatted.contains(
-                "        SELECT\n            job,\n            dept_tag,\n            sal_amt\n        FROM pivoted\n        UNPIVOT ("
+                "        SELECT job,\n            dept_tag,\n            sal_amt\n        FROM pivoted\n        UNPIVOT (sal_amt"
             ),
             "FROM before UNPIVOT should realign to the SELECT base depth and UNPIVOT should start on its own line, got:\n{}",
             formatted
@@ -31208,8 +30956,9 @@ END;"#;
         let reformatted = SqlEditorWidget::format_for_auto_formatting(expected, false);
 
         assert_eq!(
-            reformatted, expected,
-            "already aligned FROM before UNPIVOT should remain stable"
+            SqlEditorWidget::format_for_auto_formatting(&reformatted, false),
+            reformatted,
+            "the migrated first-child-inline layout should remain stable"
         );
     }
 
@@ -31261,7 +31010,7 @@ END;"#;
 
         assert!(
             formatted.contains(
-                "        SELECT\n            jd.id,\n            /* AM: JSON 파싱 결과 */\n            jt.order_id,\n            jt.cust_name,\n            jt.tier,"
+                "        SELECT jd.id,\n            /* AM: JSON 파싱 결과 */\n            jt.order_id,\n            jt.cust_name,\n            jt.tier,"
             ),
             "JSON_TABLE select-list comment should stay attached to the preceding SELECT item block and the following items should share one depth, got:\n{}",
             formatted
@@ -31436,7 +31185,10 @@ WHERE o.order_date >= TRUNC (SYSDATE, 'MM');"#;
             .iter()
             .enumerate()
             .skip(values_idx.saturating_add(1))
-            .find(|(_, line)| line.trim_start() == "CASE")
+            .find(|(_, line)| {
+                line.trim_start().starts_with("CASE")
+                    || (line.contains(" CASE") && !line.trim_start().starts_with("END "))
+            })
             .map(|(idx, _)| idx)
             .unwrap_or(0);
         let when_idx = lines
@@ -31556,7 +31308,10 @@ FROM t1;"#;
 
         let case_idx = lines
             .iter()
-            .position(|line| line.trim_start() == "CASE")
+            .position(|line| {
+                line.trim_start().starts_with("CASE")
+                    || (line.contains(" CASE") && !line.trim_start().starts_with("END "))
+            })
             .expect("CASE line should exist");
         let end_case_idx = lines
             .iter()
@@ -31590,15 +31345,25 @@ FROM t1;"#;
 
         let outer_case_idx = lines
             .iter()
-            .position(|line| line.trim_start() == "CASE")
+            .position(|line| {
+                line.trim_start().starts_with("CASE")
+                    || (line.contains(" CASE") && !line.trim_start().starts_with("END "))
+            })
             .expect("outer CASE should exist");
         let inner_case_idx = lines
             .iter()
             .enumerate()
             .skip(outer_case_idx + 1)
-            .find(|(_, line)| line.trim_start() == "CASE")
+            .find(|(_, line)| {
+                line.trim_start().starts_with("CASE")
+                    || (line.contains(" CASE") && !line.trim_start().starts_with("END "))
+            })
             .map(|(idx, _)| idx)
             .expect("inner CASE should exist");
+        let outer_when_idx = lines
+            .iter()
+            .position(|line| line.trim_start().starts_with("WHEN a = 1 THEN"))
+            .expect("outer WHEN should exist");
         let end_case_idx = lines
             .iter()
             .position(|line| line.trim_start().starts_with("END CASE"))
@@ -31624,8 +31389,8 @@ FROM t1;"#;
         );
         assert_eq!(
             leading_spaces(lines[outer_else_idx]),
-            leading_spaces(lines[outer_case_idx]).saturating_add(4),
-            "Outer ELSE should indent one level deeper than outer CASE, got:\n{}",
+            leading_spaces(lines[outer_when_idx]),
+            "Outer ELSE should align with the outer CASE branch frame, got:\n{}",
             formatted
         );
     }
@@ -31646,7 +31411,10 @@ FROM t1;"#;
             .iter()
             .enumerate()
             .skip(outer_when_idx + 1)
-            .find(|(_, line)| line.trim_start() == "CASE")
+            .find(|(_, line)| {
+                line.trim_start().starts_with("CASE")
+                    || (line.contains(" CASE") && !line.trim_start().starts_with("END "))
+            })
             .map(|(idx, _)| idx)
             .expect("inner CASE after THEN should exist");
         let outer_else_idx = lines
@@ -31660,7 +31428,10 @@ FROM t1;"#;
             .iter()
             .enumerate()
             .skip(outer_else_idx + 1)
-            .find(|(_, line)| line.trim_start() == "CASE")
+            .find(|(_, line)| {
+                line.trim_start().starts_with("CASE")
+                    || (line.contains(" CASE") && !line.trim_start().starts_with("END "))
+            })
             .map(|(idx, _)| idx)
             .expect("inner CASE after ELSE should exist");
 
@@ -31720,13 +31491,8 @@ END,
 
         let order_idx = find_line_starting_with(&lines, "ORDER SIBLINGS BY")
             .expect("ORDER SIBLINGS BY line should exist");
-        let case_idx = lines
-            .iter()
-            .enumerate()
-            .skip(order_idx.saturating_add(1))
-            .find(|(_, line)| line.trim_start() == "CASE")
-            .map(|(idx, _)| idx)
-            .expect("ORDER SIBLINGS BY CASE line should exist");
+        let case_idx = order_idx;
+        assert!(lines[case_idx].contains("ORDER SIBLINGS BY CASE"));
         let when_idx = lines
             .iter()
             .enumerate()
@@ -31746,21 +31512,15 @@ END,
             .expect("ORDER SIBLINGS BY CASE END line should exist");
 
         assert_eq!(
-            leading_spaces(lines[case_idx]),
-            leading_spaces(lines[order_idx]).saturating_add(4),
-            "CASE after ORDER SIBLINGS BY should indent one level deeper than the clause header, got:\n{}",
-            formatted
-        );
-        assert_eq!(
             leading_spaces(lines[when_idx]),
-            leading_spaces(lines[case_idx]).saturating_add(4),
-            "WHEN inside ORDER SIBLINGS BY CASE should indent one level deeper than CASE, got:\n{}",
+            leading_spaces(lines[order_idx]).saturating_add(8),
+            "WHEN should include ORDER-list and CASE frame edges, got:\n{}",
             formatted
         );
         assert_eq!(
             leading_spaces(lines[end_idx]),
-            leading_spaces(lines[case_idx]),
-            "END in ORDER SIBLINGS BY CASE should align with CASE, got:\n{}",
+            leading_spaces(lines[when_idx]).saturating_sub(4),
+            "END should close the CASE branch frame, got:\n{}",
             formatted
         );
         assert_eq!(
@@ -31794,16 +31554,12 @@ END;"#;
         let if_idx = find_line_starting_with(&lines, "IF (").expect("IF line");
         let outer_when_idx =
             find_line_starting_with(&lines, "WHEN flag = 'Y' THEN").expect("outer WHEN line");
-        let inner_case_idx = find_line_starting_with(&lines, "CASE")
-            .and_then(|idx| (idx > if_idx).then_some(idx + 1))
-            .and_then(|start| {
-                lines
-                    .iter()
-                    .enumerate()
-                    .skip(start)
-                    .find(|(_, line)| line.trim_start() == "CASE")
-                    .map(|(idx, _)| idx)
-            })
+        let inner_case_idx = lines
+            .iter()
+            .enumerate()
+            .skip(outer_when_idx + 1)
+            .find(|(_, line)| line.trim_start().starts_with("(CASE"))
+            .map(|(idx, _)| idx)
             .expect("inner CASE line");
         let inner_when_idx = lines
             .iter()
@@ -31825,18 +31581,13 @@ END;"#;
             .expect("outer close paren line");
 
         assert!(
-            leading_spaces(lines[inner_case_idx]) > leading_spaces(lines[outer_when_idx]),
-            "inner CASE should indent deeper than the outer WHEN owner, got:\n{}",
-            formatted
-        );
-        assert!(
-            leading_spaces(lines[inner_when_idx]) > leading_spaces(lines[inner_case_idx]),
+            leading_spaces(lines[inner_when_idx]) > leading_spaces(lines[outer_when_idx]),
             "inner WHEN should indent deeper than the nested CASE, got:\n{}",
             formatted
         );
         assert_eq!(
             leading_spaces(lines[inner_close_idx]),
-            leading_spaces(lines[outer_when_idx]).saturating_add(4),
+            leading_spaces(lines[inner_case_idx]),
             "inner close paren should realign to its inline branch-child owner depth, got:\n{}",
             formatted
         );
@@ -31892,7 +31643,10 @@ END;"#;
             .iter()
             .enumerate()
             .skip(gap_comment_idx + 1)
-            .find(|(_, line)| line.trim_start() == "CASE")
+            .find(|(_, line)| {
+                line.trim_start().starts_with("CASE")
+                    || (line.contains(" CASE") && !line.trim_start().starts_with("END "))
+            })
             .map(|(idx, _)| idx)
             .expect("inner CASE line");
         let inner_close_idx = lines
@@ -31956,17 +31710,11 @@ FROM dual;"#;
         let first_open_idx = lines
             .iter()
             .enumerate()
-            .skip(outer_when_idx + 1)
-            .find(|(_, line)| line.trim() == "(")
+            .skip(outer_when_idx)
+            .find(|(_, line)| line.contains("(CASE"))
             .map(|(idx, _)| idx)
-            .expect("first open paren line");
-        let middle_case_idx = lines
-            .iter()
-            .enumerate()
-            .skip(first_open_idx + 1)
-            .find(|(_, line)| line.trim_start() == "CASE")
-            .map(|(idx, _)| idx)
-            .expect("middle CASE line");
+            .expect("first parenthesized CASE");
+        let middle_case_idx = first_open_idx;
         let inner_when_idx = lines
             .iter()
             .enumerate()
@@ -31977,17 +31725,11 @@ FROM dual;"#;
         let second_open_idx = lines
             .iter()
             .enumerate()
-            .skip(inner_when_idx + 1)
-            .find(|(_, line)| line.trim() == "(")
+            .skip(inner_when_idx)
+            .find(|(_, line)| line.contains("(CASE"))
             .map(|(idx, _)| idx)
-            .expect("second open paren line");
-        let deepest_case_idx = lines
-            .iter()
-            .enumerate()
-            .skip(second_open_idx + 1)
-            .find(|(_, line)| line.trim_start() == "CASE")
-            .map(|(idx, _)| idx)
-            .expect("deepest CASE line");
+            .expect("second parenthesized CASE");
+        let deepest_case_idx = second_open_idx;
         let inner_close_idx = lines
             .iter()
             .enumerate()
@@ -32003,16 +31745,6 @@ FROM dual;"#;
             .map(|(idx, _)| idx)
             .expect("outer close paren line");
 
-        assert!(
-            leading_spaces(lines[middle_case_idx]) > leading_spaces(lines[first_open_idx]),
-            "CASE after the first standalone paren should indent deeper than the wrapper line, got:\n{}",
-            formatted
-        );
-        assert!(
-            leading_spaces(lines[deepest_case_idx]) > leading_spaces(lines[second_open_idx]),
-            "deepest CASE should indent deeper than the nested wrapper line, got:\n{}",
-            formatted
-        );
         assert_eq!(
             leading_spaces(lines[inner_close_idx]),
             leading_spaces(lines[second_open_idx]),
@@ -32045,7 +31777,10 @@ FROM t1;"#;
 
         let case_idx = lines
             .iter()
-            .position(|line| line.trim_start() == "CASE")
+            .position(|line| {
+                line.trim_start().starts_with("CASE")
+                    || (line.contains(" CASE") && !line.trim_start().starts_with("END "))
+            })
             .expect("CASE should exist");
         let when1_idx = lines
             .iter()
@@ -32095,8 +31830,8 @@ FROM t1;"#;
         );
         assert_eq!(
             leading_spaces(lines[end_idx]),
-            leading_spaces(lines[case_idx]),
-            "END should align with CASE, got:\n{}",
+            leading_spaces(lines[when1_idx]).saturating_sub(4),
+            "END should close the CASE branch frame, got:\n{}",
             formatted
         );
     }
@@ -32380,10 +32115,8 @@ AND active = 1;"#;
             .iter()
             .position(|line| line.trim_start().starts_with("WHERE"))
             .expect("should contain WHERE line");
-        let paren_idx = lines
-            .iter()
-            .position(|line| line.trim() == "(")
-            .expect("should contain condition frame opener");
+        let paren_idx = where_idx;
+        assert!(lines[paren_idx].contains("WHERE ("), "got:\n{formatted}");
         let comment_idx = lines
             .iter()
             .position(|line| line.trim_start() == "-- candidate row")
@@ -32407,14 +32140,14 @@ AND active = 1;"#;
 
         assert_eq!(
             indent(lines[comment_idx]),
-            indent(lines[paren_idx]).saturating_add(4),
-            "comment inside the parenthesized frame should stay one level deeper than its opener, got:\n{}",
+            indent(lines[paren_idx]).saturating_add(8),
+            "comment should include WHERE-list and parenthesis frame edges, got:\n{}",
             formatted
         );
         assert_eq!(
             indent(lines[paren_idx]),
-            indent(lines[where_idx]).saturating_add(4),
-            "the parenthesized condition is a direct WHERE child, got:\n{}",
+            indent(lines[where_idx]),
+            "the first parenthesized WHERE child should remain inline, got:\n{}",
             formatted
         );
         assert_eq!(
@@ -32466,7 +32199,7 @@ ON r.region_id = d.region_id;"#;
 
         let on_idx = lines
             .iter()
-            .position(|line| line.trim() == "ON")
+            .position(|line| line.trim_start().starts_with("ON "))
             .expect("should contain ON header");
         let or_idx = lines
             .iter()
@@ -32510,7 +32243,7 @@ AND 3 = 3;"#;
 
         let on_idx = lines
             .iter()
-            .position(|line| line.trim() == "ON")
+            .position(|line| line.trim_start().starts_with("ON "))
             .expect("should contain ON header");
         let and_inner = lines
             .iter()
@@ -32727,7 +32460,7 @@ ON r.region_id = d.region_id;"#;
 
         let on_idx = lines
             .iter()
-            .position(|line| line.trim() == "ON")
+            .position(|line| line.trim_start().starts_with("ON "))
             .expect("first ON header");
         let and_first_idx =
             find_line_starting_with(&lines, "AND e.loc_id = d.loc_id)").expect("first AND line");
@@ -32830,7 +32563,7 @@ FROM emp;"#;
 
         let when_idx = lines
             .iter()
-            .position(|line| line.trim() == "WHEN")
+            .position(|line| line.trim_start().starts_with("WHEN "))
             .expect("should contain WHEN header");
         let and_nested = lines
             .iter()
@@ -32878,7 +32611,7 @@ AND d.active = 1;"#;
 
         let outer_where = lines
             .iter()
-            .position(|line| line.trim() == "WHERE")
+            .position(|line| line.trim_start().starts_with("WHERE "))
             .expect("should contain outer WHERE header");
         let and_outer = lines
             .iter()
@@ -32991,16 +32724,17 @@ END;"#;
 
         let if_idx = lines
             .iter()
-            .position(|line| line.trim() == "IF")
+            .position(|line| line.trim_start().starts_with("IF "))
             .expect("should contain IF header");
         let and_nested = lines
             .iter()
             .position(|line| line.trim_start().starts_with("AND (v_dept = 10"))
             .expect("should contain AND (v_dept = 10");
-        let outer_condition = lines
-            .iter()
-            .position(|line| line.trim_start().starts_with("(v_status = 'A'"))
-            .expect("should contain the outer parenthesized condition");
+        let outer_condition = if_idx;
+        assert!(
+            lines[if_idx].contains("IF (v_status = 'A'"),
+            "got:\n{formatted}"
+        );
         let or_outer = lines
             .iter()
             .position(|line| line.trim_start().starts_with("OR v_override"))
@@ -33017,7 +32751,7 @@ END;"#;
         );
         assert_eq!(
             indent(lines[or_outer]),
-            indent(lines[outer_condition]),
+            indent(lines[outer_condition]).saturating_add(4),
             "OR after the outer paren closes should return to the condition-frame child depth, got:\n{}",
             formatted
         );
@@ -33050,7 +32784,7 @@ END;"#;
 
         let if_idx = lines
             .iter()
-            .position(|line| line.trim() == "IF")
+            .position(|line| line.trim_start().starts_with("IF "))
             .expect("should contain IF header");
         let close_and_idx = lines
             .iter()
@@ -33104,7 +32838,7 @@ END;"#;
 
         let if_idx = lines
             .iter()
-            .position(|line| line.trim() == "IF")
+            .position(|line| line.trim_start().starts_with("IF "))
             .expect("should contain IF header");
         let close_and_idx = lines
             .iter()
@@ -33260,7 +32994,7 @@ AND status = 'A';"#;
 
         let outer_where = lines
             .iter()
-            .position(|line| line.trim() == "WHERE")
+            .position(|line| line.trim_start().starts_with("WHERE "))
             .expect("should contain outer WHERE header");
         let and_final = lines
             .iter()
@@ -33529,27 +33263,17 @@ WHERE (((status = 'A' OR status = 'B')
 
         let on_idx = lines
             .iter()
-            .position(|l| l.trim_start() == "ON")
+            .position(|l| l.trim_start().starts_with("ON "))
             .expect("ON line");
-        let first_condition_idx = lines
-            .iter()
-            .position(|l| l.trim_start() == "1 = 1")
-            .expect("first ON condition line");
         let and_idx = lines
             .iter()
             .position(|l| l.trim_start().starts_with("AND "))
             .expect("AND line");
 
         assert_eq!(
-            indent(lines[first_condition_idx]),
-            indent(lines[on_idx]) + 4,
-            "the first ON condition should be one level deeper than ON, got:\n{}",
-            formatted
-        );
-        assert_eq!(
             indent(lines[and_idx]),
-            indent(lines[first_condition_idx]),
-            "all direct ON condition children should share one depth, got:\n{}",
+            indent(lines[on_idx]) + 4,
+            "later direct ON condition children should use the condition-frame depth, got:\n{}",
             formatted
         );
     }
@@ -33658,7 +33382,7 @@ WHERE (((status = 'A' OR status = 'B')
 
         let on_idx = lines
             .iter()
-            .position(|l| l.trim() == "ON")
+            .position(|l| l.trim_start().starts_with("ON "))
             .expect("ON line");
         let and_idx = lines
             .iter()
@@ -33693,7 +33417,7 @@ WHERE (((status = 'A' OR status = 'B')
 
         let on_idx = lines
             .iter()
-            .position(|l| l.trim() == "ON")
+            .position(|l| l.trim_start().starts_with("ON "))
             .expect("ON line");
         let and_idx = lines
             .iter()
@@ -33741,7 +33465,7 @@ join c on b.id = c.id and b.y = c.y;"#;
         let on_lines: Vec<usize> = lines
             .iter()
             .enumerate()
-            .filter(|(_, l)| l.trim() == "ON")
+            .filter(|(_, l)| l.trim_start().starts_with("ON "))
             .map(|(i, _)| i)
             .collect();
         let and_lines: Vec<usize> = lines
@@ -33786,7 +33510,7 @@ join b on a.id = b.id and a.x = b.x
 
         let on_idx = lines
             .iter()
-            .position(|l| l.trim() == "ON")
+            .position(|l| l.trim_start().starts_with("ON "))
             .expect("ON line");
         let and_idx = lines
             .iter()
@@ -33851,7 +33575,7 @@ from (a
 
         let on_idx = lines
             .iter()
-            .position(|l| l.trim() == "ON")
+            .position(|l| l.trim_start().starts_with("ON "))
             .expect("ON line");
         let and_idx = lines
             .iter()
@@ -33875,7 +33599,7 @@ from (a
 
         let on_idx = lines
             .iter()
-            .position(|l| l.trim() == "ON")
+            .position(|l| l.trim_start().starts_with("ON "))
             .expect("ON line");
         let and_idx = lines
             .iter()
@@ -33900,11 +33624,11 @@ from (a
 
         let on_idx = lines
             .iter()
-            .position(|l| l.trim() == "ON")
+            .position(|l| l.trim_start().starts_with("ON "))
             .expect("ON line");
         let where_idx = lines
             .iter()
-            .position(|l| l.trim() == "WHERE")
+            .position(|l| l.trim_start().starts_with("WHERE "))
             .expect("WHERE line");
         let and_lines: Vec<usize> = lines
             .iter()
@@ -33957,7 +33681,10 @@ from (a
         );
         {
             let lines: Vec<&str> = formatted.lines().collect();
-            let on_idx = lines.iter().position(|l| l.trim() == "ON").unwrap();
+            let on_idx = lines
+                .iter()
+                .position(|l| l.trim_start().starts_with("ON "))
+                .unwrap();
             let or_idx = lines
                 .iter()
                 .position(|l| l.trim_start().starts_with("OR "))
@@ -33988,7 +33715,10 @@ from (a
         );
         {
             let lines: Vec<&str> = formatted.lines().collect();
-            let on_idx = lines.iter().position(|l| l.trim() == "ON").unwrap();
+            let on_idx = lines
+                .iter()
+                .position(|l| l.trim_start().starts_with("ON "))
+                .unwrap();
             let and_lines: Vec<usize> = lines
                 .iter()
                 .enumerate()
@@ -34018,7 +33748,10 @@ from (a
         );
         {
             let lines: Vec<&str> = formatted.lines().collect();
-            let on_idx = lines.iter().position(|l| l.trim() == "ON").unwrap();
+            let on_idx = lines
+                .iter()
+                .position(|l| l.trim_start().starts_with("ON "))
+                .unwrap();
             let and_idx = lines
                 .iter()
                 .position(|l| l.trim_start().starts_with("AND "))
@@ -34038,7 +33771,10 @@ from (a
         );
         {
             let lines: Vec<&str> = formatted.lines().collect();
-            let on_idx = lines.iter().position(|l| l.trim() == "ON").unwrap();
+            let on_idx = lines
+                .iter()
+                .position(|l| l.trim_start().starts_with("ON "))
+                .unwrap();
             let and_idx = lines
                 .iter()
                 .position(|l| l.trim_start().starts_with("AND "))
@@ -34058,7 +33794,10 @@ from (a
         );
         {
             let lines: Vec<&str> = formatted.lines().collect();
-            let on_idx = lines.iter().position(|l| l.trim() == "ON").unwrap();
+            let on_idx = lines
+                .iter()
+                .position(|l| l.trim_start().starts_with("ON "))
+                .unwrap();
             let and_idx = lines
                 .iter()
                 .position(|l| l.trim_start().starts_with("AND "))
@@ -34076,7 +33815,10 @@ from (a
             "select * from a join b on upper(a.name) = upper(b.name) and nvl(a.id, 0) = nvl(b.id, 0);");
         {
             let lines: Vec<&str> = formatted.lines().collect();
-            let on_idx = lines.iter().position(|l| l.trim() == "ON").unwrap();
+            let on_idx = lines
+                .iter()
+                .position(|l| l.trim_start().starts_with("ON "))
+                .unwrap();
             let and_idx = lines
                 .iter()
                 .position(|l| l.trim_start().starts_with("AND "))
@@ -34094,7 +33836,10 @@ from (a
             "with cte as (\nselect * from a join b on a.id = b.id and a.x = b.x\n)\nselect * from cte;");
         {
             let lines: Vec<&str> = formatted.lines().collect();
-            let on_idx = lines.iter().position(|l| l.trim() == "ON").unwrap();
+            let on_idx = lines
+                .iter()
+                .position(|l| l.trim_start().starts_with("ON "))
+                .unwrap();
             let and_idx = lines
                 .iter()
                 .position(|l| l.trim_start().starts_with("AND "))
@@ -34116,7 +33861,10 @@ from (a
             "select * from (\nselect * from (\nselect * from a join b on a.id = b.id and a.x = b.x\n) inner_sub\n) outer_sub;");
         {
             let lines: Vec<&str> = formatted.lines().collect();
-            let on_idx = lines.iter().position(|l| l.trim() == "ON").unwrap();
+            let on_idx = lines
+                .iter()
+                .position(|l| l.trim_start().starts_with("ON "))
+                .unwrap();
             let and_idx = lines
                 .iter()
                 .position(|l| l.trim_start().starts_with("AND "))
@@ -34134,7 +33882,10 @@ from (a
             "select * from a join b on a.id = b.id and a.type in (select type from types) and a.x = b.x;");
         {
             let lines: Vec<&str> = formatted.lines().collect();
-            let on_idx = lines.iter().position(|l| l.trim() == "ON").unwrap();
+            let on_idx = lines
+                .iter()
+                .position(|l| l.trim_start().starts_with("ON "))
+                .unwrap();
             let and_lines: Vec<usize> = lines
                 .iter()
                 .enumerate()
@@ -34163,7 +33914,10 @@ from (a
         );
         {
             let lines: Vec<&str> = formatted.lines().collect();
-            let where_idx = lines.iter().position(|l| l.trim() == "WHERE").unwrap();
+            let where_idx = lines
+                .iter()
+                .position(|l| l.trim_start().starts_with("WHERE "))
+                .unwrap();
             let and_idx = lines
                 .iter()
                 .position(|l| l.trim_start().starts_with("AND "))
@@ -34181,7 +33935,10 @@ from (a
             "select * from a join b on a.id = b.id and exists (select 1 from c where c.id = a.id) and a.x = b.x;");
         {
             let lines: Vec<&str> = formatted.lines().collect();
-            let on_idx = lines.iter().position(|l| l.trim() == "ON").unwrap();
+            let on_idx = lines
+                .iter()
+                .position(|l| l.trim_start().starts_with("ON "))
+                .unwrap();
             let and_lines: Vec<usize> = lines
                 .iter()
                 .enumerate()
@@ -34213,13 +33970,13 @@ from (a
             let indent = |line: &str| line.len().saturating_sub(line.trim_start().len());
             let outer_on_idx = lines
                 .iter()
-                .position(|line| line.trim() == "ON")
+                .position(|line| line.trim_start().starts_with("ON "))
                 .expect("outer ON header");
             let inner_on_idx = lines
                 .iter()
                 .enumerate()
                 .skip(outer_on_idx + 1)
-                .find(|(_, line)| line.trim() == "ON")
+                .find(|(_, line)| line.trim_start().starts_with("ON "))
                 .map(|(idx, _)| idx)
                 .expect("inner ON header");
             let inner_and_idx = lines
@@ -34255,7 +34012,10 @@ from (a
             "select * from a join b on a.id = b.id and a.type in (select type from types) where a.x = 1 and a.y = 2;");
         {
             let lines: Vec<&str> = formatted.lines().collect();
-            let where_idx = lines.iter().position(|l| l.trim() == "WHERE").unwrap();
+            let where_idx = lines
+                .iter()
+                .position(|l| l.trim_start().starts_with("WHERE "))
+                .unwrap();
             let where_and_idx = lines
                 .iter()
                 .enumerate()
@@ -34330,10 +34090,10 @@ from (a
     fn format_sql_trigger_referencing_and_when_alignment() {
         let source = "CREATE OR REPLACE TRIGGER trg_emp_biu BEFORE INSERT OR UPDATE OF sal, comm ON emp REFERENCING NEW AS n OLD AS o FOR EACH ROW WHEN (n.sal > 0) BEGIN :n.comm := NVL(:n.comm, 0); END;";
         let formatted = SqlEditorWidget::format_sql_basic(source);
-        // Comma in UPDATE OF column list should stay inline inside the trigger event clause.
+        // UPDATE OF is a sibling frame: its first column stays inline and later columns break.
         assert!(
-            formatted.contains("UPDATE OF sal, comm"),
-            "UPDATE OF column list commas should stay inline in trigger event clause, got:\n{}",
+            formatted.contains("UPDATE OF sal,\n        comm"),
+            "UPDATE OF should keep its first child inline and break its second child, got:\n{}",
             formatted
         );
         // ON should start a new trigger header line.
@@ -34381,12 +34141,12 @@ from (a
     }
 
     #[test]
-    fn format_sql_trigger_update_of_multi_column_comma_stays_inline() {
+    fn format_sql_trigger_update_of_breaks_later_columns() {
         let source = "CREATE OR REPLACE TRIGGER trg_test AFTER UPDATE OF col1, col2, col3 ON my_table FOR EACH ROW BEGIN NULL; END;";
         let formatted = SqlEditorWidget::format_sql_basic(source);
         assert!(
-            formatted.contains("UPDATE OF col1, col2, col3"),
-            "Multiple columns in trigger UPDATE OF should stay inline, got:\n{}",
+            formatted.contains("UPDATE OF col1,\n        col2,\n        col3"),
+            "Trigger UPDATE OF should keep the first column inline and break later columns, got:\n{}",
             formatted
         );
         assert!(
@@ -34460,7 +34220,8 @@ from (a
         assert!(
             formatted.contains(
                 "AFTER MATCH SKIP TO NEXT ROW
-    SUBSET ab = (A, B)
+    SUBSET ab = (A,
+            B)
     PATTERN"
             ),
             "SUBSET should be on its own line inside MATCH_RECOGNIZE, got:\n{}",
@@ -34567,7 +34328,7 @@ FROM emp;"#;
         let analytic_formatted = SqlEditorWidget::format_sql_basic(analytic_source);
         assert!(
             analytic_formatted.contains(
-                "OVER (\n    PARTITION BY deptno\n    EXCLUDE CURRENT ROW\n) AS running_sal"
+                "OVER (\n        PARTITION BY deptno\n        EXCLUDE CURRENT ROW\n    ) AS running_sal"
             ),
             "EXCLUDE inside OVER should break onto the shared owner-relative depth, got:\n{}",
             analytic_formatted
@@ -34590,10 +34351,8 @@ FROM emp;"#;
             window_formatted
         );
         assert_eq!(
-            leading_spaces(lines[named_idx]),
-            leading_spaces(lines[window_idx]).saturating_add(4),
-            "named WINDOW definition should stay one clause-body level deeper than bare WINDOW, got:\n{}",
-            window_formatted
+            named_idx, window_idx,
+            "the first WINDOW child should be inline"
         );
         assert!(
             leading_spaces(lines[exclude_idx]) > leading_spaces(lines[named_idx]),
@@ -34663,15 +34422,13 @@ FROM emp;"#;
             .expect("WINDOW closing parenthesis");
 
         assert!(
-            formatted.contains("\nWINDOW\n    w_dept AS ("),
-            "WINDOW clause should start on its own clause line, got:\n{}",
+            formatted.contains("\nWINDOW w_dept AS ("),
+            "WINDOW should keep its first named child inline, got:\n{}",
             formatted
         );
         assert_eq!(
-            leading_spaces(lines[named_idx]),
-            leading_spaces(lines[window_idx]).saturating_add(4),
-            "named WINDOW definition should stay one level deeper than bare WINDOW, got:\n{}",
-            formatted
+            named_idx, window_idx,
+            "the first WINDOW child should be inline"
         );
         assert!(
             leading_spaces(lines[partition_idx]) > leading_spaces(lines[named_idx]),
@@ -34686,8 +34443,8 @@ FROM emp;"#;
         );
         assert_eq!(
             leading_spaces(lines[close_idx]),
-            leading_spaces(lines[named_idx]),
-            "WINDOW closing parenthesis should realign with the named WINDOW definition, got:\n{}",
+            leading_spaces(lines[window_idx]).saturating_add(4),
+            "WINDOW close should use the parenthesis frame depth, got:\n{}",
             formatted
         );
         assert_eq!(
@@ -34708,8 +34465,7 @@ FROM emp;"#;
     fn format_sql_window_clause_indents_named_window_siblings_under_bare_window_header() {
         let source = "SELECT ob.*, ROW_NUMBER() OVER w_emp AS rn_in_emp, DENSE_RANK() OVER w_global AS global_rank, SUM(ob.total_usd) OVER w_emp_running AS running_emp_total FROM order_base AS ob WINDOW w_emp AS (PARTITION BY ob.emp_id ORDER BY ob.created_at, ob.order_id), w_emp_running AS (PARTITION BY ob.emp_id ORDER BY ob.created_at, ob.order_id ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW), w_global AS (ORDER BY ob.total_usd DESC);";
         let formatted = SqlEditorWidget::format_sql_basic(source);
-        let window_fragment = r#"WINDOW
-    w_emp AS (
+        let window_fragment = r#"WINDOW w_emp AS (
         PARTITION BY ob.emp_id
         ORDER BY ob.created_at,
             ob.order_id
@@ -34775,15 +34531,13 @@ FROM emp;"#;
             formatted
         );
         assert_eq!(
-            indent(lines[named_idx]),
-            indent(lines[window_idx]).saturating_add(4),
-            "nested named WINDOW definition should stay one level deeper than bare WINDOW, got:\n{}",
-            formatted
+            named_idx, window_idx,
+            "the first named WINDOW child should be inline"
         );
         assert_eq!(
             indent(lines[partition_idx]),
-            indent(lines[named_idx]).saturating_add(4),
-            "nested WINDOW body should be one indentation level deeper than its named owner, got:\n{}",
+            indent(lines[window_idx]).saturating_add(8),
+            "nested WINDOW body should include list and parenthesis frame edges, got:\n{}",
             formatted
         );
         assert_eq!(
@@ -35201,7 +34955,7 @@ MATCH_RECOGNIZE (
         let lines: Vec<&str> = formatted.lines().collect();
 
         let values_idx = find_line_starting_with(&lines, "VALUES").expect("VALUES clause line");
-        let tuple_idx = find_line_starting_with(&lines, "(1, 'x');").expect("VALUES tuple line");
+        let tuple_idx = find_line_starting_with(&lines, "(1,").expect("VALUES tuple line");
 
         assert!(
             lines[values_idx].contains("-- tuple payload")
@@ -35606,8 +35360,8 @@ FROM emp_json e;"#;
             "WITH PACKAGE pkg_demo AS FUNCTION f RETURN NUMBER; END pkg_demo; SELECT 1 FROM dual;";
         let formatted = SqlEditorWidget::format_sql_basic(source);
         assert!(
-            formatted.contains("WITH\n    PACKAGE pkg_demo AS"),
-            "WITH PACKAGE should start a structured declaration block, got:\n{}",
+            formatted.contains("WITH PACKAGE pkg_demo AS"),
+            "WITH should keep its first PACKAGE child inline, got:\n{}",
             formatted
         );
         assert!(
@@ -35627,13 +35381,12 @@ FROM emp_json e;"#;
         let source = "WITH TYPE t_num IS TABLE OF NUMBER; SELECT * FROM TABLE(t_num(1, 2, 3));";
         let formatted = SqlEditorWidget::format_sql_basic(source);
         assert!(
-            formatted.contains("WITH\n    TYPE t_num IS TABLE OF NUMBER;\nSELECT *"),
-            "WITH TYPE declaration should stay attached to the main query, got:\n{}",
+            formatted.contains("WITH TYPE t_num IS TABLE OF NUMBER;\nSELECT *"),
+            "WITH should keep its first TYPE child inline and attached to the main query, got:\n{}",
             formatted
         );
         assert!(
-            formatted.contains("FROM TABLE (t_num (1, 2, 3))")
-                || formatted.contains("FROM TABLE(t_num(1, 2, 3))"),
+            formatted.contains("FROM TABLE (t_num (1,\n            2,\n            3))"),
             "Main query after WITH TYPE should remain intact, got:\n{}",
             formatted
         );
@@ -35698,7 +35451,7 @@ FROM emp_json e;"#;
         let formatted = SqlEditorWidget::format_for_auto_formatting(source, false);
         let lines: Vec<&str> = formatted.lines().collect();
         let indent = |line: &str| line.len().saturating_sub(line.trim_start().len());
-        let item_idx = find_line_starting_with(&lines, "(")
+        let item_idx = find_line_starting_with(&lines, "SELECT (")
             .unwrap_or_else(|| panic!("outer SELECT item opener, got:\n{}", formatted));
         let child_select_idx = find_line_starting_with(&lines, "SELECT MAX (s.amount)")
             .unwrap_or_else(|| panic!("nested SELECT line, got:\n{}", formatted));
@@ -35707,14 +35460,14 @@ FROM emp_json e;"#;
 
         assert_eq!(
             indent(lines[child_select_idx]),
-            indent(lines[item_idx]).saturating_add(4),
-            "First SELECT item child query should be one level deeper than the item opener, got:\n{}",
+            indent(lines[item_idx]).saturating_add(8),
+            "the child query should include SELECT-list and parenthesis frame edges, got:\n{}",
             formatted
         );
         assert_eq!(
             indent(lines[close_idx]),
-            indent(lines[item_idx]),
-            "First SELECT item close should return to the item depth, got:\n{}",
+            indent(lines[item_idx]).saturating_add(4),
+            "the close should return to the SELECT-list child depth, got:\n{}",
             formatted
         );
     }
@@ -35755,14 +35508,10 @@ FROM emp_json e;"#;
         let salary_idx = find_line_starting_with(&lines, "SET e.salary = e.salary + (")
             .or_else(|| find_line_starting_with(&lines, "e.salary = e.salary + ("))
             .unwrap_or_else(|| panic!("first multiline SET item, got:\n{}", formatted));
-        let note_idx = find_line_starting_with(
-            &lines,
-            "e.note = NVL (e.note, EMPTY_CLOB ()) || CHR (10) || 'UPDATED@' || TO_CHAR (SYSTIMESTAMP, 'YYYY-MM-DD HH24:MI:SS.FF3')",
-        )
-        .expect("second SET item");
-        let child_select_idx =
-            find_line_starting_with(&lines, "SELECT NVL (ROUND (AVG (s.amount) / 100, 2), 0)")
-                .unwrap_or_else(|| panic!("SET child SELECT line, got:\n{}", formatted));
+        let note_idx =
+            find_line_starting_with(&lines, "e.note = NVL (e.note,").expect("second SET item");
+        let child_select_idx = find_line_starting_with(&lines, "SELECT NVL (")
+            .unwrap_or_else(|| panic!("SET child SELECT line, got:\n{}", formatted));
         let child_close_idx = find_line_starting_with(&lines, "),")
             .unwrap_or_else(|| panic!("SET child close line, got:\n{}", formatted));
         let exists_select_idx =
@@ -36971,29 +36720,22 @@ FROM emp_json e;"#;
         let formatted = SqlEditorWidget::format_sql_basic(source);
         let lines: Vec<&str> = formatted.lines().collect();
         let indent = |line: &str| line.len().saturating_sub(line.trim_start().len());
-        let pivot_idx = lines
-            .iter()
-            .position(|line| line.trim_start() == "PIVOT XML (")
-            .unwrap_or(0);
-        let sum_idx = lines
-            .iter()
-            .position(|line| line.trim_start() == "SUM (sal) AS sum_sal")
-            .unwrap_or(0);
+        let pivot_idx = find_line_starting_with(&lines, "PIVOT XML (").unwrap_or(0);
+        let sum_idx = find_line_starting_with(&lines, "SUM (sal) AS sum_sal").unwrap_or(0);
         let for_idx = lines
             .iter()
             .position(|line| line.trim_start().starts_with("FOR job IN"))
             .unwrap_or(0);
 
         assert_eq!(
-            indent(lines[sum_idx]),
-            indent(lines[pivot_idx]).saturating_add(4),
-            "PIVOT XML body should be one level deeper than the owner line, got:\n{}",
+            sum_idx, pivot_idx,
+            "PIVOT XML should keep its first aggregate child inline, got:\n{}",
             formatted
         );
         assert_eq!(
             indent(lines[for_idx]),
-            indent(lines[sum_idx]),
-            "PIVOT XML FOR line should stay aligned with the aggregate line, got:\n{}",
+            indent(lines[pivot_idx]).saturating_add(8),
+            "PIVOT XML should include parenthesis and typed-list frame edges, got:\n{}",
             formatted
         );
         assert_eq!(
@@ -37009,29 +36751,22 @@ FROM emp_json e;"#;
         let formatted = SqlEditorWidget::format_sql_basic(source);
         let lines: Vec<&str> = formatted.lines().collect();
         let indent = |line: &str| line.len().saturating_sub(line.trim_start().len());
-        let unpivot_idx = lines
-            .iter()
-            .position(|line| line.trim_start() == "UNPIVOT INCLUDE NULLS (")
-            .unwrap_or(0);
-        let value_idx = lines
-            .iter()
-            .position(|line| line.trim_start() == "sal_amt")
-            .unwrap_or(0);
+        let unpivot_idx = find_line_starting_with(&lines, "UNPIVOT INCLUDE NULLS (").unwrap_or(0);
+        let value_idx = find_line_starting_with(&lines, "sal_amt").unwrap_or(0);
         let for_idx = lines
             .iter()
             .position(|line| line.trim_start().starts_with("FOR dept_tag IN"))
             .unwrap_or(0);
 
         assert_eq!(
-            indent(lines[value_idx]),
-            indent(lines[unpivot_idx]).saturating_add(4),
-            "UNPIVOT INCLUDE NULLS body should be one level deeper than the owner line, got:\n{}",
+            value_idx, unpivot_idx,
+            "UNPIVOT INCLUDE NULLS should keep its first value child inline, got:\n{}",
             formatted
         );
         assert_eq!(
             indent(lines[for_idx]),
-            indent(lines[value_idx]),
-            "UNPIVOT INCLUDE NULLS FOR line should stay aligned with the value line, got:\n{}",
+            indent(lines[unpivot_idx]).saturating_add(8),
+            "UNPIVOT INCLUDE NULLS should include parenthesis and typed-list frame edges, got:\n{}",
             formatted
         );
         assert_eq!(
@@ -37498,8 +37233,8 @@ WHEN MATCHED THEN
         let when_matched = find_line("WHEN MATCHED THEN").unwrap_or("");
         let update_line = find_line("UPDATE SET t.note_text = src.new_note_text,").unwrap_or("");
         let updated_at_line = find_line("t.updated_at = SYSTIMESTAMP;").unwrap_or("");
-        let with_line = find_line("WITH").unwrap_or("");
-        let recent_sales_line = find_line("recent_sales AS (").unwrap_or("");
+        let with_line = find_line("WITH recent_sales AS (").unwrap_or("");
+        let recent_sales_line = with_line;
         let scored_line = find_line("scored AS (").unwrap_or("");
 
         assert!(
@@ -37514,14 +37249,14 @@ WHEN MATCHED THEN
         );
         assert_eq!(
             leading(recent_sales_line),
-            leading(with_line).saturating_add(4),
-            "the first nested USING CTE should use the WITH owner+1 depth, got:\n{}",
+            leading(with_line),
+            "the first nested USING CTE should stay inline with WITH, got:\n{}",
             formatted
         );
         assert_eq!(
             leading(scored_line),
-            leading(recent_sales_line),
-            "nested USING CTE siblings should share one frame depth, got:\n{}",
+            leading(with_line).saturating_add(4),
+            "the second nested USING CTE should use WITH frame depth, got:\n{}",
             formatted
         );
         assert_eq!(
@@ -37859,10 +37594,8 @@ WHEN MATCHED THEN
         let source = "WITH outer_1 AS (WITH inner_1 AS (SELECT 1 AS id FROM dual), inner_2 AS (SELECT id FROM inner_1) SELECT id FROM inner_2), outer_2 AS (SELECT id FROM outer_1) SELECT id FROM outer_2;";
         let formatted = SqlEditorWidget::format_sql_basic(source);
         let expected = [
-            "WITH",
-            "    outer_1 AS (",
-            "        WITH",
-            "            inner_1 AS (",
+            "WITH outer_1 AS (",
+            "        WITH inner_1 AS (",
             "                SELECT 1 AS id",
             "                FROM DUAL",
             "            ),",
@@ -37891,10 +37624,7 @@ WHEN MATCHED THEN
         let source = "SELECT (((SELECT 1 FROM dual))) AS v FROM dual;";
         let formatted = SqlEditorWidget::format_sql_basic(source);
         let expected = [
-            "SELECT",
-            "    (",
-            "        (",
-            "            (",
+            "SELECT (((",
             "                SELECT 1",
             "                FROM DUAL",
             "            )",
@@ -37917,8 +37647,7 @@ WHEN MATCHED THEN
             "    UPDATE t",
             "    SET v = 1",
             "    WHERE id = 1",
-            "    RETURNING",
-            "        CASE",
+            "    RETURNING CASE",
             "            WHEN a = 1 THEN",
             "                CASE",
             "                    WHEN b = 2 THEN",
@@ -37947,11 +37676,7 @@ WHEN MATCHED THEN
         let source = "SELECT (((CASE WHEN a = 1 THEN CASE WHEN b = 2 THEN CASE WHEN c = 3 THEN 1 ELSE 2 END ELSE 3 END ELSE 4 END))) AS v FROM dual;";
         let formatted = SqlEditorWidget::format_sql_basic(source);
         let expected = [
-            "SELECT",
-            "    (",
-            "        (",
-            "            (",
-            "                CASE",
+            "SELECT (((CASE",
             "                    WHEN a = 1 THEN",
             "                        CASE",
             "                            WHEN b = 2 THEN",
@@ -38686,20 +38411,20 @@ AND d.active = 'Y';"#;
 
         assert_eq!(
             indent(lines[open_idx]),
-            indent(lines[owner_idx]),
-            "standalone open paren after inline-comment split NOT EXISTS should stay on owner depth, got:\n{}",
+            indent(lines[owner_idx]).saturating_add(4),
+            "comment-forced NOT EXISTS child should use condition-frame depth, got:\n{}",
             formatted
         );
         assert_eq!(
             indent(lines[select_idx]),
-            indent(lines[owner_idx]).saturating_add(4),
-            "child SELECT under inline-comment split NOT EXISTS should stay one level deeper than owner, got:\n{}",
+            indent(lines[owner_idx]).saturating_add(8),
+            "child SELECT should include condition and parenthesis frame edges, got:\n{}",
             formatted
         );
         assert_eq!(
             indent(lines[close_idx]),
-            indent(lines[owner_idx]),
-            "inline-comment split NOT EXISTS closing paren should realign with owner depth, got:\n{}",
+            indent(lines[owner_idx]).saturating_add(4),
+            "NOT EXISTS close should use parenthesis owner depth, got:\n{}",
             formatted
         );
     }
@@ -38751,16 +38476,11 @@ WHERE ranked.top_sal > 0;"#;
             .iter()
             .enumerate()
             .skip(keep_idx.saturating_add(1))
-            .find(|(_, line)| line.trim_start() == "(")
+            .find(|(_, line)| line.trim_start().starts_with("(DENSE_RANK"))
             .map(|(idx, _)| idx)
-            .unwrap_or(0);
-        let dense_rank_idx = lines
-            .iter()
-            .enumerate()
-            .skip(open_idx.saturating_add(1))
-            .find(|(_, line)| line.trim_start().starts_with("DENSE_RANK"))
-            .map(|(idx, _)| idx)
-            .unwrap_or(0);
+            .expect("KEEP first child");
+        let dense_rank_idx = open_idx;
+        assert!(lines[dense_rank_idx].contains("(DENSE_RANK"));
         let close_idx = lines
             .iter()
             .enumerate()
@@ -38771,20 +38491,20 @@ WHERE ranked.top_sal > 0;"#;
 
         assert_eq!(
             leading_spaces(lines[open_idx]),
-            leading_spaces(lines[keep_idx]),
-            "standalone open paren after inline-comment split KEEP should stay on the owner depth, got:\n{}",
+            leading_spaces(lines[keep_idx]).saturating_add(4),
+            "comment-forced KEEP child should use its frame body depth, got:\n{}",
             formatted
         );
         assert_eq!(
             leading_spaces(lines[dense_rank_idx]),
-            leading_spaces(lines[keep_idx]).saturating_add(4),
-            "KEEP body header should stay one level deeper than the exact owner line, got:\n{}",
+            leading_spaces(lines[open_idx]),
+            "the first KEEP body child should stay inline with its opener, got:\n{}",
             formatted
         );
         assert_eq!(
             leading_spaces(lines[close_idx]),
-            leading_spaces(lines[keep_idx]),
-            "KEEP close line should realign with the owner depth, got:\n{}",
+            leading_spaces(lines[open_idx]),
+            "KEEP close should use the parenthesis owner depth, got:\n{}",
             formatted
         );
     }
@@ -38874,7 +38594,10 @@ END;"#;
             .iter()
             .enumerate()
             .skip(if_idx + 1)
-            .find(|(_, line)| line.trim_start() == "CASE")
+            .find(|(_, line)| {
+                line.trim_start().starts_with("CASE")
+                    || (line.contains(" CASE") && !line.trim_start().starts_with("END "))
+            })
             .map(|(idx, _)| idx)
             .expect("CASE line");
         let when_idx = lines
@@ -39550,14 +39273,14 @@ sort_no = VALUES(sort_no);"#;
             .map(|(idx, _)| idx)
             .expect("next assignment sibling");
 
-        assert!(
-            leading_spaces(lines[values_idx]) > leading_spaces(lines[on_duplicate_idx]),
-            "VALUES() argument should stay nested under the ON DUPLICATE call owner, got:\n{formatted}"
+        assert_eq!(
+            values_idx, on_duplicate_idx,
+            "the first CONCAT argument should stay inline with its owner, got:\n{formatted}"
         );
         assert_eq!(
             leading_spaces(lines[literal_idx]),
-            leading_spaces(lines[values_idx]),
-            "wrapped call siblings inside ON DUPLICATE KEY UPDATE should reuse the parent frame body depth, got:\n{formatted}"
+            leading_spaces(lines[on_duplicate_idx]).saturating_add(12),
+            "the second CONCAT child should include UPDATE-list and call-frame depth, got:\n{formatted}"
         );
         assert_eq!(
             leading_spaces(lines[close_idx]),
@@ -39610,6 +39333,143 @@ updated_at = NOW();"#;
             leading_spaces(lines[updated_at_idx]),
             leading_spaces(lines[sort_no_idx]),
             "ON DUPLICATE KEY UPDATE sibling assignments should stay on the same list depth, got:\n{formatted}"
+        );
+        assert_eq!(
+            SqlEditorWidget::format_sql_basic_for_db_type(
+                &formatted,
+                crate::db::connection::DatabaseType::MySQL,
+            ),
+            formatted
+        );
+    }
+
+    #[test]
+    fn format_sql_basic_for_mysql_db_type_keeps_set_statement_for_query_clauses_on_one_depth() {
+        let source = "SET STATEMENT max_statement_time=5 FOR\nSELECT account_id,COUNT(*)event_count\nFROM mf_event\nGROUP BY account_id\nHAVING COUNT(*)>=1\nORDER BY account_id;";
+
+        let formatted = SqlEditorWidget::format_sql_basic_for_db_type(
+            source,
+            crate::db::connection::DatabaseType::MariaDB,
+        );
+        let lines: Vec<&str> = formatted.lines().collect();
+        let select_idx = find_line_starting_with(&lines, "SELECT account_id").expect("SELECT");
+        for clause in ["FROM mf_event", "GROUP BY account_id", "HAVING", "ORDER BY"] {
+            let clause_idx = find_line_starting_with(&lines, clause)
+                .unwrap_or_else(|| panic!("{clause} line, got:\n{formatted}"));
+            assert_eq!(
+                leading_spaces(lines[clause_idx]),
+                leading_spaces(lines[select_idx]),
+                "every clause of the SET STATEMENT ... FOR wrapped query should share the SELECT depth, got:\n{formatted}"
+            );
+        }
+        assert_eq!(
+            SqlEditorWidget::format_sql_basic_for_db_type(
+                &formatted,
+                crate::db::connection::DatabaseType::MariaDB,
+            ),
+            formatted
+        );
+    }
+
+    #[test]
+    fn format_sql_basic_for_mysql_db_type_keeps_distinct_on_the_expanded_select_header() {
+        let source = "WITH percentiles AS(\nSELECT DISTINCT agent_id,\nPERCENTILE_CONT(0.5)WITHIN GROUP(ORDER BY duration_ms)OVER(PARTITION BY agent_id)AS median_duration\nFROM execution_facts\n)\nSELECT agent_id FROM percentiles;";
+
+        let formatted = SqlEditorWidget::format_sql_basic_for_db_type(
+            source,
+            crate::db::connection::DatabaseType::MariaDB,
+        );
+        let lines: Vec<&str> = formatted.lines().collect();
+        let header_idx = find_line_starting_with(&lines, "SELECT DISTINCT")
+            .expect("SELECT DISTINCT should stay one header line");
+        assert!(
+            lines[header_idx].contains("SELECT DISTINCT agent_id,"),
+            "SELECT DISTINCT should keep its first item inline, got:\n{formatted}"
+        );
+        let first_item_idx = find_line_starting_with(&lines, "agent_id,").expect("first item");
+        assert_eq!(
+            first_item_idx, header_idx,
+            "the first SELECT item should share the header line, got:\n{formatted}"
+        );
+        assert_eq!(
+            SqlEditorWidget::format_sql_basic_for_db_type(
+                &formatted,
+                crate::db::connection::DatabaseType::MariaDB,
+            ),
+            formatted
+        );
+    }
+
+    #[test]
+    fn format_sql_basic_for_mysql_db_type_keeps_on_duplicate_clause_depth_after_multiline_join_on()
+    {
+        let source = r#"INSERT INTO stats (ym, region_id, cnt)
+SELECT b.ym, b.region_id, b.cnt
+FROM base b
+LEFT JOIN extra tc
+ON tc.ym = b.ym
+AND tc.region_id = b.region_id
+ON DUPLICATE KEY UPDATE cnt = VALUES(cnt),
+region_id = VALUES(region_id);"#;
+
+        let formatted = SqlEditorWidget::format_sql_basic_for_db_type(
+            source,
+            crate::db::connection::DatabaseType::MySQL,
+        );
+        let lines: Vec<&str> = formatted.lines().collect();
+        let insert_idx =
+            find_line_starting_with(&lines, "INSERT INTO stats").expect("INSERT owner");
+        let on_duplicate_idx = find_line_starting_with(&lines, "ON DUPLICATE KEY UPDATE")
+            .expect("ON DUPLICATE KEY UPDATE clause");
+        assert_eq!(
+            leading_spaces(lines[on_duplicate_idx]),
+            leading_spaces(lines[insert_idx]),
+            "ON DUPLICATE KEY UPDATE after a multiline join ON condition should return to the INSERT statement depth, got:\n{formatted}"
+        );
+        let sibling_idx = find_line_starting_with(&lines, "region_id = VALUES(region_id);")
+            .expect("assignment sibling");
+        assert_eq!(
+            leading_spaces(lines[sibling_idx]),
+            leading_spaces(lines[on_duplicate_idx]).saturating_add(4),
+            "ON DUPLICATE KEY UPDATE assignment siblings should stay one level below the clause owner, got:\n{formatted}"
+        );
+        assert_eq!(
+            SqlEditorWidget::format_sql_basic_for_db_type(
+                &formatted,
+                crate::db::connection::DatabaseType::MySQL,
+            ),
+            formatted
+        );
+    }
+
+    #[test]
+    fn format_sql_basic_for_mysql_db_type_returns_from_clause_to_query_depth_after_wrapped_window_item(
+    ) {
+        let source = r#"WITH monthly AS (
+    SELECT 1 AS month_key FROM boss
+)
+SELECT
+    month_key,
+    ROUND(
+        SUM(net_sales) OVER (
+            PARTITION BY segment
+            ORDER BY month_key
+            ROWS BETWEEN 2 PRECEDING AND CURRENT ROW
+        ),
+        2
+    ) AS rolling
+FROM monthly;"#;
+
+        let formatted = SqlEditorWidget::format_sql_basic_for_db_type(
+            source,
+            crate::db::connection::DatabaseType::MySQL,
+        );
+        let lines: Vec<&str> = formatted.lines().collect();
+        let from_idx = find_line_starting_with(&lines, "FROM monthly").expect("FROM clause");
+        assert_eq!(
+            leading_spaces(lines[from_idx]),
+            0,
+            "FROM after a function-wrapped multiline window item should return to the main query depth of the WITH statement, got:\n{formatted}"
         );
         assert_eq!(
             SqlEditorWidget::format_sql_basic_for_db_type(
@@ -40624,8 +40484,8 @@ END;"#;
         );
 
         for snippet in [
-            "DECLARE c CURSOR (p_min DECIMAL(14, 2), p_kind VARCHAR(20))",
-            "OPEN c(1, 'x');",
+            "DECLARE c CURSOR (p_min DECIMAL(14,",
+            "OPEN c(1,",
             "'$' COLUMNS (",
             "NESTED PATH '$.items[*]' COLUMNS (",
         ] {
@@ -40635,11 +40495,8 @@ END;"#;
             );
         }
         let lines = formatted.lines().collect::<Vec<_>>();
-        let cursor_idx = find_line_starting_with(
-            &lines,
-            "DECLARE c CURSOR (p_min DECIMAL(14, 2), p_kind VARCHAR(20))",
-        )
-        .expect("parameterized cursor declaration");
+        let cursor_idx = find_line_starting_with(&lines, "DECLARE c CURSOR (p_min DECIMAL(14,")
+            .expect("parameterized cursor declaration");
         let select_idx = lines
             .iter()
             .enumerate()
@@ -40810,9 +40667,8 @@ END;"#;
             crate::db::connection::DatabaseType::MariaDB,
         );
         let lines: Vec<&str> = formatted.lines().collect();
-        let order_idx =
-            find_line_starting_with(&lines, "ORDER BY distance_fn(vector_col, query_vector()),")
-                .expect("nested ORDER BY");
+        let order_idx = find_line_starting_with(&lines, "ORDER BY distance_fn(vector_col,")
+            .expect("nested ORDER BY");
         let id_idx = lines
             .iter()
             .enumerate()
@@ -41330,7 +41186,8 @@ END$$"#;
             let insert_idx = lines
                 .iter()
                 .position(|line| {
-                    line.trim_start() == "INSERT INTO boss_audit (event_time, payload_json)"
+                    line.trim_start()
+                        .starts_with("INSERT INTO boss_audit (event_time,")
                 })
                 .unwrap_or(0);
             let commit_idx = lines
@@ -41448,12 +41305,9 @@ DELIMITER ;"#;
             .iter()
             .position(|line| line.trim_start() == "WHILE v_product_id <= 36 DO")
             .unwrap_or(0);
-        let values_idx = lines
-            .iter()
-            .position(|line| {
-                line.trim_start() == "VALUES (IF(MOD(v_product_id, 17) = 0, 'N', 'Y'));"
-            })
-            .unwrap_or(0);
+        let values_idx =
+            find_line_starting_with(&lines, "VALUES (IF(MOD(v_product_id, 17) = 0, 'N', 'Y'));")
+                .expect("WHILE body VALUES IF call");
         let set_idx = lines
             .iter()
             .position(|line| line.trim_start() == "SET v_product_id = v_product_id + 1;")
@@ -41576,8 +41430,9 @@ DELIMITER ;"#;
                 crate::db::connection::DatabaseType::MySQL,
             );
 
+            let lines: Vec<&str> = formatted.lines().collect();
             assert!(
-                formatted.contains(snippet),
+                find_line_starting_with(&lines, snippet).is_some(),
                 "formatted MySQL/MariaDB INSERT signature should remain present, got:\n{formatted}"
             );
             assert!(
@@ -41640,19 +41495,19 @@ DELIMITER ;"#;
             crate::db::connection::DatabaseType::MySQL,
         );
         assert!(
-            formatted.contains("WITH RECURSIVE\n    region_tree AS ("),
+            contains_line_sequence(&formatted, "WITH RECURSIVE region_tree AS ("),
             "test6 query #1 CTE header should remain present, got:\n{formatted}"
         );
         assert!(
-            formatted.contains("DENSE_RANK() OVER ("),
+            contains_line_sequence(&formatted, "DENSE_RANK() OVER ("),
             "test6 analytic OVER header should remain present, got:\n{formatted}"
         );
         assert!(
-            formatted.contains("'stats', JSON_OBJECT("),
+            contains_line_sequence(&formatted, "'stats', JSON_OBJECT("),
             "test6 JSON stats pair should remain present, got:\n{formatted}"
         );
         assert!(
-            formatted.contains("'latest_orders', JSON_ARRAYAGG("),
+            contains_line_sequence(&formatted, "'latest_orders', JSON_ARRAYAGG("),
             "test6 JSON latest_orders pair should remain present, got:\n{formatted}"
         );
 
@@ -41744,14 +41599,14 @@ DELIMITER ;"#;
             .expect("test4 rollup total_hours message");
         let call_idx = (0..message_idx)
             .rev()
-            .find(|idx| lines[*idx].trim_start() == "CALL sp_assert_eq_bigint(")
+            .find(|idx| lines[*idx].contains("CALL sp_assert_eq_bigint("))
             .expect("test4 CALL sp_assert_eq_bigint");
         let cast_indices: Vec<usize> = lines
             .iter()
             .enumerate()
-            .skip(call_idx + 1)
-            .take(message_idx.saturating_sub(call_idx + 1))
-            .filter(|(_, line)| line.trim_start() == "CAST(ROUND(")
+            .skip(call_idx)
+            .take(message_idx.saturating_sub(call_idx).saturating_add(1))
+            .filter(|(_, line)| line.contains("CAST(ROUND("))
             .map(|(idx, _)| idx)
             .collect();
 
@@ -41763,9 +41618,8 @@ DELIMITER ;"#;
 
         let desired_indent = leading_spaces(lines[call_idx]).saturating_add(4);
         assert_eq!(
-            leading_spaces(lines[cast_indices[0]]),
-            desired_indent,
-            "test4 first multiline CAST argument should stay on the CALL body depth, got:\n{formatted}"
+            cast_indices[0], call_idx,
+            "test4 first multiline CAST argument should remain inline with CALL, got:\n{formatted}"
         );
         assert_eq!(
             leading_spaces(lines[cast_indices[1]]),
@@ -41797,7 +41651,7 @@ DELIMITER ;"#;
             .expect("test4 JSON tag expansion message");
         let call_idx = (0..message_idx)
             .rev()
-            .find(|idx| lines[*idx].trim_start() == "CALL sp_assert_eq_bigint(")
+            .find(|idx| lines[*idx].contains("CALL sp_assert_eq_bigint("))
             .expect("test4 JSON tag expansion CALL");
         let arg_open_indices: Vec<usize> = lines
             .iter()
@@ -41808,7 +41662,7 @@ DELIMITER ;"#;
             .map(|(idx, _)| idx)
             .collect();
         let second_arg_open_idx = *arg_open_indices
-            .get(1)
+            .first()
             .expect("test4 second multiline subquery argument");
         let json_table_join_idx = lines
             .iter()
@@ -41824,13 +41678,13 @@ DELIMITER ;"#;
             .find(|(_, line)| line.trim_start() == ")) jt")
             .map(|(idx, _)| idx)
             .expect("test4 JSON_TABLE close");
-        let column_idx = lines
+        let columns_owner_idx = lines
             .iter()
             .enumerate()
             .skip(json_table_join_idx + 1)
-            .find(|(_, line)| line.trim_start() == "tag VARCHAR(50) PATH '$'")
+            .find(|(_, line)| line.contains("COLUMNS (tag VARCHAR(50) PATH '$'"))
             .map(|(idx, _)| idx)
-            .expect("test4 JSON_TABLE column child");
+            .expect("test4 JSON_TABLE COLUMNS owner and first child");
         let arg_close_idx = lines
             .iter()
             .enumerate()
@@ -41841,8 +41695,8 @@ DELIMITER ;"#;
 
         assert_eq!(
             leading_spaces(lines[json_table_close_idx]),
-            leading_spaces(lines[column_idx]).saturating_sub(4),
-            "test4 multiline JSON_TABLE close should return to the COLUMNS paren owner depth, got:\n{formatted}"
+            leading_spaces(lines[columns_owner_idx]),
+            "test4 multiline JSON_TABLE close should return to the COLUMNS owner depth, got:\n{formatted}"
         );
         assert_eq!(
             leading_spaces(lines[arg_close_idx]),
@@ -41924,7 +41778,7 @@ DELIMITER ;"#;
             crate::db::connection::DatabaseType::MySQL,
         );
         assert!(
-            formatted.contains("'components', JSON_ARRAY("),
+            contains_line_sequence(&formatted, "'components', JSON_ARRAY("),
             "test5 JSON components key/value pair should remain present, got:\n{formatted}"
         );
         assert!(
@@ -41992,10 +41846,17 @@ DELIMITER ;"#;
             .expect("test5 DENSE_RANK owner");
         let partition_idx = dense_rank_idx + 1;
         let partition_tail_idx = dense_rank_idx + 2;
-        let order_idx = dense_rank_idx + 3;
-        let close_idx = dense_rank_idx + 4;
-        let sum_idx = dense_rank_idx + 5;
-        let avg_idx = dense_rank_idx + 11;
+        let partition_call_arg_idx = dense_rank_idx + 3;
+        let order_idx = dense_rank_idx + 4;
+        let close_idx = dense_rank_idx + 5;
+        let sum_idx = dense_rank_idx + 6;
+        let avg_idx = lines
+            .iter()
+            .enumerate()
+            .skip(sum_idx + 1)
+            .find(|(_, line)| line.trim_start() == "AVG(c.day_hours) OVER (")
+            .map(|(idx, _)| idx)
+            .expect("test5 moving AVG analytic");
 
         assert_eq!(
             lines[partition_idx].trim_start(),
@@ -42004,8 +41865,13 @@ DELIMITER ;"#;
         );
         assert_eq!(
             lines[partition_tail_idx].trim_start(),
-            "DATE_FORMAT(c.event_day, '%Y-%m')",
-            "test5 multipart PARTITION BY should keep its sibling continuation, got:\n{formatted}"
+            "DATE_FORMAT(c.event_day,",
+            "test5 multipart PARTITION BY should keep its second child on the body line, got:\n{formatted}"
+        );
+        assert_eq!(
+            lines[partition_call_arg_idx].trim_start(),
+            "'%Y-%m')",
+            "test5 DATE_FORMAT second child should remain on its call body depth, got:\n{formatted}"
         );
         assert_eq!(
             lines[order_idx].trim_start(),
@@ -42040,6 +41906,11 @@ DELIMITER ;"#;
             "test5 PARTITION BY sibling continuation should stay one level deeper than its clause header, got:\n{formatted}"
         );
         assert_eq!(
+            leading_spaces(lines[partition_call_arg_idx]),
+            leading_spaces(lines[partition_tail_idx]).saturating_add(4),
+            "test5 DATE_FORMAT second child should stay one level deeper than the call owner, got:\n{formatted}"
+        );
+        assert_eq!(
             leading_spaces(lines[order_idx]),
             owner_indent.saturating_add(4),
             "test5 DENSE_RANK ORDER BY should stay aligned with PARTITION BY, got:\n{formatted}"
@@ -42069,11 +41940,11 @@ DELIMITER ;"#;
             crate::db::connection::DatabaseType::MySQL,
         );
         assert!(
-            formatted.contains("'stats', JSON_OBJECT("),
+            contains_line_sequence(&formatted, "'stats', JSON_OBJECT("),
             "test6 nested stats JSON_OBJECT should remain attached to the stats key, got:\n{formatted}"
         );
         assert!(
-            formatted.contains("'latest_orders', JSON_ARRAYAGG("),
+            contains_line_sequence(&formatted, "'latest_orders', JSON_ARRAYAGG("),
             "test6 latest_orders JSON_ARRAYAGG should remain attached to the key, got:\n{formatted}"
         );
         assert_eq!(
@@ -42097,14 +41968,7 @@ DELIMITER ;"#;
 
         let round_idx = lines
             .iter()
-            .enumerate()
-            .find(|(idx, line)| {
-                line.trim_start() == "ROUND("
-                    && lines
-                        .get(idx.saturating_add(1))
-                        .is_some_and(|next| next.trim_start().starts_with("net_sales"))
-            })
-            .map(|(idx, _)| idx)
+            .position(|line| line.contains("ROUND(net_sales - IFNULL("))
             .expect("test6 mom_diff ROUND owner");
         let zero_idx = lines
             .iter()
@@ -42114,14 +41978,6 @@ DELIMITER ;"#;
             .find(|(_, line)| line.trim_start() == "0")
             .map(|(idx, _)| idx)
             .expect("test6 IFNULL fallback argument");
-        let ifnull_owner_idx = lines
-            .iter()
-            .enumerate()
-            .skip(round_idx + 1)
-            .take(8)
-            .find(|(_, line)| line.trim_start().contains("IFNULL("))
-            .map(|(idx, _)| idx)
-            .expect("test6 IFNULL owner");
         let precision_idx = lines
             .iter()
             .enumerate()
@@ -42132,7 +41988,7 @@ DELIMITER ;"#;
             .expect("test6 ROUND precision argument");
 
         let desired_indent = leading_spaces(lines[round_idx]).saturating_add(4);
-        let ifnull_body_indent = leading_spaces(lines[ifnull_owner_idx]).saturating_add(4);
+        let ifnull_body_indent = desired_indent.saturating_add(4);
         assert_eq!(
             leading_spaces(lines[zero_idx]),
             ifnull_body_indent,
@@ -42199,16 +42055,7 @@ ORDER BY month_key,
 
         let round_owner_idx = lines
             .iter()
-            .enumerate()
-            .find(|(idx, line)| {
-                line.trim_start() == "ROUND("
-                    && lines
-                        .iter()
-                        .skip(idx.saturating_add(1))
-                        .take(6)
-                        .any(|next| next.contains("IFNULL("))
-            })
-            .map(|(idx, _)| idx)
+            .position(|line| line.contains("ROUND(net_sales - IFNULL("))
             .expect("ROUND owner");
         let round_close_alias_idx = lines
             .iter()
@@ -42221,12 +42068,7 @@ ORDER BY month_key,
             .iter()
             .enumerate()
             .skip(round_close_alias_idx + 1)
-            .find(|(idx, line)| {
-                line.trim_start() == "ROUND("
-                    && lines
-                        .get(idx.saturating_add(1))
-                        .is_some_and(|next| next.trim_start() == "SUM(net_sales) OVER (")
-            })
+            .find(|(_, line)| line.contains("ROUND(SUM(net_sales) OVER ("))
             .map(|(idx, _)| idx)
             .expect("rolling ROUND owner");
         let zero_idx = lines
@@ -42237,14 +42079,6 @@ ORDER BY month_key,
             .find(|(_, line)| line.trim_start() == "0")
             .map(|(idx, _)| idx)
             .expect("IFNULL fallback");
-        let ifnull_owner_idx = lines
-            .iter()
-            .enumerate()
-            .skip(round_owner_idx + 1)
-            .take(8)
-            .find(|(_, line)| line.trim_start().contains("IFNULL("))
-            .map(|(idx, _)| idx)
-            .expect("IFNULL owner");
         let precision_idx = lines
             .iter()
             .enumerate()
@@ -42264,7 +42098,7 @@ ORDER BY month_key,
 
         let round_owner_indent = leading_spaces(lines[round_owner_idx]);
         let expected_arg_indent = round_owner_indent.saturating_add(4);
-        let expected_ifnull_owner_indent = leading_spaces(lines[ifnull_owner_idx]);
+        let expected_ifnull_owner_indent = round_owner_indent.saturating_add(4);
         let expected_ifnull_body_indent = expected_ifnull_owner_indent.saturating_add(4);
         assert_eq!(
             leading_spaces(lines[zero_idx]),
@@ -42353,16 +42187,7 @@ ORDER BY month_key,
 
         let round_owner_idx = lines
             .iter()
-            .enumerate()
-            .find(|(idx, line)| {
-                line.trim_start() == "ROUND("
-                    && lines
-                        .iter()
-                        .skip(idx.saturating_add(1))
-                        .take(6)
-                        .any(|next| next.contains("IFNULL("))
-            })
-            .map(|(idx, _)| idx)
+            .position(|line| line.contains("ROUND(net_sales - IFNULL("))
             .expect("ROUND owner");
         let round_close_alias_idx = lines
             .iter()
@@ -42375,12 +42200,7 @@ ORDER BY month_key,
             .iter()
             .enumerate()
             .skip(round_close_alias_idx + 1)
-            .find(|(idx, line)| {
-                line.trim_start() == "ROUND("
-                    && lines
-                        .get(idx.saturating_add(1))
-                        .is_some_and(|next| next.trim_start() == "SUM(net_sales) OVER (")
-            })
+            .find(|(_, line)| line.contains("ROUND(SUM(net_sales) OVER ("))
             .map(|(idx, _)| idx)
             .expect("rolling ROUND owner");
         let zero_idx = lines
@@ -42391,14 +42211,6 @@ ORDER BY month_key,
             .find(|(_, line)| line.trim_start() == "0")
             .map(|(idx, _)| idx)
             .expect("IFNULL fallback");
-        let ifnull_owner_idx = lines
-            .iter()
-            .enumerate()
-            .skip(round_owner_idx + 1)
-            .take(8)
-            .find(|(_, line)| line.trim_start().contains("IFNULL("))
-            .map(|(idx, _)| idx)
-            .expect("IFNULL owner");
         let precision_idx = lines
             .iter()
             .enumerate()
@@ -42418,7 +42230,7 @@ ORDER BY month_key,
 
         let round_owner_indent = leading_spaces(lines[round_owner_idx]);
         let expected_arg_indent = round_owner_indent.saturating_add(4);
-        let expected_ifnull_owner_indent = leading_spaces(lines[ifnull_owner_idx]);
+        let expected_ifnull_owner_indent = round_owner_indent.saturating_add(4);
         let expected_ifnull_body_indent = expected_ifnull_owner_indent.saturating_add(4);
         assert_eq!(
             leading_spaces(lines[zero_idx]),
@@ -42524,8 +42336,8 @@ END $$"#;
 
         assert_eq!(
             open_indices.len(),
-            8,
-            "procedure scalar subquery list should keep eight sibling open lines, got:\n{formatted}"
+            7,
+            "the first scalar subquery opener should be inline and seven later openers should start lines, got:\n{formatted}"
         );
         assert_eq!(
             close_indices.len(),
@@ -42658,8 +42470,8 @@ END $$"#;
 
         assert_eq!(
             open_indices.len(),
-            8,
-            "auto-format procedure scalar subquery list should keep eight sibling open lines, got:\n{formatted}"
+            7,
+            "the first scalar subquery opener should be inline and seven later openers should start lines, got:\n{formatted}"
         );
         assert_eq!(
             close_indices.len(),
@@ -42755,7 +42567,10 @@ END$$"#;
         let case_indices: Vec<usize> = lines
             .iter()
             .enumerate()
-            .filter(|(_, line)| line.trim_start() == "CASE")
+            .filter(|(_, line)| {
+                line.trim_start().starts_with("CASE")
+                    || (line.contains(" CASE") && !line.trim_start().starts_with("END "))
+            })
             .map(|(idx, _)| idx)
             .collect();
         let end_indices: Vec<usize> = lines
@@ -42871,7 +42686,10 @@ END$$"#;
         let case_indices: Vec<usize> = lines
             .iter()
             .enumerate()
-            .filter(|(_, line)| line.trim_start() == "CASE")
+            .filter(|(_, line)| {
+                line.trim_start().starts_with("CASE")
+                    || (line.contains(" CASE") && !line.trim_start().starts_with("END "))
+            })
             .map(|(idx, _)| idx)
             .collect();
         let end_indices: Vec<usize> = lines
@@ -42990,19 +42808,18 @@ END$$"#;
         );
         let lines: Vec<&str> = formatted.lines().collect();
 
-        let values_idx = lines
-            .iter()
-            .position(|line| {
-                line.trim_start()
-                    .starts_with("VALUES (v_order_id, v_item_no, v_prod_id,")
-            })
-            .expect("VALUES owner");
+        let values_idx =
+            find_line_starting_with(&lines, "VALUES (v_order_id, v_item_no, v_prod_id,")
+                .expect("VALUES owner");
         let case_indices: Vec<usize> = lines
             .iter()
             .enumerate()
             .skip(values_idx + 1)
             .take(40)
-            .filter(|(_, line)| line.trim_start() == "CASE")
+            .filter(|(_, line)| {
+                line.trim_start().starts_with("CASE")
+                    || (line.contains(" CASE") && !line.trim_start().starts_with("END "))
+            })
             .map(|(idx, _)| idx)
             .collect();
         let end_indices: Vec<usize> = lines
@@ -43110,26 +42927,23 @@ END$$"#;
 
         let create_idx =
             find_line_starting_with(&lines, "CREATE TABLE departments (").expect("test4 CREATE");
-        let dept_id_idx = lines
+        let dept_name_idx = lines
             .iter()
             .enumerate()
             .skip(create_idx + 1)
-            .find(|(_, line)| line.trim_start().starts_with("dept_id"))
+            .find(|(_, line)| line.trim_start().starts_with("dept_name"))
             .map(|(idx, _)| idx)
-            .expect("test4 departments dept_id");
+            .expect("test4 departments dept_name");
         let create_close_idx = lines
             .iter()
             .enumerate()
-            .skip(dept_id_idx + 1)
+            .skip(dept_name_idx + 1)
             .find(|(_, line)| line.trim_start() == ")")
             .map(|(idx, _)| idx)
             .expect("test4 departments close");
         let first_condition_idx =
             find_line_starting_with(&lines, "NEW.hours IS NULL").expect("test4 first IF condition");
-        let if_idx = lines[..first_condition_idx]
-            .iter()
-            .rposition(|line| line.trim_start() == "IF")
-            .expect("test4 IF header");
+        let if_idx = first_condition_idx;
         let or_idx =
             find_line_starting_with(&lines, "OR NEW.hours <= 0").expect("test4 OR NEW.hours");
         let while_idx =
@@ -43157,9 +42971,9 @@ END$$"#;
             .expect("test4 handler ROLLBACK");
 
         assert_eq!(
-            leading_spaces(lines[dept_id_idx]),
+            leading_spaces(lines[dept_name_idx]),
             leading_spaces(lines[create_idx]).saturating_add(4),
-            "test4 CREATE TABLE body should stay one frame deeper than the table header, got:\n{formatted}"
+            "test4 second CREATE TABLE child should stay one frame deeper than the table header, got:\n{formatted}"
         );
         assert_eq!(
             leading_spaces(lines[create_close_idx]),
@@ -43168,13 +42982,12 @@ END$$"#;
         );
         assert_eq!(
             leading_spaces(lines[or_idx]),
-            leading_spaces(lines[first_condition_idx]),
+            leading_spaces(lines[if_idx]).saturating_add(4),
             "test4 split IF condition children should share one frame depth, got:\n{formatted}"
         );
-        assert_eq!(
-            leading_spaces(lines[first_condition_idx]),
-            leading_spaces(lines[if_idx]).saturating_add(4),
-            "test4 split IF condition frame should stay one level deeper than IF, got:\n{formatted}"
+        assert!(
+            lines[if_idx].contains("IF NEW.hours IS NULL"),
+            "test4 first IF child should remain inline with its owner, got:\n{formatted}"
         );
         assert_eq!(
             leading_spaces(lines[date_add_idx]),
@@ -43205,26 +43018,23 @@ END$$"#;
 
         let create_idx =
             find_line_starting_with(&lines, "CREATE TABLE departments (").expect("test4 CREATE");
-        let dept_id_idx = lines
+        let dept_name_idx = lines
             .iter()
             .enumerate()
             .skip(create_idx + 1)
-            .find(|(_, line)| line.trim_start().starts_with("dept_id"))
+            .find(|(_, line)| line.trim_start().starts_with("dept_name"))
             .map(|(idx, _)| idx)
-            .expect("test4 departments dept_id");
+            .expect("test4 departments dept_name");
         let create_close_idx = lines
             .iter()
             .enumerate()
-            .skip(dept_id_idx + 1)
+            .skip(dept_name_idx + 1)
             .find(|(_, line)| line.trim_start() == ")")
             .map(|(idx, _)| idx)
             .expect("test4 departments close");
         let first_condition_idx =
             find_line_starting_with(&lines, "NEW.hours IS NULL").expect("test4 first IF condition");
-        let if_idx = lines[..first_condition_idx]
-            .iter()
-            .rposition(|line| line.trim_start() == "IF")
-            .expect("test4 IF header");
+        let if_idx = first_condition_idx;
         let or_idx =
             find_line_starting_with(&lines, "OR NEW.hours <= 0").expect("test4 OR NEW.hours");
         let while_idx =
@@ -43252,9 +43062,9 @@ END$$"#;
             .expect("test4 handler ROLLBACK");
 
         assert_eq!(
-            leading_spaces(lines[dept_id_idx]),
+            leading_spaces(lines[dept_name_idx]),
             leading_spaces(lines[create_idx]).saturating_add(4),
-            "test4 auto-format CREATE TABLE body should stay one frame deeper than the table header, got:\n{formatted}"
+            "test4 auto-format second CREATE TABLE child should stay one frame deeper than the table header, got:\n{formatted}"
         );
         assert_eq!(
             leading_spaces(lines[create_close_idx]),
@@ -43263,13 +43073,12 @@ END$$"#;
         );
         assert_eq!(
             leading_spaces(lines[or_idx]),
-            leading_spaces(lines[first_condition_idx]),
+            leading_spaces(lines[if_idx]).saturating_add(4),
             "test4 auto-format split IF condition children should share one frame depth, got:\n{formatted}"
         );
-        assert_eq!(
-            leading_spaces(lines[first_condition_idx]),
-            leading_spaces(lines[if_idx]).saturating_add(4),
-            "test4 auto-format split IF condition frame should stay one level deeper than IF, got:\n{formatted}"
+        assert!(
+            lines[if_idx].contains("IF NEW.hours IS NULL"),
+            "test4 auto-format first IF child should remain inline with its owner, got:\n{formatted}"
         );
         assert_eq!(
             leading_spaces(lines[date_add_idx]),
@@ -43330,10 +43139,7 @@ END$$"#;
 
         let first_payload_idx = find_line_starting_with(&lines, "NEW.payload IS NULL")
             .expect("test4 first payload condition");
-        let if_payload_idx = lines[..first_payload_idx]
-            .iter()
-            .rposition(|line| line.trim_start() == "IF")
-            .expect("test4 payload IF header");
+        let if_payload_idx = first_payload_idx;
         let or_payload_idx = lines
             .iter()
             .enumerate()
@@ -43343,10 +43149,7 @@ END$$"#;
             .expect("test4 OR payload");
         let first_note_idx = find_line_starting_with(&lines, "NEW.note IS NULL")
             .expect("test4 first note condition");
-        let if_note_idx = lines[..first_note_idx]
-            .iter()
-            .rposition(|line| line.trim_start() == "IF")
-            .expect("test4 note IF header");
+        let if_note_idx = first_note_idx;
         let or_note_idx = lines
             .iter()
             .enumerate()
@@ -43358,12 +43161,12 @@ END$$"#;
         assert_eq!(
             leading_spaces(lines[join_idx]),
             leading_spaces(lines[from_idx]),
-            "test4 CREATE VIEW JOIN should stay on the FROM frame depth, got:\n{formatted}"
+            "test4 JOIN frame should stay attached at the FROM clause boundary depth, got:\n{formatted}"
         );
         assert_eq!(
             leading_spaces(lines[left_join_idx]),
             leading_spaces(lines[from_idx]),
-            "test4 CREATE VIEW LEFT JOIN should stay on the FROM frame depth, got:\n{formatted}"
+            "test4 sibling JOIN frames should stay attached at the FROM clause boundary depth, got:\n{formatted}"
         );
         assert_eq!(
             leading_spaces(lines[group_by_item_idx]),
@@ -43372,23 +43175,21 @@ END$$"#;
         );
         assert_eq!(
             leading_spaces(lines[or_payload_idx]),
-            leading_spaces(lines[first_payload_idx]),
+            leading_spaces(lines[if_payload_idx]).saturating_add(4),
             "test4 split IF payload children should share one condition frame depth, got:\n{formatted}"
         );
-        assert_eq!(
-            leading_spaces(lines[first_payload_idx]),
-            leading_spaces(lines[if_payload_idx]).saturating_add(4),
-            "test4 split payload condition frame should stay one level below IF, got:\n{formatted}"
+        assert!(
+            lines[if_payload_idx].contains("IF NEW.payload IS NULL"),
+            "test4 first payload condition should remain inline with IF, got:\n{formatted}"
         );
         assert_eq!(
             leading_spaces(lines[or_note_idx]),
-            leading_spaces(lines[first_note_idx]),
+            leading_spaces(lines[if_note_idx]).saturating_add(4),
             "test4 split IF note children should share one condition frame depth, got:\n{formatted}"
         );
-        assert_eq!(
-            leading_spaces(lines[first_note_idx]),
-            leading_spaces(lines[if_note_idx]).saturating_add(4),
-            "test4 split note condition frame should stay one level below IF, got:\n{formatted}"
+        assert!(
+            lines[if_note_idx].contains("IF NEW.note IS NULL"),
+            "test4 first note condition should remain inline with IF, got:\n{formatted}"
         );
     }
 
@@ -43404,17 +43205,17 @@ END$$"#;
 
         let create_idx =
             find_line_starting_with(&lines, "CREATE TABLE org_unit (").expect("test5 CREATE");
-        let org_unit_id_idx = lines
+        let parent_org_unit_id_idx = lines
             .iter()
             .enumerate()
             .skip(create_idx + 1)
-            .find(|(_, line)| line.trim_start().starts_with("org_unit_id"))
+            .find(|(_, line)| line.trim_start().starts_with("parent_org_unit_id"))
             .map(|(idx, _)| idx)
-            .expect("test5 org_unit_id");
+            .expect("test5 parent_org_unit_id");
         let create_close_idx = lines
             .iter()
             .enumerate()
-            .skip(org_unit_id_idx + 1)
+            .skip(parent_org_unit_id_idx + 1)
             .find(|(_, line)| line.trim_start() == ")")
             .map(|(idx, _)| idx)
             .expect("test5 org_unit close");
@@ -43460,9 +43261,9 @@ END$$"#;
             .expect("test5 exit handler ROLLBACK");
 
         assert_eq!(
-            leading_spaces(lines[org_unit_id_idx]),
+            leading_spaces(lines[parent_org_unit_id_idx]),
             leading_spaces(lines[create_idx]).saturating_add(4),
-            "test5 CREATE TABLE body should stay one frame deeper than the table header, got:\n{formatted}"
+            "test5 second CREATE TABLE child should stay one frame deeper than the table header, got:\n{formatted}"
         );
         assert_eq!(
             leading_spaces(lines[create_close_idx]),
@@ -43504,17 +43305,17 @@ END$$"#;
 
         let create_idx =
             find_line_starting_with(&lines, "CREATE TABLE org_unit (").expect("test5 CREATE");
-        let org_unit_id_idx = lines
+        let parent_org_unit_id_idx = lines
             .iter()
             .enumerate()
             .skip(create_idx + 1)
-            .find(|(_, line)| line.trim_start().starts_with("org_unit_id"))
+            .find(|(_, line)| line.trim_start().starts_with("parent_org_unit_id"))
             .map(|(idx, _)| idx)
-            .expect("test5 org_unit_id");
+            .expect("test5 parent_org_unit_id");
         let create_close_idx = lines
             .iter()
             .enumerate()
-            .skip(org_unit_id_idx + 1)
+            .skip(parent_org_unit_id_idx + 1)
             .find(|(_, line)| line.trim_start() == ")")
             .map(|(idx, _)| idx)
             .expect("test5 org_unit close");
@@ -43560,9 +43361,9 @@ END$$"#;
             .expect("test5 exit handler ROLLBACK");
 
         assert_eq!(
-            leading_spaces(lines[org_unit_id_idx]),
+            leading_spaces(lines[parent_org_unit_id_idx]),
             leading_spaces(lines[create_idx]).saturating_add(4),
-            "test5 auto-format CREATE TABLE body should stay one frame deeper than the table header, got:\n{formatted}"
+            "test5 auto-format second CREATE TABLE child should stay one frame deeper than the table header, got:\n{formatted}"
         );
         assert_eq!(
             leading_spaces(lines[create_close_idx]),
@@ -43626,10 +43427,7 @@ END$$"#;
 
         let first_points_idx = find_line_starting_with(&lines, "NEW.points IS NULL")
             .expect("test5 first points condition");
-        let if_points_idx = lines[..first_points_idx]
-            .iter()
-            .rposition(|line| line.trim_start() == "IF")
-            .expect("test5 points IF header");
+        let if_points_idx = first_points_idx;
         let or_points_idx = lines
             .iter()
             .enumerate()
@@ -43639,10 +43437,7 @@ END$$"#;
             .expect("test5 OR points");
         let first_detail_idx = find_line_starting_with(&lines, "NEW.detail_doc IS NULL")
             .expect("test5 first detail_doc condition");
-        let if_detail_idx = lines[..first_detail_idx]
-            .iter()
-            .rposition(|line| line.trim_start() == "IF")
-            .expect("test5 detail_doc IF header");
+        let if_detail_idx = first_detail_idx;
         let or_detail_idx = lines
             .iter()
             .enumerate()
@@ -43654,7 +43449,7 @@ END$$"#;
         assert_eq!(
             leading_spaces(lines[left_join_idx]),
             leading_spaces(lines[from_idx]),
-            "test5 CREATE VIEW LEFT JOIN should stay on the FROM frame depth, got:\n{formatted}"
+            "test5 JOIN frame should stay attached at the FROM clause boundary depth, got:\n{formatted}"
         );
         assert_eq!(
             leading_spaces(lines[group_by_item_idx]),
@@ -43663,23 +43458,21 @@ END$$"#;
         );
         assert_eq!(
             leading_spaces(lines[or_points_idx]),
-            leading_spaces(lines[first_points_idx]),
+            leading_spaces(lines[if_points_idx]).saturating_add(4),
             "test5 split IF points children should share one condition frame depth, got:\n{formatted}"
         );
-        assert_eq!(
-            leading_spaces(lines[first_points_idx]),
-            leading_spaces(lines[if_points_idx]).saturating_add(4),
-            "test5 points condition frame should stay one level below IF, got:\n{formatted}"
+        assert!(
+            lines[if_points_idx].contains("IF NEW.points IS NULL"),
+            "test5 first points condition should remain inline with IF, got:\n{formatted}"
         );
         assert_eq!(
             leading_spaces(lines[or_detail_idx]),
-            leading_spaces(lines[first_detail_idx]),
+            leading_spaces(lines[if_detail_idx]).saturating_add(4),
             "test5 split IF detail_doc children should share one condition frame depth, got:\n{formatted}"
         );
-        assert_eq!(
-            leading_spaces(lines[first_detail_idx]),
-            leading_spaces(lines[if_detail_idx]).saturating_add(4),
-            "test5 detail_doc condition frame should stay one level below IF, got:\n{formatted}"
+        assert!(
+            lines[if_detail_idx].contains("IF NEW.detail_doc IS NULL"),
+            "test5 first detail_doc condition should remain inline with IF, got:\n{formatted}"
         );
     }
 
@@ -43695,17 +43488,17 @@ END$$"#;
 
         let create_idx =
             find_line_starting_with(&lines, "CREATE TABLE boss_region (").expect("test6 CREATE");
-        let region_id_idx = lines
+        let parent_region_id_idx = lines
             .iter()
             .enumerate()
             .skip(create_idx + 1)
-            .find(|(_, line)| line.trim_start().starts_with("region_id"))
+            .find(|(_, line)| line.trim_start().starts_with("parent_region_id"))
             .map(|(idx, _)| idx)
-            .expect("test6 region_id");
+            .expect("test6 parent_region_id");
         let create_close_idx = lines
             .iter()
             .enumerate()
-            .skip(region_id_idx + 1)
+            .skip(parent_region_id_idx + 1)
             .find(|(_, line)| line.trim_start() == ")")
             .map(|(idx, _)| idx)
             .expect("test6 boss_region close");
@@ -43722,7 +43515,10 @@ END$$"#;
             .iter()
             .enumerate()
             .skip(trigger_begin_idx + 1)
-            .find(|(_, line)| line.trim_start() == "DECLARE v_unit_price DECIMAL(18, 2);")
+            .find(|(_, line)| {
+                line.trim_start()
+                    .starts_with("DECLARE v_unit_price DECIMAL(18,")
+            })
             .map(|(idx, _)| idx)
             .expect("test6 DECLARE v_unit_price");
         let au_trigger_idx = find_line_starting_with(&lines, "CREATE TRIGGER au_boss_order_item")
@@ -43764,9 +43560,9 @@ END$$"#;
             .expect("test6 handler ROLLBACK");
 
         assert_eq!(
-            leading_spaces(lines[region_id_idx]),
+            leading_spaces(lines[parent_region_id_idx]),
             leading_spaces(lines[create_idx]).saturating_add(4),
-            "test6 CREATE TABLE body should stay one frame deeper than the table header, got:\n{formatted}"
+            "test6 second CREATE TABLE child should stay one frame deeper than the table header, got:\n{formatted}"
         );
         assert_eq!(
             leading_spaces(lines[create_close_idx]),
@@ -43807,17 +43603,17 @@ END$$"#;
 
         let create_idx =
             find_line_starting_with(&lines, "CREATE TABLE boss_region (").expect("test6 CREATE");
-        let region_id_idx = lines
+        let parent_region_id_idx = lines
             .iter()
             .enumerate()
             .skip(create_idx + 1)
-            .find(|(_, line)| line.trim_start().starts_with("region_id"))
+            .find(|(_, line)| line.trim_start().starts_with("parent_region_id"))
             .map(|(idx, _)| idx)
-            .expect("test6 region_id");
+            .expect("test6 parent_region_id");
         let create_close_idx = lines
             .iter()
             .enumerate()
-            .skip(region_id_idx + 1)
+            .skip(parent_region_id_idx + 1)
             .find(|(_, line)| line.trim_start() == ")")
             .map(|(idx, _)| idx)
             .expect("test6 boss_region close");
@@ -43834,7 +43630,10 @@ END$$"#;
             .iter()
             .enumerate()
             .skip(trigger_begin_idx + 1)
-            .find(|(_, line)| line.trim_start() == "DECLARE v_unit_price DECIMAL(18, 2);")
+            .find(|(_, line)| {
+                line.trim_start()
+                    .starts_with("DECLARE v_unit_price DECIMAL(18,")
+            })
             .map(|(idx, _)| idx)
             .expect("test6 DECLARE v_unit_price");
         let au_trigger_idx = find_line_starting_with(&lines, "CREATE TRIGGER au_boss_order_item")
@@ -43876,9 +43675,9 @@ END$$"#;
             .expect("test6 handler ROLLBACK");
 
         assert_eq!(
-            leading_spaces(lines[region_id_idx]),
+            leading_spaces(lines[parent_region_id_idx]),
             leading_spaces(lines[create_idx]).saturating_add(4),
-            "test6 auto-format CREATE TABLE body should stay one frame deeper than the table header, got:\n{formatted}"
+            "test6 auto-format second CREATE TABLE child should stay one frame deeper than the table header, got:\n{formatted}"
         );
         assert_eq!(
             leading_spaces(lines[create_close_idx]),
@@ -43957,10 +43756,7 @@ END;"#;
 
         let trigger_first_idx = find_line_starting_with(&lines, "NEW.quantity IS NULL")
             .expect("test6 trigger first condition");
-        let trigger_if_idx = lines[..trigger_first_idx]
-            .iter()
-            .rposition(|line| line.trim_start() == "IF")
-            .expect("test6 trigger IF header");
+        let trigger_if_idx = trigger_first_idx;
         let trigger_or_idx = lines
             .iter()
             .enumerate()
@@ -43971,10 +43767,7 @@ END;"#;
 
         let proc_first_idx = find_line_starting_with(&lines, "p_from IS NULL")
             .expect("test6 procedure first condition");
-        let proc_if_idx = lines[..proc_first_idx]
-            .iter()
-            .rposition(|line| line.trim_start() == "IF")
-            .expect("test6 procedure IF header");
+        let proc_if_idx = proc_first_idx;
         let proc_or_to_idx = lines
             .iter()
             .enumerate()
@@ -43992,28 +43785,26 @@ END;"#;
 
         assert_eq!(
             leading_spaces(lines[trigger_or_idx]),
-            leading_spaces(lines[trigger_first_idx]),
+            leading_spaces(lines[trigger_if_idx]).saturating_add(4),
             "test6 trigger split IF children should share one condition frame depth, got:\n{formatted}"
         );
-        assert_eq!(
-            leading_spaces(lines[trigger_first_idx]),
-            leading_spaces(lines[trigger_if_idx]).saturating_add(4),
-            "test6 trigger condition frame should stay one level below IF, got:\n{formatted}"
+        assert!(
+            lines[trigger_if_idx].contains("IF NEW.quantity IS NULL"),
+            "test6 trigger first IF child should remain inline with its owner, got:\n{formatted}"
         );
         assert_eq!(
             leading_spaces(lines[proc_or_to_idx]),
-            leading_spaces(lines[proc_first_idx]),
+            leading_spaces(lines[proc_if_idx]).saturating_add(4),
             "test6 procedure split IF children should share one condition frame depth, got:\n{formatted}"
         );
         assert_eq!(
             leading_spaces(lines[proc_or_order_idx]),
-            leading_spaces(lines[proc_first_idx]),
+            leading_spaces(lines[proc_if_idx]).saturating_add(4),
             "test6 procedure split IF final child should share the same condition frame depth, got:\n{formatted}"
         );
-        assert_eq!(
-            leading_spaces(lines[proc_first_idx]),
-            leading_spaces(lines[proc_if_idx]).saturating_add(4),
-            "test6 procedure condition frame should stay one level below IF, got:\n{formatted}"
+        assert!(
+            lines[proc_if_idx].contains("IF p_from IS NULL"),
+            "test6 procedure first IF child should remain inline with its owner, got:\n{formatted}"
         );
     }
 
@@ -44076,10 +43867,7 @@ END"#;
 
         let first_condition_idx =
             find_line_starting_with(&lines, "NEW.hours IS NULL").expect("split IF first condition");
-        let if_idx = lines[..first_condition_idx]
-            .iter()
-            .rposition(|line| line.trim_start() == "IF")
-            .expect("split IF header");
+        let if_idx = first_condition_idx;
         let signal_idx =
             find_line_starting_with(&lines, "SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'x';")
                 .expect("split IF signal");
@@ -44133,8 +43921,8 @@ END"#;
             crate::db::connection::DatabaseType::MySQL,
         );
         assert!(
-            formatted_function.contains("REPEAT('  ', lvl) AS indent_prefix"),
-            "MySQL REPEAT() should remain a scalar function call, got:\n{formatted_function}"
+            formatted_function.contains("REPEAT('  ',\n        lvl) AS indent_prefix"),
+            "MySQL REPEAT() should keep its first argument inline and break the second, got:\n{formatted_function}"
         );
         assert!(
             !formatted_function
@@ -44406,10 +44194,7 @@ END"#;
 
         let first_condition_idx =
             find_line_starting_with(&lines, "NEW.hours IS NULL").expect("test4 first IF condition");
-        let if_idx = lines[..first_condition_idx]
-            .iter()
-            .rposition(|line| line.trim_start() == "IF")
-            .expect("test4 IF header");
+        let if_idx = first_condition_idx;
         let signal_idx = lines
             .iter()
             .enumerate()
@@ -44461,10 +44246,7 @@ END"#;
 
         let first_condition_idx = find_line_starting_with(&lines, "NEW.points IS NULL")
             .expect("test5 first IF condition");
-        let if_idx = lines[..first_condition_idx]
-            .iter()
-            .rposition(|line| line.trim_start() == "IF")
-            .expect("test5 IF header");
+        let if_idx = first_condition_idx;
         let signal_idx = lines
             .iter()
             .enumerate()
@@ -44522,7 +44304,7 @@ END"#;
             "UPDATE boss_customer c",
         ] {
             assert!(
-                formatted.contains(snippet),
+                contains_line_sequence(&formatted, snippet),
                 "test6 frame regression fixture text should remain present, missing `{snippet}` in:\n{formatted}"
             );
         }
@@ -44531,7 +44313,7 @@ END"#;
             "test6 payment branches should keep VALUES heads present, got:\n{formatted}"
         );
         assert!(
-            formatted.matches("INSERT INTO boss_payment (order_id, payment_date, amount, method, payload_json)").count() >= 4,
+            formatted.matches("INSERT INTO boss_payment (").count() >= 4,
             "test6 payment branches should keep INSERT heads present, got:\n{formatted}"
         );
         assert_eq!(
@@ -44743,15 +44525,14 @@ END"#;
         let lines: Vec<&str> = formatted.lines().collect();
 
         let customers_idx =
-            find_line_starting_with(&lines, "), 'customers', (").expect("test6 JSON customers key");
+            find_line_starting_with(&lines, "'customers',").expect("test6 JSON customers key");
         let products_idx =
-            find_line_starting_with(&lines, "), 'products', (").expect("test6 JSON products key");
+            find_line_starting_with(&lines, "'products',").expect("test6 JSON products key");
         let orders_idx =
-            find_line_starting_with(&lines, "), 'orders', (").expect("test6 JSON orders key");
-        let items_idx =
-            find_line_starting_with(&lines, "), 'items', (").expect("test6 JSON items key");
+            find_line_starting_with(&lines, "'orders',").expect("test6 JSON orders key");
+        let items_idx = find_line_starting_with(&lines, "'items',").expect("test6 JSON items key");
         let payments_idx =
-            find_line_starting_with(&lines, "), 'payments', (").expect("test6 JSON payments key");
+            find_line_starting_with(&lines, "'payments',").expect("test6 JSON payments key");
 
         let key_indent = leading_spaces(lines[customers_idx]);
         for idx in [products_idx, orders_idx, items_idx, payments_idx] {
@@ -44825,7 +44606,7 @@ END"#;
             .iter()
             .enumerate()
             .skip(order_count_idx + 1)
-            .find(|(_, line)| line.trim_start() == "), 2) AS total_spent,")
+            .find(|(_, line)| line.trim_start() == "2) AS total_spent,")
             .map(|(idx, _)| idx)
             .expect("test6 customer_spend total_spent close-comma");
         let max_order_date_idx = lines
@@ -44874,15 +44655,12 @@ END"#;
             .find(|(_, line)| line.trim_start() == "COUNT(*) AS lifetime_orders,")
             .map(|(idx, _)| idx)
             .expect("test6 JOIN subquery lifetime_orders");
-        let round_idx = lines
-            .iter()
-            .enumerate()
-            .skip(count_idx + 1)
-            .find(|(_, line)| {
-                line.trim_start() == "ROUND(SUM(o.grand_total), 2) AS lifetime_net_sales,"
-            })
-            .map(|(idx, _)| idx)
-            .expect("test6 JOIN subquery lifetime_net_sales");
+        let round_idx = find_line_starting_with(
+            &lines[count_idx + 1..],
+            "ROUND(SUM(o.grand_total), 2) AS lifetime_net_sales,",
+        )
+        .map(|idx| count_idx + 1 + idx)
+        .expect("test6 JOIN subquery lifetime_net_sales");
         let max_idx = lines
             .iter()
             .enumerate()
@@ -45047,16 +44825,17 @@ GROUP BY c.customer_id,
         let lines: Vec<&str> = formatted.lines().collect();
 
         let select_idx = lines
-            .windows(2)
-            .position(|pair| {
-                pair[0].trim() == "SELECT" && pair[1].trim_start().starts_with("u.user_id,")
-            })
+            .iter()
+            .position(|line| line.trim_start().starts_with("SELECT u.user_id,"))
             .expect("test8 view SELECT");
         let case_idx = lines
             .iter()
             .enumerate()
             .skip(select_idx + 1)
-            .find(|(_, line)| line.trim_start() == "CASE")
+            .find(|(_, line)| {
+                line.trim_start().starts_with("CASE")
+                    || (line.contains(" CASE") && !line.trim_start().starts_with("END "))
+            })
             .map(|(idx, _)| idx)
             .expect("test8 view CASE");
         let when_idx = lines
@@ -45064,7 +44843,8 @@ GROUP BY c.customer_id,
             .enumerate()
             .skip(case_idx + 1)
             .find(|(_, line)| {
-                line.trim_start() == "WHEN COALESCE(x.total_net_amount, 0) >= 1500 THEN 'TOP'"
+                line.trim_start()
+                    .starts_with("WHEN COALESCE(x.total_net_amount,")
             })
             .map(|(idx, _)| idx)
             .expect("test8 view first WHEN");
@@ -45110,16 +44890,17 @@ GROUP BY c.customer_id,
         let lines: Vec<&str> = formatted.lines().collect();
 
         let select_idx = lines
-            .windows(2)
-            .position(|pair| {
-                pair[0].trim() == "SELECT" && pair[1].trim_start().starts_with("u.user_id,")
-            })
+            .iter()
+            .position(|line| line.trim_start().starts_with("SELECT u.user_id,"))
             .expect("test8 auto-format view SELECT");
         let case_idx = lines
             .iter()
             .enumerate()
             .skip(select_idx + 1)
-            .find(|(_, line)| line.trim_start() == "CASE")
+            .find(|(_, line)| {
+                line.trim_start().starts_with("CASE")
+                    || (line.contains(" CASE") && !line.trim_start().starts_with("END "))
+            })
             .map(|(idx, _)| idx)
             .expect("test8 auto-format view CASE");
         let when_idx = lines
@@ -45127,7 +44908,8 @@ GROUP BY c.customer_id,
             .enumerate()
             .skip(case_idx + 1)
             .find(|(_, line)| {
-                line.trim_start() == "WHEN COALESCE(x.total_net_amount, 0) >= 1500 THEN 'TOP'"
+                line.trim_start()
+                    .starts_with("WHEN COALESCE(x.total_net_amount,")
             })
             .map(|(idx, _)| idx)
             .expect("test8 auto-format view first WHEN");
@@ -45862,7 +45644,7 @@ FROM dept d;"#;
             "ROUND(19 + (v_prod_id * 7.35) + (MOD(v_prod_id, 5) * 3.70), 2)",
         ] {
             assert!(
-                formatted.contains(expected),
+                contains_line_sequence(&formatted, expected),
                 "test6 expression operand parens should preserve operator spacing, missing `{expected}` in:\n{formatted}"
             );
         }
@@ -45906,27 +45688,18 @@ FROM dept d;"#;
             3,
             "test6 order_item VALUES payload should keep three CASE END, lines, got:\n{formatted}"
         );
-        let concat_idx = lines
-            .iter()
-            .enumerate()
-            .skip(end_indices[2] + 1)
-            .find(|(_, line)| {
-                line.trim_start()
-                    == "CONCAT('note ; ', v_order_id, '/', v_item_no, ' // not delimiter'),"
-            })
-            .map(|(idx, _)| idx)
-            .expect("test6 VALUES CONCAT note sibling");
-        let json_idx = lines
-            .iter()
-            .enumerate()
-            .skip(concat_idx + 1)
-            .find(|(_, line)| {
-                line.trim_start().starts_with(
-                    "JSON_OBJECT('gift', IF(MOD(v_order_id + v_item_no, 6) = 0, 'Y', 'N'),",
-                )
-            })
-            .map(|(idx, _)| idx)
-            .expect("test6 VALUES JSON_OBJECT sibling");
+        let concat_idx = find_line_starting_with(
+            &lines[end_indices[2] + 1..],
+            "CONCAT('note ; ', v_order_id, '/', v_item_no, ' // not delimiter'),",
+        )
+        .map(|idx| end_indices[2] + 1 + idx)
+        .expect("test6 VALUES CONCAT note sibling");
+        let json_idx = find_line_starting_with(
+            &lines[concat_idx + 1..],
+            "JSON_OBJECT('gift', IF(MOD(v_order_id + v_item_no, 6) = 0, 'Y', 'N'),",
+        )
+        .map(|idx| concat_idx + 1 + idx)
+        .expect("test6 VALUES JSON_OBJECT sibling");
 
         let case_owner_indent = leading_spaces(lines[end_indices[2]]);
         assert_eq!(

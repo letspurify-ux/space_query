@@ -115,12 +115,12 @@ GROUP (ORDER BY name) FROM visual_t;"#;
         "SELECT dept_id, LISTAGG(name, ',') WITHIN GROUP (ORDER BY name) OVER (PARTITION BY dept_id) AS names FROM visual_t;",
         DatabaseType::Oracle,
     );
-    let within = line_starting_with(&analytic, "LISTAGG");
+    let listagg = line_starting_with(&analytic, "LISTAGG");
     let partition = line_starting_with(&analytic, "PARTITION BY dept_id");
     let close = line_starting_with(&analytic, ") AS names");
-    assert!(within.contains("WITHIN GROUP"), "{analytic}");
-    assert_eq!(indent(partition), indent(within) + 4, "{analytic}");
-    assert_eq!(indent(close), indent(within), "{analytic}");
+    assert!(analytic.contains("WITHIN GROUP"), "{analytic}");
+    assert_eq!(indent(partition), indent(listagg) + 4, "{analytic}");
+    assert_eq!(indent(close), indent(listagg), "{analytic}");
 }
 
 #[test]
@@ -165,7 +165,7 @@ fn visual_mysql_profiles_distinguish_repeat_function_from_repeat_loop() {
     for db_type in [DatabaseType::MySQL, DatabaseType::MariaDB] {
         let function = format_stable("SELECT REPEAT('ab', 3) AS repeated_value;", db_type);
         assert!(
-            function.contains("REPEAT('ab', 3)"),
+            function.contains("REPEAT('ab',\n        3)"),
             "{db_type:?}:\n{function}"
         );
         assert!(
@@ -208,12 +208,8 @@ END;"#;
     let lines: Vec<&str> = formatted.lines().collect();
     let if_idx = lines
         .iter()
-        .position(|line| line.trim() == "IF")
+        .position(|line| line.trim_start().starts_with("IF "))
         .unwrap_or_else(|| panic!("IF header:\n{formatted}"));
-    let first_condition_idx = lines
-        .iter()
-        .position(|line| line.trim_start().starts_with("l_mode = 'STRICT'"))
-        .unwrap_or_else(|| panic!("IF first condition:\n{formatted}"));
     let and_idx = lines
         .iter()
         .position(|line| line.trim_start().starts_with("AND l_count > 0 THEN"))
@@ -234,13 +230,8 @@ END;"#;
         .unwrap_or_else(|| panic!("nested IF body statement:\n{formatted}"));
 
     assert_eq!(
-        indent(lines[first_condition_idx]),
-        indent(lines[if_idx]) + 4,
-        "{formatted}"
-    );
-    assert_eq!(
         indent(lines[and_idx]),
-        indent(lines[first_condition_idx]),
+        indent(lines[if_idx]) + 4,
         "{formatted}"
     );
     assert_eq!(
@@ -352,17 +343,17 @@ FROM visual_employee;"#,
     let lines: Vec<&str> = formatted.lines().collect();
     let order_index = lines
         .iter()
-        .position(|line| line.trim() == "ORDER BY")
+        .position(|line| line.trim_start().starts_with("ORDER BY CASE"))
         .unwrap_or_else(|| panic!("WITHIN GROUP ORDER BY:\n{formatted}"));
     let case = lines
         .iter()
-        .skip(order_index + 1)
-        .find(|line| line.trim() == "CASE")
+        .skip(order_index)
+        .find(|line| line.trim_start().starts_with("ORDER BY CASE"))
         .copied()
         .unwrap_or_else(|| panic!("ORDER BY CASE:\n{formatted}"));
     let employee_id = line_starting_with(&formatted, "employee_id");
-    assert_eq!(indent(case), indent(lines[order_index]) + 4, "{formatted}");
-    assert_eq!(indent(employee_id), indent(case), "{formatted}");
+    assert_eq!(indent(case), indent(lines[order_index]), "{formatted}");
+    assert_eq!(indent(employee_id), indent(case) + 4, "{formatted}");
 }
 
 #[test]
@@ -651,7 +642,7 @@ PIVOT (
     let pivot_comment = line_starting_with(&pivot, "/* aggregate */");
     let pivot_sum = line_starting_with(&pivot, "SUM (amount)");
     let pivot_for = line_starting_with(&pivot, "FOR category IN");
-    assert_eq!(indent(pivot_comment), indent(pivot_owner) + 4, "{pivot}");
+    assert_eq!(indent(pivot_comment), indent(pivot_owner) + 8, "{pivot}");
     assert_eq!(indent(pivot_sum), indent(pivot_comment), "{pivot}");
     assert_eq!(indent(pivot_for), indent(pivot_comment), "{pivot}");
 
@@ -737,22 +728,22 @@ SELECT id, dept_id, salary FROM visual_emp;"#,
     );
     let when_lines: Vec<&str> = formatted
         .lines()
-        .filter(|line| line.trim() == "WHEN")
+        .filter(|line| line.trim_start().starts_with("WHEN "))
         .collect();
-    let condition_lines: Vec<&str> = formatted
+    let and_lines: Vec<&str> = formatted
         .lines()
-        .filter(|line| line.trim_start().starts_with("dept_id = 10"))
+        .filter(|line| line.trim_start().starts_with("AND salary"))
         .collect();
     let into_lines: Vec<&str> = formatted
         .lines()
         .filter(|line| line.trim_start().starts_with("INTO visual_"))
         .collect();
     assert_eq!(when_lines.len(), 2, "{formatted}");
-    assert_eq!(condition_lines.len(), 2, "{formatted}");
+    assert_eq!(and_lines.len(), 2, "{formatted}");
     assert_eq!(into_lines.len(), 2, "{formatted}");
     assert_eq!(indent(when_lines[0]), indent(when_lines[1]), "{formatted}");
     assert_eq!(
-        indent(condition_lines[0]),
+        indent(and_lines[0]),
         indent(when_lines[0]) + 4,
         "{formatted}"
     );
@@ -791,13 +782,17 @@ SET e.comm = (
 
     let select = formatted
         .lines()
-        .find(|line| line.trim() == "SELECT")
+        .find(|line| line.trim_start().starts_with("SELECT "))
         .unwrap_or_else(|| panic!("SELECT owner:\n{formatted}"));
-    let select_case = formatted
+    let first_when = formatted
         .lines()
-        .find(|line| line.trim() == "CASE" && indent(line) > indent(select))
-        .unwrap_or_else(|| panic!("SELECT CASE item:\n{formatted}"));
-    assert_eq!(indent(select_case), indent(select) + 4, "{formatted}");
+        .find(|line| line.trim_start().starts_with("WHEN AVG"))
+        .unwrap_or_else(|| panic!("SELECT CASE first branch:\n{formatted}"));
+    assert!(
+        select.trim_start().starts_with("SELECT CASE"),
+        "{formatted}"
+    );
+    assert_eq!(indent(first_when), indent(select) + 8, "{formatted}");
 }
 
 #[test]
@@ -928,7 +923,7 @@ END;"#,
         .filter(|line| line.trim() == "END,")
         .collect();
     let v_name = line_starting_with(&formatted, "v_name,");
-    let round = line_starting_with(&formatted, "ROUND (v_amount, 2),");
+    let round = line_starting_with(&formatted, "ROUND (v_amount,");
     let v_note = line_starting_with(&formatted, "v_note;");
 
     assert_eq!(case_lines.len(), 2, "{formatted}");
@@ -958,14 +953,16 @@ FROM visual_emp;"#,
     let insert_all = line_starting_with(&formatted, "INSERT ALL");
     let when = formatted
         .lines()
-        .find(|line| line.trim() == "WHEN")
+        .find(|line| line.trim_start().starts_with("WHEN "))
         .expect("conditional INSERT WHEN header");
-    let first_condition = line_starting_with(&formatted, "dept_id = 30");
     let and = line_starting_with(&formatted, "AND salary");
     let select = line_starting_with(&formatted, "SELECT id");
     let from = line_starting_with(&formatted, "FROM visual_emp");
-    assert_eq!(indent(first_condition), indent(when) + 4, "{formatted}");
-    assert_eq!(indent(and), indent(first_condition), "{formatted}");
+    assert!(
+        when.trim_start().starts_with("WHEN dept_id = 30"),
+        "{formatted}"
+    );
+    assert_eq!(indent(and), indent(when) + 4, "{formatted}");
     assert_eq!(indent(select), indent(insert_all), "{formatted}");
     assert_eq!(indent(from), indent(insert_all), "{formatted}");
 }
@@ -1068,6 +1065,7 @@ END;"#,
             .unwrap_or_else(|| panic!("missing `{text}` after cursor FOR:\n{formatted}"))
     };
     let loop_header = lines[header_idx];
+    let query_select = line_after("SELECT id");
     let for_update = line_after("FOR UPDATE OF salary,");
     let loop_open = line_after(") LOOP");
     let body_begin = line_after("BEGIN");
@@ -1075,8 +1073,8 @@ END;"#,
     let body_end = line_after("END;");
     let loop_end = line_after("END LOOP;");
 
-    assert_eq!(indent(for_update), indent(loop_header) + 4, "{formatted}");
-    assert_eq!(indent(loop_open), indent(loop_header), "{formatted}");
+    assert_eq!(indent(for_update), indent(query_select), "{formatted}");
+    assert_eq!(indent(loop_open), indent(loop_header) + 4, "{formatted}");
     assert_eq!(indent(body_begin), indent(loop_header) + 4, "{formatted}");
     assert_eq!(indent(body), indent(body_begin) + 4, "{formatted}");
     assert_eq!(indent(body_end), indent(body_begin), "{formatted}");
@@ -1099,9 +1097,9 @@ MODEL
         DatabaseType::Oracle,
     );
 
-    let first_rule = line_starting_with(&formatted, "forecast [ ANY, ANY ] =");
+    let rules_owner = line_starting_with(&formatted, "RULES SEQUENTIAL ORDER (forecast");
     let second_rule = line_starting_with(&formatted, "adjusted [ ANY, ANY ] =");
-    assert_eq!(indent(second_rule), indent(first_rule), "{formatted}");
+    assert_eq!(indent(second_rule), indent(rules_owner) + 4, "{formatted}");
     assert!(!formatted.contains("END, adjusted"), "{formatted}");
     assert!(!formatted.contains("CV (),\n"), "{formatted}");
 }
@@ -1141,15 +1139,17 @@ END;"#,
 
     let if_line = formatted
         .lines()
-        .find(|line| line.trim() == "IF")
+        .find(|line| line.trim_start().starts_with("IF "))
         .expect("procedure IF header");
-    let first_condition = line_starting_with(&formatted, "v_orders_cnt > 0");
     let and_line = line_starting_with(&formatted, "AND (v_top_category IS NULL");
     let or_line = line_starting_with(&formatted, "OR v_top_category = '') THEN");
     let body = line_starting_with(&formatted, "SET v_message = 'missing category';");
 
-    assert_eq!(indent(first_condition), indent(if_line) + 4, "{formatted}");
-    assert_eq!(indent(and_line), indent(first_condition), "{formatted}");
+    assert!(
+        if_line.trim_start().starts_with("IF v_orders_cnt > 0"),
+        "{formatted}"
+    );
+    assert_eq!(indent(and_line), indent(if_line) + 4, "{formatted}");
     assert_eq!(indent(or_line), indent(and_line) + 4, "{formatted}");
     assert_eq!(indent(body), indent(and_line), "{formatted}");
 }
@@ -1169,7 +1169,7 @@ MODEL
 
     assert!(
         formatted.contains(
-            "total_amt [ FOR month_no FROM 1 TO 12 INCREMENT 1 ] = NVL (total_amt [ CV (month_no) ], 0)"
+            "total_amt [ FOR month_no FROM 1 TO 12 INCREMENT 1 ] = NVL (total_amt [ CV (month_no) ],\n            0)"
         ),
         "{formatted}"
     );
@@ -1314,8 +1314,8 @@ fn visual_oracle_splits_merge_insert_and_values_clauses() {
         DatabaseType::Oracle,
     );
 
-    let insert = line_starting_with(&formatted, "INSERT (id, emp_name, created_at)");
-    let values = line_starting_with(&formatted, "VALUES (s.id, s.emp_name, SYSTIMESTAMP);");
+    let insert = line_starting_with(&formatted, "INSERT (id,");
+    let values = line_starting_with(&formatted, "VALUES (s.id,");
     assert_eq!(indent(values), indent(insert), "{formatted}");
     assert!(!insert.contains("VALUES"), "{formatted}");
 }
@@ -1346,11 +1346,12 @@ fn visual_oracle_expands_alter_table_split_partition_destination_list() {
         DatabaseType::Oracle,
     );
     let expected = r#"ALTER TABLE orders SPLIT PARTITION orders_2024
-INTO (
-        PARTITION orders_2024_h1
-        VALUES LESS THAN (TO_DATE ('2024-07-01', 'YYYY-MM-DD')),
+INTO (PARTITION orders_2024_h1
+        VALUES LESS THAN (TO_DATE ('2024-07-01',
+                    'YYYY-MM-DD')),
         PARTITION orders_2024_h2
-        VALUES LESS THAN (TO_DATE ('2025-01-01', 'YYYY-MM-DD'))
+        VALUES LESS THAN (TO_DATE ('2025-01-01',
+                    'YYYY-MM-DD'))
     );"#;
 
     assert_eq!(formatted, expected);
@@ -1385,32 +1386,30 @@ END visual_cc;"#,
         .lines()
         .filter(|line| line.trim() == "$END")
         .collect();
-    let enabled = line_starting_with(&formatted, "AUDIT ('cc', 'enabled')");
+    let audit_lines: Vec<&str> = formatted
+        .lines()
+        .filter(|line| line.trim_start().starts_with("AUDIT ('cc',"))
+        .collect();
     let error_identifier = line_starting_with(&formatted, "SELECT $ERROR");
-    let outer_tail = line_starting_with(&formatted, "AUDIT ('cc', 'outer-tail')");
-    let nested_enabled = line_starting_with(&formatted, "AUDIT ('cc', 'nested-enabled')");
-    let nested_disabled = line_starting_with(&formatted, "AUDIT ('cc', 'nested-disabled')");
-    let after_inner = line_starting_with(&formatted, "AUDIT ('cc', 'after-inner')");
-    let disabled = line_starting_with(&formatted, "AUDIT ('cc', 'disabled')");
-    let done = line_starting_with(&formatted, "AUDIT ('cc', 'done')");
 
     assert_eq!(if_directives.len(), 2, "{formatted}");
     assert_eq!(else_directives.len(), 2, "{formatted}");
     assert_eq!(end_directives.len(), 2, "{formatted}");
+    assert_eq!(audit_lines.len(), 7, "{formatted}");
     assert_eq!(indent(if_directives[0]), 4, "{formatted}");
     assert_eq!(indent(if_directives[1]), 8, "{formatted}");
     assert_eq!(indent(else_directives[0]), 8, "{formatted}");
     assert_eq!(indent(end_directives[0]), 8, "{formatted}");
     assert_eq!(indent(else_directives[1]), 4, "{formatted}");
     assert_eq!(indent(end_directives[1]), 4, "{formatted}");
-    assert_eq!(indent(enabled), 8, "{formatted}");
+    assert_eq!(indent(audit_lines[0]), 8, "{formatted}");
     assert_eq!(error_identifier.trim(), "SELECT $ERROR", "{formatted}");
-    assert_eq!(indent(outer_tail), 8, "{formatted}");
-    assert_eq!(indent(nested_enabled), 12, "{formatted}");
-    assert_eq!(indent(nested_disabled), 12, "{formatted}");
-    assert_eq!(indent(after_inner), 8, "{formatted}");
-    assert_eq!(indent(disabled), 8, "{formatted}");
-    assert_eq!(indent(done), 4, "{formatted}");
+    assert_eq!(indent(audit_lines[1]), 8, "{formatted}");
+    assert_eq!(indent(audit_lines[2]), 12, "{formatted}");
+    assert_eq!(indent(audit_lines[3]), 12, "{formatted}");
+    assert_eq!(indent(audit_lines[4]), 8, "{formatted}");
+    assert_eq!(indent(audit_lines[5]), 8, "{formatted}");
+    assert_eq!(indent(audit_lines[6]), 4, "{formatted}");
 
     let identifier = format_stable(
         "SELECT $IF AS if_col, $THEN AS then_col FROM dual;",
@@ -1462,11 +1461,11 @@ FROM JSON_TABLE (
     let lines: Vec<&str> = formatted.lines().collect();
     let columns: Vec<&str> = formatted
         .lines()
-        .filter(|line| line.trim() == "COLUMNS")
+        .filter(|line| line.trim_start().starts_with("COLUMNS "))
         .collect();
     let emp_id_lines: Vec<&str> = formatted
         .lines()
-        .filter(|line| line.trim_start().starts_with("emp_id NUMBER PATH"))
+        .filter(|line| line.contains("emp_id NUMBER PATH"))
         .collect();
     let emp_name_lines: Vec<&str> = formatted
         .lines()
@@ -1490,34 +1489,30 @@ FROM JSON_TABLE (
         .find(|line| line.trim() == ")")
         .expect("standalone XMLTYPE close");
 
-    assert_eq!(xml_owner.trim(), "FROM XMLTABLE (");
-    assert_eq!(passing.trim(), "PASSING XMLTYPE (");
-    assert_eq!(json_owner.trim(), "FROM JSON_TABLE (");
+    assert!(xml_owner.trim().starts_with("FROM XMLTABLE ('/rows/row'"));
+    assert!(passing.trim().starts_with("PASSING XMLTYPE ('<rows>"));
+    assert!(json_owner.trim().starts_with("FROM JSON_TABLE ('{"));
     assert!(indent(passing) > indent(xml_owner), "{formatted}");
     assert_eq!(indent(xmltype_close), indent(passing), "{formatted}");
     assert!(indent(columns[0]) > indent(xml_owner), "{formatted}");
     assert!(indent(columns[1]) > indent(json_owner), "{formatted}");
-    assert_eq!(
-        indent(emp_id_lines[0]),
-        indent(columns[0]) + 4,
-        "{formatted}"
-    );
+    assert_eq!(emp_id_lines[0], columns[0], "{formatted}");
     assert_eq!(
         indent(emp_name_lines[0]),
         indent(columns[0]) + 4,
         "{formatted}"
     );
-    assert_eq!(
-        indent(emp_id_lines[1]),
-        indent(columns[1]) + 4,
-        "{formatted}"
-    );
+    assert_eq!(emp_id_lines[1], columns[1], "{formatted}");
     assert_eq!(
         indent(emp_name_lines[1]),
         indent(columns[1]) + 4,
         "{formatted}"
     );
-    assert!(!formatted.contains("COLUMNS emp_id"), "{formatted}");
+    assert_eq!(
+        formatted.matches("COLUMNS emp_id").count(),
+        2,
+        "{formatted}"
+    );
 
     let compact = format_stable(
         "SELECT x.id FROM XMLTABLE ('/r' PASSING payload COLUMNS id NUMBER PATH 'id') x;",
@@ -1560,9 +1555,11 @@ FROM XMLTABLE (
 ) x;"#,
         DatabaseType::Oracle,
     );
-    assert_eq!(
-        line_starting_with(&qualified, "t.passing").trim(),
-        "t.passing"
+    assert!(
+        line_starting_with(&qualified, "FROM XMLTABLE (t.passing")
+            .trim()
+            .ends_with("t.passing"),
+        "{qualified}"
     );
     assert_eq!(
         line_starting_with(&qualified, "PASSING t.columns").trim(),
@@ -1573,8 +1570,8 @@ FROM XMLTABLE (
         "PASSING :columns"
     );
     assert_eq!(
-        line_starting_with(&qualified, "columns VARCHAR2").trim(),
-        "columns VARCHAR2 (10) PATH 'columns',"
+        line_starting_with(&qualified, "COLUMNS columns VARCHAR2").trim(),
+        "COLUMNS columns VARCHAR2 (10) PATH 'columns',"
     );
     assert_eq!(
         line_starting_with(&qualified, "passing VARCHAR2").trim(),
@@ -1583,7 +1580,7 @@ FROM XMLTABLE (
     assert_eq!(
         qualified
             .lines()
-            .filter(|line| line.trim() == "COLUMNS")
+            .filter(|line| line.trim_start().starts_with("COLUMNS "))
             .count(),
         3,
         "{qualified}"

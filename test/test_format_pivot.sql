@@ -29,8 +29,11 @@ FROM (
                 FROM DUAL
             ) e
     )
-PIVOT (
-    COUNT(*)
-    FOR job IN ('CLERK' AS "CLERK", 'MANAGER' AS "MANAGER", 'ANALYST' AS "ANALYST", 'SALESMAN' AS "SALESMAN", 'PRESIDENT' AS "PRESIDENT")
-) pvt
+PIVOT (COUNT(*)
+        FOR job IN ('CLERK' AS "CLERK",
+            'MANAGER' AS "MANAGER",
+            'ANALYST' AS "ANALYST",
+            'SALESMAN' AS "SALESMAN",
+            'PRESIDENT' AS "PRESIDENT")
+    ) pvt
 ORDER BY pvt.deptno;

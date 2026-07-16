@@ -13,3 +13,11 @@ accepted = [
     "BSL-1.0",
     "OpenSSL",
 ]
+
+# Keep the generated dependency notice independent of the host that runs
+# cargo-about. These are the targets built and checked by the release/CI jobs.
+targets = [
+    "x86_64-unknown-linux-gnu",
+    "aarch64-apple-darwin",
+    "x86_64-pc-windows-msvc",
+]

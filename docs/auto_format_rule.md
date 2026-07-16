@@ -58,16 +58,19 @@ The formatter must not infer a frame's body depth retrospectively from:
 - the previous sibling's final line;
 - the indentation of a nested child's closing token.
 
-Whether a frame is expanded must be decided before its first child is
-rendered. A later separator must not trigger insertion of a line break into
-already-rendered output or move only the first token of an existing child.
-When lookahead is required, classification skips nested frames and excludes
-fixed phrases such as `BETWEEN ... AND ...` before rendering begins.
+For a sibling-bearing condition or list frame, the first direct item remains
+on the owner line and every second or later item starts a new line at the
+stored body depth. A later separator must never insert text retrospectively or
+move only part of an already-rendered child. Owner modifiers remain part of
+the owner header; for example, `WITH RECURSIVE first_cte AS (` keeps
+`WITH RECURSIVE` and the first CTE together.
 
-Once a frame is classified as expanded, its first direct child must start on
-a new line at `d + 1`; expansion must not affect only the second and later
-children. Owner modifiers remain part of the owner header. For example,
-`WITH RECURSIVE` stays at depth `d`, and the first CTE starts at `d + 1`.
+Query, block, and other grammar-boundary frames are not sibling-item lists.
+Their body boundary may require the first statement or clause to start on a
+new line. For example, the `SELECT` inside `WITH a AS (` starts at `d + 2`:
+one live edge for the WITH child and one for the query parenthesis. This does
+not permit a sibling-bearing frame to force its first list item onto a new
+line.
 
 ### 2. Line-start siblings have one body depth
 
@@ -84,8 +87,7 @@ No direct sibling is allowed to inherit an extra level merely because it is
 not the first item.
 
 ```sql
-WHERE
-    condition_a
+WHERE condition_a
     AND condition_b
     OR condition_c
 ```
@@ -100,20 +102,28 @@ condition_a
         OR condition_c
 ```
 
-### 3. Inline children remain compact
+### 3. First sibling items remain inline
 
-A first child may remain on the owner's line. A frame does not force a line
-break solely to make the inline child visibly use `d + 1`.
+A condition or list frame keeps its first direct sibling item on the owner's
+line. The second and later siblings break at `d + 1`, even if the first item is
+long or multiline.
 
 ```sql
 WHERE condition_a
-LISTAGG(value, ',') WITHIN GROUP (ORDER BY key_a, key_b)
+    AND condition_b
+SELECT value_a,
+    value_b
+WITH first_cte AS (
+        SELECT 1
+    ),
+    second_cte AS (
+        SELECT 2
+    )
 ```
 
-If formatting makes the condition multiline, the line-start children use the
-frame body depth consistently. This compact exception does not apply after the
-frame has been classified as expanded; an expanded frame starts with its first
-direct child at `d + 1`.
+If a comment makes it impossible to continue on the owner line, the first
+line-start child still uses the stored body depth. This is a lexical
+necessity, not a different depth rule.
 
 ### 4. Nesting composes one frame at a time
 
@@ -122,12 +132,10 @@ must not be aligned directly from an outer frame or from absolute source
 columns.
 
 ```sql
-WHERE
-    EXISTS (
+WHERE EXISTS (
         SELECT 1
         FROM child_table c
-        WHERE
-            c.parent_id = p.id
+        WHERE c.parent_id = p.id
             AND c.active = 1
     )
     AND p.active = 1
@@ -210,6 +218,18 @@ A comma belongs to the innermost frame whose scope contains the comma. A comma
 inside a nested function, row constructor, or subquery must not advance the
 outer list.
 
+`FROM` owns its comma-separated relation items. A `JOIN` is not another child
+of that comma list: it starts a separate attached join frame at the `FROM`
+clause-boundary depth. `ON` or `USING` belongs to the join frame, and boolean
+siblings inside `ON` belong to its nested condition frame. Thus `FROM t, u`
+indents `u` as the second FROM-list child, while `FROM t JOIN u` aligns `JOIN`
+with `FROM` and indents the join body beneath `JOIN`.
+
+For every managed comma list, the first item stays inline with its owner and
+the comma before each later item starts that item on the list frame's body
+depth. This applies equally to clause lists and delimiter-owned argument,
+column, row, and declaration lists; compact input is not an exemption.
+
 ## Fixed phrases are not sibling separators
 
 Tokens that spell `AND`, `OR`, `ON`, or a comma are separators only when their
@@ -257,7 +277,8 @@ of the following:
 - a line-start first child or sibling at a depth different from its frame body;
 - a frame whose stored depth is not its owner depth plus one, including a
   single inline child;
-- an expanded frame whose first direct child remains inline;
+- a sibling-bearing condition/list frame whose first item is moved to a new
+  line without a forcing comment;
 - an `AND`/`OR` or comma-connected sibling without an owning frame;
 - a line-start close at a depth different from its opener/owner;
 - body-depth drift after a nested frame or leading comment;

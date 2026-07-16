@@ -7,8 +7,8 @@ are maintained separately in `THIRD_PARTY_NOTICES.md`.
 
 ## Overview
 
-- Apache License 2.0 (207)
-- MIT License (47)
+- Apache License 2.0 (174)
+- MIT License (43)
 - Unicode License v3 (19)
 - BSD 3-Clause "New" or "Revised" License (2)
 - ISC License (1)
@@ -879,20 +879,8 @@ Used by:
 - windows-sys 0.61.2
 - windows-targets 0.52.6
 - windows-targets 0.53.5
-- windows_aarch64_gnullvm 0.52.6
-- windows_aarch64_gnullvm 0.53.1
-- windows_aarch64_msvc 0.52.6
-- windows_aarch64_msvc 0.53.1
-- windows_i686_gnu 0.52.6
-- windows_i686_gnu 0.53.1
-- windows_i686_gnullvm 0.52.6
-- windows_i686_gnullvm 0.53.1
-- windows_i686_msvc 0.52.6
-- windows_i686_msvc 0.53.1
 - windows_x86_64_gnu 0.52.6
 - windows_x86_64_gnu 0.53.1
-- windows_x86_64_gnullvm 0.52.6
-- windows_x86_64_gnullvm 0.53.1
 - windows_x86_64_msvc 0.52.6
 - windows_x86_64_msvc 0.53.1
 
@@ -2583,7 +2571,6 @@ limitations under the License.
 ### Apache License 2.0
 
 Used by:
-- iana-time-zone-haiku 0.1.2
 - iana-time-zone 0.1.65
 
 ```
@@ -3432,14 +3419,12 @@ Used by:
 - bitflags 2.11.0
 - btoi 0.4.3
 - bufstream 0.1.4
-- bumpalo 3.20.2
 - cc 1.2.67
 - cexpr 0.6.0
 - cfg-if 1.0.4
 - cmake 0.1.58
 - core-foundation-sys 0.8.7
 - core-foundation 0.10.1
-- core-foundation 0.9.4
 - crossbeam-channel 0.5.15
 - crossbeam-deque 0.8.7
 - crossbeam-epoch 0.9.20
@@ -3464,7 +3449,6 @@ Used by:
 - indexmap 2.13.0
 - itertools 0.13.0
 - jobserver 0.1.35
-- js-sys 0.3.91
 - lazy_static 1.5.0
 - libz-sys 1.1.28
 - linux-raw-sys 0.12.1
@@ -3486,7 +3470,6 @@ Used by:
 - regex 1.12.3
 - rustix 1.1.4
 - security-framework-sys 2.17.0
-- security-framework 2.11.1
 - security-framework 3.7.0
 - smallvec 1.15.1
 - socket2 0.5.10
@@ -3499,12 +3482,6 @@ Used by:
 - url 2.5.8
 - uuid 1.23.0
 - version_check 0.9.5
-- wasi 0.11.1+wasi-snapshot-preview1
-- wasm-bindgen-macro-support 0.2.114
-- wasm-bindgen-macro 0.2.114
-- wasm-bindgen-shared 0.2.114
-- wasm-bindgen 0.2.114
-- wit-bindgen 0.51.0
 
 ```
                               Apache License
@@ -4764,7 +4741,6 @@ limitations under the License.
 ### Apache License 2.0
 
 Used by:
-- adler2 2.0.1
 - proc-macro-crate 3.5.0
 
 ```
@@ -5803,7 +5779,6 @@ limitations under the License.
 
 Used by:
 - allocator-api2 0.2.21
-- android_system_properties 0.1.5
 - derive_utils 0.15.1
 - dirs-sys 0.5.0
 - dirs 6.0.0
@@ -5811,14 +5786,12 @@ Used by:
 - io-enum 1.2.1
 - itoa 1.0.17
 - libc 0.2.186
-- miniz_oxide 0.8.9
 - mysql-common-derive 0.31.2
 - num-conv 0.2.2
 - oracle_procmacro 0.1.2
 - paste 1.0.15
 - proc-macro2 1.0.106
 - quote 1.0.46
-- r-efi 6.0.0
 - rand 0.8.5
 - rustc-hash 2.1.3
 - rustversion 1.0.22
@@ -5830,16 +5803,10 @@ Used by:
 - shlex 2.0.1
 - syn 2.0.118
 - thiserror-impl 1.0.69
-- thiserror-impl 2.0.18
 - thiserror 1.0.69
-- thiserror 2.0.18
 - time-core 0.1.9
 - time 0.3.53
 - unicode-ident 1.0.24
-- wasip2 1.0.2+wasi-0.2.9
-- wasip3 0.4.0+wasi-0.3.0-rc-2026-01-06
-- winapi-i686-pc-windows-gnu 0.4.0
-- winapi-x86_64-pc-windows-gnu 0.4.0
 - zstd-safe 7.2.4
 - zstd-sys 2.0.16+zstd.1.5.7
 
@@ -7129,65 +7096,6 @@ SOFTWARE.
 ### MIT License
 
 Used by:
-- libredox 0.1.14
-
-```
-MIT License
-
-Copyright (c) 2023 4lDO2
-
-Permission is hereby granted, free of charge, to any person obtaining a copy
-of this software and associated documentation files (the "Software"), to deal
-in the Software without restriction, including without limitation the rights
-to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
-copies of the Software, and to permit persons to whom the Software is
-furnished to do so, subject to the following conditions:
-
-The above copyright notice and this permission notice shall be included in all
-copies or substantial portions of the Software.
-
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
-OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
-SOFTWARE.
-
-```
-
-### MIT License
-
-Used by:
-- cmk 0.1.2
-
-```
-MIT License
-
-Copyright (c) 2024 Mohammed Alyousef
-
-Permission is hereby granted, free of charge, to any person obtaining a copy
-of this software and associated documentation files (the "Software"), to deal
-in the Software without restriction, including without limitation the rights
-to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
-copies of the Software, and to permit persons to whom the Software is
-furnished to do so, subject to the following conditions:
-
-The above copyright notice and this permission notice shall be included in all
-copies or substantial portions of the Software.
-
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
-OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
-SOFTWARE.
-```
-
-### MIT License
-
-Used by:
 - frunk_core 0.4.4
 - frunk_core 0.5.0
 - frunk_derives 0.4.4
@@ -7214,36 +7122,6 @@ LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE A
 EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER
 IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE
 USE OR OTHER DEALINGS IN THE SOFTWARE.
-
-```
-
-### MIT License
-
-Used by:
-- simd-adler32 0.3.9
-
-```
-MIT License
-
-Copyright (c) [2021] [Marvin Countryman]
-
-Permission is hereby granted, free of charge, to any person obtaining a copy
-of this software and associated documentation files (the "Software"), to deal
-in the Software without restriction, including without limitation the rights
-to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
-copies of the Software, and to permit persons to whom the Software is
-furnished to do so, subject to the following conditions:
-
-The above copyright notice and this permission notice shall be included in all
-copies or substantial portions of the Software.
-
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
-OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
-SOFTWARE.
 
 ```
 
@@ -7546,37 +7424,6 @@ AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
 LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
 THE SOFTWARE.
-
-```
-
-### MIT License
-
-Used by:
-- redox_users 0.5.2
-
-```
-The MIT License (MIT)
-
-Copyright (c) 2017 Jose Narvaez
-
-Permission is hereby granted, free of charge, to any person obtaining a copy
-of this software and associated documentation files (the "Software"), to deal
-in the Software without restriction, including without limitation the rights
-to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
-copies of the Software, and to permit persons to whom the Software is
-furnished to do so, subject to the following conditions:
-
-The above copyright notice and this permission notice shall be included in all
-copies or substantial portions of the Software.
-
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
-OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
-SOFTWARE.
-
 
 ```
 

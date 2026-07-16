@@ -2852,3 +2852,180 @@ Oracle `test`, MySQL `test_mysql`, MariaDB `test_mariadb` 아래 모든 SQL/TXT 
 | 전체 `cargo test` | 모든 lib/binary/integration/guard/doc-test 실패 0 |
 | `cargo clippy --locked --all-targets -- -D warnings -W clippy::perf -W clippy::complexity` | 통과, 경고 0 |
 | `cargo fmt --all -- --check` | 통과 |
+
+# 20. 스윕 PASS 불신 전제 61개 전수 육안 재검토와 절 depth drift 4건 수정
+
+## 20-1. 검토 방법
+
+- `formatting_sweep_all_files_generate_out_report`로 61개 fixture의 `.format.out`을 생성했다
+  (자동 감사 결과는 전부 PASS).
+- PASS를 신뢰하지 않고 61개 파일 33,626줄(포맷된 SQL 23,568줄 + 리포트 footer)을 처음부터
+  끝까지 육안으로 읽고, 각 줄의 depth를 `docs/auto_format_rule.md`의 frame 계약
+  (owner+1 고정 depth, sibling 단일 body depth, close=owner depth, drift 금지)과 대조했다.
+- 의심 지점은 `SPACE_QUERY_FORMAT_SWEEP_FILE` 프로브로 최소 재현을 만들어 실제 위반 여부를
+  확정했다. 자동 감사가 절(clause) header의 depth는 검사하지 않기 때문에 아래 4건은 모두
+  status PASS 상태에서 육안으로만 발견됐다.
+
+## 20-2. 여러 줄 join ON 조건 뒤 `ON DUPLICATE KEY UPDATE` depth (test_mariadb/test6)
+
+`INSERT ... SELECT`의 마지막 JOIN이 여러 줄 `ON` 조건으로 끝나면, 그 다음의
+`ON DUPLICATE KEY UPDATE`가 INSERT 문의 절이 아니라 join ON처럼 JoinBody depth에 붙었다.
+
+AS-IS:
+
+```sql
+    ) tc
+        ON
+            tc.month_key = b.month_key
+            AND tc.region_id = b.region_id
+        ON DUPLICATE KEY UPDATE orders_cnt = VALUES(orders_cnt),
+            customers_cnt = VALUES(customers_cnt),
+```
+
+TO-BE:
+
+```sql
+    ) tc
+        ON
+            tc.month_key = b.month_key
+            AND tc.region_id = b.region_id
+    ON DUPLICATE KEY UPDATE orders_cnt = VALUES(orders_cnt),
+        customers_cnt = VALUES(customers_cnt),
+```
+
+`ON DUPLICATE KEY UPDATE`의 `ON`을 `starts_mysql_on_duplicate_key_update_clause`로 판별해
+(1) `WHERE`/`GROUP` 등과 같은 clause 경계로 취급해 JoinBody scoped indent를 비활성화하고
+(2) join-ON depth 재사용 분기에서 제외했다. VALUES(col) 함수 처리와 assignment sibling
+depth(+1)는 기존 동작을 유지한다.
+
+추가 회귀 테스트:
+`format_sql_basic_for_mysql_db_type_keeps_on_duplicate_clause_depth_after_multiline_join_on`
+
+## 20-3. WITH 본문 query에서 함수로 감싼 window item 뒤 `FROM` drift (test_mariadb/test6)
+
+WITH 문의 main query에서 `ROUND( ... OVER (...) ... )`처럼 일반 함수 괄호 안에 analytic
+window가 들어간 select item 이후, 다음 절 header가 그 괄호 안 깊이를 상속했다.
+
+AS-IS:
+
+```sql
+    DENSE_RANK() OVER (
+        PARTITION BY month_key
+        ORDER BY net_sales DESC,
+            segment
+    ) AS month_rank
+            FROM monthly
+```
+
+TO-BE:
+
+```sql
+    DENSE_RANK() OVER (
+        PARTITION BY month_key
+        ORDER BY net_sales DESC,
+            segment
+    ) AS month_rank
+FROM monthly
+```
+
+원인은 “WITH 문 SELECT 절의 쉼표는 select-list layout 상태를 재고정한다”는 분기가 함수
+인자 쉼표(`ROUND(..., 2)`의 쉼표)에도 발동해, statement 레벨 select-list 상태를 중첩 괄호
+깊이로 덮어쓴 것이다. 이 분기를 열려 있는 모든 괄호가 query-like frame일 때
+(`all_paren_frames_are_query_like`)로 제한해, 일반 괄호 안 쉼표는 그 괄호의 list frame이
+소유하도록 했다.
+
+추가 회귀 테스트:
+`format_sql_basic_for_mysql_db_type_returns_from_clause_to_query_depth_after_wrapped_window_item`
+
+## 20-4. MariaDB `SET STATEMENT ... FOR` 래핑 query의 절 depth 분열 (test_mariadb/test9)
+
+래핑된 query의 `SELECT`/`FROM`은 SET 할당식 depth(+2)를 상속하고 `GROUP BY`부터는 depth 0으로
+떨어져, 한 문장 안에서 절 depth가 갈라졌다.
+
+AS-IS:
+
+```sql
+SET STATEMENT max_statement_time = 5 FOR
+        SELECT account_id,
+            COUNT(*) event_count,
+            ROUND(SUM(amount), 2) total_amount
+        FROM mf_event
+GROUP BY account_id
+HAVING COUNT(*) >= 1
+```
+
+TO-BE:
+
+```sql
+SET STATEMENT max_statement_time = 5 FOR
+SELECT account_id,
+    COUNT(*) event_count,
+    ROUND(SUM(amount), 2) total_amount
+FROM mf_event
+GROUP BY account_id
+HAVING COUNT(*) >= 1
+```
+
+`SET STATEMENT <assignments> FOR`의 `FOR`에서 SET 할당의 AssignmentValue frame과 Set list
+owner를 정리하고 clause 상태를 초기화해, 래핑된 문장이 새 statement 문맥(depth 0)에서
+시작하도록 했다. 모든 절이 같은 depth를 공유한다.
+
+추가 회귀 테스트:
+`format_sql_basic_for_mysql_db_type_keeps_set_statement_for_query_clauses_on_one_depth`
+
+## 20-5. 확장형 SELECT에서 `DISTINCT` modifier 분리 (test_mariadb/test14)
+
+select list가 확장(줄바꿈) 스타일로 렌더링될 때 `DISTINCT`가 owner header에서 떨어져 첫
+item 줄로 내려갔다. 계약상 owner modifier는 owner header에 남아야 한다
+(`WITH RECURSIVE`와 같은 규칙).
+
+AS-IS:
+
+```sql
+        SELECT
+            DISTINCT agent_id,
+            PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY duration_ms) OVER (
+```
+
+TO-BE:
+
+```sql
+        SELECT DISTINCT
+            agent_id,
+            PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY duration_ms) OVER (
+```
+
+확장형 SELECT에서 다음 토큰이 `DISTINCT`/`UNIQUE`/`DISTINCTROW`이면 header 줄바꿈을
+modifier 뒤로 미룬다. 첫 item은 그대로 select-list body depth를 사용한다.
+
+추가 회귀 테스트:
+`format_sql_basic_for_mysql_db_type_keeps_distinct_on_the_expanded_select_header`
+
+## 20-6. 육안 검토에서 확인 후 의도된 동작으로 판정한 항목
+
+- 재귀 CTE의 `SEARCH ... SET` / `CYCLE ... SET` 절이 WITH 키워드 depth에 오는 레이아웃:
+  `format_sql_recursive_cte_search_cycle_*`, `format_sql_recursive_cte_cycle_separator_restores_with_body_indent`
+  등 다수 테스트로 고정된 설계다.
+- `JSON_ARRAYAGG(... RETURNING CLOB)`류 continuation이 “함수 호출이 시작된 줄 depth + 1”에
+  오는 레이아웃: `format_for_auto_formatting_restores_outer_select_clause_after_nested_json_xml_select_item`의
+  expected 출력으로 고정된 설계다.
+- `OUTER APPLY (`의 body가 join 줄 +1에 오는 것: JoinBody typed view가 괄호와 owner edge를
+  공유하는 설계로, 감사 인벤토리와 일치한다.
+
+## 20-7. 전체 sweep 및 품질 게이트
+
+| 항목 | 결과 |
+| --- | ---: |
+| 전체 fixture / 리포트 줄 수(육안 검토 분량) | 61개 / 33,626줄 |
+| 포맷된 SQL 줄 수 | 23,568줄 |
+| 검사 frame / 줄 시작 body item / close | 20,878 / 12,567 / 9,660 |
+| 실패 파일 / frame issue | 0 / 0 |
+| 이번 수정으로 출력이 바뀐 fixture | test_mariadb/test6·test9·test14 (3개, 모두 개선분만) |
+
+| 검증 | 결과 |
+| --- | --- |
+| `formatting_sweep_all_files_generate_out_report` | 통과, 61개 파일·issue 0 |
+| `cargo test --lib` | 6,547 통과·228 ignored·실패 0 (회귀 테스트 4건 추가) |
+| 전체 `cargo test` | 모든 lib/binary/integration/guard 실패 0 |
+| `cargo clippy --locked --all-targets -- -D warnings -W clippy::perf -W clippy::complexity` | 통과, 경고 0 |
+| `cargo fmt --all -- --check` | 통과 |
