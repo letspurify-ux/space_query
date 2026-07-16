@@ -85,14 +85,24 @@ static ORACLE_FUNCTIONS_SET: Lazy<HashSet<&'static str>> = Lazy::new(|| {
         .collect()
 });
 
-fn is_builtin_highlight_word(upper: &str, db_type: DatabaseType) -> bool {
+static MARIADB_HIGHLIGHT_FUNCTIONS_SET: Lazy<HashSet<&'static str>> = Lazy::new(|| {
+    MYSQL_FUNCTIONS_SET
+        .iter()
+        .chain(MARIADB_FUNCTIONS_SET.iter())
+        .copied()
+        .collect()
+});
+
+fn function_catalog_for_db_type(db_type: DatabaseType) -> &'static HashSet<&'static str> {
     match db_type {
-        DatabaseType::Oracle => ORACLE_FUNCTIONS_SET.contains(upper),
-        DatabaseType::MySQL => MYSQL_FUNCTIONS_SET.contains(upper),
-        DatabaseType::MariaDB => {
-            MYSQL_FUNCTIONS_SET.contains(upper) || MARIADB_FUNCTIONS_SET.contains(upper)
-        }
+        DatabaseType::Oracle => &ORACLE_FUNCTIONS_SET,
+        DatabaseType::MySQL => &MYSQL_FUNCTIONS_SET,
+        DatabaseType::MariaDB => &MARIADB_HIGHLIGHT_FUNCTIONS_SET,
     }
+}
+
+fn is_builtin_highlight_word(upper: &str, db_type: DatabaseType) -> bool {
+    function_catalog_for_db_type(db_type).contains(upper)
 }
 
 fn mysql_compatible_highlight_mode(db_type: DatabaseType) -> bool {

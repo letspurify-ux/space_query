@@ -3856,3 +3856,99 @@ application-time, vector index, ROWS EXAMINED, UUID v7 문법/함수가 포함�
 | `cargo test --lib` | 6,575 통과·229 ignored·실패 0 |
 | `cargo clippy --locked --all-targets -- -D warnings -W clippy::perf -W clippy::complexity` | 통과, 경고 0 |
 | `cargo fmt --all -- --check` / `git diff --check` | 통과 |
+
+# 28차: 전수 육안 재감사 + 품질 게이트 복구 (2026-07-16)
+
+## 28-1. 검토 범위 (28차: 1차 sweep 후 전수 육안 재감사)
+
+`formatting_sweep_all_files_generate_out_report` 1차 실행(PASS, failures=0) 후,
+자동 검사 결과를 신뢰하지 않고 `target/format-sweep` 아래 61개 `.format.out`
+전부(총 43,691줄)를 처음부터 끝까지 육안으로 재검토했다. 검토 기준은
+`docs/auto_format_rule.md`의 10개 원칙(프레임 단일 깊이 원천, 문법 기반 부모 판정,
+first-child-inline, `d+2` = 두 개의 live frame edge, closing은 owner 깊이,
+주석/보존 텍스트의 구조 중립성, 구분자 문법성, 프레임 소유 전수성, canonical 출력)이다.
+
+집중 검증한 패턴(각각 들여쓰기 숫자를 프레임 edge 수와 대조):
+
+- Oracle: INSERT ALL/FIRST(WHEN 분기 포함), MERGE(ON 조건 d+2, UPDATE…DELETE WHERE),
+  MODEL(RULES/UPSERT/SEQUENTIAL ORDER, 2차원 CV), MATCH_RECOGNIZE(DEFINE 목록),
+  PIVOT/UNPIVOT, JSON_TABLE/XMLTABLE(NESTED PATH 2중), CURSOR 식, WITH FUNCTION/PROCEDURE,
+  SEARCH/CYCLE, $IF/$ELSE/$END, FORALL 본문 SET의 CASE 연속행, 할당값 프레임과
+  괄호-CASE 사다리(`v := a + (CASE … END)`), q-quote 다중행 보존, 주석 삽입 위치
+  (test_open_with.sql의 주석 60여 개 포함).
+- MySQL/MariaDB: DELIMITER 루틴, handler/GET DIAGNOSTICS 목록, 명명 WINDOW 상속
+  (`w_order AS (w_base ORDER BY …)`), VALUES ROW, LATERAL, WITH ROLLUP/GROUPING,
+  CTE UPDATE/DELETE 다중 타깃, FOR PORTION OF, SYSTEM_TIME/PERIOD, CYCLE…RESTRICT,
+  BEGIN NOT ATOMIC, HANDLER 문, RETURNING, GROUP_CONCAT/JSON_ARRAYAGG의
+  ORDER BY…LIMIT 연속행, EXECUTE IMMEDIATE…USING.
+
+## 28-2. 육안 재감사 결과: 프레임 위반 0건 (포맷터 수정 없음)
+
+61개 파일 전부에서 frame depth 규칙 위반을 찾지 못했다. 이번 라운드에서
+포맷터/스윕 로직 변경과 AS-IS/TO-BE 쿼리 변경은 없다.
+
+규칙 위반이 아니어서 수정하지 않은 스타일 관찰 2건(기록만 남김):
+
+- PL/SQL 선언/RETURNS/RECORD 문맥에서 타입 정밀도 쉼표도 일반 목록 규칙으로 분리됨
+  (`DECIMAL(12,\n        2)`). first-child-inline 규칙에 일관되며 회귀 기준선과 일치.
+- MODEL 셀 참조 대괄호의 토큰 간격(`sum_sal [ CV () ]`). 깊이와 무관한 토큰 간격 스타일.
+
+## 28-3. 품질 게이트에서 발견한 코드 회귀 1건 수정 (포맷팅과 무관)
+
+`cargo test` 전체 실행에서 dispatch 가드 2건이 실패했다. 직전 커밋이
+`src/ui/syntax_highlight.rs`의 DatabaseType 레지스트리 함수
+`function_catalog_for_db_type`을 제거하고 직접 match로 대체하면서 발생한 회귀다.
+MariaDB 하이라이트가 MySQL+MariaDB 함수 카탈로그 합집합을 쓰도록 한 기능 변화는
+유지하면서, 합집합을 `MARIADB_HIGHLIGHT_FUNCTIONS_SET`으로 분리하고 레지스트리
+함수를 복원했다.
+
+AS-IS:
+
+```rust
+fn is_builtin_highlight_word(upper: &str, db_type: DatabaseType) -> bool {
+    match db_type {
+        DatabaseType::Oracle => ORACLE_FUNCTIONS_SET.contains(upper),
+        DatabaseType::MySQL => MYSQL_FUNCTIONS_SET.contains(upper),
+        DatabaseType::MariaDB => {
+            MYSQL_FUNCTIONS_SET.contains(upper) || MARIADB_FUNCTIONS_SET.contains(upper)
+        }
+    }
+}
+```
+
+TO-BE:
+
+```rust
+static MARIADB_HIGHLIGHT_FUNCTIONS_SET: Lazy<HashSet<&'static str>> = Lazy::new(|| {
+    MYSQL_FUNCTIONS_SET
+        .iter()
+        .chain(MARIADB_FUNCTIONS_SET.iter())
+        .copied()
+        .collect()
+});
+
+fn function_catalog_for_db_type(db_type: DatabaseType) -> &'static HashSet<&'static str> {
+    match db_type {
+        DatabaseType::Oracle => &ORACLE_FUNCTIONS_SET,
+        DatabaseType::MySQL => &MYSQL_FUNCTIONS_SET,
+        DatabaseType::MariaDB => &MARIADB_HIGHLIGHT_FUNCTIONS_SET,
+    }
+}
+
+fn is_builtin_highlight_word(upper: &str, db_type: DatabaseType) -> bool {
+    function_catalog_for_db_type(db_type).contains(upper)
+}
+```
+
+관련 가드: `backend_registry_functions_dispatch_on_concrete_database_type`,
+`non_test_ui_source_uses_backend_specs_instead_of_direct_database_type_dispatch`
+
+## 28-4. 최종 sweep 및 품질 게이트
+
+| 검증 | 결과 |
+| --- | --- |
+| `formatting_sweep_all_files_generate_out_report` | 통과, 61개 파일 · frames 21,113 · boundaries 46,677 · depth symmetry 2,719 · body items 22,839 · closes 9,724 · failures 0 |
+| 전수 육안 재감사 | 61개 파일 · 43,691줄 · 프레임 위반 0건 |
+| `cargo test` | 전체 통과(lib 6,575 통과 · 229 ignored, 가드 71 통과 포함), 실패 0 |
+| `cargo clippy --locked --all-targets -- -D warnings -W clippy::perf -W clippy::complexity` | 통과, 경고 0 |
+| `cargo fmt --all -- --check` / `git diff --check` | 통과 |
