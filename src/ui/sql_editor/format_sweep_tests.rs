@@ -2050,16 +2050,106 @@ fn formatting_sweep_mysql_routine_parameter_type_arguments_close_inline() {
             run.formatted
         );
         assert!(
-            run.formatted.contains("a DECIMAL(12,\n        2),"),
-            "{db_type:?}: a non-last parameter's type-argument paren must close inline like the last one:\n{}",
+            run.formatted.contains("a DECIMAL(12, 2),"),
+            "{db_type:?}: a fixed type modifier is not a comma-list and must stay inline:\n{}",
             run.formatted
         );
         assert!(
-            !run.formatted.contains("2\n    ),"),
-            "{db_type:?}: type-argument close must not detach from its last argument:\n{}",
+            run.formatted.contains("b DECIMAL(14, 2)\n)")
+                && run.formatted.contains("RETURNS DECIMAL(18, 2)"),
+            "{db_type:?}: parameter and return type modifiers must remain compact:\n{}",
             run.formatted
         );
     }
+}
+
+#[test]
+fn formatting_sweep_fixed_type_modifiers_are_not_comma_lists() {
+    for db_type in [DatabaseType::MySQL, DatabaseType::MariaDB] {
+        let run = format_sweep_run(
+            "CREATE PROCEDURE p() BEGIN DECLARE v DECIMAL(18, 2); SELECT CAST(v AS NUMERIC(14, 4)) INTO v; END;",
+            db_type,
+        );
+        assert!(
+            run.issues.is_empty(),
+            "{db_type:?} fixed type-modifier issues: {:#?}\n{}",
+            run.issues,
+            run.formatted
+        );
+        assert!(
+            run.formatted.contains("DECLARE v DECIMAL(18, 2);"),
+            "{db_type:?}: declaration precision/scale must stay inline:\n{}",
+            run.formatted
+        );
+        assert!(
+            run.formatted.contains("CAST(v AS NUMERIC(14, 4))"),
+            "{db_type:?}: CAST precision/scale must stay inline:\n{}",
+            run.formatted
+        );
+    }
+
+    let oracle = format_sweep_run(
+        "DECLARE v NUMBER(18, 2); BEGIN SELECT CAST(1 AS NUMBER(14, 4)) INTO v FROM dual; END;",
+        DatabaseType::Oracle,
+    );
+    assert!(
+        oracle.issues.is_empty(),
+        "Oracle fixed type-modifier issues: {:#?}\n{}",
+        oracle.issues,
+        oracle.formatted
+    );
+    assert!(
+        oracle.formatted.contains("v NUMBER (18, 2);"),
+        "Oracle declaration precision/scale must stay inline:\n{}",
+        oracle.formatted
+    );
+    assert!(
+        oracle.formatted.contains("CAST (1 AS NUMBER (14, 4))"),
+        "Oracle CAST precision/scale must stay inline:\n{}",
+        oracle.formatted
+    );
+}
+
+#[test]
+fn formatting_sweep_assignment_keeps_case_first_child_inline() {
+    for db_type in [DatabaseType::MySQL, DatabaseType::MariaDB] {
+        let update = format_sweep_run(
+            "UPDATE jobs j SET j.job_status = CASE WHEN j.score >= 90 THEN 'READY' ELSE 'HOLD' END, j.priority = CASE WHEN j.score >= 90 THEN 1 ELSE 2 END WHERE j.id = 1;",
+            db_type,
+        );
+        assert!(
+            update.issues.is_empty(),
+            "{db_type:?} assignment CASE issues: {:#?}\n{}",
+            update.issues,
+            update.formatted
+        );
+        assert!(
+            update.formatted.contains("j.job_status = CASE\n"),
+            "{db_type:?}: the first assignment child CASE must stay on its owner line:\n{}",
+            update.formatted
+        );
+        assert!(
+            update.formatted.contains("j.priority = CASE\n"),
+            "{db_type:?}: later assignment siblings use the same first-child rule:\n{}",
+            update.formatted
+        );
+    }
+
+    let oracle = format_sweep_run(
+        "BEGIN v_result := CASE WHEN v_flag = 1 THEN 10 ELSE 20 END; END;",
+        DatabaseType::Oracle,
+    );
+    assert!(
+        oracle.issues.is_empty(),
+        "Oracle assignment CASE issues: {:#?}\n{}",
+        oracle.issues,
+        oracle.formatted
+    );
+    assert!(
+        oracle.formatted.contains("v_result := CASE\n"),
+        "Oracle := assignment must keep its first CASE child inline:\n{}",
+        oracle.formatted
+    );
 }
 
 #[test]

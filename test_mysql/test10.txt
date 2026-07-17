@@ -1,0 +1,449 @@
+-- ==========================================================================
+-- SPACE QUERY MYSQL CRUD FORMATTER FINAL BOSS VII
+-- Target: MySQL 8.0.31+ (live certification uses MySQL 8.0.46)
+-- Repeatable within its dedicated database. Covers CREATE/READ/UPDATE/DELETE,
+-- routines, triggers, transactions, prepared SQL, recursive CTEs, nested
+-- JSON_TABLE, spatial expressions, windows, ROLLUP, LATERAL, and set operators.
+-- ==========================================================================
+DROP DATABASE IF EXISTS sq_mysql_final_boss_7;
+CREATE DATABASE sq_mysql_final_boss_7 CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_ai_ci;
+USE sq_mysql_final_boss_7;
+SET NAMES utf8mb4;
+SET SESSION sql_mode='ONLY_FULL_GROUP_BY,STRICT_TRANS_TABLES,NO_ZERO_IN_DATE,NO_ZERO_DATE,ERROR_FOR_DIVISION_BY_ZERO,NO_ENGINE_SUBSTITUTION';
+SET @lexical_trap='DELIMITER $$ CREATE TRIGGER fake BEFORE DELETE; JSON_TABLE("[]", "$[*]") # inert';
+
+/* Formatter trap: UPDATE fake SET payload='DELETE FROM fake; END$$' WHERE id=1; */
+
+CREATE TABLE fb_account(
+account_id BIGINT NOT NULL,
+email VARCHAR(120)NOT NULL,
+secret_token VARBINARY(32)INVISIBLE,
+profile JSON NOT NULL,
+email_norm VARCHAR(120)GENERATED ALWAYS AS(LOWER(TRIM(email)))STORED,
+region_code VARCHAR(12)GENERATED ALWAYS AS(JSON_UNQUOTE(JSON_EXTRACT(profile,'$.region')))VIRTUAL,
+created_at TIMESTAMP(6)NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+PRIMARY KEY(account_id),
+UNIQUE KEY uk_fb_account_email(email_norm),
+KEY ix_fb_account_region(region_code),
+KEY ix_fb_account_lower((LOWER(email)))INVISIBLE,
+CONSTRAINT chk_fb_account_profile CHECK(JSON_VALID(profile))
+)ENGINE=InnoDB;
+
+CREATE TABLE fb_document(
+doc_id BIGINT NOT NULL,
+account_id BIGINT NOT NULL,
+doc_key VARCHAR(50)NOT NULL,
+doc_status ENUM('NEW','READY','ARCHIVED')NOT NULL DEFAULT'NEW',
+score DECIMAL(10,2)NOT NULL,
+payload JSON NOT NULL,
+note_text TEXT NOT NULL,
+created_at DATETIME(6)NOT NULL,
+kind_code VARCHAR(30)GENERATED ALWAYS AS(JSON_UNQUOTE(JSON_EXTRACT(payload,'$.kind')))STORED,
+PRIMARY KEY(doc_id),
+UNIQUE KEY uk_fb_document_key(doc_key),
+KEY ix_fb_document_account_score(account_id,score DESC),
+KEY ix_fb_document_kind((CAST(JSON_UNQUOTE(JSON_EXTRACT(payload,'$.kind'))AS CHAR(30)))),
+KEY ix_fb_document_tags((CAST(payload->'$.tags' AS CHAR(24)ARRAY))),
+FULLTEXT KEY ft_fb_document_note(note_text),
+CONSTRAINT fk_fb_document_account FOREIGN KEY(account_id)REFERENCES fb_account(account_id),
+CONSTRAINT chk_fb_document_score CHECK(score BETWEEN 0 AND 100),
+CONSTRAINT chk_fb_document_schema CHECK(JSON_SCHEMA_VALID('{"type":"object","required":["kind","tags"],"properties":{"kind":{"type":"string"},"tags":{"type":"array","items":{"type":"string"}}}}',payload))
+)ENGINE=InnoDB;
+
+CREATE TABLE fb_audit(
+audit_id BIGINT NOT NULL AUTO_INCREMENT,
+entity_name VARCHAR(40)NOT NULL,
+entity_id BIGINT NOT NULL,
+operation_code ENUM('INSERT','UPDATE','DELETE')NOT NULL,
+old_value JSON,
+new_value JSON,
+changed_at TIMESTAMP(6)NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+PRIMARY KEY(audit_id),
+KEY ix_fb_audit_entity(entity_name,entity_id,changed_at)
+)ENGINE=InnoDB;
+
+CREATE OR REPLACE VIEW fb_document_v AS
+SELECT d.doc_id,d.doc_key,d.doc_status,d.score,d.kind_code,d.payload,d.note_text,
+a.account_id,a.email_norm,a.region_code,
+CASE WHEN d.score>=90 THEN'ELITE'WHEN d.score>=60 THEN'STRONG'ELSE'NORMAL'END AS score_band
+FROM fb_document d
+JOIN fb_account a ON a.account_id=d.account_id;
+
+DELIMITER $$
+
+CREATE FUNCTION fb_score_band(p_score DECIMAL(10,2))
+RETURNS VARCHAR(20)
+DETERMINISTIC
+RETURN CASE WHEN p_score>=90 THEN'ELITE'WHEN p_score>=60 THEN'STRONG'WHEN p_score>=30 THEN'NORMAL'ELSE'LOW'END$$
+
+CREATE PROCEDURE fb_assert(IN p_condition BOOLEAN,IN p_message VARCHAR(255))
+BEGIN
+IF COALESCE(p_condition,FALSE)=FALSE THEN
+SIGNAL SQLSTATE'45000'SET MESSAGE_TEXT=p_message;
+END IF;
+END$$
+
+CREATE TRIGGER fb_document_bi BEFORE INSERT ON fb_document FOR EACH ROW
+BEGIN
+SET NEW.doc_status=UPPER(TRIM(NEW.doc_status));
+SET NEW.note_text=TRIM(NEW.note_text);
+IF NEW.score<0 OR NEW.score>100 OR JSON_VALID(NEW.payload)=0 THEN
+SIGNAL SQLSTATE'45000'SET MESSAGE_TEXT='invalid final-boss document';
+END IF;
+END$$
+
+CREATE TRIGGER fb_document_ai AFTER INSERT ON fb_document FOR EACH ROW
+BEGIN
+INSERT INTO fb_audit(entity_name,entity_id,operation_code,new_value)
+VALUES('DOCUMENT',NEW.doc_id,'INSERT',JSON_OBJECT('status',NEW.doc_status,'score',NEW.score,'payload',NEW.payload));
+END$$
+
+CREATE TRIGGER fb_document_au AFTER UPDATE ON fb_document FOR EACH ROW
+BEGIN
+INSERT INTO fb_audit(entity_name,entity_id,operation_code,old_value,new_value)
+VALUES('DOCUMENT',NEW.doc_id,'UPDATE',
+JSON_OBJECT('status',OLD.doc_status,'score',OLD.score,'payload',OLD.payload),
+JSON_OBJECT('status',NEW.doc_status,'score',NEW.score,'payload',NEW.payload));
+END$$
+
+CREATE TRIGGER fb_document_ad AFTER DELETE ON fb_document FOR EACH ROW
+BEGIN
+INSERT INTO fb_audit(entity_name,entity_id,operation_code,old_value)
+VALUES('DOCUMENT',OLD.doc_id,'DELETE',JSON_OBJECT('status',OLD.doc_status,'score',OLD.score,'payload',OLD.payload));
+END$$
+
+CREATE PROCEDURE fb_run_crud()
+crud_block:BEGIN
+DECLARE v_done BOOLEAN DEFAULT FALSE;
+DECLARE v_doc_id BIGINT;
+DECLARE v_score DECIMAL(10,2);
+DECLARE v_running DECIMAL(18,2)DEFAULT 0;
+DECLARE cur_docs CURSOR FOR SELECT doc_id,score FROM fb_document ORDER BY doc_id;
+DECLARE CONTINUE HANDLER FOR NOT FOUND SET v_done=TRUE;
+DECLARE EXIT HANDLER FOR SQLEXCEPTION
+BEGIN
+ROLLBACK;
+RESIGNAL;
+END;
+
+START TRANSACTION;
+SAVEPOINT before_crud;
+OPEN cur_docs;
+read_loop:LOOP
+FETCH cur_docs INTO v_doc_id,v_score;
+IF v_done THEN LEAVE read_loop;END IF;
+SET v_running=v_running+v_score;
+END LOOP read_loop;
+CLOSE cur_docs;
+
+UPDATE fb_document d
+JOIN fb_account a ON a.account_id=d.account_id
+SET d.score=LEAST(100,d.score+CASE a.region_code WHEN'KR'THEN 2 WHEN'US'THEN 1 ELSE 0 END),
+d.payload=JSON_SET(d.payload,'$.crud',JSON_OBJECT('updated',TRUE,'band',fb_score_band(d.score)))
+WHERE d.doc_id IN(101,102);
+
+DELETE FROM fb_document
+WHERE doc_id=999
+AND JSON_VALUE(payload,'$.disposable'RETURNING UNSIGNED DEFAULT 0 ON EMPTY DEFAULT 0 ON ERROR)=1;
+
+CALL fb_assert(v_running=327.50,'cursor read total');
+CALL fb_assert((SELECT COUNT(*)FROM fb_document WHERE doc_id=999)=0,'delete branch');
+COMMIT;
+END crud_block$$
+
+DELIMITER ;
+
+INSERT INTO fb_account(account_id,email,secret_token,profile)VALUES
+(1,' Alice@Example.COM ',UNHEX(SHA2('alice-secret',256)),JSON_OBJECT('region','KR','flags',JSON_ARRAY('admin','beta'))),
+(2,'bob@example.com',UNHEX(SHA2('bob-secret',256)),JSON_OBJECT('region','US','flags',JSON_ARRAY('buyer'))),
+(3,'carol@example.com',UNHEX(SHA2('carol-secret',256)),JSON_OBJECT('region','DE','flags',JSON_ARRAY('analyst','beta')));
+
+INSERT INTO fb_document(doc_id,account_id,doc_key,doc_status,score,payload,note_text,created_at)VALUES
+(101,1,'doc-a-1','new',92.50,JSON_OBJECT('kind','invoice','tags',JSON_ARRAY('priority','new'),'lines',JSON_ARRAY(JSON_OBJECT('sku','A','qty',2,'price',30),JSON_OBJECT('sku','B','qty',1,'price',32.5))),' priority invoice formatter certification ','2026-08-01 09:00:00.000001'),
+(102,1,'doc-a-2','ready',45.00,JSON_OBJECT('kind','audit','tags',JSON_ARRAY('review'),'lines',JSON_ARRAY(JSON_OBJECT('sku','C','qty',1,'price',45))),'audit trail parser certification','2026-08-02 10:00:00.000002'),
+(103,2,'doc-b-1','ready',70.00,JSON_OBJECT('kind','invoice','tags',JSON_ARRAY('priority','insured'),'lines',JSON_ARRAY(JSON_OBJECT('sku','D','qty',2,'price',35))),'priority insured document','2026-08-03 11:00:00.000003'),
+(104,3,'doc-c-1','archived',55.00,JSON_OBJECT('kind','archive','tags',JSON_ARRAY('cold'),'lines',JSON_ARRAY(JSON_OBJECT('sku','E','qty',5,'price',11))),'archived searchable document','2026-08-04 12:00:00.000004'),
+(999,3,'doc-delete','new',65.00,JSON_OBJECT('kind','temporary','tags',JSON_ARRAY('delete'),'disposable',1,'lines',JSON_ARRAY()),'delete branch sentinel','2026-08-05 13:00:00.000005');
+
+CALL fb_run_crud();
+
+WITH expanded AS(
+SELECT a.account_id,a.email_norm,a.region_code,d.doc_id,d.doc_key,d.doc_status,d.score,
+j.line_no,j.sku_code,j.quantity,j.unit_price,j.quantity*j.unit_price AS line_total
+FROM fb_document d
+JOIN fb_account a ON a.account_id=d.account_id
+JOIN JSON_TABLE(d.payload,'$.lines[*]'COLUMNS(
+line_no FOR ORDINALITY,
+sku_code VARCHAR(20)PATH'$.sku',
+quantity DECIMAL(12,2)PATH'$.qty'DEFAULT'0'ON EMPTY,
+unit_price DECIMAL(12,2)PATH'$.price'DEFAULT'0'ON EMPTY
+))AS j ON TRUE
+),ranked AS(
+SELECT e.*,
+SUM(e.line_total)OVER(PARTITION BY e.account_id ORDER BY e.doc_id,e.line_no ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW)AS running_total,
+ROW_NUMBER()OVER(PARTITION BY e.account_id ORDER BY e.score DESC,e.doc_id,e.line_no)AS score_rank
+FROM expanded e
+)
+SELECT r.*,fb_score_band(r.score)AS score_band
+FROM ranked r
+WHERE r.score_rank<=3
+ORDER BY r.account_id,r.score_rank;
+
+WITH promoted AS(
+SELECT doc_id FROM fb_document WHERE score BETWEEN 40 AND 50
+)
+UPDATE fb_document d
+JOIN promoted p ON p.doc_id=d.doc_id
+SET d.doc_status='READY',d.payload=JSON_SET(d.payload,'$.crud.cte_update',TRUE);
+
+START TRANSACTION;
+DELETE FROM fb_document WHERE doc_id=104;
+SELECT COUNT(*)AS delete_visible_inside_transaction FROM fb_document WHERE doc_id=104;
+ROLLBACK;
+
+SET @fb_account_id=1;
+PREPARE fb_read_stmt FROM'SELECT doc_id,doc_key,score FROM fb_document WHERE account_id=? ORDER BY score DESC';
+EXECUTE fb_read_stmt USING @fb_account_id;
+DEALLOCATE PREPARE fb_read_stmt;
+
+WITH RECURSIVE
+policy AS(
+SELECT JSON_OBJECT(
+'range',JSON_OBJECT('start','2026-08-01','days',7),
+'limits',JSON_OBJECT('distance_m',1500000,'delay',25),
+'required',JSON_ARRAY('priority','insured')
+)AS config
+),
+params AS(
+SELECT
+CAST(JSON_VALUE(config,'$.range.start'RETURNING CHAR(10)DEFAULT'2026-01-01'ON EMPTY DEFAULT'2026-01-01'ON ERROR)AS DATE)AS start_day,
+JSON_VALUE(config,'$.range.days'RETURNING UNSIGNED DEFAULT 1 ON EMPTY DEFAULT 1 ON ERROR)AS day_count,
+JSON_VALUE(config,'$.limits.distance_m'RETURNING UNSIGNED DEFAULT 2000000 ON EMPTY DEFAULT 2000000 ON ERROR)AS distance_limit,
+JSON_VALUE(config,'$.limits.delay'RETURNING DECIMAL(10,2)DEFAULT 99 ON EMPTY DEFAULT 99 ON ERROR)AS delay_limit,
+config
+FROM policy
+),
+calendar(day_no,day_value)AS(
+SELECT 0,start_day FROM params
+UNION ALL
+SELECT c.day_no+1,c.day_value+INTERVAL 1 DAY
+FROM calendar c
+JOIN params p ON TRUE
+WHERE c.day_no+1<p.day_count
+),
+routes(route_id,parent_route_id,route_name,active_flag,hub_point)AS(
+SELECT 1,NULL,'Pacific Spine',TRUE,ST_GeomFromText('POINT(-122.4194 37.7749)',4326,'axis-order=long-lat')UNION ALL
+SELECT 2,1,'Cascade Link',TRUE,ST_GeomFromText('POINT(-122.3321 47.6062)',4326,'axis-order=long-lat')UNION ALL
+SELECT 3,1,'Desert Relay',TRUE,ST_GeomFromText('POINT(-115.1398 36.1699)',4326,'axis-order=long-lat')UNION ALL
+SELECT 4,2,'Dormant Spur',FALSE,ST_GeomFromText('POINT(-123.1207 49.2827)',4326,'axis-order=long-lat')
+),
+route_tree(route_id,parent_route_id,route_path,tree_depth)AS(
+SELECT route_id,parent_route_id,CAST(REGEXP_REPLACE(UPPER(route_name),'[^A-Z0-9]+','_')AS CHAR(400)),0
+FROM routes
+WHERE parent_route_id IS NULL
+UNION ALL
+SELECT r.route_id,r.parent_route_id,
+CONCAT(t.route_path,'/',REGEXP_REPLACE(UPPER(r.route_name),'[^A-Z0-9]+','_')),
+t.tree_depth+1
+FROM routes r
+JOIN route_tree t ON t.route_id=r.parent_route_id
+),
+shipments(shipment_id,route_id,shipped_on,payload)AS(
+SELECT 101,1,DATE'2026-08-01',JSON_OBJECT('channel','air','events',JSON_ARRAY(
+JSON_OBJECT('type','delay','value',8,'coords',JSON_ARRAY(-122.30,37.80),'tags',JSON_ARRAY('priority','fast')),
+JSON_OBJECT('type','damage','value',1,'coords',JSON_ARRAY(-121.90,37.50),'tags',JSON_ARRAY('insured'))
+))UNION ALL
+SELECT 102,1,DATE'2026-08-05',JSON_OBJECT('channel','sea','events',JSON_ARRAY(
+JSON_OBJECT('type','delay','value',15,'coords',JSON_ARRAY(-123.10,38.10),'tags',JSON_ARRAY('stable')),
+JSON_OBJECT('type','damage','value',0,'coords',JSON_ARRAY(-122.80,37.90),'tags',JSON_ARRAY('priority','insured'))
+))UNION ALL
+SELECT 201,2,DATE'2026-08-02',JSON_OBJECT('channel','rail','events',JSON_ARRAY(
+JSON_OBJECT('type','delay','value',30,'coords',JSON_ARRAY(-122.20,47.50),'tags',JSON_ARRAY('priority')),
+JSON_OBJECT('type','damage','value',2,'coords',JSON_ARRAY(-121.70,47.20),'tags',JSON_ARRAY('insured'))
+))UNION ALL
+SELECT 301,3,DATE'2026-08-03',JSON_OBJECT('channel','road','events',JSON_ARRAY(
+JSON_OBJECT('type','delay','value',10,'coords',JSON_ARRAY(-115.00,36.20),'tags',JSON_ARRAY('priority','recovery')),
+JSON_OBJECT('type','damage','value',0,'coords',JSON_ARRAY(-114.80,36.00),'tags',JSON_ARRAY('insured'))
+))UNION ALL
+SELECT 302,3,DATE'2026-08-07',JSON_OBJECT('channel','drone','events',JSON_ARRAY(
+JSON_OBJECT('type','delay','value',5,'coords',JSON_ARRAY(-115.30,36.40),'tags',JSON_ARRAY('priority')),
+JSON_OBJECT('type','damage','value',1,'coords',JSON_ARRAY(-115.10,36.10),'tags',JSON_ARRAY('insured','quality'))
+))
+),
+event_rows AS(
+SELECT s.shipment_id,s.route_id,s.shipped_on,j.channel_code,j.event_no,
+j.event_type,j.event_value,j.longitude_value,j.latitude_value,j.tag_no,j.tag_value
+FROM shipments s
+JOIN JSON_TABLE(
+s.payload,'$'
+COLUMNS(
+channel_code VARCHAR(30)PATH'$.channel'DEFAULT'"unknown"'ON EMPTY,
+NESTED PATH'$.events[*]'
+COLUMNS(
+event_no FOR ORDINALITY,
+event_type VARCHAR(30)PATH'$.type'ERROR ON ERROR,
+event_value DECIMAL(12,2)PATH'$.value'DEFAULT'0'ON EMPTY DEFAULT'0'ON ERROR,
+longitude_value DECIMAL(10,6)PATH'$.coords[0]'NULL ON EMPTY,
+latitude_value DECIMAL(10,6)PATH'$.coords[1]'NULL ON EMPTY,
+NESTED PATH'$.tags[*]'
+COLUMNS(
+tag_no FOR ORDINALITY,
+tag_value VARCHAR(30)PATH'$'NULL ON ERROR
+)
+)
+)
+)AS j ON TRUE
+),
+event_base AS(
+SELECT shipment_id,route_id,shipped_on,MAX(channel_code)AS channel_code,
+event_no,MAX(event_type)AS event_type,MAX(event_value)AS event_value,
+MAX(longitude_value)AS longitude_value,MAX(latitude_value)AS latitude_value
+FROM event_rows
+GROUP BY shipment_id,route_id,shipped_on,event_no
+),
+shipment_facts AS(
+SELECT b.shipment_id,b.route_id,b.shipped_on,MAX(b.channel_code)AS channel_code,
+MAX(CASE WHEN b.event_type='delay'THEN b.event_value END)AS delay_minutes,
+MAX(CASE WHEN b.event_type='damage'THEN b.event_value END)AS damage_count,
+MAX(ST_Distance_Sphere(
+ST_GeomFromText(CONCAT('POINT(',b.longitude_value,' ',b.latitude_value,')'),4326,'axis-order=long-lat'),
+r.hub_point
+))AS farthest_event_meters
+FROM event_base b
+JOIN routes r ON r.route_id=b.route_id
+GROUP BY b.shipment_id,b.route_id,b.shipped_on
+),
+daily AS(
+SELECT r.route_id,c.day_no,c.day_value,
+COALESCE(AVG(f.delay_minutes),0)AS average_delay,
+COALESCE(SUM(f.damage_count),0)AS damage_count,
+COUNT(f.shipment_id)AS shipment_count
+FROM routes r
+CROSS JOIN calendar c
+LEFT JOIN shipment_facts f
+ON f.route_id=r.route_id
+AND f.shipped_on=c.day_value
+GROUP BY r.route_id,c.day_no,c.day_value
+),
+analytic_daily AS(
+SELECT d.*,
+SUM(d.damage_count)OVER w_running AS running_damage,
+FIRST_VALUE(d.average_delay)OVER w_full AS first_delay,
+LAST_VALUE(d.average_delay)OVER w_full AS last_delay,
+CUME_DIST()OVER w_rank AS delay_distribution,
+ROW_NUMBER()OVER w_rank AS delay_row_no
+FROM daily d
+WINDOW
+w_route AS(PARTITION BY route_id),
+w_ordered AS(w_route ORDER BY day_no),
+w_running AS(w_ordered ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW),
+w_full AS(w_ordered ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING),
+w_rank AS(w_route ORDER BY average_delay DESC,day_no)
+),
+rollup_rows AS(
+SELECT route_id,channel_code,SUM(delay_minutes)AS total_delay,
+GROUPING(route_id)AS route_grouped,GROUPING(channel_code)AS channel_grouped
+FROM shipment_facts
+GROUP BY route_id,channel_code WITH ROLLUP
+),
+eligible(route_id)AS(
+(SELECT route_id FROM routes WHERE active_flag IS TRUE)
+INTERSECT
+(SELECT route_id FROM shipment_facts f JOIN params p ON f.farthest_event_meters<p.distance_limit)
+EXCEPT
+(SELECT route_id FROM shipment_facts f JOIN params p ON f.delay_minutes>p.delay_limit*2)
+),
+route_rollup AS(
+SELECT f.route_id,COUNT(*)AS shipment_count,SUM(f.delay_minutes)AS total_delay,
+SUM(f.damage_count)AS total_damage,ROUND(AVG(f.delay_minutes),2)AS average_delay,
+ROUND(MAX(f.farthest_event_meters),2)AS farthest_event_meters,
+GROUP_CONCAT(DISTINCT f.channel_code ORDER BY f.channel_code SEPARATOR',')AS channel_list,
+JSON_ARRAYAGG(JSON_OBJECT(
+'shipment',f.shipment_id,
+'day',DATE_FORMAT(f.shipped_on,'%Y-%m-%d'),
+'channel',f.channel_code,
+'delay',f.delay_minutes,
+'damage',f.damage_count,
+'distance_m',ROUND(f.farthest_event_meters,2)
+))AS shipment_json
+FROM shipment_facts f
+GROUP BY f.route_id
+),
+final_rows AS(
+SELECT r.route_id,r.route_name,r.active_flag,t.route_path,t.tree_depth,
+COALESCE(a.shipment_count,0)AS shipment_count,COALESCE(a.total_delay,0)AS total_delay,
+COALESCE(a.total_damage,0)AS total_damage,COALESCE(a.average_delay,0)AS average_delay,
+a.farthest_event_meters,a.channel_list,a.shipment_json,
+CASE WHEN e.route_id IS NULL THEN'INELIGIBLE'ELSE'ELIGIBLE'END AS eligibility,
+top_shipment.shipment_id AS top_shipment_id,top_shipment.delay_minutes AS top_delay,
+(SELECT MAX(d.running_damage)FROM analytic_daily d WHERE d.route_id=r.route_id)AS peak_running_damage,
+(SELECT JSON_ARRAYAGG(er.tag_value)FROM event_rows er WHERE er.route_id=r.route_id)AS tags_json
+FROM routes r
+JOIN route_tree t ON t.route_id=r.route_id
+LEFT JOIN route_rollup a ON a.route_id=r.route_id
+LEFT JOIN(SELECT DISTINCT route_id FROM eligible)AS e ON e.route_id=r.route_id
+LEFT JOIN LATERAL(
+SELECT f.shipment_id,f.delay_minutes
+FROM shipment_facts f
+WHERE f.route_id=r.route_id
+ORDER BY f.delay_minutes DESC,f.shipment_id
+LIMIT 1
+)AS top_shipment ON TRUE
+)
+SELECT
+CASE
+WHEN(SELECT COUNT(*)FROM calendar)=7
+AND(SELECT COUNT(*)FROM route_tree)=4
+AND(SELECT COUNT(*)FROM shipments)=5
+AND(SELECT COUNT(*)FROM event_base)=10
+AND(SELECT SUM(delay_minutes)FROM shipment_facts)=68
+AND(SELECT COUNT(*)FROM rollup_rows WHERE route_grouped=1 AND channel_grouped=1)=1
+AND(SELECT JSON_VALUE(config,'$.required[1]'RETURNING CHAR(20))FROM policy)='insured'
+THEN'PASS'ELSE'FAIL'END AS status,
+f.route_id,f.route_name,f.active_flag,f.tree_depth,f.shipment_count,
+f.total_delay,f.total_damage,f.average_delay,f.eligibility,
+f.top_shipment_id,f.top_delay,f.peak_running_damage,f.channel_list,
+JSON_MERGE_PATCH(
+JSON_OBJECT(
+'path',f.route_path,
+'shipments',f.shipment_json,
+'tags',f.tags_json
+),
+JSON_OBJECT(
+'checks',JSON_OBJECT(
+'name_fragment',REGEXP_SUBSTR(f.route_name,'^[A-Za-z]+'),
+'has_priority',COALESCE('priority'MEMBER OF(f.tags_json),FALSE),
+'within_delay',f.average_delay<=(SELECT delay_limit FROM params),
+'distance_m',f.farthest_event_meters,
+'path_present',JSON_CONTAINS_PATH(JSON_OBJECT('path',f.route_path),'one','$.path')
+),
+'grand_delay',(
+SELECT total_delay
+FROM rollup_rows rr
+WHERE rr.route_grouped=1
+AND rr.channel_grouped=1
+)
+)
+)AS evidence
+FROM final_rows f
+ORDER BY f.route_id;
+
+SELECT CASE
+WHEN(SELECT COUNT(*)FROM fb_account)=3
+AND(SELECT COUNT(*)FROM fb_document)=4
+AND(SELECT COUNT(*)FROM fb_document WHERE doc_id=999)=0
+AND(SELECT COUNT(*)FROM fb_document WHERE doc_id=104)=1
+AND(SELECT COUNT(*)FROM fb_document WHERE JSON_EXTRACT(payload,'$.crud.updated')=TRUE)=2
+AND(SELECT COUNT(*)FROM fb_document WHERE JSON_EXTRACT(payload,'$.crud.cte_update')=TRUE)=1
+AND(SELECT COUNT(*)FROM fb_audit WHERE operation_code='INSERT')=5
+AND(SELECT COUNT(*)FROM fb_audit WHERE operation_code='UPDATE')>=3
+AND(SELECT COUNT(*)FROM fb_audit WHERE operation_code='DELETE')=1
+THEN'PASS'ELSE'FAIL'END AS crud_certification,
+(SELECT COUNT(*)FROM fb_audit)AS audit_rows,
+JSON_OBJECT(
+'created_accounts',(SELECT COUNT(*)FROM fb_account),
+'remaining_documents',(SELECT COUNT(*)FROM fb_document),
+'updated_documents',(SELECT COUNT(*)FROM fb_audit WHERE operation_code='UPDATE'),
+'deleted_documents',(SELECT COUNT(*)FROM fb_audit WHERE operation_code='DELETE'),
+'rollback_restored',(SELECT COUNT(*)FROM fb_document WHERE doc_id=104)
+)AS evidence;

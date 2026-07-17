@@ -158,7 +158,7 @@ ORDER BY f.node_id;
 -- source: test_mariadb/test13.txt
 -- db: MariaDB
 -- metadata: test_mariadb/test13.txt inferred catalog
--- checked: 448
+-- checked: 450
 -- missing: 0
 -- marker: [[word]] means not suggested for the tested prefix
 -- missing tokens: none

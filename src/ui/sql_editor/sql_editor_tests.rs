@@ -1053,6 +1053,50 @@ fn format_sql_certifies_mariadb_test11_gauntlet() {
 }
 
 #[test]
+fn format_sql_certifies_mysql_test10_crud_final_boss() {
+    assert_mysql_family_format_certification_gauntlet(
+        "test_mysql/test10.txt",
+        include_str!("../../../test_mysql/test10.txt"),
+        crate::db::connection::DatabaseType::MySQL,
+        &[
+            "VARBINARY(32) INVISIBLE",
+            "CAST(payload -> '$.tags' AS CHAR(24) ARRAY)",
+            "CREATE PROCEDURE fb_run_crud()",
+            "CREATE TRIGGER fb_document_ad\n    AFTER DELETE",
+            "JOIN JSON_TABLE(",
+            "UPDATE fb_document d",
+            "DELETE FROM fb_document",
+            "JOIN LATERAL (",
+            "GROUPING(route_id)",
+            "END AS crud_certification",
+        ],
+    );
+}
+
+#[test]
+fn format_sql_certifies_mariadb_test15_crud_final_boss() {
+    assert_mysql_family_format_certification_gauntlet(
+        "test_mariadb/test15.txt",
+        include_str!("../../../test_mariadb/test15.txt"),
+        crate::db::connection::DatabaseType::MariaDB,
+        &[
+            "CREATE SEQUENCE fb_job_seq",
+            "VECTOR INDEX ix_fb_worker_embedding",
+            "PERIOD FOR validity (valid_from, valid_to)",
+            "validity WITHOUT OVERLAPS",
+            "CREATE OR REPLACE PROCEDURE fb_run_crud()",
+            "CREATE OR REPLACE TRIGGER fb_job_ad\n    AFTER DELETE",
+            "UPDATE fb_rate\nFOR PORTION OF validity",
+            "DELETE FROM fb_job",
+            "RETURNING job_id,",
+            "CYCLE worker_id RESTRICT",
+            "INTERSECT ALL",
+            "END AS crud_certification",
+        ],
+    );
+}
+
+#[test]
 fn format_sql_preserves_mariadb_final_boss_script() {
     let input = load_mariadb_test_file("test1.txt");
     assert!(
@@ -8722,9 +8766,9 @@ fn format_sql_keeps_plsql_case_assignment_and_end_loop_depth() {
         .iter()
         .position(|line| line.trim_start().starts_with("v_text :="))
         .unwrap_or(0);
-    let case_idx = lines
+    let when_idx = lines
         .iter()
-        .position(|line| line.trim_start() == "CASE")
+        .position(|line| line.trim_start().starts_with("WHEN 1 = 1 THEN"))
         .unwrap_or(0);
     let loop_idx = lines
         .iter()
@@ -8736,8 +8780,9 @@ fn format_sql_keeps_plsql_case_assignment_and_end_loop_depth() {
         .unwrap_or(0);
 
     assert!(
-        indent(lines[case_idx]) >= indent(lines[assign_idx]),
-        "CASE assigned after := should stay aligned with or deeper than the assignment line, got:\n{}",
+        lines[assign_idx].contains("v_text := CASE")
+            && indent(lines[when_idx]) > indent(lines[assign_idx]),
+        "CASE should stay inline with := while its branch remains inside the value frame, got:\n{}",
         formatted
     );
     assert!(

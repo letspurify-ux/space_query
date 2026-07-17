@@ -1831,6 +1831,7 @@ struct ParenSemanticFlags {
     keep: bool,
     structured_table_function: bool,
     expanded_structured_table_function: bool,
+    fixed_type_modifier: bool,
 }
 
 #[derive(Clone)]
@@ -14128,6 +14129,13 @@ impl SqlEditorWidget {
                                     )
                                     .is_some()
                                 });
+                            let follows_assignment_operator = matches!(
+                                loop_previous_non_comment_token,
+                                Some(SqlToken::Symbol(symbol))
+                                    if matches!(symbol.as_str(), "=" | ":=")
+                            ) && format_stack
+                                .assignment_value_depth_at_scope(current_scope)
+                                .is_some();
                             let follows_concatenation_operator = matches!(
                                 loop_previous_non_comment_token,
                                 Some(SqlToken::Symbol(symbol)) if symbol == "||"
@@ -14221,19 +14229,9 @@ impl SqlEditorWidget {
                                         &mut needs_space,
                                         &mut line_indent,
                                     );
-                                } else if matches!(
-                                    loop_previous_non_comment_token,
-                                    Some(SqlToken::Symbol(symbol))
-                                        if matches!(symbol.as_str(), "=" | ":=")
-                                ) {
-                                    newline_with(
-                                        &mut out,
-                                        base_indent!(format_stack.statement_base_depth()),
-                                        0,
-                                        &mut at_line_start,
-                                        &mut needs_space,
-                                        &mut line_indent,
-                                    );
+                                } else if follows_assignment_operator {
+                                    // An assignment value is a sibling frame whose first child
+                                    // remains inline with its owner (`target = CASE`).
                                 } else if active_phase1_wrapped_owner_kind
                                     == Some(FormatIndentedParenOwnerKind::WithinGroup)
                                     && matches!(prev_word_upper, Some("BY"))
@@ -14337,7 +14335,7 @@ impl SqlEditorWidget {
                                         &mut line_indent,
                                     );
                                 }
-                            } else if in_plsql_block {
+                            } else if in_plsql_block && !follows_assignment_operator {
                                 let paren_extra = Self::paren_extra_depth(&format_stack);
                                 let in_case_branch_body = format_stack.last_block_kind_is("CASE")
                                     && format_stack.last_case_branch_started();
@@ -15462,7 +15460,16 @@ impl SqlEditorWidget {
                             .flatten()
                             .filter(|frame| frame.suppresses_comma_breaks())
                             .and_then(|frame| frame.sibling_body_indent());
-                        let case_owner_indent = compact_paren_case_owner_indent
+                        let assignment_case_owner_indent = (!at_line_start
+                            && matches!(
+                                loop_previous_non_comment_token,
+                                Some(SqlToken::Symbol(sym))
+                                    if matches!(sym.as_str(), "=" | ":=")
+                            ))
+                        .then(|| format_stack.assignment_value_depth_at_scope(current_scope))
+                        .flatten();
+                        let case_owner_indent = assignment_case_owner_indent
+                            .or(compact_paren_case_owner_indent)
                             .map_or(line_indent, |sibling| line_indent.max(sibling));
                         format_stack.push_block_for_render(
                             BlockKind::Case,
@@ -17584,6 +17591,9 @@ impl SqlEditorWidget {
                                     format_stack
                                         .last_paren_stack_frame()
                                         .is_some_and(|frame| frame.direct_list_body)
+                                        || format_stack.last_paren_stack_frame().is_some_and(
+                                            |frame| frame.semantic_flags.fixed_type_modifier,
+                                        )
                                         || is_with_cte_separator,
                                 );
                             }
@@ -17914,7 +17924,14 @@ impl SqlEditorWidget {
                                             | "SELECT"
                                     )
                                 );
-                            let paren_frame_kind = if ((!paren_body_is_empty)
+                            let is_fixed_type_modifier = Self::paren_is_fixed_type_modifier(
+                                tokens,
+                                idx,
+                                Some(matching_paren_close_indices),
+                            );
+                            let paren_frame_kind = if is_fixed_type_modifier {
+                                ParenFormatFrameKind::Compact
+                            } else if ((!paren_body_is_empty)
                                 && (multiline_clause_owner_kind
                                     == Some(FormatIndentedParenOwnerKind::Window)
                                     || is_analytic_over_paren))
@@ -18443,8 +18460,10 @@ impl SqlEditorWidget {
                                 structured_table_function: is_structured_table_function,
                                 expanded_structured_table_function:
                                     is_structured_multiline_table_function,
+                                fixed_type_modifier: is_fixed_type_modifier,
                             };
                             let owns_direct_list_body = paren_has_top_level_comma
+                                && !is_fixed_type_modifier
                                 && !paren_frame_kind.is_query_like()
                                 && !is_query_paren
                                 && multiline_clause_owner_kind.is_none()
@@ -19993,6 +20012,73 @@ impl SqlEditorWidget {
             Some(paren_body_analyses.as_slice()),
         )
         .has_top_level_comma
+    }
+
+    fn paren_is_fixed_type_modifier(
+        tokens: &[SqlToken],
+        open_idx: usize,
+        matching_paren_close_indices: Option<&[Option<usize>]>,
+    ) -> bool {
+        let Some(SqlToken::Word(type_name)) =
+            Self::previous_meaningful_token_index(tokens, open_idx).and_then(|idx| tokens.get(idx))
+        else {
+            return false;
+        };
+        if !matches!(
+            type_name.to_ascii_uppercase().as_str(),
+            "DEC" | "DECIMAL" | "FIXED" | "NUMERIC" | "NUMBER" | "FLOAT" | "DOUBLE" | "REAL"
+        ) {
+            return false;
+        }
+
+        let Some(close_idx) =
+            Self::matching_close_paren_index(tokens, open_idx, matching_paren_close_indices)
+        else {
+            return false;
+        };
+        // Precision/scale accepts only two small numeric grammar slots. The
+        // bound also prevents a malformed type-like call from causing a long
+        // secondary scan on very large scripts.
+        if close_idx <= open_idx.saturating_add(1) || close_idx.saturating_sub(open_idx) > 6 {
+            return false;
+        }
+
+        let mut value_count = 0usize;
+        let mut comma_count = 0usize;
+        let mut expects_value = true;
+        let mut saw_sign = false;
+        for token in &tokens[open_idx.saturating_add(1)..close_idx] {
+            match token {
+                SqlToken::Word(value)
+                    if expects_value
+                        && value.as_bytes().iter().all(u8::is_ascii_digit)
+                        && !value.is_empty() =>
+                {
+                    value_count += 1;
+                    expects_value = false;
+                    saw_sign = false;
+                }
+                SqlToken::Symbol(symbol)
+                    if expects_value && !saw_sign && matches!(symbol.as_str(), "+" | "-") =>
+                {
+                    saw_sign = true;
+                }
+                SqlToken::Symbol(symbol) if expects_value && symbol == "*" && !saw_sign => {
+                    value_count += 1;
+                    expects_value = false;
+                }
+                SqlToken::Symbol(symbol) if !expects_value && symbol == "," && comma_count == 0 => {
+                    comma_count += 1;
+                    expects_value = true;
+                }
+                SqlToken::Comment(_)
+                | SqlToken::String(_)
+                | SqlToken::Word(_)
+                | SqlToken::Symbol(_) => return false,
+            }
+        }
+
+        value_count == 2 && comma_count == 1 && !expects_value
     }
 
     #[cfg(test)]
@@ -22036,16 +22122,11 @@ END oqt_mega_pkg;"#;
             .iter()
             .position(|line| line.trim_start().starts_with("v :="))
             .expect("assignment line");
-        let case_idx = lines
-            .iter()
-            .enumerate()
-            .skip(assignment_idx + 1)
-            .find(|(_, line)| {
-                line.trim_start().starts_with("CASE")
-                    || (line.contains(" CASE") && !line.trim_start().starts_with("END "))
-            })
-            .map(|(idx, _)| idx)
-            .expect("CASE line");
+        let case_idx = assignment_idx;
+        assert!(
+            lines[case_idx].contains("v := CASE"),
+            "assignment CASE should stay inline with :=, got:\n{formatted}"
+        );
         let outer_when_idx = lines
             .iter()
             .enumerate()
@@ -22093,15 +22174,9 @@ END oqt_mega_pkg;"#;
             .expect("outer END line");
 
         assert_eq!(
-            indent(lines[case_idx]),
-            indent(lines[assignment_idx]).saturating_add(4),
-            "CASE after := should indent one level deeper than the assignment owner, got:\n{}",
-            formatted
-        );
-        assert_eq!(
             indent(lines[outer_when_idx]),
-            indent(lines[case_idx]).saturating_add(4),
-            "outer WHEN should indent one level deeper than CASE, got:\n{}",
+            indent(lines[assignment_idx]).saturating_add(8),
+            "outer WHEN should consume assignment-value and CASE-branch depths, got:\n{}",
             formatted
         );
         assert_eq!(
@@ -22118,8 +22193,8 @@ END oqt_mega_pkg;"#;
         );
         assert_eq!(
             indent(lines[outer_end_idx]),
-            indent(lines[case_idx]),
-            "outer CASE END should align with the CASE header, got:\n{}",
+            indent(lines[outer_when_idx]).saturating_sub(4),
+            "outer CASE END should close the branch depth, got:\n{}",
             formatted
         );
 
@@ -22273,26 +22348,23 @@ END fmt_pkg_extreme;"#;
             .iter()
             .position(|line| line.trim_start().starts_with("g_last_mode :="))
             .expect("assignment line");
-        let case_idx = lines
+        let when_idx = lines
             .iter()
             .enumerate()
             .skip(assignment_idx + 1)
-            .find(|(_, line)| {
-                line.trim_start().starts_with("CASE")
-                    || (line.contains(" CASE") && !line.trim_start().starts_with("END "))
-            })
+            .find(|(_, line)| line.trim_start().starts_with("WHEN TO_CHAR"))
             .map(|(idx, _)| idx)
-            .expect("CASE line");
+            .expect("CASE branch line");
 
         assert!(
             formatted.contains("END calc_mode;\nBEGIN\n    g_last_mode :="),
             "package body initializer BEGIN should not remain indented under declarations, got:\n{}",
             formatted
         );
-        assert_eq!(
-            indent(lines[case_idx]),
-            indent(lines[assignment_idx]).saturating_add(4),
-            "initializer CASE should indent one level deeper than the := owner, got:\n{}",
+        assert!(
+            lines[assignment_idx].contains("g_last_mode := CASE")
+                && indent(lines[when_idx]) > indent(lines[assignment_idx]),
+            "initializer CASE should stay inline while its branch remains nested, got:\n{}",
             formatted
         );
         assert!(
@@ -29348,7 +29420,7 @@ END;"#;
     }
 
     #[test]
-    fn format_sql_basic_oracle_split_case_expression_stays_below_expression_owner() {
+    fn format_sql_basic_oracle_split_case_expression_keeps_first_child_inline() {
         let source = r#"UPDATE emp e
 SET e.comm = (
         SELECT
@@ -29372,21 +29444,25 @@ SET e.comm = (
         let select_case_idx = select_idx;
         let assignment_idx = find_line_starting_with(&lines, "e.job =")
             .unwrap_or_else(|| panic!("CASE assignment, got:\n{formatted}"));
-        let assignment_case_idx = lines
+        assert!(
+            lines[assignment_idx].contains("e.job = CASE"),
+            "assignment CASE should stay inline with its expression owner, got:\n{formatted}"
+        );
+        let assignment_when_idx = lines
             .iter()
             .enumerate()
             .skip(assignment_idx + 1)
-            .find(|(_, line)| line.trim_start().starts_with("CASE"))
+            .find(|(_, line)| line.trim_start().starts_with("WHEN e.sal"))
             .map(|(idx, _)| idx)
-            .expect("assignment CASE");
+            .expect("assignment CASE branch");
 
         assert!(
             lines[select_case_idx].contains("SELECT CASE"),
             "got:\n{formatted}"
         );
         assert!(
-            leading_spaces(lines[assignment_case_idx]) > leading_spaces(lines[assignment_idx]),
-            "assignment CASE should stay below its expression owner, got:\n{formatted}"
+            leading_spaces(lines[assignment_when_idx]) > leading_spaces(lines[assignment_idx]),
+            "assignment CASE branch should stay inside its value frame, got:\n{formatted}"
         );
         assert_eq!(SqlEditorWidget::format_sql_basic(&formatted), formatted);
     }
@@ -44992,7 +45068,7 @@ END"#;
     }
 
     #[test]
-    fn format_sql_basic_for_mysql_db_type_indents_each_assignment_case_from_its_owner() {
+    fn format_sql_basic_for_mysql_db_type_keeps_assignment_case_inline_with_shared_branch_depth() {
         let source = r#"UPDATE task
 SET status_code = CASE WHEN task_id = 1 THEN 'done' ELSE status_code END,
     `rank` = CASE WHEN task_id = 2 THEN `rank` + 1 ELSE `rank` END
@@ -45005,31 +45081,37 @@ WHERE task_id IN (1, 2);"#;
         let status_idx =
             find_line_starting_with(&lines, "SET status_code =").expect("status owner");
         let rank_idx = find_line_starting_with(&lines, "`rank` =").expect("rank owner");
-        let case_indices: Vec<usize> = lines
+        assert!(
+            lines[status_idx].contains("status_code = CASE"),
+            "first assignment CASE should stay inline with its owner, got:\n{formatted}"
+        );
+        assert!(
+            lines[rank_idx].contains("`rank` = CASE"),
+            "later assignment CASE should stay inline with its owner, got:\n{formatted}"
+        );
+        let when_indices: Vec<usize> = lines
             .iter()
             .enumerate()
-            .filter(|(_, line)| line.trim() == "CASE")
+            .filter(|(_, line)| line.trim_start().starts_with("WHEN task_id ="))
             .map(|(idx, _)| idx)
             .collect();
         assert_eq!(
-            case_indices.len(),
+            when_indices.len(),
             2,
-            "expected two CASE lines, got:\n{formatted}"
+            "expected two assignment CASE branches, got:\n{formatted}"
+        );
+        assert!(
+            leading_spaces(lines[when_indices[0]]) > leading_spaces(lines[status_idx]),
+            "the first CASE branch should stay inside its assignment-value frame, got:\n{formatted}"
+        );
+        assert!(
+            leading_spaces(lines[when_indices[1]]) > leading_spaces(lines[rank_idx]),
+            "the second CASE branch should stay inside its assignment-value frame, got:\n{formatted}"
         );
         assert_eq!(
-            leading_spaces(lines[case_indices[0]]),
-            leading_spaces(lines[status_idx]).saturating_add(8),
-            "the first inline SET child should still consume its list-child depth before the assignment-value frame, got:\n{formatted}"
-        );
-        assert_eq!(
-            leading_spaces(lines[case_indices[1]]),
-            leading_spaces(lines[rank_idx]).saturating_add(4),
-            "second CASE should be one frame below its assignment, got:\n{formatted}"
-        );
-        assert_eq!(
-            leading_spaces(lines[case_indices[0]]),
-            leading_spaces(lines[case_indices[1]]),
-            "same-frame assignment values should render at the same depth even when the first assignment starts inline, got:\n{formatted}"
+            leading_spaces(lines[when_indices[0]]),
+            leading_spaces(lines[when_indices[1]]),
+            "same-frame assignment CASE branches should render at the same depth, got:\n{formatted}"
         );
     }
 

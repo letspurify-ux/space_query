@@ -3952,3 +3952,140 @@ fn is_builtin_highlight_word(upper: &str, db_type: DatabaseType) -> bool {
 | `cargo test` | 전체 통과(lib 6,575 통과 · 229 ignored, 가드 71 통과 포함), 실패 0 |
 | `cargo clippy --locked --all-targets -- -D warnings -W clippy::perf -W clippy::complexity` | 통과, 경고 0 |
 | `cargo fmt --all -- --check` / `git diff --check` | 통과 |
+
+# 29차: MySQL/MariaDB CRUD Final Boss VII 전수 인증 (2026-07-17)
+
+## 29-1. 실행 가능한 CRUD 최종 보스 스크립트 추가
+
+- MySQL `test_mysql/test10.txt`: 전용 데이터베이스 안에서 테이블·인덱스·뷰·함수·
+  프로시저·트리거를 생성하고, JSON/공간 타입·CTE·JSON_TABLE·윈도 함수·LATERAL·
+  ROLLUP·prepared statement를 결합해 CREATE/READ/UPDATE/DELETE와 트랜잭션
+  ROLLBACK을 검증한다.
+- MariaDB `test_mariadb/test15.txt`: 전용 데이터베이스 안에서 sequence·VECTOR·
+  dynamic column·INET6·application-time PERIOD와 루틴·트리거를 생성하고,
+  FOR PORTION OF·RETURNING·EXECUTE IMMEDIATE·CYCLE·INTERSECT ALL·EXCEPT ALL을
+  결합해 CRUD와 트랜잭션을 검증한다.
+- MySQL 8.0.46과 MariaDB 12.2.2에서 각각 스크립트 전체를 실제 실행했다.
+  두 스크립트 모두 종료 코드 0, 최종 `crud_certification=PASS`, `audit_rows=9`였다.
+
+## 29-2. 하이라이팅·인텔리센스 전수 검증
+
+`syntax_highlighting_sweep_all_files_generate_out_report` 결과는 63개 파일,
+73,967단어, catalog 40,093단어, object 3,042단어, 보호 span 9,467개를 검사해
+unexpected highlight 0, failure 0이었다. 하이라이터 production 수정은 필요 없었다.
+
+인텔리센스 리포트는 새 MySQL 스크립트 1,157개 후보와 MariaDB 스크립트
+1,398개 후보를 검사해 최종 missing 0이었다. 테스트는 production completion 경로를
+호출한다. 새 스크립트에서 발견한 MariaDB dynamic column 문법 누락은 재현 테스트를
+먼저 추가한 뒤 `completion.rs`의 production 경로를 수정했다.
+
+AS-IS (커서에서 `AS` 추천 누락):
+
+```sql
+UPDATE fb_job j
+JOIN fb_worker w ON w.worker_id = j.worker_id
+SET j.score = CASE COLUMN_GET(w.properties, 'tier' A| CHAR)
+    WHEN 'gold' THEN 2
+    ELSE 1
+END;
+```
+
+TO-BE (`COLUMN_GET(blob, key AS type)`의 두 번째 인자 문맥을 인식해 `AS` 추천):
+
+```sql
+UPDATE fb_job j
+JOIN fb_worker w ON w.worker_id = j.worker_id
+SET j.score = CASE COLUMN_GET(w.properties, 'tier' AS CHAR)
+    WHEN 'gold' THEN 2
+    ELSE 1
+END;
+```
+
+Oracle fixture에서는 CTE 이름이 keyword catalog와 겹칠 때 뒤따르는 relation alias를
+추천 대상으로 잘못 검사하던 스윕 오탐을 재현 테스트로 고정하고, 문법 위치로 alias
+선언을 판정하도록 테스트 헬퍼를 수정했다. MariaDB의 INET6/VECTOR/UUID 타입 선언과
+`FOR PORTION OF <period> FROM`의 period 참조도 정의 슬롯으로 인식하게 했다.
+
+`million_line_` production/snapshot/shadow completion 성능 회귀 5건은 9.02초에
+모두 통과했다. 새 production 검사는 이미 상한이 적용된 token window만 순회하며,
+고정 타입 modifier 검사도 최대 6 token으로 제한했다.
+
+## 29-3. 자동 포맷 결과 63개·45,911줄 상세 검토 및 수정
+
+`formatting_sweep_all_files_generate_out_report` 실행 후 `target/format-sweep` 아래
+63개 `.format.out`의 45,911줄 전체를 처음부터 끝까지 검토했다. 파일별 시작/끝,
+모든 statement 구조와 의심 패턴을 원문 문맥까지 확인했으며, 주석·dynamic SQL·
+Oracle q-quote 안의 보존 텍스트는 포맷 오류에서 제외했다.
+
+`docs/auto_format_rule.md`의 frame 단일 깊이 원천, 문법 기반 부모, first-child-inline,
+closing owner 깊이, 주석/보존 텍스트 구조 중립성, 구분자 문법성, canonical/idempotent
+원칙과 대조해 자동 PASS가 놓친 공통 오류 2종을 발견했다. 각 오류는 MySQL/MariaDB/
+Oracle 재현 테스트를 먼저 추가하고 특정 fixture가 아닌 문법 프레임에서 수정했다.
+
+### 고정 숫자 타입의 precision/scale
+
+AS-IS:
+
+```sql
+DECLARE v_amount DECIMAL(18,
+    2);
+SELECT CAST(v_amount AS NUMERIC(14,
+    4));
+```
+
+TO-BE:
+
+```sql
+DECLARE v_amount DECIMAL(18, 2);
+SELECT CAST(v_amount AS NUMERIC(14, 4));
+```
+
+`DECIMAL/NUMERIC/NUMBER` 등의 고정 타입 modifier는 인자 comma-list가 아니라 compact
+문법 슬롯으로 분류한다. 선언과 CAST 모두 같은 규칙을 사용한다.
+
+### 할당식의 첫 CASE 자식
+
+AS-IS:
+
+```sql
+UPDATE fb_job j
+SET j.job_status =
+    CASE
+        WHEN j.score >= 90 THEN 'READY'
+        ELSE 'HOLD'
+    END;
+```
+
+TO-BE:
+
+```sql
+UPDATE fb_job j
+SET j.job_status = CASE
+        WHEN j.score >= 90 THEN 'READY'
+        ELSE 'HOLD'
+    END;
+```
+
+`=`/`:=` 할당값의 첫 CASE 자식은 owner line에 유지하고, WHEN/ELSE/END는 기존
+assignment-value와 CASE branch frame 깊이를 그대로 소비하도록 수정했다.
+
+최종 포맷 스윕은 63개 파일, regression 30건, frame 22,326개, boundary 49,598개,
+depth symmetry 2,864개, body item 24,281개, close 10,369개를 검사해 failure 0이었다.
+
+## 29-4. 최종 품질 게이트
+
+첫 전체 테스트에서 `completion.rs`가 MariaDB 여부를 직접 비교한 한 줄을 UI backend
+dispatch 가드가 검출했다. 동작은 유지하면서 기존 `completion_db_type_is_mariadb`
+registry helper를 사용하도록 바꾸고 production completion 재현 테스트, dispatch 가드,
+전체 테스트를 다시 실행했다.
+
+| 검증 | 결과 |
+| --- | --- |
+| `syntax_highlighting_sweep_all_files_generate_out_report` | 통과, 63개 파일 · 73,967단어 · unexpected 0 · failure 0 |
+| `intellisense_sweep_generate_report_for_file_certifies_new_final_boss_queries` | 통과, 새 MySQL 1,157개·MariaDB 1,398개 후보 missing 0 |
+| `million_line_` | 5건 통과, 9.02초 |
+| `formatting_sweep_all_files_generate_out_report` | 통과, 63개 파일 · failure 0 |
+| 전수 상세 검토 | 63개 `.format.out` · 45,911줄 · 잔여 오류 0 |
+| `cargo test` | 전체 6,745 통과 · 235 ignored · 실패 0 · doc-test 실패 0 |
+| `cargo clippy --locked --all-targets -- -D warnings -W clippy::perf -W clippy::complexity` | 통과, 경고 0 |
+| `cargo fmt --all -- --check` / `git diff --check` | 통과 |

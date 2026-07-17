@@ -179,7 +179,7 @@ ORDER BY f.customer_id;
 -- source: test_mariadb/test12.txt
 -- db: MariaDB
 -- metadata: test_mariadb/test12.txt inferred catalog
--- checked: 523
+-- checked: 524
 -- missing: 0
 -- marker: [[word]] means not suggested for the tested prefix
 -- missing tokens: none

@@ -51070,6 +51070,8 @@ fn intellisense_sweep_is_mysql_type_lead(word: &str) -> bool {
             | "FLOAT"
             | "INT"
             | "INTEGER"
+            | "INET4"
+            | "INET6"
             | "JSON"
             | "LONGBLOB"
             | "LONGTEXT"
@@ -51099,7 +51101,9 @@ fn intellisense_sweep_is_mysql_type_lead(word: &str) -> bool {
             | "VARBINARY"
             | "VARCHAR"
             | "VARCHAR2"
+            | "VECTOR"
             | "XMLTYPE"
+            | "UUID"
             | "YEAR"
     )
 }
@@ -51499,19 +51503,28 @@ fn intellisense_sweep_is_mysql_period_name(
         .iter()
         .filter_map(|token| token_word_text(Some(token)).map(str::to_ascii_uppercase))
         .collect::<Vec<_>>();
-    words.len() >= 3
+    let original_upper = original.to_ascii_uppercase();
+    let period_declaration = words.len() >= 3
         && words.get(words.len() - 3).is_some_and(|word| word == "PERIOD")
         && words.get(words.len() - 2).is_some_and(|word| word == "FOR")
-        && words.last().is_some_and(|word| {
-            original
-                .to_ascii_uppercase()
-                .starts_with(word.as_str())
-        })
+        && words
+            .last()
+            .is_some_and(|word| original_upper.starts_with(word.as_str()))
         && sql
             .get(cursor..)
             .unwrap_or("")
             .trim_start()
-            .starts_with('(')
+            .starts_with('(');
+    let portion_reference = words.len() >= 4
+        && words.get(words.len() - 4).is_some_and(|word| word == "FOR")
+        && words.get(words.len() - 3).is_some_and(|word| word == "PORTION")
+        && words.get(words.len() - 2).is_some_and(|word| word == "OF")
+        && words
+            .last()
+            .is_some_and(|word| original_upper.starts_with(word.as_str()))
+        && intellisense_sweep_next_meaningful_word(sql, cursor)
+            .is_some_and(|word| word.eq_ignore_ascii_case("FROM"));
+    period_declaration || portion_reference
 }
 
 fn intellisense_sweep_is_mysql_index_name_definition(
@@ -51707,16 +51720,49 @@ fn intellisense_sweep_is_relation_alias_definition(
         .iter()
         .filter_map(|token| token_word_text(Some(token)).map(|word| word.to_ascii_uppercase()))
         .collect::<Vec<_>>();
-    let Some(previous_relation) = words.last() else {
-        return false;
-    };
-    if crate::sql_text::is_sql_keyword_for_db(previous_relation, db_type) {
-        return false;
-    }
     matches!(
         words.iter().rev().nth(1).map(String::as_str),
         Some("FROM" | "JOIN" | "STRAIGHT_JOIN" | "UPDATE" | "INTO" | "TABLE")
     )
+}
+
+#[test]
+fn intellisense_sweep_skips_plain_relation_alias_definition() {
+    use crate::db::DatabaseType::Oracle;
+
+    let script = "WITH events AS (SELECT 1 event_id FROM dual), metric_rows AS (SELECT e.event_id FROM events e CROSS APPLY JSON_TABLE('{}', '$' COLUMNS (value NUMBER PATH '$.value')) j) SELECT * FROM metric_rows";
+    let alias_start = script.find("events e CROSS").expect("relation alias") + "events ".len();
+    let candidate = IntellisenseSweepCandidate {
+        start: alias_start,
+        end: alias_start + 1,
+        word: "e".to_string(),
+        prefix: "e".to_string(),
+        replacement: "e".to_string(),
+        cursor: alias_start + 1,
+    };
+    let direct_tokens = super::query_text::tokenize_sql(script.get(..candidate.cursor).unwrap());
+    assert!(
+        intellisense_sweep_is_relation_alias_definition(
+            &direct_tokens,
+            direct_tokens.len().saturating_sub(1),
+            "e",
+            Oracle,
+        ),
+        "direct alias recognition failed: keyword={} tokens={direct_tokens:?}",
+        crate::sql_text::is_sql_keyword_for_db("E", Oracle),
+    );
+    let result = intellisense_sweep_check_candidate(
+        script,
+        &ChunkedText::from_str(script),
+        Oracle,
+        &IntellisenseData::new(),
+        &candidate,
+    );
+
+    assert!(
+        !result.checked && result.missing.is_none(),
+        "a newly declared relation alias is not a completion candidate"
+    );
 }
 
 fn intellisense_sweep_is_drop_object_without_create_metadata(
@@ -53427,6 +53473,8 @@ fn intellisense_sweep_generate_report_for_file_certifies_new_final_boss_queries(
     mariadb_test_words_generate_out_report("test13.txt", true);
     mysql_test_words_generate_out_report("test9.txt", true);
     mariadb_test_words_generate_out_report("test14.txt", true);
+    mysql_test_words_generate_out_report("test10.txt", true);
+    mariadb_test_words_generate_out_report("test15.txt", true);
 }
 
 #[test]
@@ -53475,6 +53523,18 @@ fn mysql_test9_words_generate_out_report() {
 #[ignore = "generates the MariaDB final-boss VI IntelliSense sweep report"]
 fn mariadb_test14_words_generate_out_report() {
     mariadb_test_words_generate_out_report("test14.txt", true);
+}
+
+#[test]
+#[ignore = "generates the MySQL CRUD final-boss VII IntelliSense sweep report"]
+fn mysql_test10_words_generate_out_report() {
+    mysql_test_words_generate_out_report("test10.txt", true);
+}
+
+#[test]
+#[ignore = "generates the MariaDB CRUD final-boss VII IntelliSense sweep report"]
+fn mariadb_test15_words_generate_out_report() {
+    mariadb_test_words_generate_out_report("test15.txt", true);
 }
 
 #[test]
@@ -91915,6 +91975,16 @@ fn sweep_mysql_family_new_fixture_definition_slots_are_skipped() {
             MariaDB,
         ),
         (
+            "CREATE TABLE t(host___CODEX_CURSOR__ INET6 NOT NULL)",
+            "host_addr",
+            MariaDB,
+        ),
+        (
+            "UPDATE t FOR PORTION OF vali__CODEX_CURSOR__ FROM '2026-01-01' TO '2026-02-01' SET value=1",
+            "validity",
+            MariaDB,
+        ),
+        (
             "CREATE TABLE t(v VECTOR(3),VECTOR INDEX ix_m__CODEX_CURSOR__(v) M=4 DISTANCE=cosine)",
             "ix_mb_asset_embedding",
             MariaDB,
@@ -92116,6 +92186,24 @@ fn mysql_family_new_fixture_structural_keyword_regressions() {
         "new fixture structural completion gaps:\n{}",
         failures.join("\n")
     );
+}
+
+#[test]
+fn mariadb_column_get_type_separator_uses_production_completion() {
+    use crate::db::DatabaseType::MariaDB;
+
+    for sql in [
+        "SELECT COLUMN_GET(properties,'tier' A| CHAR) FROM workers",
+        "UPDATE jobs j JOIN workers w ON w.id=j.worker_id SET j.score=CASE COLUMN_GET(w.properties,'tier' A| CHAR) WHEN 'gold' THEN 2 ELSE 1 END",
+    ] {
+        let suggestions = query_keyword_completion_suggestions(sql, MariaDB);
+        assert!(
+            suggestions
+                .iter()
+                .any(|suggestion| suggestion.eq_ignore_ascii_case("AS")),
+            "MariaDB COLUMN_GET type separator missing at `{sql}`: {suggestions:?}"
+        );
+    }
 }
 
 #[test]

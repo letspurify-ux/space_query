@@ -22753,6 +22753,56 @@ impl SqlEditorWidget {
         (Self::cursor_follows_complete_operand(tokens, end) == Some(true)).then_some(&["AS"])
     }
 
+    /// MariaDB dynamic-column reads use `COLUMN_GET(blob, key AS type)`.
+    /// The `AS` belongs to the function's second argument grammar, so it must
+    /// win over an enclosing CASE/UPDATE expression's broader continuations.
+    fn expected_mariadb_column_get_as_keyword_candidates(
+        tokens: &[SqlToken],
+        end: usize,
+        db_type: Option<crate::db::DatabaseType>,
+    ) -> Option<&'static [&'static str]> {
+        if !completion_db_type_is_mariadb(db_type) {
+            return None;
+        }
+        let end = end.min(tokens.len());
+        let open_idx = Self::nearest_unclosed_open_paren_before(tokens, end)?;
+        let follows_column_get = tokens
+            .get(..open_idx)
+            .unwrap_or(&[])
+            .iter()
+            .rev()
+            .find(|token| !matches!(token, SqlToken::Comment(_)))
+            .is_some_and(|token| {
+                matches!(token, SqlToken::Word(word) if word.eq_ignore_ascii_case("COLUMN_GET"))
+            });
+        if !follows_column_get {
+            return None;
+        }
+
+        let mut depth = 0usize;
+        let mut top_level_commas = 0usize;
+        for token in tokens.get(open_idx + 1..end).unwrap_or(&[]) {
+            match token {
+                SqlToken::Symbol(symbol) if matches!(symbol.as_str(), "(" | "[") => {
+                    depth = depth.saturating_add(1);
+                }
+                SqlToken::Symbol(symbol) if matches!(symbol.as_str(), ")" | "]") => {
+                    depth = depth.saturating_sub(1);
+                }
+                SqlToken::Symbol(symbol) if symbol == "," && depth == 0 => {
+                    top_level_commas = top_level_commas.saturating_add(1);
+                }
+                SqlToken::Word(word) if depth == 0 && word.eq_ignore_ascii_case("AS") => {
+                    return None;
+                }
+                _ => {}
+            }
+        }
+
+        (top_level_commas == 1 && Self::cursor_follows_complete_operand(tokens, end) == Some(true))
+            .then_some(&["AS"])
+    }
+
     fn expected_table_alias_as_keyword_candidates(
         tokens: &[SqlToken],
         end: usize,
@@ -51970,6 +52020,18 @@ impl SqlEditorWidget {
                 ExtractArgPosition::AwaitingFrom => &["FROM"],
             };
             return Self::filter_expected_candidates(prefix, candidates);
+        }
+        for (source_tokens, source_end) in [
+            (tokens, context_end),
+            (statement_tokens, statement_context_end),
+        ] {
+            if let Some(candidates) = Self::expected_mariadb_column_get_as_keyword_candidates(
+                source_tokens,
+                source_end,
+                db_type,
+            ) {
+                return Self::filter_expected_candidates(prefix, candidates);
+            }
         }
         for (source_tokens, source_end) in [
             (tokens, context_end),
