@@ -124,6 +124,7 @@ struct MysqlFamilyScriptCatalog {
     sequences: Vec<String>,
     synonyms: Vec<String>,
     triggers: Vec<String>,
+    events: Vec<String>,
     indexes: Vec<String>,
     schemas: Vec<String>,
     users: Vec<String>,
@@ -435,6 +436,15 @@ fn mysql_family_catalog_from_script(script: &str) -> MysqlFamilyScriptCatalog {
             if token_word_eq(tokens.get(kind_idx), "TEMPORARY") {
                 kind_idx += 1;
             }
+            if token_word_eq(tokens.get(kind_idx), "ALGORITHM") {
+                kind_idx += 1;
+                if matches!(tokens.get(kind_idx), Some(SqlToken::Symbol(symbol)) if symbol == "=") {
+                    kind_idx += 1;
+                }
+                if token_word_text(tokens.get(kind_idx)).is_some() {
+                    kind_idx += 1;
+                }
+            }
             let Some(kind) = token_word_text(tokens.get(kind_idx)) else {
                 idx += 1;
                 continue;
@@ -524,6 +534,16 @@ fn mysql_family_catalog_from_script(script: &str) -> MysqlFamilyScriptCatalog {
                         push_unique_case_insensitive(&mut catalog.triggers, name);
                     }
                 }
+                "EVENT" => {
+                    if let Some(name) = token_word_text(tokens.get(name_idx)) {
+                        push_unique_case_insensitive(&mut catalog.events, name);
+                    }
+                }
+                "SEQUENCE" => {
+                    if let Some(name) = token_word_text(tokens.get(name_idx)) {
+                        push_unique_case_insensitive(&mut catalog.sequences, name);
+                    }
+                }
                 "INDEX" => {
                     if let Some(name) = token_word_text(tokens.get(name_idx)) {
                         push_unique_case_insensitive(&mut catalog.indexes, name);
@@ -547,6 +567,54 @@ fn mysql_family_catalog_from_script(script: &str) -> MysqlFamilyScriptCatalog {
         }
         idx += 1;
     }
+    let mut idx = 0usize;
+    while idx + 4 < tokens.len() {
+        if token_word_eq(tokens.get(idx), "ALTER")
+            && token_word_eq(tokens.get(idx + 1), "TABLE")
+        {
+            if let Some(table_name) = token_word_text(tokens.get(idx + 2)) {
+                let statement_end = tokens
+                    .iter()
+                    .enumerate()
+                    .skip(idx + 3)
+                    .find_map(|(token_idx, token)| {
+                        matches!(token, SqlToken::Symbol(symbol) if symbol == ";")
+                            .then_some(token_idx)
+                    })
+                    .unwrap_or(tokens.len());
+                let columns = catalog
+                    .columns
+                    .entry(table_name.to_ascii_uppercase())
+                    .or_default();
+                let mut action_idx = idx + 3;
+                while action_idx + 2 < statement_end {
+                    if token_word_eq(tokens.get(action_idx), "ADD")
+                        && token_word_eq(tokens.get(action_idx + 1), "COLUMN")
+                    {
+                        if let Some(column) = token_word_text(tokens.get(action_idx + 2)) {
+                            push_unique_case_insensitive(columns, column);
+                        }
+                    }
+                    action_idx += 1;
+                }
+            }
+        }
+        if token_word_eq(tokens.get(idx), "RENAME")
+            && token_word_eq(tokens.get(idx + 1), "TABLE")
+            && token_word_eq(tokens.get(idx + 3), "TO")
+        {
+            if let (Some(old_name), Some(new_name)) = (
+                token_word_text(tokens.get(idx + 2)),
+                token_word_text(tokens.get(idx + 4)),
+            ) {
+                push_unique_case_insensitive(&mut catalog.tables, new_name);
+                if let Some(columns) = catalog.columns.get(&old_name.to_ascii_uppercase()).cloned() {
+                    catalog.columns.insert(new_name.to_ascii_uppercase(), columns);
+                }
+            }
+        }
+        idx += 1;
+    }
     for name in collect_mysql_create_routine_names_from_text(script, "PROCEDURE") {
         push_unique_case_insensitive(&mut catalog.procedures, &name);
     }
@@ -555,6 +623,12 @@ fn mysql_family_catalog_from_script(script: &str) -> MysqlFamilyScriptCatalog {
     }
     for name in collect_mysql_create_routine_names_from_text(script, "TRIGGER") {
         push_unique_case_insensitive(&mut catalog.triggers, &name);
+    }
+    for name in collect_mysql_create_routine_names_from_text(script, "EVENT") {
+        push_unique_case_insensitive(&mut catalog.events, &name);
+    }
+    for name in collect_mysql_create_routine_names_from_text(script, "SEQUENCE") {
+        push_unique_case_insensitive(&mut catalog.sequences, &name);
     }
     for (table, columns) in collect_mysql_temporary_tables_from_text(script) {
         push_unique_case_insensitive(&mut catalog.tables, &table);
@@ -579,6 +653,7 @@ fn intellisense_data_from_mysql_family_catalog(
     data.sequences = catalog.sequences.clone();
     data.synonyms = catalog.synonyms.clone();
     data.triggers = catalog.triggers.clone();
+    data.events = catalog.events.clone();
     data.indexes = catalog.indexes.clone();
     data.schemas = catalog.schemas.clone();
     data.users = catalog.users.clone();
@@ -781,6 +856,7 @@ fn oracle_create_kind_and_name_idx(tokens: &[SqlToken], create_idx: usize) -> Op
     while let Some(word) = token_word_text(tokens.get(idx)) {
         match word.to_ascii_uppercase().as_str() {
             "OR" | "REPLACE" | "EDITIONABLE" | "NONEDITIONABLE" | "FORCE" => idx += 1,
+            "GLOBAL" if token_word_eq(tokens.get(idx + 1), "TEMPORARY") => idx += 2,
             _ => break,
         }
     }
@@ -788,6 +864,9 @@ fn oracle_create_kind_and_name_idx(tokens: &[SqlToken], create_idx: usize) -> Op
     let kind = token_word_text(tokens.get(idx))?.to_ascii_uppercase();
     if kind == "MATERIALIZED" && token_word_eq(tokens.get(idx + 1), "VIEW") {
         return Some(("MATERIALIZED VIEW".to_string(), idx + 2));
+    }
+    if kind == "PROPERTY" && token_word_eq(tokens.get(idx + 1), "GRAPH") {
+        return Some(("PROPERTY GRAPH".to_string(), idx + 2));
     }
 
     let mut name_idx = idx + 1;
@@ -1067,6 +1146,30 @@ fn oracle_collect_script_catalog_entries(script: &str, catalog: &mut MysqlFamily
                         name.to_ascii_uppercase(),
                         collect_create_table_columns(&tokens, after_name_idx),
                     );
+                } else {
+                    let statement_end = tokens
+                        .iter()
+                        .enumerate()
+                        .skip(after_name_idx)
+                        .find_map(|(idx, token)| {
+                            matches!(token, SqlToken::Symbol(symbol) if symbol == ";")
+                                .then_some(idx)
+                        })
+                        .unwrap_or(tokens.len());
+                    if let Some(as_idx) = tokens
+                        .iter()
+                        .enumerate()
+                        .take(statement_end)
+                        .skip(after_name_idx)
+                        .find_map(|(idx, token)| token_word_eq(Some(token), "AS").then_some(idx))
+                    {
+                        let columns = oracle_view_projection_columns(
+                            &tokens[as_idx + 1..statement_end],
+                        );
+                        if !columns.is_empty() {
+                            catalog.columns.insert(name.to_ascii_uppercase(), columns);
+                        }
+                    }
                 }
             }
             "VIEW" => {
@@ -1175,12 +1278,46 @@ fn oracle_collect_script_catalog_entries(script: &str, catalog: &mut MysqlFamily
                     }
                 }
             }
+            "DOMAIN" => push_unique_case_insensitive(&mut catalog.types, &name),
+            "PROPERTY GRAPH" => push_unique_case_insensitive(&mut catalog.views, &name),
             "TRIGGER" => push_unique_case_insensitive(&mut catalog.triggers, &name),
             "INDEX" => push_unique_case_insensitive(&mut catalog.indexes, &name),
             _ => {}
         }
 
         idx += 1;
+    }
+
+    let mut idx = 0usize;
+    while idx < tokens.len() {
+        if !token_word_eq(tokens.get(idx), "ALTER") || !token_word_eq(tokens.get(idx + 1), "TABLE")
+        {
+            idx += 1;
+            continue;
+        }
+        let Some((table_name, after_table_idx)) = script_object_name_at(&tokens, idx + 2) else {
+            idx += 1;
+            continue;
+        };
+        if !token_word_eq(tokens.get(after_table_idx), "ADD") {
+            idx += 1;
+            continue;
+        }
+        let mut column_idx = after_table_idx + 1;
+        if token_word_eq(tokens.get(column_idx), "COLUMN") {
+            column_idx += 1;
+        }
+        if matches!(tokens.get(column_idx), Some(SqlToken::Symbol(symbol)) if symbol == "(") {
+            let added = collect_create_table_columns(&tokens, column_idx);
+            let columns = catalog
+                .columns
+                .entry(table_name.to_ascii_uppercase())
+                .or_default();
+            for column in added {
+                push_unique_case_insensitive(columns, &column);
+            }
+        }
+        idx = column_idx.saturating_add(1);
     }
 
     let mut idx = 0usize;
@@ -48391,7 +48528,7 @@ fn oracle_test7_production_completion_covers_advanced_query_sweep_cases() {
             "START WITH parent_id IS NULL\nCONNECT BY PRIOR node_id = parent_id\nORDER SIBLINGS BY node_id;",
             "CONNECT",
             "CONN",
-            "CONNECT",
+            "CONNECT BY",
         ),
         (
             "test7.txt",
@@ -50018,6 +50155,55 @@ fn oracle_file_scoped_sweep_metadata_includes_file_local_non_relation_objects() 
     );
 }
 
+#[test]
+fn manual_final_sweep_metadata_includes_inferred_and_system_objects() {
+    use crate::db::DatabaseType::{MariaDB, MySQL};
+
+    let mut oracle = oracle_test_file_scoped_intellisense_data("final.sql");
+    assert!(oracle.types.iter().any(|name| name.eq_ignore_ascii_case("sq_oracle_category_domain")));
+    assert!(oracle.tables.iter().any(|name| name.eq_ignore_ascii_case("sq_oracle_manual_gtt")));
+    assert!(oracle
+        .get_columns_for_table("sq_oracle_manual_gtt")
+        .iter()
+        .any(|name| name.eq_ignore_ascii_case("created_at")));
+    assert!(oracle.tables.iter().any(|name| name.eq_ignore_ascii_case("V$RESERVED_WORDS")));
+    assert!(oracle.views.iter().any(|name| name.eq_ignore_ascii_case("USER_PROPERTY_GRAPHS")));
+    assert!(oracle.tables.iter().any(|name| name.eq_ignore_ascii_case("PLAN_TABLE")));
+    assert!(oracle.views.iter().any(|name| name.eq_ignore_ascii_case("V$VERSION")));
+    assert!(oracle.packages.iter().any(|name| name.eq_ignore_ascii_case("DBMS_FLASHBACK")));
+    assert!(oracle
+        .get_member_suggestions("DBMS_FLASHBACK", "GET_", false)
+        .iter()
+        .any(|name| name.eq_ignore_ascii_case("GET_SYSTEM_CHANGE_NUMBER")));
+
+    let mysql = mysql_family_test_intellisense_data("final.sql", MySQL);
+    assert!(mysql.schemas.iter().any(|name| name.eq_ignore_ascii_case("sq_mysql_manual_final")));
+    assert!(mysql.events.iter().any(|name| name.eq_ignore_ascii_case("syntax_event")));
+    assert!(mysql.views.iter().any(|name| name.eq_ignore_ascii_case("statement_log_v")));
+    assert!(mysql.tables.iter().any(|name| name.eq_ignore_ascii_case("statement_log_stage")));
+    assert!(mysql
+        .get_columns_for_table("manual_keyword_coverage")
+        .iter()
+        .any(|name| name.eq_ignore_ascii_case("keyword_word")));
+    for column in ["category", "note"] {
+        assert!(mysql
+            .get_columns_for_table("statement_log_copy")
+            .iter()
+            .any(|name| name.eq_ignore_ascii_case(column)));
+    }
+    assert!(mysql
+        .indexes
+        .iter()
+        .any(|name| name.eq_ignore_ascii_case("ix_statement_log_copy_amount")));
+
+    let mariadb = mysql_family_test_intellisense_data("final.sql", MariaDB);
+    assert!(mariadb.schemas.iter().any(|name| name.eq_ignore_ascii_case("sq_mariadb_manual_final")));
+    assert!(mariadb.sequences.iter().any(|name| name.eq_ignore_ascii_case("statement_seq")));
+    assert!(mariadb.events.iter().any(|name| name.eq_ignore_ascii_case("syntax_event")));
+    assert!(mariadb.views.iter().any(|name| name.eq_ignore_ascii_case("statement_log_v")));
+    assert!(mariadb.tables.iter().any(|name| name.eq_ignore_ascii_case("statement_log_stage")));
+}
+
 fn oracle_intellisense_data_from_catalog(catalog: &MysqlFamilyScriptCatalog) -> IntellisenseData {
     let mut data = intellisense_data_from_mysql_family_catalog(catalog);
 
@@ -50033,6 +50219,44 @@ fn oracle_intellisense_data_from_catalog(catalog: &MysqlFamilyScriptCatalog) -> 
         "V$SQL",
         vec!["SQL_ID".to_string(), "SQL_TEXT".to_string()],
     );
+    for (kind, relation, columns) in [
+        (
+            "TABLE",
+            "V$RESERVED_WORDS",
+            vec![
+                "KEYWORD",
+                "LENGTH",
+                "RESERVED",
+                "RES_TYPE",
+                "RES_ATTR",
+                "RES_SEMI",
+                "DUPLICATE",
+            ],
+        ),
+        (
+            "TABLE",
+            "SYSTEM.HELP",
+            vec!["TOPIC", "SEQ", "INFO"],
+        ),
+        (
+            "TABLE",
+            "PLAN_TABLE",
+            vec!["OPERATION", "OPTIONS", "OBJECT_NAME", "STATEMENT_ID", "ID"],
+        ),
+        ("VIEW", "USER_PROPERTY_GRAPHS", vec!["GRAPH_NAME"]),
+        ("VIEW", "V$VERSION", vec!["BANNER_FULL"]),
+    ] {
+        if kind == "VIEW" {
+            push_unique_case_insensitive(&mut data.views, relation);
+        } else {
+            push_unique_case_insensitive(&mut data.tables, relation);
+        }
+        data.set_columns_for_table(
+            relation,
+            columns.into_iter().map(str::to_string).collect(),
+        );
+    }
+    push_unique_case_insensitive(&mut data.schemas, "SYSTEM");
     push_unique_case_insensitive(&mut data.users, "SYS");
     push_unique_case_insensitive(&mut data.tables, "EMP");
     data.set_columns_for_table(
@@ -50045,9 +50269,16 @@ fn oracle_intellisense_data_from_catalog(catalog: &MysqlFamilyScriptCatalog) -> 
         ],
     );
 
-    for package in ["DBMS_OUTPUT", "DBMS_RANDOM"] {
+    for package in ["DBMS_FLASHBACK", "DBMS_OUTPUT", "DBMS_RANDOM"] {
         push_unique_case_insensitive(&mut data.packages, package);
     }
+    data.set_members_for_qualifier_with_kinds(
+        "DBMS_FLASHBACK",
+        vec![(
+            "GET_SYSTEM_CHANGE_NUMBER".to_string(),
+            Some(QualifiedMemberKind::Function),
+        )],
+    );
     data.set_members_for_qualifier_with_kinds(
         "DBMS_OUTPUT",
         vec![(
@@ -50079,12 +50310,20 @@ fn mysql_family_test_intellisense_data(
     push_unique_case_insensitive(&mut data.schemas, "INFORMATION_SCHEMA");
     for (table, columns) in [
         (
+            "INFORMATION_SCHEMA.KEYWORDS",
+            vec!["WORD", "RESERVED"],
+        ),
+        (
             "INFORMATION_SCHEMA.COLUMN_STATISTICS",
             vec!["SCHEMA_NAME", "TABLE_NAME", "COLUMN_NAME", "HISTOGRAM"],
         ),
         (
             "INFORMATION_SCHEMA.PARTITIONS",
             vec!["TABLE_SCHEMA", "TABLE_NAME", "PARTITION_NAME"],
+        ),
+        (
+            "MYSQL.HELP_TOPIC",
+            vec!["HELP_TOPIC_ID", "NAME", "DESCRIPTION", "EXAMPLE", "URL"],
         ),
     ] {
         push_unique_case_insensitive(&mut data.tables, table);
@@ -50100,8 +50339,14 @@ fn mysql_family_test_intellisense_data(
                 "COLUMN_STATISTICS".to_string(),
                 Some(QualifiedMemberKind::Table),
             ),
+            ("KEYWORDS".to_string(), Some(QualifiedMemberKind::Table)),
             ("PARTITIONS".to_string(), Some(QualifiedMemberKind::Table)),
         ],
+    );
+    push_unique_case_insensitive(&mut data.schemas, "MYSQL");
+    data.set_members_for_qualifier_with_kinds(
+        "MYSQL",
+        vec![("HELP_TOPIC".to_string(), Some(QualifiedMemberKind::Table))],
     );
     if db_type == crate::db::DatabaseType::MariaDB && file_name == "test4.txt" {
         push_unique_case_insensitive(&mut data.tables, "tmp_rollup");
@@ -51051,6 +51296,30 @@ fn intellisense_sweep_is_create_element_name_definition(
     kind == "TABLE" || (kind == "TYPE" && tail.iter().any(|token| token_word_eq(Some(token), "OBJECT")))
 }
 
+fn intellisense_sweep_is_oracle_non_catalog_value_or_definition(
+    sql: &str,
+    word_start: usize,
+    db_type: crate::db::DatabaseType,
+) -> bool {
+    if db_type != crate::db::DatabaseType::Oracle {
+        return false;
+    }
+    let tokens = intellisense_sweep_current_statement_tokens_before_cursor(sql, word_start);
+    let words = tokens
+        .iter()
+        .filter_map(|token| token_word_text(Some(token)).map(str::to_ascii_uppercase))
+        .collect::<Vec<_>>();
+    let previous = words.last().map(String::as_str);
+
+    previous == Some("TABLESPACE")
+        || (previous == Some("LABEL")
+            && words.windows(2).any(
+                |window| matches!(window, [property, graph] if property == "PROPERTY" && graph == "GRAPH"),
+            ))
+        || (matches!(previous, Some("ADD" | "COLUMN"))
+            && matches!(words.as_slice(), [alter, table, ..] if alter == "ALTER" && table == "TABLE"))
+}
+
 fn intellisense_sweep_is_mysql_type_lead(word: &str) -> bool {
     matches!(
         word.to_ascii_uppercase().as_str(),
@@ -51391,6 +51660,43 @@ fn intellisense_sweep_is_select_alias_definition(
     original_word: &str,
     db_type: crate::db::DatabaseType,
 ) -> bool {
+    let previous_token = tokens
+        .get(..current_idx.min(tokens.len()))
+        .unwrap_or(tokens)
+        .iter()
+        .rev()
+        .find(|token| !matches!(token, SqlToken::Comment(_)));
+    let last_select = tokens
+        .get(..current_idx.min(tokens.len()))
+        .unwrap_or(tokens)
+        .iter()
+        .rposition(|token| token_word_eq(Some(token), "SELECT"));
+    let last_from = tokens
+        .get(..current_idx.min(tokens.len()))
+        .unwrap_or(tokens)
+        .iter()
+        .rposition(|token| token_word_eq(Some(token), "FROM"));
+    let in_select_list = last_select.is_some_and(|select_idx| {
+        last_from.is_none_or(|from_idx| select_idx > from_idx)
+    });
+    let tail_starts_alias_boundary = sql
+        .get(cursor..)
+        .unwrap_or("")
+        .trim_start()
+        .starts_with([',', ';'])
+        || intellisense_sweep_next_meaningful_word(sql, cursor)
+            .is_some_and(|word| word.eq_ignore_ascii_case("FROM"));
+    if in_select_list
+        && tail_starts_alias_boundary
+        && previous_token.is_some_and(|token| {
+            matches!(
+                token,
+                SqlToken::Word(_) | SqlToken::String(_) | SqlToken::Symbol(_)
+            )
+        })
+    {
+        return true;
+    }
     if crate::sql_text::is_sql_keyword_for_db(&original_word.to_ascii_uppercase(), db_type) {
         return false;
     }
@@ -51763,6 +52069,46 @@ fn intellisense_sweep_skips_plain_relation_alias_definition() {
         !result.checked && result.missing.is_none(),
         "a newly declared relation alias is not a completion candidate"
     );
+}
+
+#[test]
+fn intellisense_sweep_skips_literal_select_alias_definitions() {
+    use crate::db::DatabaseType::Oracle;
+
+    for (sql, original) in [
+        ("SELECT 'x' text__CODEX_CURSOR__ FROM dual", "text_value"),
+        ("SELECT 2 erro__CODEX_CURSOR__ FROM dual", "errors"),
+    ] {
+        assert!(
+            intellisense_sweep_word_skip_context(sql, Oracle, original),
+            "SELECT-list alias definition must not be certified as a completion reference: {sql}"
+        );
+    }
+}
+
+#[test]
+fn intellisense_sweep_skips_oracle_non_catalog_definition_and_value_slots() {
+    use crate::db::DatabaseType::Oracle;
+
+    for (sql, original) in [
+        (
+            "CREATE TABLE t (id NUMBER) TABLESPACE user__CODEX_CURSOR__",
+            "users",
+        ),
+        (
+            "CREATE PROPERTY GRAPH g VERTEX TABLES (t KEY (id) LABEL no__CODEX_CURSOR__ PROPERTIES (id))",
+            "node",
+        ),
+        (
+            "ALTER TABLE t ADD (crea__CODEX_CURSOR__ TIMESTAMP)",
+            "created_at",
+        ),
+    ] {
+        assert!(
+            intellisense_sweep_word_skip_context(sql, Oracle, original),
+            "definition or non-catalog value must not be certified as a completion reference: {sql}"
+        );
+    }
 }
 
 fn intellisense_sweep_is_drop_object_without_create_metadata(
@@ -52254,6 +52600,11 @@ fn intellisense_sweep_word_skip_context_from_analysis(
             deep_ctx,
             true,
             Some(db_type),
+        )
+        || intellisense_sweep_is_oracle_non_catalog_value_or_definition(
+            sql,
+            word_start,
+            db_type,
         )
         || intellisense_sweep_is_definition_slot(
             sql,
@@ -53155,6 +53506,34 @@ fn intellisense_sweep_fixture_paths(
     paths
 }
 
+fn intellisense_sweep_fixture_groups(
+) -> [(
+    &'static str,
+    &'static [&'static str],
+    crate::db::DatabaseType,
+); 3] {
+    use crate::db::DatabaseType::{MariaDB, MySQL, Oracle};
+
+    [
+        ("test", &["txt", "sql"], Oracle),
+        ("test_mariadb", &["txt", "sql"], MariaDB),
+        ("test_mysql", &["txt", "sql"], MySQL),
+    ]
+}
+
+#[test]
+fn intellisense_sweep_fixture_groups_include_manual_final_scripts() {
+    for (directory, extensions, _) in intellisense_sweep_fixture_groups() {
+        let final_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join(directory)
+            .join("final.sql");
+        assert!(
+            intellisense_sweep_fixture_paths(directory, extensions).contains(&final_path),
+            "{directory}/final.sql is excluded from the all-fixture IntelliSense sweep"
+        );
+    }
+}
+
 #[test]
 #[ignore = "generates IntelliSense sweep reports for every Oracle/MySQL/MariaDB fixture"]
 fn intellisense_sweep_generate_reports_for_all_fixture_files() {
@@ -53170,11 +53549,7 @@ fn intellisense_sweep_generate_reports_for_all_fixture_files() {
             }
         });
     let mut failures = Vec::new();
-    for (directory, extensions, db_type) in [
-        ("test", &["txt", "sql"][..], Oracle),
-        ("test_mariadb", &["txt"][..], MariaDB),
-        ("test_mysql", &["txt"][..], MySQL),
-    ] {
+    for (directory, extensions, db_type) in intellisense_sweep_fixture_groups() {
         for input_path in intellisense_sweep_fixture_paths(directory, extensions) {
             if requested_path
                 .as_ref()
@@ -53618,6 +53993,391 @@ fn final_boss_structural_keywords_use_production_completion() {
             "{db_type:?} `{expected}` missing for `{sql}`: {suggestions:?}"
         );
     }
+}
+
+#[test]
+fn manual_final_structural_words_use_production_completion() {
+    use crate::db::DatabaseType::{MariaDB, MySQL, Oracle};
+
+    let cases = [
+        (Oracle, "CREATE DOMA__CODEX_CURSOR__ app_domain AS VARCHAR2(32)", "DOMAIN"),
+        (Oracle, "CREATE TABLE t (id NUMBER) TABL__CODEX_CURSOR__ users", "TABLESPACE"),
+        (Oracle, "CREATE TABLE t (id NUMBER) PARTITION BY RANG__CODEX_CURSOR__ (id)", "RANGE"),
+        (Oracle, "CREATE TABLE t (id NUMBER) PARTITION BY RANGE (id) (PARTITION p VALU__CODEX_CURSOR__ LESS THAN (10))", "VALUES"),
+        (Oracle, "CREATE TABLE t (id NUMBER) PARTITION BY RANGE (id) (PARTITION p VALUES LES__CODEX_CURSOR__ THAN (10))", "LESS"),
+        (Oracle, "CREATE TABLE t (id NUMBER) PARTITION BY RANGE (id) (PARTITION p VALUES LESS THA__CODEX_CURSOR__ (10))", "THAN"),
+        (Oracle, "CREATE GLOB__CODEX_CURSOR__ TEMPORARY TABLE t (id NUMBER)", "GLOBAL"),
+        (Oracle, "CREATE GLOBAL TEMPORARY TABLE t (id NUMBER) O__CODEX_CURSOR__ COMMIT DELETE ROWS", "ON"),
+        (Oracle, "CREATE GLOBAL TEMPORARY TABLE t (id NUMBER) ON COMM__CODEX_CURSOR__ DELETE ROWS", "COMMIT"),
+        (Oracle, "CREATE GLOBAL TEMPORARY TABLE t (id NUMBER) ON COMMIT DELE__CODEX_CURSOR__ ROWS", "DELETE"),
+        (Oracle, "CREATE GLOBAL TEMPORARY TABLE t (id NUMBER) ON COMMIT DELETE ROW__CODEX_CURSOR__", "ROWS"),
+        (Oracle, "CREATE TABLE t (id NUMBER GENERATED BY DEFAULT ON NULL A__CODEX_CURSOR__ IDENTITY)", "AS"),
+        (Oracle, "CREATE TABLE t (embedding VECT__CODEX_CURSOR__(3, FLOAT32))", "VECTOR"),
+        (Oracle, "CREATE INDEX ix ON t (id DES__CODEX_CURSOR__) INVISIBLE", "DESC"),
+        (Oracle, "CREATE INDEX ix ON t (id DESC) INVI__CODEX_CURSOR__", "INVISIBLE"),
+        (Oracle, "ALTER INDEX ix VISI__CODEX_CURSOR__", "VISIBLE"),
+        (Oracle, "ALTER INDEX ix MONITORING USA__CODEX_CURSOR__", "USAGE"),
+        (Oracle, "CREATE TRIGGER trg BEFORE UPDATE OF id O__CODEX_CURSOR__ t BEGIN NULL; END;", "ON"),
+        (Oracle, "CREATE VIEW v AS SELECT id FROM t WIT__CODEX_CURSOR__ READ ONLY", "WITH"),
+        (Oracle, "CREATE VIEW v AS SELECT id FROM t WITH REA__CODEX_CURSOR__ ONLY", "READ"),
+        (Oracle, "CREATE PROP__CODEX_CURSOR__ GRAPH app_graph VERTEX TABLES (t KEY (id))", "PROPERTY"),
+        (Oracle, "CREATE PROPERTY GRAPH g EDGE TABLES (e KEY (id) SOURCE KE__CODEX_CURSOR__ (source_id) REFERENCES t (id))", "KEY"),
+        (Oracle, "SET TRANSACTION READ WRITE NAM__CODEX_CURSOR__ 'tx'", "NAME"),
+        (Oracle, "ANALYZE TABLE t COMPUTE STAT__CODEX_CURSOR__ FOR TABLE FOR ALL INDEXED COLUMNS", "STATISTICS"),
+        (Oracle, "ANALYZE TABLE t COMPUTE STATISTICS FO__CODEX_CURSOR__ TABLE FOR ALL INDEXED COLUMNS", "FOR"),
+        (Oracle, "ANALYZE TABLE t COMPUTE STATISTICS FOR TABL__CODEX_CURSOR__ FOR ALL INDEXED COLUMNS", "TABLE"),
+        (Oracle, "ANALYZE TABLE t COMPUTE STATISTICS FOR TABLE FOR AL__CODEX_CURSOR__ INDEXED COLUMNS", "ALL"),
+        (Oracle, "ANALYZE TABLE t COMPUTE STATISTICS FOR TABLE FOR ALL INDE__CODEX_CURSOR__ COLUMNS", "INDEXED"),
+        (Oracle, "ANALYZE TABLE t COMPUTE STATISTICS FOR TABLE FOR ALL INDEXED COLU__CODEX_CURSOR__", "COLUMNS"),
+        (Oracle, "SELECT CONNECT_BY_ISLEA__CODEX_CURSOR__ leaf_flag FROM t CONNECT BY PRIOR id = parent_id", "CONNECT_BY_ISLEAF"),
+        (Oracle, "SELECT id FROM t START WIT__CODEX_CURSOR__ parent_id IS NULL CONNECT BY PRIOR id = parent_id", "WITH"),
+        (Oracle, "SELECT JSON_SERIALIZE(payload RETURNING VARCHAR2 PRET__CODEX_CURSOR__) FROM t", "PRETTY"),
+        (Oracle, "SELECT VECTOR_DISTANCE(v1, v2, COSI__CODEX_CURSOR__) FROM t", "COSINE"),
+        (Oracle, "VARIABLE flashback_scn NUMB__CODEX_CURSOR__", "NUMBER"),
+        (Oracle, "WHENEVER SQLERROR EXIT SQL.SQLCODE ROLL__CODEX_CURSOR__", "ROLLBACK"),
+        (MySQL, "SET SESSION TRANSACTION ISOLATION LEVEL READ COMM__CODEX_CURSOR__", "COMMITTED"),
+        (MySQL, "CREATE TABLE t (path VARCHAR(10) CHARACTER SE__CODEX_CURSOR__ ascii)", "SET"),
+        (MySQL, "ALTER TABLE t ADD COLUMN note VARCHAR(10) AFTE__CODEX_CURSOR__ category", "AFTER"),
+        (MySQL, "ALTER TABLE t RENAME COLUMN note T__CODEX_CURSOR__ detail", "TO"),
+        (MySQL, "CREATE INDEX ix ON t (amount DES__CODEX_CURSOR__)", "DESC"),
+        (MySQL, "ALTER TABLE t ALTER INDE__CODEX_CURSOR__ ix INVISIBLE", "INDEX"),
+        (MySQL, "ALTER TABLE t ALTER INDEX ix INVI__CODEX_CURSOR__", "INVISIBLE"),
+        (MySQL, "ALTER TABLE t ALTER INDEX ix VISI__CODEX_CURSOR__", "VISIBLE"),
+        (MySQL, "INSERT INTO t SE__CODEX_CURSOR__ id = 1", "SET"),
+        (MySQL, "CREATE VIEW v AS SELECT id FROM t WIT__CODEX_CURSOR__ CASCADED CHECK OPTION", "WITH"),
+        (MySQL, "CREATE FUNCTION f() RETURNS INT RETURN CAS__CODEX_CURSOR__ WHEN 1 = 1 THEN 1 END", "CASE"),
+        (MySQL, "SELECT GROUP__CODEX_CURSOR__(id) FROM t GROUP BY id WITH ROLLUP", "GROUPING"),
+        (MySQL, "CREATE EVENT e ON SCHEDULE AT CURRENT_TIMESTAMP + INTE__CODEX_CURSOR__ 1 DAY DO SELECT 1", "INTERVAL"),
+        (MySQL, "CREATE EVENT e ON SCHEDULE AT CURRENT_TIMESTAMP DO__CODEX_CURSOR__ UPDATE t SET id = id", "DO"),
+        (MySQL, "ALTER USER app_user PASSWORD EXPI__CODEX_CURSOR__ INTERVAL 30 DAY ACCOUNT UNLOCK", "EXPIRE"),
+        (MySQL, "ALTER USER app_user PASSWORD EXPIRE INTE__CODEX_CURSOR__ 30 DAY ACCOUNT UNLOCK", "INTERVAL"),
+        (MySQL, "ALTER USER app_user PASSWORD EXPIRE INTERVAL 30 DAY ACCO__CODEX_CURSOR__ UNLOCK", "ACCOUNT"),
+        (MySQL, "GRANT app_reader T__CODEX_CURSOR__ app_user", "TO"),
+        (MariaDB, "CREATE SEQUENCE s START WIT__CODEX_CURSOR__ 100", "WITH"),
+        (MariaDB, "ALTER SEQU__CODEX_CURSOR__ s RESTART WITH 100", "SEQUENCE"),
+    ];
+
+    let mut failures = Vec::new();
+    for (db_type, sql, expected) in cases {
+        let suggestions = query_completion_suggestions_with_locals(sql, db_type);
+        if !suggestions.iter().any(|suggestion| {
+            intellisense_sweep_suggestion_matches_word(suggestion, expected)
+        }) {
+            failures.push(format!(
+                "{db_type:?} `{expected}` missing for `{sql}`: {suggestions:?}"
+            ));
+        }
+    }
+    assert!(
+        failures.is_empty(),
+        "manual final production completion gaps:\n{}",
+        failures.join("\n")
+    );
+}
+
+#[test]
+fn manual_final_multiline_structural_words_use_production_completion() {
+    use crate::db::DatabaseType::Oracle;
+
+    let cases = [
+        ("CREATE TABLE t TABLESPACE users AS\nSELECT 1 id FROM dual", "TABLESPACE", "CREATE TABLE t TABL__CODEX_CURSOR__ users AS\nSELECT 1 id FROM dual"),
+        ("CREATE TABLE t (category VARCHAR2(32) DOMAIN app_domain)", "DOMAIN", "CREATE TABLE t (category VARCHAR2(32) DOMA__CODEX_CURSOR__ app_domain)"),
+        ("CREATE TRIGGER trg\nBEFORE INSERT OR UPDATE OF category ON t\nBEGIN NULL; END;", "OF", "CREATE TRIGGER trg\nBEFORE INSERT OR UPDATE O__CODEX_CURSOR__ category ON t\nBEGIN NULL; END;"),
+        ("CREATE PROPERTY GRAPH g\nEDGE TABLES (e KEY (id) SOURCE KEY (source_id) REFERENCES t (id))", "KEY", "CREATE PROPERTY GRAPH g\nEDGE TABLES (e KEY (id) SOURCE KE__CODEX_CURSOR__ (source_id) REFERENCES t (id))"),
+        ("ANALYZE TABLE t\n  COMPUTE STATISTICS FOR TABLE FOR ALL INDEXED COLUMNS", "STATISTICS", "ANALYZE TABLE t\n  COMPUTE STAT__CODEX_CURSOR__ FOR TABLE FOR ALL INDEXED COLUMNS"),
+        ("ANALYZE TABLE t\n  COMPUTE STATISTICS FOR TABLE FOR ALL INDEXED COLUMNS", "FOR", "ANALYZE TABLE t\n  COMPUTE STATISTICS FO__CODEX_CURSOR__ TABLE FOR ALL INDEXED COLUMNS"),
+        ("ANALYZE TABLE t\n  COMPUTE STATISTICS FOR TABLE FOR ALL INDEXED COLUMNS", "TABLE", "ANALYZE TABLE t\n  COMPUTE STATISTICS FOR TABL__CODEX_CURSOR__ FOR ALL INDEXED COLUMNS"),
+        ("ANALYZE TABLE t\n  COMPUTE STATISTICS FOR TABLE FOR ALL INDEXED COLUMNS", "ALL", "ANALYZE TABLE t\n  COMPUTE STATISTICS FOR TABLE FOR AL__CODEX_CURSOR__ INDEXED COLUMNS"),
+        ("ANALYZE TABLE t\n  COMPUTE STATISTICS FOR TABLE FOR ALL INDEXED COLUMNS", "INDEXED", "ANALYZE TABLE t\n  COMPUTE STATISTICS FOR TABLE FOR ALL INDE__CODEX_CURSOR__ COLUMNS"),
+        ("ANALYZE TABLE t\n  COMPUTE STATISTICS FOR TABLE FOR ALL INDEXED COLUMNS", "COLUMNS", "ANALYZE TABLE t\n  COMPUTE STATISTICS FOR TABLE FOR ALL INDEXED COLU__CODEX_CURSOR__"),
+        ("SELECT id\nFROM t\nSTART WITH parent_id IS NULL\nCONNECT BY PRIOR id = parent_id", "WITH", "SELECT id\nFROM t\nSTART WIT__CODEX_CURSOR__ parent_id IS NULL\nCONNECT BY PRIOR id = parent_id"),
+        ("VARIABLE flashback_scn NUMBER", "NUMBER", "VARIABLE flashback_scn NUMB__CODEX_CURSOR__"),
+    ];
+
+    let mut failures = Vec::new();
+    for (_source, expected, marked) in cases {
+        let suggestions = query_completion_suggestions_with_locals(marked, Oracle);
+        if !suggestions.iter().any(|suggestion| {
+            intellisense_sweep_suggestion_matches_word(suggestion, expected)
+        }) {
+            failures.push(format!("`{expected}` missing for `{marked}`: {suggestions:?}"));
+        }
+    }
+    assert!(
+        failures.is_empty(),
+        "manual final multiline production completion gaps:\n{}",
+        failures.join("\n")
+    );
+}
+
+#[test]
+fn oracle_property_graph_columns_use_production_completion() {
+    use crate::db::DatabaseType::Oracle;
+
+    let mut data = IntellisenseData::new();
+    data.tables = vec!["app_node".to_string(), "app_edge".to_string()];
+    data.set_columns_for_table(
+        "app_node",
+        vec!["node_id".to_string(), "node_name".to_string()],
+    );
+    data.set_columns_for_table(
+        "app_edge",
+        vec![
+            "edge_id".to_string(),
+            "source_node_id".to_string(),
+            "target_node_id".to_string(),
+        ],
+    );
+    data.rebuild_indices();
+
+    for (sql, expected) in [
+        (
+            "CREATE PROPERTY GRAPH g\nVERTEX TABLES (app_node KEY (node__CODEX_CURSOR__) PROPERTIES (node_id, node_name))",
+            "node_id",
+        ),
+        (
+            "CREATE PROPERTY GRAPH g\nVERTEX TABLES (app_node KEY (node_id) PROPERTIES (node__CODEX_CURSOR__))",
+            "node_name",
+        ),
+        (
+            "CREATE PROPERTY GRAPH g\nEDGE TABLES (app_edge KEY (edge__CODEX_CURSOR__) SOURCE KEY (source_node_id) REFERENCES app_node (node_id))",
+            "edge_id",
+        ),
+        (
+            "CREATE PROPERTY GRAPH g\nEDGE TABLES (app_edge KEY (edge_id) SOURCE KEY (sour__CODEX_CURSOR__) REFERENCES app_node (node_id))",
+            "source_node_id",
+        ),
+    ] {
+        let suggestions = query_completion_suggestions_with_data(sql, Oracle, true, &mut data);
+        assert!(
+            suggestions
+                .iter()
+                .any(|suggestion| suggestion.eq_ignore_ascii_case(expected)),
+            "property-graph column `{expected}` missing for `{sql}`: {suggestions:?}"
+        );
+    }
+}
+
+#[test]
+fn oracle_multitable_insert_source_alias_uses_production_completion() {
+    for sql in [r#"INSERT FIRST
+  WHEN valu__CODEX_CURSOR__ < 100 THEN
+    INTO t(value_amount) VALUES (value_amount)
+  ELSE
+    INTO t(value_amount) VALUES (value_amount)
+SELECT 60 value_amount FROM dual"#,
+        r#"INSERT FIRST
+  WHEN value_amount < 100 THEN
+    INTO t(value_amount) VALUES (valu__CODEX_CURSOR__)
+  ELSE
+    INTO t(value_amount) VALUES (value_amount)
+SELECT 60 value_amount FROM dual"#,
+    ] {
+        let suggestions = query_completion_suggestions_with_locals(
+            sql,
+            crate::db::DatabaseType::Oracle,
+        );
+        assert!(
+            suggestions
+                .iter()
+                .any(|suggestion| suggestion.eq_ignore_ascii_case("value_amount")),
+            "multi-table INSERT lost its source projection alias for `{sql}`: {suggestions:?}"
+        );
+    }
+}
+
+#[test]
+fn oracle_manual_final_remaining_real_words_use_full_production_path() {
+    use crate::db::DatabaseType::Oracle;
+
+    let script = load_intellisense_test_file("final.sql");
+    let base_snapshot = ChunkedText::from_str(script);
+    let base_data = oracle_test_file_scoped_intellisense_data("final.sql");
+    let cases = [
+        ("PRIMARY KEY (syntax_topic, syntax_seq);", "syntax_topic"),
+        ("PRIMARY KEY (syntax_topic, syntax_seq);", "syntax_seq"),
+        (
+            "category VARCHAR2(32) DOMAIN sq_oracle_category_domain NOT NULL",
+            "sq_oracle_category_domain",
+        ),
+        (
+            "ALTER TABLE sq_oracle_manual_gtt DROP COLUMN created_at;",
+            "created_at",
+        ),
+        (
+            "VALUES ('INSERT_FIRST', JSON_OBJECT('kind' VALUE 'conditional'), value_amount)",
+            "value_amount",
+        ),
+        (
+            "SOURCE KEY (source_node_id) REFERENCES sq_oracle_manual_node (node_id)",
+            "KEY",
+        ),
+        ("ROLLBACK TO before_rollback;", "before_rollback"),
+        (
+            "COMPUTE STATISTICS FOR TABLE FOR ALL INDEXED COLUMNS;",
+            "TABLE",
+        ),
+        ("CONNECT_BY_ISLEAF leaf_flag", "CONNECT_BY_ISLEAF"),
+        ("START WITH parent_node_id IS NULL", "WITH"),
+        ("VARIABLE sq_oracle_flashback_scn NUMBER", "NUMBER"),
+    ];
+
+    let mut failures = Vec::new();
+    for (context, word) in cases {
+        assert_eq!(
+            script.matches(context).count(),
+            1,
+            "expected unique Oracle final context: {context}"
+        );
+        let context_start = script.find(context).expect("context checked above");
+        let word_start = context_start
+            + context
+                .find(word)
+                .unwrap_or_else(|| panic!("`{word}` not found in `{context}`"));
+        let prefix = intellisense_sweep_completion_prefix(word).expect("completion prefix");
+        let candidate = IntellisenseSweepCandidate {
+            start: word_start,
+            end: word_start + word.len(),
+            word: word.to_string(),
+            replacement: prefix.clone(),
+            cursor: word_start + prefix.len(),
+            prefix,
+        };
+        let result = intellisense_sweep_check_candidate(
+            script,
+            &base_snapshot,
+            Oracle,
+            &base_data,
+            &candidate,
+        );
+        if let Some(missing) = result.missing {
+            let mut edited = base_snapshot.clone();
+            assert!(edited.replace_range(
+                candidate.start,
+                candidate.end,
+                &candidate.replacement,
+            ));
+            let (expanded, analysis) =
+                intellisense_analysis_from_snapshot_for_test(&edited, candidate.cursor, Oracle);
+            failures.push(format!(
+                "line {} `{word}` in `{context}`: {:?}; phase={:?}; bounds={}..{} cursor={} cursor_in={}; expanded={:?}",
+                missing.line,
+                missing.suggestion_sample,
+                analysis.context.phase,
+                expanded.statement_start,
+                expanded.statement_end,
+                candidate.cursor,
+                expanded.cursor_in_statement,
+                expanded.text
+            ));
+        }
+    }
+    assert!(
+        failures.is_empty(),
+        "Oracle final production completion gaps:\n{}",
+        failures.join("\n")
+    );
+}
+
+#[test]
+fn mysql_manual_final_real_words_use_full_production_path() {
+    use crate::db::DatabaseType::MySQL;
+
+    let script = load_mysql_intellisense_test_file("final.sql");
+    let base_snapshot = ChunkedText::from_str(script);
+    let base_data = mysql_family_test_intellisense_data("final.sql", MySQL);
+    let cases = [
+        ("ALTER DATABASE sq_mysql_manual_final READ ONLY = 0;", "sq_mysql_manual_final"),
+        ("MODIFY keyword_word VARCHAR(128) NOT NULL", "keyword_word"),
+        ("name AS syntax_topic", "AS"),
+        ("description AS syntax_text", "description"),
+        ("ADD COLUMN note VARCHAR(80) NULL AFTER category;", "category"),
+        ("RENAME COLUMN note TO detail_text;", "note"),
+        ("ALTER INDEX ix_statement_log_copy_amount INVISIBLE;", "ix_statement_log_copy_amount"),
+        ("payload = new.payload,", "new"),
+        ("new.payload,", "payload"),
+        ("RETURN CASE", "RETURN"),
+        ("DO UPDATE statement_log SET amount = amount WHERE id = -1;", "DO"),
+        ("SHOW CREATE DATABASE sq_mysql_manual_final;", "sq_mysql_manual_final"),
+        ("SHOW PROCEDURE STATUS WHERE Db = DATABASE();", "Db"),
+        ("SHOW ENGINE INNODB STATUS;", "INNODB"),
+        ("PASSWORD EXPIRE INTERVAL 30 DAY", "EXPIRE"),
+        ("PASSWORD EXPIRE INTERVAL 30 DAY", "INTERVAL"),
+        ("ACCOUNT UNLOCK;", "ACCOUNT"),
+        ("ACCOUNT UNLOCK;", "UNLOCK"),
+        ("GRANT SELECT ON sq_mysql_manual_final.* TO", "sq_mysql_manual_final"),
+        ("GRANT 'sq_mysql_final_reader' TO 'sq_mysql_final_user'", "TO"),
+        ("SET DEFAULT ROLE 'sq_mysql_final_reader' TO 'sq_mysql_final_user'", "TO"),
+    ];
+
+    let mut failures = Vec::new();
+    for (context, word) in cases {
+        assert_eq!(
+            script.matches(context).count(),
+            1,
+            "expected unique MySQL final context: {context}"
+        );
+        let context_start = script.find(context).expect("context checked above");
+        let word_start = context_start
+            + context
+                .find(word)
+                .unwrap_or_else(|| panic!("`{word}` not found in `{context}`"));
+        let prefix = intellisense_sweep_completion_prefix(word).expect("completion prefix");
+        let candidate = IntellisenseSweepCandidate {
+            start: word_start,
+            end: word_start + word.len(),
+            word: word.to_string(),
+            replacement: prefix.clone(),
+            cursor: word_start + prefix.len(),
+            prefix,
+        };
+        let result = intellisense_sweep_check_candidate(
+            script,
+            &base_snapshot,
+            MySQL,
+            &base_data,
+            &candidate,
+        );
+        if let Some(missing) = result.missing {
+            let mut edited = base_snapshot.clone();
+            assert!(edited.replace_range(
+                candidate.start,
+                candidate.end,
+                &candidate.replacement,
+            ));
+            let (expanded, analysis) =
+                intellisense_analysis_from_snapshot_for_test(&edited, candidate.cursor, MySQL);
+            failures.push(format!(
+                "line {} `{word}` in `{context}`: {:?}; phase={:?}; bounds={}..{} cursor={}; expanded={:?}",
+                missing.line,
+                missing.suggestion_sample,
+                analysis.context.phase,
+                expanded.statement_start,
+                expanded.statement_end,
+                candidate.cursor,
+                expanded.text
+            ));
+        }
+    }
+    assert!(
+        failures.is_empty(),
+        "MySQL final production completion gaps:\n{}",
+        failures.join("\n")
+    );
+}
+
+#[test]
+fn mysql_delimiter_reset_directive_uses_the_full_production_completion_path() {
+    let (_, _, suggestions) = audit_final_suggestions_for(
+        "DELIMITER //\nCREATE PROCEDURE p()\nBEGIN\n  SELECT 1;\nEND//\n\nDELI| ;",
+        crate::db::DatabaseType::MySQL,
+    );
+    assert!(
+        suggestions
+            .iter()
+            .any(|suggestion| suggestion.eq_ignore_ascii_case("DELIMITER")),
+        "DELIMITER reset directive was not suggested: {suggestions:?}"
+    );
 }
 
 #[test]
@@ -73496,9 +74256,15 @@ fn mysql_family_show_create_database_name_slots_do_not_offer_schema_object_catal
             "SHOW CREATE SCHEMA scott.|",
         ] {
             let (kind, keywords, final_suggestions) = audit_final_suggestions_for(sql, db);
-            assert!(
-                kind.is_none(),
-                "SHOW CREATE database/schema name slot should not resolve to a schema object kind at `{sql}` {db:?}; keywords={keywords:?} final={final_suggestions:?}"
+            let expected_kind = if sql.ends_with("app |") {
+                None
+            } else {
+                Some(ExpectedObjectSuggestionKind::Database)
+            };
+            assert_eq!(
+                kind,
+                expected_kind,
+                "SHOW CREATE database/schema name slot should resolve only the database catalog at `{sql}` {db:?}; keywords={keywords:?} final={final_suggestions:?}"
             );
             for leaked in [
                 "EMP",
@@ -77638,24 +78404,6 @@ fn completed_transaction_option_tails_do_not_reoffer_keywords_or_catalog() {
         (Oracle, "COMMIT WRITE IMMEDIATE WAIT |"),
         (Oracle, "COMMIT WRITE IMMEDIATE WAIT n|"),
         (Oracle, "COMMIT WRITE IMMEDIATE WAIT scott.|"),
-        (Oracle, "SET TRANSACTION READ ONLY |"),
-        (Oracle, "SET TRANSACTION READ ONLY n|"),
-        (Oracle, "SET TRANSACTION READ ONLY scott.|"),
-        (Oracle, "SET TRANSACTION READ WRITE |"),
-        (Oracle, "SET TRANSACTION READ WRITE n|"),
-        (Oracle, "SET TRANSACTION READ WRITE scott.|"),
-        (Oracle, "SET TRANSACTION ISOLATION LEVEL SERIALIZABLE |"),
-        (Oracle, "SET TRANSACTION ISOLATION LEVEL SERIALIZABLE n|"),
-        (
-            Oracle,
-            "SET TRANSACTION ISOLATION LEVEL SERIALIZABLE scott.|",
-        ),
-        (Oracle, "SET TRANSACTION ISOLATION LEVEL READ COMMITTED |"),
-        (Oracle, "SET TRANSACTION ISOLATION LEVEL READ COMMITTED n|"),
-        (
-            Oracle,
-            "SET TRANSACTION ISOLATION LEVEL READ COMMITTED scott.|",
-        ),
         (MySQL, "SET TRANSACTION READ WRITE |"),
         (MySQL, "SET TRANSACTION READ WRITE n|"),
         (MySQL, "SET TRANSACTION READ WRITE scott.|"),
@@ -77833,6 +78581,28 @@ fn completed_transaction_option_tails_do_not_reoffer_keywords_or_catalog() {
         assert!(
             final_suggestions.is_empty(),
             "completed transaction option tail should not re-offer keywords or catalog at `{sql}` {db:?}: keywords={keywords:?} final={final_suggestions:?}"
+        );
+    }
+}
+
+#[test]
+fn oracle_set_transaction_completed_option_offers_optional_name() {
+    use crate::db::DatabaseType::Oracle;
+
+    for sql in [
+        "SET TRANSACTION READ ONLY |",
+        "SET TRANSACTION READ WRITE |",
+        "SET TRANSACTION ISOLATION LEVEL SERIALIZABLE |",
+        "SET TRANSACTION ISOLATION LEVEL READ COMMITTED |",
+    ] {
+        let (kind, keywords, final_suggestions) = audit_final_suggestions_for(sql, Oracle);
+        assert_eq!(
+            kind, None,
+            "Oracle transaction NAME slot must not resolve an object kind at `{sql}`: keywords={keywords:?} final={final_suggestions:?}"
+        );
+        assert!(
+            final_suggestions.iter().any(|candidate| candidate == "NAME"),
+            "Oracle optional NAME missing after a completed transaction option at `{sql}`: keywords={keywords:?} final={final_suggestions:?}"
         );
     }
 }

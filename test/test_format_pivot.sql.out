@@ -29,9 +29,12 @@ FROM (
                 FROM DUAL
             ) e
     )
-PIVOT (
-    COUNT(*)
-    FOR job IN ('CLERK' AS "CLERK", 'MANAGER' AS "MANAGER", 'ANALYST' AS "ANALYST", 'SALESMAN' AS "SALESMAN", 'PRESIDENT' AS "PRESIDENT")
+PIVOT (COUNT(*)
+    FOR job IN ('CLERK' AS "CLERK",
+        'MANAGER' AS "MANAGER",
+        'ANALYST' AS "ANALYST",
+        'SALESMAN' AS "SALESMAN",
+        'PRESIDENT' AS "PRESIDENT")
 ) pvt
 ORDER BY pvt.deptno;
 
@@ -41,7 +44,7 @@ ORDER BY pvt.deptno;
 -- source: test/test_format_pivot.sql
 -- db: Oracle
 -- metadata: test Oracle inferred catalog (file-scoped overlay) + Oracle built-ins
--- checked: 63
+-- checked: 59
 -- missing: 0
 -- marker: [[word]] means not suggested for the tested prefix
 -- missing tokens: none

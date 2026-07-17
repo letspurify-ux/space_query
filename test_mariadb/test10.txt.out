@@ -264,7 +264,7 @@ JSON_OBJECT('trap',@lexical_trap,'nearest_asset',(SELECT asset_code FROM mb_asse
 -- source: test_mariadb/test10.txt
 -- db: MariaDB
 -- metadata: test_mariadb/test10.txt inferred catalog
--- checked: 854
+-- checked: 820
 -- missing: 0
 -- marker: [[word]] means not suggested for the tested prefix
 -- missing tokens: none

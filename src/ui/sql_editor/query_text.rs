@@ -1940,6 +1940,110 @@ mod tests {
     }
 
     #[test]
+    fn oracle_statement_bounds_keep_sql_lines_that_resemble_tool_commands() {
+        use crate::db::connection::DatabaseType::Oracle;
+
+        for (sql, cursor_word, expected_start) in [
+            (
+                "CREATE PROPERTY GRAPH g\n  EDGE TABLES (\n    e\n      SOURCE KE (source_id) REFERENCES t (id)\n  );",
+                "KE",
+                "CREATE PROPERTY GRAPH",
+            ),
+            (
+                "ANALYZE TABLE t\n  COMPUTE STATISTICS FOR TABL FOR ALL INDEXED COLUMNS;",
+                "TABL",
+                "ANALYZE TABLE",
+            ),
+            (
+                "SELECT LEVEL depth_no,\n       CONN leaf_flag\nFROM t\nCONNECT BY PRIOR id = parent_id;",
+                "CONN",
+                "SELECT LEVEL",
+            ),
+            (
+                "SELECT id\nFROM t\nSTART WIT parent_id IS NULL\nCONNECT BY PRIOR id = parent_id;",
+                "WIT",
+                "SELECT id",
+            ),
+            (
+                "CREATE TABLE manual_help AS\nSELECT name AS topic,\n       DESC AS syntax_text\nFROM mysql.help_topic;",
+                "DESC",
+                "CREATE TABLE manual_help",
+            ),
+            (
+                "ALTER USER 'app'@'%'\n  PASSWORD EXPI INTERVAL 30 DAY\n  ACCOUNT UNLOCK;",
+                "EXPI",
+                "ALTER USER",
+            ),
+            (
+                "CREATE SEQUENCE statement_seq\n  START WIT 100 INCREMENT BY 1;",
+                "WIT",
+                "CREATE SEQUENCE",
+            ),
+        ] {
+            let cursor = sql.find(cursor_word).expect("cursor word") + cursor_word.len();
+            let (start, end) = statement_bounds_in_text_for_db_type(sql, cursor, Some(Oracle));
+            let statement = sql.get(start..end).unwrap_or("");
+            assert!(
+                statement.starts_with(expected_start) && statement.contains(cursor_word),
+                "`{cursor_word}` was split out of its SQL statement: {statement:?}"
+            );
+        }
+
+        let sql = "SELECT 1 FROM dual;\nVARIABLE flashback_scn NUMB\nSELECT 2 FROM dual;";
+        let cursor = sql.find("NUMB").expect("variable type") + "NUMB".len();
+        let (start, end) = statement_bounds_in_text_for_db_type(sql, cursor, Some(Oracle));
+        assert_eq!(
+            sql.get(start..end).unwrap_or("").trim(),
+            "VARIABLE flashback_scn NUMB",
+            "a real SQL*Plus VARIABLE line must remain its own completion statement"
+        );
+    }
+
+    #[test]
+    fn mysql_statement_bounds_keep_server_execute_and_start_statements() {
+        use crate::db::connection::DatabaseType::MySQL;
+
+        for (sql, cursor_word, expected_start) in [
+            (
+                "EXECUTE prepared_select\nUSING @prepared_amount;",
+                "prepared_amount",
+                "EXECUTE prepared_select",
+            ),
+            (
+                "START TRANSACTION READ\nWRITE;",
+                "WRITE",
+                "START TRANSACTION",
+            ),
+        ] {
+            let cursor = sql.find(cursor_word).expect("cursor word") + cursor_word.len();
+            let (start, end) = statement_bounds_in_text_for_db_type(sql, cursor, Some(MySQL));
+            assert_eq!(
+                sql.get(start..end).unwrap_or(""),
+                sql.trim_end_matches(';'),
+                "MySQL server statement was split at a client-command lookalike line"
+            );
+            assert!(sql
+                .get(start..end)
+                .unwrap_or("")
+                .starts_with(expected_start));
+
+            let statements = super::split_script_items_for_db_type(sql, Some(MySQL))
+                .into_iter()
+                .filter_map(|item| match item {
+                    crate::db::ScriptItem::Statement(statement) => Some(statement),
+                    crate::db::ScriptItem::ToolCommand(_) => None,
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(
+                statements.len(),
+                1,
+                "MySQL server statement must remain one production execution item: {statements:?}"
+            );
+            assert!(statements[0].contains(cursor_word));
+        }
+    }
+
+    #[test]
     fn normalize_single_statement_for_mysql_db_type_keeps_routine_body_intact() {
         let sql = r#"CREATE FUNCTION fn_efficiency_band (
     p_hours DECIMAL (12, 2),

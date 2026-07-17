@@ -68,6 +68,7 @@ pub struct SessionResidueState {
     may_have_temporary_table: bool,
     may_have_prepared_statement: bool,
     may_have_user_variable: bool,
+    may_have_session_setting: bool,
     may_have_next_transaction_mode_override: bool,
     may_have_transaction_mode_override: bool,
     may_have_untracked_session_state: bool,
@@ -510,6 +511,7 @@ impl SessionResidueState {
             may_have_temporary_table: effects.creates_temporary_table,
             may_have_prepared_statement: effects.creates_prepared_statement,
             may_have_user_variable: effects.sets_user_variable,
+            may_have_session_setting: effects.sets_session_setting,
             may_have_next_transaction_mode_override: effects.sets_next_transaction_mode_override,
             may_have_transaction_mode_override: effects.sets_transaction_mode_override,
             may_have_untracked_session_state: effects.may_leave_unknown_state,
@@ -523,6 +525,8 @@ impl SessionResidueState {
             may_have_prepared_statement: self.may_have_prepared_statement
                 || other.may_have_prepared_statement,
             may_have_user_variable: self.may_have_user_variable || other.may_have_user_variable,
+            may_have_session_setting: self.may_have_session_setting
+                || other.may_have_session_setting,
             may_have_next_transaction_mode_override: self.may_have_next_transaction_mode_override
                 || other.may_have_next_transaction_mode_override,
             may_have_transaction_mode_override: self.may_have_transaction_mode_override
@@ -551,6 +555,7 @@ impl SessionResidueState {
         self.may_have_temporary_table
             || self.may_have_prepared_statement
             || self.may_have_user_variable
+            || self.may_have_session_setting
             || self.may_have_untracked_session_state
     }
 
@@ -894,6 +899,7 @@ struct StatementSessionResidueEffects {
     creates_temporary_table: bool,
     creates_prepared_statement: bool,
     sets_user_variable: bool,
+    sets_session_setting: bool,
     sets_next_transaction_mode_override: bool,
     sets_transaction_mode_override: bool,
     consumes_next_transaction_mode_override: bool,
@@ -906,6 +912,7 @@ impl StatementSessionResidueEffects {
         self.creates_temporary_table
             || self.creates_prepared_statement
             || self.sets_user_variable
+            || self.sets_session_setting
             || self.sets_next_transaction_mode_override
             || self.sets_transaction_mode_override
             || self.may_leave_unknown_state
@@ -3996,6 +4003,12 @@ fn mysql_set_has_untracked_session_assignment(sql: &str) -> bool {
         })
 }
 
+fn mysql_set_has_known_session_setting(sql: &str, analysis: &SqlStatementAnalysis<'_>) -> bool {
+    mysql_statement_starts_with_words(analysis, &["SET", "NAMES"])
+        || mysql_statement_starts_with_words(analysis, &["SET", "CHARACTER", "SET"])
+        || mysql_set_has_untracked_session_assignment(sql)
+}
+
 #[cfg(test)]
 pub(crate) fn mysql_session_state_hint_for_sql(sql: &str) -> TransactionStatementStateHint {
     let analysis = SqlStatementAnalysis::new_for_db_type(DatabaseType::MySQL, sql);
@@ -4256,7 +4269,7 @@ fn mysql_session_residue_effects_for_analysis(
         Some("SET") if !mysql_set_account_ddl_statement(analysis) => {
             let starts_with_user_variable = mysql_set_body_starts_with_user_variable(sql);
             effects.sets_user_variable = mysql_set_assigns_user_variable(sql);
-            effects.may_leave_unknown_state = mysql_set_has_untracked_session_assignment(sql);
+            effects.sets_session_setting = mysql_set_has_known_session_setting(sql, analysis);
             effects.sets_next_transaction_mode_override = !starts_with_user_variable
                 && mysql_set_next_transaction_statement(analysis)
                 || mysql_set_transaction_mode_assignment_sets_next_override(sql);
@@ -5194,7 +5207,8 @@ mod tests {
 
         let generic_set = post_processor.effects_for_sql("SET sql_notes = IF(@qt_flag = 1, 0, 1)");
         assert!(!generic_set.session_residue.sets_user_variable);
-        assert!(generic_set.session_residue.may_leave_unknown_state);
+        assert!(generic_set.session_residue.sets_session_setting);
+        assert!(!generic_set.session_residue.may_leave_unknown_state);
 
         let user_var_set = post_processor.effects_for_sql("SET sql_notes = 0, @qt_flag = 1");
         assert!(user_var_set.session_residue.sets_user_variable);
@@ -5341,7 +5355,8 @@ mod tests {
         assert!(effects.state_hint.may_leave_session_bound_state);
         assert!(effects.state_hint.may_leave_untracked_session_state);
         assert!(!statement_cancel_can_reuse_session(effects.state_hint));
-        assert!(effects.session_residue.may_leave_unknown_state);
+        assert!(effects.session_residue.sets_session_setting);
+        assert!(!effects.session_residue.may_leave_unknown_state);
 
         let retained = retained_session_state_after_statement(
             post_processor,

@@ -2110,6 +2110,15 @@ fn test_is_select_statement_with_parenthesized_main_select_is_select() {
 }
 
 #[test]
+fn test_is_select_statement_with_parenthesized_set_query_is_select() {
+    let sql = "(SELECT id FROM left_source) INTERSECT (SELECT id FROM right_source) MINUS (SELECT id FROM excluded_source) ORDER BY id";
+    assert!(
+        QueryExecutor::is_select_statement(sql),
+        "a parenthesized set query should use the query execution path"
+    );
+}
+
+#[test]
 fn test_is_select_statement_with_clause_merge_is_not_select() {
     let sql = "WITH src AS (SELECT 1 AS id FROM dual) MERGE INTO t2 d USING src s ON (d.id = s.id) WHEN MATCHED THEN UPDATE SET d.id = s.id";
     assert!(

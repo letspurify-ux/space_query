@@ -1268,7 +1268,7 @@ ORDER BY e.emp_id;
 -- source: test/oracle_format_ultimate_boss.sql
 -- db: Oracle
 -- metadata: test Oracle inferred catalog (file-scoped overlay) + Oracle built-ins
--- checked: 2460
+-- checked: 2371
 -- missing: 0
 -- marker: [[word]] means not suggested for the tested prefix
 -- missing tokens: none

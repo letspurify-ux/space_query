@@ -8,7 +8,7 @@ WHERE sql_id = '6brq8ayq9s8ay';
 -- source: test/repro_sqlid_6brq8ayq9s8ay.sql
 -- db: Oracle
 -- metadata: test Oracle inferred catalog (file-scoped overlay) + Oracle built-ins
--- checked: 7
+-- checked: 5
 -- missing: 0
 -- marker: [[word]] means not suggested for the tested prefix
 -- missing tokens: none

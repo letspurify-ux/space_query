@@ -301,7 +301,7 @@ JSON_OBJECT('trap',@lexical_trap,'vip_docs',(SELECT COUNT(*)FROM mx_document WHE
 -- source: test_mysql/test5.txt
 -- db: MySQL
 -- metadata: test_mysql/test5.txt inferred catalog
--- checked: 434
+-- checked: 433
 -- missing: 0
 -- marker: [[word]] means not suggested for the tested prefix
 -- missing tokens: none

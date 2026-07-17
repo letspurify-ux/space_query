@@ -6348,6 +6348,32 @@ impl QueryExecutor {
         match Self::leading_keyword(sql).as_deref() {
             Some("SELECT") | Some("VALUES") | Some("TABLE") => true,
             Some("WITH") => Self::with_clause_starts_with_select(sql),
+            _ => Self::parenthesized_statement_starts_with_query(sql),
+        }
+    }
+
+    fn parenthesized_statement_starts_with_query(sql: &str) -> bool {
+        let mut remaining = strip_leading_comments_and_whitespace(sql);
+        let mut saw_open_paren = false;
+        while let Some(after_open) = remaining.strip_prefix('(') {
+            saw_open_paren = true;
+            remaining = strip_leading_comments_and_whitespace(after_open);
+        }
+        if !saw_open_paren {
+            return false;
+        }
+
+        match sql_text::first_meaningful_word(remaining) {
+            Some(word)
+                if word.eq_ignore_ascii_case("SELECT")
+                    || word.eq_ignore_ascii_case("VALUES")
+                    || word.eq_ignore_ascii_case("TABLE") =>
+            {
+                true
+            }
+            Some(word) if word.eq_ignore_ascii_case("WITH") => {
+                Self::with_clause_starts_with_select(remaining)
+            }
             _ => false,
         }
     }
@@ -9098,6 +9124,20 @@ impl QueryExecutor {
         let is_alter_set_clause = is_set_clause && builder.starts_with_alter_set_context();
         let is_sql_set_statement = Self::is_sql_set_statement_line(trimmed);
         let is_sql_set_clause_context = is_alter_set_clause || is_sql_set_statement;
+        let is_user_password_clause = builder.starts_with_user_account_ddl_context()
+            && trimmed
+                .split_whitespace()
+                .next()
+                .is_some_and(|word| word.eq_ignore_ascii_case("PASSWORD"));
+        let is_analyze_compute_clause = builder.starts_with_analyze_context()
+            && trimmed
+                .split_whitespace()
+                .next()
+                .is_some_and(|word| word.eq_ignore_ascii_case("COMPUTE"));
+        let mysql_server_statement_line = builder.mysql_mode()
+            && sql_text::first_meaningful_word(trimmed).is_some_and(|word| {
+                matches!(word.to_ascii_uppercase().as_str(), "EXECUTE" | "START")
+            });
 
         // ORDER BY modifiers (DESC, ASC, NULLS FIRST/LAST) on their own line
         // must not be mistaken for SQL*Plus tool commands (e.g. DESC → DESCRIBE).
@@ -9117,6 +9157,9 @@ impl QueryExecutor {
             && builder.paren_depth() == 0
             && builder.can_terminate_on_slash()
             && !is_sql_set_clause_context
+            && !is_user_password_clause
+            && !is_analyze_compute_clause
+            && !mysql_server_statement_line
             && !is_order_by_modifier_line
             && !is_list_continuation_line
             && Self::parse_tool_command_if_candidate(trimmed).is_some()
@@ -9133,7 +9176,10 @@ impl QueryExecutor {
             builder.current_is_empty(),
             parser_is_top_level,
             is_sql_set_clause_context,
-        ) && !is_order_by_modifier_line
+        ) && !is_user_password_clause
+            && !is_analyze_compute_clause
+            && !mysql_server_statement_line
+            && !is_order_by_modifier_line
             && !is_list_continuation_line
         {
             if let Some(command) = Self::parse_tool_command_if_candidate(trimmed) {
@@ -9154,6 +9200,7 @@ impl QueryExecutor {
             builder.current_is_empty(),
             parser_is_top_level,
         ) && !is_sql_set_statement
+            && !mysql_server_statement_line
         {
             // `START WITH` is an Oracle hierarchical-query clause in the general
             // parser. At a fresh statement boundary, however, the exact two-token
@@ -9179,7 +9226,10 @@ impl QueryExecutor {
         line: &'a str,
         builder: &SqlParserEngine,
     ) -> Option<Vec<&'a str>> {
-        if line.contains('\n') || builder.mysql_mode() {
+        if line.contains('\n')
+            || builder.mysql_mode()
+            || crate::sql_parser_engine::line_starts_with_consumed_slash_terminator(line)
+        {
             return None;
         }
 
@@ -11988,6 +12038,64 @@ FROM recursive_tree";
         assert!(
             matches!(items.last(), Some(super::ScriptItem::ToolCommand(_))),
             "line-leading @path at a statement boundary must stay a script command, got: {items:?}"
+        );
+    }
+
+    #[test]
+    fn split_mysql_alter_user_keeps_password_clause_in_open_statement() {
+        let sql = "ALTER USER 'app'@'localhost'\n  PASSWORD EXPIRE INTERVAL 30 DAY\n  ACCOUNT UNLOCK;\nSELECT 1;";
+        let items = QueryExecutor::split_script_items_for_db_type(
+            sql,
+            Some(crate::db::connection::DatabaseType::MySQL),
+        );
+
+        assert!(
+            matches!(items.as_slice(), [
+                super::ScriptItem::Statement(alter_user),
+                super::ScriptItem::Statement(select)
+            ] if alter_user.contains("PASSWORD EXPIRE INTERVAL 30 DAY")
+                && alter_user.contains("ACCOUNT UNLOCK")
+                && select == "SELECT 1"),
+            "PASSWORD inside an open ALTER USER must remain SQL: {items:?}"
+        );
+    }
+
+    #[test]
+    fn split_oracle_call_execute_then_block_keeps_three_statements() {
+        let sql = "CALL demo_proc('call');\nEXECUTE demo_proc('exec')\nBEGIN\n  demo_proc('block');\nEND;\n/";
+        let items = QueryExecutor::split_script_items_for_db_type(
+            sql,
+            Some(crate::db::connection::DatabaseType::Oracle),
+        );
+
+        assert!(
+            matches!(items.as_slice(), [
+                super::ScriptItem::Statement(call),
+                super::ScriptItem::Statement(exec),
+                super::ScriptItem::Statement(block)
+            ] if call.starts_with("CALL demo_proc")
+                && exec == "EXECUTE demo_proc('exec')"
+                && block.starts_with("BEGIN")
+                && block.ends_with("END")),
+            "CALL, line-terminated EXECUTE, and slash-terminated block must stay separate: {items:?}"
+        );
+    }
+
+    #[test]
+    fn split_oracle_analyze_keeps_compute_statistics_clause() {
+        let sql = "ANALYZE TABLE demo\n  COMPUTE STATISTICS FOR TABLE FOR ALL INDEXED COLUMNS;\nSELECT 1 FROM dual;";
+        let items = QueryExecutor::split_script_items_for_db_type(
+            sql,
+            Some(crate::db::connection::DatabaseType::Oracle),
+        );
+
+        assert!(
+            matches!(items.as_slice(), [
+                super::ScriptItem::Statement(analyze),
+                super::ScriptItem::Statement(select)
+            ] if analyze.contains("COMPUTE STATISTICS FOR TABLE")
+                && select.starts_with("SELECT 1")),
+            "COMPUTE inside an open ANALYZE must remain SQL: {items:?}"
         );
     }
 

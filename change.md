@@ -4089,3 +4089,338 @@ registry helper를 사용하도록 바꾸고 production completion 재현 테스
 | `cargo test` | 전체 6,745 통과 · 235 ignored · 실패 0 · doc-test 실패 0 |
 | `cargo clippy --locked --all-targets -- -D warnings -W clippy::perf -W clippy::complexity` | 통과, 경고 0 |
 | `cargo fmt --all -- --check` / `git diff --check` | 통과 |
+
+# 30차: 공식 매뉴얼 문법 final 3종 전수 인증 (2026-07-17)
+
+## 30-1. 신규 final 스크립트와 실제 실행
+
+기존 fixture를 재사용하지 않고 Oracle, MySQL, MariaDB 공식 매뉴얼의 문법군을 기준으로
+각 DB용 `final.sql`을 새로 작성했다. 세 스크립트는 Space Query의 production 실행 경로로
+각 대상 DB에 실행해 모두 정상 완료를 확인했다.
+
+- Oracle: `test/final.sql`
+- MySQL: `test_mysql/final.sql`
+- MariaDB: `test_mariadb/final.sql`
+
+## 30-2. 하이라이팅과 인텔리센스 전수 검증
+
+하이라이팅 sweep은 66개 파일, 83,402단어를 검사했다. catalog 단어 45,625개 중
+45,081개는 직접 하이라이트되고 544개는 문맥상 식별자로 판정됐으며, object 4,480개는
+전부 하이라이트됐다. unexpected highlight 0, failure 0으로 production 수정이 필요한
+잔여 오류는 없었다.
+
+인텔리센스 final 리포트는 Oracle 4,819개, MySQL 1,117개, MariaDB 418개 추천 위치를
+검사해 모두 missing 0이었다. 전체 fixture sweep에서 발견한 MySQL `DELIMITER` 문맥
+차이는 재현 테스트를 먼저 추가하고 테스트가 production completion과 같은 흐름을
+사용하도록 맞췄다. 수정 후 해당 sweep은 707개 후보 missing 0이었다.
+
+100만 줄 이상 문서의 production/snapshot/shadow completion 성능 회귀 5건은 8.87초에
+모두 통과했다. completion은 전체 문서를 다시 순회하지 않고 상한이 있는 token window와
+국소 symbol snapshot만 사용한다.
+
+## 30-3. 포맷 sweep 66개·53,361줄 전수 육안 검토
+
+`formatting_sweep_all_files_generate_out_report`로 생성한 `target/format-sweep` 아래
+66개 `.format.out`, 최종 53,361줄을 처음부터 끝까지 검토했다. 자동 PASS를 그대로
+신뢰하지 않고 원문과 결과를 대조했으며, `docs/auto_format_rule.md`의 frame 단일 깊이
+원천, 문법적 부모, first-child-inline, structural body frame, closing owner depth,
+canonical/idempotent 원칙으로 판단했다.
+
+자동 검사만으로는 잡히지 않은 네 문법군을 육안 검토에서 발견했다. 각 오류는 먼저
+독립 재현 테스트를 추가해 실패를 확인한 뒤 production formatter의 문법 owner를
+수정했다.
+
+### Oracle PROPERTY GRAPH의 TABLES/KEY/PROPERTIES 소유 관계
+
+AS-IS:
+
+```sql
+CREATE PROPERTY GRAPH graph_cert
+VERTEX TABLES (graph_node KEY (node_id) LABEL node PROPERTIES (node_id, node_name))
+EDGE TABLES (graph_edge KEY (edge_id) SOURCE KEY (source_node_id) REFERENCES graph_node (node_id) DESTINATION KEY (target_node_id) REFERENCES graph_node (node_id) LABEL owns PROPERTIES (edge_label, edge_weight));
+```
+
+TO-BE:
+
+```sql
+CREATE PROPERTY GRAPH graph_cert
+    VERTEX TABLES (graph_node
+            KEY (node_id)
+            LABEL node
+            PROPERTIES (node_id,
+                node_name)
+    )
+    EDGE TABLES (graph_edge
+            KEY (edge_id)
+            SOURCE KEY (source_node_id) REFERENCES graph_node (node_id)
+            DESTINATION KEY (target_node_id) REFERENCES graph_node (node_id)
+            LABEL owns
+            PROPERTIES (edge_label,
+                edge_weight)
+    );
+```
+
+`VERTEX TABLES`와 `EDGE TABLES`를 명시적 parenthesized owner로 추가하고,
+`KEY`/`SOURCE KEY`/`DESTINATION KEY`/`LABEL`/`PROPERTIES`를 그 자식으로 분류했다.
+`PROPERTIES` 내부 comma-list도 별도 owner를 사용하므로 100만 줄 문서에서 주변 전체를
+재탐색하지 않는다.
+
+### Oracle MATERIALIZED VIEW LOG 절 소유 관계
+
+AS-IS:
+
+```sql
+CREATE MATERIALIZED VIEW LOG
+ON sq_oracle_manual_log WITH PRIMARY KEY,
+    ROWID (category,
+        amount) INCLUDING NEW VALUES;
+```
+
+TO-BE:
+
+```sql
+CREATE MATERIALIZED VIEW LOG ON sq_oracle_manual_log
+WITH PRIMARY KEY,
+    ROWID (category,
+        amount)
+INCLUDING NEW VALUES;
+```
+
+`ON`은 CREATE header에 유지하고, `WITH` option-list와 `INCLUDING`을 각각 동일 statement의
+명시적 clause로 만들었다.
+
+### MariaDB/MySQL VIEW의 `ALGORITHM = MERGE`
+
+AS-IS:
+
+```sql
+CREATE OR REPLACE ALGORITHM =
+MERGE VIEW statement_log_v AS
+SELECT id
+FROM statement_log;
+```
+
+TO-BE:
+
+```sql
+CREATE OR REPLACE ALGORITHM = MERGE VIEW statement_log_v AS
+SELECT id
+FROM statement_log;
+```
+
+`MERGE`가 `ALGORITHM =`의 값일 때는 독립 MERGE DML opener가 아니므로 structural break를
+만들지 않게 했다.
+
+### MariaDB/MySQL EVENT의 `DO` 본문
+
+AS-IS:
+
+```sql
+CREATE EVENT syntax_event
+    ON SCHEDULE AT CURRENT_TIMESTAMP + INTERVAL 1 DAY
+    ON COMPLETION PRESERVE DISABLE COMMENT 'disabled event' DO UPDATE statement_log
+SET amount = amount
+WHERE id = -1;
+```
+
+TO-BE:
+
+```sql
+CREATE EVENT syntax_event
+    ON SCHEDULE AT CURRENT_TIMESTAMP + INTERVAL 1 DAY
+    ON COMPLETION PRESERVE DISABLE
+    COMMENT 'disabled event'
+    DO
+        UPDATE statement_log
+        SET amount = amount
+        WHERE id = -1;
+```
+
+CREATE EVENT를 명시적 construct로 추적하고 `COMMENT`/`DO`를 event clause로,
+`DO` 뒤 실제 SQL을 structural body frame으로 관리한다.
+
+## 30-4. 추가 자동 포맷 회귀 수정
+
+final 3종의 1차 sweep에서 발견한 나머지 문법도 모두 재현 테스트를 먼저 추가했다.
+
+### prepared `EXECUTE ... USING`, transaction/XA/SHOW
+
+AS-IS:
+
+```sql
+EXECUTE prepared_select
+USING @prepared_amount, @prepared_category;
+START
+TRANSACTION READ WRITE;
+COMMIT AND
+NO CHAIN;
+XA
+START 'sq-final-xa';
+```
+
+TO-BE:
+
+```sql
+EXECUTE prepared_select USING @prepared_amount, @prepared_category;
+START TRANSACTION READ WRITE;
+COMMIT AND NO CHAIN;
+XA START 'sq-final-xa';
+```
+
+prepared EXECUTE의 USING-list를 production list owner에 연결했다. MySQL/MariaDB의
+`START TRANSACTION`, `SHOW CREATE`, `XA START/END`는 client tool/control opener가 아니라
+server SQL 문법으로 판정하고, `COMMIT AND [NO] CHAIN`은 boolean condition으로 분리하지
+않게 했다.
+
+### Oracle `EXEC` bind, `EXPLAIN PLAN`
+
+AS-IS:
+
+```sql
+EXEC
+:b_inout := 10;
+
+EXPLAIN PLAN SET STATEMENT_ID = 'SQ_ORACLE_FINAL'
+FOR
+SELECT category, SUM(amount)
+FROM sq_oracle_manual_log
+GROUP BY category;
+```
+
+TO-BE:
+
+```sql
+EXEC :b_inout := 10;
+
+EXPLAIN PLAN SET STATEMENT_ID = 'SQ_ORACLE_FINAL'
+FOR SELECT category,
+    SUM(amount)
+FROM sq_oracle_manual_log
+GROUP BY category;
+```
+
+Oracle bind assignment의 `EXEC :name`은 줄 단위 tool command 자동 종결 대상에서 제외했다.
+`EXPLAIN PLAN ... FOR`는 procedural FOR-loop가 아니라 explain statement의 clause로
+판정하고 뒤 SELECT의 query/list owner를 정상 생성한다.
+
+## 30-5. 최종 포맷 결과
+
+요청된 명령을 그대로 실행한 최종 포맷 sweep은 1 passed, 0 failed였다. 생성된
+66개 `.format.out` 모두 `status: PASS`, issue 0이며, 수정된 파일의 재생성 결과까지
+다시 육안 대조해 최종 검토 수는 66개·53,361줄이다.
+
+## 30-6. 전체 테스트에서 발견한 production 경로 정합성 수정
+
+전체 `cargo test`는 개별 sweep이 놓칠 수 있는 inventory와 production 조합을 추가로
+검사했다. 실패 건은 기존 테스트 또는 새 재현 테스트로 먼저 고정한 다음 수정했다.
+
+### Oracle `SET TRANSACTION`의 선택적 `NAME`
+
+AS-IS:
+
+```sql
+SET TRANSACTION READ WRITE |;
+-- suggestions: []
+```
+
+TO-BE:
+
+```sql
+SET TRANSACTION READ WRITE NAME 'batch_tx';
+-- suggestions at |: [NAME]
+```
+
+Oracle 공식 문법에 따라 `READ ONLY`, `READ WRITE`, `ISOLATION LEVEL SERIALIZABLE`,
+`ISOLATION LEVEL READ COMMITTED` 뒤에 선택적인 `NAME`을 production grammar table에서
+추천한다. prefix가 비어 있을 때와 입력 중일 때 동일한 경로를 사용한다.
+
+### MySQL/MariaDB DATABASE 대상과 qualified-member 차단
+
+AS-IS:
+
+```sql
+DROP DATABASE IF EXISTS qt_m|;
+-- suggestions: []
+
+SHOW CREATE DATABASE app.|;
+-- suggestions: [EMP, EMP_VIEW, EMP_PROC, ...]
+```
+
+TO-BE:
+
+```sql
+DROP DATABASE IF EXISTS qt_mysql_final_boss;
+-- suggestions at qt_m|: [qt_mysql_final_boss]
+
+SHOW CREATE DATABASE app.|;
+-- suggestions: []
+```
+
+`ALTER/DROP/SHOW CREATE DATABASE|SCHEMA`의 대상은 전용 `Database` object kind로
+분류한다. 따라서 현재 파일과 database catalog의 이름은 추천하지만, 점 뒤에는
+schema의 테이블·뷰·루틴 멤버를 열지 않는다. 테스트와 production 모두 동일한
+qualified-completion entry를 사용한다.
+
+### SQL*Plus slash와 REMARK의 원자적 분할
+
+AS-IS:
+
+```sql
+END
+/ remark execute block
+SELECT 1 FROM DUAL;
+```
+
+```text
+Statement("CREATE PROCEDURE ... END")
+Slash
+Statement("remark execute block")
+Statement("SELECT 1 FROM DUAL")
+```
+
+TO-BE:
+
+```text
+Statement("CREATE PROCEDURE ... END")
+Slash
+Statement("SELECT 1 FROM DUAL")
+```
+
+slash 뒤 `REM`/`REMARK`는 parser engine이 이미 하나의 slash terminator/comment로
+분류한다. concatenated-command 복구가 이를 다시 `/`와 SQL 조각으로 나누지 않도록
+shared slash classifier를 먼저 적용한다.
+
+### MySQL session setting의 typed residue
+
+AS-IS:
+
+```sql
+SET autocommit = 1, sql_notes = 0;
+-- sql_notes를 unknown session state로만 기록
+```
+
+TO-BE:
+
+```sql
+SET autocommit = 1, sql_notes = 0;
+-- autocommit 상태와 session setting residue를 각각 typed state로 기록
+```
+
+일반 세션 설정을 `may_have_session_setting`으로 분리해 물리 세션 보존 판단은 유지하면서
+unknown 상태의 의미를 좁혔다. `SET`의 우변에 등장한 `@var`는 assignment target이
+아니므로 user-variable residue로 잘못 기록하지 않는다.
+
+## 30-7. 최종 품질 게이트
+
+| 검증 | 결과 |
+| --- | --- |
+| Space Query 실제 실행 | Oracle/MySQL/MariaDB `final.sql` 3개 모두 정상 완료 |
+| `syntax_highlighting_sweep_all_files_generate_out_report` | 66개 파일 · 83,402단어 · unexpected 0 · failure 0 |
+| final 인텔리센스 리포트 | Oracle 4,819개 · MySQL 1,117개 · MariaDB 418개, missing 0 |
+| 전체 fixture 인텔리센스 회귀 | MySQL-family 보강 707개 후보, missing 0 |
+| `million_line_` | production/snapshot/shadow 5건 통과, 8.87초 |
+| `formatting_sweep_all_files_generate_out_report` | 통과, 66개 `.format.out` · issue 0 |
+| 전수 상세 검토 | 66개 · 53,361줄 · 잔여 오류 0 |
+| `cargo test` | library 6,623 통과 · 234 ignored · 통합/가드/doc-test 실패 0 |
+| `cargo clippy --locked --all-targets -- -D warnings -W clippy::perf -W clippy::complexity` | 통과, 경고 0 |
+| `cargo fmt --all -- --check` / `git diff --check` | 통과 |

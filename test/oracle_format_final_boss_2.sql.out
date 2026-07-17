@@ -214,7 +214,7 @@ ORDER BY f.customer_id;
 -- source: test/oracle_format_final_boss_2.sql
 -- db: Oracle
 -- metadata: test Oracle inferred catalog (file-scoped overlay) + Oracle built-ins
--- checked: 576
+-- checked: 564
 -- missing: 0
 -- marker: [[word]] means not suggested for the tested prefix
 -- missing tokens: none

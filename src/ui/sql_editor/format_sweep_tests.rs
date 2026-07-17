@@ -1082,6 +1082,169 @@ DELIMITER ;"#;
 }
 
 #[test]
+fn formatting_sweep_mysql_server_statements_and_commit_modifiers_are_stable() {
+    let source = r#"EXECUTE prepared_select USING @prepared_amount, @prepared_category;
+START TRANSACTION READ WRITE;
+COMMIT AND NO CHAIN;"#;
+
+    for db_type in [DatabaseType::MySQL, DatabaseType::MariaDB] {
+        let run = format_sweep_run(source, db_type);
+        assert!(
+            run.issues.is_empty(),
+            "{db_type:?} server-statement probe issues: {:#?}",
+            run.issues
+        );
+        assert!(
+            run.formatted
+                .contains("EXECUTE prepared_select USING @prepared_amount, @prepared_category;"),
+            "{db_type:?} EXECUTE USING list lost its statement/list ownership:\n{}",
+            run.formatted
+        );
+        assert!(
+            run.formatted.contains("START TRANSACTION READ WRITE;"),
+            "{db_type:?} START TRANSACTION was split as a client command:\n{}",
+            run.formatted
+        );
+        assert!(
+            run.formatted.contains("COMMIT AND NO CHAIN;"),
+            "{db_type:?} COMMIT modifier was treated as a boolean condition:\n{}",
+            run.formatted
+        );
+    }
+}
+
+#[test]
+fn formatting_sweep_mysql_xa_and_show_server_statements_are_stable() {
+    let source = r#"XA START 'sq-final-xa';
+XA END 'sq-final-xa';
+XA PREPARE 'sq-final-xa';
+XA COMMIT 'sq-final-xa';
+SHOW CREATE DATABASE sq_manual_final;
+SHOW CREATE TABLE sq_manual_table;"#;
+
+    for db_type in [DatabaseType::MySQL, DatabaseType::MariaDB] {
+        let run = format_sweep_run(source, db_type);
+        assert!(
+            run.issues.is_empty(),
+            "{db_type:?} XA / SHOW server-statement probe issues: {:#?}\n{}",
+            run.issues,
+            run.formatted
+        );
+        assert!(run.formatted.contains("XA START 'sq-final-xa';"));
+        assert!(run
+            .formatted
+            .contains("SHOW CREATE DATABASE sq_manual_final;"));
+    }
+}
+
+#[test]
+fn formatting_sweep_oracle_exec_bind_assignment_is_stable() {
+    let run = format_sweep_run("EXEC :b_inout := 10", DatabaseType::Oracle);
+    assert!(
+        run.issues.is_empty(),
+        "Oracle EXEC bind-assignment probe issues: {:#?}\n{}",
+        run.issues,
+        run.formatted
+    );
+    assert_eq!(run.formatted, "EXEC :b_inout := 10;");
+}
+
+#[test]
+fn formatting_sweep_oracle_mv_log_and_explain_plan_are_stable() {
+    let source = r#"CREATE MATERIALIZED VIEW LOG ON sq_oracle_manual_log
+  WITH PRIMARY KEY, ROWID (category, amount)
+  INCLUDING NEW VALUES;
+
+EXPLAIN PLAN SET STATEMENT_ID = 'SQ_ORACLE_FINAL' FOR
+SELECT category, SUM(amount)
+FROM sq_oracle_manual_log
+GROUP BY category;"#;
+
+    let run = format_sweep_run(source, DatabaseType::Oracle);
+    assert!(
+        run.issues.is_empty(),
+        "Oracle MV LOG / EXPLAIN PLAN probe issues: {:#?}",
+        run.issues
+    );
+    assert!(
+        run.formatted.contains(
+            "CREATE MATERIALIZED VIEW LOG ON sq_oracle_manual_log\nWITH PRIMARY KEY,\n    ROWID (category,\n        amount)\nINCLUDING NEW VALUES"
+        ),
+        "MV LOG clauses lost their statement/list ownership:\n{}",
+        run.formatted
+    );
+    assert!(
+        run.formatted.contains("FOR SELECT category,"),
+        "EXPLAIN PLAN FOR was treated as a procedural loop:\n{}",
+        run.formatted
+    );
+}
+
+#[test]
+fn formatting_sweep_oracle_property_graph_tables_keep_structural_ownership() {
+    let source = r#"CREATE PROPERTY GRAPH graph_cert
+  VERTEX TABLES (
+    graph_node KEY (node_id) LABEL node PROPERTIES (node_id, node_name)
+  )
+  EDGE TABLES (
+    graph_edge KEY (edge_id)
+      SOURCE KEY (source_node_id) REFERENCES graph_node (node_id)
+      DESTINATION KEY (target_node_id) REFERENCES graph_node (node_id)
+      LABEL owns PROPERTIES (edge_label, edge_weight)
+  );"#;
+
+    let run = format_sweep_run(source, DatabaseType::Oracle);
+    assert!(
+        run.issues.is_empty(),
+        "Oracle PROPERTY GRAPH probe issues: {:#?}\n{}",
+        run.issues,
+        run.formatted
+    );
+    assert!(
+        run.formatted.contains(
+            "CREATE PROPERTY GRAPH graph_cert\n    VERTEX TABLES (graph_node\n            KEY (node_id)\n            LABEL node\n            PROPERTIES (node_id,\n                node_name)\n    )\n    EDGE TABLES (graph_edge\n            KEY (edge_id)\n            SOURCE KEY (source_node_id) REFERENCES graph_node (node_id)\n            DESTINATION KEY (target_node_id) REFERENCES graph_node (node_id)\n            LABEL owns\n            PROPERTIES (edge_label,\n                edge_weight)\n    );"
+        ),
+        "PROPERTY GRAPH clauses were not rendered as owned structural children:\n{}",
+        run.formatted
+    );
+}
+
+#[test]
+fn formatting_sweep_mysql_view_algorithm_and_event_body_keep_owners() {
+    let source = r#"CREATE OR REPLACE ALGORITHM = MERGE VIEW statement_log_v AS
+SELECT id FROM statement_log;
+
+CREATE EVENT syntax_event
+  ON SCHEDULE AT CURRENT_TIMESTAMP + INTERVAL 1 DAY
+  ON COMPLETION PRESERVE DISABLE
+  COMMENT 'disabled event'
+  DO UPDATE statement_log SET amount = amount WHERE id = -1;"#;
+
+    for db_type in [DatabaseType::MySQL, DatabaseType::MariaDB] {
+        let run = format_sweep_run(source, db_type);
+        assert!(
+            run.issues.is_empty(),
+            "{db_type:?} VIEW / EVENT probe issues: {:#?}\n{}",
+            run.issues,
+            run.formatted
+        );
+        assert!(
+            run.formatted
+                .contains("CREATE OR REPLACE ALGORITHM = MERGE VIEW statement_log_v AS"),
+            "{db_type:?} view algorithm value was treated as MERGE DML:\n{}",
+            run.formatted
+        );
+        assert!(
+            run.formatted.contains(
+                "    COMMENT 'disabled event'\n    DO\n        UPDATE statement_log\n        SET amount = amount\n        WHERE id = -1;"
+            ),
+            "{db_type:?} event DO statement lost its CREATE EVENT body depth:\n{}",
+            run.formatted
+        );
+    }
+}
+
+#[test]
 fn formatting_sweep_mysql_fixed_phrases_ignore_source_line_breaks() {
     let source = r#"DELIMITER $$
 CREATE PROCEDURE p(IN p_condition BOOLEAN, IN p_priority INT)
@@ -1872,6 +2035,12 @@ fn formatting_sweep_syntax_inventory_is_owned_by_typed_frames() {
             ],
         ),
         (
+            "MySQL event statement body",
+            DatabaseType::MySQL,
+            "CREATE EVENT e ON SCHEDULE AT CURRENT_TIMESTAMP DO UPDATE t SET amount = amount WHERE id = 1;",
+            &[FormatManagedFrameKind::EventBody],
+        ),
+        (
             "MariaDB routine control conditions",
             DatabaseType::MariaDB,
             "CREATE PROCEDURE p() BEGIN IF a = 1 AND b = 2 THEN SET a = 2; ELSE SET b = 3; END IF; WHILE a < 10 OR b < 10 DO SET a = a + 1; END WHILE; REPEAT SET b = b + 1; UNTIL b > 10 AND a > 5; END REPEAT; END;",
@@ -2326,11 +2495,15 @@ fn formatting_sweep_list_owner_inventory_covers_every_typed_variant() {
         ),
         (
             DatabaseType::Oracle,
-            "ALTER TABLE t ADD a NUMBER, ADD b NUMBER; LOCK TABLE t_a, t_b IN EXCLUSIVE MODE; FLASHBACK TABLE t_a, t_b TO SCN 1; CREATE OR REPLACE TRIGGER trg_order BEFORE INSERT ON t FOLLOWS trg_a, trg_b BEGIN NULL; END;",
+            "ALTER TABLE t ADD a NUMBER, ADD b NUMBER; LOCK TABLE t_a, t_b IN EXCLUSIVE MODE; FLASHBACK TABLE t_a, t_b TO SCN 1; CREATE OR REPLACE TRIGGER trg_order BEFORE INSERT ON t FOLLOWS trg_a, trg_b BEGIN NULL; END; CREATE MATERIALIZED VIEW LOG ON t WITH PRIMARY KEY, ROWID INCLUDING NEW VALUES;",
         ),
         (
             DatabaseType::Oracle,
             "WITH r (id, parent_id) AS (SELECT 1, 0 FROM DUAL UNION ALL SELECT id + 1, id FROM r WHERE id < 3) SEARCH DEPTH FIRST BY id, parent_id SET traversal_no CYCLE id, parent_id SET cycle_yn TO 'Y' DEFAULT 'N' SELECT id, parent_id FROM r;",
+        ),
+        (
+            DatabaseType::Oracle,
+            "CREATE PROPERTY GRAPH graph_cert VERTEX TABLES (graph_node KEY (node_id) PROPERTIES (node_id, node_name));",
         ),
         (
             DatabaseType::MySQL,

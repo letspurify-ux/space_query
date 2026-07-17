@@ -583,6 +583,7 @@ pub(super) enum FormatManagedFrameKind {
     ModelBody,
     JoinBody,
     MergeOn,
+    EventBody,
     AssignmentValue,
     InsertAll,
     OracleConditionalCompilation,
@@ -610,6 +611,7 @@ impl FormatManagedFrameKind {
         Self::ModelBody,
         Self::JoinBody,
         Self::MergeOn,
+        Self::EventBody,
         Self::AssignmentValue,
         Self::InsertAll,
         Self::OracleConditionalCompilation,
@@ -1307,6 +1309,12 @@ impl FormatterStatementStructure {
             Some(FormatIndentedParenOwnerKind::Unpivot)
         } else if last_word.eq_ignore_ascii_case("COLUMNS") {
             Some(FormatIndentedParenOwnerKind::StructuredColumns)
+        } else if last_word.eq_ignore_ascii_case("TABLES")
+            && penultimate_word.is_some_and(|word| {
+                word.eq_ignore_ascii_case("VERTEX") || word.eq_ignore_ascii_case("EDGE")
+            })
+        {
+            Some(FormatIndentedParenOwnerKind::PropertyGraphTables)
         } else {
             None
         }
@@ -1966,10 +1974,11 @@ enum ScopedIndentKind {
     ModelBody,
     JoinBody,
     MergeOn,
+    EventBody,
 }
 
 impl ScopedIndentKind {
-    const COUNT: usize = 9;
+    const COUNT: usize = 10;
 
     fn index(self) -> usize {
         match self {
@@ -1982,6 +1991,7 @@ impl ScopedIndentKind {
             Self::ModelBody => 6,
             Self::JoinBody => 7,
             Self::MergeOn => 8,
+            Self::EventBody => 9,
         }
     }
 }
@@ -2143,6 +2153,8 @@ pub(super) enum ListOwnerKind {
     AlterActions,
     DoExpressions,
     DeclarationNames,
+    MaterializedViewLogOptions,
+    PropertyGraphProperties,
     TriggerOrdering,
     FlashbackTargets,
 }
@@ -2205,6 +2217,8 @@ impl ListOwnerKind {
         Self::AlterActions,
         Self::DoExpressions,
         Self::DeclarationNames,
+        Self::MaterializedViewLogOptions,
+        Self::PropertyGraphProperties,
         Self::TriggerOrdering,
         Self::FlashbackTargets,
     ];
@@ -3343,6 +3357,7 @@ impl FormatFrameStack {
                 ScopedIndentKind::ModelBody => Some(FormatManagedFrameKind::ModelBody),
                 ScopedIndentKind::JoinBody => Some(FormatManagedFrameKind::JoinBody),
                 ScopedIndentKind::MergeOn => Some(FormatManagedFrameKind::MergeOn),
+                ScopedIndentKind::EventBody => Some(FormatManagedFrameKind::EventBody),
             },
             FormatFrame::AssignmentValue(_) => Some(FormatManagedFrameKind::AssignmentValue),
             FormatFrame::ExecuteImmediate(_) => Some(FormatManagedFrameKind::ExecuteImmediate),
@@ -6371,7 +6386,10 @@ enum ConstructFlagKind {
     BulkCollectActive,
     CommentOnActive,
     CreateIndexPending,
+    CreateEventActive,
+    CreateMaterializedViewLogActive,
     CreatePending,
+    CreatePropertyGraphActive,
     CreateSequenceActive,
     CreateSynonymActive,
     CreateTableParenExpected,
@@ -6390,29 +6408,32 @@ enum ConstructFlagKind {
 }
 
 impl ConstructFlagKind {
-    const COUNT: usize = 19;
+    const COUNT: usize = 22;
 
     fn index(self) -> usize {
         match self {
             Self::BulkCollectActive => 0,
             Self::CommentOnActive => 1,
             Self::CreateIndexPending => 2,
-            Self::CreatePending => 3,
-            Self::CreateSequenceActive => 4,
-            Self::CreateSynonymActive => 5,
-            Self::CreateTableParenExpected => 6,
-            Self::CursorDeclPending => 7,
-            Self::FetchActive => 8,
-            Self::ForallPending => 9,
-            Self::GrantRevokeActive => 10,
-            Self::MergeActive => 11,
-            Self::ModelActive => 12,
-            Self::ModelReferencePending => 13,
-            Self::ReferentialActionPending => 14,
-            Self::ReferentialOnActive => 15,
-            Self::ReturningActive => 16,
-            Self::RoutineDeclPending => 17,
-            Self::SearchCycleClauseActive => 18,
+            Self::CreateEventActive => 3,
+            Self::CreateMaterializedViewLogActive => 4,
+            Self::CreatePending => 5,
+            Self::CreatePropertyGraphActive => 6,
+            Self::CreateSequenceActive => 7,
+            Self::CreateSynonymActive => 8,
+            Self::CreateTableParenExpected => 9,
+            Self::CursorDeclPending => 10,
+            Self::FetchActive => 11,
+            Self::ForallPending => 12,
+            Self::GrantRevokeActive => 13,
+            Self::MergeActive => 14,
+            Self::ModelActive => 15,
+            Self::ModelReferencePending => 16,
+            Self::ReferentialActionPending => 17,
+            Self::ReferentialOnActive => 18,
+            Self::ReturningActive => 19,
+            Self::RoutineDeclPending => 20,
+            Self::SearchCycleClauseActive => 21,
         }
     }
 }
@@ -7323,6 +7344,21 @@ impl SqlEditorWidget {
         if keyword == "INTO" && matches!(prev_word_upper, Some("INSERT" | "MERGE" | "REPLACE")) {
             return true;
         }
+        if keyword == "MERGE" && matches!(prev_word_upper, Some("ALGORITHM")) {
+            return true;
+        }
+        if keyword == "ON"
+            && format_stack
+                .construct_flag_is_active(ConstructFlagKind::CreateMaterializedViewLogActive)
+        {
+            return true;
+        }
+        if keyword == "WITH"
+            && format_stack
+                .construct_flag_is_active(ConstructFlagKind::CreateMaterializedViewLogActive)
+        {
+            return true;
+        }
         if keyword == "FROM" && matches!(prev_word_upper, Some("DELETE")) {
             return true;
         }
@@ -7434,6 +7470,35 @@ impl SqlEditorWidget {
         }
         if format_stack.execute_immediate_is_active() && matches!(keyword, "INTO" | "USING") {
             return true;
+        }
+        if keyword == "USING"
+            && Self::recent_statement_is_prepared_execute_from_indices(
+                tokens,
+                recent_statement_word_indices,
+            )
+        {
+            return true;
+        }
+        if keyword == "SELECT"
+            && Self::recent_statement_is_explain_plan_from_indices(
+                tokens,
+                recent_statement_word_indices,
+            )
+        {
+            return true;
+        }
+        if keyword == "VALUES" && matches!(prev_word_upper, Some("NEW")) {
+            let recent = Self::recent_statement_words_before_from_indices(
+                tokens,
+                recent_statement_word_indices,
+                2,
+            );
+            if matches!(recent.as_slice(), [new, including]
+                if new.eq_ignore_ascii_case("NEW")
+                    && including.eq_ignore_ascii_case("INCLUDING"))
+            {
+                return true;
+            }
         }
         if merge_when_branch_active
             && (matches!(keyword, "SET" | "INTO")
@@ -10219,6 +10284,50 @@ impl SqlEditorWidget {
         )
     }
 
+    fn recent_statement_is_prepared_execute_from_indices(
+        tokens: &[SqlToken],
+        recent_statement_word_indices: &VecDeque<usize>,
+    ) -> bool {
+        let recent = Self::recent_statement_words_before_from_indices(
+            tokens,
+            recent_statement_word_indices,
+            3,
+        );
+        matches!(recent.as_slice(), [statement_name, execute, ..]
+            if !statement_name.eq_ignore_ascii_case("IMMEDIATE")
+                && execute.eq_ignore_ascii_case("EXECUTE"))
+    }
+
+    fn recent_statement_is_explain_plan_from_indices(
+        tokens: &[SqlToken],
+        recent_statement_word_indices: &VecDeque<usize>,
+    ) -> bool {
+        let recent = Self::recent_statement_words_before_from_indices(
+            tokens,
+            recent_statement_word_indices,
+            12,
+        );
+        recent.windows(2).any(|words| {
+            words[0].eq_ignore_ascii_case("PLAN") && words[1].eq_ignore_ascii_case("EXPLAIN")
+        })
+    }
+
+    fn recent_statement_is_materialized_view_log_from_indices(
+        tokens: &[SqlToken],
+        recent_statement_word_indices: &VecDeque<usize>,
+    ) -> bool {
+        let recent = Self::recent_statement_words_before_from_indices(
+            tokens,
+            recent_statement_word_indices,
+            16,
+        );
+        recent.windows(3).any(|words| {
+            words[0].eq_ignore_ascii_case("LOG")
+                && words[1].eq_ignore_ascii_case("VIEW")
+                && words[2].eq_ignore_ascii_case("MATERIALIZED")
+        })
+    }
+
     fn paren_opens_call_argument_list_from_indices(
         tokens: &[SqlToken],
         recent_statement_word_indices: &VecDeque<usize>,
@@ -11918,6 +12027,7 @@ impl SqlEditorWidget {
                     let mut newline_after_keyword_extra = 0usize;
                     let between_pending = format_stack.between_pending_matches(current_scope);
                     let is_between_and = upper == "AND" && between_pending;
+                    let is_commit_and = upper == "AND" && matches!(prev_word_upper, Some("COMMIT"));
                     let is_exit_when = exit_condition_state.is_exit_when(upper);
                     let mysql_analyze_histogram_on = mysql_compatible
                         && upper == "ON"
@@ -11937,8 +12047,11 @@ impl SqlEditorWidget {
                         };
                     let should_break_condition = condition_keywords.contains(&upper)
                         && !(is_between_and
+                            || is_commit_and
                             || is_exit_when
                             || mysql_analyze_histogram_on
+                            || (upper == "ON"
+                                && construct_flag_active!(CreateMaterializedViewLogActive))
                             || Self::suppresses_condition_break(
                                 &format_stack,
                                 upper,
@@ -11955,6 +12068,18 @@ impl SqlEditorWidget {
                     let mysql_declare_cursor_for_clause = mysql_compatible
                         && upper == "FOR"
                         && Self::is_mysql_declare_cursor_for_clause(tokens, idx);
+                    let oracle_explain_plan_for_clause = !mysql_compatible
+                        && upper == "FOR"
+                        && Self::recent_statement_is_explain_plan_from_indices(
+                            tokens,
+                            &recent_statement_word_indices,
+                        );
+                    let oracle_explain_plan_select_clause = !mysql_compatible
+                        && upper == "SELECT"
+                        && Self::recent_statement_is_explain_plan_from_indices(
+                            tokens,
+                            &recent_statement_word_indices,
+                        );
                     let mysql_declare_handler_for_clause = mysql_compatible
                         && upper == "FOR"
                         && Self::is_mysql_declare_handler_for_clause_from_indices(
@@ -12101,13 +12226,17 @@ impl SqlEditorWidget {
                         immediate_prev_token,
                         Some(SqlToken::Symbol(sym)) if sym == "@"
                     );
+                    let mysql_xa_subcommand = mysql_compatible
+                        && matches!(prev_word_upper, Some("XA"))
+                        && matches!(upper, "START" | "END");
                     let keyword_preserves_original_case = mysql_keyword_identifier
                         || formatter_keyword_identifier
                         || structured_table_function_keyword_identifier
                         || follows_at_sign_variable;
                     let keyword_suppresses_structural_handling = keyword_preserves_original_case
                         || treat_control_keyword_as_identifier
-                        || follows_alias_control_keyword;
+                        || follows_alias_control_keyword
+                        || mysql_xa_subcommand;
                     let model_bracket_member = construct_flag_active!(ModelActive)
                         && delimiter_frame_state.innermost_is_bracket();
                     let on_duplicate_key_values_function =
@@ -12219,7 +12348,10 @@ impl SqlEditorWidget {
                             Some(idx),
                         );
                     }
-                    if upper == "END" && !treat_control_keyword_as_identifier {
+                    if upper == "END"
+                        && !treat_control_keyword_as_identifier
+                        && !mysql_xa_subcommand
+                    {
                         let end_word_idx = idx;
                         let mut last_rendered_end_word_idx = end_word_idx;
                         let active_end_block = format_stack.last_block_kind();
@@ -13450,6 +13582,22 @@ impl SqlEditorWidget {
                         && (upper == "OR" || upper == "REPLACE")
                     {
                         // part of CREATE OR REPLACE
+                    } else if construct_flag_active!(CreatePending) && upper == "EVENT" {
+                        activate_construct_flag!(CreateEventActive, current_scope);
+                        deactivate_construct_flag!(CreatePending);
+                    } else if construct_flag_active!(CreatePending)
+                        && upper == "MATERIALIZED"
+                        && next_word_is("VIEW")
+                        && third_word.is_some_and(|word| word.eq_ignore_ascii_case("LOG"))
+                    {
+                        activate_construct_flag!(CreateMaterializedViewLogActive, current_scope);
+                        deactivate_construct_flag!(CreatePending);
+                    } else if construct_flag_active!(CreatePending)
+                        && upper == "PROPERTY"
+                        && next_word_is("GRAPH")
+                    {
+                        activate_construct_flag!(CreatePropertyGraphActive, current_scope);
+                        deactivate_construct_flag!(CreatePending);
                     } else if construct_flag_active!(CreatePending) && upper == "PACKAGE" {
                         if next_word_is("BODY") {
                             replace_construct_value!(
@@ -13499,6 +13647,38 @@ impl SqlEditorWidget {
                             format_stack.push_trigger_header(current_scope);
                         }
                         deactivate_construct_flag!(CreatePending);
+                    } else if construct_flag_active!(CreatePropertyGraphActive)
+                        && matches!(upper, "VERTEX" | "EDGE")
+                        && next_word_is("TABLES")
+                    {
+                        newline_with(
+                            &mut out,
+                            base_indent!(format_stack.statement_base_depth()),
+                            1,
+                            &mut at_line_start,
+                            &mut needs_space,
+                            &mut line_indent,
+                        );
+                    } else if construct_flag_active!(CreateMaterializedViewLogActive)
+                        && matches!(upper, "WITH" | "INCLUDING")
+                    {
+                        newline_with(
+                            &mut out,
+                            base_indent!(format_stack.statement_base_depth()),
+                            0,
+                            &mut at_line_start,
+                            &mut needs_space,
+                            &mut line_indent,
+                        );
+                    } else if construct_flag_active!(CreateEventActive) && upper == "COMMENT" {
+                        newline_with(
+                            &mut out,
+                            base_indent!(format_stack.statement_base_depth()),
+                            1,
+                            &mut at_line_start,
+                            &mut needs_space,
+                            &mut line_indent,
+                        );
                     } else if with_plsql_declaration_header {
                         let declaration_indent = format_stack.with_cte_separator_indent(
                             base_indent!(format_stack.statement_base_depth()),
@@ -13817,11 +13997,23 @@ impl SqlEditorWidget {
                             );
                         } else if active_phase1_wrapped_owner_kind.is_some_and(|kind| {
                             kind.starts_phase1_body_header_words(upper, next_word, third_word)
-                        }) {
+                        }) && !(upper == "KEY"
+                            && matches!(prev_word_upper, Some("SOURCE" | "DESTINATION")))
+                        {
+                            let body_header_indent = base_indent!(
+                                format_stack.statement_base_depth()
+                            )
+                            .saturating_add(usize::from(
+                                active_phase1_wrapped_owner_kind
+                                    == Some(FormatIndentedParenOwnerKind::PropertyGraphTables),
+                            ));
                             #[cfg(test)]
-                            if let Some(expected_indent) =
-                                format_stack.last_paren().map(|frame| frame.depth())
-                            {
+                            if let Some(expected_indent) = format_stack.last_paren().map(|frame| {
+                                frame.depth().saturating_add(usize::from(
+                                    active_phase1_wrapped_owner_kind
+                                        == Some(FormatIndentedParenOwnerKind::PropertyGraphTables),
+                                ))
+                            }) {
                                 format_stack.audit_expected_indent(
                                     idx,
                                     expected_indent,
@@ -13830,7 +14022,7 @@ impl SqlEditorWidget {
                             }
                             newline_with(
                                 &mut out,
-                                base_indent!(format_stack.statement_base_depth()),
+                                body_header_indent,
                                 0,
                                 &mut at_line_start,
                                 &mut needs_space,
@@ -13838,6 +14030,20 @@ impl SqlEditorWidget {
                             );
                         } else if upper == "OPEN" {
                             set_open_cursor_state!(OpenCursorFormatState::AwaitingFor);
+                        } else if oracle_explain_plan_for_clause {
+                            let _ = format_stack.pop_assignment_value_frame_at_scope(current_scope);
+                            format_stack
+                                .clear_list_owner_kind_at_scope(current_scope, ListOwnerKind::Set);
+                            set_current_clause!(None);
+                            clear_select_list_layout_state!();
+                            newline_with(
+                                &mut out,
+                                base_indent!(format_stack.statement_base_depth()),
+                                0,
+                                &mut at_line_start,
+                                &mut needs_space,
+                                &mut line_indent,
+                            );
                         } else if upper == "FOR" && mysql_declare_cursor_for_clause {
                             format_stack.push_scoped_indent_for_render(
                                 ScopedIndentKind::CursorSql,
@@ -14029,6 +14235,31 @@ impl SqlEditorWidget {
                                     &mut line_indent,
                                 );
                             }
+                            newline_after_keyword = true;
+                        } else if upper == "DO"
+                            && mysql_compatible
+                            && construct_flag_active!(CreateEventActive)
+                        {
+                            let event_owner_indent = format_stack.statement_base_depth();
+                            let event_clause_indent = event_owner_indent.saturating_add(1);
+                            newline_with(
+                                &mut out,
+                                event_clause_indent,
+                                0,
+                                &mut at_line_start,
+                                &mut needs_space,
+                                &mut line_indent,
+                            );
+                            deactivate_construct_flag!(CreateEventActive);
+                            format_stack.push_scoped_indent_for_render(
+                                ScopedIndentKind::EventBody,
+                                current_scope,
+                                event_clause_indent,
+                                idx,
+                                next_non_comment_idx,
+                            );
+                            closed_control_header_body_indent =
+                                Some(event_clause_indent.saturating_add(1));
                             newline_after_keyword = true;
                         } else if upper == "DO"
                             && mysql_compatible
@@ -14980,6 +15211,17 @@ impl SqlEditorWidget {
                             .and_then(&word_upper_at)
                             .map(Cow::into_owned);
                     }
+                    if oracle_explain_plan_select_clause {
+                        set_current_clause!(Some(upper));
+                        format_stack.push_list_owner_for_render(
+                            current_scope,
+                            upper,
+                            idx,
+                            tokens,
+                            line_indent,
+                        );
+                        format_stack.set_current_query_base_depth(Some(line_indent));
+                    }
                     if upper == "SELECT" {
                         let select_body_indent = format_stack
                             .list_owner_body_indent_for_kind(current_scope, ListOwnerKind::Select)
@@ -15148,11 +15390,53 @@ impl SqlEditorWidget {
                             second_next_non_comment_idx,
                         );
                     }
-                    if upper == "USING" && format_stack.execute_immediate_is_active() {
-                        format_stack.mark_execute_immediate_using(format_stack.paren_depth());
+                    if upper == "USING"
+                        && (format_stack.execute_immediate_is_active()
+                            || Self::recent_statement_is_prepared_execute_from_indices(
+                                tokens,
+                                &recent_statement_word_indices,
+                            ))
+                    {
+                        if format_stack.execute_immediate_is_active() {
+                            format_stack.mark_execute_immediate_using(format_stack.paren_depth());
+                        }
                         format_stack.push_list_owner_kind_for_render(
                             current_scope,
                             ListOwnerKind::Using,
+                            idx,
+                            tokens,
+                            line_indent,
+                        );
+                    }
+                    if !mysql_compatible
+                        && upper == "WITH"
+                        && (construct_flag_active!(CreateMaterializedViewLogActive)
+                            || Self::recent_statement_is_materialized_view_log_from_indices(
+                                tokens,
+                                &recent_statement_word_indices,
+                            ))
+                    {
+                        format_stack.push_list_owner_kind_for_render(
+                            current_scope,
+                            ListOwnerKind::MaterializedViewLogOptions,
+                            idx,
+                            tokens,
+                            line_indent,
+                        );
+                    }
+                    if !mysql_compatible && upper == "INCLUDING" {
+                        format_stack.clear_list_owner_kind_at_scope(
+                            current_scope,
+                            ListOwnerKind::MaterializedViewLogOptions,
+                        );
+                    }
+                    if upper == "PROPERTIES"
+                        && active_phase1_wrapped_owner_kind
+                            == Some(FormatIndentedParenOwnerKind::PropertyGraphTables)
+                    {
+                        format_stack.push_list_owner_kind_for_render(
+                            current_scope,
+                            ListOwnerKind::PropertyGraphProperties,
                             idx,
                             tokens,
                             line_indent,
@@ -17871,6 +18155,7 @@ impl SqlEditorWidget {
                                             | FormatIndentedParenOwnerKind::MatchRecognize
                                             | FormatIndentedParenOwnerKind::Pivot
                                             | FormatIndentedParenOwnerKind::Unpivot
+                                            | FormatIndentedParenOwnerKind::PropertyGraphTables
                                     )
                                 ) || is_analytic_over_paren);
                             let is_subquery = is_query_paren || is_multiline_clause_paren;
@@ -17934,6 +18219,8 @@ impl SqlEditorWidget {
                             } else if ((!paren_body_is_empty)
                                 && (multiline_clause_owner_kind
                                     == Some(FormatIndentedParenOwnerKind::Window)
+                                    || multiline_clause_owner_kind
+                                        == Some(FormatIndentedParenOwnerKind::PropertyGraphTables)
                                     || is_analytic_over_paren))
                                 || is_model_rules_paren
                                 || is_call_argument_list
@@ -18359,6 +18646,15 @@ impl SqlEditorWidget {
                                         semantic_open_line_indent.saturating_add(1)
                                     }
                                 });
+                            let property_graph_properties_paren =
+                                matches!(prev_word_upper, Some("PROPERTIES"))
+                                    && format_stack.last_paren_wrapped_owner_kind()
+                                        == Some(FormatIndentedParenOwnerKind::PropertyGraphTables);
+                            let frame_depth = if property_graph_properties_paren {
+                                frame_depth.max(rendered_owner_depth.saturating_add(1))
+                            } else {
+                                frame_depth
+                            };
                             // An assignment value that is exactly this paren is
                             // one owner edge: the AssignmentValue frame and the
                             // paren delimiter must share one depth instead of
@@ -18493,6 +18789,7 @@ impl SqlEditorWidget {
                                                 kind,
                                                 FormatIndentedParenOwnerKind::Pivot
                                                     | FormatIndentedParenOwnerKind::Unpivot
+                                                    | FormatIndentedParenOwnerKind::PropertyGraphTables
                                             )
                                         })
                                     }),

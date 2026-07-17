@@ -406,7 +406,7 @@ PROMPT [DONE]
 -- source: test/mega_torture.txt
 -- db: Oracle
 -- metadata: test Oracle inferred catalog (file-scoped overlay) + Oracle built-ins
--- checked: 832
+-- checked: 816
 -- missing: 0
 -- marker: [[word]] means not suggested for the tested prefix
 -- missing tokens: none

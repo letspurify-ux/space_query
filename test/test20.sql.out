@@ -1095,7 +1095,7 @@ SELECT audit_id, module_name, action_name, SUBSTR(message_text, 1, 120) AS msg_p
 -- source: test/test20.sql
 -- db: Oracle
 -- metadata: test Oracle inferred catalog (file-scoped overlay) + Oracle built-ins
--- checked: 1424
+-- checked: 1372
 -- missing: 0
 -- marker: [[word]] means not suggested for the tested prefix
 -- missing tokens: none

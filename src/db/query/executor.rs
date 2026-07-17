@@ -1590,6 +1590,12 @@ impl QueryExecutor {
         if !trimmed_line.is_empty()
             && Self::parse_tool_command(trimmed_line).is_some()
             && Self::line_starts_in_idle_lex_state(sql, line_start, preferred_db_type)
+            && !Self::tool_command_lookalike_continues_open_sql(
+                sql,
+                line_start,
+                trimmed_line,
+                preferred_db_type,
+            )
         {
             return Some((line_start, line_end));
         }
@@ -1610,15 +1616,51 @@ impl QueryExecutor {
         )
     }
 
-    /// True when the lexer reaches `line_start` outside any string literal or
-    /// comment. This gates the standalone tool-command short-circuit so a line that
-    /// merely *looks* like a SQL*Plus command (e.g. `SET ECHO ON`) but actually sits
-    /// inside a multi-line string or block comment is not mistaken for one.
-    ///
-    /// Only the lexical mode is checked (not block/paren depth or statement
-    /// termination), because that is the sole question here and it stays correct
-    /// regardless of custom MySQL `DELIMITER`s, which the line-oriented engine does
-    /// not otherwise track.
+    fn tool_command_lookalike_continues_open_sql(
+        sql: &str,
+        line_start: usize,
+        trimmed_line: &str,
+        preferred_db_type: Option<crate::db::connection::DatabaseType>,
+    ) -> bool {
+        let first_word = sql_text::first_meaningful_word(trimmed_line).unwrap_or("");
+        if preferred_db_type.is_some_and(|db_type| db_type.is_mysql_or_mariadb())
+            && matches!(
+                first_word.to_ascii_uppercase().as_str(),
+                "EXECUTE" | "START"
+            )
+        {
+            return true;
+        }
+        let Some(prefix) = sql.get(..line_start) else {
+            return false;
+        };
+        let tail_start = prefix.rfind(';').map_or(0, |idx| idx.saturating_add(1));
+        let statement_tail = prefix.get(tail_start..).unwrap_or("");
+        let mut tail_end = statement_tail.len().min(4096);
+        while tail_end > 0 && !statement_tail.is_char_boundary(tail_end) {
+            tail_end = tail_end.saturating_sub(1);
+        }
+        let tail_upper = statement_tail
+            .get(..tail_end)
+            .unwrap_or(statement_tail)
+            .to_ascii_uppercase();
+
+        (first_word.eq_ignore_ascii_case("SOURCE") && tail_upper.contains("CREATE PROPERTY GRAPH"))
+            || (first_word.eq_ignore_ascii_case("COMPUTE") && tail_upper.contains("ANALYZE TABLE"))
+            || (matches!(first_word.to_ascii_uppercase().as_str(), "CONN" | "CONNECT")
+                && tail_upper.contains("SELECT"))
+            || (first_word.eq_ignore_ascii_case("START")
+                && (tail_upper.contains("SELECT") || tail_upper.contains("CREATE SEQUENCE")))
+            || (matches!(
+                first_word.to_ascii_uppercase().as_str(),
+                "DESC" | "DESCRIBE"
+            ) && tail_upper.contains("SELECT"))
+            || (matches!(
+                first_word.to_ascii_uppercase().as_str(),
+                "PASSW" | "PASSWORD"
+            ) && tail_upper.contains("ALTER USER"))
+    }
+
     fn line_starts_in_idle_lex_state(
         sql: &str,
         line_start: usize,
@@ -2098,6 +2140,12 @@ impl QueryExecutor {
                 && collector.builder.can_terminate_on_slash()
                 && !collector.builder.has_pending_standard_cte_header()
                 && Self::parse_tool_command(parser_trimmed).is_some()
+                && !Self::tool_command_lookalike_continues_open_sql(
+                    sql,
+                    line_start,
+                    parser_trimmed,
+                    preferred_db_type,
+                )
                 && !collector.force_terminate_current(sql, &mut on_span)
             {
                 return;
@@ -2110,6 +2158,12 @@ impl QueryExecutor {
                 is_alter_session_set_clause,
             ) && !collector.builder.has_pending_standard_cte_header()
                 && Self::line_might_be_tool_command_for_bounds(parser_trimmed)
+                && !Self::tool_command_lookalike_continues_open_sql(
+                    sql,
+                    line_start,
+                    parser_trimmed,
+                    preferred_db_type,
+                )
             {
                 if let Some(command) = Self::parse_tool_command(parser_trimmed) {
                     if !collector.force_terminate_current(sql, &mut on_span) {
@@ -2131,6 +2185,12 @@ impl QueryExecutor {
                 collector.current_is_empty(),
                 collector.builder.block_depth() == 0 && collector.builder.paren_depth() == 0,
             ) && Self::line_might_be_tool_command_for_bounds(parser_trimmed)
+                && !Self::tool_command_lookalike_continues_open_sql(
+                    sql,
+                    line_start,
+                    parser_trimmed,
+                    preferred_db_type,
+                )
             {
                 if let Some(command) = Self::parse_tool_command(parser_trimmed) {
                     if let ToolCommand::MysqlDelimiter { delimiter } = &command {

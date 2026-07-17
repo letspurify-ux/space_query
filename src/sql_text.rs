@@ -57,6 +57,7 @@ pub const ORACLE_SQL_KEYWORDS: &[&str] = &[
     "BREADTH",
     "BREAK",
     "BREAKS",
+    "BUILD",
     "BULK",
     "BULK_EXCEPTIONS",
     "BY",
@@ -105,6 +106,7 @@ pub const ORACLE_SQL_KEYWORDS: &[&str] = &[
     "CONTENT",
     "CONTEXT",
     "CONTINUE",
+    "COSINE",
     "COUNT",
     "CREATE",
     "CROSS",
@@ -133,10 +135,12 @@ pub const ORACLE_SQL_KEYWORDS: &[&str] = &[
     "DEFINER",
     "DELETE",
     "DELETING",
+    "DEMAND",
     "DENSE_RANK",
     "DEPTH",
     "DESC",
     "DESCRIBE",
+    "DESTINATION",
     "DETERMINISTIC",
     "DIMENSION",
     "DIRECTORY",
@@ -144,12 +148,15 @@ pub const ORACLE_SQL_KEYWORDS: &[&str] = &[
     "DISASSOCIATE",
     "DISC",
     "DISCONNECT",
+    "DISPLAY",
     "DISTINCT",
     "DO",
     "DOCUMENT",
+    "DOMAIN",
     "DROP",
     "DUAL",
     "EACH",
+    "EDGE",
     "EDITION",
     "EDITIONABLE",
     "EDITIONING",
@@ -185,6 +192,7 @@ pub const ORACLE_SQL_KEYWORDS: &[&str] = &[
     "FIRST",
     "FIRST_VALUE",
     "FLASHBACK",
+    "FLOAT32",
     "FOLLOWING",
     "FOLLOWS",
     "FOR",
@@ -202,6 +210,7 @@ pub const ORACLE_SQL_KEYWORDS: &[&str] = &[
     "GLOBALLY",
     "GOTO",
     "GRANT",
+    "GRAPH",
     "GROUP",
     "GROUPS",
     "HASH",
@@ -219,6 +228,8 @@ pub const ORACLE_SQL_KEYWORDS: &[&str] = &[
     "INCLUDING",
     "INCREMENT",
     "INDEX",
+    "INDEXED",
+    "INDICES",
     "INITIALLY",
     "INITRANS",
     "INNER",
@@ -251,6 +262,7 @@ pub const ORACLE_SQL_KEYWORDS: &[&str] = &[
     "JSON_VALUE",
     "KEEP",
     "KEY",
+    "LABEL",
     "LAG",
     "LANGUAGE",
     "LAST",
@@ -296,6 +308,7 @@ pub const ORACLE_SQL_KEYWORDS: &[&str] = &[
     "MINUS",
     "MINUTE",
     "MINVALUE",
+    "MODE",
     "MODEL",
     "MONITORING",
     "MONTH",
@@ -389,6 +402,7 @@ pub const ORACLE_SQL_KEYWORDS: &[&str] = &[
     "PARTITION",
     "PASSING",
     "PASSWORD",
+    "PAST",
     "PATH",
     "PATTERN",
     "PAUSE",
@@ -404,6 +418,7 @@ pub const ORACLE_SQL_KEYWORDS: &[&str] = &[
     "PIPE",
     "PIPELINED",
     "PIVOT",
+    "PLAN",
     "PLSCOPE_SETTINGS",
     "PLSQL_CCFLAGS",
     "PLSQL_CODE_TYPE",
@@ -417,6 +432,7 @@ pub const ORACLE_SQL_KEYWORDS: &[&str] = &[
     "PRECEDES",
     "PRECEDING",
     "PRESERVE",
+    "PRETTY",
     "PRIMARY",
     "PRINT",
     "PRIOR",
@@ -424,6 +440,8 @@ pub const ORACLE_SQL_KEYWORDS: &[&str] = &[
     "PROCEDURE",
     "PROFILE",
     "PROMPT",
+    "PROPERTIES",
+    "PROPERTY",
     "PUBLIC",
     "PURGE",
     "QUALIFY",
@@ -476,6 +494,7 @@ pub const ORACLE_SQL_KEYWORDS: &[&str] = &[
     "ROW_NUMBER",
     "RULES",
     "SAMPLE",
+    "SAVE",
     "SAVEPOINT",
     "SCALE",
     "SCHEMA",
@@ -517,6 +536,7 @@ pub const ORACLE_SQL_KEYWORDS: &[&str] = &[
     "START",
     "STARTUP",
     "STATIC",
+    "STATISTICS",
     "STATISTICS_LEVEL",
     "STORAGE",
     "STORE",
@@ -535,6 +555,7 @@ pub const ORACLE_SQL_KEYWORDS: &[&str] = &[
     "SYS_OUTPUT",
     "SYS_REFCURSOR",
     "TABLE",
+    "TABLES",
     "TABLESAMPLE",
     "TABLESPACE",
     "TEMPORARY",
@@ -581,8 +602,10 @@ pub const ORACLE_SQL_KEYWORDS: &[&str] = &[
     "VARCHAR2",
     "VARIABLE",
     "VARRAY",
+    "VECTOR",
     "VERIFY",
     "VERSIONS",
+    "VERTEX",
     "VIEW",
     "VIRTUAL",
     "VISIBLE",
@@ -847,6 +870,7 @@ pub const MYSQL_SQL_KEYWORDS: &[&str] = &[
     "ASC",
     "ASENSITIVE",
     "ASSIGN_GTIDS_TO_ANONYMOUS_TRANSACTIONS",
+    "AT",
     "ATOMIC",
     "AUTOEXTEND_SIZE",
     "AUTO_INCREMENT",
@@ -864,7 +888,9 @@ pub const MYSQL_SQL_KEYWORDS: &[&str] = &[
     "BY",
     "CALL",
     "CASCADE",
+    "CASCADED",
     "CASE",
+    "CHAIN",
     "CHANGE",
     "CHAR",
     "CHARACTER",
@@ -879,6 +905,7 @@ pub const MYSQL_SQL_KEYWORDS: &[&str] = &[
     "COMMIT",
     "COMMITTED",
     "COMPACT",
+    "COMPLETION",
     "COMPRESSED",
     "CONDITION",
     "CONNECTION",
@@ -960,6 +987,7 @@ pub const MYSQL_SQL_KEYWORDS: &[&str] = &[
     "EXECUTE",
     "EXISTS",
     "EXIT",
+    "EXPIRE",
     "EXPLAIN",
     "EXTENDED",
     "EXTENT_SIZE",
@@ -1003,6 +1031,7 @@ pub const MYSQL_SQL_KEYWORDS: &[&str] = &[
     "HAVING",
     "HELP",
     "HIGH_PRIORITY",
+    "HISTORY",
     "HOST",
     "HOUR",
     "HOUR_MICROSECOND",
@@ -1123,6 +1152,7 @@ pub const MYSQL_SQL_KEYWORDS: &[&str] = &[
     "NO_WRITE_TO_BINLOG",
     "NULL",
     "NULLS",
+    "NUMBER",
     "NUMERIC",
     "NVARCHAR",
     "OF",
@@ -1210,6 +1240,7 @@ pub const MYSQL_SQL_KEYWORDS: &[&str] = &[
     "REVOKE",
     "RIGHT",
     "RLIKE",
+    "ROLE",
     "ROLLBACK",
     "ROLLUP",
     "ROUTINE",
@@ -1294,6 +1325,7 @@ pub const MYSQL_SQL_KEYWORDS: &[&str] = &[
     "SSL",
     "START",
     "STARTING",
+    "STATEMENT",
     "STATS_AUTO_RECALC",
     "STATS_PERSISTENT",
     "STATS_SAMPLE_PAGES",
@@ -3796,9 +3828,16 @@ pub(crate) fn is_auto_terminated_tool_command(line: &str) -> bool {
         "DISC" | "DISCONNECT" | "CONN" | "RUN" | "EXIT" | "QUIT" | "STARTUP" | "SHUTDOWN"
         | "RECOVER" | "ARCHIVE" | "HOST" | "TIMING" | "TTITLE" | "BTITLE" | "REPHEADER"
         | "REPFOOTER" | "PROMPT" | "REM" | "REMARK" | "SPOOL" | "STORE" | "GET" | "SAVE"
-        | "DESCRIBE" | "DESC" | "EXEC" | "EXECUTE" | "DEFINE" | "UNDEFINE" | "VARIABLE" | "VAR"
-        | "PRINT" | "ACCEPT" | "PAUSE" | "WHENEVER" | "COLUMN" | "BREAK" | "CLEAR" | "COMPUTE" => {
-            true
+        | "DESCRIBE" | "DESC" | "DEFINE" | "UNDEFINE" | "VARIABLE" | "VAR" | "PRINT" | "ACCEPT"
+        | "PAUSE" | "WHENEVER" | "COLUMN" | "BREAK" | "CLEAR" | "COMPUTE" => true,
+        "EXEC" | "EXECUTE" => {
+            let tail = trimmed.get(first.len()..).unwrap_or_default().trim();
+            !tail.strip_prefix(':').is_some_and(|bind_name| {
+                !bind_name.is_empty()
+                    && bind_name.bytes().all(|byte| {
+                        byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'$' | b'#')
+                    })
+            })
         }
         _ => false,
     }
@@ -5666,6 +5705,7 @@ pub(crate) enum FormatIndentedParenOwnerKind {
     Pivot,
     Unpivot,
     StructuredColumns,
+    PropertyGraphTables,
 }
 
 const FORMAT_ALL_INDENTED_PAREN_OWNER_KINDS: &[FormatIndentedParenOwnerKind] = &[
@@ -5678,6 +5718,7 @@ const FORMAT_ALL_INDENTED_PAREN_OWNER_KINDS: &[FormatIndentedParenOwnerKind] = &
     FormatIndentedParenOwnerKind::Pivot,
     FormatIndentedParenOwnerKind::Unpivot,
     FormatIndentedParenOwnerKind::StructuredColumns,
+    FormatIndentedParenOwnerKind::PropertyGraphTables,
 ];
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -5757,6 +5798,14 @@ const FORMAT_MATCH_RECOGNIZE_SUBCLAUSE_KEYWORD_SEQUENCES: &[&[&str]] = &[
 const FORMAT_PIVOT_UNPIVOT_SUBCLAUSE_KEYWORD_SEQUENCES: &[&[&str]] = &[&["FOR"]];
 
 const FORMAT_STRUCTURED_COLUMNS_SUBCLAUSE_KEYWORD_SEQUENCES: &[&[&str]] = &[&["NESTED"]];
+
+const FORMAT_PROPERTY_GRAPH_TABLE_SUBCLAUSE_KEYWORD_SEQUENCES: &[&[&str]] = &[
+    &["KEY"],
+    &["SOURCE", "KEY"],
+    &["DESTINATION", "KEY"],
+    &["LABEL"],
+    &["PROPERTIES"],
+];
 
 fn starts_with_keyword_sequence(text_upper: &str, sequence: &[&str]) -> bool {
     !sequence.is_empty() && line_starts_with_identifier_sequence(text_upper, sequence)
@@ -5917,6 +5966,7 @@ impl FormatIndentedParenOwnerKind {
             Self::MatchRecognize => FORMAT_MATCH_RECOGNIZE_SUBCLAUSE_KEYWORD_SEQUENCES,
             Self::Pivot | Self::Unpivot => FORMAT_PIVOT_UNPIVOT_SUBCLAUSE_KEYWORD_SEQUENCES,
             Self::StructuredColumns => FORMAT_STRUCTURED_COLUMNS_SUBCLAUSE_KEYWORD_SEQUENCES,
+            Self::PropertyGraphTables => FORMAT_PROPERTY_GRAPH_TABLE_SUBCLAUSE_KEYWORD_SEQUENCES,
         }
     }
 
@@ -5950,6 +6000,7 @@ impl FormatIndentedParenOwnerKind {
             ],
             Self::Pivot | Self::Unpivot => &[&["FOR", "IN"]],
             Self::StructuredColumns => &[&["NESTED", "PATH", "COLUMNS"], &["NESTED", "COLUMNS"]],
+            Self::PropertyGraphTables => FORMAT_PROPERTY_GRAPH_TABLE_SUBCLAUSE_KEYWORD_SEQUENCES,
         }
     }
 
@@ -5962,7 +6013,8 @@ impl FormatIndentedParenOwnerKind {
             | Self::ModelSubclause
             | Self::Pivot
             | Self::Unpivot
-            | Self::StructuredColumns => false,
+            | Self::StructuredColumns
+            | Self::PropertyGraphTables => false,
         }
     }
 
@@ -6220,7 +6272,7 @@ impl FormatIndentedParenOwnerKind {
                 3..=9 => FormatInlineCommentHeaderContinuationKind::SameDepth,
                 _ => FormatInlineCommentHeaderContinuationKind::SameDepth,
             },
-            Self::Pivot | Self::Unpivot | Self::StructuredColumns => {
+            Self::Pivot | Self::Unpivot | Self::StructuredColumns | Self::PropertyGraphTables => {
                 FormatInlineCommentHeaderContinuationKind::SameDepth
             }
         }
@@ -6263,7 +6315,8 @@ impl FormatIndentedParenOwnerKind {
             | Self::Window
             | Self::Pivot
             | Self::Unpivot
-            | Self::StructuredColumns => &[],
+            | Self::StructuredColumns
+            | Self::PropertyGraphTables => &[],
         }
     }
 
@@ -6303,7 +6356,11 @@ impl FormatIndentedParenOwnerKind {
             Self::ModelSubclause => query_base_depth
                 .map(|depth| depth.saturating_add(1))
                 .unwrap_or(fallback_depth),
-            Self::AnalyticOver | Self::WithinGroup | Self::Keep | Self::StructuredColumns => {
+            Self::AnalyticOver
+            | Self::WithinGroup
+            | Self::Keep
+            | Self::StructuredColumns
+            | Self::PropertyGraphTables => {
                 general_paren_continuation_depth.unwrap_or(fallback_depth)
             }
         }
@@ -6324,7 +6381,10 @@ impl FormatIndentedParenOwnerKind {
         owner_depth: usize,
     ) -> Option<usize> {
         self.starts_contextual_body_header(text_upper, previous_line_upper)
-            .then(|| self.body_depth(owner_depth))
+            .then(|| {
+                self.body_depth(owner_depth)
+                    .saturating_add(usize::from(self == Self::PropertyGraphTables))
+            })
     }
 }
 
@@ -6413,7 +6473,8 @@ pub(crate) fn format_indented_paren_owner_header_continues(
         | FormatIndentedParenOwnerKind::ModelSubclause
         | FormatIndentedParenOwnerKind::Window
         | FormatIndentedParenOwnerKind::MatchRecognize
-        | FormatIndentedParenOwnerKind::StructuredColumns => false,
+        | FormatIndentedParenOwnerKind::StructuredColumns
+        | FormatIndentedParenOwnerKind::PropertyGraphTables => false,
     }
 }
 
@@ -6581,6 +6642,12 @@ pub(crate) fn format_indented_paren_owner_kind_from_words(
         Some(FormatIndentedParenOwnerKind::Unpivot)
     } else if last_word.eq_ignore_ascii_case("COLUMNS") {
         Some(FormatIndentedParenOwnerKind::StructuredColumns)
+    } else if last_word.eq_ignore_ascii_case("TABLES")
+        && penultimate_word.is_some_and(|word| {
+            word.eq_ignore_ascii_case("VERTEX") || word.eq_ignore_ascii_case("EDGE")
+        })
+    {
+        Some(FormatIndentedParenOwnerKind::PropertyGraphTables)
     } else {
         None
     }
@@ -6614,6 +6681,10 @@ pub(crate) fn format_indented_paren_owner_header_kind(
         Some(FormatIndentedParenOwnerKind::Unpivot)
     } else if line_ends_with_keyword(structural_tail, "COLUMNS") {
         Some(FormatIndentedParenOwnerKind::StructuredColumns)
+    } else if line_ends_with_identifier_sequence(structural_tail, &["VERTEX", "TABLES"])
+        || line_ends_with_identifier_sequence(structural_tail, &["EDGE", "TABLES"])
+    {
+        Some(FormatIndentedParenOwnerKind::PropertyGraphTables)
     } else {
         None
     }

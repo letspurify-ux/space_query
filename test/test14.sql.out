@@ -531,7 +531,7 @@ SELECT COUNT(*) AS total_view_rows FROM qt_depth_monster_v;
 -- source: test/test14.sql
 -- db: Oracle
 -- metadata: test Oracle inferred catalog (file-scoped overlay) + Oracle built-ins
--- checked: 706
+-- checked: 648
 -- missing: 0
 -- marker: [[word]] means not suggested for the tested prefix
 -- missing tokens: none

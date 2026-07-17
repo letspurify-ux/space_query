@@ -873,7 +873,7 @@ ORDER BY
 -- source: test/oracle_format_final_boss.sql
 -- db: Oracle
 -- metadata: test Oracle inferred catalog (file-scoped overlay) + Oracle built-ins
--- checked: 1487
+-- checked: 1464
 -- missing: 0
 -- marker: [[word]] means not suggested for the tested prefix
 -- missing tokens: none

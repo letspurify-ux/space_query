@@ -25,6 +25,33 @@ fn assert_token_has_style(text: &str, styles: &str, token: &str, expected_style:
     );
 }
 
+fn assert_word_has_style(text: &str, styles: &str, word: &str, expected_style: char) {
+    let is_word_byte =
+        |byte: u8| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'$' | b'#');
+    let start = text
+        .match_indices(word)
+        .map(|(start, _)| start)
+        .find(|&start| {
+            let end = start + word.len();
+            !start
+                .checked_sub(1)
+                .and_then(|index| text.as_bytes().get(index))
+                .is_some_and(|byte| is_word_byte(*byte))
+                && !text
+                    .as_bytes()
+                    .get(end)
+                    .is_some_and(|byte| is_word_byte(*byte))
+        })
+        .unwrap_or_else(|| panic!("word `{word}` should exist in test SQL"));
+    let end = start + word.len();
+    assert!(
+        styles[start..end]
+            .chars()
+            .all(|style| style == expected_style),
+        "{word} should use style {expected_style}"
+    );
+}
+
 #[test]
 #[ignore = "audits every SQL fixture word through the production full-highlight path"]
 fn syntax_highlighting_sweep_all_files_generate_out_report() {
@@ -90,6 +117,7 @@ fn syntax_highlighting_sweep_all_files_generate_out_report() {
             let mut file_contextual_words = 0usize;
             let mut file_object_words = 0usize;
             let mut file_unexpected_highlights = 0usize;
+            let mut file_ordinary_default_words = BTreeMap::<String, (usize, String)>::new();
 
             for span in crate::sql_parser_engine::lexical_spans(
                 &source,
@@ -139,6 +167,10 @@ fn syntax_highlighting_sweep_all_files_generate_out_report() {
                         let (line, column) = highlight_sweep_line_column(&source, audit.start);
                         let location = format!("{}:{line}:{column}", relative.display());
                         ordinary_default_words
+                            .entry(upper.clone())
+                            .and_modify(|(count, _)| *count = count.saturating_add(1))
+                            .or_insert((1, location.clone()));
+                        file_ordinary_default_words
                             .entry(upper.clone())
                             .and_modify(|(count, _)| *count = count.saturating_add(1))
                             .or_insert((1, location.clone()));
@@ -253,6 +285,10 @@ fn syntax_highlighting_sweep_all_files_generate_out_report() {
             for issue in file_issues {
                 report.push_str(&issue);
                 report.push('\n');
+            }
+            report.push_str("ordinary_default_words:\n");
+            for (word, (count, location)) in file_ordinary_default_words {
+                report.push_str(&format!("{word}={count} first={location}\n"));
             }
             fs::write(&out_path, report)
                 .unwrap_or_else(|err| panic!("failed to write `{}`: {err}", out_path.display()));
@@ -538,6 +574,95 @@ CYCLE id RESTRICT;
     }
     for function in ["UUID_V7", "COLUMN_CHECK", "COLUMN_JSON"] {
         assert_token_has_style(text, &styles, function, STYLE_FUNCTION);
+    }
+}
+
+#[test]
+fn production_full_highlight_covers_manual_final_oracle_grammar() {
+    let text = r#"
+CREATE DOMAIN category_domain AS VARCHAR2(32) DISPLAY UPPER(VALUE);
+CREATE TABLE child (embedding VECTOR(3, FLOAT32));
+FORALL i IN INDICES OF values_to_update SAVE EXCEPTIONS
+  UPDATE t SET value = value WHERE id = i;
+CREATE PROPERTY GRAPH app_graph
+  VERTEX TABLES (nodes KEY (id) LABEL node PROPERTIES (id))
+  EDGE TABLES (edges KEY (id) SOURCE KEY (source_id) REFERENCES nodes (id)
+    DESTINATION KEY (target_id) REFERENCES nodes (id) LABEL owns PROPERTIES (id));
+CREATE MATERIALIZED VIEW app_mv BUILD IMMEDIATE REFRESH COMPLETE ON DEMAND AS SELECT 1 value FROM dual;
+LOCK TABLE t IN ROW SHARE MODE NOWAIT;
+EXPLAIN PLAN FOR SELECT 1 FROM dual;
+ANALYZE TABLE t COMPUTE STATISTICS FOR ALL INDEXED COLUMNS;
+SELECT JSON_SERIALIZE(payload RETURNING VARCHAR2 PRETTY),
+       VECTOR_DISTANCE(embedding, TO_VECTOR('[1,1,1]'), COSINE)
+FROM child MATCH_RECOGNIZE (AFTER MATCH SKIP PAST LAST ROW PATTERN (x));
+"#;
+    let mut highlighter = SqlHighlighter::new();
+    highlighter.set_db_type(DatabaseType::Oracle);
+    let (styles, _) =
+        crate::ui::sql_editor::build_logical_styles_and_line_states(&highlighter, text);
+
+    for keyword in [
+        "BUILD",
+        "COSINE",
+        "DEMAND",
+        "DESTINATION",
+        "DISPLAY",
+        "DOMAIN",
+        "EDGE",
+        "FLOAT32",
+        "GRAPH",
+        "INDEXED",
+        "INDICES",
+        "LABEL",
+        "MODE",
+        "PAST",
+        "PLAN",
+        "PRETTY",
+        "PROPERTIES",
+        "PROPERTY",
+        "SAVE",
+        "STATISTICS",
+        "TABLES",
+        "VECTOR",
+        "VERTEX",
+    ] {
+        assert_word_has_style(text, &styles, keyword, STYLE_KEYWORD);
+    }
+    for function in ["TO_VECTOR", "VECTOR_DISTANCE"] {
+        assert_word_has_style(text, &styles, function, STYLE_FUNCTION);
+    }
+}
+
+#[test]
+fn production_full_highlight_covers_manual_final_mysql_family_grammar() {
+    let text = r#"
+CREATE OR REPLACE VIEW app_v AS SELECT id FROM t WITH CASCADED CHECK OPTION;
+GET CURRENT DIAGNOSTICS @condition_count = NUMBER;
+COMMIT AND NO CHAIN;
+CREATE EVENT syntax_event ON SCHEDULE AT CURRENT_TIMESTAMP
+  ON COMPLETION PRESERVE DISABLE DO SELECT 1;
+CREATE ROLE app_reader;
+ALTER USER app_user PASSWORD EXPIRE INTERVAL 30 DAY;
+DELETE HISTORY FROM contract_history BEFORE SYSTEM_TIME TIMESTAMP '2000-01-01 00:00:00';
+SET STATEMENT max_statement_time = 5 FOR SELECT 1;
+"#;
+    let mut highlighter = SqlHighlighter::new();
+    highlighter.set_db_type(DatabaseType::MariaDB);
+    let (styles, _) =
+        crate::ui::sql_editor::build_logical_styles_and_line_states(&highlighter, text);
+
+    for keyword in [
+        "AT",
+        "CASCADED",
+        "CHAIN",
+        "COMPLETION",
+        "EXPIRE",
+        "HISTORY",
+        "NUMBER",
+        "ROLE",
+        "STATEMENT",
+    ] {
+        assert_word_has_style(text, &styles, keyword, STYLE_KEYWORD);
     }
 }
 

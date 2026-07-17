@@ -240,12 +240,59 @@ impl SqlEditorWidget {
                 expanded = enclosing;
             }
         }
+        if expanded.statement_end < bounded.cursor_pos {
+            if let Some(recovered) = Self::recover_statement_window_from_selected_root(
+                bounded,
+                &expanded,
+                preferred_db_type,
+            ) {
+                expanded = recovered;
+            }
+        }
         Self::trim_expanded_statement_leading_block_comment_fragment_in_bounded_text(
             &bounded.text,
             bounded.start,
             bounded.cursor_pos,
             expanded,
         )
+    }
+
+    /// A bounded window can begin in the middle of a very long preceding
+    /// statement. If that clipped prefix leaves the splitter in a false lexical
+    /// state, it may select the correct current statement root but stop at a
+    /// later line that resembles a tool command. Reparse only from that already
+    /// selected root; this discards the poisoned prefix without widening the
+    /// bounded window or making work depend on document length.
+    fn recover_statement_window_from_selected_root(
+        bounded: &BoundedIntellisenseParseText,
+        expanded: &ExpandedStatementWindow,
+        preferred_db_type: Option<crate::db::connection::DatabaseType>,
+    ) -> Option<ExpandedStatementWindow> {
+        let root = expanded.statement_start.checked_sub(bounded.start)?;
+        let cursor = bounded.cursor_pos.checked_sub(bounded.start)?;
+        if root >= cursor || cursor > bounded.text.len() {
+            return None;
+        }
+        let suffix = bounded.text.get(root..)?;
+        let (relative_start, relative_end) =
+            super::query_text::statement_bounds_in_text_for_db_type_with_mysql_delimiter(
+                suffix,
+                cursor.saturating_sub(root),
+                preferred_db_type,
+                None,
+            );
+        let statement_start = root.saturating_add(relative_start);
+        let statement_end = root.saturating_add(relative_end);
+        if statement_start > cursor || statement_end < cursor || statement_end <= root {
+            return None;
+        }
+        Some(Self::statement_window_from_bounded_text_bounds(
+            &bounded.text,
+            bounded.start,
+            bounded.cursor_pos,
+            statement_start,
+            statement_end,
+        ))
     }
 
     fn bounded_statement_needs_full_document_index(

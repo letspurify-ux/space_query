@@ -191,7 +191,7 @@ ORDER BY f.customer_id;
 -- source: test_mysql/test7.txt
 -- db: MySQL
 -- metadata: test_mysql/test7.txt inferred catalog
--- checked: 530
+-- checked: 518
 -- missing: 0
 -- marker: [[word]] means not suggested for the tested prefix
 -- missing tokens: none

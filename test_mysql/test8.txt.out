@@ -200,7 +200,7 @@ ORDER BY f.team_id;
 -- source: test_mysql/test8.txt
 -- db: MySQL
 -- metadata: test_mysql/test8.txt inferred catalog
--- checked: 512
+-- checked: 498
 -- missing: 0
 -- marker: [[word]] means not suggested for the tested prefix
 -- missing tokens: none

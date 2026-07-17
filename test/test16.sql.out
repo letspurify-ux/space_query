@@ -902,7 +902,7 @@ PROMPT === QT SPLITTER FINAL ULTIMATE BOSS END ===
 -- source: test/test16.sql
 -- db: Oracle
 -- metadata: test Oracle inferred catalog (file-scoped overlay) + Oracle built-ins
--- checked: 1106
+-- checked: 1098
 -- missing: 0
 -- marker: [[word]] means not suggested for the tested prefix
 -- missing tokens: none

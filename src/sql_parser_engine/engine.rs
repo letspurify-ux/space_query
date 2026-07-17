@@ -28,12 +28,7 @@ impl LexicalSpan {
 }
 
 #[inline]
-fn push_lexical_span(
-    spans: &mut Vec<LexicalSpan>,
-    start: usize,
-    end: usize,
-    kind: LexicalKind,
-) {
+fn push_lexical_span(spans: &mut Vec<LexicalSpan>, start: usize, end: usize, kind: LexicalKind) {
     if start >= end {
         return;
     }
@@ -80,10 +75,7 @@ pub(crate) fn lexical_spans_with_initial_mode(
     (spans, engine.state.lex_mode.clone())
 }
 
-pub(crate) fn lexical_kind_at(
-    spans: &[LexicalSpan],
-    byte_offset: usize,
-) -> Option<LexicalKind> {
+pub(crate) fn lexical_kind_at(spans: &[LexicalSpan], byte_offset: usize) -> Option<LexicalKind> {
     let idx = spans.partition_point(|span| span.end <= byte_offset);
     spans
         .get(idx)
@@ -170,7 +162,6 @@ fn detect_q_quote_start(chars: &[char], start: usize) -> Option<(usize, char)> {
     Some((prefix_len, sql_text::q_quote_closing(delimiter)))
 }
 
-
 fn next_meaningful_word(line: &str, mut idx: usize) -> Option<(&str, usize)> {
     while idx < line.len() {
         if let Some(prefix_len) = sql_text::sql_line_comment_prefix_len(line.as_bytes(), idx) {
@@ -211,7 +202,6 @@ fn next_meaningful_word(line: &str, mut idx: usize) -> Option<(&str, usize)> {
 
     None
 }
-
 
 #[inline]
 fn is_external_language_target(token_upper: &str) -> bool {
@@ -503,15 +493,17 @@ impl SqlParserEngine {
 
         let _ = self.with_preview_identifier_upper(chars, i, |candidate_upper, this| {
             if this.state.block_depth() == 1 && this.state.paren_depth == 0 {
-                let should_split_before_new_statement = this.state.should_split_before_new_statement_head()
-                    && sql_text::is_statement_head_keyword(candidate_upper)
-                    && !sql_text::is_external_language_clause_keyword(candidate_upper)
-                    && !is_external_language_target(candidate_upper)
-                    && candidate_upper != "BEGIN";
-                let should_split_pending_top_level = this.state.pending_implicit_external_top_level_split
-                    && candidate_upper != "BEGIN"
-                    && (sql_text::is_with_main_query_keyword(candidate_upper)
-                        || sql_text::is_statement_head_keyword(candidate_upper));
+                let should_split_before_new_statement =
+                    this.state.should_split_before_new_statement_head()
+                        && sql_text::is_statement_head_keyword(candidate_upper)
+                        && !sql_text::is_external_language_clause_keyword(candidate_upper)
+                        && !is_external_language_target(candidate_upper)
+                        && candidate_upper != "BEGIN";
+                let should_split_pending_top_level =
+                    this.state.pending_implicit_external_top_level_split
+                        && candidate_upper != "BEGIN"
+                        && (sql_text::is_with_main_query_keyword(candidate_upper)
+                            || sql_text::is_statement_head_keyword(candidate_upper));
                 let should_split = this
                     .state
                     .should_split_begin_after_implicit_external_semicolon(candidate_upper)
@@ -573,13 +565,31 @@ impl SqlParserEngine {
         self.starts_with_alter_keyword("SESSION") || self.starts_with_alter_keyword("SYSTEM")
     }
 
+    /// Returns `true` when the current buffer is a CREATE/ALTER USER
+    /// statement. MySQL and MariaDB allow `PASSWORD ...` on a continuation
+    /// line, where it must not be interpreted as the SQL*Plus PASSWORD command.
+    pub(crate) fn starts_with_user_account_ddl_context(&self) -> bool {
+        self.starts_with_keyword_pair("CREATE", "USER")
+            || self.starts_with_keyword_pair("ALTER", "USER")
+    }
+
+    /// Oracle ANALYZE accepts a line-leading COMPUTE clause, which shares its
+    /// keyword with the SQL*Plus report command.
+    pub(crate) fn starts_with_analyze_context(&self) -> bool {
+        self.starts_with_keyword("ANALYZE")
+    }
+
     fn starts_with_alter_keyword(&self, keyword: &str) -> bool {
+        self.starts_with_keyword_pair("ALTER", keyword)
+    }
+
+    fn starts_with_keyword_pair(&self, first_keyword: &str, second_keyword: &str) -> bool {
         let current = self.current.as_str();
         let Some((first, first_end)) = next_meaningful_word(current, 0) else {
             return false;
         };
 
-        if !first.eq_ignore_ascii_case("ALTER") {
+        if !first.eq_ignore_ascii_case(first_keyword) {
             return false;
         }
 
@@ -587,7 +597,12 @@ impl SqlParserEngine {
             return false;
         };
 
-        second.eq_ignore_ascii_case(keyword)
+        second.eq_ignore_ascii_case(second_keyword)
+    }
+
+    fn starts_with_keyword(&self, keyword: &str) -> bool {
+        next_meaningful_word(self.current.as_str(), 0)
+            .is_some_and(|(first, _)| first.eq_ignore_ascii_case(keyword))
     }
 
     #[allow(dead_code)]
@@ -599,14 +614,23 @@ impl SqlParserEngine {
         self.process_line_with_observers_after_boundary(line, |_, _, _, _| {}, |_, _| {});
     }
 
+    fn line_is_mysql_server_statement(&self, line: &str) -> bool {
+        self.state.mysql_mode
+            && sql_text::first_meaningful_word(line).is_some_and(|word| {
+                matches!(
+                    word.to_ascii_uppercase().as_str(),
+                    "EXECUTE" | "SHOW" | "START"
+                )
+            })
+    }
+
     fn process_chars_with_observer<F, G, H>(
         &mut self,
         chars: &[char],
         on_symbol: &mut F,
         on_statement_boundary: &mut G,
         on_lexical_span: &mut H,
-    )
-    where
+    ) where
         F: FnMut(&[char], usize, char, Option<char>),
         G: FnMut(&[char], usize),
         H: FnMut(&[char], usize, usize, LexicalKind),
@@ -662,12 +686,7 @@ impl SqlParserEngine {
                         if let Some((prefix_len, nested_end_char)) = detect_q_quote_start(chars, i)
                         {
                             if nested_end_char == end_char {
-                                on_lexical_span(
-                                    chars,
-                                    i,
-                                    i + prefix_len,
-                                    LexicalKind::String,
-                                );
+                                on_lexical_span(chars, i, i + prefix_len, LexicalKind::String);
                                 for k in 0..prefix_len {
                                     self.append_current_char(chars[i + k]);
                                 }
@@ -721,9 +740,7 @@ impl SqlParserEngine {
                     continue;
                 }
                 LexMode::SingleQuote => {
-                    let lexical_end = if (self.state.mysql_mode
-                        && c == '\\'
-                        && next.is_some())
+                    let lexical_end = if (self.state.mysql_mode && c == '\\' && next.is_some())
                         || (c == '\'' && next == Some('\''))
                     {
                         i + 2
@@ -751,9 +768,7 @@ impl SqlParserEngine {
                     continue;
                 }
                 LexMode::DoubleQuote => {
-                    let lexical_end = if (self.state.mysql_mode
-                        && c == '\\'
-                        && next.is_some())
+                    let lexical_end = if (self.state.mysql_mode && c == '\\' && next.is_some())
                         || (c == '"' && next == Some('"'))
                     {
                         i + 2
@@ -778,7 +793,8 @@ impl SqlParserEngine {
                         }
                         self.state.lex_mode = LexMode::Idle;
                         if let Some(identifier_upper) = self.state.finish_quoted_identifier() {
-                            self.state.observe_external_clause_quoted_identifier_target();
+                            self.state
+                                .observe_external_clause_quoted_identifier_target();
                             self.state
                                 .resolve_pending_end_on_separator_with_token(&identifier_upper);
                         } else if self.state.pending_end == PendingEnd::End {
@@ -883,12 +899,7 @@ impl SqlParserEngine {
                         self.state
                             .observe_external_clause_literal_target(allow_implicit_target);
                         self.state.start_q_quote(delimiter);
-                        on_lexical_span(
-                            chars,
-                            i,
-                            i + q_prefix_len,
-                            LexicalKind::String,
-                        );
+                        on_lexical_span(chars, i, i + q_prefix_len, LexicalKind::String);
                         for k in 0..q_prefix_len {
                             self.append_current_char(chars[i + k]);
                         }
@@ -1144,6 +1155,11 @@ impl SqlParserEngine {
         F: FnMut(&[char], usize, char, Option<char>),
         G: FnMut(&[char], usize),
     {
+        let line_started_with_empty_current = self.current_is_empty();
+        let line_started_in_with_waiting_main_query = self.state.in_with_plsql_declaration()
+            && self.state.with_clause_waiting_main_query()
+            && self.state.block_depth() == 0
+            && self.state.paren_depth() == 0;
         let mut on_symbol = on_symbol;
         let mut on_statement_boundary = on_statement_boundary;
         let mut on_lexical_span = |_: &[char], _: usize, _: usize, _: LexicalKind| {};
@@ -1159,6 +1175,15 @@ impl SqlParserEngine {
             &mut on_lexical_span,
         );
         self.state.clear_skip_next_end_label_token();
+        if (line_started_with_empty_current || line_started_in_with_waiting_main_query)
+            && self.state.is_idle()
+            && self.state.block_depth() == 0
+            && self.state.paren_depth() == 0
+            && sql_text::is_auto_terminated_tool_command(line)
+            && !self.line_is_mysql_server_statement(line)
+        {
+            self.finish_current_statement();
+        }
         self.scratch_chars = scratch_chars;
     }
 
@@ -1197,7 +1222,10 @@ impl SqlParserEngine {
             && self.state.paren_depth() == 0
             && !self.state.in_with_plsql_declaration()
             && self.current_is_empty();
-        if line_starts_at_statement_boundary && sql_text::is_auto_terminated_tool_command(line) {
+        if line_starts_at_statement_boundary
+            && sql_text::is_auto_terminated_tool_command(line)
+            && !self.line_is_mysql_server_statement(line)
+        {
             self.append_current_str(line);
             self.append_current_char('\n');
             self.finish_current_statement();
@@ -1237,6 +1265,7 @@ impl SqlParserEngine {
             && self.state.block_depth() == 0
             && self.state.paren_depth() == 0
             && sql_text::is_auto_terminated_tool_command(line)
+            && !self.line_is_mysql_server_statement(line)
         {
             self.finish_current_statement();
         }

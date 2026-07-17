@@ -26018,6 +26018,26 @@ mod query_execution_cleanup_tests {
     }
 
     #[test]
+    fn mysql_batch_transaction_mode_change_is_allowed_after_session_settings() {
+        let mut batch_effects = crate::db::MySqlBatchSessionEffects::default();
+        for sql in [
+            "SET NAMES utf8mb4",
+            "SET CHARACTER SET utf8mb4",
+            "SET SESSION sql_mode = 'TRADITIONAL'",
+        ] {
+            SqlEditorWidget::mysql_batch_session_effects_for_sql(sql, true, &mut batch_effects);
+        }
+
+        SqlEditorWidget::ensure_mysql_batch_transaction_mode_change_allowed(
+            &batch_effects,
+            SqlEditorWidget::mysql_statement_session_effects_for_sql(
+                "SET SESSION TRANSACTION ISOLATION LEVEL READ COMMITTED",
+            ),
+        )
+        .expect("session settings on the same physical session must not block SET TRANSACTION");
+    }
+
+    #[test]
     fn mysql_batch_transaction_mode_change_is_blocked_after_current_batch_dirty_work() {
         let mut batch_effects = crate::db::MySqlBatchSessionEffects::default();
         SqlEditorWidget::mysql_batch_session_effects_for_sql(
@@ -29793,6 +29813,43 @@ mod mysql_batch_execution_regression_tests {
         );
     }
 
+    fn assert_mysql_manual_final_status_pass(progress: &[QueryProgress]) {
+        let progress_summary = summarize_progress(progress);
+        let final_status_index = progress.iter().find_map(|message| match message {
+            QueryProgress::StatementFinished { index, result, .. }
+                if result
+                    .sql
+                    .to_ascii_lowercase()
+                    .contains("'pass' as final_status") =>
+            {
+                Some(*index)
+            }
+            _ => None,
+        });
+
+        assert!(
+            final_status_index.is_some(),
+            "manual final script should emit final_status\n{progress_summary}"
+        );
+        assert!(
+            progress
+                .iter()
+                .any(|message| match (final_status_index, message) {
+                    (
+                        Some(index),
+                        QueryProgress::Rows {
+                            index: row_index,
+                            rows,
+                        },
+                    ) if *row_index == index => {
+                        rows.iter().any(|row| row.iter().any(|cell| cell == "PASS"))
+                    }
+                    _ => false,
+                }),
+            "manual final script should reach a PASS row\n{progress_summary}"
+        );
+    }
+
     fn assert_mysql_final_status_pass(progress: &[QueryProgress]) {
         let progress_summary = summarize_progress(progress);
         let final_status_index = progress.iter().find_map(|message| match message {
@@ -30582,6 +30639,44 @@ DROP TEMPORARY TABLE IF EXISTS qt_result_route_monitor;
             include_str!("../../../test_mysql/test3.txt"),
             "mysql test3 regression",
         );
+    }
+
+    #[test]
+    #[ignore = "requires local MySQL 8 test database via SPACE_QUERY_TEST_MYSQL_* env vars"]
+    fn execute_mysql_batch_manual_final_reaches_pass_status() {
+        if !mysql_test_server_is_mysql8_or_newer().unwrap_or(false) {
+            eprintln!("skipping: test_mysql/final.sql requires MySQL 8 or newer");
+            return;
+        }
+        let Some(harness) = MysqlSessionRuleHarness::new_for_db_type(true, DatabaseType::MySQL)
+        else {
+            return;
+        };
+        let progress = harness.execute(
+            include_str!("../../../test_mysql/final.sql"),
+            "mysql manual final certification",
+        );
+        assert_no_failed_mysql_statement(&progress);
+        assert_mysql_manual_final_status_pass(&progress);
+    }
+
+    #[test]
+    #[ignore = "requires local MariaDB test database via SPACE_QUERY_TEST_MYSQL_* env vars"]
+    fn execute_mariadb_batch_manual_final_reaches_pass_status() {
+        if !mysql_test_server_is_mariadb().unwrap_or(false) {
+            eprintln!("skipping: test_mariadb/final.sql requires MariaDB");
+            return;
+        }
+        let Some(harness) = MysqlSessionRuleHarness::new_for_db_type(true, DatabaseType::MariaDB)
+        else {
+            return;
+        };
+        let progress = harness.execute(
+            include_str!("../../../test_mariadb/final.sql"),
+            "mariadb manual final certification",
+        );
+        assert_no_failed_mysql_statement(&progress);
+        assert_mysql_manual_final_status_pass(&progress);
     }
 
     #[test]
@@ -32002,9 +32097,28 @@ mod mysql_transaction_feedback_tests {
         oracle_thin_run_script_with_config(sql_text, oracle_thin_live_config())
     }
 
+    fn oracle_thin_run_script_with_auto_commit(
+        sql_text: &str,
+        initial_auto_commit: bool,
+    ) -> Vec<QueryProgress> {
+        oracle_thin_run_script_with_config_and_auto_commit(
+            sql_text,
+            oracle_thin_live_config(),
+            initial_auto_commit,
+        )
+    }
+
     fn oracle_thin_run_script_with_config(
         sql_text: &str,
         config: tns_thin::OracleThinConfig,
+    ) -> Vec<QueryProgress> {
+        oracle_thin_run_script_with_config_and_auto_commit(sql_text, config, true)
+    }
+
+    fn oracle_thin_run_script_with_config_and_auto_commit(
+        sql_text: &str,
+        config: tns_thin::OracleThinConfig,
+        initial_auto_commit: bool,
     ) -> Vec<QueryProgress> {
         let _oracle_schema_guard = oracle_thin_shared_schema_test_guard();
         let mut conn = tns_thin::OracleThinSession::connect(config).expect("thin login");
@@ -32050,7 +32164,7 @@ mod mysql_transaction_feedback_tests {
             &session,
             &cancel_flag,
             true,
-            true,
+            initial_auto_commit,
             RetainedSessionState::default(),
             TransactionMode::default(),
             "oracle thin script live test",
@@ -33281,6 +33395,30 @@ mod mysql_transaction_feedback_tests {
         assert!(
             oracle_thin_select_result_count(&progress) > 0,
             "test_all should emit select/grid results"
+        );
+    }
+
+    #[test]
+    #[ignore = "requires local Oracle listener and executes test/final.sql"]
+    fn oracle_thin_query_tool_runs_manual_final_script_without_errors() {
+        let sql_text = std::fs::read_to_string("test/final.sql").expect("read test/final.sql");
+        let progress = oracle_thin_run_script_with_auto_commit(&sql_text, false);
+        let failures = oracle_thin_progress_failures(&progress);
+
+        assert!(
+            failures.is_empty(),
+            "Oracle Thin manual final failures:\n{}\n\nWindow:\n{}",
+            failures.join("\n"),
+            oracle_thin_first_failure_window(&progress)
+        );
+        assert!(
+            progress.iter().any(|event| match event {
+                QueryProgress::Rows { rows, .. } =>
+                    rows.iter().any(|row| row.iter().any(|cell| cell == "PASS")),
+                _ => false,
+            }),
+            "Oracle Thin manual final should emit a PASS row; events={}",
+            progress.len()
         );
     }
 
