@@ -724,10 +724,64 @@ fn token_is_comment_or_string(token: &SqlToken) -> bool {
     matches!(token, SqlToken::Comment(_) | SqlToken::String(_))
 }
 
+/// Words that keep their keyword role even when they sit next to the `||`
+/// concatenation operator (`x || CASE ...`, `y IS NULL`), or that prefix a
+/// literal (`|| DATE '2026-01-01'`). Everything else adjacent to `||` is an
+/// expression operand and therefore an identifier.
+fn word_stays_keyword_next_to_concat(word_upper: &str) -> bool {
+    matches!(
+        word_upper,
+        "AND"
+            | "BETWEEN"
+            | "CASE"
+            | "DATE"
+            | "DIV"
+            | "ELSE"
+            | "END"
+            | "EXISTS"
+            | "FALSE"
+            | "IN"
+            | "INTERVAL"
+            | "IS"
+            | "LIKE"
+            | "LIKE2"
+            | "LIKE4"
+            | "LIKEC"
+            | "MOD"
+            | "NOT"
+            | "NULL"
+            | "OR"
+            | "REGEXP"
+            | "RLIKE"
+            | "THEN"
+            | "TIMESTAMP"
+            | "TRUE"
+            | "WHEN"
+    )
+}
+
+/// Declaration forms whose first word after `DECLARE` is a keyword rather than
+/// the declared name (`DECLARE CONTINUE HANDLER`, `DECLARE CURSOR c ...`).
+fn word_starts_keyword_declaration(word_upper: &str) -> bool {
+    matches!(
+        word_upper,
+        "CONTINUE"
+            | "EXIT"
+            | "UNDO"
+            | "PRAGMA"
+            | "TYPE"
+            | "SUBTYPE"
+            | "CURSOR"
+            | "PROCEDURE"
+            | "FUNCTION"
+    )
+}
+
 /// Audits that a formatting pass never changes the letter case of a token that
 /// sits in an unambiguous identifier slot: a segment adjacent to a `.`
-/// qualifier, a `GOTO` label target, or a `PROCEDURE`/`FUNCTION` object name.
-/// Keyword-case normalization must not rewrite identifiers.
+/// qualifier, a `GOTO` label target, a `PROCEDURE`/`FUNCTION` object name, an
+/// operand of the `||` concatenation operator, or a declaration name right
+/// after `DECLARE`. Keyword-case normalization must not rewrite identifiers.
 fn format_sweep_audit_identifier_case(
     source: &str,
     formatted: &str,
@@ -795,6 +849,30 @@ fn format_sweep_audit_identifier_case(
                     || word.eq_ignore_ascii_case("PROCEDURE")
                     || word.eq_ignore_ascii_case("FUNCTION")
         );
+        let word_upper = formatted_word.to_ascii_uppercase();
+        let previous_is_concat = matches!(
+            previous.map(|prev_span| &prev_span.token),
+            Some(SqlToken::Symbol(sym)) if sym == "||"
+        );
+        let next_is_concat = matches!(
+            next.map(|next_span| &next_span.token),
+            Some(SqlToken::Symbol(sym)) if sym == "||"
+        );
+        let next_is_open_paren = matches!(
+            next.map(|next_span| &next_span.token),
+            Some(SqlToken::Symbol(sym)) if sym == "("
+        );
+        let is_concat_operand = (previous_is_concat || next_is_concat)
+            && !next_is_open_paren
+            && !word_stays_keyword_next_to_concat(&word_upper);
+        let is_declaration_name = matches!(
+            previous.map(|prev_span| &prev_span.token),
+            Some(SqlToken::Word(word)) if word.eq_ignore_ascii_case("DECLARE")
+        ) && !word_starts_keyword_declaration(&word_upper)
+            && matches!(
+                next.map(|next_span| &next_span.token),
+                Some(SqlToken::Word(_))
+            );
         if previous_is_dot || next_is_dot || previous_names_object {
             issues.push(FormatSweepIssue::new(
                 FormatSweepIssueKind::IdentifierCase,
@@ -802,6 +880,15 @@ fn format_sweep_audit_identifier_case(
                 span.start,
                 format!(
                     "identifier `{source_word}` was case-changed to `{formatted_word}` in an identifier slot (dot-qualified or named-object position)"
+                ),
+            ));
+        } else if is_concat_operand || is_declaration_name {
+            issues.push(FormatSweepIssue::new(
+                FormatSweepIssueKind::IdentifierCase,
+                formatted,
+                span.start,
+                format!(
+                    "identifier `{source_word}` was case-changed to `{formatted_word}` in an identifier slot (concatenation operand or declaration name)"
                 ),
             ));
         }
@@ -1239,6 +1326,60 @@ DELIMITER ;"#;
             "{db_type:?} multiline string payload must remain protected: {issues:#?}"
         );
     }
+}
+
+#[test]
+fn formatting_sweep_identifier_case_preserves_declared_names_and_concat_operands() {
+    let source = r#"DECLARE
+    inner NUMBER := p_n * 11;
+BEGIN
+    log_msg('RUN', 'inner=' || inner || ' | tail');
+    UPDATE qt_t
+       SET name = normalize_name(p_name),
+           status_cd = p_status
+     WHERE id = p_id;
+END;
+/"#;
+
+    let run = format_sweep_run(source, DatabaseType::Oracle);
+    assert!(
+        run.issues.is_empty(),
+        "identifier-case probe issues: {:#?}",
+        run.issues
+    );
+    assert!(
+        run.formatted.contains("inner NUMBER"),
+        "declared name `inner` must keep its source case:\n{}",
+        run.formatted
+    );
+    assert!(
+        run.formatted.contains("|| inner ||"),
+        "concatenation operand `inner` must keep its source case:\n{}",
+        run.formatted
+    );
+    assert!(
+        run.formatted.contains("SET name ="),
+        "SET target `name` must keep its source case:\n{}",
+        run.formatted
+    );
+}
+
+#[test]
+fn formatting_sweep_identifier_case_flags_keyword_cased_concat_operand_and_declaration() {
+    let source = "DECLARE\n    inner NUMBER := 1;\nBEGIN\n    x := 'inner=' || inner;\nEND;";
+    let formatted = "DECLARE\n    INNER NUMBER := 1;\nBEGIN\n    x := 'inner=' || INNER;\nEND;";
+    let (_, issues) = format_sweep_audit_identifier_case(source, formatted, DatabaseType::Oracle);
+    assert_eq!(
+        issues.len(),
+        2,
+        "declaration name and concatenation operand must both be flagged: {issues:#?}"
+    );
+    assert!(
+        issues
+            .iter()
+            .all(|issue| issue.kind == FormatSweepIssueKind::IdentifierCase),
+        "flagged issues must be identifier-case issues: {issues:#?}"
+    );
 }
 
 #[test]

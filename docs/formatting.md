@@ -8,10 +8,10 @@ Auto-formatting rebuilds a canonical layout from tokens and structural state; it
 does not merely adjust existing whitespace. Indentation is currently fixed at
 four spaces.
 
-The Preferences dialog exposes two comma-list layouts. `Stacked` is the default
-and starts the second and later children on new lines. `Wrapped` keeps eligible
-children on the current line until the configured right margin (default 120
-columns) would be exceeded. The margin is a comma-break target, not a hard text
+The Preferences dialog exposes two comma-list layouts. `Wrapped` is the default
+and keeps eligible children on the current line until the configured right
+margin (default 120 columns) would be exceeded. `Stacked` starts the second and
+later children on new lines. The margin is a comma-break target, not a hard text
 split; structural multiline syntax and dedicated `CREATE TABLE` layouts are not
 collapsed.
 

@@ -76,7 +76,7 @@ Never derive structural depth from:
 
 ## 4. Sibling frames keep the first child inline
 
-The default `Stacked` layout for list and condition frames is:
+The `Stacked` layout for list and condition frames is:
 
 - the first direct child remains on the owner line;
 - the second and later children start new lines at the frame depth;
@@ -112,7 +112,7 @@ The Preferences dialog exposes these settings under `SQL Formatting`:
 
 | Setting | Values | Default | Contract |
 | --- | --- | --- | --- |
-| `Comma Lists` | `Stacked`, `Wrapped` | `Stacked` | `Stacked` always breaks before the second and later eligible children. `Wrapped` keeps adding children while they fit the right margin. |
+| `Comma Lists` | `Stacked`, `Wrapped` | `Wrapped` | `Stacked` always breaks before the second and later eligible children. `Wrapped` keeps adding children while they fit the right margin. |
 | `Right Margin` | `60` through `300` columns | `120` | Used only by `Wrapped`. It is a comma-break target, not a hard text-splitting boundary. |
 
 The right-margin calculation includes the existing line prefix, indentation,

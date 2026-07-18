@@ -31,8 +31,8 @@ pub const MAX_SQL_FORMAT_RIGHT_MARGIN: u32 = 300;
 #[derive(Debug, Serialize, Deserialize, Clone, Copy, Default, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum SqlCommaListLayout {
-    #[default]
     Stacked,
+    #[default]
     Wrapped,
 }
 
@@ -90,7 +90,7 @@ impl AppConfig {
             auto_commit: false,
             connection_pool_size: DEFAULT_CONNECTION_POOL_SIZE,
             cancel_timeout_seconds: DEFAULT_CANCEL_TIMEOUT_SECONDS,
-            sql_comma_list_layout: SqlCommaListLayout::Stacked,
+            sql_comma_list_layout: SqlCommaListLayout::Wrapped,
             sql_format_right_margin: DEFAULT_SQL_FORMAT_RIGHT_MARGIN,
         }
     }
@@ -494,12 +494,12 @@ mod tests {
     }
 
     #[test]
-    fn app_config_defaults_sql_comma_lists_to_stacked_with_120_column_margin() {
+    fn app_config_defaults_sql_comma_lists_to_wrapped_with_120_column_margin() {
         let config = AppConfig::new();
 
         assert_eq!(
             config.sql_comma_list_layout,
-            super::SqlCommaListLayout::Stacked
+            super::SqlCommaListLayout::Wrapped
         );
         assert_eq!(
             config.sql_format_right_margin,
@@ -585,7 +585,7 @@ mod tests {
         );
         assert_eq!(
             restored.sql_comma_list_layout,
-            super::SqlCommaListLayout::Stacked
+            super::SqlCommaListLayout::Wrapped
         );
         assert_eq!(
             restored.sql_format_right_margin,

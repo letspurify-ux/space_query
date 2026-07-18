@@ -9442,7 +9442,7 @@ impl SqlEditorWidget {
         };
 
         match next_token {
-            SqlToken::Symbol(sym) => matches!(sym.as_str(), "," | ")" | ";"),
+            SqlToken::Symbol(sym) => matches!(sym.as_str(), "," | ")" | ";" | "=" | ":="),
             SqlToken::Word(word) => {
                 let upper = word.to_ascii_uppercase();
                 upper == "ON"
@@ -9486,7 +9486,7 @@ impl SqlEditorWidget {
     ) -> bool {
         match next_token {
             None => true,
-            Some(SqlToken::Symbol(sym)) => matches!(sym.as_str(), "," | ")" | ";"),
+            Some(SqlToken::Symbol(sym)) => matches!(sym.as_str(), "," | ")" | ";" | "=" | ":="),
             Some(SqlToken::Word(word)) => {
                 let upper = word.to_ascii_uppercase();
                 upper == "ON"
@@ -9518,6 +9518,41 @@ impl SqlEditorWidget {
             prev_token,
             Some(SqlToken::Word(prev_word)) if prev_word.eq_ignore_ascii_case("GOTO")
         ) {
+            return true;
+        }
+        // A bare word adjacent to the concatenation operator is an expression
+        // operand (`'inner=' || inner`, `';name=' || name`), never a keyword.
+        // Function calls (`|| substr(...)`) and expression keywords (`|| CASE`,
+        // `IS NULL ||`) keep their keyword rendering.
+        let prev_is_concat = matches!(prev_token, Some(SqlToken::Symbol(sym)) if sym == "||");
+        let next_is_concat = matches!(next_token, Some(SqlToken::Symbol(sym)) if sym == "||");
+        let next_is_paren = matches!(next_token, Some(SqlToken::Symbol(sym)) if sym == "(");
+        if (prev_is_concat || next_is_concat)
+            && !next_is_paren
+            && !Self::mysql_keyword_must_stay_keyword_in_expression(word_upper)
+            && !matches!(word_upper, "DATE" | "TIMESTAMP")
+        {
+            return true;
+        }
+        // DECLARE introduces a declaration name (`DECLARE inner NUMBER := ...`)
+        // unless the declaration itself starts with a keyword form
+        // (`DECLARE CURSOR ... `, `DECLARE CONTINUE HANDLER ...`).
+        if matches!(
+            prev_token,
+            Some(SqlToken::Word(prev_word)) if prev_word.eq_ignore_ascii_case("DECLARE")
+        ) && !matches!(
+            word_upper,
+            "CONTINUE"
+                | "EXIT"
+                | "UNDO"
+                | "PRAGMA"
+                | "TYPE"
+                | "SUBTYPE"
+                | "CURSOR"
+                | "PROCEDURE"
+                | "FUNCTION"
+        ) && matches!(next_token, Some(SqlToken::Word(_)))
+        {
             return true;
         }
 

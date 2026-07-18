@@ -4813,3 +4813,126 @@ Space Query script splitter로 포맷 전후 statement item/token 및 실행 경
 | `cargo test` | 통과 — 전 타깃 합계 6,785 passed · 0 failed · 238 ignored |
 | `cargo clippy --locked --all-targets -- -D warnings -W clippy::perf -W clippy::complexity` | 통과, 경고 0 |
 | `cargo fmt --all -- --check` / `git diff --check` | 통과 |
+
+# 34차: 전수 재검토 + 잔여 식별자 케이스 한계 해소 (2026-07-18)
+
+## 34-1. 포맷 sweep 전수 재검토
+
+`cargo test --lib formatting_sweep_all_files_generate_out_report -- --ignored
+--nocapture`는 1차부터 PASS(failures=0)였지만 신뢰하지 않고, 생성된
+`.format.out` 66개(Oracle 42 · MySQL 11 · MariaDB 13, 총 53,361줄)를 구조
+digest(반복 패턴 축약)로 처음부터 끝까지 다시 읽었다. `docs/auto_format_rule.md`
+의 frame 규칙 10개(owner/body/close 깊이, first-child-inline, d+2의 두 frame
+edge 설명 가능성, 닫는 구분자 owner 깊이, 주석/문자열 원문 보존, 정규·멱등
+출력)와 대조했고 레이아웃/깊이 결함은 0건이었다.
+
+레이아웃과 별개로, 소스↔결과 전체 토큰 정렬 스캔(주석 제외, q-quote/문자열
+lexer 인식)으로 케이스가 바뀐 단어를 전수 나열해 아래 34-2의 실제 결함 2종을
+찾았다. 토큰 수가 달라진 20개 파일은 모두 기존에 코드로 확인한 의도된
+tool-command 정규화(`VARIABLE`→`VAR`, tool command `;` 제거, EXEC/마지막 문
+`;` 부여, `@TRANSACTION`→`SET AUTOCOMMIT = 0;`)였다.
+
+## 34-2. [수정] 31-2의 known-limitation이 실제 결함으로 확인됨
+
+31-2에서 "대문자 유지가 안전한 방향"으로 남겨 둔 `INNER`·연산자 피연산자
+슬롯이 실제 소스에서 소문자 식별자를 침범하고 있었다.
+
+### `inner` 지역변수 (test/test6.txt · test/mega_torture.txt, 각 2회)
+
+AS-IS (formatted 출력):
+
+```sql
+DECLARE
+    INNER NUMBER := p_n * 11;
+BEGIN
+    log_msg ('RUN', 'inner0', v_depth + 1, 'inner=' || INNER || q'[ | inside: END; / ; ]');
+```
+
+TO-BE:
+
+```sql
+DECLARE
+    inner NUMBER := p_n * 11;
+BEGIN
+    log_msg ('RUN', 'inner0', v_depth + 1, 'inner=' || inner || q'[ | inside: END; / ; ]');
+```
+
+### `name` 멤버/컬럼 (test/test16.sql, 2회)
+
+AS-IS (formatted 출력):
+
+```sql
+RETURN 'id=' || id || ';name=' || NAME || ';note=' || note_text || '/tail';
+-- UPDATE ... SET
+NAME = normalize_name (p_name),
+```
+
+TO-BE:
+
+```sql
+RETURN 'id=' || id || ';name=' || name || ';note=' || note_text || '/tail';
+-- UPDATE ... SET
+name = normalize_name (p_name),
+```
+
+### 수정 내용 (`formatter_keyword_should_render_as_identifier_from_context`)
+
+`INNER`를 whitelist에 넣는 방식은 기각했다 — 기존 슬롯 규칙과 결합하면 실제
+`INNER JOIN`까지 식별자로 강등될 위험이 있다. 대신 whitelist 앞 단계의 보편
+규칙 2개를 추가했다(`.`/`GOTO` 규칙과 같은 층위, 모든 키워드에 적용):
+
+1. `||` 연접 피연산자: 앞 또는 뒤 토큰이 `||`인 단어는 표현식 피연산자로
+   식별자 처리. 단 함수 호출(`|| SUBSTR(...)`), 표현식 키워드(`|| CASE`,
+   `IS NULL ||` 등 25개), `DATE`/`TIMESTAMP` 리터럴 머리는 키워드 유지.
+2. 선언 이름: `DECLARE <word> <word>` 형태의 첫 단어는 선언 이름으로 식별자
+   처리. 키워드형 선언 머리(`CURSOR`/`TYPE`/`CONTINUE`/`PRAGMA` 등 9개)는
+   제외.
+
+추가로 `token_ends_identifier_slot`(+`_from_context`)의 슬롯 종결 기호에
+`=`/`:=`를 추가해, whitelist 단어의 `SET name = ...` 대입 대상 슬롯이
+인식되게 했다 (기존은 `,`/`)`/`;`만 종결로 인정해 `SET NAME =`로 남았다).
+
+## 34-3. sweep 일반 검출 확장 + 회귀 테스트
+
+`format_sweep_audit_identifier_case`가 새 슬롯 2종(연접 피연산자, 선언 이름)의
+케이스 변경도 `IdentifierCase` 이슈로 검출하도록 확장했다. 감사는 formatter
+내부 함수를 호출하지 않는 독립 구현(감사 독립성 유지)이다. 회귀 테스트 2개:
+
+- `formatting_sweep_identifier_case_preserves_declared_names_and_concat_operands`
+  — inner/name 패턴이 포맷 후 소문자로 보존되고 sweep 이슈 0건.
+- `formatting_sweep_identifier_case_flags_keyword_cased_concat_operand_and_declaration`
+  — 대문자화된 합성 출력을 감사에 넣으면 두 슬롯 모두 FAIL 검출.
+
+수정 후 재생성한 66개 결과의 전수 토큰 스캔에서 케이스 변경은 의도된 것만
+남았다: `dual`→`DUAL` 176회, 소문자 키워드 대문자화(`raise_application_error`
+4회, `level`/`constraint`/`select`/`from` 각 1회). sweep 집계는
+identifier_case_words=90,165 · frames=30,129 · boundaries=60,928 · failures=0.
+
+## 34-4. 포맷 이후 Space Query 실제 실행
+
+33-3의 포맷-후-실행 인증 3종을 로컬 컨테이너(MySQL 8.0/3307, MariaDB
+12.2/3306, Oracle Free/1521)에서 재실행해 모두 PASS(실패 statement/event 0):
+
+- `execute_mysql_batch_formatted_manual_final_reaches_pass_status`
+- `execute_mariadb_batch_formatted_manual_final_reaches_pass_status`
+- `oracle_thin_query_tool_runs_formatted_manual_final_script_without_errors`
+
+나머지 fixture는 sweep이 동일 script splitter로 포맷 전후 statement
+item/token·실행 경계를 전수 비교하며 차이 0건.
+
+## 34-5. 변경 파일
+
+- `src/ui/sql_editor/formatter.rs`: `||` 피연산자·DECLARE 선언 이름 보편 규칙,
+  식별자 슬롯 종결 기호에 `=`/`:=` 추가.
+- `src/ui/sql_editor/format_sweep_tests.rs`: IdentifierCase 감사에 두 슬롯
+  검출 추가, 회귀 테스트 2개.
+- `change.md`: 본 절.
+
+## 34-6. 최종 품질 게이트
+
+| 검증 | 결과 |
+| --- | --- |
+| `cargo test --lib formatting_sweep_all_files_generate_out_report -- --ignored --nocapture` | 통과 — 66개 fixture, failures 0 |
+| 포맷 후 Space Query live 실행 | Oracle/MySQL/MariaDB `final.sql` 3개 모두 PASS |
+| `cargo test` | (아래 기록) |
+| `cargo clippy --locked --all-targets -- -D warnings -W clippy::perf -W clippy::complexity` | (아래 기록) |
