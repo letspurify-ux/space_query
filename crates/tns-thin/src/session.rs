@@ -4456,6 +4456,12 @@ struct AuthSessionKeyParts<'a> {
     part_b: &'a [u8],
 }
 
+struct AuthCredentialInputs<'a> {
+    password: &'a [u8],
+    new_password: Option<&'a [u8]>,
+    debug_jdwp: Option<&'a str>,
+}
+
 fn write_pending_piggybacks(
     payload: &mut Vec<u8>,
     capabilities: &OracleThinCapabilities,
@@ -12209,9 +12215,11 @@ fn generate_auth_credentials_from_password_hash(
     let mut session_key_part_b = vec![0u8; session_key_part_a.len()];
     OsRng.fill_bytes(&mut session_key_part_b);
     generate_auth_credentials_from_session_key_parts(
-        password,
-        new_password,
-        debug_jdwp,
+        AuthCredentialInputs {
+            password,
+            new_password,
+            debug_jdwp,
+        },
         state,
         password_hash,
         key_len,
@@ -12224,9 +12232,7 @@ fn generate_auth_credentials_from_password_hash(
 }
 
 fn generate_auth_credentials_from_session_key_parts(
-    password: &[u8],
-    new_password: Option<&[u8]>,
-    debug_jdwp: Option<&str>,
+    inputs: AuthCredentialInputs<'_>,
     state: &mut AuthState,
     password_hash: &[u8],
     key_len: usize,
@@ -12237,6 +12243,11 @@ fn generate_auth_credentials_from_session_key_parts(
         part_a: session_key_part_a,
         part_b: session_key_part_b,
     } = session_key_parts;
+    let AuthCredentialInputs {
+        password,
+        new_password,
+        debug_jdwp,
+    } = inputs;
     let encoded_client_key = aes_encrypt_cbc_pkcs7(password_hash, session_key_part_b)?;
     let session_key = client_session_key_hex(&encoded_client_key, session_key_part_a.len())?;
     let combo_key = derive_auth_combo_key(state, session_key_part_a, session_key_part_b, key_len)?;
@@ -14396,6 +14407,7 @@ mod tests {
     };
     use std::time::{Duration, Instant};
 
+    use super::AuthCredentialInputs;
     use super::CANCEL_RESET_DRAIN_TIMEOUT;
     use super::{
         adjust_columns_after_define, bind_column_metadata, column_metadata_from_thin,
@@ -21422,9 +21434,11 @@ mod tests {
         };
 
         let credentials = generate_auth_credentials_from_session_key_parts(
-            b"password",
-            None,
-            None,
+            AuthCredentialInputs {
+                password: b"password",
+                new_password: None,
+                debug_jdwp: None,
+            },
             &mut state,
             &password_hash,
             24,
@@ -21453,9 +21467,11 @@ mod tests {
         };
 
         let credentials = generate_auth_credentials_from_session_key_parts(
-            b"tiger",
-            None,
-            None,
+            AuthCredentialInputs {
+                password: b"tiger",
+                new_password: None,
+                debug_jdwp: None,
+            },
             &mut state,
             &password_hash,
             16,

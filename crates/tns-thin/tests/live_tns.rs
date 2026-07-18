@@ -345,7 +345,7 @@ fn python_oracledb_1108_invalid_password_change_is_rejected() {
         connect_with_config(test_user_config(&base_config, &username, original_password));
 
     assert!(
-        conn.change_password("incorrect old password", &"1".repeat(1500))
+        conn.change_password("incorrect old password", "1".repeat(1500))
             .is_err(),
         "invalid old/new password combination must be rejected"
     );

@@ -395,7 +395,7 @@ pub fn parse_sql_bind_names(sql: &str) -> Result<Vec<String>, OracleThinError> {
         }
         if sql[index..].starts_with("--") {
             index = sql[index..]
-                .find(|ch| matches!(ch, '\n' | '\r'))
+                .find(['\n', '\r'])
                 .map_or(sql.len(), |offset| index + offset + 1);
             continue;
         }
