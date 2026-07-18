@@ -4424,3 +4424,201 @@ unknown 상태의 의미를 좁혔다. `SET`의 우변에 등장한 `@var`는 as
 | `cargo test` | library 6,623 통과 · 234 ignored · 통합/가드/doc-test 실패 0 |
 | `cargo clippy --locked --all-targets -- -D warnings -W clippy::perf -W clippy::complexity` | 통과, 경고 0 |
 | `cargo fmt --all -- --check` / `git diff --check` | 통과 |
+
+## 31-1. 포맷 sweep 전수 재검토 (2026-07-17)
+
+`formatting_sweep_all_files_generate_out_report` 1차 실행은 PASS(66개 파일,
+30,120 frame, failures=0)였다. 자동 결과를 신뢰하지 않고 66개 `.format.out`
+53,361줄을 다시 전수 검토했다.
+
+- Oracle 43개 파일: 처음부터 끝까지 정독.
+- MySQL 11개·MariaDB 13개: 대표 파일 정독 + 전 파일 소스↔출력 토큰 diff,
+  공백/괄호/들여쓰기 기계 스캔, 플래그된 문맥 전부 정독.
+- 프레임 깊이(rule 1~6), 보존 텍스트(rule 7), 고정구(rule 8), 정규 출력(rule 10)
+  기준으로 대조.
+
+휴리스틱이 플래그했으나 규칙에 부합해 정상 판정한 항목: 여러 줄 주석 내부
+후행 공백/비정렬(보존 텍스트), q-quote 동적 SQL 내부의 별도 정렬, 주석 뒤로
+밀린 선행 콤마(`-- comment` 다음 `, ghij = (`), CREATE TABLE 컬럼 정렬의 이중
+공백, `COUNT(*)` 압축 표기와 `이름 (` 공백 표기의 공존.
+
+## 31-2. [수정] 키워드 대문자화가 식별자 위치를 침범
+
+Oracle 경로의 키워드 케이스 정규화(`token_text` / 메인 루프)는
+`ORACLE_SQL_KEYWORDS`에 있는 단어를 문법 위치와 무관하게 대문자화했다.
+컨텍스트 판정(`formatter_keyword_should_render_as_identifier_from_context`)은
+8개 단어(MODEL/WINDOW/…)만 허용해, NAME·DEPTH·SEED·PATH·REMARK·GRAPH·
+SETTINGS·LABEL·SOURCE·ERRORS·EVENTS·CUME_DIST 같은 비예약 키워드가 식별자
+자리에서도 대문자로 바뀌었다.
+
+AS-IS (formatted 출력):
+
+```sql
+-- test/test5.txt: 소스는 모두 소문자 name/depth
+INSERT INTO oqt_t_depth (id, grp, NAME)
+'grp=0 id=' || r.id || ' name=' || r.NAME
+MIN (DEPTH) min_depth
+
+-- test/mega_torture.txt: <<top>> 라벨과 불일치
+PROCEDURE SEED (p_rows IN NUMBER) IS
+GOTO TOP;
+oqt_mega_pkg.SEED (30);
+
+-- boss/final: CTE·별칭·스키마 한정자
+WITH GRAPH (node_id, ...)         FROM GRAPH g
+WITH SEED AS (...)                FROM SEED s
+EVENTS (event_id, ...) AS (...)   FROM EVENTS e
+) SOURCE ON (target.category = SOURCE.category)
+FROM SYSTEM.help;
+'ERRORS' AS ERRORS                2 ERRORS
+) AS CUME_DIST,                   '/') AS PATH
+PATTERN (SEED rise*)  -- FIRST (SEED.day_value)와 함께 패턴 변수까지 대문자화
+WITH RECURSIVE SETTINGS AS (      -- MySQL
+COLUMNS (LABEL VARCHAR(40) PATH '$'   -- MariaDB JSON_TABLE 컬럼명
+```
+
+TO-BE:
+
+```sql
+INSERT INTO oqt_t_depth (id, grp, name)
+'grp=0 id=' || r.id || ' name=' || r.name
+MIN (depth) min_depth
+PROCEDURE seed (p_rows IN NUMBER) IS
+GOTO top;
+oqt_mega_pkg.seed (30);
+WITH graph (node_id, ...)         FROM graph g
+WITH seed AS (...)                FROM seed s
+events (event_id, ...) AS (...)   FROM events e
+) source ON (target.category = source.category)
+FROM system.help;
+'ERRORS' AS errors                2 errors
+) AS cume_dist,                   '/') AS path
+PATTERN (seed rise*)              FIRST (seed.day_value)
+WITH RECURSIVE settings AS (
+COLUMNS (label VARCHAR(40) PATH '$'
+```
+
+컨텍스트 판정을 문법 기반으로 일반화했다
+(`formatter_keyword_should_render_as_identifier_from_context`):
+
+1. `.` 앞뒤에 붙은 단어는 항상 한정 식별자 세그먼트 (모든 키워드에 적용).
+2. `GOTO` 다음 단어는 항상 라벨 식별자 (모든 키워드에 적용).
+3. 비예약 명사 키워드 12개를 컨텍스트 판정 대상에 추가하고 새 슬롯 규칙 도입:
+   `PROCEDURE`/`FUNCTION` 뒤의 객체명, `WITH`/`RECURSIVE` 뒤의 CTE명,
+   리스트 구분자 사이(`(id, name)`)와 선언 머리(`(label VARCHAR(40)`,
+   `PATTERN (seed rise*)`), 구분자 뒤 `AS` 별칭, 절 머리 바로 뒤 테이블명
+   (`FROM seed s`), 파생 테이블 뒤 별칭(`) source ON ...`).
+4. 소스가 대문자인 경우(`REMARK` 등)는 그대로 보존된다 — 케이스는 항상
+   소스를 따른다.
+
+의도적으로 제외(잔여 known-limitation): `INNER`(조인 수식어와 충돌 위험),
+연산자 피연산자 슬롯(`'x' || inner || 'y'`), 절 밖 SELECT-리스트가 아닌 일반
+표현식 내부의 명사 키워드. 모두 대문자 유지가 안전한 방향이다.
+
+## 31-3. sweep 일반 검출 추가: IdentifierCase 감사
+
+goal: 이런 부류를 사람이 아닌 sweep이 잡도록 일반 규칙으로 내재화.
+
+`format_sweep_audit_identifier_case`를 추가했다. 소스와 포맷 결과의 Word
+토큰을 1:1로 짝지어, 케이스가 바뀐 토큰이 다음의 "문법적으로 식별자일 수밖에
+없는 슬롯"에 있으면 `IdentifierCase` 이슈로 보고한다.
+
+- 앞 또는 뒤 유의미 토큰이 `.` (한정 식별자 세그먼트)
+- 직전 유의미 단어가 `GOTO`/`PROCEDURE`/`FUNCTION` (명명 대상 위치)
+
+리포트의 `checked:` 줄에 `identifier_case_words=` 카운터가 추가되었고,
+집계에 `checked_identifier_case_words=90,145`(66개 파일 + 30개 회귀)로
+반영된다. 수정 전 포맷터로 실행하면 `r.NAME`, `oqt_mega_pkg.SEED`,
+`SYSTEM.help`, `GOTO TOP`, `PROCEDURE SEED`가 모두 FAIL로 검출된다.
+
+고정 회귀 테스트 9개 추가:
+
+- formatter: `oracle_dot_qualified_identifiers_preserve_source_case`,
+  `oracle_goto_label_target_preserves_source_case`,
+  `oracle_cte_and_table_names_matching_keywords_preserve_case`,
+  `oracle_procedure_named_like_keyword_preserves_case`,
+  `oracle_merge_source_alias_preserves_case`,
+  `oracle_column_list_members_matching_keywords_preserve_case`
+- sweep: `formatting_sweep_detects_identifier_case_change_next_to_dot`,
+  `formatting_sweep_detects_identifier_case_change_after_goto_and_procedure`,
+  `formatting_sweep_accepts_keyword_case_normalization_outside_identifier_slots`
+
+## 31-4. 검토 결과 의도된 설계로 판정한 항목 (변경 없음)
+
+1. `CALL proc(arg,\n    arg\n);` — 닫는 괄호 단독 줄. CALL 인자 목록은
+   `paren_opens_call_argument_list` → `WrappedLayout` 프레임으로 명시 분류되어
+   있고(OVER/WINDOW/MODEL RULES/ON DUPLICATE 다중행 계열과 동일), 해당 배치를
+   고정하는 회귀 테스트가 이미 존재한다. 함수 호출식 `');'` 부착과 다른 것은
+   구조 프레임 계열의 일관된 규약.
+2. MySQL `DESCRIBE t` / `SHOW PROCESSLIST` 등 5종의 문말 `;` 제거와
+   SQL*Plus `VARIABLE`→`VAR` 정규화 — 실행기(QueryExecutor)의 tool-command
+   에뮬레이션과 공유되는 canonical 렌더링(`format_tool_command`)이다.
+   포맷터 단독으로 바꾸면 실행 모델과 어긋나므로 유지. 단, 같은 SHOW 계열
+   안에서 서버 전송형(`SHOW DATABASES;`)과 도구 명령형(`SHOW PROCESSLIST`)의
+   표기가 갈리는 점은 추후 tool-command 목록 차원의 정리 후보로 기록한다.
+
+## 31-5. [수정] 케이스 보존의 일관성 보강 (후속)
+
+31-2 적용 후 전체 테스트에서 드러난 두 가지 비일관성을 함께 정리했다.
+
+### 제어 키워드 별칭의 혼합 케이스
+
+AS-IS (31-2 직후):
+
+```sql
+-- 소스: delete from sales if where if.id = 1
+DELETE FROM sales IF      -- 별칭 선언부는 대문자
+WHERE if.id = 1;          -- dot 참조부는 소문자 (혼합)
+```
+
+TO-BE:
+
+```sql
+DELETE FROM sales if
+WHERE if.id = 1;          -- 같은 별칭은 어디서나 소스 케이스
+```
+
+`treat_control_keyword_as_identifier`는 지금까지 구조 처리만 억제하고 케이스는
+대문자화했다. 새 플래그 `control_keyword_alias_preserves_case`를 도입해, 별칭
+슬롯 판정을 받은 제어 키워드 중 직전 유의미 토큰이 별칭 자리를 증명하는 경우
+(비키워드 단어 = 테이블/컬럼명, 또는 파생 테이블의 `)`)에만 케이스도 소스를
+따르게 했다. `PROCEDURE p IS begin`(IS 뒤)이나 `WHEN NOT MATCHED then`
+(MATCHED 뒤)처럼 이웃이 키워드인 경우는 키워드 케이싱을 유지한다 — 첫 시도에서
+이 두 슬롯이 소문자로 남는 회귀가 전체 테스트 8건으로 드러나 조건을 좁혔다.
+(test12/test13 픽스처는 소스가 애초에 대문자 `IF`/`RANK`/`COUNT`라 출력 변화
+없음 — 소문자 `trim` 별칭이 보존되던 기존 동작과 이제 대칭이 된다.)
+
+### ORDER/GROUP BY 머리 뒤 식별자
+
+AS-IS: `SELECT remark, ... ORDER BY REMARK;` — 같은 컬럼이 SELECT 리스트에선
+소문자, ORDER BY에선 대문자.
+
+TO-BE: `ORDER BY remark;` — `BY`(ORDER/GROUP/PARTITION 절)를 절 머리로
+인정해 그 뒤 단어도 동일한 식별자 슬롯 판정을 받는다.
+
+### 기대값 갱신 (구 동작을 고정하던 테스트 13개)
+
+- `comma_list_layout_tests` 3개: `NAME` → `name` (SELECT 리스트 멤버 보존)
+- `format_sql_basic_indents_forall_{insert,update,delete}_body` +
+  `format_sql_basic_nested_forall_update_body_uses_forall_body_depth`:
+  `v_arr.COUNT` → `v_arr.count` (dot 뒤 컬렉션 메서드 케이스 보존)
+- `format_sql_basic_oracle_remark_identifier_does_not_become_script_command`:
+  `REMARK` → `remark` 3곳 (테스트 제목 그대로 "identifier" 판정)
+- IF-별칭 테스트 5개: `sales IF`/`IF.id` → `sales if`/`if.id`
+- `format_sql_basic_keeps_keyword_like_implicit_select_aliases_inline_lowercase`:
+  `amount IF,`/`total END` → `amount if,`/`total end`
+
+이 테스트들의 원래 목적(인라인 유지·블록 키워드 오인 방지·FORALL 본문 들여쓰기)
+은 그대로 검증되며, 케이스 기대값만 새 규칙에 맞춰 바뀌었다.
+
+## 31-6. 최종 품질 게이트
+
+| 검증 | 결과 |
+| --- | --- |
+| `formatting_sweep_all_files_generate_out_report` | 통과 — 66개 파일, 30,120 frames, 60,919 boundaries, 15,154 closes, failures 0 |
+| 신규 IdentifierCase 감사 | 90,145 단어쌍 검사, 위반 0 (수정 전 포맷터 기준이면 r.NAME 등 다수 FAIL) |
+| 전수 상세 검토 | 66개 파일 · 53,361줄 — Oracle 43개 전량 정독, MySQL/MariaDB 토큰 diff + 기계 스캔 + 표본 정독, 잔여 미해결 오류 0 |
+| 수정 항목 | 식별자 케이스 침범(31-2) + 일관성 보강(31-5), 산출물 상 대문자화 오류 약 150여 토큰 해소 |
+| 회귀 고정 | 신규 테스트 9개 + 기존 테스트 14개 기대값 갱신 |
+| `cargo test` | 통과 — 전 타깃 합계 6,781 passed · 0 failed · 238 ignored |
+| `cargo clippy --locked --all-targets -- -D warnings -W clippy::perf -W clippy::complexity` | 통과, 경고 0 |

@@ -9503,9 +9503,18 @@ impl SqlEditorWidget {
         next_token: Option<&SqlToken>,
         next_words: &[Option<&str>; 3],
     ) -> bool {
-        if word_upper == "DELETE"
-            && matches!(prev_token, Some(SqlToken::Symbol(symbol)) if symbol == ".")
-        {
+        let next_token_is_dot = matches!(next_token, Some(SqlToken::Symbol(sym)) if sym == ".");
+        let prev_token_is_dot = matches!(prev_token, Some(SqlToken::Symbol(sym)) if sym == ".");
+        // A word adjacent to `.` is always a qualified-identifier segment
+        // (`pkg.seed`, `r.name`, `system.help`), never a keyword.
+        if prev_token_is_dot || next_token_is_dot {
+            return true;
+        }
+        // GOTO only ever targets a label identifier.
+        if matches!(
+            prev_token,
+            Some(SqlToken::Word(prev_word)) if prev_word.eq_ignore_ascii_case("GOTO")
+        ) {
             return true;
         }
 
@@ -9519,6 +9528,18 @@ impl SqlEditorWidget {
                 | "UNPIVOT"
                 | "SEARCH"
                 | "CYCLE"
+                | "NAME"
+                | "DEPTH"
+                | "SEED"
+                | "PATH"
+                | "REMARK"
+                | "GRAPH"
+                | "SETTINGS"
+                | "LABEL"
+                | "SOURCE"
+                | "ERRORS"
+                | "EVENTS"
+                | "CUME_DIST"
         );
         if !keyword_can_be_identifier {
             return false;
@@ -9528,12 +9549,14 @@ impl SqlEditorWidget {
             prev_token,
             Some(SqlToken::Symbol(sym)) if Self::mysql_identifier_left_boundary_symbol(sym)
         );
-        let next_token_is_dot = matches!(next_token, Some(SqlToken::Symbol(sym)) if sym == ".");
-        let prev_token_is_dot = matches!(prev_token, Some(SqlToken::Symbol(sym)) if sym == ".");
         let previous_is_current_clause_head = matches!(
             (prev_token, current_clause),
             (Some(SqlToken::Word(prev_word)), Some(current_clause_word))
                 if prev_word.eq_ignore_ascii_case(current_clause_word)
+        ) || matches!(
+            (prev_token, current_clause),
+            (Some(SqlToken::Word(prev_word)), Some("ORDER" | "GROUP" | "PARTITION"))
+                if prev_word.eq_ignore_ascii_case("BY")
         );
         let follows_alias_keyword = Self::token_is_alias_keyword(prev_token);
         let next_is_alias_keyword = Self::token_is_alias_keyword(next_token);
@@ -9551,8 +9574,67 @@ impl SqlEditorWidget {
         let in_alias_capable_clause = in_identifier_qualified_clause
             || matches!(current_clause, Some("SET"))
             || in_table_alias_clause;
+        let prev_opens_list = matches!(
+            prev_token,
+            Some(SqlToken::Symbol(sym)) if sym == "(" || sym == ","
+        );
+        let next_continues_list = matches!(
+            next_token,
+            Some(SqlToken::Symbol(sym)) if sym == "," || sym == ")"
+        );
+        let next_token_is_open_paren =
+            matches!(next_token, Some(SqlToken::Symbol(sym)) if sym == "(");
 
-        if (next_token_is_dot || prev_token_is_dot) && in_identifier_qualified_clause {
+        // Routine names: `PROCEDURE seed (...)`, `FUNCTION seed ...`.
+        if matches!(
+            prev_token,
+            Some(SqlToken::Word(prev_word))
+                if prev_word.eq_ignore_ascii_case("PROCEDURE")
+                    || prev_word.eq_ignore_ascii_case("FUNCTION")
+        ) {
+            return true;
+        }
+
+        // CTE names: `WITH seed AS (`, `WITH RECURSIVE settings AS (`,
+        // `WITH graph (col, ...) AS (`.
+        if matches!(
+            prev_token,
+            Some(SqlToken::Word(prev_word))
+                if prev_word.eq_ignore_ascii_case("WITH")
+                    || prev_word.eq_ignore_ascii_case("RECURSIVE")
+        ) && (next_is_alias_keyword || next_token_is_open_paren)
+        {
+            return true;
+        }
+
+        // List members between delimiters: `(id, name)`, `, depth)`, trailing
+        // CTE siblings `, events (` in a WITH list, plus declaration heads
+        // whose next token is another word — column definitions
+        // `COLUMNS (label VARCHAR(40) ...)` and pattern variables
+        // `PATTERN (seed rise*)`.
+        if prev_opens_list
+            && (next_continues_list
+                || next_token_is_open_paren
+                || matches!(next_token, Some(SqlToken::Word(_))))
+        {
+            return true;
+        }
+
+        // Aliases introduced right after a delimiter: `(errors AS 'ERRORS'`.
+        if prev_is_boundary && next_is_alias_keyword {
+            return true;
+        }
+
+        // Table names directly after their clause head: `FROM seed s`.
+        if in_table_alias_clause && previous_is_current_clause_head && !next_token_is_open_paren {
+            return true;
+        }
+
+        // Aliases after a derived table: `) source ON (...)`.
+        if in_table_alias_clause
+            && matches!(prev_token, Some(SqlToken::Symbol(sym)) if sym == ")")
+            && next_ends_identifier_slot
+        {
             return true;
         }
 
@@ -12229,10 +12311,27 @@ impl SqlEditorWidget {
                     let mysql_xa_subcommand = mysql_compatible
                         && matches!(prev_word_upper, Some("XA"))
                         && matches!(upper, "START" | "END");
+                    // A control keyword acting as an alias keeps its source
+                    // case only when the previous token proves the alias slot
+                    // (a non-keyword word such as the table/column name, or a
+                    // derived-table close paren). `IS begin` / `MATCHED then`
+                    // style keyword neighbors keep keyword casing.
+                    let control_keyword_alias_preserves_case = treat_control_keyword_as_identifier
+                        && (matches!(
+                            loop_previous_non_comment_token,
+                            Some(SqlToken::Word(prev_word))
+                                if !is_formatter_keyword(
+                                    prev_word.to_ascii_uppercase().as_str()
+                                )
+                        ) || matches!(
+                            loop_previous_non_comment_token,
+                            Some(SqlToken::Symbol(sym)) if sym == ")"
+                        ));
                     let keyword_preserves_original_case = mysql_keyword_identifier
                         || formatter_keyword_identifier
                         || structured_table_function_keyword_identifier
-                        || follows_at_sign_variable;
+                        || follows_at_sign_variable
+                        || control_keyword_alias_preserves_case;
                     let keyword_suppresses_structural_handling = keyword_preserves_original_case
                         || treat_control_keyword_as_identifier
                         || follows_alias_control_keyword
@@ -21248,7 +21347,7 @@ mod comma_list_layout_tests {
         );
 
         assert!(
-            formatted.contains("SELECT id,\n    NAME,\n    created_at"),
+            formatted.contains("SELECT id,\n    name,\n    created_at"),
             "{formatted}"
         );
     }
@@ -21280,7 +21379,7 @@ mod comma_list_layout_tests {
         );
 
         assert!(
-            formatted.contains("SELECT id, NAME, created_at"),
+            formatted.contains("SELECT id, name, created_at"),
             "{formatted}"
         );
         assert!(
@@ -21372,7 +21471,7 @@ mod comma_list_layout_tests {
             "{case_formatted}"
         );
         assert!(
-            comment_formatted.contains("-- keep name\n    NAME,"),
+            comment_formatted.contains("-- keep name\n    name,"),
             "{comment_formatted}"
         );
     }
@@ -29261,7 +29360,7 @@ recursive_tree (node_id, parent_id, node_name, DEPTH, PATH) AS (
         let source = "begin\nforall i in 1..v_arr.count\ninsert into t1 values (v_arr(i));\nend;";
         let formatted = SqlEditorWidget::format_sql_basic(source);
         assert!(
-            formatted.contains("    FORALL i IN 1..v_arr.COUNT\n        INSERT INTO"),
+            formatted.contains("    FORALL i IN 1..v_arr.count\n        INSERT INTO"),
             "FORALL INSERT body should be indented, got:\n{}",
             formatted
         );
@@ -29272,7 +29371,7 @@ recursive_tree (node_id, parent_id, node_name, DEPTH, PATH) AS (
         let source = "begin\nforall i in 1..v_arr.count\nupdate t1 set col1 = v_arr(i)\nwhere id = v_id(i);\nend;";
         let formatted = SqlEditorWidget::format_sql_basic(source);
         assert!(
-            formatted.contains("    FORALL i IN 1..v_arr.COUNT\n        UPDATE"),
+            formatted.contains("    FORALL i IN 1..v_arr.count\n        UPDATE"),
             "FORALL UPDATE body should be indented, got:\n{}",
             formatted
         );
@@ -29283,7 +29382,7 @@ recursive_tree (node_id, parent_id, node_name, DEPTH, PATH) AS (
         let source = "begin\nforall i in 1..v_arr.count\ndelete from t1 where id = v_arr(i);\nend;";
         let formatted = SqlEditorWidget::format_sql_basic(source);
         assert!(
-            formatted.contains("    FORALL i IN 1..v_arr.COUNT\n        DELETE"),
+            formatted.contains("    FORALL i IN 1..v_arr.count\n        DELETE"),
             "FORALL DELETE body should be indented, got:\n{}",
             formatted
         );
@@ -29302,7 +29401,7 @@ recursive_tree (node_id, parent_id, node_name, DEPTH, PATH) AS (
             .expect("should contain IF line");
         let forall_idx = lines
             .iter()
-            .position(|line| line.trim_start().starts_with("FORALL i IN 1..v_arr.COUNT"))
+            .position(|line| line.trim_start().starts_with("FORALL i IN 1..v_arr.count"))
             .expect("should contain FORALL line");
         let update_idx = lines
             .iter()
@@ -29707,12 +29806,12 @@ END;"#;
             "SELECT remark, remark(note_text) AS masked_remark FROM audit_rows ORDER BY remark;";
         let formatted = SqlEditorWidget::format_sql_basic(source);
 
-        assert!(formatted.contains("REMARK,"), "got:\n{formatted}");
+        assert!(formatted.contains("remark,"), "got:\n{formatted}");
         assert!(
-            formatted.contains("REMARK (note_text) AS masked_remark"),
+            formatted.contains("remark (note_text) AS masked_remark"),
             "got:\n{formatted}"
         );
-        assert!(formatted.contains("ORDER BY REMARK;"), "got:\n{formatted}");
+        assert!(formatted.contains("ORDER BY remark;"), "got:\n{formatted}");
         assert_eq!(SqlEditorWidget::format_sql_basic(&formatted), formatted);
     }
 
@@ -42203,6 +42302,83 @@ END;"#;
         assert!(
             !formatted.contains("VALUES(1);"),
             "formatter should not collapse top-level VALUES clause into function-like syntax, got:\n{formatted}"
+        );
+    }
+
+    #[test]
+    fn oracle_dot_qualified_identifiers_preserve_source_case() {
+        let source =
+            "SELECT r.name, r.depth, system.help_text FROM qt_case_demo r ORDER BY r.name;";
+        let formatted = SqlEditorWidget::format_sql_basic(source);
+        assert!(
+            formatted.contains("r.name") && formatted.contains("r.depth"),
+            "dot-qualified identifiers must keep source case, got:\n{formatted}"
+        );
+        assert!(
+            formatted.contains("system.help_text"),
+            "schema qualifiers before a dot must keep source case, got:\n{formatted}"
+        );
+        assert!(
+            !formatted.contains("r.NAME") && !formatted.contains("r.DEPTH"),
+            "dot-qualified identifiers must not be uppercased, got:\n{formatted}"
+        );
+    }
+
+    #[test]
+    fn oracle_goto_label_target_preserves_source_case() {
+        let source = "BEGIN\n<<top>>\nNULL;\nGOTO top;\nEND;";
+        let formatted = SqlEditorWidget::format_sql_basic(source);
+        assert!(
+            formatted.contains("GOTO top"),
+            "GOTO target must keep the label's source case, got:\n{formatted}"
+        );
+    }
+
+    #[test]
+    fn oracle_cte_and_table_names_matching_keywords_preserve_case() {
+        let source = "WITH seed AS (SELECT 1 AS n FROM DUAL) SELECT s.n FROM seed s;";
+        let formatted = SqlEditorWidget::format_sql_basic(source);
+        assert!(
+            formatted.contains("WITH seed AS"),
+            "CTE name matching a keyword must keep source case, got:\n{formatted}"
+        );
+        assert!(
+            formatted.contains("FROM seed s"),
+            "table reference matching a keyword must keep source case, got:\n{formatted}"
+        );
+    }
+
+    #[test]
+    fn oracle_procedure_named_like_keyword_preserves_case() {
+        let source = "CREATE OR REPLACE PACKAGE qt_case_pkg AS\n    PROCEDURE seed (p_rows IN NUMBER);\nEND qt_case_pkg;";
+        let formatted = SqlEditorWidget::format_sql_basic(source);
+        assert!(
+            formatted.contains("PROCEDURE seed ("),
+            "routine name matching a keyword must keep source case, got:\n{formatted}"
+        );
+    }
+
+    #[test]
+    fn oracle_merge_source_alias_preserves_case() {
+        let source = "MERGE INTO qt_case_target t USING (SELECT 1 AS id FROM DUAL) source ON (t.id = source.id) WHEN MATCHED THEN UPDATE SET t.amount = source.id;";
+        let formatted = SqlEditorWidget::format_sql_basic(source);
+        assert!(
+            formatted.contains(") source"),
+            "derived-table alias matching a keyword must keep source case, got:\n{formatted}"
+        );
+        assert!(
+            formatted.contains("source.id"),
+            "alias-qualified references must keep source case, got:\n{formatted}"
+        );
+    }
+
+    #[test]
+    fn oracle_column_list_members_matching_keywords_preserve_case() {
+        let source = "INSERT INTO qt_case_demo (id, grp, name) VALUES (1, 2, 'x');";
+        let formatted = SqlEditorWidget::format_sql_basic(source);
+        assert!(
+            formatted.contains("name)"),
+            "insert column list member matching a keyword must keep source case, got:\n{formatted}"
         );
     }
 

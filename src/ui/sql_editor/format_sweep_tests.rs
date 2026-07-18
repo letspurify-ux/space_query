@@ -83,6 +83,7 @@ const FORMAT_SWEEP_INLINE_CONTINUATION_REGRESSIONS: &[&str] = &[
 enum FormatSweepIssueKind {
     FormatPanic,
     ItemOrTokenChanged,
+    IdentifierCase,
     Indentation,
     FrameAlignment,
     LineBreak,
@@ -104,6 +105,7 @@ struct FormatSweepRun {
     formatted: String,
     checked_lines: usize,
     checked_gaps: usize,
+    checked_identifier_case_words: usize,
     checked_frames: usize,
     checked_frame_boundaries: usize,
     checked_frame_depth_symmetries: usize,
@@ -635,6 +637,91 @@ fn token_is_comment_or_string(token: &SqlToken) -> bool {
     matches!(token, SqlToken::Comment(_) | SqlToken::String(_))
 }
 
+/// Audits that a formatting pass never changes the letter case of a token that
+/// sits in an unambiguous identifier slot: a segment adjacent to a `.`
+/// qualifier, a `GOTO` label target, or a `PROCEDURE`/`FUNCTION` object name.
+/// Keyword-case normalization must not rewrite identifiers.
+fn format_sweep_audit_identifier_case(
+    source: &str,
+    formatted: &str,
+    db_type: DatabaseType,
+) -> (usize, Vec<FormatSweepIssue>) {
+    let source_document = FormatSweepDocument::new(source, db_type);
+    let formatted_document = FormatSweepDocument::new(formatted, db_type);
+    let source_words: Vec<&str> = source_document
+        .tokens
+        .iter()
+        .filter_map(|span| match &span.token {
+            SqlToken::Word(word) => Some(word.as_str()),
+            _ => None,
+        })
+        .collect();
+    let formatted_word_indices: Vec<usize> = formatted_document
+        .tokens
+        .iter()
+        .enumerate()
+        .filter_map(|(idx, span)| matches!(span.token, SqlToken::Word(_)).then_some(idx))
+        .collect();
+    if source_words.len() != formatted_word_indices.len() {
+        // Token-count changes are reported by `format_sweep_audit_token_count`.
+        return (0, Vec::new());
+    }
+
+    let mut issues = Vec::new();
+    for (source_word, token_idx) in source_words
+        .iter()
+        .zip(formatted_word_indices.iter().copied())
+    {
+        let span = &formatted_document.tokens[token_idx];
+        let SqlToken::Word(formatted_word) = &span.token else {
+            continue;
+        };
+        if *source_word == formatted_word.as_str()
+            || !source_word.eq_ignore_ascii_case(formatted_word)
+        {
+            continue;
+        }
+        let previous = formatted_document.tokens[..token_idx]
+            .iter()
+            .rev()
+            .take_while(|prev_span| prev_span.statement_index == span.statement_index)
+            .find(|prev_span| !matches!(prev_span.token, SqlToken::Comment(_)));
+        let next = formatted_document
+            .tokens
+            .get(token_idx.saturating_add(1)..)
+            .unwrap_or_default()
+            .iter()
+            .take_while(|next_span| next_span.statement_index == span.statement_index)
+            .find(|next_span| !matches!(next_span.token, SqlToken::Comment(_)));
+        let previous_is_dot = matches!(
+            previous.map(|prev_span| &prev_span.token),
+            Some(SqlToken::Symbol(sym)) if sym == "."
+        );
+        let next_is_dot = matches!(
+            next.map(|next_span| &next_span.token),
+            Some(SqlToken::Symbol(sym)) if sym == "."
+        );
+        let previous_names_object = matches!(
+            previous.map(|prev_span| &prev_span.token),
+            Some(SqlToken::Word(word))
+                if word.eq_ignore_ascii_case("GOTO")
+                    || word.eq_ignore_ascii_case("PROCEDURE")
+                    || word.eq_ignore_ascii_case("FUNCTION")
+        );
+        if previous_is_dot || next_is_dot || previous_names_object {
+            issues.push(FormatSweepIssue::new(
+                FormatSweepIssueKind::IdentifierCase,
+                formatted,
+                span.start,
+                format!(
+                    "identifier `{source_word}` was case-changed to `{formatted_word}` in an identifier slot (dot-qualified or named-object position)"
+                ),
+            ));
+        }
+    }
+    (source_words.len(), issues)
+}
+
 fn token_label(token: &SqlToken) -> &str {
     match token {
         SqlToken::Word(word)
@@ -733,6 +820,7 @@ fn format_sweep_run(source: &str, db_type: DatabaseType) -> FormatSweepRun {
                 formatted: source.to_string(),
                 checked_lines: 0,
                 checked_gaps: 0,
+                checked_identifier_case_words: 0,
                 checked_frames: 0,
                 checked_frame_boundaries: 0,
                 checked_frame_depth_symmetries: 0,
@@ -767,6 +855,9 @@ fn format_sweep_run(source: &str, db_type: DatabaseType) -> FormatSweepRun {
     if let Some(issue) = format_sweep_audit_token_count(source, &formatted, db_type) {
         issues.push(issue);
     }
+    let (checked_identifier_case_words, identifier_case_issues) =
+        format_sweep_audit_identifier_case(source, &formatted, db_type);
+    issues.extend(identifier_case_issues);
     let mut probes = 0usize;
     let formatted_document = FormatSweepDocument::new(&formatted, db_type);
     for kind in [
@@ -838,6 +929,7 @@ fn format_sweep_run(source: &str, db_type: DatabaseType) -> FormatSweepRun {
         formatted,
         checked_lines,
         checked_gaps,
+        checked_identifier_case_words,
         checked_frames: frame_alignment_audit.checked_frames,
         checked_frame_boundaries: frame_alignment_audit.checked_frame_boundaries,
         checked_frame_depth_symmetries: frame_alignment_audit.checked_frame_depth_symmetries,
@@ -894,9 +986,10 @@ fn format_sweep_render_out(
         }
     ));
     annotated.push_str(&format!(
-        "-- checked: lines={} token_gaps={} frames={} frame_boundaries={} frame_depth_symmetries={} frame_body_items={} frame_closes={} probes={}\n",
+        "-- checked: lines={} token_gaps={} identifier_case_words={} frames={} frame_boundaries={} frame_depth_symmetries={} frame_body_items={} frame_closes={} probes={}\n",
         run.checked_lines,
         run.checked_gaps,
+        run.checked_identifier_case_words,
         run.checked_frames,
         run.checked_frame_boundaries,
         run.checked_frame_depth_symmetries,
@@ -2896,6 +2989,7 @@ fn formatting_sweep_report_marks_first_pass_issue() {
         formatted: "SELECT 1 FROM DUAL;".to_string(),
         checked_lines: 1,
         checked_gaps: 1,
+        checked_identifier_case_words: 0,
         checked_frames: 0,
         checked_frame_boundaries: 0,
         checked_frame_depth_symmetries: 0,
@@ -2967,6 +3061,7 @@ fn formatting_sweep_all_files_generate_out_report() {
     let mut failures = Vec::new();
     let mut checked_files = 0usize;
     let mut checked_regressions = 0usize;
+    let mut checked_identifier_case_words = 0usize;
     let mut checked_frames = 0usize;
     let mut checked_frame_boundaries = 0usize;
     let mut checked_frame_depth_symmetries = 0usize;
@@ -3008,6 +3103,8 @@ fn formatting_sweep_all_files_generate_out_report() {
     for (db_type, source) in built_in_regressions {
         checked_regressions = checked_regressions.saturating_add(1);
         let run = format_sweep_run(source, db_type);
+        checked_identifier_case_words =
+            checked_identifier_case_words.saturating_add(run.checked_identifier_case_words);
         checked_frames = checked_frames.saturating_add(run.checked_frames);
         checked_frame_boundaries =
             checked_frame_boundaries.saturating_add(run.checked_frame_boundaries);
@@ -3063,6 +3160,8 @@ fn formatting_sweep_all_files_generate_out_report() {
                 .join(relative.parent().unwrap_or(Path::new("")))
                 .join(format!("{file_name}.format.out"));
             let run = format_sweep_generate_report_for_file(&input_path, db_type, &out_path, false);
+            checked_identifier_case_words =
+                checked_identifier_case_words.saturating_add(run.checked_identifier_case_words);
             checked_frames = checked_frames.saturating_add(run.checked_frames);
             checked_frame_boundaries =
                 checked_frame_boundaries.saturating_add(run.checked_frame_boundaries);
@@ -3095,7 +3194,7 @@ fn formatting_sweep_all_files_generate_out_report() {
     managed_frame_kinds.sort_unstable();
     managed_list_owner_kinds.sort_unstable();
     let mut aggregate = format!(
-        "Auto-format sweep aggregate\nchecked_files={checked_files}\nchecked_regressions={checked_regressions}\nchecked_frames={checked_frames}\nchecked_frame_boundaries={checked_frame_boundaries}\nchecked_frame_depth_symmetries={checked_frame_depth_symmetries}\nchecked_frame_body_items={checked_frame_body_items}\nchecked_frame_closes={checked_frame_closes}\nmanaged_frame_kinds={managed_frame_kinds:?}\nmanaged_list_owner_kinds={managed_list_owner_kinds:?}\nfailures={}\n",
+        "Auto-format sweep aggregate\nchecked_files={checked_files}\nchecked_regressions={checked_regressions}\nchecked_identifier_case_words={checked_identifier_case_words}\nchecked_frames={checked_frames}\nchecked_frame_boundaries={checked_frame_boundaries}\nchecked_frame_depth_symmetries={checked_frame_depth_symmetries}\nchecked_frame_body_items={checked_frame_body_items}\nchecked_frame_closes={checked_frame_closes}\nmanaged_frame_kinds={managed_frame_kinds:?}\nmanaged_list_owner_kinds={managed_list_owner_kinds:?}\nfailures={}\n",
         failures.len()
     );
     for failure in &failures {
@@ -3118,6 +3217,58 @@ fn formatting_sweep_all_files_generate_out_report() {
     assert_eq!(
         managed_frame_kinds, expected_frame_kinds,
         "the complete fixture sweep must exercise every production frame kind"
+    );
+}
+
+#[test]
+fn formatting_sweep_detects_identifier_case_change_next_to_dot() {
+    let source = "SELECT r.name FROM qt_case_demo r;";
+    let mutated = "SELECT r.NAME FROM qt_case_demo r;";
+    let (checked, issues) =
+        format_sweep_audit_identifier_case(source, mutated, DatabaseType::Oracle);
+    assert!(checked > 0, "audit should pair word tokens");
+    assert_eq!(
+        issues.len(),
+        1,
+        "dot-qualified identifier case change must be reported, got {issues:?}"
+    );
+    assert!(matches!(
+        issues[0].kind,
+        FormatSweepIssueKind::IdentifierCase
+    ));
+}
+
+#[test]
+fn formatting_sweep_detects_identifier_case_change_after_goto_and_procedure() {
+    let source = "BEGIN\n<<top>>\nNULL;\nGOTO top;\nEND;";
+    let mutated = "BEGIN\n<<top>>\nNULL;\nGOTO TOP;\nEND;";
+    let (_, issues) = format_sweep_audit_identifier_case(source, mutated, DatabaseType::Oracle);
+    assert_eq!(
+        issues.len(),
+        1,
+        "GOTO label case change must be reported, got {issues:?}"
+    );
+
+    let source =
+        "CREATE OR REPLACE PACKAGE qt_pkg AS\n    PROCEDURE seed (p_rows IN NUMBER);\nEND qt_pkg;";
+    let mutated =
+        "CREATE OR REPLACE PACKAGE qt_pkg AS\n    PROCEDURE SEED (p_rows IN NUMBER);\nEND qt_pkg;";
+    let (_, issues) = format_sweep_audit_identifier_case(source, mutated, DatabaseType::Oracle);
+    assert_eq!(
+        issues.len(),
+        1,
+        "PROCEDURE name case change must be reported, got {issues:?}"
+    );
+}
+
+#[test]
+fn formatting_sweep_accepts_keyword_case_normalization_outside_identifier_slots() {
+    let source = "select 1 from qt_case_demo;";
+    let formatted = "SELECT 1\nFROM qt_case_demo;";
+    let (_, issues) = format_sweep_audit_identifier_case(source, formatted, DatabaseType::Oracle);
+    assert!(
+        issues.is_empty(),
+        "keyword normalization away from identifier slots must pass, got {issues:?}"
     );
 }
 

@@ -2461,7 +2461,7 @@ fn format_sql_keeps_if_alias_member_access_intact() {
     let formatted = SqlEditorWidget::format_sql_basic(input);
 
     assert!(
-        formatted.contains("IF.a") && formatted.contains("IF.b"),
+        formatted.contains("if.a") && formatted.contains("if.b"),
         "IF alias member access should be preserved, got:\n{}",
         formatted
     );
@@ -2478,9 +2478,9 @@ fn format_sql_keeps_update_alias_named_if_inline() {
     let formatted = SqlEditorWidget::format_sql_basic(input);
 
     assert!(
-        formatted.contains("UPDATE sales IF")
-            && formatted.contains("IF.amount")
-            && formatted.contains("WHERE IF.id = 1;"),
+        formatted.contains("UPDATE sales if")
+            && formatted.contains("if.amount")
+            && formatted.contains("WHERE if.id = 1;"),
         "UPDATE alias IF should remain inline and usable in member access, got:
 {}",
         formatted
@@ -2499,9 +2499,9 @@ fn format_sql_keeps_merge_into_alias_named_if_inline() {
     let formatted = SqlEditorWidget::format_sql_basic(input);
 
     assert!(
-        formatted.contains("MERGE INTO sales IF")
-            && formatted.contains("IF.id = d.dummy")
-            && formatted.contains("IF.amount = 0;"),
+        formatted.contains("MERGE INTO sales if")
+            && formatted.contains("if.id = d.dummy")
+            && formatted.contains("if.amount = 0;"),
         "MERGE INTO alias IF should remain inline, got:
 {}",
         formatted
@@ -2520,9 +2520,9 @@ fn format_sql_keeps_merge_using_alias_named_if_inline() {
     let formatted = SqlEditorWidget::format_sql_basic(input);
 
     assert!(
-        formatted.contains("USING source_table IF")
-            && formatted.contains("IF.id")
-            && formatted.contains("IF.amount"),
+        formatted.contains("USING source_table if")
+            && formatted.contains("if.id")
+            && formatted.contains("if.amount"),
         "MERGE USING alias IF should remain inline, got:\n{}",
         formatted
     );
@@ -2539,7 +2539,7 @@ fn format_sql_keeps_delete_alias_named_if_inline() {
     let formatted = SqlEditorWidget::format_sql_basic(input);
 
     assert!(
-        formatted.contains("DELETE FROM sales IF") && formatted.contains("WHERE IF.id = 1;"),
+        formatted.contains("DELETE FROM sales if") && formatted.contains("WHERE if.id = 1;"),
         "DELETE alias IF should remain inline and usable in member access, got:\n{}",
         formatted
     );

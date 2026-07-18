@@ -31107,7 +31107,7 @@ IF"
         let formatted = SqlEditorWidget::format_sql_basic(sql);
 
         assert!(
-            formatted.contains("amount IF,") && formatted.contains("total END"),
+            formatted.contains("amount if,") && formatted.contains("total end"),
             "implicit lowercase keyword-like aliases should remain inline, got:
 {}",
             formatted
