@@ -41,7 +41,7 @@ BEGIN
     LOOP
         BEGIN
             IF r.object_type = 'TABLE' THEN
-                EXECUTE IMMEDIATE 'DROP TABLE ' || r.object_name || ' PURGE';
+                EXECUTE IMMEDIATE 'DROP TABLE ' || r.object_name || ' CASCADE CONSTRAINTS PURGE';
             ELSIF r.object_type = 'VIEW' THEN
                 EXECUTE IMMEDIATE 'DROP VIEW ' || r.object_name;
             ELSIF r.object_type = 'SEQUENCE' THEN

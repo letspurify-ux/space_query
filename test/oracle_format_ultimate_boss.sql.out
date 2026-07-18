@@ -41,7 +41,7 @@ BEGIN
                     WHEN r.object_type = 'PACKAGE' THEN
                         'DROP PACKAGE ' || r.object_name
                     WHEN r.object_type = 'TABLE' THEN
-                        'DROP TABLE ' || r.object_name || ' PURGE'
+                        'DROP TABLE ' || r.object_name || ' CASCADE CONSTRAINTS PURGE'
                     ELSE
                         NULL
                 END;
