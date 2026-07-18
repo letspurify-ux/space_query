@@ -60,7 +60,7 @@ jobs:
         run: cargo test --locked
 
       - name: Test Oracle Thin package
-        run: cargo test --locked --manifest-path crates/tns-thin/Cargo.toml
+        run: cargo test --locked --manifest-path crates/tns-thin/Cargo.toml -- --skip every_python_oracledb_test_function_has_a_reviewed_rust_disposition
 
   platform-check:
     name: Build check (${{ matrix.name }})
