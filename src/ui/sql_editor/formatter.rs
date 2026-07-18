@@ -9048,7 +9048,10 @@ impl SqlEditorWidget {
                             Some(delimiter.clone())
                         };
                     }
-                    formatted.push_str(&Self::format_tool_command(command));
+                    formatted.push_str(&Self::format_tool_command_for_document(
+                        command,
+                        preferred_db_type,
+                    ));
                     select_list_break_state.clear();
                 }
                 FormatItem::Verbatim(text) => {
@@ -11119,6 +11122,39 @@ impl SqlEditorWidget {
         } else {
             trimmed.to_string()
         }
+    }
+
+    fn format_tool_command_for_document(
+        command: &ToolCommand,
+        preferred_db_type: Option<DatabaseType>,
+    ) -> String {
+        let mysql_compatible =
+            preferred_db_type.is_some_and(DatabaseType::supports_mysql_delimiter_commands);
+        if let (true, ToolCommand::SetAutoCommit { enabled }) = (mysql_compatible, command) {
+            return format!("SET AUTOCOMMIT = {};", usize::from(*enabled));
+        }
+
+        let mut rendered = Self::format_tool_command(command);
+        if mysql_compatible
+            && matches!(
+                command,
+                ToolCommand::Use { .. }
+                    | ToolCommand::Describe { .. }
+                    | ToolCommand::ShowDatabases
+                    | ToolCommand::ShowTables
+                    | ToolCommand::ShowColumns { .. }
+                    | ToolCommand::ShowCreateTable { .. }
+                    | ToolCommand::ShowProcessList
+                    | ToolCommand::ShowVariables { .. }
+                    | ToolCommand::ShowStatus { .. }
+                    | ToolCommand::ShowWarnings
+                    | ToolCommand::MysqlShowErrors
+            )
+            && !rendered.ends_with(';')
+        {
+            rendered.push(';');
+        }
+        rendered
     }
 
     pub(super) fn format_tool_command(command: &ToolCommand) -> String {
@@ -19260,11 +19296,24 @@ impl SqlEditorWidget {
                             // Don't add space between consecutive ampersands (&&var substitution)
                             let repeats_ampersand = sym == "&" && out.ends_with('&');
                             let repeats_at_sign = sym == "@" && out.ends_with('@');
+                            let is_mysql_account_separator = mysql_compatible
+                                && sym == "@"
+                                && matches!(
+                                    immediate_prev_token,
+                                    Some(SqlToken::Word(_) | SqlToken::String(_))
+                                )
+                                && matches!(
+                                    immediate_next_token,
+                                    Some(SqlToken::Word(_) | SqlToken::String(_))
+                                )
+                                && (matches!(immediate_prev_token, Some(SqlToken::String(_)))
+                                    || matches!(immediate_next_token, Some(SqlToken::String(_))));
                             let is_pattern_quantifier =
                                 Self::is_match_recognize_pattern_quantifier(tokens, idx);
                             let should_insert_space = needs_space
                                 && !(repeats_ampersand
                                     || repeats_at_sign
+                                    || is_mysql_account_separator
                                     || is_mysql_block_label_colon
                                     || is_plsql_attribute_prefix
                                     || is_pattern_quantifier);
@@ -19339,6 +19388,7 @@ impl SqlEditorWidget {
                                 || (!is_bind_var_colon
                                     && !is_ampersand_prefix
                                     && !is_mysql_user_variable_prefix
+                                    && !is_mysql_account_separator
                                     && !is_plsql_attribute_prefix
                                     && !is_unary_sign);
                         }
@@ -22154,6 +22204,7 @@ mod formatter_scope_state_tests {
 #[cfg(test)]
 mod formatter_regression_tests {
     use super::SqlEditorWidget;
+    use crate::db::connection::DatabaseType;
     use crate::db::{FormatItem, QueryExecutor, ScriptItem, SessionState};
     use crate::ui::sql_editor::execution::PROGRESS_ROWS_INITIAL_BATCH;
     use crate::ui::sql_editor::QueryProgress;
@@ -26623,6 +26674,42 @@ FROM t;
             });
 
         assert_eq!(rendered, "SHOW VARIABLES LIKE 'sql_mode_''strict'''");
+    }
+
+    #[test]
+    fn format_mysql_server_commands_keep_executable_statement_boundaries() {
+        let sql = "DESCRIBE t;\nEXPLAIN SELECT * FROM t;\nSHOW PROCESSLIST;\nDROP USER IF EXISTS 'u'@'localhost';\nSET @value = 1;\nSELECT @value;";
+
+        let formatted = SqlEditorWidget::format_sql_basic_for_db_type(sql, DatabaseType::MySQL);
+
+        assert!(
+            formatted.contains("DESCRIBE t;\n\nEXPLAIN"),
+            "DESCRIBE must remain a terminated server statement:\n{formatted}"
+        );
+        assert!(
+            formatted.contains("SHOW PROCESSLIST;\n\nDROP USER IF EXISTS 'u'@'localhost';"),
+            "SHOW must remain a terminated server statement:\n{formatted}"
+        );
+        assert!(
+            !formatted.contains("'u' @ 'localhost'"),
+            "MySQL account separators must not gain whitespace:\n{formatted}"
+        );
+        assert!(
+            formatted.contains("SET @value = 1;\n\nSELECT @value;"),
+            "MySQL user variables must retain whitespace before @:\n{formatted}"
+        );
+    }
+
+    #[test]
+    fn format_mariadb_autocommit_keeps_executable_statement_boundary() {
+        let sql = "SET autocommit = 0;\nINSERT INTO t VALUES (1);";
+
+        let formatted = SqlEditorWidget::format_sql_basic_for_db_type(sql, DatabaseType::MariaDB);
+
+        assert!(
+            formatted.starts_with("SET AUTOCOMMIT = 0;\n\nINSERT INTO t"),
+            "SET AUTOCOMMIT must remain a terminated MariaDB statement:\n{formatted}"
+        );
     }
 
     #[test]

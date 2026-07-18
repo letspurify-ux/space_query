@@ -1,7 +1,7 @@
 use super::formatter::{FormatManagedFrameKind, ListOwnerKind};
 use super::{query_text, SqlEditorWidget, SqlToken};
 use crate::db::connection::DatabaseType;
-use crate::db::{QueryExecutor, ScriptItem};
+use crate::db::{QueryExecutor, ScriptItem, ToolCommand};
 use crate::sql_text;
 use std::any::Any;
 use std::fs;
@@ -78,11 +78,22 @@ const FORMAT_SWEEP_INLINE_CONTINUATION_REGRESSIONS: &[&str] = &[
     "SELECT calculate(first_value + -- continuation\nsecond_value, third_value) AS total FROM sample_table;",
     "WITH only_cte AS (SELECT first_value + -- continuation\nsecond_value AS total FROM sample_table) SELECT total FROM only_cte;",
 ];
+const FORMAT_SWEEP_EXECUTABLE_BOUNDARY_REGRESSION_CASES: &[(DatabaseType, &str)] = &[
+    (
+        DatabaseType::MySQL,
+        "DESCRIBE t;\nEXPLAIN SELECT * FROM t;\nSHOW PROCESSLIST;\nDROP USER IF EXISTS 'u'@'localhost';\nSET @value = 1;\nSELECT @value;",
+    ),
+    (
+        DatabaseType::MariaDB,
+        "SET autocommit = 0;\nINSERT INTO t VALUES (1);\nSHOW WARNINGS;\nSELECT 1;",
+    ),
+];
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum FormatSweepIssueKind {
     FormatPanic,
     ItemOrTokenChanged,
+    ExecutableBoundary,
     IdentifierCase,
     Indentation,
     FrameAlignment,
@@ -633,6 +644,82 @@ fn format_sweep_audit_token_count(
     })
 }
 
+fn format_sweep_audit_executable_boundaries(
+    formatted: &str,
+    db_type: DatabaseType,
+) -> Vec<FormatSweepIssue> {
+    if !mysql_compatible(db_type) {
+        return Vec::new();
+    }
+
+    let line_starts = line_start_offsets(formatted);
+    let mut issues: Vec<FormatSweepIssue> = formatted
+        .lines()
+        .enumerate()
+        .filter_map(|(line_idx, line)| {
+            let command = QueryExecutor::parse_tool_command_if_candidate(line.trim())?;
+            let is_server_statement = matches!(
+                command,
+                ToolCommand::Use { .. }
+                    | ToolCommand::Describe { .. }
+                    | ToolCommand::SetAutoCommit { .. }
+                    | ToolCommand::ShowDatabases
+                    | ToolCommand::ShowTables
+                    | ToolCommand::ShowColumns { .. }
+                    | ToolCommand::ShowCreateTable { .. }
+                    | ToolCommand::ShowProcessList
+                    | ToolCommand::ShowVariables { .. }
+                    | ToolCommand::ShowStatus { .. }
+                    | ToolCommand::ShowWarnings
+                    | ToolCommand::MysqlShowErrors
+            );
+            (is_server_statement && !sql_text::line_ends_with_semicolon_before_inline_comment(line))
+                .then(|| {
+                    FormatSweepIssue::new(
+                        FormatSweepIssueKind::ExecutableBoundary,
+                        formatted,
+                        line_starts.get(line_idx).copied().unwrap_or_default(),
+                        "MySQL-family server command lost its statement terminator".to_string(),
+                    )
+                })
+        })
+        .collect();
+
+    let document = FormatSweepDocument::new(formatted, db_type);
+    for tokens in document.tokens.windows(3) {
+        let [left, separator, right] = tokens else {
+            continue;
+        };
+        let is_account_component =
+            |token: &SqlToken| matches!(token, SqlToken::Word(_) | SqlToken::String(_));
+        if left.statement_index != separator.statement_index
+            || separator.statement_index != right.statement_index
+            || !matches!(&separator.token, SqlToken::Symbol(symbol) if symbol == "@")
+            || !is_account_component(&left.token)
+            || !is_account_component(&right.token)
+            || !matches!(&left.token, SqlToken::String(_))
+                && !matches!(&right.token, SqlToken::String(_))
+        {
+            continue;
+        }
+        let has_whitespace = formatted
+            .get(left.end..separator.start)
+            .is_some_and(|gap| !gap.is_empty())
+            || formatted
+                .get(separator.end..right.start)
+                .is_some_and(|gap| !gap.is_empty());
+        if has_whitespace {
+            issues.push(FormatSweepIssue::new(
+                FormatSweepIssueKind::ExecutableBoundary,
+                formatted,
+                separator.start,
+                "MySQL-family account separator gained whitespace".to_string(),
+            ));
+        }
+    }
+    issues
+}
+
 fn token_is_comment_or_string(token: &SqlToken) -> bool {
     matches!(token, SqlToken::Comment(_) | SqlToken::String(_))
 }
@@ -855,6 +942,9 @@ fn format_sweep_run(source: &str, db_type: DatabaseType) -> FormatSweepRun {
     if let Some(issue) = format_sweep_audit_token_count(source, &formatted, db_type) {
         issues.push(issue);
     }
+    issues.extend(format_sweep_audit_executable_boundaries(
+        &formatted, db_type,
+    ));
     let (checked_identifier_case_words, identifier_case_issues) =
         format_sweep_audit_identifier_case(source, &formatted, db_type);
     issues.extend(identifier_case_issues);
@@ -1411,6 +1501,28 @@ fn formatting_sweep_first_pass_detects_token_loss() {
     let issue = format_sweep_audit_token_count(source, formatted_with_loss, DatabaseType::Oracle)
         .expect("token loss should be reported on the first pass");
     assert_eq!(issue.kind, FormatSweepIssueKind::ItemOrTokenChanged);
+}
+
+#[test]
+fn formatting_sweep_detects_unterminated_mysql_server_command() {
+    let formatted = "DESCRIBE t\n\nSELECT 1;";
+
+    let issues = format_sweep_audit_executable_boundaries(formatted, DatabaseType::MySQL);
+
+    assert_eq!(issues.len(), 1, "unexpected issues: {issues:#?}");
+    assert_eq!(issues[0].kind, FormatSweepIssueKind::ExecutableBoundary);
+    assert_eq!(issues[0].line, 1);
+}
+
+#[test]
+fn formatting_sweep_detects_spaced_mysql_account_separator() {
+    let formatted = "DROP USER IF EXISTS 'u' @ 'localhost';";
+
+    let issues = format_sweep_audit_executable_boundaries(formatted, DatabaseType::MySQL);
+
+    assert_eq!(issues.len(), 1, "unexpected issues: {issues:#?}");
+    assert_eq!(issues[0].kind, FormatSweepIssueKind::ExecutableBoundary);
+    assert_eq!(issues[0].column, 25);
 }
 
 #[test]
@@ -3074,6 +3186,11 @@ fn formatting_sweep_all_files_generate_out_report() {
         .iter()
         .copied()
         .chain(FORMAT_SWEEP_STRUCTURAL_REGRESSION_CASES.iter().copied())
+        .chain(
+            FORMAT_SWEEP_EXECUTABLE_BOUNDARY_REGRESSION_CASES
+                .iter()
+                .copied(),
+        )
         .chain([
             (
                 DatabaseType::Oracle,

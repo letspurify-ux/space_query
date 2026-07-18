@@ -2853,6 +2853,102 @@ Oracle `test`, MySQL `test_mysql`, MariaDB `test_mariadb` 아래 모든 SQL/TXT 
 | `cargo test --lib` | 6,532 통과·228 ignored·실패 0 |
 | 전체 `cargo test` | 모든 lib/binary/integration/guard/doc-test 실패 0 |
 | `cargo clippy --locked --all-targets -- -D warnings -W clippy::perf -W clippy::complexity` | 통과, 경고 0 |
+
+## 32-1. [수정] 포맷 결과의 MySQL/MariaDB 실행 가능성 보존
+
+사용자 추가 요구에 따라 66개 포맷 결과를 실제 DB에서도 실행했다. 이 검증에서
+31-4의 "tool-command canonical 렌더링이므로 세미콜론 제거 유지" 판단이 포맷
+산출물에는 맞지 않음을 확인했다. 앱 내부 실행기는 명령 단위로 이미 분리된
+`ToolCommand`를 실행하지만, `.format.out`을 공식 CLI에 넣으면 서버 SQL은 문장
+종결자가 필요하다.
+
+### AS-IS
+
+```sql
+DESCRIBE statement_log
+
+EXPLAIN FORMAT = TREE
+SELECT ...;
+
+SHOW PROCESSLIST
+
+SHOW WARNINGS
+
+SET AUTOCOMMIT OFF
+
+INSERT INTO ...;
+
+DROP USER IF EXISTS 'sq_mysql_final_user' @ 'localhost';
+```
+
+- `DESCRIBE` 다음의 `EXPLAIN`이 한 문장으로 합쳐져 MySQL 1064 오류가 발생했다.
+- 첫 오류를 고친 뒤에는 MySQL 계정 문법의 `'user'@'host'`가
+  `'user' @ 'host'`로 벌어진 두 번째 1064 오류가 드러났다.
+- 같은 종결자 손실이 `SHOW CREATE TABLE`, `SHOW PROCESSLIST`,
+  `SHOW WARNINGS`, `SHOW ERRORS`, MariaDB `SET AUTOCOMMIT`에도 있었다.
+
+### TO-BE
+
+```sql
+DESCRIBE statement_log;
+
+EXPLAIN FORMAT = TREE
+SELECT ...;
+
+SHOW PROCESSLIST;
+
+SHOW WARNINGS;
+
+SET AUTOCOMMIT = 0;
+
+INSERT INTO ...;
+
+DROP USER IF EXISTS 'sq_mysql_final_user'@'localhost';
+```
+
+`format_tool_command_for_document`를 추가해 포맷 문서 렌더링과 기존 실행기용
+`format_tool_command`를 분리했다. 구체적인 `DatabaseType`을 UI에서 직접
+분기하지 않고 백엔드의 `supports_mysql_delimiter_commands` capability로 정책을
+선택한다.
+
+모든 `ToolCommand`에 일괄적으로 `;`를 붙이지는 않는다. `DELIMITER $$;`는
+구분자 자체를 `$$;`로 바꾸며, `SOURCE file.sql;`/`@script.sql;`은 세미콜론이
+경로에 포함될 수 있다. Oracle SQL*Plus의 `SPOOL`, `PROMPT`, `VARIABLE`,
+`SET SERVEROUTPUT`도 서버 SQL이 아닌 클라이언트 명령이다. 따라서 다음과 같이
+의미로 구분한다.
+
+- MySQL 계열 서버 SQL: `USE`, `DESCRIBE`, 지원되는 `SHOW` 명령군,
+  `SET AUTOCOMMIT` — 실행 가능한 `;` 종결 형태로 렌더링.
+- MySQL/Oracle 클라이언트 메타 명령: `DELIMITER`, `SOURCE`, SQL*Plus 명령군 —
+  기존 명령 문법 유지.
+- MySQL 계정의 인용된 `user@host` 구분자는 공백 없이 렌더링하되,
+  `SET @value`/`USING @value` 사용자 변수 앞 공백은 유지.
+
+## 32-2. sweep 일반 검출과 회귀 고정
+
+`ExecutableBoundary` 감사를 추가했다. 특정 파일이나 행 번호가 아니라 다음
+문법군 전체를 검사한다.
+
+1. MySQL 계열 서버 `ToolCommand` 출력 줄의 문장 종결자 누락.
+2. 인용된 MySQL 계정의 `user@host` 토큰 사이에 생긴 공백.
+
+MySQL/MariaDB 내장 회귀 2개와 단위 테스트 4개를 추가했다. 회귀에는
+`DESCRIBE` 뒤 인접 `EXPLAIN`, 여러 `SHOW`, `SET AUTOCOMMIT`, 계정 표기와 함께
+`SET @value`/`SELECT @value` 반대 사례도 포함해 계정 수정이 사용자 변수까지
+붙이지 못하게 했다.
+
+## 32-3. 최종 전수 검토 및 실행 검증
+
+| 검증 | 결과 |
+| --- | --- |
+| 포맷 결과 육안 검토 | 66개 · 53,361줄을 각 파일 1행부터 EOF까지 검토, 잔여 오류 0 |
+| 수정 산출물 재검토 | 변경된 4개 파일 6,669줄 전체 재검토, 후속 계정 diff 2개 파일의 변경 문맥 재확인 |
+| 최종 formatting sweep | 66개 파일 + 내장 회귀 32개, 30,129 frames, 60,928 boundaries, 15,155 closes, failures 0 |
+| Oracle 실행 | 42/42 PASS — Space Query Thin 실행 경로; 최종 Oracle 출력은 수정 전과 바이트 동일 |
+| MySQL 실행 | 11/11 PASS — MySQL 8.0 공식 CLI, 새 검증 DB에서 전 파일 실행 |
+| MariaDB 실행 | 13/13 PASS — MariaDB 12.2 공식 CLI, 새 검증 DB에서 전 파일 실행 |
+| `cargo test` | 통과 — 전 타깃 합계 6,785 passed · 0 failed · 238 ignored |
+| `cargo clippy --locked --all-targets -- -D warnings -W clippy::perf -W clippy::complexity` | 통과, 경고 0 |
 | `cargo fmt --all -- --check` | 통과 |
 
 # 20. 스윕 PASS 불신 전제 61개 전수 육안 재검토와 절 depth drift 4건 수정
