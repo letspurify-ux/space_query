@@ -5240,3 +5240,149 @@ formatter, splitter, sweep test 및 fixture에는 변경이 없다.
 | `cargo test` | 통과 — 전 타깃 합계 6,789 passed · 0 failed · 245 ignored |
 | `cargo clippy --locked --all-targets -- -D warnings -W clippy::perf -W clippy::complexity` | 통과 — 경고 0 |
 | `cargo fmt --all -- --check` / `git diff --check` | 통과 |
+
+## 37. 단일-라인 프레임 닫힘 · SQL 절 CASE 식 교정 (2026-07-18)
+
+`formatting_sweep_all_files_generate_out_report`를 1차 실행한 뒤
+`target/format-sweep` 아래 66개 `.format.out`(총 53,427줄)을
+`docs/auto_format_rule.md` §1·§5·§6 기준으로 전수 재검토했다. 자동 검사가 PASS로
+통과시켰지만 관례상 어색한 두 가지를 발견해 교정하고, 재발 방지 감사 규칙을
+frame-depth 기반으로 일반화해 추가했다.
+
+### 37.1 단일 라인 본문 프레임의 닫는 괄호가 새 줄로 떨어지던 문제
+
+`JSON_TABLE ... COLUMNS (...)` / `NESTED PATH ... COLUMNS (...)` 처럼
+`ColumnList`·`QueryLike` 프레임으로 분류되는 괄호는 본문이 한 줄에 다 들어가도
+닫는 `)`를 소유자 깊이의 새 줄에 렌더링했다. §1(실제 프레임 경계가 둘일 때만
+깊이가 생긴다)·§6(닫는 구분자가 *줄을 시작할 때만* 소유자 깊이를 쓴다)에 따르면
+본문에 줄바꿈이 없으면 닫는 괄호는 본문 끝에 붙어야 한다.
+
+`test/final.sql` — JSON_TABLE COLUMNS:
+
+```sql
+-- AS-IS
+        COLUMNS (statement_name VARCHAR2 (100) PATH '$'
+        )
+    );
+
+-- TO-BE
+        COLUMNS (statement_name VARCHAR2 (100) PATH '$')
+    );
+```
+
+`test/oracle_format_final_boss_v2.sql` — 중첩 JSON_TABLE:
+
+```sql
+-- AS-IS
+        FROM JSON_TABLE (e.json_doc,
+                '$.skills[*]' COLUMNS (skill VARCHAR2 (100) PATH '$'
+                )) jt
+
+-- TO-BE
+        FROM JSON_TABLE (e.json_doc,
+                '$.skills[*]' COLUMNS (skill VARCHAR2 (100) PATH '$')
+            ) jt
+```
+
+동형 교정: `test/test11.txt`, `test_mariadb/test4·test5.txt`,
+`test_mysql/test5.txt`.
+
+구현(`src/ui/sql_editor/formatter.rs`): `ParenFormatFrame`에 `body_start_out_len`
+필드와 `body_is_single_line(&out)` 헬퍼를 추가하고(여는 괄호를 낼 때 `out.len()`
+기록, 이후 본문에 `\n`이 없으면 단일 라인 판정), 닫는 괄호의 `closes_indented()`
+분기에 `&& !body_is_single_line(&out)` 조건을 붙였다. 여러 줄 본문은 기존대로
+소유자 깊이의 새 줄에 닫힌다.
+
+### 37.2 SQL 절 안 CASE 식의 THEN/ELSE 값이 새 줄로 분리되던 문제
+
+`ORDER BY`/`GROUP BY`/`HAVING`/`RETURNING` 등 SQL 절의 CASE **식**인데도
+`OPEN ... FOR`·`RETURNING` 같은 PL/SQL 문맥이 활성이면 THEN/ELSE 뒤 값을 문
+본문처럼 새 줄로 밀어냈다. 같은 파일의 `SELECT`/`SET` 절 CASE는 값을 THEN과 같은
+줄에 유지하므로 문맥에 따라 규칙이 갈렸다. §5는 본문 경계 규칙이 문 본문에만
+적용되고 CASE 식 분기에는 적용되지 않음을 규정한다.
+
+`test/oracle_format_final_boss_v2.sql` — OPEN ... FOR 안의 ORDER BY CASE:
+
+```sql
+-- AS-IS
+            ORDER BY CASE
+                    WHEN e.band_label LIKE 'HIGH%' THEN
+                        1
+                    WHEN e.band_label LIKE 'MID%' THEN
+                        2
+                    ELSE
+                        3
+                END,
+
+-- TO-BE
+            ORDER BY CASE
+                    WHEN e.band_label LIKE 'HIGH%' THEN 1
+                    WHEN e.band_label LIKE 'MID%' THEN 2
+                    ELSE 3
+                END,
+```
+
+`test/oracle_format_ultimate_boss.sql` — ORDER BY CASE:
+
+```sql
+-- AS-IS
+                    WHEN 'VIEW' THEN
+                        1
+                    WHEN 'PACKAGE BODY' THEN
+                        2
+
+-- TO-BE
+                    WHEN 'VIEW' THEN 1
+                    WHEN 'PACKAGE BODY' THEN 2
+```
+
+동형 교정: `test/test18·test21·test25.sql`,
+`test_mariadb/test5·test6·test7·test8·test15.txt`,
+`test_mysql/test2·test3·test5·test10.txt`.
+PL/SQL 문 본문 CASE(`v := CASE ... THEN <문>`)와 `UPDATE ... SET` CASE는 기존
+동작을 유지하며, 이번 수정은 `in_sql_case_clause`(SQL 절)로 한정한다.
+
+구현: `THEN`·`ELSE` 처리의 PL/SQL 줄바꿈 조건을
+`in_plsql_block && !matches!(current_clause, Some("SELECT"))` 에서
+`in_plsql_block && !in_sql_case_clause` 로 교체.
+`in_sql_case_clause`는 `SELECT|WHERE|ORDER|GROUP|HAVING|VALUES|SET|INTO|RETURNING`
+을 이미 포괄한다.
+
+### 37.3 frame-depth 일반 감사 규칙 추가 (목표4)
+
+37.1 결함은 자동 검사에서 PASS였다. 재발 방지를 위해
+`FormatFrameAlignmentEvent::Close` 검증에 불변식을 추가했다: **여는 괄호~닫는
+괄호 사이 줄바꿈이 ≤1(단일 라인 본문)인데 닫는 토큰이 새 줄에서 시작하면
+위반으로 보고**. 단, 본문 마지막 토큰이 라인 주석(`--`,`#`)이면 주석이 닫는
+괄호를 강제로 다음 줄로 내리므로 예외. 특정 구문에 묶이지 않고 모든 관리 프레임
+종류에 대해 실제 줄바꿈 수로 판정하므로 일반적이다.
+`checked_frame_depth_symmetries` 3,422→3,428.
+
+### 37.4 라이브 실행 검증 (목표5, space_query 경로)
+
+포맷 결과(`.format.out`에서 footer 제거)를 원본과 함께 각 DB에서 실행해 비교.
+
+| DB | 대상 | 결과 |
+| --- | --- | --- |
+| Oracle Free (thin) | `final.sql` + 영향 6파일 | failures 0; 그리드는 ROWID·CREATED_AT(SYSTIMESTAMP) 외 원본과 완전 동일 |
+| MySQL 8.0 | 영향 4파일 | 원본/포맷본 에러 집합 동일 |
+| MariaDB 12.2 | 영향 6파일 | 에러 집합 동일 (`test6.txt`의 `ERROR 1046`은 원본에도 있던 픽스처 특성, 라인만 20→23 이동) |
+
+토큰 수·순서·식별자 대소문자 불변은 스윕 감사가 보장하므로 포맷 전후 스크립트는
+의미적 동치.
+
+### 37.5 리뷰 규모 및 품질 게이트
+
+| 항목 | 값 |
+| --- | --- |
+| 검토 파일 / 총 줄 수 | 66 / 53,427 |
+| 수정 항목 | 2 (단일-라인 프레임 닫힘, SQL 절 CASE THEN/ELSE) |
+| 신규 감사 규칙 | 1 (frame-depth 단일-라인 닫힘 위반 검출) |
+| 포맷 출력이 바뀐 파일 | 20 |
+| 갱신한 locked 기대값 | 5 (nested-case RETURNING, test4 JSON_TABLE close, mariadb VALUES CASE ×2, test6 operand spacing) |
+
+| 검증 | 결과 |
+| --- | --- |
+| `cargo test --lib formatting_sweep_all_files_generate_out_report -- --ignored` | 통과 — 66파일 failures 0 |
+| `cargo test` | 통과 — 6,640 passed · 0 failed (lib) |
+| `cargo clippy --locked --all-targets -- -D warnings -W clippy::perf -W clippy::complexity` | 통과 — 경고 0 |

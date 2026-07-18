@@ -1448,6 +1448,7 @@ struct ParenFormatFrame {
     opened_at_line_start: bool,
     pending_multiline_child_continuation: bool,
     post_multiline_child_tail_token_count: u8,
+    body_start_out_len: usize,
 }
 
 impl ParenFormatFrame {
@@ -1458,7 +1459,18 @@ impl ParenFormatFrame {
             opened_at_line_start,
             pending_multiline_child_continuation: false,
             post_multiline_child_tail_token_count: 0,
+            body_start_out_len: 0,
         }
+    }
+
+    fn with_body_start(mut self, body_start_out_len: usize) -> Self {
+        self.body_start_out_len = body_start_out_len;
+        self
+    }
+
+    fn body_is_single_line(self, out: &str) -> bool {
+        out.get(self.body_start_out_len..)
+            .is_some_and(|body| !body.contains('\n'))
     }
 
     fn depth(self) -> usize {
@@ -3084,6 +3096,31 @@ impl FormatFrameAlignmentAudit {
                                 frame.map_or(0, |frame| frame.open_token_idx),
                             ),
                         });
+                    }
+                    if let Some(open_span) = frame.and_then(|frame| spans.get(frame.open_token_idx))
+                    {
+                        let close_line_break_count = formatted
+                            .get(open_span.end..span.start)
+                            .map_or(0, |body| body.matches('\n').count());
+                        let body_tail_is_line_comment = token_idx
+                            .checked_sub(1)
+                            .and_then(|prev_idx| spans.get(prev_idx))
+                            .is_some_and(|prev_span| {
+                                matches!(
+                                    &prev_span.token,
+                                    SqlToken::Comment(comment)
+                                        if comment.starts_with("--") || comment.starts_with('#')
+                                )
+                            });
+                        if close_line_break_count <= 1 && !body_tail_is_line_comment {
+                            summary.issues.push(FormatFrameAlignmentIssue {
+                                offset: span.start,
+                                message: format!(
+                                    "format frame {frame_id} close starts a new line although its body is single-line, opener_token={}",
+                                    frame.map_or(0, |frame| frame.open_token_idx),
+                                ),
+                            });
+                        }
                     }
                 }
                 FormatFrameAlignmentEvent::ContainedClause {
@@ -13960,10 +13997,7 @@ impl SqlEditorWidget {
                                 );
                             }
                         }
-                        if upper == "ELSE"
-                            && in_plsql_block
-                            && !matches!(format_stack.current_clause(), Some("SELECT"))
-                        {
+                        if upper == "ELSE" && in_plsql_block && !in_sql_case_clause {
                             newline_after_keyword = true;
                             if in_case_block {
                                 newline_after_keyword_extra = 1;
@@ -13994,9 +14028,7 @@ impl SqlEditorWidget {
                             format_stack.activate_insert_all_branch(current_scope.paren_depth);
                             newline_after_keyword = true;
                             newline_after_keyword_extra = 1;
-                        } else if in_plsql_block
-                            && !matches!(format_stack.current_clause(), Some("SELECT"))
-                        {
+                        } else if in_plsql_block && !in_sql_case_clause {
                             newline_after_keyword = true;
                             if format_stack.last_block_kind().is_some_and(|s| {
                                 matches!(s, BlockKind::Case | BlockKind::Exception)
@@ -18962,7 +18994,8 @@ impl SqlEditorWidget {
                                     paren_frame_kind,
                                     frame_owner_depth,
                                     paren_started_at_line_start,
-                                ),
+                                )
+                                .with_body_start(out.len()),
                                 paren_semantic_flags,
                                 capture_runtime_state,
                                 new_query_base_depth,
@@ -19118,7 +19151,9 @@ impl SqlEditorWidget {
                                 suppress_comma_break_depth =
                                     suppress_comma_break_depth.saturating_sub(1);
                             }
-                            if paren_frame_kind.closes_indented() {
+                            if paren_frame_kind.closes_indented()
+                                && !paren_frame_kind.body_is_single_line(&out)
+                            {
                                 // `format_stack.statement_base_depth()` was already restored by
                                 // `pop_paren` using the frame's
                                 // stored depth. No manual decrement
@@ -39313,16 +39348,12 @@ WHEN MATCHED THEN
             "                CASE",
             "                    WHEN b = 2 THEN",
             "                        CASE",
-            "                            WHEN c = 3 THEN",
-            "                                100",
-            "                            ELSE",
-            "                                200",
+            "                            WHEN c = 3 THEN 100",
+            "                            ELSE 200",
             "                        END",
-            "                    ELSE",
-            "                        300",
+            "                    ELSE 300",
             "                END",
-            "            ELSE",
-            "                400",
+            "            ELSE 400",
             "        END INTO v_out;",
             "END;",
         ]
@@ -43413,7 +43444,7 @@ DELIMITER ;"#;
             .iter()
             .enumerate()
             .skip(json_table_join_idx + 1)
-            .find(|(_, line)| line.trim_start() == ")) jt")
+            .find(|(_, line)| line.trim_start() == ") jt")
             .map(|(idx, _)| idx)
             .expect("test4 JSON_TABLE close");
         let columns_owner_idx = lines
@@ -43431,10 +43462,14 @@ DELIMITER ;"#;
             .map(|(idx, _)| idx)
             .expect("test4 second argument close");
 
+        assert!(
+            lines[columns_owner_idx].trim_end().ends_with("PATH '$')"),
+            "test4 single-column COLUMNS body stays inline and closes on its own line, got:\n{formatted}"
+        );
         assert_eq!(
             leading_spaces(lines[json_table_close_idx]),
-            leading_spaces(lines[columns_owner_idx]),
-            "test4 multiline JSON_TABLE close should return to the COLUMNS owner depth, got:\n{formatted}"
+            leading_spaces(lines[json_table_join_idx]) + 4,
+            "test4 multiline JSON_TABLE close should return to the JSON_TABLE frame owner depth, got:\n{formatted}"
         );
         assert_eq!(
             leading_spaces(lines[arg_close_idx]),
@@ -44326,7 +44361,7 @@ END$$"#;
         let else_indices: Vec<usize> = lines
             .iter()
             .enumerate()
-            .filter(|(_, line)| line.trim_start() == "ELSE")
+            .filter(|(_, line)| line.trim_start().starts_with("ELSE"))
             .map(|(idx, _)| idx)
             .collect();
 
@@ -44445,7 +44480,7 @@ END$$"#;
         let else_indices: Vec<usize> = lines
             .iter()
             .enumerate()
-            .filter(|(_, line)| line.trim_start() == "ELSE")
+            .filter(|(_, line)| line.trim_start().starts_with("ELSE"))
             .map(|(idx, _)| idx)
             .collect();
 
@@ -47385,7 +47420,7 @@ FROM dept d;"#;
         for expected in [
             "ROUND(19 + (v_product_id * 7.35) + (MOD(v_product_id, 5) * 3.70), 2)",
             "ROUND(0.5 + (v_product_id * 0.13), 2)",
-            "ROUND(19 + (v_prod_id * 7.35) + (MOD(v_prod_id, 5) * 3.70), 2)",
+            "ELSE ROUND(19 + (v_prod_id * 7.35) + (MOD(v_prod_id, 5) * 3.70), 2)",
         ] {
             assert!(
                 contains_line_sequence(&formatted, expected),
