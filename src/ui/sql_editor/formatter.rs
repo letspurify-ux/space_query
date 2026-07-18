@@ -981,7 +981,7 @@ struct RenderedLineInfo {
     starts_with_set: bool,
     starts_with_from: bool,
     ends_with_open_paren: bool,
-    is_create_query_body_header: bool,
+    is_ddl_query_body_header: bool,
     ends_with_value: bool,
     ends_with_join_or_apply: bool,
 }
@@ -1000,10 +1000,8 @@ impl RenderedLineInfo {
         let ends_with_join_or_apply = trailing_identifier.is_some_and(|word| {
             word.eq_ignore_ascii_case("JOIN") || word.eq_ignore_ascii_case("APPLY")
         });
-        let is_create_query_body_header = ends_with_as
-            && !ends_with_open_paren
-            && sql_text::starts_with_keyword_token(trimmed_start, "CREATE")
-            && sql_text::line_is_create_query_body_header(line);
+        let is_ddl_query_body_header =
+            ends_with_as && !ends_with_open_paren && sql_text::line_is_ddl_query_body_header(line);
 
         Self {
             indent: rendered_line_indent(line),
@@ -1011,7 +1009,7 @@ impl RenderedLineInfo {
             starts_with_set: sql_text::starts_with_keyword_token(trimmed_start, "SET"),
             starts_with_from: sql_text::starts_with_keyword_token(trimmed_start, "FROM"),
             ends_with_open_paren,
-            is_create_query_body_header,
+            is_ddl_query_body_header,
             ends_with_value,
             ends_with_join_or_apply,
         }
@@ -3566,11 +3564,28 @@ impl FormatFrameStack {
         }) {}
 
         let structural_parent = self.nearest_structural_child_owner_frame();
+        let query_body_parent_depth = (scope.paren_depth == 0)
+            .then(|| self.query_body_clause_base_depth())
+            .flatten();
         #[cfg(test)]
-        let audit_parent_id = structural_parent.map(|(frame_id, _)| frame_id);
-        let (_owner_depth, depth) = structural_parent
-            .filter(|(_, parent_depth)| depth > parent_depth.saturating_add(1))
-            .map(|(_, parent_depth)| (parent_depth, parent_depth.saturating_add(1)))
+        let query_body_is_effective_parent =
+            query_body_parent_depth.is_some_and(|query_body_depth| {
+                structural_parent
+                    .map(|(_, parent_depth)| query_body_depth > parent_depth)
+                    .unwrap_or(true)
+            });
+        #[cfg(test)]
+        let audit_parent_id = (!query_body_is_effective_parent)
+            .then(|| structural_parent.map(|(frame_id, _)| frame_id))
+            .flatten();
+        let effective_parent_depth = structural_parent
+            .map(|(_, parent_depth)| parent_depth)
+            .into_iter()
+            .chain(query_body_parent_depth)
+            .max();
+        let (_owner_depth, depth) = effective_parent_depth
+            .filter(|parent_depth| depth > parent_depth.saturating_add(1))
+            .map(|parent_depth| (parent_depth, parent_depth.saturating_add(1)))
             .unwrap_or((_owner_depth, depth));
 
         let frame_id = self.next_frame_id();
@@ -12990,16 +13005,16 @@ impl SqlEditorWidget {
                                     && insert_all_branch_indent.is_none()
                                     && matches!(upper, "INTO" | "VALUES"),
                             );
-                            let create_query_body_base_depth =
+                            let ddl_query_body_base_depth =
                                 (crate::sql_text::is_subquery_head_keyword(upper)
                                     && format_stack.paren_is_empty())
                                 .then(|| {
                                     rendered_line_tracker
                                         .active_query_owner_line_info(&out, at_line_start)
                                 })
-                                .filter(|owner_line| owner_line.is_create_query_body_header)
+                                .filter(|owner_line| owner_line.is_ddl_query_body_header)
                                 .map(|owner_line| owner_line.indent.saturating_add(1));
-                            if let Some(base_depth) = create_query_body_base_depth {
+                            if let Some(base_depth) = ddl_query_body_base_depth {
                                 set_query_body_clause_base_depth!(Some(base_depth));
                             }
                             let window_body_header_indent = format_stack
@@ -13399,12 +13414,12 @@ impl SqlEditorWidget {
                         if in_exception_block {
                             let _ = format_stack.set_last_exception_branch_started(false);
                         }
-                        let pending_create_query_body_owner_depth = (upper == "ON")
+                        let pending_ddl_query_body_owner_depth = (upper == "ON")
                             .then(|| rendered_line_tracker.current_line(&out))
                             .filter(|owner_line| {
                                 matches!(
                                     sql_text::format_query_owner_pending_header_kind(owner_line),
-                                    Some(sql_text::PendingFormatQueryOwnerHeaderKind::CreateQueryBody)
+                                    Some(sql_text::PendingFormatQueryOwnerHeaderKind::DdlQueryBody)
                                 )
                             })
                             .map(rendered_line_indent);
@@ -13438,7 +13453,7 @@ impl SqlEditorWidget {
                                 &mut needs_space,
                                 &mut line_indent,
                             );
-                        } else if let Some(owner_depth) = pending_create_query_body_owner_depth {
+                        } else if let Some(owner_depth) = pending_ddl_query_body_owner_depth {
                             set_query_body_clause_base_depth!(Some(owner_depth.saturating_add(1)));
                             newline_with(
                                 &mut out,

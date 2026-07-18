@@ -29070,6 +29070,15 @@ mod mysql_batch_execution_regression_tests {
         }
 
         fn execute(&self, script: &str, db_activity: &str) -> Vec<QueryProgress> {
+            self.execute_with_progress_idle_timeout(script, db_activity, Duration::from_millis(50))
+        }
+
+        fn execute_with_progress_idle_timeout(
+            &self,
+            script: &str,
+            db_activity: &str,
+            progress_idle_timeout: Duration,
+        ) -> Vec<QueryProgress> {
             let (sender, receiver) = mpsc::channel();
             SqlEditorWidget::execute_mysql_batch(
                 &self.shared_connection,
@@ -29098,7 +29107,7 @@ mod mysql_batch_execution_regression_tests {
             );
             drop(sender);
 
-            drain_mysql_progress(receiver)
+            drain_mysql_progress_with_idle_timeout(receiver, progress_idle_timeout)
         }
 
         fn switch_primary_database_to_initial(&self) {
@@ -29543,11 +29552,18 @@ mod mysql_batch_execution_regression_tests {
     }
 
     fn drain_mysql_progress(receiver: mpsc::Receiver<QueryProgress>) -> Vec<QueryProgress> {
+        drain_mysql_progress_with_idle_timeout(receiver, Duration::from_millis(50))
+    }
+
+    fn drain_mysql_progress_with_idle_timeout(
+        receiver: mpsc::Receiver<QueryProgress>,
+        progress_idle_timeout: Duration,
+    ) -> Vec<QueryProgress> {
         let mut progress = Vec::new();
         let mut wait = Duration::from_secs(5);
         while let Ok(message) = receiver.recv_timeout(wait) {
             progress.push(message);
-            wait = Duration::from_millis(50);
+            wait = progress_idle_timeout;
         }
         progress
     }
@@ -29883,6 +29899,83 @@ mod mysql_batch_execution_regression_tests {
                     _ => false,
                 }),
             "manual final script should reach a PASS row\n{progress_summary}"
+        );
+    }
+
+    fn assert_formatted_mysql_fixture_scripts_run_without_errors(
+        db_type: DatabaseType,
+        fixture_dir: &str,
+        expected_fixture_count: usize,
+    ) {
+        let mut fixture_paths = std::fs::read_dir(fixture_dir)
+            .unwrap_or_else(|err| panic!("read {fixture_dir}: {err}"))
+            .filter_map(Result::ok)
+            .map(|entry| entry.path())
+            .filter(|path| {
+                path.extension()
+                    .and_then(|extension| extension.to_str())
+                    .is_some_and(|extension| matches!(extension, "sql" | "txt"))
+            })
+            .collect::<Vec<_>>();
+        fixture_paths.sort();
+        assert_eq!(
+            fixture_paths.len(),
+            expected_fixture_count,
+            "{fixture_dir} fixture inventory changed"
+        );
+
+        let mut failures = Vec::new();
+        for path in fixture_paths {
+            let source = std::fs::read_to_string(&path)
+                .unwrap_or_else(|err| panic!("read {}: {err}", path.display()));
+            let Some(harness) = MysqlSessionRuleHarness::new_for_db_type(true, db_type) else {
+                return;
+            };
+            let formatted = SqlEditorWidget::format_for_auto_formatting_with_db_type(
+                &source,
+                false,
+                Some(db_type),
+            );
+            let path_label = path.to_string_lossy();
+            // Single SELECT fixtures use lazy fetch. Allow a complex first batch
+            // to finish instead of treating the normal 50 ms test idle gap as EOF.
+            let progress = harness.execute_with_progress_idle_timeout(
+                &formatted,
+                path_label.as_ref(),
+                Duration::from_secs(5),
+            );
+            let mut successful_statements = 0usize;
+
+            for message in &progress {
+                if let QueryProgress::StatementFinished { index, result, .. } = message {
+                    if result.success {
+                        successful_statements = successful_statements.saturating_add(1);
+                    } else {
+                        failures.push(format!(
+                            "{}: statement {index} failed: {}",
+                            path.display(),
+                            result.message
+                        ));
+                    }
+                }
+            }
+
+            if successful_statements == 0 {
+                failures.push(format!(
+                    "{}: no successful statement was emitted",
+                    path.display()
+                ));
+            }
+            eprintln!(
+                "formatted live fixture checked: {} ({successful_statements} successful statements)",
+                path.display()
+            );
+        }
+
+        assert!(
+            failures.is_empty(),
+            "formatted {db_type:?} fixture execution failures:\n{}",
+            failures.join("\n")
         );
     }
 
@@ -30717,6 +30810,34 @@ DROP TEMPORARY TABLE IF EXISTS qt_result_route_monitor;
         let progress = harness.execute(&formatted, "formatted mariadb manual final certification");
         assert_no_failed_mysql_statement(&progress);
         assert_mysql_manual_final_status_pass(&progress);
+    }
+
+    #[test]
+    #[ignore = "requires local MySQL 8 and executes every formatted test_mysql fixture"]
+    fn execute_all_formatted_mysql_fixture_scripts_without_errors() {
+        if !mysql_test_server_is_mysql8_or_newer().unwrap_or(false) {
+            eprintln!("skipping: all test_mysql fixtures require MySQL 8 or newer");
+            return;
+        }
+        assert_formatted_mysql_fixture_scripts_run_without_errors(
+            DatabaseType::MySQL,
+            "test_mysql",
+            11,
+        );
+    }
+
+    #[test]
+    #[ignore = "requires local MariaDB and executes every formatted test_mariadb fixture"]
+    fn execute_all_formatted_mariadb_fixture_scripts_without_errors() {
+        if !mysql_test_server_is_mariadb().unwrap_or(false) {
+            eprintln!("skipping: all test_mariadb fixtures require MariaDB");
+            return;
+        }
+        assert_formatted_mysql_fixture_scripts_run_without_errors(
+            DatabaseType::MariaDB,
+            "test_mariadb",
+            13,
+        );
     }
 
     #[test]
@@ -33464,6 +33585,68 @@ mod mysql_transaction_feedback_tests {
             }),
             "Oracle Thin manual final should emit a PASS row; events={}",
             progress.len()
+        );
+    }
+
+    #[test]
+    #[ignore = "requires local Oracle listener and executes every formatted test fixture"]
+    fn oracle_thin_query_tool_runs_all_formatted_fixture_scripts_without_errors() {
+        let mut fixture_paths = std::fs::read_dir("test")
+            .expect("read Oracle fixture directory")
+            .filter_map(Result::ok)
+            .map(|entry| entry.path())
+            .filter(|path| {
+                path.extension()
+                    .and_then(|extension| extension.to_str())
+                    .is_some_and(|extension| matches!(extension, "sql" | "txt"))
+            })
+            .collect::<Vec<_>>();
+        fixture_paths.sort();
+        assert_eq!(fixture_paths.len(), 42, "Oracle fixture inventory changed");
+
+        let mut audit_failures = Vec::new();
+        for path in fixture_paths {
+            let source = std::fs::read_to_string(&path)
+                .unwrap_or_else(|err| panic!("read {}: {err}", path.display()));
+            let formatted = SqlEditorWidget::format_for_auto_formatting_with_db_type(
+                &source,
+                false,
+                Some(DatabaseType::Oracle),
+            );
+            let formatted = oracle_thin_skip_unsupported_implicit_invocations(&formatted);
+            let progress = oracle_thin_run_script_with_auto_commit(&formatted, false);
+            let failures = oracle_thin_progress_failures(&progress);
+            let successful_statements = progress
+                .iter()
+                .filter(|event| {
+                    matches!(
+                        event,
+                        QueryProgress::StatementFinished { result, .. } if result.success
+                    )
+                })
+                .count();
+
+            if successful_statements == 0 {
+                audit_failures.push(format!(
+                    "{}: no successful statement was emitted",
+                    path.display()
+                ));
+            }
+            audit_failures.extend(
+                failures
+                    .into_iter()
+                    .map(|failure| format!("{}: {failure}", path.display())),
+            );
+            eprintln!(
+                "formatted live fixture checked: {} ({successful_statements} successful statements)",
+                path.display()
+            );
+        }
+
+        assert!(
+            audit_failures.is_empty(),
+            "formatted Oracle fixture execution failures:\n{}",
+            audit_failures.join("\n")
         );
     }
 

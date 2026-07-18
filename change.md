@@ -4934,5 +4934,228 @@ item/token·실행 경계를 전수 비교하며 차이 0건.
 | --- | --- |
 | `cargo test --lib formatting_sweep_all_files_generate_out_report -- --ignored --nocapture` | 통과 — 66개 fixture, failures 0 |
 | 포맷 후 Space Query live 실행 | Oracle/MySQL/MariaDB `final.sql` 3개 모두 PASS |
-| `cargo test` | (아래 기록) |
-| `cargo clippy --locked --all-targets -- -D warnings -W clippy::perf -W clippy::complexity` | (아래 기록) |
+| `cargo test` | 통과 — 35-7 최종 통합 실행 기준 6,789 passed · 0 failed · 245 ignored |
+| `cargo clippy --locked --all-targets -- -D warnings -W clippy::perf -W clippy::complexity` | 통과 — 경고 0 |
+
+# 35차: MySQL 계열 VIEW DDL query-body 깊이 일반화 (2026-07-18)
+
+## 35-1. 독립 전수 검토에서 발견한 결함
+
+지정된 ignored sweep은 최초 실행부터 66개 모두 PASS였지만, 생성된
+`.format.out` 66개 53,361줄을 리포트 꼬리까지 다시 정독하던 중 자동 판정이
+놓친 VIEW DDL owner-depth 결함 1종을 찾았다.
+
+AS-IS:
+
+```sql
+ALTER ALGORITHM = UNDEFINED VIEW statement_log_v AS
+SELECT id,
+    category
+FROM statement_log;
+```
+
+`CREATE VIEW`만 DDL query-body owner로 분류하던 규칙 때문에 MySQL의
+`ALTER VIEW`, MariaDB의 `CREATE ... ALGORITHM ... VIEW`와
+`ALTER ... ALGORITHM ... VIEW` 아래 SELECT/FROM이 owner와 같은 깊이였다.
+
+TO-BE:
+
+```sql
+ALTER ALGORITHM = UNDEFINED VIEW statement_log_v AS
+    SELECT id,
+        category
+    FROM statement_log;
+```
+
+VIEW header가 owner depth `d`, 직접 query-body가 `d + 1`이 되어
+`docs/auto_format_rule.md`의 owner/body/close 규칙과 일치한다.
+
+## 35-2. 일반 규칙 수정과 회귀 고정
+
+특정 fixture 문자열을 보정하지 않고 공용 DDL header 분류를
+CREATE/ALTER로 일반화했다. MySQL/MariaDB VIEW 문법의 `ALGORITHM`, `DEFINER`,
+`SQL SECURITY` 선택절을 건너뛴 뒤 `VIEW ... AS`를 판정하며, 기존 Oracle
+VIEW/MATERIALIZED VIEW와 CTAS 판정은 그대로 유지한다. 같은 분류를 formatter와
+Space Query script owner-boundary 판정이 함께 사용한다.
+
+테스트는 구현 전에 `ALTER ALGORITHM = UNDEFINED VIEW`와 선택절이 붙은
+`CREATE VIEW`의 SELECT/FROM 깊이를 assertion으로 추가했고, 기존 코드에서
+실패하는 것을 확인한 뒤 수정했다. 분류 단위 테스트에는 CREATE/ALTER 선택절
+연쇄와 `ALTER TABLE ... AS` 음성 사례를 추가했다.
+
+기존 sweep의 managed-frame 감사만으로는 production 분류가 owner 자체를 놓칠
+때 기대 frame도 함께 사라져 같은 결함을 검출하지 못했다. 이를 독립 보완하도록
+포맷된 statement 토큰에서 CREATE/ALTER VIEW와 CTAS header를 찾고, 다음 query
+head가 정확히 owner + 4칸인지 검사하는 DDL depth 감사를 추가했다. 이 감사는
+production DDL 분류 함수를 호출하지 않는다. SELECT를 owner 깊이에 둔 합성
+출력을 넣으면 `FrameAlignment` 2건을 검출하는 음성 테스트도 고정했다.
+
+새 감사의 query-head 검사를 66개에 적용하자 `test_mysql/test3.txt`의 MySQL
+CTAS 누락도 추가로 발견됐다.
+
+AS-IS:
+
+```sql
+    CREATE TEMPORARY TABLE tmp_step_agg AS
+    SELECT run_id,
+        owner_name
+    FROM tmp_step_tag;
+```
+
+query head를 owner + 1로 옮긴 1차 수정 뒤에도 전수 문서 대조에서 후속 list
+frame이 블록 owner에 눌리는 잔여 결함을 찾았다.
+
+INTERMEDIATE:
+
+```sql
+    CREATE TEMPORARY TABLE tmp_step_agg AS
+        SELECT run_id,
+        owner_name
+        FROM tmp_step_tag
+        GROUP BY run_id,
+        owner_name;
+```
+
+TO-BE:
+
+```sql
+    CREATE TEMPORARY TABLE tmp_step_agg AS
+        SELECT run_id,
+            owner_name
+        FROM tmp_step_tag
+        GROUP BY run_id,
+            owner_name;
+```
+
+공용 DDL 분류가 Oracle의 `GLOBAL/PRIVATE TEMPORARY TABLE`만 처리하고 MySQL의
+직접 `TEMPORARY TABLE`을 놓친 것이 원인이었다. 같은 일반 분류에 이 header를
+추가했다. 1차 수정 뒤에는 DDL query-body가 runtime base-depth로만 존재해,
+프로시저 `BEGIN` block의 structural-parent clamp가 SELECT/FROM/GROUP list frame을
+한 단계 얕게 되돌리고 있었다. top-level DDL query-body base를 합성 structural
+parent depth로 사용해 직접 clause는 body depth, comma 뒤 list sibling은 body + 1
+depth가 되도록 일반화했다.
+
+독립 감사도 production DDL 분류에 의존하지 않은 채 statement span, custom
+delimiter 내부의 같은 괄호 깊이 세미콜론, token paren depth를 조합한다. 이제
+query head뿐 아니라 direct query clause와 top-level comma 뒤 list sibling까지
+검사한다. 합성 누락 출력은 query head 2건과 list sibling 2건을 각각
+`FrameAlignment`로 검출하며, 최종 66개 위반은 0이다.
+
+VIEW 수정 직후 이전 산출물과 전체 디렉터리를 비교하면 바뀐 파일은 정확히
+2개였다.
+
+- `test_mysql/final.sql.format.out`: `ALTER VIEW` body에 4칸 추가
+- `test_mariadb/final.sql.format.out`: 선택절이 있는 CREATE/ALTER VIEW body에
+  각각 4칸 추가
+
+그 밖의 64개 산출물과 토큰·문장 경계에는 변화가 없었다.
+독립 감사 추가 후에는 `test_mysql/test3.txt.format.out` 한 파일만 더 바뀌었다.
+최종적으로 임시 CTAS의 SELECT/FROM/GROUP BY는 owner + 1, 후속 SELECT/GROUP
+list item은 owner + 2 깊이로 이동했으며 종료 뒤 procedure sibling은 원래 block
+깊이로 복귀했다. 그 외 산출물 차이는 없었다.
+
+## 35-3. 재생성 및 전수 검증
+
+| dialect | 파일 | 판독한 줄 |
+| --- | ---: | ---: |
+| Oracle | 42 | 29,228 |
+| MySQL | 11 | 9,859 |
+| MariaDB | 13 | 14,274 |
+| 합계 | 66 | 53,361 |
+
+수정 후 sweep을 다시 실행해 66/66 `status: PASS`, 66/66
+`issues: total=0`을 확인했다. 집계는 regressions=32,
+identifier_case_words=90,165, frames=30,129, boundaries=60,925,
+depth_symmetries=3,422, body_items=27,708,
+closes=15,155, failures=0이다.
+실제 format error marker, 탭, CR은 0건이었다. 후행 공백 3줄은 33-1에서
+확인한 원본 보존 블록 주석뿐이다.
+
+## 35-4. 포맷 이후 Space Query 실제 실행
+
+AS-IS 검증은 dialect별 종합 `final.sql` 3개만 실제 DB에서 실행하고, 나머지는
+splitter의 포맷 전후 item/token/실행 경계 비교로 대신했다. 목표의 "모든
+스크립트"를 엄격히 충족하도록 각 디렉터리의 fixture 전부를 명시적 dialect로
+포맷한 뒤 파일마다 새 Space Query session에서 순차 실행하는 ignored live 감사를
+추가했다. 각 파일은 실패 `StatementFinished`가 0이고 성공 statement가 1개
+이상이어야 한다.
+
+| DB | live 대상 | 성공 statement | 결과 |
+| --- | ---: | ---: | --- |
+| Oracle Free/1521 | 42/42 | 2,612 | PASS |
+| MySQL 8.0/3307 | 11/11 | 377 | PASS |
+| MariaDB 12.2/3306 | 13/13 | 647 | PASS |
+| 합계 | 66/66 | 3,636 | 실패 0 |
+
+재검증 첫 실행에서는 MariaDB의 단일 복합 SELECT fixture인 `test12.txt`가
+실패 event 없이 성공 statement 0개로 잘못 집계됐다. 포맷된 SQL은 정상이었고,
+Space Query의 단일 SELECT lazy-fetch가 첫 결과를 준비하는 동안 테스트 공용
+progress 수집기의 50ms 유휴 제한이 먼저 끝난 것이 원인이었다.
+
+AS-IS: 첫 progress event 뒤 50ms 동안 다음 event가 없으면 전수 live 감사도
+수집을 종료해, 실행 중인 복합 SELECT를 미실행으로 오판할 수 있었다.
+
+TO-BE: 일반 회귀 테스트의 50ms 동작은 유지하고, 모든 fixture를 끝까지 확인하는
+전수 live 감사에서만 유휴 제한을 5초로 늘렸다. 같은 MariaDB 13개를 다시 실행해
+`test12.txt`의 성공 statement 1개와 전체 647개, 실패 0을 확인했고, 이 경로를
+공유하는 MySQL 11개도 377개, 실패 0으로 재검증했다.
+
+추가한 live 감사 테스트는 다음과 같다.
+
+- `oracle_thin_query_tool_runs_all_formatted_fixture_scripts_without_errors`
+- `execute_all_formatted_mysql_fixture_scripts_without_errors`
+- `execute_all_formatted_mariadb_fixture_scripts_without_errors`
+
+기존 종합 `final.sql` 인증 3종도 별도로 모두 최종 PASS evidence까지 도달했다.
+
+## 35-5. [수정] Oracle fixture 반복 실행 cleanup
+
+Oracle 전수 live 감사 첫 실행에서 `final.sql`의 savepoint가 실패한 것은 감사
+하네스가 기존 인증과 달리 auto-commit을 켠 탓이었다. Oracle 감사의 초기
+auto-commit을 `false`로 맞춰 production manual-transaction 조건을 복원했다.
+
+동일 SYSTEM 스키마에서 전수 감사를 반복하자 세 boss fixture의 FK 테이블 cleanup이
+삭제 순서에 따라 부모 테이블을 남기는 문제가 드러났다.
+
+AS-IS:
+
+```sql
+EXECUTE IMMEDIATE 'DROP TABLE ' || r.object_name || ' PURGE';
+```
+
+TO-BE:
+
+```sql
+EXECUTE IMMEDIATE
+    'DROP TABLE ' || r.object_name || ' CASCADE CONSTRAINTS PURGE';
+```
+
+`oracle_format_final_boss_v2.sql`의 명시적 DROP 4곳,
+`oracle_format_ultimate_boss.sql`과 `test20.sql`의 동적 DROP 각 1곳만 보강했다.
+수정 후 같은 42개를 동일 스키마에서 다시 전수 실행해 모두 통과했다. 재생성한
+format 산출물 diff도 이 세 파일의 문자열 6곳만 바뀌었고, 나머지 출력과 전체
+53,361줄 수에는 변화가 없었다.
+
+## 35-6. 변경 파일
+
+- `src/sql_text.rs`: CREATE/ALTER VIEW 선택절과 MySQL `TEMPORARY TABLE AS`를
+  포함하는 DDL query-body header 공용 분류.
+- `src/ui/sql_editor/formatter.rs`: 공용 DDL owner 판정을 query-body depth에 적용.
+- `src/db/query/script.rs`: script owner-boundary 판정도 같은 공용 분류 사용.
+- `src/ui/sql_editor/format_sweep_tests.rs`: 독립 DDL owner/body 감사와
+  CREATE/ALTER VIEW·TEMPORARY CTAS 깊이 회귀 assertion.
+- `src/ui/sql_editor/execution.rs`: 66개 포맷 fixture 전수 live 감사 테스트와
+  단일 SELECT lazy-fetch 완료 대기.
+- `test/oracle_format_final_boss_v2.sql`, `test/oracle_format_ultimate_boss.sql`,
+  `test/test20.sql`: FK-safe 반복 cleanup.
+- `change.md`: 본 AS-IS/TO-BE와 검증 기록.
+
+## 35-7. 최종 품질 게이트
+
+| 검증 | 결과 |
+| --- | --- |
+| `cargo test --lib formatting_sweep_all_files_generate_out_report -- --ignored --nocapture` | 통과 — 66개 fixture + 32개 회귀, failures 0 |
+| 포맷 후 Space Query live 실행 | 66/66 fixture, 3,636 successful statements, 실패 0 |
+| `cargo test` | 통과 — 전 타깃 합계 6,789 passed · 0 failed · 245 ignored |
+| `cargo clippy --locked --all-targets -- -D warnings -W clippy::perf -W clippy::complexity` | 통과 — 경고 0 |
+| `cargo fmt --all -- --check` / `git diff --check` | 통과 |

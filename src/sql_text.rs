@@ -5160,20 +5160,73 @@ pub(crate) fn line_is_mysql_on_duplicate_key_update_clause(line: &str) -> bool {
     line_starts_with_identifier_sequence(structural_tail, &["ON", "DUPLICATE", "KEY", "UPDATE"])
 }
 
-/// Returns true when a CREATE query-body DDL header line owns the following
-/// query body through a trailing `AS`.
-fn line_starts_create_query_body_header_prefix(line: &str) -> bool {
+fn identifier_words_start_mysql_view_header(words: &[&str], mut idx: usize) -> bool {
+    while idx < words.len() {
+        let word = words[idx];
+        if word.eq_ignore_ascii_case("VIEW") {
+            return true;
+        }
+
+        if word.eq_ignore_ascii_case("ALGORITHM") {
+            idx = idx.saturating_add(1);
+            if !words.get(idx).is_some_and(|value| {
+                matches!(
+                    value.to_ascii_uppercase().as_str(),
+                    "UNDEFINED" | "MERGE" | "TEMPTABLE"
+                )
+            }) {
+                return false;
+            }
+            idx = idx.saturating_add(1);
+            continue;
+        }
+
+        if word.eq_ignore_ascii_case("DEFINER") {
+            idx = idx.saturating_add(1);
+            while idx < words.len()
+                && !words[idx].eq_ignore_ascii_case("SQL")
+                && !words[idx].eq_ignore_ascii_case("VIEW")
+            {
+                idx = idx.saturating_add(1);
+            }
+            continue;
+        }
+
+        if word.eq_ignore_ascii_case("SQL")
+            && words
+                .get(idx.saturating_add(1))
+                .is_some_and(|word| word.eq_ignore_ascii_case("SECURITY"))
+            && words.get(idx.saturating_add(2)).is_some_and(|word| {
+                word.eq_ignore_ascii_case("DEFINER") || word.eq_ignore_ascii_case("INVOKER")
+            })
+        {
+            idx = idx.saturating_add(3);
+            continue;
+        }
+
+        return false;
+    }
+
+    false
+}
+
+/// Returns true when a CREATE/ALTER query-body DDL header line owns the
+/// following query body through a trailing `AS`.
+fn line_starts_ddl_query_body_header_prefix(line: &str) -> bool {
     let structural_tail = owner_header_structural_tail(line);
-    let words = meaningful_identifier_words_before_inline_comment(structural_tail, 8);
-    if !words
+    let words = meaningful_identifier_words_before_inline_comment(structural_tail, 32);
+    let starts_create = words
         .first()
-        .is_some_and(|word| word.eq_ignore_ascii_case("CREATE"))
-    {
+        .is_some_and(|word| word.eq_ignore_ascii_case("CREATE"));
+    let starts_alter = words
+        .first()
+        .is_some_and(|word| word.eq_ignore_ascii_case("ALTER"));
+    if !starts_create && !starts_alter {
         return false;
     }
     let mut idx = 1usize;
 
-    while idx < words.len() {
+    while starts_create && idx < words.len() {
         match words.get(idx).copied() {
             Some(word)
                 if word.eq_ignore_ascii_case("OR")
@@ -5203,11 +5256,12 @@ fn line_starts_create_query_body_header_prefix(line: &str) -> bool {
         }
     }
 
-    if words
-        .get(idx)
-        .is_some_and(|word| word.eq_ignore_ascii_case("VIEW"))
-    {
+    if identifier_words_start_mysql_view_header(&words, idx) {
         return true;
+    }
+
+    if starts_alter {
+        return false;
     }
 
     if words
@@ -5227,6 +5281,16 @@ fn line_starts_create_query_body_header_prefix(line: &str) -> bool {
         return true;
     }
 
+    if words
+        .get(idx)
+        .is_some_and(|word| word.eq_ignore_ascii_case("TEMPORARY"))
+        && words
+            .get(idx + 1)
+            .is_some_and(|word| word.eq_ignore_ascii_case("TABLE"))
+    {
+        return true;
+    }
+
     words
         .get(idx)
         .is_some_and(|word| matches!(word.to_ascii_uppercase().as_str(), "GLOBAL" | "PRIVATE"))
@@ -5238,16 +5302,16 @@ fn line_starts_create_query_body_header_prefix(line: &str) -> bool {
             .is_some_and(|word| word.eq_ignore_ascii_case("TABLE"))
 }
 
-fn line_completes_create_query_body_pending_header(line: &str) -> bool {
+fn line_completes_ddl_query_body_pending_header(line: &str) -> bool {
     let structural_tail = owner_header_structural_tail(line);
     !structural_tail.is_empty()
         && !line_ends_with_open_paren_before_inline_comment(structural_tail)
         && line_ends_with_keyword(structural_tail, "AS")
 }
 
-pub(crate) fn line_is_create_query_body_header(line: &str) -> bool {
-    line_starts_create_query_body_header_prefix(line)
-        && line_completes_create_query_body_pending_header(line)
+pub(crate) fn line_is_ddl_query_body_header(line: &str) -> bool {
+    line_starts_ddl_query_body_header_prefix(line)
+        && line_completes_ddl_query_body_pending_header(line)
 }
 
 pub(crate) fn line_starts_query_head(trimmed_upper: &str) -> bool {
@@ -5290,7 +5354,7 @@ pub(crate) enum PendingFormatQueryOwnerHeaderKind {
     ReferenceOn,
     JoinLike,
     ConditionNot,
-    CreateQueryBody,
+    DdlQueryBody,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -5387,7 +5451,7 @@ impl PendingFormatQueryOwnerHeaderKind {
                     || line_ends_with_keyword(structural_tail, "IN"))
                 .then_some(FormatQueryOwnerKind::Condition)
             }
-            Self::CreateQueryBody => self
+            Self::DdlQueryBody => self
                 .line_completes(line)
                 .then_some(FormatQueryOwnerKind::DdlBody),
         }
@@ -5402,7 +5466,7 @@ impl PendingFormatQueryOwnerHeaderKind {
                     || line_ends_with_keyword(structural_tail, "APPLY")
             }
             Self::ConditionNot => self.owner_kind_for_line(line).is_some(),
-            Self::CreateQueryBody => line_completes_create_query_body_pending_header(line),
+            Self::DdlQueryBody => line_completes_ddl_query_body_pending_header(line),
         }
     }
 
@@ -5420,7 +5484,7 @@ impl PendingFormatQueryOwnerHeaderKind {
             // Everything else must terminate the pending header immediately.
             Self::JoinLike => starts_with_pending_query_owner_join_modifier(&trimmed_upper),
             Self::ConditionNot => self.line_completes(line),
-            Self::CreateQueryBody => {
+            Self::DdlQueryBody => {
                 if structural_tail.is_empty() {
                     return owner_header_has_only_leading_close_parens(line);
                 }
@@ -5466,7 +5530,7 @@ impl PendingFormatQueryOwnerHeaderKind {
                 .header_depth_floor(query_base_depth, condition_header_depth)
                 .map(|depth_floor| current_depth.max(depth_floor))
                 .unwrap_or(current_depth),
-            Self::CreateQueryBody => current_depth,
+            Self::DdlQueryBody => current_depth,
         }
     }
 }
@@ -5659,11 +5723,11 @@ pub(crate) fn format_query_owner_pending_header_kind(
 ) -> Option<PendingFormatQueryOwnerHeaderKind> {
     let structural_tail = owner_header_structural_tail(line);
     let trimmed_upper = structural_tail.to_ascii_uppercase();
-    if line_starts_create_query_body_header_prefix(structural_tail)
-        && !line_completes_create_query_body_pending_header(structural_tail)
+    if line_starts_ddl_query_body_header_prefix(structural_tail)
+        && !line_completes_ddl_query_body_pending_header(structural_tail)
         && !line_ends_with_semicolon_before_inline_comment(structural_tail)
     {
-        return Some(PendingFormatQueryOwnerHeaderKind::CreateQueryBody);
+        return Some(PendingFormatQueryOwnerHeaderKind::DdlQueryBody);
     }
 
     if line_starts_with_identifier_sequence(structural_tail, &["REFERENCE"])
@@ -6495,7 +6559,7 @@ pub(crate) fn starts_with_format_model_multiline_owner_tail(text_upper: &str) ->
 pub(crate) fn format_query_owner_header_kind(line: &str) -> Option<FormatQueryOwnerKind> {
     let structural_tail = owner_header_structural_tail(line);
 
-    if line_is_create_query_body_header(structural_tail) {
+    if line_is_ddl_query_body_header(structural_tail) {
         return Some(FormatQueryOwnerKind::DdlBody);
     }
 
@@ -11344,7 +11408,7 @@ mod tests {
     }
 
     #[test]
-    fn format_query_owner_pending_header_kind_tracks_split_create_query_body_headers() {
+    fn format_query_owner_pending_header_kind_tracks_split_ddl_query_body_headers() {
         let ddl_pending = format_query_owner_pending_header_kind(
             "CREATE MATERIALIZED VIEW mv_sales_dashboard BUILD DEFERRED REFRESH FAST",
         )
@@ -11363,32 +11427,40 @@ mod tests {
     }
 
     #[test]
-    fn create_query_body_header_detects_view_and_ctas_headers() {
-        assert!(line_is_create_query_body_header(
+    fn ddl_query_body_header_detects_view_ctas_and_alter_view_headers() {
+        assert!(line_is_ddl_query_body_header(
             "CREATE OR REPLACE VIEW v_demo AS"
         ));
-        assert!(line_is_create_query_body_header(
+        assert!(line_is_ddl_query_body_header(
             "CREATE/* gap */OR/* gap */REPLACE/* gap */VIEW \"v_demo\" AS"
         ));
-        assert!(line_is_create_query_body_header(
+        assert!(line_is_ddl_query_body_header(
+            "CREATE OR REPLACE ALGORITHM = MERGE DEFINER = root SQL SECURITY INVOKER VIEW v_demo AS"
+        ));
+        assert!(line_is_ddl_query_body_header(
+            "ALTER ALGORITHM = UNDEFINED VIEW v_demo AS"
+        ));
+        assert!(line_is_ddl_query_body_header(
             "CREATE MATERIALIZED VIEW mv_demo AS"
         ));
-        assert!(line_is_create_query_body_header("CREATE TABLE t_demo AS"));
-        assert!(line_is_create_query_body_header(
+        assert!(line_is_ddl_query_body_header("CREATE TABLE t_demo AS"));
+        assert!(line_is_ddl_query_body_header(
+            "CREATE TEMPORARY TABLE t_demo AS"
+        ));
+        assert!(line_is_ddl_query_body_header(
             "CREATE GLOBAL TEMPORARY TABLE t_demo AS"
         ));
-        assert!(line_is_create_query_body_header(
+        assert!(line_is_ddl_query_body_header(
             "CREATE/* gap */GLOBAL/* gap */TEMPORARY/* gap */TABLE \"t demo\" AS"
         ));
-        assert!(line_is_create_query_body_header(
+        assert!(line_is_ddl_query_body_header(
             "CREATE PRIVATE TEMPORARY TABLE ora$ptt_demo AS"
         ));
-        assert!(!line_is_create_query_body_header(
+        assert!(!line_is_ddl_query_body_header(
             "CREATE TABLE t_demo (id NUMBER)"
         ));
-        assert!(!line_is_create_query_body_header(
-            "CREATE PACKAGE pkg_demo AS"
-        ));
+        assert!(!line_is_ddl_query_body_header("CREATE PACKAGE pkg_demo AS"));
+        assert!(!line_is_ddl_query_body_header("ALTER TABLE v_demo AS"));
     }
 
     #[test]

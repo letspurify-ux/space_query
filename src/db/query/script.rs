@@ -4886,7 +4886,7 @@ impl QueryExecutor {
     fn line_ends_with_keyword_before_inline_comment_owns_query(line: &str) -> bool {
         !Self::line_ends_with_open_paren_before_inline_comment(line)
             && (sql_text::format_query_owner_header_kind(line).is_some()
-                || sql_text::line_is_create_query_body_header(line))
+                || sql_text::line_is_ddl_query_body_header(line))
     }
 
     fn mysql_handler_line_starts_body_keyword(word_upper: &str) -> bool {

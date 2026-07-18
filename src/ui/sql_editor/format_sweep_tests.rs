@@ -584,6 +584,218 @@ fn format_sweep_audit_first_pass(
     (checked_lines, document.safe_gap_count(), issues)
 }
 
+fn format_sweep_audit_ddl_query_body_depth(
+    formatted: &str,
+    db_type: DatabaseType,
+) -> (usize, Vec<FormatSweepIssue>) {
+    let lines = formatted.lines().collect::<Vec<_>>();
+    let line_starts = line_start_offsets(formatted);
+    let document = FormatSweepDocument::new(formatted, db_type);
+    let mut words_by_line = vec![Vec::<&str>::new(); lines.len()];
+    let mut first_word_paren_depth_by_line = vec![None; lines.len()];
+    let mut first_word_statement_index_by_line = vec![None; lines.len()];
+    let mut trailing_comma_paren_depth_by_line = vec![None; lines.len()];
+    let mut trailing_semicolon_paren_depth_by_line = vec![None; lines.len()];
+    let mut line_idx = 0usize;
+    let mut paren_depth = 0usize;
+
+    for token in &document.tokens {
+        while line_idx + 1 < line_starts.len() && line_starts[line_idx + 1] <= token.start {
+            line_idx = line_idx.saturating_add(1);
+        }
+        if matches!(&token.token, SqlToken::Symbol(symbol) if symbol == ")") {
+            paren_depth = paren_depth.saturating_sub(1);
+        }
+        if let SqlToken::Word(word) = &token.token {
+            if let Some(words) = words_by_line.get_mut(line_idx) {
+                if words.is_empty() {
+                    first_word_paren_depth_by_line[line_idx] = Some(paren_depth);
+                    first_word_statement_index_by_line[line_idx] = Some(token.statement_index);
+                }
+                words.push(word);
+            }
+        }
+        if !matches!(token.token, SqlToken::Comment(_)) {
+            trailing_comma_paren_depth_by_line[line_idx] =
+                matches!(&token.token, SqlToken::Symbol(symbol) if symbol == ",")
+                    .then_some(paren_depth);
+            trailing_semicolon_paren_depth_by_line[line_idx] =
+                matches!(&token.token, SqlToken::Symbol(symbol) if symbol == ";")
+                    .then_some(paren_depth);
+        }
+        if matches!(&token.token, SqlToken::Symbol(symbol) if symbol == "(") {
+            paren_depth = paren_depth.saturating_add(1);
+        }
+    }
+
+    let mut checked = 0usize;
+    let mut issues = Vec::new();
+    let is_direct_query_clause = |words: &[&str]| {
+        words.first().is_some_and(|word| {
+            matches!(
+                word.to_ascii_uppercase().as_str(),
+                "SELECT"
+                    | "WITH"
+                    | "VALUES"
+                    | "TABLE"
+                    | "FROM"
+                    | "WHERE"
+                    | "GROUP"
+                    | "HAVING"
+                    | "ORDER"
+                    | "LIMIT"
+                    | "WINDOW"
+                    | "UNION"
+                    | "INTERSECT"
+                    | "EXCEPT"
+                    | "QUALIFY"
+                    | "MODEL"
+                    | "FETCH"
+                    | "OFFSET"
+                    | "INTO"
+                    | "FOR"
+                    | "CONNECT"
+                    | "START"
+            )
+        })
+    };
+    for (header_idx, header_words) in words_by_line.iter().enumerate() {
+        let Some(first_word) = header_words.first() else {
+            continue;
+        };
+        if !header_words
+            .last()
+            .is_some_and(|word| word.eq_ignore_ascii_case("AS"))
+        {
+            continue;
+        }
+        let starts_create = first_word.eq_ignore_ascii_case("CREATE");
+        let starts_alter = first_word.eq_ignore_ascii_case("ALTER");
+        let contains_view = header_words
+            .iter()
+            .any(|word| word.eq_ignore_ascii_case("VIEW"));
+        let contains_table = header_words
+            .iter()
+            .any(|word| word.eq_ignore_ascii_case("TABLE"));
+        if !((starts_create && (contains_view || contains_table))
+            || (starts_alter && contains_view))
+        {
+            continue;
+        }
+
+        let Some(body_idx) = (header_idx.saturating_add(1)..words_by_line.len())
+            .find(|idx| !words_by_line[*idx].is_empty())
+        else {
+            continue;
+        };
+        if !words_by_line[body_idx].first().is_some_and(|word| {
+            matches!(
+                word.to_ascii_uppercase().as_str(),
+                "SELECT" | "WITH" | "VALUES" | "TABLE"
+            )
+        }) {
+            continue;
+        }
+
+        checked = checked.saturating_add(1);
+        let owner_depth = leading_spaces(lines[header_idx]);
+        let actual_body_depth = leading_spaces(lines[body_idx]);
+        let expected_body_depth = owner_depth.saturating_add(FORMAT_SWEEP_INDENT_WIDTH);
+        if actual_body_depth != expected_body_depth {
+            let offset = line_starts
+                .get(body_idx)
+                .copied()
+                .unwrap_or(0)
+                .saturating_add(actual_body_depth);
+            issues.push(FormatSweepIssue::new(
+                FormatSweepIssueKind::FrameAlignment,
+                formatted,
+                offset,
+                format!(
+                    "DDL query body depth {actual_body_depth} must equal owner depth {owner_depth} + {FORMAT_SWEEP_INDENT_WIDTH}"
+                ),
+            ));
+        }
+
+        let query_paren_depth = first_word_paren_depth_by_line[body_idx].unwrap_or(0);
+        let statement_span_end_idx = first_word_statement_index_by_line[body_idx]
+            .and_then(|statement_index| document.statements.get(statement_index))
+            .map(|statement| {
+                line_starts
+                    .partition_point(|line_start| *line_start < statement.end)
+                    .saturating_sub(1)
+                    .min(words_by_line.len().saturating_sub(1))
+            })
+            .unwrap_or(body_idx);
+        let statement_end_idx = (body_idx..=statement_span_end_idx)
+            .find(|idx| trailing_semicolon_paren_depth_by_line[*idx] == Some(query_paren_depth))
+            .unwrap_or(statement_span_end_idx);
+
+        for clause_idx in body_idx.saturating_add(1)..=statement_end_idx {
+            if first_word_paren_depth_by_line[clause_idx] != Some(query_paren_depth)
+                || !is_direct_query_clause(&words_by_line[clause_idx])
+            {
+                continue;
+            }
+            checked = checked.saturating_add(1);
+            let actual_clause_depth = leading_spaces(lines[clause_idx]);
+            if actual_clause_depth != expected_body_depth {
+                let offset = line_starts
+                    .get(clause_idx)
+                    .copied()
+                    .unwrap_or(0)
+                    .saturating_add(actual_clause_depth);
+                issues.push(FormatSweepIssue::new(
+                    FormatSweepIssueKind::FrameAlignment,
+                    formatted,
+                    offset,
+                    format!(
+                        "DDL query direct clause depth {actual_clause_depth} must equal query body depth {expected_body_depth}"
+                    ),
+                ));
+            }
+        }
+
+        for (comma_idx, trailing_comma_paren_depth) in trailing_comma_paren_depth_by_line
+            .iter()
+            .enumerate()
+            .take(statement_end_idx)
+            .skip(body_idx)
+        {
+            if *trailing_comma_paren_depth != Some(query_paren_depth) {
+                continue;
+            }
+            let Some(sibling_idx) = (comma_idx.saturating_add(1)..=statement_end_idx).find(|idx| {
+                first_word_paren_depth_by_line[*idx] == Some(query_paren_depth)
+                    && !words_by_line[*idx].is_empty()
+            }) else {
+                continue;
+            };
+            checked = checked.saturating_add(1);
+            let actual_sibling_depth = leading_spaces(lines[sibling_idx]);
+            let expected_sibling_depth =
+                expected_body_depth.saturating_add(FORMAT_SWEEP_INDENT_WIDTH);
+            if actual_sibling_depth != expected_sibling_depth {
+                let offset = line_starts
+                    .get(sibling_idx)
+                    .copied()
+                    .unwrap_or(0)
+                    .saturating_add(actual_sibling_depth);
+                issues.push(FormatSweepIssue::new(
+                    FormatSweepIssueKind::FrameAlignment,
+                    formatted,
+                    offset,
+                    format!(
+                        "DDL query list sibling depth {actual_sibling_depth} must equal query body depth {expected_body_depth} + {FORMAT_SWEEP_INDENT_WIDTH}"
+                    ),
+                ));
+            }
+        }
+    }
+
+    (checked, issues)
+}
+
 fn format_sweep_audit_token_count(
     source: &str,
     formatted: &str,
@@ -1018,6 +1230,9 @@ fn format_sweep_run(source: &str, db_type: DatabaseType) -> FormatSweepRun {
 
     let (checked_lines, checked_gaps, mut issues) =
         format_sweep_audit_first_pass(&formatted, db_type);
+    let (checked_ddl_query_body_depths, ddl_query_body_depth_issues) =
+        format_sweep_audit_ddl_query_body_depth(&formatted, db_type);
+    issues.extend(ddl_query_body_depth_issues);
     issues.extend(frame_alignment_audit.issues.into_iter().map(|issue| {
         FormatSweepIssue::new(
             FormatSweepIssueKind::FrameAlignment,
@@ -1109,7 +1324,9 @@ fn format_sweep_run(source: &str, db_type: DatabaseType) -> FormatSweepRun {
         checked_identifier_case_words,
         checked_frames: frame_alignment_audit.checked_frames,
         checked_frame_boundaries: frame_alignment_audit.checked_frame_boundaries,
-        checked_frame_depth_symmetries: frame_alignment_audit.checked_frame_depth_symmetries,
+        checked_frame_depth_symmetries: frame_alignment_audit
+            .checked_frame_depth_symmetries
+            .saturating_add(checked_ddl_query_body_depths),
         checked_frame_body_items: frame_alignment_audit.checked_body_items,
         checked_frame_closes: frame_alignment_audit.checked_closes,
         managed_frame_kinds: frame_alignment_audit.managed_frame_kinds,
@@ -1538,6 +1755,22 @@ fn formatting_sweep_mysql_view_algorithm_and_event_body_keep_owners() {
     let source = r#"CREATE OR REPLACE ALGORITHM = MERGE VIEW statement_log_v AS
 SELECT id FROM statement_log;
 
+ALTER ALGORITHM = UNDEFINED VIEW statement_log_v AS
+SELECT id FROM statement_log;
+
+CREATE TEMPORARY TABLE tmp_statement_log AS
+SELECT id FROM statement_log;
+
+DELIMITER $$
+CREATE PROCEDURE build_tmp_statement_log()
+BEGIN
+CREATE TEMPORARY TABLE nested_tmp_statement_log AS
+SELECT id, category
+FROM statement_log
+GROUP BY id, category;
+END$$
+DELIMITER ;
+
 CREATE EVENT syntax_event
   ON SCHEDULE AT CURRENT_TIMESTAMP + INTERVAL 1 DAY
   ON COMPLETION PRESERVE DISABLE
@@ -1553,9 +1786,31 @@ CREATE EVENT syntax_event
             run.formatted
         );
         assert!(
+            run.formatted.contains(
+                "CREATE OR REPLACE ALGORITHM = MERGE VIEW statement_log_v AS\n    SELECT id\n    FROM statement_log;"
+            ),
+            "{db_type:?} CREATE VIEW query body lost its DDL owner depth:\n{}",
             run.formatted
-                .contains("CREATE OR REPLACE ALGORITHM = MERGE VIEW statement_log_v AS"),
-            "{db_type:?} view algorithm value was treated as MERGE DML:\n{}",
+        );
+        assert!(
+            run.formatted.contains(
+                "ALTER ALGORITHM = UNDEFINED VIEW statement_log_v AS\n    SELECT id\n    FROM statement_log;"
+            ),
+            "{db_type:?} ALTER VIEW query body lost its DDL owner depth:\n{}",
+            run.formatted
+        );
+        assert!(
+            run.formatted.contains(
+                "CREATE TEMPORARY TABLE tmp_statement_log AS\n    SELECT id\n    FROM statement_log;"
+            ),
+            "{db_type:?} TEMPORARY TABLE query body lost its DDL owner depth:\n{}",
+            run.formatted
+        );
+        assert!(
+            run.formatted.contains(
+                "    CREATE TEMPORARY TABLE nested_tmp_statement_log AS\n        SELECT id,\n            category\n        FROM statement_log\n        GROUP BY id,\n            category;"
+            ),
+            "{db_type:?} nested TEMPORARY TABLE query frames lost their DDL owner depth:\n{}",
             run.formatted
         );
         assert!(
@@ -1565,6 +1820,45 @@ CREATE EVENT syntax_event
             "{db_type:?} event DO statement lost its CREATE EVENT body depth:\n{}",
             run.formatted
         );
+    }
+}
+
+#[test]
+fn formatting_sweep_ddl_query_body_depth_audit_flags_missing_owner_depth() {
+    let missing_depth = "CREATE OR REPLACE ALGORITHM = MERGE VIEW v_demo AS\nSELECT id FROM t;\nALTER ALGORITHM = UNDEFINED VIEW v_demo AS\nSELECT id FROM t;";
+    let owner_depth = "CREATE OR REPLACE ALGORITHM = MERGE VIEW v_demo AS\n    SELECT id FROM t;\nALTER ALGORITHM = UNDEFINED VIEW v_demo AS\n    SELECT id FROM t;";
+    let missing_list_depth = "    CREATE TEMPORARY TABLE tmp_demo AS\n        SELECT id,\n        category\n        FROM t\n        GROUP BY id,\n        category;";
+    let complete_depth = "    CREATE TEMPORARY TABLE tmp_demo AS\n        SELECT id,\n            category\n        FROM t\n        GROUP BY id,\n            category;";
+
+    for db_type in [DatabaseType::MySQL, DatabaseType::MariaDB] {
+        let (checked, issues) = format_sweep_audit_ddl_query_body_depth(missing_depth, db_type);
+        assert_eq!(checked, 2);
+        assert_eq!(issues.len(), 2, "{db_type:?}: {issues:#?}");
+        assert!(
+            issues
+                .iter()
+                .all(|issue| issue.kind == FormatSweepIssueKind::FrameAlignment),
+            "{db_type:?}: {issues:#?}"
+        );
+
+        let (checked, issues) = format_sweep_audit_ddl_query_body_depth(owner_depth, db_type);
+        assert_eq!(checked, 2);
+        assert!(issues.is_empty(), "{db_type:?}: {issues:#?}");
+
+        let (checked, issues) =
+            format_sweep_audit_ddl_query_body_depth(missing_list_depth, db_type);
+        assert_eq!(checked, 5);
+        assert_eq!(issues.len(), 2, "{db_type:?}: {issues:#?}");
+        assert!(
+            issues
+                .iter()
+                .all(|issue| issue.kind == FormatSweepIssueKind::FrameAlignment),
+            "{db_type:?}: {issues:#?}"
+        );
+
+        let (checked, issues) = format_sweep_audit_ddl_query_body_depth(complete_depth, db_type);
+        assert_eq!(checked, 5);
+        assert!(issues.is_empty(), "{db_type:?}: {issues:#?}");
     }
 }
 
