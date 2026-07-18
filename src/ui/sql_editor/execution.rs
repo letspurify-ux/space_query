@@ -1356,7 +1356,7 @@ impl QueryExecutionCleanupGuard {
         current_session_may_have_uncommitted_work: bool,
         action: &str,
     ) -> Result<(), String> {
-        crate::db::DatabaseConnection::ensure_retained_session_option_change_allowed(
+        SqlEditorWidget::ensure_oracle_retained_state_option_change_allowed(
             self.oracle_current_retained_state(current_session_may_have_uncommitted_work),
             action,
         )
@@ -18175,11 +18175,27 @@ impl SqlEditorWidget {
         live_may_have_uncommitted_work: bool,
         action: &str,
     ) -> Result<(), String> {
-        crate::db::DatabaseConnection::ensure_retained_session_option_change_allowed(
+        Self::ensure_oracle_retained_state_option_change_allowed(
             Self::oracle_retained_state_for_option_change(
                 prior_retained_state,
                 live_may_have_uncommitted_work,
             ),
+            action,
+        )
+    }
+
+    fn ensure_oracle_retained_state_option_change_allowed(
+        retained_state: RetainedSessionState,
+        action: &str,
+    ) -> Result<(), String> {
+        if retained_state.transaction_state() == TransactionSessionState::Clean
+            && !retained_state.may_hold_session_lock()
+            && !retained_state.may_have_transaction_mode_override()
+        {
+            return Ok(());
+        }
+        crate::db::DatabaseConnection::ensure_retained_session_option_change_allowed(
+            retained_state,
             action,
         )
     }
@@ -22234,6 +22250,26 @@ mod query_execution_cleanup_tests {
             )
             .is_ok(),
             "clean session residue should not block Oracle transaction mode changes"
+        );
+    }
+
+    #[test]
+    fn oracle_statement_transaction_option_change_allows_clean_unknown_session_residue() {
+        let effects =
+            crate::db::statement_session_post_processor_for(crate::db::DatabaseType::Oracle)
+                .effects_for_sql("SET TRANSACTION READ WRITE NAME 'sq-oracle-final'");
+        let prior = RetainedSessionState::from_parts(
+            TransactionSessionState::Clean,
+            SessionResidueState::new(true),
+            SessionLockState::default(),
+        );
+
+        assert!(
+            SqlEditorWidget::ensure_oracle_statement_transaction_option_change_allowed(
+                prior, effects, false,
+            )
+            .is_ok(),
+            "clean Oracle session residue must not block SET TRANSACTION"
         );
     }
 

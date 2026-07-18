@@ -112,7 +112,7 @@ impl OracleThinSessionPool {
                 return Err(OracleThinError::new("Oracle thin pool is closed"));
             }
 
-            while let Some(conn) = guard.idle.pop_front() {
+            while let Some(conn) = guard.idle.pop_back() {
                 drop(guard);
                 let mut conn = conn;
                 let healthy = conn.is_healthy();
@@ -220,7 +220,7 @@ fn acquire_from_pool<T: PoolableConnection>(
             return Err(OracleThinError::new("Oracle thin pool is closed"));
         }
 
-        while let Some(conn) = guard.idle.pop_front() {
+        while let Some(conn) = guard.idle.pop_back() {
             drop(guard);
             let mut conn = conn;
             let healthy = conn.is_healthy();
@@ -367,5 +367,18 @@ impl<T: PoolableConnection> Deref for PooledThinConnection<T> {
 impl<T: PoolableConnection> DerefMut for PooledThinConnection<T> {
     fn deref_mut(&mut self) -> &mut Self::Target {
         &mut self.conn
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::PoolOptions;
+    use std::time::Duration;
+
+    #[test]
+    fn python_oracledb_2400_pool_defaults_are_stable() {
+        let options = PoolOptions::default();
+        assert_eq!(options.max_size, 4);
+        assert_eq!(options.acquire_timeout, Duration::from_secs(5));
     }
 }

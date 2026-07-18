@@ -7,6 +7,7 @@
 )]
 
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -17,10 +18,24 @@ use tns_thin::exec::{
 use tns_thin::pool::PoolOptions;
 use tns_thin::{
     ConnectTarget, OracleDateTime, OracleNetServerType, OracleThinAppContext, OracleThinConfig,
-    OracleThinSession, OracleThinSessionPool,
+    OracleThinEndUserSecurityContext, OracleThinSession, OracleThinSessionPool,
 };
 
 static OBJECT_COUNTER: AtomicUsize = AtomicUsize::new(1);
+
+// Upstream mapping: python-oracledb test_1100.
+#[test]
+#[ignore = "requires local Oracle listener via ORACLE_THIN_TEST_* environment variables"]
+fn python_oracledb_1100_simple_connection_metadata() {
+    let config = live_config();
+    let expected_username = config.username.clone();
+    let expected_target = config.target.clone();
+
+    let conn = connect_with_config(config);
+
+    assert_eq!(conn.username(), expected_username);
+    assert_eq!(conn.connect_target(), &expected_target);
+}
 
 #[test]
 #[ignore = "requires local Oracle listener via ORACLE_THIN_TEST_* environment variables"]
@@ -283,6 +298,536 @@ fn app_context_auth_metadata_is_visible_like_python_oracledb() {
             "{namespace}.{name} should match application context value",
         );
     }
+}
+
+#[test]
+#[ignore = "requires local Oracle listener via ORACLE_THIN_TEST_* environment variables"]
+fn python_oracledb_1106_bad_password_is_rejected() {
+    let mut config = live_config();
+    config.password.push_str("_definitely_wrong");
+
+    let error = OracleThinSession::connect(config).expect_err("bad password should be rejected");
+
+    assert!(
+        error.to_string().contains("ORA-01017"),
+        "unexpected bad password error: {error}"
+    );
+}
+
+#[test]
+#[ignore = "requires local Oracle listener via ORACLE_THIN_TEST_* environment variables"]
+fn python_oracledb_1107_change_password_and_reconnect() {
+    let base_config = live_config();
+    let username = unique_object_name("PW_USER");
+    let original_password = "SqOriginalPassword1";
+    let new_password = "SqChangedPassword2";
+    let _guard = TestUserDropGuard::create(&base_config, &username, original_password);
+    let mut conn =
+        connect_with_config(test_user_config(&base_config, &username, original_password));
+
+    conn.change_password(original_password, new_password)
+        .expect("change isolated test user password");
+    conn.close().expect("close password change session");
+
+    let mut reconnected =
+        connect_with_config(test_user_config(&base_config, &username, new_password));
+    reconnected.ping().expect("connect using changed password");
+}
+
+#[test]
+#[ignore = "requires local Oracle listener via ORACLE_THIN_TEST_* environment variables"]
+fn python_oracledb_1108_invalid_password_change_is_rejected() {
+    let base_config = live_config();
+    let username = unique_object_name("PW_BAD");
+    let original_password = "SqOriginalPassword1";
+    let _guard = TestUserDropGuard::create(&base_config, &username, original_password);
+    let mut conn =
+        connect_with_config(test_user_config(&base_config, &username, original_password));
+
+    assert!(
+        conn.change_password("incorrect old password", &"1".repeat(1500))
+            .is_err(),
+        "invalid old/new password combination must be rejected"
+    );
+
+    let mut unchanged =
+        connect_with_config(test_user_config(&base_config, &username, original_password));
+    unchanged
+        .ping()
+        .expect("failed password change must preserve the original password");
+}
+
+#[test]
+#[ignore = "requires local Oracle listener via ORACLE_THIN_TEST_* environment variables"]
+fn python_oracledb_1109_password_with_slash_and_at_sign_reconnects() {
+    let base_config = live_config();
+    let username = unique_object_name("PW_SYMBOL");
+    let original_password = "SqOriginalPassword1";
+    let new_password = "SqPa/ss@word2";
+    let _guard = TestUserDropGuard::create(&base_config, &username, original_password);
+    let mut conn =
+        connect_with_config(test_user_config(&base_config, &username, original_password));
+
+    conn.change_password(original_password, new_password)
+        .expect("change password containing slash and at sign");
+    conn.close().expect("close symbolic password session");
+
+    let mut reconnected =
+        connect_with_config(test_user_config(&base_config, &username, new_password));
+    reconnected
+        .ping()
+        .expect("connect using slash and at sign password");
+}
+
+#[test]
+#[ignore = "requires local Oracle listener via ORACLE_THIN_TEST_* environment variables"]
+fn python_oracledb_1110_operations_fail_after_close() {
+    let mut conn = connect();
+    conn.close().expect("close connection");
+
+    assert!(
+        conn.rollback().is_err(),
+        "rollback on a closed connection must fail"
+    );
+}
+
+#[test]
+#[ignore = "requires local Oracle listener via ORACLE_THIN_TEST_* environment variables"]
+fn python_oracledb_1112_server_version_is_available() {
+    let conn = connect();
+    let version = conn
+        .server_version()
+        .expect("authenticated connection should report a server version");
+
+    assert!(!version.trim().is_empty());
+}
+
+#[test]
+#[ignore = "requires local Oracle listener via ORACLE_THIN_TEST_* environment variables"]
+fn python_oracledb_1113_close_rolls_back_uncommitted_transaction() {
+    let config = live_config();
+    let table = unique_table_name("CLOSE_TX");
+    let _guard = TableDropGuard::new(config.clone(), table.clone());
+    let mut writer = connect_with_config(config.clone());
+    let mut reader = connect_with_config(config);
+
+    writer
+        .query_drop(&format!("CREATE TABLE {table} (id NUMBER PRIMARY KEY)"))
+        .expect("create close rollback table");
+    writer
+        .query_drop(&format!("INSERT INTO {table} VALUES (1)"))
+        .expect("insert uncommitted row");
+    writer.close().expect("close writer connection");
+
+    assert_eq!(
+        select_count(&mut reader, &table),
+        0,
+        "closing a connection must rollback its uncommitted transaction"
+    );
+}
+
+#[test]
+#[ignore = "requires local Oracle listener via ORACLE_THIN_TEST_* environment variables"]
+fn python_oracledb_1114_drop_rolls_back_uncommitted_transaction() {
+    let config = live_config();
+    let table = unique_table_name("DROP_TX");
+    let _guard = TableDropGuard::new(config.clone(), table.clone());
+    let mut writer = connect_with_config(config.clone());
+    let mut reader = connect_with_config(config);
+
+    writer
+        .query_drop(&format!("CREATE TABLE {table} (id NUMBER PRIMARY KEY)"))
+        .expect("create drop rollback table");
+    writer
+        .query_drop(&format!("INSERT INTO {table} VALUES (1)"))
+        .expect("insert uncommitted row");
+    drop(writer);
+
+    assert_eq!(
+        select_count(&mut reader, &table),
+        0,
+        "dropping a connection must rollback its uncommitted transaction"
+    );
+}
+
+#[test]
+#[ignore = "requires local Oracle listener via ORACLE_THIN_TEST_* environment variables"]
+fn python_oracledb_1115_multiple_connections_from_threads() {
+    let config = live_config();
+    let threads = (0..20)
+        .map(|_| {
+            let config = config.clone();
+            thread::spawn(move || {
+                let mut conn = connect_with_config(config);
+                let result = conn
+                    .query_described_fetch_all("SELECT 1 AS value FROM dual", 1)
+                    .expect("query from thread-local connection");
+                assert_eq!(
+                    rows_to_strings(&result.result.rows),
+                    vec![vec!["1".to_string()]]
+                );
+            })
+        })
+        .collect::<Vec<_>>();
+
+    for thread in threads {
+        thread.join().expect("connection thread should not panic");
+    }
+}
+
+#[test]
+#[ignore = "requires local Oracle listener via ORACLE_THIN_TEST_* environment variables"]
+fn python_oracledb_1125_shared_connection_is_serialized_across_threads() {
+    let conn = Arc::new(Mutex::new(connect()));
+    let threads = (0..3)
+        .map(|_| {
+            let conn = Arc::clone(&conn);
+            thread::spawn(move || {
+                for _ in 0..5 {
+                    let result = conn
+                        .lock()
+                        .expect("lock shared Oracle thin connection")
+                        .query_described_fetch_all("SELECT 1 AS value FROM dual", 1)
+                        .expect("query shared connection from worker thread");
+                    assert_eq!(
+                        rows_to_strings(&result.result.rows),
+                        vec![vec!["1".to_string()]]
+                    );
+                }
+            })
+        })
+        .collect::<Vec<_>>();
+
+    for thread in threads {
+        thread
+            .join()
+            .expect("shared connection thread should not panic");
+    }
+}
+
+#[test]
+#[ignore = "requires local Oracle listener via ORACLE_THIN_TEST_* environment variables"]
+fn python_oracledb_1131_call_timeout_aborts_slow_call() {
+    let mut conn = connect();
+    let timeout = Duration::from_millis(500);
+    conn.set_call_timeout(Some(timeout))
+        .expect("set call timeout");
+    assert_eq!(
+        conn.call_timeout().expect("read call timeout"),
+        Some(timeout)
+    );
+
+    let started = Instant::now();
+    let error = conn
+        .query_drop("BEGIN DBMS_SESSION.SLEEP(2); END;")
+        .expect_err("slow call should time out");
+
+    assert!(
+        started.elapsed() < Duration::from_secs(2),
+        "call timeout did not abort promptly: {error}"
+    );
+}
+
+#[test]
+#[ignore = "requires local Oracle listener via ORACLE_THIN_TEST_* environment variables"]
+fn python_oracledb_1135_1138_to_1140_1142_server_metadata_matches_queries() {
+    let mut conn = connect();
+    let result = conn
+        .query_described_fetch_all(
+            "SELECT \
+                UPPER(SYS_CONTEXT('USERENV', 'INSTANCE_NAME')), \
+                (SELECT name FROM v$database), \
+                (SELECT value FROM v$parameter WHERE name = 'open_cursors'), \
+                UPPER(SYS_CONTEXT('USERENV', 'SERVICE_NAME')), \
+                (SELECT value FROM v$parameter WHERE name = 'db_domain') \
+             FROM dual",
+            1,
+        )
+        .expect("fetch server metadata reference values");
+    let row = result.result.rows.first().expect("server metadata row");
+    let optional_text = |value: Option<&OracleValue>| match value {
+        Some(OracleValue::Text(value)) | Some(OracleValue::Number(value)) => Some(value.clone()),
+        Some(OracleValue::Null) | None => None,
+        other => panic!("unexpected server metadata value {other:?}"),
+    };
+
+    assert_eq!(
+        conn.instance_name().map(str::to_uppercase),
+        optional_text(row.first()).map(|value| value.to_uppercase())
+    );
+    assert_eq!(
+        conn.db_name().map(str::to_uppercase),
+        optional_text(row.get(1)).map(|value| value.to_uppercase())
+    );
+    if conn.capabilities().protocol_version == Some(314) {
+        assert_eq!(conn.max_open_cursors(), 0);
+    } else {
+        assert_eq!(
+            conn.max_open_cursors().to_string(),
+            optional_text(row.get(2)).expect("open cursor value")
+        );
+    }
+    assert_eq!(
+        conn.service_name().map(str::to_uppercase),
+        optional_text(row.get(3)).map(|value| value.to_uppercase())
+    );
+    assert_eq!(conn.db_domain(), optional_text(row.get(4)).as_deref());
+}
+
+#[test]
+#[ignore = "requires local Oracle listener via ORACLE_THIN_TEST_* environment variables"]
+fn python_oracledb_1144_requested_sdu_is_negotiated() {
+    let mut config = live_config();
+    config.connect_options.sdu = 4096;
+
+    let conn = connect_with_config(config);
+
+    assert_eq!(conn.capabilities().sdu, 4096);
+}
+
+#[test]
+#[ignore = "requires local Oracle listener via ORACLE_THIN_TEST_* environment variables"]
+fn python_oracledb_1143_proxy_user_connects() {
+    let base_config = live_config();
+    let username = unique_object_name("PROXY_BASE");
+    let proxy_user = unique_object_name("PROXY_CLIENT");
+    let password = "SqProxyPassword1";
+    let _user_guard = TestUserDropGuard::create(&base_config, &username, password);
+    let _proxy_guard = TestUserDropGuard::create(&base_config, &proxy_user, "SqClientPassword1");
+    let mut admin = connect_with_config(base_config.clone());
+    admin
+        .query_drop(&format!(
+            "ALTER USER {proxy_user} GRANT CONNECT THROUGH {username}"
+        ))
+        .expect("grant proxy connection");
+    let mut config = test_user_config(&base_config, &format!("{username}[{proxy_user}]"), password);
+    config.username = username.clone();
+    config.proxy_user = Some(proxy_user.clone());
+    let mut conn = connect_with_config(config);
+
+    assert_eq!(conn.username(), username);
+    assert_eq!(conn.proxy_user(), Some(proxy_user.as_str()));
+    let result = conn
+        .query_described_fetch_all(
+            "SELECT SYS_CONTEXT('USERENV', 'SESSION_USER'), \
+                    SYS_CONTEXT('USERENV', 'PROXY_USER') FROM dual",
+            1,
+        )
+        .expect("fetch proxy session identities");
+    assert_eq!(
+        rows_to_strings(&result.result.rows),
+        vec![vec![proxy_user, username]]
+    );
+}
+
+#[test]
+#[ignore = "requires local Oracle listener via ORACLE_THIN_TEST_* environment variables"]
+fn python_oracledb_1127_new_password_during_connect() {
+    let base_config = live_config();
+    let username = unique_object_name("PW_CONNECT");
+    let original_password = "SqOriginalPassword1";
+    let new_password = "SqConnectedPassword2";
+    let _guard = TestUserDropGuard::create(&base_config, &username, original_password);
+    let mut config = test_user_config(&base_config, &username, original_password);
+    config.new_password = Some(new_password.to_string());
+
+    let mut changed = connect_with_config(config);
+    changed
+        .ping()
+        .expect("password-changing connect should yield a usable session");
+    changed.close().expect("close password-changing connect");
+
+    let mut reconnected =
+        connect_with_config(test_user_config(&base_config, &username, new_password));
+    reconnected
+        .ping()
+        .expect("new password from connect should be active");
+}
+
+#[test]
+#[ignore = "requires local Oracle listener via ORACLE_THIN_TEST_* environment variables"]
+fn python_oracledb_1137_password_length_boundaries() {
+    let base_config = live_config();
+    let username = unique_object_name("PW_LENGTH");
+    let original_password = "SqOriginalPassword1";
+    let password_32 = "a".repeat(32);
+    let password_1024 = "b".repeat(1024);
+    let password_1025 = "c".repeat(1025);
+    let _guard = TestUserDropGuard::create(&base_config, &username, original_password);
+    let mut conn =
+        connect_with_config(test_user_config(&base_config, &username, original_password));
+
+    conn.change_password(original_password, &password_32)
+        .expect("change to 32-byte password");
+    conn.close().expect("close 32-byte password session");
+    let mut conn = connect_with_config(test_user_config(&base_config, &username, &password_32));
+    conn.change_password(&password_32, &password_1024)
+        .expect("change to 1024-byte password");
+    conn.close().expect("close 1024-byte password session");
+    let mut conn = connect_with_config(test_user_config(&base_config, &username, &password_1024));
+    assert!(
+        conn.change_password(&password_1024, &password_1025)
+            .is_err(),
+        "Oracle must reject a 1025-byte password"
+    );
+}
+
+#[test]
+#[ignore = "requires local Oracle listener via ORACLE_THIN_TEST_* environment variables"]
+fn python_oracledb_1146_to_1150_auth_metadata_is_visible() {
+    let mut config = live_config();
+    config.program = "newprogram".to_string();
+    config.machine = "newmachine".to_string();
+    config.terminal = "newterminal".to_string();
+    config.os_user = "newosuser".to_string();
+    config.driver_name = Some("newdriver".to_string());
+    let mut conn = connect_with_config(config);
+
+    let session = conn
+        .query_described_fetch_all(
+            "SELECT program, machine, terminal, osuser FROM v$session \
+             WHERE sid = SYS_CONTEXT('USERENV', 'SID')",
+            1,
+        )
+        .expect("fetch authentication session metadata");
+    assert_eq!(
+        rows_to_strings(&session.result.rows),
+        vec![vec![
+            "newprogram".to_string(),
+            "newmachine".to_string(),
+            "newterminal".to_string(),
+            "newosuser".to_string(),
+        ]]
+    );
+
+    let driver = conn
+        .query_described_fetch_all(
+            "SELECT DISTINCT client_driver FROM v$session_connect_info \
+             WHERE sid = SYS_CONTEXT('USERENV', 'SID')",
+            1,
+        )
+        .expect("fetch authentication driver metadata");
+    assert_eq!(
+        rows_to_strings(&driver.result.rows),
+        vec![vec!["newdriver".to_string()]]
+    );
+}
+
+#[test]
+#[ignore = "requires local Oracle listener via ORACLE_THIN_TEST_* environment variables"]
+fn python_oracledb_1151_1152_session_identity_matches_server() {
+    let mut conn = connect();
+    let result = conn
+        .query_described_fetch_all(
+            "SELECT DBMS_DEBUG_JDWP.CURRENT_SESSION_ID, \
+                    DBMS_DEBUG_JDWP.CURRENT_SESSION_SERIAL \
+             FROM dual",
+            1,
+        )
+        .expect("fetch server session identity");
+    let rows = rows_to_strings(&result.result.rows);
+    let row = rows.first().expect("session identity row");
+
+    assert_eq!(
+        conn.server_session_id().map(|value| value.to_string()),
+        row.first().cloned()
+    );
+    assert_eq!(
+        conn.server_serial_num().map(|value| value.to_string()),
+        row.get(1).cloned()
+    );
+}
+
+#[test]
+#[ignore = "requires local Oracle listener via ORACLE_THIN_TEST_* environment variables"]
+fn python_oracledb_1154_alter_session_updates_edition() {
+    let mut conn = connect();
+
+    conn.query_drop("ALTER SESSION SET EDITION = ORA$BASE")
+        .expect("alter session edition");
+    let result = conn
+        .query_described_fetch_all(
+            "SELECT SYS_CONTEXT('USERENV', 'CURRENT_EDITION_NAME') FROM dual",
+            1,
+        )
+        .expect("fetch current edition");
+
+    assert_eq!(
+        conn.server_edition().map(str::to_uppercase),
+        rows_to_strings(&result.result.rows)
+            .first()
+            .and_then(|row| row.first())
+            .map(|value| value.to_uppercase())
+    );
+}
+
+#[test]
+#[ignore = "requires local Oracle listener via ORACLE_THIN_TEST_* environment variables"]
+fn python_oracledb_1155_connect_with_edition() {
+    let mut config = live_config();
+    config.edition = Some("ORA$BASE".to_string());
+    let mut conn = connect_with_config(config);
+    let result = conn
+        .query_described_fetch_all(
+            "SELECT SYS_CONTEXT('USERENV', 'CURRENT_EDITION_NAME') FROM dual",
+            1,
+        )
+        .expect("fetch connected edition");
+
+    assert_eq!(
+        rows_to_strings(&result.result.rows),
+        vec![vec!["ORA$BASE".to_string()]]
+    );
+    assert_eq!(conn.server_edition(), Some("ORA$BASE"));
+}
+
+#[test]
+#[ignore = "requires local Oracle listener via ORACLE_THIN_TEST_* environment variables"]
+fn python_oracledb_1158_error_in_middle_of_response_is_reported() {
+    let config = live_config();
+    let table = unique_table_name("MID_ERROR");
+    let _guard = TableDropGuard::new(config.clone(), table.clone());
+    let mut conn = connect_with_config(config);
+    conn.query_drop(&format!(
+        "CREATE TABLE {table} AS \
+         SELECT level AS id, CASE WHEN level < 1500 THEN 2 ELSE 0 END AS divisor \
+         FROM dual CONNECT BY level <= 1500"
+    ))
+    .expect("create middle-response error data");
+
+    let error = conn
+        .query_described_fetch_all(
+            format!("SELECT id, 1 / divisor FROM {table} ORDER BY id"),
+            1500,
+        )
+        .expect_err("division by zero at the end of the response should fail");
+
+    assert!(
+        error.to_string().contains("ORA-01476"),
+        "unexpected middle-response error: {error}"
+    );
+}
+
+#[test]
+fn python_oracledb_1160_end_user_security_context_length_is_validated() {
+    let error = OracleThinEndUserSecurityContext::new("x".repeat(70_000), "y".repeat(70_000))
+        .expect_err("oversized end user security context should fail");
+
+    assert!(error.to_string().contains("65535"));
+}
+
+#[test]
+#[ignore = "requires local Oracle listener via ORACLE_THIN_TEST_* environment variables"]
+fn python_oracledb_1161_end_user_security_context_requires_tcps() {
+    let mut conn = connect();
+    let context = OracleThinEndUserSecurityContext::new("end-user-token", "mid-tier-token")
+        .expect("create valid end user security context");
+
+    let error = conn
+        .set_end_user_security_context(&context)
+        .expect_err("TCP connection must reject end user security context");
+
+    assert!(error.to_string().contains("TCPS"));
 }
 
 #[test]
@@ -2096,7 +2641,7 @@ fn bind_nclob_column_round_trips_large_text() {
     ))
     .expect("create NCLOB bind test table");
 
-    let payload = "\u{D55C}\u{AE00}AbCd".repeat(2048);
+    let payload = "\u{D55C}\u{AE00}\u{2000E}\u{20031}AbCd".repeat(2048);
     let mut insert =
         StatementRequest::statement(format!("INSERT INTO {table} (id, doc) VALUES (:1, :2)"));
     insert.binds.push(BindValue::Number("1".to_string()));
@@ -2778,6 +3323,143 @@ fn redefined_view_type_changes_from_scalar_to_lob_like_python_oracledb() {
         vec![vec!["\u{D55C}\u{AE00}".to_string()]]
     );
 
+    let assert_redefined_value = |conn: &mut OracleThinSession,
+                                  expression: &str,
+                                  expected_type: OracleColumnType,
+                                  expected_value: OracleValue| {
+        conn.query_drop(&format!(
+            "CREATE OR REPLACE VIEW {view_name} AS \
+                 SELECT {expression} AS value FROM dual"
+        ))
+        .expect("replace scalar type-change view");
+        let result = conn
+            .query_described_fetch_all(format!("SELECT * FROM {view_name}"), 1)
+            .expect("fetch scalar type-change view");
+        assert_eq!(result.columns[0].column_type, expected_type);
+        assert_eq!(result.result.rows, vec![vec![expected_value]]);
+    };
+
+    assert_redefined_value(
+        &mut conn,
+        "CAST('string_4612' AS VARCHAR2(15))",
+        OracleColumnType::Varchar,
+        OracleValue::Text("string_4612".to_string()),
+    );
+    assert_redefined_value(
+        &mut conn,
+        "TO_NUMBER('4612')",
+        OracleColumnType::Number,
+        OracleValue::Number("4612".to_string()),
+    );
+    assert_redefined_value(
+        &mut conn,
+        "TO_NUMBER('4613')",
+        OracleColumnType::Number,
+        OracleValue::Number("4613".to_string()),
+    );
+    assert_redefined_value(
+        &mut conn,
+        "CAST('string_4613' AS VARCHAR2(15))",
+        OracleColumnType::Varchar,
+        OracleValue::Text("string_4613".to_string()),
+    );
+    assert_redefined_value(
+        &mut conn,
+        "CAST('string_4614' AS VARCHAR2(15))",
+        OracleColumnType::Varchar,
+        OracleValue::Text("string_4614".to_string()),
+    );
+    assert_redefined_value(
+        &mut conn,
+        "DATE '2022-01-04'",
+        OracleColumnType::Date,
+        OracleValue::DateTime(oracle_datetime(2022, 1, 4, 0, 0, 0, 0)),
+    );
+    assert_redefined_value(
+        &mut conn,
+        "DATE '2022-01-04'",
+        OracleColumnType::Date,
+        OracleValue::DateTime(oracle_datetime(2022, 1, 4, 0, 0, 0, 0)),
+    );
+    assert_redefined_value(
+        &mut conn,
+        "CAST('string_4615' AS VARCHAR2(15))",
+        OracleColumnType::Varchar,
+        OracleValue::Text("string_4615".to_string()),
+    );
+    assert_redefined_value(
+        &mut conn,
+        "TO_NUMBER('4616')",
+        OracleColumnType::Number,
+        OracleValue::Number("4616".to_string()),
+    );
+    assert_redefined_value(
+        &mut conn,
+        "DATE '2022-01-05'",
+        OracleColumnType::Date,
+        OracleValue::DateTime(oracle_datetime(2022, 1, 5, 0, 0, 0, 0)),
+    );
+    assert_redefined_value(
+        &mut conn,
+        "TO_CLOB('clob_4617')",
+        OracleColumnType::Clob,
+        OracleValue::Text("clob_4617".to_string()),
+    );
+    assert_redefined_value(
+        &mut conn,
+        "CAST('string_4617' AS VARCHAR2(15))",
+        OracleColumnType::Varchar,
+        OracleValue::Text("string_4617".to_string()),
+    );
+    assert_redefined_value(
+        &mut conn,
+        "TO_NCLOB('nclob_4618')",
+        OracleColumnType::Clob,
+        OracleValue::Text("nclob_4618".to_string()),
+    );
+    assert_redefined_value(
+        &mut conn,
+        "CAST('nstring_4618' AS NVARCHAR2(15))",
+        OracleColumnType::Varchar,
+        OracleValue::Text("nstring_4618".to_string()),
+    );
+    assert_redefined_value(
+        &mut conn,
+        "TO_CLOB('clob_4619')",
+        OracleColumnType::Clob,
+        OracleValue::Text("clob_4619".to_string()),
+    );
+    assert_redefined_value(
+        &mut conn,
+        "CAST('string_4619' AS NVARCHAR2(15))",
+        OracleColumnType::Varchar,
+        OracleValue::Text("string_4619".to_string()),
+    );
+    assert_redefined_value(
+        &mut conn,
+        "TO_BLOB(UTL_RAW.CAST_TO_RAW('blob_4620'))",
+        OracleColumnType::Blob,
+        OracleValue::Bytes(b"blob_4620".to_vec()),
+    );
+    assert_redefined_value(
+        &mut conn,
+        "UTL_RAW.CAST_TO_RAW('string_4620')",
+        OracleColumnType::Raw,
+        OracleValue::Bytes(b"string_4620".to_vec()),
+    );
+    assert_redefined_value(
+        &mut conn,
+        "CAST('string_4621' AS NVARCHAR2(15))",
+        OracleColumnType::Varchar,
+        OracleValue::Text("string_4621".to_string()),
+    );
+    assert_redefined_value(
+        &mut conn,
+        "TO_CLOB('clob_4621')",
+        OracleColumnType::Clob,
+        OracleValue::Text("clob_4621".to_string()),
+    );
+
     drop_view_ignore(&mut conn, &view_name);
 }
 
@@ -3094,10 +3776,17 @@ fn bind_large_korean_varchar_round_trips_utf8_boundary() {
 #[ignore = "requires local Oracle listener via ORACLE_THIN_TEST_* environment variables"]
 fn bind_raw_bytes_round_trips_as_raw() {
     let mut conn = connect();
-    let mut request = StatementRequest::query("SELECT RAWTOHEX(:1) AS payload FROM dual", 1);
+    let mut request = StatementRequest::query(
+        "SELECT RAWTOHEX(:1) AS payload, \
+         CASE WHEN :2 IS NULL THEN 'NULL' ELSE 'VALUE' END AS null_text FROM dual",
+        1,
+    );
     request
         .binds
         .push(BindValue::Bytes(vec![0xca, 0xfe, 0xba, 0xbe]));
+    request
+        .binds
+        .push(BindValue::Null(OracleColumnType::Varchar));
 
     let result = conn
         .query_described_fetch_all_request(&request)
@@ -3105,8 +3794,21 @@ fn bind_raw_bytes_round_trips_as_raw() {
 
     assert_eq!(
         rows_to_strings(&result.result.rows),
-        vec![vec!["CAFEBABE".to_string()]]
+        vec![vec!["CAFEBABE".to_string(), "NULL".to_string()]]
     );
+}
+
+#[test]
+#[ignore = "requires local Oracle listener via ORACLE_THIN_TEST_* environment variables"]
+fn bind_supplementary_unicode_varchar_round_trips() {
+    let mut conn = connect();
+    let payload = "Latin-\u{03B4}-\u{2000E}-\u{20031}-\u{D55C}\u{AE00}".repeat(100);
+    let mut request = StatementRequest::query("SELECT :1 FROM dual", 1);
+    request.binds.push(BindValue::Text(payload.clone()));
+    let result = conn
+        .query_described_fetch_all_request(&request)
+        .expect("round-trip supplementary Unicode VARCHAR bind");
+    assert_eq!(rows_to_strings(&result.result.rows), vec![vec![payload]]);
 }
 
 #[test]
@@ -3132,7 +3834,49 @@ fn bind_long_column_round_trips_large_text() {
     let result = conn
         .query_described_fetch_all(format!("SELECT payload FROM {table} WHERE id = 1"), 1)
         .expect("fetch LONG inserted from large text bind");
+    assert_eq!(result.columns[0].column_type, OracleColumnType::Long);
     assert_eq!(rows_to_strings(&result.result.rows), vec![vec![payload]]);
+}
+
+#[test]
+#[ignore = "requires local Oracle listener via ORACLE_THIN_TEST_* environment variables"]
+fn python_oracledb_2001_execute_many_long_values_round_trip() {
+    let config = live_config();
+    let table = unique_table_name("LONG_MANY");
+    let _guard = TableDropGuard::new(config.clone(), table.clone());
+    let mut conn = connect_with_config(config);
+    conn.query_drop(&format!(
+        "CREATE TABLE {table} (id NUMBER PRIMARY KEY, payload LONG)"
+    ))
+    .expect("create LONG executemany table");
+    let payloads = ["A".repeat(5000), "B".repeat(12000), "C".repeat(33000)];
+    let rows = payloads
+        .iter()
+        .enumerate()
+        .map(|(index, payload)| {
+            vec![
+                BindValue::Number((index + 1).to_string()),
+                BindValue::Text(payload.clone()),
+            ]
+        })
+        .collect();
+    conn.execute_many(
+        format!("INSERT INTO {table} (id, payload) VALUES (:1, :2)"),
+        rows,
+        false,
+    )
+    .expect("executemany LONG rows");
+
+    let result = conn
+        .query_described_fetch_all(format!("SELECT payload FROM {table} ORDER BY id"), 1)
+        .expect("fetch executemany LONG rows");
+    assert_eq!(
+        rows_to_strings(&result.result.rows),
+        payloads
+            .into_iter()
+            .map(|value| vec![value])
+            .collect::<Vec<_>>()
+    );
 }
 
 #[test]
@@ -3158,6 +3902,7 @@ fn bind_long_raw_column_round_trips_large_bytes() {
     let result = conn
         .query_described_fetch_all(format!("SELECT payload FROM {table} WHERE id = 1"), 1)
         .expect("fetch LONG RAW inserted from large bytes bind");
+    assert_eq!(result.columns[0].ora_type_num, 24);
     match result.result.rows.first().and_then(|row| row.first()) {
         Some(OracleValue::Bytes(bytes)) => assert_eq!(bytes, &payload),
         other => panic!("expected LONG RAW bytes, got {other:?}"),
@@ -3168,7 +3913,10 @@ fn bind_long_raw_column_round_trips_large_bytes() {
 #[ignore = "requires local Oracle listener via ORACLE_THIN_TEST_* environment variables"]
 fn bind_number_edge_values_round_trip() {
     let mut conn = connect();
-    let mut request = StatementRequest::query("SELECT :1, :2, :3, :4 FROM dual", 1);
+    let mut request = StatementRequest::query(
+        "SELECT :1, :2, :3, :4, CASE WHEN :5 IS NULL THEN 'NULL' ELSE 'VALUE' END FROM dual",
+        1,
+    );
     request.binds.push(BindValue::Number("-123.4".to_string()));
     request
         .binds
@@ -3177,6 +3925,9 @@ fn bind_number_edge_values_round_trip() {
         .binds
         .push(BindValue::Number("-9.8765E-3".to_string()));
     request.binds.push(BindValue::Number("1.2E3".to_string()));
+    request
+        .binds
+        .push(BindValue::Null(OracleColumnType::Number));
 
     let result = conn
         .query_described_fetch_all_request(&request)
@@ -3189,6 +3940,7 @@ fn bind_number_edge_values_round_trip() {
             "0.0098765".to_string(),
             "-0.0098765".to_string(),
             "1200".to_string(),
+            "NULL".to_string(),
         ]]
     );
 }
@@ -3200,7 +3952,8 @@ fn bind_date_and_timestamp_round_trip_values() {
     let mut request = StatementRequest::query(
         "SELECT \
          TO_CHAR(:1, 'YYYY-MM-DD HH24:MI:SS') AS d, \
-         TO_CHAR(:2, 'YYYY-MM-DD HH24:MI:SS.FF6') AS ts \
+         TO_CHAR(:2, 'YYYY-MM-DD HH24:MI:SS.FF6') AS ts, \
+         CASE WHEN :3 IS NULL THEN 'NULL' ELSE 'NOT NULL' END AS null_date \
          FROM dual",
         1,
     );
@@ -3216,6 +3969,7 @@ fn bind_date_and_timestamp_round_trip_values() {
         15,
         123_456_000,
     )));
+    request.binds.push(BindValue::Null(OracleColumnType::Date));
 
     let result = conn
         .query_described_fetch_all_request(&request)
@@ -3226,7 +3980,338 @@ fn bind_date_and_timestamp_round_trip_values() {
         vec![vec![
             "2024-02-29 13:14:15".to_string(),
             "2024-02-29 13:14:15.123456".to_string(),
+            "NULL".to_string(),
         ]]
+    );
+}
+
+#[test]
+#[ignore = "requires local Oracle listener via ORACLE_THIN_TEST_* environment variables"]
+fn python_oracledb_1414_to_1417_date_fetch_metadata_and_rows() {
+    let mut conn = connect();
+    let result = conn
+        .query_described_fetch_all(
+            "SELECT \
+                level AS int_col, \
+                DATE '2002-12-09' + level AS date_col, \
+                CASE WHEN MOD(level, 2) = 1 THEN DATE '2002-12-09' + level * 2 END \
+                    AS nullable_col \
+             FROM dual CONNECT BY level <= 10 ORDER BY level",
+            3,
+        )
+        .expect("fetch DATE rows in multiple batches");
+
+    assert_eq!(
+        result
+            .columns
+            .iter()
+            .map(|column| (column.name.as_str(), column.column_type))
+            .collect::<Vec<_>>(),
+        vec![
+            ("INT_COL", OracleColumnType::Number),
+            ("DATE_COL", OracleColumnType::Date),
+            ("NULLABLE_COL", OracleColumnType::Date),
+        ]
+    );
+    assert_eq!(result.result.rows.len(), 10);
+    assert_eq!(value_to_string(&result.result.rows[0][0]), "1");
+    assert_eq!(
+        date_value_to_string(&result.result.rows[0][1]),
+        "2002-12-10 00:00:00"
+    );
+    assert_eq!(result.result.rows[1][2], OracleValue::Null);
+    assert_eq!(value_to_string(&result.result.rows[9][0]), "10");
+}
+
+#[test]
+#[ignore = "requires local Oracle listener via ORACLE_THIN_TEST_* environment variables"]
+fn python_oracledb_1405_to_1409_date_array_binds_round_trip() {
+    let config = live_config();
+    let package_name = unique_object_name("PKG_DATE_ARRAY");
+    let _guard = DdlDropGuard::new(config.clone(), vec![format!("DROP PACKAGE {package_name}")]);
+    let mut conn = connect_with_config(config);
+    conn.query_drop(&format!(
+        "CREATE OR REPLACE PACKAGE {package_name} AS \
+         TYPE date_array IS TABLE OF DATE INDEX BY BINARY_INTEGER; \
+         PROCEDURE inspect_values(p_values IN date_array, p_count OUT NUMBER); \
+         PROCEDURE adjust_values(p_values IN OUT date_array); \
+         PROCEDURE fill_values(p_values OUT date_array); \
+         END;"
+    ))
+    .expect("create DATE array package specification");
+    conn.query_drop(&format!(
+        "CREATE OR REPLACE PACKAGE BODY {package_name} AS \
+         PROCEDURE inspect_values(p_values IN date_array, p_count OUT NUMBER) IS \
+         BEGIN p_count := p_values.COUNT; END; \
+         PROCEDURE adjust_values(p_values IN OUT date_array) IS \
+         BEGIN FOR i IN 1 .. p_values.COUNT LOOP p_values(i) := p_values(i) + i; END LOOP; END; \
+         PROCEDURE fill_values(p_values OUT date_array) IS \
+         BEGIN \
+           p_values(1) := DATE '2002-12-13'; \
+           p_values(2) := DATE '2002-12-14'; \
+           p_values(3) := DATE '2002-12-15'; \
+         END; \
+         END;"
+    ))
+    .expect("create DATE array package body");
+    let dates = (1..=5)
+        .map(|day| {
+            Some(BindInputValue::Date(oracle_datetime(
+                2002, 12, day, 0, 0, 0, 0,
+            )))
+        })
+        .collect::<Vec<_>>();
+
+    let mut inspect =
+        StatementRequest::statement(format!("BEGIN {package_name}.inspect_values(:1, :2); END;"));
+    inspect.binds.push(BindValue::Array {
+        column_type: OracleColumnType::Date,
+        max_len: 7,
+        max_num_elements: 10,
+        values: dates.clone(),
+        out: false,
+    });
+    inspect.binds.push(BindValue::Out {
+        column_type: OracleColumnType::Number,
+        max_len: 22,
+    });
+    let inspected = conn
+        .execute_out_binds(&inspect, &[])
+        .expect("bind DATE array as input");
+    assert!(matches!(
+        inspected.first(),
+        Some(OracleValue::Number(value)) if value == "5"
+    ));
+
+    let mut adjust =
+        StatementRequest::statement(format!("BEGIN {package_name}.adjust_values(:1); END;"));
+    adjust.binds.push(BindValue::Array {
+        column_type: OracleColumnType::Date,
+        max_len: 7,
+        max_num_elements: 10,
+        values: dates,
+        out: true,
+    });
+    let adjusted = conn
+        .execute_out_binds(&adjust, &[])
+        .expect("bind DATE array as IN OUT");
+    let adjusted = match adjusted.first() {
+        Some(OracleValue::Array(values)) => values,
+        other => panic!("expected adjusted DATE array, got {other:?}"),
+    };
+    assert_eq!(adjusted.len(), 5);
+    assert_eq!(date_value_to_string(&adjusted[0]), "2002-12-02 00:00:00");
+    assert_eq!(date_value_to_string(&adjusted[4]), "2002-12-10 00:00:00");
+
+    let mut fill =
+        StatementRequest::statement(format!("BEGIN {package_name}.fill_values(:1); END;"));
+    fill.binds.push(BindValue::Array {
+        column_type: OracleColumnType::Date,
+        max_len: 7,
+        max_num_elements: 10,
+        values: Vec::new(),
+        out: true,
+    });
+    let filled = conn
+        .execute_out_binds(&fill, &[])
+        .expect("bind DATE array as output");
+    let filled = match filled.first() {
+        Some(OracleValue::Array(values)) => values,
+        other => panic!("expected output DATE array, got {other:?}"),
+    };
+    assert_eq!(filled.len(), 3);
+    assert_eq!(date_value_to_string(&filled[0]), "2002-12-13 00:00:00");
+    assert_eq!(date_value_to_string(&filled[2]), "2002-12-15 00:00:00");
+}
+
+#[test]
+#[ignore = "requires local Oracle listener via ORACLE_THIN_TEST_* environment variables"]
+fn python_oracledb_number_and_nchar_associative_array_binds_round_trip() {
+    let config = live_config();
+    let package_name = unique_object_name("PKG_SCALAR_ARRAY");
+    let _guard = DdlDropGuard::new(config.clone(), vec![format!("DROP PACKAGE {package_name}")]);
+    let mut conn = connect_with_config(config);
+    conn.query_drop(&format!(
+        "CREATE OR REPLACE PACKAGE {package_name} AS \
+         TYPE number_array IS TABLE OF NUMBER INDEX BY BINARY_INTEGER; \
+         TYPE nchar_array IS TABLE OF NVARCHAR2(100) INDEX BY BINARY_INTEGER; \
+         TYPE boolean_array IS TABLE OF BOOLEAN INDEX BY BINARY_INTEGER; \
+         PROCEDURE adjust_numbers(p_values IN OUT number_array); \
+         PROCEDURE fill_numbers(p_values OUT number_array); \
+         PROCEDURE adjust_text(p_values IN OUT nchar_array); \
+         PROCEDURE fill_text(p_values OUT nchar_array); \
+         PROCEDURE adjust_booleans(p_values IN OUT boolean_array); \
+         PROCEDURE fill_booleans(p_values OUT boolean_array); \
+         END;"
+    ))
+    .expect("create scalar array package specification");
+    conn.query_drop(&format!(
+        "CREATE OR REPLACE PACKAGE BODY {package_name} AS \
+         PROCEDURE adjust_numbers(p_values IN OUT number_array) IS BEGIN \
+           FOR i IN 1 .. p_values.COUNT LOOP p_values(i) := p_values(i) + i; END LOOP; \
+         END; \
+         PROCEDURE fill_numbers(p_values OUT number_array) IS BEGIN \
+           p_values(1) := 10; p_values(2) := NULL; p_values(3) := 30.5; \
+         END; \
+         PROCEDURE adjust_text(p_values IN OUT nchar_array) IS BEGIN \
+           FOR i IN 1 .. p_values.COUNT LOOP p_values(i) := p_values(i) || ':' || i; END LOOP; \
+         END; \
+         PROCEDURE fill_text(p_values OUT nchar_array) IS BEGIN \
+           p_values(1) := UNISTR('\\03B4'); \
+           p_values(2) := UNISTR('\\D55C\\AE00'); \
+           p_values(3) := NULL; \
+         END; \
+         PROCEDURE adjust_booleans(p_values IN OUT boolean_array) IS BEGIN \
+           FOR i IN 1 .. p_values.COUNT LOOP p_values(i) := NOT p_values(i); END LOOP; \
+         END; \
+         PROCEDURE fill_booleans(p_values OUT boolean_array) IS BEGIN \
+           p_values(1) := TRUE; p_values(2) := FALSE; p_values(3) := NULL; \
+         END; \
+         END;"
+    ))
+    .expect("create scalar array package body");
+
+    let mut numbers =
+        StatementRequest::statement(format!("BEGIN {package_name}.adjust_numbers(:1); END;"));
+    numbers.binds.push(BindValue::Array {
+        column_type: OracleColumnType::Number,
+        max_len: 22,
+        max_num_elements: 10,
+        values: vec![
+            Some(BindInputValue::Number("1".to_string())),
+            Some(BindInputValue::Number("2.5".to_string())),
+            Some(BindInputValue::Number("100".to_string())),
+        ],
+        out: true,
+    });
+    let adjusted_numbers = conn
+        .execute_out_binds(&numbers, &[])
+        .expect("NUMBER associative array IN OUT");
+    assert_eq!(
+        adjusted_numbers,
+        vec![OracleValue::Array(vec![
+            OracleValue::Number("2".to_string()),
+            OracleValue::Number("4.5".to_string()),
+            OracleValue::Number("103".to_string()),
+        ])]
+    );
+
+    let mut filled_numbers =
+        StatementRequest::statement(format!("BEGIN {package_name}.fill_numbers(:1); END;"));
+    filled_numbers.binds.push(BindValue::Array {
+        column_type: OracleColumnType::Number,
+        max_len: 22,
+        max_num_elements: 10,
+        values: Vec::new(),
+        out: true,
+    });
+    let filled_numbers = conn
+        .execute_out_binds(&filled_numbers, &[])
+        .expect("NUMBER associative array OUT");
+    assert_eq!(
+        filled_numbers,
+        vec![OracleValue::Array(vec![
+            OracleValue::Number("10".to_string()),
+            OracleValue::Null,
+            OracleValue::Number("30.5".to_string()),
+        ])]
+    );
+
+    let mut text =
+        StatementRequest::statement(format!("BEGIN {package_name}.adjust_text(:1); END;"));
+    text.binds.push(BindValue::Array {
+        column_type: OracleColumnType::Nclob,
+        max_len: 400,
+        max_num_elements: 10,
+        values: vec![
+            Some(BindInputValue::Text("\u{03B4}".to_string())),
+            Some(BindInputValue::Text("\u{D55C}\u{AE00}".to_string())),
+        ],
+        out: true,
+    });
+    let adjusted_text = conn
+        .execute_out_binds(&text, &[])
+        .expect("NVARCHAR associative array IN OUT");
+    assert_eq!(
+        adjusted_text,
+        vec![OracleValue::Array(vec![
+            OracleValue::Text("\u{03B4}:1".to_string()),
+            OracleValue::Text("\u{D55C}\u{AE00}:2".to_string()),
+        ])]
+    );
+
+    let mut filled_text =
+        StatementRequest::statement(format!("BEGIN {package_name}.fill_text(:1); END;"));
+    filled_text.binds.push(BindValue::Array {
+        column_type: OracleColumnType::Nclob,
+        max_len: 400,
+        max_num_elements: 10,
+        values: Vec::new(),
+        out: true,
+    });
+    let filled_text = conn
+        .execute_out_binds(&filled_text, &[])
+        .expect("NVARCHAR associative array OUT");
+    assert_eq!(
+        filled_text,
+        vec![OracleValue::Array(vec![
+            OracleValue::Text("\u{03B4}".to_string()),
+            OracleValue::Text("\u{D55C}\u{AE00}".to_string()),
+            OracleValue::Null,
+        ])]
+    );
+
+    let mut booleans =
+        StatementRequest::statement(format!("BEGIN {package_name}.adjust_booleans(:1); END;"));
+    booleans.binds.push(BindValue::Array {
+        column_type: OracleColumnType::Boolean,
+        max_len: 4,
+        max_num_elements: 10,
+        values: vec![
+            Some(BindInputValue::Boolean(true)),
+            Some(BindInputValue::Boolean(false)),
+            None,
+        ],
+        out: true,
+    });
+    let adjusted_booleans = match conn.execute_out_binds(&booleans, &[]) {
+        Ok(values) => values,
+        Err(error) if error.code() == Some(6544) && error.to_string().contains("[78502]") => {
+            eprintln!(
+                "skipping BOOLEAN associative array test: server rejected PL/SQL BOOLEAN arrays"
+            );
+            return;
+        }
+        Err(error) => panic!("BOOLEAN associative array IN OUT: {error}"),
+    };
+    assert_eq!(
+        adjusted_booleans,
+        vec![OracleValue::Array(vec![
+            OracleValue::Boolean(false),
+            OracleValue::Boolean(true),
+            OracleValue::Null,
+        ])]
+    );
+
+    let mut filled_booleans =
+        StatementRequest::statement(format!("BEGIN {package_name}.fill_booleans(:1); END;"));
+    filled_booleans.binds.push(BindValue::Array {
+        column_type: OracleColumnType::Boolean,
+        max_len: 4,
+        max_num_elements: 10,
+        values: Vec::new(),
+        out: true,
+    });
+    let filled_booleans = conn
+        .execute_out_binds(&filled_booleans, &[])
+        .expect("BOOLEAN associative array OUT");
+    assert_eq!(
+        filled_booleans,
+        vec![OracleValue::Array(vec![
+            OracleValue::Boolean(true),
+            OracleValue::Boolean(false),
+            OracleValue::Null,
+        ])]
     );
 }
 
@@ -4669,6 +5754,456 @@ fn dml_returning_no_rows_returns_empty_out_bind_rows() {
 
 #[test]
 #[ignore = "requires local Oracle listener via ORACLE_THIN_TEST_* environment variables"]
+fn python_oracledb_1606_dml_returning_execute_many_preserves_execution_arrays() {
+    let config = live_config();
+    let table = unique_table_name("RET_MANY");
+    let _guard = TableDropGuard::new(config.clone(), table.clone());
+    let mut conn = connect_with_config(config);
+    conn.query_drop(&format!(
+        "CREATE TABLE {table} (id NUMBER PRIMARY KEY, name VARCHAR2(100))"
+    ))
+    .expect("create executemany DML RETURNING table");
+
+    let insert_rows = (1..=10)
+        .map(|id| {
+            vec![
+                BindValue::Number(id.to_string()),
+                BindValue::Text(format!("The initial value of string {id}")),
+            ]
+        })
+        .collect();
+    let inserted = conn
+        .execute_many(
+            format!("INSERT INTO {table} (id, name) VALUES (:1, :2)"),
+            insert_rows,
+            false,
+        )
+        .expect("executemany source rows");
+    assert_eq!(inserted.row_count, Some(10));
+
+    let update_rows = [3, 8, 11]
+        .into_iter()
+        .map(|threshold| {
+            vec![
+                BindValue::Number(threshold.to_string()),
+                BindValue::Out {
+                    column_type: OracleColumnType::Number,
+                    max_len: 22,
+                },
+                BindValue::Out {
+                    column_type: OracleColumnType::Varchar,
+                    max_len: 100,
+                },
+            ]
+        })
+        .collect();
+    let result = conn
+        .execute_many_out_binds(
+            format!(
+                "UPDATE {table} SET \
+                 id = id + 25, name = 'Updated value of string ' || TO_CHAR(id) \
+                 WHERE id < :1 RETURNING id, name INTO :2, :3"
+            ),
+            update_rows,
+            false,
+        )
+        .expect("executemany DML RETURNING");
+
+    let expected_numbers = [
+        vec!["26", "27"],
+        vec!["28", "29", "30", "31", "32"],
+        vec!["33", "34", "35"],
+    ];
+    let expected_names = [
+        vec!["Updated value of string 1", "Updated value of string 2"],
+        vec![
+            "Updated value of string 3",
+            "Updated value of string 4",
+            "Updated value of string 5",
+            "Updated value of string 6",
+            "Updated value of string 7",
+        ],
+        vec![
+            "Updated value of string 8",
+            "Updated value of string 9",
+            "Updated value of string 10",
+        ],
+    ];
+    assert_eq!(result.rows.len(), 3);
+    assert_eq!(result.row_count, Some(10));
+    for (index, row) in result.rows.iter().enumerate() {
+        let numbers = match &row[0] {
+            OracleValue::Array(values) => values.iter().map(value_to_string).collect::<Vec<_>>(),
+            other => panic!("expected NUMBER RETURNING array, got {other:?}"),
+        };
+        let names = match &row[1] {
+            OracleValue::Array(values) => values.iter().map(value_to_string).collect::<Vec<_>>(),
+            other => panic!("expected VARCHAR RETURNING array, got {other:?}"),
+        };
+        assert_eq!(numbers, expected_numbers[index]);
+        assert_eq!(names, expected_names[index]);
+    }
+}
+
+#[test]
+#[ignore = "requires local Oracle listener via ORACLE_THIN_TEST_* environment variables"]
+fn python_oracledb_cursor_execute_many_core_behaviors() {
+    let config = live_config();
+    let table = unique_table_name("EXEC_MANY");
+    let sequence = unique_object_name("EXEC_MANY_SEQ");
+    let _guard = DdlDropGuard::new(
+        config.clone(),
+        vec![
+            format!("DROP TABLE {table} PURGE"),
+            format!("DROP SEQUENCE {sequence}"),
+        ],
+    );
+    let mut conn = connect_with_config(config);
+    conn.query_drop(&format!(
+        "CREATE TABLE {table} (id NUMBER PRIMARY KEY, name VARCHAR2(100), amount NUMBER)"
+    ))
+    .expect("create execute_many core table");
+    conn.query_drop(&format!("CREATE SEQUENCE {sequence} START WITH 21"))
+        .expect("create execute_many sequence");
+
+    let rows = (1..=20)
+        .map(|id| {
+            vec![
+                BindValue::Number(id.to_string()),
+                BindValue::Text(format!("String for row {id}")),
+                if id <= 10 {
+                    BindValue::Null(OracleColumnType::Number)
+                } else {
+                    BindValue::Number(format!("{}.25", id))
+                },
+            ]
+        })
+        .collect();
+    let inserted = conn
+        .execute_many(
+            format!("INSERT INTO {table} (id, name, amount) VALUES (:1, :2, :3)"),
+            rows,
+            false,
+        )
+        .expect("execute_many mixed NULL and NUMBER rows");
+    assert_eq!(inserted.row_count, Some(20));
+
+    let constants = vec![Vec::new(), Vec::new(), Vec::new()];
+    let inserted_constants = conn
+        .execute_many(
+            format!(
+                "INSERT INTO {table} (id, name, amount) \
+                 VALUES ({sequence}.NEXTVAL, 'constant', NULL)"
+            ),
+            constants,
+            false,
+        )
+        .expect("execute_many statement without binds");
+    assert_eq!(inserted_constants.row_count, Some(3));
+
+    let empty = conn
+        .execute_many(
+            format!("INSERT INTO {table} (id) VALUES (:1)"),
+            Vec::new(),
+            false,
+        )
+        .expect("empty execute_many is a no-op");
+    assert_eq!(empty.row_count, Some(0));
+    assert!(conn.execute_many("   ", vec![Vec::new()], false).is_err());
+
+    let result = conn
+        .query_described_fetch_all(
+            format!("SELECT id, name, amount FROM {table} WHERE id IN (1, 11, 23) ORDER BY id"),
+            2,
+        )
+        .expect("verify execute_many rows");
+    assert_eq!(
+        result.result.rows,
+        vec![
+            vec![
+                OracleValue::Number("1".to_string()),
+                OracleValue::Text("String for row 1".to_string()),
+                OracleValue::Null,
+            ],
+            vec![
+                OracleValue::Number("11".to_string()),
+                OracleValue::Text("String for row 11".to_string()),
+                OracleValue::Number("11.25".to_string()),
+            ],
+            vec![
+                OracleValue::Number("23".to_string()),
+                OracleValue::Text("constant".to_string()),
+                OracleValue::Null,
+            ],
+        ]
+    );
+
+    let plsql_rows = (1..=5)
+        .map(|value| {
+            vec![
+                BindValue::Out {
+                    column_type: OracleColumnType::Number,
+                    max_len: 22,
+                },
+                BindValue::Number(value.to_string()),
+            ]
+        })
+        .collect();
+    let out = conn
+        .execute_many_out_binds("BEGIN :1 := :2 * 2; END;", plsql_rows, false)
+        .expect("execute_many PL/SQL OUT binds");
+    assert_eq!(
+        out.rows,
+        (1..=5)
+            .map(|value| vec![OracleValue::Number((value * 2).to_string())])
+            .collect::<Vec<_>>()
+    );
+
+    let mismatch = conn.execute_many(
+        format!("INSERT INTO {table} (id, name) VALUES (:1, :2)"),
+        vec![
+            vec![BindValue::Number("30".to_string())],
+            vec![
+                BindValue::Number("31".to_string()),
+                BindValue::Text("bad width".to_string()),
+            ],
+        ],
+        false,
+    );
+    assert!(mismatch.is_err());
+    assert!(conn
+        .execute_many(
+            "SELECT :1 FROM dual",
+            vec![vec![BindValue::Number("1".to_string())]],
+            false,
+        )
+        .is_err());
+
+    let division_rows = (1..=10)
+        .map(|value| vec![BindValue::Number(value.to_string())])
+        .collect();
+    let error = conn
+        .execute_many(
+            "DECLARE v NUMBER; BEGIN v := 10 / (4 - :1); END;",
+            division_rows,
+            false,
+        )
+        .expect_err("execute_many division by zero should fail");
+    assert_eq!(error.offset(), Some(3));
+}
+
+#[test]
+#[ignore = "requires local Oracle listener via ORACLE_THIN_TEST_* environment variables"]
+fn python_oracledb_4022_execute_many_large_bind_count() {
+    let mut conn = connect();
+    let mut statements = Vec::with_capacity(350);
+    for index in 1..=350 {
+        statements.push(format!(
+            ":out_{index} := :a_{index} + :b_{index} + :c_{index};"
+        ));
+    }
+    let sql = format!("BEGIN {} END;", statements.join(" "));
+    let rows = (0..5)
+        .map(|iteration| {
+            let mut binds = Vec::with_capacity(1400);
+            for value in 1..=350 {
+                binds.push(BindValue::Out {
+                    column_type: OracleColumnType::Number,
+                    max_len: 22,
+                });
+                binds.push(BindValue::Number((value + iteration).to_string()));
+                binds.push(BindValue::Number((value * 2 + iteration).to_string()));
+                binds.push(BindValue::Number((value * 3 + iteration).to_string()));
+            }
+            binds
+        })
+        .collect();
+    let result = conn
+        .execute_many_out_binds(sql, rows, false)
+        .expect("execute_many with 1,400 binds");
+
+    assert_eq!(result.rows.len(), 5);
+    assert!(result.rows.iter().all(|row| row.len() == 350));
+    for (iteration, row) in result.rows.iter().enumerate() {
+        assert_eq!(row[0], OracleValue::Number((6 + iteration * 3).to_string()));
+        assert_eq!(
+            row[349],
+            OracleValue::Number((2100 + iteration * 3).to_string())
+        );
+    }
+}
+
+#[test]
+#[ignore = "requires local Oracle listener via ORACLE_THIN_TEST_* environment variables"]
+fn python_oracledb_3934_to_3936_plsql_rowcount_errors_and_empty_sql() {
+    let mut conn = connect();
+    let result = conn
+        .execute(&StatementRequest::statement("BEGIN NULL; END;"), 0)
+        .expect("execute empty PL/SQL block");
+    assert_eq!(result.row_count, Some(0));
+
+    let error = conn
+        .query_drop("BEGIN RAISE NO_DATA_FOUND; END;")
+        .expect_err("PL/SQL NO_DATA_FOUND should remain an error");
+    assert_eq!(error.full_code().as_deref(), Some("ORA-01403"));
+
+    assert!(conn.query_drop("").is_err());
+    assert!(conn.query_drop("   ").is_err());
+
+    let mut too_few = StatementRequest::query("SELECT :1, :2 FROM dual", 1);
+    too_few.binds.push(BindValue::Number("1".to_string()));
+    let error = conn
+        .query_described_fetch_all_request(&too_few)
+        .expect_err("too few positional binds should fail");
+    assert!(
+        error.to_string().contains("ORA-01008")
+            || error.to_string().contains("not all variables bound")
+    );
+
+    let mut too_many = StatementRequest::query("SELECT :1 FROM dual", 1);
+    too_many.binds.push(BindValue::Number("1".to_string()));
+    too_many.binds.push(BindValue::Number("2".to_string()));
+    assert!(conn.query_described_fetch_all_request(&too_many).is_err());
+
+    let reusable = conn
+        .query_described_fetch_all("SELECT 42 FROM dual", 1)
+        .expect("connection should remain reusable after bind errors");
+    assert_eq!(
+        rows_to_strings(&reusable.result.rows),
+        vec![vec!["42".to_string()]]
+    );
+}
+
+#[test]
+#[ignore = "requires local Oracle listener via ORACLE_THIN_TEST_* environment variables"]
+fn python_oracledb_1609_ref_cursor_input_and_rowid_returning_round_trip() {
+    let config = live_config();
+    let table = unique_table_name("RET_RC");
+    let function_name = unique_object_name("FUNC_RET_RC");
+    let _guard = DdlDropGuard::new(
+        config.clone(),
+        vec![
+            format!("DROP FUNCTION {function_name}"),
+            format!("DROP TABLE {table} PURGE"),
+        ],
+    );
+    let mut conn = connect_with_config(config);
+    conn.query_drop(&format!(
+        "CREATE TABLE {table} (id NUMBER PRIMARY KEY, name VARCHAR2(100))"
+    ))
+    .expect("create REF CURSOR DML RETURNING table");
+    conn.query_drop(&format!(
+        "CREATE OR REPLACE FUNCTION {function_name}(p_cursor IN SYS_REFCURSOR) \
+         RETURN VARCHAR2 IS v_value VARCHAR2(100); BEGIN \
+         FETCH p_cursor INTO v_value; FETCH p_cursor INTO v_value; FETCH p_cursor INTO v_value; \
+         RETURN v_value || ' (Modified)'; END;"
+    ))
+    .expect("create REF CURSOR consumer function");
+
+    let source = StatementRequest::query(
+        "SELECT 'String ' || (level + 4) FROM dual CONNECT BY level <= 3 ORDER BY level",
+        1,
+    );
+    let opened = conn
+        .query_described_initial_without_prefetch_request(&source)
+        .expect("open REF CURSOR without consuming rows");
+    let cursor_id = opened
+        .result
+        .cursor_id
+        .expect("source REF CURSOR should stay open");
+    let cursor_bind = conn
+        .cursor_bind_value(cursor_id)
+        .expect("create REF CURSOR input bind");
+
+    let mut insert = StatementRequest::statement(format!(
+        "INSERT INTO {table} (id, name) VALUES (:1, {function_name}(:2)) \
+         RETURNING ROWID INTO :3"
+    ));
+    insert.binds.push(BindValue::Number("187".to_string()));
+    insert.binds.push(cursor_bind);
+    insert.binds.push(BindValue::Out {
+        column_type: OracleColumnType::Rowid,
+        max_len: 64,
+    });
+    let values = conn
+        .execute_out_binds(&insert, &[])
+        .expect("insert with REF CURSOR and return ROWID");
+    let rowid = match values.first() {
+        Some(OracleValue::Text(value)) => value.clone(),
+        other => panic!("expected ROWID RETURNING text, got {other:?}"),
+    };
+
+    let mut fetch =
+        StatementRequest::query(format!("SELECT id, name FROM {table} WHERE ROWID = :1"), 1);
+    fetch.binds.push(BindValue::Rowid(rowid));
+    let result = conn
+        .query_described_fetch_all_request(&fetch)
+        .expect("fetch row inserted with REF CURSOR");
+    assert_eq!(
+        rows_to_strings(&result.result.rows),
+        vec![vec!["187".to_string(), "String 7 (Modified)".to_string()]]
+    );
+}
+
+#[test]
+#[ignore = "requires local Oracle listener via ORACLE_THIN_TEST_* environment variables"]
+fn python_oracledb_1612_dml_returning_server_error_is_reported() {
+    let config = live_config();
+    let table = unique_table_name("RET_ERROR");
+    let _guard = TableDropGuard::new(config.clone(), table.clone());
+    let mut conn = connect_with_config(config);
+    conn.query_drop(&format!(
+        "CREATE TABLE {table} (id NUMBER PRIMARY KEY, name VARCHAR2(400))"
+    ))
+    .expect("create DML RETURNING error table");
+
+    let mut request = StatementRequest::statement(format!(
+        "INSERT INTO {table} (id, name) VALUES (:1, :2) RETURNING id, name INTO :3, :4"
+    ));
+    request.binds.push(BindValue::Number("7".to_string()));
+    request.binds.push(BindValue::Text("A".repeat(401)));
+    request.binds.push(BindValue::Out {
+        column_type: OracleColumnType::Number,
+        max_len: 22,
+    });
+    request.binds.push(BindValue::Out {
+        column_type: OracleColumnType::Varchar,
+        max_len: 400,
+    });
+    let error = conn
+        .execute_out_binds(&request, &[])
+        .expect_err("oversize value should fail DML RETURNING");
+    assert!(error.to_string().contains("ORA-12899"));
+}
+
+#[test]
+#[ignore = "requires local Oracle listener via ORACLE_THIN_TEST_* environment variables"]
+fn python_oracledb_1613_repeated_dml_returning_without_input_binds() {
+    let config = live_config();
+    let table = unique_table_name("RET_NO_INPUT");
+    let _guard = TableDropGuard::new(config.clone(), table.clone());
+    let mut conn = connect_with_config(config);
+    conn.query_drop(&format!("CREATE TABLE {table} (id NUMBER PRIMARY KEY)"))
+        .expect("create no-input DML RETURNING table");
+
+    for expected in ["1", "2"] {
+        let mut request = StatementRequest::statement(format!(
+            "INSERT INTO {table} (id) VALUES ((SELECT COUNT(*) + 1 FROM {table})) \
+             RETURNING id INTO :1"
+        ));
+        request.binds.push(BindValue::Out {
+            column_type: OracleColumnType::Number,
+            max_len: 22,
+        });
+        let values = conn
+            .execute_out_binds(&request, &[])
+            .expect("repeat no-input DML RETURNING");
+        assert_eq!(value_to_string(&values[0]), expected);
+    }
+}
+
+#[test]
+#[ignore = "requires local Oracle listener via ORACLE_THIN_TEST_* environment variables"]
 fn plsql_function_scalar_return_bind_returns_value() {
     let function_name = unique_object_name("FUNC_SCALAR");
     let mut conn = connect();
@@ -5200,6 +6735,161 @@ fn plsql_nested_cursor_manual_close_releases_parent_on_next_call() {
         .expect("next call should close child and deferred parent without ORA-01001");
 
     drop_procedure_ignore(&mut conn, &procedure_name);
+}
+
+#[test]
+#[ignore = "requires local Oracle listener via ORACLE_THIN_TEST_* environment variables"]
+fn python_oracledb_1305_open_ref_cursor_can_be_bound_as_input() {
+    let procedure_name = unique_object_name("PROC_RC_IN");
+    let mut conn = connect();
+    drop_procedure_ignore(&mut conn, &procedure_name);
+    conn.query_drop(&format!(
+        "CREATE OR REPLACE PROCEDURE {procedure_name}(\
+             p_cursor IN SYS_REFCURSOR, p_value OUT NUMBER) IS \
+         BEGIN FETCH p_cursor INTO p_value; END;"
+    ))
+    .expect("create REF CURSOR input procedure");
+
+    let query = StatementRequest::query(
+        "SELECT level AS value FROM dual CONNECT BY level <= 3 ORDER BY level",
+        1,
+    );
+    let initial = conn
+        .query_described_initial_request(&query)
+        .expect("open input REF CURSOR source query");
+    let cursor_id = initial
+        .result
+        .cursor_id
+        .expect("source query should retain an open cursor");
+    let cursor_bind = conn
+        .cursor_bind_value(cursor_id)
+        .expect("create same-session cursor bind");
+    let mut call = StatementRequest::statement(format!("BEGIN {procedure_name}(:1, :2); END;"));
+    call.binds.push(cursor_bind);
+    call.binds.push(BindValue::Out {
+        column_type: OracleColumnType::Number,
+        max_len: 22,
+    });
+
+    let values = conn
+        .execute_out_binds(&call, &[])
+        .expect("bind open REF CURSOR as input");
+    assert!(matches!(
+        values.get(1),
+        Some(OracleValue::Number(value)) if value == "2"
+    ));
+
+    drop_procedure_ignore(&mut conn, &procedure_name);
+}
+
+#[test]
+#[ignore = "requires local Oracle listener via ORACLE_THIN_TEST_* environment variables"]
+fn python_oracledb_1319_cross_connection_ref_cursor_bind_is_rejected() {
+    let mut source = connect();
+    let mut target = connect();
+    let query = StatementRequest::query(
+        "SELECT level AS value FROM dual CONNECT BY level <= 3 ORDER BY level",
+        1,
+    );
+    let initial = source
+        .query_described_initial_request(&query)
+        .expect("open cross-connection REF CURSOR source");
+    let cursor_id = initial
+        .result
+        .cursor_id
+        .expect("source query should retain an open cursor");
+    let foreign_bind = source
+        .cursor_bind_value(cursor_id)
+        .expect("create source cursor bind");
+    let mut request = StatementRequest::statement("BEGIN NULL; END;");
+    request.binds.push(foreign_bind);
+
+    let error = target
+        .execute_typed(&request, &[])
+        .expect_err("foreign REF CURSOR bind should be rejected locally");
+
+    assert!(error.to_string().contains("different connection"));
+}
+
+#[test]
+#[ignore = "requires local Oracle listener via ORACLE_THIN_TEST_* environment variables"]
+fn python_oracledb_1310_unopened_ref_cursor_bind_fails() {
+    let procedure_name = unique_object_name("PROC_RC_EMPTY");
+    let mut conn = connect();
+    drop_procedure_ignore(&mut conn, &procedure_name);
+    conn.query_drop(&format!(
+        "CREATE OR REPLACE PROCEDURE {procedure_name}(p_cursor IN SYS_REFCURSOR) IS \
+         v_value NUMBER; BEGIN FETCH p_cursor INTO v_value; END;"
+    ))
+    .expect("create unopened REF CURSOR procedure");
+    let mut request = StatementRequest::statement(format!("BEGIN {procedure_name}(:1); END;"));
+    request.binds.push(
+        conn.cursor_bind_value(0)
+            .expect("create unopened cursor bind value"),
+    );
+
+    assert!(
+        conn.execute_typed(&request, &[]).is_err(),
+        "fetching an unopened REF CURSOR must fail"
+    );
+
+    drop_procedure_ignore(&mut conn, &procedure_name);
+}
+
+#[test]
+#[ignore = "requires local Oracle listener via ORACLE_THIN_TEST_* environment variables"]
+fn python_oracledb_1318_ref_cursor_fetch_fails_after_connection_close() {
+    let mut conn = connect();
+    let request = StatementRequest::query(
+        "SELECT level AS value FROM dual CONNECT BY level <= 3 ORDER BY level",
+        1,
+    );
+    let initial = conn
+        .query_described_initial_request(&request)
+        .expect("open REF CURSOR before closing connection");
+    let cursor_id = initial
+        .result
+        .cursor_id
+        .expect("query should retain an open cursor");
+    conn.close().expect("close REF CURSOR connection");
+
+    let error = conn
+        .fetch_ref_cursor_all(cursor_id, initial.columns, 1)
+        .expect_err("REF CURSOR fetch after connection close should fail");
+
+    assert!(error.to_string().contains("closed"));
+}
+
+#[test]
+#[ignore = "requires local Oracle listener via ORACLE_THIN_TEST_* environment variables"]
+fn python_oracledb_1313_1320_nested_cursors_repeat_with_more_child_columns() {
+    let mut conn = connect();
+    for _ in 0..3 {
+        let outer = conn
+            .query_described_fetch_all(
+                "SELECT \
+                    'Top ' || TO_CHAR(outer_rows.n) AS description, \
+                    CURSOR(SELECT 'Nested', outer_rows.n, outer_rows.n + 1 FROM dual) AS nested_cursor \
+                 FROM (SELECT level AS n FROM dual CONNECT BY level <= 5) outer_rows \
+                 ORDER BY outer_rows.n",
+                10,
+            )
+            .expect("fetch repeated outer nested cursors");
+        assert_eq!(outer.result.rows.len(), 5);
+        for (index, row) in outer.result.rows.iter().enumerate() {
+            assert_eq!(value_to_string(&row[0]), format!("Top {}", index + 1));
+            let cursor = match &row[1] {
+                OracleValue::Cursor(cursor) => cursor.clone(),
+                other => panic!("expected nested cursor, got {other:?}"),
+            };
+            assert_eq!(cursor.columns.len(), 3);
+            let nested = conn
+                .fetch_nested_cursor_all(cursor.cursor_id, cursor.columns, 1)
+                .expect("fetch repeated nested cursor");
+            assert_eq!(nested.result.rows.len(), 1);
+            assert_eq!(value_to_string(&nested.result.rows[0][0]), "Nested");
+        }
+    }
 }
 
 #[test]
@@ -8034,6 +9724,100 @@ fn compilation_warning_is_preserved_and_cleared_like_python_oracledb() {
 
 #[test]
 #[ignore = "requires local Oracle listener via ORACLE_THIN_TEST_* environment variables"]
+fn python_oracledb_1704_1706_1707_compilation_warnings_cover_ddl_and_execute_many() {
+    let config = live_config();
+    let procedure_name = unique_object_name("WARN_P");
+    let type_name = unique_object_name("WARN_T");
+    let _guard = DdlDropGuard::new(
+        config.clone(),
+        vec![
+            format!("DROP PROCEDURE {procedure_name}"),
+            format!("DROP TYPE {type_name} FORCE"),
+        ],
+    );
+    let mut conn = connect_with_config(config);
+    if conn
+        .capabilities()
+        .protocol_version
+        .is_some_and(|version| version < 315)
+    {
+        return;
+    }
+
+    conn.query_drop(&format!(
+        "CREATE OR REPLACE PROCEDURE {procedure_name} AS BEGIN NULL END;"
+    ))
+    .expect("create invalid procedure with compilation warning");
+    assert_eq!(conn.last_warning().map(|warning| warning.code), Some(24344));
+
+    conn.query_drop(&format!(
+        "CREATE OR REPLACE PROCEDURE {procedure_name} AS BEGIN NULL; END;"
+    ))
+    .expect("replace invalid procedure with valid procedure");
+    assert!(conn.last_warning().is_none());
+
+    conn.query_drop(&format!(
+        "CREATE OR REPLACE TYPE {type_name} AS OBJECT (x missing_type)"
+    ))
+    .expect("create invalid type with compilation warning");
+    assert_eq!(conn.last_warning().map(|warning| warning.code), Some(24344));
+
+    conn.execute_many(
+        format!("CREATE OR REPLACE PROCEDURE {procedure_name} AS BEGIN NULL END;"),
+        vec![Vec::new()],
+        false,
+    )
+    .expect("execute_many invalid procedure with compilation warning");
+    assert_eq!(conn.last_warning().map(|warning| warning.code), Some(24344));
+}
+
+#[test]
+#[ignore = "requires local Oracle listener via ORACLE_THIN_TEST_* environment variables"]
+fn python_oracledb_1700_parse_error_preserves_server_offset() {
+    let mut conn = connect();
+    let error = conn
+        .query_drop("BEGIN t_missing := 5; END;")
+        .expect_err("invalid PL/SQL should report a parse error");
+
+    assert_eq!(error.full_code().as_deref(), Some("ORA-06550"));
+    assert_eq!(error.code(), Some(6550));
+    assert_eq!(error.offset(), Some(6));
+}
+
+#[test]
+#[ignore = "requires local Oracle listener via ORACLE_THIN_TEST_* environment variables"]
+fn python_oracledb_1709_killed_connection_error_is_recoverable() {
+    let mut admin = connect();
+    let mut victim = connect();
+    let sid = victim
+        .server_session_id()
+        .expect("victim session id should be authenticated");
+    let serial = victim
+        .server_serial_num()
+        .expect("victim serial number should be authenticated");
+
+    let kill = admin.query_drop(&format!(
+        "ALTER SYSTEM KILL SESSION '{sid},{serial}' IMMEDIATE"
+    ));
+    if let Err(error) = kill {
+        if error.to_string().contains("ORA-01031") {
+            eprintln!("skipping killed-session test: test user lacks ALTER SYSTEM");
+            return;
+        }
+        panic!("kill victim session: {error}");
+    }
+
+    let error = victim
+        .query("SELECT user FROM dual", 1)
+        .expect_err("query on killed session should fail");
+    assert!(
+        error.is_recoverable(),
+        "unexpected killed-session error: {error}"
+    );
+}
+
+#[test]
+#[ignore = "requires local Oracle listener via ORACLE_THIN_TEST_* environment variables"]
 fn commit_and_auto_commit_make_changes_visible() {
     let config = live_config();
     let table = unique_table_name("TX");
@@ -8133,6 +9917,95 @@ fn pool_return_rolls_back_uncommitted_work_before_reuse() {
         "pool reset must rollback uncommitted work before reusing a session"
     );
     pool.close();
+}
+
+#[test]
+#[ignore = "requires local Oracle listener via ORACLE_THIN_TEST_* environment variables"]
+fn python_oracledb_pool_limits_lifo_reset_close_and_concurrency() {
+    let config = live_config();
+    let pool = OracleThinSessionPool::new(
+        config.clone(),
+        PoolOptions {
+            max_size: 2,
+            acquire_timeout: Duration::from_millis(100),
+        },
+    );
+    let mut first = pool.acquire().expect("acquire first pooled connection");
+    let first_id = first.connection_id();
+    first
+        .set_call_timeout(Some(Duration::from_secs(3)))
+        .expect("set pooled call timeout");
+    let second = pool.acquire().expect("acquire second pooled connection");
+    let second_id = second.connection_id();
+    assert_ne!(first_id, second_id);
+    let timeout = pool
+        .acquire()
+        .expect_err("pool acquire beyond max should time out");
+    assert!(timeout.to_string().contains("timed out"));
+
+    drop(first);
+    let reset = pool.acquire().expect("reacquire first connection");
+    assert_eq!(reset.connection_id(), first_id);
+    assert_eq!(reset.call_timeout().expect("read reset call timeout"), None);
+    drop(reset);
+    drop(second);
+    let lifo = pool
+        .acquire()
+        .expect("acquire most recently returned connection");
+    assert_eq!(lifo.connection_id(), second_id);
+    pool.close();
+    let closed = pool
+        .acquire()
+        .expect_err("acquire from closed pool should fail");
+    assert!(closed.to_string().contains("closed"));
+    drop(lifo);
+
+    let replacement_pool = OracleThinSessionPool::new(
+        config.clone(),
+        PoolOptions {
+            max_size: 1,
+            acquire_timeout: Duration::from_secs(2),
+        },
+    );
+    let mut broken = replacement_pool
+        .acquire()
+        .expect("acquire connection to discard");
+    let broken_id = broken.connection_id();
+    broken.mark_broken();
+    drop(broken);
+    let replacement = replacement_pool
+        .acquire()
+        .expect("replace broken pooled connection");
+    assert_ne!(replacement.connection_id(), broken_id);
+    drop(replacement);
+    replacement_pool.close();
+
+    let thread_pool = OracleThinSessionPool::new(
+        config,
+        PoolOptions {
+            max_size: 4,
+            acquire_timeout: Duration::from_secs(5),
+        },
+    );
+    let handles = (0..12)
+        .map(|_| {
+            let pool = thread_pool.clone();
+            thread::spawn(move || {
+                let mut conn = pool.acquire().expect("thread pool acquire");
+                let result = conn
+                    .query_described_fetch_all("SELECT 1 FROM dual", 1)
+                    .expect("thread pool query");
+                assert_eq!(
+                    rows_to_strings(&result.result.rows),
+                    vec![vec!["1".to_string()]]
+                );
+            })
+        })
+        .collect::<Vec<_>>();
+    for handle in handles {
+        handle.join().expect("pooled worker should not panic");
+    }
+    thread_pool.close();
 }
 
 #[test]
@@ -8294,6 +10167,23 @@ fn connect() -> OracleThinSession {
 
 fn connect_with_config(config: OracleThinConfig) -> OracleThinSession {
     OracleThinSession::connect(config).expect("thin login")
+}
+
+fn test_user_config(
+    base_config: &OracleThinConfig,
+    username: &str,
+    password: &str,
+) -> OracleThinConfig {
+    let mut config = base_config.clone();
+    config.username = username.to_string();
+    config.password = password.to_string();
+    config.new_password = None;
+    config.proxy_user = None;
+    config
+}
+
+fn quoted_oracle_password(password: &str) -> String {
+    format!("\"{}\"", password.replace('"', "\"\""))
 }
 
 fn env_or(primary: &str, fallback: &str, default: &str) -> String {
@@ -9242,6 +11132,38 @@ fn oracle_datetime(
 struct TableDropGuard {
     config: OracleThinConfig,
     table: String,
+}
+
+struct TestUserDropGuard {
+    config: OracleThinConfig,
+    username: String,
+}
+
+impl TestUserDropGuard {
+    fn create(config: &OracleThinConfig, username: &str, password: &str) -> Self {
+        let mut admin = connect_with_config(config.clone());
+        admin
+            .query_drop(&format!(
+                "CREATE USER {username} IDENTIFIED BY {}",
+                quoted_oracle_password(password)
+            ))
+            .expect("create isolated password test user");
+        admin
+            .query_drop(&format!("GRANT CREATE SESSION TO {username}"))
+            .expect("grant session to isolated password test user");
+        Self {
+            config: config.clone(),
+            username: username.to_string(),
+        }
+    }
+}
+
+impl Drop for TestUserDropGuard {
+    fn drop(&mut self) {
+        if let Ok(mut admin) = OracleThinSession::connect(self.config.clone()) {
+            let _ = admin.query_drop(&format!("DROP USER {} CASCADE", self.username));
+        }
+    }
 }
 
 impl TableDropGuard {

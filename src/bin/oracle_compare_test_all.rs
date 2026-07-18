@@ -58,14 +58,20 @@ fn oracle_connection_info(mode: OracleDriverMode) -> ConnectionInfo {
     info
 }
 
-fn run_script(mode: OracleDriverMode, sql: &str) -> Result<(Vec<QueryProgress>, u32), String> {
+fn run_script(
+    mode: OracleDriverMode,
+    sql: &str,
+    auto_commit: bool,
+) -> Result<(Vec<QueryProgress>, u32), String> {
     let mut connection = DatabaseConnection::new();
     connection.connect(oracle_connection_info(mode))?;
-    connection.set_auto_commit(true)?;
-    let sid = read_current_sid(&connection, mode)?;
+    connection.set_auto_commit(auto_commit)?;
+    let sid = auto_commit
+        .then(|| read_current_sid(&connection, mode))
+        .transpose()?;
     let shared_connection = Arc::new(Mutex::new(connection));
     let timeout_input = IntInput::default();
-    let mut widget = SqlEditorWidget::new(shared_connection, timeout_input);
+    let mut widget = SqlEditorWidget::new(Arc::clone(&shared_connection), timeout_input);
     let progress = Arc::new(Mutex::new(Vec::new()));
     let done = Arc::new(AtomicBool::new(false));
     let trace_progress = env::var_os("ORACLE_COMPARE_TRACE_PROGRESS").is_some();
@@ -124,6 +130,15 @@ fn run_script(mode: OracleDriverMode, sql: &str) -> Result<(Vec<QueryProgress>, 
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
         .clone();
+    let sid = match sid {
+        Some(sid) => sid,
+        None => {
+            let connection = shared_connection
+                .lock()
+                .map_err(|_| "Oracle compare connection mutex poisoned".to_string())?;
+            read_current_sid(&connection, mode)?
+        }
+    };
     let open_cursor_count = read_open_cursor_count_for_sid(mode, &sid)?;
     Ok((events, open_cursor_count))
 }
@@ -413,6 +428,9 @@ fn mode_from_arg(value: &str) -> Result<OracleDriverMode, String> {
 
 fn child_run(mode: OracleDriverMode, path: &str) -> Result<DriverRunSnapshot, String> {
     let _app = app::App::default();
+    let is_final_sql =
+        Path::new(path).file_name().and_then(|name| name.to_str()) == Some("final.sql");
+    let auto_commit = !is_final_sql;
     let sql = if path == "__cleanup__" {
         cleanup_sql().to_string()
     } else {
@@ -423,10 +441,14 @@ fn child_run(mode: OracleDriverMode, path: &str) -> Result<DriverRunSnapshot, St
         } else {
             body
         };
-        format!("BEGIN DBMS_RANDOM.SEED(424242); END;\n/\n{body}\n")
+        if is_final_sql {
+            body
+        } else {
+            format!("BEGIN DBMS_RANDOM.SEED(424242); END;\n/\n{body}\n")
+        }
     };
 
-    let (progress, open_cursor_count) = run_script(mode, &sql)?;
+    let (progress, open_cursor_count) = run_script(mode, &sql, auto_commit)?;
     Ok(DriverRunSnapshot {
         failures: failures(&progress),
         grids: grids(&progress),
@@ -541,9 +563,26 @@ fn parent_run(path: &str) -> Result<(), String> {
         return Err("Oracle Thin select cells differ from OCI".to_string());
     }
 
+    let compared_cells = thin
+        .grids
+        .iter()
+        .flat_map(|grid| grid.rows.iter())
+        .map(Vec::len)
+        .sum::<usize>();
+    let exact_cells = oci
+        .grids
+        .iter()
+        .zip(thin.grids.iter())
+        .flat_map(|(oci_grid, thin_grid)| oci_grid.rows.iter().zip(thin_grid.rows.iter()))
+        .flat_map(|(oci_row, thin_row)| oci_row.iter().zip(thin_row.iter()))
+        .filter(|(oci_cell, thin_cell)| oci_cell == thin_cell)
+        .count();
     println!(
-        "Oracle OCI and Thin matched {} select/grid result(s) from {path}",
-        thin.grids.len()
+        "Oracle OCI and Thin matched {} select/grid result(s), {} cell(s) ({} exact, {} semantic) from {path}",
+        thin.grids.len(),
+        compared_cells,
+        exact_cells,
+        compared_cells.saturating_sub(exact_cells),
     );
     Ok(())
 }

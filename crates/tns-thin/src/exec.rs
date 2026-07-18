@@ -7,7 +7,7 @@
 // against go-ora (MIT License, Copyright (c) 2020 Samy Sultan).
 // See THIRD_PARTY_NOTICES.md.
 
-use crate::OracleDateTime;
+use crate::{OracleDateTime, OracleThinError};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OracleColumnType {
@@ -88,6 +88,17 @@ pub enum BindValue {
     Bfile {
         directory_alias: String,
         file_name: String,
+    },
+    Cursor {
+        cursor_id: u32,
+        connection_id: u64,
+    },
+    Array {
+        column_type: OracleColumnType,
+        max_len: u32,
+        max_num_elements: u32,
+        values: Vec<Option<BindInputValue>>,
+        out: bool,
     },
     LobLocator {
         column_type: OracleColumnType,
@@ -218,6 +229,7 @@ pub struct StatementRequest {
     pub auto_commit: bool,
     pub implicit_resultsets: bool,
     pub binds: Vec<BindValue>,
+    pub bind_rows: Vec<Vec<BindValue>>,
 }
 
 impl StatementRequest {
@@ -235,6 +247,7 @@ impl StatementRequest {
             auto_commit: false,
             implicit_resultsets: is_plsql,
             binds: Vec::new(),
+            bind_rows: Vec::new(),
         }
     }
 
@@ -258,6 +271,18 @@ impl StatementRequest {
 
 pub fn sql_is_dml_returning(sql: &str) -> bool {
     sql_dml_returning_into_tail(sql).is_some()
+}
+
+pub fn sql_dml_returning_has_duplicate_bind(sql: &str) -> bool {
+    let Some(into_tail) = sql_dml_returning_into_tail(sql) else {
+        return false;
+    };
+    let prefix_len = sql.len().saturating_sub(into_tail.len());
+    let input_names = parse_sql_bind_names(&sql[..prefix_len]).unwrap_or_default();
+    let output_names = parse_sql_bind_names(into_tail).unwrap_or_default();
+    input_names
+        .iter()
+        .any(|input| output_names.iter().any(|output| output == input))
 }
 
 pub fn sql_dml_returning_into_tail(sql: &str) -> Option<&str> {
@@ -349,6 +374,184 @@ fn sql_keyword_positions(sql: &str) -> Vec<(String, usize)> {
     keywords
 }
 
+pub fn parse_sql_bind_names(sql: &str) -> Result<Vec<String>, OracleThinError> {
+    let mut names = Vec::new();
+    let mut index = 0;
+    while index < sql.len() {
+        if let Some(end) = checked_q_quote_end(sql, index)? {
+            index = end;
+            continue;
+        }
+        let Some(ch) = sql[index..].chars().next() else {
+            break;
+        };
+        if ch == '\'' {
+            index = checked_quoted_end(sql, index, '\'')?;
+            continue;
+        }
+        if ch == '"' {
+            index = checked_quoted_end(sql, index, '"')?;
+            continue;
+        }
+        if sql[index..].starts_with("--") {
+            index = sql[index..]
+                .find(|ch| matches!(ch, '\n' | '\r'))
+                .map_or(sql.len(), |offset| index + offset + 1);
+            continue;
+        }
+        if sql[index..].starts_with("/*") {
+            index = sql[index + 2..]
+                .find("*/")
+                .map_or(sql.len(), |offset| index + 2 + offset + 2);
+            continue;
+        }
+        if ch != ':' {
+            index += ch.len_utf8();
+            continue;
+        }
+
+        let colon = index;
+        index += ch.len_utf8();
+        if sql[index..].starts_with('=') {
+            index += '='.len_utf8();
+            continue;
+        }
+        if sql[index..].starts_with(':') {
+            continue;
+        }
+        if sql[..colon]
+            .chars()
+            .rev()
+            .find(|previous| !previous.is_whitespace())
+            .is_some_and(|previous| matches!(previous, '\'' | '"'))
+        {
+            continue;
+        }
+
+        while let Some(space) = sql[index..].chars().next().filter(|ch| ch.is_whitespace()) {
+            index += space.len_utf8();
+        }
+        let Some(first) = sql[index..].chars().next() else {
+            continue;
+        };
+        if first == '"' {
+            let name_start = index + first.len_utf8();
+            let end = checked_quoted_end(sql, index, '"')?;
+            let name_end = end - '"'.len_utf8();
+            let name = &sql[name_start..name_end];
+            if !name.is_empty() && !names.iter().any(|existing| existing == name) {
+                names.push(name.to_string());
+            }
+            index = end;
+            continue;
+        }
+        if !(first.is_alphanumeric() || first == '_' || first == '$' || first == '#') {
+            continue;
+        }
+        let name_start = index;
+        index += first.len_utf8();
+        while let Some(next) = sql[index..].chars().next() {
+            if next.is_alphanumeric() || matches!(next, '_' | '$' | '#') {
+                index += next.len_utf8();
+            } else {
+                break;
+            }
+        }
+        let name = sql[name_start..index].to_uppercase();
+        if !names.iter().any(|existing| existing == &name) {
+            names.push(name);
+        }
+    }
+    Ok(names)
+}
+
+fn checked_quoted_end(sql: &str, start: usize, quote: char) -> Result<usize, OracleThinError> {
+    let mut index = start + quote.len_utf8();
+    while index < sql.len() {
+        let Some(ch) = sql[index..].chars().next() else {
+            return Err(OracleThinError::new(
+                "DPY-2041: SQL text contains an unterminated quoted string",
+            ));
+        };
+        index += ch.len_utf8();
+        if ch == quote {
+            if sql[index..].starts_with(quote) {
+                index += quote.len_utf8();
+            } else {
+                return Ok(index);
+            }
+        }
+    }
+    Err(OracleThinError::new(
+        "DPY-2041: SQL text contains an unterminated quoted string",
+    ))
+}
+
+fn checked_q_quote_end(sql: &str, start: usize) -> Result<Option<usize>, OracleThinError> {
+    if start > 0
+        && sql[..start]
+            .chars()
+            .next_back()
+            .is_some_and(is_sql_identifier_part)
+    {
+        return Ok(None);
+    }
+
+    let mut chars = sql[start..].char_indices();
+    let Some((_, first)) = chars.next() else {
+        return Ok(None);
+    };
+    let delimiter_rel = if first == 'q' || first == 'Q' {
+        let Some((_, quote)) = chars.next() else {
+            return Ok(None);
+        };
+        if quote != '\'' {
+            return Ok(None);
+        }
+        chars.next().map(|(offset, _)| offset)
+    } else if first == 'n' || first == 'N' {
+        let Some((_, second)) = chars.next() else {
+            return Ok(None);
+        };
+        if second != 'q' && second != 'Q' {
+            return Ok(None);
+        }
+        let Some((_, quote)) = chars.next() else {
+            return Ok(None);
+        };
+        if quote != '\'' {
+            return Ok(None);
+        }
+        chars.next().map(|(offset, _)| offset)
+    } else {
+        return Ok(None);
+    };
+    let Some(delimiter_rel) = delimiter_rel else {
+        return Err(invalid_q_quote_error());
+    };
+    let Some(delimiter) = sql[start + delimiter_rel..].chars().next() else {
+        return Err(invalid_q_quote_error());
+    };
+    if !is_valid_q_quote_delimiter(delimiter) {
+        return Err(invalid_q_quote_error());
+    }
+    let content_start = start + delimiter_rel + delimiter.len_utf8();
+    let closing = q_quote_closing(delimiter);
+    for (offset, ch) in sql[content_start..].char_indices() {
+        if ch == closing {
+            let quote_start = content_start + offset + ch.len_utf8();
+            if sql[quote_start..].starts_with('\'') {
+                return Ok(Some(quote_start + '\''.len_utf8()));
+            }
+        }
+    }
+    Err(invalid_q_quote_error())
+}
+
+fn invalid_q_quote_error() -> OracleThinError {
+    OracleThinError::new("DPY-2041: SQL text contains an unterminated q-quoted string")
+}
+
 fn skip_q_quote(sql: &str, start: usize) -> Option<usize> {
     if start > 0
         && sql[..start]
@@ -401,7 +604,7 @@ fn skip_q_quote(sql: &str, start: usize) -> Option<usize> {
 }
 
 fn is_sql_identifier_part(ch: char) -> bool {
-    ch.is_ascii_alphanumeric() || matches!(ch, '_' | '$' | '#')
+    ch.is_alphanumeric() || matches!(ch, '_' | '$' | '#')
 }
 
 fn is_valid_q_quote_delimiter(delimiter: char) -> bool {
@@ -431,4 +634,81 @@ fn is_query_head(head: &str) -> bool {
 
 fn is_plsql_head(head: &str) -> bool {
     matches!(head, "begin" | "declare" | "call")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_sql_bind_names;
+
+    fn bind_names(sql: &str) -> Vec<String> {
+        parse_sql_bind_names(sql).expect("parse SQL bind names")
+    }
+
+    fn expected_names(values: &[&str]) -> Vec<String> {
+        values.iter().map(|value| (*value).to_string()).collect()
+    }
+
+    #[test]
+    fn sql_parser_matches_python_oracledb_bind_name_rules() {
+        assert_eq!(
+            bind_names(
+                "--begin :ignored := :also_ignored;\n\
+                 begin :value2 := :a + :c + :a; end; -- :ignored"
+            ),
+            expected_names(&["VALUE2", "A", "C"])
+        );
+        assert_eq!(
+            bind_names(
+                "/* :ignored ***/ select :table_name, :value from dual \
+                 /* quotes ' :ignored \" :ignored */"
+            ),
+            expected_names(&["TABLE_NAME", "VALUE"])
+        );
+        assert_eq!(
+            bind_names(
+                r#"select '20021231 :ignored', "invalid:bind", :méil$, : "VaLue_2",
+                           :"*/3VALUE", :"more :: %colons%" from dual"#
+            ),
+            expected_names(&["MÉIL$", "VaLue_2", "*/3VALUE", "more :: %colons%"])
+        );
+        assert_eq!(
+            bind_names(
+                r#"select :a, q'{This contains ' and " and :}', :b,
+                           q'[still :ignored]', :c, q'<:ignored>', :d,
+                           q'(:ignored)', :e, q'$:ignored$', :f from dual"#
+            ),
+            expected_names(&["A", "B", "C", "D", "E", "F"])
+        );
+        assert_eq!(
+            bind_names(
+                "select json_object('foo':dummy), :bv1, \
+                 json_object('foo'::bv2), :bv3, \
+                 json { 'key1': 57, 'key2' : 58 }, :bv4 from dual"
+            ),
+            expected_names(&["BV1", "BV2", "BV3", "BV4"])
+        );
+        assert_eq!(
+            bind_names(
+                "begin :value2 := :a + :b + :c + :a; \
+                 :value2\n:=\n:a + :c; end;"
+            ),
+            expected_names(&["VALUE2", "A", "B", "C"])
+        );
+        assert_eq!(
+            bind_names("(select :a / :b from dual) union (select :c / :d from dual)"),
+            expected_names(&["A", "B", "C", "D"])
+        );
+    }
+
+    #[test]
+    fn sql_parser_rejects_unterminated_strings_like_python_oracledb() {
+        for sql in [
+            "select q'[something from dual",
+            "select 'abc, :a from dual",
+            "select q'[abc'], 5 from dual",
+        ] {
+            let error = parse_sql_bind_names(sql).expect_err("reject malformed SQL quoting");
+            assert!(error.to_string().starts_with("DPY-2041:"));
+        }
+    }
 }

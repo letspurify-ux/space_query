@@ -112,12 +112,19 @@ impl ConnectTarget {
     }
 
     pub fn easy_connect_string(&self) -> String {
-        if !self.service_name.is_empty() {
-            format!("//{}:{}/{}", self.host, self.port, self.service_name)
-        } else if let Some(sid) = self.sid.as_deref() {
-            format!("//{}:{}/?sid={}", self.host, self.port, sid)
+        let host = if self.host.contains(':')
+            && !(self.host.starts_with('[') && self.host.ends_with(']'))
+        {
+            format!("[{}]", self.host)
         } else {
-            format!("//{}:{}/", self.host, self.port)
+            self.host.clone()
+        };
+        if !self.service_name.is_empty() {
+            format!("//{host}:{}/{}", self.port, self.service_name)
+        } else if let Some(sid) = self.sid.as_deref() {
+            format!("//{host}:{}/?sid={}", self.port, sid)
+        } else {
+            format!("//{host}:{}/", self.port)
         }
     }
 }
@@ -963,6 +970,37 @@ mod tests {
         assert_eq!(options.connection_id, None);
         assert_eq!(options.connection_id_prefix, None);
         assert_eq!(options.sdu, super::TNS_DEFAULT_SDU);
+    }
+
+    #[test]
+    fn easy_connect_strings_include_ports_services_and_ipv6_brackets() {
+        assert_eq!(
+            ConnectTarget::service_name("dbhost", 1522, "service_name").easy_connect_string(),
+            "//dbhost:1522/service_name"
+        );
+        assert_eq!(
+            ConnectTarget::service_name("::1", 1521, "FREEPDB1").easy_connect_string(),
+            "//[::1]:1521/FREEPDB1"
+        );
+        assert_eq!(
+            ConnectTarget::sid("[2001:db8::1]", 1521, "ORCL").easy_connect_string(),
+            "//[2001:db8::1]:1521/?sid=ORCL"
+        );
+    }
+
+    #[test]
+    fn connect_data_requires_service_name_or_sid() {
+        let target = ConnectTarget {
+            host: "dbhost".to_string(),
+            port: 1521,
+            service_name: String::new(),
+            sid: None,
+            instance_name: None,
+            server_type: None,
+        };
+        let error = build_connect_data(&target, &ConnectOptions::default())
+            .expect_err("connect data without service or SID should fail");
+        assert!(error.to_string().contains("service name or SID"));
     }
 
     #[test]

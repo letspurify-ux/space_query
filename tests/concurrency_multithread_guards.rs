@@ -51,7 +51,7 @@ fn compact_for_pattern(value: &str) -> String {
 fn oracle_thin_pool_acquire_drops_pool_lock_before_connection_hooks() {
     let content = read_source("crates/tns-thin/src/pool.rs");
     let start = content
-        .find("while let Some(conn) = guard.idle.pop_front()")
+        .find("while let Some(conn) = guard.idle.pop_back()")
         .expect("Oracle Thin idle checkout loop should exist");
     let end = content[start..]
         .find("if guard.open_count < self.inner.options.max_size")

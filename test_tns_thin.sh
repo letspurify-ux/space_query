@@ -7,7 +7,7 @@ Usage:
   ./test_tns_thin.sh [protocol ...]
 
 Defaults:
-  Runs TNS thin live DB tests and test/test_all.sql compare tests for protocols: 314 315 318 319
+  Runs TNS thin live DB tests and all test/*.txt,test/*.sql compare tests for protocols: 314 315 318 319
 
 Environment:
   ORACLE_TEST_HOST             default: 127.0.0.1
@@ -279,8 +279,8 @@ check_prereqs() {
 
 run_unit_regression() {
   echo
-  echo "== Unit regression: tns-thin core =="
-  cargo test --manifest-path crates/tns-thin/Cargo.toml --lib
+  echo "== Unit regression: tns-thin core and coverage audit =="
+  cargo test --manifest-path crates/tns-thin/Cargo.toml
 }
 
 run_live_tns_for_protocol() {
@@ -315,6 +315,13 @@ run_compare_for_protocol() {
     ORACLE_THIN_DESIRED_PROTOCOL="$protocol" \
       cargo test --test oracle_compare_test_all_live \
         "oracle_compare_test_all_protocol_${protocol}" -- \
+        --ignored \
+        --nocapture \
+        --test-threads=1
+    echo "== oracle_compare all test fixtures protocol $protocol =="
+    ORACLE_THIN_DESIRED_PROTOCOL="$protocol" \
+      cargo test --test oracle_compare_test_all_live \
+        "oracle_compare_all_fixture_files_protocol_${protocol}" -- \
         --ignored \
         --nocapture \
         --test-threads=1
