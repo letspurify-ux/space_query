@@ -30643,7 +30643,7 @@ DROP TEMPORARY TABLE IF EXISTS qt_result_route_monitor;
 
     #[test]
     #[ignore = "requires local MySQL 8 test database via SPACE_QUERY_TEST_MYSQL_* env vars"]
-    fn execute_mysql_batch_manual_final_reaches_pass_status() {
+    fn execute_mysql_batch_formatted_manual_final_reaches_pass_status() {
         if !mysql_test_server_is_mysql8_or_newer().unwrap_or(false) {
             eprintln!("skipping: test_mysql/final.sql requires MySQL 8 or newer");
             return;
@@ -30652,17 +30652,19 @@ DROP TEMPORARY TABLE IF EXISTS qt_result_route_monitor;
         else {
             return;
         };
-        let progress = harness.execute(
+        let formatted = SqlEditorWidget::format_for_auto_formatting_with_db_type(
             include_str!("../../../test_mysql/final.sql"),
-            "mysql manual final certification",
+            false,
+            Some(DatabaseType::MySQL),
         );
+        let progress = harness.execute(&formatted, "formatted mysql manual final certification");
         assert_no_failed_mysql_statement(&progress);
         assert_mysql_manual_final_status_pass(&progress);
     }
 
     #[test]
     #[ignore = "requires local MariaDB test database via SPACE_QUERY_TEST_MYSQL_* env vars"]
-    fn execute_mariadb_batch_manual_final_reaches_pass_status() {
+    fn execute_mariadb_batch_formatted_manual_final_reaches_pass_status() {
         if !mysql_test_server_is_mariadb().unwrap_or(false) {
             eprintln!("skipping: test_mariadb/final.sql requires MariaDB");
             return;
@@ -30671,10 +30673,12 @@ DROP TEMPORARY TABLE IF EXISTS qt_result_route_monitor;
         else {
             return;
         };
-        let progress = harness.execute(
+        let formatted = SqlEditorWidget::format_for_auto_formatting_with_db_type(
             include_str!("../../../test_mariadb/final.sql"),
-            "mariadb manual final certification",
+            false,
+            Some(DatabaseType::MariaDB),
         );
+        let progress = harness.execute(&formatted, "formatted mariadb manual final certification");
         assert_no_failed_mysql_statement(&progress);
         assert_mysql_manual_final_status_pass(&progress);
     }
@@ -33400,9 +33404,14 @@ mod mysql_transaction_feedback_tests {
 
     #[test]
     #[ignore = "requires local Oracle listener and executes test/final.sql"]
-    fn oracle_thin_query_tool_runs_manual_final_script_without_errors() {
+    fn oracle_thin_query_tool_runs_formatted_manual_final_script_without_errors() {
         let sql_text = std::fs::read_to_string("test/final.sql").expect("read test/final.sql");
-        let progress = oracle_thin_run_script_with_auto_commit(&sql_text, false);
+        let formatted = SqlEditorWidget::format_for_auto_formatting_with_db_type(
+            &sql_text,
+            false,
+            Some(DatabaseType::Oracle),
+        );
+        let progress = oracle_thin_run_script_with_auto_commit(&formatted, false);
         let failures = oracle_thin_progress_failures(&progress);
 
         assert!(

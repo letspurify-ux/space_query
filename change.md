@@ -4527,7 +4527,7 @@ unknown 상태의 의미를 좁혔다. `SET`의 우변에 등장한 `@var`는 as
 30,120 frame, failures=0)였다. 자동 결과를 신뢰하지 않고 66개 `.format.out`
 53,361줄을 다시 전수 검토했다.
 
-- Oracle 43개 파일: 처음부터 끝까지 정독.
+- Oracle 42개 파일: 처음부터 끝까지 정독.
 - MySQL 11개·MariaDB 13개: 대표 파일 정독 + 전 파일 소스↔출력 토큰 diff,
   공백/괄호/들여쓰기 기계 스캔, 플래그된 문맥 전부 정독.
 - 프레임 깊이(rule 1~6), 보존 텍스트(rule 7), 고정구(rule 8), 정규 출력(rule 10)
@@ -4713,8 +4713,103 @@ TO-BE: `ORDER BY remark;` — `BY`(ORDER/GROUP/PARTITION 절)를 절 머리로
 | --- | --- |
 | `formatting_sweep_all_files_generate_out_report` | 통과 — 66개 파일, 30,120 frames, 60,919 boundaries, 15,154 closes, failures 0 |
 | 신규 IdentifierCase 감사 | 90,145 단어쌍 검사, 위반 0 (수정 전 포맷터 기준이면 r.NAME 등 다수 FAIL) |
-| 전수 상세 검토 | 66개 파일 · 53,361줄 — Oracle 43개 전량 정독, MySQL/MariaDB 토큰 diff + 기계 스캔 + 표본 정독, 잔여 미해결 오류 0 |
+| 전수 상세 검토 | 66개 파일 · 53,361줄 — Oracle 42개 전량 정독, MySQL/MariaDB 토큰 diff + 기계 스캔 + 표본 정독, 잔여 미해결 오류 0 |
 | 수정 항목 | 식별자 케이스 침범(31-2) + 일관성 보강(31-5), 산출물 상 대문자화 오류 약 150여 토큰 해소 |
 | 회귀 고정 | 신규 테스트 9개 + 기존 테스트 14개 기대값 갱신 |
 | `cargo test` | 통과 — 전 타깃 합계 6,781 passed · 0 failed · 238 ignored |
 | `cargo clippy --locked --all-targets -- -D warnings -W clippy::perf -W clippy::complexity` | 통과, 경고 0 |
+
+## 33-1. 포맷 sweep 독립 전수 재검토 (2026-07-18)
+
+### AS-IS
+
+`formatting_sweep_all_files_generate_out_report`의 자동 판정은 처음부터
+PASS였지만, PASS 리포트만으로는 사람이 보는 정렬 품질이나 포맷 이후의 실제
+실행 가능성을 증명하지 못했다. 또한 기존 dialect별 `final.sql` live 테스트는
+원본 문자열을 바로 실행해 포맷 결과를 실행하지 않았다.
+
+### TO-BE
+
+지정 명령을 실행해 생성된 `.format.out` 66개를 파일 목록의 처음부터 끝까지,
+각 파일의 첫 줄부터 마지막 리포트 줄까지 독립적으로 다시 읽었다.
+
+| dialect | 산출물 경로 | 파일 | 판독한 줄 |
+| --- | --- | ---: | ---: |
+| Oracle | `target/format-sweep/test` | 42 | 29,228 |
+| MySQL | `target/format-sweep/test_mysql` | 11 | 9,859 |
+| MariaDB | `target/format-sweep/test_mariadb` | 13 | 14,274 |
+| 합계 |  | 66 | 53,361 |
+
+`docs/auto_format_rule.md`의 owner/body/close 깊이, 4칸 배수 들여쓰기,
+SELECT/FROM/SET/VALUES/CTE/CASE/PL/SQL·routine block의 형제 정렬,
+문자열·주석·동적 SQL 보존, tool command, 키워드/식별자 케이스, 정규 출력과
+멱등성을 대조했다. 중첩 CASE·CTE·inline view·window·MODEL·JSON_TABLE·
+XMLTABLE·trigger·handler·transaction·동적 SQL까지 확인했으며 시각적/구조적
+결함은 0건이었다. 따라서 추측성 formatter 본체 수정은 하지 않았다.
+
+후행 공백 기계 스캔이 찾은 세 줄은 모두 원본의 여러 줄 블록 주석 내부와
+바이트 단위로 같았다.
+
+- `test/test17.sql:1` — `/* `
+- `test/test19.sql:1` — `/* `
+- `test/test10.txt:4` — `      ; `
+
+이는 포맷터가 새로 만든 code-line 후행 공백이 아니라 rule 7의 보존 대상이다.
+실제 code line의 후행 공백, 탭 들여쓰기, 4칸 배수 위반, CR 문자는 0건이었다.
+
+## 33-2. 일반화된 frame/depth 감사 확인
+
+기존 sweep은 특정 SQL 문자열을 하드코딩해 비교하는 방식이 아니라 production
+formatter가 만든 모든 managed frame과 list owner를 직접 감사한다. 이번 실행은
+`FormatManagedFrameKind::ALL` 23종과 `ListOwnerKind` 38종을 모두 실제로
+exercise했고 다음 일반 감사가 모두 issue 0이었다.
+
+| 감사 항목 | 검사 수 |
+| --- | ---: |
+| SQL word/식별자 케이스 쌍 | 90,165 |
+| managed frame | 30,129 |
+| frame boundary | 60,928 |
+| 대칭 depth 관계 | 3,011 |
+| frame body item | 27,708 |
+| frame close | 15,155 |
+
+소스↔결과의 SQL statement item/token fingerprint, MySQL-family executable
+boundary, 안전한 공백 변형 probe, 2차 포맷 멱등성도 함께 감사한다. 66개 fixture와
+32개 구조 회귀에서 failures=0이므로 동일 검사를 중복 구현하는 별도 휴리스틱은
+추가하지 않았다.
+
+## 33-3. 포맷 이후 Space Query 실제 실행 보강
+
+AS-IS live certification은 `include_str!(...final.sql)` 또는 원본 파일 문자열을
+Space Query 실행기에 바로 넘겼다.
+
+TO-BE는 각 테스트가 명시적 dialect로
+`format_for_auto_formatting_with_db_type`을 먼저 호출하고 그 결과를 기존
+production batch/Oracle Thin 실행기에 전달한다.
+
+- `execute_mysql_batch_formatted_manual_final_reaches_pass_status`
+- `execute_mariadb_batch_formatted_manual_final_reaches_pass_status`
+- `oracle_thin_query_tool_runs_formatted_manual_final_script_without_errors`
+
+로컬 MySQL 8.0(3307), MariaDB 12.2(3306), Oracle Free(1521) 컨테이너에서
+세 테스트를 각각 실행했다. 모두 failed statement/event 0이었고 각 수동
+`final.sql`의 최종 PASS 행까지 도달했다. 모든 66개 fixture는 sweep에서 동일한
+Space Query script splitter로 포맷 전후 statement item/token 및 실행 경계를
+전수 비교했고 차이는 0건이었다.
+
+## 33-4. 변경 파일
+
+- `src/ui/sql_editor/execution.rs`: dialect별 live certification 3개를 포맷 후
+  실행하도록 보강하고 테스트 이름/활동 라벨을 실제 검증 내용에 맞춤.
+- `change.md`: 이번 전수 검토의 AS-IS/TO-BE, 판정 근거, 실행 검증을 기록하고
+  이전 절의 Oracle 파일 수 오기(43 → 42)를 정정.
+
+## 33-5. 최종 품질 게이트
+
+| 검증 | 결과 |
+| --- | --- |
+| `cargo test --lib formatting_sweep_all_files_generate_out_report -- --ignored --nocapture` | 통과 — 66개 fixture + 32개 회귀, failures 0 |
+| 포맷 후 Space Query live 실행 | Oracle/MySQL/MariaDB `final.sql` 3개 모두 PASS, failed statement/event 0 |
+| `cargo test` | 통과 — 전 타깃 합계 6,785 passed · 0 failed · 238 ignored |
+| `cargo clippy --locked --all-targets -- -D warnings -W clippy::perf -W clippy::complexity` | 통과, 경고 0 |
+| `cargo fmt --all -- --check` / `git diff --check` | 통과 |
