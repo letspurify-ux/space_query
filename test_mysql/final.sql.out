@@ -5,14 +5,10 @@
 --     --show-warnings --binary-mode < test_mysql/final.sql
 --
 -- Reference: https://dev.mysql.com/doc/refman/8.0/en/sql-statements.html
--- This file is newly written and standalone: it does not SOURCE any existing
--- fixture.  It creates only sq_mysql_manual_final plus two short-lived account
--- objects, verifies every result it depends on, and can be run repeatedly.
---
--- manual_topic_coverage retains every official SQL-language manual topic;
--- manual_keyword_coverage and manual_syntax_coverage copy the complete server
--- keyword and HELP catalogs. Every statement family is retained separately.
--- LIVE executes a safe form; CATALOG_ONLY covers external/global operations.
+-- This standalone file creates only sq_mysql_manual_final plus two short-lived
+-- account objects, verifies every result it depends on, and can be run
+-- repeatedly. Coverage comes from syntax the server really parses and executes;
+-- manual-path and copied catalog inventories are intentionally excluded.
 
 DROP DATABASE IF EXISTS sq_mysql_manual_final;
 CREATE DATABASE sq_mysql_manual_final
@@ -26,553 +22,65 @@ SET CHARACTER SET utf8mb4;
 SET SESSION sql_mode = 'TRADITIONAL';
 SET SESSION TRANSACTION ISOLATION LEVEL READ COMMITTED;
 
-CREATE TABLE manual_keyword_coverage AS
-SELECT WORD AS keyword_word, RESERVED AS reserved_flag
-FROM INFORMATION_SCHEMA.KEYWORDS;
-ALTER TABLE manual_keyword_coverage
-  MODIFY keyword_word VARCHAR(128) NOT NULL,
-  ADD PRIMARY KEY (keyword_word);
+-- Executable DDL below keeps each documented type family in real grammar
+-- positions used by completion, formatting, highlighting, and live execution.
+CREATE TABLE editor_type_matrix (
+  type_id TINYINT UNSIGNED NOT NULL,
+  bit_value BIT(8) NOT NULL,
+  small_value SMALLINT,
+  medium_value MEDIUMINT,
+  integer_value INT,
+  big_value BIGINT,
+  decimal_value DECIMAL(20,6),
+  float_value FLOAT,
+  double_value DOUBLE,
+  boolean_value BOOLEAN,
+  char_value CHAR(8),
+  varchar_value VARCHAR(80),
+  binary_value BINARY(4),
+  varbinary_value VARBINARY(16),
+  tinytext_value TINYTEXT,
+  text_value TEXT,
+  mediumtext_value MEDIUMTEXT,
+  longtext_value LONGTEXT,
+  tinyblob_value TINYBLOB,
+  blob_value BLOB,
+  mediumblob_value MEDIUMBLOB,
+  longblob_value LONGBLOB,
+  enum_value ENUM('DDL', 'DML', 'QUERY'),
+  set_value SET('sql', 'json', 'spatial'),
+  date_value DATE,
+  time_value TIME(6),
+  datetime_value DATETIME(6),
+  timestamp_value TIMESTAMP(6) NULL,
+  year_value YEAR,
+  json_value JSON,
+  geometry_value GEOMETRY SRID 0 NOT NULL,
+  generated_value VARCHAR(80)
+    GENERATED ALWAYS AS (UPPER(varchar_value)) VIRTUAL,
+  invisible_value VARCHAR(16) INVISIBLE,
+  PRIMARY KEY (type_id)
+) ENGINE = InnoDB;
 
-CREATE TABLE manual_statement_coverage (
-  statement_name VARCHAR(100) NOT NULL,
-  execution_class ENUM('LIVE', 'CATALOG_ONLY') NOT NULL DEFAULT 'CATALOG_ONLY',
-  PRIMARY KEY (statement_name)
+INSERT INTO editor_type_matrix(
+  type_id, bit_value, small_value, medium_value, integer_value, big_value,
+  decimal_value, float_value, double_value, boolean_value, char_value,
+  varchar_value, binary_value, varbinary_value, tinytext_value, text_value,
+  mediumtext_value, longtext_value, tinyblob_value, blob_value,
+  mediumblob_value, longblob_value, enum_value, set_value, date_value,
+  time_value, datetime_value, timestamp_value, year_value, json_value,
+  geometry_value, invisible_value
+) VALUES (
+  1, b'10101010', 12, 345, 6789, 1234567890123,
+  12345.678901, 1.25, 2.5, TRUE, 'SQL', 'Manual syntax',
+  X'53514C00', X'4D7953514C', 'tiny text', 'text value',
+  'medium text', 'long text', X'01', X'0203', X'0405', X'0607',
+  'DDL', 'sql,json', DATE '2026-07-18', TIME '12:34:56.123456',
+  TIMESTAMP '2026-07-18 12:34:56.123456',
+  TIMESTAMP '2026-07-18 12:34:56.123456', 2026,
+  JSON_OBJECT('kind', 'type-matrix', 'tags', JSON_ARRAY('sql', 'json')),
+  ST_GeomFromText('POINT(1 2)', 0), 'hidden'
 );
-INSERT INTO manual_statement_coverage(statement_name) VALUES
-  ('ALTER DATABASE'), ('ALTER EVENT'), ('ALTER FUNCTION'), ('ALTER INSTANCE'),
-  ('ALTER LOGFILE GROUP'), ('ALTER PROCEDURE'), ('ALTER RESOURCE GROUP'),
-  ('ALTER SERVER'), ('ALTER TABLE'), ('ALTER TABLESPACE'), ('ALTER USER'),
-  ('ALTER VIEW'), ('CREATE DATABASE'), ('CREATE EVENT'), ('CREATE FUNCTION'),
-  ('CREATE INDEX'), ('CREATE LOGFILE GROUP'), ('CREATE PROCEDURE'),
-  ('CREATE RESOURCE GROUP'), ('CREATE ROLE'), ('CREATE SERVER'),
-  ('CREATE SPATIAL REFERENCE SYSTEM'), ('CREATE TABLE'),
-  ('CREATE TABLE LIKE'), ('CREATE TABLE SELECT'), ('CREATE TABLESPACE'),
-  ('CREATE TEMPORARY TABLE'), ('CREATE TRIGGER'), ('CREATE USER'),
-  ('CREATE VIEW'), ('DROP DATABASE'), ('DROP EVENT'), ('DROP FUNCTION'),
-  ('DROP INDEX'), ('DROP LOGFILE GROUP'), ('DROP PROCEDURE'),
-  ('DROP RESOURCE GROUP'), ('DROP ROLE'), ('DROP SERVER'),
-  ('DROP SPATIAL REFERENCE SYSTEM'), ('DROP TABLE'), ('DROP TABLESPACE'),
-  ('DROP TRIGGER'), ('DROP USER'), ('DROP VIEW'), ('RENAME TABLE'),
-  ('TRUNCATE TABLE'), ('CALL'), ('DELETE'), ('DO'), ('EXCEPT'), ('HANDLER'),
-  ('IMPORT TABLE'), ('INSERT'), ('INTERSECT'), ('LOAD DATA'), ('LOAD XML'),
-  ('REPLACE'), ('SELECT'), ('TABLE'), ('UPDATE'), ('UNION'), ('VALUES'),
-  ('WITH'), ('START TRANSACTION'), ('COMMIT'), ('ROLLBACK'), ('SAVEPOINT'),
-  ('ROLLBACK TO SAVEPOINT'), ('RELEASE SAVEPOINT'),
-  ('LOCK INSTANCE FOR BACKUP'), ('UNLOCK INSTANCE'), ('LOCK TABLES'),
-  ('UNLOCK TABLES'), ('SET TRANSACTION'), ('XA START'), ('XA END'),
-  ('XA PREPARE'), ('XA COMMIT'), ('XA ROLLBACK'), ('XA RECOVER'),
-  ('PURGE BINARY LOGS'), ('RESET MASTER'), ('SET SQL_LOG_BIN'),
-  ('CHANGE MASTER TO'), ('CHANGE REPLICATION FILTER'),
-  ('CHANGE REPLICATION SOURCE TO'), ('RESET REPLICA'), ('RESET SLAVE'),
-  ('START REPLICA'), ('START SLAVE'), ('STOP REPLICA'), ('STOP SLAVE'),
-  ('START GROUP_REPLICATION'), ('STOP GROUP_REPLICATION'), ('PREPARE'),
-  ('EXECUTE'), ('DEALLOCATE PREPARE'), ('BEGIN END'), ('STATEMENT LABEL'),
-  ('DECLARE VARIABLE'), ('CASE STATEMENT'), ('IF STATEMENT'), ('ITERATE'),
-  ('LEAVE'), ('LOOP'), ('REPEAT'), ('RETURN'), ('WHILE'),
-  ('DECLARE CURSOR'), ('OPEN CURSOR'), ('FETCH CURSOR'), ('CLOSE CURSOR'),
-  ('DECLARE CONDITION'), ('DECLARE HANDLER'), ('GET DIAGNOSTICS'),
-  ('RESIGNAL'), ('SIGNAL'), ('SET VARIABLE'), ('SET CHARACTER SET'),
-  ('SET NAMES'), ('ALTER USER ACCOUNT'), ('CREATE ROLE ACCOUNT'),
-  ('CREATE USER ACCOUNT'), ('DROP ROLE ACCOUNT'), ('DROP USER ACCOUNT'),
-  ('GRANT'), ('RENAME USER'), ('REVOKE'), ('SET DEFAULT ROLE'),
-  ('SET PASSWORD'), ('SET ROLE'), ('SET RESOURCE GROUP'), ('ANALYZE TABLE'),
-  ('CHECK TABLE'), ('CHECKSUM TABLE'), ('OPTIMIZE TABLE'), ('REPAIR TABLE'),
-  ('CREATE LOADABLE FUNCTION'), ('DROP LOADABLE FUNCTION'),
-  ('INSTALL COMPONENT'), ('INSTALL PLUGIN'), ('UNINSTALL COMPONENT'),
-  ('UNINSTALL PLUGIN'), ('CLONE'), ('SHOW BINARY LOGS'),
-  ('SHOW BINLOG EVENTS'), ('SHOW CHARACTER SET'), ('SHOW COLLATION'),
-  ('SHOW COLUMNS'), ('SHOW CREATE DATABASE'), ('SHOW CREATE EVENT'),
-  ('SHOW CREATE FUNCTION'), ('SHOW CREATE PROCEDURE'), ('SHOW CREATE TABLE'),
-  ('SHOW CREATE TRIGGER'), ('SHOW CREATE USER'), ('SHOW CREATE VIEW'),
-  ('SHOW DATABASES'), ('SHOW ENGINE'), ('SHOW ENGINES'), ('SHOW ERRORS'),
-  ('SHOW EVENTS'), ('SHOW FUNCTION CODE'), ('SHOW FUNCTION STATUS'),
-  ('SHOW GRANTS'), ('SHOW INDEX'), ('SHOW MASTER STATUS'),
-  ('SHOW OPEN TABLES'), ('SHOW PLUGINS'), ('SHOW PRIVILEGES'),
-  ('SHOW PROCEDURE CODE'), ('SHOW PROCEDURE STATUS'), ('SHOW PROCESSLIST'),
-  ('SHOW PROFILE'), ('SHOW PROFILES'), ('SHOW RELAYLOG EVENTS'),
-  ('SHOW REPLICAS'), ('SHOW REPLICA STATUS'), ('SHOW SLAVE HOSTS'),
-  ('SHOW SLAVE STATUS'), ('SHOW STATUS'), ('SHOW TABLE STATUS'),
-  ('SHOW TABLES'), ('SHOW TRIGGERS'), ('SHOW VARIABLES'), ('SHOW WARNINGS'),
-  ('BINLOG'), ('CACHE INDEX'), ('FLUSH'), ('KILL'),
-  ('LOAD INDEX INTO CACHE'), ('RESET'), ('RESET PERSIST'), ('RESTART'),
-  ('SHUTDOWN'), ('DESCRIBE'), ('EXPLAIN'), ('HELP'), ('USE');
-UPDATE manual_statement_coverage
-SET execution_class = 'LIVE'
-WHERE statement_name IN (
-  'ALTER DATABASE', 'ALTER EVENT', 'ALTER TABLE', 'ALTER VIEW',
-  'CREATE DATABASE', 'CREATE EVENT', 'CREATE FUNCTION', 'CREATE INDEX',
-  'CREATE PROCEDURE', 'CREATE ROLE', 'CREATE TABLE', 'CREATE TABLE LIKE',
-  'CREATE TABLE SELECT', 'CREATE TEMPORARY TABLE', 'CREATE TRIGGER',
-  'CREATE USER', 'CREATE VIEW', 'DROP DATABASE', 'DROP EVENT', 'DROP FUNCTION',
-  'DROP INDEX', 'DROP PROCEDURE', 'DROP ROLE', 'DROP TABLE', 'DROP TRIGGER',
-  'DROP USER', 'DROP VIEW', 'RENAME TABLE', 'TRUNCATE TABLE', 'CALL',
-  'DELETE', 'DO', 'EXCEPT', 'HANDLER', 'INSERT', 'INTERSECT', 'REPLACE',
-  'SELECT', 'TABLE', 'UPDATE', 'UNION', 'VALUES', 'WITH',
-  'START TRANSACTION', 'COMMIT', 'ROLLBACK', 'SAVEPOINT',
-  'ROLLBACK TO SAVEPOINT', 'RELEASE SAVEPOINT', 'LOCK TABLES',
-  'UNLOCK TABLES', 'SET TRANSACTION', 'XA START', 'XA END', 'XA PREPARE',
-  'XA COMMIT', 'PREPARE', 'EXECUTE', 'DEALLOCATE PREPARE', 'BEGIN END',
-  'STATEMENT LABEL', 'DECLARE VARIABLE', 'CASE STATEMENT', 'IF STATEMENT',
-  'ITERATE', 'LEAVE', 'LOOP', 'REPEAT', 'WHILE', 'DECLARE CURSOR',
-  'OPEN CURSOR', 'FETCH CURSOR', 'CLOSE CURSOR', 'DECLARE CONDITION',
-  'DECLARE HANDLER', 'GET DIAGNOSTICS', 'SIGNAL', 'SET VARIABLE',
-  'SET CHARACTER SET', 'SET NAMES', 'ALTER USER ACCOUNT',
-  'CREATE ROLE ACCOUNT', 'CREATE USER ACCOUNT', 'DROP ROLE ACCOUNT',
-  'DROP USER ACCOUNT', 'GRANT', 'RENAME USER', 'REVOKE',
-  'SET DEFAULT ROLE', 'ANALYZE TABLE', 'CHECK TABLE', 'CHECKSUM TABLE',
-  'OPTIMIZE TABLE', 'REPAIR TABLE', 'SHOW CHARACTER SET', 'SHOW COLLATION',
-  'SHOW COLUMNS', 'SHOW CREATE DATABASE', 'SHOW CREATE EVENT',
-  'SHOW CREATE FUNCTION', 'SHOW CREATE PROCEDURE', 'SHOW CREATE TABLE',
-  'SHOW CREATE VIEW', 'SHOW DATABASES', 'SHOW ENGINE', 'SHOW ENGINES',
-  'SHOW ERRORS', 'SHOW EVENTS', 'SHOW FUNCTION STATUS', 'SHOW GRANTS',
-  'SHOW INDEX', 'SHOW OPEN TABLES', 'SHOW PLUGINS', 'SHOW PRIVILEGES',
-  'SHOW PROCEDURE STATUS', 'SHOW PROCESSLIST', 'SHOW STATUS',
-  'SHOW TABLE STATUS', 'SHOW TABLES', 'SHOW TRIGGERS', 'SHOW VARIABLES',
-  'SHOW WARNINGS', 'DESCRIBE', 'EXPLAIN', 'HELP', 'USE'
-);
-
-CREATE TABLE manual_syntax_coverage AS
-SELECT help_topic_id,
-       name AS syntax_topic,
-       description AS syntax_text,
-       example AS syntax_example,
-       url AS manual_url
-FROM mysql.help_topic;
-ALTER TABLE manual_syntax_coverage
-  ADD PRIMARY KEY (help_topic_id),
-  ADD UNIQUE KEY uk_manual_syntax_topic (syntax_topic);
-
--- Exact Language Structure, Data Types, Functions and Operators, and
--- SQL Statements sidebar inventory from the official MySQL 8.0 manual.
-CREATE TABLE manual_topic_coverage (
-  manual_path VARCHAR(255) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
-  PRIMARY KEY (manual_path)
-);
-INSERT INTO manual_topic_coverage(manual_path) VALUES
-  ('sql-data-definition-statements.html'),
-  ('atomic-ddl.html'),
-  ('alter-database.html'),
-  ('alter-event.html'),
-  ('alter-function.html'),
-  ('alter-instance.html'),
-  ('alter-logfile-group.html'),
-  ('alter-procedure.html'),
-  ('alter-server.html'),
-  ('alter-table.html'),
-  ('alter-table-partition-operations.html'),
-  ('alter-table-generated-columns.html'),
-  ('alter-table-examples.html'),
-  ('alter-tablespace.html'),
-  ('alter-view.html'),
-  ('create-database.html'),
-  ('create-event.html'),
-  ('create-function.html'),
-  ('create-index.html'),
-  ('create-logfile-group.html'),
-  ('create-procedure.html'),
-  ('create-server.html'),
-  ('create-spatial-reference-system.html'),
-  ('create-table.html'),
-  ('create-table-files.html'),
-  ('create-temporary-table.html'),
-  ('create-table-like.html'),
-  ('create-table-select.html'),
-  ('create-table-foreign-keys.html'),
-  ('create-table-check-constraints.html'),
-  ('silent-column-changes.html'),
-  ('create-table-generated-columns.html'),
-  ('create-table-secondary-indexes.html'),
-  ('invisible-columns.html'),
-  ('create-table-gipks.html'),
-  ('create-table-ndb-comment-options.html'),
-  ('create-tablespace.html'),
-  ('create-trigger.html'),
-  ('create-view.html'),
-  ('drop-database.html'),
-  ('drop-event.html'),
-  ('drop-function.html'),
-  ('drop-index.html'),
-  ('drop-logfile-group.html'),
-  ('drop-procedure.html'),
-  ('drop-server.html'),
-  ('drop-spatial-reference-system.html'),
-  ('drop-table.html'),
-  ('drop-tablespace.html'),
-  ('drop-trigger.html'),
-  ('drop-view.html'),
-  ('rename-table.html'),
-  ('truncate-table.html'),
-  ('sql-data-manipulation-statements.html'),
-  ('call.html'),
-  ('delete.html'),
-  ('do.html'),
-  ('except.html'),
-  ('handler.html'),
-  ('import-table.html'),
-  ('insert.html'),
-  ('insert-select.html'),
-  ('insert-on-duplicate.html'),
-  ('insert-delayed.html'),
-  ('intersect.html'),
-  ('load-data.html'),
-  ('load-xml.html'),
-  ('parenthesized-query-expressions.html'),
-  ('replace.html'),
-  ('select.html'),
-  ('select-into.html'),
-  ('join.html'),
-  ('set-operations.html'),
-  ('subqueries.html'),
-  ('scalar-subqueries.html'),
-  ('comparisons-using-subqueries.html'),
-  ('any-in-some-subqueries.html'),
-  ('all-subqueries.html'),
-  ('row-subqueries.html'),
-  ('exists-and-not-exists-subqueries.html'),
-  ('correlated-subqueries.html'),
-  ('derived-tables.html'),
-  ('lateral-derived-tables.html'),
-  ('subquery-errors.html'),
-  ('optimizing-subqueries.html'),
-  ('subquery-restrictions.html'),
-  ('table.html'),
-  ('update.html'),
-  ('union.html'),
-  ('values.html'),
-  ('with.html'),
-  ('sql-transactional-statements.html'),
-  ('commit.html'),
-  ('cannot-roll-back.html'),
-  ('implicit-commit.html'),
-  ('savepoint.html'),
-  ('lock-instance-for-backup.html'),
-  ('lock-tables.html'),
-  ('set-transaction.html'),
-  ('xa.html'),
-  ('xa-statements.html'),
-  ('xa-states.html'),
-  ('xa-restrictions.html'),
-  ('sql-replication-statements.html'),
-  ('replication-statements-master.html'),
-  ('purge-binary-logs.html'),
-  ('reset-master.html'),
-  ('set-sql-log-bin.html'),
-  ('replication-statements-replica.html'),
-  ('change-master-to.html'),
-  ('change-replication-filter.html'),
-  ('change-replication-source-to.html'),
-  ('reset-replica.html'),
-  ('reset-slave.html'),
-  ('start-replica.html'),
-  ('start-slave.html'),
-  ('stop-replica.html'),
-  ('stop-slave.html'),
-  ('replication-statements-group.html'),
-  ('start-group-replication.html'),
-  ('stop-group-replication.html'),
-  ('sql-prepared-statements.html'),
-  ('prepare.html'),
-  ('execute.html'),
-  ('deallocate-prepare.html'),
-  ('sql-compound-statements.html'),
-  ('begin-end.html'),
-  ('statement-labels.html'),
-  ('declare.html'),
-  ('stored-program-variables.html'),
-  ('declare-local-variable.html'),
-  ('local-variable-scope.html'),
-  ('flow-control-statements.html'),
-  ('case.html'),
-  ('if.html'),
-  ('iterate.html'),
-  ('leave.html'),
-  ('loop.html'),
-  ('repeat.html'),
-  ('return.html'),
-  ('while.html'),
-  ('cursors.html'),
-  ('close.html'),
-  ('declare-cursor.html'),
-  ('fetch.html'),
-  ('open.html'),
-  ('cursor-restrictions.html'),
-  ('condition-handling.html'),
-  ('declare-condition.html'),
-  ('declare-handler.html'),
-  ('get-diagnostics.html'),
-  ('resignal.html'),
-  ('signal.html'),
-  ('handler-scope.html'),
-  ('diagnostics-area.html'),
-  ('conditions-and-parameters.html'),
-  ('condition-handling-restrictions.html'),
-  ('sql-server-administration-statements.html'),
-  ('account-management-statements.html'),
-  ('alter-user.html'),
-  ('create-role.html'),
-  ('create-user.html'),
-  ('drop-role.html'),
-  ('drop-user.html'),
-  ('grant.html'),
-  ('rename-user.html'),
-  ('revoke.html'),
-  ('set-default-role.html'),
-  ('set-password.html'),
-  ('set-role.html'),
-  ('resource-group-statements.html'),
-  ('alter-resource-group.html'),
-  ('create-resource-group.html'),
-  ('drop-resource-group.html'),
-  ('set-resource-group.html'),
-  ('table-maintenance-statements.html'),
-  ('analyze-table.html'),
-  ('check-table.html'),
-  ('checksum-table.html'),
-  ('optimize-table.html'),
-  ('repair-table.html'),
-  ('component-statements.html'),
-  ('create-function-loadable.html'),
-  ('drop-function-loadable.html'),
-  ('install-component.html'),
-  ('install-plugin.html'),
-  ('uninstall-component.html'),
-  ('uninstall-plugin.html'),
-  ('clone.html'),
-  ('set-statement.html'),
-  ('set-variable.html'),
-  ('set-character-set.html'),
-  ('set-names.html'),
-  ('show.html'),
-  ('show-binary-logs.html'),
-  ('show-binlog-events.html'),
-  ('show-character-set.html'),
-  ('show-collation.html'),
-  ('show-columns.html'),
-  ('show-create-database.html'),
-  ('show-create-event.html'),
-  ('show-create-function.html'),
-  ('show-create-procedure.html'),
-  ('show-create-table.html'),
-  ('show-create-trigger.html'),
-  ('show-create-user.html'),
-  ('show-create-view.html'),
-  ('show-databases.html'),
-  ('show-engine.html'),
-  ('show-engines.html'),
-  ('show-errors.html'),
-  ('show-events.html'),
-  ('show-function-code.html'),
-  ('show-function-status.html'),
-  ('show-grants.html'),
-  ('show-index.html'),
-  ('show-master-status.html'),
-  ('show-open-tables.html'),
-  ('show-plugins.html'),
-  ('show-privileges.html'),
-  ('show-procedure-code.html'),
-  ('show-procedure-status.html'),
-  ('show-processlist.html'),
-  ('show-profile.html'),
-  ('show-profiles.html'),
-  ('show-relaylog-events.html'),
-  ('show-replicas.html'),
-  ('show-slave-hosts.html'),
-  ('show-replica-status.html'),
-  ('show-slave-status.html'),
-  ('show-status.html'),
-  ('show-table-status.html'),
-  ('show-tables.html'),
-  ('show-triggers.html'),
-  ('show-variables.html'),
-  ('show-warnings.html'),
-  ('other-administrative-statements.html'),
-  ('binlog.html'),
-  ('cache-index.html'),
-  ('flush.html'),
-  ('kill.html'),
-  ('load-index.html'),
-  ('reset.html'),
-  ('reset-persist.html'),
-  ('restart.html'),
-  ('shutdown.html'),
-  ('sql-utility-statements.html'),
-  ('describe.html'),
-  ('explain.html'),
-  ('help.html'),
-  ('use.html');
-
-INSERT INTO manual_topic_coverage(manual_path) VALUES
-  ('aggregate-functions-and-modifiers.html'),
-  ('aggregate-functions.html'),
-  ('arithmetic-functions.html'),
-  ('assignment-operators.html'),
-  ('binary-varbinary.html'),
-  ('bit-functions.html'),
-  ('bit-type.html'),
-  ('bit-value-literals.html'),
-  ('blob.html'),
-  ('boolean-literals.html'),
-  ('built-in-function-reference.html'),
-  ('cast-functions.html'),
-  ('char.html'),
-  ('choosing-types.html'),
-  ('comments.html'),
-  ('comparison-operators.html'),
-  ('creating-spatial-columns.html'),
-  ('creating-spatial-indexes.html'),
-  ('data-type-defaults.html'),
-  ('data-types.html'),
-  ('date-and-time-functions.html'),
-  ('date-and-time-literals.html'),
-  ('date-and-time-type-conversion.html'),
-  ('date-and-time-type-syntax.html'),
-  ('date-and-time-types.html'),
-  ('datetime.html'),
-  ('encryption-functions.html'),
-  ('enum.html'),
-  ('expressions.html'),
-  ('fetching-spatial-data.html'),
-  ('fixed-point-types.html'),
-  ('floating-point-types.html'),
-  ('flow-control-functions.html'),
-  ('fractional-seconds.html'),
-  ('full-text-adding-collation.html'),
-  ('fulltext-boolean.html'),
-  ('fulltext-fine-tuning.html'),
-  ('fulltext-natural-language.html'),
-  ('fulltext-query-expansion.html'),
-  ('fulltext-restrictions.html'),
-  ('fulltext-search-mecab.html'),
-  ('fulltext-search-ngram.html'),
-  ('fulltext-search.html'),
-  ('fulltext-stopwords.html'),
-  ('function-resolution.html'),
-  ('functions.html'),
-  ('geometry-well-formedness-validity.html'),
-  ('gis-class-curve.html'),
-  ('gis-class-geometry.html'),
-  ('gis-class-geometrycollection.html'),
-  ('gis-class-linestring.html'),
-  ('gis-class-multicurve.html'),
-  ('gis-class-multilinestring.html'),
-  ('gis-class-multipoint.html'),
-  ('gis-class-multipolygon.html'),
-  ('gis-class-multisurface.html'),
-  ('gis-class-point.html'),
-  ('gis-class-polygon.html'),
-  ('gis-class-surface.html'),
-  ('gis-data-formats.html'),
-  ('gis-format-conversion-functions.html'),
-  ('gis-general-property-functions.html'),
-  ('gis-geometry-class-hierarchy.html'),
-  ('gis-geometrycollection-property-functions.html'),
-  ('gis-linestring-property-functions.html'),
-  ('gis-mysql-specific-functions.html'),
-  ('gis-point-property-functions.html'),
-  ('gis-polygon-property-functions.html'),
-  ('gis-property-functions.html'),
-  ('gis-wkb-functions.html'),
-  ('gis-wkt-functions.html'),
-  ('group-by-functional-dependence.html'),
-  ('group-by-handling.html'),
-  ('group-by-modifiers.html'),
-  ('group-replication-functions-for-communication-protocol.html'),
-  ('group-replication-functions-for-maximum-consensus.html'),
-  ('group-replication-functions-for-member-actions.html'),
-  ('group-replication-functions-for-mode.html'),
-  ('group-replication-functions-for-new-primary.html'),
-  ('group-replication-functions.html'),
-  ('gtid-functions.html'),
-  ('hexadecimal-literals.html'),
-  ('identifier-case-sensitivity.html'),
-  ('identifier-length.html'),
-  ('identifier-mapping.html'),
-  ('identifier-qualifiers.html'),
-  ('identifiers.html'),
-  ('information-functions.html'),
-  ('integer-types.html'),
-  ('internal-functions.html'),
-  ('json-attribute-functions.html'),
-  ('json-creation-functions.html'),
-  ('json-function-reference.html'),
-  ('json-functions.html'),
-  ('json-modification-functions.html'),
-  ('json-search-functions.html'),
-  ('json-table-functions.html'),
-  ('json-utility-functions.html'),
-  ('json-validation-functions.html'),
-  ('json.html'),
-  ('keywords.html'),
-  ('language-structure.html'),
-  ('literals.html'),
-  ('loadable-function-reference.html'),
-  ('locking-functions.html'),
-  ('logical-operators.html'),
-  ('mathematical-functions.html'),
-  ('miscellaneous-functions.html'),
-  ('mysql-calendar.html'),
-  ('non-typed-operators.html'),
-  ('null-values.html'),
-  ('number-literals.html'),
-  ('numeric-functions.html'),
-  ('numeric-type-attributes.html'),
-  ('numeric-type-syntax.html'),
-  ('numeric-types.html'),
-  ('opengis-geometry-model.html'),
-  ('operator-precedence.html'),
-  ('optimizing-spatial-analysis.html'),
-  ('other-vendor-data-types.html'),
-  ('out-of-range-and-overflow.html'),
-  ('performance-schema-functions.html'),
-  ('populating-spatial-columns.html'),
-  ('precision-math-decimal-characteristics.html'),
-  ('precision-math-examples.html'),
-  ('precision-math-expressions.html'),
-  ('precision-math-numbers.html'),
-  ('precision-math-rounding.html'),
-  ('precision-math.html'),
-  ('query-attributes.html'),
-  ('regexp.html'),
-  ('replication-functions-async-failover.html'),
-  ('replication-functions-synchronization.html'),
-  ('replication-functions.html'),
-  ('set.html'),
-  ('spatial-aggregate-functions.html'),
-  ('spatial-analysis-functions.html'),
-  ('spatial-convenience-functions.html'),
-  ('spatial-function-argument-handling.html'),
-  ('spatial-function-reference.html'),
-  ('spatial-geohash-functions.html'),
-  ('spatial-geojson-functions.html'),
-  ('spatial-operator-functions.html'),
-  ('spatial-reference-systems.html'),
-  ('spatial-relation-functions-mbr.html'),
-  ('spatial-relation-functions-object-shapes.html'),
-  ('spatial-relation-functions.html'),
-  ('spatial-type-overview.html'),
-  ('spatial-types.html'),
-  ('sql-statements.html'),
-  ('storage-requirements.html'),
-  ('string-comparison-functions.html'),
-  ('string-functions-charset.html'),
-  ('string-functions.html'),
-  ('string-literals.html'),
-  ('string-type-syntax.html'),
-  ('string-types.html'),
-  ('time.html'),
-  ('timestamp-initialization.html'),
-  ('two-digit-years.html'),
-  ('type-conversion.html'),
-  ('user-variables.html'),
-  ('using-spatial-indexes.html'),
-  ('window-function-descriptions.html'),
-  ('window-function-restrictions.html'),
-  ('window-functions-frames.html'),
-  ('window-functions-named-windows.html'),
-  ('window-functions-usage.html'),
-  ('window-functions.html'),
-  ('xml-functions.html'),
-  ('year.html');
 
 CREATE TABLE statement_log (
   id BIGINT NOT NULL AUTO_INCREMENT,
@@ -727,6 +235,19 @@ main_block: BEGIN
     SET loop_value = loop_value - 1;
   UNTIL loop_value = 6 END REPEAT;
 
+  IF loop_value = -1 THEN
+    BEGIN
+      DECLARE EXIT HANDLER FOR SQLEXCEPTION
+      BEGIN
+        GET STACKED DIAGNOSTICS CONDITION 1
+          @returned_sqlstate = RETURNED_SQLSTATE,
+          @returned_message = MESSAGE_TEXT;
+        RESIGNAL;
+      END;
+      SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'unreachable diagnostics probe';
+    END;
+  END IF;
+
   CASE
     WHEN loop_value = 6 THEN SET @compound_result = 'PASS';
     ELSE SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'compound statement failure';
@@ -750,6 +271,13 @@ BEGIN
   SET @last_updated_document = NEW.document_id;
 END$$
 DELIMITER ;
+
+ALTER FUNCTION amount_band
+  COMMENT 'editor grammar scalar function'
+  SQL SECURITY INVOKER;
+ALTER PROCEDURE compound_grammar
+  COMMENT 'editor grammar compound procedure'
+  SQL SECURITY INVOKER;
 
 CALL compound_grammar();
 CALL assert_true(@compound_result = 'PASS', 'compound grammar');
@@ -787,6 +315,120 @@ INSERT INTO metric_partition(metric_id, node_id, measured_on, metric_name, metri
   (3, 2, '2026-01-02', 'latency', 20),
   (4, 2, '2026-01-03', 'errors', 2),
   (5, 3, '2027-01-01', 'latency', 30);
+
+SELECT
+  +integer_value AS unary_plus,
+  -integer_value AS unary_minus,
+  ~integer_value AS bitwise_not,
+  integer_value DIV 2 AS integer_quotient,
+  integer_value MOD 5 AS modulo_keyword,
+  integer_value % 7 AS modulo_operator,
+  integer_value << 1 AS shift_left,
+  integer_value >> 1 AS shift_right,
+  integer_value & 255 AS bitwise_and,
+  integer_value | 1 AS bitwise_or,
+  integer_value ^ 3 AS bitwise_xor,
+  ABS(decimal_value) AS absolute_value,
+  CEIL(decimal_value) AS ceiling_value,
+  FLOOR(decimal_value) AS floor_value,
+  ROUND(decimal_value, 2) AS rounded_value,
+  TRUNCATE(decimal_value, 3) AS truncated_value,
+  POW(double_value, 2) AS power_value,
+  SQRT(double_value) AS square_root,
+  LN(double_value) AS natural_log,
+  LOG10(double_value) AS base10_log,
+  SIGN(decimal_value) AS sign_value,
+  CONCAT_WS(':', char_value, varchar_value) AS concatenated_value,
+  CHAR_LENGTH(varchar_value) AS character_count,
+  OCTET_LENGTH(varchar_value) AS byte_count,
+  LOWER(varchar_value) AS lower_value,
+  UPPER(varchar_value) AS upper_value,
+  TRIM(BOTH ' ' FROM varchar_value) AS trimmed_value,
+  SUBSTRING(varchar_value FROM 1 FOR 6) AS substring_value,
+  LOCATE('syntax', varchar_value) AS located_value,
+  REPLACE(varchar_value, 'Manual', 'Editor') AS replaced_value,
+  REGEXP_INSTR(varchar_value, 'syntax', 1, 1, 0, 'i') AS regexp_position,
+  REGEXP_REPLACE(varchar_value, 'manual', 'editor', 1, 0, 'i') AS regexp_value,
+  HEX(binary_value) AS hexadecimal_value,
+  TO_BASE64(varbinary_value) AS base64_value,
+  EXTRACT(YEAR_MONTH FROM datetime_value) AS extracted_value,
+  DATE_ADD(date_value, INTERVAL 1 DAY) AS added_date,
+  DATE_SUB(date_value, INTERVAL 1 MONTH) AS subtracted_date,
+  TIMESTAMPADD(HOUR, 1, datetime_value) AS added_timestamp,
+  TIMESTAMPDIFF(DAY, date_value, datetime_value) AS timestamp_difference,
+  DATE_FORMAT(datetime_value, '%Y-%m-%d %H:%i:%s') AS formatted_date,
+  STR_TO_DATE('2026-07-18', '%Y-%m-%d') AS parsed_date,
+  CAST(decimal_value AS CHAR(32)) AS cast_value,
+  CONVERT(char_value USING utf8mb4) AS converted_value,
+  IF(boolean_value, 'yes', 'no') AS conditional_value,
+  IFNULL(NULLIF(integer_value, 6789), 6789) AS null_function_value,
+  COALESCE(NULL, varchar_value, char_value) AS coalesced_value,
+  GREATEST(integer_value, small_value) AS greatest_value,
+  LEAST(integer_value, medium_value) AS least_value,
+  json_value->>'$.kind' AS json_kind,
+  JSON_SET(json_value, '$.checked', TRUE) AS json_set_value,
+  JSON_REMOVE(json_value, '$.missing') AS json_removed_value,
+  JSON_CONTAINS(json_value, JSON_QUOTE('sql'), '$.tags') AS json_contains_value,
+  JSON_OVERLAPS(json_value, JSON_OBJECT('kind', 'type-matrix')) AS json_overlap_value,
+  'sql' MEMBER OF (json_value->'$.tags') AS json_member_value,
+  ExtractValue('<manual><db>mysql</db></manual>', '/manual/db') AS xml_value,
+  UpdateXML('<manual><db>sql</db></manual>', '/manual/db', '<db>mysql</db>') AS xml_updated,
+  SHA2(varchar_value, 256) AS sha_value,
+  MD5(varchar_value) AS md5_value,
+  UNCOMPRESS(COMPRESS(varchar_value)) AS uncompressed_value,
+  INET_NTOA(INET_ATON('127.0.0.1')) AS network_value,
+  BIN_TO_UUID(UUID_TO_BIN(UUID(), 1), 1) AS uuid_value,
+  ST_AsText(geometry_value) AS geometry_text
+FROM editor_type_matrix
+WHERE integer_value BETWEEN 1 AND 10000
+  AND integer_value IN (6789, 9876)
+  AND varchar_value LIKE 'Manual%'
+  AND REGEXP_LIKE(varchar_value, 'syntax', 'i')
+  AND boolean_value IS TRUE
+  AND date_value IS NOT NULL
+  AND EXISTS (SELECT 1)
+  AND integer_value = ANY (SELECT 6789)
+  AND integer_value <= ALL (SELECT 6789)
+  AND ROW(integer_value, char_value) = ROW(6789, 'SQL');
+
+SELECT
+  COUNT(*) AS row_count,
+  COUNT(DISTINCT enum_value) AS distinct_count,
+  SUM(decimal_value) AS sum_value,
+  AVG(decimal_value) AS average_value,
+  MIN(integer_value) AS minimum_value,
+  MAX(integer_value) AS maximum_value,
+  GROUP_CONCAT(varchar_value ORDER BY type_id SEPARATOR '|') AS grouped_text,
+  JSON_ARRAYAGG(varchar_value) AS json_array_value,
+  JSON_OBJECTAGG(enum_value, integer_value) AS json_object_value,
+  BIT_AND(integer_value) AS aggregate_bit_and,
+  BIT_OR(integer_value) AS aggregate_bit_or,
+  BIT_XOR(integer_value) AS aggregate_bit_xor,
+  STDDEV_POP(decimal_value) AS population_stddev,
+  STDDEV_SAMP(decimal_value) AS sample_stddev,
+  VAR_POP(decimal_value) AS population_variance,
+  VAR_SAMP(decimal_value) AS sample_variance
+FROM editor_type_matrix;
+
+SELECT
+  type_id,
+  ROW_NUMBER() OVER editor_order AS row_number_value,
+  RANK() OVER editor_order AS rank_value,
+  DENSE_RANK() OVER editor_order AS dense_rank_value,
+  PERCENT_RANK() OVER editor_order AS percent_rank_value,
+  CUME_DIST() OVER editor_order AS cumulative_distribution,
+  NTILE(2) OVER editor_order AS tile_value,
+  FIRST_VALUE(integer_value) OVER editor_frame AS first_value_result,
+  LAST_VALUE(integer_value) OVER editor_frame AS last_value_result,
+  NTH_VALUE(integer_value, 1) OVER editor_frame AS nth_value_result,
+  LAG(integer_value) OVER editor_order AS lag_value,
+  LEAD(integer_value) OVER editor_order AS lead_value
+FROM editor_type_matrix
+WINDOW
+  editor_order AS (ORDER BY type_id),
+  editor_frame AS (
+    editor_order ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING
+  );
 
 WITH RECURSIVE node_tree(node_id, parent_node_id, node_name, depth_no, node_path) AS (
   SELECT node_id, parent_node_id, node_name, 0, CAST(node_name AS CHAR(400))
@@ -858,6 +500,33 @@ FROM document_store
 WHERE MATCH(title, body_text)
         AGAINST('+syntax +search' IN BOOLEAN MODE) > 0;
 
+SELECT DISTINCT enum_value, MAX(integer_value)
+INTO @selected_enum, @selected_integer
+FROM editor_type_matrix
+GROUP BY enum_value
+HAVING COUNT(*) > 0
+ORDER BY enum_value
+LIMIT 1 OFFSET 0;
+
+START TRANSACTION;
+WITH editable_rows AS (
+  SELECT id
+  FROM statement_log
+  WHERE amount >= 10
+)
+UPDATE statement_log AS target
+JOIN editable_rows AS source ON source.id = target.id
+SET target.amount = target.amount;
+SELECT id, category
+FROM statement_log
+WHERE id = 1
+FOR UPDATE NOWAIT;
+SELECT id, category
+FROM statement_log
+WHERE id = 1
+FOR SHARE SKIP LOCKED;
+ROLLBACK;
+
 START TRANSACTION;
 UPDATE document_store d
 JOIN tree_node n ON n.node_id = d.node_id
@@ -896,7 +565,13 @@ INSERT INTO statement_log(category, payload, amount)
 VALUES ('XA', JSON_OBJECT('kind', 'transaction'), 60);
 XA END 'sq-mysql-final-xa';
 XA PREPARE 'sq-mysql-final-xa';
+XA RECOVER CONVERT XID;
 XA COMMIT 'sq-mysql-final-xa';
+
+XA START 'sq-mysql-final-xa-rollback';
+XA END 'sq-mysql-final-xa-rollback';
+XA PREPARE 'sq-mysql-final-xa-rollback';
+XA ROLLBACK 'sq-mysql-final-xa-rollback';
 
 CREATE EVENT syntax_event
   ON SCHEDULE AT CURRENT_TIMESTAMP + INTERVAL 1 DAY
@@ -923,6 +598,7 @@ HELP 'SELECT';
 
 SHOW DATABASES LIKE 'sq_mysql_manual_final';
 SHOW FULL TABLES;
+SHOW TABLE STATUS LIKE 'statement_log';
 SHOW FULL COLUMNS FROM statement_log;
 SHOW INDEX FROM statement_log;
 SHOW CREATE DATABASE sq_mysql_manual_final;
@@ -930,6 +606,7 @@ SHOW CREATE TABLE statement_log;
 SHOW CREATE VIEW statement_log_v;
 SHOW CREATE PROCEDURE compound_grammar;
 SHOW CREATE FUNCTION amount_band;
+SHOW CREATE TRIGGER document_store_bi;
 SHOW CREATE EVENT syntax_event;
 SHOW EVENTS;
 SHOW TRIGGERS;
@@ -957,9 +634,12 @@ CREATE USER 'sq_mysql_final_user'@'localhost'
 ALTER USER 'sq_mysql_final_user'@'localhost'
   PASSWORD EXPIRE INTERVAL 30 DAY
   ACCOUNT UNLOCK;
+SET PASSWORD FOR 'sq_mysql_final_user'@'localhost' = 'Sq-final-8.0-updated!';
+SHOW CREATE USER 'sq_mysql_final_user'@'localhost';
 GRANT SELECT ON sq_mysql_manual_final.* TO 'sq_mysql_final_reader';
 GRANT 'sq_mysql_final_reader' TO 'sq_mysql_final_user'@'localhost';
 SET DEFAULT ROLE 'sq_mysql_final_reader' TO 'sq_mysql_final_user'@'localhost';
+SET ROLE NONE;
 SHOW GRANTS FOR 'sq_mysql_final_user'@'localhost';
 REVOKE 'sq_mysql_final_reader' FROM 'sq_mysql_final_user'@'localhost';
 REVOKE SELECT ON sq_mysql_manual_final.* FROM 'sq_mysql_final_reader';
@@ -974,39 +654,12 @@ CALL assert_true((SELECT COUNT(*) FROM statement_log_v) = 7, 'view row count');
 CALL assert_true((SELECT COUNT(*) FROM tree_node) = 4, 'recursive tree data');
 CALL assert_true((SELECT COUNT(*) FROM document_store) = 4, 'document data');
 CALL assert_true((SELECT COUNT(*) FROM metric_partition) = 5, 'partition data');
+CALL assert_true((SELECT COUNT(*) FROM editor_type_matrix) = 1, 'type matrix data');
 CALL assert_true(@last_updated_document = 102, 'update trigger fired before rollback');
-CALL assert_true(
-  (SELECT COUNT(*) FROM manual_keyword_coverage) =
-  (SELECT COUNT(*) FROM INFORMATION_SCHEMA.KEYWORDS),
-  'official keyword coverage'
-);
-CALL assert_true(
-  (SELECT COUNT(*) FROM manual_statement_coverage) = 200,
-  'official statement-family coverage'
-);
-CALL assert_true(
-  (SELECT COUNT(*) FROM manual_syntax_coverage) =
-  (SELECT COUNT(*) FROM mysql.help_topic),
-  'official syntax-topic coverage'
-);
-CALL assert_true(
-  (SELECT COUNT(*) FROM manual_syntax_coverage
-   WHERE syntax_text IS NULL OR syntax_text = '') = 0,
-  'official syntax text is present'
-);
-CALL assert_true(
-  (SELECT COUNT(*) FROM manual_topic_coverage) = 422,
-  'official manual topic coverage'
-);
-
 SELECT 'PASS' AS final_status,
        VERSION() AS server_version,
        (SELECT COUNT(*) FROM statement_log) AS manual_rows,
        (SELECT COUNT(*) FROM document_store) AS document_rows,
-       (SELECT COUNT(*) FROM manual_keyword_coverage) AS keyword_count,
-       (SELECT COUNT(*) FROM manual_statement_coverage) AS statement_family_count,
-       (SELECT COUNT(*) FROM manual_syntax_coverage) AS syntax_topic_count,
-       (SELECT COUNT(*) FROM manual_topic_coverage) AS manual_topic_count,
        (SELECT COUNT(*) FROM INFORMATION_SCHEMA.PARTITIONS
         WHERE TABLE_SCHEMA = DATABASE()
           AND TABLE_NAME = 'metric_partition'
@@ -1018,7 +671,7 @@ SELECT 'PASS' AS final_status,
 -- source: test_mysql/final.sql
 -- db: MySQL
 -- metadata: test_mysql/final.sql inferred catalog
--- checked: 1117
+-- checked: 1538
 -- missing: 0
 -- marker: [[word]] means not suggested for the tested prefix
 -- missing tokens: none

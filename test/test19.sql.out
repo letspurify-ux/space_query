@@ -791,7 +791,7 @@ ORDER BY log_id;
 -- source: test/test19.sql
 -- db: Oracle
 -- metadata: test Oracle inferred catalog (file-scoped overlay) + Oracle built-ins
--- checked: 732
+-- checked: 734
 -- missing: 0
 -- marker: [[word]] means not suggested for the tested prefix
 -- missing tokens: none

@@ -1342,7 +1342,7 @@ ORDER BY a.audit_id;
 -- source: test/oracle_format_final_boss_v2.sql
 -- db: Oracle
 -- metadata: test Oracle inferred catalog (file-scoped overlay) + Oracle built-ins
--- checked: 1881
+-- checked: 1888
 -- missing: 0
 -- marker: [[word]] means not suggested for the tested prefix
 -- missing tokens: none

@@ -171,6 +171,40 @@ pub(crate) fn tokenize_sql_with_mysql_compat(sql: &str, mysql_compatible: bool) 
         .collect()
 }
 
+fn compact_plsql_label_end(sql: &str, start: usize) -> Option<usize> {
+    let body_start = start.checked_add(2)?;
+    let tail = sql.get(body_start..)?;
+    let mut chars = tail.char_indices();
+    let (_, first) = chars.next()?;
+    if !sql_text::is_identifier_start_char(first) {
+        return None;
+    }
+
+    let mut body_len = first.len_utf8();
+    for (offset, ch) in chars {
+        if !sql_text::is_identifier_char(ch) {
+            body_len = offset;
+            break;
+        }
+        body_len = offset + ch.len_utf8();
+    }
+    tail.get(body_len..)
+        .is_some_and(|rest| rest.starts_with(">>"))
+        .then_some(body_start + body_len + 2)
+}
+
+fn token_allows_plsql_label_after(token: Option<&SqlToken>) -> bool {
+    match token {
+        None => true,
+        Some(SqlToken::Symbol(symbol)) => symbol == ";",
+        Some(SqlToken::Word(word)) => matches!(
+            word.to_ascii_uppercase().as_str(),
+            "BEGIN" | "THEN" | "ELSE" | "LOOP" | "DECLARE" | "IS" | "AS"
+        ),
+        Some(SqlToken::String(_) | SqlToken::Comment(_)) => false,
+    }
+}
+
 pub(crate) fn collect_local_alias_context_from_spans(spans: &[SqlTokenSpan]) -> LocalAliasContext {
     let mut context = LocalAliasContext::default();
     let matching_parens = matching_close_paren_indices(spans);
@@ -1254,6 +1288,27 @@ pub(crate) fn tokenize_sql_spanned_with_mysql_compat(
         flush_word(&mut current, &mut current_start, idx, &mut tokens);
 
         if c == '<' && next == Some('<') {
+            let previous = tokens
+                .iter()
+                .rev()
+                .find(|span| !matches!(span.token, SqlToken::Comment(_)))
+                .map(|span| &span.token);
+            if token_allows_plsql_label_after(previous) {
+                if let Some(end) = compact_plsql_label_end(sql, idx) {
+                    while iter.peek().is_some_and(|(next_idx, _)| *next_idx < end) {
+                        let _ = iter.next();
+                    }
+                    tokens.push(SqlTokenSpan {
+                        token: SqlToken::Word(sql[idx..end].to_string()),
+                        start: idx,
+                        end,
+                    });
+                    continue;
+                }
+            }
+        }
+
+        if !mysql_compatible && c == '<' && next == Some('<') {
             let mut label = String::from("<<");
             iter.next();
             let mut end = idx + 2;
@@ -1306,6 +1361,8 @@ pub(crate) fn tokenize_sql_spanned_with_mysql_compat(
         }
 
         let sym = match (c, next) {
+            ('<', Some('<')) if mysql_compatible => Some("<<".to_string()),
+            ('>', Some('>')) if mysql_compatible => Some(">>".to_string()),
             ('<', Some('=')) => Some("<=".to_string()),
             ('>', Some('=')) => Some(">=".to_string()),
             ('<', Some('>')) => Some("<>".to_string()),
@@ -2758,6 +2815,32 @@ END$$"#;
                 .iter()
                 .any(|token| matches!(token, SqlToken::Symbol(symbol) if symbol == "<=>")),
             "mysql null-safe equality should stay a single symbol token: {tokens:?}"
+        );
+    }
+
+    #[test]
+    fn tokenize_sql_distinguishes_mysql_shifts_from_compact_plsql_labels() {
+        let tokens = tokenize_sql_with_mysql_compat(
+            "BEGIN <<again>> NULL; SELECT value << 1, value >> 1 FROM metrics; END",
+            true,
+        );
+
+        assert!(tokens
+            .iter()
+            .any(|token| matches!(token, SqlToken::Word(word) if word == "<<again>>")));
+        for operator in ["<<", ">>"] {
+            assert!(
+                tokens
+                    .iter()
+                    .any(|token| matches!(token, SqlToken::Symbol(symbol) if symbol == operator)),
+                "missing shift operator {operator}: {tokens:?}"
+            );
+        }
+        assert!(
+            !tokens.iter().any(|token| {
+                matches!(token, SqlToken::Word(word) if word.starts_with("<<") && word != "<<again>>")
+            }),
+            "a shift expression was consumed as a PL/SQL label: {tokens:?}"
         );
     }
 

@@ -174,6 +174,17 @@ impl SessionState {
         name.trim().trim_start_matches(':').to_uppercase()
     }
 
+    pub fn set_connection_db_type(&mut self, db_type: DatabaseType) {
+        if self.db_type != db_type {
+            self.define_enabled = match db_type {
+                DatabaseType::Oracle => true,
+                DatabaseType::MySQL => false,
+                DatabaseType::MariaDB => false,
+            };
+        }
+        self.db_type = db_type;
+    }
+
     pub fn reset(&mut self) {
         // Reset is used for client-side SQL*Plus/session settings within the
         // current backend. Connection transitions that change backend type set
@@ -210,5 +221,26 @@ mod tests {
             DatabaseType::Oracle,
             "connection transition code must explicitly stamp the new backend after reset/connect"
         );
+    }
+
+    #[test]
+    fn connection_transition_uses_define_substitution_only_by_default_for_oracle() {
+        let mut session = SessionState::default();
+
+        session.set_connection_db_type(DatabaseType::MySQL);
+        assert!(!session.define_enabled);
+
+        session.define_enabled = true;
+        session.set_connection_db_type(DatabaseType::MySQL);
+        assert!(
+            session.define_enabled,
+            "an explicit same-backend SET DEFINE choice must survive reconnect"
+        );
+
+        session.set_connection_db_type(DatabaseType::MariaDB);
+        assert!(!session.define_enabled);
+
+        session.set_connection_db_type(DatabaseType::Oracle);
+        assert!(session.define_enabled);
     }
 }

@@ -29049,13 +29049,11 @@ mod mysql_batch_execution_regression_tests {
                     db_type,
                 ))
                 .expect("MySQL/MariaDB session-rule test connection should succeed");
+            let session = connection.session_state();
 
             Some(Self {
                 shared_connection: Arc::new(Mutex::new(connection)),
-                session: Arc::new(Mutex::new(SessionState {
-                    db_type,
-                    ..SessionState::default()
-                })),
+                session,
                 current_mysql_cancel_context: Arc::new(Mutex::new(None)),
                 current_query_cancel_handle: Arc::new(Mutex::new(None)),
                 pooled_db_session: crate::db::SharedDbSessionLease::new(),

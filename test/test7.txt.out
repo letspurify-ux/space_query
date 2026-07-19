@@ -552,7 +552,7 @@ PROMPT [DONE] Hardcore SELECT tests finished.
 -- source: test/test7.txt
 -- db: Oracle
 -- metadata: test Oracle inferred catalog (file-scoped overlay) + Oracle built-ins
--- checked: 1176
+-- checked: 1179
 -- missing: 0
 -- marker: [[word]] means not suggested for the tested prefix
 -- missing tokens: none

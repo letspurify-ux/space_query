@@ -562,6 +562,11 @@ fn mysql_family_catalog_from_script(script: &str) -> MysqlFamilyScriptCatalog {
                         push_unique_case_insensitive(&mut catalog.users, name);
                     }
                 }
+                "ROLE" | "USER" => {
+                    if let Some(name) = token_word_text(tokens.get(name_idx)) {
+                        push_unique_case_insensitive(&mut catalog.users, name);
+                    }
+                }
                 _ => {}
             }
         }
@@ -599,17 +604,24 @@ fn mysql_family_catalog_from_script(script: &str) -> MysqlFamilyScriptCatalog {
                 }
             }
         }
-        if token_word_eq(tokens.get(idx), "RENAME")
-            && token_word_eq(tokens.get(idx + 1), "TABLE")
-            && token_word_eq(tokens.get(idx + 3), "TO")
-        {
-            if let (Some(old_name), Some(new_name)) = (
-                token_word_text(tokens.get(idx + 2)),
-                token_word_text(tokens.get(idx + 4)),
-            ) {
+        if token_word_eq(tokens.get(idx), "RENAME") {
+            let rename_names = if token_word_eq(tokens.get(idx + 1), "TABLE")
+                && token_word_eq(tokens.get(idx + 3), "TO")
+            {
+                Some((idx + 2, idx + 4))
+            } else if token_word_eq(tokens.get(idx + 2), "TO") {
+                Some((idx + 1, idx + 3))
+            } else {
+                None
+            };
+            if let Some((old_idx, new_idx)) = rename_names {
+                let old_name = token_word_text(tokens.get(old_idx));
+                let new_name = token_word_text(tokens.get(new_idx));
+                if let (Some(old_name), Some(new_name)) = (old_name, new_name) {
                 push_unique_case_insensitive(&mut catalog.tables, new_name);
                 if let Some(columns) = catalog.columns.get(&old_name.to_ascii_uppercase()).cloned() {
                     catalog.columns.insert(new_name.to_ascii_uppercase(), columns);
+                }
                 }
             }
         }
@@ -1282,9 +1294,27 @@ fn oracle_collect_script_catalog_entries(script: &str, catalog: &mut MysqlFamily
             "PROPERTY GRAPH" => push_unique_case_insensitive(&mut catalog.views, &name),
             "TRIGGER" => push_unique_case_insensitive(&mut catalog.triggers, &name),
             "INDEX" => push_unique_case_insensitive(&mut catalog.indexes, &name),
+            "ROLE" | "USER" => push_unique_case_insensitive(&mut catalog.users, &name),
             _ => {}
         }
 
+        idx += 1;
+    }
+
+    let mut idx = 0usize;
+    while idx + 3 < tokens.len() {
+        if token_word_eq(tokens.get(idx), "RENAME")
+            && token_word_eq(tokens.get(idx + 2), "TO")
+        {
+            let old_name = token_word_text(tokens.get(idx + 1));
+            let new_name = token_word_text(tokens.get(idx + 3));
+            if let (Some(old_name), Some(new_name)) = (old_name, new_name) {
+                push_unique_case_insensitive(&mut catalog.tables, new_name);
+                if let Some(columns) = catalog.columns.get(&old_name.to_ascii_uppercase()).cloned() {
+                    catalog.columns.insert(new_name.to_ascii_uppercase(), columns);
+                }
+            }
+        }
         idx += 1;
     }
 
@@ -50172,6 +50202,14 @@ fn manual_final_sweep_metadata_includes_inferred_and_system_objects() {
     assert!(oracle.views.iter().any(|name| name.eq_ignore_ascii_case("V$VERSION")));
     assert!(oracle.packages.iter().any(|name| name.eq_ignore_ascii_case("DBMS_FLASHBACK")));
     assert!(oracle
+        .tables
+        .iter()
+        .any(|name| name.eq_ignore_ascii_case("sq_oracle_editor_renamed")));
+    assert!(oracle
+        .users
+        .iter()
+        .any(|name| name.eq_ignore_ascii_case("sq_oracle_manual_role")));
+    assert!(oracle
         .get_member_suggestions("DBMS_FLASHBACK", "GET_", false)
         .iter()
         .any(|name| name.eq_ignore_ascii_case("GET_SYSTEM_CHANGE_NUMBER")));
@@ -50182,9 +50220,9 @@ fn manual_final_sweep_metadata_includes_inferred_and_system_objects() {
     assert!(mysql.views.iter().any(|name| name.eq_ignore_ascii_case("statement_log_v")));
     assert!(mysql.tables.iter().any(|name| name.eq_ignore_ascii_case("statement_log_stage")));
     assert!(mysql
-        .get_columns_for_table("manual_keyword_coverage")
+        .get_columns_for_table("editor_type_matrix")
         .iter()
-        .any(|name| name.eq_ignore_ascii_case("keyword_word")));
+        .any(|name| name.eq_ignore_ascii_case("geometry_value")));
     for column in ["category", "note"] {
         assert!(mysql
             .get_columns_for_table("statement_log_copy")
@@ -51666,16 +51704,25 @@ fn intellisense_sweep_is_select_alias_definition(
         .iter()
         .rev()
         .find(|token| !matches!(token, SqlToken::Comment(_)));
-    let last_select = tokens
-        .get(..current_idx.min(tokens.len()))
-        .unwrap_or(tokens)
+    let before_current = tokens.get(..current_idx.min(tokens.len())).unwrap_or(tokens);
+    let depths = crate::ui::sql_depth::paren_depths(before_current);
+    let current_depth = crate::ui::sql_depth::paren_depth_after(before_current);
+    let last_select = before_current
         .iter()
-        .rposition(|token| token_word_eq(Some(token), "SELECT"));
-    let last_from = tokens
-        .get(..current_idx.min(tokens.len()))
-        .unwrap_or(tokens)
+        .enumerate()
+        .rfind(|(idx, token)| {
+            depths.get(*idx).copied().unwrap_or_default() == current_depth
+                && token_word_eq(Some(token), "SELECT")
+        })
+        .map(|(idx, _)| idx);
+    let last_from = before_current
         .iter()
-        .rposition(|token| token_word_eq(Some(token), "FROM"));
+        .enumerate()
+        .rfind(|(idx, token)| {
+            depths.get(*idx).copied().unwrap_or_default() == current_depth
+                && token_word_eq(Some(token), "FROM")
+        })
+        .map(|(idx, _)| idx);
     let in_select_list = last_select.is_some_and(|select_idx| {
         last_from.is_none_or(|from_idx| select_idx > from_idx)
     });
@@ -51700,7 +51747,6 @@ fn intellisense_sweep_is_select_alias_definition(
     if crate::sql_text::is_sql_keyword_for_db(&original_word.to_ascii_uppercase(), db_type) {
         return false;
     }
-    let before_current = tokens.get(..current_idx.min(tokens.len())).unwrap_or(tokens);
     let previous = before_current
         .iter()
         .rev()
@@ -52078,6 +52124,22 @@ fn intellisense_sweep_skips_literal_select_alias_definitions() {
     for (sql, original) in [
         ("SELECT 'x' text__CODEX_CURSOR__ FROM dual", "text_value"),
         ("SELECT 2 erro__CODEX_CURSOR__ FROM dual", "errors"),
+        (
+            "BEGIN FOR ddl_text IN (SELECT 'DROP TABLE t' text__CODEX_CURSOR__ FROM dual UNION ALL SELECT 'DROP VIEW v' FROM dual) LOOP NULL; END LOOP; END;",
+            "text_value",
+        ),
+        (
+            "MERGE INTO t USING (SELECT 'DML' cate__CODEX_CURSOR__, 25 amount FROM dual UNION ALL SELECT 'INSERT', 70 FROM dual) source ON (t.category = source.category) WHEN MATCHED THEN UPDATE SET t.amount = source.amount",
+            "category",
+        ),
+        (
+            "SELECT node_id FROM (SELECT 1 node_id, 10 latency, 2 erro__CODEX_CURSOR__ FROM dual) UNPIVOT INCLUDE NULLS (metric_value FOR metric_name IN (latency AS 'LATENCY', errors AS 'ERRORS'))",
+            "errors",
+        ),
+        (
+            "SELECT CASE WHEN 1 = 1 THEN 1 ELSE 0 END json__CODEX_CURSOR__, 2 FROM dual",
+            "json_exists_value",
+        ),
     ] {
         assert!(
             intellisense_sweep_word_skip_context(sql, Oracle, original),
@@ -54076,6 +54138,110 @@ fn manual_final_structural_words_use_production_completion() {
 }
 
 #[test]
+fn manual_final_added_grammar_uses_production_completion() {
+    use crate::db::DatabaseType::{MariaDB, MySQL, Oracle};
+
+    let cases = [
+        (Oracle, "CREATE TABLE t (c DOUB__CODEX_CURSOR__ PRECISION)", "DOUBLE"),
+        (Oracle, "CREATE TABLE t (c BINA__CODEX_CURSOR__)", "BINARY_DOUBLE"),
+        (Oracle, "CREATE TABLE t (c VARC__CODEX_CURSOR__(80 CHAR))", "VARCHAR"),
+        (Oracle, "CREATE TABLE t (c TIMESTAMP(6) WIT__CODEX_CURSOR__ TIME ZONE)", "WITH"),
+        (Oracle, "CREATE TABLE t (c TIMESTAMP(6) WIT__CODEX_CURSOR__ LOCAL TIME ZONE)", "WITH"),
+        (Oracle, "CREATE TABLE t (c TIMESTAMP(6) WITH TIM__CODEX_CURSOR__ ZONE)", "TIME"),
+        (Oracle, "CREATE TABLE t (c TIMESTAMP(6) WITH TIME ZON__CODEX_CURSOR__)", "ZONE"),
+        (Oracle, "CREATE TABLE t (c TIMESTAMP(6) WITH LOC__CODEX_CURSOR__ TIME ZONE)", "LOCAL"),
+        (Oracle, "CREATE TABLE t (c INTERVAL YEA__CODEX_CURSOR__(2) TO MONTH)", "YEAR"),
+        (Oracle, "CREATE TABLE t (c INTERVAL YEAR(2) T__CODEX_CURSOR__ MONTH)", "TO"),
+        (Oracle, "CREATE TABLE t (c INTERVAL DA__CODEX_CURSOR__(2) TO SECOND(6))", "DAY"),
+        (Oracle, "CREATE TABLE t (c INTERVAL DAY(2) TO SECO__CODEX_CURSOR__(6))", "SECOND"),
+        (Oracle, "SELECT TIME__CODEX_CURSOR__ '2026-07-18 12:34:56' FROM dual", "TIMESTAMP"),
+        (Oracle, "DECLARE SUBTYPE n IS PLS_INTEGER RANG__CODEX_CURSOR__ 0..9; BEGIN NULL; END;", "RANGE"),
+        (Oracle, "DECLARE CURSOR c I__CODEX_CURSOR__ SELECT 1 FROM dual; BEGIN NULL; END;", "IS"),
+        (Oracle, "$I__CODEX_CURSOR__ $$PLSQL_VERSION >= 120200 $THEN\nNULL;\n$END", "$IF"),
+        (Oracle, "$IF $$PL__CODEX_CURSOR__ >= 120200 $THEN\nNULL;\n$END", "$$PLSQL_VERSION"),
+        (Oracle, "$IF $$PLSQL_VERSION >= 120200 $THE__CODEX_CURSOR__\nNULL;\n$END", "$THEN"),
+        (Oracle, "BEGIN PRAG__CODEX_CURSOR__ INLINE(p, 'YES'); NULL; END;", "PRAGMA"),
+        (Oracle, "BEGIN PRAGMA INLI__CODEX_CURSOR__(p, 'YES'); NULL; END;", "INLINE"),
+        (Oracle, "ALTER FUNCTION f COMPILE REU__CODEX_CURSOR__ SETTINGS", "REUSE"),
+        (Oracle, "ALTER FUNCTION f COMPILE REUSE SETT__CODEX_CURSOR__", "SETTINGS"),
+        (Oracle, "ALTER PACKAGE p COMPILE SPEC__CODEX_CURSOR__ REUSE SETTINGS", "SPECIFICATION"),
+        (Oracle, "ALTER PACKAGE p COMPILE BOD__CODEX_CURSOR__ REUSE SETTINGS", "BODY"),
+        (Oracle, "SELECT SYS_EXTR__CODEX_CURSOR__(SYSTIMESTAMP) FROM dual", "SYS_EXTRACT_UTC"),
+        (Oracle, "SELECT TRIM(BOT__CODEX_CURSOR__ ' ' FROM c) FROM t", "BOTH"),
+        (Oracle, "SELECT JSON_QUERY(j, '$' RETURNING VARCHAR2(20) PRET__CODEX_CURSOR__) FROM t", "PRETTY"),
+        (Oracle, "SELECT JSON_SERIALIZE(j RETU__CODEX_CURSOR__ VARCHAR2(20) PRETTY) FROM t", "RETURNING"),
+        (Oracle, "SELECT VECTOR_DISTANCE(v1, v2, EUCL__CODEX_CURSOR__) FROM t", "EUCLIDEAN"),
+        (Oracle, "SELECT * FROM t WHERE j I__CODEX_CURSOR__ JSON", "IS"),
+        (Oracle, "SELECT * FROM t WHERE j IS JSO__CODEX_CURSOR__", "JSON"),
+        (Oracle, "SELECT JSON_OBJECTAGG(KE__CODEX_CURSOR__ k VALUE v) FROM t", "KEY"),
+        (Oracle, "SELECT JSON_OBJECTAGG(KEY k VALU__CODEX_CURSOR__ v) FROM t", "VALUE"),
+        (Oracle, "SET CONS__CODEX_CURSOR__ ALL IMMEDIATE", "CONSTRAINTS"),
+        (Oracle, "SET CONSTRAINTS AL__CODEX_CURSOR__ IMMEDIATE", "ALL"),
+        (Oracle, "SET CONSTRAINTS ALL IMME__CODEX_CURSOR__", "IMMEDIATE"),
+        (Oracle, "SELECT id FROM t QUAL__CODEX_CURSOR__ ROW_NUMBER() OVER (ORDER BY id) = 1", "QUALIFY"),
+        (Oracle, "SELECT * FROM t PART__CODEX_CURSOR__ (p2026)", "PARTITION"),
+        (Oracle, "SELECT * FROM t SAMP__CODEX_CURSOR__ (50) SEED (42)", "SAMPLE"),
+        (Oracle, "SELECT * FROM t SAMPLE (50) SEE__CODEX_CURSOR__ (42)", "SEED"),
+        (Oracle, "RENAME old_name T__CODEX_CURSOR__ new_name", "TO"),
+        (Oracle, "SET RO__CODEX_CURSOR__ NONE", "ROLE"),
+        (Oracle, "SET ROLE NON__CODEX_CURSOR__", "NONE"),
+        (Oracle, "SET ROLE AL__CODEX_CURSOR__", "ALL"),
+        (MySQL, "CREATE TABLE t (c TINYINT UNSI__CODEX_CURSOR__)", "UNSIGNED"),
+        (MySQL, "CREATE TABLE t (g GEOMETRY SRI__CODEX_CURSOR__ 0)", "SRID"),
+        (MySQL, "CREATE FUNCTION f() RETURNS INT SQ__CODEX_CURSOR__ SECURITY INVOKER RETURN 1", "SQL"),
+        (MySQL, "CREATE FUNCTION f() RETURNS INT SQL SECURITY INVO__CODEX_CURSOR__ RETURN 1", "INVOKER"),
+        (MySQL, "SELECT CONVERT(c USIN__CODEX_CURSOR__ utf8mb4) FROM t", "USING"),
+        (MySQL, "SELECT CONVERT(c USING utf8__CODEX_CURSOR__) FROM t", "utf8mb4"),
+        (MySQL, "SELECT Extr__CODEX_CURSOR__('<x/>', '/x')", "ExtractValue"),
+        (MySQL, "SELECT Upda__CODEX_CURSOR__('<x/>', '/x', '<y/>')", "UpdateXML"),
+        (MySQL, "SELECT * FROM t WHERE RO__CODEX_CURSOR__(a, b) = ROW(1, 2)", "ROW"),
+        (MariaDB, "CREATE TABLE t (c TINYINT UNSI__CODEX_CURSOR__)", "UNSIGNED"),
+        (MariaDB, "CREATE TABLE t (c REA__CODEX_CURSOR__)", "REAL"),
+        (MariaDB, "CREATE TABLE t (c VARCHAR(10) A__CODEX_CURSOR__ (UPPER(name)) PERSISTENT)", "AS"),
+        (MariaDB, "CREATE TABLE t (c VARCHAR(10) AS (UPPER(name)) PERS__CODEX_CURSOR__)", "PERSISTENT"),
+    ];
+
+    let mut failures = Vec::new();
+    for (db_type, sql, expected) in cases {
+        let suggestions = query_completion_suggestions_with_locals(sql, db_type);
+        if !suggestions
+            .iter()
+            .any(|suggestion| intellisense_sweep_suggestion_matches_word(suggestion, expected))
+        {
+            failures.push(format!(
+                "{db_type:?} `{expected}` missing for `{sql}`: {suggestions:?}"
+            ));
+        }
+    }
+    assert!(
+        failures.is_empty(),
+        "manual final added grammar completion gaps:\n{}",
+        failures.join("\n")
+    );
+}
+
+#[test]
+fn oracle_record_qualified_expression_named_fields_use_production_completion() {
+    let declaration = "DECLARE\n  TYPE amount_record IS RECORD (id NUMBER, amount NUMBER);\n  selected_amount amount_record;\nBEGIN\n";
+    for (expression, expected) in [
+        ("selected_amount := amount_record(i__CODEX_CURSOR__ => -1, amount => 0);", "id"),
+        ("selected_amount := amount_record(id => -1, amou__CODEX_CURSOR__ => 0);", "amount"),
+    ] {
+        let sql = format!("{declaration}  {expression}\nEND;");
+        let suggestions = query_completion_suggestions_with_locals(
+            &sql,
+            crate::db::DatabaseType::Oracle,
+        );
+        assert!(
+            suggestions
+                .iter()
+                .any(|suggestion| suggestion.eq_ignore_ascii_case(expected)),
+            "record qualified-expression field `{expected}` missing for `{sql}`: {suggestions:?}"
+        );
+    }
+}
+
+#[test]
 fn manual_final_multiline_structural_words_use_production_completion() {
     use crate::db::DatabaseType::Oracle;
 
@@ -54194,8 +54360,6 @@ fn oracle_manual_final_remaining_real_words_use_full_production_path() {
     let base_snapshot = ChunkedText::from_str(script);
     let base_data = oracle_test_file_scoped_intellisense_data("final.sql");
     let cases = [
-        ("PRIMARY KEY (syntax_topic, syntax_seq);", "syntax_topic"),
-        ("PRIMARY KEY (syntax_topic, syntax_seq);", "syntax_seq"),
         (
             "category VARCHAR2(32) DOMAIN sq_oracle_category_domain NOT NULL",
             "sq_oracle_category_domain",
@@ -54207,6 +54371,19 @@ fn oracle_manual_final_remaining_real_words_use_full_production_path() {
         (
             "VALUES ('INSERT_FIRST', JSON_OBJECT('kind' VALUE 'conditional'), value_amount)",
             "value_amount",
+        ),
+        (
+            "CURSOR amount_cursor IS\n      SELECT amount FROM sq_oracle_manual_log ORDER BY id;",
+            "IS",
+        ),
+        (
+            "CURSOR explicit_cursor(p_min_amount NUMBER) IS\n      SELECT id, amount",
+            "IS",
+        ),
+        ("PRAGMA INLINE(exercise_goto, 'YES');", "INLINE"),
+        (
+            "CASE WHEN JSON_EXISTS(json_value, '$.tags[0]') THEN 1 ELSE 0 END json_exists_value,",
+            "json_exists_value",
         ),
         (
             "SOURCE KEY (source_node_id) REFERENCES sq_oracle_manual_node (node_id)",
@@ -54288,15 +54465,20 @@ fn mysql_manual_final_real_words_use_full_production_path() {
     let base_data = mysql_family_test_intellisense_data("final.sql", MySQL);
     let cases = [
         ("ALTER DATABASE sq_mysql_manual_final READ ONLY = 0;", "sq_mysql_manual_final"),
-        ("MODIFY keyword_word VARCHAR(128) NOT NULL", "keyword_word"),
-        ("name AS syntax_topic", "AS"),
-        ("description AS syntax_text", "description"),
         ("ADD COLUMN note VARCHAR(80) NULL AFTER category;", "category"),
         ("RENAME COLUMN note TO detail_text;", "note"),
         ("ALTER INDEX ix_statement_log_copy_amount INVISIBLE;", "ix_statement_log_copy_amount"),
         ("payload = new.payload,", "new"),
         ("new.payload,", "payload"),
         ("RETURN CASE", "RETURN"),
+        (
+            "ALTER FUNCTION amount_band\n  COMMENT 'editor grammar scalar function'\n  SQL SECURITY INVOKER;",
+            "SQL",
+        ),
+        (
+            "ALTER PROCEDURE compound_grammar\n  COMMENT 'editor grammar compound procedure'\n  SQL SECURITY INVOKER;",
+            "SQL",
+        ),
         ("DO UPDATE statement_log SET amount = amount WHERE id = -1;", "DO"),
         ("SHOW CREATE DATABASE sq_mysql_manual_final;", "sq_mysql_manual_final"),
         ("SHOW PROCEDURE STATUS WHERE Db = DATABASE();", "Db"),

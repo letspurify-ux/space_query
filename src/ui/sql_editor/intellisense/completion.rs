@@ -1604,12 +1604,14 @@ fn data_type_keywords_for(
 
 fn oracle_data_type_keywords(position: DataTypePosition) -> &'static [&'static str] {
     const ORACLE_TYPES: &[&str] = &[
+        "VARCHAR",
         "VARCHAR2",
         "NVARCHAR2",
         "CHAR",
         "NCHAR",
         "NUMBER",
         "FLOAT",
+        "DOUBLE",
         "BINARY_FLOAT",
         "BINARY_DOUBLE",
         "DATE",
@@ -1635,6 +1637,7 @@ fn oracle_data_type_keywords(position: DataTypePosition) -> &'static [&'static s
     ];
     // PL/SQL adds a handful of types that exist only in stored code.
     const ORACLE_PLSQL_TYPES: &[&str] = &[
+        "VARCHAR",
         "VARCHAR2",
         "NVARCHAR2",
         "CHAR",
@@ -1651,6 +1654,7 @@ fn oracle_data_type_keywords(position: DataTypePosition) -> &'static [&'static s
         "BINARY_FLOAT",
         "BINARY_DOUBLE",
         "FLOAT",
+        "DOUBLE",
         "DATE",
         "TIMESTAMP",
         "INTERVAL",
@@ -1709,6 +1713,7 @@ fn mysql_data_type_keywords(
         "DECIMAL",
         "NUMERIC",
         "FLOAT",
+        "REAL",
         "DOUBLE",
         "BIT",
         "BOOLEAN",
@@ -1751,6 +1756,7 @@ fn mysql_data_type_keywords(
         "DECIMAL",
         "NUMERIC",
         "FLOAT",
+        "REAL",
         "DOUBLE",
         "BIT",
         "BOOLEAN",
@@ -3467,14 +3473,25 @@ impl SqlEditorWidget {
         let local_record_member_suggestions = effective_local_qualifier
             .as_deref()
             .and_then(|qualifier| {
-            Self::collect_local_record_member_suggestions(
-                qualifier,
-                &snapshot.prefix,
-                cursor_in_statement,
-                raw_qualifier,
-                analysis,
-            )
-        });
+                Self::collect_local_record_member_suggestions(
+                    qualifier,
+                    &snapshot.prefix,
+                    cursor_in_statement,
+                    raw_qualifier,
+                    analysis,
+                )
+            })
+            .or_else(|| {
+                if snapshot.preferred_db_type.is_mysql_or_mariadb() {
+                    None
+                } else {
+                    Self::collect_local_qualified_expression_field_suggestions(
+                        &snapshot.prefix,
+                        cursor_in_statement,
+                        analysis,
+                    )
+                }
+            });
         let early_local_collection_method_suggestions = effective_local_qualifier
             .as_deref()
             .and_then(|qualifier| {
@@ -52527,14 +52544,20 @@ impl SqlEditorWidget {
             }
         }
 
-        if let Some(candidates) = Self::expected_precise_typed_structural_keyword_candidates(
-            prefix,
-            full_statement_tokens,
-            full_statement_context_end,
-            deep_ctx.phase,
-            db_type,
-        ) {
-            return Self::filter_expected_candidates(prefix, candidates);
+        for (source_tokens, source_end) in [
+            (tokens, context_end),
+            (statement_tokens, statement_context_end),
+            (full_statement_tokens, full_statement_context_end),
+        ] {
+            if let Some(candidates) = Self::expected_precise_typed_structural_keyword_candidates(
+                prefix,
+                source_tokens,
+                source_end,
+                deep_ctx.phase,
+                db_type,
+            ) {
+                return Self::filter_expected_candidates(prefix, candidates);
+            }
         }
         if let Some(candidates) = Self::expected_flashback_query_keyword_candidates(
             tokens,
@@ -57160,6 +57183,11 @@ impl SqlEditorWidget {
                 matches!(tokens.get(idx), Some(SqlToken::Symbol(symbol)) if symbol == expected)
             })
         };
+        let next_is_symbol = |expected: &str| {
+            next_idx.is_some_and(|idx| {
+                matches!(tokens.get(idx), Some(SqlToken::Symbol(symbol)) if symbol == expected)
+            })
+        };
         let has_later_word_before_frame_end = |expected: &str| {
             let Some(current_idx) = typed_idx else {
                 return false;
@@ -57198,8 +57226,248 @@ impl SqlEditorWidget {
         };
         let has = |expected: &str| words.iter().any(|word| word == expected);
         let mysql_compatible = crate::sql_text::mysql_compatibility_for_sql("", db_type);
+        let cursor_declaration_is_after_last_select = last_word_index_before("CURSOR")
+            .is_some_and(|cursor_idx| {
+                last_word_index_before("SELECT").is_none_or(|select_idx| cursor_idx > select_idx)
+            });
+
+        // A cursor declaration is a tighter frame than the broad Oracle DDL
+        // rules below. In a package body, earlier CREATE INDEX statements must
+        // not turn the `I` in `CURSOR name I| SELECT` into `INVISIBLE`.
+        if matches_prefix("IS")
+            && next_word.is_some_and(|word| word.eq_ignore_ascii_case("SELECT"))
+            && (cursor_declaration_is_after_last_select || (!mysql_compatible && has("CURSOR")))
+        {
+            return Some(&["IS"]);
+        }
+        if ["BOTH", "LEADING", "TRAILING"]
+            .iter()
+            .any(|keyword| matches_prefix(keyword))
+            && previous_is_symbol("(")
+            && Self::innermost_open_paren_preceding_word(tokens, structural_end)
+                .is_some_and(|word| word.eq_ignore_ascii_case("TRIM"))
+        {
+            return Some(&["BOTH", "LEADING", "TRAILING"]);
+        }
 
         if !mysql_compatible {
+            if matches_prefix("WITH")
+                && (last == Some("TIMESTAMP")
+                    || (has("TIMESTAMP") && previous_is_symbol(")")))
+                && next_word.is_some_and(|word| {
+                    matches!(word.to_ascii_uppercase().as_str(), "LOCAL" | "TIME")
+                })
+            {
+                return Some(&["WITH"]);
+            }
+            if matches_prefix("LOCAL")
+                && last == Some("WITH")
+                && has("TIMESTAMP")
+                && next_word.is_some_and(|word| word.eq_ignore_ascii_case("TIME"))
+            {
+                return Some(&["LOCAL"]);
+            }
+            if matches_prefix("TIME")
+                && matches!(last, Some("WITH" | "LOCAL"))
+                && has("TIMESTAMP")
+                && next_word.is_some_and(|word| word.eq_ignore_ascii_case("ZONE"))
+            {
+                return Some(&["TIME"]);
+            }
+            if matches_prefix("ZONE") && last == Some("TIME") && has("TIMESTAMP") {
+                return Some(&["ZONE"]);
+            }
+            if matches_prefix("YEAR")
+                && last == Some("INTERVAL")
+                && (next_is_symbol("(")
+                    || next_word.is_some_and(|word| word.eq_ignore_ascii_case("TO")))
+            {
+                return Some(&["YEAR"]);
+            }
+            if matches_prefix("DAY")
+                && last == Some("INTERVAL")
+                && (next_is_symbol("(")
+                    || next_word.is_some_and(|word| word.eq_ignore_ascii_case("TO")))
+            {
+                return Some(&["DAY"]);
+            }
+            if matches_prefix("TO")
+                && (matches!(last, Some("YEAR" | "DAY"))
+                    || (previous_is_symbol(")") && (has("YEAR") || has("DAY"))))
+                && has("INTERVAL")
+                && next_word.is_some_and(|word| {
+                    matches!(word.to_ascii_uppercase().as_str(), "MONTH" | "SECOND")
+                })
+            {
+                return Some(&["TO"]);
+            }
+            if matches_prefix("SECOND") && last == Some("TO") && has("INTERVAL") {
+                return Some(&["SECOND"]);
+            }
+            if matches_prefix("RANGE")
+                && has("SUBTYPE")
+                && has("IS")
+                && last.is_some_and(|word| word != "IS")
+            {
+                return Some(&["RANGE"]);
+            }
+            if matches_prefix("$IF") {
+                return Some(&["$IF"]);
+            }
+            if matches_prefix("$$PLSQL_VERSION") {
+                return Some(&["$$PLSQL_VERSION"]);
+            }
+            if matches_prefix("$THEN") {
+                return Some(&["$THEN"]);
+            }
+            if matches_prefix("PRAGMA")
+                && next_word.is_some_and(|word| {
+                    matches!(
+                        word.to_ascii_uppercase().as_str(),
+                        "AUTONOMOUS_TRANSACTION"
+                            | "EXCEPTION_INIT"
+                            | "INLINE"
+                            | "RESTRICT_REFERENCES"
+                            | "SERIALLY_REUSABLE"
+                    )
+                })
+            {
+                return Some(&["PRAGMA"]);
+            }
+            if matches_prefix("INLINE")
+                && ((has("PRAGMA") && (last == Some("PRAGMA") || next_is_symbol("(")))
+                    || (typed_idx.is_none()
+                        && tokens
+                            .get(structural_end)
+                            .and_then(Self::token_word)
+                            .is_some_and(|word| word.eq_ignore_ascii_case("PRAGMA"))))
+            {
+                return Some(&["INLINE"]);
+            }
+            let alter_compile = words.first().is_some_and(|word| word == "ALTER")
+                && has("COMPILE");
+            if matches_prefix("SPECIFICATION")
+                && alter_compile
+                && has("PACKAGE")
+                && last == Some("COMPILE")
+            {
+                return Some(&["SPECIFICATION"]);
+            }
+            if matches_prefix("BODY")
+                && alter_compile
+                && (has("PACKAGE") || has("TYPE"))
+                && last == Some("COMPILE")
+            {
+                return Some(&["BODY"]);
+            }
+            if matches_prefix("REUSE")
+                && alter_compile
+                && matches!(last, Some("COMPILE" | "SPECIFICATION" | "BODY"))
+                && next_word.is_some_and(|word| word.eq_ignore_ascii_case("SETTINGS"))
+            {
+                return Some(&["REUSE"]);
+            }
+            if matches_prefix("SETTINGS")
+                && alter_compile
+                && last == Some("REUSE")
+            {
+                return Some(&["SETTINGS"]);
+            }
+            if matches_prefix("RETURNING") && has("JSON_SERIALIZE") {
+                return Some(&["RETURNING"]);
+            }
+            if matches_prefix("PRETTY")
+                && (has("JSON_QUERY") || has("JSON_SERIALIZE"))
+                && has("RETURNING")
+            {
+                return Some(&["PRETTY"]);
+            }
+            if matches_prefix("EUCLIDEAN") && has("VECTOR_DISTANCE") {
+                return Some(&["EUCLIDEAN"]);
+            }
+            if matches_prefix("IS")
+                && next_word.is_some_and(|word| word.eq_ignore_ascii_case("JSON"))
+                && has("SELECT")
+            {
+                return Some(&["IS"]);
+            }
+            if matches_prefix("JSON") && last == Some("IS") && has("SELECT") {
+                return Some(&["JSON"]);
+            }
+            if matches_prefix("KEY") && has("JSON_OBJECTAGG") {
+                return Some(&["KEY"]);
+            }
+            if matches_prefix("VALUE") && has("JSON_OBJECTAGG") && has("KEY") {
+                return Some(&["VALUE"]);
+            }
+            if matches_prefix("CONSTRAINTS")
+                && matches!(words.as_slice(), [set] if set == "SET")
+                && next_word.is_some_and(|word| word.eq_ignore_ascii_case("ALL"))
+            {
+                return Some(&["CONSTRAINTS"]);
+            }
+            if matches_prefix("ALL")
+                && matches!(words.as_slice(), [set, constraints] if set == "SET" && constraints == "CONSTRAINTS")
+                && next_word.is_some_and(|word| word.eq_ignore_ascii_case("IMMEDIATE"))
+            {
+                return Some(&["ALL"]);
+            }
+            if matches_prefix("IMMEDIATE")
+                && matches!(words.as_slice(), [set, constraints, all] if set == "SET" && constraints == "CONSTRAINTS" && all == "ALL")
+            {
+                return Some(&["IMMEDIATE"]);
+            }
+            if matches_prefix("QUALIFY")
+                && has("SELECT")
+                && next_word.is_some_and(|word| word.eq_ignore_ascii_case("ROW_NUMBER"))
+            {
+                return Some(&["QUALIFY"]);
+            }
+            if matches_prefix("PARTITION")
+                && has("FROM")
+                && next_is_symbol("(")
+                && last.is_some_and(|word| !Self::token_is_language_keyword(word))
+            {
+                return Some(&["PARTITION"]);
+            }
+            if matches_prefix("SAMPLE")
+                && has("FROM")
+                && next_is_symbol("(")
+                && last.is_some_and(|word| !Self::token_is_language_keyword(word))
+            {
+                return Some(&["SAMPLE"]);
+            }
+            if matches_prefix("SEED")
+                && has("FROM")
+                && has("SAMPLE")
+                && previous_is_symbol(")")
+                && next_is_symbol("(")
+            {
+                return Some(&["SEED"]);
+            }
+            if matches_prefix("TO")
+                && words.first().is_some_and(|word| word == "RENAME")
+                && words.len() == 2
+                && next_word.is_some()
+            {
+                return Some(&["TO"]);
+            }
+            if matches_prefix("ROLE")
+                && matches!(words.as_slice(), [set] if set == "SET")
+                && next_word.is_some()
+            {
+                return Some(&["ROLE"]);
+            }
+            if matches_prefix("NONE")
+                && matches!(words.as_slice(), [set, role] if set == "SET" && role == "ROLE")
+            {
+                return Some(&["NONE"]);
+            }
+            if matches_prefix("ALL")
+                && matches!(words.as_slice(), [set, role] if set == "SET" && role == "ROLE")
+            {
+                return Some(&["ALL"]);
+            }
             if matches_prefix("DOMAIN")
                 && matches!(words.as_slice(), [create] if create == "CREATE")
                 && next_word.is_some()
@@ -57381,6 +57649,89 @@ impl SqlEditorWidget {
                 return Some(&["ROLLBACK"]);
             }
         } else {
+            if matches_prefix("UNSIGNED")
+                && matches!(
+                    last,
+                    Some(
+                        "TINYINT"
+                            | "SMALLINT"
+                            | "MEDIUMINT"
+                            | "INT"
+                            | "INTEGER"
+                            | "BIGINT"
+                            | "DECIMAL"
+                            | "NUMERIC"
+                            | "FLOAT"
+                            | "DOUBLE"
+                            | "REAL"
+                    )
+                )
+            {
+                return Some(&["UNSIGNED", "UNIQUE"]);
+            }
+            if matches_prefix("SRID")
+                && matches!(
+                    last,
+                    Some(
+                        "GEOMETRY"
+                            | "GEOMETRYCOLLECTION"
+                            | "LINESTRING"
+                            | "MULTILINESTRING"
+                            | "MULTIPOINT"
+                            | "MULTIPOLYGON"
+                            | "POINT"
+                            | "POLYGON"
+                    )
+                )
+            {
+                return Some(&["SRID"]);
+            }
+            if matches_prefix("SQL")
+                && (has("CREATE") || has("ALTER"))
+                && (has("FUNCTION") || has("PROCEDURE"))
+                && next_word.is_some_and(|word| word.eq_ignore_ascii_case("SECURITY"))
+            {
+                return Some(&["SQL"]);
+            }
+            if matches_prefix("INVOKER")
+                && last == Some("SECURITY")
+                && (has("FUNCTION") || has("PROCEDURE"))
+            {
+                return Some(&["INVOKER"]);
+            }
+            if matches_prefix("USING")
+                && has("CONVERT")
+                && next_word.is_some()
+            {
+                return Some(&["USING"]);
+            }
+            if last == Some("USING") && has("CONVERT") {
+                const MYSQL_CHARACTER_SETS: &[&str] =
+                    &["ascii", "binary", "latin1", "utf8mb3", "utf8mb4"];
+                if MYSQL_CHARACTER_SETS
+                    .iter()
+                    .any(|charset| matches_prefix(charset))
+                {
+                    return Some(MYSQL_CHARACTER_SETS);
+                }
+            }
+            if completion_db_type_is_mariadb(db_type)
+                && matches_prefix("AS")
+                && has("CREATE")
+                && has("TABLE")
+                && next_is_symbol("(")
+            {
+                return Some(&["AS"]);
+            }
+            if completion_db_type_is_mariadb(db_type)
+                && matches_prefix("PERSISTENT")
+                && has("CREATE")
+                && has("TABLE")
+                && has("AS")
+                && previous_is_symbol(")")
+            {
+                return Some(&["PERSISTENT", "STORED", "VIRTUAL"]);
+            }
             if matches_prefix("AS")
                 && matches!(phase, intellisense_context::SqlPhase::SelectList)
                 && has("SELECT")
@@ -57541,17 +57892,6 @@ impl SqlEditorWidget {
                 .is_some_and(|word| word.eq_ignore_ascii_case("EXTRACT"))
         {
             return Some(&["SELECT"]);
-        }
-
-        let cursor_declaration_is_after_last_select = last_word_index_before("CURSOR")
-            .is_some_and(|cursor_idx| {
-                last_word_index_before("SELECT").is_none_or(|select_idx| cursor_idx > select_idx)
-            });
-        if matches_prefix("IS")
-            && next_word.is_some_and(|word| word.eq_ignore_ascii_case("SELECT"))
-            && cursor_declaration_is_after_last_select
-        {
-            return Some(&["IS"]);
         }
 
         if matches_prefix("MATCHED")

@@ -10287,49 +10287,6 @@ impl SqlEditorWidget {
         true
     }
 
-    fn mysql_if_is_scalar_function_from_context(
-        current_clause: Option<&str>,
-        on_duplicate_key_update_active: bool,
-        in_plsql_block: bool,
-        at_line_start: bool,
-        previous_non_comment_token: Option<&SqlToken>,
-    ) -> bool {
-        if on_duplicate_key_update_active {
-            return true;
-        }
-
-        if matches!(
-            current_clause,
-            Some(
-                "SELECT"
-                    | "SET"
-                    | "WHERE"
-                    | "HAVING"
-                    | "ORDER"
-                    | "GROUP"
-                    | "VALUES"
-                    | "RETURNING"
-                    | "ON"
-                    | "WHEN"
-            )
-        ) {
-            return true;
-        }
-
-        if !in_plsql_block && !at_line_start {
-            return matches!(
-                previous_non_comment_token,
-                Some(SqlToken::Symbol(symbol))
-                    if matches!(
-                        symbol.as_str(),
-                        "(" | "," | "=" | "<" | ">" | "<=" | ">=" | "<>" | "!=" | "<=>"
-                    )
-            );
-        }
-
-        false
-    }
-
     fn mysql_if_is_scalar_function(
         tokens: &[SqlToken],
         if_idx: usize,
@@ -10351,11 +10308,12 @@ impl SqlEditorWidget {
         else {
             return false;
         };
+        let token_after_close = meaningful_token_links
+            .and_then(|links| links.next_index(close_idx))
+            .or_else(|| Self::next_meaningful_token_index(tokens, close_idx))
+            .and_then(|idx| tokens.get(idx));
         !matches!(
-            meaningful_token_links
-                .and_then(|links| links.next_index(close_idx))
-                .or_else(|| Self::next_meaningful_token_index(tokens, close_idx))
-                .and_then(|idx| tokens.get(idx)),
+            token_after_close,
             Some(SqlToken::Word(word)) if word.eq_ignore_ascii_case("THEN")
         )
     }
@@ -12328,12 +12286,11 @@ impl SqlEditorWidget {
                         && upper == "IF"
                         && matches!(next_non_comment, Some(SqlToken::Symbol(sym)) if sym == "(")
                         && !mysql_if_exists_modifier
-                        && Self::mysql_if_is_scalar_function_from_context(
-                            format_stack.current_clause(),
-                            on_duplicate_key_update_active,
-                            in_plsql_block,
-                            at_line_start,
-                            loop_previous_non_comment_token,
+                        && Self::mysql_if_is_scalar_function(
+                            tokens,
+                            idx,
+                            Some(_meaningful_token_links),
+                            Some(matching_paren_close_indices),
                         );
                     let is_trigger_event_keyword = format_stack.trigger_header_is_active()
                         && matches!(upper, "INSERT" | "UPDATE" | "DELETE");
@@ -18559,13 +18516,17 @@ impl SqlEditorWidget {
                             );
                             let open_paren_mysql_scalar_function = mysql_compatible
                                 && matches!(prev_word_upper, Some("IF"))
-                                && Self::mysql_if_is_scalar_function_from_context(
-                                    format_stack.current_clause(),
-                                    on_duplicate_key_update_active,
-                                    in_plsql_block,
-                                    at_line_start,
-                                    loop_previous_non_comment_token,
-                                );
+                                && _meaningful_token_links
+                                    .prev_index(idx)
+                                    .or_else(|| Self::previous_meaningful_token_index(tokens, idx))
+                                    .is_some_and(|if_idx| {
+                                        Self::mysql_if_is_scalar_function(
+                                            tokens,
+                                            if_idx,
+                                            Some(_meaningful_token_links),
+                                            Some(matching_paren_close_indices),
+                                        )
+                                    });
                             let compact_function_wrapper =
                                 matches!(paren_frame_kind, ParenFormatFrameKind::Compact)
                                     && (wraps_function_call_child
@@ -42500,6 +42461,21 @@ END;"#;
             formatted.contains("GOTO top"),
             "GOTO target must keep the label's source case, got:\n{formatted}"
         );
+    }
+
+    #[test]
+    fn mysql_shift_operators_format_idempotently_without_becoming_plsql_labels() {
+        let source = "SELECT integer_value << 1 AS shift_left, integer_value >> 1 AS shift_right, CONVERT(char_value USING utf8mb4) AS converted_value, IF(boolean_value, 'yes', 'no') AS conditional_value, JSON_SET(json_value, '$.checked', TRUE) AS json_set_value FROM editor_type_matrix;";
+        let formatted =
+            SqlEditorWidget::format_sql_basic_for_db_type(source, crate::db::DatabaseType::MySQL);
+        let reformatted = SqlEditorWidget::format_sql_basic_for_db_type(
+            &formatted,
+            crate::db::DatabaseType::MySQL,
+        );
+
+        assert_eq!(reformatted, formatted, "formatted SQL:\n{formatted}");
+        assert!(formatted.contains("integer_value << 1"), "{formatted}");
+        assert!(formatted.contains("integer_value >> 1"), "{formatted}");
     }
 
     #[test]

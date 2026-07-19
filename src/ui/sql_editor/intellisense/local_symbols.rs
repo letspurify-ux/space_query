@@ -1105,6 +1105,56 @@ impl SqlEditorWidget {
         Some(suggestions)
     }
 
+    /// Field names in an Oracle record qualified expression use named
+    /// association without a dot (`record_type(field => value)`). Resolve the
+    /// local record type before the innermost argument list and reuse its
+    /// member catalog only at the start of an argument.
+    fn collect_local_qualified_expression_field_suggestions(
+        prefix: &str,
+        cursor_in_statement: usize,
+        analysis: &IntellisenseAnalysis,
+    ) -> Option<Vec<String>> {
+        let tokens = analysis.context.statement_tokens.as_ref();
+        let end = Self::expected_suggestion_context_end(
+            tokens,
+            analysis.context.cursor_token_len,
+            !prefix.is_empty(),
+        );
+        let open_idx = Self::nearest_unclosed_open_paren_before(tokens, end)?;
+        let argument_tail = tokens
+            .get(open_idx.saturating_add(1)..end.min(tokens.len()))
+            .unwrap_or(&[])
+            .iter()
+            .rev()
+            .find(|token| !matches!(token, SqlToken::Comment(_)));
+        if argument_tail
+            .is_some_and(|token| !matches!(token, SqlToken::Symbol(symbol) if symbol == ","))
+        {
+            return None;
+        }
+
+        let type_idx = Self::previous_non_comment_token_index(tokens, open_idx)?;
+        let SqlToken::Word(type_name) = tokens.get(type_idx)? else {
+            return None;
+        };
+        let symbol = Self::visible_local_symbol_for_qualifier(
+            type_name,
+            cursor_in_statement,
+            analysis,
+        )?;
+        if !symbol.is_type_symbol || symbol.members.is_empty() {
+            return None;
+        }
+
+        Self::collect_local_record_member_suggestions(
+            type_name,
+            prefix,
+            cursor_in_statement,
+            None,
+            analysis,
+        )
+    }
+
     fn append_plsql_collection_method_suggestions(
         suggestions: &mut Vec<String>,
         seen: &mut HashSet<String>,

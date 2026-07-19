@@ -3354,10 +3354,11 @@ impl DatabaseConnection {
 
         // Keep SessionState::reset() backend-preserving for same-DB resets;
         // successful connection transitions must explicitly stamp the new
-        // backend here so delimiter/bind scanning follows the live database.
+        // backend here so delimiter/bind scanning and SQL*Plus substitution
+        // defaults follow the live database.
         match self.session.lock() {
-            Ok(mut guard) => guard.db_type = db_type,
-            Err(poisoned) => poisoned.into_inner().db_type = db_type,
+            Ok(mut guard) => guard.set_connection_db_type(db_type),
+            Err(poisoned) => poisoned.into_inner().set_connection_db_type(db_type),
         }
 
         Ok(())
