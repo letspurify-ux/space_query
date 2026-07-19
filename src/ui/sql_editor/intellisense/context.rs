@@ -1814,20 +1814,6 @@ impl SqlEditorWidget {
         text.chars().next_back()
     }
 
-    fn non_whitespace_char_before_cursor(
-        buffer: &TextBuffer,
-        text_shadow: &Arc<Mutex<HighlightShadowState>>,
-        cursor_pos: i32,
-    ) -> Option<char> {
-        if cursor_pos <= 0 {
-            return None;
-        }
-        let start = (cursor_pos - INTELLISENSE_CONTEXT_WINDOW).max(0);
-        let text = text_buffer_access::text_range(buffer, Some(text_shadow), start, cursor_pos);
-        text.chars().rev().find(|ch| !ch.is_whitespace())
-    }
-
-    #[cfg(test)]
     fn non_whitespace_char_before_cursor_in_text(text: &str, cursor_pos: usize) -> Option<char> {
         if text.is_empty() || cursor_pos == 0 {
             return None;

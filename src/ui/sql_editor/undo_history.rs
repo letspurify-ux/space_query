@@ -22,8 +22,9 @@ struct EditGroup {
 struct BufferEdit {
     start: usize,
     deleted_len: usize,
-    inserted_text: String,
-    deleted_text: String,
+    // Keep FLTK's owned allocation shareable with the undo delta and the
+    // highlighter callback; Arc<str> would copy the bytes during conversion.
+    inserted_text: Arc<String>,
 }
 
 const REMOTE_EDIT_CURSOR_DISTANCE: usize = 5;
@@ -46,8 +47,8 @@ impl UndoSnapshot {
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct UndoDelta {
     start: usize,
-    deleted_text: String,
-    inserted_text: String,
+    deleted_text: Arc<String>,
+    inserted_text: Arc<String>,
     before_cursor: usize,
     after_cursor: usize,
     group_id: u64,
@@ -66,6 +67,7 @@ struct WordUndoRedoState {
     suppress_next_remote_cursor_move: bool,
     finish_group_after_next_edit: bool,
     completion_edit_group_id: Option<u64>,
+    pending_history_text_snapshots: VecDeque<ChunkedText>,
 }
 
 impl WordUndoRedoState {
@@ -84,6 +86,7 @@ impl WordUndoRedoState {
             suppress_next_remote_cursor_move: false,
             finish_group_after_next_edit: false,
             completion_edit_group_id: None,
+            pending_history_text_snapshots: VecDeque::new(),
         }
     }
 
@@ -126,7 +129,7 @@ impl WordUndoRedoState {
         let (replace_start, replace_end) = Self::normalized_replace_range(&snapshot.text, edit);
         let _ = snapshot
             .text
-            .replace_range(replace_start, replace_end, &edit.inserted_text);
+            .replace_range(replace_start, replace_end, edit.inserted_text.as_str());
         let cursor = replace_start
             .saturating_add(edit.inserted_text.len())
             .min(snapshot.text.len());
@@ -146,11 +149,6 @@ impl WordUndoRedoState {
                 delta.deleted_text.clone()
             } else {
                 delta.inserted_text.clone()
-            },
-            deleted_text: if reverse {
-                delta.inserted_text.clone()
-            } else {
-                delta.deleted_text.clone()
             },
         };
         Self::apply_edit_to_snapshot(snapshot, &edit);
@@ -191,8 +189,7 @@ impl WordUndoRedoState {
 
         let near_current_cursor = edit_start <= current_cursor.saturating_add(12)
             && current_cursor <= edit_end.saturating_add(12);
-        let deleted_size = edit.deleted_len.max(edit.deleted_text.len());
-        let small_edit = deleted_size <= 24 && edit.inserted_text.len() <= 48;
+        let small_edit = edit.deleted_len <= 24 && edit.inserted_text.len() <= 48;
         if !near_current_cursor || !small_edit {
             return false;
         }
@@ -303,8 +300,8 @@ impl WordUndoRedoState {
         let group_id = self.next_group_id();
         let delta = UndoDelta {
             start: next_cursor,
-            deleted_text: String::new(),
-            inserted_text: String::new(),
+            deleted_text: Arc::new(String::new()),
+            inserted_text: Arc::new(String::new()),
             before_cursor: current_cursor,
             after_cursor: next_cursor,
             group_id,
@@ -475,8 +472,8 @@ impl WordUndoRedoState {
         let group_id = self.next_group_id();
         let delta = UndoDelta {
             start: next_cursor,
-            deleted_text: String::new(),
-            inserted_text: String::new(),
+            deleted_text: Arc::new(String::new()),
+            inserted_text: Arc::new(String::new()),
             before_cursor: current_cursor,
             after_cursor: next_cursor,
             group_id,
@@ -513,27 +510,28 @@ impl WordUndoRedoState {
         }
     }
 
-    fn record_edit(&mut self, edit: &BufferEdit, edit_group: EditGroup) {
+    fn record_edit(&mut self, edit: &BufferEdit, edit_group: EditGroup) -> ChunkedText {
         self.normalize_index();
+        self.pending_history_text_snapshots.clear();
 
         let (replace_start, replace_end) = Self::normalized_replace_range(&self.current.text, edit);
-        let deleted_text = self
-            .current
-            .text
-            .range_string(replace_start, replace_end)
-            .unwrap_or_default();
+        let deleted_text = Arc::new(
+            self.current
+                .text
+                .range_string(replace_start, replace_end)
+                .unwrap_or_default(),
+        );
         let normalized_edit = BufferEdit {
             start: replace_start,
             deleted_len: replace_end.saturating_sub(replace_start),
             inserted_text: edit.inserted_text.clone(),
-            deleted_text,
         };
 
-        if normalized_edit.deleted_text == normalized_edit.inserted_text {
+        if deleted_text.as_str() == normalized_edit.inserted_text.as_str() {
             self.suppress_next_remote_cursor_move = false;
             self.finish_group_after_next_edit = false;
             self.completion_edit_group_id = None;
-            return;
+            return self.current.text.clone();
         }
 
         self.truncate_redo_history();
@@ -559,7 +557,7 @@ impl WordUndoRedoState {
 
         let delta = UndoDelta {
             start: replace_start,
-            deleted_text: normalized_edit.deleted_text.clone(),
+            deleted_text,
             inserted_text: normalized_edit.inserted_text,
             before_cursor,
             after_cursor,
@@ -579,6 +577,7 @@ impl WordUndoRedoState {
             Some((edit_group, group_id))
         };
         self.trim_history_if_needed();
+        self.current.text.clone()
     }
 
     fn record_programmatic_edit(
@@ -586,21 +585,22 @@ impl WordUndoRedoState {
         edit: &BufferEdit,
         before_cursor: usize,
         after_cursor: usize,
-    ) {
+    ) -> ChunkedText {
         self.normalize_index();
+        self.pending_history_text_snapshots.clear();
         self.truncate_redo_history();
 
         let (replace_start, replace_end) = Self::normalized_replace_range(&self.current.text, edit);
-        let deleted_text = self
-            .current
-            .text
-            .range_string(replace_start, replace_end)
-            .unwrap_or_default();
+        let deleted_text = Arc::new(
+            self.current
+                .text
+                .range_string(replace_start, replace_end)
+                .unwrap_or_default(),
+        );
         let normalized_edit = BufferEdit {
             start: replace_start,
             deleted_len: replace_end.saturating_sub(replace_start),
             inserted_text: edit.inserted_text.clone(),
-            deleted_text,
         };
         let before_cursor = Self::clamp_chunked_boundary(
             &self.current.text,
@@ -617,7 +617,7 @@ impl WordUndoRedoState {
 
         let delta = UndoDelta {
             start: replace_start,
-            deleted_text: normalized_edit.deleted_text.clone(),
+            deleted_text,
             inserted_text: normalized_edit.inserted_text,
             before_cursor,
             after_cursor,
@@ -639,16 +639,18 @@ impl WordUndoRedoState {
             group_id,
         ));
         self.trim_history_if_needed();
+        self.current.text.clone()
     }
 
     fn record_full_buffer_programmatic_replace(
         &mut self,
-        deleted_text: String,
-        inserted_text: String,
+        deleted_text: Arc<String>,
+        inserted_text: Arc<String>,
         before_cursor: usize,
         after_cursor: usize,
-    ) {
+    ) -> ChunkedText {
         self.normalize_index();
+        self.pending_history_text_snapshots.clear();
         self.truncate_redo_history();
 
         let before_cursor = Self::clamp_chunked_boundary(
@@ -657,7 +659,7 @@ impl WordUndoRedoState {
         );
         let group_id = self.next_group_id();
 
-        self.current.text = ChunkedText::from_str(&inserted_text);
+        self.current.text = ChunkedText::from_str(inserted_text.as_str());
         let after_cursor = Self::clamp_chunked_boundary(
             &self.current.text,
             after_cursor.min(self.current.text.len()),
@@ -688,6 +690,7 @@ impl WordUndoRedoState {
             group_id,
         ));
         self.trim_history_if_needed();
+        self.current.text.clone()
     }
 
     #[cfg(test)]
@@ -697,12 +700,10 @@ impl WordUndoRedoState {
             return;
         }
         let deleted_len = self.current.text.len();
-        let deleted_text = self.current.text.to_flat_string();
         let edit = BufferEdit {
             start: 0,
             deleted_len,
-            inserted_text: current_text,
-            deleted_text,
+            inserted_text: Arc::new(current_text),
         };
         if self.active_group.map(|(group, _)| group) != Some(edit_group) {
             self.active_group = None;
@@ -735,6 +736,7 @@ impl WordUndoRedoState {
 
     fn take_undo_group(&mut self) -> Vec<UndoDelta> {
         self.normalize_index();
+        self.pending_history_text_snapshots.clear();
         if self.index == 0 {
             return Vec::new();
         }
@@ -759,6 +761,8 @@ impl WordUndoRedoState {
             }
             self.index = self.index.saturating_sub(1);
             Self::apply_delta_to_snapshot(&mut self.current, &delta, true);
+            self.pending_history_text_snapshots
+                .push_back(self.current.text.clone());
             group.push(delta);
         }
         if !group.is_empty() {
@@ -801,6 +805,7 @@ impl WordUndoRedoState {
 
     fn take_redo_group(&mut self) -> Vec<UndoDelta> {
         self.normalize_index();
+        self.pending_history_text_snapshots.clear();
         if self.index >= self.deltas.len() {
             return Vec::new();
         }
@@ -817,6 +822,8 @@ impl WordUndoRedoState {
                 break;
             }
             Self::apply_delta_to_snapshot(&mut self.current, &delta, false);
+            self.pending_history_text_snapshots
+                .push_back(self.current.text.clone());
             self.index = self.index.saturating_add(1);
             group.push(delta);
         }
@@ -836,7 +843,7 @@ impl SqlEditorWidget {
         inserted_text: &str,
         before_cursor: usize,
         after_cursor: usize,
-    ) {
+    ) -> ChunkedText {
         let mut state = self
             .undo_redo_state
             .lock()
@@ -845,21 +852,20 @@ impl SqlEditorWidget {
             &BufferEdit {
                 start,
                 deleted_len: deleted_text.len(),
-                inserted_text: inserted_text.to_string(),
-                deleted_text: deleted_text.to_string(),
+                inserted_text: Arc::new(inserted_text.to_string()),
             },
             before_cursor,
             after_cursor,
-        );
+        )
     }
 
     fn record_full_buffer_programmatic_replace(
         &self,
-        deleted_text: String,
-        inserted_text: String,
+        deleted_text: Arc<String>,
+        inserted_text: Arc<String>,
         before_cursor: usize,
         after_cursor: usize,
-    ) {
+    ) -> ChunkedText {
         let mut state = self
             .undo_redo_state
             .lock()
@@ -869,7 +875,7 @@ impl SqlEditorWidget {
             inserted_text,
             before_cursor,
             after_cursor,
-        );
+        )
     }
 
     fn reset_word_undo_state(undo_redo_state: &Arc<Mutex<WordUndoRedoState>>) {
@@ -888,6 +894,7 @@ impl SqlEditorWidget {
         state.suppress_next_remote_cursor_move = false;
         state.finish_group_after_next_edit = false;
         state.completion_edit_group_id = None;
+        state.pending_history_text_snapshots.clear();
     }
 
     fn apply_delta_to_buffer(buffer: &mut TextBuffer, delta: &UndoDelta, reverse: bool) {
@@ -938,6 +945,7 @@ impl SqlEditorWidget {
             state.suppress_next_remote_cursor_move = false;
             state.finish_group_after_next_edit = false;
             state.completion_edit_group_id = None;
+            state.pending_history_text_snapshots.clear();
         }
         *self
             .history_cursor
@@ -981,10 +989,12 @@ impl SqlEditorWidget {
         editor.set_insert_position(cursor_pos);
         editor.show_insert_position();
 
-        self.undo_redo_state
+        let mut state = self
+            .undo_redo_state
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .applying_history = false;
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        state.applying_history = false;
+        state.pending_history_text_snapshots.clear();
     }
 
     pub fn redo(&self) {
@@ -1009,10 +1019,12 @@ impl SqlEditorWidget {
         editor.set_insert_position(cursor_pos);
         editor.show_insert_position();
 
-        self.undo_redo_state
+        let mut state = self
+            .undo_redo_state
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .applying_history = false;
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        state.applying_history = false;
+        state.pending_history_text_snapshots.clear();
     }
 
     pub fn is_query_running(&self) -> bool {

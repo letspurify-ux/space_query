@@ -1824,14 +1824,6 @@ impl AppState {
         self.set_tab_dirty(tab_id, false);
     }
 
-    fn refresh_tab_dirty_from_text(&mut self, tab_id: QueryTabId, current_text: &str) {
-        let Some(index) = self.find_tab_index(tab_id) else {
-            return;
-        };
-        let is_dirty = self.editor_tabs[index].pristine_text != current_text;
-        self.set_tab_dirty(tab_id, is_dirty);
-    }
-
     fn dirty_state_from_equal_length_local_edit(
         pristine_text: &str,
         was_dirty: bool,
@@ -1883,8 +1875,12 @@ impl AppState {
             return;
         }
 
-        let current_text = buf.text();
-        self.refresh_tab_dirty_from_text(tab_id, &current_text);
+        let is_dirty = {
+            let tab = &self.editor_tabs[index];
+            !tab.sql_editor
+                .highlight_shadow_text_matches(&tab.pristine_text)
+        };
+        self.set_tab_dirty(tab_id, is_dirty);
     }
 
     fn set_tab_file_path(&mut self, tab_id: QueryTabId, path: Option<PathBuf>) {
@@ -9561,7 +9557,7 @@ mod tests {
     }
 
     #[test]
-    fn equal_length_edit_scans_fully_only_when_it_may_restore_pristine_text() {
+    fn equal_length_edit_compares_shadow_only_when_it_may_restore_pristine_text() {
         assert_eq!(
             AppState::dirty_state_from_equal_length_local_edit("SELECT 1;", true, 7, "1"),
             None

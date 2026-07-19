@@ -2059,6 +2059,13 @@ impl SqlEditorWidget {
                     formatted.len(),
                     deleted_len,
                 );
+                let updated_text_snapshot = self.record_programmatic_buffer_edit(
+                    start_usize,
+                    &source,
+                    &formatted,
+                    original_pos,
+                    mapped_cursor,
+                );
                 self.handle_buffer_highlight_update_with_known_inserted_text(
                     &buffer,
                     start,
@@ -2066,13 +2073,7 @@ impl SqlEditorWidget {
                     deleted_len.min(i32::MAX as usize) as i32,
                     &formatted,
                     &source,
-                );
-                self.record_programmatic_buffer_edit(
-                    start_usize,
-                    &source,
-                    &formatted,
-                    original_pos,
-                    mapped_cursor,
+                    Some(&updated_text_snapshot),
                 );
 
                 buffer.select(start, selection_end.min(i32::MAX as usize) as i32);
@@ -2092,27 +2093,30 @@ impl SqlEditorWidget {
         if formatted == full_text {
             return;
         }
+        let full_text = Arc::new(full_text);
+        let formatted = Arc::new(formatted);
 
         let mut editor = self.editor.clone();
         let original_pos = Self::normalize_index(&full_text, editor.insert_position());
         let mapped_cursor = Self::clamp_to_char_boundary(&formatted, formatted.len());
 
         let _suppress_callbacks = self.suppress_buffer_callbacks();
-        buffer.set_text(&formatted);
+        buffer.set_text(formatted.as_str());
         self.invalidate_intellisense_after_buffer_edit(0, formatted.len(), full_text.len());
+        let updated_text_snapshot = self.record_full_buffer_programmatic_replace(
+            full_text.clone(),
+            formatted.clone(),
+            original_pos,
+            mapped_cursor,
+        );
         self.handle_buffer_highlight_update_with_known_inserted_text(
             &buffer,
             0,
             formatted.len().min(i32::MAX as usize) as i32,
             full_text.len().min(i32::MAX as usize) as i32,
-            &formatted,
-            &full_text,
-        );
-        self.record_full_buffer_programmatic_replace(
-            full_text,
-            formatted,
-            original_pos,
-            mapped_cursor,
+            formatted.as_str(),
+            full_text.as_str(),
+            Some(&updated_text_snapshot),
         );
         editor.set_insert_position(mapped_cursor.min(i32::MAX as usize) as i32);
         editor.show_insert_position();

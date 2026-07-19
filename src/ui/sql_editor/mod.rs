@@ -5061,8 +5061,7 @@ mod execution_state_tests {
         BufferEdit {
             start,
             deleted_len: deleted_text.len(),
-            inserted_text: inserted_text.to_string(),
-            deleted_text: deleted_text.to_string(),
+            inserted_text: Arc::new(inserted_text.to_string()),
         }
     }
 
@@ -5268,8 +5267,8 @@ mod execution_state_tests {
             current: UndoSnapshot::new("SELECT 2".to_string(), 8),
             deltas: vec![UndoDelta {
                 start: 7,
-                deleted_text: "1".to_string(),
-                inserted_text: "2".to_string(),
+                deleted_text: Arc::new("1".to_string()),
+                inserted_text: Arc::new("2".to_string()),
                 before_cursor: 8,
                 after_cursor: 8,
                 group_id: 1,
@@ -5282,6 +5281,7 @@ mod execution_state_tests {
             suppress_next_remote_cursor_move: true,
             finish_group_after_next_edit: true,
             completion_edit_group_id: Some(1),
+            pending_history_text_snapshots: Default::default(),
         }));
 
         SqlEditorWidget::reset_word_undo_state(&undo_state);
@@ -5460,12 +5460,17 @@ mod execution_state_tests {
         let inserted = "-- edited\n";
         state.current.cursor_pos = edit_at;
         let edit = build_edit(edit_at, "", inserted);
-        state.record_edit(
+        let updated_text = state.record_edit(
             &edit,
             classify_edit_group(inserted.len() as i32, 0, inserted, ""),
         );
 
         assert_eq!(state.deltas.len(), 1);
+        assert!(Arc::ptr_eq(
+            &edit.inserted_text,
+            &state.deltas[0].inserted_text
+        ));
+        assert!(updated_text.shares_storage_with(&state.current.text));
         assert_eq!(state.history_total_bytes, inserted.len());
         assert!(
             state.anchor.text.shared_chunk_count(&state.current.text)
@@ -5480,6 +5485,36 @@ mod execution_state_tests {
                 .as_deref(),
             Some(inserted)
         );
+    }
+
+    #[test]
+    fn large_undo_redo_steps_share_payloads_and_callback_snapshots() {
+        let inserted = "SELECT 1;\n".repeat(100_000);
+        let edit = build_edit(0, "", &inserted);
+        let mut state = WordUndoRedoState::new(String::new());
+        state.record_edit(
+            &edit,
+            classify_edit_group(inserted.len() as i32, 0, &inserted, ""),
+        );
+        let history_payload = state.deltas[0].inserted_text.clone();
+
+        let undo_group = state.take_undo_group();
+        assert_eq!(undo_group.len(), 1);
+        assert!(Arc::ptr_eq(&history_payload, &undo_group[0].inserted_text));
+        let undo_callback_snapshot = state
+            .pending_history_text_snapshots
+            .pop_front()
+            .expect("undo callback snapshot");
+        assert!(undo_callback_snapshot.shares_storage_with(&state.current.text));
+
+        let redo_group = state.take_redo_group();
+        assert_eq!(redo_group.len(), 1);
+        assert!(Arc::ptr_eq(&history_payload, &redo_group[0].inserted_text));
+        let redo_callback_snapshot = state
+            .pending_history_text_snapshots
+            .pop_front()
+            .expect("redo callback snapshot");
+        assert!(redo_callback_snapshot.shares_storage_with(&state.current.text));
     }
 
     #[test]
@@ -6027,8 +6062,8 @@ mod execution_state_tests {
 
         let cursor_group = state.take_undo_group();
         assert_eq!(cursor_group.len(), 1);
-        assert_eq!(cursor_group[0].deleted_text, "");
-        assert_eq!(cursor_group[0].inserted_text, "");
+        assert_eq!(cursor_group[0].deleted_text.as_str(), "");
+        assert_eq!(cursor_group[0].inserted_text.as_str(), "");
         assert_eq!(state.current.text, "alpha beta");
         assert_eq!(state.undo_cursor_after_group(&cursor_group), 10);
     }
@@ -6063,8 +6098,8 @@ mod execution_state_tests {
 
         let cursor_redo = state.take_redo_group();
         assert_eq!(cursor_redo.len(), 1);
-        assert_eq!(cursor_redo[0].deleted_text, "");
-        assert_eq!(cursor_redo[0].inserted_text, "");
+        assert_eq!(cursor_redo[0].deleted_text.as_str(), "");
+        assert_eq!(cursor_redo[0].inserted_text.as_str(), "");
         assert_eq!(state.current.text, "alpha beta");
         assert_eq!(state.current.cursor_pos, 5);
 
@@ -6133,8 +6168,8 @@ mod execution_state_tests {
 
         let cursor_group = state.take_undo_group();
         assert_eq!(cursor_group.len(), 1);
-        assert_eq!(cursor_group[0].deleted_text, "");
-        assert_eq!(cursor_group[0].inserted_text, "");
+        assert_eq!(cursor_group[0].deleted_text.as_str(), "");
+        assert_eq!(cursor_group[0].inserted_text.as_str(), "");
         assert_eq!(state.current.text, "eee     ab");
         assert_eq!(state.undo_cursor_after_group(&cursor_group), 3);
 
@@ -6241,8 +6276,8 @@ mod execution_state_tests {
         let cursor_group = state.take_undo_group();
         assert_eq!(state.current.text, "eeexxxxxabcef");
         assert_eq!(cursor_group.len(), 1);
-        assert_eq!(cursor_group[0].deleted_text, "");
-        assert_eq!(cursor_group[0].inserted_text, "");
+        assert_eq!(cursor_group[0].deleted_text.as_str(), "");
+        assert_eq!(cursor_group[0].inserted_text.as_str(), "");
         assert_eq!(state.undo_cursor_after_group(&cursor_group), 3);
 
         let first_delete_group = state.take_undo_group();
@@ -6276,8 +6311,8 @@ mod execution_state_tests {
         let cursor_group = state.take_undo_group();
         assert_eq!(state.current.text, "eee     abcef");
         assert_eq!(cursor_group.len(), 1);
-        assert_eq!(cursor_group[0].deleted_text, "");
-        assert_eq!(cursor_group[0].inserted_text, "");
+        assert_eq!(cursor_group[0].deleted_text.as_str(), "");
+        assert_eq!(cursor_group[0].inserted_text.as_str(), "");
         assert_eq!(state.undo_cursor_after_group(&cursor_group), 3);
 
         let first_delete_group = state.take_undo_group();
@@ -6315,8 +6350,8 @@ mod execution_state_tests {
 
         assert_eq!(state.current.text, "alphax beta");
         assert_eq!(cursor_group.len(), 1);
-        assert_eq!(cursor_group[0].deleted_text, "");
-        assert_eq!(cursor_group[0].inserted_text, "");
+        assert_eq!(cursor_group[0].deleted_text.as_str(), "");
+        assert_eq!(cursor_group[0].inserted_text.as_str(), "");
         assert_eq!(state.undo_cursor_after_group(&cursor_group), 6);
 
         let first_edit_group = state.take_undo_group();
@@ -6329,8 +6364,8 @@ mod execution_state_tests {
 
         assert_eq!(state.current.text, "alpha beta");
         assert_eq!(first_cursor_group.len(), 1);
-        assert_eq!(first_cursor_group[0].deleted_text, "");
-        assert_eq!(first_cursor_group[0].inserted_text, "");
+        assert_eq!(first_cursor_group[0].deleted_text.as_str(), "");
+        assert_eq!(first_cursor_group[0].inserted_text.as_str(), "");
         assert_eq!(state.undo_cursor_after_group(&first_cursor_group), 10);
     }
 
@@ -6349,8 +6384,8 @@ mod execution_state_tests {
 
         assert_eq!(state.current.text, "alpha beta");
         assert_eq!(cursor_group.len(), 1);
-        assert_eq!(cursor_group[0].deleted_text, "");
-        assert_eq!(cursor_group[0].inserted_text, "");
+        assert_eq!(cursor_group[0].deleted_text.as_str(), "");
+        assert_eq!(cursor_group[0].inserted_text.as_str(), "");
         assert_eq!(state.undo_cursor_after_group(&cursor_group), 10);
     }
 

@@ -1,7 +1,7 @@
 use crate::ui::syntax_highlight::{
-    encode_fltk_style_bytes, encode_repeated_fltk_style_bytes, replace_text_buffer_with_raw_bytes,
-    set_text_buffer_raw_bytes, LexerState, STYLE_BLOCK_COMMENT, STYLE_COMMENT,
-    STYLE_DATETIME_LITERAL, STYLE_HINT, STYLE_Q_QUOTE_STRING, STYLE_QUOTED_IDENTIFIER,
+    encode_fltk_style_bytes, replace_text_buffer_with_raw_bytes, set_text_buffer_raw_bytes,
+    LexerState, STYLE_BLOCK_COMMENT, STYLE_COMMENT, STYLE_DATETIME_LITERAL, STYLE_HINT,
+    STYLE_Q_QUOTE_STRING, STYLE_QUOTED_IDENTIFIER,
 };
 #[cfg(test)]
 use crate::ui::syntax_highlight::HighlightWordAudit;
@@ -10,6 +10,7 @@ const DEFERRED_REHIGHLIGHT_IDLE_DELAY_SECONDS: f64 = 0.15;
 const SEMANTIC_REHIGHLIGHT_OVERSCAN_LINES: usize = 100;
 const LARGE_DOCUMENT_PASTE_LINE_THRESHOLD: usize = 100_000;
 const LARGE_PASTE_DEFER_SEMANTIC_BYTES: usize = 64 * 1024;
+const INCREMENTAL_HIGHLIGHT_BATCH_BYTES: usize = 64 * 1024;
 // Keep semantic alias work independent of the total document size. The window
 // is renewed only if lexical-state propagation carries highlighting beyond it.
 const LOCAL_ALIAS_CONTEXT_LOOKAROUND_BYTES: usize = 16 * 1024;
@@ -123,14 +124,128 @@ pub(crate) struct HighlightShadowState {
     shared_sql_context: Option<BoundedSqlContextAnalysis>,
 }
 
+struct AppliedShadowTextEdit {
+    old_text: ChunkedText,
+    start: usize,
+    old_end: usize,
+    new_end: usize,
+    old_affected_line_end: usize,
+}
+
+impl AppliedShadowTextEdit {
+    fn old_position_for_new(&self, position: usize) -> Option<usize> {
+        if position <= self.start {
+            Some(position)
+        } else if position >= self.new_end {
+            Some(
+                self.old_end
+                    .saturating_add(position.saturating_sub(self.new_end)),
+            )
+        } else {
+            None
+        }
+    }
+
+    fn old_styles_for_new_range(
+        &self,
+        styles: &ChunkedValues<u8>,
+        start: usize,
+        end: usize,
+    ) -> Option<Vec<u8>> {
+        if end < start {
+            return None;
+        }
+        let mut mapped = Vec::with_capacity(end.saturating_sub(start));
+
+        let unchanged_prefix_end = end.min(self.start);
+        if start < unchanged_prefix_end {
+            mapped.extend(styles.range_vec(start, unchanged_prefix_end)?);
+        }
+
+        let inserted_start = start.max(self.start);
+        let inserted_end = end.min(self.new_end);
+        if inserted_start < inserted_end {
+            mapped.resize(
+                mapped
+                    .len()
+                    .saturating_add(inserted_end.saturating_sub(inserted_start)),
+                STYLE_DEFAULT as u8,
+            );
+        }
+
+        let unchanged_suffix_start = start.max(self.new_end);
+        if unchanged_suffix_start < end {
+            let old_start = self
+                .old_end
+                .saturating_add(unchanged_suffix_start.saturating_sub(self.new_end));
+            let old_end = old_start.saturating_add(end.saturating_sub(unchanged_suffix_start));
+            mapped.extend(styles.range_vec(old_start, old_end)?);
+        }
+
+        (mapped.len() == end.saturating_sub(start)).then_some(mapped)
+    }
+
+    fn old_line_state_for_new(
+        &self,
+        states: &ChunkedValues<LexerState>,
+        line_start: usize,
+        line_end: usize,
+    ) -> Option<LexerState> {
+        let old_line_start = if line_end <= self.start {
+            line_start
+        } else if line_start >= self.new_end {
+            self.old_end
+                .saturating_add(line_start.saturating_sub(self.new_end))
+        } else {
+            return None;
+        };
+        states
+            .get(self.old_text.line_index_for_position(old_line_start))
+            .copied()
+    }
+
+    fn old_line_state_end_for_new_line(&self, line_start: usize, line_end: usize) -> usize {
+        if line_end <= self.start {
+            return self
+                .old_text
+                .line_index_for_position(line_start)
+                .saturating_add(1);
+        }
+        if line_start >= self.new_end {
+            let old_line_start = self
+                .old_end
+                .saturating_add(line_start.saturating_sub(self.new_end));
+            return self
+                .old_text
+                .line_index_for_position(old_line_start)
+                .saturating_add(1);
+        }
+        self.old_affected_line_end
+    }
+}
+
 impl HighlightShadowState {
+    #[cfg(test)]
     pub(crate) fn rebuild(
         &mut self,
         text: String,
         styles: &str,
         line_exit_states: Vec<LexerState>,
     ) {
-        self.text = ChunkedText::from_string(text);
+        self.rebuild_from_snapshot(
+            ChunkedText::from_string(text),
+            styles,
+            line_exit_states,
+        );
+    }
+
+    fn rebuild_from_snapshot(
+        &mut self,
+        text: ChunkedText,
+        styles: &str,
+        line_exit_states: Vec<LexerState>,
+    ) {
+        self.text = text;
         self.styles = ChunkedValues::from_vec(styles.as_bytes().to_vec());
         self.line_exit_states = ChunkedValues::from_vec(line_exit_states);
         self.shared_sql_context = None;
@@ -205,6 +320,10 @@ impl HighlightShadowState {
 
     pub(crate) fn line_count(&self) -> usize {
         self.text.line_count()
+    }
+
+    fn text_matches(&self, expected: &str) -> bool {
+        self.text.matches_str(expected)
     }
 
     pub(crate) fn line_start(&self, pos: usize) -> usize {
@@ -335,16 +454,9 @@ impl HighlightShadowState {
         }
     }
 
+    #[cfg(test)]
     fn line_exit_state(&self, line_index: usize) -> Option<LexerState> {
         self.line_exit_states.get(line_index).copied()
-    }
-
-    fn set_line_exit_state(&mut self, line_index: usize, state: LexerState) {
-        if self.line_exit_states.len() <= line_index {
-            self.line_exit_states
-                .resize(line_index.saturating_add(1), LexerState::Normal);
-        }
-        let _ = self.line_exit_states.set(line_index, state);
     }
 
     pub(crate) fn text_range_string(&self, start: usize, end: usize) -> Option<String> {
@@ -409,6 +521,7 @@ impl HighlightShadowState {
         )
     }
 
+    #[cfg(test)]
     fn style_range_string(&self, start: usize, end: usize) -> Option<String> {
         let bytes = self.styles.range_vec(start, end)?;
         String::from_utf8(bytes).ok()
@@ -507,72 +620,57 @@ impl HighlightShadowState {
         Some((start, end.max(start), self.entry_state_for_line(start_line)))
     }
 
-    fn reconcile_line_exit_states_after_edit(
+    #[cfg(test)]
+    fn apply_edit(
         &mut self,
-        start_line_idx: usize,
-        old_end_line_idx: usize,
-        edit_start: usize,
-        inserted_len: usize,
-    ) {
-        let old_line_count = self.line_exit_states.len();
-        let tail_start = old_end_line_idx.saturating_add(1).min(old_line_count);
-        let placeholder_count = if !self.text.is_empty() {
-            let new_end_line_idx =
-                self.line_index_for_span_end(edit_start.min(self.text.len()), inserted_len);
-            if new_end_line_idx >= start_line_idx {
-                new_end_line_idx
-                    .saturating_sub(start_line_idx)
-                    .saturating_add(1)
-            } else {
-                0
-            }
-        } else {
-            0
-        };
-        self.line_exit_states.replace_range(
-            start_line_idx.min(old_line_count),
-            tail_start,
-            vec![LexerState::Normal; placeholder_count],
-        );
-        self.line_exit_states.truncate(self.line_count());
-        if self.line_exit_states.len() < self.line_count() {
-            self.line_exit_states
-                .resize(self.line_count(), LexerState::Normal);
-        }
+        pos: usize,
+        inserted_text: &str,
+        deleted_len: usize,
+    ) -> Option<AppliedShadowTextEdit> {
+        self.apply_edit_with_snapshot(pos, inserted_text, deleted_len, None)
     }
 
-    fn apply_edit(&mut self, pos: usize, inserted_text: &str, deleted_len: usize) -> bool {
+    fn apply_edit_with_snapshot(
+        &mut self,
+        pos: usize,
+        inserted_text: &str,
+        deleted_len: usize,
+        updated_text: Option<&ChunkedText>,
+    ) -> Option<AppliedShadowTextEdit> {
         let start = self.text.clamp_boundary(pos);
         let end = self
             .text
             .clamp_boundary(start.saturating_add(deleted_len));
         if end < start {
-            return false;
+            return None;
         }
 
         let replaced_len = end.saturating_sub(start);
-        let start_line_idx = self.line_index_for_position(start);
+        let old_text = self.text.clone();
         let old_end_line_idx = self.line_index_for_span_end(start, replaced_len);
 
-        if self.text.range_string(start, end).is_none() {
-            return false;
-        }
-        if !self.text.replace_range(start, end, inserted_text) {
-            return false;
+        if let Some(updated_text) = updated_text {
+            let expected_len = self
+                .text
+                .len()
+                .saturating_sub(replaced_len)
+                .saturating_add(inserted_text.len());
+            if updated_text.len() != expected_len {
+                return None;
+            }
+            self.text = updated_text.clone();
+        } else if !self.text.replace_range(start, end, inserted_text) {
+            return None;
         }
         self.shared_sql_context = None;
-        self.styles.replace_range(
+        let new_end = start.saturating_add(inserted_text.len());
+        Some(AppliedShadowTextEdit {
+            old_text,
             start,
-            end,
-            vec![STYLE_DEFAULT as u8; inserted_text.len()],
-        );
-        self.reconcile_line_exit_states_after_edit(
-            start_line_idx,
-            old_end_line_idx,
-            start,
-            inserted_text.len(),
-        );
-        true
+            old_end: end,
+            new_end,
+            old_affected_line_end: old_end_line_idx.saturating_add(1),
+        })
     }
 }
 
@@ -746,6 +844,14 @@ impl SqlEditorWidget {
 }
 
 impl SqlEditorWidget {
+    pub(crate) fn highlight_shadow_text_matches(&self, expected: &str) -> bool {
+        let shadow = self
+            .highlight_shadow
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        shadow.len() == self.buffer.length().max(0) as usize && shadow.text_matches(expected)
+    }
+
     fn redraw_editor_if_live(&self) {
         let mut editor = self.editor.clone();
         if editor.was_deleted() {
@@ -787,6 +893,7 @@ impl SqlEditorWidget {
         del: i32,
         inserted_text: &str,
         deleted_text: &str,
+        updated_text_snapshot: Option<&ChunkedText>,
     ) {
         let text_len = buf.length().max(0) as usize;
         if ins > 0 && inserted_text.len() != ins.max(0) as usize {
@@ -801,16 +908,24 @@ impl SqlEditorWidget {
             && del.max(0) as usize == expected_previous_len
             && ins.max(0) as usize == text_len;
         if full_buffer_replaced {
-            self.rehighlight_full_buffer_from_text(inserted_text);
+            self.rehighlight_full_buffer_from_text_and_snapshot(
+                inserted_text,
+                updated_text_snapshot.cloned(),
+            );
             return;
         }
         let mut style_buffer = self.style_buffer.clone();
-        Self::apply_style_buffer_edit_delta(&mut style_buffer, pos, inserted_text, del);
-        if style_buffer.length().max(0) as usize != text_len {
+        if style_buffer.length().max(0) as usize != expected_previous_len {
             self.rehighlight_full_buffer();
             return;
         }
         if text_len == 0 {
+            replace_text_buffer_with_raw_bytes(
+                &mut style_buffer,
+                0,
+                expected_previous_len.min(i32::MAX as usize) as i32,
+                &[],
+            );
             self.highlight_shadow
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -832,11 +947,16 @@ impl SqlEditorWidget {
             }
 
             let shadow_pos = pos.max(0) as usize;
-            if !shadow.apply_edit(shadow_pos, inserted_text, del.max(0) as usize) {
+            let Some(applied_edit) = shadow.apply_edit_with_snapshot(
+                shadow_pos,
+                inserted_text,
+                del.max(0) as usize,
+                updated_text_snapshot,
+            ) else {
                 drop(shadow);
                 self.rehighlight_full_buffer();
                 return;
-            }
+            };
 
             let defer_semantic_alias_context =
                 should_defer_semantic_alias_context_for_insert(shadow.line_count(), inserted_text);
@@ -850,6 +970,7 @@ impl SqlEditorWidget {
                     inserted_text,
                     deleted_text,
                     defer_semantic_alias_context,
+                    &applied_edit,
                 ),
                 defer_semantic_alias_context,
             )
@@ -865,24 +986,6 @@ impl SqlEditorWidget {
         }
     }
 
-    fn apply_style_buffer_edit_delta(
-        style_buffer: &mut TextBuffer,
-        pos: i32,
-        inserted_text: &str,
-        del: i32,
-    ) {
-        if inserted_text.is_empty() && del <= 0 {
-            return;
-        }
-
-        let style_len = style_buffer.length().max(0);
-        let start = pos.clamp(0, style_len);
-        let delete_len = del.max(0);
-        let delete_end = start.saturating_add(delete_len).min(style_len);
-        let placeholder_bytes = encode_repeated_fltk_style_bytes(inserted_text, STYLE_DEFAULT);
-        replace_text_buffer_with_raw_bytes(style_buffer, start, delete_end, &placeholder_bytes);
-    }
-
     fn apply_main_thread_incremental_highlighting(
         &self,
         shadow: &mut HighlightShadowState,
@@ -893,91 +996,34 @@ impl SqlEditorWidget {
         inserted_text: &str,
         deleted_text: &str,
         defer_semantic_alias_context: bool,
+        applied_edit: &AppliedShadowTextEdit,
     ) -> Option<bool> {
-        let text_len = shadow.len();
-        if text_len == 0 {
-            return Some(false);
-        }
-
-        let start =
-            incremental_rehighlight_start(shadow, pos, inserted_text, deleted_text).min(text_len);
-        let must_cover_end = incremental_direct_rehighlight_end(shadow, pos, ins, del, text_len);
         let highlighter = self
             .highlighter
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let mysql_compatible = highlighter.mysql_compatible();
-        let mut current_line_idx = shadow.line_index_for_position(start);
-        let mut entry_state = shadow.entry_state_for_line(current_line_idx);
-        let mut changed_range: Option<(usize, usize)> = None;
-        let mut alias_context = if defer_semantic_alias_context {
-            BoundedAliasContext {
-                context: Arc::new(super::query_text::LocalAliasContext::default()),
-                start: 0,
-                end: text_len,
-            }
-        } else {
-            shadow.bounded_alias_context(start, must_cover_end, mysql_compatible)
-        };
-
-        while current_line_idx < shadow.line_count() {
-            let current_start = shadow.line_start_for_index(current_line_idx);
-            let current_end = shadow.inclusive_line_end_for_index(current_line_idx);
-            if !alias_context.covers(current_start, current_end) {
-                alias_context =
-                    shadow.bounded_alias_context(current_start, current_end, mysql_compatible);
-            }
-            let range_text = shadow.text_range_string(current_start, current_end)?;
-            let previous_styles = shadow.style_range_string(current_start, current_end)?;
-            let old_exit_state = shadow.line_exit_state(current_line_idx);
-            let (new_styles, new_exit_state) = highlighter
-                .generate_styles_for_window_with_alias_context(
-                    &range_text,
-                    entry_state,
-                    alias_context.context.as_ref(),
-                    current_start,
-                );
-            if new_styles.len() != range_text.len() {
-                return None;
-            }
-
-            let styles_changed = new_styles.as_bytes() != previous_styles.as_bytes();
-            if styles_changed {
-                shadow.replace_style_range(current_start, current_end, new_styles.as_bytes());
-                changed_range = Some(match changed_range {
-                    Some((start, end)) => (start.min(current_start), end.max(current_end)),
-                    None => (current_start, current_end),
-                });
-            }
-
-            shadow.set_line_exit_state(current_line_idx, new_exit_state);
-
-            if current_end >= must_cover_end
-                && !styles_changed
-                && old_exit_state == Some(new_exit_state)
-            {
-                break;
-            }
-
-            current_line_idx = current_line_idx.saturating_add(1);
-            entry_state = new_exit_state;
-        }
-
-        let Some((changed_start, changed_end)) = changed_range else {
-            return Some(false);
-        };
-        let range_text = shadow.text_range_string(changed_start, changed_end)?;
-        let style_text = shadow.style_range_string(changed_start, changed_end)?;
-        if !Self::replace_style_buffer_range_for_text(
-            style_buffer,
-            &range_text,
-            &style_text,
-            changed_start,
-            changed_end,
-        ) {
-            return None;
-        }
-        Some(true)
+        apply_incremental_highlighting_to_shadow(
+            shadow,
+            &highlighter,
+            IncrementalHighlightEdit {
+                position: pos,
+                inserted_len: ins,
+                deleted_len: del,
+                inserted_text,
+                deleted_text,
+                defer_semantic_alias_context,
+            },
+            applied_edit,
+            |range_text, style_text, start, end| {
+                Self::replace_style_buffer_range_for_text(
+                    style_buffer,
+                    range_text,
+                    style_text,
+                    start,
+                    end,
+                )
+            },
+        )
     }
 
     fn rehighlight_full_buffer(&self) {
@@ -1083,6 +1129,14 @@ impl SqlEditorWidget {
     }
 
     fn rehighlight_full_buffer_from_text(&self, text: &str) {
+        self.rehighlight_full_buffer_from_text_and_snapshot(text, None);
+    }
+
+    fn rehighlight_full_buffer_from_text_and_snapshot(
+        &self,
+        text: &str,
+        text_snapshot: Option<ChunkedText>,
+    ) {
         let (styles, line_exit_states) = {
             let highlighter = self
                 .highlighter
@@ -1097,9 +1151,182 @@ impl SqlEditorWidget {
         self.highlight_shadow
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .rebuild(text.to_string(), &styles, line_exit_states);
+            .rebuild_from_snapshot(
+                text_snapshot.unwrap_or_else(|| ChunkedText::from_str(text)),
+                &styles,
+                line_exit_states,
+            );
         self.redraw_editor_if_live();
     }
+}
+
+struct IncrementalHighlightEdit<'a> {
+    position: usize,
+    inserted_len: usize,
+    deleted_len: usize,
+    inserted_text: &'a str,
+    deleted_text: &'a str,
+    defer_semantic_alias_context: bool,
+}
+
+fn apply_incremental_highlighting_to_shadow<F>(
+    shadow: &mut HighlightShadowState,
+    highlighter: &SqlHighlighter,
+    edit: IncrementalHighlightEdit<'_>,
+    applied_edit: &AppliedShadowTextEdit,
+    mut apply_style_range: F,
+) -> Option<bool>
+where
+    F: FnMut(&str, &str, usize, usize) -> bool,
+{
+    let text_len = shadow.len();
+    if text_len == 0 {
+        return Some(false);
+    }
+
+    let start = incremental_rehighlight_start(
+        shadow,
+        edit.position,
+        edit.inserted_text,
+        edit.deleted_text,
+    )
+    .min(text_len);
+    let must_cover_end = incremental_direct_rehighlight_end(
+        shadow,
+        edit.position,
+        edit.inserted_len,
+        edit.deleted_len,
+        text_len,
+    );
+    let mysql_compatible = highlighter.mysql_compatible();
+    let mut current_line_idx = shadow.line_index_for_position(start);
+    let first_line_idx = current_line_idx;
+    let mut entry_state = shadow.entry_state_for_line(current_line_idx);
+    let estimated_style_len = must_cover_end.saturating_sub(start);
+    let mut generated_styles = Vec::with_capacity(estimated_style_len);
+    let mut generated_exit_states = Vec::with_capacity(
+        shadow
+            .line_index_for_position(must_cover_end)
+            .saturating_sub(first_line_idx)
+            .saturating_add(1),
+    );
+    let mut line_style_scratch = Vec::new();
+    let mut processed_end = start;
+    let mut processed_line_start = start;
+    let mut processed_line_end = start;
+    let mut any_styles_changed = edit.inserted_len != edit.deleted_len;
+    let mut any_states_changed = false;
+    let mut alias_context = if edit.defer_semantic_alias_context {
+        BoundedAliasContext {
+            context: Arc::new(super::query_text::LocalAliasContext::default()),
+            start: 0,
+            end: text_len,
+        }
+    } else {
+        shadow.bounded_alias_context(start, must_cover_end, mysql_compatible)
+    };
+
+    'batches: while current_line_idx < shadow.line_count() {
+        let batch_start = shadow.line_start_for_index(current_line_idx);
+        let batch_target = batch_start
+            .saturating_add(INCREMENTAL_HIGHLIGHT_BATCH_BYTES)
+            .min(text_len);
+        let batch_end = shadow.inclusive_line_end(batch_target).max(batch_start);
+        let batch_text = shadow.text_range_string(batch_start, batch_end)?;
+        let previous_styles =
+            applied_edit.old_styles_for_new_range(&shadow.styles, batch_start, batch_end)?;
+
+        loop {
+            let current_start = shadow.line_start_for_index(current_line_idx);
+            let current_end = shadow.inclusive_line_end_for_index(current_line_idx);
+            if current_start < batch_start || current_end > batch_end {
+                break;
+            }
+            if !alias_context.covers(current_start, current_end) {
+                alias_context =
+                    shadow.bounded_alias_context(current_start, current_end, mysql_compatible);
+            }
+            let relative_start = current_start.saturating_sub(batch_start);
+            let relative_end = current_end.saturating_sub(batch_start);
+            let range_text = batch_text.get(relative_start..relative_end)?;
+            let previous_line_styles = previous_styles.get(relative_start..relative_end)?;
+            let old_exit_state = applied_edit
+                .old_line_state_for_new(&shadow.line_exit_states, current_start, current_end);
+            let new_exit_state = highlighter
+                .generate_style_bytes_for_window_with_alias_context_into(
+                    range_text,
+                    entry_state,
+                    alias_context.context.as_ref(),
+                    current_start,
+                    &mut line_style_scratch,
+                );
+            if line_style_scratch.len() != range_text.len() {
+                return None;
+            }
+
+            let styles_changed = line_style_scratch.as_slice() != previous_line_styles;
+            any_styles_changed |= styles_changed;
+            any_states_changed |= old_exit_state != Some(new_exit_state);
+            generated_styles.extend_from_slice(&line_style_scratch);
+            generated_exit_states.push(new_exit_state);
+            processed_end = current_end;
+            processed_line_start = current_start;
+            processed_line_end = current_end;
+
+            if current_end >= must_cover_end
+                && !styles_changed
+                && old_exit_state == Some(new_exit_state)
+            {
+                break 'batches;
+            }
+
+            current_line_idx = current_line_idx.saturating_add(1);
+            entry_state = new_exit_state;
+            if current_line_idx >= shadow.line_count() {
+                break 'batches;
+            }
+            let next_start = shadow.line_start_for_index(current_line_idx);
+            let include_trailing_empty_line = batch_end == text_len
+                && next_start == text_len
+                && current_line_idx.saturating_add(1) == shadow.line_count();
+            if next_start >= batch_end && !include_trailing_empty_line {
+                break;
+            }
+        }
+    }
+
+    let old_style_start = applied_edit.old_position_for_new(start)?;
+    let old_style_end = applied_edit.old_position_for_new(processed_end)?;
+    let style_text = std::str::from_utf8(&generated_styles).ok()?;
+    let range_text = shadow.text_range_string(start, processed_end)?;
+    if range_text.len() != generated_styles.len()
+        || !apply_style_range(
+            &range_text,
+            style_text,
+            old_style_start,
+            old_style_end,
+        )
+    {
+        return None;
+    }
+    shadow
+        .styles
+        .replace_range(old_style_start, old_style_end, generated_styles);
+
+    let old_line_end =
+        applied_edit.old_line_state_end_for_new_line(processed_line_start, processed_line_end);
+    shadow.line_exit_states.replace_range(
+        first_line_idx,
+        old_line_end,
+        generated_exit_states,
+    );
+    if shadow.styles_len() != shadow.len()
+        || shadow.line_exit_states.len() != shadow.line_count()
+    {
+        return None;
+    }
+
+    Some(any_styles_changed || any_states_changed)
 }
 
 fn collect_highlight_columns_from_intellisense(data: &IntellisenseData) -> Vec<String> {
@@ -1449,7 +1676,7 @@ mod tests {
             .token_spans_for_range(0, sql.len(), true)
             .is_none());
 
-        assert!(shadow.apply_edit(cursor, "x", 0));
+        assert!(shadow.apply_edit(cursor, "x", 0).is_some());
         assert!(shadow.shared_sql_context_snapshot().is_none());
     }
 
@@ -1515,12 +1742,75 @@ mod tests {
         );
 
         let edit_at = top_line.saturating_mul(LINE.len());
-        assert!(shadow.apply_edit(edit_at, "-- edited\n", 0));
+        let mut updated_text = shadow.text_snapshot();
+        assert!(updated_text.replace_range(edit_at, edit_at, "-- edited\n"));
+        assert!(
+            shadow
+                .apply_edit_with_snapshot(edit_at, "-- edited\n", 0, Some(&updated_text))
+                .is_some()
+        );
+        assert!(shadow
+            .text_snapshot()
+            .shares_storage_with(&updated_text));
         let local = shadow
             .text_range_string(edit_at, edit_at.saturating_add("-- edited\n".len()))
             .expect("edited range");
         assert_eq!(local, "-- edited\n");
         assert!(shadow.line_count() > 1_000_000);
+    }
+
+    #[test]
+    fn hundred_thousand_line_paste_batches_style_buffer_update_once() {
+        const LINES: usize = 100_001;
+        let text = "x\n".repeat(LINES);
+        let styles = std::iter::repeat_n(STYLE_DEFAULT, text.len()).collect::<String>();
+        let mut shadow = HighlightShadowState::default();
+        shadow.rebuild(
+            text,
+            &styles,
+            vec![LexerState::Normal; LINES.saturating_add(1)],
+        );
+
+        let inserted = "SELECT 1;\n".repeat(10_000);
+        let edit_at = 50_000usize.saturating_mul("x\n".len());
+        let old_style_len = shadow.styles_len();
+        let mut updated_text = shadow.text_snapshot();
+        assert!(updated_text.replace_range(edit_at, edit_at, &inserted));
+        let applied_edit = shadow
+            .apply_edit_with_snapshot(edit_at, &inserted, 0, Some(&updated_text))
+            .expect("shadow text edit");
+        assert_eq!(
+            shadow.styles_len(),
+            old_style_len,
+            "text edits must not perform a placeholder style-buffer write"
+        );
+
+        let mut style_buffer_updates = 0usize;
+        let updated = apply_incremental_highlighting_to_shadow(
+            &mut shadow,
+            &SqlHighlighter::new(),
+            IncrementalHighlightEdit {
+                position: edit_at,
+                inserted_len: inserted.len(),
+                deleted_len: 0,
+                inserted_text: &inserted,
+                deleted_text: "",
+                defer_semantic_alias_context: true,
+            },
+            &applied_edit,
+            |_text, _styles, _start, _end| {
+                style_buffer_updates = style_buffer_updates.saturating_add(1);
+                true
+            },
+        );
+
+        assert_eq!(updated, Some(true));
+        assert_eq!(style_buffer_updates, 1);
+        assert_eq!(shadow.styles_len(), shadow.len());
+        assert_eq!(
+            shadow.styles.get(edit_at).copied(),
+            Some(crate::ui::syntax_highlight::STYLE_KEYWORD as u8)
+        );
     }
 
 }

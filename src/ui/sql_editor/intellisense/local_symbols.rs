@@ -15,7 +15,7 @@ struct ExpandedStatementWindow {
 }
 
 struct BoundedIntellisenseParseText {
-    text: String,
+    text: SharedTextSlice,
     start: usize,
     cursor_pos: usize,
 }
@@ -187,9 +187,19 @@ impl SqlEditorWidget {
                 .min(text.len()),
         );
         BoundedIntellisenseParseText {
-            text: text.range_string(start, end).unwrap_or_default(),
+            text: text.range_string(start, end).unwrap_or_default().into(),
             start,
             cursor_pos,
+        }
+    }
+
+    fn bounded_intellisense_parse_text_from_cursor_analysis(
+        analysis: &CursorAnalysisSnapshot,
+    ) -> BoundedIntellisenseParseText {
+        BoundedIntellisenseParseText {
+            text: SharedTextSlice::whole(analysis.fast_text.clone()),
+            start: analysis.fast_start,
+            cursor_pos: analysis.cursor_pos,
         }
     }
 
@@ -212,7 +222,7 @@ impl SqlEditorWidget {
         let text = full_text.get(start..end).unwrap_or("").to_string();
         debug_assert!(text.len() <= Self::BOUNDED_INTELLISENSE_PARSE_WINDOW_BYTES);
         BoundedIntellisenseParseText {
-            text,
+            text: text.into(),
             start,
             cursor_pos,
         }
@@ -608,9 +618,8 @@ impl SqlEditorWidget {
         label_start
     }
 
-    fn expanded_statement_window_and_text_binds_from_shadow(
-        text_shadow: &Arc<Mutex<HighlightShadowState>>,
-        cursor_pos: usize,
+    fn expanded_statement_window_and_text_binds_from_cursor_analysis(
+        analysis: &CursorAnalysisSnapshot,
         preferred_db_type: Option<crate::db::connection::DatabaseType>,
     ) -> (
         ExpandedStatementWindow,
@@ -618,24 +627,17 @@ impl SqlEditorWidget {
         Vec<ParsedDeclarationSymbol>,
         Option<(Vec<SqlTokenSpan>, super::query_text::LocalAliasContext)>,
     ) {
-        let (text_snapshot, shared_context) = {
-            let shadow = text_shadow
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            (
-                shadow.text_snapshot(),
-                shadow.shared_sql_context_snapshot(),
-            )
-        };
+        let bounded = Self::bounded_intellisense_parse_text_from_cursor_analysis(analysis);
         let (expanded, text_bind_names, package_spec_symbols) =
-            Self::expanded_statement_window_and_text_binds_from_snapshot(
-            &text_snapshot,
-            cursor_pos,
-            preferred_db_type,
-        );
+            Self::expanded_statement_window_and_text_binds_from_bounded(
+                &analysis.text_snapshot,
+                analysis.cursor_pos,
+                preferred_db_type,
+                bounded,
+            );
         let mysql_compatible =
             sql_text::mysql_compatibility_for_sql(&expanded.text, preferred_db_type);
-        let shared_sql_context = shared_context.and_then(|context| {
+        let shared_sql_context = analysis.shared_sql_context.clone().and_then(|context| {
             context.context_for_range(
                 expanded.statement_start,
                 expanded.statement_end,
@@ -650,17 +652,32 @@ impl SqlEditorWidget {
         )
     }
 
+    #[cfg(test)]
     fn expanded_statement_window_and_text_binds_from_snapshot(
         text_snapshot: &ChunkedText,
         cursor_pos: usize,
         preferred_db_type: Option<crate::db::connection::DatabaseType>,
     ) -> (ExpandedStatementWindow, Vec<String>, Vec<ParsedDeclarationSymbol>) {
-        let mut bounded = Self::bounded_intellisense_parse_text_from_chunked_with_window(
+        let bounded = Self::bounded_intellisense_parse_text_from_chunked_with_window(
             text_snapshot,
             cursor_pos,
             Self::FAST_INTELLISENSE_PARSE_LOOKBEHIND_BYTES,
             Self::FAST_INTELLISENSE_PARSE_LOOKAHEAD_BYTES,
         );
+        Self::expanded_statement_window_and_text_binds_from_bounded(
+            text_snapshot,
+            cursor_pos,
+            preferred_db_type,
+            bounded,
+        )
+    }
+
+    fn expanded_statement_window_and_text_binds_from_bounded(
+        text_snapshot: &ChunkedText,
+        cursor_pos: usize,
+        preferred_db_type: Option<crate::db::connection::DatabaseType>,
+        mut bounded: BoundedIntellisenseParseText,
+    ) -> (ExpandedStatementWindow, Vec<String>, Vec<ParsedDeclarationSymbol>) {
         debug_assert!(
             bounded.text.len() <= Self::FAST_INTELLISENSE_PARSE_WINDOW_BYTES.saturating_add(3),
             "fast IntelliSense window exceeded its cap: len={}, start={}, cursor={}, document_len={}",

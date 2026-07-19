@@ -1,7 +1,8 @@
 use super::*;
 use crate::db::{FormatItem, QueryExecutor, ScriptItem};
 use crate::ui::syntax_highlight::{
-    encode_fltk_style_bytes, STYLE_COMMENT, STYLE_DEFAULT, STYLE_KEYWORD, STYLE_STRING,
+    encode_fltk_style_bytes, encode_repeated_fltk_style_bytes, STYLE_COMMENT, STYLE_DEFAULT,
+    STYLE_KEYWORD, STYLE_STRING,
 };
 
 use std::fs;
@@ -103,45 +104,24 @@ fn apply_incremental_highlight_for_test(
 
     let inserted_end = pos.saturating_add(inserted_len).min(updated_text.len());
     let inserted_text = updated_text.get(pos.min(updated_text.len())..inserted_end)?;
-    if !shadow.apply_edit(pos, inserted_text, deleted_len) {
-        return None;
-    }
+    let applied_edit = shadow.apply_edit(pos, inserted_text, deleted_len)?;
 
-    let text_len = shadow.len();
-    let start = incremental_rehighlight_start_for_text(updated_text, pos).min(text_len);
-    let must_cover_end =
-        incremental_direct_rehighlight_end_for_text(updated_text, pos, inserted_len, deleted_len);
-    let mut current_line_idx = shadow.line_index_for_position(start);
-    let mut entry_state = shadow.entry_state_for_line(current_line_idx);
-
-    while current_line_idx < shadow.line_count() {
-        let current_start = shadow.line_start_for_index(current_line_idx);
-        let current_end = shadow.inclusive_line_end_for_index(current_line_idx);
-        let range_text = shadow.text_range_string(current_start, current_end)?;
-        let previous_styles = shadow.style_range_string(current_start, current_end)?;
-        let old_exit_state = shadow.line_exit_state(current_line_idx);
-        let (new_styles, new_exit_state) =
-            highlighter.generate_styles_for_window(&range_text, entry_state);
-        if new_styles.len() != range_text.len() {
-            return None;
-        }
-
-        let styles_changed = new_styles.as_bytes() != previous_styles.as_bytes();
-        if styles_changed {
-            shadow.replace_style_range(current_start, current_end, new_styles.as_bytes());
-        }
-        shadow.set_line_exit_state(current_line_idx, new_exit_state);
-
-        if current_end >= must_cover_end
-            && !styles_changed
-            && old_exit_state == Some(new_exit_state)
-        {
-            break;
-        }
-
-        current_line_idx = current_line_idx.saturating_add(1);
-        entry_state = new_exit_state;
-    }
+    let deleted_end = pos.saturating_add(deleted_len).min(original_text.len());
+    let deleted_text = original_text.get(pos.min(original_text.len())..deleted_end)?;
+    apply_incremental_highlighting_to_shadow(
+        &mut shadow,
+        &highlighter,
+        IncrementalHighlightEdit {
+            position: pos,
+            inserted_len,
+            deleted_len,
+            inserted_text,
+            deleted_text,
+            defer_semantic_alias_context: false,
+        },
+        &applied_edit,
+        |_text, _styles, _start, _end| true,
+    )?;
 
     shadow.all_styles_string()
 }
@@ -158,47 +138,8 @@ fn line_start_for_text(text: &str, pos: usize) -> usize {
         .unwrap_or(0)
 }
 
-fn inclusive_line_end_for_text(text: &str, pos: usize) -> usize {
-    let clamped = pos.min(text.len());
-    let mut boundary = clamped;
-    while boundary > 0 && !text.is_char_boundary(boundary) {
-        boundary -= 1;
-    }
-    let bytes = text.as_bytes();
-    let mut idx = boundary;
-    while idx < bytes.len() {
-        match bytes.get(idx).copied() {
-            Some(b'\n') => return idx.saturating_add(1),
-            Some(b'\r') => {
-                if bytes.get(idx.saturating_add(1)) == Some(&b'\n') {
-                    return idx.saturating_add(2);
-                }
-                return idx.saturating_add(1);
-            }
-            Some(_) => idx += 1,
-            None => break,
-        }
-    }
-    text.len()
-}
-
 fn incremental_rehighlight_start_for_text(text: &str, pos: usize) -> usize {
     line_start_for_text(text, pos)
-}
-
-fn incremental_direct_rehighlight_end_for_text(
-    text: &str,
-    pos: usize,
-    inserted_len: usize,
-    deleted_len: usize,
-) -> usize {
-    if text.is_empty() {
-        return 0;
-    }
-    let changed_end = pos
-        .saturating_add(inserted_len.max(deleted_len))
-        .min(text.len());
-    inclusive_line_end_for_text(text, changed_end)
 }
 
 #[test]

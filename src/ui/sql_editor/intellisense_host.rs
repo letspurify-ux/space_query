@@ -272,25 +272,26 @@ impl SqlEditorWidget {
             let edit = BufferEdit {
                 start: pos.max(0) as usize,
                 deleted_len: del.max(0) as usize,
-                inserted_text: inserted_text(buf, pos, ins),
-                // record_edit reads the authoritative deleted bytes from its
-                // persistent pre-edit snapshot.
-                deleted_text: String::new(),
+                inserted_text: Arc::new(inserted_text(buf, pos, ins)),
             };
 
             let is_applying_navigation = *applying_history_navigation
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
-            if !is_applying_navigation {
+            let updated_text_snapshot = if is_applying_navigation {
+                None
+            } else {
                 let mut state = undo_state
                     .lock()
                     .unwrap_or_else(|poisoned| poisoned.into_inner());
-                if !state.applying_history {
+                if state.applying_history {
+                    state.pending_history_text_snapshots.pop_front()
+                } else {
                     let edit_group =
-                        classify_edit_group(ins, del, &edit.inserted_text, deleted_text);
-                    state.record_edit(&edit, edit_group);
+                        classify_edit_group(ins, del, edit.inserted_text.as_str(), deleted_text);
+                    Some(state.record_edit(&edit, edit_group))
                 }
-            }
+            };
 
             intellisense_runtime.apply_buffer_edit(
                 pos.max(0) as usize,
@@ -302,8 +303,9 @@ impl SqlEditorWidget {
                 pos,
                 ins,
                 del,
-                &edit.inserted_text,
+                edit.inserted_text.as_str(),
                 deleted_text,
+                updated_text_snapshot.as_ref(),
             );
         });
     }

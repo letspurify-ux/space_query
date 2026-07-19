@@ -16762,6 +16762,42 @@ fn million_line_production_completion_index_uses_the_bounded_fast_path() {
 }
 
 #[test]
+fn cursor_analysis_snapshot_shares_one_bounded_text_allocation() {
+    let mut sql = "SELECT 1;\n".repeat(2_000);
+    sql.push_str("SELECT emp.ena FROM emp");
+    let cursor = sql.find("ena FROM").expect("completion prefix") + "ena".len();
+    let snapshot = ChunkedText::from_str(&sql);
+    let analysis = cursor_analysis_from_snapshot_for_test(&snapshot, cursor);
+    let signature_scan_text = analysis.shared_fast_slice(
+        cursor.saturating_sub(4_000).saturating_sub(analysis.fast_start),
+        cursor.saturating_sub(analysis.fast_start),
+    );
+    let text_after_cursor = analysis.shared_fast_slice(
+        cursor.saturating_sub(analysis.fast_start),
+        cursor
+            .saturating_add(2_048)
+            .saturating_sub(analysis.fast_start),
+    );
+
+    assert!(analysis.fast_start > 0);
+    assert!(
+        analysis.fast_text.len() <= SqlEditorWidget::FAST_INTELLISENSE_PARSE_WINDOW_BYTES
+    );
+    assert!(Arc::ptr_eq(
+        &analysis.fast_text,
+        &signature_scan_text.storage,
+    ));
+    assert!(Arc::ptr_eq(
+        &analysis.fast_text,
+        &text_after_cursor.storage,
+    ));
+    assert!(
+        analysis.text_snapshot.shares_storage_with(&snapshot),
+        "cursor analysis must O(1)-clone the persistent document snapshot"
+    );
+}
+
+#[test]
 fn million_line_unterminated_statement_never_promotes_to_the_full_document() {
     use std::time::{Duration, Instant};
 
@@ -47921,10 +47957,10 @@ fn intellisense_analysis_from_snapshot_for_test(
     cursor: usize,
     db_type: crate::db::DatabaseType,
 ) -> (ExpandedStatementWindow, IntellisenseAnalysis) {
-    let (expanded, text_bind_names, package_spec_symbols) =
-        SqlEditorWidget::expanded_statement_window_and_text_binds_from_snapshot(
-            snapshot,
-            cursor,
+    let cursor_analysis = cursor_analysis_from_snapshot_for_test(snapshot, cursor);
+    let (expanded, text_bind_names, package_spec_symbols, _) =
+        SqlEditorWidget::expanded_statement_window_and_text_binds_from_cursor_analysis(
+            cursor_analysis.as_ref(),
             Some(db_type),
         );
     let mysql_compatible = db_type.is_mysql_or_mariadb();
@@ -47954,6 +47990,34 @@ fn intellisense_analysis_from_snapshot_for_test(
         expanded.cursor_in_statement,
     );
     (expanded, analysis)
+}
+
+fn cursor_analysis_from_snapshot_for_test(
+    snapshot: &ChunkedText,
+    cursor: usize,
+) -> Arc<CursorAnalysisSnapshot> {
+    let cursor = snapshot.clamp_boundary(cursor.min(snapshot.len()));
+    let fast_start = snapshot.clamp_boundary(
+        cursor.saturating_sub(SqlEditorWidget::FAST_INTELLISENSE_PARSE_LOOKBEHIND_BYTES),
+    );
+    let fast_end = snapshot.clamp_boundary(
+        cursor
+            .saturating_add(SqlEditorWidget::FAST_INTELLISENSE_PARSE_LOOKAHEAD_BYTES)
+            .min(snapshot.len()),
+    );
+    Arc::new(CursorAnalysisSnapshot {
+        text_snapshot: snapshot.clone(),
+        shared_sql_context: None,
+        fast_text: Arc::new(
+            snapshot
+                .range_string(fast_start, fast_end)
+                .unwrap_or_default(),
+        ),
+        fast_start,
+        cursor_pos: cursor,
+        fast_initial_lex_mode: crate::sql_parser_engine::LexMode::Idle,
+        cursor_in_string_or_comment: false,
+    })
 }
 
 fn signature_scan_text_before_cursor_from_snapshot_for_test(
@@ -48123,6 +48187,18 @@ fn query_completion_suggestions_from_prepared_snapshot_with_data(
         }
         snapshot.range_string(cursor, end).unwrap_or_default()
     };
+    let cursor_analysis = cursor_analysis_from_snapshot_for_test(snapshot, cursor);
+    let fast_start = cursor_analysis.fast_start;
+    let signature_scan_text = cursor_analysis.shared_fast_slice(
+        signature_scan_start.saturating_sub(fast_start),
+        cursor.saturating_sub(fast_start),
+    );
+    let text_after_cursor = cursor_analysis.shared_fast_slice(
+        cursor.saturating_sub(fast_start),
+        cursor
+            .saturating_add(text_after_cursor.len())
+            .saturating_sub(fast_start),
+    );
     let snapshot = IntellisenseTriggerSnapshot {
         request_generation: 0,
         buffer_revision: 0,
@@ -48133,6 +48209,7 @@ fn query_completion_suggestions_from_prepared_snapshot_with_data(
         word_start,
         qualifier,
         raw_qualifier,
+        cursor_analysis,
         signature_scan_text,
         signature_scan_initial_lex_mode,
         text_after_cursor,

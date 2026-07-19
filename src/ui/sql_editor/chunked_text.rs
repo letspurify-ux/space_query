@@ -3,6 +3,441 @@ use std::sync::Arc;
 const TEXT_CHUNK_TARGET_BYTES: usize = 32 * 1024;
 const VALUE_CHUNK_TARGET_LEN: usize = 4 * 1024;
 
+trait SequenceLeaf: Clone {
+    fn len(&self) -> usize;
+    fn secondary_len(&self) -> usize;
+    fn secondary_count_before(&self, position: usize) -> usize;
+    fn secondary_position(&self, ordinal: usize) -> Option<usize>;
+    fn split_at(&self, position: usize) -> (Option<Self>, Option<Self>);
+    fn rechunk_pair(left: &Self, right: &Self) -> Vec<Self>;
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum SequenceNode<L> {
+    Leaf(L),
+    Branch {
+        left: Arc<SequenceNode<L>>,
+        right: Arc<SequenceNode<L>>,
+        len: usize,
+        secondary_len: usize,
+        leaf_count: usize,
+        height: usize,
+    },
+}
+
+impl<L: SequenceLeaf> SequenceNode<L> {
+    fn len(&self) -> usize {
+        match self {
+            Self::Leaf(leaf) => leaf.len(),
+            Self::Branch { len, .. } => *len,
+        }
+    }
+
+    fn secondary_len(&self) -> usize {
+        match self {
+            Self::Leaf(leaf) => leaf.secondary_len(),
+            Self::Branch { secondary_len, .. } => *secondary_len,
+        }
+    }
+
+    fn leaf_count(&self) -> usize {
+        match self {
+            Self::Leaf(_) => 1,
+            Self::Branch { leaf_count, .. } => *leaf_count,
+        }
+    }
+
+    fn height(&self) -> usize {
+        match self {
+            Self::Leaf(_) => 1,
+            Self::Branch { height, .. } => *height,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct PersistentSequence<L> {
+    root: Option<Arc<SequenceNode<L>>>,
+}
+
+impl<L> Default for PersistentSequence<L> {
+    fn default() -> Self {
+        Self { root: None }
+    }
+}
+
+impl<L: SequenceLeaf> PersistentSequence<L> {
+    fn from_leaves(leaves: Vec<L>) -> Self {
+        Self {
+            root: build_balanced_nodes(&leaves),
+        }
+    }
+
+    fn len(&self) -> usize {
+        self.root.as_deref().map_or(0, SequenceNode::len)
+    }
+
+    fn secondary_len(&self) -> usize {
+        self.root.as_deref().map_or(0, SequenceNode::secondary_len)
+    }
+
+    #[cfg(test)]
+    fn leaf_count(&self) -> usize {
+        self.root.as_deref().map_or(0, SequenceNode::leaf_count)
+    }
+
+    #[cfg(test)]
+    fn height(&self) -> usize {
+        self.root.as_deref().map_or(0, SequenceNode::height)
+    }
+
+    fn locate(&self, position: usize) -> Option<(&L, usize)> {
+        if position >= self.len() {
+            return None;
+        }
+        locate_node(self.root.as_deref()?, position)
+    }
+
+    fn replace_range(&mut self, start: usize, end: usize, replacement: Self) {
+        let start = start.min(self.len());
+        let end = end.min(self.len()).max(start);
+        let (left, tail) = split_node(self.root.take(), start);
+        let (_, right) = split_node(tail, end.saturating_sub(start));
+        self.root = concat_normalized(concat_normalized(left, replacement.root), right);
+    }
+
+    fn visit_range(&self, start: usize, end: usize, mut visit: impl FnMut(&L, usize, usize)) {
+        let start = start.min(self.len());
+        let end = end.min(self.len()).max(start);
+        if let Some(root) = self.root.as_deref() {
+            visit_node_range(root, 0, start, end, &mut visit);
+        }
+    }
+
+    fn for_each_leaf(&self, mut visit: impl FnMut(&L)) {
+        if let Some(root) = self.root.as_deref() {
+            visit_each_leaf(root, &mut visit);
+        }
+    }
+
+    fn secondary_count_before(&self, position: usize) -> usize {
+        self.root.as_deref().map_or(0, |root| {
+            secondary_count_before_node(root, position.min(root.len()))
+        })
+    }
+
+    fn nth_secondary(&self, ordinal: usize) -> Option<usize> {
+        let root = self.root.as_deref()?;
+        if ordinal >= root.secondary_len() {
+            return None;
+        }
+        nth_secondary_in_node(root, ordinal, 0)
+    }
+
+    #[cfg(test)]
+    fn shares_root_with(&self, other: &Self) -> bool {
+        match (&self.root, &other.root) {
+            (Some(left), Some(right)) => Arc::ptr_eq(left, right),
+            (None, None) => true,
+            _ => false,
+        }
+    }
+}
+
+fn build_balanced_nodes<L: SequenceLeaf>(leaves: &[L]) -> Option<Arc<SequenceNode<L>>> {
+    match leaves.len() {
+        0 => None,
+        1 => Some(Arc::new(SequenceNode::Leaf(leaves[0].clone()))),
+        _ => {
+            let middle = crate::utils::arithmetic::safe_div(leaves.len(), 2);
+            let left = build_balanced_nodes(&leaves[..middle])?;
+            let right = build_balanced_nodes(&leaves[middle..])?;
+            Some(make_branch(left, right))
+        }
+    }
+}
+
+fn make_branch<L: SequenceLeaf>(
+    left: Arc<SequenceNode<L>>,
+    right: Arc<SequenceNode<L>>,
+) -> Arc<SequenceNode<L>> {
+    Arc::new(SequenceNode::Branch {
+        len: left.len().saturating_add(right.len()),
+        secondary_len: left.secondary_len().saturating_add(right.secondary_len()),
+        leaf_count: left.leaf_count().saturating_add(right.leaf_count()),
+        height: left.height().max(right.height()).saturating_add(1),
+        left,
+        right,
+    })
+}
+
+fn balance_nodes<L: SequenceLeaf>(
+    left: Arc<SequenceNode<L>>,
+    right: Arc<SequenceNode<L>>,
+) -> Arc<SequenceNode<L>> {
+    if left.height() > right.height().saturating_add(1) {
+        let SequenceNode::Branch {
+            left: left_left,
+            right: left_right,
+            ..
+        } = left.as_ref()
+        else {
+            return make_branch(left, right);
+        };
+        if left_left.height() >= left_right.height() {
+            return make_branch(left_left.clone(), make_branch(left_right.clone(), right));
+        }
+        let SequenceNode::Branch {
+            left: middle_left,
+            right: middle_right,
+            ..
+        } = left_right.as_ref()
+        else {
+            return make_branch(left, right);
+        };
+        return make_branch(
+            make_branch(left_left.clone(), middle_left.clone()),
+            make_branch(middle_right.clone(), right),
+        );
+    }
+
+    if right.height() > left.height().saturating_add(1) {
+        let SequenceNode::Branch {
+            left: right_left,
+            right: right_right,
+            ..
+        } = right.as_ref()
+        else {
+            return make_branch(left, right);
+        };
+        if right_right.height() >= right_left.height() {
+            return make_branch(make_branch(left, right_left.clone()), right_right.clone());
+        }
+        let SequenceNode::Branch {
+            left: middle_left,
+            right: middle_right,
+            ..
+        } = right_left.as_ref()
+        else {
+            return make_branch(left, right);
+        };
+        return make_branch(
+            make_branch(left, middle_left.clone()),
+            make_branch(middle_right.clone(), right_right.clone()),
+        );
+    }
+
+    make_branch(left, right)
+}
+
+fn concat_raw<L: SequenceLeaf>(
+    left: Option<Arc<SequenceNode<L>>>,
+    right: Option<Arc<SequenceNode<L>>>,
+) -> Option<Arc<SequenceNode<L>>> {
+    let (left, right) = match (left, right) {
+        (None, right) => return right,
+        (left, None) => return left,
+        (Some(left), Some(right)) => (left, right),
+    };
+
+    if left.height() > right.height().saturating_add(1) {
+        let SequenceNode::Branch {
+            left: left_left,
+            right: left_right,
+            ..
+        } = left.as_ref()
+        else {
+            return Some(make_branch(left, right));
+        };
+        let joined_right = concat_raw(Some(left_right.clone()), Some(right))?;
+        return Some(balance_nodes(left_left.clone(), joined_right));
+    }
+
+    if right.height() > left.height().saturating_add(1) {
+        let SequenceNode::Branch {
+            left: right_left,
+            right: right_right,
+            ..
+        } = right.as_ref()
+        else {
+            return Some(make_branch(left, right));
+        };
+        let joined_left = concat_raw(Some(left), Some(right_left.clone()))?;
+        return Some(balance_nodes(joined_left, right_right.clone()));
+    }
+
+    Some(make_branch(left, right))
+}
+
+fn concat_normalized<L: SequenceLeaf>(
+    left: Option<Arc<SequenceNode<L>>>,
+    right: Option<Arc<SequenceNode<L>>>,
+) -> Option<Arc<SequenceNode<L>>> {
+    let (left, right) = match (left, right) {
+        (None, right) => return right,
+        (left, None) => return left,
+        (Some(left), Some(right)) => (left, right),
+    };
+    let (left_rest, left_leaf) = pop_last(left);
+    let (right_rest, right_leaf) = pop_first(right);
+    let middle = build_balanced_nodes(&L::rechunk_pair(&left_leaf, &right_leaf));
+    concat_raw(concat_raw(left_rest, middle), right_rest)
+}
+
+fn split_node<L: SequenceLeaf>(
+    node: Option<Arc<SequenceNode<L>>>,
+    position: usize,
+) -> (Option<Arc<SequenceNode<L>>>, Option<Arc<SequenceNode<L>>>) {
+    let Some(node) = node else {
+        return (None, None);
+    };
+    if position == 0 {
+        return (None, Some(node));
+    }
+    if position >= node.len() {
+        return (Some(node), None);
+    }
+
+    match node.as_ref() {
+        SequenceNode::Leaf(leaf) => {
+            let (left, right) = leaf.split_at(position);
+            (
+                left.map(|leaf| Arc::new(SequenceNode::Leaf(leaf))),
+                right.map(|leaf| Arc::new(SequenceNode::Leaf(leaf))),
+            )
+        }
+        SequenceNode::Branch { left, right, .. } => {
+            let left_len = left.len();
+            if position == left_len {
+                return (Some(left.clone()), Some(right.clone()));
+            }
+            if position < left_len {
+                let (before, after) = split_node(Some(left.clone()), position);
+                (before, concat_raw(after, Some(right.clone())))
+            } else {
+                let (before, after) =
+                    split_node(Some(right.clone()), position.saturating_sub(left_len));
+                (concat_raw(Some(left.clone()), before), after)
+            }
+        }
+    }
+}
+
+fn pop_first<L: SequenceLeaf>(node: Arc<SequenceNode<L>>) -> (Option<Arc<SequenceNode<L>>>, L) {
+    match node.as_ref() {
+        SequenceNode::Leaf(leaf) => (None, leaf.clone()),
+        SequenceNode::Branch { left, right, .. } => {
+            let (left_rest, first) = pop_first(left.clone());
+            (concat_raw(left_rest, Some(right.clone())), first)
+        }
+    }
+}
+
+fn pop_last<L: SequenceLeaf>(node: Arc<SequenceNode<L>>) -> (Option<Arc<SequenceNode<L>>>, L) {
+    match node.as_ref() {
+        SequenceNode::Leaf(leaf) => (None, leaf.clone()),
+        SequenceNode::Branch { left, right, .. } => {
+            let (right_rest, last) = pop_last(right.clone());
+            (concat_raw(Some(left.clone()), right_rest), last)
+        }
+    }
+}
+
+fn locate_node<L: SequenceLeaf>(node: &SequenceNode<L>, position: usize) -> Option<(&L, usize)> {
+    match node {
+        SequenceNode::Leaf(leaf) => Some((leaf, position.min(leaf.len()))),
+        SequenceNode::Branch { left, right, .. } => {
+            if position < left.len() {
+                locate_node(left, position)
+            } else {
+                locate_node(right, position.saturating_sub(left.len()))
+            }
+        }
+    }
+}
+
+fn visit_node_range<L: SequenceLeaf>(
+    node: &SequenceNode<L>,
+    node_start: usize,
+    start: usize,
+    end: usize,
+    visit: &mut impl FnMut(&L, usize, usize),
+) {
+    let node_end = node_start.saturating_add(node.len());
+    if start >= node_end || end <= node_start {
+        return;
+    }
+    match node {
+        SequenceNode::Leaf(leaf) => {
+            let local_start = start.saturating_sub(node_start).min(leaf.len());
+            let local_end = end.saturating_sub(node_start).min(leaf.len());
+            if local_start < local_end {
+                visit(leaf, local_start, local_end);
+            }
+        }
+        SequenceNode::Branch { left, right, .. } => {
+            visit_node_range(left, node_start, start, end, visit);
+            visit_node_range(
+                right,
+                node_start.saturating_add(left.len()),
+                start,
+                end,
+                visit,
+            );
+        }
+    }
+}
+
+fn visit_each_leaf<L: SequenceLeaf>(node: &SequenceNode<L>, visit: &mut impl FnMut(&L)) {
+    match node {
+        SequenceNode::Leaf(leaf) => visit(leaf),
+        SequenceNode::Branch { left, right, .. } => {
+            visit_each_leaf(left, visit);
+            visit_each_leaf(right, visit);
+        }
+    }
+}
+
+fn secondary_count_before_node<L: SequenceLeaf>(node: &SequenceNode<L>, position: usize) -> usize {
+    match node {
+        SequenceNode::Leaf(leaf) => leaf.secondary_count_before(position.min(leaf.len())),
+        SequenceNode::Branch { left, right, .. } => {
+            if position <= left.len() {
+                secondary_count_before_node(left, position)
+            } else {
+                left.secondary_len()
+                    .saturating_add(secondary_count_before_node(
+                        right,
+                        position.saturating_sub(left.len()),
+                    ))
+            }
+        }
+    }
+}
+
+fn nth_secondary_in_node<L: SequenceLeaf>(
+    node: &SequenceNode<L>,
+    ordinal: usize,
+    node_start: usize,
+) -> Option<usize> {
+    match node {
+        SequenceNode::Leaf(leaf) => leaf
+            .secondary_position(ordinal)
+            .map(|position| node_start.saturating_add(position)),
+        SequenceNode::Branch { left, right, .. } => {
+            if ordinal < left.secondary_len() {
+                nth_secondary_in_node(left, ordinal, node_start)
+            } else {
+                nth_secondary_in_node(
+                    right,
+                    ordinal.saturating_sub(left.secondary_len()),
+                    node_start.saturating_add(left.len()),
+                )
+            }
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct TextChunk {
     text: Arc<str>,
@@ -17,24 +452,57 @@ impl TextChunk {
             line_breaks,
         }
     }
+}
 
+impl SequenceLeaf for TextChunk {
     fn len(&self) -> usize {
         self.text.len()
     }
+
+    fn secondary_len(&self) -> usize {
+        self.line_breaks.len()
+    }
+
+    fn secondary_count_before(&self, position: usize) -> usize {
+        self.line_breaks
+            .partition_point(|line_break| *line_break < position)
+    }
+
+    fn secondary_position(&self, ordinal: usize) -> Option<usize> {
+        self.line_breaks.get(ordinal).copied()
+    }
+
+    fn split_at(&self, position: usize) -> (Option<Self>, Option<Self>) {
+        let position = position.min(self.len());
+        let left = self
+            .text
+            .get(..position)
+            .filter(|text| !text.is_empty())
+            .map(|text| Self::new(text.to_string()));
+        let right = self
+            .text
+            .get(position..)
+            .filter(|text| !text.is_empty())
+            .map(|text| Self::new(text.to_string()));
+        (left, right)
+    }
+
+    fn rechunk_pair(left: &Self, right: &Self) -> Vec<Self> {
+        let mut combined = String::with_capacity(left.len().saturating_add(right.len()));
+        combined.push_str(&left.text);
+        combined.push_str(&right.text);
+        split_text_chunks(&combined)
+    }
 }
 
-/// Persistent chunked UTF-8 text used by editor-side mirrors and undo snapshots.
+/// Persistent UTF-8 rope used by editor-side mirrors and undo snapshots.
 ///
-/// Clones share every chunk. An edit copies only the chunks touching the edited
-/// range and shifts a small vector of chunk descriptors, so the cost is bounded
-/// by the edited text and the number of chunks rather than the document tail.
+/// Every internal node caches byte and line-break counts. Clones share the
+/// complete root; an edit copies only the balanced-tree paths and at most two
+/// boundary chunks, so document-size metadata is never rebuilt linearly.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct ChunkedText {
-    chunks: Arc<Vec<TextChunk>>,
-    chunk_ends: Arc<Vec<usize>>,
-    line_break_ends: Arc<Vec<usize>>,
-    len: usize,
-    line_break_count: usize,
+    tree: PersistentSequence<TextChunk>,
 }
 
 impl ChunkedText {
@@ -43,42 +511,47 @@ impl ChunkedText {
     }
 
     pub(crate) fn from_str(text: &str) -> Self {
-        let chunks = split_text_chunks(text);
-        let line_break_count = chunks.iter().map(|chunk| chunk.line_breaks.len()).sum();
-        let (chunk_ends, line_break_ends) = chunk_indexes(&chunks);
         Self {
-            chunks: Arc::new(chunks),
-            chunk_ends: Arc::new(chunk_ends),
-            line_break_ends: Arc::new(line_break_ends),
-            len: text.len(),
-            line_break_count,
+            tree: PersistentSequence::from_leaves(split_text_chunks(text)),
         }
     }
 
     pub(crate) fn len(&self) -> usize {
-        self.len
+        self.tree.len()
     }
 
     pub(crate) fn is_empty(&self) -> bool {
-        self.len == 0
+        self.len() == 0
     }
 
     #[cfg(test)]
     pub(crate) fn chunk_count(&self) -> usize {
-        self.chunks.len()
+        self.tree.leaf_count()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn tree_height(&self) -> usize {
+        self.tree.height()
     }
 
     #[cfg(test)]
     pub(crate) fn shared_chunk_count(&self, other: &Self) -> usize {
-        self.chunks
+        let mut left_chunks = Vec::new();
+        let mut right_chunks = Vec::new();
+        self.tree
+            .for_each_leaf(|chunk| left_chunks.push(chunk.text.clone()));
+        other
+            .tree
+            .for_each_leaf(|chunk| right_chunks.push(chunk.text.clone()));
+        left_chunks
             .iter()
-            .filter(|left| {
-                other
-                    .chunks
-                    .iter()
-                    .any(|right| Arc::ptr_eq(&left.text, &right.text))
-            })
+            .filter(|left| right_chunks.iter().any(|right| Arc::ptr_eq(left, right)))
             .count()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn shares_storage_with(&self, other: &Self) -> bool {
+        self.tree.shares_root_with(&other.tree)
     }
 
     #[cfg(test)]
@@ -88,127 +561,78 @@ impl ChunkedText {
             .is_some_and(|head| head == prefix)
     }
 
+    #[cfg(test)]
     pub(crate) fn to_flat_string(&self) -> String {
-        let mut text = String::with_capacity(self.len);
-        for chunk in self.chunks.iter() {
-            text.push_str(&chunk.text);
-        }
-        text
+        self.range_string(0, self.len()).unwrap_or_default()
     }
 
-    pub(crate) fn byte_at(&self, pos: usize) -> Option<u8> {
-        if pos >= self.len {
-            return None;
+    pub(crate) fn matches_str(&self, other: &str) -> bool {
+        if self.len() != other.len() {
+            return false;
         }
-        let (idx, offset) = self.locate(pos);
-        self.chunks
-            .get(idx)
-            .and_then(|chunk| chunk.text.as_bytes().get(offset))
-            .copied()
+        let mut offset = 0usize;
+        let mut matches = true;
+        self.tree.for_each_leaf(|chunk| {
+            if matches {
+                let end = offset.saturating_add(chunk.len());
+                matches = other.get(offset..end) == Some(chunk.text.as_ref());
+                offset = end;
+            }
+        });
+        matches && offset == other.len()
     }
 
-    pub(crate) fn is_char_boundary(&self, pos: usize) -> bool {
-        if pos == 0 || pos == self.len {
+    pub(crate) fn byte_at(&self, position: usize) -> Option<u8> {
+        let (chunk, offset) = self.tree.locate(position)?;
+        chunk.text.as_bytes().get(offset).copied()
+    }
+
+    pub(crate) fn is_char_boundary(&self, position: usize) -> bool {
+        if position == 0 || position == self.len() {
             return true;
         }
-        self.byte_at(pos)
+        self.byte_at(position)
             .is_some_and(|byte| byte & 0b1100_0000 != 0b1000_0000)
     }
 
-    pub(crate) fn clamp_boundary(&self, pos: usize) -> usize {
-        let mut pos = pos.min(self.len);
-        while pos > 0 && !self.is_char_boundary(pos) {
-            pos -= 1;
+    pub(crate) fn clamp_boundary(&self, position: usize) -> usize {
+        let mut position = position.min(self.len());
+        while position > 0 && !self.is_char_boundary(position) {
+            position -= 1;
         }
-        pos
+        position
     }
 
     pub(crate) fn range_string(&self, start: usize, end: usize) -> Option<String> {
-        let start = self.clamp_boundary(start.min(self.len));
-        let end = self.clamp_boundary(end.min(self.len));
+        let start = self.clamp_boundary(start.min(self.len()));
+        let end = self.clamp_boundary(end.min(self.len()));
         if end < start {
             return Some(String::new());
         }
         let mut result = String::with_capacity(end.saturating_sub(start));
-        let (start_idx, _) = self.locate(start);
-        let mut chunk_start = start_idx
-            .checked_sub(1)
-            .and_then(|idx| self.chunk_ends.get(idx))
-            .copied()
-            .unwrap_or(0);
-        for chunk in self.chunks.iter().skip(start_idx) {
-            let chunk_end = chunk_start.saturating_add(chunk.len());
-            if chunk_start >= end {
-                break;
-            }
-            let local_start = start.saturating_sub(chunk_start).min(chunk.len());
-            let local_end = end.saturating_sub(chunk_start).min(chunk.len());
-            result.push_str(chunk.text.get(local_start..local_end)?);
-            chunk_start = chunk_end;
-        }
-        Some(result)
+        let mut valid = true;
+        self.tree
+            .visit_range(start, end, |chunk, local_start, local_end| {
+                if let Some(text) = chunk.text.get(local_start..local_end) {
+                    result.push_str(text);
+                } else {
+                    valid = false;
+                }
+            });
+        (valid && result.len() == end.saturating_sub(start)).then_some(result)
     }
 
     pub(crate) fn replace_range(&mut self, start: usize, end: usize, inserted: &str) -> bool {
-        let start = self.clamp_boundary(start.min(self.len));
-        let end = self.clamp_boundary(end.min(self.len));
+        let start = self.clamp_boundary(start.min(self.len()));
+        let end = self.clamp_boundary(end.min(self.len()));
         if end < start {
             return false;
         }
-
-        let (mut start_idx, mut start_offset) = self.locate(start);
-        let (end_idx, end_offset) = self.locate(end);
-        // Include the left neighbor when an edit starts exactly on a chunk
-        // boundary. Besides keeping chunks balanced, this prevents an inserted
-        // `\n` from forming a CRLF pair with an untouched trailing `\r` whose
-        // two bytes would otherwise live in separate metadata domains.
-        if start_offset == 0 && start_idx > 0 {
-            start_idx = start_idx.saturating_sub(1);
-            start_offset = self.chunks.get(start_idx).map_or(0, TextChunk::len);
-        }
-        let mut replacement = String::new();
-        if let Some(chunk) = self.chunks.get(start_idx) {
-            let Some(prefix) = chunk.text.get(..start_offset) else {
-                return false;
-            };
-            replacement.push_str(prefix);
-        }
-        replacement.push_str(inserted);
-        if let Some(chunk) = self.chunks.get(end_idx) {
-            let Some(suffix) = chunk.text.get(end_offset..) else {
-                return false;
-            };
-            replacement.push_str(suffix);
-        }
-
-        let drain_start = start_idx.min(self.chunks.len());
-        let drain_end = if end_idx < self.chunks.len() {
-            end_idx.saturating_add(1)
-        } else {
-            self.chunks.len()
-        };
-        let removed_line_breaks = self.chunks[drain_start..drain_end.max(drain_start)]
-            .iter()
-            .map(|chunk| chunk.line_breaks.len())
-            .sum::<usize>();
-        let replacement_chunks = split_text_chunks(&replacement);
-        let replacement_line_breaks = replacement_chunks
-            .iter()
-            .map(|chunk| chunk.line_breaks.len())
-            .sum::<usize>();
-        Arc::make_mut(&mut self.chunks)
-            .splice(drain_start..drain_end.max(drain_start), replacement_chunks);
-        let (chunk_ends, line_break_ends) = chunk_indexes(&self.chunks);
-        self.chunk_ends = Arc::new(chunk_ends);
-        self.line_break_ends = Arc::new(line_break_ends);
-        self.len = self
-            .len
-            .saturating_sub(end.saturating_sub(start))
-            .saturating_add(inserted.len());
-        self.line_break_count = self
-            .line_break_count
-            .saturating_sub(removed_line_breaks)
-            .saturating_add(replacement_line_breaks);
+        self.tree.replace_range(
+            start,
+            end,
+            PersistentSequence::from_leaves(split_text_chunks(inserted)),
+        );
         true
     }
 
@@ -216,33 +640,21 @@ impl ChunkedText {
         if self.is_empty() {
             0
         } else {
-            self.line_break_count.saturating_add(1)
+            self.tree.secondary_len().saturating_add(1)
         }
     }
 
-    pub(crate) fn line_index_for_position(&self, pos: usize) -> usize {
-        let pos = pos.min(self.len);
-        let (chunk_idx, relative) = self.locate(pos);
-        let preceding_breaks = chunk_idx
-            .checked_sub(1)
-            .and_then(|idx| self.line_break_ends.get(idx))
-            .copied()
-            .unwrap_or(0);
-        self.chunks
-            .get(chunk_idx)
-            .map_or(preceding_breaks, |chunk| {
-                preceding_breaks
-                    .saturating_add(chunk.line_breaks.partition_point(|value| *value < relative))
-            })
+    pub(crate) fn line_index_for_position(&self, position: usize) -> usize {
+        self.tree.secondary_count_before(position.min(self.len()))
     }
 
-    pub(crate) fn line_start(&self, pos: usize) -> usize {
-        self.line_start_for_index(self.line_index_for_position(pos))
+    pub(crate) fn line_start(&self, position: usize) -> usize {
+        self.line_start_for_index(self.line_index_for_position(position))
     }
 
-    pub(crate) fn line_end(&self, pos: usize) -> usize {
-        self.nth_line_break(self.line_index_for_position(pos))
-            .unwrap_or(self.len)
+    pub(crate) fn line_end(&self, position: usize) -> usize {
+        self.nth_line_break(self.line_index_for_position(position))
+            .unwrap_or(self.len())
     }
 
     pub(crate) fn line_start_for_index(&self, line_index: usize) -> usize {
@@ -250,44 +662,18 @@ impl ChunkedText {
             return 0;
         }
         self.nth_line_break(line_index.saturating_sub(1))
-            .map(|value| value.saturating_add(1))
-            .unwrap_or(self.len)
+            .map(|position| position.saturating_add(1))
+            .unwrap_or(self.len())
     }
 
     pub(crate) fn inclusive_line_end_for_index(&self, line_index: usize) -> usize {
         self.nth_line_break(line_index)
-            .map(|value| value.saturating_add(1).min(self.len))
-            .unwrap_or(self.len)
+            .map(|position| position.saturating_add(1).min(self.len()))
+            .unwrap_or(self.len())
     }
 
     fn nth_line_break(&self, ordinal: usize) -> Option<usize> {
-        let chunk_idx = self.line_break_ends.partition_point(|end| *end <= ordinal);
-        let preceding_breaks = chunk_idx
-            .checked_sub(1)
-            .and_then(|idx| self.line_break_ends.get(idx))
-            .copied()
-            .unwrap_or(0);
-        let chunk_start = chunk_idx
-            .checked_sub(1)
-            .and_then(|idx| self.chunk_ends.get(idx))
-            .copied()
-            .unwrap_or(0);
-        self.chunks
-            .get(chunk_idx)?
-            .line_breaks
-            .get(ordinal.saturating_sub(preceding_breaks))
-            .map(|value| chunk_start.saturating_add(*value))
-    }
-
-    fn locate(&self, pos: usize) -> (usize, usize) {
-        let pos = pos.min(self.len);
-        let chunk_idx = self.chunk_ends.partition_point(|end| *end <= pos);
-        let chunk_start = chunk_idx
-            .checked_sub(1)
-            .and_then(|idx| self.chunk_ends.get(idx))
-            .copied()
-            .unwrap_or(0);
-        (chunk_idx, pos.saturating_sub(chunk_start))
+        self.tree.nth_secondary(ordinal)
     }
 }
 
@@ -305,169 +691,142 @@ impl From<&str> for ChunkedText {
 
 impl PartialEq<&str> for ChunkedText {
     fn eq(&self, other: &&str) -> bool {
-        self.len == other.len() && self.to_flat_string() == *other
+        self.matches_str(other)
     }
 }
 
 impl PartialEq<String> for ChunkedText {
     fn eq(&self, other: &String) -> bool {
-        self.len == other.len() && self.to_flat_string() == *other
+        self.matches_str(other)
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ValueChunk<T> {
+    values: Arc<[T]>,
+}
+
+impl<T: Clone> SequenceLeaf for ValueChunk<T> {
+    fn len(&self) -> usize {
+        self.values.len()
+    }
+
+    fn secondary_len(&self) -> usize {
+        0
+    }
+
+    fn secondary_count_before(&self, _position: usize) -> usize {
+        0
+    }
+
+    fn secondary_position(&self, _ordinal: usize) -> Option<usize> {
+        None
+    }
+
+    fn split_at(&self, position: usize) -> (Option<Self>, Option<Self>) {
+        let position = position.min(self.len());
+        let left = self
+            .values
+            .get(..position)
+            .filter(|values| !values.is_empty())
+            .map(|values| Self {
+                values: Arc::from(values.to_vec()),
+            });
+        let right = self
+            .values
+            .get(position..)
+            .filter(|values| !values.is_empty())
+            .map(|values| Self {
+                values: Arc::from(values.to_vec()),
+            });
+        (left, right)
+    }
+
+    fn rechunk_pair(left: &Self, right: &Self) -> Vec<Self> {
+        let mut combined = Vec::with_capacity(left.len().saturating_add(right.len()));
+        combined.extend_from_slice(&left.values);
+        combined.extend_from_slice(&right.values);
+        value_chunks(&combined)
     }
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct ChunkedValues<T> {
-    chunks: Vec<Arc<[T]>>,
-    len: usize,
+    tree: PersistentSequence<ValueChunk<T>>,
 }
 
 impl<T: Clone> ChunkedValues<T> {
     pub(crate) fn from_vec(values: Vec<T>) -> Self {
-        let len = values.len();
-        let chunks = values
-            .chunks(VALUE_CHUNK_TARGET_LEN)
-            .map(|chunk| Arc::<[T]>::from(chunk.to_vec()))
-            .collect();
-        Self { chunks, len }
+        Self {
+            tree: PersistentSequence::from_leaves(value_chunks(&values)),
+        }
     }
 
     pub(crate) fn len(&self) -> usize {
-        self.len
+        self.tree.len()
     }
 
-    pub(crate) fn get(&self, pos: usize) -> Option<&T> {
-        let (chunk_idx, offset) = self.locate_existing(pos)?;
-        self.chunks
-            .get(chunk_idx)
-            .and_then(|chunk| chunk.get(offset))
+    pub(crate) fn get(&self, position: usize) -> Option<&T> {
+        let (chunk, offset) = self.tree.locate(position)?;
+        chunk.values.get(offset)
     }
 
     pub(crate) fn last(&self) -> Option<&T> {
-        self.chunks.last().and_then(|chunk| chunk.last())
+        self.len()
+            .checked_sub(1)
+            .and_then(|position| self.get(position))
     }
 
     pub(crate) fn range_vec(&self, start: usize, end: usize) -> Option<Vec<T>> {
-        let start = start.min(self.len);
-        let end = end.min(self.len);
+        let start = start.min(self.len());
+        let end = end.min(self.len());
         if end < start {
             return None;
         }
         let mut result = Vec::with_capacity(end.saturating_sub(start));
-        let mut chunk_start = 0usize;
-        for chunk in &self.chunks {
-            let chunk_end = chunk_start.saturating_add(chunk.len());
-            if chunk_end <= start {
-                chunk_start = chunk_end;
-                continue;
-            }
-            if chunk_start >= end {
-                break;
-            }
-            let local_start = start.saturating_sub(chunk_start).min(chunk.len());
-            let local_end = end.saturating_sub(chunk_start).min(chunk.len());
-            result.extend_from_slice(chunk.get(local_start..local_end)?);
-            chunk_start = chunk_end;
-        }
-        (result.len() == end.saturating_sub(start)).then_some(result)
-    }
-
-    pub(crate) fn set(&mut self, pos: usize, value: T) -> bool {
-        let Some((chunk_idx, offset)) = self.locate_existing(pos) else {
-            return false;
-        };
-        let mut chunk = self.chunks[chunk_idx].to_vec();
-        let Some(slot) = chunk.get_mut(offset) else {
-            return false;
-        };
-        *slot = value;
-        self.chunks[chunk_idx] = chunk.into();
-        true
+        let mut valid = true;
+        self.tree
+            .visit_range(start, end, |chunk, local_start, local_end| {
+                if let Some(values) = chunk.values.get(local_start..local_end) {
+                    result.extend_from_slice(values);
+                } else {
+                    valid = false;
+                }
+            });
+        (valid && result.len() == end.saturating_sub(start)).then_some(result)
     }
 
     pub(crate) fn replace_range(&mut self, start: usize, end: usize, replacement: Vec<T>) {
-        let start = start.min(self.len);
-        let end = end.min(self.len).max(start);
-        let replacement_len = replacement.len();
-        let (start_idx, start_offset) = self.locate_boundary(start);
-        let (end_idx, end_offset) = self.locate_boundary(end);
-        let mut merged = Vec::new();
-        if let Some(chunk) = self.chunks.get(start_idx) {
-            merged.extend_from_slice(&chunk[..start_offset]);
-        }
-        merged.extend(replacement);
-        if let Some(chunk) = self.chunks.get(end_idx) {
-            merged.extend_from_slice(&chunk[end_offset..]);
-        }
-        let drain_start = start_idx.min(self.chunks.len());
-        let drain_end = if end_idx < self.chunks.len() {
-            end_idx.saturating_add(1)
-        } else {
-            self.chunks.len()
-        };
-        let next_chunks = merged
-            .chunks(VALUE_CHUNK_TARGET_LEN)
-            .map(|chunk| Arc::<[T]>::from(chunk.to_vec()))
-            .collect::<Vec<_>>();
-        self.chunks
-            .splice(drain_start..drain_end.max(drain_start), next_chunks);
-        self.len = self
-            .len
-            .saturating_sub(end.saturating_sub(start))
-            .saturating_add(replacement_len);
-    }
-
-    pub(crate) fn resize(&mut self, new_len: usize, value: T) {
-        if new_len < self.len {
-            self.replace_range(new_len, self.len, Vec::new());
-        } else if new_len > self.len {
-            self.replace_range(self.len, self.len, vec![value; new_len - self.len]);
-        }
-    }
-
-    pub(crate) fn truncate(&mut self, len: usize) {
-        if len < self.len {
-            self.replace_range(len, self.len, Vec::new());
-        }
+        self.tree.replace_range(
+            start,
+            end,
+            PersistentSequence::from_leaves(value_chunks(&replacement)),
+        );
     }
 
     #[cfg(test)]
     pub(crate) fn to_vec(&self) -> Vec<T> {
-        self.chunks
-            .iter()
-            .flat_map(|chunk| chunk.iter().cloned())
-            .collect()
+        self.range_vec(0, self.len()).unwrap_or_default()
     }
 
-    fn locate_existing(&self, pos: usize) -> Option<(usize, usize)> {
-        if pos >= self.len {
-            return None;
-        }
-        let mut absolute = 0usize;
-        for (idx, chunk) in self.chunks.iter().enumerate() {
-            let end = absolute.saturating_add(chunk.len());
-            if pos < end {
-                return Some((idx, pos.saturating_sub(absolute)));
-            }
-            absolute = end;
-        }
-        None
+    #[cfg(test)]
+    fn tree_height(&self) -> usize {
+        self.tree.height()
     }
 
-    fn locate_boundary(&self, pos: usize) -> (usize, usize) {
-        let pos = pos.min(self.len);
-        let mut absolute = 0usize;
-        for (idx, chunk) in self.chunks.iter().enumerate() {
-            let end = absolute.saturating_add(chunk.len());
-            if pos < end {
-                return (idx, pos.saturating_sub(absolute));
-            }
-            if pos == end {
-                return (idx.saturating_add(1), 0);
-            }
-            absolute = end;
-        }
-        (self.chunks.len(), 0)
+    #[cfg(test)]
+    fn chunk_count(&self) -> usize {
+        self.tree.leaf_count()
     }
+}
+
+fn value_chunks<T: Clone>(values: &[T]) -> Vec<ValueChunk<T>> {
+    values
+        .chunks(VALUE_CHUNK_TARGET_LEN)
+        .map(|chunk| ValueChunk {
+            values: Arc::from(chunk.to_vec()),
+        })
+        .collect()
 }
 
 fn split_text_chunks(text: &str) -> Vec<TextChunk> {
@@ -502,20 +861,6 @@ fn split_text_chunks(text: &str) -> Vec<TextChunk> {
     chunks
 }
 
-fn chunk_indexes(chunks: &[TextChunk]) -> (Vec<usize>, Vec<usize>) {
-    let mut byte_end = 0usize;
-    let mut line_break_end = 0usize;
-    let mut chunk_ends = Vec::with_capacity(chunks.len());
-    let mut line_break_ends = Vec::with_capacity(chunks.len());
-    for chunk in chunks {
-        byte_end = byte_end.saturating_add(chunk.len());
-        line_break_end = line_break_end.saturating_add(chunk.line_breaks.len());
-        chunk_ends.push(byte_end);
-        line_break_ends.push(line_break_end);
-    }
-    (chunk_ends, line_break_ends)
-}
-
 fn line_break_positions(bytes: &[u8]) -> Vec<usize> {
     let mut positions = Vec::new();
     let mut idx = 0usize;
@@ -542,7 +887,7 @@ mod tests {
     fn chunked_text_edit_preserves_utf8_and_does_not_copy_document_tail() {
         let source = format!("{}끝", "가나다라\n".repeat(20_000));
         let mut text = ChunkedText::from_str(&source);
-        let chunks_before = text.chunks.clone();
+        let before = text.clone();
         let edit_at = source.find('\n').unwrap_or(0) + 1;
         assert!(text.replace_range(edit_at, edit_at, "SELECT 1;\n"));
         let flattened = text.to_flat_string();
@@ -551,29 +896,21 @@ mod tests {
             format!("{}SELECT 1;\n{}", &source[..edit_at], &source[edit_at..])
         );
         assert!(
-            chunks_before.iter().skip(2).any(|before| text
-                .chunks
-                .iter()
-                .any(|after| Arc::ptr_eq(&before.text, &after.text))),
-            "unaffected tail chunks should remain shared"
+            text.shared_chunk_count(&before) > 0,
+            "unaffected rope leaves should remain shared"
         );
     }
 
     #[test]
-    fn chunked_text_snapshot_clone_shares_text_and_lookup_indexes() {
+    fn chunked_text_snapshot_clone_shares_persistent_tree_root() {
         let text = ChunkedText::from_str(&"SELECT 1;\n".repeat(100_000));
         let mut snapshot = text.clone();
 
-        assert!(Arc::ptr_eq(&text.chunks, &snapshot.chunks));
-        assert!(Arc::ptr_eq(&text.chunk_ends, &snapshot.chunk_ends));
-        assert!(Arc::ptr_eq(
-            &text.line_break_ends,
-            &snapshot.line_break_ends
-        ));
-
+        assert!(text.shares_storage_with(&snapshot));
         let edit_at = snapshot.len() / 2;
         assert!(snapshot.replace_range(edit_at, edit_at, "-- pasted\n"));
-        assert!(!Arc::ptr_eq(&text.chunks, &snapshot.chunks));
+        assert!(!text.shares_storage_with(&snapshot));
+        assert!(snapshot.shared_chunk_count(&text) > 0);
         assert_eq!(text.len() + "-- pasted\n".len(), snapshot.len());
     }
 
@@ -596,7 +933,21 @@ mod tests {
     }
 
     #[test]
-    fn chunked_values_replaces_only_boundary_chunks() {
+    fn persistent_text_tree_height_stays_logarithmic_after_middle_edits() {
+        let source = "SELECT 1;\n".repeat(1_000_000);
+        let mut text = ChunkedText::from_str(&source);
+        for index in 0..256 {
+            let middle = text.len() / 2;
+            let inserted = if index % 2 == 0 { "x" } else { "yz" };
+            assert!(text.replace_range(middle, middle, inserted));
+        }
+        let leaves = text.chunk_count().max(1);
+        let logarithmic_limit = usize::BITS as usize - leaves.leading_zeros() as usize;
+        assert!(text.tree_height() <= logarithmic_limit.saturating_mul(2).max(2));
+    }
+
+    #[test]
+    fn chunked_values_replaces_only_boundary_paths() {
         let mut values = ChunkedValues::from_vec((0..20_000).collect::<Vec<_>>());
         values.replace_range(5_000, 5_003, vec![9, 8]);
         let flat = values.to_vec();
@@ -606,6 +957,25 @@ mod tests {
             values.range_vec(4_998, 5_004).as_deref(),
             Some(&flat[4_998..5_004])
         );
+    }
+
+    #[test]
+    fn chunked_values_tree_keeps_deep_middle_queries_and_edits_aligned() {
+        let mut values = ChunkedValues::from_vec((0..1_000_000).collect::<Vec<_>>());
+        assert_eq!(values.get(750_000), Some(&750_000));
+        assert_eq!(
+            values.range_vec(749_998, 750_003),
+            Some(vec![749_998, 749_999, 750_000, 750_001, 750_002])
+        );
+
+        values.replace_range(750_000, 750_003, vec![7, 8]);
+
+        assert_eq!(values.get(750_000), Some(&7));
+        assert_eq!(values.get(750_001), Some(&8));
+        assert_eq!(values.get(750_002), Some(&750_003));
+        let leaves = values.chunk_count().max(1);
+        let logarithmic_limit = usize::BITS as usize - leaves.leading_zeros() as usize;
+        assert!(values.tree_height() <= logarithmic_limit.saturating_mul(2).max(2));
     }
 
     #[test]

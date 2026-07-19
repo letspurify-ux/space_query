@@ -1960,6 +1960,194 @@ impl SqlEditorWidget {
         .is_empty()
     }
 
+    fn capture_cursor_context(
+        buffer: &TextBuffer,
+        text_shadow: &Arc<Mutex<HighlightShadowState>>,
+        cursor_pos: i32,
+        preferred_db_type: crate::db::connection::DatabaseType,
+    ) -> Option<CapturedCursorContext> {
+        const SIGNATURE_SCAN_WINDOW: usize = 4000;
+        const COMPLETION_SUFFIX_SCAN_WINDOW: usize = 2048;
+
+        let buffer_len = buffer.length().max(0) as usize;
+        let shadow = text_shadow
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if shadow.len() != buffer_len {
+            return None;
+        }
+
+        let text_snapshot = shadow.text_snapshot();
+        let cursor_pos = text_snapshot.clamp_boundary((cursor_pos.max(0) as usize).min(buffer_len));
+        let fast_start = text_snapshot.clamp_boundary(
+            cursor_pos.saturating_sub(Self::FAST_INTELLISENSE_PARSE_LOOKBEHIND_BYTES),
+        );
+        let fast_end = text_snapshot.clamp_boundary(
+            cursor_pos
+                .saturating_add(Self::FAST_INTELLISENSE_PARSE_LOOKAHEAD_BYTES)
+                .min(buffer_len),
+        );
+        let mysql_compatible = preferred_db_type.is_mysql_or_mariadb();
+        let fast_initial_lex_mode = shadow.parser_lex_mode_at(fast_start, mysql_compatible);
+        let fast_text = Arc::new(
+            text_snapshot
+                .range_string(fast_start, fast_end)
+                .unwrap_or_default(),
+        );
+        let cursor_in_string_or_comment = shadow.cursor_in_string_or_comment(cursor_pos);
+        let shared_sql_context = shadow.shared_sql_context_snapshot();
+        let analysis = Arc::new(CursorAnalysisSnapshot {
+            text_snapshot: text_snapshot.clone(),
+            shared_sql_context,
+            fast_text,
+            fast_start,
+            cursor_pos,
+            fast_initial_lex_mode,
+            cursor_in_string_or_comment,
+        });
+
+        let word_window_start = text_snapshot.clamp_boundary(
+            cursor_pos.saturating_sub(INTELLISENSE_WORD_WINDOW.max(0) as usize),
+        );
+        let word_window_end = text_snapshot.clamp_boundary(
+            cursor_pos
+                .saturating_add(INTELLISENSE_WORD_WINDOW.max(0) as usize)
+                .min(buffer_len),
+        );
+        let word_slice_start = word_window_start.saturating_sub(fast_start);
+        let word_slice_end = word_window_end.saturating_sub(fast_start);
+        let word_text = analysis
+            .fast_text
+            .get(word_slice_start..word_slice_end)
+            .unwrap_or("");
+        let relative_cursor = cursor_pos
+            .saturating_sub(word_window_start)
+            .min(word_text.len());
+        let word_initial_lex_mode =
+            shadow.parser_lex_mode_at(word_window_start, mysql_compatible);
+        let (mut prefix, mut relative_word_start, mut relative_word_end) =
+            crate::ui::intellisense::get_word_at_cursor_with_lexical_mode(
+                word_text,
+                relative_cursor,
+                mysql_compatible,
+                word_initial_lex_mode,
+            );
+        if prefix
+            .chars()
+            .next()
+            .is_some_and(|ch| matches!(ch, '"' | '`' | '['))
+        {
+            let absolute_word_start = word_window_start.saturating_add(relative_word_start);
+            if shadow
+                .parser_lexical_kind_at(absolute_word_start)
+                .is_some_and(|kind| {
+                    kind != crate::sql_parser_engine::LexicalKind::QuotedIdentifier
+                })
+            {
+                (prefix, relative_word_start, relative_word_end) =
+                    crate::ui::intellisense::get_unquoted_word_at_cursor(
+                        word_text,
+                        relative_cursor,
+                    );
+            }
+        }
+        let word_start = word_window_start.saturating_add(relative_word_start);
+        let _word_end = word_window_start.saturating_add(relative_word_end);
+
+        let (qualifier, raw_qualifier) = if word_start == 0 {
+            (None, None)
+        } else {
+            let qualifier_start = text_snapshot.clamp_boundary(
+                word_start.saturating_sub(INTELLISENSE_QUALIFIER_WINDOW.max(0) as usize),
+            );
+            let slice_start = qualifier_start.saturating_sub(fast_start);
+            let slice_end = word_start.saturating_sub(fast_start);
+            let qualifier_text = analysis
+                .fast_text
+                .get(slice_start..slice_end)
+                .unwrap_or("");
+            let qualifier_initial_lex_mode =
+                shadow.parser_lex_mode_at(qualifier_start, mysql_compatible);
+            match Self::qualifier_parts_before_word_in_text_with_lexical_mode(
+                qualifier_text,
+                qualifier_text.len(),
+                mysql_compatible,
+                qualifier_initial_lex_mode,
+            ) {
+                Some((qualifier, raw_qualifier)) => {
+                    (Some(qualifier), Some(raw_qualifier))
+                }
+                None => (None, None),
+            }
+        };
+
+        let signature_window_start =
+            text_snapshot.clamp_boundary(cursor_pos.saturating_sub(SIGNATURE_SCAN_WINDOW));
+        let raw_signature_start = signature_window_start.saturating_sub(fast_start);
+        let raw_signature_end = cursor_pos.saturating_sub(fast_start);
+        let raw_signature = analysis
+            .fast_text
+            .get(raw_signature_start..raw_signature_end)
+            .unwrap_or("");
+        let signature_scan_start = if signature_window_start > 0 {
+            raw_signature
+                .find('\n')
+                .map_or(signature_window_start, |newline| {
+                    signature_window_start.saturating_add(newline + 1)
+                })
+        } else {
+            signature_window_start
+        };
+        let signature_scan_text = analysis.shared_fast_slice(
+            signature_scan_start.saturating_sub(fast_start),
+            raw_signature_end,
+        );
+        let signature_scan_initial_lex_mode =
+            shadow.parser_lex_mode_at(signature_scan_start, mysql_compatible);
+
+        let suffix_end = text_snapshot.clamp_boundary(
+            cursor_pos
+                .saturating_add(COMPLETION_SUFFIX_SCAN_WINDOW)
+                .min(buffer_len),
+        );
+        let text_after_cursor = analysis.shared_fast_slice(
+            cursor_pos.saturating_sub(fast_start),
+            suffix_end.saturating_sub(fast_start),
+        );
+        drop(shadow);
+        Some(CapturedCursorContext {
+            analysis,
+            prefix,
+            word_start,
+            qualifier,
+            raw_qualifier,
+            signature_scan_text,
+            signature_scan_initial_lex_mode,
+            text_after_cursor,
+        })
+    }
+
+    fn qualifiers_before_word_from_cursor_analysis(
+        analysis: &CursorAnalysisSnapshot,
+        word_start: usize,
+        preferred_db_type: crate::db::connection::DatabaseType,
+    ) -> (Option<String>, Option<String>) {
+        if word_start <= analysis.fast_start || word_start > analysis.fast_end() {
+            return (None, None);
+        }
+        let relative_word_start = word_start.saturating_sub(analysis.fast_start);
+        let text = analysis.fast_text.get(..relative_word_start).unwrap_or("");
+        match Self::qualifier_parts_before_word_in_text_with_lexical_mode(
+            text,
+            text.len(),
+            preferred_db_type.is_mysql_or_mariadb(),
+            analysis.fast_initial_lex_mode.clone(),
+        ) {
+            Some((qualifier, raw_qualifier)) => (Some(qualifier), Some(raw_qualifier)),
+            None => (None, None),
+        }
+    }
+
     pub(super) fn trigger_intellisense(
         editor: &TextEditor,
         buffer: &TextBuffer,
@@ -1977,25 +2165,23 @@ impl SqlEditorWidget {
         // schema refresh worker or a running query may be holding). Fall back
         // to the last observed db_type; it only changes on (re)connect.
         let preferred_db_type = runtime.db_type_without_blocking(connection);
-        let (mut prefix, mut word_start, _) = Self::word_at_cursor_for_db(
+        let Some(captured) = Self::capture_cursor_context(
             buffer,
             text_shadow,
             cursor_pos,
-            Some(preferred_db_type),
-        );
-        let (mut qualifier, mut raw_qualifier) = Self::qualifiers_before_word(
-            buffer,
-            text_shadow,
-            word_start,
-            Some(preferred_db_type),
-        );
-        let (signature_scan_text, signature_scan_initial_lex_mode) =
-            Self::signature_scan_text_before_cursor(
-                buffer,
-                text_shadow,
-                cursor_pos_usize,
-                preferred_db_type.is_mysql_or_mariadb(),
-            );
+            preferred_db_type,
+        ) else {
+            Self::clear_intellisense_ui_state(intellisense_popup, runtime);
+            return;
+        };
+        let mut prefix = captured.prefix;
+        let mut word_start = captured.word_start;
+        let mut qualifier = captured.qualifier;
+        let mut raw_qualifier = captured.raw_qualifier;
+        let signature_scan_text = captured.signature_scan_text;
+        let signature_scan_initial_lex_mode = captured.signature_scan_initial_lex_mode;
+        let text_after_cursor = captured.text_after_cursor;
+        let cursor_analysis = captured.analysis;
         if !preferred_db_type.is_mysql_or_mariadb() {
             if let Some(model_prefix) = Self::oracle_model_bracket_completion_prefix(
                 &prefix,
@@ -2003,29 +2189,27 @@ impl SqlEditorWidget {
             ) {
                 prefix = model_prefix;
                 word_start = cursor_pos_usize.saturating_sub(prefix.len());
-                (qualifier, raw_qualifier) = Self::qualifiers_before_word(
-                    buffer,
-                    text_shadow,
+                (qualifier, raw_qualifier) = Self::qualifiers_before_word_from_cursor_analysis(
+                    cursor_analysis.as_ref(),
                     word_start,
-                    Some(preferred_db_type),
+                    preferred_db_type,
                 );
             }
         }
         let should_hide_after_statement_terminator = prefix.is_empty()
             && qualifier.is_none()
-            && Self::non_whitespace_char_before_cursor(buffer, text_shadow, cursor_pos)
-                == Some(';');
+            && Self::non_whitespace_char_before_cursor_in_text(
+                cursor_analysis.fast_text.as_str(),
+                cursor_analysis.cursor_in_fast_text(),
+            ) == Some(';');
 
         // The cursor sitting inside a string literal or comment is never an
         // identifier position: keywords, columns and relations would all be
         // irrelevant there. Suppress completion uniformly for every clause by
         // reusing the syntax highlighter's already-computed styles.
-        let cursor_in_string_or_comment = text_shadow
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .cursor_in_string_or_comment(cursor_pos_usize);
-
-        if should_hide_after_statement_terminator || cursor_in_string_or_comment {
+        if should_hide_after_statement_terminator
+            || cursor_analysis.cursor_in_string_or_comment
+        {
             intellisense_popup
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -2044,9 +2228,10 @@ impl SqlEditorWidget {
             word_start,
             qualifier,
             raw_qualifier,
+            cursor_analysis,
             signature_scan_text,
             signature_scan_initial_lex_mode,
-            text_after_cursor: Self::text_after_cursor_for_completion(buffer, cursor_pos_usize),
+            text_after_cursor,
         });
 
         let cached_context = runtime.parse_cache().and_then(|entry| {
@@ -2070,7 +2255,6 @@ impl SqlEditorWidget {
 
         Self::queue_async_intellisense_parse(
             editor,
-            text_shadow,
             intellisense_data,
             intellisense_popup,
             column_sender,
@@ -2080,43 +2264,6 @@ impl SqlEditorWidget {
             cached_context,
             cached_routine,
         );
-    }
-
-    fn signature_scan_text_before_cursor(
-        buffer: &TextBuffer,
-        text_shadow: &Arc<Mutex<HighlightShadowState>>,
-        cursor: usize,
-        mysql_compatible: bool,
-    ) -> (String, crate::sql_parser_engine::LexMode) {
-        // Keep this in line with the signature-hint popup scan: enough context
-        // to find the active call without cloning the entire editor buffer.
-        const SIGNATURE_SCAN_WINDOW: usize = 4000;
-        let window_start = cursor.saturating_sub(SIGNATURE_SCAN_WINDOW);
-        let raw = buffer
-            .text_range(window_start as i32, cursor as i32)
-            .unwrap_or_default();
-        let (scan_start, scan_text) = match raw.find('\n') {
-            Some(newline) if window_start > 0 => {
-                (window_start + newline + 1, raw[newline + 1..].to_string())
-            }
-            _ => (window_start, raw),
-        };
-        let initial_mode = text_shadow
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .parser_lex_mode_at(scan_start, mysql_compatible);
-        (scan_text, initial_mode)
-    }
-
-    fn text_after_cursor_for_completion(buffer: &TextBuffer, cursor: usize) -> String {
-        // Bounded lookahead also covers late query clauses (for example an
-        // outer CONNECT BY following a long SELECT list). The fixed cap keeps
-        // completion cost independent of document size.
-        const COMPLETION_SUFFIX_SCAN_WINDOW: usize = 2048;
-        let end = (cursor + COMPLETION_SUFFIX_SCAN_WINDOW).min(buffer.length() as usize);
-        buffer
-            .text_range(cursor as i32, end as i32)
-            .unwrap_or_default()
     }
 
     #[cfg(test)]
@@ -2305,7 +2452,6 @@ impl SqlEditorWidget {
 
     fn queue_async_intellisense_parse(
         editor: &TextEditor,
-        text_shadow: &Arc<Mutex<HighlightShadowState>>,
         intellisense_data: &Arc<Mutex<IntellisenseData>>,
         intellisense_popup: &Arc<Mutex<IntellisensePopup>>,
         column_sender: &mpsc::Sender<ColumnLoadUpdate>,
@@ -2319,7 +2465,6 @@ impl SqlEditorWidget {
             mpsc::channel::<Result<AsyncIntellisenseParseResult, String>>();
         let parse_receiver = Arc::new(Mutex::new(parse_receiver));
         let snapshot_for_thread = snapshot.clone();
-        let text_shadow_for_thread = text_shadow.clone();
         let intellisense_data_for_thread = intellisense_data.clone();
         let column_sender_for_thread = column_sender.clone();
         let connection_for_thread = connection.clone();
@@ -2362,9 +2507,8 @@ impl SqlEditorWidget {
                             package_spec_symbols,
                             shared_sql_context,
                         ) =
-                            Self::expanded_statement_window_and_text_binds_from_shadow(
-                                &text_shadow_for_thread,
-                                snapshot_for_thread.cursor_pos_usize,
+                            Self::expanded_statement_window_and_text_binds_from_cursor_analysis(
+                                snapshot_for_thread.cursor_analysis.as_ref(),
                                 Some(snapshot_for_thread.preferred_db_type),
                             );
                         if cancellation.is_cancelled() {
@@ -2397,11 +2541,16 @@ impl SqlEditorWidget {
                         if cancellation.is_cancelled() {
                             return None;
                         }
+                        let cursor_in_statement = expanded_statement.cursor_in_statement;
                         let analysis = Self::build_intellisense_analysis_from_routine_cache(
                             &routine_cache,
-                            expanded_statement.cursor_in_statement,
+                            cursor_in_statement,
                         );
-                        (analysis, Some(routine_cache), expanded_statement.text)
+                        (
+                            analysis,
+                            Some(routine_cache),
+                            SharedTextSlice::from(expanded_statement.text),
+                        )
                     };
 
                 if cancellation.is_cancelled() {

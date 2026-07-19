@@ -555,6 +555,24 @@ impl SqlHighlighter {
         )
     }
 
+    pub(crate) fn generate_style_bytes_for_window_with_alias_context_into(
+        &self,
+        text: &str,
+        entry_state: LexerState,
+        alias_context: &LocalAliasContext,
+        window_start: usize,
+        styles: &mut Vec<u8>,
+    ) -> LexerState {
+        self.generate_style_bytes_with_state_impl(
+            text,
+            entry_state,
+            Some((alias_context, window_start)),
+            styles,
+            #[cfg(test)]
+            None,
+        )
+    }
+
     #[cfg(test)]
     pub(crate) fn generate_styles_for_window_with_word_audit(
         &self,
@@ -721,13 +739,34 @@ impl SqlHighlighter {
         text: &str,
         initial_state: LexerState,
         alias_context: Option<(&LocalAliasContext, usize)>,
-        #[cfg(test)] mut word_audits: Option<&mut Vec<HighlightWordAudit>>,
+        #[cfg(test)] word_audits: Option<&mut Vec<HighlightWordAudit>>,
     ) -> (String, LexerState) {
+        let mut styles = Vec::new();
+        let exit_state = self.generate_style_bytes_with_state_impl(
+            text,
+            initial_state,
+            alias_context,
+            &mut styles,
+            #[cfg(test)]
+            word_audits,
+        );
+        (style_bytes_to_string(styles), exit_state)
+    }
+
+    fn generate_style_bytes_with_state_impl(
+        &self,
+        text: &str,
+        initial_state: LexerState,
+        alias_context: Option<(&LocalAliasContext, usize)>,
+        styles: &mut Vec<u8>,
+        #[cfg(test)] mut word_audits: Option<&mut Vec<HighlightWordAudit>>,
+    ) -> LexerState {
         let len = text.len();
+        styles.clear();
         if len == 0 {
-            return (String::new(), initial_state);
+            return initial_state;
         }
-        let mut styles: Vec<u8> = vec![STYLE_DEFAULT as u8; len];
+        styles.resize(len, STYLE_DEFAULT as u8);
         let bytes = text.as_bytes();
         let mut idx = 0usize;
         let mut exit_state = LexerState::Normal;
@@ -753,7 +792,7 @@ impl SqlHighlighter {
                     }
                     ScanResult::Unterminated { state, .. } => {
                         styles[..].fill(STYLE_BLOCK_COMMENT as u8);
-                        return (style_bytes_to_string(styles), state);
+                        return state;
                     }
                 }
             }
@@ -765,7 +804,7 @@ impl SqlHighlighter {
                     }
                     ScanResult::Unterminated { state, .. } => {
                         styles[..].fill(STYLE_HINT as u8);
-                        return (style_bytes_to_string(styles), state);
+                        return state;
                     }
                 }
             }
@@ -777,7 +816,7 @@ impl SqlHighlighter {
                     }
                     ScanResult::Unterminated { state, .. } => {
                         styles[..].fill(STYLE_STRING as u8);
-                        return (style_bytes_to_string(styles), state);
+                        return state;
                     }
                 }
             }
@@ -789,7 +828,7 @@ impl SqlHighlighter {
                     }
                     ScanResult::Unterminated { state, .. } => {
                         styles[..].fill(STYLE_Q_QUOTE_STRING as u8);
-                        return (style_bytes_to_string(styles), state);
+                        return state;
                     }
                 }
             }
@@ -801,7 +840,7 @@ impl SqlHighlighter {
                     }
                     ScanResult::Unterminated { state, .. } => {
                         styles[..].fill(STYLE_QUOTED_IDENTIFIER as u8);
-                        return (style_bytes_to_string(styles), state);
+                        return state;
                     }
                 }
             }
@@ -812,7 +851,7 @@ impl SqlHighlighter {
                 }
                 ScanResult::Unterminated { state, .. } => {
                     styles[..].fill(STYLE_QUOTED_IDENTIFIER as u8);
-                    return (style_bytes_to_string(styles), state);
+                    return state;
                 }
             },
             LexerState::Normal => {}
@@ -1188,7 +1227,7 @@ impl SqlHighlighter {
             idx += 1;
         }
 
-        (style_bytes_to_string(styles), exit_state)
+        exit_state
     }
 
     /// Classifies a word as keyword, function, identifier, or default
@@ -2169,6 +2208,7 @@ pub(crate) fn encode_fltk_style_bytes(text: &str, logical_styles: &str) -> Optio
     Some(encoded)
 }
 
+#[cfg(test)]
 pub(crate) fn encode_repeated_fltk_style_bytes(text: &str, style: char) -> Vec<u8> {
     if text.is_ascii() {
         return vec![style as u8; text.len()];
