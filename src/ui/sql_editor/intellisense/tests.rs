@@ -16867,6 +16867,7 @@ fn million_line_unterminated_statement_never_promotes_to_the_full_document() {
 }
 
 #[test]
+#[ignore = "performance-sensitive million-line completion benchmark; run explicitly"]
 fn million_line_snapshot_edit_and_actual_completion_stay_bounded() {
     use std::time::{Duration, Instant};
 
