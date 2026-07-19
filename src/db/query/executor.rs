@@ -1634,6 +1634,15 @@ impl QueryExecutor {
         let Some(prefix) = sql.get(..line_start) else {
             return false;
         };
+        let follows_open_comma_list = prefix
+            .lines()
+            .rev()
+            .map(str::trim)
+            .find(|line| !line.is_empty() && !sql_text::is_sqlplus_comment_line(line))
+            .is_some_and(sql_text::line_ends_with_comma_before_inline_comment);
+        if follows_open_comma_list {
+            return true;
+        }
         let tail_start = prefix.rfind(';').map_or(0, |idx| idx.saturating_add(1));
         let statement_tail = prefix.get(tail_start..).unwrap_or("");
         let mut tail_end = statement_tail.len().min(4096);

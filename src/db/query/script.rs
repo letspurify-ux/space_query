@@ -12018,6 +12018,11 @@ FROM recursive_tree";
             sql,
             Some(crate::db::connection::DatabaseType::MySQL),
         );
+        let statement_spans = QueryExecutor::statement_spans_for_db_type_with_mysql_delimiter(
+            sql,
+            Some(crate::db::connection::DatabaseType::MySQL),
+            None,
+        );
 
         assert!(
             matches!(script_items.as_slice(), [super::ScriptItem::Statement(statement)] if statement.contains("DELETE d") && statement.contains("mx_reading r")),
@@ -12026,6 +12031,10 @@ FROM recursive_tree";
         assert!(
             matches!(format_items.as_slice(), [FormatItem::Statement(statement)] if statement.contains("DELETE d") && statement.contains("mx_reading r")),
             "multi-table DELETE aliases should remain one format statement: {format_items:?}"
+        );
+        assert!(
+            matches!(statement_spans.as_slice(), [(start, end)] if sql.get(*start..*end).is_some_and(|statement| statement.contains("DELETE d") && statement.contains("mx_reading r"))),
+            "multi-table DELETE aliases should remain one statement span: {statement_spans:?}"
         );
     }
 

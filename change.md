@@ -5386,3 +5386,99 @@ PL/SQL 문 본문 CASE(`v := CASE ... THEN <문>`)와 `UPDATE ... SET` CASE는 �
 | `cargo test --lib formatting_sweep_all_files_generate_out_report -- --ignored` | 통과 — 66파일 failures 0 |
 | `cargo test` | 통과 — 6,640 passed · 0 failed (lib) |
 | `cargo clippy --locked --all-targets -- -D warnings -W clippy::perf -W clippy::complexity` | 통과 — 경고 0 |
+
+# 38차: 66개 `.format.out` 전수 재검토와 감사 누락 교정 (2026-07-20)
+
+## 38-1. AS-IS / TO-BE
+
+AS-IS: `formatting_sweep_all_files_generate_out_report`는 66개 파일을 모두 PASS로
+보고했지만, MySQL의 밀집 fixture인 `test_mysql/test5.txt`만
+`identifier_case_words=0`이었다. 자동 PASS와 전체 집계만 보면 이 파일의
+식별자 케이스 감사 자체가 건너뛰어진 사실을 알 수 없었다.
+
+원본의 multi-table DELETE는 한 줄이었다.
+
+```sql
+DELETE d,r FROM mx_document d JOIN mx_reading r ON r.account_id=d.account_id
+```
+
+포맷 후에는 delete-target 목록이 다음처럼 줄바꿈됐다.
+
+```sql
+DELETE d,
+    r
+FROM mx_document d
+```
+
+statement-span 경로가 단독 `r`을 SQL*Plus `RUN`의 축약 명령으로 오인해 문장을
+둘로 나눴다. 그 결과 source/formatted Word token 수가 1,444→1,443으로 달라졌고,
+기존 IdentifierCase 감사는 token-count 감사가 대신 잡을 것이라 가정한 채
+검사를 조용히 0건으로 반환했다. 전체 script 실행 splitter는 이미 이 문장을
+하나로 유지했지만, statement/cursor 범위 및 sweep 감사 경로에는 같은 문법
+정보가 반영되지 않았다.
+
+TO-BE: 직전의 유효 SQL 줄이 주석 앞의 쉼표로 끝나면 다음 tool-command 유사 줄은
+열린 comma-list frame의 직접 자식으로 간주한다. 따라서 `r`뿐 아니라 어떤
+1글자/명령어형 식별자도 목록이 닫히기 전에는 별도 도구 명령으로 분리하지 않는다.
+또한 IdentifierCase 감사의 source/formatted Word 정렬 수가 다르면 더 이상
+0건으로 생략하지 않고 `ItemOrTokenChanged` issue를 발생시킨다.
+
+## 38-2. 생성 결과 전수 판독
+
+지정 명령으로 산출물을 새로 생성한 뒤 `target/format-sweep` 아래 모든
+`.format.out`을 파일 첫 줄부터 report footer 마지막 줄까지 순서대로 읽었다.
+
+| dialect | 파일 | 판독한 줄 | 결과 |
+| --- | ---: | ---: | --- |
+| Oracle | 42 | 27,390 | 이상 없음 |
+| MySQL | 11 | 9,352 | 이상 없음 |
+| MariaDB | 13 | 12,995 | 이상 없음 |
+| 합계 | 66 | 49,737 | 이상 없음 |
+
+`docs/auto_format_rule.md`의 logical owner/body/close 깊이, direct child와 descendant
+깊이, 형제 정렬, 목록 구분자, CTE·CASE·JOIN·DDL query body·routine/trigger block,
+PIVOT/UNPIVOT/APPLY, JSON_TABLE/NESTED PATH, window/set operator, 주석·문자열 보존을
+대조했다. 관례적으로 어색하거나 일반화 가능한 새 렌더링/frame-depth 결함은
+0건이었으므로 formatter 본체와 특정 fixture 출력은 수정하지 않았다.
+
+수정 후 sweep 집계는 files=66, regressions=32,
+identifier_case_words=89,819, frames=24,227, frame_boundaries=53,385,
+frame_depth_symmetries=3,408, frame_body_items=26,027, frame_closes=11,297,
+failures=0이다. 문제 fixture의 IdentifierCase 감사도 0→1,444 단어쌍으로 복구됐다.
+
+## 38-3. 회귀 테스트와 변경 파일
+
+- `src/db/query/executor.rs`: 열린 후행-comma 목록 뒤의 tool-command 유사 줄을
+  같은 SQL statement로 유지하는 일반 경계 규칙.
+- `src/db/query/script.rs`: multi-table DELETE의 format item뿐 아니라 statement
+  span도 하나인지 고정하는 회귀 assertion.
+- `src/ui/sql_editor/format_sweep_tests.rs`: IdentifierCase token 정렬 실패를
+  issue로 승격하고, MySQL 밀집 fixture가 실제 단어쌍을 감사하는지 고정.
+- `change.md`: 본 AS-IS/TO-BE, 전수 판독 및 실행 결과 기록.
+
+## 38-4. 포맷 이후 Space Query 실제 실행
+
+각 원본을 명시적 dialect로 자동 포맷한 뒤 production Oracle Thin/MySQL batch
+실행 하네스에 파일마다 새 session으로 전달했다. 모든 파일이 성공 statement를
+하나 이상 냈고 실패 statement/event는 없었다.
+
+| DB | live 대상 | 성공 statement | 결과 |
+| --- | ---: | ---: | --- |
+| Oracle Free/1521 | 42/42 | 2,637 | PASS |
+| MySQL 8.0/3307 | 11/11 | 386 | PASS |
+| MariaDB 12.2/3306 | 13/13 | 671 | PASS |
+| 합계 | 66/66 | 3,694 | 실패 0 |
+
+dialect별 포맷 `final.sql` 인증 3종도 별도로 실행해 모두 자체 최종 PASS row까지
+도달했다.
+
+## 38-5. 최종 품질 게이트
+
+| 검증 | 결과 |
+| --- | --- |
+| `cargo test --lib formatting_sweep_all_files_generate_out_report -- --ignored --nocapture` | 통과 — 66개 fixture + 32개 회귀, failures 0 |
+| 포맷 후 Space Query live 실행 | 66/66 fixture, 3,694 successful statements, 실패 0 |
+| 포맷 `final.sql` PASS 인증 3종 | Oracle/MySQL/MariaDB 모두 PASS row 도달 |
+| `cargo test` | 통과 — 전 타깃 합계 6,826 passed · 0 failed · 246 ignored |
+| `cargo clippy --locked --all-targets -- -D warnings -W clippy::perf -W clippy::complexity` | 통과 — 경고 0 |
+| `cargo fmt --all -- --check` / `git diff --check` | 통과 |

@@ -1016,8 +1016,19 @@ fn format_sweep_audit_identifier_case(
         .filter_map(|(idx, span)| matches!(span.token, SqlToken::Word(_)).then_some(idx))
         .collect();
     if source_words.len() != formatted_word_indices.len() {
-        // Token-count changes are reported by `format_sweep_audit_token_count`.
-        return (0, Vec::new());
+        return (
+            0,
+            vec![FormatSweepIssue::new(
+                FormatSweepIssueKind::ItemOrTokenChanged,
+                formatted,
+                0,
+                format!(
+                    "identifier-case audit could not align source/formatted word tokens: {} -> {}",
+                    source_words.len(),
+                    formatted_word_indices.len()
+                ),
+            )],
+        );
     }
 
     let mut issues = Vec::new();
@@ -3788,6 +3799,34 @@ fn formatting_sweep_detects_identifier_case_change_next_to_dot() {
         issues[0].kind,
         FormatSweepIssueKind::IdentifierCase
     ));
+}
+
+#[test]
+fn formatting_sweep_identifier_case_audit_covers_dense_mysql_fixture() {
+    let source = include_str!("../../../test_mysql/test5.txt");
+    let run = format_sweep_run(source, DatabaseType::MySQL);
+
+    assert!(
+        run.checked_identifier_case_words > 0,
+        "identifier-case audit must not silently skip a token-preserving fixture"
+    );
+}
+
+#[test]
+fn formatting_sweep_identifier_case_alignment_mismatch_is_reported() {
+    let (_, issues) = format_sweep_audit_identifier_case(
+        "SELECT source_name FROM source_table;",
+        "SELECT FROM source_table;",
+        DatabaseType::MySQL,
+    );
+
+    assert!(
+        issues.iter().any(|issue| {
+            issue.kind == FormatSweepIssueKind::ItemOrTokenChanged
+                && issue.message.contains("could not align")
+        }),
+        "word-token alignment loss must fail the sweep: {issues:?}"
+    );
 }
 
 #[test]
