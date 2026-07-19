@@ -9700,10 +9700,15 @@ fn escape_keydown_consumes_when_popup_is_visible() {
 #[test]
 fn min_intellisense_prefix_uses_character_count() {
     assert!(!SqlEditorWidget::has_min_intellisense_prefix(""));
-    assert!(!SqlEditorWidget::has_min_intellisense_prefix("a"));
+    assert!(SqlEditorWidget::has_min_intellisense_prefix("a"));
     assert!(SqlEditorWidget::has_min_intellisense_prefix("ab"));
-    assert!(!SqlEditorWidget::has_min_intellisense_prefix("한"));
+    assert!(SqlEditorWidget::has_min_intellisense_prefix("한"));
     assert!(SqlEditorWidget::has_min_intellisense_prefix("한글"));
+}
+
+#[test]
+fn keyup_intellisense_debounce_is_one_millisecond() {
+    assert_eq!(KEYUP_INTELLISENSE_DEBOUNCE_MS, 1);
 }
 
 #[test]
@@ -9713,7 +9718,7 @@ fn fast_path_delete_hides_popup_when_prefix_too_short_without_qualifier() {
         None,
         Key::BackSpace
     ));
-    assert!(SqlEditorWidget::should_hide_fast_path_after_delete(
+    assert!(!SqlEditorWidget::should_hide_fast_path_after_delete(
         "a",
         None,
         Key::Delete
@@ -9848,18 +9853,18 @@ fn condition_comparison_suffix_ignores_bracket_identifier_operators() {
 }
 
 #[test]
-fn auto_trigger_forced_char_requires_qualifier_or_two_chars() {
+fn auto_trigger_forced_char_requires_qualifier_or_one_char() {
     assert!(!SqlEditorWidget::should_auto_trigger_intellisense_for_forced_char("", None));
-    assert!(!SqlEditorWidget::should_auto_trigger_intellisense_for_forced_char("a", None));
-    assert!(!SqlEditorWidget::should_auto_trigger_intellisense_for_forced_char("한", None));
+    assert!(SqlEditorWidget::should_auto_trigger_intellisense_for_forced_char("a", None));
+    assert!(SqlEditorWidget::should_auto_trigger_intellisense_for_forced_char("한", None));
     assert!(SqlEditorWidget::should_auto_trigger_intellisense_for_forced_char("ab", None));
     assert!(SqlEditorWidget::should_auto_trigger_intellisense_for_forced_char("한글", None));
     assert!(SqlEditorWidget::should_auto_trigger_intellisense_for_forced_char("", Some("t")));
 }
 
 #[test]
-fn auto_trigger_identifier_char_allows_one_char_after_qualifier() {
-    assert!(!SqlEditorWidget::should_auto_trigger_intellisense_for_identifier_char(
+fn auto_trigger_identifier_char_allows_one_char() {
+    assert!(SqlEditorWidget::should_auto_trigger_intellisense_for_identifier_char(
         "p",
         None,
     ));
@@ -9953,6 +9958,53 @@ fn modifier_key_is_detected_for_shift_release() {
     assert!(SqlEditorWidget::is_modifier_key(Key::ShiftL));
     assert!(SqlEditorWidget::is_modifier_key(Key::ShiftR));
     assert!(!SqlEditorWidget::is_modifier_key(Key::from_char('a')));
+}
+
+#[test]
+fn visible_intellisense_popup_hides_on_modifier_keydown() {
+    for key in [
+        Key::ShiftL,
+        Key::ShiftR,
+        Key::ControlL,
+        Key::ControlR,
+        Key::AltL,
+        Key::AltR,
+        Key::MetaL,
+        Key::MetaR,
+    ] {
+        assert!(
+            SqlEditorWidget::should_hide_intellisense_on_modifier_keydown(true, key),
+            "modifier {key:?} should hide a visible popup"
+        );
+    }
+
+    let hidden_popup =
+        SqlEditorWidget::should_hide_intellisense_on_modifier_keydown(false, Key::MetaL);
+    assert!(!hidden_popup);
+    assert!(!SqlEditorWidget::should_hide_intellisense_on_modifier_keydown(
+        true,
+        Key::CapsLock
+    ));
+    assert!(!SqlEditorWidget::should_hide_intellisense_on_modifier_keydown(
+        true,
+        Key::from_char('a')
+    ));
+}
+
+#[test]
+fn keyup_text_input_requires_a_real_unmodified_buffer_edit() {
+    assert!(SqlEditorWidget::should_process_keyup_text_input(true, false));
+    assert!(
+        !SqlEditorWidget::should_process_keyup_text_input(false, true),
+        "Ctrl+A must not trigger IntelliSense without a buffer edit"
+    );
+    assert!(
+        !SqlEditorWidget::should_process_keyup_text_input(true, true),
+        "Ctrl+V must not trigger IntelliSense even when paste changes the buffer"
+    );
+    assert!(!SqlEditorWidget::should_process_keyup_text_input(
+        false, false
+    ));
 }
 
 #[test]

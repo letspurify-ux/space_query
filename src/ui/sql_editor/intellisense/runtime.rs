@@ -520,6 +520,10 @@ impl SqlEditorWidget {
         let navigation_keyup_state_for_handle = navigation_keyup_state;
         let intellisense_runtime_for_handle = intellisense_runtime;
         let text_shadow_for_handle = text_shadow;
+        let mut keydown_buffer_revision_for_handle =
+            intellisense_runtime_for_handle.current_buffer_revision();
+        let mut keydown_had_ctrl_or_cmd_for_handle = false;
+        let mut keydown_had_alt_for_handle = false;
         let mut widget_for_shortcuts = self.clone();
         let find_callback_for_handle = self.find_callback.clone();
         let replace_callback_for_handle = self.replace_callback.clone();
@@ -792,6 +796,21 @@ impl SqlEditorWidget {
                         || state.contains(fltk::enums::Shortcut::Command);
                     let shift = state.contains(fltk::enums::Shortcut::Shift);
                     let alt = state.contains(fltk::enums::Shortcut::Alt);
+                    keydown_buffer_revision_for_handle =
+                        intellisense_runtime_for_handle.current_buffer_revision();
+                    keydown_had_ctrl_or_cmd_for_handle = ctrl_or_cmd;
+                    keydown_had_alt_for_handle = alt;
+
+                    if Self::should_hide_intellisense_on_modifier_keydown(popup_visible, key) {
+                        intellisense_popup_for_handle
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner())
+                            .hide();
+                        Self::invalidate_and_clear_pending_intellisense_state(
+                            &intellisense_runtime_for_handle,
+                        );
+                        return false;
+                    }
 
                     #[cfg(target_os = "macos")]
                     if Self::handle_macos_user_selection_text_input(
@@ -1253,6 +1272,16 @@ impl SqlEditorWidget {
                         || state.contains(fltk::enums::Shortcut::Command);
                     let alt = state.contains(fltk::enums::Shortcut::Alt);
                     let shift = state.contains(fltk::enums::Shortcut::Shift);
+                    let keyup_ctrl_or_cmd = ctrl_or_cmd || keydown_had_ctrl_or_cmd_for_handle;
+                    let shortcut_modified =
+                        keyup_ctrl_or_cmd || alt || keydown_had_alt_for_handle;
+                    let buffer_changed_since_keydown = intellisense_runtime_for_handle
+                        .current_buffer_revision()
+                        != keydown_buffer_revision_for_handle;
+                    let should_process_text_input = Self::should_process_keyup_text_input(
+                        buffer_changed_since_keydown,
+                        shortcut_modified,
+                    );
                     if matches!(
                         key,
                         Key::Up | Key::Down | Key::Home | Key::End | Key::PageUp | Key::PageDown
@@ -1265,7 +1294,7 @@ impl SqlEditorWidget {
                     if Self::should_ignore_keyup_after_manual_trigger(
                         key,
                         original_key,
-                        ctrl_or_cmd,
+                        keyup_ctrl_or_cmd,
                     ) {
                         return true;
                     }
@@ -1284,6 +1313,19 @@ impl SqlEditorWidget {
                         char_before_cursor,
                     );
                     if Self::is_modifier_key(key) {
+                        return false;
+                    }
+
+                    if shortcut_modified {
+                        if popup_visible {
+                            intellisense_popup_for_handle
+                                .lock()
+                                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                                .hide();
+                        }
+                        Self::invalidate_and_clear_pending_intellisense_state(
+                            &intellisense_runtime_for_handle,
+                        );
                         return false;
                     }
 
@@ -1478,7 +1520,7 @@ impl SqlEditorWidget {
                         );
                     } else if key == Key::BackSpace || key == Key::Delete {
                         // After backspace/delete, re-evaluate (debounced)
-                        if Self::has_min_intellisense_prefix(&word) {
+                        if popup_visible && Self::has_min_intellisense_prefix(&word) {
                             Self::schedule_keyup_intellisense_debounce(
                                 &intellisense_runtime_for_handle,
                                 cursor_pos,
@@ -1502,7 +1544,10 @@ impl SqlEditorWidget {
                                 true,
                             );
                         }
-                    } else if let Some(ch) = typed_char {
+                    } else if should_process_text_input {
+                        let Some(ch) = typed_char else {
+                            return false;
+                        };
                         if Self::should_force_full_analysis(ch) {
                             let qualifier = Self::qualifier_before_word(
                                 &buffer_for_handle,

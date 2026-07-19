@@ -181,19 +181,25 @@ impl ChunkedText {
         } else {
             self.chunks.len()
         };
-        self.chunks.splice(
-            drain_start..drain_end.max(drain_start),
-            split_text_chunks(&replacement),
-        );
+        let removed_line_breaks = self.chunks[drain_start..drain_end.max(drain_start)]
+            .iter()
+            .map(|chunk| chunk.line_breaks.len())
+            .sum::<usize>();
+        let replacement_chunks = split_text_chunks(&replacement);
+        let replacement_line_breaks = replacement_chunks
+            .iter()
+            .map(|chunk| chunk.line_breaks.len())
+            .sum::<usize>();
+        self.chunks
+            .splice(drain_start..drain_end.max(drain_start), replacement_chunks);
         self.len = self
             .len
             .saturating_sub(end.saturating_sub(start))
             .saturating_add(inserted.len());
         self.line_break_count = self
-            .chunks
-            .iter()
-            .map(|chunk| chunk.line_breaks.len())
-            .sum();
+            .line_break_count
+            .saturating_sub(removed_line_breaks)
+            .saturating_add(replacement_line_breaks);
         true
     }
 
@@ -374,6 +380,7 @@ impl<T: Clone> ChunkedValues<T> {
     pub(crate) fn replace_range(&mut self, start: usize, end: usize, replacement: Vec<T>) {
         let start = start.min(self.len);
         let end = end.min(self.len).max(start);
+        let replacement_len = replacement.len();
         let (start_idx, start_offset) = self.locate_boundary(start);
         let (end_idx, end_offset) = self.locate_boundary(end);
         let mut merged = Vec::new();
@@ -396,7 +403,10 @@ impl<T: Clone> ChunkedValues<T> {
             .collect::<Vec<_>>();
         self.chunks
             .splice(drain_start..drain_end.max(drain_start), next_chunks);
-        self.len = self.chunks.iter().map(|chunk| chunk.len()).sum();
+        self.len = self
+            .len
+            .saturating_sub(end.saturating_sub(start))
+            .saturating_add(replacement_len);
     }
 
     pub(crate) fn resize(&mut self, new_len: usize, value: T) {

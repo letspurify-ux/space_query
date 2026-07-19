@@ -1726,8 +1726,7 @@ impl SqlEditorWidget {
     }
 
     fn has_min_intellisense_prefix(word: &str) -> bool {
-        let mut chars = word.chars();
-        chars.next().is_some() && chars.next().is_some()
+        word.chars().next().is_some()
     }
 
     fn should_hide_fast_path_after_delete(prefix: &str, qualifier: Option<&str>, key: Key) -> bool {
@@ -1878,5 +1877,27 @@ impl SqlEditorWidget {
                 | Key::MetaR
                 | Key::CapsLock
         )
+    }
+
+    fn should_hide_intellisense_on_modifier_keydown(popup_visible: bool, key: Key) -> bool {
+        popup_visible
+            && matches!(
+                key,
+                Key::ShiftL
+                    | Key::ShiftR
+                    | Key::ControlL
+                    | Key::ControlR
+                    | Key::AltL
+                    | Key::AltR
+                    | Key::MetaL
+                    | Key::MetaR
+            )
+    }
+
+    fn should_process_keyup_text_input(
+        buffer_changed_since_keydown: bool,
+        shortcut_modified: bool,
+    ) -> bool {
+        buffer_changed_since_keydown && !shortcut_modified
     }
 }

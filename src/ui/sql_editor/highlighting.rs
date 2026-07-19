@@ -8,13 +8,27 @@ use crate::ui::syntax_highlight::HighlightWordAudit;
 
 const DEFERRED_REHIGHLIGHT_IDLE_DELAY_SECONDS: f64 = 0.15;
 const SEMANTIC_REHIGHLIGHT_OVERSCAN_LINES: usize = 100;
+// Keep semantic alias work independent of the total document size. The window
+// is renewed only if lexical-state propagation carries highlighting beyond it.
+const LOCAL_ALIAS_CONTEXT_LOOKAROUND_BYTES: usize = 16 * 1024;
+
+struct BoundedAliasContext {
+    context: super::query_text::LocalAliasContext,
+    start: usize,
+    end: usize,
+}
+
+impl BoundedAliasContext {
+    fn covers(&self, start: usize, end: usize) -> bool {
+        start >= self.start && end <= self.end
+    }
+}
 
 #[derive(Clone, Default)]
 pub(crate) struct HighlightShadowState {
     text: ChunkedText,
     styles: ChunkedValues<u8>,
     line_exit_states: ChunkedValues<LexerState>,
-    alias_context: super::query_text::LocalAliasContext,
 }
 
 impl HighlightShadowState {
@@ -24,7 +38,6 @@ impl HighlightShadowState {
         styles: &str,
         line_exit_states: Vec<LexerState>,
     ) {
-        self.alias_context = super::query_text::collect_local_alias_context(&text);
         self.text = ChunkedText::from_string(text);
         self.styles = ChunkedValues::from_vec(styles.as_bytes().to_vec());
         self.line_exit_states = ChunkedValues::from_vec(line_exit_states);
@@ -293,6 +306,35 @@ impl HighlightShadowState {
         self.styles.replace_range(start, end, styles.to_vec());
     }
 
+    fn bounded_alias_context(&self, start: usize, end: usize) -> BoundedAliasContext {
+        // Never flatten the complete shadow here: this method runs in the
+        // synchronous key-edit path, including for million-line scripts.
+        let required_start = self.text.clamp_boundary(start.min(self.text.len()));
+        let required_end = self
+            .text
+            .clamp_boundary(end.max(required_start).min(self.text.len()));
+        let context_start = self.text.clamp_boundary(
+            required_start.saturating_sub(LOCAL_ALIAS_CONTEXT_LOOKAROUND_BYTES),
+        );
+        let context_end = self.text.clamp_boundary(
+            required_end
+                .saturating_add(LOCAL_ALIAS_CONTEXT_LOOKAROUND_BYTES)
+                .min(self.text.len()),
+        );
+        let text = self
+            .text
+            .range_string(context_start, context_end)
+            .unwrap_or_default();
+        BoundedAliasContext {
+            context: super::query_text::collect_local_alias_context_with_offset(
+                &text,
+                context_start,
+            ),
+            start: context_start,
+            end: context_end,
+        }
+    }
+
     fn visible_semantic_range(
         &self,
         top_line: usize,
@@ -379,8 +421,6 @@ impl HighlightShadowState {
             start,
             inserted_text.len(),
         );
-        self.alias_context =
-            super::query_text::collect_local_alias_context(&self.text.to_flat_string());
         true
     }
 }
@@ -719,10 +759,14 @@ impl SqlEditorWidget {
         let mut current_line_idx = shadow.line_index_for_position(start);
         let mut entry_state = shadow.entry_state_for_line(current_line_idx);
         let mut changed_range: Option<(usize, usize)> = None;
+        let mut alias_context = shadow.bounded_alias_context(start, must_cover_end);
 
         while current_line_idx < shadow.line_count() {
             let current_start = shadow.line_start_for_index(current_line_idx);
             let current_end = shadow.inclusive_line_end_for_index(current_line_idx);
+            if !alias_context.covers(current_start, current_end) {
+                alias_context = shadow.bounded_alias_context(current_start, current_end);
+            }
             let range_text = shadow.text_range_string(current_start, current_end)?;
             let previous_styles = shadow.style_range_string(current_start, current_end)?;
             let old_exit_state = shadow.line_exit_state(current_line_idx);
@@ -730,7 +774,7 @@ impl SqlEditorWidget {
                 .generate_styles_for_window_with_alias_context(
                     &range_text,
                     entry_state,
-                    &shadow.alias_context,
+                    &alias_context.context,
                     current_start,
                 );
             if new_styles.len() != range_text.len() {
@@ -847,6 +891,7 @@ impl SqlEditorWidget {
             let Some(text) = shadow.text_range_string(start, end) else {
                 return;
             };
+            let alias_context = shadow.bounded_alias_context(start, end);
             let highlighter = self
                 .highlighter
                 .lock()
@@ -854,7 +899,7 @@ impl SqlEditorWidget {
             let (styles, _) = highlighter.generate_styles_for_window_with_alias_context(
                 &text,
                 entry_state,
-                &shadow.alias_context,
+                &alias_context.context,
                 start,
             );
             if styles.len() != text.len() {
@@ -1111,6 +1156,60 @@ mod tests {
             ..Default::default()
         };
         assert!(!shadow.cursor_in_string_or_comment(shadow.text.len()));
+    }
+
+    #[test]
+    fn alias_context_for_large_document_edit_is_bounded_and_document_aligned() {
+        const FILLER_LINES_PER_SIDE: usize = 50_000;
+        let filler = "SELECT 1;\n".repeat(FILLER_LINES_PER_SIDE);
+        let near_statement = "SELECT IF.value FROM near_table IF WHERE IF.value > 0;\n";
+        let text = format!(
+            "SELECT far_alias.value FROM far_table far_alias;\n{filler}{near_statement}{filler}SELECT tail_alias.value FROM tail_table tail_alias;\n"
+        );
+        let edit_at = text
+            .find("IF.value >")
+            .expect("nearby alias reference");
+        let declaration_start = text
+            .find("IF WHERE")
+            .expect("nearby alias declaration");
+        let shadow = HighlightShadowState {
+            text: ChunkedText::from_str(&text),
+            ..Default::default()
+        };
+
+        let aliases = shadow.bounded_alias_context(edit_at, edit_at.saturating_add(1));
+
+        assert!(aliases.context.contains_name("IF"));
+        assert!(!aliases.context.contains_name("far_alias"));
+        assert!(!aliases.context.contains_name("tail_alias"));
+        assert!(aliases.context.is_declaration_range(
+            declaration_start,
+            declaration_start.saturating_add("IF".len())
+        ));
+        let line_start = shadow.line_start(edit_at);
+        let line_end = shadow.inclusive_line_end(edit_at);
+        let line = shadow
+            .text_range_string(line_start, line_end)
+            .expect("edited line");
+        let (styles, _) = SqlHighlighter::new().generate_styles_for_window_with_alias_context(
+            &line,
+            LexerState::Normal,
+            &aliases.context,
+            line_start,
+        );
+        let reference_offset = edit_at.saturating_sub(line_start);
+        assert_ne!(
+            styles.as_bytes().get(reference_offset).copied(),
+            Some(crate::ui::syntax_highlight::STYLE_KEYWORD as u8),
+            "keyword-like aliases must remain identifier-styled in the bounded window"
+        );
+        assert!(
+            aliases.end.saturating_sub(aliases.start)
+                <= LOCAL_ALIAS_CONTEXT_LOOKAROUND_BYTES
+                    .saturating_mul(2)
+                    .saturating_add(1),
+            "alias collection must remain independent of the 100k-line document size"
+        );
     }
 
     #[test]

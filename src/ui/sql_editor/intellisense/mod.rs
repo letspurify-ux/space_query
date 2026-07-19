@@ -32,7 +32,7 @@ use crate::ui::FindReplaceDialog;
 use super::*;
 
 const MAX_MERGED_SUGGESTIONS: usize = 100;
-const KEYUP_INTELLISENSE_DEBOUNCE_MS: u64 = 120;
+const KEYUP_INTELLISENSE_DEBOUNCE_MS: u64 = 1;
 const COLUMN_LOAD_WORKER_COUNT: usize = 4;
 const COLUMN_LOAD_CONTEXT_RETRY_DELAYS: [Duration; 3] = [
     Duration::from_millis(5),

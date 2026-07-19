@@ -164,6 +164,26 @@ pub(crate) fn collect_local_alias_context(sql: &str) -> LocalAliasContext {
     collect_local_alias_context_from_spans(&tokenize_sql_spanned(sql))
 }
 
+pub(crate) fn collect_local_alias_context_with_offset(
+    sql: &str,
+    document_offset: usize,
+) -> LocalAliasContext {
+    let mut context = collect_local_alias_context(sql);
+    if document_offset > 0 {
+        context.declaration_ranges = context
+            .declaration_ranges
+            .into_iter()
+            .map(|(start, end)| {
+                (
+                    start.saturating_add(document_offset),
+                    end.saturating_add(document_offset),
+                )
+            })
+            .collect();
+    }
+    context
+}
+
 pub(crate) fn tokenize_sql_with_mysql_compat(sql: &str, mysql_compatible: bool) -> Vec<SqlToken> {
     tokenize_sql_spanned_with_mysql_compat(sql, mysql_compatible)
         .into_iter()

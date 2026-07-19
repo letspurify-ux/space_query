@@ -4184,6 +4184,34 @@ impl FormatFrameStack {
     }
 
     fn pop_tail_auxiliary_frames_for_scope(&mut self, next_scope: FormatScope) {
+        // These scoped frames can sit below an OpenCursorRestore marker, so
+        // prune them through their cached indices before the tail-only pass.
+        while self
+            .last_trigger_header_scope()
+            .is_some_and(|scope| !scope.contains(next_scope))
+        {
+            if self
+                .take_last_frame_matching_via_tail_pop(|frame| {
+                    matches!(frame, FormatFrame::TriggerHeader(_))
+                })
+                .is_none()
+            {
+                break;
+            }
+        }
+        while self
+            .plsql_context_scope()
+            .is_some_and(|scope| !scope.contains(next_scope))
+        {
+            if self
+                .take_last_frame_matching_via_tail_pop(|frame| {
+                    matches!(frame, FormatFrame::PlsqlContext(_))
+                })
+                .is_none()
+            {
+                break;
+            }
+        }
         while self
             .frames
             .last()
@@ -6248,12 +6276,14 @@ impl FormatFrameStack {
                     frame.scope.contains(current_scope),
                     "query runtime frame survived outside its scope"
                 ),
-                FormatFrame::TriggerHeader(scope) | FormatFrame::PlsqlContext(scope) => {
-                    debug_assert!(
-                        scope.contains(current_scope),
-                        "scoped formatter frame survived outside its scope"
-                    );
-                }
+                FormatFrame::TriggerHeader(scope) => debug_assert!(
+                    scope.contains(current_scope),
+                    "trigger header frame survived outside its scope"
+                ),
+                FormatFrame::PlsqlContext(scope) => debug_assert!(
+                    scope.contains(current_scope),
+                    "PL/SQL context frame survived outside its scope"
+                ),
                 FormatFrame::CompoundTrigger(frame) => debug_assert!(
                     frame.scope.contains(current_scope),
                     "compound trigger frame survived outside its scope"
@@ -48877,6 +48907,32 @@ mod format_frame_stack_tests {
         assert!(stack.pending_split_end_suffix_indent().is_none());
         assert!(stack.pending_plsql_label_body_indent().is_none());
         assert!(stack.mysql_handler_pending_body_indent().is_none());
+    }
+
+    #[test]
+    fn format_frame_stack_scope_sync_expires_scoped_frames_below_cursor_restore() {
+        let mut stack = FormatFrameStack::default();
+        let original_scope = FormatScope::with_frame_ids(1, 0, Some(10), None);
+        let sibling_scope = FormatScope::with_frame_ids(1, 0, Some(11), None);
+
+        stack.push_trigger_header(original_scope);
+        stack.push_plsql_context(original_scope);
+        stack.push_open_cursor_restore(OpenCursorFormatState::AwaitingFor);
+        stack.set_pending_split_end_suffix(
+            original_scope,
+            2,
+            PendingSplitEndSuffixKind::SingleWord,
+        );
+
+        stack.sync_to_scope(sibling_scope);
+
+        assert!(stack.last_trigger_header_scope().is_none());
+        assert!(stack.plsql_context_scope().is_none());
+        assert!(matches!(
+            stack.pop_open_cursor_restore(),
+            Some(OpenCursorFormatState::AwaitingFor)
+        ));
+        assert!(stack.pending_split_end_suffix_indent().is_none());
     }
 
     #[test]
