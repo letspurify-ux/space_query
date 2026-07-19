@@ -8,6 +8,8 @@ use crate::ui::syntax_highlight::HighlightWordAudit;
 
 const DEFERRED_REHIGHLIGHT_IDLE_DELAY_SECONDS: f64 = 0.15;
 const SEMANTIC_REHIGHLIGHT_OVERSCAN_LINES: usize = 100;
+const LARGE_DOCUMENT_PASTE_LINE_THRESHOLD: usize = 100_000;
+const LARGE_PASTE_DEFER_SEMANTIC_BYTES: usize = 64 * 1024;
 // Keep semantic alias work independent of the total document size. The window
 // is renewed only if lexical-state propagation carries highlighting beyond it.
 const LOCAL_ALIAS_CONTEXT_LOOKAROUND_BYTES: usize = 16 * 1024;
@@ -97,6 +99,14 @@ struct BoundedAliasContext {
     context: Arc<super::query_text::LocalAliasContext>,
     start: usize,
     end: usize,
+}
+
+fn should_defer_semantic_alias_context_for_insert(
+    line_count: usize,
+    inserted_text: &str,
+) -> bool {
+    inserted_text.len() >= LARGE_PASTE_DEFER_SEMANTIC_BYTES
+        || (line_count >= LARGE_DOCUMENT_PASTE_LINE_THRESHOLD && inserted_text.len() > 1)
 }
 
 impl BoundedAliasContext {
@@ -769,25 +779,6 @@ impl SqlEditorWidget {
         self.rehighlight_full_buffer();
     }
 
-    fn handle_buffer_highlight_update(
-        &self,
-        buf: &TextBuffer,
-        pos: i32,
-        ins: i32,
-        del: i32,
-        deleted_text: &str,
-    ) {
-        let inserted_text = inserted_text(buf, &self.highlight_shadow, pos, ins);
-        self.handle_buffer_highlight_update_with_known_inserted_text(
-            buf,
-            pos,
-            ins,
-            del,
-            &inserted_text,
-            deleted_text,
-        );
-    }
-
     fn handle_buffer_highlight_update_with_known_inserted_text(
         &self,
         buf: &TextBuffer,
@@ -828,7 +819,7 @@ impl SqlEditorWidget {
             return;
         }
 
-        let updated = {
+        let (updated, defer_semantic_alias_context) = {
             let mut shadow = self
                 .highlight_shadow
                 .lock()
@@ -847,18 +838,27 @@ impl SqlEditorWidget {
                 return;
             }
 
-            self.apply_main_thread_incremental_highlighting(
-                &mut shadow,
-                &mut style_buffer,
-                shadow_pos,
-                inserted_text.len(),
-                del.max(0) as usize,
-                inserted_text,
-                deleted_text,
+            let defer_semantic_alias_context =
+                should_defer_semantic_alias_context_for_insert(shadow.line_count(), inserted_text);
+            (
+                self.apply_main_thread_incremental_highlighting(
+                    &mut shadow,
+                    &mut style_buffer,
+                    shadow_pos,
+                    inserted_text.len(),
+                    del.max(0) as usize,
+                    inserted_text,
+                    deleted_text,
+                    defer_semantic_alias_context,
+                ),
+                defer_semantic_alias_context,
             )
         };
         match updated {
             Some(true) | Some(false) => {
+                if defer_semantic_alias_context {
+                    self.schedule_deferred_visible_semantic_rehighlight();
+                }
                 self.redraw_editor_if_live();
             }
             None => self.rehighlight_full_buffer(),
@@ -892,6 +892,7 @@ impl SqlEditorWidget {
         del: usize,
         inserted_text: &str,
         deleted_text: &str,
+        defer_semantic_alias_context: bool,
     ) -> Option<bool> {
         let text_len = shadow.len();
         if text_len == 0 {
@@ -909,8 +910,15 @@ impl SqlEditorWidget {
         let mut current_line_idx = shadow.line_index_for_position(start);
         let mut entry_state = shadow.entry_state_for_line(current_line_idx);
         let mut changed_range: Option<(usize, usize)> = None;
-        let mut alias_context =
-            shadow.bounded_alias_context(start, must_cover_end, mysql_compatible);
+        let mut alias_context = if defer_semantic_alias_context {
+            BoundedAliasContext {
+                context: Arc::new(super::query_text::LocalAliasContext::default()),
+                start: 0,
+                end: text_len,
+            }
+        } else {
+            shadow.bounded_alias_context(start, must_cover_end, mysql_compatible)
+        };
 
         while current_line_idx < shadow.line_count() {
             let current_start = shadow.line_start_for_index(current_line_idx);
@@ -1162,6 +1170,23 @@ fn is_string_or_comment_style(style: char) -> bool {
 mod tests {
     use super::*;
     use crate::ui::syntax_highlight::SqlHighlighter;
+
+    #[test]
+    fn large_document_paste_defers_only_semantic_alias_work() {
+        assert!(should_defer_semantic_alias_context_for_insert(
+            LARGE_DOCUMENT_PASTE_LINE_THRESHOLD,
+            "ab"
+        ));
+        assert!(!should_defer_semantic_alias_context_for_insert(
+            LARGE_DOCUMENT_PASTE_LINE_THRESHOLD,
+            "a"
+        ));
+        assert!(should_defer_semantic_alias_context_for_insert(
+            10,
+            &"x".repeat(LARGE_PASTE_DEFER_SEMANTIC_BYTES)
+        ));
+        assert!(!should_defer_semantic_alias_context_for_insert(10, "SELECT"));
+    }
 
     #[test]
     fn incremental_direct_rehighlight_end_returns_zero_for_empty_text() {

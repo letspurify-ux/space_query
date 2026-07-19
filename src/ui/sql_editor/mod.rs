@@ -2491,7 +2491,6 @@ impl SqlEditorWidget {
         };
 
         widget.setup_intellisense();
-        widget.setup_word_undo_redo();
         widget.setup_syntax_highlighting();
         widget.sync_db_type_from_connection();
         widget.setup_progress_handler(progress_receiver, progress_callback, query_running);
@@ -5050,7 +5049,7 @@ mod execution_state_tests {
         classify_edit_group, inserted_text, load_mutex_bool, load_mutex_bool_option,
         try_mark_query_running, BufferEdit, EditGranularity, EditOperation, HighlightShadowState,
         IntellisenseRuntimeState, QueryProgress, SqlEditorWidget, UndoDelta, UndoSnapshot,
-        WordUndoRedoState, MAX_WORD_UNDO_HISTORY, STYLE_DEFAULT,
+        WordUndoRedoState, MAX_WORD_UNDO_HISTORY,
     };
     use fltk::enums::Event;
     use fltk::text::TextBuffer;
@@ -5422,17 +5421,10 @@ mod execution_state_tests {
         let mut buffer = TextBuffer::default();
         buffer.set_text(original);
 
-        let styles = std::iter::repeat_n(STYLE_DEFAULT, original.len()).collect::<String>();
-        let shadow = Arc::new(Mutex::new(HighlightShadowState::default()));
-        shadow
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .rebuild(original.to_string(), &styles, Vec::new());
-
         let pos = original.find("a FROM").unwrap_or(0);
         buffer.replace(pos as i32, pos.saturating_add(1) as i32, "'");
 
-        assert_eq!(inserted_text(&buffer, &shadow, pos as i32, 1), "'");
+        assert_eq!(inserted_text(&buffer, pos as i32, 1), "'");
     }
 
     #[test]

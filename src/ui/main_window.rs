@@ -1832,7 +1832,27 @@ impl AppState {
         self.set_tab_dirty(tab_id, is_dirty);
     }
 
-    fn on_tab_buffer_modified(&mut self, tab_id: QueryTabId, ins: i32, del: i32, buf: &TextBuffer) {
+    fn dirty_state_from_equal_length_local_edit(
+        pristine_text: &str,
+        was_dirty: bool,
+        start: usize,
+        inserted_text: &str,
+    ) -> Option<bool> {
+        let end = start.saturating_add(inserted_text.len());
+        if pristine_text.get(start..end) != Some(inserted_text) {
+            return Some(true);
+        }
+        (!was_dirty).then_some(false)
+    }
+
+    fn on_tab_buffer_modified(
+        &mut self,
+        tab_id: QueryTabId,
+        pos: i32,
+        ins: i32,
+        del: i32,
+        buf: &TextBuffer,
+    ) {
         let Some(index) = self.find_tab_index(tab_id) else {
             return;
         };
@@ -1847,6 +1867,19 @@ impl AppState {
 
         if tab.current_text_len != tab.pristine_text.len() {
             self.set_tab_dirty(tab_id, true);
+            return;
+        }
+
+        let start = pos.max(0) as usize;
+        let inserted_end = pos.saturating_add(ins.max(0)).min(buf.length());
+        let inserted_text = buf.text_range(pos.max(0), inserted_end).unwrap_or_default();
+        if let Some(is_dirty) = Self::dirty_state_from_equal_length_local_edit(
+            &tab.pristine_text,
+            tab.is_dirty,
+            start,
+            &inserted_text,
+        ) {
+            self.set_tab_dirty(tab_id, is_dirty);
             return;
         }
 
@@ -7273,12 +7306,12 @@ impl MainWindow {
 
         let weak_state_for_dirty = Arc::downgrade(state);
         let mut buffer_for_dirty = editor.get_buffer();
-        buffer_for_dirty.add_modify_callback2(move |buf, _pos, ins, del, _restyled, _deleted| {
+        buffer_for_dirty.add_modify_callback2(move |buf, pos, ins, del, _restyled, _deleted| {
             let Some(state_for_dirty) = weak_state_for_dirty.upgrade() else {
                 return;
             };
             if let Ok(mut s) = state_for_dirty.try_lock() {
-                s.on_tab_buffer_modified(tab_id, ins, del, buf)
+                s.on_tab_buffer_modified(tab_id, pos, ins, del, buf)
             };
         });
     }
@@ -9492,6 +9525,48 @@ mod tests {
     use crate::ui::sql_editor::LazyFetchRequest;
     use fltk::enums::{Key, Shortcut};
     use std::sync::{Arc, Mutex};
+
+    #[test]
+    fn equal_length_paste_avoids_full_dirty_scan_when_local_bytes_decide_state() {
+        let pristine = "SELECT employee_name FROM employees;";
+        let start = pristine.find("employee_name").expect("column name");
+
+        assert_eq!(
+            AppState::dirty_state_from_equal_length_local_edit(
+                pristine,
+                false,
+                start,
+                "employee_name",
+            ),
+            Some(false)
+        );
+        assert_eq!(
+            AppState::dirty_state_from_equal_length_local_edit(
+                pristine,
+                false,
+                start,
+                "department_id",
+            ),
+            Some(true)
+        );
+        assert_eq!(
+            AppState::dirty_state_from_equal_length_local_edit(
+                pristine,
+                true,
+                start,
+                "department_id",
+            ),
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn equal_length_edit_scans_fully_only_when_it_may_restore_pristine_text() {
+        assert_eq!(
+            AppState::dirty_state_from_equal_length_local_edit("SELECT 1;", true, 7, "1"),
+            None
+        );
+    }
 
     #[test]
     fn resolve_window_shortcut_prefers_current_key_match() {

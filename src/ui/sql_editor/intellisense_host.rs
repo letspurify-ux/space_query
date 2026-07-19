@@ -251,20 +251,60 @@ impl SqlEditorWidget {
         let mut buffer = self.buffer.clone();
         let widget = self.clone();
         let intellisense_runtime = self.intellisense_runtime.clone();
+        let undo_state = self.undo_redo_state.clone();
+        let applying_history_navigation = self.applying_history_navigation.clone();
         let suppress_buffer_callbacks = self.suppress_buffer_callbacks.clone();
         buffer.add_modify_callback2(move |buf, pos, ins, del, _restyled, deleted_text| {
             if ins <= 0 && del <= 0 {
                 return;
             }
+            crate::ui::sql_editor::ime_trace(|| {
+                format!(
+                    "modify pos={pos} ins={ins} del={del} deleted_text={deleted_text:?} \
+                     compose_state={} selection={:?}",
+                    fltk::app::compose_state(),
+                    buf.selection_position(),
+                )
+            });
             if load_mutex_bool(&suppress_buffer_callbacks) {
                 return;
             }
+            let edit = BufferEdit {
+                start: pos.max(0) as usize,
+                deleted_len: del.max(0) as usize,
+                inserted_text: inserted_text(buf, pos, ins),
+                // record_edit reads the authoritative deleted bytes from its
+                // persistent pre-edit snapshot.
+                deleted_text: String::new(),
+            };
+
+            let is_applying_navigation = *applying_history_navigation
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if !is_applying_navigation {
+                let mut state = undo_state
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                if !state.applying_history {
+                    let edit_group =
+                        classify_edit_group(ins, del, &edit.inserted_text, deleted_text);
+                    state.record_edit(&edit, edit_group);
+                }
+            }
+
             intellisense_runtime.apply_buffer_edit(
                 pos.max(0) as usize,
                 ins.max(0) as usize,
                 del.max(0) as usize,
             );
-            widget.handle_buffer_highlight_update(buf, pos, ins, del, deleted_text);
+            widget.handle_buffer_highlight_update_with_known_inserted_text(
+                buf,
+                pos,
+                ins,
+                del,
+                &edit.inserted_text,
+                deleted_text,
+            );
         });
     }
 

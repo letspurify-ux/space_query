@@ -829,55 +829,6 @@ impl WordUndoRedoState {
 }
 
 impl SqlEditorWidget {
-    fn setup_word_undo_redo(&self) {
-        let undo_state = self.undo_redo_state.clone();
-        let applying_history_navigation = self.applying_history_navigation.clone();
-        let suppress_buffer_callbacks = self.suppress_buffer_callbacks.clone();
-        let text_shadow = self.highlight_shadow.clone();
-        let mut buffer = self.buffer.clone();
-        buffer.add_modify_callback2(move |buf, pos, ins, del, _restyled, deleted_text| {
-            if ins <= 0 && del <= 0 {
-                return;
-            }
-            crate::ui::sql_editor::ime_trace(|| {
-                format!(
-                    "modify pos={pos} ins={ins} del={del} deleted_text={deleted_text:?} \
-                     compose_state={} selection={:?}",
-                    fltk::app::compose_state(),
-                    buf.selection_position(),
-                )
-            });
-            if load_mutex_bool(&suppress_buffer_callbacks) {
-                return;
-            }
-
-            let is_applying_navigation = *applying_history_navigation
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            if is_applying_navigation {
-                return;
-            }
-
-            let inserted = inserted_text(buf, &text_shadow, pos, ins);
-            let mut state = undo_state
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-
-            if state.applying_history {
-                return;
-            }
-
-            let edit_group = classify_edit_group(ins, del, &inserted, deleted_text);
-            let edit = BufferEdit {
-                start: pos.max(0) as usize,
-                deleted_len: del.max(0) as usize,
-                inserted_text: inserted,
-                deleted_text: deleted_text.to_string(),
-            };
-            state.record_edit(&edit, edit_group);
-        });
-    }
-
     fn record_programmatic_buffer_edit(
         &self,
         start: usize,
@@ -1183,7 +1134,6 @@ impl SqlEditorWidget {
 
 fn inserted_text(
     buf: &TextBuffer,
-    _text_shadow: &Arc<Mutex<HighlightShadowState>>,
     pos: i32,
     ins: i32,
 ) -> String {
