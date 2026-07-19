@@ -219,6 +219,7 @@ pub(crate) struct IntellisenseRuntimeState {
     keyup_debounce_generation: Arc<Mutex<u64>>,
     keyup_debounce_handle: Arc<Mutex<Option<crate::ui::ui_timeout::TimeoutHandle>>>,
     cached_db_type: Arc<AtomicU8>,
+    context_window_bytes: Arc<AtomicUsize>,
     session_state: Arc<Mutex<crate::db::SessionState>>,
     parse_worker: Arc<LatestTaskWorker>,
 }
@@ -243,6 +244,11 @@ impl IntellisenseRuntimeState {
             cached_db_type: Arc::new(AtomicU8::new(
                 crate::db::connection::DatabaseType::default().cache_key(),
             )),
+            context_window_bytes: Arc::new(AtomicUsize::new(
+                crate::utils::AppConfig::intellisense_context_window_bytes(
+                    crate::utils::DEFAULT_INTELLISENSE_CONTEXT_WINDOW_KIB,
+                ),
+            )),
             session_state: Arc::new(Mutex::new(crate::db::SessionState::default())),
             parse_worker: Arc::new(LatestTaskWorker::new()),
         }
@@ -265,6 +271,18 @@ impl IntellisenseRuntimeState {
 
     pub(crate) fn session_state(&self) -> Arc<Mutex<crate::db::SessionState>> {
         self.session_state.clone()
+    }
+
+    pub(crate) fn context_window_bytes(&self) -> usize {
+        self.context_window_bytes.load(Ordering::Relaxed)
+    }
+
+    pub(crate) fn set_context_window_bytes(&self, bytes: usize) {
+        if self.context_window_bytes.swap(bytes, Ordering::Relaxed) != bytes {
+            self.next_parse_generation();
+            self.clear_parse_cache();
+            self.clear_routine_symbol_cache();
+        }
     }
 
     pub(crate) fn completion_range(&self) -> Option<IntellisenseCompletionRange> {
@@ -609,6 +627,19 @@ mod tests {
             runtime.db_type_without_blocking(&connection),
             crate::db::DatabaseType::MariaDB
         );
+    }
+
+    #[test]
+    fn context_window_setting_is_the_runtime_analysis_limit() {
+        let runtime = IntellisenseRuntimeState::new();
+        let configured = crate::utils::AppConfig::intellisense_context_window_bytes(256);
+
+        runtime.set_context_window_bytes(configured);
+
+        assert_eq!(runtime.context_window_bytes(), configured);
+        assert_eq!(runtime.current_parse_generation(), 1);
+        runtime.set_context_window_bytes(configured);
+        assert_eq!(runtime.current_parse_generation(), 1);
     }
 
     #[test]

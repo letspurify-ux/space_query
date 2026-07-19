@@ -29,6 +29,7 @@ use crate::ui::intellisense_context;
 use crate::ui::text_buffer_access;
 use crate::ui::FindReplaceDialog;
 
+use super::intellisense_state::IntellisenseCancellation;
 use super::*;
 
 const MAX_MERGED_SUGGESTIONS: usize = 100;
@@ -101,55 +102,15 @@ enum DndDropState {
     AwaitingPaste(PendingDndDrop),
 }
 
-#[derive(Clone)]
-struct SharedTextSlice {
-    storage: Arc<String>,
-    range: std::ops::Range<usize>,
-}
-
-impl SharedTextSlice {
-    fn new(storage: Arc<String>, start: usize, end: usize) -> Self {
-        let start = start.min(storage.len());
-        let end = end.min(storage.len()).max(start);
-        Self {
-            storage,
-            range: start..end,
-        }
-    }
-
-    fn whole(storage: Arc<String>) -> Self {
-        let len = storage.len();
-        Self::new(storage, 0, len)
-    }
-
-    fn as_str(&self) -> &str {
-        self.storage.get(self.range.clone()).unwrap_or("")
-    }
-}
-
-impl From<String> for SharedTextSlice {
-    fn from(value: String) -> Self {
-        Self::whole(Arc::new(value))
-    }
-}
-
-impl std::ops::Deref for SharedTextSlice {
-    type Target = str;
-
-    fn deref(&self) -> &Self::Target {
-        self.as_str()
-    }
-}
+type SharedTextSlice = ChunkedTextSlice;
 
 #[derive(Clone)]
 struct CursorAnalysisSnapshot {
-    text_snapshot: ChunkedText,
     shared_sql_context: Option<SharedSqlContextSnapshot>,
-    fast_text: Arc<String>,
+    fast_text: SharedTextSlice,
     fast_start: usize,
     cursor_pos: usize,
     fast_initial_lex_mode: crate::sql_parser_engine::LexMode,
-    cursor_in_string_or_comment: bool,
 }
 
 impl CursorAnalysisSnapshot {
@@ -164,7 +125,7 @@ impl CursorAnalysisSnapshot {
     }
 
     fn shared_fast_slice(&self, start: usize, end: usize) -> SharedTextSlice {
-        SharedTextSlice::new(self.fast_text.clone(), start, end)
+        self.fast_text.subslice(start, end)
     }
 }
 
@@ -177,6 +138,11 @@ struct CapturedCursorContext {
     signature_scan_text: SharedTextSlice,
     signature_scan_initial_lex_mode: crate::sql_parser_engine::LexMode,
     text_after_cursor: SharedTextSlice,
+}
+
+enum CursorContextCapture {
+    Suppressed,
+    Ready(CapturedCursorContext),
 }
 
 #[derive(Clone)]

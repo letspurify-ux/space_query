@@ -254,6 +254,7 @@ impl SqlEditorWidget {
         let undo_state = self.undo_redo_state.clone();
         let applying_history_navigation = self.applying_history_navigation.clone();
         let suppress_buffer_callbacks = self.suppress_buffer_callbacks.clone();
+        let pending_paste_text = self.pending_paste_text.clone();
         buffer.add_modify_callback2(move |buf, pos, ins, del, _restyled, deleted_text| {
             if ins <= 0 && del <= 0 {
                 return;
@@ -269,10 +270,13 @@ impl SqlEditorWidget {
             if load_mutex_bool(&suppress_buffer_callbacks) {
                 return;
             }
+            let shared_inserted_text =
+                take_matching_pending_paste_text(buf, pos, ins, &pending_paste_text)
+                    .unwrap_or_else(|| Arc::new(inserted_text(buf, pos, ins)));
             let edit = BufferEdit {
                 start: pos.max(0) as usize,
                 deleted_len: del.max(0) as usize,
-                inserted_text: Arc::new(inserted_text(buf, pos, ins)),
+                inserted_text: shared_inserted_text,
             };
 
             let is_applying_navigation = *applying_history_navigation

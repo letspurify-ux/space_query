@@ -117,10 +117,9 @@ fn apply_incremental_highlight_for_test(
             deleted_len,
             inserted_text,
             deleted_text,
-            defer_semantic_alias_context: false,
         },
         &applied_edit,
-        |_text, _styles, _start, _end| true,
+        |_styles, _start, _end, _requires_raw_bytes| true,
     )?;
 
     shadow.all_styles_string()

@@ -21,6 +21,9 @@ pub const MAX_CONNECTION_POOL_SIZE: u32 = 16;
 pub const DEFAULT_LAZY_FETCH_BATCH_SIZE: u32 = 100;
 pub const MIN_LAZY_FETCH_BATCH_SIZE: u32 = 1;
 pub const MAX_LAZY_FETCH_BATCH_SIZE: u32 = 10_000;
+pub const DEFAULT_INTELLISENSE_CONTEXT_WINDOW_KIB: u32 = 16;
+pub const MIN_INTELLISENSE_CONTEXT_WINDOW_KIB: u32 = 8;
+pub const MAX_INTELLISENSE_CONTEXT_WINDOW_KIB: u32 = 4 * 1024;
 pub const DEFAULT_CANCEL_TIMEOUT_SECONDS: u32 = 60;
 pub const MIN_CANCEL_TIMEOUT_SECONDS: u32 = 1;
 pub const MAX_CANCEL_TIMEOUT_SECONDS: u32 = 120;
@@ -49,6 +52,7 @@ pub struct AppConfig {
     pub result_font_size: u32,
     pub result_cell_max_chars: u32,
     pub lazy_fetch_batch_size: u32,
+    pub intellisense_context_window_kib: u32,
     pub max_rows: u32,
     pub auto_commit: bool,
     pub connection_pool_size: u32,
@@ -86,6 +90,7 @@ impl AppConfig {
             result_font_size: 16,
             result_cell_max_chars: DEFAULT_RESULT_CELL_MAX_CHARS,
             lazy_fetch_batch_size: DEFAULT_LAZY_FETCH_BATCH_SIZE,
+            intellisense_context_window_kib: DEFAULT_INTELLISENSE_CONTEXT_WINDOW_KIB,
             max_rows: 1000,
             auto_commit: false,
             connection_pool_size: DEFAULT_CONNECTION_POOL_SIZE,
@@ -109,6 +114,25 @@ impl AppConfig {
 
     pub fn normalized_lazy_fetch_batch_size(&self) -> u32 {
         Self::clamp_lazy_fetch_batch_size(self.lazy_fetch_batch_size)
+    }
+
+    pub fn clamp_intellisense_context_window_kib(size: u32) -> u32 {
+        size.clamp(
+            MIN_INTELLISENSE_CONTEXT_WINDOW_KIB,
+            MAX_INTELLISENSE_CONTEXT_WINDOW_KIB,
+        )
+    }
+
+    pub fn intellisense_context_window_bytes(size_kib: u32) -> usize {
+        (Self::clamp_intellisense_context_window_kib(size_kib) as usize).saturating_mul(1024)
+    }
+
+    pub fn normalized_intellisense_context_window_kib(&self) -> u32 {
+        Self::clamp_intellisense_context_window_kib(self.intellisense_context_window_kib)
+    }
+
+    pub fn normalized_intellisense_context_window_bytes(&self) -> usize {
+        Self::intellisense_context_window_bytes(self.intellisense_context_window_kib)
     }
 
     pub fn clamp_cancel_timeout_seconds(seconds: u32) -> u32 {
@@ -478,6 +502,14 @@ mod tests {
     }
 
     #[test]
+    fn app_config_defaults_intellisense_context_window_to_sixteen_kib() {
+        assert_eq!(
+            AppConfig::new().intellisense_context_window_kib,
+            super::DEFAULT_INTELLISENSE_CONTEXT_WINDOW_KIB
+        );
+    }
+
+    #[test]
     fn app_config_defaults_result_cell_max_chars_to_one_hundred_fifty() {
         assert_eq!(
             AppConfig::new().result_cell_max_chars,
@@ -540,6 +572,20 @@ mod tests {
     }
 
     #[test]
+    fn app_config_clamps_intellisense_context_window_to_supported_range() {
+        assert_eq!(AppConfig::clamp_intellisense_context_window_kib(0), 8);
+        assert_eq!(AppConfig::clamp_intellisense_context_window_kib(128), 128);
+        assert_eq!(
+            AppConfig::clamp_intellisense_context_window_kib(10_000),
+            4 * 1024
+        );
+        assert_eq!(
+            AppConfig::intellisense_context_window_bytes(128),
+            128 * 1024
+        );
+    }
+
+    #[test]
     fn app_config_clamps_cancel_timeout_to_supported_range() {
         assert_eq!(AppConfig::clamp_cancel_timeout_seconds(0), 1);
         assert_eq!(AppConfig::clamp_cancel_timeout_seconds(30), 30);
@@ -578,6 +624,10 @@ mod tests {
         assert_eq!(
             restored.lazy_fetch_batch_size,
             super::DEFAULT_LAZY_FETCH_BATCH_SIZE
+        );
+        assert_eq!(
+            restored.intellisense_context_window_kib,
+            super::DEFAULT_INTELLISENSE_CONTEXT_WINDOW_KIB
         );
         assert_eq!(
             restored.cancel_timeout_seconds,
@@ -690,6 +740,7 @@ mod tests {
         let mut config = AppConfig::new();
         config.connection_pool_size = 8;
         config.lazy_fetch_batch_size = 500;
+        config.intellisense_context_window_kib = 256;
         config.cancel_timeout_seconds = 9;
         config.recent_connections.push(ConnectionInfo {
             name: "prod".to_string(),
@@ -707,6 +758,7 @@ mod tests {
 
         assert!(serialized.contains("\"connection_pool_size\":8"));
         assert!(serialized.contains("\"lazy_fetch_batch_size\":500"));
+        assert!(serialized.contains("\"intellisense_context_window_kib\":256"));
         assert!(serialized.contains("\"cancel_timeout_seconds\":9"));
         assert!(!serialized.contains("secret"));
         assert!(!serialized.contains("debug_oracle_thin_protocol_version"));

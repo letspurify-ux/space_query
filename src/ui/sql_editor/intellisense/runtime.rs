@@ -453,6 +453,7 @@ impl SqlEditorWidget {
                         &text_shadow_for_insert,
                         cursor_pos,
                         preferred_db_type,
+                        intellisense_runtime_for_insert.context_window_bytes(),
                     ));
                 let context = detect_sql_context(&context_text, context_text.len());
                 if matches!(context, SqlContext::TableName) {
@@ -564,6 +565,7 @@ impl SqlEditorWidget {
         let dnd_scroll_origin_for_handle = Arc::new(Mutex::new(None::<(i32, i32)>));
         let preferred_insert_position_for_handle = self.preferred_insert_position.clone();
         let undo_redo_state_for_handle = self.undo_redo_state.clone();
+        let pending_paste_text_for_handle = self.pending_paste_text.clone();
         let display_metrics_ready_for_handle = self.display_metrics_ready.clone();
         #[cfg(target_os = "macos")]
         let hangul_repair_for_handle = Arc::new(Mutex::new(
@@ -576,6 +578,12 @@ impl SqlEditorWidget {
             Arc::new(Mutex::new(None));
 
         editor.handle(move |ed, ev| {
+            if ev != Event::Paste {
+                pending_paste_text_for_handle
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .take();
+            }
             if Self::should_consume_pointer_event_until_display_metrics_ready(
                 display_metrics_ready_for_handle.load(Ordering::Acquire),
                 ev,
@@ -1474,12 +1482,6 @@ impl SqlEditorWidget {
                     // Handle typing - update intellisense filter
                     let preferred_db_type = intellisense_runtime_for_handle
                         .db_type_without_blocking(&connection_for_handle);
-                    let (word, word_start, _) = Self::word_at_cursor_for_db(
-                        &buffer_for_handle,
-                        &text_shadow_for_handle,
-                        cursor_pos,
-                        Some(preferred_db_type),
-                    );
                     let buffer_len = buffer_for_handle.length();
 
                     let fast_path_applied = if popup_visible {
@@ -1496,6 +1498,16 @@ impl SqlEditorWidget {
                         )
                     } else {
                         false
+                    };
+                    let (word, word_start, _) = if fast_path_applied {
+                        (String::new(), cursor_pos.max(0) as usize, cursor_pos.max(0) as usize)
+                    } else {
+                        Self::word_at_cursor_for_db(
+                            &buffer_for_handle,
+                            &text_shadow_for_handle,
+                            cursor_pos,
+                            Some(preferred_db_type),
+                        )
                     };
 
                     if fast_path_applied {
@@ -1556,37 +1568,64 @@ impl SqlEditorWidget {
                             // the slot has a known completion (the enclosing
                             // object's name / the construct qualifier) — those
                             // never get a 2-char prefix to trigger on otherwise.
-                            let bounded_auto_trigger_text = (ch.is_whitespace()
+                            let auto_trigger_base = ch.is_whitespace()
                                 && word.is_empty()
-                                && qualifier.is_none())
-                                .then(|| {
-                                    text_shadow_for_handle
+                                && qualifier.is_none();
+                            let db_type =
+                                Some(intellisense_runtime_for_handle.cached_db_type());
+                            let cursor = cursor_pos.max(0) as usize;
+                            let (context_lookbehind, context_lookahead) =
+                                Self::intellisense_context_lookaround(
+                                    intellisense_runtime_for_handle.context_window_bytes(),
+                                );
+                            let end_slot_auto_trigger = if auto_trigger_base {
+                                let follows_end = {
+                                    let shadow = text_shadow_for_handle
                                         .lock()
-                                        .unwrap_or_else(|poisoned| poisoned.into_inner())
-                                        .bounded_text_around(
-                                            cursor_pos.max(0) as usize,
-                                            INTELLISENSE_STATEMENT_WINDOW as usize,
-                                            INTELLISENSE_STATEMENT_WINDOW as usize,
+                                        .unwrap_or_else(|poisoned| poisoned.into_inner());
+                                    let (suffix, _, relative_cursor) =
+                                        shadow.bounded_text_around(cursor, 64, 0);
+                                    Self::cursor_follows_end_keyword_word_in_text(
+                                        &suffix,
+                                        relative_cursor,
+                                    )
+                                };
+                                follows_end
+                                    && {
+                                        let shadow = text_shadow_for_handle
+                                            .lock()
+                                            .unwrap_or_else(|poisoned| poisoned.into_inner());
+                                        let (text, _, relative_cursor) = shadow.bounded_text_around(
+                                            cursor,
+                                            context_lookbehind,
+                                            context_lookahead,
+                                        );
+                                        Self::plsql_end_auto_trigger_applies_in_text(
+                                            &text,
+                                            relative_cursor,
+                                            db_type,
                                         )
-                                });
-                            let end_slot_auto_trigger = bounded_auto_trigger_text
-                                .as_ref()
-                                .is_some_and(|(text, _, cursor)| {
-                                    Self::plsql_end_auto_trigger_applies_in_text(
-                                        text,
-                                        *cursor,
-                                        Some(intellisense_runtime_for_handle.cached_db_type()),
-                                    )
-                                });
-                            let execute_immediate_tail_auto_trigger = bounded_auto_trigger_text
-                                .as_ref()
-                                .is_some_and(|(text, _, cursor)| {
-                                    Self::plsql_execute_immediate_tail_auto_trigger_applies_in_text(
-                                        text,
-                                        *cursor,
-                                        Some(intellisense_runtime_for_handle.cached_db_type()),
-                                    )
-                                });
+                                    }
+                            } else {
+                                false
+                            };
+                            let execute_immediate_tail_auto_trigger = if auto_trigger_base {
+                                let shadow = text_shadow_for_handle
+                                    .lock()
+                                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                                let (text, _, relative_cursor) = shadow.bounded_text_around(
+                                    cursor,
+                                    context_lookbehind,
+                                    0,
+                                );
+                                Self::plsql_execute_immediate_tail_auto_trigger_applies_in_text(
+                                    &text,
+                                    relative_cursor,
+                                    db_type,
+                                )
+                            } else {
+                                false
+                            };
                             if end_slot_auto_trigger
                                 || execute_immediate_tail_auto_trigger
                                 || Self::should_auto_trigger_intellisense_for_forced_char(
@@ -1775,8 +1814,19 @@ impl SqlEditorWidget {
                 }
                 Event::Paste => {
                     let Some(drop) = Self::take_pending_dnd_drop(&dnd_drop_state_for_handle) else {
+                        let event_text = app::event_text();
+                        if !event_text.is_empty() {
+                            *pending_paste_text_for_handle
+                                .lock()
+                                .unwrap_or_else(|poisoned| poisoned.into_inner()) =
+                                Some(Arc::new(event_text));
+                        }
                         return false;
                     };
+                    pending_paste_text_for_handle
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .take();
                     let scroll_origin = Self::take_dnd_scroll_origin(&dnd_scroll_origin_for_handle);
                     Self::set_dnd_drop_target_active(ed, false);
 

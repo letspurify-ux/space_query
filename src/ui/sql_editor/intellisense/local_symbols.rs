@@ -5,7 +5,7 @@ const PLSQL_COLLECTION_METHODS: &[&str] = &[
     "COUNT", "DELETE", "EXISTS", "EXTEND", "FIRST", "LAST", "LIMIT", "NEXT", "PRIOR", "TRIM",
 ];
 
-#[derive(Clone)]
+#[derive(Clone, Default)]
 struct ExpandedStatementWindow {
     dependency_start: usize,
     statement_start: usize,
@@ -13,6 +13,13 @@ struct ExpandedStatementWindow {
     text: String,
     cursor_in_statement: usize,
 }
+
+type ExpandedStatementAnalysis = (
+    ExpandedStatementWindow,
+    Vec<String>,
+    Vec<ParsedDeclarationSymbol>,
+    Option<(Vec<SqlTokenSpan>, super::query_text::LocalAliasContext)>,
+);
 
 struct BoundedIntellisenseParseText {
     text: SharedTextSlice,
@@ -110,17 +117,10 @@ struct ResolvedLocalMemberScope {
 }
 
 impl SqlEditorWidget {
-    const FAST_INTELLISENSE_PARSE_LOOKBEHIND_BYTES: usize = 8 * 1024;
-    const FAST_INTELLISENSE_PARSE_LOOKAHEAD_BYTES: usize = 8 * 1024;
-    const FAST_INTELLISENSE_PARSE_WINDOW_BYTES: usize =
-        Self::FAST_INTELLISENSE_PARSE_LOOKBEHIND_BYTES
-            + Self::FAST_INTELLISENSE_PARSE_LOOKAHEAD_BYTES;
-    const BOUNDED_INTELLISENSE_PARSE_LOOKBEHIND_BYTES: usize =
-        INTELLISENSE_STATEMENT_WINDOW as usize;
-    const BOUNDED_INTELLISENSE_PARSE_LOOKAHEAD_BYTES: usize =
-        INTELLISENSE_STATEMENT_WINDOW as usize;
-    const BOUNDED_INTELLISENSE_PARSE_WINDOW_BYTES: usize =
-        (INTELLISENSE_STATEMENT_WINDOW as usize) * 2;
+    fn intellisense_context_lookaround(context_window_bytes: usize) -> (usize, usize) {
+        let lookbehind = crate::utils::arithmetic::safe_div(context_window_bytes, 2);
+        (lookbehind, context_window_bytes.saturating_sub(lookbehind))
+    }
 
     fn expanded_statement_starts_inside_block_comment(expanded: &ExpandedStatementWindow) -> bool {
         let prefix = expanded
@@ -161,18 +161,7 @@ impl SqlEditorWidget {
         false
     }
 
-    fn bounded_intellisense_parse_text_from_chunked(
-        text: &ChunkedText,
-        cursor_pos: usize,
-    ) -> BoundedIntellisenseParseText {
-        Self::bounded_intellisense_parse_text_from_chunked_with_window(
-            text,
-            cursor_pos,
-            Self::BOUNDED_INTELLISENSE_PARSE_LOOKBEHIND_BYTES,
-            Self::BOUNDED_INTELLISENSE_PARSE_LOOKAHEAD_BYTES,
-        )
-    }
-
+    #[cfg(test)]
     fn bounded_intellisense_parse_text_from_chunked_with_window(
         text: &ChunkedText,
         cursor_pos: usize,
@@ -187,7 +176,9 @@ impl SqlEditorWidget {
                 .min(text.len()),
         );
         BoundedIntellisenseParseText {
-            text: text.range_string(start, end).unwrap_or_default().into(),
+            text: text
+                .shared_or_owned_range(start, end)
+                .unwrap_or_else(|| SharedTextSlice::whole(Arc::new(String::new()))),
             start,
             cursor_pos,
         }
@@ -197,30 +188,32 @@ impl SqlEditorWidget {
         analysis: &CursorAnalysisSnapshot,
     ) -> BoundedIntellisenseParseText {
         BoundedIntellisenseParseText {
-            text: SharedTextSlice::whole(analysis.fast_text.clone()),
+            text: analysis.fast_text.clone(),
             start: analysis.fast_start,
             cursor_pos: analysis.cursor_pos,
         }
     }
 
-    fn bounded_intellisense_parse_text_from_text(
+    #[cfg(test)]
+    fn bounded_intellisense_parse_text_from_text_with_window(
         full_text: &str,
         cursor_pos: usize,
+        context_window_bytes: usize,
     ) -> BoundedIntellisenseParseText {
+        let (lookbehind_bytes, lookahead_bytes) =
+            Self::intellisense_context_lookaround(context_window_bytes);
         let text_len = full_text.len();
         let cursor_pos = Self::clamp_to_char_boundary_local(full_text, cursor_pos.min(text_len));
         let start = Self::clamp_to_char_boundary_forward_local(
             full_text,
-            cursor_pos.saturating_sub(Self::BOUNDED_INTELLISENSE_PARSE_LOOKBEHIND_BYTES),
+            cursor_pos.saturating_sub(lookbehind_bytes),
         );
         let end = Self::clamp_to_char_boundary_local(
             full_text,
-            cursor_pos
-                .saturating_add(Self::BOUNDED_INTELLISENSE_PARSE_LOOKAHEAD_BYTES)
-                .min(text_len),
+            cursor_pos.saturating_add(lookahead_bytes).min(text_len),
         );
         let text = full_text.get(start..end).unwrap_or("").to_string();
-        debug_assert!(text.len() <= Self::BOUNDED_INTELLISENSE_PARSE_WINDOW_BYTES);
+        debug_assert!(text.len() <= context_window_bytes.saturating_add(3));
         BoundedIntellisenseParseText {
             text: text.into(),
             start,
@@ -320,36 +313,6 @@ impl SqlEditorWidget {
             statement_start,
             statement_end,
         ))
-    }
-
-    fn bounded_statement_needs_wider_window(
-        bounded: &BoundedIntellisenseParseText,
-        expanded: &ExpandedStatementWindow,
-        document_len: usize,
-    ) -> bool {
-        let bounded_end = bounded.start.saturating_add(bounded.text.len());
-        if (bounded.start > 0 && expanded.statement_start <= bounded.start)
-            || (bounded_end < document_len && expanded.statement_end >= bounded_end)
-        {
-            return true;
-        }
-
-        // Inner semicolons make a clipped procedural unit look like a small
-        // standalone statement even when its declaration/root is before the
-        // current window. Widen only procedural-looking fragments; ordinary
-        // nearby statements in a huge script stay on the small fast path.
-        if bounded.start == 0 && bounded_end >= document_len {
-            return false;
-        }
-        let upper = expanded.text.to_ascii_uppercase();
-        let trimmed = upper.trim_start();
-        trimmed == "BEGIN"
-            || trimmed.starts_with("BEGIN\n")
-            || trimmed.starts_with("BEGIN ")
-            || trimmed.starts_with("DECLARE\n")
-            || trimmed.starts_with("DECLARE ")
-            || upper.contains("\nBEGIN\n")
-            || upper.contains("\nBEGIN ")
     }
 
     /// Recover the enclosing Oracle PL/SQL execution unit when the generic
@@ -618,23 +581,36 @@ impl SqlEditorWidget {
         label_start
     }
 
+    #[cfg(test)]
     fn expanded_statement_window_and_text_binds_from_cursor_analysis(
         analysis: &CursorAnalysisSnapshot,
         preferred_db_type: Option<crate::db::connection::DatabaseType>,
-    ) -> (
-        ExpandedStatementWindow,
-        Vec<String>,
-        Vec<ParsedDeclarationSymbol>,
-        Option<(Vec<SqlTokenSpan>, super::query_text::LocalAliasContext)>,
-    ) {
+    ) -> ExpandedStatementAnalysis {
+        Self::expanded_statement_window_and_text_binds_from_cursor_analysis_cancellable(
+            analysis,
+            preferred_db_type,
+            None,
+        )
+        .unwrap_or_default()
+    }
+
+    fn expanded_statement_window_and_text_binds_from_cursor_analysis_cancellable(
+        analysis: &CursorAnalysisSnapshot,
+        preferred_db_type: Option<crate::db::connection::DatabaseType>,
+        cancellation: Option<&IntellisenseCancellation>,
+    ) -> Option<ExpandedStatementAnalysis> {
+        if cancellation.is_some_and(IntellisenseCancellation::is_cancelled) {
+            return None;
+        }
         let bounded = Self::bounded_intellisense_parse_text_from_cursor_analysis(analysis);
         let (expanded, text_bind_names, package_spec_symbols) =
             Self::expanded_statement_window_and_text_binds_from_bounded(
-                &analysis.text_snapshot,
-                analysis.cursor_pos,
                 preferred_db_type,
                 bounded,
             );
+        if cancellation.is_some_and(IntellisenseCancellation::is_cancelled) {
+            return None;
+        }
         let mysql_compatible =
             sql_text::mysql_compatibility_for_sql(&expanded.text, preferred_db_type);
         let shared_sql_context = analysis.shared_sql_context.clone().and_then(|context| {
@@ -644,12 +620,12 @@ impl SqlEditorWidget {
                 mysql_compatible,
             )
         });
-        (
+        Some((
             expanded,
             text_bind_names,
             package_spec_symbols,
             shared_sql_context,
-        )
+        ))
     }
 
     #[cfg(test)]
@@ -657,51 +633,28 @@ impl SqlEditorWidget {
         text_snapshot: &ChunkedText,
         cursor_pos: usize,
         preferred_db_type: Option<crate::db::connection::DatabaseType>,
+        context_window_bytes: usize,
     ) -> (ExpandedStatementWindow, Vec<String>, Vec<ParsedDeclarationSymbol>) {
+        let (lookbehind_bytes, lookahead_bytes) =
+            Self::intellisense_context_lookaround(context_window_bytes);
         let bounded = Self::bounded_intellisense_parse_text_from_chunked_with_window(
             text_snapshot,
             cursor_pos,
-            Self::FAST_INTELLISENSE_PARSE_LOOKBEHIND_BYTES,
-            Self::FAST_INTELLISENSE_PARSE_LOOKAHEAD_BYTES,
+            lookbehind_bytes,
+            lookahead_bytes,
         );
         Self::expanded_statement_window_and_text_binds_from_bounded(
-            text_snapshot,
-            cursor_pos,
             preferred_db_type,
             bounded,
         )
     }
 
     fn expanded_statement_window_and_text_binds_from_bounded(
-        text_snapshot: &ChunkedText,
-        cursor_pos: usize,
         preferred_db_type: Option<crate::db::connection::DatabaseType>,
-        mut bounded: BoundedIntellisenseParseText,
+        bounded: BoundedIntellisenseParseText,
     ) -> (ExpandedStatementWindow, Vec<String>, Vec<ParsedDeclarationSymbol>) {
-        debug_assert!(
-            bounded.text.len() <= Self::FAST_INTELLISENSE_PARSE_WINDOW_BYTES.saturating_add(3),
-            "fast IntelliSense window exceeded its cap: len={}, start={}, cursor={}, document_len={}",
-            bounded.text.len(),
-            bounded.start,
-            bounded.cursor_pos,
-            text_snapshot.len()
-        );
-        let mut expanded =
+        let expanded =
             Self::expanded_statement_window_in_bounded_text_for_db_type(&bounded, preferred_db_type);
-        if text_snapshot.len() <= Self::BOUNDED_INTELLISENSE_PARSE_WINDOW_BYTES
-            || Self::bounded_statement_needs_wider_window(
-                &bounded,
-                &expanded,
-                text_snapshot.len(),
-            )
-        {
-            bounded =
-                Self::bounded_intellisense_parse_text_from_chunked(text_snapshot, cursor_pos);
-            expanded = Self::expanded_statement_window_in_bounded_text_for_db_type(
-                &bounded,
-                preferred_db_type,
-            );
-        }
         let relative_statement_start = expanded
             .statement_start
             .saturating_sub(bounded.start)
@@ -788,32 +741,76 @@ impl SqlEditorWidget {
             super::query_text::LocalAliasContext,
         )>,
     ) -> RoutineSymbolCacheEntry {
+        Self::build_routine_symbol_cache_entry_with_token_spans_cancellable(
+            buffer_revision,
+            expanded_statement,
+            text_bind_names,
+            package_spec_symbols,
+            preferred_db_type,
+            shared_sql_context,
+            None,
+        )
+        .unwrap_or_default()
+    }
+
+    fn build_routine_symbol_cache_entry_with_token_spans_cancellable(
+        buffer_revision: u64,
+        expanded_statement: &ExpandedStatementWindow,
+        text_bind_names: Vec<String>,
+        package_spec_symbols: &[ParsedDeclarationSymbol],
+        preferred_db_type: Option<crate::db::connection::DatabaseType>,
+        shared_sql_context: Option<(
+            Vec<SqlTokenSpan>,
+            super::query_text::LocalAliasContext,
+        )>,
+        cancellation: Option<&IntellisenseCancellation>,
+    ) -> Option<RoutineSymbolCacheEntry> {
+        if cancellation.is_some_and(IntellisenseCancellation::is_cancelled) {
+            return None;
+        }
         let mysql_compatible =
             sql_text::mysql_compatibility_for_sql(&expanded_statement.text, preferred_db_type);
-        let (token_spans, alias_context) = shared_sql_context.unwrap_or_else(|| {
-            let token_spans = super::query_text::tokenize_sql_spanned_with_mysql_compat(
-                &expanded_statement.text,
-                mysql_compatible,
-            );
-            let alias_context =
-                super::query_text::collect_local_alias_context_from_spans(&token_spans);
-            (token_spans, alias_context)
-        });
+        let (token_spans, alias_context) = match shared_sql_context {
+            Some(shared) => shared,
+            None => {
+                let token_spans =
+                    super::query_text::tokenize_sql_spanned_with_mysql_compat_and_cancel(
+                        &expanded_statement.text,
+                        mysql_compatible,
+                        || {
+                            cancellation
+                                .is_some_and(IntellisenseCancellation::is_cancelled)
+                        },
+                    )?;
+                if cancellation.is_some_and(IntellisenseCancellation::is_cancelled) {
+                    return None;
+                }
+                let alias_context =
+                    super::query_text::collect_local_alias_context_from_spans(&token_spans);
+                (token_spans, alias_context)
+            }
+        };
         let (local_scopes, local_symbols) = Self::analyze_local_scopes_and_symbols(
             &expanded_statement.text,
             &token_spans,
             mysql_compatible,
             completion_db_type_is_mariadb(preferred_db_type),
             package_spec_symbols,
-        );
+            cancellation,
+        )?;
         let mut statement_tokens = Vec::with_capacity(token_spans.len());
         let mut token_ends = Vec::with_capacity(token_spans.len());
-        for span in token_spans {
+        for (idx, span) in token_spans.into_iter().enumerate() {
+            if idx & 0xff == 0
+                && cancellation.is_some_and(IntellisenseCancellation::is_cancelled)
+            {
+                return None;
+            }
             token_ends.push(span.end);
             statement_tokens.push(span.token);
         }
 
-        RoutineSymbolCacheEntry {
+        Some(RoutineSymbolCacheEntry {
             buffer_revision,
             dependency_start: expanded_statement.dependency_start,
             statement_start: expanded_statement.statement_start,
@@ -824,7 +821,7 @@ impl SqlEditorWidget {
             local_symbols: local_symbols.into(),
             text_bind_names: text_bind_names.into(),
             alias_context: Arc::new(alias_context),
-        }
+        })
     }
 
     fn session_bind_names(runtime: &IntellisenseRuntimeState) -> Vec<String> {
@@ -2059,7 +2056,11 @@ impl SqlEditorWidget {
         mysql_compatible: bool,
         mariadb: bool,
         extra_root_symbols: &[ParsedDeclarationSymbol],
-    ) -> (Vec<LocalScope>, Vec<LocalSymbolEntry>) {
+        cancellation: Option<&IntellisenseCancellation>,
+    ) -> Option<(Vec<LocalScope>, Vec<LocalSymbolEntry>)> {
+        if cancellation.is_some_and(IntellisenseCancellation::is_cancelled) {
+            return None;
+        }
         let statement_len = statement_text.len();
         let root_begins_with_begin = token_spans.iter().find_map(|span| match &span.token {
             SqlToken::Word(word) => Some(word.eq_ignore_ascii_case("BEGIN")),
@@ -2113,9 +2114,14 @@ impl SqlEditorWidget {
         let mut skip_token_idx = None::<usize>;
         let mut idx = 0usize;
         let previous_meaningful_word_is_end =
-            Self::previous_meaningful_word_is_end(token_spans);
+            Self::previous_meaningful_word_is_end(token_spans, cancellation)?;
 
         while idx < token_spans.len() {
+            if idx & 0xff == 0
+                && cancellation.is_some_and(IntellisenseCancellation::is_cancelled)
+            {
+                return None;
+            }
             if skip_token_idx == Some(idx) {
                 idx += 1;
                 continue;
@@ -2643,6 +2649,11 @@ impl SqlEditorWidget {
         }
 
         for (scope_id, scope) in scopes.iter().enumerate() {
+            if scope_id & 0x3f == 0
+                && cancellation.is_some_and(IntellisenseCancellation::is_cancelled)
+            {
+                return None;
+            }
             let Some(decl_start_idx) = scope.decl_start_idx else {
                 continue;
             };
@@ -2652,7 +2663,7 @@ impl SqlEditorWidget {
             if decl_start_idx >= decl_end_idx || decl_start_idx >= token_spans.len() {
                 continue;
             }
-            Self::collect_scope_declaration_symbols(
+            if !Self::collect_scope_declaration_symbols(
                 scope_id,
                 token_spans,
                 decl_start_idx,
@@ -2663,19 +2674,36 @@ impl SqlEditorWidget {
                     .unwrap_or(&[]),
                 &mut symbols,
                 &mut seen_symbol_keys,
-            );
+                cancellation,
+            ) {
+                return None;
+            }
         }
 
         let scopes: Vec<LocalScope> = scopes.into_iter().map(|builder| builder.scope).collect();
-        Self::resolve_deferred_local_record_members(&scopes, &mut symbols);
-        (scopes, symbols)
+        if cancellation.is_some_and(IntellisenseCancellation::is_cancelled) {
+            return None;
+        }
+        if !Self::resolve_deferred_local_record_members(&scopes, &mut symbols, cancellation) {
+            return None;
+        }
+        (!cancellation.is_some_and(IntellisenseCancellation::is_cancelled))
+            .then_some((scopes, symbols))
     }
 
-    fn previous_meaningful_word_is_end(token_spans: &[SqlTokenSpan]) -> Vec<bool> {
+    fn previous_meaningful_word_is_end(
+        token_spans: &[SqlTokenSpan],
+        cancellation: Option<&IntellisenseCancellation>,
+    ) -> Option<Vec<bool>> {
         let mut previous_word_is_end = Vec::with_capacity(token_spans.len());
         let mut is_end = false;
 
-        for token in token_spans {
+        for (idx, token) in token_spans.iter().enumerate() {
+            if idx & 0xff == 0
+                && cancellation.is_some_and(IntellisenseCancellation::is_cancelled)
+            {
+                return None;
+            }
             previous_word_is_end.push(is_end);
             match &token.token {
                 SqlToken::Comment(_) => {}
@@ -2684,7 +2712,7 @@ impl SqlEditorWidget {
             }
         }
 
-        previous_word_is_end
+        Some(previous_word_is_end)
     }
 
     fn collect_scope_declaration_symbols(
@@ -2695,10 +2723,16 @@ impl SqlEditorWidget {
         child_ranges: &[(usize, usize)],
         symbols: &mut Vec<LocalSymbolEntry>,
         seen_symbol_keys: &mut HashSet<(usize, usize, String)>,
-    ) {
+        cancellation: Option<&IntellisenseCancellation>,
+    ) -> bool {
         let mut child_idx = 0usize;
         let mut idx = decl_start_idx;
         while idx < decl_end_idx {
+            if idx & 0xff == 0
+                && cancellation.is_some_and(IntellisenseCancellation::is_cancelled)
+            {
+                return false;
+            }
             while child_idx < child_ranges.len() && child_ranges[child_idx].1 <= idx {
                 child_idx += 1;
             }
@@ -2753,6 +2787,7 @@ impl SqlEditorWidget {
 
             idx = item_end;
         }
+        !cancellation.is_some_and(IntellisenseCancellation::is_cancelled)
     }
 
     fn extract_declaration_symbol_from_item(item: &[SqlTokenSpan]) -> Option<ParsedDeclarationSymbol> {
@@ -3672,12 +3707,26 @@ impl SqlEditorWidget {
     fn resolve_deferred_local_record_members(
         scopes: &[LocalScope],
         symbols: &mut [LocalSymbolEntry],
-    ) {
+        cancellation: Option<&IntellisenseCancellation>,
+    ) -> bool {
+        if cancellation.is_some_and(IntellisenseCancellation::is_cancelled) {
+            return false;
+        }
         let scope_rank_by_scope = Self::local_scope_rank_maps(scopes);
 
-        for _ in 0..symbols.len() {
+        for pass in 0..symbols.len() {
+            if pass & 0x0f == 0
+                && cancellation.is_some_and(IntellisenseCancellation::is_cancelled)
+            {
+                return false;
+            }
             let mut candidates_by_upper = HashMap::<String, Vec<usize>>::new();
             for (idx, symbol) in symbols.iter().enumerate() {
+                if idx & 0x3f == 0
+                    && cancellation.is_some_and(IntellisenseCancellation::is_cancelled)
+                {
+                    return false;
+                }
                 if symbol.members.is_empty()
                     && !symbol.member_source_is_rowtype
                     && !symbol.member_source_is_collection_like
@@ -3698,6 +3747,11 @@ impl SqlEditorWidget {
             let mut resolved_visible_member_flags = vec![None; symbols.len()];
 
             for (idx, symbol) in symbols.iter().enumerate() {
+                if idx & 0x3f == 0
+                    && cancellation.is_some_and(IntellisenseCancellation::is_cancelled)
+                {
+                    return false;
+                }
                 let Some(source_upper) = symbol.member_source_upper.as_deref() else {
                     continue;
                 };
@@ -3826,6 +3880,7 @@ impl SqlEditorWidget {
                 break;
             }
         }
+        !cancellation.is_some_and(IntellisenseCancellation::is_cancelled)
     }
 
     fn local_scope_rank_maps(scopes: &[LocalScope]) -> Vec<HashMap<usize, usize>> {
@@ -5233,12 +5288,30 @@ impl SqlEditorWidget {
         cursor_pos: usize,
         db_type: Option<crate::db::connection::DatabaseType>,
     ) -> (RoutineSymbolCacheEntry, ExpandedStatementWindow) {
+        Self::build_routine_symbol_cache_bundle_for_test_with_context_window(
+            full_text,
+            cursor_pos,
+            db_type,
+            AppConfig::intellisense_context_window_bytes(
+                crate::utils::DEFAULT_INTELLISENSE_CONTEXT_WINDOW_KIB,
+            ),
+        )
+    }
+
+    #[cfg(test)]
+    fn build_routine_symbol_cache_bundle_for_test_with_context_window(
+        full_text: &str,
+        cursor_pos: usize,
+        db_type: Option<crate::db::connection::DatabaseType>,
+        context_window_bytes: usize,
+    ) -> (RoutineSymbolCacheEntry, ExpandedStatementWindow) {
         let snapshot = ChunkedText::from_str(full_text);
         let (expanded, text_bind_names, package_spec_symbols) =
             Self::expanded_statement_window_and_text_binds_from_snapshot(
                 &snapshot,
                 cursor_pos,
                 db_type,
+                context_window_bytes,
             );
         let routine_cache = Self::build_routine_symbol_cache_entry(
             0,

@@ -5,6 +5,16 @@ fn lock_or_recover<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     }
 }
 
+fn default_intellisense_test_context_window_bytes() -> usize {
+    AppConfig::intellisense_context_window_bytes(
+        crate::utils::DEFAULT_INTELLISENSE_CONTEXT_WINDOW_KIB,
+    )
+}
+
+fn wide_intellisense_test_context_window_bytes() -> usize {
+    AppConfig::intellisense_context_window_bytes(crate::utils::MAX_INTELLISENSE_CONTEXT_WINDOW_KIB)
+}
+
 fn runtime_state_for_test(
     completion_range: Option<(usize, usize)>,
     pending: Option<PendingIntellisense>,
@@ -1492,7 +1502,11 @@ fn analyze_full_script_marker_for_db(
         .find(CURSOR_MARKER)
         .expect("cursor marker should exist");
     let sql = script_with_cursor.replacen(CURSOR_MARKER, "", 1);
-    let bounded = SqlEditorWidget::bounded_intellisense_parse_text_from_text(&sql, cursor);
+    let bounded = SqlEditorWidget::bounded_intellisense_parse_text_from_text_with_window(
+        &sql,
+        cursor,
+        wide_intellisense_test_context_window_bytes(),
+    );
     let expanded = SqlEditorWidget::expanded_statement_window_in_bounded_text_for_db_type(
         &bounded,
         db_type,
@@ -6593,7 +6607,11 @@ fn bounded_statement_window_for_mysql_db_type_keeps_double_dash_arithmetic_as_co
         crate::db::connection::DatabaseType::MySQL,
         crate::db::connection::DatabaseType::MariaDB,
     ] {
-        let bounded = SqlEditorWidget::bounded_intellisense_parse_text_from_text(sql, cursor);
+        let bounded = SqlEditorWidget::bounded_intellisense_parse_text_from_text_with_window(
+            sql,
+            cursor,
+            wide_intellisense_test_context_window_bytes(),
+        );
         let expanded = SqlEditorWidget::expanded_statement_window_in_bounded_text_for_db_type(
             &bounded,
             Some(db),
@@ -6626,7 +6644,11 @@ USING (SELECT empno FROM emp) s
 ON (b.empno = s.empno
     AND (b.empno IS NOT NULL));"#;
     let cursor = sql.find("AND (").expect("MERGE predicate") + "AN".len();
-    let bounded = SqlEditorWidget::bounded_intellisense_parse_text_from_text(sql, cursor);
+    let bounded = SqlEditorWidget::bounded_intellisense_parse_text_from_text_with_window(
+        sql,
+        cursor,
+        wide_intellisense_test_context_window_bytes(),
+    );
     let expanded = SqlEditorWidget::expanded_statement_window_in_bounded_text_for_db_type(
         &bounded,
         Some(crate::db::connection::DatabaseType::Oracle),
@@ -6645,10 +6667,13 @@ ON (b.empno = s.empno
 
 #[test]
 fn async_intellisense_parse_text_is_hard_capped_around_cursor() {
+    let context_window_bytes = default_intellisense_test_context_window_bytes();
+    let (lookbehind_bytes, lookahead_bytes) =
+        SqlEditorWidget::intellisense_context_lookaround(context_window_bytes);
     let prefix_pad = "SELECT pad_col FROM pad_table;\n"
-        .repeat(SqlEditorWidget::BOUNDED_INTELLISENSE_PARSE_LOOKBEHIND_BYTES / 28 + 64);
+        .repeat(crate::utils::arithmetic::safe_div(lookbehind_bytes, 28).saturating_add(64));
     let suffix_pad = "SELECT tail_col FROM tail_table;\n"
-        .repeat(SqlEditorWidget::BOUNDED_INTELLISENSE_PARSE_LOOKAHEAD_BYTES / 31 + 64);
+        .repeat(crate::utils::arithmetic::safe_div(lookahead_bytes, 31).saturating_add(64));
 
     let mut sql = String::from("VAR far_outside NUMBER\n");
     sql.push_str(&prefix_pad);
@@ -6658,12 +6683,16 @@ fn async_intellisense_parse_text_is_hard_capped_around_cursor() {
     sql.push_str(&suffix_pad);
     sql.push_str("SELECT far_tail_marker FROM dual;\n");
 
-    let bounded = SqlEditorWidget::bounded_intellisense_parse_text_from_text(&sql, cursor);
+    let bounded = SqlEditorWidget::bounded_intellisense_parse_text_from_text_with_window(
+        &sql,
+        cursor,
+        context_window_bytes,
+    );
     assert!(
-        bounded.text.len() <= SqlEditorWidget::BOUNDED_INTELLISENSE_PARSE_WINDOW_BYTES,
+        bounded.text.len() <= context_window_bytes,
         "async parse text exceeded the hard cap: {} > {}",
         bounded.text.len(),
-        SqlEditorWidget::BOUNDED_INTELLISENSE_PARSE_WINDOW_BYTES
+        context_window_bytes
     );
     assert!(bounded.start > 0, "test setup should force a non-zero window start");
     assert!(
@@ -9332,8 +9361,11 @@ fn context_before_cursor_uses_window_slice_for_large_multiline_statement() {
 
 #[test]
 fn statement_context_window_clamps_utf8_start_boundary() {
+    let (lookbehind_bytes, _) = SqlEditorWidget::intellisense_context_lookaround(
+        wide_intellisense_test_context_window_bytes(),
+    );
     let mut sql = String::from("가");
-    sql.push_str(&"a".repeat(INTELLISENSE_STATEMENT_WINDOW as usize - 1));
+    sql.push_str(&"a".repeat(lookbehind_bytes.saturating_sub(1)));
     let cursor = sql.len();
 
     let context = SqlEditorWidget::statement_context_in_text(&sql, cursor);
@@ -9346,8 +9378,11 @@ fn statement_context_window_clamps_utf8_start_boundary() {
 
 #[test]
 fn context_before_cursor_window_clamps_utf8_start_boundary() {
+    let (lookbehind_bytes, _) = SqlEditorWidget::intellisense_context_lookaround(
+        wide_intellisense_test_context_window_bytes(),
+    );
     let mut sql = String::from("가");
-    sql.push_str(&"a".repeat(INTELLISENSE_CONTEXT_WINDOW as usize - 1));
+    sql.push_str(&"a".repeat(lookbehind_bytes.saturating_sub(1)));
     let cursor = sql.len();
 
     let context = SqlEditorWidget::context_before_cursor_in_text(&sql, cursor);
@@ -16692,6 +16727,7 @@ END;"#,
 
 #[test]
 fn million_line_oracle_plsql_completion_window_stays_hard_capped() {
+    let context_window_bytes = default_intellisense_test_context_window_bytes();
     let padding = "\n".repeat(500_005);
     let mut sql = padding.clone();
     sql.push_str("DECLARE v_cnt NUMBER := 0;\nBEGIN\n  EXIT WHE");
@@ -16703,9 +16739,13 @@ fn million_line_oracle_plsql_completion_window_stays_hard_capped() {
         sql.as_bytes().iter().filter(|byte| **byte == b'\n').count() > 1_000_000,
         "test input must exceed one million lines"
     );
-    let bounded = SqlEditorWidget::bounded_intellisense_parse_text_from_text(&sql, cursor);
+    let bounded = SqlEditorWidget::bounded_intellisense_parse_text_from_text_with_window(
+        &sql,
+        cursor,
+        context_window_bytes,
+    );
     assert!(
-        bounded.text.len() <= SqlEditorWidget::BOUNDED_INTELLISENSE_PARSE_WINDOW_BYTES,
+        bounded.text.len() <= context_window_bytes,
         "million-line input exceeded the bounded parse cap"
     );
     assert!(
@@ -16723,7 +16763,7 @@ fn million_line_oracle_plsql_completion_window_stays_hard_capped() {
         expanded.text
     );
     assert!(
-        expanded.text.len() <= SqlEditorWidget::BOUNDED_INTELLISENSE_PARSE_WINDOW_BYTES,
+        expanded.text.len() <= context_window_bytes,
         "recovered PL/SQL unit exceeded the bounded parse cap"
     );
 }
@@ -16736,6 +16776,9 @@ fn million_line_production_completion_index_uses_the_bounded_fast_path() {
     const LINES: usize = 1_000_001;
     let sql = LINE.repeat(LINES);
     let snapshot = ChunkedText::from_str(&sql);
+    let context_window_bytes = default_intellisense_test_context_window_bytes();
+    let (lookbehind_bytes, _) =
+        SqlEditorWidget::intellisense_context_lookaround(context_window_bytes);
     let cursor = 500_000usize
         .saturating_mul(LINE.len())
         .saturating_add("SELECT ".len());
@@ -16746,13 +16789,13 @@ fn million_line_production_completion_index_uses_the_bounded_fast_path() {
             &snapshot,
             cursor,
             Some(crate::db::DatabaseType::Oracle),
+            context_window_bytes,
         );
     let elapsed = started.elapsed();
 
     assert!(expanded.dependency_start > 0);
     assert!(
-        cursor.saturating_sub(expanded.dependency_start)
-            <= SqlEditorWidget::FAST_INTELLISENSE_PARSE_LOOKBEHIND_BYTES,
+        cursor.saturating_sub(expanded.dependency_start) <= lookbehind_bytes,
         "a local statement in a million-line script must stay on the small fast window"
     );
     assert!(
@@ -16781,20 +16824,12 @@ fn cursor_analysis_snapshot_shares_one_bounded_text_allocation() {
 
     assert!(analysis.fast_start > 0);
     assert!(
-        analysis.fast_text.len() <= SqlEditorWidget::FAST_INTELLISENSE_PARSE_WINDOW_BYTES
+        analysis.fast_text.len() <= default_intellisense_test_context_window_bytes()
     );
-    assert!(Arc::ptr_eq(
-        &analysis.fast_text,
-        &signature_scan_text.storage,
-    ));
-    assert!(Arc::ptr_eq(
-        &analysis.fast_text,
-        &text_after_cursor.storage,
-    ));
-    assert!(
-        analysis.text_snapshot.shares_storage_with(&snapshot),
-        "cursor analysis must O(1)-clone the persistent document snapshot"
-    );
+    assert!(analysis
+        .fast_text
+        .shares_storage_with(&signature_scan_text));
+    assert!(analysis.fast_text.shares_storage_with(&text_after_cursor));
 }
 
 #[test]
@@ -16805,6 +16840,7 @@ fn million_line_unterminated_statement_never_promotes_to_the_full_document() {
     const LINES: usize = 1_000_001;
     let sql = LINE.repeat(LINES);
     let snapshot = ChunkedText::from_str(&sql);
+    let context_window_bytes = default_intellisense_test_context_window_bytes();
     let cursor = 500_000usize
         .saturating_mul(LINE.len())
         .saturating_add("SELECT ".len());
@@ -16815,12 +16851,13 @@ fn million_line_unterminated_statement_never_promotes_to_the_full_document() {
             &snapshot,
             cursor,
             Some(crate::db::DatabaseType::Oracle),
+            context_window_bytes,
         );
     let elapsed = started.elapsed();
 
     assert!(expanded.dependency_start > 0);
     assert!(
-        expanded.text.len() <= SqlEditorWidget::BOUNDED_INTELLISENSE_PARSE_WINDOW_BYTES,
+        expanded.text.len() <= context_window_bytes,
         "even an unterminated statement must remain inside the hard parse cap"
     );
     assert!(
@@ -16920,11 +16957,11 @@ fn large_routine_cache_stays_bounded_and_keeps_nearby_block_symbols() {
     );
 
     assert!(
-        sql.len() > INTELLISENSE_STATEMENT_WINDOW as usize,
+        sql.len() > default_intellisense_test_context_window_bytes(),
         "generated procedure should exceed the default statement window"
     );
     assert!(
-        expanded.text.len() <= SqlEditorWidget::BOUNDED_INTELLISENSE_PARSE_WINDOW_BYTES,
+        expanded.text.len() <= default_intellisense_test_context_window_bytes(),
         "a clipped routine must not escape the hard IntelliSense parse cap"
     );
     assert!(
@@ -47957,7 +47994,25 @@ fn intellisense_analysis_from_snapshot_for_test(
     cursor: usize,
     db_type: crate::db::DatabaseType,
 ) -> (ExpandedStatementWindow, IntellisenseAnalysis) {
-    let cursor_analysis = cursor_analysis_from_snapshot_for_test(snapshot, cursor);
+    intellisense_analysis_from_snapshot_for_test_with_context_window(
+        snapshot,
+        cursor,
+        db_type,
+        wide_intellisense_test_context_window_bytes(),
+    )
+}
+
+fn intellisense_analysis_from_snapshot_for_test_with_context_window(
+    snapshot: &ChunkedText,
+    cursor: usize,
+    db_type: crate::db::DatabaseType,
+    context_window_bytes: usize,
+) -> (ExpandedStatementWindow, IntellisenseAnalysis) {
+    let cursor_analysis = cursor_analysis_from_snapshot_for_test_with_context_window(
+        snapshot,
+        cursor,
+        context_window_bytes,
+    );
     let (expanded, text_bind_names, package_spec_symbols, _) =
         SqlEditorWidget::expanded_statement_window_and_text_binds_from_cursor_analysis(
             cursor_analysis.as_ref(),
@@ -47996,27 +48051,33 @@ fn cursor_analysis_from_snapshot_for_test(
     snapshot: &ChunkedText,
     cursor: usize,
 ) -> Arc<CursorAnalysisSnapshot> {
+    cursor_analysis_from_snapshot_for_test_with_context_window(
+        snapshot,
+        cursor,
+        default_intellisense_test_context_window_bytes(),
+    )
+}
+
+fn cursor_analysis_from_snapshot_for_test_with_context_window(
+    snapshot: &ChunkedText,
+    cursor: usize,
+    context_window_bytes: usize,
+) -> Arc<CursorAnalysisSnapshot> {
     let cursor = snapshot.clamp_boundary(cursor.min(snapshot.len()));
-    let fast_start = snapshot.clamp_boundary(
-        cursor.saturating_sub(SqlEditorWidget::FAST_INTELLISENSE_PARSE_LOOKBEHIND_BYTES),
-    );
+    let (lookbehind_bytes, lookahead_bytes) =
+        SqlEditorWidget::intellisense_context_lookaround(context_window_bytes);
+    let fast_start = snapshot.clamp_boundary(cursor.saturating_sub(lookbehind_bytes));
     let fast_end = snapshot.clamp_boundary(
-        cursor
-            .saturating_add(SqlEditorWidget::FAST_INTELLISENSE_PARSE_LOOKAHEAD_BYTES)
-            .min(snapshot.len()),
+        cursor.saturating_add(lookahead_bytes).min(snapshot.len()),
     );
     Arc::new(CursorAnalysisSnapshot {
-        text_snapshot: snapshot.clone(),
         shared_sql_context: None,
-        fast_text: Arc::new(
-            snapshot
-                .range_string(fast_start, fast_end)
-                .unwrap_or_default(),
-        ),
+        fast_text: snapshot
+            .shared_or_owned_range(fast_start, fast_end)
+            .unwrap_or_else(|| ChunkedTextSlice::whole(Arc::new(String::new()))),
         fast_start,
         cursor_pos: cursor,
         fast_initial_lex_mode: crate::sql_parser_engine::LexMode::Idle,
-        cursor_in_string_or_comment: false,
     })
 }
 
@@ -52981,7 +53042,12 @@ fn intellisense_sweep_check_candidate(
         &candidate.replacement,
     ));
     let prepared = panic::catch_unwind(AssertUnwindSafe(|| {
-        intellisense_analysis_from_snapshot_for_test(&snapshot, candidate.cursor, db_type)
+        intellisense_analysis_from_snapshot_for_test_with_context_window(
+            &snapshot,
+            candidate.cursor,
+            db_type,
+            wide_intellisense_test_context_window_bytes(),
+        )
     }));
     let (expanded, analysis) = match prepared {
         Ok(prepared) => prepared,
@@ -92076,10 +92142,19 @@ END |;
 #[test]
 fn plsql_end_space_auto_trigger_is_slot_precise() {
     use crate::db::DatabaseType::Oracle;
+    let context_window_bytes = default_intellisense_test_context_window_bytes();
+    let (lookbehind_bytes, lookahead_bytes) =
+        SqlEditorWidget::intellisense_context_lookaround(context_window_bytes);
     let applies = |script: &str| {
         let cursor = script.find('|').expect("cursor");
         let text = script.replace('|', "");
-        SqlEditorWidget::plsql_end_auto_trigger_applies_in_text(&text, cursor, Some(Oracle))
+        let start = cursor.saturating_sub(lookbehind_bytes);
+        let end = cursor.saturating_add(lookahead_bytes).min(text.len());
+        SqlEditorWidget::plsql_end_auto_trigger_applies_in_text(
+            text.get(start..end).unwrap_or(""),
+            cursor.saturating_sub(start),
+            Some(Oracle),
+        )
     };
 
     // Named objects and construct qualifiers → trigger.
@@ -92094,7 +92169,7 @@ fn plsql_end_space_auto_trigger_is_slot_precise() {
         assert!(applies(script), "auto-trigger missing at `{script}`");
     }
     let long_prefix = "BEGIN NULL; END;\n"
-        .repeat(SqlEditorWidget::BOUNDED_INTELLISENSE_PARSE_LOOKBEHIND_BYTES / 8);
+        .repeat(crate::utils::arithmetic::safe_div(lookbehind_bytes, 8));
     assert!(
         applies(&format!("{long_prefix}BEGIN IF a = 1 THEN NULL; END |")),
         "auto-trigger should use the local bounded END window"
@@ -92122,12 +92197,16 @@ fn plsql_end_space_auto_trigger_is_slot_precise() {
 #[test]
 fn plsql_execute_immediate_tail_space_auto_trigger_is_slot_precise() {
     use crate::db::DatabaseType::{MySQL, Oracle};
+    let context_window_bytes = default_intellisense_test_context_window_bytes();
+    let (lookbehind_bytes, _) =
+        SqlEditorWidget::intellisense_context_lookaround(context_window_bytes);
     let applies = |script: &str| {
         let cursor = script.find('|').expect("cursor");
         let text = script.replace('|', "");
+        let start = cursor.saturating_sub(lookbehind_bytes);
         SqlEditorWidget::plsql_execute_immediate_tail_auto_trigger_applies_in_text(
-            &text,
-            cursor,
+            text.get(start..cursor).unwrap_or(""),
+            cursor.saturating_sub(start),
             Some(Oracle),
         )
     };
@@ -92137,14 +92216,10 @@ fn plsql_execute_immediate_tail_space_auto_trigger_is_slot_precise() {
     ));
     assert!(applies("BEGIN EXECUTE IMMEDIATE 'select 1' |END;"));
     let long_prefix = "BEGIN NULL; END;\n"
-        .repeat(SqlEditorWidget::PLSQL_EXECUTE_IMMEDIATE_TAIL_AUTO_TRIGGER_LOOKBEHIND_BYTES / 8);
+        .repeat(crate::utils::arithmetic::safe_div(lookbehind_bytes, 8));
     let long_text = format!("{long_prefix}BEGIN EXECUTE IMMEDIATE 'select 1' INTO v ");
     assert!(
-        SqlEditorWidget::plsql_execute_immediate_tail_auto_trigger_applies_in_text(
-            &long_text,
-            long_text.len(),
-            Some(Oracle),
-        ),
+        applies(&format!("{long_text}|")),
         "auto-trigger should use the local EXECUTE IMMEDIATE window"
     );
 
@@ -93012,10 +93087,11 @@ fn production_analysis_carries_test11_derived_relation_scopes() {
             .expect("fixture cursor");
         let sql = with_cursor.replacen("__CODEX_CURSOR__", "", 1);
         let (routine_cache, expanded) =
-            SqlEditorWidget::build_routine_symbol_cache_bundle_for_test_for_db_type(
+            SqlEditorWidget::build_routine_symbol_cache_bundle_for_test_with_context_window(
                 &sql,
                 cursor,
                 Some(crate::db::DatabaseType::Oracle),
+                wide_intellisense_test_context_window_bytes(),
             );
         let analysis = SqlEditorWidget::build_intellisense_analysis_from_routine_cache(
             &routine_cache,

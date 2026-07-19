@@ -5370,7 +5370,7 @@ impl MainWindow {
     }
 
     fn apply_lazy_fetch_settings(state: &mut AppState) {
-        let (lazy_fetch_batch_size, cancel_timeout_seconds) = {
+        let (lazy_fetch_batch_size, cancel_timeout_seconds, context_window_kib) = {
             let config = state
                 .config
                 .lock()
@@ -5378,6 +5378,7 @@ impl MainWindow {
             (
                 config.normalized_lazy_fetch_batch_size(),
                 config.normalized_cancel_timeout_seconds(),
+                config.normalized_intellisense_context_window_kib(),
             )
         };
         for tab in &state.editor_tabs {
@@ -5385,6 +5386,8 @@ impl MainWindow {
                 .set_lazy_fetch_batch_size(lazy_fetch_batch_size);
             tab.sql_editor
                 .set_cancel_timeout_seconds(cancel_timeout_seconds);
+            tab.sql_editor
+                .set_intellisense_context_window_kib(context_window_kib);
         }
         state
             .sql_editor
@@ -5392,6 +5395,9 @@ impl MainWindow {
         state
             .sql_editor
             .set_cancel_timeout_seconds(cancel_timeout_seconds);
+        state
+            .sql_editor
+            .set_intellisense_context_window_kib(context_window_kib);
     }
 
     fn apply_runtime_ui_font(state: &mut AppState, font: fltk::enums::Font, ui_size: i32) {
@@ -8123,6 +8129,8 @@ impl MainWindow {
                             config.result_font_size = settings.result_size;
                             config.result_cell_max_chars = settings.result_cell_max_chars;
                             config.lazy_fetch_batch_size = settings.lazy_fetch_batch_size;
+                            config.intellisense_context_window_kib =
+                                settings.intellisense_context_window_kib;
                             config.connection_pool_size = settings.connection_pool_size;
                             config.cancel_timeout_seconds = settings.cancel_timeout_seconds;
                             config.sql_comma_list_layout = settings.sql_comma_list_layout;

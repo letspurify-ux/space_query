@@ -1965,7 +1965,8 @@ impl SqlEditorWidget {
         text_shadow: &Arc<Mutex<HighlightShadowState>>,
         cursor_pos: i32,
         preferred_db_type: crate::db::connection::DatabaseType,
-    ) -> Option<CapturedCursorContext> {
+        context_window_bytes: usize,
+    ) -> Option<CursorContextCapture> {
         const SIGNATURE_SCAN_WINDOW: usize = 4000;
         const COMPLETION_SUFFIX_SCAN_WINDOW: usize = 2048;
 
@@ -1979,36 +1980,35 @@ impl SqlEditorWidget {
 
         let text_snapshot = shadow.text_snapshot();
         let cursor_pos = text_snapshot.clamp_boundary((cursor_pos.max(0) as usize).min(buffer_len));
-        let fast_start = text_snapshot.clamp_boundary(
-            cursor_pos.saturating_sub(Self::FAST_INTELLISENSE_PARSE_LOOKBEHIND_BYTES),
+        if shadow.cursor_in_string_or_comment(cursor_pos) {
+            return Some(CursorContextCapture::Suppressed);
+        }
+        let (lookbehind_bytes, lookahead_bytes) =
+            Self::intellisense_context_lookaround(context_window_bytes);
+        let requested_fast_start = text_snapshot.clamp_boundary(
+            cursor_pos.saturating_sub(lookbehind_bytes),
         );
+        let fast_start = shadow.intellisense_context_start(requested_fast_start, cursor_pos);
         let fast_end = text_snapshot.clamp_boundary(
-            cursor_pos
-                .saturating_add(Self::FAST_INTELLISENSE_PARSE_LOOKAHEAD_BYTES)
-                .min(buffer_len),
+            cursor_pos.saturating_add(lookahead_bytes).min(buffer_len),
         );
         let mysql_compatible = preferred_db_type.is_mysql_or_mariadb();
         let fast_initial_lex_mode = shadow.parser_lex_mode_at(fast_start, mysql_compatible);
-        let fast_text = Arc::new(
-            text_snapshot
-                .range_string(fast_start, fast_end)
-                .unwrap_or_default(),
-        );
-        let cursor_in_string_or_comment = shadow.cursor_in_string_or_comment(cursor_pos);
+        let fast_text = text_snapshot.shared_or_owned_range(fast_start, fast_end)?;
         let shared_sql_context = shadow.shared_sql_context_snapshot();
         let analysis = Arc::new(CursorAnalysisSnapshot {
-            text_snapshot: text_snapshot.clone(),
             shared_sql_context,
             fast_text,
             fast_start,
             cursor_pos,
             fast_initial_lex_mode,
-            cursor_in_string_or_comment,
         });
 
-        let word_window_start = text_snapshot.clamp_boundary(
-            cursor_pos.saturating_sub(INTELLISENSE_WORD_WINDOW.max(0) as usize),
-        );
+        let word_window_start = text_snapshot
+            .clamp_boundary(
+                cursor_pos.saturating_sub(INTELLISENSE_WORD_WINDOW.max(0) as usize),
+            )
+            .max(fast_start);
         let word_window_end = text_snapshot.clamp_boundary(
             cursor_pos
                 .saturating_add(INTELLISENSE_WORD_WINDOW.max(0) as usize)
@@ -2059,7 +2059,8 @@ impl SqlEditorWidget {
         } else {
             let qualifier_start = text_snapshot.clamp_boundary(
                 word_start.saturating_sub(INTELLISENSE_QUALIFIER_WINDOW.max(0) as usize),
-            );
+            )
+            .max(fast_start);
             let slice_start = qualifier_start.saturating_sub(fast_start);
             let slice_end = word_start.saturating_sub(fast_start);
             let qualifier_text = analysis
@@ -2081,8 +2082,9 @@ impl SqlEditorWidget {
             }
         };
 
-        let signature_window_start =
-            text_snapshot.clamp_boundary(cursor_pos.saturating_sub(SIGNATURE_SCAN_WINDOW));
+        let signature_window_start = text_snapshot
+            .clamp_boundary(cursor_pos.saturating_sub(SIGNATURE_SCAN_WINDOW))
+            .max(fast_start);
         let raw_signature_start = signature_window_start.saturating_sub(fast_start);
         let raw_signature_end = cursor_pos.saturating_sub(fast_start);
         let raw_signature = analysis
@@ -2115,7 +2117,7 @@ impl SqlEditorWidget {
             suffix_end.saturating_sub(fast_start),
         );
         drop(shadow);
-        Some(CapturedCursorContext {
+        Some(CursorContextCapture::Ready(CapturedCursorContext {
             analysis,
             prefix,
             word_start,
@@ -2124,7 +2126,7 @@ impl SqlEditorWidget {
             signature_scan_text,
             signature_scan_initial_lex_mode,
             text_after_cursor,
-        })
+        }))
     }
 
     fn qualifiers_before_word_from_cursor_analysis(
@@ -2165,14 +2167,18 @@ impl SqlEditorWidget {
         // schema refresh worker or a running query may be holding). Fall back
         // to the last observed db_type; it only changes on (re)connect.
         let preferred_db_type = runtime.db_type_without_blocking(connection);
-        let Some(captured) = Self::capture_cursor_context(
+        let captured = match Self::capture_cursor_context(
             buffer,
             text_shadow,
             cursor_pos,
             preferred_db_type,
-        ) else {
-            Self::clear_intellisense_ui_state(intellisense_popup, runtime);
-            return;
+            runtime.context_window_bytes(),
+        ) {
+            Some(CursorContextCapture::Ready(captured)) => captured,
+            Some(CursorContextCapture::Suppressed) | None => {
+                Self::clear_intellisense_ui_state(intellisense_popup, runtime);
+                return;
+            }
         };
         let mut prefix = captured.prefix;
         let mut word_start = captured.word_start;
@@ -2203,13 +2209,7 @@ impl SqlEditorWidget {
                 cursor_analysis.cursor_in_fast_text(),
             ) == Some(';');
 
-        // The cursor sitting inside a string literal or comment is never an
-        // identifier position: keywords, columns and relations would all be
-        // irrelevant there. Suppress completion uniformly for every clause by
-        // reusing the syntax highlighter's already-computed styles.
-        if should_hide_after_statement_terminator
-            || cursor_analysis.cursor_in_string_or_comment
-        {
+        if should_hide_after_statement_terminator {
             intellisense_popup
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -2507,14 +2507,15 @@ impl SqlEditorWidget {
                             package_spec_symbols,
                             shared_sql_context,
                         ) =
-                            Self::expanded_statement_window_and_text_binds_from_cursor_analysis(
+                            Self::expanded_statement_window_and_text_binds_from_cursor_analysis_cancellable(
                                 snapshot_for_thread.cursor_analysis.as_ref(),
                                 Some(snapshot_for_thread.preferred_db_type),
-                            );
+                                Some(&cancellation),
+                            )?;
                         if cancellation.is_cancelled() {
                             return None;
                         }
-                        let routine_cache = {
+                        let cached_routine = {
                             let cache = routine_symbol_cache_for_thread
                                 .lock()
                                 .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -2527,17 +2528,19 @@ impl SqlEditorWidget {
                                         && entry.statement_end == expanded_statement.statement_end
                                 })
                                 .cloned()
-                        }
-                        .unwrap_or_else(|| {
-                            Self::build_routine_symbol_cache_entry_with_token_spans(
+                        };
+                        let routine_cache = match cached_routine {
+                            Some(routine_cache) => routine_cache,
+                            None => Self::build_routine_symbol_cache_entry_with_token_spans_cancellable(
                                 snapshot_for_thread.buffer_revision,
                                 &expanded_statement,
                                 text_bind_names,
                                 &package_spec_symbols,
                                 Some(snapshot_for_thread.preferred_db_type),
                                 shared_sql_context,
-                            )
-                        });
+                                Some(&cancellation),
+                            )?,
+                        };
                         if cancellation.is_cancelled() {
                             return None;
                         }
@@ -37839,7 +37842,12 @@ impl SqlEditorWidget {
         {
             return false;
         }
-        let bounded = Self::bounded_intellisense_parse_text_from_text(full_text, cursor);
+        let cursor = Self::clamp_to_char_boundary_local(full_text, cursor.min(full_text.len()));
+        let bounded = BoundedIntellisenseParseText {
+            text: full_text.to_string().into(),
+            start: 0,
+            cursor_pos: cursor,
+        };
         let expanded = Self::expanded_statement_window_in_bounded_text_for_db_type(&bounded, db_type);
         let spans = super::query_text::tokenize_sql_spanned(&expanded.text);
         let mut tokens = Vec::with_capacity(spans.len());
@@ -37853,20 +37861,22 @@ impl SqlEditorWidget {
             || Self::expected_plsql_end_qualifier_keywords(&tokens, end_idx, db_type).is_some()
     }
 
-    const PLSQL_EXECUTE_IMMEDIATE_TAIL_AUTO_TRIGGER_LOOKBEHIND_BYTES: usize = 16 * 1024;
+    fn intellisense_text_contains_ascii_case_insensitive(text: &str, needle: &[u8]) -> bool {
+        !needle.is_empty()
+            && text.as_bytes().windows(needle.len()).any(|window| {
+                window
+                    .iter()
+                    .zip(needle)
+                    .all(|(left, right)| left.eq_ignore_ascii_case(right))
+            })
+    }
 
     fn plsql_execute_immediate_tail_auto_trigger_prefix(
         full_text: &str,
         cursor: usize,
     ) -> Option<&str> {
         let cursor = Self::clamp_to_char_boundary_local(full_text, cursor.min(full_text.len()));
-        let start = Self::clamp_to_char_boundary_local(
-            full_text,
-            cursor.saturating_sub(
-                Self::PLSQL_EXECUTE_IMMEDIATE_TAIL_AUTO_TRIGGER_LOOKBEHIND_BYTES,
-            ),
-        );
-        full_text.get(start..cursor)
+        full_text.get(..cursor)
     }
 
     /// Whether typing a space in an `EXECUTE IMMEDIATE` statement should
@@ -37886,6 +37896,11 @@ impl SqlEditorWidget {
             None => return false,
         };
         if !head.chars().last().is_some_and(char::is_whitespace) {
+            return false;
+        }
+        if !Self::intellisense_text_contains_ascii_case_insensitive(head, b"EXECUTE")
+            || !Self::intellisense_text_contains_ascii_case_insensitive(head, b"IMMEDIATE")
+        {
             return false;
         }
 

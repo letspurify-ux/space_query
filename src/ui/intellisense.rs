@@ -3261,14 +3261,26 @@ impl Default for IntellisenseData {
 pub struct IntellisensePopup {
     window: Window,
     browser: HoldBrowser,
-    suggestions: Arc<Mutex<Vec<String>>>,
+    visible_suggestion_indices: Arc<Mutex<Vec<usize>>>,
     all_suggestions: Arc<Mutex<Vec<String>>>,
+    filter_prefix: Arc<Mutex<String>>,
+    suggestion_presentations: Arc<Mutex<Vec<SuggestionPresentation>>>,
     /// Optional display detail per suggestion (e.g. column type + PK/NN/FK
     /// badges), keyed by the upper-cased suggestion text. The suggestion text
     /// itself remains the inserted value; this only enriches rendering.
     descriptions: Arc<Mutex<HashMap<String, SuggestionDetail>>>,
     selected_callback: Arc<Mutex<Option<Box<dyn FnMut(String)>>>>,
     state: Arc<Mutex<PopupState>>,
+}
+
+#[derive(Clone, Debug, Default)]
+struct SuggestionPresentation {
+    row: String,
+    name_width: i32,
+    type_width: i32,
+    badge_width: i32,
+    has_type: bool,
+    has_badge: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -3424,8 +3436,10 @@ impl IntellisensePopup {
             fltk::group::Group::set_current(Some(group));
         }
 
-        let suggestions = Arc::new(Mutex::new(Vec::new()));
+        let visible_suggestion_indices = Arc::new(Mutex::new(Vec::new()));
         let all_suggestions = Arc::new(Mutex::new(Vec::new()));
+        let filter_prefix = Arc::new(Mutex::new(String::new()));
+        let suggestion_presentations = Arc::new(Mutex::new(Vec::new()));
         let descriptions = Arc::new(Mutex::new(HashMap::new()));
         let selected_callback: Arc<Mutex<Option<Box<dyn FnMut(String)>>>> =
             Arc::new(Mutex::new(None));
@@ -3436,8 +3450,10 @@ impl IntellisensePopup {
         let mut popup = Self {
             window,
             browser,
-            suggestions,
+            visible_suggestion_indices,
             all_suggestions,
+            filter_prefix,
+            suggestion_presentations,
             descriptions,
             selected_callback,
             state,
@@ -3449,7 +3465,8 @@ impl IntellisensePopup {
 
     fn setup_callbacks(&mut self) {
         // Browser click callback - handle mouse selection
-        let suggestions = self.suggestions.clone();
+        let visible_suggestion_indices = self.visible_suggestion_indices.clone();
+        let all_suggestions = self.all_suggestions.clone();
         let callback = self.selected_callback.clone();
         let mut window = self.window.clone();
         let state = self.state.clone();
@@ -3483,12 +3500,19 @@ impl IntellisensePopup {
             }
             let selected = b.value();
             if selected > 0 {
-                // First, get the text with suggestions borrow, then release it
                 let text = {
-                    let suggestions = suggestions
+                    let index = visible_suggestion_indices
                         .lock()
-                        .unwrap_or_else(|poisoned| poisoned.into_inner());
-                    suggestions.get((selected - 1) as usize).cloned()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .get((selected - 1) as usize)
+                        .copied();
+                    index.and_then(|index| {
+                        all_suggestions
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner())
+                            .get(index)
+                            .cloned()
+                    })
                 };
                 if let Some(text) = text {
                     // Take the callback out, call it, then put it back if needed.
@@ -3557,11 +3581,17 @@ impl IntellisensePopup {
             .descriptions
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = descriptions;
+        let suggestion_count = suggestions.len();
         *self
             .all_suggestions
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner()) = suggestions.clone();
-        self.set_suggestions(suggestions, None);
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = suggestions;
+        self.rebuild_suggestion_presentations();
+        self.filter_prefix
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clear();
+        self.set_visible_suggestion_indices((0..suggestion_count).collect(), None);
 
         // `set_suggestions` may have widened the window past the caller's
         // estimate, so re-clamp against the screen's work area to keep the
@@ -3587,62 +3617,35 @@ impl IntellisensePopup {
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = PopupState::Visible;
     }
 
-    fn set_suggestions(&mut self, suggestions: Vec<String>, selected_text: Option<&str>) {
-        if self.is_deleted() {
-            *self
-                .state
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner()) = PopupState::Hidden;
-            return;
-        }
-
-        let suggestion_count = suggestions.len();
-        if suggestion_count == 0 {
-            self.hide();
-            return;
-        }
-
-        // Preserve selection when possible.
-        let selected_idx = selected_text
-            .and_then(|selected| suggestions.iter().position(|item| item == selected))
-            .unwrap_or(0);
+    fn rebuild_suggestion_presentations(&mut self) {
         let type_color = theme::text_secondary().bits();
         let badge_color = theme::accent().bits();
+        let item_size = self.browser.text_size();
+        fltk::draw::set_font(fltk::enums::Font::Helvetica, item_size);
+        let all_suggestions = self
+            .all_suggestions
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let descriptions = self
             .descriptions
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-
-        // Measure rendered text so the popup can be sized to fit the longest
-        // entry instead of clipping it at a fixed width. Items render in the
-        // browser's font (Helvetica) at its configured text size.
-        let item_size = self.browser.text_size();
-        fltk::draw::set_font(fltk::enums::Font::Helvetica, item_size);
-        let mut max_name_w = 0;
-        let mut max_type_w = 0;
-        let mut max_badge_w = 0;
-        let mut any_type = false;
-        let mut any_badge = false;
-
-        self.browser.clear();
-        for suggestion in &suggestions {
-            let (name_w, _) = fltk::draw::measure(suggestion, false);
-            max_name_w = max_name_w.max(name_w);
+        let mut presentations = Vec::with_capacity(all_suggestions.len());
+        for suggestion in all_suggestions.iter() {
+            let (name_width, _) = fltk::draw::measure(suggestion, false);
             let detail = descriptions.get(&NameEntry::lookup_upper(suggestion));
-            let type_text = detail.map(|d| d.type_text.as_str()).unwrap_or("");
-            let badges = detail.map(|d| d.badges.as_str()).unwrap_or("");
-            if !type_text.is_empty() {
-                any_type = true;
-                let (type_w, _) = fltk::draw::measure(type_text, false);
-                max_type_w = max_type_w.max(type_w);
-            }
-            if !badges.is_empty() {
-                any_badge = true;
-                let (badge_w, _) = fltk::draw::measure(badges, false);
-                max_badge_w = max_badge_w.max(badge_w);
-            }
-            // Column 1: name; column 2: type; column 3: PK/NN/FK badges. Empty
-            // trailing columns are dropped so plain entries render as one cell.
+            let type_text = detail.map(|value| value.type_text.as_str()).unwrap_or("");
+            let badges = detail.map(|value| value.badges.as_str()).unwrap_or("");
+            let type_width = if type_text.is_empty() {
+                0
+            } else {
+                fltk::draw::measure(type_text, false).0
+            };
+            let badge_width = if badges.is_empty() {
+                0
+            } else {
+                fltk::draw::measure(badges, false).0
+            };
             let row = if !badges.is_empty() {
                 format!(
                     "@C255 {}\t@C{} {}\t@C{} {}",
@@ -3653,13 +3656,75 @@ impl IntellisensePopup {
             } else {
                 format!("@C255 {}", suggestion)
             };
-            self.browser.add(&row);
+            presentations.push(SuggestionPresentation {
+                row,
+                name_width,
+                type_width,
+                badge_width,
+                has_type: !type_text.is_empty(),
+                has_badge: !badges.is_empty(),
+            });
         }
         drop(descriptions);
+        drop(all_suggestions);
         *self
-            .suggestions
+            .suggestion_presentations
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner()) = suggestions;
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = presentations;
+    }
+
+    fn set_visible_suggestion_indices(
+        &mut self,
+        indices: Vec<usize>,
+        selected_original_index: Option<usize>,
+    ) {
+        if self.is_deleted() {
+            *self
+                .state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()) = PopupState::Hidden;
+            return;
+        }
+
+        let suggestion_count = indices.len();
+        if suggestion_count == 0 {
+            self.hide();
+            return;
+        }
+
+        // Preserve selection when possible.
+        let selected_idx = selected_original_index
+            .and_then(|selected| indices.iter().position(|index| *index == selected))
+            .unwrap_or(0);
+        let presentations = self
+            .suggestion_presentations
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+
+        let item_size = self.browser.text_size();
+        let mut max_name_w = 0;
+        let mut max_type_w = 0;
+        let mut max_badge_w = 0;
+        let mut any_type = false;
+        let mut any_badge = false;
+
+        self.browser.clear();
+        for index in &indices {
+            let Some(presentation) = presentations.get(*index) else {
+                continue;
+            };
+            max_name_w = max_name_w.max(presentation.name_width);
+            max_type_w = max_type_w.max(presentation.type_width);
+            max_badge_w = max_badge_w.max(presentation.badge_width);
+            any_type |= presentation.has_type;
+            any_badge |= presentation.has_badge;
+            self.browser.add(&presentation.row);
+        }
+        drop(presentations);
+        *self
+            .visible_suggestion_indices
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = indices;
 
         if suggestion_count > 0 {
             self.browser.select((selected_idx + 1) as i32);
@@ -3714,26 +3779,64 @@ impl IntellisensePopup {
             return;
         }
 
-        let selected = self.get_selected();
-        let filtered = {
+        let selected_original_index = {
+            let selected = self.browser.value();
+            (selected > 0)
+                .then(|| {
+                    self.visible_suggestion_indices
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .get((selected - 1) as usize)
+                        .copied()
+                })
+                .flatten()
+        };
+        let previous_prefix = self
+            .filter_prefix
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        let mut filtered_indices = if !previous_prefix.is_empty()
+            && prefix.starts_with(&previous_prefix)
+            && prefix.len() >= previous_prefix.len()
+        {
+            std::mem::take(
+                &mut *self
+                    .visible_suggestion_indices
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner()),
+            )
+        } else {
+            let count = self
+                .all_suggestions
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .len();
+            (0..count).collect()
+        };
+        {
             let all = self
                 .all_suggestions
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
-            filter_suggestions_by_prefix(all.as_slice(), prefix)
-        };
+            retain_matching_suggestion_indices(&all, &mut filtered_indices, prefix);
+        }
+        *self
+            .filter_prefix
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = prefix.to_string();
 
-        if filtered.is_empty() {
+        if filtered_indices.is_empty() {
             self.hide();
             self.browser.clear();
-            self.suggestions
+            self.visible_suggestion_indices
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .clear();
             return;
         }
 
-        self.set_suggestions(filtered, selected.as_deref());
+        self.set_visible_suggestion_indices(filtered_indices, selected_original_index);
     }
 
     pub fn hide(&mut self) {
@@ -3764,11 +3867,19 @@ impl IntellisensePopup {
             self.browser.set_callback(|_| {});
             self.browser.clear();
         }
-        self.suggestions
+        self.visible_suggestion_indices
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .clear();
         self.all_suggestions
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clear();
+        self.filter_prefix
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clear();
+        self.suggestion_presentations
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .clear();
@@ -3900,10 +4011,16 @@ impl IntellisensePopup {
 
         let selected = self.browser.value();
         if selected > 0 {
-            self.suggestions
+            let index = self
+                .visible_suggestion_indices
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .get((selected - 1) as usize)
+                .copied()?;
+            self.all_suggestions
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .get(index)
                 .cloned()
         } else {
             None
@@ -3921,6 +4038,21 @@ pub fn filter_suggestions_by_prefix(suggestions: &[String], prefix: &str) -> Vec
         .filter(|candidate| suggestion_matches_completion_prefix(candidate, prefix))
         .cloned()
         .collect()
+}
+
+fn retain_matching_suggestion_indices(
+    suggestions: &[String],
+    indices: &mut Vec<usize>,
+    prefix: &str,
+) {
+    if prefix.is_empty() {
+        return;
+    }
+    indices.retain(|index| {
+        suggestions
+            .get(*index)
+            .is_some_and(|candidate| suggestion_matches_completion_prefix(candidate, prefix))
+    });
 }
 
 pub fn suggestion_matches_completion_prefix(candidate: &str, prefix: &str) -> bool {
@@ -6054,6 +6186,22 @@ BEGIN
         let suggestions = vec!["SELECT".to_string(), "FROM".to_string()];
         let filtered = filter_suggestions_by_prefix(&suggestions, "zz");
         assert!(filtered.is_empty());
+    }
+
+    #[test]
+    fn popup_prefix_filter_reuses_the_existing_index_allocation() {
+        let suggestions = vec![
+            "SELECT".to_string(),
+            "SESSION_USER".to_string(),
+            "FROM".to_string(),
+        ];
+        let mut indices = vec![0, 1, 2];
+        let allocation = indices.as_ptr();
+
+        retain_matching_suggestion_indices(&suggestions, &mut indices, "se");
+
+        assert_eq!(indices, vec![0, 1]);
+        assert_eq!(indices.as_ptr(), allocation);
     }
 
     #[test]

@@ -909,10 +909,12 @@ impl SqlEditorWidget {
         text_shadow: &Arc<Mutex<HighlightShadowState>>,
         cursor_pos: i32,
         preferred_db_type: Option<crate::db::connection::DatabaseType>,
+        context_window_bytes: usize,
     ) -> String {
         let buffer_len = buffer.length().max(0);
         let cursor_pos = cursor_pos.clamp(0, buffer_len);
-        let start = (cursor_pos - INTELLISENSE_CONTEXT_WINDOW).max(0);
+        let (lookbehind_bytes, _) = Self::intellisense_context_lookaround(context_window_bytes);
+        let start = cursor_pos.saturating_sub(lookbehind_bytes.min(i32::MAX as usize) as i32);
         let (window, window_start) =
             Self::bounded_text_window(buffer, text_shadow, start, cursor_pos);
         if window.is_empty() {
@@ -950,6 +952,7 @@ impl SqlEditorWidget {
         idx
     }
 
+    #[cfg(test)]
     fn clamp_to_char_boundary_forward_local(text: &str, idx: usize) -> usize {
         let mut idx = idx.min(text.len());
         if text.is_char_boundary(idx) {
@@ -997,9 +1000,14 @@ impl SqlEditorWidget {
             return String::new();
         }
         let cursor_pos = cursor_pos.min(text.len());
-        let start_candidate = cursor_pos.saturating_sub(INTELLISENSE_STATEMENT_WINDOW as usize);
+        let context_window_bytes = AppConfig::intellisense_context_window_bytes(
+            crate::utils::MAX_INTELLISENSE_CONTEXT_WINDOW_KIB,
+        );
+        let (lookbehind_bytes, lookahead_bytes) =
+            Self::intellisense_context_lookaround(context_window_bytes);
+        let start_candidate = cursor_pos.saturating_sub(lookbehind_bytes);
         let end_candidate = cursor_pos
-            .saturating_add(INTELLISENSE_STATEMENT_WINDOW as usize)
+            .saturating_add(lookahead_bytes)
             .min(text.len());
         let bytes = text.as_bytes();
         let start = bytes[..start_candidate]
@@ -1035,7 +1043,11 @@ impl SqlEditorWidget {
         preferred_db_type: Option<crate::db::connection::DatabaseType>,
     ) -> String {
         let cursor_pos = Self::clamp_to_char_boundary_local(text, cursor_pos.min(text.len()));
-        let start = cursor_pos.saturating_sub(INTELLISENSE_CONTEXT_WINDOW as usize);
+        let context_window_bytes = AppConfig::intellisense_context_window_bytes(
+            crate::utils::MAX_INTELLISENSE_CONTEXT_WINDOW_KIB,
+        );
+        let (lookbehind_bytes, _) = Self::intellisense_context_lookaround(context_window_bytes);
+        let start = cursor_pos.saturating_sub(lookbehind_bytes);
         let start = Self::clamp_to_char_boundary_local(text, start);
         let window = text.get(start..cursor_pos).unwrap_or("");
         let (stmt_start, _) =
@@ -1630,9 +1642,14 @@ impl SqlEditorWidget {
         // Fast path: keep existing suggestions and just filter by the current in-range prefix.
         // This avoids re-tokenizing/re-analyzing SQL on each extra identifier keystroke.
         let prefix = Self::completion_prefix_from_range_text(&range_text);
-        let qualifier =
-            Self::qualifier_before_word(buffer, text_shadow, start, preferred_db_type);
-        if Self::should_hide_fast_path_after_delete(&prefix, qualifier.as_deref(), key) {
+        let should_hide_after_delete = if matches!(key, Key::BackSpace | Key::Delete) {
+            let qualifier =
+                Self::qualifier_before_word(buffer, text_shadow, start, preferred_db_type);
+            Self::should_hide_fast_path_after_delete(&prefix, qualifier.as_deref(), key)
+        } else {
+            false
+        };
+        if should_hide_after_delete {
             intellisense_popup
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())

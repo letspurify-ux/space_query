@@ -20,8 +20,9 @@ use crate::ui::constants::*;
 use crate::ui::{available_font_names, center_on_main, theme};
 use crate::utils::{
     AppConfig, SqlCommaListLayout, MAX_CANCEL_TIMEOUT_SECONDS, MAX_CONNECTION_POOL_SIZE,
-    MAX_LAZY_FETCH_BATCH_SIZE, MAX_SQL_FORMAT_RIGHT_MARGIN, MIN_CANCEL_TIMEOUT_SECONDS,
-    MIN_CONNECTION_POOL_SIZE, MIN_LAZY_FETCH_BATCH_SIZE, MIN_SQL_FORMAT_RIGHT_MARGIN,
+    MAX_INTELLISENSE_CONTEXT_WINDOW_KIB, MAX_LAZY_FETCH_BATCH_SIZE, MAX_SQL_FORMAT_RIGHT_MARGIN,
+    MIN_CANCEL_TIMEOUT_SECONDS, MIN_CONNECTION_POOL_SIZE, MIN_INTELLISENSE_CONTEXT_WINDOW_KIB,
+    MIN_LAZY_FETCH_BATCH_SIZE, MIN_SQL_FORMAT_RIGHT_MARGIN,
 };
 
 pub struct FontSettings {
@@ -31,6 +32,7 @@ pub struct FontSettings {
     pub result_size: u32,
     pub result_cell_max_chars: u32,
     pub lazy_fetch_batch_size: u32,
+    pub intellisense_context_window_kib: u32,
     pub connection_pool_size: u32,
     pub cancel_timeout_seconds: u32,
     pub sql_comma_list_layout: SqlCommaListLayout,
@@ -87,6 +89,24 @@ fn validate_lazy_fetch_batch_size(value: &str) -> Option<u32> {
             crate::ui::alert_on_main(&format!(
                 "Lazy fetch size must be a number between {} and {}.",
                 MIN_LAZY_FETCH_BATCH_SIZE, MAX_LAZY_FETCH_BATCH_SIZE
+            ));
+            None
+        }
+    }
+}
+
+fn validate_intellisense_context_window_kib(value: &str) -> Option<u32> {
+    match value.trim().parse::<u32>() {
+        Ok(size)
+            if (MIN_INTELLISENSE_CONTEXT_WINDOW_KIB..=MAX_INTELLISENSE_CONTEXT_WINDOW_KIB)
+                .contains(&size) =>
+        {
+            Some(size)
+        }
+        _ => {
+            crate::ui::alert_on_main(&format!(
+                "IntelliSense context must be a number between {} and {} KiB.",
+                MIN_INTELLISENSE_CONTEXT_WINDOW_KIB, MAX_INTELLISENSE_CONTEXT_WINDOW_KIB
             ));
             None
         }
@@ -382,6 +402,52 @@ pub fn show_settings_dialog(config: &AppConfig) -> Option<FontSettings> {
     result_group.resizable(&result_flex);
     result_group.end();
 
+    let mut intellisense_group = Group::new(content_x, tab_body_y, content_w, tab_body_h, None);
+    intellisense_group.set_label("IntelliSense");
+    intellisense_group.set_color(theme::panel_bg());
+    intellisense_group.set_label_color(theme::text_secondary());
+    intellisense_group.begin();
+
+    let mut intellisense_flex = Flex::new(
+        content_x + DIALOG_MARGIN,
+        tab_body_y + DIALOG_MARGIN,
+        content_w - DIALOG_MARGIN * 2,
+        tab_body_h - DIALOG_MARGIN * 2,
+        None,
+    );
+    intellisense_flex.set_type(FlexType::Column);
+    intellisense_flex.set_spacing(DIALOG_SPACING);
+
+    let mut context_window_row = Flex::default().with_size(0, INPUT_ROW_HEIGHT);
+    context_window_row.set_type(FlexType::Row);
+    context_window_row.set_spacing(DIALOG_SPACING);
+    let mut context_window_label = Frame::default().with_label("Context Window:");
+    context_window_label.set_label_color(theme::text_primary());
+    context_window_row.fixed(&context_window_label, FORM_LABEL_WIDTH);
+    let mut context_window_input = IntInput::default();
+    context_window_input.set_value(
+        &config
+            .normalized_intellisense_context_window_kib()
+            .to_string(),
+    );
+    context_window_input.set_color(theme::input_bg());
+    context_window_input.set_text_color(theme::text_primary());
+    context_window_row.end();
+    intellisense_flex.fixed(&context_window_row, INPUT_ROW_HEIGHT);
+
+    let mut context_window_hint = Frame::default().with_label(&format!(
+        "Cursor context: {} ~ {} KiB (larger values use more CPU)",
+        MIN_INTELLISENSE_CONTEXT_WINDOW_KIB, MAX_INTELLISENSE_CONTEXT_WINDOW_KIB
+    ));
+    context_window_hint.set_label_color(theme::text_secondary());
+    intellisense_flex.fixed(&context_window_hint, LABEL_ROW_HEIGHT);
+
+    let intellisense_filler = Frame::default();
+    intellisense_flex.resizable(&intellisense_filler);
+    intellisense_flex.end();
+    intellisense_group.resizable(&intellisense_flex);
+    intellisense_group.end();
+
     let mut connection_group = Group::new(content_x, tab_body_y, content_w, tab_body_h, None);
     connection_group.set_label("Connection");
     connection_group.set_color(theme::panel_bg());
@@ -610,6 +676,7 @@ pub fn show_settings_dialog(config: &AppConfig) -> Option<FontSettings> {
     let global_size_input_ok = global_size_input.clone();
     let result_cell_max_input_ok = result_cell_max_input.clone();
     let lazy_fetch_batch_input_ok = lazy_fetch_batch_input.clone();
+    let context_window_input_ok = context_window_input.clone();
     let pool_size_input_ok = pool_size_input.clone();
     let cancel_timeout_input_ok = cancel_timeout_input.clone();
     let comma_layout_choice_ok = comma_layout_choice.clone();
@@ -635,6 +702,11 @@ pub fn show_settings_dialog(config: &AppConfig) -> Option<FontSettings> {
             };
         let lazy_fetch_batch_size =
             match validate_lazy_fetch_batch_size(&lazy_fetch_batch_input_ok.value()) {
+                Some(size) => size,
+                None => return,
+            };
+        let intellisense_context_window_kib =
+            match validate_intellisense_context_window_kib(&context_window_input_ok.value()) {
                 Some(size) => size,
                 None => return,
             };
@@ -676,6 +748,7 @@ pub fn show_settings_dialog(config: &AppConfig) -> Option<FontSettings> {
             result_size,
             result_cell_max_chars,
             lazy_fetch_batch_size,
+            intellisense_context_window_kib,
             connection_pool_size,
             cancel_timeout_seconds,
             sql_comma_list_layout,

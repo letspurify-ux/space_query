@@ -855,6 +855,18 @@ pub(crate) fn tokenize_sql_spanned_with_mysql_compat(
     sql: &str,
     mysql_compatible: bool,
 ) -> Vec<SqlTokenSpan> {
+    tokenize_sql_spanned_with_mysql_compat_and_cancel(sql, mysql_compatible, || false)
+        .unwrap_or_default()
+}
+
+pub(crate) fn tokenize_sql_spanned_with_mysql_compat_and_cancel<F>(
+    sql: &str,
+    mysql_compatible: bool,
+    mut is_cancelled: F,
+) -> Option<Vec<SqlTokenSpan>>
+where
+    F: FnMut() -> bool,
+{
     let mut tokens = Vec::new();
     let mut iter = sql.char_indices().peekable();
     let sql_bytes = sql.as_bytes();
@@ -864,6 +876,7 @@ pub(crate) fn tokenize_sql_spanned_with_mysql_compat(
     let mut pending_newline = true;
     let mut paren_depth = 0usize;
     let mut dollar_quote_state = DollarQuoteState::default();
+    let mut bytes_since_cancel_check = 0usize;
 
     let flush_word = |current: &mut String,
                       current_start: &mut usize,
@@ -900,6 +913,13 @@ pub(crate) fn tokenize_sql_spanned_with_mysql_compat(
         |idx: usize| sql_text::is_dash_line_comment_start(sql_bytes, idx, mysql_compatible);
 
     while let Some((idx, c)) = iter.next() {
+        bytes_since_cancel_check = bytes_since_cancel_check.saturating_add(c.len_utf8());
+        if bytes_since_cancel_check >= 4096 {
+            if is_cancelled() {
+                return None;
+            }
+            bytes_since_cancel_check = 0;
+        }
         let next = iter.peek().map(|(_, ch)| *ch);
 
         if matches!(
@@ -1422,7 +1442,7 @@ pub(crate) fn tokenize_sql_spanned_with_mysql_compat(
         flush_word(&mut current, &mut current_start, sql.len(), &mut tokens);
     }
 
-    tokens
+    (!is_cancelled()).then_some(tokens)
 }
 
 fn parse_dollar_quote_tag(sql: &str, start: usize) -> Option<String> {
@@ -1929,12 +1949,25 @@ mod tests {
         statement_at_cursor_for_db_type_with_mysql_delimiter, statement_bounds_in_text,
         statement_bounds_in_text_for_db_type,
         statement_bounds_in_text_for_db_type_with_mysql_delimiter, tokenize_sql,
-        tokenize_sql_spanned, tokenize_sql_with_mysql_compat, DollarQuoteState,
-        PendingTailTokenKind,
+        tokenize_sql_spanned, tokenize_sql_spanned_with_mysql_compat_and_cancel,
+        tokenize_sql_with_mysql_compat, DollarQuoteState, PendingTailTokenKind,
     };
     use crate::db::SplitState;
     use crate::sql_text;
     use crate::ui::sql_editor::SqlToken;
+
+    #[test]
+    fn cancellable_tokenization_stops_during_a_large_stale_analysis() {
+        let sql = "SELECT identifier FROM table_name;\n".repeat(20_000);
+        let mut checks = 0usize;
+        let tokens = tokenize_sql_spanned_with_mysql_compat_and_cancel(&sql, false, || {
+            checks = checks.saturating_add(1);
+            checks >= 2
+        });
+
+        assert!(tokens.is_none());
+        assert_eq!(checks, 2);
+    }
 
     #[test]
     fn has_connection_bootstrap_command_ignores_connect_in_block_comment() {

@@ -27,7 +27,14 @@ struct BufferEdit {
     inserted_text: Arc<String>,
 }
 
+struct CompositeBufferEdit {
+    start: usize,
+    deleted_len: usize,
+    inserted_text: Arc<String>,
+}
+
 const REMOTE_EDIT_CURSOR_DISTANCE: usize = 5;
+const COMPOSITE_HISTORY_CONTEXT_BYTES: usize = 64;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct UndoSnapshot {
@@ -47,7 +54,7 @@ impl UndoSnapshot {
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct UndoDelta {
     start: usize,
-    deleted_text: Arc<String>,
+    deleted_text: ChunkedText,
     inserted_text: Arc<String>,
     before_cursor: usize,
     after_cursor: usize,
@@ -129,7 +136,7 @@ impl WordUndoRedoState {
         let (replace_start, replace_end) = Self::normalized_replace_range(&snapshot.text, edit);
         let _ = snapshot
             .text
-            .replace_range(replace_start, replace_end, edit.inserted_text.as_str());
+            .replace_range_shared(replace_start, replace_end, edit.inserted_text.clone());
         let cursor = replace_start
             .saturating_add(edit.inserted_text.len())
             .min(snapshot.text.len());
@@ -137,21 +144,28 @@ impl WordUndoRedoState {
     }
 
     fn apply_delta_to_snapshot(snapshot: &mut UndoSnapshot, delta: &UndoDelta, reverse: bool) {
+        let start = Self::clamp_chunked_boundary(&snapshot.text, delta.start);
         let delete_len = if reverse {
             delta.inserted_text.len()
         } else {
             delta.deleted_text.len()
         };
-        let edit = BufferEdit {
-            start: delta.start,
-            deleted_len: delete_len,
-            inserted_text: if reverse {
-                delta.deleted_text.clone()
-            } else {
-                delta.inserted_text.clone()
-            },
-        };
-        Self::apply_edit_to_snapshot(snapshot, &edit);
+        let end = Self::clamp_chunked_boundary(
+            &snapshot.text,
+            start.saturating_add(delete_len).min(snapshot.text.len()),
+        )
+        .max(start);
+        if reverse {
+            let _ = snapshot
+                .text
+                .replace_range_chunked(start, end, delta.deleted_text.clone());
+        } else {
+            let _ = snapshot.text.replace_range_shared(
+                start,
+                end,
+                delta.inserted_text.clone(),
+            );
+        }
         let cursor = if reverse {
             delta.before_cursor
         } else {
@@ -300,7 +314,7 @@ impl WordUndoRedoState {
         let group_id = self.next_group_id();
         let delta = UndoDelta {
             start: next_cursor,
-            deleted_text: Arc::new(String::new()),
+            deleted_text: ChunkedText::default(),
             inserted_text: Arc::new(String::new()),
             before_cursor: current_cursor,
             after_cursor: next_cursor,
@@ -472,7 +486,7 @@ impl WordUndoRedoState {
         let group_id = self.next_group_id();
         let delta = UndoDelta {
             start: next_cursor,
-            deleted_text: Arc::new(String::new()),
+            deleted_text: ChunkedText::default(),
             inserted_text: Arc::new(String::new()),
             before_cursor: current_cursor,
             after_cursor: next_cursor,
@@ -515,19 +529,18 @@ impl WordUndoRedoState {
         self.pending_history_text_snapshots.clear();
 
         let (replace_start, replace_end) = Self::normalized_replace_range(&self.current.text, edit);
-        let deleted_text = Arc::new(
-            self.current
-                .text
-                .range_string(replace_start, replace_end)
-                .unwrap_or_default(),
-        );
+        let deleted_text = self
+            .current
+            .text
+            .slice(replace_start, replace_end)
+            .unwrap_or_default();
         let normalized_edit = BufferEdit {
             start: replace_start,
             deleted_len: replace_end.saturating_sub(replace_start),
             inserted_text: edit.inserted_text.clone(),
         };
 
-        if deleted_text.as_str() == normalized_edit.inserted_text.as_str() {
+        if deleted_text.matches_str(normalized_edit.inserted_text.as_str()) {
             self.suppress_next_remote_cursor_move = false;
             self.finish_group_after_next_edit = false;
             self.completion_edit_group_id = None;
@@ -591,12 +604,11 @@ impl WordUndoRedoState {
         self.truncate_redo_history();
 
         let (replace_start, replace_end) = Self::normalized_replace_range(&self.current.text, edit);
-        let deleted_text = Arc::new(
-            self.current
-                .text
-                .range_string(replace_start, replace_end)
-                .unwrap_or_default(),
-        );
+        let deleted_text = self
+            .current
+            .text
+            .slice(replace_start, replace_end)
+            .unwrap_or_default();
         let normalized_edit = BufferEdit {
             start: replace_start,
             deleted_len: replace_end.saturating_sub(replace_start),
@@ -644,7 +656,7 @@ impl WordUndoRedoState {
 
     fn record_full_buffer_programmatic_replace(
         &mut self,
-        deleted_text: Arc<String>,
+        _deleted_text: Arc<String>,
         inserted_text: Arc<String>,
         before_cursor: usize,
         after_cursor: usize,
@@ -657,9 +669,10 @@ impl WordUndoRedoState {
             &self.current.text,
             before_cursor.min(self.current.text.len()),
         );
+        let deleted_text = self.current.text.clone();
         let group_id = self.next_group_id();
 
-        self.current.text = ChunkedText::from_str(inserted_text.as_str());
+        self.current.text = ChunkedText::from_shared_string(inserted_text.clone());
         let after_cursor = Self::clamp_chunked_boundary(
             &self.current.text,
             after_cursor.min(self.current.text.len()),
@@ -734,6 +747,119 @@ impl WordUndoRedoState {
             .collect()
     }
 
+    fn common_prefix_bytes(left: &str, right: &str) -> usize {
+        let mut prefix = 0usize;
+        for (left_char, right_char) in left.chars().zip(right.chars()) {
+            if left_char != right_char {
+                break;
+            }
+            prefix = prefix.saturating_add(left_char.len_utf8());
+        }
+        prefix
+    }
+
+    fn common_suffix_bytes(left: &str, right: &str, common_prefix: usize) -> usize {
+        let left_available = left.len().saturating_sub(common_prefix);
+        let right_available = right.len().saturating_sub(common_prefix);
+        let mut suffix = 0usize;
+        for (left_char, right_char) in left.chars().rev().zip(right.chars().rev()) {
+            if left_char != right_char {
+                break;
+            }
+            let char_len = left_char.len_utf8();
+            if suffix.saturating_add(char_len) > left_available
+                || suffix.saturating_add(char_len) > right_available
+            {
+                break;
+            }
+            suffix = suffix.saturating_add(char_len);
+        }
+        suffix
+    }
+
+    fn composite_buffer_edit(
+        before: &ChunkedText,
+        after: &ChunkedText,
+        group: &[UndoDelta],
+        reverse: bool,
+    ) -> Option<CompositeBufferEdit> {
+        let mut text_deltas = group.iter().filter(|delta| Self::delta_changes_text(delta));
+        let first = text_deltas.next()?;
+        if text_deltas.next().is_none() {
+            return Some(CompositeBufferEdit {
+                start: first.start,
+                deleted_len: if reverse {
+                    first.inserted_text.len()
+                } else {
+                    first.deleted_text.len()
+                },
+                inserted_text: if reverse {
+                    Arc::new(first.deleted_text.to_flat_string())
+                } else {
+                    first.inserted_text.clone()
+                },
+            });
+        }
+
+        let start = group
+            .iter()
+            .filter(|delta| Self::delta_changes_text(delta))
+            .map(|delta| delta.start)
+            .min()?;
+        let max_start = group
+            .iter()
+            .filter(|delta| Self::delta_changes_text(delta))
+            .map(|delta| delta.start)
+            .max()
+            .unwrap_or(start);
+        let payload_bytes = group
+            .iter()
+            .filter(|delta| Self::delta_changes_text(delta))
+            .map(|delta| {
+                delta
+                    .deleted_text
+                    .len()
+                    .saturating_add(delta.inserted_text.len())
+            })
+            .fold(0usize, usize::saturating_add);
+        let coverage = max_start
+            .saturating_sub(start)
+            .saturating_add(payload_bytes)
+            .saturating_add(COMPOSITE_HISTORY_CONTEXT_BYTES);
+        let before_end = before.clamp_boundary(
+            start
+                .saturating_add(coverage)
+                .min(before.len()),
+        );
+        let unchanged_tail = before.len().saturating_sub(before_end);
+        let after_end = after.clamp_boundary(
+            after
+                .len()
+                .saturating_sub(unchanged_tail)
+                .max(start)
+                .min(after.len()),
+        );
+        let before_fragment = before.range_string(start, before_end)?;
+        let after_fragment = after.range_string(start, after_end)?;
+        let common_prefix = Self::common_prefix_bytes(&before_fragment, &after_fragment);
+        let common_suffix =
+            Self::common_suffix_bytes(&before_fragment, &after_fragment, common_prefix);
+        let replacement_end = after_fragment.len().saturating_sub(common_suffix);
+        let inserted_text = Arc::new(
+            after_fragment
+                .get(common_prefix..replacement_end)?
+                .to_string(),
+        );
+        Some(CompositeBufferEdit {
+            start: start.saturating_add(common_prefix),
+            deleted_len: before_fragment
+                .len()
+                .saturating_sub(common_prefix)
+                .saturating_sub(common_suffix),
+            inserted_text,
+        })
+    }
+
     fn take_undo_group(&mut self) -> Vec<UndoDelta> {
         self.normalize_index();
         self.pending_history_text_snapshots.clear();
@@ -761,11 +887,13 @@ impl WordUndoRedoState {
             }
             self.index = self.index.saturating_sub(1);
             Self::apply_delta_to_snapshot(&mut self.current, &delta, true);
-            self.pending_history_text_snapshots
-                .push_back(self.current.text.clone());
             group.push(delta);
         }
         if !group.is_empty() {
+            if group.iter().any(Self::delta_changes_text) {
+                self.pending_history_text_snapshots
+                    .push_back(self.current.text.clone());
+            }
             self.active_group = None;
             self.applying_history = true;
         }
@@ -822,12 +950,14 @@ impl WordUndoRedoState {
                 break;
             }
             Self::apply_delta_to_snapshot(&mut self.current, &delta, false);
-            self.pending_history_text_snapshots
-                .push_back(self.current.text.clone());
             self.index = self.index.saturating_add(1);
             group.push(delta);
         }
         if !group.is_empty() {
+            if group.iter().any(Self::delta_changes_text) {
+                self.pending_history_text_snapshots
+                    .push_back(self.current.text.clone());
+            }
             self.active_group = None;
             self.applying_history = true;
         }
@@ -897,27 +1027,15 @@ impl SqlEditorWidget {
         state.pending_history_text_snapshots.clear();
     }
 
-    fn apply_delta_to_buffer(buffer: &mut TextBuffer, delta: &UndoDelta, reverse: bool) {
-        if !WordUndoRedoState::delta_changes_text(delta) {
-            return;
-        }
-
+    fn apply_composite_buffer_edit(buffer: &mut TextBuffer, edit: &CompositeBufferEdit) {
         let buffer_len = buffer.length().max(0) as usize;
-        let start = delta.start.min(buffer_len);
-        let delete_len = if reverse {
-            delta.inserted_text.len()
-        } else {
-            delta.deleted_text.len()
-        };
-        let end = start.saturating_add(delete_len).min(buffer_len);
+        let start = edit.start.min(buffer_len);
+        let end = start
+            .saturating_add(edit.deleted_len)
+            .min(buffer_len);
         let start_i32 = start.min(i32::MAX as usize) as i32;
         let end_i32 = end.min(i32::MAX as usize) as i32;
-        let replacement = if reverse {
-            delta.deleted_text.as_str()
-        } else {
-            delta.inserted_text.as_str()
-        };
-        buffer.replace(start_i32, end_i32, replacement);
+        buffer.replace(start_i32, end_i32, edit.inserted_text.as_str());
     }
 
     pub fn reset_undo_redo_history(&self) {
@@ -966,24 +1084,31 @@ impl SqlEditorWidget {
     }
 
     pub fn undo(&self) {
-        let (deltas, cursor_pos) = {
+        let (composite_edit, cursor_pos) = {
             let mut state = self
                 .undo_redo_state
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let before = state.current.text.clone();
             let deltas = state.take_undo_group();
             if deltas.is_empty() {
                 return;
             }
+            let composite_edit = WordUndoRedoState::composite_buffer_edit(
+                &before,
+                &state.current.text,
+                &deltas,
+                true,
+            );
             let cursor_pos = state
                 .undo_cursor_after_group(&deltas)
                 .min(i32::MAX as usize) as i32;
-            (deltas, cursor_pos)
+            (composite_edit, cursor_pos)
         };
 
-        let mut buffer = self.buffer.clone();
-        for delta in &deltas {
-            Self::apply_delta_to_buffer(&mut buffer, delta, true);
+        if let Some(edit) = composite_edit.as_ref() {
+            let mut buffer = self.buffer.clone();
+            Self::apply_composite_buffer_edit(&mut buffer, edit);
         }
         let mut editor = self.editor.clone();
         editor.set_insert_position(cursor_pos);
@@ -998,22 +1123,29 @@ impl SqlEditorWidget {
     }
 
     pub fn redo(&self) {
-        let (deltas, cursor_pos) = {
+        let (composite_edit, cursor_pos) = {
             let mut state = self
                 .undo_redo_state
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let before = state.current.text.clone();
             let deltas = state.take_redo_group();
             if deltas.is_empty() {
                 return;
             }
+            let composite_edit = WordUndoRedoState::composite_buffer_edit(
+                &before,
+                &state.current.text,
+                &deltas,
+                false,
+            );
             let cursor_pos = state.current.cursor_pos.min(i32::MAX as usize) as i32;
-            (deltas, cursor_pos)
+            (composite_edit, cursor_pos)
         };
 
-        let mut buffer = self.buffer.clone();
-        for delta in &deltas {
-            Self::apply_delta_to_buffer(&mut buffer, delta, false);
+        if let Some(edit) = composite_edit.as_ref() {
+            let mut buffer = self.buffer.clone();
+            Self::apply_composite_buffer_edit(&mut buffer, edit);
         }
         let mut editor = self.editor.clone();
         editor.set_insert_position(cursor_pos);
@@ -1157,8 +1289,55 @@ fn inserted_text(
     buf.text_range(pos, insert_end).unwrap_or_default()
 }
 
+fn take_matching_pending_paste_text(
+    buf: &TextBuffer,
+    pos: i32,
+    ins: i32,
+    pending: &Arc<Mutex<Option<Arc<String>>>>,
+) -> Option<Arc<String>> {
+    const EDGE_PROBE_BYTES: usize = 64;
+
+    let candidate = pending
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .take()?;
+    let inserted_len = usize::try_from(ins).ok()?;
+    if pos < 0 || candidate.len() != inserted_len {
+        return None;
+    }
+    if inserted_len == 0 {
+        return Some(candidate);
+    }
+
+    let probe_len = inserted_len.min(EDGE_PROBE_BYTES);
+    let prefix_end = pos.saturating_add(i32::try_from(probe_len).ok()?);
+    if buf.text_range(pos, prefix_end).as_deref()
+        != candidate.get(..probe_len)
+    {
+        return None;
+    }
+    if inserted_len > probe_len {
+        let suffix_start_offset = inserted_len.saturating_sub(probe_len);
+        let suffix_start = pos.saturating_add(i32::try_from(suffix_start_offset).ok()?);
+        let suffix_end = pos.saturating_add(ins);
+        if buf.text_range(suffix_start, suffix_end).as_deref()
+            != candidate.get(suffix_start_offset..)
+        {
+            return None;
+        }
+    }
+    Some(candidate)
+}
+
 fn classify_edit_granularity(ins: i32, del: i32, inserted: &str, deleted: &str) -> EditGranularity {
+    const MAX_GROUPED_WORD_EDIT_BYTES: usize = 128;
+
     if ins <= 0 && del <= 0 {
+        return EditGranularity::Other;
+    }
+    if inserted.len() > MAX_GROUPED_WORD_EDIT_BYTES
+        || deleted.len() > MAX_GROUPED_WORD_EDIT_BYTES
+    {
         return EditGranularity::Other;
     }
 

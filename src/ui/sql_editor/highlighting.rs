@@ -1,16 +1,15 @@
 use crate::ui::syntax_highlight::{
-    encode_fltk_style_bytes, replace_text_buffer_with_raw_bytes, set_text_buffer_raw_bytes,
+    append_fltk_style_bytes, encode_fltk_style_bytes, replace_text_buffer_with_raw_bytes,
     LexerState, STYLE_BLOCK_COMMENT, STYLE_COMMENT, STYLE_DATETIME_LITERAL, STYLE_HINT,
     STYLE_Q_QUOTE_STRING, STYLE_QUOTED_IDENTIFIER,
 };
 #[cfg(test)]
-use crate::ui::syntax_highlight::HighlightWordAudit;
+use crate::ui::syntax_highlight::{HighlightWordAudit, STYLE_DEFAULT};
 
 const DEFERRED_REHIGHLIGHT_IDLE_DELAY_SECONDS: f64 = 0.15;
 const SEMANTIC_REHIGHLIGHT_OVERSCAN_LINES: usize = 100;
-const LARGE_DOCUMENT_PASTE_LINE_THRESHOLD: usize = 100_000;
-const LARGE_PASTE_DEFER_SEMANTIC_BYTES: usize = 64 * 1024;
 const INCREMENTAL_HIGHLIGHT_BATCH_BYTES: usize = 64 * 1024;
+const PARSER_LEX_MODE_CHECKPOINT_LIMIT: usize = 256;
 // Keep semantic alias work independent of the total document size. The window
 // is renewed only if lexical-state propagation carries highlighting beyond it.
 const LOCAL_ALIAS_CONTEXT_LOOKAROUND_BYTES: usize = 16 * 1024;
@@ -21,7 +20,7 @@ struct BoundedSqlContextAnalysis {
     end: usize,
     mysql_compatible: bool,
     intellisense_shareable: bool,
-    token_spans: Arc<[SqlTokenSpan]>,
+    token_spans: Arc<Mutex<Option<Vec<SqlTokenSpan>>>>,
     alias_context: Arc<super::query_text::LocalAliasContext>,
 }
 
@@ -35,27 +34,27 @@ impl BoundedSqlContextAnalysis {
             return None;
         }
 
-        let first = self.token_spans.partition_point(|span| span.end <= start);
-        let last = self.token_spans.partition_point(|span| span.start < end);
-        let spans = self.token_spans.get(first..last)?;
-        if spans
+        let mut token_spans = self
+            .token_spans
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let spans = token_spans.as_ref()?;
+        let first = spans.partition_point(|span| span.end <= start);
+        let last = spans.partition_point(|span| span.start < end);
+        let selected = spans.get(first..last)?;
+        if selected
             .iter()
             .any(|span| span.start < start || span.end > end)
         {
             return None;
         }
-
-        Some(
-            spans
-                .iter()
-                .cloned()
-                .map(|mut span| {
-                    span.start = span.start.saturating_sub(start);
-                    span.end = span.end.saturating_sub(start);
-                    span
-                })
-                .collect(),
-        )
+        let mut spans = token_spans.take()?;
+        let mut selected = spans.drain(first..last).collect::<Vec<_>>();
+        for span in &mut selected {
+            span.start = span.start.saturating_sub(start);
+            span.end = span.end.saturating_sub(start);
+        }
+        Some(selected)
     }
 }
 
@@ -102,12 +101,53 @@ struct BoundedAliasContext {
     end: usize,
 }
 
-fn should_defer_semantic_alias_context_for_insert(
-    line_count: usize,
-    inserted_text: &str,
-) -> bool {
-    inserted_text.len() >= LARGE_PASTE_DEFER_SEMANTIC_BYTES
-        || (line_count >= LARGE_DOCUMENT_PASTE_LINE_THRESHOLD && inserted_text.len() > 1)
+#[derive(Clone)]
+struct ParserLexModeCheckpoint {
+    mode: crate::sql_parser_engine::LexMode,
+    restartable: bool,
+}
+
+#[derive(Default)]
+struct ParserLexModeCheckpoints {
+    standard: std::collections::BTreeMap<usize, ParserLexModeCheckpoint>,
+    mysql: std::collections::BTreeMap<usize, ParserLexModeCheckpoint>,
+}
+
+impl ParserLexModeCheckpoints {
+    fn map(
+        &self,
+        mysql_compatible: bool,
+    ) -> &std::collections::BTreeMap<usize, ParserLexModeCheckpoint> {
+        if mysql_compatible {
+            &self.mysql
+        } else {
+            &self.standard
+        }
+    }
+
+    fn map_mut(
+        &mut self,
+        mysql_compatible: bool,
+    ) -> &mut std::collections::BTreeMap<usize, ParserLexModeCheckpoint> {
+        if mysql_compatible {
+            &mut self.mysql
+        } else {
+            &mut self.standard
+        }
+    }
+
+    fn insert(
+        &mut self,
+        mysql_compatible: bool,
+        position: usize,
+        checkpoint: ParserLexModeCheckpoint,
+    ) {
+        let map = self.map_mut(mysql_compatible);
+        map.insert(position, checkpoint);
+        while map.len() > PARSER_LEX_MODE_CHECKPOINT_LIMIT {
+            map.pop_first();
+        }
+    }
 }
 
 impl BoundedAliasContext {
@@ -120,8 +160,9 @@ impl BoundedAliasContext {
 pub(crate) struct HighlightShadowState {
     text: ChunkedText,
     styles: ChunkedValues<u8>,
-    line_exit_states: ChunkedValues<LexerState>,
+    line_exit_states: RunValues<LexerState>,
     shared_sql_context: Option<BoundedSqlContextAnalysis>,
+    parser_lex_mode_checkpoints: Arc<Mutex<ParserLexModeCheckpoints>>,
 }
 
 struct AppliedShadowTextEdit {
@@ -146,48 +187,25 @@ impl AppliedShadowTextEdit {
         }
     }
 
-    fn old_styles_for_new_range(
+    fn old_styles_match_new_range(
         &self,
         styles: &ChunkedValues<u8>,
         start: usize,
         end: usize,
-    ) -> Option<Vec<u8>> {
-        if end < start {
-            return None;
-        }
-        let mut mapped = Vec::with_capacity(end.saturating_sub(start));
-
-        let unchanged_prefix_end = end.min(self.start);
-        if start < unchanged_prefix_end {
-            mapped.extend(styles.range_vec(start, unchanged_prefix_end)?);
-        }
-
-        let inserted_start = start.max(self.start);
-        let inserted_end = end.min(self.new_end);
-        if inserted_start < inserted_end {
-            mapped.resize(
-                mapped
-                    .len()
-                    .saturating_add(inserted_end.saturating_sub(inserted_start)),
-                STYLE_DEFAULT as u8,
-            );
-        }
-
-        let unchanged_suffix_start = start.max(self.new_end);
-        if unchanged_suffix_start < end {
-            let old_start = self
-                .old_end
-                .saturating_add(unchanged_suffix_start.saturating_sub(self.new_end));
-            let old_end = old_start.saturating_add(end.saturating_sub(unchanged_suffix_start));
-            mapped.extend(styles.range_vec(old_start, old_end)?);
-        }
-
-        (mapped.len() == end.saturating_sub(start)).then_some(mapped)
+        generated: &[u8],
+    ) -> bool {
+        let Some(old_start) = self.old_position_for_new(start) else {
+            return false;
+        };
+        let Some(old_end) = self.old_position_for_new(end) else {
+            return false;
+        };
+        styles.range_matches_slice(old_start, old_end, generated)
     }
 
     fn old_line_state_for_new(
         &self,
-        states: &ChunkedValues<LexerState>,
+        states: &RunValues<LexerState>,
         line_start: usize,
         line_end: usize,
     ) -> Option<LexerState> {
@@ -239,6 +257,7 @@ impl HighlightShadowState {
         );
     }
 
+    #[cfg(test)]
     fn rebuild_from_snapshot(
         &mut self,
         text: ChunkedText,
@@ -247,8 +266,9 @@ impl HighlightShadowState {
     ) {
         self.text = text;
         self.styles = ChunkedValues::from_vec(styles.as_bytes().to_vec());
-        self.line_exit_states = ChunkedValues::from_vec(line_exit_states);
+        self.line_exit_states = RunValues::from_vec(line_exit_states);
         self.shared_sql_context = None;
+        self.clear_parser_lex_mode_checkpoints();
     }
 
     pub(crate) fn clear(&mut self) {
@@ -296,7 +316,7 @@ impl HighlightShadowState {
         cursor: usize,
         lookbehind: usize,
         lookahead: usize,
-    ) -> (String, usize, usize) {
+    ) -> (ChunkedTextSlice, usize, usize) {
         let cursor = self.text.clamp_boundary(cursor.min(self.text.len()));
         let start = self
             .text
@@ -307,7 +327,9 @@ impl HighlightShadowState {
                 .min(self.text.len()),
         );
         (
-            self.text.range_string(start, end).unwrap_or_default(),
+            self.text
+                .shared_or_owned_range(start, end)
+                .unwrap_or_else(|| ChunkedTextSlice::whole(Arc::new(String::new()))),
             start,
             cursor.saturating_sub(start),
         )
@@ -406,30 +428,107 @@ impl HighlightShadowState {
         mysql_compatible: bool,
     ) -> crate::sql_parser_engine::LexMode {
         let pos = self.text.clamp_boundary(pos.min(self.text.len()));
+        if let Some(cached) = self
+            .parser_lex_mode_checkpoints
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .map(mysql_compatible)
+            .get(&pos)
+        {
+            return cached.mode.clone();
+        }
         let line_start = self.line_start(pos);
         let initial_mode = self.parser_lex_mode_at_line_start(line_start);
         if pos == line_start {
+            self.cache_parser_lex_mode(pos, mysql_compatible, initial_mode.clone(), true);
             return initial_mode;
         }
         // The overwhelmingly common case is a bounded window beginning in
         // ordinary code. The aligned style shadow proves that immediately,
         // avoiding a scan from the start of a pathologically long line.
+        let style_probe = if pos < self.text.len() {
+            Some(pos)
+        } else {
+            pos.checked_sub(1)
+        };
         if self.styles.len() == self.text.len()
-            && pos < self.text.len()
-            && self.parser_lexical_kind_at(pos).is_none()
+            && style_probe.is_some_and(|probe| self.parser_lexical_kind_at(probe).is_none())
         {
-            return crate::sql_parser_engine::LexMode::Idle;
+            let mode = crate::sql_parser_engine::LexMode::Idle;
+            self.cache_parser_lex_mode(
+                pos,
+                mysql_compatible,
+                mode.clone(),
+                self.parser_restart_is_safe(pos, &mode),
+            );
+            return mode;
         }
+
+        let cached_restart = self
+            .parser_lex_mode_checkpoints
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .map(mysql_compatible)
+            .range(line_start..pos)
+            .rev()
+            .find(|(_, checkpoint)| checkpoint.restartable)
+            .map(|(position, checkpoint)| (*position, checkpoint.mode.clone()));
+        let (scan_start, scan_initial_mode) =
+            cached_restart.unwrap_or((line_start, initial_mode));
         let prefix = self
             .text
-            .range_string(line_start, pos)
+            .range_string(scan_start, pos)
             .unwrap_or_default();
-        crate::sql_parser_engine::lexical_spans_with_initial_mode(
+        let mode = crate::sql_parser_engine::lexical_spans_with_initial_mode(
             &prefix,
             mysql_compatible,
-            initial_mode,
+            scan_initial_mode,
         )
-        .1
+        .1;
+        self.cache_parser_lex_mode(
+            pos,
+            mysql_compatible,
+            mode.clone(),
+            self.parser_restart_is_safe(pos, &mode),
+        );
+        mode
+    }
+
+    fn cache_parser_lex_mode(
+        &self,
+        position: usize,
+        mysql_compatible: bool,
+        mode: crate::sql_parser_engine::LexMode,
+        restartable: bool,
+    ) {
+        self.parser_lex_mode_checkpoints
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(
+                mysql_compatible,
+                position,
+                ParserLexModeCheckpoint { mode, restartable },
+            );
+    }
+
+    fn parser_restart_is_safe(
+        &self,
+        position: usize,
+        mode: &crate::sql_parser_engine::LexMode,
+    ) -> bool {
+        matches!(mode, crate::sql_parser_engine::LexMode::Idle)
+            && position
+                .checked_sub(1)
+                .and_then(|previous| self.text.byte_at(previous))
+                .is_some_and(|byte| byte.is_ascii_whitespace())
+    }
+
+    fn clear_parser_lex_mode_checkpoints(&self) {
+        *self
+            .parser_lex_mode_checkpoints
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) =
+            ParserLexModeCheckpoints::default();
     }
 
     pub(crate) fn parser_lexical_kind_at(
@@ -439,7 +538,13 @@ impl HighlightShadowState {
         if self.styles.len() != self.text.len() || pos >= self.text.len() {
             return None;
         }
-        match char::from(*self.styles.get(pos)?) {
+        Self::parser_lexical_kind_for_style(*self.styles.get(pos)?)
+    }
+
+    fn parser_lexical_kind_for_style(
+        style: u8,
+    ) -> Option<crate::sql_parser_engine::LexicalKind> {
+        match char::from(style) {
             STYLE_STRING | STYLE_Q_QUOTE_STRING | STYLE_DATETIME_LITERAL => {
                 Some(crate::sql_parser_engine::LexicalKind::String)
             }
@@ -452,6 +557,27 @@ impl HighlightShadowState {
             }
             _ => None,
         }
+    }
+
+    pub(crate) fn intellisense_context_start(&self, start: usize, cursor: usize) -> usize {
+        let start = self.text.clamp_boundary(start.min(self.text.len()));
+        let cursor = self
+            .text
+            .clamp_boundary(cursor.max(start).min(self.text.len()));
+        if self.styles.len() != self.text.len()
+            || self.parser_lexical_kind_at(start).is_none()
+        {
+            return start;
+        }
+        let Some(mut aligned) = self.styles.first_matching_position(start, cursor, |style| {
+            Self::parser_lexical_kind_for_style(*style).is_none()
+        }) else {
+            return start;
+        };
+        while aligned < cursor && !self.text.is_char_boundary(aligned) {
+            aligned = aligned.saturating_add(1);
+        }
+        aligned
     }
 
     #[cfg(test)]
@@ -568,8 +694,8 @@ impl HighlightShadowState {
         );
         let text = self
             .text
-            .range_string(context_start, context_end)
-            .unwrap_or_default();
+            .shared_or_owned_range(context_start, context_end)
+            .unwrap_or_else(|| ChunkedTextSlice::whole(Arc::new(String::new())));
         let intellisense_shareable = matches!(
             self.parser_lex_mode_at(context_start, mysql_compatible),
             crate::sql_parser_engine::LexMode::Idle
@@ -588,7 +714,7 @@ impl HighlightShadowState {
             end: context_end,
             mysql_compatible,
             intellisense_shareable,
-            token_spans: token_spans.into(),
+            token_spans: Arc::new(Mutex::new(Some(token_spans))),
             alias_context: alias_context.clone(),
         });
         BoundedAliasContext {
@@ -663,6 +789,7 @@ impl HighlightShadowState {
             return None;
         }
         self.shared_sql_context = None;
+        self.clear_parser_lex_mode_checkpoints();
         let new_end = start.saturating_add(inserted_text.len());
         Some(AppliedShadowTextEdit {
             old_text,
@@ -674,6 +801,7 @@ impl HighlightShadowState {
     }
 }
 
+#[cfg(test)]
 fn text_ends_with_line_break(text: &str) -> bool {
     text.as_bytes()
         .last()
@@ -681,6 +809,7 @@ fn text_ends_with_line_break(text: &str) -> bool {
         .is_some_and(|byte| byte == b'\n' || byte == b'\r')
 }
 
+#[cfg(test)]
 pub(crate) fn build_logical_styles_and_line_states(
     highlighter: &SqlHighlighter,
     text: &str,
@@ -732,6 +861,7 @@ pub(crate) fn build_logical_styles_and_line_states_with_word_audit(
     (styles, states, audits)
 }
 
+#[cfg(test)]
 fn build_logical_styles_and_line_states_with<F>(
     text: &str,
     mut highlight_line: F,
@@ -766,6 +896,7 @@ where
     (style_bytes_to_string(styles), line_exit_states)
 }
 
+#[cfg(test)]
 fn inclusive_line_end_for_text(text: &str, pos: usize) -> usize {
     let text_len = text.len();
     if text_len == 0 {
@@ -793,6 +924,7 @@ fn inclusive_line_end_for_text(text: &str, pos: usize) -> usize {
     text_len
 }
 
+#[cfg(test)]
 fn style_bytes_to_string(styles: Vec<u8>) -> String {
     debug_assert!(
         styles.iter().all(|&byte| byte.is_ascii()),
@@ -810,18 +942,6 @@ impl SqlEditorWidget {
         std::iter::repeat_n(STYLE_DEFAULT, len).collect()
     }
 
-    fn set_style_buffer_for_text(
-        style_buffer: &mut TextBuffer,
-        text: &str,
-        logical_styles: &str,
-    ) -> bool {
-        let Some(encoded) = encode_fltk_style_bytes(text, logical_styles) else {
-            return false;
-        };
-        set_text_buffer_raw_bytes(style_buffer, &encoded);
-        true
-    }
-
     fn replace_style_buffer_range_for_text(
         style_buffer: &mut TextBuffer,
         text: &str,
@@ -829,16 +949,47 @@ impl SqlEditorWidget {
         start: usize,
         end: usize,
     ) -> bool {
-        let Some(encoded) = encode_fltk_style_bytes(text, logical_styles) else {
+        if text.len() != logical_styles.len() {
             return false;
-        };
+        }
         let Ok(start_i32) = i32::try_from(start) else {
             return false;
         };
         let Ok(end_i32) = i32::try_from(end) else {
             return false;
         };
+        if text.is_ascii() {
+            style_buffer.replace(start_i32, end_i32, logical_styles);
+            return true;
+        }
+        let Some(encoded) = encode_fltk_style_bytes(text, logical_styles) else {
+            return false;
+        };
         replace_text_buffer_with_raw_bytes(style_buffer, start_i32, end_i32, &encoded);
+        true
+    }
+
+    fn replace_style_buffer_range_with_bytes(
+        style_buffer: &mut TextBuffer,
+        styles: &[u8],
+        start: usize,
+        end: usize,
+        requires_raw_bytes: bool,
+    ) -> bool {
+        let Ok(start_i32) = i32::try_from(start) else {
+            return false;
+        };
+        let Ok(end_i32) = i32::try_from(end) else {
+            return false;
+        };
+        if requires_raw_bytes {
+            replace_text_buffer_with_raw_bytes(style_buffer, start_i32, end_i32, styles);
+        } else {
+            let Ok(styles) = std::str::from_utf8(styles) else {
+                return false;
+            };
+            style_buffer.replace(start_i32, end_i32, styles);
+        }
         true
     }
 }
@@ -897,26 +1048,30 @@ impl SqlEditorWidget {
     ) {
         let text_len = buf.length().max(0) as usize;
         if ins > 0 && inserted_text.len() != ins.max(0) as usize {
-            self.rehighlight_full_buffer();
+            self.recover_highlighting_from_known_edit(
+                pos,
+                ins,
+                del,
+                inserted_text,
+                updated_text_snapshot,
+                text_len,
+            );
             return;
         }
 
         let expected_previous_len = text_len
             .saturating_add(del.max(0) as usize)
             .saturating_sub(ins.max(0) as usize);
-        let full_buffer_replaced = pos <= 0
-            && del.max(0) as usize == expected_previous_len
-            && ins.max(0) as usize == text_len;
-        if full_buffer_replaced {
-            self.rehighlight_full_buffer_from_text_and_snapshot(
-                inserted_text,
-                updated_text_snapshot.cloned(),
-            );
-            return;
-        }
         let mut style_buffer = self.style_buffer.clone();
         if style_buffer.length().max(0) as usize != expected_previous_len {
-            self.rehighlight_full_buffer();
+            self.recover_highlighting_from_known_edit(
+                pos,
+                ins,
+                del,
+                inserted_text,
+                updated_text_snapshot,
+                text_len,
+            );
             return;
         }
         if text_len == 0 {
@@ -934,7 +1089,7 @@ impl SqlEditorWidget {
             return;
         }
 
-        let (updated, defer_semantic_alias_context) = {
+        let updated = {
             let mut shadow = self
                 .highlight_shadow
                 .lock()
@@ -942,7 +1097,14 @@ impl SqlEditorWidget {
             if shadow.len() != expected_previous_len || shadow.styles_len() != expected_previous_len
             {
                 drop(shadow);
-                self.rehighlight_full_buffer();
+                self.recover_highlighting_from_known_edit(
+                    pos,
+                    ins,
+                    del,
+                    inserted_text,
+                    updated_text_snapshot,
+                    text_len,
+                );
                 return;
             }
 
@@ -954,36 +1116,83 @@ impl SqlEditorWidget {
                 updated_text_snapshot,
             ) else {
                 drop(shadow);
-                self.rehighlight_full_buffer();
+                self.recover_highlighting_from_known_edit(
+                    pos,
+                    ins,
+                    del,
+                    inserted_text,
+                    updated_text_snapshot,
+                    text_len,
+                );
                 return;
             };
 
-            let defer_semantic_alias_context =
-                should_defer_semantic_alias_context_for_insert(shadow.line_count(), inserted_text);
-            (
-                self.apply_main_thread_incremental_highlighting(
-                    &mut shadow,
-                    &mut style_buffer,
-                    shadow_pos,
-                    inserted_text.len(),
-                    del.max(0) as usize,
-                    inserted_text,
-                    deleted_text,
-                    defer_semantic_alias_context,
-                    &applied_edit,
-                ),
-                defer_semantic_alias_context,
+            self.apply_main_thread_incremental_highlighting(
+                &mut shadow,
+                &mut style_buffer,
+                shadow_pos,
+                inserted_text.len(),
+                del.max(0) as usize,
+                inserted_text,
+                deleted_text,
+                &applied_edit,
             )
         };
         match updated {
-            Some(true) | Some(false) => {
-                if defer_semantic_alias_context {
-                    self.schedule_deferred_visible_semantic_rehighlight();
-                }
-                self.redraw_editor_if_live();
-            }
-            None => self.rehighlight_full_buffer(),
+            Some(true) | Some(false) => self.redraw_editor_if_live(),
+            None => self.recover_highlighting_from_known_edit(
+                pos,
+                ins,
+                del,
+                inserted_text,
+                updated_text_snapshot,
+                text_len,
+            ),
         }
+    }
+
+    fn recover_highlighting_from_known_edit(
+        &self,
+        pos: i32,
+        ins: i32,
+        del: i32,
+        inserted_text: &str,
+        updated_text_snapshot: Option<&ChunkedText>,
+        expected_len: usize,
+    ) {
+        let snapshot = updated_text_snapshot.cloned().or_else(|| {
+            let mut snapshot = self
+                .highlight_shadow
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .text_snapshot();
+            if snapshot.len() == expected_len {
+                return Some(snapshot);
+            }
+            let previous_len = expected_len
+                .saturating_add(del.max(0) as usize)
+                .saturating_sub(ins.max(0) as usize);
+            if snapshot.len() != previous_len {
+                return None;
+            }
+            let start = snapshot.clamp_boundary(pos.max(0) as usize);
+            let end = snapshot.clamp_boundary(
+                start
+                    .saturating_add(del.max(0) as usize)
+                    .min(snapshot.len()),
+            );
+            snapshot
+                .replace_range(start, end, inserted_text)
+                .then_some(snapshot)
+        });
+        let Some(snapshot) = snapshot.filter(|snapshot| snapshot.len() == expected_len) else {
+            crate::utils::logging::log_error(
+                "sql_editor::highlighting",
+                "Unable to recover highlighting from the shared edit snapshot",
+            );
+            return;
+        };
+        self.rehighlight_full_buffer_from_snapshot(snapshot);
     }
 
     fn apply_main_thread_incremental_highlighting(
@@ -995,7 +1204,6 @@ impl SqlEditorWidget {
         del: usize,
         inserted_text: &str,
         deleted_text: &str,
-        defer_semantic_alias_context: bool,
         applied_edit: &AppliedShadowTextEdit,
     ) -> Option<bool> {
         let highlighter = self
@@ -1011,23 +1219,27 @@ impl SqlEditorWidget {
                 deleted_len: del,
                 inserted_text,
                 deleted_text,
-                defer_semantic_alias_context,
             },
             applied_edit,
-            |range_text, style_text, start, end| {
-                Self::replace_style_buffer_range_for_text(
+            |encoded_styles, start, end, requires_raw_bytes| {
+                Self::replace_style_buffer_range_with_bytes(
                     style_buffer,
-                    range_text,
-                    style_text,
+                    encoded_styles,
                     start,
                     end,
+                    requires_raw_bytes,
                 )
             },
         )
     }
 
     fn rehighlight_full_buffer(&self) {
-        self.rehighlight_full_buffer_from_text(&self.buffer.text());
+        let snapshot = self
+            .highlight_shadow
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .text_snapshot();
+        self.rehighlight_full_buffer_from_snapshot(snapshot);
     }
 
     pub(crate) fn schedule_deferred_visible_semantic_rehighlight(&self) {
@@ -1128,34 +1340,70 @@ impl SqlEditorWidget {
         }
     }
 
-    fn rehighlight_full_buffer_from_text(&self, text: &str) {
-        self.rehighlight_full_buffer_from_text_and_snapshot(text, None);
-    }
-
-    fn rehighlight_full_buffer_from_text_and_snapshot(
-        &self,
-        text: &str,
-        text_snapshot: Option<ChunkedText>,
-    ) {
-        let (styles, line_exit_states) = {
-            let highlighter = self
-                .highlighter
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            build_logical_styles_and_line_states(&highlighter, text)
-        };
+    fn rehighlight_full_buffer_from_snapshot(&self, text: ChunkedText) {
         let mut style_buffer = self.style_buffer.clone();
-        if !Self::set_style_buffer_for_text(&mut style_buffer, text, &styles) {
+        if text.is_empty() {
+            style_buffer.set_text("");
+            self.highlight_shadow
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .clear();
+            self.redraw_editor_if_live();
             return;
         }
-        self.highlight_shadow
+
+        let text_len = text.len();
+        let mut rebuilt = HighlightShadowState {
+            text,
+            ..Default::default()
+        };
+        let applied_edit = AppliedShadowTextEdit {
+            old_text: ChunkedText::default(),
+            start: 0,
+            old_end: 0,
+            new_end: text_len,
+            old_affected_line_end: 0,
+        };
+        let highlighter = self
+            .highlighter
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .rebuild_from_snapshot(
-                text_snapshot.unwrap_or_else(|| ChunkedText::from_str(text)),
-                &styles,
-                line_exit_states,
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let old_style_len = style_buffer.length().max(0) as usize;
+        let mut style_update_count = 0usize;
+        let updated = apply_incremental_highlighting_to_shadow(
+            &mut rebuilt,
+            &highlighter,
+            IncrementalHighlightEdit {
+                position: 0,
+                inserted_len: text_len,
+                deleted_len: old_style_len,
+                inserted_text: "",
+                deleted_text: "",
+            },
+            &applied_edit,
+            |styles, _start, _end, requires_raw_bytes| {
+                style_update_count = style_update_count.saturating_add(1);
+                Self::replace_style_buffer_range_with_bytes(
+                    &mut style_buffer,
+                    styles,
+                    0,
+                    old_style_len,
+                    requires_raw_bytes,
+                )
+            },
+        );
+        drop(highlighter);
+        if updated.is_none() || style_update_count != 1 {
+            crate::utils::logging::log_error(
+                "sql_editor::highlighting",
+                "Unable to rebuild highlighting from the shared text snapshot",
             );
+            return;
+        }
+        *self
+            .highlight_shadow
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = rebuilt;
         self.redraw_editor_if_live();
     }
 }
@@ -1166,7 +1414,6 @@ struct IncrementalHighlightEdit<'a> {
     deleted_len: usize,
     inserted_text: &'a str,
     deleted_text: &'a str,
-    defer_semantic_alias_context: bool,
 }
 
 fn apply_incremental_highlighting_to_shadow<F>(
@@ -1177,7 +1424,7 @@ fn apply_incremental_highlighting_to_shadow<F>(
     mut apply_style_range: F,
 ) -> Option<bool>
 where
-    F: FnMut(&str, &str, usize, usize) -> bool,
+    F: FnMut(&[u8], usize, usize, bool) -> bool,
 {
     let text_len = shadow.len();
     if text_len == 0 {
@@ -1199,59 +1446,74 @@ where
         text_len,
     );
     let mysql_compatible = highlighter.mysql_compatible();
+    let line_count = shadow.line_count();
     let mut current_line_idx = shadow.line_index_for_position(start);
     let first_line_idx = current_line_idx;
     let mut entry_state = shadow.entry_state_for_line(current_line_idx);
     let estimated_style_len = must_cover_end.saturating_sub(start);
     let mut generated_styles = Vec::with_capacity(estimated_style_len);
-    let mut generated_exit_states = Vec::with_capacity(
+    let estimated_state_count =
         shadow
             .line_index_for_position(must_cover_end)
             .saturating_sub(first_line_idx)
-            .saturating_add(1),
+            .saturating_add(1);
+    let mut generated_exit_state_runs = Vec::<(LexerState, usize)>::with_capacity(
+        estimated_state_count.min(256),
     );
     let mut line_style_scratch = Vec::new();
+    let mut batch_line_ends = Vec::new();
+    let mut encoded_styles = None::<Vec<u8>>;
     let mut processed_end = start;
     let mut processed_line_start = start;
     let mut processed_line_end = start;
-    let mut any_styles_changed = edit.inserted_len != edit.deleted_len;
+    let mut any_styles_changed = edit.inserted_len > 0 || edit.deleted_len > 0;
     let mut any_states_changed = false;
-    let mut alias_context = if edit.defer_semantic_alias_context {
-        BoundedAliasContext {
-            context: Arc::new(super::query_text::LocalAliasContext::default()),
-            start: 0,
-            end: text_len,
-        }
-    } else {
-        shadow.bounded_alias_context(start, must_cover_end, mysql_compatible)
-    };
+    let mut alias_context = shadow.bounded_alias_context(
+        start,
+        start
+            .saturating_add(INCREMENTAL_HIGHLIGHT_BATCH_BYTES)
+            .min(must_cover_end.max(start)),
+        mysql_compatible,
+    );
 
-    'batches: while current_line_idx < shadow.line_count() {
+    'batches: while current_line_idx < line_count {
         let batch_start = shadow.line_start_for_index(current_line_idx);
         let batch_target = batch_start
             .saturating_add(INCREMENTAL_HIGHLIGHT_BATCH_BYTES)
             .min(text_len);
         let batch_end = shadow.inclusive_line_end(batch_target).max(batch_start);
-        let batch_text = shadow.text_range_string(batch_start, batch_end)?;
-        let previous_styles =
-            applied_edit.old_styles_for_new_range(&shadow.styles, batch_start, batch_end)?;
+        let batch_text = shadow
+            .text
+            .shared_or_owned_range(batch_start, batch_end)?;
+        let batch_is_ascii = batch_text.is_known_ascii();
+        shadow
+            .text
+            .collect_line_ends_in_range(batch_start, batch_end, &mut batch_line_ends);
+        let mut relative_start = 0usize;
+        let mut batch_line_index = 0usize;
 
         loop {
-            let current_start = shadow.line_start_for_index(current_line_idx);
-            let current_end = shadow.inclusive_line_end_for_index(current_line_idx);
-            if current_start < batch_start || current_end > batch_end {
+            let trailing_empty_line = batch_start == text_len
+                && batch_text.is_empty()
+                && current_line_idx.saturating_add(1) == line_count;
+            if relative_start >= batch_text.len() && !trailing_empty_line {
                 break;
             }
+            let relative_end = if trailing_empty_line {
+                0
+            } else {
+                batch_line_ends
+                    .get(batch_line_index)
+                    .copied()?
+                    .saturating_sub(batch_start)
+            };
+            let current_start = batch_start.saturating_add(relative_start);
+            let current_end = batch_start.saturating_add(relative_end);
             if !alias_context.covers(current_start, current_end) {
                 alias_context =
                     shadow.bounded_alias_context(current_start, current_end, mysql_compatible);
             }
-            let relative_start = current_start.saturating_sub(batch_start);
-            let relative_end = current_end.saturating_sub(batch_start);
             let range_text = batch_text.get(relative_start..relative_end)?;
-            let previous_line_styles = previous_styles.get(relative_start..relative_end)?;
-            let old_exit_state = applied_edit
-                .old_line_state_for_new(&shadow.line_exit_states, current_start, current_end);
             let new_exit_state = highlighter
                 .generate_style_bytes_for_window_with_alias_context_into(
                     range_text,
@@ -1264,32 +1526,65 @@ where
                 return None;
             }
 
-            let styles_changed = line_style_scratch.as_slice() != previous_line_styles;
-            any_styles_changed |= styles_changed;
-            any_states_changed |= old_exit_state != Some(new_exit_state);
+            if let Some(encoded) = encoded_styles.as_mut() {
+                if !append_fltk_style_bytes(range_text, &line_style_scratch, encoded) {
+                    return None;
+                }
+            } else if !batch_is_ascii && !range_text.is_ascii() {
+                let mut encoded = Vec::with_capacity(estimated_style_len);
+                encoded.extend_from_slice(&generated_styles);
+                if !append_fltk_style_bytes(range_text, &line_style_scratch, &mut encoded) {
+                    return None;
+                }
+                encoded_styles = Some(encoded);
+            }
+            let compare_for_convergence = current_start >= must_cover_end;
+            let old_exit_state = compare_for_convergence.then(|| {
+                applied_edit.old_line_state_for_new(
+                    &shadow.line_exit_states,
+                    current_start,
+                    current_end,
+                )
+            });
+            let styles_match = compare_for_convergence
+                && applied_edit.old_styles_match_new_range(
+                    &shadow.styles,
+                    current_start,
+                    current_end,
+                    &line_style_scratch,
+                );
+            if compare_for_convergence {
+                any_styles_changed |= !styles_match;
+                any_states_changed |= old_exit_state.flatten() != Some(new_exit_state);
+            }
             generated_styles.extend_from_slice(&line_style_scratch);
-            generated_exit_states.push(new_exit_state);
+            if let Some((_, run_len)) = generated_exit_state_runs
+                .last_mut()
+                .filter(|(state, _)| *state == new_exit_state)
+            {
+                *run_len = run_len.saturating_add(1);
+            } else {
+                generated_exit_state_runs.push((new_exit_state, 1));
+            }
             processed_end = current_end;
             processed_line_start = current_start;
             processed_line_end = current_end;
 
-            if current_end >= must_cover_end
-                && !styles_changed
-                && old_exit_state == Some(new_exit_state)
+            if compare_for_convergence
+                && styles_match
+                && old_exit_state.flatten() == Some(new_exit_state)
             {
                 break 'batches;
             }
 
             current_line_idx = current_line_idx.saturating_add(1);
             entry_state = new_exit_state;
-            if current_line_idx >= shadow.line_count() {
+            relative_start = relative_end;
+            batch_line_index = batch_line_index.saturating_add(1);
+            if current_line_idx >= line_count {
                 break 'batches;
             }
-            let next_start = shadow.line_start_for_index(current_line_idx);
-            let include_trailing_empty_line = batch_end == text_len
-                && next_start == text_len
-                && current_line_idx.saturating_add(1) == shadow.line_count();
-            if next_start >= batch_end && !include_trailing_empty_line {
+            if relative_start >= batch_text.len() {
                 break;
             }
         }
@@ -1297,14 +1592,14 @@ where
 
     let old_style_start = applied_edit.old_position_for_new(start)?;
     let old_style_end = applied_edit.old_position_for_new(processed_end)?;
-    let style_text = std::str::from_utf8(&generated_styles).ok()?;
-    let range_text = shadow.text_range_string(start, processed_end)?;
-    if range_text.len() != generated_styles.len()
+    let styles_for_buffer = encoded_styles.as_deref().unwrap_or(&generated_styles);
+    let requires_raw_bytes = encoded_styles.is_some();
+    if styles_for_buffer.len() != generated_styles.len()
         || !apply_style_range(
-            &range_text,
-            style_text,
+            styles_for_buffer,
             old_style_start,
             old_style_end,
+            requires_raw_bytes,
         )
     {
         return None;
@@ -1315,10 +1610,10 @@ where
 
     let old_line_end =
         applied_edit.old_line_state_end_for_new_line(processed_line_start, processed_line_end);
-    shadow.line_exit_states.replace_range(
+    shadow.line_exit_states.replace_range_runs(
         first_line_idx,
         old_line_end,
-        generated_exit_states,
+        generated_exit_state_runs,
     );
     if shadow.styles_len() != shadow.len()
         || shadow.line_exit_states.len() != shadow.line_count()
@@ -1397,23 +1692,6 @@ fn is_string_or_comment_style(style: char) -> bool {
 mod tests {
     use super::*;
     use crate::ui::syntax_highlight::SqlHighlighter;
-
-    #[test]
-    fn large_document_paste_defers_only_semantic_alias_work() {
-        assert!(should_defer_semantic_alias_context_for_insert(
-            LARGE_DOCUMENT_PASTE_LINE_THRESHOLD,
-            "ab"
-        ));
-        assert!(!should_defer_semantic_alias_context_for_insert(
-            LARGE_DOCUMENT_PASTE_LINE_THRESHOLD,
-            "a"
-        ));
-        assert!(should_defer_semantic_alias_context_for_insert(
-            10,
-            &"x".repeat(LARGE_PASTE_DEFER_SEMANTIC_BYTES)
-        ));
-        assert!(!should_defer_semantic_alias_context_for_insert(10, "SELECT"));
-    }
 
     #[test]
     fn incremental_direct_rehighlight_end_returns_zero_for_empty_text() {
@@ -1522,6 +1800,38 @@ mod tests {
             shadow.parser_lexical_kind_at(sql.find("\"quoted\"").unwrap()),
             Some(crate::sql_parser_engine::LexicalKind::QuotedIdentifier)
         );
+    }
+
+    #[test]
+    fn intellisense_start_skips_a_long_completed_literal_and_edit_clears_checkpoints() {
+        let literal = "x".repeat(200_000);
+        let sql = format!("SELECT '{literal}' AS payload FROM dual WHERE na");
+        let mut shadow = shadow_for(&sql);
+        let requested_start = sql.find(&literal).expect("literal start") + 100;
+        let cursor = sql.len();
+
+        let aligned = shadow.intellisense_context_start(requested_start, cursor);
+        let closing_quote = requested_start
+            .saturating_add(literal.len().saturating_sub(100));
+        assert!(aligned > closing_quote);
+        assert_eq!(
+            shadow.parser_lex_mode_at(aligned, false),
+            crate::sql_parser_engine::LexMode::Idle
+        );
+        assert!(shadow
+            .parser_lex_mode_checkpoints
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .standard
+            .contains_key(&aligned));
+
+        assert!(shadow.apply_edit(cursor, "m", 0).is_some());
+        let checkpoints = shadow
+            .parser_lex_mode_checkpoints
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        assert!(checkpoints.standard.is_empty());
+        assert!(checkpoints.mysql.is_empty());
     }
 
     #[test]
@@ -1795,10 +2105,9 @@ mod tests {
                 deleted_len: 0,
                 inserted_text: &inserted,
                 deleted_text: "",
-                defer_semantic_alias_context: true,
             },
             &applied_edit,
-            |_text, _styles, _start, _end| {
+            |_styles, _start, _end, _requires_raw_bytes| {
                 style_buffer_updates = style_buffer_updates.saturating_add(1);
                 true
             },

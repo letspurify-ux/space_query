@@ -2190,22 +2190,32 @@ fn skip_trivia_and_comments(bytes: &[u8], mut idx: usize) -> usize {
 }
 
 pub(crate) fn encode_fltk_style_bytes(text: &str, logical_styles: &str) -> Option<Vec<u8>> {
+    let mut encoded = Vec::with_capacity(text.len());
+    append_fltk_style_bytes(text, logical_styles.as_bytes(), &mut encoded).then_some(encoded)
+}
+
+pub(crate) fn append_fltk_style_bytes(
+    text: &str,
+    logical_styles: &[u8],
+    encoded: &mut Vec<u8>,
+) -> bool {
     if text.len() != logical_styles.len() {
-        return None;
+        return false;
     }
     if text.is_ascii() {
-        return Some(logical_styles.as_bytes().to_vec());
+        encoded.extend_from_slice(logical_styles);
+        return true;
     }
 
-    let logical_bytes = logical_styles.as_bytes();
-    let mut encoded = Vec::with_capacity(text.len());
     for (start, ch) in text.char_indices() {
-        let style = logical_bytes.get(start).copied()?;
+        let Some(style) = logical_styles.get(start).copied() else {
+            return false;
+        };
         encoded.push(style);
         let continuation_len = ch.len_utf8().saturating_sub(1);
         encoded.extend(std::iter::repeat_n(0, continuation_len));
     }
-    Some(encoded)
+    true
 }
 
 #[cfg(test)]

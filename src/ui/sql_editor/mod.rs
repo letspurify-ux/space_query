@@ -34,7 +34,6 @@ use crate::ui::intellisense::{
     IntellisenseData, IntellisensePopup, SignatureLabel, SignaturePopup,
 };
 use crate::ui::query_history::{history_snapshot, QueryHistoryDialog};
-use crate::ui::syntax_highlight::STYLE_DEFAULT;
 use crate::ui::syntax_highlight::{
     create_style_table_with, HighlightData, SqlHighlighter, STYLE_STRING,
 };
@@ -57,7 +56,7 @@ pub(crate) mod macos_ime;
 // 공통 파싱/토큰 유틸(실행, 인텔리센스, 포맷팅 공통 경로)
 pub(crate) mod query_text;
 
-use self::chunked_text::{ChunkedText, ChunkedValues};
+use self::chunked_text::{ChunkedText, ChunkedTextSlice, ChunkedValues, RunValues};
 use self::intellisense_state::{
     IntellisenseCompletionRange, IntellisensePopupTransitionState, IntellisenseRuntimeState,
 };
@@ -88,9 +87,7 @@ pub enum SqlEditorContextAction {
 }
 
 const INTELLISENSE_WORD_WINDOW: i32 = 256;
-const INTELLISENSE_CONTEXT_WINDOW: i32 = 120_000;
 const INTELLISENSE_QUALIFIER_WINDOW: i32 = 256;
-const INTELLISENSE_STATEMENT_WINDOW: i32 = 120_000;
 const MAX_PROGRESS_MESSAGES_PER_POLL: usize = 8000;
 const PROGRESS_POLL_ACTIVE_INTERVAL_SECONDS: f64 = 0.001;
 const PROGRESS_POLL_INTERVAL_SECONDS: f64 = 0.05;
@@ -533,7 +530,7 @@ pub(crate) struct IntellisenseAnalysis {
     cursor_in_alias_declaration: bool,
 }
 
-#[derive(Clone)]
+#[derive(Clone, Default)]
 pub(crate) struct RoutineSymbolCacheEntry {
     buffer_revision: u64,
     /// Earliest absolute byte that contributed cross-statement bind/package
@@ -1729,6 +1726,7 @@ pub struct SqlEditorWidget {
     history_navigation_entries: Arc<Mutex<Option<Vec<QueryHistoryEntry>>>>,
     applying_history_navigation: Arc<Mutex<bool>>,
     suppress_buffer_callbacks: Arc<Mutex<bool>>,
+    pending_paste_text: Arc<Mutex<Option<Arc<String>>>>,
     undo_redo_state: Arc<Mutex<WordUndoRedoState>>,
     preferred_insert_position: Arc<Mutex<Option<i32>>>,
     lazy_fetch_batch_size: Arc<Mutex<usize>>,
@@ -2420,11 +2418,14 @@ impl SqlEditorWidget {
             initial_db_type,
             session_state,
         ));
+        intellisense_runtime
+            .set_context_window_bytes(editor_config.normalized_intellisense_context_window_bytes());
         let history_cursor = Arc::new(Mutex::new(None::<usize>));
         let history_original = Arc::new(Mutex::new(None::<String>));
         let history_navigation_entries = Arc::new(Mutex::new(None::<Vec<QueryHistoryEntry>>));
         let applying_history_navigation = Arc::new(Mutex::new(false));
         let suppress_buffer_callbacks = Arc::new(Mutex::new(false));
+        let pending_paste_text = Arc::new(Mutex::new(None));
         let undo_redo_state = Arc::new(Mutex::new(WordUndoRedoState::new(String::new())));
         let preferred_insert_position = Arc::new(Mutex::new(None::<i32>));
         let lazy_fetch_batch_size = Arc::new(Mutex::new(
@@ -2483,6 +2484,7 @@ impl SqlEditorWidget {
             history_navigation_entries,
             applying_history_navigation,
             suppress_buffer_callbacks,
+            pending_paste_text,
             undo_redo_state,
             preferred_insert_position,
             lazy_fetch_batch_size,
@@ -2803,6 +2805,11 @@ impl SqlEditorWidget {
             .lazy_fetch_batch_size
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = size;
+    }
+
+    pub fn set_intellisense_context_window_kib(&self, size_kib: u32) {
+        self.intellisense_runtime
+            .set_context_window_bytes(AppConfig::intellisense_context_window_bytes(size_kib));
     }
 
     fn lazy_fetch_batch_size(&self) -> usize {
@@ -5047,9 +5054,9 @@ mod transaction_action_tests {
 mod execution_state_tests {
     use super::{
         classify_edit_group, inserted_text, load_mutex_bool, load_mutex_bool_option,
-        try_mark_query_running, BufferEdit, EditGranularity, EditOperation, HighlightShadowState,
-        IntellisenseRuntimeState, QueryProgress, SqlEditorWidget, UndoDelta, UndoSnapshot,
-        WordUndoRedoState, MAX_WORD_UNDO_HISTORY,
+        try_mark_query_running, BufferEdit, ChunkedText, CompositeBufferEdit, EditGranularity,
+        EditOperation, HighlightShadowState, IntellisenseRuntimeState, QueryProgress,
+        SqlEditorWidget, UndoDelta, UndoSnapshot, WordUndoRedoState, MAX_WORD_UNDO_HISTORY,
     };
     use fltk::enums::Event;
     use fltk::text::TextBuffer;
@@ -5267,7 +5274,7 @@ mod execution_state_tests {
             current: UndoSnapshot::new("SELECT 2".to_string(), 8),
             deltas: vec![UndoDelta {
                 start: 7,
-                deleted_text: Arc::new("1".to_string()),
+                deleted_text: ChunkedText::from_str("1"),
                 inserted_text: Arc::new("2".to_string()),
                 before_cursor: 8,
                 after_cursor: 8,
@@ -5515,6 +5522,122 @@ mod execution_state_tests {
             .pop_front()
             .expect("redo callback snapshot");
         assert!(redo_callback_snapshot.shares_storage_with(&state.current.text));
+    }
+
+    #[test]
+    fn grouped_undo_redo_builds_one_exact_composite_buffer_edit() {
+        let mut state = WordUndoRedoState::new("TAIL".to_string());
+        state.current.cursor_pos = 0;
+        for (start, inserted) in [(0, "a"), (1, "나"), (4, "c")] {
+            state.record_edit(
+                &build_edit(start, "", inserted),
+                classify_edit_group(inserted.len() as i32, 0, inserted, ""),
+            );
+        }
+
+        let before_undo = state.current.text.clone();
+        let undo_group = state.take_undo_group();
+        assert_eq!(undo_group.len(), 3);
+        assert_eq!(state.pending_history_text_snapshots.len(), 1);
+        let undo_edit = WordUndoRedoState::composite_buffer_edit(
+            &before_undo,
+            &state.current.text,
+            &undo_group,
+            true,
+        )
+        .expect("grouped undo composite edit");
+        let mut undo_result = before_undo.to_flat_string();
+        undo_result.replace_range(
+            undo_edit.start..undo_edit.start.saturating_add(undo_edit.deleted_len),
+            undo_edit.inserted_text.as_str(),
+        );
+        assert_eq!(undo_result, state.current.text.to_flat_string());
+
+        let before_redo = state.current.text.clone();
+        let redo_group = state.take_redo_group();
+        assert_eq!(redo_group.len(), 3);
+        assert_eq!(state.pending_history_text_snapshots.len(), 1);
+        let redo_edit = WordUndoRedoState::composite_buffer_edit(
+            &before_redo,
+            &state.current.text,
+            &redo_group,
+            false,
+        )
+        .expect("grouped redo composite edit");
+        let mut redo_result = before_redo.to_flat_string();
+        redo_result.replace_range(
+            redo_edit.start..redo_edit.start.saturating_add(redo_edit.deleted_len),
+            redo_edit.inserted_text.as_str(),
+        );
+        assert_eq!(redo_result, state.current.text.to_flat_string());
+        assert_eq!(redo_result, "a나cTAIL");
+    }
+
+    #[test]
+    fn grouped_delete_and_ime_replace_composites_match_persistent_snapshots() {
+        fn apply_composite(text: &ChunkedText, edit: &CompositeBufferEdit) -> String {
+            let mut result = text.to_flat_string();
+            result.replace_range(
+                edit.start..edit.start.saturating_add(edit.deleted_len),
+                edit.inserted_text.as_str(),
+            );
+            result
+        }
+
+        fn verify_round_trip(state: &mut WordUndoRedoState, expected_redo: &str) {
+            let before_undo = state.current.text.clone();
+            let undo_group = state.take_undo_group();
+            assert!(undo_group.len() > 1);
+            assert_eq!(state.pending_history_text_snapshots.len(), 1);
+            let undo_edit = WordUndoRedoState::composite_buffer_edit(
+                &before_undo,
+                &state.current.text,
+                &undo_group,
+                true,
+            )
+            .expect("undo composite");
+            assert_eq!(
+                apply_composite(&before_undo, &undo_edit),
+                state.current.text.to_flat_string()
+            );
+
+            let before_redo = state.current.text.clone();
+            let redo_group = state.take_redo_group();
+            assert_eq!(state.pending_history_text_snapshots.len(), 1);
+            let redo_edit = WordUndoRedoState::composite_buffer_edit(
+                &before_redo,
+                &state.current.text,
+                &redo_group,
+                false,
+            )
+            .expect("redo composite");
+            assert_eq!(apply_composite(&before_redo, &redo_edit), expected_redo);
+        }
+
+        let mut deletion = WordUndoRedoState::new("abcTAIL".to_string());
+        deletion.current.cursor_pos = 3;
+        for (start, deleted) in [(2, "c"), (1, "b"), (0, "a")] {
+            deletion.record_edit(
+                &build_edit(start, deleted, ""),
+                classify_edit_group(0, deleted.len() as i32, "", deleted),
+            );
+        }
+        verify_round_trip(&mut deletion, "TAIL");
+
+        let mut ime = WordUndoRedoState::new("TAIL".to_string());
+        ime.current.cursor_pos = 0;
+        for (deleted, inserted) in [("", "ㅎ"), ("ㅎ", "하"), ("하", "한")] {
+            ime.record_edit(
+                &build_edit(0, deleted, inserted),
+                classify_edit_group(
+                    inserted.len() as i32,
+                    deleted.len() as i32,
+                    inserted,
+                    deleted,
+                ),
+            );
+        }
+        verify_round_trip(&mut ime, "한TAIL");
     }
 
     #[test]
@@ -6062,7 +6185,7 @@ mod execution_state_tests {
 
         let cursor_group = state.take_undo_group();
         assert_eq!(cursor_group.len(), 1);
-        assert_eq!(cursor_group[0].deleted_text.as_str(), "");
+        assert!(cursor_group[0].deleted_text.is_empty());
         assert_eq!(cursor_group[0].inserted_text.as_str(), "");
         assert_eq!(state.current.text, "alpha beta");
         assert_eq!(state.undo_cursor_after_group(&cursor_group), 10);
@@ -6098,7 +6221,7 @@ mod execution_state_tests {
 
         let cursor_redo = state.take_redo_group();
         assert_eq!(cursor_redo.len(), 1);
-        assert_eq!(cursor_redo[0].deleted_text.as_str(), "");
+        assert!(cursor_redo[0].deleted_text.is_empty());
         assert_eq!(cursor_redo[0].inserted_text.as_str(), "");
         assert_eq!(state.current.text, "alpha beta");
         assert_eq!(state.current.cursor_pos, 5);
@@ -6168,7 +6291,7 @@ mod execution_state_tests {
 
         let cursor_group = state.take_undo_group();
         assert_eq!(cursor_group.len(), 1);
-        assert_eq!(cursor_group[0].deleted_text.as_str(), "");
+        assert!(cursor_group[0].deleted_text.is_empty());
         assert_eq!(cursor_group[0].inserted_text.as_str(), "");
         assert_eq!(state.current.text, "eee     ab");
         assert_eq!(state.undo_cursor_after_group(&cursor_group), 3);
@@ -6276,7 +6399,7 @@ mod execution_state_tests {
         let cursor_group = state.take_undo_group();
         assert_eq!(state.current.text, "eeexxxxxabcef");
         assert_eq!(cursor_group.len(), 1);
-        assert_eq!(cursor_group[0].deleted_text.as_str(), "");
+        assert!(cursor_group[0].deleted_text.is_empty());
         assert_eq!(cursor_group[0].inserted_text.as_str(), "");
         assert_eq!(state.undo_cursor_after_group(&cursor_group), 3);
 
@@ -6311,7 +6434,7 @@ mod execution_state_tests {
         let cursor_group = state.take_undo_group();
         assert_eq!(state.current.text, "eee     abcef");
         assert_eq!(cursor_group.len(), 1);
-        assert_eq!(cursor_group[0].deleted_text.as_str(), "");
+        assert!(cursor_group[0].deleted_text.is_empty());
         assert_eq!(cursor_group[0].inserted_text.as_str(), "");
         assert_eq!(state.undo_cursor_after_group(&cursor_group), 3);
 
@@ -6350,7 +6473,7 @@ mod execution_state_tests {
 
         assert_eq!(state.current.text, "alphax beta");
         assert_eq!(cursor_group.len(), 1);
-        assert_eq!(cursor_group[0].deleted_text.as_str(), "");
+        assert!(cursor_group[0].deleted_text.is_empty());
         assert_eq!(cursor_group[0].inserted_text.as_str(), "");
         assert_eq!(state.undo_cursor_after_group(&cursor_group), 6);
 
@@ -6364,7 +6487,7 @@ mod execution_state_tests {
 
         assert_eq!(state.current.text, "alpha beta");
         assert_eq!(first_cursor_group.len(), 1);
-        assert_eq!(first_cursor_group[0].deleted_text.as_str(), "");
+        assert!(first_cursor_group[0].deleted_text.is_empty());
         assert_eq!(first_cursor_group[0].inserted_text.as_str(), "");
         assert_eq!(state.undo_cursor_after_group(&first_cursor_group), 10);
     }
@@ -6384,7 +6507,7 @@ mod execution_state_tests {
 
         assert_eq!(state.current.text, "alpha beta");
         assert_eq!(cursor_group.len(), 1);
-        assert_eq!(cursor_group[0].deleted_text.as_str(), "");
+        assert!(cursor_group[0].deleted_text.is_empty());
         assert_eq!(cursor_group[0].inserted_text.as_str(), "");
         assert_eq!(state.undo_cursor_after_group(&cursor_group), 10);
     }
