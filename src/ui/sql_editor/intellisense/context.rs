@@ -1900,4 +1900,8 @@ impl SqlEditorWidget {
     ) -> bool {
         buffer_changed_since_keydown && !shortcut_modified
     }
+
+    fn should_auto_trigger_after_delete(prefix: &str) -> bool {
+        Self::has_min_intellisense_prefix(prefix)
+    }
 }

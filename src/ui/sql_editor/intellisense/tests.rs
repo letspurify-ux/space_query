@@ -10008,6 +10008,13 @@ fn keyup_text_input_requires_a_real_unmodified_buffer_edit() {
 }
 
 #[test]
+fn delete_auto_trigger_does_not_require_an_already_visible_popup() {
+    assert!(SqlEditorWidget::should_auto_trigger_after_delete("a"));
+    assert!(SqlEditorWidget::should_auto_trigger_after_delete("한"));
+    assert!(!SqlEditorWidget::should_auto_trigger_after_delete(""));
+}
+
+#[test]
 fn request_table_columns_releases_loading_when_connection_busy() {
     let data = Arc::new(Mutex::new(IntellisenseData::new()));
     {

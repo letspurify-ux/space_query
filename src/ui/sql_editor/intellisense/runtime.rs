@@ -1520,7 +1520,7 @@ impl SqlEditorWidget {
                         );
                     } else if key == Key::BackSpace || key == Key::Delete {
                         // After backspace/delete, re-evaluate (debounced)
-                        if popup_visible && Self::has_min_intellisense_prefix(&word) {
+                        if Self::should_auto_trigger_after_delete(&word) {
                             Self::schedule_keyup_intellisense_debounce(
                                 &intellisense_runtime_for_handle,
                                 cursor_pos,
