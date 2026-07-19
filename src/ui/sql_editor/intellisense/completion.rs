@@ -2356,7 +2356,12 @@ impl SqlEditorWidget {
                             snapshot_for_thread.signature_scan_text.clone(),
                         )
                     } else {
-                        let (expanded_statement, text_bind_names, package_spec_symbols) =
+                        let (
+                            expanded_statement,
+                            text_bind_names,
+                            package_spec_symbols,
+                            shared_sql_context,
+                        ) =
                             Self::expanded_statement_window_and_text_binds_from_shadow(
                                 &text_shadow_for_thread,
                                 snapshot_for_thread.cursor_pos_usize,
@@ -2380,12 +2385,13 @@ impl SqlEditorWidget {
                                 .cloned()
                         }
                         .unwrap_or_else(|| {
-                            Self::build_routine_symbol_cache_entry(
+                            Self::build_routine_symbol_cache_entry_with_token_spans(
                                 snapshot_for_thread.buffer_revision,
                                 &expanded_statement,
                                 text_bind_names,
                                 &package_spec_symbols,
                                 Some(snapshot_for_thread.preferred_db_type),
+                                shared_sql_context,
                             )
                         });
                         if cancellation.is_cancelled() {

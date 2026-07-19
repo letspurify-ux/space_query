@@ -421,6 +421,10 @@ impl SqlHighlighter {
         self.db_type = db_type;
     }
 
+    pub(crate) fn mysql_compatible(&self) -> bool {
+        mysql_compatible_highlight_mode(self.db_type)
+    }
+
     pub fn set_highlight_data(&mut self, data: HighlightData) {
         self.highlight_data = data;
         self.rebuild_identifier_lookup();

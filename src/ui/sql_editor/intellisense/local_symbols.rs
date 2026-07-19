@@ -110,6 +110,11 @@ struct ResolvedLocalMemberScope {
 }
 
 impl SqlEditorWidget {
+    const FAST_INTELLISENSE_PARSE_LOOKBEHIND_BYTES: usize = 8 * 1024;
+    const FAST_INTELLISENSE_PARSE_LOOKAHEAD_BYTES: usize = 8 * 1024;
+    const FAST_INTELLISENSE_PARSE_WINDOW_BYTES: usize =
+        Self::FAST_INTELLISENSE_PARSE_LOOKBEHIND_BYTES
+            + Self::FAST_INTELLISENSE_PARSE_LOOKAHEAD_BYTES;
     const BOUNDED_INTELLISENSE_PARSE_LOOKBEHIND_BYTES: usize =
         INTELLISENSE_STATEMENT_WINDOW as usize;
     const BOUNDED_INTELLISENSE_PARSE_LOOKAHEAD_BYTES: usize =
@@ -160,13 +165,25 @@ impl SqlEditorWidget {
         text: &ChunkedText,
         cursor_pos: usize,
     ) -> BoundedIntellisenseParseText {
+        Self::bounded_intellisense_parse_text_from_chunked_with_window(
+            text,
+            cursor_pos,
+            Self::BOUNDED_INTELLISENSE_PARSE_LOOKBEHIND_BYTES,
+            Self::BOUNDED_INTELLISENSE_PARSE_LOOKAHEAD_BYTES,
+        )
+    }
+
+    fn bounded_intellisense_parse_text_from_chunked_with_window(
+        text: &ChunkedText,
+        cursor_pos: usize,
+        lookbehind_bytes: usize,
+        lookahead_bytes: usize,
+    ) -> BoundedIntellisenseParseText {
         let cursor_pos = text.clamp_boundary(cursor_pos.min(text.len()));
-        let start = text.clamp_boundary(
-            cursor_pos.saturating_sub(Self::BOUNDED_INTELLISENSE_PARSE_LOOKBEHIND_BYTES),
-        );
+        let start = text.clamp_boundary(cursor_pos.saturating_sub(lookbehind_bytes));
         let end = text.clamp_boundary(
             cursor_pos
-                .saturating_add(Self::BOUNDED_INTELLISENSE_PARSE_LOOKAHEAD_BYTES)
+                .saturating_add(lookahead_bytes)
                 .min(text.len()),
         );
         BoundedIntellisenseParseText {
@@ -295,7 +312,7 @@ impl SqlEditorWidget {
         ))
     }
 
-    fn bounded_statement_needs_full_document_index(
+    fn bounded_statement_needs_wider_window(
         bounded: &BoundedIntellisenseParseText,
         expanded: &ExpandedStatementWindow,
         document_len: usize,
@@ -309,8 +326,8 @@ impl SqlEditorWidget {
 
         // Inner semicolons make a clipped procedural unit look like a small
         // standalone statement even when its declaration/root is before the
-        // bounded window. Promote only procedural-looking fragments; ordinary
-        // nearby statements in a huge script stay on the bounded fast path.
+        // current window. Widen only procedural-looking fragments; ordinary
+        // nearby statements in a huge script stay on the small fast path.
         if bounded.start == 0 && bounded_end >= document_len {
             return false;
         }
@@ -595,15 +612,41 @@ impl SqlEditorWidget {
         text_shadow: &Arc<Mutex<HighlightShadowState>>,
         cursor_pos: usize,
         preferred_db_type: Option<crate::db::connection::DatabaseType>,
-    ) -> (ExpandedStatementWindow, Vec<String>, Vec<ParsedDeclarationSymbol>) {
-        let text_snapshot = text_shadow
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .text_snapshot();
-        Self::expanded_statement_window_and_text_binds_from_snapshot(
+    ) -> (
+        ExpandedStatementWindow,
+        Vec<String>,
+        Vec<ParsedDeclarationSymbol>,
+        Option<(Vec<SqlTokenSpan>, super::query_text::LocalAliasContext)>,
+    ) {
+        let (text_snapshot, shared_context) = {
+            let shadow = text_shadow
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            (
+                shadow.text_snapshot(),
+                shadow.shared_sql_context_snapshot(),
+            )
+        };
+        let (expanded, text_bind_names, package_spec_symbols) =
+            Self::expanded_statement_window_and_text_binds_from_snapshot(
             &text_snapshot,
             cursor_pos,
             preferred_db_type,
+        );
+        let mysql_compatible =
+            sql_text::mysql_compatibility_for_sql(&expanded.text, preferred_db_type);
+        let shared_sql_context = shared_context.and_then(|context| {
+            context.context_for_range(
+                expanded.statement_start,
+                expanded.statement_end,
+                mysql_compatible,
+            )
+        });
+        (
+            expanded,
+            text_bind_names,
+            package_spec_symbols,
+            shared_sql_context,
         )
     }
 
@@ -612,20 +655,31 @@ impl SqlEditorWidget {
         cursor_pos: usize,
         preferred_db_type: Option<crate::db::connection::DatabaseType>,
     ) -> (ExpandedStatementWindow, Vec<String>, Vec<ParsedDeclarationSymbol>) {
-        let mut bounded =
-            Self::bounded_intellisense_parse_text_from_chunked(text_snapshot, cursor_pos);
+        let mut bounded = Self::bounded_intellisense_parse_text_from_chunked_with_window(
+            text_snapshot,
+            cursor_pos,
+            Self::FAST_INTELLISENSE_PARSE_LOOKBEHIND_BYTES,
+            Self::FAST_INTELLISENSE_PARSE_LOOKAHEAD_BYTES,
+        );
+        debug_assert!(
+            bounded.text.len() <= Self::FAST_INTELLISENSE_PARSE_WINDOW_BYTES.saturating_add(3),
+            "fast IntelliSense window exceeded its cap: len={}, start={}, cursor={}, document_len={}",
+            bounded.text.len(),
+            bounded.start,
+            bounded.cursor_pos,
+            text_snapshot.len()
+        );
         let mut expanded =
             Self::expanded_statement_window_in_bounded_text_for_db_type(&bounded, preferred_db_type);
-        if Self::bounded_statement_needs_full_document_index(
-            &bounded,
-            &expanded,
-            text_snapshot.len(),
-        ) {
-            bounded = BoundedIntellisenseParseText {
-                text: text_snapshot.to_flat_string(),
-                start: 0,
-                cursor_pos: text_snapshot.clamp_boundary(cursor_pos.min(text_snapshot.len())),
-            };
+        if text_snapshot.len() <= Self::BOUNDED_INTELLISENSE_PARSE_WINDOW_BYTES
+            || Self::bounded_statement_needs_wider_window(
+                &bounded,
+                &expanded,
+                text_snapshot.len(),
+            )
+        {
+            bounded =
+                Self::bounded_intellisense_parse_text_from_chunked(text_snapshot, cursor_pos);
             expanded = Self::expanded_statement_window_in_bounded_text_for_db_type(
                 &bounded,
                 preferred_db_type,
@@ -696,12 +750,38 @@ impl SqlEditorWidget {
         package_spec_symbols: &[ParsedDeclarationSymbol],
         preferred_db_type: Option<crate::db::connection::DatabaseType>,
     ) -> RoutineSymbolCacheEntry {
+        Self::build_routine_symbol_cache_entry_with_token_spans(
+            buffer_revision,
+            expanded_statement,
+            text_bind_names,
+            package_spec_symbols,
+            preferred_db_type,
+            None,
+        )
+    }
+
+    fn build_routine_symbol_cache_entry_with_token_spans(
+        buffer_revision: u64,
+        expanded_statement: &ExpandedStatementWindow,
+        text_bind_names: Vec<String>,
+        package_spec_symbols: &[ParsedDeclarationSymbol],
+        preferred_db_type: Option<crate::db::connection::DatabaseType>,
+        shared_sql_context: Option<(
+            Vec<SqlTokenSpan>,
+            super::query_text::LocalAliasContext,
+        )>,
+    ) -> RoutineSymbolCacheEntry {
         let mysql_compatible =
             sql_text::mysql_compatibility_for_sql(&expanded_statement.text, preferred_db_type);
-        let token_spans: Vec<SqlTokenSpan> = super::query_text::tokenize_sql_spanned_with_mysql_compat(
-            &expanded_statement.text,
-            mysql_compatible,
-        );
+        let (token_spans, alias_context) = shared_sql_context.unwrap_or_else(|| {
+            let token_spans = super::query_text::tokenize_sql_spanned_with_mysql_compat(
+                &expanded_statement.text,
+                mysql_compatible,
+            );
+            let alias_context =
+                super::query_text::collect_local_alias_context_from_spans(&token_spans);
+            (token_spans, alias_context)
+        });
         let (local_scopes, local_symbols) = Self::analyze_local_scopes_and_symbols(
             &expanded_statement.text,
             &token_spans,
@@ -709,8 +789,6 @@ impl SqlEditorWidget {
             completion_db_type_is_mariadb(preferred_db_type),
             package_spec_symbols,
         );
-        let alias_context =
-            super::query_text::collect_local_alias_context_from_spans(&token_spans);
         let mut statement_tokens = Vec::with_capacity(token_spans.len());
         let mut token_ends = Vec::with_capacity(token_spans.len());
         for span in token_spans {

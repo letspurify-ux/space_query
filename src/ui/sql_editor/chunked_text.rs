@@ -30,7 +30,9 @@ impl TextChunk {
 /// by the edited text and the number of chunks rather than the document tail.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct ChunkedText {
-    chunks: Vec<TextChunk>,
+    chunks: Arc<Vec<TextChunk>>,
+    chunk_ends: Arc<Vec<usize>>,
+    line_break_ends: Arc<Vec<usize>>,
     len: usize,
     line_break_count: usize,
 }
@@ -43,8 +45,11 @@ impl ChunkedText {
     pub(crate) fn from_str(text: &str) -> Self {
         let chunks = split_text_chunks(text);
         let line_break_count = chunks.iter().map(|chunk| chunk.line_breaks.len()).sum();
+        let (chunk_ends, line_break_ends) = chunk_indexes(&chunks);
         Self {
-            chunks,
+            chunks: Arc::new(chunks),
+            chunk_ends: Arc::new(chunk_ends),
+            line_break_ends: Arc::new(line_break_ends),
             len: text.len(),
             line_break_count,
         }
@@ -85,7 +90,7 @@ impl ChunkedText {
 
     pub(crate) fn to_flat_string(&self) -> String {
         let mut text = String::with_capacity(self.len);
-        for chunk in &self.chunks {
+        for chunk in self.chunks.iter() {
             text.push_str(&chunk.text);
         }
         text
@@ -125,13 +130,14 @@ impl ChunkedText {
             return Some(String::new());
         }
         let mut result = String::with_capacity(end.saturating_sub(start));
-        let mut chunk_start = 0usize;
-        for chunk in &self.chunks {
+        let (start_idx, _) = self.locate(start);
+        let mut chunk_start = start_idx
+            .checked_sub(1)
+            .and_then(|idx| self.chunk_ends.get(idx))
+            .copied()
+            .unwrap_or(0);
+        for chunk in self.chunks.iter().skip(start_idx) {
             let chunk_end = chunk_start.saturating_add(chunk.len());
-            if chunk_end <= start {
-                chunk_start = chunk_end;
-                continue;
-            }
             if chunk_start >= end {
                 break;
             }
@@ -190,8 +196,11 @@ impl ChunkedText {
             .iter()
             .map(|chunk| chunk.line_breaks.len())
             .sum::<usize>();
-        self.chunks
+        Arc::make_mut(&mut self.chunks)
             .splice(drain_start..drain_end.max(drain_start), replacement_chunks);
+        let (chunk_ends, line_break_ends) = chunk_indexes(&self.chunks);
+        self.chunk_ends = Arc::new(chunk_ends);
+        self.line_break_ends = Arc::new(line_break_ends);
         self.len = self
             .len
             .saturating_sub(end.saturating_sub(start))
@@ -213,19 +222,18 @@ impl ChunkedText {
 
     pub(crate) fn line_index_for_position(&self, pos: usize) -> usize {
         let pos = pos.min(self.len);
-        let mut absolute = 0usize;
-        let mut line_index = 0usize;
-        for chunk in &self.chunks {
-            let chunk_end = absolute.saturating_add(chunk.len());
-            if pos < chunk_end {
-                let relative = pos.saturating_sub(absolute);
-                line_index += chunk.line_breaks.partition_point(|value| *value < relative);
-                return line_index;
-            }
-            line_index = line_index.saturating_add(chunk.line_breaks.len());
-            absolute = chunk_end;
-        }
-        line_index
+        let (chunk_idx, relative) = self.locate(pos);
+        let preceding_breaks = chunk_idx
+            .checked_sub(1)
+            .and_then(|idx| self.line_break_ends.get(idx))
+            .copied()
+            .unwrap_or(0);
+        self.chunks
+            .get(chunk_idx)
+            .map_or(preceding_breaks, |chunk| {
+                preceding_breaks
+                    .saturating_add(chunk.line_breaks.partition_point(|value| *value < relative))
+            })
     }
 
     pub(crate) fn line_start(&self, pos: usize) -> usize {
@@ -252,35 +260,34 @@ impl ChunkedText {
             .unwrap_or(self.len)
     }
 
-    fn nth_line_break(&self, mut ordinal: usize) -> Option<usize> {
-        let mut absolute = 0usize;
-        for chunk in &self.chunks {
-            if ordinal < chunk.line_breaks.len() {
-                return chunk
-                    .line_breaks
-                    .get(ordinal)
-                    .map(|value| absolute.saturating_add(*value));
-            }
-            ordinal = ordinal.saturating_sub(chunk.line_breaks.len());
-            absolute = absolute.saturating_add(chunk.len());
-        }
-        None
+    fn nth_line_break(&self, ordinal: usize) -> Option<usize> {
+        let chunk_idx = self.line_break_ends.partition_point(|end| *end <= ordinal);
+        let preceding_breaks = chunk_idx
+            .checked_sub(1)
+            .and_then(|idx| self.line_break_ends.get(idx))
+            .copied()
+            .unwrap_or(0);
+        let chunk_start = chunk_idx
+            .checked_sub(1)
+            .and_then(|idx| self.chunk_ends.get(idx))
+            .copied()
+            .unwrap_or(0);
+        self.chunks
+            .get(chunk_idx)?
+            .line_breaks
+            .get(ordinal.saturating_sub(preceding_breaks))
+            .map(|value| chunk_start.saturating_add(*value))
     }
 
     fn locate(&self, pos: usize) -> (usize, usize) {
         let pos = pos.min(self.len);
-        let mut absolute = 0usize;
-        for (idx, chunk) in self.chunks.iter().enumerate() {
-            let chunk_end = absolute.saturating_add(chunk.len());
-            if pos < chunk_end {
-                return (idx, pos.saturating_sub(absolute));
-            }
-            if pos == chunk_end {
-                return (idx.saturating_add(1), 0);
-            }
-            absolute = chunk_end;
-        }
-        (self.chunks.len(), 0)
+        let chunk_idx = self.chunk_ends.partition_point(|end| *end <= pos);
+        let chunk_start = chunk_idx
+            .checked_sub(1)
+            .and_then(|idx| self.chunk_ends.get(idx))
+            .copied()
+            .unwrap_or(0);
+        (chunk_idx, pos.saturating_sub(chunk_start))
     }
 }
 
@@ -495,6 +502,20 @@ fn split_text_chunks(text: &str) -> Vec<TextChunk> {
     chunks
 }
 
+fn chunk_indexes(chunks: &[TextChunk]) -> (Vec<usize>, Vec<usize>) {
+    let mut byte_end = 0usize;
+    let mut line_break_end = 0usize;
+    let mut chunk_ends = Vec::with_capacity(chunks.len());
+    let mut line_break_ends = Vec::with_capacity(chunks.len());
+    for chunk in chunks {
+        byte_end = byte_end.saturating_add(chunk.len());
+        line_break_end = line_break_end.saturating_add(chunk.line_breaks.len());
+        chunk_ends.push(byte_end);
+        line_break_ends.push(line_break_end);
+    }
+    (chunk_ends, line_break_ends)
+}
+
 fn line_break_positions(bytes: &[u8]) -> Vec<usize> {
     let mut positions = Vec::new();
     let mut idx = 0usize;
@@ -536,6 +557,24 @@ mod tests {
                 .any(|after| Arc::ptr_eq(&before.text, &after.text))),
             "unaffected tail chunks should remain shared"
         );
+    }
+
+    #[test]
+    fn chunked_text_snapshot_clone_shares_text_and_lookup_indexes() {
+        let text = ChunkedText::from_str(&"SELECT 1;\n".repeat(100_000));
+        let mut snapshot = text.clone();
+
+        assert!(Arc::ptr_eq(&text.chunks, &snapshot.chunks));
+        assert!(Arc::ptr_eq(&text.chunk_ends, &snapshot.chunk_ends));
+        assert!(Arc::ptr_eq(
+            &text.line_break_ends,
+            &snapshot.line_break_ends
+        ));
+
+        let edit_at = snapshot.len() / 2;
+        assert!(snapshot.replace_range(edit_at, edit_at, "-- pasted\n"));
+        assert!(!Arc::ptr_eq(&text.chunks, &snapshot.chunks));
+        assert_eq!(text.len() + "-- pasted\n".len(), snapshot.len());
     }
 
     #[test]

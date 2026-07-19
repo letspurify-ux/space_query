@@ -12,8 +12,89 @@ const SEMANTIC_REHIGHLIGHT_OVERSCAN_LINES: usize = 100;
 // is renewed only if lexical-state propagation carries highlighting beyond it.
 const LOCAL_ALIAS_CONTEXT_LOOKAROUND_BYTES: usize = 16 * 1024;
 
+#[derive(Clone)]
+struct BoundedSqlContextAnalysis {
+    start: usize,
+    end: usize,
+    mysql_compatible: bool,
+    intellisense_shareable: bool,
+    token_spans: Arc<[SqlTokenSpan]>,
+    alias_context: Arc<super::query_text::LocalAliasContext>,
+}
+
+impl BoundedSqlContextAnalysis {
+    fn covers(&self, start: usize, end: usize, mysql_compatible: bool) -> bool {
+        self.mysql_compatible == mysql_compatible && start >= self.start && end <= self.end
+    }
+
+    fn token_spans_for_range(&self, start: usize, end: usize) -> Option<Vec<SqlTokenSpan>> {
+        if start > end || start < self.start || end > self.end {
+            return None;
+        }
+
+        let first = self.token_spans.partition_point(|span| span.end <= start);
+        let last = self.token_spans.partition_point(|span| span.start < end);
+        let spans = self.token_spans.get(first..last)?;
+        if spans
+            .iter()
+            .any(|span| span.start < start || span.end > end)
+        {
+            return None;
+        }
+
+        Some(
+            spans
+                .iter()
+                .cloned()
+                .map(|mut span| {
+                    span.start = span.start.saturating_sub(start);
+                    span.end = span.end.saturating_sub(start);
+                    span
+                })
+                .collect(),
+        )
+    }
+}
+
+#[derive(Clone)]
+pub(crate) struct SharedSqlContextSnapshot {
+    analysis: BoundedSqlContextAnalysis,
+}
+
+impl SharedSqlContextSnapshot {
+    pub(crate) fn context_for_range(
+        &self,
+        start: usize,
+        end: usize,
+        mysql_compatible: bool,
+    ) -> Option<(Vec<SqlTokenSpan>, super::query_text::LocalAliasContext)> {
+        if !self.analysis.intellisense_shareable
+            || !self.analysis.covers(start, end, mysql_compatible)
+        {
+            return None;
+        }
+        let token_spans = self.analysis.token_spans_for_range(start, end)?;
+        let alias_context = self
+            .analysis
+            .alias_context
+            .relative_subcontext(start, end);
+        Some((token_spans, alias_context))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn token_spans_for_range(
+        &self,
+        start: usize,
+        end: usize,
+        mysql_compatible: bool,
+    ) -> Option<Vec<SqlTokenSpan>> {
+        self.context_for_range(start, end, mysql_compatible)
+            .map(|(token_spans, _)| token_spans)
+    }
+}
+
 struct BoundedAliasContext {
-    context: super::query_text::LocalAliasContext,
+    context: Arc<super::query_text::LocalAliasContext>,
     start: usize,
     end: usize,
 }
@@ -29,6 +110,7 @@ pub(crate) struct HighlightShadowState {
     text: ChunkedText,
     styles: ChunkedValues<u8>,
     line_exit_states: ChunkedValues<LexerState>,
+    shared_sql_context: Option<BoundedSqlContextAnalysis>,
 }
 
 impl HighlightShadowState {
@@ -41,6 +123,7 @@ impl HighlightShadowState {
         self.text = ChunkedText::from_string(text);
         self.styles = ChunkedValues::from_vec(styles.as_bytes().to_vec());
         self.line_exit_states = ChunkedValues::from_vec(line_exit_states);
+        self.shared_sql_context = None;
     }
 
     pub(crate) fn clear(&mut self) {
@@ -57,6 +140,30 @@ impl HighlightShadowState {
 
     pub(crate) fn text_snapshot(&self) -> ChunkedText {
         self.text.clone()
+    }
+
+    pub(crate) fn shared_sql_context_snapshot(&self) -> Option<SharedSqlContextSnapshot> {
+        self.shared_sql_context
+            .clone()
+            .map(|analysis| SharedSqlContextSnapshot { analysis })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn from_context_text_for_test(text: &str) -> Self {
+        Self {
+            text: ChunkedText::from_str(text),
+            ..Default::default()
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn prepare_shared_sql_context_for_test(
+        &mut self,
+        start: usize,
+        end: usize,
+        mysql_compatible: bool,
+    ) {
+        let _ = self.bounded_alias_context(start, end, mysql_compatible);
     }
 
     pub(crate) fn bounded_text_around(
@@ -306,13 +413,28 @@ impl HighlightShadowState {
         self.styles.replace_range(start, end, styles.to_vec());
     }
 
-    fn bounded_alias_context(&self, start: usize, end: usize) -> BoundedAliasContext {
+    fn bounded_alias_context(
+        &mut self,
+        start: usize,
+        end: usize,
+        mysql_compatible: bool,
+    ) -> BoundedAliasContext {
         // Never flatten the complete shadow here: this method runs in the
         // synchronous key-edit path, including for million-line scripts.
         let required_start = self.text.clamp_boundary(start.min(self.text.len()));
         let required_end = self
             .text
             .clamp_boundary(end.max(required_start).min(self.text.len()));
+        if let Some(cached) = self.shared_sql_context.as_ref().filter(|cached| {
+            cached.covers(required_start, required_end, mysql_compatible)
+        }) {
+            return BoundedAliasContext {
+                context: cached.alias_context.clone(),
+                start: cached.start,
+                end: cached.end,
+            };
+        }
+
         let context_start = self.text.clamp_boundary(
             required_start.saturating_sub(LOCAL_ALIAS_CONTEXT_LOOKAROUND_BYTES),
         );
@@ -325,11 +447,29 @@ impl HighlightShadowState {
             .text
             .range_string(context_start, context_end)
             .unwrap_or_default();
+        let intellisense_shareable = matches!(
+            self.parser_lex_mode_at(context_start, mysql_compatible),
+            crate::sql_parser_engine::LexMode::Idle
+        );
+        let mut token_spans =
+            super::query_text::tokenize_sql_spanned_with_mysql_compat(&text, mysql_compatible);
+        for span in &mut token_spans {
+            span.start = span.start.saturating_add(context_start);
+            span.end = span.end.saturating_add(context_start);
+        }
+        let alias_context = Arc::new(super::query_text::collect_local_alias_context_from_spans(
+            &token_spans,
+        ));
+        self.shared_sql_context = Some(BoundedSqlContextAnalysis {
+            start: context_start,
+            end: context_end,
+            mysql_compatible,
+            intellisense_shareable,
+            token_spans: token_spans.into(),
+            alias_context: alias_context.clone(),
+        });
         BoundedAliasContext {
-            context: super::query_text::collect_local_alias_context_with_offset(
-                &text,
-                context_start,
-            ),
+            context: alias_context,
             start: context_start,
             end: context_end,
         }
@@ -410,6 +550,7 @@ impl HighlightShadowState {
         if !self.text.replace_range(start, end, inserted_text) {
             return false;
         }
+        self.shared_sql_context = None;
         self.styles.replace_range(
             start,
             end,
@@ -453,7 +594,15 @@ pub(crate) fn build_logical_styles_and_line_states_with_word_audit(
     text: &str,
 ) -> (String, Vec<LexerState>, Vec<HighlightWordAudit>) {
     let mut audits = Vec::new();
-    let alias_context = super::query_text::collect_local_alias_context(text);
+    let mut context_shadow = HighlightShadowState {
+        text: ChunkedText::from_str(text),
+        ..Default::default()
+    };
+    let alias_context = context_shadow.bounded_alias_context(
+        0,
+        text.len(),
+        highlighter.mysql_compatible(),
+    );
     let (styles, states) = build_logical_styles_and_line_states_with(
         text,
         |line_text, entry_state, line_start| {
@@ -461,7 +610,7 @@ pub(crate) fn build_logical_styles_and_line_states_with_word_audit(
                 .generate_styles_for_window_with_word_audit(
                     line_text,
                     entry_state,
-                    &alias_context,
+                    alias_context.context.as_ref(),
                     line_start,
                 );
             for audit in &mut line_audits {
@@ -756,16 +905,19 @@ impl SqlEditorWidget {
             .highlighter
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mysql_compatible = highlighter.mysql_compatible();
         let mut current_line_idx = shadow.line_index_for_position(start);
         let mut entry_state = shadow.entry_state_for_line(current_line_idx);
         let mut changed_range: Option<(usize, usize)> = None;
-        let mut alias_context = shadow.bounded_alias_context(start, must_cover_end);
+        let mut alias_context =
+            shadow.bounded_alias_context(start, must_cover_end, mysql_compatible);
 
         while current_line_idx < shadow.line_count() {
             let current_start = shadow.line_start_for_index(current_line_idx);
             let current_end = shadow.inclusive_line_end_for_index(current_line_idx);
             if !alias_context.covers(current_start, current_end) {
-                alias_context = shadow.bounded_alias_context(current_start, current_end);
+                alias_context =
+                    shadow.bounded_alias_context(current_start, current_end, mysql_compatible);
             }
             let range_text = shadow.text_range_string(current_start, current_end)?;
             let previous_styles = shadow.style_range_string(current_start, current_end)?;
@@ -774,7 +926,7 @@ impl SqlEditorWidget {
                 .generate_styles_for_window_with_alias_context(
                     &range_text,
                     entry_state,
-                    &alias_context.context,
+                    alias_context.context.as_ref(),
                     current_start,
                 );
             if new_styles.len() != range_text.len() {
@@ -891,15 +1043,16 @@ impl SqlEditorWidget {
             let Some(text) = shadow.text_range_string(start, end) else {
                 return;
             };
-            let alias_context = shadow.bounded_alias_context(start, end);
             let highlighter = self
                 .highlighter
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let alias_context =
+                shadow.bounded_alias_context(start, end, highlighter.mysql_compatible());
             let (styles, _) = highlighter.generate_styles_for_window_with_alias_context(
                 &text,
                 entry_state,
-                &alias_context.context,
+                alias_context.context.as_ref(),
                 start,
             );
             if styles.len() != text.len() {
@@ -1172,12 +1325,12 @@ mod tests {
         let declaration_start = text
             .find("IF WHERE")
             .expect("nearby alias declaration");
-        let shadow = HighlightShadowState {
+        let mut shadow = HighlightShadowState {
             text: ChunkedText::from_str(&text),
             ..Default::default()
         };
 
-        let aliases = shadow.bounded_alias_context(edit_at, edit_at.saturating_add(1));
+        let aliases = shadow.bounded_alias_context(edit_at, edit_at.saturating_add(1), false);
 
         assert!(aliases.context.contains_name("IF"));
         assert!(!aliases.context.contains_name("far_alias"));
@@ -1194,7 +1347,7 @@ mod tests {
         let (styles, _) = SqlHighlighter::new().generate_styles_for_window_with_alias_context(
             &line,
             LexerState::Normal,
-            &aliases.context,
+            aliases.context.as_ref(),
             line_start,
         );
         let reference_offset = edit_at.saturating_sub(line_start);
@@ -1209,6 +1362,93 @@ mod tests {
                     .saturating_mul(2)
                     .saturating_add(1),
             "alias collection must remain independent of the 100k-line document size"
+        );
+    }
+
+    #[test]
+    fn bounded_sql_context_reuses_tokens_for_a_covered_statement() {
+        let sql = "SELECT 1;\nSELECT e.name FROM employee e WHERE e.id = 1;\nSELECT 2;";
+        let statement_start = sql.find("SELECT e.name").expect("statement start");
+        let statement_end = statement_start
+            + sql[statement_start..]
+                .find(';')
+                .expect("statement terminator")
+            + 1;
+        let cursor = sql.find("e.id").expect("alias reference");
+        let mut shadow = shadow_for(sql);
+
+        let aliases = shadow.bounded_alias_context(cursor, cursor + 1, false);
+        assert!(aliases.context.contains_name("e"));
+
+        let snapshot = shadow
+            .shared_sql_context_snapshot()
+            .expect("shared SQL context");
+        let shared = snapshot
+            .token_spans_for_range(statement_start, statement_end, false)
+            .expect("covered statement tokens");
+        let expected = super::query_text::tokenize_sql_spanned_with_mysql_compat(
+            &sql[statement_start..statement_end],
+            false,
+        );
+        let summarize = |spans: &[SqlTokenSpan]| {
+            spans
+                .iter()
+                .map(|span| (span.start, span.end, format!("{:?}", span.token)))
+                .collect::<Vec<_>>()
+        };
+
+        assert_eq!(summarize(&shared), summarize(&expected));
+        let shared_aliases = super::query_text::collect_local_alias_context_from_spans(&shared);
+        assert!(shared_aliases.contains_name("e"));
+    }
+
+    #[test]
+    fn bounded_sql_context_cache_hits_in_place_and_invalidates_on_edit() {
+        let sql = "SELECT e.name FROM employee e WHERE e.id = 1;";
+        let cursor = sql.find("e.id").expect("alias reference");
+        let mut shadow = shadow_for(sql);
+
+        let _ = shadow.bounded_alias_context(cursor, cursor + 1, false);
+        let first = shadow
+            .shared_sql_context_snapshot()
+            .expect("first shared context");
+        let _ = shadow.bounded_alias_context(cursor + 1, cursor + 2, false);
+        let second = shadow
+            .shared_sql_context_snapshot()
+            .expect("second shared context");
+        assert!(Arc::ptr_eq(
+            &first.analysis.token_spans,
+            &second.analysis.token_spans
+        ));
+        assert!(second
+            .token_spans_for_range(0, sql.len(), true)
+            .is_none());
+
+        assert!(shadow.apply_edit(cursor, "x", 0));
+        assert!(shadow.shared_sql_context_snapshot().is_none());
+    }
+
+    #[test]
+    fn bounded_sql_context_does_not_share_tokens_when_window_starts_inside_a_literal() {
+        let long_literal = "x".repeat(LOCAL_ALIAS_CONTEXT_LOOKAROUND_BYTES + 4096);
+        let sql = format!(
+            "SELECT '{long_literal}';\nSELECT e.name FROM employee e WHERE e.id = 1;"
+        );
+        let statement_start = sql.find("SELECT e.name").expect("statement start");
+        let statement_end = sql.len();
+        let cursor = sql.find("e.id").expect("alias reference");
+        let mut shadow = shadow_for(&sql);
+
+        let _ = shadow.bounded_alias_context(cursor, cursor + 1, false);
+        let snapshot = shadow
+            .shared_sql_context_snapshot()
+            .expect("shared SQL context");
+
+        assert!(
+            snapshot
+                .context_for_range(statement_start, statement_end, false)
+                .is_none(),
+            "IntelliSense must tokenize its exact statement when the shared window starts in a literal"
         );
     }
 

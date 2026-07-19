@@ -16751,12 +16751,45 @@ fn million_line_production_completion_index_uses_the_bounded_fast_path() {
 
     assert!(expanded.dependency_start > 0);
     assert!(
-        expanded.text.len() < SqlEditorWidget::BOUNDED_INTELLISENSE_PARSE_WINDOW_BYTES,
-        "a local statement in a million-line script must not promote to a full-document parse"
+        cursor.saturating_sub(expanded.dependency_start)
+            <= SqlEditorWidget::FAST_INTELLISENSE_PARSE_LOOKBEHIND_BYTES,
+        "a local statement in a million-line script must stay on the small fast window"
     );
     assert!(
         elapsed < Duration::from_secs(5),
         "bounded production completion path took {elapsed:?}"
+    );
+}
+
+#[test]
+fn million_line_unterminated_statement_never_promotes_to_the_full_document() {
+    use std::time::{Duration, Instant};
+
+    const LINE: &str = "SELECT value\n";
+    const LINES: usize = 1_000_001;
+    let sql = LINE.repeat(LINES);
+    let snapshot = ChunkedText::from_str(&sql);
+    let cursor = 500_000usize
+        .saturating_mul(LINE.len())
+        .saturating_add("SELECT ".len());
+
+    let started = Instant::now();
+    let (expanded, _, _) =
+        SqlEditorWidget::expanded_statement_window_and_text_binds_from_snapshot(
+            &snapshot,
+            cursor,
+            Some(crate::db::DatabaseType::Oracle),
+        );
+    let elapsed = started.elapsed();
+
+    assert!(expanded.dependency_start > 0);
+    assert!(
+        expanded.text.len() <= SqlEditorWidget::BOUNDED_INTELLISENSE_PARSE_WINDOW_BYTES,
+        "even an unterminated statement must remain inside the hard parse cap"
+    );
+    assert!(
+        elapsed < Duration::from_secs(5),
+        "hard-capped production completion path took {elapsed:?}"
     );
 }
 
@@ -16819,14 +16852,18 @@ fn prepend_local_symbol_suggestions_dedups_quoted_identifier_equivalents() {
 }
 
 #[test]
-fn large_routine_cache_promotes_to_full_active_statement_index() {
+fn large_routine_cache_stays_bounded_and_keeps_nearby_block_symbols() {
     let mut sql = String::from("CREATE OR REPLACE PROCEDURE demo_proc IS\n");
     sql.push_str("    v_far NUMBER := 1;\n");
     for idx in 0..10_000 {
         sql.push_str(&format!("    v_pad_{idx} NUMBER := {idx};\n"));
     }
     sql.push_str("BEGIN\n");
-    sql.push_str("    __CODEX_CURSOR__NULL;\n");
+    sql.push_str("    DECLARE\n");
+    sql.push_str("        v_near NUMBER := 2;\n");
+    sql.push_str("    BEGIN\n");
+    sql.push_str("        __CODEX_CURSOR__NULL;\n");
+    sql.push_str("    END;\n");
     sql.push_str("END demo_proc;");
 
     let cursor = sql
@@ -16851,14 +16888,20 @@ fn large_routine_cache_promotes_to_full_active_statement_index() {
         "generated procedure should exceed the default statement window"
     );
     assert!(
-        expanded.text.len() > SqlEditorWidget::BOUNDED_INTELLISENSE_PARSE_WINDOW_BYTES,
-        "a clipped routine should be promoted from the fast window to its full active statement"
+        expanded.text.len() <= SqlEditorWidget::BOUNDED_INTELLISENSE_PARSE_WINDOW_BYTES,
+        "a clipped routine must not escape the hard IntelliSense parse cap"
     );
     assert!(
         suggestions
             .iter()
+            .any(|value| value.eq_ignore_ascii_case("v_near")),
+        "the bounded index should retain nearby block declarations: {suggestions:?}"
+    );
+    assert!(
+        !suggestions
+            .iter()
             .any(|value| value.eq_ignore_ascii_case("v_far")),
-        "the full active-statement index should retain a far declaration: {suggestions:?}"
+        "a declaration beyond the hard cap must not force full-document analysis: {suggestions:?}"
     );
 }
 
@@ -47884,12 +47927,27 @@ fn intellisense_analysis_from_snapshot_for_test(
             cursor,
             Some(db_type),
         );
-    let routine_cache = SqlEditorWidget::build_routine_symbol_cache_entry(
+    let mysql_compatible = db_type.is_mysql_or_mariadb();
+    let mut context_shadow = HighlightShadowState::from_context_text_for_test(&expanded.text);
+    context_shadow.prepare_shared_sql_context_for_test(
+        0,
+        expanded.text.len(),
+        mysql_compatible,
+    );
+    let shared_sql_context = context_shadow
+        .shared_sql_context_snapshot()
+        .and_then(|context| context.context_for_range(0, expanded.text.len(), mysql_compatible));
+    assert!(
+        shared_sql_context.is_some(),
+        "IntelliSense test analysis must exercise the shared highlighter context"
+    );
+    let routine_cache = SqlEditorWidget::build_routine_symbol_cache_entry_with_token_spans(
         0,
         &expanded,
         text_bind_names,
         &package_spec_symbols,
         Some(db_type),
+        shared_sql_context,
     );
     let analysis = SqlEditorWidget::build_intellisense_analysis_from_routine_cache(
         &routine_cache,

@@ -12,6 +12,7 @@ use crate::ui::sql_editor::{SqlToken, SqlTokenSpan};
 pub(crate) struct LocalAliasContext {
     names: HashSet<String>,
     declaration_ranges: HashSet<(usize, usize)>,
+    declarations: Vec<(String, usize, usize)>,
 }
 
 impl LocalAliasContext {
@@ -31,6 +32,27 @@ impl LocalAliasContext {
         self.declaration_ranges
             .iter()
             .any(|&(start, end)| pos >= start && pos <= end)
+    }
+
+    fn record_declaration(&mut self, name: String, start: usize, end: usize) {
+        self.names.insert(name.clone());
+        if self.declaration_ranges.insert((start, end)) {
+            self.declarations.push((name, start, end));
+        }
+    }
+
+    pub(crate) fn relative_subcontext(&self, start: usize, end: usize) -> Self {
+        let mut context = Self::default();
+        for (name, declaration_start, declaration_end) in &self.declarations {
+            if *declaration_start >= start && *declaration_end <= end {
+                context.record_declaration(
+                    name.clone(),
+                    declaration_start.saturating_sub(start),
+                    declaration_end.saturating_sub(start),
+                );
+            }
+        }
+        context
     }
 }
 
@@ -164,26 +186,6 @@ pub(crate) fn collect_local_alias_context(sql: &str) -> LocalAliasContext {
     collect_local_alias_context_from_spans(&tokenize_sql_spanned(sql))
 }
 
-pub(crate) fn collect_local_alias_context_with_offset(
-    sql: &str,
-    document_offset: usize,
-) -> LocalAliasContext {
-    let mut context = collect_local_alias_context(sql);
-    if document_offset > 0 {
-        context.declaration_ranges = context
-            .declaration_ranges
-            .into_iter()
-            .map(|(start, end)| {
-                (
-                    start.saturating_add(document_offset),
-                    end.saturating_add(document_offset),
-                )
-            })
-            .collect();
-    }
-    context
-}
-
 pub(crate) fn tokenize_sql_with_mysql_compat(sql: &str, mysql_compatible: bool) -> Vec<SqlToken> {
     tokenize_sql_spanned_with_mysql_compat(sql, mysql_compatible)
         .into_iter()
@@ -230,17 +232,13 @@ pub(crate) fn collect_local_alias_context_from_spans(spans: &[SqlTokenSpan]) -> 
     let matching_parens = matching_close_paren_indices(spans);
     for idx in 0..spans.len() {
         if let Some((alias, start, end)) = bracket_alias_declaration_at(spans, idx) {
-            context.names.insert(alias);
-            context.declaration_ranges.insert((start, end));
+            context.record_declaration(alias, start, end);
             continue;
         }
 
         if span_is_cte_or_window_name_declaration(spans, idx, &matching_parens) {
             if let Some(alias) = span_alias_lookup_name(&spans[idx]) {
-                context.names.insert(alias);
-                context
-                    .declaration_ranges
-                    .insert((spans[idx].start, spans[idx].end));
+                context.record_declaration(alias, spans[idx].start, spans[idx].end);
             }
             continue;
         }
@@ -249,10 +247,7 @@ pub(crate) fn collect_local_alias_context_from_spans(spans: &[SqlTokenSpan]) -> 
             continue;
         }
         if let Some(alias) = span_alias_lookup_name(&spans[idx]) {
-            context.names.insert(alias);
-            context
-                .declaration_ranges
-                .insert((spans[idx].start, spans[idx].end));
+            context.record_declaration(alias, spans[idx].start, spans[idx].end);
         }
     }
     context
