@@ -33,6 +33,9 @@ use super::*;
 
 const MAX_MERGED_SUGGESTIONS: usize = 100;
 const KEYUP_INTELLISENSE_DEBOUNCE_MS: u64 = 1;
+// One physical press may dispatch both KeyDown and Shortcut. A missing KeyUp
+// must not keep suppressing later presses indefinitely.
+const CTRL_ENTER_DUPLICATE_WINDOW: Duration = Duration::from_millis(100);
 const COLUMN_LOAD_WORKER_COUNT: usize = 4;
 const COLUMN_LOAD_CONTEXT_RETRY_DELAYS: [Duration; 3] = [
     Duration::from_millis(5),
@@ -82,7 +85,7 @@ enum NavigationKeyupState {
 enum EnterKeyupSuppression {
     None,
     PopupConfirm,
-    CtrlEnterExecute,
+    CtrlEnterExecute(std::time::Instant),
     #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     ImeCompositionEnter,
 }

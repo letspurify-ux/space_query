@@ -1,4 +1,34 @@
 impl SqlEditorWidget {
+    fn should_suppress_ctrl_enter_dispatch(
+        suppression: &mut EnterKeyupSuppression,
+        now: std::time::Instant,
+    ) -> bool {
+        if matches!(
+            *suppression,
+            EnterKeyupSuppression::CtrlEnterExecute(previous)
+                if now.saturating_duration_since(previous) < CTRL_ENTER_DUPLICATE_WINDOW
+        ) {
+            return true;
+        }
+
+        *suppression = EnterKeyupSuppression::CtrlEnterExecute(now);
+        false
+    }
+
+    fn take_enter_keyup_suppression(
+        key: Key,
+        suppression: &mut EnterKeyupSuppression,
+    ) -> bool {
+        if !matches!(key, Key::Enter | Key::KPEnter)
+            || matches!(*suppression, EnterKeyupSuppression::None)
+        {
+            return false;
+        }
+
+        *suppression = EnterKeyupSuppression::None;
+        true
+    }
+
     /// Apply a merge produced by [`crate::ui::sql_editor::hangul_repair`] for
     /// the macOS broken-first-Hangul-key bug.
     #[cfg(target_os = "macos")]
@@ -1062,18 +1092,18 @@ impl SqlEditorWidget {
                                 return true;
                             }
                             Key::Enter | Key::KPEnter => {
-                                if matches!(
-                                    *enter_keyup_suppression_for_handle
+                                let should_suppress = {
+                                    let mut suppression = enter_keyup_suppression_for_handle
                                         .lock()
-                                        .unwrap_or_else(|poisoned| poisoned.into_inner()),
-                                    EnterKeyupSuppression::CtrlEnterExecute
-                                ) {
+                                        .unwrap_or_else(|poisoned| poisoned.into_inner());
+                                    Self::should_suppress_ctrl_enter_dispatch(
+                                        &mut suppression,
+                                        std::time::Instant::now(),
+                                    )
+                                };
+                                if should_suppress {
                                     return true;
                                 }
-                                *enter_keyup_suppression_for_handle
-                                    .lock()
-                                    .unwrap_or_else(|poisoned| poisoned.into_inner()) =
-                                    EnterKeyupSuppression::CtrlEnterExecute;
                                 widget_for_shortcuts.execute_statement_at_cursor();
                                 return true;
                             }
@@ -1316,6 +1346,16 @@ impl SqlEditorWidget {
                         return false;
                     }
 
+                    let consume_suppressed_enter_keyup = {
+                        let mut suppression = enter_keyup_suppression_for_handle
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner());
+                        Self::take_enter_keyup_suppression(key, &mut suppression)
+                    };
+                    if consume_suppressed_enter_keyup {
+                        return true;
+                    }
+
                     if shortcut_modified {
                         if popup_visible {
                             intellisense_popup_for_handle
@@ -1393,49 +1433,6 @@ impl SqlEditorWidget {
                             *nav_state = NavigationKeyupState::Idle;
                             return true;
                         }
-                    }
-
-                    if matches!(key, Key::Enter | Key::KPEnter)
-                        && matches!(
-                            *enter_keyup_suppression_for_handle
-                                .lock()
-                                .unwrap_or_else(|poisoned| poisoned.into_inner()),
-                            EnterKeyupSuppression::ImeCompositionEnter
-                        )
-                    {
-                        *enter_keyup_suppression_for_handle
-                            .lock()
-                            .unwrap_or_else(|poisoned| poisoned.into_inner()) =
-                            EnterKeyupSuppression::None;
-                        return true;
-                    }
-                    if matches!(key, Key::Enter | Key::KPEnter)
-                        && matches!(
-                            *enter_keyup_suppression_for_handle
-                                .lock()
-                                .unwrap_or_else(|poisoned| poisoned.into_inner()),
-                            EnterKeyupSuppression::PopupConfirm
-                        )
-                    {
-                        *enter_keyup_suppression_for_handle
-                            .lock()
-                            .unwrap_or_else(|poisoned| poisoned.into_inner()) =
-                            EnterKeyupSuppression::None;
-                        return true;
-                    }
-                    if matches!(key, Key::Enter | Key::KPEnter)
-                        && matches!(
-                            *enter_keyup_suppression_for_handle
-                                .lock()
-                                .unwrap_or_else(|poisoned| poisoned.into_inner()),
-                            EnterKeyupSuppression::CtrlEnterExecute
-                        )
-                    {
-                        *enter_keyup_suppression_for_handle
-                            .lock()
-                            .unwrap_or_else(|poisoned| poisoned.into_inner()) =
-                            EnterKeyupSuppression::None;
-                        return true;
                     }
 
                     // Navigation keys - hide popup and let editor handle cursor movement
@@ -1758,18 +1755,18 @@ impl SqlEditorWidget {
                     }
 
                     if ctrl_or_cmd && matches!(key, Key::Enter | Key::KPEnter) {
-                        if matches!(
-                            *enter_keyup_suppression_for_handle
+                        let should_suppress = {
+                            let mut suppression = enter_keyup_suppression_for_handle
                                 .lock()
-                                .unwrap_or_else(|poisoned| poisoned.into_inner()),
-                            EnterKeyupSuppression::CtrlEnterExecute
-                        ) {
+                                .unwrap_or_else(|poisoned| poisoned.into_inner());
+                            Self::should_suppress_ctrl_enter_dispatch(
+                                &mut suppression,
+                                std::time::Instant::now(),
+                            )
+                        };
+                        if should_suppress {
                             return true;
                         }
-                        *enter_keyup_suppression_for_handle
-                            .lock()
-                            .unwrap_or_else(|poisoned| poisoned.into_inner()) =
-                            EnterKeyupSuppression::CtrlEnterExecute;
                         widget_for_shortcuts.execute_statement_at_cursor();
                         return true;
                     }

@@ -10008,6 +10008,36 @@ fn keyup_text_input_requires_a_real_unmodified_buffer_edit() {
 }
 
 #[test]
+fn ctrl_enter_duplicate_filter_expires_without_a_keyup() {
+    let started_at = std::time::Instant::now();
+    let mut suppression = EnterKeyupSuppression::None;
+
+    assert!(!SqlEditorWidget::should_suppress_ctrl_enter_dispatch(
+        &mut suppression,
+        started_at,
+    ));
+    assert!(SqlEditorWidget::should_suppress_ctrl_enter_dispatch(
+        &mut suppression,
+        started_at + CTRL_ENTER_DUPLICATE_WINDOW / 2,
+    ));
+    assert!(!SqlEditorWidget::should_suppress_ctrl_enter_dispatch(
+        &mut suppression,
+        started_at + CTRL_ENTER_DUPLICATE_WINDOW,
+    ));
+}
+
+#[test]
+fn ctrl_enter_keyup_clears_duplicate_filter() {
+    let mut suppression = EnterKeyupSuppression::CtrlEnterExecute(std::time::Instant::now());
+
+    assert!(SqlEditorWidget::take_enter_keyup_suppression(
+        Key::Enter,
+        &mut suppression,
+    ));
+    assert_eq!(suppression, EnterKeyupSuppression::None);
+}
+
+#[test]
 fn delete_auto_trigger_does_not_require_an_already_visible_popup() {
     assert!(SqlEditorWidget::should_auto_trigger_after_delete("a"));
     assert!(SqlEditorWidget::should_auto_trigger_after_delete("한"));
