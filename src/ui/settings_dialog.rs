@@ -455,13 +455,6 @@ pub fn show_settings_dialog(config: &AppConfig) -> Option<FontSettings> {
     context_window_row.end();
     intellisense_flex.fixed(&context_window_row, INPUT_ROW_HEIGHT);
 
-    let mut context_window_hint = Frame::default().with_label(&format!(
-        "Cursor context: {} ~ {} KiB (larger values use more CPU)",
-        MIN_INTELLISENSE_CONTEXT_WINDOW_KIB, MAX_INTELLISENSE_CONTEXT_WINDOW_KIB
-    ));
-    context_window_hint.set_label_color(theme::text_secondary());
-    intellisense_flex.fixed(&context_window_hint, LABEL_ROW_HEIGHT);
-
     let mut popup_delay_row = Flex::default().with_size(0, INPUT_ROW_HEIGHT);
     popup_delay_row.set_type(FlexType::Row);
     popup_delay_row.set_spacing(DIALOG_SPACING);
@@ -474,6 +467,13 @@ pub fn show_settings_dialog(config: &AppConfig) -> Option<FontSettings> {
     popup_delay_input.set_text_color(theme::text_primary());
     popup_delay_row.end();
     intellisense_flex.fixed(&popup_delay_row, INPUT_ROW_HEIGHT);
+
+    let mut context_window_hint = Frame::default().with_label(&format!(
+        "Cursor context: {} ~ {} KiB (larger values use more CPU)",
+        MIN_INTELLISENSE_CONTEXT_WINDOW_KIB, MAX_INTELLISENSE_CONTEXT_WINDOW_KIB
+    ));
+    context_window_hint.set_label_color(theme::text_secondary());
+    intellisense_flex.fixed(&context_window_hint, LABEL_ROW_HEIGHT);
 
     let mut popup_delay_hint = Frame::default().with_label(&format!(
         "Popup delay: {} ~ {} ms",
@@ -549,6 +549,7 @@ pub fn show_settings_dialog(config: &AppConfig) -> Option<FontSettings> {
     connection_flex.end();
     connection_group.resizable(&connection_flex);
     connection_group.end();
+    tabs.insert(&connection_group, 0);
 
     let mut formatting_group = Group::new(content_x, tab_body_y, content_w, tab_body_h, None);
     formatting_group.set_label("SQL Formatting");
