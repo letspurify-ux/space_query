@@ -698,6 +698,7 @@ const UI_DATABASE_TYPE_REGISTRY_FUNCTIONS: &[&str] = &[
     "object_browser_behavior_for",
     "schema_metadata_loader_for",
     "language_catalog_for_db_type",
+    "signatures_for",
     "function_catalog_for_db_type",
     "mysql_compatible_highlight_mode",
     "extract_field_keywords_for",
@@ -2257,6 +2258,7 @@ const BACKEND_REGISTRY_FILES: &[(&str, &[&str])] = &[
     ),
     ("src/ui/object_browser.rs", &["object_browser_behavior_for"]),
     ("src/ui/intellisense.rs", &["language_catalog_for_db_type"]),
+    ("src/ui/builtin_signatures.rs", &["signatures_for"]),
     (
         "src/ui/syntax_highlight.rs",
         &[

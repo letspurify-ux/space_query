@@ -85,19 +85,11 @@ static ORACLE_FUNCTIONS_SET: Lazy<HashSet<&'static str>> = Lazy::new(|| {
         .collect()
 });
 
-static MARIADB_HIGHLIGHT_FUNCTIONS_SET: Lazy<HashSet<&'static str>> = Lazy::new(|| {
-    MYSQL_FUNCTIONS_SET
-        .iter()
-        .chain(MARIADB_FUNCTIONS_SET.iter())
-        .copied()
-        .collect()
-});
-
 fn function_catalog_for_db_type(db_type: DatabaseType) -> &'static HashSet<&'static str> {
     match db_type {
         DatabaseType::Oracle => &ORACLE_FUNCTIONS_SET,
         DatabaseType::MySQL => &MYSQL_FUNCTIONS_SET,
-        DatabaseType::MariaDB => &MARIADB_HIGHLIGHT_FUNCTIONS_SET,
+        DatabaseType::MariaDB => &MARIADB_FUNCTIONS_SET,
     }
 }
 
@@ -1166,8 +1158,11 @@ impl SqlHighlighter {
                     {
                         disposition = HighlightWordDisposition::IdentifierContext;
                     }
-                } else if folded_word.upper() == "PATH" && !is_path_keyword_usage(bytes, idx) {
-                    token_type = self.classify_non_keyword_word(&folded_word);
+                } else if folded_word.upper() == "PATH"
+                    && !is_path_keyword_usage(bytes, idx)
+                    && next_token.map(|token| token.kind) != Some(SignificantTokenKind::LeftParen)
+                {
+                    token_type = self.classify_identifier_like_word(folded_word.upper());
                     #[cfg(test)]
                     {
                         disposition = HighlightWordDisposition::PathIdentifier;

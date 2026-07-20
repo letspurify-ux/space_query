@@ -915,7 +915,11 @@ fn script_signature_label(
         arg_spans.push((start, text.len()));
     }
     text.push(')');
-    crate::ui::intellisense::SignatureLabel { text, arg_spans }
+    crate::ui::intellisense::SignatureLabel {
+        text,
+        arg_spans,
+        overloads: Vec::new(),
+    }
 }
 
 fn script_parameter_name_from_item(item: &[SqlToken]) -> Option<String> {
@@ -3880,6 +3884,7 @@ fn audit_final_suggestions_impl(
         Some(SignatureLabel {
             text: qt_split_signature,
             arg_spans: vec![(qt_split_arg_start, qt_split_arg_end)],
+            overloads: Vec::new(),
         }),
     );
     data.triggers = vec!["BI_EMP".to_string()];
@@ -35915,6 +35920,20 @@ fn completion_caret_offset_lands_between_function_parentheses() {
     // Function completions end with "()"; caret goes between the parens.
     assert_eq!(SqlEditorWidget::completion_caret_offset("NVL()"), 4);
     assert_eq!(SqlEditorWidget::completion_caret_offset("COALESCE()"), 9);
+
+    let sql = "SELECT NVL()";
+    let call = crate::ui::intellisense::enclosing_call_at_cursor(sql, sql.len() - 1)
+        .expect("completion caret should immediately be inside the call");
+    assert_eq!(call.name, "NVL");
+    assert_eq!(call.arg_index, 0);
+    assert!(
+        crate::ui::builtin_signatures::builtin_signature_label(
+            crate::db::DatabaseType::Oracle,
+            &call.name,
+        )
+        .is_some(),
+        "the immediate signature refresh must resolve the completed function"
+    );
 }
 
 #[test]
@@ -36392,6 +36411,34 @@ fn build_signature_label_formats_params_and_spans() {
     let (s1, e1) = label.arg_spans[1];
     assert_eq!(&label.text[s0..e0], "P_ID IN NUMBER");
     assert_eq!(&label.text[s1..e1], "P_NAME IN VARCHAR2(50)");
+
+    let mut overload_args = vec![
+        proc_arg(Some("P_ID"), 1, "IN", Some("NUMBER"), None),
+        proc_arg(Some("P_NAME"), 1, "IN", Some("VARCHAR2"), Some(50)),
+        proc_arg(Some("P_FLAG"), 2, "IN", Some("NUMBER"), None),
+    ];
+    overload_args[0].overload = Some(1);
+    overload_args[1].overload = Some(2);
+    overload_args[2].overload = Some(2);
+
+    let overloaded = SqlEditorWidget::build_signature_label("myproc", &overload_args);
+    assert_eq!(
+        overloaded.text,
+        "MYPROC(P_ID IN NUMBER)\nMYPROC(P_NAME IN VARCHAR2(50), P_FLAG IN NUMBER)"
+    );
+    assert_eq!(overloaded.overloads.len(), 2);
+    assert_eq!(overloaded.overloads[0].arg_spans.len(), 1);
+    assert_eq!(overloaded.overloads[1].arg_spans.len(), 2);
+    for overload in &overloaded.overloads {
+        assert_eq!(
+            &overloaded.text[overload.arg_spans[0].0..overload.arg_spans[0].1],
+            if overload.arg_spans.len() == 1 {
+                "P_ID IN NUMBER"
+            } else {
+                "P_NAME IN VARCHAR2(50)"
+            }
+        );
+    }
 }
 
 /// Resolve window-frame keyword candidates at the `|` marker.
@@ -53360,6 +53407,7 @@ fn intellisense_sweep_signature_label_from_value(
         return Some(SignatureLabel {
             text: text.to_string(),
             arg_spans: Vec::new(),
+            overloads: Vec::new(),
         });
     }
 
@@ -53380,6 +53428,7 @@ fn intellisense_sweep_signature_label_from_value(
     Some(SignatureLabel {
         text,
         arg_spans: Vec::new(),
+        overloads: Vec::new(),
     })
 }
 

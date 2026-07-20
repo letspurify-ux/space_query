@@ -341,52 +341,76 @@ impl SqlEditorWidget {
         "UNKNOWN".to_string()
     }
 
-    /// Build a one-line signature (`NAME(p1 IN TYPE, p2 OUT TYPE) RETURN TYPE`)
-    /// for the parameter-hint popup, recording the span of each positional
-    /// argument. Uses the first overload, mirroring the quick-describe view.
+    /// Build one signature line per overload
+    /// (`NAME(p1 IN TYPE, p2 OUT TYPE) RETURN TYPE`) for the parameter-hint
+    /// popup, recording every span for the active positional argument.
     fn build_signature_label(
         name: &str,
         arguments: &[ProcedureArgument],
     ) -> crate::ui::intellisense::SignatureLabel {
-        let selected_overload = arguments.first().and_then(|arg| arg.overload);
-        let selected: Vec<&ProcedureArgument> = arguments
-            .iter()
-            .filter(|arg| arg.overload == selected_overload)
-            .collect();
-
-        let mut text = name.to_uppercase();
-        text.push('(');
-        let mut arg_spans: Vec<(usize, usize)> = Vec::new();
-        let mut return_type: Option<String> = None;
-        let mut first = true;
-
-        for arg in &selected {
-            let is_return = arg.position == 0 && arg.name.is_none();
-            let type_display = Self::format_argument_type_for_quick_describe(arg);
-            if is_return {
-                return_type = Some(type_display);
-                continue;
+        let mut overloads = Vec::new();
+        for arg in arguments {
+            if !overloads.contains(&arg.overload) {
+                overloads.push(arg.overload);
             }
-            if !first {
-                text.push_str(", ");
-            }
-            first = false;
-            let arg_name = arg
-                .name
-                .clone()
-                .unwrap_or_else(|| format!("ARG{}", arg.position.max(1)));
-            let direction = arg.in_out.clone().unwrap_or_else(|| "IN".to_string());
-            let start = text.len();
-            text.push_str(&format!("{} {} {}", arg_name, direction.trim(), type_display));
-            arg_spans.push((start, text.len()));
+        }
+        if overloads.is_empty() {
+            overloads.push(None);
         }
 
-        text.push(')');
-        if let Some(return_type) = return_type {
-            text.push_str(&format!(" RETURN {}", return_type));
+        let mut text = String::new();
+        let mut arg_spans = Vec::new();
+        let mut signature_overloads = Vec::new();
+        for (overload_index, overload) in overloads.into_iter().enumerate() {
+            if overload_index > 0 {
+                text.push('\n');
+            }
+            text.push_str(&name.to_uppercase());
+            text.push('(');
+            let mut line_spans = Vec::new();
+            let mut return_type = None;
+            let mut first = true;
+
+            for arg in arguments.iter().filter(|arg| arg.overload == overload) {
+                let is_return = arg.position == 0 && arg.name.is_none();
+                let type_display = Self::format_argument_type_for_quick_describe(arg);
+                if is_return {
+                    return_type = Some(type_display);
+                    continue;
+                }
+                if !first {
+                    text.push_str(", ");
+                }
+                first = false;
+                let arg_name = arg
+                    .name
+                    .clone()
+                    .unwrap_or_else(|| format!("ARG{}", arg.position.max(1)));
+                let direction = arg.in_out.clone().unwrap_or_else(|| "IN".to_string());
+                let start = text.len();
+                text.push_str(&format!("{} {} {}", arg_name, direction.trim(), type_display));
+                line_spans.push((start, text.len()));
+            }
+
+            text.push(')');
+            if let Some(return_type) = return_type {
+                text.push_str(&format!(" RETURN {}", return_type));
+            }
+            if overload_index == 0 {
+                arg_spans.clone_from(&line_spans);
+            }
+            signature_overloads.push(crate::ui::intellisense::SignatureOverload {
+                required_args: line_spans.len(),
+                arg_spans: line_spans,
+                variadic_arg: None,
+            });
         }
 
-        crate::ui::intellisense::SignatureLabel { text, arg_spans }
+        crate::ui::intellisense::SignatureLabel {
+            text,
+            arg_spans,
+            overloads: signature_overloads,
+        }
     }
 
     fn format_routine_details(

@@ -236,7 +236,7 @@ impl SqlEditorWidget {
         }
     }
 
-    fn hide_signature_popup(&self) {
+    pub(crate) fn hide_signature_popup(&self) {
         if !Self::can_try_hide_signature_popup(
             self.intellisense_runtime.signature_popup_transition_state(),
         ) {
@@ -315,10 +315,10 @@ impl SqlEditorWidget {
             _ => (window_start, raw),
         };
 
-        let mysql_compatible = self
+        let db_type = self
             .intellisense_runtime
-            .db_type_without_blocking(&self.connection)
-            .is_mysql_or_mariadb();
+            .db_type_without_blocking(&self.connection);
+        let mysql_compatible = db_type.is_mysql_or_mariadb();
         let initial_lex_mode = self
             .highlight_shadow
             .lock()
@@ -337,11 +337,16 @@ impl SqlEditorWidget {
         };
         call.open_paren += scan_offset;
 
-        // Built-in functions have no data-dictionary argument rows; skip the
-        // futile lookup instead of issuing (and caching) an empty fetch.
-        if call.qualifier.is_none() && crate::ui::intellisense::is_builtin_function(&call.name) {
-            self.hide_signature_popup();
-            return;
+        // Built-ins are resolved from the versioned manual catalog because
+        // database argument views do not expose their parameters.
+        if call.qualifier.is_none() {
+            if let Some(label) = crate::ui::builtin_signatures::builtin_signature_label(
+                db_type,
+                &call.name,
+            ) {
+                self.show_signature_popup(&label, call.arg_index, call.open_paren as i32);
+                return;
+            }
         }
 
         let key = Self::signature_key(&call);

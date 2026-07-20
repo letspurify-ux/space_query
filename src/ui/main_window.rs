@@ -1180,8 +1180,10 @@ impl AppState {
 
     fn hide_all_intellisense_popups(&self) {
         self.sql_editor.try_hide_intellisense_popup();
+        self.sql_editor.hide_signature_popup();
         for tab in &self.editor_tabs {
             tab.sql_editor.try_hide_intellisense_popup();
+            tab.sql_editor.hide_signature_popup();
         }
     }
 
@@ -8681,6 +8683,7 @@ impl MainWindow {
                         app::event_x_root(),
                         app::event_y_root(),
                     );
+                    sql_editor.hide_signature_popup();
                     sql_editor.hide_intellisense_on_outside_click(
                         app::event_x_root(),
                         app::event_y_root(),

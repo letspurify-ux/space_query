@@ -436,6 +436,7 @@ impl SqlEditorWidget {
         let text_shadow_for_insert = text_shadow.clone();
         let preferred_insert_position_for_insert = self.preferred_insert_position.clone();
         let undo_redo_state_for_insert = self.undo_redo_state.clone();
+        let widget_for_insert = self.clone();
         {
             let mut popup = intellisense_popup
                 .lock()
@@ -538,6 +539,7 @@ impl SqlEditorWidget {
                     &buffer_for_insert,
                 );
                 Self::finalize_completion_after_selection(&intellisense_runtime_for_insert);
+                widget_for_insert.update_signature_hint();
             });
         }
 
@@ -684,6 +686,7 @@ impl SqlEditorWidget {
                     false
                 }
                 Event::Push => {
+                    widget_for_shortcuts.hide_signature_popup();
                     #[cfg(target_os = "macos")]
                     {
                         Self::finish_macos_ime_before_cursor_or_selection_change(
@@ -1047,6 +1050,9 @@ impl SqlEditorWidget {
                                     .unwrap_or_else(|poisoned| poisoned.into_inner())
                                     .hide();
                                 intellisense_runtime_for_handle.clear_pending_intellisense();
+                                if has_selected {
+                                    widget_for_shortcuts.update_signature_hint();
+                                }
                                 return Self::should_consume_popup_confirm_key(key, has_selected);
                             }
                             _ => {

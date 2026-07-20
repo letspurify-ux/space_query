@@ -1,3 +1,6 @@
+pub(crate) mod builtin_signatures;
+#[cfg(test)]
+mod builtin_signatures_live_tests;
 pub mod connection_dialog;
 pub mod constants;
 pub mod find_replace;

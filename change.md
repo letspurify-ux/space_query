@@ -5607,3 +5607,105 @@ dialect별 포맷 `final.sql` 인증 3종도 별도로 실행해 모두 자체 �
 | `cargo test` | 통과 — 전 타깃 합계 6,826 passed · 0 failed · 246 ignored |
 | `cargo clippy --locked --all-targets -- -D warnings -W clippy::perf -W clippy::complexity` | 통과 — 경고 0 |
 | `cargo fmt --all -- --check` / `git diff --check` | 통과 |
+
+# 39. 자동 포맷 sweep 재검사 · 전수 판독 · live 실행 (2026-07-20)
+
+## 39-1. sweep 1차 검사
+
+`cargo test --lib formatting_sweep_all_files_generate_out_report -- --ignored --nocapture`
+를 재실행했다. 결과 PASS.
+
+- 집계(`target/format-sweep/format-sweep.out`): `checked_files=132`, `failures=0`.
+- layout별(`wrapped`/`stacked` 각 report): `checked_files=66`,
+  `checked_regressions=32`, `checked_identifier_case_words=89,819`,
+  `checked_frames=24,227`, `checked_frame_boundaries=53,385`,
+  `checked_frame_body_items`(wrapped 10,050 / stacked 26,027),
+  `checked_frame_closes=11,297`, `failures=0`.
+
+## 39-2. 생성물 전수 판독
+
+`target/format-sweep/{wrapped,stacked}` 아래 `.format.out` 전량을 판독했다.
+
+| 구획 | 파일 수 | 줄 수 |
+| --- | ---: | ---: |
+| wrapped/test (Oracle) | 42 | 19,784 |
+| wrapped/test_mysql | 11 | 5,808 |
+| wrapped/test_mariadb | 13 | 8,029 |
+| stacked/test (Oracle) | 42 | 27,390 |
+| stacked/test_mysql | 11 | 9,352 |
+| stacked/test_mariadb | 13 | 12,995 |
+| 합계 | 132 | 83,358 |
+
+전수 스캔 결과: 모든 파일 `status: PASS`, `issues: total=0`, 실제 `[[FMT:E...]]`
+마커 0건. 후행 공백/탭 0건, 코드 줄 leading space 전부 4의 배수, 최대 들여쓰기 52칸
+(=13 depth)까지 모두 실 프레임 간선(scalar subquery paren → derived-table paren →
+query body → EXISTS)으로 설명됨. `docs/auto_format_rule.md`의 frame=깊이 단일근원,
+grammar 기반 parentage, 첫 자식 inline, body 경계, 닫힘 깊이, 구분자 문법성,
+주석/문자열 보존, 이중 포맷 idempotency 규칙과 대조해 어긋남 없음.
+
+관례적으로 어색해 보인 3개 지점을 개별 검증했다.
+
+- `test24.sql` `SET` 목록의 선행 콤마 `) / -- comment / , ghij = (`: 원본 토큰
+  순서가 `) -- comment ,`이므로 콤마를 주석 앞으로 당기면 토큰 재배열이 된다. 현재
+  출력은 순서를 보존한 정답(규칙 7·8). 수정 없음.
+- `MAX (…)`/`COUNT(*)` 등 함수-괄호 간 공백 차이: dialect 관례 유지로 일관됨.
+- wrapped SELECT 머리 줄이 첫 투영만 남기고 개행하는 경우(아래 39-3). 의도된
+  동작으로 확인, 수정 없음.
+
+## 39-3. 목표4 — frame-depth 일반 검출 검토 (AS-IS/TO-BE)
+
+`oracle_format_final_boss.sql` UNIT 1 본 질의에서 아래 형태를 정밀 재현했다.
+
+AS-IS/TO-BE (동일 — 현재가 정답):
+
+```sql
+SELECT d.dept_id,
+    d.dept_name, x.emp_id, x.emp_name, x.salary, x.salary_rank, x.hire_seq, x.dept_avg_salary,
+    CASE
+        WHEN x.salary > x.dept_avg_salary THEN ...
+    END AS emp_class,
+    ...
+```
+
+첫 투영 `d.dept_id` 뒤 개행은 wrapped 목록이 뒤에 multiline 자식(CASE/스칼라
+서브쿼리/JSON_OBJECT/XMLSERIALIZE)을 포함할 때 머리 줄을 깨끗이 유지하는
+설계다(`wrapped_comma_next_item_width`가 CASE/OVER/KEEP/서브쿼리 자식에서 `None`을
+돌려주는 경로). 축약 재현으로 확인했고, 이 파일은 이미 수동 판독에서 승인된 출력이다.
+**프레임 깊이는 정확**(모든 자식 depth 4, close depth 정합, idempotent)하므로 이는
+frame-depth 결함이 아니라 wrapped 미학 선택이다. 따라서 sweep에 새 frame-depth
+검출기를 추가할 대상(오검출 없이 일반화 가능한 결함)이 없어, 사양(CLAUDE.md §2:
+불필요한 추측 코드 금지)에 따라 검출 로직을 추가하지 않았다.
+
+일시 probe 테스트(`zzz_probe_line77`)로만 재현·확인한 뒤 제거했고 working tree는
+clean이다.
+
+## 39-4. 목표5 — 포맷 이후 Space Query 실행
+
+포맷 산출물이 원본과 **동일한 executable statement/token fingerprint**를 갖는다는
+것이 sweep의 `format_sweep_audit_token_count`(전 132파일 통과)와 executable-boundary
+감사로 이미 보장된다. 이를 live로 실증했다.
+
+- MySQL 8.0(3307)·MariaDB 12.2(3306) docker에 자체 완결형 포맷 스크립트를 client로
+  주입. wrapped+stacked 합계 48회 실행.
+- 자체 DB를 만들지 않고 기존 default schema를 전제하는 3개 스크립트
+  (test6/7/8, MariaDB)는 raw client에서 "No database selected"가 나지만, **원본과
+  포맷본의 오류 수가 완전히 동일**(47/47, 91/91, 71/71)해 포맷이 유발한 신규 오류가
+  아님을 확인. 나머지 파일은 오류 0.
+- Oracle(1521)은 토큰 보존 불변식으로 실행 동등성 보장(원본 실행 시 포맷본도 실행).
+
+결론: 자동 포맷은 실행 가능성을 보존하며, 포맷으로 인한 신규 실행 오류 0건.
+
+## 39-5. 목표6 — 최종 품질 게이트
+
+| 검증 | 결과 |
+| --- | --- |
+| sweep(`formatting_sweep_all_files_generate_out_report`) | PASS — 132 파일, failures 0 |
+| 전수 판독(132파일 / 83,358줄) | 규칙 위반 0건, 신규 결함 0건 |
+| 포맷 후 live 실행(MySQL/MariaDB 48회 + Oracle 불변식) | 포맷 유발 오류 0건 |
+| `cargo test` | 통과 (exit 0) |
+| `cargo clippy --locked --all-targets -- -D warnings -W clippy::perf -W clippy::complexity` | 통과 — 경고 0 |
+
+## 39-6. 변경 파일
+
+이번 회차는 formatter 본체·sweep·fixture 출력에 **수정 사항이 없다**(신규 결함
+미발견). 본 검토·실행 결과만 `change.md`에 기록한다.

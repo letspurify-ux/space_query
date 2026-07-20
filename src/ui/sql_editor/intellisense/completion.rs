@@ -60827,16 +60827,11 @@ impl SqlEditorWidget {
     ) -> bool {
         let name = suggestion.strip_suffix("()").unwrap_or(suggestion);
         let upper = name.to_ascii_uppercase();
-        if crate::sql_text::mysql_compatibility_for_sql("", db_type) {
-            crate::ui::intellisense::MYSQL_FUNCTIONS_SET.contains(upper.as_str())
-                || (completion_db_type_is_mariadb(db_type)
-                    && crate::ui::intellisense::MARIADB_FUNCTIONS_SET
-                        .contains(upper.as_str()))
-        } else {
-            crate::ui::intellisense::ORACLE_FUNCTIONS
-                .binary_search(&upper.as_str())
-                .is_ok()
-        }
+        crate::ui::intellisense::language_catalog_functions_for_db_type(
+            db_type.unwrap_or_default(),
+        )
+        .binary_search(&upper.as_str())
+        .is_ok()
     }
 
     fn previous_meaningful_token_index_before(tokens: &[SqlToken], idx: usize) -> Option<usize> {

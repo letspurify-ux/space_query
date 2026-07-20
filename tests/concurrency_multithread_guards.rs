@@ -2081,6 +2081,16 @@ fn intellisense_pointer_paths_remain_debounced_and_nonblocking() {
     let callback = &runtime[callback_start..callback_end];
     assert!(callback.contains("db_type_without_blocking(&connection_for_insert)"));
     assert!(!callback.contains("connection_for_insert.lock()"));
+    let callback_finalize = callback
+        .find("finalize_completion_after_selection")
+        .expect("pointer completion should finalize its edit");
+    let callback_signature = callback
+        .find("widget_for_insert.update_signature_hint()")
+        .expect("pointer completion should immediately refresh the signature popup");
+    assert!(callback_finalize < callback_signature);
+    assert!(runtime.contains(
+        "if has_selected {\n                                    widget_for_shortcuts.update_signature_hint();\n                                }"
+    ));
 
     let pointer_start = runtime
         .find("Event::Enter | Event::Move | Event::Drag | Event::Released =>")
@@ -2119,7 +2129,7 @@ fn intellisense_pointer_paths_remain_debounced_and_nonblocking() {
 }
 
 #[test]
-fn intellisense_popup_closes_on_outside_click_not_pointer_move() {
+fn intellisense_and_signature_popups_follow_window_and_click_lifecycle() {
     let main_window = read_source("src/ui/main_window.rs");
     let handler_start = main_window
         .find("window.handle(move |_w, ev|")
@@ -2130,7 +2140,19 @@ fn intellisense_popup_closes_on_outside_click_not_pointer_move() {
         .expect("window keydown handler should follow lifecycle event handler");
     let lifecycle_events = &main_window[handler_start..keydown_start];
     assert!(lifecycle_events.contains("fltk::enums::Event::Resize"));
+    assert!(lifecycle_events.contains("hide_all_intellisense_popups"));
     assert!(!lifecycle_events.contains("fltk::enums::Event::Move"));
+
+    let hide_all_start = main_window
+        .find("fn hide_all_intellisense_popups(&self)")
+        .expect("shared popup lifecycle helper should exist");
+    let hide_all_end = main_window[hide_all_start..]
+        .find("fn find_tab_index")
+        .map(|offset| hide_all_start + offset)
+        .expect("tab lookup should follow popup lifecycle helper");
+    let hide_all = &main_window[hide_all_start..hide_all_end];
+    assert!(hide_all.contains("try_hide_intellisense_popup"));
+    assert!(hide_all.contains("hide_signature_popup"));
 
     let push_start = main_window[handler_start..]
         .find("fltk::enums::Event::Push =>")
@@ -2141,9 +2163,17 @@ fn intellisense_popup_closes_on_outside_click_not_pointer_move() {
         .map(|offset| push_start + offset)
         .expect("fallback event handler should follow push handler");
     let push_handler = &main_window[push_start..push_end];
+    assert!(push_handler.contains("hide_signature_popup"));
     assert!(push_handler.contains("hide_intellisense_on_outside_click"));
     assert!(push_handler.contains("app::event_x_root()"));
     assert!(push_handler.contains("app::event_y_root()"));
+
+    let editor_runtime = read_source("src/ui/sql_editor/intellisense/runtime.rs");
+    let editor_push_start = editor_runtime
+        .find("Event::Push =>")
+        .expect("editor push handler should exist");
+    let editor_push = &editor_runtime[editor_push_start..];
+    assert!(editor_push.contains("widget_for_shortcuts.hide_signature_popup()"));
 }
 
 #[test]

@@ -11,633 +11,7 @@ use std::time::{Duration, Instant};
 // Shared Oracle SQL keywords
 pub const SQL_KEYWORDS: &[&str] = sql_text::ORACLE_SQL_KEYWORDS;
 
-// Oracle built-in functions
-pub const ORACLE_FUNCTIONS: &[&str] = &[
-    "ABS",
-    "ACOS",
-    "ADD_MONTHS",
-    "ANY_VALUE",
-    "APPENDCHILDXML",
-    "APPROX_COUNT_DISTINCT",
-    "APPROX_PERCENTILE",
-    "ASCII",
-    "ASCIISTR",
-    "ASIN",
-    "ATAN",
-    "ATAN2",
-    "AVG",
-    "BFILENAME",
-    "BIN_TO_NUM",
-    "BITAND",
-    "CARDINALITY",
-    "CAST",
-    "CEIL",
-    "CHARTOROWID",
-    "CHR",
-    "CLUSTER_DETAILS",
-    "CLUSTER_DISTANCE",
-    "CLUSTER_ID",
-    "CLUSTER_PROBABILITY",
-    "CLUSTER_SET",
-    "COALESCE",
-    "COLLECT",
-    "COMPOSE",
-    "CONCAT",
-    "CONVERT",
-    "CORR",
-    "COS",
-    "COSH",
-    "COUNT",
-    "COVAR_POP",
-    "COVAR_SAMP",
-    "CUME_DIST",
-    "CURRENT_DATE",
-    "CURRENT_TIMESTAMP",
-    "CV",
-    "DBTIMEZONE",
-    "DECODE",
-    "DECOMPOSE",
-    "DELETEXML",
-    "DENSE_RANK",
-    "DEREF",
-    "DUMP",
-    "EMPTY_BLOB",
-    "EMPTY_CLOB",
-    "EXISTSNODE",
-    "EXP",
-    "EXTRACT",
-    "EXTRACTVALUE",
-    "FEATURE_COMPARE",
-    "FEATURE_ID",
-    "FEATURE_SET",
-    "FEATURE_VALUE",
-    "FIRST_VALUE",
-    "FLOOR",
-    "FROM_TZ",
-    "GREATEST",
-    "GROUPING",
-    "GROUPING_ID",
-    "GROUP_ID",
-    "HEXTORAW",
-    "INITCAP",
-    "INSERTCHILDXML",
-    "INSERTCHILDXMLAFTER",
-    "INSERTCHILDXMLBEFORE",
-    "INSERTXMLBEFORE",
-    "INSTR",
-    "JSON_ARRAY",
-    "JSON_ARRAYAGG",
-    "JSON_EQUAL",
-    "JSON_EXISTS",
-    "JSON_MERGEPATCH",
-    "JSON_OBJECT",
-    "JSON_OBJECTAGG",
-    "JSON_QUERY",
-    "JSON_SCALAR",
-    "JSON_SERIALIZE",
-    "JSON_TABLE",
-    "JSON_TRANSFORM",
-    "JSON_VALUE",
-    "LAG",
-    "LAST_DAY",
-    "LAST_VALUE",
-    "LEAD",
-    "LEAST",
-    "LENGTH",
-    "LENGTHB",
-    "LISTAGG",
-    "LN",
-    "LNNVL",
-    "LOCALTIMESTAMP",
-    "LOG",
-    "LOWER",
-    "LPAD",
-    "LTRIM",
-    "MAKE_REF",
-    "MATCH_NUMBER",
-    "MAX",
-    "MEDIAN",
-    "MIN",
-    "MOD",
-    "MONTHS_BETWEEN",
-    "NANVL",
-    "NEW_TIME",
-    "NEXT_DAY",
-    "NLSSORT",
-    "NLS_INITCAP",
-    "NLS_LOWER",
-    "NLS_UPPER",
-    "NTH_VALUE",
-    "NTILE",
-    "NULLIF",
-    "NUMTODSINTERVAL",
-    "NUMTOYMINTERVAL",
-    "NVL",
-    "NVL2",
-    "ODCINUMBERLIST",
-    "ORA_HASH",
-    "ORA_INVOKING_USER",
-    "ORA_INVOKING_USERID",
-    "PERCENTILE_CONT",
-    "PERCENTILE_DISC",
-    "PERCENT_RANK",
-    "POWER",
-    "PREDICTION",
-    "PREDICTION_BOUNDS",
-    "PREDICTION_COST",
-    "PREDICTION_DETAILS",
-    "PREDICTION_PROBABILITY",
-    "PREDICTION_SET",
-    "PREV",
-    "RANK",
-    "RATIO_TO_REPORT",
-    "RAWTOHEX",
-    "REF",
-    "REFTOHEX",
-    "REGEXP_COUNT",
-    "REGEXP_INSTR",
-    "REGEXP_LIKE",
-    "REGEXP_REPLACE",
-    "REGEXP_SUBSTR",
-    "REGR_AVGX",
-    "REGR_AVGY",
-    "REGR_COUNT",
-    "REGR_INTERCEPT",
-    "REGR_R2",
-    "REGR_SLOPE",
-    "REGR_SXX",
-    "REGR_SXY",
-    "REGR_SYY",
-    "REMAINDER",
-    "REPLACE",
-    "REVERSE",
-    "ROUND",
-    "ROWIDTOCHAR",
-    "ROW_NUMBER",
-    "RPAD",
-    "RTRIM",
-    "SESSIONTIMEZONE",
-    "SIGN",
-    "SIN",
-    "SINH",
-    "SOUNDEX",
-    "SQRT",
-    "STANDARD_HASH",
-    "STDDEV",
-    "STDDEV_POP",
-    "STDDEV_SAMP",
-    "SUBSTR",
-    "SUM",
-    "SYSDATE",
-    "SYSTIMESTAMP",
-    "SYS_CONNECT_BY_PATH",
-    "SYS_CONTEXT",
-    "SYS_EXTRACT_UTC",
-    "SYS_GUID",
-    "SYS_TYPEID",
-    "TAN",
-    "TANH",
-    "TO_BINARY_DOUBLE",
-    "TO_BINARY_FLOAT",
-    "TO_BLOB",
-    "TO_CHAR",
-    "TO_CLOB",
-    "TO_DATE",
-    "TO_DSINTERVAL",
-    "TO_LOB",
-    "TO_MULTI_BYTE",
-    "TO_NCHAR",
-    "TO_NCLOB",
-    "TO_NUMBER",
-    "TO_SINGLE_BYTE",
-    "TO_TIMESTAMP",
-    "TO_TIMESTAMP_TZ",
-    "TO_VECTOR",
-    "TO_YMINTERVAL",
-    "TRANSLATE",
-    "TREAT",
-    "TRIM",
-    "TRUNC",
-    "TZ_OFFSET",
-    "UID",
-    "UNISTR",
-    "UPDATEXML",
-    "UPPER",
-    "USER",
-    "USERENV",
-    "VALIDATE_CONVERSION",
-    "VALUE",
-    "VARIANCE",
-    "VAR_POP",
-    "VAR_SAMP",
-    "VECTOR_DISTANCE",
-    "VSIZE",
-    "WIDTH_BUCKET",
-    "XMLAGG",
-    "XMLATTRIBUTES",
-    "XMLCAST",
-    "XMLCDATA",
-    "XMLCOLATTVAL",
-    "XMLCOMMENT",
-    "XMLCONCAT",
-    "XMLELEMENT",
-    "XMLEXISTS",
-    "XMLFOREST",
-    "XMLPARSE",
-    "XMLPI",
-    "XMLQUERY",
-    "XMLROOT",
-    "XMLSEQUENCE",
-    "XMLSERIALIZE",
-    "XMLTABLE",
-    "XMLTRANSFORM",
-    "XMLTYPE",
-    "XPATH",
-];
-
-// ---------------------------------------------------------------------------
-// MySQL / MariaDB built-in functions (sorted, uppercase)
-// ---------------------------------------------------------------------------
-pub const MYSQL_FUNCTIONS: &[&str] = &[
-    "ABS",
-    "ACOS",
-    "ADDDATE",
-    "ADDTIME",
-    "AES_DECRYPT",
-    "AES_ENCRYPT",
-    "ANY_VALUE",
-    "ASCII",
-    "ASIN",
-    "ATAN",
-    "ATAN2",
-    "AVG",
-    "BENCHMARK",
-    "BIN",
-    "BIN_TO_UUID",
-    "BIT_AND",
-    "BIT_COUNT",
-    "BIT_LENGTH",
-    "BIT_OR",
-    "BIT_XOR",
-    "CAST",
-    "CEIL",
-    "CEILING",
-    "CHAR",
-    "CHARACTER_LENGTH",
-    "CHARSET",
-    "CHAR_LENGTH",
-    "COALESCE",
-    "COERCIBILITY",
-    "COLLATION",
-    "COLUMN_CREATE",
-    "COLUMN_GET",
-    "COMPRESS",
-    "CONCAT",
-    "CONCAT_WS",
-    "CONNECTION_ID",
-    "CONV",
-    "CONVERT",
-    "CONVERT_TZ",
-    "COS",
-    "COT",
-    "COUNT",
-    "CRC32",
-    "CUME_DIST",
-    "CURDATE",
-    "CURRENT_DATE",
-    "CURRENT_TIME",
-    "CURRENT_TIMESTAMP",
-    "CURRENT_USER",
-    "CURTIME",
-    "DATABASE",
-    "DATE",
-    "DATEDIFF",
-    "DATE_ADD",
-    "DATE_FORMAT",
-    "DATE_SUB",
-    "DAY",
-    "DAYNAME",
-    "DAYOFMONTH",
-    "DAYOFWEEK",
-    "DAYOFYEAR",
-    "DECODE",
-    "DEFAULT",
-    "DEGREES",
-    "DENSE_RANK",
-    "DES_DECRYPT",
-    "DES_ENCRYPT",
-    "ELT",
-    "ENCODE",
-    "ENCRYPT",
-    "EXP",
-    "EXPORT_SET",
-    "EXTRACT",
-    "EXTRACTVALUE",
-    "FIELD",
-    "FIND_IN_SET",
-    "FIRST_VALUE",
-    "FLOOR",
-    "FORMAT",
-    "FOUND_ROWS",
-    "FROM_BASE64",
-    "FROM_DAYS",
-    "FROM_UNIXTIME",
-    "GET_FORMAT",
-    "GET_LOCK",
-    "GREATEST",
-    "GROUP_CONCAT",
-    "GROUPING",
-    "HEX",
-    "HOUR",
-    "IF",
-    "IFNULL",
-    "INET6_ATON",
-    "INET6_NTOA",
-    "INET_ATON",
-    "INET_NTOA",
-    "INSERT",
-    "INSTR",
-    "ISNULL",
-    "IS_FREE_LOCK",
-    "IS_IPV4",
-    "IS_IPV4_COMPAT",
-    "IS_IPV4_MAPPED",
-    "IS_IPV6",
-    "IS_USED_LOCK",
-    "JSON_ARRAY",
-    "JSON_ARRAYAGG",
-    "JSON_ARRAY_APPEND",
-    "JSON_ARRAY_INSERT",
-    "JSON_CONTAINS",
-    "JSON_CONTAINS_PATH",
-    "JSON_DEPTH",
-    "JSON_EXTRACT",
-    "JSON_INSERT",
-    "JSON_KEYS",
-    "JSON_LENGTH",
-    "JSON_MERGE",
-    "JSON_MERGE_PATCH",
-    "JSON_MERGE_PRESERVE",
-    "JSON_NORMALIZE",
-    "JSON_OBJECT",
-    "JSON_OBJECTAGG",
-    "JSON_OVERLAPS",
-    "JSON_PRETTY",
-    "JSON_QUOTE",
-    "JSON_REMOVE",
-    "JSON_REPLACE",
-    "JSON_SCHEMA_VALID",
-    "JSON_SCHEMA_VALIDATION_REPORT",
-    "JSON_SEARCH",
-    "JSON_SET",
-    "JSON_STORAGE_FREE",
-    "JSON_STORAGE_SIZE",
-    "JSON_TABLE",
-    "JSON_TYPE",
-    "JSON_UNQUOTE",
-    "JSON_VALID",
-    "JSON_VALUE",
-    "LAG",
-    "LAST_DAY",
-    "LAST_INSERT_ID",
-    "LAST_VALUE",
-    "LCASE",
-    "LEAD",
-    "LEAST",
-    "LEFT",
-    "LENGTH",
-    "LN",
-    "LOAD_FILE",
-    "LOCALTIME",
-    "LOCALTIMESTAMP",
-    "LOCATE",
-    "LOG",
-    "LOG10",
-    "LOG2",
-    "LOWER",
-    "LPAD",
-    "LTRIM",
-    "MAKEDATE",
-    "MAKETIME",
-    "MAKE_SET",
-    "MASTER_POS_WAIT",
-    "MAX",
-    "MBRCONTAINS",
-    "MD5",
-    "MEDIAN",
-    "MICROSECOND",
-    "MID",
-    "MIN",
-    "MINUTE",
-    "MOD",
-    "MONTH",
-    "MONTHNAME",
-    "NAME_CONST",
-    "NATURAL_SORT_KEY",
-    "NOW",
-    "NTH_VALUE",
-    "NTILE",
-    "NULLIF",
-    "OCT",
-    "OCTET_LENGTH",
-    "OLD_PASSWORD",
-    "ORD",
-    "PASSWORD",
-    "PERCENTILE_CONT",
-    "PERCENTILE_DISC",
-    "PERCENT_RANK",
-    "PERIOD_ADD",
-    "PERIOD_DIFF",
-    "PI",
-    "POINT",
-    "POLYGON",
-    "POSITION",
-    "POW",
-    "POWER",
-    "QUARTER",
-    "QUOTE",
-    "RADIANS",
-    "RAND",
-    "RANDOM_BYTES",
-    "RANK",
-    "REGEXP_INSTR",
-    "REGEXP_LIKE",
-    "REGEXP_REPLACE",
-    "REGEXP_SUBSTR",
-    "RELEASE_ALL_LOCKS",
-    "RELEASE_LOCK",
-    "REPEAT",
-    "REPLACE",
-    "REVERSE",
-    "RIGHT",
-    "ROUND",
-    "ROW",
-    "ROW_COUNT",
-    "ROW_NUMBER",
-    "RPAD",
-    "RTRIM",
-    "SCHEMA",
-    "SECOND",
-    "SEC_TO_TIME",
-    "SESSION_USER",
-    "SHA1",
-    "SHA2",
-    "SIGN",
-    "SIN",
-    "SLEEP",
-    "SOUNDEX",
-    "SPACE",
-    "SQRT",
-    "STD",
-    "STDDEV",
-    "STDDEV_POP",
-    "STDDEV_SAMP",
-    "STRCMP",
-    "STR_TO_DATE",
-    "ST_AREA",
-    "ST_ASBINARY",
-    "ST_ASGEOJSON",
-    "ST_ASTEXT",
-    "ST_ASWKB",
-    "ST_ASWKT",
-    "ST_BUFFER",
-    "ST_CENTROID",
-    "ST_CONTAINS",
-    "ST_CONVEXHULL",
-    "ST_CROSSES",
-    "ST_DIFFERENCE",
-    "ST_DIMENSION",
-    "ST_DISJOINT",
-    "ST_DISTANCE",
-    "ST_DISTANCE_SPHERE",
-    "ST_ENDPOINT",
-    "ST_ENVELOPE",
-    "ST_EQUALS",
-    "ST_EXTERIORRING",
-    "ST_GEOMCOLLFROMTEXT",
-    "ST_GEOMCOLLFROMWKB",
-    "ST_GEOMETRYCOLLECTIONFROMTEXT",
-    "ST_GEOMETRYCOLLECTIONFROMWKB",
-    "ST_GEOMETRYFROMTEXT",
-    "ST_GEOMETRYFROMWKB",
-    "ST_GEOMETRYN",
-    "ST_GEOMETRYTYPE",
-    "ST_GEOMFROMGEOJSON",
-    "ST_GEOMFROMTEXT",
-    "ST_GEOMFROMWKB",
-    "ST_INTERIORRINGN",
-    "ST_INTERSECTION",
-    "ST_INTERSECTS",
-    "ST_ISCLOSED",
-    "ST_ISEMPTY",
-    "ST_ISSIMPLE",
-    "ST_ISVALID",
-    "ST_LATFROMGEOHASH",
-    "ST_LATITUDE",
-    "ST_LENGTH",
-    "ST_LINEFROMTEXT",
-    "ST_LINEFROMWKB",
-    "ST_LINESTRINGFROMTEXT",
-    "ST_LINESTRINGFROMWKB",
-    "ST_LONGFROMGEOHASH",
-    "ST_LONGITUDE",
-    "ST_MAKEENVELOPE",
-    "ST_MLINEFROMTEXT",
-    "ST_MLINEFROMWKB",
-    "ST_MPOINTFROMTEXT",
-    "ST_MPOINTFROMWKB",
-    "ST_MPOLYFROMTEXT",
-    "ST_MPOLYFROMWKB",
-    "ST_MULTILINESTRINGFROMTEXT",
-    "ST_MULTILINESTRINGFROMWKB",
-    "ST_MULTIPOINTFROMTEXT",
-    "ST_MULTIPOINTFROMWKB",
-    "ST_MULTIPOLYGONFROMTEXT",
-    "ST_MULTIPOLYGONFROMWKB",
-    "ST_NUMGEOMETRIES",
-    "ST_NUMINTERIORRING",
-    "ST_NUMINTERIORRINGS",
-    "ST_NUMPOINTS",
-    "ST_OVERLAPS",
-    "ST_POINTATDISTANCE",
-    "ST_POINTFROMGEOHASH",
-    "ST_POINTFROMTEXT",
-    "ST_POINTFROMWKB",
-    "ST_POINTN",
-    "ST_POLYFROMTEXT",
-    "ST_POLYFROMWKB",
-    "ST_POLYGONFROMTEXT",
-    "ST_POLYGONFROMWKB",
-    "ST_SIMPLIFY",
-    "ST_SRID",
-    "ST_STARTPOINT",
-    "ST_SWAPXY",
-    "ST_SYMDIFFERENCE",
-    "ST_TOUCHES",
-    "ST_TRANSFORM",
-    "ST_UNION",
-    "ST_VALIDATE",
-    "ST_WITHIN",
-    "ST_X",
-    "ST_Y",
-    "SUBDATE",
-    "SUBSTR",
-    "SUBSTRING",
-    "SUBSTRING_INDEX",
-    "SUBTIME",
-    "SUM",
-    "SYSDATE",
-    "SYSTEM_USER",
-    "TAN",
-    "TIME",
-    "TIMEDIFF",
-    "TIMESTAMP",
-    "TIMESTAMPADD",
-    "TIMESTAMPDIFF",
-    "TIME_FORMAT",
-    "TIME_TO_SEC",
-    "TO_BASE64",
-    "TO_DAYS",
-    "TO_SECONDS",
-    "TRIM",
-    "TRUNCATE",
-    "UCASE",
-    "UNCOMPRESS",
-    "UNCOMPRESSED_LENGTH",
-    "UNHEX",
-    "UNIX_TIMESTAMP",
-    "UPDATEXML",
-    "UPPER",
-    "USER",
-    "UTC_DATE",
-    "UTC_TIME",
-    "UTC_TIMESTAMP",
-    "UUID",
-    "UUID_SHORT",
-    "UUID_TO_BIN",
-    "VALIDATE_PASSWORD_STRENGTH",
-    "VALUES",
-    "VARIANCE",
-    "VAR_POP",
-    "VAR_SAMP",
-    "VEC_DISTANCE_COSINE",
-    "VEC_DISTANCE_EUCLIDEAN",
-    "VEC_FROMTEXT",
-    "VEC_TOTEXT",
-    "VERSION",
-    "WAIT_FOR_EXECUTED_GTID_SET",
-    "WEEK",
-    "WEEKDAY",
-    "WEEKOFYEAR",
-    "WEIGHT_STRING",
-    "YEAR",
-    "YEARWEEK",
-];
-
-/// MariaDB built-ins that are not available in MySQL. Keep this separate from
-/// the shared MySQL-family catalog so dialect-specific completion never offers
-/// executable-looking functions to the wrong server.
-pub const MARIADB_FUNCTIONS: &[&str] = &["COLUMN_CHECK", "COLUMN_JSON", "JSON_EXISTS", "UUID_V7"];
+pub use crate::ui::builtin_signatures::{MARIADB_FUNCTIONS, MYSQL_FUNCTIONS, ORACLE_FUNCTIONS};
 
 pub static MYSQL_FUNCTIONS_SET: once_cell::sync::Lazy<std::collections::HashSet<&'static str>> =
     once_cell::sync::Lazy::new(|| MYSQL_FUNCTIONS.iter().copied().collect());
@@ -680,11 +54,8 @@ type LanguageCatalog = (
 const ORACLE_LANGUAGE_CATALOG: LanguageCatalog = (SQL_KEYWORDS, ORACLE_FUNCTIONS, &[]);
 const MYSQL_LANGUAGE_CATALOG: LanguageCatalog =
     (sql_text::MYSQL_SQL_KEYWORDS, MYSQL_FUNCTIONS, &[]);
-const MARIADB_LANGUAGE_CATALOG: LanguageCatalog = (
-    sql_text::MYSQL_SQL_KEYWORDS,
-    MYSQL_FUNCTIONS,
-    MARIADB_FUNCTIONS,
-);
+const MARIADB_LANGUAGE_CATALOG: LanguageCatalog =
+    (sql_text::MYSQL_SQL_KEYWORDS, MARIADB_FUNCTIONS, &[]);
 
 fn language_catalog_for_db_type(db_type: Option<crate::db::DatabaseType>) -> LanguageCatalog {
     match db_type {
@@ -693,6 +64,12 @@ fn language_catalog_for_db_type(db_type: Option<crate::db::DatabaseType>) -> Lan
         Some(crate::db::DatabaseType::MySQL) => MYSQL_LANGUAGE_CATALOG,
         Some(crate::db::DatabaseType::MariaDB) => MARIADB_LANGUAGE_CATALOG,
     }
+}
+
+pub(crate) fn language_catalog_functions_for_db_type(
+    db_type: crate::db::DatabaseType,
+) -> &'static [&'static str] {
+    language_catalog_for_db_type(Some(db_type)).1
 }
 
 pub(crate) fn language_catalog_suggestions_for_db(
@@ -4403,18 +3780,394 @@ fn quoted_identifier_end_from_cursor(
     None
 }
 
-/// A formatted routine signature for the parameter-hint popup, with the byte
-/// range of each positional argument inside `text` so the active one can be
-/// emphasized.
+/// One parsed overload inside a formatted routine signature.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct SignatureOverload {
+    pub arg_spans: Vec<(usize, usize)>,
+    pub required_args: usize,
+    pub variadic_arg: Option<usize>,
+}
+
+impl SignatureOverload {
+    fn span_for_argument(&self, active_arg: usize) -> Option<(usize, usize)> {
+        self.arg_spans.get(active_arg).copied().or_else(|| {
+            self.variadic_arg
+                .filter(|&index| active_arg >= index)
+                .and_then(|index| self.arg_spans.get(index).copied())
+        })
+    }
+}
+
+/// A formatted routine signature for the parameter-hint popup. Each overload
+/// owns its positional argument structure; `arg_spans` remains the primary
+/// overload's flat view for named-argument completion.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct SignatureLabel {
     pub text: String,
     pub arg_spans: Vec<(usize, usize)>,
+    pub overloads: Vec<SignatureOverload>,
 }
 
-/// Whether `name` is a known built-in SQL function (Oracle/MySQL/MariaDB). Used to
-/// skip a futile routine-argument DB lookup for built-ins, which never appear
-/// in the data-dictionary argument views.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SignatureSyntaxGroupKind {
+    Parenthesis,
+    Optional,
+    Choice,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum SignatureSyntaxNode {
+    Atom(usize, usize),
+    Group {
+        kind: SignatureSyntaxGroupKind,
+        start: usize,
+        end: usize,
+        children: Vec<SignatureSyntaxNode>,
+    },
+    ArgumentSeparator,
+    Repeat,
+}
+
+fn parse_signature_syntax_nodes(
+    syntax: &str,
+    cursor: &mut usize,
+    closing: Option<char>,
+) -> Option<Vec<SignatureSyntaxNode>> {
+    let mut nodes = Vec::new();
+    while *cursor < syntax.len() {
+        let ch = syntax[*cursor..].chars().next()?;
+        if Some(ch) == closing {
+            *cursor += ch.len_utf8();
+            return Some(nodes);
+        }
+        if ch.is_whitespace() {
+            *cursor += ch.len_utf8();
+            continue;
+        }
+
+        let group = match ch {
+            '(' => Some((SignatureSyntaxGroupKind::Parenthesis, ')')),
+            '[' => Some((SignatureSyntaxGroupKind::Optional, ']')),
+            '{' => Some((SignatureSyntaxGroupKind::Choice, '}')),
+            _ => None,
+        };
+        if let Some((kind, group_closing)) = group {
+            let start = *cursor;
+            *cursor += ch.len_utf8();
+            let children = parse_signature_syntax_nodes(syntax, cursor, Some(group_closing))?;
+            nodes.push(SignatureSyntaxNode::Group {
+                kind,
+                start,
+                end: *cursor,
+                children,
+            });
+            continue;
+        }
+        if matches!(ch, ')' | ']' | '}') {
+            return None;
+        }
+        if ch == ',' {
+            nodes.push(SignatureSyntaxNode::ArgumentSeparator);
+            *cursor += 1;
+            continue;
+        }
+        if syntax[*cursor..].starts_with("...") {
+            nodes.push(SignatureSyntaxNode::Repeat);
+            *cursor += 3;
+            continue;
+        }
+
+        let start = *cursor;
+        if matches!(ch, '\'' | '"') {
+            let delimiter = ch;
+            *cursor += ch.len_utf8();
+            while *cursor < syntax.len() {
+                let quoted = syntax[*cursor..].chars().next()?;
+                *cursor += quoted.len_utf8();
+                if quoted == delimiter {
+                    if syntax[*cursor..].starts_with(delimiter) {
+                        *cursor += delimiter.len_utf8();
+                    } else {
+                        break;
+                    }
+                }
+            }
+        } else {
+            *cursor += ch.len_utf8();
+            while *cursor < syntax.len() {
+                let next = syntax[*cursor..].chars().next()?;
+                if next.is_whitespace()
+                    || matches!(next, '(' | ')' | '[' | ']' | '{' | '}' | ',' | '\'' | '"')
+                    || syntax[*cursor..].starts_with("...")
+                {
+                    break;
+                }
+                *cursor += next.len_utf8();
+            }
+        }
+        nodes.push(SignatureSyntaxNode::Atom(start, *cursor));
+    }
+
+    closing.is_none().then_some(nodes)
+}
+
+fn signature_atom_is_separator_keyword(
+    syntax: &str,
+    start: usize,
+    end: usize,
+    separator_keywords: &[&str],
+) -> bool {
+    separator_keywords
+        .iter()
+        .any(|keyword| syntax[start..end].eq_ignore_ascii_case(keyword))
+}
+
+fn optional_group_has_argument_separator(
+    syntax: &str,
+    nodes: &[SignatureSyntaxNode],
+    separator_keywords: &[&str],
+) -> bool {
+    nodes.iter().any(|node| match node {
+        SignatureSyntaxNode::ArgumentSeparator => true,
+        SignatureSyntaxNode::Atom(start, end) => {
+            signature_atom_is_separator_keyword(syntax, *start, *end, separator_keywords)
+        }
+        SignatureSyntaxNode::Group {
+            kind: SignatureSyntaxGroupKind::Optional,
+            children,
+            ..
+        } => optional_group_has_argument_separator(syntax, children, separator_keywords),
+        _ => false,
+    })
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SignatureArgumentEvent {
+    Atom(usize, usize),
+    Separator,
+    Repeat,
+    OptionalArgumentsStart,
+    OptionalArgumentsEnd,
+}
+
+fn collect_signature_argument_events(
+    syntax: &str,
+    nodes: &[SignatureSyntaxNode],
+    separator_keywords: &[&str],
+    events: &mut Vec<SignatureArgumentEvent>,
+) {
+    for node in nodes {
+        match node {
+            SignatureSyntaxNode::Atom(start, end)
+                if signature_atom_is_separator_keyword(
+                    syntax,
+                    *start,
+                    *end,
+                    separator_keywords,
+                ) =>
+            {
+                events.push(SignatureArgumentEvent::Separator);
+            }
+            SignatureSyntaxNode::Atom(start, end) => {
+                events.push(SignatureArgumentEvent::Atom(*start, *end));
+            }
+            SignatureSyntaxNode::ArgumentSeparator => {
+                events.push(SignatureArgumentEvent::Separator);
+            }
+            SignatureSyntaxNode::Repeat => events.push(SignatureArgumentEvent::Repeat),
+            SignatureSyntaxNode::Group {
+                kind: SignatureSyntaxGroupKind::Optional,
+                start,
+                end,
+                children,
+            } if optional_group_has_argument_separator(syntax, children, separator_keywords) => {
+                events.push(SignatureArgumentEvent::OptionalArgumentsStart);
+                collect_signature_argument_events(syntax, children, separator_keywords, events);
+                events.push(SignatureArgumentEvent::OptionalArgumentsEnd);
+            }
+            SignatureSyntaxNode::Group { start, end, .. } => {
+                events.push(SignatureArgumentEvent::Atom(*start, *end));
+            }
+        }
+    }
+}
+
+fn trim_signature_argument_group(syntax: &str, mut start: usize, mut end: usize) -> (usize, usize) {
+    loop {
+        let value = &syntax[start..end];
+        let mut cursor = 0;
+        let Some(nodes) = parse_signature_syntax_nodes(value, &mut cursor, None) else {
+            break;
+        };
+        let [SignatureSyntaxNode::Group {
+            start: group_start,
+            end: group_end,
+            ..
+        }] = nodes.as_slice()
+        else {
+            break;
+        };
+        if *group_start != 0 || *group_end != value.len() || value.len() < 2 {
+            break;
+        }
+        start += 1;
+        end -= 1;
+        while start < end
+            && syntax[start..]
+                .chars()
+                .next()
+                .is_some_and(char::is_whitespace)
+        {
+            start += syntax[start..].chars().next().map_or(0, char::len_utf8);
+        }
+        while start < end
+            && syntax[..end]
+                .chars()
+                .next_back()
+                .is_some_and(char::is_whitespace)
+        {
+            end -= syntax[..end].chars().next_back().map_or(0, char::len_utf8);
+        }
+    }
+    (start, end)
+}
+
+fn signature_span_has_required_content(
+    nodes: &[SignatureSyntaxNode],
+    span_start: usize,
+    span_end: usize,
+    inside_optional: bool,
+) -> bool {
+    nodes.iter().any(|node| match node {
+        SignatureSyntaxNode::Atom(start, end) => {
+            !inside_optional && *start < span_end && *end > span_start
+        }
+        SignatureSyntaxNode::Group {
+            kind,
+            start,
+            end,
+            children,
+        } if *start < span_end && *end > span_start => signature_span_has_required_content(
+            children,
+            span_start,
+            span_end,
+            inside_optional || *kind == SignatureSyntaxGroupKind::Optional,
+        ),
+        _ => false,
+    })
+}
+
+fn signature_call_children(
+    nodes: &[SignatureSyntaxNode],
+    inside_optional: bool,
+) -> Option<(&[SignatureSyntaxNode], bool)> {
+    for node in nodes {
+        if let SignatureSyntaxNode::Group { kind, children, .. } = node {
+            let optional = inside_optional || *kind == SignatureSyntaxGroupKind::Optional;
+            if *kind == SignatureSyntaxGroupKind::Parenthesis {
+                return Some((children, optional));
+            }
+            if let Some(call) = signature_call_children(children, optional) {
+                return Some(call);
+            }
+        }
+    }
+    None
+}
+
+/// Parse the documented SQL grammar into a structured overload. Optional
+/// groups that introduce arguments are traversed, while nested expressions,
+/// choices, and argument-local optional modifiers remain atomic.
+pub(crate) fn signature_overload_from_syntax(
+    syntax: &str,
+    offset: usize,
+    separator_keywords: &[&str],
+) -> SignatureOverload {
+    let Some(nodes) = parse_signature_syntax_nodes(syntax, &mut 0, None) else {
+        return SignatureOverload::default();
+    };
+    let Some((children, call_optional)) = signature_call_children(&nodes, false) else {
+        return SignatureOverload::default();
+    };
+
+    let mut events = Vec::new();
+    collect_signature_argument_events(syntax, children, &[], &mut events);
+    if !events
+        .iter()
+        .any(|event| matches!(event, SignatureArgumentEvent::Separator))
+    {
+        events.clear();
+        collect_signature_argument_events(syntax, children, separator_keywords, &mut events);
+    }
+    let mut arg_spans = Vec::new();
+    let mut current_span: Option<(usize, usize)> = None;
+    let mut variadic_arg = None;
+    let mut accept_atoms = true;
+    for event in events {
+        match event {
+            SignatureArgumentEvent::Atom(start, end) => {
+                if accept_atoms {
+                    current_span = Some(match current_span {
+                        Some((current_start, _)) => (current_start, end),
+                        None => (start, end),
+                    });
+                }
+            }
+            SignatureArgumentEvent::Separator => {
+                if let Some(span) = current_span.take() {
+                    let span = trim_signature_argument_group(syntax, span.0, span.1);
+                    arg_spans.push((offset + span.0, offset + span.1));
+                }
+                accept_atoms = true;
+            }
+            SignatureArgumentEvent::Repeat => {
+                variadic_arg = Some(if current_span.is_some() {
+                    arg_spans.len()
+                } else {
+                    arg_spans.len().saturating_sub(1)
+                });
+            }
+            SignatureArgumentEvent::OptionalArgumentsStart => {
+                if current_span.is_some() {
+                    accept_atoms = false;
+                }
+            }
+            SignatureArgumentEvent::OptionalArgumentsEnd => {
+                if let Some(span) = current_span.take() {
+                    let span = trim_signature_argument_group(syntax, span.0, span.1);
+                    arg_spans.push((offset + span.0, offset + span.1));
+                    accept_atoms = false;
+                }
+            }
+        }
+    }
+    if let Some(span) = current_span {
+        let span = trim_signature_argument_group(syntax, span.0, span.1);
+        arg_spans.push((offset + span.0, offset + span.1));
+    }
+    if arg_spans.is_empty() {
+        variadic_arg = None;
+    }
+    let required_args = arg_spans
+        .iter()
+        .filter(|&&(start, end)| {
+            signature_span_has_required_content(
+                children,
+                start - offset,
+                end - offset,
+                call_optional,
+            )
+        })
+        .count();
+
+    SignatureOverload {
+        arg_spans,
+        required_args,
+        variadic_arg,
+    }
+}
+
+/// Whether `name` is a known built-in SQL function in any supported dialect.
 pub fn is_builtin_function(name: &str) -> bool {
     ORACLE_FUNCTIONS
         .iter()
@@ -4810,19 +4563,35 @@ impl SignaturePopup {
     }
 
     fn display_text(label: &SignatureLabel, active_arg: usize) -> String {
-        let Some(&(start, end)) = label.arg_spans.get(active_arg) else {
+        let overload_spans: Vec<_> = label
+            .overloads
+            .iter()
+            .filter_map(|overload| overload.span_for_argument(active_arg))
+            .collect();
+        let spans = if overload_spans.is_empty() {
+            label
+                .arg_spans
+                .get(active_arg)
+                .copied()
+                .map(|span| vec![span])
+        } else {
+            Some(overload_spans)
+        };
+        let Some(spans) = spans else {
             return label.text.clone();
         };
-        let Some(before) = label.text.get(..start) else {
+        if spans.iter().any(|&(start, end)| {
+            start > end || !label.text.is_char_boundary(start) || !label.text.is_char_boundary(end)
+        }) || spans.windows(2).any(|pair| pair[0].1 > pair[1].0)
+        {
             return label.text.clone();
-        };
-        let Some(active) = label.text.get(start..end) else {
-            return label.text.clone();
-        };
-        let Some(after) = label.text.get(end..) else {
-            return label.text.clone();
-        };
-        format!("{before}[ {active} ]{after}")
+        }
+        let mut display = label.text.clone();
+        for &(start, end) in spans.iter().rev() {
+            display.insert_str(end, " ]");
+            display.insert_str(start, "[ ");
+        }
+        display
     }
 
     /// Position inside the editor's parent window. Mirrors the completion
@@ -4864,9 +4633,13 @@ impl SignaturePopup {
 
         let display = Self::display_text(label, active_arg);
         fltk::draw::set_font(fltk::enums::Font::Helvetica, Self::font_size());
-        let (text_w, _) = fltk::draw::measure(&display, false);
+        let text_w = display
+            .lines()
+            .map(|line| fltk::draw::measure(line, false).0)
+            .max()
+            .unwrap_or_default();
         let width = (text_w + 20).clamp(120, 1100);
-        let height = Self::height();
+        let height = Self::height().saturating_mul(display.lines().count().max(1) as i32);
         let (x, y) = Self::overlay_position(editor, anchor_pos, width, height);
         let render_state = SignaturePopupRenderState {
             display,
@@ -4940,6 +4713,7 @@ impl Default for SignaturePopup {
 #[cfg(test)]
 mod intellisense_tests {
     use super::*;
+    use crate::db::DatabaseType;
 
     fn call_at(text: &str) -> Option<EnclosingCall> {
         let cursor = text.find('|').expect("cursor marker");
@@ -4948,10 +4722,11 @@ mod intellisense_tests {
     }
 
     #[test]
-    fn signature_popup_display_text_rejects_invalid_spans_without_panicking() {
+    fn signature_popup_uses_valid_structured_overload_spans() {
         let label = SignatureLabel {
             text: "PROC(한글)".to_string(),
             arg_spans: vec![(8, 6), (6, 7)],
+            overloads: Vec::new(),
         };
 
         assert_eq!(SignaturePopup::display_text(&label, 0), label.text);
@@ -4960,8 +4735,138 @@ mod intellisense_tests {
         let valid = SignatureLabel {
             text: "PROC(한글)".to_string(),
             arg_spans: vec![(5, 11)],
+            overloads: Vec::new(),
         };
         assert_eq!(SignaturePopup::display_text(&valid, 0), "PROC([ 한글 ])");
+
+        let oracle_substr =
+            crate::ui::builtin_signatures::builtin_signature_label(DatabaseType::Oracle, "SUBSTR")
+                .expect("Oracle SUBSTR signature");
+        assert_eq!(oracle_substr.overloads[0].required_args, 2);
+        assert_eq!(
+            SignaturePopup::display_text(&oracle_substr, 1),
+            "SUBSTR(char, [ position ] [, substring_length ])"
+        );
+        assert_eq!(
+            SignaturePopup::display_text(&oracle_substr, 2),
+            "SUBSTR(char, position [, [ substring_length ] ])"
+        );
+
+        let mysql_substr =
+            crate::ui::builtin_signatures::builtin_signature_label(DatabaseType::MySQL, "SUBSTR")
+                .expect("MySQL SUBSTR signatures");
+        assert_eq!(
+            mysql_substr
+                .overloads
+                .iter()
+                .map(|overload| overload.required_args)
+                .collect::<Vec<_>>(),
+            vec![2, 2, 3, 3]
+        );
+
+        let oracle_current_timestamp = crate::ui::builtin_signatures::builtin_signature_label(
+            DatabaseType::Oracle,
+            "CURRENT_TIMESTAMP",
+        )
+        .expect("Oracle CURRENT_TIMESTAMP signature");
+        assert_eq!(oracle_current_timestamp.overloads[0].arg_spans.len(), 1);
+        assert_eq!(oracle_current_timestamp.overloads[0].required_args, 0);
+        assert_eq!(
+            SignaturePopup::display_text(&mysql_substr, 1),
+            "SUBSTR(str,[ pos ])\nSUBSTR(str FROM [ pos ])\nSUBSTR(str,[ pos ],len)\nSUBSTR(str FROM [ pos ] FOR len)"
+        );
+        assert_eq!(
+            SignaturePopup::display_text(&mysql_substr, 2),
+            "SUBSTR(str,pos)\nSUBSTR(str FROM pos)\nSUBSTR(str,pos,[ len ])\nSUBSTR(str FROM pos FOR [ len ])"
+        );
+
+        for (db_type, names) in [
+            (DatabaseType::Oracle, ORACLE_FUNCTIONS),
+            (DatabaseType::MySQL, MYSQL_FUNCTIONS),
+            (DatabaseType::MariaDB, MARIADB_FUNCTIONS),
+        ] {
+            for name in names {
+                let syntaxes =
+                    crate::ui::builtin_signatures::builtin_signature_syntaxes(db_type, name)
+                        .expect("catalog syntax");
+                let label = crate::ui::builtin_signatures::builtin_signature_label(db_type, name)
+                    .expect("catalog label");
+                assert_eq!(label.overloads.len(), syntaxes.len(), "{db_type:?} {name}");
+                for (syntax, overload) in syntaxes.iter().zip(&label.overloads) {
+                    assert!(
+                        overload.required_args <= overload.arg_spans.len(),
+                        "too many required arguments for {db_type:?} {name}: {}",
+                        label.text
+                    );
+                    let nodes = parse_signature_syntax_nodes(syntax, &mut 0, None)
+                        .unwrap_or_else(|| panic!("unbalanced syntax for {db_type:?} {name}"));
+                    if signature_call_children(&nodes, false)
+                        .is_some_and(|(children, _)| !children.is_empty())
+                    {
+                        assert!(
+                            !overload.arg_spans.is_empty(),
+                            "non-empty call has no structured arguments for {db_type:?} {name}: {syntax}"
+                        );
+                    }
+                    assert!(
+                        overload
+                            .arg_spans
+                            .windows(2)
+                            .all(|pair| pair[0].1 <= pair[1].0),
+                        "overlapping spans for {db_type:?} {name}: {}",
+                        label.text
+                    );
+                    for &(start, end) in &overload.arg_spans {
+                        assert!(
+                            start < end
+                                && label.text.is_char_boundary(start)
+                                && label.text.is_char_boundary(end),
+                            "invalid span for {db_type:?} {name}: {}",
+                            label.text
+                        );
+                        let mut cursor = 0;
+                        let span_nodes = parse_signature_syntax_nodes(
+                            &label.text[start..end],
+                            &mut cursor,
+                            None,
+                        );
+                        assert!(
+                            span_nodes.is_some(),
+                            "unbalanced argument span for {db_type:?} {name}: {}",
+                            &label.text[start..end]
+                        );
+                        assert!(
+                            !span_nodes
+                                .expect("checked above")
+                                .iter()
+                                .any(|node| matches!(node, SignatureSyntaxNode::ArgumentSeparator)),
+                            "argument span contains a top-level comma for {db_type:?} {name}: {}",
+                            &label.text[start..end]
+                        );
+                    }
+                    for active_arg in 0..=overload.arg_spans.len() {
+                        let display = SignaturePopup::display_text(&label, active_arg);
+                        let overload_highlights = label
+                            .overloads
+                            .iter()
+                            .filter(|candidate| candidate.span_for_argument(active_arg).is_some())
+                            .count();
+                        let expected_highlights = if overload_highlights == 0
+                            && label.arg_spans.get(active_arg).is_some()
+                        {
+                            1
+                        } else {
+                            overload_highlights
+                        };
+                        assert_eq!(
+                            display.len(),
+                            label.text.len() + expected_highlights * 4,
+                            "unexpected highlight boundaries for {db_type:?} {name} argument {active_arg}: {display}"
+                        );
+                    }
+                }
+            }
+        }
     }
 
     #[test]
@@ -6480,6 +6385,7 @@ BEGIN
                 Some(SignatureLabel {
                     text: format!("PROC_{index}()"),
                     arg_spans: Vec::new(),
+                    overloads: Vec::new(),
                 }),
             );
         }
