@@ -44923,10 +44923,10 @@ fn negated_and_collection_predicate_operators_are_position_aware() {
     }
 }
 
-/// `FIRST`/`LAST` are not standalone-callable functions in Oracle — they only
-/// occur as syntax keywords (`… KEEP (DENSE_RANK FIRST …)`, `NULLS FIRST/LAST`).
-/// They must therefore not be treated as value-producing functions and leak into
-/// an operand position, but must stay available where they are grammatical.
+/// Oracle's row-pattern `FIRST`/`LAST` calls are valid only inside
+/// `MATCH_RECOGNIZE`. They must not be treated as general value-producing
+/// functions and leak into an ordinary operand position, while the keyword forms
+/// remain available where they are grammatical.
 #[test]
 fn first_last_are_not_value_functions() {
     let has = |v: &[String], s: &str| v.iter().any(|x| x.eq_ignore_ascii_case(s));
@@ -44954,6 +44954,40 @@ fn first_last_are_not_value_functions() {
         kw.iter().any(|k| k.eq_ignore_ascii_case("FIRST")),
         "NULLS FIRST ordering slot lost FIRST: {kw:?}"
     );
+}
+
+#[test]
+fn row_pattern_functions_are_suggested_only_inside_match_recognize() {
+    let has = |suggestions: &[String], expected: &str| {
+        suggestions
+            .iter()
+            .any(|suggestion| suggestion.eq_ignore_ascii_case(expected))
+    };
+
+    for (name, prefix) in [
+        ("CLASSIFIER", "clas"),
+        ("FIRST", "fir"),
+        ("LAST", "las"),
+        ("MATCH_NUMBER", "matc"),
+        ("NEXT", "nex"),
+        ("PREV", "pre"),
+    ] {
+        let ordinary = typed_emp_suggestions(&format!("SELECT {prefix}| FROM emp"));
+        assert!(
+            !has(&ordinary, name) && !has(&ordinary, &format!("{name}()")),
+            "{name} leaked outside MATCH_RECOGNIZE: {ordinary:?}"
+        );
+
+        let sql = format!(
+            "SELECT * FROM emp MATCH_RECOGNIZE (MEASURES {prefix}|() AS m PATTERN (A) DEFINE A AS 1 = 1)"
+        );
+        let (_, _, inside) =
+            audit_final_suggestions_for(&sql, crate::db::DatabaseType::Oracle);
+        assert!(
+            has(&inside, &format!("{name}()")),
+            "{name} was not suggested inside MATCH_RECOGNIZE: {inside:?}"
+        );
+    }
 }
 
 /// MySQL `RLIKE` is an infix regexp operator, not a standalone value-producing

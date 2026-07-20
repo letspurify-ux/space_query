@@ -329,12 +329,13 @@ impl SqlEditorWidget {
             &scan_text,
             scan_text.len(),
             mysql_compatible,
-            initial_lex_mode,
+            initial_lex_mode.clone(),
         )
         else {
             self.hide_signature_popup();
             return;
         };
+        let local_open_paren = call.open_paren;
         call.open_paren += scan_offset;
 
         // Built-ins are resolved from the versioned manual catalog because
@@ -344,7 +345,22 @@ impl SqlEditorWidget {
                 db_type,
                 &call.name,
             ) {
-                self.show_signature_popup(&label, call.arg_index, call.open_paren as i32);
+                let separator_keywords = crate::ui::builtin_signatures::
+                    builtin_signature_argument_separator_keywords(db_type, &call.name)
+                    .unwrap_or_default();
+                let active_arg = if separator_keywords.is_empty() {
+                    call.arg_index
+                } else {
+                    crate::ui::intellisense::call_argument_index_with_separator_keywords(
+                        &scan_text,
+                        scan_text.len(),
+                        local_open_paren,
+                        mysql_compatible,
+                        initial_lex_mode,
+                        separator_keywords,
+                    )
+                };
+                self.show_signature_popup(&label, active_arg, call.open_paren as i32);
                 return;
             }
         }

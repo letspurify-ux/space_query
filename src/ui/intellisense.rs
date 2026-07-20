@@ -13,6 +13,15 @@ pub const SQL_KEYWORDS: &[&str] = sql_text::ORACLE_SQL_KEYWORDS;
 
 pub use crate::ui::builtin_signatures::{MARIADB_FUNCTIONS, MYSQL_FUNCTIONS, ORACLE_FUNCTIONS};
 
+pub(crate) const ORACLE_MATCH_RECOGNIZE_FUNCTIONS: &[&str] = &[
+    "CLASSIFIER",
+    "FIRST",
+    "LAST",
+    "MATCH_NUMBER",
+    "NEXT",
+    "PREV",
+];
+
 pub static MYSQL_FUNCTIONS_SET: once_cell::sync::Lazy<std::collections::HashSet<&'static str>> =
     once_cell::sync::Lazy::new(|| MYSQL_FUNCTIONS.iter().copied().collect());
 pub static MARIADB_FUNCTIONS_SET: once_cell::sync::Lazy<std::collections::HashSet<&'static str>> =
@@ -64,6 +73,16 @@ fn language_catalog_for_db_type(db_type: Option<crate::db::DatabaseType>) -> Lan
         Some(crate::db::DatabaseType::MySQL) => MYSQL_LANGUAGE_CATALOG,
         Some(crate::db::DatabaseType::MariaDB) => MARIADB_LANGUAGE_CATALOG,
     }
+}
+
+fn is_oracle_match_recognize_function(
+    name: &str,
+    db_type: Option<crate::db::DatabaseType>,
+) -> bool {
+    !sql_text::mysql_compatibility_for_sql("", db_type)
+        && ORACLE_MATCH_RECOGNIZE_FUNCTIONS
+            .binary_search(&name)
+            .is_ok()
 }
 
 pub(crate) fn language_catalog_functions_for_db_type(
@@ -454,6 +473,9 @@ impl IntellisenseData {
             if prefer_columns && crate::sql_text::is_non_expression_keyword_upper(keyword) {
                 continue;
             }
+            if prefer_columns && is_oracle_match_recognize_function(keyword, db_type) {
+                continue;
+            }
             if !suggestion_matches_completion_prefix(keyword, prefix) {
                 continue;
             }
@@ -469,6 +491,9 @@ impl IntellisenseData {
         for func in &functions[start..] {
             if !func.starts_with(prefix_upper.as_str()) {
                 break;
+            }
+            if is_oracle_match_recognize_function(func, db_type) {
+                continue;
             }
             // Skip functions that are also keywords (e.g. MAX, TO_CHAR,
             // SYSDATE); those are emitted by the keyword loop as bare names.
@@ -2062,7 +2087,9 @@ impl IntellisenseData {
         db_type: Option<crate::db::DatabaseType>,
     ) -> bool {
         let (_keywords, functions, dialect_functions) = language_catalog_for_db_type(db_type);
-        functions.binary_search(&upper).is_ok() || dialect_functions.binary_search(&upper).is_ok()
+        !is_oracle_match_recognize_function(upper, db_type)
+            && (functions.binary_search(&upper).is_ok()
+                || dialect_functions.binary_search(&upper).is_ok())
     }
 
     /// Cached signature for a routine key: `Some(Some(label))` when resolved to
@@ -4281,6 +4308,85 @@ pub(crate) fn enclosing_call_at_cursor_with_lexical_mode(
     })
 }
 
+/// Recompute the active argument for documented call syntaxes that use a
+/// top-level keyword such as `FROM`, `FOR`, `IN`, `AS`, or `USING` instead of
+/// a comma. Nested calls and lexical spans do not affect the outer call.
+pub(crate) fn call_argument_index_with_separator_keywords(
+    text: &str,
+    cursor_pos: usize,
+    open_paren: usize,
+    mysql_compatible: bool,
+    initial_mode: crate::sql_parser_engine::LexMode,
+    separator_keywords: &[&str],
+) -> usize {
+    let end = normalize_cursor_pos(text, cursor_pos.min(text.len()));
+    if open_paren >= end || text.as_bytes().get(open_paren) != Some(&b'(') {
+        return 0;
+    }
+
+    let lexical_spans = crate::sql_parser_engine::lexical_spans_with_initial_mode(
+        &text[..end],
+        mysql_compatible,
+        initial_mode,
+    )
+    .0;
+    let bytes = text.as_bytes();
+    let mut lexical_idx = 0;
+    let mut idx = open_paren + 1;
+    let mut nested_depth = 0usize;
+    let mut argument_index = 0usize;
+
+    while idx < end {
+        while lexical_spans
+            .get(lexical_idx)
+            .is_some_and(|span| span.end <= idx)
+        {
+            lexical_idx += 1;
+        }
+        if let Some(span) = lexical_spans.get(lexical_idx) {
+            if span.start <= idx && idx < span.end {
+                idx = span.end.min(end);
+                continue;
+            }
+        }
+
+        match bytes[idx] {
+            b'(' => {
+                nested_depth += 1;
+                idx += 1;
+            }
+            b')' if nested_depth > 0 => {
+                nested_depth -= 1;
+                idx += 1;
+            }
+            b')' => break,
+            b',' if nested_depth == 0 => {
+                argument_index += 1;
+                idx += 1;
+            }
+            byte if nested_depth == 0 && (byte.is_ascii_alphabetic() || byte == b'_') => {
+                let start = idx;
+                idx += 1;
+                while idx < end
+                    && (bytes[idx].is_ascii_alphanumeric()
+                        || matches!(bytes[idx], b'_' | b'$' | b'#'))
+                {
+                    idx += 1;
+                }
+                if separator_keywords
+                    .iter()
+                    .any(|keyword| text[start..idx].eq_ignore_ascii_case(keyword))
+                {
+                    argument_index += 1;
+                }
+            }
+            _ => idx += 1,
+        }
+    }
+
+    argument_index
+}
+
 /// Clause/operator keywords that introduce a grouping or subquery parenthesis
 /// rather than a routine call. The general keyword list is unusable here
 /// because it also contains built-in functions (DECODE, NVL, TO_CHAR, ...).
@@ -4492,8 +4598,8 @@ pub(crate) fn sql_context_for_phase(
 }
 
 /// In-window overlay showing the signature of the routine call enclosing the
-/// cursor, with the active argument bracketed. Keeping this inside the editor's
-/// parent window preserves editor focus while the hint is visible.
+/// cursor, with the active argument emphasized. Keeping this inside the
+/// editor's parent window preserves editor focus while the hint is visible.
 pub struct SignaturePopup {
     frame: Option<Frame>,
     visible: bool,
@@ -4501,8 +4607,39 @@ pub struct SignaturePopup {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+struct SignaturePopupTextRun {
+    text: String,
+    style: SignaturePopupTextStyle,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SignaturePopupTextStyle {
+    Normal,
+    ActiveParameter,
+}
+
+impl SignaturePopupTextStyle {
+    fn font(self, normal: fltk::enums::Font, bold: fltk::enums::Font) -> fltk::enums::Font {
+        match self {
+            Self::Normal => normal,
+            Self::ActiveParameter => bold,
+        }
+    }
+
+    fn color(self) -> fltk::enums::Color {
+        match self {
+            Self::Normal => theme::text_primary(),
+            Self::ActiveParameter => fltk::enums::Color::from_rgb(102, 183, 255),
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 struct SignaturePopupRenderState {
-    display: String,
+    lines: Vec<Vec<SignaturePopupTextRun>>,
+    normal_font: i32,
+    bold_font: i32,
+    font_size: i32,
     x: i32,
     y: i32,
     width: i32,
@@ -4550,6 +4687,17 @@ impl SignaturePopup {
             frame.set_label_size(Self::font_size());
             frame.set_align(fltk::enums::Align::Left | fltk::enums::Align::Inside);
             frame.clear_visible_focus();
+            frame.handle(|frame, event| {
+                if event != fltk::enums::Event::Push {
+                    return false;
+                }
+                frame.hide();
+                frame.redraw();
+                if let Some(mut win) = frame.window() {
+                    win.redraw();
+                }
+                true
+            });
             frame.hide();
             parent.end();
             if let Some(ref group) = current_group {
@@ -4562,8 +4710,8 @@ impl SignaturePopup {
         self.frame.as_mut()
     }
 
-    fn display_text(label: &SignatureLabel, active_arg: usize) -> String {
-        let overload_spans: Vec<_> = label
+    fn styled_lines(label: &SignatureLabel, active_arg: usize) -> Vec<Vec<SignaturePopupTextRun>> {
+        let mut overload_spans: Vec<_> = label
             .overloads
             .iter()
             .filter_map(|overload| overload.span_for_argument(active_arg))
@@ -4575,23 +4723,55 @@ impl SignaturePopup {
                 .copied()
                 .map(|span| vec![span])
         } else {
+            overload_spans.sort_unstable_by_key(|span| span.0);
             Some(overload_spans)
         };
-        let Some(spans) = spans else {
-            return label.text.clone();
-        };
-        if spans.iter().any(|&(start, end)| {
-            start > end || !label.text.is_char_boundary(start) || !label.text.is_char_boundary(end)
-        }) || spans.windows(2).any(|pair| pair[0].1 > pair[1].0)
-        {
-            return label.text.clone();
-        }
-        let mut display = label.text.clone();
-        for &(start, end) in spans.iter().rev() {
-            display.insert_str(end, " ]");
-            display.insert_str(start, "[ ");
-        }
-        display
+        let valid_spans = spans.filter(|spans| {
+            !spans.iter().any(|&(start, end)| {
+                start >= end
+                    || !label.text.is_char_boundary(start)
+                    || !label.text.is_char_boundary(end)
+                    || label.text[start..end].contains('\n')
+            }) && spans.windows(2).all(|pair| pair[0].1 <= pair[1].0)
+        });
+
+        label
+            .text
+            .split('\n')
+            .scan(0, |line_start, line| {
+                let start = *line_start;
+                let end = start + line.len();
+                *line_start = end.saturating_add(1);
+
+                let mut runs = Vec::new();
+                let mut cursor = start;
+                if let Some(spans) = &valid_spans {
+                    for &(span_start, span_end) in spans
+                        .iter()
+                        .filter(|&&(span_start, span_end)| span_start >= start && span_end <= end)
+                    {
+                        if cursor < span_start {
+                            runs.push(SignaturePopupTextRun {
+                                text: label.text[cursor..span_start].to_string(),
+                                style: SignaturePopupTextStyle::Normal,
+                            });
+                        }
+                        runs.push(SignaturePopupTextRun {
+                            text: label.text[span_start..span_end].to_string(),
+                            style: SignaturePopupTextStyle::ActiveParameter,
+                        });
+                        cursor = span_end;
+                    }
+                }
+                if cursor < end {
+                    runs.push(SignaturePopupTextRun {
+                        text: label.text[cursor..end].to_string(),
+                        style: SignaturePopupTextStyle::Normal,
+                    });
+                }
+                Some(runs)
+            })
+            .collect()
     }
 
     /// Position inside the editor's parent window. Mirrors the completion
@@ -4617,7 +4797,7 @@ impl SignaturePopup {
         (popup_x, popup_y)
     }
 
-    /// Render `label` with the argument at `active_arg` bracketed, sizing and
+    /// Render `label` with the argument at `active_arg` emphasized, sizing and
     /// positioning the overlay above the call's opening parenthesis.
     pub fn show(
         &mut self,
@@ -4631,18 +4811,32 @@ impl SignaturePopup {
             return;
         }
 
-        let display = Self::display_text(label, active_arg);
-        fltk::draw::set_font(fltk::enums::Font::Helvetica, Self::font_size());
-        let text_w = display
-            .lines()
-            .map(|line| fltk::draw::measure(line, false).0)
+        let lines = Self::styled_lines(label, active_arg);
+        let profile = crate::ui::configured_editor_profile();
+        let font_size = Self::font_size();
+        let text_w = lines
+            .iter()
+            .map(|line| {
+                line.iter()
+                    .map(|run| {
+                        fltk::draw::set_font(
+                            run.style.font(profile.normal, profile.bold),
+                            font_size,
+                        );
+                        fltk::draw::measure(&run.text, false).0
+                    })
+                    .sum::<i32>()
+            })
             .max()
             .unwrap_or_default();
         let width = (text_w + 20).clamp(120, 1100);
-        let height = Self::height().saturating_mul(display.lines().count().max(1) as i32);
+        let height = Self::height().saturating_mul(lines.len().max(1) as i32);
         let (x, y) = Self::overlay_position(editor, anchor_pos, width, height);
         let render_state = SignaturePopupRenderState {
-            display,
+            lines,
+            normal_font: profile.normal.bits(),
+            bold_font: profile.bold.bits(),
+            font_size,
             x,
             y,
             width,
@@ -4663,7 +4857,43 @@ impl SignaturePopup {
             self.last_render = None;
             return;
         };
-        frame.set_label(&render_state.display);
+        let lines = render_state.lines.clone();
+        let normal_font = profile.normal;
+        let bold_font = profile.bold;
+        let line_height = Self::height();
+        frame.set_label("");
+        frame.draw(move |frame| {
+            fltk::draw::push_clip(frame.x(), frame.y(), frame.w(), frame.h());
+            fltk::draw::draw_box(
+                frame.frame(),
+                frame.x(),
+                frame.y(),
+                frame.w(),
+                frame.h(),
+                frame.color(),
+            );
+            for (line_index, line) in lines.iter().enumerate() {
+                let mut run_x = frame.x() + 10;
+                let line_y = frame.y() + line_index as i32 * line_height;
+                for run in line {
+                    fltk::draw::set_font(run.style.font(normal_font, bold_font), font_size);
+                    fltk::draw::set_draw_color(run.style.color());
+                    let run_width = fltk::draw::measure(&run.text, false).0;
+                    if run_width > 0 {
+                        fltk::draw::draw_text2(
+                            &run.text,
+                            run_x,
+                            line_y,
+                            run_width.saturating_add(1),
+                            line_height,
+                            fltk::enums::Align::Left | fltk::enums::Align::Inside,
+                        );
+                    }
+                    run_x = run_x.saturating_add(run_width);
+                }
+            }
+            fltk::draw::pop_clip();
+        });
         frame.set_size(width, height);
         frame.set_pos(x, y);
         frame.show();
@@ -4691,7 +4921,11 @@ impl SignaturePopup {
     }
 
     pub fn is_visible(&self) -> bool {
-        self.visible && !self.is_deleted()
+        self.visible
+            && self
+                .frame
+                .as_ref()
+                .is_some_and(|frame| !frame.was_deleted() && frame.visible())
     }
 
     pub fn delete_for_close(&mut self) {
@@ -4715,6 +4949,30 @@ mod intellisense_tests {
     use super::*;
     use crate::db::DatabaseType;
 
+    fn popup_plain_text(lines: &[Vec<SignaturePopupTextRun>]) -> String {
+        lines
+            .iter()
+            .map(|line| line.iter().map(|run| run.text.as_str()).collect::<String>())
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    fn popup_active_texts(lines: &[Vec<SignaturePopupTextRun>]) -> Vec<&str> {
+        lines
+            .iter()
+            .flatten()
+            .filter(|run| run.style == SignaturePopupTextStyle::ActiveParameter)
+            .map(|run| run.text.as_str())
+            .collect()
+    }
+
+    fn popup_run(text: &str, style: SignaturePopupTextStyle) -> SignaturePopupTextRun {
+        SignaturePopupTextRun {
+            text: text.to_string(),
+            style,
+        }
+    }
+
     fn call_at(text: &str) -> Option<EnclosingCall> {
         let cursor = text.find('|').expect("cursor marker");
         let text = text.replace('|', "");
@@ -4723,33 +4981,78 @@ mod intellisense_tests {
 
     #[test]
     fn signature_popup_uses_valid_structured_overload_spans() {
+        assert_eq!(
+            SignaturePopupTextStyle::Normal.font(
+                fltk::enums::Font::Helvetica,
+                fltk::enums::Font::HelveticaBold,
+            ),
+            fltk::enums::Font::Helvetica
+        );
+        assert_eq!(
+            SignaturePopupTextStyle::ActiveParameter.font(
+                fltk::enums::Font::Helvetica,
+                fltk::enums::Font::HelveticaBold,
+            ),
+            fltk::enums::Font::HelveticaBold
+        );
+        assert_eq!(
+            SignaturePopupTextStyle::ActiveParameter.color(),
+            fltk::enums::Color::from_rgb(102, 183, 255)
+        );
+
         let label = SignatureLabel {
             text: "PROC(한글)".to_string(),
             arg_spans: vec![(8, 6), (6, 7)],
             overloads: Vec::new(),
         };
 
-        assert_eq!(SignaturePopup::display_text(&label, 0), label.text);
-        assert_eq!(SignaturePopup::display_text(&label, 1), label.text);
+        for active_arg in 0..=1 {
+            let lines = SignaturePopup::styled_lines(&label, active_arg);
+            assert_eq!(
+                lines,
+                vec![vec![popup_run(
+                    "PROC(한글)",
+                    SignaturePopupTextStyle::Normal,
+                )]]
+            );
+        }
 
         let valid = SignatureLabel {
             text: "PROC(한글)".to_string(),
             arg_spans: vec![(5, 11)],
             overloads: Vec::new(),
         };
-        assert_eq!(SignaturePopup::display_text(&valid, 0), "PROC([ 한글 ])");
+        let lines = SignaturePopup::styled_lines(&valid, 0);
+        assert_eq!(
+            lines,
+            vec![vec![
+                popup_run("PROC(", SignaturePopupTextStyle::Normal),
+                popup_run("한글", SignaturePopupTextStyle::ActiveParameter),
+                popup_run(")", SignaturePopupTextStyle::Normal),
+            ]]
+        );
 
         let oracle_substr =
             crate::ui::builtin_signatures::builtin_signature_label(DatabaseType::Oracle, "SUBSTR")
                 .expect("Oracle SUBSTR signature");
         assert_eq!(oracle_substr.overloads[0].required_args, 2);
+        let position_lines = SignaturePopup::styled_lines(&oracle_substr, 1);
         assert_eq!(
-            SignaturePopup::display_text(&oracle_substr, 1),
-            "SUBSTR(char, [ position ] [, substring_length ])"
+            position_lines,
+            vec![vec![
+                popup_run("SUBSTR(char, ", SignaturePopupTextStyle::Normal),
+                popup_run("position", SignaturePopupTextStyle::ActiveParameter),
+                popup_run(" [, substring_length ])", SignaturePopupTextStyle::Normal),
+            ]]
         );
+        let length_lines = SignaturePopup::styled_lines(&oracle_substr, 2);
         assert_eq!(
-            SignaturePopup::display_text(&oracle_substr, 2),
-            "SUBSTR(char, position [, [ substring_length ] ])"
+            length_lines,
+            vec![vec![
+                popup_run("SUBSTR(char, position [, ", SignaturePopupTextStyle::Normal),
+                popup_run("substring_length", SignaturePopupTextStyle::ActiveParameter,),
+                popup_run(" ])", SignaturePopupTextStyle::Normal),
+            ]]
         );
 
         let mysql_substr =
@@ -4771,13 +5074,55 @@ mod intellisense_tests {
         .expect("Oracle CURRENT_TIMESTAMP signature");
         assert_eq!(oracle_current_timestamp.overloads[0].arg_spans.len(), 1);
         assert_eq!(oracle_current_timestamp.overloads[0].required_args, 0);
+        let position_lines = SignaturePopup::styled_lines(&mysql_substr, 1);
         assert_eq!(
-            SignaturePopup::display_text(&mysql_substr, 1),
-            "SUBSTR(str,[ pos ])\nSUBSTR(str FROM [ pos ])\nSUBSTR(str,[ pos ],len)\nSUBSTR(str FROM [ pos ] FOR len)"
+            position_lines,
+            vec![
+                vec![
+                    popup_run("SUBSTR(str,", SignaturePopupTextStyle::Normal),
+                    popup_run("pos", SignaturePopupTextStyle::ActiveParameter),
+                    popup_run(")", SignaturePopupTextStyle::Normal),
+                ],
+                vec![
+                    popup_run("SUBSTR(str FROM ", SignaturePopupTextStyle::Normal),
+                    popup_run("pos", SignaturePopupTextStyle::ActiveParameter),
+                    popup_run(")", SignaturePopupTextStyle::Normal),
+                ],
+                vec![
+                    popup_run("SUBSTR(str,", SignaturePopupTextStyle::Normal),
+                    popup_run("pos", SignaturePopupTextStyle::ActiveParameter),
+                    popup_run(",len)", SignaturePopupTextStyle::Normal),
+                ],
+                vec![
+                    popup_run("SUBSTR(str FROM ", SignaturePopupTextStyle::Normal),
+                    popup_run("pos", SignaturePopupTextStyle::ActiveParameter),
+                    popup_run(" FOR len)", SignaturePopupTextStyle::Normal),
+                ],
+            ]
         );
+        let length_lines = SignaturePopup::styled_lines(&mysql_substr, 2);
         assert_eq!(
-            SignaturePopup::display_text(&mysql_substr, 2),
-            "SUBSTR(str,pos)\nSUBSTR(str FROM pos)\nSUBSTR(str,pos,[ len ])\nSUBSTR(str FROM pos FOR [ len ])"
+            length_lines,
+            vec![
+                vec![popup_run(
+                    "SUBSTR(str,pos)",
+                    SignaturePopupTextStyle::Normal,
+                )],
+                vec![popup_run(
+                    "SUBSTR(str FROM pos)",
+                    SignaturePopupTextStyle::Normal,
+                )],
+                vec![
+                    popup_run("SUBSTR(str,pos,", SignaturePopupTextStyle::Normal),
+                    popup_run("len", SignaturePopupTextStyle::ActiveParameter),
+                    popup_run(")", SignaturePopupTextStyle::Normal),
+                ],
+                vec![
+                    popup_run("SUBSTR(str FROM pos FOR ", SignaturePopupTextStyle::Normal),
+                    popup_run("len", SignaturePopupTextStyle::ActiveParameter),
+                    popup_run(")", SignaturePopupTextStyle::Normal),
+                ],
+            ]
         );
 
         for (db_type, names) in [
@@ -4792,6 +5137,7 @@ mod intellisense_tests {
                 let label = crate::ui::builtin_signatures::builtin_signature_label(db_type, name)
                     .expect("catalog label");
                 assert_eq!(label.overloads.len(), syntaxes.len(), "{db_type:?} {name}");
+                let mut syntax_offset = 0;
                 for (syntax, overload) in syntaxes.iter().zip(&label.overloads) {
                     assert!(
                         overload.required_args <= overload.arg_spans.len(),
@@ -4800,12 +5146,32 @@ mod intellisense_tests {
                     );
                     let nodes = parse_signature_syntax_nodes(syntax, &mut 0, None)
                         .unwrap_or_else(|| panic!("unbalanced syntax for {db_type:?} {name}"));
-                    if signature_call_children(&nodes, false)
-                        .is_some_and(|(children, _)| !children.is_empty())
+                    if let Some((children, call_optional)) = signature_call_children(&nodes, false)
                     {
+                        if !children.is_empty() {
+                            assert!(
+                                !overload.arg_spans.is_empty(),
+                                "non-empty call has no structured arguments for {db_type:?} {name}: {syntax}"
+                            );
+                        }
+                        let required_slots = overload
+                            .arg_spans
+                            .iter()
+                            .map(|&(start, end)| {
+                                signature_span_has_required_content(
+                                    children,
+                                    start - syntax_offset,
+                                    end - syntax_offset,
+                                    call_optional,
+                                )
+                            })
+                            .collect::<Vec<_>>();
                         assert!(
-                            !overload.arg_spans.is_empty(),
-                            "non-empty call has no structured arguments for {db_type:?} {name}: {syntax}"
+                            required_slots
+                                .iter()
+                                .skip_while(|required| **required)
+                                .all(|required| !required),
+                            "required argument follows an optional argument for {db_type:?} {name}: {syntax}"
                         );
                     }
                     assert!(
@@ -4845,28 +5211,130 @@ mod intellisense_tests {
                         );
                     }
                     for active_arg in 0..=overload.arg_spans.len() {
-                        let display = SignaturePopup::display_text(&label, active_arg);
-                        let overload_highlights = label
+                        let lines = SignaturePopup::styled_lines(&label, active_arg);
+                        let mut expected_active_texts: Vec<_> = label
                             .overloads
                             .iter()
-                            .filter(|candidate| candidate.span_for_argument(active_arg).is_some())
-                            .count();
-                        let expected_highlights = if overload_highlights == 0
-                            && label.arg_spans.get(active_arg).is_some()
-                        {
-                            1
-                        } else {
-                            overload_highlights
-                        };
+                            .filter_map(|candidate| candidate.span_for_argument(active_arg))
+                            .map(|(start, end)| &label.text[start..end])
+                            .collect();
+                        if expected_active_texts.is_empty() {
+                            expected_active_texts.extend(
+                                label
+                                    .arg_spans
+                                    .get(active_arg)
+                                    .map(|&(start, end)| &label.text[start..end]),
+                            );
+                        }
                         assert_eq!(
-                            display.len(),
-                            label.text.len() + expected_highlights * 4,
-                            "unexpected highlight boundaries for {db_type:?} {name} argument {active_arg}: {display}"
+                            popup_plain_text(&lines),
+                            label.text,
+                            "styling changed signature text for {db_type:?} {name} argument {active_arg}"
+                        );
+                        assert_eq!(
+                            popup_active_texts(&lines),
+                            expected_active_texts,
+                            "unexpected highlights for {db_type:?} {name} argument {active_arg}: {}",
+                            label.text
                         );
                     }
+                    syntax_offset += syntax.len() + 1;
                 }
             }
         }
+    }
+
+    #[test]
+    fn oracle_manual_overrides_preserve_official_argument_boundaries() {
+        let argument_boundaries = |name: &str| {
+            crate::ui::builtin_signatures::builtin_signature_label(DatabaseType::Oracle, name)
+                .unwrap_or_else(|| panic!("missing Oracle signature for {name}"))
+                .overloads
+                .into_iter()
+                .map(|overload| (overload.required_args, overload.arg_spans.len()))
+                .collect::<Vec<_>>()
+        };
+
+        assert_eq!(argument_boundaries("JSON_VALUE"), vec![(1, 2)]);
+        assert_eq!(argument_boundaries("JSON_EQUAL"), vec![(2, 2)]);
+        assert_eq!(argument_boundaries("JSON_EXISTS"), vec![(2, 3)]);
+        assert_eq!(argument_boundaries("FIRST"), vec![(1, 2)]);
+        assert_eq!(argument_boundaries("LAST"), vec![(1, 2)]);
+        assert_eq!(argument_boundaries("PREV"), vec![(1, 2)]);
+        assert_eq!(argument_boundaries("NEXT"), vec![(1, 2)]);
+        assert_eq!(argument_boundaries("CLASSIFIER"), vec![(0, 0)]);
+        assert_eq!(argument_boundaries("MATCH_NUMBER"), vec![(0, 0)]);
+        assert_eq!(argument_boundaries("DOMAIN_DISPLAY"), vec![(1, 2)]);
+        assert_eq!(argument_boundaries("DOMAIN_NAME"), vec![(1, 2)]);
+        assert_eq!(argument_boundaries("DOMAIN_ORDER"), vec![(1, 2)]);
+        assert_eq!(argument_boundaries("SYS_ROW_ETAG"), vec![(1, 2)]);
+        assert_eq!(argument_boundaries("EQUALS_PATH"), vec![(2, 3)]);
+        assert_eq!(argument_boundaries("JSON_TEXTCONTAINS"), vec![(3, 3)]);
+        assert_eq!(argument_boundaries("UNDER_PATH"), vec![(2, 3), (3, 4)]);
+        assert_eq!(argument_boundaries("TRIM"), vec![(1, 1), (2, 2)]);
+        assert_eq!(argument_boundaries("XMLTABLE"), vec![(1, 1), (2, 2)]);
+        assert_eq!(argument_boundaries("STATS_T_TEST_ONE"), vec![(1, 3)]);
+        assert_eq!(argument_boundaries("STATS_T_TEST_PAIRED"), vec![(2, 3)]);
+        assert_eq!(
+            argument_boundaries("STATS_T_TEST_INDEP"),
+            vec![(2, 4), (2, 3)]
+        );
+        assert_eq!(
+            argument_boundaries("STATS_T_TEST_INDEPU"),
+            vec![(2, 4), (2, 3)]
+        );
+
+        for name in [
+            "STATS_T_TEST_ONE",
+            "STATS_T_TEST_PAIRED",
+            "STATS_T_TEST_INDEP",
+            "STATS_T_TEST_INDEPU",
+        ] {
+            for syntax in crate::ui::builtin_signatures::builtin_signature_syntaxes(
+                DatabaseType::Oracle,
+                name,
+            )
+            .expect("Oracle signature syntaxes")
+            {
+                assert!(
+                    syntax.ends_with("[ FILTER ( WHERE condition ) ]"),
+                    "Oracle manual FILTER clause missing from {name}: {syntax}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn mysql_and_mariadb_overrides_preserve_official_argument_boundaries() {
+        let argument_boundaries = |db_type, name: &str| {
+            crate::ui::builtin_signatures::builtin_signature_label(db_type, name)
+                .unwrap_or_else(|| panic!("missing {db_type:?} signature for {name}"))
+                .overloads
+                .into_iter()
+                .map(|overload| (overload.required_args, overload.arg_spans.len()))
+                .collect::<Vec<_>>()
+        };
+
+        assert_eq!(
+            argument_boundaries(DatabaseType::MySQL, "TRIM"),
+            vec![(1, 1), (2, 2), (2, 2)]
+        );
+        assert_eq!(
+            argument_boundaries(DatabaseType::MariaDB, "AES_DECRYPT"),
+            vec![(2, 4)]
+        );
+        assert_eq!(
+            argument_boundaries(DatabaseType::MariaDB, "CRC32"),
+            vec![(1, 1), (2, 2)]
+        );
+        assert_eq!(
+            argument_boundaries(DatabaseType::MariaDB, "CRC32C"),
+            vec![(1, 1), (2, 2)]
+        );
+        assert_eq!(
+            argument_boundaries(DatabaseType::MariaDB, "TRIM"),
+            vec![(1, 1), (2, 2)]
+        );
     }
 
     #[test]
@@ -4904,6 +5372,34 @@ mod intellisense_tests {
         let call = call_at("SELECT DECODE(x, 'a,b,c', |) FROM t").expect("inside call");
         assert_eq!(call.name, "DECODE");
         assert_eq!(call.arg_index, 2);
+    }
+
+    #[test]
+    fn keyword_separated_builtin_arguments_use_structural_positions() {
+        let active_argument = |marked: &str, separator_keywords: &[&str]| {
+            let cursor = marked.find('|').expect("cursor marker");
+            let text = marked.replace('|', "");
+            let call = enclosing_call_at_cursor(&text, cursor).expect("enclosing call");
+            call_argument_index_with_separator_keywords(
+                &text,
+                cursor,
+                call.open_paren,
+                false,
+                crate::sql_parser_engine::LexMode::Idle,
+                separator_keywords,
+            )
+        };
+
+        assert_eq!(active_argument("SUBSTR(|)", &["FROM", "FOR"]), 0);
+        assert_eq!(active_argument("SUBSTR(str FROM |)", &["FROM", "FOR"]), 1);
+        assert_eq!(
+            active_argument("SUBSTR(str FROM pos FOR |)", &["FROM", "FOR"]),
+            2
+        );
+        assert_eq!(active_argument("TRIM(BOTH 'x' FROM |)", &["FROM"]), 1);
+        assert_eq!(active_argument("CAST(COALESCE(x, y) AS |)", &["AS"]), 1);
+        assert_eq!(active_argument("POSITION('IN,FROM' IN |)", &["IN"]), 1);
+        assert_eq!(active_argument("SUBSTR(str, |)", &["FROM", "FOR"]), 1);
     }
 
     #[test]

@@ -2,9 +2,10 @@
 """Generate the built-in function signature catalog from official manuals.
 
 The input files are downloaded snapshots of Oracle 26ai SQL Quick Reference,
-MySQL 8.0 Reference Manual pages, and MariaDB's Markdown documentation.  The
-generated Rust is written to stdout so repository updates can still be applied
-with the normal patch workflow.
+MySQL 8.0 Reference Manual pages, and MariaDB's Markdown documentation. Oracle
+signatures absent from the quick reference are taken from the 26ai SQL Language
+Reference. The generated Rust is written to stdout so repository updates can
+still be applied with the normal patch workflow.
 """
 
 from __future__ import annotations
@@ -21,18 +22,20 @@ from pathlib import Path
 
 ORACLE_EXTRA_SIGNATURES = {
     "APPENDCHILDXML": "APPENDCHILDXML(XMLType_instance, XPath_string, value_expr [, namespace_string])",
+    "CLASSIFIER": "CLASSIFIER()",
     "DELETEXML": "DELETEXML(XMLType_instance, XPath_string [, namespace_string])",
+    "FIRST": "FIRST(expr [, offset])",
     "INSERTCHILDXML": "INSERTCHILDXML(XMLType_instance, XPath_string, child_expr, value_expr [, namespace_string])",
     "INSERTCHILDXMLAFTER": "INSERTCHILDXMLAFTER(XMLType_instance, XPath_string, child_expr, value_expr [, namespace_string])",
     "INSERTCHILDXMLBEFORE": "INSERTCHILDXMLBEFORE(XMLType_instance, XPath_string, child_expr, value_expr [, namespace_string])",
     "INSERTXMLBEFORE": "INSERTXMLBEFORE(XMLType_instance, XPath_string, value_expr [, namespace_string])",
-    "JSON_EQUAL": "JSON_EQUAL(json1, json2 [ ALLOW | DISALLOW SCALARS ] [ ERROR | TRUE | FALSE ON ERROR ])",
-    "JSON_EXISTS": "JSON_EXISTS(expr, path [ PASSING expr AS identifier [, ...] ] [ ERROR | TRUE | FALSE ON ERROR ])",
+    "LAST": "LAST(expr [, offset])",
     "LENGTHB": "LENGTHB(char)",
     "MATCH_NUMBER": "MATCH_NUMBER()",
+    "NEXT": "NEXT(expr [, offset])",
     "ODCINUMBERLIST": "ODCINUMBERLIST(number [, number ]...)",
-    "PREV": "PREV(expr)",
-    "REGEXP_LIKE": "REGEXP_LIKE(source_char, pattern [, match_param])",
+    "PREV": "PREV(expr [, offset])",
+    "SYS_ROW_ETAG": "SYS_ROW_ETAG(column_name [, column_name]...)",
     "UPDATEXML": "UPDATEXML(XMLType_instance, XPath_string, value_expr [, XPath_string, value_expr ]...)",
     "XMLATTRIBUTES": "XMLATTRIBUTES(value_expr [ AS identifier ] [, value_expr [ AS identifier ] ]...)",
     "XMLROOT": "XMLROOT(value_expr, VERSION string [ STANDALONE { YES | NO | VALUE } ])",
@@ -41,11 +44,13 @@ ORACLE_EXTRA_SIGNATURES = {
 
 ORACLE_SIGNATURE_OVERRIDES = {
     "COALESCE": "COALESCE(expr1, expr2 [, expr]...)",
+    "DOMAIN_NAME": "DOMAIN_NAME(expr [, expr]...)",
+    "DOMAIN_ORDER": "DOMAIN_ORDER(expr [, expr]...)",
     "FIRST_VALUE": [
         "FIRST_VALUE(expr) [ { RESPECT | IGNORE } NULLS ] OVER { window_name | (analytic_clause) }",
         "FIRST_VALUE(expr [ { RESPECT | IGNORE } NULLS ]) OVER { window_name | (analytic_clause) }",
     ],
-    "JSON_VALUE": "JSON_VALUE(expr [ FORMAT JSON ], JSON_basic_path_expression [ JSON_passing_clause ] [ JSON_value_returning_clause ] [ JSON_value_on_error_clause ] [ JSON_value_on_empty_clause ] [ JSON_value_on_mismatch_clause ] [ TYPE ( { STRICT | LAX } ) ])",
+    "JSON_VALUE": "JSON_VALUE(expr [ FORMAT JSON ] [, JSON_basic_path_expression] [ JSON_passing_clause ] [ JSON_value_returning_clause ] [ JSON_value_on_error_clause ] [ JSON_value_on_empty_clause ] [ JSON_value_on_mismatch_clause ] [ TYPE ( { STRICT | LAX } ) ])",
     "LAG": [
         "LAG(value_expr [, offset [, default]]) [ { RESPECT | IGNORE } NULLS ] OVER { window_name | ([window_name] [query_partition_clause] order_by_clause) }",
         "LAG(value_expr [ { RESPECT | IGNORE } NULLS ] [, offset [, default]]) OVER { window_name | ([window_name] [query_partition_clause] order_by_clause) }",
@@ -72,10 +77,24 @@ ORACLE_SIGNATURE_OVERRIDES = {
         "STATS_MW_TEST(expr1, expr2 [, ONE_SIDED_SIG, expr3]) [ FILTER ( WHERE condition ) ]",
         "STATS_MW_TEST(expr1, expr2 [, { STATISTIC | U_STATISTIC | TWO_SIDED_SIG }]) [ FILTER ( WHERE condition ) ]",
     ],
-    "STATS_T_TEST_INDEP": "STATS_T_TEST_INDEP(expr1, expr2 [, { STATISTIC | ONE_SIDED_SIG | TWO_SIDED_SIG | DF }])",
-    "STATS_T_TEST_INDEPU": "STATS_T_TEST_INDEPU(expr1, expr2 [, { STATISTIC | ONE_SIDED_SIG | TWO_SIDED_SIG | DF }])",
-    "STATS_T_TEST_ONE": "STATS_T_TEST_ONE(expr1 [, expr2] [, { STATISTIC | ONE_SIDED_SIG | TWO_SIDED_SIG | DF }])",
-    "STATS_T_TEST_PAIRED": "STATS_T_TEST_PAIRED(expr1, expr2 [, { STATISTIC | ONE_SIDED_SIG | TWO_SIDED_SIG | DF }])",
+    "STATS_T_TEST_INDEP": [
+        "STATS_T_TEST_INDEP(expr1, expr2 [, { STATISTIC | ONE_SIDED_SIG }, expr3]) [ FILTER ( WHERE condition ) ]",
+        "STATS_T_TEST_INDEP(expr1, expr2 [, { TWO_SIDED_SIG | DF }]) [ FILTER ( WHERE condition ) ]",
+    ],
+    "STATS_T_TEST_INDEPU": [
+        "STATS_T_TEST_INDEPU(expr1, expr2 [, { STATISTIC | ONE_SIDED_SIG }, expr3]) [ FILTER ( WHERE condition ) ]",
+        "STATS_T_TEST_INDEPU(expr1, expr2 [, { TWO_SIDED_SIG | DF }]) [ FILTER ( WHERE condition ) ]",
+    ],
+    "STATS_T_TEST_ONE": "STATS_T_TEST_ONE(expr1 [, expr2] [, { STATISTIC | ONE_SIDED_SIG | TWO_SIDED_SIG | DF }]) [ FILTER ( WHERE condition ) ]",
+    "STATS_T_TEST_PAIRED": "STATS_T_TEST_PAIRED(expr1, expr2 [, { STATISTIC | ONE_SIDED_SIG | TWO_SIDED_SIG | DF }]) [ FILTER ( WHERE condition ) ]",
+    "TRIM": [
+        "TRIM(trim_source)",
+        "TRIM({ { LEADING | TRAILING | BOTH } [ trim_character ] | trim_character } FROM trim_source)",
+    ],
+    "XMLTABLE": [
+        "XMLTABLE(XQuery_string XMLTABLE_options)",
+        "XMLTABLE(XMLnamespaces_clause, XQuery_string XMLTABLE_options)",
+    ],
 }
 
 for _retail_name in (
@@ -98,6 +117,14 @@ MYSQL_EXTRA_SIGNATURES = {
     "ROW": "ROW(value1, value2 [, value]...)",
 }
 
+MYSQL_SIGNATURE_OVERRIDES = {
+    "TRIM": [
+        "TRIM(str)",
+        "TRIM({ BOTH | LEADING | TRAILING } [remstr] FROM str)",
+        "TRIM(remstr FROM str)",
+    ],
+}
+
 
 ARGUMENT_SEPARATOR_KEYWORDS = {
     "CAST": ("AS",),
@@ -115,6 +142,11 @@ ARGUMENT_SEPARATOR_KEYWORDS = {
 
 
 MARIADB_SIGNATURE_OVERRIDES = {
+    # The current documentation block is mislabeled AES_ENCRYPT, while the
+    # description and examples document the AES_DECRYPT form below.
+    "AES_DECRYPT": "AES_DECRYPT(crypt_str, key_str [, iv [, mode]])",
+    "CRC32": ["CRC32(expr)", "CRC32(par, expr)"],
+    "CRC32C": ["CRC32C(expr)", "CRC32C(par, expr)"],
     "EQUALS": "EQUALS(g1, g2)",
     "JSON_MERGE_PATCH": "JSON_MERGE_PATCH(json_doc, json_doc [, json_doc]...)",
     "JSON_MERGE_PRESERVE": "JSON_MERGE_PRESERVE(json_doc, json_doc [, json_doc]...)",
@@ -130,6 +162,10 @@ MARIADB_SIGNATURE_OVERRIDES = {
     "ST_MULTIPOINTFROMWKB": "ST_MULTIPOINTFROMWKB(wkb [, srid])",
     "ST_MULTIPOLYGONFROMTEXT": "ST_MULTIPOLYGONFROMTEXT(wkt [, srid])",
     "ST_MULTIPOLYGONFROMWKB": "ST_MULTIPOLYGONFROMWKB(wkb [, srid])",
+    "TRIM": [
+        "TRIM(str)",
+        "TRIM(remstr FROM str)",
+    ],
 }
 
 
@@ -137,11 +173,8 @@ NON_CALL_MARIADB_ENTRIES = {
     "CASE",
     "DIV",
     "IN",
-    "INTERVAL",
     "IS",
-    "LASTVAL",
     "LIKE",
-    "NEXTVAL",
     "REGEXP",
     "RLIKE",
     "XOR",
@@ -257,10 +290,42 @@ ORACLE_GROUP_HEADINGS = {
     "RETAIL_X_OF_Y",
 }
 
+# The quick reference illustration has `DOMAIN DISPLAY` and an obsolete
+# `domain_name` placeholder. The detailed reference and all examples use the
+# variadic expression form below.
+ORACLE_QUICK_REFERENCE_SIGNATURE_FIXES = {
+    "DOMAIN_DISPLAY": "DOMAIN_DISPLAY(expr [, expr]...)",
+}
+
+# FIRST and LAST are documented through KEEP (DENSE_RANK ...) syntax in the
+# quick reference rather than as calls. Their callable row-pattern forms come
+# from the SQL Language Reference and are listed in ORACLE_EXTRA_SIGNATURES.
+ORACLE_NON_CALL_SIGNATURE_HEADINGS = {"FIRST", "LAST"}
+
+ORACLE_CALL_STYLE_CONDITIONS = {
+    "EQUALS_PATH",
+    "JSON_EQUAL",
+    "JSON_EXISTS",
+    "JSON_TEXTCONTAINS",
+    "REGEXP_LIKE",
+    "UNDER_PATH",
+}
+
+ORACLE_CONDITION_SIGNATURE_OVERRIDES = {
+    "JSON_EQUAL": "JSON_EQUAL(json1, json2 [ { ERROR | TRUE | FALSE } ON ERROR ])",
+    "JSON_EXISTS": "JSON_EXISTS(expr [ FORMAT JSON ], JSON_basic_path_expression [ PASSING expr AS identifier [, expr AS identifier ]...] [ { ERROR | TRUE | FALSE } ON ERROR ] [ TYPE ( { STRICT | LAX } ) ] [ { ERROR | TRUE | FALSE } ON EMPTY ])",
+    "UNDER_PATH": [
+        "UNDER_PATH(column, path_string [, correlation_integer])",
+        "UNDER_PATH(column, levels, path_string [, correlation_integer])",
+    ],
+}
+
 
 def oracle_signatures(path: Path) -> dict[str, list[str]]:
     source = path.read_text()
     grouped: dict[str, list[str]] = defaultdict(list)
+    documented_headings = set()
+    resolved_headings = set()
     for section in re.findall(r'<div class="section">(.*?)</div>', source, re.S):
         heading = re.search(r'<p class="subhead2".*?</p>', section, re.S)
         syntax = re.search(r"<pre[^>]*>(.*?)</pre>", section, re.S)
@@ -275,6 +340,7 @@ def oracle_signatures(path: Path) -> dict[str, list[str]]:
             match = re.match(r"([A-Z][A-Z0-9_]*)", clean_markup(heading.group()))
             if match:
                 heading_names.append(match.group(1))
+        documented_headings.update(heading_names)
         signature = normalize_signature(normalized_code(syntax.group(1)))
         direct_names = {
             name
@@ -314,6 +380,27 @@ def oracle_signatures(path: Path) -> dict[str, list[str]]:
                         break
             if canonical not in grouped[name]:
                 grouped[name].append(canonical)
+            if name in heading_names:
+                resolved_headings.add(name)
+
+        for name in heading_names:
+            if name not in ORACLE_QUICK_REFERENCE_SIGNATURE_FIXES:
+                continue
+            fixed = normalize_signature(ORACLE_QUICK_REFERENCE_SIGNATURE_FIXES[name])
+            if fixed not in grouped[name]:
+                grouped[name].append(fixed)
+            resolved_headings.add(name)
+
+    unresolved_headings = documented_headings.difference(
+        resolved_headings,
+        ORACLE_GROUP_HEADINGS,
+        ORACLE_NON_CALL_SIGNATURE_HEADINGS,
+    )
+    if unresolved_headings:
+        raise ValueError(
+            "unresolved Oracle quick-reference headings: "
+            + ", ".join(sorted(unresolved_headings))
+        )
 
     for name, signature in ORACLE_EXTRA_SIGNATURES.items():
         grouped[name].append(normalize_signature(signature))
@@ -330,6 +417,38 @@ def oracle_signatures(path: Path) -> dict[str, list[str]]:
         )
         for name, values in grouped.items()
     }
+
+
+def oracle_condition_signatures(path: Path) -> dict[str, list[str]]:
+    source = path.read_text()
+    signatures: dict[str, list[str]] = {}
+    for section in re.findall(r'<div class="section">(.*?)</div>', source, re.S):
+        heading = re.search(r'<p class="subhead2".*?</p>', section, re.S)
+        syntax = re.search(r"<pre[^>]*>(.*?)</pre>", section, re.S)
+        if not heading or not syntax:
+            continue
+        heading_text = clean_markup(heading.group())
+        match = re.match(r"([A-Z][A-Z0-9_]*)\s+condition\b", heading_text, re.I)
+        if not match:
+            continue
+        name = match.group(1).upper()
+        if name not in ORACLE_CALL_STYLE_CONDITIONS:
+            continue
+        value = normalize_signature(normalized_code(syntax.group(1)))
+        call = matching_call(value, name)
+        if not call:
+            raise ValueError(f"Oracle condition signature not found: {name}")
+        signatures[name] = split_top_level_overloads(value[call[0] : call[1]])
+
+    missing = ORACLE_CALL_STYLE_CONDITIONS.difference(signatures)
+    if missing:
+        raise ValueError(
+            "unresolved Oracle call-style conditions: " + ", ".join(sorted(missing))
+        )
+    for name, override in ORACLE_CONDITION_SIGNATURE_OVERRIDES.items():
+        values = override if isinstance(override, list) else [override]
+        signatures[name] = [normalize_signature(value) for value in values]
+    return signatures
 
 
 def mysql_index_rows(path: Path) -> dict[str, list[str]]:
@@ -435,6 +554,9 @@ def mysql_signatures(index_path: Path, pages_dir: Path) -> dict[str, list[str]]:
         )
     for name, signature in MYSQL_EXTRA_SIGNATURES.items():
         signatures[name] = [normalize_signature(signature)]
+    for name, override in MYSQL_SIGNATURE_OVERRIDES.items():
+        values = override if isinstance(override, list) else [override]
+        signatures[name] = [normalize_signature(value) for value in values]
     return signatures
 
 
@@ -460,7 +582,13 @@ def markdown_syntax_blocks(source: str) -> list[str]:
     )
     if not section:
         return []
-    return [block.strip() for block in re.findall(r"```[^\n]*\n(.*?)```", section.group(1), re.S)]
+    content = section.group(1)
+    current_tab = re.search(
+        r'\{% tab title="Current" %\}(.*?)\{% endtab %\}', content, re.S
+    )
+    if current_tab:
+        content = current_tab.group(1)
+    return [block.strip() for block in re.findall(r"```[^\n]*\n(.*?)```", content, re.S)]
 
 
 def canonical_markdown_signatures(block: str, name: str) -> list[str]:
@@ -511,7 +639,9 @@ def mariadb_signatures(index_path: Path, pages_dir: Path) -> dict[str, list[str]
         if re.search(r"(?i)\bUDF\b|user-defined-functions\.md", source):
             continue
         if name in MARIADB_SIGNATURE_OVERRIDES:
-            signatures[name] = [normalize_signature(MARIADB_SIGNATURE_OVERRIDES[name])]
+            override = MARIADB_SIGNATURE_OVERRIDES[name]
+            values = override if isinstance(override, list) else [override]
+            signatures[name] = [normalize_signature(value) for value in values]
             continue
         blocks = markdown_syntax_blocks(source)
         candidates = [
@@ -585,6 +715,14 @@ def balanced_signature(value: str) -> bool:
 
 
 def validate_catalogs(catalogs: dict[str, dict[str, list[str]]]) -> None:
+    expected_sizes = {"ORACLE": 463, "MYSQL": 408, "MARIADB": 469}
+    for dialect, expected_size in expected_sizes.items():
+        actual_size = len(catalogs[dialect])
+        if actual_size != expected_size:
+            raise ValueError(
+                f"{dialect} catalog has {actual_size} entries; expected {expected_size}"
+            )
+
     non_call_oracle = {
         ("JSON_ARRAY", "JSON [ JSON_ARRAY_content ]"),
         ("JSON_OBJECT", "JSON { JSON_OBJECT_content }"),
@@ -639,8 +777,8 @@ def emit_signature_array(name: str, signatures: dict[str, list[str]]) -> None:
 
 def emit_rust(catalogs: dict[str, dict[str, list[str]]]) -> None:
     print("// @generated by scripts/generate_builtin_signatures.py; do not edit by hand.")
-    print("// Sources: Oracle AI Database 26ai SQL Quick Reference, MySQL 8.0")
-    print("// Reference Manual, and MariaDB Server 12.2 documentation.\n")
+    print("// Sources: Oracle AI Database 26ai SQL Language and Quick References,")
+    print("// MySQL 8.0 Reference Manual, and MariaDB Server 12.2 documentation.\n")
     print("use crate::db::DatabaseType;")
     print(
         "use crate::ui::intellisense::{signature_overload_from_syntax, SignatureLabel};\n"
@@ -677,6 +815,13 @@ fn builtin_signature(db_type: DatabaseType, name: &str) -> Option<&'static Built
     let table = signatures_for(db_type);
     let index = table.binary_search_by_key(&upper.as_str(), |entry| entry.name).ok()?;
     Some(&table[index])
+}
+
+pub(crate) fn builtin_signature_argument_separator_keywords(
+    db_type: DatabaseType,
+    name: &str,
+) -> Option<&'static [&'static str]> {
+    Some(builtin_signature(db_type, name)?.argument_separator_keywords)
 }
 
 pub(crate) fn builtin_signature_label(
@@ -716,14 +861,17 @@ pub(crate) fn builtin_signature_label(
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--oracle-html", type=Path, required=True)
+    parser.add_argument("--oracle-conditions-html", type=Path, required=True)
     parser.add_argument("--mysql-index", type=Path, required=True)
     parser.add_argument("--mysql-pages", type=Path, required=True)
     parser.add_argument("--mariadb-index", type=Path, required=True)
     parser.add_argument("--mariadb-pages", type=Path, required=True)
     args = parser.parse_args()
 
+    oracle = oracle_signatures(args.oracle_html)
+    oracle.update(oracle_condition_signatures(args.oracle_conditions_html))
     catalogs = {
-        "ORACLE": oracle_signatures(args.oracle_html),
+        "ORACLE": oracle,
         "MYSQL": mysql_signatures(args.mysql_index, args.mysql_pages),
         "MARIADB": mariadb_signatures(args.mariadb_index, args.mariadb_pages),
     }

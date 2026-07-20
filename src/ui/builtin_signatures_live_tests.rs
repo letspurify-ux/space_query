@@ -28,6 +28,13 @@ fn assert_catalog(db_type: DatabaseType, names: &[&str], expected_len: usize) {
     }
 }
 
+#[test]
+fn builtin_signature_catalogs_match_official_manual_indices() {
+    assert_catalog(DatabaseType::Oracle, ORACLE_FUNCTIONS, 463);
+    assert_catalog(DatabaseType::MySQL, MYSQL_FUNCTIONS, 408);
+    assert_catalog(DatabaseType::MariaDB, MARIADB_FUNCTIONS, 469);
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ArgumentBoundary {
     Minimum,
@@ -262,7 +269,15 @@ fn mysql_live_sql(
         (DatabaseType::MariaDB, "CUME_DIST") => "SELECT CUME_DIST() OVER (ORDER BY sq_default) FROM sq_builtin_signature_probe WHERE 0".to_string(),
         (DatabaseType::MariaDB, "DENSE_RANK") => "SELECT DENSE_RANK() OVER (ORDER BY sq_default) FROM sq_builtin_signature_probe WHERE 0".to_string(),
         (DatabaseType::MariaDB, "JSON_TABLE") => "SELECT * FROM JSON_TABLE('[1]', '$[*]' COLUMNS (v INT PATH '$')) AS jt WHERE 0".to_string(),
+        (DatabaseType::MariaDB, "LASTVAL") => format!(
+            "SELECT LASTVAL({})",
+            sequence_name.expect("MariaDB sequence probe name")
+        ),
         (DatabaseType::MariaDB, "MEDIAN") => "SELECT MEDIAN(sq_default) OVER () FROM sq_builtin_signature_probe WHERE 0".to_string(),
+        (DatabaseType::MariaDB, "NEXTVAL") => format!(
+            "SELECT NEXTVAL({})",
+            sequence_name.expect("MariaDB sequence probe name")
+        ),
         (DatabaseType::MariaDB, "PERCENTILE_CONT") => "SELECT PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY sq_default) OVER () FROM sq_builtin_signature_probe WHERE 0".to_string(),
         (DatabaseType::MariaDB, "PERCENTILE_DISC") => "SELECT PERCENTILE_DISC(0.5) WITHIN GROUP (ORDER BY sq_default) OVER () FROM sq_builtin_signature_probe WHERE 0".to_string(),
         (DatabaseType::MariaDB, "PERCENT_RANK") => "SELECT PERCENT_RANK() OVER (ORDER BY sq_default) FROM sq_builtin_signature_probe WHERE 0".to_string(),
@@ -770,8 +785,30 @@ fn oracle_live_sql(name: &str, syntax: &str, argument_count: usize) -> String {
         "GROUPING_ID" if argument_count > 1 => "SELECT GROUPING_ID(x, y) FROM (SELECT 1 x, 2 y FROM dual) GROUP BY ROLLUP(x, y)".to_string(),
         "GROUPING_ID" => "SELECT GROUPING_ID(x) FROM (SELECT 1 x FROM dual) GROUP BY ROLLUP(x)".to_string(),
         "GROUP_ID" => "SELECT GROUP_ID() FROM (SELECT 1 x FROM dual) GROUP BY x".to_string(),
+        "EQUALS_PATH" if argument_count > 2 => "SELECT any_path FROM resource_view WHERE EQUALS_PATH(res, '/', 1) = 1 AND 1 = 0".to_string(),
+        "EQUALS_PATH" => "SELECT any_path FROM resource_view WHERE EQUALS_PATH(res, '/') = 1 AND 1 = 0".to_string(),
+        "UNDER_PATH" if syntax.contains(", levels,") && argument_count > 3 => "SELECT any_path FROM resource_view WHERE UNDER_PATH(res, 1, '/', 2) = 1 AND 1 = 0".to_string(),
+        "UNDER_PATH" if syntax.contains(", levels,") => "SELECT any_path FROM resource_view WHERE UNDER_PATH(res, 1, '/') = 1 AND 1 = 0".to_string(),
+        "UNDER_PATH" if argument_count > 2 => "SELECT any_path FROM resource_view WHERE UNDER_PATH(res, '/', 1) = 1 AND 1 = 0".to_string(),
+        "UNDER_PATH" => "SELECT any_path FROM resource_view WHERE UNDER_PATH(res, '/') = 1 AND 1 = 0".to_string(),
+        "CLASSIFIER" | "MATCH_NUMBER" => format!(
+            "SELECT * FROM (SELECT 1 id FROM dual) MATCH_RECOGNIZE (ORDER BY id MEASURES {name}() AS sq_measure ONE ROW PER MATCH PATTERN (a) DEFINE a AS 1 = 1) WHERE 1 = 0"
+        ),
+        "FIRST" | "LAST" | "PREV" | "NEXT" => {
+            let expression = if argument_count > 1 {
+                format!("{name}(a.id, 0)")
+            } else {
+                format!("{name}(a.id)")
+            };
+            format!(
+                "SELECT * FROM (SELECT 1 id FROM dual) MATCH_RECOGNIZE (ORDER BY id MEASURES {expression} AS sq_measure ONE ROW PER MATCH PATTERN (a) DEFINE a AS 1 = 1) WHERE 1 = 0"
+            )
+        }
         "JSON_TABLE" if argument_count > 1 => "SELECT * FROM JSON_TABLE('{}', '$' COLUMNS (x NUMBER PATH '$.x')) WHERE 1 = 0".to_string(),
         "JSON_TABLE" => "SELECT * FROM JSON_TABLE('{}' COLUMNS (x NUMBER PATH '$.x')) WHERE 1 = 0".to_string(),
+        "JSON_TEXTCONTAINS" => "SELECT 1 FROM (SELECT '{}' doc FROM dual) WHERE JSON_TEXTCONTAINS(doc, '$', 'x') AND 1 = 0".to_string(),
+        "SYS_ROW_ETAG" if argument_count > 1 => "SELECT SYS_ROW_ETAG(c1, c2) FROM (SELECT 1 c1, 2 c2 FROM dual) WHERE 1 = 0".to_string(),
+        "SYS_ROW_ETAG" => "SELECT SYS_ROW_ETAG(c1) FROM (SELECT 1 c1 FROM dual) WHERE 1 = 0".to_string(),
         "VECTOR_CHUNKS" => "SELECT * FROM VECTOR_CHUNKS(DBMS_VECTOR_CHAIN.UTL_TO_TEXT('x')) WHERE 1 = 0".to_string(),
         "XMLATTRIBUTES" if argument_count > 1 => "SELECT XMLELEMENT(NAME \"A\", XMLATTRIBUTES(1 AS \"X\", 2 AS \"Y\")) FROM dual WHERE 1 = 0".to_string(),
         "XMLATTRIBUTES" => "SELECT XMLELEMENT(NAME \"A\", XMLATTRIBUTES(1 AS \"X\")) FROM dual WHERE 1 = 0".to_string(),
@@ -799,12 +836,10 @@ fn oracle_context_only_name(name: &str) -> bool {
                 | "ITERATION_NUMBER"
                 | "JSON_CONSTRUCTOR"
                 | "MATCHNUM"
-                | "MATCH_NUMBER"
                 | "ORA_CHECK_DATA_PRIVILEGE"
                 | "ORA_END_USER_CONTEXT"
                 | "ORA_IS_COLUMN_AUTHORIZED"
                 | "PATH_NAME"
-                | "PREV"
                 | "TIMESTAMPDIFF"
                 | "VECTOR_EMBEDDING"
         )
@@ -842,6 +877,7 @@ fn oracle_expected_prerequisite_error(name: &str, message: &str) -> bool {
         "CV" | "PRESENTNNV" | "PRESENTV" | "PREVIOUS" => message.contains("ORA-32644"),
         "CUBE_TABLE" => message.contains("ORA-33262"),
         "ORA_DM_PARTITION_NAME" => message.contains("ORA-40281"),
+        "JSON_TEXTCONTAINS" => message.contains("ORA-40467") || message.contains("ORA-40468"),
         "XMLSEQUENCE" => message.contains("ORA-06553"),
         _ => false,
     }
@@ -870,7 +906,7 @@ fn oracle_connection_from_env() -> OracleThinSession {
 #[test]
 #[ignore = "requires local Oracle 26ai via ORACLE_TEST_* environment variables"]
 fn oracle_builtin_function_signatures_execute_live() {
-    assert_catalog(DatabaseType::Oracle, ORACLE_FUNCTIONS, 454);
+    assert_catalog(DatabaseType::Oracle, ORACLE_FUNCTIONS, 463);
     let mut session = oracle_connection_from_env();
     let mut failures = Vec::new();
     for name in ORACLE_FUNCTIONS {
@@ -925,5 +961,5 @@ fn mysql_builtin_function_signatures_execute_live() {
 #[test]
 #[ignore = "requires local MariaDB 12.2 via SPACE_QUERY_TEST_MYSQL_* environment variables"]
 fn mariadb_builtin_function_signatures_execute_live() {
-    run_mysql_catalog_live(DatabaseType::MariaDB, MARIADB_FUNCTIONS, 466);
+    run_mysql_catalog_live(DatabaseType::MariaDB, MARIADB_FUNCTIONS, 469);
 }

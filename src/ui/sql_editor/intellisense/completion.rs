@@ -60716,12 +60716,7 @@ impl SqlEditorWidget {
             .into_iter()
             .filter(|suggestion| Self::suggestion_is_builtin_function_for_db(suggestion, db_type))
             .collect::<Vec<_>>();
-        if !crate::sql_text::mysql_compatibility_for_sql("", db_type)
-            && crate::ui::intellisense::suggestion_matches_completion_prefix(
-                "CLASSIFIER",
-                prefix,
-            )
-        {
+        if !crate::sql_text::mysql_compatibility_for_sql("", db_type) {
             let tokens = Self::current_query_tokens(deep_ctx);
             let end = Self::expected_keyword_suggestion_context_end(
                 tokens,
@@ -60733,7 +60728,17 @@ impl SqlEditorWidget {
                 intellisense_context::SqlPhase::MatchRecognizeClause
             ) || Self::table_clause_construct_is_open(tokens, end, "MATCH_RECOGNIZE")
             {
-                suggestions.push("CLASSIFIER()".to_string());
+                for function in crate::ui::intellisense::ORACLE_MATCH_RECOGNIZE_FUNCTIONS {
+                    let rendered = format!("{function}()");
+                    if crate::ui::intellisense::suggestion_matches_completion_prefix(
+                        &rendered, prefix,
+                    ) && suggestions
+                        .iter()
+                        .all(|suggestion| !suggestion.eq_ignore_ascii_case(&rendered))
+                    {
+                        suggestions.push(rendered);
+                    }
+                }
             }
         }
         suggestions
