@@ -7943,6 +7943,32 @@ impl SqlEditorWidget {
         source: &str,
         preferred_db_type: Option<DatabaseType>,
     ) -> (String, FormatFrameAlignmentAuditSummary) {
+        Self::format_for_auto_formatting_with_options_and_frame_alignment_audit(
+            source,
+            preferred_db_type,
+            SqlFormatOptions::default(),
+        )
+    }
+
+    #[cfg(test)]
+    pub(super) fn format_for_auto_formatting_with_config_and_frame_alignment_audit(
+        source: &str,
+        preferred_db_type: Option<DatabaseType>,
+        config: &AppConfig,
+    ) -> (String, FormatFrameAlignmentAuditSummary) {
+        Self::format_for_auto_formatting_with_options_and_frame_alignment_audit(
+            source,
+            preferred_db_type,
+            SqlFormatOptions::from_config(config),
+        )
+    }
+
+    #[cfg(test)]
+    fn format_for_auto_formatting_with_options_and_frame_alignment_audit(
+        source: &str,
+        preferred_db_type: Option<DatabaseType>,
+        options: SqlFormatOptions,
+    ) -> (String, FormatFrameAlignmentAuditSummary) {
         let preferred_db_type = Self::resolve_format_preferred_db_type(source, preferred_db_type);
         let items = Self::normalize_format_items(
             super::query_text::split_format_items_for_db_type(source, preferred_db_type),
@@ -7951,7 +7977,7 @@ impl SqlEditorWidget {
             &items,
             true,
             preferred_db_type,
-            SqlFormatOptions::default(),
+            options,
         );
         (result.formatted, result.frame_alignment_audit)
     }
@@ -9529,6 +9555,7 @@ impl SqlEditorWidget {
                 let upper = word.to_ascii_uppercase();
                 upper == "ON"
                     || upper == "USING"
+                    || upper == "IS"
                     || Self::is_dml_clause_starter(upper.as_str())
                     || crate::sql_text::is_format_set_operator_keyword(upper.as_str())
                     || Self::next_word_sequence_starts_join_clause(
@@ -9573,6 +9600,7 @@ impl SqlEditorWidget {
                 let upper = word.to_ascii_uppercase();
                 upper == "ON"
                     || upper == "USING"
+                    || upper == "IS"
                     || Self::is_dml_clause_starter(upper.as_str())
                     || crate::sql_text::is_format_set_operator_keyword(upper.as_str())
                     || Self::next_word_sequence_starts_join_clause_from_words(next_words)
@@ -9593,6 +9621,14 @@ impl SqlEditorWidget {
         // A word adjacent to `.` is always a qualified-identifier segment
         // (`pkg.seed`, `r.name`, `system.help`), never a keyword.
         if prev_token_is_dot || next_token_is_dot {
+            return true;
+        }
+        // MySQL JSON extraction operators take an identifier expression on
+        // their left. A column named like the JSON_VALUE function must keep
+        // its identifier spelling in `json_value -> ...` / `->> ...`.
+        if word_upper == "JSON_VALUE"
+            && matches!(next_token, Some(SqlToken::Symbol(sym)) if matches!(sym.as_str(), "->" | "->>"))
+        {
             return true;
         }
         // GOTO only ever targets a label identifier.
@@ -9660,8 +9696,19 @@ impl SqlEditorWidget {
                 | "ERRORS"
                 | "EVENTS"
                 | "CUME_DIST"
+                | "FIRST_VALUE"
+                | "JSON_VALUE"
         );
         if !keyword_can_be_identifier {
+            return false;
+        }
+
+        // JSON_VALUE is both a built-in function and a valid unquoted name.
+        // Keep the function spelling normalized, but preserve source case when
+        // the same token occupies an identifier slot.
+        if word_upper == "JSON_VALUE"
+            && matches!(next_token, Some(SqlToken::Symbol(sym)) if sym == "(")
+        {
             return false;
         }
 
@@ -9677,6 +9724,12 @@ impl SqlEditorWidget {
             (prev_token, current_clause),
             (Some(SqlToken::Word(prev_word)), Some("ORDER" | "GROUP" | "PARTITION"))
                 if prev_word.eq_ignore_ascii_case("BY")
+        );
+        let follows_logical_connector = matches!(
+            prev_token,
+            Some(SqlToken::Word(prev_word))
+                if prev_word.eq_ignore_ascii_case("AND")
+                    || prev_word.eq_ignore_ascii_case("OR")
         );
         let follows_alias_keyword = Self::token_is_alias_keyword(prev_token);
         let next_is_alias_keyword = Self::token_is_alias_keyword(next_token);
@@ -9761,7 +9814,7 @@ impl SqlEditorWidget {
         if matches!(
             current_clause,
             Some("SELECT" | "WHERE" | "HAVING" | "ON" | "SET" | "GROUP" | "ORDER")
-        ) && (prev_is_boundary || previous_is_current_clause_head)
+        ) && (prev_is_boundary || previous_is_current_clause_head || follows_logical_connector)
             && (next_ends_identifier_slot || next_is_alias_keyword)
         {
             return true;
@@ -15063,10 +15116,18 @@ impl SqlEditorWidget {
                             )
                             .is_some()
                         });
+                    let renderer_kept_wrapped_comma_inline = options.comma_list_layout
+                        == SqlCommaListLayout::Wrapped
+                        && !at_line_start
+                        && matches!(
+                            loop_previous_non_comment_token,
+                            Some(SqlToken::Symbol(symbol)) if symbol == ","
+                        );
                     let source_break_policy = FormatterSourceBreakPolicy::classify(
                         is_any_within_group
                             || is_merge_delete_where
-                            || format_stack.last_paren_first_body_is(idx),
+                            || format_stack.last_paren_first_body_is(idx)
+                            || renderer_kept_wrapped_comma_inline,
                         format_stack
                             .first_condition_body_indent_for_token(current_scope, idx)
                             .is_some(),
@@ -17440,6 +17501,13 @@ impl SqlEditorWidget {
                                 .rsplit_once('\n')
                                 .map_or(out.as_str(), |(_, current_line)| current_line)
                                 .trim_start();
+                            let current_line_start = out.rfind('\n').map_or(0, |offset| offset + 1);
+                            let direct_list_opened_on_current_line = format_stack
+                                .last_paren_stack_frame()
+                                .filter(|frame| frame.direct_list_body)
+                                .is_some_and(|frame| {
+                                    frame.frame.body_start_out_len > current_line_start
+                                });
                             let current_line_starts_structural_close = current_line_trimmed
                                 .starts_with(')')
                                 || current_line_trimmed
@@ -17457,10 +17525,11 @@ impl SqlEditorWidget {
                                 && !comma_touches_comment
                                 && !follows_multiline_child_close
                                 && !previous_item_ends_case
-                                && !current_line_starts_structural_close
+                                && (!current_line_starts_structural_close
+                                    || direct_list_opened_on_current_line)
                                 && current_token_paren_depth >= line_start_token_paren_depth
-                                && !line_closes_delimiter_frame_below_start
-                                && !format_stack.execute_immediate_is_active()
+                                && (!line_closes_delimiter_frame_below_start
+                                    || direct_list_opened_on_current_line)
                                 && !construct_flag_active!(GrantRevokeActive)
                                 && !format_stack.trigger_header_is_active()
                                 && Self::wrapped_comma_fits_current_line(
@@ -19287,6 +19356,8 @@ impl SqlEditorWidget {
                                 .set(current_rendered_line_paren_depth.get().saturating_sub(1));
                             if let Some(parent_frame) = format_stack.last_paren_mut() {
                                 if paren_frame_kind.contributes_multiline_close()
+                                    && (options.comma_list_layout != SqlCommaListLayout::Wrapped
+                                        || !paren_frame_kind.body_is_single_line(&out))
                                     && !close_compact_before_parent_close
                                 {
                                     parent_frame.mark_multiline_child_closed();
@@ -21582,6 +21653,33 @@ mod comma_list_layout_tests {
     }
 
     #[test]
+    fn wrapped_insert_values_does_not_break_after_first_item_when_target_columns_wrap() {
+        let source = "insert into employee (id, employee_name, department_name, created_at) values (1, 'Alice', 'Research and Development', sysdate);";
+        let formatted = format_wrapped(source, 60);
+        let stacked = SqlEditorWidget::format_for_auto_formatting_with_db_type(
+            source,
+            false,
+            Some(DatabaseType::Oracle),
+        );
+
+        assert!(
+            formatted.contains("department_name,\n    created_at)"),
+            "the target-column list must wrap to reproduce the regression:\n{formatted}"
+        );
+        assert!(
+            formatted.contains(
+                "VALUES (1, 'Alice', 'Research and Development', SYSDATE)"
+            ),
+            "a wrapped target-column list must not force a break after the first VALUES item:\n{formatted}"
+        );
+        assert!(
+            stacked.contains("VALUES (1,\n"),
+            "Stacked must retain its item-per-line behavior:\n{stacked}"
+        );
+        assert_eq!(format_wrapped(&formatted, 60), formatted);
+    }
+
+    #[test]
     fn wrapped_keeps_case_and_comment_boundaries_multiline() {
         let case_formatted = format_wrapped(
             "select case when flag = 1 then value_a else value_b end as selected_value, id from employee;",
@@ -21650,6 +21748,72 @@ mod comma_list_layout_tests {
         let formatted = format_wrapped(source, 80);
 
         assert_eq!(format_wrapped(&formatted, 80), formatted);
+    }
+
+    #[test]
+    fn wrapped_function_arguments_ignore_source_break_after_inline_comma() {
+        let canonical = format_wrapped("begin if mod(i, 9) = 0 then null; end if; end; /", 120);
+        let source_break = format_wrapped(
+            "begin if mod(i,\n       9) = 0 then null; end if; end; /",
+            120,
+        );
+
+        assert_eq!(source_break, canonical);
+    }
+
+    #[test]
+    fn wrapped_json_table_keeps_single_line_nested_columns_close_inline() {
+        let formatted = format_wrapped_for(
+            "select count(*) from task_log t join json_table(t.payload, '$.tags[*]' columns (tag varchar(50) path '$')) jt;",
+            120,
+            DatabaseType::MariaDB,
+        );
+
+        assert!(
+            formatted.contains(
+                "JSON_TABLE(t.payload, '$.tags[*]' COLUMNS (tag VARCHAR(50) PATH '$')) jt"
+            ),
+            "a single-line nested COLUMNS frame must not force the JSON_TABLE close onto a new line:\n{formatted}"
+        );
+    }
+
+    #[test]
+    fn wrapped_in_list_ignores_close_from_the_previous_rendered_line() {
+        let formatted = format_wrapped(
+            "select * from (select 1 sales_quartile from dual) x where x.sales_quartile in (1, 2, 3, 4);",
+            120,
+        );
+
+        assert!(
+            formatted.contains("WHERE x.sales_quartile IN (1, 2, 3, 4)"),
+            "an inline-view close on the prior line must not force the new IN list to wrap:\n{formatted}"
+        );
+    }
+
+    #[test]
+    fn wrapped_in_list_opened_after_a_close_uses_its_own_frame() {
+        let formatted = format_wrapped(
+            "select case when (select count(*) from dual) in (0, 1) then 'Y' else 'N' end from dual;",
+            120,
+        );
+
+        assert!(
+            formatted.contains(") IN (0, 1) THEN"),
+            "a new IN-list frame must not inherit an earlier close on the same line:\n{formatted}"
+        );
+    }
+
+    #[test]
+    fn wrapped_execute_immediate_using_keeps_fitting_bind_items_inline() {
+        let formatted = format_wrapped(
+            "begin execute immediate 'BEGIN p(:1,:2,:3); END;' using 1, 2, 3; end; /",
+            120,
+        );
+
+        assert!(
+            formatted.contains("USING 1, 2, 3;"),
+            "Wrapped applies to EXECUTE IMMEDIATE USING lists:\n{formatted}"
+        );
     }
 }
 
@@ -42383,6 +42547,40 @@ END;"#;
                 crate::db::connection::DatabaseType::MariaDB,
             ),
             formatted
+        );
+    }
+
+    #[test]
+    fn format_sql_basic_preserves_json_value_identifier_but_normalizes_function_name() {
+        let source = "insert into qt_json (json_value, payload) values (json_value, json_value(payload, '$.kind')); select json_value from qt_json where json_value is json and json_value is not null;";
+        let formatted = SqlEditorWidget::format_sql_basic_for_db_type(
+            source,
+            crate::db::connection::DatabaseType::Oracle,
+        );
+
+        assert!(
+            formatted.contains("INSERT INTO qt_json (json_value,")
+                && formatted.contains("VALUES (json_value,")
+                && formatted.contains("JSON_VALUE (payload,")
+                && formatted.contains("SELECT json_value")
+                && formatted.contains("WHERE json_value IS JSON")
+                && formatted.contains("AND json_value IS NOT NULL;"),
+            "identifier slots must preserve `json_value` while the function call stays normalized:\n{formatted}"
+        );
+    }
+
+    #[test]
+    fn format_sql_basic_for_mysql_preserves_json_value_before_path_operator() {
+        let source = "select json_value ->> '$.kind' as kind_value, json_value(payload, '$.kind') as function_value from qt_json;";
+        let formatted = SqlEditorWidget::format_sql_basic_for_db_type(
+            source,
+            crate::db::connection::DatabaseType::MySQL,
+        );
+
+        assert!(
+            formatted.contains("SELECT json_value ->> '$.kind' AS kind_value,")
+                && formatted.contains("JSON_VALUE(payload,"),
+            "JSON path operands must preserve identifier case while function calls stay normalized:\n{formatted}"
         );
     }
 

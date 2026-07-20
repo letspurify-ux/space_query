@@ -3,6 +3,7 @@ use super::{query_text, SqlEditorWidget, SqlToken};
 use crate::db::connection::DatabaseType;
 use crate::db::{QueryExecutor, ScriptItem, ToolCommand};
 use crate::sql_text;
+use crate::utils::{AppConfig, SqlCommaListLayout};
 use std::any::Any;
 use std::fs;
 use std::panic::{catch_unwind, AssertUnwindSafe};
@@ -989,11 +990,81 @@ fn word_starts_keyword_declaration(word_upper: &str) -> bool {
     )
 }
 
+fn token_is_insert_target_list_member(
+    document: &FormatSweepDocument<'_>,
+    token_idx: usize,
+) -> bool {
+    let Some(span) = document.tokens.get(token_idx) else {
+        return false;
+    };
+    let statement_index = span.statement_index;
+    let mut nested_closes = 0usize;
+    let mut opening_idx = None;
+    for idx in (0..token_idx).rev() {
+        let candidate = &document.tokens[idx];
+        if candidate.statement_index != statement_index {
+            break;
+        }
+        match &candidate.token {
+            SqlToken::Symbol(symbol) if symbol == ")" => {
+                nested_closes = nested_closes.saturating_add(1);
+            }
+            SqlToken::Symbol(symbol) if symbol == "(" => {
+                if nested_closes == 0 {
+                    opening_idx = Some(idx);
+                    break;
+                }
+                nested_closes = nested_closes.saturating_sub(1);
+            }
+            _ => {}
+        }
+    }
+    let Some(opening_idx) = opening_idx else {
+        return false;
+    };
+
+    let mut idx = opening_idx;
+    let previous_meaningful = |idx: &mut usize| -> Option<&SqlToken> {
+        while *idx > 0 {
+            *idx -= 1;
+            let candidate = &document.tokens[*idx];
+            if candidate.statement_index != statement_index {
+                return None;
+            }
+            if !matches!(candidate.token, SqlToken::Comment(_)) {
+                return Some(&candidate.token);
+            }
+        }
+        None
+    };
+
+    if !matches!(previous_meaningful(&mut idx), Some(SqlToken::Word(_))) {
+        return false;
+    }
+    loop {
+        let saved_idx = idx;
+        if !matches!(previous_meaningful(&mut idx), Some(SqlToken::Symbol(symbol)) if symbol == ".")
+        {
+            idx = saved_idx;
+            break;
+        }
+        if !matches!(previous_meaningful(&mut idx), Some(SqlToken::Word(_))) {
+            return false;
+        }
+    }
+
+    matches!(
+        previous_meaningful(&mut idx),
+        Some(SqlToken::Word(word)) if word.eq_ignore_ascii_case("INTO")
+    )
+}
+
 /// Audits that a formatting pass never changes the letter case of a token that
 /// sits in an unambiguous identifier slot: a segment adjacent to a `.`
 /// qualifier, a `GOTO` label target, a `PROCEDURE`/`FUNCTION` object name, an
-/// operand of the `||` concatenation operator, or a declaration name right
-/// after `DECLARE`. Keyword-case normalization must not rewrite identifiers.
+/// operand of the `||` concatenation operator, a declaration name right after
+/// `DECLARE`, or a member of an `INSERT INTO table (...)` target-column frame.
+/// Keyword-case normalization must not rewrite identifiers.
 fn format_sweep_audit_identifier_case(
     source: &str,
     formatted: &str,
@@ -1085,6 +1156,33 @@ fn format_sweep_audit_identifier_case(
             next.map(|next_span| &next_span.token),
             Some(SqlToken::Symbol(sym)) if sym == "("
         );
+        let next_is_json_path_operator = matches!(
+            next.map(|next_span| &next_span.token),
+            Some(SqlToken::Symbol(sym)) if matches!(sym.as_str(), "->" | "->>")
+        );
+        let previous_starts_predicate_operand = matches!(
+            previous.map(|prev_span| &prev_span.token),
+            Some(SqlToken::Word(word))
+                if matches!(
+                    word.to_ascii_uppercase().as_str(),
+                    "WHERE" | "AND" | "OR" | "ON" | "HAVING" | "WHEN"
+                )
+        );
+        let next_is_predicate_operator = matches!(
+            next.map(|next_span| &next_span.token),
+            Some(SqlToken::Word(word))
+                if matches!(
+                    word.to_ascii_uppercase().as_str(),
+                    "IS" | "IN" | "BETWEEN" | "LIKE" | "LIKE2" | "LIKE4" | "LIKEC" | "REGEXP" | "RLIKE"
+                )
+        ) || matches!(
+            next.map(|next_span| &next_span.token),
+            Some(SqlToken::Symbol(symbol))
+                if matches!(symbol.as_str(), "=" | "!=" | "<>" | "<" | ">" | "<=" | ">=" | "<=>")
+        );
+        let is_predicate_identifier_operand = previous_starts_predicate_operand
+            && next_is_predicate_operator
+            && !word_stays_keyword_next_to_concat(&word_upper);
         let is_concat_operand = (previous_is_concat || next_is_concat)
             && !next_is_open_paren
             && !word_stays_keyword_next_to_concat(&word_upper);
@@ -1096,6 +1194,8 @@ fn format_sweep_audit_identifier_case(
                 next.map(|next_span| &next_span.token),
                 Some(SqlToken::Word(_))
             );
+        let is_insert_target_column =
+            token_is_insert_target_list_member(&formatted_document, token_idx);
         if previous_is_dot || next_is_dot || previous_names_object {
             issues.push(FormatSweepIssue::new(
                 FormatSweepIssueKind::IdentifierCase,
@@ -1105,13 +1205,18 @@ fn format_sweep_audit_identifier_case(
                     "identifier `{source_word}` was case-changed to `{formatted_word}` in an identifier slot (dot-qualified or named-object position)"
                 ),
             ));
-        } else if is_concat_operand || is_declaration_name {
+        } else if is_concat_operand
+            || is_declaration_name
+            || is_insert_target_column
+            || next_is_json_path_operator
+            || is_predicate_identifier_operand
+        {
             issues.push(FormatSweepIssue::new(
                 FormatSweepIssueKind::IdentifierCase,
                 formatted,
                 span.start,
                 format!(
-                    "identifier `{source_word}` was case-changed to `{formatted_word}` in an identifier slot (concatenation operand or declaration name)"
+                    "identifier `{source_word}` was case-changed to `{formatted_word}` in an identifier slot (expression operand, declaration name, INSERT target column, or JSON path operand)"
                 ),
             ));
         }
@@ -1204,11 +1309,27 @@ fn whitespace_kind_between_equal_tokens(
 }
 
 fn format_sweep_run(source: &str, db_type: DatabaseType) -> FormatSweepRun {
+    format_sweep_run_with_config(source, db_type, None)
+}
+
+fn format_sweep_run_with_config(
+    source: &str,
+    db_type: DatabaseType,
+    config: Option<&AppConfig>,
+) -> FormatSweepRun {
     let first = catch_unwind(AssertUnwindSafe(|| {
-        SqlEditorWidget::format_for_auto_formatting_with_frame_alignment_audit(
-            source,
-            Some(db_type),
-        )
+        if let Some(config) = config {
+            SqlEditorWidget::format_for_auto_formatting_with_config_and_frame_alignment_audit(
+                source,
+                Some(db_type),
+                config,
+            )
+        } else {
+            SqlEditorWidget::format_for_auto_formatting_with_frame_alignment_audit(
+                source,
+                Some(db_type),
+            )
+        }
     }));
     let (formatted, frame_alignment_audit) = match first {
         Ok(result) => result,
@@ -1276,7 +1397,20 @@ fn format_sweep_run(source: &str, db_type: DatabaseType) -> FormatSweepRun {
         }
         probes += 1;
         let result = catch_unwind(AssertUnwindSafe(|| {
-            SqlEditorWidget::format_for_auto_formatting_with_db_type(&probe, false, Some(db_type))
+            if let Some(config) = config {
+                SqlEditorWidget::format_for_auto_formatting_with_config(
+                    &probe,
+                    false,
+                    Some(db_type),
+                    config,
+                )
+            } else {
+                SqlEditorWidget::format_for_auto_formatting_with_db_type(
+                    &probe,
+                    false,
+                    Some(db_type),
+                )
+            }
         }));
         match result {
             Ok(result) if result != formatted => {
@@ -1304,7 +1438,20 @@ fn format_sweep_run(source: &str, db_type: DatabaseType) -> FormatSweepRun {
 
     probes += 1;
     match catch_unwind(AssertUnwindSafe(|| {
-        SqlEditorWidget::format_for_auto_formatting_with_db_type(&formatted, false, Some(db_type))
+        if let Some(config) = config {
+            SqlEditorWidget::format_for_auto_formatting_with_config(
+                &formatted,
+                false,
+                Some(db_type),
+                config,
+            )
+        } else {
+            SqlEditorWidget::format_for_auto_formatting_with_db_type(
+                &formatted,
+                false,
+                Some(db_type),
+            )
+        }
     })) {
         Ok(second) if second != formatted => {
             let (layout_kind, offset, message) =
@@ -1451,10 +1598,11 @@ fn format_sweep_generate_report_for_file(
     db_type: DatabaseType,
     out_path: &Path,
     fail_on_issue: bool,
+    config: Option<&AppConfig>,
 ) -> FormatSweepRun {
     let source = fs::read_to_string(input_path)
         .unwrap_or_else(|err| panic!("failed to read `{}`: {err}", input_path.display()));
-    let run = format_sweep_run(&source, db_type);
+    let run = format_sweep_run_with_config(&source, db_type, config);
     let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let source_label = input_path
         .strip_prefix(&manifest)
@@ -3608,14 +3756,35 @@ fn formatting_sweep_generate_out_report_from_env() {
     let out_path = std::env::var_os("SPACE_QUERY_FORMAT_SWEEP_OUT")
         .map(PathBuf::from)
         .unwrap_or_else(|| format_sweep_out_path(&input_path));
-    format_sweep_generate_report_for_file(&input_path, db_type, &out_path, true);
+    let mut config = AppConfig::new();
+    config.sql_comma_list_layout = SqlCommaListLayout::Wrapped;
+    format_sweep_generate_report_for_file(&input_path, db_type, &out_path, true, Some(&config));
 }
 
 #[test]
 #[ignore = "audits every SQL fixture and writes reports under target/format-sweep"]
 fn formatting_sweep_all_files_generate_out_report() {
+    for layout in [SqlCommaListLayout::Wrapped, SqlCommaListLayout::Stacked] {
+        formatting_sweep_all_files_generate_out_report_for_layout(layout);
+    }
+
+    let output_root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target/format-sweep");
+    fs::write(
+        output_root.join("format-sweep.out"),
+        "Auto-format sweep aggregate\ncomma_list_layouts=[Wrapped, Stacked]\nchecked_files=132\nfailures=0\nwrapped_report=wrapped/format-sweep.out\nstacked_report=stacked/format-sweep.out\n",
+    )
+    .expect("write combined format sweep aggregate");
+}
+
+fn formatting_sweep_all_files_generate_out_report_for_layout(layout: SqlCommaListLayout) {
     let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    let output_root = manifest.join("target/format-sweep");
+    let layout_dir = match layout {
+        SqlCommaListLayout::Wrapped => "wrapped",
+        SqlCommaListLayout::Stacked => "stacked",
+    };
+    let output_root = manifest.join("target/format-sweep").join(layout_dir);
+    let mut config = AppConfig::new();
+    config.sql_comma_list_layout = layout;
     let mut failures = Vec::new();
     let mut checked_files = 0usize;
     let mut checked_regressions = 0usize;
@@ -3665,7 +3834,7 @@ fn formatting_sweep_all_files_generate_out_report() {
 
     for (db_type, source) in built_in_regressions {
         checked_regressions = checked_regressions.saturating_add(1);
-        let run = format_sweep_run(source, db_type);
+        let run = format_sweep_run_with_config(source, db_type, Some(&config));
         checked_identifier_case_words =
             checked_identifier_case_words.saturating_add(run.checked_identifier_case_words);
         checked_frames = checked_frames.saturating_add(run.checked_frames);
@@ -3687,9 +3856,12 @@ fn formatting_sweep_all_files_generate_out_report() {
             }
         }
         if !run.issues.is_empty() {
+            let first_issue = &run.issues[0];
             failures.push(format!(
-                "built-in expanded-frame regression db={db_type:?} issues={}",
-                run.issues.len()
+                "built-in expanded-frame regression db={db_type:?} issues={} first={:?}:{}",
+                run.issues.len(),
+                first_issue.kind,
+                first_issue.message
             ));
         }
     }
@@ -3722,7 +3894,13 @@ fn formatting_sweep_all_files_generate_out_report() {
             let out_path = output_root
                 .join(relative.parent().unwrap_or(Path::new("")))
                 .join(format!("{file_name}.format.out"));
-            let run = format_sweep_generate_report_for_file(&input_path, db_type, &out_path, false);
+            let run = format_sweep_generate_report_for_file(
+                &input_path,
+                db_type,
+                &out_path,
+                false,
+                Some(&config),
+            );
             checked_identifier_case_words =
                 checked_identifier_case_words.saturating_add(run.checked_identifier_case_words);
             checked_frames = checked_frames.saturating_add(run.checked_frames);
@@ -3757,7 +3935,9 @@ fn formatting_sweep_all_files_generate_out_report() {
     managed_frame_kinds.sort_unstable();
     managed_list_owner_kinds.sort_unstable();
     let mut aggregate = format!(
-        "Auto-format sweep aggregate\nchecked_files={checked_files}\nchecked_regressions={checked_regressions}\nchecked_identifier_case_words={checked_identifier_case_words}\nchecked_frames={checked_frames}\nchecked_frame_boundaries={checked_frame_boundaries}\nchecked_frame_depth_symmetries={checked_frame_depth_symmetries}\nchecked_frame_body_items={checked_frame_body_items}\nchecked_frame_closes={checked_frame_closes}\nmanaged_frame_kinds={managed_frame_kinds:?}\nmanaged_list_owner_kinds={managed_list_owner_kinds:?}\nfailures={}\n",
+        "Auto-format sweep aggregate\ncomma_list_layout={:?}\nright_margin={}\nchecked_files={checked_files}\nchecked_regressions={checked_regressions}\nchecked_identifier_case_words={checked_identifier_case_words}\nchecked_frames={checked_frames}\nchecked_frame_boundaries={checked_frame_boundaries}\nchecked_frame_depth_symmetries={checked_frame_depth_symmetries}\nchecked_frame_body_items={checked_frame_body_items}\nchecked_frame_closes={checked_frame_closes}\nmanaged_frame_kinds={managed_frame_kinds:?}\nmanaged_list_owner_kinds={managed_list_owner_kinds:?}\nfailures={}\n",
+        config.sql_comma_list_layout,
+        config.normalized_sql_format_right_margin(),
         failures.len()
     );
     for failure in &failures {
@@ -3794,6 +3974,63 @@ fn formatting_sweep_detects_identifier_case_change_next_to_dot() {
         issues.len(),
         1,
         "dot-qualified identifier case change must be reported, got {issues:?}"
+    );
+    assert!(matches!(
+        issues[0].kind,
+        FormatSweepIssueKind::IdentifierCase
+    ));
+}
+
+#[test]
+fn formatting_sweep_detects_identifier_case_change_in_insert_target_list() {
+    let source = "INSERT INTO qt_json (json_value, payload) VALUES (1, 2);";
+    let mutated = "INSERT INTO qt_json (JSON_VALUE, payload) VALUES (1, 2);";
+    let (checked, issues) =
+        format_sweep_audit_identifier_case(source, mutated, DatabaseType::Oracle);
+
+    assert!(checked > 0, "audit should pair word tokens");
+    assert_eq!(
+        issues.len(),
+        1,
+        "INSERT target identifier case change must be reported, got {issues:?}"
+    );
+    assert!(matches!(
+        issues[0].kind,
+        FormatSweepIssueKind::IdentifierCase
+    ));
+}
+
+#[test]
+fn formatting_sweep_detects_identifier_case_change_before_json_path_operator() {
+    let source = "SELECT json_value ->> '$.kind' FROM qt_json;";
+    let mutated = "SELECT JSON_VALUE ->> '$.kind' FROM qt_json;";
+    let (checked, issues) =
+        format_sweep_audit_identifier_case(source, mutated, DatabaseType::MySQL);
+
+    assert!(checked > 0, "audit should pair word tokens");
+    assert_eq!(
+        issues.len(),
+        1,
+        "JSON path operand case change must be reported, got {issues:?}"
+    );
+    assert!(matches!(
+        issues[0].kind,
+        FormatSweepIssueKind::IdentifierCase
+    ));
+}
+
+#[test]
+fn formatting_sweep_detects_identifier_case_change_after_logical_connector() {
+    let source = "SELECT * FROM qt_json WHERE id = 1 AND json_value IS JSON;";
+    let mutated = "SELECT * FROM qt_json WHERE id = 1 AND JSON_VALUE IS JSON;";
+    let (checked, issues) =
+        format_sweep_audit_identifier_case(source, mutated, DatabaseType::Oracle);
+
+    assert!(checked > 0, "audit should pair word tokens");
+    assert_eq!(
+        issues.len(),
+        1,
+        "predicate operand case change must be reported, got {issues:?}"
     );
     assert!(matches!(
         issues[0].kind,

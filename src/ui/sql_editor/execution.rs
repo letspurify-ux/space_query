@@ -28723,6 +28723,7 @@ mod mysql_batch_execution_regression_tests {
         ResultPaneRoute,
     };
     use crate::ui::ResultMessageKind;
+    use crate::utils::{AppConfig, SqlCommaListLayout};
     use mysql::prelude::Queryable;
     use std::env;
     use std::sync::atomic::AtomicU64;
@@ -29926,59 +29927,64 @@ mod mysql_batch_execution_regression_tests {
             "{fixture_dir} fixture inventory changed"
         );
 
-        let mut failures = Vec::new();
-        for path in fixture_paths {
-            let source = std::fs::read_to_string(&path)
-                .unwrap_or_else(|err| panic!("read {}: {err}", path.display()));
-            let Some(harness) = MysqlSessionRuleHarness::new_for_db_type(true, db_type) else {
-                return;
-            };
-            let formatted = SqlEditorWidget::format_for_auto_formatting_with_db_type(
-                &source,
-                false,
-                Some(db_type),
-            );
-            let path_label = path.to_string_lossy();
-            // Single SELECT fixtures use lazy fetch. Allow a complex first batch
-            // to finish instead of treating the normal 50 ms test idle gap as EOF.
-            let progress = harness.execute_with_progress_idle_timeout(
-                &formatted,
-                path_label.as_ref(),
-                Duration::from_secs(5),
-            );
-            let mut successful_statements = 0usize;
+        for layout in [SqlCommaListLayout::Wrapped, SqlCommaListLayout::Stacked] {
+            let mut format_config = AppConfig::new();
+            format_config.sql_comma_list_layout = layout;
+            let mut failures = Vec::new();
+            for path in &fixture_paths {
+                let source = std::fs::read_to_string(path)
+                    .unwrap_or_else(|err| panic!("read {}: {err}", path.display()));
+                let Some(harness) = MysqlSessionRuleHarness::new_for_db_type(true, db_type) else {
+                    return;
+                };
+                let formatted = SqlEditorWidget::format_for_auto_formatting_with_config(
+                    &source,
+                    false,
+                    Some(db_type),
+                    &format_config,
+                );
+                let path_label = path.to_string_lossy();
+                // Single SELECT fixtures use lazy fetch. Allow a complex first batch
+                // to finish instead of treating the normal 50 ms test idle gap as EOF.
+                let progress = harness.execute_with_progress_idle_timeout(
+                    &formatted,
+                    path_label.as_ref(),
+                    Duration::from_secs(5),
+                );
+                let mut successful_statements = 0usize;
 
-            for message in &progress {
-                if let QueryProgress::StatementFinished { index, result, .. } = message {
-                    if result.success {
-                        successful_statements = successful_statements.saturating_add(1);
-                    } else {
-                        failures.push(format!(
-                            "{}: statement {index} failed: {}",
-                            path.display(),
-                            result.message
-                        ));
+                for message in &progress {
+                    if let QueryProgress::StatementFinished { index, result, .. } = message {
+                        if result.success {
+                            successful_statements = successful_statements.saturating_add(1);
+                        } else {
+                            failures.push(format!(
+                                "{}: statement {index} failed: {}",
+                                path.display(),
+                                result.message
+                            ));
+                        }
                     }
                 }
+
+                if successful_statements == 0 {
+                    failures.push(format!(
+                        "{}: no successful statement was emitted",
+                        path.display()
+                    ));
+                }
+                eprintln!(
+                    "{layout:?} formatted live fixture checked: {} ({successful_statements} successful statements)",
+                    path.display()
+                );
             }
 
-            if successful_statements == 0 {
-                failures.push(format!(
-                    "{}: no successful statement was emitted",
-                    path.display()
-                ));
-            }
-            eprintln!(
-                "formatted live fixture checked: {} ({successful_statements} successful statements)",
-                path.display()
+            assert!(
+                failures.is_empty(),
+                "{layout:?} formatted {db_type:?} fixture execution failures:\n{}",
+                failures.join("\n")
             );
         }
-
-        assert!(
-            failures.is_empty(),
-            "formatted {db_type:?} fixture execution failures:\n{}",
-            failures.join("\n")
-        );
     }
 
     fn assert_mysql_final_status_pass(progress: &[QueryProgress]) {
@@ -31623,6 +31629,7 @@ mod mysql_transaction_feedback_tests {
         SharedDbSessionLease, TransactionMode, TransactionSessionState,
     };
     use crate::ui::{result_pane_routes_for_progress, ResultPaneRoute};
+    use crate::utils::{AppConfig, SqlCommaListLayout};
     use std::sync::atomic::Ordering;
     use std::sync::{mpsc, Arc, Mutex};
     use std::thread;
@@ -33593,6 +33600,16 @@ mod mysql_transaction_feedback_tests {
     #[test]
     #[ignore = "requires local Oracle listener and executes every formatted test fixture"]
     fn oracle_thin_query_tool_runs_all_formatted_fixture_scripts_without_errors() {
+        for layout in [SqlCommaListLayout::Wrapped, SqlCommaListLayout::Stacked] {
+            oracle_thin_query_tool_runs_all_formatted_fixture_scripts_for_layout(layout);
+        }
+    }
+
+    fn oracle_thin_query_tool_runs_all_formatted_fixture_scripts_for_layout(
+        layout: SqlCommaListLayout,
+    ) {
+        let mut format_config = AppConfig::new();
+        format_config.sql_comma_list_layout = layout;
         let mut fixture_paths = std::fs::read_dir("test")
             .expect("read Oracle fixture directory")
             .filter_map(Result::ok)
@@ -33610,10 +33627,11 @@ mod mysql_transaction_feedback_tests {
         for path in fixture_paths {
             let source = std::fs::read_to_string(&path)
                 .unwrap_or_else(|err| panic!("read {}: {err}", path.display()));
-            let formatted = SqlEditorWidget::format_for_auto_formatting_with_db_type(
+            let formatted = SqlEditorWidget::format_for_auto_formatting_with_config(
                 &source,
                 false,
                 Some(DatabaseType::Oracle),
+                &format_config,
             );
             let formatted = oracle_thin_skip_unsupported_implicit_invocations(&formatted);
             let progress = oracle_thin_run_script_with_auto_commit(&formatted, false);
@@ -33640,14 +33658,14 @@ mod mysql_transaction_feedback_tests {
                     .map(|failure| format!("{}: {failure}", path.display())),
             );
             eprintln!(
-                "formatted live fixture checked: {} ({successful_statements} successful statements)",
+                "{layout:?} formatted live fixture checked: {} ({successful_statements} successful statements)",
                 path.display()
             );
         }
 
         assert!(
             audit_failures.is_empty(),
-            "formatted Oracle fixture execution failures:\n{}",
+            "{layout:?} formatted Oracle fixture execution failures:\n{}",
             audit_failures.join("\n")
         );
     }

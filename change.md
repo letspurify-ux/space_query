@@ -3652,6 +3652,131 @@ built-in sweep 회귀 코퍼스에 5개 케이스(SEARCH/CYCLE 중간 목록, `:
 | `cargo clippy --locked --all-targets -- -D warnings -W clippy::perf -W clippy::complexity` | 통과, 경고 0 |
 | `cargo fmt --all -- --check` / `git diff --check` | 통과 |
 
+# 39차: Wrapped/Stacked comma-list 옵션별 전수 검증과 VALUES 줄바꿈 수정 (2026-07-20)
+
+## 39-1. AS-IS / TO-BE
+
+`comma list = Wrapped`에서 `INSERT` 대상 컬럼 목록이 먼저 줄바꿈되면, 그 닫힘
+상태가 뒤에 새로 열린 `VALUES (...)` 프레임으로 누출됐다. 값 목록 전체가 right
+margin 안에 들어가도 첫 번째 쉼표 직후 강제로 줄을 바꿨다.
+
+```sql
+-- AS-IS
+INSERT INTO employee (id, employee_name, department_name,
+    created_at)
+VALUES (1,
+    'Alice', 'Research and Development', SYSDATE);
+
+-- TO-BE
+INSERT INTO employee (id, employee_name, department_name,
+    created_at)
+VALUES (1, 'Alice', 'Research and Development', SYSDATE);
+```
+
+이 TO-BE는 `Wrapped` 옵션에만 적용된다. 같은 입력을 `Stacked`로 포맷하면 기존처럼
+`VALUES (1,` 뒤에서 개행해 항목별 한 줄 배치를 유지한다.
+
+원인은 렌더링 라인에 이전 괄호 닫힘이 있었다는 사실을 현재 목록의 구조적
+부모 정보처럼 사용한 것이다. `ParenFormatFrame.body_start_out_len`과 현재 출력
+라인 시작 offset을 비교해 **현재 줄에서 새 direct-list 프레임이 열린 경우에는
+그 프레임이 자신의 Wrapped 결정을 하도록** 바꿨다. `VALUES`에 한정하지 않아
+inline view 뒤의 `IN (...)`, scalar subquery 닫힘 뒤의 새 목록에도 같은 규칙이
+적용된다.
+
+## 39-2. 전수 판독에서 함께 발견해 일반화한 항목
+
+- Wrapped가 쉼표를 inline으로 유지한 뒤 원본 개행이 다시 줄바꿈을 강제하던
+  문제: 렌더러가 내린 inline 결정을 source-break 분류가 뒤집지 않도록 했다.
+- Wrapped의 단일 라인 `JSON_TABLE(... COLUMNS (...))`에서 안쪽 프레임이 바깥
+  닫힘을 여러 줄 자식으로 오인하던 문제: 실제 frame body가 단일 라인이면
+  multiline-child close로 전파하지 않는다. `Stacked`의 기존 닫힘 배치는 유지한다.
+- `EXECUTE IMMEDIATE ... USING 1, 2, 3`가 Wrapped 대상에서 제외되던 문제:
+  `USING` 소유 목록과 right margin 규칙을 그대로 적용한다.
+- Oracle/MariaDB에서 컬럼명 `json_value`가 함수 키워드 `JSON_VALUE`로 바뀌던
+  문제: `(`가 뒤따르는 함수 호출만 키워드로 정규화하고 식별자 슬롯은 원본
+  case를 보존한다.
+- MySQL `json_value -> '$.x'` / `->>`의 왼쪽 피연산자도 식별자 슬롯으로
+  분류한다.
+- predicate 절 첫 피연산자는 보존되지만 `AND`/`OR` 뒤의 동형 피연산자는 함수
+  키워드로 바뀌던 문제: `AND json_value IS JSON`과 whitespace 회귀의
+  `WHERE first_value = ...`를 식별자 문맥으로 분류한다. `JSON_VALUE(...)`와
+  `FIRST_VALUE(...)` 함수 호출은 계속 키워드로 정규화한다.
+
+식별자 회귀는 sweep에 일반 검사를 추가했다. `INSERT INTO table (...)`의 직접
+대상 컬럼 프레임과 JSON path 연산자의 왼쪽 피연산자에서 case가 바뀌면
+`IdentifierCase` issue가 된다. 레이아웃 문제는 기존 frame-depth 감사가 모든
+관리 프레임의 parent/child, body/close, sibling 깊이를 계속 검사하도록 sweep
+자체를 실제 `Wrapped` 설정으로 실행하게 했고, 깊이 위반이 아닌 right-margin
+선택 문제는 direct-list 프레임 경계 회귀 테스트로 고정했다.
+
+## 39-3. 신규 회귀 테스트
+
+- `wrapped_insert_values_does_not_break_after_first_item_when_target_columns_wrap`
+- `wrapped_in_list_ignores_close_from_the_previous_rendered_line`
+- `wrapped_in_list_opened_after_a_close_uses_its_own_frame`
+- `wrapped_function_arguments_ignore_source_break_after_inline_comma`
+- `wrapped_json_table_keeps_single_line_nested_columns_close_inline`
+- `wrapped_execute_immediate_using_keeps_fitting_bind_items_inline`
+- `format_sql_basic_preserves_json_value_identifier_but_normalizes_function_name`
+- `format_sql_basic_for_mysql_preserves_json_value_before_path_operator`
+- `formatting_sweep_detects_identifier_case_change_in_insert_target_list`
+- `formatting_sweep_detects_identifier_case_change_before_json_path_operator`
+- `formatting_sweep_detects_identifier_case_change_after_logical_connector`
+
+첫 번째 테스트는 동일 SQL을 `Wrapped`와 `Stacked`로 각각 포맷해 Wrapped의 inline
+결과와 Stacked의 기존 item-per-line 결과를 함께 고정한다.
+
+## 39-4. Wrapped/Stacked 산출물 전수 검토
+
+지정 명령 한 번으로 `target/format-sweep/wrapped`와
+`target/format-sweep/stacked`을 함께 생성하도록 하네스를 일반화했다. 두 옵션의
+132개 `.format.out`을 각 파일 첫 줄부터 report footer 마지막 줄까지
+`docs/auto_format_rule.md`와 대조했다.
+
+| 옵션 | dialect | 파일 | 판독한 줄 | 최종 결과 |
+| --- | --- | ---: | ---: | --- |
+| Wrapped | Oracle | 42 | 19,784 | 이상 없음 |
+| Wrapped | MySQL | 11 | 5,808 | 이상 없음 |
+| Wrapped | MariaDB | 13 | 8,029 | 이상 없음 |
+| Stacked | Oracle | 42 | 27,390 | 이상 없음 |
+| Stacked | MySQL | 11 | 9,352 | 이상 없음 |
+| Stacked | MariaDB | 13 | 12,995 | 이상 없음 |
+| 합계 | 2옵션 × 3 dialect | 132 | 83,358 | 이상 없음 |
+
+옵션별 최종 집계는 공통으로 regressions=32, identifier_case_words=89,819,
+frames=24,227, frame_boundaries=53,385, frame_closes=11,297, failures=0이다.
+Wrapped는 frame_depth_symmetries=2,963/frame_body_items=10,050, Stacked는
+3,408/26,027이다. 루트 aggregate는 `checked_files=132`, `failures=0`이다.
+
+## 39-5. Space Query 실제 실행
+
+실행용 전수 테스트도 sweep과 동일하게 `Wrapped`와 `Stacked`를 각각 명시한다.
+각 원본을 두 옵션으로 포맷한 뒤 production MySQL/MariaDB batch 및 Oracle Thin
+경로로 전달했으며, 모든 옵션·파일 조합에서 성공 statement를 하나 이상 확인했다.
+
+| 옵션 | DB | live 대상 | 성공 statement | 결과 |
+| --- | --- | ---: | ---: | --- |
+| Wrapped | Oracle Free/1521 | 42/42 | 2,637 | 실패 0 |
+| Stacked | Oracle Free/1521 | 42/42 | 2,637 | 실패 0 |
+| Wrapped | MySQL 8.0/3307 | 11/11 | 386 | 실패 0 |
+| Stacked | MySQL 8.0/3307 | 11/11 | 386 | 실패 0 |
+| Wrapped | MariaDB 12.2/3306 | 13/13 | 671 | 실패 0 |
+| Stacked | MariaDB 12.2/3306 | 13/13 | 671 | 실패 0 |
+| 합계 | 2옵션 × 3 DB | 132/132 | 7,388 | 실패 0 |
+
+## 39-6. 검증
+
+| 검증 | 결과 |
+| --- | --- |
+| Wrapped comma-list 집중 회귀 | 18 passed · 0 failed |
+| `JSON_VALUE` 문맥 회귀 | 10 passed · 0 failed |
+| 신규 sweep 식별자 검사 | 5 passed · 0 failed |
+| `cargo test --lib formatting_sweep_all_files_generate_out_report -- --ignored --nocapture` | 통과 — 2옵션 × (66파일 + 32회귀), failures 0 |
+| 포맷 후 Space Query live 실행 | 132/132 옵션·파일 조합, 7,388 successful statements, 실패 0 |
+| `cargo test` | 통과 — 전 타깃 합계 6,839 passed · 0 failed · 246 ignored |
+| `cargo clippy --locked --all-targets -- -D warnings -W clippy::perf -W clippy::complexity` | 통과 — 경고 0 |
+| `cargo fmt --all -- --check` / `git diff --check` | 통과 |
+
 ## 24-1. 검토 범위 (24차: delimiter-aware sweep 감사)
 
 요청한 `formatting_sweep_all_files_generate_out_report`를 실행한 뒤 Oracle 41개,
