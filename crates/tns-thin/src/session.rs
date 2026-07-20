@@ -11680,7 +11680,7 @@ fn process_legacy_execute_error(
 fn execute_error_message(
     cursor: &mut PacketCursor<'_>,
     code: u32,
-    error_pos: i32,
+    _error_pos: i32,
 ) -> Result<Option<String>, OracleThinError> {
     if code == 0 {
         return Ok(None);
@@ -11699,9 +11699,6 @@ fn execute_error_message(
     }
     if !message.contains("ORA-") {
         message = format!("ORA-{:05}: {message}", code);
-    }
-    if error_pos > 0 && !message.contains("position") {
-        message.push_str(&format!(" (position {error_pos})"));
     }
     Ok(Some(message))
 }
@@ -22004,6 +22001,26 @@ mod tests {
             Some("ORA-00942: table or view does not exist")
         );
         assert_eq!(cursor.remaining(), 0);
+    }
+
+    #[test]
+    fn execute_error_message_does_not_append_error_position() {
+        let caps = OracleThinCapabilities::default();
+        let mut packet = Vec::new();
+        write_bytes_with_length_for_capabilities(
+            &mut packet,
+            b"ORA-00942: table or view does not exist\n",
+            &caps,
+        )
+        .unwrap();
+
+        let mut cursor = PacketCursor::with_capabilities(&packet, &caps);
+        let message = super::execute_error_message(&mut cursor, 942, 19).unwrap();
+
+        assert_eq!(
+            message.as_deref(),
+            Some("ORA-00942: table or view does not exist")
+        );
     }
 
     #[test]
