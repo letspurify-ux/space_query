@@ -2420,6 +2420,8 @@ impl SqlEditorWidget {
         ));
         intellisense_runtime
             .set_context_window_bytes(editor_config.normalized_intellisense_context_window_bytes());
+        intellisense_runtime
+            .set_popup_delay_ms(editor_config.normalized_intellisense_popup_delay_ms());
         let history_cursor = Arc::new(Mutex::new(None::<usize>));
         let history_original = Arc::new(Mutex::new(None::<String>));
         let history_navigation_entries = Arc::new(Mutex::new(None::<Vec<QueryHistoryEntry>>));
@@ -2810,6 +2812,10 @@ impl SqlEditorWidget {
     pub fn set_intellisense_context_window_kib(&self, size_kib: u32) {
         self.intellisense_runtime
             .set_context_window_bytes(AppConfig::intellisense_context_window_bytes(size_kib));
+    }
+
+    pub fn set_intellisense_popup_delay_ms(&self, delay_ms: u32) {
+        self.intellisense_runtime.set_popup_delay_ms(delay_ms);
     }
 
     fn lazy_fetch_batch_size(&self) -> usize {

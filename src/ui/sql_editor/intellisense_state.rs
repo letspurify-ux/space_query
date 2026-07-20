@@ -220,6 +220,7 @@ pub(crate) struct IntellisenseRuntimeState {
     keyup_debounce_handle: Arc<Mutex<Option<crate::ui::ui_timeout::TimeoutHandle>>>,
     cached_db_type: Arc<AtomicU8>,
     context_window_bytes: Arc<AtomicUsize>,
+    popup_delay_ms: Arc<AtomicUsize>,
     session_state: Arc<Mutex<crate::db::SessionState>>,
     parse_worker: Arc<LatestTaskWorker>,
 }
@@ -248,6 +249,9 @@ impl IntellisenseRuntimeState {
                 crate::utils::AppConfig::intellisense_context_window_bytes(
                     crate::utils::DEFAULT_INTELLISENSE_CONTEXT_WINDOW_KIB,
                 ),
+            )),
+            popup_delay_ms: Arc::new(AtomicUsize::new(
+                crate::utils::DEFAULT_INTELLISENSE_POPUP_DELAY_MS as usize,
             )),
             session_state: Arc::new(Mutex::new(crate::db::SessionState::default())),
             parse_worker: Arc::new(LatestTaskWorker::new()),
@@ -283,6 +287,16 @@ impl IntellisenseRuntimeState {
             self.clear_parse_cache();
             self.clear_routine_symbol_cache();
         }
+    }
+
+    pub(crate) fn popup_delay_ms(&self) -> u32 {
+        self.popup_delay_ms.load(Ordering::Relaxed) as u32
+    }
+
+    pub(crate) fn set_popup_delay_ms(&self, delay_ms: u32) {
+        let delay_ms = crate::utils::AppConfig::clamp_intellisense_popup_delay_ms(delay_ms);
+        self.popup_delay_ms
+            .store(delay_ms as usize, Ordering::Relaxed);
     }
 
     pub(crate) fn completion_range(&self) -> Option<IntellisenseCompletionRange> {
@@ -640,6 +654,20 @@ mod tests {
         assert_eq!(runtime.current_parse_generation(), 1);
         runtime.set_context_window_bytes(configured);
         assert_eq!(runtime.current_parse_generation(), 1);
+    }
+
+    #[test]
+    fn popup_delay_setting_defaults_to_250_ms_and_updates_at_runtime() {
+        let runtime = IntellisenseRuntimeState::new();
+
+        assert_eq!(
+            runtime.popup_delay_ms(),
+            crate::utils::DEFAULT_INTELLISENSE_POPUP_DELAY_MS
+        );
+
+        runtime.set_popup_delay_ms(400);
+
+        assert_eq!(runtime.popup_delay_ms(), 400);
     }
 
     #[test]

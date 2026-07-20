@@ -20,8 +20,9 @@ use crate::ui::constants::*;
 use crate::ui::{available_font_names, center_on_main, theme};
 use crate::utils::{
     AppConfig, SqlCommaListLayout, MAX_CANCEL_TIMEOUT_SECONDS, MAX_CONNECTION_POOL_SIZE,
-    MAX_INTELLISENSE_CONTEXT_WINDOW_KIB, MAX_LAZY_FETCH_BATCH_SIZE, MAX_SQL_FORMAT_RIGHT_MARGIN,
-    MIN_CANCEL_TIMEOUT_SECONDS, MIN_CONNECTION_POOL_SIZE, MIN_INTELLISENSE_CONTEXT_WINDOW_KIB,
+    MAX_INTELLISENSE_CONTEXT_WINDOW_KIB, MAX_INTELLISENSE_POPUP_DELAY_MS,
+    MAX_LAZY_FETCH_BATCH_SIZE, MAX_SQL_FORMAT_RIGHT_MARGIN, MIN_CANCEL_TIMEOUT_SECONDS,
+    MIN_CONNECTION_POOL_SIZE, MIN_INTELLISENSE_CONTEXT_WINDOW_KIB, MIN_INTELLISENSE_POPUP_DELAY_MS,
     MIN_LAZY_FETCH_BATCH_SIZE, MIN_SQL_FORMAT_RIGHT_MARGIN,
 };
 
@@ -33,6 +34,7 @@ pub struct FontSettings {
     pub result_cell_max_chars: u32,
     pub lazy_fetch_batch_size: u32,
     pub intellisense_context_window_kib: u32,
+    pub intellisense_popup_delay_ms: u32,
     pub connection_pool_size: u32,
     pub cancel_timeout_seconds: u32,
     pub sql_comma_list_layout: SqlCommaListLayout,
@@ -107,6 +109,24 @@ fn validate_intellisense_context_window_kib(value: &str) -> Option<u32> {
             crate::ui::alert_on_main(&format!(
                 "IntelliSense context must be a number between {} and {} KiB.",
                 MIN_INTELLISENSE_CONTEXT_WINDOW_KIB, MAX_INTELLISENSE_CONTEXT_WINDOW_KIB
+            ));
+            None
+        }
+    }
+}
+
+fn validate_intellisense_popup_delay_ms(value: &str) -> Option<u32> {
+    match value.trim().parse::<u32>() {
+        Ok(delay_ms)
+            if (MIN_INTELLISENSE_POPUP_DELAY_MS..=MAX_INTELLISENSE_POPUP_DELAY_MS)
+                .contains(&delay_ms) =>
+        {
+            Some(delay_ms)
+        }
+        _ => {
+            crate::ui::alert_on_main(&format!(
+                "IntelliSense popup delay must be a number between {} and {} milliseconds.",
+                MIN_INTELLISENSE_POPUP_DELAY_MS, MAX_INTELLISENSE_POPUP_DELAY_MS
             ));
             None
         }
@@ -442,6 +462,26 @@ pub fn show_settings_dialog(config: &AppConfig) -> Option<FontSettings> {
     context_window_hint.set_label_color(theme::text_secondary());
     intellisense_flex.fixed(&context_window_hint, LABEL_ROW_HEIGHT);
 
+    let mut popup_delay_row = Flex::default().with_size(0, INPUT_ROW_HEIGHT);
+    popup_delay_row.set_type(FlexType::Row);
+    popup_delay_row.set_spacing(DIALOG_SPACING);
+    let mut popup_delay_label = Frame::default().with_label("Popup Delay:");
+    popup_delay_label.set_label_color(theme::text_primary());
+    popup_delay_row.fixed(&popup_delay_label, FORM_LABEL_WIDTH);
+    let mut popup_delay_input = IntInput::default();
+    popup_delay_input.set_value(&config.normalized_intellisense_popup_delay_ms().to_string());
+    popup_delay_input.set_color(theme::input_bg());
+    popup_delay_input.set_text_color(theme::text_primary());
+    popup_delay_row.end();
+    intellisense_flex.fixed(&popup_delay_row, INPUT_ROW_HEIGHT);
+
+    let mut popup_delay_hint = Frame::default().with_label(&format!(
+        "Popup delay: {} ~ {} ms",
+        MIN_INTELLISENSE_POPUP_DELAY_MS, MAX_INTELLISENSE_POPUP_DELAY_MS
+    ));
+    popup_delay_hint.set_label_color(theme::text_secondary());
+    intellisense_flex.fixed(&popup_delay_hint, LABEL_ROW_HEIGHT);
+
     let intellisense_filler = Frame::default();
     intellisense_flex.resizable(&intellisense_filler);
     intellisense_flex.end();
@@ -677,6 +717,7 @@ pub fn show_settings_dialog(config: &AppConfig) -> Option<FontSettings> {
     let result_cell_max_input_ok = result_cell_max_input.clone();
     let lazy_fetch_batch_input_ok = lazy_fetch_batch_input.clone();
     let context_window_input_ok = context_window_input.clone();
+    let popup_delay_input_ok = popup_delay_input.clone();
     let pool_size_input_ok = pool_size_input.clone();
     let cancel_timeout_input_ok = cancel_timeout_input.clone();
     let comma_layout_choice_ok = comma_layout_choice.clone();
@@ -708,6 +749,11 @@ pub fn show_settings_dialog(config: &AppConfig) -> Option<FontSettings> {
         let intellisense_context_window_kib =
             match validate_intellisense_context_window_kib(&context_window_input_ok.value()) {
                 Some(size) => size,
+                None => return,
+            };
+        let intellisense_popup_delay_ms =
+            match validate_intellisense_popup_delay_ms(&popup_delay_input_ok.value()) {
+                Some(delay_ms) => delay_ms,
                 None => return,
             };
         let connection_pool_size = match validate_connection_pool_size(&pool_size_input_ok.value())
@@ -749,6 +795,7 @@ pub fn show_settings_dialog(config: &AppConfig) -> Option<FontSettings> {
             result_cell_max_chars,
             lazy_fetch_batch_size,
             intellisense_context_window_kib,
+            intellisense_popup_delay_ms,
             connection_pool_size,
             cancel_timeout_seconds,
             sql_comma_list_layout,

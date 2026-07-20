@@ -33,7 +33,6 @@ use super::intellisense_state::IntellisenseCancellation;
 use super::*;
 
 const MAX_MERGED_SUGGESTIONS: usize = 100;
-const KEYUP_INTELLISENSE_DEBOUNCE_MS: u64 = 1;
 // One physical press may dispatch both KeyDown and Shortcut. A missing KeyUp
 // must not keep suppressing later presses indefinitely.
 const CTRL_ENTER_DUPLICATE_WINDOW: Duration = Duration::from_millis(100);

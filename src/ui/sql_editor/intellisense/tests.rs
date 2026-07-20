@@ -9742,11 +9742,6 @@ fn min_intellisense_prefix_uses_character_count() {
 }
 
 #[test]
-fn keyup_intellisense_debounce_is_one_millisecond() {
-    assert_eq!(KEYUP_INTELLISENSE_DEBOUNCE_MS, 1);
-}
-
-#[test]
 fn fast_path_delete_hides_popup_when_prefix_too_short_without_qualifier() {
     assert!(SqlEditorWidget::should_hide_fast_path_after_delete(
         "",

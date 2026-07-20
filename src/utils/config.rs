@@ -24,6 +24,9 @@ pub const MAX_LAZY_FETCH_BATCH_SIZE: u32 = 10_000;
 pub const DEFAULT_INTELLISENSE_CONTEXT_WINDOW_KIB: u32 = 16;
 pub const MIN_INTELLISENSE_CONTEXT_WINDOW_KIB: u32 = 8;
 pub const MAX_INTELLISENSE_CONTEXT_WINDOW_KIB: u32 = 4 * 1024;
+pub const DEFAULT_INTELLISENSE_POPUP_DELAY_MS: u32 = 250;
+pub const MIN_INTELLISENSE_POPUP_DELAY_MS: u32 = 0;
+pub const MAX_INTELLISENSE_POPUP_DELAY_MS: u32 = 5_000;
 pub const DEFAULT_CANCEL_TIMEOUT_SECONDS: u32 = 60;
 pub const MIN_CANCEL_TIMEOUT_SECONDS: u32 = 1;
 pub const MAX_CANCEL_TIMEOUT_SECONDS: u32 = 120;
@@ -53,6 +56,7 @@ pub struct AppConfig {
     pub result_cell_max_chars: u32,
     pub lazy_fetch_batch_size: u32,
     pub intellisense_context_window_kib: u32,
+    pub intellisense_popup_delay_ms: u32,
     pub max_rows: u32,
     pub auto_commit: bool,
     pub connection_pool_size: u32,
@@ -91,6 +95,7 @@ impl AppConfig {
             result_cell_max_chars: DEFAULT_RESULT_CELL_MAX_CHARS,
             lazy_fetch_batch_size: DEFAULT_LAZY_FETCH_BATCH_SIZE,
             intellisense_context_window_kib: DEFAULT_INTELLISENSE_CONTEXT_WINDOW_KIB,
+            intellisense_popup_delay_ms: DEFAULT_INTELLISENSE_POPUP_DELAY_MS,
             max_rows: 1000,
             auto_commit: false,
             connection_pool_size: DEFAULT_CONNECTION_POOL_SIZE,
@@ -133,6 +138,17 @@ impl AppConfig {
 
     pub fn normalized_intellisense_context_window_bytes(&self) -> usize {
         Self::intellisense_context_window_bytes(self.intellisense_context_window_kib)
+    }
+
+    pub fn clamp_intellisense_popup_delay_ms(delay_ms: u32) -> u32 {
+        delay_ms.clamp(
+            MIN_INTELLISENSE_POPUP_DELAY_MS,
+            MAX_INTELLISENSE_POPUP_DELAY_MS,
+        )
+    }
+
+    pub fn normalized_intellisense_popup_delay_ms(&self) -> u32 {
+        Self::clamp_intellisense_popup_delay_ms(self.intellisense_popup_delay_ms)
     }
 
     pub fn clamp_cancel_timeout_seconds(seconds: u32) -> u32 {
@@ -510,6 +526,14 @@ mod tests {
     }
 
     #[test]
+    fn app_config_defaults_intellisense_popup_delay_to_250_ms() {
+        assert_eq!(
+            AppConfig::new().intellisense_popup_delay_ms,
+            super::DEFAULT_INTELLISENSE_POPUP_DELAY_MS
+        );
+    }
+
+    #[test]
     fn app_config_defaults_result_cell_max_chars_to_one_hundred_fifty() {
         assert_eq!(
             AppConfig::new().result_cell_max_chars,
@@ -586,6 +610,13 @@ mod tests {
     }
 
     #[test]
+    fn app_config_clamps_intellisense_popup_delay_to_supported_range() {
+        assert_eq!(AppConfig::clamp_intellisense_popup_delay_ms(0), 0);
+        assert_eq!(AppConfig::clamp_intellisense_popup_delay_ms(250), 250);
+        assert_eq!(AppConfig::clamp_intellisense_popup_delay_ms(10_000), 5_000);
+    }
+
+    #[test]
     fn app_config_clamps_cancel_timeout_to_supported_range() {
         assert_eq!(AppConfig::clamp_cancel_timeout_seconds(0), 1);
         assert_eq!(AppConfig::clamp_cancel_timeout_seconds(30), 30);
@@ -628,6 +659,10 @@ mod tests {
         assert_eq!(
             restored.intellisense_context_window_kib,
             super::DEFAULT_INTELLISENSE_CONTEXT_WINDOW_KIB
+        );
+        assert_eq!(
+            restored.intellisense_popup_delay_ms,
+            super::DEFAULT_INTELLISENSE_POPUP_DELAY_MS
         );
         assert_eq!(
             restored.cancel_timeout_seconds,
@@ -741,6 +776,7 @@ mod tests {
         config.connection_pool_size = 8;
         config.lazy_fetch_batch_size = 500;
         config.intellisense_context_window_kib = 256;
+        config.intellisense_popup_delay_ms = 400;
         config.cancel_timeout_seconds = 9;
         config.recent_connections.push(ConnectionInfo {
             name: "prod".to_string(),
@@ -759,6 +795,7 @@ mod tests {
         assert!(serialized.contains("\"connection_pool_size\":8"));
         assert!(serialized.contains("\"lazy_fetch_batch_size\":500"));
         assert!(serialized.contains("\"intellisense_context_window_kib\":256"));
+        assert!(serialized.contains("\"intellisense_popup_delay_ms\":400"));
         assert!(serialized.contains("\"cancel_timeout_seconds\":9"));
         assert!(!serialized.contains("secret"));
         assert!(!serialized.contains("debug_oracle_thin_protocol_version"));

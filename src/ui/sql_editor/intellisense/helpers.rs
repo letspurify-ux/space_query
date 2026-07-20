@@ -1115,7 +1115,7 @@ impl SqlEditorWidget {
         let column_sender_for_timeout = column_sender.clone();
         let connection_for_timeout = connection.clone();
         let handle = crate::ui::ui_timeout::schedule(
-            Duration::from_millis(KEYUP_INTELLISENSE_DEBOUNCE_MS).as_secs_f64(),
+            Duration::from_millis(runtime.popup_delay_ms() as u64).as_secs_f64(),
             move || {
                 runtime_for_timeout.take_keyup_timeout_handle();
 
