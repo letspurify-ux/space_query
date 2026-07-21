@@ -1356,24 +1356,6 @@ impl SqlEditorWidget {
                         shift,
                         char_before_cursor,
                     );
-                    let signature_delimiter_changed = buffer_changed_since_keydown
-                        && (event_text.chars().any(|ch| matches!(ch, '(' | ')' | ','))
-                            || typed_char.is_some_and(|ch| matches!(ch, '(' | ')' | ','))
-                            || char_before_cursor.is_some_and(|ch| matches!(ch, '(' | ')' | ',')));
-                    let signature_keyword_changed = buffer_changed_since_keydown
-                        && char_before_cursor.is_some_and(|ch| {
-                            matches!(ch, 'g' | 'm' | 'n' | 'r' | 's' | 'G' | 'M' | 'N' | 'R' | 'S')
-                        })
-                        && {
-                            let recent_start = cursor_pos.saturating_sub(6);
-                            let recent = buffer_for_handle
-                                .text_range(recent_start, cursor_pos)
-                                .unwrap_or_default();
-                            Self::ends_with_signature_separator_keyword(&recent)
-                                && widget_for_shortcuts.signature_popup_is_visible()
-                        };
-                    let signature_structure_changed =
-                        signature_delimiter_changed || signature_keyword_changed;
                     if Self::is_modifier_key(key) {
                         return false;
                     }
@@ -1390,11 +1372,7 @@ impl SqlEditorWidget {
 
                     if shortcut_modified {
                         if buffer_changed_since_keydown
-                            || Self::should_refresh_signature_hint_after_keyup(
-                                false,
-                                key,
-                                false,
-                            )
+                            || Self::should_refresh_signature_hint_after_keyup(false, key)
                         {
                             widget_for_shortcuts.schedule_signature_hint_update();
                         }
@@ -1410,13 +1388,14 @@ impl SqlEditorWidget {
                         return false;
                     }
 
-                    // Argument context changes on delimiters, deletion, and
-                    // caret movement. Ordinary parameter text cannot change
-                    // the active argument, so keep it off the UI-thread parser.
+                    // Re-evaluate the signature on any buffer change or caret
+                    // movement. The parse is bounded and coalesced, so running
+                    // it every keystroke keeps the popup self-healing: a missed
+                    // '(' event recovers on the next key instead of leaving the
+                    // hint permanently off.
                     if Self::should_refresh_signature_hint_after_keyup(
                         buffer_changed_since_keydown,
                         key,
-                        signature_structure_changed,
                     ) {
                         widget_for_shortcuts.schedule_signature_hint_update();
                     }

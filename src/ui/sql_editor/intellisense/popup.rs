@@ -344,23 +344,6 @@ impl SqlEditorWidget {
         Ok(args.map(|args| Self::build_signature_label(name, &args)))
     }
 
-    pub(crate) fn signature_popup_is_visible(&self) -> bool {
-        if matches!(
-            self.intellisense_runtime.signature_popup_transition_state(),
-            IntellisensePopupTransitionState::Showing
-        ) {
-            return true;
-        }
-        match self.signature_popup.try_lock() {
-            Ok(popup) => popup.is_visible(),
-            Err(std::sync::TryLockError::Poisoned(poisoned)) => poisoned.into_inner().is_visible(),
-            Err(std::sync::TryLockError::WouldBlock) => matches!(
-                self.intellisense_runtime.signature_popup_transition_state(),
-                IntellisensePopupTransitionState::Showing
-            ),
-        }
-    }
-
     pub(crate) fn hide_signature_popup(&self) {
         let generation = self
             .intellisense_runtime

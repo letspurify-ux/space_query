@@ -589,10 +589,6 @@ impl IntellisenseRuntimeState {
         store_popup_transition_state(&self.popup_show_in_progress, state);
     }
 
-    pub(crate) fn signature_popup_transition_state(&self) -> IntellisensePopupTransitionState {
-        load_popup_transition_state(&self.signature_popup_show_in_progress)
-    }
-
     pub(crate) fn set_signature_popup_transition_state(
         &self,
         state: IntellisensePopupTransitionState,

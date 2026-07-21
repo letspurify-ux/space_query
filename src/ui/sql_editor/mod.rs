@@ -3179,6 +3179,7 @@ impl SqlEditorWidget {
         let execute_callback = self.execute_callback.clone();
         let cancel_flag = self.cancel_flag.clone();
         let lifecycle_group = self.group.clone();
+        let intellisense_data = self.intellisense_data.clone();
 
         // Wrap receiver in Arc<Mutex> to share across timeout callbacks
         let receiver: Arc<Mutex<mpsc::Receiver<QueryProgress>>> =
@@ -3191,6 +3192,7 @@ impl SqlEditorWidget {
             execute_callback: Arc<Mutex<Option<Box<dyn FnMut(&QueryResult)>>>>,
             cancel_flag: Arc<Mutex<bool>>,
             lifecycle_group: Flex,
+            intellisense_data: Arc<Mutex<IntellisenseData>>,
         ) {
             if lifecycle_group.was_deleted() {
                 return;
@@ -3235,6 +3237,21 @@ impl SqlEditorWidget {
                                 timed_out,
                                 ..
                             } => {
+                                // Routine metadata (and therefore cached
+                                // signature hints) can change after DDL or a
+                                // schema switch; drop the cache so the next
+                                // hint re-fetches instead of showing stale or
+                                // negative results forever.
+                                if result.success
+                                    && SqlEditorWidget::statement_may_change_routine_signatures(
+                                        &result.sql,
+                                    )
+                                {
+                                    intellisense_data
+                                        .lock()
+                                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                                        .clear_signature_cache();
+                                }
                                 if *timed_out {
                                     SqlEditorWidget::show_alert_dialog(&format!(
                                         "Query timed out!\n\n{}",
@@ -3310,6 +3327,7 @@ impl SqlEditorWidget {
                     execute_callback.clone(),
                     cancel_flag.clone(),
                     lifecycle_group.clone(),
+                    intellisense_data.clone(),
                 );
             });
         }
@@ -3322,7 +3340,18 @@ impl SqlEditorWidget {
             execute_callback,
             cancel_flag,
             lifecycle_group,
+            intellisense_data,
         );
+    }
+
+    /// Whether a successfully executed statement can invalidate cached routine
+    /// signatures: DDL (CREATE/DROP/ALTER) changes routine definitions, and a
+    /// schema switch (USE, ALTER SESSION) changes how unqualified names resolve.
+    fn statement_may_change_routine_signatures(sql: &str) -> bool {
+        matches!(
+            QueryExecutor::leading_keyword(sql).as_deref(),
+            Some("CREATE") | Some("DROP") | Some("ALTER") | Some("USE")
+        )
     }
 
     fn handle_progress_channel_disconnected(
@@ -5415,6 +5444,34 @@ mod execution_state_tests {
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         assert_eq!(callbacks.len(), 1);
         assert!(matches!(callbacks[0], QueryProgress::BatchFinished));
+    }
+
+    #[test]
+    fn statement_may_change_routine_signatures_covers_ddl_and_schema_switch() {
+        for sql in [
+            "CREATE OR REPLACE PROCEDURE p AS BEGIN NULL; END;",
+            "drop procedure p",
+            "ALTER SESSION SET CURRENT_SCHEMA = hr",
+            "USE other_db",
+            "/* note */ CREATE FUNCTION f() RETURNS INT RETURN 1",
+        ] {
+            assert!(
+                SqlEditorWidget::statement_may_change_routine_signatures(sql),
+                "{sql:?} must invalidate cached signatures"
+            );
+        }
+        for sql in [
+            "SELECT * FROM t",
+            "INSERT INTO t VALUES (1)",
+            "UPDATE t SET a = 1",
+            "CALL p()",
+            "COMMIT",
+        ] {
+            assert!(
+                !SqlEditorWidget::statement_may_change_routine_signatures(sql),
+                "{sql:?} must keep cached signatures"
+            );
+        }
     }
 
     #[test]

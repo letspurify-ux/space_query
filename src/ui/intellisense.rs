@@ -2131,6 +2131,15 @@ impl IntellisenseData {
         self.signature_pending.remove(key);
     }
 
+    /// Drop every cached signature so the next hint re-fetches from the
+    /// database (used after statements that can change routine metadata,
+    /// e.g. CREATE OR REPLACE or a schema switch).
+    pub fn clear_signature_cache(&mut self) {
+        self.signature_cache.clear();
+        self.signature_cache_order.clear();
+        self.signature_pending.clear();
+    }
+
     pub fn mark_columns_loading(&mut self, table_name: &str) -> bool {
         let key = table_name.to_uppercase();
         if self.columns.contains_key(&key) || self.columns_loading.contains(&key) {
@@ -4297,7 +4306,7 @@ pub(crate) fn enclosing_call_at_cursor_with_lexical_mode(
 
     let frame = stack.pop()?;
     let (name, qualifier) = dotted_reference_before(text, frame.open)?;
-    if is_non_call_keyword(&name) {
+    if is_non_call_keyword(&name, mysql_compatible) {
         return None;
     }
     Some(EnclosingCall {
@@ -4390,7 +4399,7 @@ pub(crate) fn call_argument_index_with_separator_keywords(
 /// Clause/operator keywords that introduce a grouping or subquery parenthesis
 /// rather than a routine call. The general keyword list is unusable here
 /// because it also contains built-in functions (DECODE, NVL, TO_CHAR, ...).
-fn is_non_call_keyword(name: &str) -> bool {
+fn is_non_call_keyword(name: &str, mysql_compatible: bool) -> bool {
     const NON_CALL_KEYWORDS: &[&str] = &[
         "SELECT",
         "WHERE",
@@ -4440,6 +4449,12 @@ fn is_non_call_keyword(name: &str) -> bool {
         "WITH",
     ];
     let upper = name.to_uppercase();
+    // MySQL/MariaDB document IF() and VALUES() as callable functions with
+    // catalog signatures; only the other dialects use them purely as
+    // statement keywords.
+    if mysql_compatible && matches!(upper.as_str(), "IF" | "VALUES") {
+        return false;
+    }
     NON_CALL_KEYWORDS.contains(&upper.as_str())
 }
 
@@ -5476,6 +5491,38 @@ mod intellisense_tests {
     #[test]
     fn enclosing_call_none_for_bare_grouping_paren() {
         assert!(call_at("SELECT (a + |) FROM t").is_none());
+    }
+
+    #[test]
+    fn enclosing_call_accepts_mysql_if_and_values_functions() {
+        for (text, name) in [("SELECT IF(a > b, ", "IF"), ("SET c = VALUES(", "VALUES")] {
+            let call = enclosing_call_at_cursor_with_lexical_mode(
+                text,
+                text.len(),
+                true,
+                crate::sql_parser_engine::LexMode::Idle,
+            )
+            .unwrap_or_else(|| panic!("{name}( must be a call in MySQL mode"));
+            assert_eq!(call.name.to_uppercase(), name);
+        }
+    }
+
+    #[test]
+    fn enclosing_call_rejects_if_and_values_keywords_outside_mysql() {
+        for text in ["IF (a > b|) THEN", "INSERT INTO t VALUES (1, |"] {
+            let cursor = text.find('|').unwrap_or(text.len());
+            let text = text.replace('|', "");
+            assert!(
+                enclosing_call_at_cursor_with_lexical_mode(
+                    &text,
+                    cursor,
+                    false,
+                    crate::sql_parser_engine::LexMode::Idle,
+                )
+                .is_none(),
+                "{text:?} must not be a call outside MySQL mode"
+            );
+        }
     }
 
     #[test]
@@ -6910,6 +6957,28 @@ BEGIN
         assert!(data
             .cached_signature(&format!("PROC_{MAX_SIGNATURE_CACHE_ENTRIES}"))
             .is_some());
+    }
+
+    #[test]
+    fn clear_signature_cache_drops_cached_pending_and_negative_entries() {
+        let mut data = IntellisenseData::new();
+        data.set_signature(
+            "MY_PROC".to_string(),
+            Some(SignatureLabel {
+                text: "MY_PROC(a)".to_string(),
+                arg_spans: Vec::new(),
+                overloads: Vec::new(),
+            }),
+        );
+        data.set_signature("MISSING_PROC".to_string(), None);
+        assert!(data.mark_signature_pending("PENDING_PROC"));
+
+        data.clear_signature_cache();
+
+        assert!(data.cached_signature("MY_PROC").is_none());
+        assert!(data.cached_signature("MISSING_PROC").is_none());
+        // A cleared pending flag lets the next hint start a fresh fetch.
+        assert!(data.mark_signature_pending("PENDING_PROC"));
     }
 
     #[test]
