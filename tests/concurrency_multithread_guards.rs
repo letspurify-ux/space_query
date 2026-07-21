@@ -2145,6 +2145,8 @@ fn intellisense_and_signature_popups_follow_window_and_click_lifecycle() {
     let lifecycle_events = &main_window[handler_start..keydown_start];
     assert!(lifecycle_events.contains("fltk::enums::Event::Resize"));
     assert!(lifecycle_events.contains("hide_all_intellisense_popups"));
+    assert!(lifecycle_events.contains("hide_intellisense_popup_after_focus_settles"));
+    assert!(!lifecycle_events.contains("try_hide_intellisense_popup"));
     assert!(!lifecycle_events.contains("fltk::enums::Event::Move"));
 
     let hide_all_start = main_window
@@ -2178,6 +2180,39 @@ fn intellisense_and_signature_popups_follow_window_and_click_lifecycle() {
         .expect("editor push handler should exist");
     let editor_push = &editor_runtime[editor_push_start..];
     assert!(editor_push.contains("widget_for_shortcuts.hide_signature_popup()"));
+
+    let intellisense = read_source("src/ui/intellisense.rs");
+    let completion_popup_start = intellisense
+        .find("pub struct IntellisensePopup")
+        .expect("completion popup state should exist");
+    let signature_popup_start = intellisense
+        .find("pub struct SignaturePopup")
+        .expect("signature popup state should follow completion popup state");
+    let completion_popup = &intellisense[completion_popup_start..signature_popup_start];
+    assert!(completion_popup.contains("!self.is_deleted() && self.window.shown()"));
+    assert!(!completion_popup.contains("PopupState"));
+}
+
+#[test]
+fn signature_popup_is_painted_after_editor_contents() {
+    let runtime = read_source("src/ui/sql_editor/intellisense/runtime.rs");
+    assert!(runtime.contains("editor.draw(move |ed|"));
+    assert!(runtime.contains("popup.draw_overlay(ed)"));
+    assert!(runtime.contains("editor.super_draw_first(true)"));
+
+    let intellisense = read_source("src/ui/intellisense.rs");
+    let popup_start = intellisense
+        .find("pub struct SignaturePopup")
+        .expect("signature popup state should exist");
+    let popup_end = intellisense[popup_start..]
+        .find("impl Default for SignaturePopup")
+        .map(|offset| popup_start + offset)
+        .expect("signature popup default implementation should follow its renderer");
+    let popup = &intellisense[popup_start..popup_end];
+    assert!(popup.contains("fn draw_overlay(&self, editor: &TextEditor)"));
+    assert!(popup.contains("fltk::draw::push_no_clip()"));
+    assert!(!popup.contains("frame: Option<Frame>"));
+    assert!(!popup.contains("fltk::app::add_check"));
 }
 
 #[test]

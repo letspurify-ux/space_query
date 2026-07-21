@@ -2350,22 +2350,41 @@ impl SqlEditorWidget {
         popup_visible && !pointer_inside_popup
     }
 
+    fn popup_unfocus_hide_is_settled(
+        editor_has_stable_focus: bool,
+        transition: IntellisensePopupTransitionState,
+        retries_left: u8,
+    ) -> bool {
+        !editor_has_stable_focus
+            && matches!(transition, IntellisensePopupTransitionState::Idle)
+            && retries_left == 0
+    }
+
     fn schedule_deferred_unfocus_popup_hide(
         editor: TextEditor,
         intellisense_popup: Arc<Mutex<IntellisensePopup>>,
         runtime: Arc<IntellisenseRuntimeState>,
         pointer_x: i32,
         pointer_y: i32,
+        preserve_while_pointer_inside: bool,
         retries_left: u8,
     ) {
-        crate::ui::ui_timeout::schedule(0.0, move || {
+        const POPUP_UNFOCUS_RECHECK_SECONDS: f64 = 0.05;
+
+        crate::ui::ui_timeout::schedule(POPUP_UNFOCUS_RECHECK_SECONDS, move || {
             if editor.was_deleted() {
                 return;
             }
 
-            if matches!(
-                runtime.popup_transition_state(),
-                IntellisensePopupTransitionState::Showing
+            let transition = runtime.popup_transition_state();
+            let editor_has_stable_focus = editor.has_focus() && editor.active_r();
+            if editor_has_stable_focus {
+                return;
+            }
+            if !Self::popup_unfocus_hide_is_settled(
+                editor_has_stable_focus,
+                transition,
+                retries_left,
             ) {
                 if retries_left > 0 {
                     Self::schedule_deferred_unfocus_popup_hide(
@@ -2374,20 +2393,19 @@ impl SqlEditorWidget {
                         runtime.clone(),
                         pointer_x,
                         pointer_y,
+                        preserve_while_pointer_inside,
                         retries_left - 1,
                     );
                 }
-                return;
-            }
-
-            if editor.has_focus() {
                 return;
             }
             let mut popup = intellisense_popup
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
             let popup_visible = popup.is_visible();
-            let pointer_inside_popup = popup_visible && popup.contains_point(pointer_x, pointer_y);
+            let pointer_inside_popup = preserve_while_pointer_inside
+                && popup_visible
+                && popup.contains_point(pointer_x, pointer_y);
             if !Self::should_hide_popup_on_unfocus(popup_visible, pointer_inside_popup) {
                 return;
             }

@@ -8650,13 +8650,13 @@ impl MainWindow {
                     // A genuine deactivate (app switch) must hide the popups,
                     // but the completion popup window becoming macOS's key
                     // window can also deactivate the main window for a moment.
-                    // Hide the signature hint only after focus settles; the
-                    // completion popups keep their existing synchronous hide.
+                    // Let focus settle before hiding either popup so that the
+                    // completion window cannot close itself while being shown.
                     if let Ok(s) = state_for_window.try_lock() {
-                        s.sql_editor.try_hide_intellisense_popup();
+                        s.sql_editor.hide_intellisense_popup_after_focus_settles();
                         s.sql_editor.hide_signature_popup_after_focus_settles();
                         for tab in &s.editor_tabs {
-                            tab.sql_editor.try_hide_intellisense_popup();
+                            tab.sql_editor.hide_intellisense_popup_after_focus_settles();
                             tab.sql_editor.hide_signature_popup_after_focus_settles();
                         }
                     }

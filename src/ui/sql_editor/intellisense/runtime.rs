@@ -426,6 +426,20 @@ impl SqlEditorWidget {
         let navigation_keyup_state = Arc::new(Mutex::new(NavigationKeyupState::Idle));
         let intellisense_runtime = self.intellisense_runtime.clone();
 
+        // Paint the signature after TextEditor draws its text. Keeping the
+        // hint in the editor's draw pass gives it deterministic z-order across
+        // typing and syntax-highlight redraws without creating a focusable
+        // popup window.
+        let signature_popup_for_draw = self.signature_popup.clone();
+        editor.draw(move |ed| match signature_popup_for_draw.try_lock() {
+            Ok(popup) => popup.draw_overlay(ed),
+            Err(std::sync::TryLockError::Poisoned(poisoned)) => {
+                poisoned.into_inner().draw_overlay(ed);
+            }
+            Err(std::sync::TryLockError::WouldBlock) => {}
+        });
+        editor.super_draw_first(true);
+
         // Setup callback for inserting selected text
         let mut buffer_for_insert = buffer.clone();
         let mut editor_for_insert = editor.clone();
@@ -1753,6 +1767,7 @@ impl SqlEditorWidget {
                             intellisense_runtime_for_handle.clone(),
                             unfocus_x,
                             unfocus_y,
+                            true,
                             INTELLISENSE_DEFERRED_HIDE_RETRIES,
                         );
                         return false;

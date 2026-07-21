@@ -354,11 +354,16 @@ impl SqlEditorWidget {
             Self::try_hide_signature_popup_now(&self.signature_popup)
         }) {
             Some(false) => {}
-            Some(true) | None => return,
+            Some(true) => {
+                Self::redraw_signature_overlay(&self.editor);
+                return;
+            }
+            None => return,
         }
         Self::schedule_deferred_signature_popup_hide(
             self.signature_popup.clone(),
             self.intellisense_runtime.clone(),
+            self.editor.clone(),
             generation,
         );
     }
@@ -382,7 +387,7 @@ impl SqlEditorWidget {
             if widget.editor.was_deleted() {
                 return;
             }
-            if widget.editor.has_focus() {
+            if widget.editor.has_focus() && widget.editor.active_r() {
                 return;
             }
             if retries_left > 0 {
@@ -407,24 +412,38 @@ impl SqlEditorWidget {
     fn schedule_deferred_signature_popup_hide(
         signature_popup: Arc<Mutex<SignaturePopup>>,
         runtime: Arc<IntellisenseRuntimeState>,
+        editor: TextEditor,
         generation: u64,
     ) {
         crate::ui::ui_timeout::schedule(SIGNATURE_POPUP_LOCK_RETRY_SECONDS, move || {
-            if !runtime.is_current_signature_popup_request(generation) {
+            if editor.was_deleted() || !runtime.is_current_signature_popup_request(generation) {
                 return;
             }
             match Self::catch_signature_popup_action(|| {
                 Self::try_hide_signature_popup_now(&signature_popup)
             }) {
                 Some(false) => {}
-                Some(true) | None => return,
+                Some(true) => {
+                    Self::redraw_signature_overlay(&editor);
+                    return;
+                }
+                None => return,
             }
             Self::schedule_deferred_signature_popup_hide(
                 signature_popup.clone(),
                 runtime.clone(),
+                editor.clone(),
                 generation,
             );
         });
+    }
+
+    fn redraw_signature_overlay(editor: &TextEditor) {
+        if editor.was_deleted() {
+            return;
+        }
+        let mut editor = editor.clone();
+        editor.redraw();
     }
 
     fn try_show_signature_popup_now(
@@ -443,6 +462,7 @@ impl SqlEditorWidget {
             }
             Err(std::sync::TryLockError::WouldBlock) => return false,
         }
+        Self::redraw_signature_overlay(editor);
         true
     }
 
@@ -907,6 +927,21 @@ impl SqlEditorWidget {
         popup.hide();
         drop(popup);
         Self::clear_intellisense_state_for_external_hide(&self.intellisense_runtime);
+    }
+
+    /// Deactivation can be a transient side effect of showing the completion
+    /// window on macOS. Wait for focus to settle before treating it as a real
+    /// focus loss.
+    pub(crate) fn hide_intellisense_popup_after_focus_settles(&self) {
+        Self::schedule_deferred_unfocus_popup_hide(
+            self.editor.clone(),
+            self.intellisense_popup.clone(),
+            self.intellisense_runtime.clone(),
+            fltk::app::event_x_root(),
+            fltk::app::event_y_root(),
+            false,
+            INTELLISENSE_DEFERRED_HIDE_RETRIES,
+        );
     }
 
     fn can_try_hide_intellisense_popup(state: IntellisensePopupTransitionState) -> bool {

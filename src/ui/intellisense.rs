@@ -1,6 +1,6 @@
 use crate::sql_text;
 use crate::ui::theme;
-use fltk::{browser::HoldBrowser, frame::Frame, prelude::*, text::TextEditor, window::Window};
+use fltk::{browser::HoldBrowser, prelude::*, text::TextEditor, window::Window};
 use std::any::Any;
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -2683,7 +2683,6 @@ pub struct IntellisensePopup {
     /// itself remains the inserted value; this only enriches rendering.
     descriptions: Arc<Mutex<HashMap<String, SuggestionDetail>>>,
     selected_callback: Arc<Mutex<Option<Box<dyn FnMut(String)>>>>,
-    state: Arc<Mutex<PopupState>>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -2694,12 +2693,6 @@ struct SuggestionPresentation {
     badge_width: i32,
     has_type: bool,
     has_badge: bool,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum PopupState {
-    Hidden,
-    Visible,
 }
 
 #[derive(Debug, Default)]
@@ -2737,12 +2730,6 @@ impl PopupPointerGesture {
 
     fn take_selection_allowed(&mut self) -> bool {
         std::mem::take(&mut self.selection_allowed)
-    }
-}
-
-impl PopupState {
-    fn is_visible(self) -> bool {
-        matches!(self, Self::Visible)
     }
 }
 
@@ -2856,7 +2843,6 @@ impl IntellisensePopup {
         let descriptions = Arc::new(Mutex::new(HashMap::new()));
         let selected_callback: Arc<Mutex<Option<Box<dyn FnMut(String)>>>> =
             Arc::new(Mutex::new(None));
-        let state = Arc::new(Mutex::new(PopupState::Hidden));
 
         window.hide();
 
@@ -2869,7 +2855,6 @@ impl IntellisensePopup {
             suggestion_presentations,
             descriptions,
             selected_callback,
-            state,
         };
 
         popup.setup_callbacks();
@@ -2882,7 +2867,6 @@ impl IntellisensePopup {
         let all_suggestions = self.all_suggestions.clone();
         let callback = self.selected_callback.clone();
         let mut window = self.window.clone();
-        let state = self.state.clone();
         let pointer_gesture = Arc::new(Mutex::new(PopupPointerGesture::default()));
         let pointer_gesture_for_handle = pointer_gesture.clone();
 
@@ -2933,9 +2917,6 @@ impl IntellisensePopup {
                     // while preserving callbacks that were replaced during invocation.
                     Self::invoke_selected_callback(&callback, text);
                     window.hide();
-                    *state
-                        .lock()
-                        .unwrap_or_else(|poisoned| poisoned.into_inner()) = PopupState::Hidden;
                 }
             }
         });
@@ -2960,10 +2941,6 @@ impl IntellisensePopup {
         y: i32,
     ) {
         if self.is_deleted() {
-            *self
-                .state
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner()) = PopupState::Hidden;
             return;
         }
 
@@ -3024,10 +3001,6 @@ impl IntellisensePopup {
             });
             self.window.show();
         }
-        *self
-            .state
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner()) = PopupState::Visible;
     }
 
     fn rebuild_suggestion_presentations(&mut self) {
@@ -3092,10 +3065,6 @@ impl IntellisensePopup {
         selected_original_index: Option<usize>,
     ) {
         if self.is_deleted() {
-            *self
-                .state
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner()) = PopupState::Hidden;
             return;
         }
 
@@ -3181,10 +3150,6 @@ impl IntellisensePopup {
 
     pub fn filter_visible_suggestions_by_prefix(&mut self, prefix: &str) {
         if self.is_deleted() {
-            *self
-                .state
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner()) = PopupState::Hidden;
             return;
         }
 
@@ -3254,28 +3219,15 @@ impl IntellisensePopup {
 
     pub fn hide(&mut self) {
         if self.is_deleted() {
-            *self
-                .state
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner()) = PopupState::Hidden;
             return;
         }
 
         self.window.hide();
         self.window.resize(0, 0, 0, 0);
-        *self
-            .state
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner()) = PopupState::Hidden;
     }
 
     pub fn clear_for_close(&mut self) {
-        if self.is_deleted() {
-            *self
-                .state
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner()) = PopupState::Hidden;
-        } else {
+        if !self.is_deleted() {
             self.hide();
             self.browser.set_callback(|_| {});
             self.browser.clear();
@@ -3308,10 +3260,6 @@ impl IntellisensePopup {
 
     pub fn delete_for_close(&mut self) {
         if self.is_deleted() {
-            *self
-                .state
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner()) = PopupState::Hidden;
             return;
         }
 
@@ -3322,14 +3270,7 @@ impl IntellisensePopup {
     }
 
     pub fn is_visible(&self) -> bool {
-        if self.is_deleted() {
-            return false;
-        }
-
-        self.state
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .is_visible()
+        !self.is_deleted() && self.window.shown()
     }
 
     pub fn popup_dimensions(&self) -> (i32, i32) {
@@ -4612,16 +4553,12 @@ pub(crate) fn sql_context_for_phase(
     }
 }
 
-/// In-window overlay showing the signature of the routine call enclosing the
-/// cursor, with the active argument emphasized. Keeping this inside the
-/// editor's parent window preserves editor focus while the hint is visible.
+/// In-editor overlay showing the signature of the routine call enclosing the
+/// cursor, with the active argument emphasized. The editor's draw callback
+/// paints this after the text so editor redraws cannot cover the hint.
 pub struct SignaturePopup {
-    frame: Option<Frame>,
     visible: bool,
     last_render: Option<SignaturePopupRenderState>,
-    /// FLTK check-callback handle (stored as usize to stay `Send`) that keeps
-    /// the overlay frame painted above the editor; see `ensure_frame`.
-    overlay_keepalive: Option<usize>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -4655,8 +4592,8 @@ impl SignaturePopupTextStyle {
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct SignaturePopupRenderState {
     lines: Vec<Vec<SignaturePopupTextRun>>,
-    normal_font: i32,
-    bold_font: i32,
+    normal_font: fltk::enums::Font,
+    bold_font: fltk::enums::Font,
     font_size: i32,
     x: i32,
     y: i32,
@@ -4683,81 +4620,9 @@ impl SignaturePopup {
 
     pub fn new() -> Self {
         Self {
-            frame: None,
             visible: false,
             last_render: None,
-            overlay_keepalive: None,
         }
-    }
-
-    fn remove_overlay_keepalive(&mut self) {
-        if let Some(handle) = self.overlay_keepalive.take() {
-            fltk::app::remove_check(handle as fltk::app::CheckHandle);
-        }
-    }
-
-    fn is_deleted(&self) -> bool {
-        self.frame.as_ref().is_some_and(|frame| frame.was_deleted())
-    }
-
-    fn ensure_frame(&mut self, editor: &TextEditor) -> Option<&mut Frame> {
-        if self.is_deleted() {
-            self.frame = None;
-            self.visible = false;
-            self.remove_overlay_keepalive();
-        }
-        if self.frame.is_none() {
-            let parent = editor.window()?;
-            let current_group = fltk::group::Group::try_current();
-            parent.begin();
-            let mut frame = Frame::default()
-                .with_size(200, Self::height())
-                .with_pos(0, 0);
-            frame.set_frame(fltk::enums::FrameType::FlatBox);
-            frame.set_color(theme::panel_raised());
-            frame.set_label_color(theme::text_primary());
-            frame.set_label_size(Self::font_size());
-            frame.set_align(fltk::enums::Align::Left | fltk::enums::Align::Inside);
-            frame.clear_visible_focus();
-            frame.handle(|frame, event| {
-                if event != fltk::enums::Event::Push {
-                    return false;
-                }
-                frame.hide();
-                frame.redraw();
-                if let Some(mut win) = frame.window() {
-                    win.redraw();
-                }
-                true
-            });
-            frame.hide();
-            parent.end();
-            if let Some(ref group) = current_group {
-                fltk::group::Group::set_current(Some(group));
-            } else {
-                fltk::group::Group::set_current(None::<&fltk::group::Group>);
-            }
-            // The frame is a sibling overlay above the editor. FLTK partial
-            // redraws repaint only the damaged widget, so an editor repaint
-            // (typing, semantic rehighlight) paints straight over the frame
-            // and visually erases it even though it is still visible. This
-            // pre-flush check re-damages the frame whenever the editor is
-            // about to repaint beneath it; the frame is the window's last
-            // child, so it is drawn after the editor within the same flush.
-            let mut frame_handle = frame.clone();
-            let editor_handle = editor.clone();
-            let keepalive = fltk::app::add_check(move |_| {
-                if frame_handle.was_deleted() || editor_handle.was_deleted() {
-                    return;
-                }
-                if frame_handle.visible() && editor_handle.damage() && !frame_handle.damage() {
-                    frame_handle.redraw();
-                }
-            });
-            self.overlay_keepalive = Some(keepalive as usize);
-            self.frame = Some(frame);
-        }
-        self.frame.as_mut()
     }
 
     fn styled_lines(label: &SignatureLabel, active_arg: usize) -> Vec<Vec<SignaturePopupTextRun>> {
@@ -4824,9 +4689,9 @@ impl SignaturePopup {
             .collect()
     }
 
-    /// Position inside the editor's parent window. Mirrors the completion
-    /// popup's cursor-position and window-bound clamping, but deliberately keeps
-    /// coordinates local because the signature hint is an in-window overlay.
+    /// Position inside the editor. `position_to_xy` returns window-local
+    /// coordinates, so clamp them to the editor before its draw callback paints
+    /// the overlay.
     fn overlay_position(
         editor: &TextEditor,
         anchor_pos: i32,
@@ -4837,12 +4702,18 @@ impl SignaturePopup {
         let mut popup_x = cursor_x;
         let mut popup_y = cursor_y.saturating_sub(height).saturating_sub(2);
 
-        if let Some(win) = editor.window() {
-            let max_x = win.w().saturating_sub(width).max(0);
-            let max_y = win.h().saturating_sub(height).max(0);
-            popup_x = popup_x.clamp(0, max_x);
-            popup_y = popup_y.clamp(0, max_y);
-        }
+        let min_x = editor.x();
+        let min_y = editor.y();
+        let max_x = min_x
+            .saturating_add(editor.w())
+            .saturating_sub(width)
+            .max(min_x);
+        let max_y = min_y
+            .saturating_add(editor.h())
+            .saturating_sub(height)
+            .max(min_y);
+        popup_x = popup_x.clamp(min_x, max_x);
+        popup_y = popup_y.clamp(min_y, max_y);
 
         (popup_x, popup_y)
     }
@@ -4880,8 +4751,8 @@ impl SignaturePopup {
         let (x, y) = Self::overlay_position(editor, anchor_pos, width, height);
         let render_state = SignaturePopupRenderState {
             lines,
-            normal_font: profile.normal.bits(),
-            bold_font: profile.bold.bits(),
+            normal_font: profile.normal,
+            bold_font: profile.bold,
             font_size,
             x,
             y,
@@ -4897,61 +4768,62 @@ impl SignaturePopup {
         {
             return;
         }
-
-        let Some(frame) = self.ensure_frame(editor) else {
-            self.visible = false;
-            self.last_render = None;
-            return;
-        };
-        let lines = render_state.lines.clone();
-        let normal_font = profile.normal;
-        let bold_font = profile.bold;
-        let line_height = Self::height();
-        frame.set_label("");
-        frame.draw(move |frame| {
-            fltk::draw::push_clip(frame.x(), frame.y(), frame.w(), frame.h());
-            fltk::draw::draw_box(
-                frame.frame(),
-                frame.x(),
-                frame.y(),
-                frame.w(),
-                frame.h(),
-                frame.color(),
-            );
-            for (line_index, line) in lines.iter().enumerate() {
-                let mut run_x = frame.x().saturating_add(10);
-                let line_index = i32::try_from(line_index).unwrap_or(i32::MAX);
-                let line_y = frame
-                    .y()
-                    .saturating_add(line_index.saturating_mul(line_height));
-                for run in line {
-                    fltk::draw::set_font(run.style.font(normal_font, bold_font), font_size);
-                    fltk::draw::set_draw_color(run.style.color());
-                    let run_width = fltk::draw::measure(&run.text, false).0.max(0);
-                    if run_width > 0 {
-                        fltk::draw::draw_text2(
-                            &run.text,
-                            run_x,
-                            line_y,
-                            run_width.saturating_add(1),
-                            line_height,
-                            fltk::enums::Align::Left | fltk::enums::Align::Inside,
-                        );
-                    }
-                    run_x = run_x.saturating_add(run_width);
-                }
-            }
-            fltk::draw::pop_clip();
-        });
-        frame.set_size(width, height);
-        frame.set_pos(x, y);
-        frame.show();
-        frame.redraw();
-        if let Some(mut win) = editor.window() {
-            win.redraw();
-        }
         self.visible = true;
         self.last_render = Some(render_state);
+    }
+
+    /// Draw the current hint after the editor's normal contents. Resetting the
+    /// clip is intentional: FLTK may redraw only the edited text range, while
+    /// the signature can be anchored elsewhere in the same editor.
+    pub(crate) fn draw_overlay(&self, editor: &TextEditor) {
+        if !self.visible || editor.was_deleted() {
+            return;
+        }
+        let Some(render) = self.last_render.as_ref() else {
+            return;
+        };
+        let line_height = render.font_size.saturating_add(8).max(22);
+
+        fltk::draw::push_no_clip();
+        fltk::draw::push_clip(editor.x(), editor.y(), editor.w(), editor.h());
+        fltk::draw::push_clip(render.x, render.y, render.width, render.height);
+        fltk::draw::draw_box(
+            fltk::enums::FrameType::FlatBox,
+            render.x,
+            render.y,
+            render.width,
+            render.height,
+            theme::panel_raised(),
+        );
+        for (line_index, line) in render.lines.iter().enumerate() {
+            let mut run_x = render.x.saturating_add(10);
+            let line_index = i32::try_from(line_index).unwrap_or(i32::MAX);
+            let line_y = render
+                .y
+                .saturating_add(line_index.saturating_mul(line_height));
+            for run in line {
+                fltk::draw::set_font(
+                    run.style.font(render.normal_font, render.bold_font),
+                    render.font_size,
+                );
+                fltk::draw::set_draw_color(run.style.color());
+                let run_width = fltk::draw::measure(&run.text, false).0.max(0);
+                if run_width > 0 {
+                    fltk::draw::draw_text2(
+                        &run.text,
+                        run_x,
+                        line_y,
+                        run_width.saturating_add(1),
+                        line_height,
+                        fltk::enums::Align::Left | fltk::enums::Align::Inside,
+                    );
+                }
+                run_x = run_x.saturating_add(run_width);
+            }
+        }
+        fltk::draw::pop_clip();
+        fltk::draw::pop_clip();
+        fltk::draw::pop_clip();
     }
 
     pub fn hide(&mut self) {
@@ -4961,34 +4833,14 @@ impl SignaturePopup {
         }
         self.visible = false;
         self.last_render = None;
-        if let Some(frame) = self.frame.as_mut() {
-            if frame.was_deleted() {
-                return;
-            }
-            frame.hide();
-            frame.redraw();
-            if let Some(mut win) = frame.window() {
-                win.redraw();
-            }
-        }
     }
 
     pub fn is_visible(&self) -> bool {
         self.visible
-            && self
-                .frame
-                .as_ref()
-                .is_some_and(|frame| !frame.was_deleted() && frame.visible())
     }
 
     pub fn delete_for_close(&mut self) {
         self.hide();
-        self.remove_overlay_keepalive();
-        if let Some(frame) = self.frame.take() {
-            if !frame.was_deleted() {
-                Frame::delete(frame);
-            }
-        }
     }
 }
 

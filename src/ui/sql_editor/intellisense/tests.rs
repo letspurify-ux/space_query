@@ -9636,6 +9636,30 @@ fn unfocus_hide_rule_hides_only_when_pointer_is_outside_visible_popup() {
 }
 
 #[test]
+fn popup_unfocus_hide_waits_for_focus_and_show_transition_to_settle() {
+    assert!(!SqlEditorWidget::popup_unfocus_hide_is_settled(
+        true,
+        IntellisensePopupTransitionState::Idle,
+        0,
+    ));
+    assert!(!SqlEditorWidget::popup_unfocus_hide_is_settled(
+        false,
+        IntellisensePopupTransitionState::Showing,
+        0,
+    ));
+    assert!(!SqlEditorWidget::popup_unfocus_hide_is_settled(
+        false,
+        IntellisensePopupTransitionState::Idle,
+        1,
+    ));
+    assert!(SqlEditorWidget::popup_unfocus_hide_is_settled(
+        false,
+        IntellisensePopupTransitionState::Idle,
+        0,
+    ));
+}
+
+#[test]
 fn popup_hides_never_block_on_a_busy_mutex() {
     assert!(SqlEditorWidget::can_try_hide_intellisense_popup(
         IntellisensePopupTransitionState::Idle
