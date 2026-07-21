@@ -899,6 +899,7 @@ impl SqlEditorWidget {
                     }
 
                     if shortcut_key == Key::Escape {
+                        widget_for_shortcuts.dismiss_signature_popup();
                         if popup_visible {
                             Self::request_intellisense_popup_hide(
                                 &intellisense_popup_for_handle,

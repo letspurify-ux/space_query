@@ -339,9 +339,10 @@ impl SqlEditorWidget {
         session: crate::db::DbPoolSession,
         name: &str,
         qualifier: Option<&str>,
+        display_name: &str,
     ) -> Result<Option<SignatureLabel>, String> {
         let args = signature_backend_for(db_type).resolve(session, name, qualifier)?;
-        Ok(args.map(|args| Self::build_signature_label(name, &args)))
+        Ok(args.map(|args| Self::build_signature_label(display_name, &args)))
     }
 
     pub(crate) fn hide_signature_popup(&self) {
@@ -363,6 +364,25 @@ impl SqlEditorWidget {
             generation,
             SIGNATURE_POPUP_LOCK_MAX_RETRIES,
         );
+    }
+
+    /// Explicitly dismiss the hint until the next editor-originated refresh.
+    /// This prevents late metadata results and retry timers from resurrecting
+    /// a popup closed by focus, window, pointer, or Escape handling.
+    pub(crate) fn dismiss_signature_popup(&self) {
+        self.intellisense_runtime.suppress_signature_hints();
+        self.hide_signature_popup();
+    }
+
+    pub(crate) fn editor_contains_root_point(&self, x: i32, y: i32) -> bool {
+        let Some(window) = self.editor.window() else {
+            return false;
+        };
+        let left = window.x_root().saturating_add(self.editor.x());
+        let top = window.y_root().saturating_add(self.editor.y());
+        let right = left.saturating_add(self.editor.w());
+        let bottom = top.saturating_add(self.editor.h());
+        x >= left && x < right && y >= top && y < bottom
     }
 
     /// Entry point for focus-loss style hides coming from outside the
@@ -391,7 +411,7 @@ impl SqlEditorWidget {
                 widget.schedule_deferred_signature_unfocus_hide(retries_left - 1);
                 return;
             }
-            widget.hide_signature_popup();
+            widget.dismiss_signature_popup();
         });
     }
 
@@ -628,12 +648,26 @@ impl SqlEditorWidget {
     /// Coalesce signature refreshes and release the originating UI event before
     /// doing the bounded context parse.
     pub(crate) fn schedule_signature_hint_update(&self) {
+        self.intellisense_runtime.resume_signature_hints();
+        self.schedule_signature_hint_refresh();
+    }
+
+    /// Refresh requested by metadata completion or retry. Unlike an editor
+    /// event, this must honor a prior explicit dismissal.
+    pub(crate) fn schedule_signature_hint_refresh(&self) {
+        if self.intellisense_runtime.signature_hints_suppressed() {
+            return;
+        }
         let generation = self
             .intellisense_runtime
             .next_signature_hint_update_generation();
         let widget = self.clone();
         crate::ui::ui_timeout::schedule(0.0, move || {
             if widget.editor.was_deleted()
+                || widget.intellisense_runtime.signature_hints_suppressed()
+                || !widget.editor.has_focus()
+                || !widget.editor.active_r()
+                || !widget.editor.visible_r()
                 || !widget
                     .intellisense_runtime
                     .is_current_signature_hint_update(generation)
@@ -648,7 +682,7 @@ impl SqlEditorWidget {
     /// its signature accordingly. Cheap on cache hits; spawns a background
     /// fetch (deduplicated) on a miss.
     pub(crate) fn update_signature_hint(&self) {
-        if self.editor.was_deleted() {
+        if self.editor.was_deleted() || self.intellisense_runtime.signature_hints_suppressed() {
             return;
         }
         let cursor = self.editor.insert_position().max(0) as usize;
@@ -693,7 +727,7 @@ impl SqlEditorWidget {
 
         // Built-ins are resolved from the versioned manual catalog because
         // database argument views do not expose their parameters.
-        if call.qualifier.is_none() {
+        if call.qualifier.is_none() && !call.name_quoted {
             if let Some(label) = crate::ui::builtin_signatures::builtin_signature_label(
                 db_type,
                 &call.name,
@@ -763,18 +797,36 @@ impl SqlEditorWidget {
             }
             Action::Fetch => {
                 self.hide_signature_popup();
-                self.spawn_signature_fetch(key, call.name, call.qualifier);
+                let display_name = call.lookup_name.clone();
+                let (lookup_name, lookup_qualifier) =
+                    if db_type.preserves_quoted_routine_lookup_spelling() {
+                        (call.lookup_name, call.lookup_qualifier)
+                    } else {
+                        (call.name, call.qualifier)
+                    };
+                self.spawn_signature_fetch(
+                    key,
+                    display_name,
+                    lookup_name,
+                    lookup_qualifier,
+                );
             }
         }
     }
 
-    fn spawn_signature_fetch(&self, key: String, name: String, qualifier: Option<String>) {
+    fn spawn_signature_fetch(
+        &self,
+        key: String,
+        display_name: String,
+        lookup_name: String,
+        qualifier: Option<String>,
+    ) {
         let connection = self.connection.clone();
         let sender = self.ui_action_sender.clone();
         let runtime = self.intellisense_runtime.clone();
         let key_fallback = key.clone();
         let accepted = runtime.submit_signature_task(Box::new(move || {
-            let activity = format!("Signature hint {name}");
+            let activity = format!("Signature hint {display_name}");
             let result = panic::catch_unwind(AssertUnwindSafe(|| {
                 let context = crate::db::pool_session_context_for_shared_connection(
                     &connection,
@@ -800,8 +852,9 @@ impl SqlEditorWidget {
                 let label = Self::resolve_signature_label(
                     context.connection_info.db_type,
                     session,
-                    &name,
+                    &lookup_name,
                     qualifier.as_deref(),
+                    &display_name,
                 )?;
                 if !crate::db::cached_pool_session_context_matches_shared_connection(
                     &connection,
@@ -845,17 +898,27 @@ impl SqlEditorWidget {
     }
 
     pub(crate) fn schedule_signature_retry(&self, key: &str) {
-        let ticket = self.intellisense_runtime.next_signature_retry(key);
+        if self.intellisense_runtime.signature_hints_suppressed() {
+            return;
+        }
+        let Some(ticket) = self.intellisense_runtime.next_signature_retry(key) else {
+            crate::utils::logging::log_debug(
+                "signature hint",
+                &format!("signature metadata retry limit reached for {key}"),
+            );
+            return;
+        };
         let widget = self.clone();
         crate::ui::ui_timeout::schedule(ticket.delay_seconds, move || {
             if widget.editor.was_deleted()
+                || widget.intellisense_runtime.signature_hints_suppressed()
                 || !widget
                     .intellisense_runtime
                     .consume_signature_retry(ticket.generation)
             {
                 return;
             }
-            widget.schedule_signature_hint_update();
+            widget.schedule_signature_hint_refresh();
         });
     }
 

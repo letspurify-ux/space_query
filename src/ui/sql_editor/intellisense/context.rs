@@ -365,7 +365,11 @@ impl SqlEditorWidget {
             if overload_index > 0 {
                 text.push('\n');
             }
-            text.push_str(&name.to_uppercase());
+            if name.starts_with('"') || name.starts_with('`') {
+                text.push_str(name);
+            } else {
+                text.push_str(&name.to_uppercase());
+            }
             text.push('(');
             let mut line_spans = Vec::new();
             let mut return_type = None;

@@ -265,6 +265,7 @@ pub(crate) struct IntellisenseRuntimeState {
     signature_popup_show_in_progress: Arc<AtomicU8>,
     signature_popup_request_generation: Arc<AtomicU64>,
     signature_hint_update_generation: Arc<AtomicU64>,
+    signature_hints_suppressed: Arc<AtomicBool>,
     signature_retry_state: Arc<Mutex<SignatureRetryState>>,
     keyup_debounce_generation: Arc<Mutex<u64>>,
     keyup_debounce_handle: Arc<Mutex<Option<crate::ui::ui_timeout::TimeoutHandle>>>,
@@ -294,6 +295,7 @@ impl IntellisenseRuntimeState {
             )),
             signature_popup_request_generation: Arc::new(AtomicU64::new(0)),
             signature_hint_update_generation: Arc::new(AtomicU64::new(0)),
+            signature_hints_suppressed: Arc::new(AtomicBool::new(false)),
             signature_retry_state: Arc::new(Mutex::new(SignatureRetryState::default())),
             keyup_debounce_generation: Arc::new(Mutex::new(0_u64)),
             keyup_debounce_handle: Arc::new(Mutex::new(None)),
@@ -632,7 +634,23 @@ impl IntellisenseRuntimeState {
             == generation
     }
 
-    pub(crate) fn next_signature_retry(&self, key: &str) -> SignatureRetryTicket {
+    pub(crate) fn suppress_signature_hints(&self) {
+        self.signature_hints_suppressed
+            .store(true, Ordering::Release);
+        self.next_signature_hint_update_generation();
+        self.clear_signature_retry();
+    }
+
+    pub(crate) fn resume_signature_hints(&self) {
+        self.signature_hints_suppressed
+            .store(false, Ordering::Release);
+    }
+
+    pub(crate) fn signature_hints_suppressed(&self) -> bool {
+        self.signature_hints_suppressed.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn next_signature_retry(&self, key: &str) -> Option<SignatureRetryTicket> {
         const RETRY_DELAYS_SECONDS: [f64; 6] = [0.1, 0.2, 0.4, 0.8, 1.0, 2.0];
 
         let mut state = self
@@ -646,13 +664,13 @@ impl IntellisenseRuntimeState {
             state.attempts = 1;
         }
         state.generation = state.generation.wrapping_add(1);
-        SignatureRetryTicket {
-            generation: state.generation,
-            delay_seconds: RETRY_DELAYS_SECONDS[state
-                .attempts
-                .saturating_sub(1)
-                .min(RETRY_DELAYS_SECONDS.len().saturating_sub(1))],
+        if state.attempts > RETRY_DELAYS_SECONDS.len() {
+            return None;
         }
+        Some(SignatureRetryTicket {
+            generation: state.generation,
+            delay_seconds: RETRY_DELAYS_SECONDS[state.attempts.saturating_sub(1)],
+        })
     }
 
     pub(crate) fn consume_signature_retry(&self, generation: u64) -> bool {
@@ -893,18 +911,56 @@ mod tests {
     #[test]
     fn signature_retry_tickets_back_off_and_are_one_shot() {
         let runtime = IntellisenseRuntimeState::new();
-        let first = runtime.next_signature_retry("PROC");
-        let second = runtime.next_signature_retry("PROC");
+        let first = runtime.next_signature_retry("PROC").expect("first retry");
+        let second = runtime.next_signature_retry("PROC").expect("second retry");
         assert_eq!(first.delay_seconds, 0.1);
         assert_eq!(second.delay_seconds, 0.2);
         assert!(!runtime.consume_signature_retry(first.generation));
         assert!(runtime.consume_signature_retry(second.generation));
         assert!(!runtime.consume_signature_retry(second.generation));
 
-        let other_key = runtime.next_signature_retry("OTHER_PROC");
+        let other_key = runtime
+            .next_signature_retry("OTHER_PROC")
+            .expect("other-key retry");
         assert_eq!(other_key.delay_seconds, 0.1);
         runtime.clear_signature_retry();
         assert!(!runtime.consume_signature_retry(other_key.generation));
+    }
+
+    #[test]
+    fn signature_retry_tickets_stop_after_the_bounded_budget() {
+        let runtime = IntellisenseRuntimeState::new();
+        let delays = (0..6)
+            .map(|_| {
+                runtime
+                    .next_signature_retry("PROC")
+                    .expect("retry inside budget")
+                    .delay_seconds
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(delays, vec![0.1, 0.2, 0.4, 0.8, 1.0, 2.0]);
+        assert!(runtime.next_signature_retry("PROC").is_none());
+        assert!(runtime.next_signature_retry("PROC").is_none());
+        assert!(runtime.next_signature_retry("OTHER_PROC").is_some());
+    }
+
+    #[test]
+    fn explicit_signature_dismissal_suppresses_async_refreshes_until_editor_input() {
+        let runtime = IntellisenseRuntimeState::new();
+        let scheduled = runtime.next_signature_hint_update_generation();
+        let retry = runtime
+            .next_signature_retry("PROC")
+            .expect("retry before dismissal");
+
+        runtime.suppress_signature_hints();
+
+        assert!(runtime.signature_hints_suppressed());
+        assert!(!runtime.is_current_signature_hint_update(scheduled));
+        assert!(!runtime.consume_signature_retry(retry.generation));
+
+        runtime.resume_signature_hints();
+        assert!(!runtime.signature_hints_suppressed());
     }
 
     #[test]

@@ -1180,10 +1180,50 @@ impl AppState {
 
     fn hide_all_intellisense_popups(&self) {
         self.sql_editor.try_hide_intellisense_popup();
-        self.sql_editor.hide_signature_popup();
+        self.sql_editor.dismiss_signature_popup();
         for tab in &self.editor_tabs {
             tab.sql_editor.try_hide_intellisense_popup();
-            tab.sql_editor.hide_signature_popup();
+            tab.sql_editor.dismiss_signature_popup();
+        }
+    }
+
+    fn try_hide_all_intellisense_popups(state: &Arc<Mutex<Self>>) -> bool {
+        match state.try_lock() {
+            Ok(state) => state.hide_all_intellisense_popups(),
+            Err(std::sync::TryLockError::Poisoned(poisoned)) => {
+                poisoned.into_inner().hide_all_intellisense_popups();
+            }
+            Err(std::sync::TryLockError::WouldBlock) => return false,
+        }
+        true
+    }
+
+    fn schedule_hide_all_intellisense_popups(
+        state: std::sync::Weak<Mutex<Self>>,
+        retries_remaining: u8,
+    ) {
+        const POPUP_LIFECYCLE_RETRY_SECONDS: f64 = 0.01;
+        crate::ui::ui_timeout::schedule(POPUP_LIFECYCLE_RETRY_SECONDS, move || {
+            let Some(state) = state.upgrade() else {
+                return;
+            };
+            if Self::try_hide_all_intellisense_popups(&state) || retries_remaining == 0 {
+                return;
+            }
+            Self::schedule_hide_all_intellisense_popups(
+                Arc::downgrade(&state),
+                retries_remaining.saturating_sub(1),
+            );
+        });
+    }
+
+    fn hide_all_intellisense_popups_without_blocking(state: &Arc<Mutex<Self>>) {
+        const POPUP_LIFECYCLE_LOCK_RETRIES: u8 = 20;
+        if !Self::try_hide_all_intellisense_popups(state) {
+            Self::schedule_hide_all_intellisense_popups(
+                Arc::downgrade(state),
+                POPUP_LIFECYCLE_LOCK_RETRIES,
+            );
         }
     }
 
@@ -8641,9 +8681,7 @@ impl MainWindow {
                 fltk::enums::Event::Resize
                 | fltk::enums::Event::Hide
                 | fltk::enums::Event::Fullscreen => {
-                    if let Ok(s) = state_for_window.try_lock() {
-                        s.hide_all_intellisense_popups();
-                    }
+                    AppState::hide_all_intellisense_popups_without_blocking(&state_for_window);
                     false
                 }
                 fltk::enums::Event::Deactivate => {
@@ -8664,6 +8702,7 @@ impl MainWindow {
                 }
                 fltk::enums::Event::KeyDown => {
                     if app::event_key() == fltk::enums::Key::Escape {
+                        AppState::hide_all_intellisense_popups_without_blocking(&state_for_window);
                         return true;
                     }
                     if MainWindow::handle_window_shortcut(
@@ -8698,7 +8737,13 @@ impl MainWindow {
                         app::event_x_root(),
                         app::event_y_root(),
                     );
-                    sql_editor.hide_signature_popup();
+                    if sql_editor
+                        .editor_contains_root_point(app::event_x_root(), app::event_y_root())
+                    {
+                        sql_editor.hide_signature_popup();
+                    } else {
+                        sql_editor.dismiss_signature_popup();
+                    }
                     sql_editor.hide_intellisense_on_outside_click(
                         app::event_x_root(),
                         app::event_y_root(),

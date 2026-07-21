@@ -653,6 +653,10 @@ impl DatabaseType {
         backend_for(self).supports_mysql_delimiter_commands()
     }
 
+    pub(crate) fn preserves_quoted_routine_lookup_spelling(self) -> bool {
+        backend_for(self).preserves_quoted_routine_lookup_spelling()
+    }
+
     pub fn backend_kind(self) -> DatabaseBackendKind {
         backend_for(self).backend_kind()
     }
@@ -1964,6 +1968,7 @@ pub(crate) trait DbBackend: Sync {
     fn advanced_settings_form_spec(&self) -> DbAdvancedSettingsFormSpec;
     fn sql_dialect(&self) -> SqlDialect;
     fn supports_mysql_delimiter_commands(&self) -> bool;
+    fn preserves_quoted_routine_lookup_spelling(&self) -> bool;
     fn backend_kind(&self) -> DatabaseBackendKind;
     fn cache_key(&self) -> u8;
     fn default_connection_info(&self) -> ConnectionInfo;
@@ -2228,6 +2233,10 @@ impl DbBackend for OracleBackend {
 
     fn supports_mysql_delimiter_commands(&self) -> bool {
         false
+    }
+
+    fn preserves_quoted_routine_lookup_spelling(&self) -> bool {
+        true
     }
 
     fn backend_kind(&self) -> DatabaseBackendKind {
@@ -2681,6 +2690,10 @@ impl DbBackend for MysqlBackend {
 
     fn supports_mysql_delimiter_commands(&self) -> bool {
         true
+    }
+
+    fn preserves_quoted_routine_lookup_spelling(&self) -> bool {
+        false
     }
 
     fn backend_kind(&self) -> DatabaseBackendKind {

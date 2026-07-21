@@ -2158,7 +2158,7 @@ fn intellisense_and_signature_popups_follow_window_and_click_lifecycle() {
         .expect("tab lookup should follow popup lifecycle helper");
     let hide_all = &main_window[hide_all_start..hide_all_end];
     assert!(hide_all.contains("try_hide_intellisense_popup"));
-    assert!(hide_all.contains("hide_signature_popup"));
+    assert!(hide_all.contains("dismiss_signature_popup"));
 
     let push_start = main_window[handler_start..]
         .find("fltk::enums::Event::Push =>")
@@ -2169,7 +2169,7 @@ fn intellisense_and_signature_popups_follow_window_and_click_lifecycle() {
         .map(|offset| push_start + offset)
         .expect("fallback event handler should follow push handler");
     let push_handler = &main_window[push_start..push_end];
-    assert!(push_handler.contains("hide_signature_popup"));
+    assert!(push_handler.contains("dismiss_signature_popup"));
     assert!(push_handler.contains("hide_intellisense_on_outside_click"));
     assert!(push_handler.contains("app::event_x_root()"));
     assert!(push_handler.contains("app::event_y_root()"));
@@ -2186,6 +2186,31 @@ fn intellisense_and_signature_popups_follow_window_and_click_lifecycle() {
     assert!(editor_push.contains("widget_for_shortcuts.hide_signature_popup()"));
     assert!(editor_push.contains("widget_for_shortcuts.schedule_signature_hint_update()"));
     assert!(editor_push.contains("MouseButton::Left"));
+    let escape_start = editor_runtime[editor_push_end..]
+        .find("if shortcut_key == Key::Escape")
+        .map(|offset| editor_push_end + offset)
+        .expect("editor Escape handler should exist");
+    let escape_end = editor_runtime[escape_start..]
+        .find("if popup_visible")
+        .map(|offset| escape_start + offset)
+        .expect("completion handling should follow Escape handling");
+    assert!(editor_runtime[escape_start..escape_end].contains("dismiss_signature_popup"));
+
+    let signature_popup = read_source("src/ui/sql_editor/intellisense/popup.rs");
+    assert!(signature_popup.contains("signature_hints_suppressed()"));
+    assert!(signature_popup.contains("schedule_signature_hint_refresh"));
+    assert!(signature_popup.contains("!widget.editor.has_focus()"));
+
+    let ui_results = read_source("src/ui/sql_editor/mod.rs");
+    let signature_result_start = ui_results
+        .find("UiActionResult::SignatureArguments")
+        .expect("signature metadata result handler should exist");
+    let signature_result_end = ui_results[signature_result_start..]
+        .find("UiActionResult::Transaction")
+        .map(|offset| signature_result_start + offset)
+        .expect("transaction result handler should follow signature metadata");
+    assert!(ui_results[signature_result_start..signature_result_end]
+        .contains("schedule_signature_hint_refresh"));
 
     let intellisense = read_source("src/ui/intellisense.rs");
     let completion_popup_start = intellisense

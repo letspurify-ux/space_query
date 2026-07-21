@@ -4163,14 +4163,19 @@ pub struct EnclosingCall {
     pub arg_index: usize,
     /// Byte offset of the call's opening parenthesis.
     pub open_paren: usize,
+    /// Exact SQL spelling used for Oracle metadata lookup, including quotes.
+    pub(crate) lookup_name: String,
+    /// Exact SQL spelling of the qualifier, including per-segment quotes.
+    pub(crate) lookup_qualifier: Option<String>,
+    /// Quoted names must not be mistaken for same-spelled built-ins.
+    pub(crate) name_quoted: bool,
+    lookup_key: String,
 }
 
-/// Lookup key for a routine call: `QUALIFIER.NAME` uppercased.
+/// Lookup key for a routine call. Unquoted segments are uppercased; quoted
+/// segments retain their case and are length-prefixed to avoid collisions.
 pub fn signature_key_for_call(call: &EnclosingCall) -> String {
-    match &call.qualifier {
-        Some(qualifier) => format!("{}.{}", qualifier.to_uppercase(), call.name.to_uppercase()),
-        None => call.name.to_uppercase(),
-    }
+    call.lookup_key.clone()
 }
 
 /// Find the innermost function/procedure call whose argument list contains the
@@ -4244,17 +4249,28 @@ pub(crate) fn enclosing_call_at_cursor_with_lexical_mode(
         idx += 1;
     }
 
-    let frame = stack.pop()?;
-    let (name, qualifier) = dotted_reference_before(text, frame.open)?;
-    if is_non_call_keyword(&name, mysql_compatible) {
-        return None;
+    while let Some(frame) = stack.pop() {
+        let Some(reference) = dotted_reference_before(text, frame.open) else {
+            continue;
+        };
+        if is_non_call_keyword(&reference.name, mysql_compatible) {
+            continue;
+        }
+        if is_routine_declaration_context(text, reference.start) {
+            return None;
+        }
+        return Some(EnclosingCall {
+            name: reference.name,
+            qualifier: reference.qualifier,
+            arg_index: frame.commas,
+            open_paren: frame.open,
+            lookup_name: reference.lookup_name,
+            lookup_qualifier: reference.lookup_qualifier,
+            name_quoted: reference.name_quoted,
+            lookup_key: reference.lookup_key,
+        });
     }
-    Some(EnclosingCall {
-        name,
-        qualifier,
-        arg_index: frame.commas,
-        open_paren: frame.open,
-    })
+    None
 }
 
 /// Recompute the active argument for documented call syntaxes that use a
@@ -4402,77 +4418,201 @@ fn is_non_call_keyword(name: &str, mysql_compatible: bool) -> bool {
 /// whitespace). Returns the final segment as `name` and any leading segments
 /// joined as `qualifier`. Quoted identifiers (`"a.b"`, `"weird name"`) are
 /// handled: dots and spaces inside quotes are part of the segment.
-fn dotted_reference_before(text: &str, open_idx: usize) -> Option<(String, Option<String>)> {
-    let mut pos = open_idx;
-    while pos > 0 {
-        let (prev, ch) = text[..pos].char_indices().next_back()?;
+struct ParsedIdentifierSegment {
+    value: String,
+    lookup: String,
+    quoted: bool,
+}
+
+struct ParsedDottedReference {
+    name: String,
+    qualifier: Option<String>,
+    lookup_name: String,
+    lookup_qualifier: Option<String>,
+    name_quoted: bool,
+    lookup_key: String,
+    start: usize,
+}
+
+fn dotted_reference_before(text: &str, open_idx: usize) -> Option<ParsedDottedReference> {
+    let mut token_end = open_idx;
+    while token_end > 0 {
+        let (previous, ch) = text[..token_end].char_indices().next_back()?;
         if ch.is_whitespace() {
-            pos = prev;
+            token_end = previous;
         } else {
             break;
         }
     }
 
-    let token_end = pos;
-    while pos > 0 {
-        let (prev, ch) = text[..pos].char_indices().next_back()?;
-        if ch == '"' {
-            // Closing quote of a quoted identifier: consume backward through
-            // the whole quoted segment (any chars) up to its opening quote.
-            pos = prev;
-            while pos > 0 {
-                let (inner_prev, inner_ch) = text[..pos].char_indices().next_back()?;
-                pos = inner_prev;
-                if inner_ch == '"' {
-                    break;
-                }
-            }
-        } else if sql_text::is_identifier_char(ch) || ch == '.' {
-            pos = prev;
-        } else {
-            break;
-        }
-    }
-
-    let token = text.get(pos..token_end)?;
+    let token_start = dotted_reference_start_before(text, token_end)?;
+    let token = text.get(token_start..token_end)?;
     if token.is_empty() {
         return None;
     }
 
     let mut segments = split_dotted_identifier(token);
     let name = segments.pop()?;
-    if name.is_empty() {
+    if name.value.is_empty() {
         return None;
     }
-    let qualifier = (!segments.is_empty()).then(|| segments.join("."));
-    Some((name, qualifier))
+    let qualifier = (!segments.is_empty()).then(|| {
+        segments
+            .iter()
+            .map(|segment| segment.value.as_str())
+            .collect::<Vec<_>>()
+            .join(".")
+    });
+    let lookup_qualifier = (!segments.is_empty()).then(|| {
+        segments
+            .iter()
+            .map(|segment| segment.lookup.as_str())
+            .collect::<Vec<_>>()
+            .join(".")
+    });
+    let mut lookup_key = segments
+        .iter()
+        .map(signature_identifier_segment_key)
+        .collect::<Vec<_>>();
+    lookup_key.push(signature_identifier_segment_key(&name));
+    Some(ParsedDottedReference {
+        name: name.value,
+        qualifier,
+        lookup_name: name.lookup,
+        lookup_qualifier,
+        name_quoted: name.quoted,
+        lookup_key: lookup_key.join("."),
+        start: token_start,
+    })
+}
+
+fn dotted_reference_start_before(text: &str, token_end: usize) -> Option<usize> {
+    let mut segment_end = token_end;
+    loop {
+        let (last_index, last) = text[..segment_end].char_indices().next_back()?;
+        let segment_start = if matches!(last, '"' | '`') {
+            quoted_identifier_start(&text[..segment_end], last_index, last)?
+        } else if sql_text::is_identifier_char(last) {
+            let mut start = last_index;
+            while start > 0 {
+                let (previous, ch) = text[..start].char_indices().next_back()?;
+                if !sql_text::is_identifier_char(ch) {
+                    break;
+                }
+                start = previous;
+            }
+            start
+        } else {
+            return None;
+        };
+
+        let Some((dot_index, ch)) = text[..segment_start].char_indices().next_back() else {
+            return Some(segment_start);
+        };
+        if ch != '.' {
+            return Some(segment_start);
+        }
+        segment_end = dot_index;
+    }
+}
+
+fn quoted_identifier_start(text: &str, closing_index: usize, delimiter: char) -> Option<usize> {
+    let mut cursor = closing_index;
+    while cursor > 0 {
+        let (index, ch) = text[..cursor].char_indices().next_back()?;
+        if ch != delimiter {
+            cursor = index;
+            continue;
+        }
+        if let Some((escaped_index, escaped)) = text[..index].char_indices().next_back() {
+            if escaped == delimiter {
+                cursor = escaped_index;
+                continue;
+            }
+        }
+        return Some(index);
+    }
+    None
 }
 
 /// Split a dotted object reference into its segments, treating dots inside
 /// double-quoted identifiers as literal and unescaping `""` to `"`.
-fn split_dotted_identifier(token: &str) -> Vec<String> {
-    let mut segments = Vec::new();
-    let mut current = String::new();
-    let mut in_quote = false;
-    let mut chars = token.chars().peekable();
-
-    while let Some(ch) = chars.next() {
-        match ch {
-            '"' if in_quote => {
-                if chars.peek() == Some(&'"') {
-                    current.push('"');
+fn split_dotted_identifier(token: &str) -> Vec<ParsedIdentifierSegment> {
+    let mut raw_segments = Vec::new();
+    let mut segment_start = 0;
+    let mut quote = None;
+    let mut chars = token.char_indices().peekable();
+    while let Some((index, ch)) = chars.next() {
+        if let Some(delimiter) = quote {
+            if ch == delimiter {
+                if chars.peek().is_some_and(|(_, next)| *next == delimiter) {
                     chars.next();
                 } else {
-                    in_quote = false;
+                    quote = None;
                 }
             }
-            '"' => in_quote = true,
-            '.' if !in_quote => segments.push(std::mem::take(&mut current)),
-            _ => current.push(ch),
+        } else if matches!(ch, '"' | '`') {
+            quote = Some(ch);
+        } else if ch == '.' {
+            raw_segments.push(&token[segment_start..index]);
+            segment_start = index.saturating_add(1);
         }
     }
-    segments.push(current);
-    segments
+    raw_segments.push(&token[segment_start..]);
+    raw_segments
+        .into_iter()
+        .map(parse_identifier_segment)
+        .collect()
+}
+
+fn parse_identifier_segment(raw: &str) -> ParsedIdentifierSegment {
+    let delimiter = raw.chars().next().filter(|ch| matches!(ch, '"' | '`'));
+    let quoted = delimiter.is_some_and(|delimiter| raw.ends_with(delimiter) && raw.len() >= 2);
+    let value = if let Some(delimiter) = delimiter.filter(|_| quoted) {
+        let inner = &raw[delimiter.len_utf8()..raw.len().saturating_sub(delimiter.len_utf8())];
+        let doubled = format!("{delimiter}{delimiter}");
+        inner.replace(&doubled, &delimiter.to_string())
+    } else {
+        raw.to_string()
+    };
+    ParsedIdentifierSegment {
+        value,
+        lookup: raw.to_string(),
+        quoted,
+    }
+}
+
+fn signature_identifier_segment_key(segment: &ParsedIdentifierSegment) -> String {
+    if segment.quoted {
+        format!("Q{}:{}", segment.value.len(), segment.value)
+    } else {
+        segment.value.to_uppercase()
+    }
+}
+
+fn is_routine_declaration_context(text: &str, reference_start: usize) -> bool {
+    let mut end = reference_start;
+    while end > 0 {
+        let (previous, ch) = text[..end].char_indices().next_back().unwrap_or((0, '\0'));
+        if ch.is_whitespace() {
+            end = previous;
+        } else {
+            break;
+        }
+    }
+    let mut start = end;
+    while start > 0 {
+        let (previous, ch) = text[..start]
+            .char_indices()
+            .next_back()
+            .unwrap_or((0, '\0'));
+        if sql_text::is_identifier_char(ch) {
+            start = previous;
+        } else {
+            break;
+        }
+    }
+    matches!(text.get(start..end), Some(word) if word.eq_ignore_ascii_case("FUNCTION") || word.eq_ignore_ascii_case("PROCEDURE"))
 }
 
 // Detect context for smarter suggestions (after FROM, after SELECT, etc.)
@@ -5416,6 +5556,18 @@ mod intellisense_tests {
     }
 
     #[test]
+    fn enclosing_call_falls_back_to_outer_call_inside_grouped_expression() {
+        let call = call_at("SELECT MY_FUNC((a + b|").expect("outer call around grouping");
+        assert_eq!(call.name, "MY_FUNC");
+        assert_eq!(call.arg_index, 0);
+
+        let nested = call_at("SELECT MY_FUNC(CASE WHEN x IN (1, 2|)")
+            .expect("outer call around keyword grouping");
+        assert_eq!(nested.name, "MY_FUNC");
+        assert_eq!(nested.arg_index, 0);
+    }
+
+    #[test]
     fn enclosing_call_ignores_commas_in_strings() {
         let call = call_at("SELECT DECODE(x, 'a,b,c', |) FROM t").expect("inside call");
         assert_eq!(call.name, "DECODE");
@@ -5529,6 +5681,21 @@ mod intellisense_tests {
             let call = call_at(text)
                 .unwrap_or_else(|| panic!("space inside block must keep the call: {text:?}"));
             assert_eq!(call.name, name);
+        }
+    }
+
+    #[test]
+    fn enclosing_call_rejects_routine_declaration_parameter_lists() {
+        for text in [
+            "CREATE OR REPLACE FUNCTION my_func(p_id NUMBER|",
+            "CREATE PROCEDURE pkg_proc(p_value VARCHAR2|",
+            "DECLARE FUNCTION local_func(p_id NUMBER|",
+            "CREATE PACKAGE p AS PROCEDURE member_proc(p_id NUMBER|",
+        ] {
+            assert!(
+                call_at(text).is_none(),
+                "routine declaration must not be treated as a call: {text:?}"
+            );
         }
     }
 
@@ -5683,6 +5850,8 @@ mod intellisense_tests {
         assert_eq!(call.name, "my.func");
         assert_eq!(call.qualifier, None);
         assert_eq!(call.arg_index, 1);
+        assert!(call.name_quoted);
+        assert_eq!(call.lookup_name, r#""my.func""#);
     }
 
     #[test]
@@ -5697,6 +5866,40 @@ mod intellisense_tests {
         let call = call_at(r#"SELECT "weird name"(|) FROM t"#).expect("inside call");
         assert_eq!(call.name, "weird name");
         assert_eq!(call.qualifier, None);
+    }
+
+    #[test]
+    fn quoted_routine_names_keep_lookup_spelling_and_distinct_cache_keys() {
+        let quoted = call_at(r#"SELECT "round"(|"#).expect("quoted call");
+        let unquoted = call_at("SELECT round(|").expect("unquoted call");
+
+        assert_eq!(quoted.name, "round");
+        assert!(quoted.name_quoted);
+        assert_eq!(quoted.lookup_name, r#""round""#);
+        assert_eq!(signature_key_for_call(&unquoted), "ROUND");
+        assert_ne!(
+            signature_key_for_call(&quoted),
+            signature_key_for_call(&unquoted)
+        );
+
+        let escaped = call_at(r#"BEGIN "pkg.owner"."say""hi"(|"#).expect("escaped quoted call");
+        assert_eq!(escaped.name, "say\"hi");
+        assert_eq!(escaped.qualifier.as_deref(), Some("pkg.owner"));
+        assert_eq!(escaped.lookup_name, r#""say""hi""#);
+        assert_eq!(escaped.lookup_qualifier.as_deref(), Some(r#""pkg.owner""#));
+
+        let backtick = call_at("SELECT `pkg``name`.`say``hi`(|").expect("escaped backtick call");
+        assert_eq!(backtick.name, "say`hi");
+        assert_eq!(backtick.qualifier.as_deref(), Some("pkg`name"));
+        assert_eq!(backtick.lookup_name, "`say``hi`");
+        assert_eq!(backtick.lookup_qualifier.as_deref(), Some("`pkg``name`"));
+    }
+
+    #[test]
+    fn earlier_string_quotes_do_not_hide_a_later_routine_call() {
+        let call = call_at(r#"SELECT 'a"b', MY_FUNC(|"#).expect("call after string quote");
+        assert_eq!(call.name, "MY_FUNC");
+        assert_eq!(call.arg_index, 0);
     }
 
     #[test]

@@ -3481,7 +3481,7 @@ impl SqlEditorWidget {
                                 }
                                 if cache {
                                     widget.intellisense_runtime.clear_signature_retry();
-                                    widget.schedule_signature_hint_update();
+                                    widget.schedule_signature_hint_refresh();
                                 } else {
                                     widget.schedule_signature_retry(&key);
                                 }
