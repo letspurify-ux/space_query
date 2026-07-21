@@ -363,6 +363,40 @@ impl SqlEditorWidget {
         );
     }
 
+    /// Entry point for focus-loss style hides coming from outside the
+    /// intellisense module (e.g. main-window Deactivate).
+    pub(crate) fn hide_signature_popup_after_focus_settles(&self) {
+        self.schedule_deferred_signature_unfocus_hide(INTELLISENSE_DEFERRED_HIDE_RETRIES);
+    }
+
+    /// Hide the signature popup on editor unfocus only when focus actually
+    /// left the editor. Showing the completion popup window briefly pulls
+    /// focus (macOS key-window flicker), which must not kill the hint; the
+    /// completion popup's own unfocus hide uses the same deferred check.
+    /// Rechecks are spaced in real time because the key-window round trip can
+    /// take more than one event-loop turn.
+    pub(crate) fn schedule_deferred_signature_unfocus_hide(&self, retries_left: u8) {
+        const SIGNATURE_UNFOCUS_RECHECK_SECONDS: f64 = 0.05;
+        let widget = self.clone();
+        crate::ui::ui_timeout::schedule(SIGNATURE_UNFOCUS_RECHECK_SECONDS, move || {
+            if widget.editor.was_deleted() {
+                return;
+            }
+            if widget.editor.has_focus() {
+                // SIGDBG: temporary instrumentation, remove after diagnosis
+                eprintln!("SIGDBG unfocus-skip: editor has focus again");
+                return;
+            }
+            if retries_left > 0 {
+                widget.schedule_deferred_signature_unfocus_hide(retries_left - 1);
+                return;
+            }
+            // SIGDBG: temporary instrumentation, remove after diagnosis
+            eprintln!("SIGDBG unfocus-hide: focus really left the editor");
+            widget.hide_signature_popup();
+        });
+    }
+
     fn try_hide_signature_popup_now(signature_popup: &Arc<Mutex<SignaturePopup>>) -> bool {
         match signature_popup.try_lock() {
             Ok(mut popup) => popup.hide(),
@@ -608,6 +642,8 @@ impl SqlEditorWidget {
             mysql_compatible,
             initial_lex_mode.clone(),
         ) else {
+            // SIGDBG: temporary instrumentation, remove after diagnosis
+            eprintln!("SIGDBG update: no enclosing call -> hide (cursor={cursor})");
             self.intellisense_runtime.clear_signature_retry();
             self.hide_signature_popup();
             return;
@@ -674,6 +710,8 @@ impl SqlEditorWidget {
                 self.show_signature_popup(&label, active_arg, call.open_paren as i32);
             }
             Action::Hide => {
+                // SIGDBG: temporary instrumentation, remove after diagnosis
+                eprintln!("SIGDBG update: cached-none/pending -> hide (key={key})");
                 let cached = self
                     .intellisense_data
                     .lock()
@@ -686,6 +724,8 @@ impl SqlEditorWidget {
                 self.hide_signature_popup();
             }
             Action::Fetch => {
+                // SIGDBG: temporary instrumentation, remove after diagnosis
+                eprintln!("SIGDBG update: fetch -> hide (key={key})");
                 self.hide_signature_popup();
                 self.spawn_signature_fetch(key, call.name, call.qualifier);
             }

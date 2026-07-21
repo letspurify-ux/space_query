@@ -3022,6 +3022,8 @@ impl IntellisensePopup {
                     fltk::app::compose_state()
                 )
             });
+            // SIGDBG: temporary instrumentation, remove after diagnosis
+            eprintln!("SIGDBG completion-window-first-show");
             self.window.show();
         }
         *self
@@ -4869,6 +4871,8 @@ impl SignaturePopup {
             return;
         }
 
+        // SIGDBG: temporary instrumentation, remove after diagnosis
+        eprintln!("SIGDBG frame-show text={:?}", label.text);
         let Some(frame) = self.ensure_frame(editor) else {
             self.visible = false;
             self.last_render = None;
@@ -4930,6 +4934,8 @@ impl SignaturePopup {
             self.last_render = None;
             return;
         }
+        // SIGDBG: temporary instrumentation, remove after diagnosis
+        eprintln!("SIGDBG frame-hide (was visible)");
         self.visible = false;
         self.last_render = None;
         if let Some(frame) = self.frame.as_mut() {
@@ -5491,6 +5497,14 @@ mod intellisense_tests {
     #[test]
     fn enclosing_call_none_for_bare_grouping_paren() {
         assert!(call_at("SELECT (a + |) FROM t").is_none());
+    }
+
+    #[test]
+    fn enclosing_call_found_inside_declare_begin_block() {
+        let call = call_at("declare\n  v varchar2(10);\nbegin\n  v := substr(x, |\nend;")
+            .expect("call inside PL/SQL block");
+        assert_eq!(call.name, "substr");
+        assert_eq!(call.arg_index, 1);
     }
 
     #[test]

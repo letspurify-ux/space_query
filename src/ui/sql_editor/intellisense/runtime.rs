@@ -686,6 +686,8 @@ impl SqlEditorWidget {
                     false
                 }
                 Event::Push => {
+                    // SIGDBG: temporary instrumentation, remove after diagnosis
+                    eprintln!("SIGDBG hide origin: editor mouse push");
                     widget_for_shortcuts.hide_signature_popup();
                     #[cfg(target_os = "macos")]
                     {
@@ -1739,7 +1741,8 @@ impl SqlEditorWidget {
                             });
                         Self::apply_hangul_first_key_repair_edit(&mut buffer_for_handle, edit);
                     }
-                    widget_for_shortcuts.hide_signature_popup();
+                    widget_for_shortcuts
+                        .schedule_deferred_signature_unfocus_hide(INTELLISENSE_DEFERRED_HIDE_RETRIES);
                     let unfocus_x = fltk::app::event_x_root();
                     let unfocus_y = fltk::app::event_y_root();
                     if matches!(
