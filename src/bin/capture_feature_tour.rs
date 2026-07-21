@@ -5,7 +5,8 @@ use space_query::{
     db::{ColumnInfo, QueryResult},
     ui::{
         log_viewer::LogViewerDialog, profile_by_name, show_settings_dialog, theme,
-        ConnectionDialog, IntellisensePopup, MainWindow, QueryHistoryDialog,
+        ConnectionDialog, IntellisensePopup, MainWindow, QueryHistoryDialog, SignatureLabel,
+        SignatureOverload, SignaturePopup,
     },
     utils::{arithmetic::safe_div, logging, AppConfig},
 };
@@ -183,6 +184,34 @@ fn make_result(columns: &[(&str, &str)], rows: &[&[&str]], sql: &str) -> QueryRe
     }
 }
 
+fn composite_popup<W: WindowExt>(
+    canvas: &mut [u8],
+    canvas_width: i32,
+    canvas_height: i32,
+    main_x: i32,
+    main_y: i32,
+    popup_window: &mut W,
+) {
+    let offset_x = popup_window.x_root() - main_x;
+    let offset_y = popup_window.y_root() - main_y;
+    let (popup_data, popup_width, popup_height) = capture_complete_rgb(popup_window);
+    for y in 0..popup_height {
+        let target_y = offset_y + y;
+        if !(0..canvas_height).contains(&target_y) {
+            continue;
+        }
+        for x in 0..popup_width {
+            let target_x = offset_x + x;
+            if !(0..canvas_width).contains(&target_x) {
+                continue;
+            }
+            let source = ((y * popup_width + x) * 3) as usize;
+            let target = ((target_y * canvas_width + target_x) * 3) as usize;
+            canvas[target..target + 3].copy_from_slice(&popup_data[source..source + 3]);
+        }
+    }
+}
+
 fn capture_intellisense(main_window: &mut MainWindow) {
     let sql = "SELECT e.empno,\n       e.ename,\n       e.\nFROM emp e\nWHERE e.sal > 2000;";
     let cursor = sql
@@ -229,25 +258,71 @@ fn capture_intellisense(main_window: &mut MainWindow) {
     );
     pump(300);
     let mut popup_window = app::first_window().unwrap_or_else(|| fail("intellisense popup"));
-    let offset_x = popup_window.x_root() - main_x;
-    let offset_y = popup_window.y_root() - main_y;
-    let (popup_data, popup_width, popup_height) = capture_complete_rgb(&mut popup_window);
-    for y in 0..popup_height {
-        let target_y = offset_y + y;
-        if !(0..height).contains(&target_y) {
-            continue;
-        }
-        for x in 0..popup_width {
-            let target_x = offset_x + x;
-            if !(0..width).contains(&target_x) {
-                continue;
-            }
-            let source = ((y * popup_width + x) * 3) as usize;
-            let target = ((target_y * width + target_x) * 3) as usize;
-            canvas[target..target + 3].copy_from_slice(&popup_data[source..source + 3]);
-        }
-    }
+    composite_popup(
+        &mut canvas,
+        width,
+        height,
+        main_x,
+        main_y,
+        &mut popup_window,
+    );
     save_ppm("/tmp/space-query-intellisense.ppm", &canvas, width, height);
+    popup.hide();
+}
+
+fn capture_signature_popup(main_window: &mut MainWindow) {
+    let sql = "DECLARE\n    discounted_price NUMBER;\nBEGIN\n    discounted_price := ROUND(1234.567, 2);\nEND;\n/";
+    let cursor = sql.find(", 2").unwrap_or_else(|| fail("signature cursor")) as i32 + 3;
+    let open_paren = sql
+        .find("ROUND(")
+        .unwrap_or_else(|| fail("signature anchor")) as i32
+        + 5;
+    let editor = main_window.capture_tour_set_sql(sql, Some(cursor));
+    pump(300);
+
+    let mut main =
+        app::widget_from_id::<Window>("main_window").unwrap_or_else(|| fail("main window"));
+    let main_x = main.x_root();
+    let main_y = main.y_root();
+    main.set_damage(true);
+    main.redraw();
+    app::redraw();
+    pump(200);
+    let (mut canvas, width, height) = capture_complete_rgb(&mut main);
+
+    let signature = "ROUND(number [, integer])";
+    let number_start = signature
+        .find("number")
+        .unwrap_or_else(|| fail("signature first argument"));
+    let integer_start = signature
+        .find("integer")
+        .unwrap_or_else(|| fail("signature second argument"));
+    let arg_spans = vec![
+        (number_start, number_start + "number".len()),
+        (integer_start, integer_start + "integer".len()),
+    ];
+    let label = SignatureLabel {
+        text: signature.to_string(),
+        arg_spans: arg_spans.clone(),
+        overloads: vec![SignatureOverload {
+            arg_spans,
+            required_args: 1,
+            variadic_arg: None,
+        }],
+    };
+    let mut popup = SignaturePopup::new();
+    let _ = popup.show(&editor, &label, 1, open_paren);
+    pump(300);
+    let mut popup_window = app::first_window().unwrap_or_else(|| fail("signature popup"));
+    composite_popup(
+        &mut canvas,
+        width,
+        height,
+        main_x,
+        main_y,
+        &mut popup_window,
+    );
+    save_ppm("/tmp/space-query-signature.ppm", &canvas, width, height);
     popup.hide();
 }
 
@@ -524,6 +599,7 @@ fn main() {
     }
 
     capture_intellisense(&mut main_window);
+    capture_signature_popup(&mut main_window);
     capture_object_browser(&mut main_window);
     capture_formatting(&mut main_window);
     capture_result_grid(&mut main_window);

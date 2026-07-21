@@ -1674,13 +1674,11 @@ impl SqlEditorWidget {
             false
         };
         if should_hide_after_delete {
-            intellisense_popup
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .hide();
+            Self::request_intellisense_popup_hide(intellisense_popup, runtime);
             runtime.clear_completion_range();
             return true;
         }
+        runtime.next_popup_hide_request_generation();
         {
             let mut popup = intellisense_popup
                 .lock()

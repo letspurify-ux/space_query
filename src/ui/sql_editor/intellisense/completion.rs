@@ -2210,10 +2210,7 @@ impl SqlEditorWidget {
             ) == Some(';');
 
         if should_hide_after_statement_terminator {
-            intellisense_popup
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .hide();
+            Self::request_intellisense_popup_hide(intellisense_popup, runtime);
             runtime.clear_ui_tracking();
             return;
         }
@@ -2327,14 +2324,84 @@ impl SqlEditorWidget {
         runtime.current_parse_generation() == snapshot.request_generation
     }
 
+    fn try_with_popup_lock<T>(popup: &Arc<Mutex<T>>, action: impl FnOnce(&mut T)) -> bool {
+        match popup.try_lock() {
+            Ok(mut guard) => action(&mut guard),
+            Err(std::sync::TryLockError::Poisoned(poisoned)) => {
+                let mut guard = poisoned.into_inner();
+                action(&mut guard);
+            }
+            Err(std::sync::TryLockError::WouldBlock) => return false,
+        }
+        true
+    }
+
+    fn try_hide_intellisense_popup_now(
+        intellisense_popup: &Arc<Mutex<IntellisensePopup>>,
+    ) -> bool {
+        Self::try_with_popup_lock(intellisense_popup, IntellisensePopup::hide)
+    }
+
+    fn reserve_intellisense_popup_lock_retry(retries_remaining: u8) -> Option<u8> {
+        retries_remaining.checked_sub(1)
+    }
+
+    fn log_intellisense_popup_lock_retry_exhausted(operation: &str) {
+        crate::utils::logging::log_warning(
+            "intellisense popup",
+            &format!("popup {operation} abandoned after lock retry exhaustion"),
+        );
+    }
+
+    fn schedule_deferred_intellisense_popup_hide(
+        intellisense_popup: Arc<Mutex<IntellisensePopup>>,
+        runtime: Arc<IntellisenseRuntimeState>,
+        generation: u64,
+        retries_remaining: u8,
+    ) {
+        let Some(next_retries_remaining) =
+            Self::reserve_intellisense_popup_lock_retry(retries_remaining)
+        else {
+            Self::log_intellisense_popup_lock_retry_exhausted("hide");
+            return;
+        };
+        crate::ui::ui_timeout::schedule(INTELLISENSE_POPUP_LOCK_RETRY_SECONDS, move || {
+            if !runtime.is_current_popup_hide_request(generation) {
+                return;
+            }
+            if Self::try_hide_intellisense_popup_now(&intellisense_popup) {
+                return;
+            }
+            Self::schedule_deferred_intellisense_popup_hide(
+                intellisense_popup.clone(),
+                runtime.clone(),
+                generation,
+                next_retries_remaining,
+            );
+        });
+    }
+
+    fn request_intellisense_popup_hide(
+        intellisense_popup: &Arc<Mutex<IntellisensePopup>>,
+        runtime: &Arc<IntellisenseRuntimeState>,
+    ) {
+        let generation = runtime.next_popup_hide_request_generation();
+        if Self::try_hide_intellisense_popup_now(intellisense_popup) {
+            return;
+        }
+        Self::schedule_deferred_intellisense_popup_hide(
+            intellisense_popup.clone(),
+            runtime.clone(),
+            generation,
+            INTELLISENSE_POPUP_LOCK_MAX_RETRIES,
+        );
+    }
+
     fn clear_intellisense_ui_state(
         intellisense_popup: &Arc<Mutex<IntellisensePopup>>,
         runtime: &Arc<IntellisenseRuntimeState>,
     ) {
-        intellisense_popup
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .hide();
+        Self::request_intellisense_popup_hide(intellisense_popup, runtime);
         runtime.clear_ui_tracking();
     }
 
@@ -2369,10 +2436,36 @@ impl SqlEditorWidget {
         preserve_while_pointer_inside: bool,
         retries_left: u8,
     ) {
+        let generation = runtime.next_popup_hide_request_generation();
+        Self::schedule_deferred_unfocus_popup_hide_for_request(
+            editor,
+            intellisense_popup,
+            runtime,
+            pointer_x,
+            pointer_y,
+            preserve_while_pointer_inside,
+            generation,
+            retries_left,
+            INTELLISENSE_POPUP_LOCK_MAX_RETRIES,
+        );
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn schedule_deferred_unfocus_popup_hide_for_request(
+        editor: TextEditor,
+        intellisense_popup: Arc<Mutex<IntellisensePopup>>,
+        runtime: Arc<IntellisenseRuntimeState>,
+        pointer_x: i32,
+        pointer_y: i32,
+        preserve_while_pointer_inside: bool,
+        generation: u64,
+        settle_retries_left: u8,
+        lock_retries_remaining: u8,
+    ) {
         const POPUP_UNFOCUS_RECHECK_SECONDS: f64 = 0.05;
 
         crate::ui::ui_timeout::schedule(POPUP_UNFOCUS_RECHECK_SECONDS, move || {
-            if editor.was_deleted() {
+            if editor.was_deleted() || !runtime.is_current_popup_hide_request(generation) {
                 return;
             }
 
@@ -2384,24 +2477,47 @@ impl SqlEditorWidget {
             if !Self::popup_unfocus_hide_is_settled(
                 editor_has_stable_focus,
                 transition,
-                retries_left,
+                settle_retries_left,
             ) {
-                if retries_left > 0 {
-                    Self::schedule_deferred_unfocus_popup_hide(
+                if settle_retries_left > 0 {
+                    Self::schedule_deferred_unfocus_popup_hide_for_request(
                         editor.clone(),
                         intellisense_popup.clone(),
                         runtime.clone(),
                         pointer_x,
                         pointer_y,
                         preserve_while_pointer_inside,
-                        retries_left - 1,
+                        generation,
+                        settle_retries_left - 1,
+                        lock_retries_remaining,
                     );
                 }
                 return;
             }
-            let mut popup = intellisense_popup
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let mut popup = match intellisense_popup.try_lock() {
+                Ok(popup) => popup,
+                Err(std::sync::TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
+                Err(std::sync::TryLockError::WouldBlock) => {
+                    let Some(next_retries_remaining) =
+                        Self::reserve_intellisense_popup_lock_retry(lock_retries_remaining)
+                    else {
+                        Self::log_intellisense_popup_lock_retry_exhausted("unfocus hide");
+                        return;
+                    };
+                    Self::schedule_deferred_unfocus_popup_hide_for_request(
+                        editor.clone(),
+                        intellisense_popup.clone(),
+                        runtime.clone(),
+                        pointer_x,
+                        pointer_y,
+                        preserve_while_pointer_inside,
+                        generation,
+                        0,
+                        next_retries_remaining,
+                    );
+                    return;
+                }
+            };
             let popup_visible = popup.is_visible();
             let pointer_inside_popup = preserve_while_pointer_inside
                 && popup_visible
@@ -2422,25 +2538,70 @@ impl SqlEditorWidget {
         click_y: i32,
         retries_left: u8,
     ) {
+        let generation = runtime.next_popup_hide_request_generation();
+        Self::schedule_deferred_outside_click_popup_hide_for_request(
+            intellisense_popup,
+            runtime,
+            click_x,
+            click_y,
+            generation,
+            retries_left,
+            INTELLISENSE_POPUP_LOCK_MAX_RETRIES,
+        );
+    }
+
+    fn schedule_deferred_outside_click_popup_hide_for_request(
+        intellisense_popup: Arc<Mutex<IntellisensePopup>>,
+        runtime: Arc<IntellisenseRuntimeState>,
+        click_x: i32,
+        click_y: i32,
+        generation: u64,
+        transition_retries_left: u8,
+        lock_retries_remaining: u8,
+    ) {
         crate::ui::ui_timeout::schedule(0.0, move || {
+            if !runtime.is_current_popup_hide_request(generation) {
+                return;
+            }
             if matches!(
                 runtime.popup_transition_state(),
                 IntellisensePopupTransitionState::Showing
             ) {
-                if retries_left > 0 {
-                    Self::schedule_deferred_outside_click_popup_hide(
+                if transition_retries_left > 0 {
+                    Self::schedule_deferred_outside_click_popup_hide_for_request(
                         intellisense_popup.clone(),
                         runtime.clone(),
                         click_x,
                         click_y,
-                        retries_left - 1,
+                        generation,
+                        transition_retries_left - 1,
+                        lock_retries_remaining,
                     );
                 }
                 return;
             }
-            let mut popup = intellisense_popup
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let mut popup = match intellisense_popup.try_lock() {
+                Ok(popup) => popup,
+                Err(std::sync::TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
+                Err(std::sync::TryLockError::WouldBlock) => {
+                    let Some(next_retries_remaining) =
+                        Self::reserve_intellisense_popup_lock_retry(lock_retries_remaining)
+                    else {
+                        Self::log_intellisense_popup_lock_retry_exhausted("outside-click hide");
+                        return;
+                    };
+                    Self::schedule_deferred_outside_click_popup_hide_for_request(
+                        intellisense_popup.clone(),
+                        runtime.clone(),
+                        click_x,
+                        click_y,
+                        generation,
+                        0,
+                        next_retries_remaining,
+                    );
+                    return;
+                }
+            };
             let popup_visible = popup.is_visible();
             if !popup_visible {
                 return;
@@ -2761,10 +2922,7 @@ impl SqlEditorWidget {
         } = computed;
 
         if suggestions.is_empty() {
-            intellisense_popup
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .hide();
+            Self::request_intellisense_popup_hide(intellisense_popup, runtime);
             runtime.clear_completion_range();
             return;
         }
@@ -2785,6 +2943,9 @@ impl SqlEditorWidget {
                     .set_popup_transition_state(IntellisensePopupTransitionState::Idle);
             }
         }
+        // A new popup supersedes any delayed hide that was waiting for the
+        // popup mutex during an earlier UI event.
+        runtime.next_popup_hide_request_generation();
         runtime.set_popup_transition_state(IntellisensePopupTransitionState::Showing);
         let _popup_show_reset = PopupShowInProgressReset {
             runtime: runtime.clone(),

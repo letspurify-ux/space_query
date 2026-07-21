@@ -1,6 +1,8 @@
 use crate::sql_text;
 use crate::ui::theme;
-use fltk::{browser::HoldBrowser, prelude::*, text::TextEditor, window::Window};
+use fltk::{
+    browser::HoldBrowser, frame::Frame, group::Group, prelude::*, text::TextEditor, window::Window,
+};
 use std::any::Any;
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -2803,38 +2805,35 @@ impl IntellisensePopup {
     }
 
     pub fn new() -> Self {
-        // Temporarily suspend current group to prevent popup window from being
-        // added to the parent container (which causes layout issues)
-        let current_group = fltk::group::Group::try_current();
+        let (mut window, browser) = {
+            // Keep the popup outside the editor's parent container. The guard
+            // restores FLTK's process-wide current group even if construction
+            // or styling unwinds.
+            let _group_guard = PopupGroupGuard::suspend();
 
-        fltk::group::Group::set_current(None::<&fltk::group::Group>);
+            let mut window = Window::default().with_size(320, 200);
+            window.set_border(false);
+            window.set_color(theme::panel_raised());
+            window.make_modal(false);
+            // Keep typing focus on the SQL editor even when popup is shown.
+            // Override windows are not managed as focus-stealing toplevels.
+            window.set_override();
 
-        let mut window = Window::default().with_size(320, 200);
-        window.set_border(false);
-        window.set_color(theme::panel_raised());
-        window.make_modal(false);
-        // Keep typing focus on the SQL editor even when popup is shown.
-        // Override windows are not managed as focus-stealing toplevels.
-        window.set_override();
+            let mut browser = HoldBrowser::default().with_size(320, 200).with_pos(0, 0);
+            browser.set_color(theme::panel_alt());
+            browser.set_selection_color(theme::selection_strong());
+            // Render items at the configured UI font size so the popup matches the
+            // rest of the app and width/height can be measured against it.
+            browser.set_text_size(crate::ui::configured_ui_font_size());
+            // Two-column layout: suggestion name (fixed width) then a detail
+            // column (type / PK / NN / FK badges) that fills the remainder.
+            browser.set_column_char('\t');
+            browser.set_column_widths(&[180]);
+            theme::style_browser_scrollbars(&browser);
 
-        let mut browser = HoldBrowser::default().with_size(320, 200).with_pos(0, 0);
-        browser.set_color(theme::panel_alt());
-        browser.set_selection_color(theme::selection_strong());
-        // Render items at the configured UI font size so the popup matches the
-        // rest of the app and width/height can be measured against it.
-        browser.set_text_size(crate::ui::configured_ui_font_size());
-        // Two-column layout: suggestion name (fixed width) then a detail
-        // column (type / PK / NN / FK badges) that fills the remainder.
-        browser.set_column_char('\t');
-        browser.set_column_widths(&[180]);
-        theme::style_browser_scrollbars(&browser);
-
-        window.end();
-
-        // Restore current group
-        if let Some(ref group) = current_group {
-            fltk::group::Group::set_current(Some(group));
-        }
+            window.end();
+            (window, browser)
+        };
 
         let visible_suggestion_indices = Arc::new(Mutex::new(Vec::new()));
         let all_suggestions = Arc::new(Mutex::new(Vec::new()));
@@ -4553,11 +4552,35 @@ pub(crate) fn sql_context_for_phase(
     }
 }
 
-/// In-editor overlay showing the signature of the routine call enclosing the
-/// cursor, with the active argument emphasized. The editor's draw callback
-/// paints this after the text so editor redraws cannot cover the hint.
+struct PopupGroupGuard {
+    previous: Option<Group>,
+}
+
+impl PopupGroupGuard {
+    fn suspend() -> Self {
+        let previous = Group::try_current();
+        Group::set_current(None::<&Group>);
+        Self { previous }
+    }
+}
+
+impl Drop for PopupGroupGuard {
+    fn drop(&mut self) {
+        if let Some(group) = self.previous.as_ref().filter(|group| !group.was_deleted()) {
+            Group::set_current(Some(group));
+        } else {
+            Group::set_current(None::<&Group>);
+        }
+    }
+}
+
+/// Borderless override window showing the signature of the routine call
+/// enclosing the cursor, with the active argument emphasized. Keeping the hint
+/// in its own native window lets it extend above the SQL editor without being
+/// clipped or repainted by the editor.
 pub struct SignaturePopup {
-    visible: bool,
+    window: Option<Window>,
+    frame: Option<Frame>,
     last_render: Option<SignaturePopupRenderState>,
 }
 
@@ -4620,9 +4643,59 @@ impl SignaturePopup {
 
     pub fn new() -> Self {
         Self {
-            visible: false,
+            window: None,
+            frame: None,
             last_render: None,
         }
+    }
+
+    fn widgets_deleted(&self) -> bool {
+        self.window
+            .as_ref()
+            .is_some_and(|window| window.was_deleted())
+            || self.frame.as_ref().is_some_and(|frame| frame.was_deleted())
+    }
+
+    fn ensure_window(&mut self) {
+        if self.widgets_deleted() {
+            self.window = None;
+            self.frame = None;
+            self.last_render = None;
+        }
+        if self.window.is_some() && self.frame.is_some() {
+            return;
+        }
+
+        let (mut window, mut frame) = {
+            let _group_guard = PopupGroupGuard::suspend();
+
+            let mut window = Window::default().with_size(200, Self::height());
+            window.set_border(false);
+            window.set_color(theme::panel_raised());
+            window.make_modal(false);
+            window.set_override();
+
+            let mut frame = Frame::default()
+                .with_size(200, Self::height())
+                .with_pos(0, 0);
+            frame.set_frame(fltk::enums::FrameType::FlatBox);
+            frame.set_color(theme::panel_raised());
+            frame.clear_visible_focus();
+            window.end();
+            (window, frame)
+        };
+
+        let mut window_for_click = window.clone();
+        frame.handle(move |_, event| {
+            if event != fltk::enums::Event::Push {
+                return false;
+            }
+            window_for_click.hide();
+            true
+        });
+        window.hide();
+        self.window = Some(window);
+        self.frame = Some(frame);
     }
 
     fn styled_lines(label: &SignatureLabel, active_arg: usize) -> Vec<Vec<SignaturePopupTextRun>> {
@@ -4689,33 +4762,58 @@ impl SignaturePopup {
             .collect()
     }
 
-    /// Position inside the editor. `position_to_xy` returns window-local
-    /// coordinates, so clamp them to the editor before its draw callback paints
-    /// the overlay.
-    fn overlay_position(
+    fn position_in_work_area(
+        anchor: (i32, i32),
+        popup_size: (i32, i32),
+        line_height: i32,
+        work_area: (i32, i32, i32, i32),
+    ) -> (i32, i32) {
+        let (anchor_x, anchor_y) = anchor;
+        let (width, height) = popup_size;
+        let (screen_x, screen_y, screen_w, screen_h) = work_area;
+        let max_x = screen_x
+            .saturating_add(screen_w)
+            .saturating_sub(width)
+            .max(screen_x);
+        let max_y = screen_y
+            .saturating_add(screen_h)
+            .saturating_sub(height)
+            .max(screen_y);
+        let popup_x = anchor_x.clamp(screen_x, max_x);
+        let above_y = anchor_y.saturating_sub(height).saturating_sub(2);
+        let preferred_y = if above_y >= screen_y {
+            above_y
+        } else {
+            anchor_y.saturating_add(line_height).saturating_add(2)
+        };
+        let popup_y = preferred_y.clamp(screen_y, max_y);
+        (popup_x, popup_y)
+    }
+
+    /// Convert the opening parenthesis position to screen coordinates. Unlike
+    /// an editor overlay, this permits the hint to occupy space above the SQL
+    /// editor; only the monitor work area constrains it.
+    fn popup_screen_position(
         editor: &TextEditor,
         anchor_pos: i32,
         width: i32,
         height: i32,
     ) -> (i32, i32) {
         let (cursor_x, cursor_y) = editor.position_to_xy(anchor_pos);
-        let mut popup_x = cursor_x;
-        let mut popup_y = cursor_y.saturating_sub(height).saturating_sub(2);
-
-        let min_x = editor.x();
-        let min_y = editor.y();
-        let max_x = min_x
-            .saturating_add(editor.w())
-            .saturating_sub(width)
-            .max(min_x);
-        let max_y = min_y
-            .saturating_add(editor.h())
-            .saturating_sub(height)
-            .max(min_y);
-        popup_x = popup_x.clamp(min_x, max_x);
-        popup_y = popup_y.clamp(min_y, max_y);
-
-        (popup_x, popup_y)
+        let (window_x, window_y) = editor
+            .window()
+            .map(|window| (window.x_root(), window.y_root()))
+            .unwrap_or((0, 0));
+        let anchor_x = window_x.saturating_add(cursor_x);
+        let anchor_y = window_y.saturating_add(cursor_y);
+        let screen = fltk::app::screen_num(anchor_x, anchor_y);
+        let work_area = fltk::app::screen_work_area(screen);
+        Self::position_in_work_area(
+            (anchor_x, anchor_y),
+            (width, height),
+            Self::height(),
+            work_area,
+        )
     }
 
     /// Render `label` with the argument at `active_arg` emphasized, sizing and
@@ -4726,10 +4824,10 @@ impl SignaturePopup {
         label: &SignatureLabel,
         active_arg: usize,
         anchor_pos: i32,
-    ) {
+    ) -> bool {
         if label.text.is_empty() {
             self.hide();
-            return;
+            return false;
         }
 
         let lines = Self::styled_lines(label, active_arg);
@@ -4748,7 +4846,7 @@ impl SignaturePopup {
         let width = text_w.saturating_add(20).clamp(120, 1100);
         let line_count = i32::try_from(lines.len().max(1)).unwrap_or(i32::MAX);
         let height = Self::height().saturating_mul(line_count);
-        let (x, y) = Self::overlay_position(editor, anchor_pos, width, height);
+        let (x, y) = Self::popup_screen_position(editor, anchor_pos, width, height);
         let render_state = SignaturePopupRenderState {
             lines,
             normal_font: profile.normal,
@@ -4766,40 +4864,50 @@ impl SignaturePopup {
                 .as_ref()
                 .is_some_and(|last_render| last_render == &render_state)
         {
-            return;
+            return false;
         }
-        self.visible = true;
+        if !self.is_visible() && fltk::app::compose_state() > 0 {
+            return false;
+        }
+        self.ensure_window();
+        let Some(window) = self.window.as_mut() else {
+            return false;
+        };
+        let Some(frame) = self.frame.as_mut() else {
+            return false;
+        };
+
+        let draw_state = render_state.clone();
+        frame.draw(move |frame| Self::draw_render_state(frame, &draw_state));
+        window.resize(x, y, width, height);
+        frame.resize(0, 0, width, height);
+        let first_show = !window.shown();
+        if first_show {
+            window.show();
+        }
+        frame.redraw();
+        window.redraw();
         self.last_render = Some(render_state);
+        first_show
     }
 
-    /// Draw the current hint after the editor's normal contents. Resetting the
-    /// clip is intentional: FLTK may redraw only the edited text range, while
-    /// the signature can be anchored elsewhere in the same editor.
-    pub(crate) fn draw_overlay(&self, editor: &TextEditor) {
-        if !self.visible || editor.was_deleted() {
-            return;
-        }
-        let Some(render) = self.last_render.as_ref() else {
-            return;
-        };
+    fn draw_render_state(frame: &Frame, render: &SignaturePopupRenderState) {
         let line_height = render.font_size.saturating_add(8).max(22);
 
-        fltk::draw::push_no_clip();
-        fltk::draw::push_clip(editor.x(), editor.y(), editor.w(), editor.h());
-        fltk::draw::push_clip(render.x, render.y, render.width, render.height);
+        fltk::draw::push_clip(frame.x(), frame.y(), frame.w(), frame.h());
         fltk::draw::draw_box(
             fltk::enums::FrameType::FlatBox,
-            render.x,
-            render.y,
-            render.width,
-            render.height,
+            frame.x(),
+            frame.y(),
+            frame.w(),
+            frame.h(),
             theme::panel_raised(),
         );
         for (line_index, line) in render.lines.iter().enumerate() {
-            let mut run_x = render.x.saturating_add(10);
+            let mut run_x = frame.x().saturating_add(10);
             let line_index = i32::try_from(line_index).unwrap_or(i32::MAX);
-            let line_y = render
-                .y
+            let line_y = frame
+                .y()
                 .saturating_add(line_index.saturating_mul(line_height));
             for run in line {
                 fltk::draw::set_font(
@@ -4822,25 +4930,34 @@ impl SignaturePopup {
             }
         }
         fltk::draw::pop_clip();
-        fltk::draw::pop_clip();
-        fltk::draw::pop_clip();
     }
 
     pub fn hide(&mut self) {
-        if !self.visible {
+        if self.widgets_deleted() {
+            self.window = None;
+            self.frame = None;
             self.last_render = None;
             return;
         }
-        self.visible = false;
+        if let Some(window) = self.window.as_mut() {
+            window.hide();
+            window.resize(0, 0, 0, 0);
+        }
         self.last_render = None;
     }
 
     pub fn is_visible(&self) -> bool {
-        self.visible
+        !self.widgets_deleted() && self.window.as_ref().is_some_and(|window| window.shown())
     }
 
     pub fn delete_for_close(&mut self) {
         self.hide();
+        self.frame = None;
+        if let Some(window) = self.window.take() {
+            if !window.was_deleted() {
+                Window::delete(window);
+            }
+        }
     }
 }
 
@@ -4892,6 +5009,22 @@ mod intellisense_tests {
             i32::MAX
         );
         assert_eq!(SignaturePopup::saturating_line_width([-1, 10]), 10);
+    }
+
+    #[test]
+    fn signature_popup_uses_monitor_space_above_the_editor_first_line() {
+        assert_eq!(
+            SignaturePopup::position_in_work_area((320, 180), (240, 44), 22, (0, 0, 1440, 900),),
+            (320, 134)
+        );
+    }
+
+    #[test]
+    fn signature_popup_falls_below_the_line_at_the_monitor_top() {
+        assert_eq!(
+            SignaturePopup::position_in_work_area((100, 5), (200, 44), 22, (0, 0, 800, 600)),
+            (100, 29)
+        );
     }
 
     #[test]

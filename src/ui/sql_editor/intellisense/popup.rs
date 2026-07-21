@@ -354,17 +354,14 @@ impl SqlEditorWidget {
             Self::try_hide_signature_popup_now(&self.signature_popup)
         }) {
             Some(false) => {}
-            Some(true) => {
-                Self::redraw_signature_overlay(&self.editor);
-                return;
-            }
+            Some(true) => return,
             None => return,
         }
         Self::schedule_deferred_signature_popup_hide(
             self.signature_popup.clone(),
             self.intellisense_runtime.clone(),
-            self.editor.clone(),
             generation,
+            SIGNATURE_POPUP_LOCK_MAX_RETRIES,
         );
     }
 
@@ -412,38 +409,44 @@ impl SqlEditorWidget {
     fn schedule_deferred_signature_popup_hide(
         signature_popup: Arc<Mutex<SignaturePopup>>,
         runtime: Arc<IntellisenseRuntimeState>,
-        editor: TextEditor,
         generation: u64,
+        retries_remaining: u8,
     ) {
+        let Some(next_retries_remaining) =
+            Self::reserve_signature_popup_lock_retry(retries_remaining)
+        else {
+            Self::log_signature_popup_lock_retry_exhausted("hide");
+            return;
+        };
         crate::ui::ui_timeout::schedule(SIGNATURE_POPUP_LOCK_RETRY_SECONDS, move || {
-            if editor.was_deleted() || !runtime.is_current_signature_popup_request(generation) {
+            if !runtime.is_current_signature_popup_request(generation) {
                 return;
             }
             match Self::catch_signature_popup_action(|| {
                 Self::try_hide_signature_popup_now(&signature_popup)
             }) {
                 Some(false) => {}
-                Some(true) => {
-                    Self::redraw_signature_overlay(&editor);
-                    return;
-                }
+                Some(true) => return,
                 None => return,
             }
             Self::schedule_deferred_signature_popup_hide(
                 signature_popup.clone(),
                 runtime.clone(),
-                editor.clone(),
                 generation,
+                next_retries_remaining,
             );
         });
     }
 
-    fn redraw_signature_overlay(editor: &TextEditor) {
-        if editor.was_deleted() {
-            return;
-        }
-        let mut editor = editor.clone();
-        editor.redraw();
+    fn reserve_signature_popup_lock_retry(retries_remaining: u8) -> Option<u8> {
+        retries_remaining.checked_sub(1)
+    }
+
+    fn log_signature_popup_lock_retry_exhausted(operation: &str) {
+        crate::utils::logging::log_warning(
+            "signature hint",
+            &format!("signature popup {operation} abandoned after lock retry exhaustion"),
+        );
     }
 
     fn try_show_signature_popup_now(
@@ -453,16 +456,19 @@ impl SqlEditorWidget {
         active_arg: usize,
         anchor_pos: i32,
     ) -> bool {
-        match signature_popup.try_lock() {
+        let restore_editor_focus = match signature_popup.try_lock() {
             Ok(mut popup) => popup.show(editor, label, active_arg, anchor_pos),
             Err(std::sync::TryLockError::Poisoned(poisoned)) => {
                 poisoned
                     .into_inner()
-                    .show(editor, label, active_arg, anchor_pos);
+                    .show(editor, label, active_arg, anchor_pos)
             }
             Err(std::sync::TryLockError::WouldBlock) => return false,
+        };
+        if restore_editor_focus {
+            let mut editor = editor.clone();
+            let _ = editor.take_focus();
         }
-        Self::redraw_signature_overlay(editor);
         true
     }
 
@@ -488,7 +494,16 @@ impl SqlEditorWidget {
         active_arg: usize,
         anchor_pos: i32,
         generation: u64,
+        retries_remaining: u8,
     ) {
+        let Some(next_retries_remaining) =
+            Self::reserve_signature_popup_lock_retry(retries_remaining)
+        else {
+            runtime
+                .set_signature_popup_transition_state(IntellisensePopupTransitionState::Idle);
+            Self::log_signature_popup_lock_retry_exhausted("show");
+            return;
+        };
         crate::ui::ui_timeout::schedule(SIGNATURE_POPUP_LOCK_RETRY_SECONDS, move || {
             if editor.was_deleted() || !runtime.is_current_signature_popup_request(generation) {
                 return;
@@ -518,6 +533,7 @@ impl SqlEditorWidget {
                 active_arg,
                 anchor_pos,
                 generation,
+                next_retries_remaining,
             );
         });
     }
@@ -553,6 +569,7 @@ impl SqlEditorWidget {
             active_arg,
             anchor_pos,
             generation,
+            SIGNATURE_POPUP_LOCK_MAX_RETRIES,
         );
     }
 
@@ -566,6 +583,7 @@ impl SqlEditorWidget {
             self.signature_popup.clone(),
             self.intellisense_runtime.clone(),
             generation,
+            SIGNATURE_POPUP_LOCK_MAX_RETRIES,
         );
     }
 
@@ -573,6 +591,7 @@ impl SqlEditorWidget {
         signature_popup: Arc<Mutex<SignaturePopup>>,
         runtime: Arc<IntellisenseRuntimeState>,
         generation: u64,
+        retries_remaining: u8,
     ) {
         if !runtime.is_current_signature_popup_request(generation) {
             return;
@@ -590,11 +609,18 @@ impl SqlEditorWidget {
         if !matches!(deleted, Some(false)) {
             return;
         }
+        let Some(next_retries_remaining) =
+            Self::reserve_signature_popup_lock_retry(retries_remaining)
+        else {
+            Self::log_signature_popup_lock_retry_exhausted("delete");
+            return;
+        };
         crate::ui::ui_timeout::schedule(SIGNATURE_POPUP_LOCK_RETRY_SECONDS, move || {
             Self::try_delete_signature_popup_for_close(
                 signature_popup.clone(),
                 runtime.clone(),
                 generation,
+                next_retries_remaining,
             );
         });
     }
@@ -899,10 +925,20 @@ impl SqlEditorWidget {
             );
             return;
         }
-        let mut popup = self
-            .intellisense_popup
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut popup = match self.intellisense_popup.try_lock() {
+            Ok(popup) => popup,
+            Err(std::sync::TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
+            Err(std::sync::TryLockError::WouldBlock) => {
+                Self::schedule_deferred_outside_click_popup_hide(
+                    self.intellisense_popup.clone(),
+                    self.intellisense_runtime.clone(),
+                    x,
+                    y,
+                    INTELLISENSE_DEFERRED_HIDE_RETRIES,
+                );
+                return;
+            }
+        };
         let popup_visible = popup.is_visible();
         if !popup_visible {
             return;
@@ -917,10 +953,18 @@ impl SqlEditorWidget {
     }
 
     pub fn hide_intellisense_popup(&self) {
-        let mut popup = self
-            .intellisense_popup
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut popup = match self.intellisense_popup.try_lock() {
+            Ok(popup) => popup,
+            Err(std::sync::TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
+            Err(std::sync::TryLockError::WouldBlock) => {
+                Self::request_intellisense_popup_hide(
+                    &self.intellisense_popup,
+                    &self.intellisense_runtime,
+                );
+                Self::clear_intellisense_state_for_external_hide(&self.intellisense_runtime);
+                return;
+            }
+        };
         if !popup.is_visible() {
             return;
         }
@@ -954,8 +998,10 @@ impl SqlEditorWidget {
             return;
         }
 
-        let Ok(mut popup) = self.intellisense_popup.try_lock() else {
-            return;
+        let mut popup = match self.intellisense_popup.try_lock() {
+            Ok(popup) => popup,
+            Err(std::sync::TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
+            Err(std::sync::TryLockError::WouldBlock) => return,
         };
         if !popup.is_visible() {
             return;

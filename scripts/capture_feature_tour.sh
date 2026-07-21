@@ -31,6 +31,7 @@ fi
 convert_capture main main-window
 convert_capture connect connection-dialog
 convert_capture intellisense intellisense
+convert_capture signature signature-popup
 convert_capture object-browser object-browser
 convert_capture formatting-before sql-formatting-before
 convert_capture formatting-after sql-formatting-after

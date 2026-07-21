@@ -426,20 +426,6 @@ impl SqlEditorWidget {
         let navigation_keyup_state = Arc::new(Mutex::new(NavigationKeyupState::Idle));
         let intellisense_runtime = self.intellisense_runtime.clone();
 
-        // Paint the signature after TextEditor draws its text. Keeping the
-        // hint in the editor's draw pass gives it deterministic z-order across
-        // typing and syntax-highlight redraws without creating a focusable
-        // popup window.
-        let signature_popup_for_draw = self.signature_popup.clone();
-        editor.draw(move |ed| match signature_popup_for_draw.try_lock() {
-            Ok(popup) => popup.draw_overlay(ed),
-            Err(std::sync::TryLockError::Poisoned(poisoned)) => {
-                poisoned.into_inner().draw_overlay(ed);
-            }
-            Err(std::sync::TryLockError::WouldBlock) => {}
-        });
-        editor.super_draw_first(true);
-
         // Setup callback for inserting selected text
         let mut buffer_for_insert = buffer.clone();
         let mut editor_for_insert = editor.clone();
@@ -820,6 +806,12 @@ impl SqlEditorWidget {
                         Self::show_editor_context_menu(ed, &context_action_callback_for_handle);
                         return true;
                     }
+                    if event_button == fltk::app::MouseButton::Left as i32 {
+                        // The custom handler runs before TextEditor moves its
+                        // caret. Recompute on the next UI turn so the hint is
+                        // anchored to the final click position.
+                        widget_for_shortcuts.schedule_signature_hint_update();
+                    }
                     false
                 }
                 Event::KeyDown => {
@@ -857,10 +849,10 @@ impl SqlEditorWidget {
                     keydown_had_alt_for_handle = alt;
 
                     if Self::should_hide_intellisense_on_modifier_keydown(popup_visible, key) {
-                        intellisense_popup_for_handle
-                            .lock()
-                            .unwrap_or_else(|poisoned| poisoned.into_inner())
-                            .hide();
+                        Self::request_intellisense_popup_hide(
+                            &intellisense_popup_for_handle,
+                            &intellisense_runtime_for_handle,
+                        );
                         Self::invalidate_and_clear_pending_intellisense_state(
                             &intellisense_runtime_for_handle,
                         );
@@ -893,10 +885,10 @@ impl SqlEditorWidget {
 
                     if ctrl_or_cmd && shift && matches!(key, Key::Up | Key::Down) {
                         if popup_visible {
-                            intellisense_popup_for_handle
-                                .lock()
-                                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                                .hide();
+                            Self::request_intellisense_popup_hide(
+                                &intellisense_popup_for_handle,
+                                &intellisense_runtime_for_handle,
+                            );
                         }
                         Self::invalidate_and_clear_pending_intellisense_state(
                             &intellisense_runtime_for_handle,
@@ -908,10 +900,10 @@ impl SqlEditorWidget {
 
                     if shortcut_key == Key::Escape {
                         if popup_visible {
-                            intellisense_popup_for_handle
-                                .lock()
-                                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                                .hide();
+                            Self::request_intellisense_popup_hide(
+                                &intellisense_popup_for_handle,
+                                &intellisense_runtime_for_handle,
+                            );
                         }
                         return Self::cancel_intellisense_on_escape_keydown(
                             popup_visible,
@@ -1059,10 +1051,10 @@ impl SqlEditorWidget {
                                         .unwrap_or_else(|poisoned| poisoned.into_inner()) =
                                         EnterKeyupSuppression::PopupConfirm;
                                 }
-                                intellisense_popup_for_handle
-                                    .lock()
-                                    .unwrap_or_else(|poisoned| poisoned.into_inner())
-                                    .hide();
+                                Self::request_intellisense_popup_hide(
+                                    &intellisense_popup_for_handle,
+                                    &intellisense_runtime_for_handle,
+                                );
                                 intellisense_runtime_for_handle.clear_pending_intellisense();
                                 if has_selected {
                                     widget_for_shortcuts.schedule_signature_hint_update();
@@ -1189,10 +1181,10 @@ impl SqlEditorWidget {
                             &text_shadow_for_handle,
                         );
                         if handled {
-                            intellisense_popup_for_handle
-                                .lock()
-                                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                                .hide();
+                            Self::request_intellisense_popup_hide(
+                                &intellisense_popup_for_handle,
+                                &intellisense_runtime_for_handle,
+                            );
                             intellisense_runtime_for_handle.clear_ui_tracking();
                             Self::invalidate_keyup_debounce_with_parse_generation(
                                 &intellisense_runtime_for_handle,
@@ -1209,10 +1201,10 @@ impl SqlEditorWidget {
                             &text_shadow_for_handle,
                         );
                         if handled {
-                            intellisense_popup_for_handle
-                                .lock()
-                                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                                .hide();
+                            Self::request_intellisense_popup_hide(
+                                &intellisense_popup_for_handle,
+                                &intellisense_runtime_for_handle,
+                            );
                             intellisense_runtime_for_handle.clear_ui_tracking();
                             Self::invalidate_keyup_debounce_with_parse_generation(
                                 &intellisense_runtime_for_handle,
@@ -1391,10 +1383,10 @@ impl SqlEditorWidget {
                             widget_for_shortcuts.schedule_signature_hint_update();
                         }
                         if popup_visible {
-                            intellisense_popup_for_handle
-                                .lock()
-                                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                                .hide();
+                            Self::request_intellisense_popup_hide(
+                                &intellisense_popup_for_handle,
+                                &intellisense_runtime_for_handle,
+                            );
                         }
                         Self::invalidate_and_clear_pending_intellisense_state(
                             &intellisense_runtime_for_handle,
@@ -1437,10 +1429,10 @@ impl SqlEditorWidget {
                         )
                     {
                         if popup_visible {
-                            intellisense_popup_for_handle
-                                .lock()
-                                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                                .hide();
+                            Self::request_intellisense_popup_hide(
+                                &intellisense_popup_for_handle,
+                                &intellisense_runtime_for_handle,
+                            );
                             intellisense_runtime_for_handle.clear_ui_tracking();
                             Self::invalidate_keyup_debounce_with_parse_generation(
                                 &intellisense_runtime_for_handle,
@@ -1473,10 +1465,10 @@ impl SqlEditorWidget {
                         Key::Left | Key::Right | Key::Home | Key::End | Key::PageUp | Key::PageDown
                     ) {
                         if popup_visible {
-                            intellisense_popup_for_handle
-                                .lock()
-                                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                                .hide();
+                            Self::request_intellisense_popup_hide(
+                                &intellisense_popup_for_handle,
+                                &intellisense_runtime_for_handle,
+                            );
                             intellisense_runtime_for_handle.clear_ui_tracking();
                         }
                         Self::invalidate_keyup_debounce_with_parse_generation(
@@ -1567,10 +1559,10 @@ impl SqlEditorWidget {
                                 &connection_for_handle,
                             );
                         } else {
-                            intellisense_popup_for_handle
-                                .lock()
-                                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                                .hide();
+                            Self::request_intellisense_popup_hide(
+                                &intellisense_popup_for_handle,
+                                &intellisense_runtime_for_handle,
+                            );
                             intellisense_runtime_for_handle.clear_ui_tracking();
                             Self::invalidate_keyup_debounce_with_parse_generation(
                                 &intellisense_runtime_for_handle,
@@ -1670,10 +1662,10 @@ impl SqlEditorWidget {
                                     &connection_for_handle,
                                 );
                             } else {
-                                intellisense_popup_for_handle
-                                    .lock()
-                                    .unwrap_or_else(|poisoned| poisoned.into_inner())
-                                    .hide();
+                                Self::request_intellisense_popup_hide(
+                                    &intellisense_popup_for_handle,
+                                    &intellisense_runtime_for_handle,
+                                );
                                 intellisense_runtime_for_handle.clear_ui_tracking();
                                 Self::invalidate_keyup_debounce_with_parse_generation(
                                     &intellisense_runtime_for_handle,
@@ -1705,10 +1697,10 @@ impl SqlEditorWidget {
                                     &connection_for_handle,
                                 );
                             } else {
-                                intellisense_popup_for_handle
-                                    .lock()
-                                    .unwrap_or_else(|poisoned| poisoned.into_inner())
-                                    .hide();
+                                Self::request_intellisense_popup_hide(
+                                    &intellisense_popup_for_handle,
+                                    &intellisense_runtime_for_handle,
+                                );
                                 intellisense_runtime_for_handle.clear_ui_tracking();
                                 Self::invalidate_keyup_debounce_with_parse_generation(
                                     &intellisense_runtime_for_handle,
@@ -1718,10 +1710,10 @@ impl SqlEditorWidget {
                         } else {
                             // Non-identifier character (space, punctuation, etc.)
                             // Close popup - user is done with this word
-                            intellisense_popup_for_handle
-                                .lock()
-                                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                                .hide();
+                            Self::request_intellisense_popup_hide(
+                                &intellisense_popup_for_handle,
+                                &intellisense_runtime_for_handle,
+                            );
                             intellisense_runtime_for_handle.clear_ui_tracking();
                             Self::invalidate_keyup_debounce_with_parse_generation(
                                 &intellisense_runtime_for_handle,
@@ -1773,9 +1765,24 @@ impl SqlEditorWidget {
                         return false;
                     }
                     let should_hide_and_clear = {
-                        let mut popup = intellisense_popup_for_handle
-                            .lock()
-                            .unwrap_or_else(|poisoned| poisoned.into_inner());
+                        let mut popup = match intellisense_popup_for_handle.try_lock() {
+                            Ok(popup) => popup,
+                            Err(std::sync::TryLockError::Poisoned(poisoned)) => {
+                                poisoned.into_inner()
+                            }
+                            Err(std::sync::TryLockError::WouldBlock) => {
+                                Self::schedule_deferred_unfocus_popup_hide(
+                                    ed.clone(),
+                                    intellisense_popup_for_handle.clone(),
+                                    intellisense_runtime_for_handle.clone(),
+                                    unfocus_x,
+                                    unfocus_y,
+                                    true,
+                                    0,
+                                );
+                                return false;
+                            }
+                        };
                         let popup_visible = popup.is_visible();
                         let pointer_inside_popup =
                             popup_visible && popup.contains_point(unfocus_x, unfocus_y);

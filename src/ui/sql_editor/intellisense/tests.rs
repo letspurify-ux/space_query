@@ -9667,6 +9667,25 @@ fn popup_hides_never_block_on_a_busy_mutex() {
     assert!(!SqlEditorWidget::can_try_hide_intellisense_popup(
         IntellisensePopupTransitionState::Showing
     ));
+    let intellisense_popup_state = Arc::new(Mutex::new(false));
+    let locked = intellisense_popup_state
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    assert!(!SqlEditorWidget::try_with_popup_lock(
+        &intellisense_popup_state,
+        |hidden| *hidden = true,
+    ));
+    drop(locked);
+    assert!(SqlEditorWidget::try_with_popup_lock(
+        &intellisense_popup_state,
+        |hidden| *hidden = true,
+    ));
+    assert!(
+        *intellisense_popup_state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    );
+
     let signature_popup = Arc::new(Mutex::new(SignaturePopup::new()));
     let locked = signature_popup
         .lock()
@@ -9681,11 +9700,46 @@ fn popup_hides_never_block_on_a_busy_mutex() {
 }
 
 #[test]
+fn intellisense_popup_lock_retry_budget_is_bounded() {
+    let mut retries_remaining = INTELLISENSE_POPUP_LOCK_MAX_RETRIES;
+    let mut retry_count = 0;
+
+    while let Some(next) =
+        SqlEditorWidget::reserve_intellisense_popup_lock_retry(retries_remaining)
+    {
+        retry_count += 1;
+        retries_remaining = next;
+    }
+
+    assert_eq!(
+        retry_count,
+        usize::from(INTELLISENSE_POPUP_LOCK_MAX_RETRIES)
+    );
+    assert_eq!(retries_remaining, 0);
+}
+
+#[test]
 fn signature_popup_actions_contain_panics() {
     assert_eq!(
         SqlEditorWidget::catch_signature_popup_action(|| panic!("popup test panic")),
         None
     );
+}
+
+#[test]
+fn signature_popup_lock_retry_budget_is_bounded() {
+    let mut retries_remaining = SIGNATURE_POPUP_LOCK_MAX_RETRIES;
+    let mut retry_count = 0;
+
+    while let Some(next) =
+        SqlEditorWidget::reserve_signature_popup_lock_retry(retries_remaining)
+    {
+        retry_count += 1;
+        retries_remaining = next;
+    }
+
+    assert_eq!(retry_count, usize::from(SIGNATURE_POPUP_LOCK_MAX_RETRIES));
+    assert_eq!(retries_remaining, 0);
 }
 
 #[test]

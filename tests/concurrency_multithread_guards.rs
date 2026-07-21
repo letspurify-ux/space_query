@@ -2178,8 +2178,14 @@ fn intellisense_and_signature_popups_follow_window_and_click_lifecycle() {
     let editor_push_start = editor_runtime
         .find("Event::Push =>")
         .expect("editor push handler should exist");
-    let editor_push = &editor_runtime[editor_push_start..];
+    let editor_push_end = editor_runtime[editor_push_start..]
+        .find("Event::KeyDown =>")
+        .map(|offset| editor_push_start + offset)
+        .expect("editor keydown handler should follow push handler");
+    let editor_push = &editor_runtime[editor_push_start..editor_push_end];
     assert!(editor_push.contains("widget_for_shortcuts.hide_signature_popup()"));
+    assert!(editor_push.contains("widget_for_shortcuts.schedule_signature_hint_update()"));
+    assert!(editor_push.contains("MouseButton::Left"));
 
     let intellisense = read_source("src/ui/intellisense.rs");
     let completion_popup_start = intellisense
@@ -2190,15 +2196,14 @@ fn intellisense_and_signature_popups_follow_window_and_click_lifecycle() {
         .expect("signature popup state should follow completion popup state");
     let completion_popup = &intellisense[completion_popup_start..signature_popup_start];
     assert!(completion_popup.contains("!self.is_deleted() && self.window.shown()"));
+    assert!(completion_popup.contains("let _group_guard = PopupGroupGuard::suspend()"));
     assert!(!completion_popup.contains("PopupState"));
 }
 
 #[test]
-fn signature_popup_is_painted_after_editor_contents() {
+fn signature_popup_uses_an_override_window_outside_the_editor_clip() {
     let runtime = read_source("src/ui/sql_editor/intellisense/runtime.rs");
-    assert!(runtime.contains("editor.draw(move |ed|"));
-    assert!(runtime.contains("popup.draw_overlay(ed)"));
-    assert!(runtime.contains("editor.super_draw_first(true)"));
+    assert!(!runtime.contains("popup.draw_overlay(ed)"));
 
     let intellisense = read_source("src/ui/intellisense.rs");
     let popup_start = intellisense
@@ -2209,10 +2214,14 @@ fn signature_popup_is_painted_after_editor_contents() {
         .map(|offset| popup_start + offset)
         .expect("signature popup default implementation should follow its renderer");
     let popup = &intellisense[popup_start..popup_end];
-    assert!(popup.contains("fn draw_overlay(&self, editor: &TextEditor)"));
-    assert!(popup.contains("fltk::draw::push_no_clip()"));
-    assert!(!popup.contains("frame: Option<Frame>"));
-    assert!(!popup.contains("fltk::app::add_check"));
+    assert!(popup.contains("window: Option<Window>"));
+    assert!(popup.contains("frame: Option<Frame>"));
+    assert!(popup.contains("window.set_override()"));
+    assert!(intellisense.contains("impl Drop for PopupGroupGuard"));
+    assert!(popup.contains("let _group_guard = PopupGroupGuard::suspend()"));
+    assert!(popup.contains("fn popup_screen_position("));
+    assert!(popup.contains("fltk::app::screen_work_area(screen)"));
+    assert!(!popup.contains("fn draw_overlay("));
 }
 
 #[test]

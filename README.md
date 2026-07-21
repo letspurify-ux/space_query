@@ -9,8 +9,8 @@ script execution, result inspection, and session diagnostics into one app.
 ## Highlights
 
 - Connect through Oracle Thin or OCI, MySQL, and MariaDB profiles.
-- Edit SQL with syntax highlighting, IntelliSense, formatting, quick describe,
-  file tabs, and query history.
+- Edit SQL with syntax highlighting, IntelliSense, function signature hints,
+  formatting, quick describe, file tabs, and query history.
 - Run one statement, a selection, or a complete database-aware script.
 - Inspect, sort, copy, export, and lazily fetch results in independent tabs.
 - Track active sessions, view application logs, and recover crash details.
@@ -127,6 +127,13 @@ IntelliSense uses the current SQL context and loaded database metadata to
 suggest keywords, schemas, tables, views, aliases, columns, routines, packages,
 and other objects. Use the arrow keys to select an item, `Enter` or `Tab` to
 insert it, and `Esc` to close the popup.
+
+![Function signature hint with the active argument emphasized](docs/images/signature-popup.png)
+
+When the cursor is inside a function or procedure call, the signature hint
+shows the available parameters and emphasizes the active argument. It follows
+typing and mouse cursor movement, and closes when the application window moves
+or resizes so it cannot remain detached from the editor.
 
 The editor also supports multiple SQL file tabs, open/save/recent files,
 syntax highlighting, find and replace, undo/redo, comment toggling, selection

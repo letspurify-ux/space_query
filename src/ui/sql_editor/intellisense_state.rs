@@ -261,6 +261,7 @@ pub(crate) struct IntellisenseRuntimeState {
     parse_generation: Arc<AtomicU64>,
     buffer_revision: Arc<AtomicU64>,
     popup_show_in_progress: Arc<AtomicU8>,
+    popup_hide_request_generation: Arc<AtomicU64>,
     signature_popup_show_in_progress: Arc<AtomicU8>,
     signature_popup_request_generation: Arc<AtomicU64>,
     signature_hint_update_generation: Arc<AtomicU64>,
@@ -287,6 +288,7 @@ impl IntellisenseRuntimeState {
             popup_show_in_progress: Arc::new(AtomicU8::new(
                 IntellisensePopupTransitionState::Idle as u8,
             )),
+            popup_hide_request_generation: Arc::new(AtomicU64::new(0)),
             signature_popup_show_in_progress: Arc::new(AtomicU8::new(
                 IntellisensePopupTransitionState::Idle as u8,
             )),
@@ -587,6 +589,16 @@ impl IntellisenseRuntimeState {
 
     pub(crate) fn set_popup_transition_state(&self, state: IntellisensePopupTransitionState) {
         store_popup_transition_state(&self.popup_show_in_progress, state);
+    }
+
+    pub(crate) fn next_popup_hide_request_generation(&self) -> u64 {
+        self.popup_hide_request_generation
+            .fetch_add(1, Ordering::AcqRel)
+            .wrapping_add(1)
+    }
+
+    pub(crate) fn is_current_popup_hide_request(&self, generation: u64) -> bool {
+        self.popup_hide_request_generation.load(Ordering::Acquire) == generation
     }
 
     pub(crate) fn set_signature_popup_transition_state(
@@ -902,6 +914,16 @@ mod tests {
         let current = runtime.next_signature_popup_request_generation();
         assert!(!runtime.is_current_signature_popup_request(old));
         assert!(runtime.is_current_signature_popup_request(current));
+    }
+
+    #[test]
+    fn newer_popup_hide_request_invalidates_an_older_request() {
+        let runtime = IntellisenseRuntimeState::new();
+        let old = runtime.next_popup_hide_request_generation();
+        let current = runtime.next_popup_hide_request_generation();
+
+        assert!(!runtime.is_current_popup_hide_request(old));
+        assert!(runtime.is_current_popup_hide_request(current));
     }
 
     #[test]
