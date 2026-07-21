@@ -1931,10 +1931,9 @@ impl SqlEditorWidget {
     fn should_refresh_signature_hint_after_keyup(
         buffer_changed_since_keydown: bool,
         key: Key,
-        popup_visible: bool,
+        signature_structure_changed: bool,
     ) -> bool {
-        buffer_changed_since_keydown
-            || popup_visible
+        (buffer_changed_since_keydown && signature_structure_changed)
             || matches!(
                 key,
                 Key::BackSpace
@@ -1951,6 +1950,20 @@ impl SqlEditorWidget {
                     | Key::KPEnter
                     | Key::Tab
             )
+    }
+
+    fn ends_with_signature_separator_keyword(text: &str) -> bool {
+        const KEYWORDS: [&[u8]; 5] = [b"AS", b"IN", b"FOR", b"FROM", b"USING"];
+
+        let bytes = text.as_bytes();
+        KEYWORDS.iter().any(|keyword| {
+            let Some(start) = bytes.len().checked_sub(keyword.len()) else {
+                return false;
+            };
+            bytes[start..].eq_ignore_ascii_case(keyword)
+                && (start == 0
+                    || !matches!(bytes[start - 1], b'0'..=b'9' | b'A'..=b'Z' | b'_' | b'a'..=b'z' | 0x80..=0xff))
+        })
     }
 
     fn should_auto_trigger_after_delete(prefix: &str) -> bool {

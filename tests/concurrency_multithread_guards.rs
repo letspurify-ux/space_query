@@ -2085,12 +2085,16 @@ fn intellisense_pointer_paths_remain_debounced_and_nonblocking() {
         .find("finalize_completion_after_selection")
         .expect("pointer completion should finalize its edit");
     let callback_signature = callback
-        .find("widget_for_insert.update_signature_hint()")
-        .expect("pointer completion should immediately refresh the signature popup");
+        .find("widget_for_insert.schedule_signature_hint_update()")
+        .expect("pointer completion should schedule a coalesced signature popup refresh");
     assert!(callback_finalize < callback_signature);
     assert!(runtime.contains(
-        "if has_selected {\n                                    widget_for_shortcuts.update_signature_hint();\n                                }"
+        "if has_selected {\n                                    widget_for_shortcuts.schedule_signature_hint_update();\n                                }"
     ));
+
+    let signature_popup = read_source("src/ui/sql_editor/intellisense/popup.rs");
+    assert!(signature_popup.contains("next_signature_hint_update_generation()"));
+    assert!(signature_popup.contains("is_current_signature_hint_update(generation)"));
 
     let pointer_start = runtime
         .find("Event::Enter | Event::Move | Event::Drag | Event::Released =>")

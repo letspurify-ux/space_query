@@ -566,6 +566,25 @@ impl SqlEditorWidget {
         });
     }
 
+    /// Coalesce signature refreshes and release the originating UI event before
+    /// doing the bounded context parse.
+    pub(crate) fn schedule_signature_hint_update(&self) {
+        let generation = self
+            .intellisense_runtime
+            .next_signature_hint_update_generation();
+        let widget = self.clone();
+        crate::ui::ui_timeout::schedule(0.0, move || {
+            if widget.editor.was_deleted()
+                || !widget
+                    .intellisense_runtime
+                    .is_current_signature_hint_update(generation)
+            {
+                return;
+            }
+            widget.update_signature_hint();
+        });
+    }
+
     /// Recompute the routine call enclosing the cursor and show, hide, or fetch
     /// its signature accordingly. Cheap on cache hits; spawns a background
     /// fetch (deduplicated) on a miss.
@@ -777,7 +796,7 @@ impl SqlEditorWidget {
             {
                 return;
             }
-            widget.update_signature_hint();
+            widget.schedule_signature_hint_update();
         });
     }
 

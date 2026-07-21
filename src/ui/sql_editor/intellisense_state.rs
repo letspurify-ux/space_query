@@ -263,6 +263,7 @@ pub(crate) struct IntellisenseRuntimeState {
     popup_show_in_progress: Arc<AtomicU8>,
     signature_popup_show_in_progress: Arc<AtomicU8>,
     signature_popup_request_generation: Arc<AtomicU64>,
+    signature_hint_update_generation: Arc<AtomicU64>,
     signature_retry_state: Arc<Mutex<SignatureRetryState>>,
     keyup_debounce_generation: Arc<Mutex<u64>>,
     keyup_debounce_handle: Arc<Mutex<Option<crate::ui::ui_timeout::TimeoutHandle>>>,
@@ -290,6 +291,7 @@ impl IntellisenseRuntimeState {
                 IntellisensePopupTransitionState::Idle as u8,
             )),
             signature_popup_request_generation: Arc::new(AtomicU64::new(0)),
+            signature_hint_update_generation: Arc::new(AtomicU64::new(0)),
             signature_retry_state: Arc::new(Mutex::new(SignatureRetryState::default())),
             keyup_debounce_generation: Arc::new(Mutex::new(0_u64)),
             keyup_debounce_handle: Arc::new(Mutex::new(None)),
@@ -610,6 +612,18 @@ impl IntellisenseRuntimeState {
             == generation
     }
 
+    pub(crate) fn next_signature_hint_update_generation(&self) -> u64 {
+        self.signature_hint_update_generation
+            .fetch_add(1, Ordering::AcqRel)
+            .wrapping_add(1)
+    }
+
+    pub(crate) fn is_current_signature_hint_update(&self, generation: u64) -> bool {
+        self.signature_hint_update_generation
+            .load(Ordering::Acquire)
+            == generation
+    }
+
     pub(crate) fn next_signature_retry(&self, key: &str) -> SignatureRetryTicket {
         const RETRY_DELAYS_SECONDS: [f64; 6] = [0.1, 0.2, 0.4, 0.8, 1.0, 2.0];
 
@@ -892,5 +906,14 @@ mod tests {
         let current = runtime.next_signature_popup_request_generation();
         assert!(!runtime.is_current_signature_popup_request(old));
         assert!(runtime.is_current_signature_popup_request(current));
+    }
+
+    #[test]
+    fn newer_signature_hint_update_invalidates_an_older_update() {
+        let runtime = IntellisenseRuntimeState::new();
+        let old = runtime.next_signature_hint_update_generation();
+        let current = runtime.next_signature_hint_update_generation();
+        assert!(!runtime.is_current_signature_hint_update(old));
+        assert!(runtime.is_current_signature_hint_update(current));
     }
 }

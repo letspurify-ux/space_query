@@ -4911,6 +4911,10 @@ impl SignaturePopup {
     }
 
     pub fn hide(&mut self) {
+        if !self.visible {
+            self.last_render = None;
+            return;
+        }
         self.visible = false;
         self.last_render = None;
         if let Some(frame) = self.frame.as_mut() {

@@ -10077,21 +10077,41 @@ fn signature_hint_refresh_covers_deletion_and_every_caret_movement_key() {
             "{key:?} must refresh a hidden signature hint"
         );
     }
-    assert!(SqlEditorWidget::should_refresh_signature_hint_after_keyup(
-        true,
-        Key::from_char('x'),
-        false,
-    ));
-    assert!(SqlEditorWidget::should_refresh_signature_hint_after_keyup(
-        false,
-        Key::from_char('x'),
-        true,
-    ));
     assert!(!SqlEditorWidget::should_refresh_signature_hint_after_keyup(
-        false,
+        true,
         Key::from_char('x'),
         false,
     ));
+}
+
+#[test]
+fn signature_hint_refreshes_only_for_signature_structure_edits() {
+    for ch in ['(', ')', ','] {
+        assert!(SqlEditorWidget::should_refresh_signature_hint_after_keyup(
+            true,
+            Key::from_char(ch),
+            true,
+        ));
+        assert!(!SqlEditorWidget::should_refresh_signature_hint_after_keyup(
+            false,
+            Key::from_char(ch),
+            true,
+        ));
+    }
+}
+
+#[test]
+fn signature_separator_keyword_detection_is_bounded_and_identifier_aware() {
+    for text in ["AS", " in", "(for", " str FROM", "x using"] {
+        assert!(SqlEditorWidget::ends_with_signature_separator_keyword(
+            text
+        ));
+    }
+    for text in ["", "FROMx", "xFROM", "_IN", "한FROM"] {
+        assert!(!SqlEditorWidget::ends_with_signature_separator_keyword(
+            text
+        ));
+    }
 }
 
 #[test]

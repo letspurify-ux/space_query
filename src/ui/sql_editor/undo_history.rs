@@ -1121,7 +1121,7 @@ impl SqlEditorWidget {
         state.applying_history = false;
         state.pending_history_text_snapshots.clear();
         drop(state);
-        self.update_signature_hint();
+        self.schedule_signature_hint_update();
     }
 
     pub fn redo(&self) {
@@ -1160,7 +1160,7 @@ impl SqlEditorWidget {
         state.applying_history = false;
         state.pending_history_text_snapshots.clear();
         drop(state);
-        self.update_signature_hint();
+        self.schedule_signature_hint_update();
     }
 
     pub fn is_query_running(&self) -> bool {

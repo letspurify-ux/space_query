@@ -539,7 +539,7 @@ impl SqlEditorWidget {
                     &buffer_for_insert,
                 );
                 Self::finalize_completion_after_selection(&intellisense_runtime_for_insert);
-                widget_for_insert.update_signature_hint();
+                widget_for_insert.schedule_signature_hint_update();
             });
         }
 
@@ -1051,7 +1051,7 @@ impl SqlEditorWidget {
                                     .hide();
                                 intellisense_runtime_for_handle.clear_pending_intellisense();
                                 if has_selected {
-                                    widget_for_shortcuts.update_signature_hint();
+                                    widget_for_shortcuts.schedule_signature_hint_update();
                                 }
                                 return Self::should_consume_popup_confirm_key(key, has_selected);
                             }
@@ -1356,6 +1356,24 @@ impl SqlEditorWidget {
                         shift,
                         char_before_cursor,
                     );
+                    let signature_delimiter_changed = buffer_changed_since_keydown
+                        && (event_text.chars().any(|ch| matches!(ch, '(' | ')' | ','))
+                            || typed_char.is_some_and(|ch| matches!(ch, '(' | ')' | ','))
+                            || char_before_cursor.is_some_and(|ch| matches!(ch, '(' | ')' | ',')));
+                    let signature_keyword_changed = buffer_changed_since_keydown
+                        && char_before_cursor.is_some_and(|ch| {
+                            matches!(ch, 'g' | 'm' | 'n' | 'r' | 's' | 'G' | 'M' | 'N' | 'R' | 'S')
+                        })
+                        && {
+                            let recent_start = cursor_pos.saturating_sub(6);
+                            let recent = buffer_for_handle
+                                .text_range(recent_start, cursor_pos)
+                                .unwrap_or_default();
+                            Self::ends_with_signature_separator_keyword(&recent)
+                                && widget_for_shortcuts.signature_popup_is_visible()
+                        };
+                    let signature_structure_changed =
+                        signature_delimiter_changed || signature_keyword_changed;
                     if Self::is_modifier_key(key) {
                         return false;
                     }
@@ -1371,12 +1389,14 @@ impl SqlEditorWidget {
                     }
 
                     if shortcut_modified {
-                        if Self::should_refresh_signature_hint_after_keyup(
-                            buffer_changed_since_keydown,
-                            key,
-                            widget_for_shortcuts.signature_popup_is_visible(),
-                        ) {
-                            widget_for_shortcuts.update_signature_hint();
+                        if buffer_changed_since_keydown
+                            || Self::should_refresh_signature_hint_after_keyup(
+                                false,
+                                key,
+                                false,
+                            )
+                        {
+                            widget_for_shortcuts.schedule_signature_hint_update();
                         }
                         if popup_visible {
                             intellisense_popup_for_handle
@@ -1390,16 +1410,15 @@ impl SqlEditorWidget {
                         return false;
                     }
 
-                    // Refresh after every actual edit and every caret-moving
-                    // key, even while the popup is hidden or metadata is being
-                    // retried. This keeps deletion and navigation from missing
-                    // the enclosing-call transition.
+                    // Argument context changes on delimiters, deletion, and
+                    // caret movement. Ordinary parameter text cannot change
+                    // the active argument, so keep it off the UI-thread parser.
                     if Self::should_refresh_signature_hint_after_keyup(
                         buffer_changed_since_keydown,
                         key,
-                        widget_for_shortcuts.signature_popup_is_visible(),
+                        signature_structure_changed,
                     ) {
-                        widget_for_shortcuts.update_signature_hint();
+                        widget_for_shortcuts.schedule_signature_hint_update();
                     }
 
                     if event_text.is_empty()
@@ -1825,12 +1844,7 @@ impl SqlEditorWidget {
                     false
                 }
                 Event::Paste => {
-                    let widget_for_signature = widget_for_shortcuts.clone();
-                    crate::ui::ui_timeout::schedule(0.0, move || {
-                        if !widget_for_signature.editor.was_deleted() {
-                            widget_for_signature.update_signature_hint();
-                        }
-                    });
+                    widget_for_shortcuts.schedule_signature_hint_update();
                     let Some(drop) = Self::take_pending_dnd_drop(&dnd_drop_state_for_handle) else {
                         let event_text = app::event_text();
                         if !event_text.is_empty() {
