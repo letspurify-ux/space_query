@@ -686,8 +686,6 @@ impl SqlEditorWidget {
                     false
                 }
                 Event::Push => {
-                    // SIGDBG: temporary instrumentation, remove after diagnosis
-                    eprintln!("SIGDBG hide origin: editor mouse push");
                     widget_for_shortcuts.hide_signature_popup();
                     #[cfg(target_os = "macos")]
                     {

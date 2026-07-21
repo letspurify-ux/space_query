@@ -3022,8 +3022,6 @@ impl IntellisensePopup {
                     fltk::app::compose_state()
                 )
             });
-            // SIGDBG: temporary instrumentation, remove after diagnosis
-            eprintln!("SIGDBG completion-window-first-show");
             self.window.show();
         }
         *self
@@ -4621,6 +4619,9 @@ pub struct SignaturePopup {
     frame: Option<Frame>,
     visible: bool,
     last_render: Option<SignaturePopupRenderState>,
+    /// FLTK check-callback handle (stored as usize to stay `Send`) that keeps
+    /// the overlay frame painted above the editor; see `ensure_frame`.
+    overlay_keepalive: Option<usize>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -4685,6 +4686,13 @@ impl SignaturePopup {
             frame: None,
             visible: false,
             last_render: None,
+            overlay_keepalive: None,
+        }
+    }
+
+    fn remove_overlay_keepalive(&mut self) {
+        if let Some(handle) = self.overlay_keepalive.take() {
+            fltk::app::remove_check(handle as fltk::app::CheckHandle);
         }
     }
 
@@ -4696,6 +4704,7 @@ impl SignaturePopup {
         if self.is_deleted() {
             self.frame = None;
             self.visible = false;
+            self.remove_overlay_keepalive();
         }
         if self.frame.is_none() {
             let parent = editor.window()?;
@@ -4728,6 +4737,24 @@ impl SignaturePopup {
             } else {
                 fltk::group::Group::set_current(None::<&fltk::group::Group>);
             }
+            // The frame is a sibling overlay above the editor. FLTK partial
+            // redraws repaint only the damaged widget, so an editor repaint
+            // (typing, semantic rehighlight) paints straight over the frame
+            // and visually erases it even though it is still visible. This
+            // pre-flush check re-damages the frame whenever the editor is
+            // about to repaint beneath it; the frame is the window's last
+            // child, so it is drawn after the editor within the same flush.
+            let mut frame_handle = frame.clone();
+            let editor_handle = editor.clone();
+            let keepalive = fltk::app::add_check(move |_| {
+                if frame_handle.was_deleted() || editor_handle.was_deleted() {
+                    return;
+                }
+                if frame_handle.visible() && editor_handle.damage() && !frame_handle.damage() {
+                    frame_handle.redraw();
+                }
+            });
+            self.overlay_keepalive = Some(keepalive as usize);
             self.frame = Some(frame);
         }
         self.frame.as_mut()
@@ -4871,8 +4898,6 @@ impl SignaturePopup {
             return;
         }
 
-        // SIGDBG: temporary instrumentation, remove after diagnosis
-        eprintln!("SIGDBG frame-show text={:?}", label.text);
         let Some(frame) = self.ensure_frame(editor) else {
             self.visible = false;
             self.last_render = None;
@@ -4934,8 +4959,6 @@ impl SignaturePopup {
             self.last_render = None;
             return;
         }
-        // SIGDBG: temporary instrumentation, remove after diagnosis
-        eprintln!("SIGDBG frame-hide (was visible)");
         self.visible = false;
         self.last_render = None;
         if let Some(frame) = self.frame.as_mut() {
@@ -4960,6 +4983,7 @@ impl SignaturePopup {
 
     pub fn delete_for_close(&mut self) {
         self.hide();
+        self.remove_overlay_keepalive();
         if let Some(frame) = self.frame.take() {
             if !frame.was_deleted() {
                 Frame::delete(frame);
@@ -5505,6 +5529,22 @@ mod intellisense_tests {
             .expect("call inside PL/SQL block");
         assert_eq!(call.name, "substr");
         assert_eq!(call.arg_index, 1);
+    }
+
+    #[test]
+    fn enclosing_call_survives_trailing_space_inside_block() {
+        for (text, name) in [
+            (
+                "declare\n  v number;\nbegin\n  v := substr(x |\nend;",
+                "substr",
+            ),
+            ("begin\n  pkg.run(a, |\nend;", "run"),
+            ("declare\nbegin\n  set_val(a || 'x' |", "set_val"),
+        ] {
+            let call = call_at(text)
+                .unwrap_or_else(|| panic!("space inside block must keep the call: {text:?}"));
+            assert_eq!(call.name, name);
+        }
     }
 
     #[test]

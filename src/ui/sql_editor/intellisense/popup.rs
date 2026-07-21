@@ -383,16 +383,12 @@ impl SqlEditorWidget {
                 return;
             }
             if widget.editor.has_focus() {
-                // SIGDBG: temporary instrumentation, remove after diagnosis
-                eprintln!("SIGDBG unfocus-skip: editor has focus again");
                 return;
             }
             if retries_left > 0 {
                 widget.schedule_deferred_signature_unfocus_hide(retries_left - 1);
                 return;
             }
-            // SIGDBG: temporary instrumentation, remove after diagnosis
-            eprintln!("SIGDBG unfocus-hide: focus really left the editor");
             widget.hide_signature_popup();
         });
     }
@@ -642,8 +638,6 @@ impl SqlEditorWidget {
             mysql_compatible,
             initial_lex_mode.clone(),
         ) else {
-            // SIGDBG: temporary instrumentation, remove after diagnosis
-            eprintln!("SIGDBG update: no enclosing call -> hide (cursor={cursor})");
             self.intellisense_runtime.clear_signature_retry();
             self.hide_signature_popup();
             return;
@@ -710,8 +704,6 @@ impl SqlEditorWidget {
                 self.show_signature_popup(&label, active_arg, call.open_paren as i32);
             }
             Action::Hide => {
-                // SIGDBG: temporary instrumentation, remove after diagnosis
-                eprintln!("SIGDBG update: cached-none/pending -> hide (key={key})");
                 let cached = self
                     .intellisense_data
                     .lock()
@@ -724,8 +716,6 @@ impl SqlEditorWidget {
                 self.hide_signature_popup();
             }
             Action::Fetch => {
-                // SIGDBG: temporary instrumentation, remove after diagnosis
-                eprintln!("SIGDBG update: fetch -> hide (key={key})");
                 self.hide_signature_popup();
                 self.spawn_signature_fetch(key, call.name, call.qualifier);
             }

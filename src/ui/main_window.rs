@@ -1179,8 +1179,6 @@ impl AppState {
     }
 
     fn hide_all_intellisense_popups(&self) {
-        // SIGDBG: temporary instrumentation, remove after diagnosis
-        eprintln!("SIGDBG hide origin: hide_all_intellisense_popups");
         self.sql_editor.try_hide_intellisense_popup();
         self.sql_editor.hide_signature_popup();
         for tab in &self.editor_tabs {
@@ -8643,16 +8641,12 @@ impl MainWindow {
                 fltk::enums::Event::Resize
                 | fltk::enums::Event::Hide
                 | fltk::enums::Event::Fullscreen => {
-                    // SIGDBG: temporary instrumentation, remove after diagnosis
-                    eprintln!("SIGDBG window event triggers hide_all: {ev:?}");
                     if let Ok(s) = state_for_window.try_lock() {
                         s.hide_all_intellisense_popups();
                     }
                     false
                 }
                 fltk::enums::Event::Deactivate => {
-                    // SIGDBG: temporary instrumentation, remove after diagnosis
-                    eprintln!("SIGDBG window deactivate");
                     // A genuine deactivate (app switch) must hide the popups,
                     // but the completion popup window becoming macOS's key
                     // window can also deactivate the main window for a moment.
@@ -8704,8 +8698,6 @@ impl MainWindow {
                         app::event_x_root(),
                         app::event_y_root(),
                     );
-                    // SIGDBG: temporary instrumentation, remove after diagnosis
-                    eprintln!("SIGDBG hide origin: main window push");
                     sql_editor.hide_signature_popup();
                     sql_editor.hide_intellisense_on_outside_click(
                         app::event_x_root(),
