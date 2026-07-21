@@ -3445,12 +3445,17 @@ impl SqlEditorWidget {
                                         .lock()
                                         .unwrap_or_else(|poisoned| poisoned.into_inner());
                                     if cache {
-                                        data.set_signature(key, label);
+                                        data.set_signature(key.clone(), label);
                                     } else {
                                         data.clear_signature_pending(&key);
                                     }
                                 }
-                                widget.update_signature_hint();
+                                if cache {
+                                    widget.intellisense_runtime.clear_signature_retry();
+                                    widget.update_signature_hint();
+                                } else {
+                                    widget.schedule_signature_retry(&key);
+                                }
                             }
                             UiActionResult::Transaction { action, result } => match result {
                                 Ok(()) => {

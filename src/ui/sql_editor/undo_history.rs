@@ -1120,6 +1120,8 @@ impl SqlEditorWidget {
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         state.applying_history = false;
         state.pending_history_text_snapshots.clear();
+        drop(state);
+        self.update_signature_hint();
     }
 
     pub fn redo(&self) {
@@ -1157,6 +1159,8 @@ impl SqlEditorWidget {
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         state.applying_history = false;
         state.pending_history_text_snapshots.clear();
+        drop(state);
+        self.update_signature_hint();
     }
 
     pub fn is_query_running(&self) -> bool {

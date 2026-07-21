@@ -9636,19 +9636,32 @@ fn unfocus_hide_rule_hides_only_when_pointer_is_outside_visible_popup() {
 }
 
 #[test]
-fn nonblocking_popup_hide_waits_until_show_transition_finishes() {
+fn popup_hides_never_block_on_a_busy_mutex() {
     assert!(SqlEditorWidget::can_try_hide_intellisense_popup(
         IntellisensePopupTransitionState::Idle
     ));
     assert!(!SqlEditorWidget::can_try_hide_intellisense_popup(
         IntellisensePopupTransitionState::Showing
     ));
-    assert!(SqlEditorWidget::can_try_hide_signature_popup(
-        IntellisensePopupTransitionState::Idle
+    let signature_popup = Arc::new(Mutex::new(SignaturePopup::new()));
+    let locked = signature_popup
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    assert!(!SqlEditorWidget::try_hide_signature_popup_now(
+        &signature_popup
     ));
-    assert!(!SqlEditorWidget::can_try_hide_signature_popup(
-        IntellisensePopupTransitionState::Showing
+    drop(locked);
+    assert!(SqlEditorWidget::try_hide_signature_popup_now(
+        &signature_popup
     ));
+}
+
+#[test]
+fn signature_popup_actions_contain_panics() {
+    assert_eq!(
+        SqlEditorWidget::catch_signature_popup_action(|| panic!("popup test panic")),
+        None
+    );
 }
 
 #[test]
@@ -10039,6 +10052,45 @@ fn keyup_text_input_requires_a_real_unmodified_buffer_edit() {
     );
     assert!(!SqlEditorWidget::should_process_keyup_text_input(
         false, false
+    ));
+}
+
+#[test]
+fn signature_hint_refresh_covers_deletion_and_every_caret_movement_key() {
+    for key in [
+        Key::BackSpace,
+        Key::Delete,
+        Key::Left,
+        Key::Right,
+        Key::Up,
+        Key::Down,
+        Key::Home,
+        Key::End,
+        Key::PageUp,
+        Key::PageDown,
+        Key::Enter,
+        Key::KPEnter,
+        Key::Tab,
+    ] {
+        assert!(
+            SqlEditorWidget::should_refresh_signature_hint_after_keyup(false, key, false),
+            "{key:?} must refresh a hidden signature hint"
+        );
+    }
+    assert!(SqlEditorWidget::should_refresh_signature_hint_after_keyup(
+        true,
+        Key::from_char('x'),
+        false,
+    ));
+    assert!(SqlEditorWidget::should_refresh_signature_hint_after_keyup(
+        false,
+        Key::from_char('x'),
+        true,
+    ));
+    assert!(!SqlEditorWidget::should_refresh_signature_hint_after_keyup(
+        false,
+        Key::from_char('x'),
+        false,
     ));
 }
 

@@ -1371,6 +1371,13 @@ impl SqlEditorWidget {
                     }
 
                     if shortcut_modified {
+                        if Self::should_refresh_signature_hint_after_keyup(
+                            buffer_changed_since_keydown,
+                            key,
+                            widget_for_shortcuts.signature_popup_is_visible(),
+                        ) {
+                            widget_for_shortcuts.update_signature_hint();
+                        }
                         if popup_visible {
                             intellisense_popup_for_handle
                                 .lock()
@@ -1383,16 +1390,15 @@ impl SqlEditorWidget {
                         return false;
                     }
 
-                    // Keep the parameter-hint popup in sync. Limited to events
-                    // that can change the enclosing call (or while a hint is
-                    // shown) so the buffer is not cloned on every keystroke.
-                    if matches!(typed_char, Some('(') | Some(')') | Some(','))
-                        || matches!(
-                            key,
-                            Key::Left | Key::Right | Key::Home | Key::End
-                        )
-                        || widget_for_shortcuts.signature_popup_is_visible()
-                    {
+                    // Refresh after every actual edit and every caret-moving
+                    // key, even while the popup is hidden or metadata is being
+                    // retried. This keeps deletion and navigation from missing
+                    // the enclosing-call transition.
+                    if Self::should_refresh_signature_hint_after_keyup(
+                        buffer_changed_since_keydown,
+                        key,
+                        widget_for_shortcuts.signature_popup_is_visible(),
+                    ) {
                         widget_for_shortcuts.update_signature_hint();
                     }
 
@@ -1819,6 +1825,12 @@ impl SqlEditorWidget {
                     false
                 }
                 Event::Paste => {
+                    let widget_for_signature = widget_for_shortcuts.clone();
+                    crate::ui::ui_timeout::schedule(0.0, move || {
+                        if !widget_for_signature.editor.was_deleted() {
+                            widget_for_signature.update_signature_hint();
+                        }
+                    });
                     let Some(drop) = Self::take_pending_dnd_drop(&dnd_drop_state_for_handle) else {
                         let event_text = app::event_text();
                         if !event_text.is_empty() {

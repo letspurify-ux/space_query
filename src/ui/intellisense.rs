@@ -4654,7 +4654,13 @@ impl SignaturePopup {
     }
 
     pub(crate) fn height() -> i32 {
-        (Self::font_size() + 8).max(22)
+        Self::font_size().saturating_add(8).max(22)
+    }
+
+    fn saturating_line_width(widths: impl IntoIterator<Item = i32>) -> i32 {
+        widths
+            .into_iter()
+            .fold(0_i32, |total, width| total.saturating_add(width.max(0)))
     }
 
     pub fn new() -> Self {
@@ -4785,11 +4791,11 @@ impl SignaturePopup {
     ) -> (i32, i32) {
         let (cursor_x, cursor_y) = editor.position_to_xy(anchor_pos);
         let mut popup_x = cursor_x;
-        let mut popup_y = cursor_y - height - 2;
+        let mut popup_y = cursor_y.saturating_sub(height).saturating_sub(2);
 
         if let Some(win) = editor.window() {
-            let max_x = (win.w() - width).max(0);
-            let max_y = (win.h() - height).max(0);
+            let max_x = win.w().saturating_sub(width).max(0);
+            let max_y = win.h().saturating_sub(height).max(0);
             popup_x = popup_x.clamp(0, max_x);
             popup_y = popup_y.clamp(0, max_y);
         }
@@ -4817,20 +4823,16 @@ impl SignaturePopup {
         let text_w = lines
             .iter()
             .map(|line| {
-                line.iter()
-                    .map(|run| {
-                        fltk::draw::set_font(
-                            run.style.font(profile.normal, profile.bold),
-                            font_size,
-                        );
-                        fltk::draw::measure(&run.text, false).0
-                    })
-                    .sum::<i32>()
+                Self::saturating_line_width(line.iter().map(|run| {
+                    fltk::draw::set_font(run.style.font(profile.normal, profile.bold), font_size);
+                    fltk::draw::measure(&run.text, false).0
+                }))
             })
             .max()
             .unwrap_or_default();
-        let width = (text_w + 20).clamp(120, 1100);
-        let height = Self::height().saturating_mul(lines.len().max(1) as i32);
+        let width = text_w.saturating_add(20).clamp(120, 1100);
+        let line_count = i32::try_from(lines.len().max(1)).unwrap_or(i32::MAX);
+        let height = Self::height().saturating_mul(line_count);
         let (x, y) = Self::overlay_position(editor, anchor_pos, width, height);
         let render_state = SignaturePopupRenderState {
             lines,
@@ -4873,12 +4875,15 @@ impl SignaturePopup {
                 frame.color(),
             );
             for (line_index, line) in lines.iter().enumerate() {
-                let mut run_x = frame.x() + 10;
-                let line_y = frame.y() + line_index as i32 * line_height;
+                let mut run_x = frame.x().saturating_add(10);
+                let line_index = i32::try_from(line_index).unwrap_or(i32::MAX);
+                let line_y = frame
+                    .y()
+                    .saturating_add(line_index.saturating_mul(line_height));
                 for run in line {
                     fltk::draw::set_font(run.style.font(normal_font, bold_font), font_size);
                     fltk::draw::set_draw_color(run.style.color());
-                    let run_width = fltk::draw::measure(&run.text, false).0;
+                    let run_width = fltk::draw::measure(&run.text, false).0.max(0);
                     if run_width > 0 {
                         fltk::draw::draw_text2(
                             &run.text,
@@ -4977,6 +4982,15 @@ mod intellisense_tests {
         let cursor = text.find('|').expect("cursor marker");
         let text = text.replace('|', "");
         enclosing_call_at_cursor(&text, cursor)
+    }
+
+    #[test]
+    fn signature_popup_width_accumulation_saturates() {
+        assert_eq!(
+            SignaturePopup::saturating_line_width([i32::MAX, 1, -20]),
+            i32::MAX
+        );
+        assert_eq!(SignaturePopup::saturating_line_width([-1, 10]), 10);
     }
 
     #[test]

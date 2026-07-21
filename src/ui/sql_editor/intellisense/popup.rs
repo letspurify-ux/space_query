@@ -80,15 +80,17 @@ impl QuickDescribeBackend for MysqlQuickDescribeBackend {
     }
 }
 
+fn non_empty(args: Vec<ProcedureArgument>) -> Option<Vec<ProcedureArgument>> {
+    (!args.is_empty()).then_some(args)
+}
+
 trait SignatureBackend: Sync {
-    /// Resolve the argument list of a routine call, trying package-member then
-    /// standalone resolution. Returns `None` when no such routine is found.
     fn resolve(
         &self,
-        conn_guard: &mut crate::db::ConnectionLockGuard<'_>,
+        session: crate::db::DbPoolSession,
         name: &str,
         qualifier: Option<&str>,
-    ) -> Option<Vec<ProcedureArgument>>;
+    ) -> Result<Option<Vec<ProcedureArgument>>, String>;
 }
 
 struct OracleSignatureBackend;
@@ -105,68 +107,203 @@ fn signature_backend_for(db_type: crate::db::DatabaseType) -> &'static dyn Signa
     }
 }
 
-fn non_empty(args: Vec<ProcedureArgument>) -> Option<Vec<ProcedureArgument>> {
-    (!args.is_empty()).then_some(args)
+fn resolve_oracle_signature_arguments(
+    conn: &Connection,
+    name: &str,
+    qualifier: Option<&str>,
+) -> Result<Option<Vec<ProcedureArgument>>, String> {
+    if let Some(qualifier) = qualifier {
+        if let Some(args) = ObjectBrowser::get_package_procedure_arguments(conn, qualifier, name)
+            .map(non_empty)
+            .map_err(|err| err.to_string())?
+        {
+            return Ok(Some(args));
+        }
+        let qualified = format!("{qualifier}.{name}");
+        return ObjectBrowser::get_procedure_arguments(conn, &qualified)
+            .map(non_empty)
+            .map_err(|err| err.to_string());
+    }
+    ObjectBrowser::get_procedure_arguments(conn, name)
+        .map(non_empty)
+        .map_err(|err| err.to_string())
+}
+
+fn resolve_oracle_thin_signature_arguments(
+    conn: &mut tns_thin::OracleThinSession,
+    name: &str,
+    qualifier: Option<&str>,
+) -> Result<Option<Vec<ProcedureArgument>>, String> {
+    if let Some(qualifier) = qualifier {
+        if let Some(args) =
+            ObjectBrowser::get_thin_package_procedure_arguments(conn, qualifier, name)
+                .map(non_empty)?
+        {
+            return Ok(Some(args));
+        }
+        let qualified = format!("{qualifier}.{name}");
+        return ObjectBrowser::get_thin_procedure_arguments(conn, &qualified).map(non_empty);
+    }
+    ObjectBrowser::get_thin_procedure_arguments(conn, name).map(non_empty)
+}
+
+fn resolve_mysql_signature_arguments(
+    conn: &mut mysql::PooledConn,
+    name: &str,
+    qualifier: Option<&str>,
+) -> Result<Option<Vec<ProcedureArgument>>, mysql::Error> {
+    crate::db::query::mysql_executor::MysqlObjectBrowser::get_routine_arguments_in_schema(
+        conn.as_mut(),
+        qualifier,
+        name,
+    )
+    .map(non_empty)
+}
+
+impl SqlEditorWidget {
+    fn resolve_oracle_signature_with_timeout(
+        conn: &Connection,
+        name: &str,
+        qualifier: Option<&str>,
+    ) -> Result<Option<Vec<ProcedureArgument>>, String> {
+        let previous_timeout = conn
+            .call_timeout()
+            .map_err(|err| format!("Failed to read Oracle signature timeout: {err}"))?;
+        conn.set_call_timeout(Some(SIGNATURE_METADATA_TIMEOUT))
+            .map_err(|err| format!("Failed to apply Oracle signature timeout: {err}"))?;
+        let result = panic::catch_unwind(AssertUnwindSafe(|| {
+            resolve_oracle_signature_arguments(conn, name, qualifier)
+        }));
+        let reset_result = conn
+            .set_call_timeout(previous_timeout)
+            .map_err(|err| format!("Failed to restore Oracle signature timeout: {err}"));
+        match result {
+            Ok(Ok(args)) => reset_result.map(|()| args),
+            Ok(Err(message)) => Err(match reset_result {
+                Ok(()) => message,
+                Err(reset_message) => format!("{message}; {reset_message}"),
+            }),
+            Err(payload) => {
+                if let Err(message) = reset_result {
+                    crate::utils::logging::log_error("signature hint", &message);
+                }
+                panic::resume_unwind(payload);
+            }
+        }
+    }
+
+    fn resolve_oracle_thin_signature_with_timeout(
+        conn: &mut tns_thin::OracleThinSession,
+        name: &str,
+        qualifier: Option<&str>,
+    ) -> Result<Option<Vec<ProcedureArgument>>, String> {
+        let previous_timeout = conn
+            .call_timeout()
+            .map_err(|err| format!("Failed to read Oracle Thin signature timeout: {err}"))?;
+        conn.set_call_timeout(Some(SIGNATURE_METADATA_TIMEOUT))
+            .map_err(|err| format!("Failed to apply Oracle Thin signature timeout: {err}"))?;
+        let result = panic::catch_unwind(AssertUnwindSafe(|| {
+            resolve_oracle_thin_signature_arguments(conn, name, qualifier)
+        }));
+        let reset_result = conn
+            .set_call_timeout(previous_timeout)
+            .map_err(|err| format!("Failed to restore Oracle Thin signature timeout: {err}"));
+        match result {
+            Ok(Ok(args)) => reset_result.map(|()| args),
+            Ok(Err(message)) => Err(match reset_result {
+                Ok(()) => message,
+                Err(reset_message) => format!("{message}; {reset_message}"),
+            }),
+            Err(payload) => {
+                if let Err(message) = reset_result {
+                    crate::utils::logging::log_error("signature hint", &message);
+                }
+                panic::resume_unwind(payload);
+            }
+        }
+    }
+
+    fn resolve_mysql_signature_with_timeout(
+        mut conn: mysql::PooledConn,
+        db_type: crate::db::DatabaseType,
+        name: &str,
+        qualifier: Option<&str>,
+    ) -> Result<Option<Vec<ProcedureArgument>>, String> {
+        let timeout_restore = match crate::db::query::mysql_executor::MysqlExecutor::apply_session_timeout_with_restore_for_db(
+            &mut conn,
+            Some(SIGNATURE_METADATA_TIMEOUT),
+            db_type,
+        ) {
+            Ok(restore) => restore,
+            Err(err) => {
+                let restore_failed = err.restore_failed();
+                let message = Self::mysql_timeout_apply_error_message(
+                    &err,
+                    db_type,
+                    Some(SIGNATURE_METADATA_TIMEOUT),
+                );
+                if restore_failed {
+                    crate::db::discard_mysql_pooled_connection(conn);
+                }
+                return Err(message);
+            }
+        };
+        let result = panic::catch_unwind(AssertUnwindSafe(|| {
+            resolve_mysql_signature_arguments(&mut conn, name, qualifier).map_err(|err| {
+                Self::mysql_error_message(&err, Some(SIGNATURE_METADATA_TIMEOUT))
+            })
+        }));
+        let reset_result = timeout_restore.map_or(Ok(()), |restore| {
+            restore.restore_for_db(&mut conn, db_type).map_err(|err| {
+                format!("Failed to restore {} signature timeout: {err}", db_type.display_name())
+            })
+        });
+        match result {
+            Ok(Ok(args)) => match reset_result {
+                Ok(()) => Ok(args),
+                Err(message) => {
+                    crate::db::discard_mysql_pooled_connection(conn);
+                    Err(message)
+                }
+            },
+            Ok(Err(message)) => match reset_result {
+                Ok(()) => Err(message),
+                Err(reset_message) => {
+                    crate::db::discard_mysql_pooled_connection(conn);
+                    Err(format!("{message}; {reset_message}"))
+                }
+            },
+            Err(payload) => {
+                if let Err(message) = reset_result {
+                    crate::utils::logging::log_error("signature hint", &message);
+                    crate::db::discard_mysql_pooled_connection(conn);
+                }
+                panic::resume_unwind(payload);
+            }
+        }
+    }
 }
 
 impl SignatureBackend for OracleSignatureBackend {
     fn resolve(
         &self,
-        conn_guard: &mut crate::db::ConnectionLockGuard<'_>,
+        session: crate::db::DbPoolSession,
         name: &str,
         qualifier: Option<&str>,
-    ) -> Option<Vec<ProcedureArgument>> {
-        let tracked_schema = conn_guard
-            .tracked_oracle_current_schema()
-            .map(str::to_string);
-        match conn_guard.require_live_db_connection().ok()? {
-            crate::db::DbConnection::Oracle(db_conn) => {
-                let conn = db_conn.as_ref();
-                if let Some(qualifier) = qualifier {
-                    if let Some(args) = ObjectBrowser::get_package_procedure_arguments(
-                        conn, qualifier, name,
-                    )
-                    .ok()
-                    .and_then(non_empty)
-                    {
-                        return Some(args);
-                    }
-                    let qualified = format!("{qualifier}.{name}");
-                    return ObjectBrowser::get_procedure_arguments(conn, &qualified)
-                        .ok()
-                        .and_then(non_empty);
-                }
-                ObjectBrowser::get_procedure_arguments(conn, name)
-                    .ok()
-                    .and_then(non_empty)
+    ) -> Result<Option<Vec<ProcedureArgument>>, String> {
+        match session {
+            crate::db::DbPoolSession::Oracle(conn) => {
+                SqlEditorWidget::resolve_oracle_signature_with_timeout(&conn, name, qualifier)
             }
-            crate::db::DbConnection::OracleThin(db_conn) => {
-                let mut session = db_conn.lock().ok()?;
-                let _ = crate::db::DatabaseConnection::apply_oracle_thin_current_schema(
-                    &mut session,
-                    tracked_schema.as_deref(),
-                );
-                if let Some(qualifier) = qualifier {
-                    if let Some(args) = ObjectBrowser::get_thin_package_procedure_arguments(
-                        &mut session,
-                        qualifier,
-                        name,
-                    )
-                    .ok()
-                    .and_then(non_empty)
-                    {
-                        return Some(args);
-                    }
-                    let qualified = format!("{qualifier}.{name}");
-                    return ObjectBrowser::get_thin_procedure_arguments(&mut session, &qualified)
-                        .ok()
-                        .and_then(non_empty);
-                }
-                ObjectBrowser::get_thin_procedure_arguments(&mut session, name)
-                    .ok()
-                    .and_then(non_empty)
+            crate::db::DbPoolSession::OracleThin(mut conn) => {
+                SqlEditorWidget::resolve_oracle_thin_signature_with_timeout(
+                    &mut conn, name, qualifier,
+                )
             }
-            crate::db::DbConnection::MySQL { .. } => None,
+            crate::db::DbPoolSession::MySQL { db_type, .. } => Err(format!(
+                "Expected Oracle signature session but found {}",
+                db_type.display_name()
+            )),
         }
     }
 }
@@ -174,35 +311,20 @@ impl SignatureBackend for OracleSignatureBackend {
 impl SignatureBackend for MysqlSignatureBackend {
     fn resolve(
         &self,
-        conn_guard: &mut crate::db::ConnectionLockGuard<'_>,
+        session: crate::db::DbPoolSession,
         name: &str,
         qualifier: Option<&str>,
-    ) -> Option<Vec<ProcedureArgument>> {
-        let _ = conn_guard.apply_tracked_mysql_current_database();
-        let conn = conn_guard.get_mysql_connection_mut()?;
-        crate::db::query::mysql_executor::MysqlObjectBrowser::get_routine_arguments_in_schema(
-            conn, qualifier, name,
-        )
-        .ok()
-        .and_then(non_empty)
-    }
-}
-
-struct SignaturePopupTransitionGuard {
-    runtime: Arc<IntellisenseRuntimeState>,
-}
-
-impl SignaturePopupTransitionGuard {
-    fn new(runtime: Arc<IntellisenseRuntimeState>) -> Self {
-        runtime.set_signature_popup_transition_state(IntellisensePopupTransitionState::Showing);
-        Self { runtime }
-    }
-}
-
-impl Drop for SignaturePopupTransitionGuard {
-    fn drop(&mut self) {
-        self.runtime
-            .set_signature_popup_transition_state(IntellisensePopupTransitionState::Idle);
+    ) -> Result<Option<Vec<ProcedureArgument>>, String> {
+        match session {
+            crate::db::DbPoolSession::MySQL { conn, db_type } => {
+                SqlEditorWidget::resolve_mysql_signature_with_timeout(
+                    conn, db_type, name, qualifier,
+                )
+            }
+            crate::db::DbPoolSession::Oracle(_) | crate::db::DbPoolSession::OracleThin(_) => {
+                Err("Expected MySQL-family signature session but found Oracle".to_string())
+            }
+        }
     }
 }
 
@@ -213,13 +335,13 @@ impl SqlEditorWidget {
     }
 
     fn resolve_signature_label(
-        conn_guard: &mut crate::db::ConnectionLockGuard<'_>,
+        db_type: crate::db::DatabaseType,
+        session: crate::db::DbPoolSession,
         name: &str,
         qualifier: Option<&str>,
-    ) -> Option<SignatureLabel> {
-        let db_type = conn_guard.db_type();
-        let args = signature_backend_for(db_type).resolve(conn_guard, name, qualifier)?;
-        Some(Self::build_signature_label(name, &args))
+    ) -> Result<Option<SignatureLabel>, String> {
+        let args = signature_backend_for(db_type).resolve(session, name, qualifier)?;
+        Ok(args.map(|args| Self::build_signature_label(name, &args)))
     }
 
     pub(crate) fn signature_popup_is_visible(&self) -> bool {
@@ -232,27 +354,30 @@ impl SqlEditorWidget {
         match self.signature_popup.try_lock() {
             Ok(popup) => popup.is_visible(),
             Err(std::sync::TryLockError::Poisoned(poisoned)) => poisoned.into_inner().is_visible(),
-            Err(std::sync::TryLockError::WouldBlock) => false,
+            Err(std::sync::TryLockError::WouldBlock) => matches!(
+                self.intellisense_runtime.signature_popup_transition_state(),
+                IntellisensePopupTransitionState::Showing
+            ),
         }
     }
 
     pub(crate) fn hide_signature_popup(&self) {
-        if !Self::can_try_hide_signature_popup(
-            self.intellisense_runtime.signature_popup_transition_state(),
-        ) {
-            return;
-        }
-        if Self::try_hide_signature_popup_now(&self.signature_popup) {
-            return;
+        let generation = self
+            .intellisense_runtime
+            .next_signature_popup_request_generation();
+        self.intellisense_runtime
+            .set_signature_popup_transition_state(IntellisensePopupTransitionState::Idle);
+        match Self::catch_signature_popup_action(|| {
+            Self::try_hide_signature_popup_now(&self.signature_popup)
+        }) {
+            Some(false) => {}
+            Some(true) | None => return,
         }
         Self::schedule_deferred_signature_popup_hide(
             self.signature_popup.clone(),
-            SIGNATURE_POPUP_DEFERRED_HIDE_RETRIES,
+            self.intellisense_runtime.clone(),
+            generation,
         );
-    }
-
-    fn can_try_hide_signature_popup(state: IntellisensePopupTransitionState) -> bool {
-        matches!(state, IntellisensePopupTransitionState::Idle)
     }
 
     fn try_hide_signature_popup_now(signature_popup: &Arc<Mutex<SignaturePopup>>) -> bool {
@@ -268,25 +393,177 @@ impl SqlEditorWidget {
 
     fn schedule_deferred_signature_popup_hide(
         signature_popup: Arc<Mutex<SignaturePopup>>,
-        remaining_retries: u8,
+        runtime: Arc<IntellisenseRuntimeState>,
+        generation: u64,
     ) {
-        crate::ui::ui_timeout::schedule(0.0, move || {
-            if Self::try_hide_signature_popup_now(&signature_popup) || remaining_retries == 0 {
+        crate::ui::ui_timeout::schedule(SIGNATURE_POPUP_LOCK_RETRY_SECONDS, move || {
+            if !runtime.is_current_signature_popup_request(generation) {
                 return;
+            }
+            match Self::catch_signature_popup_action(|| {
+                Self::try_hide_signature_popup_now(&signature_popup)
+            }) {
+                Some(false) => {}
+                Some(true) | None => return,
             }
             Self::schedule_deferred_signature_popup_hide(
                 signature_popup.clone(),
-                remaining_retries - 1,
+                runtime.clone(),
+                generation,
+            );
+        });
+    }
+
+    fn try_show_signature_popup_now(
+        signature_popup: &Arc<Mutex<SignaturePopup>>,
+        editor: &TextEditor,
+        label: &SignatureLabel,
+        active_arg: usize,
+        anchor_pos: i32,
+    ) -> bool {
+        match signature_popup.try_lock() {
+            Ok(mut popup) => popup.show(editor, label, active_arg, anchor_pos),
+            Err(std::sync::TryLockError::Poisoned(poisoned)) => {
+                poisoned
+                    .into_inner()
+                    .show(editor, label, active_arg, anchor_pos);
+            }
+            Err(std::sync::TryLockError::WouldBlock) => return false,
+        }
+        true
+    }
+
+    fn catch_signature_popup_action(action: impl FnOnce() -> bool) -> Option<bool> {
+        match panic::catch_unwind(AssertUnwindSafe(action)) {
+            Ok(result) => Some(result),
+            Err(payload) => {
+                let message = Self::panic_payload_to_string(payload.as_ref());
+                crate::utils::logging::log_error(
+                    "signature hint",
+                    &format!("signature popup action panicked: {message}"),
+                );
+                None
+            }
+        }
+    }
+
+    fn schedule_deferred_signature_popup_show(
+        signature_popup: Arc<Mutex<SignaturePopup>>,
+        runtime: Arc<IntellisenseRuntimeState>,
+        editor: TextEditor,
+        label: SignatureLabel,
+        active_arg: usize,
+        anchor_pos: i32,
+        generation: u64,
+    ) {
+        crate::ui::ui_timeout::schedule(SIGNATURE_POPUP_LOCK_RETRY_SECONDS, move || {
+            if editor.was_deleted() || !runtime.is_current_signature_popup_request(generation) {
+                return;
+            }
+            match Self::catch_signature_popup_action(|| {
+                Self::try_show_signature_popup_now(
+                    &signature_popup,
+                    &editor,
+                    &label,
+                    active_arg,
+                    anchor_pos,
+                )
+            }) {
+                Some(false) => {}
+                Some(true) | None => {
+                    runtime.set_signature_popup_transition_state(
+                        IntellisensePopupTransitionState::Idle,
+                    );
+                    return;
+                }
+            }
+            Self::schedule_deferred_signature_popup_show(
+                signature_popup.clone(),
+                runtime.clone(),
+                editor.clone(),
+                label.clone(),
+                active_arg,
+                anchor_pos,
+                generation,
             );
         });
     }
 
     fn show_signature_popup(&self, label: &SignatureLabel, active_arg: usize, anchor_pos: i32) {
-        let _transition = SignaturePopupTransitionGuard::new(self.intellisense_runtime.clone());
-        self.signature_popup
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .show(&self.editor, label, active_arg, anchor_pos);
+        let generation = self
+            .intellisense_runtime
+            .next_signature_popup_request_generation();
+        self.intellisense_runtime
+            .set_signature_popup_transition_state(IntellisensePopupTransitionState::Showing);
+        match Self::catch_signature_popup_action(|| {
+            Self::try_show_signature_popup_now(
+                &self.signature_popup,
+                &self.editor,
+                label,
+                active_arg,
+                anchor_pos,
+            )
+        }) {
+            Some(false) => {}
+            Some(true) | None => {
+                self.intellisense_runtime.set_signature_popup_transition_state(
+                    IntellisensePopupTransitionState::Idle,
+                );
+                return;
+            }
+        }
+        Self::schedule_deferred_signature_popup_show(
+            self.signature_popup.clone(),
+            self.intellisense_runtime.clone(),
+            self.editor.clone(),
+            label.clone(),
+            active_arg,
+            anchor_pos,
+            generation,
+        );
+    }
+
+    pub(crate) fn delete_signature_popup_for_close(&self) {
+        let generation = self
+            .intellisense_runtime
+            .next_signature_popup_request_generation();
+        self.intellisense_runtime
+            .set_signature_popup_transition_state(IntellisensePopupTransitionState::Idle);
+        Self::try_delete_signature_popup_for_close(
+            self.signature_popup.clone(),
+            self.intellisense_runtime.clone(),
+            generation,
+        );
+    }
+
+    fn try_delete_signature_popup_for_close(
+        signature_popup: Arc<Mutex<SignaturePopup>>,
+        runtime: Arc<IntellisenseRuntimeState>,
+        generation: u64,
+    ) {
+        if !runtime.is_current_signature_popup_request(generation) {
+            return;
+        }
+        let deleted = Self::catch_signature_popup_action(|| {
+            match signature_popup.try_lock() {
+                Ok(mut popup) => popup.delete_for_close(),
+                Err(std::sync::TryLockError::Poisoned(poisoned)) => {
+                    poisoned.into_inner().delete_for_close();
+                }
+                Err(std::sync::TryLockError::WouldBlock) => return false,
+            }
+            true
+        });
+        if !matches!(deleted, Some(false)) {
+            return;
+        }
+        crate::ui::ui_timeout::schedule(SIGNATURE_POPUP_LOCK_RETRY_SECONDS, move || {
+            Self::try_delete_signature_popup_for_close(
+                signature_popup.clone(),
+                runtime.clone(),
+                generation,
+            );
+        });
     }
 
     /// Recompute the routine call enclosing the cursor and show, hide, or fetch
@@ -298,10 +575,13 @@ impl SqlEditorWidget {
         }
         let cursor = self.editor.insert_position().max(0) as usize;
 
-        // Scan only a bounded window before the cursor (snapped to a line
-        // start) instead of cloning the whole buffer on every keystroke,
-        // matching the editor's deliberately lightweight KeyUp handling. A
-        // call's opening parenthesis is effectively always within this window.
+        let db_type = self
+            .intellisense_runtime
+            .db_type_without_blocking(&self.connection);
+        let mysql_compatible = db_type.is_mysql_or_mariadb();
+        // Keep signature parsing bounded on every edit/caret move. Snap a
+        // partial leading line forward so lexical state can be supplied from
+        // the highlighter without cloning the full query buffer.
         const SIGNATURE_SCAN_WINDOW: usize = 4000;
         let window_start = cursor.saturating_sub(SIGNATURE_SCAN_WINDOW);
         let raw = self
@@ -309,29 +589,24 @@ impl SqlEditorWidget {
             .text_range(window_start as i32, cursor as i32)
             .unwrap_or_default();
         let (scan_offset, scan_text) = match raw.find('\n') {
-            Some(newline) if window_start > 0 => {
-                (window_start + newline + 1, raw[newline + 1..].to_string())
-            }
+            Some(newline) if window_start > 0 => (
+                window_start.saturating_add(newline).saturating_add(1),
+                raw[newline + 1..].to_string(),
+            ),
             _ => (window_start, raw),
         };
-
-        let db_type = self
-            .intellisense_runtime
-            .db_type_without_blocking(&self.connection);
-        let mysql_compatible = db_type.is_mysql_or_mariadb();
         let initial_lex_mode = self
             .highlight_shadow
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .parser_lex_mode_at(scan_offset, mysql_compatible);
-
         let Some(mut call) = crate::ui::intellisense::enclosing_call_at_cursor_with_lexical_mode(
             &scan_text,
             scan_text.len(),
             mysql_compatible,
             initial_lex_mode.clone(),
-        )
-        else {
+        ) else {
+            self.intellisense_runtime.clear_signature_retry();
             self.hide_signature_popup();
             return;
         };
@@ -345,6 +620,7 @@ impl SqlEditorWidget {
                 db_type,
                 &call.name,
             ) {
+                self.intellisense_runtime.clear_signature_retry();
                 let separator_keywords = crate::ui::builtin_signatures::
                     builtin_signature_argument_separator_keywords(db_type, &call.name)
                     .unwrap_or_default();
@@ -392,9 +668,21 @@ impl SqlEditorWidget {
 
         match action {
             Action::Show(label, active_arg) => {
+                self.intellisense_runtime.clear_signature_retry();
                 self.show_signature_popup(&label, active_arg, call.open_paren as i32);
             }
-            Action::Hide => self.hide_signature_popup(),
+            Action::Hide => {
+                let cached = self
+                    .intellisense_data
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .cached_signature(&key)
+                    .is_some();
+                if cached {
+                    self.intellisense_runtime.clear_signature_retry();
+                }
+                self.hide_signature_popup();
+            }
             Action::Fetch => {
                 self.hide_signature_popup();
                 self.spawn_signature_fetch(key, call.name, call.qualifier);
@@ -405,45 +693,70 @@ impl SqlEditorWidget {
     fn spawn_signature_fetch(&self, key: String, name: String, qualifier: Option<String>) {
         let connection = self.connection.clone();
         let sender = self.ui_action_sender.clone();
+        let runtime = self.intellisense_runtime.clone();
         let key_fallback = key.clone();
-        let spawn_result = thread::Builder::new()
-            .name("signature-hint".to_string())
-            .spawn(move || {
-                let sender_for_panic = sender.clone();
-                let key_for_panic = key.clone();
-                let result = panic::catch_unwind(AssertUnwindSafe(|| {
-                    let Some(mut conn_guard) = crate::db::try_lock_connection_with_activity(
-                        &connection,
-                        format!("Signature hint {}", name),
-                    ) else {
-                        let _ = sender.send(UiActionResult::SignatureArguments {
-                            key: key.clone(),
-                            label: None,
-                            cache: false,
-                        });
-                        app::awake();
-                        return;
-                    };
-                    let label =
-                        Self::resolve_signature_label(&mut conn_guard, &name, qualifier.as_deref());
-                    let _ = sender.send(UiActionResult::SignatureArguments {
-                        key: key.clone(),
-                        label,
-                        cache: true,
-                    });
-                    app::awake();
-                }));
-                if result.is_err() {
-                    let _ = sender_for_panic.send(UiActionResult::SignatureArguments {
-                        key: key_for_panic,
-                        label: None,
-                        cache: false,
-                    });
-                    app::awake();
+        let accepted = runtime.submit_signature_task(Box::new(move || {
+            let activity = format!("Signature hint {name}");
+            let result = panic::catch_unwind(AssertUnwindSafe(|| {
+                let context = crate::db::pool_session_context_for_shared_connection(
+                    &connection,
+                    Some(&activity),
+                )?;
+                let _activity_guard = crate::db::track_pool_db_activity(
+                    activity,
+                    context.connection_info.db_type,
+                );
+                if !crate::db::cached_pool_session_context_matches_shared_connection(
+                    &connection,
+                    &context,
+                ) {
+                    return Err("Signature metadata connection changed before acquire".to_string());
                 }
+                let session = context.acquire_session_for_current_scope()?;
+                if !crate::db::cached_pool_session_context_matches_shared_connection(
+                    &connection,
+                    &context,
+                ) {
+                    return Err("Signature metadata connection changed during acquire".to_string());
+                }
+                let label = Self::resolve_signature_label(
+                    context.connection_info.db_type,
+                    session,
+                    &name,
+                    qualifier.as_deref(),
+                )?;
+                if !crate::db::cached_pool_session_context_matches_shared_connection(
+                    &connection,
+                    &context,
+                ) {
+                    return Err("Signature metadata connection changed during lookup".to_string());
+                }
+                Ok(label)
+            }));
+            let (label, cache) = match result {
+                Ok(Ok(label)) => (label, true),
+                Ok(Err(message)) => {
+                    crate::utils::logging::log_debug("signature hint", &message);
+                    (None, false)
+                }
+                Err(payload) => {
+                    let message = Self::panic_payload_to_string(payload.as_ref());
+                    crate::utils::logging::log_error(
+                        "signature hint",
+                        &format!("signature metadata lookup panicked: {message}"),
+                    );
+                    (None, false)
+                }
+            };
+            let _ = sender.send(UiActionResult::SignatureArguments {
+                key,
+                label,
+                cache,
             });
+            app::awake();
+        }));
 
-        if spawn_result.is_err() {
+        if !accepted {
             let _ = self.ui_action_sender.send(UiActionResult::SignatureArguments {
                 key: key_fallback,
                 label: None,
@@ -451,6 +764,21 @@ impl SqlEditorWidget {
             });
             app::awake();
         }
+    }
+
+    pub(crate) fn schedule_signature_retry(&self, key: &str) {
+        let ticket = self.intellisense_runtime.next_signature_retry(key);
+        let widget = self.clone();
+        crate::ui::ui_timeout::schedule(ticket.delay_seconds, move || {
+            if widget.editor.was_deleted()
+                || !widget
+                    .intellisense_runtime
+                    .consume_signature_retry(ticket.generation)
+            {
+                return;
+            }
+            widget.update_signature_hint();
+        });
     }
 
     pub fn show_quick_describe_text_dialog(title: &str, content: &str) {

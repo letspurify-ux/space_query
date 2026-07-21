@@ -1928,6 +1928,31 @@ impl SqlEditorWidget {
         buffer_changed_since_keydown && !shortcut_modified
     }
 
+    fn should_refresh_signature_hint_after_keyup(
+        buffer_changed_since_keydown: bool,
+        key: Key,
+        popup_visible: bool,
+    ) -> bool {
+        buffer_changed_since_keydown
+            || popup_visible
+            || matches!(
+                key,
+                Key::BackSpace
+                    | Key::Delete
+                    | Key::Left
+                    | Key::Right
+                    | Key::Up
+                    | Key::Down
+                    | Key::Home
+                    | Key::End
+                    | Key::PageUp
+                    | Key::PageDown
+                    | Key::Enter
+                    | Key::KPEnter
+                    | Key::Tab
+            )
+    }
+
     fn should_auto_trigger_after_delete(prefix: &str) -> bool {
         Self::has_min_intellisense_prefix(prefix)
     }

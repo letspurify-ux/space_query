@@ -376,10 +376,7 @@ impl SqlEditorWidget {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .delete_for_close();
-        self.signature_popup
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .delete_for_close();
+        self.delete_signature_popup_for_close();
         self.highlighter
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())

@@ -24,16 +24,18 @@ struct LatestTaskWorker {
     queue: Arc<(Mutex<LatestTaskQueueState>, Condvar)>,
     stats: Arc<LatestTaskWorkerStats>,
     handle: Mutex<Option<JoinHandle<()>>>,
+    thread_name: &'static str,
+    log_context: &'static str,
 }
 
 impl LatestTaskWorker {
-    fn new() -> Self {
+    fn new(thread_name: &'static str, log_context: &'static str) -> Self {
         let queue = Arc::new((Mutex::new(LatestTaskQueueState::default()), Condvar::new()));
         let stats = Arc::new(LatestTaskWorkerStats::default());
         let queue_for_thread = queue.clone();
         let stats_for_thread = stats.clone();
         let handle = thread::Builder::new()
-            .name("intellisense-latest-worker".to_string())
+            .name(thread_name.to_string())
             .spawn(move || loop {
                 let task = {
                     let (lock, ready) = &*queue_for_thread;
@@ -76,6 +78,8 @@ impl LatestTaskWorker {
             queue,
             stats,
             handle: Mutex::new(handle),
+            thread_name,
+            log_context,
         }
     }
 
@@ -119,24 +123,66 @@ impl Drop for LatestTaskWorker {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .take()
         {
+            let thread_name = self.thread_name;
+            let log_context = self.log_context;
             let spawn_result = thread::Builder::new()
-                .name("intellisense-latest-worker-reaper".to_string())
+                .name(format!("{thread_name}-reaper"))
                 .spawn(move || {
                     if let Err(err) = handle.join() {
                         crate::utils::logging::log_error(
-                            "sql_editor::intellisense::parse_worker",
+                            log_context,
                             &format!("latest worker join failed: {:?}", err),
                         );
                     }
                 });
             if let Err(err) = spawn_result {
                 crate::utils::logging::log_error(
-                    "sql_editor::intellisense::parse_worker",
+                    log_context,
                     &format!("failed to start latest worker reaper: {err}"),
                 );
             }
         }
     }
+}
+
+impl LatestTaskWorker {
+    /// Queue at most one task behind the active task. Signature metadata
+    /// requests must never replace a queued task because the replaced key
+    /// would otherwise remain marked as pending forever.
+    fn submit_if_pending_empty(&self, task: LatestIntellisenseTask) -> bool {
+        self.stats.submitted.fetch_add(1, Ordering::Relaxed);
+        let (lock, ready) = &*self.queue;
+        let mut state = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        if state.shutdown {
+            drop(state);
+            let fallback_name = format!("{}-fallback", self.thread_name);
+            return thread::Builder::new()
+                .name(fallback_name)
+                .spawn(move || {
+                    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(task));
+                })
+                .is_ok();
+        }
+        if state.pending.is_some() {
+            return false;
+        }
+        state.pending = Some(task);
+        ready.notify_one();
+        true
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct SignatureRetryTicket {
+    pub(crate) generation: u64,
+    pub(crate) delay_seconds: f64,
+}
+
+#[derive(Default)]
+struct SignatureRetryState {
+    generation: u64,
+    key: Option<String>,
+    attempts: usize,
 }
 
 #[derive(Clone)]
@@ -216,6 +262,8 @@ pub(crate) struct IntellisenseRuntimeState {
     buffer_revision: Arc<AtomicU64>,
     popup_show_in_progress: Arc<AtomicU8>,
     signature_popup_show_in_progress: Arc<AtomicU8>,
+    signature_popup_request_generation: Arc<AtomicU64>,
+    signature_retry_state: Arc<Mutex<SignatureRetryState>>,
     keyup_debounce_generation: Arc<Mutex<u64>>,
     keyup_debounce_handle: Arc<Mutex<Option<crate::ui::ui_timeout::TimeoutHandle>>>,
     cached_db_type: Arc<AtomicU8>,
@@ -223,6 +271,7 @@ pub(crate) struct IntellisenseRuntimeState {
     popup_delay_ms: Arc<AtomicUsize>,
     session_state: Arc<Mutex<crate::db::SessionState>>,
     parse_worker: Arc<LatestTaskWorker>,
+    signature_worker: Arc<LatestTaskWorker>,
 }
 
 impl IntellisenseRuntimeState {
@@ -240,6 +289,8 @@ impl IntellisenseRuntimeState {
             signature_popup_show_in_progress: Arc::new(AtomicU8::new(
                 IntellisensePopupTransitionState::Idle as u8,
             )),
+            signature_popup_request_generation: Arc::new(AtomicU64::new(0)),
+            signature_retry_state: Arc::new(Mutex::new(SignatureRetryState::default())),
             keyup_debounce_generation: Arc::new(Mutex::new(0_u64)),
             keyup_debounce_handle: Arc::new(Mutex::new(None)),
             cached_db_type: Arc::new(AtomicU8::new(
@@ -254,7 +305,14 @@ impl IntellisenseRuntimeState {
                 crate::utils::DEFAULT_INTELLISENSE_POPUP_DELAY_MS as usize,
             )),
             session_state: Arc::new(Mutex::new(crate::db::SessionState::default())),
-            parse_worker: Arc::new(LatestTaskWorker::new()),
+            parse_worker: Arc::new(LatestTaskWorker::new(
+                "intellisense-latest-worker",
+                "sql_editor::intellisense::parse_worker",
+            )),
+            signature_worker: Arc::new(LatestTaskWorker::new(
+                "intellisense-signature-worker",
+                "sql_editor::intellisense::signature_worker",
+            )),
         }
     }
 
@@ -502,6 +560,10 @@ impl IntellisenseRuntimeState {
         self.parse_worker.submit(task)
     }
 
+    pub(crate) fn submit_signature_task(&self, task: LatestIntellisenseTask) -> bool {
+        self.signature_worker.submit_if_pending_empty(task)
+    }
+
     #[cfg(test)]
     pub(crate) fn parse_worker_stats(&self) -> (usize, usize, usize, usize) {
         self.parse_worker.stats()
@@ -534,6 +596,65 @@ impl IntellisenseRuntimeState {
         state: IntellisensePopupTransitionState,
     ) {
         store_popup_transition_state(&self.signature_popup_show_in_progress, state);
+    }
+
+    pub(crate) fn next_signature_popup_request_generation(&self) -> u64 {
+        self.signature_popup_request_generation
+            .fetch_add(1, Ordering::AcqRel)
+            .wrapping_add(1)
+    }
+
+    pub(crate) fn is_current_signature_popup_request(&self, generation: u64) -> bool {
+        self.signature_popup_request_generation
+            .load(Ordering::Acquire)
+            == generation
+    }
+
+    pub(crate) fn next_signature_retry(&self, key: &str) -> SignatureRetryTicket {
+        const RETRY_DELAYS_SECONDS: [f64; 6] = [0.1, 0.2, 0.4, 0.8, 1.0, 2.0];
+
+        let mut state = self
+            .signature_retry_state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if state.key.as_deref() == Some(key) {
+            state.attempts = state.attempts.saturating_add(1);
+        } else {
+            state.key = Some(key.to_string());
+            state.attempts = 1;
+        }
+        state.generation = state.generation.wrapping_add(1);
+        SignatureRetryTicket {
+            generation: state.generation,
+            delay_seconds: RETRY_DELAYS_SECONDS[state
+                .attempts
+                .saturating_sub(1)
+                .min(RETRY_DELAYS_SECONDS.len().saturating_sub(1))],
+        }
+    }
+
+    pub(crate) fn consume_signature_retry(&self, generation: u64) -> bool {
+        let mut state = self
+            .signature_retry_state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if state.generation != generation || state.key.is_none() {
+            return false;
+        }
+        // A fired ticket is one-shot. Incrementing here prevents a duplicate
+        // callback from executing the same retry while preserving backoff.
+        state.generation = state.generation.wrapping_add(1);
+        true
+    }
+
+    pub(crate) fn clear_signature_retry(&self) {
+        let mut state = self
+            .signature_retry_state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        state.generation = state.generation.wrapping_add(1);
+        state.key = None;
+        state.attempts = 0;
     }
 
     pub(crate) fn take_keyup_timeout_handle(&self) -> Option<crate::ui::ui_timeout::TimeoutHandle> {
@@ -685,5 +806,91 @@ mod tests {
         completed_receiver
             .recv_timeout(Duration::from_secs(2))
             .expect("worker-side runtime drop must not self-join");
+    }
+
+    #[test]
+    fn signature_worker_never_replaces_a_pending_request() {
+        let runtime = IntellisenseRuntimeState::new();
+        let release = Arc::new((Mutex::new(false), Condvar::new()));
+        let release_first = release.clone();
+        let (started_sender, started_receiver) = std::sync::mpsc::channel();
+        assert!(runtime.submit_signature_task(Box::new(move || {
+            let _ = started_sender.send(());
+            let (lock, ready) = &*release_first;
+            let mut released = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            while !*released {
+                released = ready
+                    .wait(released)
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+            }
+        })));
+        started_receiver
+            .recv_timeout(Duration::from_secs(2))
+            .expect("first signature task should start");
+
+        let (pending_sender, pending_receiver) = std::sync::mpsc::channel();
+        assert!(runtime.submit_signature_task(Box::new(move || {
+            let _ = pending_sender.send(());
+        })));
+        assert!(!runtime.submit_signature_task(Box::new(|| {
+            panic!("a rejected signature task must never run");
+        })));
+
+        let (lock, ready) = &*release;
+        *lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = true;
+        ready.notify_all();
+        pending_receiver
+            .recv_timeout(Duration::from_secs(2))
+            .expect("accepted pending signature task should run");
+    }
+
+    #[test]
+    fn signature_worker_uses_a_retryable_fallback_after_initial_spawn_failure() {
+        let worker = LatestTaskWorker::new(
+            "signature-worker-fallback-test",
+            "signature worker fallback test",
+        );
+        {
+            let mut state = worker
+                .queue
+                .0
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            state.shutdown = true;
+            worker.queue.1.notify_all();
+        }
+        let (completed_sender, completed_receiver) = std::sync::mpsc::channel();
+        assert!(worker.submit_if_pending_empty(Box::new(move || {
+            let _ = completed_sender.send(());
+        })));
+        completed_receiver
+            .recv_timeout(Duration::from_secs(2))
+            .expect("fallback signature task should run after worker startup failure");
+    }
+
+    #[test]
+    fn signature_retry_tickets_back_off_and_are_one_shot() {
+        let runtime = IntellisenseRuntimeState::new();
+        let first = runtime.next_signature_retry("PROC");
+        let second = runtime.next_signature_retry("PROC");
+        assert_eq!(first.delay_seconds, 0.1);
+        assert_eq!(second.delay_seconds, 0.2);
+        assert!(!runtime.consume_signature_retry(first.generation));
+        assert!(runtime.consume_signature_retry(second.generation));
+        assert!(!runtime.consume_signature_retry(second.generation));
+
+        let other_key = runtime.next_signature_retry("OTHER_PROC");
+        assert_eq!(other_key.delay_seconds, 0.1);
+        runtime.clear_signature_retry();
+        assert!(!runtime.consume_signature_retry(other_key.generation));
+    }
+
+    #[test]
+    fn newer_signature_popup_request_invalidates_an_older_request() {
+        let runtime = IntellisenseRuntimeState::new();
+        let old = runtime.next_signature_popup_request_generation();
+        let current = runtime.next_signature_popup_request_generation();
+        assert!(!runtime.is_current_signature_popup_request(old));
+        assert!(runtime.is_current_signature_popup_request(current));
     }
 }
