@@ -4883,6 +4883,7 @@ fn audit_final_suggestions_impl(
     // Fold every source through the SAME merge pipeline production uses, so this
     // harness can no longer drift from `apply_intellisense_with_context` on merge
     // order, the per-source `prefer_aliases` flags, or which sources participate.
+    let mut contextual_type_labels = HashMap::new();
     let suggestions = SqlEditorWidget::merge_completion_sources(
         suggestions,
         expected_object_suggestions,
@@ -4890,6 +4891,7 @@ fn audit_final_suggestions_impl(
         comparison_suggestions,
         local_suggestions,
         None,
+        &mut contextual_type_labels,
         CompletionMergeContext {
             deep_ctx: &ctx,
             context,
@@ -34775,6 +34777,7 @@ fn qualified_member_suggestion_details_use_schema_member_kind_metadata() {
         &[],
         Some("app"),
         None,
+        &HashMap::new(),
         Some(Oracle),
     );
 
@@ -37243,6 +37246,7 @@ fn suggested_data_types_have_keyword_popup_details_for_every_database() {
                 &[],
                 None,
                 Some(position),
+                &HashMap::new(),
                 Some(db_type),
             );
             for suggestion in &suggestions {
@@ -37256,6 +37260,24 @@ fn suggested_data_types_have_keyword_popup_details_for_every_database() {
             }
         }
     }
+}
+
+#[test]
+fn column_suggestions_without_loaded_type_metadata_still_have_column_labels() {
+    let mut data = IntellisenseData::new();
+    data.set_columns_for_table("EMP", vec!["EMPNO".to_string()]);
+    let suggestions = vec!["EMPNO".to_string()];
+    let details = SqlEditorWidget::build_suggestion_details(
+        &data,
+        &suggestions,
+        &["EMP".to_string()],
+        None,
+        None,
+        &HashMap::new(),
+        Some(crate::db::DatabaseType::Oracle),
+    );
+
+    assert_eq!(details.get("EMPNO").map(|detail| detail.type_text.as_str()), Some("COLUMN"));
 }
 
 #[test]
@@ -48405,6 +48427,82 @@ fn query_completion_suggestions_from_prepared_snapshot_with_data(
     expanded: &ExpandedStatementWindow,
     analysis: &IntellisenseAnalysis,
 ) -> Vec<String> {
+    query_completion_popup_from_prepared_snapshot_with_data(
+        snapshot,
+        cursor,
+        db_type,
+        include_locals,
+        data,
+        expanded,
+        analysis,
+    )
+    .suggestions
+}
+
+struct IntellisensePopupSuggestionsForTest {
+    suggestions: Vec<String>,
+    descriptions: HashMap<String, SuggestionDetail>,
+}
+
+fn intellisense_sweep_untyped_popup_suggestion_names(
+    popup: &IntellisensePopupSuggestionsForTest,
+) -> Vec<String> {
+    popup
+        .suggestions
+        .iter()
+        .filter(|suggestion| {
+            let key = SqlEditorWidget::completion_identifier_lookup_upper(suggestion);
+            popup
+                .descriptions
+                .get(&key)
+                .map(|detail| detail.type_text.trim().is_empty())
+                .unwrap_or(true)
+        })
+        .cloned()
+        .collect()
+}
+
+#[test]
+fn intellisense_sweep_detects_every_missing_or_empty_popup_type_label() {
+    let popup = IntellisensePopupSuggestionsForTest {
+        suggestions: vec![
+            "typed".to_string(),
+            "blank".to_string(),
+            "missing".to_string(),
+        ],
+        descriptions: HashMap::from([
+            (
+                "TYPED".to_string(),
+                SuggestionDetail {
+                    type_text: "COLUMN".to_string(),
+                    badges: String::new(),
+                },
+            ),
+            (
+                "BLANK".to_string(),
+                SuggestionDetail {
+                    type_text: "  ".to_string(),
+                    badges: "PK".to_string(),
+                },
+            ),
+        ]),
+    };
+
+    assert_eq!(
+        intellisense_sweep_untyped_popup_suggestion_names(&popup),
+        vec!["blank".to_string(), "missing".to_string()]
+    );
+}
+
+fn query_completion_popup_from_prepared_snapshot_with_data(
+    snapshot: &ChunkedText,
+    cursor: usize,
+    db_type: crate::db::DatabaseType,
+    include_locals: bool,
+    data: &mut IntellisenseData,
+    expanded: &ExpandedStatementWindow,
+    analysis: &IntellisenseAnalysis,
+) -> IntellisensePopupSuggestionsForTest {
     let signature_scan_text =
         signature_scan_text_before_cursor_from_snapshot_for_test(snapshot, cursor);
     let mysql_compatible = db_type.is_mysql_or_mariadb();
@@ -48557,8 +48655,32 @@ fn query_completion_suggestions_from_prepared_snapshot_with_data(
                 .clone()
         });
     match computation {
-        IntellisenseCompletionComputation::Suppressed => Vec::new(),
-        IntellisenseCompletionComputation::Computed(computed) => computed.suggestions,
+        IntellisenseCompletionComputation::Suppressed => IntellisensePopupSuggestionsForTest {
+            suggestions: Vec::new(),
+            descriptions: HashMap::new(),
+        },
+        IntellisenseCompletionComputation::Computed(computed) => {
+            let IntellisenseComputedSuggestions {
+                suggestions,
+                column_tables,
+                data_type_position,
+                contextual_type_labels,
+                ..
+            } = computed;
+            let descriptions = SqlEditorWidget::build_suggestion_details(
+                data,
+                &suggestions,
+                &column_tables,
+                snapshot.qualifier.as_deref(),
+                data_type_position,
+                &contextual_type_labels,
+                Some(db_type),
+            );
+            IntellisensePopupSuggestionsForTest {
+                suggestions,
+                descriptions,
+            }
+        }
     }
 }
 
@@ -50670,7 +50792,19 @@ struct IntellisenseSweepMissing {
 
 struct IntellisenseSweepRun {
     checked: usize,
+    suggestions_checked: usize,
     missing: Vec<IntellisenseSweepMissing>,
+    untyped_suggestions: Vec<IntellisenseSweepUntypedSuggestion>,
+}
+
+#[derive(Debug)]
+struct IntellisenseSweepUntypedSuggestion {
+    start: usize,
+    line: usize,
+    column: usize,
+    word: String,
+    prefix: String,
+    suggestion: String,
 }
 
 struct IntellisenseSweepCandidate {
@@ -50684,7 +50818,9 @@ struct IntellisenseSweepCandidate {
 
 struct IntellisenseSweepCandidateResult {
     checked: bool,
+    suggestions_checked: usize,
     missing: Option<IntellisenseSweepMissing>,
+    untyped_suggestions: Vec<IntellisenseSweepUntypedSuggestion>,
 }
 
 fn oracle_test1_intellisense_data() -> IntellisenseData {
@@ -53223,12 +53359,16 @@ fn intellisense_sweep_word_skip_context_from_analysis(
 fn intellisense_sweep_render_out(
     script: &str,
     checked: usize,
+    suggestions_checked: usize,
     missing: &[IntellisenseSweepMissing],
+    untyped_suggestions: &[IntellisenseSweepUntypedSuggestion],
     source_label: &str,
     db_type: crate::db::DatabaseType,
     metadata_label: Option<&str>,
 ) -> String {
-    let mut output = String::with_capacity(script.len() + missing.len() * 96 + 512);
+    let mut output = String::with_capacity(
+        script.len() + missing.len() * 96 + untyped_suggestions.len() * 96 + 640,
+    );
     let mut cursor = 0usize;
     for miss in missing {
         output.push_str(script.get(cursor..miss.start).unwrap_or(""));
@@ -53247,7 +53387,12 @@ fn intellisense_sweep_render_out(
         output.push_str(&format!("-- metadata: {metadata_label}\n"));
     }
     output.push_str(&format!("-- checked: {checked}\n"));
+    output.push_str(&format!("-- suggestions checked: {suggestions_checked}\n"));
     output.push_str(&format!("-- missing: {}\n", missing.len()));
+    output.push_str(&format!(
+        "-- suggestions without type labels: {}\n",
+        untyped_suggestions.len()
+    ));
     output.push_str("-- marker: [[word]] means not suggested for the tested prefix\n");
     if missing.is_empty() {
         output.push_str("-- missing tokens: none\n");
@@ -53268,6 +53413,22 @@ fn intellisense_sweep_render_out(
                 suggestions,
                 miss.suggestion_count,
                 intellisense_sweep_line_text(script, miss.start)
+            ));
+        }
+    }
+    if untyped_suggestions.is_empty() {
+        output.push_str("-- suggestions without type labels: none\n");
+    } else {
+        output.push_str("-- suggestions without type labels:\n");
+        for untyped in untyped_suggestions {
+            output.push_str(&format!(
+                "--   {}:{} word={} prefix={} suggestion={} line={}\n",
+                untyped.line,
+                untyped.column,
+                untyped.word,
+                untyped.prefix,
+                untyped.suggestion,
+                intellisense_sweep_line_text(script, untyped.start)
             ));
         }
     }
@@ -53312,6 +53473,7 @@ fn intellisense_sweep_check_candidate(
             let (line, column) = intellisense_sweep_line_column(script, candidate.start);
             return IntellisenseSweepCandidateResult {
                 checked: true,
+                suggestions_checked: 0,
                 missing: Some(IntellisenseSweepMissing {
                     start: candidate.start,
                     end: candidate.end,
@@ -53325,6 +53487,7 @@ fn intellisense_sweep_check_candidate(
                     )],
                     suggestion_count: 0,
                 }),
+                untyped_suggestions: Vec::new(),
             };
         }
     };
@@ -53341,13 +53504,15 @@ fn intellisense_sweep_check_candidate(
     if skip {
         return IntellisenseSweepCandidateResult {
             checked: false,
+            suggestions_checked: 0,
             missing: None,
+            untyped_suggestions: Vec::new(),
         };
     }
 
     let result = panic::catch_unwind(AssertUnwindSafe(|| {
         let mut data = base_data.clone();
-        query_completion_suggestions_from_prepared_snapshot_with_data(
+        query_completion_popup_from_prepared_snapshot_with_data(
             &snapshot,
             candidate.cursor,
             db_type,
@@ -53357,14 +53522,26 @@ fn intellisense_sweep_check_candidate(
             &analysis,
         )
     }));
-    let (matched, suggestion_sample, suggestion_count) = match result {
-        Ok(suggestions) => {
-            let matched = suggestions.iter().any(|suggestion| {
+    let (matched, suggestion_sample, suggestion_count, untyped_suggestions) = match result {
+        Ok(popup) => {
+            let matched = popup.suggestions.iter().any(|suggestion| {
                 intellisense_sweep_suggestion_matches_word(suggestion, &candidate.word)
             });
-            let count = suggestions.len();
-            let sample = suggestions.into_iter().take(16).collect::<Vec<_>>();
-            (matched, sample, count)
+            let count = popup.suggestions.len();
+            let (line, column) = intellisense_sweep_line_column(script, candidate.start);
+            let untyped = intellisense_sweep_untyped_popup_suggestion_names(&popup)
+                .into_iter()
+                .map(|suggestion| IntellisenseSweepUntypedSuggestion {
+                    start: candidate.start,
+                    line,
+                    column,
+                    word: candidate.word.clone(),
+                    prefix: candidate.prefix.clone(),
+                    suggestion,
+                })
+                .collect::<Vec<_>>();
+            let sample = popup.suggestions.into_iter().take(16).collect::<Vec<_>>();
+            (matched, sample, count, untyped)
         }
         Err(err) => (
             false,
@@ -53373,6 +53550,7 @@ fn intellisense_sweep_check_candidate(
                 intellisense_sweep_panic_payload_text(err.as_ref())
             )],
             0,
+            Vec::new(),
         ),
     };
     let missing = (!matched).then(|| {
@@ -53390,7 +53568,9 @@ fn intellisense_sweep_check_candidate(
     });
     IntellisenseSweepCandidateResult {
         checked: true,
+        suggestions_checked: suggestion_count,
         missing,
+        untyped_suggestions,
     }
 }
 
@@ -53487,12 +53667,28 @@ fn intellisense_sweep_run(
         .into_inner()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     let checked = results.iter().filter(|result| result.checked).count();
-    let mut missing = results
-        .into_iter()
-        .filter_map(|result| result.missing)
-        .collect::<Vec<_>>();
+    let suggestions_checked = results
+        .iter()
+        .map(|result| result.suggestions_checked)
+        .sum();
+    let mut missing = Vec::new();
+    let mut untyped_suggestions = Vec::new();
+    for result in results {
+        if let Some(item) = result.missing {
+            missing.push(item);
+        }
+        untyped_suggestions.extend(result.untyped_suggestions);
+    }
     missing.sort_by_key(|item| item.start);
-    IntellisenseSweepRun { checked, missing }
+    untyped_suggestions.sort_by(|left, right| {
+        (left.start, left.suggestion.as_str()).cmp(&(right.start, right.suggestion.as_str()))
+    });
+    IntellisenseSweepRun {
+        checked,
+        suggestions_checked,
+        missing,
+        untyped_suggestions,
+    }
 }
 
 fn intellisense_sweep_db_type_from_env(value: &str) -> Option<crate::db::DatabaseType> {
@@ -54061,7 +54257,9 @@ fn intellisense_sweep_generate_report_for_file(
     let out = intellisense_sweep_render_out(
         &script,
         run.checked,
+        run.suggestions_checked,
         &run.missing,
+        &run.untyped_suggestions,
         &source_label,
         db_type,
         metadata_label,
@@ -54082,9 +54280,10 @@ fn intellisense_sweep_generate_report_for_file(
     );
     if fail_on_missing {
         assert!(
-            run.missing.is_empty(),
-            "IntelliSense sweep found {} missing tokens; report written to `{}`",
+            run.missing.is_empty() && run.untyped_suggestions.is_empty(),
+            "IntelliSense sweep found {} missing tokens and {} suggestions without type labels; report written to `{}`",
             run.missing.len(),
+            run.untyped_suggestions.len(),
             out_path.display()
         );
     }
@@ -54194,19 +54393,25 @@ fn intellisense_sweep_generate_reports_for_all_fixture_files() {
                 false,
             );
             eprintln!(
-                "IntelliSense sweep: {relative_path}: checked={} missing={}",
+                "IntelliSense sweep: {relative_path}: checked={} suggestions={} missing={} untyped={}",
                 run.checked,
-                run.missing.len()
+                run.suggestions_checked,
+                run.missing.len(),
+                run.untyped_suggestions.len()
             );
-            if !run.missing.is_empty() {
-                failures.push(format!("{relative_path}: {}", run.missing.len()));
+            if !run.missing.is_empty() || !run.untyped_suggestions.is_empty() {
+                failures.push(format!(
+                    "{relative_path}: missing={} untyped={}",
+                    run.missing.len(),
+                    run.untyped_suggestions.len()
+                ));
             }
         }
     }
 
     assert!(
         failures.is_empty(),
-        "IntelliSense sweep found missing tokens:\n{}",
+        "IntelliSense sweep found missing tokens or suggestions without type labels:\n{}",
         failures.join("\n")
     );
 }
@@ -61665,6 +61870,13 @@ fn mysql_set_assignment_value_expression_filters_statement_and_relation_noise() 
                 );
             }
         }
+
+        let next_statement =
+            run("CREATE PROCEDURE p() BEGIN SET @v = 1; INSE| INTO t VALUES(1); END", db);
+        assert!(
+            has(&next_statement, "INSERT"),
+            "a completed SET assignment leaked its expression filter into the next statement for {db:?}: {next_statement:?}"
+        );
     }
 }
 
@@ -93653,6 +93865,40 @@ fn mysql_family_new_fixture_type_and_builtin_completion_regressions() {
 }
 
 #[test]
+fn remaining_sweep_builtin_and_for_loop_keyword_regressions() {
+    use crate::db::DatabaseType::{MariaDB, Oracle};
+
+    let cases = [
+        ("BEGIN FOR j IN REVE| 1..3 LOOP NULL; END LOOP; END;", Oracle, "REVERSE"),
+        ("SELECT LA|(amount) OVER(ORDER BY id) FROM t", MariaDB, "LAG"),
+        ("SELECT LEA|(amount) OVER(ORDER BY id) FROM t", MariaDB, "LEAD"),
+        ("SELECT FIRS|(amount) OVER w FROM t WINDOW w AS()", MariaDB, "FIRST_VALUE"),
+        ("SELECT NTH_|(amount, 2) OVER w FROM t WINDOW w AS()", MariaDB, "NTH_VALUE"),
+        ("INSERT INTO t(a) VALUES(1) ON DUPLICATE KEY UPDATE a=VALU|(a)", MariaDB, "VALUES"),
+        ("SELECT CONCAT(a, REPL|(b, '-', '_')) FROM t", MariaDB, "REPLACE"),
+        ("CREATE PROCEDURE p() BEGIN INSERT| INTO t VALUES(1); END", MariaDB, "INSERT"),
+    ];
+
+    let mut failures = Vec::new();
+    for (sql, db_type, expected) in cases {
+        let suggestions = query_keyword_completion_suggestions(sql, db_type);
+        if !suggestions
+            .iter()
+            .any(|suggestion| intellisense_sweep_suggestion_matches_word(suggestion, expected))
+        {
+            failures.push(format!(
+                "`{expected}` missing at {db_type:?} `{sql}`: {suggestions:?}"
+            ));
+        }
+    }
+    assert!(
+        failures.is_empty(),
+        "remaining sweep completion gaps:\n{}",
+        failures.join("\n")
+    );
+}
+
+#[test]
 fn mysql_family_new_fixture_structural_keyword_regressions() {
     use crate::db::DatabaseType::{MariaDB, MySQL};
 
@@ -93839,6 +94085,11 @@ fn mysql_family_new_fixture_local_scope_regressions() {
                 "CALL mb3_assert(v_event_total>0",
                 "CALL mb3_assert(v_event_|>0",
                 "v_event_total",
+            ),
+            (
+                "INSERT INTO mb3_error_log(phase_name,sql_state,error_no,message_text)VALUES('EXPECTED_DUPLICATE'",
+                "INSE| INTO mb3_error_log(phase_name,sql_state,error_no,message_text)VALUES('EXPECTED_DUPLICATE'",
+                "INSERT",
             ),
         ],
     ));

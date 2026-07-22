@@ -9,7 +9,10 @@ WHERE sql_id = '6brq8ayq9s8ay';
 -- db: Oracle
 -- metadata: test Oracle inferred catalog (file-scoped overlay) + Oracle built-ins
 -- checked: 5
+-- suggestions checked: 6
 -- missing: 0
+-- suggestions without type labels: 0
 -- marker: [[word]] means not suggested for the tested prefix
 -- missing tokens: none
+-- suggestions without type labels: none
 -- =========================================================

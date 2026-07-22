@@ -381,6 +381,7 @@ pub const ORACLE_SQL_KEYWORDS: &[&str] = &[
     "ONE",
     "ONLY",
     "OPEN",
+    "OPERATOR",
     "OPTIMIZER_MODE",
     "OR",
     "ORDER",

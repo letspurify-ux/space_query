@@ -219,7 +219,10 @@ ORDER BY f.agent_id;
 -- db: MariaDB
 -- metadata: test_mariadb/test14.txt inferred catalog
 -- checked: 543
+-- suggestions checked: 5745
 -- missing: 0
+-- suggestions without type labels: 0
 -- marker: [[word]] means not suggested for the tested prefix
 -- missing tokens: none
+-- suggestions without type labels: none
 -- =========================================================

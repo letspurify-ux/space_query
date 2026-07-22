@@ -31,6 +31,7 @@ pub static MARIADB_FUNCTIONS_SET: once_cell::sync::Lazy<std::collections::HashSe
 
 const FUNCTION_SUFFIX: &str = "()";
 const ORACLE_BUILTIN_PACKAGES: &[&str] = &[
+    "DBMS_DB_VERSION",
     "DBMS_OUTPUT",
     "DBMS_LOB",
     "DBMS_SQL",
@@ -2055,9 +2056,11 @@ impl IntellisenseData {
             "JAVA CLASS"
         } else if has(&self.java_resource_entries) {
             "JAVA RESOURCE"
+        } else if has(&self.schema_entries) {
+            "SCHEMA"
         } else if has(&self.user_entries) {
             "USER"
-        } else if self.is_catalog_keyword(upper.as_str(), db_type) {
+        } else if self.is_catalog_keyword_suggestion(upper.as_str(), db_type) {
             "KEYWORD"
         } else {
             return None;
@@ -2068,6 +2071,18 @@ impl IntellisenseData {
     fn is_catalog_keyword(&self, upper: &str, db_type: Option<crate::db::DatabaseType>) -> bool {
         let (keywords, _functions, _dialect_functions) = language_catalog_for_db_type(db_type);
         keywords.binary_search(&upper).is_ok()
+    }
+
+    fn is_catalog_keyword_suggestion(
+        &self,
+        upper: &str,
+        db_type: Option<crate::db::DatabaseType>,
+    ) -> bool {
+        self.is_catalog_keyword(upper, db_type)
+            || (upper.contains(' ')
+                && upper
+                    .split_ascii_whitespace()
+                    .all(|word| self.is_catalog_keyword(word, db_type)))
     }
 
     /// True when `upper` (an upper-cased token) is a reserved language keyword for

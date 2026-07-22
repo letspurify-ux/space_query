@@ -455,7 +455,10 @@ JSON_OBJECT(
 -- db: MySQL
 -- metadata: test_mysql/test10.txt inferred catalog
 -- checked: 1115
+-- suggestions checked: 8747
 -- missing: 0
+-- suggestions without type labels: 0
 -- marker: [[word]] means not suggested for the tested prefix
 -- missing tokens: none
+-- suggestions without type labels: none
 -- =========================================================

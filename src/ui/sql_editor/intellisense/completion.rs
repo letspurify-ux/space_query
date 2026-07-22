@@ -296,6 +296,7 @@ struct IntellisenseComputedSuggestions {
     suggestions: Vec<String>,
     column_tables: Vec<String>,
     data_type_position: Option<DataTypePosition>,
+    contextual_type_labels: HashMap<String, String>,
     should_refresh_when_columns_ready: bool,
 }
 
@@ -2920,6 +2921,7 @@ impl SqlEditorWidget {
             suggestions,
             column_tables,
             data_type_position,
+            contextual_type_labels,
             ..
         } = computed;
 
@@ -2962,6 +2964,7 @@ impl SqlEditorWidget {
                 &column_tables,
                 snapshot.qualifier.as_deref(),
                 data_type_position,
+                &contextual_type_labels,
                 Some(snapshot.preferred_db_type),
             )
         };
@@ -5264,6 +5267,92 @@ impl SqlEditorWidget {
             false
         };
 
+        let mut contextual_type_labels = HashMap::new();
+        {
+            let mut label_suggestions = |values: &[String], label: &str| {
+                for value in values {
+                    contextual_type_labels.insert(
+                        Self::completion_identifier_lookup_upper(value),
+                        label.to_string(),
+                    );
+                }
+            };
+            label_suggestions(&local_suggestions, "LOCAL");
+            label_suggestions(&local_record_member_suggestions, "FIELD");
+            label_suggestions(&local_rowtype_member_suggestions, "COLUMN");
+            label_suggestions(&local_schema_type_member_suggestions, "ATTRIBUTE");
+            label_suggestions(&qualified_member_suggestions, "MEMBER");
+            label_suggestions(
+                &oracle_type_attribute_relation_member_suggestions,
+                "ATTRIBUTE",
+            );
+            label_suggestions(&mysql_named_value_suggestions, "VARIABLE");
+            if let Some(values) = oracle_property_graph_column_suggestions.as_deref() {
+                label_suggestions(values, "COLUMN");
+            }
+            if let Some(values) = mysql_delete_target_list_suggestions.as_deref() {
+                label_suggestions(values, "ALIAS");
+            }
+            for values in [
+                create_table_declared_column_suggestions.as_deref(),
+                create_table_storage_column_suggestions.as_deref(),
+                create_table_partition_declared_column_suggestions.as_deref(),
+                oracle_trigger_update_of_column_suggestions.as_deref(),
+            ]
+            .into_iter()
+            .flatten()
+            {
+                label_suggestions(values, "COLUMN");
+            }
+            label_suggestions(&multi_table_insert_source_projection_suggestions, "COLUMN");
+            label_suggestions(&early_model_identifier_suggestions, "IDENTIFIER");
+            label_suggestions(&early_text_model_identifier_suggestions, "IDENTIFIER");
+            label_suggestions(&early_inline_function_suggestions, "FUNCTION");
+            label_suggestions(&early_relation_alias_suggestions, "ALIAS");
+            label_suggestions(&early_table_relation_suggestions, "TABLE");
+            label_suggestions(&early_unqualified_visible_column_suggestions, "COLUMN");
+            label_suggestions(&early_oracle_collection_column_suggestions, "COLUMN");
+            label_suggestions(&early_comment_column_suggestions, "COLUMN");
+            label_suggestions(&early_local_type_suggestions, "TYPE");
+            label_suggestions(&early_mariadb_type_of_target_suggestions, "LOCAL");
+            label_suggestions(&early_qualified_subquery_column_suggestions, "COLUMN");
+            label_suggestions(
+                &early_qualified_visible_relation_column_suggestions,
+                "COLUMN",
+            );
+            label_suggestions(&early_local_collection_method_suggestions, "METHOD");
+            label_suggestions(&early_local_rowtype_member_suggestions, "COLUMN");
+            label_suggestions(&early_cte_relation_suggestions, "CTE");
+            label_suggestions(&early_own_type_body_member_suggestions, "MEMBER");
+            label_suggestions(&early_oracle_show_errors_object_suggestions, "OBJECT");
+            label_suggestions(&early_mysql_call_target_suggestions, "PROCEDURE");
+            label_suggestions(&expected_keyword_suggestions, "KEYWORD");
+            label_suggestions(&signature_argument_suggestions, "PARAMETER");
+            label_suggestions(&session_bind_names, "BIND");
+        }
+        for exception in PLSQL_PREDEFINED_EXCEPTIONS {
+            contextual_type_labels.insert((*exception).to_string(), "EXCEPTION".to_string());
+        }
+        for symbol in analysis.local_symbols.iter() {
+            if local_suggestions
+                .iter()
+                .any(|suggestion| Self::completion_identifiers_match(suggestion, &symbol.name))
+            {
+                let label = if symbol.is_type_symbol {
+                    "TYPE".to_string()
+                } else {
+                    symbol
+                        .type_display
+                        .as_deref()
+                        .filter(|value| !value.trim().is_empty())
+                        .unwrap_or("LOCAL")
+                        .to_string()
+                };
+                contextual_type_labels
+                    .insert(Self::completion_identifier_lookup_upper(&symbol.name), label);
+            }
+        }
+
         let suggestions = if has_resolved_local_record_member_scope {
             Self::merge_suggestions_with_context_aliases(
                 local_record_member_suggestions,
@@ -5655,6 +5744,12 @@ impl SqlEditorWidget {
         } else {
             Vec::new()
         };
+        for suggestion in &comparison_suggestions {
+            contextual_type_labels.insert(
+                Self::completion_identifier_lookup_upper(suggestion),
+                "VALUE".to_string(),
+            );
+        }
 
         // Build the FK-based auto-join condition (if any) before the merge: it
         // needs foreign-key metadata and a data lock, and lazily triggers FK
@@ -5692,6 +5787,12 @@ impl SqlEditorWidget {
         } else {
             None
         };
+        if let Some(suggestion) = auto_join_condition.as_deref() {
+            contextual_type_labels.insert(
+                Self::completion_identifier_lookup_upper(suggestion),
+                "JOIN CONDITION".to_string(),
+            );
+        }
 
         let should_refresh_when_columns_ready = include_columns && columns_loading;
 
@@ -5730,6 +5831,7 @@ impl SqlEditorWidget {
             comparison_suggestions,
             local_suggestions,
             auto_join_condition,
+            &mut contextual_type_labels,
             CompletionMergeContext {
                 deep_ctx,
                 context,
@@ -5759,13 +5861,35 @@ impl SqlEditorWidget {
                 )
             },
         );
+        for suggestion in &suggestions {
+            if suggestion.trim_end().ends_with(".*") {
+                contextual_type_labels.insert(
+                    Self::completion_identifier_lookup_upper(suggestion),
+                    "WILDCARD".to_string(),
+                );
+            }
+        }
 
         IntellisenseCompletionComputation::Computed(IntellisenseComputedSuggestions {
             suggestions,
             column_tables,
             data_type_position,
+            contextual_type_labels,
             should_refresh_when_columns_ready,
         })
+    }
+
+    fn insert_contextual_type_labels(
+        labels: &mut HashMap<String, String>,
+        suggestions: &[String],
+        label: &str,
+    ) {
+        for suggestion in suggestions {
+            labels.insert(
+                Self::completion_identifier_lookup_upper(suggestion),
+                label.to_string(),
+            );
+        }
     }
 
     /// The completion merge pipeline: folds every already-computed source vector
@@ -5787,6 +5911,7 @@ impl SqlEditorWidget {
         comparison_suggestions: Vec<String>,
         local_suggestions: Vec<String>,
         auto_join_condition: Option<String>,
+        contextual_type_labels: &mut HashMap<String, String>,
         cx: CompletionMergeContext<'_>,
         mut is_scoped_column: impl FnMut(&str) -> bool,
     ) -> Vec<String> {
@@ -5806,6 +5931,33 @@ impl SqlEditorWidget {
             signature_scan_text,
             oracle_qualifier_head_suggestions,
         } = cx;
+
+        Self::insert_contextual_type_labels(
+            contextual_type_labels,
+            &expected_object_suggestions,
+            "OBJECT",
+        );
+        Self::insert_contextual_type_labels(
+            contextual_type_labels,
+            &expected_keyword_suggestions,
+            "KEYWORD",
+        );
+        Self::insert_contextual_type_labels(
+            contextual_type_labels,
+            &comparison_suggestions,
+            "VALUE",
+        );
+        Self::insert_contextual_type_labels(
+            contextual_type_labels,
+            &local_suggestions,
+            "LOCAL",
+        );
+        if let Some(condition) = auto_join_condition.as_deref() {
+            contextual_type_labels.insert(
+                Self::completion_identifier_lookup_upper(condition),
+                "JOIN CONDITION".to_string(),
+            );
+        }
 
         if !expected_object_suggestions.is_empty() && !replace_table_context_with_expected_objects {
             suggestions = Self::merge_suggestions_with_context_aliases(
@@ -5836,6 +5988,11 @@ impl SqlEditorWidget {
             Vec::new()
         };
         if !builtin_function_call_suggestions.is_empty() {
+            Self::insert_contextual_type_labels(
+                contextual_type_labels,
+                &builtin_function_call_suggestions,
+                "FUNCTION",
+            );
             suggestions = Self::merge_suggestions_with_context_aliases(
                 suggestions,
                 builtin_function_call_suggestions,
@@ -5861,6 +6018,11 @@ impl SqlEditorWidget {
             Self::collect_clause_wildcard_suggestions(prefix, qualifier, deep_ctx)
         };
         if !wildcard_suggestions.is_empty() {
+            Self::insert_contextual_type_labels(
+                contextual_type_labels,
+                &wildcard_suggestions,
+                "WILDCARD",
+            );
             suggestions =
                 Self::merge_suggestions_with_context_aliases(suggestions, wildcard_suggestions, true);
         }
@@ -5871,6 +6033,11 @@ impl SqlEditorWidget {
             {
                 derived_columns.push("COLUMN_VALUE".to_string());
             }
+            Self::insert_contextual_type_labels(
+                contextual_type_labels,
+                &derived_columns,
+                "COLUMN",
+            );
             suggestions = if Self::cursor_is_in_query_level_order_by(deep_ctx) {
                 Self::merge_suggestions_with_prioritized_derived_columns(
                     suggestions,
@@ -5897,11 +6064,53 @@ impl SqlEditorWidget {
             } else {
                 Vec::new()
             };
+        Self::insert_contextual_type_labels(
+            contextual_type_labels,
+            &context_name_suggestions,
+            "CONTEXT",
+        );
+        for table_ref in &deep_ctx.tables_in_scope {
+            if let Some(alias) = table_ref.alias.as_deref() {
+                contextual_type_labels.insert(
+                    Self::completion_identifier_lookup_upper(alias),
+                    "ALIAS".to_string(),
+                );
+            }
+        }
+        for column in Self::recursive_cte_columns_declared_before_cursor(deep_ctx) {
+            contextual_type_labels.insert(
+                Self::completion_identifier_lookup_upper(&column),
+                "COLUMN".to_string(),
+            );
+        }
+        for cte in &deep_ctx.ctes {
+            contextual_type_labels.insert(
+                Self::completion_identifier_lookup_upper(&cte.name),
+                "CTE".to_string(),
+            );
+        }
+        for cte_name in Self::cte_names_declared_before_cursor(deep_ctx) {
+            contextual_type_labels.insert(
+                Self::completion_identifier_lookup_upper(&cte_name),
+                "CTE".to_string(),
+            );
+        }
+        for subquery in &deep_ctx.subqueries {
+            contextual_type_labels.insert(
+                Self::completion_identifier_lookup_upper(&subquery.alias),
+                "ALIAS".to_string(),
+            );
+        }
         let recursive_cte_column_suggestions = if qualifier.is_none() {
             Self::recursive_cte_column_suggestions_for_prefix(prefix, deep_ctx)
         } else {
             Vec::new()
         };
+        Self::insert_contextual_type_labels(
+            contextual_type_labels,
+            &recursive_cte_column_suggestions,
+            "COLUMN",
+        );
         let text_recursive_cte_column_suggestions = if qualifier.is_none() {
             signature_scan_text
                 .map(|scan_text| {
@@ -5913,11 +6122,21 @@ impl SqlEditorWidget {
         } else {
             Vec::new()
         };
+        Self::insert_contextual_type_labels(
+            contextual_type_labels,
+            &text_recursive_cte_column_suggestions,
+            "COLUMN",
+        );
         let mysql_trigger_pseudo_rows = if force_context_name_qualifier_head {
             Self::collect_mysql_trigger_pseudo_row_suggestions(prefix, expr_keyword_ctx, db_type)
         } else {
             Vec::new()
         };
+        Self::insert_contextual_type_labels(
+            contextual_type_labels,
+            &mysql_trigger_pseudo_rows,
+            "PSEUDORECORD",
+        );
         let oracle_qualifier_head_suggestions = if force_context_name_qualifier_head
             && !crate::sql_text::mysql_compatibility_for_sql("", db_type)
         {
@@ -5925,6 +6144,11 @@ impl SqlEditorWidget {
         } else {
             Vec::new()
         };
+        Self::insert_contextual_type_labels(
+            contextual_type_labels,
+            &oracle_qualifier_head_suggestions,
+            "QUALIFIER",
+        );
         let suggestions = Self::maybe_merge_suggestions_with_context_aliases(
             suggestions,
             context_name_suggestions,
@@ -37290,6 +37514,13 @@ impl SqlEditorWidget {
             {
                 Some(&["SELECT", "WITH"])
             }
+            // `FOR <index> IN |` — a numeric loop may optionally reverse its
+            // lower-to-upper iteration order before the first range operand.
+            [.., for_word, index, in_word]
+                if for_word == "FOR" && in_word == "IN" && !is_keyword(index) =>
+            {
+                Some(&["REVERSE"])
+            }
             // `OPEN <cur> |` — the query opener follows.
             [.., open, name] if open == "OPEN" && !is_keyword(name) => Some(&["FOR"]),
             // `OPEN <cur> FOR |` — a query expression follows.
@@ -45367,7 +45598,13 @@ impl SqlEditorWidget {
             return false;
         };
         let tail = &toks[set_pos + 1..];
-        if tail.is_empty() {
+        // A prior `SET ...;` in the same routine/block must not make every
+        // later statement look like part of that assignment expression.
+        if tail.is_empty()
+            || tail
+                .iter()
+                .any(|token| matches!(token, SqlToken::Symbol(sym) if sym == ";"))
+        {
             return false;
         }
         let segment_start = tail
@@ -59385,6 +59622,7 @@ impl SqlEditorWidget {
         column_tables: &[String],
         qualifier: Option<&str>,
         data_type_position: Option<DataTypePosition>,
+        contextual_type_labels: &HashMap<String, String>,
         db_type: Option<crate::db::DatabaseType>,
     ) -> HashMap<String, SuggestionDetail> {
         let mut details = Self::build_column_descriptions(data, column_tables);
@@ -59403,7 +59641,8 @@ impl SqlEditorWidget {
                             .any(|keyword| suggestion.eq_ignore_ascii_case(keyword))
                             .then_some("KEYWORD")
                     })
-                });
+                })
+                .or_else(|| contextual_type_labels.get(&key).map(String::as_str));
             if let Some(label) = label {
                 details.insert(
                     key,
@@ -59440,6 +59679,13 @@ impl SqlEditorWidget {
                     continue;
                 }
                 let Some(meta) = data.get_column_meta(table, &column) else {
+                    descriptions.insert(
+                        key,
+                        SuggestionDetail {
+                            type_text: "COLUMN".to_string(),
+                            badges: String::new(),
+                        },
+                    );
                     continue;
                 };
 
@@ -59456,15 +59702,17 @@ impl SqlEditorWidget {
                     badges.push_str(&format!("FK\u{2192}{ref_table}"));
                 }
 
-                if !meta.type_display.trim().is_empty() || !badges.is_empty() {
-                    descriptions.insert(
-                        key,
-                        SuggestionDetail {
-                            type_text: meta.type_display.clone(),
-                            badges,
+                descriptions.insert(
+                    key,
+                    SuggestionDetail {
+                        type_text: if meta.type_display.trim().is_empty() {
+                            "COLUMN".to_string()
+                        } else {
+                            meta.type_display.clone()
                         },
-                    );
-                }
+                        badges,
+                    },
+                );
             }
         }
         descriptions

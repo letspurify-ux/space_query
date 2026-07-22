@@ -7168,6 +7168,7 @@ pub const MARIADB_FUNCTIONS: &[&str] = &[
     "EXTRACTVALUE",
     "FIELD",
     "FIND_IN_SET",
+    "FIRST_VALUE",
     "FLOOR",
     "FORMAT",
     "FORMAT_BYTES",
@@ -7256,11 +7257,13 @@ pub const MARIADB_FUNCTIONS: &[&str] = &[
     "JSON_VALID",
     "JSON_VALUE",
     "KDF",
+    "LAG",
     "LASTVAL",
     "LAST_DAY",
     "LAST_INSERT_ID",
     "LAST_VALUE",
     "LCASE",
+    "LEAD",
     "LEAST",
     "LEFT",
     "LENGTH",
@@ -7323,6 +7326,7 @@ pub const MARIADB_FUNCTIONS: &[&str] = &[
     "NATURAL_SORT_KEY",
     "NEXTVAL",
     "NOW",
+    "NTH_VALUE",
     "NTILE",
     "NULLIF",
     "NUMGEOMETRIES",
@@ -7362,6 +7366,7 @@ pub const MARIADB_FUNCTIONS: &[&str] = &[
     "REGEXP_REPLACE",
     "REGEXP_SUBSTR",
     "RELEASE_LOCK",
+    "REPLACE",
     "REVERSE",
     "RIGHT",
     "ROUND",
@@ -7515,6 +7520,7 @@ pub const MARIADB_FUNCTIONS: &[&str] = &[
     "UUID_SHORT",
     "UUID_V4",
     "UUID_V7",
+    "VALUES",
     "VARIANCE",
     "VAR_POP",
     "VAR_SAMP",
@@ -8255,6 +8261,13 @@ const MARIADB_SIGNATURES: &[BuiltinSignature] = &[
         argument_separator_keywords: &[],
     },
     BuiltinSignature {
+        name: "FIRST_VALUE",
+        syntaxes: &[
+            "FIRST_VALUE(expr) OVER ( [ PARTITION BY partition_expression ] [ ORDER BY order_list ] )",
+        ],
+        argument_separator_keywords: &[],
+    },
+    BuiltinSignature {
         name: "FLOOR",
         syntaxes: &[
             "FLOOR(X)",
@@ -8872,6 +8885,13 @@ const MARIADB_SIGNATURES: &[BuiltinSignature] = &[
         argument_separator_keywords: &[],
     },
     BuiltinSignature {
+        name: "LAG",
+        syntaxes: &[
+            "LAG(expr[, offset]) OVER ( [ PARTITION BY partition_expression ] [ ORDER BY order_list ] )",
+        ],
+        argument_separator_keywords: &[],
+    },
+    BuiltinSignature {
         name: "LASTVAL",
         syntaxes: &[
             "LASTVAL(sequence_name)",
@@ -8904,6 +8924,13 @@ const MARIADB_SIGNATURES: &[BuiltinSignature] = &[
         name: "LCASE",
         syntaxes: &[
             "LCASE(str)",
+        ],
+        argument_separator_keywords: &[],
+    },
+    BuiltinSignature {
+        name: "LEAD",
+        syntaxes: &[
+            "LEAD(expr[, offset]) OVER ( [ PARTITION BY partition_expression ] [ ORDER BY order_list ] )",
         ],
         argument_separator_keywords: &[],
     },
@@ -9342,6 +9369,13 @@ const MARIADB_SIGNATURES: &[BuiltinSignature] = &[
         argument_separator_keywords: &[],
     },
     BuiltinSignature {
+        name: "NTH_VALUE",
+        syntaxes: &[
+            "NTH_VALUE(expr, num_row) OVER ( [ PARTITION BY partition_expression ] [ ORDER BY order_list ] )",
+        ],
+        argument_separator_keywords: &[],
+    },
+    BuiltinSignature {
         name: "NTILE",
         syntaxes: &[
             "NTILE (expr) OVER ( [ PARTITION BY partition_expression ] [ ORDER BY order_list ] )",
@@ -9611,6 +9645,13 @@ const MARIADB_SIGNATURES: &[BuiltinSignature] = &[
         name: "RELEASE_LOCK",
         syntaxes: &[
             "RELEASE_LOCK(str)",
+        ],
+        argument_separator_keywords: &[],
+    },
+    BuiltinSignature {
+        name: "REPLACE",
+        syntaxes: &[
+            "REPLACE(str,from_str,to_str)",
         ],
         argument_separator_keywords: &[],
     },
@@ -10692,6 +10733,13 @@ const MARIADB_SIGNATURES: &[BuiltinSignature] = &[
         name: "UUID_V7",
         syntaxes: &[
             "UUID_v7()",
+        ],
+        argument_separator_keywords: &[],
+    },
+    BuiltinSignature {
+        name: "VALUES",
+        syntaxes: &[
+            "VALUES(col_name)",
         ],
         argument_separator_keywords: &[],
     },

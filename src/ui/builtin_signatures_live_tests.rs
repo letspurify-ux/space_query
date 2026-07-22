@@ -32,7 +32,7 @@ fn assert_catalog(db_type: DatabaseType, names: &[&str], expected_len: usize) {
 fn builtin_signature_catalogs_match_official_manual_indices() {
     assert_catalog(DatabaseType::Oracle, ORACLE_FUNCTIONS, 463);
     assert_catalog(DatabaseType::MySQL, MYSQL_FUNCTIONS, 408);
-    assert_catalog(DatabaseType::MariaDB, MARIADB_FUNCTIONS, 469);
+    assert_catalog(DatabaseType::MariaDB, MARIADB_FUNCTIONS, 475);
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -961,5 +961,5 @@ fn mysql_builtin_function_signatures_execute_live() {
 #[test]
 #[ignore = "requires local MariaDB 12.2 via SPACE_QUERY_TEST_MYSQL_* environment variables"]
 fn mariadb_builtin_function_signatures_execute_live() {
-    run_mysql_catalog_live(DatabaseType::MariaDB, MARIADB_FUNCTIONS, 469);
+    run_mysql_catalog_live(DatabaseType::MariaDB, MARIADB_FUNCTIONS, 475);
 }

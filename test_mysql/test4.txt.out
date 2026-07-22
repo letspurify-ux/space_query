@@ -355,7 +355,10 @@ JSON_OBJECT('delimiter_trap',@delimiter_trap,'version_gate',@version_gate,'error
 -- db: MySQL
 -- metadata: test_mysql/test4.txt inferred catalog
 -- checked: 555
+-- suggestions checked: 2923
 -- missing: 0
+-- suggestions without type labels: 0
 -- marker: [[word]] means not suggested for the tested prefix
 -- missing tokens: none
+-- suggestions without type labels: none
 -- =========================================================
