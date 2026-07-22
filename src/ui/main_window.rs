@@ -9542,6 +9542,12 @@ impl MainWindow {
     }
 
     fn finish_application_exit(state: &Arc<Mutex<AppState>>, mut window: Window) {
+        // FLTK's event loop returns only after every native top-level window is
+        // hidden. Establish that exit condition before any resource cleanup
+        // that could be delayed by a database driver or worker state.
+        window.hide();
+        Self::hide_all_visible_windows();
+
         crate::db::clear_tracked_db_activity();
         let (popups, editor_tabs, mut result_tabs) = {
             let s = state
@@ -9570,8 +9576,6 @@ impl MainWindow {
         }
         result_tabs.clear();
         crate::ui::sql_editor::SqlEditorWidget::shutdown_column_load_workers();
-        window.hide();
-        Self::hide_all_visible_windows();
         app::quit();
     }
 
