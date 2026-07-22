@@ -51,7 +51,6 @@ const RESULT_ONE_TAB_PER_QUERY_LABEL: &str = " One tab per query";
 const RESULT_CHECKBOX_GROUP_GAP: i32 = TOOLBAR_SPACING;
 const UI_SCALE_BUTTON_WIDTH: i32 = 32;
 const UI_SCALE_EPSILON: f32 = 0.01;
-const UI_SCALE_STEPS: [u32; 13] = [50, 67, 80, 90, 100, 110, 120, 133, 150, 170, 200, 240, 300];
 const APPLICATION_EXIT_POLL_SECONDS: f64 = 0.2;
 // Once the user chose Cancel and Exit, a stuck database worker must not keep
 // FLTK's event loop alive indefinitely.
@@ -79,25 +78,49 @@ fn application_exit_wait_decision(
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum UiScaleDirection {
+enum UiScaleAction {
     In,
     Out,
+    Reset,
 }
 
-fn next_ui_scale_percent(current: f32, direction: UiScaleDirection) -> u32 {
-    match direction {
-        UiScaleDirection::In => UI_SCALE_STEPS
-            .iter()
-            .copied()
-            .find(|step| *step as f32 > current + UI_SCALE_EPSILON)
-            .unwrap_or(UI_SCALE_STEPS[UI_SCALE_STEPS.len() - 1]),
-        UiScaleDirection::Out => UI_SCALE_STEPS
-            .iter()
-            .rev()
-            .copied()
-            .find(|step| (*step as f32) < current - UI_SCALE_EPSILON)
-            .unwrap_or(UI_SCALE_STEPS[0]),
+fn next_ui_scale_percent(current: u32, action: UiScaleAction) -> u32 {
+    match action {
+        UiScaleAction::In => AppConfig::increase_ui_scale_percent(current),
+        UiScaleAction::Out => AppConfig::decrease_ui_scale_percent(current),
+        UiScaleAction::Reset => crate::utils::DEFAULT_UI_SCALE_PERCENT,
     }
+}
+
+fn window_position_after_ui_scale(
+    x: i32,
+    y: i32,
+    width: i32,
+    height: i32,
+    screen_bounds: (i32, i32, i32, i32),
+    old_scale: f32,
+    new_scale: f32,
+) -> (i32, i32) {
+    let ratio = safe_div(old_scale, new_scale);
+    let mut scaled_x = (x as f32 * ratio) as i32;
+    let mut scaled_y = (y as f32 * ratio) as i32;
+    let (screen_x, screen_y, screen_width, screen_height) = screen_bounds;
+    let center_margin = 5;
+    let half_width = safe_div(width, 2);
+    let half_height = safe_div(height, 2);
+
+    if scaled_x + half_width < screen_x {
+        scaled_x = screen_x - half_width + center_margin;
+    } else if scaled_x + half_width > screen_x + screen_width - 1 {
+        scaled_x = screen_x + screen_width - 1 - half_width - center_margin;
+    }
+    if scaled_y + half_height < screen_y {
+        scaled_y = screen_y - half_height + center_margin;
+    } else if scaled_y + half_height > screen_y + screen_height - 1 {
+        scaled_y = screen_y + screen_height - 1 - half_height - center_margin;
+    }
+
+    (scaled_x, scaled_y)
 }
 
 static NEXT_MUTEX_FLAG_TOKEN: AtomicU64 = AtomicU64::new(1);
@@ -4333,10 +4356,7 @@ impl MainWindow {
         let ui_scale_bases = (0..app::screen_count())
             .map(app::screen_scale)
             .collect::<Vec<_>>();
-        let configured_scale_ratio = safe_div(config.normalized_ui_scale_percent() as f32, 100.0);
-        for (screen, base) in ui_scale_bases.iter().copied().enumerate() {
-            app::set_screen_scale(screen as i32, base * configured_scale_ratio);
-        }
+        Self::apply_ui_scale_percent(&ui_scale_bases, config.normalized_ui_scale_percent(), None);
 
         let current_group = fltk::group::Group::try_current();
 
@@ -5024,14 +5044,14 @@ impl MainWindow {
         let weak_state_for_zoom_out = Arc::downgrade(&state);
         zoom_out_btn.set_callback(move |_| {
             if let Some(state_for_zoom_out) = weak_state_for_zoom_out.upgrade() {
-                MainWindow::adjust_ui_scale(&state_for_zoom_out, UiScaleDirection::Out);
+                MainWindow::adjust_ui_scale(&state_for_zoom_out, UiScaleAction::Out);
             }
         });
 
         let weak_state_for_zoom_in = Arc::downgrade(&state);
         zoom_in_btn.set_callback(move |_| {
             if let Some(state_for_zoom_in) = weak_state_for_zoom_in.upgrade() {
-                MainWindow::adjust_ui_scale(&state_for_zoom_in, UiScaleDirection::In);
+                MainWindow::adjust_ui_scale(&state_for_zoom_in, UiScaleAction::In);
             }
         });
 
@@ -8344,7 +8364,7 @@ impl MainWindow {
     fn zoom_shortcut_for_key(
         key: fltk::enums::Key,
         modifiers: fltk::enums::Shortcut,
-    ) -> Option<UiScaleDirection> {
+    ) -> Option<UiScaleAction> {
         let ctrl_or_cmd = modifiers.contains(fltk::enums::Shortcut::Ctrl)
             || modifiers.contains(fltk::enums::Shortcut::Command);
         if !ctrl_or_cmd || modifiers.contains(fltk::enums::Shortcut::Alt) {
@@ -8353,9 +8373,10 @@ impl MainWindow {
 
         match key {
             k if k == fltk::enums::Key::from_char('+') || k == fltk::enums::Key::from_char('=') => {
-                Some(UiScaleDirection::In)
+                Some(UiScaleAction::In)
             }
-            k if k == fltk::enums::Key::from_char('-') => Some(UiScaleDirection::Out),
+            k if k == fltk::enums::Key::from_char('-') => Some(UiScaleAction::Out),
+            k if k == fltk::enums::Key::from_char('0') => Some(UiScaleAction::Reset),
             _ => None,
         }
     }
@@ -8364,12 +8385,109 @@ impl MainWindow {
         event_key: fltk::enums::Key,
         event_original_key: fltk::enums::Key,
         event_state: fltk::enums::Shortcut,
-    ) -> Option<UiScaleDirection> {
+    ) -> Option<UiScaleAction> {
         Self::zoom_shortcut_for_key(event_key, event_state)
             .or_else(|| Self::zoom_shortcut_for_key(event_original_key, event_state))
     }
 
-    fn adjust_ui_scale(state: &Arc<Mutex<AppState>>, direction: UiScaleDirection) -> bool {
+    fn set_screen_scale_preserving_window_position(
+        screen: i32,
+        new_scale: f32,
+        window: Option<&Window>,
+        affects_all_screens: bool,
+    ) -> bool {
+        let old_scale = app::screen_scale(screen);
+        if !old_scale.is_finite()
+            || old_scale <= 0.0
+            || !new_scale.is_finite()
+            || new_scale <= 0.0
+            || (new_scale - old_scale).abs() <= UI_SCALE_EPSILON
+        {
+            return false;
+        }
+
+        let window_geometry = window.and_then(|window| {
+            let window_screen = window.screen_num();
+            if !window.shown()
+                || window.fullscreen_active()
+                || window.maximize_active()
+                || (!affects_all_screens && window_screen != screen)
+            {
+                None
+            } else {
+                Some((
+                    window.x(),
+                    window.y(),
+                    window.w(),
+                    window.h(),
+                    window_screen,
+                ))
+            }
+        });
+
+        app::set_screen_scale(screen, new_scale);
+
+        if let (Some(window), Some((x, y, width, height, window_screen))) =
+            (window, window_geometry)
+        {
+            let (scaled_x, scaled_y) = window_position_after_ui_scale(
+                x,
+                y,
+                width,
+                height,
+                app::screen_xywh(window_screen),
+                old_scale,
+                new_scale,
+            );
+            let mut window = window.clone();
+            window.resize(scaled_x, scaled_y, width, height);
+        }
+
+        true
+    }
+
+    fn apply_ui_scale_percent(scale_bases: &[f32], percent: u32, window: Option<&Window>) -> bool {
+        let screen_count = app::screen_count();
+        if screen_count <= 0 || !app::Screen::scaling_supported() {
+            return false;
+        }
+
+        let ratio = safe_div(AppConfig::clamp_ui_scale_percent(percent) as f32, 100.0);
+        let separate_screen_scales = app::Screen::scaling_supported_separately();
+        let mut changed = false;
+
+        if separate_screen_scales {
+            for (screen, base) in scale_bases
+                .iter()
+                .copied()
+                .take(screen_count as usize)
+                .enumerate()
+            {
+                if base.is_finite() && base > 0.0 {
+                    changed |= Self::set_screen_scale_preserving_window_position(
+                        screen as i32,
+                        base * ratio,
+                        window,
+                        false,
+                    );
+                }
+            }
+        } else if let Some(base) = scale_bases
+            .first()
+            .copied()
+            .filter(|base| base.is_finite() && *base > 0.0)
+        {
+            changed =
+                Self::set_screen_scale_preserving_window_position(0, base * ratio, window, true);
+        }
+
+        if changed {
+            app::redraw();
+        }
+        changed
+    }
+
+    fn set_ui_scale_percent(state: &Arc<Mutex<AppState>>, percent: u32) -> bool {
         let (window, scale_bases, config) = {
             let state = state
                 .lock()
@@ -8380,62 +8498,55 @@ impl MainWindow {
                 state.config.clone(),
             )
         };
-        let screen_count = app::screen_count();
-        if screen_count <= 0 {
-            return false;
-        }
-        let screen = window.screen_num().clamp(0, screen_count - 1);
-        let current = app::screen_scale(screen);
-        let base = scale_bases
-            .get(screen as usize)
-            .copied()
-            .filter(|scale| scale.is_finite() && *scale > 0.0)
-            .unwrap_or(current);
-        if !current.is_finite() || current <= 0.0 {
-            return false;
-        }
-
-        let next_percent = next_ui_scale_percent(safe_div(current, base) * 100.0, direction);
-        let next = base * safe_div(next_percent as f32, 100.0);
-        if (next - current).abs() > UI_SCALE_EPSILON {
-            app::set_screen_scale(screen, next);
-            app::redraw();
-        }
+        let percent = AppConfig::clamp_ui_scale_percent(percent);
 
         let mut config = config
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        config.ui_scale_percent = next_percent;
-        if let Err(err) = config.save() {
-            crate::utils::logging::log_warning(
-                "ui_scale",
-                &format!("Failed to save screen scale setting: {err}"),
-            );
+        if config.ui_scale_percent != percent {
+            config.ui_scale_percent = percent;
+            if let Err(err) = config.save() {
+                crate::utils::logging::log_warning(
+                    "ui_scale",
+                    &format!("Failed to save screen scale setting: {err}"),
+                );
+            }
         }
+        drop(config);
+
+        Self::apply_ui_scale_percent(&scale_bases, percent, Some(&window));
         true
     }
 
+    fn adjust_ui_scale(state: &Arc<Mutex<AppState>>, action: UiScaleAction) -> bool {
+        let config = state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .config
+            .clone();
+        let current_percent = config
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .normalized_ui_scale_percent();
+        Self::set_ui_scale_percent(state, next_ui_scale_percent(current_percent, action))
+    }
+
     fn apply_configured_ui_scale(state: &Arc<Mutex<AppState>>) {
-        let (scale_bases, config) = {
+        let (window, scale_bases, config) = {
             let state = state
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
-            (state.ui_scale_bases.clone(), state.config.clone())
+            (
+                state.window.clone(),
+                state.ui_scale_bases.clone(),
+                state.config.clone(),
+            )
         };
         let percent = config
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .normalized_ui_scale_percent();
-        let ratio = safe_div(percent as f32, 100.0);
-        for (screen, base) in scale_bases
-            .iter()
-            .copied()
-            .take(app::screen_count().max(0) as usize)
-            .enumerate()
-        {
-            app::set_screen_scale(screen as i32, base * ratio);
-        }
-        app::redraw();
+        Self::apply_ui_scale_percent(&scale_bases, percent, Some(&window));
     }
 
     fn menu_shortcut_for_key(
@@ -8621,7 +8732,18 @@ impl MainWindow {
             .or_else(|| Self::menu_shortcut_for_key(event_original_key, event_state))
     }
 
-    fn handle_window_shortcut(
+    fn handle_window_zoom_shortcut(state: &Arc<Mutex<AppState>>) -> bool {
+        let Some(action) = Self::resolve_window_zoom_shortcut(
+            app::event_key(),
+            app::event_original_key(),
+            app::event_state(),
+        ) else {
+            return false;
+        };
+        Self::adjust_ui_scale(state, action)
+    }
+
+    fn handle_window_menu_shortcut(
         state: &Arc<Mutex<AppState>>,
         schema_sender: &std::sync::mpsc::Sender<SchemaUpdate>,
         conn_sender: &std::sync::mpsc::Sender<ConnectionResult>,
@@ -8630,11 +8752,6 @@ impl MainWindow {
         let event_key = app::event_key();
         let event_original_key = app::event_original_key();
         let event_state = app::event_state();
-        if let Some(direction) =
-            Self::resolve_window_zoom_shortcut(event_key, event_original_key, event_state)
-        {
-            return Self::adjust_ui_scale(state, direction);
-        }
         let Some(action) =
             Self::resolve_window_shortcut_action(event_key, event_original_key, event_state)
         else {
@@ -8925,7 +9042,7 @@ impl MainWindow {
                         AppState::hide_all_intellisense_popups_without_blocking(&state_for_window);
                         return true;
                     }
-                    if MainWindow::handle_window_shortcut(
+                    if MainWindow::handle_window_menu_shortcut(
                         &state_for_window,
                         &schema_sender_for_window,
                         &conn_sender_for_window,
@@ -8936,12 +9053,14 @@ impl MainWindow {
                     false
                 }
                 fltk::enums::Event::Shortcut => {
-                    if MainWindow::handle_window_shortcut(
-                        &state_for_window,
-                        &schema_sender_for_window,
-                        &conn_sender_for_window,
-                        &file_sender_for_window,
-                    ) {
+                    if MainWindow::handle_window_zoom_shortcut(&state_for_window)
+                        || MainWindow::handle_window_menu_shortcut(
+                            &state_for_window,
+                            &schema_sender_for_window,
+                            &conn_sender_for_window,
+                            &file_sender_for_window,
+                        )
+                    {
                         return true;
                     }
                     false
@@ -9961,7 +10080,7 @@ mod tests {
                 Key::from_char('+'),
                 Shortcut::Ctrl,
             ),
-            Some(UiScaleDirection::In)
+            Some(UiScaleAction::In)
         );
         assert_eq!(
             MainWindow::resolve_window_zoom_shortcut(
@@ -9969,7 +10088,7 @@ mod tests {
                 Key::from_char('-'),
                 Shortcut::Command,
             ),
-            Some(UiScaleDirection::Out)
+            Some(UiScaleAction::Out)
         );
     }
 
@@ -9981,7 +10100,19 @@ mod tests {
                 Key::from_char('='),
                 Shortcut::Ctrl,
             ),
-            Some(UiScaleDirection::In)
+            Some(UiScaleAction::In)
+        );
+    }
+
+    #[test]
+    fn resolve_window_zoom_shortcut_accepts_reset_key() {
+        assert_eq!(
+            MainWindow::resolve_window_zoom_shortcut(
+                Key::from_char('0'),
+                Key::from_char('0'),
+                Shortcut::Ctrl,
+            ),
+            Some(UiScaleAction::Reset)
         );
     }
 
@@ -10006,16 +10137,19 @@ mod tests {
     }
 
     #[test]
-    fn ui_scale_steps_move_once_and_clamp_at_bounds() {
-        assert_eq!(next_ui_scale_percent(100.0, UiScaleDirection::In), 110);
-        assert_eq!(next_ui_scale_percent(100.0, UiScaleDirection::Out), 90);
+    fn ui_scale_actions_use_configured_percent_and_clamp_at_bounds() {
+        assert_eq!(next_ui_scale_percent(125, UiScaleAction::In), 135);
+        assert_eq!(next_ui_scale_percent(135, UiScaleAction::Out), 125);
+        assert_eq!(next_ui_scale_percent(300, UiScaleAction::In), 300);
+        assert_eq!(next_ui_scale_percent(50, UiScaleAction::Out), 50);
+        assert_eq!(next_ui_scale_percent(175, UiScaleAction::Reset), 100);
+    }
+
+    #[test]
+    fn window_position_uses_old_to_new_scale_ratio() {
         assert_eq!(
-            next_ui_scale_percent(300.0, UiScaleDirection::In),
-            UI_SCALE_STEPS[UI_SCALE_STEPS.len() - 1]
-        );
-        assert_eq!(
-            next_ui_scale_percent(50.0, UiScaleDirection::Out),
-            UI_SCALE_STEPS[0]
+            window_position_after_ui_scale(300, 200, 800, 600, (0, 0, 1920, 1080), 1.0, 2.0),
+            (150, 100)
         );
     }
 

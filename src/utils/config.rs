@@ -19,6 +19,7 @@ const DEFAULT_RESULT_CELL_MAX_CHARS: u32 = 150;
 pub const DEFAULT_UI_SCALE_PERCENT: u32 = 100;
 pub const MIN_UI_SCALE_PERCENT: u32 = 50;
 pub const MAX_UI_SCALE_PERCENT: u32 = 300;
+pub const UI_SCALE_INCREMENT_PERCENT: u32 = 10;
 pub const DEFAULT_CONNECTION_POOL_SIZE: u32 = 12;
 pub const MIN_CONNECTION_POOL_SIZE: u32 = 1;
 pub const MAX_CONNECTION_POOL_SIZE: u32 = 16;
@@ -125,6 +126,18 @@ impl AppConfig {
 
     pub fn clamp_ui_scale_percent(percent: u32) -> u32 {
         percent.clamp(MIN_UI_SCALE_PERCENT, MAX_UI_SCALE_PERCENT)
+    }
+
+    pub fn increase_ui_scale_percent(percent: u32) -> u32 {
+        Self::clamp_ui_scale_percent(percent)
+            .saturating_add(UI_SCALE_INCREMENT_PERCENT)
+            .min(MAX_UI_SCALE_PERCENT)
+    }
+
+    pub fn decrease_ui_scale_percent(percent: u32) -> u32 {
+        Self::clamp_ui_scale_percent(percent)
+            .saturating_sub(UI_SCALE_INCREMENT_PERCENT)
+            .max(MIN_UI_SCALE_PERCENT)
     }
 
     pub fn normalized_ui_scale_percent(&self) -> u32 {
@@ -670,6 +683,20 @@ mod tests {
         assert_eq!(AppConfig::clamp_ui_scale_percent(0), 50);
         assert_eq!(AppConfig::clamp_ui_scale_percent(100), 100);
         assert_eq!(AppConfig::clamp_ui_scale_percent(999), 300);
+    }
+
+    #[test]
+    fn app_config_adjusts_arbitrary_ui_scale_by_ten_percentage_points() {
+        assert_eq!(AppConfig::increase_ui_scale_percent(125), 135);
+        assert_eq!(AppConfig::decrease_ui_scale_percent(135), 125);
+    }
+
+    #[test]
+    fn app_config_ui_scale_adjustments_clamp_at_bounds() {
+        assert_eq!(AppConfig::increase_ui_scale_percent(300), 300);
+        assert_eq!(AppConfig::increase_ui_scale_percent(u32::MAX), 300);
+        assert_eq!(AppConfig::decrease_ui_scale_percent(50), 50);
+        assert_eq!(AppConfig::decrease_ui_scale_percent(0), 50);
     }
 
     #[test]

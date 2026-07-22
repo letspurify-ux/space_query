@@ -27,6 +27,9 @@ impl App {
     pub fn run(&self) {
         let startup = Self::bootstrap();
 
+        // The application owns Ctrl/Cmd +/-/0 so the FLTK default handler must
+        // not apply a second, unsaved screen-scale change.
+        app::keyboard_screen_scaling(false);
         let app = app::App::default()
             .with_scheme(app::Scheme::Gtk)
             .load_system_fonts();
