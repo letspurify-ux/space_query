@@ -1,15 +1,16 @@
 use fltk::{
     app,
+    browser::Browser,
     button::{Button, CheckButton},
     dialog::{FileDialog, FileDialogType},
     draw::set_cursor,
     enums::{Cursor, FrameType},
     frame::Frame,
     group::{Flex, FlexType, Group, Tile},
-    input::IntInput,
-    menu::{Choice, MenuBar},
+    input::{Input, IntInput},
+    menu::{Choice, MenuBar, MenuButton},
     prelude::*,
-    text::TextBuffer,
+    text::{TextBuffer, TextDisplay},
     widget::Widget,
     window::Window,
 };
@@ -4322,6 +4323,7 @@ impl MainWindow {
     }
 
     pub fn new_with_config(config: AppConfig) -> Self {
+        font_settings::update_runtime_font_settings(&config);
         let connection = create_shared_connection();
         {
             let mut guard = crate::db::lock_connection(&connection);
@@ -5458,41 +5460,42 @@ impl MainWindow {
     }
 
     fn apply_font_settings(state: &mut AppState) {
-        let (unified_profile, ui_size, editor_size, result_size, result_cell_max_chars) = {
-            let config = state
-                .config
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            (
-                font_settings::profile_by_name(&config.editor_font),
-                config.ui_font_size.clamp(8, 24) as i32,
-                config.editor_font_size,
-                config.result_font_size,
-                config.result_cell_max_chars.clamp(
-                    RESULT_CELL_MAX_DISPLAY_CHARS_MIN,
-                    RESULT_CELL_MAX_DISPLAY_CHARS_MAX,
-                ),
-            )
-        };
-        font_settings::apply_global_default_font(unified_profile.normal);
+        let config = state
+            .config
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        font_settings::update_runtime_font_settings(&config);
+        let (editor_profile, result_profile, ui_size, editor_size, result_size) = (
+            font_settings::profile_by_name(&config.editor_font),
+            font_settings::profile_by_name(&config.result_font),
+            config.normalized_ui_font_size() as i32,
+            config.normalized_editor_font_size(),
+            config.normalized_result_font_size(),
+        );
+        let result_cell_max_chars = config.result_cell_max_chars.clamp(
+            RESULT_CELL_MAX_DISPLAY_CHARS_MIN,
+            RESULT_CELL_MAX_DISPLAY_CHARS_MAX,
+        );
+        font_settings::apply_global_default_font(editor_profile.normal);
         app::set_font_size(ui_size);
-        fltk::misc::Tooltip::set_font(unified_profile.normal);
+        fltk::misc::Tooltip::set_font(editor_profile.normal);
         fltk::misc::Tooltip::set_font_size(ui_size);
-        fltk::dialog::message_set_font(unified_profile.normal, ui_size);
+        fltk::dialog::message_set_font(editor_profile.normal, ui_size);
+        Self::apply_runtime_ui_font(state, editor_profile.normal, ui_size);
         for tab in &mut state.editor_tabs {
             tab.sql_editor
-                .apply_font_settings(unified_profile, editor_size, ui_size);
+                .apply_font_settings(editor_profile, editor_size, ui_size);
         }
         state
             .result_tabs
-            .apply_font_settings(unified_profile, result_size);
+            .apply_font_settings(result_profile, result_size);
         state
             .result_tabs
             .set_max_cell_display_chars(result_cell_max_chars as usize);
         state
             .object_browser
-            .apply_font_settings(unified_profile, ui_size);
-        Self::apply_runtime_ui_font(state, unified_profile.normal, ui_size);
+            .apply_font_settings(editor_profile, ui_size);
         state.right_tile.redraw();
         state.window.redraw();
         app::redraw();
@@ -5544,6 +5547,25 @@ impl MainWindow {
         fn apply_widget_font_recursive(widget: &mut Widget, font: fltk::enums::Font, size: i32) {
             widget.set_label_font(font);
             widget.set_label_size(size);
+            if let Some(mut input) = Input::from_dyn_widget(widget) {
+                input.set_text_font(font);
+                input.set_text_size(size);
+            }
+            if let Some(mut choice) = Choice::from_dyn_widget(widget) {
+                choice.set_text_font(font);
+                choice.set_text_size(size);
+            }
+            if let Some(mut menu_button) = MenuButton::from_dyn_widget(widget) {
+                menu_button.set_text_font(font);
+                menu_button.set_text_size(size);
+            }
+            if let Some(mut browser) = Browser::from_dyn_widget(widget) {
+                browser.set_text_size(size);
+            }
+            if let Some(mut display) = TextDisplay::from_dyn_widget(widget) {
+                display.set_text_font(font);
+                display.set_text_size(size);
+            }
             if let Some(group) = widget.as_group() {
                 for mut child in group.into_iter() {
                     apply_widget_font_recursive(&mut child, font, size);
@@ -5562,6 +5584,11 @@ impl MainWindow {
             menu.set_text_font(font);
             menu.set_text_size(ui_size);
         }
+
+        state.transaction_isolation_choice.set_text_font(font);
+        state.transaction_isolation_choice.set_text_size(ui_size);
+        state.transaction_access_choice.set_text_font(font);
+        state.transaction_access_choice.set_text_size(ui_size);
 
         for popup in state
             .popups

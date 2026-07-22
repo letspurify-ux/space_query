@@ -2017,7 +2017,7 @@ impl SqlEditorWidget {
         let mut buffer = self.buffer.clone();
         let selection = buffer.selection_position();
         let preferred_db_type = Some(self.current_db_type());
-        let format_config = AppConfig::load();
+        let format_config = AppConfig::runtime();
         if let Some((start, end)) = selection {
             if start != end {
                 let buffer_len = buffer.length().max(0);

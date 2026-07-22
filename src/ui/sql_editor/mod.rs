@@ -29,7 +29,9 @@ use crate::db::{
     TransactionSessionState,
 };
 use crate::ui::constants::*;
-use crate::ui::font_settings::{configured_editor_profile, FontProfile};
+use crate::ui::font_settings::{
+    configured_editor_font_size, configured_editor_profile, FontProfile,
+};
 use crate::ui::intellisense::{
     IntellisenseData, IntellisensePopup, SignatureLabel, SignaturePopup,
 };
@@ -2341,9 +2343,9 @@ impl SqlEditorWidget {
         editor.set_buffer(buffer.clone());
         editor.set_color(theme::editor_bg());
         editor.set_text_color(theme::text_primary());
-        let editor_config = AppConfig::load();
+        let editor_config = AppConfig::runtime();
         let editor_profile = configured_editor_profile();
-        let editor_size = editor_config.editor_font_size;
+        let editor_size = configured_editor_font_size();
         editor.set_text_font(editor_profile.normal);
         editor.set_text_size(editor_size as i32);
         editor.set_cursor_color(theme::text_primary());
@@ -4772,17 +4774,29 @@ impl SqlEditorWidget {
     }
 
     pub fn apply_font_settings(&mut self, profile: FontProfile, size: u32, ui_size: i32) {
+        let size = AppConfig::clamp_font_size(size);
+        let ui_size = ui_size.clamp(8, 24);
         let size_i32 = size as i32;
         self.editor.set_text_font(profile.normal);
         self.editor.set_text_size(size_i32);
         self.editor.set_linenumber_font(profile.normal);
         self.editor
             .set_linenumber_size((size.saturating_sub(2)) as i32);
+        self.timeout_input.set_text_font(profile.normal);
         self.timeout_input.set_text_size(ui_size);
+        self.intellisense_popup
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .apply_font_settings(ui_size);
+        self.signature_popup
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .invalidate_font_settings();
         let style_table = create_style_table_with(profile, size);
         self.editor
             .set_highlight_data(self.style_buffer.clone(), style_table);
         Self::refresh_editor_display_metrics(&mut self.editor);
+        self.editor.redraw();
         self.timeout_input.redraw();
     }
 

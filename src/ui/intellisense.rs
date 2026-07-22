@@ -3073,6 +3073,28 @@ impl IntellisensePopup {
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = presentations;
     }
 
+    pub fn apply_font_settings(&mut self, ui_size: i32) {
+        if self.is_deleted() {
+            return;
+        }
+        self.browser.set_text_size(ui_size.clamp(8, 24));
+        self.rebuild_suggestion_presentations();
+        let indices = self
+            .visible_suggestion_indices
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        let selected = self.browser.value();
+        let selected_original_index = (selected > 0)
+            .then(|| indices.get((selected - 1) as usize).copied())
+            .flatten();
+        if !indices.is_empty() {
+            self.set_visible_suggestion_indices(indices, selected_original_index);
+        }
+        self.browser.redraw();
+        self.window.redraw();
+    }
+
     fn set_visible_suggestion_indices(
         &mut self,
         indices: Vec<usize>,
@@ -3156,7 +3178,7 @@ impl IntellisensePopup {
             self.browser.set_column_widths(&[name_col + NAME_GAP]);
         }
         // Row height tracks the font size so larger fonts are not clipped.
-        let row_h = (item_size + 6).max(20);
+        let row_h = intellisense_popup_row_height(item_size);
         let height = (suggestion_count.min(10) as i32) * row_h + 10;
         self.window.set_size(width, height);
         self.browser.set_size(width, height);
@@ -3394,6 +3416,10 @@ impl IntellisensePopup {
             None
         }
     }
+}
+
+pub(crate) fn intellisense_popup_row_height(ui_font_size: i32) -> i32 {
+    ui_font_size.clamp(8, 24).saturating_add(6).max(20)
 }
 
 pub fn filter_suggestions_by_prefix(suggestions: &[String], prefix: &str) -> Vec<String> {
@@ -4804,6 +4830,13 @@ impl SignaturePopup {
         }
     }
 
+    pub fn invalidate_font_settings(&mut self) {
+        // The render state owns measured widths and line heights. Hiding it is
+        // safer than briefly displaying geometry measured with the old font;
+        // the next signature refresh rebuilds it from the runtime snapshot.
+        self.hide();
+    }
+
     fn widgets_deleted(&self) -> bool {
         self.window
             .as_ref()
@@ -5142,6 +5175,29 @@ mod intellisense_tests {
             .filter(|run| run.style == SignaturePopupTextStyle::ActiveParameter)
             .map(|run| run.text.as_str())
             .collect()
+    }
+
+    #[test]
+    fn completion_popup_row_height_clamps_untrusted_font_sizes() {
+        assert_eq!(intellisense_popup_row_height(i32::MIN), 20);
+        assert_eq!(intellisense_popup_row_height(16), 22);
+        assert_eq!(intellisense_popup_row_height(i32::MAX), 30);
+    }
+
+    #[test]
+    #[cfg_attr(
+        any(target_os = "macos", target_os = "linux"),
+        ignore = "FLTK widget tests require a native UI test environment"
+    )]
+    fn completion_popup_applies_new_size_to_existing_widget() {
+        let mut popup = IntellisensePopup::new();
+        popup.show_suggestions(vec!["EMP".to_string(), "DEPT".to_string()], 0, 0);
+
+        popup.apply_font_settings(24);
+
+        assert_eq!(popup.browser.text_size(), 24);
+        assert_eq!(popup.window.h(), 2 * intellisense_popup_row_height(24) + 10);
+        popup.delete_for_close();
     }
 
     fn popup_run(text: &str, style: SignaturePopupTextStyle) -> SignaturePopupTextRun {

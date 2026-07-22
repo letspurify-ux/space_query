@@ -13,7 +13,9 @@ use std::time::Duration;
 use crate::db::query::result_messages;
 use crate::db::{ColumnInfo, QueryResult};
 use crate::ui::constants;
-use crate::ui::font_settings::{configured_editor_profile, FontProfile};
+use crate::ui::font_settings::{
+    configured_result_font_size, configured_result_profile, FontProfile,
+};
 use crate::ui::result_table::{
     LazyFetchCallback, ResultGridSqlExecuteCallback, ResultTableContextActionCallback,
 };
@@ -710,8 +712,8 @@ impl ResultTabsWidget {
         let data = Arc::new(Mutex::new(Vec::<ResultTab>::new()));
         let active_index = Arc::new(Mutex::new(None));
         let next_result_tab_id = Arc::new(Mutex::new(1u64));
-        let font_profile = Arc::new(Mutex::new(configured_editor_profile()));
-        let font_size = Arc::new(Mutex::new(constants::DEFAULT_FONT_SIZE as u32));
+        let font_profile = Arc::new(Mutex::new(configured_result_profile()));
+        let font_size = Arc::new(Mutex::new(configured_result_font_size()));
         let max_cell_display_chars = Arc::new(Mutex::new(
             constants::RESULT_CELL_MAX_DISPLAY_CHARS_DEFAULT as usize,
         ));
@@ -1072,6 +1074,7 @@ impl ResultTabsWidget {
     }
 
     pub fn apply_font_settings(&mut self, profile: FontProfile, size: u32) {
+        let size = crate::utils::AppConfig::clamp_font_size(size);
         *self
             .font_profile
             .lock()
@@ -1086,6 +1089,16 @@ impl ResultTabsWidget {
             pane.display.set_text_size(size as i32);
             pane.display.redraw();
         });
+        let tables = self
+            .data
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .iter()
+            .map(|tab| tab.table.clone())
+            .collect::<Vec<_>>();
+        for mut table in tables {
+            table.apply_font_settings(profile, size);
+        }
     }
 
     pub fn set_max_cell_display_chars(&mut self, max_chars: usize) {
@@ -2206,6 +2219,7 @@ mod tests {
     use fltk::enums::Event;
 
     use super::{ResultTabStatus, ResultTabsWidget};
+    use crate::ui::font_settings::FONT_PROFILES;
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
 
@@ -2440,5 +2454,27 @@ mod tests {
             }));
 
         ResultTabsWidget::invoke_lazy_fetch_callback(&callback, 11, LazyFetchRequest::Cancel);
+    }
+
+    #[test]
+    #[cfg_attr(
+        any(target_os = "macos", target_os = "linux"),
+        ignore = "FLTK widget tests require a native UI test environment"
+    )]
+    fn font_changes_update_existing_and_future_result_tables() {
+        let mut tabs = ResultTabsWidget::new(0, 0, 640, 360);
+        tabs.append_explain_plan_tab("first");
+
+        tabs.apply_font_settings(FONT_PROFILES[1], 23);
+        tabs.append_explain_plan_tab("second");
+
+        let sizes = tabs
+            .data
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .iter()
+            .map(|tab| tab.table.font_size_for_test())
+            .collect::<Vec<_>>();
+        assert_eq!(sizes, vec![23, 23]);
     }
 }

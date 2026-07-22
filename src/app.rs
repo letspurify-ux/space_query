@@ -65,7 +65,8 @@ impl Default for App {
 }
 
 pub(crate) fn configure_fltk_globals(config: &AppConfig) {
-    let ui_size = config.ui_font_size.clamp(8, 24) as i32;
+    crate::ui::update_runtime_font_settings(config);
+    let ui_size = config.normalized_ui_font_size() as i32;
     let font = crate::ui::profile_by_name(&config.editor_font).normal;
     crate::ui::apply_global_default_font(font);
     app::set_font_size(ui_size);

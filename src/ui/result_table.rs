@@ -21,7 +21,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use crate::db::query::result_messages;
 use crate::db::{QueryExecutor, QueryResult};
 use crate::ui::constants::*;
-use crate::ui::font_settings::{configured_editor_profile, FontProfile};
+use crate::ui::font_settings::{
+    configured_result_font_size, configured_result_profile, FontProfile,
+};
 use crate::ui::sql_editor::LazyFetchRequest;
 use crate::ui::theme;
 use crate::utils::arithmetic::safe_div;
@@ -190,7 +192,7 @@ impl SharedFontSettings {
             normal_font: AtomicI32::new(profile.normal.bits()),
             bold_font: AtomicI32::new(profile.bold.bits()),
             italic_font: AtomicI32::new(profile.italic.bits()),
-            font_size: AtomicU32::new(size),
+            font_size: AtomicU32::new(crate::utils::AppConfig::clamp_font_size(size)),
         }
     }
 
@@ -234,7 +236,10 @@ impl SharedFontSettings {
         self.bold_font.store(profile.bold.bits(), Ordering::Relaxed);
         self.italic_font
             .store(profile.italic.bits(), Ordering::Relaxed);
-        self.font_size.store(size, Ordering::Relaxed);
+        self.font_size.store(
+            crate::utils::AppConfig::clamp_font_size(size),
+            Ordering::Relaxed,
+        );
     }
 }
 
@@ -1817,11 +1822,13 @@ impl ResultTableWidget {
     }
 
     fn row_height_for_font(size: u32) -> i32 {
-        (size as i32 + TABLE_CELL_PADDING * 2 + 4).max(TABLE_ROW_HEIGHT)
+        let size = crate::utils::AppConfig::clamp_font_size(size) as i32;
+        (size + TABLE_CELL_PADDING * 2 + 4).max(TABLE_ROW_HEIGHT)
     }
 
     fn header_height_for_font(size: u32) -> i32 {
-        (size as i32 + TABLE_CELL_PADDING * 2 + 6).max(TABLE_COL_HEADER_HEIGHT)
+        let size = crate::utils::AppConfig::clamp_font_size(size) as i32;
+        (size + TABLE_CELL_PADDING * 2 + 6).max(TABLE_COL_HEADER_HEIGHT)
     }
 
     fn set_table_rows_for_current_font(&mut self, row_count: i32) {
@@ -2012,8 +2019,8 @@ impl ResultTableWidget {
         let headers: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
         let full_data: Arc<Mutex<Vec<Vec<String>>>> = Arc::new(Mutex::new(Vec::new()));
         let font_settings = Arc::new(SharedFontSettings::new(
-            configured_editor_profile(),
-            DEFAULT_FONT_SIZE as u32,
+            configured_result_profile(),
+            configured_result_font_size(),
         ));
         let max_cell_display_chars =
             Arc::new(Mutex::new(RESULT_CELL_MAX_DISPLAY_CHARS_DEFAULT as usize));
@@ -2053,8 +2060,8 @@ impl ResultTableWidget {
         table.set_row_header(true);
         table.set_row_header_width(TABLE_ROW_HEADER_WIDTH);
         table.set_col_header(true);
-        table.set_col_header_height(Self::header_height_for_font(DEFAULT_FONT_SIZE as u32));
-        table.set_row_height_all(Self::row_height_for_font(DEFAULT_FONT_SIZE as u32));
+        table.set_col_header_height(Self::header_height_for_font(configured_result_font_size()));
+        table.set_row_height_all(Self::row_height_for_font(configured_result_font_size()));
         table.set_rows(0);
         table.set_cols(0);
         theme::style_table_scrollbars(&table);
@@ -8352,6 +8359,8 @@ impl ResultTableWidget {
     pub fn apply_font_settings(&mut self, profile: FontProfile, size: u32) {
         self.font_settings.update(profile, size);
         self.apply_table_metrics_for_current_font();
+        self.table
+            .set_row_height_all(Self::row_height_for_font(self.font_settings.size()));
         self.recalculate_widths_for_current_font();
         // Force FLTK to recalculate the table's internal layout after
         // header height / column width changes from the new font metrics.
@@ -8363,6 +8372,11 @@ impl ResultTableWidget {
         );
         self.table.resize(x, y, w, h);
         self.table.redraw();
+    }
+
+    #[cfg(test)]
+    pub(crate) fn font_size_for_test(&self) -> u32 {
+        self.font_settings.size()
     }
 
     pub fn set_max_cell_display_chars(&mut self, max_chars: usize) {
@@ -12075,7 +12089,7 @@ UPDATE EMP SET ENAME = 'MILLER' WHERE ROWID = 'AAABBB';"
         any(target_os = "macos", target_os = "linux"),
         ignore = "FLTK widget tests require a native UI test environment"
     )]
-    fn font_change_does_not_retouch_existing_rows_but_updates_new_rows() {
+    fn font_change_updates_existing_and_new_row_heights() {
         let mut widget = ResultTableWidget::new();
         let headers = vec!["EMPNO".to_string()];
         widget.start_streaming(&headers);
@@ -12088,12 +12102,12 @@ UPDATE EMP SET ENAME = 'MILLER' WHERE ROWID = 'AAABBB';"
         let updated_size = original_size.saturating_add(4);
         widget.apply_font_settings(widget.font_settings.profile(), updated_size);
 
-        assert_eq!(widget.table.row_height(0), original_height);
+        let updated_height = ResultTableWidget::row_height_for_font(updated_size);
+        assert_eq!(widget.table.row_height(0), updated_height);
 
         widget.append_rows(vec![vec!["7499".to_string()], vec!["7521".to_string()]]);
 
-        let updated_height = ResultTableWidget::row_height_for_font(updated_size);
-        assert_eq!(widget.table.row_height(0), original_height);
+        assert_eq!(widget.table.row_height(0), updated_height);
         assert_eq!(widget.table.row_height(1), updated_height);
         assert_eq!(widget.table.row_height(2), updated_height);
     }

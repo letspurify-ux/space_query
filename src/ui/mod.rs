@@ -35,6 +35,9 @@ use fltk::{
     window::Window,
 };
 
+#[cfg(not(test))]
+use fltk::enums::Font;
+
 use crate::utils::arithmetic::safe_div;
 
 pub use connection_dialog::*;
@@ -87,29 +90,50 @@ pub fn center_on_main(window: &mut Window) {
     window.set_pos(x, y);
 }
 
-fn dialog_text_columns(text: &str) -> i32 {
-    text.chars()
-        .map(|ch| if ch.is_ascii() { 1 } else { 2 })
-        .sum::<i32>()
-}
-
 fn dialog_prompt_height(text: &str, available_width: i32) -> i32 {
-    let columns_per_line = safe_div(available_width - 16, 8).max(1);
-    let line_count = text
-        .lines()
-        .map(|line| {
-            let columns = dialog_text_columns(line).max(1);
-            safe_div(columns + columns_per_line - 1, columns_per_line)
-        })
-        .sum::<i32>()
-        .max(1);
+    #[cfg(test)]
+    let height = {
+        let columns_per_line = safe_div(available_width - 16, 8).max(1);
+        let line_count = text
+            .lines()
+            .map(|line| {
+                let columns = line
+                    .chars()
+                    .map(|ch| if ch.is_ascii() { 1 } else { 2 })
+                    .sum::<i32>()
+                    .max(1);
+                safe_div(columns + columns_per_line - 1, columns_per_line)
+            })
+            .sum::<i32>()
+            .max(1);
+        (line_count * 22 + 16).clamp(56, 420)
+    };
 
-    (line_count * 22 + 16).clamp(56, 420)
+    #[cfg(not(test))]
+    let height = {
+        let font_size = app::font_size().clamp(8, 24);
+        fltk::draw::set_font(Font::Helvetica, font_size);
+        let (_, measured_height) =
+            fltk::draw::wrap_measure(text, (available_width - 16).max(1), false);
+        measured_height.saturating_add(16).clamp(56, 420)
+    };
+
+    height
 }
 
 fn dialog_button_width(label: &str) -> i32 {
-    let text_width = label.chars().count() as i32 * 8 + 28;
-    text_width.clamp(constants::BUTTON_WIDTH, 180)
+    #[cfg(test)]
+    let width = (label.chars().count() as i32 * 8 + 28).clamp(constants::BUTTON_WIDTH, 320);
+
+    #[cfg(not(test))]
+    let width = {
+        let font_size = app::font_size().clamp(8, 24);
+        fltk::draw::set_font(Font::Helvetica, font_size);
+        let text_width = fltk::draw::measure(label, false).0.saturating_add(28);
+        text_width.clamp(constants::BUTTON_WIDTH, 320)
+    };
+
+    width
 }
 
 fn finish_modal_dialog(dialog: Window) {
@@ -129,7 +153,18 @@ fn choice2_on_main_with_title(title: &str, txt: &str, b0: &str, b1: &str, b2: &s
     let current_group = fltk::group::Group::try_current();
     fltk::group::Group::set_current(None::<&fltk::group::Group>);
 
-    let width = 520;
+    let button_width = choices
+        .iter()
+        .map(|(_, label)| dialog_button_width(label))
+        .sum::<i32>();
+    let button_spacing = constants::DIALOG_SPACING
+        .saturating_mul(i32::try_from(choices.len().saturating_sub(1)).unwrap_or(i32::MAX));
+    let width = 520.max(
+        constants::DIALOG_MARGIN
+            .saturating_mul(2)
+            .saturating_add(button_width)
+            .saturating_add(button_spacing),
+    );
     let content_width = width - constants::DIALOG_MARGIN * 2;
     let prompt_height = dialog_prompt_height(txt, content_width);
     let height = constants::DIALOG_MARGIN * 2
@@ -313,22 +348,24 @@ pub fn input_on_main(txt: &str, deflt: &str) -> Option<String> {
 
     let _spacer = Frame::default();
 
+    let ok_button_width = dialog_button_width("OK");
+    let cancel_button_width = dialog_button_width("Cancel");
     let mut ok_btn = Button::default()
-        .with_size(constants::BUTTON_WIDTH, constants::BUTTON_HEIGHT)
+        .with_size(ok_button_width, constants::BUTTON_HEIGHT)
         .with_label("OK");
     ok_btn.set_color(theme::button_primary());
     ok_btn.set_label_color(theme::text_primary());
     ok_btn.set_frame(FrameType::RFlatBox);
 
     let mut cancel_btn = Button::default()
-        .with_size(constants::BUTTON_WIDTH, constants::BUTTON_HEIGHT)
+        .with_size(cancel_button_width, constants::BUTTON_HEIGHT)
         .with_label("Cancel");
     cancel_btn.set_color(theme::button_cancel());
     cancel_btn.set_label_color(theme::text_primary());
     cancel_btn.set_frame(FrameType::RFlatBox);
 
-    button_flex.fixed(&ok_btn, constants::BUTTON_WIDTH);
-    button_flex.fixed(&cancel_btn, constants::BUTTON_WIDTH);
+    button_flex.fixed(&ok_btn, ok_button_width);
+    button_flex.fixed(&cancel_btn, cancel_button_width);
     button_flex.end();
     main_flex.fixed(&button_flex, constants::BUTTON_ROW_HEIGHT);
     main_flex.end();

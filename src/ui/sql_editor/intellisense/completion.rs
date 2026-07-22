@@ -2934,7 +2934,9 @@ impl SqlEditorWidget {
         let popup_width = Self::INTELLISENSE_POPUP_WIDTH;
         // Mirror IntellisensePopup's row height (font size + 6, min 20) so the
         // vertical clamp keeps the actual popup on screen.
-        let row_h = (crate::ui::configured_ui_font_size() + 6).max(20);
+        let row_h = crate::ui::intellisense_popup_row_height(
+            crate::ui::configured_ui_font_size(),
+        );
         let popup_height = (suggestions.len().min(10) as i32) * row_h + 10;
         let (popup_x, popup_y) =
             Self::popup_screen_position(editor, snapshot.cursor_pos, popup_width, popup_height);

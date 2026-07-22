@@ -17,14 +17,14 @@ fn fold_for_case_insensitive(value: &str) -> String {
 }
 
 use crate::ui::constants::*;
-use crate::ui::{available_font_names, center_on_main, theme};
+use crate::ui::{available_font_names, center_on_main, resolved_font_name, theme};
 use crate::utils::{
     AppConfig, SqlCommaListLayout, MAX_CANCEL_TIMEOUT_SECONDS, MAX_CONNECTION_POOL_SIZE,
-    MAX_INTELLISENSE_CONTEXT_WINDOW_KIB, MAX_INTELLISENSE_POPUP_DELAY_MS,
-    MAX_LAZY_FETCH_BATCH_SIZE, MAX_SQL_FORMAT_RIGHT_MARGIN, MAX_UI_SCALE_PERCENT,
-    MIN_CANCEL_TIMEOUT_SECONDS, MIN_CONNECTION_POOL_SIZE, MIN_INTELLISENSE_CONTEXT_WINDOW_KIB,
-    MIN_INTELLISENSE_POPUP_DELAY_MS, MIN_LAZY_FETCH_BATCH_SIZE, MIN_SQL_FORMAT_RIGHT_MARGIN,
-    MIN_UI_SCALE_PERCENT,
+    MAX_FONT_SIZE, MAX_INTELLISENSE_CONTEXT_WINDOW_KIB, MAX_INTELLISENSE_POPUP_DELAY_MS,
+    MAX_LAZY_FETCH_BATCH_SIZE, MAX_SQL_FORMAT_RIGHT_MARGIN, MAX_UI_FONT_SIZE, MAX_UI_SCALE_PERCENT,
+    MIN_CANCEL_TIMEOUT_SECONDS, MIN_CONNECTION_POOL_SIZE, MIN_FONT_SIZE,
+    MIN_INTELLISENSE_CONTEXT_WINDOW_KIB, MIN_INTELLISENSE_POPUP_DELAY_MS,
+    MIN_LAZY_FETCH_BATCH_SIZE, MIN_SQL_FORMAT_RIGHT_MARGIN, MIN_UI_FONT_SIZE, MIN_UI_SCALE_PERCENT,
 };
 
 pub struct FontSettings {
@@ -45,11 +45,11 @@ pub struct FontSettings {
 
 fn validate_size(label: &str, value: &str) -> Option<u32> {
     match value.trim().parse::<u32>() {
-        Ok(size) if (8..=48).contains(&size) => Some(size),
+        Ok(size) if (MIN_FONT_SIZE..=MAX_FONT_SIZE).contains(&size) => Some(size),
         _ => {
             crate::ui::alert_on_main(&format!(
-                "{} size must be a number between 8 and 48.",
-                label
+                "{} size must be a number between {} and {}.",
+                label, MIN_FONT_SIZE, MAX_FONT_SIZE
             ));
             None
         }
@@ -58,9 +58,12 @@ fn validate_size(label: &str, value: &str) -> Option<u32> {
 
 fn validate_ui_size(value: &str) -> Option<u32> {
     match value.trim().parse::<u32>() {
-        Ok(size) if (8..=24).contains(&size) => Some(size),
+        Ok(size) if (MIN_UI_FONT_SIZE..=MAX_UI_FONT_SIZE).contains(&size) => Some(size),
         _ => {
-            crate::ui::alert_on_main("Global UI size must be a number between 8 and 24.");
+            crate::ui::alert_on_main(&format!(
+                "Global UI size must be a number between {} and {}.",
+                MIN_UI_FONT_SIZE, MAX_UI_FONT_SIZE
+            ));
             None
         }
     }
@@ -237,20 +240,15 @@ pub fn show_settings_dialog(config: &AppConfig) -> Option<FontSettings> {
     let current_group = fltk::group::Group::try_current();
     fltk::group::Group::set_current(None::<&fltk::group::Group>);
 
-    let mut font_names = available_font_names();
-    let current_font = if !config.editor_font.trim().is_empty() {
-        config.editor_font.clone()
+    let font_names = available_font_names();
+    let configured_font = if !config.editor_font.trim().is_empty() {
+        config.editor_font.as_str()
     } else if !config.result_font.trim().is_empty() {
-        config.result_font.clone()
+        config.result_font.as_str()
     } else {
-        "Courier".to_string()
+        "Courier"
     };
-    if !font_names
-        .iter()
-        .any(|font_name| font_name.eq_ignore_ascii_case(&current_font))
-    {
-        font_names.push(current_font.clone());
-    }
+    let current_font = resolved_font_name(configured_font);
 
     let width = 520;
     let height = 560 + INPUT_ROW_HEIGHT + DIALOG_SPACING;
@@ -324,6 +322,12 @@ pub fn show_settings_dialog(config: &AppConfig) -> Option<FontSettings> {
     selected_label.set_label_color(theme::text_primary());
     let mut selected_value = Frame::default();
     selected_value.set_label(&current_font);
+    if !current_font.eq_ignore_ascii_case(configured_font) {
+        selected_value.set_tooltip(&format!(
+            "Configured font '{}' is unavailable; '{}' is being used.",
+            configured_font, current_font
+        ));
+    }
     selected_value.set_label_color(theme::text_secondary());
     selected_value.set_align(Align::Left | Align::Inside);
     selected_row.fixed(&selected_label, FORM_LABEL_WIDTH);
@@ -337,7 +341,7 @@ pub fn show_settings_dialog(config: &AppConfig) -> Option<FontSettings> {
     editor_size_label.set_label_color(theme::text_primary());
     editor_size_row.fixed(&editor_size_label, FORM_LABEL_WIDTH);
     let mut editor_size_input = IntInput::default();
-    editor_size_input.set_value(&config.editor_font_size.to_string());
+    editor_size_input.set_value(&config.normalized_editor_font_size().to_string());
     editor_size_input.set_color(theme::input_bg());
     editor_size_input.set_text_color(theme::text_primary());
     editor_size_row.end();
@@ -350,7 +354,7 @@ pub fn show_settings_dialog(config: &AppConfig) -> Option<FontSettings> {
     result_size_label.set_label_color(theme::text_primary());
     result_size_row.fixed(&result_size_label, FORM_LABEL_WIDTH);
     let mut result_size_input = IntInput::default();
-    result_size_input.set_value(&config.result_font_size.to_string());
+    result_size_input.set_value(&config.normalized_result_font_size().to_string());
     result_size_input.set_color(theme::input_bg());
     result_size_input.set_text_color(theme::text_primary());
     result_size_row.end();
@@ -363,7 +367,7 @@ pub fn show_settings_dialog(config: &AppConfig) -> Option<FontSettings> {
     global_size_label.set_label_color(theme::text_primary());
     global_size_row.fixed(&global_size_label, FORM_LABEL_WIDTH);
     let mut global_size_input = IntInput::default();
-    global_size_input.set_value(&config.ui_font_size.to_string());
+    global_size_input.set_value(&config.normalized_ui_font_size().to_string());
     global_size_input.set_color(theme::input_bg());
     global_size_input.set_text_color(theme::text_primary());
     global_size_row.end();
@@ -387,8 +391,13 @@ pub fn show_settings_dialog(config: &AppConfig) -> Option<FontSettings> {
     font_flex.fixed(&ui_scale_row, INPUT_ROW_HEIGHT);
 
     let mut size_hint = Frame::default().with_label(&format!(
-        "Font: 8 ~ 48pt, Global UI: 8 ~ 24pt, Scale: {} ~ {}%",
-        MIN_UI_SCALE_PERCENT, MAX_UI_SCALE_PERCENT
+        "Font: {} ~ {}pt, Global UI: {} ~ {}pt, Scale: {} ~ {}%",
+        MIN_FONT_SIZE,
+        MAX_FONT_SIZE,
+        MIN_UI_FONT_SIZE,
+        MAX_UI_FONT_SIZE,
+        MIN_UI_SCALE_PERCENT,
+        MAX_UI_SCALE_PERCENT
     ));
     size_hint.set_label_color(theme::text_secondary());
     font_flex.fixed(&size_hint, LABEL_ROW_HEIGHT);

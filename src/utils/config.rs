@@ -2,6 +2,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
 use std::fs;
 use std::path::PathBuf;
+use std::sync::{OnceLock, RwLock};
 
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
@@ -36,6 +37,14 @@ pub const MAX_CANCEL_TIMEOUT_SECONDS: u32 = 120;
 pub const DEFAULT_SQL_FORMAT_RIGHT_MARGIN: u32 = 120;
 pub const MIN_SQL_FORMAT_RIGHT_MARGIN: u32 = 60;
 pub const MAX_SQL_FORMAT_RIGHT_MARGIN: u32 = 300;
+pub const DEFAULT_FONT_SIZE: u32 = 16;
+pub const MIN_FONT_SIZE: u32 = 8;
+pub const MAX_FONT_SIZE: u32 = 48;
+pub const DEFAULT_UI_FONT_SIZE: u32 = 16;
+pub const MIN_UI_FONT_SIZE: u32 = 8;
+pub const MAX_UI_FONT_SIZE: u32 = 24;
+
+static RUNTIME_CONFIG: OnceLock<RwLock<AppConfig>> = OnceLock::new();
 
 #[derive(Debug, Serialize, Deserialize, Clone, Copy, Default, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -91,12 +100,12 @@ impl AppConfig {
             recent_connections: Vec::new(),
             recent_sql_files: Vec::new(),
             last_connection: None,
-            editor_font: "맑은 고딕".to_string(),
-            ui_font_size: 16,
+            editor_font: "Courier".to_string(),
+            ui_font_size: DEFAULT_UI_FONT_SIZE,
             ui_scale_percent: DEFAULT_UI_SCALE_PERCENT,
-            editor_font_size: 16,
-            result_font: "맑은 고딕".to_string(),
-            result_font_size: 16,
+            editor_font_size: DEFAULT_FONT_SIZE,
+            result_font: "Courier".to_string(),
+            result_font_size: DEFAULT_FONT_SIZE,
             result_cell_max_chars: DEFAULT_RESULT_CELL_MAX_CHARS,
             lazy_fetch_batch_size: DEFAULT_LAZY_FETCH_BATCH_SIZE,
             intellisense_context_window_kib: DEFAULT_INTELLISENSE_CONTEXT_WINDOW_KIB,
@@ -120,6 +129,26 @@ impl AppConfig {
 
     pub fn normalized_ui_scale_percent(&self) -> u32 {
         Self::clamp_ui_scale_percent(self.ui_scale_percent)
+    }
+
+    pub fn clamp_font_size(size: u32) -> u32 {
+        size.clamp(MIN_FONT_SIZE, MAX_FONT_SIZE)
+    }
+
+    pub fn normalized_editor_font_size(&self) -> u32 {
+        Self::clamp_font_size(self.editor_font_size)
+    }
+
+    pub fn normalized_result_font_size(&self) -> u32 {
+        Self::clamp_font_size(self.result_font_size)
+    }
+
+    pub fn clamp_ui_font_size(size: u32) -> u32 {
+        size.clamp(MIN_UI_FONT_SIZE, MAX_UI_FONT_SIZE)
+    }
+
+    pub fn normalized_ui_font_size(&self) -> u32 {
+        Self::clamp_ui_font_size(self.ui_font_size)
     }
 
     pub fn normalized_connection_pool_size(&self) -> u32 {
@@ -190,7 +219,7 @@ impl AppConfig {
 
     pub fn load() -> Self {
         let mut loaded_from_legacy = false;
-        let config = if let Some(path) = Self::config_path() {
+        let mut config = if let Some(path) = Self::config_path() {
             if let Some(loaded) = Self::load_from_path(&path) {
                 loaded
             } else if let Some(legacy_path) = Self::legacy_config_path() {
@@ -207,6 +236,8 @@ impl AppConfig {
             Self::new()
         };
 
+        config.normalize_font_settings();
+
         if loaded_from_legacy {
             // Migrate config location from legacy app folder to new app folder.
             if let Err(e) = config.save() {
@@ -215,6 +246,35 @@ impl AppConfig {
         }
 
         config
+    }
+
+    fn normalize_font_settings(&mut self) {
+        self.ui_font_size = self.normalized_ui_font_size();
+        self.editor_font_size = self.normalized_editor_font_size();
+        self.result_font_size = self.normalized_result_font_size();
+        if self.editor_font.trim().is_empty() {
+            self.editor_font = "Courier".to_string();
+        }
+        if self.result_font.trim().is_empty() {
+            self.result_font = self.editor_font.clone();
+        }
+    }
+
+    /// Updates the process-local configuration used by UI hot paths.
+    /// Disk reads remain explicit at application/bootstrap boundaries.
+    pub fn update_runtime(config: &Self) {
+        let runtime = RUNTIME_CONFIG.get_or_init(|| RwLock::new(config.clone()));
+        *runtime
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = config.clone();
+    }
+
+    pub fn runtime() -> Self {
+        RUNTIME_CONFIG
+            .get_or_init(|| RwLock::new(Self::load()))
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
     }
 
     pub fn save(&self) -> Result<(), Box<dyn std::error::Error>> {
@@ -269,6 +329,7 @@ impl AppConfig {
                 eprintln!("Warning: could not set config file permissions: {}", e);
             }
         }
+        Self::update_runtime(self);
         Ok(())
     }
 
@@ -606,6 +667,31 @@ mod tests {
         assert_eq!(AppConfig::clamp_ui_scale_percent(0), 50);
         assert_eq!(AppConfig::clamp_ui_scale_percent(100), 100);
         assert_eq!(AppConfig::clamp_ui_scale_percent(999), 300);
+    }
+
+    #[test]
+    fn app_config_normalizes_font_settings_from_untrusted_config_values() {
+        let mut config = AppConfig::new();
+        config.editor_font.clear();
+        config.result_font.clear();
+        config.ui_font_size = u32::MAX;
+        config.editor_font_size = 0;
+        config.result_font_size = u32::MAX;
+
+        config.normalize_font_settings();
+
+        assert_eq!(config.editor_font, "Courier");
+        assert_eq!(config.result_font, "Courier");
+        assert_eq!(config.ui_font_size, super::MAX_UI_FONT_SIZE);
+        assert_eq!(config.editor_font_size, super::MIN_FONT_SIZE);
+        assert_eq!(config.result_font_size, super::MAX_FONT_SIZE);
+    }
+
+    #[test]
+    fn app_config_uses_a_cross_platform_builtin_font_by_default() {
+        let config = AppConfig::new();
+        assert_eq!(config.editor_font, "Courier");
+        assert_eq!(config.result_font, "Courier");
     }
 
     #[test]
