@@ -51,6 +51,31 @@ const RESULT_CHECKBOX_GROUP_GAP: i32 = TOOLBAR_SPACING;
 const UI_SCALE_BUTTON_WIDTH: i32 = 32;
 const UI_SCALE_EPSILON: f32 = 0.01;
 const UI_SCALE_STEPS: [u32; 13] = [50, 67, 80, 90, 100, 110, 120, 133, 150, 170, 200, 240, 300];
+const APPLICATION_EXIT_POLL_SECONDS: f64 = 0.2;
+// Once the user chose Cancel and Exit, a stuck database worker must not keep
+// FLTK's event loop alive indefinitely.
+const APPLICATION_EXIT_CANCEL_GRACE: Duration = Duration::from_secs(5);
+const MAX_TOP_LEVEL_WINDOWS_TO_HIDE: usize = 1024;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ApplicationExitWaitDecision {
+    Continue,
+    Retry,
+    Force,
+}
+
+fn application_exit_wait_decision(
+    has_running_work: bool,
+    elapsed: Duration,
+) -> ApplicationExitWaitDecision {
+    if !has_running_work {
+        ApplicationExitWaitDecision::Continue
+    } else if elapsed < APPLICATION_EXIT_CANCEL_GRACE {
+        ApplicationExitWaitDecision::Retry
+    } else {
+        ApplicationExitWaitDecision::Force
+    }
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum UiScaleDirection {
@@ -5449,7 +5474,7 @@ impl MainWindow {
                 ),
             )
         };
-        app::set_font(unified_profile.normal);
+        font_settings::apply_global_default_font(unified_profile.normal);
         app::set_font_size(ui_size);
         fltk::misc::Tooltip::set_font(unified_profile.normal);
         fltk::misc::Tooltip::set_font_size(ui_size);
@@ -5471,11 +5496,6 @@ impl MainWindow {
         state.right_tile.redraw();
         state.window.redraw();
         app::redraw();
-        // Force FLTK to process the pending redraw immediately, so font
-        // changes are visible right after the settings dialog closes
-        // instead of requiring multiple save cycles.
-        app::flush();
-        app::awake();
     }
 
     fn apply_lazy_fetch_settings(state: &mut AppState) {
@@ -8268,6 +8288,8 @@ impl MainWindow {
                         save_result.map_err(|err| err.to_string())
                     });
                     MainWindow::apply_configured_ui_scale(state);
+                    // Apply pending font and scale redraws only after releasing AppState.
+                    app::flush();
                     if let Err(err) = save_result {
                         crate::ui::alert_on_main(&format!("Failed to save settings: {}", err));
                     }
@@ -9461,7 +9483,7 @@ impl MainWindow {
                 return;
             }
             Self::cancel_all_running_queries(&state);
-            Self::defer_application_exit_until_idle(state, window);
+            Self::defer_application_exit_until_idle(state, window, Instant::now());
             return;
         }
 
@@ -9472,20 +9494,51 @@ impl MainWindow {
         Self::finish_application_exit(&state, window);
     }
 
-    fn defer_application_exit_until_idle(state: Arc<Mutex<AppState>>, window: Window) {
-        crate::ui::ui_timeout::schedule(0.2, move || {
-            let should_wait = {
+    fn defer_application_exit_until_idle(
+        state: Arc<Mutex<AppState>>,
+        window: Window,
+        started_at: Instant,
+    ) {
+        crate::ui::ui_timeout::schedule(APPLICATION_EXIT_POLL_SECONDS, move || {
+            let has_running_work = {
                 let s = state
                     .lock()
                     .unwrap_or_else(|poisoned| poisoned.into_inner());
                 s.has_running_query_or_lazy_fetch()
             };
-            if should_wait {
-                Self::defer_application_exit_until_idle(state.clone(), window.clone());
-                return;
+            match application_exit_wait_decision(has_running_work, started_at.elapsed()) {
+                ApplicationExitWaitDecision::Continue => {
+                    Self::continue_application_exit(state.clone(), window.clone(), false);
+                }
+                ApplicationExitWaitDecision::Retry => {
+                    Self::defer_application_exit_until_idle(
+                        state.clone(),
+                        window.clone(),
+                        started_at,
+                    );
+                }
+                ApplicationExitWaitDecision::Force => {
+                    crate::utils::logging::log_warning(
+                        "app",
+                        "Forcing application exit after query cancellation did not become idle",
+                    );
+                    Self::finish_application_exit(&state, window.clone());
+                }
             }
-            Self::continue_application_exit(state.clone(), window.clone(), false);
         });
+    }
+
+    fn hide_all_visible_windows() {
+        for _ in 0..MAX_TOP_LEVEL_WINDOWS_TO_HIDE {
+            let Some(mut visible_window) = app::first_window() else {
+                return;
+            };
+            visible_window.hide();
+        }
+        crate::utils::logging::log_error(
+            "app",
+            "Failed to hide all top-level windows during application exit",
+        );
     }
 
     fn finish_application_exit(state: &Arc<Mutex<AppState>>, mut window: Window) {
@@ -9500,25 +9553,25 @@ impl MainWindow {
                 s.result_tabs.clone(),
             )
         };
-        let mut popups = popups
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        for mut popup in popups.drain(..) {
-            if popup.was_deleted() {
-                continue;
+        {
+            let mut popups = popups
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            for mut popup in popups.drain(..) {
+                if popup.was_deleted() {
+                    continue;
+                }
+                popup.hide();
+                Window::delete(popup);
             }
-            popup.hide();
-            Window::delete(popup);
         }
         for mut tab in editor_tabs {
             tab.sql_editor.cleanup_for_close();
         }
         result_tabs.clear();
         crate::ui::sql_editor::SqlEditorWidget::shutdown_column_load_workers();
-        if let Err(err) = crate::utils::logging::flush_log_writer() {
-            eprintln!("Application log flush on exit failed: {err}");
-        }
         window.hide();
+        Self::hide_all_visible_windows();
         app::quit();
     }
 
@@ -9536,10 +9589,8 @@ impl MainWindow {
                 MainWindow::continue_application_exit(state, w.clone(), true);
             } else {
                 crate::ui::sql_editor::SqlEditorWidget::shutdown_column_load_workers();
-                if let Err(err) = crate::utils::logging::flush_log_writer() {
-                    eprintln!("Application log flush on exit failed: {err}");
-                }
                 w.hide();
+                MainWindow::hide_all_visible_windows();
                 app::quit();
             }
         });
@@ -9683,6 +9734,9 @@ The crash has been recorded in the application log.",
                 eprintln!("Failed to run app: {err}");
             }
         }
+        if let Err(err) = crate::utils::logging::flush_log_writer() {
+            eprintln!("Application log flush on exit failed: {err}");
+        }
         // Restore current group
         if let Some(ref group) = current_group {
             fltk::group::Group::set_current(Some(group));
@@ -9776,6 +9830,33 @@ mod tests {
     use crate::ui::sql_editor::LazyFetchRequest;
     use fltk::enums::{Key, Shortcut};
     use std::sync::{Arc, Mutex};
+
+    #[test]
+    fn application_exit_wait_continues_as_soon_as_work_is_idle() {
+        assert_eq!(
+            application_exit_wait_decision(false, Duration::ZERO),
+            ApplicationExitWaitDecision::Continue
+        );
+    }
+
+    #[test]
+    fn application_exit_wait_retries_only_within_cancel_grace() {
+        assert_eq!(
+            application_exit_wait_decision(
+                true,
+                APPLICATION_EXIT_CANCEL_GRACE - Duration::from_millis(1),
+            ),
+            ApplicationExitWaitDecision::Retry
+        );
+    }
+
+    #[test]
+    fn application_exit_wait_forces_shutdown_at_cancel_deadline() {
+        assert_eq!(
+            application_exit_wait_decision(true, APPLICATION_EXIT_CANCEL_GRACE),
+            ApplicationExitWaitDecision::Force
+        );
+    }
 
     #[test]
     fn equal_length_paste_avoids_full_dirty_scan_when_local_bytes_decide_state() {

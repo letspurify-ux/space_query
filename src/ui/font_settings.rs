@@ -1,5 +1,6 @@
 use fltk::{app, enums::Font};
 use std::collections::HashSet;
+use std::sync::OnceLock;
 
 use crate::utils::AppConfig;
 
@@ -31,6 +32,26 @@ pub const FONT_PROFILES: &[FontProfile] = &[
         italic: Font::TimesItalic,
     },
 ];
+
+static ORIGINAL_DEFAULT_FONT_NAME: OnceLock<String> = OnceLock::new();
+
+/// Remaps only FLTK's default font slot, preserving the selected font's own slot.
+///
+/// `app::set_font` swaps font slots and can make a second runtime selection point
+/// at the previously selected font instead of the requested one.
+pub fn apply_global_default_font(font: Font) {
+    let original_default =
+        ORIGINAL_DEFAULT_FONT_NAME.get_or_init(|| app::get_font(Font::Helvetica));
+    let desired_name = if font == Font::Helvetica {
+        original_default.clone()
+    } else {
+        app::get_font(font)
+    };
+
+    if app::get_font(Font::Helvetica) != desired_name {
+        Font::set_font(Font::Helvetica, &desired_name);
+    }
+}
 
 pub fn profile_by_name(name: &str) -> FontProfile {
     if let Some(profile) = FONT_PROFILES
@@ -108,7 +129,10 @@ fn find_font_by_name(name: &str) -> Option<Font> {
         return None;
     }
 
-    for (idx, raw_name) in app::get_font_names().into_iter().enumerate() {
+    // Slot 0 is the remappable application default. After a runtime font
+    // change it duplicates the selected system font and must not be returned
+    // as that font's stable identity.
+    for (idx, raw_name) in app::get_font_names().into_iter().enumerate().skip(1) {
         if raw_name.eq_ignore_ascii_case(name)
             || normalize_font_name(&raw_name).eq_ignore_ascii_case(name)
         {

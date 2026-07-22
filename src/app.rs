@@ -66,8 +66,12 @@ impl Default for App {
 
 pub(crate) fn configure_fltk_globals(config: &AppConfig) {
     let ui_size = config.ui_font_size.clamp(8, 24) as i32;
+    let font = crate::ui::profile_by_name(&config.editor_font).normal;
+    crate::ui::apply_global_default_font(font);
     app::set_font_size(ui_size);
+    fltk::misc::Tooltip::set_font(font);
     fltk::misc::Tooltip::set_font_size(ui_size);
+    fltk::dialog::message_set_font(font, ui_size);
 
     let (bg_r, bg_g, bg_b) = theme::app_background().to_rgb();
     app::background(bg_r, bg_g, bg_b);

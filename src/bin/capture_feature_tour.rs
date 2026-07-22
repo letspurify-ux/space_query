@@ -4,9 +4,9 @@ use fltk::{
 use space_query::{
     db::{ColumnInfo, QueryResult},
     ui::{
-        log_viewer::LogViewerDialog, profile_by_name, show_settings_dialog, theme,
-        ConnectionDialog, IntellisensePopup, MainWindow, QueryHistoryDialog, SignatureLabel,
-        SignatureOverload, SignaturePopup,
+        apply_global_default_font, log_viewer::LogViewerDialog, profile_by_name,
+        show_settings_dialog, theme, ConnectionDialog, IntellisensePopup, MainWindow,
+        QueryHistoryDialog, SignatureLabel, SignatureOverload, SignaturePopup,
     },
     utils::{arithmetic::safe_div, logging, AppConfig},
 };
@@ -574,7 +574,7 @@ fn main() {
     let _app = app::App::default()
         .with_scheme(app::Scheme::Gtk)
         .load_system_fonts();
-    app::set_font(profile_by_name("D2Coding").normal);
+    apply_global_default_font(profile_by_name("D2Coding").normal);
     app::set_font_size(16);
     Tooltip::set_font(profile_by_name("D2Coding").normal);
     Tooltip::set_font_size(16);
