@@ -575,6 +575,9 @@ impl MenuBarBuilder {
                     Ctrl+Space - Intellisense\n\
                     Ctrl+Shift+Up/Down - Select SQL Block\n\
                     Ctrl+Click - Quick Describe at Cursor\n\n\
+                    View:\n\
+                    Ctrl++ - Zoom In\n\
+                    Ctrl+- - Zoom Out\n\n\
                     Query:\n\
                     Ctrl+Enter - Execute Statement\n\
                     F5 - Execute Script\n\

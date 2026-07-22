@@ -48,6 +48,31 @@ type MutexFlag = Arc<Mutex<Option<u64>>>;
 
 const RESULT_ONE_TAB_PER_QUERY_LABEL: &str = " One tab per query";
 const RESULT_CHECKBOX_GROUP_GAP: i32 = TOOLBAR_SPACING;
+const UI_SCALE_BUTTON_WIDTH: i32 = 32;
+const UI_SCALE_EPSILON: f32 = 0.01;
+const UI_SCALE_STEPS: [u32; 13] = [50, 67, 80, 90, 100, 110, 120, 133, 150, 170, 200, 240, 300];
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum UiScaleDirection {
+    In,
+    Out,
+}
+
+fn next_ui_scale_percent(current: f32, direction: UiScaleDirection) -> u32 {
+    match direction {
+        UiScaleDirection::In => UI_SCALE_STEPS
+            .iter()
+            .copied()
+            .find(|step| *step as f32 > current + UI_SCALE_EPSILON)
+            .unwrap_or(UI_SCALE_STEPS[UI_SCALE_STEPS.len() - 1]),
+        UiScaleDirection::Out => UI_SCALE_STEPS
+            .iter()
+            .rev()
+            .copied()
+            .find(|step| (*step as f32) < current - UI_SCALE_EPSILON)
+            .unwrap_or(UI_SCALE_STEPS[0]),
+    }
+}
 
 static NEXT_MUTEX_FLAG_TOKEN: AtomicU64 = AtomicU64::new(1);
 
@@ -1027,6 +1052,7 @@ pub struct AppState {
     schema_intellisense_data: Arc<Mutex<IntellisenseData>>,
     schema_highlight_data: HighlightData,
     query_timeout_input: IntInput,
+    ui_scale_bases: Vec<f32>,
     pub result_tabs: ResultTabsWidget,
     result_toolbar: Flex,
     result_one_tab_per_query_check: CheckButton,
@@ -4277,6 +4303,14 @@ impl MainWindow {
             guard.set_connection_pool_size(config.normalized_connection_pool_size());
         }
 
+        let ui_scale_bases = (0..app::screen_count())
+            .map(app::screen_scale)
+            .collect::<Vec<_>>();
+        let configured_scale_ratio = safe_div(config.normalized_ui_scale_percent() as f32, 100.0);
+        for (screen, base) in ui_scale_bases.iter().copied().enumerate() {
+            app::set_screen_scale(screen as i32, base * configured_scale_ratio);
+        }
+
         let current_group = fltk::group::Group::try_current();
 
         fltk::group::Group::set_current(None::<&fltk::group::Group>);
@@ -4379,6 +4413,24 @@ impl MainWindow {
         timeout_input.set_tooltip("Call timeout in seconds (empty = no timeout)");
         timeout_input.set_value("60");
         query_toolbar.fixed(&timeout_input, NUMERIC_INPUT_WIDTH);
+
+        let mut zoom_out_btn = Button::default()
+            .with_size(UI_SCALE_BUTTON_WIDTH, BUTTON_HEIGHT)
+            .with_label("-");
+        zoom_out_btn.set_color(theme::button_subtle());
+        zoom_out_btn.set_label_color(theme::text_primary());
+        zoom_out_btn.set_frame(FrameType::RFlatBox);
+        zoom_out_btn.set_tooltip("Zoom out (Ctrl/Cmd+-)");
+        query_toolbar.fixed(&zoom_out_btn, UI_SCALE_BUTTON_WIDTH);
+
+        let mut zoom_in_btn = Button::default()
+            .with_size(UI_SCALE_BUTTON_WIDTH, BUTTON_HEIGHT)
+            .with_label("+");
+        zoom_in_btn.set_color(theme::button_subtle());
+        zoom_in_btn.set_label_color(theme::text_primary());
+        zoom_in_btn.set_frame(FrameType::RFlatBox);
+        zoom_in_btn.set_tooltip("Zoom in (Ctrl/Cmd++)");
+        query_toolbar.fixed(&zoom_in_btn, UI_SCALE_BUTTON_WIDTH);
 
         query_toolbar.end();
         main_flex.fixed(&query_toolbar, RESULT_TOOLBAR_HEIGHT);
@@ -4824,6 +4876,7 @@ impl MainWindow {
             schema_intellisense_data,
             schema_highlight_data: HighlightData::new(),
             query_timeout_input: timeout_input.clone(),
+            ui_scale_bases,
             result_tabs: result_tabs.clone(),
             result_toolbar: result_toolbar.clone(),
             result_one_tab_per_query_check: one_tab_per_query_check.clone(),
@@ -4938,6 +4991,20 @@ impl MainWindow {
                     &state_for_execute,
                     SqlExecutionRequest::StatementAtCursor,
                 );
+            }
+        });
+
+        let weak_state_for_zoom_out = Arc::downgrade(&state);
+        zoom_out_btn.set_callback(move |_| {
+            if let Some(state_for_zoom_out) = weak_state_for_zoom_out.upgrade() {
+                MainWindow::adjust_ui_scale(&state_for_zoom_out, UiScaleDirection::Out);
+            }
+        });
+
+        let weak_state_for_zoom_in = Arc::downgrade(&state);
+        zoom_in_btn.set_callback(move |_| {
+            if let Some(state_for_zoom_in) = weak_state_for_zoom_in.upgrade() {
+                MainWindow::adjust_ui_scale(&state_for_zoom_in, UiScaleDirection::In);
             }
         });
 
@@ -8177,6 +8244,7 @@ impl MainWindow {
                                 .unwrap_or_else(|poisoned| poisoned.into_inner());
                             config.editor_font = settings.font.clone();
                             config.ui_font_size = settings.ui_size;
+                            config.ui_scale_percent = settings.ui_scale_percent;
                             config.editor_font_size = settings.editor_size;
                             config.result_font = settings.font;
                             config.result_font_size = settings.result_size;
@@ -8199,6 +8267,7 @@ impl MainWindow {
                         MainWindow::apply_font_settings(&mut s);
                         save_result.map_err(|err| err.to_string())
                     });
+                    MainWindow::apply_configured_ui_scale(state);
                     if let Err(err) = save_result {
                         crate::ui::alert_on_main(&format!("Failed to save settings: {}", err));
                     }
@@ -8221,6 +8290,103 @@ impl MainWindow {
             raw
         };
         label.replace('&', "")
+    }
+
+    fn zoom_shortcut_for_key(
+        key: fltk::enums::Key,
+        modifiers: fltk::enums::Shortcut,
+    ) -> Option<UiScaleDirection> {
+        let ctrl_or_cmd = modifiers.contains(fltk::enums::Shortcut::Ctrl)
+            || modifiers.contains(fltk::enums::Shortcut::Command);
+        if !ctrl_or_cmd || modifiers.contains(fltk::enums::Shortcut::Alt) {
+            return None;
+        }
+
+        match key {
+            k if k == fltk::enums::Key::from_char('+') || k == fltk::enums::Key::from_char('=') => {
+                Some(UiScaleDirection::In)
+            }
+            k if k == fltk::enums::Key::from_char('-') => Some(UiScaleDirection::Out),
+            _ => None,
+        }
+    }
+
+    fn resolve_window_zoom_shortcut(
+        event_key: fltk::enums::Key,
+        event_original_key: fltk::enums::Key,
+        event_state: fltk::enums::Shortcut,
+    ) -> Option<UiScaleDirection> {
+        Self::zoom_shortcut_for_key(event_key, event_state)
+            .or_else(|| Self::zoom_shortcut_for_key(event_original_key, event_state))
+    }
+
+    fn adjust_ui_scale(state: &Arc<Mutex<AppState>>, direction: UiScaleDirection) -> bool {
+        let (window, scale_bases, config) = {
+            let state = state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            (
+                state.window.clone(),
+                state.ui_scale_bases.clone(),
+                state.config.clone(),
+            )
+        };
+        let screen_count = app::screen_count();
+        if screen_count <= 0 {
+            return false;
+        }
+        let screen = window.screen_num().clamp(0, screen_count - 1);
+        let current = app::screen_scale(screen);
+        let base = scale_bases
+            .get(screen as usize)
+            .copied()
+            .filter(|scale| scale.is_finite() && *scale > 0.0)
+            .unwrap_or(current);
+        if !current.is_finite() || current <= 0.0 {
+            return false;
+        }
+
+        let next_percent = next_ui_scale_percent(safe_div(current, base) * 100.0, direction);
+        let next = base * safe_div(next_percent as f32, 100.0);
+        if (next - current).abs() > UI_SCALE_EPSILON {
+            app::set_screen_scale(screen, next);
+            app::redraw();
+        }
+
+        let mut config = config
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        config.ui_scale_percent = next_percent;
+        if let Err(err) = config.save() {
+            crate::utils::logging::log_warning(
+                "ui_scale",
+                &format!("Failed to save screen scale setting: {err}"),
+            );
+        }
+        true
+    }
+
+    fn apply_configured_ui_scale(state: &Arc<Mutex<AppState>>) {
+        let (scale_bases, config) = {
+            let state = state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            (state.ui_scale_bases.clone(), state.config.clone())
+        };
+        let percent = config
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .normalized_ui_scale_percent();
+        let ratio = safe_div(percent as f32, 100.0);
+        for (screen, base) in scale_bases
+            .iter()
+            .copied()
+            .take(app::screen_count().max(0) as usize)
+            .enumerate()
+        {
+            app::set_screen_scale(screen as i32, base * ratio);
+        }
+        app::redraw();
     }
 
     fn menu_shortcut_for_key(
@@ -8415,6 +8581,11 @@ impl MainWindow {
         let event_key = app::event_key();
         let event_original_key = app::event_original_key();
         let event_state = app::event_state();
+        if let Some(direction) =
+            Self::resolve_window_zoom_shortcut(event_key, event_original_key, event_state)
+        {
+            return Self::adjust_ui_scale(state, direction);
+        }
         let Some(action) =
             Self::resolve_window_shortcut_action(event_key, event_original_key, event_state)
         else {
@@ -9668,6 +9839,72 @@ mod tests {
         );
 
         assert_eq!(action, Some("Edit/Find"));
+    }
+
+    #[test]
+    fn resolve_window_zoom_shortcut_accepts_ctrl_and_command() {
+        assert_eq!(
+            MainWindow::resolve_window_zoom_shortcut(
+                Key::from_char('+'),
+                Key::from_char('+'),
+                Shortcut::Ctrl,
+            ),
+            Some(UiScaleDirection::In)
+        );
+        assert_eq!(
+            MainWindow::resolve_window_zoom_shortcut(
+                Key::from_char('-'),
+                Key::from_char('-'),
+                Shortcut::Command,
+            ),
+            Some(UiScaleDirection::Out)
+        );
+    }
+
+    #[test]
+    fn resolve_window_zoom_shortcut_accepts_unshifted_plus_key() {
+        assert_eq!(
+            MainWindow::resolve_window_zoom_shortcut(
+                Key::from_char('='),
+                Key::from_char('='),
+                Shortcut::Ctrl,
+            ),
+            Some(UiScaleDirection::In)
+        );
+    }
+
+    #[test]
+    fn resolve_window_zoom_shortcut_rejects_unmodified_or_alt_keys() {
+        assert_eq!(
+            MainWindow::resolve_window_zoom_shortcut(
+                Key::from_char('+'),
+                Key::from_char('+'),
+                Shortcut::None,
+            ),
+            None
+        );
+        assert_eq!(
+            MainWindow::resolve_window_zoom_shortcut(
+                Key::from_char('-'),
+                Key::from_char('-'),
+                Shortcut::Ctrl | Shortcut::Alt,
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn ui_scale_steps_move_once_and_clamp_at_bounds() {
+        assert_eq!(next_ui_scale_percent(100.0, UiScaleDirection::In), 110);
+        assert_eq!(next_ui_scale_percent(100.0, UiScaleDirection::Out), 90);
+        assert_eq!(
+            next_ui_scale_percent(300.0, UiScaleDirection::In),
+            UI_SCALE_STEPS[UI_SCALE_STEPS.len() - 1]
+        );
+        assert_eq!(
+            next_ui_scale_percent(50.0, UiScaleDirection::Out),
+            UI_SCALE_STEPS[0]
+        );
     }
 
     #[test]

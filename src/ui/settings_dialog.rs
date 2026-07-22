@@ -21,14 +21,16 @@ use crate::ui::{available_font_names, center_on_main, theme};
 use crate::utils::{
     AppConfig, SqlCommaListLayout, MAX_CANCEL_TIMEOUT_SECONDS, MAX_CONNECTION_POOL_SIZE,
     MAX_INTELLISENSE_CONTEXT_WINDOW_KIB, MAX_INTELLISENSE_POPUP_DELAY_MS,
-    MAX_LAZY_FETCH_BATCH_SIZE, MAX_SQL_FORMAT_RIGHT_MARGIN, MIN_CANCEL_TIMEOUT_SECONDS,
-    MIN_CONNECTION_POOL_SIZE, MIN_INTELLISENSE_CONTEXT_WINDOW_KIB, MIN_INTELLISENSE_POPUP_DELAY_MS,
-    MIN_LAZY_FETCH_BATCH_SIZE, MIN_SQL_FORMAT_RIGHT_MARGIN,
+    MAX_LAZY_FETCH_BATCH_SIZE, MAX_SQL_FORMAT_RIGHT_MARGIN, MAX_UI_SCALE_PERCENT,
+    MIN_CANCEL_TIMEOUT_SECONDS, MIN_CONNECTION_POOL_SIZE, MIN_INTELLISENSE_CONTEXT_WINDOW_KIB,
+    MIN_INTELLISENSE_POPUP_DELAY_MS, MIN_LAZY_FETCH_BATCH_SIZE, MIN_SQL_FORMAT_RIGHT_MARGIN,
+    MIN_UI_SCALE_PERCENT,
 };
 
 pub struct FontSettings {
     pub font: String,
     pub ui_size: u32,
+    pub ui_scale_percent: u32,
     pub editor_size: u32,
     pub result_size: u32,
     pub result_cell_max_chars: u32,
@@ -59,6 +61,21 @@ fn validate_ui_size(value: &str) -> Option<u32> {
         Ok(size) if (8..=24).contains(&size) => Some(size),
         _ => {
             crate::ui::alert_on_main("Global UI size must be a number between 8 and 24.");
+            None
+        }
+    }
+}
+
+fn validate_ui_scale_percent(value: &str) -> Option<u32> {
+    match value.trim().parse::<u32>() {
+        Ok(percent) if (MIN_UI_SCALE_PERCENT..=MAX_UI_SCALE_PERCENT).contains(&percent) => {
+            Some(percent)
+        }
+        _ => {
+            crate::ui::alert_on_main(&format!(
+                "Screen scale must be a number between {} and {} percent.",
+                MIN_UI_SCALE_PERCENT, MAX_UI_SCALE_PERCENT
+            ));
             None
         }
     }
@@ -236,7 +253,7 @@ pub fn show_settings_dialog(config: &AppConfig) -> Option<FontSettings> {
     }
 
     let width = 520;
-    let height = 560;
+    let height = 560 + INPUT_ROW_HEIGHT + DIALOG_SPACING;
     let mut dialog = Window::default()
         .with_size(width, height)
         .with_label("Settings");
@@ -352,7 +369,27 @@ pub fn show_settings_dialog(config: &AppConfig) -> Option<FontSettings> {
     global_size_row.end();
     font_flex.fixed(&global_size_row, INPUT_ROW_HEIGHT);
 
-    let mut size_hint = Frame::default().with_label("Font size: 8 ~ 48pt, Global UI: 8 ~ 24pt");
+    let mut ui_scale_row = Flex::default().with_size(0, INPUT_ROW_HEIGHT);
+    ui_scale_row.set_type(FlexType::Row);
+    ui_scale_row.set_spacing(DIALOG_SPACING);
+    let mut ui_scale_label = Frame::default().with_label("Screen Scale:");
+    ui_scale_label.set_label_color(theme::text_primary());
+    ui_scale_row.fixed(&ui_scale_label, FORM_LABEL_WIDTH);
+    let mut ui_scale_input = IntInput::default();
+    ui_scale_input.set_value(&config.normalized_ui_scale_percent().to_string());
+    ui_scale_input.set_color(theme::input_bg());
+    ui_scale_input.set_text_color(theme::text_primary());
+    ui_scale_input.set_tooltip("Application screen scale percentage");
+    let mut ui_scale_unit = Frame::default().with_label("%");
+    ui_scale_unit.set_label_color(theme::text_secondary());
+    ui_scale_row.fixed(&ui_scale_unit, 24);
+    ui_scale_row.end();
+    font_flex.fixed(&ui_scale_row, INPUT_ROW_HEIGHT);
+
+    let mut size_hint = Frame::default().with_label(&format!(
+        "Font: 8 ~ 48pt, Global UI: 8 ~ 24pt, Scale: {} ~ {}%",
+        MIN_UI_SCALE_PERCENT, MAX_UI_SCALE_PERCENT
+    ));
     size_hint.set_label_color(theme::text_secondary());
     font_flex.fixed(&size_hint, LABEL_ROW_HEIGHT);
 
@@ -715,6 +752,7 @@ pub fn show_settings_dialog(config: &AppConfig) -> Option<FontSettings> {
     let editor_size_input_ok = editor_size_input.clone();
     let result_size_input_ok = result_size_input.clone();
     let global_size_input_ok = global_size_input.clone();
+    let ui_scale_input_ok = ui_scale_input.clone();
     let result_cell_max_input_ok = result_cell_max_input.clone();
     let lazy_fetch_batch_input_ok = lazy_fetch_batch_input.clone();
     let context_window_input_ok = context_window_input.clone();
@@ -727,6 +765,10 @@ pub fn show_settings_dialog(config: &AppConfig) -> Option<FontSettings> {
     ok_btn.set_callback(move |_| {
         let ui_size = match validate_ui_size(&global_size_input_ok.value()) {
             Some(size) => size,
+            None => return,
+        };
+        let ui_scale_percent = match validate_ui_scale_percent(&ui_scale_input_ok.value()) {
+            Some(percent) => percent,
             None => return,
         };
         let editor_size = match validate_size("Editor", &editor_size_input_ok.value()) {
@@ -791,6 +833,7 @@ pub fn show_settings_dialog(config: &AppConfig) -> Option<FontSettings> {
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(FontSettings {
             font,
             ui_size,
+            ui_scale_percent,
             editor_size,
             result_size,
             result_cell_max_chars,

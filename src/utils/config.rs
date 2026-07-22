@@ -15,6 +15,9 @@ const MAX_RECENT_CONNECTIONS: usize = 50;
 pub const MAX_RECENT_SQL_FILES: usize = 10;
 const MAX_QUERY_HISTORY_ENTRIES: usize = 100;
 const DEFAULT_RESULT_CELL_MAX_CHARS: u32 = 150;
+pub const DEFAULT_UI_SCALE_PERCENT: u32 = 100;
+pub const MIN_UI_SCALE_PERCENT: u32 = 50;
+pub const MAX_UI_SCALE_PERCENT: u32 = 300;
 pub const DEFAULT_CONNECTION_POOL_SIZE: u32 = 12;
 pub const MIN_CONNECTION_POOL_SIZE: u32 = 1;
 pub const MAX_CONNECTION_POOL_SIZE: u32 = 16;
@@ -50,6 +53,7 @@ pub struct AppConfig {
     pub last_connection: Option<String>,
     pub editor_font: String,
     pub ui_font_size: u32,
+    pub ui_scale_percent: u32,
     pub editor_font_size: u32,
     pub result_font: String,
     pub result_font_size: u32,
@@ -89,6 +93,7 @@ impl AppConfig {
             last_connection: None,
             editor_font: "맑은 고딕".to_string(),
             ui_font_size: 16,
+            ui_scale_percent: DEFAULT_UI_SCALE_PERCENT,
             editor_font_size: 16,
             result_font: "맑은 고딕".to_string(),
             result_font_size: 16,
@@ -107,6 +112,14 @@ impl AppConfig {
 
     pub fn clamp_connection_pool_size(size: u32) -> u32 {
         size.clamp(MIN_CONNECTION_POOL_SIZE, MAX_CONNECTION_POOL_SIZE)
+    }
+
+    pub fn clamp_ui_scale_percent(percent: u32) -> u32 {
+        percent.clamp(MIN_UI_SCALE_PERCENT, MAX_UI_SCALE_PERCENT)
+    }
+
+    pub fn normalized_ui_scale_percent(&self) -> u32 {
+        Self::clamp_ui_scale_percent(self.ui_scale_percent)
     }
 
     pub fn normalized_connection_pool_size(&self) -> u32 {
@@ -589,6 +602,13 @@ mod tests {
     }
 
     #[test]
+    fn app_config_clamps_ui_scale_to_supported_range() {
+        assert_eq!(AppConfig::clamp_ui_scale_percent(0), 50);
+        assert_eq!(AppConfig::clamp_ui_scale_percent(100), 100);
+        assert_eq!(AppConfig::clamp_ui_scale_percent(999), 300);
+    }
+
+    #[test]
     fn app_config_clamps_lazy_fetch_batch_size_to_supported_range() {
         assert_eq!(AppConfig::clamp_lazy_fetch_batch_size(0), 1);
         assert_eq!(AppConfig::clamp_lazy_fetch_batch_size(100), 100);
@@ -652,6 +672,7 @@ mod tests {
             restored.connection_pool_size,
             super::DEFAULT_CONNECTION_POOL_SIZE
         );
+        assert_eq!(restored.ui_scale_percent, super::DEFAULT_UI_SCALE_PERCENT);
         assert_eq!(
             restored.lazy_fetch_batch_size,
             super::DEFAULT_LAZY_FETCH_BATCH_SIZE

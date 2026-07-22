@@ -65378,6 +65378,23 @@ fn mysql_family_select_modifiers_continue_until_projection_starts() {
     }
 }
 
+#[test]
+fn select_start_production_suggestions_include_distinct_for_every_database() {
+    use crate::db::DatabaseType::{MariaDB, MySQL, Oracle};
+
+    for db in [Oracle, MySQL, MariaDB] {
+        for sql in ["SELECT |", "SELECT | FROM emp"] {
+            let suggestions = query_keyword_completion_suggestions(sql, db);
+            assert!(
+                suggestions
+                    .iter()
+                    .any(|suggestion| suggestion.eq_ignore_ascii_case("DISTINCT")),
+                "DISTINCT missing from production suggestions at `{sql}` for {db:?}: {suggestions:?}"
+            );
+        }
+    }
+}
+
 /// `FROM` in the select list is gated on a *top-level* `SELECT`: a `SELECT` buried
 /// in a sub-paren (a CTE body, a scalar subquery) does not put the cursor in a
 /// projection, so `WITH c AS (SELECT …) … |` (in the WITH clause) must not offer
@@ -92413,6 +92430,53 @@ fn plsql_end_space_auto_trigger_is_slot_precise() {
         44,
         Some(crate::db::DatabaseType::MySQL),
     ));
+}
+
+#[test]
+fn select_space_auto_trigger_is_query_slot_precise_for_every_database() {
+    use crate::db::DatabaseType::{MariaDB, MySQL, Oracle};
+
+    let context_window_bytes = default_intellisense_test_context_window_bytes();
+    let (lookbehind_bytes, lookahead_bytes) =
+        SqlEditorWidget::intellisense_context_lookaround(context_window_bytes);
+    let applies = |script: &str, db| {
+        let cursor = script.find('|').expect("cursor");
+        let text = script.replace('|', "");
+        let start = cursor.saturating_sub(lookbehind_bytes);
+        let end = cursor.saturating_add(lookahead_bytes).min(text.len());
+        SqlEditorWidget::select_modifier_space_auto_trigger_applies_in_text(
+            text.get(start..end).unwrap_or(""),
+            cursor.saturating_sub(start),
+            Some(db),
+        )
+    };
+
+    for db in [Oracle, MySQL, MariaDB] {
+        for script in [
+            "SELECT |",
+            "select |",
+            "SELECT * FROM emp UNION SELECT |",
+            "INSERT INTO emp SELECT |",
+            "WITH e AS (SELECT 1 FROM emp) SELECT | FROM e",
+        ] {
+            assert!(
+                applies(script, db),
+                "SELECT-space auto-trigger missing at `{script}` for {db:?}"
+            );
+        }
+
+        for script in [
+            "GRANT SELECT | ON emp TO scott",
+            "SELECTED |",
+            "SELECT empno | FROM emp",
+            "SELECT 'SELECT |' FROM emp",
+        ] {
+            assert!(
+                !applies(script, db),
+                "SELECT-space auto-trigger leaked at `{script}` for {db:?}"
+            );
+        }
+    }
 }
 
 #[test]

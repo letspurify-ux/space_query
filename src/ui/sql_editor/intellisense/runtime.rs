@@ -1643,8 +1643,26 @@ impl SqlEditorWidget {
                             } else {
                                 false
                             };
+                            let select_modifier_auto_trigger = if auto_trigger_base {
+                                let shadow = text_shadow_for_handle
+                                    .lock()
+                                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                                let (text, _, relative_cursor) = shadow.bounded_text_around(
+                                    cursor,
+                                    context_lookbehind,
+                                    context_lookahead,
+                                );
+                                Self::select_modifier_space_auto_trigger_applies_in_text(
+                                    &text,
+                                    relative_cursor,
+                                    db_type,
+                                )
+                            } else {
+                                false
+                            };
                             if end_slot_auto_trigger
                                 || execute_immediate_tail_auto_trigger
+                                || select_modifier_auto_trigger
                                 || Self::should_auto_trigger_intellisense_for_forced_char(
                                     &word,
                                     qualifier.as_deref(),

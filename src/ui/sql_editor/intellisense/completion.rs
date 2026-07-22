@@ -37991,6 +37991,10 @@ impl SqlEditorWidget {
     /// Cheap pre-check for the `END `-space auto-trigger: the characters right
     /// before the cursor, past any whitespace, form the bare word `END`.
     fn cursor_follows_end_keyword_word_in_text(text: &str, cursor: usize) -> bool {
+        Self::cursor_follows_keyword_word_in_text(text, cursor, "END")
+    }
+
+    fn cursor_follows_keyword_word_in_text(text: &str, cursor: usize, keyword: &str) -> bool {
         let head = match text.get(..cursor.min(text.len())) {
             Some(head) => head,
             None => return false,
@@ -38002,7 +38006,44 @@ impl SqlEditorWidget {
             .unwrap_or(0);
         trimmed
             .get(word_start..)
-            .is_some_and(|word| word.eq_ignore_ascii_case("END"))
+            .is_some_and(|word| word.eq_ignore_ascii_case(keyword))
+    }
+
+    /// Whether typing a space after a query `SELECT` should auto-open the popup
+    /// for select modifiers such as `DISTINCT`. The phase check excludes other
+    /// uses of the word, including `GRANT SELECT` privilege lists.
+    fn select_modifier_space_auto_trigger_applies_in_text(
+        full_text: &str,
+        cursor: usize,
+        db_type: Option<crate::db::DatabaseType>,
+    ) -> bool {
+        if !Self::cursor_follows_keyword_word_in_text(full_text, cursor, "SELECT") {
+            return false;
+        }
+
+        let cursor = Self::clamp_to_char_boundary_local(full_text, cursor.min(full_text.len()));
+        let bounded = BoundedIntellisenseParseText {
+            text: full_text.to_string().into(),
+            start: 0,
+            cursor_pos: cursor,
+        };
+        let expanded = Self::expanded_statement_window_in_bounded_text_for_db_type(&bounded, db_type);
+        let spans = super::query_text::tokenize_sql_spanned(&expanded.text);
+        if spans.iter().any(|span| {
+            span.start < expanded.cursor_in_statement
+                && expanded.cursor_in_statement < span.end
+                && matches!(span.token, SqlToken::String(_) | SqlToken::Comment(_))
+        }) {
+            return false;
+        }
+        let split_idx = spans.partition_point(|span| span.end <= expanded.cursor_in_statement);
+        let tokens = spans
+            .into_iter()
+            .map(|span| span.token)
+            .collect::<Vec<_>>();
+        let context = intellisense_context::analyze_cursor_context(&tokens, split_idx);
+
+        matches!(context.phase, intellisense_context::SqlPhase::SelectList)
     }
 
     /// Whether typing a space after `END` should auto-open the popup: the slot
