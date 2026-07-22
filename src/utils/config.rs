@@ -271,7 +271,10 @@ impl AppConfig {
 
     pub fn runtime() -> Self {
         RUNTIME_CONFIG
-            .get_or_init(|| RwLock::new(Self::load()))
+            // Runtime consumers must never perform disk I/O. Application and
+            // window bootstrap load the persisted config, then publish it via
+            // `update_runtime`; the default only covers isolated/test widgets.
+            .get_or_init(|| RwLock::new(Self::new()))
             .read()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .clone()
