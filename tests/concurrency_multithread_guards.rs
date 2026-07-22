@@ -2107,6 +2107,14 @@ fn intellisense_pointer_paths_remain_debounced_and_nonblocking() {
     assert!(pointer_handler.contains("if ev == Event::Released"));
     assert!(!pointer_handler.contains("matches!(ev, Event::Drag"));
 
+    let wheel_end = runtime[pointer_end..]
+        .find("Event::Push =>")
+        .map(|offset| pointer_end + offset)
+        .expect("mouse push handler should follow mouse wheel handler");
+    let wheel_handler = &runtime[pointer_end..wheel_end];
+    assert!(wheel_handler.contains("widget_for_shortcuts.hide_intellisense_popup()"));
+    assert!(wheel_handler.contains("widget_for_shortcuts.dismiss_signature_popup()"));
+
     let highlighting = read_source("src/ui/sql_editor/highlighting.rs");
     let db_type_start = highlighting
         .find("pub fn set_db_type(&self, db_type:")

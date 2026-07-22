@@ -682,6 +682,8 @@ impl SqlEditorWidget {
                     false
                 }
                 Event::MouseWheel => {
+                    widget_for_shortcuts.hide_intellisense_popup();
+                    widget_for_shortcuts.dismiss_signature_popup();
                     widget_for_shortcuts.schedule_deferred_visible_semantic_rehighlight();
                     false
                 }
