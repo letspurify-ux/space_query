@@ -9660,6 +9660,22 @@ fn popup_unfocus_hide_waits_for_focus_and_show_transition_to_settle() {
 }
 
 #[test]
+fn signature_popup_unfocus_hide_is_deferred_only_while_a_popup_is_being_shown() {
+    assert!(!SqlEditorWidget::should_defer_signature_unfocus_hide(
+        IntellisensePopupTransitionState::Idle,
+        IntellisensePopupTransitionState::Idle,
+    ));
+    assert!(SqlEditorWidget::should_defer_signature_unfocus_hide(
+        IntellisensePopupTransitionState::Showing,
+        IntellisensePopupTransitionState::Idle,
+    ));
+    assert!(SqlEditorWidget::should_defer_signature_unfocus_hide(
+        IntellisensePopupTransitionState::Idle,
+        IntellisensePopupTransitionState::Showing,
+    ));
+}
+
+#[test]
 fn popup_hides_never_block_on_a_busy_mutex() {
     assert!(SqlEditorWidget::can_try_hide_intellisense_popup(
         IntellisensePopupTransitionState::Idle

@@ -610,6 +610,10 @@ impl IntellisenseRuntimeState {
         store_popup_transition_state(&self.signature_popup_show_in_progress, state);
     }
 
+    pub(crate) fn signature_popup_transition_state(&self) -> IntellisensePopupTransitionState {
+        load_popup_transition_state(&self.signature_popup_show_in_progress)
+    }
+
     pub(crate) fn next_signature_popup_request_generation(&self) -> u64 {
         self.signature_popup_request_generation
             .fetch_add(1, Ordering::AcqRel)

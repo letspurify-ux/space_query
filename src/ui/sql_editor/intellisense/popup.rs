@@ -391,6 +391,29 @@ impl SqlEditorWidget {
         self.schedule_deferred_signature_unfocus_hide(INTELLISENSE_DEFERRED_HIDE_RETRIES);
     }
 
+    fn should_defer_signature_unfocus_hide(
+        completion_transition: IntellisensePopupTransitionState,
+        signature_transition: IntellisensePopupTransitionState,
+    ) -> bool {
+        matches!(completion_transition, IntellisensePopupTransitionState::Showing)
+            || matches!(signature_transition, IntellisensePopupTransitionState::Showing)
+    }
+
+    /// Match the completion popup's unfocus behavior: close immediately once
+    /// both popup show transitions have settled. A show transition can briefly
+    /// unfocus the editor on macOS, so that case still uses the deferred check.
+    pub(crate) fn hide_signature_popup_on_editor_unfocus(&self) {
+        if Self::should_defer_signature_unfocus_hide(
+            self.intellisense_runtime.popup_transition_state(),
+            self.intellisense_runtime
+                .signature_popup_transition_state(),
+        ) {
+            self.schedule_deferred_signature_unfocus_hide(INTELLISENSE_DEFERRED_HIDE_RETRIES);
+        } else {
+            self.dismiss_signature_popup();
+        }
+    }
+
     /// Hide the signature popup on editor unfocus only when focus actually
     /// left the editor. Showing the completion popup window briefly pulls
     /// focus (macOS key-window flicker), which must not kill the hint; the
