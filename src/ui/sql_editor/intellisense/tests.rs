@@ -34774,6 +34774,7 @@ fn qualified_member_suggestion_details_use_schema_member_kind_metadata() {
         &suggestions,
         &[],
         Some("app"),
+        None,
         Some(Oracle),
     );
 
@@ -37218,6 +37219,43 @@ fn has_data_type_keyword(values: &[String]) -> bool {
                 | "SYS_REFCURSOR"
         )
     })
+}
+
+#[test]
+fn suggested_data_types_have_keyword_popup_details_for_every_database() {
+    use crate::db::DatabaseType::{MariaDB, MySQL, Oracle};
+
+    let data = IntellisenseData::new();
+    for db_type in [Oracle, MySQL, MariaDB] {
+        for position in [
+            DataTypePosition::Cast,
+            DataTypePosition::ColumnDef,
+            DataTypePosition::Plsql,
+            DataTypePosition::ToolVariable,
+        ] {
+            let suggestions = data_type_keywords_for(Some(db_type), position)
+                .iter()
+                .map(|value| (*value).to_string())
+                .collect::<Vec<_>>();
+            let details = SqlEditorWidget::build_suggestion_details(
+                &data,
+                &suggestions,
+                &[],
+                None,
+                Some(position),
+                Some(db_type),
+            );
+            for suggestion in &suggestions {
+                assert_eq!(
+                    details
+                        .get(suggestion)
+                        .map(|detail| detail.type_text.as_str()),
+                    Some("KEYWORD"),
+                    "{suggestion} should have a keyword popup detail at {position:?} for {db_type:?}"
+                );
+            }
+        }
+    }
 }
 
 #[test]

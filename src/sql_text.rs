@@ -599,6 +599,7 @@ pub const ORACLE_SQL_KEYWORDS: &[&str] = &[
     "VALIDATE",
     "VALUES",
     "VAR",
+    "VARCHAR",
     "VARCHAR2",
     "VARIABLE",
     "VARRAY",

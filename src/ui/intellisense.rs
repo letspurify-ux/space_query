@@ -5803,6 +5803,10 @@ mod intellisense_tests {
             Some("KEYWORD")
         );
         assert_eq!(
+            data.suggestion_type_label("VARCHAR", oracle),
+            Some("KEYWORD")
+        );
+        assert_eq!(
             data.suggestion_type_label("COUNT()", oracle),
             Some("FUNCTION")
         );

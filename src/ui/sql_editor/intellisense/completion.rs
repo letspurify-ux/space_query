@@ -295,6 +295,7 @@ enum IntellisenseCompletionComputation {
 struct IntellisenseComputedSuggestions {
     suggestions: Vec<String>,
     column_tables: Vec<String>,
+    data_type_position: Option<DataTypePosition>,
     should_refresh_when_columns_ready: bool,
 }
 
@@ -2918,6 +2919,7 @@ impl SqlEditorWidget {
         let IntellisenseComputedSuggestions {
             suggestions,
             column_tables,
+            data_type_position,
             ..
         } = computed;
 
@@ -2959,6 +2961,7 @@ impl SqlEditorWidget {
                 &suggestions,
                 &column_tables,
                 snapshot.qualifier.as_deref(),
+                data_type_position,
                 Some(snapshot.preferred_db_type),
             )
         };
@@ -5760,6 +5763,7 @@ impl SqlEditorWidget {
         IntellisenseCompletionComputation::Computed(IntellisenseComputedSuggestions {
             suggestions,
             column_tables,
+            data_type_position,
             should_refresh_when_columns_ready,
         })
     }
@@ -59372,13 +59376,15 @@ impl SqlEditorWidget {
     /// badge column). Column entries carry their data type and constraint
     /// badges; every other entry (table, view, keyword, …) gets a type label
     /// via qualifier member metadata first, then
-    /// [`IntellisenseData::suggestion_type_label`]. Column details take precedence
-    /// over object-store labels for a shared name.
+    /// [`IntellisenseData::suggestion_type_label`]. Dialect-specific data types
+    /// that are not general language keywords get a contextual keyword label.
+    /// Column details take precedence over object-store labels for a shared name.
     fn build_suggestion_details(
         data: &IntellisenseData,
         suggestions: &[String],
         column_tables: &[String],
         qualifier: Option<&str>,
+        data_type_position: Option<DataTypePosition>,
         db_type: Option<crate::db::DatabaseType>,
     ) -> HashMap<String, SuggestionDetail> {
         let mut details = Self::build_column_descriptions(data, column_tables);
@@ -59389,7 +59395,15 @@ impl SqlEditorWidget {
             }
             let label = qualifier
                 .and_then(|qualifier| data.qualifier_member_type_label(qualifier, suggestion))
-                .or_else(|| data.suggestion_type_label(suggestion, db_type));
+                .or_else(|| data.suggestion_type_label(suggestion, db_type))
+                .or_else(|| {
+                    data_type_position.and_then(|position| {
+                        data_type_keywords_for(db_type, position)
+                            .iter()
+                            .any(|keyword| suggestion.eq_ignore_ascii_case(keyword))
+                            .then_some("KEYWORD")
+                    })
+                });
             if let Some(label) = label {
                 details.insert(
                     key,
