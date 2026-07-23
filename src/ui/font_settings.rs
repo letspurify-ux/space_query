@@ -136,6 +136,9 @@ impl FontCatalog {
             .filter_map(|(index, raw_name)| {
                 let (display_name, style) =
                     parse_raw_font_name(&raw_name, &regular_prefixed_names)?;
+                if display_name.starts_with('@') {
+                    return None;
+                }
                 Some(FontCatalogEntry {
                     display_name,
                     raw_name,
@@ -424,6 +427,24 @@ mod tests {
                 .map(|entry| entry.display_name.as_str()),
             Some("PTMono-Regular")
         );
+    }
+
+    #[test]
+    fn catalog_excludes_vertical_font_names() {
+        let catalog = FontCatalog::from_raw_names(vec![
+            "slot-zero".to_string(),
+            " @Malgun Gothic".to_string(),
+            "B@Malgun Gothic".to_string(),
+            " @맑은 고딕".to_string(),
+            "@Vertical Face".to_string(),
+            " Consolas".to_string(),
+        ]);
+
+        assert!(catalog
+            .entries
+            .iter()
+            .all(|entry| !entry.display_name.starts_with('@')));
+        assert!(catalog.entry_by_name("Consolas").is_some());
     }
 
     #[test]
