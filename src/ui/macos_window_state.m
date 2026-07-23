@@ -44,6 +44,14 @@ int space_query_macos_window_is_zoomed(void *raw_window) {
   return [(NSWindow *)raw_window isZoomed] ? 1 : 0;
 }
 
+int space_query_macos_window_is_fullscreen(void *raw_window) {
+  if (raw_window == NULL) {
+    return 0;
+  }
+  NSWindow *window = (NSWindow *)raw_window;
+  return ([window styleMask] & NSWindowStyleMaskFullScreen) != 0 ? 1 : 0;
+}
+
 int space_query_macos_set_window_zoomed(void *raw_window, int zoomed) {
   if (raw_window == NULL) {
     return 0;

@@ -51,6 +51,10 @@ const RESULT_ONE_TAB_PER_QUERY_LABEL: &str = " One tab per query";
 const RESULT_CHECKBOX_GROUP_GAP: i32 = TOOLBAR_SPACING;
 const UI_SCALE_BUTTON_WIDTH: i32 = 32;
 const UI_SCALE_EPSILON: f32 = 0.01;
+#[cfg(target_os = "macos")]
+const MACOS_FULLSCREEN_EXIT_POLL_SECONDS: f64 = 0.05;
+#[cfg(target_os = "macos")]
+const MACOS_FULLSCREEN_EXIT_POLL_RETRIES: u8 = 100;
 const APPLICATION_EXIT_POLL_SECONDS: f64 = 0.2;
 // Once the user chose Cancel and Exit, a stuck database worker must not keep
 // FLTK's event loop alive indefinitely.
@@ -8384,6 +8388,69 @@ impl MainWindow {
             .or_else(|| Self::zoom_shortcut_for_key(event_original_key, event_state))
     }
 
+    #[cfg(target_os = "macos")]
+    fn defer_ui_scale_until_fullscreen_exit(state: &Arc<Mutex<AppState>>, window: &Window) -> bool {
+        if !window.shown() {
+            return false;
+        }
+
+        let fullscreen_active = window.fullscreen_active();
+        let native_fullscreen = crate::ui::macos_window_state::is_fullscreen(window.raw_handle());
+        if !fullscreen_active && !native_fullscreen {
+            return false;
+        }
+
+        if fullscreen_active {
+            let mut window = window.clone();
+            window.fullscreen(false);
+        }
+        Self::schedule_ui_scale_after_fullscreen_exit(
+            Arc::downgrade(state),
+            MACOS_FULLSCREEN_EXIT_POLL_RETRIES,
+        );
+        true
+    }
+
+    #[cfg(target_os = "macos")]
+    fn schedule_ui_scale_after_fullscreen_exit(
+        weak_state: std::sync::Weak<Mutex<AppState>>,
+        retries_remaining: u8,
+    ) {
+        crate::ui::ui_timeout::schedule(MACOS_FULLSCREEN_EXIT_POLL_SECONDS, move || {
+            let Some(state) = weak_state.upgrade() else {
+                return;
+            };
+            let window = state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .window
+                .clone();
+            if !window.shown() {
+                return;
+            }
+
+            let fullscreen_active = window.fullscreen_active();
+            let native_fullscreen =
+                crate::ui::macos_window_state::is_fullscreen(window.raw_handle());
+            if fullscreen_active || native_fullscreen {
+                if retries_remaining == 0 {
+                    crate::utils::logging::log_warning(
+                        "ui_scale",
+                        "Timed out waiting for the macOS fullscreen transition; scale change was not applied",
+                    );
+                    return;
+                }
+                Self::schedule_ui_scale_after_fullscreen_exit(
+                    Arc::downgrade(&state),
+                    retries_remaining - 1,
+                );
+                return;
+            }
+
+            Self::apply_configured_ui_scale(&state);
+        });
+    }
+
     fn set_screen_scale_preserving_window_frame(
         screen: i32,
         new_scale: f32,
@@ -8402,43 +8469,41 @@ impl MainWindow {
 
         #[cfg(target_os = "macos")]
         if affects_all_screens {
-            // FLTK resizes mapped NSWindows before returning and does not
-            // special-case zoomed windows. Preserve the exact AppKit frame in
-            // the normal state, then restore the zoom state after scaling.
-            if let Some(window) =
-                window.filter(|window| window.shown() && !window.fullscreen_active())
-            {
+            // FLTK resizes mapped NSWindows before returning. Keep the normal
+            // AppKit frame exact while updating FLTK's matching geometry.
+            if let Some(window) = window.filter(|window| window.shown()) {
                 let raw_window = window.raw_handle();
-                if let Some(initial_frame) =
-                    crate::ui::macos_window_state::capture_frame(raw_window)
+                if window.fullscreen_active()
+                    || crate::ui::macos_window_state::is_fullscreen(raw_window)
                 {
-                    let was_zoomed = crate::ui::macos_window_state::is_zoomed(raw_window);
-                    if !was_zoomed || crate::ui::macos_window_state::set_zoomed(raw_window, false) {
-                        let preserved_frame = if was_zoomed {
-                            crate::ui::macos_window_state::capture_frame(raw_window)
-                                .unwrap_or(initial_frame)
-                        } else {
-                            initial_frame
-                        };
-                        let geometry = (window.x(), window.y(), window.w(), window.h());
-
-                        app::set_screen_scale(screen, new_scale);
-
-                        let (x, y, width, height) = window_geometry_after_ui_scale(
-                            geometry.0, geometry.1, geometry.2, geometry.3, old_scale, new_scale,
-                        );
-                        let mut window = window.clone();
-                        window.resize(x, y, width, height);
-                        let _ = crate::ui::macos_window_state::restore_frame(
-                            raw_window,
-                            preserved_frame,
-                        );
-                        if was_zoomed {
-                            let _ = crate::ui::macos_window_state::set_zoomed(raw_window, true);
-                        }
-                        return true;
-                    }
+                    return false;
                 }
+
+                if window.maximize_active() {
+                    let mut window = window.clone();
+                    window.un_maximize();
+                }
+                if crate::ui::macos_window_state::is_zoomed(raw_window)
+                    && !crate::ui::macos_window_state::set_zoomed(raw_window, false)
+                {
+                    return false;
+                }
+                let Some(preserved_frame) =
+                    crate::ui::macos_window_state::capture_frame(raw_window)
+                else {
+                    return false;
+                };
+                let geometry = (window.x(), window.y(), window.w(), window.h());
+
+                app::set_screen_scale(screen, new_scale);
+
+                let (x, y, width, height) = window_geometry_after_ui_scale(
+                    geometry.0, geometry.1, geometry.2, geometry.3, old_scale, new_scale,
+                );
+                let mut window = window.clone();
+                window.resize(x, y, width, height);
+                let _ = crate::ui::macos_window_state::restore_frame(raw_window, preserved_frame);
+                return true;
             }
         }
 
@@ -8550,6 +8615,11 @@ impl MainWindow {
         }
         drop(config);
 
+        #[cfg(target_os = "macos")]
+        if Self::defer_ui_scale_until_fullscreen_exit(state, &window) {
+            return true;
+        }
+
         if Self::apply_ui_scale_percent(&scale_bases, percent, Some(&window)) {
             // Screen-scale changes can report their final logical window size
             // after the current event. Recheck once that geometry has settled;
@@ -8587,6 +8657,10 @@ impl MainWindow {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .normalized_ui_scale_percent();
+        #[cfg(target_os = "macos")]
+        if Self::defer_ui_scale_until_fullscreen_exit(state, &window) {
+            return;
+        }
         if Self::apply_ui_scale_percent(&scale_bases, percent, Some(&window)) {
             Self::schedule_tab_strip_refresh_after_scale(state);
         }

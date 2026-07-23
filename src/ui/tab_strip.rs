@@ -8,6 +8,8 @@ use fltk::{
     prelude::*,
 };
 
+use crate::utils::arithmetic::safe_div;
+
 // These values mirror Fl_Tabs.cxx in FLTK 1.5.x.
 const FLTK_TABS_BORDER: i32 = 2;
 const FLTK_TABS_OVERFLOW_BUTTON_BORDER: i32 = 2;
@@ -171,7 +173,7 @@ fn point_is_in_pulldown_button(
 
 fn tab_width(label_width: i32, tabs_label_size: i32, closeable: bool) -> i32 {
     let close_width = if closeable {
-        tabs_label_size.max(0) / 2 + FLTK_TABS_CLOSE_EXTRA_GAP
+        safe_div(tabs_label_size.max(0), 2) + FLTK_TABS_CLOSE_EXTRA_GAP
     } else {
         0
     };

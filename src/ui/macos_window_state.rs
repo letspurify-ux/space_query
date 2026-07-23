@@ -19,6 +19,7 @@ unsafe extern "C" {
         frame: *const NativeWindowFrame,
     ) -> i32;
     fn space_query_macos_window_is_zoomed(raw_window: *mut c_void) -> i32;
+    fn space_query_macos_window_is_fullscreen(raw_window: *mut c_void) -> i32;
     fn space_query_macos_set_window_zoomed(raw_window: *mut c_void, zoomed: i32) -> i32;
 }
 
@@ -57,6 +58,11 @@ pub(crate) fn restore_frame(raw_window: *mut c_void, frame: NativeWindowFrame) -
 pub(crate) fn is_zoomed(raw_window: *mut c_void) -> bool {
     // SAFETY: The caller passes FLTK's live NSWindow handle on the main thread.
     unsafe { space_query_macos_window_is_zoomed(raw_window) != 0 }
+}
+
+pub(crate) fn is_fullscreen(raw_window: *mut c_void) -> bool {
+    // SAFETY: The caller passes FLTK's live NSWindow handle on the main thread.
+    unsafe { space_query_macos_window_is_fullscreen(raw_window) != 0 }
 }
 
 pub(crate) fn set_zoomed(raw_window: *mut c_void, zoomed: bool) -> bool {
