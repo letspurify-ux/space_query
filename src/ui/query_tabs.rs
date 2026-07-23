@@ -196,30 +196,27 @@ impl QueryTabsWidget {
         tabs: &mut Tabs,
         tab_strip_state: &Arc<Mutex<tab_strip::TabStripState>>,
     ) {
-        let mut state = tab_strip_state
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        tab_strip::sync_overflow_mode(tabs, &mut state, TAB_HEADER_HEIGHT);
+        let _ = tab_strip::try_with_state(tab_strip_state, |state| {
+            tab_strip::sync_overflow_mode(tabs, state, TAB_HEADER_HEIGHT);
+        });
     }
 
     fn record_tab_strip_selection_for(
         tabs: &mut Tabs,
         tab_strip_state: &Arc<Mutex<tab_strip::TabStripState>>,
     ) {
-        let mut state = tab_strip_state
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        tab_strip::record_selected_tab(tabs, &mut state, TAB_HEADER_HEIGHT);
+        let _ = tab_strip::try_with_state(tab_strip_state, |state| {
+            tab_strip::record_selected_tab(tabs, state, TAB_HEADER_HEIGHT);
+        });
     }
 
     fn record_tab_strip_removal_for(
         group: &Group,
         tab_strip_state: &Arc<Mutex<tab_strip::TabStripState>>,
     ) {
-        let mut state = tab_strip_state
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        tab_strip::record_removed_tab(&mut state, group.as_widget_ptr() as usize);
+        let _ = tab_strip::try_with_state(tab_strip_state, |state| {
+            tab_strip::record_removed_tab(state, group.as_widget_ptr() as usize);
+        });
     }
 
     fn sync_tab_strip_overflow_mode(&mut self) {
@@ -323,41 +320,44 @@ impl QueryTabsWidget {
                     | Event::Hide
                     | Event::MouseWheel
             ) {
-                let mut state = tab_strip_state_for_handle
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner());
-                let mut gesture = tab_strip_pointer_gesture
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner());
-                if tab_strip::handle_pointer_event(
-                    tabs,
-                    ev,
-                    &mut state,
-                    &mut gesture,
-                    TAB_HEADER_HEIGHT,
-                ) {
+                let handled = tab_strip::try_with_state(&tab_strip_state_for_handle, |state| {
+                    let mut gesture = tab_strip_pointer_gesture
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    tab_strip::handle_pointer_event(
+                        tabs,
+                        ev,
+                        state,
+                        &mut gesture,
+                        TAB_HEADER_HEIGHT,
+                    )
+                });
+                if handled == Some(true)
+                    || (handled.is_none()
+                        && ev == Event::MouseWheel
+                        && tab_strip::should_consume_mouse_wheel_for_tabs(tabs, TAB_HEADER_HEIGHT))
+                {
                     return true;
                 }
             }
             if Self::should_suppress_pointer_event(&suppress_pointer_for_cb, ev) {
                 return true;
             }
-            if ev == Event::Push {
-                let mut state = tab_strip_state_for_handle
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner());
-                let mut gesture = tab_strip_pointer_gesture
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner());
-                if tab_strip::handle_pointer_event(
-                    tabs,
-                    ev,
-                    &mut state,
-                    &mut gesture,
-                    TAB_HEADER_HEIGHT,
-                ) {
-                    return true;
-                }
+            if ev == Event::Push
+                && tab_strip::try_with_state(&tab_strip_state_for_handle, |state| {
+                    let mut gesture = tab_strip_pointer_gesture
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    tab_strip::handle_pointer_event(
+                        tabs,
+                        ev,
+                        state,
+                        &mut gesture,
+                        TAB_HEADER_HEIGHT,
+                    )
+                }) == Some(true)
+            {
+                return true;
             }
             false
         });

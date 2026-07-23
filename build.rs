@@ -233,6 +233,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let target_os = env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
 
+    if target_os == "macos" {
+        println!("cargo:rerun-if-changed=src/ui/macos_window_state.m");
+        cc::Build::new()
+            .file("src/ui/macos_window_state.m")
+            .warnings(false)
+            .compile("space_query_macos_window_state");
+        println!("cargo:rustc-link-lib=framework=AppKit");
+    }
+
     if target_os == "linux" {
         let out_dir = env::var("OUT_DIR")?;
         let out_path = Path::new(&out_dir).to_path_buf();

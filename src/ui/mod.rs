@@ -8,6 +8,8 @@ pub mod font_settings;
 pub mod intellisense;
 pub mod intellisense_context;
 pub mod log_viewer;
+#[cfg(target_os = "macos")]
+pub(crate) mod macos_window_state;
 pub mod main_window;
 pub mod menu;
 pub mod object_browser;

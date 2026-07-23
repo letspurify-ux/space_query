@@ -1,4 +1,5 @@
 use std::collections::HashSet;
+use std::sync::{Mutex, TryLockError};
 
 use fltk::{
     app, draw,
@@ -66,6 +67,20 @@ pub(crate) struct TabStripState {
 pub(crate) struct TabStripPointerGesture {
     active: bool,
     dragged: bool,
+}
+
+pub(crate) fn try_with_state<R>(
+    shared: &Mutex<TabStripState>,
+    f: impl FnOnce(&mut TabStripState) -> R,
+) -> Option<R> {
+    // FLTK can synchronously dispatch focus/visibility events from set_value().
+    // Skip that nested access instead of blocking the UI thread on its own mutex.
+    let mut state = match shared.try_lock() {
+        Ok(state) => state,
+        Err(TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
+        Err(TryLockError::WouldBlock) => return None,
+    };
+    Some(f(&mut state))
 }
 
 fn tab_header_height(tabs: &Tabs, fallback: i32) -> i32 {
@@ -769,9 +784,11 @@ mod tests {
         point_is_in_tab_header, record_removed_tab, replay_tab_offset_anchor,
         rightmost_replay_seed, selected_tab_can_stably_fit, shortcut_label_text,
         should_consume_mouse_wheel, should_use_pulldown, should_use_stable_pulldown, tab_width,
-        AnchoredTabOffset, TabGeometry, TabOffsetAnchor, TabStripGeometry, TabStripState,
+        try_with_state, AnchoredTabOffset, TabGeometry, TabOffsetAnchor, TabStripGeometry,
+        TabStripState,
     };
     use fltk::group::TabsOverflow;
+    use std::sync::Mutex;
 
     fn geometry(available_width: i32, tabs: &[(usize, i32)]) -> TabStripGeometry {
         let mut left = 0;
@@ -818,6 +835,16 @@ mod tests {
             Some(selected_ptr),
             |_| {},
         )
+    }
+
+    #[test]
+    fn nested_tab_strip_state_access_is_skipped_instead_of_blocking() {
+        let shared = Mutex::new(TabStripState::default());
+
+        let nested = try_with_state(&shared, |_| try_with_state(&shared, |_| ()));
+
+        assert_eq!(nested, Some(None));
+        assert!(try_with_state(&shared, |_| ()).is_some());
     }
 
     #[test]

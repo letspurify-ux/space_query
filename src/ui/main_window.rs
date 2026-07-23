@@ -8400,6 +8400,48 @@ impl MainWindow {
             return false;
         }
 
+        #[cfg(target_os = "macos")]
+        if affects_all_screens {
+            // FLTK resizes mapped NSWindows before returning and does not
+            // special-case zoomed windows. Preserve the exact AppKit frame in
+            // the normal state, then restore the zoom state after scaling.
+            if let Some(window) =
+                window.filter(|window| window.shown() && !window.fullscreen_active())
+            {
+                let raw_window = window.raw_handle();
+                if let Some(initial_frame) =
+                    crate::ui::macos_window_state::capture_frame(raw_window)
+                {
+                    let was_zoomed = crate::ui::macos_window_state::is_zoomed(raw_window);
+                    if !was_zoomed || crate::ui::macos_window_state::set_zoomed(raw_window, false) {
+                        let preserved_frame = if was_zoomed {
+                            crate::ui::macos_window_state::capture_frame(raw_window)
+                                .unwrap_or(initial_frame)
+                        } else {
+                            initial_frame
+                        };
+                        let geometry = (window.x(), window.y(), window.w(), window.h());
+
+                        app::set_screen_scale(screen, new_scale);
+
+                        let (x, y, width, height) = window_geometry_after_ui_scale(
+                            geometry.0, geometry.1, geometry.2, geometry.3, old_scale, new_scale,
+                        );
+                        let mut window = window.clone();
+                        window.resize(x, y, width, height);
+                        let _ = crate::ui::macos_window_state::restore_frame(
+                            raw_window,
+                            preserved_frame,
+                        );
+                        if was_zoomed {
+                            let _ = crate::ui::macos_window_state::set_zoomed(raw_window, true);
+                        }
+                        return true;
+                    }
+                }
+            }
+        }
+
         let window_geometry = window.and_then(|window| {
             let window_screen = window.screen_num();
             if window.fullscreen_active()
@@ -8470,11 +8512,14 @@ impl MainWindow {
             let Some(state) = weak_state.upgrade() else {
                 return;
             };
-            let mut state = state
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            state.query_tabs.refresh_tab_strip_overflow_mode();
-            state.result_tabs.refresh_tab_strip_overflow_mode();
+            let (mut query_tabs, mut result_tabs) = {
+                let state = state
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                (state.query_tabs.clone(), state.result_tabs.clone())
+            };
+            query_tabs.refresh_tab_strip_overflow_mode();
+            result_tabs.refresh_tab_strip_overflow_mode();
         });
     }
 
@@ -10166,6 +10211,14 @@ mod tests {
             window_geometry_after_ui_scale(x, y, width, height, 2.0, 1.0),
             (300, 200, 800, 600)
         );
+    }
+
+    #[test]
+    fn fractional_window_geometry_requires_native_frame_restoration() {
+        let (_, _, width, _) = window_geometry_after_ui_scale(0, 0, 104, 100, 1.0, 1.1);
+
+        assert_eq!(width, 95);
+        assert_eq!((f64::from(width) * 1.1).round() as i32, 105);
     }
 
     #[test]
