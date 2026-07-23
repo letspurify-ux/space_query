@@ -46,16 +46,38 @@ impl DelimiterLineStartSnapshot {
     pub(crate) fn frame_state(&self) -> DelimiterFrameState {
         DelimiterFrameState {
             stack: self.visible_frames.clone(),
+            close_generations_by_resulting_depth: None,
         }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct DelimiterBoundary {
+    depth: usize,
+    close_generation_below: u64,
+}
+
+impl DelimiterBoundary {
+    #[inline]
+    pub(crate) fn depth(self) -> usize {
+        self.depth
     }
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub(crate) struct DelimiterFrameState {
     stack: Vec<DelimiterFrameKind>,
+    close_generations_by_resulting_depth: Option<Vec<u64>>,
 }
 
 impl DelimiterFrameState {
+    pub(crate) fn with_boundary_tracking() -> Self {
+        Self {
+            stack: Vec::new(),
+            close_generations_by_resulting_depth: Some(Vec::new()),
+        }
+    }
+
     #[inline]
     pub(crate) fn depth(&self) -> usize {
         self.stack.len()
@@ -67,6 +89,36 @@ impl DelimiterFrameState {
 
     pub(crate) fn innermost_is_bracket(&self) -> bool {
         self.stack.last() == Some(&DelimiterFrameKind::Bracket)
+    }
+
+    pub(crate) fn boundary(&self) -> DelimiterBoundary {
+        let depth = self.depth();
+        let close_generation_below = depth
+            .checked_sub(1)
+            .and_then(|resulting_depth| {
+                self.close_generations_by_resulting_depth
+                    .as_ref()
+                    .and_then(|generations| generations.get(resulting_depth))
+            })
+            .copied()
+            .unwrap_or(0);
+
+        DelimiterBoundary {
+            depth,
+            close_generation_below,
+        }
+    }
+
+    pub(crate) fn has_closed_below(&self, boundary: DelimiterBoundary) -> bool {
+        let Some(resulting_depth) = boundary.depth.checked_sub(1) else {
+            return false;
+        };
+        self.close_generations_by_resulting_depth
+            .as_ref()
+            .and_then(|generations| generations.get(resulting_depth))
+            .copied()
+            .unwrap_or(0)
+            != boundary.close_generation_below
     }
 
     pub(crate) fn apply_token(&mut self, token: &SqlToken) {
@@ -118,6 +170,7 @@ impl DelimiterFrameState {
                 .is_some_and(|top| top == close_kind)
             {
                 let _ = self.stack.pop();
+                self.record_successful_close();
             }
         }
     }
@@ -140,6 +193,7 @@ impl DelimiterFrameState {
                 .is_some_and(|top| top.can_be_closed_by(close_kind))
             {
                 let _ = self.stack.pop();
+                self.record_successful_close();
                 if self.stack.len() < baseline_depth {
                     return true;
                 }
@@ -147,6 +201,21 @@ impl DelimiterFrameState {
         }
 
         false
+    }
+
+    fn record_successful_close(&mut self) {
+        let Some(close_generations_by_resulting_depth) =
+            self.close_generations_by_resulting_depth.as_mut()
+        else {
+            return;
+        };
+        let resulting_depth = self.stack.len();
+        if close_generations_by_resulting_depth.len() <= resulting_depth {
+            close_generations_by_resulting_depth.resize(resulting_depth.saturating_add(1), 0);
+        }
+        if let Some(generation) = close_generations_by_resulting_depth.get_mut(resulting_depth) {
+            *generation = generation.wrapping_add(1);
+        }
     }
 }
 
@@ -191,6 +260,7 @@ pub(crate) fn line_closes_delimiter_frame_below_snapshot_before_token(
 mod tests {
     use super::{
         line_closes_delimiter_frame_below_snapshot_before_token, line_start_snapshot_before_token,
+        DelimiterFrameState,
     };
     use crate::ui::sql_editor::query_text::tokenize_sql;
     use crate::ui::sql_editor::SqlToken;
@@ -241,5 +311,33 @@ mod tests {
         assert!(line_closes_delimiter_frame_below_snapshot_before_token(
             &tokens, 0, comma_idx, &snapshot,
         ));
+    }
+
+    #[test]
+    fn boundary_detects_close_even_when_the_same_depth_reopens() {
+        let mut state = DelimiterFrameState::with_boundary_tracking();
+        state.apply_token(&SqlToken::Symbol("(".to_string()));
+        let boundary = state.boundary();
+
+        state.apply_token(&SqlToken::Symbol(")".to_string()));
+        state.apply_token(&SqlToken::Symbol("(".to_string()));
+
+        assert_eq!(state.depth(), boundary.depth());
+        assert!(state.has_closed_below(boundary));
+    }
+
+    #[test]
+    fn boundary_ignores_inner_and_mismatched_closes() {
+        let mut state = DelimiterFrameState::with_boundary_tracking();
+        state.apply_token(&SqlToken::Symbol("(".to_string()));
+        let boundary = state.boundary();
+
+        state.apply_token(&SqlToken::Symbol("[".to_string()));
+        state.apply_token(&SqlToken::Symbol(")".to_string()));
+        assert!(!state.has_closed_below(boundary));
+
+        state.apply_token(&SqlToken::Symbol("]".to_string()));
+        assert!(!state.has_closed_below(boundary));
+        assert_eq!(state.depth(), boundary.depth());
     }
 }

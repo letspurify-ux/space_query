@@ -1,8 +1,8 @@
 use crate::db::connection::DatabaseType;
 use crate::db::{FormatItem, QueryExecutor, ToolCommand};
 use crate::sql_delimiter::{
-    line_closes_delimiter_frame_below_snapshot_before_token, DelimiterFrameState,
-    DelimiterLineStartSnapshot,
+    line_closes_delimiter_frame_below_snapshot_before_token, DelimiterBoundary,
+    DelimiterFrameState, DelimiterLineStartSnapshot,
 };
 use crate::sql_format::{SqlFormatFrameId, SqlFormatFrameIdAllocator, SqlFormatScopedFrame};
 use crate::sql_text::{
@@ -864,6 +864,89 @@ struct StatementWordLinks {
 impl StatementWordLinks {
     fn prev_word_index(&self, idx: usize) -> Option<usize> {
         self.prev_word_in_statement.get(idx).copied().flatten()
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct RenderedDelimiterBoundary {
+    line_epoch: u64,
+    delimiter: DelimiterBoundary,
+}
+
+#[derive(Default)]
+struct RenderedDelimiterBoundaryTracker {
+    scanned_len: usize,
+    next_line_epoch: u64,
+    current_line: RenderedDelimiterBoundary,
+    boundary_before_trailing_newlines: Option<RenderedDelimiterBoundary>,
+}
+
+impl RenderedDelimiterBoundaryTracker {
+    fn new(delimiter: DelimiterBoundary) -> Self {
+        Self {
+            current_line: RenderedDelimiterBoundary {
+                line_epoch: 0,
+                delimiter,
+            },
+            ..Self::default()
+        }
+    }
+
+    fn sync(&mut self, out: &str, delimiter_state: &DelimiterFrameState) {
+        if out.len() < self.scanned_len {
+            // Renderer truncations that are not explicit line joins remove only
+            // trailing indentation or spaces, so the physical-line boundary is
+            // unchanged.
+            self.scanned_len = out.len();
+        }
+        if self.scanned_len >= out.len() {
+            return;
+        }
+
+        let delimiter = delimiter_state.boundary();
+        let Some(suffix) = out.get(self.scanned_len..) else {
+            self.scanned_len = out.len();
+            return;
+        };
+        for byte in suffix.bytes() {
+            match byte {
+                b'\n' => {
+                    if self.boundary_before_trailing_newlines.is_none() {
+                        self.boundary_before_trailing_newlines = Some(self.current_line);
+                    }
+                    self.next_line_epoch = self.next_line_epoch.wrapping_add(1);
+                    self.current_line = RenderedDelimiterBoundary {
+                        line_epoch: self.next_line_epoch,
+                        delimiter,
+                    };
+                }
+                b' ' | b'\t' | b'\r' => {}
+                _ => {
+                    self.boundary_before_trailing_newlines = None;
+                }
+            }
+        }
+        self.scanned_len = out.len();
+    }
+
+    fn current_line(&self) -> RenderedDelimiterBoundary {
+        self.current_line
+    }
+
+    fn current_position(&self, delimiter_state: &DelimiterFrameState) -> RenderedDelimiterBoundary {
+        RenderedDelimiterBoundary {
+            line_epoch: self.current_line.line_epoch,
+            delimiter: delimiter_state.boundary(),
+        }
+    }
+
+    fn restore_after_trailing_newline_join(&mut self, out: &str) {
+        self.scanned_len = out.len();
+        if !out.ends_with('\n') {
+            if let Some(boundary) = self.boundary_before_trailing_newlines.take() {
+                self.current_line = boundary;
+            }
+        }
     }
 }
 
@@ -1858,6 +1941,7 @@ struct ParenStackFrame {
     frame: ParenFormatFrame,
     first_body_token_idx: Option<usize>,
     direct_list_body: bool,
+    rendered_boundary: RenderedDelimiterBoundary,
     semantic_flags: ParenSemanticFlags,
     structured_table_function_columns_started: bool,
     previous_active_paren_metrics: ActiveParenMetrics,
@@ -2431,6 +2515,7 @@ struct ListOwnerFrame {
     scope: FormatScope,
     kind: ListOwnerKind,
     depth: usize,
+    rendered_boundary: RenderedDelimiterBoundary,
     first_body_start_token_idx: Option<usize>,
     first_body_token_idx: Option<usize>,
 }
@@ -3307,6 +3392,7 @@ struct FormatFrameStack {
     frames: Vec<FormatFrame>,
     paren_depth: usize,
     block_depth: usize,
+    current_rendered_boundary: RenderedDelimiterBoundary,
     active_paren_metrics: ActiveParenMetrics,
     current_runtime_state: FormatRuntimeState,
     last_paren_frame_id_cache: Option<SqlFormatFrameId>,
@@ -3342,6 +3428,7 @@ impl Default for FormatFrameStack {
             frames: Vec::new(),
             paren_depth: 0,
             block_depth: 0,
+            current_rendered_boundary: RenderedDelimiterBoundary::default(),
             active_paren_metrics: ActiveParenMetrics::default(),
             current_runtime_state: FormatRuntimeState::default(),
             last_paren_frame_id_cache: None,
@@ -3374,6 +3461,16 @@ impl Default for FormatFrameStack {
 }
 
 impl FormatFrameStack {
+    fn set_current_rendered_boundary(&mut self, boundary: RenderedDelimiterBoundary) {
+        self.current_rendered_boundary = boundary;
+    }
+
+    fn direct_list_rendered_boundary(&self) -> Option<RenderedDelimiterBoundary> {
+        self.last_paren_stack_frame()
+            .filter(|frame| frame.direct_list_body && !frame.frame.is_query_like())
+            .map(|frame| frame.rendered_boundary)
+    }
+
     #[cfg(test)]
     fn managed_frame_kind(frame: &FormatFrame) -> Option<FormatManagedFrameKind> {
         match frame {
@@ -3639,11 +3736,13 @@ impl FormatFrameStack {
             }
             start_idx
         });
+        let rendered_boundary = self.current_rendered_boundary;
         self.push_frame(FormatFrame::ListOwner(ListOwnerFrame {
             id: frame_id,
             scope,
             kind,
             depth,
+            rendered_boundary,
             first_body_start_token_idx,
             first_body_token_idx,
         }));
@@ -3666,17 +3765,17 @@ impl FormatFrameStack {
         );
     }
 
-    fn list_owner_for_clause(
+    fn find_list_owner_for_clause(
         &self,
         scope: FormatScope,
         clause: Option<&str>,
-    ) -> Option<(SqlFormatFrameId, ListOwnerKind)> {
+    ) -> Option<ListOwnerFrame> {
         let clause = clause?;
         self.frames.iter().rev().find_map(|frame| match frame {
             FormatFrame::ListOwner(owner)
                 if owner.scope == scope && owner.kind.matches_clause(clause) =>
             {
-                Some((owner.id, owner.kind))
+                Some(*owner)
             }
             _ => None,
         })
@@ -3687,9 +3786,18 @@ impl FormatFrameStack {
         scope: FormatScope,
         kind: ListOwnerKind,
     ) -> Option<(SqlFormatFrameId, ListOwnerKind)> {
+        self.find_list_owner_for_kind(scope, kind)
+            .map(|owner| (owner.id, owner.kind))
+    }
+
+    fn find_list_owner_for_kind(
+        &self,
+        scope: FormatScope,
+        kind: ListOwnerKind,
+    ) -> Option<ListOwnerFrame> {
         self.frames.iter().rev().find_map(|frame| match frame {
             FormatFrame::ListOwner(owner) if owner.scope == scope && owner.kind == kind => {
-                Some((owner.id, owner.kind))
+                Some(*owner)
             }
             _ => None,
         })
@@ -3727,12 +3835,9 @@ impl FormatFrameStack {
         })
     }
 
-    fn list_owner_for_scope(
-        &self,
-        scope: FormatScope,
-    ) -> Option<(SqlFormatFrameId, ListOwnerKind)> {
+    fn find_list_owner_for_scope(&self, scope: FormatScope) -> Option<ListOwnerFrame> {
         self.frames.iter().rev().find_map(|frame| match frame {
-            FormatFrame::ListOwner(owner) if owner.scope == scope => Some((owner.id, owner.kind)),
+            FormatFrame::ListOwner(owner) if owner.scope == scope => Some(*owner),
             _ => None,
         })
     }
@@ -4545,11 +4650,13 @@ impl FormatFrameStack {
         let depth_before = self.statement_base_depth();
         let frame_id = self.next_frame_id();
         let should_push_runtime_state = capture_runtime_state || new_query_base_depth.is_some();
+        let rendered_boundary = self.current_rendered_boundary;
         self.push_frame(FormatFrame::Paren(Box::new(ParenStackFrame {
             id: frame_id,
             frame,
             first_body_token_idx: None,
             direct_list_body: false,
+            rendered_boundary,
             semantic_flags,
             structured_table_function_columns_started: false,
             previous_active_paren_metrics: self.active_paren_metrics,
@@ -11630,11 +11737,9 @@ impl SqlEditorWidget {
         let mut needs_space = false;
         let mut has_rendered_content = false;
         let mut line_indent = 0usize;
-        let mut line_start_token_paren_depth = 0usize;
-        let mut delimiter_frame_state = DelimiterFrameState::default();
-        let mut line_delimiter_frame_state = DelimiterFrameState::default();
-        let mut line_closes_delimiter_frame_below_start = false;
-        let mut line_start_delimiter_snapshot = DelimiterLineStartSnapshot::default();
+        let mut delimiter_frame_state = DelimiterFrameState::with_boundary_tracking();
+        let mut rendered_delimiter_boundary_tracker =
+            RenderedDelimiterBoundaryTracker::new(delimiter_frame_state.boundary());
         let current_rendered_line_paren_depth = Cell::new(0usize);
         let mut join_modifier_active = false;
         let mut prev_word_idx: Option<usize> = None;
@@ -11883,9 +11988,12 @@ impl SqlEditorWidget {
 
         let mut mysql_begin_not_atomic_header_open = false;
         let mut idx = 0;
-        let mut lexical_paren_depth_state = ParenDepthState::default();
         let mut previous_token_end_newline_count = 0usize;
         while idx < tokens.len() {
+            rendered_delimiter_boundary_tracker.sync(&out, &delimiter_frame_state);
+            format_stack.set_current_rendered_boundary(
+                rendered_delimiter_boundary_tracker.current_position(&delimiter_frame_state),
+            );
             if at_line_start {
                 comment_prefix_text
                     .lock()
@@ -11893,7 +12001,7 @@ impl SqlEditorWidget {
                     .clear();
             }
             let rendered_token_idx = idx;
-            let current_token_paren_depth = lexical_paren_depth_state.depth();
+            let current_token_paren_depth = delimiter_frame_state.depth();
             let current_scope = format_stack.sync_for_token_entry();
             if matches!(tokens.get(idx), Some(SqlToken::Symbol(symbol)) if symbol == ",") {
                 let _ = format_stack.pop_assignment_value_frame_at_scope(current_scope);
@@ -12007,14 +12115,6 @@ impl SqlEditorWidget {
                     }
                 }
             }
-            if at_line_start {
-                line_start_token_paren_depth = current_token_paren_depth;
-                line_start_delimiter_snapshot =
-                    delimiter_frame_state.line_start_snapshot(line_start_token_paren_depth);
-                line_delimiter_frame_state = line_start_delimiter_snapshot.frame_state();
-                line_closes_delimiter_frame_below_start = false;
-            }
-
             match &tokens[idx] {
                 SqlToken::Word(word) => {
                     let upper = ascii_uppercase_cow(word);
@@ -12258,7 +12358,14 @@ impl SqlEditorWidget {
                             .and_then(|text| text.rsplit('\n').next())
                             .map(rendered_line_indent)
                             .unwrap_or(line_indent);
+                        rendered_delimiter_boundary_tracker.sync(&out, &delimiter_frame_state);
                         out.pop();
+                        rendered_delimiter_boundary_tracker
+                            .restore_after_trailing_newline_join(&out);
+                        format_stack.set_current_rendered_boundary(
+                            rendered_delimiter_boundary_tracker
+                                .current_position(&delimiter_frame_state),
+                        );
                         rendered_line_tracker.invalidate();
                         at_line_start = false;
                         needs_space = true;
@@ -12900,15 +13007,9 @@ impl SqlEditorWidget {
                         for processed_idx in rendered_token_idx..idx {
                             if let Some(token) = tokens.get(processed_idx) {
                                 query_apply_context_tracker
-                                    .observe(token, lexical_paren_depth_state.depth());
+                                    .observe(token, delimiter_frame_state.depth());
                                 statement_tail_state.observe(token);
-                                apply_paren_token(&mut lexical_paren_depth_state, token);
                                 delimiter_frame_state.apply_token(token);
-                                line_closes_delimiter_frame_below_start |=
-                                    line_delimiter_frame_state.apply_token_with_close_detection(
-                                        token,
-                                        line_start_delimiter_snapshot.baseline_depth(),
-                                    );
                             }
                             previous_token_end_newline_count =
                                 token_line_cursor.profile(processed_idx).end_newline_count;
@@ -15202,7 +15303,14 @@ impl SqlEditorWidget {
                             .and_then(|text| text.rsplit('\n').next())
                             .map(rendered_line_indent)
                             .unwrap_or(line_indent);
+                        rendered_delimiter_boundary_tracker.sync(&out, &delimiter_frame_state);
                         out.pop();
+                        rendered_delimiter_boundary_tracker
+                            .restore_after_trailing_newline_join(&out);
+                        format_stack.set_current_rendered_boundary(
+                            rendered_delimiter_boundary_tracker
+                                .current_position(&delimiter_frame_state),
+                        );
                         rendered_line_tracker.invalidate();
                         at_line_start = false;
                         needs_space = true;
@@ -16505,7 +16613,14 @@ impl SqlEditorWidget {
                         has_leading_newline = false;
                         trim_trailing_space(&mut out);
                         if out.ends_with('\n') {
+                            rendered_delimiter_boundary_tracker.sync(&out, &delimiter_frame_state);
                             out.pop();
+                            rendered_delimiter_boundary_tracker
+                                .restore_after_trailing_newline_join(&out);
+                            format_stack.set_current_rendered_boundary(
+                                rendered_delimiter_boundary_tracker
+                                    .current_position(&delimiter_frame_state),
+                            );
                         }
                         at_line_start = false;
                     }
@@ -17332,51 +17447,57 @@ impl SqlEditorWidget {
                                     ListOwnerKind::CycleColumns,
                                 );
                             }
-                            let active_list_owner = if mysql_handler_condition_separator {
-                                format_stack.list_owner_for_kind(
+                            let active_list_owner_frame = if mysql_handler_condition_separator {
+                                format_stack.find_list_owner_for_kind(
                                     current_scope,
                                     ListOwnerKind::HandlerConditions,
                                 )
-                            } else if let Some(owner) = format_stack
-                                .list_owner_for_kind(current_scope, ListOwnerKind::DiagnosticsItems)
-                            {
+                            } else if let Some(owner) = format_stack.find_list_owner_for_kind(
+                                current_scope,
+                                ListOwnerKind::DiagnosticsItems,
+                            ) {
                                 Some(owner)
                             } else if construct_flag_active_at_paren_depth!(
                                 SearchCycleClauseActive,
                                 current_scope.paren_depth
                             ) {
                                 format_stack
-                                    .list_owner_for_kind(current_scope, ListOwnerKind::CycleColumns)
+                                    .find_list_owner_for_kind(
+                                        current_scope,
+                                        ListOwnerKind::CycleColumns,
+                                    )
                                     .or_else(|| {
-                                        format_stack.list_owner_for_kind(
+                                        format_stack.find_list_owner_for_kind(
                                             current_scope,
                                             ListOwnerKind::SearchBy,
                                         )
                                     })
                             } else if construct_flag_active!(GrantRevokeActive) {
-                                format_stack.list_owner_for_kind(
+                                format_stack.find_list_owner_for_kind(
                                     current_scope,
                                     ListOwnerKind::GrantPrivileges,
                                 )
                             } else if format_stack.structured_table_function_columns_started() {
                                 format_stack
-                                    .list_owner_for_kind(
+                                    .find_list_owner_for_kind(
                                         current_scope,
                                         ListOwnerKind::StructuredColumns,
                                     )
                                     .or_else(|| {
-                                        format_stack.list_owner_for_clause(
+                                        format_stack.find_list_owner_for_clause(
                                             current_scope,
                                             format_stack.current_clause(),
                                         )
                                     })
                             } else {
-                                format_stack.list_owner_for_clause(
+                                format_stack.find_list_owner_for_clause(
                                     current_scope,
                                     format_stack.current_clause(),
                                 )
                             }
-                            .or_else(|| format_stack.list_owner_for_scope(current_scope));
+                            .or_else(|| format_stack.find_list_owner_for_scope(current_scope));
+                            let active_list_owner =
+                                active_list_owner_frame.map(|owner| (owner.id, owner.kind));
                             let active_list_owner_kind = active_list_owner.map(|(_, kind)| kind);
                             let search_cycle_cte_separator_indent =
                                 search_cycle_starts_cte_definition.then(|| {
@@ -17501,13 +17622,22 @@ impl SqlEditorWidget {
                                 .rsplit_once('\n')
                                 .map_or(out.as_str(), |(_, current_line)| current_line)
                                 .trim_start();
-                            let current_line_start = out.rfind('\n').map_or(0, |offset| offset + 1);
-                            let direct_list_opened_on_current_line = format_stack
-                                .last_paren_stack_frame()
-                                .filter(|frame| frame.direct_list_body)
-                                .is_some_and(|frame| {
-                                    frame.frame.body_start_out_len > current_line_start
+                            let physical_line_boundary =
+                                rendered_delimiter_boundary_tracker.current_line();
+                            let owner_boundary = active_list_owner_frame
+                                .map(|owner| owner.rendered_boundary)
+                                .or_else(|| format_stack.direct_list_rendered_boundary());
+                            let owner_started_on_current_line =
+                                owner_boundary.is_some_and(|boundary| {
+                                    boundary.line_epoch == physical_line_boundary.line_epoch
                                 });
+                            let effective_comma_boundary = owner_boundary
+                                .filter(|boundary| {
+                                    boundary.line_epoch == physical_line_boundary.line_epoch
+                                })
+                                .unwrap_or(physical_line_boundary);
+                            let closes_below_effective_boundary = delimiter_frame_state
+                                .has_closed_below(effective_comma_boundary.delimiter);
                             let current_line_starts_structural_close = current_line_trimmed
                                 .starts_with(')')
                                 || current_line_trimmed
@@ -17526,10 +17656,10 @@ impl SqlEditorWidget {
                                 && !follows_multiline_child_close
                                 && !previous_item_ends_case
                                 && (!current_line_starts_structural_close
-                                    || direct_list_opened_on_current_line)
-                                && current_token_paren_depth >= line_start_token_paren_depth
-                                && (!line_closes_delimiter_frame_below_start
-                                    || direct_list_opened_on_current_line)
+                                    || owner_started_on_current_line)
+                                && current_token_paren_depth
+                                    >= effective_comma_boundary.delimiter.depth()
+                                && !closes_below_effective_boundary
                                 && !construct_flag_active!(GrantRevokeActive)
                                 && !format_stack.trigger_header_is_active()
                                 && Self::wrapped_comma_fits_current_line(
@@ -17975,9 +18105,9 @@ impl SqlEditorWidget {
                                         format_stack.current_clause(),
                                         Some("SELECT" | "SET")
                                     ) && (current_token_paren_depth
-                                        < line_start_token_paren_depth
+                                        < effective_comma_boundary.delimiter.depth()
                                         || follows_multiline_child_close
-                                        || line_closes_delimiter_frame_below_start)
+                                        || closes_below_effective_boundary)
                                     {
                                         // Mixed close-comma SELECT/SET siblings must snap to the
                                         // active list frame depth after the current line closes
@@ -18985,6 +19115,7 @@ impl SqlEditorWidget {
                             if paren_started_at_line_start {
                                 line_indent = frame_owner_depth;
                             }
+                            rendered_delimiter_boundary_tracker.sync(&out, &delimiter_frame_state);
                             ensure_indent(&mut out, &mut at_line_start, line_indent);
                             let keeps_count_star_call_tight =
                                 matches!(prev_word_upper, Some("COUNT"))
@@ -19350,6 +19481,7 @@ impl SqlEditorWidget {
                                     paren_frame_kind.compact_multiline_close_indent()
                                 };
                             }
+                            rendered_delimiter_boundary_tracker.sync(&out, &delimiter_frame_state);
                             ensure_indent(&mut out, &mut at_line_start, line_indent);
                             out.push(')');
                             current_rendered_line_paren_depth
@@ -19418,15 +19550,24 @@ impl SqlEditorWidget {
                                 && !out.trim_end_matches('\n').is_empty()
                                 && !matches!(immediate_prev_token, Some(SqlToken::Comment(_)));
                             if joins_line_start_at_sign {
+                                rendered_delimiter_boundary_tracker
+                                    .sync(&out, &delimiter_frame_state);
                                 while out.ends_with('\n') {
                                     out.pop();
                                 }
+                                rendered_delimiter_boundary_tracker
+                                    .restore_after_trailing_newline_join(&out);
+                                format_stack.set_current_rendered_boundary(
+                                    rendered_delimiter_boundary_tracker
+                                        .current_position(&delimiter_frame_state),
+                                );
                                 rendered_line_tracker.invalidate();
                                 at_line_start = false;
                                 needs_space = true;
                                 line_indent =
                                     rendered_line_indent(out.rsplit('\n').next().unwrap_or(""));
                             }
+                            rendered_delimiter_boundary_tracker.sync(&out, &delimiter_frame_state);
                             ensure_indent(&mut out, &mut at_line_start, line_indent);
                             let is_mysql_block_label_colon = sym == ":"
                                 && immediate_prev_token
@@ -19563,15 +19704,9 @@ impl SqlEditorWidget {
                 _ => {}
             }
             if let Some(token) = tokens.get(idx) {
-                query_apply_context_tracker.observe(token, lexical_paren_depth_state.depth());
+                query_apply_context_tracker.observe(token, delimiter_frame_state.depth());
                 statement_tail_state.observe(token);
-                apply_paren_token(&mut lexical_paren_depth_state, token);
                 delimiter_frame_state.apply_token(token);
-                line_closes_delimiter_frame_below_start |= line_delimiter_frame_state
-                    .apply_token_with_close_detection(
-                        token,
-                        line_start_delimiter_snapshot.baseline_depth(),
-                    );
             }
             for consumed_idx in rendered_token_idx..=idx {
                 if let Some(token) = tokens.get(consumed_idx) {
@@ -21800,6 +21935,47 @@ mod comma_list_layout_tests {
         assert!(
             formatted.contains(") IN (0, 1) THEN"),
             "a new IN-list frame must not inherit an earlier close on the same line:\n{formatted}"
+        );
+    }
+
+    #[test]
+    fn wrapped_outer_select_does_not_inherit_cte_close_after_inner_comment() {
+        let formatted = format_wrapped(
+            "with a as (select /*1*/ 1 from dual) select 1, 2, 3 from dual;",
+            300,
+        );
+
+        assert!(
+            formatted.contains("SELECT 1, 2, 3\nFROM DUAL;"),
+            "the outer SELECT list must not inherit the CTE close from the previous rendered line:\n{formatted}"
+        );
+        assert_eq!(format_wrapped(&formatted, 300), formatted);
+    }
+
+    #[test]
+    fn wrapped_direct_list_does_not_inherit_cte_close_at_a_deeper_depth() {
+        let formatted = format_wrapped(
+            "with a as (select (select /*1*/ 1 from dual) value from dual) select fn(1, 2, 3) from dual;",
+            300,
+        );
+
+        assert!(
+            formatted.contains("SELECT fn (1, 2, 3)\nFROM DUAL;"),
+            "a direct list opened after the CTE must use its own rendered boundary:\n{formatted}"
+        );
+        assert_eq!(format_wrapped(&formatted, 300), formatted);
+    }
+
+    #[test]
+    fn wrapped_clause_owner_started_after_same_line_close_ignores_that_close() {
+        let formatted = format_wrapped(
+            "begin execute immediate fn(/*1*/ 1) using 1, 2, 3; end; /",
+            300,
+        );
+
+        assert!(
+            formatted.contains(") USING 1, 2, 3;"),
+            "USING must ignore a close rendered before the USING owner started:\n{formatted}"
         );
     }
 
