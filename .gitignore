@@ -17,3 +17,7 @@ toad_manual_features.json
 # AI 에이전트 지침 파일 (로컬 전용)
 AGENTS.md
 CLAUDE.md
+
+# Python bytecode cache
+__pycache__/
+*.pyc
