@@ -169,6 +169,21 @@ MARIADB_SIGNATURE_OVERRIDES = {
 }
 
 
+MARIADB_EXTRA_SIGNATURES = {
+    # Window functions and the string REPLACE()/VALUES() builtins are documented
+    # in the reference manual but absent from the scraped function index table
+    # (the window functions live on their own pages, REPLACE() shares a page with
+    # the REPLACE statement, and VALUES() is documented under INSERT ... ON
+    # DUPLICATE KEY UPDATE). They are user-callable server built-ins all the same.
+    "FIRST_VALUE": "FIRST_VALUE(expr) OVER ( [ PARTITION BY partition_expression ] [ ORDER BY order_list ] )",
+    "LAG": "LAG(expr[, offset]) OVER ( [ PARTITION BY partition_expression ] [ ORDER BY order_list ] )",
+    "LEAD": "LEAD(expr[, offset]) OVER ( [ PARTITION BY partition_expression ] [ ORDER BY order_list ] )",
+    "NTH_VALUE": "NTH_VALUE(expr, num_row) OVER ( [ PARTITION BY partition_expression ] [ ORDER BY order_list ] )",
+    "REPLACE": "REPLACE(str,from_str,to_str)",
+    "VALUES": "VALUES(col_name)",
+}
+
+
 NON_CALL_MARIADB_ENTRIES = {
     "CASE",
     "DIV",
@@ -687,6 +702,10 @@ def mariadb_signatures(index_path: Path, pages_dir: Path) -> dict[str, list[str]
         for name, href in unresolved:
             print(f"unresolved MariaDB function: {name} ({href})", file=sys.stderr)
         raise ValueError(f"{len(unresolved)} MariaDB signatures unresolved")
+    for name, signature in MARIADB_EXTRA_SIGNATURES.items():
+        signatures[name] = list(
+            dict.fromkeys(split_top_level_overloads(normalize_signature(signature)))
+        )
     return signatures
 
 
@@ -715,7 +734,7 @@ def balanced_signature(value: str) -> bool:
 
 
 def validate_catalogs(catalogs: dict[str, dict[str, list[str]]]) -> None:
-    expected_sizes = {"ORACLE": 463, "MYSQL": 408, "MARIADB": 469}
+    expected_sizes = {"ORACLE": 463, "MYSQL": 408, "MARIADB": 475}
     for dialect, expected_size in expected_sizes.items():
         actual_size = len(catalogs[dialect])
         if actual_size != expected_size:
