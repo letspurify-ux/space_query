@@ -92,35 +92,25 @@ fn next_ui_scale_percent(current: u32, action: UiScaleAction) -> u32 {
     }
 }
 
-fn window_position_after_ui_scale(
+fn window_geometry_after_ui_scale(
     x: i32,
     y: i32,
     width: i32,
     height: i32,
-    screen_bounds: (i32, i32, i32, i32),
     old_scale: f32,
     new_scale: f32,
-) -> (i32, i32) {
-    let ratio = safe_div(old_scale, new_scale);
-    let mut scaled_x = (x as f32 * ratio) as i32;
-    let mut scaled_y = (y as f32 * ratio) as i32;
-    let (screen_x, screen_y, screen_width, screen_height) = screen_bounds;
-    let center_margin = 5;
-    let half_width = safe_div(width, 2);
-    let half_height = safe_div(height, 2);
-
-    if scaled_x + half_width < screen_x {
-        scaled_x = screen_x - half_width + center_margin;
-    } else if scaled_x + half_width > screen_x + screen_width - 1 {
-        scaled_x = screen_x + screen_width - 1 - half_width - center_margin;
-    }
-    if scaled_y + half_height < screen_y {
-        scaled_y = screen_y - half_height + center_margin;
-    } else if scaled_y + half_height > screen_y + screen_height - 1 {
-        scaled_y = screen_y + screen_height - 1 - half_height - center_margin;
-    }
-
-    (scaled_x, scaled_y)
+) -> (i32, i32, i32, i32) {
+    // Preserve the complete physical frame. If only the logical position is
+    // scaled, macOS can constrain an oversized native frame while FLTK keeps
+    // the unconstrained logical size, breaking subsequent move coordinates.
+    let ratio = safe_div(f64::from(old_scale), f64::from(new_scale));
+    let scaled = |value: i32| (f64::from(value) * ratio).round() as i32;
+    (
+        scaled(x),
+        scaled(y),
+        scaled(width).max(1),
+        scaled(height).max(1),
+    )
 }
 
 static NEXT_MUTEX_FLAG_TOKEN: AtomicU64 = AtomicU64::new(1);
@@ -4356,7 +4346,6 @@ impl MainWindow {
         let ui_scale_bases = (0..app::screen_count())
             .map(app::screen_scale)
             .collect::<Vec<_>>();
-        Self::apply_ui_scale_percent(&ui_scale_bases, config.normalized_ui_scale_percent(), None);
 
         let current_group = fltk::group::Group::try_current();
 
@@ -4369,6 +4358,11 @@ impl MainWindow {
         window.set_id("main_window");
         window.set_color(theme::window_bg());
         app_icon::apply_window_icon(&mut window);
+        Self::apply_ui_scale_percent(
+            &ui_scale_bases,
+            config.normalized_ui_scale_percent(),
+            Some(&window),
+        );
 
         let mut main_flex = Flex::default_fill();
         main_flex.set_type(FlexType::Column);
@@ -8390,7 +8384,7 @@ impl MainWindow {
             .or_else(|| Self::zoom_shortcut_for_key(event_original_key, event_state))
     }
 
-    fn set_screen_scale_preserving_window_position(
+    fn set_screen_scale_preserving_window_frame(
         screen: i32,
         new_scale: f32,
         window: Option<&Window>,
@@ -8408,39 +8402,23 @@ impl MainWindow {
 
         let window_geometry = window.and_then(|window| {
             let window_screen = window.screen_num();
-            if !window.shown()
-                || window.fullscreen_active()
+            if window.fullscreen_active()
                 || window.maximize_active()
                 || (!affects_all_screens && window_screen != screen)
             {
                 None
             } else {
-                Some((
-                    window.x(),
-                    window.y(),
-                    window.w(),
-                    window.h(),
-                    window_screen,
-                ))
+                Some((window.x(), window.y(), window.w(), window.h()))
             }
         });
 
         app::set_screen_scale(screen, new_scale);
 
-        if let (Some(window), Some((x, y, width, height, window_screen))) =
-            (window, window_geometry)
-        {
-            let (scaled_x, scaled_y) = window_position_after_ui_scale(
-                x,
-                y,
-                width,
-                height,
-                app::screen_xywh(window_screen),
-                old_scale,
-                new_scale,
-            );
+        if let (Some(window), Some((x, y, width, height))) = (window, window_geometry) {
+            let (scaled_x, scaled_y, scaled_width, scaled_height) =
+                window_geometry_after_ui_scale(x, y, width, height, old_scale, new_scale);
             let mut window = window.clone();
-            window.resize(scaled_x, scaled_y, width, height);
+            window.resize(scaled_x, scaled_y, scaled_width, scaled_height);
         }
 
         true
@@ -8464,7 +8442,7 @@ impl MainWindow {
                 .enumerate()
             {
                 if base.is_finite() && base > 0.0 {
-                    changed |= Self::set_screen_scale_preserving_window_position(
+                    changed |= Self::set_screen_scale_preserving_window_frame(
                         screen as i32,
                         base * ratio,
                         window,
@@ -8477,8 +8455,7 @@ impl MainWindow {
             .copied()
             .filter(|base| base.is_finite() && *base > 0.0)
         {
-            changed =
-                Self::set_screen_scale_preserving_window_position(0, base * ratio, window, true);
+            changed = Self::set_screen_scale_preserving_window_frame(0, base * ratio, window, true);
         }
 
         if changed {
@@ -10146,10 +10123,27 @@ mod tests {
     }
 
     #[test]
-    fn window_position_uses_old_to_new_scale_ratio() {
+    fn window_geometry_uses_old_to_new_scale_ratio() {
         assert_eq!(
-            window_position_after_ui_scale(300, 200, 800, 600, (0, 0, 1920, 1080), 1.0, 2.0),
-            (150, 100)
+            window_geometry_after_ui_scale(300, 200, 800, 600, 1.0, 2.0),
+            (150, 100, 400, 300)
+        );
+    }
+
+    #[test]
+    fn window_geometry_preserves_oversized_or_offscreen_physical_frame() {
+        assert_eq!(
+            window_geometry_after_ui_scale(1700, -200, 2400, 1600, 1.0, 2.0),
+            (850, -100, 1200, 800)
+        );
+    }
+
+    #[test]
+    fn window_geometry_scale_round_trip_restores_original_frame() {
+        let (x, y, width, height) = window_geometry_after_ui_scale(300, 200, 800, 600, 1.0, 2.0);
+        assert_eq!(
+            window_geometry_after_ui_scale(x, y, width, height, 2.0, 1.0),
+            (300, 200, 800, 600)
         );
     }
 
