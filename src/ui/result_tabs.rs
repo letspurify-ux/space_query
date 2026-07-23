@@ -19,6 +19,7 @@ use crate::ui::font_settings::{
 use crate::ui::result_table::{
     LazyFetchCallback, ResultGridSqlExecuteCallback, ResultTableContextActionCallback,
 };
+use crate::ui::tab_strip;
 use crate::ui::text_buffer_access;
 use crate::ui::theme;
 use crate::ui::ResultTableWidget;
@@ -71,6 +72,7 @@ pub struct ResultTabsWidget {
     on_change_callback: Arc<Mutex<Option<ResultTabsChangeCallback>>>,
     on_close_callback: Arc<Mutex<Option<ResultTabsCloseCallback>>>,
     suppress_pointer_event_depth: Arc<Mutex<u32>>,
+    data_tab_strip_state: Arc<Mutex<tab_strip::TabStripState>>,
 }
 
 #[derive(Clone)]
@@ -346,7 +348,6 @@ impl ResultTabsWidget {
         // a stale y after the tabs widget moves during a splitter drag makes that
         // minimum diverge from TAB_HEADER_HEIGHT, so the header shrinks or grows.
         Self::layout_children(tabs);
-        tabs.set_label_size((constants::TAB_HEADER_HEIGHT - 8).max(8));
         tabs.redraw();
     }
 
@@ -405,18 +406,6 @@ impl ResultTabsWidget {
         );
     }
 
-    fn should_reset_tab_strip_left_anchor(child_count: i32, width: i32, height: i32) -> bool {
-        child_count > 1 && width > 0 && height > 0
-    }
-
-    fn should_reapply_tab_overflow_mode_on_wheel(
-        child_count: i32,
-        width: i32,
-        height: i32,
-    ) -> bool {
-        child_count > 0 && width > 0 && height > 0
-    }
-
     fn should_suppress_pointer_event(depth: &Arc<Mutex<u32>>, ev: Event) -> bool {
         matches!(
             ev,
@@ -447,20 +436,53 @@ impl ResultTabsWidget {
             )
     }
 
-    fn reset_tab_strip_left_anchor(&mut self) {
-        // Re-applying overflow mode resets FLTK's internal tab offset,
-        // keeping the visible strip anchored from the left. Skip transient
-        // empty/single-tab states while tabs are being recreated because
-        // overflow math is irrelevant there.
-        if Self::should_reset_tab_strip_left_anchor(
-            self.data_tabs.children(),
-            self.data_tabs.w(),
-            self.data_tabs.h(),
-        ) {
-            self.data_tabs.handle_overflow(TabsOverflow::Pulldown);
-        } else {
-            self.data_tabs.handle_overflow(TabsOverflow::Compress);
-        }
+    fn sync_data_tab_strip_overflow_mode_for(
+        tabs: &mut Tabs,
+        tab_strip_state: &Arc<Mutex<tab_strip::TabStripState>>,
+    ) {
+        let mut state = tab_strip_state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        tab_strip::sync_overflow_mode(tabs, &mut state, constants::TAB_HEADER_HEIGHT);
+    }
+
+    fn record_data_tab_strip_selection_for(
+        tabs: &mut Tabs,
+        tab_strip_state: &Arc<Mutex<tab_strip::TabStripState>>,
+    ) {
+        let mut state = tab_strip_state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        tab_strip::record_selected_tab(tabs, &mut state, constants::TAB_HEADER_HEIGHT);
+    }
+
+    fn record_data_tab_strip_removal_for(
+        group: &Group,
+        tab_strip_state: &Arc<Mutex<tab_strip::TabStripState>>,
+    ) {
+        let mut state = tab_strip_state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        tab_strip::record_removed_tab(&mut state, group.as_widget_ptr() as usize);
+    }
+
+    fn sync_data_tab_strip_overflow_mode(&mut self) {
+        Self::sync_data_tab_strip_overflow_mode_for(
+            &mut self.data_tabs,
+            &self.data_tab_strip_state,
+        );
+    }
+
+    fn sync_data_tab_strip_overflow_mode_after_close(&self) {
+        let mut tabs = self.data_tabs.clone();
+        let tab_strip_state = self.data_tab_strip_state.clone();
+        crate::ui::ui_timeout::schedule(0.0, move || {
+            if tabs.was_deleted() {
+                return;
+            }
+            Self::sync_data_tab_strip_overflow_mode_for(&mut tabs, &tab_strip_state);
+            tabs.redraw();
+        });
     }
 
     fn maybe_shrink_tab_storage(data: &mut Vec<ResultTab>) {
@@ -571,6 +593,7 @@ impl ResultTabsWidget {
             title, index, status, row_count,
         ));
         group.redraw();
+        self.sync_data_tab_strip_overflow_mode();
         self.data_tabs.redraw();
     }
 
@@ -726,6 +749,7 @@ impl ResultTabsWidget {
         let on_close_callback: Arc<Mutex<Option<ResultTabsCloseCallback>>> =
             Arc::new(Mutex::new(None));
         let suppress_pointer_event_depth = Arc::new(Mutex::new(0u32));
+        let data_tab_strip_state = Arc::new(Mutex::new(tab_strip::TabStripState::default()));
 
         tabs.begin();
         let (section_x, section_y, section_w, section_h) = Self::content_bounds(&tabs);
@@ -858,7 +882,9 @@ impl ResultTabsWidget {
         let data_for_cb = data.clone();
         let active_for_cb = active_index.clone();
         let on_change_for_cb = on_change_callback.clone();
+        let data_tab_strip_state_for_cb = data_tab_strip_state.clone();
         data_tabs.set_callback(move |t| {
+            Self::record_data_tab_strip_selection_for(t, &data_tab_strip_state_for_cb);
             if let Some(widget) = t.value() {
                 let ptr = widget.as_widget_ptr();
                 let index = data_for_cb
@@ -881,6 +907,9 @@ impl ResultTabsWidget {
 
         let suppress_pointer_for_cb = suppress_pointer_event_depth.clone();
         let tabs_for_key = tabs.clone();
+        // Filter header wheel events before FLTK can mutate its tab offset.
+        // Wheel events in result content must continue to reach the active pane.
+        tabs.super_handle_first(false);
         tabs.handle(move |tabs, ev| {
             if Self::should_suppress_pointer_event(&suppress_pointer_for_cb, ev) {
                 return true;
@@ -889,16 +918,11 @@ impl ResultTabsWidget {
                 return true;
             }
             if matches!(ev, Event::MouseWheel)
-                && Self::should_reapply_tab_overflow_mode_on_wheel(
-                    tabs.children(),
-                    tabs.w(),
-                    tabs.h(),
+                && tab_strip::should_consume_mouse_wheel_for_tabs(
+                    tabs,
+                    constants::TAB_HEADER_HEIGHT,
                 )
             {
-                // Prevent FLTK Tabs from applying wheel-based strip offset changes.
-                // Wheel events can bubble down from nearby panes and cause the
-                // result-tab header to snap right unexpectedly.
-                tabs.handle_overflow(TabsOverflow::Pulldown);
                 return true;
             }
 
@@ -934,21 +958,61 @@ impl ResultTabsWidget {
 
         let suppress_pointer_for_data_cb = suppress_pointer_event_depth.clone();
         let data_tabs_for_key = data_tabs.clone();
+        let data_tab_strip_state_for_handle = data_tab_strip_state.clone();
+        let data_tab_strip_pointer_gesture =
+            Arc::new(Mutex::new(tab_strip::TabStripPointerGesture::default()));
+        data_tabs.super_handle_first(false);
         data_tabs.handle(move |tabs, ev| {
+            // An active native-first header gesture must always be finalized,
+            // even while a nested close/select operation suppresses pointer
+            // events. Otherwise FLTK remains native-first and a later wheel or
+            // drag can mutate the private tab offset before this filter runs.
+            if matches!(
+                ev,
+                Event::Drag
+                    | Event::Released
+                    | Event::Unfocus
+                    | Event::Deactivate
+                    | Event::Hide
+                    | Event::MouseWheel
+            ) {
+                let mut state = data_tab_strip_state_for_handle
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                let mut gesture = data_tab_strip_pointer_gesture
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                if tab_strip::handle_pointer_event(
+                    tabs,
+                    ev,
+                    &mut state,
+                    &mut gesture,
+                    constants::TAB_HEADER_HEIGHT,
+                ) {
+                    return true;
+                }
+            }
             if Self::should_suppress_pointer_event(&suppress_pointer_for_data_cb, ev) {
                 return true;
             }
-            if Self::should_consume_empty_tab_pointer_event(tabs.children(), ev) {
-                return true;
+            if ev == Event::Push {
+                let mut state = data_tab_strip_state_for_handle
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                let mut gesture = data_tab_strip_pointer_gesture
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                if tab_strip::handle_pointer_event(
+                    tabs,
+                    ev,
+                    &mut state,
+                    &mut gesture,
+                    constants::TAB_HEADER_HEIGHT,
+                ) {
+                    return true;
+                }
             }
-            if matches!(ev, Event::MouseWheel)
-                && Self::should_reapply_tab_overflow_mode_on_wheel(
-                    tabs.children(),
-                    tabs.w(),
-                    tabs.h(),
-                )
-            {
-                tabs.handle_overflow(TabsOverflow::Pulldown);
+            if Self::should_consume_empty_tab_pointer_event(tabs.children(), ev) {
                 return true;
             }
             if !matches!(ev, Event::KeyDown) {
@@ -978,8 +1042,10 @@ impl ResultTabsWidget {
         });
 
         let mut data_tabs_for_resize = data_tabs.clone();
+        let data_tab_strip_state_for_resize = data_tab_strip_state.clone();
         data_tabs.resize_callback(move |t, _, _, _, _| {
             Self::layout_active_tab_child(t);
+            Self::sync_data_tab_strip_overflow_mode_for(t, &data_tab_strip_state_for_resize);
         });
         let script_output_for_resize = script_output.clone();
         let script_errors_for_resize = script_errors.clone();
@@ -1046,6 +1112,7 @@ impl ResultTabsWidget {
             on_change_callback,
             on_close_callback,
             suppress_pointer_event_depth,
+            data_tab_strip_state,
         }
     }
 
@@ -1099,6 +1166,16 @@ impl ResultTabsWidget {
         for mut table in tables {
             table.apply_font_settings(profile, size);
         }
+        self.sync_data_tab_strip_overflow_mode();
+        self.data_tabs.redraw();
+    }
+
+    pub(crate) fn refresh_tab_strip_overflow_mode(&mut self) {
+        if self.data_tabs.was_deleted() {
+            return;
+        }
+        self.sync_data_tab_strip_overflow_mode();
+        self.data_tabs.redraw();
     }
 
     pub fn set_max_cell_display_chars(&mut self, max_chars: usize) {
@@ -1131,7 +1208,7 @@ impl ResultTabsWidget {
             .active_index
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
-        self.reset_tab_strip_left_anchor();
+        self.sync_data_tab_strip_overflow_mode();
         self.data_tabs.redraw();
         self.fire_on_change_callback();
     }
@@ -1280,6 +1357,10 @@ impl ResultTabsWidget {
             if select_tab {
                 self.select_top_group(&self.sections.data_grid.clone());
                 let _ = self.data_tabs.set_value(&group);
+                Self::record_data_tab_strip_selection_for(
+                    &mut self.data_tabs,
+                    &self.data_tab_strip_state,
+                );
                 *self
                     .active_index
                     .lock()
@@ -1387,7 +1468,7 @@ impl ResultTabsWidget {
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(new_index);
         }
-        self.reset_tab_strip_left_anchor();
+        self.sync_data_tab_strip_overflow_mode();
         self.fire_on_change_callback();
     }
 
@@ -1737,11 +1818,6 @@ impl ResultTabsWidget {
         restored
     }
 
-    pub fn align_tab_strip_left(&mut self) {
-        self.reset_tab_strip_left_anchor();
-        self.tabs.redraw();
-    }
-
     fn display_result(&mut self, index: usize, result: &crate::db::QueryResult) {
         let status = ResultTabStatus::from_query_result(result);
         let table = self
@@ -2031,6 +2107,8 @@ impl ResultTabsWidget {
         // 3. Delete child widgets
         // 4. Delete parent container
 
+        Self::record_data_tab_strip_removal_for(&tab.group, &self.data_tab_strip_state);
+
         // Step 1: Cleanup the table widget (clears callbacks and data buffers)
         tab.table.cleanup();
 
@@ -2039,7 +2117,10 @@ impl ResultTabsWidget {
         // additional child widgets that may be added to result tabs in the future.
         let mut group = tab.group;
         let table_widget = tab.table.get_widget();
-        if !group.was_deleted() && !table_widget.was_deleted() && group.find(&table_widget) >= 0 {
+        if !group.was_deleted()
+            && !table_widget.was_deleted()
+            && group.find(&table_widget) < group.children()
+        {
             group.remove(&table_widget);
         }
         if !table_widget.was_deleted() {
@@ -2050,7 +2131,9 @@ impl ResultTabsWidget {
         }
 
         // Step 4: Remove group from tabs and delete
-        if !self.data_tabs.was_deleted() && !group.was_deleted() && self.data_tabs.find(&group) >= 0
+        if !self.data_tabs.was_deleted()
+            && !group.was_deleted()
+            && self.data_tabs.find(&group) < self.data_tabs.children()
         {
             self.data_tabs.remove(&group);
         }
@@ -2122,13 +2205,6 @@ impl ResultTabsWidget {
         };
         let lazy_fetch_session = tab.table.active_lazy_fetch_session();
 
-        if let Some(group) = selected_group.as_ref() {
-            if !self.data_tabs.was_deleted() && !group.was_deleted() {
-                self.select_top_group(&self.sections.data_grid.clone());
-                let _ = self.data_tabs.set_value(group);
-            }
-        }
-
         self.delete_tab(tab);
 
         {
@@ -2151,8 +2227,18 @@ impl ResultTabsWidget {
                 .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
         }
 
+        if let Some(group) = selected_group.as_ref() {
+            if !self.data_tabs.was_deleted()
+                && !group.was_deleted()
+                && Self::tabs_contains_group(&self.data_tabs, group)
+            {
+                self.select_top_group(&self.sections.data_grid.clone());
+                let _ = self.data_tabs.set_value(group);
+            }
+        }
+
         if !self.data_tabs.was_deleted() {
-            self.reset_tab_strip_left_anchor();
+            self.sync_data_tab_strip_overflow_mode_after_close();
             self.data_tabs.redraw();
         }
         self.fire_on_change_callback();
@@ -2254,29 +2340,6 @@ mod tests {
             ResultTabsWidget::inner_tabs_bounds(10, 20, 100, 1),
             (10, 20, 100, 1)
         );
-    }
-
-    #[test]
-    fn tab_strip_left_anchor_reset_requires_multi_tab_layout() {
-        assert!(!ResultTabsWidget::should_reset_tab_strip_left_anchor(
-            0, 320, 240
-        ));
-        assert!(!ResultTabsWidget::should_reset_tab_strip_left_anchor(
-            1, 320, 240
-        ));
-        assert!(ResultTabsWidget::should_reset_tab_strip_left_anchor(
-            2, 320, 240
-        ));
-    }
-
-    #[test]
-    fn mouse_wheel_overflow_reapply_allows_single_tab() {
-        assert!(!ResultTabsWidget::should_reapply_tab_overflow_mode_on_wheel(0, 320, 240));
-        assert!(ResultTabsWidget::should_reapply_tab_overflow_mode_on_wheel(
-            1, 320, 240
-        ));
-        assert!(!ResultTabsWidget::should_reapply_tab_overflow_mode_on_wheel(1, 0, 240));
-        assert!(!ResultTabsWidget::should_reapply_tab_overflow_mode_on_wheel(1, 320, 0));
     }
 
     #[test]

@@ -9,17 +9,12 @@ use std::panic::{self, AssertUnwindSafe};
 use std::sync::{Arc, Mutex};
 
 use crate::ui::constants::TAB_HEADER_HEIGHT;
+use crate::ui::tab_strip;
 use crate::ui::theme;
 
 pub type QueryTabId = u64;
 type TabSelectCallback = Box<dyn FnMut(QueryTabId)>;
 type TabCloseCallback = Box<dyn FnMut(QueryTabId)>;
-
-// Mirror the FLTK `Fl_Tabs.cxx` width math closely enough to tell whether
-// `Pulldown` overflow handling is actually active before re-applying it.
-const FLTK_TABS_BORDER: i32 = 2;
-const FLTK_TABS_OVERFLOW_BUTTON_BORDER: i32 = 2;
-const FLTK_TABS_EXTRA_SPACE: i32 = 10;
 
 #[derive(Clone)]
 pub struct QueryTabsWidget {
@@ -30,7 +25,7 @@ pub struct QueryTabsWidget {
     on_close: Arc<Mutex<Option<TabCloseCallback>>>,
     suppress_select_callback_depth: Arc<Mutex<u32>>,
     suppress_pointer_event_depth: Arc<Mutex<u32>>,
-    tab_strip_reset_generation: Arc<Mutex<u64>>,
+    tab_strip_state: Arc<Mutex<tab_strip::TabStripState>>,
 }
 
 #[derive(Clone)]
@@ -89,13 +84,6 @@ impl Drop for PointerEventSuppressGuard {
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         *guard = guard.saturating_sub(1);
     }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum TabStripLeftAnchorResetMode {
-    None,
-    Immediate,
-    Deferred,
 }
 
 impl QueryTabsWidget {
@@ -188,133 +176,6 @@ impl QueryTabsWidget {
         }
     }
 
-    fn has_actual_tab_strip_overflow(total_tab_width: i32, available_tab_strip_width: i32) -> bool {
-        total_tab_width > available_tab_strip_width.max(0)
-    }
-
-    fn should_reset_tab_strip_left_anchor(
-        child_count: i32,
-        width: i32,
-        height: i32,
-        total_tab_width: i32,
-        available_tab_strip_width: i32,
-    ) -> bool {
-        child_count > 1
-            && width > 0
-            && height > 0
-            && Self::has_actual_tab_strip_overflow(total_tab_width, available_tab_strip_width)
-    }
-
-    fn should_reapply_tab_overflow_mode_on_wheel(
-        child_count: i32,
-        width: i32,
-        height: i32,
-    ) -> bool {
-        // Consume wheel events whenever the strip exists, regardless of whether
-        // our width estimate detects overflow. FLTK routes wheel to the widget
-        // under the cursor, so this handler only fires over the tab strip (body
-        // scrolling is unaffected). Gating on an estimated overflow let FLTK's
-        // native strip-scroll leak through at the estimate boundary and snap the
-        // header right. Mirrors `ResultTabsWidget`.
-        child_count > 0 && width > 0 && height > 0
-    }
-
-    fn estimated_tab_strip_width(tabs: &Tabs) -> i32 {
-        let mut total = FLTK_TABS_BORDER;
-        for child in tabs.clone().into_iter() {
-            let Some(group) = child.as_group() else {
-                continue;
-            };
-            if group.was_deleted() {
-                continue;
-            }
-            let (label_w, _) = group.measure_label();
-            total = total
-                .saturating_add(label_w.max(0))
-                .saturating_add(FLTK_TABS_EXTRA_SPACE)
-                .saturating_add(FLTK_TABS_BORDER);
-        }
-        total
-    }
-
-    fn estimated_available_tab_strip_width(tabs: &Tabs) -> i32 {
-        let header_height = tabs
-            .clone()
-            .into_iter()
-            .filter_map(|child| child.as_group())
-            .find_map(|group| {
-                if group.was_deleted() {
-                    None
-                } else {
-                    Some(group.y().saturating_sub(tabs.y()).abs())
-                }
-            })
-            .unwrap_or(TAB_HEADER_HEIGHT)
-            .max(0);
-        tabs.w()
-            .saturating_sub(header_height)
-            .saturating_add(FLTK_TABS_OVERFLOW_BUTTON_BORDER)
-            .max(0)
-    }
-
-    fn should_reset_tab_strip_left_anchor_for_tabs(tabs: &Tabs) -> bool {
-        Self::should_reset_tab_strip_left_anchor(
-            tabs.children(),
-            tabs.w(),
-            tabs.h(),
-            Self::estimated_tab_strip_width(tabs),
-            Self::estimated_available_tab_strip_width(tabs),
-        )
-    }
-
-    fn should_reapply_tab_overflow_mode_on_wheel_for_tabs(tabs: &Tabs) -> bool {
-        Self::should_reapply_tab_overflow_mode_on_wheel(tabs.children(), tabs.w(), tabs.h())
-    }
-
-    fn tab_strip_left_anchor_reset_mode(
-        child_count: i32,
-        width: i32,
-        height: i32,
-        total_tab_width: i32,
-        available_tab_strip_width: i32,
-        defer_until_next_loop: bool,
-    ) -> TabStripLeftAnchorResetMode {
-        if !Self::should_reset_tab_strip_left_anchor(
-            child_count,
-            width,
-            height,
-            total_tab_width,
-            available_tab_strip_width,
-        ) {
-            return TabStripLeftAnchorResetMode::None;
-        }
-
-        if defer_until_next_loop {
-            TabStripLeftAnchorResetMode::Deferred
-        } else {
-            TabStripLeftAnchorResetMode::Immediate
-        }
-    }
-
-    fn advance_tab_strip_reset_generation(counter: &Arc<Mutex<u64>>) -> u64 {
-        let mut guard = counter
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let generation = (*guard).wrapping_add(1);
-        *guard = generation;
-        generation
-    }
-
-    fn current_tab_strip_reset_generation(counter: &Arc<Mutex<u64>>) -> u64 {
-        *counter
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-    }
-
-    fn apply_tab_strip_left_anchor_reset(tabs: &mut Tabs) {
-        tabs.handle_overflow(TabsOverflow::Pulldown);
-    }
-
     fn should_suppress_pointer_event(depth: &Arc<Mutex<u32>>, ev: Event) -> bool {
         matches!(
             ev,
@@ -331,51 +192,50 @@ impl QueryTabsWidget {
             > 0
     }
 
-    fn reset_tab_strip_left_anchor(&mut self) {
-        self.request_tab_strip_left_anchor_reset(false);
+    fn sync_tab_strip_overflow_mode_for(
+        tabs: &mut Tabs,
+        tab_strip_state: &Arc<Mutex<tab_strip::TabStripState>>,
+    ) {
+        let mut state = tab_strip_state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        tab_strip::sync_overflow_mode(tabs, &mut state, TAB_HEADER_HEIGHT);
     }
 
-    fn request_tab_strip_left_anchor_reset(&mut self, defer_until_next_loop: bool) {
-        let generation = Self::advance_tab_strip_reset_generation(&self.tab_strip_reset_generation);
-        let mode = Self::tab_strip_left_anchor_reset_mode(
-            self.tabs.children(),
-            self.tabs.w(),
-            self.tabs.h(),
-            Self::estimated_tab_strip_width(&self.tabs),
-            Self::estimated_available_tab_strip_width(&self.tabs),
-            defer_until_next_loop,
-        );
+    fn record_tab_strip_selection_for(
+        tabs: &mut Tabs,
+        tab_strip_state: &Arc<Mutex<tab_strip::TabStripState>>,
+    ) {
+        let mut state = tab_strip_state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        tab_strip::record_selected_tab(tabs, &mut state, TAB_HEADER_HEIGHT);
+    }
 
-        match mode {
-            TabStripLeftAnchorResetMode::None => {}
-            TabStripLeftAnchorResetMode::Immediate => {
-                Self::apply_tab_strip_left_anchor_reset(&mut self.tabs);
+    fn record_tab_strip_removal_for(
+        group: &Group,
+        tab_strip_state: &Arc<Mutex<tab_strip::TabStripState>>,
+    ) {
+        let mut state = tab_strip_state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        tab_strip::record_removed_tab(&mut state, group.as_widget_ptr() as usize);
+    }
+
+    fn sync_tab_strip_overflow_mode(&mut self) {
+        Self::sync_tab_strip_overflow_mode_for(&mut self.tabs, &self.tab_strip_state);
+    }
+
+    fn sync_tab_strip_overflow_mode_after_close(&self) {
+        let mut tabs = self.tabs.clone();
+        let tab_strip_state = self.tab_strip_state.clone();
+        crate::ui::ui_timeout::schedule(0.0, move || {
+            if tabs.was_deleted() {
+                return;
             }
-            TabStripLeftAnchorResetMode::Deferred => {
-                let generation_ref = self.tab_strip_reset_generation.clone();
-                let mut tabs = self.tabs.clone();
-                crate::ui::ui_timeout::schedule(0.0, move || {
-                    if Self::current_tab_strip_reset_generation(&generation_ref) != generation {
-                        return;
-                    }
-
-                    if tabs.was_deleted() {
-                        return;
-                    }
-
-                    if !Self::should_reset_tab_strip_left_anchor_for_tabs(&tabs) {
-                        return;
-                    }
-
-                    // `handle_overflow()` triggers `FL_DAMAGE_SCROLL` redraw inside
-                    // FLTK. Deferring the reset until the next loop avoids calling
-                    // into `Fl_Tabs::draw()/value()` while a close transaction is
-                    // still removing the old child and swapping selection.
-                    Self::apply_tab_strip_left_anchor_reset(&mut tabs);
-                    tabs.redraw();
-                });
-            }
-        }
+            Self::sync_tab_strip_overflow_mode_for(&mut tabs, &tab_strip_state);
+            tabs.redraw();
+        });
     }
 
     fn maybe_shrink_entry_storage(entries: &mut Vec<TabEntry>) {
@@ -398,10 +258,9 @@ impl QueryTabsWidget {
         tabs.set_label_size((TAB_HEADER_HEIGHT - 8).max(8));
         // Center labels in tab headers.
         tabs.set_tab_align(Align::Center);
-        // Keep tab header widths stable while surrounding panes are resized.
-        // `Compress` dynamically shrinks/expands tab buttons as width changes,
-        // which causes distracting header size jumps during splitter drags.
-        tabs.handle_overflow(TabsOverflow::Pulldown);
+        // Start without a movable tab offset. The shared strip logic enables
+        // Pulldown only when the selected tab has a stable viewport.
+        tabs.handle_overflow(TabsOverflow::Compress);
 
         let entries = Arc::new(Mutex::new(Vec::<TabEntry>::new()));
         let next_id = Arc::new(Mutex::new(1u64));
@@ -409,14 +268,15 @@ impl QueryTabsWidget {
         let on_close = Arc::new(Mutex::new(None::<TabCloseCallback>));
         let suppress_select_callback_depth = Arc::new(Mutex::new(0u32));
         let suppress_pointer_event_depth = Arc::new(Mutex::new(0u32));
-        let tab_strip_reset_generation = Arc::new(Mutex::new(0u64));
+        let tab_strip_state = Arc::new(Mutex::new(tab_strip::TabStripState::default()));
 
         let entries_for_cb = entries.clone();
         let on_select_for_cb = on_select.clone();
         let suppress_for_cb = suppress_select_callback_depth.clone();
         let suppress_pointer_for_cb = suppress_pointer_event_depth.clone();
-        let tab_strip_reset_generation_for_cb = tab_strip_reset_generation.clone();
+        let tab_strip_state_for_cb = tab_strip_state.clone();
         tabs.set_callback(move |tabs| {
+            Self::record_tab_strip_selection_for(tabs, &tab_strip_state_for_cb);
             if *suppress_for_cb
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -438,19 +298,66 @@ impl QueryTabsWidget {
                 Self::invoke_on_select_callback(&on_select_for_cb, tab_id);
             }
         });
+        let tab_strip_state_for_resize = tab_strip_state.clone();
         tabs.resize_callback(move |t, _, _, _, _| {
             Self::layout_children(t);
+            Self::sync_tab_strip_overflow_mode_for(t, &tab_strip_state_for_resize);
         });
+        // Run this filter before FLTK's built-in Tabs handler. Header wheel
+        // events must be consumed before FLTK mutates its internal tab offset,
+        // while body wheel events must still reach the active editor.
+        tabs.super_handle_first(false);
+        let tab_strip_state_for_handle = tab_strip_state.clone();
+        let tab_strip_pointer_gesture =
+            Arc::new(Mutex::new(tab_strip::TabStripPointerGesture::default()));
         tabs.handle(move |tabs, ev| {
+            // Once a header press has switched FLTK to native-first handling,
+            // cleanup/reset must run even if a nested programmatic operation is
+            // temporarily suppressing pointer events.
+            if matches!(
+                ev,
+                Event::Drag
+                    | Event::Released
+                    | Event::Unfocus
+                    | Event::Deactivate
+                    | Event::Hide
+                    | Event::MouseWheel
+            ) {
+                let mut state = tab_strip_state_for_handle
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                let mut gesture = tab_strip_pointer_gesture
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                if tab_strip::handle_pointer_event(
+                    tabs,
+                    ev,
+                    &mut state,
+                    &mut gesture,
+                    TAB_HEADER_HEIGHT,
+                ) {
+                    return true;
+                }
+            }
             if Self::should_suppress_pointer_event(&suppress_pointer_for_cb, ev) {
                 return true;
             }
-            if matches!(ev, Event::MouseWheel)
-                && Self::should_reapply_tab_overflow_mode_on_wheel_for_tabs(tabs)
-            {
-                Self::advance_tab_strip_reset_generation(&tab_strip_reset_generation_for_cb);
-                Self::apply_tab_strip_left_anchor_reset(tabs);
-                return true;
+            if ev == Event::Push {
+                let mut state = tab_strip_state_for_handle
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                let mut gesture = tab_strip_pointer_gesture
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                if tab_strip::handle_pointer_event(
+                    tabs,
+                    ev,
+                    &mut state,
+                    &mut gesture,
+                    TAB_HEADER_HEIGHT,
+                ) {
+                    return true;
+                }
             }
             false
         });
@@ -463,7 +370,7 @@ impl QueryTabsWidget {
             on_close,
             suppress_select_callback_depth,
             suppress_pointer_event_depth,
-            tab_strip_reset_generation,
+            tab_strip_state,
         }
     }
 
@@ -489,6 +396,14 @@ impl QueryTabsWidget {
 
     pub fn get_widget(&self) -> Tabs {
         self.tabs.clone()
+    }
+
+    pub(crate) fn refresh_tab_strip_overflow_mode(&mut self) {
+        if self.tabs.was_deleted() {
+            return;
+        }
+        self.sync_tab_strip_overflow_mode();
+        self.tabs.redraw();
     }
 
     pub fn add_tab(&mut self, label: &str) -> QueryTabId {
@@ -530,7 +445,7 @@ impl QueryTabsWidget {
         let _suppress_guard =
             CallbackSuppressGuard::new(self.suppress_select_callback_depth.clone());
         let _ = self.tabs.set_value(&group);
-        self.reset_tab_strip_left_anchor();
+        self.sync_tab_strip_overflow_mode();
         Self::layout_children(&self.tabs);
         self.tabs.redraw();
         tab_id
@@ -543,7 +458,7 @@ impl QueryTabsWidget {
             let _suppress_guard =
                 CallbackSuppressGuard::new(self.suppress_select_callback_depth.clone());
             let _ = self.tabs.set_value(&group);
-            self.reset_tab_strip_left_anchor();
+            Self::record_tab_strip_selection_for(&mut self.tabs, &self.tab_strip_state);
             self.tabs.redraw();
         }
     }
@@ -566,6 +481,7 @@ impl QueryTabsWidget {
             let mut group = group;
             group.set_label(&Self::display_label(label));
             group.set_align(Align::Center | Align::Inside);
+            self.sync_tab_strip_overflow_mode();
             self.tabs.redraw();
         }
     }
@@ -580,10 +496,18 @@ impl QueryTabsWidget {
                 return false;
             };
             let group = entries.remove(index).group;
-            let replacement = entries
-                .get(index)
-                .or_else(|| index.checked_sub(1).and_then(|prev| entries.get(prev)))
-                .map(|entry| entry.group.clone());
+            // Fl_Tabs keeps only its selected child locally visible. Reading
+            // that flag avoids calling Fl_Tabs::value() while its close
+            // callback is still unwinding.
+            let replacement = group
+                .visible()
+                .then(|| {
+                    entries
+                        .get(index)
+                        .or_else(|| index.checked_sub(1).and_then(|prev| entries.get(prev)))
+                        .map(|entry| entry.group.clone())
+                })
+                .flatten();
             Self::maybe_shrink_entry_storage(&mut entries);
             (group, replacement)
         };
@@ -592,18 +516,21 @@ impl QueryTabsWidget {
             PointerEventSuppressGuard::new(self.suppress_pointer_event_depth.clone());
         let _suppress_guard =
             CallbackSuppressGuard::new(self.suppress_select_callback_depth.clone());
-        if let Some(replacement_group) = replacement_group {
-            if !replacement_group.was_deleted() && self.tabs.find(&replacement_group) >= 0 {
-                let _ = self.tabs.set_value(&replacement_group);
-            }
-        }
-        if !self.tabs.was_deleted() && self.tabs.find(&group) >= 0 {
+        Self::record_tab_strip_removal_for(&group, &self.tab_strip_state);
+        if !self.tabs.was_deleted() && self.tabs.find(&group) < self.tabs.children() {
             self.tabs.remove(&group);
         }
         if !group.was_deleted() {
             fltk::group::Group::delete(group);
         }
-        self.request_tab_strip_left_anchor_reset(true);
+        if let Some(replacement_group) = replacement_group {
+            if !replacement_group.was_deleted()
+                && self.tabs.find(&replacement_group) < self.tabs.children()
+            {
+                let _ = self.tabs.set_value(&replacement_group);
+            }
+        }
+        self.sync_tab_strip_overflow_mode_after_close();
         Self::layout_children(&self.tabs);
         self.tabs.redraw();
         true
@@ -640,67 +567,9 @@ impl Default for QueryTabsWidget {
 
 #[cfg(test)]
 mod tests {
-    use super::{QueryTabsWidget, TabStripLeftAnchorResetMode};
+    use super::QueryTabsWidget;
     use fltk::enums::Event;
     use std::sync::{Arc, Mutex};
-
-    #[test]
-    fn tab_strip_left_anchor_reset_requires_real_overflow_state() {
-        assert!(!QueryTabsWidget::should_reset_tab_strip_left_anchor(
-            0, 320, 240, 420, 280
-        ));
-        assert!(!QueryTabsWidget::should_reset_tab_strip_left_anchor(
-            1, 320, 240, 420, 280
-        ));
-        assert!(!QueryTabsWidget::should_reset_tab_strip_left_anchor(
-            2, 0, 240, 420, 280
-        ));
-        assert!(!QueryTabsWidget::should_reset_tab_strip_left_anchor(
-            2, 320, 0, 420, 280
-        ));
-        assert!(!QueryTabsWidget::should_reset_tab_strip_left_anchor(
-            2, 320, 240, 280, 280
-        ));
-        assert!(QueryTabsWidget::should_reset_tab_strip_left_anchor(
-            2, 320, 240, 420, 280
-        ));
-    }
-
-    #[test]
-    fn tab_strip_left_anchor_reset_mode_defers_close_path_only_when_reset_is_needed() {
-        assert_eq!(
-            QueryTabsWidget::tab_strip_left_anchor_reset_mode(1, 320, 240, 420, 280, true),
-            TabStripLeftAnchorResetMode::None
-        );
-        assert_eq!(
-            QueryTabsWidget::tab_strip_left_anchor_reset_mode(3, 320, 240, 420, 280, false),
-            TabStripLeftAnchorResetMode::Immediate
-        );
-        assert_eq!(
-            QueryTabsWidget::tab_strip_left_anchor_reset_mode(3, 320, 240, 420, 280, true),
-            TabStripLeftAnchorResetMode::Deferred
-        );
-    }
-
-    #[test]
-    fn mouse_wheel_overflow_reapply_allows_single_tab() {
-        // No tabs: nothing to re-pin.
-        assert!(!QueryTabsWidget::should_reapply_tab_overflow_mode_on_wheel(
-            0, 320, 240
-        ));
-        // Any existing strip consumes the wheel, regardless of overflow, so the
-        // native FLTK strip-scroll can never snap the header right.
-        assert!(QueryTabsWidget::should_reapply_tab_overflow_mode_on_wheel(
-            1, 320, 240
-        ));
-        // Degenerate geometry is ignored.
-        assert!(!QueryTabsWidget::should_reapply_tab_overflow_mode_on_wheel(
-            1, 0, 240
-        ));
-        assert!(!QueryTabsWidget::should_reapply_tab_overflow_mode_on_wheel(
-            1, 320, 0
-        ));
-    }
 
     #[test]
     fn pointer_event_suppression_only_applies_to_mouse_driven_tab_events() {

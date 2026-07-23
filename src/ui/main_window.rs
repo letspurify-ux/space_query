@@ -5501,6 +5501,7 @@ impl MainWindow {
             tab.sql_editor
                 .apply_font_settings(editor_profile, editor_size, ui_size);
         }
+        state.query_tabs.refresh_tab_strip_overflow_mode();
         state
             .result_tabs
             .apply_font_settings(result_profile, result_size);
@@ -7438,7 +7439,6 @@ impl MainWindow {
                         drop(s);
 
                         result_tabs.finish_non_lazy_streaming();
-                        result_tabs.align_tab_strip_left();
                         let recovered_save_states = result_tabs.clear_orphaned_save_requests();
                         let recovered_edit_states = result_tabs.clear_orphaned_query_edit_backups();
 
@@ -8464,6 +8464,20 @@ impl MainWindow {
         changed
     }
 
+    fn schedule_tab_strip_refresh_after_scale(state: &Arc<Mutex<AppState>>) {
+        let weak_state = Arc::downgrade(state);
+        crate::ui::ui_timeout::schedule(0.0, move || {
+            let Some(state) = weak_state.upgrade() else {
+                return;
+            };
+            let mut state = state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            state.query_tabs.refresh_tab_strip_overflow_mode();
+            state.result_tabs.refresh_tab_strip_overflow_mode();
+        });
+    }
+
     fn set_ui_scale_percent(state: &Arc<Mutex<AppState>>, percent: u32) -> bool {
         let (window, scale_bases, config) = {
             let state = state
@@ -8491,7 +8505,12 @@ impl MainWindow {
         }
         drop(config);
 
-        Self::apply_ui_scale_percent(&scale_bases, percent, Some(&window));
+        if Self::apply_ui_scale_percent(&scale_bases, percent, Some(&window)) {
+            // Screen-scale changes can report their final logical window size
+            // after the current event. Recheck once that geometry has settled;
+            // normal resize callbacks still handle the synchronous path.
+            Self::schedule_tab_strip_refresh_after_scale(state);
+        }
         true
     }
 
@@ -8523,7 +8542,9 @@ impl MainWindow {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .normalized_ui_scale_percent();
-        Self::apply_ui_scale_percent(&scale_bases, percent, Some(&window));
+        if Self::apply_ui_scale_percent(&scale_bases, percent, Some(&window)) {
+            Self::schedule_tab_strip_refresh_after_scale(state);
+        }
     }
 
     fn menu_shortcut_for_key(
