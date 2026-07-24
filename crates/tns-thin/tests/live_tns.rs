@@ -528,6 +528,30 @@ fn python_oracledb_1131_call_timeout_aborts_slow_call() {
     );
 }
 
+// python-oracledb maps a zero call timeout to `settimeout(None)`, so a
+// connection with no call timeout blocks until the server answers. The bounded
+// socket timeout used for the connect handshake must not leak into calls and
+// cap them.
+#[test]
+#[ignore = "requires local Oracle listener via ORACLE_THIN_TEST_* environment variables"]
+fn no_call_timeout_lets_a_long_call_finish() {
+    let mut conn = connect();
+    assert_eq!(conn.call_timeout().expect("read call timeout"), None);
+
+    let sleep = Duration::from_secs(33);
+    let started = Instant::now();
+    conn.query_drop(&format!(
+        "BEGIN DBMS_SESSION.SLEEP({}); END;",
+        sleep.as_secs()
+    ))
+    .expect("long call should finish when no call timeout is set");
+
+    assert!(
+        started.elapsed() >= sleep - Duration::from_secs(1),
+        "call returned before the server finished sleeping"
+    );
+}
+
 #[test]
 #[ignore = "requires local Oracle listener via ORACLE_THIN_TEST_* environment variables"]
 fn python_oracledb_1135_1138_to_1140_1142_server_metadata_matches_queries() {

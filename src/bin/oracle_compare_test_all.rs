@@ -27,6 +27,8 @@ struct GridSnapshot {
 #[derive(Debug, Serialize, Deserialize)]
 struct DriverRunSnapshot {
     failures: Vec<String>,
+    #[serde(default)]
+    type_limit_skips: Vec<String>,
     grids: Vec<GridSnapshot>,
     open_cursor_count: u32,
 }
@@ -282,16 +284,51 @@ fn thin_value_to_text(value: &ThinOracleValue) -> Option<&str> {
     }
 }
 
-fn failures(progress: &[QueryProgress]) -> Vec<String> {
+fn failures(progress: &[QueryProgress], skip_oci_type_limits: bool) -> Vec<String> {
     progress
         .iter()
         .filter_map(|event| match progress_inner(event) {
-            QueryProgress::StatementFinished { index, result, .. } if !result.success => Some(
-                format!("#{index}: {} => {}", result.sql.trim(), result.message),
-            ),
+            QueryProgress::StatementFinished { index, result, .. } if !result.success => {
+                let oci_type_limit_skip =
+                    skip_oci_type_limits && oci_type_limit_message(&result.message);
+                if oci_type_limit_skip {
+                    None
+                } else {
+                    Some(format!(
+                        "#{index}: {} => {}",
+                        result.sql.trim(),
+                        result.message
+                    ))
+                }
+            }
             _ => None,
         })
         .collect()
+}
+
+/// SQL of statements the rust `oracle` (OCI) crate refuses to fetch because it
+/// has no mapping for the column type. Thin decodes these natively, so the
+/// statement has no OCI grid to compare against and is dropped from the
+/// comparison instead of failing it.
+fn oci_type_limit_skips(progress: &[QueryProgress]) -> Vec<String> {
+    progress
+        .iter()
+        .filter_map(|event| match progress_inner(event) {
+            QueryProgress::StatementFinished { result, .. }
+                if !result.success && oci_type_limit_message(&result.message) =>
+            {
+                Some(result.sql.trim().to_string())
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+/// The rust `oracle` crate raises these from its own type table (native JSON,
+/// VECTOR), so they can only come from the OCI driver and never from the server
+/// or from thin.
+fn oci_type_limit_message(message: &str) -> bool {
+    message.contains("unsupported Oracle type") || message.contains("unknown Oracle type number")
 }
 
 fn grids(progress: &[QueryProgress]) -> Vec<GridSnapshot> {
@@ -441,6 +478,8 @@ fn child_run(mode: OracleDriverMode, path: &str) -> Result<DriverRunSnapshot, St
         } else {
             body
         };
+        let body = serialize_native_json_select_items(&body);
+        let body = serialize_driver_divergent_select_items(&body);
         if is_final_sql {
             body
         } else {
@@ -449,8 +488,14 @@ fn child_run(mode: OracleDriverMode, path: &str) -> Result<DriverRunSnapshot, St
     };
 
     let (progress, open_cursor_count) = run_script(mode, &sql, auto_commit)?;
+    let is_oci = mode == OracleDriverMode::Oci;
     Ok(DriverRunSnapshot {
-        failures: failures(&progress),
+        failures: failures(&progress, is_oci),
+        type_limit_skips: if is_oci {
+            oci_type_limit_skips(&progress)
+        } else {
+            Vec::new()
+        },
         grids: grids(&progress),
         open_cursor_count,
     })
@@ -517,6 +562,18 @@ fn parent_run(path: &str) -> Result<(), String> {
         ));
     }
     let oci = run_child(OracleDriverMode::Oci, path)?;
+
+    // The OCI script run aborts on the first error, so a statement the rust
+    // `oracle` crate cannot fetch would silently cut the comparison short.
+    // `serialize_native_json_select_items` is meant to have neutralized them.
+    if !oci.type_limit_skips.is_empty() {
+        return Err(format!(
+            "Oracle OCI cannot fetch {} statement(s) in {path}; add them to \
+             serialize_native_json_select_items so both drivers stay comparable:\n{}",
+            oci.type_limit_skips.len(),
+            oci.type_limit_skips.join("\n")
+        ));
+    }
 
     if !oci.failures.is_empty() || !thin.failures.is_empty() {
         return Err(format!(
@@ -585,6 +642,80 @@ fn parent_run(path: &str) -> Result<(), String> {
         compared_cells.saturating_sub(exact_cells),
     );
     Ok(())
+}
+
+/// The rust `oracle` (OCI) crate has no mapping for the native JSON type, so a
+/// select item that returns JSON aborts the OCI side of the comparison and
+/// leaves nothing to compare for the rest of the script. Both children serialize
+/// such items to VARCHAR2 so every other cell in the fixture stays gated; thin's
+/// native JSON decoding is covered by the tns-thin live tests instead.
+fn serialize_native_json_select_items(body: &str) -> String {
+    const NATIVE_JSON_SELECT_ITEMS: [(&str, &str); 3] = [
+        (
+            "  JSON_MERGEPATCH(\n\
+             \x20   json_value,\n\
+             \x20   JSON_OBJECT('checked' VALUE TRUE RETURNING JSON)\n\
+             \x20 ) json_merged_value,",
+            "  JSON_SERIALIZE(JSON_MERGEPATCH(\n\
+             \x20   json_value,\n\
+             \x20   JSON_OBJECT('checked' VALUE TRUE RETURNING JSON)\n\
+             \x20 ) RETURNING VARCHAR2(4000)) json_merged_value,",
+        ),
+        (
+            "JSON_ARRAYAGG(varchar2_value ORDER BY type_id RETURNING JSON) json_array_value,",
+            "JSON_ARRAYAGG(varchar2_value ORDER BY type_id RETURNING VARCHAR2(4000)) \
+             json_array_value,",
+        ),
+        (
+            "  JSON_OBJECTAGG(\n\
+             \x20   KEY char_value VALUE integer_value\n\
+             \x20   RETURNING JSON\n\
+             \x20 ) json_object_value,",
+            "  JSON_OBJECTAGG(\n\
+             \x20   KEY char_value VALUE integer_value\n\
+             \x20   RETURNING VARCHAR2(4000)\n\
+             \x20 ) json_object_value,",
+        ),
+    ];
+
+    let mut body = body.to_string();
+    for (native, serialized) in NATIVE_JSON_SELECT_ITEMS {
+        body = body.replace(native, serialized);
+    }
+    body
+}
+
+/// The rust `oracle` (OCI) crate renders INTERVAL and TIMESTAMP WITH TIME ZONE
+/// values with ODPI-C's own text form (leading-precision zero padding, a numeric
+/// UTC offset), while thin decodes them the python-oracledb way (minimal padding,
+/// the stored region name). Both are faithful to the same value, so the drivers
+/// can never produce byte-identical grid cells for these items. Wrapping each in
+/// a server-side `TO_CHAR` moves the formatting into the database, so both
+/// drivers fetch one identical VARCHAR2 and the rest of the row stays gated;
+/// thin's native interval and timestamp-tz decoding is covered by the tns-thin
+/// live tests instead.
+fn serialize_driver_divergent_select_items(body: &str) -> String {
+    const DIVERGENT_SELECT_ITEMS: [(&str, &str); 3] = [
+        (
+            "  NUMTODSINTERVAL(90, 'SECOND') second_interval,",
+            "  TO_CHAR(NUMTODSINTERVAL(90, 'SECOND')) second_interval,",
+        ),
+        (
+            "  NUMTOYMINTERVAL(2, 'YEAR') year_interval,",
+            "  TO_CHAR(NUMTOYMINTERVAL(2, 'YEAR')) year_interval,",
+        ),
+        (
+            "  FROM_TZ(timestamp_value, 'Asia/Seoul') zoned_timestamp,",
+            "  TO_CHAR(FROM_TZ(timestamp_value, 'Asia/Seoul'), \
+             'YYYY-MM-DD HH24:MI:SS.FF6 TZR') zoned_timestamp,",
+        ),
+    ];
+
+    let mut body = body.to_string();
+    for (native, serialized) in DIVERGENT_SELECT_ITEMS {
+        body = body.replace(native, serialized);
+    }
+    body
 }
 
 fn thin_protocol_314() -> bool {
@@ -795,6 +926,85 @@ mod tests {
         assert!(rewritten.contains("implicit results unsupported by protocol 314"));
         assert!(!rewritten.contains("SET SERVEROUTPUT ON"));
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn native_json_select_item_is_serialized_for_both_drivers() {
+        let body = std::fs::read_to_string("test/final.sql").expect("read final.sql");
+
+        let rewritten = serialize_native_json_select_items(&body);
+
+        assert!(
+            rewritten.contains("JSON_SERIALIZE(JSON_MERGEPATCH("),
+            "the native JSON select item should be wrapped"
+        );
+        assert!(
+            rewritten.contains(") RETURNING VARCHAR2(4000)) json_merged_value,"),
+            "the wrapped item should keep its alias"
+        );
+        for alias in ["json_merged_value", "json_array_value", "json_object_value"] {
+            assert_eq!(
+                rewritten.matches(alias).count(),
+                body.matches(alias).count(),
+                "the rewrite should not duplicate or drop {alias}"
+            );
+        }
+        assert!(
+            !rewritten.contains("RETURNING JSON) json_array_value"),
+            "the aggregate select items should no longer return native JSON"
+        );
+        assert!(
+            !rewritten.contains("RETURNING JSON\n  ) json_object_value"),
+            "the aggregate select items should no longer return native JSON"
+        );
+    }
+
+    #[test]
+    fn driver_divergent_select_items_are_serialized_for_both_drivers() {
+        let body = std::fs::read_to_string("test/final.sql").expect("read final.sql");
+
+        let rewritten = serialize_driver_divergent_select_items(&body);
+
+        assert!(
+            rewritten.contains("TO_CHAR(NUMTODSINTERVAL(90, 'SECOND')) second_interval,"),
+            "the day-second interval item should be wrapped in TO_CHAR"
+        );
+        assert!(
+            rewritten.contains("TO_CHAR(NUMTOYMINTERVAL(2, 'YEAR')) year_interval,"),
+            "the year-month interval item should be wrapped in TO_CHAR"
+        );
+        assert!(
+            rewritten.contains(
+                "TO_CHAR(FROM_TZ(timestamp_value, 'Asia/Seoul'), \
+                 'YYYY-MM-DD HH24:MI:SS.FF6 TZR') zoned_timestamp,"
+            ),
+            "the timestamp-tz item should be formatted server-side with an explicit mask"
+        );
+        for alias in ["second_interval", "year_interval", "zoned_timestamp"] {
+            assert_eq!(
+                rewritten.matches(alias).count(),
+                body.matches(alias).count(),
+                "the rewrite should not duplicate or drop {alias}"
+            );
+        }
+        assert!(
+            !rewritten.contains("  NUMTODSINTERVAL(90, 'SECOND') second_interval,"),
+            "the raw interval select item should no longer be present"
+        );
+        assert!(
+            !rewritten.contains("  FROM_TZ(timestamp_value, 'Asia/Seoul') zoned_timestamp,"),
+            "the raw timestamp-tz select item should no longer be present"
+        );
+    }
+
+    #[test]
+    fn oci_type_limit_messages_are_recognized() {
+        assert!(oci_type_limit_message(
+            "Error: unsupported Oracle type JSON"
+        ));
+        assert!(oci_type_limit_message("unknown Oracle type number 2033"));
+        assert!(!oci_type_limit_message("ORA-00932: inconsistent datatypes"));
+        assert!(!oci_type_limit_message("ORA-00942: table does not exist"));
     }
 
     #[test]

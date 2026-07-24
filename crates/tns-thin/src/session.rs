@@ -38,8 +38,7 @@ use sha2::{Digest, Sha512};
 use crate::connect::{
     connect_data_descriptor_parts, connect_description_option_parts,
     validate_connect_descriptor_value, AcceptInfo, ConnectOptions, ConnectTarget,
-    OracleNetConnector, OracleNetServerType, TNS_DEFAULT_SOCKET_TIMEOUT,
-    TNS_MIN_SUPPORTED_PROTOCOL,
+    OracleNetConnector, OracleNetServerType, TNS_MIN_SUPPORTED_PROTOCOL,
 };
 use crate::exec::{
     parse_sql_bind_names, sql_dml_returning_has_duplicate_bind, sql_is_dml_returning,
@@ -786,6 +785,10 @@ impl OracleThinSession {
         negotiate_protocol(&mut stream, &mut capabilities)?;
         negotiate_data_types(&mut stream, &capabilities)?;
         let auth = authenticate(&mut stream, &config, &capabilities)?;
+        // The connect handshake runs under a bounded socket timeout; an
+        // established session has no call timeout until one is set, so clear it
+        // the way python-oracledb leaves the socket blocking after login.
+        clear_socket_timeouts(&stream)?;
         Ok(Self {
             stream,
             config,
@@ -1269,11 +1272,10 @@ impl OracleThinSession {
     }
 
     pub fn set_call_timeout(&mut self, timeout: Option<Duration>) -> Result<(), OracleThinError> {
-        let socket_timeout = Some(
-            timeout
-                .filter(|timeout| !timeout.is_zero())
-                .unwrap_or(TNS_DEFAULT_SOCKET_TIMEOUT),
-        );
+        // python-oracledb `set_call_timeout(0)` maps to `settimeout(None)`, so
+        // no call timeout means the socket blocks until the server answers.
+        // Falling back to a default socket timeout here would cap every call.
+        let socket_timeout = timeout.filter(|timeout| !timeout.is_zero());
         self.stream
             .set_read_timeout(socket_timeout)
             .map_err(|err| {
@@ -3601,6 +3603,18 @@ impl Drop for OracleThinSession {
     fn drop(&mut self) {
         let _ = self.close();
     }
+}
+
+/// Drops the bounded socket timeout used for the connect handshake. Matches
+/// python-oracledb `Transport.set_from_socket`, which puts the socket back into
+/// blocking mode once the connection is established.
+fn clear_socket_timeouts(stream: &TcpStream) -> Result<(), OracleThinError> {
+    stream.set_read_timeout(None).map_err(|err| {
+        OracleThinError::new(format!("failed to clear Oracle read timeout: {err}"))
+    })?;
+    stream
+        .set_write_timeout(None)
+        .map_err(|err| OracleThinError::new(format!("failed to clear Oracle write timeout: {err}")))
 }
 
 /// Cheap liveness probe for a session expected to be idle at a request
@@ -13149,10 +13163,10 @@ fn process_control_packet(data: &[u8]) -> Result<ControlPacketStatus, OracleThin
                 ))),
             }
         }
-        other => Err(OracleThinError::new(format!(
-            "received unsupported TNS control packet type {other}: {}",
-            hex_encode_upper(data)
-        ))),
+        // python-oracledb `_process_control_packet` only reacts to the OOB
+        // reset and in-band notification types and discards anything else, so
+        // an unknown control type must not break the connection.
+        _ => Ok(ControlPacketStatus::default()),
     }
 }
 
@@ -14404,6 +14418,7 @@ mod tests {
     };
     use std::time::{Duration, Instant};
 
+    use super::clear_socket_timeouts;
     use super::AuthCredentialInputs;
     use super::CANCEL_RESET_DRAIN_TIMEOUT;
     use super::{
@@ -14513,6 +14528,7 @@ mod tests {
         encode_oracle_bind_text, ORACLE_CHARSET_JA16SJIS, ORACLE_CHARSET_KO16KSC5601,
         ORACLE_CHARSET_KO16MSWIN949, ORACLE_CHARSET_ZHS16GBK, ORACLE_CHARSET_ZHT16BIG5,
     };
+    use crate::connect::TNS_DEFAULT_SOCKET_TIMEOUT;
     use crate::connect::{AcceptInfo, ConnectOptions, ConnectTarget, OracleNetServerType};
     use crate::exec::{
         BindInputValue, BindValue, ColumnMetadata, OracleColumnType, OracleIntervalDaySecond,
@@ -15031,6 +15047,54 @@ mod tests {
         ];
         write_ub4(&mut expected, 0);
         assert_eq!(release_body, expected);
+    }
+
+    #[test]
+    fn set_call_timeout_none_leaves_the_socket_blocking() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let (_server, _) = listener.accept().unwrap();
+        let mut session = test_session_with_stream(client);
+
+        session
+            .set_call_timeout(Some(Duration::from_secs(7)))
+            .unwrap();
+        assert_eq!(
+            session.stream.read_timeout().unwrap(),
+            Some(Duration::from_secs(7))
+        );
+        assert_eq!(
+            session.stream.write_timeout().unwrap(),
+            Some(Duration::from_secs(7))
+        );
+
+        // python-oracledb maps a zero/absent call timeout to `settimeout(None)`;
+        // a default socket timeout here would cap every call instead.
+        session.set_call_timeout(None).unwrap();
+        assert_eq!(session.stream.read_timeout().unwrap(), None);
+        assert_eq!(session.stream.write_timeout().unwrap(), None);
+
+        session.set_call_timeout(Some(Duration::ZERO)).unwrap();
+        assert_eq!(session.stream.read_timeout().unwrap(), None);
+        assert_eq!(session.stream.write_timeout().unwrap(), None);
+    }
+
+    #[test]
+    fn clear_socket_timeouts_drops_the_connect_handshake_timeout() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let (_server, _) = listener.accept().unwrap();
+        client
+            .set_read_timeout(Some(TNS_DEFAULT_SOCKET_TIMEOUT))
+            .unwrap();
+        client
+            .set_write_timeout(Some(TNS_DEFAULT_SOCKET_TIMEOUT))
+            .unwrap();
+
+        clear_socket_timeouts(&client).unwrap();
+
+        assert_eq!(client.read_timeout().unwrap(), None);
+        assert_eq!(client.write_timeout().unwrap(), None);
     }
 
     #[test]
@@ -16734,6 +16798,41 @@ mod tests {
             read_data_packet_with_control(&mut session.stream, 319).unwrap();
 
         assert!(oob_reset_received);
+        assert_eq!(payload, vec![TNS_MSG_TYPE_PROTOCOL]);
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn read_data_packet_discards_unknown_control_packet_types() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream
+                .write_all(&tns_test_packet(
+                    319,
+                    TNS_PACKET_TYPE_CONTROL,
+                    &[0x00, 0x63, 0xde, 0xad],
+                ))
+                .unwrap();
+
+            let mut data_body = Vec::new();
+            data_body.extend_from_slice(&TNS_DATA_FLAGS_EOF.to_be_bytes());
+            data_body.push(TNS_MSG_TYPE_PROTOCOL);
+            stream
+                .write_all(&tns_test_packet(319, TNS_PACKET_TYPE_DATA, &data_body))
+                .unwrap();
+        });
+        let stream = TcpStream::connect(addr).unwrap();
+        let mut session = test_session_with_stream(stream);
+        session
+            .set_call_timeout(Some(Duration::from_secs(1)))
+            .expect("set thin call timeout");
+
+        let (oob_reset_received, payload) =
+            read_data_packet_with_control(&mut session.stream, 319).unwrap();
+
+        assert!(!oob_reset_received);
         assert_eq!(payload, vec![TNS_MSG_TYPE_PROTOCOL]);
         server.join().unwrap();
     }

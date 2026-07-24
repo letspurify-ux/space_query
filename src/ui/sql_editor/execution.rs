@@ -32256,11 +32256,92 @@ mod mysql_transaction_feedback_tests {
         oracle_thin_skip_implicit_call_block(&sql_text)
     }
 
+    /// Replaces every `oqt_pkg.p_implicit(...)` invocation with a DBMS_OUTPUT
+    /// line. Callers pass both raw fixture text and auto-formatted text, so the
+    /// call is matched by identifier and argument list rather than by exact
+    /// layout.
     fn oracle_thin_skip_implicit_call_block(sql_text: &str) -> String {
-        sql_text.replace(
-            "BEGIN\n  oqt_pkg.p_implicit(10);\nEND;\n/",
-            "BEGIN\n  DBMS_OUTPUT.PUT_LINE('[p_implicit] skipped: implicit results unsupported by negotiated TTC field version');\nEND;\n/",
-        )
+        const CALL: &str = "oqt_pkg.p_implicit";
+        const SKIP_MESSAGE: &str = "DBMS_OUTPUT.PUT_LINE('[p_implicit] skipped: implicit results unsupported by negotiated TTC field version');";
+
+        let mut skipped = String::with_capacity(sql_text.len());
+        let mut copied = 0;
+        while let Some(offset) = oracle_thin_find_ignore_ascii_case(&sql_text[copied..], CALL) {
+            let start = copied + offset;
+            let Some(end) = oracle_thin_implicit_call_end(sql_text, start + CALL.len()) else {
+                break;
+            };
+            skipped.push_str(&sql_text[copied..start]);
+            skipped.push_str(SKIP_MESSAGE);
+            copied = end;
+        }
+        skipped.push_str(&sql_text[copied..]);
+        skipped
+    }
+
+    /// Byte offset of the first ASCII-case-insensitive match of `needle`.
+    fn oracle_thin_find_ignore_ascii_case(haystack: &str, needle: &str) -> Option<usize> {
+        haystack
+            .as_bytes()
+            .windows(needle.len())
+            .position(|window| window.eq_ignore_ascii_case(needle.as_bytes()))
+    }
+
+    /// Returns the offset just past the `(...)` argument list and `;` that
+    /// follow an `oqt_pkg.p_implicit` identifier, or `None` when the text does
+    /// not continue with a complete call statement.
+    fn oracle_thin_implicit_call_end(sql_text: &str, after_name: usize) -> Option<usize> {
+        let mut depth = 0usize;
+        let mut saw_arguments = false;
+        for (offset, character) in sql_text[after_name..].char_indices() {
+            match character {
+                character if character.is_whitespace() => {}
+                '(' => depth += 1,
+                ')' if depth > 0 => {
+                    depth -= 1;
+                    if depth == 0 {
+                        saw_arguments = true;
+                    }
+                }
+                ';' if depth == 0 && saw_arguments => {
+                    return Some(after_name + offset + character.len_utf8())
+                }
+                _ if depth > 0 => {}
+                _ => return None,
+            }
+        }
+        None
+    }
+
+    #[test]
+    fn oracle_thin_implicit_call_skip_matches_raw_and_formatted_fixture_text() {
+        let raw = "BEGIN\n  oqt_pkg.p_implicit(10);\nEND;\n/";
+        let formatted = "BEGIN\n    OQT_PKG.P_IMPLICIT (10);\nEND;\n/";
+
+        for sql_text in [raw, formatted] {
+            let skipped = oracle_thin_skip_implicit_call_block(sql_text);
+            assert!(
+                !skipped.to_lowercase().contains("oqt_pkg.p_implicit"),
+                "invocation should be replaced: {skipped}"
+            );
+            assert!(
+                skipped.contains("[p_implicit] skipped"),
+                "skip message should be substituted: {skipped}"
+            );
+            assert!(skipped.starts_with("BEGIN\n"), "block should stay intact");
+            assert!(skipped.ends_with("END;\n/"), "block should stay intact");
+        }
+    }
+
+    #[test]
+    fn oracle_thin_implicit_call_skip_leaves_declarations_untouched() {
+        let declarations = "PROCEDURE p_implicit(p_deptno IN NUMBER);\n\
+                            PROCEDURE p_implicit(p_deptno IN NUMBER) IS\n";
+
+        assert_eq!(
+            oracle_thin_skip_implicit_call_block(declarations),
+            declarations
+        );
     }
 
     fn oracle_thin_run_script(sql_text: &str) -> Vec<QueryProgress> {
