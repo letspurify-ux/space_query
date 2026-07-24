@@ -48,6 +48,15 @@ codegen-units = 1
 panic = "unwind"
 strip = true
 
+# Optimized profile for slow #[ignore] harness tests (e.g. the IntelliSense
+# fixture sweep): release-level speed without fat LTO, so rebuilds stay fast.
+[profile.sweep]
+inherits = "release"
+lto = false
+codegen-units = 16
+strip = false
+incremental = true
+
 [build-dependencies]
 cc = "1.2"
 syn = { version = "2", features = ["full"] }

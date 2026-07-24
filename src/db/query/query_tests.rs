@@ -2481,6 +2481,34 @@ fn test_maybe_inject_rowid_for_editing_skips_group_by() {
 }
 
 #[test]
+fn test_maybe_inject_rowid_for_editing_skips_nested_aggregate_wrappers() {
+    for sql in [
+        r#"SELECT XMLSERIALIZE(
+                 CONTENT XMLELEMENT("metrics",
+                   XMLAGG(
+                     XMLELEMENT("m", XMLFOREST(m.node_id AS "node"))
+                     ORDER BY m.metric_id))
+                 AS CLOB) AS xml_report
+            FROM sq_hard_metric m"#,
+        "SELECT ROUND(PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY sal), 2) FROM emp",
+        "SELECT XMLELEMENT(\"stats\", SYS_XMLAGG(XMLELEMENT(\"v\", sal))) FROM emp",
+    ] {
+        let rewritten = QueryExecutor::maybe_inject_rowid_for_editing(sql);
+        assert_eq!(rewritten, sql);
+    }
+}
+
+#[test]
+fn test_maybe_inject_rowid_for_editing_ignores_aggregate_in_scalar_subquery() {
+    let sql = "SELECT ENAME, COALESCE((SELECT AVG(SAL) FROM EMP), 0) AS AVG_SAL FROM EMP e";
+    let rewritten = QueryExecutor::maybe_inject_rowid_for_editing(sql);
+    assert_eq!(
+        rewritten,
+        "SELECT e.ROWID, ENAME, COALESCE((SELECT AVG(SAL) FROM EMP), 0) AS AVG_SAL FROM EMP e"
+    );
+}
+
+#[test]
 fn test_maybe_inject_rowid_for_editing_skips_connect_by() {
     let sql =
         "SELECT EMPNO, MGR, LEVEL FROM EMP CONNECT BY PRIOR EMPNO = MGR START WITH MGR IS NULL";
@@ -2779,6 +2807,16 @@ fn test_retryable_rowid_injection_error_detects_rowid_illegal_here() {
 fn test_retryable_rowid_injection_error_detects_invalid_identifier_rowid() {
     let message = "ORA-00904: \"ROWID\": invalid identifier";
     assert!(QueryExecutor::is_retryable_rowid_injection_error(message));
+}
+
+#[test]
+fn test_retryable_rowid_injection_error_detects_injected_grouping_errors() {
+    for message in [
+        "ORA-00937: not a single-group group function",
+        "ORA-00979: not a GROUP BY expression",
+    ] {
+        assert!(QueryExecutor::is_retryable_rowid_injection_error(message));
+    }
 }
 
 #[test]

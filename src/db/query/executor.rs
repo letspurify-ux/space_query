@@ -86,6 +86,8 @@ impl QueryExecutor {
     pub(crate) fn is_retryable_rowid_injection_error(message: &str) -> bool {
         message.contains("ORA-01445")
             || message.contains("ORA-01446")
+            || message.contains("ORA-00937")
+            || message.contains("ORA-00979")
             || (message.contains("ORA-00904") && message.to_ascii_uppercase().contains("ROWID"))
     }
 

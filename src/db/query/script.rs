@@ -6662,7 +6662,7 @@ impl QueryExecutor {
             || Self::has_top_level_identifier_keyword(sql, "MODEL")
             || !Self::is_single_table_from_clause(sql, from_idx)
             || Self::select_clause_has_distinct_or_unique(sql, select_idx, from_idx)
-            || Self::select_clause_has_top_level_aggregate(sql, select_idx, from_idx)
+            || Self::select_clause_has_aggregate_outside_subquery(sql, select_idx, from_idx)
             || Self::select_clause_has_top_level_analytic(sql, select_idx, from_idx)
         {
             return false;
@@ -6670,7 +6670,7 @@ impl QueryExecutor {
         true
     }
 
-    fn select_clause_has_top_level_aggregate(
+    fn select_clause_has_aggregate_outside_subquery(
         sql: &str,
         select_idx: usize,
         from_idx: usize,
@@ -6688,14 +6688,60 @@ impl QueryExecutor {
         }
 
         let select_list = &sql[select_body_start..from_idx];
-        let mut scanner = TopLevelScanner::new(select_list);
-        while let Some(token) = scanner.next() {
-            if let ScanToken::Word { text, .. } = token {
-                if Self::is_aggregate_function_name(text)
-                    && scanner.peek_next_non_ws_byte() == Some(b'(')
-                {
-                    return true;
+        let protected_spans = crate::sql_parser_engine::lexical_spans(select_list, false);
+        let bytes = select_list.as_bytes();
+        let mut protected_idx = 0usize;
+        let mut pos = 0usize;
+        let mut paren_frames = Vec::<(bool, bool)>::new();
+
+        while pos < bytes.len() {
+            while protected_idx < protected_spans.len() && protected_spans[protected_idx].end <= pos
+            {
+                protected_idx = protected_idx.saturating_add(1);
+            }
+            if protected_spans
+                .get(protected_idx)
+                .is_some_and(|span| span.start <= pos && pos < span.end)
+            {
+                pos = protected_spans[protected_idx].end;
+                continue;
+            }
+
+            match bytes[pos] {
+                b'(' => {
+                    paren_frames.push((false, false));
+                    pos = pos.saturating_add(1);
                 }
+                b')' => {
+                    paren_frames.pop();
+                    pos = pos.saturating_add(1);
+                }
+                byte if sql_text::is_identifier_start_byte(byte) => {
+                    let word_start = pos;
+                    pos = pos.saturating_add(1);
+                    while pos < bytes.len() && sql_text::is_identifier_byte(bytes[pos]) {
+                        pos = pos.saturating_add(1);
+                    }
+                    let word = &select_list[word_start..pos];
+                    if let Some((saw_first_word, is_subquery)) = paren_frames.last_mut() {
+                        if !*saw_first_word {
+                            *saw_first_word = true;
+                            *is_subquery = word.eq_ignore_ascii_case("SELECT")
+                                || word.eq_ignore_ascii_case("WITH");
+                        }
+                    }
+                    let next_byte = bytes[pos..]
+                        .iter()
+                        .copied()
+                        .find(|byte| !byte.is_ascii_whitespace());
+                    if !paren_frames.iter().any(|(_, is_subquery)| *is_subquery)
+                        && Self::is_aggregate_function_name(word)
+                        && next_byte == Some(b'(')
+                    {
+                        return true;
+                    }
+                }
+                _ => pos = pos.saturating_add(1),
             }
         }
         false
@@ -6709,16 +6755,30 @@ impl QueryExecutor {
                 | "AVG"
                 | "MIN"
                 | "MAX"
+                | "ANY_VALUE"
+                | "APPROX_COUNT_DISTINCT"
+                | "APPROX_MEDIAN"
+                | "APPROX_PERCENTILE"
+                | "COLLECT"
+                | "CUME_DIST"
+                | "DENSE_RANK"
                 | "LISTAGG"
                 | "JSON_ARRAYAGG"
                 | "JSON_OBJECTAGG"
+                | "PERCENT_RANK"
+                | "PERCENTILE_CONT"
+                | "PERCENTILE_DISC"
+                | "RANK"
+                | "STATS_MODE"
                 | "STDDEV"
                 | "STDDEV_POP"
                 | "STDDEV_SAMP"
+                | "SYS_XMLAGG"
                 | "VARIANCE"
                 | "VAR_POP"
                 | "VAR_SAMP"
                 | "MEDIAN"
+                | "XMLAGG"
                 | "CORR"
                 | "COVAR_POP"
                 | "COVAR_SAMP"
