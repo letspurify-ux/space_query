@@ -832,8 +832,8 @@ ORDER BY log_id;
 -- source: test_mysql/test2.txt
 -- db: MySQL
 -- metadata: test_mysql/test2.txt inferred catalog
--- checked: 707
--- suggestions checked: 2604
+-- checked: 706
+-- suggestions checked: 2598
 -- missing: 0
 -- suggestions without type labels: 0
 -- marker: [[word]] means not suggested for the tested prefix

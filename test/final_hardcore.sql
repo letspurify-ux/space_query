@@ -1,0 +1,1056 @@
+--------------------------------------------------------------------------------
+-- Oracle SQL / PL/SQL HARDCORE editor-engine stress suite.
+-- Live target: Oracle AI Database Free 26ai (23.26.0.0.0).
+-- Run from the repository root with SYSTEM connected to the FREE service.
+--
+-- Purpose: DELIBERATELY hostile-but-legal grammar that pushes the completion,
+-- auto-formatting, and syntax-highlighting engines far past the gentle coverage
+-- of test/final.sql. Everything here still parses and executes on the live
+-- server so the formatted output can be re-executed for certification.
+--
+-- Standalone: creates only isolated SQ_HARD_* objects, verifies every result it
+-- depends on, and can be run repeatedly.
+--------------------------------------------------------------------------------
+
+SET SERVEROUTPUT ON SIZE UNLIMITED
+SET FEEDBACK ON
+SET DEFINE OFF
+WHENEVER SQLERROR EXIT SQL.SQLCODE ROLLBACK
+
+PROMPT [ORACLE HARDCORE] hostile-but-legal grammar stress
+
+BEGIN
+  FOR ddl_text IN (
+    SELECT 'DROP PROPERTY GRAPH sq_hard_graph' text_value FROM dual UNION ALL
+    SELECT 'DROP VIEW sq_hard_dv' FROM dual UNION ALL
+    SELECT 'DROP MATERIALIZED VIEW sq_hard_mv' FROM dual UNION ALL
+    SELECT 'DROP VIEW sq_hard_v' FROM dual UNION ALL
+    SELECT 'DROP FUNCTION sq_hard_pipe' FROM dual UNION ALL
+    SELECT 'DROP FUNCTION sq_hard_topn' FROM dual UNION ALL
+    SELECT 'DROP FUNCTION sq_hard_taxed' FROM dual UNION ALL
+    SELECT 'DROP PACKAGE sq_hard_pkg' FROM dual UNION ALL
+    SELECT 'DROP TYPE sq_hard_point3_t FORCE' FROM dual UNION ALL
+    SELECT 'DROP TYPE sq_hard_point_t FORCE' FROM dual UNION ALL
+    SELECT 'DROP TYPE sq_hard_num_tab FORCE' FROM dual UNION ALL
+    SELECT 'DROP TABLE sq_hard_merge PURGE' FROM dual UNION ALL
+    SELECT 'DROP TABLE sq_hard_edge PURGE' FROM dual UNION ALL
+    SELECT 'DROP TABLE sq_hard_split_hi PURGE' FROM dual UNION ALL
+    SELECT 'DROP TABLE sq_hard_split_lo PURGE' FROM dual UNION ALL
+    SELECT 'DROP TABLE sq_hard_metric PURGE' FROM dual UNION ALL
+    SELECT 'DROP TABLE sq_hard_metric_audit PURGE' FROM dual UNION ALL
+    SELECT 'DROP TABLE sq_hard_quoted PURGE' FROM dual UNION ALL
+    SELECT 'DROP TABLE sq_hard_doc PURGE' FROM dual
+  ) LOOP
+    BEGIN
+      EXECUTE IMMEDIATE ddl_text.text_value;
+    EXCEPTION
+      WHEN OTHERS THEN NULL;
+    END;
+  END LOOP;
+END;
+/
+
+--------------------------------------------------------------------------------
+-- Quoted identifiers that collide with reserved words, embed spaces, doubled
+-- quotes, and $/# characters. Highlighting and completion must treat these as
+-- identifiers, never keywords.
+--------------------------------------------------------------------------------
+CREATE TABLE sq_hard_quoted (
+  "SELECT"                 NUMBER,
+  "FROM"                   VARCHAR2(30),
+  "Group By"               DATE,
+  "order"                  NUMBER,
+  "x$weird#col$"           NUMBER,
+  "Column With Spaces"     VARCHAR2(30),
+  CONSTRAINT "sq_hard_quoted$pk" PRIMARY KEY ("SELECT")
+) TABLESPACE users;
+
+INSERT INTO sq_hard_quoted (
+  "SELECT", "FROM", "Group By", "order", "x$weird#col$", "Column With Spaces"
+) VALUES (1, 'from-value', DATE '2024-02-29', 2, 3, 'q"q');
+
+SELECT q."SELECT" + q."order"                      AS "Total Sum",
+       q."FROM" || '/' || q."Column With Spaces"   AS joined_text,
+       EXTRACT(YEAR FROM q."Group By")             AS leap_year
+FROM sq_hard_quoted q
+WHERE q."SELECT" = 1 AND q."order" BETWEEN 1 AND 9;
+
+--------------------------------------------------------------------------------
+-- Deeply nested inline views + scalar subqueries + optimizer hints + comments
+-- interleaved mid-statement (block and line).
+--------------------------------------------------------------------------------
+SELECT /* torture: deep nesting */ deep.total,
+       (SELECT MAX(LEVEL) FROM dual CONNECT BY LEVEL <= deep.total) AS max_level
+FROM (
+  SELECT /*+ NO_MERGE */
+         (SELECT COUNT(*) -- innermost scalar
+          FROM (SELECT 3 c FROM (SELECT 2 b FROM (SELECT 1 a FROM dual) t3) t2) t1
+         ) AS total
+  FROM dual
+) deep;
+
+--------------------------------------------------------------------------------
+-- Operator adjacency without whitespace, alternative-quoted and national
+-- literals with nested delimiters, float/scientific suffixes.
+--------------------------------------------------------------------------------
+SELECT 1+2*3-4/2                          AS arithmetic_value,
+       'a'||'b'||'c'||'d'                 AS concat_chain,
+       q'{brace {nested} literal}'        AS q_brace,
+       q'!bang ' apostrophe!'             AS q_bang,
+       nq'[national <<quote>>]'           AS q_national,
+       3.14f                              AS binary_float_lit,
+       2.71d                              AS binary_double_lit,
+       0.5e-3                             AS scientific_lit,
+       CASE WHEN 5<>6 AND 7<=8 AND 9>=9 THEN 'Y' ELSE 'N' END AS comparison_chain
+FROM dual;
+
+--------------------------------------------------------------------------------
+-- Analytic RANGE window over DATE with an INTERVAL bound, nested CASE inside the
+-- projection, DECODE / NVL2 / NULLIF stacked.
+--------------------------------------------------------------------------------
+CREATE TABLE sq_hard_metric (
+  metric_id   NUMBER CONSTRAINT sq_hard_metric_pk PRIMARY KEY,
+  node_id     NUMBER NOT NULL,
+  metric_day  DATE   NOT NULL,
+  metric_name VARCHAR2(32) NOT NULL,
+  metric_value NUMBER(12,2) NOT NULL,
+  payload     JSON
+) TABLESPACE users;
+
+INSERT INTO sq_hard_metric VALUES (1, 1, DATE '2026-01-01', 'LATENCY', 12,
+  JSON_OBJECT('tags' VALUE JSON_ARRAY('sql', 'manual')));
+INSERT INTO sq_hard_metric VALUES (2, 1, DATE '2026-01-03', 'LATENCY', 18,
+  JSON_OBJECT('tags' VALUE JSON_ARRAY('query')));
+INSERT INTO sq_hard_metric VALUES (3, 1, DATE '2026-01-08', 'LATENCY', 24,
+  JSON_OBJECT('tags' VALUE JSON_ARRAY('json', 'vector')));
+INSERT INTO sq_hard_metric VALUES (4, 2, DATE '2026-01-02', 'ERRORS', 2,
+  JSON_OBJECT('tags' VALUE JSON_ARRAY('routine')));
+
+--------------------------------------------------------------------------------
+-- Compound-trigger state shared across timing points. The no-op UPDATE is
+-- intentional: it makes INSERTING/UPDATING/DELETING, :OLD/:NEW, associative
+-- arrays, and statement/row timing sections executable rather than decorative.
+--------------------------------------------------------------------------------
+CREATE TABLE sq_hard_metric_audit (
+  statement_no    NUMBER GENERATED ALWAYS AS IDENTITY,
+  action_name     VARCHAR2(10) NOT NULL,
+  changed_rows    NUMBER NOT NULL,
+  sample_metric_id NUMBER NOT NULL,
+  CONSTRAINT sq_hard_metric_audit_pk PRIMARY KEY (statement_no)
+) TABLESPACE users;
+
+CREATE OR REPLACE TRIGGER sq_hard_metric_ct
+FOR INSERT OR UPDATE OF metric_value OR DELETE ON sq_hard_metric
+COMPOUND TRIGGER
+  TYPE metric_id_tab IS TABLE OF sq_hard_metric.metric_id%TYPE
+    INDEX BY PLS_INTEGER;
+  g_metric_ids metric_id_tab;
+  g_row_count  PLS_INTEGER := 0;
+  g_action     VARCHAR2(10);
+
+  BEFORE STATEMENT IS
+  BEGIN
+    g_metric_ids.DELETE;
+    g_row_count := 0;
+    IF INSERTING THEN
+      g_action := 'INSERT';
+    ELSIF UPDATING THEN
+      g_action := 'UPDATE';
+    ELSE
+      g_action := 'DELETE';
+    END IF;
+  END BEFORE STATEMENT;
+
+  AFTER EACH ROW IS
+  BEGIN
+    g_row_count := g_row_count + 1;
+    IF INSERTING OR UPDATING THEN
+      g_metric_ids(g_row_count) := :NEW.metric_id;
+    ELSE
+      g_metric_ids(g_row_count) := :OLD.metric_id;
+    END IF;
+  END AFTER EACH ROW;
+
+  AFTER STATEMENT IS
+    l_sample_metric_id sq_hard_metric.metric_id%TYPE;
+  BEGIN
+    IF g_row_count > 0 THEN
+      l_sample_metric_id := g_metric_ids(g_metric_ids.FIRST);
+      INSERT INTO sq_hard_metric_audit (
+        action_name, changed_rows, sample_metric_id
+      ) VALUES (
+        g_action, g_row_count, l_sample_metric_id
+      );
+    END IF;
+  END AFTER STATEMENT;
+END sq_hard_metric_ct;
+/
+
+UPDATE sq_hard_metric
+SET metric_value = metric_value
+WHERE node_id = 1;
+
+SELECT metric_id, node_id, metric_day, metric_value,
+       CASE WHEN metric_value >
+                 (CASE WHEN node_id = 1 THEN 10 ELSE 20 END)
+            THEN NVL2(payload, 'has-json',
+                      DECODE(node_id, 1, 'one', 2, 'two', 'other'))
+            ELSE NULLIF(metric_name, 'MISSING') END        AS nested_branch,
+       SUM(metric_value) OVER (
+         PARTITION BY node_id ORDER BY metric_day
+         RANGE BETWEEN INTERVAL '7' DAY PRECEDING AND CURRENT ROW
+       )                                                    AS windowed_sum
+FROM sq_hard_metric
+ORDER BY node_id, metric_id;
+
+--------------------------------------------------------------------------------
+-- Doubly nested JSON_TABLE with NESTED PATH, ordinality, and ON EMPTY defaults.
+--------------------------------------------------------------------------------
+SELECT m.metric_id, jt.tag_no, jt.tag_value
+FROM sq_hard_metric m,
+     JSON_TABLE(m.payload, '$'
+       COLUMNS (
+         NESTED PATH '$.tags[*]' COLUMNS (
+           tag_no    FOR ORDINALITY,
+           tag_value VARCHAR2(32) PATH '$'
+         )
+       )) jt
+ORDER BY m.metric_id, jt.tag_no;
+
+--------------------------------------------------------------------------------
+-- MATCH_RECOGNIZE with a quantified pattern, DEFINE, MEASURES, and PREV/NEXT.
+--------------------------------------------------------------------------------
+SELECT node_id, match_no, rising_days
+FROM sq_hard_metric
+MATCH_RECOGNIZE (
+  PARTITION BY node_id
+  ORDER BY metric_day
+  MEASURES MATCH_NUMBER() AS match_no,
+           COUNT(rise.*)  AS rising_days
+  ONE ROW PER MATCH
+  AFTER MATCH SKIP PAST LAST ROW
+  PATTERN (strt rise+)
+  DEFINE rise AS rise.metric_value > PREV(rise.metric_value)
+)
+ORDER BY node_id, match_no;
+
+--------------------------------------------------------------------------------
+-- Single-statement frame collision: local PL/SQL function + two recursive
+-- clauses (SEARCH/CYCLE), JSON_TABLE, inherited data through OUTER APPLY,
+-- GROUPING SETS, LISTAGG overflow syntax, JSON aggregation, analytics, and
+-- QUALIFY. This deliberately makes the parser restore every parent scope before
+-- it can resolve the final aliases.
+--------------------------------------------------------------------------------
+WITH
+  FUNCTION canonical_code(p_text VARCHAR2) RETURN VARCHAR2 IS
+  BEGIN
+    RETURN UPPER(REGEXP_REPLACE(TRIM(p_text), '[^[:alnum:]]+', '_'));
+  END;
+  hard_nodes (node_id, parent_node_id, node_name) AS (
+    SELECT 1, CAST(NULL AS NUMBER), 'Root Node' FROM dual
+    UNION ALL SELECT 2, 1, 'Blue Child' FROM dual
+    UNION ALL SELECT 3, 1, 'Green Child' FROM dual
+    UNION ALL SELECT 4, 2, 'Leaf Node' FROM dual
+  ),
+  hard_tree (
+    node_id, parent_node_id, node_name, tree_depth, node_path
+  ) AS (
+    SELECT n.node_id, n.parent_node_id, n.node_name, 0,
+           CAST('/' || canonical_code(n.node_name) AS VARCHAR2(400))
+    FROM hard_nodes n
+    WHERE n.parent_node_id IS NULL
+    UNION ALL
+    SELECT n.node_id, n.parent_node_id, n.node_name, t.tree_depth + 1,
+           t.node_path || '/' || canonical_code(n.node_name)
+    FROM hard_nodes n
+    JOIN hard_tree t ON t.node_id = n.parent_node_id
+  )
+  SEARCH DEPTH FIRST BY node_name SET traversal_no
+  CYCLE node_id SET cycle_yn TO 'Y' DEFAULT 'N',
+  tag_rows (
+    metric_id, node_id, metric_name, metric_value, tag_no, tag_value
+  ) AS (
+    SELECT m.metric_id, m.node_id, m.metric_name, m.metric_value,
+           jt.tag_no, jt.tag_value
+    FROM sq_hard_metric m
+    CROSS APPLY JSON_TABLE(
+      m.payload,
+      '$.tags[*]' COLUMNS (
+        tag_no    FOR ORDINALITY,
+        tag_value VARCHAR2(32) PATH '$' NULL ON ERROR
+      )
+    ) jt
+  ),
+  metric_analytics AS (
+    SELECT m.metric_id, m.node_id, m.metric_day, m.metric_name, m.metric_value,
+           SUM(m.metric_value) OVER (
+             PARTITION BY m.node_id
+             ORDER BY m.metric_day, m.metric_id
+             ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+           ) AS running_value,
+           DENSE_RANK() OVER (
+             PARTITION BY m.node_id
+             ORDER BY m.metric_value DESC, m.metric_id
+           ) AS value_rank
+    FROM sq_hard_metric m
+  ),
+  metric_rollup (
+    node_id, metric_name, metric_total, grouping_value
+  ) AS (
+    SELECT node_id, metric_name, SUM(metric_value),
+           GROUPING_ID(node_id, metric_name)
+    FROM sq_hard_metric
+    GROUP BY GROUPING SETS (
+      (node_id, metric_name),
+      (node_id),
+      ()
+    )
+  ),
+  final_rows AS (
+    SELECT t.node_id, t.parent_node_id, t.node_name, t.tree_depth,
+           t.node_path, t.cycle_yn,
+           top_metric.metric_id, top_metric.metric_name,
+           top_metric.metric_value, top_metric.running_value,
+           (SELECT LISTAGG(
+                     r.tag_value,
+                     ',' ON OVERFLOW TRUNCATE '...' WITH COUNT
+                   ) WITHIN GROUP (
+                     ORDER BY r.metric_id, r.tag_no
+                   )
+            FROM tag_rows r
+            WHERE r.node_id = t.node_id) AS tag_list,
+           (SELECT JSON_ARRAYAGG(
+                     r.tag_value
+                     ORDER BY r.metric_id, r.tag_no
+                     RETURNING CLOB
+                   )
+            FROM tag_rows r
+            WHERE r.node_id = t.node_id) AS tag_json
+    FROM hard_tree t
+    OUTER APPLY (
+      SELECT a.metric_id, a.metric_name, a.metric_value, a.running_value
+      FROM metric_analytics a
+      WHERE a.node_id = t.node_id
+      ORDER BY a.value_rank, a.metric_id
+      FETCH FIRST 1 ROW ONLY
+    ) top_metric
+  )
+SELECT CASE
+         WHEN (SELECT COUNT(*) FROM hard_tree) = 4
+          AND (SELECT COUNT(*) FROM tag_rows) = 6
+          AND (SELECT metric_total
+               FROM metric_rollup
+               WHERE grouping_value = 3) = 56
+         THEN 'PASS'
+         ELSE TO_CHAR(1 / 0)
+       END AS integrated_status,
+       f.node_id, f.node_name, f.tree_depth, f.node_path,
+       f.metric_name, f.metric_value, f.running_value, f.tag_list,
+       JSON_OBJECT(
+         'cycle' VALUE f.cycle_yn,
+         'tags' VALUE f.tag_json FORMAT JSON,
+         'grandTotal' VALUE (
+           SELECT metric_total
+           FROM metric_rollup
+           WHERE grouping_value = 3
+         )
+         RETURNING CLOB
+       ) AS evidence
+FROM final_rows f
+QUALIFY ROW_NUMBER() OVER (
+  PARTITION BY NVL(f.parent_node_id, -1)
+  ORDER BY f.node_id
+) = 1
+ORDER BY f.node_id;
+/
+
+--------------------------------------------------------------------------------
+-- Recursive WITH carrying a PL/SQL WITH FUNCTION, hierarchical CONNECT BY, and
+-- a MODEL rule in the same script.
+--------------------------------------------------------------------------------
+WITH
+  FUNCTION sq_hard_double(p NUMBER) RETURN NUMBER IS
+  BEGIN
+    RETURN p * 2;
+  END;
+  counter (n) AS (
+    SELECT 1 FROM dual
+    UNION ALL
+    SELECT n + 1 FROM counter WHERE n < 5
+  )
+SELECT n, sq_hard_double(n) AS doubled
+FROM counter
+ORDER BY n;
+/
+
+SELECT metric_id, node_id, metric_value
+FROM sq_hard_metric
+MODEL
+  PARTITION BY (node_id)
+  DIMENSION BY (metric_id)
+  MEASURES (metric_value)
+  RULES UPSERT SEQUENTIAL ORDER (
+    metric_value[999] = MAX(metric_value)[ANY] + 1
+  )
+ORDER BY node_id, metric_id;
+
+--------------------------------------------------------------------------------
+-- XMLTABLE with namespaces, PIVOT, and a set operator chain with parentheses.
+--------------------------------------------------------------------------------
+SELECT x.seq, x.label
+FROM XMLTABLE(
+       XMLNAMESPACES ('urn:sq:hard' AS "h"),
+       '/h:root/h:item'
+       PASSING XMLTYPE(
+         '<h:root xmlns:h="urn:sq:hard">' ||
+         '<h:item seq="1">alpha</h:item>' ||
+         '<h:item seq="2">beta</h:item></h:root>')
+       COLUMNS
+         seq   NUMBER       PATH '@seq',
+         label VARCHAR2(16) PATH 'text()'
+     ) x
+ORDER BY x.seq;
+
+SELECT *
+FROM (SELECT node_id, metric_name, metric_value FROM sq_hard_metric)
+PIVOT (SUM(metric_value) AS total
+       FOR metric_name IN ('LATENCY' AS lat, 'ERRORS' AS err))
+ORDER BY node_id;
+
+(SELECT node_id FROM sq_hard_metric WHERE metric_value >= 10)
+INTERSECT
+(SELECT node_id FROM sq_hard_metric WHERE metric_name = 'LATENCY')
+MINUS
+(SELECT node_id FROM sq_hard_metric WHERE metric_name = 'NEVER')
+ORDER BY node_id;
+
+--------------------------------------------------------------------------------
+-- PL/SQL: pipelined table function over a collection type.
+--------------------------------------------------------------------------------
+CREATE OR REPLACE TYPE sq_hard_num_tab AS TABLE OF NUMBER;
+/
+CREATE OR REPLACE FUNCTION sq_hard_pipe(p_n PLS_INTEGER)
+  RETURN sq_hard_num_tab PIPELINED
+IS
+BEGIN
+  FOR i IN 1 .. p_n LOOP
+    PIPE ROW (i * i);
+  END LOOP;
+  RETURN;
+END sq_hard_pipe;
+/
+SELECT COLUMN_VALUE AS squared
+FROM TABLE(sq_hard_pipe(4))
+ORDER BY 1;
+
+--------------------------------------------------------------------------------
+-- PL/SQL: quoted keyword identifiers, nested labelled blocks, %ROWTYPE
+-- associative array, BULK COLLECT, FORALL with SAVE EXCEPTIONS, conditional
+-- compilation, and a REF CURSOR.
+--------------------------------------------------------------------------------
+CREATE OR REPLACE PACKAGE sq_hard_pkg AUTHID DEFINER AS
+  TYPE metric_rows IS TABLE OF sq_hard_metric%ROWTYPE INDEX BY PLS_INTEGER;
+  TYPE metric_ref  IS REF CURSOR RETURN sq_hard_metric%ROWTYPE;
+  FUNCTION bulk_total RETURN NUMBER;
+END sq_hard_pkg;
+/
+CREATE OR REPLACE PACKAGE BODY sq_hard_pkg AS
+  FUNCTION bulk_total RETURN NUMBER IS
+    l_rows   metric_rows;
+    l_total  NUMBER := 0;
+    "BEGIN"  PLS_INTEGER := 0;
+    l_cursor metric_ref;
+    l_one    sq_hard_metric%ROWTYPE;
+  BEGIN
+    <<load_block>>
+    BEGIN
+      SELECT * BULK COLLECT INTO l_rows FROM sq_hard_metric ORDER BY metric_id;
+      FORALL i IN 1 .. l_rows.COUNT SAVE EXCEPTIONS
+        UPDATE sq_hard_metric SET metric_value = metric_value
+        WHERE metric_id = l_rows(i).metric_id;
+    END load_block;
+
+    FOR i IN 1 .. l_rows.COUNT LOOP
+      "BEGIN" := "BEGIN" + 1;
+      l_total := l_total + l_rows(i).metric_value;
+    END LOOP;
+
+    OPEN l_cursor FOR SELECT * FROM sq_hard_metric WHERE ROWNUM <= 1;
+    FETCH l_cursor INTO l_one;
+    CLOSE l_cursor;
+
+    $IF DBMS_DB_VERSION.VER_LE_11 $THEN
+      l_total := l_total;
+    $ELSE
+      l_total := l_total + 0;
+    $END
+
+    RETURN l_total + "BEGIN" * 0;
+  END bulk_total;
+END sq_hard_pkg;
+/
+
+--------------------------------------------------------------------------------
+-- Multi-branch MERGE with a matched DELETE clause and conditional INSERT.
+--------------------------------------------------------------------------------
+CREATE TABLE sq_hard_merge (
+  k NUMBER CONSTRAINT sq_hard_merge_pk PRIMARY KEY,
+  v NUMBER,
+  tag VARCHAR2(10)
+) TABLESPACE users;
+
+INSERT INTO sq_hard_merge
+SELECT LEVEL, LEVEL * 10, 'init' FROM dual CONNECT BY LEVEL <= 5;
+
+MERGE INTO sq_hard_merge t
+USING (SELECT LEVEL k, LEVEL * 100 v FROM dual CONNECT BY LEVEL <= 7) s
+ON (t.k = s.k)
+WHEN MATCHED THEN UPDATE SET t.v = s.v, t.tag = 'upd'
+  DELETE WHERE t.v < 300
+WHEN NOT MATCHED THEN INSERT (k, v, tag) VALUES (s.k, s.v, 'ins')
+  WHERE s.k > 5;
+
+--------------------------------------------------------------------------------
+-- View + materialized view built on the torture tables, then a flashback query.
+--------------------------------------------------------------------------------
+CREATE OR REPLACE VIEW sq_hard_v AS
+SELECT node_id, COUNT(*) AS metric_count, SUM(metric_value) AS total_value
+FROM sq_hard_metric
+GROUP BY node_id
+WITH READ ONLY;
+
+CREATE MATERIALIZED VIEW sq_hard_mv
+  BUILD IMMEDIATE REFRESH COMPLETE ON DEMAND
+  AS SELECT node_id, MAX(metric_value) AS peak FROM sq_hard_metric GROUP BY node_id;
+
+--------------------------------------------------------------------------------
+-- 23ai surface: BOOLEAN column (never projected raw), VECTOR similarity,
+-- XMLTYPE storage, DEFAULT ON NULL, Unicode quoted identifier, and UNISTR /
+-- national literals in one table.
+--------------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS sq_hard_doc (
+  doc_id       NUMBER DEFAULT ON NULL 0 NOT NULL,
+  "한글 컬럼"  NVARCHAR2(40),
+  is_hot       BOOLEAN NOT NULL,
+  body_xml     XMLTYPE,
+  embedding    VECTOR(3, FLOAT32),
+  CONSTRAINT sq_hard_doc_pk PRIMARY KEY (doc_id)
+) TABLESPACE users;
+
+INSERT INTO sq_hard_doc (doc_id, "한글 컬럼", is_hot, body_xml, embedding) VALUES
+  (1, N'첫번째 문서', TRUE,
+   XMLTYPE('<doc><v>10</v><v>30</v><v>20</v></doc>'),
+   TO_VECTOR('[1.0, 2.0, 2.0]')),
+  (2, UNISTR('\B450\BC88\C9F8'), FALSE,
+   XMLTYPE('<doc><v>5</v></doc>'),
+   TO_VECTOR('[0.0, 3.0, 4.0]'));
+
+SELECT d.doc_id,
+       d."한글 컬럼"                                     AS unicode_name,
+       CASE WHEN d.is_hot THEN 'hot' ELSE 'cold' END     AS heat,
+       ROUND(VECTOR_DISTANCE(d.embedding,
+                             TO_VECTOR('[1.0, 2.0, 2.0]'),
+                             EUCLIDEAN), 4)              AS vec_dist,
+       XMLCAST(XMLQUERY('sum(/doc/v)' PASSING d.body_xml
+                        RETURNING CONTENT) AS NUMBER)    AS xml_sum
+FROM sq_hard_doc d
+WHERE d.is_hot OR NOT d.is_hot
+ORDER BY d.doc_id;
+
+--------------------------------------------------------------------------------
+-- XQuery FLWOR inside XMLQUERY, XMLEXISTS predicate, and indented
+-- XMLSERIALIZE over aggregated XMLELEMENT/XMLFOREST/XMLAGG output.
+--------------------------------------------------------------------------------
+SELECT XMLSERIALIZE(
+         CONTENT XMLELEMENT("metrics",
+           XMLAGG(
+             XMLELEMENT("m",
+               XMLFOREST(m.node_id AS "node", m.metric_value AS "value"))
+             ORDER BY m.metric_id))
+         AS CLOB INDENT SIZE = 2)                        AS xml_report
+FROM sq_hard_metric m;
+
+SELECT XMLCAST(
+         XMLQUERY('for $v in /doc/v where xs:integer($v) > 5 order by xs:integer($v) descending return $v'
+                  PASSING d.body_xml RETURNING CONTENT
+         ) AS VARCHAR2(40))                              AS flwor_values
+FROM sq_hard_doc d
+WHERE XMLEXISTS('/doc/v[. > 25]' PASSING d.body_xml);
+
+--------------------------------------------------------------------------------
+-- Multi-table conditional INSERT FIRST with overlapping WHEN branches and an
+-- ELSE bucket fed by a correlated source query.
+--------------------------------------------------------------------------------
+CREATE TABLE sq_hard_split_hi (
+  metric_id NUMBER PRIMARY KEY,
+  bucket_tag VARCHAR2(8) NOT NULL
+) TABLESPACE users;
+CREATE TABLE sq_hard_split_lo (
+  metric_id NUMBER PRIMARY KEY,
+  bucket_tag VARCHAR2(8) NOT NULL
+) TABLESPACE users;
+
+INSERT FIRST
+  WHEN src_value >= 20 THEN
+    INTO sq_hard_split_hi (metric_id, bucket_tag) VALUES (src_id, 'peak')
+  WHEN src_value >= 15 THEN
+    INTO sq_hard_split_hi (metric_id, bucket_tag) VALUES (src_id, 'high')
+  ELSE
+    INTO sq_hard_split_lo (metric_id, bucket_tag) VALUES (src_id, 'low')
+SELECT m.metric_id AS src_id, m.metric_value AS src_value
+FROM sq_hard_metric m;
+
+--------------------------------------------------------------------------------
+-- Object-relational: NOT FINAL supertype, subtype with OVERRIDING member, MAP
+-- ordering, TREAT / IS OF (TYPE ...) narrowing, and method calls through a
+-- table alias.
+--------------------------------------------------------------------------------
+CREATE OR REPLACE TYPE sq_hard_point_t AS OBJECT (
+  x NUMBER,
+  y NUMBER,
+  MEMBER FUNCTION norm RETURN NUMBER,
+  MAP MEMBER FUNCTION sort_key RETURN NUMBER
+) NOT FINAL;
+/
+CREATE OR REPLACE TYPE BODY sq_hard_point_t AS
+  MEMBER FUNCTION norm RETURN NUMBER IS
+  BEGIN
+    RETURN SQRT(x * x + y * y);
+  END norm;
+  MAP MEMBER FUNCTION sort_key RETURN NUMBER IS
+  BEGIN
+    RETURN SELF.norm();
+  END sort_key;
+END;
+/
+CREATE OR REPLACE TYPE sq_hard_point3_t UNDER sq_hard_point_t (
+  z NUMBER,
+  OVERRIDING MEMBER FUNCTION norm RETURN NUMBER
+);
+/
+CREATE OR REPLACE TYPE BODY sq_hard_point3_t AS
+  OVERRIDING MEMBER FUNCTION norm RETURN NUMBER IS
+  BEGIN
+    RETURN SQRT(x * x + y * y + z * z);
+  END norm;
+END;
+/
+
+SELECT t.tag_name,
+       t.pt.norm()                                        AS point_norm,
+       CASE WHEN t.pt IS OF (ONLY sq_hard_point3_t)
+            THEN TREAT(t.pt AS sq_hard_point3_t).z
+            ELSE NULL END                                 AS depth_z,
+       lat.echo_norm
+FROM (SELECT 'flat' tag_name, sq_hard_point_t(3, 4) pt FROM dual
+      UNION ALL
+      SELECT 'deep', sq_hard_point3_t(3, 4, 12) FROM dual) t
+CROSS JOIN LATERAL (SELECT t.pt.norm() AS echo_norm FROM dual) lat
+ORDER BY t.tag_name;
+
+--------------------------------------------------------------------------------
+-- Collection algebra over the pipelined type: MULTISET UNION DISTINCT /
+-- INTERSECT / EXCEPT, SUBMULTISET, MEMBER OF, IS A SET, CARDINALITY, and
+-- CAST(COLLECT(...)) reduced back to a scalar.
+--------------------------------------------------------------------------------
+SELECT CARDINALITY(sq_hard_num_tab(1, 2, 3)
+                   MULTISET UNION DISTINCT sq_hard_num_tab(3, 4)) AS union_card,
+       CARDINALITY(sq_hard_num_tab(1, 2, 3)
+                   MULTISET INTERSECT sq_hard_num_tab(2, 3, 9))   AS intersect_card,
+       CARDINALITY(sq_hard_num_tab(1, 2, 2, 3)
+                   MULTISET EXCEPT sq_hard_num_tab(2))            AS except_card,
+       CASE WHEN sq_hard_num_tab(1, 2)
+                 SUBMULTISET OF sq_hard_num_tab(1, 2, 3) THEN 'sub' END AS sub_flag,
+       CASE WHEN 2 MEMBER OF sq_hard_num_tab(1, 2, 3) THEN 'member' END AS member_flag,
+       CASE WHEN sq_hard_num_tab(1, 2, 3) IS A SET THEN 'set' END AS set_flag,
+       (SELECT CARDINALITY(CAST(COLLECT(CAST(m.metric_value AS NUMBER)
+                                        ORDER BY m.metric_id)
+                                AS sq_hard_num_tab))
+        FROM sq_hard_metric m)                                    AS collected_card
+FROM dual;
+
+--------------------------------------------------------------------------------
+-- 23ai table value constructor feeding CONNECT BY with PRIOR on both ends,
+-- CONNECT_BY_ROOT, SYS_CONNECT_BY_PATH, CONNECT_BY_ISLEAF, NOCYCLE, and
+-- ORDER SIBLINGS BY.
+--------------------------------------------------------------------------------
+SELECT LPAD(' ', 2 * (LEVEL - 1)) || v.step_name          AS indented_step,
+       CONNECT_BY_ROOT v.step_name                        AS root_step,
+       SYS_CONNECT_BY_PATH(v.step_name, '>')              AS step_path,
+       CONNECT_BY_ISLEAF                                  AS leaf_yn,
+       LEVEL                                              AS tree_level
+FROM (VALUES (1, NULL, 'plan'),
+             (2, 1,    'parse'),
+             (3, 1,    'bind'),
+             (4, 2,    'optimize')) v (step_id, parent_step_id, step_name)
+START WITH v.parent_step_id IS NULL
+CONNECT BY NOCYCLE PRIOR v.step_id = v.parent_step_id
+ORDER SIBLINGS BY v.step_name;
+
+--------------------------------------------------------------------------------
+-- PIVOT with two aggregates and aliases per cell, then a multi-column UNPIVOT
+-- INCLUDE NULLS over the same shape, and percent row limiting WITH TIES.
+--------------------------------------------------------------------------------
+SELECT node_id,
+       lat_total, lat_ct, err_total, err_ct
+FROM (SELECT node_id, metric_name, metric_value FROM sq_hard_metric)
+PIVOT (SUM(metric_value) AS total, COUNT(*) AS ct
+       FOR metric_name IN ('LATENCY' AS lat, 'ERRORS' AS err))
+ORDER BY node_id;
+
+SELECT node_id, metric_kind, kind_total, kind_ct
+FROM (
+  SELECT node_id,
+         SUM(CASE WHEN metric_name = 'LATENCY' THEN metric_value END) AS lat_total,
+         COUNT(CASE WHEN metric_name = 'LATENCY' THEN 1 END)          AS lat_ct,
+         SUM(CASE WHEN metric_name = 'ERRORS' THEN metric_value END)  AS err_total,
+         COUNT(CASE WHEN metric_name = 'ERRORS' THEN 1 END)           AS err_ct
+  FROM sq_hard_metric
+  GROUP BY node_id
+)
+UNPIVOT INCLUDE NULLS (
+  (kind_total, kind_ct) FOR metric_kind IN (
+    (lat_total, lat_ct) AS 'LATENCY',
+    (err_total, err_ct) AS 'ERRORS'
+  )
+)
+ORDER BY node_id, metric_kind;
+
+SELECT metric_id, metric_value
+FROM sq_hard_metric
+ORDER BY metric_value DESC, metric_id
+OFFSET 1 ROW FETCH NEXT 50 PERCENT ROWS WITH TIES;
+
+--------------------------------------------------------------------------------
+-- Analytic edge functions: KEEP (DENSE_RANK FIRST/LAST), RATIO_TO_REPORT,
+-- CUME_DIST, PERCENT_RANK, NTILE, WIDTH_BUCKET, MEDIAN, LISTAGG DISTINCT,
+-- NTH_VALUE FROM LAST IGNORE NULLS, and a GROUPS frame with EXCLUDE.
+--------------------------------------------------------------------------------
+SELECT metric_id, node_id, metric_value,
+       MAX(metric_value) KEEP (DENSE_RANK FIRST ORDER BY metric_day)
+         OVER (PARTITION BY node_id)                      AS first_day_value,
+       ROUND(RATIO_TO_REPORT(metric_value) OVER (), 4)    AS value_share,
+       CUME_DIST() OVER (ORDER BY metric_value)           AS cume_share,
+       PERCENT_RANK() OVER (ORDER BY metric_value)        AS pct_rank,
+       NTILE(2) OVER (ORDER BY metric_value)              AS half_bucket,
+       WIDTH_BUCKET(metric_value, 0, 30, 3)               AS width_bin,
+       MEDIAN(metric_value) OVER (PARTITION BY node_id)   AS node_median,
+       NTH_VALUE(metric_value, 1) FROM LAST IGNORE NULLS
+         OVER (PARTITION BY node_id ORDER BY metric_day
+               ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING)
+                                                          AS last_value_seen,
+       SUM(metric_value) OVER (
+         ORDER BY metric_value
+         GROUPS BETWEEN 1 PRECEDING AND 1 FOLLOWING
+         EXCLUDE CURRENT ROW)                             AS neighbor_sum,
+       (SELECT LISTAGG(DISTINCT metric_name, '+')
+                 WITHIN GROUP (ORDER BY metric_name)
+        FROM sq_hard_metric)                              AS name_menu
+FROM sq_hard_metric
+ORDER BY metric_id;
+
+--------------------------------------------------------------------------------
+-- SQL table macro: the macro text itself is an alternative-quoted literal, and
+-- the call site must resolve macro columns for completion.
+--------------------------------------------------------------------------------
+CREATE OR REPLACE FUNCTION sq_hard_topn(p_rows NUMBER)
+  RETURN VARCHAR2 SQL_MACRO(TABLE)
+IS
+BEGIN
+  RETURN q'~
+    SELECT m.metric_id, m.node_id, m.metric_value
+    FROM sq_hard_metric m
+    ORDER BY m.metric_value DESC, m.metric_id
+    FETCH FIRST p_rows ROWS ONLY
+  ~';
+END sq_hard_topn;
+/
+
+SELECT metric_id, metric_value
+FROM sq_hard_topn(p_rows => 2)
+ORDER BY metric_id;
+
+--------------------------------------------------------------------------------
+-- PRAGMA UDF scalar function used from SQL, with named-notation defaults.
+--------------------------------------------------------------------------------
+CREATE OR REPLACE FUNCTION sq_hard_taxed(
+  p_amount NUMBER,
+  p_rate   NUMBER DEFAULT 0.1
+) RETURN NUMBER DETERMINISTIC IS
+  PRAGMA UDF;
+BEGIN
+  RETURN ROUND(p_amount * (1 + p_rate), 2);
+END sq_hard_taxed;
+/
+
+SELECT metric_id,
+       sq_hard_taxed(metric_value)                        AS default_taxed,
+       sq_hard_taxed(p_rate => 0.5, p_amount => metric_value) AS named_taxed
+FROM sq_hard_metric
+ORDER BY metric_id;
+
+--------------------------------------------------------------------------------
+-- Property graph over metric rows plus an explicit edge table; GRAPH_TABLE
+-- arrow patterns are deliberately hostile to tokenizers.
+--------------------------------------------------------------------------------
+CREATE TABLE sq_hard_edge (
+  edge_id NUMBER PRIMARY KEY,
+  src_metric_id NUMBER NOT NULL REFERENCES sq_hard_metric (metric_id),
+  dst_metric_id NUMBER NOT NULL REFERENCES sq_hard_metric (metric_id),
+  hop_cost NUMBER NOT NULL
+) TABLESPACE users;
+
+INSERT INTO sq_hard_edge VALUES (1, 1, 2, 5);
+INSERT INTO sq_hard_edge VALUES (2, 2, 3, 7);
+INSERT INTO sq_hard_edge VALUES (3, 1, 4, 11);
+
+CREATE PROPERTY GRAPH sq_hard_graph
+  VERTEX TABLES (
+    sq_hard_metric
+      KEY (metric_id)
+      LABEL metric
+      PROPERTIES (metric_id, node_id, metric_value)
+  )
+  EDGE TABLES (
+    sq_hard_edge
+      KEY (edge_id)
+      SOURCE KEY (src_metric_id) REFERENCES sq_hard_metric (metric_id)
+      DESTINATION KEY (dst_metric_id) REFERENCES sq_hard_metric (metric_id)
+      LABEL links
+      PROPERTIES (hop_cost)
+  );
+
+SELECT src_metric, dst_metric, total_cost
+FROM GRAPH_TABLE (sq_hard_graph
+  MATCH (a IS metric) -[e IS links]-> (b IS metric)
+  WHERE a.metric_value < b.metric_value
+  COLUMNS (a.metric_id AS src_metric,
+           b.metric_id AS dst_metric,
+           e.hop_cost  AS total_cost)
+)
+ORDER BY src_metric, dst_metric;
+
+--------------------------------------------------------------------------------
+-- JSON-relational duality view with the 23ai JSON {...} constructor syntax.
+--------------------------------------------------------------------------------
+CREATE OR REPLACE JSON RELATIONAL DUALITY VIEW sq_hard_dv AS
+SELECT JSON {
+         '_id'         : m.metric_id,
+         'nodeId'      : m.node_id,
+         'metricValue' : m.metric_value WITH UPDATE
+       }
+FROM sq_hard_metric m WITH UPDATE INSERT DELETE;
+
+SELECT JSON_VALUE(data, '$.nodeId' RETURNING NUMBER) AS node_id_from_dv
+FROM sq_hard_dv
+WHERE JSON_VALUE(data, '$._id' RETURNING NUMBER) = 1;
+
+--------------------------------------------------------------------------------
+-- Time-zone and interval arithmetic, projected as text so every driver agrees.
+--------------------------------------------------------------------------------
+SELECT TO_CHAR(FROM_TZ(TIMESTAMP '2026-01-01 09:30:00', 'UTC')
+                 AT TIME ZONE 'Asia/Seoul',
+               'YYYY-MM-DD HH24:MI:SS TZR')               AS seoul_time,
+       TO_CHAR((TIMESTAMP '2026-01-03 12:00:00'
+                - TIMESTAMP '2026-01-01 09:30:00') DAY(2) TO SECOND(0)) AS gap_text,
+       TO_CHAR(DATE '2026-01-31' + INTERVAL '1' MONTH * 2 -
+               NUMTODSINTERVAL(36, 'HOUR'), 'YYYY-MM-DD HH24:MI')       AS shifted,
+       EXTRACT(TIMEZONE_HOUR FROM
+               FROM_TZ(TIMESTAMP '2026-06-01 00:00:00', '+09:00'))      AS tz_hour
+FROM dual;
+
+--------------------------------------------------------------------------------
+-- PL/SQL grammar torture: forward-declared nested subprograms, record + VARRAY
+-- + INDEX BY VARCHAR2 collections, REVERSE loop, CONTINUE WHEN, EXIT ... WHEN
+-- with labels, GOTO, searched CASE statement, EXECUTE IMMEDIATE with OUT bind
+-- and RETURNING INTO, and a PRAGMA EXCEPTION_INIT handler.
+--------------------------------------------------------------------------------
+DECLARE
+  TYPE metric_rec_t IS RECORD (
+    metric_id sq_hard_metric.metric_id%TYPE,
+    label     VARCHAR2(20) := 'unset'
+  );
+  TYPE rec_by_name_t IS TABLE OF metric_rec_t INDEX BY VARCHAR2(20);
+  TYPE triple_t IS VARRAY(4) OF NUMBER NOT NULL;
+
+  by_name    rec_by_name_t;
+  triple     triple_t := triple_t(10, 20, 30);
+  walk_total NUMBER := 0;
+  probe_row  sq_hard_metric%ROWTYPE;
+  out_double NUMBER;
+  updated_v  NUMBER;
+  stuck      EXCEPTION;
+  PRAGMA EXCEPTION_INIT(stuck, -54);
+
+  FUNCTION shrink(p_in VARCHAR2) RETURN VARCHAR2;
+  PROCEDURE stamp(p_key VARCHAR2, p_id NUMBER);
+
+  FUNCTION shrink(p_in VARCHAR2) RETURN VARCHAR2 IS
+  BEGIN
+    RETURN SUBSTR(p_in, 1, 4);
+  END shrink;
+
+  PROCEDURE stamp(p_key VARCHAR2, p_id NUMBER) IS
+    r metric_rec_t;
+  BEGIN
+    r.metric_id := p_id;
+    r.label := shrink(p_key) || '#' || p_id;
+    by_name(p_key) := r;
+  END stamp;
+BEGIN
+  <<fill_loop>>
+  FOR i IN REVERSE 1 .. triple.COUNT LOOP
+    CONTINUE fill_loop WHEN MOD(triple(i), 20) = 0;
+    walk_total := walk_total + triple(i);
+  END LOOP fill_loop;
+
+  triple.EXTEND;
+  triple(4) := 40;
+  triple.TRIM(1);
+
+  stamp('latency', 1);
+  stamp('errors', 4);
+
+  <<scan_loop>>
+  LOOP
+    EXIT scan_loop WHEN by_name.COUNT = 2;
+    NULL;
+  END LOOP scan_loop;
+
+  IF walk_total = 40 THEN
+    GOTO verified;
+  END IF;
+  RAISE_APPLICATION_ERROR(-20030, 'reverse/continue walk ' || walk_total);
+
+  <<verified>>
+  CASE
+    WHEN by_name('latency').label LIKE 'late#%' THEN
+      NULL;
+    ELSE
+      RAISE_APPLICATION_ERROR(-20031, 'record label ' || by_name('latency').label);
+  END CASE;
+
+  EXECUTE IMMEDIATE
+    'BEGIN :doubled := :seed * 2; END;'
+    USING OUT out_double, IN walk_total;
+  IF out_double <> 80 THEN
+    RAISE_APPLICATION_ERROR(-20032, 'out bind ' || out_double);
+  END IF;
+
+  SELECT * INTO probe_row FROM sq_hard_metric WHERE metric_id = 1;
+  BEGIN
+    EXECUTE IMMEDIATE
+      'UPDATE sq_hard_metric SET metric_value = metric_value
+       WHERE metric_id = :id RETURNING metric_value INTO :v'
+      USING probe_row.metric_id RETURNING INTO updated_v;
+  EXCEPTION
+    WHEN stuck THEN
+      RAISE_APPLICATION_ERROR(-20033, 'unexpected resource lock');
+  END;
+  IF updated_v <> probe_row.metric_value THEN
+    RAISE_APPLICATION_ERROR(-20034, 'returning into ' || updated_v);
+  END IF;
+
+  DBMS_OUTPUT.PUT_LINE('plsql torture total=' || walk_total);
+END;
+/
+
+--------------------------------------------------------------------------------
+-- Whitespace-hostile but legal literals and aliases in a single tight line.
+--------------------------------------------------------------------------------
+SELECT 1"X",.5+2."Y",3.5e1"Z",'it''s'||q'[ok]'"W" FROM dual WHERE 1=1 AND 2>1;
+
+--------------------------------------------------------------------------------
+-- Extension self-verification.
+--------------------------------------------------------------------------------
+DECLARE
+  hi_rows    PLS_INTEGER;
+  lo_rows    PLS_INTEGER;
+  edge_pairs PLS_INTEGER;
+  macro_rows PLS_INTEGER;
+  deep_norm  NUMBER;
+  dv_node    NUMBER;
+  doc_names  VARCHAR2(200);
+BEGIN
+  SELECT COUNT(*) INTO hi_rows FROM sq_hard_split_hi;
+  SELECT COUNT(*) INTO lo_rows FROM sq_hard_split_lo;
+  SELECT COUNT(*) INTO edge_pairs
+  FROM GRAPH_TABLE (sq_hard_graph
+    MATCH (a IS metric) -[e IS links]-> (b IS metric)
+    COLUMNS (e.hop_cost AS hop_cost));
+  SELECT COUNT(*) INTO macro_rows FROM sq_hard_topn(p_rows => 2);
+  SELECT sq_hard_point3_t(3, 4, 12).norm() INTO deep_norm FROM dual;
+  SELECT JSON_VALUE(data, '$.nodeId' RETURNING NUMBER) INTO dv_node
+  FROM sq_hard_dv
+  WHERE JSON_VALUE(data, '$._id' RETURNING NUMBER) = 1;
+  SELECT LISTAGG("한글 컬럼", ',') WITHIN GROUP (ORDER BY doc_id)
+  INTO doc_names FROM sq_hard_doc;
+
+  IF hi_rows <> 2 OR lo_rows <> 2 THEN
+    RAISE_APPLICATION_ERROR(-20040, 'insert-first split ' || hi_rows || '/' || lo_rows);
+  END IF;
+  IF edge_pairs <> 3 THEN
+    RAISE_APPLICATION_ERROR(-20041, 'graph edges ' || edge_pairs);
+  END IF;
+  IF macro_rows <> 2 THEN
+    RAISE_APPLICATION_ERROR(-20042, 'macro rows ' || macro_rows);
+  END IF;
+  IF deep_norm <> 13 THEN
+    RAISE_APPLICATION_ERROR(-20043, 'subtype norm ' || deep_norm);
+  END IF;
+  IF dv_node <> 1 THEN
+    RAISE_APPLICATION_ERROR(-20044, 'duality view node ' || dv_node);
+  END IF;
+  IF doc_names <> N'첫번째 문서,두번째' THEN
+    RAISE_APPLICATION_ERROR(-20045, 'unicode roundtrip ' || doc_names);
+  END IF;
+END;
+/
+
+--------------------------------------------------------------------------------
+-- Final self-verification and PASS banner.
+--------------------------------------------------------------------------------
+DECLARE
+  quoted_sum   NUMBER;
+  metric_total NUMBER;
+  merge_rows   PLS_INTEGER;
+  pipe_rows    PLS_INTEGER;
+  view_nodes   PLS_INTEGER;
+  audit_rows   PLS_INTEGER;
+BEGIN
+  SELECT "SELECT" + "order" INTO quoted_sum FROM sq_hard_quoted;
+  metric_total := sq_hard_pkg.bulk_total;
+  SELECT COUNT(*) INTO merge_rows FROM sq_hard_merge;
+  SELECT COUNT(*) INTO pipe_rows FROM TABLE(sq_hard_pipe(4));
+  SELECT COUNT(*) INTO view_nodes FROM sq_hard_v;
+  SELECT COUNT(*) INTO audit_rows
+  FROM sq_hard_metric_audit
+  WHERE action_name = 'UPDATE' AND changed_rows = 3;
+
+  IF quoted_sum <> 3 THEN
+    RAISE_APPLICATION_ERROR(-20010, 'quoted-identifier sum');
+  END IF;
+  IF metric_total <> 56 THEN
+    RAISE_APPLICATION_ERROR(-20011, 'metric bulk total ' || metric_total);
+  END IF;
+  IF merge_rows <> 5 THEN
+    RAISE_APPLICATION_ERROR(-20012, 'merge row count ' || merge_rows);
+  END IF;
+  IF pipe_rows <> 4 THEN
+    RAISE_APPLICATION_ERROR(-20013, 'pipelined row count ' || pipe_rows);
+  END IF;
+  IF view_nodes <> 2 THEN
+    RAISE_APPLICATION_ERROR(-20014, 'view node count ' || view_nodes);
+  END IF;
+  IF audit_rows < 1 THEN
+    RAISE_APPLICATION_ERROR(-20015, 'compound trigger audit');
+  END IF;
+END;
+/
+
+SELECT 'PASS' AS final_status,
+       (SELECT COUNT(*) FROM sq_hard_metric) AS metric_rows,
+       (SELECT COUNT(*) FROM sq_hard_merge)  AS merge_rows
+FROM dual;
+
+PROMPT [ORACLE HARDCORE] PASS

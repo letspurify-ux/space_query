@@ -303,6 +303,92 @@ fn collect_oracle_object_type_members(tokens: &[SqlToken], open_idx: usize) -> V
     members
 }
 
+fn collect_oracle_property_graph_properties(
+    tokens: &[SqlToken],
+    start_idx: usize,
+    end_idx: usize,
+) -> Vec<String> {
+    let mut properties = Vec::new();
+    let mut idx = start_idx;
+    while idx < end_idx {
+        if !token_word_eq(tokens.get(idx), "PROPERTIES")
+            || !matches!(
+                tokens.get(idx + 1),
+                Some(SqlToken::Symbol(symbol)) if symbol == "("
+            )
+        {
+            idx += 1;
+            continue;
+        }
+        let open_idx = idx + 1;
+        let Some(close_idx) = matching_paren_index(tokens, open_idx) else {
+            break;
+        };
+        let mut item_start = open_idx + 1;
+        let mut depth = 0usize;
+        for item_end in open_idx + 1..=close_idx {
+            match tokens.get(item_end) {
+                Some(SqlToken::Symbol(symbol)) if symbol == "(" => {
+                    depth = depth.saturating_add(1)
+                }
+                Some(SqlToken::Symbol(symbol)) if symbol == ")" && depth > 0 => {
+                    depth = depth.saturating_sub(1)
+                }
+                Some(SqlToken::Symbol(symbol))
+                    if (symbol == "," && depth == 0) || item_end == close_idx =>
+                {
+                    if let Some(property) = tokens[item_start..item_end]
+                        .iter()
+                        .rev()
+                        .find_map(|token| token_word_text(Some(token)))
+                        .filter(|word| {
+                            !crate::sql_text::is_sql_keyword_for_db(
+                                &word.to_ascii_uppercase(),
+                                crate::db::DatabaseType::Oracle,
+                            )
+                        })
+                    {
+                        push_unique_case_insensitive(&mut properties, property);
+                    }
+                    item_start = item_end.saturating_add(1);
+                }
+                _ => {}
+            }
+        }
+        idx = close_idx.saturating_add(1);
+    }
+    properties
+}
+
+fn oracle_q_quote_body(literal: &str) -> Option<&str> {
+    let quote_idx = literal.find('\'')?;
+    let delimiter_start = quote_idx.saturating_add(1);
+    let delimiter = literal.get(delimiter_start..)?.chars().next()?;
+    let body_start = delimiter_start.saturating_add(delimiter.len_utf8());
+    let closing = crate::sql_text::q_quote_closing(delimiter);
+    let suffix = format!("{closing}'");
+    let body_end = literal.rfind(&suffix)?;
+    (body_end >= body_start).then(|| literal.get(body_start..body_end)).flatten()
+}
+
+fn oracle_sql_macro_projection_columns(
+    tokens: &[SqlToken],
+    start_idx: usize,
+    end_idx: usize,
+) -> Vec<String> {
+    tokens
+        .get(start_idx..end_idx)
+        .unwrap_or(&[])
+        .iter()
+        .find_map(|token| match token {
+            SqlToken::String(literal) => oracle_q_quote_body(literal),
+            _ => None,
+        })
+        .map(super::query_text::tokenize_sql)
+        .map(|body_tokens| oracle_view_projection_columns(&body_tokens))
+        .unwrap_or_default()
+}
+
 fn collect_mysql_create_routine_names_from_text(script: &str, keyword: &str) -> Vec<String> {
     let upper = script.to_ascii_uppercase();
     let marker = format!("CREATE {keyword}");
@@ -890,10 +976,23 @@ fn oracle_create_kind_and_name_idx(tokens: &[SqlToken], create_idx: usize) -> Op
     if kind == "PROPERTY" && token_word_eq(tokens.get(idx + 1), "GRAPH") {
         return Some(("PROPERTY GRAPH".to_string(), idx + 2));
     }
+    if kind == "JSON"
+        && token_word_eq(tokens.get(idx + 1), "RELATIONAL")
+        && token_word_eq(tokens.get(idx + 2), "DUALITY")
+        && token_word_eq(tokens.get(idx + 3), "VIEW")
+    {
+        return Some(("JSON RELATIONAL DUALITY VIEW".to_string(), idx + 4));
+    }
 
     let mut name_idx = idx + 1;
     if matches!(kind.as_str(), "PACKAGE" | "TYPE") && token_word_eq(tokens.get(name_idx), "BODY") {
         name_idx += 1;
+    }
+    if token_word_eq(tokens.get(name_idx), "IF")
+        && token_word_eq(tokens.get(name_idx + 1), "NOT")
+        && token_word_eq(tokens.get(name_idx + 2), "EXISTS")
+    {
+        name_idx += 3;
     }
     Some((kind, name_idx))
 }
@@ -1228,7 +1327,45 @@ fn oracle_collect_script_catalog_entries(script: &str, catalog: &mut MysqlFamily
                 push_unique_case_insensitive(&mut catalog.materialized_views, &name)
             }
             "PROCEDURE" => push_unique_case_insensitive(&mut catalog.procedures, &name),
-            "FUNCTION" => push_unique_case_insensitive(&mut catalog.functions, &name),
+            "FUNCTION" => {
+                push_unique_case_insensitive(&mut catalog.functions, &name);
+                let statement_end = tokens
+                    .iter()
+                    .enumerate()
+                    .skip(after_name_idx)
+                    .find_map(|(idx, token)| {
+                        matches!(token, SqlToken::Symbol(symbol) if symbol == ";")
+                            .then_some(idx)
+                    })
+                    .unwrap_or(tokens.len());
+                let is_table_sql_macro = tokens
+                    .get(after_name_idx..statement_end)
+                    .unwrap_or(&[])
+                    .windows(4)
+                    .any(|window| {
+                        token_word_eq(window.first(), "SQL_MACRO")
+                            && matches!(
+                                window.get(1),
+                                Some(SqlToken::Symbol(symbol)) if symbol == "("
+                            )
+                            && token_word_eq(window.get(2), "TABLE")
+                            && matches!(
+                                window.get(3),
+                                Some(SqlToken::Symbol(symbol)) if symbol == ")"
+                            )
+                    });
+                if is_table_sql_macro {
+                    push_unique_case_insensitive(&mut catalog.views, &name);
+                    let columns = oracle_sql_macro_projection_columns(
+                        &tokens,
+                        after_name_idx,
+                        statement_end,
+                    );
+                    if !columns.is_empty() {
+                        catalog.columns.insert(name.to_ascii_uppercase(), columns);
+                    }
+                }
+            }
             "PACKAGE" => push_unique_case_insensitive(&mut catalog.packages, &name),
             "SEQUENCE" => push_unique_case_insensitive(&mut catalog.sequences, &name),
             "SYNONYM" => {
@@ -1303,9 +1440,62 @@ fn oracle_collect_script_catalog_entries(script: &str, catalog: &mut MysqlFamily
                         }
                     }
                 }
+                if token_word_eq(tokens.get(after_name_idx), "UNDER") {
+                    if let Some((parent_type, after_parent_idx)) =
+                        script_object_name_at(&tokens, after_name_idx + 1)
+                    {
+                        let mut members = catalog
+                            .type_members
+                            .get(&parent_type.to_ascii_uppercase())
+                            .cloned()
+                            .unwrap_or_default();
+                        if matches!(
+                            tokens.get(after_parent_idx),
+                            Some(SqlToken::Symbol(symbol)) if symbol == "("
+                        ) {
+                            for member in
+                                collect_oracle_object_type_members(&tokens, after_parent_idx)
+                            {
+                                push_unique_case_insensitive(&mut members, &member);
+                            }
+                        }
+                        if !members.is_empty() {
+                            catalog
+                                .type_members
+                                .insert(name.to_ascii_uppercase(), members);
+                        }
+                    }
+                }
             }
             "DOMAIN" => push_unique_case_insensitive(&mut catalog.types, &name),
-            "PROPERTY GRAPH" => push_unique_case_insensitive(&mut catalog.views, &name),
+            "PROPERTY GRAPH" => {
+                push_unique_case_insensitive(&mut catalog.views, &name);
+                let statement_end = tokens
+                    .iter()
+                    .enumerate()
+                    .skip(after_name_idx)
+                    .find_map(|(idx, token)| {
+                        matches!(token, SqlToken::Symbol(symbol) if symbol == ";")
+                            .then_some(idx)
+                    })
+                    .unwrap_or(tokens.len());
+                let properties = collect_oracle_property_graph_properties(
+                    &tokens,
+                    after_name_idx,
+                    statement_end,
+                );
+                if !properties.is_empty() {
+                    catalog
+                        .columns
+                        .insert(name.to_ascii_uppercase(), properties);
+                }
+            }
+            "JSON RELATIONAL DUALITY VIEW" => {
+                push_unique_case_insensitive(&mut catalog.views, &name);
+                catalog
+                    .columns
+                    .insert(name.to_ascii_uppercase(), vec!["DATA".to_string()]);
+            }
             "TRIGGER" => push_unique_case_insensitive(&mut catalog.triggers, &name),
             "INDEX" => push_unique_case_insensitive(&mut catalog.indexes, &name),
             "ROLE" | "USER" => push_unique_case_insensitive(&mut catalog.users, &name),
@@ -48363,6 +48553,7 @@ fn cursor_analysis_from_snapshot_for_test_with_context_window(
 fn signature_scan_text_before_cursor_from_snapshot_for_test(
     snapshot: &ChunkedText,
     cursor: usize,
+    mysql_compatible: bool,
 ) -> String {
     const SIGNATURE_SCAN_WINDOW: usize = 4000;
     let cursor = snapshot.clamp_boundary(cursor.min(snapshot.len()));
@@ -48370,15 +48561,32 @@ fn signature_scan_text_before_cursor_from_snapshot_for_test(
     while window_start < cursor && !snapshot.is_char_boundary(window_start) {
         window_start += 1;
     }
-    let raw = snapshot
-        .range_string(window_start, cursor)
-        .unwrap_or_default();
+    let text_before_cursor = snapshot.range_string(0, cursor).unwrap_or_default();
     if window_start > 0 {
-        if let Some(newline) = raw.find('\n') {
-            return raw.get(newline + 1..).unwrap_or("").to_string();
+        if let Some(newline) = text_before_cursor
+            .get(window_start..)
+            .and_then(|raw| raw.find('\n'))
+        {
+            window_start = window_start.saturating_add(newline + 1);
         }
     }
-    raw
+    while window_start < cursor
+        && intellisense_test_lex_mode_at(&text_before_cursor, window_start, mysql_compatible)
+            != crate::sql_parser_engine::LexMode::Idle
+    {
+        let Some(newline) = text_before_cursor
+            .get(window_start..)
+            .and_then(|tail| tail.find('\n'))
+        else {
+            window_start = cursor;
+            break;
+        };
+        window_start = window_start.saturating_add(newline + 1);
+    }
+    text_before_cursor
+        .get(window_start..cursor)
+        .unwrap_or("")
+        .to_string()
 }
 
 fn intellisense_test_lex_mode_at(
@@ -48503,9 +48711,12 @@ fn query_completion_popup_from_prepared_snapshot_with_data(
     expanded: &ExpandedStatementWindow,
     analysis: &IntellisenseAnalysis,
 ) -> IntellisensePopupSuggestionsForTest {
-    let signature_scan_text =
-        signature_scan_text_before_cursor_from_snapshot_for_test(snapshot, cursor);
     let mysql_compatible = db_type.is_mysql_or_mariadb();
+    let signature_scan_text = signature_scan_text_before_cursor_from_snapshot_for_test(
+        snapshot,
+        cursor,
+        mysql_compatible,
+    );
     let signature_scan_start = cursor.saturating_sub(signature_scan_text.len());
     let signature_scan_initial_lex_mode = if signature_scan_start >= expanded.statement_start {
         intellisense_test_lex_mode_at(
@@ -48605,10 +48816,9 @@ fn query_completion_popup_from_prepared_snapshot_with_data(
     };
     let cursor_analysis = cursor_analysis_from_snapshot_for_test(snapshot, cursor);
     let fast_start = cursor_analysis.fast_start;
-    let signature_scan_text = cursor_analysis.shared_fast_slice(
-        signature_scan_start.saturating_sub(fast_start),
-        cursor.saturating_sub(fast_start),
-    );
+    let signature_scan_text = snapshot
+        .shared_or_owned_range(signature_scan_start, cursor)
+        .expect("signature scan range");
     let text_after_cursor = cursor_analysis.shared_fast_slice(
         cursor.saturating_sub(fast_start),
         cursor
@@ -49042,6 +49252,75 @@ fn assert_oracle_sweep_fixture_completion_cases(
         "Oracle fixture production-path gaps:\n{}",
         failures.join("\n")
     );
+}
+
+#[test]
+fn oracle_final_hardcore_production_completion_covers_advanced_sweep_cases() {
+    assert_oracle_sweep_fixture_completion_cases(&[
+        (
+            "final_hardcore.sql",
+            "RANGE BETWEEN INTERVAL '7' DAY PRECEDING",
+            "DAY",
+            "DA",
+            "DAY",
+        ),
+        (
+            "final_hardcore.sql",
+            "RANGE BETWEEN INTERVAL '7' DAY PRECEDING",
+            "PRECEDING",
+            "PREC",
+            "PRECEDING",
+        ),
+        (
+            "final_hardcore.sql",
+            "SELECT n + 1 FROM counter WHERE n < 5",
+            "counter",
+            "coun",
+            "counter",
+        ),
+        (
+            "final_hardcore.sql",
+            "MAX(metric_value)[ANY] + 1",
+            "ANY",
+            "AN",
+            "ANY",
+        ),
+        (
+            "final_hardcore.sql",
+            "XMLNAMESPACES ('urn:sq:hard'",
+            "XMLNAMESPACES",
+            "XMLN",
+            "XMLNAMESPACES",
+        ),
+        (
+            "final_hardcore.sql",
+            "TYPE metric_id_tab IS TABLE OF",
+            "TYPE",
+            "TYP",
+            "TYPE",
+        ),
+        (
+            "final_hardcore.sql",
+            "XMLNAMESPACES ('urn:sq:hard' AS \"h\")",
+            "AS",
+            "A",
+            "AS",
+        ),
+        (
+            "final_hardcore.sql",
+            "DBMS_DB_VERSION.VER_LE_11 $THEN",
+            "VER_LE_11",
+            "VER_",
+            "VER_LE_11",
+        ),
+        (
+            "final_hardcore.sql",
+            "RETURN l_total + \"BEGIN\" * 0",
+            "RETURN",
+            "RETU",
+            "RETURN",
+        ),
+    ]);
 }
 
 #[test]
@@ -50755,6 +51034,54 @@ fn mysql_family_all_fixture_sweep_gaps_use_production_completion() {
             "EXPA",
             "EXPANSION",
         ),
+        (
+            "final_hardcore.sql",
+            MariaDB,
+            "RETURNING id, INET6_NTOA(addr) AS printable",
+            "AS",
+            "A",
+            "AS",
+        ),
+        (
+            "final_hardcore.sql",
+            MariaDB,
+            "HANDLER metric_handle READ FIRST",
+            "metric_handle",
+            "metr",
+            "metric_handle",
+        ),
+        (
+            "final_hardcore.sql",
+            MySQL,
+            "SUM(metric_value) OVER w_run",
+            "w_run",
+            "w_ru",
+            "w_run",
+        ),
+        (
+            "final_hardcore.sql",
+            MySQL,
+            "LAG(metric_value, 1, 0) OVER w_ord",
+            "w_ord",
+            "w_or",
+            "w_ord",
+        ),
+        (
+            "final_hardcore.sql",
+            MySQL,
+            "hard_document.payload,",
+            "hard_document",
+            "hard",
+            "hard_document",
+        ),
+        (
+            "final_hardcore.sql",
+            MySQL,
+            ") top_item ON TRUE",
+            "TRUE",
+            "TRU",
+            "TRUE",
+        ),
     ];
 
     let mut failures = Vec::new();
@@ -50775,6 +51102,51 @@ fn mysql_family_all_fixture_sweep_gaps_use_production_completion() {
         failures.is_empty(),
         "MySQL-family fixture production-path gaps:\n{}",
         failures.join("\n")
+    );
+}
+
+#[test]
+fn mariadb_handler_alias_reference_uses_prior_open_statement() {
+    use crate::db::DatabaseType::MariaDB;
+
+    let text_before_cursor = "HANDLER metric OPEN AS metric_handle;\nHANDLER metr";
+    assert!(
+        SqlEditorWidget::cursor_is_at_mysql_handler_alias_reference_slot_from_bounded_text(
+            text_before_cursor,
+            "metr",
+            " READ FIRST;",
+            Some(MariaDB),
+        )
+    );
+    assert_eq!(
+        SqlEditorWidget::mysql_handler_alias_suggestions_from_text(
+            text_before_cursor,
+            "metr",
+            Some(MariaDB),
+        ),
+        vec!["metric_handle".to_string()]
+    );
+
+    let script = load_mariadb_intellisense_test_file("final_hardcore.sql");
+    let context = "HANDLER metric_handle READ FIRST";
+    let cursor = script.find(context).expect("handler read") + "HANDLER metr".len();
+    let scan = signature_scan_text_before_cursor_from_snapshot_for_test(
+        &ChunkedText::from_str(script),
+        cursor,
+        true,
+    );
+    assert!(scan.contains("HANDLER metric OPEN AS metric_handle;"));
+    assert!(
+        SqlEditorWidget::cursor_is_at_mysql_handler_alias_reference_slot_from_bounded_text(
+            &scan,
+            "metr",
+            script.get(cursor..).unwrap_or(""),
+            Some(MariaDB),
+        )
+    );
+    assert_eq!(
+        SqlEditorWidget::mysql_handler_alias_suggestions_from_text(&scan, "metr", Some(MariaDB)),
+        vec!["metric_handle".to_string()]
     );
 }
 
@@ -51593,7 +51965,7 @@ fn oracle_qquoted_package_body_keeps_routine_and_merge_scope_in_production_compl
         "fixture metadata lost QT_FB_LOG_PROC signature"
     );
     let signature_scan =
-        signature_scan_text_before_cursor_from_snapshot_for_test(&snapshot, cursor);
+        signature_scan_text_before_cursor_from_snapshot_for_test(&snapshot, cursor, false);
     let signature_scan_start = cursor.saturating_sub(signature_scan.len());
     let signature_prefix = snapshot
         .range_string(0, signature_scan_start)
@@ -52738,7 +53110,10 @@ fn intellisense_sweep_is_relation_alias_definition(
                 .get(open_idx.saturating_add(1)..close_idx)
                 .unwrap_or(&[])
                 .iter()
-                .any(|token| token_word_eq(Some(token), "SELECT"))
+                .any(|token| {
+                    token_word_eq(Some(token), "SELECT")
+                        || token_word_eq(Some(token), "VALUES")
+                })
         });
         if table_function_alias || derived_query_alias {
             return true;
@@ -52840,6 +53215,10 @@ fn intellisense_sweep_skips_oracle_non_catalog_definition_and_value_slots() {
             "node",
         ),
         (
+            "SELECT * FROM GRAPH_TABLE (g MATCH (a IS node) -[e IS li__CODEX_CURSOR__]-> (b IS node) COLUMNS (e.cost AS cost))",
+            "links",
+        ),
+        (
             "ALTER TABLE t ADD (crea__CODEX_CURSOR__ TIMESTAMP)",
             "created_at",
         ),
@@ -52885,6 +53264,54 @@ fn intellisense_sweep_is_drop_object_without_create_metadata(
     !script_upper.contains(&create_needle) && !script_upper.contains(&create_or_replace_needle)
 }
 
+fn intellisense_sweep_is_oracle_graph_pattern_definition(
+    tokens_before_word: &[SqlToken],
+    sql: &str,
+    cursor: usize,
+    word_start: usize,
+    db_type: crate::db::DatabaseType,
+) -> bool {
+    if crate::sql_text::mysql_compatibility_for_sql("", Some(db_type)) {
+        return false;
+    }
+    let words = tokens_before_word
+        .iter()
+        .filter_map(|token| token_word_text(Some(token)).map(str::to_ascii_uppercase))
+        .collect::<Vec<_>>();
+    let Some(match_idx) = words.iter().rposition(|word| word == "MATCH") else {
+        return false;
+    };
+    if words
+        .iter()
+        .rposition(|word| word == "COLUMNS")
+        .is_some_and(|columns_idx| columns_idx > match_idx)
+    {
+        return false;
+    }
+    let previous = tokens_before_word
+        .iter()
+        .rev()
+        .find(|token| !matches!(token, SqlToken::Comment(_)));
+    let next = intellisense_sweep_next_meaningful_word(sql, cursor)
+        .map(|word| word.to_ascii_uppercase());
+    let text_previous_word = sql
+        .get(..word_start)
+        .unwrap_or("")
+        .rsplit(|ch: char| !crate::sql_text::is_identifier_char(ch))
+        .find(|word| !word.is_empty())
+        .map(str::to_ascii_uppercase);
+    (next.as_deref() == Some("IS")
+        && !matches!(
+            previous,
+            Some(SqlToken::Word(word)) if word.eq_ignore_ascii_case("MATCH")
+        ))
+        || matches!(
+            previous,
+            Some(SqlToken::Word(word)) if word.eq_ignore_ascii_case("IS")
+        )
+        || text_previous_word.as_deref() == Some("IS")
+}
+
 fn intellisense_sweep_is_definition_slot(
     sql: &str,
     cursor: usize,
@@ -52901,6 +53328,117 @@ fn intellisense_sweep_is_definition_slot(
         .trim_matches(|ch| matches!(ch, '"' | '`'))
         .to_ascii_uppercase();
     let next_word = intellisense_sweep_next_meaningful_word(sql, cursor);
+
+    // A quoted / backtick identifier is a name the author types explicitly, so
+    // it is never "completed" when it introduces a brand-new object. This covers
+    // reserved words used as identifiers (`CREATE TABLE `select``, a PL/SQL
+    // `"BEGIN" PLS_INTEGER` declaration), which the keyword-guarded rules below
+    // deliberately skip. The engine already returns nothing at these slots; this
+    // records that the empty result is correct rather than a gap.
+    let word_is_quoted = original_word.starts_with('"') || original_word.starts_with('`');
+    if word_is_quoted {
+        let stmt_start = tokens_before_word
+            .iter()
+            .rposition(|token| matches!(token, SqlToken::Symbol(sym) if sym == ";"))
+            .map_or(0, |idx| idx + 1);
+        let segment = &tokens_before_word[stmt_start..];
+        let segment_first_word = segment.iter().find_map(|token| match token {
+            SqlToken::Word(word) => Some(word.to_ascii_uppercase()),
+            _ => None,
+        });
+        let segment_last_meaningful = segment
+            .iter()
+            .rev()
+            .find(|token| !matches!(token, SqlToken::Comment(_)));
+        const CREATE_NAME_INTRODUCERS: &[&str] = &[
+            "TABLE", "VIEW", "INDEX", "SEQUENCE", "EVENT", "TRIGGER", "PROCEDURE", "FUNCTION",
+            "PACKAGE", "TYPE", "DATABASE", "SCHEMA", "ROLE", "USER", "SYNONYM", "EXISTS",
+        ];
+        // `CREATE <object-type> "quoted new name"`.
+        if segment_first_word.as_deref() == Some("CREATE")
+            && matches!(
+                segment_last_meaningful,
+                Some(SqlToken::Word(word))
+                    if CREATE_NAME_INTRODUCERS.contains(&word.to_ascii_uppercase().as_str())
+            )
+        {
+            return true;
+        }
+        // A quoted identifier that opens a statement and is followed by another
+        // word is a PL/SQL declaration name (`"BEGIN" PLS_INTEGER := 0;`).
+        if segment_last_meaningful.is_none() && next_word.is_some() {
+            return true;
+        }
+        let text_before_word = sql.get(..word_start).unwrap_or("");
+        let immediately_preceding = text_before_word.chars().next_back();
+        let numeric_trailing_dot = immediately_preceding == Some('.')
+            && text_before_word
+                .get(..text_before_word.len().saturating_sub(1))
+                .and_then(|head| head.chars().next_back())
+                .is_some_and(|ch| ch.is_ascii_digit());
+        let tail_after_identifier = sql
+            .get(cursor..)
+            .unwrap_or("")
+            .trim_start_matches(|ch: char| ch.is_whitespace() || matches!(ch, '"' | '`'));
+        let followed_by_projection_boundary = tail_after_identifier.starts_with([',', ';'])
+            || tail_after_identifier
+                .get(.."FROM".len().min(tail_after_identifier.len()))
+                .is_some_and(|word| word.eq_ignore_ascii_case("FROM"))
+            || next_word
+                .as_deref()
+                .is_some_and(|word| word.eq_ignore_ascii_case("FROM"));
+        if (immediately_preceding.is_some_and(|ch| {
+            !ch.is_whitespace() && !matches!(ch, ',' | '(' | '.')
+        }) || numeric_trailing_dot)
+            && followed_by_projection_boundary
+        {
+            return true;
+        }
+    }
+
+    // A character-set introducer glued to a string literal (`_utf8mb4'…'`) is
+    // literal syntax, not a completion slot.
+    if original_word.starts_with('_')
+        && sql
+            .get(cursor..)
+            .unwrap_or("")
+            .trim_start_matches(|ch: char| ch.is_alphanumeric() || ch == '_')
+            .starts_with('\'')
+    {
+        return true;
+    }
+
+    // The RHS of a `COLLATE` operator is a collation name drawn from the live
+    // catalog (see `operand_type_operators_match_the_preceding_operand_type`,
+    // which pins the slot as catalog-only). The sweep's file-inferred catalog
+    // carries no collations, so an empty result here is expected, not a gap.
+    if matches!(
+        tokens_before_word
+            .iter()
+            .rev()
+            .find(|token| !matches!(token, SqlToken::Comment(_))),
+        Some(SqlToken::Word(word)) if word.eq_ignore_ascii_case("COLLATE")
+    ) {
+        return true;
+    }
+
+    if matches!(
+        deep_ctx.phase,
+        intellisense_context::SqlPhase::DerivedAliasColumnList
+    ) {
+        return true;
+    }
+
+    if intellisense_sweep_is_oracle_graph_pattern_definition(
+        &tokens_before_word,
+        sql,
+        cursor,
+        word_start,
+        db_type,
+    ) {
+        return true;
+    }
+
     let next_is_type = next_word
         .as_deref()
         .is_some_and(intellisense_sweep_is_mysql_type_lead);
@@ -55004,6 +55542,7 @@ fn manual_final_multiline_structural_words_use_production_completion() {
         ("CREATE TABLE t (category VARCHAR2(32) DOMAIN app_domain)", "DOMAIN", "CREATE TABLE t (category VARCHAR2(32) DOMA__CODEX_CURSOR__ app_domain)"),
         ("CREATE TRIGGER trg\nBEFORE INSERT OR UPDATE OF category ON t\nBEGIN NULL; END;", "OF", "CREATE TRIGGER trg\nBEFORE INSERT OR UPDATE O__CODEX_CURSOR__ category ON t\nBEGIN NULL; END;"),
         ("CREATE PROPERTY GRAPH g\nEDGE TABLES (e KEY (id) SOURCE KEY (source_id) REFERENCES t (id))", "KEY", "CREATE PROPERTY GRAPH g\nEDGE TABLES (e KEY (id) SOURCE KE__CODEX_CURSOR__ (source_id) REFERENCES t (id))"),
+        ("SELECT * FROM GRAPH_TABLE (g\n  MATCH (a IS node) -[e IS links]-> (b IS node)\n  COLUMNS (e.cost AS cost))", "IS", "SELECT * FROM GRAPH_TABLE (g\n  MATCH (a IS node) -[e I__CODEX_CURSOR__ links]-> (b IS node)\n  COLUMNS (e.cost AS cost))"),
         ("ANALYZE TABLE t\n  COMPUTE STATISTICS FOR TABLE FOR ALL INDEXED COLUMNS", "STATISTICS", "ANALYZE TABLE t\n  COMPUTE STAT__CODEX_CURSOR__ FOR TABLE FOR ALL INDEXED COLUMNS"),
         ("ANALYZE TABLE t\n  COMPUTE STATISTICS FOR TABLE FOR ALL INDEXED COLUMNS", "FOR", "ANALYZE TABLE t\n  COMPUTE STATISTICS FO__CODEX_CURSOR__ TABLE FOR ALL INDEXED COLUMNS"),
         ("ANALYZE TABLE t\n  COMPUTE STATISTICS FOR TABLE FOR ALL INDEXED COLUMNS", "TABLE", "ANALYZE TABLE t\n  COMPUTE STATISTICS FOR TABL__CODEX_CURSOR__ FOR ALL INDEXED COLUMNS"),
@@ -88146,6 +88685,12 @@ fn plsql_deeper_local_scope_and_clause_value_positions_offer_symbols() {
             "CREATE OR REPLACE TRIGGER trg FOR INSERT ON emp COMPOUND TRIGGER g_rows PLS_INTEGER := 0; AFTER EACH ROW IS BEGIN g_rows := __CODEX_CURSOR__; END AFTER EACH ROW; END;"
                 .to_string(),
             &["g_rows", "NULL", "CASE"],
+            &[],
+        ),
+        (
+            "CREATE OR REPLACE TRIGGER trg FOR INSERT ON emp COMPOUND TRIGGER g_rows PLS_INTEGER := 0; AFTER STATEMENT IS l_sample PLS_INTEGER; BEGIN l_sample := __CODEX_CURSOR__; END AFTER STATEMENT; END;"
+                .to_string(),
+            &["g_rows", "l_sample", "NULL", "CASE"],
             &[],
         ),
         (

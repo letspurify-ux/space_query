@@ -3149,6 +3149,17 @@ fn multiset_intersect_inside_expression_keeps_where_phase_and_table_scope() {
     );
 }
 
+#[test]
+fn nth_value_from_last_does_not_start_the_query_from_clause() {
+    let ctx = analyze(
+        "SELECT NTH_VALUE(sal, 1) FROM LAST IGNORE NULLS \
+         OVER (PARTITION BY deptno ORDER BY hiredate), | FROM emp",
+    );
+
+    assert_eq!(ctx.phase, SqlPhase::SelectList);
+    assert!(has_name(&table_names(&ctx), "EMP"));
+}
+
 // ─── Qualifier resolution tests ──────────────────────────────────────────
 
 #[test]

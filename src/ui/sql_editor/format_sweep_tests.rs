@@ -3764,19 +3764,22 @@ fn formatting_sweep_generate_out_report_from_env() {
 #[test]
 #[ignore = "audits every SQL fixture and writes reports under target/format-sweep"]
 fn formatting_sweep_all_files_generate_out_report() {
-    for layout in [SqlCommaListLayout::Wrapped, SqlCommaListLayout::Stacked] {
-        formatting_sweep_all_files_generate_out_report_for_layout(layout);
-    }
+    let checked_files = [SqlCommaListLayout::Wrapped, SqlCommaListLayout::Stacked]
+        .into_iter()
+        .map(formatting_sweep_all_files_generate_out_report_for_layout)
+        .sum::<usize>();
 
     let output_root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target/format-sweep");
     fs::write(
         output_root.join("format-sweep.out"),
-        "Auto-format sweep aggregate\ncomma_list_layouts=[Wrapped, Stacked]\nchecked_files=132\nfailures=0\nwrapped_report=wrapped/format-sweep.out\nstacked_report=stacked/format-sweep.out\n",
+        format!(
+            "Auto-format sweep aggregate\ncomma_list_layouts=[Wrapped, Stacked]\nchecked_files={checked_files}\nfailures=0\nwrapped_report=wrapped/format-sweep.out\nstacked_report=stacked/format-sweep.out\n"
+        ),
     )
     .expect("write combined format sweep aggregate");
 }
 
-fn formatting_sweep_all_files_generate_out_report_for_layout(layout: SqlCommaListLayout) {
+fn formatting_sweep_all_files_generate_out_report_for_layout(layout: SqlCommaListLayout) -> usize {
     let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let layout_dir = match layout {
         SqlCommaListLayout::Wrapped => "wrapped",
@@ -3961,6 +3964,7 @@ fn formatting_sweep_all_files_generate_out_report_for_layout(layout: SqlCommaLis
         managed_frame_kinds, expected_frame_kinds,
         "the complete fixture sweep must exercise every production frame kind"
     );
+    checked_files
 }
 
 #[test]

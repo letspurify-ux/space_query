@@ -30830,7 +30830,7 @@ DROP TEMPORARY TABLE IF EXISTS qt_result_route_monitor;
         assert_formatted_mysql_fixture_scripts_run_without_errors(
             DatabaseType::MySQL,
             "test_mysql",
-            11,
+            12,
         );
     }
 
@@ -30844,7 +30844,7 @@ DROP TEMPORARY TABLE IF EXISTS qt_result_route_monitor;
         assert_formatted_mysql_fixture_scripts_run_without_errors(
             DatabaseType::MariaDB,
             "test_mariadb",
-            13,
+            14,
         );
     }
 
@@ -33702,7 +33702,7 @@ mod mysql_transaction_feedback_tests {
             })
             .collect::<Vec<_>>();
         fixture_paths.sort();
-        assert_eq!(fixture_paths.len(), 42, "Oracle fixture inventory changed");
+        assert_eq!(fixture_paths.len(), 43, "Oracle fixture inventory changed");
 
         let mut audit_failures = Vec::new();
         for path in fixture_paths {

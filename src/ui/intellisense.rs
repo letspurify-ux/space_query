@@ -3723,7 +3723,13 @@ fn incomplete_quoted_identifier_start_before_cursor(
                 span.kind == crate::sql_parser_engine::LexicalKind::QuotedIdentifier
                     && span.start == prev_idx
             });
-            let bracket_starts_in_code = ch == '[' && lexical_span.is_none();
+            let bracket_starts_graph_edge = ch == '['
+                && text
+                    .get(..prev_idx)
+                    .and_then(|head| head.chars().next_back())
+                    == Some('-');
+            let bracket_starts_in_code =
+                ch == '[' && lexical_span.is_none() && !bracket_starts_graph_edge;
             if (is_parser_quoted_identifier_start || bracket_starts_in_code)
                 && !has_unescaped_identifier_delimiter(
                     text,
@@ -6371,6 +6377,17 @@ mod intellisense_tests {
 
         assert_eq!(word, "[Street N");
         assert_eq!(sql.get(start..cursor), Some("[Street N"));
+        assert_eq!(end, cursor);
+    }
+
+    #[test]
+    fn get_word_at_cursor_does_not_treat_property_graph_edge_as_bracket_identifier() {
+        let sql = "SELECT * FROM GRAPH_TABLE (g MATCH (a IS node) -[e I links]-> (b IS node))";
+        let cursor = sql.find(" links").expect("expected cursor anchor");
+        let (word, start, end) = get_word_at_cursor(sql, cursor);
+
+        assert_eq!(word, "I");
+        assert_eq!(sql.get(start..cursor), Some("I"));
         assert_eq!(end, cursor);
     }
 

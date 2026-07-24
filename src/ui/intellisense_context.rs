@@ -1198,6 +1198,22 @@ fn is_from_consuming_function(name: &str) -> bool {
     sql_text::is_from_consuming_function(name)
 }
 
+fn is_nth_value_from_modifier(tokens: &[SqlToken], from_idx: usize) -> bool {
+    if !next_word_upper(tokens, from_idx.saturating_add(1))
+        .is_some_and(|(word, _)| matches!(word.as_str(), "FIRST" | "LAST"))
+    {
+        return false;
+    }
+    let Some((SqlToken::Symbol(close), close_idx)) = prev_non_comment_token(tokens, from_idx)
+    else {
+        return false;
+    };
+    close == ")"
+        && matching_open_paren_before_close(tokens, close_idx)
+            .and_then(|open_idx| prev_word_upper(tokens, open_idx))
+            .is_some_and(|(word, _)| word == "NTH_VALUE")
+}
+
 /// FROM-clause table functions that may reference left-side row source aliases
 /// without an explicit APPLY/LATERAL modifier.
 fn is_implicitly_lateral_table_function(name: &str) -> bool {
@@ -3860,6 +3876,8 @@ fn scan_cursor_context(tokens: &[SqlToken], cursor_token_len: usize) -> CursorSc
                         let from_belongs_to_distinct_predicate =
                             is_distinct_from_operator(tokens, idx)
                                 && current_phase.is_column_context();
+                        let from_belongs_to_nth_value_modifier =
+                            is_nth_value_from_modifier(tokens, idx);
                         let should_treat_as_function_from = depth_frames
                             .get(depth)
                             .map(|frame| {
@@ -3880,6 +3898,7 @@ fn scan_cursor_context(tokens: &[SqlToken], cursor_token_len: usize) -> CursorSc
                                 current_phase,
                             )
                             || from_belongs_to_distinct_predicate
+                            || from_belongs_to_nth_value_modifier
                         {
                             relation_state.clear();
                         } else {

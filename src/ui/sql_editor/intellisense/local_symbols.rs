@@ -2110,6 +2110,7 @@ impl SqlEditorWidget {
         let mut root_decl_end_idx = None;
         let mut root_awaiting_body_begin = false;
         let mut root_awaiting_compound_trigger_section = false;
+        let mut root_is_compound_trigger = false;
         let mut pending_loop_var = None::<ParsedForLoopRecord>;
         let mut skip_token_idx = None::<usize>;
         let mut idx = 0usize;
@@ -2198,6 +2199,7 @@ impl SqlEditorWidget {
                         {
                             root_decl_start_idx = Some(parsed.decl_start_idx);
                             root_awaiting_compound_trigger_section = true;
+                            root_is_compound_trigger = true;
                             idx = parsed.trigger_keyword_idx.saturating_add(1);
                             continue;
                         }
@@ -2292,9 +2294,43 @@ impl SqlEditorWidget {
 
                     match upper.as_str() {
                         "BEFORE" | "AFTER" | "INSTEAD" => {
-                            if root_awaiting_compound_trigger_section && block_stack.is_empty() {
-                                root_decl_end_idx = Some(idx);
-                                root_awaiting_compound_trigger_section = false;
+                            if root_is_compound_trigger && block_stack.is_empty() && !prev_is_end {
+                                if let Some(section_is_idx) =
+                                    Self::parse_compound_trigger_section_header(token_spans, idx)
+                                {
+                                    if root_awaiting_compound_trigger_section {
+                                        root_decl_end_idx = Some(idx);
+                                        root_awaiting_compound_trigger_section = false;
+                                    }
+                                    let parent_scope =
+                                        Self::current_local_parent_scope_id(&block_stack);
+                                    let scope_id = scopes.len();
+                                    scopes.push(LocalScopeBuilder {
+                                        scope: LocalScope {
+                                            parent: Some(parent_scope),
+                                            start: token_spans[section_is_idx].end,
+                                            end: statement_len,
+                                            depth: scopes[parent_scope]
+                                                .scope
+                                                .depth
+                                                .saturating_add(1),
+                                            kind: LocalScopeKind::DeclareBlock,
+                                            return_type_display: None,
+                                        },
+                                        token_start_idx: idx,
+                                        token_end_idx: token_spans.len(),
+                                        decl_start_idx: Some(section_is_idx.saturating_add(1)),
+                                        decl_end_idx: None,
+                                        mysql_declare_statements: false,
+                                    });
+                                    block_stack.push(LocalBlockFrame {
+                                        kind: LocalBlockKind::Declare,
+                                        scope_id: Some(scope_id),
+                                        awaiting_body_begin: true,
+                                    });
+                                    idx = section_is_idx.saturating_add(1);
+                                    continue;
+                                }
                             }
                         }
                         "DECLARE" => {
@@ -4293,6 +4329,39 @@ impl SqlEditorWidget {
             trigger_keyword_idx: trigger_idx,
             decl_start_idx: trigger_idx.saturating_add(1),
         })
+    }
+
+    fn parse_compound_trigger_section_header(
+        tokens: &[SqlTokenSpan],
+        section_idx: usize,
+    ) -> Option<usize> {
+        let section_word = Self::token_word(&tokens.get(section_idx)?.token)?;
+        let expected_tail: &[&str] = if section_word.eq_ignore_ascii_case("BEFORE")
+            || section_word.eq_ignore_ascii_case("AFTER")
+        {
+            let next_idx = Self::next_meaningful_token_idx(tokens, section_idx + 1)?;
+            let next_word = Self::token_word(&tokens[next_idx].token)?;
+            if next_word.eq_ignore_ascii_case("STATEMENT") {
+                &["STATEMENT", "IS"]
+            } else {
+                &["EACH", "ROW", "IS"]
+            }
+        } else if section_word.eq_ignore_ascii_case("INSTEAD") {
+            &["OF", "EACH", "ROW", "IS"]
+        } else {
+            return None;
+        };
+
+        let mut token_idx = section_idx;
+        for expected in expected_tail {
+            token_idx = Self::next_meaningful_token_idx(tokens, token_idx + 1)?;
+            if !Self::token_word(&tokens[token_idx].token)
+                .is_some_and(|word| word.eq_ignore_ascii_case(expected))
+            {
+                return None;
+            }
+        }
+        Some(token_idx)
     }
 
     /// The package name (last identifier segment, upper-cased) of a

@@ -3197,7 +3197,19 @@ impl FormatFrameAlignmentAudit {
                                         if comment.starts_with("--") || comment.starts_with('#')
                                 )
                             });
-                        if close_line_break_count <= 1 && !body_tail_is_line_comment {
+                        let empty_block = self.frame_kind(frame_id)
+                            == Some(FormatManagedFrameKind::Block)
+                            && !self.events.iter().any(|event| {
+                                matches!(
+                                    event,
+                                    FormatFrameAlignmentEvent::BodyItem {
+                                        frame_id: body_frame_id,
+                                        ..
+                                    } if *body_frame_id == frame_id
+                                )
+                            });
+                        if close_line_break_count <= 1 && !body_tail_is_line_comment && !empty_block
+                        {
                             summary.issues.push(FormatFrameAlignmentIssue {
                                 offset: span.start,
                                 message: format!(
@@ -4767,6 +4779,16 @@ impl FormatFrameStack {
             .and_then(|frame| frame.wrapped_owner_kind)
     }
 
+    #[cfg(test)]
+    fn has_wrapped_paren_owner_kind(&self, kind: FormatIndentedParenOwnerKind) -> bool {
+        self.frames.iter().rev().any(|frame| {
+            matches!(
+                frame,
+                FormatFrame::Paren(paren) if paren.wrapped_owner_kind == Some(kind)
+            )
+        })
+    }
+
     fn last_paren_is_analytic_or_window(&self) -> bool {
         self.last_paren_stack_frame().is_some_and(|frame| {
             frame.semantic_flags.analytic_over || frame.semantic_flags.window_clause
@@ -5614,7 +5636,7 @@ impl FormatFrameStack {
         &self,
         owner_depth: usize,
     ) -> Option<(SqlFormatFrameId, usize)> {
-        self.frames.iter().rev().find_map(|frame| match frame {
+        let stack_owner = self.frames.iter().rev().find_map(|frame| match frame {
             FormatFrame::Paren(frame) if frame.frame.depth() == owner_depth => {
                 Some((frame.id, frame.frame.depth()))
             }
@@ -5640,7 +5662,15 @@ impl FormatFrameStack {
                 Some((frame.id, frame.depth_frame.depth))
             }
             _ => None,
-        })
+        });
+        let conditional_owner = self
+            .oracle_conditional_compilation_frames
+            .iter()
+            .rev()
+            .find(|frame| frame.branch_body_active && frame.depth.depth == owner_depth)
+            .map(|frame| (frame.id, frame.depth.depth));
+
+        stack_owner.or(conditional_owner)
     }
 
     #[cfg(test)]
@@ -11747,6 +11777,13 @@ impl SqlEditorWidget {
         let mut pending_package_member_separator = false;
         let mut active_package_member_name: Option<String> = None;
         let mut mysql_handler_state = MySqlHandlerFormatState::None;
+        let oracle_property_graph_query = !mysql_compatible
+            && tokens.iter().any(
+                |token| matches!(token, SqlToken::Word(word) if word.eq_ignore_ascii_case("GRAPH_TABLE")),
+            )
+            && tokens.iter().any(
+                |token| matches!(token, SqlToken::Word(word) if word.eq_ignore_ascii_case("MATCH")),
+            );
         let mut select_list_break_state = select_list_break_state_on_start;
         let mut exit_condition_state = ExitConditionState::None;
         // MySQL ON DUPLICATE KEY UPDATE: tracks when VALUES() is a function, not a clause
@@ -12581,6 +12618,14 @@ impl SqlEditorWidget {
                     let mysql_xa_subcommand = mysql_compatible
                         && matches!(prev_word_upper, Some("XA"))
                         && matches!(upper, "START" | "END");
+                    let oracle_json_duality_capability_keyword = !mysql_compatible
+                        && matches!(upper, "UPDATE" | "INSERT" | "DELETE")
+                        && tokens.iter().take(idx).any(|token| {
+                            matches!(
+                                token,
+                                SqlToken::Word(word) if word.eq_ignore_ascii_case("DUALITY")
+                            )
+                        });
                     // A control keyword acting as an alias keeps its source
                     // case only when the previous token proves the alias slot
                     // (a non-keyword word such as the table/column name, or a
@@ -12605,7 +12650,8 @@ impl SqlEditorWidget {
                     let keyword_suppresses_structural_handling = keyword_preserves_original_case
                         || treat_control_keyword_as_identifier
                         || follows_alias_control_keyword
-                        || mysql_xa_subcommand;
+                        || mysql_xa_subcommand
+                        || oracle_json_duality_capability_keyword;
                     let model_bracket_member = construct_flag_active!(ModelActive)
                         && delimiter_frame_state.innermost_is_bracket();
                     let on_duplicate_key_values_function =
@@ -18281,6 +18327,9 @@ impl SqlEditorWidget {
                                         || format_stack.last_paren_stack_frame().is_some_and(
                                             |frame| frame.semantic_flags.fixed_type_modifier,
                                         )
+                                        || format_stack.has_wrapped_paren_owner_kind(
+                                            FormatIndentedParenOwnerKind::Unpivot,
+                                        )
                                         || is_with_cte_separator,
                                 );
                             }
@@ -19488,8 +19537,10 @@ impl SqlEditorWidget {
                                 .set(current_rendered_line_paren_depth.get().saturating_sub(1));
                             if let Some(parent_frame) = format_stack.last_paren_mut() {
                                 if paren_frame_kind.contributes_multiline_close()
-                                    && (options.comma_list_layout != SqlCommaListLayout::Wrapped
-                                        || !paren_frame_kind.body_is_single_line(&out))
+                                    && (!paren_frame_kind.body_is_single_line(&out)
+                                        || (options.comma_list_layout
+                                            != SqlCommaListLayout::Wrapped
+                                            && !oracle_property_graph_query))
                                     && !close_compact_before_parent_close
                                 {
                                     parent_frame.mark_multiline_child_closed();
@@ -19525,8 +19576,83 @@ impl SqlEditorWidget {
                             }
                             needs_space = true;
                         }
+                        "<" if oracle_property_graph_query
+                            && matches!(
+                                immediate_next_token,
+                                Some(SqlToken::Symbol(next)) if next == "-"
+                            )
+                            && matches!(
+                                immediate_next_next_token,
+                                Some(SqlToken::Symbol(next)) if next == "["
+                            ) =>
+                        {
+                            ensure_indent(&mut out, &mut at_line_start, line_indent);
+                            if needs_space {
+                                out.push(' ');
+                            }
+                            out.push('<');
+                            needs_space = false;
+                        }
+                        "-" if oracle_property_graph_query
+                            && matches!(
+                                immediate_next_token,
+                                Some(SqlToken::Symbol(next)) if next == "["
+                            ) =>
+                        {
+                            ensure_indent(&mut out, &mut at_line_start, line_indent);
+                            if needs_space {
+                                out.push(' ');
+                            }
+                            out.push('-');
+                            needs_space = false;
+                        }
+                        "[" if oracle_property_graph_query
+                            && matches!(
+                                immediate_prev_token,
+                                Some(SqlToken::Symbol(previous)) if previous == "-"
+                            ) =>
+                        {
+                            trim_trailing_space(&mut out);
+                            ensure_indent(&mut out, &mut at_line_start, line_indent);
+                            out.push('[');
+                            needs_space = false;
+                        }
+                        "]" if oracle_property_graph_query
+                            && matches!(
+                                immediate_next_token,
+                                Some(SqlToken::Symbol(next)) if matches!(next.as_str(), "->" | "-")
+                            ) =>
+                        {
+                            trim_trailing_space(&mut out);
+                            ensure_indent(&mut out, &mut at_line_start, line_indent);
+                            out.push(']');
+                            needs_space = false;
+                        }
+                        "->" if oracle_property_graph_query
+                            && matches!(
+                                immediate_prev_token,
+                                Some(SqlToken::Symbol(previous)) if previous == "]"
+                            ) =>
+                        {
+                            trim_trailing_space(&mut out);
+                            ensure_indent(&mut out, &mut at_line_start, line_indent);
+                            out.push_str("->");
+                            needs_space = true;
+                        }
+                        "-" if oracle_property_graph_query
+                            && matches!(
+                                immediate_prev_token,
+                                Some(SqlToken::Symbol(previous)) if previous == "]"
+                            ) =>
+                        {
+                            trim_trailing_space(&mut out);
+                            ensure_indent(&mut out, &mut at_line_start, line_indent);
+                            out.push('-');
+                            needs_space = true;
+                        }
                         "." => {
                             trim_trailing_space(&mut out);
+                            ensure_indent(&mut out, &mut at_line_start, line_indent);
                             out.push('.');
                             needs_space = false;
                         }
@@ -30838,6 +30964,103 @@ sales_agg AS (
             leading_spaces(lines[with_idx]).saturating_add(4),
             "the second CTE should begin on the WITH frame body depth, got:\n{}",
             formatted
+        );
+    }
+
+    #[test]
+    fn format_for_auto_formatting_keeps_json_duality_view_query_body_owned() {
+        let source = r#"CREATE OR REPLACE JSON RELATIONAL DUALITY VIEW dv_demo AS
+SELECT JSON {'_id':t.id WITH UPDATE}
+FROM demo t WITH UPDATE INSERT DELETE;"#;
+
+        let formatted = SqlEditorWidget::format_for_auto_formatting(source, false);
+        let lines: Vec<&str> = formatted.lines().collect();
+        let select_idx =
+            find_line_starting_with(&lines, "SELECT JSON").expect("duality SELECT line");
+        let from_idx = find_line_starting_with(&lines, "FROM demo").expect("duality FROM line");
+
+        assert_eq!(leading_spaces(lines[select_idx]), 4, "{formatted}");
+        assert_eq!(leading_spaces(lines[from_idx]), 4, "{formatted}");
+        assert_eq!(
+            SqlEditorWidget::format_for_auto_formatting(&formatted, false),
+            formatted,
+            "duality-view formatting must be idempotent"
+        );
+    }
+
+    #[test]
+    fn format_for_auto_formatting_keeps_parenthesized_sql_macro_body_attached() {
+        let source = r#"CREATE OR REPLACE FUNCTION topn RETURN VARCHAR2 SQL_MACRO(TABLE)
+IS
+BEGIN
+  RETURN q'[SELECT 1 FROM dual]';
+END topn;
+/"#;
+
+        let formatted = SqlEditorWidget::format_for_auto_formatting(source, false);
+        assert!(
+            formatted.contains("SQL_MACRO (TABLE) IS\nBEGIN"),
+            "SQL macro header was split from its body:\n{formatted}"
+        );
+        assert!(
+            !formatted.contains("SQL_MACRO (TABLE) IS;\n"),
+            "formatter inserted a terminator before the SQL macro body:\n{formatted}"
+        );
+        assert_eq!(
+            SqlEditorWidget::format_for_auto_formatting(&formatted, false),
+            formatted,
+            "SQL macro formatting must be idempotent"
+        );
+    }
+
+    #[test]
+    fn format_for_auto_formatting_keeps_leading_decimal_select_item_indented() {
+        let source = r#"SELECT 1"X",.5+2."Y",3.5e1"Z",'it''s'||q'[ok]'"W" FROM dual;"#;
+
+        let formatted = SqlEditorWidget::format_for_auto_formatting(source, false);
+        assert!(
+            formatted.contains("\n    .5 + 2.\"Y\","),
+            "leading decimal select item lost its list indentation:\n{formatted}"
+        );
+        assert!(
+            !formatted.contains(".    5"),
+            "formatter split a leading decimal literal:\n{formatted}"
+        );
+        assert_eq!(
+            SqlEditorWidget::format_for_auto_formatting(&formatted, false),
+            formatted,
+            "leading-decimal formatting must be idempotent"
+        );
+    }
+
+    #[test]
+    fn format_for_auto_formatting_keeps_property_graph_edge_connectors_atomic() {
+        let source = r#"SELECT COUNT(*)
+FROM GRAPH_TABLE (sq_hard_graph
+  MATCH (a IS metric) -[e IS links]-> (b IS metric)
+  COLUMNS (e.hop_cost AS hop_cost));"#;
+
+        let formatted = SqlEditorWidget::format_for_auto_formatting_with_db_type(
+            source,
+            false,
+            Some(crate::db::connection::DatabaseType::Oracle),
+        );
+        assert!(
+            formatted.contains("-[e IS links]->"),
+            "property-graph edge connector was split:\n{formatted}"
+        );
+        assert!(
+            !formatted.contains("- [") && !formatted.contains("] - >"),
+            "property-graph edge punctuation must remain atomic:\n{formatted}"
+        );
+        assert_eq!(
+            SqlEditorWidget::format_for_auto_formatting_with_db_type(
+                &formatted,
+                false,
+                Some(crate::db::connection::DatabaseType::Oracle),
+            ),
+            formatted,
+            "property-graph formatting must be idempotent"
         );
     }
 
@@ -43826,7 +44049,7 @@ DELIMITER ;"#;
             .skip(json_table_join_idx + 1)
             .find(|(_, line)| line.trim_start() == ") jt")
             .map(|(idx, _)| idx)
-            .expect("test4 JSON_TABLE close");
+            .unwrap_or_else(|| panic!("test4 JSON_TABLE close, got:\n{formatted}"));
         let columns_owner_idx = lines
             .iter()
             .enumerate()
@@ -49596,6 +49819,25 @@ mod format_frame_stack_tests {
         assert!(stack.pop_insert_all_at_paren_depth(1));
         let _ = stack.pop_paren();
         assert_eq!(stack.insert_all_branch_body_indent(0), Some(3));
+    }
+
+    #[test]
+    fn conditional_compilation_branch_is_semantic_parent_for_assignment_value() {
+        let mut stack = FormatFrameStack::default();
+
+        stack.push_block(BlockKind::Begin, 0);
+        stack.push_oracle_conditional_compilation(2);
+        assert_eq!(stack.activate_oracle_conditional_branch(), Some(3));
+        let conditional_id = stack
+            .oracle_conditional_compilation_frames
+            .last()
+            .expect("conditional compilation frame")
+            .id;
+
+        assert_eq!(
+            stack.nearest_semantic_owner_parent_frame(3),
+            Some((conditional_id, 3))
+        );
     }
 
     #[test]

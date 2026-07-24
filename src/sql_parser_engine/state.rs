@@ -1439,24 +1439,30 @@ impl SplitState {
 
 
     pub(crate) fn track_create_plsql_symbol(&mut self, ch: char) {
-        if self.block_depth() != 0
-            || self.create_plsql_kind != CreatePlsqlKind::PackageBody
-            || !self.awaiting_package_body_name
-        {
-            return;
+        if self.pending_sql_macro_call_spec && ch == '(' {
+            // `SQL_MACRO(TABLE)` / `SQL_MACRO(SCALAR)` is a function
+            // declaration property. It is followed by the real `AS`/`IS`
+            // routine body and must not be treated like the body-less
+            // `AS SQL_MACRO;` call-spec form.
+            self.pending_sql_macro_call_spec = false;
         }
 
-        let keeps_awaiting_segment_after_dot = self.awaiting_package_body_name_dot
-            && matches!(ch, '/' | '*' | '-');
+        if self.block_depth() == 0
+            && self.create_plsql_kind == CreatePlsqlKind::PackageBody
+            && self.awaiting_package_body_name
+        {
+            let keeps_awaiting_segment_after_dot = self.awaiting_package_body_name_dot
+                && matches!(ch, '/' | '*' | '-');
 
-        match ch {
-            '.' if !self.package_body_name_segments.is_empty() => {
-                self.awaiting_package_body_name_dot = true;
+            match ch {
+                '.' if !self.package_body_name_segments.is_empty() => {
+                    self.awaiting_package_body_name_dot = true;
+                }
+                _ if !ch.is_whitespace() && !keeps_awaiting_segment_after_dot => {
+                    self.awaiting_package_body_name_dot = false;
+                }
+                _ => {}
             }
-            _ if !ch.is_whitespace() && !keeps_awaiting_segment_after_dot => {
-                self.awaiting_package_body_name_dot = false;
-            }
-            _ => {}
         }
     }
 

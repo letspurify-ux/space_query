@@ -5278,6 +5278,22 @@ fn line_starts_ddl_query_body_header_prefix(line: &str) -> bool {
 
     if words
         .get(idx)
+        .is_some_and(|word| word.eq_ignore_ascii_case("JSON"))
+        && words
+            .get(idx + 1)
+            .is_some_and(|word| word.eq_ignore_ascii_case("RELATIONAL"))
+        && words
+            .get(idx + 2)
+            .is_some_and(|word| word.eq_ignore_ascii_case("DUALITY"))
+        && words
+            .get(idx + 3)
+            .is_some_and(|word| word.eq_ignore_ascii_case("VIEW"))
+    {
+        return true;
+    }
+
+    if words
+        .get(idx)
         .is_some_and(|word| word.eq_ignore_ascii_case("TABLE"))
     {
         return true;
@@ -11444,6 +11460,9 @@ mod tests {
         ));
         assert!(line_is_ddl_query_body_header(
             "CREATE MATERIALIZED VIEW mv_demo AS"
+        ));
+        assert!(line_is_ddl_query_body_header(
+            "CREATE OR REPLACE JSON RELATIONAL DUALITY VIEW dv_demo AS"
         ));
         assert!(line_is_ddl_query_body_header("CREATE TABLE t_demo AS"));
         assert!(line_is_ddl_query_body_header(

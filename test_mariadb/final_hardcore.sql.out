@@ -1,0 +1,613 @@
+-- MariaDB HARDCORE editor-engine stress suite.
+-- Live target: MariaDB Server 12.2.2.
+-- Run from the repository root:
+--   mariadb --protocol=TCP -h127.0.0.1 -P3306 -uroot -ppassword \
+--     --show-warnings --binary-mode < test_mariadb/final_hardcore.sql
+--
+-- Purpose: DELIBERATELY hostile-but-legal grammar that pushes the completion,
+-- auto-formatting, and syntax-highlighting engines far past the gentle coverage
+-- of test_mariadb/final.sql. Everything still parses and executes on the live
+-- server so the formatted output can be re-executed for certification.
+
+DROP DATABASE IF EXISTS sq_hard_mariadb;
+CREATE DATABASE sq_hard_mariadb CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
+USE sq_hard_mariadb;
+SET SESSION sql_mode = 'STRICT_TRANS_TABLES,NO_ENGINE_SUBSTITUTION';
+
+-- Backtick identifiers that collide with reserved words, embed spaces, doubled
+-- backticks, and $/# characters; plus a PERSISTENT generated column.
+CREATE TABLE `select` (
+  `from`               INT NOT NULL,
+  `Group By`           DATE,
+  `order`              INT,
+  `x$weird#col`        INT,
+  `Column ``With`` Backtick` VARCHAR(30),
+  json_value           JSON,
+  computed_upper       VARCHAR(30) AS (UPPER(`from`)) PERSISTENT,
+  PRIMARY KEY (`from`)
+) ENGINE = InnoDB;
+
+INSERT INTO `select` (`from`, `Group By`, `order`, `x$weird#col`,
+                      `Column ``With`` Backtick`, json_value)
+VALUES (1, DATE '2024-02-29', 2, 3, 'b`t',
+        JSON_OBJECT('tags', JSON_ARRAY('sql', 'json'),
+                    'items', JSON_ARRAY(JSON_OBJECT('n', 'a', 'v', 10),
+                                        JSON_OBJECT('n', 'b', 'v', 20))));
+
+SELECT s.`from` + s.`order`                            AS summed,
+       s.`Column ``With`` Backtick`                    AS quoted_col,
+       EXTRACT(YEAR FROM s.`Group By`)                 AS leap_year
+FROM `select` s
+WHERE s.`from` = 1 AND s.`order` BETWEEN 1 AND 9;
+
+-- Sequence, MariaDB-specific types (UUID / INET6), and INSERT ... RETURNING.
+CREATE SEQUENCE seq_hard START WITH 100 INCREMENT BY 5;
+
+CREATE TABLE endpoint (
+  id     INT NOT NULL DEFAULT (NEXT VALUE FOR seq_hard),
+  guid   UUID   NOT NULL,
+  addr   INET6  NOT NULL,
+  PRIMARY KEY (id)
+) ENGINE = InnoDB;
+
+INSERT INTO endpoint (guid, addr)
+VALUES (UUID(), INET6_ATON('2001:db8::1'))
+RETURNING id, INET6_NTOA(addr) AS printable;
+
+-- Deeply nested derived tables (aliased), scalar subqueries, inline comments.
+SELECT /* deep nesting */ deep.total
+FROM (
+  SELECT /* level 1 */
+         (SELECT COUNT(*)
+          FROM (SELECT 3 c FROM (SELECT 2 b FROM (SELECT 1 a) t3) t2) t1) AS total
+) deep;
+
+-- Operator adjacency, exotic literals, JSON path operators, JSON_CONTAINS.
+SELECT 1+2*3-4 DIV 2                       AS arithmetic_value,
+       5%3, 6&3, 7|1, 8^2, ~9, 1<<4, 256>>2 AS bit_ops,
+       X'53514C'                           AS hex_literal,
+       0x4D79                              AS zerox_literal,
+       b'1010'                             AS bit_literal,
+       JSON_EXTRACT(json_value, '$.tags[0]') AS json_extract_value,
+       JSON_VALUE(json_value, '$.items[1].n') AS json_scalar_value,
+       JSON_CONTAINS(JSON_EXTRACT(json_value, '$.tags'), JSON_QUOTE('sql')) AS json_has_tag
+FROM `select`;
+
+-- JSON_TABLE with NESTED PATH, ordinality, and ON EMPTY defaults.
+SELECT jt.item_no, jt.item_name, jt.item_value
+FROM `select` s,
+     JSON_TABLE(s.json_value, '$'
+       COLUMNS (
+         NESTED PATH '$.items[*]' COLUMNS (
+           item_no    FOR ORDINALITY,
+           item_name  VARCHAR(16) PATH '$.n',
+           item_value INT PATH '$.v' DEFAULT '0' ON EMPTY
+         )
+       )) jt
+ORDER BY jt.item_no;
+
+-- Recursive CTE whose recursive branch references its own name in FROM.
+WITH RECURSIVE counter (n, fact) AS (
+  SELECT 1, 1
+  UNION ALL
+  SELECT n + 1, fact * (n + 1) FROM counter WHERE n < 6
+)
+SELECT n, fact FROM counter ORDER BY n;
+
+CREATE TABLE metric (
+  metric_id    INT NOT NULL,
+  node_id      INT NOT NULL,
+  measured_on  DATE NOT NULL,
+  metric_value DECIMAL(12,2) NOT NULL,
+  PRIMARY KEY (metric_id)
+) ENGINE = InnoDB;
+INSERT INTO metric VALUES
+  (1, 1, '2026-01-01', 12), (2, 1, '2026-01-03', 18),
+  (3, 1, '2026-01-08', 24), (4, 2, '2026-01-02', 2);
+
+-- Recursive CYCLE + nested JSON_TABLE + named-window inheritance +
+-- ordered-set analytics + INTERSECT ALL/EXCEPT ALL. Keeping these constructs
+-- in one WITH chain forces each editor subsystem to recover the exact CTE,
+-- JSON, window, and set-operation owner before the final SELECT.
+WITH RECURSIVE
+hard_nodes (node_id, parent_node_id, node_name) AS (
+  SELECT 1, NULL, 'root'
+  UNION ALL SELECT 2, 1, 'blue'
+  UNION ALL SELECT 3, 1, 'green'
+  UNION ALL SELECT 4, 2, 'leaf'
+),
+hard_tree (node_id, parent_node_id, node_path, tree_depth) AS (
+  SELECT node_id, parent_node_id, CAST(UPPER(node_name) AS CHAR(400)), 0
+  FROM hard_nodes
+  WHERE parent_node_id IS NULL
+  UNION ALL
+  SELECT n.node_id, n.parent_node_id,
+         CONCAT(t.node_path, '/', UPPER(n.node_name)), t.tree_depth + 1
+  FROM hard_nodes n
+  JOIN hard_tree t ON t.node_id = n.parent_node_id
+)
+CYCLE node_id RESTRICT,
+metric_docs (metric_id, node_id, measured_on, payload) AS (
+  SELECT metric_id, node_id, measured_on,
+         JSON_OBJECT(
+           'samples', JSON_ARRAY(
+             JSON_OBJECT('kind', 'actual', 'value', metric_value),
+             JSON_OBJECT('kind', 'forecast', 'value', metric_value + 1)
+           )
+         )
+  FROM metric
+),
+expanded AS (
+  SELECT d.metric_id, d.node_id, d.measured_on,
+         jt.sample_no, jt.sample_kind, jt.sample_value
+  FROM metric_docs d
+  JOIN JSON_TABLE(
+    d.payload,
+    '$.samples[*]' COLUMNS (
+      sample_no    FOR ORDINALITY,
+      sample_kind  VARCHAR(16) PATH '$.kind' ERROR ON ERROR,
+      sample_value DECIMAL(12,2) PATH '$.value'
+                   DEFAULT '0' ON EMPTY DEFAULT '0' ON ERROR
+    )
+  ) jt ON TRUE
+),
+analytic AS (
+  SELECT e.*,
+         SUM(e.sample_value) OVER w_running AS running_value,
+         COALESCE(LAG(e.sample_value, 1) OVER w_ordered, 0) AS previous_value,
+         PERCENTILE_CONT(0.5) WITHIN GROUP (
+           ORDER BY e.sample_value
+         ) OVER (PARTITION BY e.node_id) AS median_value,
+         ROW_NUMBER() OVER w_rank AS value_rank
+  FROM expanded e
+  WINDOW
+    w_node AS (PARTITION BY e.node_id),
+    w_ordered AS (
+      w_node ORDER BY e.measured_on, e.metric_id, e.sample_no
+    ),
+    w_running AS (
+      w_ordered ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+    ),
+    w_rank AS (
+      w_node ORDER BY e.sample_value DESC, e.metric_id, e.sample_no
+    )
+),
+eligible (node_id) AS (
+  (SELECT node_id FROM hard_nodes)
+  INTERSECT ALL
+  (SELECT node_id FROM metric)
+  EXCEPT ALL
+  (SELECT node_id FROM metric WHERE metric_value < 0)
+),
+final_rows AS (
+  SELECT t.node_id, t.node_path, t.tree_depth,
+         CASE WHEN e.node_id IS NULL THEN 'EMPTY' ELSE 'MEASURED' END AS state_name,
+         (SELECT a.sample_value
+          FROM analytic a
+          WHERE a.node_id = t.node_id AND a.value_rank = 1
+          LIMIT 1) AS peak_value,
+         (SELECT MAX(a.running_value)
+          FROM analytic a
+          WHERE a.node_id = t.node_id) AS peak_running,
+         (SELECT JSON_ARRAYAGG(
+                   JSON_OBJECT(
+                     'metric', a.metric_id,
+                     'kind', a.sample_kind,
+                     'value', a.sample_value
+                   )
+                   ORDER BY a.metric_id, a.sample_no
+                 )
+          FROM analytic a
+          WHERE a.node_id = t.node_id) AS evidence
+  FROM hard_tree t
+  LEFT JOIN (SELECT DISTINCT node_id FROM eligible) e
+    ON e.node_id = t.node_id
+)
+SELECT CASE
+         WHEN (SELECT COUNT(*) FROM hard_tree) = 4
+          AND (SELECT COUNT(*) FROM expanded) = 8
+          AND (SELECT COUNT(*) FROM eligible) = 2
+         THEN 'PASS' ELSE 'FAIL'
+       END AS integrated_status,
+       node_id, node_path, tree_depth, state_name,
+       peak_value, peak_running, evidence
+FROM final_rows
+ORDER BY node_id;
+
+-- Window functions with named windows, frame, nested CASE, and top-per-group
+-- via ROW_NUMBER (MariaDB has no LATERAL).
+SELECT metric_id, node_id, metric_value,
+       CASE WHEN metric_value > (CASE WHEN node_id = 1 THEN 10 ELSE 20 END)
+            THEN 'high' ELSE 'low' END               AS band,
+       SUM(metric_value) OVER w_run                  AS running_sum,
+       LAG(metric_value, 1) OVER w_ord               AS prev_value
+FROM metric
+WINDOW w_ord AS (PARTITION BY node_id ORDER BY measured_on, metric_id),
+       w_run AS (w_ord ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW)
+ORDER BY node_id, metric_id;
+
+SELECT node_id, metric_id, metric_value
+FROM (
+  SELECT metric_id, node_id, metric_value,
+         ROW_NUMBER() OVER (PARTITION BY node_id ORDER BY metric_value DESC) AS rn
+  FROM metric
+) ranked
+WHERE rn = 1
+ORDER BY node_id;
+
+SELECT node_id, SUM(metric_value) AS total
+FROM metric GROUP BY node_id WITH ROLLUP;
+
+-- Simultaneous application-time + system-time table. FOR PORTION OF splits the
+-- current application interval while FOR SYSTEM_TIME preserves the pre-split
+-- snapshot, creating deliberately ambiguous PERIOD/FOR/FROM/TO token contexts.
+CREATE TABLE versioned (
+  id         INT NOT NULL,
+  valid_from DATE NOT NULL,
+  valid_to   DATE NOT NULL,
+  v          INT NOT NULL,
+  row_start  TIMESTAMP(6) GENERATED ALWAYS AS ROW START,
+  row_end    TIMESTAMP(6) GENERATED ALWAYS AS ROW END,
+  PERIOD FOR validity (valid_from, valid_to),
+  PERIOD FOR SYSTEM_TIME (row_start, row_end),
+  PRIMARY KEY (id, validity WITHOUT OVERLAPS)
+) WITH SYSTEM VERSIONING;
+INSERT INTO versioned (id, valid_from, valid_to, v) VALUES
+  (1, '2026-01-01', '2027-01-01', 10),
+  (2, '2026-01-01', '2027-01-01', 20);
+SET @version_cutover = NOW(6);
+DO SLEEP(0.02);
+UPDATE versioned FOR PORTION OF validity
+FROM '2026-03-01' TO '2026-06-01'
+SET v = v + 5
+WHERE id = 1;
+UPDATE versioned SET v = v + 1 WHERE id = 2;
+
+SELECT id, valid_from, valid_to, v, row_start, row_end
+FROM versioned FOR SYSTEM_TIME AS OF @version_cutover
+ORDER BY id, valid_from;
+
+SELECT id, valid_from, valid_to, v, row_start, row_end
+FROM versioned FOR SYSTEM_TIME ALL
+ORDER BY id, row_start, valid_from;
+
+-- Stored routine torture: labelled loops, cursor, handlers, SIGNAL/RESIGNAL,
+-- GET DIAGNOSTICS, nested blocks, and a scalar function.
+DELIMITER $$
+CREATE FUNCTION sq_hard_band(v DECIMAL(12,2)) RETURNS VARCHAR(8) DETERMINISTIC
+RETURN CASE WHEN v >= 20 THEN 'HIGH' WHEN v >= 10 THEN 'MID' ELSE 'LOW' END$$
+
+CREATE PROCEDURE sq_hard_walk(OUT total_out DECIMAL(12,2))
+outer_block: BEGIN
+  DECLARE done_flag BOOLEAN DEFAULT FALSE;
+  DECLARE v DECIMAL(12,2);
+  DECLARE acc DECIMAL(12,2) DEFAULT 0;
+  DECLARE cur CURSOR FOR SELECT metric_value FROM metric ORDER BY metric_id;
+  DECLARE CONTINUE HANDLER FOR NOT FOUND SET done_flag = TRUE;
+
+  OPEN cur;
+  scan: LOOP
+    FETCH cur INTO v;
+    IF done_flag THEN
+      LEAVE scan;
+    END IF;
+    SET acc = acc + v;
+  END LOOP scan;
+  CLOSE cur;
+
+  IF acc < 0 THEN
+    BEGIN
+      DECLARE EXIT HANDLER FOR SQLEXCEPTION
+      BEGIN
+        GET DIAGNOSTICS CONDITION 1 @sq_state = RETURNED_SQLSTATE;
+        RESIGNAL;
+      END;
+      SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'unreachable';
+    END;
+  END IF;
+
+  SET total_out = acc;
+END outer_block$$
+
+CREATE PROCEDURE sq_hard_assert(IN cond BOOLEAN, IN msg VARCHAR(255))
+BEGIN
+  IF COALESCE(cond, FALSE) = FALSE THEN
+    SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = msg;
+  END IF;
+END$$
+DELIMITER ;
+
+CALL sq_hard_walk(@walk_total);
+
+-- Anonymous compound statement with implicit cursor FOR, nested label, local
+-- handler, diagnostics, and parameterized EXECUTE IMMEDIATE.
+DELIMITER $$
+BEGIN NOT ATOMIC
+  DECLARE local_total DECIMAL(18,2) DEFAULT 0;
+  DECLARE local_rows INT DEFAULT 0;
+  DECLARE local_state CHAR(5);
+  DECLARE local_errno INT;
+  DECLARE local_message TEXT;
+
+  metric_loop: FOR metric_rec IN (
+    SELECT node_id, SUM(metric_value) AS node_total
+    FROM metric
+    GROUP BY node_id
+    ORDER BY node_id
+  ) DO
+    SET local_total = local_total + metric_rec.node_total;
+    SET local_rows = local_rows + 1;
+  END FOR metric_loop;
+
+  unreachable_probe: BEGIN
+    DECLARE CONTINUE HANDLER FOR SQLEXCEPTION
+    BEGIN
+      GET DIAGNOSTICS CONDITION 1
+        local_state = RETURNED_SQLSTATE,
+        local_errno = MYSQL_ERRNO,
+        local_message = MESSAGE_TEXT;
+      RESIGNAL SET MESSAGE_TEXT = local_message;
+    END;
+    IF local_total < 0 THEN
+      SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'unreachable';
+    END IF;
+  END unreachable_probe;
+
+  CALL sq_hard_assert(local_total = 56 AND local_rows = 2,
+                      'anonymous cursor totals');
+  SET @hard_floor = 20;
+  EXECUTE IMMEDIATE
+    'SELECT metric_id, node_id, metric_value
+       FROM metric
+      WHERE metric_value >= ?
+      ORDER BY metric_value DESC, metric_id'
+    USING @hard_floor;
+END$$
+DELIMITER ;
+
+CALL sq_hard_assert(@walk_total = 56, 'cursor walk total');
+CALL sq_hard_assert((SELECT `from` + `order` FROM `select`) = 3, 'quoted identifier sum');
+CALL sq_hard_assert((SELECT COUNT(*) FROM metric) = 4, 'metric rows');
+CALL sq_hard_assert(sq_hard_band(24) = 'HIGH' COLLATE utf8mb4_unicode_ci, 'scalar function');
+CALL sq_hard_assert((SELECT COUNT(*) FROM versioned) = 4, 'application fragments');
+CALL sq_hard_assert(
+  (SELECT COUNT(*) FROM versioned FOR SYSTEM_TIME AS OF @version_cutover) = 2,
+  'system-time snapshot'
+);
+CALL sq_hard_assert(
+  (SELECT COUNT(*) FROM versioned FOR SYSTEM_TIME ALL) >= 6,
+  'bitemporal versions'
+);
+
+-- Standalone table value constructor statement and hash/executable comments.
+# hash comment: the next statement is a bare VALUES table constructor
+VALUES (1, 'one'), (2, 'two'), (3, 'three');
+
+SELECT /*M! STRAIGHT_JOIN */ /*!40001 SQL_NO_CACHE */ m.metric_id, n.node_total
+FROM metric m
+JOIN (SELECT node_id, SUM(metric_value) AS node_total
+      FROM metric GROUP BY node_id) n
+  ON n.node_id = m.node_id
+WHERE m.metric_id = 1;
+
+-- Unquoted and backticked Unicode identifiers plus Unicode aliases.
+CREATE TABLE 한글테이블 (
+  식별자 INT NOT NULL PRIMARY KEY,
+  `한글 컬럼` VARCHAR(40) NOT NULL,
+  숨김열 VARCHAR(20) INVISIBLE DEFAULT '그림자'
+) ENGINE = InnoDB;
+
+INSERT INTO 한글테이블 (식별자, `한글 컬럼`) VALUES (1, '첫번째'), (2, '두번째');
+
+SELECT t.식별자 AS 한글별칭,
+       CONCAT(t.`한글 컬럼`, '/', t.숨김열) AS 조합값
+FROM 한글테이블 t
+ORDER BY t.식별자;
+
+-- MariaDB dynamic columns round-trip: CREATE/ADD/GET/JSON/LIST/EXISTS.
+SELECT COLUMN_GET(doc.blob_col, 'depth' AS INT)              AS depth_value,
+       COLUMN_GET(doc.blob_col, '색상' AS CHAR)              AS color_value,
+       COLUMN_JSON(COLUMN_ADD(doc.blob_col, 'extra', 9))     AS json_view,
+       COLUMN_LIST(doc.blob_col)                             AS key_list,
+       COLUMN_EXISTS(doc.blob_col, '색상')                   AS has_color
+FROM (SELECT COLUMN_CREATE('depth', 3, '색상', '파랑' AS CHAR) AS blob_col) doc;
+
+-- Sequence algebra: PREVIOUS/NEXT VALUE, SETVAL, LASTVAL, ALTER ... RESTART.
+SELECT NEXT VALUE FOR seq_hard AS seq_first;
+SELECT PREVIOUS VALUE FOR seq_hard AS seq_prev, LASTVAL(seq_hard) AS seq_last;
+SELECT SETVAL(seq_hard, 500) AS seq_forced;
+ALTER SEQUENCE seq_hard RESTART WITH 900;
+SELECT NEXT VALUE FOR seq_hard AS seq_after_restart;
+
+-- DELETE ... RETURNING and single-table UPDATE ... ORDER BY ... LIMIT.
+CREATE TABLE scratch_rows (
+  id INT NOT NULL PRIMARY KEY,
+  v  INT NOT NULL
+) ENGINE = InnoDB;
+INSERT INTO scratch_rows VALUES (1, 10), (2, 20), (3, 30), (4, 40);
+
+DELETE FROM scratch_rows
+WHERE v > 25
+ORDER BY v DESC
+LIMIT 1
+RETURNING id, v * 2 AS doubled;
+
+UPDATE scratch_rows
+SET v = v + 1
+ORDER BY v ASC
+LIMIT 2;
+
+INSERT INTO scratch_rows (id, v) VALUES (1, 99)
+ON DUPLICATE KEY UPDATE v = VALUES(v) + scratch_rows.v;
+
+-- Range/hash subpartitioned table with explicit partition selection.
+CREATE TABLE part_metric (
+  metric_id INT NOT NULL,
+  measured_year INT NOT NULL,
+  metric_value DECIMAL(12,2) NOT NULL,
+  PRIMARY KEY (metric_id, measured_year)
+) ENGINE = InnoDB
+PARTITION BY RANGE (measured_year)
+SUBPARTITION BY HASH (metric_id)
+SUBPARTITIONS 2 (
+  PARTITION p_old VALUES LESS THAN (2026),
+  PARTITION p_now VALUES LESS THAN (2027),
+  PARTITION p_max VALUES LESS THAN MAXVALUE
+);
+
+INSERT INTO part_metric VALUES
+  (1, 2025, 11), (2, 2026, 22), (3, 2026, 33), (4, 2030, 44);
+
+SELECT metric_id, metric_value
+FROM part_metric PARTITION (p_now)
+ORDER BY metric_id;
+
+SELECT COUNT(*) AS old_and_max_rows
+FROM part_metric PARTITION (p_old, p_max);
+
+-- HANDLER interface: OPEN/READ FIRST/READ NEXT/CLOSE.
+HANDLER metric OPEN AS metric_handle;
+HANDLER metric_handle READ FIRST;
+HANDLER metric_handle READ NEXT;
+HANDLER metric_handle CLOSE;
+
+-- Prepared statements with placeholders and session variables.
+PREPARE hard_stmt FROM
+  'SELECT metric_id, metric_value FROM metric
+   WHERE node_id = ? AND metric_value >= ?
+   ORDER BY metric_id';
+SET @want_node = 1, @want_floor = 15;
+EXECUTE hard_stmt USING @want_node, @want_floor;
+DEALLOCATE PREPARE hard_stmt;
+
+-- XA transaction (one-phase) wrapping an insert.
+XA START 'sq_hard_xa';
+INSERT INTO scratch_rows (id, v) VALUES (7, 70);
+XA END 'sq_hard_xa';
+XA COMMIT 'sq_hard_xa' ONE PHASE;
+
+-- MEDIAN window function, GROUP_CONCAT with ORDER BY + SEPARATOR + LIMIT,
+-- and NTILE/PERCENT_RANK stacked over one partition spec.
+SELECT metric_id, node_id, metric_value,
+       MEDIAN(metric_value) OVER (PARTITION BY node_id)        AS node_median,
+       NTILE(2) OVER (ORDER BY metric_value)                   AS half_bucket,
+       PERCENT_RANK() OVER (ORDER BY metric_value)             AS pct_rank
+FROM metric
+ORDER BY metric_id;
+
+SELECT GROUP_CONCAT(metric_value ORDER BY metric_value DESC SEPARATOR '|' LIMIT 3)
+         AS top_values
+FROM metric;
+
+-- Trigger ordering with FOLLOWS plus CREATE OR REPLACE.
+CREATE TABLE trigger_log (
+  log_id INT NOT NULL AUTO_INCREMENT PRIMARY KEY,
+  note VARCHAR(40) NOT NULL
+) ENGINE = InnoDB;
+
+CREATE TRIGGER scratch_first
+BEFORE INSERT ON scratch_rows FOR EACH ROW
+INSERT INTO trigger_log (note) VALUES (CONCAT('first:', NEW.id));
+
+CREATE OR REPLACE TRIGGER scratch_second
+BEFORE INSERT ON scratch_rows FOR EACH ROW
+FOLLOWS scratch_first
+INSERT INTO trigger_log (note) VALUES (CONCAT('second:', NEW.id * 10));
+
+INSERT INTO scratch_rows (id, v) VALUES (9, 90);
+
+-- Disabled event: never fires, but exercises the event grammar.
+CREATE EVENT sq_hard_event
+  ON SCHEDULE AT CURRENT_TIMESTAMP + INTERVAL 10 YEAR
+  ON COMPLETION PRESERVE
+  DISABLE
+  COMMENT '편집기 스트레스용'
+  DO UPDATE scratch_rows SET v = v WHERE id = -1;
+
+-- Routine with REPEAT/UNTIL, WHILE, ITERATE, CASE statement, and a named
+-- condition handler.
+DELIMITER $$
+CREATE PROCEDURE sq_hard_loops(OUT spin_total INT)
+main_block: BEGIN
+  DECLARE tick INT DEFAULT 0;
+  DECLARE spin INT DEFAULT 0;
+  DECLARE overflow_guard CONDITION FOR SQLSTATE '22003';
+  DECLARE CONTINUE HANDLER FOR overflow_guard SET spin = -1;
+
+  count_up: REPEAT
+    SET tick = tick + 1;
+    CASE
+      WHEN MOD(tick, 2) = 0 THEN SET spin = spin + tick;
+      ELSE BEGIN END;
+    END CASE;
+  UNTIL tick >= 6
+  END REPEAT count_up;
+
+  drain: WHILE tick > 0 DO
+    SET tick = tick - 1;
+    IF MOD(tick, 3) = 0 THEN
+      ITERATE drain;
+    END IF;
+    SET spin = spin + 1;
+  END WHILE drain;
+
+  SET spin_total = spin;
+END main_block$$
+DELIMITER ;
+
+CALL sq_hard_loops(@spin_total);
+
+-- Date/interval algebra with STR_TO_DATE and TIMESTAMPDIFF.
+SELECT DATE_ADD(STR_TO_DATE('2026/01/31', '%Y/%m/%d'),
+                INTERVAL '1-2' YEAR_MONTH)               AS pushed_out,
+       TIMESTAMPDIFF(HOUR,
+                     '2026-01-01 00:00:00',
+                     '2026-01-03 12:00:00')              AS hour_gap,
+       ADDTIME(TIME'10:30:00', '01:15:30.5')             AS padded_time;
+
+-- Extension self-verification.
+CALL sq_hard_assert(@spin_total = 16, 'repeat/while spin total');
+CALL sq_hard_assert(
+  (SELECT COUNT(*) FROM scratch_rows) = 5,
+  'scratch rows after returning-delete/xa/trigger inserts'
+);
+CALL sq_hard_assert(
+  (SELECT v FROM scratch_rows WHERE id = 1) = 110,
+  'values() upsert result'
+);
+CALL sq_hard_assert(
+  (SELECT COUNT(*) FROM trigger_log WHERE note IN ('first:9', 'second:90')) = 2,
+  'ordered trigger pair'
+);
+CALL sq_hard_assert(
+  (SELECT COUNT(*) FROM part_metric PARTITION (p_now)) = 2,
+  'partition selection'
+);
+CALL sq_hard_assert(
+  (SELECT 식별자 FROM 한글테이블 WHERE `한글 컬럼` = '두번째') = 2,
+  'unicode identifiers'
+);
+CALL sq_hard_assert(
+  (SELECT COLUMN_GET(COLUMN_CREATE('k', 42), 'k' AS INT)) = 42,
+  'dynamic columns'
+);
+
+SELECT 'PASS' AS final_status,
+       VERSION() AS server_version,
+       (SELECT COUNT(*) FROM metric) AS metric_rows,
+       @walk_total AS walk_total;
+
+
+-- =========================================================
+-- IntelliSense sweep report generated by intellisense sweep
+-- source: test_mariadb/final_hardcore.sql
+-- db: MariaDB
+-- metadata: test_mariadb/final_hardcore.sql inferred catalog
+-- checked: 1103
+-- suggestions checked: 5298
+-- missing: 0
+-- suggestions without type labels: 0
+-- marker: [[word]] means not suggested for the tested prefix
+-- missing tokens: none
+-- suggestions without type labels: none
+-- =========================================================

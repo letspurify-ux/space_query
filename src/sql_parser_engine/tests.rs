@@ -5180,6 +5180,25 @@ fn sql_macro_call_spec_without_external_keyword_splits_before_following_statemen
 }
 
 #[test]
+fn parenthesized_sql_macro_property_keeps_function_body_attached() {
+    let mut engine = SqlParserEngine::new();
+
+    engine.process_line("CREATE OR REPLACE FUNCTION topn RETURN VARCHAR2 SQL_MACRO(TABLE)");
+    engine.process_line("IS");
+    engine.process_line("BEGIN");
+    engine.process_line("  RETURN 'SELECT 1 FROM dual';");
+    engine.process_line("END topn;");
+    engine.process_line("/");
+    engine.process_line("SELECT * FROM topn();");
+
+    let statements = engine.finalize_and_take_statements();
+    assert_eq!(statements.len(), 2, "unexpected statements: {statements:?}");
+    assert!(statements[0].contains("SQL_MACRO(TABLE)\nIS\nBEGIN"));
+    assert!(statements[0].contains("END topn"));
+    assert!(statements[1].starts_with("SELECT * FROM topn()"));
+}
+
+#[test]
 fn package_nested_sql_macro_call_spec_closes_nested_function_block_on_semicolon() {
     let mut engine = SqlParserEngine::new();
 

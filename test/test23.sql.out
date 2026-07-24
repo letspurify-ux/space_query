@@ -620,7 +620,7 @@ WHERE v.emp_id IN (1, 2, 3, 101);
 -- db: Oracle
 -- metadata: test Oracle inferred catalog (file-scoped overlay) + Oracle built-ins
 -- checked: 1020
--- suggestions checked: 4552
+-- suggestions checked: 4555
 -- missing: 0
 -- suggestions without type labels: 0
 -- marker: [[word]] means not suggested for the tested prefix

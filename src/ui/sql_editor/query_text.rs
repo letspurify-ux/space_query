@@ -1320,6 +1320,21 @@ where
             continue;
         }
 
+        // A signed exponent (`1e-3`, `0.5E+7`) keeps its sign attached to the
+        // numeric literal so the formatter never rewrites it as subtraction.
+        // Guarded to decimal literals: `current` must start with a digit, end in
+        // `e`/`E`, not be a hex literal, and be followed by a digit.
+        if matches!(c, '-' | '+')
+            && next.is_some_and(|following| following.is_ascii_digit())
+            && current.ends_with(['e', 'E'])
+            && current.as_bytes().first().is_some_and(u8::is_ascii_digit)
+            && !current.starts_with("0x")
+            && !current.starts_with("0X")
+        {
+            current.push(c);
+            continue;
+        }
+
         flush_word(&mut current, &mut current_start, idx, &mut tokens);
 
         if c == '<' && next == Some('<') {
@@ -1380,8 +1395,8 @@ where
             continue;
         }
 
-        if mysql_compatible && c == '-' && next == Some('>') {
-            let has_unquoted_arrow = sql_bytes.get(idx + 2) == Some(&b'>');
+        if c == '-' && next == Some('>') {
+            let has_unquoted_arrow = mysql_compatible && sql_bytes.get(idx + 2) == Some(&b'>');
             let symbol = if has_unquoted_arrow { "->>" } else { "->" };
             tokens.push(SqlTokenSpan {
                 token: SqlToken::Symbol(symbol.to_string()),
@@ -2905,6 +2920,19 @@ END$$"#;
                 "MySQL JSON operator {expected} should stay a single symbol: {tokens:?}"
             );
         }
+    }
+
+    #[test]
+    fn tokenize_sql_treats_oracle_property_graph_arrow_as_single_symbol() {
+        let tokens =
+            tokenize_sql_with_mysql_compat("MATCH (a IS node) -[e IS links]-> (b IS node)", false);
+
+        assert!(
+            tokens
+                .iter()
+                .any(|token| matches!(token, SqlToken::Symbol(symbol) if symbol == "->")),
+            "Oracle property-graph arrow should stay a single symbol: {tokens:?}"
+        );
     }
 
     #[test]
