@@ -585,6 +585,236 @@ fn format_sweep_audit_first_pass(
     (checked_lines, document.safe_gap_count(), issues)
 }
 
+fn format_sweep_audit_semantic_layout(
+    formatted: &str,
+    db_type: DatabaseType,
+) -> Vec<FormatSweepIssue> {
+    let document = FormatSweepDocument::new(formatted, db_type);
+    let line_starts = line_start_offsets(formatted);
+    let lines = formatted.lines().collect::<Vec<_>>();
+    let line_index = |offset: usize| {
+        line_starts
+            .partition_point(|line_start| *line_start <= offset)
+            .saturating_sub(1)
+    };
+    let word_is = |span: &FormatSweepScriptTokenSpan, expected: &str| matches!(&span.token, SqlToken::Word(word) if word.eq_ignore_ascii_case(expected));
+    let word_is_any = |span: &FormatSweepScriptTokenSpan, expected: &[&str]| matches!(&span.token, SqlToken::Word(word) if expected.iter().any(|candidate| word.eq_ignore_ascii_case(candidate)));
+    let has_comment_between = |token_start: usize, token_end: usize| {
+        document.tokens[token_start.saturating_add(1)..token_end]
+            .iter()
+            .any(|span| matches!(span.token, SqlToken::Comment(_)))
+    };
+    let mut issues = Vec::new();
+
+    for statement in &document.statements {
+        let meaningful = document.tokens[statement.token_start..statement.token_end]
+            .iter()
+            .enumerate()
+            .filter(|(_, span)| !matches!(span.token, SqlToken::Comment(_)))
+            .map(|(idx, span)| (statement.token_start.saturating_add(idx), span))
+            .collect::<Vec<_>>();
+
+        if !mysql_compatible(db_type) {
+            for pair in meaningful.windows(2) {
+                let [(_, left), (_, right)] = pair else {
+                    continue;
+                };
+                if word_is_any(left, &["PARTITION", "SUBPARTITION"])
+                    && word_is(right, "FOR")
+                    && line_index(left.start) != line_index(right.start)
+                {
+                    issues.push(FormatSweepIssue::new(
+                        FormatSweepIssueKind::LineBreak,
+                        formatted,
+                        right.start,
+                        "PARTITION FOR / SUBPARTITION FOR must remain one extended table-reference phrase"
+                            .to_string(),
+                    ));
+                }
+            }
+
+            if let Some(explain_idx) = meaningful
+                .windows(2)
+                .position(|pair| word_is(pair[0].1, "EXPLAIN") && word_is(pair[1].1, "PLAN"))
+            {
+                let for_idx = meaningful
+                    .iter()
+                    .enumerate()
+                    .skip(explain_idx.saturating_add(2))
+                    .find_map(|(idx, (_, span))| word_is(span, "FOR").then_some(idx));
+                if let Some((_, into)) = meaningful
+                    .iter()
+                    .skip(explain_idx.saturating_add(2))
+                    .take(
+                        for_idx
+                            .unwrap_or(meaningful.len())
+                            .saturating_sub(explain_idx + 2),
+                    )
+                    .find(|(_, span)| word_is(span, "INTO"))
+                {
+                    let explain_line = line_index(meaningful[explain_idx].1.start);
+                    let into_line = line_index(into.start);
+                    if lines
+                        .get(explain_line)
+                        .zip(lines.get(into_line))
+                        .is_some_and(|(explain, into)| {
+                            leading_spaces(explain) != leading_spaces(into)
+                        })
+                    {
+                        issues.push(FormatSweepIssue::new(
+                            FormatSweepIssueKind::Indentation,
+                            formatted,
+                            into.start,
+                            "EXPLAIN PLAN INTO must align with the EXPLAIN PLAN header".to_string(),
+                        ));
+                    }
+                }
+            }
+        }
+
+        for (idx, (into_token_idx, into)) in meaningful.iter().enumerate() {
+            if !word_is(into, "INTO") {
+                continue;
+            }
+            let mut prefix_idx = idx;
+            let mut saw_modifier = false;
+            while prefix_idx > 0
+                && word_is_any(
+                    meaningful[prefix_idx - 1].1,
+                    &["LOW_PRIORITY", "DELAYED", "HIGH_PRIORITY", "IGNORE"],
+                )
+            {
+                saw_modifier = true;
+                prefix_idx -= 1;
+            }
+            if !saw_modifier || prefix_idx == 0 {
+                continue;
+            }
+            let (head_token_idx, head) = meaningful[prefix_idx - 1];
+            if !word_is_any(head, &["INSERT", "REPLACE"])
+                || has_comment_between(head_token_idx, *into_token_idx)
+            {
+                continue;
+            }
+            if line_index(head.start) != line_index(into.start) {
+                issues.push(FormatSweepIssue::new(
+                    FormatSweepIssueKind::LineBreak,
+                    formatted,
+                    into.start,
+                    "INSERT/REPLACE modifiers and INTO must remain on one DML target header line"
+                        .to_string(),
+                ));
+            }
+        }
+
+        for triple in meaningful.windows(3) {
+            let [(operator_token_idx, operator), (_, modifier), (open_token_idx, open)] = triple
+            else {
+                continue;
+            };
+            if !word_is_any(operator, &["UNION", "INTERSECT", "EXCEPT"])
+                || !word_is_any(modifier, &["ALL", "DISTINCT"])
+                || !matches!(&open.token, SqlToken::Symbol(symbol) if symbol == "(")
+                || has_comment_between(*operator_token_idx, *open_token_idx)
+            {
+                continue;
+            }
+            let gap = formatted.get(modifier.end..open.start).unwrap_or_default();
+            if line_index(modifier.start) != line_index(open.start)
+                || gap.is_empty()
+                || !gap.bytes().all(|byte| byte.is_ascii_whitespace())
+            {
+                issues.push(FormatSweepIssue::new(
+                    FormatSweepIssueKind::LineBreak,
+                    formatted,
+                    open.start,
+                    "set-operator ALL/DISTINCT modifier must be separated from its parenthesized branch"
+                        .to_string(),
+                ));
+            }
+        }
+
+        if mysql_compatible(db_type)
+            && meaningful
+                .first()
+                .is_some_and(|(_, span)| word_is(span, "CREATE"))
+            && meaningful
+                .iter()
+                .take(12)
+                .any(|(_, span)| word_is(span, "TRIGGER"))
+        {
+            if let Some(row_idx) = meaningful.windows(3).position(|triple| {
+                word_is(triple[0].1, "FOR")
+                    && word_is(triple[1].1, "EACH")
+                    && word_is(triple[2].1, "ROW")
+            }) {
+                let row_idx = row_idx.saturating_add(2);
+                let body = meaningful
+                    .iter()
+                    .enumerate()
+                    .skip(row_idx.saturating_add(1))
+                    .find(|(idx, (_, span))| {
+                        word_is_any(
+                            span,
+                            &[
+                                "CALL", "DELETE", "DO", "INSERT", "REPLACE", "RESIGNAL", "SELECT",
+                                "SET", "SIGNAL", "UPDATE", "WITH",
+                            ],
+                        ) && idx
+                            .checked_sub(1)
+                            .and_then(|previous| meaningful.get(previous))
+                            .is_none_or(|(_, previous)| {
+                                !word_is_any(previous, &["FOLLOWS", "PRECEDES"])
+                            })
+                    });
+                if let Some((_, (_, body))) = body {
+                    let row = meaningful[row_idx].1;
+                    if line_index(row.start) == line_index(body.start) {
+                        issues.push(FormatSweepIssue::new(
+                            FormatSweepIssueKind::LineBreak,
+                            formatted,
+                            body.start,
+                            "single-statement trigger body must start after the FOR EACH ROW header"
+                                .to_string(),
+                        ));
+                    }
+                }
+            }
+        }
+
+        if db_type == DatabaseType::MariaDB
+            && meaningful
+                .first()
+                .is_some_and(|(_, span)| word_is(span, "CREATE"))
+        {
+            if let Some(package_idx) = meaningful
+                .iter()
+                .take(10)
+                .position(|(_, span)| word_is(span, "PACKAGE"))
+            {
+                if let Some((_, member)) = meaningful
+                    .iter()
+                    .skip(package_idx.saturating_add(1))
+                    .find(|(_, span)| word_is_any(span, &["PROCEDURE", "FUNCTION"]))
+                {
+                    let package = meaningful[package_idx].1;
+                    if line_index(package.start) == line_index(member.start) {
+                        issues.push(FormatSweepIssue::new(
+                            FormatSweepIssueKind::LineBreak,
+                            formatted,
+                            member.start,
+                            "MariaDB package members must start below an AS/IS-less package header"
+                                .to_string(),
+                        ));
+                    }
+                }
+            }
+        }
+    }
+
+    issues
+}
+
 fn format_sweep_audit_ddl_query_body_depth(
     formatted: &str,
     db_type: DatabaseType,
@@ -1362,6 +1592,7 @@ fn format_sweep_run_with_config(
 
     let (checked_lines, checked_gaps, mut issues) =
         format_sweep_audit_first_pass(&formatted, db_type);
+    issues.extend(format_sweep_audit_semantic_layout(&formatted, db_type));
     let (checked_ddl_query_body_depths, ddl_query_body_depth_issues) =
         format_sweep_audit_ddl_query_body_depth(&formatted, db_type);
     issues.extend(ddl_query_body_depth_issues);
@@ -1878,6 +2109,144 @@ GROUP BY category;"#;
         "EXPLAIN PLAN FOR was treated as a procedural loop:\n{}",
         run.formatted
     );
+}
+
+#[test]
+fn formatting_sweep_semantic_layout_audit_detects_known_misalignment_families() {
+    let oracle = r#"SELECT *
+FROM sales PARTITION
+FOR (DATE '2026-02-15');
+
+EXPLAIN PLAN
+SET STATEMENT_ID = 'probe'
+        INTO plan_table
+FOR SELECT * FROM sales;"#;
+    let maria = r#"CREATE PACKAGE pkg PROCEDURE ping();
+END;
+
+CREATE TRIGGER trg BEFORE INSERT ON t FOR EACH ROW INSERT INTO log_t VALUES (1);
+
+INSERT IGNORE
+INTO t VALUES (1);
+
+(SELECT 1)
+INTERSECT DISTINCT(SELECT 1);"#;
+
+    let messages = format_sweep_audit_semantic_layout(oracle, DatabaseType::Oracle)
+        .into_iter()
+        .chain(format_sweep_audit_semantic_layout(
+            maria,
+            DatabaseType::MariaDB,
+        ))
+        .map(|issue| issue.message)
+        .collect::<Vec<_>>();
+
+    for expected in [
+        "PARTITION FOR / SUBPARTITION FOR",
+        "EXPLAIN PLAN INTO",
+        "package members",
+        "single-statement trigger body",
+        "modifiers and INTO",
+        "set-operator ALL/DISTINCT",
+    ] {
+        assert!(
+            messages.iter().any(|message| message.contains(expected)),
+            "semantic sweep audit did not detect {expected:?}: {messages:#?}"
+        );
+    }
+}
+
+#[test]
+fn formatting_sweep_normalizes_oracle_and_mariadb_alignment_regressions() {
+    let oracle = r#"SELECT *
+FROM sales PARTITION
+FOR (DATE '2026-02-15');
+
+SELECT *
+FROM sales SUBPARTITION
+FOR (DATE '2026-02-15', 'EAST');
+
+EXPLAIN PLAN SET STATEMENT_ID = 'probe' INTO plan_table FOR
+SELECT * FROM sales;"#;
+    let maria = r#"DELIMITER //
+CREATE PACKAGE pkg
+  PROCEDURE ping(OUT x INT);
+  FUNCTION answer() RETURNS INT;
+END//
+
+CREATE PACKAGE BODY pkg
+  PROCEDURE ping(OUT x INT)
+  BEGIN
+    SET x = 42;
+  END;
+  FUNCTION answer() RETURNS INT
+  BEGIN
+    RETURN 42;
+  END;
+END//
+
+CREATE TRIGGER trg_first BEFORE INSERT ON t FOR EACH ROW
+  INSERT INTO log_t(note) VALUES ('first')//
+CREATE TRIGGER trg_second BEFORE INSERT ON t FOR EACH ROW FOLLOWS trg_first
+  SET @last_id = NEW.id//
+DELIMITER ;
+
+INSERT LOW_PRIORITY IGNORE
+INTO t(id) VALUES (1);
+REPLACE DELAYED
+INTO t(id) VALUES (2);
+
+(SELECT id FROM t)
+INTERSECT DISTINCT(SELECT id FROM t)
+EXCEPT ALL(SELECT id FROM t);"#;
+
+    for layout in [SqlCommaListLayout::Wrapped, SqlCommaListLayout::Stacked] {
+        let mut config = AppConfig::new();
+        config.sql_comma_list_layout = layout;
+
+        let oracle_run = format_sweep_run_with_config(oracle, DatabaseType::Oracle, Some(&config));
+        assert!(
+            oracle_run.issues.is_empty(),
+            "{layout:?} Oracle alignment regression issues: {:#?}\n{}",
+            oracle_run.issues,
+            oracle_run.formatted
+        );
+        assert!(oracle_run
+            .formatted
+            .contains("FROM sales PARTITION FOR (DATE '2026-02-15')"));
+        assert!(oracle_run
+            .formatted
+            .contains("FROM sales SUBPARTITION FOR (DATE '2026-02-15',"));
+        assert!(oracle_run
+            .formatted
+            .contains("EXPLAIN PLAN\nSET STATEMENT_ID = 'probe'\nINTO plan_table\nFOR SELECT"));
+
+        let maria_run = format_sweep_run_with_config(maria, DatabaseType::MariaDB, Some(&config));
+        assert!(
+            maria_run.issues.is_empty(),
+            "{layout:?} MariaDB alignment regression issues: {:#?}\n{}",
+            maria_run.issues,
+            maria_run.formatted
+        );
+        assert!(maria_run
+            .formatted
+            .contains("CREATE PACKAGE pkg\n    PROCEDURE ping"));
+        assert!(maria_run
+            .formatted
+            .contains("CREATE PACKAGE BODY pkg\n    PROCEDURE ping"));
+        assert!(maria_run
+            .formatted
+            .contains("FOR EACH ROW\nINSERT INTO log_t"));
+        assert!(maria_run
+            .formatted
+            .contains("FOR EACH ROW FOLLOWS trg_first\nSET @last_id"));
+        assert!(maria_run
+            .formatted
+            .contains("INSERT LOW_PRIORITY IGNORE INTO t"));
+        assert!(maria_run.formatted.contains("REPLACE DELAYED INTO t"));
+        assert!(maria_run.formatted.contains("INTERSECT DISTINCT ("));
+        assert!(maria_run.formatted.contains("EXCEPT ALL ("));
+    }
 }
 
 #[test]

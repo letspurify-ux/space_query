@@ -7743,6 +7743,10 @@ pub(crate) fn format_source_gap_is_canonical_inline(
 ) -> bool {
     is_format_expression_continuation_keyword(current_word)
         || previous_word.is_some_and(is_format_expression_continuation_keyword)
+        || (current_word.eq_ignore_ascii_case("FOR")
+            && previous_word.is_some_and(|word| {
+                word.eq_ignore_ascii_case("PARTITION") || word.eq_ignore_ascii_case("SUBPARTITION")
+            }))
 }
 
 fn is_format_comment_header_keyword(word: &str) -> bool {

@@ -10226,6 +10226,7 @@ impl SqlEditorWidget {
                     | "COLUMNS"
                     | "CURSOR"
                     | "DEFAULT"
+                    | "DISTINCT"
                     | "ELSE"
                     | "ELSEIF"
                     | "ELSIF"
@@ -10668,6 +10669,28 @@ impl SqlEditorWidget {
         recent.windows(2).any(|words| {
             words[0].eq_ignore_ascii_case("PLAN") && words[1].eq_ignore_ascii_case("EXPLAIN")
         })
+    }
+
+    fn recent_statement_has_dml_target_modifier_prefix_from_indices(
+        tokens: &[SqlToken],
+        recent_statement_word_indices: &VecDeque<usize>,
+    ) -> bool {
+        let mut saw_modifier = false;
+        for word_idx in recent_statement_word_indices.iter().rev() {
+            let Some(SqlToken::Word(word)) = tokens.get(*word_idx) else {
+                continue;
+            };
+            if matches!(
+                word.to_ascii_uppercase().as_str(),
+                "LOW_PRIORITY" | "DELAYED" | "HIGH_PRIORITY" | "IGNORE"
+            ) {
+                saw_modifier = true;
+                continue;
+            }
+            return saw_modifier
+                && matches!(word.to_ascii_uppercase().as_str(), "INSERT" | "REPLACE");
+        }
+        false
     }
 
     fn recent_statement_is_materialized_view_log_from_indices(
@@ -11829,6 +11852,7 @@ impl SqlEditorWidget {
         let mut recent_statement_word_indices: VecDeque<usize> = VecDeque::with_capacity(8);
         let mut pending_package_member_separator = false;
         let mut active_package_member_name: Option<String> = None;
+        let mut mysql_trigger_row_body_pending = false;
         let mut mysql_handler_state = MySqlHandlerFormatState::None;
         let oracle_property_graph_query = !mysql_compatible
             && tokens.iter().any(
@@ -12488,6 +12512,105 @@ impl SqlEditorWidget {
                                     .iter()
                                     .any(|word| word.eq_ignore_ascii_case("ANALYZE"))
                         };
+                    let mysql_dml_target_modifier_into = mysql_compatible
+                        && upper == "INTO"
+                        && Self::recent_statement_has_dml_target_modifier_prefix_from_indices(
+                            tokens,
+                            &recent_statement_word_indices,
+                        );
+                    let oracle_partition_for_clause = !mysql_compatible
+                        && upper == "FOR"
+                        && matches!(prev_word_upper, Some("PARTITION" | "SUBPARTITION"));
+                    let oracle_explain_plan_into_clause = !mysql_compatible
+                        && upper == "INTO"
+                        && Self::recent_statement_is_explain_plan_from_indices(
+                            tokens,
+                            &recent_statement_word_indices,
+                        );
+                    let completes_mysql_trigger_row_header = mysql_compatible
+                        && format_stack.trigger_header_is_active()
+                        && upper == "ROW"
+                        && matches!(prev_word_upper, Some("EACH"))
+                        && recent_statement_word_indices
+                            .iter()
+                            .rev()
+                            .nth(1)
+                            .and_then(|word_idx| tokens.get(*word_idx))
+                            .is_some_and(
+                                |token| matches!(token, SqlToken::Word(word) if word.eq_ignore_ascii_case("FOR")),
+                            );
+                    if completes_mysql_trigger_row_header {
+                        mysql_trigger_row_body_pending = true;
+                    }
+                    let starts_mysql_single_statement_trigger_body = mysql_trigger_row_body_pending
+                        && matches!(
+                            upper,
+                            "CALL"
+                                | "DELETE"
+                                | "DO"
+                                | "INSERT"
+                                | "REPLACE"
+                                | "RESIGNAL"
+                                | "SELECT"
+                                | "SET"
+                                | "SIGNAL"
+                                | "UPDATE"
+                                | "WITH"
+                        );
+                    if starts_mysql_single_statement_trigger_body {
+                        format_stack.clear_condition_owners_at_scope(current_scope);
+                        format_stack.clear_list_owners_at_scope_except(current_scope, None);
+                        format_stack.clear_trigger_header();
+                        clear_construct_value!(CreateObject);
+                        deactivate_construct_flag!(RoutineDeclPending);
+                        mysql_trigger_row_body_pending = false;
+                        newline_with(
+                            &mut out,
+                            base_indent!(format_stack.statement_base_depth()),
+                            0,
+                            &mut at_line_start,
+                            &mut needs_space,
+                            &mut line_indent,
+                        );
+                    }
+                    let mysql_package_member_without_as = mysql_compatible
+                        && matches!(upper, "PROCEDURE" | "FUNCTION")
+                        && matches!(
+                            construct_value_as_deref!(CreateObject),
+                            Some("PACKAGE" | "PACKAGE_BODY")
+                        );
+                    if mysql_package_member_without_as {
+                        let package_block_kind = if matches!(
+                            construct_value_as_deref!(CreateObject),
+                            Some("PACKAGE_BODY")
+                        ) {
+                            BlockKind::PackageBody
+                        } else {
+                            BlockKind::Declare
+                        };
+                        let package_owner_depth = base_indent!(format_stack.statement_base_depth());
+                        format_stack.push_block_for_render(
+                            package_block_kind,
+                            package_owner_depth,
+                            token_context.prev_non_comment_idx.unwrap_or(idx),
+                            Some(idx),
+                        );
+                        format_stack.push_plsql_context(format_stack.current_scope());
+                        clear_construct_value!(CreateObject);
+                        set_current_clause!(None);
+                        newline_with(
+                            &mut out,
+                            base_indent!(format_stack.statement_base_depth()),
+                            0,
+                            &mut at_line_start,
+                            &mut needs_space,
+                            &mut line_indent,
+                        );
+                    }
+                    let mysql_package_member_begin_without_as = mysql_compatible
+                        && upper == "BEGIN"
+                        && construct_flag_active!(RoutineDeclPending)
+                        && format_stack.last_block_kind_is(BlockKind::PackageBody);
                     let should_break_condition = condition_keywords.contains(&upper)
                         && !(is_between_and
                             || is_commit_and
@@ -13156,6 +13279,23 @@ impl SqlEditorWidget {
                         && matches!(prev_word_upper, Some("BEFORE" | "AFTER" | "OF"))
                     {
                         // Keep trigger event verbs on the same line as BEFORE/AFTER/INSTEAD OF.
+                    } else if oracle_partition_for_clause {
+                        // PARTITION FOR and SUBPARTITION FOR are Oracle
+                        // extended-table-reference phrases, not procedural headers.
+                    } else if oracle_explain_plan_into_clause {
+                        let _ = format_stack.pop_assignment_value_frame_at_scope(current_scope);
+                        format_stack
+                            .clear_list_owner_kind_at_scope(current_scope, ListOwnerKind::Set);
+                        set_current_clause!(None);
+                        clear_select_list_layout_state!();
+                        newline_with(
+                            &mut out,
+                            base_indent!(format_stack.statement_base_depth()),
+                            0,
+                            &mut at_line_start,
+                            &mut needs_space,
+                            &mut line_indent,
+                        );
                     } else if format_stack
                         .scoped_indent_is_active(ScopedIndentKind::MergeWhenBranch)
                         && upper == "SET"
@@ -13245,6 +13385,7 @@ impl SqlEditorWidget {
                         && !mysql_declare_for_clause
                         // VALUES() inside ON DUPLICATE KEY UPDATE is a function, not a clause
                         && !on_duplicate_key_values_function
+                        && !mysql_dml_target_modifier_into
                         && !Self::suppresses_clause_break(
                             &format_stack,
                             tokens,
@@ -15105,7 +15246,16 @@ impl SqlEditorWidget {
                             let inside_declare = format_stack.last_block_kind().is_some_and(|s| {
                                 matches!(s, BlockKind::Declare | BlockKind::PackageBody)
                             });
-                            if inside_declare {
+                            if mysql_package_member_begin_without_as {
+                                newline_with(
+                                    &mut out,
+                                    base_indent!(format_stack.statement_base_depth()),
+                                    0,
+                                    &mut at_line_start,
+                                    &mut needs_space,
+                                    &mut line_indent,
+                                );
+                            } else if inside_declare {
                                 // DECLARE ... BEGIN - BEGIN is at same level as DECLARE.
                                 // PACKAGE BODY initializer BEGIN snaps to package owner depth.
                                 let begin_indent =
@@ -15338,6 +15488,8 @@ impl SqlEditorWidget {
                     let source_break_policy = FormatterSourceBreakPolicy::classify(
                         is_any_within_group
                             || is_merge_delete_where
+                            || mysql_dml_target_modifier_into
+                            || oracle_partition_for_clause
                             || format_stack.last_paren_first_body_is(idx)
                             || renderer_kept_wrapped_comma_inline,
                         format_stack
@@ -15490,6 +15642,7 @@ impl SqlEditorWidget {
                     }
                     if at_line_start
                         && upper == "BEGIN"
+                        && !mysql_package_member_begin_without_as
                         && (format_stack.last_block_kind_is("PACKAGE_BODY")
                             || pending_package_member_separator)
                     {
@@ -16170,36 +16323,46 @@ impl SqlEditorWidget {
                         if format_stack.trigger_header_is_active() {
                             format_stack.clear_trigger_header();
                         }
-                        let package_initializer_begin = pending_package_member_separator;
-                        let inside_declare = format_stack.last_block_kind().is_some_and(|s| {
-                            matches!(s, BlockKind::Declare | BlockKind::PackageBody)
-                        }) || package_initializer_begin;
-                        if inside_declare {
-                            // DECLARE ... BEGIN - same block depth.
-                            // PACKAGE BODY initialization BEGIN is also same depth as PACKAGE_BODY.
-                            if package_initializer_begin {
-                                while format_stack
-                                    .last_block_kind()
-                                    .is_some_and(|block| block != BlockKind::PackageBody)
-                                {
-                                    let _ = format_stack.pop_block();
-                                }
-                                pending_package_member_separator = false;
-                            } else if format_stack.last_block_kind_is(BlockKind::Declare) {
-                                format_stack.set_last_block_kind(BlockKind::Begin);
-                            } else if format_stack.package_body_member_indent().is_some() {
-                                // Package initializer body always starts one level under
-                                // the package owner, regardless of prior member-body depth.
-                            }
-                            // DECLARE keeps current depth; PACKAGE BODY resets to owner+1.
-                        } else {
-                            // Standalone BEGIN block
+                        if mysql_package_member_begin_without_as {
                             format_stack.push_block_for_render(
                                 BlockKind::Begin,
                                 line_indent,
                                 idx,
                                 next_non_comment_idx.filter(|_| !next_word_is("END")),
                             );
+                            deactivate_construct_flag!(RoutineDeclPending);
+                        } else {
+                            let package_initializer_begin = pending_package_member_separator;
+                            let inside_declare = format_stack.last_block_kind().is_some_and(|s| {
+                                matches!(s, BlockKind::Declare | BlockKind::PackageBody)
+                            }) || package_initializer_begin;
+                            if inside_declare {
+                                // DECLARE ... BEGIN - same block depth.
+                                // PACKAGE BODY initialization BEGIN is also same depth as PACKAGE_BODY.
+                                if package_initializer_begin {
+                                    while format_stack
+                                        .last_block_kind()
+                                        .is_some_and(|block| block != BlockKind::PackageBody)
+                                    {
+                                        let _ = format_stack.pop_block();
+                                    }
+                                    pending_package_member_separator = false;
+                                } else if format_stack.last_block_kind_is(BlockKind::Declare) {
+                                    format_stack.set_last_block_kind(BlockKind::Begin);
+                                } else if format_stack.package_body_member_indent().is_some() {
+                                    // Package initializer body always starts one level under
+                                    // the package owner, regardless of prior member-body depth.
+                                }
+                                // DECLARE keeps current depth; PACKAGE BODY resets to owner+1.
+                            } else {
+                                // Standalone BEGIN block
+                                format_stack.push_block_for_render(
+                                    BlockKind::Begin,
+                                    line_indent,
+                                    idx,
+                                    next_non_comment_idx.filter(|_| !next_word_is("END")),
+                                );
+                            }
                         }
                         format_stack.push_plsql_context(format_stack.current_scope());
                         if mysql_handler_block_begin {
