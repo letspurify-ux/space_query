@@ -69,6 +69,7 @@ pub struct SessionResidueState {
     may_have_prepared_statement: bool,
     may_have_user_variable: bool,
     may_have_session_setting: bool,
+    may_have_statement_diagnostics: bool,
     may_have_next_transaction_mode_override: bool,
     may_have_transaction_mode_override: bool,
     may_have_untracked_session_state: bool,
@@ -512,6 +513,7 @@ impl SessionResidueState {
             may_have_prepared_statement: effects.creates_prepared_statement,
             may_have_user_variable: effects.sets_user_variable,
             may_have_session_setting: effects.sets_session_setting,
+            may_have_statement_diagnostics: effects.sets_statement_diagnostics,
             may_have_next_transaction_mode_override: effects.sets_next_transaction_mode_override,
             may_have_transaction_mode_override: effects.sets_transaction_mode_override,
             may_have_untracked_session_state: effects.may_leave_unknown_state,
@@ -527,6 +529,8 @@ impl SessionResidueState {
             may_have_user_variable: self.may_have_user_variable || other.may_have_user_variable,
             may_have_session_setting: self.may_have_session_setting
                 || other.may_have_session_setting,
+            may_have_statement_diagnostics: self.may_have_statement_diagnostics
+                || other.may_have_statement_diagnostics,
             may_have_next_transaction_mode_override: self.may_have_next_transaction_mode_override
                 || other.may_have_next_transaction_mode_override,
             may_have_transaction_mode_override: self.may_have_transaction_mode_override
@@ -540,13 +544,21 @@ impl SessionResidueState {
         if effects.clears_all_session_residue {
             return Self::default();
         }
-        let state = if effects.consumes_next_transaction_mode_override {
+        let state = if effects.clears_statement_diagnostics {
             Self {
-                may_have_next_transaction_mode_override: false,
+                may_have_statement_diagnostics: false,
                 ..self
             }
         } else {
             self
+        };
+        let state = if effects.consumes_next_transaction_mode_override {
+            Self {
+                may_have_next_transaction_mode_override: false,
+                ..state
+            }
+        } else {
+            state
         };
         state.merged_with(Self::from_effects(effects))
     }
@@ -556,6 +568,7 @@ impl SessionResidueState {
             || self.may_have_prepared_statement
             || self.may_have_user_variable
             || self.may_have_session_setting
+            || self.may_have_statement_diagnostics
             || self.may_have_untracked_session_state
     }
 
@@ -613,6 +626,13 @@ impl SessionResidueState {
     fn with_next_transaction_mode_override_consumed(self) -> Self {
         Self {
             may_have_next_transaction_mode_override: false,
+            ..self
+        }
+    }
+
+    fn with_statement_diagnostics_cleared(self) -> Self {
+        Self {
+            may_have_statement_diagnostics: false,
             ..self
         }
     }
@@ -900,6 +920,8 @@ struct StatementSessionResidueEffects {
     creates_prepared_statement: bool,
     sets_user_variable: bool,
     sets_session_setting: bool,
+    sets_statement_diagnostics: bool,
+    clears_statement_diagnostics: bool,
     sets_next_transaction_mode_override: bool,
     sets_transaction_mode_override: bool,
     consumes_next_transaction_mode_override: bool,
@@ -913,9 +935,18 @@ impl StatementSessionResidueEffects {
             || self.creates_prepared_statement
             || self.sets_user_variable
             || self.sets_session_setting
+            || self.sets_statement_diagnostics
             || self.sets_next_transaction_mode_override
             || self.sets_transaction_mode_override
             || self.may_leave_unknown_state
+    }
+
+    fn without_statement_diagnostics(self) -> Self {
+        Self {
+            sets_statement_diagnostics: false,
+            clears_statement_diagnostics: false,
+            ..self
+        }
     }
 }
 
@@ -981,6 +1012,10 @@ impl StatementSessionEffects {
 
     pub(crate) fn may_leave_session_residue(self) -> bool {
         self.session_residue.may_leave_session_residue()
+    }
+
+    pub(crate) fn preserves_statement_diagnostics(self) -> bool {
+        self.session_residue.sets_statement_diagnostics
     }
 
     pub(crate) fn has_implicit_commit(self) -> bool {
@@ -1425,7 +1460,10 @@ impl MySqlBatchSessionEffects {
         } else {
             self.session_residue_state = self
                 .session_residue_state
-                .merged_with(SessionResidueState::from_effects(effects.session_residue));
+                .with_statement_diagnostics_cleared()
+                .merged_with(SessionResidueState::from_effects(
+                    effects.session_residue.without_statement_diagnostics(),
+                ));
         }
 
         if cleanup_effects_confirmed && effects.releases_table_lock() {
@@ -1973,7 +2011,11 @@ pub(crate) fn retained_session_state_after_statement(
         } else {
             prior_state.session_residue_state()
         };
-        prior_residue.merged_with(SessionResidueState::from_effects(effects.session_residue))
+        prior_residue
+            .with_statement_diagnostics_cleared()
+            .merged_with(SessionResidueState::from_effects(
+                effects.session_residue.without_statement_diagnostics(),
+            ))
     } else if effects.releases_physical_session() {
         SessionResidueState::default()
     } else {
@@ -4256,6 +4298,14 @@ fn mysql_session_residue_effects_for_analysis(
 
     let leading_keyword = analysis.leading_keyword();
     let mut effects = StatementSessionResidueEffects::default();
+    let sets_found_rows = matches!(leading_keyword, Some("SELECT" | "WITH"))
+        && analysis
+            .words()
+            .iter()
+            .any(|word| word == "SQL_CALC_FOUND_ROWS");
+    effects.sets_statement_diagnostics =
+        sets_found_rows || analysis.classify_for_db_type(db_type) == SqlKind::Dml;
+    effects.clears_statement_diagnostics = !effects.sets_statement_diagnostics;
     if mysql_statement_assigns_user_variable(sql, analysis) {
         effects.sets_user_variable = true;
     }
@@ -5659,6 +5709,56 @@ mod tests {
             mysql_session_state_hint_for_sql("SELECT '@total := not assignment' AS note");
         assert!(!plain_hint.may_leave_session_bound_state);
         assert!(!plain_hint.may_leave_untracked_session_state);
+    }
+
+    #[test]
+    fn mysql_statement_diagnostics_are_retained_until_the_next_select() {
+        for db_type in [DatabaseType::MySQL, DatabaseType::MariaDB] {
+            let post_processor = statement_session_post_processor_for(db_type);
+            for sql in [
+                "UPDATE t SET value = value + 1",
+                "SELECT SQL_CALC_FOUND_ROWS id FROM t LIMIT 1",
+            ] {
+                let effects = post_processor.effects_for_sql(sql);
+                assert!(
+                    effects.preserves_statement_diagnostics(),
+                    "{db_type} should preserve diagnostics after `{sql}`"
+                );
+                let retained = retained_session_state_after_statement(
+                    post_processor,
+                    RetainedSessionState::default(),
+                    effects,
+                    false,
+                    false,
+                    false,
+                    false,
+                );
+                assert!(
+                    retained.may_have_untracked_session_state(),
+                    "{db_type} should retain the physical session after `{sql}`"
+                );
+
+                let next_select = post_processor.effects_for_sql("SELECT ROW_COUNT()");
+                assert!(!next_select.preserves_statement_diagnostics());
+                let cleared = retained_session_state_after_statement(
+                    post_processor,
+                    retained,
+                    next_select,
+                    false,
+                    false,
+                    false,
+                    false,
+                );
+                assert!(
+                    !cleared.may_have_untracked_session_state(),
+                    "{db_type} should release consumed diagnostics after the next SELECT"
+                );
+            }
+
+            assert!(!post_processor
+                .effects_for_sql("SELECT 'SQL_CALC_FOUND_ROWS' AS note")
+                .preserves_statement_diagnostics());
+        }
     }
 
     #[test]

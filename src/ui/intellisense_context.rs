@@ -785,6 +785,14 @@ fn ddl_alter_table_add_action_is_new_name(
     action_words: &[String],
     action_ends_with_dot: bool,
 ) -> bool {
+    let action_words = match action_words {
+        [if_kw, not_kw, exists_kw, rest @ ..]
+            if if_kw == "IF" && not_kw == "NOT" && exists_kw == "EXISTS" =>
+        {
+            rest
+        }
+        _ => action_words,
+    };
     match action_words {
         [] => true,
         [word] if word == "CONSTRAINT" => true,
@@ -8087,13 +8095,18 @@ fn parse_top_level_pivot_clause(tokens: &[SqlToken]) -> Option<PivotClauseColumn
     let aggregate_columns = parse_pivot_aggregate_columns(&clause_tokens[..for_idx]);
     let aggregate_aliases = parse_pivot_aggregate_aliases(&clause_tokens[..for_idx]);
     let for_columns = parse_identifier_segment(&clause_tokens[for_idx + 1..in_idx]);
-    let generated_columns = if pivot_mode.should_skip_generated_columns() {
-        Vec::new()
-    } else {
-        parse_pivot_generated_columns_from_in_segment(
+    let generated_columns = match pivot_mode {
+        PivotMode::Regular => parse_pivot_generated_columns_from_in_segment(
             &clause_tokens[in_idx + 1..],
             &aggregate_aliases,
-        )
+        ),
+        PivotMode::Xml => {
+            let name = for_columns.join("_");
+            (!name.is_empty())
+                .then(|| format!("{name}_XML"))
+                .into_iter()
+                .collect()
+        }
     };
 
     let mut result = PivotClauseColumns {
@@ -12700,12 +12713,6 @@ fn normalize_dotted_identifier_tokens(tokens: &[&SqlToken]) -> Option<String> {
 enum PivotMode {
     Regular,
     Xml,
-}
-
-impl PivotMode {
-    fn should_skip_generated_columns(self) -> bool {
-        matches!(self, Self::Xml)
-    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

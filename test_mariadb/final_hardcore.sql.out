@@ -1136,7 +1136,7 @@ FROM (SELECT bucket,
         AND weight <> ALL (SELECT 999)
         AND EXISTS (SELECT 1 FROM metric WHERE metric.node_id = sq_hard_w5_hint.node_id)
       GROUP BY bucket WITH ROLLUP
-      HAVING [[bucket_total]] > 0) AS r
+      HAVING bucket_total > 0) AS r
 ORDER BY r.is_total,
          FIELD(r.bucket, 'gamma', 'beta', 'alpha'),
          r.bucket COLLATE utf8mb4_bin;
@@ -1191,15 +1191,15 @@ SELECT * FROM sq_hard_w5_ddl ORDER BY ddl_id;
 SELECT ddl_id, visible_v, hidden_v FROM sq_hard_w5_ddl ORDER BY ddl_id;
 
 ALTER TABLE sq_hard_w5_ddl
-  ADD COLUMN IF NOT EXISTS [[added_v]] [[INT]] NOT NULL DEFAULT 0,
+  ADD COLUMN IF NOT EXISTS added_v INT NOT NULL DEFAULT 0,
   ALGORITHM = INSTANT;
 
 ALTER TABLE sq_hard_w5_ddl
-  RENAME COLUMN [[added_v]] TO renamed_v,
+  RENAME COLUMN added_v TO renamed_v,
   ALGORITHM = INPLACE,
   LOCK = NONE;
 
-ALTER TABLE sq_hard_w5_ddl DROP CONSTRAINT IF EXISTS [[ck_sq_hard_w5_ddl]];
+ALTER TABLE sq_hard_w5_ddl DROP CONSTRAINT IF EXISTS ck_sq_hard_w5_ddl;
 
 DROP INDEX IF EXISTS ix_never_created ON sq_hard_w5_ddl;
 
@@ -1404,16 +1404,11 @@ SELECT 'PASS' AS final_status,
 -- source: test_mariadb/final_hardcore.sql
 -- db: MariaDB
 -- metadata: test_mariadb/final_hardcore.sql inferred catalog
--- checked: 2730
--- suggestions checked: 14560
--- missing: 5
+-- checked: 2725
+-- suggestions checked: 14559
+-- missing: 0
 -- suggestions without type labels: 0
 -- marker: [[word]] means not suggested for the tested prefix
--- missing tokens:
---   1139:14 word=bucket_total prefix=buck suggestions=[bucket] total=1 line=HAVING bucket_total > 0) AS r
---   1194:28 word=added_v prefix=adde suggestions=[] total=0 line=ADD COLUMN IF NOT EXISTS added_v INT NOT NULL DEFAULT 0,
---   1194:36 word=INT prefix=IN suggestions=[INVISIBLE, INDEX, INFORMATION_SCHEMA.COLUMNS, INFORMATION_SCHEMA.COLUMN_STATISTICS, INFORMATION_SCHEMA.KEYWORDS, INFORMATION_SCHEMA.PARTITIONS, INFORMATION_SCHEMA.STATISTICS, endpoint, sq_hard_w5_hint] total=9 line=ADD COLUMN IF NOT EXISTS added_v INT NOT NULL DEFAULT 0,
---   1198:17 word=added_v prefix=adde suggestions=[] total=0 line=RENAME COLUMN added_v TO renamed_v,
---   1202:54 word=ck_sq_hard_w5_ddl prefix=ck_s suggestions=[] total=0 line=ALTER TABLE sq_hard_w5_ddl DROP CONSTRAINT IF EXISTS ck_sq_hard_w5_ddl;
+-- missing tokens: none
 -- suggestions without type labels: none
 -- =========================================================

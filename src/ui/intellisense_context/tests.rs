@@ -7536,13 +7536,13 @@ fn extract_oracle_pivot_projection_columns_unescapes_string_literals_without_ali
 }
 
 #[test]
-fn extract_oracle_pivot_xml_projection_keeps_source_columns_without_generated_aliases() {
+fn extract_oracle_pivot_xml_projection_includes_the_generated_xml_column() {
     let tokens = tokenize(
         "SELECT * FROM (SELECT DEPTNO, job, SAL FROM oqt_t_emp) \
          PIVOT XML (SUM(SAL) FOR DEPTNO IN (ANY))",
     );
     let cols = extract_oracle_pivot_unpivot_projection_columns(&tokens);
-    assert_eq!(cols, vec!["job"]);
+    assert_eq!(cols, vec!["job", "DEPTNO_XML"]);
 }
 
 #[test]
@@ -10076,11 +10076,11 @@ fn full_join_table_position_is_table_context() {
 // ─── State machine regression tests ─────────────────────────────────────
 
 #[test]
-fn pivot_xml_skips_generated_columns() {
+fn pivot_xml_generates_one_xml_column() {
     let tokens =
         tokenize("SELECT * FROM sales PIVOT XML (SUM(amount) FOR quarter IN ('Q1' AS Q1))");
     let parsed = parse_top_level_pivot_clause(&tokens).expect("PIVOT XML clause should be parsed");
-    assert!(parsed.generated_columns.is_empty());
+    assert_eq!(parsed.generated_columns, vec!["quarter_XML".to_string()]);
     assert_eq!(parsed.for_columns, vec!["quarter".to_string()]);
     assert_eq!(parsed.aggregate_columns, vec!["amount".to_string()]);
 }

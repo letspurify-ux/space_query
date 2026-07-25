@@ -339,6 +339,10 @@ pub struct IntellisenseData {
     member_kinds_by_qualifier: HashMap<String, HashMap<String, HashSet<QualifiedMemberKind>>>,
     relation_member_entries_by_qualifier: HashMap<String, Vec<NameEntry>>,
     collection_element_type_by_type: HashMap<String, String>,
+    /// Declared object type of a column, keyed `TABLE.COLUMN`. Lets a
+    /// `alias.object_column.` chain resolve to the type's attributes/methods
+    /// even when nothing in the statement text spells the type out.
+    object_type_by_column: HashMap<String, String>,
     synonym_target_by_synonym: HashMap<String, String>,
     relations_upper: HashSet<String>,
     /// Names of virtual tables (CTEs, subquery aliases) whose columns were
@@ -427,6 +431,7 @@ impl IntellisenseData {
             member_kinds_by_qualifier: HashMap::new(),
             relation_member_entries_by_qualifier: HashMap::new(),
             collection_element_type_by_type: HashMap::new(),
+            object_type_by_column: HashMap::new(),
             synonym_target_by_synonym: HashMap::new(),
             relations_upper: HashSet::new(),
             virtual_table_keys: HashSet::new(),
@@ -1197,6 +1202,33 @@ impl IntellisenseData {
             return;
         }
         self.collection_element_type_by_type.insert(key, element);
+    }
+
+    pub fn set_object_type_for_column(&mut self, table: &str, column: &str, type_name: &str) {
+        let table_key = Self::normalize_qualifier_lookup_key(table);
+        let column_key = Self::normalize_qualifier_lookup_key(column);
+        let type_key = Self::normalize_qualifier_lookup_key(type_name);
+        if table_key.is_empty() || column_key.is_empty() || type_key.is_empty() {
+            return;
+        }
+        self.object_type_by_column
+            .insert(format!("{table_key}.{column_key}"), type_key);
+    }
+
+    pub fn object_type_for_column(&self, table: &str, column: &str) -> Option<&str> {
+        let column_key = Self::normalize_qualifier_lookup_key(column);
+        if column_key.is_empty() {
+            return None;
+        }
+        for table_key in Self::qualifier_lookup_keys(table) {
+            if let Some(type_name) = self
+                .object_type_by_column
+                .get(&format!("{table_key}.{column_key}"))
+            {
+                return Some(type_name.as_str());
+            }
+        }
+        None
     }
 
     pub fn collection_element_type_for_type(&self, collection_type: &str) -> Option<&str> {

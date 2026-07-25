@@ -1957,14 +1957,14 @@ SELECT LEVEL, LEVEL * 10, 'seed' FROM dual CONNECT BY LEVEL <= 5;
 UPDATE (SELECT amount, note
         FROM sq_hard_w5_bulk
         WHERE bulk_id <= 2)
-SET [[note]] = 'inline-view', [[amount]] = [[amount]] + 1;
+SET note = 'inline-view', amount = amount + 1;
 
 DELETE FROM (SELECT * FROM sq_hard_w5_bulk WHERE bulk_id = 5);
 
 BEGIN
   DBMS_ERRLOG.CREATE_ERROR_LOG(
-    [[dml_table_name]]   => 'SQ_HARD_W5_BULK',
-    [[err_log_table_name]] => 'SQ_HARD_W5_ERR'
+    dml_table_name   => 'SQ_HARD_W5_BULK',
+    err_log_table_name => 'SQ_HARD_W5_ERR'
   );
 END;
 /
@@ -1972,7 +1972,7 @@ END;
 INSERT INTO sq_hard_w5_bulk (bulk_id, amount, note)
 SELECT 1, 999, 'dup' FROM dual UNION ALL
 SELECT 6, 60, 'logged-ok' FROM dual
-LOG ERRORS INTO [[sq_hard_w5_err]] ('wave5') REJECT LIMIT UNLIMITED;
+LOG ERRORS INTO sq_hard_w5_err ('wave5') REJECT LIMIT UNLIMITED;
 
 ALTER TABLE sq_hard_w5_bulk ADD CONSTRAINT sq_hard_w5_bulk_ck
   CHECK (amount >= 0) DEFERRABLE INITIALLY DEFERRED;
@@ -1984,7 +1984,7 @@ CREATE INDEX sq_hard_w5_bulk_fx ON sq_hard_w5_bulk (UPPER(note)) INVISIBLE;
 ALTER INDEX sq_hard_w5_bulk_fx VISIBLE;
 
 INSERT INTO sq_hard_w5_note (note_key, note_value)
-SELECT 'errlog', COUNT(*) FROM [[sq_hard_w5_err]];
+SELECT 'errlog', COUNT(*) FROM sq_hard_w5_err;
 
 --------------------------------------------------------------------------------
 -- W5-D: object type round two. A user-defined constructor returns SELF AS
@@ -2043,23 +2043,23 @@ INSERT INTO sq_hard_w5_wallet VALUES (2, sq_hard_w5_money_t(90));
 INSERT INTO sq_hard_w5_wallet VALUES (3, sq_hard_w5_money_t.zero());
 
 ALTER TYPE sq_hard_w5_money_t
-  ADD ATTRIBUTE ([[currency]] VARCHAR2(3)) CASCADE INCLUDING TABLE DATA;
+  ADD ATTRIBUTE (currency VARCHAR2(3)) CASCADE INCLUDING TABLE DATA;
 
 ALTER TYPE sq_hard_w5_money_t COMPILE BODY;
 
 UPDATE sq_hard_w5_wallet w
-SET w.balance.[[currency]] = CASE WHEN w.wallet_id = 3 THEN 'KRW' ELSE 'USD' END;
+SET w.balance.currency = CASE WHEN w.wallet_id = 3 THEN 'KRW' ELSE 'USD' END;
 
 SELECT w.wallet_id,
-       w.balance.[[amount]]        AS balance_amount,
-       w.balance.[[currency]]      AS balance_currency,
-       w.balance.[[scaled]](3)     AS tripled,
-       w.balance.[[scaled]]()      AS doubled
+       w.balance.amount        AS balance_amount,
+       w.balance.currency      AS balance_currency,
+       w.balance.scaled(3)     AS tripled,
+       w.balance.scaled()      AS doubled
 FROM sq_hard_w5_wallet w
 ORDER BY w.balance, w.wallet_id;
 
 INSERT INTO sq_hard_w5_note (note_key, note_value)
-SELECT 'wallet', SUM(w.balance.[[amount]]) FROM sq_hard_w5_wallet w;
+SELECT 'wallet', SUM(w.balance.amount) FROM sq_hard_w5_wallet w;
 
 --------------------------------------------------------------------------------
 -- W5-E: PIVOT XML with the ANY pseudo-value, a WITH clause carrying an explicit
@@ -2067,7 +2067,7 @@ SELECT 'wallet', SUM(w.balance.[[amount]]) FROM sq_hard_w5_wallet w;
 -- ORDER BY, and a seeded block SAMPLE.
 --------------------------------------------------------------------------------
 SELECT px.node_id,
-       CASE WHEN INSTR(XMLSERIALIZE(CONTENT px.[[metric_name_xml]]), 'LATENCY') > 0
+       CASE WHEN INSTR(XMLSERIALIZE(CONTENT px.metric_name_xml), 'LATENCY') > 0
             THEN 'has-latency' ELSE 'no-latency' END AS xml_shape
 FROM (SELECT node_id, metric_name, metric_value FROM sq_hard_metric)
 PIVOT XML (SUM(metric_value) AS total FOR metric_name IN (ANY)) px
@@ -2183,7 +2183,7 @@ END sq_hard_w5_pkg;
 
 SELECT sq_hard_w5_pkg.render(12)             AS numeric_render,
        sq_hard_w5_pkg.render('ab')           AS text_render,
-       sq_hard_w5_pkg.render('ab', [[p_pad]] => 6) AS padded_render,
+       sq_hard_w5_pkg.render('ab', p_pad => 6) AS padded_render,
        sq_hard_w5_pkg.guarded_total(5)       AS guarded_total
 FROM dual;
 
@@ -2219,7 +2219,7 @@ BEGIN
   END LOOP;
 
   FORALL j IN VALUES OF chosen
-    [[UPDATE]] sq_hard_w5_bulk
+    UPDATE sq_hard_w5_bulk
     SET note = note || '+v'
     WHERE bulk_id = ids(j);
 
@@ -2322,8 +2322,8 @@ BEGIN
                                WHERE x.node_id = m.node_id);
 
   SELECT COUNT(*), SUM(amount) INTO bulk_rows, bulk_sum FROM sq_hard_w5_bulk;
-  SELECT SUM(w.balance.[[amount]]) INTO wallet_sum FROM sq_hard_w5_wallet w;
-  SELECT w.balance.[[currency]] INTO wallet_cur
+  SELECT SUM(w.balance.amount) INTO wallet_sum FROM sq_hard_w5_wallet w;
+  SELECT w.balance.currency INTO wallet_cur
   FROM sq_hard_w5_wallet w WHERE w.wallet_id = 3;
 
   SELECT MAX(CASE note_key WHEN 'errlog'       THEN note_value END),
@@ -2341,7 +2341,7 @@ BEGIN
   SELECT COUNT(*)
   INTO pivot_hits
   FROM (SELECT node_id, metric_name, metric_value FROM sq_hard_metric)
-  PIVOT XML (SUM(metric_value) AS total FOR metric_name IN ([[ANY]]));
+  PIVOT XML (SUM(metric_value) AS total FOR metric_name IN (ANY));
 
   IF dense_rows <> 6 THEN
     RAISE_APPLICATION_ERROR(-20080, 'partitioned outer join ' || dense_rows);
@@ -2435,31 +2435,11 @@ PROMPT [ORACLE HARDCORE] PASS
 -- source: test/final_hardcore.sql
 -- db: Oracle
 -- metadata: test Oracle inferred catalog (file-scoped overlay) + Oracle built-ins
--- checked: 5254
--- suggestions checked: 25174
--- missing: 20
+-- checked: 5253
+-- suggestions checked: 25399
+-- missing: 0
 -- suggestions without type labels: 0
 -- marker: [[word]] means not suggested for the tested prefix
--- missing tokens:
---   1960:5 word=note prefix=not suggestions=[] total=0 line=SET note = 'inline-view', amount = amount + 1;
---   1960:27 word=amount prefix=amou suggestions=[] total=0 line=SET note = 'inline-view', amount = amount + 1;
---   1960:36 word=amount prefix=amou suggestions=[] total=0 line=SET note = 'inline-view', amount = amount + 1;
---   1966:5 word=dml_table_name prefix=dml_ suggestions=[] total=0 line=dml_table_name   => 'SQ_HARD_W5_BULK',
---   1967:5 word=err_log_table_name prefix=err_ suggestions=[] total=0 line=err_log_table_name => 'SQ_HARD_W5_ERR'
---   1975:17 word=sq_hard_w5_err prefix=sq_h suggestions=[sq_hard_bag, sq_hard_doc, sq_hard_edge, sq_hard_ledger, sq_hard_merge, sq_hard_metric, sq_hard_metric_audit, sq_hard_node_dim, sq_hard_quoted, sq_hard_sales, sq_hard_split_hi, sq_hard_split_lo, sq_hard_w3_log, sq_hard_w4_source, sq_hard_w4_target, sq_hard_w4_temporal] total=29 line=LOG ERRORS INTO sq_hard_w5_err ('wave5') REJECT LIMIT UNLIMITED;
---   1987:32 word=sq_hard_w5_err prefix=sq_h suggestions=[sq_hard_bag, sq_hard_doc, sq_hard_edge, sq_hard_ledger, sq_hard_merge, sq_hard_metric, sq_hard_metric_audit, sq_hard_node_dim, sq_hard_quoted, sq_hard_sales, sq_hard_split_hi, sq_hard_split_lo, sq_hard_w3_log, sq_hard_w4_source, sq_hard_w4_target, sq_hard_w4_temporal] total=29 line=SELECT 'errlog', COUNT(*) FROM sq_hard_w5_err;
---   2046:18 word=currency prefix=curr suggestions=[] total=0 line=ADD ATTRIBUTE (currency VARCHAR2(3)) CASCADE INCLUDING TABLE DATA;
---   2051:15 word=currency prefix=curr suggestions=[] total=0 line=SET w.balance.currency = CASE WHEN w.wallet_id = 3 THEN 'KRW' ELSE 'USD' END;
---   2054:18 word=amount prefix=amou suggestions=[] total=0 line=w.balance.amount        AS balance_amount,
---   2055:18 word=currency prefix=curr suggestions=[] total=0 line=w.balance.currency      AS balance_currency,
---   2056:18 word=scaled prefix=scal suggestions=[] total=0 line=w.balance.scaled(3)     AS tripled,
---   2057:18 word=scaled prefix=scal suggestions=[] total=0 line=w.balance.scaled()      AS doubled
---   2062:32 word=amount prefix=amou suggestions=[] total=0 line=SELECT 'wallet', SUM(w.balance.amount) FROM sq_hard_w5_wallet w;
---   2070:48 word=metric_name_xml prefix=metr suggestions=[metric_name, metric_value] total=2 line=CASE WHEN INSTR(XMLSERIALIZE(CONTENT px.metric_name_xml), 'LATENCY') > 0
---   2186:36 word=p_pad prefix=p_pa suggestions=[] total=0 line=sq_hard_w5_pkg.render('ab', p_pad => 6) AS padded_render,
---   2222:5 word=UPDATE prefix=UPDA suggestions=[] total=0 line=UPDATE sq_hard_w5_bulk
---   2325:24 word=amount prefix=amou suggestions=[] total=0 line=SELECT SUM(w.balance.amount) INTO wallet_sum FROM sq_hard_w5_wallet w;
---   2326:20 word=currency prefix=curr suggestions=[] total=0 line=SELECT w.balance.currency INTO wallet_cur
---   2344:61 word=ANY prefix=AN suggestions=[] total=0 line=PIVOT XML (SUM(metric_value) AS total FOR metric_name IN (ANY));
+-- missing tokens: none
 -- suggestions without type labels: none
 -- =========================================================

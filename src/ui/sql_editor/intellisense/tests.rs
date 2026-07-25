@@ -145,6 +145,10 @@ struct MysqlFamilyScriptCatalog {
     signatures: HashMap<String, crate::ui::intellisense::SignatureLabel>,
     signature_kinds: HashMap<String, QualifiedMemberKind>,
     routine_return_types: HashMap<String, String>,
+    /// `TABLE.COLUMN` -> declared type word, for columns typed with a
+    /// user-defined object type. Filtered against `type_members` when the
+    /// catalog is materialised, so scalar columns never leak in.
+    column_object_types: HashMap<String, String>,
 }
 
 fn token_word_eq(token: Option<&SqlToken>, expected: &str) -> bool {
@@ -252,6 +256,47 @@ fn collect_create_table_columns(tokens: &[SqlToken], open_idx: usize) -> Vec<Str
         }
     }
     columns
+}
+
+/// `(column type, …)` pairs of a `CREATE TABLE` element list. Only the first two
+/// words of an element are read, which is exactly `column <type>` for the object
+/// column case; constraint elements and multi-word scalar types are discarded by
+/// the object-type filter applied at the call site.
+fn collect_create_table_column_types(
+    tokens: &[SqlToken],
+    open_idx: usize,
+) -> Vec<(String, String)> {
+    let Some(close_idx) = matching_paren_index(tokens, open_idx) else {
+        return Vec::new();
+    };
+    let mut pairs = Vec::new();
+    let mut depth = 0usize;
+    let mut item: Vec<&str> = Vec::new();
+    let mut flush = |item: &mut Vec<&str>| {
+        if let [column, type_word] = item.as_slice() {
+            pairs.push(((*column).to_string(), (*type_word).to_string()));
+        }
+        item.clear();
+    };
+    for token in tokens.iter().take(close_idx).skip(open_idx + 1) {
+        match token {
+            SqlToken::Symbol(symbol) if symbol == "(" => depth = depth.saturating_add(1),
+            SqlToken::Symbol(symbol) if symbol == ")" => depth = depth.saturating_sub(1),
+            SqlToken::Symbol(symbol) if symbol == "," && depth == 0 => flush(&mut item),
+            SqlToken::Word(word) if depth == 0 => {
+                if item.len() < 2 {
+                    item.push(word.as_str());
+                } else {
+                    item.push("");
+                }
+            }
+            SqlToken::Comment(_) => {}
+            _ if depth == 0 => item.push(""),
+            _ => {}
+        }
+    }
+    flush(&mut item);
+    pairs
 }
 
 fn collect_mysql_inline_index_names(tokens: &[SqlToken], open_idx: usize) -> Vec<String> {
@@ -873,8 +918,27 @@ fn mysql_family_catalog_from_script(script: &str) -> MysqlFamilyScriptCatalog {
                     if token_word_eq(tokens.get(action_idx), "ADD")
                         && token_word_eq(tokens.get(action_idx + 1), "COLUMN")
                     {
+                        let mut column_idx = action_idx + 2;
+                        if token_word_eq(tokens.get(column_idx), "IF")
+                            && token_word_eq(tokens.get(column_idx + 1), "NOT")
+                            && token_word_eq(tokens.get(column_idx + 2), "EXISTS")
+                        {
+                            column_idx += 3;
+                        }
+                        if let Some(column) = token_word_text(tokens.get(column_idx)) {
+                            push_unique_case_insensitive(columns, column);
+                        }
+                    }
+                    if token_word_eq(tokens.get(action_idx), "RENAME")
+                        && token_word_eq(tokens.get(action_idx + 1), "COLUMN")
+                    {
                         if let Some(column) = token_word_text(tokens.get(action_idx + 2)) {
                             push_unique_case_insensitive(columns, column);
+                        }
+                        if token_word_eq(tokens.get(action_idx + 3), "TO") {
+                            if let Some(column) = token_word_text(tokens.get(action_idx + 4)) {
+                                push_unique_case_insensitive(columns, column);
+                            }
                         }
                     }
                     action_idx += 1;
@@ -970,6 +1034,19 @@ fn intellisense_data_from_mysql_family_catalog(
     }
     for (type_name, members) in &catalog.type_members {
         data.set_members_for_qualifier(type_name, members.clone());
+    }
+    for (table_column, type_name) in &catalog.column_object_types {
+        // Only object types the script actually declared can own members.
+        if !catalog
+            .type_members
+            .keys()
+            .any(|declared| declared.eq_ignore_ascii_case(type_name))
+        {
+            continue;
+        }
+        if let Some((table, column)) = table_column.rsplit_once('.') {
+            data.set_object_type_for_column(table, column, type_name);
+        }
     }
     for (collection_type, element_type) in &catalog.collection_element_types {
         data.set_collection_element_type_for_type(collection_type, element_type);
@@ -1300,10 +1377,19 @@ fn oracle_insert_signature(
     return_type: Option<&str>,
 ) {
     let key = key.to_ascii_uppercase();
-    catalog
-        .signatures
-        .entry(key.clone())
-        .or_insert_with(|| script_signature_label(routine_name, parameter_names));
+    // Overloads share one signature key. The script catalog holds a single label
+    // per key, so keep the widest one — named notation can address any parameter
+    // of any overload, and the widest signature carries the most of them.
+    match catalog.signatures.entry(key.clone()) {
+        std::collections::hash_map::Entry::Occupied(mut existing) => {
+            if existing.get().arg_spans.len() < parameter_names.len() {
+                existing.insert(script_signature_label(routine_name, parameter_names));
+            }
+        }
+        std::collections::hash_map::Entry::Vacant(slot) => {
+            slot.insert(script_signature_label(routine_name, parameter_names));
+        }
+    }
     catalog.signature_kinds.insert(key.clone(), kind);
     if let Some(return_type) = return_type {
         catalog
@@ -1549,6 +1635,15 @@ fn oracle_collect_dbms_tf_new_columns(tokens: &[SqlToken]) -> Vec<String> {
 fn oracle_collect_script_catalog_entries(script: &str, catalog: &mut MysqlFamilyScriptCatalog) {
     oracle_collect_script_signatures(script, catalog);
     let tokens = super::query_text::tokenize_sql(script);
+    for window in tokens.windows(3) {
+        if token_word_eq(window.first(), "ERR_LOG_TABLE_NAME")
+            && matches!(window.get(1), Some(SqlToken::Symbol(symbol)) if symbol == "=>")
+        {
+            if let Some(SqlToken::String(name)) = window.get(2) {
+                push_unique_case_insensitive(&mut catalog.tables, name.trim_matches('\''));
+            }
+        }
+    }
     let mut idx = 0usize;
     while idx < tokens.len() {
         if !token_word_eq(tokens.get(idx), "CREATE") {
@@ -1574,6 +1669,14 @@ fn oracle_collect_script_catalog_entries(script: &str, catalog: &mut MysqlFamily
                         name.to_ascii_uppercase(),
                         collect_create_table_columns(&tokens, after_name_idx),
                     );
+                    for (column, column_type) in
+                        collect_create_table_column_types(&tokens, after_name_idx)
+                    {
+                        catalog.column_object_types.insert(
+                            format!("{}.{}", name.to_ascii_uppercase(), column.to_ascii_uppercase()),
+                            column_type,
+                        );
+                    }
                 } else {
                     let statement_end = tokens
                         .iter()
@@ -1875,6 +1978,37 @@ fn oracle_collect_script_catalog_entries(script: &str, catalog: &mut MysqlFamily
             }
         }
         idx += 1;
+    }
+
+    // `ALTER TYPE t ADD ATTRIBUTE (name type, …)` grows the object type after its
+    // CREATE, so the attribute list has to be folded into the declared members.
+    let mut idx = 0usize;
+    while idx < tokens.len() {
+        if !token_word_eq(tokens.get(idx), "ALTER") || !token_word_eq(tokens.get(idx + 1), "TYPE") {
+            idx += 1;
+            continue;
+        }
+        let Some((type_name, after_type_idx)) = script_object_name_at(&tokens, idx + 2) else {
+            idx += 1;
+            continue;
+        };
+        if !token_word_eq(tokens.get(after_type_idx), "ADD")
+            || !token_word_eq(tokens.get(after_type_idx + 1), "ATTRIBUTE")
+        {
+            idx += 1;
+            continue;
+        }
+        let list_idx = after_type_idx + 2;
+        if matches!(tokens.get(list_idx), Some(SqlToken::Symbol(symbol)) if symbol == "(") {
+            let members = catalog
+                .type_members
+                .entry(type_name.to_ascii_uppercase())
+                .or_default();
+            for attribute in collect_create_table_columns(&tokens, list_idx) {
+                push_unique_case_insensitive(members, &attribute);
+            }
+        }
+        idx = list_idx.saturating_add(1);
     }
 
     let mut idx = 0usize;
@@ -54850,6 +54984,11 @@ fn intellisense_sweep_word_skip_context_from_analysis(
             true,
             Some(db_type),
         )
+        // `ALTER TYPE t ADD ATTRIBUTE (name …)` introduces the attribute name.
+        || SqlEditorWidget::cursor_is_at_alter_type_attribute_name_slot_for_context(deep_ctx, true)
+        || SqlEditorWidget::cursor_is_at_ddl_identifier_suppression_slot_for_context(
+            deep_ctx, true,
+        )
         || intellisense_sweep_is_oracle_non_catalog_value_or_definition(
             sql,
             word_start,
@@ -64469,6 +64608,18 @@ fn forall_offers_the_bound_dml_statement() {
     // Once a verb has begun, nothing is re-offered.
     assert!(!has(
         &kw("BEGIN FORALL i IN 1..10 INSERT INTO t | END;"),
+        "UPDATE"
+    ));
+
+    // A completed FORALL earlier in the same block must not mask the DML slot
+    // of the current FORALL.
+    assert!(has(
+        &kw(
+            "BEGIN \
+             FORALL i IN INDICES OF ids SAVE EXCEPTIONS UPDATE t SET value = i; \
+             FORALL j IN VALUES OF chosen UPDA| t SET value = j; \
+             END;"
+        ),
         "UPDATE"
     ));
 }
@@ -93339,6 +93490,16 @@ fn plsql_open_cursor_for_dynamic_sql_offers_using() {
          BEGIN OPEN p_rc FOR v_sql |; END;", Oracle);
     assert!(has(&s, "USING"), "USING missing at `OPEN cur FOR dynamic_sql |`: {s:?}");
 
+    let s = query_keyword_completion_suggestions(
+        "DECLARE v_sql VARCHAR2(100); p_rc SYS_REFCURSOR; p_rc2 SYS_REFCURSOR; \
+         BEGIN OPEN p_rc FOR SELECT * FROM emp; OPEN p_rc2 FOR v_sql |; END;",
+        Oracle,
+    );
+    assert!(
+        has(&s, "USING"),
+        "an earlier OPEN masked USING at the current dynamic OPEN: {s:?}"
+    );
+
     // A static embedded query must not offer USING there.
     let s = query_keyword_completion_suggestions(
         "DECLARE p_rc SYS_REFCURSOR; BEGIN OPEN p_rc FOR SELECT * FROM emp |; END;", Oracle);
@@ -95959,3 +96120,153 @@ fn sweep_preserves_quotes_around_quoted_identifier_prefixes() {
     );
 }
 
+#[test]
+fn final_hardcore_completion_gap_regressions_are_covered() {
+    use crate::db::DatabaseType::{MariaDB, MySQL, Oracle};
+
+    let contains = |values: &[String], expected: &str| {
+        values
+            .iter()
+            .any(|value| value.eq_ignore_ascii_case(expected))
+    };
+    let having_ctx = analyze_inline_cursor_sql(
+        "SELECT deptno, SUM(sal) AS bucket_total FROM emp \
+         GROUP BY deptno HAVING buck| > 0",
+    );
+    let having_projection = intellisense_context::extract_select_list_columns(
+        SqlEditorWidget::current_query_tokens(&having_ctx),
+    );
+    assert!(
+        contains(&having_projection, "bucket_total"),
+        "HAVING query projection was not extracted: phase={:?} range={:?} tokens={:?} projection={having_projection:?}",
+        having_ctx.phase,
+        having_ctx.active_query_range,
+        SqlEditorWidget::current_query_tokens(&having_ctx),
+    );
+    let type_ctx = analyze_inline_cursor_sql(
+        "ALTER TABLE emp ADD COLUMN IF NOT EXISTS added_v IN| NOT NULL",
+    );
+    assert!(
+        SqlEditorWidget::data_type_position_for_context_for_db(
+            &type_ctx,
+            true,
+            Some(MariaDB),
+        )
+        .is_some(),
+        "IF NOT EXISTS column type slot was not classified: phase={:?} new_name={} tokens={:?}",
+        type_ctx.phase,
+        type_ctx.ddl_new_name_position,
+        type_ctx.statement_tokens,
+    );
+    let type_keywords =
+        SqlEditorWidget::collect_expected_keyword_suggestions("IN", &type_ctx, Some(MariaDB));
+    assert!(
+        contains(&type_keywords, "INT"),
+        "IF NOT EXISTS type keywords were preempted: keywords={type_keywords:?}, structural={:?}",
+        SqlEditorWidget::mysql_family_structural_keyword_inference(
+            "IN",
+            &type_ctx,
+            Some(MariaDB),
+        ),
+    );
+
+    for (db_type, sql, expected) in [
+        (
+            MySQL,
+            "SELECT deptno, SUM(sal) AS bucket_total FROM emp \
+             GROUP BY deptno HAVING buck| > 0",
+            "bucket_total",
+        ),
+        (
+            MariaDB,
+            "SELECT deptno, SUM(sal) AS bucket_total FROM emp \
+             GROUP BY deptno HAVING buck| > 0",
+            "bucket_total",
+        ),
+        (
+            MySQL,
+            "SELECT h.empno FROM emp h FOR SHARE OF h| NOWAIT",
+            "h",
+        ),
+        (
+            Oracle,
+            "SELECT p.job_| FROM (SELECT deptno, job, sal FROM emp) \
+             PIVOT XML (SUM(sal) AS total FOR job IN (ANY)) p",
+            "job_XML",
+        ),
+        (
+            Oracle,
+            "DECLARE pivot_rows NUMBER; BEGIN SELECT COUNT(*) INTO pivot_rows \
+             FROM (SELECT deptno, job, sal FROM emp) \
+             PIVOT XML (SUM(sal) AS total FOR job IN (AN|)); END;",
+            "ANY",
+        ),
+        (
+            MariaDB,
+            "ALTER TABLE emp ADD COLUMN IF NOT EXISTS added_v IN| NOT NULL",
+            "INT",
+        ),
+        (
+            MariaDB,
+            "ALTER TABLE emp ADD COLUMN IF NO| EXISTS added_v INT",
+            "NOT",
+        ),
+        (
+            Oracle,
+            "CREATE TABLE vector_store (embedding VECT|)",
+            "VECTOR",
+        ),
+        (
+            Oracle,
+            "CREATE PACKAGE p AS TYPE ids_t IS TABLE OF NUMBER; \
+             PROCEDURE open_cursor(p_rc OU| SYS_REFCURSOR); END;",
+            "OUT",
+        ),
+    ] {
+        let suggestions = query_keyword_completion_suggestions(sql, db_type);
+        assert!(
+            contains(&suggestions, expected),
+            "{expected} missing at `{sql}` ({db_type:?}): {suggestions:?}"
+        );
+    }
+
+    let new_column =
+        analyze_inline_cursor_sql("ALTER TABLE emp ADD COLUMN IF NOT EXISTS added_v| INT");
+    assert!(
+        new_column.ddl_new_name_position,
+        "IF NOT EXISTS column name must remain a DDL definition slot"
+    );
+    let mut mysql_catalog = mysql_family_catalog_from_script(
+        "CREATE TABLE t (id INT); \
+         ALTER TABLE t ADD COLUMN IF NOT EXISTS added_v INT; \
+         ALTER TABLE t RENAME COLUMN added_v TO renamed_v;",
+    );
+    let columns = mysql_catalog.columns.remove("T").unwrap_or_default();
+    for expected in ["added_v", "renamed_v"] {
+        assert!(
+            contains(&columns, expected),
+            "{expected} missing from ALTER TABLE script catalog: {columns:?}"
+        );
+    }
+
+    let mut oracle_catalog = MysqlFamilyScriptCatalog::default();
+    oracle_collect_script_catalog_entries(
+        "BEGIN DBMS_ERRLOG.CREATE_ERROR_LOG(\
+         dml_table_name => 'T', err_log_table_name => 'ERR_T'); END;",
+        &mut oracle_catalog,
+    );
+    assert!(
+        contains(&oracle_catalog.tables, "ERR_T"),
+        "explicit DBMS_ERRLOG table missing from script catalog: {:?}",
+        oracle_catalog.tables
+    );
+
+    assert!(
+        intellisense_sweep_word_skip_context(
+            "ALTER TABLE t DROP CONSTRAINT IF EXISTS ck_t__CODEX_CURSOR__;",
+            MariaDB,
+            "ck_t",
+        ),
+        "constraint references intentionally suppressed by production completion must be skipped"
+    );
+}

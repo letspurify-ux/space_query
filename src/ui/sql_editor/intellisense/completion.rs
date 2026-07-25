@@ -616,6 +616,58 @@ const PLSQL_PREDEFINED_EXCEPTIONS: &[&str] = &[
 /// catalog — the supplied packages are not in the user's object catalog, so
 /// without this the qualifier resolves to nothing. Routine names only (plus a
 /// few widely used constants); not exhaustive.
+/// Named parameters of built-in package subprograms that are normally called in
+/// named notation. Built-in packages are never fetched from the catalog, so this
+/// is the only source completion has for `DBMS_x.y(param => …)`.
+const ORACLE_BUILTIN_PACKAGE_MEMBER_PARAMETERS: &[(&str, &[&str])] = &[
+    (
+        "DBMS_APPLICATION_INFO.SET_MODULE",
+        &["module_name", "action_name"],
+    ),
+    (
+        "DBMS_ERRLOG.CREATE_ERROR_LOG",
+        &[
+            "dml_table_name",
+            "err_log_table_name",
+            "err_log_table_owner",
+            "err_log_table_space",
+            "skip_unsupported",
+        ],
+    ),
+    (
+        "DBMS_METADATA.GET_DDL",
+        &["object_type", "name", "schema", "version", "model", "transform"],
+    ),
+    (
+        "DBMS_METADATA.SESSION_TRANSFORM",
+        &["transform_handle", "name", "value", "object_type"],
+    ),
+    (
+        "DBMS_METADATA.SET_TRANSFORM_PARAM",
+        &["transform_handle", "name", "value", "object_type"],
+    ),
+    ("DBMS_RANDOM.VALUE", &["low", "high"]),
+    (
+        "DBMS_SESSION.SET_CONTEXT",
+        &["namespace", "attribute", "value", "username", "client_id"],
+    ),
+    (
+        "DBMS_STATS.GATHER_TABLE_STATS",
+        &[
+            "ownname",
+            "tabname",
+            "partname",
+            "estimate_percent",
+            "block_sample",
+            "method_opt",
+            "degree",
+            "cascade",
+            "no_invalidate",
+        ],
+    ),
+    ("DBMS_UTILITY.COMMA_TO_TABLE", &["list", "tablen", "tab"]),
+];
+
 const ORACLE_BUILTIN_PACKAGE_MEMBERS: &[(&str, &[&str])] = &[
     (
         "DBMS_DB_VERSION",
@@ -1654,6 +1706,7 @@ fn oracle_data_type_keywords(position: DataTypePosition) -> &'static [&'static s
         "UROWID",
         "XMLTYPE",
         "JSON",
+        "VECTOR",
         "BOOLEAN",
         "INTEGER",
         "INT",
@@ -3140,6 +3193,15 @@ impl SqlEditorWidget {
         } else {
             None
         };
+        let update_inline_view_column_suggestions = if qualifier.is_none() {
+            Self::update_inline_view_column_suggestions_for_context(
+                deep_ctx,
+                !snapshot.prefix.is_empty(),
+                &snapshot.prefix,
+            )
+        } else {
+            None
+        };
         let create_table_storage_column_suggestions = if qualifier.is_none() {
             Self::create_table_storage_column_suggestions_for_context(
                 deep_ctx,
@@ -3826,6 +3888,43 @@ impl SqlEditorWidget {
         } else {
             Vec::new()
         };
+        let early_having_projection_suggestions = if qualifier.is_none()
+            && matches!(
+                deep_ctx.phase,
+                intellisense_context::SqlPhase::HavingClause
+            )
+        {
+            intellisense_context::extract_select_list_columns(Self::current_query_tokens(deep_ctx))
+                .into_iter()
+                .filter(|column| {
+                    Self::completion_suggestion_matches_prefix(column, &snapshot.prefix)
+                })
+                .collect::<Vec<_>>()
+        } else {
+            Vec::new()
+        };
+        let early_mysql_locking_table_suggestions = if qualifier.is_none()
+            && snapshot.preferred_db_type.is_mysql_or_mariadb()
+            && matches!(
+                deep_ctx.phase,
+                intellisense_context::SqlPhase::LockingColumnList
+            )
+        {
+            let mut suggestions = Vec::new();
+            for table in &deep_ctx.tables_in_scope {
+                let candidate = table.alias.as_deref().unwrap_or(&table.name);
+                if Self::completion_suggestion_matches_prefix(candidate, &snapshot.prefix)
+                    && suggestions
+                        .iter()
+                        .all(|existing: &String| !existing.eq_ignore_ascii_case(candidate))
+                {
+                    suggestions.push(candidate.to_string());
+                }
+            }
+            suggestions
+        } else {
+            Vec::new()
+        };
         let early_oracle_collection_column_suggestions = if !snapshot
             .preferred_db_type
             .is_mysql_or_mariadb()
@@ -4130,6 +4229,10 @@ impl SqlEditorWidget {
                     deep_ctx,
                     has_prefix || qualifier.is_some(),
                 )
+                || Self::cursor_is_at_alter_type_attribute_name_slot_for_context(
+                    deep_ctx,
+                    has_prefix || qualifier.is_some(),
+                )
                 || Self::cursor_is_inside_post_table_modifier_value_slot_for_context(
                     deep_ctx,
                     has_prefix || qualifier.is_some(),
@@ -4209,6 +4312,8 @@ impl SqlEditorWidget {
             && early_relation_alias_suggestions.is_empty()
             && early_table_relation_suggestions.is_empty()
             && early_unqualified_visible_column_suggestions.is_empty()
+            && early_having_projection_suggestions.is_empty()
+            && early_mysql_locking_table_suggestions.is_empty()
             && early_oracle_collection_column_suggestions.is_empty()
             && early_comment_column_suggestions.is_empty()
             && early_qualified_subquery_column_suggestions.is_empty()
@@ -5307,6 +5412,8 @@ impl SqlEditorWidget {
             || !expected_keyword_suggestions.is_empty()
             || !expected_object_suggestions.is_empty()
             || !mysql_named_value_suggestions.is_empty()
+            || !early_having_projection_suggestions.is_empty()
+            || !early_mysql_locking_table_suggestions.is_empty()
             // A PL/SQL value-operand start (`v := |`, `IF |`, `RETURN |`, a call
             // argument) always has grammatical material to offer — locals,
             // SQLCODE/NULL/CASE, value-producing objects — even when none of the
@@ -5505,6 +5612,7 @@ impl SqlEditorWidget {
                 label_suggestions(values, "ALIAS");
             }
             for values in [
+                update_inline_view_column_suggestions.as_deref(),
                 create_table_declared_column_suggestions.as_deref(),
                 create_table_storage_column_suggestions.as_deref(),
                 create_table_partition_declared_column_suggestions.as_deref(),
@@ -5522,6 +5630,8 @@ impl SqlEditorWidget {
             label_suggestions(&early_relation_alias_suggestions, "ALIAS");
             label_suggestions(&early_table_relation_suggestions, "TABLE");
             label_suggestions(&early_unqualified_visible_column_suggestions, "COLUMN");
+            label_suggestions(&early_having_projection_suggestions, "COLUMN");
+            label_suggestions(&early_mysql_locking_table_suggestions, "TABLE");
             label_suggestions(&early_oracle_collection_column_suggestions, "COLUMN");
             label_suggestions(&early_comment_column_suggestions, "COLUMN");
             label_suggestions(&early_local_type_suggestions, "TYPE");
@@ -5628,6 +5738,8 @@ impl SqlEditorWidget {
             )
         } else if replace_table_context_with_expected_objects {
             expected_object_suggestions.clone()
+        } else if let Some(suggestions) = update_inline_view_column_suggestions.clone() {
+            suggestions
         } else if let Some(suggestions) = create_table_declared_column_suggestions.clone() {
             suggestions
         } else if let Some(suggestions) = create_table_storage_column_suggestions.clone() {
@@ -5825,6 +5937,24 @@ impl SqlEditorWidget {
             Self::merge_suggestions_with_context_aliases(
                 suggestions,
                 early_unqualified_visible_column_suggestions,
+                true,
+            )
+        };
+        let suggestions = if early_having_projection_suggestions.is_empty() {
+            suggestions
+        } else {
+            Self::merge_suggestions_with_context_aliases(
+                suggestions,
+                early_having_projection_suggestions,
+                true,
+            )
+        };
+        let suggestions = if early_mysql_locking_table_suggestions.is_empty() {
+            suggestions
+        } else {
+            Self::merge_suggestions_with_context_aliases(
+                suggestions,
+                early_mysql_locking_table_suggestions,
                 true,
             )
         };
@@ -8673,6 +8803,22 @@ impl SqlEditorWidget {
                 "RULES",
             );
         if matches_prefix("ANY")
+            && tokens
+                .get(..end)
+                .unwrap_or(tokens)
+                .iter()
+                .any(|token| matches!(token, SqlToken::Word(word) if word.eq_ignore_ascii_case("PIVOT")))
+            && tokens
+                .get(..end)
+                .unwrap_or(tokens)
+                .iter()
+                .any(|token| matches!(token, SqlToken::Word(word) if word.eq_ignore_ascii_case("XML")))
+            && Self::innermost_open_paren_preceding_word(tokens, end)
+                .is_some_and(|word| word.eq_ignore_ascii_case("IN"))
+        {
+            return Some("ANY".to_string());
+        }
+        if matches_prefix("ANY")
             && (matches!(deep_ctx.phase, intellisense_context::SqlPhase::ModelClause)
                 || in_open_model_clause)
         {
@@ -9765,6 +9911,27 @@ impl SqlEditorWidget {
             .last()
             .and_then(|token| Self::token_word(token))
             .map(str::to_ascii_uppercase);
+        let full_has_word = |keyword: &str| {
+            full_meaningful_before.iter().any(
+                |token| matches!(token, SqlToken::Word(word) if word.eq_ignore_ascii_case(keyword)),
+            )
+        };
+        if matches_prefix("NOT")
+            && full_last_word.as_deref() == Some("IF")
+            && full_has_word("ALTER")
+            && full_has_word("TABLE")
+            && full_has_word("ADD")
+        {
+            return Some("NOT".to_string());
+        }
+        if matches_prefix("EXISTS")
+            && matches!(full_last_word.as_deref(), Some("IF" | "NOT"))
+            && full_has_word("ALTER")
+            && full_has_word("TABLE")
+            && full_has_word("ADD")
+        {
+            return Some("EXISTS".to_string());
+        }
         let last_token_is = |symbol: &str| {
             matches!(
                 meaningful_before.last(),
@@ -21768,6 +21935,50 @@ impl SqlEditorWidget {
             && words.iter().any(|word| word == "ATTRIBUTE")
     }
 
+    /// True at the *name* slot of `ALTER TYPE t {ADD|MODIFY} ATTRIBUTE (name type)`.
+    /// The attribute is being introduced, so like a `CREATE TABLE` column name it is
+    /// the author's word and nothing should be completed there.
+    pub(crate) fn cursor_is_at_alter_type_attribute_name_slot(
+        tokens: &[SqlToken],
+        end: usize,
+    ) -> bool {
+        let toks = Self::meaningful_tokens_before(tokens, end);
+        if !matches!(
+            toks.last(),
+            Some(SqlToken::Symbol(sym)) if matches!(sym.as_str(), "(" | ",")
+        ) {
+            return false;
+        }
+
+        let words = toks
+            .iter()
+            .filter_map(|token| match token {
+                SqlToken::Word(word) => Some(word.to_ascii_uppercase()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        words.iter().any(|word| word == "ALTER")
+            && words.iter().any(|word| word == "TYPE")
+            && words
+                .iter()
+                .any(|word| matches!(word.as_str(), "ADD" | "MODIFY"))
+            && words.last().is_some_and(|word| word == "ATTRIBUTE")
+    }
+
+    pub(crate) fn cursor_is_at_alter_type_attribute_name_slot_for_context(
+        deep_ctx: &intellisense_context::CursorContext,
+        exclude_current_identifier_chain: bool,
+    ) -> bool {
+        let tokens = Self::current_query_tokens(deep_ctx);
+        let cursor_token_len = Self::cursor_token_len_in_current_query(deep_ctx);
+        let end = Self::expected_suggestion_context_end(
+            tokens,
+            cursor_token_len,
+            exclude_current_identifier_chain,
+        );
+        Self::cursor_is_at_alter_type_attribute_name_slot(tokens, end)
+    }
+
     fn cursor_is_at_create_type_under_supertype(tokens: &[SqlToken], end: usize) -> bool {
         let toks = Self::meaningful_tokens_before(tokens, end);
         if !matches!(toks.last(), Some(SqlToken::Word(word)) if word.eq_ignore_ascii_case("UNDER"))
@@ -30816,6 +31027,20 @@ impl SqlEditorWidget {
         let def = Self::current_create_table_definition(after_add);
         let had_column_keyword = matches!(def.first(), Some(SqlToken::Word(word)) if word.eq_ignore_ascii_case("COLUMN"));
         let def = if had_column_keyword { &def[1..] } else { def };
+        let def = match def {
+            [
+                SqlToken::Word(if_kw),
+                SqlToken::Word(not_kw),
+                SqlToken::Word(exists_kw),
+                rest @ ..,
+            ] if if_kw.eq_ignore_ascii_case("IF")
+                && not_kw.eq_ignore_ascii_case("NOT")
+                && exists_kw.eq_ignore_ascii_case("EXISTS") =>
+            {
+                rest
+            }
+            _ => def,
+        };
         if def.is_empty() {
             // `MODIFY |` names an existing column — defer to the column path.
             if is_modify || had_column_keyword {
@@ -32253,6 +32478,61 @@ impl SqlEditorWidget {
         (in_column_reference_list && depth > 0)
             .then_some(active_column_reference_marker)
             .flatten()
+    }
+
+    /// `UPDATE (SELECT a, b FROM t) SET a = …` — an updatable inline view. Its
+    /// projection is the only column list the SET clause may name, and because the
+    /// target is a subquery rather than a relation, nothing lands in
+    /// `tables_in_scope` for the ordinary column source to use.
+    fn update_inline_view_column_suggestions_for_context(
+        deep_ctx: &intellisense_context::CursorContext,
+        exclude_current_identifier_chain: bool,
+        prefix: &str,
+    ) -> Option<Vec<String>> {
+        let tokens = Self::current_query_tokens(deep_ctx);
+        let cursor_token_len = Self::cursor_token_len_in_current_query(deep_ctx);
+        let end = Self::expected_suggestion_context_end(
+            tokens,
+            cursor_token_len,
+            exclude_current_identifier_chain,
+        )
+        .min(tokens.len());
+
+        let head_idx = tokens
+            .iter()
+            .position(|token| !matches!(token, SqlToken::Comment(_)))?;
+        if !matches!(
+            tokens.get(head_idx),
+            Some(SqlToken::Word(word)) if word.eq_ignore_ascii_case("UPDATE")
+        ) {
+            return None;
+        }
+        let open_idx = Self::next_non_comment_token_index(tokens, head_idx + 1)?;
+        if !matches!(tokens.get(open_idx), Some(SqlToken::Symbol(sym)) if sym == "(") {
+            return None;
+        }
+        let close_idx = Self::matching_close_paren_index_before(tokens, open_idx, tokens.len())?;
+        if end <= close_idx {
+            return None;
+        }
+        // Only the SET list names the inline view's columns.
+        if !tokens
+            .get(close_idx + 1..end)
+            .unwrap_or(&[])
+            .iter()
+            .any(|token| matches!(token, SqlToken::Word(word) if word.eq_ignore_ascii_case("SET")))
+        {
+            return None;
+        }
+
+        let columns = intellisense_context::extract_select_list_columns(
+            tokens.get(open_idx + 1..close_idx).unwrap_or(&[]),
+        );
+        let filtered = columns
+            .into_iter()
+            .filter(|column| Self::completion_suggestion_matches_prefix(column, prefix))
+            .collect::<Vec<_>>();
+        (!filtered.is_empty()).then_some(filtered)
     }
 
     fn create_table_declared_column_suggestions_for_context(
@@ -38617,7 +38897,10 @@ impl SqlEditorWidget {
         // bound DML statement. After the bound (a complete operand) the DML verbs are
         // offered — plus `SAVE EXCEPTIONS`, until it is present; once a DML verb has
         // begun, nothing is re-offered.
-        if let Some(forall_idx) = words.iter().position(|word| word == "FORALL") {
+        // The innermost `FORALL`: a PL/SQL block may run several in sequence, and
+        // an earlier one that already consumed its bound DML must not hide the
+        // verb slot of the one being written.
+        if let Some(forall_idx) = words.iter().rposition(|word| word == "FORALL") {
             let after = &words[forall_idx..];
             let has_in = after.iter().any(|word| word == "IN");
             let has_dml = after.iter().any(|word| {
@@ -38663,7 +38946,8 @@ impl SqlEditorWidget {
         // embedded query (`FOR SELECT|WITH ...`) never takes `USING` here (its
         // predicates hold literal/bound values directly), so this is scoped to
         // a `FOR` target that is not itself a query.
-        if let Some(open_idx) = words.iter().position(|word| word == "OPEN") {
+        // Innermost `OPEN` for the same reason as `FORALL` above.
+        if let Some(open_idx) = words.iter().rposition(|word| word == "OPEN") {
             if let Some(for_idx) = words[open_idx..]
                 .iter()
                 .position(|word| word == "FOR")
@@ -39973,7 +40257,34 @@ impl SqlEditorWidget {
                         resolved = Some(type_word.trim_matches('"').to_string());
                     }
                 }
-                resolved
+                // No constructor spells the type out in this statement, so the
+                // attribute must be a stored object column: resolve its owning
+                // relation (`w` in `w.balance.|`) and take the column's declared type.
+                resolved.or_else(|| {
+                    let owner_dot_idx =
+                        Self::previous_non_comment_token_index(tokens, owner_idx)?;
+                    if !matches!(
+                        tokens.get(owner_dot_idx),
+                        Some(SqlToken::Symbol(symbol)) if symbol == "."
+                    ) {
+                        return None;
+                    }
+                    let relation_idx =
+                        Self::previous_non_comment_token_index(tokens, owner_dot_idx)?;
+                    let relation = tokens.get(relation_idx).and_then(Self::token_word)?;
+                    let relation_tables = intellisense_context::resolve_qualifier_tables(
+                        relation,
+                        &deep_ctx.tables_in_scope,
+                    );
+                    relation_tables
+                        .iter()
+                        .map(String::as_str)
+                        .chain(std::iter::once(relation))
+                        .find_map(|table| {
+                            data.object_type_for_column(table, attribute)
+                                .map(str::to_string)
+                        })
+                })
             }
             Some(SqlToken::Symbol(symbol)) if symbol == ")" => (|| {
                 let open_idx =
@@ -42463,6 +42774,15 @@ impl SqlEditorWidget {
             && Self::table_clause_construct_is_open(tokens, end, "PIVOT")
             && Self::table_clause_construct_has_table_source_anchor(tokens, end, "PIVOT")
         {
+            if has("XML")
+                && Self::innermost_open_paren_preceding_word(tokens, end)
+                    .is_some_and(|word| word.eq_ignore_ascii_case("IN"))
+                && Self::meaningful_tokens_before(tokens, end)
+                    .last()
+                    .is_some_and(|token| matches!(token, SqlToken::Symbol(symbol) if symbol == "("))
+            {
+                return Some(&["ANY"]);
+            }
             if current_word_is_followed_by_string {
                 return Some(&["AS"]);
             }
@@ -45873,6 +46193,21 @@ impl SqlEditorWidget {
             if w3.as_deref() == Some("CHANGE") {
                 return true;
             }
+            // MySQL/MariaDB: `ADD [COLUMN] IF NOT EXISTS name |`.
+            if w2.as_deref() == Some("EXISTS")
+                && w3.as_deref() == Some("NOT")
+                && last >= 4
+                && word_upper(last - 3).as_deref() == Some("IF")
+            {
+                let action_idx = if word_upper(last - 4).as_deref() == Some("COLUMN") {
+                    last.checked_sub(5)
+                } else {
+                    last.checked_sub(4)
+                };
+                if action_idx.is_some_and(|idx| word_upper(idx).as_deref() == Some("ADD")) {
+                    return true;
+                }
+            }
             // Oracle parenthesized form: `ADD (col |)`, `MODIFY (c1 NUMBER, c2 |)`.
             // The enclosing paren must directly follow `ADD`/`MODIFY` so that
             // `ADD CHECK (...)` / `ADD CONSTRAINT ... (...)` are not mistaken.
@@ -45886,7 +46221,30 @@ impl SqlEditorWidget {
             return false;
         }
 
-        if starts_with("CREATE") && any_word("TABLE") && !any_word("SELECT") {
+        let create_table_head = starts_with("CREATE")
+            && toks
+                .iter()
+                .skip(1)
+                .filter_map(|token| match token {
+                    SqlToken::Word(word) => Some(word.to_ascii_uppercase()),
+                    _ => None,
+                })
+                .find(|word| {
+                    !matches!(
+                        word.as_str(),
+                        "OR"
+                            | "REPLACE"
+                            | "GLOBAL"
+                            | "PRIVATE"
+                            | "TEMPORARY"
+                            | "SHARDED"
+                            | "DUPLICATED"
+                            | "IMMUTABLE"
+                            | "BLOCKCHAIN"
+                    )
+                })
+                .is_some_and(|word| word == "TABLE");
+        if create_table_head && !any_word("SELECT") {
             // Inside the column-definition list, a column name begins after `(` or
             // `,`. Exclude CTAS column lists (handled by the `SELECT` guard above).
             if is_symbol(last - 1, "(") || is_symbol(last - 1, ",") {
@@ -52914,13 +53272,38 @@ impl SqlEditorWidget {
 
         let key = crate::ui::intellisense::signature_key_for_call(&call);
         let Some(Some(label)) = data.cached_signature(&key) else {
-            return Vec::new();
+            if mysql_compatible {
+                return Vec::new();
+            }
+            let Some((_, parameters)) = ORACLE_BUILTIN_PACKAGE_MEMBER_PARAMETERS
+                .iter()
+                .find(|(member, _)| member.eq_ignore_ascii_case(&key))
+            else {
+                return Vec::new();
+            };
+            let used_names =
+                Self::used_named_arguments_before_cursor(call_scan_text, call.open_paren);
+            return parameters
+                .iter()
+                .filter(|name| {
+                    !used_names.contains(&Self::completion_identifier_lookup_upper(name))
+                        && Self::completion_suggestion_matches_prefix(name, prefix)
+                })
+                .map(|name| (*name).to_string())
+                .collect();
         };
 
         let used_names =
             Self::used_named_arguments_before_cursor(call_scan_text, call.open_paren);
         let mut suggestions: Vec<String> = Vec::new();
-        for &(start, end) in &label.arg_spans {
+        // Overloads share one signature key, and named notation may address any
+        // parameter of any of them (`pkg.render('ab', p_pad => 6)` reaches the
+        // two-argument form), so every overload's parameter names are candidates.
+        for &(start, end) in label
+            .arg_spans
+            .iter()
+            .chain(label.overloads.iter().flat_map(|overload| &overload.arg_spans))
+        {
             let Some(name) = Self::signature_argument_name(label, start, end) else {
                 continue;
             };
@@ -54517,6 +54900,17 @@ impl SqlEditorWidget {
             deep_ctx.cursor_token_len,
             prefix,
         );
+        if matches!(
+            Self::data_type_position_for_context_for_db(deep_ctx, !prefix.is_empty(), db_type),
+            Some(DataTypePosition::ColumnDef)
+        ) && (Self::cursor_is_at_ddl_column_type(tokens, context_end)
+            || Self::cursor_is_at_ddl_column_type(statement_tokens, statement_context_end))
+        {
+            return Self::filter_expected_candidates(
+                prefix,
+                data_type_keywords_for(db_type, DataTypePosition::ColumnDef),
+            );
+        }
         // Nested, fixed grammar frames must win before broad statement/CTE
         // classifiers. In a large WITH statement those broader classifiers can
         // validly return a different keyword set for the containing query; an

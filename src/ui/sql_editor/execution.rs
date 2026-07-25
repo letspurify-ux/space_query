@@ -18072,12 +18072,20 @@ impl SqlEditorWidget {
         fallback_on_error: bool,
         interruption_requires_transaction_decision: bool,
     ) -> RetainedSessionState {
-        let transaction_probe = Self::mysql_session_uncommitted_work_probe(
-            db_type,
-            conn,
-            log_context,
-            fallback_on_error,
-        );
+        let transaction_probe = Self::mysql_statement_diagnostic_safe_transaction_probe(
+            prior_state,
+            statement_effects,
+            auto_commit,
+            statement_failed,
+        )
+        .unwrap_or_else(|| {
+            Self::mysql_session_uncommitted_work_probe(
+                db_type,
+                conn,
+                log_context,
+                fallback_on_error,
+            )
+        });
         Self::mysql_retained_session_state_after_statement_from_probe(
             db_type,
             prior_state,
@@ -18088,6 +18096,29 @@ impl SqlEditorWidget {
             transaction_probe,
             interruption_requires_transaction_decision,
         )
+    }
+
+    fn mysql_statement_diagnostic_safe_transaction_probe(
+        prior_state: RetainedSessionState,
+        statement_effects: crate::db::StatementSessionEffects,
+        auto_commit: bool,
+        statement_failed: bool,
+    ) -> Option<crate::db::TransactionProbeResult> {
+        if !statement_effects.preserves_statement_diagnostics() {
+            return None;
+        }
+
+        let clears_prior_transaction = statement_effects.state_hint.clears_session_state
+            || statement_effects.clears_transaction_state()
+            || statement_effects.has_implicit_commit()
+            || statement_effects.releases_physical_session();
+        Some(crate::db::TransactionProbeResult {
+            may_have_uncommitted_work: ((!clears_prior_transaction || statement_failed)
+                && prior_state.may_have_uncommitted_work())
+                || statement_effects.starts_transaction_state()
+                || (!auto_commit && statement_effects.may_leave_uncommitted_work()),
+            used_fallback: false,
+        })
     }
 
     fn mysql_statement_session_effects_for_sql_for_db_type(
@@ -20023,7 +20054,8 @@ impl SqlEditorWidget {
         statement_effects: crate::db::StatementSessionEffects,
     ) -> bool {
         let hint = statement_effects.state_hint;
-        hint.may_leave_session_bound_state
+        statement_effects.may_leave_session_residue()
+            || hint.may_leave_session_bound_state
             || hint.may_leave_untracked_session_state
             || hint.may_hold_session_lock
             || hint.requires_retention_when_autocommit_off
@@ -22986,6 +23018,59 @@ mod query_execution_cleanup_tests {
                 ),
                 crate::db::RetainedSessionPreflightDecision::Allow,
                 "{db_type} close preflight must not ask for commit/rollback after read-only SELECT"
+            );
+        }
+    }
+
+    #[test]
+    fn mysql_statement_diagnostics_use_inferred_state_instead_of_a_sql_probe() {
+        for db_type in [
+            crate::db::DatabaseType::MySQL,
+            crate::db::DatabaseType::MariaDB,
+        ] {
+            let post_processor = crate::db::statement_session_post_processor_for(db_type);
+            for sql in [
+                "UPDATE t SET value = value + 1",
+                "SELECT SQL_CALC_FOUND_ROWS id FROM t LIMIT 1",
+            ] {
+                let effects = post_processor.effects_for_sql(sql);
+                let auto_commit_probe =
+                    SqlEditorWidget::mysql_statement_diagnostic_safe_transaction_probe(
+                        RetainedSessionState::default(),
+                        effects,
+                        true,
+                        false,
+                    )
+                    .unwrap_or_else(|| panic!("{db_type} should infer state after `{sql}`"));
+                assert!(
+                    !auto_commit_probe.may_have_uncommitted_work,
+                    "{db_type} auto-commit statement should remain clean after `{sql}`"
+                );
+
+                let manual_commit_probe =
+                    SqlEditorWidget::mysql_statement_diagnostic_safe_transaction_probe(
+                        RetainedSessionState::default(),
+                        effects,
+                        false,
+                        false,
+                    )
+                    .unwrap_or_else(|| panic!("{db_type} should infer state after `{sql}`"));
+                assert_eq!(
+                    manual_commit_probe.may_have_uncommitted_work,
+                    sql.starts_with("UPDATE"),
+                    "{db_type} manual-commit state mismatch after `{sql}`"
+                );
+            }
+
+            assert!(
+                SqlEditorWidget::mysql_statement_diagnostic_safe_transaction_probe(
+                    RetainedSessionState::default(),
+                    post_processor.effects_for_sql("SELECT 1"),
+                    true,
+                    false,
+                )
+                .is_none(),
+                "{db_type} ordinary SELECT should keep the existing transaction probe"
             );
         }
     }
@@ -27811,14 +27896,14 @@ mod query_execution_cleanup_tests {
             SqlEditorWidget::mysql_statement_session_effects_for_sql("START TRANSACTION");
 
         assert!(
-            !SqlEditorWidget::mysql_success_requires_retained_session_after_action(
+            SqlEditorWidget::mysql_success_requires_retained_session_after_action(
                 DatabaseType::MySQL,
                 RetainedSessionState::default(),
                 insert_effects,
                 true,
                 false,
             ),
-            "autocommit-on DML does not leave a transaction that must be retained"
+            "autocommit-on DML must preserve ROW_COUNT() on the same session"
         );
         assert!(
             SqlEditorWidget::mysql_success_requires_retained_session_after_action(
