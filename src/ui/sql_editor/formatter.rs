@@ -8623,11 +8623,12 @@ impl SqlEditorWidget {
         false
     }
 
-    fn collect_inline_statement_split_points(formatted: &str) -> Vec<usize> {
-        let spans = super::query_text::tokenize_sql_spanned_with_mysql_compat(
-            formatted,
-            formatted.as_bytes().contains(&b'#'),
-        );
+    fn collect_inline_statement_split_points(
+        formatted: &str,
+        mysql_compatible: bool,
+    ) -> Vec<usize> {
+        let spans =
+            super::query_text::tokenize_sql_spanned_with_mysql_compat(formatted, mysql_compatible);
         let mut split_points: Vec<usize> = Vec::new();
         let bytes = formatted.as_bytes();
         let mut previous_end = 0usize;
@@ -8698,13 +8699,14 @@ impl SqlEditorWidget {
         split_points
     }
 
-    fn split_inline_statement_separators(mut formatted: String) -> String {
+    fn split_inline_statement_separators(mut formatted: String, mysql_compatible: bool) -> String {
         formatted.truncate(formatted.trim_end().len());
         if formatted.is_empty() || !Self::has_inline_statement_separator_candidate(&formatted) {
             return formatted;
         }
 
-        let split_points = Self::collect_inline_statement_split_points(&formatted);
+        let split_points =
+            Self::collect_inline_statement_split_points(&formatted, mysql_compatible);
         if split_points.is_empty() {
             return formatted;
         }
@@ -8832,7 +8834,31 @@ impl SqlEditorWidget {
 
     #[cfg(test)]
     fn split_inline_statement_separators_for_test(formatted: &str) -> String {
-        Self::split_inline_statement_separators(formatted.to_string())
+        Self::split_inline_statement_separators(formatted.to_string(), false)
+    }
+
+    fn innermost_open_paren_owner_word(tokens: &[SqlToken], end: usize) -> Option<&str> {
+        let mut nested_closes = 0usize;
+        for idx in (0..end.min(tokens.len())).rev() {
+            match tokens.get(idx) {
+                Some(SqlToken::Symbol(symbol)) if symbol == ")" => {
+                    nested_closes = nested_closes.saturating_add(1);
+                }
+                Some(SqlToken::Symbol(symbol)) if symbol == "(" => {
+                    if nested_closes > 0 {
+                        nested_closes = nested_closes.saturating_sub(1);
+                        continue;
+                    }
+                    return tokens[..idx].iter().rev().find_map(|token| match token {
+                        SqlToken::Comment(_) => None,
+                        SqlToken::Word(word) => Some(word.as_str()),
+                        SqlToken::String(_) | SqlToken::Symbol(_) => None,
+                    });
+                }
+                _ => {}
+            }
+        }
+        None
     }
 
     #[cfg_attr(not(test), allow(dead_code))]
@@ -12695,6 +12721,15 @@ impl SqlEditorWidget {
                             Some(_meaningful_token_links),
                             Some(matching_paren_close_indices),
                         );
+                    let oracle_json_transform_ignore_if_modifier = !mysql_compatible
+                        && upper == "IF"
+                        && matches!(prev_word_upper, Some("IGNORE"))
+                        && next_word.is_some_and(|word| {
+                            word.eq_ignore_ascii_case("PRESENT")
+                                || word.eq_ignore_ascii_case("ABSENT")
+                        })
+                        && Self::innermost_open_paren_owner_word(tokens, idx)
+                            .is_some_and(|word| word.eq_ignore_ascii_case("JSON_TRANSFORM"));
                     let is_trigger_event_keyword = format_stack.trigger_header_is_active()
                         && matches!(upper, "INSERT" | "UPDATE" | "DELETE");
                     let is_compound_trigger_timing_header = format_stack
@@ -12915,6 +12950,7 @@ impl SqlEditorWidget {
                         && !(format_stack.pending_split_end_suffix_indent().is_some()
                             || mysql_if_exists_modifier
                             || mysql_scalar_if_function
+                            || oracle_json_transform_ignore_if_modifier
                             || mysql_compound_declare
                             || treat_control_keyword_as_identifier
                             || follows_alias_control_keyword);
@@ -15461,6 +15497,7 @@ impl SqlEditorWidget {
                     let starts_control_condition_header = in_plsql_block
                         && matches!(upper, "IF" | "WHILE" | "ELSIF" | "ELSEIF")
                         && !mysql_scalar_if_function
+                        && !oracle_json_transform_ignore_if_modifier
                         && format_stack.current_clause().is_none();
                     let pending_control_header_parenthesized = starts_control_condition_header
                         .then_some(
@@ -17804,6 +17841,9 @@ impl SqlEditorWidget {
                             let active_list_owner =
                                 active_list_owner_frame.map(|owner| (owner.id, owner.kind));
                             let active_list_owner_kind = active_list_owner.map(|(_, kind)| kind);
+                            let active_case_choice_owner = format_stack
+                                .last_condition_owner(ConditionOwnerKind::Case)
+                                .filter(|owner| owner.scope == current_scope);
                             let search_cycle_cte_separator_indent =
                                 search_cycle_starts_cte_definition.then(|| {
                                     format_stack.with_cte_separator_indent(rendered_line_indent(
@@ -18349,7 +18389,17 @@ impl SqlEditorWidget {
                                         .last_paren_stack_frame()
                                         .filter(|frame| frame.direct_list_body)
                                         .map(|frame| frame.frame.depth());
-                                    if let Some(sibling_indent) = direct_list_sibling_indent {
+                                    if let Some(case_choice_owner) = active_case_choice_owner {
+                                        newline_with(
+                                            &mut out,
+                                            case_choice_owner.depth,
+                                            0,
+                                            &mut at_line_start,
+                                            &mut needs_space,
+                                            &mut line_indent,
+                                        );
+                                    } else if let Some(sibling_indent) = direct_list_sibling_indent
+                                    {
                                         newline_with(
                                             &mut out,
                                             sibling_indent,
@@ -18577,20 +18627,39 @@ impl SqlEditorWidget {
                             }
                             #[cfg(test)]
                             if !delimiter_frame_state.is_inside_bracket() {
-                                format_stack.audit_comma(
-                                    active_list_owner.map(|(frame_id, _)| frame_id),
-                                    next_non_comment_idx,
-                                    format_stack
-                                        .last_paren_stack_frame()
-                                        .is_some_and(|frame| frame.direct_list_body)
-                                        || format_stack.last_paren_stack_frame().is_some_and(
-                                            |frame| frame.semantic_flags.fixed_type_modifier,
-                                        )
-                                        || format_stack.has_wrapped_paren_owner_kind(
-                                            FormatIndentedParenOwnerKind::Unpivot,
-                                        )
-                                        || is_with_cte_separator,
-                                );
+                                let parent_frame_owns_comma = format_stack
+                                    .last_paren_stack_frame()
+                                    .is_some_and(|frame| frame.direct_list_body);
+                                if active_list_owner.is_none() && !parent_frame_owns_comma {
+                                    if let (Some(owner), Some(token_idx)) =
+                                        (active_case_choice_owner, next_non_comment_idx)
+                                    {
+                                        format_stack.audit_condition_sibling(owner.id, token_idx);
+                                    } else {
+                                        format_stack.audit_comma(
+                                            None,
+                                            next_non_comment_idx,
+                                            format_stack.last_paren_stack_frame().is_some_and(
+                                                |frame| frame.semantic_flags.fixed_type_modifier,
+                                            ) || format_stack.has_wrapped_paren_owner_kind(
+                                                FormatIndentedParenOwnerKind::Unpivot,
+                                            ) || is_with_cte_separator,
+                                        );
+                                    }
+                                } else {
+                                    format_stack.audit_comma(
+                                        active_list_owner.map(|(frame_id, _)| frame_id),
+                                        next_non_comment_idx,
+                                        parent_frame_owns_comma
+                                            || format_stack.last_paren_stack_frame().is_some_and(
+                                                |frame| frame.semantic_flags.fixed_type_modifier,
+                                            )
+                                            || format_stack.has_wrapped_paren_owner_kind(
+                                                FormatIndentedParenOwnerKind::Unpivot,
+                                            )
+                                            || is_with_cte_separator,
+                                    );
+                                }
                             }
                         }
                         ";" => {
@@ -19377,7 +19446,8 @@ impl SqlEditorWidget {
                             // first operand of a longer value keeps its own edge.
                             let paren_spans_entire_assignment_value = matches!(
                                 loop_previous_non_comment_token,
-                                Some(SqlToken::Symbol(symbol)) if symbol == ":=" || symbol == "="
+                                Some(SqlToken::Symbol(symbol))
+                                    if symbol == ":=" || symbol == "="
                             )
                                 && matching_paren_close_indices
                                     .get(idx)
@@ -20033,6 +20103,7 @@ impl SqlEditorWidget {
                             let is_mysql_user_variable_prefix = sym == "@"
                                 && immediate_next_token.is_some_and(|token| {
                                     matches!(token, SqlToken::Word(_))
+                                        || matches!(token, SqlToken::String(_))
                                         || matches!(token, SqlToken::Symbol(s) if s == "@")
                                 });
                             let is_unary_sign = matches!(sym.as_str(), "+" | "-")
@@ -20107,7 +20178,7 @@ impl SqlEditorWidget {
             idx += 1;
         }
 
-        let formatted = Self::split_inline_statement_separators(out);
+        let formatted = Self::split_inline_statement_separators(out, mysql_compatible);
         let formatted = Self::trim_code_line_trailing_whitespace(formatted, mysql_compatible);
         #[cfg(test)]
         let frame_alignment_audit =
@@ -23080,6 +23151,28 @@ mod formatter_regression_tests {
             formatted.contains("SET @from = 1;"),
             "clause keyword after @ must not open a clause line break, got:\n{formatted}"
         );
+    }
+
+    #[test]
+    fn mysql_quoted_user_variable_keeps_at_sign_attached() {
+        for db_type in [
+            crate::db::connection::DatabaseType::MySQL,
+            crate::db::connection::DatabaseType::MariaDB,
+        ] {
+            let formatted = SqlEditorWidget::format_for_auto_formatting_with_db_type(
+                "SET @'odd--variable' := 41;\nSELECT @'odd--variable' + 1;",
+                false,
+                Some(db_type),
+            );
+            assert!(
+                formatted.matches("@'odd--variable'").count() == 2,
+                "{db_type:?} quoted user variables must stay lexically attached:\n{formatted}"
+            );
+            assert!(
+                !formatted.contains("@ 'odd--variable'"),
+                "{db_type:?} quoted user variables must not gain whitespace:\n{formatted}"
+            );
+        }
     }
 
     #[test]
@@ -50133,5 +50226,53 @@ mod format_frame_stack_tests {
         assert!(stack.last_block_kind_is("BEGIN"));
         assert!(stack.scoped_indent_is_active(ScopedIndentKind::CursorSql));
         assert_eq!(stack.block_depth(), 1);
+    }
+
+    #[test]
+    fn oracle_wave4_formatting_preserves_execution_statement_boundaries() {
+        let fixture = include_str!("../../../test/final_hardcore.sql");
+        let source = fixture;
+        let mut config = AppConfig::new();
+        config.sql_comma_list_layout = SqlCommaListLayout::Wrapped;
+        let (formatted, _) =
+            SqlEditorWidget::format_for_auto_formatting_with_config_and_frame_alignment_audit(
+                source,
+                Some(crate::db::connection::DatabaseType::Oracle),
+                &config,
+            );
+        let source_statements = crate::db::QueryExecutor::split_script_items_for_db_type(
+            source,
+            Some(crate::db::connection::DatabaseType::Oracle),
+        )
+        .into_iter()
+        .filter(|item| matches!(item, crate::db::ScriptItem::Statement(_)))
+        .count();
+        let formatted_items = crate::db::QueryExecutor::split_script_items_for_db_type(
+            &formatted,
+            Some(crate::db::connection::DatabaseType::Oracle),
+        );
+        let formatted_statements: Vec<&str> = formatted_items
+            .iter()
+            .filter_map(|item| match item {
+                crate::db::ScriptItem::Statement(statement) => Some(statement.as_str()),
+                _ => None,
+            })
+            .collect();
+
+        assert_eq!(
+            formatted_statements.len(),
+            source_statements,
+            "Oracle formatting must preserve execution boundaries; merged statements: {formatted_statements:#?}"
+        );
+        assert_eq!(
+            SqlEditorWidget::format_for_auto_formatting_with_config_and_frame_alignment_audit(
+                &formatted,
+                Some(crate::db::connection::DatabaseType::Oracle),
+                &config,
+            )
+            .0,
+            formatted,
+            "Oracle wave4 formatting should be idempotent"
+        );
     }
 }

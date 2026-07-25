@@ -828,6 +828,28 @@ impl SqlParserEngine {
                     i += 1;
                     continue;
                 }
+                LexMode::BracketQuote => {
+                    let lexical_end = if c == ']' && next == Some(']') {
+                        i + 2
+                    } else {
+                        i + 1
+                    };
+                    on_lexical_span(chars, i, lexical_end, LexicalKind::QuotedIdentifier);
+                    self.append_current_char(c);
+                    if c == ']' {
+                        if next == Some(']') {
+                            self.append_current_char(']');
+                            i += 2;
+                            continue;
+                        }
+                        self.state.lex_mode = LexMode::Idle;
+                        if self.state.pending_end == PendingEnd::End {
+                            self.state.resolve_pending_end_on_separator();
+                        }
+                    }
+                    i += 1;
+                    continue;
+                }
                 LexMode::Idle => {
                     // Fall through to normal code processing below.
                 }
@@ -989,6 +1011,15 @@ impl SqlParserEngine {
                 on_lexical_span(chars, i, i + 1, LexicalKind::QuotedIdentifier);
                 self.state.flush_token();
                 self.state.lex_mode = LexMode::BacktickQuote;
+                self.append_current_char(c);
+                i += 1;
+                continue;
+            }
+
+            if self.state.mysql_mode && c == '[' {
+                on_lexical_span(chars, i, i + 1, LexicalKind::QuotedIdentifier);
+                self.state.flush_token();
+                self.state.lex_mode = LexMode::BracketQuote;
                 self.append_current_char(c);
                 i += 1;
                 continue;

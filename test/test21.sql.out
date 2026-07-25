@@ -1536,8 +1536,8 @@ SELECT err_id,
 -- source: test/test21.sql
 -- db: Oracle
 -- metadata: test Oracle inferred catalog (file-scoped overlay) + Oracle built-ins
--- checked: 1750
--- suggestions checked: 8233
+-- checked: 1747
+-- suggestions checked: 8147
 -- missing: 0
 -- suggestions without type labels: 0
 -- marker: [[word]] means not suggested for the tested prefix

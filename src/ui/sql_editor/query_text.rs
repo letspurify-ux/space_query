@@ -105,7 +105,10 @@ impl PendingTailTokenKind {
             LexMode::SingleQuote | LexMode::QQuote { .. } | LexMode::DollarQuote { .. } => {
                 Self::String
             }
-            LexMode::DoubleQuote | LexMode::BacktickQuote | LexMode::Idle => Self::Word,
+            LexMode::DoubleQuote
+            | LexMode::BacktickQuote
+            | LexMode::BracketQuote
+            | LexMode::Idle => Self::Word,
         }
     }
 
@@ -1123,6 +1126,28 @@ where
             continue;
         }
 
+        if matches!(
+            scan_state.lex_mode,
+            crate::sql_parser_engine::LexMode::BracketQuote
+        ) {
+            current.push(c);
+            if c == ']' {
+                if next == Some(']') {
+                    iter.next();
+                    current.push(']');
+                    continue;
+                }
+                tokens.push(SqlTokenSpan {
+                    token: SqlToken::Word(std::mem::take(&mut current)),
+                    start: current_start,
+                    end: idx + 1,
+                });
+                scan_state.lex_mode = crate::sql_parser_engine::LexMode::Idle;
+                continue;
+            }
+            continue;
+        }
+
         if c.is_whitespace() {
             flush_word(&mut current, &mut current_start, idx, &mut tokens);
             if c == '\n' {
@@ -1291,6 +1316,14 @@ where
             continue;
         }
 
+        if mysql_compatible && c == '[' {
+            flush_word(&mut current, &mut current_start, idx, &mut tokens);
+            current_start = idx;
+            scan_state.lex_mode = crate::sql_parser_engine::LexMode::BracketQuote;
+            current.push('[');
+            continue;
+        }
+
         if !mysql_compatible {
             if let Some(tag) = parse_dollar_quote_tag(sql, idx) {
                 let is_oracle_conditional_flag = tag == "$$"
@@ -1381,13 +1414,21 @@ where
             continue;
         }
 
-        if mysql_compatible
-            && c == '<'
-            && next == Some('=')
-            && sql_bytes.get(idx + 2) == Some(&b'>')
-        {
+        if c == '<' && next == Some('=') && sql_bytes.get(idx + 2) == Some(&b'>') {
             tokens.push(SqlTokenSpan {
                 token: SqlToken::Symbol("<=>".to_string()),
+                start: idx,
+                end: idx + 3,
+            });
+            let _ = iter.next();
+            let _ = iter.next();
+            continue;
+        }
+
+        if c == '<' && matches!(next, Some('-' | '#')) && sql_bytes.get(idx + 2) == Some(&b'>') {
+            let symbol = if next == Some('-') { "<->" } else { "<#>" };
+            tokens.push(SqlTokenSpan {
+                token: SqlToken::Symbol(symbol.to_string()),
                 start: idx,
                 end: idx + 3,
             });

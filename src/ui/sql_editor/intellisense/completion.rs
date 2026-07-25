@@ -3098,8 +3098,8 @@ impl SqlEditorWidget {
         } else {
             None
         };
-        let at_mysql_drop_object_name_slot = qualifier.is_none()
-            && Self::cursor_is_at_mysql_drop_object_name_slot(
+        let at_drop_object_name_slot = qualifier.is_none()
+            && Self::cursor_is_at_drop_object_name_slot(
                 deep_ctx,
                 has_prefix,
                 Some(snapshot.preferred_db_type),
@@ -4138,7 +4138,7 @@ impl SqlEditorWidget {
                 )
                 || (!at_package_declaration_default_value
                     && !in_plsql_executable_block
-                    && !at_mysql_drop_object_name_slot
+                    && !at_drop_object_name_slot
                     && Self::cursor_is_at_ddl_identifier_suppression_slot_for_context(
                         deep_ctx,
                         has_prefix || qualifier.is_some(),
@@ -4497,6 +4497,15 @@ impl SqlEditorWidget {
         } else {
             None
         };
+        let oracle_returning_row_image_column_scope = if qualifier.is_none() {
+            Self::oracle_dml_returning_row_image_column_scope_for_context(
+                deep_ctx,
+                !snapshot.prefix.is_empty(),
+                Some(snapshot.preferred_db_type),
+            )
+        } else {
+            None
+        };
         let multi_table_insert_condition_source = qualifier
             .is_none()
             .then(|| {
@@ -4542,6 +4551,8 @@ impl SqlEditorWidget {
         } else if let Some(scope) = alter_table_check_expression_column_scope.as_ref() {
             scope.clone()
         } else if let Some(scope) = alter_table_partition_column_scope.as_ref() {
+            scope.clone()
+        } else if let Some(scope) = oracle_returning_row_image_column_scope.as_ref() {
             scope.clone()
         } else if let Some(scope) = reference_column_scope.as_ref() {
             scope.clone()
@@ -7420,6 +7431,12 @@ impl SqlEditorWidget {
         };
         // Prefer suffix-anchored exact keywords before broader prefix matches
         // such as `ON` for `ONE` and `INTO` for `IS`.
+        if matches_prefix("IF")
+            && full_previous_word.as_deref() == Some("IGNORE")
+            && matches!(next_word, Some("ABSENT" | "PRESENT"))
+        {
+            return Some("IF".to_string());
+        }
         if matches_prefix("ONE")
             && full_has("MATCH_RECOGNIZE")
             && Self::current_meaningful_word_is_followed_by_word(
@@ -18743,6 +18760,74 @@ impl SqlEditorWidget {
         &[]
     }
 
+    fn expected_oracle_extended_simple_case_choice_candidates(
+        tokens: &[SqlToken],
+        end: usize,
+        db_type: Option<crate::db::DatabaseType>,
+    ) -> &'static [&'static str] {
+        if crate::sql_text::mysql_compatibility_for_sql("", db_type) {
+            return &[];
+        }
+        let limit = end.min(tokens.len());
+        let depths = crate::ui::sql_depth::paren_depths(tokens);
+        let mut case_stack = Vec::new();
+        for (idx, token) in tokens.iter().enumerate().take(limit) {
+            let Some(word) = Self::token_word(token) else {
+                continue;
+            };
+            match word.to_ascii_uppercase().as_str() {
+                "CASE" => case_stack.push(idx),
+                "END" => {
+                    case_stack.pop();
+                }
+                _ => {}
+            }
+        }
+        let Some(case_idx) = case_stack.last().copied() else {
+            return &[];
+        };
+        let case_depth = depths.get(case_idx).copied().unwrap_or_default();
+        let top_level_after_case = tokens
+            .iter()
+            .enumerate()
+            .take(limit)
+            .skip(case_idx + 1)
+            .filter(|(idx, token)| {
+                depths.get(*idx).copied().unwrap_or_default() == case_depth
+                    && !matches!(token, SqlToken::Comment(_))
+            })
+            .collect::<Vec<_>>();
+        let Some(first_when_pos) = top_level_after_case.iter().position(
+            |(_, token)| matches!(token, SqlToken::Word(word) if word.eq_ignore_ascii_case("WHEN")),
+        ) else {
+            return &[];
+        };
+        // Searched CASE begins directly with WHEN. Extended dangling predicates
+        // are legal only when a selector expression precedes the first WHEN.
+        if first_when_pos == 0 {
+            return &[];
+        }
+        let Some(last_when_pos) = top_level_after_case.iter().rposition(
+            |(_, token)| matches!(token, SqlToken::Word(word) if word.eq_ignore_ascii_case("WHEN")),
+        ) else {
+            return &[];
+        };
+        if top_level_after_case[last_when_pos + 1..].iter().any(
+            |(_, token)| matches!(token, SqlToken::Word(word) if word.eq_ignore_ascii_case("THEN")),
+        ) {
+            return &[];
+        }
+        match top_level_after_case.last().map(|(_, token)| *token) {
+            Some(SqlToken::Word(word)) if word.eq_ignore_ascii_case("WHEN") => {
+                &["BETWEEN", "IN", "IS", "LIKE"]
+            }
+            Some(SqlToken::Symbol(symbol)) if symbol == "," => {
+                &["BETWEEN", "IN", "IS", "LIKE"]
+            }
+            _ => &[],
+        }
+    }
+
     fn expected_expression_construct_continuation_keywords_for_context(
         deep_ctx: &intellisense_context::CursorContext,
         exclude_current_identifier_chain: bool,
@@ -25865,6 +25950,36 @@ impl SqlEditorWidget {
         )
     }
 
+    /// Oracle 26ai schema-object families that admit `DROP <obj> IF EXISTS`.
+    /// Compound heads (for example `MATERIALIZED VIEW`) are handled by their
+    /// final name-introducing word.
+    fn is_oracle_if_exists_droppable_object_type(word: &str) -> bool {
+        matches!(
+            word,
+            "CLUSTER"
+                | "CONTEXT"
+                | "DIRECTORY"
+                | "EDITION"
+                | "FUNCTION"
+                | "INDEX"
+                | "INDEXTYPE"
+                | "LIBRARY"
+                | "OPERATOR"
+                | "PACKAGE"
+                | "PROCEDURE"
+                | "PROFILE"
+                | "ROLE"
+                | "SEQUENCE"
+                | "SYNONYM"
+                | "TABLE"
+                | "TABLESPACE"
+                | "TRIGGER"
+                | "TYPE"
+                | "USER"
+                | "VIEW"
+        )
+    }
+
     /// `DROP [TEMPORARY] <object> |` — the object-name slot, where the structural
     /// candidates offer the optional `IF [EXISTS]` prefix but an existing object
     /// name is equally grammatical. Unlike a `CREATE <object> |` slot (a brand-new
@@ -25872,14 +25987,19 @@ impl SqlEditorWidget {
     /// the structural-keyword suppression. Only the bare name slot qualifies; past
     /// the name the DDL-tail handler suppresses, and `DROP <obj> IF EXISTS |` keeps
     /// the catalog on its own.
-    fn cursor_is_at_mysql_drop_object_name_slot(
+    fn cursor_is_at_drop_object_name_slot(
         deep_ctx: &intellisense_context::CursorContext,
         exclude_current_identifier_chain: bool,
         db_type: Option<crate::db::DatabaseType>,
     ) -> bool {
-        if !crate::sql_text::mysql_compatibility_for_sql("", db_type) {
-            return false;
-        }
+        let mysql_compatible = crate::sql_text::mysql_compatibility_for_sql("", db_type);
+        let accepts_object_type = |word: &str| {
+            if mysql_compatible {
+                Self::is_mysql_droppable_object_type(word)
+            } else {
+                Self::is_oracle_if_exists_droppable_object_type(word)
+            }
+        };
         let tokens = deep_ctx.statement_tokens.as_ref();
         let end = Self::expected_suggestion_context_end(
             tokens,
@@ -25889,20 +26009,21 @@ impl SqlEditorWidget {
         let words = Self::words_for_keyword_slot(tokens, end);
         match words.as_slice() {
             [drop, object_type]
-                if drop == "DROP" && Self::is_mysql_droppable_object_type(object_type) =>
+                if drop == "DROP" && accepts_object_type(object_type) =>
             {
                 true
             }
             [drop, temporary, object_type]
                 if drop == "DROP"
+                    && mysql_compatible
                     && temporary == "TEMPORARY"
-                    && Self::is_mysql_droppable_object_type(object_type) =>
+                    && accepts_object_type(object_type) =>
             {
                 true
             }
             [drop, object_type, if_kw, exists]
                 if drop == "DROP"
-                    && Self::is_mysql_droppable_object_type(object_type)
+                    && accepts_object_type(object_type)
                     && if_kw == "IF"
                     && exists == "EXISTS" =>
             {
@@ -25910,8 +26031,9 @@ impl SqlEditorWidget {
             }
             [drop, temporary, object_type, if_kw, exists]
                 if drop == "DROP"
+                    && mysql_compatible
                     && temporary == "TEMPORARY"
-                    && Self::is_mysql_droppable_object_type(object_type)
+                    && accepts_object_type(object_type)
                     && if_kw == "IF"
                     && exists == "EXISTS" =>
             {
@@ -27059,7 +27181,7 @@ impl SqlEditorWidget {
 
     /// Whether the statement-structural keyword slot suppresses the identifier
     /// catalog. It does for every fixed-keyword statement head/tail except the
-    /// MySQL `DROP <object> |` name slot and the `LOCK`/`FLUSH TABLES` table-list
+    /// `DROP <object> |` name slots and the MySQL `LOCK`/`FLUSH TABLES` table-list
     /// slots, where an existing relation name belongs alongside the keywords.
     fn statement_structural_slot_suppresses_identifiers(
         deep_ctx: &intellisense_context::CursorContext,
@@ -27072,7 +27194,7 @@ impl SqlEditorWidget {
             db_type,
         )
         .is_some()
-            && !Self::cursor_is_at_mysql_drop_object_name_slot(
+            && !Self::cursor_is_at_drop_object_name_slot(
                 deep_ctx,
                 exclude_current_identifier_chain,
                 db_type,
@@ -27753,6 +27875,12 @@ impl SqlEditorWidget {
             )
             .is_some()
             || Self::expected_json_function_option_keyword_candidates_for_context(
+                deep_ctx,
+                exclude_current_identifier_chain,
+                db_type,
+            )
+            .is_some()
+            || Self::expected_oracle_function_option_keyword_candidates_for_context(
                 deep_ctx,
                 exclude_current_identifier_chain,
                 db_type,
@@ -28880,7 +29008,7 @@ impl SqlEditorWidget {
     ///
     ///   * `UPDATE t [alias] |`          → `SET`
     ///   * `DELETE FROM t [alias] |`     → `WHERE`
-    ///   * `INSERT INTO t |`             → `VALUES` / `SELECT`
+    ///   * `INSERT INTO t |`             → dialect-valid row/source forms
     ///   * `MERGE INTO t [alias] |`      → `USING`
     ///
     /// Returns `None` while the target is still being typed (the cursor's word is
@@ -28975,6 +29103,13 @@ impl SqlEditorWidget {
         if mysql_compatible && lead == "MERGE" {
             return Some(&[]);
         }
+        if !mysql_compatible
+            && lead == "INSERT"
+            && matches!(phase, SqlPhase::IntoClause)
+            && last.eq_ignore_ascii_case("BY")
+        {
+            return Some(&["NAME"]);
+        }
         let has_set = toks.iter().any(|token| {
             matches!(token, SqlToken::Word(word) if word.eq_ignore_ascii_case("SET"))
         });
@@ -28987,7 +29122,11 @@ impl SqlEditorWidget {
                 Some(&["SET"])
             }
             "INSERT" | "REPLACE" if matches!(phase, SqlPhase::IntoClause) => {
-                Some(&["VALUES", "SELECT"])
+                if mysql_compatible {
+                    Some(&["SET", "VALUES", "SELECT"])
+                } else {
+                    Some(&["SET", "BY NAME", "VALUES", "SELECT"])
+                }
             }
             "MERGE" if matches!(phase, SqlPhase::IntoClause | SqlPhase::MergeTarget) => {
                 Some(&["USING"])
@@ -29744,6 +29883,16 @@ impl SqlEditorWidget {
         Self::token_slice_forms_complete_predicate(&toks)
     }
 
+    fn cursor_follows_complete_predicate_for_db(
+        tokens: &[SqlToken],
+        end: usize,
+        db_type: Option<crate::db::DatabaseType>,
+    ) -> bool {
+        let toks = Self::meaningful_tokens_before(tokens, end);
+        let mysql = crate::sql_text::mysql_compatibility_for_sql("", db_type);
+        Self::token_slice_forms_complete_predicate_at_depth(&toks, 0, mysql)
+    }
+
     /// True when the cursor immediately follows a complete `USING (col, …)` join
     /// condition — the last meaningful token is the `)` closing the column list
     /// whose matching `(` is introduced by `USING`. Like a finished `ON` predicate
@@ -29849,12 +29998,52 @@ impl SqlEditorWidget {
     }
 
     fn token_slice_forms_complete_predicate(toks: &[&SqlToken]) -> bool {
-        Self::token_slice_forms_complete_predicate_at_depth(toks, 0)
+        Self::token_slice_forms_complete_predicate_at_depth(toks, 0, false)
+    }
+
+    fn token_slice_forms_complete_boolean_call(toks: &[&SqlToken]) -> bool {
+        let mut idx = 0usize;
+        if matches!(
+            toks.get(idx),
+            Some(SqlToken::Word(word)) if word.eq_ignore_ascii_case("NOT")
+        ) {
+            idx += 1;
+        }
+
+        if !matches!(toks.get(idx), Some(SqlToken::Word(_))) {
+            return false;
+        }
+        idx += 1;
+        while matches!(
+            (toks.get(idx), toks.get(idx + 1)),
+            (Some(SqlToken::Symbol(dot)), Some(SqlToken::Word(_))) if *dot == "."
+        ) {
+            idx += 2;
+        }
+        if !matches!(toks.get(idx), Some(SqlToken::Symbol(open)) if *open == "(") {
+            return false;
+        }
+
+        let mut depth = 0i32;
+        for (offset, token) in toks[idx..].iter().enumerate() {
+            match token {
+                SqlToken::Symbol(symbol) if *symbol == "(" => depth += 1,
+                SqlToken::Symbol(symbol) if *symbol == ")" => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return idx + offset + 1 == toks.len();
+                    }
+                }
+                _ => {}
+            }
+        }
+        false
     }
 
     fn token_slice_forms_complete_predicate_at_depth(
         toks: &[&SqlToken],
         depth: usize,
+        allow_bare_boolean_call: bool,
     ) -> bool {
         if depth >= MAX_INTELLISENSE_RECURSION_DEPTH {
             return false;
@@ -29901,6 +30090,9 @@ impl SqlEditorWidget {
         if Self::token_slice_forms_complete_is_distinct_from_predicate(conjunct) {
             return true;
         }
+        if allow_bare_boolean_call && Self::token_slice_forms_complete_boolean_call(conjunct) {
+            return true;
+        }
         // Forward state machine over the conjunct at depth 0: a complete predicate
         // ends with an operand and has seen a comparison/predicate operator. An
         // `IS …` predicate is tracked separately (`is_tail`) because its tail
@@ -29939,6 +30131,7 @@ impl SqlEditorWidget {
                         && Self::token_slice_forms_complete_predicate_at_depth(
                             &conjunct[idx + 1..close - 1],
                             depth + 1,
+                            allow_bare_boolean_call,
                         )
                     {
                         saw_predicate_operator = true;
@@ -30027,6 +30220,36 @@ impl SqlEditorWidget {
         end: usize,
         db_type: Option<crate::db::DatabaseType>,
     ) -> Option<&'static [&'static str]> {
+        let original_end = end.min(tokens.len());
+        let depths = crate::ui::sql_depth::paren_depths(tokens);
+        let cursor_depth = tokens
+            .iter()
+            .take(original_end)
+            .fold(0usize, |depth, token| match token {
+                SqlToken::Symbol(symbol) if symbol == "(" || symbol == "[" => depth + 1,
+                SqlToken::Symbol(symbol) if symbol == ")" || symbol == "]" => {
+                    depth.saturating_sub(1)
+                }
+                _ => depth,
+            });
+        // A fallback source can be the whole PL/SQL block. Isolate the innermost
+        // SELECT at the cursor's paren depth so FROMs in earlier statements or a
+        // closed query-valued function argument do not hide the current SELECT
+        // list's FROM slot.
+        let select_start = tokens
+            .iter()
+            .enumerate()
+            .take(original_end)
+            .rev()
+            .find_map(|(idx, token)| {
+                (depths.get(idx).copied().unwrap_or_default() == cursor_depth
+                    && matches!(token, SqlToken::Word(word) if word.eq_ignore_ascii_case("SELECT")))
+                .then_some(idx)
+            })
+            .unwrap_or(0);
+        let tokens = tokens.get(select_start..).unwrap_or(tokens);
+        let end = original_end.saturating_sub(select_start);
+
         let mut depth = 0i32;
         let mut has_top_level_from_before_cursor = false;
         let mut has_top_level_into_before_cursor = false;
@@ -30432,6 +30655,7 @@ impl SqlEditorWidget {
                     "UNIQUE",
                     "FOREIGN KEY",
                     "CHECK",
+                    "PERIOD",
                 ])
             };
         }
@@ -31572,6 +31796,9 @@ impl SqlEditorWidget {
         // A partial multi-word constraint keyword being typed takes precedence
         // over the generic tail (and over the `REFERENCES`-aware inference below).
         match words.as_slice() {
+            [period] if period == "PERIOD" && !crate::sql_text::mysql_compatibility_for_sql("", db_type) => {
+                return Some(&["FOR"]);
+            }
             [.., last] if last == "PRIMARY" => return Some(&["KEY"]),
             [.., last] if last == "FOREIGN" => return Some(&["KEY"]),
             [.., last]
@@ -32664,7 +32891,7 @@ impl SqlEditorWidget {
                 } else if mysql {
                     Some(&["WHERE", "ORDER BY", "LIMIT"])
                 } else {
-                    Some(&["WHERE", "RETURNING"])
+                    Some(&["FROM", "WHERE", "RETURNING"])
                 }
             }
             "DELETE" if has_where && !returning_done && complete_assignment_or_predicate => {
@@ -32925,9 +33152,9 @@ impl SqlEditorWidget {
         phase: intellisense_context::SqlPhase,
         db_type: Option<crate::db::DatabaseType>,
     ) -> Option<&'static [&'static str]> {
-        // Flashback (`AS OF`, `VERSIONS BETWEEN`) is Oracle-only. In MySQL a table's
+        // Flashback and application-time validity are Oracle-only. In MySQL a table's
         // `AS` introduces an alias (a new name), so `OF` must not be offered there.
-        if !phase.is_table_context() || crate::sql_text::mysql_compatibility_for_sql("", db_type) {
+        if crate::sql_text::mysql_compatibility_for_sql("", db_type) {
             return None;
         }
 
@@ -32941,9 +33168,31 @@ impl SqlEditorWidget {
                     && last == "OF"
                     && Self::flashback_as_of_anchor_is_relation(tokens, end) =>
             {
-                Some(&["SCN", "TIMESTAMP"])
+                Some(&["SCN", "TIMESTAMP", "PERIOD"])
             }
-            [.., last] if last == "VERSIONS" => Some(&["BETWEEN"]),
+            [.., as_kw, of, period]
+                if as_kw == "AS"
+                    && of == "OF"
+                    && period == "PERIOD"
+                    && Self::flashback_as_of_anchor_is_relation(tokens, end) =>
+            {
+                Some(&["FOR"])
+            }
+            [.., last]
+                if last == "VERSIONS"
+                    && (phase.is_table_context()
+                        || Self::flashback_versions_anchor_is_relation(tokens, end)) =>
+            {
+                Some(&["BETWEEN", "PERIOD"])
+            }
+            [.., versions, period]
+                if versions == "VERSIONS"
+                    && period == "PERIOD"
+                    && (phase.is_table_context()
+                        || Self::flashback_versions_anchor_is_relation(tokens, end)) =>
+            {
+                Some(&["FOR"])
+            }
             [.., prev, last] if prev == "VERSIONS" && last == "BETWEEN" => {
                 Some(&["SCN", "TIMESTAMP"])
             }
@@ -32957,6 +33206,47 @@ impl SqlEditorWidget {
             }
             _ => None,
         }
+    }
+
+    fn flashback_versions_anchor_is_relation(tokens: &[SqlToken], end: usize) -> bool {
+        let Some(versions_idx) = tokens
+            .iter()
+            .enumerate()
+            .take(end.min(tokens.len()))
+            .rev()
+            .find_map(|(idx, token)| {
+                matches!(token, SqlToken::Word(word) if word.eq_ignore_ascii_case("VERSIONS"))
+                    .then_some(idx)
+            })
+        else {
+            return false;
+        };
+        if !matches!(
+            Self::previous_non_comment_token_index(tokens, versions_idx)
+                .and_then(|idx| tokens.get(idx)),
+            Some(SqlToken::Word(_) | SqlToken::String(_))
+        ) {
+            return false;
+        }
+
+        let depths = crate::ui::sql_depth::paren_depths(tokens);
+        let anchor_depth = depths.get(versions_idx).copied().unwrap_or_default();
+        let mut saw_relation_anchor = false;
+        for idx in (0..versions_idx).rev() {
+            if depths.get(idx).copied().unwrap_or_default() != anchor_depth {
+                continue;
+            }
+            let Some(word) = Self::token_word(&tokens[idx]) else {
+                continue;
+            };
+            match word.to_ascii_uppercase().as_str() {
+                "FROM" | "JOIN" | "APPLY" | "STRAIGHT_JOIN" => saw_relation_anchor = true,
+                "SELECT" => return saw_relation_anchor,
+                "UPDATE" | "DELETE" | "INSERT" | "MERGE" | "INTO" => return false,
+                _ => {}
+            }
+        }
+        false
     }
 
     fn flashback_as_of_anchor_is_relation(tokens: &[SqlToken], end: usize) -> bool {
@@ -32977,6 +33267,26 @@ impl SqlEditorWidget {
                 return false;
             };
             if !as_word.eq_ignore_ascii_case("AS") {
+                return false;
+            }
+            as_idx
+        } else if last.eq_ignore_ascii_case("PERIOD") {
+            let Some(of_idx) = Self::previous_non_comment_token_index(tokens, last_idx) else {
+                return false;
+            };
+            if !matches!(
+                tokens.get(of_idx),
+                Some(SqlToken::Word(word)) if word.eq_ignore_ascii_case("OF")
+            ) {
+                return false;
+            }
+            let Some(as_idx) = Self::previous_non_comment_token_index(tokens, of_idx) else {
+                return false;
+            };
+            if !matches!(
+                tokens.get(as_idx),
+                Some(SqlToken::Word(word)) if word.eq_ignore_ascii_case("AS")
+            ) {
                 return false;
             }
             as_idx
@@ -43728,8 +44038,13 @@ impl SqlEditorWidget {
                 return Some(&["SETS"]);
             }
             if at_group_by_tail {
-                return Some(&["ROLLUP", "CUBE", "GROUPING SETS"]);
+                return Some(&["ALL", "ROLLUP", "CUBE", "GROUPING SETS"]);
             }
+        }
+        if let Some(candidates) =
+            Self::expected_oracle_dml_returning_row_image_candidates(tokens, end, db_type)
+        {
+            return Some(candidates);
         }
         if let Some(candidates) =
             Self::expected_dml_returning_into_keyword_candidates(tokens, end, db_type)
@@ -43784,7 +44099,36 @@ impl SqlEditorWidget {
     }
 
     fn grouping_returning_and_insert_tail_suppresses_columns(candidates: &[&str]) -> bool {
-        !matches!(candidates, ["ROLLUP", "CUBE", "GROUPING SETS"])
+        !candidates
+            .iter()
+            .any(|candidate| matches!(*candidate, "ROLLUP" | "OLD" | "NEW"))
+    }
+
+    fn expected_oracle_dml_returning_row_image_candidates(
+        tokens: &[SqlToken],
+        end: usize,
+        db_type: Option<crate::db::DatabaseType>,
+    ) -> Option<&'static [&'static str]> {
+        if crate::sql_text::mysql_compatibility_for_sql("", db_type)
+            || !Self::top_level_dml_clause_word_present_before(tokens, end, "RETURNING")
+            || Self::cursor_is_at_json_returning_type(tokens, end)
+            || Self::unclosed_paren_count(tokens, end) != 0
+        {
+            return None;
+        }
+
+        let meaningful = Self::meaningful_tokens_before(tokens, end);
+        let returning_idx = meaningful.iter().rposition(
+            |token| matches!(token, SqlToken::Word(word) if word.eq_ignore_ascii_case("RETURNING")),
+        )?;
+        if meaningful[returning_idx + 1..].iter().any(
+            |token| matches!(token, SqlToken::Word(word) if word.eq_ignore_ascii_case("INTO")),
+        ) {
+            return None;
+        }
+        let at_item_start = meaningful.len() == returning_idx + 1
+            || matches!(meaningful.last(), Some(SqlToken::Symbol(symbol)) if symbol == ",");
+        at_item_start.then_some(&["OLD", "NEW"][..])
     }
 
     fn expected_mysql_on_duplicate_after_on_keyword_candidates(
@@ -43878,7 +44222,10 @@ impl SqlEditorWidget {
         // still lacks one. A later `INTO` (after the RETURNING keyword, not the
         // statement-leading `INSERT INTO`) means the bind list has begun.
         let words = Self::words_for_keyword_slot(tokens, end);
-        if words.last().is_some_and(|word| word == "RETURNING") {
+        if words
+            .last()
+            .is_some_and(|word| matches!(word.as_str(), "RETURNING" | "OLD" | "NEW"))
+        {
             return None;
         }
         let into_already = words
@@ -44215,7 +44562,7 @@ impl SqlEditorWidget {
                 // `ORDER BY … LIMIT …`.
                 if mysql
                     && matches!(phase, intellisense_context::SqlPhase::WhereClause)
-                    && Self::cursor_follows_complete_predicate(tokens, end)
+                    && Self::cursor_follows_complete_predicate_for_db(tokens, end, db_type)
                 {
                     return &["ORDER BY", "LIMIT"];
                 }
@@ -44261,13 +44608,15 @@ impl SqlEditorWidget {
             // continuation follow. (`USING (…)` is a column list, not a predicate,
             // so it deliberately does not pick up the `AND`/`OR` conjunction tail.)
             SqlPhase::JoinCondition => {
-                Self::cursor_follows_complete_predicate(tokens, end)
+                Self::cursor_follows_complete_predicate_for_db(tokens, end, db_type)
                     || Self::cursor_follows_complete_using_clause(tokens, end)
             }
             SqlPhase::WhereClause
             | SqlPhase::HavingClause
             | SqlPhase::ConnectByClause
-            | SqlPhase::StartWithClause => Self::cursor_follows_complete_predicate(tokens, end),
+            | SqlPhase::StartWithClause => {
+                Self::cursor_follows_complete_predicate_for_db(tokens, end, db_type)
+            }
             SqlPhase::OrderByClause => {
                 let words = Self::previous_meaningful_words_upper(tokens, end, 2);
                 !matches!(
@@ -44608,7 +44957,7 @@ impl SqlEditorWidget {
             return &[];
         }
 
-        if Self::cursor_follows_complete_predicate(tokens, end) {
+        if Self::cursor_follows_complete_predicate_for_db(tokens, end, db_type) {
             return &["AND", "OR"];
         }
 
@@ -47382,6 +47731,23 @@ impl SqlEditorWidget {
         }
 
         match words.as_slice() {
+            [.., drop, object_type]
+                if drop == "DROP"
+                    && Self::is_oracle_if_exists_droppable_object_type(object_type) =>
+            {
+                if matches!(object_type.as_str(), "PACKAGE" | "TYPE") {
+                    Some(&["BODY", "IF"])
+                } else {
+                    Some(&["IF"])
+                }
+            }
+            [.., drop, object_type, if_kw]
+                if drop == "DROP"
+                    && Self::is_oracle_if_exists_droppable_object_type(object_type)
+                    && if_kw == "IF" =>
+            {
+                Some(&["EXISTS"])
+            }
             [.., prev, last]
                 if *prev == "CREATE" && matches!(last.as_str(), "UNIQUE" | "BITMAP") =>
             {
@@ -55211,6 +55577,18 @@ impl SqlEditorWidget {
             return Self::filter_expected_candidates(prefix, candidates);
         }
         if let Some(candidates) =
+            Self::expected_oracle_function_option_keyword_candidates(tokens, context_end, db_type)
+                .or_else(|| {
+                    Self::expected_oracle_function_option_keyword_candidates(
+                        statement_tokens,
+                        statement_context_end,
+                        db_type,
+                    )
+                })
+        {
+            return Self::filter_expected_candidates(prefix, candidates);
+        }
+        if let Some(candidates) =
             Self::expected_json_function_option_keyword_candidates(tokens, context_end, db_type)
         {
             return Self::filter_expected_candidates(prefix, candidates);
@@ -55886,6 +56264,13 @@ impl SqlEditorWidget {
         let mut tail =
             Self::expected_expression_construct_continuation_keywords(tokens, context_end);
         if tail.is_empty() {
+            tail = Self::expected_oracle_extended_simple_case_choice_candidates(
+                tokens,
+                context_end,
+                db_type,
+            );
+        }
+        if tail.is_empty() {
             let statement_tail = Self::expected_expression_construct_continuation_keywords(
                 statement_tokens,
                 statement_context_end,
@@ -55893,6 +56278,13 @@ impl SqlEditorWidget {
             if !statement_tail.is_empty() {
                 tail = statement_tail;
             }
+        }
+        if tail.is_empty() {
+            tail = Self::expected_oracle_extended_simple_case_choice_candidates(
+                statement_tokens,
+                statement_context_end,
+                db_type,
+            );
         }
         if tail.is_empty() {
             let full_statement_tail = Self::expected_expression_construct_continuation_keywords(
@@ -58974,6 +59366,30 @@ impl SqlEditorWidget {
             {
                 return Some(&["INTERVAL"]);
             }
+            if matches_prefix("OF")
+                && previous_word.is_some_and(|word| word.eq_ignore_ascii_case("AS"))
+                && next_word.is_some_and(|word| word.eq_ignore_ascii_case("PERIOD"))
+            {
+                return Some(&["OF"]);
+            }
+            if matches_prefix("VERSIONS")
+                && next_word.is_some_and(|word| {
+                    matches!(
+                        word.to_ascii_uppercase().as_str(),
+                        "BETWEEN" | "PERIOD"
+                    )
+                })
+            {
+                return Some(&["VERSIONS"]);
+            }
+            if matches_prefix("PERIOD")
+                && next_word.is_some_and(|word| word.eq_ignore_ascii_case("FOR"))
+                && previous_word.is_some_and(|word| {
+                    matches!(word.to_ascii_uppercase().as_str(), "OF" | "VERSIONS")
+                })
+            {
+                return Some(&["PERIOD"]);
+            }
 
             if matches_prefix("ANNOTATIONS")
                 && has("CREATE")
@@ -59047,18 +59463,48 @@ impl SqlEditorWidget {
             }
 
             if has("JSON_TRANSFORM")
-                && ["APPEND", "REMOVE"]
+                && [
+                    "ADD_SET",
+                    "APPEND",
+                    "INSERT",
+                    "KEEP",
+                    "REMOVE",
+                    "REMOVE_SET",
+                    "RENAME",
+                    "REPLACE",
+                    "SET",
+                ]
                     .iter()
                     .any(|keyword| matches_prefix(keyword))
                 && next_is_identifier_or_string
             {
-                return Some(&["APPEND", "REMOVE"]);
+                return Some(&[
+                    "ADD_SET",
+                    "APPEND",
+                    "INSERT",
+                    "KEEP",
+                    "REMOVE",
+                    "REMOVE_SET",
+                    "RENAME",
+                    "REPLACE",
+                    "SET",
+                ]);
             }
             if has("JSON_TRANSFORM")
                 && matches_prefix("IGNORE")
                 && next_word.is_some_and(|word| word.eq_ignore_ascii_case("ON"))
             {
                 return Some(&["IGNORE"]);
+            }
+            if matches_prefix("IF")
+                && next_word.is_some_and(|word| {
+                    matches!(
+                        word.to_ascii_uppercase().as_str(),
+                        "ABSENT" | "PRESENT"
+                    )
+                })
+            {
+                return Some(&["IF"]);
             }
             if has("JSON_TRANSFORM")
                 && matches_prefix("ON")
@@ -59374,7 +59820,13 @@ impl SqlEditorWidget {
                 && Self::innermost_open_paren_preceding_word(tokens, structural_end)
                     .is_some_and(|word| word.eq_ignore_ascii_case("VECTOR"))
             {
-                return Some(&["FLOAT32"]);
+                return Some(&["FLOAT32", "FLOAT64"]);
+            }
+            if matches_prefix("FLOAT64")
+                && Self::innermost_open_paren_preceding_word(tokens, structural_end)
+                    .is_some_and(|word| word.eq_ignore_ascii_case("VECTOR"))
+            {
+                return Some(&["FLOAT32", "FLOAT64"]);
             }
             if matches_prefix("INDENT")
                 && has("XMLSERIALIZE")
@@ -60806,6 +61258,128 @@ impl SqlEditorWidget {
         }
 
         None
+    }
+
+    fn expected_oracle_function_option_keyword_candidates(
+        tokens: &[SqlToken],
+        end: usize,
+        db_type: Option<crate::db::DatabaseType>,
+    ) -> Option<&'static [&'static str]> {
+        if crate::sql_text::mysql_compatibility_for_sql("", db_type) {
+            return None;
+        }
+        let limit = end.min(tokens.len());
+        let open_idx = Self::nearest_unclosed_open_paren_before(tokens, limit)?;
+        let name_idx = Self::previous_non_comment_token_index(tokens, open_idx)?;
+        let name = Self::token_word(tokens.get(name_idx)?)?.to_ascii_uppercase();
+
+        let mut depth = 0i32;
+        let mut argument_index = 0usize;
+        let mut segment_start = open_idx + 1;
+        for (idx, token) in tokens
+            .iter()
+            .enumerate()
+            .take(limit)
+            .skip(open_idx + 1)
+        {
+            match token {
+                SqlToken::Symbol(symbol) if symbol == "(" || symbol == "[" => depth += 1,
+                SqlToken::Symbol(symbol) if symbol == ")" || symbol == "]" => {
+                    depth = (depth - 1).max(0)
+                }
+                SqlToken::Symbol(symbol) if symbol == "," && depth == 0 => {
+                    argument_index += 1;
+                    segment_start = idx + 1;
+                }
+                _ => {}
+            }
+        }
+        let segment = Self::meaningful_tokens_before(
+            tokens.get(segment_start..limit).unwrap_or(&[]),
+            limit.saturating_sub(segment_start),
+        );
+        let words = segment
+            .iter()
+            .filter_map(|token| Self::token_word(token).map(|word| word.to_ascii_uppercase()))
+            .collect::<Vec<_>>();
+        let last = words.last().map(String::as_str);
+
+        match name.as_str() {
+            "TIME_BUCKET" if argument_index == 3 => match words.as_slice() {
+                [] => Some(&["START", "END"]),
+                [.., last] if matches!(last.as_str(), "START" | "END") => {
+                    Some(&["ON OVERFLOW"])
+                }
+                [.., penultimate, last]
+                    if matches!(penultimate.as_str(), "START" | "END") && last == "ON" =>
+                {
+                    Some(&["OVERFLOW"])
+                }
+                [.., penultimate, last] if penultimate == "ON" && last == "OVERFLOW" => {
+                    Some(&["ERROR", "NULL", "ROUND"])
+                }
+                _ => None,
+            },
+            "JSON_SERIALIZE" if argument_index == 0 && words.iter().any(|word| word == "RETURNING") => {
+                if matches!(last, Some("RETURNING")) {
+                    None
+                } else {
+                    Some(&["VALUE", "PRETTY", "ASCII", "ORDERED", "TRUNCATE"])
+                }
+            }
+            "JSON_TRANSFORM" if argument_index >= 1 => {
+                const OPERATIONS: &[&str] = &[
+                    "ADD_SET",
+                    "APPEND",
+                    "INSERT",
+                    "KEEP",
+                    "REMOVE",
+                    "REMOVE_SET",
+                    "RENAME",
+                    "REPLACE",
+                    "SET",
+                ];
+                if segment.is_empty() {
+                    return Some(OPERATIONS);
+                }
+                match last {
+                    Some("IGNORE") => Some(&["IF", "ON"]),
+                    Some("IF") => Some(&["ABSENT", "PRESENT"]),
+                    Some("CREATE" | "REPLACE") => Some(&["ON"]),
+                    Some("ON") => Some(&["MISSING"]),
+                    _ if segment
+                        .iter()
+                        .any(|token| matches!(token, SqlToken::Symbol(symbol) if symbol == "=")) =>
+                    {
+                        Some(&["CREATE", "IGNORE", "REPLACE"])
+                    }
+                    _ => None,
+                }
+            }
+            _ => None,
+        }
+    }
+
+    fn expected_oracle_function_option_keyword_candidates_for_context(
+        deep_ctx: &intellisense_context::CursorContext,
+        exclude_current_identifier_chain: bool,
+        db_type: Option<crate::db::DatabaseType>,
+    ) -> Option<&'static [&'static str]> {
+        let sources = [
+            (
+                Self::current_query_tokens(deep_ctx),
+                Self::cursor_token_len_in_current_query(deep_ctx),
+            ),
+            (deep_ctx.statement_tokens.as_ref(), deep_ctx.cursor_token_len),
+        ];
+        sources.into_iter().find_map(|(tokens, cursor_len)| {
+            let end = Self::expected_suggestion_context_end(
+                tokens,
+                cursor_len,
+                exclude_current_identifier_chain,
+            );
+            Self::expected_oracle_function_option_keyword_candidates(tokens, end, db_type)
+        })
     }
 
     fn matches_string_list_case_insensitive(values: &[String], candidate: &str) -> bool {
@@ -64564,6 +65138,67 @@ impl SqlEditorWidget {
 
         prepend_virtual_alias_if_present(&mut resolved, qualifier, deep_ctx);
         resolved
+    }
+
+    fn oracle_dml_returning_row_image_column_scope_for_context(
+        deep_ctx: &intellisense_context::CursorContext,
+        exclude_current_identifier_chain: bool,
+        db_type: Option<crate::db::DatabaseType>,
+    ) -> Option<Vec<String>> {
+        if crate::sql_text::mysql_compatibility_for_sql("", db_type) {
+            return None;
+        }
+        let tokens = deep_ctx.statement_tokens.as_ref();
+        let end = Self::expected_suggestion_context_end(
+            tokens,
+            deep_ctx.cursor_token_len,
+            exclude_current_identifier_chain,
+        );
+        let previous_idx = Self::previous_non_comment_token_index(tokens, end)?;
+        if !matches!(
+            tokens.get(previous_idx),
+            Some(SqlToken::Word(word))
+                if word.eq_ignore_ascii_case("OLD") || word.eq_ignore_ascii_case("NEW")
+        ) {
+            return None;
+        }
+        if !Self::top_level_dml_clause_word_present_before(tokens, end, "RETURNING") {
+            return None;
+        }
+
+        let anchor_idx =
+            Self::statement_start_anchor_index(tokens, end, &["UPDATE", "INSERT", "DELETE", "MERGE"])?;
+        let head = Self::token_word(tokens.get(anchor_idx)?)?.to_ascii_uppercase();
+        let relation_start = match head.as_str() {
+            "UPDATE" => Self::next_non_comment_token_index(tokens, anchor_idx + 1)?,
+            "INSERT" | "MERGE" => {
+                let into_idx = tokens
+                    .iter()
+                    .enumerate()
+                    .take(end.min(tokens.len()))
+                    .skip(anchor_idx + 1)
+                    .find_map(|(idx, token)| {
+                        matches!(token, SqlToken::Word(word) if word.eq_ignore_ascii_case("INTO"))
+                            .then_some(idx)
+                    })?;
+                Self::next_non_comment_token_index(tokens, into_idx + 1)?
+            }
+            "DELETE" => {
+                let from_idx = tokens
+                    .iter()
+                    .enumerate()
+                    .take(end.min(tokens.len()))
+                    .skip(anchor_idx + 1)
+                    .find_map(|(idx, token)| {
+                        matches!(token, SqlToken::Word(word) if word.eq_ignore_ascii_case("FROM"))
+                            .then_some(idx)
+                    })?;
+                Self::next_non_comment_token_index(tokens, from_idx + 1)?
+            }
+            _ => return None,
+        };
+        let (relation, _) = Self::relation_name_after_insert_into(tokens, relation_start)?;
+        Some(vec![relation])
     }
 
     #[cfg(test)]

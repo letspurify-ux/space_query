@@ -203,6 +203,7 @@ pub const ORACLE_FUNCTIONS: &[&str] = &[
     "JSON_DATAGUIDE",
     "JSON_EQUAL",
     "JSON_EXISTS",
+    "JSON_ID",
     "JSON_MERGEPATCH",
     "JSON_OBJECT",
     "JSON_OBJECTAGG",
@@ -1824,6 +1825,13 @@ const ORACLE_SIGNATURES: &[BuiltinSignature] = &[
         name: "JSON_EXISTS",
         syntaxes: &[
             "JSON_EXISTS(expr [ FORMAT JSON ], JSON_basic_path_expression [ PASSING expr AS identifier [, expr AS identifier ]...] [ { ERROR | TRUE | FALSE } ON ERROR ] [ TYPE ( { STRICT | LAX } ) ] [ { ERROR | TRUE | FALSE } ON EMPTY ])",
+        ],
+        argument_separator_keywords: &[],
+    },
+    BuiltinSignature {
+        name: "JSON_ID",
+        syntaxes: &[
+            "JSON_ID([type])",
         ],
         argument_separator_keywords: &[],
     },

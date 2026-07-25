@@ -159,7 +159,8 @@ fn token_word_text(token: Option<&SqlToken>) -> Option<&str> {
 }
 
 fn push_unique_case_insensitive(values: &mut Vec<String>, value: &str) {
-    let value = value.trim_matches(|ch| ch == '`' || ch == '"').trim();
+    let normalized = crate::sql_text::strip_identifier_quotes(value);
+    let value = normalized.trim();
     if value.is_empty() || values.iter().any(|item| item.eq_ignore_ascii_case(value)) {
         return;
     }
@@ -1130,7 +1131,7 @@ fn script_object_name_at(tokens: &[SqlToken], start_idx: usize) -> Option<(Strin
         last = next;
         idx = next_idx;
     }
-    Some((last.trim_matches('"').to_string(), idx + 1))
+    Some((crate::sql_text::strip_identifier_quotes(last), idx + 1))
 }
 
 fn script_qualified_object_name_at(
@@ -1138,11 +1139,9 @@ fn script_qualified_object_name_at(
     start_idx: usize,
 ) -> Option<(String, String, usize)> {
     let mut idx = start_idx;
-    let mut segments = vec![
-        token_word_text(tokens.get(idx))?
-            .trim_matches(['"', '`'])
-            .to_string(),
-    ];
+    let mut segments = vec![crate::sql_text::strip_identifier_quotes(token_word_text(
+        tokens.get(idx),
+    )?)];
     loop {
         let dot_idx = idx + 1;
         let next_idx = idx + 2;
@@ -1152,7 +1151,7 @@ fn script_qualified_object_name_at(
         let Some(next) = token_word_text(tokens.get(next_idx)) else {
             break;
         };
-        segments.push(next.trim_matches(['"', '`']).to_string());
+        segments.push(crate::sql_text::strip_identifier_quotes(next));
         idx = next_idx;
     }
     let short = segments.last()?.clone();
@@ -4050,6 +4049,15 @@ fn query_clause_continuation_offers_downstream_clause_openers() {
         let got = kw("SELECT a FROM t WHERE a = 1 |", db);
         assert!(has(&got, "LIMIT"), "{db:?} uses LIMIT: {got:?}");
         assert!(!has(&got, "CONNECT BY"), "{db:?} no CONNECT BY: {got:?}");
+
+        let boolean_call = kw(
+            "SELECT a FROM t1 JOIN t2 ON MBRContains(t2.shape, t1.point) AND ST_Contains(t2.shape, t1.point) |",
+            db,
+        );
+        assert!(
+            has(&boolean_call, "JOIN") && has(&boolean_call, "WHERE"),
+            "{db:?} complete boolean function condition should admit another join or clause: {boolean_call:?}"
+        );
     }
 
     // Incomplete / lookalike positions -> no openers.
@@ -4118,11 +4126,20 @@ fn insert_after_column_list_offers_value_source() {
     };
     use crate::db::DatabaseType::{MariaDB, MySQL, Oracle};
     let values_select = vec!["VALUES".to_string(), "SELECT".to_string()];
-    assert_eq!(kw("INSERT INTO emp (a, b) |", Oracle), values_select);
-    assert_eq!(kw("INSERT INTO emp |", Oracle), values_select);
+    assert_eq!(
+        kw("INSERT INTO emp (a, b) |", Oracle),
+        values_select.clone()
+    );
+    assert_eq!(
+        kw("INSERT INTO emp |", Oracle),
+        vec!["SET", "BY NAME", "VALUES", "SELECT"]
+    );
     for db in [MySQL, MariaDB] {
-        assert_eq!(kw("INSERT INTO emp (a, b) |", db), values_select);
-        assert_eq!(kw("REPLACE INTO emp (a) |", db), values_select);
+        assert_eq!(
+            kw("INSERT INTO emp (a, b) |", db),
+            values_select.clone()
+        );
+        assert_eq!(kw("REPLACE INTO emp (a) |", db), values_select.clone());
     }
     // Already-supplied source: no value-source re-emission.
     for sql in [
@@ -27433,6 +27450,112 @@ fn classify_intellisense_context_treats_insert_returning_expression_as_column_co
 }
 
 #[test]
+fn oracle_returning_row_image_modifiers_keep_the_dml_target_column_scope() {
+    use crate::db::DatabaseType::Oracle;
+
+    for sql in [
+        "UPDATE emp SET sal = sal + 1 RETURNING OLD sa| INTO :old_sal",
+        "UPDATE emp SET sal = sal + 1 RETURNING sal, NEW sa| INTO :sal, :new_sal",
+        "DELETE FROM emp WHERE empno = 1 RETURNING OLD emp| INTO :old_empno",
+        "INSERT INTO emp (empno) VALUES (1) RETURNING NEW emp| INTO :new_empno",
+    ] {
+        let context = analyze_inline_cursor_sql(sql);
+        let scope =
+            SqlEditorWidget::oracle_dml_returning_row_image_column_scope_for_context(
+                &context,
+                true,
+                Some(Oracle),
+            );
+        assert_eq!(scope, Some(vec!["emp".to_string()]), "scope for `{sql}`");
+        let tokens = SqlEditorWidget::current_query_tokens(&context);
+        let end = SqlEditorWidget::expected_suggestion_context_end(
+            tokens,
+            SqlEditorWidget::cursor_token_len_in_current_query(&context),
+            true,
+        );
+        let row_image_keywords =
+            SqlEditorWidget::expected_oracle_dml_returning_row_image_candidates(
+                tokens,
+                end,
+                Some(Oracle),
+            );
+        assert_eq!(
+            row_image_keywords, None,
+            "row-image keyword state at a target column for `{sql}`: end={end} tokens={tokens:?}",
+        );
+        assert!(
+            !SqlEditorWidget::cursor_is_at_column_suppressing_keyword_slot_for_db(
+                &context,
+                true,
+                Some(Oracle),
+            ),
+            "row-image target column must not be treated as a keyword-only slot for `{sql}`",
+        );
+    }
+}
+
+#[test]
+fn oracle_returning_item_start_offers_columns_alongside_row_image_modifiers() {
+    use crate::db::DatabaseType::Oracle;
+
+    let (_, keywords, suggestions) =
+        audit_final_suggestions_for("UPDATE emp SET sal = sal + 1 RETURNING | INTO :sal", Oracle);
+    for expected in ["EMPNO", "ENAME", "SAL"] {
+        assert!(
+            suggestions.iter().any(|suggestion| suggestion == expected),
+            "{expected} missing from RETURNING item start: keywords={keywords:?} final={suggestions:?}"
+        );
+    }
+
+    for (sql, expected) in [
+        (
+            "UPDATE emp SET sal = sal + 1 RETURNING sa| INTO :sal",
+            "SAL",
+        ),
+        (
+            "INSERT INTO emp (empno) VALUES (1) RETURNING emp| INTO :empno",
+            "EMPNO",
+        ),
+    ] {
+        let (_, keywords, suggestions) = audit_final_suggestions_for(sql, Oracle);
+        assert!(
+            suggestions.iter().any(|suggestion| suggestion == expected),
+            "{expected} missing at `{sql}`: keywords={keywords:?} final={suggestions:?}"
+        );
+    }
+}
+
+#[test]
+fn oracle_json_transform_set_operations_complete_their_presence_handlers() {
+    use crate::db::DatabaseType::Oracle;
+
+    for sql in [
+        "SELECT JSON_TRANSFORM(payload, ADD_SET '$.tags' = 'x' IGNORE I| PRESENT) FROM t",
+        "SELECT JSON_TRANSFORM(payload, REMOVE_SET '$.tags' = 'x' IGNORE I| ABSENT) FROM t",
+    ] {
+        let context = analyze_inline_cursor_sql(sql);
+        let inferred = SqlEditorWidget::oracle_structural_keyword_inference(
+            "I",
+            &context,
+            Some(Oracle),
+        );
+        assert_eq!(
+            inferred,
+            Some("IF".to_string()),
+            "structural inference at `{sql}`: statement={:?}",
+            context.statement_tokens,
+        );
+        let suggestions = query_keyword_completion_suggestions(sql, Oracle);
+        assert!(
+            suggestions
+                .iter()
+                .any(|suggestion| suggestion.eq_ignore_ascii_case("IF")),
+            "IGNORE IF handler lost IF at `{sql}`: {suggestions:?}",
+        );
+    }
+}
+
+#[test]
 fn resolve_column_tables_for_merge_insert_column_list_prefers_merge_target() {
     let sql_with_cursor =
             "MERGE INTO target_table t USING source_table s ON (t.id = s.id) WHEN NOT MATCHED THEN INSERT (|) VALUES (s.id)";
@@ -29738,7 +29861,11 @@ fn dml_target_continuation_offers_structural_keyword_and_suppresses_relations() 
     assert_eq!(kw("DELETE FROM emp |"), vec!["WHERE"]);
     assert!(det("DELETE FROM emp e |"));
     assert!(det("INSERT INTO emp |"));
-    assert_eq!(kw("INSERT INTO emp |"), vec!["VALUES", "SELECT"]);
+    assert_eq!(
+        kw("INSERT INTO emp |"),
+        vec!["SET", "BY NAME", "VALUES", "SELECT"]
+    );
+    assert_eq!(kw("INSERT INTO emp BY |"), vec!["NAME"]);
     assert!(det("MERGE INTO emp |"));
     assert_eq!(kw("MERGE INTO emp |"), vec!["USING"]);
     assert!(det("MERGE INTO emp e |"));
@@ -33727,8 +33854,6 @@ fn collect_expected_keyword_suggestions_complete_plsql_body_object_tails() {
         "CREATE OR REPLACE PACKAGE |",
         "CREATE TYPE |",
         "CREATE OR REPLACE TYPE |",
-        "DROP PACKAGE |",
-        "DROP TYPE |",
     ] {
         let ctx = analyze_inline_cursor_sql(sql);
         let suggestions = SqlEditorWidget::collect_expected_keyword_suggestions("", &ctx, None);
@@ -33736,6 +33861,16 @@ fn collect_expected_keyword_suggestions_complete_plsql_body_object_tails() {
             suggestions,
             vec!["BODY".to_string()],
             "PL/SQL body tail should complete BODY for `{sql}`"
+        );
+    }
+
+    for sql in ["DROP PACKAGE |", "DROP TYPE |"] {
+        let ctx = analyze_inline_cursor_sql(sql);
+        let suggestions = SqlEditorWidget::collect_expected_keyword_suggestions("", &ctx, None);
+        assert_eq!(
+            suggestions,
+            vec!["BODY".to_string(), "IF".to_string()],
+            "DROP PACKAGE/TYPE accepts either the BODY modifier or IF EXISTS for `{sql}`"
         );
     }
 
@@ -52098,6 +52233,15 @@ fn mysql_family_test_intellisense_data(
             vec!["TABLE_SCHEMA", "TABLE_NAME", "PARTITION_NAME"],
         ),
         (
+            "INFORMATION_SCHEMA.STATISTICS",
+            vec![
+                "TABLE_SCHEMA",
+                "TABLE_NAME",
+                "INDEX_NAME",
+                "IS_VISIBLE",
+            ],
+        ),
+        (
             "MYSQL.HELP_TOPIC",
             vec!["HELP_TOPIC_ID", "NAME", "DESCRIPTION", "EXAMPLE", "URL"],
         ),
@@ -52117,6 +52261,7 @@ fn mysql_family_test_intellisense_data(
             ),
             ("KEYWORDS".to_string(), Some(QualifiedMemberKind::Table)),
             ("PARTITIONS".to_string(), Some(QualifiedMemberKind::Table)),
+            ("STATISTICS".to_string(), Some(QualifiedMemberKind::Table)),
         ],
     );
     push_unique_case_insensitive(&mut data.schemas, "MYSQL");
@@ -53566,23 +53711,22 @@ fn intellisense_sweep_is_mysql_label_definition(
             .is_some_and(|word| matches!(word.to_ascii_uppercase().as_str(), "BEGIN" | "LOOP" | "WHILE" | "REPEAT"))
 }
 
-fn intellisense_sweep_is_mysql_period_name(
+fn intellisense_sweep_is_temporal_period_name(
     sql: &str,
     cursor: usize,
     original_word: &str,
     db_type: crate::db::DatabaseType,
 ) -> bool {
-    if !crate::sql_text::mysql_compatibility_for_sql("", Some(db_type)) {
-        return false;
-    }
     let original = original_word.trim_matches('`');
     let tokens = super::query_text::tokenize_sql(sql);
-    let declared_elsewhere = tokens.windows(4).any(|window| {
-        token_word_eq(window.first(), "PERIOD")
-            && token_word_eq(window.get(1), "FOR")
-            && token_word_text(window.get(2))
-                .is_some_and(|word| word.eq_ignore_ascii_case(original))
-            && matches!(window.get(3), Some(SqlToken::Symbol(symbol)) if symbol == "(")
+    let definition_words = tokens
+        .iter()
+        .filter_map(|token| token_word_text(Some(token)))
+        .collect::<Vec<_>>();
+    let declared_elsewhere = definition_words.windows(3).any(|window| {
+        window[0].eq_ignore_ascii_case("PERIOD")
+            && window[1].eq_ignore_ascii_case("FOR")
+            && window[2].eq_ignore_ascii_case(original)
     });
     if declared_elsewhere {
         return true;
@@ -53605,6 +53749,17 @@ fn intellisense_sweep_is_mysql_period_name(
             .unwrap_or("")
             .trim_start()
             .starts_with('(');
+    let period_reference = ((words.len() >= 5
+        && words
+            .get(words.len() - 5..words.len() - 1)
+            .is_some_and(|tail| tail == ["AS", "OF", "PERIOD", "FOR"]))
+        || (words.len() >= 4
+            && words
+                .get(words.len() - 4..words.len() - 1)
+                .is_some_and(|tail| tail == ["VERSIONS", "PERIOD", "FOR"])))
+        && words
+            .last()
+            .is_some_and(|word| original_upper.starts_with(word.as_str()));
     let portion_reference = words.len() >= 4
         && words.get(words.len() - 4).is_some_and(|word| word == "FOR")
         && words.get(words.len() - 3).is_some_and(|word| word == "PORTION")
@@ -53614,7 +53769,10 @@ fn intellisense_sweep_is_mysql_period_name(
             .is_some_and(|word| original_upper.starts_with(word.as_str()))
         && intellisense_sweep_next_meaningful_word(sql, cursor)
             .is_some_and(|word| word.eq_ignore_ascii_case("FROM"));
-    period_declaration || portion_reference
+    period_declaration
+        || period_reference
+        || (crate::sql_text::mysql_compatibility_for_sql("", Some(db_type))
+            && portion_reference)
 }
 
 fn intellisense_sweep_is_mysql_index_name_definition(
@@ -53950,24 +54108,24 @@ fn intellisense_sweep_is_drop_object_without_create_metadata(
     original_word: &str,
     db_type: crate::db::DatabaseType,
 ) -> bool {
-    if !crate::sql_text::mysql_compatibility_for_sql("", Some(db_type)) {
-        return false;
-    }
     let tokens = intellisense_sweep_current_statement_tokens_before_cursor(sql, cursor);
     let words = tokens
         .iter()
         .filter_map(|token| token_word_text(Some(token)).map(|word| word.to_ascii_uppercase()))
         .collect::<Vec<_>>();
-    let kind = match words.as_slice() {
+    let (kind, has_if_exists) = match words.as_slice() {
         [drop_kw, kind, if_kw, exists_kw, ..]
             if drop_kw == "DROP" && if_kw == "IF" && exists_kw == "EXISTS" =>
         {
-            kind.as_str()
+            (kind.as_str(), true)
         }
-        [drop_kw, kind, ..] if drop_kw == "DROP" => kind.as_str(),
+        [drop_kw, kind, ..] if drop_kw == "DROP" => (kind.as_str(), false),
         _ => return false,
     };
-    if !matches!(kind, "FUNCTION" | "PROCEDURE" | "TRIGGER" | "EVENT") {
+    if !has_if_exists
+        && (!crate::sql_text::mysql_compatibility_for_sql("", Some(db_type))
+            || !matches!(kind, "FUNCTION" | "PROCEDURE" | "TRIGGER" | "EVENT"))
+    {
         return false;
     }
     let object_name = original_word.trim_matches(|ch| matches!(ch, '`' | '"'));
@@ -54430,7 +54588,7 @@ fn intellisense_sweep_is_definition_slot(
     if intellisense_sweep_is_mysql_label_definition(sql, cursor, db_type) {
         return true;
     }
-    if intellisense_sweep_is_mysql_period_name(sql, cursor, original_word, db_type) {
+    if intellisense_sweep_is_temporal_period_name(sql, cursor, original_word, db_type) {
         return true;
     }
     if intellisense_sweep_is_mysql_index_name_definition(sql, cursor, db_type) {
@@ -57299,12 +57457,12 @@ fn registered_keyword_slot_cases() -> Vec<RegisteredKeywordSlotCase> {
         RegisteredKeywordSlotCase {
             db_type: Oracle,
             sql: "SELECT * FROM emp AS OF |",
-            keywords: &["SCN", "TIMESTAMP"],
+            keywords: &["SCN", "TIMESTAMP", "PERIOD"],
         },
         RegisteredKeywordSlotCase {
             db_type: Oracle,
             sql: "SELECT * FROM emp VERSIONS |",
-            keywords: &["BETWEEN"],
+            keywords: &["BETWEEN", "PERIOD"],
         },
         RegisteredKeywordSlotCase {
             db_type: Oracle,
@@ -57444,7 +57602,7 @@ fn registered_keyword_slot_cases() -> Vec<RegisteredKeywordSlotCase> {
         RegisteredKeywordSlotCase {
             db_type: Oracle,
             sql: "INSERT INTO emp |",
-            keywords: &["VALUES", "SELECT"],
+            keywords: &["SET", "BY NAME", "VALUES", "SELECT"],
         },
         RegisteredKeywordSlotCase {
             db_type: Oracle,
@@ -58401,7 +58559,7 @@ fn registered_keyword_slot_cases() -> Vec<RegisteredKeywordSlotCase> {
         RegisteredKeywordSlotCase {
             db_type: Oracle,
             sql: "SELECT deptno, COUNT(*) FROM emp GROUP BY |",
-            keywords: &["ROLLUP", "CUBE", "GROUPING SETS"],
+            keywords: &["ALL", "ROLLUP", "CUBE", "GROUPING SETS"],
         },
         RegisteredKeywordSlotCase {
             db_type: Oracle,
@@ -60271,8 +60429,16 @@ fn specialized_sql_keyword_slots_complete_with_empty_and_two_letter_prefixes() {
         !has(&mysql_sample, "BLOCK"),
         "Oracle SAMPLE BLOCK keyword leaked in MySQL mode: {mysql_sample:?}"
     );
-    assert_keywords("SELECT * FROM emp AS OF |", &["SCN", "TIMESTAMP"], Oracle);
-    assert_keyword("SELECT * FROM emp VERSIONS |", "BETWEEN", Oracle);
+    assert_keywords(
+        "SELECT * FROM emp AS OF |",
+        &["SCN", "TIMESTAMP", "PERIOD"],
+        Oracle,
+    );
+    assert_keywords(
+        "SELECT * FROM emp VERSIONS |",
+        &["BETWEEN", "PERIOD"],
+        Oracle,
+    );
     assert_keywords(
         "SELECT * FROM emp VERSIONS BETWEEN |",
         &["SCN", "TIMESTAMP"],
@@ -62684,7 +62850,7 @@ fn remaining_grouping_returning_and_insert_tail_keyword_slots_are_formalized() {
         (
             Oracle,
             "SELECT deptno, COUNT(*) FROM emp GROUP BY |",
-            &["ROLLUP", "CUBE", "GROUPING SETS"][..],
+            &["ALL", "ROLLUP", "CUBE", "GROUPING SETS"][..],
         ),
         (
             Oracle,
@@ -70506,10 +70672,16 @@ fn unprefixed_dml_and_fk_keyword_slots_do_not_offer_object_catalog() {
         };
 
     let keyword_only_cases: &[(crate::db::DatabaseType, &str, &[&str])] = &[
-        (Oracle, "INSERT INTO emp |", &["VALUES", "SELECT"][..]),
+        (
+            Oracle,
+            "INSERT INTO emp |",
+            &["SET", "BY NAME", "VALUES", "SELECT"][..],
+        ),
         (Oracle, "INSERT INTO emp (a, b) |", &["VALUES", "SELECT"]),
+        (MySQL, "INSERT INTO emp |", &["SET", "VALUES", "SELECT"]),
         (MySQL, "INSERT INTO emp (a, b) |", &["VALUES", "SELECT"]),
         (MySQL, "REPLACE INTO emp (a) |", &["VALUES", "SELECT"]),
+        (MariaDB, "INSERT INTO emp |", &["SET", "VALUES", "SELECT"]),
         (MariaDB, "INSERT INTO emp (a, b) |", &["VALUES", "SELECT"]),
         (MariaDB, "REPLACE INTO emp (a) |", &["VALUES", "SELECT"]),
         (Oracle, "INSERT INTO emp VALUES (1, 2) |", &["RETURNING"]),
@@ -70531,7 +70703,11 @@ fn unprefixed_dml_and_fk_keyword_slots_do_not_offer_object_catalog() {
         ),
         (Oracle, "DELETE FROM emp WHERE a = 1 |", &["RETURNING"]),
         (Oracle, "UPDATE emp SET a = 1 WHERE b = 2 |", &["RETURNING"]),
-        (Oracle, "UPDATE emp SET a = 1 |", &["WHERE", "RETURNING"]),
+        (
+            Oracle,
+            "UPDATE emp SET a = 1 |",
+            &["FROM", "WHERE", "RETURNING"],
+        ),
         (
             MySQL,
             "DELETE FROM emp WHERE a = 1 |",
@@ -72130,7 +72306,7 @@ fn oracle_plsql_requested_completion_regressions_are_suggested() {
         ("SELECT deptno, COUNT(*) FROM emp GROUP |", &["BY"]),
         (
             "SELECT deptno, COUNT(*) FROM emp GROUP BY |",
-            &["ROLLUP", "CUBE", "GROUPING SETS"],
+            &["ALL", "ROLLUP", "CUBE", "GROUPING SETS"],
         ),
     ] {
         let (_kind, keywords, final_suggestions) = audit_final_suggestions_for(sql, Oracle);

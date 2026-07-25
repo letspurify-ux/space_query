@@ -3262,6 +3262,54 @@ fn test_mysql_backtick_identifier_highlighting_uses_quoted_identifier_style() {
 }
 
 #[test]
+fn test_mysql_family_bracket_identifier_highlighting_uses_quoted_identifier_style() {
+    for db_type in [
+        crate::db::connection::DatabaseType::MySQL,
+        crate::db::connection::DatabaseType::MariaDB,
+    ] {
+        let mut highlighter = SqlHighlighter::new();
+        highlighter.set_db_type(db_type);
+        let text = "SELECT [select], [bracket]]name], [semi;--/*comment*/] FROM [mode table]";
+        let styles = highlighter.generate_styles(text);
+
+        for token in [
+            "[select]",
+            "[bracket]]name]",
+            "[semi;--/*comment*/]",
+            "[mode table]",
+        ] {
+            let start = text.find(token).unwrap_or(0);
+            let end = start + token.len();
+            assert!(
+                styles[start..end]
+                    .chars()
+                    .all(|style| style == STYLE_QUOTED_IDENTIFIER),
+                "{db_type:?} {token} should use quoted identifier highlighting"
+            );
+        }
+    }
+}
+
+#[test]
+fn test_mysql_family_multiline_bracket_identifier_carries_lexer_state() {
+    let mut highlighter = SqlHighlighter::new();
+    highlighter.set_db_type(crate::db::connection::DatabaseType::MariaDB);
+
+    let (first_styles, state) =
+        highlighter.generate_styles_for_window("SELECT [line\n", LexerState::Normal);
+    assert_eq!(state, LexerState::InBracketQuote);
+    assert!(first_styles["SELECT ".len()..]
+        .chars()
+        .all(|style| style == STYLE_QUOTED_IDENTIFIER));
+
+    let (second_styles, state) = highlighter.generate_styles_for_window("break] FROM t", state);
+    assert_eq!(state, LexerState::Normal);
+    assert!(second_styles[.."break]".len()]
+        .chars()
+        .all(|style| style == STYLE_QUOTED_IDENTIFIER));
+}
+
+#[test]
 fn test_mysql_double_dash_without_whitespace_is_not_comment_highlighted() {
     let mut highlighter = SqlHighlighter::new();
     highlighter.set_db_type(crate::db::connection::DatabaseType::MySQL);

@@ -350,8 +350,8 @@ JSON_OBJECT('delimiter_trap',@delimiter_trap,'sequence_next',NEXT VALUE FOR mf_e
 -- source: test_mariadb/test9.txt
 -- db: MariaDB
 -- metadata: test_mariadb/test9.txt inferred catalog
--- checked: 1264
--- suggestions checked: 8274
+-- checked: 1263
+-- suggestions checked: 8285
 -- missing: 0
 -- suggestions without type labels: 0
 -- marker: [[word]] means not suggested for the tested prefix

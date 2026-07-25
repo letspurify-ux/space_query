@@ -2182,6 +2182,27 @@ fn test_maybe_inject_rowid_for_editing_keeps_existing_rowid() {
 }
 
 #[test]
+fn test_maybe_inject_rowid_for_editing_skips_flashback_and_temporal_queries() {
+    for sql in [
+        "SELECT ENAME FROM EMP AS OF SCN 123",
+        "SELECT ENAME FROM EMP AS OF TIMESTAMP (SYSTIMESTAMP - INTERVAL '5' SECOND)",
+        "SELECT ENAME FROM EMP AS OF PERIOD FOR validity DATE '2026-02-01'",
+        "SELECT ENAME FROM EMP VERSIONS BETWEEN SCN MINVALUE AND MAXVALUE",
+        "SELECT ENAME FROM EMP VERSIONS PERIOD FOR validity BETWEEN DATE '2026-01-01' AND DATE '2026-02-01'",
+    ] {
+        assert_eq!(
+            QueryExecutor::maybe_inject_rowid_for_editing(sql),
+            sql,
+            "flashback and temporal snapshots must not become editable"
+        );
+        assert!(
+            !QueryExecutor::is_rowid_edit_eligible_query(sql),
+            "flashback and temporal snapshots must not be ROWID-edit eligible"
+        );
+    }
+}
+
+#[test]
 fn test_maybe_inject_rowid_for_editing_injects_for_join_query() {
     let sql = "SELECT e.ENAME, d.DNAME FROM EMP e JOIN DEPT d ON d.DEPTNO = e.DEPTNO";
     let rewritten = QueryExecutor::maybe_inject_rowid_for_editing(sql);
@@ -9532,6 +9553,49 @@ fn test_split_script_items_for_mysql_db_type_keeps_double_dash_arithmetic_as_cod
         stmts,
         vec!["SELECT 5--2", "SELECT 9"],
         "MySQL db-type split must keep `--2` as arithmetic and preserve the next statement: {stmts:?}"
+    );
+}
+
+#[test]
+fn test_split_script_items_for_oracle_keeps_vector_operators_inside_expressions() {
+    let sql = r#"CREATE PROPERTY GRAPH vector_graph
+EDGE TABLES (vector_edges
+    SOURCE KEY (source_id) REFERENCES vector_items (target_id)
+    DESTINATION KEY (target_id) REFERENCES vector_items (target_id)
+);
+
+SELECT target_id,
+       FROM_VECTOR(embedding + VECTOR('[1, 1, 1]', 3, FLOAT32)) AS vector_sum,
+       FROM_VECTOR(embedding * VECTOR('[2, 3, 4]', 3, FLOAT32)) AS vector_product,
+       ROUND(embedding <-> VECTOR('[1, 1, 1]', 3, FLOAT32), 6) AS l2_distance,
+       ROUND(embedding <=> VECTOR('[1, 1, 1]', 3, FLOAT32), 6) AS cosine_distance,
+       ROUND(embedding <#> VECTOR('[1, 1, 1]', 3, FLOAT32), 6) AS neg_dot_product
+FROM vector_items
+ORDER BY target_id;
+
+SELECT FROM_VECTOR(AVG(embedding)) AS centroid
+FROM vector_items;"#;
+    let items = QueryExecutor::split_script_items_for_db_type(
+        sql,
+        Some(crate::db::connection::DatabaseType::Oracle),
+    );
+    let statements = get_statements(&items);
+
+    assert_eq!(
+        statements.len(),
+        3,
+        "Oracle SOURCE KEY must not enable MySQL parsing, and vector operators must not absorb the following statement: {statements:?}"
+    );
+    assert!(
+        statements[1].contains("<->")
+            && statements[1].contains("<=>")
+            && statements[1].contains("<#>"),
+        "all Oracle vector operators should remain in the first expression: {}",
+        statements[1]
+    );
+    assert_eq!(
+        statements[2],
+        "SELECT FROM_VECTOR(AVG(embedding)) AS centroid\nFROM vector_items"
     );
 }
 

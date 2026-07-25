@@ -779,6 +779,182 @@ EXCEPT DISTINCT
 (SELECT 999 FROM DUAL)
 ORDER BY node_id;
 
+-- ULTRA WAVE 4: native vectors + UUIDv7 + INET6, a live mid-script lexer-mode
+-- transition, square-bracket identifiers, a nonstandard multi-symbol delimiter,
+-- parameterized cursor FOR / forward and reverse range FOR loops, EXECUTE
+-- IMMEDIATE binds, DML RETURNING, Oracle-mode MINUS, and temporal history ranges.
+CREATE TABLE sq_hard_w4_vector_asset (
+  asset_id    INT NOT NULL,
+  asset_uuid  UUID NOT NULL DEFAULT (UUID_v7()),
+  asset_name  VARCHAR(30) NOT NULL,
+  embedding   VECTOR(3) NOT NULL,
+  source_addr INET6 NOT NULL,
+  metadata    JSON NOT NULL,
+  PRIMARY KEY (asset_id),
+  UNIQUE KEY uk_sq_hard_w4_asset_uuid (asset_uuid),
+  VECTOR INDEX vx_sq_hard_w4_embedding (embedding)
+    M = 4 DISTANCE = cosine,
+  CONSTRAINT chk_sq_hard_w4_metadata CHECK (JSON_VALID(metadata))
+) ENGINE = InnoDB;
+
+INSERT INTO sq_hard_w4_vector_asset (
+  asset_id, asset_name, embedding, source_addr, metadata
+) VALUES
+  (1, 'alpha', VEC_FromText('[1,2,3]'), '2001:db8::1',
+   JSON_OBJECT('tags', JSON_ARRAY('sql', 'vector'))),
+  (2, 'beta', VEC_FromText('[2,2,2]'), '10.0.0.2',
+   JSON_OBJECT('tags', JSON_ARRAY('nearest'))),
+  (3, 'gamma', VEC_FromText('[0,1,0]'), '2001:db8::3',
+   JSON_OBJECT('tags', JSON_ARRAY('archive')));
+
+WITH vector_distances AS (
+  SELECT a.asset_id, a.asset_name,
+         CAST(a.asset_uuid AS CHAR) AS uuid_text,
+         CAST(a.source_addr AS CHAR) AS address_text,
+         VEC_ToText(a.embedding) AS vector_text,
+         VEC_DISTANCE_COSINE(
+           a.embedding, VEC_FromText('[1,1,1]')
+         ) AS cosine_distance,
+         VEC_DISTANCE_EUCLIDEAN(
+           a.embedding, VEC_FromText('[1,1,1]')
+         ) AS euclidean_distance
+  FROM sq_hard_w4_vector_asset a
+)
+SELECT asset_id, asset_name, uuid_text, address_text, vector_text,
+       cosine_distance, euclidean_distance,
+       ROW_NUMBER() OVER (
+         ORDER BY cosine_distance, asset_id
+       ) AS nearest_rank
+FROM vector_distances
+ORDER BY cosine_distance, asset_id;
+
+-- The client must keep parsing across a real mode transition. MSSQL enables
+-- square brackets, ANSI_QUOTES, and PIPES_AS_CONCAT; NO_BACKSLASH_ESCAPES
+-- changes the string lexer at the same boundary.
+SET @sq_hard_w4_saved_mode = @@SESSION.sql_mode;
+SET SESSION sql_mode = CONCAT(
+  @sq_hard_w4_saved_mode,
+  ',MSSQL,NO_BACKSLASH_ESCAPES'
+);
+
+CREATE TABLE [mode table] (
+  [select]        INT NOT NULL PRIMARY KEY,
+  [semi colon]    VARCHAR(80) NOT NULL,
+  [bracket]]name] VARCHAR(80) NOT NULL
+);
+
+INSERT INTO [mode table] (
+  [select], [semi colon], [bracket]]name]
+) VALUES
+  (1, 'C:\tmp\semi;--literal', 'left/*middle*/right'),
+  (2, 'DELIMITER |!| $$ //', 'bracket]value');
+
+SET @sq_hard_w4_pipe_concat = 'left' || '/' || 'right';
+SET @'odd--variable' := 41;
+
+SELECT [select],
+       'left' || '/' || 'right' AS [pipe||alias],
+       [semi colon],
+       [bracket]]name],
+       @'odd--variable' + [select] AS [quoted user variable]
+FROM [mode table]
+ORDER BY [select];
+
+SET SESSION sql_mode = @sq_hard_w4_saved_mode;
+
+-- |!| is intentionally unlike either delimiter used above. Its exact bytes
+-- also occur inside a quoted literal in the body.
+DELIMITER |!|
+CREATE PROCEDURE sq_hard_w4_walk(OUT total_out INT)
+outer_w4: BEGIN
+  DECLARE asset_total   INT DEFAULT 0;
+  DECLARE forward_total INT DEFAULT 0;
+  DECLARE reverse_total INT DEFAULT 0;
+  DECLARE cur_asset CURSOR(p_floor INT) FOR
+    SELECT asset_id
+    FROM sq_hard_w4_vector_asset
+    WHERE asset_id >= p_floor
+    ORDER BY asset_id;
+
+  FOR asset_rec IN cur_asset(2) DO
+    SET asset_total = asset_total + asset_rec.asset_id;
+  END FOR;
+
+  FOR i IN 1..3 DO
+    SET forward_total = forward_total + i;
+  END FOR;
+
+  FOR j IN REVERSE 1..3 DO
+    SET reverse_total = reverse_total + j;
+  END FOR;
+
+  SET @sq_hard_w4_dyn_id = 3;
+  SET @sq_hard_w4_dyn_text = 'dynamic; -- /* */';
+  EXECUTE IMMEDIATE
+    'INSERT INTO `mode table` (`select`, `semi colon`, `bracket]name`)
+     VALUES (?, ?, ?)'
+    USING @sq_hard_w4_dyn_id,
+          @sq_hard_w4_dyn_text,
+          @sq_hard_w4_dyn_text;
+
+  SET @sq_hard_w4_delimiter_literal =
+    '|!| inside literal; $$ and // stay inert';
+  SET total_out = asset_total + forward_total + reverse_total;
+END outer_w4|!|
+DELIMITER ;
+
+CALL sq_hard_w4_walk(@sq_hard_w4_walk_total);
+
+-- MariaDB returns rows from both the duplicate-update branch and REPLACE /
+-- DELETE. The latter pair is rollback-only and must leave no asset 9 behind.
+INSERT INTO sq_hard_w4_vector_asset (
+  asset_id, asset_uuid, asset_name, embedding, source_addr, metadata
+) VALUES (
+  1, UUID_v7(), 'alpha-upsert', VEC_FromText('[9,9,9]'), '10.0.0.1',
+  JSON_OBJECT('tags', JSON_ARRAY('updated'))
+)
+ON DUPLICATE KEY UPDATE
+  asset_name = VALUES(asset_name),
+  metadata = VALUES(metadata)
+RETURNING asset_id, asset_name, VEC_ToText(embedding) AS retained_vector;
+
+START TRANSACTION;
+REPLACE INTO sq_hard_w4_vector_asset (
+  asset_id, asset_name, embedding, source_addr, metadata
+) VALUES (
+  9, 'temporary', VEC_FromText('[9,0,0]'), '2001:db8::9',
+  JSON_OBJECT('tags', JSON_ARRAY('temporary'))
+)
+RETURNING asset_id, asset_name, source_addr;
+
+DELETE FROM sq_hard_w4_vector_asset
+WHERE asset_id = 9
+RETURNING asset_id, asset_name, source_addr;
+ROLLBACK;
+
+-- The same input switches dialect spelling and switches back. Parenthesized
+-- owners force MINUS to be distinguished from arithmetic subtraction.
+SET @sq_hard_w4_saved_mode = @@SESSION.sql_mode;
+SET SESSION sql_mode = CONCAT(@sq_hard_w4_saved_mode, ',ORACLE');
+(SELECT asset_id FROM sq_hard_w4_vector_asset)
+MINUS
+(SELECT asset_id
+ FROM sq_hard_w4_vector_asset
+ WHERE asset_id = 2)
+ORDER BY asset_id;
+SET SESSION sql_mode = @sq_hard_w4_saved_mode;
+
+-- BETWEEN is a third system-time shape after AS OF and ALL. DELETE HISTORY is
+-- deliberately a no-op but exercises its statement boundary and timestamp arm.
+SELECT id, valid_from, valid_to, v, row_start, row_end
+FROM versioned
+FOR SYSTEM_TIME BETWEEN
+  (@version_cutover - INTERVAL 1 SECOND) AND NOW(6)
+ORDER BY id, row_start, valid_from;
+
+DELETE HISTORY FROM versioned
+BEFORE SYSTEM_TIME TIMESTAMP '2000-01-01 00:00:00';
+
 -- Wave-3 self-verification.
 CALL sq_hard_assert(@pack_probe = 42 AND sq_hard_pack.fortytwo() = 42,
                     'package procedure/function');
@@ -834,7 +1010,68 @@ CALL sq_hard_assert(
   'dynamic columns'
 );
 
+-- Wave-4 self-verification.
+CALL sq_hard_assert(
+  (SELECT COUNT(*) FROM sq_hard_w4_vector_asset) = 3 AND
+  (SELECT COUNT(*) FROM sq_hard_w4_vector_asset WHERE asset_id = 9) = 0,
+  'vector rows + returning rollback'
+);
+CALL sq_hard_assert(
+  (SELECT asset_id
+   FROM sq_hard_w4_vector_asset
+   ORDER BY VEC_DISTANCE_COSINE(
+              embedding, VEC_FromText('[1,1,1]')
+            ),
+            asset_id
+   LIMIT 1) = 2,
+  'cosine nearest vector'
+);
+CALL sq_hard_assert(
+  (SELECT COUNT(*)
+   FROM sq_hard_w4_vector_asset
+   WHERE SUBSTRING(CAST(asset_uuid AS CHAR), 15, 1) = '7') = 3,
+  'uuid v7 defaults'
+);
+CALL sq_hard_assert(
+  (SELECT asset_name FROM sq_hard_w4_vector_asset WHERE asset_id = 1) =
+    'alpha-upsert' AND
+  JSON_VALUE(
+    (SELECT metadata
+     FROM sq_hard_w4_vector_asset
+     WHERE asset_id = 1),
+    '$.tags[0]'
+  ) = 'updated',
+  'upsert returning branch'
+);
+CALL sq_hard_assert(
+  (SELECT COUNT(*) FROM `mode table`) = 3 AND
+  (SELECT `bracket]name`
+   FROM `mode table`
+   WHERE `select` = 3) = 'dynamic; -- /* */',
+  'mode transition + dynamic insert'
+);
+CALL sq_hard_assert(
+  @sq_hard_w4_walk_total = 17 AND
+  @sq_hard_w4_pipe_concat = 'left/right' AND
+  @'odd--variable' = 41,
+  'parameter cursor + loop + lexer mode'
+);
+CALL sq_hard_assert(
+  @sq_hard_w4_delimiter_literal =
+    '|!| inside literal; $$ and // stay inert',
+  'custom delimiter literal'
+);
+CALL sq_hard_assert(
+  (SELECT COUNT(*)
+   FROM versioned
+   FOR SYSTEM_TIME BETWEEN
+     (@version_cutover - INTERVAL 1 SECOND) AND NOW(6)) >= 6,
+  'system-time between range'
+);
+
 SELECT 'PASS' AS final_status,
        VERSION() AS server_version,
        (SELECT COUNT(*) FROM metric) AS metric_rows,
-       @walk_total AS walk_total;
+       @walk_total AS walk_total,
+       (SELECT COUNT(*) FROM sq_hard_w4_vector_asset) AS vector_rows,
+       @sq_hard_w4_walk_total AS wave4_total;

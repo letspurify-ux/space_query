@@ -32,6 +32,9 @@ BEGIN
     SELECT 'DROP DOMAIN sq_hard_share_d' FROM dual UNION ALL
     SELECT 'DROP TABLE sq_hard_node_dim PURGE' FROM dual UNION ALL
     SELECT 'DROP TABLE sq_hard_w3_log PURGE' FROM dual UNION ALL
+    SELECT 'DROP TABLE sq_hard_w4_temporal PURGE' FROM dual UNION ALL
+    SELECT 'DROP TABLE sq_hard_w4_source PURGE' FROM dual UNION ALL
+    SELECT 'DROP TABLE sq_hard_w4_target PURGE' FROM dual UNION ALL
     SELECT 'DROP PROPERTY GRAPH sq_hard_graph' FROM dual UNION ALL
     SELECT 'DROP VIEW sq_hard_dv' FROM dual UNION ALL
     SELECT 'DROP MATERIALIZED VIEW sq_hard_mv' FROM dual UNION ALL
@@ -1530,6 +1533,310 @@ END;
 /
 
 --------------------------------------------------------------------------------
+-- ULTRA WAVE 4: 26ai non-positional INSERT, direct-join UPDATE, OLD/NEW
+-- RETURNING, GROUP BY ALL, TIME_BUCKET, vector arithmetic/aggregation/distance
+-- operators, query-fed JSON_ARRAY, JSON set transforms, JSON_ID, Temporal
+-- Validity, DDL IF EXISTS/IF NOT EXISTS, and extended PL/SQL CASE controls.
+--------------------------------------------------------------------------------
+DROP TABLE IF EXISTS sq_hard_w4_absent PURGE;
+
+CREATE TABLE IF NOT EXISTS sq_hard_w4_target (
+  target_id   NUMBER CONSTRAINT sq_hard_w4_target_pk PRIMARY KEY,
+  node_id     NUMBER NOT NULL,
+  target_name VARCHAR2(30) NOT NULL,
+  amount      NUMBER(10, 2) NOT NULL,
+  embedding   VECTOR(3, FLOAT32) NOT NULL,
+  payload     JSON NOT NULL
+) TABLESPACE users;
+
+-- SET makes each target/value association explicit; the next INSERT reverses
+-- every source column so BY NAME, not position, must resolve the mapping.
+INSERT INTO sq_hard_w4_target SET
+  target_id = 1,
+  node_id = 1,
+  target_name = 'alpha',
+  amount = 10,
+  embedding = VECTOR('[1, 2, 3]', 3, FLOAT32),
+  payload = JSON_OBJECT(
+    'tags' VALUE JSON_ARRAY('core', 'sql')
+    RETURNING JSON
+  );
+
+INSERT INTO sq_hard_w4_target BY NAME
+SELECT JSON_OBJECT(
+         'tags' VALUE JSON_ARRAY('edge')
+         RETURNING JSON
+       )                                           AS payload,
+       VECTOR('[2, 2, 2]', 3, FLOAT32)             AS embedding,
+       20                                          AS amount,
+       'beta'                                      AS target_name,
+       2                                           AS node_id,
+       2                                           AS target_id;
+
+CREATE TABLE sq_hard_w4_source (
+  target_id  NUMBER CONSTRAINT sq_hard_w4_source_pk PRIMARY KEY,
+  new_amount NUMBER(10, 2) NOT NULL
+) TABLESPACE users;
+
+INSERT INTO sq_hard_w4_source VALUES (2, 25);
+
+UPDATE sq_hard_w4_target t
+SET t.amount = s.new_amount
+FROM sq_hard_w4_source s
+WHERE s.target_id = t.target_id;
+
+--------------------------------------------------------------------------------
+-- RETURNING sees both row images. The simple CASE mixes a choice list with
+-- dangling predicates; this is PL/SQL-only grammar despite looking like SQL.
+--------------------------------------------------------------------------------
+DECLARE
+  old_amount NUMBER;
+  new_amount NUMBER;
+  probe      PLS_INTEGER := 25;
+  band_name  VARCHAR2(20);
+BEGIN
+  UPDATE sq_hard_w4_target
+  SET amount = amount + 5
+  WHERE target_id = 1
+  RETURNING OLD amount, NEW amount INTO old_amount, new_amount;
+
+  band_name :=
+    CASE probe
+      WHEN < 0, > 100 THEN 'invalid'
+      WHEN 0, IS NULL THEN 'empty'
+      WHEN BETWEEN 20 AND 29, 42 THEN 'boss'
+      ELSE 'ordinary'
+    END;
+
+  IF old_amount <> 10 OR new_amount <> 15 OR band_name <> 'boss' THEN
+    RAISE_APPLICATION_ERROR(
+      -20061,
+      'old/new/case ' || old_amount || '/' || new_amount || '/' || band_name
+    );
+  END IF;
+END;
+/
+
+--------------------------------------------------------------------------------
+-- GROUP BY ALL infers both non-aggregate expressions; TIME_BUCKET has two
+-- interval-like argument families and a bare START control token.
+--------------------------------------------------------------------------------
+SELECT node_id,
+       UPPER(target_name)                                  AS normalized_name,
+       SUM(amount)                                         AS total_amount,
+       SUM(CASE WHEN amount >= 20 THEN amount ELSE 0 END)  AS filtered_amount,
+       COUNT(CASE WHEN target_name LIKE '%a' THEN 1 END)   AS matched_names
+FROM sq_hard_w4_target
+GROUP BY ALL
+ORDER BY node_id, normalized_name;
+
+SELECT TIME_BUCKET(
+         TIMESTAMP '2026-01-03 10:37:00',
+         INTERVAL '15' MINUTE,
+         TIMESTAMP '2026-01-01 00:00:00',
+         START
+       ) AS bucket_start,
+       TIME_BUCKET(
+         DATE '2026-03-10',
+         'P1Y',
+         DATE '2024-02-29',
+         START ON OVERFLOW ROUND
+       ) AS leap_bucket
+FROM dual;
+
+--------------------------------------------------------------------------------
+-- The three vector distance operators intentionally collide with ordinary
+-- comparison/comment punctuation. Addition and Hadamard multiplication return
+-- vectors, while AVG changes the element format to FLOAT64.
+--------------------------------------------------------------------------------
+SELECT target_id,
+       FROM_VECTOR(
+         embedding + VECTOR('[1, 1, 1]', 3, FLOAT32)
+       )                                                       AS vector_sum,
+       FROM_VECTOR(
+         embedding * VECTOR('[2, 3, 4]', 3, FLOAT32)
+       )                                                       AS vector_product,
+       ROUND(
+         embedding <-> VECTOR('[1, 1, 1]', 3, FLOAT32), 6
+       )                                                       AS l2_distance,
+       ROUND(
+         embedding <=> VECTOR('[1, 1, 1]', 3, FLOAT32), 6
+       )                                                       AS cosine_distance,
+       ROUND(
+         embedding <#> VECTOR('[1, 1, 1]', 3, FLOAT32), 6
+       )                                                       AS neg_dot_product
+FROM sq_hard_w4_target
+ORDER BY target_id;
+
+SELECT FROM_VECTOR(AVG(embedding)) AS centroid
+FROM sq_hard_w4_target;
+
+--------------------------------------------------------------------------------
+-- A complete subquery is the single JSON_ARRAY argument. The transform then
+-- treats tags as a mathematical set, including its two specialized handlers.
+--------------------------------------------------------------------------------
+SELECT JSON_SERIALIZE(
+         JSON_ARRAY(
+           SELECT JSON_OBJECT(
+                    'id' VALUE target_id,
+                    'name' VALUE target_name
+                    RETURNING JSON
+                  )
+           FROM sq_hard_w4_target
+           ORDER BY target_id
+         )
+         RETURNING CLOB VALUE PRETTY ORDERED
+       ) AS target_array
+FROM dual;
+
+UPDATE sq_hard_w4_target
+SET payload = JSON_TRANSFORM(
+      payload,
+      ADD_SET '$.tags' = 'wave4' IGNORE IF PRESENT,
+      REMOVE_SET '$.tags' = 'ghost' IGNORE IF ABSENT
+    );
+
+SELECT target_id,
+       JSON_SERIALIZE(
+         payload
+         RETURNING VARCHAR2(400) ORDERED
+       )                                                       AS ordered_payload,
+       RAWTOHEX(JSON_ID('UUID'))                               AS generated_uuid
+FROM sq_hard_w4_target
+ORDER BY target_id;
+
+--------------------------------------------------------------------------------
+-- Temporal Validity has its own PERIOD owner. AS OF returns rows valid at one
+-- instant; VERSIONS returns rows intersecting an application-time interval.
+--------------------------------------------------------------------------------
+CREATE TABLE sq_hard_w4_temporal (
+  temporal_id NUMBER CONSTRAINT sq_hard_w4_temporal_pk PRIMARY KEY,
+  label_name  VARCHAR2(30) NOT NULL,
+  valid_from  DATE NOT NULL,
+  valid_to    DATE NOT NULL,
+  PERIOD FOR validity (valid_from, valid_to)
+) TABLESPACE users;
+
+INSERT INTO sq_hard_w4_temporal VALUES
+  (1, 'winter', DATE '2026-01-01', DATE '2026-04-01'),
+  (2, 'summer', DATE '2026-04-01', DATE '2026-10-01'),
+  (3, 'winter-next', DATE '2027-01-01', DATE '2027-04-01');
+
+SELECT temporal_id, label_name
+FROM sq_hard_w4_temporal
+AS OF PERIOD FOR validity DATE '2026-02-01'
+ORDER BY temporal_id;
+
+SELECT temporal_id, label_name, valid_from, valid_to
+FROM sq_hard_w4_temporal
+VERSIONS PERIOD FOR validity
+BETWEEN DATE '2026-03-01' AND DATE '2026-05-01'
+ORDER BY temporal_id;
+
+--------------------------------------------------------------------------------
+-- Wave-4 self-verification.
+--------------------------------------------------------------------------------
+DECLARE
+  target_rows    PLS_INTEGER;
+  amount_total   NUMBER;
+  beta_amount    NUMBER;
+  tagged_rows    PLS_INTEGER;
+  temporal_asof  PLS_INTEGER;
+  temporal_range PLS_INTEGER;
+  json_items     PLS_INTEGER;
+  uuid_bytes     PLS_INTEGER;
+  centroid_gap   NUMBER;
+  bucket_start   TIMESTAMP;
+BEGIN
+  SELECT COUNT(*), SUM(amount)
+  INTO target_rows, amount_total
+  FROM sq_hard_w4_target;
+
+  SELECT amount
+  INTO beta_amount
+  FROM sq_hard_w4_target
+  WHERE target_id = 2;
+
+  SELECT COUNT(*)
+  INTO tagged_rows
+  FROM sq_hard_w4_target t
+  WHERE JSON_EXISTS(t.payload, '$.tags[*]?(@ == "wave4")');
+
+  SELECT COUNT(*)
+  INTO temporal_asof
+  FROM sq_hard_w4_temporal
+  AS OF PERIOD FOR validity DATE '2026-02-01';
+
+  SELECT COUNT(*)
+  INTO temporal_range
+  FROM sq_hard_w4_temporal
+  VERSIONS PERIOD FOR validity
+  BETWEEN DATE '2026-03-01' AND DATE '2026-05-01';
+
+  SELECT JSON_VALUE(
+           JSON_ARRAY(
+             SELECT target_id
+             FROM sq_hard_w4_target
+             ORDER BY target_id
+           ),
+           '$.size()' RETURNING NUMBER
+         )
+  INTO json_items
+  FROM dual;
+
+  SELECT UTL_RAW.LENGTH(JSON_ID('UUID'))
+  INTO uuid_bytes
+  FROM dual;
+
+  SELECT VECTOR_DISTANCE(
+           AVG(embedding),
+           VECTOR('[1.5, 2, 2.5]', 3, FLOAT64),
+           EUCLIDEAN
+         )
+  INTO centroid_gap
+  FROM sq_hard_w4_target;
+
+  SELECT TIME_BUCKET(
+           TIMESTAMP '2026-01-03 10:37:00',
+           INTERVAL '15' MINUTE,
+           TIMESTAMP '2026-01-01 00:00:00',
+           START
+         )
+  INTO bucket_start
+  FROM dual;
+
+  IF target_rows <> 2 OR amount_total <> 40 OR beta_amount <> 25 THEN
+    RAISE_APPLICATION_ERROR(
+      -20062,
+      'non-positional/update-from ' ||
+      target_rows || '/' || amount_total || '/' || beta_amount
+    );
+  END IF;
+  IF tagged_rows <> 2 OR json_items <> 2 OR uuid_bytes <> 16 THEN
+    RAISE_APPLICATION_ERROR(
+      -20063,
+      'json wave4 ' || tagged_rows || '/' || json_items || '/' || uuid_bytes
+    );
+  END IF;
+  IF temporal_asof <> 1 OR temporal_range <> 2 THEN
+    RAISE_APPLICATION_ERROR(
+      -20064,
+      'temporal wave4 ' || temporal_asof || '/' || temporal_range
+    );
+  END IF;
+  IF ABS(centroid_gap) > 0.000001 THEN
+    RAISE_APPLICATION_ERROR(-20065, 'vector centroid ' || centroid_gap);
+  END IF;
+  IF bucket_start <> TIMESTAMP '2026-01-03 10:30:00' THEN
+    RAISE_APPLICATION_ERROR(
+      -20066,
+      'time bucket ' || TO_CHAR(bucket_start, 'YYYY-MM-DD HH24:MI:SS')
+    );
+  END IF;
+END;
+/
+
+--------------------------------------------------------------------------------
 -- Final self-verification and PASS banner.
 --------------------------------------------------------------------------------
 DECLARE
@@ -1583,8 +1890,8 @@ PROMPT [ORACLE HARDCORE] PASS
 -- source: test/final_hardcore.sql
 -- db: Oracle
 -- metadata: test Oracle inferred catalog (file-scoped overlay) + Oracle built-ins
--- checked: 3469
--- suggestions checked: 15751
+-- checked: 3952
+-- suggestions checked: 18125
 -- missing: 0
 -- suggestions without type labels: 0
 -- marker: [[word]] means not suggested for the tested prefix

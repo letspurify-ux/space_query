@@ -16,6 +16,7 @@ pub const ORACLE_SQL_KEYWORDS: &[&str] = &[
     "ACCESSIBLE",
     "ACCOUNT",
     "ADD",
+    "ADD_SET",
     "ADMINISTER",
     "ADVISE",
     "AFTER",
@@ -193,6 +194,7 @@ pub const ORACLE_SQL_KEYWORDS: &[&str] = &[
     "FIRST_VALUE",
     "FLASHBACK",
     "FLOAT32",
+    "FLOAT64",
     "FOLLOWING",
     "FOLLOWS",
     "FOR",
@@ -385,6 +387,7 @@ pub const ORACLE_SQL_KEYWORDS: &[&str] = &[
     "OPTIMIZER_MODE",
     "OR",
     "ORDER",
+    "ORDERED",
     "ORDINALITY",
     "ORGANIZATION",
     "OSERROR",
@@ -432,6 +435,7 @@ pub const ORACLE_SQL_KEYWORDS: &[&str] = &[
     "PRAGMA",
     "PRECEDES",
     "PRECEDING",
+    "PRESENT",
     "PRESERVE",
     "PRETTY",
     "PRIMARY",
@@ -467,6 +471,8 @@ pub const ORACLE_SQL_KEYWORDS: &[&str] = &[
     "RELY",
     "REM",
     "REMARK",
+    "REMOVE",
+    "REMOVE_SET",
     "RENAME",
     "REPEAT",
     "REPEATABLE",
@@ -2475,7 +2481,7 @@ fn sql_contains_mysql_only_operator(sql: &str) -> bool {
             continue;
         }
 
-        if current == b'-' && next == Some(b'>')
+        if current == b'-' && next == Some(b'>') && !arrow_closes_property_graph_edge(bytes, idx)
             || current == b'<'
                 && next == Some(b'=')
                 && bytes.get(idx.saturating_add(2)) == Some(&b'>')
@@ -2487,6 +2493,36 @@ fn sql_contains_mysql_only_operator(sql: &str) -> bool {
     }
 
     false
+}
+
+fn arrow_closes_property_graph_edge(bytes: &[u8], arrow_idx: usize) -> bool {
+    let Some(close_idx) = previous_non_whitespace_byte(bytes, arrow_idx) else {
+        return false;
+    };
+    if bytes.get(close_idx) != Some(&b']') {
+        return false;
+    }
+
+    let mut cursor = close_idx;
+    while cursor > 0 {
+        cursor -= 1;
+        match bytes[cursor] {
+            b'[' => {
+                return previous_non_whitespace_byte(bytes, cursor)
+                    .is_some_and(|idx| bytes.get(idx) == Some(&b'-'));
+            }
+            b']' => return false,
+            _ => {}
+        }
+    }
+
+    false
+}
+
+fn previous_non_whitespace_byte(bytes: &[u8], before: usize) -> Option<usize> {
+    (0..before)
+        .rev()
+        .find(|&idx| !bytes[idx].is_ascii_whitespace())
 }
 
 pub(crate) fn sql_uses_mysql_compatible_syntax(sql: &str) -> bool {
@@ -9331,6 +9367,12 @@ mod tests {
         ));
         assert!(!sql_uses_mysql_compatible_syntax(
             "SELECT '->', \"<=>\", nq'{->}', uq'!<=>!' FROM dual /* -> */"
+        ));
+        assert!(!sql_uses_mysql_compatible_syntax(
+            "SELECT * FROM GRAPH_TABLE (g MATCH (a)-[e IS links]->(b))"
+        ));
+        assert!(sql_uses_mysql_compatible_syntax(
+            "SELECT payload[index_col]->'$.kind' FROM docs"
         ));
     }
 

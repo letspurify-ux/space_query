@@ -419,6 +419,7 @@ impl HighlightShadowState {
             }
             LexerState::InDoubleQuote => crate::sql_parser_engine::LexMode::DoubleQuote,
             LexerState::InBacktickQuote => crate::sql_parser_engine::LexMode::BacktickQuote,
+            LexerState::InBracketQuote => crate::sql_parser_engine::LexMode::BracketQuote,
         }
     }
 

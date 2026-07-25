@@ -1167,8 +1167,8 @@ LIMIT 20;
 -- source: test_mariadb/test6.txt
 -- db: MariaDB
 -- metadata: test_mariadb/test6.txt inferred catalog
--- checked: 2371
--- suggestions checked: 12821
+-- checked: 2363
+-- suggestions checked: 12791
 -- missing: 0
 -- suggestions without type labels: 0
 -- marker: [[word]] means not suggested for the tested prefix

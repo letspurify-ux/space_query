@@ -159,7 +159,7 @@ ORDER BY f.node_id;
 -- db: MariaDB
 -- metadata: test_mariadb/test13.txt inferred catalog
 -- checked: 424
--- suggestions checked: 4344
+-- suggestions checked: 4346
 -- missing: 0
 -- suggestions without type labels: 0
 -- marker: [[word]] means not suggested for the tested prefix

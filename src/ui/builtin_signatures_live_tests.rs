@@ -30,7 +30,7 @@ fn assert_catalog(db_type: DatabaseType, names: &[&str], expected_len: usize) {
 
 #[test]
 fn builtin_signature_catalogs_match_official_manual_indices() {
-    assert_catalog(DatabaseType::Oracle, ORACLE_FUNCTIONS, 463);
+    assert_catalog(DatabaseType::Oracle, ORACLE_FUNCTIONS, 464);
     assert_catalog(DatabaseType::MySQL, MYSQL_FUNCTIONS, 408);
     assert_catalog(DatabaseType::MariaDB, MARIADB_FUNCTIONS, 475);
 }
@@ -906,7 +906,7 @@ fn oracle_connection_from_env() -> OracleThinSession {
 #[test]
 #[ignore = "requires local Oracle 26ai via ORACLE_TEST_* environment variables"]
 fn oracle_builtin_function_signatures_execute_live() {
-    assert_catalog(DatabaseType::Oracle, ORACLE_FUNCTIONS, 463);
+    assert_catalog(DatabaseType::Oracle, ORACLE_FUNCTIONS, 464);
     let mut session = oracle_connection_from_env();
     let mut failures = Vec::new();
     for name in ORACLE_FUNCTIONS {

@@ -6656,6 +6656,7 @@ impl QueryExecutor {
         if Self::has_top_level_set_operator(sql)
             || Self::has_top_level_identifier_keyword(sql, "GROUP")
             || Self::has_top_level_connect_by(sql)
+            || Self::has_top_level_flashback_query_clause(sql, from_idx)
             || Self::has_top_level_identifier_keyword(sql, "MATCH_RECOGNIZE")
             || Self::has_top_level_identifier_keyword(sql, "PIVOT")
             || Self::has_top_level_identifier_keyword(sql, "UNPIVOT")
@@ -6668,6 +6669,33 @@ impl QueryExecutor {
             return false;
         }
         true
+    }
+
+    fn has_top_level_flashback_query_clause(sql: &str, from_idx: usize) -> bool {
+        let from_body_start = from_idx.saturating_add("FROM".len());
+        let Some(from_tail) = sql.get(from_body_start..) else {
+            return false;
+        };
+        let mut previous_word = None::<&str>;
+
+        for token in TopLevelScanner::new(from_tail) {
+            match token {
+                ScanToken::Word { text, .. } => {
+                    if previous_word.is_some_and(|previous| {
+                        (previous.eq_ignore_ascii_case("AS") && text.eq_ignore_ascii_case("OF"))
+                            || (previous.eq_ignore_ascii_case("VERSIONS")
+                                && (text.eq_ignore_ascii_case("BETWEEN")
+                                    || text.eq_ignore_ascii_case("PERIOD")))
+                    }) {
+                        return true;
+                    }
+                    previous_word = Some(text);
+                }
+                ScanToken::Symbol { .. } => previous_word = None,
+            }
+        }
+
+        false
     }
 
     fn select_clause_has_aggregate_outside_subquery(
@@ -8846,6 +8874,10 @@ impl QueryExecutor {
         preferred_db_type: Option<crate::db::connection::DatabaseType>,
         mysql_delimiter: Option<&str>,
     ) -> bool {
+        if preferred_db_type.is_some_and(|db_type| !db_type.is_mysql_or_mariadb()) {
+            return false;
+        }
+
         mysql_delimiter.is_some_and(|delimiter| delimiter != ";")
             || Self::parse_mysql_tool_command_if_candidate(trimmed).is_some()
             || Self::statement_ends_with_mysql_vertical_terminator(trimmed)

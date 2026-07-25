@@ -266,6 +266,7 @@ pub enum LexerState {
     },
     InDoubleQuote,
     InBacktickQuote,
+    InBracketQuote,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -847,6 +848,16 @@ impl SqlHighlighter {
                     return state;
                 }
             },
+            LexerState::InBracketQuote => match scan_until_bracket_quote_end(bytes, idx) {
+                ScanResult::Closed { next_idx } => {
+                    idx = next_idx;
+                    styles[..idx].fill(STYLE_QUOTED_IDENTIFIER as u8);
+                }
+                ScanResult::Unterminated { state, .. } => {
+                    styles[..].fill(STYLE_QUOTED_IDENTIFIER as u8);
+                    return state;
+                }
+            },
             LexerState::Normal => {}
         }
 
@@ -1026,6 +1037,23 @@ impl SqlHighlighter {
                 let start = idx;
                 idx += 1;
                 let scan_result = scan_until_backtick_quote_end(bytes, idx);
+                idx = match scan_result {
+                    ScanResult::Closed { next_idx } | ScanResult::Unterminated { next_idx, .. } => {
+                        next_idx
+                    }
+                };
+                styles[start..idx].fill(STYLE_QUOTED_IDENTIFIER as u8);
+                if let ScanResult::Unterminated { state, .. } = scan_result {
+                    exit_state = state;
+                }
+                scan_context.record_token(SignificantTokenKind::String, false);
+                continue;
+            }
+
+            if mysql_compatible && byte == b'[' {
+                let start = idx;
+                idx += 1;
+                let scan_result = scan_until_bracket_quote_end(bytes, idx);
                 idx = match scan_result {
                     ScanResult::Closed { next_idx } | ScanResult::Unterminated { next_idx, .. } => {
                         next_idx
@@ -1855,6 +1883,28 @@ fn scan_until_backtick_quote_end(bytes: &[u8], mut idx: usize) -> ScanResult {
                 return ScanResult::Unterminated {
                     next_idx: idx,
                     state: LexerState::InBacktickQuote,
+                };
+            }
+        }
+    }
+}
+
+fn scan_until_bracket_quote_end(bytes: &[u8], mut idx: usize) -> ScanResult {
+    loop {
+        match bytes.get(idx) {
+            Some(&b']') => {
+                if bytes.get(idx + 1) == Some(&b']') {
+                    idx += 2;
+                } else {
+                    idx += 1;
+                    return ScanResult::Closed { next_idx: idx };
+                }
+            }
+            Some(_) => idx += 1,
+            None => {
+                return ScanResult::Unterminated {
+                    next_idx: idx,
+                    state: LexerState::InBracketQuote,
                 };
             }
         }

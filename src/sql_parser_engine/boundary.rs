@@ -14,6 +14,7 @@ pub(crate) enum LexMode {
     SingleQuote,
     DoubleQuote,
     BacktickQuote,
+    BracketQuote,
     LineComment,
     BlockComment,
     QQuote {

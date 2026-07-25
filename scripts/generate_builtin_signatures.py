@@ -29,6 +29,7 @@ ORACLE_EXTRA_SIGNATURES = {
     "INSERTCHILDXMLAFTER": "INSERTCHILDXMLAFTER(XMLType_instance, XPath_string, child_expr, value_expr [, namespace_string])",
     "INSERTCHILDXMLBEFORE": "INSERTCHILDXMLBEFORE(XMLType_instance, XPath_string, child_expr, value_expr [, namespace_string])",
     "INSERTXMLBEFORE": "INSERTXMLBEFORE(XMLType_instance, XPath_string, value_expr [, namespace_string])",
+    "JSON_ID": "JSON_ID([type])",
     "LAST": "LAST(expr [, offset])",
     "LENGTHB": "LENGTHB(char)",
     "MATCH_NUMBER": "MATCH_NUMBER()",

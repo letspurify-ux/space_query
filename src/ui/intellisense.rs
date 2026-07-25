@@ -3730,7 +3730,8 @@ fn incomplete_quoted_identifier_start_before_cursor(
                     == Some('-');
             let bracket_starts_in_code =
                 ch == '[' && lexical_span.is_none() && !bracket_starts_graph_edge;
-            if (is_parser_quoted_identifier_start || bracket_starts_in_code)
+            if !bracket_starts_graph_edge
+                && (is_parser_quoted_identifier_start || bracket_starts_in_code)
                 && !has_unescaped_identifier_delimiter(
                     text,
                     prev_idx + ch.len_utf8(),
