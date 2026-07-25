@@ -1259,8 +1259,8 @@ ORDER BY m.ym,
 -- source: test_mariadb/test5.txt
 -- db: MariaDB
 -- metadata: test_mariadb/test5.txt inferred catalog
--- checked: 2057
--- suggestions checked: 11879
+-- checked: 2181
+-- suggestions checked: 12771
 -- missing: 0
 -- suggestions without type labels: 0
 -- marker: [[word]] means not suggested for the tested prefix

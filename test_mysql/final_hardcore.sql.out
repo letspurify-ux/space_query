@@ -10,6 +10,7 @@
 -- server so the formatted output can be re-executed for certification.
 
 DROP DATABASE IF EXISTS sq_hard_mysql;
+DROP DATABASE IF EXISTS sq_hard_mysql_aux;
 CREATE DATABASE sq_hard_mysql CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_ai_ci;
 USE sq_hard_mysql;
 SET NAMES utf8mb4;
@@ -607,6 +608,224 @@ START TRANSACTION;
 SELECT metric_id FROM metric WHERE metric_id = 1 FOR UPDATE NOWAIT;
 ROLLBACK;
 
+-- ULTRA WAVE 3: cross-database objects force schema-qualified completion.
+CREATE DATABASE sq_hard_mysql_aux CHARACTER SET utf8mb4;
+CREATE TABLE sq_hard_mysql_aux.node_lookup (
+  node_id  INT NOT NULL PRIMARY KEY,
+  node_tag VARCHAR(20) NOT NULL
+) ENGINE = InnoDB;
+INSERT INTO sq_hard_mysql_aux.node_lookup VALUES (1, 'core'), (2, 'edge');
+
+SELECT m.metric_id, l.node_tag
+FROM metric m
+JOIN sq_hard_mysql_aux.node_lookup l ON l.node_id = m.node_id
+WHERE m.metric_id <= 2
+ORDER BY m.metric_id;
+
+-- Lexer bait: backtick aliases containing comment openers, charset introducers
+-- with hex payloads, bit literals, null-safe / XOR / && operators, and a
+-- running user-variable assignment inside the projection.
+SELECT '/* not a comment */'                    AS `co--mment`,
+       '-- still a string'                      AS `/*alias*/`,
+       _utf8mb4 X'E29C93'                       AS check_glyph,
+       _binary X'DEAD'                          AS bin_lit,
+       b'1011'                                  AS bit_literal,
+       NULL <=> NULL                            AS null_safe_eq,
+       TRUE XOR FALSE                           AS xor_flag,
+       (1 < 2) && (3 < 4)                       AS and_legacy
+FROM DUAL;
+
+SET @running_total := 0;
+SELECT (@running_total := @running_total + s.metric_value) AS running_assign
+FROM (SELECT metric_value FROM metric ORDER BY metric_id) s;
+
+-- Non-recursive CTE that shadows the physical table it reads from: the inner
+-- reference must resolve to the base table, the outer one to the CTE.
+WITH metric AS (
+  SELECT metric_id, metric_value * 100 AS boosted
+  FROM metric
+  WHERE node_id = 2
+)
+SELECT metric_id, boosted FROM metric ORDER BY metric_id;
+
+-- Functional/expression DEFAULTs, an unenforced CHECK, and an INSTANT column
+-- add on the same table.
+CREATE TABLE gadget (
+  gadget_id BIGINT NOT NULL AUTO_INCREMENT PRIMARY KEY,
+  gid       BINARY(16) NOT NULL DEFAULT (UUID_TO_BIN(UUID())),
+  made_on   DATE NOT NULL DEFAULT ((CURRENT_DATE + INTERVAL 1 YEAR)),
+  qty       INT NOT NULL,
+  CONSTRAINT chk_gadget_qty  CHECK (qty >= 0),
+  CONSTRAINT chk_gadget_soft CHECK (qty < 1000) NOT ENFORCED
+) ENGINE = InnoDB;
+
+INSERT INTO gadget (qty) VALUES (1), (2), (3);
+ALTER TABLE gadget ADD COLUMN note VARCHAR(20) NOT NULL DEFAULT '즉시', ALGORITHM = INSTANT;
+
+-- REGEXP family with explicit match_type arguments.
+SELECT article_id,
+       REGEXP_LIKE(title, 'CRITICAL', 'i')             AS rx_like,
+       REGEXP_INSTR(body, 'search')                    AS rx_instr,
+       REGEXP_SUBSTR(title, '[[:alpha:]]+')            AS rx_first_word,
+       REGEXP_REPLACE(title, '[aeiou]', '*', 1, 0, 'c') AS rx_masked
+FROM article
+ORDER BY article_id;
+
+-- Geographic SRID 4326 math over the spatial column.
+SELECT s.`from`,
+       ST_SRID(s.location)                             AS srid_value,
+       ST_Latitude(s.location)                         AS lat_value,
+       ST_Longitude(s.location)                        AS lon_value,
+       ROUND(ST_Distance_Sphere(
+         s.location,
+         ST_GeomFromText('POINT(3 4)', 4326, 'axis-order=long-lat')
+       ))                                              AS sphere_dist_m
+FROM `select` s;
+
+-- View with CHECK OPTION plus DML routed through the view.
+CREATE ALGORITHM = MERGE SQL SECURITY INVOKER VIEW big_gadget_v AS
+SELECT gadget_id, qty, note
+FROM gadget
+WHERE qty >= 1
+WITH CHECK OPTION;
+
+INSERT INTO big_gadget_v (qty, note) VALUES (7, 'via view');
+CALL sq_hard_assert(
+  (SELECT COUNT(*) FROM gadget WHERE qty = 7) = 1,
+  'insert through check-option view'
+);
+DELETE FROM big_gadget_v WHERE qty = 7;
+
+-- Multi-table UPDATE and both multi-table DELETE spellings, REPLACE,
+-- INSERT IGNORE, and a CTE-fed multi-table DELETE.
+CREATE TABLE prune_rows (
+  id INT NOT NULL PRIMARY KEY,
+  v  INT NOT NULL
+) ENGINE = InnoDB;
+INSERT INTO prune_rows VALUES (1, 1), (2, 2), (3, 3), (4, 4);
+
+UPDATE prune_rows p
+JOIN metric m ON m.metric_id = p.id
+SET p.v = p.v + m.node_id;
+
+DELETE p
+FROM prune_rows p
+JOIN metric m ON m.metric_id = p.id
+WHERE m.node_id = 2;
+
+DELETE FROM p
+USING prune_rows p
+JOIN metric m ON m.metric_id = p.id
+WHERE m.metric_value >= 24;
+
+REPLACE INTO prune_rows (id, v) VALUES (1, 100);
+INSERT IGNORE INTO prune_rows (id, v) VALUES (1, 999), (8, 80);
+
+WITH doomed AS (
+  SELECT id FROM prune_rows WHERE v >= 100
+)
+DELETE FROM p
+USING prune_rows p
+JOIN doomed d ON d.id = p.id;
+
+-- JSON inspection helpers over the document table.
+SELECT doc_id,
+       JSON_KEYS(payload)                                   AS key_list,
+       JSON_UNQUOTE(JSON_SEARCH(payload, 'one', 'critical')) AS critical_path,
+       JSON_STORAGE_FREE(payload)                           AS storage_free,
+       JSON_PRETTY(payload->'$.tags')                       AS pretty_tags
+FROM hard_document
+WHERE doc_id = 101;
+
+-- Invisible index brought back through a SET_VAR optimizer-switch hint.
+SELECT /*+ SET_VAR(optimizer_switch = 'use_invisible_indexes=on') */
+       COUNT(*) AS kind_rows
+FROM hard_document
+WHERE CAST(JSON_UNQUOTE(JSON_EXTRACT(payload, '$.kind')) AS CHAR(16)) = 'latency';
+
+-- Deep recursion beyond the default depth cap.
+SET SESSION cte_max_recursion_depth = 2000;
+WITH RECURSIVE deep (n) AS (
+  SELECT 1
+  UNION ALL
+  SELECT n + 1 FROM deep WHERE n < 1500
+)
+SELECT COUNT(*) AS deep_rows, MAX(n) AS deep_max FROM deep;
+
+-- RENAME TABLE three-way swap and TRUNCATE.
+CREATE TABLE swap_a (id INT NOT NULL PRIMARY KEY, tag CHAR(1) NOT NULL);
+CREATE TABLE swap_b (id INT NOT NULL PRIMARY KEY, tag CHAR(1) NOT NULL);
+INSERT INTO swap_a VALUES (1, 'a'), (2, 'a');
+INSERT INTO swap_b VALUES (9, 'b');
+
+RENAME TABLE swap_a TO swap_tmp, swap_b TO swap_a, swap_tmp TO swap_b;
+TRUNCATE TABLE swap_a;
+
+-- Advisory locks and the DO statement.
+SELECT GET_LOCK('sq_hard_lock', 0) AS got_lock;
+DO RELEASE_LOCK('sq_hard_lock');
+
+-- Prepared statement whose text is assembled in a user variable.
+SET @dyn_sql = CONCAT('SELECT COUNT(*) AS dyn_count FROM ',
+                      'metric WHERE node_id = ?');
+PREPARE dyn_stmt FROM @dyn_sql;
+SET @dyn_node = 1;
+EXECUTE dyn_stmt USING @dyn_node;
+DEALLOCATE PREPARE dyn_stmt;
+
+-- Warning-class SIGNAL (does not abort) plus GET DIAGNOSTICS accounting.
+DELIMITER $$
+CREATE PROCEDURE sq_hard_warn(OUT warn_count INT)
+BEGIN
+  SIGNAL SQLSTATE '01000' SET MESSAGE_TEXT = '경고만 발생', MYSQL_ERRNO = 1642;
+  GET DIAGNOSTICS warn_count = NUMBER;
+END$$
+DELIMITER ;
+CALL sq_hard_warn(@warn_total);
+
+-- EXPLAIN ANALYZE executes the plan for real.
+EXPLAIN ANALYZE
+SELECT node_id, SUM(metric_value)
+FROM metric
+GROUP BY node_id;
+
+-- Wave-3 self-verification.
+CALL sq_hard_assert(@running_total = 56, 'user variable running total');
+CALL sq_hard_assert(
+  (SELECT boosted FROM (
+     WITH metric AS (
+       SELECT metric_id, metric_value * 100 AS boosted
+       FROM metric
+       WHERE node_id = 2
+     )
+     SELECT metric_id, boosted FROM metric
+   ) shadowed WHERE metric_id = 4) = 200,
+  'cte shadowing base table'
+);
+CALL sq_hard_assert(
+  (SELECT COUNT(*) FROM gadget
+   WHERE made_on > CURRENT_DATE AND note = '즉시') = 3,
+  'functional defaults + instant column'
+);
+CALL sq_hard_assert(
+  (SELECT COUNT(*) FROM prune_rows) = 2,
+  'multi-table delete/replace/ignore net rows'
+);
+CALL sq_hard_assert(
+  (SELECT COUNT(*) FROM article WHERE REGEXP_LIKE(title, 'CRITICAL', 'i')) = 1,
+  'regexp match_type'
+);
+CALL sq_hard_assert(
+  (SELECT ST_Latitude(location) FROM `select`) = 2,
+  'geographic latitude'
+);
+CALL sq_hard_assert(
+  (SELECT COUNT(*) FROM swap_a) = 0 AND
+  (SELECT COUNT(*) FROM swap_b) = 2,
+  'rename swap + truncate'
+);
+CALL sq_hard_assert(@warn_total = 1, 'warning-class signal diagnostics');
+
 -- Extension self-verification.
 CALL sq_hard_assert(@spin_total = 16, 'repeat/while spin total');
 CALL sq_hard_assert(
@@ -639,8 +858,8 @@ SELECT 'PASS' AS final_status,
 -- source: test_mysql/final_hardcore.sql
 -- db: MySQL
 -- metadata: test_mysql/final_hardcore.sql inferred catalog
--- checked: 717
--- suggestions checked: 4381
+-- checked: 1634
+-- suggestions checked: 7703
 -- missing: 0
 -- suggestions without type labels: 0
 -- marker: [[word]] means not suggested for the tested prefix

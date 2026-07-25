@@ -253,6 +253,53 @@ fn collect_create_table_columns(tokens: &[SqlToken], open_idx: usize) -> Vec<Str
     columns
 }
 
+fn collect_mysql_inline_index_names(tokens: &[SqlToken], open_idx: usize) -> Vec<String> {
+    let Some(close_idx) = matching_paren_index(tokens, open_idx) else {
+        return Vec::new();
+    };
+    let mut indexes = Vec::new();
+    let mut item_start = open_idx + 1;
+    let mut depth = 0usize;
+    for idx in open_idx + 1..=close_idx {
+        match tokens.get(idx) {
+            Some(SqlToken::Symbol(symbol)) if symbol == "(" => {
+                depth = depth.saturating_add(1)
+            }
+            Some(SqlToken::Symbol(symbol)) if symbol == ")" && depth > 0 => {
+                depth = depth.saturating_sub(1)
+            }
+            Some(SqlToken::Symbol(symbol)) if (symbol == "," && depth == 0) || idx == close_idx => {
+                let words = tokens[item_start..idx]
+                    .iter()
+                    .filter_map(|token| token_word_text(Some(token)))
+                    .collect::<Vec<_>>();
+                let name = match words.as_slice() {
+                    [kind, name, ..]
+                        if matches!(kind.to_ascii_uppercase().as_str(), "INDEX" | "KEY") =>
+                    {
+                        Some(*name)
+                    }
+                    [modifier, kind, name, ..]
+                        if matches!(
+                            modifier.to_ascii_uppercase().as_str(),
+                            "FULLTEXT" | "SPATIAL" | "UNIQUE"
+                        ) && matches!(kind.to_ascii_uppercase().as_str(), "INDEX" | "KEY") =>
+                    {
+                        Some(*name)
+                    }
+                    _ => None,
+                };
+                if let Some(name) = name {
+                    push_unique_case_insensitive(&mut indexes, name);
+                }
+                item_start = idx + 1;
+            }
+            _ => {}
+        }
+    }
+    indexes
+}
+
 fn collect_oracle_object_type_members(tokens: &[SqlToken], open_idx: usize) -> Vec<String> {
     let Some(close_idx) = matching_paren_index(tokens, open_idx) else {
         return Vec::new();
@@ -517,52 +564,163 @@ fn collect_mysql_temporary_tables_from_text(script: &str) -> Vec<(String, Vec<St
     tables
 }
 
-fn mysql_family_catalog_from_script(script: &str) -> MysqlFamilyScriptCatalog {
-    let tokens = super::query_text::tokenize_sql_with_mysql_compat(script, true);
-    let mut catalog = MysqlFamilyScriptCatalog::default();
+fn mysql_family_collect_package_signatures(
+    tokens: &[SqlToken],
+    catalog: &mut MysqlFamilyScriptCatalog,
+) {
+    let mut current_package = None::<String>;
     let mut idx = 0usize;
     while idx < tokens.len() {
         if token_word_eq(tokens.get(idx), "CREATE") {
-            let mut kind_idx = idx + 1;
-            if token_word_eq(tokens.get(kind_idx), "OR")
-                && token_word_eq(tokens.get(kind_idx + 1), "REPLACE")
-            {
-                kind_idx += 2;
-            }
-            if token_word_eq(tokens.get(kind_idx), "TEMPORARY") {
-                kind_idx += 1;
-            }
-            if token_word_eq(tokens.get(kind_idx), "ALGORITHM") {
-                kind_idx += 1;
-                if matches!(tokens.get(kind_idx), Some(SqlToken::Symbol(symbol)) if symbol == "=") {
-                    kind_idx += 1;
-                }
-                if token_word_text(tokens.get(kind_idx)).is_some() {
-                    kind_idx += 1;
-                }
-            }
+            let statement_end = tokens
+                .iter()
+                .enumerate()
+                .skip(idx + 1)
+                .find_map(|(token_idx, token)| {
+                    matches!(token, SqlToken::Symbol(symbol) if symbol == ";")
+                        .then_some(token_idx)
+                })
+                .unwrap_or(tokens.len());
+            let package_idx = tokens
+                .iter()
+                .enumerate()
+                .take(statement_end)
+                .skip(idx + 1)
+                .find_map(|(token_idx, token)| {
+                    token_word_eq(Some(token), "PACKAGE").then_some(token_idx)
+                });
+            current_package = package_idx.and_then(|package_idx| {
+                let name_idx = package_idx
+                    + usize::from(token_word_eq(tokens.get(package_idx + 1), "BODY"))
+                    + 1;
+                script_object_name_at(tokens, name_idx).map(|(name, _)| name)
+            });
+        }
+
+        let Some(routine_kind) = token_word_text(tokens.get(idx))
+            .map(str::to_ascii_uppercase)
+            .filter(|word| matches!(word.as_str(), "PROCEDURE" | "FUNCTION"))
+        else {
+            idx += 1;
+            continue;
+        };
+        let Some(package) = current_package.as_deref() else {
+            idx += 1;
+            continue;
+        };
+        let Some((name, after_name_idx)) = script_object_name_at(tokens, idx + 1) else {
+            idx += 1;
+            continue;
+        };
+        let params = if matches!(
+            tokens.get(after_name_idx),
+            Some(SqlToken::Symbol(symbol)) if symbol == "("
+        ) {
+            script_parameter_names_from_open_paren(tokens, after_name_idx)
+        } else {
+            Vec::new()
+        };
+        let member_kind = if routine_kind == "FUNCTION" {
+            QualifiedMemberKind::Function
+        } else {
+            QualifiedMemberKind::Procedure
+        };
+        let return_type = oracle_script_routine_return_type(tokens, after_name_idx);
+        oracle_insert_signature(
+            catalog,
+            format!("{package}.{name}"),
+            &name,
+            &params,
+            member_kind,
+            return_type.as_deref(),
+        );
+        idx += 1;
+    }
+}
+
+fn mysql_family_catalog_from_script(script: &str) -> MysqlFamilyScriptCatalog {
+    let tokens = super::query_text::tokenize_sql_with_mysql_compat(script, true);
+    let mut catalog = MysqlFamilyScriptCatalog::default();
+    mysql_family_collect_package_signatures(&tokens, &mut catalog);
+    let mut idx = 0usize;
+    while idx < tokens.len() {
+        if token_word_eq(tokens.get(idx), "CREATE") {
+            let statement_end = tokens
+                .iter()
+                .enumerate()
+                .skip(idx + 1)
+                .find_map(|(token_idx, token)| {
+                    matches!(token, SqlToken::Symbol(symbol) if symbol == ";")
+                        .then_some(token_idx)
+                })
+                .unwrap_or(tokens.len());
+            let Some(kind_idx) = tokens
+                .iter()
+                .enumerate()
+                .take(statement_end)
+                .skip(idx + 1)
+                .find_map(|(token_idx, token)| {
+                    token_word_text(Some(token))
+                        .is_some_and(|word| {
+                            matches!(
+                                word.to_ascii_uppercase().as_str(),
+                                "DATABASE"
+                                    | "EVENT"
+                                    | "FUNCTION"
+                                    | "INDEX"
+                                    | "PACKAGE"
+                                    | "PROCEDURE"
+                                    | "ROLE"
+                                    | "SCHEMA"
+                                    | "SEQUENCE"
+                                    | "TABLE"
+                                    | "TRIGGER"
+                                    | "USER"
+                                    | "VIEW"
+                            )
+                        })
+                        .then_some(token_idx)
+                })
+            else {
+                idx += 1;
+                continue;
+            };
             let Some(kind) = token_word_text(tokens.get(kind_idx)) else {
                 idx += 1;
                 continue;
             };
-            let name_idx = kind_idx + 1;
+            let mut name_idx = kind_idx + 1;
+            if kind.eq_ignore_ascii_case("PACKAGE")
+                && token_word_eq(tokens.get(name_idx), "BODY")
+            {
+                name_idx += 1;
+            }
             match kind.to_ascii_uppercase().as_str() {
                 "TABLE" => {
-                    if let Some(name) = token_word_text(tokens.get(name_idx)) {
-                        push_unique_case_insensitive(&mut catalog.tables, name);
+                    if let Some((name, qualified_name, after_name_idx)) =
+                        script_qualified_object_name_at(&tokens, name_idx)
+                    {
+                        push_unique_case_insensitive(&mut catalog.tables, &name);
                         if matches!(
-                            tokens.get(name_idx + 1),
+                            tokens.get(after_name_idx),
                             Some(SqlToken::Symbol(symbol)) if symbol == "("
                         ) {
-                            catalog.columns.insert(
-                                name.to_ascii_uppercase(),
-                                collect_create_table_columns(&tokens, name_idx + 1),
+                            insert_script_relation_columns(
+                                &mut catalog,
+                                &name,
+                                &qualified_name,
+                                collect_create_table_columns(&tokens, after_name_idx),
                             );
+                            for index in
+                                collect_mysql_inline_index_names(&tokens, after_name_idx)
+                            {
+                                push_unique_case_insensitive(&mut catalog.indexes, &index);
+                            }
                         } else {
                             let statement_end = tokens
                                 .iter()
                                 .enumerate()
-                                .skip(name_idx + 1)
+                                .skip(after_name_idx)
                                 .find_map(|(idx, token)| {
                                     matches!(token, SqlToken::Symbol(symbol) if symbol == ";")
                                         .then_some(idx)
@@ -572,7 +730,7 @@ fn mysql_family_catalog_from_script(script: &str) -> MysqlFamilyScriptCatalog {
                                 .iter()
                                 .enumerate()
                                 .take(statement_end)
-                                .skip(name_idx + 1)
+                                .skip(after_name_idx)
                                 .find_map(|(idx, token)| {
                                     token_word_eq(Some(token), "AS").then_some(idx)
                                 })
@@ -581,20 +739,25 @@ fn mysql_family_catalog_from_script(script: &str) -> MysqlFamilyScriptCatalog {
                                     intellisense_context::extract_select_list_columns(
                                         &tokens[as_idx + 1..statement_end],
                                     );
-                                if !columns.is_empty() {
-                                    catalog.columns.insert(name.to_ascii_uppercase(), columns);
-                                }
+                                insert_script_relation_columns(
+                                    &mut catalog,
+                                    &name,
+                                    &qualified_name,
+                                    columns,
+                                );
                             }
                         }
                     }
                 }
                 "VIEW" => {
-                    if let Some(name) = token_word_text(tokens.get(name_idx)) {
-                        push_unique_case_insensitive(&mut catalog.views, name);
+                    if let Some((name, qualified_name, after_name_idx)) =
+                        script_qualified_object_name_at(&tokens, name_idx)
+                    {
+                        push_unique_case_insensitive(&mut catalog.views, &name);
                         let statement_end = tokens
                             .iter()
                             .enumerate()
-                            .skip(name_idx + 1)
+                            .skip(after_name_idx)
                             .find_map(|(idx, token)| {
                                 matches!(token, SqlToken::Symbol(symbol) if symbol == ";")
                                     .then_some(idx)
@@ -604,45 +767,48 @@ fn mysql_family_catalog_from_script(script: &str) -> MysqlFamilyScriptCatalog {
                             .iter()
                             .enumerate()
                             .take(statement_end)
-                            .skip(name_idx + 1)
+                            .skip(after_name_idx)
                             .find_map(|(idx, token)| token_word_eq(Some(token), "AS").then_some(idx))
                         {
                             let columns =
                                 intellisense_context::extract_select_list_columns(&tokens[as_idx + 1..statement_end]);
-                            if !columns.is_empty() {
-                                catalog.columns.insert(name.to_ascii_uppercase(), columns);
-                            }
+                            insert_script_relation_columns(
+                                &mut catalog,
+                                &name,
+                                &qualified_name,
+                                columns,
+                            );
                         }
                     }
                 }
                 "PROCEDURE" => {
-                    if let Some(name) = token_word_text(tokens.get(name_idx)) {
-                        push_unique_case_insensitive(&mut catalog.procedures, name);
+                    if let Some((name, _)) = script_object_name_at(&tokens, name_idx) {
+                        push_unique_case_insensitive(&mut catalog.procedures, &name);
                     }
                 }
                 "FUNCTION" => {
-                    if let Some(name) = token_word_text(tokens.get(name_idx)) {
-                        push_unique_case_insensitive(&mut catalog.functions, name);
+                    if let Some((name, _)) = script_object_name_at(&tokens, name_idx) {
+                        push_unique_case_insensitive(&mut catalog.functions, &name);
                     }
                 }
                 "TRIGGER" => {
-                    if let Some(name) = token_word_text(tokens.get(name_idx)) {
-                        push_unique_case_insensitive(&mut catalog.triggers, name);
+                    if let Some((name, _)) = script_object_name_at(&tokens, name_idx) {
+                        push_unique_case_insensitive(&mut catalog.triggers, &name);
                     }
                 }
                 "EVENT" => {
-                    if let Some(name) = token_word_text(tokens.get(name_idx)) {
-                        push_unique_case_insensitive(&mut catalog.events, name);
+                    if let Some((name, _)) = script_object_name_at(&tokens, name_idx) {
+                        push_unique_case_insensitive(&mut catalog.events, &name);
                     }
                 }
                 "SEQUENCE" => {
-                    if let Some(name) = token_word_text(tokens.get(name_idx)) {
-                        push_unique_case_insensitive(&mut catalog.sequences, name);
+                    if let Some((name, _)) = script_object_name_at(&tokens, name_idx) {
+                        push_unique_case_insensitive(&mut catalog.sequences, &name);
                     }
                 }
                 "INDEX" => {
-                    if let Some(name) = token_word_text(tokens.get(name_idx)) {
-                        push_unique_case_insensitive(&mut catalog.indexes, name);
+                    if let Some((name, _)) = script_object_name_at(&tokens, name_idx) {
+                        push_unique_case_insensitive(&mut catalog.indexes, &name);
                     }
                 }
                 "DATABASE" | "SCHEMA" => {
@@ -661,6 +827,11 @@ fn mysql_family_catalog_from_script(script: &str) -> MysqlFamilyScriptCatalog {
                 "ROLE" | "USER" => {
                     if let Some(name) = token_word_text(tokens.get(name_idx)) {
                         push_unique_case_insensitive(&mut catalog.users, name);
+                    }
+                }
+                "PACKAGE" => {
+                    if let Some((name, _)) = script_object_name_at(&tokens, name_idx) {
+                        push_unique_case_insensitive(&mut catalog.packages, &name);
                     }
                 }
                 _ => {}
@@ -775,6 +946,9 @@ fn intellisense_data_from_mysql_family_catalog(
         if let Some(columns) = catalog.columns.get(&relation.to_ascii_uppercase()) {
             data.set_columns_for_table(relation, columns.clone());
         }
+    }
+    for (relation, columns) in &catalog.columns {
+        data.set_columns_for_table(relation, columns.clone());
     }
     for routine in catalog.routine_return_types.keys() {
         if let Some(columns) = catalog.columns.get(routine) {
@@ -959,6 +1133,51 @@ fn script_object_name_at(tokens: &[SqlToken], start_idx: usize) -> Option<(Strin
     Some((last.trim_matches('"').to_string(), idx + 1))
 }
 
+fn script_qualified_object_name_at(
+    tokens: &[SqlToken],
+    start_idx: usize,
+) -> Option<(String, String, usize)> {
+    let mut idx = start_idx;
+    let mut segments = vec![
+        token_word_text(tokens.get(idx))?
+            .trim_matches(['"', '`'])
+            .to_string(),
+    ];
+    loop {
+        let dot_idx = idx + 1;
+        let next_idx = idx + 2;
+        if !matches!(tokens.get(dot_idx), Some(SqlToken::Symbol(symbol)) if symbol == ".") {
+            break;
+        }
+        let Some(next) = token_word_text(tokens.get(next_idx)) else {
+            break;
+        };
+        segments.push(next.trim_matches(['"', '`']).to_string());
+        idx = next_idx;
+    }
+    let short = segments.last()?.clone();
+    Some((short, segments.join("."), idx + 1))
+}
+
+fn insert_script_relation_columns(
+    catalog: &mut MysqlFamilyScriptCatalog,
+    short_name: &str,
+    qualified_name: &str,
+    columns: Vec<String>,
+) {
+    if columns.is_empty() {
+        return;
+    }
+    catalog
+        .columns
+        .insert(short_name.to_ascii_uppercase(), columns.clone());
+    if !qualified_name.eq_ignore_ascii_case(short_name) {
+        catalog
+            .columns
+            .insert(qualified_name.to_ascii_uppercase(), columns);
+    }
+}
+
 fn oracle_create_kind_and_name_idx(tokens: &[SqlToken], create_idx: usize) -> Option<(String, usize)> {
     let mut idx = create_idx + 1;
     while let Some(word) = token_word_text(tokens.get(idx)) {
@@ -972,6 +1191,12 @@ fn oracle_create_kind_and_name_idx(tokens: &[SqlToken], create_idx: usize) -> Op
     let kind = token_word_text(tokens.get(idx))?.to_ascii_uppercase();
     if kind == "MATERIALIZED" && token_word_eq(tokens.get(idx + 1), "VIEW") {
         return Some(("MATERIALIZED VIEW".to_string(), idx + 2));
+    }
+    if kind == "ATTRIBUTE" && token_word_eq(tokens.get(idx + 1), "DIMENSION") {
+        return Some(("ATTRIBUTE DIMENSION".to_string(), idx + 2));
+    }
+    if kind == "ANALYTIC" && token_word_eq(tokens.get(idx + 1), "VIEW") {
+        return Some(("ANALYTIC VIEW".to_string(), idx + 2));
     }
     if kind == "PROPERTY" && token_word_eq(tokens.get(idx + 1), "GRAPH") {
         return Some(("PROPERTY GRAPH".to_string(), idx + 2));
@@ -1243,6 +1468,76 @@ fn oracle_view_projection_columns(tokens: &[SqlToken]) -> Vec<String> {
     )
 }
 
+fn oracle_statement_end(tokens: &[SqlToken], start_idx: usize) -> usize {
+    tokens
+        .iter()
+        .enumerate()
+        .skip(start_idx)
+        .find_map(|(idx, token)| {
+            matches!(token, SqlToken::Symbol(symbol) if symbol == ";").then_some(idx)
+        })
+        .unwrap_or(tokens.len())
+}
+
+fn oracle_collect_named_items_after_keyword(
+    tokens: &[SqlToken],
+    start_idx: usize,
+    end_idx: usize,
+    keyword: &str,
+) -> Vec<String> {
+    let Some(open_idx) = tokens
+        .iter()
+        .enumerate()
+        .take(end_idx)
+        .skip(start_idx)
+        .find_map(|(idx, token)| {
+            (token_word_eq(Some(token), keyword)
+                && matches!(
+                    tokens.get(idx + 1),
+                    Some(SqlToken::Symbol(symbol)) if symbol == "("
+                ))
+            .then_some(idx + 1)
+        })
+    else {
+        return Vec::new();
+    };
+    collect_create_table_columns(tokens, open_idx)
+}
+
+fn oracle_collect_dbms_tf_new_columns(tokens: &[SqlToken]) -> Vec<String> {
+    let mut columns = Vec::new();
+    for metadata_idx in 0..tokens.len() {
+        if !token_word_eq(tokens.get(metadata_idx), "COLUMN_METADATA_T") {
+            continue;
+        }
+        let Some(open_idx) = tokens
+            .iter()
+            .enumerate()
+            .skip(metadata_idx + 1)
+            .find_map(|(idx, token)| match token {
+                SqlToken::Comment(_) => None,
+                SqlToken::Symbol(symbol) if symbol == "(" => Some(idx),
+                _ => None,
+            })
+        else {
+            continue;
+        };
+        let Some(close_idx) = matching_paren_index(tokens, open_idx) else {
+            continue;
+        };
+        for window in tokens[open_idx + 1..close_idx].windows(3) {
+            if token_word_eq(window.first(), "NAME")
+                && matches!(window.get(1), Some(SqlToken::Symbol(symbol)) if symbol == "=>")
+            {
+                if let Some(SqlToken::String(name)) = window.get(2) {
+                    push_unique_case_insensitive(&mut columns, name.trim_matches('\''));
+                }
+            }
+        }
+    }
+    columns
+}
+
 fn oracle_collect_script_catalog_entries(script: &str, catalog: &mut MysqlFamilyScriptCatalog) {
     oracle_collect_script_signatures(script, catalog);
     let tokens = super::query_text::tokenize_sql(script);
@@ -1325,6 +1620,58 @@ fn oracle_collect_script_catalog_entries(script: &str, catalog: &mut MysqlFamily
             }
             "MATERIALIZED VIEW" => {
                 push_unique_case_insensitive(&mut catalog.materialized_views, &name)
+            }
+            "ATTRIBUTE DIMENSION" => {
+                push_unique_case_insensitive(&mut catalog.views, &name);
+                let statement_end = oracle_statement_end(&tokens, after_name_idx);
+                let mut columns = oracle_collect_named_items_after_keyword(
+                    &tokens,
+                    after_name_idx,
+                    statement_end,
+                    "ATTRIBUTES",
+                );
+                for level_idx in tokens
+                    .iter()
+                    .enumerate()
+                    .take(statement_end)
+                    .skip(after_name_idx)
+                    .filter_map(|(idx, token)| {
+                        token_word_eq(Some(token), "LEVEL").then_some(idx)
+                    })
+                {
+                    if let Some(level_name) = token_word_text(tokens.get(level_idx + 1)) {
+                        if !level_name.eq_ignore_ascii_case("TYPE") {
+                            push_unique_case_insensitive(&mut columns, level_name);
+                        }
+                    }
+                }
+                if !columns.is_empty() {
+                    catalog.columns.insert(name.to_ascii_uppercase(), columns);
+                }
+            }
+            "HIERARCHY" => {
+                push_unique_case_insensitive(&mut catalog.views, &name);
+                catalog.columns.insert(
+                    name.to_ascii_uppercase(),
+                    vec![
+                        "MEMBER_NAME".to_string(),
+                        "LEVEL_NAME".to_string(),
+                        "HIER_ORDER".to_string(),
+                    ],
+                );
+            }
+            "ANALYTIC VIEW" => {
+                push_unique_case_insensitive(&mut catalog.views, &name);
+                let statement_end = oracle_statement_end(&tokens, after_name_idx);
+                let columns = oracle_collect_named_items_after_keyword(
+                    &tokens,
+                    after_name_idx,
+                    statement_end,
+                    "MEASURES",
+                );
+                if !columns.is_empty() {
+                    catalog.columns.insert(name.to_ascii_uppercase(), columns);
+                }
             }
             "PROCEDURE" => push_unique_case_insensitive(&mut catalog.procedures, &name),
             "FUNCTION" => {
@@ -1610,6 +1957,17 @@ fn oracle_collect_script_catalog_entries(script: &str, catalog: &mut MysqlFamily
         };
         if !columns.is_empty() {
             catalog.columns.insert(routine, columns);
+        }
+    }
+
+    let dbms_tf_columns = oracle_collect_dbms_tf_new_columns(&tokens);
+    if !dbms_tf_columns.is_empty() {
+        for (routine, return_type) in &catalog.routine_return_types {
+            if routine.contains('.') && return_type.eq_ignore_ascii_case("TABLE") {
+                catalog
+                    .columns
+                    .insert(routine.clone(), dbms_tf_columns.clone());
+            }
         }
     }
 }
@@ -51292,6 +51650,295 @@ fn manual_final_sweep_metadata_includes_inferred_and_system_objects() {
     assert!(mariadb.tables.iter().any(|name| name.eq_ignore_ascii_case("statement_log_stage")));
 }
 
+#[test]
+fn hardcore_final_sweep_metadata_includes_qualified_relations_views_and_packages() {
+    use crate::db::DatabaseType::{MariaDB, MySQL};
+
+    let mut oracle = oracle_test_file_scoped_intellisense_data("final_hardcore.sql");
+    for view in ["sq_hard_node_ad", "sq_hard_node_h", "sq_hard_av"] {
+        assert!(
+            oracle
+                .views
+                .iter()
+                .any(|name| name.eq_ignore_ascii_case(view)),
+            "missing inferred Oracle analytic object `{view}`"
+        );
+    }
+    for (relation, column) in [
+        ("sq_hard_metric", "metric_value"),
+        ("sq_hard_node_ad", "node_lvl"),
+        ("sq_hard_node_h", "member_name"),
+        ("sq_hard_av", "total_value"),
+        ("sq_hard_ptf_pkg.tag_rows", "row_tag"),
+    ] {
+        assert!(
+            oracle
+                .get_columns_for_table(relation)
+                .iter()
+                .any(|name| name.eq_ignore_ascii_case(column)),
+            "missing inferred `{relation}.{column}`"
+        );
+    }
+    for member in ["TABLE_T", "DESCRIBE_T", "GET_ENV", "PUT_COL"] {
+        assert!(
+            oracle
+                .get_member_suggestions("DBMS_TF", member, false)
+                .iter()
+                .any(|name| name.eq_ignore_ascii_case(member)),
+            "missing DBMS_TF member `{member}`"
+        );
+    }
+
+    let mysql = mysql_family_test_intellisense_data("final_hardcore.sql", MySQL);
+    assert!(mysql
+        .schemas
+        .iter()
+        .any(|name| name.eq_ignore_ascii_case("sq_hard_mysql_aux")),
+        "inferred schemas: {:?}",
+        mysql.schemas);
+    assert!(mysql
+        .tables
+        .iter()
+        .any(|name| name.eq_ignore_ascii_case("node_lookup")));
+    assert!(mysql
+        .get_columns_for_table("node_lookup")
+        .iter()
+        .any(|name| name.eq_ignore_ascii_case("node_id")));
+
+    let mut mariadb = mysql_family_test_intellisense_data("final_hardcore.sql", MariaDB);
+    assert!(mariadb
+        .tables
+        .iter()
+        .any(|name| name.eq_ignore_ascii_case("node_lookup")));
+    assert!(mariadb
+        .views
+        .iter()
+        .any(|name| name.eq_ignore_ascii_case("high_metric_v")));
+    assert!(mariadb
+        .get_columns_for_table("high_metric_v")
+        .iter()
+        .any(|name| name.eq_ignore_ascii_case("metric_value")));
+    assert!(mariadb
+        .packages
+        .iter()
+        .any(|name| name.eq_ignore_ascii_case("sq_hard_pack")));
+    let members = mariadb.get_member_suggestions("sq_hard_pack", "", false);
+    assert!(members
+        .iter()
+        .any(|name| name.eq_ignore_ascii_case("ping")));
+    assert!(members
+        .iter()
+        .any(|name| name.eq_ignore_ascii_case("fortytwo")));
+}
+
+#[test]
+fn hardcore_final_advanced_words_use_full_production_completion() {
+    use crate::db::DatabaseType::{MariaDB, MySQL, Oracle};
+
+    let check = |script: &str,
+                 db_type: crate::db::DatabaseType,
+                 data: &IntellisenseData,
+                 cases: &[(&str, &str)]| {
+        let snapshot = ChunkedText::from_str(script);
+        let mut failures = Vec::new();
+        for (context, word) in cases {
+            let context_start = script
+                .find(context)
+                .unwrap_or_else(|| panic!("fixture context not found: {context}"));
+            let relative_word_start = context
+                .find(word)
+                .unwrap_or_else(|| panic!("`{word}` not found in `{context}`"));
+            let word_start = context_start + relative_word_start;
+            let prefix = intellisense_sweep_completion_prefix(word).expect("completion prefix");
+            let candidate = IntellisenseSweepCandidate {
+                start: word_start,
+                end: word_start + word.len(),
+                word: (*word).to_string(),
+                replacement: prefix.clone(),
+                cursor: word_start + prefix.len(),
+                prefix,
+            };
+            let result = intellisense_sweep_check_candidate(
+                script, &snapshot, db_type, data, &candidate,
+            );
+            if let Some(missing) = result.missing {
+                let (_, analysis) =
+                    intellisense_analysis_from_snapshot_for_test(&snapshot, candidate.cursor, db_type);
+                let inferred_relation =
+                    SqlEditorWidget::oracle_analytic_object_relation_for_column_slot_for_context(
+                        analysis.context.as_ref(),
+                        &candidate.prefix,
+                        Some(db_type),
+                    );
+                let statement_words = analysis
+                    .context
+                    .statement_tokens
+                    .iter()
+                    .filter_map(|token| token_word_text(Some(token)).map(str::to_string))
+                    .collect::<Vec<_>>();
+                let qualifier =
+                    SqlEditorWidget::qualifier_before_word_in_text(script, word_start);
+                let mut diagnostic_data = data.clone();
+                let member_suggestions = qualifier
+                    .as_deref()
+                    .map(|qualifier| {
+                        diagnostic_data.get_member_suggestions(
+                            qualifier,
+                            &candidate.prefix,
+                            false,
+                        )
+                    })
+                    .unwrap_or_default();
+                let qualified_mode = qualifier.as_deref().and_then(|qualifier| {
+                    SqlEditorWidget::resolve_qualified_completion_mode_for_db(
+                        qualifier,
+                        SqlEditorWidget::classify_intellisense_context(
+                            analysis.context.as_ref(),
+                            analysis.context.statement_tokens.as_ref(),
+                        ),
+                        analysis.context.as_ref(),
+                        &diagnostic_data,
+                        Some(db_type),
+                    )
+                });
+                failures.push(format!(
+                    "line {} `{word}` in `{context}`: {:?}; phase={:?}; qualifier={qualifier:?}; mode={qualified_mode:?}; members={member_suggestions:?}; inferred_relation={inferred_relation:?}; words={statement_words:?}",
+                    missing.line, missing.suggestion_sample, analysis.context.phase,
+                ));
+            }
+        }
+        assert!(
+            failures.is_empty(),
+            "{db_type:?} hardcore production completion gaps:\n{}",
+            failures.join("\n")
+        );
+    };
+
+    let oracle_script = load_intellisense_test_file("final_hardcore.sql");
+    let oracle_data = oracle_test_file_scoped_intellisense_data("final_hardcore.sql");
+    check(
+        oracle_script,
+        Oracle,
+        &oracle_data,
+        &[
+            ("NUMBER DEFAULT -1 ON CONVERSION ERROR", "DEFAULT"),
+            ("GENERATED ALWAYS AS (ROUND", "AS"),
+            ("NOT NULL ANNOTATIONS (Display", "ANNOTATIONS"),
+            ("PARTITION BY RANGE (sale_day) INTERVAL", "INTERVAL"),
+            ("RUNNING SUM(metric_value)", "RUNNING"),
+            ("\n  ALL ROWS PER MATCH WITH UNMATCHED ROWS", "UNMATCHED"),
+            ("APPEND '$.tags'", "APPEND"),
+            ("m.payload.grade.string()", "string"),
+            ("INSERT INTO TABLE(SELECT b.nums", "TABLE"),
+            ("SET t.COLUMN_VALUE =", "COLUMN_VALUE"),
+            ("RULES ITERATE (5) UNTIL", "ITERATE"),
+            ("SYSTIMESTAMP - INTERVAL", "SYSTIMESTAMP"),
+            ("IN OUT DBMS_TF.TABLE_T", "DBMS_TF"),
+            ("new_columns => DBMS_TF", "new_columns"),
+            ("l_env.row_count LOOP", "row_count"),
+            ("ATTRIBUTE DIMENSION sq_hard_node_ad", "ATTRIBUTE"),
+            ("ATTRIBUTES (node_id, node_name)", "node_id"),
+            ("USING sq_hard_node_ad (node_lvl)", "node_lvl"),
+            ("total_value FACT metric_value", "metric_value"),
+            ("PARTITION BY node_id\n  ORDER BY metric_day", "node_id"),
+            ("ORDER BY metric_day\n  MEASURES", "metric_day"),
+            ("RUNNING SUM(metric_value) AS run_val", "metric_value"),
+            ("WHERE b.bag_id = 1)\nVALUES", "bag_id"),
+            ("DBMS_FLASHBACK.GET_SYSTEM_CHANGE_NUMBER", "GET_SYSTEM_CHANGE_NUMBER"),
+            ("DBMS_TF.PUT_COL(1, l_tags)", "PUT_COL"),
+            ("\n    sq_hard_node_ad\n      KEY", "sq_hard_node_ad"),
+            ("HIERARCHIES (sq_hard_node_h DEFAULT)", "sq_hard_node_h"),
+            ("sq_hard_node_h.member_name AS", "member_name"),
+            ("SEQUENCE => i * i", "SEQUENCE"),
+            ("SEQUENCE => i * i", "i"),
+            ("FOR v IN VALUES OF", "VALUES"),
+            ("GROUP BY grp_alias", "grp_alias"),
+            ("COUNT(DISTINCT row_tag)", "row_tag"),
+            ("SELECT total_value INTO av_all_total", "total_value"),
+        ],
+    );
+    let oracle_cte_script = load_intellisense_test_file("test20.sql");
+    let oracle_cte_data = oracle_test_file_scoped_intellisense_data("test20.sql");
+    check(
+        oracle_cte_script,
+        Oracle,
+        &oracle_cte_data,
+        &[("WITH x AS\n            (", "AS")],
+    );
+
+    let mariadb_script = load_mariadb_intellisense_test_file("final_hardcore.sql");
+    let mariadb_data = mysql_family_test_intellisense_data("final_hardcore.sql", MariaDB);
+    check(
+        mariadb_script,
+        MariaDB,
+        &mariadb_data,
+        &[
+            ("JOIN sq_hard_mariadb_aux.node_lookup l ON l.node_id", "node_id"),
+            ("PROCEDURE ping(OUT x INT);", "PROCEDURE"),
+            ("CALL sq_hard_pack.ping", "sq_hard_pack"),
+            ("OFFSET 0 ROWS FETCH", "OFFSET"),
+            ("ANALYZE FORMAT=JSON", "FORMAT"),
+            ("ENGINE = Aria TRANSACTIONAL", "Aria"),
+            ("EXCHANGE PARTITION pe_lo", "PARTITION"),
+            ("DELETE FROM p\nUSING", "p"),
+            ("USING prune_rows p", "USING"),
+            ("INTERSECT DISTINCT", "DISTINCT"),
+        ],
+    );
+
+    let mysql_script = load_mysql_intellisense_test_file("final_hardcore.sql");
+    let mysql_data = mysql_family_test_intellisense_data("final_hardcore.sql", MySQL);
+    check(
+        mysql_script,
+        MySQL,
+        &mysql_data,
+        &[
+            ("(TABLE metric ORDER BY", "TABLE"),
+            ("SUBPARTITION BY KEY", "KEY"),
+            ("JOIN sq_hard_mysql_aux.node_lookup l ON l.node_id", "node_id"),
+            ("ALGORITHM = INSTANT", "INSTANT"),
+            ("WITH CHECK OPTION", "WITH"),
+            (
+                "UNION ALL\n(TABLE metric ORDER BY metric_id ASC",
+                "TABLE",
+            ),
+            ("DELETE FROM p\nUSING", "p"),
+            ("USING prune_rows p", "USING"),
+            ("SET SESSION cte_max_recursion_depth", "cte_max_recursion_depth"),
+        ],
+    );
+}
+
+#[test]
+fn mysql_custom_delimiter_terminators_are_not_completion_candidates() {
+    use crate::db::DatabaseType::{MariaDB, MySQL};
+
+    for db_type in [MariaDB, MySQL] {
+        let script =
+            "DELIMITER $$\nCREATE PROCEDURE p()\nBEGIN\nEND$$\nDELIMITER ;\nSELECT END_TOKEN;";
+        let end_start = script.find("END$$").expect("custom delimiter terminator");
+        assert!(intellisense_sweep_is_mysql_custom_delimiter_fragment(
+            script, end_start, "END$$", db_type,
+        ));
+
+        let label_start = script.find("END$$").expect("custom delimiter terminator");
+        assert!(intellisense_sweep_is_mysql_custom_delimiter_fragment(
+            script,
+            label_start,
+            "outer_block$$",
+            db_type,
+        ));
+
+        let ordinary_start = script.find("END_TOKEN").expect("ordinary identifier");
+        assert!(!intellisense_sweep_is_mysql_custom_delimiter_fragment(
+            script,
+            ordinary_start,
+            "END_TOKEN",
+            db_type,
+        ));
+    }
+}
+
 fn oracle_intellisense_data_from_catalog(catalog: &MysqlFamilyScriptCatalog) -> IntellisenseData {
     let mut data = intellisense_data_from_mysql_family_catalog(catalog);
 
@@ -51357,7 +52004,7 @@ fn oracle_intellisense_data_from_catalog(catalog: &MysqlFamilyScriptCatalog) -> 
         ],
     );
 
-    for package in ["DBMS_FLASHBACK", "DBMS_OUTPUT", "DBMS_RANDOM"] {
+    for package in ["DBMS_FLASHBACK", "DBMS_OUTPUT", "DBMS_RANDOM", "DBMS_TF"] {
         push_unique_case_insensitive(&mut data.packages, package);
     }
     data.set_members_for_qualifier_with_kinds(
@@ -51378,6 +52025,45 @@ fn oracle_intellisense_data_from_catalog(catalog: &MysqlFamilyScriptCatalog) -> 
         "DBMS_RANDOM",
         vec![("VALUE".to_string(), Some(QualifiedMemberKind::Function))],
     );
+    data.set_members_for_qualifier_with_kinds(
+        "DBMS_TF",
+        vec![
+            ("TABLE_T".to_string(), Some(QualifiedMemberKind::Type)),
+            ("DESCRIBE_T".to_string(), Some(QualifiedMemberKind::Type)),
+            ("COLUMNS_NEW_T".to_string(), Some(QualifiedMemberKind::Type)),
+            (
+                "COLUMN_METADATA_T".to_string(),
+                Some(QualifiedMemberKind::Type),
+            ),
+            ("ENV_T".to_string(), Some(QualifiedMemberKind::Type)),
+            ("TAB_VARCHAR2_T".to_string(), Some(QualifiedMemberKind::Type)),
+            ("TYPE_VARCHAR2".to_string(), Some(QualifiedMemberKind::Type)),
+            ("GET_ENV".to_string(), Some(QualifiedMemberKind::Function)),
+            ("PUT_COL".to_string(), Some(QualifiedMemberKind::Procedure)),
+        ],
+    );
+    for qualifier in ["ENV_T", "DBMS_TF.ENV_T"] {
+        data.set_members_for_qualifier_with_kinds(
+            qualifier,
+            vec![("ROW_COUNT".to_string(), None)],
+        );
+    }
+    for (routine, parameters) in [
+        ("DBMS_TF.DESCRIBE_T", &["NEW_COLUMNS"][..]),
+        ("DBMS_TF.COLUMN_METADATA_T", &["NAME", "TYPE"][..]),
+        ("DBMS_TF.PUT_COL", &["COLUMN_ID", "COLLECTION"][..]),
+    ] {
+        data.set_signature(
+            routine.to_string(),
+            Some(script_signature_label(
+                routine.rsplit_once('.').map_or(routine, |(_, name)| name),
+                &parameters
+                    .iter()
+                    .map(|parameter| (*parameter).to_string())
+                    .collect::<Vec<_>>(),
+            )),
+        );
+    }
     push_unique_case_insensitive(&mut data.types, "SYS_REFCURSOR");
 
     data.rebuild_indices();
@@ -51395,6 +52081,8 @@ fn mysql_family_test_intellisense_data(
     };
     let catalog = mysql_family_catalog_from_script(script);
     let mut data = intellisense_data_from_mysql_family_catalog(&catalog);
+    push_unique_case_insensitive(&mut data.tables, "DUAL");
+    data.set_columns_for_table("DUAL", vec!["DUMMY".to_string()]);
     push_unique_case_insensitive(&mut data.schemas, "INFORMATION_SCHEMA");
     for (table, columns) in [
         (
@@ -52713,7 +53401,7 @@ fn intellisense_sweep_is_oracle_routine_parameter_definition(
     next.is_some_and(|word| {
         matches!(word.as_str(), "IN" | "OUT" | "INOUT")
             || intellisense_sweep_is_mysql_type_lead(&word)
-            || word == "SYS_REFCURSOR"
+            || matches!(word.as_str(), "SYS_REFCURSOR" | "TABLE")
     })
 }
 
@@ -52982,18 +53670,19 @@ fn intellisense_sweep_is_mysql_handler_index_reference(
     original_word: &str,
     db_type: crate::db::DatabaseType,
 ) -> bool {
-    let following = sql
+    let tail = sql
         .get(cursor..)
         .unwrap_or("")
-        .trim_start_matches(|ch: char| ch.is_whitespace() || matches!(ch, '`' | '"' | ']'))
+        .trim_start_matches(|ch: char| ch.is_whitespace() || matches!(ch, '`' | '"' | ']'));
+    let following = tail
         .split(|ch: char| !crate::sql_text::is_identifier_char(ch))
         .next()
         .unwrap_or("");
     if !crate::sql_text::mysql_compatibility_for_sql("", Some(db_type))
-        || !matches!(
+        || (!matches!(
             following.to_ascii_uppercase().as_str(),
             "FIRST" | "LAST" | "NEXT" | "PREV"
-        )
+        ) && !tail.starts_with(['=', '<', '>']))
     {
         return false;
     }
@@ -53014,6 +53703,31 @@ fn intellisense_sweep_is_mysql_handler_index_reference(
                     .to_ascii_uppercase()
                     .starts_with(partial.as_str())
     )
+}
+
+fn intellisense_sweep_is_mysql_custom_delimiter_fragment(
+    sql: &str,
+    word_start: usize,
+    original_word: &str,
+    db_type: crate::db::DatabaseType,
+) -> bool {
+    if !db_type.is_mysql_or_mariadb() {
+        return false;
+    }
+    let delimiter = sql
+        .get(..word_start)
+        .unwrap_or("")
+        .lines()
+        .rev()
+        .find_map(|line| {
+            let mut words = line.split_whitespace();
+            words
+                .next()
+                .is_some_and(|word| word.eq_ignore_ascii_case("DELIMITER"))
+                .then(|| words.next().unwrap_or(";").to_string())
+        })
+        .unwrap_or_else(|| ";".to_string());
+    delimiter != ";" && original_word.ends_with(&delimiter)
 }
 
 fn intellisense_sweep_is_cte_name_with_column_list_definition(
@@ -53328,6 +54042,49 @@ fn intellisense_sweep_is_definition_slot(
         .trim_matches(|ch| matches!(ch, '"' | '`'))
         .to_ascii_uppercase();
     let next_word = intellisense_sweep_next_meaningful_word(sql, cursor);
+    if !crate::sql_text::is_sql_keyword_for_db(&original_upper, db_type) {
+        let statement_words = tokens_before_word
+            .iter()
+            .filter_map(|token| token_word_text(Some(token)).map(str::to_ascii_uppercase))
+            .collect::<Vec<_>>();
+        let previous_word = statement_words.last().map(String::as_str);
+        let statement_has = |word: &str| statement_words.iter().any(|item| item == word);
+        let statement_text = sql
+            .get(..word_start)
+            .unwrap_or("")
+            .rsplit_once(';')
+            .map_or_else(
+                || sql.get(..word_start).unwrap_or(""),
+                |(_, statement)| statement,
+            )
+            .to_ascii_uppercase();
+        if (statement_has("ANNOTATIONS")
+            && statement_text.matches('(').count() > statement_text.matches(')').count())
+            || (previous_word == Some("LEVEL")
+                && statement_has("ATTRIBUTE")
+                && statement_has("DIMENSION"))
+            || (next_word
+                .as_deref()
+                .is_some_and(|word| word.eq_ignore_ascii_case("FACT"))
+                && statement_has("ANALYTIC")
+                && statement_has("MEASURES"))
+            || (previous_word == Some("PARTITION")
+                && statement_has("ALTER")
+                && statement_has("EXCHANGE"))
+            || (matches!(
+                tokens_before_word.last(),
+                Some(SqlToken::Symbol(symbol)) if symbol == "."
+            ) && sql.get(cursor..).unwrap_or("").trim_start().starts_with('.')
+                && next_word.as_deref().is_some_and(|word| {
+                    matches!(
+                        word.to_ascii_uppercase().as_str(),
+                        "BOOLEAN" | "DATE" | "NUMBER" | "SIZE" | "STRING" | "TIMESTAMP" | "TYPE"
+                    )
+                }))
+        {
+            return true;
+        }
+    }
 
     // A quoted / backtick identifier is a name the author types explicitly, so
     // it is never "completed" when it introduces a brand-new object. This covers
@@ -53406,6 +54163,21 @@ fn intellisense_sweep_is_definition_slot(
             .starts_with('\'')
     {
         return true;
+    }
+    if original_word.starts_with('_') {
+        let tail = sql.get(cursor..).unwrap_or("").trim_start();
+        if tail
+            .chars()
+            .next()
+            .is_some_and(|ch| matches!(ch, 'B' | 'N' | 'X' | 'b' | 'n' | 'x'))
+            && tail
+                .get(1..)
+                .unwrap_or("")
+                .trim_start()
+                .starts_with('\'')
+        {
+            return true;
+        }
     }
 
     // The RHS of a `COLLATE` operator is a collation name drawn from the live
@@ -53848,6 +54620,12 @@ fn intellisense_sweep_word_skip_context_from_analysis(
     cursor_in_literal_or_comment
         || analysis.cursor_in_alias_declaration
         || deep_ctx.ddl_new_name_position
+        || intellisense_sweep_is_mysql_custom_delimiter_fragment(
+            sql,
+            word_start,
+            original_word,
+            db_type,
+        )
         || intellisense_sweep_is_out_of_scope_relation_qualifier(
             sql,
             cursor,
@@ -53991,6 +54769,19 @@ fn intellisense_sweep_check_candidate(
     base_data: &IntellisenseData,
     candidate: &IntellisenseSweepCandidate,
 ) -> IntellisenseSweepCandidateResult {
+    if intellisense_sweep_is_mysql_custom_delimiter_fragment(
+        script,
+        candidate.start,
+        &candidate.word,
+        db_type,
+    ) {
+        return IntellisenseSweepCandidateResult {
+            checked: false,
+            suggestions_checked: 0,
+            missing: None,
+            untyped_suggestions: Vec::new(),
+        };
+    }
     let mut snapshot = base_snapshot.clone();
     assert!(snapshot.replace_range(
         candidate.start,

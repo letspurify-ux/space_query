@@ -10,6 +10,7 @@
 -- server so the formatted output can be re-executed for certification.
 
 DROP DATABASE IF EXISTS sq_hard_mariadb;
+DROP DATABASE IF EXISTS sq_hard_mariadb_aux;
 CREATE DATABASE sq_hard_mariadb CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
 USE sq_hard_mariadb;
 SET SESSION sql_mode = 'STRICT_TRANS_TABLES,NO_ENGINE_SUBSTITUTION';
@@ -565,11 +566,252 @@ SELECT DATE_ADD(STR_TO_DATE('2026/01/31', '%Y/%m/%d'),
                      '2026-01-03 12:00:00')              AS hour_gap,
        ADDTIME(TIME'10:30:00', '01:15:30.5')             AS padded_time;
 
+-- ULTRA WAVE 3: cross-database objects force schema-qualified completion.
+CREATE DATABASE sq_hard_mariadb_aux CHARACTER SET utf8mb4;
+CREATE TABLE sq_hard_mariadb_aux.node_lookup (
+  node_id   INT NOT NULL PRIMARY KEY,
+  node_tag  VARCHAR(20) NOT NULL
+) ENGINE = InnoDB;
+INSERT INTO sq_hard_mariadb_aux.node_lookup VALUES (1, 'core'), (2, 'edge');
+
+SELECT m.metric_id, l.node_tag
+FROM metric m
+JOIN sq_hard_mariadb_aux.node_lookup l ON l.node_id = m.node_id
+WHERE m.metric_id <= 2
+ORDER BY m.metric_id;
+
+-- Lexer bait: backtick aliases containing comment openers, charset introducers
+-- with hex payloads, bit literals, null-safe / XOR / && operators, and a
+-- running user-variable assignment inside the projection.
+SELECT '/* not a comment */'                    AS `co--mment`,
+       '-- still a string'                      AS `/*alias*/`,
+       _utf8mb4 X'E29C93'                       AS check_glyph,
+       _binary X'DEAD'                          AS bin_lit,
+       0b1011                                   AS zerob_literal,
+       N'국가별'                                AS national_lit,
+       NULL <=> NULL                            AS null_safe_eq,
+       TRUE XOR FALSE                           AS xor_flag,
+       (1 < 2) && (3 < 4)                       AS and_legacy
+FROM DUAL;
+
+SET @running_total := 0;
+SELECT (@running_total := @running_total + s.metric_value) AS running_assign
+FROM (SELECT metric_value FROM metric ORDER BY metric_id) s;
+
+-- MariaDB 11.4+ packages outside sql_mode=ORACLE, built under DELIMITER //
+-- while the body carries a literal '$$' splitter bait.
+DELIMITER //
+CREATE PACKAGE sq_hard_pack
+  PROCEDURE ping(OUT x INT);
+  FUNCTION fortytwo() RETURNS INT;
+END//
+CREATE PACKAGE BODY sq_hard_pack
+  PROCEDURE ping(OUT x INT)
+  BEGIN
+    SET x = CHAR_LENGTH('$$') + 40;
+  END;
+  FUNCTION fortytwo() RETURNS INT
+  BEGIN
+    RETURN 42;
+  END;
+END//
+DELIMITER ;
+
+CALL sq_hard_pack.ping(@pack_probe);
+
+-- Compound block with ROW TYPE OF / TYPE OF anchored declarations and a
+-- ROW-constructor comparison.
+DELIMITER $$
+BEGIN NOT ATOMIC
+  DECLARE rec  ROW TYPE OF metric;
+  DECLARE v_id TYPE OF metric.metric_id;
+  SELECT metric_id, node_id, measured_on, metric_value
+    INTO rec
+    FROM metric WHERE metric_id = 1;
+  SET v_id = rec.metric_id;
+  IF ROW(rec.metric_id, rec.node_id) = ROW(1, 1) THEN
+    SET @row_probe = rec.metric_value + v_id;
+  ELSE
+    SET @row_probe = -1;
+  END IF;
+END$$
+DELIMITER ;
+
+-- MariaDB-only statement shells: SET STATEMENT ... FOR, LIMIT ROWS EXAMINED,
+-- and OFFSET ... FETCH ... WITH TIES row limiting.
+SET STATEMENT max_statement_time = 0 FOR
+SELECT COUNT(*) AS stmt_scoped_count FROM metric;
+
+SELECT metric_id, metric_value
+FROM metric
+ORDER BY metric_id
+LIMIT 2 ROWS EXAMINED 1000;
+
+SELECT metric_id, metric_value
+FROM metric
+ORDER BY metric_value DESC
+OFFSET 0 ROWS FETCH FIRST 2 ROWS WITH TIES;
+
+-- Diagnostic statement family: ANALYZE (executes!), EXPLAIN EXTENDED,
+-- EXPLAIN FORMAT=JSON, ANALYZE TABLE, CHECKSUM TABLE.
+ANALYZE FORMAT=JSON
+SELECT node_id, SUM(metric_value) FROM metric GROUP BY node_id;
+
+EXPLAIN EXTENDED
+SELECT m.metric_id FROM metric m WHERE m.metric_value > 10;
+
+EXPLAIN FORMAT=JSON
+SELECT node_id FROM metric GROUP BY node_id;
+
+ANALYZE TABLE metric;
+CHECKSUM TABLE metric, scratch_rows;
+
+-- View stack: ALGORITHM/DEFINER/SQL SECURITY plus WITH CASCADED CHECK OPTION,
+-- then DML routed through the view (insert and delete).
+CREATE ALGORITHM = MERGE DEFINER = CURRENT_USER SQL SECURITY INVOKER
+VIEW high_metric_v AS
+SELECT metric_id, node_id, measured_on, metric_value
+FROM metric
+WHERE metric_value >= 10
+WITH CASCADED CHECK OPTION;
+
+INSERT INTO high_metric_v (metric_id, node_id, measured_on, metric_value)
+VALUES (91, 9, '2026-05-01', 99);
+CALL sq_hard_assert(
+  (SELECT COUNT(*) FROM metric WHERE metric_id = 91) = 1,
+  'insert through check-option view'
+);
+DELETE FROM high_metric_v WHERE metric_id = 91;
+
+-- Engine zoo: Aria with PAGE_CHECKSUM, CREATE TABLE ... LIKE onto a partitioned
+-- source, REMOVE PARTITIONING, and EXCHANGE PARTITION handover.
+CREATE TABLE aria_notes (
+  note_id INT NOT NULL PRIMARY KEY,
+  note    VARCHAR(60) NOT NULL
+) ENGINE = Aria TRANSACTIONAL = 1 PAGE_CHECKSUM = 1;
+INSERT INTO aria_notes VALUES (1, '아리아 엔진'), (2, 'page checksum');
+
+CREATE TABLE exch_metric (
+  id INT NOT NULL PRIMARY KEY,
+  v  INT NOT NULL
+) ENGINE = InnoDB
+PARTITION BY RANGE (id) (
+  PARTITION pe_lo VALUES LESS THAN (100),
+  PARTITION pe_hi VALUES LESS THAN MAXVALUE
+);
+INSERT INTO exch_metric VALUES (1, 10), (2, 20), (500, 50);
+
+CREATE TABLE exch_swap LIKE exch_metric;
+ALTER TABLE exch_swap REMOVE PARTITIONING;
+ALTER TABLE exch_metric EXCHANGE PARTITION pe_lo WITH TABLE exch_swap;
+
+-- Multi-table UPDATE and both multi-table DELETE spellings.
+CREATE TABLE prune_rows (
+  id INT NOT NULL PRIMARY KEY,
+  v  INT NOT NULL
+) ENGINE = InnoDB;
+INSERT INTO prune_rows VALUES (1, 1), (2, 2), (3, 3), (4, 4);
+
+UPDATE prune_rows p
+JOIN metric m ON m.metric_id = p.id
+SET p.v = p.v + m.node_id;
+
+DELETE p
+FROM prune_rows p
+JOIN metric m ON m.metric_id = p.id
+WHERE m.node_id = 2;
+
+DELETE FROM p
+USING prune_rows p
+JOIN metric m ON m.metric_id = p.id
+WHERE m.metric_value >= 24;
+
+REPLACE INTO prune_rows (id, v) VALUES (1, 100);
+INSERT IGNORE INTO prune_rows (id, v) VALUES (1, 999), (8, 80);
+
+INSERT INTO prune_rows (id, v)
+SELECT metric_id + 20, node_id FROM metric WHERE node_id = 2
+RETURNING id, v;
+
+-- JSON path wildcards, JSON_DETAILED/JSON_COMPACT round trip, and JSON_EXISTS.
+SELECT JSON_EXTRACT(s.json_value, '$**.v')                        AS wildcard_vals,
+       JSON_COMPACT(JSON_DETAILED(s.json_value)) = s.json_value  AS json_roundtrip,
+       JSON_EXISTS(s.json_value, '$.items[1].n')                 AS has_second_item
+FROM `select` s;
+
+-- PERCENTILE_DISC ordered-set function beside its window siblings.
+SELECT DISTINCT node_id,
+       PERCENTILE_DISC(0.5) WITHIN GROUP (ORDER BY metric_value)
+         OVER (PARTITION BY node_id) AS median_disc
+FROM metric
+ORDER BY node_id;
+
+-- Third trigger wired in with PRECEDES, then a probing insert.
+CREATE TRIGGER scratch_zero
+BEFORE INSERT ON scratch_rows FOR EACH ROW
+PRECEDES scratch_first
+INSERT INTO trigger_log (note) VALUES (CONCAT('zero:', NEW.id));
+
+INSERT INTO scratch_rows (id, v) VALUES (11, 110);
+
+-- HANDLER with an explicit backticked index probe, advisory locks, and DO.
+HANDLER prune_rows OPEN AS prune_handle;
+HANDLER prune_handle READ `PRIMARY` FIRST;
+HANDLER prune_handle READ `PRIMARY` = (8);
+HANDLER prune_handle CLOSE;
+
+SELECT GET_LOCK('sq_hard_lock', 0) AS got_lock;
+DO RELEASE_LOCK('sq_hard_lock');
+
+-- Prepared statement whose text is assembled in a user variable.
+SET @dyn_sql = CONCAT('SELECT COUNT(*) AS dyn_count FROM ',
+                      'metric WHERE node_id = ?');
+PREPARE dyn_stmt FROM @dyn_sql;
+SET @dyn_node = 1;
+EXECUTE dyn_stmt USING @dyn_node;
+DEALLOCATE PREPARE dyn_stmt;
+
+-- Explicit INTERSECT/EXCEPT DISTINCT spellings.
+(SELECT node_id FROM metric)
+INTERSECT DISTINCT
+(SELECT node_id FROM sq_hard_mariadb_aux.node_lookup)
+EXCEPT DISTINCT
+(SELECT 999 FROM DUAL)
+ORDER BY node_id;
+
+-- Wave-3 self-verification.
+CALL sq_hard_assert(@pack_probe = 42 AND sq_hard_pack.fortytwo() = 42,
+                    'package procedure/function');
+CALL sq_hard_assert(@row_probe = 13, 'row type of block');
+CALL sq_hard_assert(@running_total = 56, 'user variable running total');
+CALL sq_hard_assert(
+  (SELECT COUNT(*) FROM exch_metric) = 1 AND
+  (SELECT COUNT(*) FROM exch_swap) = 2,
+  'exchange partition'
+);
+CALL sq_hard_assert(
+  (SELECT COUNT(*) FROM prune_rows) = 4,
+  'multi-table delete/replace/ignore net rows'
+);
+CALL sq_hard_assert(
+  (SELECT COUNT(*) FROM trigger_log
+   WHERE note IN ('zero:11', 'first:11', 'second:110')) = 3,
+  'precedes/follows trigger trio'
+);
+CALL sq_hard_assert(
+  (SELECT JSON_COMPACT(JSON_EXTRACT(json_value, '$**.v')) FROM `select`) = '[10,20]',
+  'json wildcard path'
+);
+CALL sq_hard_assert(
+  (SELECT COUNT(*) FROM aria_notes) = 2,
+  'aria engine rows'
+);
+
 -- Extension self-verification.
 CALL sq_hard_assert(@spin_total = 16, 'repeat/while spin total');
 CALL sq_hard_assert(
-  (SELECT COUNT(*) FROM scratch_rows) = 5,
-  'scratch rows after returning-delete/xa/trigger inserts'
+  (SELECT COUNT(*) FROM scratch_rows) = 6,
+  'scratch rows after returning-delete/xa/trigger/wave3 inserts'
 );
 CALL sq_hard_assert(
   (SELECT v FROM scratch_rows WHERE id = 1) = 110,

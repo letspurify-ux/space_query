@@ -479,7 +479,7 @@ COMMIT;
 -- db: Oracle
 -- metadata: test Oracle inferred catalog (file-scoped overlay) + Oracle built-ins
 -- checked: 664
--- suggestions checked: 4470
+-- suggestions checked: 4476
 -- missing: 0
 -- suggestions without type labels: 0
 -- marker: [[word]] means not suggested for the tested prefix

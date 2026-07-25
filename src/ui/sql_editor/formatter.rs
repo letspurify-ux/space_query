@@ -2233,6 +2233,8 @@ pub(super) enum ListOwnerKind {
     SearchBy,
     CycleColumns,
     DiagnosticsItems,
+    SignalItems,
+    IterationControls,
     DeleteTargets,
     Subset,
     UpdateTargets,
@@ -2297,6 +2299,8 @@ impl ListOwnerKind {
         Self::SearchBy,
         Self::CycleColumns,
         Self::DiagnosticsItems,
+        Self::SignalItems,
+        Self::IterationControls,
         Self::DeleteTargets,
         Self::Subset,
         Self::UpdateTargets,
@@ -9835,6 +9839,7 @@ impl SqlEditorWidget {
                 | "CUME_DIST"
                 | "FIRST_VALUE"
                 | "JSON_VALUE"
+                | "DESCRIBE"
         );
         if !keyword_can_be_identifier {
             return false;
@@ -9895,7 +9900,10 @@ impl SqlEditorWidget {
         let next_token_is_open_paren =
             matches!(next_token, Some(SqlToken::Symbol(sym)) if sym == "(");
 
-        // Routine names: `PROCEDURE seed (...)`, `FUNCTION seed ...`.
+        // Routine names which can also occupy identifier slots keep their
+        // source spelling (`FUNCTION describe`, `PROCEDURE qualify`). Keywords
+        // outside the ambiguity set above retain the formatter's established
+        // keyword normalization (`PROCEDURE AUDIT`).
         if matches!(
             prev_token,
             Some(SqlToken::Word(prev_word))
@@ -10987,6 +10995,51 @@ impl SqlEditorWidget {
             true
         });
         has_signal
+    }
+
+    fn oracle_for_in_has_multiple_iteration_controls(tokens: &[SqlToken], idx: usize) -> bool {
+        let mut paren_depth = 0usize;
+        let mut bracket_depth = 0usize;
+        let mut saw_body_token = false;
+        let mut saw_separator = false;
+
+        for token in tokens.iter().skip(idx.saturating_add(1)) {
+            match token {
+                SqlToken::Comment(_) => {}
+                SqlToken::Symbol(symbol) => match symbol.as_str() {
+                    "(" => {
+                        if !saw_body_token {
+                            return false;
+                        }
+                        paren_depth = paren_depth.saturating_add(1);
+                        saw_body_token = true;
+                    }
+                    ")" => paren_depth = paren_depth.saturating_sub(1),
+                    "[" => {
+                        bracket_depth = bracket_depth.saturating_add(1);
+                        saw_body_token = true;
+                    }
+                    "]" => bracket_depth = bracket_depth.saturating_sub(1),
+                    "," if paren_depth == 0 && bracket_depth == 0 => saw_separator = true,
+                    ";" if paren_depth == 0 && bracket_depth == 0 => return false,
+                    _ => saw_body_token = true,
+                },
+                SqlToken::Word(word) if paren_depth == 0 && bracket_depth == 0 => {
+                    if !saw_body_token
+                        && (word.eq_ignore_ascii_case("SELECT")
+                            || word.eq_ignore_ascii_case("WITH"))
+                    {
+                        return false;
+                    }
+                    if word.eq_ignore_ascii_case("LOOP") || word.eq_ignore_ascii_case("DO") {
+                        return saw_separator;
+                    }
+                    saw_body_token = true;
+                }
+                SqlToken::Word(_) | SqlToken::String(_) => saw_body_token = true,
+            }
+        }
+        false
     }
 
     /// Returns true when UPDATE is the keyword following ON DUPLICATE KEY,
@@ -12626,6 +12679,13 @@ impl SqlEditorWidget {
                                 SqlToken::Word(word) if word.eq_ignore_ascii_case("DUALITY")
                             )
                         });
+                    let oracle_iteration_collection_keyword = !mysql_compatible
+                        && matches!(upper, "INDICES" | "VALUES")
+                        && matches!(prev_word_upper, Some("IN"))
+                        && next_word_is("OF")
+                        && format_stack
+                            .last_condition_owner(ConditionOwnerKind::LoopHeader)
+                            .is_some_and(|owner| owner.scope == current_scope);
                     // A control keyword acting as an alias keeps its source
                     // case only when the previous token proves the alias slot
                     // (a non-keyword word such as the table/column name, or a
@@ -12651,7 +12711,8 @@ impl SqlEditorWidget {
                         || treat_control_keyword_as_identifier
                         || follows_alias_control_keyword
                         || mysql_xa_subcommand
-                        || oracle_json_duality_capability_keyword;
+                        || oracle_json_duality_capability_keyword
+                        || oracle_iteration_collection_keyword;
                     let model_bracket_member = construct_flag_active!(ModelActive)
                         && delimiter_frame_state.innermost_is_bracket();
                     let on_duplicate_key_values_function =
@@ -14575,6 +14636,10 @@ impl SqlEditorWidget {
                                     .map(|frame| frame.depth.saturating_sub(1));
                                 closed_control_header_body_indent =
                                     closed_control_header_owner_indent.map(|indent| indent + 1);
+                                format_stack.clear_list_owner_kind_at_scope(
+                                    current_scope,
+                                    ListOwnerKind::IterationControls,
+                                );
                             }
                             let follows_for_range_case_end = follows_for_while
                                 && matches!(prev_word_upper, Some("END"))
@@ -15759,6 +15824,36 @@ impl SqlEditorWidget {
                         );
                     }
                     if mysql_compatible
+                        && upper == "SET"
+                        && Self::is_mysql_signal_set_clause_from_indices(
+                            tokens,
+                            &recent_statement_word_indices,
+                        )
+                    {
+                        format_stack.push_list_owner_kind_for_render(
+                            current_scope,
+                            ListOwnerKind::SignalItems,
+                            idx,
+                            tokens,
+                            line_indent,
+                        );
+                    }
+                    if !mysql_compatible
+                        && upper == "IN"
+                        && format_stack
+                            .last_condition_owner(ConditionOwnerKind::LoopHeader)
+                            .is_some_and(|owner| owner.scope == current_scope)
+                        && Self::oracle_for_in_has_multiple_iteration_controls(tokens, idx)
+                    {
+                        format_stack.push_list_owner_kind_for_render(
+                            current_scope,
+                            ListOwnerKind::IterationControls,
+                            idx,
+                            tokens,
+                            line_indent,
+                        );
+                    }
+                    if mysql_compatible
                         && upper == "DECLARE"
                         && (recent_statement_word_indices.is_empty()
                             || matches!(
@@ -15958,9 +16053,10 @@ impl SqlEditorWidget {
                         (Some("LOCK"), "TABLE" | "TABLES") | (Some("FLUSH"), "TABLES") => {
                             Some(ListOwnerKind::LockTables)
                         }
-                        (Some("ANALYZE" | "CHECK" | "OPTIMIZE" | "REPAIR"), "TABLE") => {
-                            Some(ListOwnerKind::MaintenanceTables)
-                        }
+                        (
+                            Some("ANALYZE" | "CHECK" | "CHECKSUM" | "OPTIMIZE" | "REPAIR"),
+                            "TABLE",
+                        ) => Some(ListOwnerKind::MaintenanceTables),
                         (Some("CREATE" | "ALTER" | "DROP"), "USER" | "ROLE") => {
                             Some(ListOwnerKind::AccountTargets)
                         }
@@ -16587,7 +16683,7 @@ impl SqlEditorWidget {
                             next_non_comment_idx,
                         );
                         #[cfg(test)]
-                        if upper == "UNTIL" {
+                        if upper == "UNTIL" && format_stack.last_block_kind_is("REPEAT") {
                             format_stack
                                 .audit_mark_last_condition_attached(ConditionOwnerKind::Generic);
                         }

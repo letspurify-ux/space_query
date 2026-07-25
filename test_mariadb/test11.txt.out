@@ -261,7 +261,7 @@ JSON_NORMALIZE(JSON_OBJECT('trap',@lexical_trap,'as_of_count',(SELECT COUNT(*)FR
 -- db: MariaDB
 -- metadata: test_mariadb/test11.txt inferred catalog
 -- checked: 786
--- suggestions checked: 4308
+-- suggestions checked: 4315
 -- missing: 0
 -- suggestions without type labels: 0
 -- marker: [[word]] means not suggested for the tested prefix

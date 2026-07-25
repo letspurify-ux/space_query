@@ -192,7 +192,7 @@ ORDER BY f.customer_id;
 -- db: MySQL
 -- metadata: test_mysql/test7.txt inferred catalog
 -- checked: 518
--- suggestions checked: 4928
+-- suggestions checked: 4958
 -- missing: 0
 -- suggestions without type labels: 0
 -- marker: [[word]] means not suggested for the tested prefix

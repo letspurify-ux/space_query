@@ -468,7 +468,7 @@ JSON_NORMALIZE(JSON_OBJECT(
 -- db: MariaDB
 -- metadata: test_mariadb/test15.txt inferred catalog
 -- checked: 1334
--- suggestions checked: 10461
+-- suggestions checked: 10480
 -- missing: 0
 -- suggestions without type labels: 0
 -- marker: [[word]] means not suggested for the tested prefix

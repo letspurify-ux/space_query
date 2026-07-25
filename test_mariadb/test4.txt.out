@@ -653,8 +653,8 @@ ORDER BY mr.ym,
 -- source: test_mariadb/test4.txt
 -- db: MariaDB
 -- metadata: test_mariadb/test4.txt inferred catalog
--- checked: 466
--- suggestions checked: 1423
+-- checked: 1175
+-- suggestions checked: 6749
 -- missing: 0
 -- suggestions without type labels: 0
 -- marker: [[word]] means not suggested for the tested prefix

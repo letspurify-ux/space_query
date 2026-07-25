@@ -1291,24 +1291,25 @@ where
             continue;
         }
 
-        if let Some(tag) = parse_dollar_quote_tag(sql, idx) {
-            let is_oracle_conditional_flag = !mysql_compatible
-                && tag == "$$"
-                && sql
-                    .get(idx.saturating_add(2)..)
-                    .and_then(|tail| tail.chars().next())
-                    .is_some_and(sql_text::is_identifier_start_char)
-                && oracle_conditional_header_is_open(&tokens, &current)
-                && oracle_conditional_header_has_then(sql, idx);
-            if !is_oracle_conditional_flag {
-                flush_word(&mut current, &mut current_start, idx, &mut tokens);
-                current_start = idx;
-                current.push_str(&tag);
-                dollar_quote_state.activate(tag.clone());
-                for _ in 0..tag.len().saturating_sub(1) {
-                    let _ = iter.next();
+        if !mysql_compatible {
+            if let Some(tag) = parse_dollar_quote_tag(sql, idx) {
+                let is_oracle_conditional_flag = tag == "$$"
+                    && sql
+                        .get(idx.saturating_add(2)..)
+                        .and_then(|tail| tail.chars().next())
+                        .is_some_and(sql_text::is_identifier_start_char)
+                    && oracle_conditional_header_is_open(&tokens, &current)
+                    && oracle_conditional_header_has_then(sql, idx);
+                if !is_oracle_conditional_flag {
+                    flush_word(&mut current, &mut current_start, idx, &mut tokens);
+                    current_start = idx;
+                    current.push_str(&tag);
+                    dollar_quote_state.activate(tag.clone());
+                    for _ in 0..tag.len().saturating_sub(1) {
+                        let _ = iter.next();
+                    }
+                    continue;
                 }
-                continue;
             }
         }
 
@@ -2786,6 +2787,20 @@ END$$"#;
         assert!(tokens
             .iter()
             .any(|t| matches!(t, SqlToken::String(s) if s == "$$a,(b)$$")));
+    }
+
+    #[test]
+    fn tokenize_mysql_custom_dollar_delimiter_does_not_hide_following_statements() {
+        let sql = "DELIMITER $$\nCREATE PROCEDURE p() BEGIN SELECT 1; END$$\n\
+                   DELIMITER ;\nCREATE DATABASE app_aux;\n";
+        let tokens = tokenize_sql_with_mysql_compat(sql, true);
+
+        assert!(tokens.iter().any(
+            |token| matches!(token, SqlToken::Word(word) if word.eq_ignore_ascii_case("app_aux"))
+        ));
+        assert!(!tokens.iter().any(
+            |token| matches!(token, SqlToken::String(text) if text.contains("CREATE DATABASE"))
+        ));
     }
 
     #[test]

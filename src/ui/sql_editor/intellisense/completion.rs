@@ -938,6 +938,7 @@ const MYSQL_SYSTEM_VARIABLE_NAME_SUGGESTIONS: &[&str] = &[
     "character_set_connection",
     "character_set_results",
     "collation_connection",
+    "cte_max_recursion_depth",
     "foreign_key_checks",
     "group_concat_max_len",
     "max_allowed_packet",
@@ -3160,6 +3161,13 @@ impl SqlEditorWidget {
                 &snapshot.prefix,
                 Some(snapshot.preferred_db_type),
             )
+            .or_else(|| {
+                Self::oracle_analytic_object_relation_for_column_slot_for_context(
+                    deep_ctx,
+                    &snapshot.prefix,
+                    Some(snapshot.preferred_db_type),
+                )
+            })
             .map(|relation| {
                 intellisense_data
                     .lock()
@@ -3304,17 +3312,40 @@ impl SqlEditorWidget {
                 "",
                 Some(snapshot.preferred_db_type),
             )
-            && prefix_is_followed_by_call_paren
             && Self::text_before_cursor_preceding_word_is(
                 &snapshot.signature_scan_text,
                 &snapshot.prefix,
                 "CALL",
             )
+            && (prefix_is_followed_by_call_paren
+                || Self::text_after_cursor_starts_with_qualifier_dot(
+                    &snapshot.text_after_cursor,
+                ))
         {
             let mut data = intellisense_data
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
-            data.get_procedure_object_suggestions(&snapshot.prefix)
+            if prefix_is_followed_by_call_paren {
+                data.get_procedure_object_suggestions(&snapshot.prefix)
+            } else {
+                data.get_package_object_suggestions(&snapshot.prefix)
+            }
+        } else {
+            Vec::new()
+        };
+        let early_oracle_analytic_reference_suggestions = if qualifier.is_none()
+            && Self::cursor_is_at_oracle_analytic_object_reference_slot_for_context(
+                deep_ctx,
+                &snapshot.prefix,
+                Some(snapshot.preferred_db_type),
+            )
+        {
+            let mut data = intellisense_data
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let dimensions = data.get_dimension_object_suggestions(&snapshot.prefix);
+            let views = data.get_view_object_suggestions(&snapshot.prefix);
+            Self::merge_suggestions_with_context_aliases(dimensions, views, false)
         } else {
             Vec::new()
         };
@@ -3332,6 +3363,27 @@ impl SqlEditorWidget {
             })
             .flatten()
         });
+        let has_early_qualified_catalog_member_suggestions =
+            qualifier.is_some_and(|qualifier| {
+                let mut data = intellisense_data
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                let qualifier_is_schema_namespace = data
+                    .schemas
+                    .iter()
+                    .chain(data.users.iter())
+                    .any(|name| name.eq_ignore_ascii_case(qualifier))
+                    || Self::qualifier_has_members_or_oracle_synonym_target(
+                        &data,
+                        qualifier,
+                        true,
+                        Some(snapshot.preferred_db_type),
+                    );
+                !qualifier_is_schema_namespace
+                    && !data
+                        .get_member_suggestions(qualifier, &snapshot.prefix, false)
+                        .is_empty()
+            });
         let early_oracle_show_errors_object_kind = if qualifier.is_none()
             && !snapshot.prefix.is_empty()
             && !crate::sql_text::mysql_compatibility_for_sql(
@@ -3737,12 +3789,26 @@ impl SqlEditorWidget {
         } else {
             Vec::new()
         };
+        let cursor_is_inside_oracle_match_recognize = if snapshot
+            .preferred_db_type
+            .is_mysql_or_mariadb()
+        {
+            false
+        } else {
+            let tokens = deep_ctx.statement_tokens.as_ref();
+            let end = Self::expected_suggestion_context_end(
+                tokens,
+                deep_ctx.cursor_token_len,
+                !snapshot.prefix.is_empty(),
+            );
+            Self::table_clause_construct_is_open(tokens, end, "MATCH_RECOGNIZE")
+        };
         let early_unqualified_visible_column_suggestions = if qualifier.is_none()
-            && matches!(
+            && (matches!(
                 deep_ctx.phase,
                 intellisense_context::SqlPhase::SelectList
                     | intellisense_context::SqlPhase::WhereClause
-            )
+            ) || cursor_is_inside_oracle_match_recognize)
         {
             let tables = deep_ctx
                 .tables_in_scope
@@ -3760,17 +3826,11 @@ impl SqlEditorWidget {
             .preferred_db_type
             .is_mysql_or_mariadb()
             && qualifier.is_some_and(|qualifier| {
-                deep_ctx.tables_in_scope.iter().any(|table| {
-                    table
-                        .alias
-                        .as_deref()
-                        .is_some_and(|alias| alias.eq_ignore_ascii_case(qualifier))
-                        && table
-                            .name
-                            .rsplit('.')
-                            .next()
-                            .is_some_and(|name| name.eq_ignore_ascii_case("ODCINUMBERLIST"))
-                })
+                Self::oracle_collection_table_source_matches_qualifier(
+                    deep_ctx,
+                    Some(snapshot.preferred_db_type),
+                    qualifier,
+                )
             })
             && Self::completion_suggestion_matches_prefix("COLUMN_VALUE", &snapshot.prefix)
         {
@@ -3823,10 +3883,19 @@ impl SqlEditorWidget {
             .unwrap_or_default();
         let early_qualified_visible_relation_column_suggestions = if let Some(qualifier) = qualifier
         {
-            let tables = intellisense_context::resolve_qualifier_tables(
+            let mut tables = intellisense_context::resolve_qualifier_tables(
                 qualifier,
                 &deep_ctx.tables_in_scope,
             );
+            if tables.is_empty()
+                && Self::oracle_hierarchy_qualifier_is_visible(
+                    deep_ctx,
+                    qualifier,
+                    Some(snapshot.preferred_db_type),
+                )
+            {
+                tables.push(qualifier.to_string());
+            }
             let mut data = intellisense_data
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -4101,9 +4170,11 @@ impl SqlEditorWidget {
             && early_signature_argument_suggestions.is_empty()
             && early_builtin_function_call_suggestions.is_empty()
             && early_mysql_call_target_suggestions.is_empty()
+            && early_oracle_analytic_reference_suggestions.is_empty()
             && early_oracle_language_member_suggestions
                 .as_ref()
                 .is_none_or(Vec::is_empty)
+            && !has_early_qualified_catalog_member_suggestions
             && early_expected_keyword_suggestions.is_empty()
             && early_structural_keyword_before_current_identifier.is_none()
             && early_model_identifier_suggestions.is_empty()
@@ -4128,6 +4199,9 @@ impl SqlEditorWidget {
             && early_local_symbol_suggestions.is_empty()
             && early_forall_index_suggestions.is_empty()
             && local_record_member_suggestions
+                .as_ref()
+                .is_none_or(Vec::is_empty)
+            && oracle_property_graph_column_suggestions
                 .as_ref()
                 .is_none_or(Vec::is_empty)
             && mysql_named_value_suggestions.is_empty()
@@ -5436,6 +5510,7 @@ impl SqlEditorWidget {
             );
             label_suggestions(&early_oracle_show_errors_object_suggestions, "OBJECT");
             label_suggestions(&early_mysql_call_target_suggestions, "PROCEDURE");
+            label_suggestions(&early_oracle_analytic_reference_suggestions, "DIMENSION");
             label_suggestions(&expected_keyword_suggestions, "KEYWORD");
             label_suggestions(&signature_argument_suggestions, "PARAMETER");
             label_suggestions(&session_bind_names, "BIND");
@@ -5849,6 +5924,15 @@ impl SqlEditorWidget {
             Self::merge_suggestions_with_context_aliases(
                 suggestions,
                 early_mysql_call_target_suggestions,
+                true,
+            )
+        };
+        let suggestions = if early_oracle_analytic_reference_suggestions.is_empty() {
+            suggestions
+        } else {
+            Self::merge_suggestions_with_context_aliases(
+                suggestions,
+                early_oracle_analytic_reference_suggestions,
                 true,
             )
         };
@@ -8127,6 +8211,20 @@ impl SqlEditorWidget {
             {
                 return Some("ROW".to_string());
             }
+            if matches_prefix("WITH") && next_word == Some("UNMATCHED") {
+                return Some("WITH".to_string());
+            }
+            if matches_prefix("UNMATCHED")
+                && full_previous_word.as_deref() == Some("WITH")
+                && next_word == Some("ROWS")
+            {
+                return Some("UNMATCHED".to_string());
+            }
+            if matches_prefix("ROWS")
+                && full_previous_word.as_deref() == Some("UNMATCHED")
+            {
+                return Some("ROWS".to_string());
+            }
             if matches_prefix("PER") && full_previous_word.as_deref() == Some("ROW") {
                 return Some("PER".to_string());
             }
@@ -8315,6 +8413,16 @@ impl SqlEditorWidget {
             )
         {
             return Some("INDICES".to_string());
+        }
+        if matches_prefix("VALUES")
+            && full_previous_word.as_deref() == Some("IN")
+            && Self::current_meaningful_word_is_followed_by_word(
+                statement_tokens,
+                full_end,
+                &["OF"],
+            )
+        {
+            return Some("VALUES".to_string());
         }
         if matches_prefix("LOOP")
             && !segment_has("LOOP")
@@ -8979,6 +9087,128 @@ impl SqlEditorWidget {
         relation
     }
 
+    fn oracle_analytic_object_relation_for_column_slot_for_context(
+        deep_ctx: &intellisense_context::CursorContext,
+        prefix: &str,
+        db_type: Option<crate::db::DatabaseType>,
+    ) -> Option<String> {
+        if crate::sql_text::mysql_compatibility_for_sql("", db_type) {
+            return None;
+        }
+        let statement_tokens = deep_ctx.statement_tokens.as_ref();
+        let end = Self::expected_keyword_suggestion_context_end(
+            statement_tokens,
+            deep_ctx.cursor_token_len,
+            prefix,
+        )
+        .min(statement_tokens.len());
+        let tokens = statement_tokens.get(..end).unwrap_or(statement_tokens);
+        let words = tokens
+            .iter()
+            .filter_map(|token| Self::token_word(token).map(str::to_ascii_uppercase))
+            .collect::<Vec<_>>();
+        let attribute_dimension = words.windows(2).any(
+            |window| matches!(window, [attribute, dimension] if attribute == "ATTRIBUTE" && dimension == "DIMENSION"),
+        );
+        let analytic_view = words.windows(2).any(
+            |window| matches!(window, [analytic, view] if analytic == "ANALYTIC" && view == "VIEW"),
+        );
+        let hierarchy = words.iter().any(|word| word == "CREATE")
+            && words.iter().any(|word| word == "HIERARCHY");
+        if !words.iter().any(|word| word == "CREATE")
+            || (!attribute_dimension && !analytic_view && !hierarchy)
+        {
+            return None;
+        }
+        let using_idx = tokens.iter().enumerate().find_map(|(idx, token)| {
+            matches!(token, SqlToken::Word(word) if word.eq_ignore_ascii_case("USING"))
+                .then_some(idx)
+        })?;
+        let relation_idx = Self::next_non_comment_token_index(tokens, using_idx + 1)?;
+        let relation = Self::token_word(tokens.get(relation_idx)?)?
+            .trim_matches('"')
+            .to_string();
+        let tail = tokens.get(relation_idx + 1..).unwrap_or(&[]);
+        let previous_word = tail
+            .iter()
+            .rev()
+            .find_map(|token| Self::token_word(token).map(str::to_ascii_uppercase));
+        let attributes_body = attribute_dimension
+            && Self::innermost_open_paren_preceding_word(tokens, tokens.len())
+                .is_some_and(|owner| owner.eq_ignore_ascii_case("ATTRIBUTES"));
+        let attribute_column_slot = attribute_dimension
+            && (attributes_body
+                || previous_word.as_deref().is_some_and(|word| {
+                    matches!(word, "BY" | "CAPTION" | "KEY" | "TO_CHAR")
+                }));
+        let analytic_column_slot = analytic_view
+            && previous_word
+                .as_deref()
+                .is_some_and(|word| matches!(word, "FACT" | "KEY" | "REFERENCES"));
+        let hierarchy_level_slot = hierarchy
+            && matches!(
+                tail.last(),
+                Some(SqlToken::Symbol(symbol)) if symbol == "("
+            );
+        (attribute_column_slot || analytic_column_slot || hierarchy_level_slot)
+            .then_some(relation)
+    }
+
+    fn cursor_is_at_oracle_analytic_object_reference_slot_for_context(
+        deep_ctx: &intellisense_context::CursorContext,
+        prefix: &str,
+        db_type: Option<crate::db::DatabaseType>,
+    ) -> bool {
+        if crate::sql_text::mysql_compatibility_for_sql("", db_type) {
+            return false;
+        }
+        let tokens = deep_ctx.statement_tokens.as_ref();
+        let end =
+            Self::expected_keyword_suggestion_context_end(
+                tokens,
+                deep_ctx.cursor_token_len,
+                prefix,
+            )
+            .min(tokens.len());
+        let meaningful = Self::meaningful_tokens_before(tokens, end);
+        let words = meaningful
+            .iter()
+            .filter_map(|token| Self::token_word(token).map(str::to_ascii_uppercase))
+            .collect::<Vec<_>>();
+        if !words.windows(2).any(
+            |window| matches!(window, [analytic, view] if analytic == "ANALYTIC" && view == "VIEW"),
+        ) || !matches!(
+            meaningful.last(),
+            Some(SqlToken::Symbol(symbol)) if symbol == "("
+        ) {
+            return false;
+        }
+        matches!(
+            words.as_slice(),
+            [.., dimension, by] if dimension == "DIMENSION" && by == "BY"
+        ) || words.last().is_some_and(|word| word == "HIERARCHIES")
+    }
+
+    fn oracle_hierarchy_qualifier_is_visible(
+        deep_ctx: &intellisense_context::CursorContext,
+        qualifier: &str,
+        db_type: Option<crate::db::DatabaseType>,
+    ) -> bool {
+        if crate::sql_text::mysql_compatibility_for_sql("", db_type) {
+            return false;
+        }
+        let tokens = deep_ctx.statement_tokens.as_ref();
+        tokens.windows(3).any(|window| {
+            matches!(
+                window,
+                [SqlToken::Word(hierarchies), SqlToken::Symbol(open), SqlToken::Word(name)]
+                    if hierarchies.eq_ignore_ascii_case("HIERARCHIES")
+                        && open == "("
+                        && name.trim_matches('"').eq_ignore_ascii_case(qualifier)
+            )
+        })
+    }
+
     fn oracle_graph_table_pattern(
         deep_ctx: &intellisense_context::CursorContext,
         db_type: Option<crate::db::DatabaseType>,
@@ -9563,6 +9793,17 @@ impl SqlEditorWidget {
                 || Self::active_query_range_starts_after_set_operator(deep_ctx))
         {
             return Some("SELECT".to_string());
+        }
+        if matches_prefix("TABLE")
+            && last_token_is("(")
+            && following_words
+                .first()
+                .is_some_and(|word| !Self::token_is_language_keyword(word))
+            && ["UNION", "INTERSECT", "EXCEPT"]
+                .iter()
+                .any(|operator| statement_has(operator))
+        {
+            return Some("TABLE".to_string());
         }
         if matches_prefix("UPDATE")
             && matches!(deep_ctx.phase, intellisense_context::SqlPhase::WithClause)
@@ -18621,9 +18862,22 @@ impl SqlEditorWidget {
         }
         let in_plsql_executable_block =
             Self::cursor_in_plsql_executable_block_for_context(deep_ctx, true, db_type);
+        let qualifier_is_schema_namespace = data
+            .schemas
+            .iter()
+            .chain(data.users.iter())
+            .any(|name| name.eq_ignore_ascii_case(qualifier))
+            || Self::qualifier_has_members_or_oracle_synonym_target(
+                data, qualifier, true, db_type,
+            );
+        let qualifier_has_object_members = !qualifier_is_schema_namespace
+            && Self::qualifier_has_members_or_oracle_synonym_target(
+                data, qualifier, false, db_type,
+            );
         if (deep_ctx.ddl_new_name_position && !in_plsql_executable_block)
             || (matches!(context, SqlContext::VariableName | SqlContext::BindValue)
-                && !Self::qualifier_resolves_to_oracle_sequence(data, qualifier, db_type))
+                && !Self::qualifier_resolves_to_oracle_sequence(data, qualifier, db_type)
+                && !qualifier_has_object_members)
             || (!in_plsql_executable_block
                 && Self::cursor_is_at_create_object_new_name(deep_ctx, true, db_type))
             || Self::cursor_is_at_rename_target_new_name_slot_for_context(deep_ctx, true)
@@ -18640,6 +18894,7 @@ impl SqlEditorWidget {
                 deep_ctx, true, db_type,
             )
             || (!Self::qualifier_resolves_to_oracle_sequence(data, qualifier, db_type)
+                && !qualifier_has_object_members
                 && !Self::cursor_is_at_comment_on_column_qualified_name_slot_for_context(
                     deep_ctx, true,
                 )
@@ -28898,13 +29153,21 @@ impl SqlEditorWidget {
                 && matches!(token, SqlToken::Word(word) if word.eq_ignore_ascii_case("FROM")))
             .then_some(idx)
                 })?;
-        if context_end > from_idx {
-            return None;
-        }
-        if (delete_idx + 1..context_end).any(|idx| {
-            crate::ui::sql_depth::is_top_level_depth(&depths, idx)
-                && matches!(tokens.get(idx), Some(SqlToken::Word(word)) if word.eq_ignore_ascii_case("FROM"))
-        }) {
+        let using_idx = tokens
+            .iter()
+            .enumerate()
+            .skip(from_idx + 1)
+            .find_map(|(idx, token)| {
+                (crate::ui::sql_depth::is_top_level_depth(&depths, idx)
+                    && matches!(token, SqlToken::Word(word) if word.eq_ignore_ascii_case("USING")))
+                .then_some(idx)
+            });
+        let in_target_list = if let Some(using_idx) = using_idx {
+            context_end > from_idx && context_end <= using_idx
+        } else {
+            context_end > delete_idx && context_end <= from_idx
+        };
+        if !in_target_list {
             return None;
         }
 
@@ -28921,6 +29184,12 @@ impl SqlEditorWidget {
                 suggestions.push(candidate.clone());
             } else {
                 suggestions.push(lookup);
+            }
+        }
+        for candidate in Self::mysql_delete_forward_source_aliases(deep_ctx) {
+            let lookup = Self::completion_identifier_lookup_upper(&candidate);
+            if lookup.starts_with(&prefix_lookup) && seen.insert(lookup) {
+                suggestions.push(candidate);
             }
         }
 
@@ -58637,8 +58906,462 @@ impl SqlEditorWidget {
         {
             return Some(&["BOTH", "LEADING", "TRAILING"]);
         }
+        if matches_prefix("AS")
+            && ((previous_word.is_some_and(|word| word.eq_ignore_ascii_case("ALWAYS"))
+                && has("GENERATED"))
+                || (next_is_symbol("(")
+                    && has("WITH")
+                    && previous_word.is_some_and(|word| {
+                        !Self::token_is_language_keyword(&word.to_ascii_uppercase())
+                    })))
+        {
+            return Some(&["AS"]);
+        }
 
         if !mysql_compatible {
+            let in_conversion_function = Self::innermost_open_paren_preceding_word(
+                tokens,
+                structural_end,
+            )
+            .is_some_and(|word| {
+                matches!(
+                    word.to_ascii_uppercase().as_str(),
+                    "CAST"
+                        | "TO_BINARY_DOUBLE"
+                        | "TO_BINARY_FLOAT"
+                        | "TO_DATE"
+                        | "TO_DSINTERVAL"
+                        | "TO_NUMBER"
+                        | "TO_TIMESTAMP"
+                        | "TO_TIMESTAMP_TZ"
+                        | "TO_YMINTERVAL"
+                )
+            });
+            if matches_prefix("DEFAULT")
+                && in_conversion_function
+                && has_later_word_before_frame_end("CONVERSION")
+            {
+                return Some(&["DEFAULT"]);
+            }
+            if matches_prefix("ON")
+                && in_conversion_function
+                && next_word.is_some_and(|word| word.eq_ignore_ascii_case("CONVERSION"))
+            {
+                return Some(&["ON"]);
+            }
+            if matches_prefix("CONVERSION")
+                && previous_word.is_some_and(|word| word.eq_ignore_ascii_case("ON"))
+                && next_word.is_some_and(|word| word.eq_ignore_ascii_case("ERROR"))
+            {
+                return Some(&["CONVERSION"]);
+            }
+            if matches_prefix("ERROR")
+                && previous_word.is_some_and(|word| word.eq_ignore_ascii_case("CONVERSION"))
+            {
+                return Some(&["ERROR"]);
+            }
+            if matches_prefix("SYSTIMESTAMP")
+                && has("AS")
+                && has("OF")
+                && has("TIMESTAMP")
+                && next_is_symbol("-")
+            {
+                return Some(&["SYSTIMESTAMP"]);
+            }
+            if matches_prefix("INTERVAL")
+                && next_is_identifier_or_string
+                && (previous_is_symbol("-") || previous_is_symbol("+"))
+            {
+                return Some(&["INTERVAL"]);
+            }
+
+            if matches_prefix("ANNOTATIONS")
+                && has("CREATE")
+                && has("TABLE")
+                && next_is_symbol("(")
+            {
+                return Some(&["ANNOTATIONS"]);
+            }
+            if matches_prefix("INTERVAL")
+                && has("CREATE")
+                && has("PARTITION")
+                && has("RANGE")
+                && next_is_symbol("(")
+            {
+                return Some(&["INTERVAL"]);
+            }
+            if matches_prefix("LIST")
+                && previous_word.is_some_and(|word| word.eq_ignore_ascii_case("BY"))
+                && has("SUBPARTITION")
+                && next_is_symbol("(")
+            {
+                return Some(&["LIST"]);
+            }
+            if ["PARTITION", "SUBPARTITION"]
+                .iter()
+                .any(|keyword| matches_prefix(keyword))
+                && has("FROM")
+                && next_word.is_some_and(|word| word.eq_ignore_ascii_case("FOR"))
+            {
+                return Some(&["PARTITION", "SUBPARTITION"]);
+            }
+
+            let in_match_recognize = has("MATCH_RECOGNIZE");
+            if in_match_recognize
+                && ["RUNNING", "FINAL"]
+                    .iter()
+                    .any(|keyword| matches_prefix(keyword))
+                && next_word.is_some()
+                && word_after_next.is_none_or(|word| {
+                    word.eq_ignore_ascii_case("AS")
+                        || !Self::token_is_language_keyword(&word.to_ascii_uppercase())
+                })
+            {
+                return Some(&["RUNNING", "FINAL"]);
+            }
+            if in_match_recognize
+                && matches_prefix("WITH")
+                && next_word.is_some_and(|word| word.eq_ignore_ascii_case("UNMATCHED"))
+            {
+                return Some(&["WITH"]);
+            }
+            if in_match_recognize
+                && matches_prefix("UNMATCHED")
+                && previous_word.is_some_and(|word| word.eq_ignore_ascii_case("WITH"))
+                && next_word.is_some_and(|word| word.eq_ignore_ascii_case("ROWS"))
+            {
+                return Some(&["UNMATCHED"]);
+            }
+            if in_match_recognize
+                && matches_prefix("ROWS")
+                && previous_word.is_some_and(|word| word.eq_ignore_ascii_case("UNMATCHED"))
+            {
+                return Some(&["ROWS"]);
+            }
+            if in_match_recognize
+                && matches_prefix("NEXT")
+                && previous_word.is_some_and(|word| word.eq_ignore_ascii_case("TO"))
+                && next_word.is_some_and(|word| word.eq_ignore_ascii_case("ROW"))
+            {
+                return Some(&["NEXT"]);
+            }
+
+            if has("JSON_TRANSFORM")
+                && ["APPEND", "REMOVE"]
+                    .iter()
+                    .any(|keyword| matches_prefix(keyword))
+                && next_is_identifier_or_string
+            {
+                return Some(&["APPEND", "REMOVE"]);
+            }
+            if has("JSON_TRANSFORM")
+                && matches_prefix("IGNORE")
+                && next_word.is_some_and(|word| word.eq_ignore_ascii_case("ON"))
+            {
+                return Some(&["IGNORE"]);
+            }
+            if has("JSON_TRANSFORM")
+                && matches_prefix("ON")
+                && previous_word.is_some_and(|word| {
+                    matches!(word.to_ascii_uppercase().as_str(), "CREATE" | "IGNORE")
+                })
+                && next_word.is_some_and(|word| word.eq_ignore_ascii_case("MISSING"))
+            {
+                return Some(&["ON"]);
+            }
+            if has("JSON_TRANSFORM")
+                && matches_prefix("MISSING")
+                && previous_word.is_some_and(|word| word.eq_ignore_ascii_case("ON"))
+            {
+                return Some(&["MISSING"]);
+            }
+            if has("JSON_QUERY")
+                && matches_prefix("WITH")
+                && next_word.is_some_and(|word| {
+                    matches!(
+                        word.to_ascii_uppercase().as_str(),
+                        "ARRAY" | "CONDITIONAL" | "UNCONDITIONAL"
+                    )
+                })
+            {
+                return Some(&["WITH"]);
+            }
+            if has("JSON_QUERY")
+                && ["CONDITIONAL", "UNCONDITIONAL"]
+                    .iter()
+                    .any(|keyword| matches_prefix(keyword))
+                && previous_word.is_some_and(|word| word.eq_ignore_ascii_case("WITH"))
+                && next_word.is_some_and(|word| word.eq_ignore_ascii_case("ARRAY"))
+            {
+                return Some(&["CONDITIONAL", "UNCONDITIONAL"]);
+            }
+            if has("JSON_QUERY")
+                && matches_prefix("ARRAY")
+                && next_word.is_some_and(|word| word.eq_ignore_ascii_case("WRAPPER"))
+            {
+                return Some(&["ARRAY"]);
+            }
+            if has("JSON_QUERY")
+                && matches_prefix("WRAPPER")
+                && previous_word.is_some_and(|word| word.eq_ignore_ascii_case("ARRAY"))
+            {
+                return Some(&["WRAPPER"]);
+            }
+            if has("JSON_EXISTS")
+                && matches_prefix("PASSING")
+                && next_is_identifier_or_string
+            {
+                return Some(&["PASSING"]);
+            }
+            if ["string", "number", "boolean", "date", "timestamp", "size", "type"]
+                .iter()
+                .any(|method| matches_prefix(method))
+                && previous_is_symbol(".")
+                && next_is_symbol("(")
+            {
+                return Some(&[
+                    "string",
+                    "number",
+                    "boolean",
+                    "date",
+                    "timestamp",
+                    "size",
+                    "type",
+                ]);
+            }
+
+            if matches_prefix("NESTED")
+                && has("CREATE")
+                && has("TABLE")
+                && next_word.is_some_and(|word| word.eq_ignore_ascii_case("TABLE"))
+            {
+                return Some(&["NESTED"]);
+            }
+            if matches_prefix("TABLE")
+                && ((previous_word.is_some_and(|word| {
+                    matches!(
+                        word.to_ascii_uppercase().as_str(),
+                        "FROM" | "INTO" | "NESTED" | "RETURN" | "UPDATE"
+                    )
+                }) && (next_is_symbol("(") || next_word.is_some()))
+                    || (has("FUNCTION")
+                        && next_is_symbol(",")
+                        && !has("SELECT"))
+                    || (has("FROM") && next_is_symbol("(")))
+            {
+                return Some(&["TABLE"]);
+            }
+            if matches_prefix("STORE")
+                && has("NESTED")
+                && has("TABLE")
+                && next_word.is_some_and(|word| word.eq_ignore_ascii_case("AS"))
+            {
+                return Some(&["STORE"]);
+            }
+            if matches_prefix("AS")
+                && has("NESTED")
+                && has("STORE")
+                && next_word.is_some()
+            {
+                return Some(&["AS"]);
+            }
+            if matches_prefix("ROW")
+                && previous_word.is_some_and(|word| word.eq_ignore_ascii_case("PIPELINED"))
+                && next_word.is_some_and(|word| word.eq_ignore_ascii_case("POLYMORPHIC"))
+            {
+                return Some(&["ROW"]);
+            }
+            if matches_prefix("POLYMORPHIC")
+                && previous_word.is_some_and(|word| word.eq_ignore_ascii_case("ROW"))
+                && next_word.is_some_and(|word| word.eq_ignore_ascii_case("USING"))
+            {
+                return Some(&["POLYMORPHIC"]);
+            }
+            if matches_prefix("USING")
+                && has("POLYMORPHIC")
+                && previous_word.is_some_and(|word| word.eq_ignore_ascii_case("POLYMORPHIC"))
+            {
+                return Some(&["USING"]);
+            }
+
+            if has("MODEL")
+                && matches_prefix("ITERATE")
+                && previous_word.is_some_and(|word| word.eq_ignore_ascii_case("RULES"))
+                && next_is_symbol("(")
+            {
+                return Some(&["ITERATE"]);
+            }
+            if has("MODEL") && matches_prefix("UNTIL") && next_is_symbol("(") {
+                return Some(&["UNTIL"]);
+            }
+            if has("MODEL") && matches_prefix("ITERATION_NUMBER") {
+                return Some(&["ITERATION_NUMBER"]);
+            }
+
+            if matches_prefix("ATTRIBUTE")
+                && has("CREATE")
+                && next_word.is_some_and(|word| word.eq_ignore_ascii_case("DIMENSION"))
+            {
+                return Some(&["ATTRIBUTE"]);
+            }
+            if matches_prefix("DIMENSION")
+                && previous_word.is_some_and(|word| word.eq_ignore_ascii_case("ATTRIBUTE"))
+            {
+                return Some(&["DIMENSION"]);
+            }
+            if matches_prefix("HIERARCHY")
+                && has("CREATE")
+                && next_word.is_some()
+            {
+                return Some(&["HIERARCHY"]);
+            }
+            if matches_prefix("ANALYTIC")
+                && has("CREATE")
+                && next_word.is_some_and(|word| word.eq_ignore_ascii_case("VIEW"))
+            {
+                return Some(&["ANALYTIC"]);
+            }
+            if matches_prefix("ATTRIBUTES")
+                && has("ATTRIBUTE")
+                && has("DIMENSION")
+                && next_is_symbol("(")
+            {
+                return Some(&["ATTRIBUTES"]);
+            }
+            if matches_prefix("ALL")
+                && has("ATTRIBUTE")
+                && has("DIMENSION")
+                && next_word.is_some_and(|word| word.eq_ignore_ascii_case("MEMBER"))
+            {
+                return Some(&["ALL"]);
+            }
+            if matches_prefix("MEMBER")
+                && has("ATTRIBUTE")
+                && has("DIMENSION")
+                && next_word.is_some_and(|word| {
+                    matches!(word.to_ascii_uppercase().as_str(), "CAPTION" | "NAME")
+                })
+            {
+                return Some(&["MEMBER"]);
+            }
+            if matches_prefix("NAME")
+                && has("ATTRIBUTE")
+                && has("DIMENSION")
+                && previous_word.is_some_and(|word| word.eq_ignore_ascii_case("MEMBER"))
+            {
+                return Some(&["NAME"]);
+            }
+            if matches_prefix("CAPTION")
+                && has("ATTRIBUTE")
+                && has("DIMENSION")
+                && previous_word.is_some_and(|word| word.eq_ignore_ascii_case("MEMBER"))
+            {
+                return Some(&["CAPTION"]);
+            }
+            if matches_prefix("REFERENCES")
+                && has("ANALYTIC")
+                && has("VIEW")
+                && next_word.is_some()
+            {
+                return Some(&["REFERENCES"]);
+            }
+            if matches_prefix("HIERARCHIES")
+                && has("ANALYTIC")
+                && has("VIEW")
+                && next_is_symbol("(")
+            {
+                return Some(&["HIERARCHIES"]);
+            }
+            if matches_prefix("DEFAULT")
+                && has("ANALYTIC")
+                && has("VIEW")
+                && (next_is_symbol(")")
+                    || next_word.is_some_and(|word| word.eq_ignore_ascii_case("MEASURE")))
+            {
+                return Some(&["DEFAULT"]);
+            }
+            if matches_prefix("USING")
+                && has("CREATE")
+                && (has("ATTRIBUTE") || has("ANALYTIC") || has("HIERARCHY"))
+                && next_word.is_some()
+            {
+                return Some(&["USING"]);
+            }
+            if matches_prefix("KEY")
+                && has("ANALYTIC")
+                && has("VIEW")
+                && next_word.is_some()
+            {
+                return Some(&["KEY"]);
+            }
+            if matches_prefix("FACT")
+                && has("ANALYTIC")
+                && has("MEASURES")
+                && next_word.is_some()
+            {
+                return Some(&["FACT"]);
+            }
+            if matches_prefix("AGGREGATE")
+                && has("ANALYTIC")
+                && has("MEASURES")
+                && next_word.is_some_and(|word| word.eq_ignore_ascii_case("BY"))
+            {
+                return Some(&["AGGREGATE"]);
+            }
+            if matches_prefix("BY")
+                && has("ANALYTIC")
+                && has("MEASURES")
+                && previous_word.is_some_and(|word| word.eq_ignore_ascii_case("AGGREGATE"))
+            {
+                return Some(&["BY"]);
+            }
+            if ["SUM", "AVG", "COUNT", "MIN", "MAX"]
+                .iter()
+                .any(|keyword| matches_prefix(keyword))
+                && has("ANALYTIC")
+                && has("MEASURES")
+                && previous_word.is_some_and(|word| word.eq_ignore_ascii_case("BY"))
+            {
+                return Some(&["SUM", "AVG", "COUNT", "MIN", "MAX"]);
+            }
+            if matches_prefix("MEASURE")
+                && has("ANALYTIC")
+                && has("VIEW")
+                && previous_word.is_some_and(|word| word.eq_ignore_ascii_case("DEFAULT"))
+            {
+                return Some(&["MEASURE"]);
+            }
+
+            if matches_prefix("SEQUENCE")
+                && has("FOR")
+                && has("IN")
+                && next_is_symbol("=>")
+            {
+                return Some(&["SEQUENCE"]);
+            }
+            if matches_prefix("REVERSE")
+                && has("FOR")
+                && has("IN")
+                && next_word.is_some()
+                && has_later_word_before_frame_end("LOOP")
+            {
+                return Some(&["REVERSE"]);
+            }
+            if matches_prefix("BY")
+                && has("FOR")
+                && has("IN")
+                && next_word.is_some()
+                && has_later_word_before_frame_end("LOOP")
+            {
+                return Some(&["BY"]);
+            }
+            if matches_prefix("VALUES")
+                && previous_word.is_some_and(|word| word.eq_ignore_ascii_case("IN"))
+                && next_word.is_some_and(|word| word.eq_ignore_ascii_case("OF"))
+            {
+                return Some(&["VALUES"]);
+            }
+
             if matches_prefix("ON")
                 && previous_word.is_some_and(|word| word.eq_ignore_ascii_case("DEFAULT"))
                 && next_word.is_some_and(|word| word.eq_ignore_ascii_case("NULL"))
@@ -59313,6 +60036,201 @@ impl SqlEditorWidget {
                 && next_is_symbol("=")
             {
                 return Some(&["ENGINE"]);
+            }
+            if matches_prefix("NUMBER")
+                && has("GET")
+                && has("DIAGNOSTICS")
+                && (has("CURRENT") || has("STACKED"))
+            {
+                return Some(&["NUMBER"]);
+            }
+            if completion_db_type_is_mariadb(db_type)
+                && matches_prefix("MOD")
+                && next_word.is_some()
+                && (has("WHEN") || has("IF"))
+            {
+                return Some(&["MOD"]);
+            }
+            if matches_prefix("TABLE")
+                && previous_is_symbol("(")
+                && next_word.is_some()
+                && !has("CREATE")
+            {
+                return Some(&["TABLE"]);
+            }
+            if matches_prefix("KEY")
+                && previous_word.is_some_and(|word| word.eq_ignore_ascii_case("BY"))
+                && has("SUBPARTITION")
+                && next_is_symbol("(")
+            {
+                return Some(&["KEY"]);
+            }
+            if matches_prefix("INSTANT")
+                && has("ALTER")
+                && has("TABLE")
+                && has("ALGORITHM")
+            {
+                return Some(&["INSTANT"]);
+            }
+            if matches_prefix("WITH")
+                && has("CREATE")
+                && has("VIEW")
+                && next_word.is_some_and(|word| word.eq_ignore_ascii_case("CHECK"))
+            {
+                return Some(&["WITH"]);
+            }
+            const MYSQL_INTERVAL_UNITS: &[&str] = &[
+                "MICROSECOND",
+                "SECOND",
+                "MINUTE",
+                "HOUR",
+                "DAY",
+                "WEEK",
+                "MONTH",
+                "QUARTER",
+                "YEAR",
+                "SECOND_MICROSECOND",
+                "MINUTE_MICROSECOND",
+                "MINUTE_SECOND",
+                "HOUR_MICROSECOND",
+                "HOUR_SECOND",
+                "HOUR_MINUTE",
+                "DAY_MICROSECOND",
+                "DAY_SECOND",
+                "DAY_MINUTE",
+                "DAY_HOUR",
+                "YEAR_MONTH",
+            ];
+            if has("INTERVAL")
+                && MYSQL_INTERVAL_UNITS
+                    .iter()
+                    .any(|unit| matches_prefix(unit))
+                && (previous_is_symbol(")") || previous_word.is_some())
+            {
+                return Some(MYSQL_INTERVAL_UNITS);
+            }
+            if matches_prefix("USING") && has("DELETE") && next_word.is_some() {
+                return Some(&["USING"]);
+            }
+            if completion_db_type_is_mariadb(db_type) {
+                if ["PROCEDURE", "FUNCTION"]
+                    .iter()
+                    .any(|keyword| matches_prefix(keyword))
+                    && has("CREATE")
+                    && has("PACKAGE")
+                    && next_word.is_some()
+                {
+                    return Some(&["PROCEDURE", "FUNCTION"]);
+                }
+                if matches_prefix("RETURN")
+                    && has("CREATE")
+                    && has("PACKAGE")
+                    && has("FUNCTION")
+                    && next_word.is_some()
+                {
+                    return Some(&["RETURN"]);
+                }
+                if matches_prefix("AS")
+                    && has("CREATE")
+                    && has("PACKAGE")
+                    && (has("FUNCTION") || has("PROCEDURE"))
+                    && next_word.is_some()
+                {
+                    return Some(&["AS"]);
+                }
+                if matches_prefix("END") && has("CREATE") && has("PACKAGE") {
+                    return Some(&["END"]);
+                }
+                if matches_prefix("GOTO")
+                    && next_word.is_some()
+                    && (has("BEGIN") || has("LOOP"))
+                {
+                    return Some(&["GOTO"]);
+                }
+                if matches_prefix("OFFSET") && has("SELECT") && has("ORDER") {
+                    return Some(&["OFFSET"]);
+                }
+                if matches_prefix("ROWS")
+                    && has("OFFSET")
+                    && next_word.is_some_and(|word| word.eq_ignore_ascii_case("FETCH"))
+                {
+                    return Some(&["ROWS"]);
+                }
+                if matches_prefix("FORMAT")
+                    && previous_word.is_some_and(|word| {
+                        matches!(word.to_ascii_uppercase().as_str(), "ANALYZE" | "EXPLAIN")
+                    })
+                    && next_is_symbol("=")
+                {
+                    return Some(&["FORMAT"]);
+                }
+                if matches_prefix("EXTENDED")
+                    && previous_word.is_some_and(|word| word.eq_ignore_ascii_case("EXPLAIN"))
+                {
+                    return Some(&["EXTENDED"]);
+                }
+                if matches_prefix("CURRENT_USER")
+                    && has("DEFINER")
+                    && next_word.is_some_and(|word| word.eq_ignore_ascii_case("SQL"))
+                {
+                    return Some(&["CURRENT_USER"]);
+                }
+                const MARIADB_STORAGE_ENGINES: &[&str] = &[
+                    "Aria",
+                    "InnoDB",
+                    "MEMORY",
+                    "MyISAM",
+                    "SEQUENCE",
+                ];
+                if has("ENGINE")
+                    && MARIADB_STORAGE_ENGINES
+                        .iter()
+                        .any(|engine| matches_prefix(engine))
+                {
+                    return Some(MARIADB_STORAGE_ENGINES);
+                }
+                if ["TRANSACTIONAL", "PAGE_CHECKSUM"]
+                    .iter()
+                    .any(|keyword| matches_prefix(keyword))
+                    && has("CREATE")
+                    && has("TABLE")
+                    && has("ENGINE")
+                    && next_is_symbol("=")
+                {
+                    return Some(&["TRANSACTIONAL", "PAGE_CHECKSUM"]);
+                }
+                if matches_prefix("PARTITION")
+                    && has("ALTER")
+                    && has("TABLE")
+                    && previous_word.is_some_and(|word| word.eq_ignore_ascii_case("EXCHANGE"))
+                    && next_word.is_some()
+                {
+                    return Some(&["PARTITION"]);
+                }
+                if matches_prefix("WITH")
+                    && has("ALTER")
+                    && has("EXCHANGE")
+                    && has("PARTITION")
+                    && next_word.is_some_and(|word| word.eq_ignore_ascii_case("TABLE"))
+                {
+                    return Some(&["WITH"]);
+                }
+                if matches_prefix("USING") && has("DELETE") && next_word.is_some() {
+                    return Some(&["USING"]);
+                }
+                if matches_prefix("DISTINCT")
+                    && previous_word.is_some_and(|word| {
+                        matches!(word.to_ascii_uppercase().as_str(), "EXCEPT" | "INTERSECT")
+                    })
+                {
+                    return Some(&["DISTINCT"]);
+                }
+                if matches_prefix("INT")
+                    && previous_word.is_some_and(|word| word.eq_ignore_ascii_case("RETURNS"))
+                    && has("PACKAGE")
+                {
+                    return Some(&["INT"]);
+                }
             }
             if completion_db_type_is_mariadb(db_type)
                 && matches_prefix("PREVIOUS")
@@ -60910,9 +61828,121 @@ impl SqlEditorWidget {
             for subq in &deep_ctx.subqueries {
                 push_candidate(&subq.alias);
             }
+            for iterator in Self::oracle_iterator_expression_names_before_cursor(deep_ctx) {
+                push_candidate(&iterator);
+            }
+            for alias in Self::mysql_delete_forward_source_aliases(deep_ctx) {
+                push_candidate(&alias);
+            }
         }
 
         suggestions
+    }
+
+    fn oracle_iterator_expression_names_before_cursor(
+        deep_ctx: &intellisense_context::CursorContext,
+    ) -> Vec<String> {
+        let tokens = deep_ctx.statement_tokens.as_ref();
+        let end = deep_ctx.cursor_token_len.min(tokens.len());
+        let Some(sequence_idx) = tokens
+            .get(..end)
+            .unwrap_or(tokens)
+            .iter()
+            .rposition(|token| {
+                matches!(token, SqlToken::Word(word) if word.eq_ignore_ascii_case("SEQUENCE"))
+            })
+        else {
+            return Vec::new();
+        };
+        if tokens[sequence_idx..end]
+            .iter()
+            .any(|token| matches!(token, SqlToken::Symbol(symbol) if symbol == ";"))
+        {
+            return Vec::new();
+        }
+        let Some(for_idx) = tokens
+            .get(..sequence_idx)
+            .unwrap_or(tokens)
+            .iter()
+            .rposition(|token| {
+                matches!(token, SqlToken::Word(word) if word.eq_ignore_ascii_case("FOR"))
+            })
+        else {
+            return Vec::new();
+        };
+        let Some(name_idx) = Self::next_non_comment_token_index(tokens, for_idx + 1) else {
+            return Vec::new();
+        };
+        let Some(in_idx) = Self::next_non_comment_token_index(tokens, name_idx + 1) else {
+            return Vec::new();
+        };
+        if !matches!(
+            tokens.get(in_idx),
+            Some(SqlToken::Word(word)) if word.eq_ignore_ascii_case("IN")
+        ) {
+            return Vec::new();
+        }
+        match tokens.get(name_idx) {
+            Some(SqlToken::Word(name)) => vec![name.trim_matches('"').to_string()],
+            _ => Vec::new(),
+        }
+    }
+
+    fn mysql_delete_forward_source_aliases(
+        deep_ctx: &intellisense_context::CursorContext,
+    ) -> Vec<String> {
+        let tokens = deep_ctx.statement_tokens.as_ref();
+        let cursor_end = deep_ctx.cursor_token_len.min(tokens.len());
+        let first_word = tokens
+            .iter()
+            .find_map(|token| Self::token_word(token).map(str::to_ascii_uppercase));
+        if first_word.as_deref() != Some("DELETE") {
+            return Vec::new();
+        }
+        let Some(source_idx) = tokens
+            .iter()
+            .enumerate()
+            .skip(cursor_end)
+            .find_map(|(idx, token)| {
+                matches!(
+                    token,
+                    SqlToken::Word(word)
+                        if word.eq_ignore_ascii_case("FROM")
+                            || word.eq_ignore_ascii_case("USING")
+                )
+                .then_some(idx)
+            })
+        else {
+            return Vec::new();
+        };
+        let source_end = tokens
+            .iter()
+            .enumerate()
+            .skip(source_idx + 1)
+            .find_map(|(idx, token)| {
+                matches!(
+                    token,
+                    SqlToken::Word(word)
+                        if matches!(
+                            word.to_ascii_uppercase().as_str(),
+                            "ORDER" | "RETURNING" | "WHERE"
+                        )
+                )
+                .then_some(idx)
+            })
+            .unwrap_or(tokens.len());
+        let mut aliases = Vec::new();
+        for window in tokens[source_idx + 1..source_end].windows(2) {
+            let [SqlToken::Word(relation), SqlToken::Word(alias)] = window else {
+                continue;
+            };
+            if !Self::token_is_language_keyword(&relation.to_ascii_uppercase())
+                && !Self::token_is_language_keyword(&alias.to_ascii_uppercase())
+            {
+                Self::push_unique_completion_name(&mut aliases, alias);
+            }
+        }
+        aliases
     }
 
     fn named_window_suggestions_for_context(
@@ -63493,6 +64523,10 @@ impl SqlEditorWidget {
                 &Self::comparison_scope_tables_for_context(deep_ctx),
             );
         }
+        if resolved.is_empty() {
+            resolved =
+                Self::oracle_table_subquery_qualifier_scope(deep_ctx, qualifier, db_type);
+        }
         if let Some(virtual_scope) = replacement_virtual_alias_scope(qualifier, deep_ctx) {
             return virtual_scope;
         }
@@ -64089,6 +65123,15 @@ impl SqlEditorWidget {
             }
         }
 
+        if matches!(
+            deep_ctx.phase,
+            intellisense_context::SqlPhase::GroupByClause
+        ) {
+            derived_columns.extend(intellisense_context::extract_select_list_columns(
+                current_query_tokens,
+            ));
+        }
+
         if Self::cursor_is_in_query_level_order_by(deep_ctx) {
             derived_columns.extend(intellisense_context::extract_select_list_columns(
                 current_query_tokens,
@@ -64121,15 +65164,134 @@ impl SqlEditorWidget {
         }
         let current_query_tokens = Self::current_query_tokens(deep_ctx);
         let tokens = Self::meaningful_tokens_before(current_query_tokens, current_query_tokens.len());
-        tokens.windows(3).any(|window| {
+        tokens.windows(2).any(|window| {
             matches!(
                 window,
-                [SqlToken::Word(from), SqlToken::Word(table), SqlToken::Symbol(open)]
-                    if from.eq_ignore_ascii_case("FROM")
-                        && table.eq_ignore_ascii_case("TABLE")
-                        && open == "("
+                [SqlToken::Word(table), SqlToken::Symbol(open)]
+                    if table.eq_ignore_ascii_case("TABLE") && open == "("
             )
         })
+    }
+
+    fn oracle_collection_table_source_matches_qualifier(
+        deep_ctx: &intellisense_context::CursorContext,
+        db_type: Option<crate::db::DatabaseType>,
+        qualifier: &str,
+    ) -> bool {
+        if crate::sql_text::mysql_compatibility_for_sql("", db_type) {
+            return false;
+        }
+        if deep_ctx.tables_in_scope.iter().any(|table| {
+            table
+                .alias
+                .as_deref()
+                .is_some_and(|alias| alias.eq_ignore_ascii_case(qualifier))
+                && table
+                    .name
+                    .rsplit('.')
+                    .next()
+                    .is_some_and(|name| name.eq_ignore_ascii_case("ODCINUMBERLIST"))
+        }) {
+            return true;
+        }
+
+        let tokens = Self::current_query_tokens(deep_ctx);
+        for table_idx in 0..tokens.len() {
+            if !matches!(
+                tokens.get(table_idx),
+                Some(SqlToken::Word(word)) if word.eq_ignore_ascii_case("TABLE")
+            ) {
+                continue;
+            }
+            let Some(open_idx) =
+                Self::next_non_comment_token_index(tokens, table_idx.saturating_add(1))
+            else {
+                continue;
+            };
+            if !matches!(
+                tokens.get(open_idx),
+                Some(SqlToken::Symbol(symbol)) if symbol == "("
+            ) {
+                continue;
+            }
+            let Some(close_idx) =
+                Self::matching_close_paren_index_before(tokens, open_idx, tokens.len())
+            else {
+                continue;
+            };
+            let Some(mut alias_idx) =
+                Self::next_non_comment_token_index(tokens, close_idx.saturating_add(1))
+            else {
+                continue;
+            };
+            if matches!(
+                tokens.get(alias_idx),
+                Some(SqlToken::Word(word)) if word.eq_ignore_ascii_case("AS")
+            ) {
+                let Some(next_idx) =
+                    Self::next_non_comment_token_index(tokens, alias_idx.saturating_add(1))
+                else {
+                    continue;
+                };
+                alias_idx = next_idx;
+            }
+            if matches!(
+                tokens.get(alias_idx),
+                Some(SqlToken::Word(alias)) if alias.trim_matches('"').eq_ignore_ascii_case(qualifier)
+            ) {
+                return true;
+            }
+        }
+        false
+    }
+
+    fn oracle_table_subquery_qualifier_scope(
+        deep_ctx: &intellisense_context::CursorContext,
+        qualifier: &str,
+        db_type: Option<crate::db::DatabaseType>,
+    ) -> Vec<String> {
+        if crate::sql_text::mysql_compatibility_for_sql("", db_type) {
+            return Vec::new();
+        }
+        let tokens = deep_ctx.statement_tokens.as_ref();
+        let end =
+            Self::expected_suggestion_context_end(tokens, deep_ctx.cursor_token_len, true)
+                .min(tokens.len());
+        let mut parens = Vec::<(usize, bool)>::new();
+        for idx in 0..end {
+            match tokens.get(idx) {
+                Some(SqlToken::Symbol(symbol)) if symbol == "(" => {
+                    let owner_is_table = Self::previous_non_comment_token_index(tokens, idx)
+                        .and_then(|owner_idx| Self::token_word(tokens.get(owner_idx)?))
+                        .is_some_and(|word| word.eq_ignore_ascii_case("TABLE"));
+                    parens.push((idx, owner_is_table));
+                }
+                Some(SqlToken::Symbol(symbol)) if symbol == ")" => {
+                    parens.pop();
+                }
+                _ => {}
+            }
+        }
+        let Some(open_idx) = parens
+            .iter()
+            .rev()
+            .find_map(|(idx, owner_is_table)| owner_is_table.then_some(*idx))
+        else {
+            return Vec::new();
+        };
+        let body = tokens.get(open_idx + 1..end).unwrap_or(&[]);
+        if !body
+            .iter()
+            .any(|token| matches!(token, SqlToken::Word(word) if word.eq_ignore_ascii_case("SELECT")))
+        {
+            return Vec::new();
+        }
+        let tables =
+            intellisense_context::collect_tables_in_statement_declared_before_cursor(
+                body,
+                body.len(),
+            );
+        intellisense_context::resolve_qualifier_tables(qualifier, &tables)
     }
 
     fn first_set_operand_projection_columns(tokens: &[SqlToken]) -> Vec<String> {

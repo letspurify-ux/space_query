@@ -3122,7 +3122,7 @@ fn formatting_sweep_assignment_keeps_case_first_child_inline() {
 
 #[test]
 fn formatting_sweep_mysql_non_parenthesized_lists_have_dedicated_frames() {
-    let source = "CREATE PROCEDURE p() BEGIN DECLARE v_state CHAR(5); DECLARE v_errno INT; DECLARE v_message TEXT; GET STACKED DIAGNOSTICS CONDITION 1 v_state = RETURNED_SQLSTATE, v_errno = MYSQL_ERRNO, v_message = MESSAGE_TEXT; END; DELETE d, r FROM document d JOIN reading r ON r.id = d.id;";
+    let source = "CREATE PROCEDURE p() BEGIN DECLARE v_state CHAR(5); DECLARE v_errno INT; DECLARE v_message TEXT; GET STACKED DIAGNOSTICS CONDITION 1 v_state = RETURNED_SQLSTATE, v_errno = MYSQL_ERRNO, v_message = MESSAGE_TEXT; SIGNAL SQLSTATE '01000' SET MESSAGE_TEXT = 'warning', MYSQL_ERRNO = 1642; END; DELETE d, r FROM document d JOIN reading r ON r.id = d.id;";
     let run = format_sweep_run(source, DatabaseType::MySQL);
 
     assert!(
@@ -3133,6 +3133,7 @@ fn formatting_sweep_mysql_non_parenthesized_lists_have_dedicated_frames() {
     );
     for kind in [
         ListOwnerKind::DiagnosticsItems,
+        ListOwnerKind::SignalItems,
         ListOwnerKind::DeleteTargets,
     ] {
         assert!(
@@ -3145,11 +3146,53 @@ fn formatting_sweep_mysql_non_parenthesized_lists_have_dedicated_frames() {
 }
 
 #[test]
+fn formatting_sweep_oracle_routine_names_preserve_keyword_spelling() {
+    let source = "CREATE OR REPLACE PACKAGE p AS FUNCTION describe RETURN NUMBER; PROCEDURE qualify; END p; CREATE OR REPLACE PACKAGE BODY p AS FUNCTION describe RETURN NUMBER IS BEGIN RETURN 1; END describe; PROCEDURE qualify IS BEGIN NULL; END qualify; END p;";
+    let run = format_sweep_run(source, DatabaseType::Oracle);
+
+    assert!(
+        run.issues.is_empty(),
+        "Oracle keyword-named routine issues: {:#?}\n{}",
+        run.issues,
+        run.formatted
+    );
+    assert!(
+        run.formatted.contains("FUNCTION describe") && run.formatted.contains("PROCEDURE qualify"),
+        "routine declaration identifiers must preserve their source spelling:\n{}",
+        run.formatted
+    );
+}
+
+#[test]
+fn formatting_sweep_oracle_iterator_and_model_conditions_use_structural_frames() {
+    let source = "DECLARE TYPE num_list IS TABLE OF NUMBER; l_values num_list := num_list(1, 2); BEGIN FOR i IN 1..2, REVERSE 5..6, 9..9 LOOP NULL; END LOOP; FOR v IN VALUES OF l_values LOOP NULL; END LOOP; END; SELECT metric_id, iterated_value FROM metric MODEL DIMENSION BY (metric_id) MEASURES (metric_value AS iterated_value) RULES ITERATE (5) UNTIL (ITERATION_NUMBER >= 2) (iterated_value[1] = iterated_value[1] + ITERATION_NUMBER);";
+    let run = format_sweep_run(source, DatabaseType::Oracle);
+
+    assert!(
+        run.issues.is_empty(),
+        "Oracle iterator/MODEL frame issues: {:#?}\n{}",
+        run.issues,
+        run.formatted
+    );
+    assert!(
+        run.managed_list_owner_kinds
+            .contains(&ListOwnerKind::IterationControls),
+        "multiple iteration controls must have a dedicated list frame:\n{}",
+        run.formatted
+    );
+    assert!(
+        run.formatted.contains("FOR v IN VALUES OF l_values LOOP"),
+        "VALUES OF must remain part of the iterator header:\n{}",
+        run.formatted
+    );
+}
+
+#[test]
 fn formatting_sweep_additional_non_parenthesized_child_lists_have_typed_frames() {
     let cases: &[(DatabaseType, &str, &[ListOwnerKind])] = &[
         (
             DatabaseType::Oracle,
-            "SELECT * FROM sales MATCH_RECOGNIZE (ORDER BY sale_id SUBSET ab = (A, B), cd = (C, D) PATTERN (A B C D) DEFINE A AS amount > 0); SELECT a, b FROM t FOR UPDATE OF a, b; CREATE OR REPLACE TRIGGER trg BEFORE UPDATE OF a, b ON t FOLLOWS trg_a, trg_b BEGIN NULL; END; GRANT SELECT, UPDATE ON t TO app_a, app_b; ALTER TABLE t ADD c NUMBER, ADD d NUMBER; LOCK TABLE t_a, t_b IN EXCLUSIVE MODE; FLASHBACK TABLE t_a, t_b TO SCN 1;",
+            "SELECT * FROM sales MATCH_RECOGNIZE (ORDER BY sale_id SUBSET ab = (A, B), cd = (C, D) PATTERN (A B C D) DEFINE A AS amount > 0); SELECT a, b FROM t FOR UPDATE OF a, b; CREATE OR REPLACE TRIGGER trg BEFORE UPDATE OF a, b ON t FOLLOWS trg_a, trg_b BEGIN NULL; END; GRANT SELECT, UPDATE ON t TO app_a, app_b; ALTER TABLE t ADD c NUMBER, ADD d NUMBER; LOCK TABLE t_a, t_b IN EXCLUSIVE MODE; FLASHBACK TABLE t_a, t_b TO SCN 1; BEGIN FOR i IN 1..2, REVERSE 5..6, 9..9 LOOP NULL; END LOOP; END;",
             &[
                 ListOwnerKind::Subset,
                 ListOwnerKind::ForUpdateColumns,
@@ -3160,11 +3203,12 @@ fn formatting_sweep_additional_non_parenthesized_child_lists_have_typed_frames()
                 ListOwnerKind::AlterActions,
                 ListOwnerKind::LockTables,
                 ListOwnerKind::FlashbackTargets,
+                ListOwnerKind::IterationControls,
             ],
         ),
         (
             DatabaseType::MySQL,
-            "UPDATE t1, t2 SET t1.v = 1, t2.v = 2; ALTER TABLE t1 ADD a INT, ADD b INT; DROP TABLE IF EXISTS old_a, old_b; RENAME TABLE old_c TO new_c, old_d TO new_d; LOCK TABLES new_c READ, new_d WRITE; ANALYZE TABLE new_c, new_d; CREATE USER user_a IDENTIFIED BY 'x', user_b IDENTIFIED BY 'y'; CREATE PROCEDURE p() BEGIN DECLARE v_a, v_b INT; DO v_a, v_b; END;",
+            "UPDATE t1, t2 SET t1.v = 1, t2.v = 2; ALTER TABLE t1 ADD a INT, ADD b INT; DROP TABLE IF EXISTS old_a, old_b; RENAME TABLE old_c TO new_c, old_d TO new_d; LOCK TABLES new_c READ, new_d WRITE; ANALYZE TABLE new_c, new_d; CREATE USER user_a IDENTIFIED BY 'x', user_b IDENTIFIED BY 'y'; CREATE PROCEDURE p() BEGIN DECLARE v_a, v_b INT; SIGNAL SQLSTATE '01000' SET MESSAGE_TEXT = 'warning', MYSQL_ERRNO = 1642; DO v_a, v_b; END;",
             &[
                 ListOwnerKind::UpdateTargets,
                 ListOwnerKind::AlterActions,
@@ -3175,11 +3219,12 @@ fn formatting_sweep_additional_non_parenthesized_child_lists_have_typed_frames()
                 ListOwnerKind::AccountTargets,
                 ListOwnerKind::DeclarationNames,
                 ListOwnerKind::DoExpressions,
+                ListOwnerKind::SignalItems,
             ],
         ),
         (
             DatabaseType::MariaDB,
-            "UPDATE t1, t2 SET t1.v = 1, t2.v = 2; ALTER TABLE t1 ADD a INT, ADD b INT; CHECK TABLE t1, t2; REPAIR TABLE t1, t2; GRANT role_a, role_b TO user_a, user_b; CREATE PROCEDURE p() BEGIN DECLARE v_a, v_b INT; DO v_a, v_b; END;",
+            "UPDATE t1, t2 SET t1.v = 1, t2.v = 2; ALTER TABLE t1 ADD a INT, ADD b INT; CHECK TABLE t1, t2; CHECKSUM TABLE t1, t2; REPAIR TABLE t1, t2; GRANT role_a, role_b TO user_a, user_b; CREATE PROCEDURE p() BEGIN DECLARE v_a, v_b INT; DO v_a, v_b; END;",
             &[
                 ListOwnerKind::UpdateTargets,
                 ListOwnerKind::AlterActions,
@@ -3294,7 +3339,7 @@ fn formatting_sweep_list_owner_inventory_covers_every_typed_variant() {
         ),
         (
             DatabaseType::Oracle,
-            "ALTER TABLE t ADD a NUMBER, ADD b NUMBER; LOCK TABLE t_a, t_b IN EXCLUSIVE MODE; FLASHBACK TABLE t_a, t_b TO SCN 1; CREATE OR REPLACE TRIGGER trg_order BEFORE INSERT ON t FOLLOWS trg_a, trg_b BEGIN NULL; END; CREATE MATERIALIZED VIEW LOG ON t WITH PRIMARY KEY, ROWID INCLUDING NEW VALUES;",
+            "ALTER TABLE t ADD a NUMBER, ADD b NUMBER; LOCK TABLE t_a, t_b IN EXCLUSIVE MODE; FLASHBACK TABLE t_a, t_b TO SCN 1; CREATE OR REPLACE TRIGGER trg_order BEFORE INSERT ON t FOLLOWS trg_a, trg_b BEGIN NULL; END; CREATE MATERIALIZED VIEW LOG ON t WITH PRIMARY KEY, ROWID INCLUDING NEW VALUES; BEGIN FOR i IN 1..2, REVERSE 5..6 LOOP NULL; END LOOP; END;",
         ),
         (
             DatabaseType::Oracle,
@@ -3306,7 +3351,7 @@ fn formatting_sweep_list_owner_inventory_covers_every_typed_variant() {
         ),
         (
             DatabaseType::MySQL,
-            "CREATE PROCEDURE p() BEGIN DECLARE v_state CHAR(5); DECLARE v_errno INT; DECLARE v_a, v_b INT; DECLARE CONTINUE HANDLER FOR SQLWARNING, SQLEXCEPTION SET @handled = 1; GET STACKED DIAGNOSTICS CONDITION 1 v_state = RETURNED_SQLSTATE, v_errno = MYSQL_ERRNO; DO v_a, v_b; END; DELETE d, r FROM document d JOIN reading r ON r.id = d.id;",
+            "CREATE PROCEDURE p() BEGIN DECLARE v_state CHAR(5); DECLARE v_errno INT; DECLARE v_a, v_b INT; DECLARE CONTINUE HANDLER FOR SQLWARNING, SQLEXCEPTION SET @handled = 1; GET STACKED DIAGNOSTICS CONDITION 1 v_state = RETURNED_SQLSTATE, v_errno = MYSQL_ERRNO; SIGNAL SQLSTATE '01000' SET MESSAGE_TEXT = 'warning', MYSQL_ERRNO = 1642; DO v_a, v_b; END; DELETE d, r FROM document d JOIN reading r ON r.id = d.id;",
         ),
         (
             DatabaseType::MySQL,

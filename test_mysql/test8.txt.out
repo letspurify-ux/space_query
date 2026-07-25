@@ -201,7 +201,7 @@ ORDER BY f.team_id;
 -- db: MySQL
 -- metadata: test_mysql/test8.txt inferred catalog
 -- checked: 486
--- suggestions checked: 4451
+-- suggestions checked: 4464
 -- missing: 0
 -- suggestions without type labels: 0
 -- marker: [[word]] means not suggested for the tested prefix

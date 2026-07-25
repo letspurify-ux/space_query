@@ -34,7 +34,7 @@ DROP TABLE OQT_CLOB_FIX_T PURGE;
 -- db: Oracle
 -- metadata: test Oracle inferred catalog (file-scoped overlay) + Oracle built-ins
 -- checked: 85
--- suggestions checked: 518
+-- suggestions checked: 521
 -- missing: 0
 -- suggestions without type labels: 0
 -- marker: [[word]] means not suggested for the tested prefix
