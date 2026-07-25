@@ -1343,7 +1343,7 @@ ORDER BY a.audit_id;
 -- db: Oracle
 -- metadata: test Oracle inferred catalog (file-scoped overlay) + Oracle built-ins
 -- checked: 1888
--- suggestions checked: 12025
+-- suggestions checked: 12265
 -- missing: 0
 -- suggestions without type labels: 0
 -- marker: [[word]] means not suggested for the tested prefix

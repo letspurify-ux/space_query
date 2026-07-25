@@ -1269,7 +1269,7 @@ ORDER BY e.emp_id;
 -- db: Oracle
 -- metadata: test Oracle inferred catalog (file-scoped overlay) + Oracle built-ins
 -- checked: 2405
--- suggestions checked: 19688
+-- suggestions checked: 21161
 -- missing: 0
 -- suggestions without type labels: 0
 -- marker: [[word]] means not suggested for the tested prefix

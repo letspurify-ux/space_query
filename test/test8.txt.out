@@ -478,7 +478,7 @@ select * from EMP;
 -- db: Oracle
 -- metadata: test Oracle inferred catalog (file-scoped overlay) + Oracle built-ins
 -- checked: 823
--- suggestions checked: 2642
+-- suggestions checked: 2742
 -- missing: 0
 -- suggestions without type labels: 0
 -- marker: [[word]] means not suggested for the tested prefix

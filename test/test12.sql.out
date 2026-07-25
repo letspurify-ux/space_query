@@ -564,7 +564,7 @@ FROM qt_if_child;
 -- db: Oracle
 -- metadata: test Oracle inferred catalog (file-scoped overlay) + Oracle built-ins
 -- checked: 808
--- suggestions checked: 5468
+-- suggestions checked: 6169
 -- missing: 0
 -- suggestions without type labels: 0
 -- marker: [[word]] means not suggested for the tested prefix

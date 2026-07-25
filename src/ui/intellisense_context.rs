@@ -1604,6 +1604,45 @@ fn find_order_by_keyword(tokens: &[SqlToken], start_idx: usize) -> Option<usize>
     None
 }
 
+/// Recognizes a MySQL/MariaDB index hint starting at `hint_idx`
+/// (`USE|IGNORE|FORCE {INDEX|KEY} [FOR {JOIN|ORDER BY|GROUP BY}] (index, …)`)
+/// and returns the index of its last token. `None` when the words after
+/// `USE`/`IGNORE`/`FORCE` do not spell a hint, so `INSERT IGNORE`,
+/// `CREATE FORCE VIEW` and `USE db` keep their ordinary handling.
+fn mysql_index_hint_end(tokens: &[SqlToken], hint_idx: usize) -> Option<usize> {
+    let (kind, kind_idx) = next_word_upper(tokens, hint_idx + 1)?;
+    if !matches!(kind.as_str(), "INDEX" | "KEY") {
+        return None;
+    }
+
+    let mut idx = kind_idx;
+    if let Some(for_idx) = next_word_upper(tokens, idx + 1)
+        .filter(|(word, _)| word == "FOR")
+        .map(|(_, at)| at)
+    {
+        let (scope, scope_idx) = next_word_upper(tokens, for_idx + 1)?;
+        idx = match scope.as_str() {
+            "JOIN" => scope_idx,
+            "ORDER" | "GROUP" => {
+                let (by, by_idx) = next_word_upper(tokens, scope_idx + 1)?;
+                if by != "BY" {
+                    return None;
+                }
+                by_idx
+            }
+            _ => return None,
+        };
+    }
+
+    let list_idx = skip_comment_tokens(tokens, idx + 1);
+    match tokens.get(list_idx) {
+        Some(SqlToken::Symbol(sym)) if sym == "(" => {
+            Some(skip_parenthesized_clause(tokens, list_idx).saturating_sub(1))
+        }
+        _ => Some(idx),
+    }
+}
+
 fn previous_word_upper(tokens: &[SqlToken], start_idx: usize) -> Option<(String, usize)> {
     let mut idx = start_idx;
     while idx > 0 {
@@ -4113,6 +4152,21 @@ fn scan_cursor_context(tokens: &[SqlToken], cursor_token_len: usize) -> CursorSc
                             depth_frames[depth].phase = SqlPhase::FromClause;
                             depth_frames[depth].join_using_tables.clear();
                             relation_state.expect_table();
+                        }
+                    }
+                    // `USE|IGNORE|FORCE INDEX|KEY [FOR JOIN|ORDER BY|GROUP BY] (idx, …)`
+                    // is a table-level hint glued to the preceding FROM item. Its
+                    // FOR/JOIN/ORDER/GROUP words are not clause starters, so the whole
+                    // phrase is stepped over and the FROM phase is preserved.
+                    "USE" | "IGNORE" | "FORCE"
+                        if matches!(
+                            current_phase,
+                            SqlPhase::FromClause | SqlPhase::JoinCondition
+                        ) =>
+                    {
+                        if let Some(end_idx) = mysql_index_hint_end(tokens, idx) {
+                            depth_frames[depth].phase = SqlPhase::FromClause;
+                            idx = end_idx;
                         }
                     }
                     "ON" => {

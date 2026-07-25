@@ -7416,6 +7416,34 @@ impl SqlEditorWidget {
         first_is_errors && second_is_log
     }
 
+    /// True when `keyword` sits inside a MySQL/MariaDB index hint
+    /// (`USE|IGNORE|FORCE INDEX|KEY [FOR JOIN|ORDER BY|GROUP BY] (index_list)`).
+    /// The scan walks raw tokens so the closing paren of a preceding hint stops
+    /// it — a real `ORDER BY` after `USE INDEX (...)` is never absorbed.
+    fn is_mysql_index_hint_phrase_word(tokens: &[SqlToken], idx: usize, keyword: &str) -> bool {
+        if !matches!(
+            keyword,
+            "INDEX" | "KEY" | "FOR" | "JOIN" | "ORDER" | "GROUP" | "BY"
+        ) {
+            return false;
+        }
+        let mut cursor = idx;
+        while cursor > 0 {
+            cursor = cursor.saturating_sub(1);
+            let word = match &tokens[cursor] {
+                SqlToken::Comment(_) => continue,
+                SqlToken::Word(word) => word.to_ascii_uppercase(),
+                _ => return false,
+            };
+            match word.as_str() {
+                "USE" | "IGNORE" | "FORCE" => return true,
+                "INDEX" | "KEY" | "FOR" | "JOIN" | "ORDER" | "GROUP" | "BY" => {}
+                _ => return false,
+            }
+        }
+        false
+    }
+
     fn is_multiset_set_operator_from_indices(
         tokens: &[SqlToken],
         prev_word_upper: Option<&str>,
@@ -10263,6 +10291,7 @@ impl SqlEditorWidget {
                     | "HAVING"
                     | "IF"
                     | "IN"
+                    | "INDEX"
                     | "INTO"
                     | "JOIN"
                     | "KEY"
@@ -12865,12 +12894,23 @@ impl SqlEditorWidget {
                         || structured_table_function_keyword_identifier
                         || follows_at_sign_variable
                         || control_keyword_alias_preserves_case;
+                    // `ORDER MEMBER FUNCTION` declares an object-type comparison
+                    // method; the leading ORDER is a method modifier, not ORDER BY.
+                    let oracle_type_method_order_modifier =
+                        !mysql_compatible && upper == "ORDER" && next_word_is("MEMBER");
+                    // `USE|IGNORE|FORCE INDEX|KEY [FOR JOIN|ORDER BY|GROUP BY] (...)`
+                    // is a table-level hint attached to the FROM item; every word in
+                    // it looks like a clause starter but owns no clause.
+                    let mysql_index_hint_phrase_word = mysql_compatible
+                        && Self::is_mysql_index_hint_phrase_word(tokens, idx, upper);
                     let keyword_suppresses_structural_handling = keyword_preserves_original_case
                         || treat_control_keyword_as_identifier
                         || follows_alias_control_keyword
                         || mysql_xa_subcommand
                         || oracle_json_duality_capability_keyword
-                        || oracle_iteration_collection_keyword;
+                        || oracle_iteration_collection_keyword
+                        || oracle_type_method_order_modifier
+                        || mysql_index_hint_phrase_word;
                     let model_bracket_member = construct_flag_active!(ModelActive)
                         && delimiter_frame_state.innermost_is_bracket();
                     let on_duplicate_key_values_function =
@@ -14750,6 +14790,7 @@ impl SqlEditorWidget {
                                 && delimiter_frame_state.innermost_is_bracket())
                             && !(upper == "FOR"
                                 && (construct_flag_active!(CreateSynonymActive)
+                                    || mysql_index_hint_phrase_word
                                     || suppress_comma_break_depth > 0
                                     || (next_word_is("UPDATE") && !in_plsql_block)))
                         {

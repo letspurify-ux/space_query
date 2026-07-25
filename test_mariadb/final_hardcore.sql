@@ -1069,9 +1069,331 @@ CALL sq_hard_assert(
   'system-time between range'
 );
 
+-- ULTRA WAVE 5: optimizer-steering syntax that only exists between FROM and ON,
+-- ROLLUP hidden inside a derived table, the 11.x/12.x JSON function zoo,
+-- MariaDB-only DDL spellings, spatial and full-text index families, temporary
+-- tables, row-locking modifiers, and routine attribute stacking.
+
+-- W5-A: join and index steering. STRAIGHT_JOIN appears twice with two different
+-- grammars in one statement (SELECT modifier and join operator), the index hints
+-- carry FOR JOIN / FOR ORDER BY scopes, and NATURAL LEFT JOIN plus JOIN ...
+-- USING keep their join columns unqualifiable.
+CREATE TABLE sq_hard_w5_hint (
+  hint_id INT NOT NULL,
+  node_id INT NOT NULL,
+  bucket  VARCHAR(16) NOT NULL,
+  weight  DECIMAL(10,2) NOT NULL,
+  PRIMARY KEY (hint_id),
+  KEY ix_sq_hard_w5_hint_node (node_id),
+  KEY ix_sq_hard_w5_hint_bucket (bucket, weight)
+) ENGINE = InnoDB;
+
+INSERT INTO sq_hard_w5_hint VALUES
+  (1, 1, 'alpha', 10.50), (2, 1, 'beta', 20.25),
+  (3, 2, 'alpha', 5.00),  (4, 2, 'gamma', 7.75);
+
+SELECT STRAIGHT_JOIN SQL_SMALL_RESULT SQL_BUFFER_RESULT
+       h.node_id                AS node_id,
+       COUNT(*)                 AS pair_rows,
+       ROUND(SUM(h.weight), 2)  AS weight_sum
+FROM sq_hard_w5_hint AS h USE INDEX FOR JOIN (ix_sq_hard_w5_hint_node)
+     STRAIGHT_JOIN metric AS m FORCE INDEX (PRIMARY)
+       ON m.node_id = h.node_id
+GROUP BY h.node_id
+ORDER BY h.node_id;
+
+SELECT SQL_CALC_FOUND_ROWS h.hint_id, h.bucket
+FROM sq_hard_w5_hint AS h IGNORE INDEX FOR ORDER BY (ix_sq_hard_w5_hint_bucket)
+ORDER BY h.bucket, h.hint_id
+LIMIT 2;
+
+SET @sq_hard_w5_found = FOUND_ROWS();
+
+SELECT node_id, ROUND(SUM(weight), 2) AS natural_weight
+FROM sq_hard_w5_hint
+NATURAL LEFT JOIN (SELECT node_id, MAX(metric_value) AS peak
+                   FROM metric
+                   GROUP BY node_id) AS pk
+GROUP BY node_id
+ORDER BY node_id;
+
+SELECT node_id, COUNT(*) AS using_rows
+FROM metric
+JOIN sq_hard_w5_hint USING (node_id)
+GROUP BY node_id
+ORDER BY node_id;
+
+-- W5-B: quantified subqueries, a row-constructor IN list, WITH ROLLUP tucked
+-- inside a derived table (MariaDB refuses ROLLUP beside ORDER BY), and an ORDER
+-- BY that mixes FIELD() with an explicit COLLATE.
+SELECT r.bucket, r.is_total, r.bucket_total
+FROM (SELECT bucket,
+             (bucket IS NULL)       AS is_total,
+             ROUND(SUM(weight), 2)  AS bucket_total
+      FROM sq_hard_w5_hint
+      WHERE weight >= ANY (SELECT weight FROM sq_hard_w5_hint WHERE node_id = 2)
+        AND (node_id, bucket) IN ((1, 'alpha'), (1, 'beta'), (2, 'gamma'))
+        AND weight <> ALL (SELECT 999)
+        AND EXISTS (SELECT 1 FROM metric WHERE metric.node_id = sq_hard_w5_hint.node_id)
+      GROUP BY bucket WITH ROLLUP
+      HAVING bucket_total > 0) AS r
+ORDER BY r.is_total,
+         FIELD(r.bucket, 'gamma', 'beta', 'alpha'),
+         r.bucket COLLATE utf8mb4_bin;
+
+-- W5-C: the 11.x/12.x JSON zoo. Every one of these takes a path or a document
+-- literal whose braces and $ sigils must never leak into the SQL lexer.
+CREATE TABLE sq_hard_w5_doc (
+  doc_id  INT NOT NULL,
+  body    JSON NOT NULL CHECK (JSON_VALID(body)),
+  tag_set JSON NOT NULL,
+  PRIMARY KEY (doc_id)
+) ENGINE = InnoDB;
+
+INSERT INTO sq_hard_w5_doc VALUES
+  (1, '{"name":"alpha","score":10,"nested":{"deep":[1,2,3]}}', '[1,2,3]'),
+  (2, '{"score":10,"name":"alpha","nested":{"deep":[1,2,3]}}', '[3,4,5]');
+
+SELECT d.doc_id,
+       JSON_OVERLAPS(d.tag_set, '[3,9]')                       AS overlaps_three,
+       JSON_ARRAY_INTERSECT('[2,3,4]', d.tag_set)              AS shared_tags,
+       JSON_EQUALS(d.body, '{"score":10,"name":"alpha",
+                             "nested":{"deep":[1,2,3]}}')      AS same_document,
+       JSON_SCHEMA_VALID('{"type":"object",
+                           "required":["name"]}', d.body)      AS schema_ok,
+       JSON_KEY_VALUE(d.body, '$')                             AS key_values,
+       JSON_OBJECT_TO_ARRAY(JSON_OBJECT('k', d.doc_id))        AS object_pairs,
+       JSON_OBJECT_FILTER_KEYS(d.body, '["name"]')             AS kept_keys,
+       JSON_ARRAY_APPEND(d.tag_set, '$', 99)                   AS appended,
+       JSON_ARRAY_INSERT(d.tag_set, '$[0]', 0)                 AS inserted
+FROM sq_hard_w5_doc AS d
+ORDER BY d.doc_id;
+
+SELECT JSON_NORMALIZE('{"b":2,"a":1}') = JSON_NORMALIZE('{"a":1,"b":2}')
+         AS normalized_match;
+
+-- W5-D: MariaDB-only DDL spellings. CREATE OR REPLACE TABLE, an INVISIBLE
+-- column that SELECT * must skip, a parenthesized expression DEFAULT, a named
+-- CHECK, IF NOT EXISTS / IF EXISTS clause tails, RENAME COLUMN, and an
+-- ALGORITHM/LOCK pair on the same ALTER.
+CREATE OR REPLACE TABLE sq_hard_w5_ddl (
+  ddl_id     INT NOT NULL,
+  visible_v  VARCHAR(20) DEFAULT (CONCAT('v', '-', 'default')),
+  hidden_v   INT INVISIBLE DEFAULT 7,
+  PRIMARY KEY (ddl_id),
+  CONSTRAINT ck_sq_hard_w5_ddl CHECK (ddl_id > 0)
+) ENGINE = InnoDB;
+
+INSERT INTO sq_hard_w5_ddl (ddl_id) VALUES (1), (2);
+
+SELECT * FROM sq_hard_w5_ddl ORDER BY ddl_id;
+
+SELECT ddl_id, visible_v, hidden_v FROM sq_hard_w5_ddl ORDER BY ddl_id;
+
+ALTER TABLE sq_hard_w5_ddl
+  ADD COLUMN IF NOT EXISTS added_v INT NOT NULL DEFAULT 0,
+  ALGORITHM = INSTANT;
+
+ALTER TABLE sq_hard_w5_ddl
+  RENAME COLUMN added_v TO renamed_v,
+  ALGORITHM = INPLACE,
+  LOCK = NONE;
+
+ALTER TABLE sq_hard_w5_ddl DROP CONSTRAINT IF EXISTS ck_sq_hard_w5_ddl;
+
+DROP INDEX IF EXISTS ix_never_created ON sq_hard_w5_ddl;
+
+CREATE OR REPLACE TABLE sq_hard_w5_swap_a (swap_v INT) ENGINE = InnoDB;
+CREATE OR REPLACE TABLE sq_hard_w5_swap_b (swap_v INT) ENGINE = InnoDB;
+INSERT INTO sq_hard_w5_swap_a VALUES (1);
+INSERT INTO sq_hard_w5_swap_b VALUES (2);
+
+RENAME TABLE sq_hard_w5_swap_a TO sq_hard_w5_swap_t,
+             sq_hard_w5_swap_b TO sq_hard_w5_swap_a,
+             sq_hard_w5_swap_t TO sq_hard_w5_swap_b;
+
+-- W5-E: geometry columns with a spatial index, WKT constructors, and predicate
+-- plus measurement functions over them.
+CREATE TABLE sq_hard_w5_geo (
+  geo_id INT NOT NULL,
+  label  VARCHAR(20) NOT NULL,
+  spot   POINT NOT NULL,
+  zone   POLYGON NOT NULL,
+  PRIMARY KEY (geo_id),
+  SPATIAL INDEX sx_sq_hard_w5_geo (spot)
+) ENGINE = InnoDB;
+
+INSERT INTO sq_hard_w5_geo VALUES
+  (1, 'inner', ST_GeomFromText('POINT(1 1)'),
+   ST_GeomFromText('POLYGON((0 0,0 5,5 5,5 0,0 0))')),
+  (2, 'outer', ST_PointFromText('POINT(9 9)'),
+   ST_PolygonFromText('POLYGON((8 8,8 10,10 10,10 8,8 8))'));
+
+SELECT g.geo_id,
+       ST_X(g.spot)                          AS spot_x,
+       ST_AsText(ST_Centroid(g.zone))        AS zone_centre,
+       ST_Contains(g.zone, g.spot)           AS zone_holds_spot,
+       ROUND(ST_Distance(g.spot, POINT(0, 0)), 4) AS origin_gap,
+       ST_GeometryType(g.zone)               AS zone_kind
+FROM sq_hard_w5_geo AS g
+ORDER BY g.geo_id;
+
+-- W5-F: full-text index with all three search modes. The boolean-mode operators
+-- sit inside a string literal where they must stay inert.
+CREATE TABLE sq_hard_w5_ft (
+  ft_id INT NOT NULL,
+  body  TEXT NOT NULL,
+  PRIMARY KEY (ft_id),
+  FULLTEXT KEY fx_sq_hard_w5_ft (body)
+) ENGINE = InnoDB;
+
+INSERT INTO sq_hard_w5_ft VALUES
+  (1, 'hostile grammar stress engine'),
+  (2, 'gentle grammar coverage baseline');
+
+SELECT f.ft_id,
+       ROUND(MATCH(f.body) AGAINST ('grammar'), 4) AS natural_score
+FROM sq_hard_w5_ft AS f
+ORDER BY f.ft_id;
+
+SELECT f.ft_id
+FROM sq_hard_w5_ft AS f
+WHERE MATCH(f.body) AGAINST ('+hostile -gentle' IN BOOLEAN MODE)
+ORDER BY f.ft_id;
+
+SELECT f.ft_id
+FROM sq_hard_w5_ft AS f
+WHERE MATCH(f.body) AGAINST ('engine' WITH QUERY EXPANSION)
+ORDER BY f.ft_id;
+
+-- W5-G: a MEMORY temporary table, a multi-target SELECT ... INTO, and the three
+-- row-locking modifier spellings inside one explicit transaction.
+CREATE TEMPORARY TABLE sq_hard_w5_tmp (
+  tmp_id   INT NOT NULL,
+  tmp_note VARCHAR(20) NOT NULL,
+  PRIMARY KEY (tmp_id)
+) ENGINE = Memory;
+
+INSERT INTO sq_hard_w5_tmp
+SELECT hint_id, CONCAT('tmp-', bucket) FROM sq_hard_w5_hint;
+
+SELECT COUNT(*), MAX(tmp_id)
+INTO @sq_hard_w5_tmp_rows, @sq_hard_w5_tmp_max
+FROM sq_hard_w5_tmp;
+
+START TRANSACTION;
+
+SELECT hint_id FROM sq_hard_w5_hint WHERE node_id = 1 ORDER BY hint_id
+FOR UPDATE SKIP LOCKED;
+
+SELECT hint_id FROM sq_hard_w5_hint WHERE node_id = 2 ORDER BY hint_id
+FOR UPDATE NOWAIT;
+
+SELECT hint_id FROM sq_hard_w5_hint WHERE bucket = 'alpha' ORDER BY hint_id
+LOCK IN SHARE MODE;
+
+COMMIT;
+
+-- W5-H: routine attribute stacking plus IN / INOUT / OUT parameter modes; the
+-- COMMENT payload carries delimiter bait that must stay inside the literal.
+DELIMITER //
+CREATE OR REPLACE FUNCTION sq_hard_w5_triple(p_value INT)
+  RETURNS INT
+  DETERMINISTIC
+  CONTAINS SQL
+  SQL SECURITY INVOKER
+  COMMENT 'wave5 // $$ ; attribute stack'
+BEGIN
+  RETURN p_value * 3;
+END//
+
+CREATE OR REPLACE PROCEDURE sq_hard_w5_accumulate(IN    p_seed  INT,
+                                                  INOUT p_acc   INT,
+                                                  OUT   p_label VARCHAR(32))
+  MODIFIES SQL DATA
+  SQL SECURITY DEFINER
+  COMMENT 'wave5 out params'
+BEGIN
+  SET p_acc = p_acc + sq_hard_w5_triple(p_seed);
+  INSERT INTO sq_hard_w5_tmp (tmp_id, tmp_note)
+  VALUES (100 + p_seed, CONCAT('acc-', p_acc))
+  ON DUPLICATE KEY UPDATE tmp_note = VALUES(tmp_note);
+  SET p_label = CONCAT('acc=', p_acc);
+END//
+DELIMITER ;
+
+SET @sq_hard_w5_acc = 1;
+CALL sq_hard_w5_accumulate(4, @sq_hard_w5_acc, @sq_hard_w5_label);
+
+SELECT @sq_hard_w5_acc AS accumulated, @sq_hard_w5_label AS accumulated_label;
+
+-- W5-I: wave-5 self-verification.
+CALL sq_hard_assert(
+  (SELECT COUNT(*)
+   FROM sq_hard_w5_hint AS h
+        STRAIGHT_JOIN metric AS m ON m.node_id = h.node_id) = 8
+  AND @sq_hard_w5_found = 4,
+  'join steering + calc found rows'
+);
+CALL sq_hard_assert(
+  (SELECT ROUND(SUM(r.bucket_total), 2)
+   FROM (SELECT bucket, ROUND(SUM(weight), 2) AS bucket_total
+         FROM sq_hard_w5_hint
+         WHERE (node_id, bucket) IN ((1, 'alpha'), (1, 'beta'), (2, 'gamma'))
+         GROUP BY bucket WITH ROLLUP) AS r) = 77.00,
+  'rollup inside derived table'
+);
+CALL sq_hard_assert(
+  (SELECT JSON_OVERLAPS(tag_set, '[3,9]') FROM sq_hard_w5_doc WHERE doc_id = 1) = 1
+  AND (SELECT JSON_EQUALS(
+                 (SELECT body FROM sq_hard_w5_doc WHERE doc_id = 1),
+                 (SELECT body FROM sq_hard_w5_doc WHERE doc_id = 2))) = 1
+  AND JSON_NORMALIZE('{"b":2,"a":1}') = JSON_NORMALIZE('{"a":1,"b":2}'),
+  'json zoo equality'
+);
+CALL sq_hard_assert(
+  (SELECT COUNT(*)
+   FROM information_schema.COLUMNS
+   WHERE TABLE_SCHEMA = DATABASE()
+     AND TABLE_NAME = 'sq_hard_w5_ddl'
+     AND COLUMN_NAME = 'renamed_v') = 1
+  AND (SELECT hidden_v FROM sq_hard_w5_ddl WHERE ddl_id = 1) = 7
+  AND (SELECT visible_v FROM sq_hard_w5_ddl WHERE ddl_id = 2) = 'v-default'
+  AND (SELECT swap_v FROM sq_hard_w5_swap_a) = 2
+  AND (SELECT swap_v FROM sq_hard_w5_swap_b) = 1,
+  'ddl spellings + rename swap'
+);
+CALL sq_hard_assert(
+  (SELECT COUNT(*)
+   FROM sq_hard_w5_geo AS g
+   WHERE ST_Contains(g.zone, g.spot)) = 2
+  AND (SELECT ST_AsText(ST_Centroid(zone))
+       FROM sq_hard_w5_geo WHERE geo_id = 1) = 'POINT(2.5 2.5)',
+  'spatial containment + centroid'
+);
+CALL sq_hard_assert(
+  (SELECT COUNT(*)
+   FROM sq_hard_w5_ft
+   WHERE MATCH(body) AGAINST ('+hostile -gentle' IN BOOLEAN MODE)) = 1
+  AND (SELECT COUNT(*)
+       FROM sq_hard_w5_ft
+       WHERE MATCH(body) AGAINST ('engine' WITH QUERY EXPANSION)) = 2,
+  'fulltext boolean + query expansion'
+);
+CALL sq_hard_assert(
+  @sq_hard_w5_tmp_rows = 4
+  AND @sq_hard_w5_tmp_max = 4
+  AND @sq_hard_w5_acc = 13
+  AND @sq_hard_w5_label = 'acc=13'
+  AND (SELECT tmp_note FROM sq_hard_w5_tmp WHERE tmp_id = 104) = 'acc-13',
+  'temporary table + out params'
+);
+
 SELECT 'PASS' AS final_status,
        VERSION() AS server_version,
        (SELECT COUNT(*) FROM metric) AS metric_rows,
        @walk_total AS walk_total,
        (SELECT COUNT(*) FROM sq_hard_w4_vector_asset) AS vector_rows,
-       @sq_hard_w4_walk_total AS wave4_total;
+       @sq_hard_w4_walk_total AS wave4_total,
+       (SELECT COUNT(*) FROM sq_hard_w5_hint) AS wave5_rows,
+       @sq_hard_w5_label AS wave5_label;

@@ -639,6 +639,10 @@ const ORACLE_BUILTIN_PACKAGE_MEMBERS: &[(&str, &[&str])] = &[
         ],
     ),
     (
+        "DBMS_ERRLOG",
+        &["CREATE_ERROR_LOG"],
+    ),
+    (
         "DBMS_OUTPUT",
         &["PUT_LINE", "PUT", "NEW_LINE", "GET_LINE", "GET_LINES", "ENABLE", "DISABLE"],
     ),
@@ -3899,7 +3903,28 @@ impl SqlEditorWidget {
             let mut data = intellisense_data
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
-            data.get_column_suggestions(&snapshot.prefix, Some(&tables))
+            let mut columns = data.get_column_suggestions(&snapshot.prefix, Some(&tables));
+            // Oracle row pseudo-columns are addressable through a table alias
+            // (`m.ROWID`, `m.ORA_ROWSCN`) but live in no catalog.
+            if !tables.is_empty()
+                && !crate::sql_text::mysql_compatibility_for_sql(
+                    "",
+                    Some(snapshot.preferred_db_type),
+                )
+            {
+                for pseudo in ["ROWID", "ORA_ROWSCN"] {
+                    if crate::ui::intellisense::suggestion_matches_completion_prefix(
+                        pseudo,
+                        &snapshot.prefix,
+                    ) && !columns
+                        .iter()
+                        .any(|column| column.eq_ignore_ascii_case(pseudo))
+                    {
+                        columns.push(pseudo.to_string());
+                    }
+                }
+            }
+            columns
         } else {
             Vec::new()
         };
@@ -6034,7 +6059,6 @@ impl SqlEditorWidget {
             None
         };
         let oracle_qualifier_head_suggestions = if qualifier.is_none()
-            && !crate::sql_text::mysql_compatibility_for_sql("", Some(snapshot.preferred_db_type))
             && !matches!(
                 expected_object_kind,
                 Some(ExpectedObjectSuggestionKind::Sequence)
@@ -6050,6 +6074,7 @@ impl SqlEditorWidget {
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
             Self::collect_oracle_qualifier_head_suggestions(
                 &data,
+                deep_ctx,
                 &snapshot.prefix,
                 Some(snapshot.preferred_db_type),
             )
@@ -6369,9 +6394,7 @@ impl SqlEditorWidget {
             &mysql_trigger_pseudo_rows,
             "PSEUDORECORD",
         );
-        let oracle_qualifier_head_suggestions = if force_context_name_qualifier_head
-            && !crate::sql_text::mysql_compatibility_for_sql("", db_type)
-        {
+        let oracle_qualifier_head_suggestions = if force_context_name_qualifier_head {
             oracle_qualifier_head_suggestions.to_vec()
         } else {
             Vec::new()
@@ -7622,11 +7645,22 @@ impl SqlEditorWidget {
             return Some("AS".to_string());
         }
 
-        if matches_prefix("$END") && full_has("$ELSE") {
-            return Some("$END".to_string());
-        }
+        // `$ELSE` is checked first: on the shared `$E` prefix an open `$IF` without
+        // an `$ELSE` still wants the alternative branch, while the narrower `$EN`
+        // prefix only reaches the `$END` rule below.
         if matches_prefix("$ELSE") && full_has("$IF") && !full_has("$ELSE") {
             return Some("$ELSE".to_string());
+        }
+        // `$END` closes `$IF`/`$ELSE` and also the `$ERROR … $END` directive, so an
+        // `$IF … $THEN $ERROR '…' $END $END` chain without any `$ELSE` still ends
+        // every open selection/error directive.
+        if matches_prefix("$END")
+            && (full_has("$ELSE") || full_has("$THEN") || full_has("$ERROR"))
+        {
+            return Some("$END".to_string());
+        }
+        if matches_prefix("$ERROR") && (full_has("$THEN") || full_has("$ELSE")) {
+            return Some("$ERROR".to_string());
         }
         if matches_prefix("$THEN") && full_has("$IF") && !full_has("$THEN") {
             return Some("$THEN".to_string());
@@ -11059,6 +11093,7 @@ impl SqlEditorWidget {
             "TIME",
             "ROWNUM",
             "ROWID",
+            "ORA_ROWSCN",
             "MULTISET",
             "BINARY",
         ];
@@ -18561,7 +18596,8 @@ impl SqlEditorWidget {
         ];
         // Keywords that themselves complete an operand (a literal/pseudo-column).
         const VALUE_COMPLETE_PREV: &[&str] = &[
-            "NULL", "TRUE", "FALSE", "UNKNOWN", "LEVEL", "ROWNUM", "ROWID", "DUAL", "DEFAULT",
+            "NULL", "TRUE", "FALSE", "UNKNOWN", "LEVEL", "ROWNUM", "ROWID", "ORA_ROWSCN", "DUAL",
+            "DEFAULT",
         ];
         let meaningful = Self::meaningful_tokens_before(tokens, end);
         match meaningful.last() {
@@ -22769,8 +22805,20 @@ impl SqlEditorWidget {
         }
 
         let words = Self::words_for_keyword_slot(tokens, end);
-        let constructor_idx = words.iter().rposition(|word| word == "CONSTRUCTOR")?;
-        let tail = &words[constructor_idx..];
+        // `RETURN SELF AS RESULT` belongs to the constructor being declared, so the
+        // cursor must still be inside it. Anchoring on the innermost member start
+        // (rather than the last `CONSTRUCTOR` anywhere in the type) keeps a later
+        // `MEMBER … RETURN |` a plain data-type slot.
+        let member_idx = words.iter().rposition(|word| {
+            matches!(
+                word.as_str(),
+                "CONSTRUCTOR" | "MEMBER" | "STATIC" | "MAP" | "ORDER" | "OVERRIDING"
+            )
+        })?;
+        if words.get(member_idx).map(String::as_str) != Some("CONSTRUCTOR") {
+            return None;
+        }
+        let tail = &words[member_idx..];
         if !tail.iter().any(|word| word == "FUNCTION") {
             return None;
         }
@@ -26317,7 +26365,6 @@ impl SqlEditorWidget {
         let next_word = following_words.next();
         matches!(words.as_slice(), [handler] if handler.eq_ignore_ascii_case("HANDLER"))
             && next_word
-                .as_deref()
                 .is_some_and(|word| matches!(word.to_ascii_uppercase().as_str(), "READ" | "CLOSE"))
     }
 
@@ -29680,6 +29727,32 @@ impl SqlEditorWidget {
     /// excluded by the caller, leaving `JOIN`/the join type as the last token) so
     /// table completion keeps working there, and for `CROSS`/`NATURAL` joins,
     /// which take neither `ON` nor `USING`.
+    /// `SELECT [ALL|DISTINCT|HIGH_PRIORITY|…] STRAIGHT_JOIN …` spells the select
+    /// modifier, which forces join order for the whole statement and introduces
+    /// no relation. Only once a projection has been read does `STRAIGHT_JOIN`
+    /// become a join operator, so the modifier form must never anchor a join
+    /// target slot.
+    fn mysql_straight_join_at_is_select_modifier(toks: &[&SqlToken], idx: usize) -> bool {
+        let mut cursor = idx;
+        while cursor > 0 {
+            cursor -= 1;
+            let SqlToken::Word(word) = toks[cursor] else {
+                return false;
+            };
+            let upper = word.to_ascii_uppercase();
+            if upper == "SELECT" {
+                return true;
+            }
+            if !Self::keyword_is_select_modifier_candidate(
+                &upper,
+                Some(crate::db::DatabaseType::MySQL),
+            ) {
+                return false;
+            }
+        }
+        false
+    }
+
     fn expected_join_target_keyword_candidates(
         tokens: &[SqlToken],
         end: usize,
@@ -29732,6 +29805,13 @@ impl SqlEditorWidget {
                     if word.eq_ignore_ascii_case("JOIN")
                         && idx > 0
                         && matches!(&toks[idx - 1], SqlToken::Word(w) if w.eq_ignore_ascii_case("FOR")) =>
+                {
+                    return None;
+                }
+                SqlToken::Word(word)
+                    if word.eq_ignore_ascii_case("STRAIGHT_JOIN")
+                        && mysql
+                        && Self::mysql_straight_join_at_is_select_modifier(&toks, idx) =>
                 {
                     return None;
                 }
@@ -43589,7 +43669,15 @@ impl SqlEditorWidget {
                     ])
                 }
                 [action] if action == "DROP" => {
-                    return Some(&["COLUMN", "INDEX", "KEY", "PRIMARY KEY", "FOREIGN KEY"])
+                    return Some(&[
+                        "COLUMN",
+                        "INDEX",
+                        "KEY",
+                        "PRIMARY KEY",
+                        "FOREIGN KEY",
+                        "CONSTRAINT",
+                        "CHECK",
+                    ])
                 }
                 [action] if action == "RENAME" => {
                     // `ALTER TABLE t RENAME |` — the table itself (`TO`/`AS`) or a
@@ -44669,6 +44757,9 @@ impl SqlEditorWidget {
                 "CROSS JOIN",
                 "NATURAL JOIN",
                 "STRAIGHT_JOIN",
+                "USE INDEX",
+                "IGNORE INDEX",
+                "FORCE INDEX",
                 "GROUP BY",
                 "HAVING",
                 "ORDER BY",
@@ -44716,6 +44807,9 @@ impl SqlEditorWidget {
                 "CROSS JOIN",
                 "NATURAL JOIN",
                 "STRAIGHT_JOIN",
+                "USE INDEX",
+                "IGNORE INDEX",
+                "FORCE INDEX",
                 "GROUP BY",
                 "HAVING",
                 "ORDER BY",
@@ -45053,6 +45147,7 @@ impl SqlEditorWidget {
                     "TIME",
                     "ROWNUM",
                     "ROWID",
+                    "ORA_ROWSCN",
                 ]
             }
             Some(false) if phase == intellisense_context::SqlPhase::ConnectByClause => &[
@@ -45075,6 +45170,7 @@ impl SqlEditorWidget {
                 "TIME",
                 "ROWNUM",
                 "ROWID",
+                "ORA_ROWSCN",
             ],
             Some(false) if mysql && follows_comparison_operator => {
                 MYSQL_AFTER_COMPARISON_OPERATOR_KEYWORDS
@@ -45097,6 +45193,7 @@ impl SqlEditorWidget {
                 "TIME",
                 "ROWNUM",
                 "ROWID",
+                "ORA_ROWSCN",
             ],
             Some(false) if mysql => MYSQL_OPERAND_START_KEYWORDS,
             Some(false) => &[
@@ -45114,6 +45211,7 @@ impl SqlEditorWidget {
                 "TIME",
                 "ROWNUM",
                 "ROWID",
+                "ORA_ROWSCN",
             ],
             None => &[],
         }
@@ -46049,9 +46147,27 @@ impl SqlEditorWidget {
         end: usize,
         db_type: Option<crate::db::DatabaseType>,
     ) -> bool {
-        if !crate::sql_text::mysql_compatibility_for_sql("", db_type)
-            || !Self::cursor_is_inside_routine_param_list(tokens, end)
+        if !crate::sql_text::mysql_compatibility_for_sql("", db_type) {
+            return false;
+        }
+        // `CREATE FUNCTION f(…) RETURNS <type>` — the return type sits outside the
+        // parameter list but is the same data-type slot. The closing paren of the
+        // parameter list must precede the keyword, so a routine *named* `returns`
+        // (`CREATE FUNCTION returns |`) still expects the `RETURNS` keyword itself.
         {
+            let before = Self::meaningful_tokens_before(tokens, end);
+            let is_returns_tail = matches!(
+                before.last(),
+                Some(SqlToken::Word(word)) if word.eq_ignore_ascii_case("RETURNS")
+            ) && matches!(
+                before.len().checked_sub(2).and_then(|idx| before.get(idx)),
+                Some(SqlToken::Symbol(sym)) if sym == ")"
+            );
+            if is_returns_tail {
+                return true;
+            }
+        }
+        if !Self::cursor_is_inside_routine_param_list(tokens, end) {
             return false;
         }
 
@@ -59310,7 +59426,390 @@ impl SqlEditorWidget {
             return Some(&["AS"]);
         }
 
+        // `expr COLLATE collation` binds to a finished operand in any expression
+        // slot; every dialect here spells it the same way.
+        if matches_prefix("COLLATE")
+            && !Self::cursor_applied_postfix_operators(tokens, structural_end).collate
+            && matches!(
+                phase,
+                intellisense_context::SqlPhase::OrderByClause
+                    | intellisense_context::SqlPhase::SelectList
+                    | intellisense_context::SqlPhase::WhereClause
+                    | intellisense_context::SqlPhase::GroupByClause
+                    | intellisense_context::SqlPhase::HavingClause
+            )
+            && (previous_is_symbol(")")
+                || previous_word.is_some_and(|word| {
+                    !Self::token_is_language_keyword(&word.to_ascii_uppercase())
+                }))
+        {
+            return Some(&["COLLATE"]);
+        }
+
+        if mysql_compatible {
+            // `SELECT … LOCK IN SHARE MODE` — the pre-8.0 spelling of `FOR SHARE`,
+            // still the only one MariaDB accepts.
+            if matches_prefix("LOCK")
+                && next_word
+                    .is_some_and(|word| word.eq_ignore_ascii_case("IN"))
+            {
+                return Some(&["LOCK IN SHARE MODE"]);
+            }
+            if matches_prefix("IN") && matches!(previous_word, Some("LOCK")) {
+                return Some(&["IN"]);
+            }
+            if matches_prefix("SHARE")
+                && matches!(previous_word, Some("IN"))
+                && has("LOCK")
+            {
+                return Some(&["SHARE"]);
+            }
+            if matches_prefix("MODE")
+                && matches!(previous_word, Some("SHARE"))
+                && has("LOCK")
+            {
+                return Some(&["MODE"]);
+            }
+            // `FOR {UPDATE|SHARE} [OF t] {NOWAIT|SKIP LOCKED}` wait policy.
+            if matches_prefix("LOCKED") && matches!(previous_word, Some("SKIP")) {
+                return Some(&["LOCKED"]);
+            }
+            // `CAST(x AS CHAR CHARACTER SET cs)` / `… AS BINARY CHARACTER SET cs`.
+            if matches_prefix("CHARACTER")
+                && next_word
+                    .is_some_and(|word| word.eq_ignore_ascii_case("SET"))
+                && matches!(
+                    previous_word,
+                    Some("CHAR" | "VARCHAR" | "BINARY" | "NCHAR" | "TEXT")
+                )
+            {
+                return Some(&["CHARACTER SET"]);
+            }
+            // `IF [NOT] EXISTS` guards on DDL clause tails.
+            if matches_prefix("NOT")
+                && matches!(previous_word, Some("IF"))
+                && (has("CREATE") || has("ADD"))
+            {
+                return Some(&["NOT"]);
+            }
+            if matches_prefix("EXISTS") && matches!(previous_word, Some("IF" | "NOT")) {
+                return Some(&["EXISTS"]);
+            }
+            if has("ALTER") && has("TABLE") {
+                // `ALTER TABLE … , ALGORITHM = {DEFAULT|INSTANT|INPLACE|COPY|NOCOPY}`
+                // and `, LOCK = {DEFAULT|NONE|SHARED|EXCLUSIVE}` execution options.
+                if matches_prefix("ALGORITHM")
+                    && next_is_symbol("=")
+                {
+                    return Some(&["ALGORITHM"]);
+                }
+                if matches_prefix("LOCK") && next_is_symbol("=") {
+                    return Some(&["LOCK"]);
+                }
+                if previous_is_symbol("=") {
+                    return match last {
+                        Some("ALGORITHM") => {
+                            Some(&["DEFAULT", "INSTANT", "INPLACE", "COPY", "NOCOPY"])
+                        }
+                        Some("LOCK") => Some(&["DEFAULT", "NONE", "SHARED", "EXCLUSIVE"]),
+                        _ => None,
+                    };
+                }
+            }
+        }
+
         if !mysql_compatible {
+            // `ALTER SESSION SET <parameter> = <value>`: both halves are a closed
+            // vocabulary that no catalog carries.
+            if has("ALTER") && has("SESSION") && has("SET") {
+                if matches!(previous_word, Some("SET")) || previous_is_symbol(",") {
+                    return Some(&[
+                        "CURRENT_SCHEMA",
+                        "CONTAINER",
+                        "DDL_LOCK_TIMEOUT",
+                        "ISOLATION_LEVEL",
+                        "NLS_COMP",
+                        "NLS_DATE_FORMAT",
+                        "NLS_LANGUAGE",
+                        "NLS_NUMERIC_CHARACTERS",
+                        "NLS_SORT",
+                        "NLS_TERRITORY",
+                        "NLS_TIMESTAMP_FORMAT",
+                        "OPTIMIZER_MODE",
+                        "PLSQL_OPTIMIZE_LEVEL",
+                        "PLSQL_WARNINGS",
+                        "QUERY_REWRITE_ENABLED",
+                        "RESULT_CACHE_MODE",
+                        "SQL_TRACE",
+                        "STATISTICS_LEVEL",
+                        "TIME_ZONE",
+                    ]);
+                }
+                if previous_is_symbol("=") {
+                    return match last {
+                        Some("STATISTICS_LEVEL") => Some(&["BASIC", "TYPICAL", "ALL"]),
+                        Some("OPTIMIZER_MODE") => Some(&[
+                            "ALL_ROWS",
+                            "FIRST_ROWS",
+                            "FIRST_ROWS_1",
+                            "FIRST_ROWS_10",
+                            "FIRST_ROWS_100",
+                            "FIRST_ROWS_1000",
+                        ]),
+                        Some("RESULT_CACHE_MODE") => Some(&["MANUAL", "FORCE"]),
+                        Some("SQL_TRACE" | "QUERY_REWRITE_ENABLED") => Some(&["TRUE", "FALSE"]),
+                        Some("ISOLATION_LEVEL") => Some(&["READ COMMITTED", "SERIALIZABLE"]),
+                        _ => None,
+                    };
+                }
+            }
+            // Constraint state trailing a finished constraint: `[NOT] DEFERRABLE`,
+            // `INITIALLY {IMMEDIATE|DEFERRED}`, `RELY|NORELY`, `ENABLE|DISABLE`,
+            // `VALIDATE|NOVALIDATE`. Anchored on the constraint's closing paren (or
+            // an inline `NOT NULL`) so a column-property slot never picks these up.
+            if (has("CREATE") || has("ALTER"))
+                && has("TABLE")
+                && (has("CONSTRAINT")
+                    || has("CHECK")
+                    || has("PRIMARY")
+                    || has("UNIQUE")
+                    || has("FOREIGN")
+                    || has("REFERENCES")
+                    || has("NULL"))
+            {
+                let after_constraint_body = previous_is_symbol(")")
+                    || matches!(previous_word, Some("NULL"))
+                    || matches!(
+                        previous_word,
+                        Some(
+                            "DEFERRABLE"
+                                | "IMMEDIATE"
+                                | "DEFERRED"
+                                | "RELY"
+                                | "NORELY"
+                                | "ENABLE"
+                                | "DISABLE"
+                                | "VALIDATE"
+                                | "NOVALIDATE"
+                        )
+                    );
+                if matches_prefix("DEFERRABLE")
+                    && (after_constraint_body
+                        || matches!(previous_word, Some("NOT")))
+                {
+                    return Some(&["DEFERRABLE"]);
+                }
+                if matches_prefix("INITIALLY") && after_constraint_body {
+                    return Some(&["INITIALLY"]);
+                }
+                if (matches_prefix("IMMEDIATE") || matches_prefix("DEFERRED"))
+                    && matches!(previous_word, Some("INITIALLY"))
+                {
+                    return Some(&["IMMEDIATE", "DEFERRED"]);
+                }
+                if after_constraint_body
+                    && ["RELY", "NORELY", "ENABLE", "DISABLE", "VALIDATE", "NOVALIDATE"]
+                        .iter()
+                        .any(|keyword| matches_prefix(keyword))
+                {
+                    return Some(&[
+                        "RELY",
+                        "NORELY",
+                        "ENABLE",
+                        "DISABLE",
+                        "VALIDATE",
+                        "NOVALIDATE",
+                    ]);
+                }
+            }
+            // `ACCESSIBLE BY ( [unit_kind] unit [, …] )` whitelist on a PL/SQL unit.
+            if matches_prefix("ACCESSIBLE")
+                && (has("PROCEDURE") || has("FUNCTION") || has("PACKAGE") || has("TYPE"))
+                && next_word
+                    .is_some_and(|word| word.eq_ignore_ascii_case("BY"))
+            {
+                return Some(&["ACCESSIBLE BY"]);
+            }
+            if matches_prefix("BY") && matches!(previous_word, Some("ACCESSIBLE")) {
+                return Some(&["BY"]);
+            }
+            if has("ACCESSIBLE")
+                && (previous_is_symbol("(") || previous_is_symbol(","))
+                && last_word_index_before("ACCESSIBLE").is_some()
+            {
+                return Some(&["FUNCTION", "PACKAGE", "PROCEDURE", "TRIGGER", "TYPE"]);
+            }
+            // Temporary-table lifetime: `ON COMMIT {DELETE|PRESERVE} ROWS` for a
+            // global temporary table, `ON COMMIT {DROP|PRESERVE} DEFINITION` for a
+            // private one.
+            if matches_prefix("PRIVATE")
+                && matches!(previous_word, Some("CREATE"))
+                && next_word
+                    .is_some_and(|word| word.eq_ignore_ascii_case("TEMPORARY"))
+            {
+                return Some(&["GLOBAL", "PRIVATE"]);
+            }
+            if has("TEMPORARY") && has("TABLE") {
+                if matches_prefix("ON")
+                    && next_word
+                        .is_some_and(|word| word.eq_ignore_ascii_case("COMMIT"))
+                {
+                    return Some(&["ON"]);
+                }
+                if matches!(previous_word, Some("COMMIT")) {
+                    return Some(if has("PRIVATE") {
+                        &["DROP", "PRESERVE"]
+                    } else {
+                        &["DELETE", "PRESERVE"]
+                    });
+                }
+                if matches!(previous_word, Some("PRESERVE" | "DELETE" | "DROP"))
+                    && has("COMMIT")
+                {
+                    return Some(if has("PRIVATE") {
+                        &["DEFINITION"]
+                    } else {
+                        &["ROWS"]
+                    });
+                }
+            }
+            // `ALTER TYPE … {ADD|DROP|MODIFY} ATTRIBUTE (…) CASCADE [NOT] INCLUDING
+            // TABLE DATA` — the dependent-rewrite tail.
+            if has("ALTER") && has("TYPE") {
+                if matches_prefix("CASCADE") && previous_is_symbol(")") && has("ATTRIBUTE") {
+                    return Some(&["CASCADE", "INVALIDATE"]);
+                }
+                if matches_prefix("INCLUDING") && matches!(previous_word, Some("CASCADE" | "NOT")) {
+                    return Some(&["INCLUDING"]);
+                }
+                if matches_prefix("NOT") && matches!(previous_word, Some("CASCADE")) {
+                    return Some(&["NOT"]);
+                }
+                if matches_prefix("TABLE") && matches!(previous_word, Some("INCLUDING")) {
+                    return Some(&["TABLE"]);
+                }
+                if matches_prefix("DATA")
+                    && matches!(previous_word, Some("TABLE"))
+                    && has("INCLUDING")
+                {
+                    return Some(&["DATA"]);
+                }
+            }
+            // `INSERT … LOG ERRORS [INTO t] [('tag')] REJECT LIMIT {n|UNLIMITED}`
+            // DML error logging tail.
+            if matches_prefix("ERRORS") && matches!(previous_word, Some("LOG")) {
+                return Some(&["ERRORS"]);
+            }
+            if has("LOG") && has("ERRORS") {
+                if matches_prefix("INTO") && matches!(previous_word, Some("ERRORS")) {
+                    return Some(&["INTO"]);
+                }
+                if matches_prefix("REJECT") {
+                    return Some(&["REJECT LIMIT"]);
+                }
+                if matches_prefix("LIMIT") && matches!(previous_word, Some("REJECT")) {
+                    return Some(&["LIMIT"]);
+                }
+                if matches_prefix("UNLIMITED")
+                    && matches!(previous_word, Some("LIMIT"))
+                    && has("REJECT")
+                {
+                    return Some(&["UNLIMITED"]);
+                }
+            }
+            // Inside `CREATE TYPE BODY`, `SELF` names the instance the method was
+            // invoked on, and each member declaration restarts with its modifier.
+            if has("TYPE") && has("BODY") {
+                if matches_prefix("SELF") {
+                    return Some(&["SELF"]);
+                }
+                if next_word.is_some_and(|word| {
+                    matches!(
+                        word.to_ascii_uppercase().as_str(),
+                        "FUNCTION" | "PROCEDURE" | "MEMBER"
+                    )
+                }) && [
+                    "MEMBER",
+                    "STATIC",
+                    "CONSTRUCTOR",
+                    "MAP",
+                    "ORDER",
+                    "OVERRIDING",
+                    "FINAL",
+                    "INSTANTIABLE",
+                ]
+                .iter()
+                .any(|keyword| matches_prefix(keyword))
+                {
+                    return Some(&[
+                        "MEMBER",
+                        "STATIC",
+                        "CONSTRUCTOR",
+                        "MAP MEMBER",
+                        "ORDER MEMBER",
+                        "OVERRIDING MEMBER",
+                        "FINAL MEMBER",
+                        "INSTANTIABLE MEMBER",
+                    ]);
+                }
+            }
+            // Table-clause constructs that reshape the row source of the FROM item
+            // just read. Each is admitted only by the exact token that follows it,
+            // so a completed construct elsewhere in the query is never re-offered.
+            if matches!(phase, intellisense_context::SqlPhase::FromClause) {
+                if matches_prefix("PARTITION")
+                    && next_word
+                        .is_some_and(|word| word.eq_ignore_ascii_case("BY"))
+                    && previous_word.is_some_and(|word| {
+                        !Self::token_is_language_keyword(&word.to_ascii_uppercase())
+                    })
+                {
+                    return Some(&["PARTITION BY"]);
+                }
+                if (matches_prefix("PIVOT") || matches_prefix("UNPIVOT"))
+                    && (next_is_symbol("(")
+                        || next_word.is_some_and(|word| {
+                            word.eq_ignore_ascii_case("XML") || word.eq_ignore_ascii_case("INCLUDE")
+                        }))
+                {
+                    return Some(&["PIVOT", "UNPIVOT"]);
+                }
+                // The preserved side of a partitioned outer join follows the query
+                // partition clause: `t PARTITION BY (c) RIGHT OUTER JOIN …`.
+                if previous_is_symbol(")")
+                    && has("PARTITION")
+                    && ["LEFT", "RIGHT", "FULL"]
+                        .iter()
+                        .any(|keyword| matches_prefix(keyword))
+                {
+                    return Some(&[
+                        "LEFT OUTER JOIN",
+                        "RIGHT OUTER JOIN",
+                        "FULL OUTER JOIN",
+                    ]);
+                }
+            }
+            // `PIVOT XML (agg FOR col IN (ANY|subquery|values))`.
+            if matches_prefix("XML") && matches!(previous_word, Some("PIVOT")) {
+                return Some(&["XML"]);
+            }
+            if matches_prefix("ANY")
+                && previous_is_symbol("(")
+                && has("PIVOT")
+                && has("XML")
+                && has("IN")
+            {
+                return Some(&["ANY"]);
+            }
+            // `RETURNING col BULK COLLECT INTO collection`.
+            if has("RETURNING") {
+                if matches_prefix("BULK") && !has("BULK") {
+                    return Some(&["BULK COLLECT INTO"]);
+                }
+                if matches_prefix("COLLECT") && matches!(previous_word, Some("BULK")) {
+                    return Some(&["COLLECT"]);
+                }
+            }
             let in_conversion_function = Self::innermost_open_paren_preceding_word(
                 tokens,
                 structural_end,
@@ -63251,6 +63750,7 @@ impl SqlEditorWidget {
 
     fn collect_oracle_qualifier_head_suggestions(
         data: &IntellisenseData,
+        deep_ctx: &intellisense_context::CursorContext,
         prefix: &str,
         db_type: Option<crate::db::DatabaseType>,
     ) -> Vec<String> {
@@ -63264,6 +63764,22 @@ impl SqlEditorWidget {
                 suggestions.push(name.to_string());
             }
         };
+
+        // Every dialect lets a column be qualified by the relation itself, not only
+        // by its alias (`metric.node_id` in a query whose FROM says `FROM metric`).
+        for table_ref in deep_ctx.tables_in_scope.iter() {
+            if let Some(alias) = table_ref.alias.as_deref() {
+                push(alias);
+            }
+            push(&table_ref.name);
+            if let Some((_, short)) = table_ref.name.rsplit_once('.') {
+                push(short);
+            }
+        }
+
+        if crate::sql_text::mysql_compatibility_for_sql("", db_type) {
+            return suggestions;
+        }
 
         for name in IntellisenseData::get_oracle_builtin_package_suggestions_for_db(prefix, db_type)
         {

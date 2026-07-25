@@ -553,8 +553,17 @@ fn collect_mysql_temporary_tables_from_text(script: &str) -> Vec<(String, Vec<St
         };
         let tail = script.get(after_name..).unwrap_or("");
         let tail_upper = upper.get(after_name..).unwrap_or("");
-        let columns = if let Some(as_idx) = tail_upper.find(" AS") {
-            let select_sql = tail.get(as_idx + " AS".len()..).unwrap_or("");
+        // Only this statement may contribute columns. Without the bound, a
+        // `CREATE TEMPORARY TABLE t (col …)` picked up the next ` AS` alias
+        // anywhere later in the script and overwrote the real DDL columns.
+        let statement_len = tail.find(';').unwrap_or(tail.len());
+        let statement = tail.get(..statement_len).unwrap_or("");
+        let statement_upper = tail_upper.get(..statement_len).unwrap_or("");
+        let columns = if statement.trim_start().starts_with('(') {
+            // Explicit column list — the token-based pass already registered it.
+            Vec::new()
+        } else if let Some(as_idx) = statement_upper.find(" AS") {
+            let select_sql = statement.get(as_idx + " AS".len()..).unwrap_or("");
             mysql_select_columns_from_text(select_sql)
         } else {
             Vec::new()
@@ -1182,7 +1191,7 @@ fn oracle_create_kind_and_name_idx(tokens: &[SqlToken], create_idx: usize) -> Op
     while let Some(word) = token_word_text(tokens.get(idx)) {
         match word.to_ascii_uppercase().as_str() {
             "OR" | "REPLACE" | "EDITIONABLE" | "NONEDITIONABLE" | "FORCE" => idx += 1,
-            "GLOBAL" if token_word_eq(tokens.get(idx + 1), "TEMPORARY") => idx += 2,
+            "GLOBAL" | "PRIVATE" if token_word_eq(tokens.get(idx + 1), "TEMPORARY") => idx += 2,
             _ => break,
         }
     }
@@ -5429,7 +5438,6 @@ fn audit_final_suggestions_impl(
         );
     }
     let oracle_qualifier_head_suggestions = if qualifier.is_none()
-        && !crate::sql_text::mysql_compatibility_for_sql("", Some(db))
         && !matches!(
             expected_object_kind,
             Some(ExpectedObjectSuggestionKind::Sequence)
@@ -5441,7 +5449,7 @@ fn audit_final_suggestions_impl(
             !prefix.is_empty(),
         ))
     {
-        SqlEditorWidget::collect_oracle_qualifier_head_suggestions(&data, &prefix, Some(db))
+        SqlEditorWidget::collect_oracle_qualifier_head_suggestions(&data, &ctx, &prefix, Some(db))
     } else {
         Vec::new()
     };
@@ -52114,6 +52122,11 @@ fn oracle_intellisense_data_from_catalog(catalog: &MysqlFamilyScriptCatalog) -> 
             vec!["OPERATION", "OPTIONS", "OBJECT_NAME", "STATEMENT_ID", "ID"],
         ),
         ("VIEW", "USER_PROPERTY_GRAPHS", vec!["GRAPH_NAME"]),
+        (
+            "VIEW",
+            "USER_PRIVATE_TEMP_TABLES",
+            vec!["TABLE_NAME", "DURATION"],
+        ),
         ("VIEW", "V$VERSION", vec!["BANNER_FULL"]),
     ] {
         if kind == "VIEW" {
@@ -52221,6 +52234,18 @@ fn mysql_family_test_intellisense_data(
     push_unique_case_insensitive(&mut data.schemas, "INFORMATION_SCHEMA");
     for (table, columns) in [
         (
+            "INFORMATION_SCHEMA.COLUMNS",
+            vec![
+                "TABLE_SCHEMA",
+                "TABLE_NAME",
+                "COLUMN_NAME",
+                "ORDINAL_POSITION",
+                "DATA_TYPE",
+                "IS_NULLABLE",
+                "COLUMN_DEFAULT",
+            ],
+        ),
+        (
             "INFORMATION_SCHEMA.KEYWORDS",
             vec!["WORD", "RESERVED"],
         ),
@@ -52255,6 +52280,7 @@ fn mysql_family_test_intellisense_data(
     data.set_members_for_qualifier_with_kinds(
         "INFORMATION_SCHEMA",
         vec![
+            ("COLUMNS".to_string(), Some(QualifiedMemberKind::Table)),
             (
                 "COLUMN_STATISTICS".to_string(),
                 Some(QualifiedMemberKind::Table),
@@ -54811,6 +54837,15 @@ fn intellisense_sweep_word_skip_context_from_analysis(
             Some(db_type),
         )
         || SqlEditorWidget::cursor_is_at_plsql_declaration_object_name_slot_for_context(
+            deep_ctx,
+            true,
+            Some(db_type),
+        )
+        // A routine parameter name is a brand-new name. The production predicate
+        // knows the whole parameter list shape, so it also covers parameters typed
+        // with a user-defined type (`other money_t`), which the text heuristics
+        // below only recognize for built-in type leads.
+        || SqlEditorWidget::cursor_is_at_plsql_routine_parameter_name_slot_for_context(
             deep_ctx,
             true,
             Some(db_type),
@@ -95923,3 +95958,4 @@ fn sweep_preserves_quotes_around_quoted_identifier_prefixes() {
         "quoted HANDLER index reference should remain lexically separated during the sweep"
     );
 }
+

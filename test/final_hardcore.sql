@@ -26,6 +26,17 @@ BEGIN
     SELECT 'DROP ATTRIBUTE DIMENSION sq_hard_node_ad' FROM dual UNION ALL
     SELECT 'DROP PACKAGE sq_hard_ptf_pkg' FROM dual UNION ALL
     SELECT 'DROP PROCEDURE sq_hard_autolog' FROM dual UNION ALL
+    SELECT 'DROP PROCEDURE sq_hard_w5_guarded' FROM dual UNION ALL
+    SELECT 'DROP PACKAGE sq_hard_w5_pkg' FROM dual UNION ALL
+    SELECT 'DROP FUNCTION sq_hard_w5_scale' FROM dual UNION ALL
+    SELECT 'TRUNCATE TABLE sq_hard_w5_gtt' FROM dual UNION ALL
+    SELECT 'DROP TABLE sq_hard_w5_gtt PURGE' FROM dual UNION ALL
+    SELECT 'DROP TABLE ora$ptt_sq_hard_w5' FROM dual UNION ALL
+    SELECT 'DROP TABLE sq_hard_w5_err PURGE' FROM dual UNION ALL
+    SELECT 'DROP TABLE sq_hard_w5_note PURGE' FROM dual UNION ALL
+    SELECT 'DROP TABLE sq_hard_w5_wallet PURGE' FROM dual UNION ALL
+    SELECT 'DROP TABLE sq_hard_w5_bulk PURGE' FROM dual UNION ALL
+    SELECT 'DROP TYPE sq_hard_w5_money_t FORCE' FROM dual UNION ALL
     SELECT 'DROP TABLE sq_hard_bag PURGE' FROM dual UNION ALL
     SELECT 'DROP TABLE sq_hard_sales PURGE' FROM dual UNION ALL
     SELECT 'DROP TABLE sq_hard_ledger PURGE' FROM dual UNION ALL
@@ -1701,7 +1712,7 @@ SELECT target_id,
          payload
          RETURNING VARCHAR2(400) ORDERED
        )                                                       AS ordered_payload,
-       RAWTOHEX(JSON_ID('UUID'))                               AS generated_uuid
+       LENGTH(RAWTOHEX(JSON_ID('UUID')))                       AS generated_uuid_len
 FROM sq_hard_w4_target
 ORDER BY target_id;
 
@@ -1836,6 +1847,540 @@ BEGIN
 END;
 /
 
+--------------------------------------------------------------------------------
+-- ULTRA WAVE 5: join grammar the parser cannot resolve from token shape alone
+-- (partitioned outer join, CROSS APPLY / LATERAL, NATURAL JOIN, USING, legacy
+-- (+)), DML through an updatable inline view, INSERT ... LOG ERRORS, object
+-- types with user constructors / STATIC / ORDER members and a live ALTER TYPE,
+-- PIVOT XML with ANY, temporary-table families, subprogram attribute stacking,
+-- bulk-binding torture, and hint syntax that is one line-join away from
+-- commenting out its own projection.
+--------------------------------------------------------------------------------
+
+CREATE TABLE sq_hard_w5_note (
+  note_key   VARCHAR2(30) CONSTRAINT sq_hard_w5_note_pk PRIMARY KEY,
+  note_value NUMBER NOT NULL
+) TABLESPACE users;
+
+--------------------------------------------------------------------------------
+-- W5-A: join-grammar torture. The partitioned outer join densifies a calendar
+-- per node, CROSS APPLY and CROSS JOIN LATERAL correlate back into the outer
+-- row, NATURAL JOIN / JOIN USING hide their predicates (and forbid qualifying
+-- the join column), and the legacy (+) operator sits flush against a column.
+--------------------------------------------------------------------------------
+SELECT cal.metric_day,
+       m.node_id,
+       NVL(m.metric_value, 0) AS filled_value
+FROM sq_hard_metric m PARTITION BY (m.node_id)
+RIGHT OUTER JOIN (SELECT DATE '2026-01-01' + LEVEL - 1 AS metric_day
+                  FROM dual
+                  CONNECT BY LEVEL <= 3) cal
+  ON cal.metric_day = m.metric_day
+ORDER BY m.node_id, cal.metric_day;
+
+SELECT n.node_id,
+       peak.metric_name    AS peak_name,
+       peak.metric_value   AS peak_value,
+       spread.value_spread AS value_spread
+FROM (SELECT DISTINCT node_id FROM sq_hard_metric) n
+CROSS APPLY (SELECT m.metric_name, m.metric_value
+             FROM sq_hard_metric m
+             WHERE m.node_id = n.node_id
+             ORDER BY m.metric_value DESC, m.metric_id
+             FETCH FIRST 1 ROW ONLY) peak
+CROSS JOIN LATERAL (SELECT MAX(x.metric_value) - MIN(x.metric_value) AS value_spread
+                    FROM sq_hard_metric x
+                    WHERE x.node_id = n.node_id) spread
+ORDER BY n.node_id;
+
+SELECT node_id, metric_count, peak_value
+FROM (SELECT node_id, COUNT(*) AS metric_count
+      FROM sq_hard_metric
+      GROUP BY node_id)
+NATURAL JOIN (SELECT node_id, MAX(metric_value) AS peak_value
+              FROM sq_hard_metric
+              GROUP BY node_id)
+ORDER BY node_id;
+
+SELECT node_id, COUNT(*) AS joined_rows
+FROM sq_hard_metric
+JOIN sq_hard_v USING (node_id)
+GROUP BY node_id
+ORDER BY node_id;
+
+SELECT m.metric_id, COUNT(e.edge_id) AS out_edges
+FROM sq_hard_metric m, sq_hard_edge e
+WHERE e.src_metric_id(+) = m.metric_id
+GROUP BY m.metric_id
+ORDER BY m.metric_id;
+
+--------------------------------------------------------------------------------
+-- W5-B: quantified comparisons, a row-value constructor IN list, IS JSON and
+-- JSON_EQUAL conditions, and the ORA_ROWSCN / ROWID pseudo-columns.
+--------------------------------------------------------------------------------
+SELECT COUNT(*) AS above_all,
+       COUNT(CASE WHEN pair_hit = 1 THEN 1 END) AS pair_hits
+FROM (SELECT m.metric_id,
+             CASE WHEN (m.node_id, m.metric_name) IN ((1, 'LATENCY'), (2, 'ERRORS'))
+                  THEN 1 ELSE 0 END AS pair_hit
+      FROM sq_hard_metric m
+      WHERE m.metric_value >= ALL (SELECT x.metric_value
+                                   FROM sq_hard_metric x
+                                   WHERE x.node_id = m.node_id)
+        AND m.metric_name = ANY ('LATENCY', 'ERRORS')
+        AND m.metric_id <> SOME (SELECT y.metric_id FROM sq_hard_metric y));
+
+SELECT COUNT(*) AS json_rows
+FROM sq_hard_metric m
+WHERE m.payload IS JSON
+  AND JSON_EQUAL('{"a":1,"b":[2,3]}', '{"b":[2,3],"a":1}')
+  AND NOT ('{oops' IS JSON);
+
+SELECT COUNT(DISTINCT ROWIDTOCHAR(m.ROWID))                       AS distinct_rowids,
+       CASE WHEN COUNT(DISTINCT ORA_ROWSCN) >= 1 THEN 'scn-ok' END AS scn_shape
+FROM sq_hard_metric m;
+
+--------------------------------------------------------------------------------
+-- W5-C: DML through an updatable inline view, then INSERT ... LOG ERRORS
+-- routing the primary-key collision into a DBMS_ERRLOG shadow table instead of
+-- failing the statement.
+--------------------------------------------------------------------------------
+CREATE TABLE sq_hard_w5_bulk (
+  bulk_id  NUMBER CONSTRAINT sq_hard_w5_bulk_pk PRIMARY KEY,
+  amount   NUMBER(10, 2) NOT NULL,
+  note     VARCHAR2(30)
+) TABLESPACE users;
+
+INSERT INTO sq_hard_w5_bulk (bulk_id, amount, note)
+SELECT LEVEL, LEVEL * 10, 'seed' FROM dual CONNECT BY LEVEL <= 5;
+
+UPDATE (SELECT amount, note
+        FROM sq_hard_w5_bulk
+        WHERE bulk_id <= 2)
+SET note = 'inline-view', amount = amount + 1;
+
+DELETE FROM (SELECT * FROM sq_hard_w5_bulk WHERE bulk_id = 5);
+
+BEGIN
+  DBMS_ERRLOG.CREATE_ERROR_LOG(
+    dml_table_name   => 'SQ_HARD_W5_BULK',
+    err_log_table_name => 'SQ_HARD_W5_ERR'
+  );
+END;
+/
+
+INSERT INTO sq_hard_w5_bulk (bulk_id, amount, note)
+SELECT 1, 999, 'dup' FROM dual UNION ALL
+SELECT 6, 60, 'logged-ok' FROM dual
+LOG ERRORS INTO sq_hard_w5_err ('wave5') REJECT LIMIT UNLIMITED;
+
+ALTER TABLE sq_hard_w5_bulk ADD CONSTRAINT sq_hard_w5_bulk_ck
+  CHECK (amount >= 0) DEFERRABLE INITIALLY DEFERRED;
+
+SET CONSTRAINTS ALL IMMEDIATE;
+
+CREATE INDEX sq_hard_w5_bulk_fx ON sq_hard_w5_bulk (UPPER(note)) INVISIBLE;
+
+ALTER INDEX sq_hard_w5_bulk_fx VISIBLE;
+
+INSERT INTO sq_hard_w5_note (note_key, note_value)
+SELECT 'errlog', COUNT(*) FROM sq_hard_w5_err;
+
+--------------------------------------------------------------------------------
+-- W5-D: object type round two. A user-defined constructor returns SELF AS
+-- RESULT, a STATIC function builds a zero value, ORDER MEMBER makes the object
+-- column sortable, and ALTER TYPE ... ADD ATTRIBUTE CASCADE rewrites live rows
+-- before an attribute-path UPDATE fills the new attribute in.
+--------------------------------------------------------------------------------
+CREATE OR REPLACE TYPE sq_hard_w5_money_t AS OBJECT (
+  amount NUMBER,
+  CONSTRUCTOR FUNCTION sq_hard_w5_money_t(cents NUMBER, per_unit NUMBER)
+    RETURN SELF AS RESULT,
+  STATIC FUNCTION zero RETURN sq_hard_w5_money_t,
+  MEMBER FUNCTION scaled(factor NUMBER DEFAULT 2) RETURN NUMBER,
+  ORDER MEMBER FUNCTION rank_against(other sq_hard_w5_money_t) RETURN INTEGER
+);
+/
+
+CREATE OR REPLACE TYPE BODY sq_hard_w5_money_t AS
+  CONSTRUCTOR FUNCTION sq_hard_w5_money_t(cents NUMBER, per_unit NUMBER)
+    RETURN SELF AS RESULT
+  IS
+  BEGIN
+    SELF.amount := cents / NULLIF(per_unit, 0);
+    RETURN;
+  END;
+
+  STATIC FUNCTION zero RETURN sq_hard_w5_money_t IS
+  BEGIN
+    RETURN sq_hard_w5_money_t(0, 1);
+  END zero;
+
+  MEMBER FUNCTION scaled(factor NUMBER DEFAULT 2) RETURN NUMBER IS
+  BEGIN
+    RETURN SELF.amount * factor;
+  END scaled;
+
+  ORDER MEMBER FUNCTION rank_against(other sq_hard_w5_money_t) RETURN INTEGER IS
+  BEGIN
+    RETURN CASE
+             WHEN other IS NULL THEN 1
+             WHEN SELF.amount < other.amount THEN -1
+             WHEN SELF.amount > other.amount THEN 1
+             ELSE 0
+           END;
+  END rank_against;
+END;
+/
+
+CREATE TABLE sq_hard_w5_wallet (
+  wallet_id NUMBER CONSTRAINT sq_hard_w5_wallet_pk PRIMARY KEY,
+  balance   sq_hard_w5_money_t
+) TABLESPACE users;
+
+INSERT INTO sq_hard_w5_wallet VALUES (1, sq_hard_w5_money_t(500, 5));
+INSERT INTO sq_hard_w5_wallet VALUES (2, sq_hard_w5_money_t(90));
+INSERT INTO sq_hard_w5_wallet VALUES (3, sq_hard_w5_money_t.zero());
+
+ALTER TYPE sq_hard_w5_money_t
+  ADD ATTRIBUTE (currency VARCHAR2(3)) CASCADE INCLUDING TABLE DATA;
+
+ALTER TYPE sq_hard_w5_money_t COMPILE BODY;
+
+UPDATE sq_hard_w5_wallet w
+SET w.balance.currency = CASE WHEN w.wallet_id = 3 THEN 'KRW' ELSE 'USD' END;
+
+SELECT w.wallet_id,
+       w.balance.amount        AS balance_amount,
+       w.balance.currency      AS balance_currency,
+       w.balance.scaled(3)     AS tripled,
+       w.balance.scaled()      AS doubled
+FROM sq_hard_w5_wallet w
+ORDER BY w.balance, w.wallet_id;
+
+INSERT INTO sq_hard_w5_note (note_key, note_value)
+SELECT 'wallet', SUM(w.balance.amount) FROM sq_hard_w5_wallet w;
+
+--------------------------------------------------------------------------------
+-- W5-E: PIVOT XML with the ANY pseudo-value, a WITH clause carrying an explicit
+-- column alias list, GROUPING SETS with an empty grouping set, a COLLATE'd
+-- ORDER BY, and a seeded block SAMPLE.
+--------------------------------------------------------------------------------
+SELECT px.node_id,
+       CASE WHEN INSTR(XMLSERIALIZE(CONTENT px.metric_name_xml), 'LATENCY') > 0
+            THEN 'has-latency' ELSE 'no-latency' END AS xml_shape
+FROM (SELECT node_id, metric_name, metric_value FROM sq_hard_metric)
+PIVOT XML (SUM(metric_value) AS total FOR metric_name IN (ANY)) px
+ORDER BY px.node_id;
+
+WITH tally (bucket_name, bucket_total, bucket_rows) AS (
+  SELECT metric_name, SUM(metric_value), COUNT(*)
+  FROM sq_hard_metric
+  GROUP BY metric_name
+), rollup_grid AS (
+  SELECT metric_name,
+         GROUPING(metric_name) AS is_total,
+         SUM(metric_value)     AS grid_total
+  FROM sq_hard_metric
+  GROUP BY GROUPING SETS ((metric_name), ())
+)
+SELECT t.bucket_name,
+       t.bucket_total,
+       t.bucket_rows,
+       g.grid_total,
+       g.is_total
+FROM tally t
+JOIN rollup_grid g
+  ON g.metric_name = t.bucket_name
+ORDER BY t.bucket_name COLLATE BINARY_CI, t.bucket_total DESC NULLS LAST;
+
+SELECT CASE WHEN COUNT(*) BETWEEN 0 AND 4 THEN 'sample-ok' END AS sample_shape
+FROM sq_hard_metric SAMPLE (99) SEED (7);
+
+--------------------------------------------------------------------------------
+-- W5-F: a session-scoped global temporary table that survives the commit, and a
+-- private temporary table whose ORA$PTT_ name carries a dollar sign.
+--------------------------------------------------------------------------------
+CREATE GLOBAL TEMPORARY TABLE sq_hard_w5_gtt (
+  slot_id   NUMBER,
+  slot_note VARCHAR2(30)
+) ON COMMIT PRESERVE ROWS;
+
+INSERT INTO sq_hard_w5_gtt (slot_id, slot_note)
+SELECT LEVEL, 'gtt-' || LEVEL FROM dual CONNECT BY LEVEL <= 3;
+
+CREATE PRIVATE TEMPORARY TABLE ora$ptt_sq_hard_w5 (
+  slot_id   NUMBER,
+  slot_note VARCHAR2(30)
+) ON COMMIT PRESERVE DEFINITION;
+
+INSERT INTO sq_hard_w5_note (note_key, note_value)
+SELECT 'ptt', COUNT(*)
+FROM user_private_temp_tables
+WHERE table_name = 'ORA$PTT_SQ_HARD_W5';
+
+DROP TABLE ora$ptt_sq_hard_w5;
+
+INSERT INTO sq_hard_w5_note (note_key, note_value)
+SELECT 'gtt', COUNT(*) FROM sq_hard_w5_gtt;
+
+--------------------------------------------------------------------------------
+-- W5-G: subprogram attribute stacking (DETERMINISTIC / PARALLEL_ENABLE /
+-- RESULT_CACHE), a package with two overloads of one name and a RANGE-limited
+-- SUBTYPE, an ACCESSIBLE BY whitelist, and a $ERROR arm that must stay unlit.
+--------------------------------------------------------------------------------
+CREATE OR REPLACE FUNCTION sq_hard_w5_scale(p_value NUMBER)
+  RETURN NUMBER
+  DETERMINISTIC
+  PARALLEL_ENABLE
+  RESULT_CACHE
+IS
+BEGIN
+  RETURN p_value * 3;
+END sq_hard_w5_scale;
+/
+
+CREATE OR REPLACE PROCEDURE sq_hard_w5_guarded(p_seed IN NUMBER,
+                                               p_out  OUT NOCOPY NUMBER)
+  ACCESSIBLE BY (PACKAGE sq_hard_w5_pkg)
+IS
+BEGIN
+  p_out := sq_hard_w5_scale(p_seed) + 1;
+END sq_hard_w5_guarded;
+/
+
+CREATE OR REPLACE PACKAGE sq_hard_w5_pkg AUTHID CURRENT_USER AS
+  SUBTYPE small_count IS PLS_INTEGER RANGE 0 .. 9999;
+  FUNCTION render(p_value NUMBER) RETURN VARCHAR2;
+  FUNCTION render(p_value VARCHAR2, p_pad small_count DEFAULT 4) RETURN VARCHAR2;
+  FUNCTION guarded_total(p_seed NUMBER) RETURN NUMBER;
+END sq_hard_w5_pkg;
+/
+
+CREATE OR REPLACE PACKAGE BODY sq_hard_w5_pkg AS
+  FUNCTION render(p_value NUMBER) RETURN VARCHAR2 IS
+  BEGIN
+    $IF DBMS_DB_VERSION.VER_LE_10 $THEN
+      $ERROR 'sq_hard_w5_pkg requires 11g or later' $END
+    $END
+    RETURN 'n:' || TO_CHAR(p_value);
+  END render;
+
+  FUNCTION render(p_value VARCHAR2, p_pad small_count DEFAULT 4)
+    RETURN VARCHAR2 IS
+  BEGIN
+    RETURN 's:' || LPAD(p_value, p_pad, '.');
+  END render;
+
+  FUNCTION guarded_total(p_seed NUMBER) RETURN NUMBER IS
+    l_out NUMBER;
+  BEGIN
+    sq_hard_w5_guarded(p_seed => p_seed, p_out => l_out);
+    RETURN l_out;
+  END guarded_total;
+END sq_hard_w5_pkg;
+/
+
+SELECT sq_hard_w5_pkg.render(12)             AS numeric_render,
+       sq_hard_w5_pkg.render('ab')           AS text_render,
+       sq_hard_w5_pkg.render('ab', p_pad => 6) AS padded_render,
+       sq_hard_w5_pkg.guarded_total(5)       AS guarded_total
+FROM dual;
+
+--------------------------------------------------------------------------------
+-- W5-H: bulk-binding torture. INDICES OF walks a sparse collection, VALUES OF
+-- walks an index collection, SQL%BULK_ROWCOUNT is read per iteration, and the
+-- DELETE hands its keys back through RETURNING ... BULK COLLECT INTO.
+--------------------------------------------------------------------------------
+DECLARE
+  TYPE id_tab  IS TABLE OF sq_hard_w5_bulk.bulk_id%TYPE;
+  TYPE idx_tab IS TABLE OF PLS_INTEGER;
+
+  ids         id_tab  := id_tab(1, 2, 3, 4, 6);
+  chosen      idx_tab := idx_tab(2, 5);
+  removed     id_tab;
+  touched     PLS_INTEGER := 0;
+  second_rows PLS_INTEGER := 0;
+  removed_ct  PLS_INTEGER := 0;
+  dml_errors  PLS_INTEGER := 0;
+  walker      PLS_INTEGER;
+BEGIN
+  ids.DELETE(3);
+
+  FORALL i IN INDICES OF ids SAVE EXCEPTIONS
+    UPDATE sq_hard_w5_bulk
+    SET amount = amount + 1
+    WHERE bulk_id = ids(i);
+
+  walker := ids.FIRST;
+  WHILE walker IS NOT NULL LOOP
+    touched := touched + NVL(SQL%BULK_ROWCOUNT(walker), 0);
+    walker  := ids.NEXT(walker);
+  END LOOP;
+
+  FORALL j IN VALUES OF chosen
+    UPDATE sq_hard_w5_bulk
+    SET note = note || '+v'
+    WHERE bulk_id = ids(j);
+
+  second_rows := SQL%ROWCOUNT;
+
+  DELETE FROM sq_hard_w5_bulk
+  WHERE bulk_id >= 6
+  RETURNING bulk_id BULK COLLECT INTO removed;
+
+  removed_ct := removed.COUNT;
+
+  INSERT INTO sq_hard_w5_note (note_key, note_value) VALUES ('bulk_touched', touched);
+  INSERT INTO sq_hard_w5_note (note_key, note_value) VALUES ('bulk_second', second_rows);
+  INSERT INTO sq_hard_w5_note (note_key, note_value) VALUES ('bulk_removed', removed_ct);
+EXCEPTION
+  WHEN OTHERS THEN
+    IF SQLCODE = -24381 THEN
+      dml_errors := SQL%BULK_EXCEPTIONS.COUNT;
+      RAISE_APPLICATION_ERROR(-20090, 'unexpected bulk errors ' || dml_errors);
+    END IF;
+    RAISE;
+END;
+/
+
+--------------------------------------------------------------------------------
+-- W5-I: hint torture. The single-line --+ form must keep its own line or it
+-- comments the projection out, and the block form carries query-block names
+-- that are referenced from an outer hint with @.
+--------------------------------------------------------------------------------
+SELECT --+ FULL(m) NO_PARALLEL(m)
+       m.metric_id,
+       m.metric_value
+FROM sq_hard_metric m
+WHERE m.metric_id <= 2
+ORDER BY m.metric_id;
+
+SELECT /*+ QB_NAME(outer_qb)
+           LEADING(@outer_qb m@outer_qb e@outer_qb)
+           NO_MERGE(@inner_qb) */
+       m.metric_id, e.edge_cost
+FROM sq_hard_metric m,
+     (SELECT /*+ QB_NAME(inner_qb) */
+             src_metric_id, MIN(hop_cost) AS edge_cost
+      FROM sq_hard_edge
+      GROUP BY src_metric_id) e
+WHERE e.src_metric_id = m.metric_id
+ORDER BY m.metric_id;
+
+ALTER SESSION SET STATISTICS_LEVEL = ALL;
+
+ALTER SESSION SET OPTIMIZER_MODE = ALL_ROWS;
+
+--------------------------------------------------------------------------------
+-- W5-J: wave-5 self-verification.
+--------------------------------------------------------------------------------
+DECLARE
+  dense_rows   PLS_INTEGER;
+  apply_spread NUMBER;
+  outer_join   PLS_INTEGER;
+  quant_rows   PLS_INTEGER;
+  bulk_rows    PLS_INTEGER;
+  bulk_sum     NUMBER;
+  wallet_sum   NUMBER;
+  wallet_cur   VARCHAR2(3);
+  errlog_rows  NUMBER;
+  gtt_rows     NUMBER;
+  ptt_rows     NUMBER;
+  touched      NUMBER;
+  second_rows  NUMBER;
+  removed_rows NUMBER;
+  render_text  VARCHAR2(40);
+  guarded_val  NUMBER;
+  pivot_hits   PLS_INTEGER;
+BEGIN
+  SELECT COUNT(*)
+  INTO dense_rows
+  FROM sq_hard_metric m PARTITION BY (m.node_id)
+  RIGHT OUTER JOIN (SELECT DATE '2026-01-01' + LEVEL - 1 AS metric_day
+                    FROM dual
+                    CONNECT BY LEVEL <= 3) cal
+    ON cal.metric_day = m.metric_day;
+
+  SELECT MAX(spread.value_spread)
+  INTO apply_spread
+  FROM (SELECT DISTINCT node_id FROM sq_hard_metric) n
+  CROSS JOIN LATERAL (SELECT MAX(x.metric_value) - MIN(x.metric_value) AS value_spread
+                      FROM sq_hard_metric x
+                      WHERE x.node_id = n.node_id) spread;
+
+  SELECT COUNT(*)
+  INTO outer_join
+  FROM sq_hard_metric m, sq_hard_edge e
+  WHERE e.src_metric_id(+) = m.metric_id;
+
+  SELECT COUNT(*)
+  INTO quant_rows
+  FROM sq_hard_metric m
+  WHERE m.metric_value >= ALL (SELECT x.metric_value
+                               FROM sq_hard_metric x
+                               WHERE x.node_id = m.node_id);
+
+  SELECT COUNT(*), SUM(amount) INTO bulk_rows, bulk_sum FROM sq_hard_w5_bulk;
+  SELECT SUM(w.balance.amount) INTO wallet_sum FROM sq_hard_w5_wallet w;
+  SELECT w.balance.currency INTO wallet_cur
+  FROM sq_hard_w5_wallet w WHERE w.wallet_id = 3;
+
+  SELECT MAX(CASE note_key WHEN 'errlog'       THEN note_value END),
+         MAX(CASE note_key WHEN 'gtt'          THEN note_value END),
+         MAX(CASE note_key WHEN 'ptt'          THEN note_value END),
+         MAX(CASE note_key WHEN 'bulk_touched' THEN note_value END),
+         MAX(CASE note_key WHEN 'bulk_second'  THEN note_value END),
+         MAX(CASE note_key WHEN 'bulk_removed' THEN note_value END)
+  INTO errlog_rows, gtt_rows, ptt_rows, touched, second_rows, removed_rows
+  FROM sq_hard_w5_note;
+
+  render_text := sq_hard_w5_pkg.render('ab', 6);
+  guarded_val := sq_hard_w5_pkg.guarded_total(5);
+
+  SELECT COUNT(*)
+  INTO pivot_hits
+  FROM (SELECT node_id, metric_name, metric_value FROM sq_hard_metric)
+  PIVOT XML (SUM(metric_value) AS total FOR metric_name IN (ANY));
+
+  IF dense_rows <> 6 THEN
+    RAISE_APPLICATION_ERROR(-20080, 'partitioned outer join ' || dense_rows);
+  END IF;
+  IF apply_spread <> 12 THEN
+    RAISE_APPLICATION_ERROR(-20081, 'lateral spread ' || apply_spread);
+  END IF;
+  IF outer_join <> 5 THEN
+    RAISE_APPLICATION_ERROR(-20082, 'legacy outer join ' || outer_join);
+  END IF;
+  IF quant_rows <> 2 THEN
+    RAISE_APPLICATION_ERROR(-20083, 'quantified rows ' || quant_rows);
+  END IF;
+  IF bulk_rows <> 4 OR bulk_sum <> 105 THEN
+    RAISE_APPLICATION_ERROR(-20084, 'bulk ' || bulk_rows || '/' || bulk_sum);
+  END IF;
+  IF wallet_sum <> 190 OR wallet_cur <> 'KRW' THEN
+    RAISE_APPLICATION_ERROR(-20085, 'wallet ' || wallet_sum || '/' || wallet_cur);
+  END IF;
+  IF errlog_rows <> 1 OR gtt_rows <> 3 OR ptt_rows <> 1 THEN
+    RAISE_APPLICATION_ERROR(
+      -20086,
+      'temp/errlog ' || errlog_rows || '/' || gtt_rows || '/' || ptt_rows
+    );
+  END IF;
+  IF touched <> 4 OR second_rows <> 2 OR removed_rows <> 1 THEN
+    RAISE_APPLICATION_ERROR(
+      -20087,
+      'forall ' || touched || '/' || second_rows || '/' || removed_rows
+    );
+  END IF;
+  IF render_text <> 's:....ab' OR guarded_val <> 16 THEN
+    RAISE_APPLICATION_ERROR(-20088, 'package ' || render_text || '/' || guarded_val);
+  END IF;
+  IF pivot_hits <> 2 THEN
+    RAISE_APPLICATION_ERROR(-20089, 'pivot xml ' || pivot_hits);
+  END IF;
+END;
+/
 --------------------------------------------------------------------------------
 -- Final self-verification and PASS banner.
 --------------------------------------------------------------------------------

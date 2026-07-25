@@ -1181,9 +1181,274 @@ CALL sq_hard_assert(
   'json schema validation report'
 );
 
+-- ULTRA WAVE 5: optimizer-steering syntax that only exists between FROM and ON,
+-- ROLLUP with GROUPING(), LATERAL derived tables, a multi-valued JSON index
+-- driving MEMBER OF, the 8.0.19 row-alias upsert, CTE-driven UPDATE/DELETE,
+-- locking reads with an explicit OF list, and routine attribute stacking.
+
+-- W5-A: join and index steering. STRAIGHT_JOIN appears twice with two different
+-- grammars in one statement (SELECT modifier and join operator), the index hints
+-- carry FOR JOIN / FOR ORDER BY scopes, and NATURAL LEFT JOIN plus JOIN ...
+-- USING keep their join columns unqualifiable.
+CREATE TABLE sq_hard_w5_hint (
+  hint_id INT NOT NULL,
+  node_id INT NOT NULL,
+  bucket  VARCHAR(16) NOT NULL,
+  weight  DECIMAL(10,2) NOT NULL,
+  PRIMARY KEY (hint_id),
+  KEY ix_sq_hard_w5_hint_node (node_id),
+  KEY ix_sq_hard_w5_hint_bucket (bucket, weight)
+) ENGINE = InnoDB;
+
+INSERT INTO sq_hard_w5_hint VALUES
+  (1, 1, 'alpha', 10.50), (2, 1, 'beta', 20.25),
+  (3, 2, 'alpha', 5.00),  (4, 2, 'gamma', 7.75);
+
+SELECT STRAIGHT_JOIN SQL_SMALL_RESULT SQL_BUFFER_RESULT
+       h.node_id                AS node_id,
+       COUNT(*)                 AS pair_rows,
+       ROUND(SUM(h.weight), 2)  AS weight_sum
+FROM sq_hard_w5_hint AS h USE INDEX FOR JOIN (ix_sq_hard_w5_hint_node)
+     STRAIGHT_JOIN metric AS m FORCE INDEX (PRIMARY)
+       ON m.node_id = h.node_id
+GROUP BY h.node_id
+ORDER BY h.node_id;
+
+SELECT node_id, ROUND(SUM(weight), 2) AS natural_weight
+FROM sq_hard_w5_hint
+NATURAL LEFT JOIN (SELECT node_id, MAX(metric_value) AS peak
+                   FROM metric
+                   GROUP BY node_id) AS pk
+GROUP BY node_id
+ORDER BY node_id;
+
+SELECT node_id, COUNT(*) AS using_rows
+FROM metric
+JOIN sq_hard_w5_hint USING (node_id)
+GROUP BY node_id
+ORDER BY node_id;
+
+-- W5-B: quantified subqueries, a row-constructor IN list, WITH ROLLUP with a
+-- GROUPING() super-aggregate marker, and an ORDER BY that mixes FIELD() with an
+-- explicit COLLATE over the rollup result.
+SELECT bucket,
+       GROUPING(bucket)      AS is_total,
+       ROUND(SUM(weight), 2) AS bucket_total
+FROM sq_hard_w5_hint AS h IGNORE INDEX FOR ORDER BY (ix_sq_hard_w5_hint_bucket)
+WHERE weight >= ANY (SELECT weight FROM sq_hard_w5_hint WHERE node_id = 2)
+  AND (node_id, bucket) IN ((1, 'alpha'), (1, 'beta'), (2, 'gamma'))
+  AND weight <> ALL (SELECT 999)
+  AND EXISTS (SELECT 1 FROM metric AS m WHERE m.node_id = h.node_id)
+GROUP BY bucket WITH ROLLUP
+HAVING bucket_total > 0
+ORDER BY is_total,
+         FIELD(bucket, 'gamma', 'beta', 'alpha'),
+         bucket COLLATE utf8mb4_bin;
+
+-- W5-C: LATERAL derived tables. The first correlates a per-node top row, the
+-- second is joined ON TRUE so the correlation is the only thing linking it.
+SELECT n.node_id,
+       peak.top_value,
+       spread.value_spread
+FROM (SELECT DISTINCT node_id FROM metric) AS n
+JOIN LATERAL (SELECT x.metric_value AS top_value
+              FROM metric AS x
+              WHERE x.node_id = n.node_id
+              ORDER BY x.metric_value DESC, x.metric_id
+              LIMIT 1) AS peak ON TRUE
+LEFT JOIN LATERAL (SELECT MAX(y.metric_value) - MIN(y.metric_value) AS value_spread
+                   FROM metric AS y
+                   WHERE y.node_id = n.node_id) AS spread ON TRUE
+ORDER BY n.node_id;
+
+-- W5-D: a multi-valued index over a JSON array, the three predicates that can
+-- use it, and the 8.0.19 row-alias upsert whose alias shadows nothing.
+CREATE TABLE sq_hard_w5_doc (
+  doc_id INT NOT NULL,
+  doc    JSON NOT NULL,
+  PRIMARY KEY (doc_id),
+  KEY mv_sq_hard_w5_tags ((CAST(doc->'$.tags' AS UNSIGNED ARRAY)))
+) ENGINE = InnoDB;
+
+INSERT INTO sq_hard_w5_doc VALUES
+  (1, JSON_OBJECT('tags', JSON_ARRAY(1, 2, 3), 'name', 'alpha')),
+  (2, JSON_OBJECT('tags', JSON_ARRAY(3, 4, 5), 'name', 'beta'));
+
+SELECT d.doc_id
+FROM sq_hard_w5_doc AS d
+WHERE 3 MEMBER OF (d.doc->'$.tags')
+ORDER BY d.doc_id;
+
+SELECT d.doc_id
+FROM sq_hard_w5_doc AS d
+WHERE JSON_OVERLAPS(d.doc->'$.tags', CAST('[5,9]' AS JSON))
+ORDER BY d.doc_id;
+
+SELECT d.doc_id
+FROM sq_hard_w5_doc AS d
+WHERE JSON_CONTAINS(d.doc->'$.tags', CAST('[1,2]' AS JSON))
+ORDER BY d.doc_id;
+
+INSERT INTO sq_hard_w5_doc (doc_id, doc)
+VALUES (1, JSON_OBJECT('tags', JSON_ARRAY(7), 'name', 'upserted')) AS incoming
+ON DUPLICATE KEY UPDATE
+  doc = JSON_SET(sq_hard_w5_doc.doc, '$.name', incoming.doc->>'$.name');
+
+SELECT d.doc_id, d.doc->>'$.name' AS doc_name
+FROM sq_hard_w5_doc AS d
+ORDER BY d.doc_id;
+
+-- W5-E: common table expressions feeding a multi-table UPDATE and a DELETE.
+-- The CTE name is only visible to the statement it is attached to.
+WITH renamed AS (
+  SELECT doc_id FROM sq_hard_w5_doc WHERE doc_id = 2
+)
+UPDATE sq_hard_w5_doc
+JOIN renamed ON renamed.doc_id = sq_hard_w5_doc.doc_id
+SET sq_hard_w5_doc.doc = JSON_SET(sq_hard_w5_doc.doc, '$.name', 'cte-renamed');
+
+WITH doomed AS (
+  SELECT hint_id FROM sq_hard_w5_hint WHERE bucket = 'gamma'
+)
+DELETE h FROM sq_hard_w5_hint AS h
+JOIN doomed ON doomed.hint_id = h.hint_id;
+
+INSERT INTO sq_hard_w5_hint VALUES (4, 2, 'gamma', 7.75);
+
+-- W5-F: locking reads that name their tables. OF narrows the lock to one table
+-- of the join, and the two wait modifiers spell out opposite policies.
+START TRANSACTION;
+
+SELECT h.hint_id
+FROM sq_hard_w5_hint AS h
+WHERE h.node_id = 1
+ORDER BY h.hint_id
+FOR UPDATE OF h SKIP LOCKED;
+
+SELECT h.hint_id
+FROM sq_hard_w5_hint AS h
+JOIN metric AS m ON m.node_id = h.node_id
+WHERE h.node_id = 2
+ORDER BY h.hint_id
+FOR SHARE OF h NOWAIT;
+
+COMMIT;
+
+-- W5-G: a MEMORY temporary table, a multi-target SELECT ... INTO, a table value
+-- constructor with an explicit column alias list, and two charset conversion
+-- spellings that both name a character set.
+CREATE TEMPORARY TABLE sq_hard_w5_tmp (
+  tmp_id   INT NOT NULL,
+  tmp_note VARCHAR(20) NOT NULL,
+  PRIMARY KEY (tmp_id)
+) ENGINE = Memory;
+
+INSERT INTO sq_hard_w5_tmp
+SELECT hint_id, CONCAT('tmp-', bucket) FROM sq_hard_w5_hint;
+
+SELECT COUNT(*), MAX(tmp_id)
+INTO @sq_hard_w5_tmp_rows, @sq_hard_w5_tmp_max
+FROM sq_hard_w5_tmp;
+
+SELECT v.row_key, v.row_label
+FROM (VALUES ROW(1, 'first'), ROW(2, 'second')) AS v (row_key, row_label)
+ORDER BY v.row_key;
+
+SELECT CONVERT('hostile' USING utf8mb4)                    AS converted,
+       CAST('hostile' AS CHAR CHARACTER SET utf8mb4)       AS cast_charset,
+       CHARSET(CONVERT('hostile' USING latin1))            AS converted_charset;
+
+-- W5-H: routine attribute stacking plus IN / INOUT / OUT parameter modes; the
+-- COMMENT payload carries delimiter bait that must stay inside the literal.
+DELIMITER //
+CREATE FUNCTION sq_hard_w5_triple(p_value INT)
+  RETURNS INT
+  DETERMINISTIC
+  CONTAINS SQL
+  SQL SECURITY INVOKER
+  COMMENT 'wave5 // $$ ; attribute stack'
+BEGIN
+  RETURN p_value * 3;
+END//
+
+CREATE PROCEDURE sq_hard_w5_accumulate(IN    p_seed  INT,
+                                       INOUT p_acc   INT,
+                                       OUT   p_label VARCHAR(32))
+  MODIFIES SQL DATA
+  SQL SECURITY DEFINER
+  COMMENT 'wave5 out params'
+BEGIN
+  SET p_acc = p_acc + sq_hard_w5_triple(p_seed);
+  INSERT INTO sq_hard_w5_tmp (tmp_id, tmp_note)
+  VALUES (100 + p_seed, CONCAT('acc-', p_acc)) AS incoming
+  ON DUPLICATE KEY UPDATE tmp_note = incoming.tmp_note;
+  SET p_label = CONCAT('acc=', p_acc);
+END//
+DELIMITER ;
+
+SET @sq_hard_w5_acc = 1;
+CALL sq_hard_w5_accumulate(4, @sq_hard_w5_acc, @sq_hard_w5_label);
+
+SELECT @sq_hard_w5_acc AS accumulated, @sq_hard_w5_label AS accumulated_label;
+
+-- W5-I: wave-5 self-verification.
+CALL sq_hard_assert(
+  (SELECT COUNT(*)
+   FROM sq_hard_w5_hint AS h
+        STRAIGHT_JOIN metric AS m ON m.node_id = h.node_id) = 8
+  AND (SELECT COUNT(*) FROM metric JOIN sq_hard_w5_hint USING (node_id)) = 8,
+  'join steering + using join'
+);
+CALL sq_hard_assert(
+  (SELECT COUNT(*)
+   FROM (SELECT bucket, GROUPING(bucket) AS is_total, SUM(weight) AS bucket_total
+         FROM sq_hard_w5_hint
+         WHERE (node_id, bucket) IN ((1, 'alpha'), (1, 'beta'), (2, 'gamma'))
+         GROUP BY bucket WITH ROLLUP) AS r
+   WHERE r.is_total = 1 AND r.bucket_total = 38.50) = 1,
+  'rollup grouping super-aggregate'
+);
+CALL sq_hard_assert(
+  (SELECT MAX(peak.top_value)
+   FROM (SELECT DISTINCT node_id FROM metric) AS n
+   JOIN LATERAL (SELECT x.metric_value AS top_value
+                 FROM metric AS x
+                 WHERE x.node_id = n.node_id
+                 ORDER BY x.metric_value DESC, x.metric_id
+                 LIMIT 1) AS peak ON TRUE) = 24.00,
+  'lateral derived table'
+);
+CALL sq_hard_assert(
+  (SELECT COUNT(*) FROM sq_hard_w5_doc WHERE 3 MEMBER OF (doc->'$.tags')) = 2
+  AND (SELECT doc->>'$.name' FROM sq_hard_w5_doc WHERE doc_id = 1) = 'upserted'
+  AND (SELECT doc->>'$.name' FROM sq_hard_w5_doc WHERE doc_id = 2) = 'cte-renamed',
+  'multi-valued index + row alias + cte update'
+);
+CALL sq_hard_assert(
+  (SELECT COUNT(*) FROM sq_hard_w5_hint) = 4
+  AND (SELECT bucket FROM sq_hard_w5_hint WHERE hint_id = 4) = 'gamma',
+  'cte-fed delete then restore'
+);
+CALL sq_hard_assert(
+  @sq_hard_w5_tmp_rows = 4
+  AND @sq_hard_w5_tmp_max = 4
+  AND @sq_hard_w5_acc = 13
+  AND @sq_hard_w5_label = 'acc=13'
+  AND (SELECT tmp_note FROM sq_hard_w5_tmp WHERE tmp_id = 104) = 'acc-13',
+  'temporary table + out params'
+);
+CALL sq_hard_assert(
+  (SELECT COUNT(*)
+   FROM (VALUES ROW(1, 'first'), ROW(2, 'second')) AS v (row_key, row_label)) = 2
+  AND CHARSET(CONVERT('hostile' USING latin1)) = 'latin1',
+  'table value constructor + charset conversion'
+);
+
 SELECT 'PASS' AS final_status,
        VERSION() AS server_version,
        (SELECT COUNT(*) FROM metric) AS metric_rows,
        @walk_total AS walk_total,
        (SELECT COUNT(*) FROM sq_hard_w4_place) AS spatial_rows,
-       @sq_hard_w4_walk_total AS wave4_total;
+       @sq_hard_w4_walk_total AS wave4_total,
+       (SELECT COUNT(*) FROM sq_hard_w5_hint) AS wave5_rows,
+       @sq_hard_w5_label AS wave5_label;

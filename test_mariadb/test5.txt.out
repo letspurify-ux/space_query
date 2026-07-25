@@ -1260,7 +1260,7 @@ ORDER BY m.ym,
 -- db: MariaDB
 -- metadata: test_mariadb/test5.txt inferred catalog
 -- checked: 2180
--- suggestions checked: 12786
+-- suggestions checked: 12979
 -- missing: 0
 -- suggestions without type labels: 0
 -- marker: [[word]] means not suggested for the tested prefix

@@ -654,7 +654,7 @@ ORDER BY mr.ym,
 -- db: MariaDB
 -- metadata: test_mariadb/test4.txt inferred catalog
 -- checked: 1174
--- suggestions checked: 6751
+-- suggestions checked: 6832
 -- missing: 0
 -- suggestions without type labels: 0
 -- marker: [[word]] means not suggested for the tested prefix

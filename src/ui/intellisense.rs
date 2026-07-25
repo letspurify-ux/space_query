@@ -32,6 +32,7 @@ pub static MARIADB_FUNCTIONS_SET: once_cell::sync::Lazy<std::collections::HashSe
 const FUNCTION_SUFFIX: &str = "()";
 const ORACLE_BUILTIN_PACKAGES: &[&str] = &[
     "DBMS_DB_VERSION",
+    "DBMS_ERRLOG",
     "DBMS_OUTPUT",
     "DBMS_LOB",
     "DBMS_SQL",
@@ -57,7 +58,11 @@ const ORACLE_BUILTIN_PACKAGES: &[&str] = &[
     "UTL_INADDR",
 ];
 
-pub(crate) const MAX_SUGGESTIONS: usize = 80;
+/// Per-source suggestion budget. Kept equal to the merge cap
+/// (`MAX_MERGED_SUGGESTIONS`) so a single large family — the ~90 `ST_*` spatial
+/// builtins matched by a `ST_` prefix — is never truncated alphabetically while
+/// the merged popup still has room for it.
+pub(crate) const MAX_SUGGESTIONS: usize = 100;
 type LanguageCatalog = (
     &'static [&'static str],
     &'static [&'static str],
@@ -6012,7 +6017,9 @@ mod intellisense_tests {
     #[test]
     fn get_suggestions_prefers_relations_in_table_context_with_empty_prefix() {
         let mut data = IntellisenseData::new();
-        data.tables = (0..80).map(|i| format!("TBL_{:02}", i)).collect();
+        data.tables = (0..MAX_SUGGESTIONS + 20)
+            .map(|i| format!("TBL_{i:03}"))
+            .collect();
         data.rebuild_indices();
 
         let suggestions = data.get_suggestions("", false, None, true, false);

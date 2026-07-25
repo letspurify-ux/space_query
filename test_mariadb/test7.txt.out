@@ -1021,7 +1021,7 @@ SELECT
 -- db: MariaDB
 -- metadata: test_mariadb/test7.txt inferred catalog
 -- checked: 1423
--- suggestions checked: 6777
+-- suggestions checked: 6800
 -- missing: 0
 -- suggestions without type labels: 0
 -- marker: [[word]] means not suggested for the tested prefix
