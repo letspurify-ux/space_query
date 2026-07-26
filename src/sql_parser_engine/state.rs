@@ -800,9 +800,18 @@ impl SplitState {
         }
 
         // Plain END – CASE expression or PL/SQL block
+        let closed_case_expression = self.top_is_case();
         self.resolve_plain_end(token_upper);
         self.pending_end = PendingEnd::None;
         self.pending_end_label_segments.clear();
+        if closed_case_expression {
+            // A CASE expression's END never carries a label, and live tokens follow
+            // it directly: `CASE WHEN c THEN CASE ... END ELSE x END` closes the
+            // inner CASE and must still see the outer `ELSE`/`END`. Arming the
+            // END-label skip here swallowed the rest of the line instead.
+            self.skip_next_end_label_token = false;
+            return false;
+        }
         self.skip_next_end_label_token = true;
         true
     }
@@ -853,6 +862,27 @@ impl SplitState {
         // already started and the parser is only nested under CASE-expression
         // depth, that token must remain an identifier alias instead of arming
         // the PL/SQL IF...THEN state machine.
+        self.has_non_case_block_context()
+    }
+
+    fn should_arm_loop_block(&self, end_token_role: EndTokenRole) -> bool {
+        if end_token_role.is_suffix(PendingEndSuffix::Loop) {
+            return false;
+        }
+
+        if self.top_level_token_state == TopLevelTokenState::NoneSeen {
+            return true;
+        }
+
+        // A `FOR ... LOOP` / `WHILE ... LOOP` header arms the loop even at the
+        // top level of a bare snippet.
+        if self.pending_do != PendingDo::None {
+            return true;
+        }
+
+        // `SELECT CASE WHEN c THEN 'a' END loop FROM t` uses LOOP as a column
+        // alias. Outside a loop header, a real loop body only opens inside a
+        // procedural block, so CASE-expression nesting alone must not arm one.
         self.has_non_case_block_context()
     }
 
@@ -913,7 +943,7 @@ impl SplitState {
         }
 
         // LOOP (opening, not END LOOP)
-        if upper == "LOOP" && !end_token_role.is_suffix(PendingEndSuffix::Loop) {
+        if upper == "LOOP" && self.should_arm_loop_block(end_token_role) {
             self.block_stack.push(BlockKind::Loop);
             self.pending_do = PendingDo::None;
         }

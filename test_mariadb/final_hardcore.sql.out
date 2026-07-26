@@ -1389,6 +1389,260 @@ CALL sq_hard_assert(
   'temporary table + out params'
 );
 
+--------------------------------------------------------------------------------
+-- ULTRA WAVE 6: named WINDOW definitions reused and extended by frame clauses,
+-- a recursive CTE closed by MariaDB's CYCLE clause, partition maintenance DDL,
+-- roles, the DML modifier zoo, a condition/handler/RESIGNAL chain, CTAS with
+-- table rewrites, and a pure lexer round where a comment sits between nearly
+-- every token.
+--------------------------------------------------------------------------------
+
+-- W6-A: one WINDOW clause defines two named windows; the frame-extended forms
+-- `(w RANGE ...)` and `(w ROWS ...)` inherit the partition and ordering.
+CREATE TABLE sq_hard_w6_series (
+  series_id INT           NOT NULL,
+  bucket    VARCHAR(8)    NOT NULL,
+  taken_on  DATE          NOT NULL,
+  amount    DECIMAL(10,2) NOT NULL,
+  PRIMARY KEY (series_id)
+) ENGINE = InnoDB;
+
+INSERT INTO sq_hard_w6_series (series_id, bucket, taken_on, amount)
+VALUES (1, 'alpha', DATE '2026-01-01', 10.00),
+       (2, 'alpha', DATE '2026-01-03', 20.00),
+       (3, 'alpha', DATE '2026-01-08', 30.00),
+       (4, 'beta',  DATE '2026-01-02', 40.00);
+
+SELECT s.series_id,
+       SUM(s.amount)        OVER w_bucket  AS bucket_total,
+       ROW_NUMBER()         OVER w_ordered AS ordered_no,
+       SUM(s.amount)        OVER (w_ordered RANGE BETWEEN 4 PRECEDING
+                                                      AND CURRENT ROW) AS window_4d,
+       LAST_VALUE(s.amount) OVER (w_ordered ROWS BETWEEN UNBOUNDED PRECEDING
+                                                     AND UNBOUNDED FOLLOWING) AS last_amount
+FROM sq_hard_w6_series AS s
+WINDOW w_bucket  AS (PARTITION BY s.bucket),
+       w_ordered AS (PARTITION BY s.bucket ORDER BY TO_DAYS(s.taken_on))
+ORDER BY s.series_id;
+
+-- W6-B: a cyclic edge set walked by a recursive CTE that would never terminate
+-- without MariaDB's CYCLE ... RESTRICT clause between the CTE and the query.
+CREATE TABLE sq_hard_w6_edge (
+  src INT NOT NULL,
+  dst INT NOT NULL,
+  PRIMARY KEY (src, dst)
+) ENGINE = InnoDB;
+
+INSERT INTO sq_hard_w6_edge (src, dst) VALUES (1, 2), (2, 3), (3, 1), (3, 4);
+
+WITH RECURSIVE walk (node, depth, path) AS (
+  SELECT 1, 0, CAST('1' AS CHAR(64))
+  UNION ALL
+  SELECT e.dst, w.depth + 1, CONCAT(w.path, '>', e.dst)
+  FROM walk AS w
+       JOIN sq_hard_w6_edge AS e ON e.src = w.node
+)
+CYCLE node RESTRICT
+SELECT COUNT(*) AS walk_rows, MAX(depth) AS max_depth INTO @sq_hard_w6_walk_rows,
+       @sq_hard_w6_walk_depth
+FROM walk;
+
+SELECT @sq_hard_w6_walk_rows AS walk_rows, @sq_hard_w6_walk_depth AS max_depth;
+
+-- W6-C: RANGE-partitioned table reshaped in place - REORGANIZE splits a range,
+-- TRUNCATE PARTITION empties one, and ANALYZE PARTITION returns a result set.
+CREATE TABLE sq_hard_w6_part (
+  part_id INT        NOT NULL,
+  region  VARCHAR(8) NOT NULL,
+  PRIMARY KEY (part_id)
+) ENGINE = InnoDB
+PARTITION BY RANGE (part_id) (
+  PARTITION p0   VALUES LESS THAN (10),
+  PARTITION p1   VALUES LESS THAN (20),
+  PARTITION pmax VALUES LESS THAN MAXVALUE
+);
+
+INSERT INTO sq_hard_w6_part (part_id, region)
+VALUES (1, 'a'), (11, 'b'), (21, 'c');
+
+ALTER TABLE sq_hard_w6_part
+  REORGANIZE PARTITION p0, p1 INTO (
+    PARTITION p0 VALUES LESS THAN (5),
+    PARTITION p1 VALUES LESS THAN (20)
+  );
+
+ALTER TABLE sq_hard_w6_part TRUNCATE PARTITION p1;
+
+ALTER TABLE sq_hard_w6_part ANALYZE PARTITION p0;
+
+SELECT COUNT(*) AS partition_rows
+FROM sq_hard_w6_part PARTITION (p0, pmax);
+
+-- W6-D: role grammar. The role is a global object, so it is dropped defensively
+-- before it is created and again once the grants have been exercised.
+DROP ROLE IF EXISTS sq_hard_w6_role;
+
+CREATE ROLE sq_hard_w6_role;
+
+GRANT SELECT ON sq_hard_mariadb.sq_hard_w6_series TO sq_hard_w6_role;
+
+GRANT sq_hard_w6_role TO CURRENT_USER;
+
+SET ROLE sq_hard_w6_role;
+
+SELECT CURRENT_ROLE() AS active_role;
+
+SET ROLE NONE;
+
+REVOKE SELECT ON sq_hard_mariadb.sq_hard_w6_series FROM sq_hard_w6_role;
+
+DROP ROLE sq_hard_w6_role;
+
+-- W6-E: the DML modifier zoo. Every statement keyword here can also appear as
+-- an ordinary identifier, so the modifiers must be read positionally.
+CREATE TABLE sq_hard_w6_dml (
+  dml_id INT         NOT NULL,
+  tag    VARCHAR(20) NOT NULL,
+  PRIMARY KEY (dml_id),
+  UNIQUE KEY sq_hard_w6_dml_uq (tag)
+) ENGINE = InnoDB;
+
+INSERT IGNORE INTO sq_hard_w6_dml (dml_id, tag)
+VALUES (1, 'one'), (1, 'duplicate-key'), (2, 'two');
+
+REPLACE INTO sq_hard_w6_dml (dml_id, tag) VALUES (2, 'two-replaced');
+
+INSERT INTO sq_hard_w6_dml (dml_id, tag)
+VALUES (1, 'three')
+ON DUPLICATE KEY UPDATE tag = CONCAT(VALUES(tag), '-merged');
+
+UPDATE IGNORE sq_hard_w6_dml SET tag = 'two-replaced' WHERE dml_id = 1;
+
+DELETE LOW_PRIORITY QUICK IGNORE FROM sq_hard_w6_dml WHERE dml_id = 99;
+
+SELECT dml_id, tag FROM sq_hard_w6_dml ORDER BY dml_id;
+
+-- W6-F: named condition, a CONTINUE handler for it, a nested block whose EXIT
+-- handler re-raises through RESIGNAL, and diagnostics read back out.
+DELIMITER //
+CREATE OR REPLACE PROCEDURE sq_hard_w6_guard(IN  p_value INT,
+                                             OUT p_state VARCHAR(40))
+  MODIFIES SQL DATA
+BEGIN
+  DECLARE sq_hard_w6_negative CONDITION FOR SQLSTATE '45001';
+  DECLARE handled_errno INT DEFAULT 0;
+  DECLARE CONTINUE HANDLER FOR sq_hard_w6_negative
+  BEGIN
+    GET DIAGNOSTICS CONDITION 1 handled_errno = MYSQL_ERRNO;
+    SET p_state = CONCAT('handled-', handled_errno);
+  END;
+
+  SET p_state = 'clean';
+
+  IF p_value < 0 THEN
+    SIGNAL sq_hard_w6_negative SET MESSAGE_TEXT = 'negative input',
+                                   MYSQL_ERRNO = 1451;
+  END IF;
+
+  BEGIN
+    DECLARE CONTINUE HANDLER FOR SQLEXCEPTION
+    BEGIN
+      SET p_state = CONCAT(p_state, '/inner');
+    END;
+
+    IF p_value = 0 THEN
+      SIGNAL SQLSTATE '45002' SET MESSAGE_TEXT = 'zero input';
+    END IF;
+  END;
+END//
+DELIMITER ;
+
+CALL sq_hard_w6_guard(-1, @sq_hard_w6_state_neg);
+CALL sq_hard_w6_guard(0, @sq_hard_w6_state_zero);
+CALL sq_hard_w6_guard(1, @sq_hard_w6_state_ok);
+
+SELECT @sq_hard_w6_state_neg  AS state_negative,
+       @sq_hard_w6_state_zero AS state_zero,
+       @sq_hard_w6_state_ok   AS state_ok;
+
+-- W6-G: CREATE TABLE ... AS SELECT, then three ALTER spellings that rewrite the
+-- whole table: charset conversion, an index with an explicit algorithm, and a
+-- physical ORDER BY.
+CREATE TABLE sq_hard_w6_ctas
+  ENGINE = InnoDB
+  AS
+SELECT s.bucket, SUM(s.amount) AS bucket_total, COUNT(*) AS bucket_rows
+FROM sq_hard_w6_series AS s
+GROUP BY s.bucket;
+
+ALTER TABLE sq_hard_w6_ctas CONVERT TO CHARACTER SET utf8mb4 COLLATE utf8mb4_bin;
+
+ALTER TABLE sq_hard_w6_ctas ADD INDEX sq_hard_w6_ctas_ix (bucket) USING BTREE;
+
+ALTER TABLE sq_hard_w6_ctas ORDER BY bucket;
+
+SELECT bucket, bucket_total, bucket_rows FROM sq_hard_w6_ctas ORDER BY bucket;
+
+-- W6-H: pure lexer and layout torture. CASE nests five deep, a comment sits
+-- between nearly every token, one projection is a single unspaced line, and the
+-- keywords arrive in alternating case.
+SELECT /*a*/ s.series_id /*b*/ AS /*c*/ id_out /*d*/,
+       /*e*/ COALESCE(
+         CASE WHEN s.amount > 25 THEN
+           CASE WHEN s.bucket = 'alpha' THEN
+             CASE WHEN s.series_id > 2 THEN
+               CASE WHEN DAYOFMONTH(s.taken_on) = 8 THEN
+                 CASE WHEN s.amount = 30 THEN 'deep-hit' ELSE 'deep-miss' END
+               ELSE 'day-miss' END
+             ELSE 'id-miss' END
+           ELSE 'bucket-miss' END
+         ELSE NULL END,
+         'fallback') AS nested_case,
+       'a `b` /* still literal */ -- still literal' AS quoted_payload
+FROM /*f*/ sq_hard_w6_series /*g*/ s /*h*/
+WHERE /*i*/ s.series_id /*j*/ IN /*k*/ (1, 2, 3, 4)
+ORDER BY /*l*/ s.series_id /*m*/ DESC /*n*/, s.bucket /*o*/ ASC;
+
+SELECT s.series_id||'' AS packed_id,CONCAT(s.bucket,'-',CAST(s.amount AS CHAR))AS packed_line,(s.amount*2)-(s.series_id*3)+MOD(s.series_id,2)AS packed_math FROM sq_hard_w6_series s WHERE s.series_id IN(1,2)AND s.amount BETWEEN 1 AND 999 ORDER BY s.series_id;
+
+sElEcT	CoUnT(*)	As	mixed_case_rows	FrOm	sq_hard_w6_series	WhErE	bucket	iS	NoT	nUlL;
+
+-- W6-I: wave-6 self-verification.
+CALL sq_hard_assert(
+  (SELECT SUM(window_4d)
+   FROM (SELECT SUM(s.amount) OVER (PARTITION BY s.bucket
+                                    ORDER BY TO_DAYS(s.taken_on)
+                                    RANGE BETWEEN 4 PRECEDING
+                                              AND CURRENT ROW) AS window_4d
+         FROM sq_hard_w6_series AS s) AS framed) = 110.00,
+  'named window frames'
+);
+CALL sq_hard_assert(
+  @sq_hard_w6_walk_rows = 4 AND @sq_hard_w6_walk_depth = 3,
+  'recursive cycle walk'
+);
+CALL sq_hard_assert(
+  (SELECT COUNT(*) FROM sq_hard_w6_part PARTITION (p0, pmax)) = 2
+  AND (SELECT COUNT(*) FROM sq_hard_w6_part) = 2,
+  'partition maintenance'
+);
+CALL sq_hard_assert(
+  (SELECT COUNT(*) FROM sq_hard_w6_dml) = 2
+  AND (SELECT tag FROM sq_hard_w6_dml WHERE dml_id = 1) = 'three-merged',
+  'dml modifier zoo'
+);
+CALL sq_hard_assert(
+  @sq_hard_w6_state_neg = 'handled-1451'
+  AND @sq_hard_w6_state_zero = 'clean/inner'
+  AND @sq_hard_w6_state_ok = 'clean',
+  'condition handler chain'
+);
+CALL sq_hard_assert(
+  (SELECT ROUND(SUM(bucket_total), 2) FROM sq_hard_w6_ctas) = 100.00
+  AND (SELECT COUNT(*) FROM sq_hard_w6_ctas) = 2,
+  'ctas + table rewrites'
+);
+
 SELECT 'PASS' AS final_status,
        VERSION() AS server_version,
        (SELECT COUNT(*) FROM metric) AS metric_rows,
@@ -1396,7 +1650,9 @@ SELECT 'PASS' AS final_status,
        (SELECT COUNT(*) FROM sq_hard_w4_vector_asset) AS vector_rows,
        @sq_hard_w4_walk_total AS wave4_total,
        (SELECT COUNT(*) FROM sq_hard_w5_hint) AS wave5_rows,
-       @sq_hard_w5_label AS wave5_label;
+       @sq_hard_w5_label AS wave5_label,
+       (SELECT COUNT(*) FROM sq_hard_w6_series) AS wave6_rows,
+       @sq_hard_w6_walk_rows AS wave6_walk_rows;
 
 
 -- =========================================================
@@ -1404,8 +1660,8 @@ SELECT 'PASS' AS final_status,
 -- source: test_mariadb/final_hardcore.sql
 -- db: MariaDB
 -- metadata: test_mariadb/final_hardcore.sql inferred catalog
--- checked: 2725
--- suggestions checked: 14559
+-- checked: 3275
+-- suggestions checked: 19805
 -- missing: 0
 -- suggestions without type labels: 0
 -- marker: [[word]] means not suggested for the tested prefix

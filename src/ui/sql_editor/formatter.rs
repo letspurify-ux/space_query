@@ -7444,6 +7444,34 @@ impl SqlEditorWidget {
         false
     }
 
+    /// Words that look like query-clause starters but are DDL option phrases:
+    /// `ALTER TABLE t SET UNUSED COLUMN c`, `ALTER TABLE t ORDER BY c`,
+    /// `ALTER TABLE t ALTER COLUMN c SET DEFAULT 1` and the index-type tail of
+    /// `… ADD INDEX ix (c) USING BTREE` / `CREATE INDEX ix ON t (c) USING BTREE`.
+    /// None of these owns a clause, so none may open a format frame.
+    fn is_ddl_option_phrase_word(tokens: &[SqlToken], idx: usize, keyword: &str) -> bool {
+        if !matches!(keyword, "SET" | "ORDER" | "BY" | "USING") {
+            return false;
+        }
+
+        let mut leading = tokens.iter().take(idx).filter_map(|token| match token {
+            SqlToken::Word(word) => Some(word.to_ascii_uppercase()),
+            _ => None,
+        });
+        let Some(first) = leading.next() else {
+            return false;
+        };
+
+        match first.as_str() {
+            // ALTER TABLE has no query clauses at the top level at all.
+            "ALTER" => leading.next().as_deref() == Some("TABLE"),
+            // `USING <index_type>` is the only one of these that can follow a
+            // CREATE INDEX column list.
+            "CREATE" if keyword == "USING" => leading.any(|word| word == "INDEX"),
+            _ => false,
+        }
+    }
+
     fn is_multiset_set_operator_from_indices(
         tokens: &[SqlToken],
         prev_word_upper: Option<&str>,
@@ -8543,6 +8571,10 @@ impl SqlEditorWidget {
         let mut insert_at = trim_len;
         let mut has_trailing_comment = false;
 
+        // Only block comments can be detached from the code; a REM/line comment
+        // has to keep the terminator in front of it on the same line.
+        let mut trailing_comments_are_all_blocks = true;
+
         let mut trailing_comment_start = trim_len;
         loop {
             let prefix = &trimmed[..trailing_comment_start];
@@ -8551,6 +8583,7 @@ impl SqlEditorWidget {
             let line_trimmed = line.trim_start();
             if Self::is_sqlplus_remark_comment_statement(line_trimmed) {
                 has_trailing_comment = true;
+                trailing_comments_are_all_blocks = false;
                 insert_at = line_start;
                 trailing_comment_start = prefix[..line_start].trim_end().len();
                 if trailing_comment_start == 0 {
@@ -8571,8 +8604,11 @@ impl SqlEditorWidget {
                 SqlToken::Comment(comment) if Self::is_mysql_executable_comment_token(comment) => {
                     break;
                 }
-                SqlToken::Comment(_) => {
+                SqlToken::Comment(comment) => {
                     has_trailing_comment = true;
+                    if !comment.trim_start().starts_with("/*") {
+                        trailing_comments_are_all_blocks = false;
+                    }
                     insert_at = insert_at.min(span.start);
                 }
                 SqlToken::Symbol(sym) if sym == "/" => continue,
@@ -8581,11 +8617,22 @@ impl SqlEditorWidget {
         }
 
         if has_trailing_comment {
+            let comment_start = insert_at;
             while insert_at > 0 {
                 match trimmed.as_bytes().get(insert_at - 1) {
                     Some(b' ' | b'\t' | b'\n' | b'\r') => insert_at -= 1,
                     _ => break,
                 }
+            }
+            let gap = &formatted_statement[insert_at..comment_start];
+            if trailing_comments_are_all_blocks && !gap.is_empty() && !gap.contains('\n') {
+                // `SELECT 1 FROM t /*note*/` would render as `... FROM t; /*note*/`,
+                // which the next parse reads as a standalone comment and moves onto
+                // its own line. Emit that shape straight away so formatting settles
+                // in a single pass.
+                formatted_statement
+                    .replace_range(insert_at..comment_start, &format!("{terminator}\n\n"));
+                return;
             }
             let suffix = &formatted_statement[insert_at..trim_len];
             let separator = match suffix.as_bytes().first() {
@@ -11921,6 +11968,10 @@ impl SqlEditorWidget {
         // MySQL ON DUPLICATE KEY UPDATE: tracks when VALUES() is a function, not a clause
         let mut on_duplicate_key_update_active = false;
         let mut inline_comment_continuation_state = InlineCommentContinuationState::None;
+        // Indent of the line the `CURSOR` keyword opened on. A parameter list that
+        // wraps moves `line_indent` deeper before `IS` arrives, and anchoring the
+        // cursor body on that continuation indent pushed the body one level too far.
+        let mut cursor_decl_owner_depth: Option<usize> = None;
         let is_package_body_statement = input.is_package_body_statement;
         let mut query_apply_context_tracker = LiveQueryApplyTracker::default();
         let mut statement_tail_state = FormatterTailState::new();
@@ -12903,6 +12954,8 @@ impl SqlEditorWidget {
                     // it looks like a clause starter but owns no clause.
                     let mysql_index_hint_phrase_word = mysql_compatible
                         && Self::is_mysql_index_hint_phrase_word(tokens, idx, upper);
+                    let ddl_option_phrase_word = current_scope.paren_depth == 0
+                        && Self::is_ddl_option_phrase_word(tokens, idx, upper);
                     let keyword_suppresses_structural_handling = keyword_preserves_original_case
                         || treat_control_keyword_as_identifier
                         || follows_alias_control_keyword
@@ -12910,7 +12963,8 @@ impl SqlEditorWidget {
                         || oracle_json_duality_capability_keyword
                         || oracle_iteration_collection_keyword
                         || oracle_type_method_order_modifier
-                        || mysql_index_hint_phrase_word;
+                        || mysql_index_hint_phrase_word
+                        || ddl_option_phrase_word;
                     let model_bracket_member = construct_flag_active!(ModelActive)
                         && delimiter_frame_state.innermost_is_bracket();
                     let on_duplicate_key_values_function =
@@ -15992,11 +16046,15 @@ impl SqlEditorWidget {
                         && format_stack.current_clause().is_none()
                     {
                         activate_construct_flag!(CursorDeclPending, current_scope);
+                        cursor_decl_owner_depth = Some(line_indent);
                     }
                     if matches!(upper, "IS" | "AS") && construct_flag_active!(CursorDeclPending) {
                         deactivate_construct_flag!(CursorDeclPending);
-                        let cursor_owner_depth =
-                            format_stack.statement_base_depth().max(line_indent);
+                        let declaration_indent =
+                            cursor_decl_owner_depth.take().unwrap_or(line_indent);
+                        let cursor_owner_depth = format_stack
+                            .statement_base_depth()
+                            .max(declaration_indent.min(line_indent));
                         format_stack.push_scoped_indent_for_render(
                             ScopedIndentKind::CursorSql,
                             current_scope,
@@ -17760,7 +17818,12 @@ impl SqlEditorWidget {
                                         base_indent!(format_stack.statement_base_depth()),
                                     )
                                 } else {
-                                    0
+                                    // Inside a clause body (`ORDER BY b DESC /*n*/` →
+                                    // `NULLS FIRST`) the break must stay one level in;
+                                    // dedenting to the statement base made the next
+                                    // formatting pass re-indent it, so the output was
+                                    // not idempotent.
+                                    usize::from(format_stack.current_clause().is_some())
                                 };
                                 newline_with(
                                     &mut out,
@@ -50314,6 +50377,97 @@ mod format_frame_stack_tests {
             .0,
             formatted,
             "Oracle wave4 formatting should be idempotent"
+        );
+    }
+}
+
+#[cfg(test)]
+mod ddl_option_phrase_tests {
+    use super::*;
+
+    fn format_once(sql: &str, db: crate::db::connection::DatabaseType) -> String {
+        let mut config = AppConfig::new();
+        config.sql_comma_list_layout = SqlCommaListLayout::Wrapped;
+        SqlEditorWidget::format_for_auto_formatting_with_config(sql, false, Some(db), &config)
+    }
+
+    fn assert_stable_single_line(sql: &str, db: crate::db::connection::DatabaseType) {
+        let once = format_once(sql, db);
+        let twice = format_once(&once, db);
+        assert_eq!(once, twice, "formatting must be idempotent for {sql:?}");
+        assert_eq!(
+            once.trim().lines().count(),
+            1,
+            "DDL option phrases must stay on one line, got:\n{once}"
+        );
+    }
+
+    #[test]
+    fn ddl_option_phrases_never_open_a_clause_frame() {
+        use crate::db::connection::DatabaseType;
+
+        assert_stable_single_line(
+            "ALTER TABLE t SET UNUSED COLUMN legacy_flag ONLINE;",
+            DatabaseType::Oracle,
+        );
+        assert_stable_single_line("ALTER TABLE t ORDER BY bucket;", DatabaseType::MySQL);
+        assert_stable_single_line(
+            "ALTER TABLE t ADD INDEX ix (bucket) USING BTREE;",
+            DatabaseType::MySQL,
+        );
+        assert_stable_single_line(
+            "ALTER TABLE t ALTER COLUMN c SET DEFAULT 1;",
+            DatabaseType::MySQL,
+        );
+        assert_stable_single_line("CREATE INDEX ix ON t (c) USING BTREE;", DatabaseType::MySQL);
+    }
+
+    #[test]
+    fn real_query_clauses_still_break_onto_their_own_line() {
+        let formatted = format_once(
+            "SELECT a FROM t ORDER BY a;",
+            crate::db::connection::DatabaseType::Oracle,
+        );
+        assert!(
+            formatted.contains("\nORDER BY a"),
+            "ORDER BY must still own a line: {formatted}"
+        );
+
+        let updated = format_once(
+            "UPDATE t SET a = 1 WHERE b = 2;",
+            crate::db::connection::DatabaseType::Oracle,
+        );
+        assert!(
+            updated.contains("\nSET a = 1"),
+            "the DML SET clause must still own a line: {updated}"
+        );
+    }
+
+    #[test]
+    fn trailing_block_comment_terminator_settles_in_one_pass() {
+        use crate::db::connection::DatabaseType;
+
+        for db in [DatabaseType::Oracle, DatabaseType::MySQL] {
+            let once = format_once("SELECT a FROM t /*note*/;", db);
+            let twice = format_once(&once, db);
+            assert_eq!(
+                once, twice,
+                "trailing block comment must settle in one pass: {once}"
+            );
+            assert!(
+                once.contains("/*note*/"),
+                "comment text must survive: {once}"
+            );
+        }
+
+        // A trailing line comment cannot be detached - the terminator stays before it.
+        let line_comment = format_once(
+            "SELECT a FROM t -- note\n;",
+            crate::db::connection::DatabaseType::Oracle,
+        );
+        assert!(
+            line_comment.contains("; -- note"),
+            "line comment must keep the terminator in front: {line_comment}"
         );
     }
 }

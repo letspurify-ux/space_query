@@ -282,6 +282,9 @@ pub struct IntellisenseData {
     pub triggers: Vec<String>,
     pub events: Vec<String>,
     pub indexes: Vec<String>,
+    /// Table partition names, addressable in partition maintenance and
+    /// `PARTITION (...)` selection clauses.
+    pub partitions: Vec<String>,
     pub procedures: Vec<String>,
     pub functions: Vec<String>,
     pub packages: Vec<String>,
@@ -313,6 +316,7 @@ pub struct IntellisenseData {
     trigger_entries: Vec<NameEntry>,
     event_entries: Vec<NameEntry>,
     index_entries: Vec<NameEntry>,
+    partition_entries: Vec<NameEntry>,
     procedure_entries: Vec<NameEntry>,
     function_entries: Vec<NameEntry>,
     package_entries: Vec<NameEntry>,
@@ -376,6 +380,7 @@ impl IntellisenseData {
             triggers: Vec::new(),
             events: Vec::new(),
             indexes: Vec::new(),
+            partitions: Vec::new(),
             procedures: Vec::new(),
             functions: Vec::new(),
             packages: Vec::new(),
@@ -405,6 +410,7 @@ impl IntellisenseData {
             trigger_entries: Vec::new(),
             event_entries: Vec::new(),
             index_entries: Vec::new(),
+            partition_entries: Vec::new(),
             procedure_entries: Vec::new(),
             function_entries: Vec::new(),
             package_entries: Vec::new(),
@@ -996,6 +1002,11 @@ impl IntellisenseData {
     pub fn get_index_object_suggestions(&mut self, prefix: &str) -> Vec<String> {
         self.ensure_base_indices();
         Self::suggestions_from_entry_groups(prefix, &[&self.index_entries])
+    }
+
+    pub fn get_partition_object_suggestions(&mut self, prefix: &str) -> Vec<String> {
+        self.ensure_base_indices();
+        Self::suggestions_from_entry_groups(prefix, &[&self.partition_entries])
     }
 
     pub fn get_procedure_object_suggestions(&mut self, prefix: &str) -> Vec<String> {
@@ -2257,6 +2268,7 @@ impl IntellisenseData {
         self.trigger_entries = Self::build_entries(&self.triggers);
         self.event_entries = Self::build_entries(&self.events);
         self.index_entries = Self::build_entries(&self.indexes);
+        self.partition_entries = Self::build_entries(&self.partitions);
         self.procedure_entries = Self::build_entries(&self.procedures);
         self.function_entries = Self::build_entries(&self.functions);
         self.package_entries = Self::build_entries(&self.packages);
@@ -2358,6 +2370,7 @@ impl IntellisenseData {
             || self.trigger_entries.len() != self.triggers.len()
             || self.event_entries.len() != self.events.len()
             || self.index_entries.len() != self.indexes.len()
+            || self.partition_entries.len() != self.partitions.len()
             || self.procedure_entries.len() != self.procedures.len()
             || self.function_entries.len() != self.functions.len()
             || self.package_entries.len() != self.packages.len()

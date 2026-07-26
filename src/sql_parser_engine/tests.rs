@@ -8131,3 +8131,38 @@ fn slash_on_own_line_inside_parens_is_not_terminator() {
         final_stmts
     );
 }
+
+#[test]
+fn nested_case_expression_ends_close_before_the_next_statement() {
+    let mut engine = SqlParserEngine::new();
+
+    engine.process_line("SELECT CASE WHEN 1 = 1 THEN");
+    engine.process_line("  CASE WHEN 2 = 2 THEN 'a' ELSE 'b' END");
+    engine.process_line("  ELSE 'c' END AS v FROM dual;");
+    engine.process_line("SELECT 99 FROM dual;");
+
+    let statements = engine.finalize_and_take_statements();
+
+    assert_eq!(statements.len(), 2, "unexpected statements: {statements:?}");
+    assert!(
+        statements[0].contains("ELSE 'c' END AS v"),
+        "nested CASE statement should be complete: {}",
+        statements[0]
+    );
+    assert!(
+        statements[1].contains("SELECT 99"),
+        "statement after a nested CASE must not be swallowed: {}",
+        statements[1]
+    );
+}
+
+#[test]
+fn nested_case_expression_on_one_line_still_reaches_block_depth_zero() {
+    let mut engine = SqlParserEngine::new();
+
+    engine.process_line(
+        "SELECT CASE WHEN 1 = 1 THEN CASE WHEN 2 = 2 THEN 'a' ELSE 'b' END ELSE 'c' END v FROM dual;",
+    );
+
+    assert_eq!(engine.block_depth(), 0, "both CASE frames must be closed");
+}

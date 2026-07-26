@@ -579,6 +579,12 @@ impl SqlParserEngine {
         self.starts_with_keyword("ANALYZE")
     }
 
+    /// CREATE/ALTER DDL bodies accept line-leading element keywords (`COLUMN`,
+    /// `CONSTRAINT`, `KEY`, ...) that collide with SQL*Plus report commands.
+    pub(crate) fn starts_with_table_element_ddl_context(&self) -> bool {
+        self.starts_with_keyword("CREATE") || self.starts_with_keyword("ALTER")
+    }
+
     fn starts_with_alter_keyword(&self, keyword: &str) -> bool {
         self.starts_with_keyword_pair("ALTER", keyword)
     }

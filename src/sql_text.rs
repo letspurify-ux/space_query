@@ -2069,11 +2069,22 @@ pub(crate) fn is_mysql_hash_comment_start(bytes: &[u8], idx: usize) -> bool {
 
 #[inline]
 pub(crate) fn is_mysql_dash_comment_start(bytes: &[u8], idx: usize) -> bool {
-    bytes.get(idx) == Some(&b'-')
-        && bytes.get(idx + 1) == Some(&b'-')
-        && bytes
-            .get(idx + 2)
-            .is_none_or(|byte| byte.is_ascii_whitespace() || byte.is_ascii_control())
+    if bytes.get(idx) != Some(&b'-') || bytes.get(idx + 1) != Some(&b'-') {
+        return false;
+    }
+    match bytes.get(idx + 2) {
+        None => true,
+        Some(byte) if byte.is_ascii_whitespace() || byte.is_ascii_control() => true,
+        // A dash ruler (`--------…` to end of line) is a comment banner, not a
+        // chain of minus operators. MySQL's `-- ` rule alone would open the
+        // comment at the *last* two dashes and re-render everything before it as
+        // operators, so re-formatting kept peeling the ruler apart.
+        Some(b'-') => bytes[idx + 2..]
+            .iter()
+            .take_while(|byte| **byte != b'\n' && **byte != b'\r')
+            .all(|byte| *byte == b'-' || byte.is_ascii_whitespace()),
+        Some(_) => false,
+    }
 }
 
 #[inline]

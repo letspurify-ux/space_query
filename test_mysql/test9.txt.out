@@ -226,8 +226,8 @@ ORDER BY f.service_id;
 -- source: test_mysql/test9.txt
 -- db: MySQL
 -- metadata: test_mysql/test9.txt inferred catalog
--- checked: 550
--- suggestions checked: 5333
+-- checked: 546
+-- suggestions checked: 5323
 -- missing: 0
 -- suggestions without type labels: 0
 -- marker: [[word]] means not suggested for the tested prefix

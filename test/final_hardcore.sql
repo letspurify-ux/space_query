@@ -33,6 +33,29 @@ BEGIN
     SELECT 'DROP TABLE sq_hard_w5_gtt PURGE' FROM dual UNION ALL
     SELECT 'DROP TABLE ora$ptt_sq_hard_w5' FROM dual UNION ALL
     SELECT 'DROP TABLE sq_hard_w5_err PURGE' FROM dual UNION ALL
+    SELECT 'DROP TRIGGER sq_hard_w6_iov_late' FROM dual UNION ALL
+    SELECT 'DROP TRIGGER sq_hard_w6_iov_trg' FROM dual UNION ALL
+    SELECT 'DROP VIEW sq_hard_w6_iov' FROM dual UNION ALL
+    SELECT 'DROP VIEW sq_hard_w6_checked' FROM dual UNION ALL
+    SELECT 'DROP VIEW sq_hard_w6_frozen' FROM dual UNION ALL
+    SELECT 'DROP SYNONYM sq_hard_w6_syn' FROM dual UNION ALL
+    SELECT 'DROP MATERIALIZED VIEW sq_hard_w6_mv' FROM dual UNION ALL
+    SELECT 'DROP MATERIALIZED VIEW LOG ON sq_hard_w6_fact' FROM dual UNION ALL
+    SELECT 'DROP TABLE sq_hard_w6_child PURGE' FROM dual UNION ALL
+    SELECT 'DROP TABLE sq_hard_w6_fact PURGE' FROM dual UNION ALL
+    SELECT 'DROP PACKAGE sq_hard_w6_reuse' FROM dual UNION ALL
+    SELECT 'DROP PACKAGE sq_hard_w6_types' FROM dual UNION ALL
+    SELECT 'DROP FUNCTION sq_hard_w6_pct' FROM dual UNION ALL
+    SELECT 'DROP FUNCTION sq_hard_w6_span' FROM dual UNION ALL
+    SELECT 'DROP TABLE sq_hard_w6_clustered PURGE' FROM dual UNION ALL
+    SELECT 'DROP CLUSTER sq_hard_w6_cl INCLUDING TABLES' FROM dual UNION ALL
+    SELECT 'DROP TABLE sq_hard_w6_iot PURGE' FROM dual UNION ALL
+    SELECT 'DROP TABLE sq_hard_w6_recycle PURGE' FROM dual UNION ALL
+    SELECT 'DROP TABLE sq_hard_w6_ddl PURGE' FROM dual UNION ALL
+    SELECT 'DROP TABLE sq_hard_w6_ver PURGE' FROM dual UNION ALL
+    SELECT 'DROP SEQUENCE sq_hard_w6_seq' FROM dual UNION ALL
+    SELECT 'DROP TABLE sq_hard_w6_note PURGE' FROM dual UNION ALL
+    SELECT 'PURGE RECYCLEBIN' FROM dual UNION ALL
     SELECT 'DROP TABLE sq_hard_w5_note PURGE' FROM dual UNION ALL
     SELECT 'DROP TABLE sq_hard_w5_wallet PURGE' FROM dual UNION ALL
     SELECT 'DROP TABLE sq_hard_w5_bulk PURGE' FROM dual UNION ALL
@@ -2382,6 +2405,702 @@ BEGIN
 END;
 /
 --------------------------------------------------------------------------------
+-- ULTRA WAVE 6: the PL/SQL JSON and XMLTYPE object APIs, a fast-refresh
+-- materialized view fed by its own log, physical-storage DDL (index-organized
+-- table, cluster, unused columns, recyclebin recovery), flashback version
+-- pseudo-columns, approximate and bitwise aggregates, DBMS_SQL handed to a
+-- native ref cursor, INSTEAD OF triggers with renamed correlation names, a
+-- scalar SQL macro, WITH PROCEDURE, referential DDL, and a lexer torture round.
+--------------------------------------------------------------------------------
+CREATE TABLE sq_hard_w6_note (
+  note_key   VARCHAR2(30) CONSTRAINT sq_hard_w6_note_pk PRIMARY KEY,
+  note_value NUMBER,
+  note_text  VARCHAR2(400)
+) TABLESPACE users;
+
+-- Created first so the flashback version query in W6-E has a settled history.
+CREATE TABLE sq_hard_w6_ver (
+  ver_id NUMBER CONSTRAINT sq_hard_w6_ver_pk PRIMARY KEY,
+  state  VARCHAR2(12) NOT NULL
+) TABLESPACE users;
+
+INSERT INTO sq_hard_w6_ver (ver_id, state) VALUES (1, 'created');
+COMMIT;
+
+UPDATE sq_hard_w6_ver SET state = 'changed' WHERE ver_id = 1;
+COMMIT;
+
+--------------------------------------------------------------------------------
+-- W6-A: the PL/SQL JSON object API. Method chains through JSON_OBJECT_T /
+-- JSON_ARRAY_T / JSON_ELEMENT_T mix mixed-case member names with SQL keywords
+-- (get, put, parse) and a varray key list walked by COUNT.
+--------------------------------------------------------------------------------
+DECLARE
+  doc      JSON_OBJECT_T;
+  limits   JSON_OBJECT_T;
+  tag_arr  JSON_ARRAY_T;
+  elem     JSON_ELEMENT_T;
+  key_list JSON_KEY_LIST;
+  key_line VARCHAR2(200);
+  hard_cap NUMBER;
+  key_count PLS_INTEGER;
+  tag_count PLS_INTEGER;
+  shape_txt VARCHAR2(30);
+  spare_txt VARCHAR2(30);
+BEGIN
+  doc := JSON_OBJECT_T.parse(
+    '{"node":"alpha","limits":{"soft":10,"hard":20},"tags":["sql","json"]}');
+  limits := doc.get_Object('limits');
+  hard_cap := limits.get_Number('hard');
+  tag_arr := doc.get_Array('tags');
+  tag_arr.append('wave6');
+  doc.put('tags', tag_arr);
+  doc.put('checked', TRUE);
+  doc.put_null('spare');
+  elem := doc.get('limits');
+  IF elem.is_Object() AND NOT elem.is_Array() THEN
+    doc.put('shape', 'object');
+  END IF;
+  key_list := doc.get_Keys;
+  FOR key_pos IN 1 .. key_list.COUNT LOOP
+    key_line := key_line || CASE WHEN key_line IS NULL THEN '' ELSE '|' END
+                || key_list(key_pos);
+  END LOOP;
+
+  key_count := key_list.COUNT;
+  tag_count := tag_arr.get_size;
+  shape_txt := doc.get_String('shape');
+  spare_txt := CASE WHEN doc.has('spare') THEN 'has-spare' END;
+
+  INSERT INTO sq_hard_w6_note (note_key, note_value, note_text)
+  VALUES ('json_api', hard_cap + tag_count,
+          shape_txt || ':' || key_count || ':' || spare_txt || ':' || key_line);
+END;
+/
+
+SELECT note_key, note_value, note_text
+FROM sq_hard_w6_note
+WHERE note_key = 'json_api';
+
+--------------------------------------------------------------------------------
+-- W6-B: XMLTYPE member functions chained off a local variable and SYS.ANYDATA
+-- reflection. Both are object method paths that look like package calls.
+--------------------------------------------------------------------------------
+DECLARE
+  doc_xml  XMLTYPE;
+  leaf_xml XMLTYPE;
+  leaf_txt VARCHAR2(200);
+  root_tag VARCHAR2(60);
+  has_node PLS_INTEGER;
+  any_val  SYS.ANYDATA;
+  any_kind VARCHAR2(80);
+  any_num  NUMBER;
+  any_ok   PLS_INTEGER;
+BEGIN
+  doc_xml  := XMLTYPE('<metrics unit="ms"><m id="1">12</m><m id="2">18</m></metrics>');
+  leaf_xml := doc_xml.extract('/metrics/m[@id="2"]/text()');
+  leaf_txt := leaf_xml.getStringVal();
+  root_tag := doc_xml.getRootElement();
+  has_node := doc_xml.existsNode('/metrics/m[@id="1"]');
+
+  any_val  := SYS.ANYDATA.convertNumber(has_node * 21);
+  any_kind := any_val.getTypeName();
+  any_ok   := any_val.getNumber(any_num);
+
+  INSERT INTO sq_hard_w6_note (note_key, note_value, note_text)
+  VALUES ('xml_anydata', any_num + TO_NUMBER(leaf_txt),
+          root_tag || ':' || any_kind || ':' || any_ok || ':' || leaf_txt);
+END;
+/
+
+--------------------------------------------------------------------------------
+-- W6-C: materialized view log with SEQUENCE / INCLUDING NEW VALUES feeding a
+-- FAST REFRESH ON COMMIT aggregate materialized view.
+--------------------------------------------------------------------------------
+CREATE TABLE sq_hard_w6_fact (
+  fact_id NUMBER CONSTRAINT sq_hard_w6_fact_pk PRIMARY KEY,
+  bucket  VARCHAR2(10) NOT NULL,
+  qty     NUMBER(8, 2) NOT NULL
+) TABLESPACE users;
+
+INSERT INTO sq_hard_w6_fact (fact_id, bucket, qty) VALUES (1, 'alpha', 10);
+INSERT INTO sq_hard_w6_fact (fact_id, bucket, qty) VALUES (2, 'alpha', 15);
+INSERT INTO sq_hard_w6_fact (fact_id, bucket, qty) VALUES (3, 'beta', 4);
+COMMIT;
+
+CREATE MATERIALIZED VIEW LOG ON sq_hard_w6_fact
+  WITH ROWID, SEQUENCE (bucket, qty)
+  INCLUDING NEW VALUES;
+
+CREATE MATERIALIZED VIEW sq_hard_w6_mv
+  BUILD IMMEDIATE
+  REFRESH FAST ON COMMIT
+  ENABLE QUERY REWRITE
+AS
+  SELECT bucket,
+         COUNT(*)   AS bucket_rows,
+         SUM(qty)   AS bucket_qty,
+         COUNT(qty) AS qty_rows
+  FROM sq_hard_w6_fact
+  GROUP BY bucket;
+
+INSERT INTO sq_hard_w6_fact (fact_id, bucket, qty) VALUES (4, 'beta', 6);
+COMMIT;
+
+SELECT bucket, bucket_rows, bucket_qty
+FROM sq_hard_w6_mv
+ORDER BY bucket;
+
+--------------------------------------------------------------------------------
+-- W6-D: physical storage grammar - index-organized table with an overflow
+-- segment, a hash-free cluster with a clustered table, unused-column surgery,
+-- and a table recovered out of the recyclebin.
+--------------------------------------------------------------------------------
+CREATE TABLE sq_hard_w6_iot (
+  iot_key  NUMBER,
+  iot_name VARCHAR2(20),
+  iot_note VARCHAR2(100),
+  CONSTRAINT sq_hard_w6_iot_pk PRIMARY KEY (iot_key, iot_name)
+) ORGANIZATION INDEX
+  PCTTHRESHOLD 20
+  INCLUDING iot_name
+  OVERFLOW TABLESPACE users;
+
+INSERT INTO sq_hard_w6_iot (iot_key, iot_name, iot_note) VALUES (1, 'a', 'first');
+INSERT INTO sq_hard_w6_iot (iot_key, iot_name, iot_note) VALUES (2, 'b', 'second');
+
+CREATE CLUSTER sq_hard_w6_cl (cluster_key NUMBER) SIZE 512 TABLESPACE users;
+
+CREATE INDEX sq_hard_w6_cl_ix ON CLUSTER sq_hard_w6_cl;
+
+CREATE TABLE sq_hard_w6_clustered (
+  cluster_key NUMBER NOT NULL,
+  payload     VARCHAR2(30)
+) CLUSTER sq_hard_w6_cl (cluster_key);
+
+INSERT INTO sq_hard_w6_clustered (cluster_key, payload) VALUES (1, 'clustered');
+
+CREATE TABLE sq_hard_w6_ddl (
+  ddl_id      NUMBER CONSTRAINT sq_hard_w6_ddl_pk PRIMARY KEY,
+  legacy_flag CHAR(1),
+  old_name    VARCHAR2(20),
+  note        VARCHAR2(30)
+) TABLESPACE users;
+
+INSERT INTO sq_hard_w6_ddl (ddl_id, legacy_flag, old_name, note)
+VALUES (1, 'Y', 'renamed-me', 'kept');
+
+ALTER TABLE sq_hard_w6_ddl SET UNUSED COLUMN legacy_flag ONLINE;
+ALTER TABLE sq_hard_w6_ddl DROP UNUSED COLUMNS CHECKPOINT 250;
+ALTER TABLE sq_hard_w6_ddl RENAME COLUMN old_name TO new_name;
+ALTER TABLE sq_hard_w6_ddl MODIFY (note VARCHAR2(60) DEFAULT 'w6-default');
+ALTER TABLE sq_hard_w6_ddl ENABLE ROW MOVEMENT;
+
+INSERT INTO sq_hard_w6_ddl (ddl_id, new_name) VALUES (2, 'defaulted');
+
+SELECT ddl_id, new_name, note FROM sq_hard_w6_ddl ORDER BY ddl_id;
+
+CREATE TABLE sq_hard_w6_recycle (
+  bin_id NUMBER CONSTRAINT sq_hard_w6_recycle_pk PRIMARY KEY,
+  label  VARCHAR2(20)
+) TABLESPACE users;
+
+INSERT INTO sq_hard_w6_recycle (bin_id, label) VALUES (1, 'restored');
+COMMIT;
+
+DROP TABLE sq_hard_w6_recycle;
+
+FLASHBACK TABLE sq_hard_w6_recycle TO BEFORE DROP;
+
+SELECT label FROM sq_hard_w6_recycle ORDER BY bin_id;
+
+--------------------------------------------------------------------------------
+-- W6-E: row-version pseudo-columns from a VERSIONS BETWEEN flashback query,
+-- locking modifiers that read like ordinary keywords, and named transactions.
+--------------------------------------------------------------------------------
+-- A flashback version range that reaches back across a fresh CREATE TABLE is
+-- rejected with ORA-01466 until the DDL leaves the current timestamp bucket.
+BEGIN
+  DBMS_SESSION.SLEEP(6);
+END;
+/
+
+SELECT CASE WHEN COUNT(*) >= 1 THEN 'versions-ok' END       AS version_shape,
+       CASE WHEN COUNT(v.VERSIONS_STARTSCN) >= 0 THEN 'scn-ok' END AS scn_shape,
+       CASE WHEN COUNT(CASE WHEN v.VERSIONS_OPERATION IN ('I', 'U', 'D')
+                          THEN 1 END) >= 0
+            THEN 'ops-ok' END                                AS operation_shape
+FROM sq_hard_w6_ver VERSIONS BETWEEN SCN MINVALUE AND MAXVALUE v
+WHERE v.ver_id = 1;
+
+SELECT ver_id, state
+FROM sq_hard_w6_ver
+WHERE ver_id = 1
+FOR UPDATE OF state WAIT 3;
+
+COMMIT;
+
+SELECT ver_id
+FROM sq_hard_w6_ver
+ORDER BY ver_id
+FOR UPDATE SKIP LOCKED;
+
+COMMIT;
+
+SET TRANSACTION ISOLATION LEVEL SERIALIZABLE NAME 'sq_hard_w6_tx';
+
+SELECT COUNT(*) AS serializable_rows FROM sq_hard_w6_ver;
+
+COMMIT;
+
+SET TRANSACTION READ ONLY;
+
+SELECT COUNT(*) AS read_only_rows FROM sq_hard_w6_ver;
+
+COMMIT;
+
+--------------------------------------------------------------------------------
+-- W6-F: aggregate/analytic zoo - approximate aggregates with a DETERMINISTIC
+-- modifier, 23ai bitwise aggregates, an analytic LISTAGG, and regular
+-- expressions whose escapes look like broken string literals.
+--------------------------------------------------------------------------------
+SELECT APPROX_COUNT_DISTINCT(metric_name)                          AS approx_names,
+       APPROX_PERCENTILE(0.5 DETERMINISTIC)
+         WITHIN GROUP (ORDER BY metric_value)                      AS approx_median,
+       BIT_OR_AGG(TRUNC(metric_value))                             AS bits_or,
+       BIT_AND_AGG(TRUNC(metric_value))                            AS bits_and,
+       BIT_XOR_AGG(TRUNC(metric_value))                            AS bits_xor,
+       CASE WHEN CHECKSUM(metric_value) IS NOT NULL
+            THEN 'checksum-ok' END                                 AS checksum_shape,
+       CASE WHEN ANY_VALUE(metric_name) IN ('LATENCY', 'ERRORS')
+            THEN 'any-ok' END                                      AS any_shape
+FROM sq_hard_metric;
+
+SELECT m.metric_id,
+       LISTAGG(m.metric_name, ',') WITHIN GROUP (ORDER BY m.metric_id)
+         OVER (PARTITION BY m.node_id)                      AS node_names,
+       REGEXP_SUBSTR('a1-b22-c3', '([a-z])(\d+)', 1, 2, 'i', 2) AS second_digits,
+       REGEXP_REPLACE('a1-b22', '([a-z])(\d+)', '\2:\1')        AS swapped,
+       REGEXP_COUNT('x/*y*/z--w', '[*/-]')                       AS punct_hits,
+       REGEXP_INSTR('one two three', '\s\w+\s', 1, 1, 1, 'x')    AS after_match
+FROM sq_hard_metric m
+ORDER BY m.metric_id;
+
+--------------------------------------------------------------------------------
+-- W6-G: PL/SQL torture round two - a locally declared collection type used in
+-- static SQL through TABLE(), every collection method in one block, a
+-- multi-exception handler, PRAGMA INLINE, and a DBMS_SQL cursor handed to a
+-- native ref cursor mid-fetch.
+--------------------------------------------------------------------------------
+CREATE OR REPLACE PACKAGE sq_hard_w6_types AS
+  TYPE span_tab IS TABLE OF NUMBER;
+END sq_hard_w6_types;
+/
+
+DECLARE
+  TYPE span_arr IS VARRAY(8) OF NUMBER;
+  spans      sq_hard_w6_types.span_tab := sq_hard_w6_types.span_tab(5, 3, 9, 1);
+  bounded    span_arr := span_arr(2, 4);
+  table_sum  NUMBER;
+  probe_line VARCHAR2(200);
+  cur_id     INTEGER;
+  exec_rows  INTEGER;
+  ref_cur    SYS_REFCURSOR;
+  got_id     NUMBER;
+  got_name   VARCHAR2(32);
+  fetched    PLS_INTEGER := 0;
+  missing    NUMBER;
+
+  FUNCTION describe(p_at PLS_INTEGER) RETURN VARCHAR2 IS
+  BEGIN
+    PRAGMA INLINE(describe, 'YES');
+    RETURN 'at' || p_at;
+  END describe;
+BEGIN
+  SELECT SUM(COLUMN_VALUE) INTO table_sum FROM TABLE(spans);
+
+  spans.EXTEND;
+  spans(spans.LAST) := 7;
+  spans.TRIM(1);
+  spans.DELETE(2);
+  bounded.EXTEND(2, 1);
+
+  probe_line := describe(spans.FIRST)
+                || CASE WHEN spans.EXISTS(2) THEN '/live' ELSE '/gone' END
+                || '/' || spans.NEXT(1)
+                || '/' || spans.PRIOR(spans.LAST)
+                || '/' || spans.COUNT
+                || '/' || bounded.LIMIT
+                || '/' || bounded.COUNT;
+
+  cur_id := DBMS_SQL.OPEN_CURSOR;
+  DBMS_SQL.PARSE(
+    cur_id,
+    'SELECT metric_id, metric_name FROM sq_hard_metric WHERE node_id = :node_bind'
+      || ' ORDER BY metric_id',
+    DBMS_SQL.NATIVE
+  );
+  DBMS_SQL.BIND_VARIABLE(cur_id, ':node_bind', 1);
+  exec_rows := DBMS_SQL.EXECUTE(cur_id);
+  ref_cur := DBMS_SQL.TO_REFCURSOR(cur_id);
+  LOOP
+    FETCH ref_cur INTO got_id, got_name;
+    EXIT WHEN ref_cur%NOTFOUND;
+    fetched := fetched + 1;
+  END LOOP;
+  CLOSE ref_cur;
+
+  BEGIN
+    SELECT metric_value INTO missing FROM sq_hard_metric WHERE 1 = 0;
+  EXCEPTION
+    WHEN NO_DATA_FOUND OR TOO_MANY_ROWS THEN
+      missing := -1;
+  END;
+
+  INSERT INTO sq_hard_w6_note (note_key, note_value, note_text)
+  VALUES ('plsql_round2', table_sum + fetched + missing + exec_rows, probe_line);
+END;
+/
+
+ALTER SESSION SET PLSQL_CCFLAGS = 'sq_hard_w6_level:3';
+
+CREATE OR REPLACE PACKAGE sq_hard_w6_reuse AS
+  PRAGMA SERIALLY_REUSABLE;
+  FUNCTION tick RETURN PLS_INTEGER;
+END sq_hard_w6_reuse;
+/
+
+CREATE OR REPLACE PACKAGE BODY sq_hard_w6_reuse AS
+  PRAGMA SERIALLY_REUSABLE;
+  g_ticks PLS_INTEGER := 0;
+
+  FUNCTION tick RETURN PLS_INTEGER IS
+  BEGIN
+    g_ticks := g_ticks + 1;
+    RETURN g_ticks;
+  END tick;
+END sq_hard_w6_reuse;
+/
+
+CREATE OR REPLACE FUNCTION sq_hard_w6_span(p_scale NUMBER DEFAULT 1)
+  RETURN NUMBER
+  DETERMINISTIC
+IS
+  base NUMBER;
+BEGIN
+$IF $$sq_hard_w6_level >= 3 $THEN
+  base := 30;
+$ELSIF $$sq_hard_w6_level IS NULL $THEN
+  base := 0;
+$ELSE
+  base := 10;
+$END
+  RETURN base * p_scale;
+END sq_hard_w6_span;
+/
+
+SELECT sq_hard_w6_span(p_scale => 2) AS scaled_span FROM dual;
+
+--------------------------------------------------------------------------------
+-- W6-H: INSTEAD OF trigger over a join-free view with renamed correlation
+-- names, plus a WHEN-restricted row trigger ordered by FOLLOWS on the base
+-- table.
+--------------------------------------------------------------------------------
+CREATE OR REPLACE VIEW sq_hard_w6_iov AS
+SELECT f.fact_id, f.bucket, f.qty, f.qty * 2 AS doubled_qty
+FROM sq_hard_w6_fact f;
+
+CREATE OR REPLACE TRIGGER sq_hard_w6_iov_trg
+INSTEAD OF INSERT OR UPDATE ON sq_hard_w6_iov
+REFERENCING NEW AS incoming OLD AS existing
+FOR EACH ROW
+BEGIN
+  IF INSERTING THEN
+    INSERT INTO sq_hard_w6_fact (fact_id, bucket, qty)
+    VALUES (:incoming.fact_id, :incoming.bucket, :incoming.qty);
+  ELSIF UPDATING THEN
+    UPDATE sq_hard_w6_fact
+    SET qty = :incoming.qty
+    WHERE fact_id = :existing.fact_id;
+  END IF;
+END;
+/
+
+CREATE OR REPLACE TRIGGER sq_hard_w6_iov_late
+INSTEAD OF INSERT ON sq_hard_w6_iov
+REFERENCING NEW AS incoming
+FOR EACH ROW
+FOLLOWS sq_hard_w6_iov_trg
+BEGIN
+  UPDATE sq_hard_w6_fact
+  SET bucket = LOWER(:incoming.bucket)
+  WHERE fact_id = :incoming.fact_id;
+END;
+/
+
+INSERT INTO sq_hard_w6_iov (fact_id, bucket, qty) VALUES (5, 'GAMMA', 8);
+
+UPDATE sq_hard_w6_iov SET qty = 9 WHERE fact_id = 5;
+
+COMMIT;
+
+SELECT fact_id, bucket, qty, doubled_qty
+FROM sq_hard_w6_iov
+WHERE fact_id = 5;
+
+--------------------------------------------------------------------------------
+-- W6-I: scalar SQL macro whose body is a bare expression string, a WITH clause
+-- carrying both a PROCEDURE and a FUNCTION, and read-only / check-option views
+-- plus a synonym over the same base table.
+--------------------------------------------------------------------------------
+CREATE OR REPLACE FUNCTION sq_hard_w6_pct(p_part NUMBER, p_whole NUMBER)
+  RETURN VARCHAR2 SQL_MACRO(SCALAR)
+IS
+BEGIN
+  RETURN 'ROUND(p_part * 100 / NULLIF(p_whole, 0), 2)';
+END sq_hard_w6_pct;
+/
+
+SELECT bucket,
+       sq_hard_w6_pct(SUM(qty), (SELECT SUM(qty) FROM sq_hard_w6_fact)) AS share_pct
+FROM sq_hard_w6_fact
+GROUP BY bucket
+ORDER BY bucket;
+
+WITH
+  PROCEDURE bump(io_value IN OUT NUMBER) IS
+  BEGIN
+    io_value := io_value * 2;
+  END;
+  FUNCTION bumped(p_value NUMBER) RETURN NUMBER IS
+    local_value NUMBER := p_value;
+  BEGIN
+    bump(local_value);
+    RETURN local_value + 1;
+  END;
+SELECT fact_id, bumped(qty) AS bumped_qty
+FROM sq_hard_w6_fact
+WHERE fact_id <= 2
+ORDER BY fact_id;
+/
+
+CREATE OR REPLACE FORCE EDITIONABLE VIEW sq_hard_w6_checked AS
+SELECT fact_id, bucket, qty
+FROM sq_hard_w6_fact
+WHERE qty >= 0
+WITH CHECK OPTION CONSTRAINT sq_hard_w6_checked_ck;
+
+CREATE OR REPLACE VIEW sq_hard_w6_frozen AS
+SELECT bucket, SUM(qty) AS bucket_qty
+FROM sq_hard_w6_fact
+GROUP BY bucket
+WITH READ ONLY;
+
+CREATE OR REPLACE SYNONYM sq_hard_w6_syn FOR sq_hard_w6_fact;
+
+UPDATE sq_hard_w6_checked SET qty = qty + 0 WHERE fact_id = 1;
+
+SELECT (SELECT COUNT(*) FROM sq_hard_w6_syn)    AS synonym_rows,
+       (SELECT COUNT(*) FROM sq_hard_w6_frozen) AS frozen_buckets
+FROM dual;
+
+CREATE SEQUENCE sq_hard_w6_seq START WITH 1 INCREMENT BY 2 NOCACHE ORDER;
+
+SELECT sq_hard_w6_seq.NEXTVAL AS first_value FROM dual;
+
+ALTER SEQUENCE sq_hard_w6_seq RESTART START WITH 50;
+
+SELECT sq_hard_w6_seq.NEXTVAL AS restarted_value FROM dual;
+
+--------------------------------------------------------------------------------
+-- W6-J: referential grammar and object metadata - a self-referencing FOREIGN
+-- KEY with ON DELETE SET NULL, COMMENT ON whose text contains comment openers,
+-- GRANT/REVOKE, an unconditional multi-table INSERT ALL, TRUNCATE with a
+-- storage clause, and ANALYZE.
+--------------------------------------------------------------------------------
+ALTER TABLE sq_hard_w6_ddl ADD CONSTRAINT sq_hard_w6_ddl_uq UNIQUE (new_name);
+
+CREATE TABLE sq_hard_w6_child (
+  child_id  NUMBER CONSTRAINT sq_hard_w6_child_pk PRIMARY KEY,
+  parent_id NUMBER,
+  label     VARCHAR2(20),
+  CONSTRAINT sq_hard_w6_child_fk FOREIGN KEY (parent_id)
+    REFERENCES sq_hard_w6_ddl (ddl_id) ON DELETE SET NULL
+    DEFERRABLE INITIALLY IMMEDIATE
+) TABLESPACE users;
+
+COMMENT ON TABLE sq_hard_w6_child IS 'wave 6 /* not a comment */ child rows';
+COMMENT ON COLUMN sq_hard_w6_child.parent_id IS 'points at sq_hard_w6_ddl -- not a comment';
+
+GRANT SELECT, INSERT ON sq_hard_w6_child TO PUBLIC;
+REVOKE INSERT ON sq_hard_w6_child FROM PUBLIC;
+
+INSERT ALL
+  INTO sq_hard_w6_child (child_id, parent_id, label) VALUES (src_id, 1, 'left')
+  INTO sq_hard_w6_child (child_id, parent_id, label) VALUES (src_id + 10, 2, 'right')
+SELECT 1 AS src_id FROM dual;
+
+DELETE FROM sq_hard_w6_ddl WHERE ddl_id = 1;
+
+SELECT child_id, parent_id, label
+FROM sq_hard_w6_child
+ORDER BY child_id;
+
+TRUNCATE TABLE sq_hard_w6_iot DROP STORAGE;
+
+INSERT INTO sq_hard_w6_iot (iot_key, iot_name, iot_note) VALUES (3, 'c', 'refilled');
+
+ANALYZE TABLE sq_hard_w6_iot COMPUTE STATISTICS FOR TABLE;
+
+--------------------------------------------------------------------------------
+-- W6-K: parameterized cursor with a defaulted parameter, a cursor %ROWTYPE
+-- record, a temporary CLOB assembled through DBMS_LOB, and the serially
+-- reusable package counter.
+--------------------------------------------------------------------------------
+DECLARE
+  CURSOR node_cur(p_node NUMBER, p_floor NUMBER DEFAULT 0) IS
+    SELECT metric_id, metric_name, metric_value
+    FROM sq_hard_metric
+    WHERE node_id = p_node AND metric_value >= p_floor
+    ORDER BY metric_id;
+  node_rec  node_cur%ROWTYPE;
+  seen_rows PLS_INTEGER := 0;
+  scratch   CLOB;
+  clob_len  PLS_INTEGER;
+  clob_head VARCHAR2(40);
+  slash_at  PLS_INTEGER;
+  tick_one  PLS_INTEGER;
+  tick_two  PLS_INTEGER;
+BEGIN
+  OPEN node_cur(1, p_floor => 18);
+  LOOP
+    FETCH node_cur INTO node_rec;
+    EXIT WHEN node_cur%NOTFOUND;
+    seen_rows := seen_rows + node_cur%ROWCOUNT;
+  END LOOP;
+  CLOSE node_cur;
+
+  DBMS_LOB.CREATETEMPORARY(scratch, TRUE);
+  DBMS_LOB.WRITEAPPEND(scratch, 6, 'wave6/');
+  DBMS_LOB.APPEND(scratch, TO_CLOB('tail'));
+  clob_len  := DBMS_LOB.GETLENGTH(scratch);
+  clob_head := DBMS_LOB.SUBSTR(scratch, 5, 1);
+  slash_at  := DBMS_LOB.INSTR(scratch, '/', 1, 1);
+  DBMS_LOB.FREETEMPORARY(scratch);
+
+  tick_one := sq_hard_w6_reuse.tick;
+  tick_two := sq_hard_w6_reuse.tick;
+
+  INSERT INTO sq_hard_w6_note (note_key, note_value, note_text)
+  VALUES ('cursor_lob', seen_rows + clob_len + slash_at + tick_one + tick_two,
+          clob_head || ':' || node_rec.metric_name);
+END;
+/
+
+--------------------------------------------------------------------------------
+-- W6-L: pure lexer and layout torture. A comment sits between nearly every
+-- token, CASE nests five deep inside COALESCE, the q-quote payload carries both
+-- comment openers and its own delimiter family, and the last projection is one
+-- very long unbroken line with no space around any operator.
+--------------------------------------------------------------------------------
+SELECT /*a*/ m.metric_id /*b*/ AS /*c*/ id_out /*d*/,
+       /*e*/ COALESCE(
+         CASE WHEN m.metric_value > 20 THEN
+           CASE WHEN m.node_id = 1 THEN
+             CASE WHEN m.metric_name LIKE 'L%' THEN
+               CASE WHEN LENGTH(m.metric_name) = 7 THEN
+                 CASE WHEN m.metric_id > 0 THEN 'deep-hit' ELSE 'deep-miss' END
+               ELSE 'len-miss' END
+             ELSE 'like-miss' END
+           ELSE 'node-miss' END
+         ELSE NULL END,
+         'fallback') AS nested_case,
+       q'[a ]] b /* still literal */ -- still literal]' AS bracket_payload,
+       q'{outer {inner} /* literal */}' AS brace_payload,
+       NVL2(m.payload, 'json', 'none') AS payload_shape
+FROM /*f*/ sq_hard_metric /*g*/ m /*h*/
+WHERE /*i*/ m.metric_id /*j*/ IN /*k*/ (1, 2, 3, 4)
+ORDER BY /*l*/ m.metric_id /*m*/ DESC /*n*/ NULLS FIRST;
+
+SELECT m.metric_id||'-'||m.node_id||'/'||TO_CHAR(m.metric_value,'FM9990D00')||CASE WHEN m.metric_value>=18 THEN'/hi'ELSE'/lo'END AS packed_line,(m.metric_value*2)-(m.node_id*3)+MOD(m.metric_id,2)AS packed_math FROM sq_hard_metric m WHERE m.node_id IN(1,2)AND m.metric_value BETWEEN 1 AND 999 ORDER BY m.metric_id;
+
+sElEcT	CoUnT(*)	As	mixed_case_rows	FrOm	sq_hard_w6_note	WhErE	note_key	iS	NoT	nUlL;
+
+--------------------------------------------------------------------------------
+-- W6-M: wave-6 self-verification.
+--------------------------------------------------------------------------------
+DECLARE
+  json_val    NUMBER;
+  json_txt    VARCHAR2(400);
+  xml_val     NUMBER;
+  xml_txt     VARCHAR2(400);
+  plsql_val   NUMBER;
+  plsql_txt   VARCHAR2(400);
+  lob_val     NUMBER;
+  lob_txt     VARCHAR2(400);
+  mv_buckets  PLS_INTEGER;
+  mv_qty      NUMBER;
+  iot_rows    PLS_INTEGER;
+  child_rows  PLS_INTEGER;
+  parented    PLS_INTEGER;
+  ddl_rows    PLS_INTEGER;
+  span_val    NUMBER;
+  synonym_rows PLS_INTEGER;
+  recycled    PLS_INTEGER;
+  clustered   PLS_INTEGER;
+BEGIN
+  SELECT note_value, note_text INTO json_val, json_txt
+  FROM sq_hard_w6_note WHERE note_key = 'json_api';
+  SELECT note_value, note_text INTO xml_val, xml_txt
+  FROM sq_hard_w6_note WHERE note_key = 'xml_anydata';
+  SELECT note_value, note_text INTO plsql_val, plsql_txt
+  FROM sq_hard_w6_note WHERE note_key = 'plsql_round2';
+  SELECT note_value, note_text INTO lob_val, lob_txt
+  FROM sq_hard_w6_note WHERE note_key = 'cursor_lob';
+
+  SELECT COUNT(*), SUM(bucket_qty) INTO mv_buckets, mv_qty FROM sq_hard_w6_mv;
+  SELECT COUNT(*) INTO iot_rows FROM sq_hard_w6_iot;
+  SELECT COUNT(*), COUNT(parent_id) INTO child_rows, parented FROM sq_hard_w6_child;
+  SELECT COUNT(*) INTO ddl_rows FROM sq_hard_w6_ddl;
+  SELECT COUNT(*) INTO recycled FROM sq_hard_w6_recycle;
+  SELECT COUNT(*) INTO clustered FROM sq_hard_w6_clustered;
+  SELECT COUNT(*) INTO synonym_rows FROM sq_hard_w6_syn;
+  span_val := sq_hard_w6_span(2);
+
+  IF json_val <> 23
+     OR json_txt <> 'object:6:has-spare:node|limits|tags|checked|spare|shape' THEN
+    RAISE_APPLICATION_ERROR(-20090, 'json api ' || json_val || '/' || json_txt);
+  END IF;
+  IF xml_val <> 39 OR xml_txt <> 'metrics:SYS.NUMBER:0:18' THEN
+    RAISE_APPLICATION_ERROR(-20091, 'xml/anydata ' || xml_val || '/' || xml_txt);
+  END IF;
+  IF plsql_val <> 20 OR plsql_txt <> 'at1/gone/3/3/3/8/4' THEN
+    RAISE_APPLICATION_ERROR(-20092, 'plsql round2 ' || plsql_val || '/' || plsql_txt);
+  END IF;
+  IF lob_val <> 22 OR lob_txt <> 'wave6:LATENCY' THEN
+    RAISE_APPLICATION_ERROR(-20093, 'cursor/lob ' || lob_val || '/' || lob_txt);
+  END IF;
+  IF mv_buckets <> 3 OR mv_qty <> 44 THEN
+    RAISE_APPLICATION_ERROR(-20094, 'fast mv ' || mv_buckets || '/' || mv_qty);
+  END IF;
+  IF iot_rows <> 1 OR clustered <> 1 OR recycled <> 1 THEN
+    RAISE_APPLICATION_ERROR(
+      -20095,
+      'storage ddl ' || iot_rows || '/' || clustered || '/' || recycled
+    );
+  END IF;
+  IF child_rows <> 2 OR parented <> 1 OR ddl_rows <> 1 THEN
+    RAISE_APPLICATION_ERROR(
+      -20096,
+      'referential ' || child_rows || '/' || parented || '/' || ddl_rows
+    );
+  END IF;
+  IF span_val <> 60 OR synonym_rows <> 5 THEN
+    RAISE_APPLICATION_ERROR(-20097, 'span/synonym ' || span_val || '/' || synonym_rows);
+  END IF;
+END;
+/
+--------------------------------------------------------------------------------
 -- Final self-verification and PASS banner.
 --------------------------------------------------------------------------------
 DECLARE
@@ -2423,8 +3142,10 @@ END;
 /
 
 SELECT 'PASS' AS final_status,
-       (SELECT COUNT(*) FROM sq_hard_metric) AS metric_rows,
-       (SELECT COUNT(*) FROM sq_hard_merge)  AS merge_rows
+       (SELECT COUNT(*) FROM sq_hard_metric)  AS metric_rows,
+       (SELECT COUNT(*) FROM sq_hard_merge)   AS merge_rows,
+       (SELECT COUNT(*) FROM sq_hard_w6_note) AS wave6_notes,
+       (SELECT SUM(bucket_qty) FROM sq_hard_w6_mv) AS wave6_mv_qty
 FROM dual;
 
 PROMPT [ORACLE HARDCORE] PASS

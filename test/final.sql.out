@@ -1019,7 +1019,7 @@ PROMPT [ORACLE FINAL] PASS
 -- source: test/final.sql
 -- db: Oracle
 -- metadata: test Oracle inferred catalog (file-scoped overlay) + Oracle built-ins
--- checked: 2374
+-- checked: 2373
 -- suggestions checked: 8804
 -- missing: 0
 -- suggestions without type labels: 0

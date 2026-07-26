@@ -136,6 +136,7 @@ struct MysqlFamilyScriptCatalog {
     triggers: Vec<String>,
     events: Vec<String>,
     indexes: Vec<String>,
+    partitions: Vec<String>,
     schemas: Vec<String>,
     users: Vec<String>,
     columns: HashMap<String, Vec<String>>,
@@ -149,6 +150,56 @@ struct MysqlFamilyScriptCatalog {
     /// user-defined object type. Filtered against `type_members` when the
     /// catalog is materialised, so scalar columns never leak in.
     column_object_types: HashMap<String, String>,
+}
+
+/// `PARTITION <name>` in a `PARTITION BY ... (...)` definition or in an
+/// `ALTER TABLE ... REORGANIZE ... INTO (...)` list names a partition of the table.
+fn collect_partition_names(tokens: &[SqlToken], partitions: &mut Vec<String>) {
+    for (idx, token) in tokens.iter().enumerate() {
+        let is_partition_keyword = matches!(token, SqlToken::Word(word)
+            if word.eq_ignore_ascii_case("PARTITION")
+                || word.eq_ignore_ascii_case("SUBPARTITION"));
+        if !is_partition_keyword {
+            continue;
+        }
+        let Some(SqlToken::Word(name)) = tokens.get(idx + 1) else {
+            continue;
+        };
+        if crate::sql_text::is_mysql_sql_keyword(name)
+            || crate::sql_text::is_oracle_sql_keyword(&name.to_ascii_uppercase())
+        {
+            continue;
+        }
+        push_unique_case_insensitive(partitions, name);
+    }
+}
+
+/// `ALTER TABLE t ADD [UNIQUE|FULLTEXT|SPATIAL] INDEX|KEY <name> (...)` creates a
+/// named index just like `CREATE INDEX`.
+fn collect_added_index_names(tokens: &[SqlToken], indexes: &mut Vec<String>) {
+    for (idx, token) in tokens.iter().enumerate() {
+        if !token_word_eq(Some(token), "ADD") {
+            continue;
+        }
+        let mut cursor = idx + 1;
+        while matches!(tokens.get(cursor), Some(SqlToken::Word(word))
+            if matches!(
+                word.to_ascii_uppercase().as_str(),
+                "UNIQUE" | "FULLTEXT" | "SPATIAL" | "CONSTRAINT"
+            ))
+        {
+            cursor += 1;
+        }
+        if !(token_word_eq(tokens.get(cursor), "INDEX") || token_word_eq(tokens.get(cursor), "KEY"))
+        {
+            continue;
+        }
+        if let Some(SqlToken::Word(name)) = tokens.get(cursor + 1) {
+            if !crate::sql_text::is_mysql_sql_keyword(name) {
+                push_unique_case_insensitive(indexes, name);
+            }
+        }
+    }
 }
 
 fn token_word_eq(token: Option<&SqlToken>, expected: &str) -> bool {
@@ -989,6 +1040,9 @@ fn mysql_family_catalog_from_script(script: &str) -> MysqlFamilyScriptCatalog {
             catalog.columns.insert(table.to_ascii_uppercase(), columns);
         }
     }
+    let script_tokens = super::query_text::tokenize_sql(script);
+    collect_partition_names(&script_tokens, &mut catalog.partitions);
+    collect_added_index_names(&script_tokens, &mut catalog.indexes);
     catalog
 }
 
@@ -1008,8 +1062,21 @@ fn intellisense_data_from_mysql_family_catalog(
     data.triggers = catalog.triggers.clone();
     data.events = catalog.events.clone();
     data.indexes = catalog.indexes.clone();
+    data.partitions = catalog.partitions.clone();
     data.schemas = catalog.schemas.clone();
     data.users = catalog.users.clone();
+    // The fixtures use a single database, so every collected relation is reachable
+    // through the schema qualifier (`sq_hard_mysql.sq_hard_w6_series`).
+    for schema in &catalog.schemas {
+        data.set_members_for_qualifier_with_kinds(
+            schema,
+            catalog
+                .tables
+                .iter()
+                .map(|table| (table.clone(), Some(QualifiedMemberKind::Table)))
+                .collect(),
+        );
+    }
     for relation in catalog
         .tables
         .iter()
@@ -1632,6 +1699,45 @@ fn oracle_collect_dbms_tf_new_columns(tokens: &[SqlToken]) -> Vec<String> {
     columns
 }
 
+/// `ALTER TABLE t RENAME COLUMN old TO new` introduces a second spelling of the
+/// column into the inferred catalog.
+fn oracle_apply_renamed_columns(tokens: &[SqlToken], catalog: &mut MysqlFamilyScriptCatalog) {
+    let mut idx = 0usize;
+    while idx + 6 < tokens.len() {
+        if !(token_word_eq(tokens.get(idx), "ALTER") && token_word_eq(tokens.get(idx + 1), "TABLE"))
+        {
+            idx += 1;
+            continue;
+        }
+        let Some(table) = token_word_text(tokens.get(idx + 2)) else {
+            idx += 1;
+            continue;
+        };
+        if !(token_word_eq(tokens.get(idx + 3), "RENAME")
+            && token_word_eq(tokens.get(idx + 4), "COLUMN")
+            && token_word_eq(tokens.get(idx + 6), "TO"))
+        {
+            idx += 1;
+            continue;
+        }
+        let (Some(old_name), Some(new_name)) = (
+            token_word_text(tokens.get(idx + 5)),
+            token_word_text(tokens.get(idx + 7)),
+        ) else {
+            idx += 1;
+            continue;
+        };
+        // The overlay is file-scoped: statements before the rename still reference
+        // the old name, so both spellings stay in the catalog.
+        if let Some(columns) = catalog.columns.get_mut(&table.to_ascii_uppercase()) {
+            if columns.iter().any(|column| column.eq_ignore_ascii_case(old_name)) {
+                push_unique_case_insensitive(columns, new_name);
+            }
+        }
+        idx += 8;
+    }
+}
+
 fn oracle_collect_script_catalog_entries(script: &str, catalog: &mut MysqlFamilyScriptCatalog) {
     oracle_collect_script_signatures(script, catalog);
     let tokens = super::query_text::tokenize_sql(script);
@@ -1730,7 +1836,21 @@ fn oracle_collect_script_catalog_entries(script: &str, catalog: &mut MysqlFamily
                 }
             }
             "MATERIALIZED VIEW" => {
-                push_unique_case_insensitive(&mut catalog.materialized_views, &name)
+                push_unique_case_insensitive(&mut catalog.materialized_views, &name);
+                let statement_end = oracle_statement_end(&tokens, after_name_idx);
+                if let Some(as_idx) = tokens
+                    .iter()
+                    .enumerate()
+                    .take(statement_end)
+                    .skip(after_name_idx)
+                    .find_map(|(idx, token)| token_word_eq(Some(token), "AS").then_some(idx))
+                {
+                    let columns =
+                        oracle_view_projection_columns(&tokens[as_idx + 1..statement_end]);
+                    if !columns.is_empty() {
+                        catalog.columns.insert(name.to_ascii_uppercase(), columns);
+                    }
+                }
             }
             "ATTRIBUTE DIMENSION" => {
                 push_unique_case_insensitive(&mut catalog.views, &name);
@@ -2112,6 +2232,9 @@ fn oracle_collect_script_catalog_entries(script: &str, catalog: &mut MysqlFamily
             }
         }
     }
+    oracle_apply_renamed_columns(&tokens, catalog);
+    collect_partition_names(&tokens, &mut catalog.partitions);
+    collect_added_index_names(&tokens, &mut catalog.indexes);
 }
 
 fn oracle_catalog_from_test1_script() -> MysqlFamilyScriptCatalog {
@@ -54389,6 +54512,23 @@ fn intellisense_sweep_is_definition_slot(
             || (previous_word == Some("PARTITION")
                 && statement_has("ALTER")
                 && statement_has("EXCHANGE"))
+            // `PARTITION p0 VALUES LESS THAN (...)` names a partition the
+            // statement is creating.
+            || (previous_word == Some("PARTITION")
+                && next_word
+                    .as_deref()
+                    .is_some_and(|word| word.eq_ignore_ascii_case("VALUES")))
+            // `... MAXVALUE v` binds the flashback row source to a new alias.
+            || (matches!(previous_word, Some("MAXVALUE" | "MINVALUE"))
+                && statement_has("VERSIONS"))
+            // `CREATE CLUSTER c (cluster_key NUMBER)` declares the cluster key.
+            || (statement_has("CREATE")
+                && statement_has("CLUSTER")
+                && statement_text.matches('(').count() > statement_text.matches(')').count())
+            // `RENAME COLUMN old TO new` introduces the new column name.
+            || (previous_word == Some("TO")
+                && statement_has("RENAME")
+                && statement_has("COLUMN"))
             || (matches!(
                 tokens_before_word.last(),
                 Some(SqlToken::Symbol(symbol)) if symbol == "."
@@ -54402,6 +54542,28 @@ fn intellisense_sweep_is_definition_slot(
         {
             return true;
         }
+    }
+
+    // A MySQL block label (`LEAVE wrapper` / `END wrapper`) names the enclosing
+    // labelled block. The completion snapshot for a routine's *inner* statement
+    // does not span that enclosing block, so the label is not reachable from the
+    // slot's analysis window - a property of the window, not a missing source.
+    if matches!(db_type, crate::db::DatabaseType::MySQL | crate::db::DatabaseType::MariaDB) {
+        let previous_upper = tokens_before_word
+            .iter()
+            .rev()
+            .find_map(|token| token_word_text(Some(token)))
+            .map(str::to_ascii_uppercase);
+        if matches!(previous_upper.as_deref(), Some("LEAVE") | Some("ITERATE") | Some("END")) {
+            return true;
+        }
+    }
+
+    // An inquiry directive (`$$my_flag`) names a PL/SQL conditional-compilation
+    // flag that lives in a session setting, not in any catalog, so a user-defined
+    // one cannot be completed from metadata.
+    if original_word.starts_with("$$") {
+        return true;
     }
 
     // A quoted / backtick identifier is a name the author types explicitly, so
@@ -96270,3 +96432,5 @@ fn final_hardcore_completion_gap_regressions_are_covered() {
         "constraint references intentionally suppressed by production completion must be skipped"
     );
 }
+
+

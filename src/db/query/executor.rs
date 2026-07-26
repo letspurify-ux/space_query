@@ -321,12 +321,62 @@ impl QueryExecutor {
         false
     }
 
+    /// Correlation names a trigger body may prefix with `:`. `NEW`, `OLD` and
+    /// `PARENT` are always available; a `REFERENCING NEW AS incoming OLD AS
+    /// existing` header renames them, and the renamed forms are pseudo-records
+    /// too, not bind variables.
+    pub(crate) fn trigger_correlation_names(sql: &str) -> HashSet<String> {
+        let mut correlations: HashSet<String> = ["NEW", "OLD", "PARENT"]
+            .iter()
+            .map(|name| (*name).to_string())
+            .collect();
+
+        let cleaned = Self::strip_leading_comments(sql);
+        let upper = cleaned.to_uppercase();
+        let mut tokens = upper.split_whitespace();
+        while let Some(token) = tokens.next() {
+            // The body cannot rename correlations, so stop before entering it.
+            if matches!(token, "BEGIN" | "DECLARE") {
+                break;
+            }
+            if token != "REFERENCING" {
+                continue;
+            }
+            let mut pending = tokens.next();
+            while let Some(kind) = pending {
+                if !matches!(kind, "NEW" | "OLD" | "PARENT") {
+                    break;
+                }
+                let mut alias = tokens.next();
+                if alias == Some("AS") {
+                    alias = tokens.next();
+                }
+                match alias {
+                    Some(name) => {
+                        correlations.insert(name.to_string());
+                        pending = tokens.next();
+                    }
+                    None => break,
+                }
+            }
+            break;
+        }
+
+        correlations
+    }
+
     pub(crate) fn extract_bind_names(sql: &str) -> Vec<String> {
         let mut names: Vec<String> = Vec::new();
         let mut seen: HashSet<String> = HashSet::new();
 
-        // In CREATE TRIGGER statements, :NEW and :OLD are pseudo-records, not bind variables
+        // In CREATE TRIGGER statements, correlation names such as :NEW and :OLD
+        // are pseudo-records, not bind variables
         let is_trigger = Self::is_create_trigger(sql);
+        let trigger_correlations = if is_trigger {
+            Self::trigger_correlation_names(sql)
+        } else {
+            HashSet::new()
+        };
 
         let mut in_single_quote = false;
         let mut in_double_quote = false;
@@ -527,13 +577,10 @@ impl QueryExecutor {
                         let name = chars[bind_start..j].iter().collect::<String>();
                         let normalized = SessionState::normalize_name(&name);
 
-                        // In CREATE TRIGGER, skip :NEW and :OLD pseudo-records
-                        if is_trigger {
-                            let upper_name = normalized.to_uppercase();
-                            if upper_name == "NEW" || upper_name == "OLD" {
-                                i = j;
-                                continue;
-                            }
+                        // In CREATE TRIGGER, skip correlation-name pseudo-records
+                        if is_trigger && trigger_correlations.contains(&normalized.to_uppercase()) {
+                            i = j;
+                            continue;
                         }
 
                         if seen.insert(normalized.clone()) {
@@ -2287,20 +2334,81 @@ impl QueryExecutor {
     /// Returns `true` when `trimmed` (a single input line) consists entirely of
     /// ORDER BY modifier keywords (DESC, ASC, NULLS FIRST, NULLS LAST) and
     /// therefore must not be misinterpreted as a SQL*Plus tool command.
-    pub(crate) fn is_order_by_modifier_line(trimmed: &str) -> bool {
-        let stripped = trimmed.trim_end_matches(';').trim();
-        if stripped.is_empty() {
-            return false;
+    /// Uppercase code words of one script line, with comments removed and any
+    /// trailing list/terminator punctuation dropped. Keyword-shaped continuation
+    /// lines have to be recognised through comments (`DESC /*n*/`) and through a
+    /// trailing separator (`DESC NULLS LAST,`), so every guard below matches on
+    /// this normalized form instead of on the raw text.
+    fn line_code_words_upper(trimmed: &str) -> Vec<String> {
+        let mut words: Vec<String> = Self::strip_comments(trimmed)
+            .split_whitespace()
+            .map(str::to_ascii_uppercase)
+            .collect();
+        if let Some(last) = words.last_mut() {
+            let cleaned = last.trim_end_matches([',', ';']).to_string();
+            if cleaned.is_empty() {
+                words.pop();
+            } else {
+                *last = cleaned;
+            }
         }
-        let upper = stripped.to_ascii_uppercase();
-        upper == "DESC"
-            || upper == "ASC"
-            || upper == "NULLS FIRST"
-            || upper == "NULLS LAST"
-            || upper == "DESC NULLS FIRST"
-            || upper == "DESC NULLS LAST"
-            || upper == "ASC NULLS FIRST"
-            || upper == "ASC NULLS LAST"
+        words
+    }
+
+    /// `DESC` and `ASC` double as SQL*Plus DESCRIBE, so an ORDER BY continuation
+    /// must never be mistaken for a tool command that cuts the open statement.
+    pub(crate) fn is_order_by_modifier_line(trimmed: &str) -> bool {
+        let words = Self::line_code_words_upper(trimmed);
+        let is_direction = |word: &str| matches!(word, "DESC" | "ASC");
+        let is_nulls_position = |word: &str| matches!(word, "FIRST" | "LAST");
+
+        match words.as_slice() {
+            [direction] => is_direction(direction),
+            [nulls, position] => nulls == "NULLS" && is_nulls_position(position),
+            [direction, nulls, position] => {
+                is_direction(direction) && nulls == "NULLS" && is_nulls_position(position)
+            }
+            _ => false,
+        }
+    }
+
+    /// Table/index DDL bodies start continuation lines with element keywords such
+    /// as `COLUMN`, which is also the SQL*Plus report command. Only meaningful
+    /// while a CREATE/ALTER statement is still open.
+    pub(crate) fn is_ddl_element_continuation_line(trimmed: &str) -> bool {
+        let words = Self::line_code_words_upper(trimmed);
+        words.first().is_some_and(|word| {
+            matches!(
+                word.trim_end_matches('('),
+                "COLUMN"
+                    | "COLUMNS"
+                    | "CONSTRAINT"
+                    | "PRIMARY"
+                    | "UNIQUE"
+                    | "FOREIGN"
+                    | "CHECK"
+                    | "INDEX"
+                    | "KEY"
+                    | "FULLTEXT"
+                    | "SPATIAL"
+                    | "PERIOD"
+                    | "PARTITION"
+                    | "SUBPARTITION"
+            )
+        })
+    }
+
+    /// `USE|IGNORE|FORCE INDEX|KEY (...)` is a MySQL table hint attached to the
+    /// FROM item. Its leading `USE` is also the MySQL client's database-switch
+    /// command, which would otherwise cut the query in half.
+    pub(crate) fn is_mysql_index_hint_line(trimmed: &str) -> bool {
+        let words = Self::line_code_words_upper(trimmed);
+        matches!(
+            words.first().map(String::as_str),
+            Some("USE" | "IGNORE" | "FORCE")
+        ) && words
+            .get(1)
+            .is_some_and(|word| matches!(word.trim_end_matches('('), "INDEX" | "KEY"))
     }
 
     pub(crate) fn should_try_tool_command_with_open_statement(

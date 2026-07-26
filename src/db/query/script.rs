@@ -9237,6 +9237,15 @@ impl QueryExecutor {
             && !builder.current_is_empty()
             && builder.current_has_order_by_context();
 
+        // A DDL element line (`COLUMN c INT`) inside an open CREATE/ALTER, and a
+        // MySQL index hint (`USE INDEX (ix)`) inside any open statement, are SQL
+        // continuations even though both words name a client command.
+        let is_ddl_element_continuation_line = !builder.current_is_empty()
+            && builder.starts_with_table_element_ddl_context()
+            && Self::is_ddl_element_continuation_line(trimmed);
+        let is_mysql_index_hint_line =
+            !builder.current_is_empty() && Self::is_mysql_index_hint_line(trimmed);
+
         // No tool-command-shaped line may cut an open statement that is
         // mid-list. This covers both MySQL `@x` variables and one-letter SQL
         // aliases such as `r`, which otherwise resembles SQL*Plus RUN.
@@ -9253,6 +9262,8 @@ impl QueryExecutor {
             && !is_analyze_compute_clause
             && !mysql_server_statement_line
             && !is_order_by_modifier_line
+            && !is_ddl_element_continuation_line
+            && !is_mysql_index_hint_line
             && !is_list_continuation_line
             && Self::parse_tool_command_if_candidate(trimmed).is_some()
         {
@@ -9272,6 +9283,8 @@ impl QueryExecutor {
             && !is_analyze_compute_clause
             && !mysql_server_statement_line
             && !is_order_by_modifier_line
+            && !is_ddl_element_continuation_line
+            && !is_mysql_index_hint_line
             && !is_list_continuation_line
         {
             if let Some(command) = Self::parse_tool_command_if_candidate(trimmed) {
@@ -9962,12 +9975,17 @@ impl QueryExecutor {
             return Self::parse_show_command(trimmed);
         }
 
-        if upper == "DESC"
-            || upper.starts_with("DESC ")
-            || upper == "DESCRIBE"
-            || upper.starts_with("DESCRIBE ")
-        {
+        if upper == "DESC" || upper == "DESCRIBE" {
             return Some(Self::parse_describe_command(trimmed));
+        }
+
+        if upper.starts_with("DESC ") || upper.starts_with("DESCRIBE ") {
+            // `DESC` doubles as the ORDER BY direction, so a line such as
+            // `DESC /*n*/,` is a sort continuation, not DESCRIBE. Only an
+            // argument that can actually name an object makes it a tool command.
+            if Self::describe_target_names_an_object(trimmed) {
+                return Some(Self::parse_describe_command(trimmed));
+            }
         }
 
         if Self::is_word_command(&upper, "PROMPT") {
@@ -10603,6 +10621,19 @@ impl QueryExecutor {
             "ERRORS" if tokens.len() == 2 => Some(ToolCommand::MysqlShowErrors),
             _ => None,
         }
+    }
+
+    /// True when the argument of `DESC`/`DESCRIBE` can start an object name.
+    /// Comments and punctuation cannot, which is what separates a tool command
+    /// from an ORDER BY continuation line.
+    fn describe_target_names_an_object(raw: &str) -> bool {
+        let mut parts = raw.splitn(2, char::is_whitespace);
+        let _ = parts.next();
+        let target = parts.next().unwrap_or("").trim_start();
+        target
+            .chars()
+            .next()
+            .is_some_and(|ch| ch.is_alphabetic() || ch == '_' || ch == '"' || ch == '`')
     }
 
     fn parse_describe_command(raw: &str) -> ToolCommand {

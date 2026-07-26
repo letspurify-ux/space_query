@@ -18151,3 +18151,156 @@ fn shared_result_message_formatters_match_executor_output() {
         "Executed 1 of 2 statements, 7 row(s) affected | Errors: Statement 2: ORA-00900"
     );
 }
+
+#[test]
+fn test_extract_bind_names_skips_renamed_trigger_correlations() {
+    // REFERENCING renames the pseudo-records; the renamed forms are still not binds.
+    let sql = r#"CREATE OR REPLACE TRIGGER sq_iov_trg
+INSTEAD OF INSERT OR UPDATE ON sq_iov
+REFERENCING NEW AS incoming OLD AS existing
+FOR EACH ROW
+BEGIN
+  INSERT INTO sq_fact (fact_id, qty) VALUES (:incoming.fact_id, :incoming.qty);
+  UPDATE sq_fact SET qty = :incoming.qty WHERE fact_id = :existing.fact_id;
+  :NEW.audited := :audit_user;
+END;"#;
+    let names = QueryExecutor::extract_bind_names(sql);
+    assert_eq!(
+        names.len(),
+        1,
+        "only the real bind should survive, got: {:?}",
+        names
+    );
+    assert!(
+        names.iter().any(|n| n.to_uppercase() == "AUDIT_USER"),
+        "Should contain AUDIT_USER, got: {:?}",
+        names
+    );
+}
+
+#[test]
+fn test_trigger_correlation_names_defaults_without_referencing() {
+    let sql = r#"CREATE OR REPLACE TRIGGER sq_plain_trg
+BEFORE INSERT ON sq_fact
+FOR EACH ROW
+BEGIN
+  :NEW.qty := 1;
+END;"#;
+    let correlations = QueryExecutor::trigger_correlation_names(sql);
+    assert!(correlations.contains("NEW"));
+    assert!(correlations.contains("OLD"));
+    assert!(correlations.contains("PARENT"));
+    assert!(!correlations.contains("QTY"));
+}
+
+#[test]
+fn order_by_direction_with_inline_comment_does_not_split_the_statement() {
+    // `DESC` doubles as SQL*Plus DESCRIBE; a trailing comment must not turn an
+    // ORDER BY continuation into a tool command.
+    let sql = "SELECT a\nFROM t\nORDER BY b /*m*/\n    DESC /*n*/\n    NULLS FIRST;\n\nSELECT 99 FROM dual;\n";
+    let items = QueryExecutor::split_script_items(sql);
+    let stmts = get_statements(&items);
+    assert_eq!(stmts.len(), 2, "unexpected statements: {stmts:?}");
+    assert!(stmts[0].contains("NULLS FIRST"), "got: {}", stmts[0]);
+}
+
+#[test]
+fn describe_tool_command_still_recognised_with_an_object_name() {
+    let sql = "SELECT 1 FROM dual;\nDESC sq_hard_metric\n";
+    let items = QueryExecutor::split_script_items(sql);
+    assert!(
+        items.iter().any(|item| matches!(
+            item,
+            crate::db::ScriptItem::ToolCommand(crate::db::ToolCommand::Describe { name })
+                if name.eq_ignore_ascii_case("sq_hard_metric")
+        )),
+        "DESCRIBE with an object name must stay a tool command: {items:?}"
+    );
+}
+
+#[test]
+fn tool_command_shaped_lines_never_cut_an_open_statement() {
+    // Every one of these continuation lines starts with a word that is also a
+    // client command (SQL*Plus COLUMN/DESCRIBE, MySQL USE); none of them may end
+    // the statement that is still open above it.
+    let cases: &[(&str, &str)] = &[
+        (
+            "alter-add-column",
+            "ALTER TABLE t\n  ADD\n  COLUMN c INT;\n\nSELECT 99 FROM dual;\n",
+        ),
+        (
+            "alter-add-constraint",
+            "ALTER TABLE t\n  ADD\n  CONSTRAINT ck CHECK (a > 0);\n\nSELECT 99 FROM dual;\n",
+        ),
+        (
+            "mysql-index-hint",
+            "SELECT a FROM t\nUSE INDEX (ix)\nWHERE a = 1;\n\nSELECT 99 FROM dual;\n",
+        ),
+        (
+            "order-by-direction-with-separator",
+            "SELECT a FROM t\nORDER BY b\n  DESC NULLS LAST,\n  c;\n\nSELECT 99 FROM dual;\n",
+        ),
+        (
+            "order-by-direction-with-comment",
+            "SELECT a FROM t\nORDER BY b\n  DESC /*n*/,\n  c;\n\nSELECT 99 FROM dual;\n",
+        ),
+    ];
+
+    for (name, sql) in cases {
+        let items = QueryExecutor::split_script_items(sql);
+        let stmts = get_statements(&items);
+        assert_eq!(stmts.len(), 2, "{name} split unexpectedly: {stmts:?}");
+        assert!(
+            stmts[1].contains("SELECT 99"),
+            "{name} lost the following statement: {stmts:?}"
+        );
+    }
+}
+
+#[test]
+fn case_expression_end_does_not_arm_a_loop_from_a_column_alias() {
+    let sql = "SELECT CASE WHEN 1 = 1 THEN 'a' END loop FROM t;\n\nSELECT 99 FROM dual;\n";
+    let items = QueryExecutor::split_script_items(sql);
+    let stmts = get_statements(&items);
+    assert_eq!(stmts.len(), 2, "unexpected statements: {stmts:?}");
+    assert!(stmts[0].contains("END loop FROM t"), "got: {}", stmts[0]);
+}
+
+#[test]
+fn trigger_correlation_names_cover_every_referencing_spelling() {
+    // PARENT (nested-table triggers), a bare alias without AS, and the default
+    // pseudo-records all have to be recognised as correlations, not binds.
+    let sql = r#"CREATE OR REPLACE TRIGGER sq_nested_trg
+INSTEAD OF INSERT ON sq_nested_view
+REFERENCING NEW AS incoming OLD existing PARENT AS owner_row
+FOR EACH ROW
+BEGIN
+  INSERT INTO sq_fact (a, b, c, d)
+  VALUES (:incoming.a, :existing.b, :owner_row.c, :NEW.d);
+  :OLD.e := :PARENT.f;
+  :audit_user := 1;
+END;"#;
+    let names = QueryExecutor::extract_bind_names(sql);
+    assert_eq!(
+        names.len(),
+        1,
+        "only the real bind should survive: {names:?}"
+    );
+    assert!(names.iter().any(|name| name.to_uppercase() == "AUDIT_USER"));
+}
+
+#[test]
+fn mysql_dash_ruler_is_a_comment_not_a_chain_of_minus_operators() {
+    for line in ["--------", "--------   ", "-- ", "----\t"] {
+        assert!(
+            crate::sql_text::is_mysql_dash_comment_start(line.as_bytes(), 0),
+            "{line:?} should open a comment"
+        );
+    }
+    for line in ["---x", "-x", "-"] {
+        assert!(
+            !crate::sql_text::is_mysql_dash_comment_start(line.as_bytes(), 0),
+            "{line:?} must not open a comment"
+        );
+    }
+}

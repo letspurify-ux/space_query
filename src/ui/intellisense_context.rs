@@ -631,7 +631,7 @@ fn token_is_symbol(token: &SqlToken, symbol: &str) -> bool {
 ///
 /// `ADD`/`RENAME TO`/type positions deliberately return `None`: those introduce
 /// new names or expect data types, not existing columns.
-fn ddl_existing_column_target_table(
+pub(crate) fn ddl_existing_column_target_table(
     tokens: &[SqlToken],
     cursor_token_len: usize,
 ) -> Option<String> {
@@ -639,12 +639,29 @@ fn ddl_existing_column_target_table(
     let first = sig.first()?;
 
     if token_is_word(first, "CREATE") {
-        return ddl_create_index_column_target(&sig);
+        return ddl_create_index_column_target(&sig)
+            .or_else(|| ddl_create_table_including_column_target(&sig));
     }
     if token_is_word(first, "ALTER") {
         return ddl_alter_table_column_target(&sig);
     }
     None
+}
+
+/// `CREATE TABLE t (...) ORGANIZATION INDEX ... INCLUDING <col>` names one of the
+/// columns just defined for the table, so the table itself is the column source.
+fn ddl_create_table_including_column_target(sig: &[&SqlToken]) -> Option<String> {
+    if !sig.iter().any(|token| token_is_word(token, "TABLE")) {
+        return None;
+    }
+    if !sig
+        .last()
+        .is_some_and(|token| token_is_word(token, "INCLUDING"))
+    {
+        return None;
+    }
+    let table_idx = sig.iter().position(|token| token_is_word(token, "TABLE"))? + 1;
+    read_dotted_name(sig, table_idx).map(|(table, _)| table)
 }
 
 fn ddl_create_index_column_target(sig: &[&SqlToken]) -> Option<String> {
@@ -1880,8 +1897,12 @@ fn should_keep_waiting_for_insert_target_after_modifier(
     relation_state: Expectation,
     keyword: &str,
 ) -> bool {
-    matches!(statement_kind, StatementKind::Insert)
+    (matches!(statement_kind, StatementKind::Insert)
         && matches!(current_phase, SqlPhase::IntoClause)
+        // `UPDATE LOW_PRIORITY IGNORE t SET ...` puts the same modifiers between
+        // the statement keyword and its target table.
+        || matches!(statement_kind, StatementKind::Update)
+            && matches!(current_phase, SqlPhase::UpdateTarget))
         && relation_state.is_expect_table()
         && is_insert_target_modifier_keyword(keyword)
 }

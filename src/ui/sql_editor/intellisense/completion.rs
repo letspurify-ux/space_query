@@ -668,6 +668,70 @@ const ORACLE_BUILTIN_PACKAGE_MEMBER_PARAMETERS: &[(&str, &[&str])] = &[
     ("DBMS_UTILITY.COMMA_TO_TABLE", &["list", "tablen", "tab"]),
 ];
 
+/// Oracle-supplied PL/SQL object types. Their members are reachable both through
+/// the type name (`JSON_OBJECT_T.parse(...)`, `SYS.ANYDATA.convertNumber(...)`)
+/// and through a variable declared with the type (`doc.get_Array(...)`), so the
+/// same table feeds the qualifier path and the local-symbol path.
+pub(crate) const ORACLE_BUILTIN_OBJECT_TYPE_MEMBERS: &[(&str, &[&str])] = &[
+    (
+        "JSON_OBJECT_T",
+        &[
+            "parse", "get", "get_String", "get_Number", "get_Boolean", "get_Date",
+            "get_Timestamp", "get_Clob", "get_Blob", "get_Object", "get_Array", "get_Keys",
+            "get_Size", "get_Type", "has", "is_Object", "is_Array", "is_Scalar", "is_String",
+            "is_Number", "is_Boolean", "is_Null", "is_Date", "is_Timestamp", "put", "put_Null",
+            "remove", "rename_Key", "clone", "stringify", "to_String", "to_Clob", "to_Blob",
+            "on_Error",
+        ],
+    ),
+    (
+        "JSON_ARRAY_T",
+        &[
+            "parse", "get", "get_String", "get_Number", "get_Boolean", "get_Date",
+            "get_Timestamp", "get_Clob", "get_Blob", "get_Object", "get_Array", "get_Size",
+            "get_Type", "append", "append_Null", "put", "put_Null", "remove", "clone",
+            "stringify", "to_String", "to_Clob", "to_Blob", "on_Error",
+        ],
+    ),
+    (
+        "JSON_ELEMENT_T",
+        &[
+            "parse", "get_Size", "get_Type", "is_Object", "is_Array", "is_Scalar", "is_String",
+            "is_Number", "is_Boolean", "is_Null", "is_Date", "is_Timestamp", "clone", "stringify",
+            "to_String", "to_Clob", "to_Blob", "to_Number", "to_Boolean", "to_Date", "on_Error",
+        ],
+    ),
+    (
+        "JSON_SCALAR_T",
+        &["parse", "get_Type", "stringify", "to_String", "to_Number", "to_Boolean", "to_Date"],
+    ),
+    (
+        "XMLTYPE",
+        &[
+            "createXML", "createSchemaBasedXML", "createNonSchemaBasedXML", "existsNode",
+            "extract", "getClobVal", "getStringVal", "getNumberVal", "getBlobVal",
+            "getRootElement", "getNamespace", "isFragment", "isSchemaBased", "isSchemaValid",
+            "schemaValidate", "toObject", "transform", "appendChildXML", "insertChildXML",
+            "deleteXML",
+        ],
+    ),
+    (
+        "ANYDATA",
+        &[
+            "convertNumber", "convertVarchar2", "convertChar", "convertDate", "convertTimestamp",
+            "convertClob", "convertBlob", "convertRaw", "convertObject", "convertCollection",
+            "getTypeName", "getNumber", "getVarchar2", "getChar", "getDate", "getTimestamp",
+            "getClob", "getBlob", "getRaw", "getObject", "getCollection", "getType",
+            "beginCreate", "endCreate", "piecewise", "setNumber", "setVarchar2",
+        ],
+    ),
+    (
+        "ANYTYPE",
+        &["beginCreate", "endCreate", "setInfo", "addAttr", "getPersistent", "getInfo",
+          "getAttrElemInfo"],
+    ),
+];
+
 const ORACLE_BUILTIN_PACKAGE_MEMBERS: &[(&str, &[&str])] = &[
     (
         "DBMS_DB_VERSION",
@@ -688,6 +752,21 @@ const ORACLE_BUILTIN_PACKAGE_MEMBERS: &[(&str, &[&str])] = &[
             "VER_LE_12_2",
             "VER_LE_18",
             "VER_LE_19",
+        ],
+    ),
+    (
+        // Owner of the supplied object types, so `SYS.|` offers them.
+        "SYS",
+        &[
+            "ANYDATA",
+            "ANYDATASET",
+            "ANYTYPE",
+            "JSON_ARRAY_T",
+            "JSON_ELEMENT_T",
+            "JSON_KEY_LIST",
+            "JSON_OBJECT_T",
+            "JSON_SCALAR_T",
+            "XMLTYPE",
         ],
     ),
     (
@@ -1294,6 +1373,7 @@ enum ExpectedObjectSuggestionKind {
     Trigger,
     Event,
     Index,
+    Partition,
     Procedure,
     Function,
     Package,
@@ -1755,6 +1835,14 @@ fn oracle_data_type_keywords(position: DataTypePosition) -> &'static [&'static s
         "NUMERIC",
         "REAL",
         "SYS_REFCURSOR",
+        // Oracle-supplied object types are legal PL/SQL variable types.
+        "ANYDATA",
+        "ANYTYPE",
+        "JSON_ARRAY_T",
+        "JSON_ELEMENT_T",
+        "JSON_KEY_LIST",
+        "JSON_OBJECT_T",
+        "JSON_SCALAR_T",
     ];
     const ORACLE_TOOL_VARIABLE_TYPES: &[&str] = &[
         "REFCURSOR",
@@ -3426,6 +3514,13 @@ impl SqlEditorWidget {
                     qualifier,
                     &snapshot.prefix,
                 )
+                .or_else(|| {
+                    Self::oracle_script_package_member_suggestions(
+                        &snapshot.signature_scan_text,
+                        qualifier,
+                        &snapshot.prefix,
+                    )
+                })
             })
             .flatten()
         });
@@ -3869,6 +3964,30 @@ impl SqlEditorWidget {
             );
             Self::table_clause_construct_is_open(tokens, end, "MATCH_RECOGNIZE")
         };
+        // A DDL column-name slot that is still being typed (`ALTER TABLE t MODIFY
+        // bb|`, `... ) ORGANIZATION INDEX INCLUDING iot|`) keeps the half-typed
+        // word in the context tokens, so the slot has to be re-asked with that
+        // word excluded before the target table's columns can be offered.
+        let early_ddl_target_column_suggestions = if qualifier.is_none()
+            && !snapshot.prefix.is_empty()
+            && !matches!(
+                deep_ctx.phase,
+                intellisense_context::SqlPhase::DdlColumnList
+            ) {
+            let tokens = deep_ctx.statement_tokens.as_ref();
+            let trimmed_end =
+                Self::expected_suggestion_context_end(tokens, deep_ctx.cursor_token_len, true);
+            intellisense_context::ddl_existing_column_target_table(tokens, trimmed_end)
+                .map(|table| {
+                    let mut data = intellisense_data
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    data.get_column_suggestions(&snapshot.prefix, Some(&[table]))
+                })
+                .unwrap_or_default()
+        } else {
+            Vec::new()
+        };
         let early_unqualified_visible_column_suggestions = if qualifier.is_none()
             && (matches!(
                 deep_ctx.phase,
@@ -4011,7 +4130,18 @@ impl SqlEditorWidget {
                     Some(snapshot.preferred_db_type),
                 )
             {
-                for pseudo in ["ROWID", "ORA_ROWSCN"] {
+                for pseudo in [
+                    "ROWID",
+                    "ORA_ROWSCN",
+                    // A `VERSIONS BETWEEN ...` row source also exposes the
+                    // flashback version pseudo-columns through its alias.
+                    "VERSIONS_STARTSCN",
+                    "VERSIONS_STARTTIME",
+                    "VERSIONS_ENDSCN",
+                    "VERSIONS_ENDTIME",
+                    "VERSIONS_XID",
+                    "VERSIONS_OPERATION",
+                ] {
                     if crate::ui::intellisense::suggestion_matches_completion_prefix(
                         pseudo,
                         &snapshot.prefix,
@@ -4824,12 +4954,23 @@ impl SqlEditorWidget {
                 "",
                 Some(snapshot.preferred_db_type),
             ) {
-                Self::plsql_cursor_parameter_suggestions_from_statement_text(
-                    expanded_statement_text,
-                    cursor_in_statement,
-                    &snapshot.prefix,
-                    Some(snapshot.preferred_db_type),
-                )
+                let call_parameters =
+                    Self::plsql_cursor_call_parameter_suggestions_from_statement_text(
+                        expanded_statement_text,
+                        cursor_in_statement,
+                        &snapshot.prefix,
+                        Some(snapshot.preferred_db_type),
+                    );
+                if !call_parameters.is_empty() {
+                    call_parameters
+                } else {
+                    Self::plsql_cursor_parameter_suggestions_from_statement_text(
+                        expanded_statement_text,
+                        cursor_in_statement,
+                        &snapshot.prefix,
+                        Some(snapshot.preferred_db_type),
+                    )
+                }
             } else {
                 Vec::new()
             }
@@ -5937,6 +6078,15 @@ impl SqlEditorWidget {
             Self::merge_suggestions_with_context_aliases(
                 suggestions,
                 early_unqualified_visible_column_suggestions,
+                true,
+            )
+        };
+        let suggestions = if early_ddl_target_column_suggestions.is_empty() {
+            suggestions
+        } else {
+            Self::merge_suggestions_with_context_aliases(
+                suggestions,
+                early_ddl_target_column_suggestions,
                 true,
             )
         };
@@ -7231,6 +7381,7 @@ impl SqlEditorWidget {
                         | "WITH"
                         | "WITHIN"
                         | "$ELSE"
+                        | "$ELSIF"
                         | "$END"
                         | "$IF"
                         | "$THEN"
@@ -11261,6 +11412,12 @@ impl SqlEditorWidget {
             "ROWNUM",
             "ROWID",
             "ORA_ROWSCN",
+            "VERSIONS_STARTSCN",
+            "VERSIONS_STARTTIME",
+            "VERSIONS_ENDSCN",
+            "VERSIONS_ENDTIME",
+            "VERSIONS_XID",
+            "VERSIONS_OPERATION",
             "MULTISET",
             "BINARY",
         ];
@@ -14553,7 +14710,19 @@ impl SqlEditorWidget {
                     }
                 }
                 SqlToken::Word(word) if depth == 0 && word.eq_ignore_ascii_case("UPDATE") => {
-                    let table_start = Self::next_non_comment_token_index(tokens, idx + 1)?;
+                    let mut table_start = Self::next_non_comment_token_index(tokens, idx + 1)?;
+                    // `UPDATE LOW_PRIORITY IGNORE t SET ...`: the MySQL modifiers sit
+                    // between the keyword and the target table.
+                    while matches!(
+                        tokens.get(table_start),
+                        Some(SqlToken::Word(modifier))
+                            if matches!(
+                                modifier.to_ascii_uppercase().as_str(),
+                                "LOW_PRIORITY" | "IGNORE"
+                            )
+                    ) {
+                        table_start = Self::next_non_comment_token_index(tokens, table_start + 1)?;
+                    }
                     if matches!(
                         tokens.get(table_start),
                         Some(SqlToken::Word(next_word)) if next_word.eq_ignore_ascii_case("SET")
@@ -40380,6 +40549,93 @@ impl SqlEditorWidget {
         suggestions
     }
 
+    /// Parameter names of the cursor being opened, for the named-notation
+    /// arguments of `OPEN c(1, p_floor => 18)`. The declaration-side helper below
+    /// only serves the cursor's own query body.
+    fn plsql_cursor_call_parameter_suggestions_from_statement_text(
+        statement_text: &str,
+        cursor_in_statement: usize,
+        prefix: &str,
+        db_type: Option<crate::db::DatabaseType>,
+    ) -> Vec<String> {
+        if crate::sql_text::mysql_compatibility_for_sql("", db_type) {
+            return Vec::new();
+        }
+
+        let cursor = cursor_in_statement.min(statement_text.len());
+        let spans = super::query_text::tokenize_sql_spanned(statement_text);
+        let tokens: Vec<SqlToken> = spans.iter().map(|span| span.token.clone()).collect();
+        let token_ends: Vec<usize> = spans.iter().map(|span| span.end).collect();
+        let end = token_ends.partition_point(|token_end| *token_end <= cursor);
+
+        // Innermost still-open `(` before the cursor.
+        let mut open_stack: Vec<usize> = Vec::new();
+        for (idx, token) in tokens.iter().enumerate().take(end) {
+            match token {
+                SqlToken::Symbol(symbol) if symbol == "(" => open_stack.push(idx),
+                SqlToken::Symbol(symbol) if symbol == ")" => {
+                    let _ = open_stack.pop();
+                }
+                _ => {}
+            }
+        }
+        let Some(open_idx) = open_stack.last().copied() else {
+            return Vec::new();
+        };
+        let Some(name_idx) = Self::previous_non_comment_token_index(&tokens, open_idx) else {
+            return Vec::new();
+        };
+        let Some(SqlToken::Word(cursor_name)) = tokens.get(name_idx) else {
+            return Vec::new();
+        };
+        let Some(open_keyword_idx) = Self::previous_non_comment_token_index(&tokens, name_idx)
+        else {
+            return Vec::new();
+        };
+        if !matches!(tokens.get(open_keyword_idx), Some(SqlToken::Word(word)) if word.eq_ignore_ascii_case("OPEN"))
+        {
+            return Vec::new();
+        }
+
+        // The matching declaration's parameter list.
+        let prefix_upper = prefix.to_ascii_uppercase();
+        let mut suggestions = Vec::new();
+        let mut seen = HashSet::new();
+        for idx in 0..tokens.len() {
+            if !matches!(tokens.get(idx), Some(SqlToken::Word(word)) if word.eq_ignore_ascii_case("CURSOR"))
+            {
+                continue;
+            }
+            let Some(declared_idx) = Self::next_non_comment_token_index(&tokens, idx + 1) else {
+                continue;
+            };
+            if !matches!(tokens.get(declared_idx), Some(SqlToken::Word(word)) if word.eq_ignore_ascii_case(cursor_name))
+            {
+                continue;
+            }
+            let Some(decl_open_idx) = Self::next_non_comment_token_index(&tokens, declared_idx + 1)
+            else {
+                continue;
+            };
+            let Some(decl_close_idx) =
+                Self::matching_symbol_token_index(&tokens, decl_open_idx, "(", ")")
+            else {
+                continue;
+            };
+            Self::append_plsql_cursor_parameter_suggestions(
+                &tokens,
+                decl_open_idx + 1,
+                decl_close_idx,
+                &prefix_upper,
+                &mut suggestions,
+                &mut seen,
+            );
+            break;
+        }
+
+        suggestions
+    }
+
     fn plsql_cursor_parameter_suggestions_from_statement_text(
         statement_text: &str,
         cursor_in_statement: usize,
@@ -41790,6 +42046,31 @@ impl SqlEditorWidget {
         if matches!(last, Some("BEGIN" | "DO" | "ELSE" | "THEN" | "LOOP" | "REPEAT")) {
             return Some(STATEMENT_START);
         }
+
+        // `[RE]SIGNAL ... SET <item> = <value>[, ...]` can be the whole body of an
+        // inline handler declaration, so the item slot has to be recognised before
+        // the DECLARE/HANDLER arms below claim the statement.
+        if let Some(signal_idx) = words
+            .iter()
+            .rposition(|word| matches!(word.as_str(), "SIGNAL" | "RESIGNAL"))
+        {
+            let tail = &words[signal_idx.saturating_add(1)..];
+            // `SET` has to belong to this SIGNAL, not to a later statement.
+            let set_idx = tail
+                .iter()
+                .position(|word| word == "SET")
+                .filter(|_| !tail.iter().any(|word| word == "END" || word == "BEGIN"));
+            if let Some(set_idx) = set_idx {
+                let after_set = &tail[set_idx.saturating_add(1)..];
+                let awaits_assignment = after_set
+                    .last()
+                    .is_some_and(|word| CONDITION_ITEMS.contains(&word.as_str()));
+                if !awaits_assignment {
+                    return Some(CONDITION_ITEMS);
+                }
+            }
+        }
+
 
         if let Some(declare_idx) = words.iter().rposition(|word| word == "DECLARE") {
             let declare_tail = &words[declare_idx + 1..];
@@ -43625,8 +43906,29 @@ impl SqlEditorWidget {
         let first = words.first().map(String::as_str)?;
         let last = words.last().map(String::as_str);
         let has = |keyword: &str| words.iter().any(|word| word == keyword);
-        const MYSQL_ALTER_TABLE_ACTION_KEYWORDS: &[&str] =
-            &["ADD", "ALTER", "CHANGE", "DROP", "MODIFY", "RENAME"];
+        const MYSQL_ALTER_TABLE_ACTION_KEYWORDS: &[&str] = &[
+            "ADD",
+            "ALTER",
+            "ANALYZE",
+            "CHANGE",
+            "CHECK",
+            "COALESCE",
+            "CONVERT",
+            "DISABLE",
+            "DROP",
+            "ENABLE",
+            "ENGINE",
+            "EXCHANGE",
+            "MODIFY",
+            "OPTIMIZE",
+            "ORDER",
+            "REBUILD",
+            "REMOVE",
+            "RENAME",
+            "REORGANIZE",
+            "REPAIR",
+            "TRUNCATE",
+        ];
         const MYSQL_CREATE_EVENT_TAIL_KEYWORDS: &[&str] =
             &["COMMENT", "DISABLE", "DO", "ENABLE", "ENDS", "ON", "STARTS"];
         const MYSQL_CREATE_EVENT_TAIL_AFTER_STARTS: &[&str] =
@@ -43714,6 +44016,30 @@ impl SqlEditorWidget {
                 })
                 .collect::<Vec<_>>();
             if table_tail_words.is_empty() {
+                // Table options are only grammatical before a definition when the
+                // statement is visibly a CTAS/copy (`CREATE TABLE t ENGINE = InnoDB
+                // AS SELECT ...`); with nothing after the name the slot still wants
+                // the definition itself.
+                let continues_as_ctas = tokens.iter().skip(end).any(|token| {
+                    matches!(token, SqlToken::Word(word)
+                        if word.eq_ignore_ascii_case("AS")
+                            || word.eq_ignore_ascii_case("SELECT")
+                            || word.eq_ignore_ascii_case("LIKE"))
+                });
+                if continues_as_ctas {
+                    return Some(&[
+                        "LIKE",
+                        "AS",
+                        "ENGINE",
+                        "DEFAULT CHARSET",
+                        "CHARACTER SET",
+                        "COLLATE",
+                        "AUTO_INCREMENT",
+                        "COMMENT",
+                        "ROW_FORMAT",
+                        "PARTITION BY",
+                    ]);
+                }
                 return Some(&["LIKE", "AS"]);
             }
             if table_tail_words
@@ -43725,10 +44051,24 @@ impl SqlEditorWidget {
             match table_tail_words.as_slice() {
                 [word] if word == "LIKE" => return None,
                 [word] if word == "AS" => return Some(&["SELECT", "WITH"]),
+                // `LIKE emp` / `LIKE scott.emp` completes the copy source; nothing
+                // else may follow it.
+                [word, ..] if word == "LIKE" => return Some(&[]),
                 _ => {}
             }
+            let mut ctas_without_column_list = false;
             if !Self::tail_has_closed_top_level_paren(&table_tail) {
-                return Some(&[]);
+                // `CREATE TABLE t ENGINE = InnoDB AS SELECT ...` and
+                // `CREATE TABLE t LIKE other` carry no column list at all, so the
+                // option tail starts right after the table name. Only an *open*
+                // column list suppresses the option keywords.
+                if table_tail
+                    .iter()
+                    .any(|token| matches!(token, SqlToken::Symbol(symbol) if symbol == "("))
+                {
+                    return Some(&[]);
+                }
+                ctas_without_column_list = true;
             }
             if table_tail_words.last().map(String::as_str) == Some("DEFAULT") {
                 return Some(&["CHARACTER SET", "CHARSET", "COLLATE"]);
@@ -43748,15 +44088,31 @@ impl SqlEditorWidget {
             }) {
                 return Some(MYSQL_STORAGE_ENGINES);
             }
-            return Some(&[
-                "ENGINE",
-                "DEFAULT CHARSET",
-                "CHARACTER SET",
-                "COLLATE",
-                "AUTO_INCREMENT",
-                "COMMENT",
-                "ROW_FORMAT",
-            ]);
+            // Without a column list the statement still has to reach its source,
+            // so `AS`/`LIKE` stay available beside the options.
+            return Some(if ctas_without_column_list {
+                &[
+                    "ENGINE",
+                    "DEFAULT CHARSET",
+                    "CHARACTER SET",
+                    "COLLATE",
+                    "AUTO_INCREMENT",
+                    "COMMENT",
+                    "ROW_FORMAT",
+                    "AS",
+                    "LIKE",
+                ]
+            } else {
+                &[
+                    "ENGINE",
+                    "DEFAULT CHARSET",
+                    "CHARACTER SET",
+                    "COLLATE",
+                    "AUTO_INCREMENT",
+                    "COMMENT",
+                    "ROW_FORMAT",
+                ]
+            });
         }
         if first == "CREATE" && has("INDEX") {
             let mariadb = completion_db_type_is_mariadb(db_type);
@@ -44004,8 +44360,65 @@ impl SqlEditorWidget {
                     // renamable element, never the standalone `RENAME TABLE/USER`.
                     return Some(&["TO", "AS", "COLUMN", "INDEX", "KEY"]);
                 }
+                [action] if Self::is_mysql_alter_table_partition_action(action) => {
+                    return Some(&["PARTITION"]);
+                }
+                [action] if action == "CONVERT" => return Some(&["TO"]),
+                [action, to] if action == "CONVERT" && to == "TO" => {
+                    return Some(&["CHARACTER SET"]);
+                }
+                [action, to, character]
+                    if action == "CONVERT" && to == "TO" && character == "CHARACTER" =>
+                {
+                    return Some(&["SET"]);
+                }
+                [action] if action == "ORDER" => return Some(&["BY"]),
+                [action] if matches!(action.as_str(), "DISABLE" | "ENABLE") => {
+                    return Some(&["KEYS"]);
+                }
+                [action] if action == "REMOVE" => return Some(&["PARTITIONING"]),
                 _ => {}
             }
+
+            // `ADD INDEX ix (c) USING |` picks an index algorithm; the same tail
+            // right after the column list offers the index options themselves.
+            if matches!(alter_table_tail_words.last().map(String::as_str), Some("USING")) {
+                return Some(&["BTREE", "HASH"]);
+            }
+            if matches!(
+                alter_table_tail_words.first().map(String::as_str),
+                Some("ADD")
+            ) && alter_table_tail_words
+                .get(1)
+                .is_some_and(|word| matches!(word.as_str(), "INDEX" | "KEY"))
+                && alter_table_tail_words.len() >= 3
+                && !alter_table_tail_words.iter().any(|word| {
+                    matches!(
+                        word.as_str(),
+                        "USING" | "COMMENT" | "INVISIBLE" | "VISIBLE" | "KEY_BLOCK_SIZE" | "PARSER"
+                    )
+                })
+                // The index column list is still open while the cursor sits in it.
+                && Self::innermost_open_paren_preceding_word(tokens, end).is_none()
+            {
+                return Some(&[
+                    "USING",
+                    "COMMENT",
+                    "INVISIBLE",
+                    "VISIBLE",
+                    "KEY_BLOCK_SIZE",
+                    "WITH PARSER",
+                ]);
+            }
+
+            // `REORGANIZE PARTITION p0, p1 |` is followed by the replacement list.
+            if matches!(alter_table_tail_words.first().map(String::as_str), Some("REORGANIZE"))
+                && alter_table_tail_words.len() >= 3
+                && !alter_table_tail_words.iter().any(|word| word == "INTO")
+            {
+                return Some(&["INTO"]);
+            }
+
         }
         let routine_kind_idx = words
             .iter()
@@ -45968,6 +46381,22 @@ impl SqlEditorWidget {
         false
     }
 
+    /// Actions whose object is a partition (`ALTER TABLE t TRUNCATE PARTITION p`).
+    fn is_mysql_alter_table_partition_action(word: &str) -> bool {
+        matches!(
+            word,
+            "ANALYZE"
+                | "CHECK"
+                | "COALESCE"
+                | "EXCHANGE"
+                | "OPTIMIZE"
+                | "REBUILD"
+                | "REORGANIZE"
+                | "REPAIR"
+                | "TRUNCATE"
+        )
+    }
+
     fn alter_table_tail_words_after_target(tokens: &[SqlToken], end: usize) -> Option<Vec<String>> {
         let toks = Self::meaningful_tokens_before(tokens, end);
         if !matches!(toks.first(), Some(SqlToken::Word(word)) if word.eq_ignore_ascii_case("ALTER"))
@@ -45995,7 +46424,18 @@ impl SqlEditorWidget {
             match token {
                 SqlToken::Symbol(sym) if sym == "(" || sym == "[" => depth += 1,
                 SqlToken::Symbol(sym) if sym == ")" || sym == "]" => depth = (depth - 1).max(0),
-                SqlToken::Symbol(sym) if depth == 0 && sym == "," => words.clear(),
+                SqlToken::Symbol(sym) if depth == 0 && sym == "," => {
+                    // `REORGANIZE PARTITION p0, p1 INTO (...)` keeps one action across
+                    // the comma; only a real action separator resets the tail.
+                    let continues_partition_list = words
+                        .first()
+                        .map(String::as_str)
+                        .is_some_and(Self::is_mysql_alter_table_partition_action)
+                        && words.iter().any(|word| word == "PARTITION");
+                    if !continues_partition_list {
+                        words.clear();
+                    }
+                }
                 SqlToken::Word(word) => words.push(word.to_ascii_uppercase()),
                 _ => {}
             }
@@ -46176,6 +46616,15 @@ impl SqlEditorWidget {
         }
 
         let starts_with = |kw: &str| word_upper(0).as_deref() == Some(kw);
+
+        // `CREATE CLUSTER c (cluster_key |` - the cluster key is declared with a
+        // data type exactly like a column.
+        if starts_with("CREATE")
+            && any_word("CLUSTER")
+            && (is_symbol(last - 1, "(") || is_symbol(last - 1, ","))
+        {
+            return true;
+        }
 
         if starts_with("ALTER") && any_word("TABLE") {
             // `ADD col |`, `MODIFY col |`, `ADD|MODIFY|CHANGE COLUMN col |`,
@@ -49178,6 +49627,45 @@ impl SqlEditorWidget {
             "CURSOR_NAME",
         ];
 
+        let signal_items: Vec<String> = Self::meaningful_tokens_before(tokens, end)
+            .into_iter()
+            .filter_map(|token| match token {
+                SqlToken::Word(word) => Some(word.to_ascii_uppercase()),
+                SqlToken::String(_) => Some("__VALUE__".to_string()),
+                SqlToken::Symbol(sym) if matches!(sym.as_str(), "," | "=" | ";") => {
+                    Some(sym.clone())
+                }
+                SqlToken::Symbol(_) | SqlToken::Comment(_) => None,
+            })
+            .collect();
+        let expected_signal_condition_item_candidates =
+            |items: &[String]| -> Option<&'static [&'static str]> {
+                let signal_idx = items
+                    .iter()
+                    .rposition(|item| matches!(item.as_str(), "SIGNAL" | "RESIGNAL"))?;
+                let tail = &items[signal_idx + 1..];
+                // The SIGNAL must still be the statement the cursor is in: a
+                // terminator in between means an unrelated later statement.
+                if tail.iter().any(|item| item == ";") {
+                    return None;
+                }
+                let set_idx = tail.iter().position(|item| item == "SET")?;
+                let after_set = &tail[set_idx + 1..];
+                let segment_start = after_set
+                    .iter()
+                    .rposition(|item| item == ",")
+                    .map_or(0, |idx| idx + 1);
+                let segment = &after_set[segment_start..];
+                if segment.is_empty()
+                    || (segment.len() == 1 && segment.first().map(String::as_str) != Some("="))
+                {
+                    return Some(MYSQL_SIGNAL_CONDITION_ITEMS);
+                }
+                None
+            };
+        if let Some(candidates) = expected_signal_condition_item_candidates(&signal_items) {
+            return Some(candidates);
+        }
         if let Some(candidates) =
             Self::expected_mysql_routine_parameter_mode_keyword_candidates(tokens, end, db_type)
         {
@@ -49340,38 +49828,6 @@ impl SqlEditorWidget {
             return Some(candidates);
         }
 
-        let signal_items: Vec<String> = Self::meaningful_tokens_before(tokens, end)
-            .into_iter()
-            .filter_map(|token| match token {
-                SqlToken::Word(word) => Some(word.to_ascii_uppercase()),
-                SqlToken::String(_) => Some("__VALUE__".to_string()),
-                SqlToken::Symbol(sym) if matches!(sym.as_str(), "," | "=") => Some(sym.clone()),
-                SqlToken::Symbol(_) | SqlToken::Comment(_) => None,
-            })
-            .collect();
-        let expected_signal_condition_item_candidates =
-            |items: &[String]| -> Option<&'static [&'static str]> {
-                let signal_idx = items
-                    .iter()
-                    .rposition(|item| matches!(item.as_str(), "SIGNAL" | "RESIGNAL"))?;
-                let tail = &items[signal_idx + 1..];
-                let set_idx = tail.iter().position(|item| item == "SET")?;
-                let after_set = &tail[set_idx + 1..];
-                let segment_start = after_set
-                    .iter()
-                    .rposition(|item| item == ",")
-                    .map_or(0, |idx| idx + 1);
-                let segment = &after_set[segment_start..];
-                if segment.is_empty()
-                    || (segment.len() == 1 && segment.first().map(String::as_str) != Some("="))
-                {
-                    return Some(MYSQL_SIGNAL_CONDITION_ITEMS);
-                }
-                None
-            };
-        if let Some(candidates) = expected_signal_condition_item_candidates(&signal_items) {
-            return Some(candidates);
-        }
 
         let srs_items: Vec<String> = Self::meaningful_tokens_before(tokens, end)
             .into_iter()
@@ -57513,6 +57969,34 @@ impl SqlEditorWidget {
             }
         }
 
+        // `ALTER TABLE t TRUNCATE PARTITION p`, `... REORGANIZE PARTITION a, b INTO`
+        // and `SELECT ... FROM t PARTITION (p)` all name existing partitions.
+        if Self::cursor_is_at_partition_name_slot(tokens, context_end) {
+            return Some(ExpectedObjectSuggestionKind::Partition);
+        }
+
+        // `GRANT <role> TO <user>` (MySQL/MariaDB): the slot right after GRANT can
+        // name a role as well as a privilege keyword.
+        if crate::sql_text::mysql_compatibility_for_sql("", db_type)
+            && matches!(words.last().map(String::as_str), Some("GRANT"))
+            // `GRANT <priv> ON ...` is the privilege form; only the role form
+            // (`GRANT <role> TO <user>`) names an object here.
+            && !tokens.iter().skip(context_end).any(|token| {
+                matches!(token, SqlToken::Word(word) if word.eq_ignore_ascii_case("ON"))
+            })
+        {
+            return Some(ExpectedObjectSuggestionKind::User);
+        }
+
+        // `CREATE TRIGGER ... FOLLOWS|PRECEDES <other_trigger>` orders this trigger
+        // against an existing one, wherever the clause sits in the header.
+        if matches!(
+            words.last().map(String::as_str),
+            Some("FOLLOWS") | Some("PRECEDES")
+        ) {
+            return Some(ExpectedObjectSuggestionKind::Trigger);
+        }
+
         if Self::cursor_has_statement_start_anchor(
             tokens,
             context_end,
@@ -57758,6 +58242,11 @@ impl SqlEditorWidget {
             }
             [.., prev, last] if *prev == "ALTER" && *last == "TRIGGER" => {
                 Some(oracle_only_kind(ExpectedObjectSuggestionKind::Trigger))
+            }
+            // `CREATE TRIGGER ... FOLLOWS|PRECEDES <other_trigger>` orders this
+            // trigger against an existing one.
+            [.., last] if matches!(last.as_str(), "FOLLOWS" | "PRECEDES") => {
+                Some(ExpectedObjectSuggestionKind::Trigger)
             }
             [.., prev, last] if *prev == "DROP" && *last == "TRIGGER" => {
                 Some(ExpectedObjectSuggestionKind::Trigger)
@@ -59253,6 +59742,75 @@ impl SqlEditorWidget {
         None
     }
 
+    /// True at a slot that names an existing partition: directly after
+    /// `PARTITION`/`SUBPARTITION`, or after a comma continuing such a list.
+    /// The definition form (`PARTITION p VALUES ...`) is excluded by the caller's
+    /// definition-slot handling, which never reaches an object suggestion kind.
+    /// A word that any supported dialect treats as a keyword. Used where a slot
+    /// must tell a user-supplied name apart from grammar, independently of which
+    /// database the statement targets.
+    fn word_is_any_sql_keyword(word: &str) -> bool {
+        let upper = word.to_ascii_uppercase();
+        crate::sql_text::is_oracle_sql_keyword(&upper) || crate::sql_text::is_mysql_sql_keyword(word)
+    }
+
+    fn cursor_is_at_partition_name_slot(tokens: &[SqlToken], end: usize) -> bool {
+        let Some(previous_idx) = Self::previous_non_comment_token_index(tokens, end) else {
+            return false;
+        };
+        // Only two shapes name an existing partition: a maintenance action inside
+        // `ALTER TABLE`, and the `t PARTITION (p)` row-source selection. Analytic
+        // and MODEL `PARTITION BY` clauses, and the `(PARTITION ...` head of
+        // MATCH_RECOGNIZE, all introduce grouping expressions instead.
+        let inside_alter_table = matches!(
+            tokens.first(),
+            Some(SqlToken::Word(word)) if word.eq_ignore_ascii_case("ALTER")
+        );
+        // A bare `PARTITION <name>` is a maintenance action; the row-source
+        // selection always parenthesises its list (`t PARTITION (p)`).
+        let partition_keyword_names_an_object = |keyword_idx: usize, parenthesized: bool| {
+            if inside_alter_table {
+                return true;
+            }
+            if !parenthesized {
+                return false;
+            }
+            Self::previous_non_comment_token_index(tokens, keyword_idx).is_some_and(|idx| {
+                matches!(tokens.get(idx), Some(SqlToken::Word(word))
+                    if !Self::word_is_any_sql_keyword(word))
+            })
+        };
+        match tokens.get(previous_idx) {
+            Some(SqlToken::Word(word))
+                if word.eq_ignore_ascii_case("PARTITION")
+                    || word.eq_ignore_ascii_case("SUBPARTITION") =>
+            {
+                partition_keyword_names_an_object(previous_idx, false)
+            }
+            Some(SqlToken::Symbol(symbol)) if symbol == "," || symbol == "(" => {
+                let mut scan_end = previous_idx;
+                while let Some(idx) = Self::previous_non_comment_token_index(tokens, scan_end) {
+                    match tokens.get(idx) {
+                        Some(SqlToken::Word(word))
+                            if word.eq_ignore_ascii_case("PARTITION")
+                                || word.eq_ignore_ascii_case("SUBPARTITION") =>
+                        {
+                            return partition_keyword_names_an_object(idx, true);
+                        }
+                        Some(SqlToken::Symbol(symbol)) if symbol == "," => {}
+                        // Earlier names in the same list (`PARTITION p0, p1|`).
+                        Some(SqlToken::Word(word))
+                            if !Self::word_is_any_sql_keyword(word) => {}
+                        _ => return false,
+                    }
+                    scan_end = idx;
+                }
+                false
+            }
+            _ => false,
+        }
+    }
+
     fn cursor_is_at_mysql_grant_database_wildcard_slot(
         tokens: &[SqlToken],
         end: usize,
@@ -59262,7 +59820,7 @@ impl SqlEditorWidget {
             return false;
         }
         let words = Self::previous_meaningful_words_upper(tokens, end, 16);
-        if words.first().map(String::as_str) != Some("GRANT")
+        if !matches!(words.first().map(String::as_str), Some("GRANT") | Some("REVOKE"))
             || words.last().map(String::as_str) != Some("ON")
         {
             return false;
@@ -59275,9 +59833,13 @@ impl SqlEditorWidget {
             })
             .and_then(|identifier_idx| {
                 let dot_idx = Self::next_non_comment_token_index(tokens, identifier_idx + 1)?;
-                let star_idx = Self::next_non_comment_token_index(tokens, dot_idx + 1)?;
+                let target_idx = Self::next_non_comment_token_index(tokens, dot_idx + 1)?;
+                // `db.*` and `db.table` both put a database name in this slot.
                 (matches!(tokens.get(dot_idx), Some(SqlToken::Symbol(symbol)) if symbol == ".")
-                    && matches!(tokens.get(star_idx), Some(SqlToken::Symbol(symbol)) if symbol == "*"))
+                    && (matches!(
+                        tokens.get(target_idx),
+                        Some(SqlToken::Symbol(symbol)) if symbol == "*"
+                    ) || matches!(tokens.get(target_idx), Some(SqlToken::Word(_)))))
                     .then_some(())
             })
             .is_some()
@@ -59622,7 +60184,17 @@ impl SqlEditorWidget {
                 data.get_executable_object_suggestions(prefix)
             }
             ExpectedObjectSuggestionKind::RelationOrSequence => {
-                data.get_relation_or_sequence_object_suggestions(prefix)
+                let mut suggestions = data.get_relation_or_sequence_object_suggestions(prefix);
+                // A MySQL/MariaDB grant target is `db.table`, `db.*` or `table`, so
+                // the databases are part of this slot too.
+                if crate::sql_text::mysql_compatibility_for_sql("", db_type) {
+                    suggestions = Self::merge_suggestions_with_context_aliases(
+                        suggestions,
+                        data.get_schema_suggestions(prefix),
+                        false,
+                    );
+                }
+                suggestions
             }
             ExpectedObjectSuggestionKind::ColumnOwner => {
                 data.get_column_owner_object_suggestions(prefix)
@@ -59636,6 +60208,9 @@ impl SqlEditorWidget {
             ExpectedObjectSuggestionKind::Trigger => data.get_trigger_object_suggestions(prefix),
             ExpectedObjectSuggestionKind::Event => data.get_event_object_suggestions(prefix),
             ExpectedObjectSuggestionKind::Index => data.get_index_object_suggestions(prefix),
+            ExpectedObjectSuggestionKind::Partition => {
+                data.get_partition_object_suggestions(prefix)
+            }
             ExpectedObjectSuggestionKind::Procedure => {
                 data.get_procedure_object_suggestions(prefix)
             }
@@ -59799,6 +60374,250 @@ impl SqlEditorWidget {
         {
             return Some(&["IS"]);
         }
+        // `GRANT role TO CURRENT_USER` / `REVOKE ... FROM CURRENT_ROLE`: the
+        // grantee slot accepts these pseudo-users beside catalog users.
+        if (matches_prefix("CURRENT_USER") || matches_prefix("CURRENT_ROLE"))
+            && (has("GRANT") || has("REVOKE"))
+            && previous_word.is_some_and(|word| {
+                word.eq_ignore_ascii_case("TO") || word.eq_ignore_ascii_case("FROM")
+            })
+        {
+            return Some(&["CURRENT_USER", "CURRENT_ROLE"]);
+        }
+
+        // `REORGANIZE PARTITION a, b INTO (PARTITION c VALUES ...)` - the
+        // replacement list repeats the PARTITION keyword inside the parentheses.
+        if matches_prefix("PARTITION")
+            && has("REORGANIZE")
+            && Self::innermost_open_paren_preceding_word(tokens, structural_end)
+                .is_some_and(|word| word.eq_ignore_ascii_case("INTO"))
+        {
+            return Some(&["PARTITION"]);
+        }
+
+        // ---- Oracle wave-6 DDL / PL/SQL option tails -----------------------
+        if !mysql_compatible {
+            // Inquiry directives. The user-defined ones name a session ccflag that
+            // lives in no catalog, but the PL/SQL-supplied set is always available.
+            if prefix.starts_with("$$") {
+                return Some(&[
+                    "$$PLSQL_LINE",
+                    "$$PLSQL_UNIT",
+                    "$$PLSQL_VERSION",
+                    "$$PLSQL_UNIT_OWNER",
+                    "$$PLSQL_UNIT_TYPE",
+                    "$$PLSQL_CCFLAGS",
+                    "$$PLSQL_OPTIMIZE_LEVEL",
+                    "$$PLSQL_WARNINGS",
+                ]);
+            }
+            // `$ELSIF` and `$ELSE` share the `$EL` prefix and both continue an open
+            // `$IF`, so the slot has to offer the pair rather than pick one.
+            if (matches_prefix("$ELSIF") || matches_prefix("$ELSE")) && has("$IF") {
+                return Some(&["$ELSIF", "$ELSE"]);
+            }
+            // CREATE MATERIALIZED VIEW ... [ENABLE|DISABLE] QUERY REWRITE
+            if matches_prefix("ENABLE") && next_word.is_some_and(|word| word.eq_ignore_ascii_case("QUERY")) {
+                return Some(&["ENABLE", "DISABLE"]);
+            }
+            if matches_prefix("QUERY")
+                && previous_word.is_some_and(|word| {
+                    word.eq_ignore_ascii_case("ENABLE") || word.eq_ignore_ascii_case("DISABLE")
+                })
+            {
+                return Some(&["QUERY REWRITE"]);
+            }
+            if matches_prefix("REWRITE")
+                && previous_word.is_some_and(|word| word.eq_ignore_ascii_case("QUERY"))
+            {
+                return Some(&["REWRITE"]);
+            }
+            // CREATE MATERIALIZED VIEW ... <options> AS SELECT
+            if matches_prefix("AS")
+                && has("MATERIALIZED")
+                && has("VIEW")
+                && next_word.is_some_and(|word| {
+                    word.eq_ignore_ascii_case("SELECT") || word.eq_ignore_ascii_case("WITH")
+                })
+            {
+                return Some(&["AS"]);
+            }
+            // CREATE TABLE ... ORGANIZATION INDEX / HEAP / EXTERNAL
+            if matches_prefix("INDEX")
+                && previous_word.is_some_and(|word| word.eq_ignore_ascii_case("ORGANIZATION"))
+            {
+                return Some(&["INDEX", "HEAP", "EXTERNAL"]);
+            }
+            // CREATE CLUSTER c (...) SIZE n
+            if matches_prefix("SIZE") && has("CLUSTER") && has("CREATE") {
+                return Some(&["SIZE", "TABLESPACE"]);
+            }
+            // CREATE INDEX ix ON CLUSTER c / CREATE TABLE ... ) CLUSTER c (col)
+            if matches_prefix("CLUSTER")
+                && !has("MATERIALIZED")
+                && ((previous_word.is_some_and(|word| word.eq_ignore_ascii_case("ON"))
+                    && has("INDEX"))
+                    || (previous_is_symbol(")") && has("TABLE")))
+                && has("CREATE")
+            {
+                return Some(&["CLUSTER"]);
+            }
+            // ALTER TABLE t SET UNUSED ... / SET INTERVAL ... - the action keyword
+            // itself, which otherwise reads as the start of a DML SET clause.
+            if matches_prefix("SET")
+                && has("ALTER")
+                && has("TABLE")
+                && next_word.is_some_and(|word| {
+                    matches!(
+                        word.to_ascii_uppercase().as_str(),
+                        "UNUSED" | "INTERVAL" | "SUBPARTITION" | "PARTITIONING"
+                    )
+                })
+            {
+                return Some(&["SET"]);
+            }
+            // CREATE TRIGGER ... FOLLOWS <trigger>
+            // ALTER TABLE ... SET UNUSED COLUMN c / DROP UNUSED COLUMNS CHECKPOINT n
+            if matches_prefix("UNUSED")
+                && previous_word.is_some_and(|word| {
+                    word.eq_ignore_ascii_case("SET") || word.eq_ignore_ascii_case("DROP")
+                })
+                && has("ALTER")
+                && has("TABLE")
+            {
+                return Some(&["UNUSED"]);
+            }
+            if matches_prefix("COLUMN")
+                && previous_word.is_some_and(|word| word.eq_ignore_ascii_case("UNUSED"))
+            {
+                return Some(&["COLUMN", "COLUMNS"]);
+            }
+            if matches_prefix("CHECKPOINT")
+                && previous_word.is_some_and(|word| word.eq_ignore_ascii_case("COLUMNS"))
+            {
+                return Some(&["CHECKPOINT"]);
+            }
+            // ALTER TABLE ... RENAME COLUMN old TO new
+            if matches_prefix("TO")
+                && has("RENAME")
+                && has("COLUMN")
+                && has("ALTER")
+                && next_is_identifier_or_string
+            {
+                return Some(&["TO"]);
+            }
+            // ALTER TABLE ... ENABLE|DISABLE ROW MOVEMENT
+            if matches_prefix("ENABLE")
+                && next_word.is_some_and(|word| word.eq_ignore_ascii_case("ROW"))
+                && has("ALTER")
+                && has("TABLE")
+            {
+                return Some(&["ENABLE", "DISABLE"]);
+            }
+            if matches_prefix("ROW")
+                && next_word.is_some_and(|word| word.eq_ignore_ascii_case("MOVEMENT"))
+            {
+                return Some(&["ROW MOVEMENT"]);
+            }
+            if matches_prefix("MOVEMENT")
+                && previous_word.is_some_and(|word| word.eq_ignore_ascii_case("ROW"))
+            {
+                return Some(&["MOVEMENT"]);
+            }
+            // VERSIONS BETWEEN SCN|TIMESTAMP MINVALUE AND MAXVALUE
+            if (matches_prefix("MINVALUE") || matches_prefix("MAXVALUE")) && has("VERSIONS") {
+                return Some(&["MINVALUE", "MAXVALUE"]);
+            }
+            // APPROX_PERCENTILE(x DETERMINISTIC)
+            if matches_prefix("DETERMINISTIC")
+                && Self::innermost_open_paren_preceding_word(tokens, structural_end)
+                    .is_some_and(|word| word.to_ascii_uppercase().starts_with("APPROX_"))
+            {
+                return Some(&["DETERMINISTIC"]);
+            }
+            // EXCEPTION WHEN a OR b THEN
+            if matches_prefix("OR")
+                && has("EXCEPTION")
+                && next_is_identifier_or_string
+                && previous_word.is_some_and(|word| {
+                    !Self::word_is_any_sql_keyword(word)
+                })
+                && matches!(
+                    words.iter().rev().nth(1).map(String::as_str),
+                    Some("WHEN" | "OR")
+                )
+            {
+                return Some(&["OR"]);
+            }
+            // CREATE TRIGGER ... INSTEAD OF ... / ... FOLLOWS other_trigger
+            if matches_prefix("OF")
+                && previous_word.is_some_and(|word| word.eq_ignore_ascii_case("INSTEAD"))
+            {
+                return Some(&["OF"]);
+            }
+            if (matches_prefix("FOLLOWS") || matches_prefix("PRECEDES"))
+                && has("TRIGGER")
+                && next_word.is_some_and(|word| {
+                    !Self::word_is_any_sql_keyword(word)
+                })
+            {
+                return Some(&["FOLLOWS", "PRECEDES"]);
+            }
+            // RETURN VARCHAR2 SQL_MACRO(SCALAR|TABLE)
+            if (matches_prefix("SCALAR") || matches_prefix("TABLE"))
+                && Self::innermost_open_paren_preceding_word(tokens, structural_end)
+                    .is_some_and(|word| word.eq_ignore_ascii_case("SQL_MACRO"))
+            {
+                return Some(&["SCALAR", "TABLE"]);
+            }
+            // WITH PROCEDURE p ... / WITH FUNCTION f ... before the main query
+            if (matches_prefix("PROCEDURE") || matches_prefix("FUNCTION"))
+                && previous_word.is_some_and(|word| word.eq_ignore_ascii_case("WITH"))
+            {
+                return Some(&["FUNCTION", "PROCEDURE"]);
+            }
+            // CREATE VIEW ... WITH CHECK OPTION [CONSTRAINT name] / WITH READ ONLY
+            if matches_prefix("WITH")
+                && next_word.is_some_and(|word| {
+                    word.eq_ignore_ascii_case("CHECK") || word.eq_ignore_ascii_case("READ")
+                })
+                && has("VIEW")
+            {
+                return Some(&["WITH"]);
+            }
+            if matches_prefix("CHECK")
+                && previous_word.is_some_and(|word| word.eq_ignore_ascii_case("WITH"))
+                && has("VIEW")
+            {
+                return Some(&["CHECK OPTION"]);
+            }
+            if matches_prefix("OPTION")
+                && previous_word.is_some_and(|word| word.eq_ignore_ascii_case("CHECK"))
+            {
+                return Some(&["OPTION"]);
+            }
+            // ALTER SEQUENCE s RESTART [START WITH n]
+            if matches_prefix("RESTART") && has("ALTER") && has("SEQUENCE") {
+                return Some(&["RESTART"]);
+            }
+            // GRANT ... TO PUBLIC / REVOKE ... FROM PUBLIC
+            if matches_prefix("PUBLIC")
+                && (has("GRANT") || has("REVOKE"))
+                && previous_word.is_some_and(|word| {
+                    word.eq_ignore_ascii_case("TO") || word.eq_ignore_ascii_case("FROM")
+                })
+            {
+                return Some(&["PUBLIC"]);
+            }
+            // ANALYZE TABLE t COMPUTE STATISTICS FOR TABLE|ALL COLUMNS|ALL INDEXES
+            if matches_prefix("TABLE")
+                && previous_word.is_some_and(|word| word.eq_ignore_ascii_case("FOR"))
+                && has("ANALYZE")
+            {
+                return Some(&["TABLE", "ALL COLUMNS", "ALL INDEXES", "COLUMNS"]);
+            }
+        }
+
         if ["BOTH", "LEADING", "TRAILING"]
             .iter()
             .any(|keyword| matches_prefix(keyword))
@@ -59930,6 +60749,7 @@ impl SqlEditorWidget {
                         "NLS_TERRITORY",
                         "NLS_TIMESTAMP_FORMAT",
                         "OPTIMIZER_MODE",
+                        "PLSQL_CCFLAGS",
                         "PLSQL_OPTIMIZE_LEVEL",
                         "PLSQL_WARNINGS",
                         "QUERY_REWRITE_ENABLED",
@@ -61527,7 +62347,10 @@ impl SqlEditorWidget {
                     "MyISAM",
                     "SEQUENCE",
                 ];
-                if has("ENGINE")
+                // Only at the ENGINE *value* slot: further table options (and the
+                // CTAS `AS`) follow the engine name, and several engines share
+                // their first letter with them.
+                if matches!(last, Some("ENGINE"))
                     && MARIADB_STORAGE_ENGINES
                         .iter()
                         .any(|engine| matches_prefix(engine))
@@ -62150,6 +62973,8 @@ impl SqlEditorWidget {
             }
         }
 
+
+
         None
     }
 
@@ -62285,6 +63110,9 @@ impl SqlEditorWidget {
     ) -> Option<&'static [QualifiedMemberKind]> {
         match kind {
             ExpectedObjectSuggestionKind::NoSuggestions => Some(&[]),
+            // Partitions are not schema members, so a qualified path never
+            // resolves to one.
+            ExpectedObjectSuggestionKind::Partition => Some(&[]),
             ExpectedObjectSuggestionKind::SchemaObject => Some(&[
                 QualifiedMemberKind::Table,
                 QualifiedMemberKind::View,
@@ -64180,6 +65008,9 @@ impl SqlEditorWidget {
             push(&name);
         }
         for (name, _) in ORACLE_BUILTIN_PACKAGE_MEMBERS {
+            push(name);
+        }
+        for (name, _) in ORACLE_BUILTIN_OBJECT_TYPE_MEMBERS {
             push(name);
         }
         for name in data
@@ -67363,6 +68194,33 @@ impl SqlEditorWidget {
         )
     }
 
+    /// Members of a package declared earlier in the same script (`pkg.span_tab`).
+    /// The spec is found by the same bounded scan that makes a package-qualified
+    /// type resolvable, so `<pkg>.|` offers what that spec declares.
+    fn oracle_script_package_member_suggestions(
+        script_text: &str,
+        qualifier: &str,
+        prefix: &str,
+    ) -> Option<Vec<String>> {
+        let qualifier_upper = Self::completion_identifier_lookup_upper(qualifier);
+        if qualifier_upper.is_empty() {
+            return None;
+        }
+        let members =
+            Self::extract_package_spec_symbols(script_text, &qualifier_upper, script_text.len());
+        if members.is_empty() {
+            return None;
+        }
+        Some(
+            members
+                .into_iter()
+                .filter(|symbol| symbol.suggest_name)
+                .map(|symbol| symbol.name)
+                .filter(|name| Self::completion_suggestion_matches_prefix(name, prefix))
+                .collect(),
+        )
+    }
+
     fn oracle_language_qualified_member_suggestions(
         analysis: &IntellisenseAnalysis,
         qualifier: &str,
@@ -67388,9 +68246,16 @@ impl SqlEditorWidget {
         prefix: &str,
     ) -> Option<Vec<String>> {
         let qualifier_upper = Self::completion_identifier_lookup_upper(qualifier);
+        // `SYS.ANYDATA.convertNumber(...)` reaches the type through its owner.
+        let unqualified_upper = qualifier_upper
+            .rsplit_once('.')
+            .map_or(qualifier_upper.as_str(), |(_, tail)| tail);
         let members = ORACLE_BUILTIN_PACKAGE_MEMBERS
             .iter()
-            .find_map(|(package, members)| (*package == qualifier_upper).then_some(*members))?;
+            .chain(ORACLE_BUILTIN_OBJECT_TYPE_MEMBERS.iter())
+            .find_map(|(package, members)| {
+                (*package == qualifier_upper || *package == unqualified_upper).then_some(*members)
+            })?;
         Some(
             members
                 .iter()

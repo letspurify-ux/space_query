@@ -664,11 +664,16 @@ impl SqlEditorWidget {
             relative_statement_start,
             preferred_db_type,
         );
-        let package_spec_symbols = Self::package_spec_symbols_for_body(
+        let mut package_spec_symbols = Self::package_spec_symbols_for_body(
             &bounded.text,
             &expanded.text,
             relative_statement_start,
         );
+        package_spec_symbols.extend(Self::package_spec_symbols_for_qualified_type_references(
+            &bounded.text,
+            &expanded.text,
+            relative_statement_start,
+        ));
         (expanded, text_bind_names, package_spec_symbols)
     }
 
@@ -711,6 +716,47 @@ impl SqlEditorWidget {
             text_bind_names: routine_cache.text_bind_names.clone(),
             cursor_in_alias_declaration,
         }
+    }
+
+    /// Cross-statement package-spec symbols reached through a qualified type
+    /// reference (`spans pkg.span_tab;`). The same spec scan that serves a
+    /// package body also answers "what is `pkg.span_tab`", which is what makes
+    /// the collection methods on `spans` resolvable.
+    const QUALIFIED_TYPE_PACKAGE_SCAN_LIMIT: usize = 4;
+
+    fn package_spec_symbols_for_qualified_type_references(
+        full_text: &str,
+        statement_text: &str,
+        statement_start: usize,
+    ) -> Vec<ParsedDeclarationSymbol> {
+        let mut packages: Vec<String> = Vec::new();
+        let spans = super::query_text::tokenize_sql_spanned(statement_text);
+        let mut idx = 0usize;
+        while idx + 2 < spans.len() {
+            let (Some(head), true, Some(_)) = (
+                Self::token_word(&spans[idx].token),
+                Self::token_symbol_is(&spans[idx + 1].token, "."),
+                Self::token_word(&spans[idx + 2].token),
+            ) else {
+                idx += 1;
+                continue;
+            };
+            let head_upper = head.trim().to_ascii_uppercase();
+            if !packages.contains(&head_upper)
+                && Self::builtin_object_type_members(&head_upper).is_none()
+            {
+                packages.push(head_upper);
+                if packages.len() >= Self::QUALIFIED_TYPE_PACKAGE_SCAN_LIMIT {
+                    break;
+                }
+            }
+            idx += 3;
+        }
+
+        packages
+            .into_iter()
+            .flat_map(|name| Self::extract_package_spec_symbols(full_text, &name, statement_start))
+            .collect()
     }
 
     fn build_routine_symbol_cache_entry(
@@ -1245,6 +1291,51 @@ impl SqlEditorWidget {
             None,
             analysis,
         )
+    }
+
+    /// Members of an Oracle-supplied PL/SQL object type, matched on the type's
+    /// own name so an owner prefix (`SYS.ANYDATA`) resolves the same way.
+    /// Oracle-supplied object types double as SQL keywords (`XMLTYPE`), so the
+    /// generic identifier rule rejects them in a declaration's type position even
+    /// though `doc_xml XMLTYPE;` must still expose the type's members.
+    /// Oracle-supplied object types that are collections (`JSON_KEY_LIST` is a
+    /// varray of keys), so `list.|` offers the collection methods.
+    fn is_builtin_collection_object_type(source_upper: &str) -> bool {
+        let unqualified = source_upper
+            .rsplit_once('.')
+            .map_or(source_upper, |(_, tail)| tail);
+        matches!(unqualified, "JSON_KEY_LIST")
+    }
+
+    fn builtin_object_type_source_name(
+        item: &[SqlTokenSpan],
+        type_idx: usize,
+    ) -> Option<(String, usize)> {
+        let word = Self::token_word(&item.get(type_idx)?.token)?;
+        let upper = word.trim().to_ascii_uppercase();
+        if Self::builtin_object_type_members(&upper).is_some() {
+            return Some((upper, type_idx));
+        }
+
+        // `SYS.ANYDATA` - the owner is an identifier but the type itself may not
+        // survive the identifier rule, so the pair is matched as a whole.
+        let dot_idx = Self::next_meaningful_token_idx(item, type_idx + 1)?;
+        if !Self::token_symbol_at(item, dot_idx, ".") {
+            return None;
+        }
+        let member_idx = Self::next_meaningful_token_idx(item, dot_idx + 1)?;
+        let member = Self::token_word(&item.get(member_idx)?.token)?;
+        let qualified = format!("{upper}.{}", member.trim().to_ascii_uppercase());
+        Self::builtin_object_type_members(&qualified).map(|_| (qualified, member_idx))
+    }
+
+    fn builtin_object_type_members(source_upper: &str) -> Option<&'static [&'static str]> {
+        let unqualified = source_upper
+            .rsplit_once('.')
+            .map_or(source_upper, |(_, tail)| tail);
+        ORACLE_BUILTIN_OBJECT_TYPE_MEMBERS
+            .iter()
+            .find_map(|(type_name, members)| (*type_name == unqualified).then_some(*members))
     }
 
     fn append_plsql_collection_method_suggestions(
@@ -3217,8 +3308,11 @@ impl SqlEditorWidget {
             type_idx = next_type_idx;
         }
 
+        // The builtin object types are matched first: `SYS.ANYDATA` would
+        // otherwise resolve to the owner alone.
         let Some((source_name, source_end_idx)) =
-            Self::extract_declaration_type_source_name(item, type_idx)
+            Self::builtin_object_type_source_name(item, type_idx)
+                .or_else(|| Self::extract_declaration_type_source_name(item, type_idx))
         else {
             return (None, false);
         };
@@ -3795,11 +3889,47 @@ impl SqlEditorWidget {
                     continue;
                 }
 
+                // A variable declared with an Oracle-supplied object type
+                // (`doc JSON_OBJECT_T;`, `x SYS.ANYDATA;`) exposes that type's
+                // members at `doc.|`, exactly like the `TYPE.member` qualifier.
+                if Self::is_builtin_collection_object_type(source_upper) {
+                    resolved_collection_flags[idx] = Some(true);
+                    continue;
+                }
+                if let Some(members) = Self::builtin_object_type_members(source_upper) {
+                    resolved_members[idx] =
+                        Some(members.iter().map(|member| (*member).to_string()).collect());
+                    resolved_member_entries[idx] = Some(
+                        members
+                            .iter()
+                            .map(|member| LocalMemberEntry {
+                                name: (*member).to_string(),
+                                upper: member.to_ascii_uppercase(),
+                                type_display: None,
+                                member_source_upper: None,
+                                member_source_uppers: Vec::new(),
+                                member_source_is_rowtype: false,
+                                member_source_is_collection_like: false,
+                                member_source_allows_visible_members: false,
+                            })
+                            .collect(),
+                    );
+                    resolved_visible_member_flags[idx] = Some(true);
+                    continue;
+                }
+
                 let Some(scope_ranks) = scope_rank_by_scope.get(symbol.scope_id) else {
                     continue;
                 };
                 let mut best: Option<(usize, usize, usize)> = None;
-                let Some(candidate_indices) = candidates_by_upper.get(source_upper) else {
+                // `spans pkg.span_tab` names a type declared inside `pkg`; when the
+                // package declaration is visible the unqualified type name resolves it.
+                let candidate_indices = candidates_by_upper.get(source_upper).or_else(|| {
+                    source_upper
+                        .rsplit_once('.')
+                        .and_then(|(_, tail)| candidates_by_upper.get(tail))
+                });
+                let Some(candidate_indices) = candidate_indices else {
                     continue;
                 };
                 for &candidate_idx in candidate_indices {
