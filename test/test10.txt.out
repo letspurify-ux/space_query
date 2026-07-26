@@ -857,7 +857,7 @@ ORDER BY log_id;
 -- db: Oracle
 -- metadata: test Oracle inferred catalog (file-scoped overlay) + Oracle built-ins
 -- checked: 1795
--- suggestions checked: 10742
+-- suggestions checked: 10847
 -- missing: 0
 -- suggestions without type labels: 0
 -- marker: [[word]] means not suggested for the tested prefix

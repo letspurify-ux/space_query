@@ -3561,7 +3561,7 @@ fn formatting_sweep_additional_non_parenthesized_child_lists_have_typed_frames()
     let cases: &[(DatabaseType, &str, &[ListOwnerKind])] = &[
         (
             DatabaseType::Oracle,
-            "SELECT * FROM sales MATCH_RECOGNIZE (ORDER BY sale_id SUBSET ab = (A, B), cd = (C, D) PATTERN (A B C D) DEFINE A AS amount > 0); SELECT a, b FROM t FOR UPDATE OF a, b; CREATE OR REPLACE TRIGGER trg BEFORE UPDATE OF a, b ON t FOLLOWS trg_a, trg_b BEGIN NULL; END; GRANT SELECT, UPDATE ON t TO app_a, app_b; ALTER TABLE t ADD c NUMBER, ADD d NUMBER; LOCK TABLE t_a, t_b IN EXCLUSIVE MODE; FLASHBACK TABLE t_a, t_b TO SCN 1; BEGIN FOR i IN 1..2, REVERSE 5..6, 9..9 LOOP NULL; END LOOP; END;",
+            "SELECT * FROM sales MATCH_RECOGNIZE (ORDER BY sale_id SUBSET ab = (A, B), cd = (C, D) PATTERN (A B C D) DEFINE A AS amount > 0); SELECT a, b FROM t FOR UPDATE OF a, b; CREATE OR REPLACE TRIGGER trg BEFORE UPDATE OF a, b ON t FOLLOWS trg_a, trg_b BEGIN NULL; END; GRANT SELECT, UPDATE ON t TO app_a, app_b; ALTER TABLE t ADD c NUMBER, ADD d NUMBER; LOCK TABLE t_a, t_b IN EXCLUSIVE MODE; FLASHBACK TABLE t_a, t_b TO SCN 1; CREATE AUDIT POLICY pol ACTIONS SELECT ON t_a, UPDATE ON t_b; BEGIN FOR i IN 1..2, REVERSE 5..6, 9..9 LOOP NULL; END LOOP; END;",
             &[
                 ListOwnerKind::Subset,
                 ListOwnerKind::ForUpdateColumns,
@@ -3572,6 +3572,7 @@ fn formatting_sweep_additional_non_parenthesized_child_lists_have_typed_frames()
                 ListOwnerKind::AlterActions,
                 ListOwnerKind::LockTables,
                 ListOwnerKind::FlashbackTargets,
+                ListOwnerKind::AuditActions,
                 ListOwnerKind::IterationControls,
             ],
         ),
@@ -3708,7 +3709,7 @@ fn formatting_sweep_list_owner_inventory_covers_every_typed_variant() {
         ),
         (
             DatabaseType::Oracle,
-            "ALTER TABLE t ADD a NUMBER, ADD b NUMBER; LOCK TABLE t_a, t_b IN EXCLUSIVE MODE; FLASHBACK TABLE t_a, t_b TO SCN 1; CREATE OR REPLACE TRIGGER trg_order BEFORE INSERT ON t FOLLOWS trg_a, trg_b BEGIN NULL; END; CREATE MATERIALIZED VIEW LOG ON t WITH PRIMARY KEY, ROWID INCLUDING NEW VALUES; BEGIN FOR i IN 1..2, REVERSE 5..6 LOOP NULL; END LOOP; END;",
+            "ALTER TABLE t ADD a NUMBER, ADD b NUMBER; LOCK TABLE t_a, t_b IN EXCLUSIVE MODE; FLASHBACK TABLE t_a, t_b TO SCN 1; CREATE AUDIT POLICY pol ACTIONS SELECT ON t_a, UPDATE ON t_b; CREATE OR REPLACE TRIGGER trg_order BEFORE INSERT ON t FOLLOWS trg_a, trg_b BEGIN NULL; END; CREATE MATERIALIZED VIEW LOG ON t WITH PRIMARY KEY, ROWID INCLUDING NEW VALUES; BEGIN FOR i IN 1..2, REVERSE 5..6 LOOP NULL; END LOOP; END;",
         ),
         (
             DatabaseType::Oracle,

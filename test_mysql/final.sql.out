@@ -672,7 +672,7 @@ SELECT 'PASS' AS final_status,
 -- db: MySQL
 -- metadata: test_mysql/final.sql inferred catalog
 -- checked: 1651
--- suggestions checked: 6048
+-- suggestions checked: 6123
 -- missing: 0
 -- suggestions without type labels: 0
 -- marker: [[word]] means not suggested for the tested prefix

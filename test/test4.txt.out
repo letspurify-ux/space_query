@@ -188,7 +188,7 @@ PROMPT DONE.
 -- db: Oracle
 -- metadata: test Oracle inferred catalog (file-scoped overlay) + Oracle built-ins
 -- checked: 297
--- suggestions checked: 787
+-- suggestions checked: 800
 -- missing: 0
 -- suggestions without type labels: 0
 -- marker: [[word]] means not suggested for the tested prefix

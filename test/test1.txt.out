@@ -379,7 +379,7 @@ SELECT * FROM oqt_run_log WHERE run_id = 20260127 ORDER BY run_ts DESC;
 -- db: Oracle
 -- metadata: test Oracle inferred catalog (file-scoped overlay) + Oracle built-ins
 -- checked: 570
--- suggestions checked: 2421
+-- suggestions checked: 2444
 -- missing: 0
 -- suggestions without type labels: 0
 -- marker: [[word]] means not suggested for the tested prefix

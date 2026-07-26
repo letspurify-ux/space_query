@@ -76,7 +76,7 @@ SELECT id, abcd, ghij FROM qt_depth_sample ORDER BY id;
 -- db: Oracle
 -- metadata: test Oracle inferred catalog (file-scoped overlay) + Oracle built-ins
 -- checked: 129
--- suggestions checked: 244
+-- suggestions checked: 246
 -- missing: 0
 -- suggestions without type labels: 0
 -- marker: [[word]] means not suggested for the tested prefix

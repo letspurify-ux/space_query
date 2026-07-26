@@ -21,7 +21,26 @@ PROMPT [ORACLE HARDCORE] hostile-but-legal grammar stress
 
 BEGIN
   FOR ddl_text IN (
-    SELECT 'DROP ANALYTIC VIEW sq_hard_av' text_value FROM dual UNION ALL
+    SELECT 'NOAUDIT POLICY sq_hard_w7_pol' text_value FROM dual UNION ALL
+    SELECT 'DROP AUDIT POLICY sq_hard_w7_pol' FROM dual UNION ALL
+    SELECT 'DISASSOCIATE STATISTICS FROM PACKAGES sq_hard_w7_ctx_pkg' FROM dual UNION ALL
+    SELECT 'DROP DIMENSION sq_hard_w7_prod_dim' FROM dual UNION ALL
+    SELECT 'DROP DIMENSION sq_hard_w7_time_dim' FROM dual UNION ALL
+    SELECT 'DROP CONTEXT sq_hard_w7_ctx' FROM dual UNION ALL
+    SELECT 'DROP PACKAGE sq_hard_w7_ctx_pkg' FROM dual UNION ALL
+    SELECT 'DROP TABLE sq_hard_w7_sales PURGE' FROM dual UNION ALL
+    SELECT 'DROP TABLE sq_hard_w7_prod PURGE' FROM dual UNION ALL
+    SELECT 'DROP TABLE sq_hard_w7_cat PURGE' FROM dual UNION ALL
+    SELECT 'DROP TABLE sq_hard_w7_time PURGE' FROM dual UNION ALL
+    SELECT 'DROP TABLE sq_hard_w7_arch PURGE' FROM dual UNION ALL
+    SELECT 'DROP TABLE sq_hard_w7_pos PURGE' FROM dual UNION ALL
+    SELECT 'DROP TABLE sq_hard_w7_src PURGE' FROM dual UNION ALL
+    SELECT 'DROP TABLE sq_hard_w7_xml PURGE' FROM dual UNION ALL
+    SELECT 'DROP TABLE sq_hard_w7_note PURGE' FROM dual UNION ALL
+    SELECT 'DROP TYPE sq_hard_w7_num_bag FORCE' FROM dual UNION ALL
+    SELECT 'DROP TYPE sq_hard_w7_num_tab FORCE' FROM dual UNION ALL
+    SELECT 'DROP TYPE sq_hard_w7_str_tab FORCE' FROM dual UNION ALL
+    SELECT 'DROP ANALYTIC VIEW sq_hard_av' FROM dual UNION ALL
     SELECT 'DROP HIERARCHY sq_hard_node_h' FROM dual UNION ALL
     SELECT 'DROP ATTRIBUTE DIMENSION sq_hard_node_ad' FROM dual UNION ALL
     SELECT 'DROP PACKAGE sq_hard_ptf_pkg' FROM dual UNION ALL
@@ -3101,6 +3120,579 @@ BEGIN
 END;
 /
 --------------------------------------------------------------------------------
+-- ULTRA WAVE 7: the legacy XML DML/generation family, an application context
+-- driven by its own trusted package plus call-stack reflection, CREATE
+-- DIMENSION and ASSOCIATE STATISTICS, in-database archiving with a hidden
+-- ORA_ARCHIVE_STATE column, cursor-positioned and record-shaped DML,
+-- collection algebra with the binary float/double literal suffixes, the
+-- scalar and REGR_ statistical builtins, unified audit policy DDL, and a
+-- second lexer torture round.
+--------------------------------------------------------------------------------
+CREATE TABLE sq_hard_w7_note (
+  note_key   VARCHAR2(30) CONSTRAINT sq_hard_w7_note_pk PRIMARY KEY,
+  note_value NUMBER,
+  note_text  VARCHAR2(400)
+) TABLESPACE users;
+
+--------------------------------------------------------------------------------
+-- W7-A: the legacy XML DML and generation family. UPDATEXML / INSERTCHILDXML /
+-- DELETEXML take an XPath string in an argument slot that looks like a column,
+-- XMLPI and XMLCOLATTVAL take a NAME/AS keyword inside the argument list, and
+-- XMLSEQUENCE returns a collection that TABLE() then unnests.
+--------------------------------------------------------------------------------
+CREATE TABLE sq_hard_w7_xml (
+  doc_id   NUMBER CONSTRAINT sq_hard_w7_xml_pk PRIMARY KEY,
+  body_xml XMLTYPE
+) TABLESPACE users;
+
+INSERT INTO sq_hard_w7_xml (doc_id, body_xml)
+VALUES (1, XMLTYPE('<doc><v unit="ms">12</v><v unit="ms">18</v><spare/></doc>'));
+
+UPDATE sq_hard_w7_xml
+   SET body_xml = UPDATEXML(body_xml, '/doc/v[1]/text()', '30')
+ WHERE doc_id = 1;
+
+UPDATE sq_hard_w7_xml
+   SET body_xml = INSERTCHILDXML(body_xml, '/doc', 'v',
+                                 XMLTYPE('<v unit="s">7</v>'))
+ WHERE doc_id = 1;
+
+UPDATE sq_hard_w7_xml
+   SET body_xml = DELETEXML(body_xml, '/doc/spare')
+ WHERE doc_id = 1;
+
+COMMIT;
+
+SELECT SUM(TO_NUMBER(seq_row.COLUMN_VALUE.extract('/v/text()').getStringVal()))
+         AS xml_total,
+       COUNT(*) AS xml_nodes
+FROM sq_hard_w7_xml x,
+     TABLE(XMLSEQUENCE(x.body_xml.extract('/doc/v'))) seq_row
+WHERE x.doc_id = 1;
+
+SELECT XMLSERIALIZE(CONTENT
+         XMLELEMENT("wrap",
+           XMLPI(NAME "sq-hard", 'version="7"'),
+           XMLCOLATTVAL(x.doc_id AS "id"),
+           XMLCDATA('a > b & c < d')
+         )
+       AS CLOB INDENT SIZE = 2) AS built_xml
+FROM sq_hard_w7_xml x
+WHERE x.doc_id = 1;
+
+DECLARE
+  gen_ctx  DBMS_XMLGEN.ctxHandle;
+  gen_clob CLOB;
+  gen_rows NUMBER;
+BEGIN
+  gen_ctx := DBMS_XMLGEN.newContext(
+    'SELECT doc_id FROM sq_hard_w7_xml ORDER BY doc_id');
+  DBMS_XMLGEN.setRowSetTag(gen_ctx, 'docs');
+  DBMS_XMLGEN.setRowTag(gen_ctx, 'doc');
+  gen_clob := DBMS_XMLGEN.getXML(gen_ctx);
+  gen_rows := DBMS_XMLGEN.getNumRowsProcessed(gen_ctx);
+  DBMS_XMLGEN.closeContext(gen_ctx);
+
+  INSERT INTO sq_hard_w7_note (note_key, note_value, note_text)
+  VALUES ('xmlgen', gen_rows,
+          CASE WHEN gen_clob LIKE '%<docs>%' THEN 'rowset-tag' ELSE 'plain' END);
+END;
+/
+
+--------------------------------------------------------------------------------
+-- W7-B: an application context driven by its own trusted package, plus the
+-- call-stack reflection API. UTL_CALL_STACK members take a numeric depth and
+-- CONCATENATE_SUBPROGRAM takes the collection another member returns.
+--------------------------------------------------------------------------------
+CREATE OR REPLACE PACKAGE sq_hard_w7_ctx_pkg AUTHID CURRENT_USER AS
+  PROCEDURE set_tenant(p_tenant IN VARCHAR2, p_tier IN VARCHAR2);
+  FUNCTION where_am_i RETURN VARCHAR2;
+  FUNCTION doubled(p_n IN NUMBER) RETURN NUMBER DETERMINISTIC;
+  PRAGMA RESTRICT_REFERENCES(doubled, WNDS, RNPS, WNPS);
+END sq_hard_w7_ctx_pkg;
+/
+
+CREATE OR REPLACE PACKAGE BODY sq_hard_w7_ctx_pkg AS
+  PROCEDURE set_tenant(p_tenant IN VARCHAR2, p_tier IN VARCHAR2) IS
+  BEGIN
+    DBMS_SESSION.set_context('SQ_HARD_W7_CTX', 'tenant', p_tenant);
+    DBMS_SESSION.set_context('SQ_HARD_W7_CTX', 'tier', p_tier);
+  END set_tenant;
+
+  FUNCTION where_am_i RETURN VARCHAR2 IS
+  BEGIN
+    RETURN UTL_CALL_STACK.concatenate_subprogram(
+             UTL_CALL_STACK.subprogram(1));
+  END where_am_i;
+
+  FUNCTION doubled(p_n IN NUMBER) RETURN NUMBER DETERMINISTIC IS
+  BEGIN
+    RETURN p_n * 2;
+  END doubled;
+END sq_hard_w7_ctx_pkg;
+/
+
+CREATE OR REPLACE CONTEXT sq_hard_w7_ctx USING sq_hard_w7_ctx_pkg;
+
+DECLARE
+  tenant_now VARCHAR2(60);
+  tier_now   VARCHAR2(60);
+  who_now    VARCHAR2(200);
+  depth_now  PLS_INTEGER;
+  trace_ok   VARCHAR2(10);
+BEGIN
+  sq_hard_w7_ctx_pkg.set_tenant('wave7', 'gold');
+  tenant_now := SYS_CONTEXT('SQ_HARD_W7_CTX', 'tenant');
+  tier_now   := SYS_CONTEXT('SQ_HARD_W7_CTX', 'tier');
+  who_now    := sq_hard_w7_ctx_pkg.where_am_i;
+  depth_now  := UTL_CALL_STACK.dynamic_depth;
+
+  DBMS_APPLICATION_INFO.set_module(module_name => 'sq_hard_w7',
+                                   action_name => 'context');
+  BEGIN
+    RAISE_APPLICATION_ERROR(-20701, 'planted');
+  EXCEPTION
+    WHEN OTHERS THEN
+      trace_ok := CASE
+                    WHEN DBMS_UTILITY.format_error_backtrace IS NOT NULL
+                    THEN 'traced'
+                    ELSE 'bare'
+                  END;
+  END;
+
+  INSERT INTO sq_hard_w7_note (note_key, note_value, note_text)
+  VALUES ('context', CASE WHEN depth_now >= 1 THEN 1 ELSE 0 END,
+          tenant_now || '/' || tier_now || '/' || who_now || '/' || trace_ok);
+END;
+/
+
+SELECT note_key, note_value, note_text
+FROM sq_hard_w7_note
+WHERE note_key = 'context';
+
+--------------------------------------------------------------------------------
+-- W7-C: CREATE DIMENSION -- a DDL statement built almost entirely out of words
+-- that are clause keywords everywhere else (LEVEL, HIERARCHY, CHILD OF,
+-- JOIN KEY, REFERENCES, ATTRIBUTE, DETERMINES), plus ASSOCIATE STATISTICS.
+--------------------------------------------------------------------------------
+CREATE TABLE sq_hard_w7_time (
+  day_id    DATE         NOT NULL,
+  month_id  VARCHAR2(7)  NOT NULL,
+  year_id   NUMBER       NOT NULL,
+  day_name  VARCHAR2(12),
+  CONSTRAINT sq_hard_w7_time_pk PRIMARY KEY (day_id)
+) TABLESPACE users;
+
+CREATE TABLE sq_hard_w7_cat (
+  cat_id   VARCHAR2(10) NOT NULL,
+  cat_name VARCHAR2(30),
+  CONSTRAINT sq_hard_w7_cat_pk PRIMARY KEY (cat_id)
+) TABLESPACE users;
+
+CREATE TABLE sq_hard_w7_prod (
+  prod_id   NUMBER       NOT NULL,
+  cat_id    VARCHAR2(10) NOT NULL,
+  prod_name VARCHAR2(30),
+  CONSTRAINT sq_hard_w7_prod_pk PRIMARY KEY (prod_id),
+  CONSTRAINT sq_hard_w7_prod_fk FOREIGN KEY (cat_id)
+    REFERENCES sq_hard_w7_cat (cat_id)
+) TABLESPACE users;
+
+CREATE TABLE sq_hard_w7_sales (
+  day_id  DATE   NOT NULL,
+  prod_id NUMBER NOT NULL,
+  amount  NUMBER(10, 2)
+) TABLESPACE users;
+
+INSERT INTO sq_hard_w7_time (day_id, month_id, year_id, day_name)
+VALUES (DATE '2024-02-29', '2024-02', 2024, 'Thursday');
+INSERT INTO sq_hard_w7_time (day_id, month_id, year_id, day_name)
+VALUES (DATE '2024-03-01', '2024-03', 2024, 'Friday');
+
+INSERT INTO sq_hard_w7_cat (cat_id, cat_name) VALUES ('CORE', 'Core parts');
+INSERT INTO sq_hard_w7_cat (cat_id, cat_name) VALUES ('AUX', 'Auxiliary');
+
+INSERT INTO sq_hard_w7_prod (prod_id, cat_id, prod_name)
+VALUES (10, 'CORE', 'widget');
+INSERT INTO sq_hard_w7_prod (prod_id, cat_id, prod_name)
+VALUES (20, 'AUX', 'gasket');
+
+INSERT INTO sq_hard_w7_sales (day_id, prod_id, amount)
+VALUES (DATE '2024-02-29', 10, 40.50);
+INSERT INTO sq_hard_w7_sales (day_id, prod_id, amount)
+VALUES (DATE '2024-02-29', 20, 9.50);
+INSERT INTO sq_hard_w7_sales (day_id, prod_id, amount)
+VALUES (DATE '2024-03-01', 10, 50.00);
+COMMIT;
+
+CREATE DIMENSION sq_hard_w7_time_dim
+  LEVEL day   IS sq_hard_w7_time.day_id
+  LEVEL month IS sq_hard_w7_time.month_id
+  LEVEL year  IS sq_hard_w7_time.year_id
+  HIERARCHY cal_rollup (
+    day   CHILD OF
+    month CHILD OF
+    year
+  )
+  ATTRIBUTE day DETERMINES (day_name);
+
+CREATE DIMENSION sq_hard_w7_prod_dim
+  LEVEL prod IS sq_hard_w7_prod.prod_id
+  LEVEL cat  IS sq_hard_w7_cat.cat_id
+  HIERARCHY prod_rollup (
+    prod CHILD OF cat
+    JOIN KEY sq_hard_w7_prod.cat_id REFERENCES cat
+  )
+  ATTRIBUTE prod DETERMINES (sq_hard_w7_prod.prod_name)
+  ATTRIBUTE cat  DETERMINES (sq_hard_w7_cat.cat_name);
+
+ASSOCIATE STATISTICS WITH PACKAGES sq_hard_w7_ctx_pkg
+  DEFAULT SELECTIVITY 5 DEFAULT COST (100, 5, 0);
+
+SELECT COUNT(*) AS dimension_count
+FROM user_dimensions
+WHERE dimension_name IN ('SQ_HARD_W7_TIME_DIM', 'SQ_HARD_W7_PROD_DIM');
+
+DISASSOCIATE STATISTICS FROM PACKAGES sq_hard_w7_ctx_pkg;
+
+--------------------------------------------------------------------------------
+-- W7-D: in-database archiving. ROW ARCHIVAL adds a hidden ORA_ARCHIVE_STATE
+-- column that only becomes visible through ALTER SESSION SET ROW ARCHIVAL
+-- VISIBILITY, and the segment DDL tail stacks physical attributes.
+--------------------------------------------------------------------------------
+CREATE TABLE sq_hard_w7_arch (
+  arch_id  NUMBER CONSTRAINT sq_hard_w7_arch_pk PRIMARY KEY,
+  arch_tag VARCHAR2(20)
+) PCTFREE 5 INITRANS 2 MAXTRANS 40 NOLOGGING ROWDEPENDENCIES
+  TABLESPACE users;
+
+ALTER TABLE sq_hard_w7_arch ROW ARCHIVAL;
+
+INSERT INTO sq_hard_w7_arch (arch_id, arch_tag) VALUES (1, 'live');
+INSERT INTO sq_hard_w7_arch (arch_id, arch_tag) VALUES (2, 'retired');
+COMMIT;
+
+UPDATE sq_hard_w7_arch
+   SET ORA_ARCHIVE_STATE = DBMS_ILM.ARCHIVESTATENAME(1)
+ WHERE arch_id = 2;
+COMMIT;
+
+SELECT COUNT(*) AS visible_rows FROM sq_hard_w7_arch;
+
+ALTER SESSION SET ROW ARCHIVAL VISIBILITY = ALL;
+
+SELECT COUNT(*)                                        AS all_rows,
+       COUNT(NULLIF(ORA_ARCHIVE_STATE, '0'))           AS archived_rows
+FROM sq_hard_w7_arch;
+
+ALTER SESSION SET ROW ARCHIVAL VISIBILITY = ACTIVE;
+
+ALTER TABLE sq_hard_w7_arch ENABLE ROW MOVEMENT;
+ALTER TABLE sq_hard_w7_arch SHRINK SPACE COMPACT;
+ALTER TABLE sq_hard_w7_arch LOGGING;
+
+--------------------------------------------------------------------------------
+-- W7-E: cursor-positioned and record-shaped DML. FOR UPDATE OF feeding
+-- WHERE CURRENT OF, SET ROW = record, INSERT VALUES record, a multi-column
+-- subquery assignment, and a MERGE whose matched branch both filters and
+-- deletes.
+--------------------------------------------------------------------------------
+CREATE TABLE sq_hard_w7_pos (
+  pos_id NUMBER CONSTRAINT sq_hard_w7_pos_pk PRIMARY KEY,
+  qty    NUMBER,
+  tag    VARCHAR2(20)
+) TABLESPACE users;
+
+CREATE TABLE sq_hard_w7_src (
+  pos_id NUMBER,
+  qty    NUMBER,
+  tag    VARCHAR2(20)
+) TABLESPACE users;
+
+INSERT INTO sq_hard_w7_pos (pos_id, qty, tag) VALUES (1, 5, 'one');
+INSERT INTO sq_hard_w7_pos (pos_id, qty, tag) VALUES (2, 7, 'two');
+INSERT INTO sq_hard_w7_pos (pos_id, qty, tag) VALUES (3, 9, 'three');
+
+INSERT INTO sq_hard_w7_src (pos_id, qty, tag) VALUES (2, 70, 'two-new');
+INSERT INTO sq_hard_w7_src (pos_id, qty, tag) VALUES (3, -1, 'kill');
+INSERT INTO sq_hard_w7_src (pos_id, qty, tag) VALUES (4, 11, 'four');
+INSERT INTO sq_hard_w7_src (pos_id, qty, tag) VALUES (5, 999, 'skipped');
+COMMIT;
+
+DECLARE
+  CURSOR pos_cur IS
+    SELECT pos_id, qty
+    FROM sq_hard_w7_pos
+    WHERE qty < 8
+    ORDER BY pos_id
+    FOR UPDATE OF qty;
+  bumped  PLS_INTEGER := 0;
+  new_row sq_hard_w7_pos%ROWTYPE;
+BEGIN
+  FOR pos_rec IN pos_cur LOOP
+    UPDATE sq_hard_w7_pos
+       SET qty = pos_rec.qty * 2
+     WHERE CURRENT OF pos_cur;
+    bumped := bumped + 1;
+  END LOOP;
+
+  new_row.pos_id := 6;
+  new_row.qty    := 60;
+  new_row.tag    := 'six';
+  INSERT INTO sq_hard_w7_pos VALUES new_row;
+
+  new_row.qty := 61;
+  new_row.tag := 'six-fixed';
+  UPDATE sq_hard_w7_pos SET ROW = new_row WHERE pos_id = 6;
+
+  INSERT INTO sq_hard_w7_note (note_key, note_value, note_text)
+  VALUES ('cursor_dml', bumped, 'current-of/set-row');
+END;
+/
+
+UPDATE sq_hard_w7_pos
+   SET (qty, tag) = (SELECT s.qty, s.tag
+                     FROM sq_hard_w7_src s
+                     WHERE s.pos_id = sq_hard_w7_pos.pos_id)
+ WHERE pos_id = 2;
+
+MERGE INTO sq_hard_w7_pos t
+USING (SELECT pos_id, qty, tag FROM sq_hard_w7_src) s
+   ON (t.pos_id = s.pos_id)
+ WHEN MATCHED THEN
+   UPDATE SET t.tag = s.tag
+   WHERE  s.qty > 0
+   DELETE WHERE t.qty < 0
+ WHEN NOT MATCHED THEN
+   INSERT (pos_id, qty, tag)
+   VALUES (s.pos_id, s.qty, s.tag)
+   WHERE  s.qty <> 999;
+
+COMMIT;
+
+SELECT pos_id, qty, tag FROM sq_hard_w7_pos ORDER BY pos_id;
+
+--------------------------------------------------------------------------------
+-- W7-F: collection algebra round 2 and the numeric-literal suffixes.
+-- POWERMULTISET_BY_CARDINALITY nests a collection inside a collection, SET()
+-- and COLLECT(... ORDER BY) build them in SQL, and the PL/SQL side walks a
+-- string-indexed associative array while labelled loops jump around it.
+--------------------------------------------------------------------------------
+CREATE OR REPLACE TYPE sq_hard_w7_num_tab AS TABLE OF NUMBER;
+/
+CREATE OR REPLACE TYPE sq_hard_w7_str_tab AS TABLE OF VARCHAR2(30);
+/
+CREATE OR REPLACE TYPE sq_hard_w7_num_bag AS TABLE OF sq_hard_w7_num_tab;
+/
+
+SELECT CARDINALITY(SET(sq_hard_w7_num_tab(1, 1, 2, 2, 3)))    AS deduped,
+       (SELECT COUNT(*)
+        FROM TABLE(POWERMULTISET_BY_CARDINALITY(
+                     sq_hard_w7_num_tab(1, 2, 3), 2)))        AS pair_subsets,
+       (SELECT COUNT(*) FROM TABLE(sys.odcivarchar2list('a', 'b', 'c')))
+                                                              AS odci_rows
+FROM dual;
+
+-- Projected as a count, not as the collection itself: the two drivers render a
+-- collection column differently (OCI spells out the type name, the thin path
+-- renders decoded elements as JSON), so a raw collection projection is not
+-- driver-neutral.
+SELECT CARDINALITY(CAST(COLLECT(p.tag ORDER BY p.tag) AS sq_hard_w7_str_tab))
+         AS tag_count
+FROM sq_hard_w7_pos p
+WHERE p.qty IS NOT NULL;
+
+SELECT bag_row.COLUMN_VALUE AS ordered_tag,
+       ROWNUM               AS tag_ord
+FROM TABLE(CAST(MULTISET(SELECT p.tag
+                         FROM sq_hard_w7_pos p
+                         ORDER BY p.tag) AS sq_hard_w7_str_tab)) bag_row;
+
+DECLARE
+  TYPE tally_t IS TABLE OF PLS_INTEGER INDEX BY VARCHAR2(20);
+  SUBTYPE small_count IS PLS_INTEGER RANGE 0 .. 99 NOT NULL;
+
+  tally      tally_t;
+  walk_key   VARCHAR2(20);
+  seen       small_count := 0;
+  skipped    small_count := 0;
+  float_val  BINARY_FLOAT  := 1.5f;
+  double_val BINARY_DOUBLE := 2.5d;
+  fast_ctr   SIMPLE_INTEGER := 0;
+  left_over  sq_hard_w7_num_tab;
+  left_count PLS_INTEGER;
+BEGIN
+  tally('core')  := 3;
+  tally('aux')   := 0;
+  tally('spare') := 5;
+
+  walk_key := tally.FIRST;
+  <<walk_loop>>
+  WHILE walk_key IS NOT NULL LOOP
+    IF tally(walk_key) = 0 THEN
+      skipped  := skipped + 1;
+      walk_key := tally.NEXT(walk_key);
+      CONTINUE walk_loop;
+    END IF;
+
+    seen     := seen + 1;
+    fast_ctr := fast_ctr + tally(walk_key);
+    walk_key := tally.NEXT(walk_key);
+
+    EXIT walk_loop WHEN seen >= 9;
+  END LOOP walk_loop;
+
+  left_over := sq_hard_w7_num_tab(1, 2, 3, 4)
+                 MULTISET EXCEPT DISTINCT sq_hard_w7_num_tab(2, 4);
+  left_count := left_over.COUNT;
+
+  IF float_val > 1 AND double_val > 2 THEN
+    GOTO record_it;
+  END IF;
+  RAISE_APPLICATION_ERROR(-20702, 'literal suffix compare');
+
+  <<record_it>>
+  INSERT INTO sq_hard_w7_note (note_key, note_value, note_text)
+  VALUES ('collections', fast_ctr + left_count,
+          seen || '/' || skipped || '/' || left_count || '/'
+          || TO_CHAR(float_val + double_val));
+END;
+/
+
+--------------------------------------------------------------------------------
+-- W7-G: the scalar and statistical builtin zoo. LNNVL only makes sense in a
+-- WHERE clause, DUMP returns a formatted string, GROUP_ID needs a grouping
+-- set, and the REGR_ family takes two arguments in a fixed order.
+--------------------------------------------------------------------------------
+SELECT COUNT(*) AS lnnvl_rows
+FROM sq_hard_w7_pos p
+WHERE LNNVL(p.qty > 1000);
+
+SELECT DUMP(42, 10)                                AS dumped_number,
+       VSIZE(42)                                   AS number_bytes,
+       -- Wrapped in CASE on purpose: a bare BOOLEAN projection comes back as
+       -- TRUE on the newer protocols and as 1 on 314, which has no native
+       -- boolean, so the raw form is not protocol-neutral.
+       CASE
+         WHEN STANDARD_HASH('wave7', 'SHA256') IS NOT NULL THEN 'hashed'
+         ELSE 'unhashed'
+       END                                         AS hashed_ok,
+       ORA_HASH('wave7', 4095)                     AS bucketed,
+       NANVL(1, 0)                                 AS nan_guarded,
+       REMAINDER(17, 5)                            AS remainder_val,
+       BITAND(12, 10)                              AS bit_and,
+       TZ_OFFSET('+05:30')                         AS fixed_offset,
+       -- Both constructors return the server-default precision of 9. The thin
+       -- driver must preserve that describe metadata and render the same width
+       -- as OCI instead of collapsing the leading field to two digits.
+       NUMTOYMINTERVAL(14, 'MONTH')                 AS ym_interval,
+       TO_DSINTERVAL('P1DT2H')                     AS ds_interval
+FROM dual;
+
+SELECT NVL(s.prod_id, -1)                                  AS prod_id,
+       GROUP_ID()                                          AS gid,
+       GROUPING_ID(s.prod_id)                              AS grouping_id,
+       ROUND(REGR_SLOPE(s.amount, s.prod_id), 4)           AS regr_slope,
+       REGR_COUNT(s.amount, s.prod_id)                     AS regr_count,
+       ROUND(REGR_R2(s.amount, s.prod_id), 4)              AS regr_r2,
+       ROUND(REGR_AVGX(s.amount, s.prod_id), 4)            AS regr_avgx,
+       ROUND(CORR(s.amount, s.prod_id), 4)                 AS corr_val,
+       ROUND(COVAR_POP(s.amount, s.prod_id), 4)            AS covar_pop,
+       STATS_MODE(s.prod_id)                               AS modal_prod
+FROM sq_hard_w7_sales s
+GROUP BY GROUPING SETS ((s.prod_id), ())
+ORDER BY prod_id;
+
+--------------------------------------------------------------------------------
+-- W7-H: unified audit policy DDL -- ACTIONS / ON / WHEN read as clause
+-- keywords, and AUDIT/NOAUDIT POLICY are statements that start with a word the
+-- lexer also sees as an object type.
+--------------------------------------------------------------------------------
+CREATE AUDIT POLICY sq_hard_w7_pol
+  ACTIONS SELECT ON system.sq_hard_w7_note,
+          UPDATE ON system.sq_hard_w7_note;
+
+AUDIT POLICY sq_hard_w7_pol;
+
+SELECT COUNT(*) AS audit_policy_rows
+FROM audit_unified_enabled_policies
+WHERE policy_name = 'SQ_HARD_W7_POL';
+
+NOAUDIT POLICY sq_hard_w7_pol;
+
+--------------------------------------------------------------------------------
+-- W7-I: lexer round 2. A not-equals spelled ^=, comment and terminator
+-- lookalikes buried inside literals, an N-literal and a U-literal, keyword
+-- aliases with no AS, and one line that never uses a space.
+--------------------------------------------------------------------------------
+SELECT p.pos_id                                           AS "select",
+       'a -- not a comment /* nor this */; still text'     AS bait_text,
+       q'#hash-quoted 'inner' quotes#'                     AS hash_quoted,
+       N'nchar literal'                                    AS nchar_text,
+       U'esc\00e9ape'                                      AS uchar_text,
+       'doubled '' quote'                                  count,
+       LENGTH('a' || CHR(10) || 'b')                       partition
+FROM sq_hard_w7_pos p
+WHERE p.pos_id ^= 999
+  AND p.qty IS NOT NULL
+ORDER BY p.pos_id
+FETCH FIRST 2 ROWS ONLY;
+
+SELECT(1+2)*3-4/2 AS crammed,MOD(7,3)modded,ABS(-8)absed FROM dual WHERE 1^=2;
+
+SeLeCt CaSe WhEn 1=1 tHeN 'mixed' ElSe 'case' EnD AS alternating FROM DuAl;
+
+--------------------------------------------------------------------------------
+-- W7 self-verification.
+--------------------------------------------------------------------------------
+DECLARE
+  note_rows  PLS_INTEGER;
+  ctx_text   VARCHAR2(400);
+  pos_rows   PLS_INTEGER;
+  pos_two    VARCHAR2(20);
+  arch_rows  PLS_INTEGER;
+  xml_total  NUMBER;
+  coll_value NUMBER;
+BEGIN
+  SELECT COUNT(*) INTO note_rows FROM sq_hard_w7_note;
+  SELECT note_text INTO ctx_text
+  FROM sq_hard_w7_note WHERE note_key = 'context';
+  SELECT COUNT(*) INTO pos_rows FROM sq_hard_w7_pos;
+  SELECT tag INTO pos_two FROM sq_hard_w7_pos WHERE pos_id = 2;
+  SELECT COUNT(*) INTO arch_rows FROM sq_hard_w7_arch;
+  SELECT SUM(TO_NUMBER(s.COLUMN_VALUE.extract('/v/text()').getStringVal()))
+    INTO xml_total
+  FROM sq_hard_w7_xml x,
+       TABLE(XMLSEQUENCE(x.body_xml.extract('/doc/v'))) s
+  WHERE x.doc_id = 1;
+  SELECT note_value INTO coll_value
+  FROM sq_hard_w7_note WHERE note_key = 'collections';
+
+  IF note_rows <> 4 THEN
+    RAISE_APPLICATION_ERROR(-20710, 'w7 note rows ' || note_rows);
+  END IF;
+  IF ctx_text NOT LIKE 'wave7/gold/%' THEN
+    RAISE_APPLICATION_ERROR(-20711, 'w7 context ' || ctx_text);
+  END IF;
+  IF pos_rows <> 5 THEN
+    RAISE_APPLICATION_ERROR(-20712, 'w7 pos rows ' || pos_rows);
+  END IF;
+  IF pos_two <> 'two-new' THEN
+    RAISE_APPLICATION_ERROR(-20713, 'w7 pos tag ' || pos_two);
+  END IF;
+  IF arch_rows <> 1 THEN
+    RAISE_APPLICATION_ERROR(-20714, 'w7 archival rows ' || arch_rows);
+  END IF;
+  IF xml_total <> 55 THEN
+    RAISE_APPLICATION_ERROR(-20715, 'w7 xml total ' || xml_total);
+  END IF;
+  IF coll_value <> 10 THEN
+    RAISE_APPLICATION_ERROR(-20716, 'w7 collections ' || coll_value);
+  END IF;
+END;
+/
+
+--------------------------------------------------------------------------------
 -- Final self-verification and PASS banner.
 --------------------------------------------------------------------------------
 DECLARE
@@ -3145,7 +3737,9 @@ SELECT 'PASS' AS final_status,
        (SELECT COUNT(*) FROM sq_hard_metric)  AS metric_rows,
        (SELECT COUNT(*) FROM sq_hard_merge)   AS merge_rows,
        (SELECT COUNT(*) FROM sq_hard_w6_note) AS wave6_notes,
-       (SELECT SUM(bucket_qty) FROM sq_hard_w6_mv) AS wave6_mv_qty
+       (SELECT SUM(bucket_qty) FROM sq_hard_w6_mv) AS wave6_mv_qty,
+       (SELECT COUNT(*) FROM sq_hard_w7_note) AS wave7_notes,
+       (SELECT COUNT(*) FROM sq_hard_w7_pos)  AS wave7_pos
 FROM dual;
 
 PROMPT [ORACLE HARDCORE] PASS
@@ -3156,8 +3750,8 @@ PROMPT [ORACLE HARDCORE] PASS
 -- source: test/final_hardcore.sql
 -- db: Oracle
 -- metadata: test Oracle inferred catalog (file-scoped overlay) + Oracle built-ins
--- checked: 6868
--- suggestions checked: 36635
+-- checked: 8145
+-- suggestions checked: 49251
 -- missing: 0
 -- suggestions without type labels: 0
 -- marker: [[word]] means not suggested for the tested prefix

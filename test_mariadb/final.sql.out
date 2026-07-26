@@ -731,7 +731,7 @@ SELECT 'PASS' AS final_status,
 -- db: MariaDB
 -- metadata: test_mariadb/final.sql inferred catalog
 -- checked: 606
--- suggestions checked: 2185
+-- suggestions checked: 2222
 -- missing: 0
 -- suggestions without type labels: 0
 -- marker: [[word]] means not suggested for the tested prefix

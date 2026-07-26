@@ -1184,6 +1184,8 @@ pub const MYSQL_SQL_KEYWORDS: &[&str] = &[
     "OVERLAPS",
     "PACK_KEYS",
     "PAGE_CHECKSUM",
+    "PAGE_COMPRESSED",
+    "PAGE_COMPRESSION_LEVEL",
     "PARSER",
     "PARSE_VCOL_EXPR",
     "PARTIAL",
@@ -2075,14 +2077,25 @@ pub(crate) fn is_mysql_dash_comment_start(bytes: &[u8], idx: usize) -> bool {
     match bytes.get(idx + 2) {
         None => true,
         Some(byte) if byte.is_ascii_whitespace() || byte.is_ascii_control() => true,
-        // A dash ruler (`--------…` to end of line) is a comment banner, not a
-        // chain of minus operators. MySQL's `-- ` rule alone would open the
-        // comment at the *last* two dashes and re-render everything before it as
-        // operators, so re-formatting kept peeling the ruler apart.
-        Some(b'-') => bytes[idx + 2..]
-            .iter()
-            .take_while(|byte| **byte != b'\n' && **byte != b'\r')
-            .all(|byte| *byte == b'-' || byte.is_ascii_whitespace()),
+        // A dash ruler is a comment banner, not a chain of minus operators. The
+        // `-- ` rule applied to the first two dashes alone would open the comment
+        // at the *last* two dashes of the run and re-render everything before it
+        // as operators, so re-formatting kept peeling the ruler apart.
+        //
+        // The `-- ` rule is therefore applied to the whole dash *run*: whatever
+        // follows the run must be whitespace or end-of-line. That accepts both a
+        // bare ruler and a titled banner (`----- banner -----`), while leaving
+        // `---x` and `1---1` as operators, which is what the server computes.
+        Some(b'-') => {
+            let run_end = bytes[idx..]
+                .iter()
+                .position(|byte| *byte != b'-')
+                .map_or(bytes.len(), |offset| idx + offset);
+            match bytes.get(run_end) {
+                None => true,
+                Some(byte) => byte.is_ascii_whitespace() || byte.is_ascii_control(),
+            }
+        }
         Some(_) => false,
     }
 }

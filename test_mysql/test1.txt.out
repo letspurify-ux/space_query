@@ -867,7 +867,7 @@ ORDER BY audit_id;
 -- db: MySQL
 -- metadata: test_mysql/test1.txt inferred catalog
 -- checked: 850
--- suggestions checked: 2958
+-- suggestions checked: 2992
 -- missing: 0
 -- suggestions without type labels: 0
 -- marker: [[word]] means not suggested for the tested prefix

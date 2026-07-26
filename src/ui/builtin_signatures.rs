@@ -7528,6 +7528,7 @@ pub const MARIADB_FUNCTIONS: &[&str] = &[
     "UUID_SHORT",
     "UUID_V4",
     "UUID_V7",
+    "VALUE",
     "VALUES",
     "VARIANCE",
     "VAR_POP",
@@ -10741,6 +10742,13 @@ const MARIADB_SIGNATURES: &[BuiltinSignature] = &[
         name: "UUID_V7",
         syntaxes: &[
             "UUID_v7()",
+        ],
+        argument_separator_keywords: &[],
+    },
+    BuiltinSignature {
+        name: "VALUE",
+        syntaxes: &[
+            "VALUE(col_name)",
         ],
         argument_separator_keywords: &[],
     },

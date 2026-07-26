@@ -157,6 +157,8 @@ pub enum OracleVectorValue {
 pub struct ColumnMetadata {
     pub name: String,
     pub column_type: OracleColumnType,
+    pub precision: i8,
+    pub scale: i8,
     pub charset_form: u8,
     pub ora_type_num: u8,
     pub buffer_size: u32,

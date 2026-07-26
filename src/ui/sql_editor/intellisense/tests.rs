@@ -2142,6 +2142,17 @@ fn oracle_collect_script_catalog_entries(script: &str, catalog: &mut MysqlFamily
             idx += 1;
             continue;
         };
+        if token_word_eq(tokens.get(after_table_idx), "ROW")
+            && token_word_eq(tokens.get(after_table_idx + 1), "ARCHIVAL")
+        {
+            let columns = catalog
+                .columns
+                .entry(table_name.to_ascii_uppercase())
+                .or_default();
+            push_unique_case_insensitive(columns, "ORA_ARCHIVE_STATE");
+            idx = after_table_idx.saturating_add(2);
+            continue;
+        }
         if !token_word_eq(tokens.get(after_table_idx), "ADD") {
             idx += 1;
             continue;
@@ -52255,6 +52266,23 @@ fn hardcore_final_advanced_words_use_full_production_completion() {
             ("GROUP BY grp_alias", "grp_alias"),
             ("COUNT(DISTINCT row_tag)", "row_tag"),
             ("SELECT total_value INTO av_all_total", "total_value"),
+            (
+                "seq_row.COLUMN_VALUE.extract('/v/text()').getStringVal",
+                "getStringVal",
+            ),
+            ("LEVEL day   IS sq_hard_w7_time.day_id", "day_id"),
+            ("day   CHILD OF", "day"),
+            ("ATTRIBUTE day DETERMINES (day_name)", "day_name"),
+            (
+                "ATTRIBUTE cat  DETERMINES (sq_hard_w7_cat.cat_name)",
+                "sq_hard_w7_cat",
+            ),
+            ("SET ORA_ARCHIVE_STATE", "ORA_ARCHIVE_STATE"),
+            (
+                "ACTIONS SELECT ON system.sq_hard_w7_note",
+                "system",
+            ),
+            ("UPDATE ON system.sq_hard_w7_note", "UPDATE"),
         ],
     );
     let oracle_cte_script = load_intellisense_test_file("test20.sql");
@@ -52305,6 +52333,10 @@ fn hardcore_final_advanced_words_use_full_production_completion() {
             ("DELETE FROM p\nUSING", "p"),
             ("USING prune_rows p", "USING"),
             ("SET SESSION cte_max_recursion_depth", "cte_max_recursion_depth"),
+            (
+                "ALTER RESOURCE GROUP sq_hard_w7_rg",
+                "sq_hard_w7_rg",
+            ),
         ],
     );
 }
@@ -52385,6 +52417,24 @@ fn oracle_intellisense_data_from_catalog(catalog: &MysqlFamilyScriptCatalog) -> 
             vec!["TABLE_NAME", "DURATION"],
         ),
         ("VIEW", "V$VERSION", vec!["BANNER_FULL"]),
+        (
+            "VIEW",
+            "USER_DIMENSIONS",
+            vec!["OWNER", "DIMENSION_NAME", "INVALID", "COMPILE_STATE"],
+        ),
+        (
+            "VIEW",
+            "AUDIT_UNIFIED_ENABLED_POLICIES",
+            vec![
+                "USER_NAME",
+                "POLICY_NAME",
+                "ENABLED_OPTION",
+                "ENTITY_NAME",
+                "ENTITY_TYPE",
+                "SUCCESS",
+                "FAILURE",
+            ],
+        ),
     ] {
         if kind == "VIEW" {
             push_unique_case_insensitive(&mut data.views, relation);
@@ -52397,6 +52447,7 @@ fn oracle_intellisense_data_from_catalog(catalog: &MysqlFamilyScriptCatalog) -> 
         );
     }
     push_unique_case_insensitive(&mut data.schemas, "SYSTEM");
+    push_unique_case_insensitive(&mut data.users, "SYSTEM");
     push_unique_case_insensitive(&mut data.users, "SYS");
     push_unique_case_insensitive(&mut data.tables, "EMP");
     data.set_columns_for_table(
@@ -52471,6 +52522,21 @@ fn oracle_intellisense_data_from_catalog(catalog: &MysqlFamilyScriptCatalog) -> 
     }
     push_unique_case_insensitive(&mut data.types, "SYS_REFCURSOR");
 
+    data.set_members_for_qualifier_with_kinds(
+        "SYSTEM",
+        catalog
+            .tables
+            .iter()
+            .map(|name| (name.clone(), Some(QualifiedMemberKind::Table)))
+            .chain(
+                catalog
+                    .views
+                    .iter()
+                    .map(|name| (name.clone(), Some(QualifiedMemberKind::View))),
+            )
+            .collect(),
+    );
+
     data.rebuild_indices();
     data
 }
@@ -52524,6 +52590,31 @@ fn mysql_family_test_intellisense_data(
             ],
         ),
         (
+            "INFORMATION_SCHEMA.APPLICABLE_ROLES",
+            vec!["USER", "HOST", "GRANTEE", "GRANTEE_HOST", "ROLE_NAME", "IS_GRANTABLE"],
+        ),
+        (
+            "INFORMATION_SCHEMA.RESOURCE_GROUPS",
+            vec![
+                "RESOURCE_GROUP_NAME",
+                "RESOURCE_GROUP_TYPE",
+                "RESOURCE_GROUP_ENABLED",
+                "VCPU_IDS",
+                "THREAD_PRIORITY",
+            ],
+        ),
+        (
+            "INFORMATION_SCHEMA.ST_SPATIAL_REFERENCE_SYSTEMS",
+            vec![
+                "SRS_NAME",
+                "SRS_ID",
+                "ORGANIZATION",
+                "ORGANIZATION_COORDSYS_ID",
+                "DEFINITION",
+                "DESCRIPTION",
+            ],
+        ),
+        (
             "MYSQL.HELP_TOPIC",
             vec!["HELP_TOPIC_ID", "NAME", "DESCRIPTION", "EXAMPLE", "URL"],
         ),
@@ -52545,6 +52636,18 @@ fn mysql_family_test_intellisense_data(
             ("KEYWORDS".to_string(), Some(QualifiedMemberKind::Table)),
             ("PARTITIONS".to_string(), Some(QualifiedMemberKind::Table)),
             ("STATISTICS".to_string(), Some(QualifiedMemberKind::Table)),
+            (
+                "APPLICABLE_ROLES".to_string(),
+                Some(QualifiedMemberKind::Table),
+            ),
+            (
+                "RESOURCE_GROUPS".to_string(),
+                Some(QualifiedMemberKind::Table),
+            ),
+            (
+                "ST_SPATIAL_REFERENCE_SYSTEMS".to_string(),
+                Some(QualifiedMemberKind::Table),
+            ),
         ],
     );
     push_unique_case_insensitive(&mut data.schemas, "MYSQL");
@@ -55148,6 +55251,11 @@ fn intellisense_sweep_word_skip_context_from_analysis(
         )
         // `ALTER TYPE t ADD ATTRIBUTE (name …)` introduces the attribute name.
         || SqlEditorWidget::cursor_is_at_alter_type_attribute_name_slot_for_context(deep_ctx, true)
+        || SqlEditorWidget::cursor_is_at_oracle_create_dimension_declaration_name_slot_for_context(
+            deep_ctx,
+            true,
+            Some(db_type),
+        )
         || SqlEditorWidget::cursor_is_at_ddl_identifier_suppression_slot_for_context(
             deep_ctx, true,
         )
@@ -96432,5 +96540,3 @@ fn final_hardcore_completion_gap_regressions_are_covered() {
         "constraint references intentionally suppressed by production completion must be skipped"
     );
 }
-
-

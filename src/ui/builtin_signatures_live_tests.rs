@@ -32,7 +32,7 @@ fn assert_catalog(db_type: DatabaseType, names: &[&str], expected_len: usize) {
 fn builtin_signature_catalogs_match_official_manual_indices() {
     assert_catalog(DatabaseType::Oracle, ORACLE_FUNCTIONS, 464);
     assert_catalog(DatabaseType::MySQL, MYSQL_FUNCTIONS, 408);
-    assert_catalog(DatabaseType::MariaDB, MARIADB_FUNCTIONS, 475);
+    assert_catalog(DatabaseType::MariaDB, MARIADB_FUNCTIONS, 476);
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

@@ -16,6 +16,7 @@ CREATE DATABASE sq_hard_mysql CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_ai_ci;
 USE sq_hard_mysql;
 SET NAMES utf8mb4;
 SET SESSION sql_mode = 'STRICT_ALL_TABLES';
+SET TRANSACTION ISOLATION LEVEL REPEATABLE READ;
 
 -- Backtick identifiers that collide with reserved words, embed spaces, and use
 -- $/# characters. Highlighting/completion must treat these as identifiers.
@@ -1713,6 +1714,228 @@ CALL sq_hard_assert(
   'ctas + visibility ddl'
 );
 
+-- ULTRA WAVE 7: transaction control (consistent-snapshot start, savepoint
+-- release, LOCK TABLES ... READ LOCAL), roles round 2 with SET DEFAULT ROLE and
+-- SHOW GRANTS ... USING, two MySQL-only option-word DDL statements (resource
+-- group, spatial reference system), a three-argument LAG/LEAD MariaDB rejects,
+-- the JSON mutation family, RENAME INDEX / ALTER COLUMN DEFAULT maintenance
+-- with the SHOW/CHECKSUM/FLUSH/ANALYZE family, and a lexer round.
+
+-- W7-A: transaction control. START TRANSACTION takes modifier phrases that
+-- read as clause keywords, savepoint names sit where an identifier is only
+-- legal in this one statement, and LOCK TABLES takes a per-table lock mode.
+CREATE TABLE sq_hard_w7_txn (
+  txn_id INT PRIMARY KEY,
+  state  VARCHAR(12) NOT NULL
+) ENGINE = InnoDB;
+
+-- The isolation level is set once up in the prelude, not here: a stored-procedure
+-- CALL earlier in the script leaves the session conservatively marked as possibly
+-- holding a named lock and carrying unknown state (a procedure body can call
+-- GET_LOCK, which outlives COMMIT), and a transaction-mode change is refused
+-- while that is outstanding. REPEATABLE READ is what makes the snapshot below
+-- meaningful.
+START TRANSACTION WITH CONSISTENT SNAPSHOT;
+INSERT INTO sq_hard_w7_txn (txn_id, state) VALUES (1, 'kept');
+SAVEPOINT after_first;
+INSERT INTO sq_hard_w7_txn (txn_id, state) VALUES (2, 'rolled-back');
+ROLLBACK TO SAVEPOINT after_first;
+INSERT INTO sq_hard_w7_txn (txn_id, state) VALUES (3, 'kept-too');
+RELEASE SAVEPOINT after_first;
+COMMIT;
+
+LOCK TABLES sq_hard_w7_txn READ LOCAL;
+SELECT COUNT(*) AS locked_rows FROM sq_hard_w7_txn;
+UNLOCK TABLES;
+
+SELECT txn_id, state FROM sq_hard_w7_txn ORDER BY txn_id;
+
+-- W7-B: roles round 2. SET DEFAULT ROLE and SHOW GRANTS ... USING put role
+-- names in slots that otherwise only accept users, and a role name is a
+-- two-part user@host identifier.
+DROP ROLE IF EXISTS 'sq_hard_w7_reader', 'sq_hard_w7_writer';
+DROP USER IF EXISTS 'sq_hard_w7_app'@'localhost';
+
+CREATE ROLE 'sq_hard_w7_reader', 'sq_hard_w7_writer';
+CREATE USER 'sq_hard_w7_app'@'localhost' IDENTIFIED BY 'Wave7Pass!';
+
+GRANT SELECT ON sq_hard_mysql.* TO 'sq_hard_w7_reader';
+GRANT INSERT, UPDATE ON sq_hard_mysql.sq_hard_w7_txn TO 'sq_hard_w7_writer';
+GRANT 'sq_hard_w7_reader', 'sq_hard_w7_writer' TO 'sq_hard_w7_app'@'localhost';
+SET DEFAULT ROLE 'sq_hard_w7_reader' TO 'sq_hard_w7_app'@'localhost';
+
+SHOW GRANTS FOR 'sq_hard_w7_app'@'localhost' USING 'sq_hard_w7_reader';
+
+SELECT COUNT(*) AS granted_roles
+FROM INFORMATION_SCHEMA.APPLICABLE_ROLES
+WHERE GRANTEE = 'sq_hard_w7_app';
+
+REVOKE 'sq_hard_w7_writer' FROM 'sq_hard_w7_app'@'localhost';
+DROP USER 'sq_hard_w7_app'@'localhost';
+DROP ROLE 'sq_hard_w7_reader', 'sq_hard_w7_writer';
+
+-- W7-C: two MySQL-only DDL statements built from `=`-joined option words --
+-- a resource group and a spatial reference system whose DEFINITION is one
+-- 700-character bracket-nested WKT literal on a single line. Both are reset
+-- through a swallowing handler first, because DROP RESOURCE GROUP has no
+-- IF EXISTS form and the prepared-statement protocol refuses it outright.
+DROP PROCEDURE IF EXISTS sq_hard_w7_reset;
+DELIMITER $$
+CREATE PROCEDURE sq_hard_w7_reset()
+BEGIN
+  DECLARE CONTINUE HANDLER FOR SQLEXCEPTION BEGIN END;
+  DECLARE CONTINUE HANDLER FOR SQLWARNING BEGIN END;
+  DROP RESOURCE GROUP sq_hard_w7_rg;
+  DROP SPATIAL REFERENCE SYSTEM IF EXISTS 998877;
+END$$
+DELIMITER ;
+CALL sq_hard_w7_reset();
+
+CREATE RESOURCE GROUP sq_hard_w7_rg
+  TYPE = USER
+  VCPU = 0
+  THREAD_PRIORITY = 0
+  ENABLE;
+
+ALTER RESOURCE GROUP sq_hard_w7_rg VCPU = 0 THREAD_PRIORITY = 0 DISABLE;
+
+SELECT RESOURCE_GROUP_TYPE, THREAD_PRIORITY, RESOURCE_GROUP_ENABLED
+FROM INFORMATION_SCHEMA.RESOURCE_GROUPS
+WHERE RESOURCE_GROUP_NAME = 'sq_hard_w7_rg';
+
+DROP RESOURCE GROUP sq_hard_w7_rg;
+
+CREATE SPATIAL REFERENCE SYSTEM 998877
+  NAME 'sq_hard_w7 mercator'
+  DESCRIPTION 'wave 7 fixture projection'
+  DEFINITION 'PROJCS["sq_hard_w7 pseudo-mercator",GEOGCS["WGS 84",DATUM["World Geodetic System 1984",SPHEROID["WGS 84",6378137,298.257223563,AUTHORITY["EPSG","7030"]],AUTHORITY["EPSG","6326"]],PRIMEM["Greenwich",0,AUTHORITY["EPSG","8901"]],UNIT["degree",0.017453292519943278,AUTHORITY["EPSG","9122"]],AXIS["Lat",NORTH],AXIS["Lon",EAST],AUTHORITY["EPSG","4326"]],PROJECTION["Popular Visualisation Pseudo Mercator",AUTHORITY["EPSG","1024"]],PARAMETER["Latitude of natural origin",0,AUTHORITY["EPSG","8801"]],PARAMETER["Longitude of natural origin",0,AUTHORITY["EPSG","8802"]],PARAMETER["False easting",0,AUTHORITY["EPSG","8806"]],PARAMETER["False northing",0,AUTHORITY["EPSG","8807"]],UNIT["metre",1,AUTHORITY["EPSG","9001"]],AXIS["X",EAST],AXIS["Y",NORTH]]';
+
+SELECT SRS_NAME, ORGANIZATION IS NULL AS org_absent
+FROM INFORMATION_SCHEMA.ST_SPATIAL_REFERENCE_SYSTEMS
+WHERE SRS_ID = 998877;
+
+DROP SPATIAL REFERENCE SYSTEM 998877;
+
+-- W7-D: a three-argument LAG/LEAD -- whose default argument sits where a frame
+-- clause could otherwise start, and which MariaDB rejects outright -- over a
+-- named window that a later reference frame-extends. NTH_VALUE is spelled
+-- without FROM FIRST / FROM LAST: neither MySQL 8.0 nor MariaDB accepts those.
+CREATE TABLE sq_hard_w7_win (
+  win_id INT PRIMARY KEY,
+  bucket VARCHAR(10) NOT NULL,
+  amount INT NOT NULL
+) ENGINE = InnoDB;
+
+INSERT INTO sq_hard_w7_win (win_id, bucket, amount)
+VALUES (1, 'a', 10), (2, 'a', 30), (3, 'a', 20), (4, 'b', 40);
+
+SELECT w.win_id,
+       w.bucket,
+       w.amount,
+       NTH_VALUE(w.amount, 2) OVER (
+         w_ord ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING
+       )                                                AS second_value,
+       FIRST_VALUE(w.amount) OVER (
+         w_ord ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING
+       )                                                AS earliest_value,
+       LAG(w.amount, 2, -1) OVER w_ord                   AS lag_two_default,
+       LEAD(w.amount, 2, -2) OVER w_ord                  AS lead_two_default,
+       ROUND(PERCENT_RANK() OVER w_ord, 4)               AS pct_rank,
+       ROUND(CUME_DIST() OVER w_ord, 4)                  AS cume
+FROM sq_hard_w7_win w
+WINDOW w_ord AS (PARTITION BY w.bucket ORDER BY w.amount)
+ORDER BY w.win_id;
+
+-- W7-E: the JSON mutation family nested into one expression, plus the 8.0.17
+-- CAST target types that are otherwise only column-type keywords.
+SELECT JSON_PRETTY(
+         JSON_MERGE_PATCH(
+           JSON_SET(
+             JSON_REMOVE(
+               JSON_ARRAY_INSERT(
+                 JSON_ARRAY_APPEND(
+                   JSON_OBJECT('tags', JSON_ARRAY('sql'), 'drop', 1),
+                   '$.tags', 'json'),
+                 '$.tags[0]', 'first'),
+               '$.drop'),
+             '$.depth', JSON_DEPTH(JSON_ARRAY(1, JSON_ARRAY(2)))),
+           JSON_OBJECT('patched', TRUE))
+       )                                                AS mutated,
+       JSON_REPLACE('{"a":1}', '$.a', 9)                AS replaced,
+       CAST(1 AS DOUBLE)                                AS as_double,
+       CAST(2 AS FLOAT)                                 AS as_float,
+       CAST(3 AS REAL)                                  AS as_real,
+       CAST('4.5' AS DECIMAL(4, 2))                     AS as_decimal;
+
+-- W7-F: table maintenance. RENAME INDEX / ALTER COLUMN SET DEFAULT read as
+-- action phrases, and SHOW / CHECKSUM / FLUSH / ANALYZE are statements whose
+-- second word is an object-kind keyword.
+CREATE TABLE sq_hard_w7_maint (
+  maint_id INT NOT NULL PRIMARY KEY,
+  bucket   VARCHAR(10) NOT NULL,
+  measured INT NOT NULL DEFAULT 0,
+  KEY ix_before (bucket)
+) ENGINE = InnoDB;
+
+INSERT INTO sq_hard_w7_maint (maint_id, bucket, measured)
+VALUES (1, 'a', 10), (2, 'b', 20);
+
+ALTER TABLE sq_hard_w7_maint RENAME INDEX ix_before TO ix_after;
+ALTER TABLE sq_hard_w7_maint ALTER COLUMN measured SET DEFAULT 7;
+INSERT INTO sq_hard_w7_maint (maint_id, bucket) VALUES (3, 'c');
+ALTER TABLE sq_hard_w7_maint ALTER COLUMN measured DROP DEFAULT;
+
+SHOW CREATE TABLE sq_hard_w7_maint;
+SHOW INDEX FROM sq_hard_w7_maint FROM sq_hard_mysql;
+SHOW COLUMNS FROM sq_hard_w7_maint LIKE 'meas%';
+CHECKSUM TABLE sq_hard_w7_maint QUICK;
+FLUSH LOCAL TABLES sq_hard_w7_maint;
+ANALYZE TABLE sq_hard_w7_maint;
+
+SELECT maint_id, bucket, measured FROM sq_hard_w7_maint ORDER BY maint_id;
+
+-- W7-G: lexer round. MySQL rejects a long dash ruler as a comment, so every
+-- comment here is `-- text`; the rest is literals that impersonate comments and
+-- terminators, an executable comment, and one unspaced line.
+SELECT /*! 1 + */ 1                                      AS versioned_comment,
+       'a -- not a comment /* nor this */; still text'    AS bait_text,
+       0x4D7953514C                                      AS hex_literal,
+       b'1011'                                           AS bit_literal,
+       1.5e-3                                            AS sci_literal,
+       X'4D79'                                           AS x_literal,
+       `select`.`from`                                    AS quoted_path
+FROM (SELECT 1 AS `from`) AS `select`;
+
+SELECT(1+2)*3-4/2 AS crammed,MOD(7,3)modded,ABS(-8)absed FROM DUAL WHERE 1<>2;
+
+sElEcT cAsE wHeN 1=1 tHeN 'mixed' eLsE 'case' eNd AS alternating;
+
+-- W7-H: wave-7 self-verification.
+CALL sq_hard_assert(
+  (SELECT COUNT(*) FROM sq_hard_w7_txn) = 2
+  AND (SELECT COUNT(*) FROM sq_hard_w7_txn WHERE txn_id = 2) = 0,
+  'savepoint rollback'
+);
+CALL sq_hard_assert(
+  (SELECT measured FROM sq_hard_w7_maint WHERE maint_id = 3) = 7,
+  'alter column default'
+);
+CALL sq_hard_assert(
+  (SELECT COUNT(*)
+   FROM INFORMATION_SCHEMA.STATISTICS
+   WHERE TABLE_SCHEMA = 'sq_hard_mysql'
+     AND TABLE_NAME = 'sq_hard_w7_maint'
+     AND INDEX_NAME = 'ix_after') = 1,
+  'rename index'
+);
+CALL sq_hard_assert(
+  (SELECT COUNT(*) FROM INFORMATION_SCHEMA.RESOURCE_GROUPS
+   WHERE RESOURCE_GROUP_NAME = 'sq_hard_w7_rg') = 0
+  AND (SELECT COUNT(*) FROM INFORMATION_SCHEMA.ST_SPATIAL_REFERENCE_SYSTEMS
+       WHERE SRS_ID = 998877) = 0,
+  'resource group + srs cleanup'
+);
+
 SELECT 'PASS' AS final_status,
        VERSION() AS server_version,
        (SELECT COUNT(*) FROM metric) AS metric_rows,
@@ -1722,4 +1945,6 @@ SELECT 'PASS' AS final_status,
        (SELECT COUNT(*) FROM sq_hard_w5_hint) AS wave5_rows,
        @sq_hard_w5_label AS wave5_label,
        (SELECT COUNT(*) FROM sq_hard_w6_series) AS wave6_rows,
-       @sq_hard_w6_walk_rows AS wave6_walk_rows;
+       @sq_hard_w6_walk_rows AS wave6_walk_rows,
+       (SELECT COUNT(*) FROM sq_hard_w7_txn) AS wave7_txn_rows,
+       (SELECT COUNT(*) FROM sq_hard_w7_maint) AS wave7_maint_rows;

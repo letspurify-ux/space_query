@@ -2202,6 +2202,8 @@ impl OracleThinSession {
             .map(|(index, column_type)| ColumnMetadata {
                 name: format!("COL{}", index + 1),
                 column_type: *column_type,
+                precision: 0,
+                scale: 0,
                 charset_form: bind_column_metadata(&BindValue::Null(*column_type)).charset_form,
                 ora_type_num: 0,
                 buffer_size: 0,
@@ -2224,6 +2226,8 @@ impl OracleThinSession {
             .map(|(index, column_type)| ColumnMetadata {
                 name: format!("COL{}", index + 1),
                 column_type: *column_type,
+                precision: 0,
+                scale: 0,
                 charset_form: bind_column_metadata(&BindValue::Null(*column_type)).charset_form,
                 ora_type_num: 0,
                 buffer_size: 0,
@@ -3975,6 +3979,8 @@ struct LobReadResponse {
 struct ThinColumn {
     name: String,
     column_type: OracleColumnType,
+    precision: i8,
+    scale: i8,
     ora_type_num: u8,
     charset_form: u8,
     buffer_size: u32,
@@ -4199,6 +4205,8 @@ fn thin_column_from_object_attr(
         return Ok(ThinColumn {
             name,
             column_type,
+            precision: 0,
+            scale: 0,
             ora_type_num,
             charset_form,
             buffer_size,
@@ -4360,6 +4368,14 @@ fn thin_column_from_object_attr(
     Ok(ThinColumn {
         name,
         column_type,
+        precision: match column_type {
+            OracleColumnType::IntervalYearMonth | OracleColumnType::IntervalDaySecond => 2,
+            _ => 0,
+        },
+        scale: match column_type {
+            OracleColumnType::IntervalDaySecond => 6,
+            _ => 0,
+        },
         ora_type_num,
         charset_form,
         buffer_size,
@@ -5334,8 +5350,8 @@ fn write_column_metadata_inner(
     };
     payload.push(ora_type_num);
     payload.push(TNS_BIND_USE_INDICATORS | if is_array { TNS_BIND_ARRAY } else { 0 });
-    payload.push(0);
-    payload.push(0);
+    payload.push(column.precision as u8);
+    payload.push(column.scale as u8);
     write_ub4(payload, buffer_size);
     write_ub4(payload, max_num_elements);
     if capabilities.ttc_field_version <= 6 {
@@ -6221,9 +6237,16 @@ fn bind_column_metadata(bind: &BindValue) -> ThinColumn {
             _ => 0,
         }
     };
+    let (precision, scale) = match column_type {
+        OracleColumnType::IntervalYearMonth => (2, 0),
+        OracleColumnType::IntervalDaySecond => (2, 6),
+        _ => (0, 0),
+    };
     ThinColumn {
         name: String::new(),
         column_type,
+        precision,
+        scale,
         ora_type_num,
         charset_form,
         buffer_size: max_len,
@@ -6276,6 +6299,8 @@ fn thin_column_from_column_metadata(column: &ColumnMetadata) -> ThinColumn {
         return ThinColumn {
             name: column.name.clone(),
             column_type: column.column_type,
+            precision: column.precision,
+            scale: column.scale,
             ora_type_num: column.ora_type_num,
             charset_form: column.charset_form,
             buffer_size: column.buffer_size,
@@ -6313,6 +6338,8 @@ fn thin_column_from_column_metadata(column: &ColumnMetadata) -> ThinColumn {
     };
     let mut thin = bind_column_metadata(&bind_like);
     thin.name = column.name.clone();
+    thin.precision = column.precision;
+    thin.scale = column.scale;
     thin.schema_name = column.schema_name.clone();
     thin.type_name = column.type_name.clone();
     if column.charset_form != 0 {
@@ -7324,8 +7351,8 @@ fn process_column_metadata(
 ) -> Result<ThinColumn, OracleThinError> {
     let ora_type_num = cursor.read_u8()?;
     cursor.skip(1)?;
-    let _ = cursor.read_i8()?;
-    let _ = cursor.read_i8()?;
+    let precision = cursor.read_i8()?;
+    let scale = cursor.read_i8()?;
     let buffer_size = cursor.read_ub4()?;
     let _ = cursor.read_ub4()?;
     let _ = cursor.read_ub8()?;
@@ -7376,6 +7403,8 @@ fn process_column_metadata(
     Ok(ThinColumn {
         name,
         column_type,
+        precision,
+        scale,
         charset_form: normalize_metadata_charset_form(column_type, charset_form),
         ora_type_num,
         buffer_size,
@@ -7794,7 +7823,10 @@ fn read_column_value(
                         column.ora_type_num,
                     );
                 };
-                OracleValue::Text(decode_oracle_interval_ym(&bytes)?)
+                OracleValue::Text(decode_oracle_interval_ym_with_precision(
+                    &bytes,
+                    column.precision,
+                )?)
             }
             ORA_TYPE_NUM_INTERVAL_DS | ORA_TYPE_NUM_INTERVAL_DS_DTY => {
                 let Some(bytes) = cursor.read_bytes()? else {
@@ -7805,7 +7837,11 @@ fn read_column_value(
                         column.ora_type_num,
                     );
                 };
-                OracleValue::Text(decode_oracle_interval_ds(&bytes)?)
+                OracleValue::Text(decode_oracle_interval_ds_with_precision(
+                    &bytes,
+                    column.precision,
+                    column.scale,
+                )?)
             }
             ORA_TYPE_NUM_CURSOR | TNS_DATA_TYPE_RSET => {
                 let _ = cursor.read_u8()?;
@@ -8211,13 +8247,19 @@ fn read_object_attr_value(
             .unwrap_or(OracleValue::Null)),
         ORA_TYPE_NUM_INTERVAL_YM | ORA_TYPE_NUM_INTERVAL_YM_DTY => {
             read_object_pickle_bytes(cursor)?
-                .map(|bytes| decode_oracle_interval_ym(&bytes).map(OracleValue::Text))
+                .map(|bytes| {
+                    decode_oracle_interval_ym_with_precision(&bytes, attr.precision)
+                        .map(OracleValue::Text)
+                })
                 .transpose()
                 .map(|value| value.unwrap_or(OracleValue::Null))
         }
         ORA_TYPE_NUM_INTERVAL_DS | ORA_TYPE_NUM_INTERVAL_DS_DTY => {
             read_object_pickle_bytes(cursor)?
-                .map(|bytes| decode_oracle_interval_ds(&bytes).map(OracleValue::Text))
+                .map(|bytes| {
+                    decode_oracle_interval_ds_with_precision(&bytes, attr.precision, attr.scale)
+                        .map(OracleValue::Text)
+                })
                 .transpose()
                 .map(|value| value.unwrap_or(OracleValue::Null))
         }
@@ -9643,6 +9685,8 @@ fn column_metadata_from_thin(column: &ThinColumn) -> ColumnMetadata {
     ColumnMetadata {
         name: column.name.clone(),
         column_type: column.column_type,
+        precision: column.precision,
+        scale: column.scale,
         charset_form: column.charset_form,
         ora_type_num: column.ora_type_num,
         buffer_size: column.buffer_size,
@@ -10764,6 +10808,13 @@ fn read_vector_slice<'a>(
 }
 
 fn decode_oracle_interval_ym(bytes: &[u8]) -> Result<String, OracleThinError> {
+    decode_oracle_interval_ym_with_precision(bytes, 2)
+}
+
+fn decode_oracle_interval_ym_with_precision(
+    bytes: &[u8],
+    precision: i8,
+) -> Result<String, OracleThinError> {
     if bytes.len() != 5 {
         return Err(OracleThinError::new(format!(
             "invalid Oracle INTERVAL YEAR TO MONTH length {}",
@@ -10774,7 +10825,14 @@ fn decode_oracle_interval_ym(bytes: &[u8]) -> Result<String, OracleThinError> {
         i64::from(u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]])) - TNS_DURATION_MID;
     let months = i32::from(bytes[4]) - TNS_DURATION_OFFSET;
     let sign = if years < 0 || months < 0 { '-' } else { '+' };
-    Ok(format!("{sign}{:02}-{:02}", years.abs(), months.abs()))
+    let width = usize::from(
+        u8::try_from(precision)
+            .ok()
+            .filter(|value| *value <= 9)
+            .unwrap_or(2),
+    )
+    .max(1);
+    Ok(format!("{sign}{:0width$}-{:02}", years.abs(), months.abs()))
 }
 
 fn encode_oracle_interval_ym(value: &OracleIntervalYearMonth) -> Result<Vec<u8>, OracleThinError> {
@@ -10787,6 +10845,14 @@ fn encode_oracle_interval_ym(value: &OracleIntervalYearMonth) -> Result<Vec<u8>,
 }
 
 fn decode_oracle_interval_ds(bytes: &[u8]) -> Result<String, OracleThinError> {
+    decode_oracle_interval_ds_with_precision(bytes, 2, 6)
+}
+
+fn decode_oracle_interval_ds_with_precision(
+    bytes: &[u8],
+    precision: i8,
+    scale: i8,
+) -> Result<String, OracleThinError> {
     if bytes.len() != 11 {
         return Err(OracleThinError::new(format!(
             "invalid Oracle INTERVAL DAY TO SECOND length {}",
@@ -10806,14 +10872,32 @@ fn decode_oracle_interval_ds(bytes: &[u8]) -> Result<String, OracleThinError> {
     } else {
         '+'
     };
-    Ok(format!(
-        "{sign}{:02} {:02}:{:02}:{:02}.{:06}",
+    let day_width = usize::from(
+        u8::try_from(precision)
+            .ok()
+            .filter(|value| *value <= 9)
+            .unwrap_or(2),
+    )
+    .max(1);
+    let fractional_width = usize::from(
+        u8::try_from(scale)
+            .ok()
+            .filter(|value| *value <= 9)
+            .unwrap_or(6),
+    );
+    let mut rendered = format!(
+        "{sign}{:0day_width$} {:02}:{:02}:{:02}",
         days.abs(),
         hours.abs(),
         minutes.abs(),
         seconds.abs(),
-        (fseconds / 1_000).abs()
-    ))
+    );
+    if fractional_width > 0 {
+        let nanoseconds = format!("{:09}", fseconds.abs());
+        rendered.push('.');
+        rendered.push_str(&nanoseconds[..fractional_width]);
+    }
+    Ok(rendered)
 }
 
 fn encode_oracle_interval_ds(value: &OracleIntervalDaySecond) -> Result<Vec<u8>, OracleThinError> {
@@ -14476,35 +14560,37 @@ mod tests {
         client_compile_caps, client_runtime_caps, decode_collection_payload, decode_json_payload,
         decode_json_payload_value, decode_object_payload, decode_oracle_binary_double,
         decode_oracle_binary_float, decode_oracle_datetime, decode_oracle_interval_ds,
-        decode_oracle_interval_ym, decode_oracle_number, decode_oracle_text, decode_oracle_vector,
-        decode_oson_to_json, default_ttc_field_version, define_column_metadata,
-        derive_auth_combo_key, des_encrypt_block, encode_auth_password, encode_bfile_locator,
-        encode_debug_jdwp_data, encode_oracle_binary_double, encode_oracle_binary_float,
-        encode_oracle_number, encode_oracle_timestamp_bind, encode_oson_bool_json,
-        encode_oson_date_json, encode_oson_id_json, encode_oson_interval_ds_json,
-        encode_oson_interval_ym_json, encode_oson_json, encode_oson_number_json,
-        encode_oson_raw_json, encode_oson_string_json, encode_oson_timestamp_json,
-        encode_oson_vector_json, encode_physical_rowid, encode_temp_clob_text, encode_vector,
-        execute_flags_for_request, fetched_lob_locator_needs_free, generate_10g_password_hash,
-        generate_11g_password_hash, generate_auth_credentials_from_session_key_parts,
-        hex_encode_upper, local_timezone_offset_string, normalize_cursor_ids,
-        normalize_metadata_charset_form, oracle_column_type_from_ora_type,
-        oracle_column_type_from_ora_type_for_protocol, process_auth_payload, process_describe_body,
-        process_legacy_execute_error, process_protocol_message, process_return_parameters,
-        process_row_data, process_server_side_piggyback, process_token, process_warning,
-        read_boolean_value, read_connect_data_packet, read_data_packet_with_control,
-        read_data_packet_with_flags, read_rowid_value, read_urowid_value, request_is_dml_returning,
-        request_with_out_bind_types, sql_dml_returning_has_duplicate_bind,
-        thin_column_from_column_metadata, thin_column_from_object_attr,
-        validate_supported_protocol, verify_server_response, windows_code_pages_for_encoding,
-        write_bind_rows_for_request, write_bind_value, write_bytes_with_length_for_capabilities,
-        write_bytes_with_two_lengths, write_close_cursors_piggyback, write_column_metadata,
-        write_current_schema_piggyback, write_data_packet, write_data_type_representations,
-        write_end_to_end_piggyback, write_eof_data_packet, write_function_code,
-        write_session_state_piggyback, write_ub2, write_ub4, write_ub8, AuthCredentials, AuthState,
-        BreakSignal, CancelReadState, EndToEndAttributes, OracleThinAppContext, OracleThinAuthMode,
-        OracleThinCapabilities, OracleThinConfig, OracleThinPurity, OracleThinSession, OracleValue,
-        PacketCursor, ServerSidePiggybackState, ThinColumn, BREAK_SIGNAL_INBAND, BREAK_SIGNAL_NONE,
+        decode_oracle_interval_ds_with_precision, decode_oracle_interval_ym,
+        decode_oracle_interval_ym_with_precision, decode_oracle_number, decode_oracle_text,
+        decode_oracle_vector, decode_oson_to_json, default_ttc_field_version,
+        define_column_metadata, derive_auth_combo_key, des_encrypt_block, encode_auth_password,
+        encode_bfile_locator, encode_debug_jdwp_data, encode_oracle_binary_double,
+        encode_oracle_binary_float, encode_oracle_number, encode_oracle_timestamp_bind,
+        encode_oson_bool_json, encode_oson_date_json, encode_oson_id_json,
+        encode_oson_interval_ds_json, encode_oson_interval_ym_json, encode_oson_json,
+        encode_oson_number_json, encode_oson_raw_json, encode_oson_string_json,
+        encode_oson_timestamp_json, encode_oson_vector_json, encode_physical_rowid,
+        encode_temp_clob_text, encode_vector, execute_flags_for_request,
+        fetched_lob_locator_needs_free, generate_10g_password_hash, generate_11g_password_hash,
+        generate_auth_credentials_from_session_key_parts, hex_encode_upper,
+        local_timezone_offset_string, normalize_cursor_ids, normalize_metadata_charset_form,
+        oracle_column_type_from_ora_type, oracle_column_type_from_ora_type_for_protocol,
+        process_auth_payload, process_describe_body, process_legacy_execute_error,
+        process_protocol_message, process_return_parameters, process_row_data,
+        process_server_side_piggyback, process_token, process_warning, read_boolean_value,
+        read_connect_data_packet, read_data_packet_with_control, read_data_packet_with_flags,
+        read_rowid_value, read_urowid_value, request_is_dml_returning, request_with_out_bind_types,
+        sql_dml_returning_has_duplicate_bind, thin_column_from_column_metadata,
+        thin_column_from_object_attr, validate_supported_protocol, verify_server_response,
+        windows_code_pages_for_encoding, write_bind_rows_for_request, write_bind_value,
+        write_bytes_with_length_for_capabilities, write_bytes_with_two_lengths,
+        write_close_cursors_piggyback, write_column_metadata, write_current_schema_piggyback,
+        write_data_packet, write_data_type_representations, write_end_to_end_piggyback,
+        write_eof_data_packet, write_function_code, write_session_state_piggyback, write_ub2,
+        write_ub4, write_ub8, AuthCredentials, AuthState, BreakSignal, CancelReadState,
+        EndToEndAttributes, OracleThinAppContext, OracleThinAuthMode, OracleThinCapabilities,
+        OracleThinConfig, OracleThinPurity, OracleThinSession, OracleValue, PacketCursor,
+        ServerSidePiggybackState, ThinColumn, BREAK_SIGNAL_INBAND, BREAK_SIGNAL_NONE,
         BREAK_SIGNAL_OOB, CS_FORM_IMPLICIT, CS_FORM_NCHAR, ORACLE_CHARSET_AL32UTF8,
         ORACLE_CHARSET_UTF8, TNS_CCAP_END_OF_CALL_STATUS, TNS_CCAP_END_OF_RESPONSE,
         TNS_CCAP_EXPLICIT_BOUNDARY, TNS_CCAP_FIELD_VERSION, TNS_CCAP_FIELD_VERSION_20_1,
@@ -16600,6 +16686,8 @@ mod tests {
         let scalar_columns = [ColumnMetadata {
             name: "N".to_string(),
             column_type: OracleColumnType::Number,
+            precision: 0,
+            scale: 0,
             charset_form: 0,
             ora_type_num: ORA_TYPE_NUM_NUMBER,
             buffer_size: 22,
@@ -16609,6 +16697,8 @@ mod tests {
         let ref_cursor_columns = [ColumnMetadata {
             name: "RC".to_string(),
             column_type: OracleColumnType::Cursor,
+            precision: 0,
+            scale: 0,
             charset_form: 0,
             ora_type_num: ORA_TYPE_NUM_CURSOR,
             buffer_size: 4,
@@ -17175,6 +17265,10 @@ mod tests {
             decode_oracle_interval_ym(&[127, 255, 255, 251, 57]).unwrap(),
             "-05-03"
         );
+        assert_eq!(
+            decode_oracle_interval_ym_with_precision(&[128, 0, 0, 1, 62], 9).unwrap(),
+            "+000000001-02"
+        );
     }
 
     #[test]
@@ -17186,6 +17280,24 @@ mod tests {
         assert_eq!(
             decode_oracle_interval_ds(&[128, 0, 0, 0, 50, 40, 30, 100, 197, 243, 248]).unwrap(),
             "-00 10:20:30.456789"
+        );
+        assert_eq!(
+            decode_oracle_interval_ds_with_precision(
+                &[128, 0, 0, 2, 72, 83, 94, 155, 46, 2, 0],
+                5,
+                3,
+            )
+            .unwrap(),
+            "+00002 12:23:34.456"
+        );
+        assert_eq!(
+            decode_oracle_interval_ds_with_precision(
+                &[128, 0, 0, 2, 72, 83, 94, 155, 46, 2, 0],
+                5,
+                0,
+            )
+            .unwrap(),
+            "+00002 12:23:34"
         );
     }
 
@@ -17451,6 +17563,8 @@ mod tests {
             ThinColumn {
                 name: "C_CHAR".to_string(),
                 column_type: OracleColumnType::Varchar,
+                precision: 0,
+                scale: 0,
                 ora_type_num: ORA_TYPE_NUM_CHAR,
                 charset_form: CS_FORM_NCHAR,
                 buffer_size: 10,
@@ -17460,6 +17574,8 @@ mod tests {
             ThinColumn {
                 name: "C_VARCHAR".to_string(),
                 column_type: OracleColumnType::Varchar,
+                precision: 0,
+                scale: 0,
                 ora_type_num: ORA_TYPE_NUM_VARCHAR,
                 charset_form: CS_FORM_IMPLICIT,
                 buffer_size: 10,
@@ -17469,6 +17585,8 @@ mod tests {
             ThinColumn {
                 name: "B_RAW".to_string(),
                 column_type: OracleColumnType::Raw,
+                precision: 0,
+                scale: 0,
                 ora_type_num: ORA_TYPE_NUM_RAW,
                 charset_form: 0,
                 buffer_size: 10,
@@ -17478,6 +17596,8 @@ mod tests {
             ThinColumn {
                 name: "B_LONG_RAW".to_string(),
                 column_type: OracleColumnType::Raw,
+                precision: 0,
+                scale: 0,
                 ora_type_num: ORA_TYPE_NUM_LONG_RAW,
                 charset_form: 0,
                 buffer_size: 10,
@@ -17489,6 +17609,8 @@ mod tests {
             ThinColumn {
                 name: "C_CHAR".to_string(),
                 column_type: OracleColumnType::Clob,
+                precision: 0,
+                scale: 0,
                 ora_type_num: ORA_TYPE_NUM_CLOB,
                 charset_form: CS_FORM_IMPLICIT,
                 buffer_size: 112,
@@ -17498,6 +17620,8 @@ mod tests {
             ThinColumn {
                 name: "C_VARCHAR".to_string(),
                 column_type: OracleColumnType::Clob,
+                precision: 0,
+                scale: 0,
                 ora_type_num: ORA_TYPE_NUM_CLOB,
                 charset_form: CS_FORM_NCHAR,
                 buffer_size: 112,
@@ -17507,6 +17631,8 @@ mod tests {
             ThinColumn {
                 name: "B_RAW".to_string(),
                 column_type: OracleColumnType::Blob,
+                precision: 0,
+                scale: 0,
                 ora_type_num: ORA_TYPE_NUM_BLOB,
                 charset_form: 0,
                 buffer_size: 112,
@@ -17516,6 +17642,8 @@ mod tests {
             ThinColumn {
                 name: "B_LONG_RAW".to_string(),
                 column_type: OracleColumnType::Blob,
+                precision: 0,
+                scale: 0,
                 ora_type_num: ORA_TYPE_NUM_BLOB,
                 charset_form: 0,
                 buffer_size: 112,
@@ -18133,6 +18261,8 @@ mod tests {
         let mut state = execute_read_state_with_columns(vec![ThinColumn {
             name: "DURATION".to_string(),
             column_type: OracleColumnType::IntervalDaySecond,
+            precision: 2,
+            scale: 6,
             ora_type_num: ORA_TYPE_NUM_INTERVAL_DS,
             charset_form: 0,
             buffer_size: 11,
@@ -18156,6 +18286,8 @@ mod tests {
         let mut state = execute_read_state_with_columns(vec![ThinColumn {
             name: "VALUE".to_string(),
             column_type: OracleColumnType::BinaryFloat,
+            precision: 0,
+            scale: 0,
             ora_type_num: ORA_TYPE_NUM_BINARY_FLOAT,
             charset_form: 0,
             buffer_size: 4,
@@ -18180,6 +18312,8 @@ mod tests {
             ThinColumn {
                 name: "BF".to_string(),
                 column_type: OracleColumnType::BinaryFloat,
+                precision: 0,
+                scale: 0,
                 ora_type_num: TNS_DATA_TYPE_BFLOAT,
                 charset_form: 0,
                 buffer_size: 4,
@@ -18189,6 +18323,8 @@ mod tests {
             ThinColumn {
                 name: "BD".to_string(),
                 column_type: OracleColumnType::BinaryDouble,
+                precision: 0,
+                scale: 0,
                 ora_type_num: TNS_DATA_TYPE_BDOUBLE,
                 charset_form: 0,
                 buffer_size: 8,
@@ -18928,6 +19064,8 @@ mod tests {
             ThinColumn {
                 name: "N".to_string(),
                 column_type: OracleColumnType::Number,
+                precision: 0,
+                scale: 0,
                 ora_type_num: TNS_DATA_TYPE_DTR,
                 charset_form: 0,
                 buffer_size: 22,
@@ -18937,6 +19075,8 @@ mod tests {
             ThinColumn {
                 name: "S".to_string(),
                 column_type: OracleColumnType::Varchar,
+                precision: 0,
+                scale: 0,
                 ora_type_num: TNS_DATA_TYPE_VCS,
                 charset_form: CS_FORM_IMPLICIT,
                 buffer_size: 10,
@@ -18946,6 +19086,8 @@ mod tests {
             ThinColumn {
                 name: "CLV".to_string(),
                 column_type: OracleColumnType::Varchar,
+                precision: 0,
+                scale: 0,
                 ora_type_num: TNS_DATA_TYPE_CLV,
                 charset_form: CS_FORM_IMPLICIT,
                 buffer_size: 10,
@@ -18955,6 +19097,8 @@ mod tests {
             ThinColumn {
                 name: "R".to_string(),
                 column_type: OracleColumnType::Raw,
+                precision: 0,
+                scale: 0,
                 ora_type_num: TNS_DATA_TYPE_LVB,
                 charset_form: 0,
                 buffer_size: 3,
@@ -18964,6 +19108,8 @@ mod tests {
             ThinColumn {
                 name: "D".to_string(),
                 column_type: OracleColumnType::Date,
+                precision: 0,
+                scale: 0,
                 ora_type_num: TNS_DATA_TYPE_ODT,
                 charset_form: 0,
                 buffer_size: 7,
@@ -18973,6 +19119,8 @@ mod tests {
             ThinColumn {
                 name: "C".to_string(),
                 column_type: OracleColumnType::Clob,
+                precision: 0,
+                scale: 0,
                 ora_type_num: TNS_DATA_TYPE_DCLOB,
                 charset_form: 0,
                 buffer_size: 4,
@@ -18982,6 +19130,8 @@ mod tests {
             ThinColumn {
                 name: "U".to_string(),
                 column_type: OracleColumnType::Number,
+                precision: 0,
+                scale: 0,
                 ora_type_num: TNS_DATA_TYPE_UB8,
                 charset_form: 0,
                 buffer_size: 8,
@@ -18991,6 +19141,8 @@ mod tests {
             ThinColumn {
                 name: "T".to_string(),
                 column_type: OracleColumnType::Varchar,
+                precision: 0,
+                scale: 0,
                 ora_type_num: TNS_DATA_TYPE_TIME,
                 charset_form: 0,
                 buffer_size: 11,
@@ -19000,6 +19152,8 @@ mod tests {
             ThinColumn {
                 name: "TTZ".to_string(),
                 column_type: OracleColumnType::Varchar,
+                precision: 0,
+                scale: 0,
                 ora_type_num: TNS_DATA_TYPE_TIME_TZ,
                 charset_form: 0,
                 buffer_size: 13,
@@ -19009,6 +19163,8 @@ mod tests {
             ThinColumn {
                 name: "RID".to_string(),
                 column_type: OracleColumnType::Varchar,
+                precision: 0,
+                scale: 0,
                 ora_type_num: TNS_DATA_TYPE_RDD,
                 charset_form: 0,
                 buffer_size: 18,
@@ -19080,6 +19236,8 @@ mod tests {
         let mut state = execute_read_state_with_columns(vec![ThinColumn {
             name: "VBI".to_string(),
             column_type: OracleColumnType::Raw,
+            precision: 0,
+            scale: 0,
             ora_type_num: TNS_DATA_TYPE_VBI,
             charset_form: 0,
             buffer_size: 3,
@@ -19108,6 +19266,8 @@ mod tests {
         let mut state = execute_read_state_with_columns(vec![ThinColumn {
             name: "VBI".to_string(),
             column_type: OracleColumnType::Varchar,
+            precision: 0,
+            scale: 0,
             ora_type_num: TNS_DATA_TYPE_VBI,
             charset_form: CS_FORM_IMPLICIT,
             buffer_size: 3,
@@ -19134,6 +19294,8 @@ mod tests {
             out_bind_columns: vec![ThinColumn {
                 name: "P".to_string(),
                 column_type: OracleColumnType::Varchar,
+                precision: 0,
+                scale: 0,
                 ora_type_num: ORA_TYPE_NUM_VARCHAR,
                 charset_form: CS_FORM_IMPLICIT,
                 buffer_size: 3,
@@ -19163,6 +19325,8 @@ mod tests {
             out_bind_columns: vec![ThinColumn {
                 name: "P".to_string(),
                 column_type: OracleColumnType::Boolean,
+                precision: 0,
+                scale: 0,
                 ora_type_num: ORA_TYPE_NUM_BOOLEAN,
                 charset_form: 0,
                 buffer_size: 4,
@@ -19185,6 +19349,8 @@ mod tests {
         let mut state = execute_read_state_with_columns(vec![ThinColumn {
             name: "TS_LTZ".to_string(),
             column_type: OracleColumnType::Timestamp,
+            precision: 0,
+            scale: 0,
             ora_type_num: ORA_TYPE_NUM_TIMESTAMP_LTZ,
             charset_form: 0,
             buffer_size: 11,
@@ -19217,6 +19383,8 @@ mod tests {
         let mut state = execute_read_state_with_columns(vec![ThinColumn {
             name: "TS_TZ".to_string(),
             column_type: OracleColumnType::Timestamp,
+            precision: 0,
+            scale: 0,
             ora_type_num: ORA_TYPE_NUM_TIMESTAMP_TZ_EXT,
             charset_form: 0,
             buffer_size: 13,
@@ -19249,6 +19417,8 @@ mod tests {
         let thin = thin_column_from_column_metadata(&ColumnMetadata {
             name: "NV".to_string(),
             column_type: OracleColumnType::Varchar,
+            precision: 0,
+            scale: 0,
             charset_form: CS_FORM_NCHAR,
             ora_type_num: 0,
             buffer_size: 0,
@@ -19265,6 +19435,8 @@ mod tests {
         let thin = define_column_metadata(&ColumnMetadata {
             name: "NC".to_string(),
             column_type: OracleColumnType::Nclob,
+            precision: 0,
+            scale: 0,
             charset_form: CS_FORM_NCHAR,
             ora_type_num: 0,
             buffer_size: 0,
@@ -19310,6 +19482,8 @@ mod tests {
         let original = ThinColumn {
             name: "TS_TZ".to_string(),
             column_type: OracleColumnType::Timestamp,
+            precision: 9,
+            scale: 3,
             ora_type_num: ORA_TYPE_NUM_TIMESTAMP_TZ_EXT,
             charset_form: 0,
             buffer_size: 13,
@@ -19323,6 +19497,10 @@ mod tests {
         assert_eq!(restored.column_type, original.column_type);
         assert_eq!(restored.ora_type_num, ORA_TYPE_NUM_TIMESTAMP_TZ_EXT);
         assert_eq!(restored.buffer_size, 13);
+        assert_eq!(public.precision, 9);
+        assert_eq!(public.scale, 3);
+        assert_eq!(restored.precision, 9);
+        assert_eq!(restored.scale, 3);
         assert_eq!(public.schema_name, "APP");
         assert_eq!(public.type_name, "EVENT_OBJ");
         assert_eq!(restored.schema_name, "APP");
@@ -19342,6 +19520,8 @@ mod tests {
             vec![ThinColumn {
                 name: "TS_TZ".to_string(),
                 column_type: OracleColumnType::Timestamp,
+                precision: 0,
+                scale: 0,
                 ora_type_num: ORA_TYPE_NUM_TIMESTAMP_TZ_EXT,
                 charset_form: 0,
                 buffer_size: 13,
@@ -19367,6 +19547,8 @@ mod tests {
         let column = ColumnMetadata {
             name: "LONG_RAW_VALUE".to_string(),
             column_type: OracleColumnType::Raw,
+            precision: 0,
+            scale: 0,
             charset_form: 0,
             ora_type_num: ORA_TYPE_NUM_LONG_RAW,
             buffer_size: 0,
@@ -19396,6 +19578,8 @@ mod tests {
             let column = ThinColumn {
                 name: "LOB".to_string(),
                 column_type: OracleColumnType::Clob,
+                precision: 0,
+                scale: 0,
                 ora_type_num,
                 charset_form: 0,
                 buffer_size: 4000,
@@ -19429,6 +19613,8 @@ mod tests {
         let column = ThinColumn {
             name: "JSON".to_string(),
             column_type: OracleColumnType::Json,
+            precision: 0,
+            scale: 0,
             ora_type_num: ORA_TYPE_NUM_JSON,
             charset_form: 0,
             buffer_size: TNS_JSON_MAX_LENGTH,
@@ -19525,6 +19711,8 @@ mod tests {
             ThinColumn {
                 name: "RID".to_string(),
                 column_type: OracleColumnType::Rowid,
+                precision: 0,
+                scale: 0,
                 ora_type_num: ORA_TYPE_NUM_ROWID,
                 charset_form: 0,
                 buffer_size: 18,
@@ -19534,6 +19722,8 @@ mod tests {
             ThinColumn {
                 name: "URID".to_string(),
                 column_type: OracleColumnType::Urowid,
+                precision: 0,
+                scale: 0,
                 ora_type_num: ORA_TYPE_NUM_UROWID,
                 charset_form: 0,
                 buffer_size: 18,
@@ -19563,6 +19753,8 @@ mod tests {
             ThinColumn {
                 name: "RID".to_string(),
                 column_type: OracleColumnType::Rowid,
+                precision: 0,
+                scale: 0,
                 ora_type_num: ORA_TYPE_NUM_ROWID,
                 charset_form: 0,
                 buffer_size: 18,
@@ -19572,6 +19764,8 @@ mod tests {
             ThinColumn {
                 name: "URID".to_string(),
                 column_type: OracleColumnType::Urowid,
+                precision: 0,
+                scale: 0,
                 ora_type_num: ORA_TYPE_NUM_UROWID,
                 charset_form: 0,
                 buffer_size: 18,
@@ -20024,6 +20218,8 @@ mod tests {
         let mut state = execute_read_state_with_columns(vec![ThinColumn {
             name: "J".to_string(),
             column_type: OracleColumnType::Json,
+            precision: 0,
+            scale: 0,
             ora_type_num: ORA_TYPE_NUM_JSON,
             charset_form: 0,
             buffer_size: TNS_JSON_MAX_LENGTH,
@@ -20064,6 +20260,8 @@ mod tests {
         let mut state = execute_read_state_with_columns(vec![ThinColumn {
             name: "J".to_string(),
             column_type: oracle_column_type_from_ora_type(ORA_TYPE_NUM_DJSON),
+            precision: 0,
+            scale: 0,
             ora_type_num: ORA_TYPE_NUM_DJSON,
             charset_form: 0,
             buffer_size: TNS_JSON_MAX_LENGTH,
@@ -20102,6 +20300,8 @@ mod tests {
         let mut state = execute_read_state_with_columns(vec![ThinColumn {
             name: "X".to_string(),
             column_type: OracleColumnType::Xml,
+            precision: 0,
+            scale: 0,
             ora_type_num: ORA_TYPE_NUM_OBJECT,
             charset_form: 0,
             buffer_size: TNS_MAX_LONG_LENGTH,
@@ -20140,6 +20340,8 @@ mod tests {
         let mut state = execute_read_state_with_columns(vec![ThinColumn {
             name: "X".to_string(),
             column_type: OracleColumnType::Xml,
+            precision: 0,
+            scale: 0,
             ora_type_num: ORA_TYPE_NUM_OBJECT,
             charset_form: 0,
             buffer_size: TNS_MAX_LONG_LENGTH,
@@ -20178,6 +20380,8 @@ mod tests {
         let mut state = execute_read_state_with_columns(vec![ThinColumn {
             name: "X".to_string(),
             column_type: OracleColumnType::Xml,
+            precision: 0,
+            scale: 0,
             ora_type_num: ORA_TYPE_NUM_OBJECT,
             charset_form: 0,
             buffer_size: TNS_MAX_LONG_LENGTH,
@@ -20216,6 +20420,8 @@ mod tests {
         let column = ThinColumn {
             name: "O".to_string(),
             column_type: OracleColumnType::Object,
+            precision: 0,
+            scale: 0,
             ora_type_num: ORA_TYPE_NUM_OBJECT,
             charset_form: 0,
             buffer_size: 1,
@@ -20228,6 +20434,8 @@ mod tests {
             vec![ThinColumn {
                 name: "A".to_string(),
                 column_type: OracleColumnType::Varchar,
+                precision: 0,
+                scale: 0,
                 ora_type_num: ORA_TYPE_NUM_VARCHAR,
                 charset_form: CS_FORM_IMPLICIT,
                 buffer_size: 1,
@@ -20272,6 +20480,8 @@ mod tests {
         let element = ThinColumn {
             name: "E".to_string(),
             column_type: OracleColumnType::Varchar,
+            precision: 0,
+            scale: 0,
             ora_type_num: ORA_TYPE_NUM_VARCHAR,
             charset_form: CS_FORM_IMPLICIT,
             buffer_size: 1,
@@ -20300,6 +20510,8 @@ mod tests {
         let element = ThinColumn {
             name: "E".to_string(),
             column_type: OracleColumnType::Varchar,
+            precision: 0,
+            scale: 0,
             ora_type_num: ORA_TYPE_NUM_VARCHAR,
             charset_form: CS_FORM_IMPLICIT,
             buffer_size: 1,
@@ -20332,6 +20544,8 @@ mod tests {
         let column = ThinColumn {
             name: "O".to_string(),
             column_type: OracleColumnType::Object,
+            precision: 0,
+            scale: 0,
             ora_type_num: ORA_TYPE_NUM_OBJECT,
             charset_form: 0,
             buffer_size: 1,
@@ -20341,6 +20555,8 @@ mod tests {
         let attr = ThinColumn {
             name: "BI".to_string(),
             column_type: OracleColumnType::Number,
+            precision: 0,
+            scale: 0,
             ora_type_num: TNS_DATA_TYPE_BINARY_INTEGER,
             charset_form: 0,
             buffer_size: 4,
@@ -20376,6 +20592,8 @@ mod tests {
         let column = ThinColumn {
             name: "O".to_string(),
             column_type: OracleColumnType::Object,
+            precision: 0,
+            scale: 0,
             ora_type_num: ORA_TYPE_NUM_OBJECT,
             charset_form: 0,
             buffer_size: 1,
@@ -20386,6 +20604,8 @@ mod tests {
             ThinColumn {
                 name: "LEADING_TRUE".to_string(),
                 column_type: OracleColumnType::Boolean,
+                precision: 0,
+                scale: 0,
                 ora_type_num: ORA_TYPE_NUM_BOOLEAN,
                 charset_form: 0,
                 buffer_size: 4,
@@ -20395,6 +20615,8 @@ mod tests {
             ThinColumn {
                 name: "TRUE_VALUE".to_string(),
                 column_type: OracleColumnType::Boolean,
+                precision: 0,
+                scale: 0,
                 ora_type_num: ORA_TYPE_NUM_BOOLEAN,
                 charset_form: 0,
                 buffer_size: 4,
@@ -20433,6 +20655,8 @@ mod tests {
         let column = ThinColumn {
             name: "O".to_string(),
             column_type: OracleColumnType::Object,
+            precision: 0,
+            scale: 0,
             ora_type_num: ORA_TYPE_NUM_OBJECT,
             charset_form: 0,
             buffer_size: 1,
@@ -20442,6 +20666,8 @@ mod tests {
         let attr = ThinColumn {
             name: "PAYLOAD".to_string(),
             column_type: OracleColumnType::Long,
+            precision: 0,
+            scale: 0,
             ora_type_num: ORA_TYPE_NUM_LONG,
             charset_form: CS_FORM_IMPLICIT,
             buffer_size: TNS_MAX_LONG_LENGTH,
@@ -20477,6 +20703,8 @@ mod tests {
         let column = ThinColumn {
             name: "O".to_string(),
             column_type: OracleColumnType::Object,
+            precision: 0,
+            scale: 0,
             ora_type_num: ORA_TYPE_NUM_OBJECT,
             charset_form: 0,
             buffer_size: 1,
@@ -20521,6 +20749,8 @@ mod tests {
         let column = ThinColumn {
             name: "O".to_string(),
             column_type: OracleColumnType::Object,
+            precision: 0,
+            scale: 0,
             ora_type_num: ORA_TYPE_NUM_OBJECT,
             charset_form: 0,
             buffer_size: 1,
@@ -20530,6 +20760,8 @@ mod tests {
         let attr = ThinColumn {
             name: "PAYLOAD".to_string(),
             column_type: OracleColumnType::Raw,
+            precision: 0,
+            scale: 0,
             ora_type_num: ORA_TYPE_NUM_LONG_RAW,
             charset_form: 0,
             buffer_size: TNS_MAX_LONG_LENGTH,
@@ -20565,6 +20797,8 @@ mod tests {
         let column = ThinColumn {
             name: "P".to_string(),
             column_type: OracleColumnType::Object,
+            precision: 0,
+            scale: 0,
             ora_type_num: ORA_TYPE_NUM_OBJECT,
             charset_form: 0,
             buffer_size: 1,
@@ -20574,6 +20808,8 @@ mod tests {
         let child_attr = ThinColumn {
             name: "CHILD".to_string(),
             column_type: OracleColumnType::Object,
+            precision: 0,
+            scale: 0,
             ora_type_num: ORA_TYPE_NUM_OBJECT,
             charset_form: 0,
             buffer_size: 1,
@@ -20583,6 +20819,8 @@ mod tests {
         let child_value_attr = ThinColumn {
             name: "A".to_string(),
             column_type: OracleColumnType::Varchar,
+            precision: 0,
+            scale: 0,
             ora_type_num: ORA_TYPE_NUM_VARCHAR,
             charset_form: CS_FORM_IMPLICIT,
             buffer_size: 1,
@@ -20624,6 +20862,8 @@ mod tests {
         let element = ThinColumn {
             name: "E".to_string(),
             column_type: OracleColumnType::Number,
+            precision: 0,
+            scale: 0,
             ora_type_num: TNS_DATA_TYPE_BINARY_INTEGER,
             charset_form: 0,
             buffer_size: 4,
@@ -20660,6 +20900,8 @@ mod tests {
         let mut state = execute_read_state_with_columns(vec![ThinColumn {
             name: "BF".to_string(),
             column_type: OracleColumnType::Bfile,
+            precision: 0,
+            scale: 0,
             ora_type_num: ORA_TYPE_NUM_BFILE,
             charset_form: 0,
             buffer_size: 1,
@@ -20689,6 +20931,8 @@ mod tests {
         let mut state = execute_read_state_with_columns(vec![ThinColumn {
             name: "V".to_string(),
             column_type: OracleColumnType::Vector,
+            precision: 0,
+            scale: 0,
             ora_type_num: ORA_TYPE_NUM_VECTOR,
             charset_form: 0,
             buffer_size: 1,
@@ -22348,6 +22592,8 @@ mod tests {
                 ThinColumn {
                     name: "A".to_string(),
                     column_type: OracleColumnType::Varchar,
+                    precision: 0,
+                    scale: 0,
                     ora_type_num: ORA_TYPE_NUM_VARCHAR,
                     charset_form: 1,
                     buffer_size: 10,
@@ -22357,6 +22603,8 @@ mod tests {
                 ThinColumn {
                     name: "B".to_string(),
                     column_type: OracleColumnType::Varchar,
+                    precision: 0,
+                    scale: 0,
                     ora_type_num: ORA_TYPE_NUM_VARCHAR,
                     charset_form: 1,
                     buffer_size: 10,

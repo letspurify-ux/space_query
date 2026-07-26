@@ -714,7 +714,7 @@ SELECT 'FINAL_STATUS' AS section_name,
 -- db: MariaDB
 -- metadata: test_mariadb/test8.txt inferred catalog
 -- checked: 956
--- suggestions checked: 4076
+-- suggestions checked: 4123
 -- missing: 0
 -- suggestions without type labels: 0
 -- marker: [[word]] means not suggested for the tested prefix

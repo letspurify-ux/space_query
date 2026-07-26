@@ -991,12 +991,20 @@ fn fetch_interval_columns_decodes_vendor_formats() {
         ]
     );
     assert_eq!(
+        result
+            .columns
+            .iter()
+            .map(|column| (column.precision, column.scale))
+            .collect::<Vec<_>>(),
+        vec![(9, 0), (9, 0), (9, 9), (9, 9)]
+    );
+    assert_eq!(
         rows_to_strings(&result.result.rows),
         vec![vec![
-            "+2021-10".to_string(),
-            "-05-03".to_string(),
-            "+02 12:23:34.456000".to_string(),
-            "-00 10:20:30.456789".to_string(),
+            "+000002021-10".to_string(),
+            "-000000005-03".to_string(),
+            "+000000002 12:23:34.456000000".to_string(),
+            "-000000000 10:20:30.456789000".to_string(),
         ]]
     );
 }

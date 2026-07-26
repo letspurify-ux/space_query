@@ -774,6 +774,31 @@ const ORACLE_BUILTIN_PACKAGE_MEMBERS: &[(&str, &[&str])] = &[
         &["CREATE_ERROR_LOG"],
     ),
     (
+        // `ctxHandle` is the package's context type, named in a declaration the
+        // same way a routine is called off the package.
+        "DBMS_XMLGEN",
+        &[
+            "CLOSECONTEXT", "CONVERT", "CTXHANDLE", "GETNUMROWSPROCESSED", "GETXML",
+            "GETXMLTYPE", "NEWCONTEXT", "NEWCONTEXTFROMHIERARCHY", "RESTARTQUERY",
+            "SETCONVERTSPECIALCHARS", "SETMAXROWS", "SETNULLHANDLING", "SETROWSETTAG",
+            "SETROWTAG", "SETSKIPROWS", "USEITEMTAGSFORCOLL", "USENULLATTRIBUTEINDICATOR",
+        ],
+    ),
+    (
+        "DBMS_ILM",
+        &[
+            "ARCHIVESTATENAME", "EXECUTE_ILM", "EXECUTE_ILM_TASK", "STOP_ILM",
+        ],
+    ),
+    (
+        "UTL_CALL_STACK",
+        &[
+            "BACKTRACE_DEPTH", "BACKTRACE_LINE", "BACKTRACE_UNIT", "CONCATENATE_SUBPROGRAM",
+            "CURRENT_EDITION", "DYNAMIC_DEPTH", "ERROR_DEPTH", "ERROR_MSG", "ERROR_NUMBER",
+            "LEXICAL_DEPTH", "OWNER", "SUBPROGRAM", "UNIT_LINE",
+        ],
+    ),
+    (
         "DBMS_OUTPUT",
         &["PUT_LINE", "PUT", "NEW_LINE", "GET_LINE", "GET_LINES", "ENABLE", "DISABLE"],
     ),
@@ -3385,6 +3410,30 @@ impl SqlEditorWidget {
                 deep_ctx,
                 has_prefix || qualifier.is_some(),
             );
+        let (at_oracle_create_dimension_object_reference, at_oracle_audit_policy_target) = {
+            let tokens = deep_ctx.statement_tokens.as_ref();
+            let end = Self::expected_suggestion_context_end(
+                tokens,
+                deep_ctx.cursor_token_len,
+                has_prefix || qualifier.is_some(),
+            );
+            (
+                Self::expected_oracle_create_dimension_object_suggestion_kind(
+                    tokens,
+                    end,
+                    qualifier,
+                    Some(snapshot.preferred_db_type),
+                )
+                .is_some(),
+                Self::expected_oracle_create_audit_policy_target_kind(
+                    tokens,
+                    end,
+                    qualifier,
+                    Some(snapshot.preferred_db_type),
+                )
+                .is_some(),
+            )
+        };
         let at_package_declaration_default_value_empty_operand_start = qualifier.is_none()
             && snapshot.prefix.is_empty()
             && Self::cursor_is_at_package_declaration_default_value_operand_start_for_context(
@@ -3487,6 +3536,13 @@ impl SqlEditorWidget {
         } else {
             Vec::new()
         };
+        let early_mysql_resource_group_suggestions =
+            Self::mysql_script_resource_group_suggestions(
+                &snapshot.signature_scan_text,
+                &snapshot.prefix,
+                deep_ctx,
+                Some(snapshot.preferred_db_type),
+            );
         let early_oracle_analytic_reference_suggestions = if qualifier.is_none()
             && Self::cursor_is_at_oracle_analytic_object_reference_slot_for_context(
                 deep_ctx,
@@ -3500,6 +3556,48 @@ impl SqlEditorWidget {
             let dimensions = data.get_dimension_object_suggestions(&snapshot.prefix);
             let views = data.get_view_object_suggestions(&snapshot.prefix);
             Self::merge_suggestions_with_context_aliases(dimensions, views, false)
+        } else {
+            Vec::new()
+        };
+        let early_oracle_create_dimension_suggestions = if qualifier.is_none()
+            && !Self::cursor_is_at_oracle_create_dimension_declaration_name_slot_for_context(
+                deep_ctx,
+                has_prefix,
+                Some(snapshot.preferred_db_type),
+            )
+        {
+            Self::oracle_create_dimension_level_names_and_relations_for_context(
+                deep_ctx,
+                has_prefix,
+                Some(snapshot.preferred_db_type),
+            )
+            .map(|(levels, relations)| {
+                for relation in &relations {
+                    Self::request_table_columns_for_db(
+                        relation,
+                        intellisense_data,
+                        column_sender,
+                        connection,
+                        Some(snapshot.preferred_db_type),
+                    );
+                }
+                let level_suggestions = levels
+                    .into_iter()
+                    .filter(|name| {
+                        Self::completion_suggestion_matches_prefix(name, &snapshot.prefix)
+                    })
+                    .collect();
+                let column_suggestions = intellisense_data
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .get_column_suggestions(&snapshot.prefix, Some(&relations));
+                Self::merge_suggestions_with_context_aliases(
+                    level_suggestions,
+                    column_suggestions,
+                    false,
+                )
+            })
+            .unwrap_or_default()
         } else {
             Vec::new()
         };
@@ -4342,6 +4440,8 @@ impl SqlEditorWidget {
                     && !at_data_type_position
                     && !at_package_declaration_default_value
                     && !ddl_new_name_allows_keyword_suggestions
+                    && !at_oracle_create_dimension_object_reference
+                    && !at_oracle_audit_policy_target
                     && reference_column_scope.is_none()
                     && oracle_trigger_update_of_column_scope.is_none()
                     && create_table_declared_column_suggestions.is_none()
@@ -4362,6 +4462,11 @@ impl SqlEditorWidget {
                 || Self::cursor_is_at_alter_type_attribute_name_slot_for_context(
                     deep_ctx,
                     has_prefix || qualifier.is_some(),
+                )
+                || Self::cursor_is_at_oracle_create_dimension_declaration_name_slot_for_context(
+                    deep_ctx,
+                    has_prefix || qualifier.is_some(),
+                    Some(snapshot.preferred_db_type),
                 )
                 || Self::cursor_is_inside_post_table_modifier_value_slot_for_context(
                     deep_ctx,
@@ -4408,6 +4513,8 @@ impl SqlEditorWidget {
                     && !at_mysql_trigger_pseudo_row_qualified_column
                     && !at_mysql_insert_values_row_alias_qualified_column
                     && !at_comment_on_column_qualified_name_slot
+                    && !at_oracle_create_dimension_object_reference
+                    && !at_oracle_audit_policy_target
                     && Self::cursor_is_at_qualified_identifier_suppression_slot_for_context(
                         deep_ctx,
                         Some(snapshot.preferred_db_type),
@@ -4428,7 +4535,9 @@ impl SqlEditorWidget {
             && early_signature_argument_suggestions.is_empty()
             && early_builtin_function_call_suggestions.is_empty()
             && early_mysql_call_target_suggestions.is_empty()
+            && early_mysql_resource_group_suggestions.is_empty()
             && early_oracle_analytic_reference_suggestions.is_empty()
+            && early_oracle_create_dimension_suggestions.is_empty()
             && early_oracle_language_member_suggestions
                 .as_ref()
                 .is_none_or(Vec::is_empty)
@@ -5797,7 +5906,15 @@ impl SqlEditorWidget {
             );
             label_suggestions(&early_oracle_show_errors_object_suggestions, "OBJECT");
             label_suggestions(&early_mysql_call_target_suggestions, "PROCEDURE");
+            label_suggestions(
+                &early_mysql_resource_group_suggestions,
+                "RESOURCE GROUP",
+            );
             label_suggestions(&early_oracle_analytic_reference_suggestions, "DIMENSION");
+            label_suggestions(
+                &early_oracle_create_dimension_suggestions,
+                "DIMENSION ITEM",
+            );
             label_suggestions(&expected_keyword_suggestions, "KEYWORD");
             label_suggestions(&signature_argument_suggestions, "PARAMETER");
             label_suggestions(&session_bind_names, "BIND");
@@ -6243,12 +6360,30 @@ impl SqlEditorWidget {
                 true,
             )
         };
+        let suggestions = if early_mysql_resource_group_suggestions.is_empty() {
+            suggestions
+        } else {
+            Self::merge_suggestions_with_context_aliases(
+                suggestions,
+                early_mysql_resource_group_suggestions,
+                true,
+            )
+        };
         let suggestions = if early_oracle_analytic_reference_suggestions.is_empty() {
             suggestions
         } else {
             Self::merge_suggestions_with_context_aliases(
                 suggestions,
                 early_oracle_analytic_reference_suggestions,
+                true,
+            )
+        };
+        let suggestions = if early_oracle_create_dimension_suggestions.is_empty() {
+            suggestions
+        } else {
+            Self::merge_suggestions_with_context_aliases(
+                suggestions,
+                early_oracle_create_dimension_suggestions,
                 true,
             )
         };
@@ -9535,6 +9670,198 @@ impl SqlEditorWidget {
             words.as_slice(),
             [.., dimension, by] if dimension == "DIMENSION" && by == "BY"
         ) || words.last().is_some_and(|word| word == "HIERARCHIES")
+    }
+
+    fn tokens_begin_oracle_create_dimension(tokens: &[&SqlToken]) -> bool {
+        let words = tokens
+            .iter()
+            .filter_map(|token| Self::token_word(token).map(str::to_ascii_uppercase))
+            .collect::<Vec<_>>();
+        let mut idx = 0usize;
+        if words.get(idx).map(String::as_str) != Some("CREATE") {
+            return false;
+        }
+        idx += 1;
+        while matches!(
+            words.get(idx).map(String::as_str),
+            Some("OR" | "REPLACE" | "FORCE" | "NOFORCE")
+        ) {
+            idx += 1;
+        }
+        words.get(idx).map(String::as_str) == Some("DIMENSION")
+    }
+
+    fn cursor_is_at_oracle_create_dimension_declaration_name_slot_for_context(
+        deep_ctx: &intellisense_context::CursorContext,
+        exclude_current_identifier_chain: bool,
+        db_type: Option<crate::db::DatabaseType>,
+    ) -> bool {
+        if crate::sql_text::mysql_compatibility_for_sql("", db_type) {
+            return false;
+        }
+        let tokens = deep_ctx.statement_tokens.as_ref();
+        let end = Self::expected_suggestion_context_end(
+            tokens,
+            deep_ctx.cursor_token_len,
+            exclude_current_identifier_chain,
+        );
+        let meaningful = Self::meaningful_tokens_before(tokens, end);
+        Self::tokens_begin_oracle_create_dimension(&meaningful)
+            && matches!(
+                meaningful.last(),
+                Some(SqlToken::Word(word))
+                    if word.eq_ignore_ascii_case("LEVEL")
+                        || word.eq_ignore_ascii_case("HIERARCHY")
+            )
+    }
+
+    fn oracle_create_dimension_level_names_and_relations_for_context(
+        deep_ctx: &intellisense_context::CursorContext,
+        exclude_current_identifier_chain: bool,
+        db_type: Option<crate::db::DatabaseType>,
+    ) -> Option<(Vec<String>, Vec<String>)> {
+        if crate::sql_text::mysql_compatibility_for_sql("", db_type) {
+            return None;
+        }
+        let tokens = deep_ctx.statement_tokens.as_ref();
+        let end = Self::expected_suggestion_context_end(
+            tokens,
+            deep_ctx.cursor_token_len,
+            exclude_current_identifier_chain,
+        );
+        let meaningful = Self::meaningful_tokens_before(tokens, end);
+        if !Self::tokens_begin_oracle_create_dimension(&meaningful) {
+            return None;
+        }
+
+        let mut levels = Vec::new();
+        let mut relations = Vec::new();
+        for window in meaningful.windows(4) {
+            let [
+                SqlToken::Word(level_kw),
+                SqlToken::Word(level_name),
+                SqlToken::Word(is_kw),
+                SqlToken::Word(relation),
+            ] = window
+            else {
+                continue;
+            };
+            if !level_kw.eq_ignore_ascii_case("LEVEL") || !is_kw.eq_ignore_ascii_case("IS") {
+                continue;
+            }
+            Self::push_unique_completion_name(&mut levels, level_name);
+            Self::push_unique_completion_name(&mut relations, relation);
+        }
+        Some((levels, relations))
+    }
+
+    fn expected_oracle_create_dimension_object_suggestion_kind(
+        tokens: &[SqlToken],
+        end: usize,
+        _qualifier: Option<&str>,
+        db_type: Option<crate::db::DatabaseType>,
+    ) -> Option<ExpectedObjectSuggestionKind> {
+        if crate::sql_text::mysql_compatibility_for_sql("", db_type) {
+            return None;
+        }
+        let meaningful = Self::meaningful_tokens_before(tokens, end);
+        if !Self::tokens_begin_oracle_create_dimension(&meaningful) {
+            return None;
+        }
+        let words = meaningful
+            .iter()
+            .filter_map(|token| Self::token_word(token).map(str::to_ascii_uppercase))
+            .collect::<Vec<_>>();
+        let relation_owner_slot = words.last().map(String::as_str) == Some("IS")
+            || matches!(
+                words.as_slice(),
+                [.., join, key] if join == "JOIN" && key == "KEY"
+            )
+            || (words.last().map(String::as_str) == Some("DETERMINES")
+                && matches!(
+                    meaningful.last(),
+                    Some(SqlToken::Symbol(symbol)) if symbol == "("
+                ));
+        relation_owner_slot
+        .then_some(ExpectedObjectSuggestionKind::ColumnOwner)
+    }
+
+    fn expected_oracle_create_audit_policy_target_kind(
+        tokens: &[SqlToken],
+        end: usize,
+        qualifier: Option<&str>,
+        db_type: Option<crate::db::DatabaseType>,
+    ) -> Option<ExpectedObjectSuggestionKind> {
+        if crate::sql_text::mysql_compatibility_for_sql("", db_type) {
+            return None;
+        }
+        let meaningful = Self::meaningful_tokens_before(tokens, end);
+        let words = meaningful
+            .iter()
+            .filter_map(|token| Self::token_word(token).map(str::to_ascii_uppercase))
+            .collect::<Vec<_>>();
+        let in_create_audit_policy = words.first().map(String::as_str) == Some("CREATE")
+            && words.windows(2).any(
+                |window| matches!(window, [audit, policy] if audit == "AUDIT" && policy == "POLICY"),
+            )
+            && words.iter().any(|word| word == "ACTIONS");
+        if !in_create_audit_policy {
+            return None;
+        }
+        let last_on = words.iter().rposition(|word| word == "ON")?;
+        (qualifier.is_some() || last_on + 1 == words.len())
+            .then_some(ExpectedObjectSuggestionKind::ColumnOwner)
+    }
+
+    fn mysql_script_resource_group_suggestions(
+        script_before_cursor: &str,
+        prefix: &str,
+        deep_ctx: &intellisense_context::CursorContext,
+        db_type: Option<crate::db::DatabaseType>,
+    ) -> Vec<String> {
+        if !crate::sql_text::mysql_compatibility_for_sql("", db_type)
+            || completion_db_type_is_mariadb(db_type)
+        {
+            return Vec::new();
+        }
+        let statement_tokens = deep_ctx.statement_tokens.as_ref();
+        let end = Self::expected_suggestion_context_end(
+            statement_tokens,
+            deep_ctx.cursor_token_len,
+            !prefix.is_empty(),
+        );
+        let words = Self::previous_meaningful_words_upper(statement_tokens, end, 4);
+        if !matches!(
+            words.as_slice(),
+            [verb, resource, group]
+                if matches!(verb.as_str(), "ALTER" | "DROP")
+                    && resource == "RESOURCE"
+                    && group == "GROUP"
+        ) {
+            return Vec::new();
+        }
+
+        let tokens = super::query_text::tokenize_sql(script_before_cursor);
+        let mut suggestions = Vec::new();
+        for window in tokens.windows(4) {
+            let [
+                SqlToken::Word(create),
+                SqlToken::Word(resource),
+                SqlToken::Word(group),
+                SqlToken::Word(name),
+            ] = window
+            else {
+                continue;
+            };
+            if create.eq_ignore_ascii_case("CREATE")
+                && resource.eq_ignore_ascii_case("RESOURCE")
+                && group.eq_ignore_ascii_case("GROUP")
+                && Self::completion_suggestion_matches_prefix(name, prefix)
+            {
+                Self::push_unique_completion_name(&mut suggestions, name);
+            }
+        }
+        suggestions
     }
 
     fn oracle_hierarchy_qualifier_is_visible(
@@ -14503,9 +14830,12 @@ impl SqlEditorWidget {
     }
 
     fn is_values_function_call_after_assignment(tokens: &[SqlToken], values_idx: usize) -> bool {
+        // MariaDB spells the same upsert source function `VALUE(col)` as well as
+        // `VALUES(col)`, so both open a column scope on the insert target.
         if !matches!(
             tokens.get(values_idx),
-            Some(SqlToken::Word(word)) if word.eq_ignore_ascii_case("VALUES")
+            Some(SqlToken::Word(word))
+                if word.eq_ignore_ascii_case("VALUES") || word.eq_ignore_ascii_case("VALUE")
         ) {
             return false;
         }
@@ -19317,6 +19647,26 @@ impl SqlEditorWidget {
         ) {
             return None;
         }
+        let allows_oracle_ddl_relation_reference = {
+            let tokens = deep_ctx.statement_tokens.as_ref();
+            let end =
+                Self::expected_suggestion_context_end(tokens, deep_ctx.cursor_token_len, true);
+            Self::expected_oracle_create_dimension_object_suggestion_kind(
+                tokens,
+                end,
+                Some(qualifier),
+                db_type,
+            )
+            .or_else(|| {
+                Self::expected_oracle_create_audit_policy_target_kind(
+                    tokens,
+                    end,
+                    Some(qualifier),
+                    db_type,
+                )
+            })
+            .is_some()
+        };
         let in_plsql_executable_block =
             Self::cursor_in_plsql_executable_block_for_context(deep_ctx, true, db_type);
         let qualifier_is_schema_namespace = data
@@ -19331,7 +19681,9 @@ impl SqlEditorWidget {
             && Self::qualifier_has_members_or_oracle_synonym_target(
                 data, qualifier, false, db_type,
             );
-        if (deep_ctx.ddl_new_name_position && !in_plsql_executable_block)
+        if (deep_ctx.ddl_new_name_position
+            && !in_plsql_executable_block
+            && !allows_oracle_ddl_relation_reference)
             || (matches!(context, SqlContext::VariableName | SqlContext::BindValue)
                 && !Self::qualifier_resolves_to_oracle_sequence(data, qualifier, db_type)
                 && !qualifier_has_object_members)
@@ -19352,6 +19704,7 @@ impl SqlEditorWidget {
             )
             || (!Self::qualifier_resolves_to_oracle_sequence(data, qualifier, db_type)
                 && !qualifier_has_object_members
+                && !allows_oracle_ddl_relation_reference
                 && !Self::cursor_is_at_comment_on_column_qualified_name_slot_for_context(
                     deep_ctx, true,
                 )
@@ -20383,6 +20736,7 @@ impl SqlEditorWidget {
             "CONTEXT",
             "CLUSTER",
             "DIMENSION",
+            "POLICY",
             "OPERATOR",
             "INDEXTYPE",
             "EDITION",
@@ -40461,6 +40815,9 @@ impl SqlEditorWidget {
                 let function_idx = Self::previous_non_comment_token_index(tokens, open_idx)?;
                 let function = tokens.get(function_idx).and_then(Self::token_word)?;
                 if !function.eq_ignore_ascii_case("TREAT") {
+                    if function.eq_ignore_ascii_case("EXTRACT") {
+                        return Some("XMLTYPE".to_string());
+                    }
                     return Some(function.trim_matches('"').to_string());
                 }
                 let as_idx = tokens
@@ -40480,9 +40837,25 @@ impl SqlEditorWidget {
             })(),
             _ => None,
         };
-        type_name
-            .filter(|name| data.has_members_for_qualifier(name, false))
-            .map(|name| data.get_member_suggestions(&name, prefix, false))
+        let Some(type_name) = type_name else {
+            return Vec::new();
+        };
+        let suggestions = data.get_member_suggestions(&type_name, prefix, false);
+        if !suggestions.is_empty() {
+            return suggestions;
+        }
+        ORACLE_BUILTIN_OBJECT_TYPE_MEMBERS
+            .iter()
+            .find(|(name, _)| name.eq_ignore_ascii_case(&type_name))
+            .map(|(_, members)| {
+                members
+                    .iter()
+                    .filter(|member| {
+                        Self::completion_suggestion_matches_prefix(member, prefix)
+                    })
+                    .map(|member| (*member).to_string())
+                    .collect()
+            })
             .unwrap_or_default()
     }
 
@@ -57623,6 +57996,22 @@ impl SqlEditorWidget {
         );
         let statement_words =
             Self::previous_meaningful_words_upper(statement_tokens, statement_context_end, 16);
+        if let Some(kind) = Self::expected_oracle_create_dimension_object_suggestion_kind(
+            statement_tokens,
+            statement_context_end,
+            qualifier,
+            db_type,
+        ) {
+            return Some(kind);
+        }
+        if let Some(kind) = Self::expected_oracle_create_audit_policy_target_kind(
+            statement_tokens,
+            statement_context_end,
+            qualifier,
+            db_type,
+        ) {
+            return Some(kind);
+        }
         if !crate::sql_text::mysql_compatibility_for_sql("", db_type)
             && statement_words.last().is_some_and(|word| word == "DOMAIN")
             && statement_words.windows(2).any(
@@ -60524,6 +60913,281 @@ impl SqlEditorWidget {
             {
                 return Some(&["MOVEMENT"]);
             }
+            // ALTER TABLE t ROW ARCHIVAL - in-database archiving, which adds the
+            // hidden ORA_ARCHIVE_STATE column.
+            if matches_prefix("ROW")
+                && next_word.is_some_and(|word| word.eq_ignore_ascii_case("ARCHIVAL"))
+            {
+                return Some(&["ROW ARCHIVAL"]);
+            }
+            if matches_prefix("ARCHIVAL")
+                && previous_word.is_some_and(|word| word.eq_ignore_ascii_case("ROW"))
+            {
+                return Some(&["ARCHIVAL"]);
+            }
+            // ALTER SESSION SET ROW ARCHIVAL VISIBILITY = ALL | ACTIVE
+            if matches_prefix("VISIBILITY")
+                && previous_word.is_some_and(|word| word.eq_ignore_ascii_case("ARCHIVAL"))
+            {
+                return Some(&["VISIBILITY"]);
+            }
+            if (matches_prefix("ALL") || matches_prefix("ACTIVE"))
+                && has("VISIBILITY")
+                && has("ARCHIVAL")
+            {
+                return Some(&["ALL", "ACTIVE"]);
+            }
+            // ALTER TABLE t SHRINK SPACE [COMPACT | CASCADE]
+            if matches_prefix("SPACE")
+                && previous_word.is_some_and(|word| word.eq_ignore_ascii_case("SHRINK"))
+            {
+                return Some(&["SPACE"]);
+            }
+            if (matches_prefix("COMPACT") || matches_prefix("CASCADE"))
+                && has("SHRINK")
+                && previous_word.is_some_and(|word| word.eq_ignore_ascii_case("SPACE"))
+            {
+                return Some(&["COMPACT", "CASCADE"]);
+            }
+            // UPDATE t SET ROW = record - the whole row replaced by a record.
+            if matches_prefix("ROW")
+                && previous_word.is_some_and(|word| word.eq_ignore_ascii_case("SET"))
+                && has("UPDATE")
+            {
+                return Some(&["ROW"]);
+            }
+            // ... WHERE CURRENT OF <cursor> - only legal against an open cursor.
+            if matches_prefix("CURRENT")
+                && previous_word.is_some_and(|word| word.eq_ignore_ascii_case("WHERE"))
+                && next_word.is_some_and(|word| word.eq_ignore_ascii_case("OF"))
+            {
+                return Some(&["CURRENT OF"]);
+            }
+            if matches_prefix("OF")
+                && previous_word.is_some_and(|word| word.eq_ignore_ascii_case("CURRENT"))
+                && has("WHERE")
+            {
+                return Some(&["OF"]);
+            }
+            // CAST(MULTISET(SELECT ...) AS <collection type>)
+            if matches_prefix("MULTISET")
+                && next_word.is_none()
+                && Self::innermost_open_paren_preceding_word(tokens, structural_end)
+                    .is_some_and(|word| word.eq_ignore_ascii_case("CAST"))
+            {
+                return Some(&["MULTISET"]);
+            }
+            // PRAGMA RESTRICT_REFERENCES(f, WNDS, RNPS, WNPS)
+            if matches_prefix("RESTRICT_REFERENCES")
+                && previous_word.is_some_and(|word| word.eq_ignore_ascii_case("PRAGMA"))
+            {
+                return Some(&["RESTRICT_REFERENCES"]);
+            }
+            if ["WNDS", "WNPS", "RNDS", "RNPS", "TRUST"]
+                .iter()
+                .any(|keyword| matches_prefix(keyword))
+                && has("RESTRICT_REFERENCES")
+            {
+                return Some(&["WNDS", "WNPS", "RNDS", "RNPS", "TRUST"]);
+            }
+            // CREATE AUDIT POLICY p ACTIONS ... / AUDIT|NOAUDIT POLICY p
+            if matches_prefix("POLICY")
+                && previous_word.is_some_and(|word| {
+                    matches!(
+                        word.to_ascii_uppercase().as_str(),
+                        "AUDIT" | "NOAUDIT"
+                    )
+                })
+            {
+                return Some(&["POLICY"]);
+            }
+            if matches_prefix("ACTIONS") && has("AUDIT") && has("POLICY") {
+                return Some(&["ACTIONS"]);
+            }
+            let in_create_audit_policy = words.first().map(String::as_str) == Some("CREATE")
+                && words.windows(2).any(
+                    |window| matches!(window, [audit, policy] if audit == "AUDIT" && policy == "POLICY"),
+                );
+            if in_create_audit_policy
+                && ["SELECT", "INSERT", "UPDATE", "DELETE", "EXECUTE"]
+                    .iter()
+                    .any(|keyword| matches_prefix(keyword))
+                && (previous_word.is_some_and(|word| word.eq_ignore_ascii_case("ACTIONS"))
+                    || previous_is_symbol(","))
+            {
+                return Some(&["SELECT", "INSERT", "UPDATE", "DELETE", "EXECUTE"]);
+            }
+            if in_create_audit_policy
+                && matches_prefix("ON")
+                && previous_word.is_some_and(|word| {
+                    matches!(
+                        word.to_ascii_uppercase().as_str(),
+                        "SELECT" | "INSERT" | "UPDATE" | "DELETE" | "EXECUTE"
+                    )
+                })
+            {
+                return Some(&["ON"]);
+            }
+            // ASSOCIATE|DISASSOCIATE STATISTICS WITH|FROM <kind> ...
+            if matches_prefix("WITH")
+                && previous_word.is_some_and(|word| word.eq_ignore_ascii_case("STATISTICS"))
+                && has("ASSOCIATE")
+            {
+                return Some(&["WITH"]);
+            }
+            if matches_prefix("FROM")
+                && previous_word.is_some_and(|word| word.eq_ignore_ascii_case("STATISTICS"))
+                && has("DISASSOCIATE")
+            {
+                return Some(&["FROM"]);
+            }
+            if ["COLUMNS", "FUNCTIONS", "PACKAGES", "TYPES", "INDEXES", "INDEXTYPES"]
+                .iter()
+                .any(|keyword| matches_prefix(keyword))
+                && has("STATISTICS")
+                && previous_word.is_some_and(|word| {
+                    matches!(word.to_ascii_uppercase().as_str(), "WITH" | "FROM")
+                })
+            {
+                return Some(&[
+                    "COLUMNS",
+                    "FUNCTIONS",
+                    "PACKAGES",
+                    "TYPES",
+                    "INDEXES",
+                    "INDEXTYPES",
+                ]);
+            }
+            if matches_prefix("DEFAULT")
+                && has("STATISTICS")
+                && has("ASSOCIATE")
+                && next_word.is_some_and(|word| {
+                    matches!(
+                        word.to_ascii_uppercase().as_str(),
+                        "SELECTIVITY" | "COST"
+                    )
+                })
+            {
+                return Some(&["DEFAULT"]);
+            }
+            if (matches_prefix("SELECTIVITY") || matches_prefix("COST"))
+                && has("STATISTICS")
+                && previous_word.is_some_and(|word| word.eq_ignore_ascii_case("DEFAULT"))
+            {
+                return Some(&["SELECTIVITY", "COST"]);
+            }
+            // CREATE DIMENSION - a DDL statement built almost entirely out of
+            // words that own clauses everywhere else (LEVEL is also a CONNECT BY
+            // pseudo-column, ATTRIBUTE/REFERENCES/JOIN KEY are constraint and
+            // join vocabulary), so each is gated on the DIMENSION statement.
+            // Must be a real `CREATE [OR REPLACE] DIMENSION`, not merely a
+            // statement that happens to contain both words: a `MODEL ... DIMENSION
+            // BY` query inside a CTAS would otherwise let the ATTRIBUTE rule below
+            // replace the candidate list and drop `AS` at the prefix "A".
+            // `CREATE ATTRIBUTE DIMENSION` is excluded too - that is the analytic
+            // view grammar, which owns ATTRIBUTES/HIERARCHIES instead.
+            let in_create_dimension = {
+                let mut leading = words.iter().map(String::as_str);
+                matches!(leading.next(), Some("CREATE"))
+                    && {
+                        let mut next = leading.next();
+                        while matches!(next, Some("OR" | "REPLACE" | "FORCE" | "NOFORCE")) {
+                            next = leading.next();
+                        }
+                        next == Some("DIMENSION")
+                    }
+            };
+            if matches_prefix("LEVEL") && in_create_dimension && next_is_identifier_or_string {
+                return Some(&["LEVEL"]);
+            }
+            if matches_prefix("HIERARCHY") && in_create_dimension {
+                return Some(&["HIERARCHY", "HIERARCHIES"]);
+            }
+            if matches_prefix("ATTRIBUTE") && in_create_dimension {
+                return Some(&["ATTRIBUTE", "ATTRIBUTES"]);
+            }
+            if matches_prefix("CHILD")
+                && in_create_dimension
+                && next_word.is_some_and(|word| word.eq_ignore_ascii_case("OF"))
+            {
+                return Some(&["CHILD OF"]);
+            }
+            if matches_prefix("OF")
+                && in_create_dimension
+                && previous_word.is_some_and(|word| word.eq_ignore_ascii_case("CHILD"))
+            {
+                return Some(&["OF"]);
+            }
+            if matches_prefix("DETERMINES") && in_create_dimension && has("ATTRIBUTE") {
+                return Some(&["DETERMINES"]);
+            }
+            if matches_prefix("KEY")
+                && in_create_dimension
+                && previous_word.is_some_and(|word| word.eq_ignore_ascii_case("JOIN"))
+            {
+                return Some(&["KEY"]);
+            }
+            if matches_prefix("JOIN")
+                && in_create_dimension
+                && next_word.is_some_and(|word| word.eq_ignore_ascii_case("KEY"))
+            {
+                return Some(&["JOIN KEY"]);
+            }
+            if matches_prefix("REFERENCES") && in_create_dimension && has("JOIN") {
+                return Some(&["REFERENCES"]);
+            }
+            // CREATE [OR REPLACE] CONTEXT c USING pkg
+            if matches_prefix("CONTEXT")
+                && has("CREATE")
+                && next_is_identifier_or_string
+            {
+                return Some(&["CONTEXT"]);
+            }
+            // INTERVAL YEAR(2) TO MONTH / INTERVAL DAY(2) TO SECOND(6) - the
+            // trailing field, where MONTH/SECOND otherwise read as functions.
+            if ["YEAR", "MONTH", "DAY", "HOUR", "MINUTE", "SECOND"]
+                .iter()
+                .any(|keyword| matches_prefix(keyword))
+                && has("INTERVAL")
+                && previous_word.is_some_and(|word| word.eq_ignore_ascii_case("TO"))
+            {
+                return Some(&["YEAR", "MONTH", "DAY", "HOUR", "MINUTE", "SECOND"]);
+            }
+            // Physical storage attributes in a CREATE/ALTER TABLE tail. Gated on
+            // following either a non-word (the `)` closing the column list, or a
+            // preceding attribute's numeric value) or another attribute, so the
+            // shared `INIT`/`NO` prefixes cannot steal DEFERRABLE INITIALLY or a
+            // column-level NOT NULL.
+            const ORACLE_SEGMENT_ATTRIBUTES: &[&str] = &[
+                "PCTFREE",
+                "PCTUSED",
+                "INITRANS",
+                "MAXTRANS",
+                "LOGGING",
+                "NOLOGGING",
+                "ROWDEPENDENCIES",
+                "NOROWDEPENDENCIES",
+            ];
+            if ORACLE_SEGMENT_ATTRIBUTES
+                .iter()
+                .any(|keyword| matches_prefix(keyword))
+                && has("TABLE")
+                && (has("CREATE") || has("ALTER"))
+                && previous_word.is_none_or(|word| {
+                    ORACLE_SEGMENT_ATTRIBUTES
+                        .iter()
+                        .any(|attribute| word.eq_ignore_ascii_case(attribute))
+                })
+            {
+                return Some(ORACLE_SEGMENT_ATTRIBUTES);
+            }
+            // XMLPI(NAME "tag", value)
+            if matches_prefix("NAME")
+                && Self::innermost_open_paren_preceding_word(tokens, structural_end)
+                    .is_some_and(|word| word.eq_ignore_ascii_case("XMLPI"))
+            {
+                return Some(&["NAME"]);
+            }
             // VERSIONS BETWEEN SCN|TIMESTAMP MINVALUE AND MAXVALUE
             if (matches_prefix("MINVALUE") || matches_prefix("MAXVALUE")) && has("VERSIONS") {
                 return Some(&["MINVALUE", "MAXVALUE"]);
@@ -60660,6 +61324,22 @@ impl SqlEditorWidget {
         }
 
         if mysql_compatible {
+            // SET TRANSACTION ISOLATION LEVEL REPEATABLE READ — the second word of
+            // the level name, where READ otherwise reads as a lock mode.
+            if matches_prefix("READ") && matches!(previous_word, Some("REPEATABLE")) {
+                return Some(&["READ"]);
+            }
+            if (matches_prefix("COMMITTED") || matches_prefix("UNCOMMITTED"))
+                && matches!(previous_word, Some("READ"))
+                && has("ISOLATION")
+            {
+                return Some(&["COMMITTED", "UNCOMMITTED"]);
+            }
+            // SHOW GRANTS FOR user USING role — the role the grants are resolved
+            // through, not a join or an index hint.
+            if matches_prefix("USING") && has("SHOW") && has("GRANTS") {
+                return Some(&["USING"]);
+            }
             // `SELECT … LOCK IN SHARE MODE` — the pre-8.0 spelling of `FOR SHARE`,
             // still the only one MariaDB accepts.
             if matches_prefix("LOCK")
@@ -62357,7 +63037,7 @@ impl SqlEditorWidget {
                 {
                     return Some(MARIADB_STORAGE_ENGINES);
                 }
-                if ["TRANSACTIONAL", "PAGE_CHECKSUM"]
+                if ["TRANSACTIONAL", "PAGE_CHECKSUM", "PAGE_COMPRESSED", "PAGE_COMPRESSION_LEVEL"]
                     .iter()
                     .any(|keyword| matches_prefix(keyword))
                     && has("CREATE")
@@ -62365,7 +63045,12 @@ impl SqlEditorWidget {
                     && has("ENGINE")
                     && next_is_symbol("=")
                 {
-                    return Some(&["TRANSACTIONAL", "PAGE_CHECKSUM"]);
+                    return Some(&[
+                        "TRANSACTIONAL",
+                        "PAGE_CHECKSUM",
+                        "PAGE_COMPRESSED",
+                        "PAGE_COMPRESSION_LEVEL",
+                    ]);
                 }
                 if matches_prefix("PARTITION")
                     && has("ALTER")

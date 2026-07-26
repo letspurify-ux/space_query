@@ -180,7 +180,7 @@ ORDER BY f.customer_id;
 -- db: MariaDB
 -- metadata: test_mariadb/test12.txt inferred catalog
 -- checked: 510
--- suggestions checked: 5864
+-- suggestions checked: 5882
 -- missing: 0
 -- suggestions without type labels: 0
 -- marker: [[word]] means not suggested for the tested prefix

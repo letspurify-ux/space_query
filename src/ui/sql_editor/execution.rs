@@ -14252,9 +14252,41 @@ impl SqlEditorWidget {
             ),
             OracleValue::Lob(_) => Some("[LOB]".to_string()),
             OracleValue::Cursor(_) => Some("[CURSOR]".to_string()),
-            OracleValue::Object(_) => Some("[OBJECT]".to_string()),
-            OracleValue::Array(_) => Some("[ARRAY]".to_string()),
-            OracleValue::IndexedArray(_) => Some("[INDEXED ARRAY]".to_string()),
+            OracleValue::Object(_) | OracleValue::Array(_) | OracleValue::IndexedArray(_) => {
+                serde_json::to_string(&Self::oracle_thin_value_json(value)).ok()
+            }
+        }
+    }
+
+    fn oracle_thin_value_json(value: &OracleValue) -> serde_json::Value {
+        match value {
+            OracleValue::Null => serde_json::Value::Null,
+            OracleValue::Number(value) => value
+                .parse::<serde_json::Number>()
+                .map(serde_json::Value::Number)
+                .unwrap_or_else(|_| serde_json::Value::String(value.clone())),
+            OracleValue::Boolean(value) => serde_json::Value::Bool(*value),
+            OracleValue::Text(value) => serde_json::Value::String(value.clone()),
+            OracleValue::Object(attributes) => {
+                let mut object = serde_json::Map::new();
+                for (name, value) in attributes {
+                    object.insert(name.clone(), Self::oracle_thin_value_json(value));
+                }
+                serde_json::Value::Object(object)
+            }
+            OracleValue::Array(values) => {
+                serde_json::Value::Array(values.iter().map(Self::oracle_thin_value_json).collect())
+            }
+            OracleValue::IndexedArray(values) => {
+                let mut object = serde_json::Map::new();
+                for (index, value) in values {
+                    object.insert(index.to_string(), Self::oracle_thin_value_json(value));
+                }
+                serde_json::Value::Object(object)
+            }
+            _ => {
+                serde_json::Value::String(Self::oracle_thin_string_cell(value).unwrap_or_default())
+            }
         }
     }
 
@@ -21248,6 +21280,42 @@ impl SqlEditorWidget {
             .progress_callback
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(Box::new(callback));
+    }
+}
+
+#[cfg(test)]
+mod oracle_thin_value_render_tests {
+    use super::{OracleValue, SqlEditorWidget};
+
+    #[test]
+    fn decoded_oracle_collections_render_their_elements() {
+        let value = OracleValue::Array(vec![
+            OracleValue::Number("10".to_string()),
+            OracleValue::Null,
+            OracleValue::Text("thirty".to_string()),
+            OracleValue::Object(vec![(
+                "NESTED".to_string(),
+                OracleValue::Array(vec![OracleValue::Boolean(true)]),
+            )]),
+        ]);
+
+        assert_eq!(
+            SqlEditorWidget::oracle_thin_string_cell(&value).as_deref(),
+            Some(r#"[10,null,"thirty",{"NESTED":[true]}]"#)
+        );
+    }
+
+    #[test]
+    fn decoded_oracle_indexed_arrays_keep_indexes_and_values() {
+        let value = OracleValue::IndexedArray(vec![
+            (5, OracleValue::Text("x".to_string())),
+            (9, OracleValue::Number("42".to_string())),
+        ]);
+
+        assert_eq!(
+            SqlEditorWidget::oracle_thin_string_cell(&value).as_deref(),
+            Some(r#"{"5":"x","9":42}"#)
+        );
     }
 }
 

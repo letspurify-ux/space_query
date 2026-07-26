@@ -1643,6 +1643,238 @@ CALL sq_hard_assert(
   'ctas + table rewrites'
 );
 
+--------------------------------------------------------------------------------
+-- ULTRA WAVE 7: an application-time period closed over by a WITHOUT OVERLAPS
+-- primary key, a system-versioned table partitioned BY SYSTEM_TIME INTERVAL,
+-- index/column maintenance (descending key part, ALTER INDEX IGNORED, ALTER
+-- COLUMN SET/DROP DEFAULT), the SHOW/FLUSH/CHECKSUM family, the window
+-- functions no earlier wave reached, the regexp trio and JSON mutation family,
+-- a ROW-typed local variable with a SQLWARNING handler, and a lexer round.
+--
+-- Dialect delta pinned here on purpose: MariaDB has no three-argument LAG,
+-- which MySQL does accept (see test_mysql/final_hardcore.sql W7-D).
+--------------------------------------------------------------------------------
+--------------------------------------------------------------------------------
+-- W7-A: an application-time period whose primary key closes over it with
+-- WITHOUT OVERLAPS, so the period name sits in a key-part slot where only
+-- column names are otherwise legal, and UPDATE/DELETE FOR PORTION OF split
+-- rows against it.
+--------------------------------------------------------------------------------
+CREATE TABLE sq_hard_w7_lease (
+  lease_id  INT NOT NULL,
+  tenant    VARCHAR(20) NOT NULL,
+  starts_on DATE NOT NULL,
+  ends_on   DATE NOT NULL,
+  rate      DECIMAL(8,2) NOT NULL,
+  PERIOD FOR term (starts_on, ends_on),
+  PRIMARY KEY (lease_id, term WITHOUT OVERLAPS)
+) ENGINE = InnoDB;
+
+INSERT INTO sq_hard_w7_lease (lease_id, tenant, starts_on, ends_on, rate)
+VALUES (1, 'alpha', '2024-01-01', '2024-12-31', 100.00),
+       (2, 'beta',  '2024-03-01', '2024-06-30', 200.00);
+
+UPDATE sq_hard_w7_lease
+   FOR PORTION OF term FROM '2024-04-01' TO '2024-07-01'
+   SET rate = rate + 50
+ WHERE lease_id = 1;
+
+DELETE FROM sq_hard_w7_lease
+   FOR PORTION OF term FROM '2024-05-01' TO '2024-05-15'
+ WHERE lease_id = 2;
+
+SELECT lease_id, tenant, starts_on, ends_on, rate
+FROM sq_hard_w7_lease
+ORDER BY lease_id, starts_on;
+
+--------------------------------------------------------------------------------
+-- W7-B: a system-versioned table partitioned BY SYSTEM_TIME INTERVAL, where
+-- INTERVAL/LIMIT/CURRENT read as clause keywords inside the partition list and
+-- the partition names are definition slots.
+--------------------------------------------------------------------------------
+CREATE TABLE sq_hard_w7_ver (
+  ver_id INT PRIMARY KEY,
+  state  VARCHAR(12) NOT NULL
+) ENGINE = InnoDB
+  WITH SYSTEM VERSIONING
+  PARTITION BY SYSTEM_TIME INTERVAL 10 YEAR
+  STARTS '2020-01-01 00:00:00' (
+    PARTITION p_hist HISTORY,
+    PARTITION p_cur  CURRENT
+  );
+
+INSERT INTO sq_hard_w7_ver (ver_id, state) VALUES (1, 'created');
+UPDATE sq_hard_w7_ver SET state = 'changed' WHERE ver_id = 1;
+
+SELECT COUNT(*) AS current_rows FROM sq_hard_w7_ver;
+SELECT COUNT(*) AS all_rows
+FROM sq_hard_w7_ver FOR SYSTEM_TIME ALL;
+
+--------------------------------------------------------------------------------
+-- W7-C: index and column maintenance whose action words are all keywords
+-- elsewhere -- a descending key part, ALTER INDEX ... IGNORED (the optimizer
+-- keeps the index but refuses to use it), and ALTER COLUMN SET/DROP DEFAULT.
+--------------------------------------------------------------------------------
+CREATE TABLE sq_hard_w7_idx (
+  idx_id   INT NOT NULL PRIMARY KEY,
+  bucket   VARCHAR(10) NOT NULL,
+  measured INT NOT NULL DEFAULT 0,
+  KEY ix_desc (bucket, measured DESC)
+) ENGINE = InnoDB PAGE_COMPRESSED = 1;
+
+INSERT INTO sq_hard_w7_idx (idx_id, bucket, measured)
+VALUES (1, 'a', 10), (2, 'a', 30), (3, 'b', 20);
+
+ALTER TABLE sq_hard_w7_idx ALTER INDEX ix_desc IGNORED;
+ALTER TABLE sq_hard_w7_idx ALTER COLUMN measured SET DEFAULT 7;
+
+INSERT INTO sq_hard_w7_idx (idx_id, bucket) VALUES (4, 'b');
+
+ALTER TABLE sq_hard_w7_idx ALTER COLUMN measured DROP DEFAULT;
+ALTER TABLE sq_hard_w7_idx ALTER INDEX ix_desc NOT IGNORED;
+
+SELECT idx_id, bucket, measured FROM sq_hard_w7_idx ORDER BY idx_id;
+
+--------------------------------------------------------------------------------
+-- W7-D: the SHOW / FLUSH / CHECKSUM family. These are statements whose second
+-- word is an object-kind keyword, and SHOW ... LIKE takes a pattern where a
+-- table name would otherwise sit.
+--------------------------------------------------------------------------------
+SHOW CREATE TABLE sq_hard_w7_idx;
+SHOW INDEX FROM sq_hard_w7_idx FROM sq_hard_mariadb;
+SHOW COLUMNS FROM sq_hard_w7_lease LIKE 'rate%';
+SHOW TABLE STATUS LIKE 'sq\_hard\_w7\_idx';
+FLUSH LOCAL TABLES sq_hard_w7_idx;
+CHECKSUM TABLE sq_hard_w7_idx, sq_hard_w7_lease QUICK;
+
+--------------------------------------------------------------------------------
+-- W7-E: the window functions no earlier wave reached, plus a named window that
+-- a later frame-extended reference re-anchors and a three-argument LAG.
+--------------------------------------------------------------------------------
+SELECT i.idx_id,
+       i.bucket,
+       i.measured,
+       ROUND(CUME_DIST() OVER w_ordered, 4)              AS cume,
+       ROUND(PERCENT_RANK() OVER w_ordered, 4)           AS pct_rank,
+       -- No FROM FIRST / FROM LAST modifier on NTH_VALUE here: MariaDB rejects
+       -- it and MySQL 8.0 reports it unimplemented, so the frame-extended named
+       -- window carries the whole partition instead.
+       NTH_VALUE(i.measured, 2) OVER (
+         w_ordered ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING
+       )                                                 AS second_value,
+       -- Two-argument LAG only: MariaDB rejects the third default argument
+       -- that MySQL accepts, so the fallback is spelled with COALESCE.
+       COALESCE(LAG(i.measured, 2) OVER w_ordered, -1)   AS lag_two_default,
+       NTILE(2) OVER w_ordered                           AS half
+FROM sq_hard_w7_idx i
+WINDOW w_ordered AS (PARTITION BY i.bucket ORDER BY i.measured)
+ORDER BY i.idx_id;
+
+--------------------------------------------------------------------------------
+-- W7-F: the regular-expression trio and the JSON mutation family, whose
+-- arguments alternate between a path literal and a value.
+--------------------------------------------------------------------------------
+SELECT REGEXP_REPLACE('wave-7-maria', '([a-z]+)-([0-9]+)', '\\2:\\1') AS replaced,
+       REGEXP_SUBSTR('wave-7-maria', '[0-9]+')                        AS matched,
+       REGEXP_INSTR('wave-7-maria', '[0-9]+')                         AS matched_at;
+
+SELECT JSON_DETAILED(
+         JSON_MERGE_PATCH(
+           JSON_SET(
+             JSON_REMOVE(
+               JSON_ARRAY_APPEND(
+                 JSON_OBJECT('tags', JSON_ARRAY('sql'), 'drop', 1),
+                 '$.tags', 'json'),
+               '$.drop'),
+             '$.depth', JSON_LENGTH(JSON_ARRAY(1, 2, 3))),
+           JSON_OBJECT('patched', TRUE))
+       )                                              AS mutated,
+       JSON_TYPE(JSON_EXTRACT('{"a":[1]}', '$.a'))    AS extracted_type,
+       JSON_VALID('{"a":1}')                          AS is_valid,
+       JSON_UNQUOTE(JSON_QUOTE('quoted'))             AS round_tripped;
+
+--------------------------------------------------------------------------------
+-- W7-G: a ROW-typed local variable, VALUE() as the MariaDB spelling of the
+-- upsert source, and a handler that fires on SQLWARNING rather than an error.
+--------------------------------------------------------------------------------
+CREATE TABLE sq_hard_w7_up (
+  up_id INT PRIMARY KEY,
+  hits  INT NOT NULL,
+  label VARCHAR(20)
+) ENGINE = InnoDB;
+
+INSERT INTO sq_hard_w7_up (up_id, hits, label) VALUES (1, 1, 'first');
+
+INSERT INTO sq_hard_w7_up (up_id, hits, label)
+VALUES (1, 10, 'second'), (2, 20, 'new')
+ON DUPLICATE KEY UPDATE hits  = hits + VALUE(hits),
+                        label = CONCAT(VALUE(label), '/merged');
+
+DELIMITER $$
+CREATE PROCEDURE sq_hard_w7_rowvar(OUT out_text VARCHAR(60))
+BEGIN
+  DECLARE row_var ROW(up_id INT, hits INT, label VARCHAR(20));
+  DECLARE warn_seen INT DEFAULT 0;
+  DECLARE CONTINUE HANDLER FOR SQLWARNING SET warn_seen = warn_seen + 1;
+
+  SELECT up_id, hits, label INTO row_var FROM sq_hard_w7_up WHERE up_id = 1;
+  SET @truncated = CAST('12abc' AS DECIMAL(4,0));
+
+  SET out_text = CONCAT_WS('/', row_var.up_id, row_var.hits, row_var.label,
+                           warn_seen);
+END$$
+DELIMITER ;
+
+CALL sq_hard_w7_rowvar(@sq_hard_w7_rowvar);
+SELECT @sq_hard_w7_rowvar AS rowvar_text;
+
+--------------------------------------------------------------------------------
+-- W7-H: lexer round. A dash banner (legal in MariaDB, rejected by MySQL), an
+-- executable comment, backtick identifiers that spell statements, comment and
+-- terminator lookalikes inside literals, and one unspaced line.
+--------------------------------------------------------------------------------
+------------------------------------------------------------ banner ------------
+SELECT /*!100000 1 + */ 1                                   AS versioned_comment,
+       'a -- not a comment /* nor this */; still text'       AS bait_text,
+       "double-quoted string in default mode"               AS dq_text,
+       0x4D61726961                                         AS hex_literal,
+       b'1011'                                              AS bit_literal,
+       1.5e-3                                               AS sci_literal,
+       `select`.`from`                                       AS quoted_path
+FROM (SELECT 1 AS `from`) AS `select`;
+
+SELECT(1+2)*3-4/2 AS crammed,MOD(7,3)modded,ABS(-8)absed FROM DUAL WHERE 1<>2;
+
+sElEcT cAsE wHeN 1=1 tHeN 'mixed' eLsE 'case' eNd AS alternating;
+
+--------------------------------------------------------------------------------
+-- W7-I: wave-7 self-verification.
+--------------------------------------------------------------------------------
+CALL sq_hard_assert(
+  (SELECT COUNT(*) FROM sq_hard_w7_lease) = 5
+  AND (SELECT rate FROM sq_hard_w7_lease
+       WHERE lease_id = 1 AND starts_on = '2024-04-01') = 150.00,
+  'application-time portions'
+);
+CALL sq_hard_assert(
+  (SELECT COUNT(*) FROM sq_hard_w7_ver) = 1
+  AND (SELECT COUNT(*) FROM sq_hard_w7_ver FOR SYSTEM_TIME ALL) = 2,
+  'system versioning partitions'
+);
+CALL sq_hard_assert(
+  (SELECT measured FROM sq_hard_w7_idx WHERE idx_id = 4) = 7,
+  'alter column default'
+);
+CALL sq_hard_assert(
+  (SELECT hits FROM sq_hard_w7_up WHERE up_id = 1) = 11
+  AND (SELECT label FROM sq_hard_w7_up WHERE up_id = 1) = 'second/merged',
+  'value() upsert'
+);
+CALL sq_hard_assert(
+  @sq_hard_w7_rowvar = '1/11/second/merged/1',
+  CONCAT('row variable + warning handler: ', @sq_hard_w7_rowvar)
+);
+
 SELECT 'PASS' AS final_status,
        VERSION() AS server_version,
        (SELECT COUNT(*) FROM metric) AS metric_rows,
@@ -1652,4 +1884,6 @@ SELECT 'PASS' AS final_status,
        (SELECT COUNT(*) FROM sq_hard_w5_hint) AS wave5_rows,
        @sq_hard_w5_label AS wave5_label,
        (SELECT COUNT(*) FROM sq_hard_w6_series) AS wave6_rows,
-       @sq_hard_w6_walk_rows AS wave6_walk_rows;
+       @sq_hard_w6_walk_rows AS wave6_walk_rows,
+       (SELECT COUNT(*) FROM sq_hard_w7_lease) AS wave7_lease_rows,
+       @sq_hard_w7_rowvar AS wave7_rowvar;

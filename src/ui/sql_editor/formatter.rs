@@ -2253,6 +2253,7 @@ pub(super) enum ListOwnerKind {
     PropertyGraphProperties,
     TriggerOrdering,
     FlashbackTargets,
+    AuditActions,
 }
 
 impl ListOwnerKind {
@@ -2319,6 +2320,7 @@ impl ListOwnerKind {
         Self::PropertyGraphProperties,
         Self::TriggerOrdering,
         Self::FlashbackTargets,
+        Self::AuditActions,
     ];
 
     fn depth(self, header_indent: usize) -> usize {
@@ -7470,6 +7472,33 @@ impl SqlEditorWidget {
             "CREATE" if keyword == "USING" => leading.any(|word| word == "INDEX"),
             _ => false,
         }
+    }
+
+    /// Whether `idx` sits inside a `CREATE|ALTER AUDIT POLICY` statement, and if
+    /// so whether its ACTIONS list has already been opened. Inside that list
+    /// every word names an audited action or its ON target, so SELECT / UPDATE /
+    /// ON own no clause there the way they do everywhere else.
+    fn oracle_audit_policy_position(tokens: &[SqlToken], idx: usize) -> Option<bool> {
+        let mut leading = tokens.iter().take(idx).filter_map(|token| match token {
+            SqlToken::Word(word) => Some(word.to_ascii_uppercase()),
+            _ => None,
+        });
+        if !matches!(leading.next().as_deref(), Some("CREATE") | Some("ALTER")) {
+            return None;
+        }
+
+        let mut saw_audit_policy = false;
+        let mut prev: Option<String> = None;
+        for word in leading {
+            if word == "ACTIONS" && saw_audit_policy {
+                return Some(true);
+            }
+            if word == "POLICY" && prev.as_deref() == Some("AUDIT") {
+                saw_audit_policy = true;
+            }
+            prev = Some(word);
+        }
+        saw_audit_policy.then_some(false)
     }
 
     fn is_multiset_set_operator_from_indices(
@@ -12956,6 +12985,14 @@ impl SqlEditorWidget {
                         && Self::is_mysql_index_hint_phrase_word(tokens, idx, upper);
                     let ddl_option_phrase_word = current_scope.paren_depth == 0
                         && Self::is_ddl_option_phrase_word(tokens, idx, upper);
+                    // `HIERARCHY h (child CHILD OF parent JOIN KEY t.c REFERENCES
+                    // parent)` in CREATE DIMENSION: `JOIN KEY` is a dimension
+                    // phrase, not a join, and it lives inside the hierarchy parens
+                    // so it cannot be gated on paren_depth.
+                    let oracle_dimension_join_key =
+                        !mysql_compatible && upper == "JOIN" && next_word_is("KEY");
+                    let oracle_audit_policy_action_word = !mysql_compatible
+                        && matches!(Self::oracle_audit_policy_position(tokens, idx), Some(true));
                     let keyword_suppresses_structural_handling = keyword_preserves_original_case
                         || treat_control_keyword_as_identifier
                         || follows_alias_control_keyword
@@ -12964,7 +13001,9 @@ impl SqlEditorWidget {
                         || oracle_iteration_collection_keyword
                         || oracle_type_method_order_modifier
                         || mysql_index_hint_phrase_word
-                        || ddl_option_phrase_word;
+                        || ddl_option_phrase_word
+                        || oracle_dimension_join_key
+                        || oracle_audit_policy_action_word;
                     let model_bracket_member = construct_flag_active!(ModelActive)
                         && delimiter_frame_state.innermost_is_bracket();
                     let on_duplicate_key_values_function =
@@ -16320,6 +16359,18 @@ impl SqlEditorWidget {
                         format_stack.clear_list_owner_kind_at_scope(
                             current_scope,
                             ListOwnerKind::TriggerUpdateColumns,
+                        );
+                    }
+                    if upper == "ACTIONS"
+                        && !mysql_compatible
+                        && matches!(Self::oracle_audit_policy_position(tokens, idx), Some(false))
+                    {
+                        format_stack.push_list_owner_kind_for_render(
+                            current_scope,
+                            ListOwnerKind::AuditActions,
+                            idx,
+                            tokens,
+                            line_indent,
                         );
                     }
                     if matches!(upper, "FOLLOWS" | "PRECEDES")
