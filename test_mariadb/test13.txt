@@ -1,0 +1,153 @@
+-- ==========================================================================
+-- SPACE QUERY MARIADB SINGLE-STATEMENT FORMATTER FINAL BOSS V
+-- Target: MariaDB 12.2+ (live certification uses MariaDB 12.2.2)
+-- A repeatable, side-effect-free statement covering recursive CYCLE, nested
+-- JSON_TABLE, dynamic columns, analytic percentiles, INTERSECT/EXCEPT ALL,
+-- JSON aggregate ordering/limits, INET6 functions, and deep frame recovery.
+-- ==========================================================================
+WITH RECURSIVE
+nodes(node_id,parent_node_id,node_name,active_flag,properties,host_addr)AS(
+SELECT 1,NULL,'Aurora Core',TRUE,COLUMN_CREATE('tier','gold','weight',10),INET6_ATON('2001:db8::1')UNION ALL
+SELECT 2,1,'Bluebird Edge',TRUE,COLUMN_CREATE('tier','silver','weight',7),INET6_ATON('2001:db8::2')UNION ALL
+SELECT 3,1,'Cobalt Data',TRUE,COLUMN_CREATE('tier','gold','weight',9),INET6_ATON('2001:db8::3')UNION ALL
+SELECT 4,2,'Dormant Lab',FALSE,COLUMN_CREATE('tier','bronze','weight',3),INET6_ATON('2001:db8::4')
+),
+node_tree(node_id,parent_node_id,node_path,tree_depth)AS(
+SELECT node_id,parent_node_id,CAST(REGEXP_REPLACE(UPPER(node_name),'[^A-Z0-9]+','_')AS CHAR(300)),0
+FROM nodes WHERE parent_node_id IS NULL
+UNION ALL
+SELECT n.node_id,n.parent_node_id,CONCAT(p.node_path,'/',REGEXP_REPLACE(UPPER(n.node_name),'[^A-Z0-9]+','_')),p.tree_depth+1
+FROM nodes n JOIN node_tree p ON p.node_id=n.parent_node_id
+)
+CYCLE node_id RESTRICT,
+runs(run_id,node_id,run_day,run_status,payload)AS(
+SELECT 101,1,DATE'2026-06-01','SUCCESS',JSON_OBJECT('source','web','measures',JSON_ARRAY(
+JSON_OBJECT('name','duration','value',12,'labels',JSON_ARRAY('critical','fast')),
+JSON_OBJECT('name','failures','value',1,'labels',JSON_ARRAY('quality'))
+))UNION ALL
+SELECT 102,1,DATE'2026-06-03','SUCCESS',JSON_OBJECT('source','partner','measures',JSON_ARRAY(
+JSON_OBJECT('name','duration','value',18,'labels',JSON_ARRAY('renewal')),
+JSON_OBJECT('name','failures','value',0,'labels',JSON_ARRAY('critical','quality'))
+))UNION ALL
+SELECT 201,2,DATE'2026-06-02','SUCCESS',JSON_OBJECT('source','store','measures',JSON_ARRAY(
+JSON_OBJECT('name','duration','value',25,'labels',JSON_ARRAY('edge')),
+JSON_OBJECT('name','failures','value',2,'labels',JSON_ARRAY('quality'))
+))UNION ALL
+SELECT 301,3,DATE'2026-06-02','FAILED',JSON_OBJECT('source','direct','measures',JSON_ARRAY(
+JSON_OBJECT('name','duration','value',40,'labels',JSON_ARRAY('critical','bulk')),
+JSON_OBJECT('name','failures','value',5,'labels',JSON_ARRAY('incident'))
+))UNION ALL
+SELECT 302,3,DATE'2026-06-05','SUCCESS',JSON_OBJECT('source','partner','measures',JSON_ARRAY(
+JSON_OBJECT('name','duration','value',20,'labels',JSON_ARRAY('recovery')),
+JSON_OBJECT('name','failures','value',0,'labels',JSON_ARRAY('quality'))
+))
+),
+measure_rows AS(
+SELECT r.run_id,r.node_id,r.run_day,r.run_status,j.source_code,
+j.measure_no,j.measure_name,j.measure_value,j.label_no,j.label_value
+FROM runs r
+JOIN JSON_TABLE(
+r.payload,'$'
+COLUMNS(
+source_code VARCHAR(30)PATH'$.source',
+NESTED PATH'$.measures[*]'
+COLUMNS(
+measure_no FOR ORDINALITY,
+measure_name VARCHAR(30)PATH'$.name',
+measure_value DECIMAL(12,2)PATH'$.value'DEFAULT 0 ON ERROR,
+NESTED PATH'$.labels[*]'
+COLUMNS(
+label_no FOR ORDINALITY,
+label_value VARCHAR(30)PATH'$'
+)
+)
+)
+)j ON TRUE
+),
+measure_base AS(
+SELECT run_id,node_id,run_day,run_status,MAX(source_code)AS source_code,
+measure_name,MAX(measure_value)AS measure_value
+FROM measure_rows
+GROUP BY run_id,node_id,run_day,run_status,measure_name
+),
+run_facts AS(
+SELECT run_id,node_id,run_day,run_status,MAX(source_code)AS source_code,
+MAX(IF(measure_name='duration',measure_value,NULL))AS duration_ms,
+MAX(IF(measure_name='failures',measure_value,NULL))AS failure_count
+FROM measure_base
+GROUP BY run_id,node_id,run_day,run_status
+),
+analytic_runs AS(
+SELECT f.*,
+ROW_NUMBER()OVER(PARTITION BY node_id ORDER BY duration_ms DESC,run_id)AS duration_rank,
+SUM(failure_count)OVER(PARTITION BY node_id ORDER BY run_day,run_id ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW)AS running_failures,
+PERCENTILE_CONT(0.5)WITHIN GROUP(ORDER BY duration_ms)OVER(PARTITION BY node_id)AS median_duration,
+MEDIAN(duration_ms)OVER(PARTITION BY node_id)AS median_duration_check
+FROM run_facts f
+),
+eligible(node_id)AS(
+(SELECT node_id FROM nodes WHERE active_flag IS TRUE)
+INTERSECT ALL
+(SELECT node_id FROM run_facts WHERE run_status='SUCCESS')
+EXCEPT ALL
+(SELECT node_id FROM run_facts WHERE failure_count>10)
+),
+node_rollup AS(
+SELECT f.node_id,COUNT(*)AS run_count,SUM(f.failure_count)AS total_failures,
+ROUND(AVG(f.duration_ms),2)AS average_duration,
+GROUP_CONCAT(DISTINCT f.source_code ORDER BY f.source_code SEPARATOR','LIMIT 3)AS source_list,
+JSON_ARRAYAGG(JSON_OBJECT(
+'run',f.run_id,
+'status',f.run_status,
+'duration',f.duration_ms,
+'failures',f.failure_count
+)ORDER BY f.run_day,f.run_id LIMIT 10)AS run_json
+FROM run_facts f
+GROUP BY f.node_id
+),
+final_rows AS(
+SELECT n.node_id,n.node_name,n.active_flag,t.node_path,t.tree_depth,
+COLUMN_GET(n.properties,'tier'AS CHAR)AS tier_code,
+COLUMN_GET(n.properties,'weight'AS UNSIGNED)AS weight_value,
+INET6_NTOA(n.host_addr)AS host_text,
+IFNULL(r.run_count,0)AS run_count,IFNULL(r.total_failures,0)AS total_failures,
+IFNULL(r.average_duration,0)AS average_duration,r.source_list,r.run_json,
+CASE WHEN e.node_id IS NULL THEN'INELIGIBLE'ELSE'ELIGIBLE'END AS eligibility,
+(SELECT MAX(a.running_failures)FROM analytic_runs a WHERE a.node_id=n.node_id)AS peak_running_failures,
+(SELECT MAX(a.median_duration)FROM analytic_runs a WHERE a.node_id=n.node_id)AS median_duration,
+(SELECT JSON_ARRAYAGG(m.label_value ORDER BY m.run_id,m.measure_no,m.label_no LIMIT 20)FROM measure_rows m WHERE m.node_id=n.node_id)AS labels_json
+FROM nodes n
+JOIN node_tree t ON t.node_id=n.node_id
+LEFT JOIN node_rollup r ON r.node_id=n.node_id
+LEFT JOIN(SELECT DISTINCT node_id FROM eligible)AS e ON e.node_id=n.node_id
+)
+SELECT
+CASE
+WHEN(SELECT COUNT(*)FROM runs)=5
+AND(SELECT COUNT(*)FROM measure_base)=10
+AND(SELECT SUM(failure_count)FROM run_facts)=8
+AND(SELECT COUNT(*)FROM node_tree)=4
+AND(SELECT COUNT(DISTINCT node_id)FROM eligible)=3
+AND(SELECT COUNT(*)FROM nodes WHERE COLUMN_CHECK(properties)=1)=4
+AND JSON_EXISTS((SELECT payload FROM runs WHERE run_id=101),'$.measures[0].labels[0]')=1
+THEN'PASS'ELSE'FAIL'END AS status,
+f.node_id,f.node_name,f.active_flag,f.tree_depth,f.tier_code,f.weight_value,
+f.host_text,f.run_count,f.total_failures,f.average_duration,f.eligibility,
+f.peak_running_failures,f.median_duration,f.source_list,
+JSON_NORMALIZE(JSON_OBJECT(
+'path',f.node_path,
+'runs',f.run_json,
+'labels',f.labels_json,
+'properties',COLUMN_JSON((SELECT properties FROM nodes n WHERE n.node_id=f.node_id)),
+'predicates',JSON_OBJECT(
+'host_ok',f.host_text LIKE'2001:db8:%',
+'name_ok',f.node_name REGEXP'^[A-Z]',
+'has_critical',JSON_OVERLAPS(IFNULL(f.labels_json,JSON_ARRAY()),JSON_ARRAY('critical'))
+),
+'all_labels',(
+SELECT COUNT(*)
+FROM measure_rows
+)
+))AS evidence
+FROM final_rows f
+ORDER BY f.node_id;

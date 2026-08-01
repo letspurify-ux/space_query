@@ -1,0 +1,15 @@
+SPACE Query
+Copyright (c) 2026 SPACE Query contributors
+
+This project is licensed under either the MIT License or the Apache License,
+Version 2.0, at your option. See LICENSE-MIT and LICENSE-APACHE.
+
+The bundled tns-thin component is licensed under the Apache License, Version
+2.0. Its attribution notice is maintained in crates/tns-thin/NOTICE.
+
+Third-party notices are maintained in THIRD_PARTY_NOTICES.md.
+
+Oracle, Java, MySQL, and NetSuite are registered trademarks of Oracle and/or
+its affiliates. Other names may be trademarks of their respective owners.
+This project is independent and is not affiliated with, endorsed by, or
+sponsored by Oracle.

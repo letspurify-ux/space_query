@@ -1,0 +1,1372 @@
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum EditGranularity {
+    Word,
+    Other,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum EditOperation {
+    Insert,
+    Delete,
+    Replace,
+    Other,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+struct EditGroup {
+    granularity: EditGranularity,
+    operation: EditOperation,
+}
+
+#[derive(Clone, Debug)]
+struct BufferEdit {
+    start: usize,
+    deleted_len: usize,
+    // Keep FLTK's owned allocation shareable with the undo delta and the
+    // highlighter callback; Arc<str> would copy the bytes during conversion.
+    inserted_text: Arc<String>,
+}
+
+struct CompositeBufferEdit {
+    start: usize,
+    deleted_len: usize,
+    inserted_text: Arc<String>,
+}
+
+const REMOTE_EDIT_CURSOR_DISTANCE: usize = 5;
+const COMPOSITE_HISTORY_CONTEXT_BYTES: usize = 64;
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct UndoSnapshot {
+    text: ChunkedText,
+    cursor_pos: usize,
+}
+
+impl UndoSnapshot {
+    fn new(text: String, cursor_pos: usize) -> Self {
+        Self {
+            text: ChunkedText::from_string(text),
+            cursor_pos,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct UndoDelta {
+    start: usize,
+    deleted_text: ChunkedText,
+    inserted_text: Arc<String>,
+    before_cursor: usize,
+    after_cursor: usize,
+    group_id: u64,
+}
+
+#[derive(Clone)]
+struct WordUndoRedoState {
+    anchor: UndoSnapshot,
+    current: UndoSnapshot,
+    deltas: Vec<UndoDelta>,
+    history_total_bytes: usize,
+    index: usize,
+    active_group: Option<(EditGroup, u64)>,
+    next_group_id: u64,
+    applying_history: bool,
+    suppress_next_remote_cursor_move: bool,
+    finish_group_after_next_edit: bool,
+    completion_edit_group_id: Option<u64>,
+    pending_history_text_snapshots: VecDeque<ChunkedText>,
+}
+
+impl WordUndoRedoState {
+    fn new(initial_text: String) -> Self {
+        let initial_cursor = initial_text.len();
+        let initial_snapshot = UndoSnapshot::new(initial_text, initial_cursor);
+        Self {
+            anchor: initial_snapshot.clone(),
+            current: initial_snapshot,
+            deltas: Vec::new(),
+            history_total_bytes: 0,
+            index: 0,
+            active_group: None,
+            next_group_id: 1,
+            applying_history: false,
+            suppress_next_remote_cursor_move: false,
+            finish_group_after_next_edit: false,
+            completion_edit_group_id: None,
+            pending_history_text_snapshots: VecDeque::new(),
+        }
+    }
+
+    fn normalize_index(&mut self) {
+        if self.index > self.deltas.len() {
+            self.index = self.deltas.len();
+            self.active_group = None;
+        }
+        self.current.cursor_pos =
+            Self::clamp_chunked_boundary(&self.current.text, self.current.cursor_pos);
+    }
+
+    #[cfg(test)]
+    fn current_snapshot_matches(&self, current_text: &str) -> bool {
+        self.current.text.to_flat_string() == current_text
+    }
+
+    fn clamp_to_char_boundary(text: &str, idx: usize) -> usize {
+        let mut idx = idx.min(text.len());
+        while idx > 0 && !text.is_char_boundary(idx) {
+            idx -= 1;
+        }
+        idx
+    }
+
+    fn clamp_chunked_boundary(text: &ChunkedText, idx: usize) -> usize {
+        text.clamp_boundary(idx)
+    }
+
+    fn normalized_replace_range(text: &ChunkedText, edit: &BufferEdit) -> (usize, usize) {
+        let replace_start = Self::clamp_chunked_boundary(text, edit.start);
+        let delete_end = replace_start
+            .saturating_add(edit.deleted_len)
+            .min(text.len());
+        let replace_end = Self::clamp_chunked_boundary(text, delete_end).max(replace_start);
+        (replace_start, replace_end)
+    }
+
+    fn apply_edit_to_snapshot(snapshot: &mut UndoSnapshot, edit: &BufferEdit) {
+        let (replace_start, replace_end) = Self::normalized_replace_range(&snapshot.text, edit);
+        let _ = snapshot
+            .text
+            .replace_range_shared(replace_start, replace_end, edit.inserted_text.clone());
+        let cursor = replace_start
+            .saturating_add(edit.inserted_text.len())
+            .min(snapshot.text.len());
+        snapshot.cursor_pos = Self::clamp_chunked_boundary(&snapshot.text, cursor);
+    }
+
+    fn apply_delta_to_snapshot(snapshot: &mut UndoSnapshot, delta: &UndoDelta, reverse: bool) {
+        let start = Self::clamp_chunked_boundary(&snapshot.text, delta.start);
+        let delete_len = if reverse {
+            delta.inserted_text.len()
+        } else {
+            delta.deleted_text.len()
+        };
+        let end = Self::clamp_chunked_boundary(
+            &snapshot.text,
+            start.saturating_add(delete_len).min(snapshot.text.len()),
+        )
+        .max(start);
+        if reverse {
+            let _ = snapshot
+                .text
+                .replace_range_chunked(start, end, delta.deleted_text.clone());
+        } else {
+            let _ = snapshot.text.replace_range_shared(
+                start,
+                end,
+                delta.inserted_text.clone(),
+            );
+        }
+        let cursor = if reverse {
+            delta.before_cursor
+        } else {
+            delta.after_cursor
+        };
+        snapshot.cursor_pos = Self::clamp_chunked_boundary(&snapshot.text, cursor);
+    }
+
+    fn should_merge_into_active_group(&self, edit_group: EditGroup, edit: &BufferEdit) -> bool {
+        let Some((active_group, _)) = self.active_group else {
+            return false;
+        };
+
+        // Group contiguous "word" edits together regardless of low-level operation
+        // (insert/delete/replace). This keeps IME composition updates as one word step.
+        if active_group.granularity != EditGranularity::Word
+            || edit_group.granularity != EditGranularity::Word
+            || active_group.operation == EditOperation::Other
+            || edit_group.operation == EditOperation::Other
+        {
+            return false;
+        }
+
+        if edit.inserted_text.contains('\n') {
+            return false;
+        }
+
+        let current_cursor = self.current.cursor_pos;
+        let (edit_start, edit_end) = Self::normalized_replace_range(&self.current.text, edit);
+        if Self::cursor_distance_chars_chunked(&self.current.text, current_cursor, edit_start)
+            >= REMOTE_EDIT_CURSOR_DISTANCE
+        {
+            return false;
+        }
+
+        let near_current_cursor = edit_start <= current_cursor.saturating_add(12)
+            && current_cursor <= edit_end.saturating_add(12);
+        let small_edit = edit.deleted_len <= 24 && edit.inserted_text.len() <= 48;
+        if !near_current_cursor || !small_edit {
+            return false;
+        }
+
+        if !Self::is_same_line_chunked(&self.current.text, current_cursor, edit_start)
+            || !Self::is_same_line_chunked(&self.current.text, current_cursor, edit_end)
+        {
+            return false;
+        }
+
+        let window_start = self
+            .current
+            .text
+            .clamp_boundary(self.current.cursor_pos.saturating_sub(256));
+        let window_end = self
+            .current
+            .cursor_pos
+            .saturating_add(256)
+            .min(self.current.text.len());
+        let current_text = self
+            .current
+            .text
+            .range_string(window_start, window_end)
+            .unwrap_or_default();
+        let local_cursor = current_cursor.saturating_sub(window_start);
+        let Some((word_start, word_end)) =
+            Self::word_span_touching_offset(&current_text, local_cursor)
+        else {
+            // IME composition can briefly remove the in-progress syllable,
+            // leaving no identifier under the cursor for one callback.
+            return edit_start == current_cursor;
+        };
+        let word_start = window_start.saturating_add(word_start);
+        let word_end = window_start.saturating_add(word_end);
+        if !Self::edit_touches_word_span(edit_start, edit_end, word_start, word_end) {
+            return false;
+        }
+        true
+    }
+
+    fn is_same_line_chunked(text: &ChunkedText, left: usize, right: usize) -> bool {
+        let left = text.clamp_boundary(left.min(text.len()));
+        let right = text.clamp_boundary(right.min(text.len()));
+        let (start, end) = if left <= right {
+            (left, right)
+        } else {
+            (right, left)
+        };
+        !text
+            .range_string(start, end)
+            .unwrap_or_default()
+            .as_bytes()
+            .contains(&b'\n')
+    }
+
+    fn cursor_distance_chars_chunked(text: &ChunkedText, left: usize, right: usize) -> usize {
+        let left = text.clamp_boundary(left.min(text.len()));
+        let right = text.clamp_boundary(right.min(text.len()));
+        let (start, end) = if left <= right {
+            (left, right)
+        } else {
+            (right, left)
+        };
+        // Callers only distinguish "nearer than the remote-edit threshold".
+        // UTF-8 uses at most four bytes per scalar, so a range this wide is
+        // certainly remote and never needs to be copied from the document.
+        if end.saturating_sub(start) >= REMOTE_EDIT_CURSOR_DISTANCE.saturating_mul(4) {
+            return REMOTE_EDIT_CURSOR_DISTANCE;
+        }
+        text.range_string(start, end)
+            .map(|range| range.chars().count())
+            .unwrap_or_else(|| end.saturating_sub(start))
+    }
+
+    fn delta_changes_text(delta: &UndoDelta) -> bool {
+        !delta.deleted_text.is_empty() || !delta.inserted_text.is_empty()
+    }
+
+    fn record_cursor_move_if_remote(
+        &mut self,
+        replace_start: usize,
+        merge_group: bool,
+        edit_group: EditGroup,
+    ) {
+        let suppress_remote_cursor_move = self.suppress_next_remote_cursor_move;
+        self.suppress_next_remote_cursor_move = false;
+        if suppress_remote_cursor_move {
+            return;
+        }
+
+        if merge_group || edit_group.operation == EditOperation::Other {
+            return;
+        }
+
+        let current_cursor = Self::clamp_chunked_boundary(
+            &self.current.text,
+            self.current.cursor_pos.min(self.current.text.len()),
+        );
+        let next_cursor =
+            Self::clamp_chunked_boundary(&self.current.text, replace_start.min(self.current.text.len()));
+        if current_cursor == next_cursor
+            || Self::cursor_distance_chars_chunked(&self.current.text, current_cursor, next_cursor)
+                < REMOTE_EDIT_CURSOR_DISTANCE
+        {
+            return;
+        }
+
+        let group_id = self.next_group_id();
+        let delta = UndoDelta {
+            start: next_cursor,
+            deleted_text: ChunkedText::default(),
+            inserted_text: Arc::new(String::new()),
+            before_cursor: current_cursor,
+            after_cursor: next_cursor,
+            group_id,
+        };
+        Self::apply_delta_to_snapshot(&mut self.current, &delta, false);
+        self.deltas.push(delta);
+        self.index = self.deltas.len();
+        self.active_group = None;
+        self.trim_history_if_needed();
+    }
+
+    fn truncate_redo_history(&mut self) {
+        if self.index >= self.deltas.len() {
+            return;
+        }
+
+        let removed_bytes: usize = self.deltas[self.index..]
+            .iter()
+            .map(|delta| {
+                delta
+                    .deleted_text
+                    .len()
+                    .saturating_add(delta.inserted_text.len())
+            })
+            .sum();
+        self.deltas.truncate(self.index);
+        self.history_total_bytes = self.history_total_bytes.saturating_sub(removed_bytes);
+        self.active_group = None;
+    }
+
+    fn effective_history_byte_limit(&self) -> usize {
+        MAX_WORD_UNDO_HISTORY_BYTES.max(self.current.text.len().saturating_mul(2))
+    }
+
+    fn trim_history_if_needed(&mut self) {
+        let byte_limit = self.effective_history_byte_limit();
+        while self.deltas.len() > 1
+            && (self.deltas.len() > MAX_WORD_UNDO_HISTORY || self.history_total_bytes > byte_limit)
+        {
+            let removed = self.deltas.remove(0);
+            let removed_len = removed
+                .deleted_text
+                .len()
+                .saturating_add(removed.inserted_text.len());
+            self.history_total_bytes = self.history_total_bytes.saturating_sub(removed_len);
+            if self.index > 0 {
+                Self::apply_delta_to_snapshot(&mut self.anchor, &removed, false);
+                self.index = self.index.saturating_sub(1);
+            }
+        }
+
+        if self.index > self.deltas.len() {
+            self.index = self.deltas.len();
+        }
+        if self.index == 0 {
+            self.active_group = None;
+        }
+    }
+
+    fn word_span_touching_offset(text: &str, pos: usize) -> Option<(usize, usize)> {
+        if text.is_empty() {
+            return None;
+        }
+
+        let pos = Self::clamp_to_char_boundary(text, pos.min(text.len()));
+
+        let anchor = if pos < text.len() {
+            let ch = text.get(pos..)?.chars().next()?;
+            if is_word_edit_char(ch) {
+                Some(pos)
+            } else {
+                None
+            }
+        } else {
+            None
+        }
+        .or_else(|| {
+            if pos == 0 {
+                return None;
+            }
+            text.get(..pos)
+                .and_then(|prefix| prefix.char_indices().next_back())
+                .and_then(|(start, ch)| is_word_edit_char(ch).then_some(start))
+        })?;
+
+        let mut start = anchor;
+        while start > 0 {
+            let Some((prev_start, ch)) = text
+                .get(..start)
+                .and_then(|prefix| prefix.char_indices().next_back())
+            else {
+                break;
+            };
+            if is_word_edit_char(ch) {
+                start = prev_start;
+            } else {
+                break;
+            }
+        }
+
+        let mut end = anchor;
+        while end < text.len() {
+            let Some(ch) = text.get(end..).and_then(|suffix| suffix.chars().next()) else {
+                break;
+            };
+            if is_word_edit_char(ch) {
+                end += ch.len_utf8();
+            } else {
+                break;
+            }
+        }
+
+        Some((start, end))
+    }
+
+    fn edit_touches_word_span(
+        edit_start: usize,
+        edit_end: usize,
+        word_start: usize,
+        word_end: usize,
+    ) -> bool {
+        if edit_start == edit_end {
+            return edit_start >= word_start && edit_start <= word_end;
+        }
+        edit_start < word_end && edit_end > word_start
+    }
+
+    fn next_group_id(&mut self) -> u64 {
+        let group_id = self.next_group_id;
+        self.next_group_id = self.next_group_id.saturating_add(1);
+        group_id
+    }
+
+    fn finish_active_group(&mut self) {
+        self.active_group = None;
+        self.suppress_next_remote_cursor_move = false;
+        self.finish_group_after_next_edit = false;
+        self.completion_edit_group_id = None;
+    }
+
+    fn sync_current_cursor(&mut self, cursor_pos: usize) {
+        self.current.cursor_pos = Self::clamp_chunked_boundary(
+            &self.current.text,
+            cursor_pos.min(self.current.text.len()),
+        );
+    }
+
+    fn record_cursor_move_to_if_remote(&mut self, cursor_pos: usize) {
+        self.normalize_index();
+
+        let current_cursor = Self::clamp_chunked_boundary(
+            &self.current.text,
+            self.current.cursor_pos.min(self.current.text.len()),
+        );
+        let next_cursor = Self::clamp_chunked_boundary(
+            &self.current.text,
+            cursor_pos.min(self.current.text.len()),
+        );
+        if current_cursor == next_cursor
+            || Self::cursor_distance_chars_chunked(&self.current.text, current_cursor, next_cursor)
+                < REMOTE_EDIT_CURSOR_DISTANCE
+        {
+            return;
+        }
+
+        self.truncate_redo_history();
+
+        let group_id = self.next_group_id();
+        let delta = UndoDelta {
+            start: next_cursor,
+            deleted_text: ChunkedText::default(),
+            inserted_text: Arc::new(String::new()),
+            before_cursor: current_cursor,
+            after_cursor: next_cursor,
+            group_id,
+        };
+        Self::apply_delta_to_snapshot(&mut self.current, &delta, false);
+        self.deltas.push(delta);
+        self.index = self.deltas.len();
+        self.active_group = None;
+        self.trim_history_if_needed();
+    }
+
+    fn prepare_completion_edit(&mut self) {
+        self.active_group = None;
+        self.suppress_next_remote_cursor_move = true;
+        self.finish_group_after_next_edit = true;
+        self.completion_edit_group_id = None;
+    }
+
+    fn finish_completion_edit_cursor(&mut self, cursor_pos: usize, changed_text: bool) {
+        let cursor = Self::clamp_chunked_boundary(
+            &self.current.text,
+            cursor_pos.min(self.current.text.len()),
+        );
+        self.current.cursor_pos = cursor;
+        let completion_group_id = self.completion_edit_group_id.take();
+        self.suppress_next_remote_cursor_move = false;
+        self.finish_group_after_next_edit = false;
+        if changed_text && completion_group_id.is_some() && self.index == self.deltas.len() {
+            if let Some(delta) = self.deltas.last_mut() {
+                if Some(delta.group_id) == completion_group_id {
+                    delta.after_cursor = cursor;
+                }
+            }
+        }
+    }
+
+    fn record_edit(&mut self, edit: &BufferEdit, edit_group: EditGroup) -> ChunkedText {
+        self.normalize_index();
+        self.pending_history_text_snapshots.clear();
+
+        let (replace_start, replace_end) = Self::normalized_replace_range(&self.current.text, edit);
+        let deleted_text = self
+            .current
+            .text
+            .slice(replace_start, replace_end)
+            .unwrap_or_default();
+        let normalized_edit = BufferEdit {
+            start: replace_start,
+            deleted_len: replace_end.saturating_sub(replace_start),
+            inserted_text: edit.inserted_text.clone(),
+        };
+
+        if deleted_text.matches_str(normalized_edit.inserted_text.as_str()) {
+            self.suppress_next_remote_cursor_move = false;
+            self.finish_group_after_next_edit = false;
+            self.completion_edit_group_id = None;
+            return self.current.text.clone();
+        }
+
+        self.truncate_redo_history();
+
+        let finish_group_after_edit = self.finish_group_after_next_edit;
+        self.finish_group_after_next_edit = false;
+        let merge_group = self.should_merge_into_active_group(edit_group, &normalized_edit);
+        self.record_cursor_move_if_remote(replace_start, merge_group, edit_group);
+        let before_cursor = self.current.cursor_pos;
+        let group_id = if merge_group {
+            self.active_group
+                .map(|(_, id)| id)
+                .unwrap_or_else(|| self.next_group_id())
+        } else {
+            self.next_group_id()
+        };
+        if finish_group_after_edit {
+            self.completion_edit_group_id = Some(group_id);
+        }
+
+        Self::apply_edit_to_snapshot(&mut self.current, &normalized_edit);
+        let after_cursor = self.current.cursor_pos;
+
+        let delta = UndoDelta {
+            start: replace_start,
+            deleted_text,
+            inserted_text: normalized_edit.inserted_text,
+            before_cursor,
+            after_cursor,
+            group_id,
+        };
+        self.history_total_bytes = self.history_total_bytes.saturating_add(
+            delta
+                .deleted_text
+                .len()
+                .saturating_add(delta.inserted_text.len()),
+        );
+        self.deltas.push(delta);
+        self.index = self.deltas.len();
+        self.active_group = if finish_group_after_edit {
+            None
+        } else {
+            Some((edit_group, group_id))
+        };
+        self.trim_history_if_needed();
+        self.current.text.clone()
+    }
+
+    fn record_programmatic_edit(
+        &mut self,
+        edit: &BufferEdit,
+        before_cursor: usize,
+        after_cursor: usize,
+    ) -> ChunkedText {
+        self.normalize_index();
+        self.pending_history_text_snapshots.clear();
+        self.truncate_redo_history();
+
+        let (replace_start, replace_end) = Self::normalized_replace_range(&self.current.text, edit);
+        let deleted_text = self
+            .current
+            .text
+            .slice(replace_start, replace_end)
+            .unwrap_or_default();
+        let normalized_edit = BufferEdit {
+            start: replace_start,
+            deleted_len: replace_end.saturating_sub(replace_start),
+            inserted_text: edit.inserted_text.clone(),
+        };
+        let before_cursor = Self::clamp_chunked_boundary(
+            &self.current.text,
+            before_cursor.min(self.current.text.len()),
+        );
+        let group_id = self.next_group_id();
+
+        Self::apply_edit_to_snapshot(&mut self.current, &normalized_edit);
+        let after_cursor = Self::clamp_chunked_boundary(
+            &self.current.text,
+            after_cursor.min(self.current.text.len()),
+        );
+        self.current.cursor_pos = after_cursor;
+
+        let delta = UndoDelta {
+            start: replace_start,
+            deleted_text,
+            inserted_text: normalized_edit.inserted_text,
+            before_cursor,
+            after_cursor,
+            group_id,
+        };
+        self.history_total_bytes = self.history_total_bytes.saturating_add(
+            delta
+                .deleted_text
+                .len()
+                .saturating_add(delta.inserted_text.len()),
+        );
+        self.deltas.push(delta);
+        self.index = self.deltas.len();
+        self.active_group = Some((
+            EditGroup {
+                granularity: EditGranularity::Other,
+                operation: EditOperation::Replace,
+            },
+            group_id,
+        ));
+        self.trim_history_if_needed();
+        self.current.text.clone()
+    }
+
+    fn record_full_buffer_programmatic_replace(
+        &mut self,
+        _deleted_text: Arc<String>,
+        inserted_text: Arc<String>,
+        before_cursor: usize,
+        after_cursor: usize,
+    ) -> ChunkedText {
+        self.normalize_index();
+        self.pending_history_text_snapshots.clear();
+        self.truncate_redo_history();
+
+        let before_cursor = Self::clamp_chunked_boundary(
+            &self.current.text,
+            before_cursor.min(self.current.text.len()),
+        );
+        let deleted_text = self.current.text.clone();
+        let group_id = self.next_group_id();
+
+        self.current.text = ChunkedText::from_shared_string(inserted_text.clone());
+        let after_cursor = Self::clamp_chunked_boundary(
+            &self.current.text,
+            after_cursor.min(self.current.text.len()),
+        );
+        self.current.cursor_pos = after_cursor;
+
+        let delta = UndoDelta {
+            start: 0,
+            deleted_text,
+            inserted_text,
+            before_cursor,
+            after_cursor,
+            group_id,
+        };
+        self.history_total_bytes = self.history_total_bytes.saturating_add(
+            delta
+                .deleted_text
+                .len()
+                .saturating_add(delta.inserted_text.len()),
+        );
+        self.deltas.push(delta);
+        self.index = self.deltas.len();
+        self.active_group = Some((
+            EditGroup {
+                granularity: EditGranularity::Other,
+                operation: EditOperation::Replace,
+            },
+            group_id,
+        ));
+        self.trim_history_if_needed();
+        self.current.text.clone()
+    }
+
+    #[cfg(test)]
+    fn record_snapshot(&mut self, current_text: String, edit_group: EditGroup) {
+        self.normalize_index();
+        if self.current_snapshot_matches(&current_text) {
+            return;
+        }
+        let deleted_len = self.current.text.len();
+        let edit = BufferEdit {
+            start: 0,
+            deleted_len,
+            inserted_text: Arc::new(current_text),
+        };
+        if self.active_group.map(|(group, _)| group) != Some(edit_group) {
+            self.active_group = None;
+        }
+        self.record_edit(&edit, edit_group);
+    }
+
+    #[cfg(test)]
+    fn history_snapshots(&self) -> Vec<UndoSnapshot> {
+        let mut snapshots = Vec::with_capacity(self.deltas.len().saturating_add(1));
+        let mut snapshot = self.anchor.clone();
+        snapshots.push(snapshot.clone());
+        for (idx, delta) in self.deltas.iter().enumerate() {
+            Self::apply_delta_to_snapshot(&mut snapshot, delta, false);
+            let next_group = self.deltas.get(idx.saturating_add(1)).map(|d| d.group_id);
+            if next_group != Some(delta.group_id) && Self::delta_changes_text(delta) {
+                snapshots.push(snapshot.clone());
+            }
+        }
+        snapshots
+    }
+
+    #[cfg(test)]
+    fn history_texts(&self) -> Vec<String> {
+        self.history_snapshots()
+            .iter()
+            .map(|snapshot| snapshot.text.to_flat_string())
+            .collect()
+    }
+
+    fn common_prefix_bytes(left: &str, right: &str) -> usize {
+        let mut prefix = 0usize;
+        for (left_char, right_char) in left.chars().zip(right.chars()) {
+            if left_char != right_char {
+                break;
+            }
+            prefix = prefix.saturating_add(left_char.len_utf8());
+        }
+        prefix
+    }
+
+    fn common_suffix_bytes(left: &str, right: &str, common_prefix: usize) -> usize {
+        let left_available = left.len().saturating_sub(common_prefix);
+        let right_available = right.len().saturating_sub(common_prefix);
+        let mut suffix = 0usize;
+        for (left_char, right_char) in left.chars().rev().zip(right.chars().rev()) {
+            if left_char != right_char {
+                break;
+            }
+            let char_len = left_char.len_utf8();
+            if suffix.saturating_add(char_len) > left_available
+                || suffix.saturating_add(char_len) > right_available
+            {
+                break;
+            }
+            suffix = suffix.saturating_add(char_len);
+        }
+        suffix
+    }
+
+    fn composite_buffer_edit(
+        before: &ChunkedText,
+        after: &ChunkedText,
+        group: &[UndoDelta],
+        reverse: bool,
+    ) -> Option<CompositeBufferEdit> {
+        let mut text_deltas = group.iter().filter(|delta| Self::delta_changes_text(delta));
+        let first = text_deltas.next()?;
+        if text_deltas.next().is_none() {
+            return Some(CompositeBufferEdit {
+                start: first.start,
+                deleted_len: if reverse {
+                    first.inserted_text.len()
+                } else {
+                    first.deleted_text.len()
+                },
+                inserted_text: if reverse {
+                    Arc::new(first.deleted_text.to_flat_string())
+                } else {
+                    first.inserted_text.clone()
+                },
+            });
+        }
+
+        let start = group
+            .iter()
+            .filter(|delta| Self::delta_changes_text(delta))
+            .map(|delta| delta.start)
+            .min()?;
+        let max_start = group
+            .iter()
+            .filter(|delta| Self::delta_changes_text(delta))
+            .map(|delta| delta.start)
+            .max()
+            .unwrap_or(start);
+        let payload_bytes = group
+            .iter()
+            .filter(|delta| Self::delta_changes_text(delta))
+            .map(|delta| {
+                delta
+                    .deleted_text
+                    .len()
+                    .saturating_add(delta.inserted_text.len())
+            })
+            .fold(0usize, usize::saturating_add);
+        let coverage = max_start
+            .saturating_sub(start)
+            .saturating_add(payload_bytes)
+            .saturating_add(COMPOSITE_HISTORY_CONTEXT_BYTES);
+        let before_end = before.clamp_boundary(
+            start
+                .saturating_add(coverage)
+                .min(before.len()),
+        );
+        let unchanged_tail = before.len().saturating_sub(before_end);
+        let after_end = after.clamp_boundary(
+            after
+                .len()
+                .saturating_sub(unchanged_tail)
+                .max(start)
+                .min(after.len()),
+        );
+        let before_fragment = before.range_string(start, before_end)?;
+        let after_fragment = after.range_string(start, after_end)?;
+        let common_prefix = Self::common_prefix_bytes(&before_fragment, &after_fragment);
+        let common_suffix =
+            Self::common_suffix_bytes(&before_fragment, &after_fragment, common_prefix);
+        let replacement_end = after_fragment.len().saturating_sub(common_suffix);
+        let inserted_text = Arc::new(
+            after_fragment
+                .get(common_prefix..replacement_end)?
+                .to_string(),
+        );
+        Some(CompositeBufferEdit {
+            start: start.saturating_add(common_prefix),
+            deleted_len: before_fragment
+                .len()
+                .saturating_sub(common_prefix)
+                .saturating_sub(common_suffix),
+            inserted_text,
+        })
+    }
+
+    fn take_undo_group(&mut self) -> Vec<UndoDelta> {
+        self.normalize_index();
+        self.pending_history_text_snapshots.clear();
+        if self.index == 0 {
+            return Vec::new();
+        }
+
+        let Some(target_group_id) = self
+            .deltas
+            .get(self.index.saturating_sub(1))
+            .map(|delta| delta.group_id)
+        else {
+            return Vec::new();
+        };
+
+        let mut group = Vec::new();
+        while self.index > 0 {
+            let Some(delta) = self.deltas.get(self.index.saturating_sub(1)).cloned() else {
+                self.index = self.deltas.len();
+                self.active_group = None;
+                break;
+            };
+            if delta.group_id != target_group_id {
+                break;
+            }
+            self.index = self.index.saturating_sub(1);
+            Self::apply_delta_to_snapshot(&mut self.current, &delta, true);
+            group.push(delta);
+        }
+        if !group.is_empty() {
+            if group.iter().any(Self::delta_changes_text) {
+                self.pending_history_text_snapshots
+                    .push_back(self.current.text.clone());
+            }
+            self.active_group = None;
+            self.applying_history = true;
+        }
+        group
+    }
+
+    fn undo_cursor_after_group(&self, group: &[UndoDelta]) -> usize {
+        let Some(latest_delta) = group.first() else {
+            return self.current.cursor_pos;
+        };
+        let earliest_delta = group.last().unwrap_or(latest_delta);
+
+        // Undo cursor policy:
+        // - Undoing a deletion group should land at the end of restored text.
+        // - Undoing grouped edits should restore the cursor before the group's
+        //   first edit (earliest delta), not before the latest sub-edit.
+        let all_deletions = group
+            .iter()
+            .all(|delta| delta.inserted_text.is_empty() && !delta.deleted_text.is_empty());
+        let cursor = if all_deletions {
+            let restored_start = group
+                .iter()
+                .map(|delta| delta.start)
+                .min()
+                .unwrap_or(latest_delta.start);
+            let restored_len = group
+                .iter()
+                .map(|delta| delta.deleted_text.len())
+                .sum::<usize>();
+            restored_start.saturating_add(restored_len)
+        } else {
+            earliest_delta.before_cursor
+        }
+        .min(self.current.text.len());
+        Self::clamp_chunked_boundary(&self.current.text, cursor)
+    }
+
+    fn take_redo_group(&mut self) -> Vec<UndoDelta> {
+        self.normalize_index();
+        self.pending_history_text_snapshots.clear();
+        if self.index >= self.deltas.len() {
+            return Vec::new();
+        }
+        let Some(target_group_id) = self.deltas.get(self.index).map(|delta| delta.group_id) else {
+            return Vec::new();
+        };
+
+        let mut group = Vec::new();
+        while self.index < self.deltas.len() {
+            let Some(delta) = self.deltas.get(self.index).cloned() else {
+                break;
+            };
+            if delta.group_id != target_group_id {
+                break;
+            }
+            Self::apply_delta_to_snapshot(&mut self.current, &delta, false);
+            self.index = self.index.saturating_add(1);
+            group.push(delta);
+        }
+        if !group.is_empty() {
+            if group.iter().any(Self::delta_changes_text) {
+                self.pending_history_text_snapshots
+                    .push_back(self.current.text.clone());
+            }
+            self.active_group = None;
+            self.applying_history = true;
+        }
+        group
+    }
+}
+
+impl SqlEditorWidget {
+    fn record_programmatic_buffer_edit(
+        &self,
+        start: usize,
+        deleted_text: &str,
+        inserted_text: &str,
+        before_cursor: usize,
+        after_cursor: usize,
+    ) -> ChunkedText {
+        let mut state = self
+            .undo_redo_state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        state.record_programmatic_edit(
+            &BufferEdit {
+                start,
+                deleted_len: deleted_text.len(),
+                inserted_text: Arc::new(inserted_text.to_string()),
+            },
+            before_cursor,
+            after_cursor,
+        )
+    }
+
+    fn record_full_buffer_programmatic_replace(
+        &self,
+        deleted_text: Arc<String>,
+        inserted_text: Arc<String>,
+        before_cursor: usize,
+        after_cursor: usize,
+    ) -> ChunkedText {
+        let mut state = self
+            .undo_redo_state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        state.record_full_buffer_programmatic_replace(
+            deleted_text,
+            inserted_text,
+            before_cursor,
+            after_cursor,
+        )
+    }
+
+    fn reset_word_undo_state(undo_redo_state: &Arc<Mutex<WordUndoRedoState>>) {
+        let mut state = undo_redo_state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let fresh_snapshot = UndoSnapshot::new(String::new(), 0);
+        state.anchor = fresh_snapshot.clone();
+        state.current = fresh_snapshot;
+        state.deltas.clear();
+        state.history_total_bytes = 0;
+        state.index = 0;
+        state.active_group = None;
+        state.next_group_id = 1;
+        state.applying_history = false;
+        state.suppress_next_remote_cursor_move = false;
+        state.finish_group_after_next_edit = false;
+        state.completion_edit_group_id = None;
+        state.pending_history_text_snapshots.clear();
+    }
+
+    fn apply_composite_buffer_edit(buffer: &mut TextBuffer, edit: &CompositeBufferEdit) {
+        let buffer_len = buffer.length().max(0) as usize;
+        let start = edit.start.min(buffer_len);
+        let end = start
+            .saturating_add(edit.deleted_len)
+            .min(buffer_len);
+        let start_i32 = start.min(i32::MAX as usize) as i32;
+        let end_i32 = end.min(i32::MAX as usize) as i32;
+        buffer.replace(start_i32, end_i32, edit.inserted_text.as_str());
+    }
+
+    pub fn reset_undo_redo_history(&self) {
+        let current_text = self.buffer.text();
+        let buffer_len = self.buffer.length().max(0);
+        let cursor_pos = self.editor.insert_position().clamp(0, buffer_len) as usize;
+        let clamped_cursor = WordUndoRedoState::clamp_to_char_boundary(
+            &current_text,
+            cursor_pos.min(current_text.len()),
+        );
+        let snapshot = UndoSnapshot::new(current_text, clamped_cursor);
+        {
+            let mut state = self
+                .undo_redo_state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            state.anchor = snapshot.clone();
+            state.current = snapshot;
+            state.deltas.clear();
+            state.history_total_bytes = 0;
+            state.index = 0;
+            state.active_group = None;
+            state.next_group_id = 1;
+            state.applying_history = false;
+            state.suppress_next_remote_cursor_move = false;
+            state.finish_group_after_next_edit = false;
+            state.completion_edit_group_id = None;
+            state.pending_history_text_snapshots.clear();
+        }
+        *self
+            .history_cursor
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+        *self
+            .history_original
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+        self.history_navigation_entries
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take();
+        *self
+            .applying_history_navigation
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = false;
+    }
+
+    pub fn undo(&self) {
+        let (composite_edit, cursor_pos) = {
+            let mut state = self
+                .undo_redo_state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let before = state.current.text.clone();
+            let deltas = state.take_undo_group();
+            if deltas.is_empty() {
+                return;
+            }
+            let composite_edit = WordUndoRedoState::composite_buffer_edit(
+                &before,
+                &state.current.text,
+                &deltas,
+                true,
+            );
+            let cursor_pos = state
+                .undo_cursor_after_group(&deltas)
+                .min(i32::MAX as usize) as i32;
+            (composite_edit, cursor_pos)
+        };
+
+        if let Some(edit) = composite_edit.as_ref() {
+            let mut buffer = self.buffer.clone();
+            Self::apply_composite_buffer_edit(&mut buffer, edit);
+        }
+        let mut editor = self.editor.clone();
+        editor.set_insert_position(cursor_pos);
+        editor.show_insert_position();
+
+        let mut state = self
+            .undo_redo_state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        state.applying_history = false;
+        state.pending_history_text_snapshots.clear();
+        drop(state);
+        self.schedule_signature_hint_update();
+    }
+
+    pub fn redo(&self) {
+        let (composite_edit, cursor_pos) = {
+            let mut state = self
+                .undo_redo_state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let before = state.current.text.clone();
+            let deltas = state.take_redo_group();
+            if deltas.is_empty() {
+                return;
+            }
+            let composite_edit = WordUndoRedoState::composite_buffer_edit(
+                &before,
+                &state.current.text,
+                &deltas,
+                false,
+            );
+            let cursor_pos = state.current.cursor_pos.min(i32::MAX as usize) as i32;
+            (composite_edit, cursor_pos)
+        };
+
+        if let Some(edit) = composite_edit.as_ref() {
+            let mut buffer = self.buffer.clone();
+            Self::apply_composite_buffer_edit(&mut buffer, edit);
+        }
+        let mut editor = self.editor.clone();
+        editor.set_insert_position(cursor_pos);
+        editor.show_insert_position();
+
+        let mut state = self
+            .undo_redo_state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        state.applying_history = false;
+        state.pending_history_text_snapshots.clear();
+        drop(state);
+        self.schedule_signature_hint_update();
+    }
+
+    pub fn is_query_running(&self) -> bool {
+        load_mutex_bool(&self.query_running)
+    }
+
+    fn apply_history_navigation_text(&mut self, text: &str) {
+        {
+            let mut applying_navigation = self
+                .applying_history_navigation
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            *applying_navigation = true;
+        }
+
+        self.buffer.set_text(text);
+
+        {
+            let mut applying_navigation = self
+                .applying_history_navigation
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            *applying_navigation = false;
+        }
+        let cursor_pos = text.len().min(i32::MAX as usize) as i32;
+        self.editor.set_insert_position(cursor_pos);
+        self.editor.show_insert_position();
+    }
+
+    pub fn navigate_history(&mut self, direction: i32) {
+        enum NavigationUpdate {
+            NoOp,
+            RestoreOriginal(String),
+            ShowSql(String),
+        }
+
+        let mut cursor = self
+            .history_cursor
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut original = self
+            .history_original
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut history_entries = self
+            .history_navigation_entries
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+
+        if cursor.is_none() {
+            if let Ok(snapshot) = history_snapshot() {
+                if snapshot.is_empty() {
+                    return;
+                }
+                *history_entries = Some(snapshot);
+                *original = Some(self.buffer.text());
+            } else {
+                return;
+            }
+        }
+
+        let Some(entries) = history_entries.as_ref() else {
+            return;
+        };
+
+        let update = match *cursor {
+            None => {
+                if direction > 0 {
+                    if let Some(first) = entries.first() {
+                        *cursor = Some(0);
+                        NavigationUpdate::ShowSql(first.sql.clone())
+                    } else {
+                        NavigationUpdate::NoOp
+                    }
+                } else {
+                    return;
+                }
+            }
+            Some(index) => {
+                if direction > 0 {
+                    let next_index = index.saturating_add(1);
+                    if next_index >= entries.len() {
+                        NavigationUpdate::NoOp
+                    } else {
+                        *cursor = Some(next_index);
+                        NavigationUpdate::ShowSql(entries[next_index].sql.clone())
+                    }
+                } else if index == 0 {
+                    *cursor = None;
+                    history_entries.take();
+                    if let Some(saved) = original.take() {
+                        NavigationUpdate::RestoreOriginal(saved)
+                    } else {
+                        NavigationUpdate::NoOp
+                    }
+                } else {
+                    let next_index = index.saturating_sub(1);
+                    *cursor = Some(next_index);
+                    NavigationUpdate::ShowSql(entries[next_index].sql.clone())
+                }
+            }
+        };
+
+        drop(history_entries);
+        drop(original);
+        drop(cursor);
+
+        match update {
+            NavigationUpdate::NoOp => {}
+            NavigationUpdate::RestoreOriginal(saved) => {
+                self.apply_history_navigation_text(&saved);
+            }
+            NavigationUpdate::ShowSql(sql) => {
+                self.apply_history_navigation_text(&sql);
+            }
+        }
+    }
+}
+
+fn inserted_text(
+    buf: &TextBuffer,
+    pos: i32,
+    ins: i32,
+) -> String {
+    if ins <= 0 || pos < 0 {
+        return String::new();
+    }
+
+    let insert_end = pos.saturating_add(ins).min(buf.length());
+    buf.text_range(pos, insert_end).unwrap_or_default()
+}
+
+fn take_matching_pending_paste_text(
+    buf: &TextBuffer,
+    pos: i32,
+    ins: i32,
+    pending: &Arc<Mutex<Option<Arc<String>>>>,
+) -> Option<Arc<String>> {
+    const EDGE_PROBE_BYTES: usize = 64;
+
+    let candidate = pending
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .take()?;
+    let inserted_len = usize::try_from(ins).ok()?;
+    if pos < 0 || candidate.len() != inserted_len {
+        return None;
+    }
+    if inserted_len == 0 {
+        return Some(candidate);
+    }
+
+    let probe_len = inserted_len.min(EDGE_PROBE_BYTES);
+    let prefix_end = pos.saturating_add(i32::try_from(probe_len).ok()?);
+    if buf.text_range(pos, prefix_end).as_deref()
+        != candidate.get(..probe_len)
+    {
+        return None;
+    }
+    if inserted_len > probe_len {
+        let suffix_start_offset = inserted_len.saturating_sub(probe_len);
+        let suffix_start = pos.saturating_add(i32::try_from(suffix_start_offset).ok()?);
+        let suffix_end = pos.saturating_add(ins);
+        if buf.text_range(suffix_start, suffix_end).as_deref()
+            != candidate.get(suffix_start_offset..)
+        {
+            return None;
+        }
+    }
+    Some(candidate)
+}
+
+fn classify_edit_granularity(ins: i32, del: i32, inserted: &str, deleted: &str) -> EditGranularity {
+    const MAX_GROUPED_WORD_EDIT_BYTES: usize = 128;
+
+    if ins <= 0 && del <= 0 {
+        return EditGranularity::Other;
+    }
+    if inserted.len() > MAX_GROUPED_WORD_EDIT_BYTES
+        || deleted.len() > MAX_GROUPED_WORD_EDIT_BYTES
+    {
+        return EditGranularity::Other;
+    }
+
+    if (ins > 0 && inserted.chars().all(is_word_edit_char))
+        || (del > 0 && deleted.chars().all(is_word_edit_char))
+    {
+        return EditGranularity::Word;
+    }
+
+    EditGranularity::Other
+}
+
+fn classify_edit_group(ins: i32, del: i32, inserted: &str, deleted: &str) -> EditGroup {
+    let operation = match (ins > 0, del > 0) {
+        (true, false) => EditOperation::Insert,
+        (false, true) => EditOperation::Delete,
+        (true, true) => EditOperation::Replace,
+        _ => EditOperation::Other,
+    };
+    EditGroup {
+        granularity: classify_edit_granularity(ins, del, inserted, deleted),
+        operation,
+    }
+}
+
+fn is_word_edit_char(ch: char) -> bool {
+    ch.is_alphanumeric() || ch == '_'
+}

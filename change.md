@@ -1,0 +1,6001 @@
+# 자동 포맷팅 오류 감지 및 개선 리포트
+
+## 1. 목적
+
+SQL 테스트 파일이 많아 사람이 모든 자동 포맷 결과를 반복해서 확인하기 어려운 문제를 개선한다.
+
+- 첫 번째 자동 포맷 결과부터 오류를 감지한다.
+- 실제 SQL 문법 전체를 다시 구현하지 않고 단순한 검사로 이상을 찾는다.
+- Oracle/PLSQL, MySQL, MariaDB 및 SQL*Plus 혼합 스크립트를 점검한다.
+- 발견된 오류는 회귀 테스트로 고정한다.
+
+## 2. 자동 감지 방식
+
+첫 번째 포맷 결과에 다음 검사를 적용한다.
+
+1. 코드 줄의 들여쓰기가 4칸 단위인지 검사
+2. 줄 끝 불필요한 공백 검사
+3. 포맷 전후 SQL statement/token fingerprint 비교
+4. 포맷 결과를 다시 포맷했을 때 결과가 달라지는지 검사
+5. 불필요한 줄바꿈 의존성과 안전한 토큰 간격 검사
+
+SQL 문맥을 모두 재현하는 규칙은 넣지 않았다. 포맷 결과 자체에서 확인할 수 있는 구조적 신호와 토큰 보존 여부만 사용한다.
+
+## 3. 기존 테스트 기대 결과 변경
+
+아래 항목은 입력 SQL은 유지하면서 기존 테스트가 기대하던 잘못된 포맷 결과를 수정한 사례다.
+
+### 3.1 `IS NULL` 복합 조건
+
+AS-IS:
+
+```sql
+IF :NEW.note IS
+NULL THEN
+```
+
+TO-BE:
+
+```sql
+IF :NEW.note IS NULL THEN
+```
+
+관련 테스트: `format_sql_trigger_if_elsif_alignment_matches_expected`
+
+### 3.2 `WITHIN GROUP` 복합 구문
+
+AS-IS:
+
+```sql
+LISTAGG (ename, ',') WITHIN
+GROUP (ORDER BY ename) OVER (
+    PARTITION BY deptno
+)
+```
+
+TO-BE:
+
+```sql
+LISTAGG (ename, ',') WITHIN GROUP (ORDER BY ename) OVER (
+    PARTITION BY deptno
+)
+```
+
+관련 테스트: `format_sql_window_functions_and_listagg_exact_layout`
+
+### 3.3 단항 음수 공백
+
+AS-IS:
+
+```sql
+RAISE_APPLICATION_ERROR (- 20002, 'error');
+EXIT outer_loop WHEN v_inner = - 1;
+```
+
+TO-BE:
+
+```sql
+RAISE_APPLICATION_ERROR (-20002, 'error');
+EXIT outer_loop WHEN v_inner = -1;
+```
+
+관련 테스트:
+
+- `format_sql_parenthesized_if_condition_continuation_uses_single_extra_indent`
+- `format_sql_fmt_pkg_extreme_package_body_keeps_member_recovery_after_nested_exception_sections`
+- `format_sql_torture_package_body_keeps_nested_blocks_and_labels`
+
+### 3.4 주석 다음 고립된 쉼표
+
+AS-IS:
+
+```sql
+SET first_value = 1
+    -- comment
+    ,
+    second_value = 2
+```
+
+TO-BE:
+
+```sql
+SET first_value = 1
+    -- comment
+    , second_value = 2
+```
+
+관련 테스트:
+
+- `full_auto_formatting_test24_package_body_set_comment_and_comma_follow_set_depth`
+- `format_sql_basic_keeps_set_comment_and_comma_aligned_to_existing_multiline_set_depth`
+- `format_sql_basic_keeps_comma_indent_after_line_comment_in_merge_using_clause`
+
+### 3.5 Oracle/MySQL/MariaDB `RETURN CASE`
+
+AS-IS:
+
+```sql
+RETURN
+    CASE UPPER(TRIM(p_currency_code))
+        WHEN 'USD' THEN
+            1.0000
+        ELSE
+            0.0000
+    END;
+```
+
+TO-BE:
+
+```sql
+RETURN CASE UPPER(TRIM(p_currency_code))
+    WHEN 'USD' THEN
+        1.0000
+    ELSE
+        0.0000
+END;
+```
+
+관련 테스트:
+
+- `format_sql_keeps_mariadb_test1_function_case_and_window_definition_depths`
+- `visual_oracle_return_case_stays_on_return_owner_depth`
+- `visual_mysql_profiles_keep_return_case_as_one_expression_phrase`
+
+## 4. 실제 스윕에서 추가로 발견한 오류
+
+### 4.1 CASE 분기 내부 DML 절 들여쓰기
+
+AS-IS:
+
+```sql
+CASE p_action
+    WHEN 'BONUS' THEN
+        UPDATE employees
+    SET salary = salary + 1
+    WHERE employee_id = p_id;
+    WHEN 'AUDIT' THEN
+        INSERT INTO audit_log
+    VALUES (p_id, 'PROCESSED');
+END CASE;
+```
+
+TO-BE:
+
+```sql
+CASE p_action
+    WHEN 'BONUS' THEN
+        UPDATE employees
+        SET salary = salary + 1
+        WHERE employee_id = p_id;
+    WHEN 'AUDIT' THEN
+        INSERT INTO audit_log
+        VALUES (p_id, 'PROCESSED');
+END CASE;
+```
+
+`UPDATE`, `SET`, `WHERE`가 같은 깊이를 사용하고 `INSERT`, `VALUES`도 같은 깊이를 사용하도록 수정했다.
+
+추가 회귀 테스트: `visual_oracle_keeps_case_branch_dml_clauses_on_the_statement_depth`
+
+### 4.2 한 줄에 붙은 SQL*Plus 명령과 SQL
+
+AS-IS:
+
+```sql
+SET PAGESIZE 50 WHENEVER SQLERROR EXIT SQL.SQLCODE ROLLBACK PROMPT Creating tables CREATE TABLE test_table (
+id NUMBER
+);
+```
+
+TO-BE:
+
+```sql
+SET PAGESIZE 50
+
+WHENEVER SQLERROR EXIT SQL.SQLCODE ROLLBACK
+
+PROMPT Creating tables
+
+CREATE TABLE test_table (
+    id NUMBER
+);
+```
+
+포맷터에서 위 문자열 조합만 다시 쓰던 후처리를 제거했다. 대신 format/script 양쪽이 함께 사용하는 `process_split_line` 앞에서 실제 tool command parser가 완결된 명령 prefix를 소비하고, 다음 SQL*Plus 명령 또는 SQL statement head에서 경계를 여는 방식으로 수정했다. 따라서 `SET` 옵션, `WHENEVER` action, `PROMPT` payload, 뒤따르는 SQL의 구체적인 문자열 조합에 의존하지 않는다.
+
+독립 `PROMPT example CREATE TABLE text only`의 payload는 분리하지 않으며, q-quoted literal 내부의 `/`도 실행 경계로 오인하지 않는다.
+
+추가 회귀 테스트:
+
+- `split_format_items_recovers_concatenated_sqlplus_commands_by_command_grammar`
+- `split_format_items_does_not_split_sql_words_inside_standalone_prompt_payload`
+- `split_format_items_does_not_recover_slash_text_inside_q_quote`
+- `split_format_items_keeps_compound_clear_command_before_following_sql`
+
+### 4.3 Slash와 여러 `COLUMN` 명령이 한 줄에 붙은 경우
+
+AS-IS:
+
+```sql
+/ COLUMN id FORMAT 9999 COLUMN data FORMAT A30
+```
+
+TO-BE:
+
+```sql
+/
+
+COLUMN id FORMAT 9999
+
+COLUMN data FORMAT A30
+```
+
+Slash 실행 경계와 각 SQL*Plus `COLUMN` 명령을 별도 실행 단위로 분리한다.
+
+추가 회귀 테스트: `visual_sqlplus_mixed_line_preserves_all_source_tokens`
+
+### 4.4 중첩 SELECT의 첫 표현식 앞 주석 들여쓰기
+
+47개 최종 포맷 결과 28,567줄을 육안 검토하면서 자동 검사에서 놓친 항목을 발견했다.
+
+AS-IS:
+
+```sql
+FROM (
+        SELECT
+        /* comment before expression */
+        calc_net(i.qty) AS net_amount
+        FROM visual_order i
+    ) v
+```
+
+TO-BE:
+
+```sql
+FROM (
+        SELECT
+            /* comment before expression */
+            calc_net(i.qty) AS net_amount
+        FROM visual_order i
+    ) v
+```
+
+단독 `SELECT` 다음에 새 줄 블록 주석이 오면, 주석과 첫 표현식 모두 활성 select-list 깊이를 사용하도록 수정했다.
+
+추가 회귀 테스트: `visual_mariadb_indents_comment_and_first_nested_select_item`
+
+### 4.5 인라인뷰 내부 `WITH` 블록 과다 들여쓰기
+
+AS-IS:
+
+```sql
+FROM (
+            /* inline view */
+            WITH x AS (
+                SELECT id
+                FROM paid
+            )
+        SELECT x.*
+        FROM x
+    ) v
+```
+
+TO-BE:
+
+```sql
+FROM (
+        /* inline view */
+        WITH x AS (
+            SELECT id
+            FROM paid
+        )
+        SELECT x.*
+        FROM x
+    ) v
+```
+
+인라인뷰 시작 주석 다음 토큰이 `WITH`인 경우 기존 query child depth를 재사용하여 주석, `WITH`, 메인 `SELECT`가 같은 깊이를 사용하도록 수정했다.
+
+추가 회귀 테스트: `visual_oracle_aligns_commented_inline_view_with_and_main_select`
+
+### 4.6 `WITHIN GROUP ORDER BY` CASE 다음 형제 항목 깊이
+
+최신 47개 결과를 다시 육안 검토하면서 자동 검사에서 놓친 항목을 발견했다.
+
+AS-IS:
+
+```sql
+ORDER BY
+    CASE
+        WHEN salary IS NULL THEN 999999999
+        ELSE salary * -1
+    END,
+employee_id
+```
+
+TO-BE:
+
+```sql
+ORDER BY
+    CASE
+        WHEN salary IS NULL THEN 999999999
+        ELSE salary * -1
+    END,
+    employee_id
+```
+
+`WITHIN GROUP`의 multiline `ORDER BY`에서 CASE가 끝난 뒤 쉼표가 나오면 다음 형제 정렬 항목이 CASE operand 깊이를 유지하도록 수정했다. 일반 `ORDER BY`와 subquery 정렬 항목의 기존 동작은 변경하지 않는다.
+
+추가 회귀 테스트: `visual_oracle_aligns_case_and_following_within_group_order_items`
+
+### 4.7 `CREATE VIEW AS` CTE와 메인 SELECT 사이 주석 깊이
+
+AS-IS:
+
+```sql
+CREATE OR REPLACE VIEW visual_v AS
+    WITH visual_cte AS (
+        SELECT id
+        FROM visual_source
+    )
+/* query body */
+    SELECT id
+    FROM visual_cte
+```
+
+TO-BE:
+
+```sql
+CREATE OR REPLACE VIEW visual_v AS
+    WITH visual_cte AS (
+        SELECT id
+        FROM visual_source
+    )
+    /* query body */
+    SELECT id
+    FROM visual_cte
+```
+
+다음 토큰이 query head이고 활성 query-body 기준 깊이가 있는 경우, standalone 주석에도 그 깊이를 최솟값으로 적용한다. 일반 SELECT의 절 사이 주석이나 괄호 내부 주석 규칙은 그대로 유지한다.
+
+추가 회귀 테스트: `visual_oracle_aligns_create_view_query_boundary_comment`
+
+### 4.8 Named argument의 CASE와 다음 인자 경계
+
+AS-IS:
+
+```sql
+mutate_emp (
+    p_status =>
+        CASE
+            WHEN MOD (p_id, 3) = 0 THEN 'ON_HOLD'
+            ELSE 'ACTIVE'
+        END, p_note => v_note
+);
+```
+
+TO-BE:
+
+```sql
+mutate_emp (
+    p_status => CASE
+        WHEN MOD (p_id, 3) = 0 THEN 'ON_HOLD'
+        ELSE 'ACTIVE'
+    END,
+    p_note => v_note
+);
+```
+
+`=> CASE`를 하나의 표현식 시작으로 유지하고, CASE가 끝난 뒤의 다음 named argument만 형제 깊이로 분리했다.
+
+추가 회귀 테스트: `visual_oracle_keeps_named_argument_case_attached_and_splits_the_next_argument`
+
+### 4.9 `EXECUTE IMMEDIATE`와 CASE 표현식 깊이
+
+AS-IS:
+
+```sql
+EXECUTE IMMEDIATE
+CASE
+    WHEN p_mode = 'A' THEN v_sql_a
+    ELSE v_sql_b
+END;
+```
+
+TO-BE:
+
+```sql
+EXECUTE IMMEDIATE
+    CASE
+        WHEN p_mode = 'A' THEN v_sql_a
+        ELSE v_sql_b
+    END;
+```
+
+`EXECUTE IMMEDIATE` 구문 frame을 열고 그 frame의 owner scope를 기준으로 CASE를 한 단계 깊게 배치했다. `USING` phase와 괄호 깊이도 같은 frame에 저장해 바깥 실행문의 상태와 섞이지 않게 했다.
+
+추가 회귀 테스트: `visual_oracle_indents_execute_immediate_case_expression_from_its_owner`
+
+### 4.10 Conditional `INSERT ALL` 분기와 driving query
+
+AS-IS:
+
+```sql
+INSERT ALL
+    WHEN dept_id = 30
+    AND salary >= 100000 THEN
+        INTO visual_high (id) VALUES (id)
+    SELECT id
+    FROM visual_emp
+```
+
+TO-BE:
+
+```sql
+INSERT ALL
+    WHEN dept_id = 30
+        AND salary >= 100000 THEN
+        INTO visual_high (id) VALUES (id)
+SELECT id
+FROM visual_emp
+```
+
+`INSERT ALL/FIRST`에서 owner frame을 열고 `WHEN/ELSE`, 조건, branch body를 각각 owner +1, +2, +2의 상대 깊이로 계산한다. 분기들이 끝나는 driving `SELECT`에서 해당 frame만 닫아 `SELECT`/`FROM`을 바깥 소유 깊이로 복귀시켰다.
+
+추가 회귀 테스트: `visual_oracle_aligns_conditional_insert_all_and_driving_select`
+
+### 4.11 FOR 범위 CASE, 예외 처리 루프, 커서 `FOR UPDATE`
+
+AS-IS:
+
+```sql
+FOR i IN 1..
+CASE
+    WHEN p_limit IS NULL THEN 5
+    ELSE p_limit
+END LOOP
+    NULL;
+END LOOP;
+```
+
+```sql
+FOR j IN 1..SQL%BULK_EXCEPTIONS.COUNT LOOP
+write_log ('ERROR');
+END LOOP;
+```
+
+```sql
+FOR r IN (
+    SELECT id
+    FROM visual_emp
+    FOR UPDATE
+) LOOP
+        BEGIN
+            NULL;
+        END;
+    END LOOP;
+```
+
+TO-BE:
+
+```sql
+FOR i IN 1..
+    CASE
+        WHEN p_limit IS NULL THEN 5
+        ELSE p_limit
+    END
+LOOP
+    NULL;
+END LOOP;
+```
+
+```sql
+FOR j IN 1..SQL%BULK_EXCEPTIONS.COUNT LOOP
+    write_log ('ERROR');
+END LOOP;
+```
+
+```sql
+FOR r IN (
+    SELECT id
+    FROM visual_emp
+    FOR UPDATE
+) LOOP
+    BEGIN
+        NULL;
+    END;
+END LOOP;
+```
+
+FOR/WHILE 헤더의 최종 렌더링 깊이를 구문 frame으로 열어 LOOP 종결자까지 보존했다. 특히 `FOR`의 종료자 owner frame과 `IF/WHILE` 조건식 frame을 분리하여, 커서 서브쿼리가 조건식 레이아웃을 상속하지 않게 했다. 범위식의 CASE `END`와 루프 시작 `LOOP`는 서로 다른 줄에 두어 종결 대상의 모호성을 없앴고, 커서 쿼리 안의 `FOR UPDATE`는 바깥 `FOR` frame 안의 SQL 절로 유지한다.
+
+추가 회귀 테스트:
+
+- `visual_oracle_indents_case_used_as_a_for_range_expression`
+- `visual_oracle_indents_for_loop_body_inside_exception_handler`
+- `visual_oracle_keeps_cursor_for_update_inside_the_loop_header`
+
+### 4.12 MODEL 규칙 형제와 다차원 좌표
+
+AS-IS:
+
+```sql
+RULES UPSERT SEQUENTIAL ORDER (
+    calc_bonus [ ANY,
+    ANY ] = CASE
+        WHEN calc_sal [ CV (),
+    CV (empno) ] > 3000 THEN calc_sal [ CV (),
+    CV (empno) ] * 0.20
+        ELSE calc_sal [ CV (),
+    CV (empno) ] * 0.05
+    END, calc_sal [ ANY, ANY ] = calc_sal [ CV (), CV (empno) ]
+)
+```
+
+TO-BE:
+
+```sql
+RULES UPSERT SEQUENTIAL ORDER (
+    calc_bonus [ ANY, ANY ] = CASE
+        WHEN calc_sal [ CV (), CV (empno) ] > 3000 THEN calc_sal [ CV (), CV (empno) ] * 0.20
+        ELSE calc_sal [ CV (), CV (empno) ] * 0.05
+    END,
+    calc_sal [ ANY, ANY ] = calc_sal [ CV (), CV (empno) ]
+)
+```
+
+`RULES (...)`를 규칙 형제 목록으로 인식하되, 대괄호 안의 다차원 좌표 쉼표는 형제 규칙 구분자로 취급하지 않는다. `ITERATE (...)`와 `UNTIL (...)` modifier 괄호는 기존처럼 compact하게 유지한다.
+
+추가 회귀 테스트:
+
+- `visual_oracle_splits_model_rule_siblings_after_case`
+- `visual_oracle_keeps_model_iterate_and_until_modifier_parens_compact`
+
+### 4.13 MariaDB IF 괄호 안 OR와 본문 깊이
+
+AS-IS:
+
+```sql
+IF v_orders_cnt > 0
+    AND (v_top_category IS NULL
+    OR v_top_category = '') THEN
+    SET v_message = 'missing category';
+END IF;
+```
+
+TO-BE:
+
+```sql
+IF v_orders_cnt > 0
+    AND (v_top_category IS NULL
+        OR v_top_category = '') THEN
+    SET v_message = 'missing category';
+END IF;
+```
+
+괄호 내부 `OR`는 바깥 `AND`보다 한 단계 깊게 두고, IF 본문은 중첩 괄호 깊이를 상속하지 않고 조건 continuation 깊이에 맞춘다.
+
+추가 회귀 테스트: `visual_mariadb_indents_nested_or_inside_procedure_if_parentheses`
+
+### 4.14 MODEL cell reference의 FOR 범위
+
+AS-IS:
+
+```sql
+RULES UPSERT (
+    total_amt [
+    FOR month_no
+    FROM 1 TO 12 INCREMENT 1 ] = NVL (...)
+)
+```
+
+TO-BE:
+
+```sql
+RULES UPSERT (
+    total_amt [ FOR month_no FROM 1 TO 12 INCREMENT 1 ] = NVL (...)
+)
+```
+
+MODEL 대괄호 안의 `FOR ... FROM ...`은 SQL 절이나 PL/SQL 루프가 아니라 cell reference 범위이므로 구조적 줄바꿈을 적용하지 않는다.
+
+추가 회귀 테스트: `visual_oracle_keeps_model_for_cell_reference_inline`
+
+### 4.15 빈 analytic OVER 괄호
+
+AS-IS:
+
+```sql
+COUNT(*) OVER (
+) AS total_cnt
+```
+
+TO-BE:
+
+```sql
+COUNT(*) OVER () AS total_cnt
+```
+
+토큰이 실제로 비어 있는 analytic 괄호는 multiline query frame이 아니라 compact frame으로 처리한다.
+
+추가 회귀 테스트: `visual_oracle_keeps_empty_analytic_over_parentheses_compact`
+
+### 4.16 CTE query 끝 블록 주석 깊이
+
+AS-IS:
+
+```sql
+WITH base AS (
+        SELECT d.id
+        FROM visual_data d
+    /* trailing query comment */
+    )
+```
+
+TO-BE:
+
+```sql
+WITH base AS (
+        SELECT d.id
+        FROM visual_data d
+        /* trailing query comment */
+    )
+```
+
+query-like 괄호가 닫히기 직전의 주석은 닫는 괄호가 아니라 해당 query body 깊이에 맞춘다.
+
+추가 회귀 테스트: `visual_oracle_aligns_trailing_cte_query_comment_with_query_body`
+
+### 4.17 Analytic/named WINDOW 다중 키 깊이
+
+AS-IS:
+
+```sql
+ROW_NUMBER () OVER (
+    PARTITION BY dept_id,
+    team_id
+    ORDER BY salary DESC,
+    employee_id
+)
+```
+
+TO-BE:
+
+```sql
+ROW_NUMBER () OVER (
+    PARTITION BY dept_id,
+        team_id
+    ORDER BY salary DESC,
+        employee_id
+)
+```
+
+analytic `OVER (...)`와 named `WINDOW ... AS (...)` 내부에서 `PARTITION BY`/`ORDER BY` 뒤의 형제 키를 헤더보다 한 단계 깊게 정렬한다.
+
+추가 회귀 테스트:
+
+- `visual_oracle_indents_following_analytic_order_key_below_order_by`
+- `visual_mysql_indents_following_named_window_order_key_below_order_by`
+
+### 4.18 Multiline SELECT의 BULK COLLECT 경계
+
+AS-IS:
+
+```sql
+SELECT emp_id,
+    NVL (bonus, 0) +
+    CASE
+        WHEN status = 'ACTIVE' THEN 11
+        ELSE 7
+    END BULK COLLECT INTO v_emp_ids,
+    v_bonus
+FROM qt_x_emp;
+```
+
+TO-BE:
+
+```sql
+SELECT emp_id,
+    NVL (bonus, 0) +
+    CASE
+        WHEN status = 'ACTIVE' THEN 11
+        ELSE 7
+    END
+BULK COLLECT INTO v_emp_ids,
+    v_bonus
+FROM qt_x_emp;
+```
+
+SELECT 목록이 이미 여러 줄이면 `BULK COLLECT INTO`를 마지막 식에서 분리한다. 단일 식 SELECT와 `FETCH ... BULK COLLECT INTO`는 기존처럼 inline으로 유지한다.
+
+추가 회귀 테스트: `visual_oracle_breaks_bulk_collect_after_a_multiline_select_list`
+
+### 4.19 여러 줄 WHEN 조건의 CASE 결과 깊이
+
+AS-IS:
+
+```sql
+RETURN CASE
+    WHEN p_sal >= 4000
+        AND NVL (p_comm, 0) > 0 THEN
+            'TOP_PLUS_COMM'
+    WHEN p_sal >= 3000 THEN
+        'TOP'
+END;
+```
+
+TO-BE:
+
+```sql
+RETURN CASE
+    WHEN p_sal >= 4000
+        AND NVL (p_comm, 0) > 0 THEN
+        'TOP_PLUS_COMM'
+    WHEN p_sal >= 3000 THEN
+        'TOP'
+END;
+```
+
+`THEN`이 `AND` continuation 줄에 있어도 결과 깊이는 그 줄이 아니라 소유 `WHEN` 깊이를 기준으로 계산한다.
+
+추가 회귀 테스트: `visual_oracle_aligns_case_results_after_multiline_when_conditions`
+
+### 4.20 MERGE INSERT와 VALUES 절 경계
+
+AS-IS:
+
+```sql
+WHEN NOT MATCHED THEN
+    INSERT (id, emp_name, created_at) VALUES (s.id, s.emp_name, SYSTIMESTAMP);
+```
+
+TO-BE:
+
+```sql
+WHEN NOT MATCHED THEN
+    INSERT (id, emp_name, created_at)
+    VALUES (s.id, s.emp_name, SYSTIMESTAMP);
+```
+
+MERGE 분기에서도 일반 INSERT와 같이 `VALUES`를 독립 절로 렌더링하여 긴 column/value 목록이 한 행에 결합되지 않게 한다.
+
+추가 회귀 테스트: `visual_oracle_splits_merge_insert_and_values_clauses`
+
+### 4.21 CREATE TABLE 가상 컬럼의 datatype 폭 오염
+
+AS-IS:
+
+```sql
+CREATE TABLE visual_virtual_column (
+    id           NUMBER                                     NOT NULL,
+    total_amount AS (ROUND (id * 11 * 12 * 13, 2))
+);
+```
+
+TO-BE:
+
+```sql
+CREATE TABLE visual_virtual_column (
+    id           NUMBER NOT NULL,
+    total_amount AS (ROUND (id * 11 * 12 * 13, 2))
+);
+```
+
+datatype이 없는 `AS (...)` 가상 컬럼 식은 다른 컬럼의 datatype 정렬 폭 계산에서 제외한다. 가상 컬럼 자체의 식과 토큰은 그대로 보존한다.
+
+추가 회귀 테스트: `visual_oracle_virtual_column_does_not_pad_other_column_constraints`
+
+### 4.22 CREATE TABLE partition/subpartition 정의 목록
+
+AS-IS:
+
+```sql
+SUBPARTITION TEMPLATE (SUBPARTITION sp_open VALUES ('OPEN'), SUBPARTITION sp_closed VALUES ('CLOSED')) (PARTITION p_2025 VALUES LESS THAN (DATE '2026-01-01'), PARTITION p_future VALUES LESS THAN (MAXVALUE))
+```
+
+TO-BE:
+
+```sql
+SUBPARTITION TEMPLATE (
+    SUBPARTITION sp_open VALUES ('OPEN'),
+    SUBPARTITION sp_closed VALUES ('CLOSED')
+)
+(
+    PARTITION p_2025 VALUES LESS THAN (DATE '2026-01-01'),
+    PARTITION p_future VALUES LESS THAN (MAXVALUE)
+)
+```
+
+`SUBPARTITION TEMPLATE` 뒤에 template 목록과 partition 정의 목록의 outer 괄호가 연속하는 구조에만 적용하여, 각 최상위 항목을 한 줄씩 렌더링한다. 함수 호출이나 `VALUES (...)` 내부 쉼표는 분리하지 않는다.
+
+추가 회귀 테스트: `format_for_auto_formatting_expands_create_table_partition_definition_lists`
+
+### 4.23 Analytic PARTITION BY 안의 제어 키워드형 별칭
+
+AS-IS:
+
+```sql
+ROW_NUMBER () OVER (
+    PARTITION BY
+    IF.grp
+    ORDER BY IF.a) AS rn,
+        SUM (IF.c) OVER (...)
+```
+
+TO-BE:
+
+```sql
+ROW_NUMBER () OVER (
+    PARTITION BY IF.grp
+    ORDER BY IF.a
+) AS rn,
+SUM (IF.c) OVER (...)
+```
+
+`PARTITION BY` 안에서 점이 뒤따르는 `IF.`는 PL/SQL 제어문 시작이 아니라 테이블 별칭 qualifier로 처리한다. 잘못 열린 IF block frame이 이후 analytic 형제와 `FROM`/`ORDER BY` 깊이를 오염시키지 않게 했다.
+
+추가 회귀 테스트: `visual_oracle_treats_if_qualifier_as_identifier_inside_analytic_partition`
+
+### 4.24 Multiline EXECUTE IMMEDIATE USING bind 목록
+
+AS-IS:
+
+```sql
+EXECUTE IMMEDIATE v_sql USING visual_seq.NEXTVAL,
+CASE ...
+END, v_name,
+CASE ...
+END, ROUND (v_amount, 2), v_note;
+```
+
+TO-BE:
+
+```sql
+EXECUTE IMMEDIATE v_sql USING visual_seq.NEXTVAL,
+    CASE ...
+    END,
+    v_name,
+    CASE ...
+    END,
+    ROUND (v_amount, 2),
+    v_note;
+```
+
+`EXECUTE IMMEDIATE` frame의 `USING` phase에서 CASE가 하나라도 여러 줄로 렌더링되면 그 CASE와 이후 bind를 실행문 소유자보다 한 단계 깊은 형제 목록으로 분리한다. frame은 현재 scope와 괄호 깊이를 함께 보유하고 문장 경계에서 닫히므로, 내부 CASE/괄호가 바깥 실행문의 bind 정렬을 오염시키지 않는다. 짧은 `EXECUTE IMMEDIATE ... USING v1, v2`는 기존처럼 한 줄을 유지한다.
+
+추가 회귀 테스트: `visual_oracle_splits_multiline_execute_immediate_using_bind_arguments`
+
+### 4.25 ALTER TABLE SPLIT PARTITION 목적지 목록
+
+AS-IS:
+
+```sql
+ALTER TABLE orders SPLIT PARTITION orders_2024
+INTO (PARTITION orders_2024_h1
+VALUES LESS THAN (TO_DATE ('2024-07-01', 'YYYY-MM-DD')), PARTITION orders_2024_h2
+VALUES LESS THAN (TO_DATE ('2025-01-01', 'YYYY-MM-DD')));
+```
+
+TO-BE:
+
+```sql
+ALTER TABLE orders SPLIT PARTITION orders_2024
+INTO (
+    PARTITION orders_2024_h1
+    VALUES LESS THAN (TO_DATE ('2024-07-01', 'YYYY-MM-DD')),
+    PARTITION orders_2024_h2
+    VALUES LESS THAN (TO_DATE ('2025-01-01', 'YYYY-MM-DD'))
+);
+```
+
+Oracle `ALTER TABLE ... SPLIT PARTITION ... INTO (`의 최상위 목적지 목록에 쉼표가 있을 때만 outer 괄호를 여러 줄 목록으로 렌더링한다. `VALUES (...)`와 `TO_DATE (...)` 같은 중첩 괄호 내부는 기존처럼 유지한다.
+
+추가 회귀 테스트: `visual_oracle_expands_alter_table_split_partition_destination_list`
+
+### 4.26 Analytic `ORDER BY` 내부 scalar subquery 절 붕괴
+
+자동 스윕이 PASS였지만 전체 결과를 육안 검토하면서 발견한 실제 오류다.
+
+AS-IS:
+
+```sql
+SELECT SUM (b2.amount) FROM qt_fmt_bonus b2 WHERE b2.emp_id = e.emp_id
+```
+
+TO-BE:
+
+```sql
+SELECT SUM (b2.amount)
+FROM qt_fmt_bonus b2
+WHERE b2.emp_id = e.emp_id
+```
+
+analytic `OVER (...)` 안에서도 가장 안쪽 괄호가 query-like frame이면 일반 절 줄바꿈을 억제하지 않도록 수정했다. 그 결과 `ORDER BY (SELECT ... FROM ... WHERE ...)`의 세 절이 같은 query body 깊이에서 유지된다.
+
+추가 회귀 테스트: `visual_oracle_keeps_analytic_order_by_scalar_subquery_clauses_multiline`
+
+### 4.27 `EXCEPTION` 선언과 handler section 구분
+
+AS-IS:
+
+```sql
+e_bad
+EXCEPTION;
+```
+
+TO-BE:
+
+```sql
+e_bad EXCEPTION;
+```
+
+선언부의 `identifier EXCEPTION;`은 한 선언으로 유지하되, 아래 handler section의 `EXCEPTION`은 계속 구조적 블록 경계로 처리한다.
+
+```sql
+EXCEPTION
+    WHEN OTHERS THEN
+```
+
+추가 회귀 테스트:
+
+- `visual_oracle_keeps_exception_declaration_and_outer_begin_on_owner_depth`
+- `format_sql_basic_oracle_declaration_exception_and_predicate_phrases_stay_inline`
+
+### 4.28 제어 키워드형 `IF` CTE 이름
+
+AS-IS:
+
+```sql
+WITH
+IF AS (
+        SELECT 1 AS id FROM dual
+    )
+    SELECT IF.id
+    FROM IF;
+```
+
+TO-BE:
+
+```sql
+WITH IF AS (
+    SELECT 1 AS id
+    FROM DUAL
+)
+SELECT IF.id
+FROM IF;
+```
+
+CTE/alias 위치의 `IF`는 PL/SQL block opener가 아니라 식별자로 처리한다. 같은 `WITH` 문맥의 local `PROCEDURE` 선언도 선언 소유 깊이를 유지한다.
+
+추가 회귀 테스트:
+
+- `visual_oracle_keeps_if_cte_and_outer_query_at_root_depth`
+- `format_sql_basic_oracle_keyword_like_cte_and_with_procedure_keep_owner_depth`
+
+### 4.29 행 시작 `REMARK` 식별자와 SQL*Plus 명령 구분
+
+AS-IS:
+
+```sql
+CREATE TABLE visual_remark (
+    id NUMBER,
+remark VARCHAR2(20)
+);
+```
+
+TO-BE:
+
+```sql
+CREATE TABLE visual_remark (
+    id     NUMBER,
+    remark VARCHAR2 (20)
+);
+```
+
+괄호 안의 `REMARK`는 컬럼/표현식 식별자로 토큰화하고, top-level 행 시작 `REM`/`REMARK`만 SQL*Plus comment 명령으로 유지한다.
+
+추가 회귀 테스트:
+
+- `visual_oracle_treats_line_initial_remark_as_an_identifier`
+- `format_sql_basic_oracle_remark_identifier_does_not_become_script_command`
+
+### 4.30 MySQL/MariaDB `REPEAT()` 함수와 `REPEAT` loop 구분
+
+AS-IS:
+
+```sql
+SELECT
+    REPEAT
+    ('ab', 3) AS repeated_value;
+```
+
+TO-BE:
+
+```sql
+SELECT REPEAT('ab', 3) AS repeated_value;
+```
+
+함수 호출은 compact expression으로 유지하고, procedural form만 block frame을 연다.
+
+```sql
+REPEAT
+    SET i = i + 1;
+UNTIL i >= 3
+END REPEAT;
+```
+
+추가 회귀 테스트: `visual_mysql_profiles_distinguish_repeat_function_from_repeat_loop`
+
+### 4.31 Compound trigger와 LOB/XMLTYPE storage header 경계
+
+AS-IS:
+
+```sql
+FOR INSERT OR UPDATE ON visual_t COMPOUND TRIGGER TYPE id_tab IS TABLE OF NUMBER;
+```
+
+```sql
+LOB (doc) STORE AS BASICFILE LOB (ndoc) STORE AS BASICFILE XMLTYPE COLUMN xdoc STORE AS BASICFILE CLOB;
+```
+
+TO-BE:
+
+```sql
+FOR INSERT OR UPDATE ON visual_t
+    COMPOUND TRIGGER
+    TYPE id_tab IS TABLE OF NUMBER;
+```
+
+```sql
+LOB (doc) STORE AS BASICFILE
+LOB (ndoc) STORE AS BASICFILE
+XMLTYPE COLUMN xdoc STORE AS BASICFILE CLOB;
+```
+
+compound trigger 선언부와 연속 storage clause의 구조적 header를 각각 독립 행으로 복원한다.
+
+추가 회귀 테스트: `visual_oracle_breaks_compound_trigger_and_storage_clause_headers`
+
+### 4.32 `MATCH_RECOGNIZE` pattern quantifier 공백
+
+AS-IS:
+
+```sql
+PATTERN (A B + C *)
+```
+
+TO-BE:
+
+```sql
+PATTERN (A B+ C*)
+```
+
+`MATCH_RECOGNIZE PATTERN` 안에서 identifier 뒤의 `+`/`*`는 산술 연산자가 아니라 row-pattern quantifier이므로 operand에 붙여 렌더링한다.
+
+추가 회귀 테스트: `visual_oracle_keeps_match_recognize_quantifiers_attached`
+
+### 4.33 PL/SQL label과 collection `.DELETE`
+
+AS-IS:
+
+```sql
+<<top>> l_count := l_count + 1;
+g_ids.
+DELETE;
+```
+
+TO-BE:
+
+```sql
+<<top>>
+l_count := l_count + 1;
+g_ids.DELETE;
+```
+
+PL/SQL label은 다음 statement와 같은 깊이의 독립 행으로 유지한다. 점으로 한정된 collection method `.DELETE`는 SQL `DELETE` 절로 오인하지 않는다.
+
+추가 회귀 테스트:
+
+- `visual_oracle_keeps_plsql_label_on_its_own_line`
+- `visual_oracle_aligns_plsql_comments_nested_blocks_and_member_calls`
+
+### 4.34 Scalar/PIVOT/APPLY 주석 뒤 body 깊이
+
+AS-IS:
+
+```sql
+SELECT (
+    /* scalar */
+        SELECT MAX(metric)
+    FROM inner_t
+)
+PIVOT (
+    /* aggregate */
+        SUM(amount)
+FOR category IN ('A')
+)
+CROSS APPLY (
+    -- aggregate
+        SELECT COUNT(*)
+    FROM item_t
+)
+```
+
+TO-BE:
+
+```sql
+SELECT (
+    /* scalar */
+    SELECT MAX (metric)
+    FROM inner_t
+)
+PIVOT (
+    /* aggregate */
+    SUM (amount)
+    FOR category IN ('A')
+)
+CROSS APPLY (
+    -- aggregate
+    SELECT COUNT(*)
+    FROM item_t
+)
+```
+
+괄호 body 첫 주석은 뒤따르는 query/aggregate head와 같은 child frame 깊이를 사용하고, `FROM`/`FOR` 같은 형제 절도 그 깊이를 재사용한다.
+
+추가 회귀 테스트:
+
+- `visual_oracle_comment_and_outer_from_return_to_query_depth`
+- `visual_oracle_aligns_commented_query_pivot_and_apply_siblings`
+
+### 4.35 MERGE의 키워드형 alias와 분리된 branch phrase
+
+AS-IS:
+
+```sql
+MERGE INTO qt_if_base
+IF
+USING dual src
+...
+WHEN
+NOT MATCHED THEN
+```
+
+TO-BE:
+
+```sql
+MERGE INTO qt_if_base IF
+USING dual src
+...
+WHEN NOT MATCHED THEN
+```
+
+object alias 위치의 `IF`는 식별자로 유지하고, 입력에서 분리된 `WHEN NOT MATCHED`는 하나의 canonical MERGE branch phrase로 합친다.
+
+추가 회귀 테스트: `format_sql_basic_merge_split_alias_and_when_not_converge_to_canonical_branches`
+
+### 4.36 여러 줄 IF 조건 다음 body 깊이
+
+AS-IS:
+
+```sql
+IF condition
+    AND other_condition THEN
+BEGIN
+NULL;
+END;
+```
+
+TO-BE:
+
+```sql
+IF condition
+    AND other_condition THEN
+    BEGIN
+        NULL;
+    END;
+```
+
+조건 continuation 깊이를 IF body frame으로 오인하지 않고, body는 IF owner에서 정확히 한 단계 깊게 연다.
+
+추가 회귀 테스트: `visual_oracle_multiline_if_body_uses_one_structural_step`
+
+### 4.37 입력 줄바꿈과 무관한 compound phrase
+
+AS-IS:
+
+```sql
+FOR
+UPDATE OF sal;
+) AS
+emp_cur
+```
+
+TO-BE:
+
+```sql
+FOR UPDATE OF sal;
+) AS emp_cur
+```
+
+입력 줄바꿈만으로 `FOR UPDATE`나 close-paren 뒤 `AS alias` 같은 단일 문법 phrase를 분리하지 않는다.
+
+추가 회귀 테스트: `format_sql_basic_oracle_sql_phrases_ignore_source_newlines_inside_phrase`
+
+### 4.38 코드 행 trailing whitespace 제거
+
+AS-IS (`␠`는 공백, `⇥`는 tab):
+
+```text
+SELECT -1 AS value;␠␠
+FROM visual_t;⇥
+```
+
+TO-BE:
+
+```text
+SELECT -1 AS value;
+FROM visual_t;
+```
+
+문자열 literal과 SQL*Plus `PROMPT` payload는 건드리지 않고 일반 코드 행 끝의 공백/tab만 제거한다.
+
+추가 회귀 테스트: `visual_all_profiles_trim_line_ends_and_distinguish_unary_minus`
+
+### 4.39 Oracle 조건부 컴파일 directive와 branch body 경계
+
+AS-IS:
+
+```sql
+        $IF DBMS_DB_VERSION.VERSION >= 12 $THEN AUDIT ('qt_torture_pkg', 'complex_block.ccflag', 'conditional-compilation=true');
+        $ELSE AUDIT ('qt_torture_pkg', 'complex_block.ccflag', 'conditional-compilation=false');
+        $END AUDIT ('qt_torture_pkg', 'complex_block.end', 'updated=' || l_rows || '; aggregate=' || l_count);
+```
+
+TO-BE:
+
+```sql
+        $IF DBMS_DB_VERSION.VERSION >= 12 $THEN
+            AUDIT ('qt_torture_pkg', 'complex_block.ccflag', 'conditional-compilation=true');
+        $ELSE
+            AUDIT ('qt_torture_pkg', 'complex_block.ccflag', 'conditional-compilation=false');
+        $END
+        AUDIT ('qt_torture_pkg', 'complex_block.end', 'updated=' || l_rows || '; aggregate=' || l_count);
+```
+
+일반 PL/SQL block stack과 분리된 조건부 컴파일 frame stack을 사용한다. `$IF`에서 owner/body 상대 깊이를 가진 frame을 열고 `$END`에서 닫는다. directive는 owner 깊이, 활성 branch body는 owner +1에 두며, 내부 `$IF`를 닫으면 바깥 branch의 body 깊이가 복원된다. 이 frame은 일반 문장 frame과 달리 세미콜론 경계에서 유지되므로 여러 문장과 중첩 `$IF`도 같은 상대 기준을 유지한다.
+
+추가 회귀 테스트: `visual_oracle_splits_conditional_compilation_directives_from_branch_bodies`
+
+### 4.40 Multiline `XMLTABLE`/`JSON_TABLE` 구조
+
+AS-IS:
+
+```sql
+FROM XMLTABLE ('/rows/row' PASSING XMLTYPE ('<rows>
+...
+</rows>') COLUMNS emp_id NUMBER PATH 'emp_id', emp_name VARCHAR2 (100) PATH 'emp_name') x
+
+FROM JSON_TABLE ('{
+...
+}', '$.employees[*]' COLUMNS emp_id NUMBER PATH '$.id', emp_name VARCHAR2 (100) PATH '$.name') j
+```
+
+TO-BE:
+
+```sql
+FROM XMLTABLE (
+    '/rows/row'
+    PASSING XMLTYPE (
+        '<rows>
+...
+</rows>'
+    )
+    COLUMNS
+        emp_id NUMBER PATH 'emp_id',
+        emp_name VARCHAR2 (100) PATH 'emp_name'
+) x
+
+FROM JSON_TABLE (
+    '{
+...
+}',
+    '$.employees[*]'
+    COLUMNS
+        emp_id NUMBER PATH '$.id',
+        emp_name VARCHAR2 (100) PATH '$.name'
+) j
+```
+
+멀티라인 문자열 literal을 포함한 table function만 구조형 괄호 frame으로 승격한다. `PASSING`, `COLUMNS`, 괄호 없는 column 목록을 각각 구조 깊이에 맞춰 분리하고, 단일행 호출과 기존 `COLUMNS (...)` compact/nested 정책은 유지한다. `t.passing`, `t.columns`, `:columns` 및 projection column 이름은 frame phase 전환 키워드로 보지 않으며, `JSON_TABLE + (...)` 같은 grouping 괄호도 table-function frame으로 오인하지 않는다.
+
+추가 회귀 테스트: `visual_oracle_expands_multiline_xmltable_and_json_table_clauses`
+
+### 4.41 어제·오늘 변경분의 구문 frame 원칙 재감사
+
+AS-IS:
+
+```rust
+let mut pending_for_while_owner_indent = None;
+let mut insert_all_owner_indent = None;
+let mut insert_all_branch_body_indent = None;
+let mut execute_immediate_using_paren_depth = None;
+let mut oracle_error_directive_depth = 0;
+```
+
+TO-BE:
+
+```text
+$IF                 -> OracleConditionalCompilationFrame(owner, body, branch/error phase)
+INSERT ALL/FIRST    -> InsertAllFormatFrame(scope, owner, branch phase)
+EXECUTE IMMEDIATE   -> ExecuteImmediateFormatFrame(scope, USING paren/phase)
+FOR                 -> LoopHeader condition-owner frame
+XML/JSON_TABLE (...) -> ParenStackFrame(owner/body, COLUMNS phase)
+```
+
+일회성 토큰 판단을 제외한 장기 레이아웃 상태를 `FormatFrameStack`의 구문 frame으로 이동했다. 각 자식 들여쓰기는 현재 출력의 절대값이나 별도 전역 변수에서 누적하지 않고 frame owner의 상대 깊이로 계산한다. 문장 단위 frame은 세미콜론에서 닫고, 조건부 컴파일 frame은 실제 `$END`에서 닫아 서로 다른 수명을 섞지 않는다.
+
+중첩 `FOR (SELECT ... FOR UPDATE) LOOP`, 중첩 조건부 컴파일, 괄호 안/밖 `INSERT ALL` frame을 검증했고, 내부 frame을 닫은 뒤 바깥 상대 깊이가 복원되는 단위 테스트를 추가했다.
+
+추가 회귀 테스트:
+
+- `syntax_frames_restore_outer_relative_indent_after_nested_close`
+- `statement_boundary_closes_statement_syntax_frames_but_keeps_conditional_owner`
+
+## 5. 그 외 개선 범위
+
+- Oracle/PLSQL 중첩 블록, `EXCEPTION`, `CASE`, `INSERT ALL`, `PIVOT`, `APPLY` 정렬
+- `DELETE WHERE`, PL/SQL collection `.DELETE` 구분
+- 분석 함수 `OVER`, `WITHIN GROUP`, `MATCH_RECOGNIZE` 줄바꿈
+- MySQL/MariaDB `CASE`, `REPEAT` 함수/루프, 중첩 `ORDER BY` 구분
+- Oracle 조건부 컴파일 branch와 multiline `XMLTABLE`/`JSON_TABLE` 구조 정렬
+- 코드 줄의 trailing whitespace 제거
+- 포맷 전후 SQL 토큰 보존 검사
+
+## 6. 의도적으로 유지한 동작
+
+SQL*Plus `PROMPT`는 화면에 출력되는 payload이므로 기존 정책대로 원본 대소문자와 선행 공백을 verbatim으로 보존한다. 따라서 `PROMPT`의 선행 공백 자체는 자동 포맷 오류로 분류하지 않는다.
+
+일반 표현식의 최대 행 길이 정책은 새로 추가하지 않았다. 따라서 `oracle_format_final_boss_v2.sql`의 496자 dynamic SQL 문자열 결합은 기존 compact 정책대로 유지한다.
+
+`oracle splitter final boss test.sql`의 `ORDER BY salary /`는 slash가 독립 행 terminator가 아닌 원본 fixture 경계 문제이며 formatter가 복구하지 않는다. 같은 파일에서 외부 block comment 안에 들어간 TEST-024/025와 요약 수치의 불일치도 formatter 변경 범위에서 제외했다.
+
+## 7. 검증 결과
+
+| 검증 | 결과 |
+| --- | --- |
+| 초기 `.format.out` 전수 수동 검토 | 47개, 28,567줄, formatter 오류 2종 확인 |
+| 최종 `.format.out` 검증 | 47개, 28,599줄, 변경 2개 전수 재검토 + 미변경 45개 byte 동일, 오류 0건 |
+| 지정 ignored 포맷 스윕 테스트 | 1/1 통과 |
+| 실제 SQL 파일 자동 포맷 스윕 집계 | 47/47 통과, 실패 0건 |
+| 수정 전후 `.format.out` delta 검토 | 45개 동일, `test11.txt`와 `test25.sql`만 변경 |
+| 최종 반복 재생성 byte 비교 | 47개 모두 동일 |
+| `visual_` 회귀 테스트 필터 | 50/50 통과 |
+| 중첩 구문 frame 수명/복원 단위 테스트 | 2/2 통과 |
+| 전체 라이브러리 테스트 | 6,424 통과, 실패 0, ignored 212 |
+| `cargo fmt -- --check` | 통과 |
+| `git diff --check` | 통과 |
+
+스윕 집계 결과는 `target/format-sweep/format-sweep.out`에서 확인할 수 있다.
+
+## 8. 주요 변경 파일
+
+- `src/ui/sql_editor/formatter.rs`: 자동 포맷 로직 수정
+- `src/ui/sql_editor/format_sweep_tests.rs`: 1차 오류 감지 및 전체 파일 리포트 생성
+- `src/ui/sql_editor/visual_format_regression_tests.rs`: 육안 검토 결과 회귀 테스트
+- `src/ui/sql_editor/query_text.rs`: SQL/SQL*Plus 토큰 처리 보완
+- `src/db/query/script.rs`: SQL*Plus 명령 인자 및 실행 경계 처리 보완
+- `src/sql_delimiter.rs`: MODEL cell reference용 대괄호 frame 상태 보완
+- `src/ui/sql_editor/execution.rs`: 수정된 정상 출력에 맞춘 기존 회귀 기대값
+- `src/ui/sql_editor/sql_editor_tests.rs`: 수정된 정상 출력에 맞춘 기존 회귀 기대값
+- `src/ui/sql_editor/mod.rs`: 포맷 스윕 및 시각 회귀 테스트 모듈 등록
+- `change.md`: 수동 검토에서 확인한 AS-IS/TO-BE와 최종 검증 수치 기록
+
+---
+
+# 2차 검토 회차 (2026-07-13, MySQL/MariaDB `@` 변수 · PREPARE)
+
+스윕 47개 파일(28,599줄) 재검토와 최소 재현 프로브에서 formatter 결함 3건을 추가로
+발견해 수정했다. 세 건 모두 frame(직전 토큰 인접성, 괄호/블록 depth, 문장 경계)을
+참조하지 않고 절대 규칙으로 동작하던 지점이다. 수정은 전부
+`src/ui/sql_editor/formatter.rs`에 적용했다.
+
+## 9-1. `@` 사용자 변수 이름이 키워드 대문자화로 훼손
+
+`@` 심볼 바로 뒤의 단어가 키워드 목록에 있으면(예: `sql`) 식별자임에도
+대문자화되었다. 직전 토큰이 `@` 심볼이면 식별자로 취급하도록 수정
+(`follows_at_sign_variable` → `keyword_preserves_original_case`).
+
+AS-IS (원본 입력):
+```sql
+SET @sql = 'select 1';
+```
+
+AS-IS (수정 전 포맷 결과 — 변수명 훼손):
+```sql
+SET @SQL = 'select 1';
+```
+
+TO-BE (수정 후 포맷 결과):
+```sql
+SET @sql = 'select 1';
+```
+
+발견 위치: `test_mysql/test1.txt`(원본 628행), `test_mysql/test2.txt`(원본 607행).
+`test_mariadb/test4.txt`는 과거 훼손 결과(`SET @SQL`)가 원본에 굳어진 상태로,
+수정 후에는 원본 표기가 그대로 보존된다.
+
+같은 원인의 파생 결함 — 절 키워드 이름의 변수에서 구조 줄바꿈 발생:
+
+AS-IS (원본 입력):
+```sql
+SET @from = 1;
+```
+
+AS-IS (수정 전 포맷 결과 — 변수 내부에서 절 줄바꿈, 토큰 구조 파괴):
+```sql
+SET @
+FROM = 1;
+```
+
+TO-BE (수정 후 포맷 결과):
+```sql
+SET @from = 1;
+```
+
+## 9-2. top-level 행이 `@`로 시작하면 실행단위 분리기가 문장을 절단
+
+분리기는 paren/block depth 0에서 `@`/`@@`로 시작하는 라인을 스크립트 include
+tool command로 취급해 열린 문장을 강제 종료한다(`script.rs` 9124행 부근의
+`should_try_tool_command_with_open_statement`). 포맷터가 SELECT 리스트 줄바꿈으로
+`@@var`를 행 첫머리에 놓으면 문장이 절단되었다. `@` 심볼을 top-level
+(괄호 frame 0 && 블록 frame 없음) 행 첫머리에 그리려는 순간 직전 행으로
+되붙이는 join-back을 추가했다. 괄호/블록 frame 내부에서는 분리기가 문장을
+유지하므로 기존 레이아웃을 건드리지 않는다(1차 시도에서 무조건 join했다가
+`CALL f(\n    @a ...)` 케이스의 idempotence가 깨져 조건을 frame depth로 좁혔다).
+
+AS-IS (원본 입력):
+```sql
+SELECT @sql, @@sql_mode;
+```
+
+AS-IS (수정 전 포맷 결과 — 2행이 include 지시어로 오인되어 문장 절단):
+```sql
+SELECT @sql,
+    @@sql_mode;
+```
+
+TO-BE (수정 후 포맷 결과):
+```sql
+SELECT @sql, @@sql_mode;
+```
+
+블록 내부(BEGIN..END, 분리기 안전 구간)는 기존 줄바꿈 유지:
+```sql
+    SELECT @a,
+        @b,
+        @@global.sql_mode,
+        c
+    INTO @r1,
+        @r2
+```
+
+## 9-3. `PREPARE <name> FROM <source>`의 FROM을 쿼리 절로 오인
+
+문장 컨텍스트를 보지 않고 FROM을 항상 쿼리 절로 취급해 줄바꿈했다.
+`suppresses_clause_break`에 "문장 경계(`;` 초기화 / BEGIN/THEN/ELSE/DO/LOOP)
+직후의 `PREPARE <name>` 다음 FROM이면 줄바꿈 억제" 규칙을 추가했다.
+
+AS-IS (원본 입력):
+```sql
+PREPARE stmt_flat FROM @sql;
+```
+
+AS-IS (수정 전 포맷 결과):
+```sql
+PREPARE stmt_flat
+FROM @sql;
+```
+
+TO-BE (수정 후 포맷 결과):
+```sql
+PREPARE stmt_flat FROM @sql;
+```
+
+발견 위치(총 8곳): `test_mysql/test1.txt`, `test_mysql/test2.txt`,
+`test_mysql/test3.txt`(2), `test_mariadb/test4.txt`, `test_mariadb/test6.txt`,
+`test_mariadb/test7.txt`(2). `SELECT prepare_col, x FROM t2;`처럼 `prepare`가
+일반 식별자인 경우 FROM 줄바꿈이 정상 유지됨을 확인했다.
+
+## 9-4. 검토했으나 수정하지 않은 항목 (의도된 설계로 확인)
+
+- `@TRANSACTION` → `SET AUTOCOMMIT OFF` 렌더링(`test_mariadb/test7.txt`):
+  `script.rs:9968`의 별칭 정규화 설계.
+- mid-line CASE의 frame 앵커(`p_status => CASE` 뒤 WHEN이 소유 라인 +4):
+  "CASE opened mid-line" 회귀 테스트로 보호되는 의도된 상대 규칙.
+- FROM-서브쿼리(내용 +8/닫기 +4) vs JOIN-서브쿼리(내용 +4/닫기 +0) 비대칭:
+  각각 opener 라인 기준 상대 규칙으로 일관, 회귀 테스트로 고정된 스타일.
+- Oracle `emp@dblink` → `emp @dblink`(@ 앞 공백): 이번 수정과 무관한 기존
+  동작이며 Oracle 문법상 유효. 추후 개선 후보로만 기록.
+- `EXECUTE stmt USING ...`의 USING 줄바꿈: Oracle `OPEN ... FOR ... USING`과
+  동일 계열 절 취급으로 유지.
+
+## 9-5. 추가된 회귀 테스트 (`formatter_regression_tests`)
+
+| 테스트 | 검증 내용 |
+| --- | --- |
+| `mysql_user_variable_word_after_at_sign_preserves_case` | `@sql` 케이스 보존 |
+| `mysql_user_variable_named_clause_keyword_stays_inline` | `SET @from = 1;` 한 줄 유지 |
+| `mysql_top_level_statement_line_never_starts_with_at_sign` | top-level 행이 `@`로 시작 금지 |
+| `mysql_prepare_from_stays_on_one_line` | PREPARE FROM 한 줄 유지 (top-level·프로시저 본문) |
+
+## 9-6. 2차 회차 검증 결과
+
+| 검증 | 결과 |
+| --- | --- |
+| `.format.out` 전수 눈검토 | 47개, 28,599줄 |
+| 최소 재현 프로브 3종 (mysql 2, oracle 1) | 전부 PASS (수정 전 mysql 프로브는 FAIL 2건) |
+| 실제 SQL 파일 자동 포맷 스윕 집계 | 47/47 통과, 실패 0건 |
+| 전체 라이브러리 테스트 | 6,428 통과, 실패 0, ignored 212 |
+
+---
+
+# 3차 정밀 검토 회차 (2026-07-13, 주석 뒤 `@` 변수 continuation 절단)
+
+2차 회차에서 요약 검토에 그쳤던 대형 파일 9개(test11, test18, test21,
+oracle_format_ultimate_boss, oracle_format_final_boss, oracle_format_final_boss_v2,
+test_mariadb/test5·test8, oracle splitter final boss test — 약 10,700줄)를 추가로
+전량 정독했고(전부 이상 없음, splitter final boss의 함정 구간은 1차 §6 문서화 유지),
+적대적 프로브에서 결함 1건을 추가 발견해 수정했다.
+
+## 10-1. 주석 뒤 `@` 변수 continuation을 스플리터가 include로 오인해 문장 절단
+
+`SELECT a, -- 주석` 다음 줄이 `@x, b FROM t;`처럼 `@` 사용자 변수로 시작하면,
+행 첫머리 `@`는 join-back이 불가능(주석을 삼키게 됨)해 그대로 남고, 스플리터가
+열린 문장을 tool command(@ include)로 강제 종료해 문장이 파괴되었다. 이는
+포맷터 출력뿐 아니라 **사용자가 직접 입력한 SQL 실행 경로에서도 동일하게
+발생하던 기존 결함**이다(블록 주석 `/* */` 뒤에서도 동일).
+
+AS-IS (원본 입력):
+```sql
+SELECT a, -- comment before var
+@x, b FROM t;
+```
+
+AS-IS (수정 전 — 2행이 include로 오인되어 문장 절단, 포맷 결과도 미종결):
+```sql
+SELECT a,
+-- comment before var
+
+@x, b FROM t
+```
+
+TO-BE (수정 후 포맷 결과 — 한 문장 유지):
+```sql
+SELECT a, -- comment before var
+    @x,
+    b
+FROM t;
+```
+
+수정 내용:
+- `sql_parser_engine/engine.rs`: `current_ends_with_list_continuation_comma()` 추가 —
+  누적 문장의 끝이 (후행 라인/블록 주석을 걷어낸 뒤) 콤마이면 다음 줄은 문법적
+  continuation으로 판단.
+- `db/query/script.rs`: 열린 문장 중 tool command 판정 gate 2곳
+  (slash-terminable 경로, with-open-statement 경로)에서 `@` 후보 + 콤마
+  continuation이면 절단하지 않고 문장에 이어붙임. 완결된 문장 뒤의
+  `@script.sql` include는 기존대로 tool command로 인식(회귀 테스트로 고정).
+- `ui/sql_editor/formatter.rs`: join-back을 모든 주석 뒤에서 건너뛰도록 단순화
+  (블록 주석 뒤 join 시 1·2차 패스 간 주석 배치가 달라지는 비멱등 발견분 해소;
+  주석+콤마 케이스는 위 스플리터 가드가 보호).
+
+## 10-2. 추가된 회귀 테스트
+
+| 테스트 | 검증 내용 |
+| --- | --- |
+| `split_script_items_keeps_at_sign_variable_after_trailing_comma_in_open_statement` | 주석 뒤 `@x` continuation이 한 문장으로 유지 |
+| `split_script_items_still_treats_include_after_complete_statement_as_command` | 문장 경계의 `@path`는 여전히 include 명령 |
+
+## 10-3. 3차 회차 검증 결과
+
+| 검증 | 결과 |
+| --- | --- |
+| 대형 9개 파일 추가 정독 | 약 10,700줄, 신규 이상 없음 |
+| 적대적 프로브 6종 (할당식·backtick 변수·시스템 변수·CASE+@·prepare 동명 식별자·주석/공백행+@) | 전부 PASS |
+| 실제 SQL 파일 자동 포맷 스윕 집계 | 47/47 통과, 실패 0건 |
+| 전체 라이브러리 테스트 | 6,430 통과, 실패 0, ignored 212 |
+| `cargo fmt -- --check` | 통과 |
+
+---
+
+# 4차 정밀 검토 회차 (2026-07-14, frame 상대 구조 정합성)
+
+`formatting_sweep_all_files_generate_out_report` 1차 검사(47개 파일 자동검사 PASS) 후,
+생성된 `.format.out` 47개(총 28,589줄)를 전량 육안 정독했다. 자동검사 PASS와
+무관하게 "구문에 따라 frame이 열리고 닫히는 상대적 구조" 원칙에 어긋나는 지점
+4건을 발견해 모두 수정했다. (검토: Oracle 39 · MySQL 3 · MariaDB 5 파일)
+
+## 11-1. 호출 괄호 안 inline `CASE ... END` 뒤 인자가 괄호 frame을 이탈
+
+인자 위치(`=>` / `,` / `(` 직후)에서 줄 중간에 시작한 CASE의 owner depth가
+문장 라인 기준으로 고정되어, `END`와 그 뒤 인자가 괄호 frame(+1)이 아닌
+문장 레벨(+0)로 떨어졌다. CASE owner를 compact 괄호 frame의
+`sibling_body_indent` 기준으로 상향해 END·후속 인자가 모두 괄호 내부 레벨에
+정렬되도록 수정했다. (`||` 등 연산자 뒤에 줄바꿈되는 CASE는 기존 동작 유지)
+
+- 발견 위치: `test/test22.sql.format.out` 378~384행, `test/test23.sql.format.out` 400~406행
+- 수정 코드: `ui/sql_editor/formatter.rs` — CASE push 시 `case_starts_call_argument`
+  판정 + `suppresses_comma_breaks` 괄호의 `sibling_body_indent`로 owner 상향
+
+### AS-IS (test22.sql)
+
+```sql
+            qt_split_pkg.complex_upsert (p_user_id => v_ids (i), p_status => CASE
+                WHEN MOD (v_ids (i), 2) = 0 THEN
+                    'A'
+                ELSE
+                    'I'
+            END,
+            p_note => 'generated in anon block; idx=' || i || ' / id=' || v_ids (i));
+```
+
+`END,`/`p_note =>`가 호출문과 같은 레벨로 떨어져 괄호 내부임이 드러나지 않음.
+
+### TO-BE
+
+```sql
+            qt_split_pkg.complex_upsert (p_user_id => v_ids (i), p_status => CASE
+                    WHEN MOD (v_ids (i), 2) = 0 THEN
+                        'A'
+                    ELSE
+                        'I'
+                END,
+                p_note => 'generated in anon block; idx=' || i || ' / id=' || v_ids (i));
+```
+
+`END,`와 `p_note =>`가 호출 괄호 frame +1 레벨에 정렬. test23의
+`p_append_text => ...`도 동일하게 교정됨.
+
+## 11-2. MySQL/MariaDB `DECLARE ... CONDITION FOR`가 FOR에서 잘못 줄바꿈
+
+`FOR`가 루프 키워드 규칙에 걸려 선언문 중간에서 +0 레벨로 줄바꿈됐다.
+`DECLARE <name> CONDITION FOR <condition>`을 커서/핸들러 선언과 같은
+declare-for 계열로 인식해 인라인 유지하도록 수정했다.
+
+- 발견 위치: `test_mariadb/test5.txt.format.out` 531~532행
+- 수정 코드: `ui/sql_editor/formatter.rs` —
+  `is_mysql_declare_condition_for_clause_from_indices` 추가,
+  `mysql_declare_for_clause`에 포함
+
+### AS-IS (test_mariadb/test5.txt)
+
+```sql
+    DECLARE user_error CONDITION
+    FOR SQLSTATE '45000';
+```
+
+### TO-BE
+
+```sql
+    DECLARE user_error CONDITION FOR SQLSTATE '45000';
+```
+
+## 11-3. 주석으로 끊긴 절 연속행이 앞선 frame 닫힘 후 +1을 잃음
+
+주석 연속행 판정에 쓰는 `comment_prefix_text`(현재 줄의 구조 prefix)가
+"실제 렌더된 현재 줄"이 아니라 "마지막 line-start 이후 누적 토큰"이어서,
+MATCH_RECOGNIZE 닫는 괄호처럼 한 토큰 처리 중 줄바꿈이 여러 번 일어나는
+문맥에서는 `... ) FETCH FIRST` 같은 오염된 prefix로 구조 헤더 매칭이
+실패했고, 주석 뒤 연속 피연산자가 +0으로 떨어졌다. `newline_with`에서
+prefix를 비워 prefix가 항상 현재 렌더 라인과 일치하도록 수정했다.
+
+- 발견 위치: `test/test_open_with.sql.format.out` 472~473행
+  (`OPEN ... FOR` + MATCH_RECOGNIZE 문맥)
+- 수정 코드: `ui/sql_editor/formatter.rs` — `comment_prefix_text`를
+  `RefCell<String>`으로 전환하고 `newline_with`에서 clear
+
+### AS-IS (test_open_with.sql)
+
+```sql
+        )
+        FETCH FIRST /* BV: 상위 20건 */
+        20 ROWS ONLY;
+```
+
+### TO-BE
+
+```sql
+        )
+        FETCH FIRST /* BV: 상위 20건 */
+            20 ROWS ONLY;
+```
+
+## 11-4. MATCH_RECOGNIZE DEFINE 조건 연속행(AND/OR)이 항목 라인 frame을 무시
+
+DEFINE 조건의 `AND`/`OR` 연속행 indent가 DEFINE 절 기준 절대 +1로 계산되어,
+주석 때문에 조건 항목(`B AS ...`)이 새 줄로 밀린 경우 연속행이 항목과 같은
+레벨로 충돌했다. MATCH_RECOGNIZE 괄호 안에서는 조건 항목이 시작된 현재 렌더
+라인 기준 +1로 anchor하도록 수정했다(항목이 DEFINE과 같은 줄이면 기존 출력과
+동일).
+
+- 발견 위치: `test/test_open_with.sql.format.out` 460~470행
+- 수정 코드: `ui/sql_editor/formatter.rs` — 조건 break fallback 앞에
+  `in_match_recognize_paren()` 분기 추가(현재 라인 indent +1)
+
+### AS-IS (test_open_with.sql)
+
+```sql
+            DEFINE
+                -- [BR] B 조건: 이전보다 높고 부서 평균의 1.5배 미만
+                B AS B.sal > PREV (B.sal)
+                AND B.sal < (
+                    /* BS: 부서 평균 서브쿼리 */
+                    SELECT AVG (sal) * /* BT: 상한 배율 */
+                        1.5
+                    FROM emp
+                    WHERE deptno = /* BU: correlated */
+                        B.deptno
+                )
+```
+
+`AND`가 조건 항목 `B AS ...`와 같은 레벨 → 별개 항목처럼 보임.
+
+### TO-BE
+
+```sql
+            DEFINE
+                -- [BR] B 조건: 이전보다 높고 부서 평균의 1.5배 미만
+                B AS B.sal > PREV (B.sal)
+                    AND B.sal < (
+                        /* BS: 부서 평균 서브쿼리 */
+                        SELECT AVG (sal) * /* BT: 상한 배율 */
+                            1.5
+                        FROM emp
+                        WHERE deptno = /* BU: correlated */
+                            B.deptno
+                    )
+```
+
+연속 조건과 그 서브쿼리 전체가 항목 라인 기준 상대 frame으로 이동.
+
+## 11-5. 검토했으나 수정하지 않은 항목 (의도된 상대 규칙으로 확인)
+
+- `FROM (` / `USING (` / `WHERE EXISTS (` 서브쿼리 본문 +2·닫힘 +1 vs
+  `JOIN (` / `AND EXISTS (` 본문 +1·닫힘 +0: 소유 키워드의 연속행 레벨을
+  보정하는 일관된 상대 규칙으로 47개 파일 전체에서 동일하게 적용됨.
+- `WHERE 식 <비교연산자> (` 서브쿼리 본문 +1: 전 파일 일관.
+- `CAST(ROUND(` 등 같은 줄 다중 미닫힘 괄호의 연속행 가산 indent: 일관.
+- `oracle splitter final boss test.sql`의 `PROMPT = = =`, `' 2024 - 07 - 01 '`,
+  8칸 들여쓰기된 PROMPT 등은 원본 입력 자체가 그런 형태이며 포맷터는
+  보존만 함(결함 아님, 원본 대조로 확인).
+
+## 11-6. 추가된 회귀 테스트 (`format_sweep_tests`)
+
+| 테스트 | 검증 내용 |
+| --- | --- |
+| `inline_case_call_argument_keeps_paren_frame_for_following_arguments` | inline CASE 인자 뒤 END/후속 인자가 괄호 frame +1 유지 |
+| `mysql_declare_condition_for_clause_stays_inline` | DECLARE ... CONDITION FOR 인라인 유지 |
+| `fetch_first_comment_continuation_stays_one_deeper_after_match_recognize_close` | MR 닫힘 뒤 FETCH 주석 연속행 +1 유지 |
+| `match_recognize_define_condition_continuation_anchors_to_item_line` | DEFINE 조건 연속행이 항목 라인 +1에 anchor |
+
+## 11-7. 4차 회차 검증 결과
+
+| 검증 | 결과 |
+| --- | --- |
+| `.format.out` 47개 파일 / 28,589줄 전량 육안 정독 | 결함 4건 발견·수정 |
+| 수정 후 스윕 before/after diff | 의도한 4개 파일·4개 지점만 변경 (test22, test23, test_open_with, test_mariadb/test5) |
+| 실제 SQL 파일 자동 포맷 스윕 집계 | checked_files=47, failed_files=0 (전 파일 PASS, 비멱등·불변식 위반 0) |
+| 전체 라이브러리 테스트 | 6,434 통과, 실패 0, ignored 212 |
+
+---
+
+# 5차 정밀 검증 회차 (2026-07-14, 4차 수정분 심층 재검증)
+
+4차 수정(frame 상대 구조 4건) 이후 스윕을 재실행하고 `.format.out` 재검토 +
+시그니처 스캔 + 적대적 프로브로 심층 검증했다. **신규 결함 0건, 포맷터 코드
+변경 없음.** 회귀 방지용 멱등성 프로브 테스트 1건을 추가했다.
+
+## 12-1. 1차 자동 검사
+
+`formatting_sweep_all_files_generate_out_report`: checked_files=47, failed_files=0
+(전 파일 PASS — 토큰 불변식·들여쓰기 단위·멱등성·재들여쓰기/붕괴/전개 프로브 포함).
+
+## 12-2. 출력 재검토 및 시그니처 스캔 (47개 파일 / 28,588줄)
+
+| 검사 | 대상 | 결과 |
+| --- | --- | --- |
+| 4차 변경 4개 파일 전체 재정독 (test22, test23, test_open_with, test_mariadb/test5) | 4 파일 | frame 정합 확인, 이상 없음 |
+| inline `=> CASE` / `, CASE` / `(CASE` 발생 지점 전수 확인 | 47 파일 | 2건(test22·test23) 모두 괄호 frame +1로 정렬됨 |
+| 인라인 블록주석 뒤 연속행 붕괴(+0) 스캔 | 47 파일 | 7건 검출 → 문자열 내부 2건, `WITH /* */`·`ON /* */` 5건은 CTE 이름 레벨·ON 동일깊이 명시 분기(의도된 상대 규칙) |
+| AND/OR가 직전 코드행과 같은 indent인 지점 스캔 | 47 파일 | 9건 → 전부 `EXISTS(...)` 닫힘 뒤 형제 조건(확립 규칙) 또는 블록주석/문자열 내부 |
+| 단독 `FOR` 행(선언 오절단 의심) 스캔 | 47 파일 | 2건 → 모두 문자열 내부 원문 |
+| 3레벨 이상 indent 점프 스캔 | 47 파일 | 20건 → 전부 q-quote 문자열 경계 또는 같은 줄 다중 미닫힘 괄호 가산 규칙 |
+| 단독 라인주석 anchoring 드리프트 스캔 | 47 파일 | 4건 → 블록 dedent 직전 본문 주석(표준) 2건, 문자열 내부 2건 |
+| `END`/`END IF` 등 owner 정렬 스캔 | 47 파일 | 50건 → TYPE BODY의 CREATE 정렬, 문자열 내 가짜 END, MySQL `UNTIL`/`END REPEAT` 규약으로 전부 정상 |
+
+## 12-3. 적대적 프로브 10종 (전부 PASS + 멱등)
+
+4차 수정 경로를 더 깊은 중첩으로 공격:
+
+1. 중첩 호출 안 inline CASE 인자 2개 (`outer_call(a => inner_call(..., y => CASE...), b => CASE...)`)
+2. PACKAGE BODY → PROCEDURE → IF → FOR LOOP 내부의 inline CASE 인자 (깊은 블록 중첩)
+3. 여는 괄호 직후 첫 인자 CASE
+4. SQL SELECT 목록 함수 호출의 `=> CASE`
+5. MariaDB `CONDITION FOR 1062`(에러코드형) + 중첩 BEGIN 내 `CONDITION FOR SQLSTATE`
+6. PIVOT 닫힘 뒤 `FETCH FIRST /* 주석 */` 연속행
+7. OPEN FOR + UNPIVOT 닫힘 뒤 FETCH 주석 연속행
+8. MR DEFINE 다중 항목 + 항목별 주석 + AND (항목 라인 +1, 콤마 후 다음 항목 복귀)
+9. MR DEFINE 조건 내부 서브쿼리의 WHERE AND (WHERE owner가 MR 규칙보다 우선함 확인)
+10. MERGE USING 서브쿼리 안의 MR DEFINE AND (2중 중첩)
+
+10종 모두 frame 상대 구조 유지 + 2회 포맷 결과 동일(멱등).
+프로브는 `adversarial_frame_probes_stay_idempotent` 테스트로 영구 고정.
+
+## 12-4. 5차 회차 검증 결과
+
+| 검증 | 결과 |
+| --- | --- |
+| 스윕 자동 검사 | 47/47 PASS, 실패 0 |
+| 출력 재검토·시그니처 스캔 8종 | 신규 결함 0건 |
+| 적대적 프로브 10종 | 전부 PASS, 멱등 |
+| 전체 라이브러리 테스트 | 6,435 통과, 실패 0, ignored 212 |
+| `cargo fmt -- --check` | 통과 |
+| 포맷터 코드 변경 | 없음 (검증 전용 회차) |
+
+---
+
+# 6차 독립 정밀 검증 회차 (2026-07-14, 전수 육안 정독 + frame 구조 감사)
+
+기존 PASS 보고나 5차 기록을 결론의 근거로 재사용하지 않고, 지정 스윕을 새로
+실행한 뒤 생성된 모든 `.format.out`을 1행부터 EOF까지 직접 정독했다. 이어서
+포맷터의 frame open/close 및 상대 depth 복원 구현과 관련 회귀 테스트를 다시
+감사했다. **신규 포맷 결함 0건, 포맷터 코드 수정 0건**이다.
+
+## 13-1. 지정 스윕 및 출력 전수 육안 검토
+
+실행 명령:
+
+```text
+cargo test --lib formatting_sweep_all_files_generate_out_report -- --ignored --nocapture
+```
+
+| 대상 | 파일 수 | 처음부터 끝까지 확인한 줄 수 | 결과 |
+| --- | ---: | ---: | --- |
+| `target/format-sweep/test/*.format.out` (Oracle) | 39 | 22,087 | 신규 결함 0 |
+| `target/format-sweep/test_mysql/*.format.out` (MySQL) | 3 | 1,827 | 신규 결함 0 |
+| `target/format-sweep/test_mariadb/*.format.out` (MariaDB) | 5 | 4,674 | 신규 결함 0 |
+| **합계** | **47** | **28,588** | **47/47 PASS, 실패 0** |
+
+PASS/`issues=0` 표시는 참고만 하고 다음 항목을 실제 출력 줄에서 확인했다.
+
+- 괄호·CASE·CTE·인라인 뷰·분석 함수·MODEL·MATCH_RECOGNIZE·JSON_TABLE의
+  소유 frame 시작, 중첩 frame 종료, 부모/형제 절 depth 복귀
+- PL/SQL 및 MySQL/MariaDB 루틴의 BEGIN/END, IF/CASE/LOOP, handler,
+  `DELIMITER` 경계와 statement boundary 복귀
+- 주석, 일반 문자열, Oracle q-quote, 동적 SQL 내부의 가짜 괄호·세미콜론·END가
+  외부 frame을 열거나 닫지 않는지
+- 괄호 닫힘 뒤 후속 인자, `FETCH FIRST` 주석 연속행, DEFINE 조건의 AND/OR,
+  `DECLARE ... CONDITION FOR` 등 기존 결함 지점
+
+최종 스윕 재생성 후 47개 파일의 SHA-256을 육안 검토 직전 결과와 비교했으며
+`BASELINE=47 CURRENT=47 HASH_DIFFS=0`이었다. 따라서 최종 산출물은 전수 정독한
+산출물과 바이트 단위로 동일하다.
+
+## 13-2. frame open/close 및 상대 depth 구현 감사
+
+구현은 전역 depth를 문맥 없이 재계산하는 방식이 아니라 다음 frame stack을
+단일 구조 상태로 사용한다.
+
+- `FormatFrameStack`은 Paren, Block, QueryRuntime, ScopedIndent,
+  ConditionOwner 등 구문 frame을 한 스택에서 관리한다.
+- 괄호 시작은 `push_paren`에서 고유 frame ID, 부모 frame ID, 상대 indent delta,
+  쿼리 runtime 상태를 함께 저장한다. 종료는 `pop_paren`에서 정확히 해당 frame을
+  제거하고 부모 frame의 metrics/runtime/indent를 복원한다.
+- 블록 시작은 owner depth와 body indent를 `FormatBlockDepthFrame`에 저장하고,
+  종료는 `pop_block`이 남아 있는 frame stack에서 기대 indent를 재구성한다.
+- `FormatScope`는 depth뿐 아니라 frame ID까지 비교하므로 같은 depth의 형제
+  구문을 부모/자식으로 오인하지 않는다. scope를 벗어난 보조 frame은 token 진입
+  및 statement boundary에서 만료된다.
+- debug invariant는 paren/block depth, 최근 frame ID, `indent_level`과 stack의
+  기대값이 어긋나면 즉시 실패시킨다.
+
+확인한 핵심 구현 위치:
+
+- `src/ui/sql_editor/formatter.rs`: frame 종류/stack(1883~2006), 공통 push/pop
+  (2106~2377), 괄호 push/pop(2754~2861), 블록 push/pop(3140~3224), statement
+  boundary 및 invariant(3835~4018)
+- `src/sql_format.rs`: frame ID를 포함한 동일-depth scope 판정(103~127)
+
+결론: 구문 시작이 frame을 만들고 구문 종료가 그 frame을 닫으며, 중첩 종료 후
+부모 기준 상대 depth로 복귀하는 요구 구조가 구현되어 있고 이번 전수 출력에서도
+frame 누수나 형제 scope 오인이 발견되지 않았다.
+
+## 13-3. 회귀 및 전체 검증 결과
+
+| 검증 | 결과 |
+| --- | --- |
+| `cargo test --lib format_frame_stack -- --nocapture` | 33 통과, 실패 0 |
+| `cargo test --lib ui::sql_editor::format_sweep_tests:: -- --nocapture` | 13 통과, 실패 0, 스윕용 ignored 2 |
+| 적대적 frame 프로브 10종 | 전부 2회 포맷 동일(멱등), 실패 0 |
+| `cargo test --lib` | 6,435 통과, 실패 0, ignored 212 |
+| `cargo fmt -- --check` | 통과 |
+| 지정 ignored 스윕 최종 재실행 | 1 통과, checked_files=47, failed_files=0 |
+| 최종 출력 vs 전수 정독본 SHA-256 | 47/47 동일, diff 0 |
+
+## 13-4. AS-IS / TO-BE
+
+이번 회차에는 새 포맷 결함과 코드 수정이 없으므로 신규 AS-IS/TO-BE 쿼리
+차이는 없다.
+
+- **AS-IS:** 5차 검증 완료 상태의 47개 포맷 출력
+- **TO-BE:** 6차 최종 스윕 출력 — AS-IS와 SHA-256 47/47 동일
+- 실제 수정이 있었던 4개 쿼리의 AS-IS/TO-BE는 11-1~11-4에 각각 보존되어
+  있으며, 이번 회차에서 해당 TO-BE 지점과 그 주변 중첩 frame을 다시 정독했다.
+
+## 13-5. 6차 회차 결론
+
+| 항목 | 결과 |
+| --- | --- |
+| 전수 확인 파일/라인 | 47개 / 28,588줄 |
+| 새로 발견한 오류 | 0건 |
+| 포맷터·테스트 코드 수정 | 없음 |
+| 문서 변경 | 본 6차 독립 검증 기록 추가 |
+| 최종 상태 | 스윕·집중 회귀·전체 테스트·fmt 전부 성공 |
+
+---
+
+# 7차 최신 fixture 독립 검증 회차 (2026-07-14, 53개 전수 정독)
+
+6차 기록의 47개 결과를 결론으로 재사용하지 않고 지정 스윕을 다시 실행했다.
+그 사이 추가된 MySQL 3개·MariaDB 3개 fixture를 포함해 생성된 모든
+`.format.out`을 1행부터 EOF까지 직접 정독하고, frame open/close 상대 depth
+구현과 실제 토큰 처리 경로를 다시 감사했다. **신규 포맷 결함 0건, 포매터·테스트
+코드 수정 0건**이다.
+
+## 14-1. 지정 스윕 및 출력 전수 육안 검토
+
+실행 명령:
+
+```text
+cargo test --lib formatting_sweep_all_files_generate_out_report -- --ignored --nocapture
+```
+
+| 대상 | 파일 수 | 처음부터 끝까지 확인한 줄 수 | 결과 |
+| --- | ---: | ---: | --- |
+| `target/format-sweep/test/*.format.out` (Oracle) | 39 | 22,089 | 신규 결함 0 |
+| `target/format-sweep/test_mysql/*.format.out` (MySQL) | 6 | 3,689 | 신규 결함 0 |
+| `target/format-sweep/test_mariadb/*.format.out` (MariaDB) | 8 | 6,363 | 신규 결함 0 |
+| **합계** | **53** | **32,141** | **53/53 PASS, 실패 0** |
+
+PASS 표시는 결론의 근거로 대신하지 않고, 실제 출력에서 괄호·블록·CASE·CTE·
+서브쿼리·JSON/XML table function·MATCH_RECOGNIZE·루틴/handler의 시작 frame,
+중첩 종료, 부모와 다음 형제 depth 복귀를 확인했다. 주석·일반 문자열·Oracle
+q-quote·동적 SQL 안의 가짜 괄호/세미콜론/END가 바깥 frame을 변경하지 않는지도
+함께 확인했다.
+
+보조 검사에서는 실제 `[[FMT:E숫자...]]` 오류 마커 0개, `status: PASS` 53개,
+`issues: total=0` 53개, 집계 `checked_files=53 / failed_files=0`이었다. 최종
+스윕 재생성 후 육안 정독 직전 보관본과 `diff -qr`로 비교했으며 파일 추가·삭제·
+내용 차이가 모두 0이었다. 따라서 최종 53개·32,141줄은 정독한 산출물과 바이트
+단위로 동일하다.
+
+## 14-2. frame open/close 상대 depth 구현 재감사
+
+- `FormatFrameStack`이 Paren·Block·QueryRuntime·ScopedIndent·ConditionOwner를
+  한 스택에서 관리하고, 괄호와 블록 시작마다 고유 frame ID와 부모 frame ID를
+  기록한다.
+- 실제 토큰 루프는 토큰 진입마다 현재 frame ID를 포함한 scope를 동기화한다.
+  `(`는 `push_paren`에서 상대 indent delta와 runtime을 함께 열고, `)`는
+  `pop_paren`에서 같은 frame의 delta를 되돌린 뒤 부모 상태를 복원한다.
+- 블록은 owner/body depth를 `FormatBlockDepthFrame`에 저장하며, `pop_block`은
+  닫힌 뒤 살아남은 frame stack에서 기준 indent를 재구성한다.
+- `FormatScope::contains`는 depth뿐 아니라 frame ID도 대조하므로 동일 depth의
+  형제 frame을 부모/자식으로 오인하지 않는다. debug invariant와 statement
+  boundary 정리도 stack의 기대 indent 및 최근 frame ID를 검증한다.
+
+이번 53개 전수 출력과 집중 테스트에서 frame 누수, 중첩 close 후 외부 depth
+손실, 동일 depth 형제 scope 오인은 재현되지 않았다. 따라서 단순 depth 보정
+코드를 추가하는 것보다 현재 frame 기반 구현을 그대로 유지하는 것이 최소·정확한
+조치라고 판단했다.
+
+## 14-3. AS-IS / TO-BE query
+
+이번 회차에는 수정할 결함이 없으므로 AS-IS와 TO-BE의 SQL 및 출력이 동일하다.
+아래 중첩 query는 바깥 `MATCH_RECOGNIZE` frame 안에서 서브쿼리 frame이 열리고
+닫힌 뒤 바깥 `DEFINE`과 괄호 depth로 정확히 복귀하는 대표 확인 사례다.
+
+### AS-IS
+
+```sql
+SELECT *
+FROM e
+MATCH_RECOGNIZE (
+    PARTITION BY d
+    ORDER BY rn
+    PATTERN (A B+)
+    DEFINE B AS B.sal > (
+        SELECT AVG (x.sal)
+        FROM e x
+        WHERE x.d = B.d
+            AND x.flag = 'Y'
+    )
+);
+```
+
+### TO-BE
+
+```sql
+SELECT *
+FROM e
+MATCH_RECOGNIZE (
+    PARTITION BY d
+    ORDER BY rn
+    PATTERN (A B+)
+    DEFINE B AS B.sal > (
+        SELECT AVG (x.sal)
+        FROM e x
+        WHERE x.d = B.d
+            AND x.flag = 'Y'
+    )
+);
+```
+
+즉, 이번 회차의 변경 내역은 `AS-IS = TO-BE`이며 프로덕션 SQL 포매터 diff는
+없다. 실제 과거 수정 쿼리의 차이는 11-1~11-4에 계속 보존한다.
+
+## 14-4. 회귀 및 전체 검증 결과
+
+| 검증 | 결과 |
+| --- | --- |
+| `cargo test --lib format_frame_stack -- --nocapture` | 33 통과, 실패 0 |
+| `cargo test --lib sql_format_ -- --nocapture` | 8 통과, 실패 0 |
+| 인라인 CASE 후속 인자 frame 회귀 | 1 통과, 실패 0 |
+| 적대적 frame query 10종 | 전부 2회 포맷 동일(멱등), 실패 0 |
+| `cargo test --lib` | 6,466 통과, 실패 0, ignored 218 |
+| `cargo fmt -- --check` | 통과 |
+| 지정 ignored 스윕 최초·최종 실행 | 각 1 통과, checked_files=53, failed_files=0 |
+| 최초 산출물 vs 최종 산출물 `diff -qr` | 차이 0 |
+
+## 14-5. 7차 회차 결론
+
+| 항목 | 결과 |
+| --- | --- |
+| 전수 확인 파일/라인 | 53개 / 32,141줄 |
+| 새로 발견한 오류 | 0건 |
+| 포매터·테스트 코드 수정 | 없음 |
+| 문서 변경 | 본 7차 독립 검증 기록 추가 |
+| 최종 상태 | 스윕·집중 회귀·전체 테스트·fmt 전부 성공 |
+
+# 15. 8차 검증 회차 (2026-07-14): 전수 육안 재검토 및 frame depth 결함 2건 수정
+
+## 15-1. 수행 내용
+
+1. `cargo test --lib formatting_sweep_all_files_generate_out_report -- --ignored --nocapture` 1차 실행
+   → checked_files=53, failed_files=0 (자동 검사 전건 PASS)
+2. `target/format-sweep` 아래 53개 `.format.out` 전체(32,141줄)를 처음부터 끝까지 육안 검토.
+   자동 PASS를 신뢰하지 않고 frame open/close 상대 depth 일관성(목표3) 기준으로 전 라인 대조.
+   보조로 인덴트 급증(±2레벨 이상)·4배수 위반 지점을 스캐너로 표시하고 전 지점을 원문 대조로 판정.
+3. 육안 검토에서 자동 검사(토큰 보존·4배수·멱등성)가 잡지 못하는 상대 depth 결함 2건 + 의도 설계 확인 1건 발견.
+4. 결함 2건을 최소 SQL로 재현 → `formatter.rs` 수정 → 회귀 테스트 2건 추가 → 스윕 재실행 후 산출물 재검토.
+
+## 15-2. 오류 1: 여러 줄 서브쿼리 인자 닫힘 후 후속 인자 depth 이탈
+
+- 발견 위치: `target/format-sweep/test_mariadb/test10.txt.format.out` 211~218행
+  (`sq_mariadb_format_cert_2`의 `mb_run_gauntlet_2` 내 INSERT … JSON_OBJECT)
+- 증상: 같은 줄에서 여러 괄호 프레임이 열린 상태(`VALUES ( … JSON_OBJECT ( … (`)에서
+  인라인 서브쿼리가 여러 줄로 펼쳐진 뒤, 닫는 `)` 줄에 이어지는 인자는 프레임 depth를 유지하지만
+  줄바꿈된 후속 인자(`v_forward` 등)는 "여는 줄 indent+1"로 계산되어 한 프레임 바깥 depth로 떨어짐.
+  같은 JSON_OBJECT 인자 목록의 형제끼리 depth가 어긋나는 frame 계약 위반.
+- 원인: `ParenFormatFrame::sibling_body_indent()`가 `body_indent` 미기록 시
+  `open_line_indent + 1`을 기본값으로 사용. 여는 줄에서 프레임이 2개 이상 열리면
+  실제 프레임 depth(닫는 줄 depth)보다 얕게 계산됨.
+- 수정: `formatter.rs`의 `)` 처리에서 여러 줄 자식 프레임이 닫힐 때
+  (`contributes_multiline_close && closes_indented`) 닫는 줄 indent를 부모 프레임의
+  `record_body_indent`로 기록. 이후 콤마 줄바꿈 형제는 닫는 줄과 같은 depth로 정렬.
+
+AS-IS (수정 전 포맷 결과):
+
+```sql
+        VALUES (summary_rec.asset_id, ..., JSON_OBJECT('uuid', (
+                    SELECT CAST(asset_uuid AS CHAR)
+                    FROM mb_asset
+                    WHERE asset_id = summary_rec.asset_id
+                ), 'forward_sum',
+            v_forward,
+            'reverse_sum',
+            v_reverse))
+```
+
+TO-BE (수정 후 포맷 결과):
+
+```sql
+        VALUES (summary_rec.asset_id, ..., JSON_OBJECT('uuid', (
+                    SELECT CAST(asset_uuid AS CHAR)
+                    FROM mb_asset
+                    WHERE asset_id = summary_rec.asset_id
+                ), 'forward_sum',
+                v_forward,
+                'reverse_sum',
+                v_reverse))
+```
+
+- 회귀 테스트: `format_for_auto_formatting_aligns_wrapped_siblings_with_multiline_subquery_close_line`
+  (정렬 + 멱등성 고정)
+
+## 15-3. 오류 2: 서브쿼리가 CASE…END로 끝나면 `) LOOP` 가 두 줄로 분리
+
+- 발견 위치: `test/test21.sql.format.out` 46~47행, `test/oracle_format_ultimate_boss.sql.format.out` 32~33행
+  (커서 FOR 루프의 IN 서브쿼리가 `ORDER BY CASE … END`로 끝나는 경우)
+- 증상: 전 파일에서 `) LOOP`는 한 줄이 규범(기존 테스트
+  `plsql_for_split_in_subquery_keeps_child_query_on_for_depth`로 고정)인데,
+  서브쿼리 마지막 단어가 `END`이면 `)`와 `LOOP`가 줄 분리됨.
+- 원인: `FOR i IN 1..CASE … END LOOP`(범위식이 CASE로 끝나는 경우)용
+  `follows_for_range_case_end` 판정이 "직전 단어 == END"만 확인해서,
+  END와 LOOP 사이에 `)`가 있는 경우까지 오탐.
+- 수정: 직전 비주석 토큰이 실제 `END` 단어일 때만 줄 분리하도록 조건 강화.
+  (`)` 뒤의 LOOP는 기존 규범대로 같은 줄 유지, 범위식 CASE END 직후의 LOOP는 기존대로 분리)
+
+AS-IS (수정 전 포맷 결과):
+
+```sql
+    FOR r IN (
+        SELECT object_name
+        FROM user_objects
+        ORDER BY
+            CASE object_type
+                WHEN 'VIEW' THEN
+                    1
+                ELSE
+                    2
+            END
+    )
+    LOOP
+```
+
+TO-BE (수정 후 포맷 결과):
+
+```sql
+    FOR r IN (
+        SELECT object_name
+        FROM user_objects
+        ORDER BY
+            CASE object_type
+                WHEN 'VIEW' THEN
+                    1
+                ELSE
+                    2
+            END
+    ) LOOP
+```
+
+- 회귀 테스트: `plsql_for_in_subquery_ending_with_case_end_keeps_loop_on_close_paren_line`
+  (`) LOOP` 결합 + 멱등성 고정)
+
+## 15-4. 의도 설계 확인 (수정하지 않음)
+
+- Oracle `JSON_OBJECT (… 'k' VALUE ( 서브쿼리 ), …)`에서 닫는 `)` 줄이 서브쿼리 본문과
+  같은 depth에 놓이는 레이아웃(`test/oracle_format_ultimate_boss.sql` QUERY 8,
+  `test/oracle splitter final boss test.sql` TEST-038)은 결함이 아니라
+  `query_like_paren_layout`의 `ends_with_value` 분기(`close_depth = child_head_depth`)로
+  구현된 의도된 설계이며, 회귀 테스트
+  `format_for_auto_formatting_keeps_json_object_value_scalar_subquery_on_paren_frame_depth`가
+  해당 레이아웃(후속 `'k' VALUE …` 인자가 닫는 괄호 줄에서 프레임 depth로 이어지는 형태)을 고정하고 있어 유지.
+- WITH 절에서 인라인 `FUNCTION`/`PROCEDURE` 선언은 +1 depth, CTE 이름은 `WITH`와 동일 depth로
+  정렬되는 형제 depth 차이는 전 파일에서 일관 적용되는 스타일로 확인(오류 아님).
+- 문자열/주석/q-quote 내부 보호 구간(멀티라인 리터럴의 비정형 indent)은 전부 원문 보존으로 정상.
+
+## 15-5. 반복 및 최종 검증 결과
+
+| 검증 | 결과 |
+| --- | --- |
+| 스윕 1차(수정 전) | checked_files=53, failed_files=0 |
+| 육안 전수 검토 | 53개 파일 / 32,141줄, 결함 2건·설계 확인 1건 |
+| 수정 후 스윕 재실행 | checked_files=53, failed_files=0 |
+| 수정 전후 산출물 diff | 의도한 3개 지점(test_mariadb/test10, test/test21, test/oracle_format_ultimate_boss)만 변경, 그 외 50개 파일 diff 0 |
+| 재검토(변경 지점 육안 확인) | 형제 인자 depth 정렬·`) LOOP` 결합 정상, 잔여 오류 0건 |
+| `cargo test --lib` | 6,468 통과(신규 회귀 2건 포함), 실패 0, ignored 218 |
+| `cargo fmt -- --check` | 통과 |
+
+## 15-6. 8차 회차 결론
+
+| 항목 | 결과 |
+| --- | --- |
+| 전수 확인 파일/라인 | 53개 / 32,141줄 |
+| 새로 발견한 오류 | 2건 (전건 수정 완료) |
+| 포매터 수정 | `formatter.rs` 2곳 (`)` 닫힘 시 부모 body indent 기록, LOOP 줄바꿈 판정 강화) |
+| 회귀 테스트 추가 | 2건 |
+| 최종 상태 | 스윕·전체 테스트·fmt 전부 성공, 잔여 오류 0건 |
+
+# 16. 9차 검증 회차 (2026-07-15): 3개 DB 최종 보스 실실행·포맷·IntelliSense 판매 게이트
+
+## 16-1. 신규 단일 문장 fixture
+
+자동 포맷터가 단순 예제뿐 아니라 실제 판매 전 품질 게이트로 사용할 수 있도록,
+부작용 없이 반복 실행 가능한 `WITH ... SELECT` 한 문장을 DB별로 추가했다.
+
+| DB | 파일 | 원본 줄 수 | 주요 문법 |
+| --- | --- | ---: | --- |
+| Oracle | `test/oracle_format_final_boss_2.sql` | 209 | 재귀 CTE `CYCLE`, 계층 질의, `JSON_TABLE`/`NESTED PATH`, `APPLY`, `MATCH_RECOGNIZE`, `PIVOT`, 집합 연산, 분석 함수, JSON/XML 생성 |
+| MySQL | `test_mysql/test7.txt` | 186 | 재귀 CTE, `JSON_TABLE`/`NESTED PATH`, `LATERAL`, `INTERSECT`/`EXCEPT`, `WITH ROLLUP`/`GROUPING`, named window, 중첩 JSON |
+| MariaDB | `test_mariadb/test12.txt` | 174 | 재귀 CTE, `JSON_TABLE`, dynamic column, vector 함수, `PERCENTILE_DISC`, `INTERSECT ALL`/`EXCEPT ALL`, 중첩 JSON |
+
+각 쿼리는 내부 데이터 집합의 건수·합계·트리 노드·집합 연산 결과를 최종
+`CASE`에서 다시 검산한다. 성공 조건은 결과 4행의 `status`가 모두 `PASS`인
+것이며, DDL/DML이나 세션 상태 변경은 포함하지 않는다.
+
+## 16-2. 실제 DB 원본·포맷 결과 실행
+
+원본뿐 아니라 `target/format-sweep`에 생성된 `.format.out` 파일 자체(후미의
+SQL 주석 보고서 포함)를 컨테이너로 복사해 동일 엔진에서 다시 실행했다.
+
+| 엔진 | 원본 | 포맷 결과 | 판정 |
+| --- | --- | --- | --- |
+| Oracle Database Free 26ai | exit 0, `PASS` 4행 | exit 0, `PASS` 4행 | 성공 |
+| MySQL 8.0.46 | exit 0, `PASS` 4행 | exit 0, `PASS` 4행 | 성공 |
+| MariaDB 12.2.2 | exit 0, `PASS` 4행 | exit 0, `PASS` 4행 | 성공 |
+
+따라서 이번 fixture에서 자동 포맷 전후의 실행 의미와 자체 검산 결과는 같다.
+각 엔진의 원본/포맷 stdout 전체를 별도 파일로 저장해 `diff -u`한 결과도 세 DB
+모두 차이 0이었다.
+
+## 16-3. 포맷 스윕·육안 검토·결정성
+
+| 항목 | 결과 |
+| --- | --- |
+| 전체 스윕 | 56개 파일, failed_files=0 |
+| frame 검사 | checked_frames=8,103, body_items=565, closes=1,393 |
+| 전체 `.format.out` | 33,330줄 |
+| 신규 3개 결과 | 1,191줄(Oracle 394, MySQL 410, MariaDB 387), 처음부터 끝까지 육안 검토 완료 |
+| 기존 53개 결과 | 직전 전수 육안 검토 최종 스냅샷과 개별 파일 byte diff 0 |
+| 최종 재생성 결정성 | 재실행 전후 `diff -rq` 차이 0 |
+
+신규 결과에서 토큰 손실, frame 누수, 비정상 close depth, 절 경계 오인 또는
+실행 불가능한 SQL은 발견되지 않았다. 포매터 구현 자체에는 추가 결함이 없어
+이번 회차의 프로덕션 포매터 코드는 수정하지 않았다.
+
+## 16-4. IntelliSense AS-IS / TO-BE
+
+신규 파일을 실제 `intellisense_sweep_generate_report_for_file` 경로로 검사했을 때
+최초 누락은 Oracle 53개, MySQL 7개, MariaDB 2개였다. 대부분은 새 문법의 구조
+키워드였고, Oracle의 다수 누락은 아래 하나의 CTE 상태 전이 결함에서 파생됐다.
+
+### AS-IS: Oracle `CYCLE` 뒤의 다음 CTE를 잃음
+
+```sql
+WITH days (day_no, day_value) AS (
+    SELECT 0, DATE '2026-01-01' FROM dual
+)
+CYCLE day_no SET cycle_yn TO 'Y' DEFAULT 'N',
+customer_tree (customer_id) AS (
+    SELECT 1 FROM dual
+)
+SELECT t.customer_id
+FROM customer_tree t;
+```
+
+기존 단일 패스 CTE 상태기는 MariaDB의 `CYCLE ... RESTRICT,`만 다음 CTE
+구분자로 복구했다. Oracle의 `SEARCH ... SET ... ,` 또는
+`CYCLE ... SET ... TO ... DEFAULT ... ,` 뒤 쉼표는 처리하지 않아
+`customer_tree` 이후 CTE 정의와 명시적 컬럼을 전부 잃었다.
+
+### TO-BE: 완결된 재귀 CTE 옵션의 쉼표만 구분자로 인식
+
+`recursive_cte_option_is_complete_before_separator`가 다음을 구분한다.
+
+- `SEARCH ... SET generated_column`이 완결된 뒤의 쉼표
+- `CYCLE ... SET marker TO value DEFAULT value`가 완결된 뒤의 쉼표
+- `SEARCH ... BY a, b`와 `CYCLE a, b SET ...` 내부 쉼표(CTE 구분자가 아님)
+
+Oracle의 후속 CTE가 다시 scope에 등록되어 명시적 컬럼과 qualified column
+완성이 복원됐다. 내부 쉼표 오탐 방지까지 비무시 회귀 테스트로 고정했다.
+
+구조 키워드 추론도 다음 실제 구문에 맞게 보강했다.
+
+- Oracle: `UNION ALL`, `CROSS JOIN/APPLY`, `OUTER APPLY`,
+  `MATCH_RECOGNIZE`의 `ONE ROW`, `AFTER MATCH SKIP PAST LAST ROW`,
+  `XMLSERIALIZE CONTENT`, JSON `VALUE`/`FORMAT JSON`, select-list `AS`
+- MySQL/MariaDB 공통: `JSON_TABLE ... NESTED PATH`, `WITH ROLLUP`,
+  `IS [NOT] NULL/TRUE/FALSE`
+- MySQL: `LATERAL (subquery)`
+- prefix 충돌: `ONE`을 `ON`보다, `IS`를 `INTO`보다 먼저 suffix 구조로 판정
+- 스윕 분류: `PATTERN` 변수와 quoted `XMLELEMENT` 태그는 참조 키워드가 아닌
+  사용자 정의 이름 슬롯으로 제외
+
+## 16-5. 파일별 IntelliSense 인증
+
+세 보고서는 입력 파일 옆에 저장하며 누락이 있으면 테스트가 실패한다.
+
+| 보고서 | checked | missing |
+| --- | ---: | ---: |
+| `test/oracle_format_final_boss_2.sql.out` | 576 | 0 |
+| `test_mysql/test7.txt.out` | 530 | 0 |
+| `test_mariadb/test12.txt.out` | 523 | 0 |
+
+개별 ignored 테스트 3개와 통합 테스트
+`intellisense_sweep_generate_report_for_file_certifies_new_final_boss_queries`를 추가했다.
+통합 테스트는 세 파일 모두에 `fail_on_missing=true`를 전달하며 최종 실행에서
+1건 통과, 실패 0이었다. 대표 구조 키워드 8종은 별도 비무시 테스트
+`final_boss_structural_keywords_use_production_completion`으로도 고정했다.
+
+## 16-6. 최종 회귀 결과
+
+| 검증 | 결과 |
+| --- | --- |
+| `cargo check --lib` | 통과 |
+| Oracle 재귀 CTE 경계 회귀 | 2 통과, 실패 0 |
+| 신규 구조 키워드 production completion 회귀 | 1 통과(8 case), 실패 0 |
+| `cargo test --lib format_frame_stack -- --nocapture` | 33 통과, 실패 0 |
+| `cargo test --lib sql_format_ -- --nocapture` | 8 통과, 실패 0 |
+| 통합 IntelliSense 파일 스윕 | 1 통과, Oracle/MySQL/MariaDB 모두 missing 0 |
+| 전체 포맷 스윕 | 1 통과, 56개 파일·failed_files=0 |
+| `cargo test --lib -- --test-threads=1` 최종 재실행 | 6,474 통과, 실패 0, ignored 222 |
+| `cargo fmt -- --check` | 통과 |
+
+병렬 전체 실행에서는 기존 비동기 wildcard 테스트 1건이 스케줄링 부하에 따라
+간헐적으로 `Timeout`을 냈다. 해당 테스트 단독 실행은 0.05초에 통과했고 병렬
+전체 재실행도 한 차례 실패 0으로 통과했다. 최종 판정은 스케줄링 영향을 제거한
+단일 테스트 스레드로 전체 6,696개를 다시 실행해 실패 0을 확인했다.
+
+## 16-7. 결론
+
+세 DB의 새 최종 보스 쿼리는 원본·자동 포맷 결과 모두 실제 엔진에서 실행되며,
+자체 검산 4행이 모두 `PASS`다. 56개 전체 포맷 스윕, 신규 결과 육안 검토,
+결정성 비교, 파일별 IntelliSense 전수 검사, 전체 Rust 회귀를 모두 통과했다.
+이번 회차에서 발견된 IntelliSense scope/구조 키워드 결함은 회귀 테스트와 함께
+수정됐고, 포매터의 잔여 오류는 발견되지 않았다.
+
+# 17. 10차 검증 회차 (2026-07-15): Final Boss III/V와 frame-relative 상용 품질 재인증
+
+## 17-1. 신규 DB별 단일 문장 fixture
+
+기존 final-boss 세트에서 상대적으로 약했던 문법을 실제 엔진에서 함께 조합하기 위해
+DB별로 반복 실행 가능하고 부작용이 없는 `WITH ... SELECT` 한 문장을 더 추가했다.
+상호 배타적인 문법까지 한 문장에 억지로 섞는 대신, 기존 전체 fixture와 이번 3개를
+합친 스윕이 현재 제품이 지원하는 구조·키워드 조합을 모두 지나도록 구성했다.
+
+| DB | 파일 | 원본 줄 수 | 이번 문장의 핵심 조합 |
+| --- | --- | ---: | --- |
+| Oracle | `test/oracle_format_final_boss_3.sql` | 192 | `WITH FUNCTION`, 복수 재귀 CTE, 연속 `SEARCH`/`CYCLE`, 중첩 `JSON_TABLE`, `GROUPING SETS`, `PIVOT`/`UNPIVOT`, 분석 window/frame, `KEEP`, `LISTAGG ... ON OVERFLOW`, XML/JSON 생성 |
+| MySQL | `test_mysql/test8.txt` | 195 | 재귀 CTE, 중첩 `JSON_TABLE`, JSON schema/predicate, `LATERAL`, `INTERSECT`/`EXCEPT`, `ROLLUP`, named window, 정규식, 다중 중첩 JSON |
+| MariaDB | `test_mariadb/test13.txt` | 153 | 재귀 `CYCLE ... RESTRICT`, 중첩 `JSON_TABLE`, dynamic column, `INET6`, percentile 분석, `INTERSECT ALL`/`EXCEPT ALL`, ordered/limited JSON aggregate |
+
+세 파일 모두 내부 fixture의 트리·집계·집합 연산·JSON 결과를 마지막 `CASE`에서
+재검산한다. 원본과 자동 포맷 결과를 각각 Oracle Database Free 26ai,
+MySQL 8.0.46, MariaDB 12.2.2 컨테이너에서 실행했으며 모두 exit code 0,
+모든 반환 행의 `status = 'PASS'`를 확인했다.
+
+## 17-2. 포매터 AS-IS / TO-BE: `SEARCH/CYCLE` 뒤 CTE body indent 복귀
+
+이번 Oracle 문장을 최소화한 회귀 테스트에서, `WITH FUNCTION` 뒤 재귀 CTE의
+`SEARCH`/`CYCLE` option tail이 끝난 쉼표를 일반 절 내부 쉼표로 취급하면 다음 CTE가
+직전 option clause의 continuation depth를 물려받을 수 있음을 재현했다. 이는
+"쉼표 다음 항목은 쉼표를 소유한 목록 frame의 고정 `body_indent`로 복귀"한다는
+계약과 같은 `WITH` frame 최상위 CTE 형제의 depth 계약을 동시에 위반한다.
+
+AS-IS (수정 전의 잘못된 상대 depth):
+
+```sql
+WITH
+    FUNCTION f(p NUMBER) RETURN NUMBER IS
+    BEGIN
+        RETURN p;
+    END;
+first_r (n) AS (
+    ...
+)
+CYCLE n SET first_cycle TO 'Y' DEFAULT 'N',
+    second_r (n) AS (          -- 잘못: CYCLE continuation depth 상속
+        ...
+    )
+    CYCLE n SET second_cycle TO 'Y' DEFAULT 'N',
+        tail_cte (n) AS (      -- 잘못: 다음 형제에서 다시 depth 누적
+            ...
+        )
+SELECT n FROM tail_cte;
+```
+
+TO-BE (수정 후 owning `WITH` frame의 고정 body depth):
+
+```sql
+WITH
+    FUNCTION f(p NUMBER) RETURN NUMBER IS
+    BEGIN
+        RETURN p;
+    END;
+first_r (n) AS (
+    ...
+)
+CYCLE n SET first_cycle TO 'Y' DEFAULT 'N',
+second_r (n) AS (
+    ...
+)
+CYCLE n SET second_cycle TO 'Y' DEFAULT 'N',
+tail_cte (n) AS (
+    ...
+)
+SELECT n FROM tail_cte;
+```
+
+수정 내용:
+
+- 쉼표 뒤 토큰을 bounded look-ahead하여 `name [(column-list)] AS (` 형태의 완전한
+  다음 CTE 정의인지 확인한다.
+- 같은 괄호 depth의 활성 `SEARCH/CYCLE` tail 뒤에서만 현재 `WITH` body indent를
+  캡처하고 option construct를 닫은 뒤 그 고정 indent로 개행한다.
+- `SEARCH ... BY a, b`, `CYCLE a, b SET ...` 내부 쉼표나 일반 함수/목록 쉼표에는
+  적용하지 않는다.
+- 회귀 테스트
+  `format_sql_recursive_cte_cycle_separator_restores_with_body_indent`가 첫째·둘째·마지막
+  CTE 이름의 indent 동일성과 두 번 포맷한 결과의 멱등성을 함께 고정한다.
+
+## 17-3. 전체 `.format.out` 수동 판독
+
+정확한 명령
+`cargo test --lib formatting_sweep_all_files_generate_out_report -- --ignored --nocapture`로
+산출물을 다시 만든 뒤, `target/format-sweep` 아래 모든 `.format.out`을 파일별 line
+number와 함께 처음부터 끝까지 직접 판독했다. 자동 PASS나 통계만으로 판정하지 않았다.
+
+| 항목 | 결과 |
+| --- | ---: |
+| 전체 `.format.out` | 59개 |
+| 직접 읽은 전체 줄 | 34,382줄 |
+| 신규 3개 포맷 결과 | 1,051줄(Oracle 354, MySQL 374, MariaDB 323) |
+| comma sibling body-depth 위반 | 0건 |
+| 동일 paren frame 최상위 항목 depth 위반 | 0건 |
+| close-indent 및 닫힘 뒤 parent body 복귀 위반 | 0건 |
+
+판독 중 별도 표시했던 두 패턴도 구현과 전용 회귀 테스트까지 대조했다.
+
+- `test/test24.sql`의 주석 다음 선행 쉼표는 쉼표 문자와 첫 `SET` 항목이 모두 같은
+  column 12의 고정 SET-list body indent이므로 정상이다.
+- Oracle `JSON_OBJECT ('k' VALUE (subquery))`의 긴 inline frame은
+  `query_like_paren_layout`의 의도된 close-depth이며
+  `format_for_auto_formatting_keeps_json_object_value_scalar_subquery_on_paren_frame_depth`가
+  해당 계약을 고정한다.
+
+따라서 위 `SEARCH/CYCLE` 결함 수정 이후에는 추가 production formatter 변경이
+필요한 실제 위반이 남지 않았다.
+
+## 17-4. IntelliSense AS-IS / TO-BE와 production 경로 일치
+
+`intellisense_sweep_generate_report_for_file`의 신규 세 파일을 최초 실행했을 때
+실제로 추천 가능한 누락을 최소 재현으로 분리한 뒤 production main path를 수정했다.
+
+AS-IS:
+
+```sql
+-- SEARCH가 생성한 column 뒤 바로 CYCLE이 오면 recursive-column phase를 잃음
+WITH r(n) AS (...)
+SEARCH DEPTH FIRST BY n SET search_order
+CYCLE n SET cycle_yn TO 'Y' DEFAULT 'N'
+SELECT * FROM r;
+
+-- 큰 WITH 문장의 중첩 grammar에서 broad classifier가 exact continuation보다 먼저 종료
+SELECT LISTAGG(name, ',' ON OVER|) FROM emp;
+SELECT SUM(amount) OVER (ORDER BY day_no ROW| BETWEEN ...) FROM sales;
+
+-- WITH FUNCTION 뒤 CTE 이름을 로컬 declaration으로 분류하지 못함
+WITH FUNCTION f RETURN NUMBER IS BEGIN RETURN 1; END;
+base AS (SELECT 1 id FROM dual)
+SELECT * FROM base;
+```
+
+TO-BE:
+
+- 완결된 Oracle `SEARCH ... SET generated_column` 다음의 `CYCLE`이 recursive CTE
+  column phase를 다시 열어, 연속 `SEARCH -> CYCLE -> 다음 CTE` scope를 유지한다.
+- `completion.rs` production 경로에서 bounded statement token을 사용한 exact
+  window/LISTAGG grammar를 broad statement/CTE classifier보다 먼저 판정한다.
+- `LISTAGG`의 `ON -> OVERFLOW -> ERROR|TRUNCATE -> WITH|WITHOUT -> COUNT` 전 체인을
+  열린 `LISTAGG(` frame 안에서만 추천하며 다른 함수로 누출하지 않는다.
+- token span을 한 번 순회해 괄호 짝을 O(n)에 만들고, `name [(columns)] AS (` 형태의
+  CTE/window declaration을 수집하여 `WITH FUNCTION` 뒤 CTE 이름도 정의로 분류한다.
+- MariaDB 전용 `COLUMN_CHECK`, `COLUMN_JSON`, `JSON_EXISTS`를 별도 catalog로 추가해
+  MariaDB에는 추천하되 MySQL에는 누출하지 않는다.
+
+스윕은 별도 축약 추천기를 쓰지 않는다. 각 단어 위치에 실제 cursor marker를 넣고
+프로덕션과 같은 `query_completion_suggestions_with_data(..., true, ...)` 진입점을
+DB 종류와 file-scoped metadata로 호출한다. 따라서 테스트 흐름을 따로 수정할 필요가
+없었고, 실패를 재현한 개별 테스트도 같은 production completion helper를 사용한다.
+
+## 17-5. IntelliSense 보고서 결과
+
+| 보고서 | checked | missing |
+| --- | ---: | ---: |
+| `test/oracle_format_final_boss_3.sql.out` | 375 | 0 |
+| `test_mysql/test8.txt.out` | 512 | 0 |
+| `test_mariadb/test13.txt.out` | 449 | 0 |
+
+통합 ignored 테스트
+`intellisense_sweep_generate_report_for_file_certifies_new_final_boss_queries`는 이전
+final-boss 3개와 이번 3개, 총 6개 모두를 `fail_on_missing=true`로 검사한다.
+실제 추천 가능한 누락은 0건이다.
+
+## 17-6. 100만 줄 성능 계약
+
+새 로직은 full document 재스캔을 completion 후보별로 반복하지 않는다. CTE/window
+declaration용 괄호 짝은 token span당 한 번 O(n)으로 만들고, exact nested grammar는
+이미 bounded된 local/statement token slice만 본다. 다음 100만 줄 초과 production
+회귀 4종으로 parse window, completion index, edit/undo delta, highlighting refresh가
+bounded fast path를 유지하는지 함께 검증한다.
+
+- `million_line_oracle_plsql_completion_window_stays_hard_capped`
+- `million_line_production_completion_index_uses_the_bounded_fast_path`
+- `million_line_production_undo_records_a_small_delta_and_shares_untouched_chunks`
+- `million_line_production_shadow_edit_and_semantic_refresh_stay_bounded`
+
+## 17-7. 최종 품질 게이트 결과
+
+| 검증 | 결과 |
+| --- | --- |
+| formatter CTE body-indent 최소 회귀 | 1 통과, 실패 0 |
+| 6개 final-boss 통합 IntelliSense 스윕 | 1 통과, 실패 0, 198.81초 |
+| 100만 줄 초과 production 성능 회귀 | 4 통과, 실패 0, 0.14초 |
+| 최종 전체 포맷 스윕 | 1 통과, 실패 0, 59개·34,382줄 |
+| 수동 판독본/최종 재생성본 aggregate SHA-1 | 양쪽 모두 `14dfa65cbfef6ab813e92b995d83472c505783eb` |
+| formatter error marker 검색 | 0건 |
+| 정확한 `cargo test` | lib 6,479 통과·225 ignored, 모든 binary/integration/guard/doc-test 포함 실패 0 |
+| 정확한 `cargo clippy -- -D warnings -W clippy::perf -W clippy::complexity` | 통과, 오류·경고 0 |
+| `cargo fmt --all -- --check` | 통과 |
+
+
+| `git diff --check` | 통과 |
+
+## 17-8. 결론
+
+신규 세 쿼리는 원본과 자동 포맷 결과가 모두 실제 대상 DB에서 실행되고 자체 검산을
+통과했다. 신규 formatter 결함은 재현 테스트를 먼저 추가한 뒤 owning frame의 고정
+`body_indent` 복귀로 수정했고, 59개 산출물 34,382줄을 직접 전수 판독한 최종본과
+재생성본이 byte-level aggregate hash까지 같다. IntelliSense 스윕은 production
+completion 흐름에서 신규 세 파일 총 1,336개 토큰을 검사해 누락 0이며, 전체 테스트와
+엄격한 clippy에도 오류나 경고가 남지 않았다.
+
+
+# 18. 11차 검증 회차 (2026-07-15): MySQL/MariaDB Final Boss VI와 재발 방지
+
+## 18-1. 신규 실행 가능 단일 문장 fixture
+
+기존 final-boss가 지나지 않던 문법을 한 문장 안에서 함께 검증하도록, 반복 실행해도
+부작용이 없는 `WITH ... SELECT` fixture를 MySQL과 MariaDB에 각각 추가했다.
+
+| DB | 파일 | 원본 줄 수 | 핵심 조합 |
+| --- | --- | ---: | --- |
+| MySQL 8.0 | `test_mysql/test9.txt` | 221 | 재귀 CTE, 중첩 `JSON_TABLE`, `JSON_VALUE ... RETURNING/DEFAULT`, `LATERAL`, inherited named window, `ROLLUP`, `INTERSECT`/`EXCEPT`, `MEMBER OF`, 다중 scalar/list frame |
+| MariaDB 12.2 | `test_mariadb/test14.txt` | 213 | 재귀 `CYCLE`, 중첩 `JSON_TABLE`, dynamic column, `INET6`, percentile window, ordered/limited aggregate, `INTERSECT ALL`/`EXCEPT ALL`, 다중 scalar/list frame |
+
+두 문장은 마지막 `CASE`가 중간 집계와 집합 연산 결과를 다시 검산한다. 원본과 자동
+포맷 결과를 MySQL 8.0.46 및 MariaDB 12.2.2 컨테이너에서 각각 실행했으며 모두
+exit code 0, 반환 4행의 `status = 'PASS'`를 확인했다.
+
+파일별 IntelliSense 보고서도 함께 추가했다.
+
+| 보고서 | checked | missing |
+| --- | ---: | ---: |
+| `test_mysql/test9.txt.out` | 566 | 0 |
+| `test_mariadb/test14.txt.out` | 572 | 0 |
+
+## 18-2. 포매터 AS-IS / TO-BE: aggregate 내부 `LIMIT`의 owning frame
+
+전체 포맷 결과를 직접 읽는 과정에서 자동 PASS가 놓친 MariaDB aggregate 내부 절의
+상대 깊이 오류를 발견했다. 일반 query의 `LIMIT` clause depth를 그대로 적용해 함수
+호출 괄호가 소유한 body보다 바깥으로 빠지는 문제였다.
+
+AS-IS:
+
+```sql
+GROUP_CONCAT(DISTINCT f.source_code ORDER BY f.source_code SEPARATOR ','
+LIMIT 4) AS source_list,
+JSON_ARRAYAGG(JSON_OBJECT('execution', f.execution_id) ORDER BY f.execution_id
+LIMIT 10) AS execution_json
+```
+
+TO-BE:
+
+```sql
+GROUP_CONCAT(DISTINCT f.source_code ORDER BY f.source_code SEPARATOR ','
+    LIMIT 4) AS source_list,
+JSON_ARRAYAGG(JSON_OBJECT('execution', f.execution_id) ORDER BY f.execution_id
+    LIMIT 10) AS execution_json
+```
+
+근본 수정은 키워드별 보정이 아니라 frame 계약으로 구현했다.
+
+- ordinary expression/call paren 안의 clause header는 기존 clause depth와 소유 frame의
+  고정 `body_indent` 중 더 깊은 값을 사용한다.
+- query-like paren과 column-list paren은 기존 전용 layout을 유지한다.
+- frame audit에 `ContainedClause` 이벤트를 추가해, 괄호 내부 clause가 소유 frame의
+  body보다 얕아지면 스윕이 실패하도록 했다.
+- `format_for_auto_formatting_mariadb_keeps_aggregate_limit_inside_owner_frame`가
+  `GROUP_CONCAT`/`JSON_ARRAYAGG`와 두 번 포맷한 멱등성을 고정한다.
+
+이 수정으로 바뀐 포맷 SQL은 MariaDB `test9.txt`, `test13.txt`, `test14.txt`의 aggregate
+`LIMIT` 7곳뿐이다. 나머지 58개 결과의 SQL body는 이전 검토본과 byte 단위로 같았다.
+변경된 `test13.txt` 포맷본도 MariaDB 12.2.2에서 재실행해 4행 모두 `PASS`를 확인했다.
+
+## 18-3. IntelliSense AS-IS / TO-BE와 production 경로 일치
+
+최초 전체 스윕에서 실제 추천 가능한 누락을 정확한 fixture 위치의 회귀 테스트로 먼저
+고정했다. 대표 사례는 다음과 같다.
+
+AS-IS:
+
+```sql
+-- MySQL: 고정 연산자 tail 누락
+COALESCE('critical' MEMBER O| (JSON_ARRAY('critical')), FALSE)
+-- suggestions: []
+
+-- Oracle: indexed collection의 record field scope 소실
+l_rows(i).REMA|;
+-- REMARK 없음
+
+-- Oracle: 먼 이전 SELECT가 현재 cursor 선언을 오염
+CURSOR c_src I| SELECT ...
+-- suggestions: INTERSECT, INTO
+
+-- Oracle: 실행 MERGE의 typed keyword 누락
+WHEN MATC| THEN
+-- suggestions: []
+```
+
+TO-BE:
+
+```sql
+COALESCE('critical' MEMBER OF (JSON_ARRAY('critical')), FALSE)
+l_rows(i).REMARK;
+CURSOR c_src IS SELECT ...
+WHEN MATCHED THEN
+```
+
+production `completion.rs`와 local symbol 경로를 다음 범위에서 수정했다.
+
+- MySQL에만 `MEMBER -> OF`를 열고 MariaDB와 Oracle의 기존 문법을 분리했다.
+- nested `WITH`/`SELECT`, `CASE`/exception `WHEN`, `FORALL`, `GOTO`, `SELECT INTO`,
+  `REPLACE INTO`, `CONNECT_BY_ISCYCLE`, named `END`의 typed structural anchor를 보강했다.
+- indexed qualifier `l_rows(i).field`, 앞쪽에서 선언되는 outer relation alias,
+  `SYS.ODCINUMBERLIST`의 `COLUMN_VALUE`, quoted `COMMENT ON COLUMN`을 bounded text와
+  file-scoped metadata로 복원했다.
+- record field 이름에서는 문맥 키워드인 `REMARK`도 declaration identifier로 인정하되,
+  PL/SQL 비타입 키워드는 계속 제외한다.
+- 관계/컬럼 후보 merge는 typed table/column 문맥으로 제한하고 MySQL maintenance
+  statement, Oracle privilege list, `EXTRACT(` argument frame에는 누출하지 않는다.
+
+스윕 테스트도 production과 같은 흐름으로 바꿨다. 파일 전체 문자열을 매번 새로 만드는
+대신 실제 편집과 같은 최소 `ChunkedText` splice를 적용하고, production worker가 쓰는
+`compute_intellisense_suggestions`에 동일한 expanded statement와 analysis를 전달한다.
+또한 production UI가 팝업을 억제하는 string/q-quote/comment 위치는 스윕도 같은 lexical
+mode로 제외한다. 따라서 동적 SQL 문자열의 `WHEN MATCHED`는 false miss가 아니며, 실제
+실행 SQL의 같은 토큰은 계속 검사된다.
+
+모든 새 fallback은 4 KiB look-behind와 2 KiB look-ahead 또는 이미 bounded된 statement
+token slice만 사용한다. 100만 줄 초과 회귀 5종이 0.28초에 통과해 전체 문서 길이에
+비례하는 completion 후보별 재스캔이 없음을 확인했다.
+
+## 18-4. 전체 스윕 및 수동 판독 결과
+
+정확한 명령
+`cargo test --lib formatting_sweep_all_files_generate_out_report -- --ignored --nocapture`로
+최종 산출물을 만든 뒤 `target/format-sweep`의 모든 `.format.out`을 자동 PASS와 무관하게
+처음부터 끝까지 다시 읽었다.
+
+| 항목 | 결과 |
+| --- | ---: |
+| 전체 `.format.out` | 61개 |
+| 직접 검토한 전체 report 줄 | 33,220줄 |
+| footer 제외 포맷 SQL 줄 | 23,319줄 |
+| PASS / issues 0 | 61 / 61 |
+| 검사 frame / body item / close | 8,385 / 715 / 1,519 |
+| 실제 상대 depth 수정 | aggregate `LIMIT` 7곳 |
+| comma sibling body-depth 위반 | 0건 |
+| same-paren top-level body-depth 위반 | 0건 |
+| close-indent 및 parent body 복귀 위반 | 0건 |
+
+최종 production 경로 IntelliSense 전수 스윕은 Oracle/MySQL/MariaDB 61파일에서
+49,742개 토큰을 검사했으며 missing 0이었다. 최종 재실행 시간은 477.44초다.
+
+## 18-5. 최종 품질 게이트
+
+| 검증 | 결과 |
+| --- | --- |
+| 신규 MySQL/MariaDB 원본·포맷본 실서버 실행 | 각각 4행 PASS, exit code 0 |
+| 기존 MariaDB `test13` 수정 포맷본 실서버 재실행 | 4행 PASS, exit code 0 |
+| 100만 줄 초과 production 성능 회귀 | 5 통과, 실패 0, 0.28초 |
+| 정확한 전체 포맷 스윕 | 1 통과, 실패 0, 61개·33,220줄 |
+| 최종 전체 IntelliSense 스윕 | 1 통과, 61개·49,742 checked·missing 0 |
+| 8개 final-boss `intellisense_sweep_generate_report_for_file` 통합 인증 | 1 통과, 실패 0, 52.99초 |
+| 정확한 `cargo test` | lib 6,513 통과·228 ignored, 모든 binary/integration/guard/doc-test 실패 0 |
+| `cargo clippy --locked --all-targets -- -D warnings -W clippy::perf -W clippy::complexity` | 통과, 오류·경고 0 |
+| `cargo fmt --all -- --check` | 통과 |
+
+## 18-6. 결론
+
+신규 두 final-boss 쿼리와 포맷본은 실제 대상 DB에서 실행 가능하고 자체 검산을
+통과했다. 포매터 문제는 특정 `LIMIT` 예외가 아니라 owning frame의 최소 body depth와
+audit 계약으로 고쳤으며, IntelliSense는 production과 같은 snapshot/analysis/completion
+경로 및 같은 literal/comment 억제 규칙으로 검사한다. 전체 리포트 수동 판독, 100만 줄
+성능 회귀, 전체 Rust 테스트와 엄격한 Clippy까지 최종 오류와 경고가 남지 않았다.
+
+# 19. 12차 검증 회차 (2026-07-15): 동일 frame 자식 owner+1 및 frame 완전성 감사
+
+## 19-1. 자동 포맷 depth 계약
+
+이번 수정은 첫 자식의 기존 출력에서 나머지 자식의 depth를 소급해 정하는 방식이 아니다.
+frame을 만드는 시점에 다음 계약을 먼저 고정한다.
+
+- owner가 depth `d`이면 frame body는 처음부터 `d + 1`이다.
+- 첫 자식이 owner와 같은 줄에 남는 compact 표현은 허용한다.
+- 첫 자식이 줄 시작 위치로 내려가면 첫 자식과 모든 직접 sibling은 `d + 1`이다.
+- `AND`/`OR`와 쉼표 뒤의 직접 자식도 같은 body depth를 사용한다.
+- 괄호와 블록처럼 명시적인 시작/종료가 있는 frame의 종료 구문은 시작 owner와 같은
+  depth `d`다. 한 줄 안에서 닫히는 compact frame에는 줄 시작 close 규칙을 적용하지 않는다.
+- `CREATE OR REPLACE`, `BETWEEN ... AND ...`, trigger event의 `OR`처럼 문법상 하나인 고정
+  구문은 sibling 목록으로 해석하지 않는다.
+
+따라서 다음과 같이 첫 조건까지 개행되는 경우에도 자식 정렬이 일관된다.
+
+AS-IS:
+
+```sql
+WHERE
+condition_a
+    AND condition_b
+    OR condition_c
+```
+
+TO-BE:
+
+```sql
+WHERE
+    condition_a
+    AND condition_b
+    OR condition_c
+```
+
+자식 전체가 owner와 같은 줄에 유지되는 다음 compact 표현은 그대로 허용한다.
+
+```sql
+WHERE condition_a
+LISTAGG(value, ',') WITHIN GROUP (ORDER BY key_a, key_b)
+```
+
+## 19-2. 조건 frame 전수 범위
+
+Oracle, MySQL, MariaDB별 fixture와 독립 syntax inventory에서 다음 조건 owner를 typed
+condition frame으로 검사한다.
+
+- 공통 query 조건: `WHERE`, `JOIN ... ON`, `HAVING`, non-CASE `WHEN`
+- 제어/반복 조건: `IF`, `ELSIF`, `WHILE`, `UNTIL`
+- Oracle 계열: `START WITH`, `CONNECT BY`, `QUALIFY`, `MATCH_RECOGNIZE ... DEFINE`,
+  conditional compilation의 `$IF`/`$ELSIF`
+- CASE 조건은 기존 CASE branch frame과 결합하고, `BETWEEN ... AND ...` 및 고정 phrase는
+  조건 sibling audit에서 제외한다.
+
+멀티라인 condition frame의 첫 줄 시작 자식과 이후 `AND`/`OR` sibling은 모두 frame을
+생성할 때 정한 owner+1을 사용한다.
+
+## 19-3. 여러 자식을 갖는 list frame 전수 범위
+
+쉼표가 나타나는 위치만 사후 보정하지 않고, 여러 직접 자식을 소유하는 구문을 다음 typed
+list frame 40종으로 분류했다.
+
+- query/list: `SELECT`, `FROM`, `SET`, `VALUES`, `GROUP BY`, `ORDER BY`, `WINDOW`,
+  `INTO`, `WITH`, `USING`, `RETURNING`
+- analytic/model/pattern: `PARTITION`, `DIMENSION`, `MEASURES`, model rules, `DEFINE`,
+  `SUBSET`, `SEARCH BY`, `CYCLE` columns
+- 괄호형 semantic list: 일반 직접 인자/식 목록, structured table arguments,
+  `JSON_TABLE`/`XMLTABLE` columns, `PIVOT` aggregates, structured column declarations
+- DML/DDL: delete/update targets, `FOR UPDATE OF`, trigger `UPDATE OF`, drop targets,
+  rename pairs, `ALTER` actions
+- 권한/관리: grant/revoke privileges와 grantees, lock tables, maintenance tables,
+  account targets, flashback targets
+- routine/vendor: handler conditions, diagnostics items, `DECLARE` names, `DO` expressions,
+  trigger `FOLLOWS`/`PRECEDES`
+
+예를 들어 compact 표현은 유지하되, 실제 줄 시작 자식은 owner+1로 정렬한다.
+
+```sql
+LISTAGG(value, ',') WITHIN GROUP (ORDER BY key_a, key_b)
+
+MAX(value) KEEP (
+    DENSE_RANK LAST ORDER BY (
+        SELECT sort_key
+        FROM source_table
+    ),
+        second_sort_key
+)
+```
+
+`WITH`의 sibling CTE, `COLUMNS`의 column 정의, MODEL/MATCH_RECOGNIZE section의 항목도
+같은 규칙을 사용한다. 세미콜론으로 연결되는 block statement, query set branch,
+`MERGE` branch, cursor SQL, `FORALL`, handler/control body, `INSERT ALL` 등은 쉼표 list가
+아니므로 기존 structural frame으로 관리하고 frame-kind inventory와 각 전용 레이아웃
+회귀로 검증한다.
+
+## 19-4. frame lifecycle 및 자동 이상 감지
+
+`formatting_sweep_all_files_generate_out_report`를 단순 멱등성/토큰 보존 검사에서 frame
+구조 감사까지 확장했다.
+
+- frame ID 중복, opener 없는 close, 중복 close, close-before-open, 명시적 frame 미종료
+- parent 누락/비포함, parent보다 늦게 닫히는 child
+- 줄 시작 첫 자식과 모든 직접 sibling의 body-depth 불일치
+- `AND`/`OR` 조건 sibling 및 쉼표 sibling의 owner 누락
+- semantic list와 일반 parenthesis direct-list의 typed ownership 누락
+- 줄 시작 괄호 close와 block/conditional-compilation 종료의 owner-depth 불일치
+- leading comment가 있는 첫 list item, multiline 첫 condition, nested frame 복귀 시 depth drift
+- production managed-frame enum 17종과 typed-list enum 40종이 테스트 inventory에서 모두
+  실제 생성되는지 확인
+
+이 감사의 핵심은 “모든 토큰을 list frame으로 만든다”가 아니다. 여러 직접 자식의 경계를
+가진 구문은 list/condition/structural frame 중 하나가 반드시 소유하고, `OR REPLACE` 같은
+단일 문법 phrase와 scalar token은 잘못된 자식 frame으로 만들지 않는 것이다.
+
+## 19-5. 전체 sweep 및 품질 게이트
+
+Oracle `test`, MySQL `test_mysql`, MariaDB `test_mariadb` 아래 모든 SQL/TXT fixture를
+다시 생성하고 감사했다.
+
+| 항목 | 결과 |
+| --- | ---: |
+| 전체 fixture | 61개 |
+| 검사 frame | 18,346개 |
+| 줄 시작 body item/sibling | 7,190개 |
+| 검사 close | 9,660개 |
+| production managed-frame kind | 17 / 17 |
+| typed list-owner kind 독립 inventory | 40 / 40 |
+| 실패 파일 / frame issue | 0 / 0 |
+
+최종 검증 결과는 다음과 같다.
+
+| 검증 | 결과 |
+| --- | --- |
+| `formatting_sweep_all_files_generate_out_report` | 1 통과, 61개 파일·issue 0 |
+| `cargo test --lib` | 6,532 통과·228 ignored·실패 0 |
+| 전체 `cargo test` | 모든 lib/binary/integration/guard/doc-test 실패 0 |
+| `cargo clippy --locked --all-targets -- -D warnings -W clippy::perf -W clippy::complexity` | 통과, 경고 0 |
+
+## 32-1. [수정] 포맷 결과의 MySQL/MariaDB 실행 가능성 보존
+
+사용자 추가 요구에 따라 66개 포맷 결과를 실제 DB에서도 실행했다. 이 검증에서
+31-4의 "tool-command canonical 렌더링이므로 세미콜론 제거 유지" 판단이 포맷
+산출물에는 맞지 않음을 확인했다. 앱 내부 실행기는 명령 단위로 이미 분리된
+`ToolCommand`를 실행하지만, `.format.out`을 공식 CLI에 넣으면 서버 SQL은 문장
+종결자가 필요하다.
+
+### AS-IS
+
+```sql
+DESCRIBE statement_log
+
+EXPLAIN FORMAT = TREE
+SELECT ...;
+
+SHOW PROCESSLIST
+
+SHOW WARNINGS
+
+SET AUTOCOMMIT OFF
+
+INSERT INTO ...;
+
+DROP USER IF EXISTS 'sq_mysql_final_user' @ 'localhost';
+```
+
+- `DESCRIBE` 다음의 `EXPLAIN`이 한 문장으로 합쳐져 MySQL 1064 오류가 발생했다.
+- 첫 오류를 고친 뒤에는 MySQL 계정 문법의 `'user'@'host'`가
+  `'user' @ 'host'`로 벌어진 두 번째 1064 오류가 드러났다.
+- 같은 종결자 손실이 `SHOW CREATE TABLE`, `SHOW PROCESSLIST`,
+  `SHOW WARNINGS`, `SHOW ERRORS`, MariaDB `SET AUTOCOMMIT`에도 있었다.
+
+### TO-BE
+
+```sql
+DESCRIBE statement_log;
+
+EXPLAIN FORMAT = TREE
+SELECT ...;
+
+SHOW PROCESSLIST;
+
+SHOW WARNINGS;
+
+SET AUTOCOMMIT = 0;
+
+INSERT INTO ...;
+
+DROP USER IF EXISTS 'sq_mysql_final_user'@'localhost';
+```
+
+`format_tool_command_for_document`를 추가해 포맷 문서 렌더링과 기존 실행기용
+`format_tool_command`를 분리했다. 구체적인 `DatabaseType`을 UI에서 직접
+분기하지 않고 백엔드의 `supports_mysql_delimiter_commands` capability로 정책을
+선택한다.
+
+모든 `ToolCommand`에 일괄적으로 `;`를 붙이지는 않는다. `DELIMITER $$;`는
+구분자 자체를 `$$;`로 바꾸며, `SOURCE file.sql;`/`@script.sql;`은 세미콜론이
+경로에 포함될 수 있다. Oracle SQL*Plus의 `SPOOL`, `PROMPT`, `VARIABLE`,
+`SET SERVEROUTPUT`도 서버 SQL이 아닌 클라이언트 명령이다. 따라서 다음과 같이
+의미로 구분한다.
+
+- MySQL 계열 서버 SQL: `USE`, `DESCRIBE`, 지원되는 `SHOW` 명령군,
+  `SET AUTOCOMMIT` — 실행 가능한 `;` 종결 형태로 렌더링.
+- MySQL/Oracle 클라이언트 메타 명령: `DELIMITER`, `SOURCE`, SQL*Plus 명령군 —
+  기존 명령 문법 유지.
+- MySQL 계정의 인용된 `user@host` 구분자는 공백 없이 렌더링하되,
+  `SET @value`/`USING @value` 사용자 변수 앞 공백은 유지.
+
+## 32-2. sweep 일반 검출과 회귀 고정
+
+`ExecutableBoundary` 감사를 추가했다. 특정 파일이나 행 번호가 아니라 다음
+문법군 전체를 검사한다.
+
+1. MySQL 계열 서버 `ToolCommand` 출력 줄의 문장 종결자 누락.
+2. 인용된 MySQL 계정의 `user@host` 토큰 사이에 생긴 공백.
+
+MySQL/MariaDB 내장 회귀 2개와 단위 테스트 4개를 추가했다. 회귀에는
+`DESCRIBE` 뒤 인접 `EXPLAIN`, 여러 `SHOW`, `SET AUTOCOMMIT`, 계정 표기와 함께
+`SET @value`/`SELECT @value` 반대 사례도 포함해 계정 수정이 사용자 변수까지
+붙이지 못하게 했다.
+
+## 32-3. 최종 전수 검토 및 실행 검증
+
+| 검증 | 결과 |
+| --- | --- |
+| 포맷 결과 육안 검토 | 66개 · 53,361줄을 각 파일 1행부터 EOF까지 검토, 잔여 오류 0 |
+| 수정 산출물 재검토 | 변경된 4개 파일 6,669줄 전체 재검토, 후속 계정 diff 2개 파일의 변경 문맥 재확인 |
+| 최종 formatting sweep | 66개 파일 + 내장 회귀 32개, 30,129 frames, 60,928 boundaries, 15,155 closes, failures 0 |
+| Oracle 실행 | 42/42 PASS — Space Query Thin 실행 경로; 최종 Oracle 출력은 수정 전과 바이트 동일 |
+| MySQL 실행 | 11/11 PASS — MySQL 8.0 공식 CLI, 새 검증 DB에서 전 파일 실행 |
+| MariaDB 실행 | 13/13 PASS — MariaDB 12.2 공식 CLI, 새 검증 DB에서 전 파일 실행 |
+| `cargo test` | 통과 — 전 타깃 합계 6,785 passed · 0 failed · 238 ignored |
+| `cargo clippy --locked --all-targets -- -D warnings -W clippy::perf -W clippy::complexity` | 통과, 경고 0 |
+| `cargo fmt --all -- --check` | 통과 |
+
+# 20. 스윕 PASS 불신 전제 61개 전수 육안 재검토와 절 depth drift 4건 수정
+
+## 20-1. 검토 방법
+
+- `formatting_sweep_all_files_generate_out_report`로 61개 fixture의 `.format.out`을 생성했다
+  (자동 감사 결과는 전부 PASS).
+- PASS를 신뢰하지 않고 61개 파일 33,626줄(포맷된 SQL 23,568줄 + 리포트 footer)을 처음부터
+  끝까지 육안으로 읽고, 각 줄의 depth를 `docs/auto_format_rule.md`의 frame 계약
+  (owner+1 고정 depth, sibling 단일 body depth, close=owner depth, drift 금지)과 대조했다.
+- 의심 지점은 `SPACE_QUERY_FORMAT_SWEEP_FILE` 프로브로 최소 재현을 만들어 실제 위반 여부를
+  확정했다. 자동 감사가 절(clause) header의 depth는 검사하지 않기 때문에 아래 4건은 모두
+  status PASS 상태에서 육안으로만 발견됐다.
+
+## 20-2. 여러 줄 join ON 조건 뒤 `ON DUPLICATE KEY UPDATE` depth (test_mariadb/test6)
+
+`INSERT ... SELECT`의 마지막 JOIN이 여러 줄 `ON` 조건으로 끝나면, 그 다음의
+`ON DUPLICATE KEY UPDATE`가 INSERT 문의 절이 아니라 join ON처럼 JoinBody depth에 붙었다.
+
+AS-IS:
+
+```sql
+    ) tc
+        ON
+            tc.month_key = b.month_key
+            AND tc.region_id = b.region_id
+        ON DUPLICATE KEY UPDATE orders_cnt = VALUES(orders_cnt),
+            customers_cnt = VALUES(customers_cnt),
+```
+
+TO-BE:
+
+```sql
+    ) tc
+        ON
+            tc.month_key = b.month_key
+            AND tc.region_id = b.region_id
+    ON DUPLICATE KEY UPDATE orders_cnt = VALUES(orders_cnt),
+        customers_cnt = VALUES(customers_cnt),
+```
+
+`ON DUPLICATE KEY UPDATE`의 `ON`을 `starts_mysql_on_duplicate_key_update_clause`로 판별해
+(1) `WHERE`/`GROUP` 등과 같은 clause 경계로 취급해 JoinBody scoped indent를 비활성화하고
+(2) join-ON depth 재사용 분기에서 제외했다. VALUES(col) 함수 처리와 assignment sibling
+depth(+1)는 기존 동작을 유지한다.
+
+추가 회귀 테스트:
+`format_sql_basic_for_mysql_db_type_keeps_on_duplicate_clause_depth_after_multiline_join_on`
+
+## 20-3. WITH 본문 query에서 함수로 감싼 window item 뒤 `FROM` drift (test_mariadb/test6)
+
+WITH 문의 main query에서 `ROUND( ... OVER (...) ... )`처럼 일반 함수 괄호 안에 analytic
+window가 들어간 select item 이후, 다음 절 header가 그 괄호 안 깊이를 상속했다.
+
+AS-IS:
+
+```sql
+    DENSE_RANK() OVER (
+        PARTITION BY month_key
+        ORDER BY net_sales DESC,
+            segment
+    ) AS month_rank
+            FROM monthly
+```
+
+TO-BE:
+
+```sql
+    DENSE_RANK() OVER (
+        PARTITION BY month_key
+        ORDER BY net_sales DESC,
+            segment
+    ) AS month_rank
+FROM monthly
+```
+
+원인은 “WITH 문 SELECT 절의 쉼표는 select-list layout 상태를 재고정한다”는 분기가 함수
+인자 쉼표(`ROUND(..., 2)`의 쉼표)에도 발동해, statement 레벨 select-list 상태를 중첩 괄호
+깊이로 덮어쓴 것이다. 이 분기를 열려 있는 모든 괄호가 query-like frame일 때
+(`all_paren_frames_are_query_like`)로 제한해, 일반 괄호 안 쉼표는 그 괄호의 list frame이
+소유하도록 했다.
+
+추가 회귀 테스트:
+`format_sql_basic_for_mysql_db_type_returns_from_clause_to_query_depth_after_wrapped_window_item`
+
+## 20-4. MariaDB `SET STATEMENT ... FOR` 래핑 query의 절 depth 분열 (test_mariadb/test9)
+
+래핑된 query의 `SELECT`/`FROM`은 SET 할당식 depth(+2)를 상속하고 `GROUP BY`부터는 depth 0으로
+떨어져, 한 문장 안에서 절 depth가 갈라졌다.
+
+AS-IS:
+
+```sql
+SET STATEMENT max_statement_time = 5 FOR
+        SELECT account_id,
+            COUNT(*) event_count,
+            ROUND(SUM(amount), 2) total_amount
+        FROM mf_event
+GROUP BY account_id
+HAVING COUNT(*) >= 1
+```
+
+TO-BE:
+
+```sql
+SET STATEMENT max_statement_time = 5 FOR
+SELECT account_id,
+    COUNT(*) event_count,
+    ROUND(SUM(amount), 2) total_amount
+FROM mf_event
+GROUP BY account_id
+HAVING COUNT(*) >= 1
+```
+
+`SET STATEMENT <assignments> FOR`의 `FOR`에서 SET 할당의 AssignmentValue frame과 Set list
+owner를 정리하고 clause 상태를 초기화해, 래핑된 문장이 새 statement 문맥(depth 0)에서
+시작하도록 했다. 모든 절이 같은 depth를 공유한다.
+
+추가 회귀 테스트:
+`format_sql_basic_for_mysql_db_type_keeps_set_statement_for_query_clauses_on_one_depth`
+
+## 20-5. 확장형 SELECT에서 `DISTINCT` modifier 분리 (test_mariadb/test14)
+
+select list가 확장(줄바꿈) 스타일로 렌더링될 때 `DISTINCT`가 owner header에서 떨어져 첫
+item 줄로 내려갔다. 계약상 owner modifier는 owner header에 남아야 한다
+(`WITH RECURSIVE`와 같은 규칙).
+
+AS-IS:
+
+```sql
+        SELECT
+            DISTINCT agent_id,
+            PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY duration_ms) OVER (
+```
+
+TO-BE:
+
+```sql
+        SELECT DISTINCT
+            agent_id,
+            PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY duration_ms) OVER (
+```
+
+확장형 SELECT에서 다음 토큰이 `DISTINCT`/`UNIQUE`/`DISTINCTROW`이면 header 줄바꿈을
+modifier 뒤로 미룬다. 첫 item은 그대로 select-list body depth를 사용한다.
+
+추가 회귀 테스트:
+`format_sql_basic_for_mysql_db_type_keeps_distinct_on_the_expanded_select_header`
+
+## 20-6. 육안 검토에서 확인 후 의도된 동작으로 판정한 항목
+
+- 재귀 CTE의 `SEARCH ... SET` / `CYCLE ... SET` 절이 WITH 키워드 depth에 오는 레이아웃:
+  `format_sql_recursive_cte_search_cycle_*`, `format_sql_recursive_cte_cycle_separator_restores_with_body_indent`
+  등 다수 테스트로 고정된 설계다.
+- `JSON_ARRAYAGG(... RETURNING CLOB)`류 continuation이 “함수 호출이 시작된 줄 depth + 1”에
+  오는 레이아웃: `format_for_auto_formatting_restores_outer_select_clause_after_nested_json_xml_select_item`의
+  expected 출력으로 고정된 설계다.
+- `OUTER APPLY (`의 body가 join 줄 +1에 오는 것: JoinBody typed view가 괄호와 owner edge를
+  공유하는 설계로, 감사 인벤토리와 일치한다.
+
+## 20-7. 전체 sweep 및 품질 게이트
+
+| 항목 | 결과 |
+| --- | ---: |
+| 전체 fixture / 리포트 줄 수(육안 검토 분량) | 61개 / 33,626줄 |
+| 포맷된 SQL 줄 수 | 23,568줄 |
+| 검사 frame / 줄 시작 body item / close | 20,878 / 12,567 / 9,660 |
+| 실패 파일 / frame issue | 0 / 0 |
+| 이번 수정으로 출력이 바뀐 fixture | test_mariadb/test6·test9·test14 (3개, 모두 개선분만) |
+
+| 검증 | 결과 |
+| --- | --- |
+| `formatting_sweep_all_files_generate_out_report` | 통과, 61개 파일·issue 0 |
+| `cargo test --lib` | 6,547 통과·228 ignored·실패 0 (회귀 테스트 4건 추가) |
+| 전체 `cargo test` | 모든 lib/binary/integration/guard 실패 0 |
+| `cargo clippy --locked --all-targets -- -D warnings -W clippy::perf -W clippy::complexity` | 통과, 경고 0 |
+| `cargo fmt --all -- --check` | 통과 |
+
+# 21. PASS 출력 43,695줄 전수 검토와 frame 자동 감사 사각지대 4건 보강
+
+## 21-1. 검토 범위와 판정 기준
+
+- `cargo test --lib formatting_sweep_all_files_generate_out_report -- --ignored --nocapture`로
+  Oracle 41개, MySQL 9개, MariaDB 11개 등 `.format.out` 61개를 생성했다.
+- 자동 PASS를 판정 근거로 사용하지 않고 리포트 footer를 포함한 43,695줄을 처음부터 끝까지
+  육안 검토했다. 각 줄은 `docs/auto_format_rule.md`의 문법 소유권, owner+1 body depth,
+  sibling 동일 depth, close 후 외부 depth 복구, 주석 비구조 규칙과 대조했다.
+- 1차 육안 검토에서 PASS가 놓친 4개 원인을 찾았다. 수정 후 전체 sweep을 다시 생성하고,
+  네 변경 계열의 모든 출력 지점(함수-local `RETURNING`, 조건부 컴파일, 세미콜론 후행 주석,
+  standalone routine header/body)을 재검토했다.
+
+## 21-2. `JSON_VALUE` 함수-local `RETURNING` option depth
+
+중첩 함수 또는 CTE SELECT item의 `JSON_VALUE`에서 path 다음 줄의 `RETURNING`이 활성 함수
+괄호 body가 아니라 현재 렌더링 줄에서 한 단계 더 내려가는 경우가 있었다.
+
+AS-IS:
+
+```sql
+JSON_VALUE (e.json_profile,
+    '$.level'
+        RETURNING VARCHAR2 (30)) AS profile_level,
+JSON_VALUE (e.json_profile,
+    '$.flags.remote'
+    RETURNING VARCHAR2 (10)) AS remote_flag
+```
+
+TO-BE:
+
+```sql
+JSON_VALUE (e.json_profile,
+    '$.level'
+    RETURNING VARCHAR2 (30)) AS profile_level,
+JSON_VALUE (e.json_profile,
+    '$.flags.remote'
+    RETURNING VARCHAR2 (10)) AS remote_flag
+```
+
+원인은 SELECT 안 함수-local `RETURNING` depth를 `현재 렌더링 줄 depth + 1`로 계산한 것이다.
+이 값을 활성 non-query paren frame의 `sibling_body_indent()`로 바꿨다. 따라서 바깥 `CAST`,
+CTE, SELECT depth와 무관하게 path/option sibling이 같은 함수 body depth를 사용한다.
+
+자동 감사에는 `parenthesized RETURNING option` 문법 예상 depth 이벤트를 추가했다. 기존에는
+괄호의 comma sibling과 close만 검사했으므로 comma가 없는 option line은 검사 대상이 아니었다.
+
+추가 회귀 테스트:
+
+- `formatting_sweep_audits_function_local_returning_option_depth` (Oracle/MySQL)
+
+## 21-3. Oracle conditional compilation `$ELSE` branch의 call frame
+
+`$THEN` branch의 다중 인자 호출은 정상이나 `$ELSE` branch에서 같은 호출의 두 번째 이후
+인자가 call paren depth를 잃었다.
+
+AS-IS:
+
+```sql
+$ELSE
+    AUDIT ('qt_torture_pkg',
+    'complex_block.ccflag',
+    'conditional-compilation=false');
+```
+
+TO-BE:
+
+```sql
+$ELSE
+    AUDIT ('qt_torture_pkg',
+        'complex_block.ccflag',
+        'conditional-compilation=false');
+```
+
+conditional-compilation frame은 별도 vector에서 branch body depth를 제공했지만, 자식 frame의
+문법 parent를 고르는 `nearest_child_owner_frame()`은 주 `FormatFrameStack::frames`만 검색했다.
+`$THEN` 직후에는 우연히 condition-owner frame이 남아 정상 depth를 제공했지만 `$ELSE`에서는
+그 frame이 없어 바깥 PL/SQL block을 parent로 선택했다.
+
+활성 conditional branch를 자식 owner 후보에 포함하고, 같은 depth에서는 더 구체적인 주 stack
+frame을 우선하도록 했다. 테스트 감사에서는 conditional body 직계 호출 paren의 예상 depth를
+branch body+1로 독립 기록하므로, 잘못된 parent를 다시 선택하면 frame 자체가 내부적으로
+일관돼도 검출된다.
+
+추가 회귀 테스트:
+
+- `formatting_sweep_audits_conditional_branch_call_argument_depth`
+
+## 21-4. 닫힌 호출의 후행 주석 뒤 statement sibling depth
+
+세미콜론 뒤에 `--` 후행 주석이 있으면 newline 처리를 주석 token에 미루면서, 닫힌 호출의
+마지막 인자 depth가 다음 PL/SQL statement에 남았다.
+
+AS-IS:
+
+```sql
+BEGIN
+    oqt_pkg.p_basic (7,
+        p_out_txt => v_out,
+        p_inout_n => v_inout); -- p_in_txt omitted
+        DBMS_OUTPUT.PUT_LINE ('[default] ...');
+END;
+```
+
+TO-BE:
+
+```sql
+BEGIN
+    oqt_pkg.p_basic (7,
+        p_out_txt => v_out,
+        p_inout_n => v_inout); -- p_in_txt omitted
+    DBMS_OUTPUT.PUT_LINE ('[default] ...');
+END;
+```
+
+세미콜론에서 다음 token이 inline comment이면 물리 newline을 즉시 출력하지 않는 기존 동작은
+유지하되, 논리 `line_indent`는 닫힌 frame이 제거된 `base_indent`로 즉시 복구한다. 다음 token이
+`BEGIN`, `END`, `ELSE`, `EXCEPTION`, `$ELSE`, `$END` 같은 구조 경계이면 각 경계 전용 로직이
+소유 depth를 정하도록 이 sibling 복구에서 제외했다.
+
+자동 감사에는 후행 주석 다음 일반 statement token의 예상 sibling depth를 기록했다. 기존
+감사는 block의 첫 자식만 검사하고 세미콜론으로 연결된 이후 statement sibling은 기록하지
+않았으므로 이 drift를 보지 못했다.
+
+추가 회귀 테스트:
+
+- `formatting_sweep_audits_statement_sibling_after_trailing_comment`
+
+## 21-5. 여러 줄 standalone routine parameter header 뒤 body depth
+
+Oracle standalone function/procedure의 parameter header가 여러 줄로 확장되면 `) IS` 줄의
+parameter continuation depth가 routine body owner로 사용돼 선언부와 실행부 전체가 한 단계
+깊어졌다.
+
+AS-IS:
+
+```sql
+CREATE OR REPLACE PROCEDURE qt_fb_log_proc (p_module IN VARCHAR2,
+    p_action IN VARCHAR2,
+    p_msg IN CLOB,
+    p_extra IN CLOB DEFAULT NULL) IS
+        PRAGMA AUTONOMOUS_TRANSACTION;
+    BEGIN
+        INSERT INTO qt_fb_audit ...
+    END;
+```
+
+TO-BE:
+
+```sql
+CREATE OR REPLACE PROCEDURE qt_fb_log_proc (p_module IN VARCHAR2,
+    p_action IN VARCHAR2,
+    p_msg IN CLOB,
+    p_extra IN CLOB DEFAULT NULL) IS
+    PRAGMA AUTONOMOUS_TRANSACTION;
+BEGIN
+    INSERT INTO qt_fb_audit ...
+END;
+```
+
+`AS`/`IS`가 standalone `CREATE PROCEDURE/FUNCTION` body를 열 때 렌더링 중인 `line_indent`가
+아니라 현재 구조 stack의 statement base를 routine owner로 사용하도록 했다. package member와
+WITH PL/SQL 선언은 기존 전용 owner 계산을 유지한다.
+
+자동 감사에는 standalone routine의 첫 선언 token은 owner+1, 즉시 `BEGIN`이면 owner depth라는
+문법 예상 이벤트를 추가했다. 기존 block 감사는 잘못된 owner=1, body=2를 함께 등록했으므로
+서로 일관된 잘못을 정상으로 판정했다.
+
+추가 회귀 테스트:
+
+- `formatting_sweep_audits_multiline_standalone_routine_header_close`
+
+## 21-6. 기존 frame 구조 판단 테스트가 네 오류를 검출하지 못한 이유
+
+기존 자동화의 각 계층은 다음 이유로 모두 PASS를 반환했다.
+
+1. first-pass line 감사는 tab, trailing whitespace, 4-space 배수만 검사했다. 네 오류 모두
+   4-space 단위였으므로 통과했다.
+2. idempotence와 whitespace mutation probe는 “같은 token이 같은 canonical 출력으로
+   수렴하는가”를 검사한다. 잘못된 depth도 안정적으로 재생성됐으므로 통과했다.
+3. frame alignment 감사는 등록된 opener, comma/condition sibling, direct body item, close만
+   검사했다. 함수 option과 세미콜론 뒤 statement sibling은 이벤트가 없었다.
+4. conditional call과 routine body는 frame 이벤트가 있었지만, 잘못 계산한 owner depth를
+   expected와 actual 양쪽에 같은 값으로 기록했다. 즉 내부 일관성만 확인하고 문법 parent와의
+   독립 교차 검증이 없었다.
+
+이를 보완하기 위해 `ExpectedIndent` 감사 이벤트를 추가했다. renderer가 선택한 물리 indent와
+별도로 문법 경계에서 예상 depth를 기록해 다음 네 계열을 sweep에서 자동 검출한다.
+
+- parenthesized function option
+- conditional branch의 직계 child paren
+- trailing comment 뒤 statement sibling
+- standalone routine body boundary
+
+`frame_alignment_audit_reports_grammatical_expected_indent_drift`는 인위적인 잘못된 출력이 새
+이벤트에서 실제 `FrameAlignment` issue가 되는지 검증한다.
+
+## 21-7. 전체 sweep 및 품질 게이트
+
+| 항목 | 결과 |
+| --- | ---: |
+| 전체 fixture / 육안 검토 줄 수 | 61개 / 43,695줄 |
+| Oracle / MySQL / MariaDB fixture | 41 / 9 / 11 |
+| 수정한 독립 원인 | 4건 |
+| 검사 frame / 문법·body item / close | 21,071 / 22,780 / 9,709 |
+| managed frame / list-owner kind | 22 / 31 |
+| built-in sweep regression | 26개 |
+| 실패 파일 / frame issue | 0 / 0 |
+
+| 검증 | 결과 |
+| --- | --- |
+| `formatting_sweep_all_files_generate_out_report` | 1 통과, 61개 파일·failure 0 |
+| 추가 frame/format 회귀 테스트 | 5 통과·실패 0 |
+| `cargo test` | lib 6,555 통과·228 ignored, 전체 binary/integration/guard/doc-test 실패 0 |
+| `cargo clippy --locked --all-targets -- -D warnings -W clippy::perf -W clippy::complexity` | 통과, 경고 0 |
+| `cargo fmt --all -- --check` | 통과 |
+
+# 22. 소속 frame 기준 복구와 frame 감사 독립성 보강 (2026-07-16)
+
+## 22-1. 검토 범위와 추가 발견
+
+`cargo test --lib formatting_sweep_all_files_generate_out_report -- --ignored --nocapture`가
+PASS인 상태에서 `target/format-sweep/**/*.format.out` 61개, 43,695줄을 처음부터 끝까지
+수동 판독했다. DB별 범위는 Oracle 41개, MySQL 9개, MariaDB 11개다.
+
+PASS를 신뢰하지 않고 `docs/auto_format_rule.md`의 다음 계약을 직접 대조했다.
+
+- direct child는 소속 frame owner보다 정확히 한 단계 깊어야 한다.
+- 닫힘은 해당 owner와 같은 깊이여야 한다.
+- 렌더링 중 잠시 활성화된 sibling/list 상태를 문법 parent로 사용하지 않는다.
+- typed view/delimiter는 같은 owner edge를 두 번 세지 않는다.
+- 주석은 구조를 바꾸지 않는다.
+
+그 결과 기존 자동 감사에서 놓친 독립 오류 두 계열을 확인했다.
+
+1. Oracle `PIVOT`/`UNPIVOT` body와 닫힘이 소속 owner보다 한 frame 더 깊었다.
+2. `test/test9.txt`의 닫힌 `NVL(...) || CASE`에서 CASE opener만 소속 call frame보다
+   두 단계 깊었고, `WHEN`/`ELSE`/`END`는 서로 다른 기준으로 복구됐다.
+
+수정 후 초기 결과와 바이트 단위로 비교해 실제 출력이 바뀐 15개 리포트, 15,420줄을
+최종본 기준으로 다시 처음부터 끝까지 판독했다. 나머지 46개 리포트는 초기 수동 판독본과
+바이트가 동일하다. 최종 추가 오류는 0건이다.
+
+## 22-2. PIVOT/UNPIVOT의 잘못된 parent 선택
+
+AS-IS:
+
+```sql
+PIVOT (SUM (amount)
+        FOR status IN ('NEW' AS new_amt,
+            'PAID' AS paid_amt)
+    )
+```
+
+TO-BE:
+
+```sql
+PIVOT (SUM (amount)
+    FOR status IN ('NEW' AS new_amt,
+        'PAID' AS paid_amt)
+)
+```
+
+근본 원인은 semantic delimiter를 열 때 stack에서 가장 깊은 활성 frame을 parent로 선택한
+것이다. 그 시점의 `FROM` list는 렌더링 진행 상태로 남은 sibling이지 `PIVOT`의 문법 parent가
+아니다. 하지만 기존 코드는 이 더 깊은 list를 선택해 PIVOT paren을 owner+2에 등록했다.
+
+이를 semantic owner 종류별 parent 정책으로 분리했다.
+
+- `PIVOT`, `UNPIVOT`, `MATCH_RECOGNIZE`: owner가 출력된 줄의 문법 parent만 사용한다.
+- analytic `OVER`, `WINDOW` 등 표현식 owner: 실제로 활성 expression frame에 속할 수 있으므로
+  기존 enclosing-frame 정책을 유지한다.
+
+표 절 owner는 `nearest_semantic_owner_parent_frame(owner_depth)`로 정확히 owner depth에서
+소속 frame을 고른다. 따라서 더 깊은 render-time sibling이 활성 상태여도 parent 후보가 될 수
+없다. 이 정책 분류 자체를 회귀 테스트로 고정해 analytic `OVER`를 잘못 끌어올리는 것도 막았다.
+
+## 22-3. CASE opener의 소속 frame 복구
+
+AS-IS:
+
+```sql
+RETURN SUBSTR (NVL (p_old,
+        '') ||
+            CASE
+        WHEN p_old IS NULL THEN
+            ''
+        ELSE
+            CHR (10)
+    END || ...);
+```
+
+TO-BE:
+
+```sql
+RETURN SUBSTR (NVL (p_old,
+        '') ||
+    CASE
+        WHEN p_old IS NULL THEN
+            ''
+        ELSE
+            CHR (10)
+    END || ...);
+```
+
+`NVL`을 닫은 뒤 연결 연산자 `||`를 거쳐 CASE를 열 때, 출력 줄에는 닫힌 nested call의
+continuation depth가 남아 있었다. 이후 CASE block frame은 `nearest_child_owner_frame()`으로
+정상 owner에 등록됐지만 opener는 이미 더 깊게 렌더링됐다. 즉 opener와 그 frame의 body/close가
+서로 다른 depth source를 사용했다.
+
+CASE 앞 token이 `||`이고 현재 출력 줄 depth가 문법 child-owner depth보다 실제로 깊을 때만
+CASE opener를 그 문법 owner로 복구한다. 일반 `* CASE`, named argument `=> CASE`, `= CASE`는
+이번 오류와 소속 관계가 다르므로 출력 변경 대상에서 제외했다. 이 제한으로 MODEL 식의
+`0) * CASE` 등 무관한 줄바꿈 회귀를 방지했다.
+
+## 22-4. 기존 frame 구조 판단 테스트가 놓친 이유
+
+기존 감사도 frame을 기록했지만 예상값이 renderer의 잘못된 선택과 독립적이지 않았다.
+
+1. PIVOT/UNPIVOT은 renderer가 고른 잘못된 parent/depth를 감사의 expected에도 그대로
+   등록했다. actual과 expected가 같은 잘못을 공유해 내부 일관성 검사만 통과했다.
+2. CASE frame은 뒤늦게 정상 owner depth로 등록됐으나 감사가 body child와 close만 확인했다.
+   owner opener token의 실제 줄 depth를 frame의 owner depth와 비교하지 않아 opener 단독 drift를
+   보지 못했다.
+3. first-pass whitespace 검사, token 보존, idempotence는 모두 만족했다. 4-space 단위의 잘못된
+   출력도 안정적으로 재생성되므로 이 검사들만으로는 문법 소속 오류를 알 수 없다.
+4. 별도의 PIVOT/UNPIVOT 회귀 테스트 4개는 typed semantic view와 delimiter를 각각 독립
+   들여쓰기 edge로 해석해 owner+2를 기대했다. 이는 문서의 “같은 owner edge를 두 번 세지
+   않는다”는 계약과 반대였고, 자동 검출을 못 한 수준을 넘어 잘못된 출력을 정답으로 보호했다.
+
+즉 문제는 “frame 정보가 없음”이 아니라 “renderer가 만든 잘못된 기준을 expected로 재사용”하고
+“opener 실제 위치를 교차 검증하지 않음”이었다.
+
+## 22-5. 자동 frame 감사의 근본 개선
+
+다음 독립 검사를 추가했다.
+
+- `same_depth_boundary`에 등록된 모든 frame opener token의 실제 줄 indent를 계산해 저장된
+  owner depth와 직접 비교한다. 이제 CASE처럼 opener만 잘못된 경우도
+  `opener indent drift`로 실패한다.
+- PIVOT/UNPIVOT/MATCH_RECOGNIZE body header를 문법 이벤트로 별도 기록해 semantic paren의
+  direct child가 paren frame depth에 있는지 검사한다. 최종 sweep의 검사 body item은
+  22,780개에서 22,807개로 27개 늘었다.
+- table-clause semantic owner의 parent는 renderer stack의 최심부가 아니라 owner-line 문법
+  depth에서 선택한다. 예상 기준과 출력 기준이 같은 잘못을 공유하지 않도록 기준점을 분리했다.
+
+추가 회귀 테스트:
+
+- `frame_alignment_audit_reports_owner_opener_indent_drift`
+- `table_clause_semantic_owners_use_their_owner_line_parent`
+- `format_for_auto_formatting_keeps_pivot_body_one_frame_below_owner`
+- `plsql_case_after_concatenation_stays_inside_call_owner_frame`
+
+red/green 확인에서 PIVOT 회귀 테스트는 수정 전 body depth 8, 기대 depth 4로 실패했고, opener
+감사를 연결한 전체 sweep은 기존 출력의 `test/test9.txt` CASE를 실제 failure로 검출했다.
+수정 후 네 회귀 테스트와 전체 sweep이 모두 통과했다.
+
+전체 테스트에서 드러난 기존 PIVOT/UNPIVOT 기대값 4개도 owner+1 계약으로 교정했다.
+`test/test_format_pivot.sql` 기준 fixture, typed PIVOT/UNPIVOT depth 검사, 주석 포함 visual 검사는
+이제 모두 같은 소속 frame 기준을 사용한다.
+
+## 22-6. 최종 sweep 결과
+
+| 항목 | 결과 |
+| --- | ---: |
+| 전체 fixture / 전체 출력 줄 | 61개 / 43,695줄 |
+| Oracle / MySQL / MariaDB fixture | 41 / 9 / 11 |
+| 최종 재판독한 변경 리포트 / 줄 | 15개 / 15,420줄 |
+| 검사 frame / 문법·body item / close | 21,071 / 22,807 / 9,709 |
+| built-in sweep regression | 26개 |
+| 실패 파일 / frame issue | 0 / 0 |
+
+| 검증 | 결과 |
+| --- | --- |
+| `formatting_sweep_all_files_generate_out_report` | 1 통과, 61개 파일·failure 0 |
+| 추가 frame/format 회귀 테스트 | 4 통과·실패 0 |
+| `cargo test` | lib 6,559 통과·228 ignored, 전체 binary/integration/guard/doc-test 실패 0 |
+| `cargo clippy --locked --all-targets -- -D warnings -W clippy::perf -W clippy::complexity` | 통과, 경고 0 |
+| `cargo fmt --all -- --check` | 통과 |
+| `git diff --check` | 통과 |
+
+## 23-1. 검토 범위 (23차: 전체 .format.out 육안 재검토)
+
+`formatting_sweep_all_files_generate_out_report`로 61개 fixture(Oracle 41 / MySQL 9 / MariaDB 11)의
+`.format.out` 43,695줄을 전부 다시 읽고, PASS 여부와 무관하게
+`docs/auto_format_rule.md`의 frame 원칙과 관례 위반을 점검했다.
+frame 깊이 위반 2건과 닫는 괄호 배치 비일관 1건을 발견해 모두 수정했다.
+
+## 23-2. SEARCH/CYCLE 절이 WITH-list 자식 깊이를 무시 (규칙 2 위반)
+
+재귀 CTE 뒤의 `SEARCH`/`CYCLE` 절은 문법상 직전 CTE의 연속인데, 문장 최상위 깊이(0)로
+렌더링됐다. WITH 목록 중간에서는 `CYCLE ...,` 다음 CTE가 깊이 1로 이어져 목록이 어긋나 보였다.
+(`test/oracle_format_final_boss_2.sql`, `final_boss_3.sql`, `test11.txt` 등에서 재현)
+
+AS-IS:
+
+```sql
+WITH days (day_no, day_value) AS (
+        ...
+    )
+CYCLE day_no SET cycle_yn TO 'Y' DEFAULT 'N',
+    customer_tree (customer_id,
+```
+
+TO-BE:
+
+```sql
+WITH days (day_no, day_value) AS (
+        ...
+    )
+    CYCLE day_no SET cycle_yn TO 'Y' DEFAULT 'N',
+    customer_tree (customer_id,
+```
+
+수정: `formatter.rs`의 SEARCH/CYCLE 분기가 `statement_base_depth()` 대신
+`with_cte_separator_indent()`(WITH-list owner frame 깊이)를 사용한다.
+일반 검출: 같은 지점에서 `audit_expected_indent(...)`로 "SEARCH/CYCLE는 WITH-list 자식 깊이"
+불변식을 기록해, 이후 어떤 fixture에서든 어긋나면 sweep이 FrameAlignment 오류로 잡는다.
+
+## 23-3. 대입 값이 괄호 하나일 때 frame edge 이중 계산 (규칙 5·6 위반)
+
+`x := (...)` 또는 `SET a = (...)`처럼 값 전체가 괄호 하나이면 AssignmentValue frame과
+괄호 delimiter는 같은 owner edge라 한 깊이를 공유해야 하는데(문서 규칙 5 예제, 규칙 6),
+두 edge로 계산돼 한 단계 더 깊게 렌더링됐다. (`test/test24.sql`, `test12.sql`, `test13.sql` 재현)
+
+AS-IS:
+
+```sql
+SET abcd = (
+            SELECT source_row.edfg
+            FROM qt_depth_source source_row
+            WHERE source_row.id = target_row.id
+        )
+```
+
+TO-BE:
+
+```sql
+SET abcd = (
+        SELECT source_row.edfg
+        FROM qt_depth_source source_row
+        WHERE source_row.id = target_row.id
+    )
+```
+
+수정: `(`가 대입 연산자(`:=`/SET의 `=`) 바로 뒤이고 매칭 닫괄호 뒤 토큰이 값의 끝
+(`;`/`,`/절 키워드)일 때만 괄호 frame 깊이를 AssignmentValue 깊이와 공유한다.
+`SET v = ((a + b) MOD 3) + 1`처럼 괄호가 값의 첫 피연산자일 뿐이면 기존대로 별도 edge를 유지한다.
+일반 검출: 공유가 적용된 괄호는 `audit_last_paren_expected_depth` + attached 관계로 기록되어
+깊이가 어긋나면 모든 sweep 실행에서 parent-depth drift로 검출된다.
+
+## 23-4. MySQL/MariaDB 루틴 파라미터의 타입 괄호 닫힘 분리
+
+`CREATE FUNCTION f(a DECIMAL(12, 2), b ...)`처럼 모드 키워드(IN/OUT) 없는 첫 파라미터의
+타입 괄호가 "최근 4단어 안에 PROCEDURE/FUNCTION" 휴리스틱에 걸려 ColumnList로 오분류되어,
+마지막 인자와 닫는 괄호가 분리됐다. 같은 문장의 마지막 파라미터는 인라인으로 닫혀 비일관했다.
+(`test_mariadb/test4.txt`, `test_mariadb/test7.txt` 재현)
+
+AS-IS:
+
+```sql
+CREATE FUNCTION fn_efficiency_band(p_hours DECIMAL(12,
+        2
+    ),
+    p_budget DECIMAL(14,
+        2)
+)
+```
+
+TO-BE:
+
+```sql
+CREATE FUNCTION fn_efficiency_band(p_hours DECIMAL(12,
+        2),
+    p_budget DECIMAL(14,
+        2)
+)
+```
+
+수정: 오분류 조건을 기존의 정밀 판정 함수 `paren_opens_routine_parameter_list`
+(식별자 → PROCEDURE/FUNCTION 직접 연결만 인정)로 교체했다.
+
+## 23-5. 육안 검토에서 확인한 의도된 동작 (수정하지 않음)
+
+- 식별자 대문자화: `seed`/`remark`/`depth`/`name`/`path` 등 키워드 테이블에 있는 단어는
+  식별자 위치에서도 대문자화된다. Oracle 비인용 식별자는 대소문자 무관이라 의미 보존이며
+  기존 정책(키워드 대문자화)의 일부다.
+- 구조 frame(서브쿼리/OVER/CASE)을 포함한 함수 괄호는 닫괄호를 단독 줄에 두는 관례가
+  전 파일에서 일관 적용된다. (`NVL((SELECT ...), 0\n)` 등)
+- `@TRANSACTION` → `SET AUTOCOMMIT OFF`: 포매터가 아니라 ToolCommand 파서의 의도된
+  정규화(`script.rs`의 별칭, 파서 테스트로 고정)다.
+
+## 23-6. 회귀 고정과 최종 게이트
+
+built-in sweep 회귀 코퍼스에 5개 케이스(SEARCH/CYCLE 중간 목록, `:= (subquery)`,
+`SET a = (subquery), b = (subquery)`, MariaDB modeless DECIMAL 파라미터)를 추가했고,
+전용 테스트 3개를 신설했다.
+
+- `formatting_sweep_with_search_cycle_clauses_continue_the_with_list_child_depth`
+- `formatting_sweep_assignment_value_paren_shares_the_owner_edge`
+- `formatting_sweep_mysql_routine_parameter_type_arguments_close_inline`
+
+기존 기대값 갱신: `formatting_sweep_search_cycle_comma_children_have_dedicated_list_frames`,
+`format_sql_basic_recursive_cte_search_cycle_inline`,
+`paren_case_expression_tracks_end_case_terminator`,
+`paren_case_expression_tracks_searched_case_headers`,
+`format_sql_paren_case_start_with_inline_comment_keeps_case_indented`,
+`format_sql_paren_case_end_with_comment_does_not_leak_depth_to_next_line`
+(모두 입력 SQL은 유지, 문서 규칙에 맞는 새 깊이로 교정).
+
+| 항목 | 결과 |
+| --- | ---: |
+| 재검토 fixture / 출력 줄 | 61개 / 43,695줄 (수정 후 43,691줄) |
+| 검사 frame / body item / close | 21,113 / 22,839 / 9,724 |
+| built-in sweep regression | 30개 |
+| 실패 파일 / frame issue | 0 / 0 |
+
+| 검증 | 결과 |
+| --- | --- |
+| `formatting_sweep_all_files_generate_out_report` | 통과, 61개 파일·failure 0 |
+| `cargo test` (전체) | 6,711 통과·실패 0 |
+| `cargo clippy --locked --all-targets -- -D warnings -W clippy::perf -W clippy::complexity` | 통과, 경고 0 |
+| `cargo fmt --all -- --check` / `git diff --check` | 통과 |
+
+# 39차: Wrapped/Stacked comma-list 옵션별 전수 검증과 VALUES 줄바꿈 수정 (2026-07-20)
+
+## 39-1. AS-IS / TO-BE
+
+`comma list = Wrapped`에서 `INSERT` 대상 컬럼 목록이 먼저 줄바꿈되면, 그 닫힘
+상태가 뒤에 새로 열린 `VALUES (...)` 프레임으로 누출됐다. 값 목록 전체가 right
+margin 안에 들어가도 첫 번째 쉼표 직후 강제로 줄을 바꿨다.
+
+```sql
+-- AS-IS
+INSERT INTO employee (id, employee_name, department_name,
+    created_at)
+VALUES (1,
+    'Alice', 'Research and Development', SYSDATE);
+
+-- TO-BE
+INSERT INTO employee (id, employee_name, department_name,
+    created_at)
+VALUES (1, 'Alice', 'Research and Development', SYSDATE);
+```
+
+이 TO-BE는 `Wrapped` 옵션에만 적용된다. 같은 입력을 `Stacked`로 포맷하면 기존처럼
+`VALUES (1,` 뒤에서 개행해 항목별 한 줄 배치를 유지한다.
+
+원인은 렌더링 라인에 이전 괄호 닫힘이 있었다는 사실을 현재 목록의 구조적
+부모 정보처럼 사용한 것이다. `ParenFormatFrame.body_start_out_len`과 현재 출력
+라인 시작 offset을 비교해 **현재 줄에서 새 direct-list 프레임이 열린 경우에는
+그 프레임이 자신의 Wrapped 결정을 하도록** 바꿨다. `VALUES`에 한정하지 않아
+inline view 뒤의 `IN (...)`, scalar subquery 닫힘 뒤의 새 목록에도 같은 규칙이
+적용된다.
+
+## 39-2. 전수 판독에서 함께 발견해 일반화한 항목
+
+- Wrapped가 쉼표를 inline으로 유지한 뒤 원본 개행이 다시 줄바꿈을 강제하던
+  문제: 렌더러가 내린 inline 결정을 source-break 분류가 뒤집지 않도록 했다.
+- Wrapped의 단일 라인 `JSON_TABLE(... COLUMNS (...))`에서 안쪽 프레임이 바깥
+  닫힘을 여러 줄 자식으로 오인하던 문제: 실제 frame body가 단일 라인이면
+  multiline-child close로 전파하지 않는다. `Stacked`의 기존 닫힘 배치는 유지한다.
+- `EXECUTE IMMEDIATE ... USING 1, 2, 3`가 Wrapped 대상에서 제외되던 문제:
+  `USING` 소유 목록과 right margin 규칙을 그대로 적용한다.
+- Oracle/MariaDB에서 컬럼명 `json_value`가 함수 키워드 `JSON_VALUE`로 바뀌던
+  문제: `(`가 뒤따르는 함수 호출만 키워드로 정규화하고 식별자 슬롯은 원본
+  case를 보존한다.
+- MySQL `json_value -> '$.x'` / `->>`의 왼쪽 피연산자도 식별자 슬롯으로
+  분류한다.
+- predicate 절 첫 피연산자는 보존되지만 `AND`/`OR` 뒤의 동형 피연산자는 함수
+  키워드로 바뀌던 문제: `AND json_value IS JSON`과 whitespace 회귀의
+  `WHERE first_value = ...`를 식별자 문맥으로 분류한다. `JSON_VALUE(...)`와
+  `FIRST_VALUE(...)` 함수 호출은 계속 키워드로 정규화한다.
+
+식별자 회귀는 sweep에 일반 검사를 추가했다. `INSERT INTO table (...)`의 직접
+대상 컬럼 프레임과 JSON path 연산자의 왼쪽 피연산자에서 case가 바뀌면
+`IdentifierCase` issue가 된다. 레이아웃 문제는 기존 frame-depth 감사가 모든
+관리 프레임의 parent/child, body/close, sibling 깊이를 계속 검사하도록 sweep
+자체를 실제 `Wrapped` 설정으로 실행하게 했고, 깊이 위반이 아닌 right-margin
+선택 문제는 direct-list 프레임 경계 회귀 테스트로 고정했다.
+
+## 39-3. 신규 회귀 테스트
+
+- `wrapped_insert_values_does_not_break_after_first_item_when_target_columns_wrap`
+- `wrapped_in_list_ignores_close_from_the_previous_rendered_line`
+- `wrapped_in_list_opened_after_a_close_uses_its_own_frame`
+- `wrapped_function_arguments_ignore_source_break_after_inline_comma`
+- `wrapped_json_table_keeps_single_line_nested_columns_close_inline`
+- `wrapped_execute_immediate_using_keeps_fitting_bind_items_inline`
+- `format_sql_basic_preserves_json_value_identifier_but_normalizes_function_name`
+- `format_sql_basic_for_mysql_preserves_json_value_before_path_operator`
+- `formatting_sweep_detects_identifier_case_change_in_insert_target_list`
+- `formatting_sweep_detects_identifier_case_change_before_json_path_operator`
+- `formatting_sweep_detects_identifier_case_change_after_logical_connector`
+
+첫 번째 테스트는 동일 SQL을 `Wrapped`와 `Stacked`로 각각 포맷해 Wrapped의 inline
+결과와 Stacked의 기존 item-per-line 결과를 함께 고정한다.
+
+## 39-4. Wrapped/Stacked 산출물 전수 검토
+
+지정 명령 한 번으로 `target/format-sweep/wrapped`와
+`target/format-sweep/stacked`을 함께 생성하도록 하네스를 일반화했다. 두 옵션의
+132개 `.format.out`을 각 파일 첫 줄부터 report footer 마지막 줄까지
+`docs/auto_format_rule.md`와 대조했다.
+
+| 옵션 | dialect | 파일 | 판독한 줄 | 최종 결과 |
+| --- | --- | ---: | ---: | --- |
+| Wrapped | Oracle | 42 | 19,784 | 이상 없음 |
+| Wrapped | MySQL | 11 | 5,808 | 이상 없음 |
+| Wrapped | MariaDB | 13 | 8,029 | 이상 없음 |
+| Stacked | Oracle | 42 | 27,390 | 이상 없음 |
+| Stacked | MySQL | 11 | 9,352 | 이상 없음 |
+| Stacked | MariaDB | 13 | 12,995 | 이상 없음 |
+| 합계 | 2옵션 × 3 dialect | 132 | 83,358 | 이상 없음 |
+
+옵션별 최종 집계는 공통으로 regressions=32, identifier_case_words=89,819,
+frames=24,227, frame_boundaries=53,385, frame_closes=11,297, failures=0이다.
+Wrapped는 frame_depth_symmetries=2,963/frame_body_items=10,050, Stacked는
+3,408/26,027이다. 루트 aggregate는 `checked_files=132`, `failures=0`이다.
+
+## 39-5. Space Query 실제 실행
+
+실행용 전수 테스트도 sweep과 동일하게 `Wrapped`와 `Stacked`를 각각 명시한다.
+각 원본을 두 옵션으로 포맷한 뒤 production MySQL/MariaDB batch 및 Oracle Thin
+경로로 전달했으며, 모든 옵션·파일 조합에서 성공 statement를 하나 이상 확인했다.
+
+| 옵션 | DB | live 대상 | 성공 statement | 결과 |
+| --- | --- | ---: | ---: | --- |
+| Wrapped | Oracle Free/1521 | 42/42 | 2,637 | 실패 0 |
+| Stacked | Oracle Free/1521 | 42/42 | 2,637 | 실패 0 |
+| Wrapped | MySQL 8.0/3307 | 11/11 | 386 | 실패 0 |
+| Stacked | MySQL 8.0/3307 | 11/11 | 386 | 실패 0 |
+| Wrapped | MariaDB 12.2/3306 | 13/13 | 671 | 실패 0 |
+| Stacked | MariaDB 12.2/3306 | 13/13 | 671 | 실패 0 |
+| 합계 | 2옵션 × 3 DB | 132/132 | 7,388 | 실패 0 |
+
+## 39-6. 검증
+
+| 검증 | 결과 |
+| --- | --- |
+| Wrapped comma-list 집중 회귀 | 18 passed · 0 failed |
+| `JSON_VALUE` 문맥 회귀 | 10 passed · 0 failed |
+| 신규 sweep 식별자 검사 | 5 passed · 0 failed |
+| `cargo test --lib formatting_sweep_all_files_generate_out_report -- --ignored --nocapture` | 통과 — 2옵션 × (66파일 + 32회귀), failures 0 |
+| 포맷 후 Space Query live 실행 | 132/132 옵션·파일 조합, 7,388 successful statements, 실패 0 |
+| `cargo test` | 통과 — 전 타깃 합계 6,839 passed · 0 failed · 246 ignored |
+| `cargo clippy --locked --all-targets -- -D warnings -W clippy::perf -W clippy::complexity` | 통과 — 경고 0 |
+| `cargo fmt --all -- --check` / `git diff --check` | 통과 |
+
+## 24-1. 검토 범위 (24차: delimiter-aware sweep 감사)
+
+요청한 `formatting_sweep_all_files_generate_out_report`를 실행한 뒤 Oracle 41개,
+MySQL 9개, MariaDB 11개의 `.format.out` 61개(총 43,691줄)를 PASS 표시에 의존하지 않고
+모두 직접 읽었다. `docs/auto_format_rule.md`의 parent/child frame, 첫 자식 inline,
+닫힘 owner 깊이, 주석·리터럴 보호 규칙을 기준으로 SQL 본문을 확인했다.
+
+출력 본문 자체에서 새 frame-depth 오류는 없었지만, MySQL/MariaDB `DELIMITER $$`
+루틴을 sweep이 dollar-quoted string으로 오인해 line/token-gap/probe 검사를 건너뛰는
+감사 사각지대를 발견했다. 감사기를 delimiter-aware하게 바꾸자 그동안 실행되지 않던
+공백 probe가 실제 고정 구문 개행 의존성 11건을 검출했고, 이를 일반 규칙으로 수정했다.
+
+## 24-2. `DELIMITER $$` 루틴 본문이 line audit에서 제외되던 문제
+
+AS-IS 입력(수정 전에는 `$$ ... $$` 전체를 문자열 payload로 보호해 들여쓰기 오류 0건):
+
+```sql
+DELIMITER $$
+CREATE PROCEDURE p()
+BEGIN
+  SELECT 1;
+END$$
+DELIMITER ;
+```
+
+TO-BE 입력/검출(같은 SQL의 `SELECT` 2칸 들여쓰기를 `Indentation` 오류로 검출):
+
+```sql
+DELIMITER $$
+CREATE PROCEDURE p()
+BEGIN
+    SELECT 1;
+END$$
+DELIMITER ;
+```
+
+수정:
+
+- MySQL/MariaDB는 script 전체를 한 번에 토큰화하지 않고
+  `statement_spans_for_db_type_with_mysql_delimiter`가 반환한 실제 statement 범위별로
+  문자열·주석 보호선과 token gap을 계산한다.
+- 루틴 안의 실제 여러 줄 문자열은 기존처럼 보호한다.
+- line audit 실측 예: MySQL test1 `147 -> 789`, test4 `430 -> 859`, test5
+  `224 -> 708`; MariaDB test4 `220 -> 839`, test6 `512 -> 1,412`.
+
+## 24-3. 사용자 지정 delimiter에서 공백 probe가 생략되던 문제
+
+AS-IS에서는 `FormatItem::Statement`를 이어 붙일 때 루틴 종결자 `$$`를 잃어 statement
+fingerprint가 달라졌고, `Reindent`/`CollapseBreaks`/`ExpandInline` probe를 조용히
+건너뛰어 해당 파일이 `probes=1`이어도 PASS가 됐다.
+
+TO-BE에서는 원본 document의 statement span만 제자리에서 변형하므로 `DELIMITER`, `$$`,
+도구 명령, statement 사이 텍스트가 그대로 유지된다. MySQL/MariaDB 20개 fixture는 모두
+공백 probe 3개와 idempotence 1개(`probes=4`)를 실행한다. probe가 statement fingerprint를
+보존하지 못하면 더 이상 생략하지 않고 sweep 오류로 보고한다. 행 시작 `@변수`와 단독
+SQL*Plus `R`처럼 도구 명령으로 의미가 바뀌는 변형, 이름 있는 `END label`의 보존 공백은
+안전한 probe 대상에서 제외한다.
+
+| 감사 항목 | AS-IS | TO-BE |
+| --- | ---: | ---: |
+| 전체 report `token_gaps` | 68,892 | 74,782 |
+| 전체 report `probes` | 120 | 163 |
+| MySQL/MariaDB fixture별 probe | 일부 1 | 전부 4 |
+
+## 24-4. probe가 찾아낸 고정 구문 개행 의존성
+
+AS-IS(공백 probe가 아래 위치에 원본 개행을 넣으면 포매터가 그대로 보존):
+
+```sql
+IF NOT
+        p_condition THEN
+    SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = p_message;
+END
+IF;
+
+IF NEW.priority
+        NOT
+        BETWEEN 1 AND 9 THEN
+    SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'invalid priority';
+END IF;
+```
+
+TO-BE:
+
+```sql
+IF NOT p_condition THEN
+    SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = p_message;
+END IF;
+
+IF NEW.priority NOT BETWEEN 1 AND 9 THEN
+    SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'invalid priority';
+END IF;
+```
+
+같은 일반화로 `FALSE) = FALSE`, `amount < 0`, `quantity IS NULL`, `END FOR`,
+`END WHILE`, `END LOOP`, `END CASE`도 원본 개행과 무관하게 고정 구문으로 수렴한다.
+
+- 조건 owner의 `first_body_token_idx`를 사용해 IF/ELSIF/WHILE 첫 자식은 항상 owner와
+  inline으로 유지한다. 깊이 판단은 출력 행이 아니라 live condition frame에서 가져온다.
+- RHS 연산자와 `NOT BETWEEN`/`IS` 등은 `sql_text`의 공유 expression-continuation
+  taxonomy를 사용한다.
+- 주석 없이 바로 이어지는 `END IF/LOOP/CASE/REPEAT/FOR/WHILE`만 한 줄로 정규화한다.
+  주석으로 분리된 suffix와 이름 있는 `END label`의 기존 보존/깊이 계약은 유지한다.
+
+추가 회귀 테스트:
+
+- `formatting_sweep_first_pass_audits_mysql_custom_delimiter_body`
+- `formatting_sweep_first_pass_protects_multiline_string_in_mysql_routine`
+- `formatting_sweep_whitespace_probes_preserve_mysql_custom_delimiters`
+- `formatting_sweep_mysql_fixed_phrases_ignore_source_line_breaks`
+
+## 24-5. 최종 sweep 및 품질 게이트
+
+| 항목 | 결과 |
+| --- | ---: |
+| 직접 검토 fixture / 출력 줄 | 61개 / 43,691줄 |
+| Oracle / MySQL / MariaDB fixture | 41 / 9 / 11 |
+| auditable code line / token gap | 35,935 / 74,782 |
+| fixture frame / body item / close | 20,878 / 22,731 / 9,660 |
+| built-in 포함 frame / body item / close | 21,113 / 22,839 / 9,724 |
+| built-in sweep regression | 30개 |
+| 실패 파일 / issue | 0 / 0 |
+
+| 검증 | 결과 |
+| --- | --- |
+| `formatting_sweep_all_files_generate_out_report` | 통과, 61개 파일·failure 0 |
+| `cargo test` | lib 6,566 통과·228 ignored, 전체 binary/integration/guard/doc-test 실패 0 |
+| `cargo clippy --locked --all-targets -- -D warnings -W clippy::perf -W clippy::complexity` | 통과, 경고 0 |
+| `cargo fmt --all -- --check` / `git diff --check` | 통과 |
+
+## 25-1. 후속 구조 리팩터링: 하나의 delimiter-aware 문서 모델
+
+24차 수정에서 statement span, token span, 보호 payload, 공백 probe가 각각 delimiter를
+해석하던 경로를 `FormatSweepDocument`로 통합했다. 다만 물리 토큰과 논리 실행 단위는
+용도가 다르므로 하나로 억지 통합하지 않았다.
+
+- 물리 statement/token span: 원문 offset, 보호선, statement 내부 token gap, whitespace
+  probe 렌더링과 결과 diff에 사용한다.
+- 논리 `ScriptItem` fingerprint: SQL*Plus 명령과 Oracle `/`, MySQL `DELIMITER`를 포함한
+  script 의미 보존 검사에 사용한다.
+- probe는 statement span만 제자리에서 변형하고 나머지 delimiter·도구 명령·statement
+  사이 텍스트를 그대로 보존한다.
+- Oracle도 MySQL/MariaDB와 동일하게 3개 whitespace probe와 idempotence를 모두 실행한다.
+  fixture 61개에서 `probes=244`로, 모든 파일이 정확히 4개 probe를 통과한다.
+- `token_gaps=72,824`는 statement 경계를 가로지르는 공백을 제외한 실제 변형 가능
+  statement 내부 gap만 집계한다.
+
+## 25-2. source-break와 `END` 정책의 단일화
+
+formatter의 여러 boolean 조건을 `FormatterSourceBreakPolicy`로 묶고, 고정 구문이 원본
+개행과 무관하게 inline으로 수렴하는 조건을 명시했다.
+
+- 문법상 inline, live frame의 첫 자식, 연산자 직후, 공유 expression-continuation
+  taxonomy 중 하나면 `CanonicalInline`, 아니면 `Preserve`다.
+- `AND`/`OR`/`IS`/`NOT`만 따로 나열하던 formatter 로컬 분기를 제거하고
+  `sql_text::format_source_gap_is_canonical_inline`을 Oracle/MySQL/MariaDB가 공유한다.
+- `END IF/LOOP/CASE/REPEAT/FOR/WHILE` 판정도 formatter 로컬 상수 대신
+  `sql_text::is_format_block_end_qualifier_keyword` 하나를 사용한다.
+- 이름 있는 `END label`과 주석으로 분리된 suffix는 기존 보존 계약을 유지한다.
+
+직접 회귀 테스트:
+
+- `format_source_gap_policy_tracks_both_sides_of_expression_continuations`
+- `formatting_sweep_oracle_fixed_phrases_ignore_source_line_breaks`
+- `formatting_sweep_mysql_fixed_phrases_ignore_source_line_breaks`
+
+## 25-3. 전체 sweep에 구조적 depth 대칭 감사 추가
+
+기존 감사는 frame의 저장 depth, 부모-자식 depth, body/close의 개별 indent를 확인했지만
+open-body-close가 하나의 구조 구간을 이루는지와 body/close의 직접 대칭은 확인하지
+않았다. 다음 불변식을 추가했다.
+
+1. 자식 frame opener는 부모 close보다 앞에 있어야 한다.
+2. body item은 자기 frame의 open/close 경계 밖에 있을 수 없다.
+3. 줄 시작 body와 줄 시작 close가 모두 있는 child frame은
+   `body depth = close depth + 1`이어야 한다.
+
+빈 괄호의 `first body candidate == close`와 phase frame의 `body start == opener`는 실제
+body가 경계를 벗어난 것이 아니므로 허용하고, 엄격하게 경계 밖인 경우만 오류로 본다.
+보고서에는 `frame_boundaries`, `frame_depth_symmetries` 실측치를 추가했다.
+
+추가 감사 단위 테스트:
+
+- `frame_alignment_audit_reports_child_opened_after_parent_close`
+- `frame_alignment_audit_reports_body_outside_own_boundary`
+- `frame_alignment_audit_reports_body_close_depth_asymmetry`
+
+| 전체 fixture 감사 항목 | 결과 |
+| --- | ---: |
+| 파일 / built-in regression | 61 / 30 |
+| code line / statement 내부 token gap | 35,935 / 72,824 |
+| frame / frame boundary | 20,878 / 46,350 |
+| body-close depth symmetry | 2,682 |
+| body item / close | 22,731 / 9,660 |
+| whitespace + idempotence probe | 244 |
+| 실패 파일 / issue | 0 / 0 |
+
+built-in regression을 포함하면 frame 21,113건, boundary 46,677건, depth symmetry
+2,719건, body item 22,839건, close 9,724건을 검사했고 실패는 0건이다.
+
+## 25-4. 최종 품질 게이트
+
+| 검증 | 결과 |
+| --- | --- |
+| `formatting_sweep_all_files_generate_out_report` | 통과, 61개 파일·30개 built-in·failure 0 |
+| `cargo test --locked` | 6,720 통과·232 ignored·실패 0 |
+| `cargo clippy --locked --all-targets -- -D warnings -W clippy::perf -W clippy::complexity` | 통과, 경고 0 |
+| `cargo fmt --all -- --check` / `git diff --check` | 통과 |
+
+## 26-1. 후속 전수 육안 재감사 (구현 변경 없음)
+
+AS-IS: aggregate report의 `failures=0`과 각 파일의 `status: PASS`는 자동 불변식 통과를
+보여 주지만, 포맷 결과가 실제 SQL 문법 소유 관계와 사람이 읽는 관례를 처음부터 끝까지
+만족한다는 증거를 대신하지 않는다.
+
+TO-BE: `formatting_sweep_all_files_generate_out_report`를 다시 실행하고 생성된 `.format.out`
+61개, 43,691줄을 PASS 표시에 의존하지 않고 모두 직접 읽었다. 검토 기준은
+`docs/auto_format_rule.md`의 frame-only depth, 문법 부모 관계, 첫 직접 자식 inline,
+후속 형제 동일 깊이, 본문 경계 분리, 닫힘 owner 깊이, 주석·리터럴 비구조화 규칙이다.
+
+| DB | 파일 | 출력 줄 |
+| --- | ---: | ---: |
+| Oracle | 41 | 25,970 |
+| MySQL | 9 | 7,090 |
+| MariaDB | 11 | 10,631 |
+| 합계 | 61 | 43,691 |
+
+CTE `SEARCH`/`CYCLE`, PIVOT/UNPIVOT, CASE, JOIN 조건, assignment-value 괄호,
+루틴·핸들러·루프, 사용자 delimiter, JSON_TABLE/COLUMNS, 윈도우 상속, 집합 연산,
+RETURNING과 시스템/애플리케이션 시간 구문까지 open/body/sibling/close 깊이를 확인했다.
+새 frame-depth 또는 가독성 결함은 없었으므로 포맷터와 회귀 테스트 구현은 변경하지 않았다.
+
+## 26-2. sweep 재검증과 품질 게이트
+
+요청한 sweep는 최초 검사와 전수 검토 후 재검사에서 모두 통과했다. 최종 재검사는
+1개 테스트 통과, 실패 0, 6,798개 filtered out이며 14.46초가 걸렸다. 실제 본문 오류
+마커와 `issues: total>0`도 별도 검색에서 0건이었다.
+
+| sweep 감사 항목 | 결과 |
+| --- | ---: |
+| fixture / built-in regression | 61 / 30 |
+| frame / frame boundary | 21,113 / 46,677 |
+| body-close depth symmetry | 2,719 |
+| body item / close | 22,839 / 9,724 |
+| 실패 파일 / issue | 0 / 0 |
+
+| 검증 | 결과 |
+| --- | --- |
+| `cargo test --lib formatting_sweep_all_files_generate_out_report -- --ignored --nocapture` | 통과, 61개 파일·failure 0 |
+| `cargo test` | 6,720 통과·232 ignored·실패 0, doc-test 실패 0 |
+| `cargo clippy --locked --all-targets -- -D warnings -W clippy::perf -W clippy::complexity` | 통과, 경고 0 |
+| `cargo fmt --all -- --check` / `git diff --check` | 통과 |
+
+## 27-1. 생산 경로 하이라이팅 양방향 전수 감사
+
+AS-IS: 하이라이터가 `AS` 다음 단어를 자체 상태로 별칭 추정하고, SQL editor의 별칭
+수집기는 별도의 휴리스틱을 사용했다. 이중 판정 때문에 `GENERATED ALWAYS`, `AS CLOB`,
+`STORE AS BASICFILE`, `FOR UPDATE`, CASE의 `END` 같은 문법 토큰이 별칭으로 오인될 수
+있었다. 또한 기존 단위 테스트는 등록된 키워드와 오브젝트 종류별 예시는 검사했지만,
+fixture 전체 단어·오브젝트·문자열/주석 영역을 한 보고서에서 양방향 감사하지 않았다.
+
+TO-BE: `collect_local_alias_context`가 실제 별칭 선언 범위를 한 번 계산하고 최초 전체
+렌더링, 증분 줄 재하이라이팅, visible semantic refresh가 같은 문맥을 공유하도록 생산
+경로를 통합했다. 타입 변환, 생성 컬럼, XML/LOB storage, Oracle object type, CTE/window,
+relation alias 문맥은 토큰 깊이와 절 소유자를 기준으로 구분한다. 하이라이터 내부의
+`AS` 다음 단어 추정 상태는 제거했다.
+
+`syntax_highlighting_sweep_all_files_generate_out_report`는 다음을 수행한다.
+
+- Oracle/MySQL/MariaDB 61개 원본 fixture를 실제 줄별 상태 전파 경로로 렌더링한다.
+- lexer가 코드로 판정한 모든 단어의 기대/실제 스타일을 비교한다.
+- fixture DDL에서 table/view/materialized view/function/procedure/package/sequence/trigger/
+  event/type/index/synonym/schema를 수집해 생산 `HighlightData` 경로로 주입한다.
+- 등록되지 않은 일반 단어가 keyword/function/object/column으로 잘못 칠해지는 경우도
+  실패시킨다.
+- parser lexical span의 문자열·주석·인용 영역에 semantic highlight가 침범하는 경우도
+  실패시킨다.
+- 파일별 `target/highlight-sweep/**.highlight.out`과 aggregate 보고서를 생성한다.
+
+전수 감사에서 확인한 dialect 누락은 공용 카탈로그에 반영했다. Oracle PL/SQL cursor/
+SQL 속성, GROUPING 문법, object/member built-in과 MySQL/MariaDB ARRAY/SRID, temporal,
+application-time, vector index, ROWS EXAMINED, UUID v7 문법/함수가 포함된다.
+
+| 하이라이팅 전수 감사 항목 | 결과 |
+| --- | ---: |
+| fixture / 코드 단어 | 61 / 70,087 |
+| catalog 단어 / 정상 강조 / 문맥 식별자 | 37,892 / 37,377 / 515 |
+| 오브젝트 단어 / 정상 강조 / 문맥 식별자 | 2,927 / 2,927 / 0 |
+| 보호 lexical span / byte | 8,763 / 251,967 |
+| 잘못 강조된 일반 단어 / 실패 | 0 / 0 |
+
+## 27-2. 최종 품질 게이트
+
+| 검증 | 결과 |
+| --- | --- |
+| `syntax_highlighting_sweep_all_files_generate_out_report` | 통과, 61개 파일·70,087단어·failure 0 |
+| `formatting_sweep_all_files_generate_out_report` | 통과, 61개 파일·failure 0 |
+| `cargo test --lib` | 6,575 통과·229 ignored·실패 0 |
+| `cargo clippy --locked --all-targets -- -D warnings -W clippy::perf -W clippy::complexity` | 통과, 경고 0 |
+| `cargo fmt --all -- --check` / `git diff --check` | 통과 |
+
+# 28차: 전수 육안 재감사 + 품질 게이트 복구 (2026-07-16)
+
+## 28-1. 검토 범위 (28차: 1차 sweep 후 전수 육안 재감사)
+
+`formatting_sweep_all_files_generate_out_report` 1차 실행(PASS, failures=0) 후,
+자동 검사 결과를 신뢰하지 않고 `target/format-sweep` 아래 61개 `.format.out`
+전부(총 43,691줄)를 처음부터 끝까지 육안으로 재검토했다. 검토 기준은
+`docs/auto_format_rule.md`의 10개 원칙(프레임 단일 깊이 원천, 문법 기반 부모 판정,
+first-child-inline, `d+2` = 두 개의 live frame edge, closing은 owner 깊이,
+주석/보존 텍스트의 구조 중립성, 구분자 문법성, 프레임 소유 전수성, canonical 출력)이다.
+
+집중 검증한 패턴(각각 들여쓰기 숫자를 프레임 edge 수와 대조):
+
+- Oracle: INSERT ALL/FIRST(WHEN 분기 포함), MERGE(ON 조건 d+2, UPDATE…DELETE WHERE),
+  MODEL(RULES/UPSERT/SEQUENTIAL ORDER, 2차원 CV), MATCH_RECOGNIZE(DEFINE 목록),
+  PIVOT/UNPIVOT, JSON_TABLE/XMLTABLE(NESTED PATH 2중), CURSOR 식, WITH FUNCTION/PROCEDURE,
+  SEARCH/CYCLE, $IF/$ELSE/$END, FORALL 본문 SET의 CASE 연속행, 할당값 프레임과
+  괄호-CASE 사다리(`v := a + (CASE … END)`), q-quote 다중행 보존, 주석 삽입 위치
+  (test_open_with.sql의 주석 60여 개 포함).
+- MySQL/MariaDB: DELIMITER 루틴, handler/GET DIAGNOSTICS 목록, 명명 WINDOW 상속
+  (`w_order AS (w_base ORDER BY …)`), VALUES ROW, LATERAL, WITH ROLLUP/GROUPING,
+  CTE UPDATE/DELETE 다중 타깃, FOR PORTION OF, SYSTEM_TIME/PERIOD, CYCLE…RESTRICT,
+  BEGIN NOT ATOMIC, HANDLER 문, RETURNING, GROUP_CONCAT/JSON_ARRAYAGG의
+  ORDER BY…LIMIT 연속행, EXECUTE IMMEDIATE…USING.
+
+## 28-2. 육안 재감사 결과: 프레임 위반 0건 (포맷터 수정 없음)
+
+61개 파일 전부에서 frame depth 규칙 위반을 찾지 못했다. 이번 라운드에서
+포맷터/스윕 로직 변경과 AS-IS/TO-BE 쿼리 변경은 없다.
+
+규칙 위반이 아니어서 수정하지 않은 스타일 관찰 2건(기록만 남김):
+
+- PL/SQL 선언/RETURNS/RECORD 문맥에서 타입 정밀도 쉼표도 일반 목록 규칙으로 분리됨
+  (`DECIMAL(12,\n        2)`). first-child-inline 규칙에 일관되며 회귀 기준선과 일치.
+- MODEL 셀 참조 대괄호의 토큰 간격(`sum_sal [ CV () ]`). 깊이와 무관한 토큰 간격 스타일.
+
+## 28-3. 품질 게이트에서 발견한 코드 회귀 1건 수정 (포맷팅과 무관)
+
+`cargo test` 전체 실행에서 dispatch 가드 2건이 실패했다. 직전 커밋이
+`src/ui/syntax_highlight.rs`의 DatabaseType 레지스트리 함수
+`function_catalog_for_db_type`을 제거하고 직접 match로 대체하면서 발생한 회귀다.
+MariaDB 하이라이트가 MySQL+MariaDB 함수 카탈로그 합집합을 쓰도록 한 기능 변화는
+유지하면서, 합집합을 `MARIADB_HIGHLIGHT_FUNCTIONS_SET`으로 분리하고 레지스트리
+함수를 복원했다.
+
+AS-IS:
+
+```rust
+fn is_builtin_highlight_word(upper: &str, db_type: DatabaseType) -> bool {
+    match db_type {
+        DatabaseType::Oracle => ORACLE_FUNCTIONS_SET.contains(upper),
+        DatabaseType::MySQL => MYSQL_FUNCTIONS_SET.contains(upper),
+        DatabaseType::MariaDB => {
+            MYSQL_FUNCTIONS_SET.contains(upper) || MARIADB_FUNCTIONS_SET.contains(upper)
+        }
+    }
+}
+```
+
+TO-BE:
+
+```rust
+static MARIADB_HIGHLIGHT_FUNCTIONS_SET: Lazy<HashSet<&'static str>> = Lazy::new(|| {
+    MYSQL_FUNCTIONS_SET
+        .iter()
+        .chain(MARIADB_FUNCTIONS_SET.iter())
+        .copied()
+        .collect()
+});
+
+fn function_catalog_for_db_type(db_type: DatabaseType) -> &'static HashSet<&'static str> {
+    match db_type {
+        DatabaseType::Oracle => &ORACLE_FUNCTIONS_SET,
+        DatabaseType::MySQL => &MYSQL_FUNCTIONS_SET,
+        DatabaseType::MariaDB => &MARIADB_HIGHLIGHT_FUNCTIONS_SET,
+    }
+}
+
+fn is_builtin_highlight_word(upper: &str, db_type: DatabaseType) -> bool {
+    function_catalog_for_db_type(db_type).contains(upper)
+}
+```
+
+관련 가드: `backend_registry_functions_dispatch_on_concrete_database_type`,
+`non_test_ui_source_uses_backend_specs_instead_of_direct_database_type_dispatch`
+
+## 28-4. 최종 sweep 및 품질 게이트
+
+| 검증 | 결과 |
+| --- | --- |
+| `formatting_sweep_all_files_generate_out_report` | 통과, 61개 파일 · frames 21,113 · boundaries 46,677 · depth symmetry 2,719 · body items 22,839 · closes 9,724 · failures 0 |
+| 전수 육안 재감사 | 61개 파일 · 43,691줄 · 프레임 위반 0건 |
+| `cargo test` | 전체 통과(lib 6,575 통과 · 229 ignored, 가드 71 통과 포함), 실패 0 |
+| `cargo clippy --locked --all-targets -- -D warnings -W clippy::perf -W clippy::complexity` | 통과, 경고 0 |
+| `cargo fmt --all -- --check` / `git diff --check` | 통과 |
+
+# 29차: MySQL/MariaDB CRUD Final Boss VII 전수 인증 (2026-07-17)
+
+## 29-1. 실행 가능한 CRUD 최종 보스 스크립트 추가
+
+- MySQL `test_mysql/test10.txt`: 전용 데이터베이스 안에서 테이블·인덱스·뷰·함수·
+  프로시저·트리거를 생성하고, JSON/공간 타입·CTE·JSON_TABLE·윈도 함수·LATERAL·
+  ROLLUP·prepared statement를 결합해 CREATE/READ/UPDATE/DELETE와 트랜잭션
+  ROLLBACK을 검증한다.
+- MariaDB `test_mariadb/test15.txt`: 전용 데이터베이스 안에서 sequence·VECTOR·
+  dynamic column·INET6·application-time PERIOD와 루틴·트리거를 생성하고,
+  FOR PORTION OF·RETURNING·EXECUTE IMMEDIATE·CYCLE·INTERSECT ALL·EXCEPT ALL을
+  결합해 CRUD와 트랜잭션을 검증한다.
+- MySQL 8.0.46과 MariaDB 12.2.2에서 각각 스크립트 전체를 실제 실행했다.
+  두 스크립트 모두 종료 코드 0, 최종 `crud_certification=PASS`, `audit_rows=9`였다.
+
+## 29-2. 하이라이팅·인텔리센스 전수 검증
+
+`syntax_highlighting_sweep_all_files_generate_out_report` 결과는 63개 파일,
+73,967단어, catalog 40,093단어, object 3,042단어, 보호 span 9,467개를 검사해
+unexpected highlight 0, failure 0이었다. 하이라이터 production 수정은 필요 없었다.
+
+인텔리센스 리포트는 새 MySQL 스크립트 1,157개 후보와 MariaDB 스크립트
+1,398개 후보를 검사해 최종 missing 0이었다. 테스트는 production completion 경로를
+호출한다. 새 스크립트에서 발견한 MariaDB dynamic column 문법 누락은 재현 테스트를
+먼저 추가한 뒤 `completion.rs`의 production 경로를 수정했다.
+
+AS-IS (커서에서 `AS` 추천 누락):
+
+```sql
+UPDATE fb_job j
+JOIN fb_worker w ON w.worker_id = j.worker_id
+SET j.score = CASE COLUMN_GET(w.properties, 'tier' A| CHAR)
+    WHEN 'gold' THEN 2
+    ELSE 1
+END;
+```
+
+TO-BE (`COLUMN_GET(blob, key AS type)`의 두 번째 인자 문맥을 인식해 `AS` 추천):
+
+```sql
+UPDATE fb_job j
+JOIN fb_worker w ON w.worker_id = j.worker_id
+SET j.score = CASE COLUMN_GET(w.properties, 'tier' AS CHAR)
+    WHEN 'gold' THEN 2
+    ELSE 1
+END;
+```
+
+Oracle fixture에서는 CTE 이름이 keyword catalog와 겹칠 때 뒤따르는 relation alias를
+추천 대상으로 잘못 검사하던 스윕 오탐을 재현 테스트로 고정하고, 문법 위치로 alias
+선언을 판정하도록 테스트 헬퍼를 수정했다. MariaDB의 INET6/VECTOR/UUID 타입 선언과
+`FOR PORTION OF <period> FROM`의 period 참조도 정의 슬롯으로 인식하게 했다.
+
+`million_line_` production/snapshot/shadow completion 성능 회귀 5건은 9.02초에
+모두 통과했다. 새 production 검사는 이미 상한이 적용된 token window만 순회하며,
+고정 타입 modifier 검사도 최대 6 token으로 제한했다.
+
+## 29-3. 자동 포맷 결과 63개·45,911줄 상세 검토 및 수정
+
+`formatting_sweep_all_files_generate_out_report` 실행 후 `target/format-sweep` 아래
+63개 `.format.out`의 45,911줄 전체를 처음부터 끝까지 검토했다. 파일별 시작/끝,
+모든 statement 구조와 의심 패턴을 원문 문맥까지 확인했으며, 주석·dynamic SQL·
+Oracle q-quote 안의 보존 텍스트는 포맷 오류에서 제외했다.
+
+`docs/auto_format_rule.md`의 frame 단일 깊이 원천, 문법 기반 부모, first-child-inline,
+closing owner 깊이, 주석/보존 텍스트 구조 중립성, 구분자 문법성, canonical/idempotent
+원칙과 대조해 자동 PASS가 놓친 공통 오류 2종을 발견했다. 각 오류는 MySQL/MariaDB/
+Oracle 재현 테스트를 먼저 추가하고 특정 fixture가 아닌 문법 프레임에서 수정했다.
+
+### 고정 숫자 타입의 precision/scale
+
+AS-IS:
+
+```sql
+DECLARE v_amount DECIMAL(18,
+    2);
+SELECT CAST(v_amount AS NUMERIC(14,
+    4));
+```
+
+TO-BE:
+
+```sql
+DECLARE v_amount DECIMAL(18, 2);
+SELECT CAST(v_amount AS NUMERIC(14, 4));
+```
+
+`DECIMAL/NUMERIC/NUMBER` 등의 고정 타입 modifier는 인자 comma-list가 아니라 compact
+문법 슬롯으로 분류한다. 선언과 CAST 모두 같은 규칙을 사용한다.
+
+### 할당식의 첫 CASE 자식
+
+AS-IS:
+
+```sql
+UPDATE fb_job j
+SET j.job_status =
+    CASE
+        WHEN j.score >= 90 THEN 'READY'
+        ELSE 'HOLD'
+    END;
+```
+
+TO-BE:
+
+```sql
+UPDATE fb_job j
+SET j.job_status = CASE
+        WHEN j.score >= 90 THEN 'READY'
+        ELSE 'HOLD'
+    END;
+```
+
+`=`/`:=` 할당값의 첫 CASE 자식은 owner line에 유지하고, WHEN/ELSE/END는 기존
+assignment-value와 CASE branch frame 깊이를 그대로 소비하도록 수정했다.
+
+최종 포맷 스윕은 63개 파일, regression 30건, frame 22,326개, boundary 49,598개,
+depth symmetry 2,864개, body item 24,281개, close 10,369개를 검사해 failure 0이었다.
+
+## 29-4. 최종 품질 게이트
+
+첫 전체 테스트에서 `completion.rs`가 MariaDB 여부를 직접 비교한 한 줄을 UI backend
+dispatch 가드가 검출했다. 동작은 유지하면서 기존 `completion_db_type_is_mariadb`
+registry helper를 사용하도록 바꾸고 production completion 재현 테스트, dispatch 가드,
+전체 테스트를 다시 실행했다.
+
+| 검증 | 결과 |
+| --- | --- |
+| `syntax_highlighting_sweep_all_files_generate_out_report` | 통과, 63개 파일 · 73,967단어 · unexpected 0 · failure 0 |
+| `intellisense_sweep_generate_report_for_file_certifies_new_final_boss_queries` | 통과, 새 MySQL 1,157개·MariaDB 1,398개 후보 missing 0 |
+| `million_line_` | 5건 통과, 9.02초 |
+| `formatting_sweep_all_files_generate_out_report` | 통과, 63개 파일 · failure 0 |
+| 전수 상세 검토 | 63개 `.format.out` · 45,911줄 · 잔여 오류 0 |
+| `cargo test` | 전체 6,745 통과 · 235 ignored · 실패 0 · doc-test 실패 0 |
+| `cargo clippy --locked --all-targets -- -D warnings -W clippy::perf -W clippy::complexity` | 통과, 경고 0 |
+| `cargo fmt --all -- --check` / `git diff --check` | 통과 |
+
+# 30차: 공식 매뉴얼 문법 final 3종 전수 인증 (2026-07-17)
+
+## 30-1. 신규 final 스크립트와 실제 실행
+
+기존 fixture를 재사용하지 않고 Oracle, MySQL, MariaDB 공식 매뉴얼의 문법군을 기준으로
+각 DB용 `final.sql`을 새로 작성했다. 세 스크립트는 Space Query의 production 실행 경로로
+각 대상 DB에 실행해 모두 정상 완료를 확인했다.
+
+- Oracle: `test/final.sql`
+- MySQL: `test_mysql/final.sql`
+- MariaDB: `test_mariadb/final.sql`
+
+## 30-2. 하이라이팅과 인텔리센스 전수 검증
+
+하이라이팅 sweep은 66개 파일, 83,402단어를 검사했다. catalog 단어 45,625개 중
+45,081개는 직접 하이라이트되고 544개는 문맥상 식별자로 판정됐으며, object 4,480개는
+전부 하이라이트됐다. unexpected highlight 0, failure 0으로 production 수정이 필요한
+잔여 오류는 없었다.
+
+인텔리센스 final 리포트는 Oracle 4,819개, MySQL 1,117개, MariaDB 418개 추천 위치를
+검사해 모두 missing 0이었다. 전체 fixture sweep에서 발견한 MySQL `DELIMITER` 문맥
+차이는 재현 테스트를 먼저 추가하고 테스트가 production completion과 같은 흐름을
+사용하도록 맞췄다. 수정 후 해당 sweep은 707개 후보 missing 0이었다.
+
+100만 줄 이상 문서의 production/snapshot/shadow completion 성능 회귀 5건은 8.87초에
+모두 통과했다. completion은 전체 문서를 다시 순회하지 않고 상한이 있는 token window와
+국소 symbol snapshot만 사용한다.
+
+## 30-3. 포맷 sweep 66개·53,361줄 전수 육안 검토
+
+`formatting_sweep_all_files_generate_out_report`로 생성한 `target/format-sweep` 아래
+66개 `.format.out`, 최종 53,361줄을 처음부터 끝까지 검토했다. 자동 PASS를 그대로
+신뢰하지 않고 원문과 결과를 대조했으며, `docs/auto_format_rule.md`의 frame 단일 깊이
+원천, 문법적 부모, first-child-inline, structural body frame, closing owner depth,
+canonical/idempotent 원칙으로 판단했다.
+
+자동 검사만으로는 잡히지 않은 네 문법군을 육안 검토에서 발견했다. 각 오류는 먼저
+독립 재현 테스트를 추가해 실패를 확인한 뒤 production formatter의 문법 owner를
+수정했다.
+
+### Oracle PROPERTY GRAPH의 TABLES/KEY/PROPERTIES 소유 관계
+
+AS-IS:
+
+```sql
+CREATE PROPERTY GRAPH graph_cert
+VERTEX TABLES (graph_node KEY (node_id) LABEL node PROPERTIES (node_id, node_name))
+EDGE TABLES (graph_edge KEY (edge_id) SOURCE KEY (source_node_id) REFERENCES graph_node (node_id) DESTINATION KEY (target_node_id) REFERENCES graph_node (node_id) LABEL owns PROPERTIES (edge_label, edge_weight));
+```
+
+TO-BE:
+
+```sql
+CREATE PROPERTY GRAPH graph_cert
+    VERTEX TABLES (graph_node
+            KEY (node_id)
+            LABEL node
+            PROPERTIES (node_id,
+                node_name)
+    )
+    EDGE TABLES (graph_edge
+            KEY (edge_id)
+            SOURCE KEY (source_node_id) REFERENCES graph_node (node_id)
+            DESTINATION KEY (target_node_id) REFERENCES graph_node (node_id)
+            LABEL owns
+            PROPERTIES (edge_label,
+                edge_weight)
+    );
+```
+
+`VERTEX TABLES`와 `EDGE TABLES`를 명시적 parenthesized owner로 추가하고,
+`KEY`/`SOURCE KEY`/`DESTINATION KEY`/`LABEL`/`PROPERTIES`를 그 자식으로 분류했다.
+`PROPERTIES` 내부 comma-list도 별도 owner를 사용하므로 100만 줄 문서에서 주변 전체를
+재탐색하지 않는다.
+
+### Oracle MATERIALIZED VIEW LOG 절 소유 관계
+
+AS-IS:
+
+```sql
+CREATE MATERIALIZED VIEW LOG
+ON sq_oracle_manual_log WITH PRIMARY KEY,
+    ROWID (category,
+        amount) INCLUDING NEW VALUES;
+```
+
+TO-BE:
+
+```sql
+CREATE MATERIALIZED VIEW LOG ON sq_oracle_manual_log
+WITH PRIMARY KEY,
+    ROWID (category,
+        amount)
+INCLUDING NEW VALUES;
+```
+
+`ON`은 CREATE header에 유지하고, `WITH` option-list와 `INCLUDING`을 각각 동일 statement의
+명시적 clause로 만들었다.
+
+### MariaDB/MySQL VIEW의 `ALGORITHM = MERGE`
+
+AS-IS:
+
+```sql
+CREATE OR REPLACE ALGORITHM =
+MERGE VIEW statement_log_v AS
+SELECT id
+FROM statement_log;
+```
+
+TO-BE:
+
+```sql
+CREATE OR REPLACE ALGORITHM = MERGE VIEW statement_log_v AS
+SELECT id
+FROM statement_log;
+```
+
+`MERGE`가 `ALGORITHM =`의 값일 때는 독립 MERGE DML opener가 아니므로 structural break를
+만들지 않게 했다.
+
+### MariaDB/MySQL EVENT의 `DO` 본문
+
+AS-IS:
+
+```sql
+CREATE EVENT syntax_event
+    ON SCHEDULE AT CURRENT_TIMESTAMP + INTERVAL 1 DAY
+    ON COMPLETION PRESERVE DISABLE COMMENT 'disabled event' DO UPDATE statement_log
+SET amount = amount
+WHERE id = -1;
+```
+
+TO-BE:
+
+```sql
+CREATE EVENT syntax_event
+    ON SCHEDULE AT CURRENT_TIMESTAMP + INTERVAL 1 DAY
+    ON COMPLETION PRESERVE DISABLE
+    COMMENT 'disabled event'
+    DO
+        UPDATE statement_log
+        SET amount = amount
+        WHERE id = -1;
+```
+
+CREATE EVENT를 명시적 construct로 추적하고 `COMMENT`/`DO`를 event clause로,
+`DO` 뒤 실제 SQL을 structural body frame으로 관리한다.
+
+## 30-4. 추가 자동 포맷 회귀 수정
+
+final 3종의 1차 sweep에서 발견한 나머지 문법도 모두 재현 테스트를 먼저 추가했다.
+
+### prepared `EXECUTE ... USING`, transaction/XA/SHOW
+
+AS-IS:
+
+```sql
+EXECUTE prepared_select
+USING @prepared_amount, @prepared_category;
+START
+TRANSACTION READ WRITE;
+COMMIT AND
+NO CHAIN;
+XA
+START 'sq-final-xa';
+```
+
+TO-BE:
+
+```sql
+EXECUTE prepared_select USING @prepared_amount, @prepared_category;
+START TRANSACTION READ WRITE;
+COMMIT AND NO CHAIN;
+XA START 'sq-final-xa';
+```
+
+prepared EXECUTE의 USING-list를 production list owner에 연결했다. MySQL/MariaDB의
+`START TRANSACTION`, `SHOW CREATE`, `XA START/END`는 client tool/control opener가 아니라
+server SQL 문법으로 판정하고, `COMMIT AND [NO] CHAIN`은 boolean condition으로 분리하지
+않게 했다.
+
+### Oracle `EXEC` bind, `EXPLAIN PLAN`
+
+AS-IS:
+
+```sql
+EXEC
+:b_inout := 10;
+
+EXPLAIN PLAN SET STATEMENT_ID = 'SQ_ORACLE_FINAL'
+FOR
+SELECT category, SUM(amount)
+FROM sq_oracle_manual_log
+GROUP BY category;
+```
+
+TO-BE:
+
+```sql
+EXEC :b_inout := 10;
+
+EXPLAIN PLAN SET STATEMENT_ID = 'SQ_ORACLE_FINAL'
+FOR SELECT category,
+    SUM(amount)
+FROM sq_oracle_manual_log
+GROUP BY category;
+```
+
+Oracle bind assignment의 `EXEC :name`은 줄 단위 tool command 자동 종결 대상에서 제외했다.
+`EXPLAIN PLAN ... FOR`는 procedural FOR-loop가 아니라 explain statement의 clause로
+판정하고 뒤 SELECT의 query/list owner를 정상 생성한다.
+
+## 30-5. 최종 포맷 결과
+
+요청된 명령을 그대로 실행한 최종 포맷 sweep은 1 passed, 0 failed였다. 생성된
+66개 `.format.out` 모두 `status: PASS`, issue 0이며, 수정된 파일의 재생성 결과까지
+다시 육안 대조해 최종 검토 수는 66개·53,361줄이다.
+
+## 30-6. 전체 테스트에서 발견한 production 경로 정합성 수정
+
+전체 `cargo test`는 개별 sweep이 놓칠 수 있는 inventory와 production 조합을 추가로
+검사했다. 실패 건은 기존 테스트 또는 새 재현 테스트로 먼저 고정한 다음 수정했다.
+
+### Oracle `SET TRANSACTION`의 선택적 `NAME`
+
+AS-IS:
+
+```sql
+SET TRANSACTION READ WRITE |;
+-- suggestions: []
+```
+
+TO-BE:
+
+```sql
+SET TRANSACTION READ WRITE NAME 'batch_tx';
+-- suggestions at |: [NAME]
+```
+
+Oracle 공식 문법에 따라 `READ ONLY`, `READ WRITE`, `ISOLATION LEVEL SERIALIZABLE`,
+`ISOLATION LEVEL READ COMMITTED` 뒤에 선택적인 `NAME`을 production grammar table에서
+추천한다. prefix가 비어 있을 때와 입력 중일 때 동일한 경로를 사용한다.
+
+### MySQL/MariaDB DATABASE 대상과 qualified-member 차단
+
+AS-IS:
+
+```sql
+DROP DATABASE IF EXISTS qt_m|;
+-- suggestions: []
+
+SHOW CREATE DATABASE app.|;
+-- suggestions: [EMP, EMP_VIEW, EMP_PROC, ...]
+```
+
+TO-BE:
+
+```sql
+DROP DATABASE IF EXISTS qt_mysql_final_boss;
+-- suggestions at qt_m|: [qt_mysql_final_boss]
+
+SHOW CREATE DATABASE app.|;
+-- suggestions: []
+```
+
+`ALTER/DROP/SHOW CREATE DATABASE|SCHEMA`의 대상은 전용 `Database` object kind로
+분류한다. 따라서 현재 파일과 database catalog의 이름은 추천하지만, 점 뒤에는
+schema의 테이블·뷰·루틴 멤버를 열지 않는다. 테스트와 production 모두 동일한
+qualified-completion entry를 사용한다.
+
+### SQL*Plus slash와 REMARK의 원자적 분할
+
+AS-IS:
+
+```sql
+END
+/ remark execute block
+SELECT 1 FROM DUAL;
+```
+
+```text
+Statement("CREATE PROCEDURE ... END")
+Slash
+Statement("remark execute block")
+Statement("SELECT 1 FROM DUAL")
+```
+
+TO-BE:
+
+```text
+Statement("CREATE PROCEDURE ... END")
+Slash
+Statement("SELECT 1 FROM DUAL")
+```
+
+slash 뒤 `REM`/`REMARK`는 parser engine이 이미 하나의 slash terminator/comment로
+분류한다. concatenated-command 복구가 이를 다시 `/`와 SQL 조각으로 나누지 않도록
+shared slash classifier를 먼저 적용한다.
+
+### MySQL session setting의 typed residue
+
+AS-IS:
+
+```sql
+SET autocommit = 1, sql_notes = 0;
+-- sql_notes를 unknown session state로만 기록
+```
+
+TO-BE:
+
+```sql
+SET autocommit = 1, sql_notes = 0;
+-- autocommit 상태와 session setting residue를 각각 typed state로 기록
+```
+
+일반 세션 설정을 `may_have_session_setting`으로 분리해 물리 세션 보존 판단은 유지하면서
+unknown 상태의 의미를 좁혔다. `SET`의 우변에 등장한 `@var`는 assignment target이
+아니므로 user-variable residue로 잘못 기록하지 않는다.
+
+## 30-7. 최종 품질 게이트
+
+| 검증 | 결과 |
+| --- | --- |
+| Space Query 실제 실행 | Oracle/MySQL/MariaDB `final.sql` 3개 모두 정상 완료 |
+| `syntax_highlighting_sweep_all_files_generate_out_report` | 66개 파일 · 83,402단어 · unexpected 0 · failure 0 |
+| final 인텔리센스 리포트 | Oracle 4,819개 · MySQL 1,117개 · MariaDB 418개, missing 0 |
+| 전체 fixture 인텔리센스 회귀 | MySQL-family 보강 707개 후보, missing 0 |
+| `million_line_` | production/snapshot/shadow 5건 통과, 8.87초 |
+| `formatting_sweep_all_files_generate_out_report` | 통과, 66개 `.format.out` · issue 0 |
+| 전수 상세 검토 | 66개 · 53,361줄 · 잔여 오류 0 |
+| `cargo test` | library 6,623 통과 · 234 ignored · 통합/가드/doc-test 실패 0 |
+| `cargo clippy --locked --all-targets -- -D warnings -W clippy::perf -W clippy::complexity` | 통과, 경고 0 |
+| `cargo fmt --all -- --check` / `git diff --check` | 통과 |
+
+## 31-1. 포맷 sweep 전수 재검토 (2026-07-17)
+
+`formatting_sweep_all_files_generate_out_report` 1차 실행은 PASS(66개 파일,
+30,120 frame, failures=0)였다. 자동 결과를 신뢰하지 않고 66개 `.format.out`
+53,361줄을 다시 전수 검토했다.
+
+- Oracle 42개 파일: 처음부터 끝까지 정독.
+- MySQL 11개·MariaDB 13개: 대표 파일 정독 + 전 파일 소스↔출력 토큰 diff,
+  공백/괄호/들여쓰기 기계 스캔, 플래그된 문맥 전부 정독.
+- 프레임 깊이(rule 1~6), 보존 텍스트(rule 7), 고정구(rule 8), 정규 출력(rule 10)
+  기준으로 대조.
+
+휴리스틱이 플래그했으나 규칙에 부합해 정상 판정한 항목: 여러 줄 주석 내부
+후행 공백/비정렬(보존 텍스트), q-quote 동적 SQL 내부의 별도 정렬, 주석 뒤로
+밀린 선행 콤마(`-- comment` 다음 `, ghij = (`), CREATE TABLE 컬럼 정렬의 이중
+공백, `COUNT(*)` 압축 표기와 `이름 (` 공백 표기의 공존.
+
+## 31-2. [수정] 키워드 대문자화가 식별자 위치를 침범
+
+Oracle 경로의 키워드 케이스 정규화(`token_text` / 메인 루프)는
+`ORACLE_SQL_KEYWORDS`에 있는 단어를 문법 위치와 무관하게 대문자화했다.
+컨텍스트 판정(`formatter_keyword_should_render_as_identifier_from_context`)은
+8개 단어(MODEL/WINDOW/…)만 허용해, NAME·DEPTH·SEED·PATH·REMARK·GRAPH·
+SETTINGS·LABEL·SOURCE·ERRORS·EVENTS·CUME_DIST 같은 비예약 키워드가 식별자
+자리에서도 대문자로 바뀌었다.
+
+AS-IS (formatted 출력):
+
+```sql
+-- test/test5.txt: 소스는 모두 소문자 name/depth
+INSERT INTO oqt_t_depth (id, grp, NAME)
+'grp=0 id=' || r.id || ' name=' || r.NAME
+MIN (DEPTH) min_depth
+
+-- test/mega_torture.txt: <<top>> 라벨과 불일치
+PROCEDURE SEED (p_rows IN NUMBER) IS
+GOTO TOP;
+oqt_mega_pkg.SEED (30);
+
+-- boss/final: CTE·별칭·스키마 한정자
+WITH GRAPH (node_id, ...)         FROM GRAPH g
+WITH SEED AS (...)                FROM SEED s
+EVENTS (event_id, ...) AS (...)   FROM EVENTS e
+) SOURCE ON (target.category = SOURCE.category)
+FROM SYSTEM.help;
+'ERRORS' AS ERRORS                2 ERRORS
+) AS CUME_DIST,                   '/') AS PATH
+PATTERN (SEED rise*)  -- FIRST (SEED.day_value)와 함께 패턴 변수까지 대문자화
+WITH RECURSIVE SETTINGS AS (      -- MySQL
+COLUMNS (LABEL VARCHAR(40) PATH '$'   -- MariaDB JSON_TABLE 컬럼명
+```
+
+TO-BE:
+
+```sql
+INSERT INTO oqt_t_depth (id, grp, name)
+'grp=0 id=' || r.id || ' name=' || r.name
+MIN (depth) min_depth
+PROCEDURE seed (p_rows IN NUMBER) IS
+GOTO top;
+oqt_mega_pkg.seed (30);
+WITH graph (node_id, ...)         FROM graph g
+WITH seed AS (...)                FROM seed s
+events (event_id, ...) AS (...)   FROM events e
+) source ON (target.category = source.category)
+FROM system.help;
+'ERRORS' AS errors                2 errors
+) AS cume_dist,                   '/') AS path
+PATTERN (seed rise*)              FIRST (seed.day_value)
+WITH RECURSIVE settings AS (
+COLUMNS (label VARCHAR(40) PATH '$'
+```
+
+컨텍스트 판정을 문법 기반으로 일반화했다
+(`formatter_keyword_should_render_as_identifier_from_context`):
+
+1. `.` 앞뒤에 붙은 단어는 항상 한정 식별자 세그먼트 (모든 키워드에 적용).
+2. `GOTO` 다음 단어는 항상 라벨 식별자 (모든 키워드에 적용).
+3. 비예약 명사 키워드 12개를 컨텍스트 판정 대상에 추가하고 새 슬롯 규칙 도입:
+   `PROCEDURE`/`FUNCTION` 뒤의 객체명, `WITH`/`RECURSIVE` 뒤의 CTE명,
+   리스트 구분자 사이(`(id, name)`)와 선언 머리(`(label VARCHAR(40)`,
+   `PATTERN (seed rise*)`), 구분자 뒤 `AS` 별칭, 절 머리 바로 뒤 테이블명
+   (`FROM seed s`), 파생 테이블 뒤 별칭(`) source ON ...`).
+4. 소스가 대문자인 경우(`REMARK` 등)는 그대로 보존된다 — 케이스는 항상
+   소스를 따른다.
+
+의도적으로 제외(잔여 known-limitation): `INNER`(조인 수식어와 충돌 위험),
+연산자 피연산자 슬롯(`'x' || inner || 'y'`), 절 밖 SELECT-리스트가 아닌 일반
+표현식 내부의 명사 키워드. 모두 대문자 유지가 안전한 방향이다.
+
+## 31-3. sweep 일반 검출 추가: IdentifierCase 감사
+
+goal: 이런 부류를 사람이 아닌 sweep이 잡도록 일반 규칙으로 내재화.
+
+`format_sweep_audit_identifier_case`를 추가했다. 소스와 포맷 결과의 Word
+토큰을 1:1로 짝지어, 케이스가 바뀐 토큰이 다음의 "문법적으로 식별자일 수밖에
+없는 슬롯"에 있으면 `IdentifierCase` 이슈로 보고한다.
+
+- 앞 또는 뒤 유의미 토큰이 `.` (한정 식별자 세그먼트)
+- 직전 유의미 단어가 `GOTO`/`PROCEDURE`/`FUNCTION` (명명 대상 위치)
+
+리포트의 `checked:` 줄에 `identifier_case_words=` 카운터가 추가되었고,
+집계에 `checked_identifier_case_words=90,145`(66개 파일 + 30개 회귀)로
+반영된다. 수정 전 포맷터로 실행하면 `r.NAME`, `oqt_mega_pkg.SEED`,
+`SYSTEM.help`, `GOTO TOP`, `PROCEDURE SEED`가 모두 FAIL로 검출된다.
+
+고정 회귀 테스트 9개 추가:
+
+- formatter: `oracle_dot_qualified_identifiers_preserve_source_case`,
+  `oracle_goto_label_target_preserves_source_case`,
+  `oracle_cte_and_table_names_matching_keywords_preserve_case`,
+  `oracle_procedure_named_like_keyword_preserves_case`,
+  `oracle_merge_source_alias_preserves_case`,
+  `oracle_column_list_members_matching_keywords_preserve_case`
+- sweep: `formatting_sweep_detects_identifier_case_change_next_to_dot`,
+  `formatting_sweep_detects_identifier_case_change_after_goto_and_procedure`,
+  `formatting_sweep_accepts_keyword_case_normalization_outside_identifier_slots`
+
+## 31-4. 검토 결과 의도된 설계로 판정한 항목 (변경 없음)
+
+1. `CALL proc(arg,\n    arg\n);` — 닫는 괄호 단독 줄. CALL 인자 목록은
+   `paren_opens_call_argument_list` → `WrappedLayout` 프레임으로 명시 분류되어
+   있고(OVER/WINDOW/MODEL RULES/ON DUPLICATE 다중행 계열과 동일), 해당 배치를
+   고정하는 회귀 테스트가 이미 존재한다. 함수 호출식 `');'` 부착과 다른 것은
+   구조 프레임 계열의 일관된 규약.
+2. MySQL `DESCRIBE t` / `SHOW PROCESSLIST` 등 5종의 문말 `;` 제거와
+   SQL*Plus `VARIABLE`→`VAR` 정규화 — 실행기(QueryExecutor)의 tool-command
+   에뮬레이션과 공유되는 canonical 렌더링(`format_tool_command`)이다.
+   포맷터 단독으로 바꾸면 실행 모델과 어긋나므로 유지. 단, 같은 SHOW 계열
+   안에서 서버 전송형(`SHOW DATABASES;`)과 도구 명령형(`SHOW PROCESSLIST`)의
+   표기가 갈리는 점은 추후 tool-command 목록 차원의 정리 후보로 기록한다.
+
+## 31-5. [수정] 케이스 보존의 일관성 보강 (후속)
+
+31-2 적용 후 전체 테스트에서 드러난 두 가지 비일관성을 함께 정리했다.
+
+### 제어 키워드 별칭의 혼합 케이스
+
+AS-IS (31-2 직후):
+
+```sql
+-- 소스: delete from sales if where if.id = 1
+DELETE FROM sales IF      -- 별칭 선언부는 대문자
+WHERE if.id = 1;          -- dot 참조부는 소문자 (혼합)
+```
+
+TO-BE:
+
+```sql
+DELETE FROM sales if
+WHERE if.id = 1;          -- 같은 별칭은 어디서나 소스 케이스
+```
+
+`treat_control_keyword_as_identifier`는 지금까지 구조 처리만 억제하고 케이스는
+대문자화했다. 새 플래그 `control_keyword_alias_preserves_case`를 도입해, 별칭
+슬롯 판정을 받은 제어 키워드 중 직전 유의미 토큰이 별칭 자리를 증명하는 경우
+(비키워드 단어 = 테이블/컬럼명, 또는 파생 테이블의 `)`)에만 케이스도 소스를
+따르게 했다. `PROCEDURE p IS begin`(IS 뒤)이나 `WHEN NOT MATCHED then`
+(MATCHED 뒤)처럼 이웃이 키워드인 경우는 키워드 케이싱을 유지한다 — 첫 시도에서
+이 두 슬롯이 소문자로 남는 회귀가 전체 테스트 8건으로 드러나 조건을 좁혔다.
+(test12/test13 픽스처는 소스가 애초에 대문자 `IF`/`RANK`/`COUNT`라 출력 변화
+없음 — 소문자 `trim` 별칭이 보존되던 기존 동작과 이제 대칭이 된다.)
+
+### ORDER/GROUP BY 머리 뒤 식별자
+
+AS-IS: `SELECT remark, ... ORDER BY REMARK;` — 같은 컬럼이 SELECT 리스트에선
+소문자, ORDER BY에선 대문자.
+
+TO-BE: `ORDER BY remark;` — `BY`(ORDER/GROUP/PARTITION 절)를 절 머리로
+인정해 그 뒤 단어도 동일한 식별자 슬롯 판정을 받는다.
+
+### 기대값 갱신 (구 동작을 고정하던 테스트 13개)
+
+- `comma_list_layout_tests` 3개: `NAME` → `name` (SELECT 리스트 멤버 보존)
+- `format_sql_basic_indents_forall_{insert,update,delete}_body` +
+  `format_sql_basic_nested_forall_update_body_uses_forall_body_depth`:
+  `v_arr.COUNT` → `v_arr.count` (dot 뒤 컬렉션 메서드 케이스 보존)
+- `format_sql_basic_oracle_remark_identifier_does_not_become_script_command`:
+  `REMARK` → `remark` 3곳 (테스트 제목 그대로 "identifier" 판정)
+- IF-별칭 테스트 5개: `sales IF`/`IF.id` → `sales if`/`if.id`
+- `format_sql_basic_keeps_keyword_like_implicit_select_aliases_inline_lowercase`:
+  `amount IF,`/`total END` → `amount if,`/`total end`
+
+이 테스트들의 원래 목적(인라인 유지·블록 키워드 오인 방지·FORALL 본문 들여쓰기)
+은 그대로 검증되며, 케이스 기대값만 새 규칙에 맞춰 바뀌었다.
+
+## 31-6. 최종 품질 게이트
+
+| 검증 | 결과 |
+| --- | --- |
+| `formatting_sweep_all_files_generate_out_report` | 통과 — 66개 파일, 30,120 frames, 60,919 boundaries, 15,154 closes, failures 0 |
+| 신규 IdentifierCase 감사 | 90,145 단어쌍 검사, 위반 0 (수정 전 포맷터 기준이면 r.NAME 등 다수 FAIL) |
+| 전수 상세 검토 | 66개 파일 · 53,361줄 — Oracle 42개 전량 정독, MySQL/MariaDB 토큰 diff + 기계 스캔 + 표본 정독, 잔여 미해결 오류 0 |
+| 수정 항목 | 식별자 케이스 침범(31-2) + 일관성 보강(31-5), 산출물 상 대문자화 오류 약 150여 토큰 해소 |
+| 회귀 고정 | 신규 테스트 9개 + 기존 테스트 14개 기대값 갱신 |
+| `cargo test` | 통과 — 전 타깃 합계 6,781 passed · 0 failed · 238 ignored |
+| `cargo clippy --locked --all-targets -- -D warnings -W clippy::perf -W clippy::complexity` | 통과, 경고 0 |
+
+## 33-1. 포맷 sweep 독립 전수 재검토 (2026-07-18)
+
+### AS-IS
+
+`formatting_sweep_all_files_generate_out_report`의 자동 판정은 처음부터
+PASS였지만, PASS 리포트만으로는 사람이 보는 정렬 품질이나 포맷 이후의 실제
+실행 가능성을 증명하지 못했다. 또한 기존 dialect별 `final.sql` live 테스트는
+원본 문자열을 바로 실행해 포맷 결과를 실행하지 않았다.
+
+### TO-BE
+
+지정 명령을 실행해 생성된 `.format.out` 66개를 파일 목록의 처음부터 끝까지,
+각 파일의 첫 줄부터 마지막 리포트 줄까지 독립적으로 다시 읽었다.
+
+| dialect | 산출물 경로 | 파일 | 판독한 줄 |
+| --- | --- | ---: | ---: |
+| Oracle | `target/format-sweep/test` | 42 | 29,228 |
+| MySQL | `target/format-sweep/test_mysql` | 11 | 9,859 |
+| MariaDB | `target/format-sweep/test_mariadb` | 13 | 14,274 |
+| 합계 |  | 66 | 53,361 |
+
+`docs/auto_format_rule.md`의 owner/body/close 깊이, 4칸 배수 들여쓰기,
+SELECT/FROM/SET/VALUES/CTE/CASE/PL/SQL·routine block의 형제 정렬,
+문자열·주석·동적 SQL 보존, tool command, 키워드/식별자 케이스, 정규 출력과
+멱등성을 대조했다. 중첩 CASE·CTE·inline view·window·MODEL·JSON_TABLE·
+XMLTABLE·trigger·handler·transaction·동적 SQL까지 확인했으며 시각적/구조적
+결함은 0건이었다. 따라서 추측성 formatter 본체 수정은 하지 않았다.
+
+후행 공백 기계 스캔이 찾은 세 줄은 모두 원본의 여러 줄 블록 주석 내부와
+바이트 단위로 같았다.
+
+- `test/test17.sql:1` — `/* `
+- `test/test19.sql:1` — `/* `
+- `test/test10.txt:4` — `      ; `
+
+이는 포맷터가 새로 만든 code-line 후행 공백이 아니라 rule 7의 보존 대상이다.
+실제 code line의 후행 공백, 탭 들여쓰기, 4칸 배수 위반, CR 문자는 0건이었다.
+
+## 33-2. 일반화된 frame/depth 감사 확인
+
+기존 sweep은 특정 SQL 문자열을 하드코딩해 비교하는 방식이 아니라 production
+formatter가 만든 모든 managed frame과 list owner를 직접 감사한다. 이번 실행은
+`FormatManagedFrameKind::ALL` 23종과 `ListOwnerKind` 38종을 모두 실제로
+exercise했고 다음 일반 감사가 모두 issue 0이었다.
+
+| 감사 항목 | 검사 수 |
+| --- | ---: |
+| SQL word/식별자 케이스 쌍 | 90,165 |
+| managed frame | 30,129 |
+| frame boundary | 60,928 |
+| 대칭 depth 관계 | 3,011 |
+| frame body item | 27,708 |
+| frame close | 15,155 |
+
+소스↔결과의 SQL statement item/token fingerprint, MySQL-family executable
+boundary, 안전한 공백 변형 probe, 2차 포맷 멱등성도 함께 감사한다. 66개 fixture와
+32개 구조 회귀에서 failures=0이므로 동일 검사를 중복 구현하는 별도 휴리스틱은
+추가하지 않았다.
+
+## 33-3. 포맷 이후 Space Query 실제 실행 보강
+
+AS-IS live certification은 `include_str!(...final.sql)` 또는 원본 파일 문자열을
+Space Query 실행기에 바로 넘겼다.
+
+TO-BE는 각 테스트가 명시적 dialect로
+`format_for_auto_formatting_with_db_type`을 먼저 호출하고 그 결과를 기존
+production batch/Oracle Thin 실행기에 전달한다.
+
+- `execute_mysql_batch_formatted_manual_final_reaches_pass_status`
+- `execute_mariadb_batch_formatted_manual_final_reaches_pass_status`
+- `oracle_thin_query_tool_runs_formatted_manual_final_script_without_errors`
+
+로컬 MySQL 8.0(3307), MariaDB 12.2(3306), Oracle Free(1521) 컨테이너에서
+세 테스트를 각각 실행했다. 모두 failed statement/event 0이었고 각 수동
+`final.sql`의 최종 PASS 행까지 도달했다. 모든 66개 fixture는 sweep에서 동일한
+Space Query script splitter로 포맷 전후 statement item/token 및 실행 경계를
+전수 비교했고 차이는 0건이었다.
+
+## 33-4. 변경 파일
+
+- `src/ui/sql_editor/execution.rs`: dialect별 live certification 3개를 포맷 후
+  실행하도록 보강하고 테스트 이름/활동 라벨을 실제 검증 내용에 맞춤.
+- `change.md`: 이번 전수 검토의 AS-IS/TO-BE, 판정 근거, 실행 검증을 기록하고
+  이전 절의 Oracle 파일 수 오기(43 → 42)를 정정.
+
+## 33-5. 최종 품질 게이트
+
+| 검증 | 결과 |
+| --- | --- |
+| `cargo test --lib formatting_sweep_all_files_generate_out_report -- --ignored --nocapture` | 통과 — 66개 fixture + 32개 회귀, failures 0 |
+| 포맷 후 Space Query live 실행 | Oracle/MySQL/MariaDB `final.sql` 3개 모두 PASS, failed statement/event 0 |
+| `cargo test` | 통과 — 전 타깃 합계 6,785 passed · 0 failed · 238 ignored |
+| `cargo clippy --locked --all-targets -- -D warnings -W clippy::perf -W clippy::complexity` | 통과, 경고 0 |
+| `cargo fmt --all -- --check` / `git diff --check` | 통과 |
+
+# 34차: 전수 재검토 + 잔여 식별자 케이스 한계 해소 (2026-07-18)
+
+## 34-1. 포맷 sweep 전수 재검토
+
+`cargo test --lib formatting_sweep_all_files_generate_out_report -- --ignored
+--nocapture`는 1차부터 PASS(failures=0)였지만 신뢰하지 않고, 생성된
+`.format.out` 66개(Oracle 42 · MySQL 11 · MariaDB 13, 총 53,361줄)를 구조
+digest(반복 패턴 축약)로 처음부터 끝까지 다시 읽었다. `docs/auto_format_rule.md`
+의 frame 규칙 10개(owner/body/close 깊이, first-child-inline, d+2의 두 frame
+edge 설명 가능성, 닫는 구분자 owner 깊이, 주석/문자열 원문 보존, 정규·멱등
+출력)와 대조했고 레이아웃/깊이 결함은 0건이었다.
+
+레이아웃과 별개로, 소스↔결과 전체 토큰 정렬 스캔(주석 제외, q-quote/문자열
+lexer 인식)으로 케이스가 바뀐 단어를 전수 나열해 아래 34-2의 실제 결함 2종을
+찾았다. 토큰 수가 달라진 20개 파일은 모두 기존에 코드로 확인한 의도된
+tool-command 정규화(`VARIABLE`→`VAR`, tool command `;` 제거, EXEC/마지막 문
+`;` 부여, `@TRANSACTION`→`SET AUTOCOMMIT = 0;`)였다.
+
+## 34-2. [수정] 31-2의 known-limitation이 실제 결함으로 확인됨
+
+31-2에서 "대문자 유지가 안전한 방향"으로 남겨 둔 `INNER`·연산자 피연산자
+슬롯이 실제 소스에서 소문자 식별자를 침범하고 있었다.
+
+### `inner` 지역변수 (test/test6.txt · test/mega_torture.txt, 각 2회)
+
+AS-IS (formatted 출력):
+
+```sql
+DECLARE
+    INNER NUMBER := p_n * 11;
+BEGIN
+    log_msg ('RUN', 'inner0', v_depth + 1, 'inner=' || INNER || q'[ | inside: END; / ; ]');
+```
+
+TO-BE:
+
+```sql
+DECLARE
+    inner NUMBER := p_n * 11;
+BEGIN
+    log_msg ('RUN', 'inner0', v_depth + 1, 'inner=' || inner || q'[ | inside: END; / ; ]');
+```
+
+### `name` 멤버/컬럼 (test/test16.sql, 2회)
+
+AS-IS (formatted 출력):
+
+```sql
+RETURN 'id=' || id || ';name=' || NAME || ';note=' || note_text || '/tail';
+-- UPDATE ... SET
+NAME = normalize_name (p_name),
+```
+
+TO-BE:
+
+```sql
+RETURN 'id=' || id || ';name=' || name || ';note=' || note_text || '/tail';
+-- UPDATE ... SET
+name = normalize_name (p_name),
+```
+
+### 수정 내용 (`formatter_keyword_should_render_as_identifier_from_context`)
+
+`INNER`를 whitelist에 넣는 방식은 기각했다 — 기존 슬롯 규칙과 결합하면 실제
+`INNER JOIN`까지 식별자로 강등될 위험이 있다. 대신 whitelist 앞 단계의 보편
+규칙 2개를 추가했다(`.`/`GOTO` 규칙과 같은 층위, 모든 키워드에 적용):
+
+1. `||` 연접 피연산자: 앞 또는 뒤 토큰이 `||`인 단어는 표현식 피연산자로
+   식별자 처리. 단 함수 호출(`|| SUBSTR(...)`), 표현식 키워드(`|| CASE`,
+   `IS NULL ||` 등 25개), `DATE`/`TIMESTAMP` 리터럴 머리는 키워드 유지.
+2. 선언 이름: `DECLARE <word> <word>` 형태의 첫 단어는 선언 이름으로 식별자
+   처리. 키워드형 선언 머리(`CURSOR`/`TYPE`/`CONTINUE`/`PRAGMA` 등 9개)는
+   제외.
+
+추가로 `token_ends_identifier_slot`(+`_from_context`)의 슬롯 종결 기호에
+`=`/`:=`를 추가해, whitelist 단어의 `SET name = ...` 대입 대상 슬롯이
+인식되게 했다 (기존은 `,`/`)`/`;`만 종결로 인정해 `SET NAME =`로 남았다).
+
+## 34-3. sweep 일반 검출 확장 + 회귀 테스트
+
+`format_sweep_audit_identifier_case`가 새 슬롯 2종(연접 피연산자, 선언 이름)의
+케이스 변경도 `IdentifierCase` 이슈로 검출하도록 확장했다. 감사는 formatter
+내부 함수를 호출하지 않는 독립 구현(감사 독립성 유지)이다. 회귀 테스트 2개:
+
+- `formatting_sweep_identifier_case_preserves_declared_names_and_concat_operands`
+  — inner/name 패턴이 포맷 후 소문자로 보존되고 sweep 이슈 0건.
+- `formatting_sweep_identifier_case_flags_keyword_cased_concat_operand_and_declaration`
+  — 대문자화된 합성 출력을 감사에 넣으면 두 슬롯 모두 FAIL 검출.
+
+수정 후 재생성한 66개 결과의 전수 토큰 스캔에서 케이스 변경은 의도된 것만
+남았다: `dual`→`DUAL` 176회, 소문자 키워드 대문자화(`raise_application_error`
+4회, `level`/`constraint`/`select`/`from` 각 1회). sweep 집계는
+identifier_case_words=90,165 · frames=30,129 · boundaries=60,928 · failures=0.
+
+## 34-4. 포맷 이후 Space Query 실제 실행
+
+33-3의 포맷-후-실행 인증 3종을 로컬 컨테이너(MySQL 8.0/3307, MariaDB
+12.2/3306, Oracle Free/1521)에서 재실행해 모두 PASS(실패 statement/event 0):
+
+- `execute_mysql_batch_formatted_manual_final_reaches_pass_status`
+- `execute_mariadb_batch_formatted_manual_final_reaches_pass_status`
+- `oracle_thin_query_tool_runs_formatted_manual_final_script_without_errors`
+
+나머지 fixture는 sweep이 동일 script splitter로 포맷 전후 statement
+item/token·실행 경계를 전수 비교하며 차이 0건.
+
+## 34-5. 변경 파일
+
+- `src/ui/sql_editor/formatter.rs`: `||` 피연산자·DECLARE 선언 이름 보편 규칙,
+  식별자 슬롯 종결 기호에 `=`/`:=` 추가.
+- `src/ui/sql_editor/format_sweep_tests.rs`: IdentifierCase 감사에 두 슬롯
+  검출 추가, 회귀 테스트 2개.
+- `change.md`: 본 절.
+
+## 34-6. 최종 품질 게이트
+
+| 검증 | 결과 |
+| --- | --- |
+| `cargo test --lib formatting_sweep_all_files_generate_out_report -- --ignored --nocapture` | 통과 — 66개 fixture, failures 0 |
+| 포맷 후 Space Query live 실행 | Oracle/MySQL/MariaDB `final.sql` 3개 모두 PASS |
+| `cargo test` | 통과 — 35-7 최종 통합 실행 기준 6,789 passed · 0 failed · 245 ignored |
+| `cargo clippy --locked --all-targets -- -D warnings -W clippy::perf -W clippy::complexity` | 통과 — 경고 0 |
+
+# 35차: MySQL 계열 VIEW DDL query-body 깊이 일반화 (2026-07-18)
+
+## 35-1. 독립 전수 검토에서 발견한 결함
+
+지정된 ignored sweep은 최초 실행부터 66개 모두 PASS였지만, 생성된
+`.format.out` 66개 53,361줄을 리포트 꼬리까지 다시 정독하던 중 자동 판정이
+놓친 VIEW DDL owner-depth 결함 1종을 찾았다.
+
+AS-IS:
+
+```sql
+ALTER ALGORITHM = UNDEFINED VIEW statement_log_v AS
+SELECT id,
+    category
+FROM statement_log;
+```
+
+`CREATE VIEW`만 DDL query-body owner로 분류하던 규칙 때문에 MySQL의
+`ALTER VIEW`, MariaDB의 `CREATE ... ALGORITHM ... VIEW`와
+`ALTER ... ALGORITHM ... VIEW` 아래 SELECT/FROM이 owner와 같은 깊이였다.
+
+TO-BE:
+
+```sql
+ALTER ALGORITHM = UNDEFINED VIEW statement_log_v AS
+    SELECT id,
+        category
+    FROM statement_log;
+```
+
+VIEW header가 owner depth `d`, 직접 query-body가 `d + 1`이 되어
+`docs/auto_format_rule.md`의 owner/body/close 규칙과 일치한다.
+
+## 35-2. 일반 규칙 수정과 회귀 고정
+
+특정 fixture 문자열을 보정하지 않고 공용 DDL header 분류를
+CREATE/ALTER로 일반화했다. MySQL/MariaDB VIEW 문법의 `ALGORITHM`, `DEFINER`,
+`SQL SECURITY` 선택절을 건너뛴 뒤 `VIEW ... AS`를 판정하며, 기존 Oracle
+VIEW/MATERIALIZED VIEW와 CTAS 판정은 그대로 유지한다. 같은 분류를 formatter와
+Space Query script owner-boundary 판정이 함께 사용한다.
+
+테스트는 구현 전에 `ALTER ALGORITHM = UNDEFINED VIEW`와 선택절이 붙은
+`CREATE VIEW`의 SELECT/FROM 깊이를 assertion으로 추가했고, 기존 코드에서
+실패하는 것을 확인한 뒤 수정했다. 분류 단위 테스트에는 CREATE/ALTER 선택절
+연쇄와 `ALTER TABLE ... AS` 음성 사례를 추가했다.
+
+기존 sweep의 managed-frame 감사만으로는 production 분류가 owner 자체를 놓칠
+때 기대 frame도 함께 사라져 같은 결함을 검출하지 못했다. 이를 독립 보완하도록
+포맷된 statement 토큰에서 CREATE/ALTER VIEW와 CTAS header를 찾고, 다음 query
+head가 정확히 owner + 4칸인지 검사하는 DDL depth 감사를 추가했다. 이 감사는
+production DDL 분류 함수를 호출하지 않는다. SELECT를 owner 깊이에 둔 합성
+출력을 넣으면 `FrameAlignment` 2건을 검출하는 음성 테스트도 고정했다.
+
+새 감사의 query-head 검사를 66개에 적용하자 `test_mysql/test3.txt`의 MySQL
+CTAS 누락도 추가로 발견됐다.
+
+AS-IS:
+
+```sql
+    CREATE TEMPORARY TABLE tmp_step_agg AS
+    SELECT run_id,
+        owner_name
+    FROM tmp_step_tag;
+```
+
+query head를 owner + 1로 옮긴 1차 수정 뒤에도 전수 문서 대조에서 후속 list
+frame이 블록 owner에 눌리는 잔여 결함을 찾았다.
+
+INTERMEDIATE:
+
+```sql
+    CREATE TEMPORARY TABLE tmp_step_agg AS
+        SELECT run_id,
+        owner_name
+        FROM tmp_step_tag
+        GROUP BY run_id,
+        owner_name;
+```
+
+TO-BE:
+
+```sql
+    CREATE TEMPORARY TABLE tmp_step_agg AS
+        SELECT run_id,
+            owner_name
+        FROM tmp_step_tag
+        GROUP BY run_id,
+            owner_name;
+```
+
+공용 DDL 분류가 Oracle의 `GLOBAL/PRIVATE TEMPORARY TABLE`만 처리하고 MySQL의
+직접 `TEMPORARY TABLE`을 놓친 것이 원인이었다. 같은 일반 분류에 이 header를
+추가했다. 1차 수정 뒤에는 DDL query-body가 runtime base-depth로만 존재해,
+프로시저 `BEGIN` block의 structural-parent clamp가 SELECT/FROM/GROUP list frame을
+한 단계 얕게 되돌리고 있었다. top-level DDL query-body base를 합성 structural
+parent depth로 사용해 직접 clause는 body depth, comma 뒤 list sibling은 body + 1
+depth가 되도록 일반화했다.
+
+독립 감사도 production DDL 분류에 의존하지 않은 채 statement span, custom
+delimiter 내부의 같은 괄호 깊이 세미콜론, token paren depth를 조합한다. 이제
+query head뿐 아니라 direct query clause와 top-level comma 뒤 list sibling까지
+검사한다. 합성 누락 출력은 query head 2건과 list sibling 2건을 각각
+`FrameAlignment`로 검출하며, 최종 66개 위반은 0이다.
+
+VIEW 수정 직후 이전 산출물과 전체 디렉터리를 비교하면 바뀐 파일은 정확히
+2개였다.
+
+- `test_mysql/final.sql.format.out`: `ALTER VIEW` body에 4칸 추가
+- `test_mariadb/final.sql.format.out`: 선택절이 있는 CREATE/ALTER VIEW body에
+  각각 4칸 추가
+
+그 밖의 64개 산출물과 토큰·문장 경계에는 변화가 없었다.
+독립 감사 추가 후에는 `test_mysql/test3.txt.format.out` 한 파일만 더 바뀌었다.
+최종적으로 임시 CTAS의 SELECT/FROM/GROUP BY는 owner + 1, 후속 SELECT/GROUP
+list item은 owner + 2 깊이로 이동했으며 종료 뒤 procedure sibling은 원래 block
+깊이로 복귀했다. 그 외 산출물 차이는 없었다.
+
+## 35-3. 재생성 및 전수 검증
+
+| dialect | 파일 | 판독한 줄 |
+| --- | ---: | ---: |
+| Oracle | 42 | 29,228 |
+| MySQL | 11 | 9,859 |
+| MariaDB | 13 | 14,274 |
+| 합계 | 66 | 53,361 |
+
+수정 후 sweep을 다시 실행해 66/66 `status: PASS`, 66/66
+`issues: total=0`을 확인했다. 집계는 regressions=32,
+identifier_case_words=90,165, frames=30,129, boundaries=60,925,
+depth_symmetries=3,422, body_items=27,708,
+closes=15,155, failures=0이다.
+실제 format error marker, 탭, CR은 0건이었다. 후행 공백 3줄은 33-1에서
+확인한 원본 보존 블록 주석뿐이다.
+
+## 35-4. 포맷 이후 Space Query 실제 실행
+
+AS-IS 검증은 dialect별 종합 `final.sql` 3개만 실제 DB에서 실행하고, 나머지는
+splitter의 포맷 전후 item/token/실행 경계 비교로 대신했다. 목표의 "모든
+스크립트"를 엄격히 충족하도록 각 디렉터리의 fixture 전부를 명시적 dialect로
+포맷한 뒤 파일마다 새 Space Query session에서 순차 실행하는 ignored live 감사를
+추가했다. 각 파일은 실패 `StatementFinished`가 0이고 성공 statement가 1개
+이상이어야 한다.
+
+| DB | live 대상 | 성공 statement | 결과 |
+| --- | ---: | ---: | --- |
+| Oracle Free/1521 | 42/42 | 2,612 | PASS |
+| MySQL 8.0/3307 | 11/11 | 377 | PASS |
+| MariaDB 12.2/3306 | 13/13 | 647 | PASS |
+| 합계 | 66/66 | 3,636 | 실패 0 |
+
+재검증 첫 실행에서는 MariaDB의 단일 복합 SELECT fixture인 `test12.txt`가
+실패 event 없이 성공 statement 0개로 잘못 집계됐다. 포맷된 SQL은 정상이었고,
+Space Query의 단일 SELECT lazy-fetch가 첫 결과를 준비하는 동안 테스트 공용
+progress 수집기의 50ms 유휴 제한이 먼저 끝난 것이 원인이었다.
+
+AS-IS: 첫 progress event 뒤 50ms 동안 다음 event가 없으면 전수 live 감사도
+수집을 종료해, 실행 중인 복합 SELECT를 미실행으로 오판할 수 있었다.
+
+TO-BE: 일반 회귀 테스트의 50ms 동작은 유지하고, 모든 fixture를 끝까지 확인하는
+전수 live 감사에서만 유휴 제한을 5초로 늘렸다. 같은 MariaDB 13개를 다시 실행해
+`test12.txt`의 성공 statement 1개와 전체 647개, 실패 0을 확인했고, 이 경로를
+공유하는 MySQL 11개도 377개, 실패 0으로 재검증했다.
+
+추가한 live 감사 테스트는 다음과 같다.
+
+- `oracle_thin_query_tool_runs_all_formatted_fixture_scripts_without_errors`
+- `execute_all_formatted_mysql_fixture_scripts_without_errors`
+- `execute_all_formatted_mariadb_fixture_scripts_without_errors`
+
+기존 종합 `final.sql` 인증 3종도 별도로 모두 최종 PASS evidence까지 도달했다.
+
+## 35-5. [수정] Oracle fixture 반복 실행 cleanup
+
+Oracle 전수 live 감사 첫 실행에서 `final.sql`의 savepoint가 실패한 것은 감사
+하네스가 기존 인증과 달리 auto-commit을 켠 탓이었다. Oracle 감사의 초기
+auto-commit을 `false`로 맞춰 production manual-transaction 조건을 복원했다.
+
+동일 SYSTEM 스키마에서 전수 감사를 반복하자 세 boss fixture의 FK 테이블 cleanup이
+삭제 순서에 따라 부모 테이블을 남기는 문제가 드러났다.
+
+AS-IS:
+
+```sql
+EXECUTE IMMEDIATE 'DROP TABLE ' || r.object_name || ' PURGE';
+```
+
+TO-BE:
+
+```sql
+EXECUTE IMMEDIATE
+    'DROP TABLE ' || r.object_name || ' CASCADE CONSTRAINTS PURGE';
+```
+
+`oracle_format_final_boss_v2.sql`의 명시적 DROP 4곳,
+`oracle_format_ultimate_boss.sql`과 `test20.sql`의 동적 DROP 각 1곳만 보강했다.
+수정 후 같은 42개를 동일 스키마에서 다시 전수 실행해 모두 통과했다. 재생성한
+format 산출물 diff도 이 세 파일의 문자열 6곳만 바뀌었고, 나머지 출력과 전체
+53,361줄 수에는 변화가 없었다.
+
+## 35-6. 변경 파일
+
+- `src/sql_text.rs`: CREATE/ALTER VIEW 선택절과 MySQL `TEMPORARY TABLE AS`를
+  포함하는 DDL query-body header 공용 분류.
+- `src/ui/sql_editor/formatter.rs`: 공용 DDL owner 판정을 query-body depth에 적용.
+- `src/db/query/script.rs`: script owner-boundary 판정도 같은 공용 분류 사용.
+- `src/ui/sql_editor/format_sweep_tests.rs`: 독립 DDL owner/body 감사와
+  CREATE/ALTER VIEW·TEMPORARY CTAS 깊이 회귀 assertion.
+- `src/ui/sql_editor/execution.rs`: 66개 포맷 fixture 전수 live 감사 테스트와
+  단일 SELECT lazy-fetch 완료 대기.
+- `test/oracle_format_final_boss_v2.sql`, `test/oracle_format_ultimate_boss.sql`,
+  `test/test20.sql`: FK-safe 반복 cleanup.
+- `change.md`: 본 AS-IS/TO-BE와 검증 기록.
+
+## 35-7. 최종 품질 게이트
+
+| 검증 | 결과 |
+| --- | --- |
+| `cargo test --lib formatting_sweep_all_files_generate_out_report -- --ignored --nocapture` | 통과 — 66개 fixture + 32개 회귀, failures 0 |
+| 포맷 후 Space Query live 실행 | 66/66 fixture, 3,636 successful statements, 실패 0 |
+| `cargo test` | 통과 — 전 타깃 합계 6,789 passed · 0 failed · 245 ignored |
+| `cargo clippy --locked --all-targets -- -D warnings -W clippy::perf -W clippy::complexity` | 통과 — 경고 0 |
+| `cargo fmt --all -- --check` / `git diff --check` | 통과 |
+
+# 36차: 66개 `.format.out` 독립 재감사 및 live 재인증 (2026-07-18)
+
+## 36-1. AS-IS / TO-BE
+
+AS-IS: ignored formatting sweep의 `status: PASS`와 `issues: total=0` 집계만으로는
+생성된 출력 전체가 관례적으로 자연스럽고 `docs/auto_format_rule.md`의 frame-depth
+규칙을 처음부터 끝까지 만족하는지, 또 포맷 결과가 실제 Space Query 실행 경로에서
+모두 동작하는지를 독립적으로 증명하지 못한다.
+
+TO-BE: sweep을 새로 실행한 뒤 66개 `.format.out`의 모든 53,361줄을 줄 번호와
+선행 공백 수를 보존한 구조 판독으로 처음부터 끝까지 다시 검토한다. 인용 문자열
+payload는 sweep의 source/literal fingerprint와 token/order·idempotence 감사로 별도
+검증하고, 탭·CR·후행 공백·실제 format error marker도 전수 검색한다. 마지막으로
+66개 포맷 fixture 전부를 dialect별 Space Query 실행 하네스로 실제 DB에서 실행해
+실패 statement/event가 없음을 확인한다.
+
+## 36-2. 생성 결과 전수 판독
+
+| dialect | 파일 | 판독한 줄 | 결과 |
+| --- | ---: | ---: | --- |
+| Oracle | 42 | 29,228 | 이상 없음 |
+| MySQL | 11 | 9,859 | 이상 없음 |
+| MariaDB | 13 | 14,274 | 이상 없음 |
+| 합계 | 66 | 53,361 | 이상 없음 |
+
+DDL query body, CTE/재귀 CTE, 괄호·목록, CASE branch, JOIN body, routine/trigger
+block, cursor/handler, window inheritance, JSON_TABLE, set operator, RETURNING,
+application/system time 구문을 문서의 owner/body/close 규칙과 대조했다. 주석과
+동적 SQL·q-quote·멀티라인 literal 내부의 비정규 들여쓰기는 원문 보존 영역으로
+확인했으며 구조 깊이로 오판하지 않았다.
+
+일반화할 수 있는 새 frame-depth 결함이나 관례적 포맷 결함은 발견되지 않았다.
+따라서 특정 fixture 보정, formatter 변경, 또는 이미 통과하는 sweep assertion을
+추가하지 않았다. 이는 요청 범위에 필요한 최소 변경이며 기존 35차의 독립 DDL
+owner/body 감사와 managed-frame 감사가 이번 산출물에서도 위반 0건을 냈다.
+
+## 36-3. sweep 및 보존 영역 재검증
+
+`cargo test --lib formatting_sweep_all_files_generate_out_report -- --ignored
+--nocapture`를 새로 실행해 1 passed, failures=0을 확인했다. 집계는
+files=66, regressions=32, identifier_case_words=90,165, frames=30,129,
+frame_boundaries=60,925, frame_depth_symmetries=3,422,
+frame_body_items=27,708, frame_closes=15,155였다. 관리 대상 frame kind 23종과
+list-owner kind 38종이 모두 감사 대상에 포함됐다.
+
+실제 `[[FMT:E숫자...]]` marker, 탭, CR, nonzero issue count는 0건이다. 후행 공백
+3줄은 원본과 byte-for-byte 동일한 보존 영역이다.
+
+- `test/test17.sql:1`: `/* `
+- `test/test19.sql:1`: `/* `
+- `test/test10.txt:4`: literal 내부의 `      ; `
+
+## 36-4. 포맷 이후 Space Query 실제 실행
+
+| DB | live 대상 | 성공 statement | 결과 |
+| --- | ---: | ---: | --- |
+| Oracle Free/1521 | 42/42 | 2,612 | PASS |
+| MySQL 8.0/3307 | 11/11 | 377 | PASS |
+| MariaDB 12.2/3306 | 13/13 | 647 | PASS |
+| 합계 | 66/66 | 3,636 | 실패 0 |
+
+전수 live 감사 3종에 더해 dialect별 포맷 `final.sql` 인증 3종도 별도로 재실행해
+모두 최종 PASS row까지 도달했다.
+
+## 36-5. 변경 파일
+
+- `change.md`: 본 독립 AS-IS/TO-BE 감사와 검증 결과만 기록.
+
+formatter, splitter, sweep test 및 fixture에는 변경이 없다.
+
+## 36-6. 최종 품질 게이트
+
+| 검증 | 결과 |
+| --- | --- |
+| `cargo test --lib formatting_sweep_all_files_generate_out_report -- --ignored --nocapture` | 통과 — 66개 fixture + 32개 회귀, failures 0 |
+| 포맷 후 Space Query live 실행 | 66/66 fixture, 3,636 successful statements, 실패 0 |
+| 포맷 `final.sql` PASS 인증 3종 | Oracle/MySQL/MariaDB 모두 PASS row 도달 |
+| `cargo test` | 통과 — 전 타깃 합계 6,789 passed · 0 failed · 245 ignored |
+| `cargo clippy --locked --all-targets -- -D warnings -W clippy::perf -W clippy::complexity` | 통과 — 경고 0 |
+| `cargo fmt --all -- --check` / `git diff --check` | 통과 |
+
+## 37. 단일-라인 프레임 닫힘 · SQL 절 CASE 식 교정 (2026-07-18)
+
+`formatting_sweep_all_files_generate_out_report`를 1차 실행한 뒤
+`target/format-sweep` 아래 66개 `.format.out`(총 53,427줄)을
+`docs/auto_format_rule.md` §1·§5·§6 기준으로 전수 재검토했다. 자동 검사가 PASS로
+통과시켰지만 관례상 어색한 두 가지를 발견해 교정하고, 재발 방지 감사 규칙을
+frame-depth 기반으로 일반화해 추가했다.
+
+### 37.1 단일 라인 본문 프레임의 닫는 괄호가 새 줄로 떨어지던 문제
+
+`JSON_TABLE ... COLUMNS (...)` / `NESTED PATH ... COLUMNS (...)` 처럼
+`ColumnList`·`QueryLike` 프레임으로 분류되는 괄호는 본문이 한 줄에 다 들어가도
+닫는 `)`를 소유자 깊이의 새 줄에 렌더링했다. §1(실제 프레임 경계가 둘일 때만
+깊이가 생긴다)·§6(닫는 구분자가 *줄을 시작할 때만* 소유자 깊이를 쓴다)에 따르면
+본문에 줄바꿈이 없으면 닫는 괄호는 본문 끝에 붙어야 한다.
+
+`test/final.sql` — JSON_TABLE COLUMNS:
+
+```sql
+-- AS-IS
+        COLUMNS (statement_name VARCHAR2 (100) PATH '$'
+        )
+    );
+
+-- TO-BE
+        COLUMNS (statement_name VARCHAR2 (100) PATH '$')
+    );
+```
+
+`test/oracle_format_final_boss_v2.sql` — 중첩 JSON_TABLE:
+
+```sql
+-- AS-IS
+        FROM JSON_TABLE (e.json_doc,
+                '$.skills[*]' COLUMNS (skill VARCHAR2 (100) PATH '$'
+                )) jt
+
+-- TO-BE
+        FROM JSON_TABLE (e.json_doc,
+                '$.skills[*]' COLUMNS (skill VARCHAR2 (100) PATH '$')
+            ) jt
+```
+
+동형 교정: `test/test11.txt`, `test_mariadb/test4·test5.txt`,
+`test_mysql/test5.txt`.
+
+구현(`src/ui/sql_editor/formatter.rs`): `ParenFormatFrame`에 `body_start_out_len`
+필드와 `body_is_single_line(&out)` 헬퍼를 추가하고(여는 괄호를 낼 때 `out.len()`
+기록, 이후 본문에 `\n`이 없으면 단일 라인 판정), 닫는 괄호의 `closes_indented()`
+분기에 `&& !body_is_single_line(&out)` 조건을 붙였다. 여러 줄 본문은 기존대로
+소유자 깊이의 새 줄에 닫힌다.
+
+### 37.2 SQL 절 안 CASE 식의 THEN/ELSE 값이 새 줄로 분리되던 문제
+
+`ORDER BY`/`GROUP BY`/`HAVING`/`RETURNING` 등 SQL 절의 CASE **식**인데도
+`OPEN ... FOR`·`RETURNING` 같은 PL/SQL 문맥이 활성이면 THEN/ELSE 뒤 값을 문
+본문처럼 새 줄로 밀어냈다. 같은 파일의 `SELECT`/`SET` 절 CASE는 값을 THEN과 같은
+줄에 유지하므로 문맥에 따라 규칙이 갈렸다. §5는 본문 경계 규칙이 문 본문에만
+적용되고 CASE 식 분기에는 적용되지 않음을 규정한다.
+
+`test/oracle_format_final_boss_v2.sql` — OPEN ... FOR 안의 ORDER BY CASE:
+
+```sql
+-- AS-IS
+            ORDER BY CASE
+                    WHEN e.band_label LIKE 'HIGH%' THEN
+                        1
+                    WHEN e.band_label LIKE 'MID%' THEN
+                        2
+                    ELSE
+                        3
+                END,
+
+-- TO-BE
+            ORDER BY CASE
+                    WHEN e.band_label LIKE 'HIGH%' THEN 1
+                    WHEN e.band_label LIKE 'MID%' THEN 2
+                    ELSE 3
+                END,
+```
+
+`test/oracle_format_ultimate_boss.sql` — ORDER BY CASE:
+
+```sql
+-- AS-IS
+                    WHEN 'VIEW' THEN
+                        1
+                    WHEN 'PACKAGE BODY' THEN
+                        2
+
+-- TO-BE
+                    WHEN 'VIEW' THEN 1
+                    WHEN 'PACKAGE BODY' THEN 2
+```
+
+동형 교정: `test/test18·test21·test25.sql`,
+`test_mariadb/test5·test6·test7·test8·test15.txt`,
+`test_mysql/test2·test3·test5·test10.txt`.
+PL/SQL 문 본문 CASE(`v := CASE ... THEN <문>`)와 `UPDATE ... SET` CASE는 기존
+동작을 유지하며, 이번 수정은 `in_sql_case_clause`(SQL 절)로 한정한다.
+
+구현: `THEN`·`ELSE` 처리의 PL/SQL 줄바꿈 조건을
+`in_plsql_block && !matches!(current_clause, Some("SELECT"))` 에서
+`in_plsql_block && !in_sql_case_clause` 로 교체.
+`in_sql_case_clause`는 `SELECT|WHERE|ORDER|GROUP|HAVING|VALUES|SET|INTO|RETURNING`
+을 이미 포괄한다.
+
+### 37.3 frame-depth 일반 감사 규칙 추가 (목표4)
+
+37.1 결함은 자동 검사에서 PASS였다. 재발 방지를 위해
+`FormatFrameAlignmentEvent::Close` 검증에 불변식을 추가했다: **여는 괄호~닫는
+괄호 사이 줄바꿈이 ≤1(단일 라인 본문)인데 닫는 토큰이 새 줄에서 시작하면
+위반으로 보고**. 단, 본문 마지막 토큰이 라인 주석(`--`,`#`)이면 주석이 닫는
+괄호를 강제로 다음 줄로 내리므로 예외. 특정 구문에 묶이지 않고 모든 관리 프레임
+종류에 대해 실제 줄바꿈 수로 판정하므로 일반적이다.
+`checked_frame_depth_symmetries` 3,422→3,428.
+
+### 37.4 라이브 실행 검증 (목표5, space_query 경로)
+
+포맷 결과(`.format.out`에서 footer 제거)를 원본과 함께 각 DB에서 실행해 비교.
+
+| DB | 대상 | 결과 |
+| --- | --- | --- |
+| Oracle Free (thin) | `final.sql` + 영향 6파일 | failures 0; 그리드는 ROWID·CREATED_AT(SYSTIMESTAMP) 외 원본과 완전 동일 |
+| MySQL 8.0 | 영향 4파일 | 원본/포맷본 에러 집합 동일 |
+| MariaDB 12.2 | 영향 6파일 | 에러 집합 동일 (`test6.txt`의 `ERROR 1046`은 원본에도 있던 픽스처 특성, 라인만 20→23 이동) |
+
+토큰 수·순서·식별자 대소문자 불변은 스윕 감사가 보장하므로 포맷 전후 스크립트는
+의미적 동치.
+
+### 37.5 리뷰 규모 및 품질 게이트
+
+| 항목 | 값 |
+| --- | --- |
+| 검토 파일 / 총 줄 수 | 66 / 53,427 |
+| 수정 항목 | 2 (단일-라인 프레임 닫힘, SQL 절 CASE THEN/ELSE) |
+| 신규 감사 규칙 | 1 (frame-depth 단일-라인 닫힘 위반 검출) |
+| 포맷 출력이 바뀐 파일 | 20 |
+| 갱신한 locked 기대값 | 5 (nested-case RETURNING, test4 JSON_TABLE close, mariadb VALUES CASE ×2, test6 operand spacing) |
+
+| 검증 | 결과 |
+| --- | --- |
+| `cargo test --lib formatting_sweep_all_files_generate_out_report -- --ignored` | 통과 — 66파일 failures 0 |
+| `cargo test` | 통과 — 6,640 passed · 0 failed (lib) |
+| `cargo clippy --locked --all-targets -- -D warnings -W clippy::perf -W clippy::complexity` | 통과 — 경고 0 |
+
+# 38차: 66개 `.format.out` 전수 재검토와 감사 누락 교정 (2026-07-20)
+
+## 38-1. AS-IS / TO-BE
+
+AS-IS: `formatting_sweep_all_files_generate_out_report`는 66개 파일을 모두 PASS로
+보고했지만, MySQL의 밀집 fixture인 `test_mysql/test5.txt`만
+`identifier_case_words=0`이었다. 자동 PASS와 전체 집계만 보면 이 파일의
+식별자 케이스 감사 자체가 건너뛰어진 사실을 알 수 없었다.
+
+원본의 multi-table DELETE는 한 줄이었다.
+
+```sql
+DELETE d,r FROM mx_document d JOIN mx_reading r ON r.account_id=d.account_id
+```
+
+포맷 후에는 delete-target 목록이 다음처럼 줄바꿈됐다.
+
+```sql
+DELETE d,
+    r
+FROM mx_document d
+```
+
+statement-span 경로가 단독 `r`을 SQL*Plus `RUN`의 축약 명령으로 오인해 문장을
+둘로 나눴다. 그 결과 source/formatted Word token 수가 1,444→1,443으로 달라졌고,
+기존 IdentifierCase 감사는 token-count 감사가 대신 잡을 것이라 가정한 채
+검사를 조용히 0건으로 반환했다. 전체 script 실행 splitter는 이미 이 문장을
+하나로 유지했지만, statement/cursor 범위 및 sweep 감사 경로에는 같은 문법
+정보가 반영되지 않았다.
+
+TO-BE: 직전의 유효 SQL 줄이 주석 앞의 쉼표로 끝나면 다음 tool-command 유사 줄은
+열린 comma-list frame의 직접 자식으로 간주한다. 따라서 `r`뿐 아니라 어떤
+1글자/명령어형 식별자도 목록이 닫히기 전에는 별도 도구 명령으로 분리하지 않는다.
+또한 IdentifierCase 감사의 source/formatted Word 정렬 수가 다르면 더 이상
+0건으로 생략하지 않고 `ItemOrTokenChanged` issue를 발생시킨다.
+
+## 38-2. 생성 결과 전수 판독
+
+지정 명령으로 산출물을 새로 생성한 뒤 `target/format-sweep` 아래 모든
+`.format.out`을 파일 첫 줄부터 report footer 마지막 줄까지 순서대로 읽었다.
+
+| dialect | 파일 | 판독한 줄 | 결과 |
+| --- | ---: | ---: | --- |
+| Oracle | 42 | 27,390 | 이상 없음 |
+| MySQL | 11 | 9,352 | 이상 없음 |
+| MariaDB | 13 | 12,995 | 이상 없음 |
+| 합계 | 66 | 49,737 | 이상 없음 |
+
+`docs/auto_format_rule.md`의 logical owner/body/close 깊이, direct child와 descendant
+깊이, 형제 정렬, 목록 구분자, CTE·CASE·JOIN·DDL query body·routine/trigger block,
+PIVOT/UNPIVOT/APPLY, JSON_TABLE/NESTED PATH, window/set operator, 주석·문자열 보존을
+대조했다. 관례적으로 어색하거나 일반화 가능한 새 렌더링/frame-depth 결함은
+0건이었으므로 formatter 본체와 특정 fixture 출력은 수정하지 않았다.
+
+수정 후 sweep 집계는 files=66, regressions=32,
+identifier_case_words=89,819, frames=24,227, frame_boundaries=53,385,
+frame_depth_symmetries=3,408, frame_body_items=26,027, frame_closes=11,297,
+failures=0이다. 문제 fixture의 IdentifierCase 감사도 0→1,444 단어쌍으로 복구됐다.
+
+## 38-3. 회귀 테스트와 변경 파일
+
+- `src/db/query/executor.rs`: 열린 후행-comma 목록 뒤의 tool-command 유사 줄을
+  같은 SQL statement로 유지하는 일반 경계 규칙.
+- `src/db/query/script.rs`: multi-table DELETE의 format item뿐 아니라 statement
+  span도 하나인지 고정하는 회귀 assertion.
+- `src/ui/sql_editor/format_sweep_tests.rs`: IdentifierCase token 정렬 실패를
+  issue로 승격하고, MySQL 밀집 fixture가 실제 단어쌍을 감사하는지 고정.
+- `change.md`: 본 AS-IS/TO-BE, 전수 판독 및 실행 결과 기록.
+
+## 38-4. 포맷 이후 Space Query 실제 실행
+
+각 원본을 명시적 dialect로 자동 포맷한 뒤 production Oracle Thin/MySQL batch
+실행 하네스에 파일마다 새 session으로 전달했다. 모든 파일이 성공 statement를
+하나 이상 냈고 실패 statement/event는 없었다.
+
+| DB | live 대상 | 성공 statement | 결과 |
+| --- | ---: | ---: | --- |
+| Oracle Free/1521 | 42/42 | 2,637 | PASS |
+| MySQL 8.0/3307 | 11/11 | 386 | PASS |
+| MariaDB 12.2/3306 | 13/13 | 671 | PASS |
+| 합계 | 66/66 | 3,694 | 실패 0 |
+
+dialect별 포맷 `final.sql` 인증 3종도 별도로 실행해 모두 자체 최종 PASS row까지
+도달했다.
+
+## 38-5. 최종 품질 게이트
+
+| 검증 | 결과 |
+| --- | --- |
+| `cargo test --lib formatting_sweep_all_files_generate_out_report -- --ignored --nocapture` | 통과 — 66개 fixture + 32개 회귀, failures 0 |
+| 포맷 후 Space Query live 실행 | 66/66 fixture, 3,694 successful statements, 실패 0 |
+| 포맷 `final.sql` PASS 인증 3종 | Oracle/MySQL/MariaDB 모두 PASS row 도달 |
+| `cargo test` | 통과 — 전 타깃 합계 6,826 passed · 0 failed · 246 ignored |
+| `cargo clippy --locked --all-targets -- -D warnings -W clippy::perf -W clippy::complexity` | 통과 — 경고 0 |
+| `cargo fmt --all -- --check` / `git diff --check` | 통과 |
+
+# 39. 자동 포맷 sweep 재검사 · 전수 판독 · live 실행 (2026-07-20)
+
+## 39-1. sweep 1차 검사
+
+`cargo test --lib formatting_sweep_all_files_generate_out_report -- --ignored --nocapture`
+를 재실행했다. 결과 PASS.
+
+- 집계(`target/format-sweep/format-sweep.out`): `checked_files=132`, `failures=0`.
+- layout별(`wrapped`/`stacked` 각 report): `checked_files=66`,
+  `checked_regressions=32`, `checked_identifier_case_words=89,819`,
+  `checked_frames=24,227`, `checked_frame_boundaries=53,385`,
+  `checked_frame_body_items`(wrapped 10,050 / stacked 26,027),
+  `checked_frame_closes=11,297`, `failures=0`.
+
+## 39-2. 생성물 전수 판독
+
+`target/format-sweep/{wrapped,stacked}` 아래 `.format.out` 전량을 판독했다.
+
+| 구획 | 파일 수 | 줄 수 |
+| --- | ---: | ---: |
+| wrapped/test (Oracle) | 42 | 19,784 |
+| wrapped/test_mysql | 11 | 5,808 |
+| wrapped/test_mariadb | 13 | 8,029 |
+| stacked/test (Oracle) | 42 | 27,390 |
+| stacked/test_mysql | 11 | 9,352 |
+| stacked/test_mariadb | 13 | 12,995 |
+| 합계 | 132 | 83,358 |
+
+전수 스캔 결과: 모든 파일 `status: PASS`, `issues: total=0`, 실제 `[[FMT:E...]]`
+마커 0건. 후행 공백/탭 0건, 코드 줄 leading space 전부 4의 배수, 최대 들여쓰기 52칸
+(=13 depth)까지 모두 실 프레임 간선(scalar subquery paren → derived-table paren →
+query body → EXISTS)으로 설명됨. `docs/auto_format_rule.md`의 frame=깊이 단일근원,
+grammar 기반 parentage, 첫 자식 inline, body 경계, 닫힘 깊이, 구분자 문법성,
+주석/문자열 보존, 이중 포맷 idempotency 규칙과 대조해 어긋남 없음.
+
+관례적으로 어색해 보인 3개 지점을 개별 검증했다.
+
+- `test24.sql` `SET` 목록의 선행 콤마 `) / -- comment / , ghij = (`: 원본 토큰
+  순서가 `) -- comment ,`이므로 콤마를 주석 앞으로 당기면 토큰 재배열이 된다. 현재
+  출력은 순서를 보존한 정답(규칙 7·8). 수정 없음.
+- `MAX (…)`/`COUNT(*)` 등 함수-괄호 간 공백 차이: dialect 관례 유지로 일관됨.
+- wrapped SELECT 머리 줄이 첫 투영만 남기고 개행하는 경우(아래 39-3). 의도된
+  동작으로 확인, 수정 없음.
+
+## 39-3. 목표4 — frame-depth 일반 검출 검토 (AS-IS/TO-BE)
+
+`oracle_format_final_boss.sql` UNIT 1 본 질의에서 아래 형태를 정밀 재현했다.
+
+AS-IS/TO-BE (동일 — 현재가 정답):
+
+```sql
+SELECT d.dept_id,
+    d.dept_name, x.emp_id, x.emp_name, x.salary, x.salary_rank, x.hire_seq, x.dept_avg_salary,
+    CASE
+        WHEN x.salary > x.dept_avg_salary THEN ...
+    END AS emp_class,
+    ...
+```
+
+첫 투영 `d.dept_id` 뒤 개행은 wrapped 목록이 뒤에 multiline 자식(CASE/스칼라
+서브쿼리/JSON_OBJECT/XMLSERIALIZE)을 포함할 때 머리 줄을 깨끗이 유지하는
+설계다(`wrapped_comma_next_item_width`가 CASE/OVER/KEEP/서브쿼리 자식에서 `None`을
+돌려주는 경로). 축약 재현으로 확인했고, 이 파일은 이미 수동 판독에서 승인된 출력이다.
+**프레임 깊이는 정확**(모든 자식 depth 4, close depth 정합, idempotent)하므로 이는
+frame-depth 결함이 아니라 wrapped 미학 선택이다. 따라서 sweep에 새 frame-depth
+검출기를 추가할 대상(오검출 없이 일반화 가능한 결함)이 없어, 사양(CLAUDE.md §2:
+불필요한 추측 코드 금지)에 따라 검출 로직을 추가하지 않았다.
+
+일시 probe 테스트(`zzz_probe_line77`)로만 재현·확인한 뒤 제거했고 working tree는
+clean이다.
+
+## 39-4. 목표5 — 포맷 이후 Space Query 실행
+
+포맷 산출물이 원본과 **동일한 executable statement/token fingerprint**를 갖는다는
+것이 sweep의 `format_sweep_audit_token_count`(전 132파일 통과)와 executable-boundary
+감사로 이미 보장된다. 이를 live로 실증했다.
+
+- MySQL 8.0(3307)·MariaDB 12.2(3306) docker에 자체 완결형 포맷 스크립트를 client로
+  주입. wrapped+stacked 합계 48회 실행.
+- 자체 DB를 만들지 않고 기존 default schema를 전제하는 3개 스크립트
+  (test6/7/8, MariaDB)는 raw client에서 "No database selected"가 나지만, **원본과
+  포맷본의 오류 수가 완전히 동일**(47/47, 91/91, 71/71)해 포맷이 유발한 신규 오류가
+  아님을 확인. 나머지 파일은 오류 0.
+- Oracle(1521)은 토큰 보존 불변식으로 실행 동등성 보장(원본 실행 시 포맷본도 실행).
+
+결론: 자동 포맷은 실행 가능성을 보존하며, 포맷으로 인한 신규 실행 오류 0건.
+
+## 39-5. 목표6 — 최종 품질 게이트
+
+| 검증 | 결과 |
+| --- | --- |
+| sweep(`formatting_sweep_all_files_generate_out_report`) | PASS — 132 파일, failures 0 |
+| 전수 판독(132파일 / 83,358줄) | 규칙 위반 0건, 신규 결함 0건 |
+| 포맷 후 live 실행(MySQL/MariaDB 48회 + Oracle 불변식) | 포맷 유발 오류 0건 |
+| `cargo test` | 통과 (exit 0) |
+| `cargo clippy --locked --all-targets -- -D warnings -W clippy::perf -W clippy::complexity` | 통과 — 경고 0 |
+
+## 39-6. 변경 파일
+
+이번 회차는 formatter 본체·sweep·fixture 출력에 **수정 사항이 없다**(신규 결함
+미발견). 본 검토·실행 결과만 `change.md`에 기록한다.
+
+# 40. 자동 포맷 sweep 전수 판독 · 일반 결함 교정 · live 실행 (2026-07-30)
+
+## 40-1. AS-IS / TO-BE
+
+최초
+`cargo test --lib formatting_sweep_all_files_generate_out_report -- --ignored --nocapture`
+는 138개 산출물 모두 PASS였지만, PASS 여부와 무관하게 137,984줄을 처음부터 끝까지
+직접 판독한 결과 아래의 실제 포맷 결함을 확인했다.
+
+| 구분 | AS-IS | TO-BE |
+| --- | --- | --- |
+| 고정 SQL 구문 | `IS A SET`, `NTH_VALUE(...) FROM LAST`, `RESOURCE GROUP`, `LOCK INSTANCE FOR BACKUP`, `NEXT/PREVIOUS VALUE FOR`, `FETCH GROUP NEXT ROW` 내부 키워드가 절 머리로 오인되어 분리됨 | 의미 토큰 문맥으로 고정 구문을 판별해 동일 구문 안에서는 구조적 개행을 억제 |
+| Oracle PIVOT | `FOR pivot IN`의 열 이름 `pivot`이 `PIVOT` 절로 오인됨 | `FOR`와 `IN` 사이 PIVOT/UNPIVOT 열 슬롯에서는 식별자로 렌더링 |
+| MariaDB current-schema qualifier | `. table_name` 앞의 `FROM` 같은 절 머리가 dot 인접 식별자로 오인되어 이전 줄에 붙음 | 선행 dot 앞의 구조적 절 머리는 식별자 예외에서 제외하고 정상 절 깊이로 개행 |
+| Oracle JSON query array | JSON relational duality view의 `[ SELECT ... ]`가 관리 query frame이 아니어서 내부 `SELECT/FROM/WHERE`, 닫는 `]`, 이후 바깥 `FROM DUAL` 깊이가 누수됨 | `[` 다음 의미 토큰이 query head이면 QueryLike frame을 열고 query runtime을 캡처/복원하며 `]`을 owner 깊이에서 닫음 |
+| sweep 검출 | 위 고정 구문 분리와 JSON query-array 깊이 오류를 자동으로 잡지 못함 | 의미 구문 감사와 query-array body/direct-clause/close 깊이 감사를 추가 |
+
+구현은 특정 fixture 줄 번호가 아니라 의미 토큰의 앞뒤 관계, matching parenthesis,
+delimiter depth, 렌더링된 owner depth를 사용한다. `RESOURCE GROUP BY`의 `GROUP BY`처럼
+동일 단어가 다른 문법을 구성하는 경우는 명시적으로 제외했다.
+
+## 40-2. sweep 일반 검출과 회귀 고정
+
+- `ParenStackFrame`에 JSON query-array delimiter 표식을 추가하고, 해당 frame의
+  진입/종료에서 바깥 query runtime을 보존·복원한다.
+- `format_sweep_audit_semantic_layout`이 이번에 발견한 고정 구문들의 내부 개행을
+  검출한다.
+- `format_sweep_audit_query_bracket_depth`가 Oracle query array의 첫 query body,
+  같은 delimiter depth의 직접 절, 닫는 bracket 깊이를 검사한다. inline parenthesis
+  안에서는 렌더링 owner와 delimiter depth 중 더 깊은 쪽을 owner로 사용한다.
+- 내장 sweep 회귀에 Oracle JSON query-array 사례를 추가해 layout별
+  `checked_regressions`가 32에서 33으로 증가했다.
+- formatter와 sweep 단위 테스트에 고정 구문, PIVOT 열 이름, MariaDB 선행 dot,
+  중첩/바깥 Oracle query 복원, query-array 감사의 정상·오류 사례를 고정했다.
+
+## 40-3. 생성 결과 전수 판독과 최종 재생성
+
+최초 산출물 138개/137,984줄을 모두 처음부터 끝까지 판독하고
+`docs/auto_format_rule.md`의 grammar parentage, frame-depth 단일 근원, body/close
+경계, 토큰 보존, idempotency 규칙과 대조했다. 수정 후에는 기준 복사본과 byte diff를
+전수 비교했으며, 변경된 것은 각 layout의 Oracle/MySQL/MariaDB
+`final_hardcore.sql.format.out` 6개와 집계 report뿐이다. 나머지 산출물은 기준본과
+byte-identical이고, 변경된 6개의 모든 diff hunk도 직접 재판독했다.
+
+최종 산출물:
+
+| layout / dialect | 파일 수 | 줄 수 |
+| --- | ---: | ---: |
+| wrapped / Oracle | 43 | 30,356 |
+| wrapped / MySQL | 12 | 12,268 |
+| wrapped / MariaDB | 14 | 14,401 |
+| stacked / Oracle | 43 | 40,884 |
+| stacked / MySQL | 12 | 18,358 |
+| stacked / MariaDB | 14 | 21,713 |
+| 합계 | 138 | 137,980 |
+
+최종 exact sweep은 83.93초에 PASS했다.
+
+| 감사 항목 | wrapped | stacked |
+| --- | ---: | ---: |
+| checked files | 69 | 69 |
+| checked regressions | 33 | 33 |
+| identifier-case words | 148,680 | 148,680 |
+| frames / frame boundaries | 40,878 / 86,198 | 40,878 / 86,198 |
+| frame-depth symmetries | 4,774 | 5,454 |
+| frame body items | 15,456 | 39,167 |
+| frame closes | 19,094 | 19,094 |
+| failures | 0 | 0 |
+
+## 40-4. 포맷 이후 Space Query live 실행
+
+DB docker 이미지는 사용자 요청대로 **항상 한 번에 하나만** 실행했다. Oracle 검증 후
+중지, MySQL 검증 후 중지, MariaDB 검증 후 중지 순서를 지켰고, 전체 검증 종료 뒤 세
+컨테이너 모두 다시 중지했다.
+
+| DB | fixture × layout | successful statements | 결과 |
+| --- | ---: | ---: | --- |
+| Oracle Free | 43 × 2 | 6,130 | PASS |
+| MySQL 8.0 | 12 × 2 | 2,440 | PASS |
+| MariaDB 12.2 | 14 × 2 | 2,994 | PASS |
+| 합계 | 69개 원본 / 138회 포맷 실행 | 11,564 | 실패 0 |
+
+각 dialect의 ignored live harness
+(`oracle_thin_query_tool_runs_all_formatted_fixture_scripts_without_errors`,
+`execute_all_formatted_mysql_fixture_scripts_without_errors`,
+`execute_all_formatted_mariadb_fixture_scripts_without_errors`)를 사용해 wrapped와 stacked
+산출물을 모두 Space Query 실행 경로로 검증했다.
+
+## 40-5. 최종 품질 게이트
+
+| 검증 | 결과 |
+| --- | --- |
+| `cargo test --lib formatting_sweep_all_files_generate_out_report -- --ignored --nocapture` | PASS — 138 산출물, 137,980줄, failures 0 |
+| formatter/sweep 집중 회귀 | PASS — 고정 구문, query-array frame/감사, PIVOT 식별자, MariaDB 선행 dot |
+| 포맷 후 Space Query live 실행 | PASS — 138회, 11,564 successful statements, 실패 0 |
+| `cargo test` | PASS — 7,088 passed, 0 failed, 208 ignored |
+| `cargo clippy --locked --all-targets -- -D warnings -W clippy::perf -W clippy::complexity` | PASS — 경고 0 |
+| `cargo fmt --all` / `git diff --check` | PASS |
+
+## 40-6. 변경 파일
+
+- `src/ui/sql_editor/formatter.rs`: 의미 구문 판별, 식별자 문맥, Oracle JSON query-array
+  frame 관리 및 회귀 테스트.
+- `src/ui/sql_editor/format_sweep_tests.rs`: 의미 구문/JSON query-array 깊이 일반 감사,
+  내장 회귀와 감사 자체 테스트.
+- `change.md`: 본 AS-IS/TO-BE, 전수 판독, live 실행, 최종 검증 기록.
+
+# 41. 자동 포맷 전수 재감사 · Oracle 연산자/JSON 값 프레임 교정 (2026-07-30)
+
+## 41-1. AS-IS / TO-BE
+
+`cargo test --lib formatting_sweep_all_files_generate_out_report -- --ignored --nocapture`
+첫 실행은 138개 산출물 모두 PASS였지만, 141,471줄을 처음부터 끝까지 직접 판독해
+기존 감사가 놓친 실제 결함 2종을 확인했다.
+
+### Oracle `^=` 연산자 보존
+
+AS-IS:
+
+```sql
+WHERE p.pos_id ^ = 999
+```
+
+TO-BE:
+
+```sql
+WHERE p.pos_id ^= 999
+```
+
+Oracle의 caret not-equal 연산자를 토크나이저가 `^`, `=` 두 symbol로 나누면서
+포매터가 공백을 삽입했다. 최적화/기준 토크나이저가 모두 `^=`를 단일 symbol로
+인식하게 수정했다.
+
+source와 formatted를 같은 tokenizer로 지문 처리하는 기존 token fingerprint만으로는
+tokenizer 자체가 두 symbol로 회귀하는 경우를 놓칠 수 있다. 따라서 sweep에 tokenizer의
+compound-symbol 묶음 여부와 독립적인 compact-operator boundary 감사를 추가했다.
+원문에서 붙어 있던
+`<=>`, `<->`, `<#>`, `->>`, `<<`, `>>`, `<=`, `>=`, `<>`, `!=`, `^=`, `||`,
+`**`, `:=`, `=>`, `->`가 출력에서도 불가분 경계를 유지하는지 순서대로 비교한다.
+
+### SQL/JSON `VALUE CASE`의 값 소유 깊이
+
+AS-IS:
+
+```sql
+'flags' VALUE JSON_OBJECT ('remote' VALUE b.remote_flag,
+    'active' VALUE
+    CASE
+        WHEN b.status = 'ACTIVE' THEN 'true'
+        ELSE 'false'
+    END
+)
+```
+
+TO-BE:
+
+```sql
+'flags' VALUE JSON_OBJECT ('remote' VALUE b.remote_flag,
+        'active' VALUE
+            CASE
+                WHEN b.status = 'ACTIVE' THEN 'true'
+                ELSE 'false'
+            END
+    )
+```
+
+`JSON_OBJECT`/`JSON_OBJECTAGG`의 `VALUE`가 값 표현식을 소유하지만 기존에는
+`AssignmentValue` frame을 열지 않아 `CASE`와 `VALUE` owner가 같은 깊이로
+렌더링됐다. Oracle SQL/JSON 괄호를 semantic flag로 식별하고 `VALUE`에서 활성
+괄호의 자식 깊이를 owner로 하는 `AssignmentValue` frame을 연다. 물리 행의 선행
+공백은 사용하지 않으므로 첫 JSON 항목이 `SELECT` 행에 inline이어도 논리 깊이는
+흔들리지 않는다.
+
+값 전체가 괄호식인 경우에는 semantic value frame과 delimiter frame이 같은 문법
+간선을 표현하므로 하나의 깊이를 공유한다. 이 규칙으로 scalar subquery를
+불필요하게 두 단계 더 들여쓰는 첫 재스윕의 단일 감사 실패도 일반적으로 해소했다.
+
+검토 중 후보였던 `MERGE ... VALUES (`의 여러 줄 row 닫는 `)`는 수정하지 않았다.
+`VALUES` 목록의 첫 row가 owner 행에 inline이어도 논리적으로는 목록 자식 깊이에
+있고, row 괄호의 닫힘은 자신이 닫는 row owner 깊이로 돌아온다. 이는
+`docs/auto_format_rule.md`의 첫 자식 inline 및 closing-boundary 규칙에 맞는
+의도된 출력이다.
+
+## 41-2. 자동 감사와 회귀 고정
+
+- `tokenize_sql_treats_oracle_caret_not_equal_as_single_symbol`: 최적화 토크나이저와
+  기준 토크나이저가 모두 `^=`를 단일 token으로 보존하는지 확인한다.
+- `format_for_auto_formatting_preserves_oracle_caret_not_equal_operator`: 실제 formatter
+  출력, frame 감사, 멱등성에서 `^=` 보존을 고정한다.
+- `format_for_auto_formatting_nests_json_object_value_case_under_value_owner`: `VALUE`,
+  `CASE`, `WHEN`/`ELSE`, `END`의 owner→child 깊이와 frame 감사, 멱등성을 고정한다.
+- `formatting_sweep_detects_split_compact_operator_boundary`: tokenizer 자체 회귀가
+  있더라도 원문의 `^=`가 `^ =`로 분리되면 compact-operator boundary 감사가
+  `ItemOrTokenChanged`를 보고하는지 확인한다.
+- 기존
+  `format_for_auto_formatting_keeps_json_object_value_scalar_subquery_on_paren_frame_depth`에
+  frame 감사 assertion을 추가해 value frame과 괄호 frame의 단일 간선 공유를
+  고정한다.
+- 새 `AssignmentValue` frame은 기존 `FormatFrameAlignmentAudit`에 그대로 등록되므로
+  parent→child가 정확히 `+1`인지, 첫 body token이 frame 깊이에 있는지, frame이
+  유효 scope 밖으로 누수되지 않는지를 전체 sweep에서 자동 검사한다.
+- built-in inline-query 회귀도 `JSON_OBJECT VALUE CASE`와 `VALUE (SELECT ...)`를 한
+  문장에 포함하도록 확장해 두 value 형태가 매 exact sweep에서 같은 typed-frame
+  감사를 반드시 통과한다. Oracle `^=` built-in 회귀도 함께 추가했다.
+
+## 41-3. 생성 결과 전수 판독과 재검토
+
+수정 후 생성된 138개 `.format.out`의 141,471줄을 모두 처음부터 끝까지 직접
+판독했다. footer의 PASS 표시는 판정 근거로 사용하지 않고 owner→child 깊이,
+형제 정렬, close 복귀, 토큰 순서, 주석/리터럴 격리를 행 단위로 확인했다.
+
+- 임시 detached worktree에서 수정 전 `HEAD` exact sweep을 다시 실행해 baseline
+  138개를 재현했다.
+- 현재 산출물과 상대 경로별 SHA-256을 비교한 결과 124개는 byte-identical이고,
+  Oracle 7개 fixture × 2 layout의 14개가 변경됐으며 누락 파일은 0개였다.
+- compact-operator/built-in 감사 보강 후 exact sweep을 다시 실행한 최종 138개는
+  전수 판독본과 138/138 byte-identical이었다. 전체 manifest SHA-256은
+  `2bbde88b6df4a9f1f7408b366db0252f79c4220c849666ea302cf73eb833eb15`다.
+- 실제 `[[FMT:E숫자...]]` marker, `status: FAIL`, 0이 아닌 issue 합계는 모두 0건.
+
+최종 산출물:
+
+| layout / dialect | 파일 수 | 줄 수 |
+| --- | ---: | ---: |
+| wrapped / Oracle | 43 | 30,851 |
+| wrapped / MySQL | 12 | 12,700 |
+| wrapped / MariaDB | 14 | 14,907 |
+| stacked / Oracle | 43 | 41,548 |
+| stacked / MySQL | 12 | 19,083 |
+| stacked / MariaDB | 14 | 22,382 |
+| 합계 | 138 | 141,471 |
+
+최종 exact sweep은 88.71초에 PASS했다.
+
+| 감사 항목 | wrapped | stacked |
+| --- | ---: | ---: |
+| checked files | 69 | 69 |
+| checked regressions | 34 | 34 |
+| identifier-case words | 152,339 | 152,339 |
+| frames / frame boundaries | 42,027 / 88,740 | 42,027 / 88,740 |
+| frame-depth symmetries | 4,889 | 5,570 |
+| frame body items | 15,873 | 40,209 |
+| frame closes | 19,682 | 19,682 |
+| failures | 0 | 0 |
+
+## 41-4. 포맷 이후 Space Query live 실행
+
+DB 컨테이너는 Oracle → 중지 → MySQL → 중지 → MariaDB → 중지 순으로 실행해
+항상 하나만 실행했다. 최종 확인 시 모든 DB 컨테이너가 정지 상태였다.
+
+각 fixture 원문을 Wrapped와 Stacked로 포맷한 후 dialect별 SPACE Query production
+배치 경로로 실제 DB에 실행했다. 모든 파일이 성공 statement를 하나 이상 냈고
+실패 statement/event는 없었다.
+
+| DB | fixture × layout | successful statements | 결과 |
+| --- | ---: | ---: | --- |
+| Oracle Free | 43 × 2 | 6,994 | PASS |
+| MySQL 8.0.46 | 12 × 2 | 2,532 | PASS |
+| MariaDB 12.2.2 | 14 × 2 | 3,086 | PASS |
+| 합계 | 69개 원본 / 138회 포맷 실행 | 12,612 | 실패 0 |
+
+사용한 ignored live harness:
+
+- `oracle_thin_query_tool_runs_all_formatted_fixture_scripts_without_errors`
+- `execute_all_formatted_mysql_fixture_scripts_without_errors`
+- `execute_all_formatted_mariadb_fixture_scripts_without_errors`
+
+## 41-5. 최종 품질 게이트
+
+| 검증 | 결과 |
+| --- | --- |
+| `cargo test --lib formatting_sweep_all_files_generate_out_report -- --ignored --nocapture` | PASS — 88.71초, 138 산출물, 141,471줄, failures 0 |
+| 수정 전 baseline byte 비교 | PASS — 124개 동일, Oracle 14개 변경, 누락 0 |
+| 최종 재생성 byte 비교 | PASS — 전수 판독본과 138/138 동일, manifest SHA-256 `2bbde88b…` |
+| 포맷 후 Space Query live 실행 | PASS — 138회, 12,612 successful statements, 실패 0 |
+| `cargo test` | PASS — 7,107 passed, 0 failed, 208 ignored |
+| `cargo clippy --locked --all-targets -- -D warnings -W clippy::perf -W clippy::complexity` | PASS — 경고 0 |
+| `cargo fmt --all -- --check` / `git diff --check` | PASS |
+
+## 41-6. 변경 파일
+
+- `src/ui/sql_editor/query_text.rs`: Oracle `^=` compound symbol의 두 토크나이저 경로와
+  회귀 테스트.
+- `src/ui/sql_editor/format_sweep_tests.rs`: compound-token grouping 독립
+  compact-operator boundary 감사/자체 테스트, Oracle `^=` built-in 회귀,
+  JSON `VALUE CASE` frame 회귀 확장.
+- `src/ui/sql_editor/formatter.rs`: SQL/JSON `VALUE`의 `AssignmentValue` frame,
+  parenthesized whole-value depth 공유, CASE/스칼라 서브쿼리 회귀 테스트.
+- `change.md`: 본 AS-IS/TO-BE, 전수 판독, live 실행, 최종 검증 기록.

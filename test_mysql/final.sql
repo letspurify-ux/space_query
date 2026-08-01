@@ -1,0 +1,666 @@
+-- MySQL 8.0 official-syntax executable certification suite.
+-- Live target: MySQL Community Server 8.0.46.
+-- Run from the repository root:
+--   mariadb --protocol=TCP -h127.0.0.1 -P3307 -uroot -pspacequery \
+--     --show-warnings --binary-mode < test_mysql/final.sql
+--
+-- Reference: https://dev.mysql.com/doc/refman/8.0/en/sql-statements.html
+-- This standalone file creates only sq_mysql_manual_final plus two short-lived
+-- account objects, verifies every result it depends on, and can be run
+-- repeatedly. Coverage comes from syntax the server really parses and executes;
+-- manual-path and copied catalog inventories are intentionally excluded.
+
+DROP DATABASE IF EXISTS sq_mysql_manual_final;
+CREATE DATABASE sq_mysql_manual_final
+  CHARACTER SET utf8mb4
+  COLLATE utf8mb4_0900_ai_ci;
+ALTER DATABASE sq_mysql_manual_final READ ONLY = 0;
+USE sq_mysql_manual_final;
+
+SET NAMES utf8mb4 COLLATE utf8mb4_0900_ai_ci;
+SET CHARACTER SET utf8mb4;
+SET SESSION sql_mode = 'TRADITIONAL';
+SET SESSION TRANSACTION ISOLATION LEVEL READ COMMITTED;
+
+-- Executable DDL below keeps each documented type family in real grammar
+-- positions used by completion, formatting, highlighting, and live execution.
+CREATE TABLE editor_type_matrix (
+  type_id TINYINT UNSIGNED NOT NULL,
+  bit_value BIT(8) NOT NULL,
+  small_value SMALLINT,
+  medium_value MEDIUMINT,
+  integer_value INT,
+  big_value BIGINT,
+  decimal_value DECIMAL(20,6),
+  float_value FLOAT,
+  double_value DOUBLE,
+  boolean_value BOOLEAN,
+  char_value CHAR(8),
+  varchar_value VARCHAR(80),
+  binary_value BINARY(4),
+  varbinary_value VARBINARY(16),
+  tinytext_value TINYTEXT,
+  text_value TEXT,
+  mediumtext_value MEDIUMTEXT,
+  longtext_value LONGTEXT,
+  tinyblob_value TINYBLOB,
+  blob_value BLOB,
+  mediumblob_value MEDIUMBLOB,
+  longblob_value LONGBLOB,
+  enum_value ENUM('DDL', 'DML', 'QUERY'),
+  set_value SET('sql', 'json', 'spatial'),
+  date_value DATE,
+  time_value TIME(6),
+  datetime_value DATETIME(6),
+  timestamp_value TIMESTAMP(6) NULL,
+  year_value YEAR,
+  json_value JSON,
+  geometry_value GEOMETRY SRID 0 NOT NULL,
+  generated_value VARCHAR(80)
+    GENERATED ALWAYS AS (UPPER(varchar_value)) VIRTUAL,
+  invisible_value VARCHAR(16) INVISIBLE,
+  PRIMARY KEY (type_id)
+) ENGINE = InnoDB;
+
+INSERT INTO editor_type_matrix(
+  type_id, bit_value, small_value, medium_value, integer_value, big_value,
+  decimal_value, float_value, double_value, boolean_value, char_value,
+  varchar_value, binary_value, varbinary_value, tinytext_value, text_value,
+  mediumtext_value, longtext_value, tinyblob_value, blob_value,
+  mediumblob_value, longblob_value, enum_value, set_value, date_value,
+  time_value, datetime_value, timestamp_value, year_value, json_value,
+  geometry_value, invisible_value
+) VALUES (
+  1, b'10101010', 12, 345, 6789, 1234567890123,
+  12345.678901, 1.25, 2.5, TRUE, 'SQL', 'Manual syntax',
+  X'53514C00', X'4D7953514C', 'tiny text', 'text value',
+  'medium text', 'long text', X'01', X'0203', X'0405', X'0607',
+  'DDL', 'sql,json', DATE '2026-07-18', TIME '12:34:56.123456',
+  TIMESTAMP '2026-07-18 12:34:56.123456',
+  TIMESTAMP '2026-07-18 12:34:56.123456', 2026,
+  JSON_OBJECT('kind', 'type-matrix', 'tags', JSON_ARRAY('sql', 'json')),
+  ST_GeomFromText('POINT(1 2)', 0), 'hidden'
+);
+
+CREATE TABLE statement_log (
+  id BIGINT NOT NULL AUTO_INCREMENT,
+  category VARCHAR(32) NOT NULL,
+  payload JSON,
+  amount DECIMAL(12,2) NOT NULL DEFAULT 0,
+  created_at TIMESTAMP(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+  payload_kind VARCHAR(32)
+    GENERATED ALWAYS AS (JSON_UNQUOTE(payload->'$.kind')) STORED,
+  PRIMARY KEY (id),
+  UNIQUE KEY uk_statement_log_category (category),
+  KEY ix_statement_log_kind (payload_kind),
+  CONSTRAINT chk_statement_log_json CHECK (JSON_VALID(payload))
+) ENGINE = InnoDB;
+
+CREATE TABLE tree_node (
+  node_id INT NOT NULL,
+  parent_node_id INT NULL,
+  node_name VARCHAR(80) NOT NULL,
+  attributes JSON NOT NULL,
+  PRIMARY KEY (node_id),
+  CONSTRAINT fk_tree_node_parent
+    FOREIGN KEY (parent_node_id) REFERENCES tree_node(node_id)
+) ENGINE = InnoDB;
+
+CREATE TABLE document_store (
+  document_id BIGINT NOT NULL,
+  node_id INT NOT NULL,
+  title VARCHAR(160) NOT NULL,
+  body_text TEXT NOT NULL,
+  payload JSON NOT NULL,
+  location POINT SRID 4326 NOT NULL,
+  score DECIMAL(10,2) NOT NULL,
+  kind_code VARCHAR(32)
+    GENERATED ALWAYS AS (JSON_UNQUOTE(payload->'$.kind')) STORED,
+  PRIMARY KEY (document_id),
+  CONSTRAINT fk_document_node FOREIGN KEY (node_id) REFERENCES tree_node(node_id),
+  CONSTRAINT chk_document_score CHECK (score BETWEEN 0 AND 100),
+  FULLTEXT KEY ft_document_text (title, body_text),
+  SPATIAL KEY sx_document_location (location),
+  KEY ix_document_lower_title ((LOWER(title))),
+  KEY ix_document_tags ((CAST(payload->'$.tags' AS CHAR(24) ARRAY)))
+) ENGINE = InnoDB;
+
+CREATE TABLE metric_partition (
+  metric_id BIGINT NOT NULL,
+  node_id INT NOT NULL,
+  measured_on DATE NOT NULL,
+  metric_name VARCHAR(32) NOT NULL,
+  metric_value DECIMAL(12,2) NOT NULL,
+  PRIMARY KEY (metric_id, measured_on),
+  KEY ix_metric_node_date (node_id, measured_on)
+) ENGINE = InnoDB
+PARTITION BY RANGE COLUMNS(measured_on) (
+  PARTITION p2025 VALUES LESS THAN ('2026-01-01'),
+  PARTITION p2026 VALUES LESS THAN ('2027-01-01'),
+  PARTITION pmax VALUES LESS THAN (MAXVALUE)
+);
+
+CREATE TEMPORARY TABLE temp_statement_log LIKE statement_log;
+CREATE TABLE statement_log_copy AS
+SELECT id, category, payload, amount, created_at
+FROM statement_log
+WHERE FALSE;
+ALTER TABLE statement_log_copy
+  ADD PRIMARY KEY (id),
+  ADD COLUMN note VARCHAR(80) NULL AFTER category;
+ALTER TABLE statement_log_copy RENAME COLUMN note TO detail_text;
+CREATE INDEX ix_statement_log_copy_amount
+  ON statement_log_copy (amount DESC);
+ALTER TABLE statement_log_copy ALTER INDEX ix_statement_log_copy_amount INVISIBLE;
+ALTER TABLE statement_log_copy ALTER INDEX ix_statement_log_copy_amount VISIBLE;
+RENAME TABLE statement_log_copy TO statement_log_stage;
+TRUNCATE TABLE statement_log_stage;
+
+INSERT INTO statement_log(category, payload, amount) VALUES
+  ('DDL', JSON_OBJECT('kind', 'schema'), 10),
+  ('DML', JSON_OBJECT('kind', 'write'), 20),
+  ('QUERY', JSON_OBJECT('kind', 'read'), 30);
+INSERT INTO statement_log SET
+  category = 'SET_FORM', payload = JSON_OBJECT('kind', 'write'), amount = 40;
+INSERT INTO statement_log(category, payload, amount)
+SELECT 'SELECT_FORM', JSON_OBJECT('kind', 'query'), SUM(amount)
+FROM statement_log;
+INSERT INTO statement_log(category, payload, amount)
+VALUES ('DML', JSON_OBJECT('kind', 'upsert'), 25)
+AS new
+ON DUPLICATE KEY UPDATE
+  payload = new.payload,
+  amount = new.amount;
+REPLACE INTO statement_log(id, category, payload, amount)
+VALUES (100, 'REPLACE', JSON_OBJECT('kind', 'replace'), 50);
+
+CREATE OR REPLACE VIEW statement_log_v AS
+SELECT id, category, payload_kind, amount
+FROM statement_log
+WHERE amount >= 10
+WITH CASCADED CHECK OPTION;
+ALTER VIEW statement_log_v AS
+SELECT id, category, payload_kind, amount
+FROM statement_log
+WHERE amount >= 10;
+
+DELIMITER $$
+CREATE PROCEDURE assert_true(IN condition_value BOOLEAN, IN message_value VARCHAR(255))
+BEGIN
+  IF COALESCE(condition_value, FALSE) = FALSE THEN
+    SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = message_value;
+  END IF;
+END$$
+
+CREATE FUNCTION amount_band(amount_value DECIMAL(12,2))
+RETURNS VARCHAR(16)
+DETERMINISTIC
+RETURN CASE
+  WHEN amount_value >= 50 THEN 'HIGH'
+  WHEN amount_value >= 20 THEN 'MEDIUM'
+  ELSE 'LOW'
+END$$
+
+CREATE PROCEDURE compound_grammar()
+main_block: BEGIN
+  DECLARE done_value BOOLEAN DEFAULT FALSE;
+  DECLARE loop_value INT DEFAULT 0;
+  DECLARE category_value VARCHAR(32);
+  DECLARE duplicate_key CONDITION FOR SQLSTATE '23000';
+  DECLARE category_cursor CURSOR FOR
+    SELECT category FROM statement_log ORDER BY id;
+  DECLARE CONTINUE HANDLER FOR NOT FOUND SET done_value = TRUE;
+  DECLARE CONTINUE HANDLER FOR duplicate_key
+  BEGIN
+    GET CURRENT DIAGNOSTICS @condition_count = NUMBER;
+  END;
+
+  OPEN category_cursor;
+  read_loop: LOOP
+    FETCH category_cursor INTO category_value;
+    IF done_value THEN
+      LEAVE read_loop;
+    END IF;
+    SET loop_value = loop_value + 1;
+    IF loop_value = 2 THEN
+      ITERATE read_loop;
+    END IF;
+  END LOOP;
+  CLOSE category_cursor;
+
+  count_loop: WHILE loop_value < 7 DO
+    SET loop_value = loop_value + 1;
+  END WHILE;
+  repeat_loop: REPEAT
+    SET loop_value = loop_value - 1;
+  UNTIL loop_value = 6 END REPEAT;
+
+  IF loop_value = -1 THEN
+    BEGIN
+      DECLARE EXIT HANDLER FOR SQLEXCEPTION
+      BEGIN
+        GET STACKED DIAGNOSTICS CONDITION 1
+          @returned_sqlstate = RETURNED_SQLSTATE,
+          @returned_message = MESSAGE_TEXT;
+        RESIGNAL;
+      END;
+      SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'unreachable diagnostics probe';
+    END;
+  END IF;
+
+  CASE
+    WHEN loop_value = 6 THEN SET @compound_result = 'PASS';
+    ELSE SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'compound statement failure';
+  END CASE;
+END main_block$$
+
+CREATE TRIGGER document_store_bi
+BEFORE INSERT ON document_store
+FOR EACH ROW
+BEGIN
+  SET NEW.title = TRIM(NEW.title);
+  IF NEW.score < 0 OR NEW.score > 100 THEN
+    SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'document score out of range';
+  END IF;
+END$$
+
+CREATE TRIGGER document_store_au
+AFTER UPDATE ON document_store
+FOR EACH ROW
+BEGIN
+  SET @last_updated_document = NEW.document_id;
+END$$
+DELIMITER ;
+
+ALTER FUNCTION amount_band
+  COMMENT 'editor grammar scalar function'
+  SQL SECURITY INVOKER;
+ALTER PROCEDURE compound_grammar
+  COMMENT 'editor grammar compound procedure'
+  SQL SECURITY INVOKER;
+
+CALL compound_grammar();
+CALL assert_true(@compound_result = 'PASS', 'compound grammar');
+
+INSERT INTO tree_node(node_id, parent_node_id, node_name, attributes) VALUES
+  (1, NULL, 'Root', JSON_OBJECT('tier', 'root')),
+  (2, 1, 'North', JSON_OBJECT('tier', 'branch')),
+  (3, 1, 'South', JSON_OBJECT('tier', 'branch')),
+  (4, 2, 'Leaf', JSON_OBJECT('tier', 'leaf'));
+
+INSERT INTO document_store(
+  document_id, node_id, title, body_text, payload, location, score
+) VALUES
+  (101, 1, 'Alpha Manual', 'database syntax search',
+   JSON_OBJECT('kind', 'guide', 'tags', JSON_ARRAY('sql', 'manual'),
+               'items', JSON_ARRAY(JSON_OBJECT('name', 'ddl', 'value', 10),
+                                   JSON_OBJECT('name', 'dml', 'value', 20))),
+   ST_GeomFromText('POINT(127.0276 37.4979)', 4326, 'axis-order=long-lat'), 91),
+  (102, 2, 'Beta Reference', 'advanced query grammar',
+   JSON_OBJECT('kind', 'reference', 'tags', JSON_ARRAY('json', 'query'),
+               'items', JSON_ARRAY(JSON_OBJECT('name', 'select', 'value', 30))),
+   ST_GeomFromText('POINT(129.0756 35.1796)', 4326, 'axis-order=long-lat'), 82),
+  (103, 3, 'Gamma Notes', 'transaction and routine examples',
+   JSON_OBJECT('kind', 'note', 'tags', JSON_ARRAY('routine', 'manual'),
+               'items', JSON_ARRAY(JSON_OBJECT('name', 'tcl', 'value', 40))),
+   ST_GeomFromText('POINT(126.7052 37.4563)', 4326, 'axis-order=long-lat'), 73),
+  (104, 4, 'Delta Archive', 'historic syntax archive',
+   JSON_OBJECT('kind', 'archive', 'tags', JSON_ARRAY('legacy'),
+               'items', JSON_ARRAY(JSON_OBJECT('name', 'archive', 'value', 5))),
+   ST_GeomFromText('POINT(126.5312 33.4996)', 4326, 'axis-order=long-lat'), 44);
+
+INSERT INTO metric_partition(metric_id, node_id, measured_on, metric_name, metric_value) VALUES
+  (1, 1, '2025-12-31', 'latency', 12),
+  (2, 1, '2026-01-01', 'latency', 10),
+  (3, 2, '2026-01-02', 'latency', 20),
+  (4, 2, '2026-01-03', 'errors', 2),
+  (5, 3, '2027-01-01', 'latency', 30);
+
+SELECT
+  +integer_value AS unary_plus,
+  -integer_value AS unary_minus,
+  ~integer_value AS bitwise_not,
+  integer_value DIV 2 AS integer_quotient,
+  integer_value MOD 5 AS modulo_keyword,
+  integer_value % 7 AS modulo_operator,
+  integer_value << 1 AS shift_left,
+  integer_value >> 1 AS shift_right,
+  integer_value & 255 AS bitwise_and,
+  integer_value | 1 AS bitwise_or,
+  integer_value ^ 3 AS bitwise_xor,
+  ABS(decimal_value) AS absolute_value,
+  CEIL(decimal_value) AS ceiling_value,
+  FLOOR(decimal_value) AS floor_value,
+  ROUND(decimal_value, 2) AS rounded_value,
+  TRUNCATE(decimal_value, 3) AS truncated_value,
+  POW(double_value, 2) AS power_value,
+  SQRT(double_value) AS square_root,
+  LN(double_value) AS natural_log,
+  LOG10(double_value) AS base10_log,
+  SIGN(decimal_value) AS sign_value,
+  CONCAT_WS(':', char_value, varchar_value) AS concatenated_value,
+  CHAR_LENGTH(varchar_value) AS character_count,
+  OCTET_LENGTH(varchar_value) AS byte_count,
+  LOWER(varchar_value) AS lower_value,
+  UPPER(varchar_value) AS upper_value,
+  TRIM(BOTH ' ' FROM varchar_value) AS trimmed_value,
+  SUBSTRING(varchar_value FROM 1 FOR 6) AS substring_value,
+  LOCATE('syntax', varchar_value) AS located_value,
+  REPLACE(varchar_value, 'Manual', 'Editor') AS replaced_value,
+  REGEXP_INSTR(varchar_value, 'syntax', 1, 1, 0, 'i') AS regexp_position,
+  REGEXP_REPLACE(varchar_value, 'manual', 'editor', 1, 0, 'i') AS regexp_value,
+  HEX(binary_value) AS hexadecimal_value,
+  TO_BASE64(varbinary_value) AS base64_value,
+  EXTRACT(YEAR_MONTH FROM datetime_value) AS extracted_value,
+  DATE_ADD(date_value, INTERVAL 1 DAY) AS added_date,
+  DATE_SUB(date_value, INTERVAL 1 MONTH) AS subtracted_date,
+  TIMESTAMPADD(HOUR, 1, datetime_value) AS added_timestamp,
+  TIMESTAMPDIFF(DAY, date_value, datetime_value) AS timestamp_difference,
+  DATE_FORMAT(datetime_value, '%Y-%m-%d %H:%i:%s') AS formatted_date,
+  STR_TO_DATE('2026-07-18', '%Y-%m-%d') AS parsed_date,
+  CAST(decimal_value AS CHAR(32)) AS cast_value,
+  CONVERT(char_value USING utf8mb4) AS converted_value,
+  IF(boolean_value, 'yes', 'no') AS conditional_value,
+  IFNULL(NULLIF(integer_value, 6789), 6789) AS null_function_value,
+  COALESCE(NULL, varchar_value, char_value) AS coalesced_value,
+  GREATEST(integer_value, small_value) AS greatest_value,
+  LEAST(integer_value, medium_value) AS least_value,
+  json_value->>'$.kind' AS json_kind,
+  JSON_SET(json_value, '$.checked', TRUE) AS json_set_value,
+  JSON_REMOVE(json_value, '$.missing') AS json_removed_value,
+  JSON_CONTAINS(json_value, JSON_QUOTE('sql'), '$.tags') AS json_contains_value,
+  JSON_OVERLAPS(json_value, JSON_OBJECT('kind', 'type-matrix')) AS json_overlap_value,
+  'sql' MEMBER OF (json_value->'$.tags') AS json_member_value,
+  ExtractValue('<manual><db>mysql</db></manual>', '/manual/db') AS xml_value,
+  UpdateXML('<manual><db>sql</db></manual>', '/manual/db', '<db>mysql</db>') AS xml_updated,
+  SHA2(varchar_value, 256) AS sha_value,
+  MD5(varchar_value) AS md5_value,
+  UNCOMPRESS(COMPRESS(varchar_value)) AS uncompressed_value,
+  INET_NTOA(INET_ATON('127.0.0.1')) AS network_value,
+  BIN_TO_UUID(UUID_TO_BIN(UUID(), 1), 1) AS uuid_value,
+  ST_AsText(geometry_value) AS geometry_text
+FROM editor_type_matrix
+WHERE integer_value BETWEEN 1 AND 10000
+  AND integer_value IN (6789, 9876)
+  AND varchar_value LIKE 'Manual%'
+  AND REGEXP_LIKE(varchar_value, 'syntax', 'i')
+  AND boolean_value IS TRUE
+  AND date_value IS NOT NULL
+  AND EXISTS (SELECT 1)
+  AND integer_value = ANY (SELECT 6789)
+  AND integer_value <= ALL (SELECT 6789)
+  AND ROW(integer_value, char_value) = ROW(6789, 'SQL');
+
+SELECT
+  COUNT(*) AS row_count,
+  COUNT(DISTINCT enum_value) AS distinct_count,
+  SUM(decimal_value) AS sum_value,
+  AVG(decimal_value) AS average_value,
+  MIN(integer_value) AS minimum_value,
+  MAX(integer_value) AS maximum_value,
+  GROUP_CONCAT(varchar_value ORDER BY type_id SEPARATOR '|') AS grouped_text,
+  JSON_ARRAYAGG(varchar_value) AS json_array_value,
+  JSON_OBJECTAGG(enum_value, integer_value) AS json_object_value,
+  BIT_AND(integer_value) AS aggregate_bit_and,
+  BIT_OR(integer_value) AS aggregate_bit_or,
+  BIT_XOR(integer_value) AS aggregate_bit_xor,
+  STDDEV_POP(decimal_value) AS population_stddev,
+  STDDEV_SAMP(decimal_value) AS sample_stddev,
+  VAR_POP(decimal_value) AS population_variance,
+  VAR_SAMP(decimal_value) AS sample_variance
+FROM editor_type_matrix;
+
+SELECT
+  type_id,
+  ROW_NUMBER() OVER editor_order AS row_number_value,
+  RANK() OVER editor_order AS rank_value,
+  DENSE_RANK() OVER editor_order AS dense_rank_value,
+  PERCENT_RANK() OVER editor_order AS percent_rank_value,
+  CUME_DIST() OVER editor_order AS cumulative_distribution,
+  NTILE(2) OVER editor_order AS tile_value,
+  FIRST_VALUE(integer_value) OVER editor_frame AS first_value_result,
+  LAST_VALUE(integer_value) OVER editor_frame AS last_value_result,
+  NTH_VALUE(integer_value, 1) OVER editor_frame AS nth_value_result,
+  LAG(integer_value) OVER editor_order AS lag_value,
+  LEAD(integer_value) OVER editor_order AS lead_value
+FROM editor_type_matrix
+WINDOW
+  editor_order AS (ORDER BY type_id),
+  editor_frame AS (
+    editor_order ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING
+  );
+
+WITH RECURSIVE node_tree(node_id, parent_node_id, node_name, depth_no, node_path) AS (
+  SELECT node_id, parent_node_id, node_name, 0, CAST(node_name AS CHAR(400))
+  FROM tree_node
+  WHERE parent_node_id IS NULL
+  UNION ALL
+  SELECT n.node_id, n.parent_node_id, n.node_name, t.depth_no + 1,
+         CONCAT(t.node_path, '/', n.node_name)
+  FROM tree_node n
+  JOIN node_tree t ON t.node_id = n.parent_node_id
+)
+SELECT * FROM node_tree ORDER BY node_id;
+
+SELECT d.document_id, d.title, jt.item_no, jt.item_name, jt.item_value,
+       JSON_VALUE(d.payload, '$.kind' RETURNING CHAR(32)) AS kind_value
+FROM document_store d
+JOIN JSON_TABLE(
+  d.payload,
+  '$.items[*]' COLUMNS (
+    item_no FOR ORDINALITY,
+    item_name VARCHAR(32) PATH '$.name',
+    item_value DECIMAL(12,2) PATH '$.value' DEFAULT '0' ON EMPTY
+  )
+) jt ON TRUE
+ORDER BY d.document_id, jt.item_no;
+
+SELECT node_id, measured_on, metric_name, metric_value,
+       SUM(metric_value) OVER running_window AS running_value,
+       LAG(metric_value, 1, 0) OVER ordered_window AS previous_value,
+       DENSE_RANK() OVER (PARTITION BY metric_name ORDER BY metric_value DESC) AS value_rank
+FROM metric_partition
+WINDOW
+  ordered_window AS (PARTITION BY node_id ORDER BY measured_on, metric_id),
+  running_window AS (ordered_window ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW)
+ORDER BY node_id, measured_on;
+
+SELECT node_id, metric_name, SUM(metric_value) AS total_value,
+       GROUPING(node_id) AS node_rollup,
+       GROUPING(metric_name) AS metric_rollup
+FROM metric_partition
+GROUP BY node_id, metric_name WITH ROLLUP;
+
+SELECT n.node_id, n.node_name, top_document.document_id, top_document.score
+FROM tree_node n
+LEFT JOIN LATERAL (
+  SELECT d.document_id, d.score
+  FROM document_store d
+  WHERE d.node_id = n.node_id
+  ORDER BY d.score DESC, d.document_id
+  LIMIT 1
+) top_document ON TRUE
+ORDER BY n.node_id;
+
+(SELECT node_id FROM tree_node WHERE parent_node_id IS NOT NULL)
+INTERSECT
+(SELECT node_id FROM document_store WHERE score >= 70)
+EXCEPT
+(SELECT node_id FROM tree_node WHERE node_name = 'Never')
+ORDER BY node_id;
+
+VALUES ROW(1, 'one'), ROW(2, 'two'), ROW(3, 'three');
+TABLE statement_log_v ORDER BY id LIMIT 3;
+
+SELECT document_id, title,
+       MATCH(title, body_text)
+         AGAINST('+syntax +search' IN BOOLEAN MODE) AS search_score,
+       ST_AsGeoJSON(location, 6) AS location_json
+FROM document_store
+WHERE MATCH(title, body_text)
+        AGAINST('+syntax +search' IN BOOLEAN MODE) > 0;
+
+SELECT DISTINCT enum_value, MAX(integer_value)
+INTO @selected_enum, @selected_integer
+FROM editor_type_matrix
+GROUP BY enum_value
+HAVING COUNT(*) > 0
+ORDER BY enum_value
+LIMIT 1 OFFSET 0;
+
+START TRANSACTION;
+WITH editable_rows AS (
+  SELECT id
+  FROM statement_log
+  WHERE amount >= 10
+)
+UPDATE statement_log AS target
+JOIN editable_rows AS source ON source.id = target.id
+SET target.amount = target.amount;
+SELECT id, category
+FROM statement_log
+WHERE id = 1
+FOR UPDATE NOWAIT;
+SELECT id, category
+FROM statement_log
+WHERE id = 1
+FOR SHARE SKIP LOCKED;
+ROLLBACK;
+
+START TRANSACTION;
+UPDATE document_store d
+JOIN tree_node n ON n.node_id = d.node_id
+SET d.score = d.score + CASE WHEN n.parent_node_id IS NULL THEN 1 ELSE 2 END
+WHERE d.document_id IN (101, 102);
+DELETE d
+FROM document_store d
+JOIN tree_node n ON n.node_id = d.node_id
+WHERE n.node_name = 'Never';
+ROLLBACK;
+
+DO amount_band(55), JSON_VALID('{"ok":true}');
+SET @prepared_amount = 20;
+PREPARE prepared_select FROM
+  'SELECT category, amount_band(amount) AS band FROM statement_log WHERE amount >= ? ORDER BY id';
+EXECUTE prepared_select USING @prepared_amount;
+DEALLOCATE PREPARE prepared_select;
+
+HANDLER statement_log OPEN;
+HANDLER statement_log READ `PRIMARY` FIRST;
+HANDLER statement_log READ `PRIMARY` NEXT;
+HANDLER statement_log CLOSE;
+
+START TRANSACTION READ WRITE;
+SAVEPOINT before_rollback;
+UPDATE statement_log SET amount = amount + 1 WHERE category = 'DDL';
+ROLLBACK TO SAVEPOINT before_rollback;
+RELEASE SAVEPOINT before_rollback;
+COMMIT AND NO CHAIN;
+
+LOCK TABLES statement_log READ, statement_log_stage WRITE;
+UNLOCK TABLES;
+
+XA START 'sq-mysql-final-xa';
+INSERT INTO statement_log(category, payload, amount)
+VALUES ('XA', JSON_OBJECT('kind', 'transaction'), 60);
+XA END 'sq-mysql-final-xa';
+XA PREPARE 'sq-mysql-final-xa';
+XA RECOVER CONVERT XID;
+XA COMMIT 'sq-mysql-final-xa';
+
+XA START 'sq-mysql-final-xa-rollback';
+XA END 'sq-mysql-final-xa-rollback';
+XA PREPARE 'sq-mysql-final-xa-rollback';
+XA ROLLBACK 'sq-mysql-final-xa-rollback';
+
+CREATE EVENT syntax_event
+  ON SCHEDULE AT CURRENT_TIMESTAMP + INTERVAL 1 DAY
+  ON COMPLETION PRESERVE DISABLE
+  COMMENT 'syntax-only disabled event'
+  DO UPDATE statement_log SET amount = amount WHERE id = -1;
+ALTER EVENT syntax_event DISABLE;
+
+ANALYZE TABLE statement_log;
+CHECK TABLE statement_log FOR UPGRADE;
+CHECKSUM TABLE statement_log EXTENDED;
+OPTIMIZE TABLE statement_log;
+REPAIR NO_WRITE_TO_BINLOG TABLE statement_log QUICK;
+
+DESCRIBE statement_log;
+EXPLAIN FORMAT = TREE
+SELECT category, SUM(amount)
+FROM statement_log
+GROUP BY category
+ORDER BY category;
+EXPLAIN ANALYZE
+SELECT * FROM statement_log WHERE id = 1;
+HELP 'SELECT';
+
+SHOW DATABASES LIKE 'sq_mysql_manual_final';
+SHOW FULL TABLES;
+SHOW TABLE STATUS LIKE 'statement_log';
+SHOW FULL COLUMNS FROM statement_log;
+SHOW INDEX FROM statement_log;
+SHOW CREATE DATABASE sq_mysql_manual_final;
+SHOW CREATE TABLE statement_log;
+SHOW CREATE VIEW statement_log_v;
+SHOW CREATE PROCEDURE compound_grammar;
+SHOW CREATE FUNCTION amount_band;
+SHOW CREATE TRIGGER document_store_bi;
+SHOW CREATE EVENT syntax_event;
+SHOW EVENTS;
+SHOW TRIGGERS;
+SHOW PROCEDURE STATUS WHERE Db = DATABASE();
+SHOW FUNCTION STATUS WHERE Db = DATABASE();
+SHOW CHARACTER SET LIKE 'utf8mb4';
+SHOW COLLATION LIKE 'utf8mb4_0900_ai_ci';
+SHOW ENGINES;
+SHOW ENGINE INNODB STATUS;
+SHOW OPEN TABLES FROM sq_mysql_manual_final;
+SHOW PLUGINS;
+SHOW PRIVILEGES;
+SHOW PROCESSLIST;
+SHOW GLOBAL STATUS LIKE 'Uptime';
+SHOW SESSION VARIABLES LIKE 'sql_mode';
+SHOW WARNINGS;
+SHOW ERRORS;
+
+DROP USER IF EXISTS 'sq_mysql_final_user'@'localhost';
+DROP USER IF EXISTS 'sq_mysql_final_user_renamed'@'localhost';
+DROP ROLE IF EXISTS 'sq_mysql_final_reader';
+CREATE ROLE 'sq_mysql_final_reader';
+CREATE USER 'sq_mysql_final_user'@'localhost'
+  IDENTIFIED WITH caching_sha2_password BY 'Sq-final-8.0!';
+ALTER USER 'sq_mysql_final_user'@'localhost'
+  PASSWORD EXPIRE INTERVAL 30 DAY
+  ACCOUNT UNLOCK;
+SET PASSWORD FOR 'sq_mysql_final_user'@'localhost' = 'Sq-final-8.0-updated!';
+SHOW CREATE USER 'sq_mysql_final_user'@'localhost';
+GRANT SELECT ON sq_mysql_manual_final.* TO 'sq_mysql_final_reader';
+GRANT 'sq_mysql_final_reader' TO 'sq_mysql_final_user'@'localhost';
+SET DEFAULT ROLE 'sq_mysql_final_reader' TO 'sq_mysql_final_user'@'localhost';
+SET ROLE NONE;
+SHOW GRANTS FOR 'sq_mysql_final_user'@'localhost';
+REVOKE 'sq_mysql_final_reader' FROM 'sq_mysql_final_user'@'localhost';
+REVOKE SELECT ON sq_mysql_manual_final.* FROM 'sq_mysql_final_reader';
+RENAME USER 'sq_mysql_final_user'@'localhost'
+  TO 'sq_mysql_final_user_renamed'@'localhost';
+DROP USER 'sq_mysql_final_user_renamed'@'localhost';
+DROP ROLE 'sq_mysql_final_reader';
+
+CALL assert_true((SELECT COUNT(*) FROM statement_log) = 7, 'manual statement row count');
+CALL assert_true((SELECT amount FROM statement_log WHERE category = 'DDL') = 10, 'rollback');
+CALL assert_true((SELECT COUNT(*) FROM statement_log_v) = 7, 'view row count');
+CALL assert_true((SELECT COUNT(*) FROM tree_node) = 4, 'recursive tree data');
+CALL assert_true((SELECT COUNT(*) FROM document_store) = 4, 'document data');
+CALL assert_true((SELECT COUNT(*) FROM metric_partition) = 5, 'partition data');
+CALL assert_true((SELECT COUNT(*) FROM editor_type_matrix) = 1, 'type matrix data');
+CALL assert_true(@last_updated_document = 102, 'update trigger fired before rollback');
+SELECT 'PASS' AS final_status,
+       VERSION() AS server_version,
+       (SELECT COUNT(*) FROM statement_log) AS manual_rows,
+       (SELECT COUNT(*) FROM document_store) AS document_rows,
+       (SELECT COUNT(*) FROM INFORMATION_SCHEMA.PARTITIONS
+        WHERE TABLE_SCHEMA = DATABASE()
+          AND TABLE_NAME = 'metric_partition'
+          AND PARTITION_NAME IS NOT NULL) AS partition_count;

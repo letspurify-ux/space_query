@@ -1,0 +1,9 @@
+tns-thin
+Copyright (c) 2026 SPACE Query contributors
+
+Portions of this product are modified from, and reimplemented in Rust based
+on, the thin protocol implementation in python-oracledb.
+
+Copyright (c) 2016, 2026, Oracle and/or its affiliates.
+
+Additional third-party attributions are provided in THIRD_PARTY_NOTICES.md.

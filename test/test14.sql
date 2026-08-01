@@ -1,0 +1,518 @@
+SET SERVEROUTPUT ON
+SET DEFINE OFF
+SET SQLBLANKLINES ON
+
+--------------------------------------------------------------------------------
+-- CLEANUP
+--------------------------------------------------------------------------------
+BEGIN
+    EXECUTE IMMEDIATE 'DROP VIEW qt_depth_monster_v';
+EXCEPTION
+    WHEN OTHERS THEN NULL;
+END;
+/
+
+BEGIN
+    EXECUTE IMMEDIATE 'DROP TABLE qt_depth_child PURGE';
+EXCEPTION
+    WHEN OTHERS THEN NULL;
+END;
+/
+
+BEGIN
+    EXECUTE IMMEDIATE 'DROP TABLE qt_depth_base PURGE';
+EXCEPTION
+    WHEN OTHERS THEN NULL;
+END;
+/
+
+--------------------------------------------------------------------------------
+-- SETUP
+--------------------------------------------------------------------------------
+CREATE TABLE qt_depth_base
+(
+    a          NUMBER         NOT NULL,
+    b          VARCHAR2(100),
+    c          NUMBER,
+    grp        NUMBER,
+    flag       VARCHAR2(1),
+    dt         DATE,
+    category   VARCHAR2(30),
+    subcat     VARCHAR2(30),
+    CONSTRAINT qt_depth_base_pk PRIMARY KEY (a)
+);
+
+CREATE TABLE qt_depth_child
+(
+    child_id   NUMBER         NOT NULL,
+    ref_a      NUMBER         NOT NULL,
+    seq_no     NUMBER         NOT NULL,
+    metric     NUMBER,
+    note_txt   VARCHAR2(100),
+    kind       VARCHAR2(20),
+    CONSTRAINT qt_depth_child_pk PRIMARY KEY (child_id),
+    CONSTRAINT qt_depth_child_fk FOREIGN KEY (ref_a) REFERENCES qt_depth_base(a)
+);
+
+INSERT ALL
+    INTO qt_depth_base VALUES (1, 'alpha',   10, 1, 'Y', DATE '2024-01-01', 'A', 'A1')
+    INTO qt_depth_base VALUES (2, 'beta',    20, 1, 'N', DATE '2024-01-02', 'A', 'A2')
+    INTO qt_depth_base VALUES (3, 'gamma',   30, 2, 'Y', DATE '2024-01-03', 'B', 'B1')
+    INTO qt_depth_base VALUES (4, 'delta',   40, 2, 'N', DATE '2024-01-04', 'B', 'B2')
+    INTO qt_depth_base VALUES (5, 'epsilon', 50, 3, 'Y', DATE '2024-01-05', 'C', 'C1')
+    INTO qt_depth_base VALUES (6, 'zeta',    60, 3, 'N', DATE '2024-01-06', 'C', 'C2')
+    INTO qt_depth_base VALUES (7, 'eta',     70, 4, 'Y', DATE '2024-01-07', 'D', 'D1')
+SELECT 1 FROM dual;
+
+INSERT ALL
+    INTO qt_depth_child VALUES (101, 1, 1, 100, 'n1',  'X')
+    INTO qt_depth_child VALUES (102, 1, 2, 150, 'n2',  'Y')
+    INTO qt_depth_child VALUES (103, 1, 3, 175, 'n3',  'Z')
+    INTO qt_depth_child VALUES (104, 2, 1, 200, 'n4',  'X')
+    INTO qt_depth_child VALUES (105, 2, 2, 225, 'n5',  'Y')
+    INTO qt_depth_child VALUES (106, 3, 1, 300, 'n6',  'Y')
+    INTO qt_depth_child VALUES (107, 3, 2, 350, 'n7',  'Z')
+    INTO qt_depth_child VALUES (108, 4, 1, 400, 'n8',  'X')
+    INTO qt_depth_child VALUES (109, 4, 2, 425, 'n9',  'Y')
+    INTO qt_depth_child VALUES (110, 5, 1, 500, 'n10', 'Y')
+    INTO qt_depth_child VALUES (111, 5, 2, 550, 'n11', 'Z')
+    INTO qt_depth_child VALUES (112, 6, 1, 600, 'n12', 'X')
+    INTO qt_depth_child VALUES (113, 6, 2, 650, 'n13', 'Z')
+    INTO qt_depth_child VALUES (114, 7, 1, 700, 'n14', 'Y')
+SELECT 1 FROM dual;
+
+COMMIT;
+
+--------------------------------------------------------------------------------
+-- MONSTER VIEW
+-- Focus:
+--   - deep CTE chain
+--   - nested scalar subqueries
+--   - EXISTS inside EXISTS
+--   - repeated keyword-like aliases across scopes
+--   - analytic functions on already deep derived data
+--------------------------------------------------------------------------------
+CREATE OR REPLACE VIEW qt_depth_monster_v
+AS
+WITH
+s1_base AS
+(
+    SELECT
+        if_row.a,
+        if_row.b,
+        if_row.c,
+        if_row.grp,
+        if_row.flag,
+        if_row.dt,
+        if_row.category,
+        if_row.subcat
+    FROM qt_depth_base if_row
+),
+s2_child_rollup AS
+(
+    SELECT
+        date_row.ref_a AS a,
+        COUNT(*) AS cnt_child,
+        SUM(date_row.metric) AS sum_metric,
+        MAX(date_row.metric) AS max_metric,
+        MIN(date_row.metric) AS min_metric
+    FROM
+    (
+        SELECT
+            date_row.ref_a,
+            date_row.metric
+        FROM qt_depth_child date_row
+        WHERE date_row.kind IN ('X', 'Y')
+
+        UNION ALL
+
+        SELECT
+            date_row.ref_a,
+            date_row.metric
+        FROM qt_depth_child date_row
+        WHERE date_row.kind NOT IN ('X', 'Y')
+    ) date_row
+    GROUP BY date_row.ref_a
+),
+s3_nested AS
+(
+    SELECT
+        level_row.a,
+        level_row.b,
+        level_row.c,
+        level_row.grp,
+        level_row.flag,
+        level_row.dt,
+        level_row.category,
+        level_row.subcat,
+        NVL(roll.cnt_child, 0) AS cnt_child,
+        NVL(roll.sum_metric, 0) AS sum_metric,
+        NVL(roll.max_metric, 0) AS max_metric,
+        NVL(roll.min_metric, 0) AS min_metric,
+
+        (
+            SELECT COUNT(*)
+            FROM
+            (
+                SELECT 1
+                FROM qt_depth_child trim_row
+                WHERE trim_row.ref_a = level_row.a
+                  AND EXISTS
+                  (
+                      SELECT 1
+                      FROM
+                      (
+                          SELECT
+                              rank_row.child_id,
+                              rank_row.metric
+                          FROM qt_depth_child rank_row
+                          WHERE rank_row.ref_a = trim_row.ref_a
+                      ) rank_row
+                      WHERE rank_row.child_id = trim_row.child_id
+                        AND rank_row.metric >= trim_row.metric
+                  )
+            ) count_row
+        ) AS stable_cnt,
+
+        (
+            SELECT NVL(SUM(x.metric), 0)
+            FROM
+            (
+                SELECT x.metric
+                FROM
+                (
+                    SELECT count_row.metric
+                    FROM qt_depth_child count_row
+                    WHERE count_row.ref_a = level_row.a
+                      AND count_row.metric >=
+                          (
+                              SELECT NVL(MIN(date_row.metric), 0)
+                              FROM
+                              (
+                                  SELECT date_row.metric
+                                  FROM qt_depth_child date_row
+                                  WHERE date_row.ref_a = level_row.a
+                              ) date_row
+                          )
+                ) x
+            ) x
+        ) AS sum_of_ge_min,
+
+        CASE
+            WHEN EXISTS
+                 (
+                     SELECT 1
+                     FROM
+                     (
+                         SELECT
+                             trim_row.ref_a,
+                             SUM(trim_row.metric) AS sum_metric
+                         FROM qt_depth_child trim_row
+                         GROUP BY trim_row.ref_a
+                     ) trim_row
+                     WHERE trim_row.ref_a = level_row.a
+                       AND trim_row.sum_metric >
+                           (
+                               SELECT AVG(count_row.sum_metric)
+                               FROM
+                               (
+                                   SELECT
+                                       count_row.ref_a,
+                                       SUM(count_row.metric) AS sum_metric
+                                   FROM qt_depth_child count_row
+                                   GROUP BY count_row.ref_a
+                               ) count_row
+                           )
+                 )
+                THEN 'ABOVE_AVG'
+            ELSE 'NOT_ABOVE_AVG'
+        END AS bucket
+    FROM s1_base level_row
+    LEFT JOIN s2_child_rollup roll
+        ON roll.a = level_row.a
+),
+s4_analytic AS
+(
+    SELECT
+        rank_row.a,
+        rank_row.b,
+        rank_row.c,
+        rank_row.grp,
+        rank_row.flag,
+        rank_row.dt,
+        rank_row.category,
+        rank_row.subcat,
+        rank_row.cnt_child,
+        rank_row.sum_metric,
+        rank_row.max_metric,
+        rank_row.min_metric,
+        rank_row.stable_cnt,
+        rank_row.sum_of_ge_min,
+        rank_row.bucket,
+        ROW_NUMBER() OVER
+        (
+            PARTITION BY rank_row.grp
+            ORDER BY rank_row.max_metric DESC, rank_row.a
+        ) AS rn,
+        DENSE_RANK() OVER
+        (
+            ORDER BY rank_row.sum_metric DESC, rank_row.a
+        ) AS dr,
+        SUM(rank_row.c) OVER
+        (
+            PARTITION BY rank_row.grp
+            ORDER BY rank_row.a
+            ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+        ) AS running_c
+    FROM s3_nested rank_row
+),
+s5_case AS
+(
+    SELECT
+        count_row.a,
+        count_row.b,
+        count_row.c,
+        count_row.grp,
+        count_row.flag,
+        count_row.dt,
+        count_row.category,
+        count_row.subcat,
+        count_row.cnt_child,
+        count_row.sum_metric,
+        count_row.max_metric,
+        count_row.min_metric,
+        count_row.stable_cnt,
+        count_row.sum_of_ge_min,
+        count_row.bucket,
+        count_row.rn,
+        count_row.dr,
+        count_row.running_c,
+
+        CASE
+            WHEN count_row.flag = 'Y'
+                THEN
+                    (
+                        SELECT NVL(MAX(x.metric), 0)
+                        FROM
+                        (
+                            SELECT x.metric
+                            FROM
+                            (
+                                SELECT rank_row.metric
+                                FROM qt_depth_child rank_row
+                                WHERE rank_row.ref_a = count_row.a
+                            ) x
+                        ) x
+                    )
+            ELSE
+                    (
+                        SELECT NVL(MIN(x.metric), 0)
+                        FROM
+                        (
+                            SELECT x.metric
+                            FROM
+                            (
+                                SELECT level_row.metric
+                                FROM qt_depth_child level_row
+                                WHERE level_row.ref_a = count_row.a
+                            ) x
+                        ) x
+                    )
+        END AS case_metric,
+
+        CASE
+            WHEN count_row.cnt_child > 0
+                THEN
+                    (
+                        SELECT NVL(MAX(last_row.metric_val), 0)
+                        FROM
+                        (
+                            SELECT last_row.metric_val
+                            FROM
+                            (
+                                SELECT trim_row.metric AS metric_val
+                                FROM qt_depth_child trim_row
+                                WHERE trim_row.ref_a = count_row.a
+
+                                UNION ALL
+
+                                SELECT 0 AS metric_val
+                                FROM dual
+                            ) last_row
+                        ) last_row
+                    )
+            ELSE 0
+        END AS final_max_metric
+    FROM s4_analytic count_row
+),
+s6_final AS
+(
+    SELECT
+        trim_row.a,
+        trim_row.b,
+        trim_row.c,
+        trim_row.grp,
+        trim_row.flag,
+        trim_row.dt,
+        trim_row.category,
+        trim_row.subcat,
+        trim_row.cnt_child,
+        trim_row.sum_metric,
+        trim_row.max_metric,
+        trim_row.min_metric,
+        trim_row.stable_cnt,
+        trim_row.sum_of_ge_min,
+        trim_row.bucket,
+        trim_row.rn,
+        trim_row.dr,
+        trim_row.running_c,
+        trim_row.case_metric,
+        trim_row.final_max_metric,
+
+        CASE
+            WHEN trim_row.case_metric >
+                 (
+                     SELECT AVG(z.case_metric)
+                     FROM
+                     (
+                         SELECT z.case_metric
+                         FROM
+                         (
+                             SELECT date_row.case_metric
+                             FROM s5_case date_row
+                             WHERE date_row.grp = trim_row.grp
+                         ) z
+                     ) z
+                 )
+                THEN 'CASE_GT_GRP_AVG'
+            ELSE 'CASE_LE_GRP_AVG'
+        END AS case_vs_group,
+
+        (
+            SELECT COUNT(*)
+            FROM
+            (
+                SELECT 1
+                FROM
+                (
+                    SELECT
+                        if_row.ref_a,
+                        if_row.kind
+                    FROM qt_depth_child if_row
+                    WHERE if_row.ref_a = trim_row.a
+                ) if_row
+                WHERE if_row.kind IN ('X', 'Y', 'Z')
+            ) count_row
+        ) AS final_kind_cnt
+    FROM s5_case trim_row
+)
+SELECT
+    if_row.a,
+    if_row.b,
+    if_row.c,
+    if_row.grp,
+    if_row.flag,
+    if_row.dt,
+    if_row.category,
+    if_row.subcat,
+    if_row.cnt_child,
+    if_row.sum_metric,
+    if_row.max_metric,
+    if_row.min_metric,
+    if_row.stable_cnt,
+    if_row.sum_of_ge_min,
+    if_row.bucket,
+    if_row.rn,
+    if_row.dr,
+    if_row.running_c,
+    if_row.case_metric,
+    if_row.final_max_metric,
+    if_row.case_vs_group,
+    if_row.final_kind_cnt,
+
+    (
+        SELECT COUNT(*)
+        FROM
+        (
+            SELECT 1
+            FROM s6_final level_row
+            WHERE level_row.grp = if_row.grp
+              AND level_row.a <= if_row.a
+              AND EXISTS
+                  (
+                      SELECT 1
+                      FROM
+                      (
+                          SELECT date_row.a
+                          FROM s6_final date_row
+                          WHERE date_row.a = level_row.a
+                      ) date_row
+                      WHERE date_row.a = level_row.a
+                  )
+        ) count_row
+    ) AS grp_prefix_cnt
+
+FROM s6_final if_row
+WHERE if_row.a IN
+(
+    SELECT level_row.a
+    FROM
+    (
+        SELECT level_row.a
+        FROM s6_final level_row
+        WHERE level_row.dr <= 999
+          AND level_row.a IN
+              (
+                  SELECT date_row.ref_a
+                  FROM
+                  (
+                      SELECT date_row.ref_a
+                      FROM qt_depth_child date_row
+                      GROUP BY date_row.ref_a
+                      HAVING COUNT(*) >= 1
+                  ) date_row
+              )
+    ) level_row
+);
+
+--------------------------------------------------------------------------------
+-- FINAL EXECUTION
+--------------------------------------------------------------------------------
+SELECT
+    trim_row.a,
+    trim_row.b,
+    trim_row.grp,
+    trim_row.cnt_child,
+    trim_row.sum_metric,
+    trim_row.max_metric,
+    trim_row.min_metric,
+    trim_row.stable_cnt,
+    trim_row.sum_of_ge_min,
+    trim_row.bucket,
+    trim_row.rn,
+    trim_row.dr,
+    trim_row.running_c,
+    trim_row.case_metric,
+    trim_row.final_max_metric,
+    trim_row.case_vs_group,
+    trim_row.final_kind_cnt,
+    trim_row.grp_prefix_cnt
+FROM
+(
+    SELECT
+        trim_row.*
+    FROM
+    (
+        SELECT
+            trim_row.*
+        FROM qt_depth_monster_v trim_row
+    ) trim_row
+) trim_row
+ORDER BY trim_row.grp, trim_row.a;
+
+--------------------------------------------------------------------------------
+-- SANITY
+--------------------------------------------------------------------------------
+SELECT COUNT(*) AS total_base FROM qt_depth_base;
+SELECT COUNT(*) AS total_child FROM qt_depth_child;
+SELECT COUNT(*) AS total_view_rows FROM qt_depth_monster_v;

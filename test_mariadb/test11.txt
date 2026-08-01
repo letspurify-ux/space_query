@@ -1,0 +1,255 @@
+-- ============================================================================
+-- SPACE QUERY MARIADB AUTO-FORMAT CERTIFICATION GAUNTLET III
+-- Target: MariaDB 12.2+
+--
+-- Bitemporal + anonymous-block boss: simultaneous application/system time,
+-- snapshot and range history, BEGIN NOT ATOMIC, direct HANDLER reads, upsert
+-- RETURNING, standalone VALUES, Oracle-mode MINUS, JSON normalization,
+-- PERCENTILE_DISC, ROWS EXAMINED, diagnostics, and rollback-only time slicing.
+-- ============================================================================
+
+DELIMITER ;
+DROP DATABASE IF EXISTS sq_mariadb_format_cert_3;
+CREATE DATABASE sq_mariadb_format_cert_3 CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
+USE sq_mariadb_format_cert_3;
+SET NAMES utf8mb4;
+SET SESSION sql_mode='STRICT_TRANS_TABLES,ERROR_FOR_DIVISION_BY_ZERO,NO_ENGINE_SUBSTITUTION';
+SET @lexical_trap='BEGIN NOT ATOMIC; FOR SYSTEM_TIME AS OF x; HANDLER y READ `PRIMARY` NEXT; MINUS // inert';
+
+# Comment trap: DELETE HISTORY FROM imaginary BEFORE SYSTEM_TIME TIMESTAMP '2000-01-01' //
+/* String-looking syntax is inert: VALUES (1); RETURNING id; END NOT ATOMIC; */
+
+CREATE TABLE mb3_contract(
+contract_id INT NOT NULL,
+valid_from DATE NOT NULL,
+valid_to DATE NOT NULL,
+customer_code VARCHAR(30)NOT NULL,
+contract_status VARCHAR(20)NOT NULL,
+amount DECIMAL(14,2)NOT NULL,
+terms_doc JSON NOT NULL,
+row_start TIMESTAMP(6)GENERATED ALWAYS AS ROW START,
+row_end TIMESTAMP(6)GENERATED ALWAYS AS ROW END,
+PERIOD FOR validity(valid_from,valid_to),
+PERIOD FOR SYSTEM_TIME(row_start,row_end),
+PRIMARY KEY(contract_id,validity WITHOUT OVERLAPS),
+KEY ix_mb3_contract_customer(customer_code),
+CONSTRAINT chk_mb3_contract_amount CHECK(amount>0),
+CONSTRAINT chk_mb3_contract_terms CHECK(JSON_VALID(terms_doc))
+)ENGINE=InnoDB WITH SYSTEM VERSIONING;
+
+CREATE TABLE mb3_event(
+event_id BIGINT NOT NULL AUTO_INCREMENT,
+contract_id INT NOT NULL,
+event_at DATETIME(6)NOT NULL,
+event_type VARCHAR(30)NOT NULL,
+event_amount DECIMAL(14,2)NOT NULL,
+payload JSON NOT NULL,
+PRIMARY KEY(event_id),
+KEY ix_mb3_event_contract_time(contract_id,event_at),
+CONSTRAINT chk_mb3_event_payload CHECK(JSON_VALID(payload))
+)ENGINE=InnoDB;
+
+CREATE TABLE mb3_rollup(
+contract_id INT NOT NULL,
+current_fragments BIGINT NOT NULL,
+history_versions BIGINT NOT NULL,
+event_count BIGINT NOT NULL,
+event_total DECIMAL(18,2)NOT NULL,
+evidence JSON NOT NULL,
+PRIMARY KEY(contract_id)
+)ENGINE=InnoDB;
+
+CREATE TABLE mb3_direct(
+direct_id INT NOT NULL,
+payload VARCHAR(80)NOT NULL,
+score INT NOT NULL,
+PRIMARY KEY(direct_id),
+KEY ix_mb3_direct_score(score)
+)ENGINE=InnoDB;
+
+CREATE TABLE mb3_error_log(
+log_id BIGINT NOT NULL AUTO_INCREMENT,
+phase_name VARCHAR(80)NOT NULL,
+sql_state CHAR(5),
+error_no INT,
+message_text TEXT,
+PRIMARY KEY(log_id)
+)ENGINE=InnoDB;
+
+DELIMITER //
+
+CREATE OR REPLACE PROCEDURE mb3_assert(IN p_condition BOOLEAN,IN p_message VARCHAR(255))
+BEGIN
+IF IFNULL(p_condition,FALSE)=FALSE THEN SIGNAL SQLSTATE'45000'SET MESSAGE_TEXT=p_message;END IF;
+END//
+
+CREATE OR REPLACE FUNCTION mb3_contract_band(p_amount DECIMAL(14,2))
+RETURNS VARCHAR(20)
+DETERMINISTIC
+RETURN CASE WHEN p_amount>=200 THEN'PLATINUM'WHEN p_amount>=100 THEN'GOLD'WHEN p_amount>=50 THEN'SILVER'ELSE'BRONZE'END//
+
+CREATE OR REPLACE TRIGGER mb3_event_bi BEFORE INSERT ON mb3_event FOR EACH ROW
+BEGIN
+SET NEW.event_type=UPPER(TRIM(NEW.event_type));
+IF NEW.event_amount<0 OR JSON_VALID(NEW.payload)=0 THEN
+SIGNAL SQLSTATE'45000'SET MESSAGE_TEXT='invalid bitemporal event';
+END IF;
+END//
+
+DELIMITER ;
+
+INSERT INTO mb3_contract(contract_id,valid_from,valid_to,customer_code,contract_status,amount,terms_doc)VALUES
+(1,'2026-01-01','2027-01-01','alpha','ACTIVE',100,JSON_OBJECT('plan','core','features',JSON_ARRAY('history','portion'))),
+(2,'2026-01-01','2026-07-01','beta','ACTIVE',80,JSON_OBJECT('plan','starter','features',JSON_ARRAY('snapshot'))),
+(2,'2026-07-01','2027-01-01','beta','ACTIVE',90,JSON_OBJECT('plan','renewal','features',JSON_ARRAY('snapshot','renewal'))),
+(3,'2026-01-01','2027-01-01','gamma','ACTIVE',220,JSON_OBJECT('plan','enterprise','features',JSON_ARRAY('history','analytics')));
+
+UPDATE mb3_contract FOR PORTION OF validity FROM'2026-03-01'TO'2026-06-01'
+SET amount=125,terms_doc=JSON_SET(terms_doc,'$.campaign','spring','$.revision',2)
+WHERE contract_id=1;
+
+SET @history_cutover=NOW(6);
+DO SLEEP(0.02);
+UPDATE mb3_contract SET contract_status='REVIEWED',terms_doc=JSON_SET(terms_doc,'$.reviewed',TRUE)
+WHERE contract_id=1 AND valid_from='2026-01-01';
+
+INSERT INTO mb3_event(contract_id,event_at,event_type,event_amount,payload)VALUES
+(1,'2026-01-10 09:00:00.000001','charge',100,JSON_OBJECT('channel','web','tags',JSON_ARRAY('initial','core'))),
+(1,'2026-03-10 10:00:00.000002','adjustment',25,JSON_OBJECT('channel','app','tags',JSON_ARRAY('campaign'))),
+(2,'2026-02-10 11:00:00.000003','charge',80,JSON_OBJECT('channel','partner','tags',JSON_ARRAY('initial'))),
+(2,'2026-08-10 12:00:00.000004','renewal',90,JSON_OBJECT('channel','partner','tags',JSON_ARRAY('renewal'))),
+(3,'2026-04-10 13:00:00.000005','charge',220,JSON_OBJECT('channel','direct','tags',JSON_ARRAY('enterprise'))),
+(3,'2026-05-10 14:00:00.000006','credit',20,JSON_OBJECT('channel','direct','tags',JSON_ARRAY('credit','manual')));
+
+INSERT INTO mb3_direct(direct_id,payload,score)VALUES(1,'one',10),(2,'two',30),(3,'three',20);
+
+DELIMITER //
+
+BEGIN NOT ATOMIC
+DECLARE v_contract_count INT DEFAULT 0;
+DECLARE v_event_total DECIMAL(18,2)DEFAULT 0;
+DECLARE v_state CHAR(5);
+DECLARE v_errno INT;
+DECLARE v_message TEXT;
+DECLARE duplicate_key CONDITION FOR 1062;
+DECLARE EXIT HANDLER FOR SQLEXCEPTION
+BEGIN
+GET DIAGNOSTICS CONDITION 1 v_state=RETURNED_SQLSTATE,v_errno=MYSQL_ERRNO,v_message=MESSAGE_TEXT;
+ROLLBACK;
+INSERT INTO mb3_error_log(phase_name,sql_state,error_no,message_text)VALUES('UNEXPECTED',v_state,v_errno,v_message);
+RESIGNAL;
+END;
+START TRANSACTION;
+FOR contract_rec IN(
+SELECT contract_id,COUNT(*)AS fragment_count,SUM(amount)AS fragment_amount
+FROM mb3_contract GROUP BY contract_id ORDER BY contract_id
+)DO
+SET v_contract_count=v_contract_count+1;
+SET v_event_total=v_event_total+contract_rec.fragment_amount;
+END FOR;
+
+duplicate_probe:BEGIN
+DECLARE CONTINUE HANDLER FOR duplicate_key
+BEGIN
+GET DIAGNOSTICS CONDITION 1 v_state=RETURNED_SQLSTATE,v_errno=MYSQL_ERRNO,v_message=MESSAGE_TEXT;
+INSERT INTO mb3_error_log(phase_name,sql_state,error_no,message_text)VALUES('EXPECTED_DUPLICATE',v_state,v_errno,v_message);
+END;
+INSERT INTO mb3_direct(direct_id,payload,score)VALUES(1,'duplicate',999);
+END duplicate_probe;
+
+INSERT INTO mb3_rollup(contract_id,current_fragments,history_versions,event_count,event_total,evidence)
+SELECT c.contract_id,COUNT(*),
+(SELECT COUNT(*)FROM mb3_contract FOR SYSTEM_TIME ALL AS h WHERE h.contract_id=c.contract_id),
+(SELECT COUNT(*)FROM mb3_event e WHERE e.contract_id=c.contract_id),
+COALESCE((SELECT SUM(e2.event_amount)FROM mb3_event e2 WHERE e2.contract_id=c.contract_id),0),
+JSON_NORMALIZE(JSON_OBJECT('customer',MAX(c.customer_code),'band',mb3_contract_band(MAX(c.amount)),'statuses',JSON_ARRAYAGG(c.contract_status)))
+FROM mb3_contract c GROUP BY c.contract_id;
+CALL mb3_assert(v_contract_count=3,'anonymous cursor contract count');
+CALL mb3_assert(v_event_total>0,'anonymous accumulator');
+COMMIT;
+END//
+
+DELIMITER ;
+
+-- Bitemporal snapshot before the ordinary system-versioned update.
+SELECT contract_id,valid_from,valid_to,contract_status,amount,row_start,row_end
+FROM mb3_contract FOR SYSTEM_TIME AS OF @history_cutover
+ORDER BY contract_id,valid_from;
+
+-- System-time range keeps both the old and current version of the changed slice.
+SELECT contract_id,valid_from,valid_to,contract_status,amount,row_start,row_end
+FROM mb3_contract FOR SYSTEM_TIME BETWEEN(@history_cutover-INTERVAL 1 SECOND)AND NOW(6)
+WHERE contract_id=1
+ORDER BY row_start,valid_from;
+
+-- Current application fragments + analytics + JSON aggregation.
+WITH event_daily AS(
+SELECT contract_id,DATE(event_at)AS event_day,SUM(event_amount)AS day_amount,COUNT(*)AS event_count
+FROM mb3_event GROUP BY contract_id,DATE(event_at)
+),analytic AS(
+SELECT e.*,
+SUM(e.day_amount)OVER(PARTITION BY e.contract_id ORDER BY e.event_day ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW)AS running_amount,
+PERCENTILE_DISC(0.5)WITHIN GROUP(ORDER BY e.day_amount)OVER(PARTITION BY e.contract_id)AS median_amount,
+LAG(e.day_amount)OVER(PARTITION BY e.contract_id ORDER BY e.event_day)AS previous_amount
+FROM event_daily e
+)
+SELECT a.contract_id,a.event_day,a.day_amount,a.event_count,a.running_amount,a.median_amount,COALESCE(a.previous_amount,0)AS previous_amount,
+(SELECT JSON_OBJECTAGG(CONCAT(c.valid_from,'/',c.valid_to),JSON_OBJECT('status',c.contract_status,'amount',c.amount))FROM mb3_contract c WHERE c.contract_id=a.contract_id)AS application_versions,
+(SELECT JSON_ARRAYAGG(JSON_VALUE(e2.payload,'$.channel')ORDER BY e2.event_at)FROM mb3_event e2 WHERE e2.contract_id=a.contract_id)AS channels
+FROM analytic a
+ORDER BY a.contract_id,a.event_day;
+
+-- Direct table access syntax is deliberately outside SELECT ownership.
+HANDLER mb3_direct OPEN;
+HANDLER mb3_direct READ`PRIMARY`FIRST;
+HANDLER mb3_direct READ`PRIMARY`NEXT;
+HANDLER mb3_direct CLOSE;
+
+-- MariaDB upsert RETURNING and standalone VALUES are separate result sets.
+INSERT INTO mb3_direct(direct_id,payload,score)VALUES(1,'returning-upsert',25)
+ON DUPLICATE KEY UPDATE payload=VALUES(payload),score=VALUES(score)
+RETURNING direct_id,payload,score;
+
+VALUES(1,'one'),(2,'two'),(3,'three');
+
+-- Oracle compatibility changes EXCEPT's spelling without changing the data.
+SET @saved_sql_mode=@@SESSION.sql_mode;
+SET SESSION sql_mode=CONCAT(@@SESSION.sql_mode,',ORACLE');
+SELECT contract_id FROM mb3_contract
+MINUS
+SELECT contract_id FROM mb3_contract WHERE contract_id=2
+ORDER BY contract_id;
+SET SESSION sql_mode=@saved_sql_mode;
+
+-- No-op purge syntax and MariaDB-specific execution ceiling.
+DELETE HISTORY FROM mb3_contract BEFORE SYSTEM_TIME TIMESTAMP'2000-01-01 00:00:00';
+
+SELECT direct_id,payload,score,NATURAL_SORT_KEY(payload)AS natural_key
+FROM mb3_direct
+ORDER BY score DESC,direct_id
+LIMIT 3 ROWS EXAMINED 1000;
+
+-- Rollback-only application-time update must leave fragment counts unchanged.
+START TRANSACTION;
+UPDATE mb3_contract FOR PORTION OF validity FROM'2026-04-01'TO'2026-05-01'
+SET amount=amount+999,contract_status='TEMPORARY'
+WHERE contract_id=1;
+ROLLBACK;
+
+CALL mb3_assert((SELECT COUNT(*)FROM mb3_contract)=6,'current bitemporal fragments');
+CALL mb3_assert((SELECT COUNT(*)FROM mb3_contract FOR SYSTEM_TIME AS OF @history_cutover)=6,'snapshot fragment count');
+CALL mb3_assert((SELECT COUNT(*)FROM mb3_contract FOR SYSTEM_TIME ALL)>=8,'system history count');
+CALL mb3_assert((SELECT COUNT(*)FROM mb3_contract WHERE contract_status='REVIEWED')=1,'reviewed current version');
+CALL mb3_assert((SELECT COUNT(*)FROM mb3_event)=6,'event count');
+CALL mb3_assert((SELECT COUNT(*)FROM mb3_rollup)=3,'rollup count');
+CALL mb3_assert((SELECT score FROM mb3_direct WHERE direct_id=1)=25,'upsert returning value');
+CALL mb3_assert((SELECT COUNT(*)FROM mb3_error_log WHERE phase_name='EXPECTED_DUPLICATE')=1,'expected duplicate handler');
+CALL mb3_assert((SELECT COUNT(*)FROM mb3_error_log WHERE phase_name='UNEXPECTED')=0,'unexpected errors');
+
+SELECT'PASS'AS status,
+(SELECT COUNT(*)FROM mb3_contract)AS current_fragments,
+(SELECT COUNT(*)FROM mb3_contract FOR SYSTEM_TIME ALL)AS all_versions,
+(SELECT COUNT(*)FROM mb3_event)AS event_rows,
+(SELECT COUNT(*)FROM mb3_rollup)AS rollup_rows,
+(SELECT COUNT(*)FROM mb3_error_log)AS expected_errors,
+JSON_NORMALIZE(JSON_OBJECT('trap',@lexical_trap,'as_of_count',(SELECT COUNT(*)FROM mb3_contract FOR SYSTEM_TIME AS OF @history_cutover),'reviewed',(SELECT COUNT(*)FROM mb3_contract WHERE contract_status='REVIEWED'),'direct_payload',(SELECT payload FROM mb3_direct WHERE direct_id=1)))AS evidence;

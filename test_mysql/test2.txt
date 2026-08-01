@@ -1,0 +1,828 @@
+-- MYSQL QUERY TOOL VALIDATION SCRIPT #2
+-- Focus: parser/splitter/control-flow/delimiter/JSON/CTE/window/handlers
+-- Target: MySQL 8.0+
+
+DROP DATABASE IF EXISTS qt_mysql_parser_killer;
+CREATE DATABASE qt_mysql_parser_killer CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_ai_ci;
+USE qt_mysql_parser_killer;
+
+SET NAMES utf8mb4;
+
+SET @versioned_comment_ok = 0;
+/*!80000 SET @versioned_comment_ok = 1 */;
+
+# line comment torture ; ; ; DELIMITER $$ should not split here
+
+/*
+  block comment torture
+  DELIMITER //
+  CREATE PROCEDURE fake_x() BEGIN SELECT 1; END//
+*/
+
+CREATE TABLE node (
+    node_id INT NOT NULL,
+    parent_node_id INT NULL,
+    `group` VARCHAR(20) NOT NULL,
+    node_name VARCHAR(100) NOT NULL,
+    sort_no INT NOT NULL,
+    meta JSON NOT NULL,
+    path_hint VARCHAR(200)
+        GENERATED ALWAYS AS (JSON_UNQUOTE(JSON_EXTRACT(meta, '$.pathHint'))) VIRTUAL,
+    PRIMARY KEY (node_id),
+    UNIQUE KEY uk_node_group_name (`group`, node_name),
+    KEY idx_node_parent (parent_node_id),
+    CONSTRAINT fk_node_parent
+        FOREIGN KEY (parent_node_id) REFERENCES node (node_id),
+    CONSTRAINT chk_node_self
+        CHECK (parent_node_id IS NULL OR parent_node_id <> node_id)
+) ENGINE = InnoDB;
+
+CREATE TABLE task (
+    task_id BIGINT NOT NULL,
+    node_id INT NOT NULL,
+    owner_name VARCHAR(100) NOT NULL,
+    status_code VARCHAR(20) NOT NULL,
+    priority INT NOT NULL,
+    `rank` INT NOT NULL,
+    payload JSON NOT NULL,
+    created_at DATETIME(6) NOT NULL,
+    first_tag VARCHAR(50)
+        GENERATED ALWAYS AS (JSON_UNQUOTE(JSON_EXTRACT(payload, '$.tags[0]'))) STORED,
+    tag_count INT
+        GENERATED ALWAYS AS (JSON_LENGTH(JSON_EXTRACT(payload, '$.tags'))) STORED,
+    note_text VARCHAR(255)
+        GENERATED ALWAYS AS (JSON_UNQUOTE(JSON_EXTRACT(payload, '$.note'))) VIRTUAL,
+    PRIMARY KEY (task_id),
+    UNIQUE KEY uk_task_owner_rank (owner_name, `rank`),
+    KEY idx_task_node_status (node_id, status_code),
+    KEY idx_task_owner_priority (owner_name, priority DESC),
+    CONSTRAINT fk_task_node
+        FOREIGN KEY (node_id) REFERENCES node (node_id),
+    CONSTRAINT chk_task_priority
+        CHECK (priority BETWEEN 1 AND 9)
+) ENGINE = InnoDB;
+
+CREATE TABLE task_log (
+    log_id BIGINT NOT NULL AUTO_INCREMENT,
+    task_id BIGINT NOT NULL,
+    log_type VARCHAR(30) NOT NULL,
+    old_status VARCHAR(20) NULL,
+    new_status VARCHAR(20) NULL,
+    log_note VARCHAR(255) NOT NULL,
+    created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+    PRIMARY KEY (log_id),
+    KEY idx_task_log_task (task_id)
+) ENGINE = InnoDB;
+
+CREATE TABLE agg_result (
+    result_key VARCHAR(100) NOT NULL,
+    `group` VARCHAR(20) NOT NULL,
+    result_num DECIMAL(18, 4) NULL,
+    result_text VARCHAR(500) NULL,
+    result_json JSON NULL,
+    created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+    PRIMARY KEY (result_key)
+) ENGINE = InnoDB;
+
+CREATE TABLE error_log (
+    log_id BIGINT NOT NULL AUTO_INCREMENT,
+    step_name VARCHAR(100) NOT NULL,
+    sql_state CHAR(5) NULL,
+    mysql_errno INT NULL,
+    message_text VARCHAR(512) NULL,
+    created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+    PRIMARY KEY (log_id)
+) ENGINE = InnoDB;
+
+DELIMITER $$
+
+CREATE FUNCTION fn_priority_weight (p_priority INT)
+RETURNS DECIMAL(10, 2)
+DETERMINISTIC
+BEGIN
+    RETURN CASE
+        WHEN p_priority >= 9 THEN 3.50
+        WHEN p_priority >= 7 THEN 2.25
+        WHEN p_priority >= 5 THEN 1.50
+        ELSE 1.00
+    END;
+END$$
+
+CREATE PROCEDURE sp_check (
+    IN p_condition BOOLEAN,
+    IN p_message VARCHAR(255)
+)
+BEGIN
+    IF NOT p_condition THEN
+        SIGNAL SQLSTATE '45000'
+            SET MESSAGE_TEXT = p_message;
+    END IF;
+END$$
+
+CREATE PROCEDURE sp_touch_rank (
+    INOUT p_rank INT,
+    IN p_delta INT
+)
+BEGIN
+    SET p_rank = p_rank + p_delta;
+END$$
+
+CREATE PROCEDURE sp_status_counts (
+    OUT p_done_cnt INT,
+    OUT p_running_cnt INT
+)
+BEGIN
+    SELECT
+        SUM(CASE WHEN status_code = 'DONE' THEN 1 ELSE 0 END),
+        SUM(CASE WHEN status_code = 'RUNNING' THEN 1 ELSE 0 END)
+    INTO
+        p_done_cnt,
+        p_running_cnt
+    FROM task;
+END$$
+
+CREATE TRIGGER trg_task_bi
+BEFORE INSERT ON task
+FOR EACH ROW
+BEGIN
+    SET NEW.owner_name = LOWER(TRIM(NEW.owner_name));
+    SET NEW.status_code = UPPER(TRIM(NEW.status_code));
+
+    IF NEW.priority NOT BETWEEN 1 AND 9 THEN
+        SIGNAL SQLSTATE '45000'
+            SET MESSAGE_TEXT = 'priority must be between 1 and 9';
+    END IF;
+END$$
+
+CREATE TRIGGER trg_task_bu
+BEFORE UPDATE ON task
+FOR EACH ROW
+BEGIN
+    SET NEW.owner_name = LOWER(TRIM(NEW.owner_name));
+    SET NEW.status_code = UPPER(TRIM(NEW.status_code));
+END$$
+
+CREATE TRIGGER trg_task_ai
+AFTER INSERT ON task
+FOR EACH ROW
+BEGIN
+    INSERT INTO task_log (
+        task_id,
+        log_type,
+        old_status,
+        new_status,
+        log_note
+    )
+    VALUES (
+        NEW.task_id,
+        'INSERT',
+        NULL,
+        NEW.status_code,
+        CONCAT(
+            'inserted first_tag=',
+            COALESCE(JSON_UNQUOTE(JSON_EXTRACT(NEW.payload, '$.tags[0]')), 'null')
+        )
+    );
+END$$
+
+CREATE TRIGGER trg_task_au
+AFTER UPDATE ON task
+FOR EACH ROW
+BEGIN
+    IF NOT (OLD.status_code <=> NEW.status_code) THEN
+        INSERT INTO task_log (
+            task_id,
+            log_type,
+            old_status,
+            new_status,
+            log_note
+        )
+        VALUES (
+            NEW.task_id,
+            'STATUS_CHANGE',
+            OLD.status_code,
+            NEW.status_code,
+            CONCAT(OLD.status_code, ' -> ', NEW.status_code)
+        );
+    END IF;
+END$$
+
+DELIMITER //
+
+CREATE PROCEDURE sp_run_parser_killer ()
+main_block: BEGIN
+    DECLARE v_fetch_done INT DEFAULT 0;
+    DECLARE v_task_id BIGINT;
+    DECLARE v_priority INT;
+    DECLARE v_owner_name VARCHAR(100);
+    DECLARE v_status_code VARCHAR(20);
+
+    DECLARE v_i INT DEFAULT 0;
+    DECLARE v_sum_while INT DEFAULT 0;
+    DECLARE v_pow_repeat INT DEFAULT 1;
+    DECLARE v_even_sum INT DEFAULT 0;
+
+    DECLARE v_task_count INT DEFAULT 0;
+    DECLARE v_done_count INT DEFAULT 0;
+    DECLARE v_running_count INT DEFAULT 0;
+    DECLARE v_other_count INT DEFAULT 0;
+    DECLARE v_cnt INT DEFAULT 0;
+    DECLARE v_tree_depth INT DEFAULT 0;
+    DECLARE v_weight_sum DECIMAL(18, 2) DEFAULT 0.00;
+    DECLARE v_top_owner VARCHAR(100) DEFAULT NULL;
+    DECLARE v_top_weight DECIMAL(18, 2) DEFAULT 0.00;
+
+    DECLARE v_state CHAR(5) DEFAULT NULL;
+    DECLARE v_errno INT DEFAULT NULL;
+    DECLARE v_msg TEXT DEFAULT NULL;
+
+    DECLARE cur_task CURSOR FOR
+        SELECT
+            task_id,
+            priority,
+            owner_name,
+            status_code
+        FROM task
+        ORDER BY task_id;
+
+    DECLARE CONTINUE HANDLER FOR NOT FOUND
+        SET v_fetch_done = 1;
+
+    DECLARE CONTINUE HANDLER FOR 1062
+    BEGIN
+        GET DIAGNOSTICS CONDITION 1
+            v_state = RETURNED_SQLSTATE,
+            v_errno = MYSQL_ERRNO,
+            v_msg = MESSAGE_TEXT;
+
+        INSERT INTO error_log (
+            step_name,
+            sql_state,
+            mysql_errno,
+            message_text
+        )
+        VALUES (
+            'EXPECTED_DUPLICATE',
+            v_state,
+            v_errno,
+            LEFT(v_msg, 512)
+        );
+    END;
+
+    DECLARE EXIT HANDLER FOR SQLEXCEPTION
+    BEGIN
+        GET DIAGNOSTICS CONDITION 1
+            v_state = RETURNED_SQLSTATE,
+            v_errno = MYSQL_ERRNO,
+            v_msg = MESSAGE_TEXT;
+
+        ROLLBACK;
+
+        INSERT INTO error_log (
+            step_name,
+            sql_state,
+            mysql_errno,
+            message_text
+        )
+        VALUES (
+            'UNEXPECTED_EXCEPTION',
+            v_state,
+            v_errno,
+            LEFT(v_msg, 512)
+        );
+
+        RESIGNAL;
+    END;
+
+    START TRANSACTION;
+
+    CALL sp_check(@versioned_comment_ok = 1, 'versioned comment handling failed');
+
+    INSERT INTO node (
+        node_id,
+        parent_node_id,
+        `group`,
+        node_name,
+        sort_no,
+        meta
+    )
+    VALUES (
+        1,
+        NULL,
+        'ROOT',
+        'Root',
+        1,
+        JSON_OBJECT('pathHint', 'ROOT')
+    );
+
+    INSERT INTO node (
+        node_id,
+        parent_node_id,
+        `group`,
+        node_name,
+        sort_no,
+        meta
+    )
+    VALUES
+        (
+            2,
+            1,
+            'APP',
+            'App',
+            2,
+            JSON_OBJECT('pathHint', 'ROOT > APP')
+        ),
+        (
+            3,
+            2,
+            'API',
+            'Api',
+            3,
+            JSON_OBJECT('pathHint', 'ROOT > APP > API')
+        ),
+        (
+            4,
+            2,
+            'BATCH',
+            'Batch',
+            4,
+            JSON_OBJECT('pathHint', 'ROOT > APP > BATCH')
+        ),
+        (
+            5,
+            4,
+            'ETL',
+            'Etl',
+            5,
+            JSON_OBJECT('pathHint', 'ROOT > APP > BATCH > ETL')
+        );
+
+    INSERT INTO node (
+        node_id,
+        parent_node_id,
+        `group`,
+        node_name,
+        sort_no,
+        meta
+    )
+    VALUES (
+        2,
+        1,
+        'APP',
+        'AppTouched',
+        22,
+        JSON_OBJECT('pathHint', 'ROOT > APP')
+    )
+    ON DUPLICATE KEY UPDATE
+        node_name = VALUES(node_name),
+        sort_no = VALUES(sort_no);
+
+    INSERT INTO task (
+        task_id,
+        node_id,
+        owner_name,
+        status_code,
+        priority,
+        `rank`,
+        payload,
+        created_at
+    )
+    VALUES
+        (
+            2001,
+            3,
+            ' Alice ',
+            ' new ',
+            9,
+            1,
+            JSON_OBJECT(
+                'title', 'Parser Boss',
+                'note', 'contains ; semicolon, DELIMITER //, $$, quote ''x'', backslash \\\\, -- line comment text, /* block comment text */, emoji 😃',
+                'tags', JSON_ARRAY('sql', 'parser')
+            ),
+            '2026-02-01 10:00:00.000001'
+        ),
+        (
+            2002,
+            3,
+            'ALICE',
+            ' running ',
+            7,
+            2,
+            JSON_OBJECT(
+                'title', 'Json Task',
+                'note', 'json_table candidate',
+                'tags', JSON_ARRAY('json')
+            ),
+            '2026-02-01 10:05:00.000001'
+        ),
+        (
+            2003,
+            4,
+            ' Bob ',
+            ' hold ',
+            8,
+            1,
+            JSON_OBJECT(
+                'title', 'Loop / Handler / CTE',
+                'note', 'nested control flow',
+                'tags', JSON_ARRAY('loop', 'handler', 'cte')
+            ),
+            '2026-02-01 10:10:00.000001'
+        ),
+        (
+            2004,
+            5,
+            ' Zoe ',
+            ' done ',
+            4,
+            1,
+            JSON_OBJECT(
+                'title', 'Window',
+                'note', 'already completed',
+                'tags', JSON_ARRAY()
+            ),
+            '2026-02-01 10:15:00.000001'
+        ),
+        (
+            2005,
+            5,
+            'ZOE',
+            ' new ',
+            5,
+            2,
+            JSON_OBJECT(
+                'title', 'UTF8 한글 테스트',
+                'note', '한글, 공백, 특수문자 ; // $$ -- /* */',
+                'tags', JSON_ARRAY('한글', 'utf8')
+            ),
+            '2026-02-01 10:20:00.000001'
+        );
+
+    UPDATE task
+       SET status_code = CASE
+               WHEN task_id = 2003 THEN 'done'
+               WHEN task_id = 2005 THEN 'running'
+               ELSE status_code
+           END,
+           `rank` = CASE
+               WHEN task_id = 2002 THEN `rank` + 1
+               ELSE `rank`
+           END
+     WHERE task_id IN (2002, 2003, 2005);
+
+    SAVEPOINT sp_before_temp_result;
+
+    INSERT INTO agg_result (
+        result_key,
+        `group`,
+        result_num,
+        result_text,
+        result_json
+    )
+    VALUES (
+        'TEMP_ROLLBACK',
+        'TEMP',
+        999.0000,
+        'this row must disappear after rollback',
+        JSON_OBJECT('temp', TRUE)
+    );
+
+    ROLLBACK TO SAVEPOINT sp_before_temp_result;
+    RELEASE SAVEPOINT sp_before_temp_result;
+
+    SELECT COUNT(*)
+      INTO v_cnt
+      FROM agg_result
+     WHERE result_key = 'TEMP_ROLLBACK';
+
+    CALL sp_check(v_cnt = 0, 'savepoint rollback mismatch');
+
+    -- expected duplicate
+    INSERT INTO task (
+        task_id,
+        node_id,
+        owner_name,
+        status_code,
+        priority,
+        `rank`,
+        payload,
+        created_at
+    )
+    VALUES (
+        2001,
+        3,
+        'Alice',
+        'NEW',
+        9,
+        9,
+        JSON_OBJECT(
+            'title', 'duplicate',
+            'note', 'should fail with duplicate key',
+            'tags', JSON_ARRAY('dup')
+        ),
+        '2026-02-01 11:00:00.000001'
+    );
+
+    SET @rank_var = 10;
+    CALL sp_touch_rank(@rank_var, 5);
+    CALL sp_check(@rank_var = 15, 'INOUT parameter mismatch');
+
+    SET v_i = 1;
+    SET v_sum_while = 0;
+
+    WHILE v_i <= 5 DO
+        SET v_sum_while = v_sum_while + v_i;
+        SET v_i = v_i + 1;
+    END WHILE;
+
+    CALL sp_check(v_sum_while = 15, 'WHILE loop mismatch');
+
+    SET v_i = 0;
+    SET v_pow_repeat = 1;
+
+    REPEAT
+        SET v_i = v_i + 1;
+        SET v_pow_repeat = v_pow_repeat * 2;
+    UNTIL v_i = 4
+    END REPEAT;
+
+    CALL sp_check(v_pow_repeat = 16, 'REPEAT loop mismatch');
+
+    SET v_i = 0;
+    SET v_even_sum = 0;
+
+    even_loop: LOOP
+        SET v_i = v_i + 1;
+
+        IF v_i > 6 THEN
+            LEAVE even_loop;
+        END IF;
+
+        IF MOD(v_i, 2) = 1 THEN
+            ITERATE even_loop;
+        END IF;
+
+        SET v_even_sum = v_even_sum + v_i;
+    END LOOP;
+
+    CALL sp_check(v_even_sum = 12, 'LOOP/ITERATE/LEAVE mismatch');
+
+    CALL sp_status_counts(@done_cnt, @running_cnt);
+    CALL sp_check(@done_cnt = 2, 'OUT parameter done count mismatch');
+    CALL sp_check(@running_cnt = 2, 'OUT parameter running count mismatch');
+
+    OPEN cur_task;
+
+    read_loop: LOOP
+        FETCH cur_task INTO v_task_id, v_priority, v_owner_name, v_status_code;
+
+        IF v_fetch_done = 1 THEN
+            LEAVE read_loop;
+        END IF;
+
+        SET v_task_count = v_task_count + 1;
+        SET v_weight_sum = v_weight_sum + fn_priority_weight(v_priority);
+
+        CASE v_status_code
+            WHEN 'DONE' THEN
+                SET v_done_count = v_done_count + 1;
+            WHEN 'RUNNING' THEN
+                SET v_running_count = v_running_count + 1;
+            ELSE
+                SET v_other_count = v_other_count + 1;
+        END CASE;
+    END LOOP;
+
+    CLOSE cur_task;
+
+    CALL sp_check(v_task_count = 5, 'cursor task count mismatch');
+    CALL sp_check(v_done_count = 2, 'cursor done count mismatch');
+    CALL sp_check(v_running_count = 2, 'cursor running count mismatch');
+    CALL sp_check(v_other_count = 1, 'cursor other count mismatch');
+    CALL sp_check(v_weight_sum = 10.50, 'weighted sum mismatch');
+
+    DROP TEMPORARY TABLE IF EXISTS tmp_task_tag;
+
+    SET @sql = '
+        CREATE TEMPORARY TABLE tmp_task_tag AS
+        SELECT
+            t.task_id,
+            t.owner_name,
+            jt.tag
+        FROM task AS t
+        JOIN JSON_TABLE(
+            t.payload,
+            ''$.tags[*]''
+            COLUMNS (
+                tag VARCHAR(50) PATH ''$''
+            )
+        ) AS jt ON TRUE
+    ';
+
+    PREPARE stmt_tag FROM @sql;
+    EXECUTE stmt_tag;
+    DEALLOCATE PREPARE stmt_tag;
+
+    SELECT COUNT(*)
+      INTO v_cnt
+      FROM tmp_task_tag;
+
+    CALL sp_check(v_cnt = 8, 'JSON_TABLE tag row count mismatch');
+
+    WITH RECURSIVE node_tree AS (
+        SELECT
+            n.node_id,
+            n.parent_node_id,
+            n.node_name,
+            CAST(n.node_name AS CHAR(300)) AS path_txt,
+            1 AS depth
+        FROM node AS n
+        WHERE n.parent_node_id IS NULL
+
+        UNION ALL
+
+        SELECT
+            c.node_id,
+            c.parent_node_id,
+            c.node_name,
+            CONCAT(p.path_txt, ' > ', c.node_name) AS path_txt,
+            p.depth + 1 AS depth
+        FROM node AS c
+        JOIN node_tree AS p
+          ON c.parent_node_id = p.node_id
+    )
+    SELECT MAX(depth)
+      INTO v_tree_depth
+      FROM node_tree;
+
+    CALL sp_check(v_tree_depth = 4, 'recursive CTE depth mismatch');
+
+    SELECT COUNT(*)
+      INTO v_cnt
+      FROM (
+            SELECT
+                owner_name
+            FROM task
+            GROUP BY owner_name
+            HAVING SUM(priority) >= 10
+      ) AS q_owner;
+
+    CALL sp_check(v_cnt = 1, 'GROUP BY / HAVING mismatch');
+
+    SELECT COUNT(*)
+      INTO v_cnt
+      FROM node AS n
+     WHERE EXISTS (
+            SELECT 1
+              FROM task AS t
+             WHERE t.node_id = n.node_id
+               AND t.status_code = 'DONE'
+      );
+
+    CALL sp_check(v_cnt = 2, 'EXISTS predicate mismatch');
+
+    WITH owner_score AS (
+        SELECT
+            owner_name,
+            COUNT(*) AS task_cnt,
+            SUM(priority) AS priority_sum,
+            ROUND(SUM(fn_priority_weight(priority)), 2) AS weight_sum
+        FROM task
+        GROUP BY owner_name
+    ),
+    ranked AS (
+        SELECT
+            owner_name,
+            task_cnt,
+            priority_sum,
+            weight_sum,
+            ROW_NUMBER() OVER (
+                ORDER BY weight_sum DESC, owner_name
+            ) AS rn
+        FROM owner_score
+    )
+    SELECT
+        owner_name,
+        weight_sum
+    INTO
+        v_top_owner,
+        v_top_weight
+    FROM ranked
+    WHERE rn = 1;
+
+    CALL sp_check(v_top_owner = 'alice', 'window ranking owner mismatch');
+    CALL sp_check(v_top_weight = 5.75, 'window ranking weight mismatch');
+
+    INSERT INTO agg_result (
+        result_key,
+        `group`,
+        result_num,
+        result_text,
+        result_json
+    )
+    VALUES (
+        'TOP_OWNER',
+        'METRIC',
+        v_top_weight,
+        v_top_owner,
+        JSON_OBJECT(
+            'task_count', v_task_count,
+            'done_count', v_done_count,
+            'running_count', v_running_count
+        )
+    )
+    ON DUPLICATE KEY UPDATE
+        `group` = VALUES(`group`),
+        result_num = VALUES(result_num),
+        result_text = VALUES(result_text),
+        result_json = VALUES(result_json);
+
+    INSERT INTO agg_result (
+        result_key,
+        `group`,
+        result_num,
+        result_text,
+        result_json
+    )
+    VALUES
+        (
+            'TREE_DEPTH',
+            'METRIC',
+            v_tree_depth,
+            'recursive cte max depth',
+            JSON_OBJECT('depth', v_tree_depth)
+        ),
+        (
+            'TAG_ROWS',
+            'METRIC',
+            8.0000,
+            'flattened tag row count',
+            JSON_OBJECT('rows', 8)
+        ),
+        (
+            'WEIGHT_SUM',
+            'METRIC',
+            v_weight_sum,
+            'cursor accumulated weight',
+            JSON_OBJECT('weight_sum', v_weight_sum)
+        )
+    ON DUPLICATE KEY UPDATE
+        `group` = VALUES(`group`),
+        result_num = VALUES(result_num),
+        result_text = VALUES(result_text),
+        result_json = VALUES(result_json);
+
+    COMMIT;
+END//
+
+DELIMITER ;
+
+CALL sp_run_parser_killer();
+
+SELECT
+    'PASS' AS status,
+    (SELECT result_text FROM agg_result WHERE result_key = 'TOP_OWNER') AS top_owner,
+    (SELECT result_num FROM agg_result WHERE result_key = 'TOP_OWNER') AS top_owner_weight,
+    (SELECT result_num FROM agg_result WHERE result_key = 'TREE_DEPTH') AS tree_depth,
+    (SELECT result_num FROM agg_result WHERE result_key = 'TAG_ROWS') AS tag_rows,
+    (SELECT result_num FROM agg_result WHERE result_key = 'WEIGHT_SUM') AS weight_sum,
+    (SELECT COUNT(*) FROM error_log WHERE step_name = 'EXPECTED_DUPLICATE') AS expected_duplicate_errors,
+    (SELECT COUNT(*) FROM task_log) AS task_log_rows;
+
+SELECT
+    task_id,
+    owner_name,
+    status_code,
+    priority,
+    `rank`,
+    first_tag,
+    tag_count
+FROM task
+ORDER BY task_id;
+
+SELECT
+    result_key,
+    `group`,
+    result_num,
+    result_text,
+    result_json
+FROM agg_result
+ORDER BY result_key;
+
+SELECT
+    step_name,
+    sql_state,
+    mysql_errno,
+    message_text
+FROM error_log
+ORDER BY log_id;
+
+SELECT
+    task_id,
+    log_type,
+    old_status,
+    new_status,
+    log_note
+FROM task_log
+ORDER BY log_id;

@@ -1,0 +1,562 @@
+--------------------------------------------------------------------------------
+-- 0) 정리
+--------------------------------------------------------------------------------
+
+SET SQLBLANKLINES ON
+
+BEGIN
+    EXECUTE IMMEDIATE 'DROP PACKAGE fmt_pkg_extreme';
+EXCEPTION
+    WHEN OTHERS THEN
+        IF SQLCODE != - 4043 THEN
+            RAISE;
+        END IF;
+END;
+/
+
+BEGIN
+    EXECUTE IMMEDIATE 'DROP TABLE fmtx_audit PURGE';
+EXCEPTION
+    WHEN OTHERS THEN
+        IF SQLCODE != - 942 THEN
+            RAISE;
+        END IF;
+END;
+/
+
+BEGIN
+    EXECUTE IMMEDIATE 'DROP TABLE fmtx_unit PURGE';
+EXCEPTION
+    WHEN OTHERS THEN
+        IF SQLCODE != - 942 THEN
+            RAISE;
+        END IF;
+END;
+/
+
+BEGIN
+    EXECUTE IMMEDIATE 'DROP SEQUENCE fmtx_audit_seq';
+EXCEPTION
+    WHEN OTHERS THEN
+        IF SQLCODE != - 2289 THEN
+            RAISE;
+        END IF;
+END;
+/
+
+--------------------------------------------------------------------------------
+-- 1) 테스트용 객체
+--------------------------------------------------------------------------------
+
+CREATE TABLE fmtx_unit (
+    id         NUMBER         PRIMARY KEY,
+    parent_id  NUMBER,
+    code       VARCHAR2(50)   NOT NULL,
+    qty        NUMBER,
+    price      NUMBER(12, 2),
+    status     VARCHAR2(10),
+    note       VARCHAR2(4000),
+    created_at DATE           DEFAULT SYSDATE,
+    CONSTRAINT fk_fmtx_unit_parent FOREIGN KEY(parent_id) REFERENCES fmtx_unit(id)
+);
+
+CREATE TABLE fmtx_audit (
+    audit_id   NUMBER         PRIMARY KEY,
+    phase      VARCHAR2(30),
+    message    VARCHAR2(4000),
+    created_at TIMESTAMP      DEFAULT SYSTIMESTAMP
+);
+
+CREATE SEQUENCE fmtx_audit_seq
+START WITH 1 INCREMENT BY 1 NOCACHE;
+
+INSERT INTO fmtx_unit (id, parent_id, code, qty, price, status, note)
+VALUES (1, NULL, 'ROOT', 2, 100, 'NEW', 'root node');
+
+INSERT INTO fmtx_unit (id, parent_id, code, qty, price, status, note)
+VALUES (2, 1, 'ORD-A', 4, 15, 'OPEN', 'child a');
+
+INSERT INTO fmtx_unit (id, parent_id, code, qty, price, status, note)
+VALUES (3, 1, 'ORD-B', 1, 80, 'HOLD', 'child b');
+
+INSERT INTO fmtx_unit (id, parent_id, code, qty, price, status, note)
+VALUES (4, 2, 'ORD-A-01', 10, 5, 'DONE', 'leaf a-01');
+
+INSERT INTO fmtx_unit (id, parent_id, code, qty, price, status, note)
+VALUES (5, 2, 'ORD-A-02', 7, 12, 'NEW', 'leaf a-02');
+
+INSERT INTO fmtx_unit (id, parent_id, code, qty, price, status, note)
+VALUES (6, 3, 'ORD-B-01', 3, 25, 'OPEN', 'leaf b-01');
+
+INSERT INTO fmtx_unit (id, parent_id, code, qty, price, status, note)
+VALUES (7, 3, 'ORD-B-02', 8, 9, 'HOLD', 'leaf b-02');
+
+COMMIT;
+
+--------------------------------------------------------------------------------
+-- 2) package spec
+--------------------------------------------------------------------------------
+
+CREATE OR REPLACE PACKAGE fmt_pkg_extreme AS
+    TYPE t_num_aat IS TABLE OF NUMBER INDEX BY PLS_INTEGER;
+    TYPE t_vc_aat IS TABLE OF VARCHAR2 (32767) INDEX BY PLS_INTEGER;
+    PROCEDURE run_extreme (p_root_id IN NUMBER DEFAULT 1, p_text OUT CLOB);
+    PROCEDURE validate_and_process (p_root_id IN NUMBER, p_mode IN VARCHAR2 DEFAULT 'NORMAL');
+    FUNCTION calc_score (p_qty IN NUMBER, p_price IN NUMBER, p_status IN VARCHAR2, p_depth IN PLS_INTEGER DEFAULT 0) RETURN NUMBER;
+    FUNCTION render_snapshot (p_root_id IN NUMBER) RETURN CLOB;
+END fmt_pkg_extreme;
+/
+
+--------------------------------------------------------------------------------
+-- 3) package body
+--------------------------------------------------------------------------------
+
+CREATE OR REPLACE PACKAGE BODY fmt_pkg_extreme AS
+    c_pkg_name CONSTANT VARCHAR2 (30) := 'FMT_PKG_EXTREME';
+    c_max_depth CONSTANT PLS_INTEGER := 9;
+    g_exec_count NUMBER := 0;
+    g_last_mode VARCHAR2 (30) := 'BOOT';
+    SUBTYPE t_status IS VARCHAR2 (10);
+    ----------------------------------------------------------------------------
+    -- audit log
+    ----------------------------------------------------------------------------
+    PROCEDURE AUDIT (p_phase IN VARCHAR2, p_message IN VARCHAR2) IS
+        PRAGMA AUTONOMOUS_TRANSACTION;
+    BEGIN
+        INSERT INTO fmtx_audit (audit_id, phase, message, created_at)
+        VALUES (fmtx_audit_seq.NEXTVAL, SUBSTR (UPPER (p_phase), 1, 30), SUBSTR (p_message, 1, 4000), SYSTIMESTAMP);
+        COMMIT;
+    EXCEPTION
+        WHEN OTHERS THEN
+            ROLLBACK;
+    END AUDIT;
+
+    ----------------------------------------------------------------------------
+    -- score calculation
+    ----------------------------------------------------------------------------
+    FUNCTION calc_score (p_qty IN NUMBER, p_price IN NUMBER, p_status IN VARCHAR2, p_depth IN PLS_INTEGER DEFAULT 0) RETURN NUMBER IS
+        l_score NUMBER := 0;
+        l_multiplier NUMBER := 1;
+        l_status t_status := UPPER (TRIM (NVL (p_status, 'NEW')));
+        FUNCTION base_score (p_qty_inner IN NUMBER, p_price_inner IN NUMBER) RETURN NUMBER IS
+            l_base NUMBER := 0;
+        BEGIN
+            l_base := NVL (p_qty_inner, 0) * NVL (p_price_inner, 0) +
+            CASE
+                WHEN NVL (p_qty_inner, 0) >= 10 THEN
+                    25
+                WHEN NVL (p_qty_inner, 0) >= 5 THEN
+                    10
+                ELSE
+                    3
+            END;
+            RETURN l_base;
+        END base_score;
+        FUNCTION tier_bonus (p_status_inner IN VARCHAR2) RETURN NUMBER IS
+        BEGIN
+            RETURN
+            CASE UPPER (TRIM (NVL (p_status_inner, 'NEW')))
+                WHEN 'DONE' THEN
+                    40
+                WHEN 'OPEN' THEN
+                    20
+                WHEN 'HOLD' THEN
+                    - 5
+                ELSE
+                    0
+            END;
+        END tier_bonus;
+    BEGIN
+        l_score := base_score (p_qty, p_price) + tier_bonus (l_status);
+        <<score_policy>>
+        DECLARE
+            l_depth_bonus NUMBER := 0;
+        BEGIN
+            IF p_depth <= 0 THEN
+                l_depth_bonus := 0;
+            ELSIF p_depth = 1 THEN
+                l_depth_bonus := 2;
+            ELSIF p_depth BETWEEN 2 AND 3 THEN
+                l_depth_bonus := 7;
+            ELSE
+                l_depth_bonus := 15;
+            END IF;
+            CASE
+                WHEN l_status IN ('NEW', 'OPEN') THEN
+                    l_multiplier := 1.10;
+                WHEN l_status = 'DONE' THEN
+                    l_multiplier := 1.35;
+                WHEN l_status = 'HOLD' THEN
+                    l_multiplier := 0.80;
+                ELSE
+                    l_multiplier := 1;
+            END CASE;
+            l_score := ROUND ((l_score + l_depth_bonus) * l_multiplier, 2);
+        EXCEPTION
+            WHEN VALUE_ERROR THEN
+                l_score := - 1;
+        END score_policy;
+        RETURN l_score;
+    EXCEPTION
+        WHEN OTHERS THEN
+            RETURN - 999999;
+    END calc_score;
+
+    ----------------------------------------------------------------------------
+    -- current snapshot
+    ----------------------------------------------------------------------------
+    FUNCTION render_snapshot (p_root_id IN NUMBER) RETURN CLOB IS
+        l_out CLOB := TO_CLOB ('');
+        PROCEDURE push (p_line IN VARCHAR2) IS
+        BEGIN
+            l_out := l_out || p_line || CHR (10);
+        END push;
+    BEGIN
+        push ('=== SNAPSHOT START ===');
+        push ('PACKAGE=' || c_pkg_name || ', EXEC_COUNT=' || g_exec_count || ', LAST_MODE=' || g_last_mode);
+        FOR r IN (
+            SELECT LEVEL AS lvl,
+                id,
+                parent_id,
+                LPAD (' ', (LEVEL - 1) * 2) || code AS tree_code,
+                qty,
+                price,
+                status
+            FROM fmtx_unit
+            START WITH id = p_root_id
+            CONNECT BY PRIOR id = parent_id
+            ORDER SIBLINGS BY id
+        ) LOOP
+            push ('[' || r.lvl || '] ' || 'ID=' || r.id || ', PARENT=' || NVL (TO_CHAR (r.parent_id), 'NULL') || ', CODE=' || r.tree_code || ', QTY=' || NVL (TO_CHAR (r.qty), 'NULL') || ', PRICE=' || NVL (TO_CHAR (r.price, 'FM9999990.00'), 'NULL') || ', STATUS=' || NVL (r.status, 'NULL') || ', BAND=' ||
+            CASE
+                        WHEN NVL (r.price, 0) >= 50 THEN
+                    'HIGH'
+                        WHEN NVL (r.price, 0) >= 10 THEN
+                    'MID'
+                        ELSE
+                    'LOW'
+                END
+                    );
+        END LOOP;
+        push ('=== SNAPSHOT END ===');
+        RETURN l_out;
+    EXCEPTION
+        WHEN OTHERS THEN
+            RETURN 'SNAPSHOT ERROR: ' || SQLERRM;
+    END render_snapshot;
+
+    ----------------------------------------------------------------------------
+    -- main processor
+    ----------------------------------------------------------------------------
+    PROCEDURE validate_and_process (p_root_id IN NUMBER, p_mode IN VARCHAR2 DEFAULT 'NORMAL') IS
+        CURSOR c_units (cp_root_id NUMBER) IS
+        SELECT id,
+            parent_id,
+            code,
+            qty,
+            price,
+            status,
+            note,
+            LEVEL AS lvl
+        FROM fmtx_unit
+        START WITH id = cp_root_id
+        CONNECT BY PRIOR id = parent_id
+        ORDER SIBLINGS BY id;
+        TYPE t_units_tab IS TABLE OF c_units%ROWTYPE INDEX BY PLS_INTEGER;
+        l_units t_units_tab;
+        l_ids t_num_aat;
+        l_marks t_vc_aat;
+        l_idx PLS_INTEGER;
+        l_mode VARCHAR2 (30) := UPPER (TRIM (NVL (p_mode, 'NORMAL')));
+        l_total NUMBER := 0;
+        l_sql VARCHAR2 (32767);
+        l_count NUMBER := 0;
+        e_bad_mode EXCEPTION;
+        e_deadlock EXCEPTION;
+        e_bulk_errors EXCEPTION;
+        PRAGMA EXCEPTION_INIT (e_deadlock, - 60);
+        PRAGMA EXCEPTION_INIT (e_bulk_errors, - 24381);
+        PROCEDURE ensure_mode IS
+        BEGIN
+            IF l_mode NOT IN ('NORMAL', 'STRICT', 'AGGRESSIVE', 'DRYRUN') THEN
+                RAISE e_bad_mode;
+            END IF;
+        END ensure_mode;
+        FUNCTION decorate_note (p_old IN VARCHAR2, p_score IN NUMBER, p_seq IN PLS_INTEGER) RETURN VARCHAR2 IS
+        BEGIN
+            RETURN SUBSTR (NVL (p_old, '') ||
+            CASE
+                WHEN p_old IS NULL THEN
+                    ''
+                ELSE
+                    CHR (10)
+                END || q'~[fmt-begin
+quotes: 'single', "double", q'[inner]'
+purpose: formatter stress test
+]~'                 || 'seq=' || p_seq || ', score=' || TO_CHAR (p_score, 'FM9999990.00') || CHR (10) || q'~[fmt-end]~', 1, 4000);
+        END decorate_note;
+        PROCEDURE apply_one (p_row IN c_units%ROWTYPE, p_pos IN PLS_INTEGER) IS
+            l_score NUMBER := 0;
+            l_new_status VARCHAR2 (10);
+        BEGIN
+            SAVEPOINT sp_apply_one;
+            IF l_mode = 'STRICT'
+                    AND p_row.qty IS NULL THEN
+                RAISE_APPLICATION_ERROR (- 20001, 'qty is required for id=' || p_row.id);
+            END IF;
+            l_score := calc_score (p_qty => p_row.qty, p_price => p_row.price, p_status => p_row.status, p_depth => p_row.lvl);
+            <<inner_rules>>
+            DECLARE
+                l_counter PLS_INTEGER := 0;
+                l_gate VARCHAR2 (10) := 'INIT';
+            BEGIN
+                LOOP
+                    l_counter := l_counter + 1;
+                    IF l_counter = 1 THEN
+                        l_gate := 'FIRST';
+                    ELSIF l_counter BETWEEN 2 AND 3 THEN
+                        l_gate := 'MID';
+                    ELSE
+                        l_gate := 'STOP';
+                    END IF;
+                    EXIT WHEN l_gate = 'STOP';
+                END LOOP;
+            EXCEPTION
+                WHEN OTHERS THEN
+                    AUDIT ('INNER_RULES', 'inner_rules failed for id=' || p_row.id);
+            END inner_rules;
+            CASE
+                WHEN l_score >= 150 THEN
+                    l_new_status := 'DONE';
+                WHEN l_score >= 80 THEN
+                    l_new_status := 'OPEN';
+                WHEN l_score >= 40 THEN
+                    l_new_status := 'HOLD';
+                ELSE
+                    l_new_status := 'NEW';
+            END CASE;
+            l_sql := q'[
+MERGE INTO fmtx_unit t
+USING (
+    SELECT :1 AS id,
+           :2 AS status,
+           :3 AS note
+      FROM dual
+) s
+   ON (t.id = s.id)
+ WHEN MATCHED THEN
+      UPDATE
+         SET t.status = s.status,
+             t.note   = s.note,
+             t.price  = CASE
+                           WHEN t.price IS NULL THEN 0
+                           ELSE t.price
+                        END
+]';
+            EXECUTE IMMEDIATE l_sql USING p_row.id,
+                l_new_status,
+                decorate_note (p_row.note, l_score, p_pos);
+            l_ids (p_pos) := p_row.id;
+            l_marks (p_pos) := l_new_status || ':' || TO_CHAR (l_score, 'FM9999990.00');
+            l_total := l_total + l_score;
+        EXCEPTION
+            WHEN e_deadlock THEN
+                ROLLBACK TO sp_apply_one;
+                AUDIT ('DEADLOCK', 'deadlock for id=' || p_row.id);
+                RAISE;
+            WHEN OTHERS THEN
+                ROLLBACK TO sp_apply_one;
+                AUDIT ('ROW_ERROR', 'apply_one failed for id=' || p_row.id || ': ' || SQLERRM);
+                IF l_mode = 'STRICT' THEN
+                    RAISE;
+                END IF;
+        END apply_one;
+    BEGIN
+        ensure_mode;
+        g_exec_count := g_exec_count + 1;
+        g_last_mode := l_mode;
+        OPEN c_units (p_root_id);
+        FETCH c_units BULK COLLECT
+        INTO l_units;
+        CLOSE c_units;
+        IF l_units.COUNT = 0 THEN
+            AUDIT ('INFO', 'no rows for root_id=' || p_root_id);
+            RETURN;
+        END IF;
+        l_idx := l_units.FIRST;
+        <<scan_loop>>
+        WHILE l_idx IS NOT NULL LOOP
+            IF l_units (l_idx).lvl > c_max_depth THEN
+                l_idx := l_units.NEXT (l_idx);
+                CONTINUE scan_loop;
+            END IF;
+            BEGIN
+                CASE
+                    WHEN l_mode = 'DRYRUN' THEN
+                        AUDIT ('DRYRUN', 'skip id=' || l_units (l_idx).id || ', code=' || l_units (l_idx).code);
+                    WHEN l_mode = 'AGGRESSIVE' THEN
+                        apply_one (l_units (l_idx), l_idx);
+                        IF l_units (l_idx).status = 'HOLD' THEN
+                            apply_one (l_units (l_idx), l_idx);
+                        END IF;
+                    ELSE
+                        apply_one (l_units (l_idx), l_idx);
+                END CASE;
+            EXCEPTION
+                WHEN OTHERS THEN
+                    AUDIT ('LOOP_ERROR', 'scan_loop item failed. idx=' || l_idx || ', id=' || l_units (l_idx).id);
+                    IF l_mode = 'STRICT' THEN
+                        RAISE;
+                    END IF;
+            END;
+            l_idx := l_units.NEXT (l_idx);
+        END LOOP scan_loop;
+        IF l_mode <> 'DRYRUN'
+                AND l_ids.COUNT > 0 THEN
+            BEGIN
+                FORALL i IN INDICES OF l_ids SAVE EXCEPTIONS
+                UPDATE fmtx_unit
+                SET note = SUBSTR (NVL (note, '') ||
+                        CASE
+                            WHEN note IS NULL THEN
+                        ''
+                            ELSE
+                        CHR (10)
+                        END || '[batch-mark:' || l_marks (i) || ']', 1, 4000)
+                WHERE id = l_ids (i);
+            EXCEPTION
+                WHEN e_bulk_errors THEN
+                    FOR j IN 1..SQL%BULK_EXCEPTIONS.COUNT LOOP
+                        AUDIT ('FORALL_ERR', 'index=' || SQL%BULK_EXCEPTIONS (j).ERROR_INDEX || ', code=' || SQL%BULK_EXCEPTIONS (j).ERROR_CODE);
+                    END LOOP;
+            END;
+        END IF;
+        BEGIN
+            EXECUTE IMMEDIATE q'[
+                SELECT COUNT(*)
+                  FROM fmtx_unit
+                 WHERE parent_id = :x
+            ]'
+            INTO l_count USING p_root_id;
+            AUDIT ('SUMMARY', 'root_id=' || p_root_id || ', mode=' || l_mode || ', rows=' || l_units.COUNT || ', child_count=' || l_count || ', total=' || TO_CHAR (l_total, 'FM9999990.00'));
+        EXCEPTION
+            WHEN OTHERS THEN
+                AUDIT ('SUMMARY_ERR', 'summary failed for root_id=' || p_root_id);
+        END;
+    EXCEPTION
+        WHEN e_bad_mode THEN
+            AUDIT ('BAD_MODE', 'unsupported mode=' || l_mode);
+            RAISE_APPLICATION_ERROR (- 20002, 'unsupported mode: ' || l_mode);
+        WHEN OTHERS THEN
+            AUDIT ('FATAL', 'validate_and_process failed for root_id=' || p_root_id || ': ' || SQLERRM);
+            RAISE;
+    END validate_and_process;
+
+    ----------------------------------------------------------------------------
+    -- orchestrator
+    ----------------------------------------------------------------------------
+    PROCEDURE run_extreme (p_root_id IN NUMBER DEFAULT 1, p_text OUT CLOB) IS
+        l_modes t_vc_aat;
+        l_snapshot CLOB;
+        l_done_cnt NUMBER;
+        l_open_cnt NUMBER;
+        l_hold_cnt NUMBER;
+        PROCEDURE add_line (p_target IN OUT NOCOPY CLOB, p_line IN VARCHAR2) IS
+        BEGIN
+            p_target := p_target || p_line || CHR (10);
+        END add_line;
+    BEGIN
+        p_text := TO_CLOB ('');
+        l_modes (1) := 'NORMAL';
+        l_modes (2) := 'AGGRESSIVE';
+        l_modes (3) := 'DRYRUN';
+        FOR i IN 1..l_modes.COUNT LOOP
+            BEGIN
+                add_line (p_text, '=== MODE ' || l_modes (i) || ' START ===');
+                validate_and_process (p_root_id => p_root_id, p_mode => l_modes (i));
+                l_snapshot := render_snapshot (p_root_id);
+                add_line (p_text, DBMS_LOB.SUBSTR (l_snapshot, 32767, 1));
+                add_line (p_text, '=== MODE ' || l_modes (i) || ' END ===');
+            EXCEPTION
+                WHEN OTHERS THEN
+                    add_line (p_text, 'MODE ' || l_modes (i) || ' ERROR: ' || SQLERRM);
+            END;
+        END LOOP;
+        <<summary_block>>
+        BEGIN
+            SELECT SUM (
+                    CASE
+                        WHEN status = 'DONE' THEN 1
+                        ELSE 0
+                    END
+                ),
+                SUM (
+                    CASE
+                        WHEN status = 'OPEN' THEN 1
+                        ELSE 0
+                    END
+                ),
+                SUM (
+                    CASE
+                        WHEN status = 'HOLD' THEN 1
+                        ELSE 0
+                    END
+                )
+            INTO l_done_cnt,
+                l_open_cnt,
+                l_hold_cnt
+            FROM fmtx_unit;
+            add_line (p_text, 'FINAL SUMMARY => DONE=' || NVL (l_done_cnt, 0) || ', OPEN=' || NVL (l_open_cnt, 0) || ', HOLD=' || NVL (l_hold_cnt, 0));
+        EXCEPTION
+            WHEN OTHERS THEN
+                add_line (p_text, 'FINAL SUMMARY ERROR');
+        END summary_block;
+    EXCEPTION
+        WHEN OTHERS THEN
+            p_text := 'RUN_EXTREME_ERROR: ' || SQLERRM;
+    END run_extreme;
+BEGIN
+    g_last_mode :=
+    CASE
+        WHEN TO_CHAR (SYSDATE, 'DY', 'NLS_DATE_LANGUAGE=ENGLISH') IN ('SAT', 'SUN') THEN
+            'WEEKEND_BOOT'
+        ELSE
+            'WEEKDAY_BOOT'
+    END;
+    AUDIT ('INIT', 'package initialized. mode=' || g_last_mode);
+END fmt_pkg_extreme;
+/
+
+--------------------------------------------------------------------------------
+-- 4) 실행 테스트
+--------------------------------------------------------------------------------
+
+SET SERVEROUTPUT ON
+
+DECLARE
+    l_text CLOB;
+BEGIN
+    fmt_pkg_extreme.run_extreme (1, l_text);
+    DBMS_OUTPUT.PUT_LINE (DBMS_LOB.SUBSTR (l_text, 32767, 1));
+END;
+/
+
+--------------------------------------------------------------------------------
+-- 5) 결과 확인
+--------------------------------------------------------------------------------
+
+SELECT id,
+    parent_id,
+    code,
+    qty,
+    price,
+    status
+FROM fmtx_unit
+ORDER BY id;
+
+SELECT audit_id,
+    phase,
+    message,
+    created_at
+FROM fmtx_audit
+ORDER BY audit_id;

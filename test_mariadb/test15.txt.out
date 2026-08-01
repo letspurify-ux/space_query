@@ -1,0 +1,477 @@
+-- ==========================================================================
+-- SPACE QUERY MARIADB CRUD FORMATTER FINAL BOSS VII
+-- Target: MariaDB 12.2+ (live certification uses MariaDB 12.2.2)
+-- Repeatable within its dedicated database. Covers CREATE/READ/UPDATE/DELETE,
+-- routines, triggers, transactions, VECTOR/dynamic columns, application time,
+-- recursive CYCLE, JSON_TABLE, INET6, percentiles, and set operators.
+-- ==========================================================================
+DELIMITER ;
+DROP DATABASE IF EXISTS sq_mariadb_final_boss_7;
+CREATE DATABASE sq_mariadb_final_boss_7 CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
+USE sq_mariadb_final_boss_7;
+SET NAMES utf8mb4;
+SET SESSION sql_mode='STRICT_TRANS_TABLES,ERROR_FOR_DIVISION_BY_ZERO,NO_ENGINE_SUBSTITUTION';
+SET @lexical_trap='BEGIN NOT ATOMIC; DELETE FOR PORTION OF fake; VECTOR(3); END// inert';
+
+# Formatter trap: CREATE TRIGGER fake AFTER DELETE // JSON_TABLE('[1]','$[*]')
+/* Quoted CRUD is inert: UPDATE fake SET payload='DELETE FROM fake; RETURNING id'; */
+
+CREATE SEQUENCE fb_job_seq START WITH 100 INCREMENT BY 1 MINVALUE 100 CACHE 20;
+
+CREATE TABLE fb_worker(
+worker_id INT NOT NULL,
+worker_uuid UUID NOT NULL DEFAULT(UUID_v7()),
+worker_code VARCHAR(40)NOT NULL,
+display_name VARCHAR(100)NOT NULL,
+properties BLOB NOT NULL,
+embedding VECTOR(3)NOT NULL,
+host_addr INET6 NOT NULL,
+created_at TIMESTAMP(6)NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+PRIMARY KEY(worker_id),
+UNIQUE KEY uk_fb_worker_uuid(worker_uuid),
+UNIQUE KEY uk_fb_worker_code(worker_code),
+VECTOR INDEX ix_fb_worker_embedding(embedding)M=4 DISTANCE=cosine
+)ENGINE=InnoDB;
+
+CREATE TABLE fb_job(
+job_id BIGINT NOT NULL DEFAULT(NEXT VALUE FOR fb_job_seq),
+job_key VARCHAR(50)NOT NULL,
+worker_id INT NOT NULL,
+job_status ENUM('NEW','READY','DONE','ARCHIVED')NOT NULL DEFAULT'NEW',
+payload JSON NOT NULL,
+note_text TEXT NOT NULL,
+created_at DATETIME(6)NOT NULL,
+runtime_ms DECIMAL(12,2)AS(JSON_VALUE(payload,'$.runtime'))PERSISTENT,
+source_code VARCHAR(30)AS(JSON_VALUE(payload,'$.source'))PERSISTENT,
+PRIMARY KEY(job_id),
+UNIQUE KEY uk_fb_job_key(job_key),
+KEY ix_fb_job_worker_time(worker_id,created_at),
+KEY ix_fb_job_runtime(runtime_ms),
+CONSTRAINT fk_fb_job_worker FOREIGN KEY(worker_id)REFERENCES fb_worker(worker_id),
+CONSTRAINT chk_fb_job_payload CHECK(JSON_VALID(payload))
+)ENGINE=InnoDB;
+
+CREATE TABLE fb_rate(
+worker_id INT NOT NULL,
+valid_from DATE NOT NULL,
+valid_to DATE NOT NULL,
+hourly_rate DECIMAL(12,2)NOT NULL,
+currency CHAR(3)NOT NULL,
+source_doc JSON NOT NULL,
+PERIOD FOR validity(valid_from,valid_to),
+PRIMARY KEY(worker_id,validity WITHOUT OVERLAPS),
+CONSTRAINT chk_fb_rate_positive CHECK(hourly_rate>0),
+CONSTRAINT chk_fb_rate_source CHECK(JSON_VALID(source_doc))
+)ENGINE=InnoDB;
+
+CREATE TABLE fb_audit(
+audit_id BIGINT NOT NULL AUTO_INCREMENT,
+entity_name VARCHAR(40)NOT NULL,
+entity_id BIGINT NOT NULL,
+operation_code ENUM('INSERT','UPDATE','DELETE')NOT NULL,
+old_value JSON,
+new_value JSON,
+changed_at TIMESTAMP(6)NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+PRIMARY KEY(audit_id),
+KEY ix_fb_audit_entity(entity_name,entity_id,changed_at)
+)ENGINE=InnoDB;
+
+CREATE OR REPLACE VIEW fb_job_v AS
+SELECT j.job_id,j.job_key,j.job_status,j.runtime_ms,j.source_code,j.payload,j.note_text,
+w.worker_id,w.worker_code,w.display_name,INET6_NTOA(w.host_addr)AS host_text,
+COLUMN_GET(w.properties,'tier'AS CHAR)AS tier_code
+FROM fb_job j
+JOIN fb_worker w ON w.worker_id=j.worker_id;
+
+DELIMITER //
+
+CREATE OR REPLACE FUNCTION fb_runtime_band(p_runtime DECIMAL(12,2))
+RETURNS VARCHAR(20)
+DETERMINISTIC
+RETURN CASE WHEN p_runtime>=40 THEN'CRITICAL'WHEN p_runtime>=25 THEN'HIGH'WHEN p_runtime>=10 THEN'NORMAL'ELSE'LOW'END//
+
+CREATE OR REPLACE PROCEDURE fb_assert(IN p_condition BOOLEAN,IN p_message VARCHAR(255))
+BEGIN
+IF IFNULL(p_condition,FALSE)=FALSE THEN
+SIGNAL SQLSTATE'45000'SET MESSAGE_TEXT=p_message;
+END IF;
+END//
+
+CREATE OR REPLACE TRIGGER fb_job_bi BEFORE INSERT ON fb_job FOR EACH ROW
+BEGIN
+SET NEW.job_status=UPPER(TRIM(NEW.job_status));
+SET NEW.note_text=TRIM(NEW.note_text);
+IF JSON_VALID(NEW.payload)=0 OR JSON_VALUE(NEW.payload,'$.runtime')<0 THEN
+SIGNAL SQLSTATE'45000'SET MESSAGE_TEXT='invalid MariaDB final-boss job';
+END IF;
+END//
+
+CREATE OR REPLACE TRIGGER fb_job_ai AFTER INSERT ON fb_job FOR EACH ROW
+BEGIN
+INSERT INTO fb_audit(entity_name,entity_id,operation_code,new_value)
+VALUES('JOB',NEW.job_id,'INSERT',JSON_OBJECT('status',NEW.job_status,'runtime',NEW.runtime_ms,'payload',NEW.payload));
+END//
+
+CREATE OR REPLACE TRIGGER fb_job_au AFTER UPDATE ON fb_job FOR EACH ROW
+BEGIN
+INSERT INTO fb_audit(entity_name,entity_id,operation_code,old_value,new_value)
+VALUES('JOB',NEW.job_id,'UPDATE',
+JSON_OBJECT('status',OLD.job_status,'runtime',OLD.runtime_ms,'payload',OLD.payload),
+JSON_OBJECT('status',NEW.job_status,'runtime',NEW.runtime_ms,'payload',NEW.payload));
+END//
+
+CREATE OR REPLACE TRIGGER fb_job_ad AFTER DELETE ON fb_job FOR EACH ROW
+BEGIN
+INSERT INTO fb_audit(entity_name,entity_id,operation_code,old_value)
+VALUES('JOB',OLD.job_id,'DELETE',JSON_OBJECT('status',OLD.job_status,'runtime',OLD.runtime_ms,'payload',OLD.payload));
+END//
+
+CREATE OR REPLACE PROCEDURE fb_run_crud()
+crud_block:BEGIN
+DECLARE v_done BOOLEAN DEFAULT FALSE;
+DECLARE v_job_id BIGINT;
+DECLARE v_runtime TYPE OF fb_job.runtime_ms;
+DECLARE v_running DECIMAL(18,2)DEFAULT 0;
+DECLARE cur_jobs CURSOR FOR SELECT job_id,runtime_ms FROM fb_job ORDER BY job_id;
+DECLARE CONTINUE HANDLER FOR NOT FOUND SET v_done=TRUE;
+DECLARE EXIT HANDLER FOR SQLEXCEPTION
+BEGIN
+ROLLBACK;
+RESIGNAL;
+END;
+
+START TRANSACTION;
+SAVEPOINT before_crud;
+OPEN cur_jobs;
+read_loop:LOOP
+FETCH cur_jobs INTO v_job_id,v_runtime;
+IF v_done THEN LEAVE read_loop;END IF;
+SET v_running=v_running+v_runtime;
+END LOOP read_loop;
+CLOSE cur_jobs;
+
+UPDATE fb_job j
+JOIN fb_worker w ON w.worker_id=j.worker_id
+SET j.payload=JSON_SET(j.payload,'$.runtime',j.runtime_ms+CASE COLUMN_GET(w.properties,'tier'AS CHAR)WHEN'gold'THEN 2 ELSE 1 END,'$.crud',JSON_OBJECT('updated',TRUE)),
+j.job_status=CASE WHEN j.runtime_ms>=40 THEN'READY'ELSE j.job_status END
+WHERE j.job_id IN(100,101);
+
+DELETE FROM fb_job
+WHERE job_key='job-delete'
+AND JSON_VALUE(payload,'$.disposable')=1;
+
+CALL fb_assert(v_running=103,'cursor read total');
+CALL fb_assert((SELECT COUNT(*)FROM fb_job WHERE job_key='job-delete')=0,'delete branch');
+COMMIT;
+END crud_block//
+
+DELIMITER ;
+
+INSERT INTO fb_worker(worker_id,worker_code,display_name,properties,embedding,host_addr)VALUES
+(1,'atlas','Atlas Gateway',COLUMN_CREATE('tier','gold','weight',12),VEC_FromText('[1,2,3]'),'2001:db8:7::1'),
+(2,'boreal','Boreal Runner',COLUMN_CREATE('tier','silver','weight',8),VEC_FromText('[2,2,2]'),'2001:db8:7::2'),
+(3,'cirrus','Cirrus Auditor',COLUMN_CREATE('tier','gold','weight',10),VEC_FromText('[0,1,0]'),'2001:db8:7::3');
+
+INSERT INTO fb_rate(worker_id,valid_from,valid_to,hourly_rate,currency,source_doc)VALUES
+(1,'2026-01-01','2027-01-01',100,'USD',JSON_OBJECT('source','initial','revision',1)),
+(2,'2026-01-01','2026-07-01',80,'USD',JSON_OBJECT('source','initial','revision',1)),
+(2,'2026-07-01','2027-01-01',90,'USD',JSON_OBJECT('source','renewal','revision',2)),
+(3,'2026-01-01','2027-01-01',200,'EUR',JSON_OBJECT('source','initial','revision',1));
+
+UPDATE fb_rate FOR PORTION OF validity FROM'2026-03-01'TO'2026-06-01'
+SET hourly_rate=125,source_doc=JSON_SET(source_doc,'$.source','campaign','$.revision',2)
+WHERE worker_id=1;
+
+INSERT INTO fb_job(job_key,worker_id,job_status,payload,note_text,created_at)VALUES
+('job-a-1',1,'new',JSON_OBJECT('source','api','runtime',12,'tags',JSON_ARRAY('priority','fast'),'steps',JSON_ARRAY(JSON_OBJECT('name','parse','cost',4),JSON_OBJECT('name','execute','cost',8))),' priority parser job ','2026-08-10 09:00:00.000001'),
+('job-a-2',1,'ready',JSON_OBJECT('source','batch','runtime',18,'tags',JSON_ARRAY('verified'),'steps',JSON_ARRAY(JSON_OBJECT('name','format','cost',18))),'formatter verification job','2026-08-11 10:00:00.000002'),
+('job-b-1',2,'ready',JSON_OBJECT('source','edge','runtime',28,'tags',JSON_ARRAY('priority','verified'),'steps',JSON_ARRAY(JSON_OBJECT('name','load','cost',10),JSON_OBJECT('name','run','cost',18))),'edge execution job','2026-08-12 11:00:00.000003'),
+('job-c-1',3,'done',JSON_OBJECT('source','stream','runtime',44,'tags',JSON_ARRAY('incident'),'steps',JSON_ARRAY(JSON_OBJECT('name','audit','cost',44))),'audited stream job','2026-08-13 12:00:00.000004'),
+('job-delete',3,'new',JSON_OBJECT('source','temporary','runtime',1,'tags',JSON_ARRAY('delete'),'disposable',1,'steps',JSON_ARRAY()),'delete branch sentinel','2026-08-14 13:00:00.000005');
+
+CALL fb_run_crud();
+
+WITH expanded AS(
+SELECT v.worker_id,v.worker_code,v.tier_code,v.job_id,v.job_key,v.job_status,v.runtime_ms,
+j.step_no,j.step_name,j.step_cost
+FROM fb_job_v v
+JOIN JSON_TABLE(v.payload,'$.steps[*]'COLUMNS(
+step_no FOR ORDINALITY,
+step_name VARCHAR(30)PATH'$.name',
+step_cost DECIMAL(12,2)PATH'$.cost'DEFAULT 0 ON EMPTY
+))AS j ON TRUE
+),ranked AS(
+SELECT e.*,
+SUM(e.step_cost)OVER(PARTITION BY e.worker_id ORDER BY e.job_id,e.step_no ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW)AS running_cost,
+ROW_NUMBER()OVER(PARTITION BY e.worker_id ORDER BY e.runtime_ms DESC,e.job_id,e.step_no)AS runtime_rank
+FROM expanded e
+)
+SELECT r.*,fb_runtime_band(r.runtime_ms)AS runtime_band
+FROM ranked r
+WHERE r.runtime_rank<=3
+ORDER BY r.worker_id,r.runtime_rank;
+
+UPDATE fb_job j
+JOIN fb_worker w ON w.worker_id=j.worker_id
+SET j.job_status='READY',j.payload=JSON_SET(j.payload,'$.crud',JSON_OBJECT('join_update',TRUE))
+WHERE j.job_id=102
+AND COLUMN_GET(w.properties,'tier'AS CHAR)='silver';
+
+START TRANSACTION;
+DELETE FROM fb_job WHERE job_id=103 RETURNING job_id,job_key,job_status;
+ROLLBACK;
+
+START TRANSACTION;
+INSERT INTO fb_job(job_key,worker_id,job_status,payload,note_text,created_at)
+VALUES('job-returning',1,'new',JSON_OBJECT('source','returning','runtime',9,'tags',JSON_ARRAY('rollback'),'steps',JSON_ARRAY()),'rollback returning insert',NOW(6))
+RETURNING job_id,job_key,runtime_ms;
+ROLLBACK;
+
+SET @fb_worker_id=1;
+EXECUTE IMMEDIATE'SELECT job_id,job_key,runtime_ms FROM fb_job WHERE worker_id=? ORDER BY runtime_ms DESC'USING @fb_worker_id;
+
+WITH RECURSIVE
+policy AS(
+SELECT JSON_OBJECT(
+'range',JSON_OBJECT('start','2026-08-10','days',6),
+'limits',JSON_OBJECT('runtime',40,'errors',5),
+'required',JSON_ARRAY('priority','verified')
+)AS config
+),
+params AS(
+SELECT
+CAST(JSON_VALUE(config,'$.range.start')AS DATE)AS start_day,
+CAST(JSON_VALUE(config,'$.range.days')AS UNSIGNED)AS day_count,
+CAST(JSON_VALUE(config,'$.limits.runtime')AS DECIMAL(10,2))AS runtime_limit,
+CAST(JSON_VALUE(config,'$.limits.errors')AS UNSIGNED)AS error_limit,
+config
+FROM policy
+),
+calendar(day_no,day_value)AS(
+SELECT 0,start_day FROM params
+UNION ALL
+SELECT c.day_no+1,c.day_value+INTERVAL 1 DAY
+FROM calendar c
+JOIN params p ON TRUE
+WHERE c.day_no+1<p.day_count
+),
+workers(worker_id,parent_worker_id,worker_name,active_flag,properties,host_addr)AS(
+SELECT 1,NULL,'Atlas Gateway',TRUE,COLUMN_CREATE('tier','gold','weight',12),INET6_ATON('2001:db8:7::1')UNION ALL
+SELECT 2,1,'Boreal Runner',TRUE,COLUMN_CREATE('tier','silver','weight',8),INET6_ATON('2001:db8:7::2')UNION ALL
+SELECT 3,1,'Cirrus Auditor',TRUE,COLUMN_CREATE('tier','gold','weight',10),INET6_ATON('2001:db8:7::3')UNION ALL
+SELECT 4,2,'Dormant Mirror',FALSE,COLUMN_CREATE('tier','bronze','weight',4),INET6_ATON('2001:db8:7::4')
+),
+worker_tree(worker_id,parent_worker_id,worker_path,tree_depth)AS(
+SELECT worker_id,parent_worker_id,CAST(REGEXP_REPLACE(UPPER(worker_name),'[^A-Z0-9]+','_')AS CHAR(400)),0
+FROM workers
+WHERE parent_worker_id IS NULL
+UNION ALL
+SELECT w.worker_id,w.parent_worker_id,
+CONCAT(t.worker_path,'/',REGEXP_REPLACE(UPPER(w.worker_name),'[^A-Z0-9]+','_')),
+t.tree_depth+1
+FROM workers w
+JOIN worker_tree t ON t.worker_id=w.parent_worker_id
+)
+CYCLE worker_id RESTRICT,
+runs(run_id,worker_id,run_on,payload)AS(
+SELECT 101,1,DATE'2026-08-10',JSON_OBJECT('source','api','metrics',JSON_ARRAY(
+JSON_OBJECT('name','runtime','value',13,'unit','ms','labels',JSON_ARRAY('priority','fast')),
+JSON_OBJECT('name','errors','value',1,'unit','count','labels',JSON_ARRAY('verified'))
+))UNION ALL
+SELECT 102,1,DATE'2026-08-14',JSON_OBJECT('source','batch','metrics',JSON_ARRAY(
+JSON_OBJECT('name','runtime','value',18,'unit','ms','labels',JSON_ARRAY('stable')),
+JSON_OBJECT('name','errors','value',0,'unit','count','labels',JSON_ARRAY('priority','verified'))
+))UNION ALL
+SELECT 201,2,DATE'2026-08-11',JSON_OBJECT('source','edge','metrics',JSON_ARRAY(
+JSON_OBJECT('name','runtime','value',29,'unit','ms','labels',JSON_ARRAY('priority')),
+JSON_OBJECT('name','errors','value',2,'unit','count','labels',JSON_ARRAY('verified'))
+))UNION ALL
+SELECT 301,3,DATE'2026-08-12',JSON_OBJECT('source','stream','metrics',JSON_ARRAY(
+JSON_OBJECT('name','runtime','value',44,'unit','ms','labels',JSON_ARRAY('incident')),
+JSON_OBJECT('name','errors','value',4,'unit','count','labels',JSON_ARRAY('priority','verified'))
+))UNION ALL
+SELECT 302,3,DATE'2026-08-15',JSON_OBJECT('source','replay','metrics',JSON_ARRAY(
+JSON_OBJECT('name','runtime','value',21,'unit','ms','labels',JSON_ARRAY('recovery')),
+JSON_OBJECT('name','errors','value',1,'unit','count','labels',JSON_ARRAY('verified'))
+))
+),
+metric_rows AS(
+SELECT r.run_id,r.worker_id,r.run_on,j.source_code,j.metric_no,
+j.metric_name,j.metric_value,j.metric_unit,j.has_labels,j.label_no,j.label_value
+FROM runs r
+JOIN JSON_TABLE(
+r.payload,'$'
+COLUMNS(
+source_code VARCHAR(30)PATH'$.source'DEFAULT'unknown'ON EMPTY,
+NESTED PATH'$.metrics[*]'
+COLUMNS(
+metric_no FOR ORDINALITY,
+metric_name VARCHAR(30)PATH'$.name'ERROR ON ERROR,
+metric_value DECIMAL(12,2)PATH'$.value'DEFAULT 0 ON EMPTY DEFAULT 0 ON ERROR,
+metric_unit VARCHAR(20)PATH'$.unit'NULL ON EMPTY,
+has_labels INT EXISTS PATH'$.labels',
+NESTED PATH'$.labels[*]'
+COLUMNS(
+label_no FOR ORDINALITY,
+label_value VARCHAR(30)PATH'$'NULL ON ERROR
+)
+)
+)
+)AS j ON TRUE
+),
+metric_base AS(
+SELECT run_id,worker_id,run_on,MAX(source_code)AS source_code,
+metric_name,MAX(metric_value)AS metric_value,MAX(metric_unit)AS metric_unit,
+MAX(has_labels)AS has_labels
+FROM metric_rows
+GROUP BY run_id,worker_id,run_on,metric_name
+),
+run_facts AS(
+SELECT run_id,worker_id,run_on,MAX(source_code)AS source_code,
+MAX(IF(metric_name='runtime',metric_value,NULL))AS runtime_ms,
+MAX(IF(metric_name='errors',metric_value,NULL))AS error_count,
+SUM(has_labels)AS labeled_metric_count
+FROM metric_base
+GROUP BY run_id,worker_id,run_on
+),
+daily AS(
+SELECT w.worker_id,c.day_no,c.day_value,
+IFNULL(AVG(f.runtime_ms),0)AS average_runtime,
+IFNULL(SUM(f.error_count),0)AS error_count,
+COUNT(f.run_id)AS run_count
+FROM workers w
+CROSS JOIN calendar c
+LEFT JOIN run_facts f
+ON f.worker_id=w.worker_id
+AND f.run_on=c.day_value
+GROUP BY w.worker_id,c.day_no,c.day_value
+),
+analytic_daily AS(
+SELECT d.*,
+SUM(error_count)OVER w_running AS running_errors,
+FIRST_VALUE(average_runtime)OVER w_full AS first_runtime,
+LAST_VALUE(average_runtime)OVER w_full AS last_runtime,
+NTH_VALUE(average_runtime,2)OVER w_full AS second_runtime,
+CUME_DIST()OVER w_rank AS runtime_distribution
+FROM daily d
+WINDOW
+w_worker AS(PARTITION BY worker_id),
+w_ordered AS(w_worker ORDER BY day_no),
+w_running AS(w_ordered ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW),
+w_full AS(w_ordered ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING),
+w_rank AS(w_worker ORDER BY average_runtime DESC,day_no)
+),
+percentiles AS(
+SELECT DISTINCT worker_id,
+PERCENTILE_CONT(0.5)WITHIN GROUP(ORDER BY runtime_ms)OVER(PARTITION BY worker_id)AS median_runtime,
+PERCENTILE_DISC(0.5)WITHIN GROUP(ORDER BY runtime_ms)OVER(PARTITION BY worker_id)AS discrete_runtime
+FROM run_facts
+),
+eligible(worker_id)AS(
+(SELECT worker_id FROM workers WHERE active_flag IS TRUE)
+INTERSECT ALL
+(SELECT worker_id FROM run_facts WHERE runtime_ms<60)
+EXCEPT ALL
+(SELECT f.worker_id FROM run_facts f JOIN params p ON f.error_count>p.error_limit*3)
+),
+worker_rollup AS(
+SELECT f.worker_id,COUNT(*)AS run_count,SUM(f.error_count)AS total_errors,
+ROUND(AVG(f.runtime_ms),2)AS average_runtime,
+GROUP_CONCAT(DISTINCT f.source_code ORDER BY f.source_code SEPARATOR','LIMIT 5)AS source_list,
+JSON_ARRAYAGG(JSON_OBJECT(
+'run',f.run_id,
+'day',DATE_FORMAT(f.run_on,'%Y-%m-%d'),
+'source',f.source_code,
+'runtime',f.runtime_ms,
+'errors',f.error_count
+)ORDER BY f.run_on,f.run_id LIMIT 10)AS run_json
+FROM run_facts f
+GROUP BY f.worker_id
+),
+final_rows AS(
+SELECT w.worker_id,w.worker_name,w.active_flag,t.worker_path,t.tree_depth,
+COLUMN_GET(w.properties,'tier'AS CHAR)AS tier_code,
+COLUMN_GET(w.properties,'weight'AS UNSIGNED)AS weight_value,
+INET6_NTOA(w.host_addr)AS host_text,
+IFNULL(r.run_count,0)AS run_count,IFNULL(r.total_errors,0)AS total_errors,
+IFNULL(r.average_runtime,0)AS average_runtime,r.source_list,r.run_json,
+CASE WHEN e.worker_id IS NULL THEN'INELIGIBLE'ELSE'ELIGIBLE'END AS eligibility,
+p.median_runtime,p.discrete_runtime,
+(SELECT MAX(d.running_errors)FROM analytic_daily d WHERE d.worker_id=w.worker_id)AS peak_running_errors,
+(SELECT JSON_ARRAYAGG(m.label_value ORDER BY m.run_id,m.metric_no,m.label_no LIMIT 30)FROM metric_rows m WHERE m.worker_id=w.worker_id)AS labels_json
+FROM workers w
+JOIN worker_tree t ON t.worker_id=w.worker_id
+LEFT JOIN worker_rollup r ON r.worker_id=w.worker_id
+LEFT JOIN(SELECT DISTINCT worker_id FROM eligible)AS e ON e.worker_id=w.worker_id
+LEFT JOIN percentiles p ON p.worker_id=w.worker_id
+)
+SELECT
+CASE
+WHEN(SELECT COUNT(*)FROM calendar)=6
+AND(SELECT COUNT(*)FROM worker_tree)=4
+AND(SELECT COUNT(*)FROM runs)=5
+AND(SELECT COUNT(*)FROM metric_base)=10
+AND(SELECT SUM(error_count)FROM run_facts)=8
+AND(SELECT COUNT(*)FROM workers WHERE COLUMN_CHECK(properties)=1)=4
+AND JSON_EXISTS((SELECT config FROM policy),'$.required[1]')=1
+THEN'PASS'ELSE'FAIL'END AS status,
+f.worker_id,f.worker_name,f.active_flag,f.tree_depth,f.tier_code,f.weight_value,
+f.host_text,f.run_count,f.total_errors,f.average_runtime,f.eligibility,
+f.median_runtime,f.discrete_runtime,f.peak_running_errors,f.source_list,
+JSON_NORMALIZE(JSON_OBJECT(
+'path',f.worker_path,
+'runs',f.run_json,
+'labels',f.labels_json,
+'properties',COLUMN_JSON((SELECT properties FROM workers w WHERE w.worker_id=f.worker_id)),
+'checks',JSON_OBJECT(
+'host_ok',f.host_text LIKE'2001:db8:7:%',
+'name_fragment',REGEXP_SUBSTR(f.worker_name,'^[A-Za-z]+'),
+'has_priority',JSON_OVERLAPS(IFNULL(f.labels_json,JSON_ARRAY()),JSON_ARRAY('priority')),
+'within_runtime',f.average_runtime<=(SELECT runtime_limit FROM params),
+'natural_name',HEX(NATURAL_SORT_KEY(f.worker_name))
+),
+'all_labels',(
+SELECT COUNT(*)
+FROM metric_rows
+)
+))AS evidence
+FROM final_rows f
+ORDER BY f.worker_id;
+
+SELECT CASE
+WHEN(SELECT COUNT(*)FROM fb_worker)=3
+AND(SELECT COUNT(*)FROM fb_job)=4
+AND(SELECT COUNT(*)FROM fb_job WHERE job_key='job-delete')=0
+AND(SELECT COUNT(*)FROM fb_job WHERE job_id=103)=1
+AND(SELECT COUNT(*)FROM fb_job WHERE JSON_VALUE(payload,'$.crud.updated')=1)=2
+AND(SELECT COUNT(*)FROM fb_job WHERE JSON_VALUE(payload,'$.crud.join_update')=1)=1
+AND(SELECT COUNT(*)FROM fb_rate WHERE worker_id=1)=3
+AND(SELECT COUNT(*)FROM fb_audit WHERE operation_code='INSERT')=5
+AND(SELECT COUNT(*)FROM fb_audit WHERE operation_code='UPDATE')>=3
+AND(SELECT COUNT(*)FROM fb_audit WHERE operation_code='DELETE')=1
+THEN'PASS'ELSE'FAIL'END AS crud_certification,
+(SELECT COUNT(*)FROM fb_audit)AS audit_rows,
+JSON_NORMALIZE(JSON_OBJECT(
+'created_workers',(SELECT COUNT(*)FROM fb_worker),
+'remaining_jobs',(SELECT COUNT(*)FROM fb_job),
+'rate_fragments',(SELECT COUNT(*)FROM fb_rate),
+'updated_jobs',(SELECT COUNT(*)FROM fb_audit WHERE operation_code='UPDATE'),
+'deleted_jobs',(SELECT COUNT(*)FROM fb_audit WHERE operation_code='DELETE'),
+'rollback_restored',(SELECT COUNT(*)FROM fb_job WHERE job_id=103),
+'vector_distance',(SELECT VEC_DISTANCE_COSINE(a.embedding,b.embedding)FROM fb_worker a JOIN fb_worker b ON a.worker_id=1 AND b.worker_id=2)
+))AS evidence;
+
+
+-- =========================================================
+-- IntelliSense sweep report generated by intellisense sweep
+-- source: test_mariadb/test15.txt
+-- db: MariaDB
+-- metadata: test_mariadb/test15.txt inferred catalog
+-- checked: 1309
+-- suggestions checked: 10500
+-- missing: 0
+-- suggestions without type labels: 0
+-- marker: [[word]] means not suggested for the tested prefix
+-- missing tokens: none
+-- suggestions without type labels: none
+-- =========================================================

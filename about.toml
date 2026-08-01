@@ -1,0 +1,30 @@
+accepted = [
+    "Apache-2.0",
+    "MIT",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Zlib",
+    "Unicode-3.0",
+    "Unicode-DFS-2016",
+    "MPL-2.0",
+    "CC0-1.0",
+    "0BSD",
+    "BSL-1.0",
+    "OpenSSL",
+]
+
+# Keep the generated dependency notice independent of the host that runs
+# cargo-about. These are the targets built and checked by the release/CI jobs.
+targets = [
+    "x86_64-unknown-linux-gnu",
+    "aarch64-apple-darwin",
+    "x86_64-pc-windows-msvc",
+]
+
+[fltk-sys.clarify]
+license = "MIT"
+
+[[fltk-sys.clarify.files]]
+path = "LICENSE"
+checksum = "0996ce6111d448c339ed44bd9f01390c8fd08d6a53f8d38385aee571fd3c1591"

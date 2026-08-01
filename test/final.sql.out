@@ -1,0 +1,1029 @@
+--------------------------------------------------------------------------------
+-- Oracle SQL / PL/SQL official-syntax executable certification suite.
+-- Live target: Oracle AI Database Free 26ai (23.26.0.0.0).
+-- Run from the repository root with SYSTEM connected to the FREE service.
+--
+-- References:
+--   https://docs.oracle.com/en/database/oracle/oracle-database/26/sqlrf/
+--   https://docs.oracle.com/en/database/oracle/oracle-database/26/lnpls/
+--
+-- This standalone file creates isolated SQ_ORACLE_* objects, validates every
+-- result it depends on, and can be run repeatedly. Coverage comes from SQL and
+-- PL/SQL that the database really parses and executes; manual-path and copied
+-- catalog inventories are intentionally excluded.
+--------------------------------------------------------------------------------
+
+SET SERVEROUTPUT ON SIZE UNLIMITED
+SET FEEDBACK ON
+SET VERIFY OFF
+SET DEFINE ON
+WHENEVER SQLERROR EXIT SQL.SQLCODE ROLLBACK
+
+PROMPT [ORACLE FINAL] standalone schema, SQL, and PL/SQL coverage
+
+BEGIN
+  FOR ddl_text IN (
+    SELECT 'DROP PROPERTY GRAPH sq_oracle_manual_graph' text_value FROM dual UNION ALL
+    SELECT 'DROP MATERIALIZED VIEW sq_oracle_manual_mv' FROM dual UNION ALL
+    SELECT 'DROP MATERIALIZED VIEW LOG ON sq_oracle_manual_log' FROM dual UNION ALL
+    SELECT 'DROP VIEW sq_oracle_manual_v' FROM dual UNION ALL
+    SELECT 'DROP SYNONYM sq_oracle_manual_syn' FROM dual UNION ALL
+    SELECT 'DROP TRIGGER sq_oracle_manual_biu' FROM dual UNION ALL
+    SELECT 'DROP TRIGGER sq_oracle_editor_ct' FROM dual UNION ALL
+    SELECT 'DROP PACKAGE sq_oracle_manual_pkg' FROM dual UNION ALL
+    SELECT 'DROP PROCEDURE sq_oracle_manual_proc' FROM dual UNION ALL
+    SELECT 'DROP FUNCTION sq_oracle_manual_fn' FROM dual UNION ALL
+    SELECT 'DROP TYPE sq_oracle_manual_obj FORCE' FROM dual UNION ALL
+    SELECT 'DROP TABLE sq_oracle_manual_gtt' FROM dual UNION ALL
+    SELECT 'DROP TABLE sq_oracle_manual_lob PURGE' FROM dual UNION ALL
+    SELECT 'DROP TABLE sq_oracle_editor_long PURGE' FROM dual UNION ALL
+    SELECT 'DROP TABLE sq_oracle_editor_long_raw PURGE' FROM dual UNION ALL
+    SELECT 'DROP TABLE sq_oracle_editor_types PURGE' FROM dual UNION ALL
+    SELECT 'DROP TABLE sq_oracle_editor_rename PURGE' FROM dual UNION ALL
+    SELECT 'DROP TABLE sq_oracle_editor_renamed PURGE' FROM dual UNION ALL
+    SELECT 'DROP TABLE sq_oracle_editor_purge PURGE' FROM dual UNION ALL
+    SELECT 'PURGE TABLE sq_oracle_editor_purge' FROM dual UNION ALL
+    SELECT 'DROP TABLE sq_oracle_manual_metric PURGE' FROM dual UNION ALL
+    SELECT 'DROP TABLE sq_oracle_manual_edge PURGE' FROM dual UNION ALL
+    SELECT 'DROP TABLE sq_oracle_manual_node PURGE' FROM dual UNION ALL
+    SELECT 'DROP TABLE sq_oracle_manual_child PURGE' FROM dual UNION ALL
+    SELECT 'DROP TABLE sq_oracle_manual_log PURGE' FROM dual UNION ALL
+    SELECT 'DROP SEQUENCE sq_oracle_manual_seq' FROM dual UNION ALL
+    SELECT 'DROP ROLE sq_oracle_manual_role' FROM dual UNION ALL
+    SELECT 'DROP DOMAIN sq_oracle_category_domain' FROM dual
+  ) LOOP
+    BEGIN
+      EXECUTE IMMEDIATE ddl_text.text_value;
+    EXCEPTION
+      WHEN OTHERS THEN NULL;
+    END;
+  END LOOP;
+END;
+/
+
+CREATE DOMAIN sq_oracle_category_domain AS VARCHAR2(32)
+  CONSTRAINT sq_oracle_category_domain_ck CHECK (LENGTH(TRIM(VALUE)) > 0)
+  DISPLAY UPPER(VALUE);
+
+CREATE SEQUENCE sq_oracle_manual_seq
+  START WITH 100 INCREMENT BY 1 MINVALUE 100 CACHE 20 NOCYCLE NOORDER;
+ALTER SEQUENCE sq_oracle_manual_seq INCREMENT BY 1 CACHE 10;
+
+-- Executable schema objects below exercise Oracle SQL and PL/SQL grammar
+-- directly; copied catalog rows and manual-path inventories are omitted.
+CREATE TABLE sq_oracle_manual_log (
+  id NUMBER DEFAULT sq_oracle_manual_seq.NEXTVAL,
+  category VARCHAR2(32) DOMAIN sq_oracle_category_domain NOT NULL,
+  payload JSON,
+  amount NUMBER(12,2) DEFAULT 0 NOT NULL,
+  created_at TIMESTAMP(6) DEFAULT SYSTIMESTAMP NOT NULL,
+  payload_kind VARCHAR2(32)
+    GENERATED ALWAYS AS (JSON_VALUE(payload, '$.kind' RETURNING VARCHAR2(32))) VIRTUAL,
+  CONSTRAINT sq_oracle_manual_pk PRIMARY KEY (id),
+  CONSTRAINT sq_oracle_manual_uk UNIQUE (category),
+  CONSTRAINT sq_oracle_manual_amount_ck CHECK (amount >= 0)
+) TABLESPACE users;
+
+CREATE TABLE sq_oracle_manual_node (
+  node_id NUMBER CONSTRAINT sq_oracle_manual_node_pk PRIMARY KEY,
+  parent_node_id NUMBER,
+  node_name VARCHAR2(80) NOT NULL,
+  attributes JSON NOT NULL,
+  CONSTRAINT sq_oracle_manual_node_fk
+    FOREIGN KEY (parent_node_id) REFERENCES sq_oracle_manual_node(node_id)
+) TABLESPACE users;
+
+CREATE TABLE sq_oracle_manual_edge (
+  edge_id NUMBER CONSTRAINT sq_oracle_manual_edge_pk PRIMARY KEY,
+  source_node_id NUMBER NOT NULL,
+  target_node_id NUMBER NOT NULL,
+  edge_label VARCHAR2(32) NOT NULL,
+  edge_weight NUMBER(10,2) DEFAULT 1 NOT NULL,
+  CONSTRAINT sq_oracle_manual_edge_source_fk
+    FOREIGN KEY (source_node_id) REFERENCES sq_oracle_manual_node(node_id),
+  CONSTRAINT sq_oracle_manual_edge_target_fk
+    FOREIGN KEY (target_node_id) REFERENCES sq_oracle_manual_node(node_id)
+) TABLESPACE users;
+
+CREATE TABLE sq_oracle_manual_metric (
+  metric_id NUMBER NOT NULL,
+  node_id NUMBER NOT NULL,
+  metric_day DATE NOT NULL,
+  metric_name VARCHAR2(32) NOT NULL,
+  metric_value NUMBER(12,2) NOT NULL,
+  payload JSON,
+  CONSTRAINT sq_oracle_manual_metric_pk PRIMARY KEY (metric_id, metric_day)
+) TABLESPACE users
+PARTITION BY RANGE (metric_day) (
+  PARTITION p2025 VALUES LESS THAN (DATE '2026-01-01'),
+  PARTITION p2026 VALUES LESS THAN (DATE '2027-01-01'),
+  PARTITION pmax VALUES LESS THAN (MAXVALUE)
+);
+
+CREATE TABLE sq_oracle_manual_lob (
+  lob_id NUMBER CONSTRAINT sq_oracle_manual_lob_pk PRIMARY KEY,
+  text_doc CLOB,
+  national_doc NCLOB,
+  binary_doc BLOB,
+  xml_doc XMLTYPE
+) TABLESPACE users
+LOB (text_doc) STORE AS SECUREFILE
+LOB (national_doc) STORE AS SECUREFILE
+LOB (binary_doc) STORE AS SECUREFILE;
+
+-- The TOC rows above are inventory. These columns put the documented scalar,
+-- national-character, temporal, row locator, JSON, and vector type families
+-- into executable DDL for completion, formatting, and highlighting.
+CREATE TABLE sq_oracle_editor_types (
+  type_id NUMBER(10) CONSTRAINT sq_oracle_editor_types_pk PRIMARY KEY,
+  number_value NUMBER(20,6),
+  decimal_value DECIMAL(20,6),
+  numeric_value NUMERIC(20,6),
+  integer_value INTEGER,
+  smallint_value SMALLINT,
+  float_value FLOAT(126),
+  real_value REAL,
+  double_value DOUBLE PRECISION,
+  binary_float_value BINARY_FLOAT,
+  binary_double_value BINARY_DOUBLE,
+  char_value CHAR(8 CHAR),
+  varchar_value VARCHAR(80 CHAR),
+  varchar2_value VARCHAR2(80 CHAR),
+  nchar_value NCHAR(8),
+  nvarchar2_value NVARCHAR2(80),
+  raw_value RAW(16),
+  date_value DATE,
+  timestamp_value TIMESTAMP(6),
+  timestamp_tz_value TIMESTAMP(6) WITH TIME ZONE,
+  timestamp_ltz_value TIMESTAMP(6) WITH LOCAL TIME ZONE,
+  interval_ym_value INTERVAL YEAR(2) TO MONTH,
+  interval_ds_value INTERVAL DAY(2) TO SECOND(6),
+  boolean_value BOOLEAN,
+  json_value JSON,
+  vector_value VECTOR(3, FLOAT32),
+  rowid_value ROWID,
+  urowid_value UROWID(4000),
+  bfile_value BFILE,
+  generated_value VARCHAR2(80 CHAR)
+    GENERATED ALWAYS AS (UPPER(varchar2_value)) VIRTUAL,
+  invisible_value VARCHAR2(16) INVISIBLE
+) TABLESPACE users;
+
+INSERT INTO sq_oracle_editor_types(
+  type_id, number_value, decimal_value, numeric_value, integer_value,
+  smallint_value, float_value, real_value, double_value, binary_float_value,
+  binary_double_value, char_value, varchar_value, varchar2_value, nchar_value,
+  nvarchar2_value, raw_value, date_value, timestamp_value,
+  timestamp_tz_value, timestamp_ltz_value, interval_ym_value,
+  interval_ds_value, boolean_value, json_value, vector_value, invisible_value
+) VALUES (
+  1, 12345.678901, 12345.678901, 12345.678901, 6789,
+  12, 1.25, 2.5, 3.75, 1.25f,
+  2.5d, 'SQL', 'Manual syntax', q'[Oracle editor syntax]', N'국제SQL',
+  N'내셔널 문자 구문', HEXTORAW('53514C'), DATE '2026-07-18',
+  TIMESTAMP '2026-07-18 12:34:56.123456',
+  TIMESTAMP '2026-07-18 12:34:56.123456 +09:00',
+  TIMESTAMP '2026-07-18 12:34:56.123456', INTERVAL '2-3' YEAR TO MONTH,
+  INTERVAL '4 05:06:07.123456' DAY TO SECOND, TRUE,
+  JSON_OBJECT(
+    'kind' VALUE 'type-matrix',
+    'tags' VALUE JSON_ARRAY('sql', 'json')
+    RETURNING JSON
+  ),
+  TO_VECTOR('[1,2,3]'), 'hidden'
+);
+
+CREATE TABLE sq_oracle_editor_long (
+  type_id NUMBER CONSTRAINT sq_oracle_editor_long_pk PRIMARY KEY,
+  long_value LONG
+) TABLESPACE users;
+INSERT INTO sq_oracle_editor_long VALUES (1, 'legacy long character syntax');
+
+CREATE TABLE sq_oracle_editor_long_raw (
+  type_id NUMBER CONSTRAINT sq_oracle_editor_long_raw_pk PRIMARY KEY,
+  long_raw_value LONG RAW
+) TABLESPACE users;
+INSERT INTO sq_oracle_editor_long_raw VALUES (1, HEXTORAW('53514C'));
+
+CREATE GLOBAL TEMPORARY TABLE sq_oracle_manual_gtt (
+  id NUMBER,
+  value_text VARCHAR2(100)
+) ON COMMIT DELETE ROWS;
+ALTER TABLE sq_oracle_manual_gtt ADD (created_at TIMESTAMP DEFAULT SYSTIMESTAMP);
+ALTER TABLE sq_oracle_manual_gtt DROP COLUMN created_at;
+TRUNCATE TABLE sq_oracle_manual_gtt;
+
+CREATE TABLE sq_oracle_manual_child (
+  child_id NUMBER GENERATED BY DEFAULT ON NULL AS IDENTITY,
+  log_id NUMBER NOT NULL,
+  note_text VARCHAR2(200),
+  embedding VECTOR(3, FLOAT32),
+  CONSTRAINT sq_oracle_manual_child_pk PRIMARY KEY (child_id),
+  CONSTRAINT sq_oracle_manual_child_fk
+    FOREIGN KEY (log_id) REFERENCES sq_oracle_manual_log(id)
+) TABLESPACE users;
+
+CREATE INDEX sq_oracle_manual_kind_ix
+  ON sq_oracle_manual_log(payload_kind, amount DESC) INVISIBLE;
+ALTER INDEX sq_oracle_manual_kind_ix VISIBLE;
+ALTER INDEX sq_oracle_manual_kind_ix MONITORING USAGE;
+
+COMMENT ON TABLE sq_oracle_manual_log IS 'Oracle final syntax certification';
+COMMENT ON COLUMN sq_oracle_manual_log.category IS 'statement category';
+
+CREATE OR REPLACE TYPE sq_oracle_manual_obj AS OBJECT (
+  amount NUMBER,
+  MEMBER FUNCTION band RETURN VARCHAR2
+);
+/
+CREATE OR REPLACE TYPE BODY sq_oracle_manual_obj AS
+  MEMBER FUNCTION band RETURN VARCHAR2 IS
+  BEGIN
+    RETURN CASE WHEN amount >= 50 THEN 'HIGH' ELSE 'LOW' END;
+  END;
+END;
+/
+
+CREATE OR REPLACE FUNCTION sq_oracle_manual_fn(p_amount NUMBER)
+RETURN VARCHAR2
+DETERMINISTIC
+IS
+BEGIN
+  RETURN sq_oracle_manual_obj(p_amount).band();
+END;
+/
+
+CREATE OR REPLACE PROCEDURE sq_oracle_manual_proc(
+  p_category IN VARCHAR2,
+  p_amount IN NUMBER DEFAULT 0
+)
+AUTHID DEFINER
+IS
+BEGIN
+  INSERT INTO sq_oracle_manual_log(category, payload, amount)
+  VALUES (p_category, JSON_OBJECT('kind' VALUE LOWER(p_category)), p_amount);
+END;
+/
+
+CREATE OR REPLACE PACKAGE sq_oracle_manual_pkg AUTHID DEFINER AS
+  PROCEDURE assert_true(p_condition BOOLEAN, p_message VARCHAR2);
+  PROCEDURE run_compound;
+  FUNCTION row_count RETURN PLS_INTEGER;
+END sq_oracle_manual_pkg;
+/
+CREATE OR REPLACE PACKAGE BODY sq_oracle_manual_pkg AS
+  PROCEDURE assert_true(p_condition BOOLEAN, p_message VARCHAR2) IS
+  BEGIN
+    IF p_condition IS NULL OR NOT p_condition THEN
+      RAISE_APPLICATION_ERROR(-20000, p_message);
+    END IF;
+  END;
+
+  PROCEDURE run_compound IS
+    TYPE number_list IS TABLE OF NUMBER;
+    TYPE amount_record IS RECORD (
+      id sq_oracle_manual_log.id%TYPE,
+      amount sq_oracle_manual_log.amount%TYPE
+    );
+    TYPE amount_map IS TABLE OF amount_record INDEX BY PLS_INTEGER;
+    SUBTYPE nonnegative_index IS PLS_INTEGER RANGE 0..2147483647;
+    amount_values number_list;
+    amount_by_index amount_map;
+    selected_amount amount_record := amount_record(id => -1, amount => 0);
+    total_amount NUMBER(12,2) := 0;
+    loop_count nonnegative_index := 0;
+    control_value PLS_INTEGER := 0;
+    editor_exception EXCEPTION;
+    PRAGMA EXCEPTION_INIT(editor_exception, -20002);
+    CURSOR amount_cursor IS
+      SELECT amount FROM sq_oracle_manual_log ORDER BY id;
+    CURSOR explicit_cursor(p_min_amount NUMBER) IS
+      SELECT id, amount
+      FROM sq_oracle_manual_log
+      WHERE amount >= p_min_amount
+      ORDER BY id;
+
+    PROCEDURE autonomous_probe IS
+      PRAGMA AUTONOMOUS_TRANSACTION;
+    BEGIN
+      ROLLBACK;
+    END;
+
+    PROCEDURE exercise_goto(p_limit PLS_INTEGER) IS
+      counter_value PLS_INTEGER := 0;
+    BEGIN
+      <<again>>
+      counter_value := counter_value + 1;
+      IF counter_value < p_limit THEN
+        GOTO again;
+      END IF;
+    END;
+  BEGIN
+    SELECT amount
+    BULK COLLECT INTO amount_values
+    FROM sq_oracle_manual_log
+    ORDER BY id;
+
+    FORALL index_value IN INDICES OF amount_values SAVE EXCEPTIONS
+      UPDATE sq_oracle_manual_log
+      SET amount = amount
+      WHERE id = -amount_values(index_value);
+
+    OPEN explicit_cursor(0);
+    LOOP
+      FETCH explicit_cursor INTO selected_amount.id, selected_amount.amount;
+      EXIT WHEN explicit_cursor%NOTFOUND;
+      amount_by_index(explicit_cursor%ROWCOUNT) := selected_amount;
+      CONTINUE WHEN selected_amount.amount < 0;
+    END LOOP;
+    IF explicit_cursor%ISOPEN THEN
+      CLOSE explicit_cursor;
+    END IF;
+
+    WHILE loop_count < 1 LOOP
+      loop_count := loop_count + 1;
+    END LOOP;
+
+    <<control_loop>>
+    LOOP
+      control_value := control_value + 1;
+      CONTINUE control_loop WHEN control_value = 1;
+      EXIT control_loop WHEN control_value >= 2;
+    END LOOP control_loop;
+
+    FOR amount_row IN amount_cursor LOOP
+      total_amount := total_amount + amount_row.amount;
+      loop_count := loop_count + 1;
+      EXIT WHEN loop_count > 100;
+    END LOOP;
+
+    CASE
+      WHEN total_amount > 0 THEN NULL;
+      ELSE RAISE_APPLICATION_ERROR(-20001, 'compound total');
+    END CASE;
+
+    $IF $$PLSQL_VERSION >= 120200 $THEN
+      NULL;
+    $ELSE
+      NULL;
+    $END
+
+    BEGIN
+      IF FALSE THEN
+        autonomous_probe;
+      END IF;
+    EXCEPTION
+      WHEN editor_exception THEN NULL;
+    END;
+
+    PRAGMA INLINE(exercise_goto, 'YES');
+    exercise_goto(2);
+  EXCEPTION
+    WHEN OTHERS THEN
+      RAISE;
+  END;
+
+  FUNCTION row_count RETURN PLS_INTEGER IS
+    result_value PLS_INTEGER;
+  BEGIN
+    SELECT COUNT(*) INTO result_value FROM sq_oracle_manual_log;
+    RETURN result_value;
+  END;
+END sq_oracle_manual_pkg;
+/
+
+CREATE OR REPLACE TRIGGER sq_oracle_manual_biu
+BEFORE INSERT OR UPDATE OF category, amount ON sq_oracle_manual_log
+FOR EACH ROW
+BEGIN
+  :NEW.category := UPPER(TRIM(:NEW.category));
+  :NEW.amount := ROUND(:NEW.amount, 2);
+END;
+/
+
+CREATE OR REPLACE TRIGGER sq_oracle_editor_ct
+FOR INSERT OR UPDATE OR DELETE ON sq_oracle_manual_metric
+COMPOUND TRIGGER
+  changed_rows PLS_INTEGER := 0;
+
+  BEFORE STATEMENT IS
+  BEGIN
+    changed_rows := 0;
+  END BEFORE STATEMENT;
+
+  BEFORE EACH ROW IS
+  BEGIN
+    NULL;
+  END BEFORE EACH ROW;
+
+  AFTER EACH ROW IS
+  BEGIN
+    changed_rows := changed_rows + 1;
+  END AFTER EACH ROW;
+
+  AFTER STATEMENT IS
+  BEGIN
+    NULL;
+  END AFTER STATEMENT;
+END sq_oracle_editor_ct;
+/
+
+ALTER FUNCTION sq_oracle_manual_fn COMPILE REUSE SETTINGS;
+ALTER PROCEDURE sq_oracle_manual_proc COMPILE REUSE SETTINGS;
+ALTER PACKAGE sq_oracle_manual_pkg COMPILE SPECIFICATION REUSE SETTINGS;
+ALTER PACKAGE sq_oracle_manual_pkg COMPILE BODY REUSE SETTINGS;
+ALTER TRIGGER sq_oracle_manual_biu COMPILE;
+ALTER TRIGGER sq_oracle_editor_ct COMPILE;
+ALTER TYPE sq_oracle_manual_obj COMPILE BODY REUSE SETTINGS;
+
+CALL sq_oracle_manual_proc('ddl', 10);
+EXECUTE sq_oracle_manual_proc('dml', 20)
+BEGIN
+  sq_oracle_manual_proc('query', 30);
+END;
+/
+
+INSERT INTO sq_oracle_manual_node(node_id, parent_node_id, node_name, attributes) VALUES
+  (1, NULL, 'Root', JSON_OBJECT('tier' VALUE 'root'));
+INSERT INTO sq_oracle_manual_node VALUES
+  (2, 1, 'North', JSON_OBJECT('tier' VALUE 'branch'));
+INSERT INTO sq_oracle_manual_node VALUES
+  (3, 1, 'South', JSON_OBJECT('tier' VALUE 'branch'));
+INSERT INTO sq_oracle_manual_node VALUES
+  (4, 2, 'Leaf', JSON_OBJECT('tier' VALUE 'leaf'));
+
+INSERT INTO sq_oracle_manual_edge VALUES (1, 1, 2, 'OWNS', 1);
+INSERT INTO sq_oracle_manual_edge VALUES (2, 1, 3, 'OWNS', 1);
+INSERT INTO sq_oracle_manual_edge VALUES (3, 2, 4, 'OWNS', 2);
+
+INSERT INTO sq_oracle_manual_metric VALUES
+  (1, 1, DATE '2025-12-31', 'LATENCY', 12,
+   JSON_OBJECT('tags' VALUE JSON_ARRAY('sql', 'manual')));
+INSERT INTO sq_oracle_manual_metric VALUES
+  (2, 1, DATE '2026-01-01', 'LATENCY', 10,
+   JSON_OBJECT('tags' VALUE JSON_ARRAY('query')));
+INSERT INTO sq_oracle_manual_metric VALUES
+  (3, 2, DATE '2026-01-02', 'LATENCY', 20,
+   JSON_OBJECT('tags' VALUE JSON_ARRAY('json', 'manual')));
+INSERT INTO sq_oracle_manual_metric VALUES
+  (4, 2, DATE '2026-01-03', 'ERRORS', 2,
+   JSON_OBJECT('tags' VALUE JSON_ARRAY('routine')));
+INSERT INTO sq_oracle_manual_metric VALUES
+  (5, 3, DATE '2027-01-01', 'LATENCY', 30,
+   JSON_OBJECT('tags' VALUE JSON_ARRAY('vector')));
+
+INSERT INTO sq_oracle_manual_lob(
+  lob_id, text_doc, national_doc, binary_doc, xml_doc
+) VALUES (
+  1,
+  TO_CLOB('standalone Oracle LOB syntax'),
+  TO_NCLOB('national text'),
+  EMPTY_BLOB(),
+  XMLTYPE('<manual><section name="sql">26ai</section></manual>')
+);
+
+SELECT
+  +integer_value unary_plus,
+  -integer_value unary_minus,
+  number_value + decimal_value addition_value,
+  number_value - decimal_value subtraction_value,
+  number_value * 2 multiplication_value,
+  number_value / 2 division_value,
+  MOD(integer_value, 5) modulo_value,
+  BITAND(integer_value, 255) bitwise_and_value,
+  ABS(number_value) absolute_value,
+  CEIL(number_value) ceiling_value,
+  FLOOR(number_value) floor_value,
+  ROUND(number_value, 2) rounded_value,
+  TRUNC(number_value, 3) truncated_value,
+  POWER(double_value, 2) power_value,
+  SQRT(double_value) square_root,
+  LN(double_value) natural_log,
+  LOG(10, double_value) base10_log,
+  EXP(1) exponential_value,
+  SIGN(number_value) sign_value,
+  REMAINDER(integer_value, 7) remainder_value,
+  WIDTH_BUCKET(integer_value, 0, 10000, 10) bucket_value,
+  char_value || ':' || varchar2_value concatenated_value,
+  LENGTH(varchar2_value) character_count,
+  LENGTHB(varchar2_value) byte_count,
+  LOWER(varchar2_value) lower_value,
+  UPPER(varchar2_value) upper_value,
+  INITCAP(varchar2_value) initcap_value,
+  TRIM(BOTH ' ' FROM varchar2_value) trimmed_value,
+  LTRIM(varchar2_value, 'O') left_trimmed_value,
+  RTRIM(varchar2_value, 'x') right_trimmed_value,
+  SUBSTR(varchar2_value, 1, 6) substring_value,
+  INSTR(varchar2_value, 'editor') located_value,
+  REPLACE(varchar2_value, 'Oracle', 'SQL') replaced_value,
+  TRANSLATE(char_value, 'SQL', 'sql') translated_value,
+  LPAD(char_value, 10, '.') left_padded_value,
+  RPAD(char_value, 10, '.') right_padded_value,
+  REGEXP_COUNT(varchar2_value, '[[:alpha:]]+') regexp_count_value,
+  REGEXP_INSTR(varchar2_value, 'editor', 1, 1, 0, 'i') regexp_position,
+  REGEXP_REPLACE(varchar2_value, 'oracle', 'database', 1, 0, 'i') regexp_value,
+  REGEXP_SUBSTR(varchar2_value, '[[:alpha:]]+', 1, 2, 'i') regexp_substring,
+  RAWTOHEX(raw_value) hexadecimal_value,
+  DUMP(raw_value, 16) dump_value,
+  ADD_MONTHS(date_value, 1) added_month,
+  LAST_DAY(date_value) last_day_value,
+  NEXT_DAY(date_value, 'MONDAY') next_day_value,
+  MONTHS_BETWEEN(ADD_MONTHS(date_value, 2), date_value) month_difference,
+  EXTRACT(YEAR FROM timestamp_value) extracted_year,
+  NUMTODSINTERVAL(90, 'SECOND') second_interval,
+  NUMTOYMINTERVAL(2, 'YEAR') year_interval,
+  FROM_TZ(timestamp_value, 'Asia/Seoul') zoned_timestamp,
+  SYS_EXTRACT_UTC(timestamp_tz_value) utc_timestamp,
+  TO_CHAR(timestamp_value, 'YYYY-MM-DD HH24:MI:SS.FF6') formatted_timestamp,
+  TO_NUMBER('12345.67', '99999D99', 'NLS_NUMERIC_CHARACTERS=''.,''') parsed_number,
+  TO_DATE('2026-07-18', 'YYYY-MM-DD') parsed_date,
+  TO_TIMESTAMP('2026-07-18 12:34:56', 'YYYY-MM-DD HH24:MI:SS') parsed_timestamp,
+  CAST(number_value AS VARCHAR2(32)) cast_value,
+  VALIDATE_CONVERSION('123.45' AS NUMBER) valid_number,
+  TO_BINARY_FLOAT(number_value) converted_binary_float,
+  TO_BINARY_DOUBLE(number_value) converted_binary_double,
+  NANVL(binary_float_value, 0) nan_safe_value,
+  NVL(NULL, varchar2_value) nvl_value,
+  NVL2(varchar2_value, 'present', 'missing') nvl2_value,
+  NULLIF(integer_value, 6789) nullif_value,
+  COALESCE(NULL, varchar2_value, char_value) coalesced_value,
+  GREATEST(integer_value, smallint_value) greatest_value,
+  LEAST(integer_value, smallint_value) least_value,
+  DECODE(integer_value, 6789, 'matched', 'other') decoded_value,
+  JSON_VALUE(json_value, '$.kind' RETURNING VARCHAR2(32)) json_kind,
+  JSON_QUERY(json_value, '$.tags' RETURNING VARCHAR2(200) PRETTY) json_tags,
+  JSON_SERIALIZE(json_value RETURNING VARCHAR2(200) PRETTY) json_text,
+  JSON_MERGEPATCH(
+    json_value,
+    JSON_OBJECT('checked' VALUE TRUE RETURNING JSON)
+  ) json_merged_value,
+  CASE WHEN JSON_EXISTS(json_value, '$.tags[0]') THEN 1 ELSE 0 END json_exists_value,
+  XMLCAST(
+    XMLQUERY(
+      '/manual/db/text()'
+      PASSING XMLTYPE('<manual><db>oracle</db></manual>')
+      RETURNING CONTENT
+    ) AS VARCHAR2(32)
+  ) xml_value,
+  STANDARD_HASH(varchar2_value, 'SHA256') hash_value,
+  ORA_HASH(varchar2_value) ora_hash_value,
+  VECTOR_DISTANCE(vector_value, TO_VECTOR('[1,1,1]'), EUCLIDEAN) vector_distance
+FROM sq_oracle_editor_types
+WHERE integer_value BETWEEN 1 AND 10000
+  AND integer_value IN (6789, 9876)
+  AND varchar2_value LIKE 'Oracle%'
+  AND REGEXP_LIKE(varchar2_value, 'editor', 'i')
+  AND boolean_value IS TRUE
+  AND json_value IS JSON
+  AND date_value IS NOT NULL
+  AND EXISTS (SELECT 1 FROM dual)
+  AND integer_value = ANY (SELECT 6789 FROM dual)
+  AND integer_value <= ALL (SELECT 6789 FROM dual)
+  AND LNNVL(integer_value < 0);
+
+SELECT
+  COUNT(*) row_count,
+  COUNT(DISTINCT integer_value) distinct_count,
+  SUM(number_value) sum_value,
+  AVG(number_value) average_value,
+  MIN(integer_value) minimum_value,
+  MAX(integer_value) maximum_value,
+  LISTAGG(varchar2_value, '|') WITHIN GROUP (ORDER BY type_id) grouped_text,
+  JSON_ARRAYAGG(varchar2_value ORDER BY type_id RETURNING JSON) json_array_value,
+  JSON_OBJECTAGG(
+    KEY char_value VALUE integer_value
+    RETURNING JSON
+  ) json_object_value,
+  STDDEV(number_value) standard_deviation,
+  VARIANCE(number_value) variance_value,
+  MEDIAN(number_value) median_value,
+  PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY number_value) percentile_continuous,
+  PERCENTILE_DISC(0.5) WITHIN GROUP (ORDER BY number_value) percentile_discrete,
+  APPROX_COUNT_DISTINCT(integer_value) approximate_distinct_count,
+  CORR(number_value, integer_value) correlation_value,
+  COVAR_POP(number_value, integer_value) population_covariance,
+  COVAR_SAMP(number_value, integer_value) sample_covariance
+FROM sq_oracle_editor_types;
+
+SELECT
+  type_id,
+  ROW_NUMBER() OVER (ORDER BY type_id) row_number_value,
+  RANK() OVER (ORDER BY type_id) rank_value,
+  DENSE_RANK() OVER (ORDER BY type_id) dense_rank_value,
+  PERCENT_RANK() OVER (ORDER BY type_id) percent_rank_value,
+  CUME_DIST() OVER (ORDER BY type_id) cumulative_distribution,
+  NTILE(2) OVER (ORDER BY type_id) tile_value,
+  FIRST_VALUE(integer_value) OVER (
+    ORDER BY type_id ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING
+  ) first_value_result,
+  LAST_VALUE(integer_value) OVER (
+    ORDER BY type_id ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING
+  ) last_value_result,
+  NTH_VALUE(integer_value, 1) OVER (
+    ORDER BY type_id ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING
+  ) nth_value_result,
+  LAG(integer_value) OVER (ORDER BY type_id) lag_value,
+  LEAD(integer_value) OVER (ORDER BY type_id) lead_value,
+  RATIO_TO_REPORT(number_value) OVER () ratio_value
+FROM sq_oracle_editor_types;
+
+INSERT ALL
+  INTO sq_oracle_manual_log(id, category, payload, amount)
+    VALUES (1000, 'INSERT_ALL_A', JSON_OBJECT('kind' VALUE 'multi'), 40)
+  INTO sq_oracle_manual_log(id, category, payload, amount)
+    VALUES (1001, 'INSERT_ALL_B', JSON_OBJECT('kind' VALUE 'multi'), 50)
+SELECT 1 FROM dual;
+
+INSERT FIRST
+  WHEN value_amount < 100 THEN
+    INTO sq_oracle_manual_log(category, payload, amount)
+    VALUES ('INSERT_FIRST', JSON_OBJECT('kind' VALUE 'conditional'), value_amount)
+  ELSE
+    INTO sq_oracle_manual_log(category, payload, amount)
+    VALUES ('INSERT_ELSE', JSON_OBJECT('kind' VALUE 'conditional'), value_amount)
+SELECT 60 value_amount FROM dual;
+
+MERGE INTO sq_oracle_manual_log target
+USING (
+  SELECT 'DML' category, 25 amount FROM dual UNION ALL
+  SELECT 'MERGE_INSERT', 70 FROM dual
+) source
+ON (target.category = source.category)
+WHEN MATCHED THEN UPDATE SET
+  target.amount = source.amount,
+  target.payload = JSON_OBJECT('kind' VALUE 'merge-update')
+WHEN NOT MATCHED THEN INSERT (category, payload, amount)
+VALUES (source.category, JSON_OBJECT('kind' VALUE 'merge-insert'), source.amount);
+
+CALL sq_oracle_manual_pkg.run_compound();
+
+INSERT INTO sq_oracle_manual_child(log_id, note_text, embedding)
+SELECT id, 'vector child', TO_VECTOR('[1,2,3]')
+FROM sq_oracle_manual_log
+WHERE category = 'DDL';
+
+CREATE OR REPLACE VIEW sq_oracle_manual_v AS
+SELECT id, category, payload_kind, amount, sq_oracle_manual_fn(amount) amount_band
+FROM sq_oracle_manual_log
+WHERE amount >= 10
+WITH READ ONLY;
+ALTER VIEW sq_oracle_manual_v COMPILE;
+
+CREATE SYNONYM sq_oracle_manual_syn FOR sq_oracle_manual_v;
+ALTER SYNONYM sq_oracle_manual_syn COMPILE;
+
+CREATE PROPERTY GRAPH sq_oracle_manual_graph
+  VERTEX TABLES (
+    sq_oracle_manual_node
+      KEY (node_id)
+      LABEL node PROPERTIES (node_id, node_name)
+  )
+  EDGE TABLES (
+    sq_oracle_manual_edge
+      KEY (edge_id)
+      SOURCE KEY (source_node_id) REFERENCES sq_oracle_manual_node (node_id)
+      DESTINATION KEY (target_node_id) REFERENCES sq_oracle_manual_node (node_id)
+      LABEL owns PROPERTIES (edge_label, edge_weight)
+  );
+ALTER PROPERTY GRAPH sq_oracle_manual_graph COMPILE;
+
+CREATE MATERIALIZED VIEW LOG ON sq_oracle_manual_log
+  WITH PRIMARY KEY, ROWID (category, amount)
+  INCLUDING NEW VALUES;
+CREATE MATERIALIZED VIEW sq_oracle_manual_mv
+  BUILD IMMEDIATE
+  REFRESH COMPLETE ON DEMAND
+  AS SELECT category, SUM(amount) total_amount
+     FROM sq_oracle_manual_log
+     GROUP BY category;
+ALTER MATERIALIZED VIEW sq_oracle_manual_mv COMPILE;
+
+SAVEPOINT before_rollback;
+UPDATE sq_oracle_manual_log SET amount = amount + 1 WHERE category = 'DDL';
+DELETE FROM sq_oracle_manual_log WHERE category = 'NEVER_MATCHES';
+ROLLBACK TO before_rollback;
+COMMIT WRITE IMMEDIATE WAIT;
+
+SET TRANSACTION READ WRITE NAME 'sq-oracle-final';
+SET CONSTRAINTS ALL IMMEDIATE;
+LOCK TABLE sq_oracle_manual_log IN ROW SHARE MODE NOWAIT;
+SELECT id, category
+FROM sq_oracle_manual_log
+WHERE category = 'DDL'
+FOR UPDATE OF amount SKIP LOCKED;
+COMMIT;
+
+DECLARE
+  returned_amount NUMBER;
+BEGIN
+  UPDATE sq_oracle_manual_log
+  SET amount = amount
+  WHERE category = 'DDL'
+  RETURNING amount INTO returned_amount;
+  sq_oracle_manual_pkg.assert_true(returned_amount = 10, 'RETURNING');
+END;
+/
+
+DECLARE
+  dynamic_count PLS_INTEGER;
+BEGIN
+  EXECUTE IMMEDIATE
+    'SELECT COUNT(*) FROM sq_oracle_manual_log WHERE amount >= :1'
+    INTO dynamic_count USING 10;
+  sq_oracle_manual_pkg.assert_true(dynamic_count = 7, 'dynamic SQL');
+END;
+/
+
+EXPLAIN PLAN SET STATEMENT_ID = 'SQ_ORACLE_FINAL' FOR
+SELECT category, SUM(amount)
+FROM sq_oracle_manual_log
+GROUP BY category;
+SELECT operation, options, object_name
+FROM plan_table
+WHERE statement_id = 'SQ_ORACLE_FINAL'
+ORDER BY id;
+
+ANALYZE TABLE sq_oracle_manual_log
+  COMPUTE STATISTICS FOR TABLE FOR ALL INDEXED COLUMNS;
+UPDATE sq_oracle_manual_log SET amount = amount WHERE id = -1;
+COMMIT;
+
+WITH node_tree(node_id, parent_node_id, node_name, depth_no, node_path) AS (
+  SELECT node_id, parent_node_id, node_name, 0,
+         CAST('/' || node_name AS VARCHAR2(400))
+  FROM sq_oracle_manual_node
+  WHERE parent_node_id IS NULL
+  UNION ALL
+  SELECT n.node_id, n.parent_node_id, n.node_name, t.depth_no + 1,
+         t.node_path || '/' || n.node_name
+  FROM sq_oracle_manual_node n
+  JOIN node_tree t ON t.node_id = n.parent_node_id
+)
+SEARCH DEPTH FIRST BY node_name SET traversal_order
+CYCLE node_id SET cycle_mark TO 'Y' DEFAULT 'N'
+SELECT node_id, parent_node_id, node_name, depth_no, node_path, cycle_mark
+FROM node_tree
+ORDER BY traversal_order;
+
+SELECT node_id, parent_node_id, node_name,
+       LEVEL depth_no,
+       CONNECT_BY_ISLEAF leaf_flag,
+       SYS_CONNECT_BY_PATH(node_name, '/') node_path
+FROM sq_oracle_manual_node
+START WITH parent_node_id IS NULL
+CONNECT BY NOCYCLE PRIOR node_id = parent_node_id
+ORDER SIBLINGS BY node_name;
+
+SELECT m.metric_id, m.metric_name, tags.tag_no, tags.tag_value
+FROM sq_oracle_manual_metric m
+CROSS APPLY JSON_TABLE(
+  m.payload,
+  '$.tags[*]' COLUMNS (
+    tag_no FOR ORDINALITY,
+    tag_value VARCHAR2(32) PATH '$'
+  )
+) tags
+ORDER BY m.metric_id, tags.tag_no;
+
+SELECT x.section_name, x.section_value
+FROM sq_oracle_manual_lob l
+CROSS JOIN XMLTABLE(
+  '/manual/section'
+  PASSING l.xml_doc
+  COLUMNS
+    section_name VARCHAR2(32) PATH '@name',
+    section_value VARCHAR2(32) PATH 'text()'
+) x;
+
+SELECT node_id, metric_day, metric_name, metric_value,
+       SUM(metric_value) OVER (
+         PARTITION BY node_id
+         ORDER BY metric_day, metric_id
+         ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+       ) running_value,
+       LAG(metric_value, 1, 0) OVER (
+         PARTITION BY node_id ORDER BY metric_day, metric_id
+       ) previous_value,
+       DENSE_RANK() OVER (
+         PARTITION BY metric_name ORDER BY metric_value DESC
+       ) value_rank
+FROM sq_oracle_manual_metric
+ORDER BY node_id, metric_day;
+
+SELECT node_id, metric_name, SUM(metric_value) total_value,
+       GROUPING_ID(node_id, metric_name) grouping_value
+FROM sq_oracle_manual_metric
+GROUP BY GROUPING SETS ((node_id, metric_name), (node_id), ());
+
+SELECT node_id, metric_name, SUM(metric_value) total_value,
+       GROUPING(node_id) node_grouping,
+       GROUPING(metric_name) metric_grouping
+FROM sq_oracle_manual_metric
+GROUP BY CUBE(node_id, metric_name)
+ORDER BY node_id NULLS LAST, metric_name NULLS LAST;
+
+SELECT node_id, metric_name, SUM(metric_value) total_value
+FROM sq_oracle_manual_metric
+GROUP BY ROLLUP(node_id, metric_name)
+HAVING SUM(metric_value) > 0
+ORDER BY node_id NULLS LAST, metric_name NULLS LAST;
+
+SELECT metric_id, node_id, metric_value
+FROM sq_oracle_manual_metric
+MODEL
+  PARTITION BY (node_id)
+  DIMENSION BY (metric_id)
+  MEASURES (metric_value)
+  RULES UPSERT (
+    metric_value[999] = 0
+  )
+ORDER BY node_id, metric_id;
+
+SELECT metric_id, node_id, metric_value,
+       ROW_NUMBER() OVER (
+         PARTITION BY node_id ORDER BY metric_value DESC, metric_id
+       ) metric_rank
+FROM sq_oracle_manual_metric
+QUALIFY ROW_NUMBER() OVER (
+  PARTITION BY node_id ORDER BY metric_value DESC, metric_id
+) = 1
+ORDER BY node_id;
+
+SELECT metric_id, node_id, metric_value
+FROM sq_oracle_manual_metric PARTITION (p2026)
+ORDER BY metric_id
+OFFSET 0 ROWS FETCH NEXT 2 ROWS WITH TIES;
+
+SELECT metric_id, node_id, metric_value
+FROM sq_oracle_manual_metric SAMPLE (50) SEED (42)
+ORDER BY metric_id;
+
+SELECT *
+FROM (
+  SELECT node_id, metric_name, metric_value
+  FROM sq_oracle_manual_metric
+)
+PIVOT (
+  SUM(metric_value) FOR metric_name IN (
+    'LATENCY' AS latency,
+    'ERRORS' AS errors
+  )
+)
+ORDER BY node_id;
+
+SELECT node_id, metric_name, metric_value
+FROM (
+  SELECT 1 node_id, 10 latency, 2 errors FROM dual
+)
+UNPIVOT INCLUDE NULLS (
+  metric_value FOR metric_name IN (
+    latency AS 'LATENCY',
+    errors AS 'ERRORS'
+  )
+);
+
+SELECT node_id, match_no, first_day, last_day
+FROM sq_oracle_manual_metric
+MATCH_RECOGNIZE (
+  PARTITION BY node_id
+  ORDER BY metric_day
+  MEASURES
+    MATCH_NUMBER() AS match_no,
+    FIRST(start_row.metric_day) AS first_day,
+    LAST(rise_row.metric_day) AS last_day
+  ONE ROW PER MATCH
+  AFTER MATCH SKIP PAST LAST ROW
+  PATTERN (start_row rise_row*)
+  DEFINE rise_row AS rise_row.metric_value >= PREV(rise_row.metric_value)
+)
+ORDER BY node_id, match_no;
+
+SELECT n.node_id, n.node_name, top_metric.metric_name, top_metric.metric_value
+FROM sq_oracle_manual_node n
+OUTER APPLY (
+  SELECT metric_name, metric_value
+  FROM sq_oracle_manual_metric m
+  WHERE m.node_id = n.node_id
+  ORDER BY metric_value DESC, metric_id
+  FETCH FIRST 1 ROW ONLY
+) top_metric
+ORDER BY n.node_id;
+
+WITH
+FUNCTION classify_amount(p_amount NUMBER) RETURN VARCHAR2 IS
+BEGIN
+  RETURN CASE WHEN p_amount >= 50 THEN 'HIGH' ELSE 'LOW' END;
+END;
+SELECT category, classify_amount(amount) amount_class
+FROM sq_oracle_manual_log
+ORDER BY id;
+/
+
+(SELECT node_id FROM sq_oracle_manual_node WHERE parent_node_id IS NOT NULL)
+INTERSECT
+(SELECT node_id FROM sq_oracle_manual_metric WHERE metric_value >= 10)
+MINUS
+(SELECT node_id FROM sq_oracle_manual_node WHERE node_name = 'Never')
+ORDER BY node_id;
+
+SELECT l.category,
+       l.amount,
+       JSON_SERIALIZE(l.payload RETURNING VARCHAR2 PRETTY) payload_text,
+       c.note_text,
+       VECTOR_DISTANCE(c.embedding, TO_VECTOR('[1,1,1]'), COSINE) vector_distance
+FROM sq_oracle_manual_log l
+LEFT OUTER JOIN sq_oracle_manual_child c ON c.log_id = l.id
+ORDER BY l.id
+FETCH FIRST 10 ROWS ONLY;
+
+CREATE TABLE sq_oracle_editor_rename (id NUMBER) TABLESPACE users;
+RENAME sq_oracle_editor_rename TO sq_oracle_editor_renamed;
+DROP TABLE sq_oracle_editor_renamed PURGE;
+
+CREATE TABLE sq_oracle_editor_purge (id NUMBER) TABLESPACE users;
+DROP TABLE sq_oracle_editor_purge;
+PURGE TABLE sq_oracle_editor_purge;
+
+CREATE ROLE sq_oracle_manual_role NOT IDENTIFIED;
+GRANT SELECT ON sq_oracle_editor_types TO sq_oracle_manual_role;
+REVOKE SELECT ON sq_oracle_editor_types FROM sq_oracle_manual_role;
+SET ROLE NONE;
+SET ROLE ALL;
+DROP ROLE sq_oracle_manual_role;
+
+VARIABLE sq_oracle_flashback_scn NUMBER
+BEGIN
+  :sq_oracle_flashback_scn := DBMS_FLASHBACK.GET_SYSTEM_CHANGE_NUMBER;
+END;
+/
+SELECT COUNT(*) flashback_help_rows
+FROM system.help AS OF SCN :sq_oracle_flashback_scn;
+
+DECLARE
+  log_count PLS_INTEGER;
+  ddl_amount NUMBER;
+  node_count PLS_INTEGER;
+  metric_count PLS_INTEGER;
+  type_count PLS_INTEGER;
+  graph_count PLS_INTEGER;
+BEGIN
+  SELECT COUNT(*) INTO log_count FROM sq_oracle_manual_log;
+  SELECT amount INTO ddl_amount
+  FROM sq_oracle_manual_log
+  WHERE category = 'DDL';
+  SELECT COUNT(*) INTO node_count FROM sq_oracle_manual_node;
+  SELECT COUNT(*) INTO metric_count FROM sq_oracle_manual_metric;
+  SELECT COUNT(*) INTO type_count FROM sq_oracle_editor_types;
+  SELECT COUNT(*) INTO graph_count
+  FROM user_property_graphs
+  WHERE graph_name = 'SQ_ORACLE_MANUAL_GRAPH';
+  sq_oracle_manual_pkg.assert_true(
+    log_count = 7 AND sq_oracle_manual_pkg.row_count = 7,
+    'manual statement row count'
+  );
+  sq_oracle_manual_pkg.assert_true(
+    ddl_amount = 10,
+    'rollback'
+  );
+  sq_oracle_manual_pkg.assert_true(
+    node_count = 4,
+    'node data'
+  );
+  sq_oracle_manual_pkg.assert_true(
+    metric_count = 5,
+    'partition data'
+  );
+  sq_oracle_manual_pkg.assert_true(
+    type_count = 1,
+    'type matrix data'
+  );
+  sq_oracle_manual_pkg.assert_true(
+    graph_count = 1,
+    'property graph'
+  );
+END;
+/
+
+SELECT 'PASS' final_status,
+       banner_full server_version,
+       (SELECT COUNT(*) FROM sq_oracle_manual_log) manual_rows,
+       (SELECT COUNT(*) FROM sq_oracle_editor_types) type_rows
+FROM v$version
+WHERE banner_full LIKE 'Oracle%';
+
+PROMPT [ORACLE FINAL] PASS
+
+
+-- =========================================================
+-- IntelliSense sweep report generated by intellisense sweep
+-- source: test/final.sql
+-- db: Oracle
+-- metadata: test Oracle inferred catalog (file-scoped overlay) + Oracle built-ins
+-- checked: 2349
+-- suggestions checked: 9147
+-- missing: 0
+-- suggestions without type labels: 0
+-- marker: [[word]] means not suggested for the tested prefix
+-- missing tokens: none
+-- suggestions without type labels: none
+-- =========================================================

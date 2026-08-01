@@ -1,0 +1,723 @@
+DROP PROCEDURE IF EXISTS cfb_fail;
+
+DROP PROCEDURE IF EXISTS cfb_assert_true;
+
+DROP PROCEDURE IF EXISTS cfb_assert_eq_int;
+
+DROP PROCEDURE IF EXISTS cfb_assert_eq_decimal;
+
+DROP FUNCTION IF EXISTS cfb_fn_order_item_net;
+
+DROP FUNCTION IF EXISTS cfb_fn_customer_grade;
+
+DROP PROCEDURE IF EXISTS cfb_rebuild_monthly_summary;
+
+DROP PROCEDURE IF EXISTS cfb_cursor_inventory_scan;
+
+DROP PROCEDURE IF EXISTS cfb_make_test_order;
+
+DROP PROCEDURE IF EXISTS cfb_fail;
+
+DROP PROCEDURE IF EXISTS cfb_assert_true;
+
+DROP PROCEDURE IF EXISTS cfb_assert_eq_int;
+
+DROP PROCEDURE IF EXISTS cfb_build_temp_report;
+
+DROP PROCEDURE IF EXISTS cfb_make_paid_order;
+
+DROP FUNCTION IF EXISTS cfb_fn_net_amount;
+
+DROP FUNCTION IF EXISTS cfb_fn_status_name;
+
+/* #########################################################################
+   MariaDB Query Tool - COMMENT FINAL BOSS
+   목적:
+   - 다양한 주석이 극단적으로 섞여 있어도 statement split / delimiter 처리 /
+     프로시저 생성 / 동적 SQL / 트리거 / 트랜잭션 / 결과셋 반환이 정상 동작하는지 검증
+   - 자체 검증형 스크립트
+   - 중간에 틀리면 SIGNAL SQLSTATE '45000'
+   ######################################################################### */
+
+/* -------------------------------------------------------------------------
+   [중요]
+   아래 주석 안에는 일부러 위험한 토큰이 들어있다.
+   ; ; ; ; ;
+   BEGIN
+   END
+   CASE
+   WHEN
+   THEN
+   ELSE
+   DELIMITER //
+   DELIMITER ;
+   SELECT * FROM imaginary_table;
+   CALL something();
+   CREATE PROCEDURE x() BEGIN SELECT 1; END;
+   'single quote'
+   "double quote"
+   -- dash comment lookalike
+   /* nested-like text but not real nesting * /
+   ------------------------------------------------------------------------- */
+
+DROP VIEW IF EXISTS cfb_v_result;
+
+DROP TABLE IF EXISTS cfb_audit;
+
+DROP TABLE IF EXISTS cfb_item;
+
+DROP TABLE IF EXISTS cfb_order_hdr;
+
+DROP TABLE IF EXISTS cfb_user;
+
+DROP TABLE IF EXISTS cfb_assert_log;
+
+-- 한 줄 주석 테스트 ;;;;; SELECT 1; CALL broken(); END; DELIMITER //
+
+CREATE TABLE cfb_assert_log (
+    id          BIGINT       NOT NULL AUTO_INCREMENT PRIMARY KEY,
+    test_name   VARCHAR(200) NOT NULL,
+    detail_text LONGTEXT     NULL,
+    created_at  DATETIME(6)  NOT NULL DEFAULT CURRENT_TIMESTAMP(6)
+);
+
+/* 블록 주석 안의 세미콜론 테스트 ;;;
+   블록 주석 안의 SQL 흉내:
+   INSERT INTO x VALUES (1);
+   UPDATE x SET a = 1;
+   DELETE FROM x;
+*/
+
+CREATE TABLE cfb_user (
+    user_id      INT          NOT NULL PRIMARY KEY,
+    user_code    VARCHAR(30)  NOT NULL UNIQUE,
+    user_name    VARCHAR(200) NOT NULL,
+    status_code  CHAR(1)      NOT NULL DEFAULT 'A',
+    profile_json LONGTEXT     NULL,
+    note_text    LONGTEXT     NULL,
+    created_at   DATETIME(6)  NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+    CHECK (status_code IN ('A', 'I'))
+);
+
+CREATE TABLE cfb_order_hdr (
+    order_id     BIGINT                           NOT NULL PRIMARY KEY,
+    user_id      INT                              NOT NULL,
+    order_no     VARCHAR(40)                      NOT NULL UNIQUE,
+    order_status ENUM('NEW', 'PAID', 'CANCELLED') NOT NULL,
+    ordered_at   DATETIME(6)                      NOT NULL,
+    memo_text    LONGTEXT                         NULL,
+    payload_json LONGTEXT                         NULL,
+    created_at   DATETIME(6)                      NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+    CONSTRAINT fk_cfb_order_hdr_user FOREIGN KEY (user_id) REFERENCES cfb_user(user_id)
+);
+
+CREATE TABLE cfb_item (
+    item_id       BIGINT         NOT NULL PRIMARY KEY,
+    order_id      BIGINT         NOT NULL,
+    line_no       INT            NOT NULL,
+    item_name     VARCHAR(200)   NOT NULL,
+    qty           INT            NOT NULL,
+    unit_price    DECIMAL(18, 2) NOT NULL,
+    discount_rate DECIMAL(9, 4)  NOT NULL DEFAULT 0,
+    note_text     LONGTEXT       NULL,
+    created_at    DATETIME(6)    NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+    CONSTRAINT uq_cfb_item UNIQUE (order_id, line_no),
+    CONSTRAINT fk_cfb_item_order FOREIGN KEY (order_id) REFERENCES cfb_order_hdr(order_id),
+    CHECK (qty > 0),
+    CHECK (unit_price >= 0),
+    CHECK (discount_rate >= 0 AND discount_rate <= 1)
+);
+
+CREATE TABLE cfb_audit (
+    audit_id    BIGINT       NOT NULL AUTO_INCREMENT PRIMARY KEY,
+    entity_name VARCHAR(50)  NOT NULL,
+    entity_pk   VARCHAR(100) NOT NULL,
+    action_name VARCHAR(50)  NOT NULL,
+    detail_text LONGTEXT     NULL,
+    created_at  DATETIME(6)  NOT NULL DEFAULT CURRENT_TIMESTAMP(6)
+);
+
+/* -------------------------------------------------------------------------
+   데이터 적재부
+   여기서 note_text 안에는 주석처럼 보이는 문자열을 일부러 넣는다.
+   ------------------------------------------------------------------------- */
+
+INSERT INTO cfb_user (user_id, user_code, user_name, status_code, profile_json, note_text)
+VALUES (1, 'USR-001', 'Alpha', 'A', JSON_OBJECT('region', 'KR', 'tags', JSON_ARRAY('vip', 'beta'), 'commentish', '/* not a real comment */ -- still text ;'), 'Text with ; semicolon, -- line marker, /* block marker */, BEGIN END'),
+    (2, 'USR-002', 'Beta', 'A', JSON_OBJECT('region', 'US', 'tags', JSON_ARRAY('normal'), 'commentish', 'DELIMITER // ; SELECT x ;'), 'Another text "quoted" and ''single-quoted'' with ; ; ;'),
+    (3, 'USR-003', 'Gamma', 'I', JSON_OBJECT('region', 'JP', 'tags', JSON_ARRAY('inactive')), 'inactive user');
+
+INSERT INTO cfb_order_hdr (order_id, user_id, order_no, order_status, ordered_at, memo_text, payload_json)
+VALUES (1000, 1, 'ORD-CFB-0001', 'PAID', '2025-02-01 10:00:00.123456', 'memo ; -- /* */ BEGIN END', JSON_OBJECT('channel', 'online', 'priority', 1)),
+    (1001, 1, 'ORD-CFB-0002', 'PAID', '2025-02-02 11:00:00.654321', 'memo "quoted"', JSON_OBJECT('channel', 'partner', 'priority', 2)),
+    (1002, 2, 'ORD-CFB-0003', 'NEW', '2025-02-03 09:10:11.000001', 'pending ; not paid', JSON_OBJECT('channel', 'online'));
+
+INSERT INTO cfb_item (item_id, order_id, line_no, item_name, qty, unit_price, discount_rate, note_text)
+VALUES (10000, 1000, 1, 'CPU X', 2, 300.00, 0.10, 'item note with -- and /* */ and ;'),
+    (10001, 1000, 2, 'RAM Y', 4, 150.00, 0.00, 'plain note'),
+    (10002, 1001, 1, 'TOOL Z', 1, 700.00, 0.20, 'contains fake sql: SELECT * FROM t;'),
+    (10003, 1002, 1, 'PENDING ITEM', 5, 99.99, 0.05, 'new order item');
+
+-- -------------------------------------------------------------------------
+-- DELIMITER 변경 구간 시작
+-- -------------------------------------------------------------------------
+
+DELIMITER //
+
+/* 프로시저 앞 주석
+   CREATE PROCEDURE bad() BEGIN SELECT 1; END;
+   위 텍스트는 진짜 SQL이 아니어야 한다.
+*/
+CREATE PROCEDURE cfb_fail(IN p_message TEXT)
+BEGIN
+    /* BEGIN ; END ; CASE ; DELIMITER ; */
+    SET @cfb_fail_msg = LEFT(COALESCE(p_message, 'UNKNOWN FAILURE'), 128);
+    SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = @cfb_fail_msg;
+END//
+
+CREATE PROCEDURE cfb_assert_true(IN p_condition BOOLEAN, IN p_message TEXT)
+BEGIN
+    -- 한 줄 주석 안의 ; 는 실행 분리 기준이 아니어야 한다 ; ; ; ;
+    INSERT INTO cfb_assert_log (test_name, detail_text)
+    VALUES ('ASSERT_TRUE', CONCAT('condition=', IFNULL(CAST(p_condition AS CHAR), 'NULL'), ', message=', p_message));
+    IF COALESCE(p_condition, 0) = 0 THEN
+        CALL cfb_fail(CONCAT('ASSERT_TRUE FAILED: ', p_message));
+    END IF;
+END//
+
+CREATE PROCEDURE cfb_assert_eq_int(IN p_expected BIGINT, IN p_actual BIGINT, IN p_message TEXT)
+BEGIN
+    /* 주석 안 SQL 흉내
+       IF 1 = 1 THEN
+          SELECT 'broken';
+       END IF;
+    */
+    INSERT INTO cfb_assert_log (test_name, detail_text)
+    VALUES ('ASSERT_EQ_INT', CONCAT('expected=', p_expected, ', actual=', p_actual, ', message=', p_message));
+    IF COALESCE(p_expected, - 999999999) <> COALESCE(p_actual, - 999999999) THEN
+        CALL cfb_fail(
+            CONCAT('ASSERT_EQ_INT FAILED: ', p_message, ' [expected=', p_expected, ', actual=', p_actual, ']')
+        );
+    END IF;
+END//
+
+CREATE PROCEDURE cfb_assert_eq_decimal(
+    IN p_expected DECIMAL(30, 8),
+    IN p_actual DECIMAL(30, 8),
+    IN p_scale INT,
+    IN p_message TEXT
+)
+BEGIN
+    DECLARE v_expected DECIMAL(30, 8);
+    DECLARE v_actual DECIMAL(30, 8);
+    /* ;;;;; */
+    SET v_expected = ROUND(COALESCE(p_expected, 0), p_scale);
+    SET v_actual = ROUND(COALESCE(p_actual, 0), p_scale);
+    INSERT INTO cfb_assert_log (test_name, detail_text)
+    VALUES ('ASSERT_EQ_DECIMAL', CONCAT('expected=', v_expected, ', actual=', v_actual, ', scale=', p_scale, ', message=', p_message));
+    IF v_expected <> v_actual THEN
+        CALL cfb_fail(
+            CONCAT('ASSERT_EQ_DECIMAL FAILED: ', p_message, ' [expected=', v_expected, ', actual=', v_actual, ']')
+        );
+    END IF;
+END//
+
+CREATE FUNCTION cfb_fn_net_amount(
+    p_qty INT,
+    p_unit_price DECIMAL(18, 2),
+    p_discount_rate DECIMAL(9, 4)
+)
+RETURNS DECIMAL(18, 2)
+DETERMINISTIC
+BEGIN
+    -- "/* not comment */" 는 문자열이 아니라 주석이다? 아니다. 여기선 그냥 주석.
+    RETURN ROUND(p_qty * p_unit_price * (1 - p_discount_rate), 2);
+END//
+
+CREATE FUNCTION cfb_fn_status_name(p_status CHAR(1))
+RETURNS VARCHAR(20)
+DETERMINISTIC
+BEGIN
+    DECLARE v_name VARCHAR(20);
+    SET v_name =
+        CASE
+            WHEN p_status = 'A' THEN
+                'ACTIVE'
+            WHEN p_status = 'I' THEN
+                'INACTIVE'
+            ELSE
+                'UNKNOWN'
+        END;
+    RETURN v_name;
+END//
+
+CREATE TRIGGER trg_cfb_item_ai
+    AFTER INSERT
+    ON cfb_item
+    FOR EACH ROW
+BEGIN
+    /* 트리거 내부 주석 테스트
+       BEGIN
+       END
+       ;
+       CALL x();
+    */
+    INSERT INTO cfb_audit (entity_name, entity_pk, action_name, detail_text)
+    VALUES ('cfb_item', CAST(NEW.item_id AS CHAR), 'INSERT', CONCAT('order_id=', NEW.order_id, ', line_no=', NEW.line_no, ', qty=', NEW.qty, ', note=', COALESCE(NEW.note_text, 'NULL')));
+END//
+
+CREATE TRIGGER trg_cfb_item_au
+    AFTER UPDATE
+    ON cfb_item
+    FOR EACH ROW
+BEGIN
+    -- old/new 값 비교
+    INSERT INTO cfb_audit (entity_name, entity_pk, action_name, detail_text)
+    VALUES ('cfb_item', CAST(NEW.item_id AS CHAR), 'UPDATE', CONCAT('old_qty=', OLD.qty, ', new_qty=', NEW.qty, ', old_disc=', OLD.discount_rate, ', new_disc=', NEW.discount_rate));
+END//
+
+CREATE TRIGGER trg_cfb_item_ad
+    AFTER DELETE
+    ON cfb_item
+    FOR EACH ROW
+BEGIN
+    INSERT INTO cfb_audit (entity_name, entity_pk, action_name, detail_text)
+    VALUES ('cfb_item', CAST(OLD.item_id AS CHAR), 'DELETE', CONCAT('deleted item from order_id=', OLD.order_id));
+END//
+
+CREATE PROCEDURE cfb_make_paid_order(
+    IN p_order_id BIGINT,
+    IN p_user_id INT,
+    IN p_order_no VARCHAR(40),
+    IN p_ordered_at DATETIME(6),
+    IN p_item_name VARCHAR(200),
+    IN p_qty INT,
+    IN p_unit_price DECIMAL(18, 2),
+    IN p_discount_rate DECIMAL(9, 4)
+)
+BEGIN
+    DECLARE v_exists INT DEFAULT 0;
+    /* 일부러 긴 주석
+       여기 안의 세미콜론은 무시되어야 한다.
+       ;
+       ;
+       ;
+       fake END//
+       fake DELIMITER ;
+       fake CREATE TRIGGER ...
+    */
+    SELECT COUNT(*)
+    INTO v_exists
+    FROM cfb_user
+    WHERE user_id = p_user_id
+        AND status_code = 'A';
+    IF v_exists = 0 THEN
+        CALL cfb_fail(CONCAT('inactive or missing user: ', p_user_id));
+    END IF;
+    START TRANSACTION;
+    INSERT INTO cfb_order_hdr (order_id, user_id, order_no, order_status, ordered_at, memo_text, payload_json)
+    VALUES (p_order_id, p_user_id, p_order_no, 'PAID', p_ordered_at, 'generated by cfb_make_paid_order ; contains ''quote'' and -- text', JSON_OBJECT('source', 'proc', 'danger_text', '/* fake comment */ ; DELIMITER //'));
+    INSERT INTO cfb_item (item_id, order_id, line_no, item_name, qty, unit_price, discount_rate, note_text)
+    VALUES (p_order_id * 10, p_order_id, 1, p_item_name, p_qty, p_unit_price, p_discount_rate, 'generated item note ; -- /* */');
+    COMMIT;
+END//
+
+CREATE PROCEDURE cfb_build_temp_report()
+BEGIN
+    DECLARE v_sql LONGTEXT;
+    /* 동적 SQL 텍스트 안에 주석 문자처럼 보이는 것 넣기 */
+    SET v_sql = '
+        CREATE TEMPORARY TABLE tmp_cfb_report AS
+        SELECT
+            oh.user_id,
+            DATE_FORMAT(oh.ordered_at, ''%Y-%m'') AS ym,
+            COUNT(DISTINCT oh.order_id) AS order_count,
+            ROUND(SUM(cfb_fn_net_amount(i.qty, i.unit_price, i.discount_rate)), 2) AS net_amount
+        FROM cfb_order_hdr oh
+        JOIN cfb_item i
+          ON i.order_id = oh.order_id
+        WHERE oh.order_status = ''PAID''
+        GROUP BY oh.user_id, DATE_FORMAT(oh.ordered_at, ''%Y-%m'')
+    ';
+    PREPARE stmt
+    FROM v_sql;
+    EXECUTE stmt;
+    DEALLOCATE PREPARE stmt;
+END//
+
+DELIMITER ;
+
+-- -------------------------------------------------------------------------
+-- 뷰 생성
+-- -------------------------------------------------------------------------
+
+/* 뷰 정의 전 주석
+   SELECT ; ; ; END ; CALL ;
+*/
+
+CREATE OR REPLACE VIEW cfb_v_result AS
+    SELECT u.user_id,
+        u.user_code,
+        u.user_name,
+        cfb_fn_status_name(u.status_code) AS user_status_name,
+        COALESCE(x.paid_order_count, 0) AS paid_order_count,
+        COALESCE(x.total_net_amount, 0.00) AS total_net_amount,
+    CASE
+        WHEN COALESCE(x.total_net_amount, 0) >= 1500 THEN 'TOP'
+        WHEN COALESCE(x.total_net_amount, 0) >= 500 THEN 'MID'
+        WHEN COALESCE(x.total_net_amount, 0) > 0 THEN 'LOW'
+        ELSE 'NONE'
+    END AS spend_band
+    FROM cfb_user u
+    LEFT JOIN (
+        SELECT oh.user_id,
+            COUNT(DISTINCT oh.order_id) AS paid_order_count,
+            ROUND(SUM(cfb_fn_net_amount(i.qty, i.unit_price, i.discount_rate)), 2) AS total_net_amount
+        FROM cfb_order_hdr oh
+        JOIN cfb_item i
+            ON i.order_id = oh.order_id
+        WHERE oh.order_status = 'PAID'
+        GROUP BY oh.user_id
+    ) x
+        ON x.user_id = u.user_id;
+
+-- -------------------------------------------------------------------------
+-- 트랜잭션 + 트리거 + 롤백 검증
+-- -------------------------------------------------------------------------
+
+START TRANSACTION;
+
+/* 롤백될 테스트 */
+
+INSERT INTO cfb_order_hdr (order_id, user_id, order_no, order_status, ordered_at, memo_text, payload_json)
+VALUES (2000, 1, 'ORD-CFB-ROLLBACK-01', 'PAID', '2025-02-10 01:02:03.444444', 'rollback test', JSON_OBJECT('source', 'rollback'));
+
+INSERT INTO cfb_item (item_id, order_id, line_no, item_name, qty, unit_price, discount_rate, note_text)
+VALUES (20000, 2000, 1, 'ROLLBACK ITEM', 3, 123.45, 0.10, 'should rollback audit too');
+
+UPDATE cfb_item
+SET qty = 4
+WHERE item_id = 20000;
+
+DELETE FROM cfb_item
+WHERE item_id = 20000;
+
+ROLLBACK;
+
+-- -------------------------------------------------------------------------
+-- 실제 커밋될 프로시저 기반 데이터 생성
+-- -------------------------------------------------------------------------
+
+CALL cfb_make_paid_order(
+    3000,
+    1,
+    'ORD-CFB-PROC-01',
+    '2025-02-11 10:10:10.100100',
+    'PROC ITEM A',
+    2,
+    500.00,
+    0.10
+);
+
+CALL cfb_make_paid_order(
+    3001,
+    2,
+    'ORD-CFB-PROC-02',
+    '2025-02-12 11:11:11.200200',
+    'PROC ITEM B',
+    1,
+    800.00,
+    0.25
+);
+
+-- -------------------------------------------------------------------------
+-- 복합 검증
+-- -------------------------------------------------------------------------
+
+CALL cfb_assert_eq_int(
+    3,
+    (
+        SELECT COUNT(*)
+        FROM cfb_user
+    ),
+    'user count'
+);
+
+CALL cfb_assert_eq_int(
+    5,
+    (
+        SELECT COUNT(*)
+        FROM cfb_order_hdr
+        WHERE order_status = 'PAID'
+    ) + (
+        SELECT COUNT(*)
+        FROM cfb_order_hdr
+        WHERE order_status = 'NEW'
+    ),
+    'basic order count total by statuses used in test'
+);
+
+CALL cfb_assert_eq_int(
+    0,
+    (
+        SELECT COUNT(*)
+        FROM cfb_audit
+        WHERE entity_pk = '20000'
+    ),
+    'rollback should remove trigger audit rows'
+);
+
+CALL cfb_assert_eq_int(
+    2,
+    (
+        SELECT COUNT(*)
+        FROM cfb_order_hdr
+        WHERE order_id IN (3000, 3001)
+                AND order_status = 'PAID'
+    ),
+    'generated paid orders count'
+);
+
+CALL cfb_assert_eq_decimal(
+    540.00,
+    cfb_fn_net_amount(2, 300.00, 0.10),
+    2,
+    'net amount function'
+);
+
+CALL cfb_assert_true(
+    (
+        SELECT cfb_fn_status_name(status_code)
+        FROM cfb_user
+        WHERE user_id = 1
+    ) = 'ACTIVE',
+    'status function active user'
+);
+
+CALL cfb_assert_true(
+    EXISTS (
+        SELECT 1
+        FROM cfb_v_result
+        WHERE user_id = 1
+                AND spend_band IN ('MID', 'TOP')
+    ),
+    'view classification for user 1'
+);
+
+-- JSON 추출 검증
+
+SELECT JSON_UNQUOTE(JSON_EXTRACT(profile_json, '$.region'))
+INTO @cfb_region_1
+FROM cfb_user
+WHERE user_id = 1;
+
+CALL cfb_assert_true(
+    @cfb_region_1 = 'KR',
+    'json region extract'
+);
+
+SELECT JSON_LENGTH(JSON_EXTRACT(profile_json, '$.tags'))
+INTO @cfb_tag_count_1
+FROM cfb_user
+WHERE user_id = 1;
+
+CALL cfb_assert_eq_int(
+    2,
+    @cfb_tag_count_1,
+    'json tag count'
+);
+
+-- 문자열 내부의 주석 기호는 문자열이어야 함
+
+SET @comment_like_text = 'This is text: -- not comment ; /* not block */ END ; DELIMITER //';
+
+CALL cfb_assert_true(
+    LOCATE('--', @comment_like_text) > 0,
+    'string containing line comment marker'
+);
+
+CALL cfb_assert_true(
+    LOCATE('/*', @comment_like_text) > 0,
+    'string containing block comment marker'
+);
+
+CALL cfb_assert_true(
+    LOCATE(';', @comment_like_text) > 0,
+    'string containing semicolon'
+);
+
+-- WITH RECURSIVE + 주석
+
+WITH RECURSIVE seq AS (
+    SELECT 1 AS n
+    UNION ALL
+    SELECT n + 1
+    FROM seq
+    WHERE n < 7
+)
+SELECT COUNT(*)
+INTO @seq_count
+FROM seq;
+
+CALL cfb_assert_eq_int(
+    7,
+    @seq_count,
+    'recursive cte count'
+);
+
+-- 윈도우 함수 테스트
+
+WITH paid_line AS (
+    SELECT
+        oh.user_id,
+        oh.order_id,
+        i.item_id,
+        cfb_fn_net_amount(i.qty, i.unit_price, i.discount_rate) AS net_amount
+    FROM cfb_order_hdr oh
+    JOIN cfb_item i
+        ON i.order_id = oh.order_id
+    WHERE oh.order_status = 'PAID'
+),
+ranked AS (
+    SELECT
+        p.*,
+        ROW_NUMBER() OVER (
+            PARTITION BY p.user_id
+            ORDER BY p.net_amount DESC,
+            p.item_id
+        ) AS rn
+    FROM paid_line p
+)
+SELECT COUNT(*)
+INTO @top_line_count
+FROM ranked
+WHERE rn = 1;
+
+CALL cfb_assert_eq_int(
+    2,
+    @top_line_count,
+    'top line count for users with paid orders'
+);
+
+-- 동적 SQL + temporary table
+
+CALL cfb_build_temp_report();
+
+CALL cfb_assert_true(
+    (
+        SELECT COUNT(*)
+        FROM tmp_cfb_report
+    ) >= 2,
+    'temporary report row count'
+);
+
+DROP TEMPORARY TABLE IF EXISTS tmp_cfb_report;
+
+-- -------------------------------------------------------------------------
+-- 복잡한 주석이 문장 중간에 들어가는 형태
+-- -------------------------------------------------------------------------
+
+SELECT 1 /* inline block ; BEGIN END ; */ + 2 /* another block comment */ + 3
+INTO @inline_sum;
+
+CALL cfb_assert_eq_int(
+    6,
+    @inline_sum,
+    'inline comment arithmetic'
+);
+
+SELECT SUM(v.net_amount)
+INTO @sum_paid_net
+FROM (
+        SELECT
+        /* comment before expression */
+            cfb_fn_net_amount(i.qty, i.unit_price, i.discount_rate) AS net_amount
+        FROM cfb_order_hdr oh
+        JOIN cfb_item i
+            ON i.order_id = oh.order_id
+        WHERE oh.order_status = 'PAID' /* trailing block comment ; */
+    ) v;
+
+CALL cfb_assert_true(
+    @sum_paid_net > 0,
+    'sum paid net amount positive'
+);
+
+-- -------------------------------------------------------------------------
+-- 멀티 결과셋 반환
+-- -------------------------------------------------------------------------
+
+SELECT 'AUDIT_ROWS' AS section_name,
+    audit_id,
+    entity_name,
+    entity_pk,
+    action_name,
+    detail_text,
+    created_at
+FROM cfb_audit
+ORDER BY audit_id;
+
+SELECT 'VIEW_RESULT' AS section_name,
+    user_id,
+    user_code,
+    user_name,
+    user_status_name,
+    paid_order_count,
+    total_net_amount,
+    spend_band
+FROM cfb_v_result
+ORDER BY user_id;
+
+WITH paid_summary AS (
+    SELECT
+        oh.user_id,
+        COUNT(DISTINCT oh.order_id) AS paid_orders,
+        ROUND(SUM(cfb_fn_net_amount(i.qty, i.unit_price, i.discount_rate)), 2) AS paid_net
+    FROM cfb_order_hdr oh
+    JOIN cfb_item i
+        ON i.order_id = oh.order_id
+    WHERE oh.order_status = 'PAID'
+    GROUP BY oh.user_id
+)
+SELECT
+    'PAID_SUMMARY' AS section_name,
+    user_id,
+    paid_orders,
+    paid_net
+FROM paid_summary
+ORDER BY user_id;
+
+SELECT 'FINAL_STATUS' AS section_name,
+    'PASS' AS result_status,
+    NOW(6) AS executed_at,
+    (
+        SELECT COUNT(*)
+        FROM cfb_assert_log
+    ) AS assertion_rows,
+    (
+        SELECT COUNT(*)
+        FROM cfb_audit
+    ) AS audit_rows,
+    (
+        SELECT COUNT(*)
+        FROM cfb_order_hdr
+    ) AS total_orders,
+    (
+        SELECT COUNT(*)
+        FROM cfb_item
+    ) AS total_items;
+
+
+-- =========================================================
+-- IntelliSense sweep report generated by intellisense sweep
+-- source: test_mariadb/test8.txt
+-- db: MariaDB
+-- metadata: test_mariadb/test8.txt inferred catalog
+-- checked: 951
+-- suggestions checked: 4270
+-- missing: 0
+-- suggestions without type labels: 0
+-- marker: [[word]] means not suggested for the tested prefix
+-- missing tokens: none
+-- suggestions without type labels: none
+-- =========================================================

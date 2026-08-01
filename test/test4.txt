@@ -1,0 +1,183 @@
+-- =========================================================
+-- exec_procedure_test.sql
+-- 목적: EXEC(=EXECUTE)로 프로시저 호출이 정상 동작하는지 검증
+-- =========================================================
+
+
+PROMPT ==========================================
+PROMPT [1] 준비: 테스트 오브젝트 정리
+PROMPT ==========================================
+
+BEGIN
+  EXECUTE IMMEDIATE 'DROP TABLE oqt_exec_test PURGE';
+EXCEPTION WHEN OTHERS THEN NULL;
+END;
+/
+
+BEGIN
+  EXECUTE IMMEDIATE 'DROP PACKAGE oqt_exec_demo_pkg';
+EXCEPTION WHEN OTHERS THEN NULL;
+END;
+/
+
+PROMPT ==========================================
+PROMPT [2] 테이블/패키지 생성
+PROMPT ==========================================
+
+CREATE TABLE oqt_exec_test (
+  id         NUMBER PRIMARY KEY,
+  tag        VARCHAR2(30),
+  msg        VARCHAR2(4000),
+  created_at DATE DEFAULT SYSDATE
+);
+
+CREATE OR REPLACE PACKAGE oqt_exec_demo_pkg AS
+  -- 단순 IN
+  PROCEDURE p_simple(p_id IN NUMBER, p_msg IN VARCHAR2);
+
+  -- DEFAULT + OUT + IN OUT
+  PROCEDURE p_mix(
+    p_id      IN     NUMBER,
+    p_in_txt  IN     VARCHAR2 DEFAULT 'DEF',
+    p_out_txt OUT    VARCHAR2,
+    p_inout_n IN OUT NUMBER
+  );
+
+  -- 오버로드(파라미터 수/타입 차이)
+  PROCEDURE p_over(p_id IN NUMBER);
+  PROCEDURE p_over(p_tag IN VARCHAR2, p_id IN NUMBER);
+
+  -- 예외 발생 테스트
+  PROCEDURE p_raise(p_code IN NUMBER);
+
+  -- REFCURSOR 반환
+  PROCEDURE p_rc(p_tag IN VARCHAR2, p_rc OUT SYS_REFCURSOR);
+END oqt_exec_demo_pkg;
+/
+
+SHOW ERRORS
+
+CREATE OR REPLACE PACKAGE BODY oqt_exec_demo_pkg AS
+  PROCEDURE p_simple(p_id IN NUMBER, p_msg IN VARCHAR2) IS
+  BEGIN
+    INSERT INTO oqt_exec_test(id, tag, msg) VALUES (p_id, 'SIMPLE', p_msg);
+    DBMS_OUTPUT.PUT_LINE('[p_simple] inserted id='||p_id||', msg='||p_msg);
+  END;
+
+  PROCEDURE p_mix(
+    p_id      IN     NUMBER,
+    p_in_txt  IN     VARCHAR2 DEFAULT 'DEF',
+    p_out_txt OUT    VARCHAR2,
+    p_inout_n IN OUT NUMBER
+  ) IS
+  BEGIN
+    p_out_txt := 'ID='||p_id||', IN='||p_in_txt||', INOUT='||NVL(p_inout_n,0);
+    p_inout_n := NVL(p_inout_n,0) + p_id;
+
+    INSERT INTO oqt_exec_test(id, tag, msg) VALUES (p_id, 'MIX', p_out_txt);
+
+    DBMS_OUTPUT.PUT_LINE('[p_mix] out='||p_out_txt||', new_inout='||p_inout_n);
+  END;
+
+  PROCEDURE p_over(p_id IN NUMBER) IS
+  BEGIN
+    INSERT INTO oqt_exec_test(id, tag, msg) VALUES (p_id, 'OVER1', 'only id');
+    DBMS_OUTPUT.PUT_LINE('[p_over#1] id='||p_id);
+  END;
+
+  PROCEDURE p_over(p_tag IN VARCHAR2, p_id IN NUMBER) IS
+  BEGIN
+    INSERT INTO oqt_exec_test(id, tag, msg) VALUES (p_id, 'OVER2', p_tag);
+    DBMS_OUTPUT.PUT_LINE('[p_over#2] tag='||p_tag||', id='||p_id);
+  END;
+
+  PROCEDURE p_raise(p_code IN NUMBER) IS
+  BEGIN
+    IF p_code = 1 THEN
+      RAISE_APPLICATION_ERROR(-20001, 'demo error from p_raise');
+    ELSIF p_code = 2 THEN
+      -- 의도적으로 SQL 에러 유발
+      EXECUTE IMMEDIATE 'select 1/0 from dual';
+    END IF;
+
+    DBMS_OUTPUT.PUT_LINE('[p_raise] no error for code='||p_code);
+  END;
+
+  PROCEDURE p_rc(p_tag IN VARCHAR2, p_rc OUT SYS_REFCURSOR) IS
+  BEGIN
+    OPEN p_rc FOR
+      SELECT id, tag, msg, created_at
+      FROM oqt_exec_test
+      WHERE tag LIKE p_tag
+      ORDER BY id;
+    DBMS_OUTPUT.PUT_LINE('[p_rc] opened refcursor for tag like '||p_tag);
+  END;
+END oqt_exec_demo_pkg;
+/
+
+SHOW ERRORS
+
+PROMPT ==========================================
+PROMPT [3] EXEC 호출 테스트 (핵심)
+PROMPT ==========================================
+
+PROMPT -- 3-1) 기본 EXEC (IN 파라미터)
+EXEC oqt_exec_demo_pkg.p_simple(1, 'hello exec');
+
+PROMPT -- 3-2) DEFAULT 파라미터 동작 + OUT/INOUT 바인드
+VARIABLE v_out VARCHAR2(4000)
+VARIABLE v_inout NUMBER
+EXEC :v_inout := 10;
+
+EXEC oqt_exec_demo_pkg.p_mix(2, p_out_txt => :v_out, p_inout_n => :v_inout);
+PRINT v_out
+PRINT v_inout
+
+PROMPT -- 3-3) DEFAULT 사용 확인(두 번째 파라미터 생략)
+EXEC oqt_exec_demo_pkg.p_mix(3, p_out_txt => :v_out, p_inout_n => :v_inout);
+PRINT v_out
+PRINT v_inout
+
+PROMPT -- 3-4) Named parameter 호출(순서 바꿔도 되는지)
+EXEC oqt_exec_demo_pkg.p_mix(p_id => 4, p_inout_n => :v_inout, p_out_txt => :v_out, p_in_txt => 'NAMED');
+PRINT v_out
+PRINT v_inout
+
+PROMPT -- 3-5) 오버로드 호출 확인
+EXEC oqt_exec_demo_pkg.p_over(5);
+EXEC oqt_exec_demo_pkg.p_over('tagged-overload', 6);
+
+PROMPT -- 3-6) 예외 발생 확인(에러를 툴이 정상 표기하는지)
+BEGIN
+  oqt_exec_demo_pkg.p_raise(1);
+EXCEPTION WHEN OTHERS THEN
+  DBMS_OUTPUT.PUT_LINE('[p_raise expected] '||SQLERRM);
+END;
+/
+
+PROMPT -- 3-7) REFCURSOR 바인드 + PRINT 확인
+VARIABLE v_rc REFCURSOR
+EXEC oqt_exec_demo_pkg.p_rc('%', :v_rc);
+PRINT v_rc
+
+PROMPT ==========================================
+PROMPT [4] 결과 검증 쿼리
+PROMPT ==========================================
+
+SELECT tag, COUNT(*) cnt
+FROM oqt_exec_test
+GROUP BY tag
+ORDER BY tag;
+
+SELECT *
+FROM oqt_exec_test
+ORDER BY id;
+
+PROMPT ==========================================
+PROMPT [5] 정리(선택)
+PROMPT ==========================================
+-- 필요하면 아래 주석 해제
+-- DROP PACKAGE oqt_exec_demo_pkg;
+-- DROP TABLE oqt_exec_test PURGE;
+
+PROMPT DONE.

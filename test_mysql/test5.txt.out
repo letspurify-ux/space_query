@@ -1,0 +1,311 @@
+-- ============================================================================
+-- SPACE QUERY MYSQL AUTO-FORMAT CERTIFICATION GAUNTLET II
+-- Target: MySQL 8.0.31+
+--
+-- Intentionally hostile layout. This complementary boss stresses features not
+-- concentrated in test4: invisible columns/indexes, functional and multi-valued
+-- indexes, RANGE partitions, LATERAL, VALUES ROW, GROUPING, three loop forms,
+-- JSON schema checks, multi-table DML, and NOWAIT locking.
+-- ============================================================================
+
+DROP DATABASE IF EXISTS sq_mysql_format_cert_2;
+CREATE DATABASE sq_mysql_format_cert_2 CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_ai_ci;
+USE sq_mysql_format_cert_2;
+SET NAMES utf8mb4;
+SET SESSION sql_mode='STRICT_TRANS_TABLES,ERROR_FOR_DIVISION_BY_ZERO,NO_ENGINE_SUBSTITUTION';
+SET @lexical_trap='LATERAL( VALUES ROW(1) ) DELIMITER $$ START TRANSACTION; # inert';
+
+/* tokenizer traps: MEMBER OF(), JSON_TABLE(), PARTITION(), END$$ and VALUES ROW
+   are text here; quoted comment markers '--', '#', and '/* * /' stay inert. */
+
+CREATE TABLE mx_account(
+account_id BIGINT NOT NULL,
+email VARCHAR(120)NOT NULL,
+secret_token VARBINARY(32)INVISIBLE,
+profile JSON NOT NULL,
+email_norm VARCHAR(120)GENERATED ALWAYS AS(LOWER(TRIM(email)))STORED,
+region_code VARCHAR(12)GENERATED ALWAYS AS(JSON_UNQUOTE(JSON_EXTRACT(profile,'$.region')))VIRTUAL,
+created_at TIMESTAMP(6)NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+PRIMARY KEY(account_id),
+UNIQUE KEY uk_mx_account_email(email_norm),
+KEY ix_mx_account_region(region_code),
+KEY ix_mx_account_lower((LOWER(email)))INVISIBLE,
+CONSTRAINT chk_mx_account_profile CHECK(JSON_VALID(profile))
+)ENGINE=InnoDB;
+
+CREATE TABLE mx_document(
+doc_id BIGINT NOT NULL,
+account_id BIGINT NOT NULL,
+doc_key VARCHAR(50)NOT NULL,
+doc_status ENUM('NEW','READY','ARCHIVED')NOT NULL DEFAULT 'NEW',
+score DECIMAL(10,2)NOT NULL,
+payload JSON NOT NULL,
+created_at DATETIME(6)NOT NULL,
+kind_code VARCHAR(30)GENERATED ALWAYS AS(JSON_UNQUOTE(JSON_EXTRACT(payload,'$.kind')))STORED,
+PRIMARY KEY(doc_id),
+UNIQUE KEY uk_mx_document_key(doc_key),
+KEY ix_mx_document_account_score(account_id,score DESC),
+KEY ix_mx_document_kind((CAST(JSON_UNQUOTE(JSON_EXTRACT(payload,'$.kind'))AS CHAR(30)))),
+KEY ix_mx_document_tags((CAST(payload->'$.tags' AS CHAR(24)ARRAY))),
+CONSTRAINT fk_mx_document_account FOREIGN KEY(account_id)REFERENCES mx_account(account_id),
+CONSTRAINT chk_mx_document_score CHECK(score BETWEEN 0 AND 100),
+CONSTRAINT chk_mx_document_schema CHECK(JSON_SCHEMA_VALID('{"type":"object","required":["kind","tags"],"properties":{"kind":{"type":"string"},"tags":{"type":"array","items":{"type":"string"}}}}',payload))
+)ENGINE=InnoDB;
+
+CREATE TABLE mx_reading(
+reading_id BIGINT NOT NULL,
+account_id BIGINT NOT NULL,
+captured_on DATE NOT NULL,
+reading_kind VARCHAR(30)NOT NULL,
+reading_value DECIMAL(14,3)NOT NULL,
+attributes JSON NOT NULL,
+PRIMARY KEY(reading_id,captured_on),
+KEY ix_mx_reading_account_date(account_id,captured_on),
+CONSTRAINT chk_mx_reading_attributes CHECK(JSON_VALID(attributes))
+)ENGINE=InnoDB
+PARTITION BY RANGE COLUMNS(captured_on)(
+PARTITION p_before_2026 VALUES LESS THAN('2026-01-01'),
+PARTITION p_2026_q1 VALUES LESS THAN('2026-04-01'),
+PARTITION p_2026_q2 VALUES LESS THAN('2026-07-01'),
+PARTITION p_2026_q3 VALUES LESS THAN('2026-10-01'),
+PARTITION p_max VALUES LESS THAN(MAXVALUE)
+);
+
+CREATE TABLE mx_rollup(
+account_id BIGINT NOT NULL,
+document_count BIGINT NOT NULL,
+reading_total DECIMAL(18,3)NOT NULL,
+evidence JSON NOT NULL,
+PRIMARY KEY(account_id),
+CONSTRAINT fk_mx_rollup_account FOREIGN KEY(account_id)REFERENCES mx_account(account_id)
+)ENGINE=InnoDB;
+
+CREATE TABLE mx_error_log(
+log_id BIGINT NOT NULL AUTO_INCREMENT,
+phase_name VARCHAR(80)NOT NULL,
+sql_state CHAR(5),
+error_no INT,
+message_text VARCHAR(512),
+PRIMARY KEY(log_id)
+)ENGINE=InnoDB;
+
+DELIMITER $$
+
+CREATE FUNCTION mx_score_band(p_score DECIMAL(10,2))
+RETURNS VARCHAR(20)
+DETERMINISTIC
+BEGIN
+RETURN CASE WHEN p_score>=90 THEN'ELITE'WHEN p_score>=60 THEN'STRONG'WHEN p_score>=30 THEN'NORMAL'ELSE'LOW'END;
+END$$
+
+CREATE PROCEDURE mx_assert_2(IN p_condition BOOLEAN,IN p_message VARCHAR(255))
+BEGIN
+IF COALESCE(p_condition,FALSE)=FALSE THEN SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT=p_message;END IF;
+END$$
+
+CREATE TRIGGER mx_document_bi BEFORE INSERT ON mx_document FOR EACH ROW
+BEGIN
+SET NEW.doc_status=UPPER(TRIM(NEW.doc_status));
+IF NEW.score<0 OR NEW.score>100 OR JSON_VALID(NEW.payload)=0 THEN
+SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT='invalid document';
+END IF;
+END$$
+
+CREATE PROCEDURE mx_run_gauntlet_2()
+main_block:BEGIN
+DECLARE v_i INT DEFAULT 0;
+DECLARE v_repeat INT DEFAULT 0;
+DECLARE v_running DECIMAL(18,3)DEFAULT 0;
+DECLARE v_state CHAR(5);
+DECLARE v_errno INT;
+DECLARE v_message VARCHAR(512);
+DECLARE duplicate_key CONDITION FOR 1062;
+DECLARE EXIT HANDLER FOR SQLEXCEPTION
+BEGIN
+GET STACKED DIAGNOSTICS CONDITION 1 v_state=RETURNED_SQLSTATE,v_errno=MYSQL_ERRNO,v_message=MESSAGE_TEXT;
+ROLLBACK;
+INSERT INTO mx_error_log(phase_name,sql_state,error_no,message_text)VALUES('UNEXPECTED',v_state,v_errno,v_message);
+RESIGNAL;
+END;
+
+START TRANSACTION;
+SAVEPOINT before_loops;
+WHILE v_i<3 DO
+SET v_i=v_i+1;
+UPDATE mx_account SET profile=JSON_SET(profile,CONCAT('$.while_',v_i),v_i)WHERE account_id=v_i;
+END WHILE;
+
+REPEAT
+SET v_repeat=v_repeat+1;
+SET v_running=v_running+v_repeat*0.125;
+UNTIL v_repeat>=3 END REPEAT;
+
+SET v_i=0;
+scan_loop:LOOP
+SET v_i=v_i+1;
+IF v_i=2 THEN ITERATE scan_loop;END IF;
+SET v_running=v_running+CASE v_i WHEN 1 THEN 10 WHEN 3 THEN 30 ELSE 5 END;
+IF v_i>=4 THEN LEAVE scan_loop;END IF;
+END LOOP scan_loop;
+
+duplicate_probe:BEGIN
+DECLARE CONTINUE HANDLER FOR duplicate_key
+BEGIN
+GET DIAGNOSTICS CONDITION 1 v_state=RETURNED_SQLSTATE,v_errno=MYSQL_ERRNO,v_message=MESSAGE_TEXT;
+INSERT INTO mx_error_log(phase_name,sql_state,error_no,message_text)VALUES('EXPECTED_DUPLICATE',v_state,v_errno,v_message);
+END;
+INSERT INTO mx_document(doc_id,account_id,doc_key,doc_status,score,payload,created_at)
+VALUES(999,1,'doc-a-1','new',1,JSON_OBJECT('kind','duplicate','tags',JSON_ARRAY('trap')),NOW(6));
+END duplicate_probe;
+
+INSERT INTO mx_rollup(account_id,document_count,reading_total,evidence)
+SELECT a.account_id,
+(SELECT COUNT(*)FROM mx_document d WHERE d.account_id=a.account_id),
+COALESCE((SELECT SUM(r.reading_value)FROM mx_reading r WHERE r.account_id=a.account_id),0),
+JSON_OBJECT('email',a.email_norm,'vip_docs',(SELECT COUNT(*)FROM mx_document vd WHERE vd.account_id=a.account_id AND 'vip'MEMBER OF(vd.payload->'$.tags')))
+FROM mx_account a
+ON DUPLICATE KEY UPDATE document_count=VALUES(document_count),reading_total=VALUES(reading_total),evidence=VALUES(evidence);
+
+SET @mx_dynamic_sql=CONCAT('CREATE TEMPORARY TABLE mx_top_document AS ',
+'SELECT account_id,doc_id,score FROM (SELECT account_id,doc_id,score,',
+'ROW_NUMBER() OVER(PARTITION BY account_id ORDER BY score DESC,doc_id) rn FROM mx_document) x WHERE rn=1');
+PREPARE mx_dynamic_stmt FROM @mx_dynamic_sql;
+EXECUTE mx_dynamic_stmt;
+DEALLOCATE PREPARE mx_dynamic_stmt;
+CALL mx_assert_2((SELECT COUNT(*)FROM mx_top_document)=3,'top document count');
+CALL mx_assert_2(v_running>40,'loop accumulator');
+COMMIT;
+END main_block$$
+
+DELIMITER ;
+
+INSERT INTO mx_account(account_id,email,secret_token,profile)VALUES
+(1,' Alice@Example.COM ',UNHEX(SHA2('alice-secret',256)),JSON_OBJECT('region','KR','flags',JSON_ARRAY('admin','beta'))),
+(2,'bob@example.com',UNHEX(SHA2('bob-secret',256)),JSON_OBJECT('region','US','flags',JSON_ARRAY('buyer'))),
+(3,'carol@example.com',UNHEX(SHA2('carol-secret',256)),JSON_OBJECT('region','DE','flags',JSON_ARRAY('analyst','beta')));
+
+INSERT INTO mx_document(doc_id,account_id,doc_key,doc_status,score,payload,created_at)VALUES
+(101,1,'doc-a-1','new',92.5,JSON_OBJECT('kind','invoice','tags',JSON_ARRAY('vip','new'),'lines',JSON_ARRAY(JSON_OBJECT('sku','A','qty',2,'price',30),JSON_OBJECT('sku','B','qty',1,'price',32.5))),'2026-01-05 09:00:00.000001'),
+(102,1,'doc-a-2','ready',45,JSON_OBJECT('kind','audit','tags',JSON_ARRAY('review'),'lines',JSON_ARRAY(JSON_OBJECT('sku','C','qty',1,'price',45))),'2026-02-06 10:00:00.000002'),
+(103,2,'doc-b-1','ready',70,JSON_OBJECT('kind','invoice','tags',JSON_ARRAY('vip'),'lines',JSON_ARRAY(JSON_OBJECT('sku','D','qty',2,'price',35))),'2026-03-07 11:00:00.000003'),
+(104,3,'doc-c-1','archived',55,JSON_OBJECT('kind','report','tags',JSON_ARRAY('basic'),'lines',JSON_ARRAY(JSON_OBJECT('sku','E','qty',5,'price',11))),'2026-04-08 12:00:00.000004'),
+(105,3,'doc-c-2','ready',95,JSON_OBJECT('kind','invoice','tags',JSON_ARRAY('vip','archive'),'lines',JSON_ARRAY(JSON_OBJECT('sku','F','qty',1,'price',95))),'2026-05-09 13:00:00.000005');
+
+INSERT INTO mx_reading(reading_id,account_id,captured_on,reading_kind,reading_value,attributes)VALUES
+(1,1,'2025-12-31','latency',10.125,JSON_OBJECT('unit','ms')),
+(2,1,'2026-01-15','latency',20.250,JSON_OBJECT('unit','ms')),
+(3,1,'2026-04-15','throughput',30.375,JSON_OBJECT('unit','rps')),
+(4,2,'2026-02-10','latency',40.500,JSON_OBJECT('unit','ms')),
+(5,2,'2026-07-10','throughput',50.625,JSON_OBJECT('unit','rps')),
+(6,3,'2026-03-20','latency',60.750,JSON_OBJECT('unit','ms')),
+(7,3,'2026-10-20','throughput',70.875,JSON_OBJECT('unit','rps'));
+
+CALL mx_run_gauntlet_2();
+
+-- LATERAL owners + VALUES ROW weights + nested JSON_TABLE + analytic inheritance.
+WITH tag_weights(tag_name,tag_weight)AS(
+SELECT * FROM(VALUES ROW('vip',5),ROW('new',3),ROW('archive',2),ROW('review',1),ROW('basic',1))AS weights(tag_name,tag_weight)
+),expanded AS(
+SELECT d.doc_id,d.account_id,d.doc_key,d.score,d.kind_code,j.tag_name,j.line_no,j.sku,j.qty,j.price
+FROM mx_document d
+JOIN JSON_TABLE(d.payload,'$'COLUMNS(
+NESTED PATH'$.tags[*]'COLUMNS(tag_name VARCHAR(24)PATH'$'),
+NESTED PATH'$.lines[*]'COLUMNS(line_no FOR ORDINALITY,sku VARCHAR(20)PATH'$.sku',qty INT PATH'$.qty'DEFAULT'0'ON EMPTY,price DECIMAL(10,2)PATH'$.price'DEFAULT'0'ON ERROR)
+))j ON TRUE
+),ranked AS(
+SELECT e.*,
+SUM(COALESCE(w.tag_weight,0))OVER win_doc AS tag_weight_sum,
+JSON_ARRAYAGG(e.sku)OVER win_doc AS sku_window,
+PERCENT_RANK()OVER win_account AS score_percentile,
+NTH_VALUE(e.score,2)OVER(win_account ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING)AS second_score
+FROM expanded e LEFT JOIN tag_weights w ON w.tag_name=e.tag_name
+WINDOW win_doc AS(PARTITION BY e.doc_id),win_account AS(PARTITION BY e.account_id ORDER BY e.score DESC,e.doc_id)
+)
+SELECT /*+ JOIN_ORDER(a,top_doc,stats) */a.account_id,a.email_norm,top_doc.doc_key,top_doc.score,top_doc.band,
+stats.document_count,stats.vip_count,stats.valid_schema_count,
+(SELECT JSON_ARRAYAGG(x.partition_name)FROM(
+SELECT DISTINCT PARTITION_NAME AS partition_name FROM INFORMATION_SCHEMA.PARTITIONS
+WHERE TABLE_SCHEMA=DATABASE()AND TABLE_NAME='mx_reading'AND PARTITION_NAME IS NOT NULL ORDER BY PARTITION_NAME
+)x)AS partition_evidence,
+(SELECT MAX(r.tag_weight_sum)FROM ranked r WHERE r.account_id=a.account_id)AS max_tag_weight
+FROM mx_account a
+JOIN LATERAL(
+SELECT d.doc_key,d.score,mx_score_band(d.score)AS band
+FROM mx_document d WHERE d.account_id=a.account_id ORDER BY d.score DESC,d.doc_id LIMIT 1
+)top_doc ON TRUE
+JOIN LATERAL(
+SELECT COUNT(*)AS document_count,
+SUM('vip'MEMBER OF(d.payload->'$.tags'))AS vip_count,
+SUM(JSON_SCHEMA_VALID('{"type":"object","required":["kind","tags"]}',d.payload))AS valid_schema_count
+FROM mx_document d WHERE d.account_id=a.account_id
+)stats ON TRUE
+WHERE REGEXP_LIKE(a.email_norm,'^[a-z]+@example\\.com$','i')
+ORDER BY a.account_id;
+
+-- GROUPING distinguishes real NULLs from ROLLUP rows.
+SELECT region_code,kind_code,GROUPING(region_code)AS region_rollup,GROUPING(kind_code)AS kind_rollup,
+COUNT(*)AS document_count,ROUND(SUM(score),2)AS total_score
+FROM mx_account a JOIN mx_document d ON d.account_id=a.account_id
+GROUP BY region_code,kind_code WITH ROLLUP
+HAVING GROUPING(region_code)=1 OR region_code IS NOT NULL
+ORDER BY GROUPING(region_code),region_code,GROUPING(kind_code),kind_code;
+
+-- VALUES is a query owner on both sides of set operators.
+VALUES ROW(1,'seed'),ROW(2,'seed'),ROW(3,'seed')
+UNION DISTINCT
+SELECT account_id,'active'FROM mx_account
+EXCEPT
+VALUES ROW(99,'never')
+ORDER BY 1,2;
+
+-- Multi-table UPDATE/DELETE are rollback-only; SAVEPOINT is intentionally nested.
+START TRANSACTION;
+SAVEPOINT before_multi_dml;
+UPDATE mx_document d JOIN mx_account a ON a.account_id=d.account_id
+SET d.payload=JSON_SET(d.payload,'$.temporary_region',a.region_code),d.score=d.score+0.01
+WHERE d.doc_id IN(SELECT doc_id FROM mx_top_document);
+DELETE d,r FROM mx_document d JOIN mx_reading r ON r.account_id=d.account_id
+WHERE d.doc_id=101 AND r.reading_id=1;
+ROLLBACK TO SAVEPOINT before_multi_dml;
+ROLLBACK;
+
+START TRANSACTION;
+SELECT doc_id,account_id,score FROM mx_document
+WHERE doc_id=(SELECT doc_id FROM mx_top_document WHERE account_id=1)
+FOR UPDATE NOWAIT;
+COMMIT;
+
+ALTER TABLE mx_account ALTER INDEX ix_mx_account_lower VISIBLE;
+ALTER TABLE mx_account ALTER INDEX ix_mx_account_lower INVISIBLE;
+
+CALL mx_assert_2((SELECT COUNT(*)FROM mx_account)=3,'account count');
+CALL mx_assert_2((SELECT COUNT(secret_token)FROM mx_account)=3,'invisible secret count');
+CALL mx_assert_2((SELECT COUNT(*)FROM mx_document)=5,'document count after rollback');
+CALL mx_assert_2((SELECT COUNT(*)FROM mx_reading)=7,'partitioned reading count');
+CALL mx_assert_2((SELECT COUNT(*)FROM mx_document WHERE'vip'MEMBER OF(payload->'$.tags'))=3,'multi-valued vip count');
+CALL mx_assert_2((SELECT COUNT(*)FROM mx_rollup)=3,'rollup count');
+CALL mx_assert_2((SELECT COUNT(*)FROM mx_error_log WHERE phase_name='EXPECTED_DUPLICATE')=1,'expected duplicate count');
+CALL mx_assert_2((SELECT COUNT(*)FROM mx_error_log WHERE phase_name='UNEXPECTED')=0,'unexpected errors');
+
+SELECT'PASS'AS status,
+(SELECT COUNT(*)FROM mx_account)AS account_rows,
+(SELECT COUNT(*)FROM mx_document)AS document_rows,
+(SELECT COUNT(*)FROM mx_reading)AS reading_rows,
+(SELECT COUNT(*)FROM INFORMATION_SCHEMA.PARTITIONS WHERE TABLE_SCHEMA=DATABASE()AND TABLE_NAME='mx_reading'AND PARTITION_NAME IS NOT NULL)AS partition_rows,
+(SELECT COUNT(*)FROM mx_error_log)AS expected_errors,
+JSON_OBJECT('trap',@lexical_trap,'vip_docs',(SELECT COUNT(*)FROM mx_document WHERE'vip'MEMBER OF(payload->'$.tags')),'schema_valid',(SELECT SUM(JSON_SCHEMA_VALID('{"type":"object","required":["kind","tags"]}',payload))FROM mx_document))AS evidence;
+
+
+-- =========================================================
+-- IntelliSense sweep report generated by intellisense sweep
+-- source: test_mysql/test5.txt
+-- db: MySQL
+-- metadata: test_mysql/test5.txt inferred catalog
+-- checked: 921
+-- suggestions checked: 4754
+-- missing: 0
+-- suggestions without type labels: 0
+-- marker: [[word]] means not suggested for the tested prefix
+-- missing tokens: none
+-- suggestions without type labels: none
+-- =========================================================
