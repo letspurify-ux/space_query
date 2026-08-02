@@ -584,6 +584,10 @@ impl SessionResidueState {
         self.may_have_user_variable
     }
 
+    pub(crate) fn may_have_statement_diagnostics(self) -> bool {
+        self.may_have_statement_diagnostics
+    }
+
     pub fn may_have_transaction_mode_override(self) -> bool {
         self.may_have_next_transaction_mode_override || self.may_have_transaction_mode_override
     }

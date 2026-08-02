@@ -205,13 +205,7 @@ fn choice2_on_main_with_title(title: &str, txt: &str, b0: &str, b1: &str, b2: &s
         let mut button = Button::default()
             .with_size(dialog_button_width(label), constants::BUTTON_HEIGHT)
             .with_label(label);
-        button.set_color(if choice_index == 0 {
-            theme::button_cancel()
-        } else if choice_index == 1 {
-            theme::button_primary()
-        } else {
-            theme::button_secondary()
-        });
+        button.set_color(theme::button_dark());
         button.set_label_color(theme::text_primary());
         button.set_frame(FrameType::RFlatBox);
 
@@ -356,14 +350,14 @@ pub fn input_on_main(txt: &str, deflt: &str) -> Option<String> {
     let mut ok_btn = Button::default()
         .with_size(ok_button_width, constants::BUTTON_HEIGHT)
         .with_label("OK");
-    ok_btn.set_color(theme::button_primary());
+    ok_btn.set_color(theme::button_dark());
     ok_btn.set_label_color(theme::text_primary());
     ok_btn.set_frame(FrameType::RFlatBox);
 
     let mut cancel_btn = Button::default()
         .with_size(cancel_button_width, constants::BUTTON_HEIGHT)
         .with_label("Cancel");
-    cancel_btn.set_color(theme::button_cancel());
+    cancel_btn.set_color(theme::button_dark());
     cancel_btn.set_label_color(theme::text_primary());
     cancel_btn.set_frame(FrameType::RFlatBox);
 

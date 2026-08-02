@@ -48,7 +48,7 @@ fn db_selection_section_height(db_type: DatabaseType, driver_mode: OracleDriverM
 }
 const SAVE_CONNECTION_BUTTON_WIDTH: i32 = 170;
 const CONNECTION_ACTION_BUTTONS_WIDTH: i32 =
-    SAVE_CONNECTION_BUTTON_WIDTH + BUTTON_WIDTH * 3 + DIALOG_SPACING * 3;
+    SAVE_CONNECTION_BUTTON_WIDTH + BUTTON_WIDTH * 2 + DIALOG_SPACING * 2;
 const SESSION_TIME_ZONE_CHOICES: &[&str] = &[
     "", "+00:00", "+09:00", "+08:00", "+05:30", "+01:00", "-05:00", "-08:00",
 ];
@@ -300,7 +300,7 @@ fn style_input_choice(choice: &mut InputChoice) {
     input.set_text_color(theme::text_primary());
 
     let mut menu_button = choice.menu_button();
-    menu_button.set_color(theme::input_bg());
+    menu_button.set_color(theme::button_dark());
     menu_button.set_label_color(theme::text_primary());
     menu_button.set_text_color(theme::text_primary());
 }
@@ -881,7 +881,6 @@ impl ConnectionDialog {
             Save(ConnectionInfo),
             Connect(ConnectionInfo, bool),
             SetTestInProgress(bool),
-            Cancel,
         }
 
         let (sender, receiver) = mpsc::channel::<DialogMessage>();
@@ -1309,7 +1308,7 @@ impl ConnectionDialog {
         let mut delete_btn = Button::default()
             .with_size(BUTTON_WIDTH, BUTTON_HEIGHT)
             .with_label("Delete");
-        delete_btn.set_color(theme::button_danger());
+        delete_btn.set_color(theme::button_dark());
         delete_btn.set_label_color(theme::text_primary());
         delete_btn.set_frame(FrameType::RFlatBox);
 
@@ -1321,35 +1320,27 @@ impl ConnectionDialog {
         let mut save_btn = Button::default()
             .with_size(SAVE_CONNECTION_BUTTON_WIDTH, BUTTON_HEIGHT)
             .with_label("Save this connection");
-        save_btn.set_color(theme::button_success());
+        save_btn.set_color(theme::button_dark());
         save_btn.set_label_color(theme::text_primary());
         save_btn.set_frame(FrameType::RFlatBox);
 
         let mut test_btn = Button::default()
             .with_size(BUTTON_WIDTH, BUTTON_HEIGHT)
             .with_label("Test");
-        test_btn.set_color(theme::button_secondary());
+        test_btn.set_color(theme::button_dark());
         test_btn.set_label_color(theme::text_primary());
         test_btn.set_frame(FrameType::RFlatBox);
 
         let mut connect_btn = Button::default()
             .with_size(BUTTON_WIDTH, BUTTON_HEIGHT)
             .with_label("Connect");
-        connect_btn.set_color(theme::button_primary());
+        connect_btn.set_color(theme::selection_soft());
         connect_btn.set_label_color(theme::text_primary());
         connect_btn.set_frame(FrameType::RFlatBox);
-
-        let mut cancel_btn = Button::default()
-            .with_size(BUTTON_WIDTH, BUTTON_HEIGHT)
-            .with_label("Cancel");
-        cancel_btn.set_color(theme::button_cancel());
-        cancel_btn.set_label_color(theme::text_primary());
-        cancel_btn.set_frame(FrameType::RFlatBox);
 
         action_button_flex.fixed(&save_btn, SAVE_CONNECTION_BUTTON_WIDTH);
         action_button_flex.fixed(&test_btn, BUTTON_WIDTH);
         action_button_flex.fixed(&connect_btn, BUTTON_WIDTH);
-        action_button_flex.fixed(&cancel_btn, BUTTON_WIDTH);
         action_button_flex.end();
 
         button_flex.fixed(&delete_btn, BUTTON_WIDTH);
@@ -2152,13 +2143,6 @@ impl ConnectionDialog {
             app::awake();
         });
 
-        // Cancel button callback
-        let sender_for_cancel = sender.clone();
-        cancel_btn.set_callback(move |_| {
-            let _ = sender_for_cancel.send(DialogMessage::Cancel);
-            app::awake();
-        });
-
         dialog.show();
         let _ = dialog.take_focus();
         let _ = connect_btn.take_focus();
@@ -2281,9 +2265,6 @@ impl ConnectionDialog {
                         *result
                             .lock()
                             .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(info);
-                        dialog.hide();
-                    }
-                    DialogMessage::Cancel => {
                         dialog.hide();
                     }
                 }

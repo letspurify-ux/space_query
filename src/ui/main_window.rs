@@ -814,17 +814,25 @@ fn status_bar_content_label(connection_label: &str, activity: Option<&str>) -> S
     )
 }
 
+fn status_connection_color(is_connected: bool) -> Color {
+    if is_connected {
+        theme::status_connected()
+    } else {
+        theme::status_disconnected()
+    }
+}
+
 fn status_bar_pulse_value(pulse_frame: usize) -> f64 {
     let offset = safe_rem(pulse_frame, 200);
     let value = if offset <= 100 { offset } else { 200 - offset };
     value as f64
 }
 
-fn status_activity_pulse_color(pulse_frame: usize, default_color: Color) -> Color {
+fn status_activity_pulse_color(pulse_frame: usize, active_color: Color) -> Color {
     let progress = safe_div(status_bar_pulse_value(pulse_frame), 100.0);
     let eased_progress = progress * progress * (3.0 - 2.0 * progress);
-    let (start_r, start_g, start_b) = theme::status_activity_dark().to_rgb();
-    let (end_r, end_g, end_b) = default_color.to_rgb();
+    let (start_r, start_g, start_b) = theme::status_bar_default().to_rgb();
+    let (end_r, end_g, end_b) = active_color.to_rgb();
     let interpolate = |start: u8, end: u8| {
         (f64::from(start) + (f64::from(end) - f64::from(start)) * eased_progress).round() as u8
     };
@@ -888,6 +896,7 @@ where
 
 struct StatusBarWidget {
     root: Flex,
+    connection_indicator: Frame,
     content: Frame,
     additional_count: Frame,
     pulse_frame: usize,
@@ -901,13 +910,18 @@ impl StatusBarWidget {
     fn new() -> Self {
         let mut root = Flex::default().row();
         root.set_frame(FrameType::FlatBox);
-        root.set_color(theme::accent());
+        root.set_color(theme::status_bar_default());
         root.set_margins(
             Self::HORIZONTAL_MARGIN,
             Self::VERTICAL_MARGIN,
             Self::HORIZONTAL_MARGIN,
             Self::VERTICAL_MARGIN,
         );
+
+        let mut connection_indicator = Frame::default().with_label("●");
+        connection_indicator.set_frame(FrameType::NoBox);
+        connection_indicator.set_label_color(theme::status_disconnected());
+        connection_indicator.set_align(Align::Center | Align::Inside);
 
         let mut content = Frame::default();
         content.set_frame(FrameType::NoBox);
@@ -919,12 +933,14 @@ impl StatusBarWidget {
         additional_count.set_label_color(theme::text_primary());
         additional_count.set_align(Align::Center | Align::Inside);
 
+        root.fixed(&connection_indicator, 14);
         root.resizable(&content);
         root.fixed(&additional_count, 1);
         root.end();
 
         Self {
             root,
+            connection_indicator,
             content,
             additional_count,
             pulse_frame: 0,
@@ -938,12 +954,15 @@ impl StatusBarWidget {
         activity: Option<&crate::db::DbActivitySnapshot>,
         additional_count: usize,
     ) {
+        let is_connected = connection_info.is_some() && has_live_connection;
+        self.connection_indicator
+            .set_label_color(status_connection_color(is_connected));
         let connection_label = status_connection_label(connection_info, has_live_connection);
         let content_label = status_bar_content_label(
             &connection_label,
             activity.map(|activity| activity.activity.as_str()),
         );
-        self.content.set_label(&format!(" {}", content_label));
+        self.content.set_label(&content_label);
         self.content.set_tooltip(&content_label);
         let additional_count_label = if additional_count == 0 {
             String::new()
@@ -954,7 +973,7 @@ impl StatusBarWidget {
         self.resize_additional_count();
 
         if activity.is_none() {
-            self.root.set_color(theme::accent());
+            self.root.set_color(theme::status_bar_default());
             self.pulse_frame = 0;
             self.redraw();
             return;
@@ -988,11 +1007,15 @@ impl StatusBarWidget {
     }
 
     fn was_deleted(&self) -> bool {
-        self.root.was_deleted() || self.content.was_deleted() || self.additional_count.was_deleted()
+        self.root.was_deleted()
+            || self.connection_indicator.was_deleted()
+            || self.content.was_deleted()
+            || self.additional_count.was_deleted()
     }
 
     fn redraw(&mut self) {
         self.root.redraw();
+        self.connection_indicator.redraw();
         self.content.redraw();
         self.additional_count.redraw();
     }
@@ -1416,7 +1439,6 @@ pub struct AppState {
     result_cancel_btn: Button,
     execute_btn: Button,
     query_cancel_btn: Button,
-    explain_btn: Button,
     commit_btn: Button,
     rollback_btn: Button,
     transaction_isolation_choice: Choice,
@@ -3119,11 +3141,9 @@ impl AppState {
         self.query_cancel_btn.activate();
 
         if is_connected {
-            self.explain_btn.activate();
             self.commit_btn.activate();
             self.rollback_btn.activate();
         } else {
-            self.explain_btn.deactivate();
             self.commit_btn.deactivate();
             self.rollback_btn.deactivate();
         }
@@ -4259,23 +4279,6 @@ impl MainWindow {
         }
     }
 
-    fn clear_current_result_view(state: &Arc<Mutex<AppState>>) {
-        let result_target = {
-            let s = state
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            s.result_tabs
-                .active_result_id()
-                .map(ResultTabCloseTarget::Result)
-        };
-        if let Some(target) = result_target {
-            Self::close_result_tab_by_target(state, target);
-            return;
-        }
-
-        Self::clear_current_result_support_section(state);
-    }
-
     fn clear_all_result_views(state: &Arc<Mutex<AppState>>) {
         let query_running = state
             .lock()
@@ -4308,19 +4311,6 @@ impl MainWindow {
                 crate::ui::sql_editor::LazyFetchRequest::CancelAndDiscard,
             );
         }
-    }
-
-    fn clear_current_result_support_section(state: &Arc<Mutex<AppState>>) {
-        let mut s = state
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if s.result_tabs.clear_current_support_section() {
-            s.set_status_message("Cleared current result view");
-        } else {
-            s.set_status_message("Nothing to clear");
-        }
-        s.refresh_result_edit_controls();
-        app::redraw();
     }
 
     fn start_status_activity_timer(state: &Arc<Mutex<AppState>>) {
@@ -5014,7 +5004,7 @@ impl MainWindow {
         let mut execute_btn = Button::default()
             .with_size(BUTTON_WIDTH, BUTTON_HEIGHT)
             .with_label("@> Execute");
-        execute_btn.set_color(theme::button_primary());
+        execute_btn.set_color(theme::selection_soft());
         execute_btn.set_label_color(theme::text_primary());
         execute_btn.set_frame(FrameType::RFlatBox);
         query_toolbar.fixed(&execute_btn, BUTTON_WIDTH);
@@ -5026,14 +5016,6 @@ impl MainWindow {
         cancel_btn.set_label_color(theme::text_primary());
         cancel_btn.set_frame(FrameType::RFlatBox);
         query_toolbar.fixed(&cancel_btn, BUTTON_WIDTH);
-
-        let mut explain_btn = Button::default()
-            .with_size(BUTTON_WIDTH, BUTTON_HEIGHT)
-            .with_label("Explain");
-        explain_btn.set_color(theme::button_secondary());
-        explain_btn.set_label_color(theme::text_primary());
-        explain_btn.set_frame(FrameType::RFlatBox);
-        query_toolbar.fixed(&explain_btn, BUTTON_WIDTH);
 
         let mut commit_btn = Button::default()
             .with_size(BUTTON_WIDTH, BUTTON_HEIGHT)
@@ -5206,35 +5188,6 @@ impl MainWindow {
         let query_tabs_widget = query_tabs.get_widget();
         query_top_flex.add(&query_tabs_widget);
         query_top_flex.resizable(&query_tabs_widget);
-
-        let mut query_tab_toolbar = Flex::default();
-        query_tab_toolbar.set_type(FlexType::Row);
-        query_tab_toolbar.set_margin(TOOLBAR_SPACING);
-        query_tab_toolbar.set_spacing(TOOLBAR_SPACING);
-
-        let mut query_close_tab_btn = Button::default()
-            .with_size(BUTTON_WIDTH_LARGE, BUTTON_HEIGHT)
-            .with_label("Close Current");
-        query_close_tab_btn.set_color(theme::button_subtle());
-        query_close_tab_btn.set_label_color(theme::text_secondary());
-        query_close_tab_btn.set_frame(FrameType::RFlatBox);
-        query_close_tab_btn.set_tooltip("Close the current query tab (Cmd/Ctrl+W)");
-        query_tab_toolbar.fixed(&query_close_tab_btn, BUTTON_WIDTH_LARGE);
-
-        let close_all_queries_width = BUTTON_WIDTH_LARGE;
-        let mut query_close_all_tabs_btn = Button::default()
-            .with_size(close_all_queries_width, BUTTON_HEIGHT)
-            .with_label("Close All");
-        query_close_all_tabs_btn.set_color(theme::button_subtle());
-        query_close_all_tabs_btn.set_label_color(theme::text_secondary());
-        query_close_all_tabs_btn.set_frame(FrameType::RFlatBox);
-        query_close_all_tabs_btn.set_tooltip("Close all query tabs");
-        query_tab_toolbar.fixed(&query_close_all_tabs_btn, close_all_queries_width);
-
-        let query_tab_toolbar_spacer = Frame::default();
-        query_tab_toolbar.resizable(&query_tab_toolbar_spacer);
-        query_tab_toolbar.end();
-        query_top_flex.fixed(&query_tab_toolbar, RESULT_TOOLBAR_HEIGHT);
         query_top_flex.end();
         query_top_group.resizable(&query_top_flex);
         query_top_group.end();
@@ -5259,16 +5212,6 @@ impl MainWindow {
         result_toolbar.set_margin(TOOLBAR_SPACING);
         result_toolbar.set_spacing(TOOLBAR_SPACING);
 
-        let mut clear_current_btn = Button::default()
-            .with_size(BUTTON_WIDTH_LARGE + 10, BUTTON_HEIGHT)
-            .with_label("Clear Current");
-        clear_current_btn.set_color(theme::button_subtle());
-        clear_current_btn.set_label_color(theme::text_secondary());
-        clear_current_btn.set_frame(FrameType::RFlatBox);
-        clear_current_btn
-            .set_tooltip("Clear the current result grid, output, message, or plan view");
-        result_toolbar.fixed(&clear_current_btn, BUTTON_WIDTH_LARGE + 10);
-
         let mut clear_all_btn = Button::default()
             .with_size(BUTTON_WIDTH_LARGE, BUTTON_HEIGHT)
             .with_label("Clear All");
@@ -5284,6 +5227,7 @@ impl MainWindow {
         let mut one_tab_per_query_check = CheckButton::default()
             .with_size(BUTTON_WIDTH_LARGE + 45, BUTTON_HEIGHT)
             .with_label(RESULT_ONE_TAB_PER_QUERY_LABEL);
+        one_tab_per_query_check.set_color(theme::button_secondary());
         one_tab_per_query_check.set_tooltip(
             "Unchecked: clear existing result tabs before each execution. Checked: append result tabs.",
         );
@@ -5299,6 +5243,7 @@ impl MainWindow {
         let mut edit_mode_check = CheckButton::default()
             .with_size(BUTTON_WIDTH_SMALL, BUTTON_HEIGHT)
             .with_label(" Edit");
+        edit_mode_check.set_color(theme::button_secondary());
         edit_mode_check.set_tooltip("Enable staged edit mode for the current result tab");
         edit_mode_check.hide();
         result_toolbar.fixed(&edit_mode_check, 0);
@@ -5562,7 +5507,6 @@ impl MainWindow {
             result_cancel_btn: edit_cancel_btn.clone(),
             execute_btn: execute_btn.clone(),
             query_cancel_btn: cancel_btn.clone(),
-            explain_btn: explain_btn.clone(),
             commit_btn: commit_btn.clone(),
             rollback_btn: rollback_btn.clone(),
             transaction_isolation_choice: transaction_isolation_choice.clone(),
@@ -5689,15 +5633,6 @@ impl MainWindow {
             }
         });
 
-        let weak_state_for_explain = Arc::downgrade(&state);
-        explain_btn.set_callback(move |_| {
-            if let Some(state_for_explain) = weak_state_for_explain.upgrade() {
-                if let Some(editor) = acquire_sql_editor_if_idle(&state_for_explain) {
-                    editor.explain_current();
-                }
-            }
-        });
-
         let weak_state_for_commit = Arc::downgrade(&state);
         commit_btn.set_callback(move |_| {
             if let Some(state_for_commit) = weak_state_for_commit.upgrade() {
@@ -5730,43 +5665,12 @@ impl MainWindow {
             }
         });
 
-        let weak_state_for_result_clear_current = Arc::downgrade(&state);
-        clear_current_btn.set_callback(move |_| {
-            let Some(state_for_result_clear_current) =
-                weak_state_for_result_clear_current.upgrade()
-            else {
-                return;
-            };
-            MainWindow::clear_current_result_view(&state_for_result_clear_current);
-        });
-
         let weak_state_for_result_clear_all = Arc::downgrade(&state);
         clear_all_btn.set_callback(move |_| {
             let Some(state_for_result_clear_all) = weak_state_for_result_clear_all.upgrade() else {
                 return;
             };
             MainWindow::clear_all_result_views(&state_for_result_clear_all);
-        });
-
-        let weak_state_for_query_close = Arc::downgrade(&state);
-        query_close_tab_btn.set_callback(move |_| {
-            let Some(state_for_query_close) = weak_state_for_query_close.upgrade() else {
-                return;
-            };
-            let tab_id = state_for_query_close
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .active_editor_tab_id;
-            MainWindow::close_query_editor_tab(&state_for_query_close, tab_id);
-            app::redraw();
-        });
-
-        let weak_state_for_query_close_all = Arc::downgrade(&state);
-        query_close_all_tabs_btn.set_callback(move |_| {
-            let Some(state_for_query_close_all) = weak_state_for_query_close_all.upgrade() else {
-                return;
-            };
-            MainWindow::close_all_query_editor_tabs(&state_for_query_close_all);
         });
 
         let weak_state_for_tab_select = Arc::downgrade(&state);
@@ -10847,6 +10751,18 @@ mod tests {
     }
 
     #[test]
+    fn status_connection_color_uses_dark_theme_semantic_colors() {
+        assert_eq!(
+            status_connection_color(false).to_rgb(),
+            theme::status_disconnected().to_rgb()
+        );
+        assert_eq!(
+            status_connection_color(true).to_rgb(),
+            theme::status_connected().to_rgb()
+        );
+    }
+
+    #[test]
     fn status_bar_content_places_connection_and_activity_in_status_bar() {
         assert_eq!(
             status_bar_content_label("Local (Oracle)", Some("Running | Executing SQL: SELECT 1")),
@@ -10859,12 +10775,12 @@ mod tests {
     }
 
     #[test]
-    fn status_activity_color_pulse_reaches_each_default_color_over_six_seconds() {
+    fn status_activity_color_pulse_transitions_between_default_and_active_color() {
         let one_way_frames = 100 / STATUS_ANIMATION_STEP;
 
         assert_eq!(
             status_activity_pulse_color(0, theme::accent()).to_rgb(),
-            theme::status_activity_dark().to_rgb()
+            theme::status_bar_default().to_rgb()
         );
         assert_eq!(
             status_activity_pulse_color(one_way_frames * STATUS_ANIMATION_STEP, theme::accent())
@@ -10877,7 +10793,7 @@ mod tests {
                 theme::accent()
             )
             .to_rgb(),
-            theme::status_activity_dark().to_rgb()
+            theme::status_bar_default().to_rgb()
         );
         assert!((STATUS_ANIMATION_INTERVAL * one_way_frames as f64 - 3.0).abs() < 0.001);
     }

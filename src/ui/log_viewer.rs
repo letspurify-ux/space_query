@@ -125,21 +125,21 @@ impl LogViewerDialog {
         let mut export_btn = Button::default()
             .with_size(BUTTON_WIDTH_LARGE, BUTTON_HEIGHT)
             .with_label("Export...");
-        export_btn.set_color(theme::button_primary());
+        export_btn.set_color(theme::button_dark());
         export_btn.set_label_color(theme::text_primary());
         export_btn.set_frame(FrameType::RFlatBox);
 
         let mut clear_btn = Button::default()
             .with_size(BUTTON_WIDTH_LARGE, BUTTON_HEIGHT)
             .with_label("Clear Log");
-        clear_btn.set_color(theme::button_danger());
+        clear_btn.set_color(theme::button_dark());
         clear_btn.set_label_color(theme::text_primary());
         clear_btn.set_frame(FrameType::RFlatBox);
 
         let mut close_btn = Button::default()
             .with_size(BUTTON_WIDTH, BUTTON_HEIGHT)
             .with_label("Close");
-        close_btn.set_color(theme::button_subtle());
+        close_btn.set_color(theme::button_dark());
         close_btn.set_label_color(theme::text_primary());
         close_btn.set_frame(FrameType::RFlatBox);
 

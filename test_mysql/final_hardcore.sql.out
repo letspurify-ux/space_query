@@ -16,6 +16,7 @@ CREATE DATABASE sq_hard_mysql CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_ai_ci;
 USE sq_hard_mysql;
 SET NAMES utf8mb4;
 SET SESSION sql_mode = 'STRICT_ALL_TABLES';
+SET SESSION autocommit = 1;
 SET TRANSACTION ISOLATION LEVEL REPEATABLE READ;
 
 -- Backtick identifiers that collide with reserved words, embed spaces, and use

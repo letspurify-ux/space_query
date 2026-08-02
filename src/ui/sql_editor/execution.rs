@@ -5762,6 +5762,7 @@ impl SqlEditorWidget {
                             false,
                             false,
                             preserve_session_state_after_action,
+                            statement_effects.preserves_statement_diagnostics(),
                             None,
                         );
                         should_retain_session = health_check_ok;
@@ -18033,14 +18034,14 @@ impl SqlEditorWidget {
         let mut ok_btn = Button::default()
             .with_size(BUTTON_WIDTH, BUTTON_HEIGHT)
             .with_label("OK");
-        ok_btn.set_color(theme::button_primary());
+        ok_btn.set_color(theme::button_dark());
         ok_btn.set_label_color(theme::text_primary());
         ok_btn.set_frame(FrameType::RFlatBox);
 
         let mut cancel_btn = Button::default()
             .with_size(BUTTON_WIDTH, BUTTON_HEIGHT)
             .with_label("Cancel");
-        cancel_btn.set_color(theme::button_cancel());
+        cancel_btn.set_color(theme::button_dark());
         cancel_btn.set_label_color(theme::text_primary());
         cancel_btn.set_frame(FrameType::RFlatBox);
 
@@ -19050,6 +19051,9 @@ impl SqlEditorWidget {
                     false,
                     false,
                     retained_state.requires_physical_session_preservation(),
+                    retained_state
+                        .session_residue_state()
+                        .may_have_statement_diagnostics(),
                     None,
                 );
                 outcome = crate::db::retained_session_outcome_after_session_info_sync(
@@ -19460,7 +19464,11 @@ impl SqlEditorWidget {
         advanced: &crate::db::ConnectionAdvancedSettings,
         db_type: crate::db::DatabaseType,
         preserve_existing_session_state: bool,
+        preserve_statement_diagnostics: bool,
     ) -> Result<bool, String> {
+        if preserve_statement_diagnostics {
+            return Ok(true);
+        }
         if conn.as_mut().ping().is_err() {
             return Ok(false);
         }
@@ -19572,6 +19580,9 @@ impl SqlEditorWidget {
                     &context.connection_info.advanced,
                     context.connection_info.db_type,
                     prior_retained_state.requires_physical_session_preservation(),
+                    prior_retained_state
+                        .session_residue_state()
+                        .may_have_statement_diagnostics(),
                 ) {
                     Ok(true) => (conn, prior_retained_state),
                     Ok(false) => {
@@ -20575,14 +20586,16 @@ impl SqlEditorWidget {
         refresh_encoding: bool,
         allow_global_database_update: bool,
         preserve_existing_session_state: bool,
+        preserve_statement_diagnostics: bool,
         known_current_database: Option<&str>,
     ) -> bool {
-        // `preserve_existing_session_state` deliberately weakens the health
-        // probe from ping+SELECT to ping-only. Running internal SELECT/SET
-        // statements while a transaction, temp table, prepared statement, or
-        // named lock is being retained can itself change what the user sees
-        // next; clean pooled sessions still get the full central health check.
-        let session_is_alive = if preserve_existing_session_state {
+        // Internal protocol/SQL health commands change MySQL's statement
+        // diagnostics. Skip them while ROW_COUNT()/FOUND_ROWS() is pending;
+        // the user statement itself will report a dead connection. Other
+        // retained state uses ping-only, and clean sessions get the full check.
+        let session_is_alive = if preserve_statement_diagnostics {
+            true
+        } else if preserve_existing_session_state {
             Self::mysql_pooled_session_ping(conn, db_activity)
         } else {
             Self::mysql_pooled_session_health_check(conn, db_activity)
@@ -21287,6 +21300,9 @@ impl SqlEditorWidget {
                     false,
                     false,
                     prior_retained_state.requires_physical_session_preservation(),
+                    prior_retained_state
+                        .session_residue_state()
+                        .may_have_statement_diagnostics(),
                     None,
                 )
             {
@@ -21494,6 +21510,8 @@ impl SqlEditorWidget {
                     refresh_encoding_after,
                     allow_global_database_update,
                     preserve_session_state_after_action,
+                    matches!(&result, Ok(Ok(_)))
+                        && statement_effects.preserves_statement_diagnostics(),
                     known_current_database.as_deref(),
                 )
             }
@@ -31862,6 +31880,54 @@ DROP TEMPORARY TABLE IF EXISTS qt_result_route_monitor;
         let progress = harness.execute_with_query_timeout(
             include_str!("../../../test_mariadb/final_hardcore.sql"),
             "MariaDB final_hardcore with query timeout",
+            Duration::from_secs(60),
+        );
+
+        assert_no_failed_mysql_statement(&progress);
+        assert_mysql_manual_final_status_pass(&progress);
+    }
+
+    #[test]
+    #[ignore = "requires local MySQL 8 test database via SPACE_QUERY_TEST_MYSQL_* env vars"]
+    fn mysql_query_timeout_preserves_row_count_diagnostics() {
+        if !mysql_test_server_is_mysql8_or_newer().unwrap_or(false) {
+            eprintln!("skipping: ROW_COUNT diagnostics regression requires MySQL 8 or newer");
+            return;
+        }
+        let Some(harness) = MysqlSessionRuleHarness::new_for_db_type(true, DatabaseType::MySQL)
+        else {
+            return;
+        };
+        let progress = harness.execute_with_query_timeout(
+            "DROP TEMPORARY TABLE IF EXISTS qt_row_count_timeout;
+             CREATE TEMPORARY TABLE qt_row_count_timeout (id INT PRIMARY KEY, value INT NOT NULL);
+             INSERT INTO qt_row_count_timeout VALUES (1, 0), (2, 0);
+             UPDATE qt_row_count_timeout SET value = 1;
+             SET @qt_row_count_timeout = ROW_COUNT();
+             SELECT 'PASS' AS final_status WHERE @qt_row_count_timeout = 2;
+             DROP TEMPORARY TABLE qt_row_count_timeout;",
+            "MySQL ROW_COUNT with query timeout",
+            Duration::from_secs(60),
+        );
+
+        assert_no_failed_mysql_statement(&progress);
+        assert_mysql_manual_final_status_pass(&progress);
+    }
+
+    #[test]
+    #[ignore = "requires local MySQL 8 test database via SPACE_QUERY_TEST_MYSQL_* env vars"]
+    fn execute_mysql_final_hardcore_with_query_timeout() {
+        if !mysql_test_server_is_mysql8_or_newer().unwrap_or(false) {
+            eprintln!("skipping: final_hardcore.sql requires MySQL 8 or newer");
+            return;
+        }
+        let Some(harness) = MysqlSessionRuleHarness::new_for_db_type(false, DatabaseType::MySQL)
+        else {
+            return;
+        };
+        let progress = harness.execute_with_query_timeout(
+            include_str!("../../../test_mysql/final_hardcore.sql"),
+            "MySQL final_hardcore with query timeout",
             Duration::from_secs(60),
         );
 

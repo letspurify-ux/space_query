@@ -118,11 +118,11 @@ pub fn query_timeout_for_statement_for_db_type(
         DatabaseType::Oracle => false,
         DatabaseType::MySQL => {
             mysql_statement_sets_session_timeout_variable(sql)
-                || mysql_statement_uses_found_rows_diagnostics(db_type, sql)
+                || mysql_statement_uses_timeout_sensitive_diagnostics(db_type, sql)
         }
         DatabaseType::MariaDB => {
             mysql_statement_sets_session_timeout_variable(sql)
-                || mysql_statement_uses_found_rows_diagnostics(db_type, sql)
+                || mysql_statement_uses_timeout_sensitive_diagnostics(db_type, sql)
         }
     };
     if query_timeout.is_some() && skips_session_timeout_wrapper {
@@ -144,11 +144,15 @@ fn mysql_statement_sets_session_timeout_variable(sql: &str) -> bool {
     )
 }
 
-fn mysql_statement_uses_found_rows_diagnostics(db_type: DatabaseType, sql: &str) -> bool {
-    SqlStatementAnalysis::new_for_db_type(db_type, sql)
-        .words()
-        .iter()
-        .any(|word| matches!(word.as_str(), "SQL_CALC_FOUND_ROWS" | "FOUND_ROWS"))
+fn mysql_statement_uses_timeout_sensitive_diagnostics(db_type: DatabaseType, sql: &str) -> bool {
+    let analysis = SqlStatementAnalysis::new_for_db_type(db_type, sql);
+    analysis.classify_for_db_type(db_type) == SqlKind::Dml
+        || analysis.words().iter().any(|word| {
+            matches!(
+                word.as_str(),
+                "SQL_CALC_FOUND_ROWS" | "FOUND_ROWS" | "ROW_COUNT"
+            )
+        })
 }
 
 fn classify_mysql_result_kind(db_type: DatabaseType, sql: &str) -> StatementResultKind {
@@ -340,23 +344,27 @@ mod tests {
     }
 
     #[test]
-    fn mysql_timeout_profile_preserves_found_rows_diagnostics() {
+    fn mysql_timeout_profile_preserves_statement_diagnostics() {
         let timeout = Some(Duration::from_secs(60));
 
-        for sql in [
-            "SELECT SQL_CALC_FOUND_ROWS id FROM t LIMIT 2",
-            "SET @found = FOUND_ROWS()",
-        ] {
-            assert_eq!(
-                query_timeout_for_statement_for_db_type(DatabaseType::MariaDB, sql, timeout),
-                None,
-                "{sql}"
-            );
+        for db_type in [DatabaseType::MySQL, DatabaseType::MariaDB] {
+            for sql in [
+                "SELECT SQL_CALC_FOUND_ROWS id FROM t LIMIT 2",
+                "SET @found = FOUND_ROWS()",
+                "UPDATE t SET value = value + 1",
+                "SET @updated = ROW_COUNT()",
+            ] {
+                assert_eq!(
+                    query_timeout_for_statement_for_db_type(db_type, sql, timeout),
+                    None,
+                    "{db_type}: {sql}"
+                );
+            }
         }
         assert_eq!(
             query_timeout_for_statement_for_db_type(
                 DatabaseType::MariaDB,
-                "SELECT 'FOUND_ROWS()' AS text_value",
+                "SELECT 'FOUND_ROWS() / ROW_COUNT()' AS text_value",
                 timeout,
             ),
             timeout

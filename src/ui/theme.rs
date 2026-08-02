@@ -57,12 +57,12 @@ pub fn text_muted() -> Color {
     Color::from_rgb(168, 168, 168)
 }
 
-pub fn accent() -> Color {
-    Color::from_rgb(0, 120, 212)
+pub fn text_error() -> Color {
+    Color::from_rgb(232, 17, 35)
 }
 
-pub fn status_activity_dark() -> Color {
-    Color::from_rgb(18, 18, 18)
+pub fn accent() -> Color {
+    Color::from_rgb(0, 120, 212)
 }
 
 pub fn selection_soft() -> Color {
@@ -74,23 +74,23 @@ pub fn selection_strong() -> Color {
 }
 
 pub fn button_primary() -> Color {
-    accent()
+    panel_raised()
 }
 
 pub fn button_secondary() -> Color {
-    Color::from_rgb(58, 58, 58)
+    panel_raised()
 }
 
 pub fn button_subtle() -> Color {
-    Color::from_rgb(50, 50, 50)
+    panel_raised()
 }
 
 pub fn button_success() -> Color {
-    Color::from_rgb(16, 124, 16)
+    panel_raised()
 }
 
 pub fn button_warning() -> Color {
-    Color::from_rgb(202, 80, 16)
+    panel_raised()
 }
 
 pub fn button_cancel() -> Color {
@@ -98,7 +98,23 @@ pub fn button_cancel() -> Color {
 }
 
 pub fn button_danger() -> Color {
-    Color::from_rgb(232, 17, 35)
+    panel_raised()
+}
+
+pub fn button_dark() -> Color {
+    input_bg()
+}
+
+pub fn status_bar_default() -> Color {
+    panel_raised()
+}
+
+pub fn status_connected() -> Color {
+    Color::from_rgb(74, 222, 128)
+}
+
+pub fn status_disconnected() -> Color {
+    Color::from_rgb(255, 107, 107)
 }
 
 pub fn table_header_bg() -> Color {
@@ -192,4 +208,38 @@ pub fn style_text_display_scrollbars(display: &TextDisplay) {
 
 pub fn style_text_editor_scrollbars(editor: &TextEditor) {
     style_group_children_as_scrollbars(editor);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn button_and_status_bar_default_colors_match_panel_raised() {
+        let expected = (52, 52, 52);
+
+        for color in [
+            button_primary(),
+            button_secondary(),
+            button_subtle(),
+            button_success(),
+            button_warning(),
+            button_cancel(),
+            button_danger(),
+            status_bar_default(),
+        ] {
+            assert_eq!(color.to_rgb(), expected);
+        }
+    }
+
+    #[test]
+    fn dark_button_color_matches_input_background() {
+        assert_eq!(button_dark().to_rgb(), (46, 46, 46));
+    }
+
+    #[test]
+    fn connection_status_colors_match_dark_theme_palette() {
+        assert_eq!(status_connected().to_rgb(), (74, 222, 128));
+        assert_eq!(status_disconnected().to_rgb(), (255, 107, 107));
+    }
 }

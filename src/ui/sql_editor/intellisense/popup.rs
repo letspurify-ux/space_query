@@ -974,7 +974,7 @@ impl SqlEditorWidget {
             .with_pos(close_btn_x, 460)
             .with_size(BUTTON_WIDTH, BUTTON_HEIGHT)
             .with_label("Close");
-        close_btn.set_color(theme::button_secondary());
+        close_btn.set_color(theme::button_dark());
         close_btn.set_label_color(theme::text_primary());
 
         let (sender, receiver) = mpsc::channel::<()>();

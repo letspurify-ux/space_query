@@ -53,7 +53,7 @@ fn show_info_dialog(title: &str, content: &str, width: i32, height: i32) {
         .with_pos(button_x, button_y)
         .with_size(BUTTON_WIDTH, BUTTON_HEIGHT)
         .with_label("Close");
-    close_btn.set_color(theme::button_secondary());
+    close_btn.set_color(theme::button_dark());
     close_btn.set_label_color(theme::text_primary());
     close_btn.set_frame(FrameType::RFlatBox);
 

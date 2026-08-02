@@ -314,7 +314,7 @@ fn preview_style_table() -> Vec<StyleTableEntry> {
             size,
         },
         StyleTableEntry {
-            color: theme::button_danger(),
+            color: theme::text_error(),
             font: profile.normal,
             size,
         },
@@ -402,6 +402,7 @@ impl QueryHistoryDialog {
         filter_row.fixed(&search_input, 224);
 
         let mut failed_only_check = CheckButton::default().with_label("Failed only");
+        failed_only_check.set_color(theme::button_dark());
         failed_only_check.set_label_color(theme::text_primary());
         filter_row.fixed(&failed_only_check, 114);
 
@@ -473,21 +474,21 @@ impl QueryHistoryDialog {
         let mut use_btn = Button::default()
             .with_size(BUTTON_WIDTH_LARGE, BUTTON_HEIGHT)
             .with_label("Use Query");
-        use_btn.set_color(theme::button_primary());
+        use_btn.set_color(theme::button_dark());
         use_btn.set_label_color(theme::text_primary());
         use_btn.set_frame(FrameType::RFlatBox);
 
         let mut clear_btn = Button::default()
             .with_size(BUTTON_WIDTH_LARGE, BUTTON_HEIGHT)
             .with_label("Clear History");
-        clear_btn.set_color(theme::button_danger());
+        clear_btn.set_color(theme::button_dark());
         clear_btn.set_label_color(theme::text_primary());
         clear_btn.set_frame(FrameType::RFlatBox);
 
         let mut close_btn = Button::default()
             .with_size(BUTTON_WIDTH, BUTTON_HEIGHT)
             .with_label("Close");
-        close_btn.set_color(theme::button_subtle());
+        close_btn.set_color(theme::button_dark());
         close_btn.set_label_color(theme::text_primary());
         close_btn.set_frame(FrameType::RFlatBox);
 

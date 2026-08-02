@@ -2280,22 +2280,6 @@ impl ResultTabsWidget {
         self.fire_on_change_callback();
     }
 
-    pub fn clear_current_support_section(&mut self) -> bool {
-        if self.top_group_is_current(&self.sections.script_output) {
-            Self::clear_pane(&self.script_output);
-            Self::clear_pane(&self.script_errors);
-        } else if self.top_group_is_current(&self.sections.dbms_output) {
-            Self::clear_pane(&self.dbms_output);
-        } else if self.top_group_is_current(&self.sections.messages) {
-            Self::clear_pane(&self.messages_info);
-            Self::clear_pane(&self.messages_errors);
-        } else {
-            return false;
-        }
-        self.fire_on_change_callback();
-        true
-    }
-
     fn clear_support_panes(&mut self) {
         self.with_text_panes(Self::clear_pane);
     }

@@ -260,6 +260,7 @@ impl FindReplaceDialog {
         let mut options_flex = Flex::default();
         options_flex.set_type(fltk::group::FlexType::Row);
         let mut case_check = CheckButton::default().with_label("Case sensitive");
+        case_check.set_color(theme::button_dark());
         case_check.set_label_color(theme::text_secondary());
         options_flex.end();
         main_flex.fixed(&options_flex, CHECKBOX_ROW_HEIGHT);
@@ -274,7 +275,7 @@ impl FindReplaceDialog {
         let mut find_next_btn = Button::default()
             .with_size(BUTTON_WIDTH, BUTTON_HEIGHT)
             .with_label("Find Next");
-        find_next_btn.set_color(theme::button_primary());
+        find_next_btn.set_color(theme::button_dark());
         find_next_btn.set_label_color(theme::text_primary());
         find_next_btn.set_frame(FrameType::RFlatBox);
 
@@ -282,7 +283,7 @@ impl FindReplaceDialog {
             let mut btn = Button::default()
                 .with_size(BUTTON_WIDTH, BUTTON_HEIGHT)
                 .with_label("Replace");
-            btn.set_color(theme::button_secondary());
+            btn.set_color(theme::button_dark());
             btn.set_label_color(theme::text_primary());
             btn.set_frame(FrameType::RFlatBox);
             button_flex.fixed(&btn, BUTTON_WIDTH);
@@ -295,7 +296,7 @@ impl FindReplaceDialog {
             let mut btn = Button::default()
                 .with_size(BUTTON_WIDTH, BUTTON_HEIGHT)
                 .with_label("Replace All");
-            btn.set_color(theme::button_secondary());
+            btn.set_color(theme::button_dark());
             btn.set_label_color(theme::text_primary());
             btn.set_frame(FrameType::RFlatBox);
             button_flex.fixed(&btn, BUTTON_WIDTH);
@@ -307,7 +308,7 @@ impl FindReplaceDialog {
         let mut close_btn = Button::default()
             .with_size(BUTTON_WIDTH_SMALL, BUTTON_HEIGHT)
             .with_label("Close");
-        close_btn.set_color(theme::button_subtle());
+        close_btn.set_color(theme::button_dark());
         close_btn.set_label_color(theme::text_primary());
         close_btn.set_frame(FrameType::RFlatBox);
 
