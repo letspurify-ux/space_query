@@ -237,8 +237,20 @@ impl MenuBarBuilder {
             forward_menu_callback,
         );
         menu.add(
-            "&File/&Disconnect",
+            "&File/&Reconnect Active Connection",
+            Shortcut::None,
+            MenuFlag::Normal,
+            forward_menu_callback,
+        );
+        menu.add(
+            "&File/&Disconnect Active Connection",
             Shortcut::Command | 'd',
+            MenuFlag::Normal,
+            forward_menu_callback,
+        );
+        menu.add(
+            "&File/Disconnect &All",
+            Shortcut::None,
             MenuFlag::Normal,
             forward_menu_callback,
         );

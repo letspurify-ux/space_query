@@ -22,11 +22,11 @@ use std::time::{Duration, Instant};
 
 use crate::db::{
     ColumnInfo, ConnectionAdvancedSettings, ConnectionInfo, DatabaseType, DbConnection,
-    DbSessionLease, QueryExecutor, QueryResult, RetainedSessionDisposition,
+    DbSessionLease, ExecutionOrigin, QueryExecutor, QueryResult, RetainedSessionDisposition,
     RetainedSessionMutationOutcome, RetainedSessionPreflightAction,
     RetainedSessionPreflightDecision, RetainedSessionResolutionAction, RetainedSessionState,
-    ScriptItem, SharedConnection, SharedDbSessionLease, TableColumnDetail, TransactionMode,
-    TransactionSessionState,
+    ScriptItem, SharedConnection, SharedDbSessionLease, TabConnectionBinding, TableColumnDetail,
+    TransactionMode, TransactionSessionState,
 };
 use crate::ui::constants::*;
 use crate::ui::font_settings::{
@@ -282,6 +282,7 @@ pub(crate) struct QueryProgressSender {
     sender: mpsc::Sender<QueryProgress>,
     operation_token: Option<QueryOperationToken>,
     status_activity: Option<crate::db::DbActivityGuard>,
+    execution_origin: Arc<Mutex<Option<ExecutionOrigin>>>,
 }
 
 #[derive(Debug)]
@@ -293,14 +294,21 @@ impl QueryProgressSender {
             sender,
             operation_token: None,
             status_activity: None,
+            execution_origin: Arc::new(Mutex::new(None)),
         }
     }
 
     fn for_operation(&self, token: QueryOperationToken) -> Self {
+        let execution_origin = self
+            .execution_origin
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
         Self {
             sender: self.sender.clone(),
             operation_token: Some(token),
             status_activity: self.status_activity.clone(),
+            execution_origin: Arc::new(Mutex::new(execution_origin)),
         }
     }
 
@@ -309,13 +317,53 @@ impl QueryProgressSender {
         self
     }
 
+    fn with_execution_origin(self, origin: Option<ExecutionOrigin>) -> Self {
+        self.set_execution_origin(origin);
+        self
+    }
+
+    fn set_execution_origin(&self, origin: Option<ExecutionOrigin>) {
+        *self
+            .execution_origin
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = origin;
+    }
+
+    fn set_execution_scope(&self, scope: Option<String>) {
+        if let Some(origin) = self
+            .execution_origin
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .as_mut()
+        {
+            origin.scope = scope;
+        }
+    }
+
     fn status_finish_handle(&self) -> Option<crate::db::DbActivityFinishHandle> {
         self.status_activity
             .as_ref()
             .map(crate::db::DbActivityGuard::finish_handle)
     }
 
+    fn set_status_connection_id(&self, connection_id: crate::db::ConnectionId) {
+        if let Some(activity) = self.status_activity.as_ref() {
+            activity.set_connection_id(connection_id);
+        }
+    }
+
     pub(crate) fn send(&self, progress: QueryProgress) -> Result<(), QueryProgressSendError> {
+        match &progress {
+            QueryProgress::ConnectionChanged { info: None } => self.set_execution_origin(None),
+            QueryProgress::DatabaseChanged { info } => {
+                let scope = info.service_name.trim();
+                self.set_execution_scope((!scope.is_empty()).then(|| scope.to_string()));
+            }
+            QueryProgress::ScopeChangedNotice { selected_scope, .. } => {
+                self.set_execution_scope(selected_scope.clone());
+            }
+            _ => {}
+        }
         let progress = match progress {
             QueryProgress::BatchStart {
                 activity,
@@ -327,6 +375,22 @@ impl QueryProgressSender {
                 status_activity: status_activity.or_else(|| self.status_activity.clone()),
             },
             progress => progress,
+        };
+        let progress = if matches!(progress, QueryProgress::StatementFinished { .. }) {
+            let origin = self
+                .execution_origin
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .clone();
+            match origin {
+                Some(origin) => QueryProgress::StatementOrigin {
+                    origin,
+                    progress: Box::new(progress),
+                },
+                None => progress,
+            }
+        } else {
+            progress
         };
         let progress = match self.operation_token {
             Some(token) => QueryProgress::Operation {
@@ -370,6 +434,10 @@ pub enum QueryProgress {
     },
     OperationFinished {
         token: QueryOperationToken,
+    },
+    StatementOrigin {
+        origin: ExecutionOrigin,
+        progress: Box<QueryProgress>,
     },
     CancelOutcome {
         token: QueryOperationToken,
@@ -494,10 +562,19 @@ impl ResultTabPolicy {
 }
 
 impl QueryProgress {
-    fn inner(&self) -> &QueryProgress {
+    pub(crate) fn inner(&self) -> &QueryProgress {
         match self {
-            QueryProgress::Operation { progress, .. } => progress.inner(),
+            QueryProgress::Operation { progress, .. }
+            | QueryProgress::StatementOrigin { progress, .. } => progress.inner(),
             other => other,
+        }
+    }
+
+    fn execution_origin(&self) -> Option<&ExecutionOrigin> {
+        match self {
+            QueryProgress::Operation { progress, .. } => progress.execution_origin(),
+            QueryProgress::StatementOrigin { origin, .. } => Some(origin),
+            _ => None,
         }
     }
 }
@@ -1415,10 +1492,14 @@ impl TransactionActionBackend for MysqlTransactionActionBackend {
             mysql_auto_commit_override,
         );
         let db_type = conn_guard.db_type();
+        let execution_scope = pooled_db_session
+            .snapshot()
+            .and_then(|snapshot| snapshot.current_scope().map(str::to_string));
         drop(conn_guard);
         SqlEditorWidget::run_mysql_pooled_action_with_timeout(
             connection,
             pooled_db_session,
+            execution_scope.as_deref(),
             Some(session_pool_sender),
             current_mysql_cancel_context,
             current_query_cancel_handle,
@@ -1831,7 +1912,7 @@ pub struct SqlEditorWidget {
     editor: TextEditor,
     buffer: TextBuffer,
     style_buffer: TextBuffer,
-    connection: SharedConnection,
+    connection_binding: TabConnectionBinding,
     execute_callback: Arc<Mutex<Option<Box<dyn FnMut(&QueryResult)>>>>,
     result_tab_callback: Arc<Mutex<Option<Box<dyn FnMut(ResultTabRequest)>>>>,
     progress_callback: Arc<Mutex<Option<Box<dyn FnMut(QueryProgress)>>>>,
@@ -1896,6 +1977,10 @@ impl SqlEditorWidget {
 
     pub(crate) fn set_owner_tab_id(&self, tab_id: QueryTabId) {
         self.owner_tab_id.store(tab_id, Ordering::Relaxed);
+    }
+
+    fn bound_connection(&self) -> Option<SharedConnection> {
+        self.connection_binding.snapshot().connection()
     }
 
     pub(crate) fn editor_instance_id(&self) -> u64 {
@@ -2052,8 +2137,9 @@ impl SqlEditorWidget {
         sql_kind: crate::db::session_policy::SqlKind,
         activity_label: &'static str,
     ) -> Option<QueryOperationToken> {
+        let connection = self.bound_connection()?;
         let (db_type, connection_generation, autocommit) = {
-            let conn_guard = crate::db::try_lock_connection(&self.connection)?;
+            let conn_guard = crate::db::try_lock_connection(&connection)?;
             (
                 conn_guard.db_type(),
                 conn_guard.connection_generation(),
@@ -2616,6 +2702,18 @@ impl SqlEditorWidget {
         timeout_input: IntInput,
         intellisense_data: Arc<Mutex<IntellisenseData>>,
     ) -> Self {
+        Self::new_with_binding_and_intellisense_data(
+            TabConnectionBinding::from_connection(connection),
+            timeout_input,
+            intellisense_data,
+        )
+    }
+
+    pub(crate) fn new_with_binding_and_intellisense_data(
+        connection_binding: TabConnectionBinding,
+        timeout_input: IntInput,
+        intellisense_data: Arc<Mutex<IntellisenseData>>,
+    ) -> Self {
         let mut group = Flex::default();
         group.set_type(FlexType::Column);
         group.set_margin(0);
@@ -2705,8 +2803,13 @@ impl SqlEditorWidget {
             Arc::new(Mutex::new(None));
         let object_context_callback: ObjectContextCallback = Arc::new(Mutex::new(None));
         let context_action_callback: SqlEditorContextActionCallback = Arc::new(Mutex::new(None));
-        let (initial_db_type, session_state) =
-            crate::db::shared_connection_identity_snapshot(&connection);
+        let session_state = connection_binding.session_state();
+        let initial_db_type = connection_binding
+            .snapshot()
+            .runtime
+            .as_ref()
+            .map(|runtime| runtime.sanitized_info().db_type)
+            .unwrap_or_default();
         let intellisense_runtime = Arc::new(IntellisenseRuntimeState::new_for_connection(
             initial_db_type,
             session_state,
@@ -2736,7 +2839,7 @@ impl SqlEditorWidget {
             editor,
             buffer,
             style_buffer,
-            connection,
+            connection_binding,
             execute_callback,
             result_tab_callback,
             progress_callback: progress_callback.clone(),
@@ -2946,9 +3049,12 @@ impl SqlEditorWidget {
 
     fn run_pooled_session_close_action(&self, action: CloseSessionAction) -> Result<(), String> {
         let query_timeout = Self::parse_timeout(&self.timeout_input.value());
+        let Some(connection) = self.bound_connection() else {
+            return Err(crate::db::NOT_CONNECTED_MESSAGE.to_string());
+        };
         let (connection_generation, db_type) = {
             let Some(conn_guard) =
-                crate::db::try_lock_connection_with_activity(&self.connection, "Closing query tab")
+                crate::db::try_lock_connection_with_activity(&connection, "Closing query tab")
             else {
                 return Err(crate::db::format_connection_busy_message());
             };
@@ -3242,8 +3348,11 @@ impl SqlEditorWidget {
         enabled: bool,
         db_activity: &str,
     ) -> RetainedSessionMutationOutcome {
+        let Some(connection) = self.bound_connection() else {
+            return RetainedSessionMutationOutcome::NoSession;
+        };
         transaction_action_backend_for(db_type).apply_auto_commit_to_retained_session(
-            &self.connection,
+            &connection,
             &self.pooled_db_session,
             connection_generation,
             pool_context_epoch,
@@ -3260,8 +3369,11 @@ impl SqlEditorWidget {
         mode: TransactionMode,
         db_activity: &str,
     ) -> RetainedSessionMutationOutcome {
+        let Some(connection) = self.bound_connection() else {
+            return RetainedSessionMutationOutcome::NoSession;
+        };
         transaction_action_backend_for(db_type).apply_transaction_mode_to_retained_session(
-            &self.connection,
+            &connection,
             &self.pooled_db_session,
             connection_generation,
             pool_context_epoch,
@@ -3608,6 +3720,7 @@ impl SqlEditorWidget {
                 match message {
                     Ok(message) => {
                         processed += 1;
+                        let execution_origin = message.execution_origin().cloned();
                         match message.inner() {
                             QueryProgress::Rows { .. } => {
                                 SqlEditorWidget::invoke_progress_callback(
@@ -3653,6 +3766,7 @@ impl SqlEditorWidget {
                                     result.execution_time.as_millis() as u64,
                                     result.row_count,
                                     connection_name,
+                                    execution_origin.as_ref(),
                                     result.success,
                                     &result.message,
                                 ) {
@@ -4003,15 +4117,31 @@ impl SqlEditorWidget {
             return;
         };
         let operation_id = operation_token.operation_id;
-        let operation_activity = crate::db::track_db_activity(
-            "Generating explain plan",
-            Some(self.intellisense_runtime.cached_db_type()),
+        let operation_activity = self.connection_binding.snapshot().runtime.map_or_else(
+            || {
+                crate::db::track_db_activity(
+                    "Generating explain plan",
+                    Some(self.intellisense_runtime.cached_db_type()),
+                )
+            },
+            |runtime| {
+                crate::db::track_db_activity_for_connection(
+                    "Generating explain plan",
+                    Some(self.intellisense_runtime.cached_db_type()),
+                    runtime.id(),
+                )
+            },
         );
         let current_query_cancel_handle = self
             .install_operation_cancel_handle(operation_token, operation_activity.finish_handle());
 
         let query_timeout = Self::parse_timeout(&self.timeout_input.value());
-        let connection = self.connection.clone();
+        let Some(connection) = self.bound_connection() else {
+            Self::finalize_execution_state(&self.query_running, &self.cancel_flag);
+            let _ = self.ui_action_sender.send(UiActionResult::ConnectionBusy);
+            app::awake();
+            return;
+        };
         let sender = self.ui_action_sender.clone();
         let progress_sender =
             Self::operation_progress_sender(self.progress_sender.clone(), operation_token);
@@ -4404,14 +4534,30 @@ impl SqlEditorWidget {
             return;
         };
         let operation_id = operation_token.operation_id;
-        let operation_activity = crate::db::track_db_activity(
-            activity_label,
-            Some(self.intellisense_runtime.cached_db_type()),
+        let operation_activity = self.connection_binding.snapshot().runtime.map_or_else(
+            || {
+                crate::db::track_db_activity(
+                    activity_label,
+                    Some(self.intellisense_runtime.cached_db_type()),
+                )
+            },
+            |runtime| {
+                crate::db::track_db_activity_for_connection(
+                    activity_label,
+                    Some(self.intellisense_runtime.cached_db_type()),
+                    runtime.id(),
+                )
+            },
         );
         let current_query_cancel_handle = self
             .install_operation_cancel_handle(operation_token, operation_activity.finish_handle());
 
-        let connection = self.connection.clone();
+        let Some(connection) = self.bound_connection() else {
+            Self::finalize_execution_state(&self.query_running, &self.cancel_flag);
+            let _ = self.ui_action_sender.send(UiActionResult::ConnectionBusy);
+            app::awake();
+            return;
+        };
         let sender = self.ui_action_sender.clone();
         let session_pool_sender =
             Self::operation_progress_sender(self.progress_sender.clone(), operation_token);
@@ -5508,8 +5654,13 @@ impl SqlEditorWidget {
     }
 
     fn current_db_type(&self) -> crate::db::connection::DatabaseType {
-        self.intellisense_runtime
-            .db_type_without_blocking(&self.connection)
+        self.bound_connection()
+            .as_ref()
+            .map(|connection| {
+                self.intellisense_runtime
+                    .db_type_without_blocking(connection)
+            })
+            .unwrap_or_else(|| self.intellisense_runtime.cached_db_type())
     }
 
     fn current_mysql_delimiter(&self) -> Option<String> {
@@ -5896,7 +6047,8 @@ mod execution_state_tests {
         try_mark_query_running, BufferEdit, CancelOperationMetadata, ChunkedText,
         CompositeBufferEdit, EditGranularity, EditOperation, HighlightShadowState,
         IntellisenseRuntimeState, QueryOperationToken, QueryProgress, QueryProgressSender,
-        SqlEditorWidget, UndoDelta, UndoSnapshot, WordUndoRedoState, MAX_WORD_UNDO_HISTORY,
+        QueryResult, SqlEditorWidget, TabConnectionBinding, UndoDelta, UndoSnapshot,
+        WordUndoRedoState, MAX_WORD_UNDO_HISTORY,
     };
     use fltk::enums::Event;
     use fltk::text::TextBuffer;
@@ -6063,6 +6215,60 @@ mod execution_state_tests {
                 && matches!(first.as_ref(), QueryProgress::BatchStart { .. })
                 && matches!(second.as_ref(), QueryProgress::OperationFinished { token: inner } if *inner == token)
                 && matches!(third.as_ref(), QueryProgress::BatchFinished)
+        ));
+    }
+
+    #[test]
+    fn statement_progress_captures_connection_and_scope_at_send_time() {
+        let first_binding = TabConnectionBinding::from_connection(Arc::new(Mutex::new(
+            crate::db::DatabaseConnection::new(),
+        )));
+        first_binding.set_scope(Some("HR".to_string()));
+        let first_origin = first_binding
+            .snapshot()
+            .execution_origin()
+            .expect("first execution origin");
+        let second_binding = TabConnectionBinding::from_connection(Arc::new(Mutex::new(
+            crate::db::DatabaseConnection::new(),
+        )));
+        second_binding.set_scope(Some("SALES".to_string()));
+        let second_origin = second_binding
+            .snapshot()
+            .execution_origin()
+            .expect("second execution origin");
+        let (raw_sender, receiver) = mpsc::channel();
+        let sender =
+            QueryProgressSender::new(raw_sender).with_execution_origin(Some(first_origin.clone()));
+
+        sender
+            .send(QueryProgress::StatementFinished {
+                index: 0,
+                result: QueryResult::new_error("SELECT 1", "test"),
+                connection_name: "first".to_string(),
+                timed_out: false,
+            })
+            .expect("first statement");
+        sender.set_execution_origin(Some(second_origin.clone()));
+        sender
+            .send(QueryProgress::StatementFinished {
+                index: 1,
+                result: QueryResult::new_error("SELECT 2", "test"),
+                connection_name: "second".to_string(),
+                timed_out: false,
+            })
+            .expect("second statement");
+
+        let first = receiver.recv().expect("first progress");
+        let second = receiver.recv().expect("second progress");
+        assert_eq!(first.execution_origin(), Some(&first_origin));
+        assert_eq!(second.execution_origin(), Some(&second_origin));
+        assert!(matches!(
+            first.inner(),
+            QueryProgress::StatementFinished { .. }
+        ));
+        assert!(matches!(
+            second.inner(),
+            QueryProgress::StatementFinished { .. }
         ));
     }
 

@@ -466,6 +466,10 @@ pub struct QueryHistoryEntry {
     pub execution_time_ms: u64,
     pub row_count: usize,
     pub connection_name: String,
+    #[serde(default)]
+    pub connection_id: Option<u64>,
+    #[serde(default)]
+    pub scope: Option<String>,
     #[serde(default = "default_query_success")]
     pub success: bool,
     #[serde(default)]
@@ -504,7 +508,7 @@ impl Default for QueryHistory {
 
 #[cfg(test)]
 mod tests {
-    use super::AppConfig;
+    use super::{AppConfig, QueryHistoryEntry};
     use crate::db::{ConnectionInfo, DatabaseType};
 
     fn sample_connection(name: &str) -> ConnectionInfo {
@@ -602,6 +606,24 @@ mod tests {
 
         assert_eq!(restored.recent_connections.len(), 1);
         assert_eq!(restored.recent_connections[0].db_type, DatabaseType::MySQL);
+    }
+
+    #[test]
+    fn query_history_origin_fields_are_backward_compatible() {
+        let restored: QueryHistoryEntry = serde_json::from_str(
+            r#"{
+                "sql":"SELECT 1",
+                "timestamp":"2026-08-03 12:00:00",
+                "execution_time_ms":1,
+                "row_count":1,
+                "connection_name":"Local Oracle"
+            }"#,
+        )
+        .expect("legacy query history should deserialize");
+
+        assert_eq!(restored.connection_id, None);
+        assert_eq!(restored.scope, None);
+        assert!(restored.success);
     }
 
     #[test]

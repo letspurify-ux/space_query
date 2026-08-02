@@ -182,7 +182,8 @@ fn sql_editor_ui_connection_reads_do_not_block_on_the_shared_mutex() {
         .expect("delimiter helper should follow current_db_type");
     let helpers = &content[start..end];
 
-    assert!(helpers.contains("db_type_without_blocking(&self.connection)"));
+    assert!(helpers.contains("self.bound_connection()"));
+    assert!(helpers.contains("db_type_without_blocking(connection)"));
     assert!(helpers.contains("intellisense_runtime.session_state()"));
     assert!(!helpers.contains("self.connection.lock()"));
 }
@@ -363,7 +364,7 @@ fn oracle_reused_open_transaction_skips_transaction_mode_reapply() {
 }
 
 #[test]
-fn oracle_reused_tab_session_applies_global_schema_before_execution() {
+fn oracle_reused_tab_session_applies_tab_scope_before_execution() {
     let file = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/ui/sql_editor/execution.rs");
     let content = fs::read_to_string(&file)
         .unwrap_or_else(|err| panic!("failed to read source file {}: {err}", file.display()));
@@ -390,8 +391,10 @@ fn oracle_reused_tab_session_applies_global_schema_before_execution() {
         "Reusable Oracle execution must not clone the Arc while leaving TakenDbSessionLease to drop and close the physical session"
     );
     assert!(
-        helper.contains("conn_guard.apply_tracked_oracle_current_schema(conn.as_ref())"),
-        "Reusable and fresh Oracle execution sessions must apply the global schema before execution"
+        helper.contains("execution_scope: Option<&str>")
+            && helper.matches("apply_oracle_current_schema(").count() >= 2
+            && helper.contains("execution_scope"),
+        "Reusable and fresh Oracle execution sessions must apply the owning tab's explicit scope before execution"
     );
     assert!(
         helper.contains("prior_retained_state.requires_physical_session_preservation()"),
@@ -594,8 +597,10 @@ fn mysql_lazy_select_preserves_full_retained_session_state() {
     );
     assert!(
         helper.contains("Self::mysql_retained_session_state_after_statement(")
-            && helper.contains("Self::retain_mysql_pooled_session_if_current_with_state("),
-        "MySQL lazy SELECT cleanup must store RetainedSessionState so lock metadata survives"
+            && helper
+                .contains("Self::retain_mysql_pooled_session_if_current_with_state_and_scope(")
+            && helper.contains("execution_scope.clone()"),
+        "MySQL lazy SELECT cleanup must store RetainedSessionState with the owning tab scope so lock metadata survives"
     );
     assert!(
         !helper.contains("prior_may_have_uncommitted_work")
@@ -850,8 +855,10 @@ fn object_metadata_refresh_aborts_when_scope_apply_fails() {
         .expect("context check helper should follow pooled object session helper");
     let pooled_helper = &object_content[pooled_start..pooled_end];
     assert!(
-        pooled_helper.contains("context.acquire_session_for_current_scope()?"),
-        "Object actions should acquire sessions through the current-scope helper before querying metadata"
+        pooled_helper.contains("let context = base_context.for_scope(selected_scope);")
+            && pooled_helper
+                .contains("base_context.acquire_session_for_scope(selected_scope)?"),
+        "Object actions should acquire sessions for the selected connection root's explicit scope before querying metadata"
     );
 
     let metadata_start = object_content
@@ -1793,10 +1800,11 @@ fn regression_current_scope_matching_uses_database_backend_helper() {
     let connection = read_source("src/db/connection.rs");
 
     assert!(
-        main_window.contains("db_type.scope_values_match(Some(&current_scope), Some(scope))")
-            && main_window.contains("db_type.scope_values_match(Some(&current_scope), Some(&scope))")
-            && main_window.contains("db_type.scope_values_match(Some(update_scope), Some(current_scope))"),
-        "main-window current scope comparisons must use DatabaseType::scope_values_match instead of raw string equality"
+        main_window.contains("fn schema_update_scope_matches(")
+            && main_window.contains(
+                "db_type.scope_values_match(Some(update_scope), Some(current_scope))"
+            ),
+        "tab-scoped metadata comparisons must use DatabaseType::scope_values_match instead of raw string equality"
     );
     assert!(
         connection.contains("fn scope_values_match_exact")
@@ -1929,7 +1937,7 @@ fn mysql_plain_use_statement_updates_scope_and_refreshes_metadata() {
 }
 
 #[test]
-fn mysql_database_changed_updates_object_browser_without_clearing_sessions() {
+fn mysql_database_changed_updates_all_same_connection_tabs_without_releasing_sessions() {
     let file = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/ui/main_window.rs");
     let content = fs::read_to_string(&file)
         .unwrap_or_else(|err| panic!("failed to read source file {}: {err}", file.display()));
@@ -1944,24 +1952,22 @@ fn mysql_database_changed_updates_object_browser_without_clearing_sessions() {
     let handler = &content[start..end];
 
     assert!(
-        handler.contains("object_browser.set_selected_scope"),
-        "DatabaseChanged should select the new database in the object browser"
+        handler.contains("s.synchronize_scope_for_connection(")
+            && handler.contains("connection_id")
+            && handler.contains("selected_scope.clone()"),
+        "DatabaseChanged should synchronize the selected database by ConnectionId"
     );
     assert!(
-        handler.contains("scope_matches_current_connection"),
-        "DatabaseChanged should ignore stale database changes that do not match the current global connection"
+        handler.contains("s.retained_scope_update_for_connection("),
+        "DatabaseChanged should update retained sessions across the same connection"
     );
     assert!(
-        handler.contains("retained_scope_update"),
-        "DatabaseChanged should propagate the selected database to retained tab sessions"
+        handler.contains("if s.active_editor_tab_id == tab_id"),
+        "A background database change should not replace unrelated status text"
     );
     assert!(
-        !handler.contains("set_tab_metadata_scope"),
-        "DatabaseChanged should not maintain per-tab metadata scope"
-    );
-    assert!(
-        handler.contains("start_connection_metadata_refresh"),
-        "DatabaseChanged should reload object browser and schema metadata"
+        handler.contains("owning_result_tabs.set_execution_origin(origin)"),
+        "Scope changes should update subsequent result-tab origin labels"
     );
     assert!(
         !handler.contains("release_all_pooled_db_sessions"),
@@ -2014,20 +2020,20 @@ fn oracle_current_schema_change_updates_object_browser_scope_before_refresh() {
         .expect("StatementFinished handler should follow ScopeChangedNotice");
     let handler = &main_window[handler_start..handler_end];
     assert!(
-        handler.contains("object_browser.set_selected_scope"),
-        "ScopeChangedNotice should update object browser scope when a selected scope is supplied"
+        handler.contains("s.synchronize_scope_for_connection("),
+        "ScopeChangedNotice should synchronize the object-browser and every same-connection tab"
     );
     assert!(
-        handler.contains("scope_matches_current_connection"),
-        "ScopeChangedNotice should ignore stale schema changes that do not match the current global connection"
+        handler.contains("s.retained_scope_update_for_connection("),
+        "ScopeChangedNotice should update retained sessions for the same ConnectionId"
     );
     assert!(
-        handler.contains("retained_scope_update"),
-        "ScopeChangedNotice should propagate the selected schema to retained tab sessions"
+        handler.contains("owning_result_tabs.set_execution_origin(origin)"),
+        "ScopeChangedNotice should refresh the owning result workspace origin"
     );
     assert!(
-        !handler.contains("set_tab_metadata_scope"),
-        "ScopeChangedNotice should not maintain per-tab metadata scope"
+        handler.contains("if s.active_editor_tab_id == tab_id"),
+        "A background tab scope event must not replace the visible object-browser selection"
     );
 }
 
@@ -2327,13 +2333,13 @@ fn active_query_tab_selection_keeps_global_object_browser_scope() {
 }
 
 #[test]
-fn object_browser_scope_change_updates_global_metadata_scope() {
+fn object_browser_scope_change_updates_same_connection_metadata_scope() {
     let file = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/ui/main_window.rs");
     let content = fs::read_to_string(&file)
         .unwrap_or_else(|err| panic!("failed to read source file {}: {err}", file.display()));
 
     let start = content
-        .find("object_browser.set_scope_change_callback(move ||")
+        .find("object_browser.set_scope_change_callback(move |connection_id|")
         .expect("object browser scope change callback should exist");
     let end = content[start..]
         .find("let weak_state_for_window")
@@ -2342,33 +2348,100 @@ fn object_browser_scope_change_updates_global_metadata_scope() {
     let callback = &content[start..end];
 
     assert!(
-        callback.contains("object_browser.selected_scope()"),
-        "object browser scope changes should read the selected scope"
+        callback.contains("selected_scope_for_connection(connection_id)"),
+        "object browser scope changes should read the scope for the source ConnectionId"
     );
     assert!(
         callback.contains("retained_scope_update"),
         "object browser scope changes should propagate to retained tab sessions"
     );
     assert!(
-        callback.contains("try_lock_connection_with_activity"),
-        "object browser scope changes should avoid blocking the UI while reading connection state"
+        callback.contains("s.synchronize_scope_for_connection(connection_id")
+            && callback.contains("s.retained_scope_update_for_connection("),
+        "object browser scope changes should update every tab and retained session for the source ConnectionId"
     );
     assert!(
-        !callback.contains(".connection\n                        .lock()"),
-        "object browser scope change callback must not block on the connection mutex while holding AppState"
+        !callback.contains("try_lock_connection_with_activity")
+            && !callback.contains(".connection\n                        .lock()"),
+        "object browser scope change callback must not read a shared connection mutex while holding AppState"
     );
     assert!(
         callback.contains("start_connection_metadata_refresh"),
-        "object browser scope changes should refresh global metadata"
+        "object browser scope changes should refresh the active tab's metadata"
     );
     assert!(
-        !callback.contains("set_tab_metadata_scope"),
-        "object browser scope changes should not update per-tab metadata scope"
+        callback.contains("set_scope_switch_preflight_callback(move |connection_id|")
+            && callback.contains("retained_scope_change_blocker_for_connection(connection_id)"),
+        "scope preflight must check the source ConnectionId even when another query tab is active"
     );
 }
 
 #[test]
-fn metadata_refresh_needed_defers_while_queries_are_running() {
+fn object_browser_actions_are_routed_to_the_source_connection_tab() {
+    let main_window = read_source("src/ui/main_window.rs");
+    let callback_start = main_window
+        .find("object_browser.set_sql_callback(move |connection_id, action|")
+        .expect("connection-aware object action callback should exist");
+    let callback_end = main_window[callback_start..]
+        .find("object_browser.set_scope_change_callback")
+        .map(|offset| callback_start + offset)
+        .expect("scope callback should follow the object action callback");
+    let callback = &main_window[callback_start..callback_end];
+    assert!(callback.contains("select_or_create_query_editor_tab_for_connection("));
+    assert!(callback.contains("connection_id"));
+
+    let object_browser = read_source("src/ui/object_browser.rs");
+    let wire_start = object_browser
+        .find("fn wire_callbacks(&self, connection_id: ConnectionId")
+        .expect("multi-connection browser callback wiring should exist");
+    let wire_end = object_browser[wire_start..]
+        .find("pub fn add_runtime")
+        .map(|offset| wire_start + offset)
+        .expect("runtime registration should follow callback wiring");
+    let wiring = &object_browser[wire_start..wire_end];
+    assert!(wiring.contains("callback(connection_id, action)"));
+    assert!(!wiring.contains("Object action blocked"));
+}
+
+#[test]
+fn script_connect_transfers_runtime_work_tracking_before_old_guard_is_dropped() {
+    let execution = read_source("src/ui/sql_editor/execution.rs");
+    assert!(execution.contains("let candidate_work_guard = candidate_runtime.begin_work();"));
+    assert!(execution.contains("runtime_work_guard = Some(candidate_work_guard);"));
+    assert!(execution.contains("*context.runtime_work_guard = Some(candidate.work_guard);"));
+    assert!(execution.contains("drop(candidate_work_guard);"));
+}
+
+#[test]
+fn scope_synchronization_is_connection_id_scoped_for_oracle_mysql_and_mariadb() {
+    let content = read_source("src/ui/main_window.rs");
+    let sync_start = content
+        .find("fn synchronize_scope_for_connection(")
+        .expect("connection scope synchronization helper should exist");
+    let sync_end = content[sync_start..]
+        .find("fn set_active_editor_tab(")
+        .map(|offset| sync_start + offset)
+        .expect("active-tab helper should follow connection scope synchronization");
+    let helper = &content[sync_start..sync_end];
+
+    assert!(
+        helper.contains("connection_id() == Some(connection_id)")
+            && helper.contains("tab.connection_binding.set_scope(scope.clone())")
+            && helper.contains("set_selected_scope_for_connection(connection_id, scope)")
+            && helper.contains("self.clear_metadata_for_connection(connection_id)")
+            && helper.contains("self.mark_metadata_refresh_pending(tab_id)"),
+        "a scope change must update bindings, browser state, and metadata for every tab sharing the ConnectionId"
+    );
+    assert!(
+        !helper.contains("DatabaseType::Oracle")
+            && !helper.contains("DatabaseType::MySQL")
+            && !helper.contains("DatabaseType::MariaDB"),
+        "ConnectionId scope synchronization must use one backend-neutral policy for Oracle, MySQL, and MariaDB"
+    );
+}
+
+#[test]
+fn metadata_refresh_needed_defers_while_the_owning_tab_is_running() {
     let file = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/ui/main_window.rs");
     let content = fs::read_to_string(&file)
         .unwrap_or_else(|err| panic!("failed to read source file {}: {err}", file.display()));
@@ -2383,12 +2456,12 @@ fn metadata_refresh_needed_defers_while_queries_are_running() {
     let handler = &content[start..end];
 
     assert!(
-        handler.contains("is_any_query_running()"),
-        "metadata refresh should check for active query work before starting"
+        handler.contains("has_running_query_or_lazy_fetch_for_tab(tab_id)"),
+        "metadata refresh should check query work on the owning tab before starting"
     );
     assert!(
-        handler.contains("pending_connection_metadata_refresh = true"),
-        "metadata refresh should be deferred while query work is still active"
+        handler.contains("s.mark_metadata_refresh_pending(tab_id)"),
+        "metadata refresh should be queued for the owning tab while work is active"
     );
     assert!(
         handler.contains("start_connection_metadata_refresh"),
@@ -2397,7 +2470,7 @@ fn metadata_refresh_needed_defers_while_queries_are_running() {
 }
 
 #[test]
-fn new_query_tab_reuses_global_schema_metadata() {
+fn new_query_tab_reuses_only_same_connection_schema_metadata() {
     let file = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/ui/main_window.rs");
     let content = fs::read_to_string(&file)
         .unwrap_or_else(|err| panic!("failed to read source file {}: {err}", file.display()));
@@ -2412,21 +2485,129 @@ fn new_query_tab_reuses_global_schema_metadata() {
     let helper = &content[start..end];
 
     assert!(
-        helper.contains("state.schema_intellisense_data.clone()"),
-        "new tabs should share the global schema metadata"
+        helper.contains("let binding_connection_id = binding.snapshot().connection_id();")
+            && helper.contains(
+                "tab.connection_binding.snapshot().connection_id() == binding_connection_id"
+            ),
+        "new tabs should seed metadata only from a tab bound to the same ConnectionId"
     );
     assert!(
-        helper.contains("state.schema_highlight_data.clone()"),
-        "new tabs should receive the current global highlight data"
+        helper.contains("tab.intellisense_data") && helper.contains("tab.highlight_data.clone()"),
+        "new tabs should copy both completion and highlight data from the same connection"
     );
     assert!(
-        !helper.contains("metadata_scope"),
-        "new tabs should not retain per-tab metadata scope"
+        helper.contains("unwrap_or_else(|| (IntellisenseData::new(), HighlightData::new()))"),
+        "new tabs must start with empty metadata when no same-connection tab exists"
     );
 }
 
 #[test]
-fn connection_menu_transitions_resolve_dirty_tab_sessions_first() {
+fn startup_has_no_placeholder_database_runtime() {
+    let main_window = read_source("src/ui/main_window.rs");
+    let object_browser = read_source("src/ui/object_browser.rs");
+
+    assert!(
+        main_window.contains("let initial_binding = TabConnectionBinding::unbound();")
+            && main_window.contains("MultiObjectBrowserWidget::new(0, 0, 250, 600)")
+            && !main_window
+                .contains("let initial_runtime = connection_registry.register_unmanaged"),
+        "startup must not expose a synthetic default ORCL runtime"
+    );
+    assert!(
+        object_browser.contains("visible_connection_id: Arc::new(Mutex::new(None))")
+            && object_browser.contains("bound_tab_connection_id: Arc::new(Mutex::new(None))")
+            && object_browser.contains("connection_choice.deactivate();"),
+        "the connection selector must start empty and disabled until a real runtime is opened"
+    );
+}
+
+#[test]
+fn new_open_recent_and_last_tab_creation_capture_the_selected_database() {
+    let content = read_source("src/ui/main_window.rs");
+
+    let binding_start = content
+        .find("fn binding_for_selected_database(")
+        .expect("selected-database binding helper should exist");
+    let binding_end = content[binding_start..]
+        .find("fn create_query_editor_tab_for_runtime(")
+        .map(|offset| binding_start + offset)
+        .expect("runtime tab helper should follow selected-database binding helper");
+    let binding_helper = &content[binding_start..binding_end];
+    assert!(
+        binding_helper.contains("object_browser.selected_connection_context()")
+            && binding_helper.contains("TabConnectionBinding::bound_in_registry(")
+            && binding_helper.contains("runtime,\n                    scope"),
+        "new tabs must bind to the connection and scope selected in the DB selector"
+    );
+
+    let open_start = content
+        .find("fn open_sql_file_path(")
+        .expect("Open SQL File helper should exist");
+    let recent_start = content[open_start..]
+        .find("fn open_recent_sql_file_path(")
+        .map(|offset| open_start + offset)
+        .expect("Recent File helper should follow Open SQL File helper");
+    let recent_end = content[recent_start..]
+        .find("fn apply_default_extension(")
+        .map(|offset| recent_start + offset)
+        .expect("file extension helper should follow Recent File helper");
+    let open_helper = &content[open_start..recent_start];
+    let recent_helper = &content[recent_start..recent_end];
+    assert!(
+        open_helper.contains("binding_for_selected_database(&s)")
+            && open_helper.contains("FileActionResult::OpenInNewTab {")
+            && open_helper.contains("binding,"),
+        "Open SQL File must capture the selected DB binding before its background file read"
+    );
+    assert!(
+        recent_helper.contains("binding_for_selected_database(&s)")
+            && recent_helper.contains("create_query_editor_tab_for_binding("),
+        "Recent File must open against the selected DB binding"
+    );
+
+    let close_start = content
+        .find("fn close_query_editor_tab(")
+        .expect("query-tab close helper should exist");
+    let close_end = content[close_start..]
+        .find("fn attach_editor_callbacks(")
+        .map(|offset| close_start + offset)
+        .expect("editor callback helper should follow query-tab close helper");
+    assert!(
+        content[close_start..close_end]
+            .contains("create_query_editor_tab_for_selected_database_with_display_stabilization("),
+        "closing the last tab must recreate it against the selected DB"
+    );
+}
+
+#[test]
+fn query_tab_headers_prefix_the_database_context() {
+    let content = read_source("src/ui/main_window.rs");
+    let display_start = content
+        .find("fn tab_display_label(")
+        .expect("query tab display helper should exist");
+    let display_end = content[display_start..]
+        .find("fn refresh_tab_label(")
+        .map(|offset| display_start + offset)
+        .expect("tab refresh helper should follow display helper");
+    let display_helper = &content[display_start..display_end];
+
+    assert!(
+        display_helper.contains("format!(\"{connection} · {document_label}\")")
+            && !display_helper.contains("format!(\"{document_label} · {connection}\")"),
+        "query tab headers must place the DB connection before the query or file label"
+    );
+    assert!(
+        !display_helper.contains("binding.scope"),
+        "query tab headers must not display schema, account, or selected database scope"
+    );
+    assert!(
+        content.contains("format!(\"{connection_label} · Query {query_number}\")"),
+        "new query tab headers must use the same DB-first order immediately"
+    );
+}
+
+#[test]
+fn connection_menu_disconnects_resolve_only_the_target_runtime_sessions() {
     let file = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/ui/main_window.rs");
     let content = fs::read_to_string(&file)
         .unwrap_or_else(|err| panic!("failed to read source file {}: {err}", file.display()));
@@ -2435,24 +2616,28 @@ fn connection_menu_transitions_resolve_dirty_tab_sessions_first() {
         .find("\"File/Connect\" => {")
         .expect("File/Connect branch should exist");
     let connect_end = content[connect_start..]
-        .find("\"File/Disconnect\" => {")
+        .find("\"File/Reconnect Active Connection\" => {")
         .map(|offset| connect_start + offset)
-        .expect("File/Disconnect branch should follow File/Connect");
+        .expect("Reconnect branch should follow File/Connect");
     let connect_branch = &content[connect_start..connect_end];
     assert!(
-        connect_branch.contains("resolve_pooled_sessions_before_connection_transition(state)"),
-        "Connect must resolve dirty/decision-required tab sessions before replacing the physical connection"
+        connect_branch.contains("create_query_editor_tab_for_runtime")
+            && !connect_branch.contains("resolve_pooled_sessions_before_retained_action"),
+        "Connect should open/reuse a separate runtime and must not disturb retained sessions on other connections"
     );
 
-    let disconnect_start = connect_end;
+    let disconnect_start = content
+        .find("\"File/Disconnect\" | \"File/Disconnect Active Connection\" => {")
+        .expect("active disconnect branch should exist");
     let disconnect_end = content[disconnect_start..]
-        .find("\"File/Open SQL File\" => {")
+        .find("\"File/Disconnect All\" => {")
         .map(|offset| disconnect_start + offset)
-        .expect("File/Open SQL File branch should follow File/Disconnect");
+        .expect("Disconnect All should follow active disconnect");
     let disconnect_branch = &content[disconnect_start..disconnect_end];
     assert!(
-        disconnect_branch.contains("resolve_pooled_sessions_before_connection_transition(state)"),
-        "Disconnect must resolve dirty/decision-required tab sessions before dropping physical sessions"
+        disconnect_branch
+            .contains("resolve_pooled_sessions_before_runtime_disconnect(state, connection_id)"),
+        "Active disconnect must resolve dirty/decision-required sessions only for its ConnectionId"
     );
 }
 
@@ -2516,49 +2701,44 @@ fn mysql_late_cancel_does_not_mark_completed_batch_interrupted() {
 }
 
 #[test]
-fn connection_success_clears_schema_snapshot_before_set_db_type() {
-    // ConnectionResult::Success used to leave the previous connection's
-    // schema_intellisense_data and schema_highlight_data in place until the
-    // async metadata refresh completed. set_db_type below it triggers a
-    // rehighlight, so for the duration of the refresh the editors painted
-    // identifiers from the previous connection's schema. The handler must drop
-    // the stale snapshot before set_db_type runs.
+fn connection_success_clears_matching_connection_metadata_before_set_db_type() {
     let file = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/ui/main_window.rs");
     let content = fs::read_to_string(&file)
         .unwrap_or_else(|err| panic!("failed to read source file {}: {err}", file.display()));
 
     let start = content
-        .find("ConnectionResult::Success(info) => {")
+        .rfind("ConnectionResult::Success {")
         .expect("ConnectionResult::Success handler should exist");
     let end = content[start..]
-        .find("ConnectionResult::Failure(err) =>")
+        .find("ConnectionResult::Failure {")
         .map(|offset| start + offset)
         .expect("ConnectionResult::Failure handler should follow Success");
     let handler = &content[start..end];
 
     let clear_idx = handler
-        .find("MainWindow::update_schema_snapshot(")
-        .expect("connection success must clear the schema snapshot");
+        .find("s.clear_metadata_for_connection(connection_id)")
+        .expect("connection success must clear metadata for its ConnectionId");
     let set_db_type_idx = handler
         .find("set_db_type(info.db_type)")
         .expect("connection success must set the db type on editors");
     assert!(
         clear_idx < set_db_type_idx,
-        "schema snapshot must be cleared before set_db_type triggers rehighlight"
+        "connection-scoped metadata must be cleared before set_db_type triggers rehighlight"
     );
 
-    let clear_call_end = handler[clear_idx..]
-        .find(");")
-        .map(|offset| clear_idx + offset)
-        .expect("update_schema_snapshot call must terminate");
-    let clear_call = &handler[clear_idx..clear_call_end];
+    let clear_start = content
+        .find("fn clear_metadata_for_connection(")
+        .expect("connection-scoped metadata clear helper should exist");
+    let clear_end = content[clear_start..]
+        .find("fn mark_metadata_refresh_pending(")
+        .map(|offset| clear_start + offset)
+        .expect("metadata pending helper should follow clear helper");
+    let clear_helper = &content[clear_start..clear_end];
     assert!(
-        clear_call.contains("IntellisenseData::new()"),
-        "connection switch must reset intellisense data to empty"
-    );
-    assert!(
-        clear_call.contains("HighlightData::new()"),
-        "connection switch must reset highlight data to empty"
+        clear_helper.contains("connection_id() == Some(connection_id)")
+            && clear_helper.contains("IntellisenseData::new()")
+            && clear_helper.contains("HighlightData::new()"),
+        "metadata clear must reset completion/highlight data only on tabs bound to the matching ConnectionId"
     );
 }
 

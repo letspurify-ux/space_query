@@ -13,6 +13,7 @@ use std::sync::{mpsc, OnceLock};
 use std::sync::{Arc, Mutex};
 use std::thread;
 
+use crate::db::ExecutionOrigin;
 use crate::ui::center_on_main;
 use crate::ui::constants::*;
 use crate::ui::syntax_highlight::{encode_fltk_style_bytes, set_text_buffer_raw_bytes};
@@ -33,6 +34,8 @@ struct PendingHistoryEntry {
     execution_time_ms: u64,
     row_count: usize,
     connection_name: String,
+    connection_id: Option<u64>,
+    scope: Option<String>,
     success: bool,
     message: String,
 }
@@ -73,6 +76,8 @@ fn materialize_history_entry(entry: PendingHistoryEntry) -> QueryHistoryEntry {
         execution_time_ms: entry.execution_time_ms,
         row_count: entry.row_count,
         connection_name: entry.connection_name,
+        connection_id: entry.connection_id,
+        scope: entry.scope,
         success: entry.success,
         error_message,
         error_line,
@@ -135,7 +140,7 @@ fn history_writer_sender() -> mpsc::Sender<HistoryCommand> {
         .clone()
 }
 
-fn send_history_command(command: HistoryCommand) -> Result<(), mpsc::SendError<HistoryCommand>> {
+fn send_history_command(command: HistoryCommand) -> Result<(), ()> {
     let initial_sender = history_writer_sender();
     let command = match initial_sender.send(command) {
         Ok(()) => return Ok(()),
@@ -146,7 +151,7 @@ fn send_history_command(command: HistoryCommand) -> Result<(), mpsc::SendError<H
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     *guard = spawn_history_writer();
-    guard.send(command)
+    guard.send(command).map_err(|_| ())
 }
 
 fn parse_error_line(message: &str) -> Option<usize> {
@@ -735,6 +740,7 @@ impl QueryHistoryDialog {
         execution_time_ms: u64,
         row_count: usize,
         connection_name: &str,
+        origin: Option<&ExecutionOrigin>,
         success: bool,
         message: &str,
     ) -> Result<(), String> {
@@ -746,6 +752,8 @@ impl QueryHistoryDialog {
             execution_time_ms,
             row_count,
             connection_name: connection_name.to_string(),
+            connection_id: origin.map(|origin| origin.connection_id.get()),
+            scope: origin.and_then(|origin| origin.scope.clone()),
             success,
             message: message.to_string(),
         };
@@ -833,6 +841,14 @@ fn history_entry_matches_filter(
         return true;
     }
 
+    if entry
+        .scope
+        .as_deref()
+        .is_some_and(|scope| contains_lower(scope, search_lower))
+    {
+        return true;
+    }
+
     if contains_lower(&entry.timestamp, search_lower) {
         return true;
     }
@@ -888,9 +904,14 @@ fn history_entry_display(entry: &QueryHistoryEntry) -> String {
         .next()
         .unwrap_or_default()
         .trim_end_matches('\r');
+    let origin = entry.scope.as_deref().map_or_else(
+        || entry.connection_name.clone(),
+        |scope| format!("{} / {scope}", entry.connection_name),
+    );
     format!(
-        "{color_prefix}{} | {} | {}ms | {} rows",
+        "{color_prefix}{} | {} | {} | {}ms | {} rows",
         entry.timestamp,
+        origin,
         truncate_sql(sql_first_line, 50),
         entry.execution_time_ms,
         entry.row_count
@@ -1008,12 +1029,15 @@ server location at line 12";
             execution_time_ms: 10,
             row_count: 1,
             connection_name: "HRDEV".to_string(),
+            connection_id: Some(7),
+            scope: Some("HR".to_string()),
             success: true,
             error_message: None,
             error_line: None,
         };
         assert!(history_entry_matches_filter(&entry, "employees", false));
         assert!(history_entry_matches_filter(&entry, "hrdev", false));
+        assert!(history_entry_matches_filter(&entry, "hr", false));
         assert!(!history_entry_matches_filter(&entry, "orders", false));
     }
 
@@ -1025,6 +1049,8 @@ server location at line 12";
             execution_time_ms: 5,
             row_count: 1,
             connection_name: "DEV".to_string(),
+            connection_id: None,
+            scope: None,
             success: true,
             error_message: None,
             error_line: None,
@@ -1035,6 +1061,8 @@ server location at line 12";
             execution_time_ms: 5,
             row_count: 0,
             connection_name: "DEV".to_string(),
+            connection_id: None,
+            scope: None,
             success: false,
             error_message: Some("ORA-00900 invalid SQL statement".to_string()),
             error_line: Some(1),
@@ -1051,6 +1079,8 @@ server location at line 12";
             execution_time_ms: 21,
             row_count: 0,
             connection_name: "DEV".to_string(),
+            connection_id: Some(9),
+            scope: Some("HR".to_string()),
             success: false,
             message: "ORA-00900 invalid SQL statement near line 7".to_string(),
         };
@@ -1058,6 +1088,8 @@ server location at line 12";
         let materialized = materialize_history_entry(entry);
         assert_eq!(materialized.sql, "CONNECT scott/tiger@localhost:1521/ORCL");
         assert_eq!(materialized.error_line, Some(7));
+        assert_eq!(materialized.connection_id, Some(9));
+        assert_eq!(materialized.scope.as_deref(), Some("HR"));
         assert!(materialized.error_message.is_some());
     }
 }

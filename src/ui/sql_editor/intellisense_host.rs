@@ -20,7 +20,7 @@ impl SqlEditorWidget {
         let widget = self.clone();
         let intellisense_popup = self.intellisense_popup.clone();
         let column_sender = self.column_sender.clone();
-        let connection = self.connection.clone();
+        let connection_binding = self.connection_binding.clone();
         let intellisense_runtime = self.intellisense_runtime.clone();
 
         let receiver: Arc<Mutex<mpsc::Receiver<ColumnLoadUpdate>>> =
@@ -39,7 +39,7 @@ impl SqlEditorWidget {
             widget: SqlEditorWidget,
             intellisense_popup: Arc<Mutex<IntellisensePopup>>,
             column_sender: mpsc::Sender<ColumnLoadUpdate>,
-            connection: SharedConnection,
+            connection_binding: TabConnectionBinding,
             intellisense_runtime: Arc<IntellisenseRuntimeState>,
         ) {
             if editor.was_deleted() {
@@ -154,16 +154,18 @@ impl SqlEditorWidget {
                 if let Some(pending) = pending {
                     let (cursor_pos, _) = SqlEditorWidget::editor_cursor_position(&editor, &buffer);
                     if cursor_pos == pending.cursor_pos {
-                        SqlEditorWidget::trigger_intellisense(
-                            &editor,
-                            &buffer,
-                            &widget.highlight_shadow,
-                            &intellisense_data,
-                            &intellisense_popup,
-                            &column_sender,
-                            &connection,
-                            &intellisense_runtime,
-                        );
+                        if let Some(connection) = connection_binding.metadata_connection() {
+                            SqlEditorWidget::trigger_intellisense(
+                                &editor,
+                                &buffer,
+                                &widget.highlight_shadow,
+                                &intellisense_data,
+                                &intellisense_popup,
+                                &column_sender,
+                                &connection,
+                                &intellisense_runtime,
+                            );
+                        }
                     } else {
                         intellisense_runtime.clear_pending_intellisense();
                     }
@@ -230,7 +232,7 @@ impl SqlEditorWidget {
                     widget.clone(),
                     intellisense_popup.clone(),
                     column_sender.clone(),
-                    connection.clone(),
+                    connection_binding.clone(),
                     intellisense_runtime.clone(),
                 );
             });
@@ -245,7 +247,7 @@ impl SqlEditorWidget {
             widget,
             intellisense_popup,
             column_sender,
-            connection,
+            connection_binding,
             intellisense_runtime,
         );
     }

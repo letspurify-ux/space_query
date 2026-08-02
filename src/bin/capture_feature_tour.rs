@@ -343,7 +343,14 @@ fn capture_object_browser(main_window: &mut MainWindow) {
     );
     main_window.capture_tour_show_object_browser();
     pump(500);
-    save_main_part("/tmp/space-query-object-browser.ppm", 0, 70, 250, 705);
+    save_main("/tmp/space-query-object-browser-full.ppm");
+    let capture_scale = std::env::var("SPACE_QUERY_CAPTURE_UI_SCALE")
+        .ok()
+        .and_then(|value| value.parse::<u32>().ok())
+        .unwrap_or(100);
+    if capture_scale <= 100 {
+        save_main_part("/tmp/space-query-object-browser.ppm", 0, 70, 250, 705);
+    }
 }
 
 fn capture_result_grid(main_window: &mut MainWindow) {
@@ -519,6 +526,7 @@ fn capture_dialogs(config: &AppConfig) {
         18,
         6,
         "Local Oracle",
+        None,
         true,
         "6 rows selected",
     );
@@ -527,6 +535,7 @@ fn capture_dialogs(config: &AppConfig) {
         4,
         0,
         "Local Oracle",
+        None,
         false,
         "ORA-00942: table or view does not exist",
     );
@@ -559,12 +568,18 @@ fn capture_dialogs(config: &AppConfig) {
 }
 
 fn main() {
+    let ui_scale_percent = std::env::var("SPACE_QUERY_CAPTURE_UI_SCALE")
+        .ok()
+        .and_then(|value| value.parse::<u32>().ok())
+        .map(AppConfig::clamp_ui_scale_percent)
+        .unwrap_or(100);
     let config = AppConfig {
         editor_font: "D2Coding".to_string(),
         result_font: "D2Coding".to_string(),
         ui_font_size: 16,
         editor_font_size: 16,
         result_font_size: 16,
+        ui_scale_percent,
         ..AppConfig::default()
     };
     config

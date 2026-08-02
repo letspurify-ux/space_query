@@ -1,8 +1,7 @@
 use fltk::{
     app,
     button::Button,
-    draw::set_cursor,
-    enums::{Align, CallbackTrigger, Cursor, FrameType},
+    enums::{Align, CallbackTrigger, FrameType},
     frame::Frame,
     group::{Flex, FlexType},
     input::Input,
@@ -16,6 +15,9 @@ use std::env;
 use std::fs;
 use std::fs::OpenOptions;
 use std::io::Write;
+#[cfg(test)]
+use std::ops::Deref;
+use std::ops::DerefMut;
 use std::panic::{self, AssertUnwindSafe};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -277,6 +279,83 @@ struct OracleThinBatchOutcome {
     refreshed_pool_context_epoch: Option<u64>,
 }
 
+#[cfg(test)]
+struct DirectOracleThinSession<'a>(&'a mut OracleThinSession);
+
+#[cfg(test)]
+impl Deref for DirectOracleThinSession<'_> {
+    type Target = OracleThinSession;
+
+    fn deref(&self) -> &Self::Target {
+        self.0
+    }
+}
+
+#[cfg(test)]
+impl DerefMut for DirectOracleThinSession<'_> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        self.0
+    }
+}
+
+trait OracleThinBatchConnection: DerefMut<Target = OracleThinSession> {
+    fn replace_pooled(
+        &mut self,
+        replacement: PooledThinConnection<OracleThinSession>,
+    ) -> Result<(), String>;
+}
+
+impl OracleThinBatchConnection for PooledThinConnection<OracleThinSession> {
+    fn replace_pooled(
+        &mut self,
+        replacement: PooledThinConnection<OracleThinSession>,
+    ) -> Result<(), String> {
+        *self = replacement;
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+impl OracleThinBatchConnection for DirectOracleThinSession<'_> {
+    fn replace_pooled(
+        &mut self,
+        _replacement: PooledThinConnection<OracleThinSession>,
+    ) -> Result<(), String> {
+        Err("CONNECT requires a tab-owned Oracle Thin pooled session".to_string())
+    }
+}
+
+struct OracleThinConnectedCandidate {
+    connection: crate::db::SharedConnection,
+    session: PooledThinConnection<OracleThinSession>,
+    sanitized_info: ConnectionInfo,
+    connection_generation: u64,
+    pool_context_epoch: u64,
+    binding_revision: u64,
+    auto_commit: bool,
+    transaction_mode: crate::db::TransactionMode,
+    connection_id: crate::db::ConnectionId,
+    work_guard: crate::db::ConnectionWorkGuard,
+}
+
+struct OracleThinConnectionTransitionContext<'a> {
+    connection_binding: &'a crate::db::TabConnectionBinding,
+    pooled_db_session: &'a SharedDbSessionLease,
+    current_oracle_thin_cancel_context: &'a Arc<Mutex<Option<OracleThinCancelHandle>>>,
+    current_query_cancel_handle: &'a Arc<Mutex<Option<QueryCancelHandle>>>,
+    current_operation_id: &'a Arc<AtomicU64>,
+    operation_id: u64,
+    pool_size: u32,
+    binding_revision: u64,
+    active_connection: crate::db::SharedConnection,
+    connection_generation: u64,
+    pool_context_epoch: u64,
+    scope: Option<String>,
+    connected: bool,
+    preconnected_info: Option<ConnectionInfo>,
+    runtime_work_guard: &'a mut Option<crate::db::ConnectionWorkGuard>,
+}
+
 struct OracleThinCursorStreamOutcome {
     cursor_result: CursorResult,
     was_cancelled: bool,
@@ -417,6 +496,8 @@ enum ExecutionWorkerOutcome<'a> {
 /// through the trait and every implementation.
 struct ExecutionWorkerContext<'a> {
     shared_connection: &'a crate::db::SharedConnection,
+    connection_binding: &'a crate::db::TabConnectionBinding,
+    binding_revision: u64,
     sender: &'a QueryProgressSender,
     sql_text: &'a str,
     pooled_db_session: &'a SharedDbSessionLease,
@@ -436,6 +517,8 @@ struct ExecutionWorkerContext<'a> {
     lazy_fetch_batch_size: usize,
     db_activity: &'a str,
     current_operation_autocommit: &'a Arc<Mutex<bool>>,
+    execution_scope: Option<String>,
+    runtime_work_guard: &'a mut Option<crate::db::ConnectionWorkGuard>,
 }
 
 trait ExecutionWorkerBackend: Sync {
@@ -496,6 +579,8 @@ impl ExecutionWorkerBackend for OracleExecutionWorkerBackend {
     ) -> ExecutionWorkerOutcome<'a> {
         let ExecutionWorkerContext {
             shared_connection,
+            connection_binding,
+            binding_revision,
             sender,
             sql_text,
             pooled_db_session,
@@ -512,6 +597,8 @@ impl ExecutionWorkerBackend for OracleExecutionWorkerBackend {
             lazy_fetch_batch_size,
             db_activity,
             current_operation_autocommit,
+            execution_scope,
+            runtime_work_guard,
             ..
         } = context;
 
@@ -525,14 +612,21 @@ impl ExecutionWorkerBackend for OracleExecutionWorkerBackend {
             conn_guard,
             mut conn_name,
             db_type,
-            auto_commit,
-            selected_transaction_mode,
+            auto_commit: initial_auto_commit,
+            selected_transaction_mode: initial_transaction_mode,
             session,
         } = startup;
 
-        if startup_policy.requires_connected_session
-            && (!conn_guard.is_connected() || !conn_guard.has_connection_handle())
-        {
+        let items = super::query_text::split_script_items_for_db_type(
+            sql_text,
+            Some(crate::db::DatabaseType::Oracle),
+        );
+        let binding_snapshot = connection_binding.snapshot();
+        let has_bound_live_connection = binding_snapshot.revision == binding_revision
+            && binding_snapshot.runtime.is_some()
+            && conn_guard.is_connected()
+            && conn_guard.has_connection_handle();
+        if startup_policy.requires_connected_session && !has_bound_live_connection {
             let message = crate::db::NOT_CONNECTED_MESSAGE.to_string();
             let _ = sender.send(QueryProgress::ConnectionChanged { info: None });
             app::awake();
@@ -547,100 +641,204 @@ impl ExecutionWorkerBackend for OracleExecutionWorkerBackend {
             return ExecutionWorkerOutcome::Handled;
         }
 
-        if conn_guard.is_connected() {
-            conn_name = conn_guard.get_info().name.clone();
-        } else {
-            conn_name.clear();
-        }
-
-        let connection_generation = conn_guard.connection_generation();
-        let pool_context = match conn_guard.pool_session_context() {
-            Ok(context) => context,
-            Err(message) => {
-                SqlEditorWidget::emit_execution_startup_error(
-                    sender,
-                    script_mode,
-                    sql_text,
-                    &conn_name,
-                    &message,
-                    Some(&session),
-                );
-                return ExecutionWorkerOutcome::Handled;
-            }
-        };
-        let pool_context_epoch = pool_context.pool_context_epoch();
-        let retained = pooled_db_session.take_reusable_lease(
+        let pool_size = conn_guard.connection_pool_size();
+        let (
+            mut thin_conn,
+            prior_retained_state,
+            active_connection,
             connection_generation,
             pool_context_epoch,
-            db_type,
-        );
-        drop(conn_guard);
+            auto_commit,
+            selected_transaction_mode,
+            active_scope,
+            active_binding_revision,
+            preconnected_info,
+        ) = if has_bound_live_connection {
+            conn_name = conn_guard.get_info().name.clone();
+            let connection_generation = conn_guard.connection_generation();
+            let pool_context = match conn_guard.pool_session_context() {
+                Ok(context) => context.for_scope(execution_scope.as_deref()),
+                Err(message) => {
+                    SqlEditorWidget::emit_execution_startup_error(
+                        sender,
+                        script_mode,
+                        sql_text,
+                        &conn_name,
+                        &message,
+                        Some(&session),
+                    );
+                    return ExecutionWorkerOutcome::Handled;
+                }
+            };
+            let pool_context_epoch = pool_context.pool_context_epoch();
+            let retained = pooled_db_session.take_reusable_lease(
+                connection_generation,
+                pool_context_epoch,
+                db_type,
+            );
+            drop(conn_guard);
 
-        let (mut thin_conn, prior_retained_state) = match retained {
-            crate::db::RetainedSessionTakeOutcome::Reusable(retained_session) => {
-                match retained_session.into_oracle_thin_connection_with_retained_state() {
-                    Some((conn, state)) => (conn, state),
-                    None => {
-                        SqlEditorWidget::emit_execution_startup_error(
-                            sender,
-                            script_mode,
-                            sql_text,
-                            &conn_name,
-                            "Expected Oracle thin retained session",
-                            Some(&session),
-                        );
-                        return ExecutionWorkerOutcome::Handled;
+            let (thin_conn, prior_retained_state) = match retained {
+                crate::db::RetainedSessionTakeOutcome::Reusable(retained_session) => {
+                    match retained_session.into_oracle_thin_connection_with_retained_state() {
+                        Some((conn, state)) => (conn, state),
+                        None => {
+                            SqlEditorWidget::emit_execution_startup_error(
+                                sender,
+                                script_mode,
+                                sql_text,
+                                &conn_name,
+                                "Expected Oracle thin retained session",
+                                Some(&session),
+                            );
+                            return ExecutionWorkerOutcome::Handled;
+                        }
                     }
                 }
-            }
-            crate::db::RetainedSessionTakeOutcome::BlockedContextMismatch(state) => {
+                crate::db::RetainedSessionTakeOutcome::BlockedContextMismatch(state) => {
+                    SqlEditorWidget::emit_execution_startup_error(
+                        sender,
+                        script_mode,
+                        sql_text,
+                        &conn_name,
+                        &format!(
+                            "Cannot execute with a retained Oracle thin session in state {}. Commit, rollback, or discard it first.",
+                            state.label()
+                        ),
+                        Some(&session),
+                    );
+                    return ExecutionWorkerOutcome::Handled;
+                }
+                crate::db::RetainedSessionTakeOutcome::NoSession
+                | crate::db::RetainedSessionTakeOutcome::DiscardedBecauseStale => {
+                    match pool_context.acquire_session_for_current_scope() {
+                        Ok(DbPoolSession::OracleThin(conn)) => {
+                            (*conn, RetainedSessionState::default())
+                        }
+                        Ok(other) => {
+                            SqlEditorWidget::emit_execution_startup_error(
+                                sender,
+                                script_mode,
+                                sql_text,
+                                &conn_name,
+                                &format!(
+                                    "Expected Oracle thin pool session but acquired {}",
+                                    other.db_type()
+                                ),
+                                Some(&session),
+                            );
+                            return ExecutionWorkerOutcome::Handled;
+                        }
+                        Err(message) => {
+                            SqlEditorWidget::emit_execution_startup_error(
+                                sender,
+                                script_mode,
+                                sql_text,
+                                &conn_name,
+                                &message,
+                                Some(&session),
+                            );
+                            return ExecutionWorkerOutcome::Handled;
+                        }
+                    }
+                }
+            };
+            (
+                thin_conn,
+                prior_retained_state,
+                shared_connection.clone(),
+                connection_generation,
+                pool_context_epoch,
+                initial_auto_commit,
+                initial_transaction_mode,
+                execution_scope.clone(),
+                binding_revision,
+                None,
+            )
+        } else {
+            pooled_db_session.clear();
+            drop(conn_guard);
+            let Some(ScriptItem::ToolCommand(ToolCommand::Connect {
+                username,
+                password,
+                host,
+                port,
+                service_name,
+            })) = items.first().cloned()
+            else {
                 SqlEditorWidget::emit_execution_startup_error(
                     sender,
                     script_mode,
                     sql_text,
                     &conn_name,
-                    &format!(
-                        "Cannot execute with a retained Oracle thin session in state {}. Commit, rollback, or discard it first.",
-                        state.label()
-                    ),
+                    "A disconnected Oracle Thin tab must begin the script with CONNECT",
                     Some(&session),
                 );
                 return ExecutionWorkerOutcome::Handled;
+            };
+            if !SqlEditorWidget::operation_snapshot_is_current(current_operation_id, operation_id) {
+                return ExecutionWorkerOutcome::Handled;
             }
-            crate::db::RetainedSessionTakeOutcome::NoSession
-            | crate::db::RetainedSessionTakeOutcome::DiscardedBecauseStale => {
-                match pool_context.acquire_session_for_current_scope() {
-                    Ok(DbPoolSession::OracleThin(conn)) => (*conn, RetainedSessionState::default()),
-                    Ok(other) => {
-                        SqlEditorWidget::emit_execution_startup_error(
-                            sender,
-                            script_mode,
-                            sql_text,
-                            &conn_name,
-                            &format!(
-                                "Expected Oracle thin pool session but acquired {}",
-                                other.db_type()
-                            ),
-                            Some(&session),
-                        );
-                        return ExecutionWorkerOutcome::Handled;
-                    }
-                    Err(message) => {
-                        SqlEditorWidget::emit_execution_startup_error(
-                            sender,
-                            script_mode,
-                            sql_text,
-                            &conn_name,
-                            &message,
-                            Some(&session),
-                        );
-                        return ExecutionWorkerOutcome::Handled;
-                    }
+            let info = SqlEditorWidget::oracle_thin_connect_info(
+                username,
+                password,
+                host,
+                port,
+                service_name,
+            );
+            let candidate = match SqlEditorWidget::connect_oracle_thin_tab_candidate(
+                connection_binding,
+                binding_revision,
+                info,
+                pool_size,
+                db_activity,
+                current_operation_id,
+                operation_id,
+                cancel_flag,
+                query_timeout,
+            ) {
+                Ok(candidate) => candidate,
+                Err(message) => {
+                    SqlEditorWidget::emit_execution_startup_error(
+                        sender,
+                        script_mode,
+                        sql_text,
+                        &conn_name,
+                        &format!("Connection failed: {message}"),
+                        Some(&session),
+                    );
+                    return ExecutionWorkerOutcome::Handled;
                 }
-            }
+            };
+            *runtime_work_guard = Some(candidate.work_guard);
+            conn_name = candidate.sanitized_info.name.clone();
+            sender.set_status_connection_id(candidate.connection_id);
+            sender.set_execution_origin(Some(ExecutionOrigin {
+                connection_id: candidate.connection_id,
+                connection_generation: candidate.connection_generation,
+                pool_context_epoch: candidate.pool_context_epoch,
+                binding_revision: candidate.binding_revision,
+                db_type: candidate.sanitized_info.db_type,
+                scope: None,
+                display_name: candidate.sanitized_info.name.clone(),
+            }));
+            (
+                candidate.session,
+                RetainedSessionState::default(),
+                candidate.connection,
+                candidate.connection_generation,
+                candidate.pool_context_epoch,
+                candidate.auto_commit,
+                candidate.transaction_mode,
+                None,
+                candidate.binding_revision,
+                Some(candidate.sanitized_info),
+            )
         };
 
-        if !SqlEditorWidget::operation_snapshot_is_current(current_operation_id, operation_id) {
+        if preconnected_info.is_none()
+            && !SqlEditorWidget::operation_snapshot_is_current(current_operation_id, operation_id)
+        {
             return ExecutionWorkerOutcome::Handled;
         }
 
@@ -655,7 +853,9 @@ impl ExecutionWorkerBackend for OracleExecutionWorkerBackend {
             current_query_cancel_handle,
             Some(cancel_handle.clone()),
         );
-        if !SqlEditorWidget::operation_snapshot_is_current(current_operation_id, operation_id) {
+        if preconnected_info.is_none()
+            && !SqlEditorWidget::operation_snapshot_is_current(current_operation_id, operation_id)
+        {
             SqlEditorWidget::set_current_oracle_thin_cancel_context(
                 current_oracle_thin_cancel_context,
                 current_query_cancel_handle,
@@ -667,10 +867,6 @@ impl ExecutionWorkerBackend for OracleExecutionWorkerBackend {
             let _ = cancel_handle.break_execution();
         }
 
-        let items = super::query_text::split_script_items_for_db_type(
-            sql_text,
-            Some(crate::db::DatabaseType::Oracle),
-        );
         if SqlEditorWidget::should_use_lazy_fetch_for_single_statement(&items) {
             if let ScriptItem::Statement(statement_sql) = &items[0] {
                 let sql_to_execute = statement_sql.trim_end_matches(';').trim().to_string();
@@ -711,12 +907,7 @@ impl ExecutionWorkerBackend for OracleExecutionWorkerBackend {
                             SqlEditorWidget::current_text_output_settings(&session);
                         let session_id = next_lazy_fetch_session_id
                             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                        let current_scope = SqlEditorWidget::current_scope_for_retained_session(
-                            shared_connection,
-                            connection_generation,
-                            crate::db::DatabaseType::Oracle,
-                            "oracle thin lazy fetch",
-                        );
+                        let current_scope = execution_scope.clone();
                         match SqlEditorWidget::start_oracle_thin_lazy_select(
                             thin_conn,
                             pooled_db_session.clone(),
@@ -772,11 +963,28 @@ impl ExecutionWorkerBackend for OracleExecutionWorkerBackend {
             return ExecutionWorkerOutcome::Handled;
         }
 
-        let batch_outcome = SqlEditorWidget::execute_oracle_thin_batch(
+        let mut transition_context = OracleThinConnectionTransitionContext {
+            connection_binding,
+            pooled_db_session,
+            current_oracle_thin_cancel_context,
+            current_query_cancel_handle,
+            current_operation_id,
+            operation_id,
+            pool_size,
+            binding_revision: active_binding_revision,
+            active_connection: active_connection.clone(),
+            connection_generation,
+            pool_context_epoch,
+            scope: active_scope.clone(),
+            connected: true,
+            preconnected_info,
+            runtime_work_guard,
+        };
+        let batch_outcome = SqlEditorWidget::execute_oracle_thin_batch_with_connection(
             &mut thin_conn,
             sender,
             sql_text,
-            &conn_name,
+            &mut conn_name,
             &session,
             cancel_flag,
             script_mode,
@@ -786,7 +994,9 @@ impl ExecutionWorkerBackend for OracleExecutionWorkerBackend {
             db_activity,
             current_operation_autocommit,
             query_timeout,
-            Some((shared_connection, connection_generation)),
+            Some((active_connection, connection_generation)),
+            Some(&mut transition_context),
+            items,
         );
 
         let cancel_requested = load_mutex_bool(cancel_flag);
@@ -821,22 +1031,21 @@ impl ExecutionWorkerBackend for OracleExecutionWorkerBackend {
             final_auto_commit,
             health_check_ok,
         );
-        let current_scope = SqlEditorWidget::current_scope_for_retained_session(
-            shared_connection,
-            connection_generation,
-            crate::db::DatabaseType::Oracle,
-            "oracle thin execution",
-        );
-        pooled_db_session.apply_retained_session_disposition_with_scope(
-            connection_generation,
-            batch_outcome
-                .refreshed_pool_context_epoch
-                .unwrap_or(pool_context_epoch),
-            DbSessionLease::OracleThin(Box::new(thin_conn)),
-            disposition,
-            "oracle thin execution",
-            current_scope,
-        );
+        if transition_context.connected {
+            pooled_db_session.apply_retained_session_disposition_with_scope(
+                transition_context.connection_generation,
+                batch_outcome
+                    .refreshed_pool_context_epoch
+                    .unwrap_or(transition_context.pool_context_epoch),
+                DbSessionLease::OracleThin(Box::new(thin_conn)),
+                disposition,
+                "oracle thin execution",
+                transition_context.scope,
+            );
+        } else {
+            pooled_db_session.clear();
+            drop(thin_conn);
+        }
         ExecutionWorkerOutcome::Handled
     }
 }
@@ -867,6 +1076,7 @@ impl ExecutionWorkerBackend for MysqlExecutionWorkerBackend {
     ) -> ExecutionWorkerOutcome<'a> {
         let ExecutionWorkerContext {
             shared_connection,
+            connection_binding,
             sender,
             sql_text,
             pooled_db_session,
@@ -885,6 +1095,7 @@ impl ExecutionWorkerBackend for MysqlExecutionWorkerBackend {
             lazy_fetch_batch_size,
             db_activity,
             current_operation_autocommit,
+            execution_scope,
             ..
         } = context;
 
@@ -949,7 +1160,11 @@ impl ExecutionWorkerBackend for MysqlExecutionWorkerBackend {
             Some(current_operation_autocommit),
             Some(current_operation_id),
             operation_id,
+            execution_scope,
         );
+        if let Some(runtime) = connection_binding.snapshot().runtime {
+            runtime.refresh_state_from_connection();
+        }
         ExecutionWorkerOutcome::Handled
     }
 }
@@ -2800,6 +3015,7 @@ impl SqlEditorWidget {
         sender: &QueryProgressSender,
         allows_disconnected_start: bool,
         pooled_db_session: &SharedDbSessionLease,
+        execution_scope: Option<&str>,
     ) -> (
         crate::db::ConnectionLockGuard<'a>,
         Result<Option<(Arc<Connection>, RetainedSessionState, u64)>, String>,
@@ -2835,13 +3051,21 @@ impl SqlEditorWidget {
                     let preserve_existing_session_state =
                         prior_retained_state.requires_physical_session_preservation();
                     let setup_result = if preserve_existing_session_state {
-                        conn_guard.apply_tracked_oracle_current_schema(conn.as_ref())
+                        crate::db::DatabaseConnection::apply_oracle_current_schema(
+                            conn.as_ref(),
+                            execution_scope,
+                        )
                     } else {
                         crate::db::DatabaseConnection::apply_oracle_session_settings(
                             conn.as_ref(),
                             &conn_guard.get_info().advanced,
                         )
-                        .and_then(|_| conn_guard.apply_tracked_oracle_current_schema(conn.as_ref()))
+                        .and_then(|_| {
+                            crate::db::DatabaseConnection::apply_oracle_current_schema(
+                                conn.as_ref(),
+                                execution_scope,
+                            )
+                        })
                     };
                     match setup_result {
                         Ok(()) => {
@@ -2855,10 +3079,7 @@ impl SqlEditorWidget {
                                 prior_retained_state,
                                 Self::oracle_error_message_allows_session_reuse(&message),
                             ) {
-                                let current_scope = conn_guard
-                                    .current_scope_name()
-                                    .map(|scope| scope.trim().to_string())
-                                    .filter(|scope| !scope.is_empty());
+                                let current_scope = execution_scope.map(str::to_string);
                                 let _ = pooled_db_session
                                     .apply_retained_session_disposition_with_scope(
                                         connection_generation,
@@ -2950,7 +3171,10 @@ impl SqlEditorWidget {
                 Some(conn) => conn,
                 None => return (conn_guard, Err("Expected Oracle pool session".to_string())),
             };
-            match conn_guard.apply_tracked_oracle_current_schema(conn.as_ref()) {
+            match crate::db::DatabaseConnection::apply_oracle_current_schema(
+                conn.as_ref(),
+                execution_scope,
+            ) {
                 Ok(()) => {
                     return (
                         conn_guard,
@@ -5248,6 +5472,7 @@ impl SqlEditorWidget {
         shared_connection: crate::db::SharedConnection,
         conn: mysql::PooledConn,
         connection_info: ConnectionInfo,
+        execution_scope: Option<String>,
         pooled_db_session: SharedDbSessionLease,
         sender: QueryProgressSender,
         session: Arc<Mutex<SessionState>>,
@@ -5764,6 +5989,7 @@ impl SqlEditorWidget {
                             preserve_session_state_after_action,
                             statement_effects.preserves_statement_diagnostics(),
                             None,
+                            execution_scope.as_deref(),
                         );
                         should_retain_session = health_check_ok;
                     }
@@ -5843,7 +6069,7 @@ impl SqlEditorWidget {
                             if should_retain_session
                                 && Self::lazy_fetch_can_keep_session(&active_lazy_fetch, session_id)
                             {
-                                Self::retain_mysql_pooled_session_if_current_with_state(
+                                Self::retain_mysql_pooled_session_if_current_with_state_and_scope(
                                     &shared_connection,
                                     &pooled_db_session,
                                     connection_generation,
@@ -5851,6 +6077,7 @@ impl SqlEditorWidget {
                                     conn,
                                     retained_state,
                                     "mysql lazy fetch cleanup",
+                                    execution_scope.clone(),
                                 );
                             } else {
                                 Self::discard_mysql_pooled_connection(conn);
@@ -6229,6 +6456,7 @@ impl SqlEditorWidget {
         current_operation_autocommit: Option<&Arc<Mutex<bool>>>,
         current_operation_id: Option<&Arc<AtomicU64>>,
         operation_id: u64,
+        initial_scope: Option<String>,
     ) {
         let items = Self::build_mysql_batch_items(
             sql_text,
@@ -6255,6 +6483,13 @@ impl SqlEditorWidget {
         let mut conn_name = conn_name.to_string();
         let mut result_index = 0usize;
         let mut auto_commit = initial_auto_commit;
+        let execution_scope = Mutex::new(initial_scope);
+        let current_execution_scope = || {
+            execution_scope
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .clone()
+        };
         let mut continue_on_error = match session.lock() {
             Ok(guard) => guard.continue_on_error,
             Err(poisoned) => {
@@ -6318,9 +6553,11 @@ impl SqlEditorWidget {
                 statement_effects.sets_found_rows(),
             );
             let statement_reached_server = std::cell::Cell::new(false);
+            let statement_scope = current_execution_scope();
             match SqlEditorWidget::run_mysql_pooled_action_with_timeout(
                 shared_connection,
                 pooled_db_session,
+                statement_scope.as_deref(),
                 Some(sender),
                 current_mysql_cancel_context,
                 current_query_cancel_handle,
@@ -6392,9 +6629,11 @@ impl SqlEditorWidget {
                     statement_effects.sets_found_rows(),
                 );
                 let statement_reached_server = std::cell::Cell::new(false);
+                let statement_scope = current_execution_scope();
                 match SqlEditorWidget::run_mysql_pooled_action_with_timeout(
                     shared_connection,
                     pooled_db_session,
+                    statement_scope.as_deref(),
                     Some(sender),
                     current_mysql_cancel_context,
                     current_query_cancel_handle,
@@ -7390,6 +7629,7 @@ impl SqlEditorWidget {
                         match Self::acquire_mysql_pooled_session(
                             shared_connection,
                             pooled_db_session,
+                            current_execution_scope().as_deref(),
                             db_activity,
                             auto_commit,
                             Some(sender),
@@ -7411,6 +7651,7 @@ impl SqlEditorWidget {
                                     Self::apply_mysql_global_database_before_pooled_action(
                                         shared_connection,
                                         &mut conn,
+                                        current_execution_scope().as_deref(),
                                         db_activity,
                                         connection_generation,
                                         auto_commit,
@@ -7474,6 +7715,7 @@ impl SqlEditorWidget {
                                     Arc::clone(shared_connection),
                                     conn,
                                     connection_info,
+                                    current_execution_scope(),
                                     pooled_db_session.clone(),
                                     sender.clone(),
                                     session.clone(),
@@ -7761,6 +8003,12 @@ impl SqlEditorWidget {
                                 } else {
                                     None
                                 };
+                            if let Some((_, Some(scope), _)) = &current_database_notice {
+                                *execution_scope
+                                    .lock()
+                                    .unwrap_or_else(|poisoned| poisoned.into_inner()) =
+                                    Some(scope.clone());
+                            }
                             if load_mutex_bool(cancel_flag) {
                                 stop_execution = true;
                             }
@@ -8123,9 +8371,22 @@ impl SqlEditorWidget {
         let operation_autocommit;
         let operation_db_type;
         let operation_connection_generation;
+        let binding_snapshot = self.connection_binding.snapshot();
+        let shared_connection = match binding_snapshot.connection() {
+            Some(connection) => connection,
+            None if startup_policy.allows_disconnected_start => binding_snapshot
+                .detached_runtime
+                .as_ref()
+                .map(|runtime| runtime.connection())
+                .unwrap_or_else(|| Arc::new(Mutex::new(crate::db::DatabaseConnection::new()))),
+            None => {
+                SqlEditorWidget::show_alert_dialog("This query tab is not bound to a database");
+                return;
+            }
+        };
         // Pre-check connection status without holding lock for long
         {
-            let Some(conn_guard) = crate::db::try_lock_connection(&self.connection) else {
+            let Some(conn_guard) = crate::db::try_lock_connection(&shared_connection) else {
                 let _ = self.ui_action_sender.send(UiActionResult::ConnectionBusy);
                 app::awake();
                 return;
@@ -8153,7 +8414,14 @@ impl SqlEditorWidget {
         // Worker thread cleanup now owns execution state reset.
         query_run_reservation.disarm();
 
-        let shared_connection = self.connection.clone();
+        let tab_session = self.connection_binding.session_state();
+        let connection_binding_for_worker = self.connection_binding.clone();
+        let initial_binding_revision = binding_snapshot.revision;
+        let operation_scope = binding_snapshot.scope.clone();
+        let runtime_work_guard = binding_snapshot
+            .runtime
+            .as_ref()
+            .map(|runtime| runtime.begin_work());
         let query_timeout = Self::parse_timeout(&self.timeout_input.value());
         let sql_text = sql.to_string();
         let operation_id = self.next_operation_id();
@@ -8174,12 +8442,21 @@ impl SqlEditorWidget {
             operation_id,
             connection_generation: operation_connection_generation,
         };
-        let operation_activity =
-            crate::db::track_db_activity(db_activity.clone(), Some(operation_db_type));
+        let operation_activity = binding_snapshot.runtime.as_ref().map_or_else(
+            || crate::db::track_db_activity(db_activity.clone(), Some(operation_db_type)),
+            |runtime| {
+                crate::db::track_db_activity_for_connection(
+                    db_activity.clone(),
+                    Some(operation_db_type),
+                    runtime.id(),
+                )
+            },
+        );
         let current_query_cancel_handle = self
             .install_operation_cancel_handle(operation_token, operation_activity.finish_handle());
         let sender = Self::operation_progress_sender(self.progress_sender.clone(), operation_token)
-            .with_status_activity(operation_activity);
+            .with_status_activity(operation_activity)
+            .with_execution_origin(binding_snapshot.execution_origin());
         let query_running = self.query_running.clone();
         let current_query_connection = self.current_query_connection.clone();
         let current_oracle_thin_cancel_context = self.current_oracle_thin_cancel_context.clone();
@@ -8199,9 +8476,6 @@ impl SqlEditorWidget {
         let lazy_fetch_batch_size = self.lazy_fetch_batch_size();
         let initial_mysql_delimiter_for_worker = initial_mysql_delimiter;
 
-        set_cursor(Cursor::Wait);
-        app::flush();
-
         let spawn_error_sender = sender.clone();
         let spawn_error_query_running = query_running.clone();
         let spawn_error_cancel_flag = cancel_flag.clone();
@@ -8218,7 +8492,10 @@ impl SqlEditorWidget {
         let spawn_result = thread::Builder::new()
             .name("query-execution".to_string())
             .spawn(move || {
+            let mut runtime_work_guard = runtime_work_guard;
             let result = panic::catch_unwind(AssertUnwindSafe(|| {
+                let mut shared_connection = shared_connection;
+                let mut binding_revision = initial_binding_revision;
                 let mut cleanup = QueryExecutionCleanupGuard::new(
                     operation_db_type,
                     sender.clone(),
@@ -8290,7 +8567,7 @@ impl SqlEditorWidget {
                     &mysql_auto_commit_override,
                 );
                 let selected_transaction_mode = conn_guard.transaction_mode();
-                let session = conn_guard.session_state();
+                let session = tab_session.clone();
 
                 let startup = LockedExecutionStartup {
                     conn_guard,
@@ -8311,6 +8588,8 @@ impl SqlEditorWidget {
                     startup,
                     ExecutionWorkerContext {
                         shared_connection: &shared_connection,
+                        connection_binding: &connection_binding_for_worker,
+                        binding_revision,
                         sender: &sender,
                         sql_text: &sql_text,
                         pooled_db_session: &pooled_db_session,
@@ -8330,6 +8609,8 @@ impl SqlEditorWidget {
                         lazy_fetch_batch_size,
                         db_activity: &db_activity,
                         current_operation_autocommit: &current_operation_autocommit,
+                        execution_scope: operation_scope.clone(),
+                        runtime_work_guard: &mut runtime_work_guard,
                     },
                     &mut cleanup,
                 ) {
@@ -8345,6 +8626,7 @@ impl SqlEditorWidget {
                         &sender,
                         startup_policy.allows_disconnected_start,
                         &pooled_db_session,
+                        operation_scope.as_deref(),
                     );
                 let conn_guard = guard_after_acquire;
                 let (mut conn_opt, oracle_prior_retained_state, oracle_pool_context_epoch) =
@@ -8372,7 +8654,7 @@ impl SqlEditorWidget {
                 let oracle_prior_requires_physical_session_preservation =
                     oracle_prior_retained_state.requires_physical_session_preservation();
 
-                let connection_generation = conn_guard.connection_generation();
+                let mut connection_generation = conn_guard.connection_generation();
 
                 if conn_guard.is_connected() {
                     conn_name = conn_guard.get_info().name.clone();
@@ -9958,166 +10240,240 @@ impl SqlEditorWidget {
                                             );
                                             conn_guard.connection_pool_size()
                                         };
-                                        let connect_attempt =
-                                            connect_shared_connection_with_policy(
-                                                &shared_connection,
-                                                conn_info.clone(),
-                                                pool_size,
-                                                ConnectionAttemptPolicy::runtime(),
-                                            );
-                                        let connect_result = {
-                                            let conn_guard = lock_connection_with_activity(
-                                                &shared_connection,
-                                                db_activity.clone(),
-                                            );
-                                            match connect_attempt {
-                                                Ok(_) => {
-                                                    let conn_opt_local = conn_guard.get_connection();
-                                                    let sanitized =
+                                        let candidate_connection: crate::db::SharedConnection =
+                                            Arc::new(Mutex::new(
+                                                crate::db::DatabaseConnection::new(),
+                                            ));
+                                        match connect_shared_connection_with_policy(
+                                            &candidate_connection,
+                                            conn_info.clone(),
+                                            pool_size,
+                                            ConnectionAttemptPolicy::runtime(),
+                                        ) {
+                                            Ok(_) => {
+                                                if !Self::connection_candidate_commit_allowed(
+                                                    &current_operation_id,
+                                                    operation_id,
+                                                    &cancel_flag,
+                                                ) {
+                                                    if let Some(mut guard) =
+                                                        crate::db::try_lock_connection(
+                                                            &candidate_connection,
+                                                        )
+                                                    {
+                                                        guard.disconnect();
+                                                    }
+                                                    SqlEditorWidget::emit_script_message(
+                                                        &sender,
+                                                        &session,
+                                                        "CONNECT",
+                                                        "Error: CONNECT was cancelled before the candidate connection was committed",
+                                                    );
+                                                    continue;
+                                                }
+                                                let (
+                                                    next_conn_opt,
+                                                    sanitized_conn_info,
+                                                    next_conn_name,
+                                                    next_connection_generation,
+                                                ) = {
+                                                    let conn_guard =
+                                                        lock_connection_with_activity(
+                                                            &candidate_connection,
+                                                            db_activity.clone(),
+                                                        );
+                                                    (
+                                                        conn_guard.get_connection(),
                                                         SqlEditorWidget::connection_info_for_ui(
                                                             conn_guard.get_info(),
-                                                        );
-                                                    let conn_name_local =
-                                                        if conn_guard.is_connected() {
-                                                            conn_guard.get_info().name.clone()
-                                                        } else {
-                                                            String::new()
-                                                        };
-                                                    Ok((conn_opt_local, sanitized, conn_name_local))
-                                                }
-                                                Err(err) => {
-                                                    let preserved = if conn_guard.is_connected()
-                                                        && conn_guard.has_connection_handle()
-                                                    {
-                                                        (
-                                                            conn_guard.get_connection(),
-                                                            conn_guard.get_info().name.clone(),
-                                                            Some(
-                                                                SqlEditorWidget::connection_info_for_ui(
-                                                                    conn_guard.get_info(),
-                                                                ),
-                                                            ),
+                                                        ),
+                                                        conn_guard.get_info().name.clone(),
+                                                        conn_guard.connection_generation(),
+                                                    )
+                                                };
+                                                let Some(prepared_conn) =
+                                                    next_conn_opt.as_ref().cloned()
+                                                else {
+                                                    if let Some(mut guard) =
+                                                        crate::db::try_lock_connection(
+                                                            &candidate_connection,
                                                         )
-                                                    } else {
-                                                        (None, String::new(), None)
-                                                    };
-                                                    Err((err, preserved))
+                                                    {
+                                                        guard.disconnect();
+                                                    }
+                                                    SqlEditorWidget::emit_script_message(
+                                                        &sender,
+                                                        &session,
+                                                        "CONNECT",
+                                                        "Error: CONNECT succeeded without a usable Oracle session",
+                                                    );
+                                                    continue;
+                                                };
+                                                let previous_timeout =
+                                                    prepared_conn.call_timeout().ok().flatten();
+                                                if let Err(err) =
+                                                    prepared_conn.set_call_timeout(query_timeout)
+                                                {
+                                                    if let Some(mut guard) =
+                                                        crate::db::try_lock_connection(
+                                                            &candidate_connection,
+                                                        )
+                                                    {
+                                                        guard.disconnect();
+                                                    }
+                                                    SqlEditorWidget::emit_script_message(
+                                                        &sender,
+                                                        &session,
+                                                        "CONNECT",
+                                                        &format!(
+                                                            "Error: Failed to apply query timeout before CONNECT: {err}"
+                                                        ),
+                                                    );
+                                                    continue;
                                                 }
-                                            }
-                                        };
-
-                                        match connect_result {
-                                            Ok((
-                                                next_conn_opt,
-                                                sanitized_conn_info,
-                                                next_conn_name,
-                                            )) => {
+                                                if let Err(err) = crate::db::DatabaseConnection::apply_oracle_transaction_mode(
+                                                    prepared_conn.as_ref(),
+                                                    transaction_mode,
+                                                ) {
+                                                    if let Some(mut guard) =
+                                                        crate::db::try_lock_connection(
+                                                            &candidate_connection,
+                                                        )
+                                                    {
+                                                        guard.disconnect();
+                                                    }
+                                                    SqlEditorWidget::emit_script_message(
+                                                        &sender,
+                                                        &session,
+                                                        "CONNECT",
+                                                        &format!(
+                                                            "Error: Failed to apply transaction mode before CONNECT: {err}"
+                                                        ),
+                                                    );
+                                                    continue;
+                                                }
+                                                if !requires_transaction_first_statement {
+                                                    if let Err(err) =
+                                                        SqlEditorWidget::sync_serveroutput_with_session(
+                                                            prepared_conn.as_ref(),
+                                                            &session,
+                                                        )
+                                                    {
+                                                        eprintln!(
+                                                            "Failed to apply SERVEROUTPUT before CONNECT: {err}"
+                                                        );
+                                                    }
+                                                }
+                                                if !Self::connection_candidate_commit_allowed(
+                                                    &current_operation_id,
+                                                    operation_id,
+                                                    &cancel_flag,
+                                                ) {
+                                                    if let Some(mut guard) =
+                                                        crate::db::try_lock_connection(
+                                                            &candidate_connection,
+                                                        )
+                                                    {
+                                                        guard.disconnect();
+                                                    }
+                                                    SqlEditorWidget::emit_script_message(
+                                                        &sender,
+                                                        &session,
+                                                        "CONNECT",
+                                                        "Error: CONNECT was cancelled before the candidate connection was committed",
+                                                    );
+                                                    continue;
+                                                }
+                                                let candidate_runtime = connection_binding_for_worker
+                                                    .register_transient_connection(
+                                                        candidate_connection.clone(),
+                                                    );
+                                                let candidate_runtime_id = candidate_runtime.id();
+                                                let candidate_work_guard =
+                                                    candidate_runtime.begin_work();
+                                                let Ok(next_binding_revision) =
+                                                    connection_binding_for_worker.bind_if_revision(
+                                                        binding_revision,
+                                                        candidate_runtime.clone(),
+                                                        None,
+                                                    )
+                                                else {
+                                                    if let Some(mut guard) =
+                                                        crate::db::try_lock_connection(
+                                                            &candidate_connection,
+                                                        )
+                                                    {
+                                                        guard.disconnect();
+                                                    }
+                                                    drop(candidate_work_guard);
+                                                    let _ = connection_binding_for_worker
+                                                        .remove_transient_if_idle(
+                                                            candidate_runtime_id,
+                                                        );
+                                                    SqlEditorWidget::emit_script_message(
+                                                        &sender,
+                                                        &session,
+                                                        "CONNECT",
+                                                        "Error: The query tab connection changed while CONNECT was authenticating",
+                                                    );
+                                                    continue;
+                                                };
+                                                runtime_work_guard = Some(candidate_work_guard);
+                                                binding_revision = next_binding_revision;
+                                                sender.set_status_connection_id(
+                                                    candidate_runtime_id,
+                                                );
+                                                sender.set_execution_origin(Some(ExecutionOrigin {
+                                                    connection_id: candidate_runtime_id,
+                                                    connection_generation:
+                                                        next_connection_generation,
+                                                    pool_context_epoch: candidate_runtime
+                                                        .pool_context_epoch(),
+                                                    binding_revision: next_binding_revision,
+                                                    db_type: sanitized_conn_info.db_type,
+                                                    scope: None,
+                                                    display_name: sanitized_conn_info.name.clone(),
+                                                }));
                                                 pooled_db_session.clear();
                                                 cleanup.clear_oracle_pooled_session_tracking();
+                                                cleanup.clear_timeout_tracking();
+                                                cleanup.track_timeout(
+                                                    Arc::clone(&prepared_conn),
+                                                    previous_timeout,
+                                                );
+                                                Self::record_applied_oracle_transaction_mode_effects(
+                                                    &mut cleanup,
+                                                    transaction_mode,
+                                                );
+                                                shared_connection = candidate_connection;
+                                                connection_generation =
+                                                    next_connection_generation;
                                                 conn_opt = next_conn_opt;
                                                 conn_name = next_conn_name;
                                                 // Update cancel connection so break_execution() uses the new connection
-                                                if let Some(ref conn) = conn_opt {
-                                                    SqlEditorWidget::set_current_query_connection(
-                                                        &current_query_connection,
-                                                        &current_query_cancel_handle,
-                                                        Some(Arc::clone(conn)),
-                                                    );
-                                                }
+                                                SqlEditorWidget::set_current_query_connection(
+                                                    &current_query_connection,
+                                                    &current_query_cancel_handle,
+                                                    Some(prepared_conn),
+                                                );
                                                 SqlEditorWidget::emit_script_message(
                                                     &sender,
                                                     &session,
                                                     "CONNECT",
                                                     &format!("Connected to {}", conn_info.name),
                                                 );
-                                                if let Some(conn) = conn_opt.as_ref() {
-                                                    let previous_timeout =
-                                                        conn.call_timeout().ok().flatten();
-                                                    cleanup.track_timeout(
-                                                        Arc::clone(conn),
-                                                        previous_timeout,
-                                                    );
-                                                    if let Err(err) =
-                                                        conn.set_call_timeout(query_timeout)
-                                                    {
-                                                        SqlEditorWidget::emit_script_message(
-                                                            &sender,
-                                                            &session,
-                                                            "CONNECT",
-                                                            &format!(
-                                                                "Error: Failed to apply query timeout after CONNECT: {}",
-                                                                err
-                                                            ),
-                                                        );
-                                                        command_error = true;
-                                                    }
-                                                    match crate::db::DatabaseConnection::apply_oracle_transaction_mode(
-                                                        conn.as_ref(),
-                                                        transaction_mode,
-                                                    ) {
-                                                        Ok(()) => {
-                                                            Self::record_applied_oracle_transaction_mode_effects(
-                                                                &mut cleanup,
-                                                                transaction_mode,
-                                                            );
-                                                        }
-                                                        Err(err) => {
-                                                            SqlEditorWidget::emit_script_message(
-                                                                &sender,
-                                                                &session,
-                                                                "CONNECT",
-                                                                &format!(
-                                                                    "Error: Failed to apply transaction mode after CONNECT: {}",
-                                                                    err
-                                                                ),
-                                                            );
-                                                            command_error = true;
-                                                        }
-                                                    }
-                                                    if !requires_transaction_first_statement {
-                                                        if let Err(err) =
-                                                            SqlEditorWidget::sync_serveroutput_with_session(
-                                                                conn.as_ref(),
-                                                                &session,
-                                                            )
-                                                        {
-                                                            eprintln!(
-                                                                "Failed to apply SERVEROUTPUT after CONNECT: {err}"
-                                                            );
-                                                        }
-                                                    }
-                                                }
                                                 let _ =
                                                     sender.send(QueryProgress::ConnectionChanged {
                                                         info: Some(sanitized_conn_info),
                                                     });
                                                 app::awake();
                                             }
-                                            Err((
-                                                err,
-                                                (
-                                                    preserved_conn_opt,
-                                                    preserved_conn_name,
-                                                    preserved_conn_info,
-                                                ),
-                                            )) => {
-                                                conn_opt = preserved_conn_opt;
-                                                conn_name = preserved_conn_name;
-                                                SqlEditorWidget::set_current_query_connection(
-                                                    &current_query_connection,
-                                                    &current_query_cancel_handle,
-                                                    conn_opt.as_ref().map(Arc::clone),
-                                                );
+                                            Err(err) => {
                                                 let error_msg =
                                                     format!("Connection failed: {}", err);
                                                 SqlEditorWidget::emit_script_message(
                                                     &sender, &session, "CONNECT", &error_msg,
                                                 );
-                                                let _ =
-                                                    sender.send(QueryProgress::ConnectionChanged {
-                                                        info: preserved_conn_info,
-                                                    });
-                                                app::awake();
                                                 command_error = true;
                                             }
                                         }
@@ -10148,54 +10504,20 @@ impl SqlEditorWidget {
                                         );
                                         command_error = true;
                                     } else {
-                                        // Treat stale handles (connection exists but connected flag is false)
-                                        // as a disconnectable state so UI/session state is fully reset.
-                                        let (had_connection, next_conn_opt, next_conn_name) = {
-                                            let mut conn_guard = lock_connection_with_activity(
-                                                &shared_connection,
-                                                db_activity.clone(),
-                                            );
-                                            let had_connection = conn_guard.is_connected()
-                                                || conn_guard.has_connection_handle();
-                                            clear_pool_session_context_for_shared_connection(
-                                                &shared_connection,
-                                            );
-                                            conn_guard.disconnect();
-                                            conn_guard.refresh_tracked_connection();
-                                            let next_conn_opt = conn_guard.get_connection();
-                                            let next_conn_name = if conn_guard.is_connected() {
-                                                conn_guard.get_info().name.clone()
-                                            } else {
-                                                String::new()
-                                            };
-                                            (had_connection, next_conn_opt, next_conn_name)
-                                        };
+                                        let had_connection = conn_opt.is_some();
                                         pooled_db_session.clear();
 
-                                        // Clear cancel connection before disconnect
+                                        // SQL*Plus DISCONNECT is tab-local: other tabs sharing the
+                                        // runtime and its pool remain connected.
                                         SqlEditorWidget::set_current_query_connection(
                                             &current_query_connection,
                                             &current_query_cancel_handle,
                                             None,
                                         );
-                                        conn_opt = next_conn_opt;
-                                        conn_name = next_conn_name;
-                                        match session.lock() {
-                                            Ok(mut guard) => {
-                                                guard.reset_for_connection(
-                                                    crate::db::DatabaseType::default(),
-                                                );
-                                            }
-                                            Err(poisoned) => {
-                                                eprintln!(
-                                                    "Warning: session state lock was poisoned; recovering."
-                                                );
-                                                let mut guard = poisoned.into_inner();
-                                                guard.reset_for_connection(
-                                                    crate::db::DatabaseType::default(),
-                                                );
-                                            }
-                                        }
+                                        conn_opt = None;
+                                        conn_name.clear();
+                                        binding_revision =
+                                            connection_binding_for_worker.detach();
                                         let disconnect_message = if had_connection {
                                             "Disconnected from database"
                                         } else {
@@ -12630,6 +12952,15 @@ impl SqlEditorWidget {
                                                     .refresh_oracle_pooled_session_pool_context_epoch(
                                                         refreshed_epoch,
                                                     );
+                                                if let Some(runtime) = connection_binding_for_worker
+                                                    .snapshot()
+                                                    .runtime
+                                                {
+                                                    runtime.update_connection_context(
+                                                        connection_generation,
+                                                        refreshed_epoch,
+                                                    );
+                                                }
                                             }
                                             result.message = notice.clone();
                                             let _ =
@@ -12798,10 +13129,7 @@ impl SqlEditorWidget {
                     &spawn_error_cancel_flag,
                 );
             }
-            if app::is_ui_thread() {
-                set_cursor(Cursor::Default);
-                app::flush();
-            }
+            if app::is_ui_thread() {}
         }
     }
 
@@ -14974,6 +15302,148 @@ impl SqlEditorWidget {
         );
     }
 
+    fn oracle_thin_connect_info(
+        username: String,
+        password: String,
+        host: String,
+        port: u16,
+        service_name: String,
+    ) -> ConnectionInfo {
+        let connection_name_target = if host.trim().is_empty() {
+            service_name.clone()
+        } else {
+            host.clone()
+        };
+        let mut advanced =
+            crate::db::ConnectionAdvancedSettings::default_for(crate::db::DatabaseType::Oracle);
+        advanced.oracle_driver_mode = crate::db::OracleDriverMode::Thin;
+        ConnectionInfo {
+            name: format!("{}@{}", username, connection_name_target),
+            username,
+            password,
+            host,
+            port,
+            service_name,
+            db_type: crate::db::DatabaseType::Oracle,
+            advanced,
+            debug_oracle_thin_protocol_version: None,
+        }
+    }
+
+    fn connect_oracle_thin_tab_candidate(
+        connection_binding: &crate::db::TabConnectionBinding,
+        expected_binding_revision: u64,
+        info: ConnectionInfo,
+        pool_size: u32,
+        db_activity: &str,
+        current_operation_id: &Arc<AtomicU64>,
+        operation_id: u64,
+        cancel_flag: &Arc<Mutex<bool>>,
+        query_timeout: Option<Duration>,
+    ) -> Result<OracleThinConnectedCandidate, String> {
+        let candidate_connection: crate::db::SharedConnection =
+            Arc::new(Mutex::new(crate::db::DatabaseConnection::new()));
+        connect_shared_connection_with_policy(
+            &candidate_connection,
+            info,
+            pool_size,
+            ConnectionAttemptPolicy::runtime(),
+        )?;
+
+        let (
+            pool_context,
+            sanitized_info,
+            connection_generation,
+            pool_context_epoch,
+            auto_commit,
+            transaction_mode,
+        ) = {
+            let guard = lock_connection_with_activity(&candidate_connection, db_activity);
+            (
+                guard.pool_session_context()?,
+                Self::connection_info_for_ui(guard.get_info()),
+                guard.connection_generation(),
+                guard.pool_context_epoch(),
+                guard.auto_commit(),
+                guard.transaction_mode(),
+            )
+        };
+        let mut session = match pool_context.acquire_session_for_current_scope()? {
+            DbPoolSession::OracleThin(session) => *session,
+            DbPoolSession::Oracle(_) => {
+                return Err(format!(
+                    "Expected Oracle Thin pool session but acquired {}",
+                    crate::db::DatabaseType::Oracle
+                ))
+            }
+            DbPoolSession::MySQL { db_type, .. } => {
+                return Err(format!(
+                    "Expected Oracle Thin pool session but acquired {db_type}"
+                ))
+            }
+        };
+        if !Self::connection_candidate_commit_allowed(
+            current_operation_id,
+            operation_id,
+            cancel_flag,
+        ) {
+            return Err(
+                "CONNECT was cancelled before the candidate connection was committed".to_string(),
+            );
+        }
+        session
+            .set_call_timeout(query_timeout)
+            .map_err(|err| format!("Failed to apply query timeout before CONNECT: {err}"))?;
+        Self::ensure_oracle_thin_runtime(&mut session).map_err(|message| {
+            format!("Failed to initialize Oracle Thin session before CONNECT: {message}")
+        })?;
+        if !Self::connection_candidate_commit_allowed(
+            current_operation_id,
+            operation_id,
+            cancel_flag,
+        ) {
+            return Err(
+                "CONNECT was cancelled before the candidate connection was committed".to_string(),
+            );
+        }
+
+        let candidate_runtime =
+            connection_binding.register_transient_connection(candidate_connection.clone());
+        let candidate_runtime_id = candidate_runtime.id();
+        let candidate_work_guard = candidate_runtime.begin_work();
+        let binding_revision = match connection_binding.bind_if_revision(
+            expected_binding_revision,
+            candidate_runtime,
+            None,
+        ) {
+            Ok(revision) => revision,
+            Err(_) => {
+                if let Some(mut guard) = crate::db::try_lock_connection(&candidate_connection) {
+                    guard.disconnect();
+                }
+                drop(candidate_work_guard);
+                let _ = connection_binding.remove_transient_if_idle(candidate_runtime_id);
+                return Err(
+                    "The query tab connection changed while CONNECT was authenticating".to_string(),
+                );
+            }
+        };
+
+        Ok(OracleThinConnectedCandidate {
+            connection: candidate_connection,
+            session,
+            sanitized_info,
+            connection_generation,
+            pool_context_epoch,
+            binding_revision,
+            auto_commit,
+            transaction_mode,
+            connection_id: candidate_runtime_id,
+            work_guard: candidate_work_guard,
+        })
+    }
+
+    #[cfg(test)]
     fn execute_oracle_thin_batch(
         conn: &mut OracleThinSession,
         sender: &QueryProgressSender,
@@ -14994,6 +15464,47 @@ impl SqlEditorWidget {
             sql_text,
             Some(crate::db::DatabaseType::Oracle),
         );
+        let mut direct = DirectOracleThinSession(conn);
+        let mut active_conn_name = conn_name.to_string();
+        Self::execute_oracle_thin_batch_with_connection(
+            &mut direct,
+            sender,
+            sql_text,
+            &mut active_conn_name,
+            session,
+            cancel_flag,
+            script_mode,
+            initial_auto_commit,
+            prior_retained_state,
+            selected_transaction_mode,
+            db_activity,
+            current_operation_autocommit,
+            query_timeout,
+            scope_sync_context.map(|(connection, generation)| (connection.clone(), generation)),
+            None,
+            items,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn execute_oracle_thin_batch_with_connection<C: OracleThinBatchConnection>(
+        conn: &mut C,
+        sender: &QueryProgressSender,
+        sql_text: &str,
+        conn_name: &mut String,
+        session: &Arc<Mutex<SessionState>>,
+        cancel_flag: &Arc<Mutex<bool>>,
+        script_mode: bool,
+        initial_auto_commit: bool,
+        prior_retained_state: RetainedSessionState,
+        selected_transaction_mode: crate::db::TransactionMode,
+        db_activity: &str,
+        current_operation_autocommit: &Arc<Mutex<bool>>,
+        query_timeout: Option<Duration>,
+        mut scope_sync_context: Option<(crate::db::SharedConnection, u64)>,
+        mut transition_context: Option<&mut OracleThinConnectionTransitionContext<'_>>,
+        items: Vec<ScriptItem>,
+    ) -> OracleThinBatchOutcome {
         if items.is_empty() {
             return OracleThinBatchOutcome {
                 retained_state: prior_retained_state,
@@ -15054,6 +15565,7 @@ impl SqlEditorWidget {
         let mut timed_out = false;
         let mut interrupted_sql_kind = None;
         let mut interrupted_state_hint = None;
+        let mut active_transaction_mode = selected_transaction_mode;
         let mut transaction_mode_applied =
             !Self::should_apply_oracle_thin_transaction_mode(prior_retained_state);
         let mut batch_may_report_transaction_work =
@@ -15732,6 +16244,218 @@ impl SqlEditorWidget {
                                 Err(poisoned) => poisoned.into_inner().continue_on_error = !exit,
                             }
                         }
+                        ToolCommand::Connect {
+                            username,
+                            password,
+                            host,
+                            port,
+                            service_name,
+                        } => 'connect_command: {
+                            let Some(context) = transition_context.as_deref_mut() else {
+                                command_error = Some(
+                                    "CONNECT is available only from a query-tab Oracle Thin session"
+                                        .to_string(),
+                                );
+                                break 'connect_command;
+                            };
+                            if let Some(info) = context.preconnected_info.take() {
+                                *conn_name = info.name.clone();
+                                Self::emit_script_message(
+                                    sender,
+                                    session,
+                                    "CONNECT",
+                                    &format!("Connected to {}", info.name),
+                                );
+                                let _ = sender
+                                    .send(QueryProgress::ConnectionChanged { info: Some(info) });
+                                app::awake();
+                                break 'connect_command;
+                            }
+
+                            let live_state = if context.connected
+                                && crate::db::DatabaseConnection::oracle_thin_session_may_have_uncommitted_work(
+                                    conn,
+                                    db_activity,
+                                )
+                            {
+                                RetainedSessionState::from_transaction_state(
+                                    TransactionSessionState::MaybeDirty,
+                                )
+                            } else {
+                                RetainedSessionState::default()
+                            };
+                            if Self::connection_transition_requires_retained_resolution(
+                                retained_state.conservative_merge(live_state),
+                                context.pooled_db_session.snapshot(),
+                            ) {
+                                command_error = Some(
+                                    Self::connection_transition_dirty_session_message("CONNECT"),
+                                );
+                                break 'connect_command;
+                            }
+                            if !Self::operation_snapshot_is_current(
+                                context.current_operation_id,
+                                context.operation_id,
+                            ) {
+                                command_error =
+                                    Some("CONNECT was cancelled before authentication".to_string());
+                                break 'connect_command;
+                            }
+
+                            let info = Self::oracle_thin_connect_info(
+                                username,
+                                password,
+                                host,
+                                port,
+                                service_name,
+                            );
+                            match Self::connect_oracle_thin_tab_candidate(
+                                context.connection_binding,
+                                context.binding_revision,
+                                info,
+                                context.pool_size,
+                                db_activity,
+                                context.current_operation_id,
+                                context.operation_id,
+                                cancel_flag,
+                                query_timeout,
+                            ) {
+                                Ok(candidate) => {
+                                    context.pooled_db_session.clear();
+                                    if let Err(message) = conn.replace_pooled(candidate.session) {
+                                        context.connection_binding.detach();
+                                        if let Some(mut guard) =
+                                            crate::db::try_lock_connection(&candidate.connection)
+                                        {
+                                            guard.disconnect();
+                                        }
+                                        drop(candidate.work_guard);
+                                        let _ = context
+                                            .connection_binding
+                                            .remove_transient_if_idle(candidate.connection_id);
+                                        command_error = Some(message);
+                                        break 'connect_command;
+                                    }
+                                    sender.set_status_connection_id(candidate.connection_id);
+                                    sender.set_execution_origin(Some(ExecutionOrigin {
+                                        connection_id: candidate.connection_id,
+                                        connection_generation: candidate.connection_generation,
+                                        pool_context_epoch: candidate.pool_context_epoch,
+                                        binding_revision: candidate.binding_revision,
+                                        db_type: candidate.sanitized_info.db_type,
+                                        scope: None,
+                                        display_name: candidate.sanitized_info.name.clone(),
+                                    }));
+                                    *context.runtime_work_guard = Some(candidate.work_guard);
+                                    context.binding_revision = candidate.binding_revision;
+                                    context.active_connection = candidate.connection.clone();
+                                    context.connection_generation = candidate.connection_generation;
+                                    context.pool_context_epoch = candidate.pool_context_epoch;
+                                    context.scope = None;
+                                    context.connected = true;
+                                    scope_sync_context = Some((
+                                        candidate.connection,
+                                        candidate.connection_generation,
+                                    ));
+                                    retained_state = RetainedSessionState::default();
+                                    batch_may_report_transaction_work = false;
+                                    invalid_session = false;
+                                    interrupted_sql_kind = None;
+                                    interrupted_state_hint = None;
+                                    refreshed_pool_context_epoch = None;
+                                    auto_commit = candidate.auto_commit;
+                                    store_mutex_bool(current_operation_autocommit, auto_commit);
+                                    active_transaction_mode = candidate.transaction_mode;
+                                    transaction_mode_applied = false;
+                                    continue_on_error = session
+                                        .lock()
+                                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                                        .continue_on_error;
+                                    *conn_name = candidate.sanitized_info.name.clone();
+
+                                    conn.reset_pending_cancel();
+                                    let cancel_handle = conn.cancel_handle();
+                                    Self::set_current_oracle_thin_cancel_context(
+                                        context.current_oracle_thin_cancel_context,
+                                        context.current_query_cancel_handle,
+                                        Some(cancel_handle),
+                                    );
+                                    Self::emit_script_message(
+                                        sender,
+                                        session,
+                                        "CONNECT",
+                                        &format!("Connected to {}", conn_name),
+                                    );
+                                    let _ = sender.send(QueryProgress::ConnectionChanged {
+                                        info: Some(candidate.sanitized_info),
+                                    });
+                                    app::awake();
+                                }
+                                Err(message) => command_error = Some(message),
+                            }
+                        }
+                        ToolCommand::Disconnect => 'disconnect_command: {
+                            let Some(context) = transition_context.as_deref_mut() else {
+                                command_error = Some(
+                                    "DISCONNECT is available only from a query-tab Oracle Thin session"
+                                        .to_string(),
+                                );
+                                break 'disconnect_command;
+                            };
+                            let live_state = if context.connected
+                                && crate::db::DatabaseConnection::oracle_thin_session_may_have_uncommitted_work(
+                                    conn,
+                                    db_activity,
+                                )
+                            {
+                                RetainedSessionState::from_transaction_state(
+                                    TransactionSessionState::MaybeDirty,
+                                )
+                            } else {
+                                RetainedSessionState::default()
+                            };
+                            if Self::connection_transition_requires_retained_resolution(
+                                retained_state.conservative_merge(live_state),
+                                context.pooled_db_session.snapshot(),
+                            ) {
+                                command_error = Some(
+                                    Self::connection_transition_dirty_session_message("DISCONNECT"),
+                                );
+                                break 'disconnect_command;
+                            }
+
+                            let had_connection = context.connected;
+                            context.pooled_db_session.clear();
+                            context.binding_revision = context.connection_binding.detach();
+                            context.scope = None;
+                            context.connected = false;
+                            context.preconnected_info = None;
+                            scope_sync_context = None;
+                            retained_state = RetainedSessionState::default();
+                            batch_may_report_transaction_work = false;
+                            continue_on_error = session
+                                .lock()
+                                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                                .continue_on_error;
+                            conn_name.clear();
+                            Self::set_current_oracle_thin_cancel_context(
+                                context.current_oracle_thin_cancel_context,
+                                context.current_query_cancel_handle,
+                                None,
+                            );
+                            Self::emit_script_message(
+                                sender,
+                                session,
+                                "DISCONNECT",
+                                if had_connection {
+                                    "Disconnected from database"
+                                } else {
+                                    "Not connected to any database"
+                                },
+                            );
+                            let _ = sender.send(QueryProgress::ConnectionChanged { info: None });
+                            app::awake();
+                        }
                         ToolCommand::ShowAll => {
                             let lines = Self::show_all_lines(session, auto_commit);
                             Self::emit_script_message(
@@ -15788,6 +16512,28 @@ impl SqlEditorWidget {
                     }
                 }
                 ScriptItem::Statement(statement) => {
+                    if transition_context
+                        .as_deref()
+                        .is_some_and(|context| !context.connected)
+                    {
+                        had_error = true;
+                        Self::emit_non_select_result(
+                            sender,
+                            session,
+                            conn_name,
+                            result_index,
+                            &statement,
+                            format!("Error: {}", crate::db::NOT_CONNECTED_MESSAGE),
+                            false,
+                            false,
+                            script_mode,
+                        );
+                        result_index += 1;
+                        if !continue_on_error {
+                            break;
+                        }
+                        continue;
+                    }
                     let started = Instant::now();
                     let mut sql_to_execute = statement;
                     let scan_enabled = match session.lock() {
@@ -15918,7 +16664,7 @@ impl SqlEditorWidget {
                         for tx_sql in
                             crate::db::DatabaseConnection::transaction_mode_statements_for(
                                 crate::db::DatabaseType::Oracle,
-                                selected_transaction_mode,
+                                active_transaction_mode,
                             )
                             .unwrap_or_default()
                         {
@@ -16139,13 +16885,13 @@ impl SqlEditorWidget {
                                 );
                                 if !Self::oracle_statement_sets_current_schema(&execution_sql) {
                                     if let Some((shared_connection, connection_generation)) =
-                                        scope_sync_context
+                                        scope_sync_context.as_ref()
                                     {
                                         if let Some(epoch) =
                                             Self::clear_tracked_oracle_schema_after_drop_user(
                                                 shared_connection,
                                                 db_activity,
-                                                connection_generation,
+                                                *connection_generation,
                                                 &execution_sql,
                                             )
                                         {
@@ -16153,16 +16899,16 @@ impl SqlEditorWidget {
                                         }
                                     }
                                 } else {
-                                    let synced_current_schema = scope_sync_context.and_then(
-                                        |(shared_connection, connection_generation)| {
+                                    let synced_current_schema = scope_sync_context
+                                        .as_ref()
+                                        .and_then(|(shared_connection, connection_generation)| {
                                             Self::sync_oracle_thin_pooled_session_current_schema(
                                                 shared_connection,
                                                 conn,
                                                 db_activity,
-                                                connection_generation,
+                                                *connection_generation,
                                             )
-                                        },
-                                    );
+                                        });
                                     match Self::oracle_current_schema_sync_notice(
                                         synced_current_schema,
                                     ) {
@@ -16170,12 +16916,12 @@ impl SqlEditorWidget {
                                             if let Some((
                                                 shared_connection,
                                                 connection_generation,
-                                            )) = scope_sync_context
+                                            )) = scope_sync_context.as_ref()
                                             {
                                                 if let Some(epoch) =
                                                     Self::pool_context_epoch_for_generation(
                                                         shared_connection,
-                                                        connection_generation,
+                                                        *connection_generation,
                                                         db_activity,
                                                     )
                                                 {
@@ -16183,6 +16929,13 @@ impl SqlEditorWidget {
                                                 }
                                             }
                                             message = notice.clone();
+                                            if let Some(context) = transition_context.as_deref_mut()
+                                            {
+                                                context.binding_revision = context
+                                                    .connection_binding
+                                                    .set_scope(Some(current_schema.clone()));
+                                                context.scope = Some(current_schema.clone());
+                                            }
                                             let _ =
                                                 sender.send(QueryProgress::ScopeChangedNotice {
                                                     message: notice,
@@ -16196,6 +16949,18 @@ impl SqlEditorWidget {
                                             invalid_session = true;
                                             statement_error = Some(message);
                                         }
+                                    }
+                                }
+                                if let (Some(context), Some(pool_context_epoch)) =
+                                    (transition_context.as_deref(), refreshed_pool_context_epoch)
+                                {
+                                    if let Some(runtime) =
+                                        context.connection_binding.snapshot().runtime
+                                    {
+                                        runtime.update_connection_context(
+                                            context.connection_generation,
+                                            pool_context_epoch,
+                                        );
                                     }
                                 }
                                 if statement_error.is_none() {
@@ -16976,8 +17741,8 @@ impl SqlEditorWidget {
                 } else {
                     base_dir.join(&path)
                 };
-                guard.spool_path = Some(target_path.clone());
-                guard.spool_truncate = !append;
+                let target_path = Self::normalize_spool_path(&target_path);
+                guard.claim_spool_path(target_path.clone(), !append)?;
                 Ok(format!(
                     "Spooling output to {} ({})",
                     target_path.display(),
@@ -16993,11 +17758,44 @@ impl SqlEditorWidget {
                 }
             }
             None => {
-                guard.spool_path = None;
-                guard.spool_truncate = false;
+                guard.clear_spool_path();
                 Ok("Spooling disabled".to_string())
             }
         }
+    }
+
+    fn normalize_spool_path(path: &Path) -> PathBuf {
+        use std::path::Component;
+
+        let absolute = if path.is_absolute() {
+            path.to_path_buf()
+        } else {
+            std::env::current_dir()
+                .unwrap_or_else(|_| PathBuf::from("."))
+                .join(path)
+        };
+        if let Ok(canonical) = std::fs::canonicalize(&absolute) {
+            return canonical;
+        }
+        if let (Some(parent), Some(file_name)) = (absolute.parent(), absolute.file_name()) {
+            if let Ok(canonical_parent) = std::fs::canonicalize(parent) {
+                return canonical_parent.join(file_name);
+            }
+        }
+
+        let mut normalized = PathBuf::new();
+        for component in absolute.components() {
+            match component {
+                Component::CurDir => {}
+                Component::ParentDir => {
+                    normalized.pop();
+                }
+                Component::Prefix(_) | Component::RootDir | Component::Normal(_) => {
+                    normalized.push(component.as_os_str());
+                }
+            }
+        }
+        normalized
     }
 
     fn expand_tabs_with_stop(text: &str, tab_stop: usize) -> String {
@@ -19055,6 +19853,7 @@ impl SqlEditorWidget {
                         .session_residue_state()
                         .may_have_statement_diagnostics(),
                     None,
+                    None,
                 );
                 outcome = crate::db::retained_session_outcome_after_session_info_sync(
                     retained_state,
@@ -19423,6 +20222,15 @@ impl SqlEditorWidget {
         }
     }
 
+    fn connection_candidate_commit_allowed(
+        current_operation_id: &Arc<AtomicU64>,
+        operation_id: u64,
+        cancel_flag: &Arc<Mutex<bool>>,
+    ) -> bool {
+        Self::operation_snapshot_is_current(current_operation_id, operation_id)
+            && !load_mutex_bool(cancel_flag)
+    }
+
     fn reset_mysql_timeout_on_connection(
         mysql_conn: &mut mysql::Conn,
         db_type: crate::db::DatabaseType,
@@ -19522,6 +20330,7 @@ impl SqlEditorWidget {
     fn acquire_mysql_pooled_session(
         shared_connection: &crate::db::SharedConnection,
         pooled_db_session: &SharedDbSessionLease,
+        execution_scope: Option<&str>,
         db_activity: &str,
         auto_commit: bool,
         session_pool_sender: Option<&QueryProgressSender>,
@@ -19540,7 +20349,9 @@ impl SqlEditorWidget {
         let context = {
             let conn_guard =
                 lock_connection_with_activity(shared_connection, db_activity.to_string());
-            conn_guard.pool_session_context()?
+            conn_guard
+                .pool_session_context()?
+                .for_scope(execution_scope)
         };
         let db_display_name = context.connection_info.db_type.display_name();
 
@@ -19905,6 +20716,28 @@ impl SqlEditorWidget {
         disposition: crate::db::RetainedSessionOutcome,
         db_activity: &str,
     ) {
+        Self::apply_mysql_pooled_session_disposition_if_current_with_scope(
+            shared_connection,
+            pooled_db_session,
+            connection_generation,
+            pool_context_epoch,
+            conn,
+            disposition,
+            db_activity,
+            None,
+        );
+    }
+
+    fn apply_mysql_pooled_session_disposition_if_current_with_scope(
+        shared_connection: &crate::db::SharedConnection,
+        pooled_db_session: &SharedDbSessionLease,
+        connection_generation: u64,
+        pool_context_epoch: u64,
+        conn: mysql::PooledConn,
+        disposition: crate::db::RetainedSessionOutcome,
+        db_activity: &str,
+        explicit_scope: Option<String>,
+    ) {
         let scope_context = {
             let conn_guard =
                 lock_connection_with_activity(shared_connection, db_activity.to_string());
@@ -19914,10 +20747,12 @@ impl SqlEditorWidget {
                 .then(|| {
                     (
                         db_type,
-                        conn_guard
-                            .current_scope_name()
-                            .map(|scope| scope.trim().to_string())
-                            .filter(|scope| !scope.is_empty()),
+                        explicit_scope.or_else(|| {
+                            conn_guard
+                                .current_scope_name()
+                                .map(|scope| scope.trim().to_string())
+                                .filter(|scope| !scope.is_empty())
+                        }),
                     )
                 })
         };
@@ -19954,6 +20789,28 @@ impl SqlEditorWidget {
             db_activity,
         )
         .retain(conn, retained_state);
+    }
+
+    fn retain_mysql_pooled_session_if_current_with_state_and_scope(
+        shared_connection: &crate::db::SharedConnection,
+        pooled_db_session: &SharedDbSessionLease,
+        connection_generation: u64,
+        pool_context_epoch: u64,
+        conn: mysql::PooledConn,
+        retained_state: RetainedSessionState,
+        db_activity: &str,
+        explicit_scope: Option<String>,
+    ) {
+        Self::apply_mysql_pooled_session_disposition_if_current_with_scope(
+            shared_connection,
+            pooled_db_session,
+            connection_generation,
+            pool_context_epoch,
+            conn,
+            crate::db::RetainedSessionOutcome::Retain(retained_state),
+            db_activity,
+            explicit_scope,
+        );
     }
 
     fn mysql_pooled_session_db_type_for_generation(
@@ -20588,6 +21445,7 @@ impl SqlEditorWidget {
         preserve_existing_session_state: bool,
         preserve_statement_diagnostics: bool,
         known_current_database: Option<&str>,
+        execution_scope: Option<&str>,
     ) -> bool {
         // Internal protocol/SQL health commands change MySQL's statement
         // diagnostics. Skip them while ROW_COUNT()/FOUND_ROWS() is pending;
@@ -20649,7 +21507,11 @@ impl SqlEditorWidget {
                 return true;
             }
 
-            let target_database = conn_guard.get_info().service_name.trim().to_string();
+            let target_database = execution_scope
+                .map(str::trim)
+                .filter(|scope| !scope.is_empty())
+                .unwrap_or(conn_guard.get_info().service_name.trim())
+                .to_string();
             let advanced = conn_guard.get_info().advanced.clone();
             let current_database = match conn.query_first::<Option<String>, _>("SELECT DATABASE()")
             {
@@ -20904,6 +21766,7 @@ impl SqlEditorWidget {
     fn apply_mysql_global_database_before_pooled_action(
         shared_connection: &crate::db::SharedConnection,
         conn: &mut mysql::PooledConn,
+        execution_scope: Option<&str>,
         db_activity: &str,
         connection_generation: u64,
         operation_auto_commit: bool,
@@ -20924,7 +21787,11 @@ impl SqlEditorWidget {
                 return Err(crate::db::NOT_CONNECTED_MESSAGE.to_string());
             }
             (
-                conn_guard.get_info().service_name.trim().to_string(),
+                execution_scope
+                    .map(str::trim)
+                    .filter(|scope| !scope.is_empty())
+                    .unwrap_or(conn_guard.get_info().service_name.trim())
+                    .to_string(),
                 conn_guard.get_info().advanced.clone(),
                 conn_guard.pool_session_context().ok(),
                 db_type,
@@ -21087,6 +21954,7 @@ impl SqlEditorWidget {
     pub(super) fn run_mysql_pooled_action_with_timeout<T, F>(
         shared_connection: &crate::db::SharedConnection,
         pooled_db_session: &SharedDbSessionLease,
+        execution_scope: Option<&str>,
         session_pool_sender: Option<&QueryProgressSender>,
         current_mysql_cancel_context: &Arc<Mutex<Option<MySqlQueryCancelContext>>>,
         current_query_cancel_handle: &Arc<Mutex<Option<QueryCancelHandle>>>,
@@ -21115,6 +21983,7 @@ impl SqlEditorWidget {
         ) = Self::acquire_mysql_pooled_session(
             shared_connection,
             pooled_db_session,
+            execution_scope,
             log_context,
             auto_commit,
             session_pool_sender,
@@ -21304,9 +22173,10 @@ impl SqlEditorWidget {
                         .session_residue_state()
                         .may_have_statement_diagnostics(),
                     None,
+                    execution_scope,
                 )
             {
-                Self::retain_mysql_pooled_session_if_current_with_state(
+                Self::retain_mysql_pooled_session_if_current_with_state_and_scope(
                     shared_connection,
                     pooled_db_session,
                     connection_generation,
@@ -21314,6 +22184,7 @@ impl SqlEditorWidget {
                     conn,
                     prior_retained_state,
                     log_context,
+                    execution_scope.map(str::to_string),
                 );
             } else {
                 Self::discard_mysql_pooled_connection(conn);
@@ -21328,6 +22199,7 @@ impl SqlEditorWidget {
             if let Err(message) = Self::apply_mysql_global_database_before_pooled_action(
                 shared_connection,
                 &mut conn,
+                execution_scope,
                 log_context,
                 connection_generation,
                 auto_commit,
@@ -21513,6 +22385,7 @@ impl SqlEditorWidget {
                     matches!(&result, Ok(Ok(_)))
                         && statement_effects.preserves_statement_diagnostics(),
                     known_current_database.as_deref(),
+                    execution_scope,
                 )
             }
             crate::db::MySqlPooledSessionReuseDecision::DropPhysicalSession => false,
@@ -21606,7 +22479,7 @@ impl SqlEditorWidget {
         } else {
             pool_context_epoch
         };
-        Self::apply_mysql_pooled_session_disposition_if_current(
+        Self::apply_mysql_pooled_session_disposition_if_current_with_scope(
             shared_connection,
             pooled_db_session,
             connection_generation,
@@ -21614,6 +22487,7 @@ impl SqlEditorWidget {
             conn,
             disposition,
             log_context,
+            execution_scope.map(str::to_string),
         );
         if use_statement_scope_sync_required && !should_retain_session {
             return Err(Self::mysql_scope_sync_lost_after_success_message());
@@ -24896,6 +25770,30 @@ mod query_execution_cleanup_tests {
         let result = SqlEditorWidget::abort_if_cancelled(&cancel_flag);
 
         assert_eq!(result, Err(SqlEditorWidget::cancel_message()));
+    }
+
+    #[test]
+    fn connection_candidate_commit_requires_current_uncancelled_operation() {
+        let current_operation_id = Arc::new(AtomicU64::new(41));
+        let cancel_flag = Arc::new(Mutex::new(false));
+
+        assert!(SqlEditorWidget::connection_candidate_commit_allowed(
+            &current_operation_id,
+            41,
+            &cancel_flag,
+        ));
+        assert!(!SqlEditorWidget::connection_candidate_commit_allowed(
+            &current_operation_id,
+            40,
+            &cancel_flag,
+        ));
+
+        *cancel_flag.lock().unwrap() = true;
+        assert!(!SqlEditorWidget::connection_candidate_commit_allowed(
+            &current_operation_id,
+            41,
+            &cancel_flag,
+        ));
     }
 
     #[test]
@@ -29766,6 +30664,7 @@ mod mysql_batch_execution_regression_tests {
         SqlEditorWidget::apply_mysql_global_database_before_pooled_action(
             &shared_connection,
             &mut conn,
+            None,
             "mysql empty scope recheck",
             connection_generation,
             true,
@@ -30016,6 +30915,7 @@ mod mysql_batch_execution_regression_tests {
                 None,
                 None,
                 0,
+                None,
             );
             drop(sender);
 
@@ -30103,6 +31003,7 @@ mod mysql_batch_execution_regression_tests {
             None,
             None,
             0,
+            None,
         );
         drop(sender);
 
@@ -30133,6 +31034,11 @@ mod mysql_batch_execution_regression_tests {
                         summarize_progress(std::slice::from_ref(progress))
                     )
                 }
+                QueryProgress::StatementOrigin { origin, progress } => format!(
+                    "StatementOrigin({}, {})",
+                    origin.connection_id,
+                    summarize_progress(std::slice::from_ref(progress))
+                ),
                 QueryProgress::OperationAbandoned { token } => {
                     format!("OperationAbandoned({})", token.operation_id)
                 }
@@ -30381,6 +31287,13 @@ mod mysql_batch_execution_regression_tests {
                         &nested_summary,
                     );
                 }
+                QueryProgress::StatementOrigin { progress, .. } => {
+                    let nested_summary = summarize_progress(std::slice::from_ref(progress));
+                    assert_all_mysql_live_progress_routes_are_intended(
+                        std::slice::from_ref(progress),
+                        &nested_summary,
+                    );
+                }
                 QueryProgress::OperationAbandoned { .. }
                 | QueryProgress::OperationFinished { .. }
                 | QueryProgress::CancelOutcome { .. } => {
@@ -30582,6 +31495,7 @@ mod mysql_batch_execution_regression_tests {
             None,
             None,
             0,
+            None,
         );
         drop(sender);
 
@@ -30703,6 +31617,7 @@ mod mysql_batch_execution_regression_tests {
             None,
             None,
             0,
+            None,
         );
         drop(sender);
 
@@ -30991,6 +31906,7 @@ mod mysql_batch_execution_regression_tests {
                 None,
                 None,
                 0,
+                None,
             );
             drop(sender);
 
@@ -31077,6 +31993,7 @@ mod mysql_batch_execution_regression_tests {
                 None,
                 None,
                 0,
+                None,
             );
             drop(sender);
 
@@ -31629,6 +32546,7 @@ SELECT 'FINAL_STATUS' AS section_name,
             None,
             None,
             0,
+            None,
         );
         drop(sender);
 

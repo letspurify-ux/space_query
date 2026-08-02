@@ -1,6 +1,8 @@
 use oracle::sql_type::OracleType;
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Mutex, OnceLock};
 
 use crate::db::connection::DatabaseType;
 
@@ -60,7 +62,36 @@ pub struct ComputeConfig {
     pub on_column: Option<String>,
 }
 
-#[derive(Debug, Clone)]
+static NEXT_SPOOL_OWNER_ID: AtomicU64 = AtomicU64::new(1);
+static SPOOL_PATH_OWNERS: OnceLock<Mutex<HashMap<PathBuf, u64>>> = OnceLock::new();
+
+#[derive(Debug)]
+pub(crate) struct SpoolOwner {
+    id: u64,
+}
+
+impl SpoolOwner {
+    fn new() -> Self {
+        Self {
+            id: NEXT_SPOOL_OWNER_ID.fetch_add(1, Ordering::Relaxed),
+        }
+    }
+}
+
+impl Drop for SpoolOwner {
+    fn drop(&mut self) {
+        spool_path_owners().retain(|_, owner_id| *owner_id != self.id);
+    }
+}
+
+fn spool_path_owners() -> std::sync::MutexGuard<'static, HashMap<PathBuf, u64>> {
+    SPOOL_PATH_OWNERS
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+#[derive(Debug)]
 pub struct SessionState {
     pub db_type: DatabaseType,
     pub binds: HashMap<String, BindVar>,
@@ -94,6 +125,7 @@ pub struct SessionState {
     pub compute: Option<ComputeConfig>,
     pub spool_path: Option<PathBuf>,
     pub spool_truncate: bool,
+    pub(crate) spool_owner: SpoolOwner,
     /// MySQL DELIMITER state — custom statement terminator for stored routines.
     pub mysql_delimiter: Option<String>,
 }
@@ -142,6 +174,7 @@ impl Default for SessionState {
             compute: None,
             spool_path: None,
             spool_truncate: false,
+            spool_owner: SpoolOwner::new(),
             mysql_delimiter: None,
         }
     }
@@ -182,6 +215,12 @@ impl BindVar {
 }
 
 impl SessionState {
+    pub fn for_connection(db_type: DatabaseType) -> Self {
+        let mut session = Self::default();
+        session.set_connection_db_type(db_type);
+        session
+    }
+
     pub fn normalize_name(name: &str) -> String {
         name.trim().trim_start_matches(':').to_uppercase()
     }
@@ -206,8 +245,39 @@ impl SessionState {
     }
 
     pub fn reset_for_connection(&mut self, db_type: DatabaseType) {
-        *self = Self::default();
-        self.set_connection_db_type(db_type);
+        *self = Self::for_connection(db_type);
+    }
+
+    pub fn claim_spool_path(&mut self, path: PathBuf, truncate: bool) -> Result<(), String> {
+        let mut owners = spool_path_owners();
+        if let Some(owner_id) = owners.get(&path) {
+            if *owner_id != self.spool_owner.id {
+                return Err(format!(
+                    "Spool file is already in use by another query tab: {}",
+                    path.display()
+                ));
+            }
+        }
+
+        if let Some(previous_path) = self.spool_path.as_ref() {
+            if previous_path != &path && owners.get(previous_path) == Some(&self.spool_owner.id) {
+                owners.remove(previous_path);
+            }
+        }
+        owners.insert(path.clone(), self.spool_owner.id);
+        self.spool_path = Some(path);
+        self.spool_truncate = truncate;
+        Ok(())
+    }
+
+    pub fn clear_spool_path(&mut self) {
+        if let Some(path) = self.spool_path.take() {
+            let mut owners = spool_path_owners();
+            if owners.get(&path) == Some(&self.spool_owner.id) {
+                owners.remove(&path);
+            }
+        }
+        self.spool_truncate = false;
     }
 }
 
@@ -259,5 +329,38 @@ mod tests {
 
         session.set_connection_db_type(DatabaseType::Oracle);
         assert!(session.define_enabled);
+    }
+
+    #[test]
+    fn spool_path_has_one_session_owner_and_off_releases_it() {
+        let path = PathBuf::from("/tmp/space_query_spool_path_owner_test.log");
+        let mut first = SessionState::default();
+        let mut second = SessionState::default();
+
+        first
+            .claim_spool_path(path.clone(), true)
+            .expect("first tab should own the spool path");
+        assert!(second.claim_spool_path(path.clone(), false).is_err());
+
+        first.clear_spool_path();
+        second
+            .claim_spool_path(path, false)
+            .expect("SPOOL OFF should release ownership");
+    }
+
+    #[test]
+    fn resetting_session_releases_spool_path() {
+        let path = PathBuf::from("/tmp/space_query_spool_path_reset_test.log");
+        let mut first = SessionState::default();
+        first
+            .claim_spool_path(path.clone(), true)
+            .expect("first tab should own the spool path");
+
+        first.reset_for_connection(DatabaseType::Oracle);
+
+        let mut second = SessionState::default();
+        second
+            .claim_spool_path(path, false)
+            .expect("connection transition should release spool ownership");
     }
 }

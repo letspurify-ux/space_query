@@ -419,7 +419,10 @@ impl SqlEditorWidget {
         let mut editor = self.editor.clone();
         let intellisense_data = self.intellisense_data.clone();
         let intellisense_popup = self.intellisense_popup.clone();
-        let connection = self.connection.clone();
+        let connection_binding = self.connection_binding.clone();
+        let fallback_connection = self
+            .bound_connection()
+            .unwrap_or_else(crate::db::create_shared_connection);
         let column_sender = self.column_sender.clone();
         let text_shadow = self.highlight_shadow.clone();
         let enter_keyup_suppression = Arc::new(Mutex::new(EnterKeyupSuppression::None));
@@ -432,7 +435,8 @@ impl SqlEditorWidget {
         let intellisense_runtime_for_insert = intellisense_runtime.clone();
         let intellisense_data_for_insert = intellisense_data.clone();
         let column_sender_for_insert = column_sender.clone();
-        let connection_for_insert = connection.clone();
+        let connection_binding_for_insert = connection_binding.clone();
+        let fallback_connection_for_insert = fallback_connection.clone();
         let text_shadow_for_insert = text_shadow.clone();
         let preferred_insert_position_for_insert = self.preferred_insert_position.clone();
         let undo_redo_state_for_insert = self.undo_redo_state.clone();
@@ -442,6 +446,9 @@ impl SqlEditorWidget {
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
             popup.set_selected_callback(move |selected| {
+                let connection_for_insert = connection_binding_for_insert
+                    .metadata_connection()
+                    .unwrap_or_else(|| fallback_connection_for_insert.clone());
                 let (cursor_pos, cursor_pos_usize) =
                     Self::editor_cursor_position(&editor_for_insert, &buffer_for_insert);
                 let preferred_db_type = Some(
@@ -548,7 +555,8 @@ impl SqlEditorWidget {
         let intellisense_data_for_handle = intellisense_data;
         let intellisense_popup_for_handle = intellisense_popup;
         let column_sender_for_handle = column_sender;
-        let connection_for_handle = connection;
+        let connection_binding_for_handle = connection_binding;
+        let fallback_connection_for_handle = fallback_connection;
         let enter_keyup_suppression_for_handle = enter_keyup_suppression;
         let navigation_keyup_state_for_handle = navigation_keyup_state;
         let intellisense_runtime_for_handle = intellisense_runtime;
@@ -580,6 +588,9 @@ impl SqlEditorWidget {
             Arc::new(Mutex::new(None));
 
         editor.handle(move |ed, ev| {
+            let connection_for_handle = connection_binding_for_handle
+                .metadata_connection()
+                .unwrap_or_else(|| fallback_connection_for_handle.clone());
             if ev != Event::Paste {
                 pending_paste_text_for_handle
                     .lock()

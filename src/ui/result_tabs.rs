@@ -11,7 +11,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use crate::db::query::result_messages;
-use crate::db::{ColumnInfo, QueryResult};
+use crate::db::{ColumnInfo, ExecutionOrigin, QueryResult};
 use crate::ui::constants;
 use crate::ui::font_settings::{
     configured_result_font_size, configured_result_profile, FontProfile,
@@ -73,6 +73,7 @@ pub struct ResultTabsWidget {
     on_close_callback: Arc<Mutex<Option<ResultTabsCloseCallback>>>,
     suppress_pointer_event_depth: Arc<Mutex<u32>>,
     data_tab_strip_state: Arc<Mutex<tab_strip::TabStripState>>,
+    execution_origin: Arc<Mutex<Option<ExecutionOrigin>>>,
 }
 
 #[derive(Clone)]
@@ -83,6 +84,7 @@ struct ResultTab {
     table: ResultTableWidget,
     status: ResultTabStatus,
     row_count: usize,
+    origin: Option<ExecutionOrigin>,
 }
 
 #[derive(Clone)]
@@ -541,6 +543,14 @@ impl ResultTabsWidget {
         }
     }
 
+    fn result_title_for_origin(label: &str, origin: Option<&ExecutionOrigin>) -> String {
+        let label = label.trim();
+        origin.map_or_else(
+            || label.to_string(),
+            |origin| format!("{} · {label}", origin.display_name),
+        )
+    }
+
     fn tabs_contains_group(tabs: &Tabs, group: &Group) -> bool {
         !tabs.was_deleted() && !group.was_deleted() && tabs.find(group) < tabs.children()
     }
@@ -747,6 +757,7 @@ impl ResultTabsWidget {
             Arc::new(Mutex::new(None));
         let suppress_pointer_event_depth = Arc::new(Mutex::new(0u32));
         let data_tab_strip_state = Arc::new(Mutex::new(tab_strip::TabStripState::default()));
+        let execution_origin = Arc::new(Mutex::new(None));
 
         tabs.begin();
         let (section_x, section_y, section_w, section_h) = Self::content_bounds(&tabs);
@@ -1117,7 +1128,29 @@ impl ResultTabsWidget {
             on_close_callback,
             suppress_pointer_event_depth,
             data_tab_strip_state,
+            execution_origin,
         }
+    }
+
+    pub(crate) fn set_execution_origin(&mut self, origin: Option<ExecutionOrigin>) {
+        *self
+            .execution_origin
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = origin;
+    }
+
+    pub(crate) fn active_result_origin(&self) -> Option<ExecutionOrigin> {
+        let active_index = *self
+            .active_index
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        active_index.and_then(|index| {
+            self.data
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .get(index)
+                .and_then(|tab| tab.origin.clone())
+        })
     }
 
     pub fn set_on_change<F>(&mut self, callback: F)
@@ -1221,6 +1254,34 @@ impl ResultTabsWidget {
         self.clear_grids();
         self.clear_support_panes();
         self.fire_on_change_callback();
+    }
+
+    pub(crate) fn delete_workspace(&mut self) {
+        *self
+            .execute_sql_callback
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+        *self
+            .lazy_fetch_callback
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+        *self
+            .context_action_callback
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+        *self
+            .on_change_callback
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+        *self
+            .on_close_callback
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+        self.clear();
+        let tabs = self.tabs.clone();
+        if !tabs.was_deleted() {
+            fltk::group::Tabs::delete(tabs);
+        }
     }
 
     pub fn tab_count(&self) -> usize {
@@ -1352,6 +1413,21 @@ impl ResultTabsWidget {
     ) {
         let _pointer_suppress_guard =
             PointerEventSuppressGuard::new(self.suppress_pointer_event_depth.clone());
+        let origin = self
+            .execution_origin
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        let title = Self::result_title_for_origin(label, origin.as_ref());
+        if let Some(tab) = self
+            .data
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get_mut(index)
+        {
+            tab.origin = origin.clone();
+            tab.title = title.clone();
+        }
         let existing_group = self
             .set_result_tab_state(index, ResultTabStatus::Running, 0)
             .map(|(group, _)| group);
@@ -1376,7 +1452,6 @@ impl ResultTabsWidget {
         self.data_tabs.begin();
         // Use explicit tab content bounds to avoid relying on hard-coded header height.
         let (x, y, w, h) = Self::content_bounds(&self.data_tabs);
-        let title = label.trim().to_string();
         let mut group = Group::new(x, y, w, h, None).with_label(&Self::result_tab_label_for_title(
             &title,
             index,
@@ -1455,6 +1530,7 @@ impl ResultTabsWidget {
                 table,
                 status: ResultTabStatus::Running,
                 row_count: 0,
+                origin,
             });
             let idx = data.len().saturating_sub(1);
             let group = data.get(idx).map(|tab| tab.group.clone());
@@ -2293,7 +2369,9 @@ impl Default for ResultTabsWidget {
 
 #[cfg(test)]
 mod tests {
-    use crate::db::QueryResult;
+    use crate::db::{
+        create_shared_connection, ConnectionRegistry, QueryResult, TabConnectionBinding,
+    };
     use crate::ui::result_table::LazyFetchCallback;
     use crate::ui::sql_editor::LazyFetchRequest;
     use fltk::enums::Event;
@@ -2406,6 +2484,27 @@ mod tests {
         assert_eq!(
             ResultTabsWidget::result_tab_label_for_title("Result", 0, ResultTabStatus::Done, 12),
             " Done (12) "
+        );
+    }
+
+    #[test]
+    fn result_title_places_connection_before_the_result_label_without_scope() {
+        let registry = ConnectionRegistry::new();
+        let runtime = registry
+            .register_saved("analytics", create_shared_connection())
+            .runtime;
+        let mut info = runtime.sanitized_info();
+        info.name = "analytics".to_string();
+        runtime.update_sanitized_info(info);
+        let binding = TabConnectionBinding::bound(runtime, Some("REPORTING".to_string()));
+        let origin = binding
+            .snapshot()
+            .execution_origin()
+            .expect("bound tab should have an execution origin");
+
+        assert_eq!(
+            ResultTabsWidget::result_title_for_origin("Result", Some(&origin)),
+            "analytics · Result"
         );
     }
 

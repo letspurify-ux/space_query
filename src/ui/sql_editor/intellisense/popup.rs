@@ -710,9 +710,7 @@ impl SqlEditorWidget {
         }
         let cursor = self.editor.insert_position().max(0) as usize;
 
-        let db_type = self
-            .intellisense_runtime
-            .db_type_without_blocking(&self.connection);
+        let db_type = self.current_db_type();
         let mysql_compatible = db_type.is_mysql_or_mariadb();
         // Keep signature parsing bounded on every edit/caret move. Snap a
         // partial leading line forward so lexical state can be supplied from
@@ -844,7 +842,15 @@ impl SqlEditorWidget {
         lookup_name: String,
         qualifier: Option<String>,
     ) {
-        let connection = self.connection.clone();
+        let Some(connection) = self.bound_connection() else {
+            let _ = self.ui_action_sender.send(UiActionResult::SignatureArguments {
+                key,
+                label: None,
+                cache: false,
+            });
+            app::awake();
+            return;
+        };
         let sender = self.ui_action_sender.clone();
         let runtime = self.intellisense_runtime.clone();
         let key_fallback = key.clone();
@@ -1111,6 +1117,9 @@ impl SqlEditorWidget {
         self.intellisense_data.clone()
     }
     pub fn show_intellisense(&self) {
+        let Some(connection) = self.connection_binding.metadata_connection() else {
+            return;
+        };
         Self::trigger_intellisense(
             &self.editor,
             &self.buffer,
@@ -1118,7 +1127,7 @@ impl SqlEditorWidget {
             &self.intellisense_data,
             &self.intellisense_popup,
             &self.column_sender,
-            &self.connection,
+            &connection,
             &self.intellisense_runtime,
         );
     }
@@ -1130,10 +1139,7 @@ impl SqlEditorWidget {
         else {
             return;
         };
-        let preferred_db_type = Some(
-            self.intellisense_runtime
-                .db_type_without_blocking(&self.connection),
-        );
+        let preferred_db_type = Some(self.current_db_type());
         let (qualifier, raw_qualifier) = Self::qualifiers_before_word(
             &self.buffer,
             &self.highlight_shadow,
@@ -1146,7 +1152,10 @@ impl SqlEditorWidget {
             raw_word.clone()
         };
 
-        let connection = self.connection.clone();
+        let Some(connection) = self.bound_connection() else {
+            Self::show_alert_dialog("This query tab is not connected to a database");
+            return;
+        };
         let sender = self.ui_action_sender.clone();
         let sender_for_thread = sender.clone();
         set_cursor(Cursor::Wait);

@@ -17,6 +17,7 @@ use tns_thin::exec::{OracleValue, StatementRequest};
 use tns_thin::pool::{PoolOptions as OracleThinPoolOptions, PooledThinConnection};
 use tns_thin::{ConnectTarget, OracleThinConfig, OracleThinSession, OracleThinSessionPool};
 
+use crate::db::runtime::ConnectionId;
 use crate::db::session::SessionState;
 use crate::db::session_policy::{
     retained_session_state_preflight_decision, RetainedSessionPreflightAction,
@@ -1414,13 +1415,38 @@ impl DbPoolSessionContext {
     }
 
     pub fn acquire_session_for_current_scope(&self) -> Result<DbPoolSession, String> {
+        self.acquire_session_with_scope_context(self)
+    }
+
+    pub fn acquire_session_for_scope(&self, scope: Option<&str>) -> Result<DbPoolSession, String> {
+        let scoped = self.for_scope(scope);
+        self.acquire_session_with_scope_context(&scoped)
+    }
+
+    pub fn for_scope(&self, scope: Option<&str>) -> Self {
+        let mut scoped = self.clone();
+        let scope = scope.map(str::trim).filter(|scope| !scope.is_empty());
+        if self.connection_info.db_type.is_mysql_or_mariadb() {
+            scoped.current_service_name = scope
+                .unwrap_or(self.connection_info.service_name.trim())
+                .to_string();
+        } else {
+            scoped.oracle_current_schema = scope.map(str::to_string);
+        }
+        scoped
+    }
+
+    fn acquire_session_with_scope_context(
+        &self,
+        scope_context: &DbPoolSessionContext,
+    ) -> Result<DbPoolSession, String> {
         self.ensure_current()?;
         let mut session = self.pool.acquire_session()?;
         if let Err(err) = self.ensure_current() {
             Self::discard_stale_session(session);
             return Err(err);
         }
-        if let Err(err) = self.apply_current_scope_to_session(&mut session) {
+        if let Err(err) = scope_context.apply_current_scope_to_session(&mut session) {
             Self::discard_stale_session(session);
             return Err(err);
         }
@@ -2485,7 +2511,7 @@ impl DbBackend for OracleBackend {
             service_name_required: true,
             default_host: "localhost",
             default_port: 1521,
-            default_service_name: "ORCL",
+            default_service_name: "",
             supports_tns_alias: true,
         }
     }
@@ -5819,6 +5845,7 @@ struct TrackedDbActivity {
     activity: String,
     started_at: Instant,
     db_type: Option<DatabaseType>,
+    connection_id: Option<ConnectionId>,
     kind: DbActivityKind,
     progress: DbActivityProgress,
 }
@@ -5829,6 +5856,7 @@ pub struct DbActivitySnapshot {
     pub activity: String,
     pub started_at: Instant,
     pub db_type: Option<DatabaseType>,
+    pub connection_id: Option<ConnectionId>,
     pub progress: DbActivityProgress,
 }
 
@@ -5912,6 +5940,15 @@ impl DbActivityGuard {
             tracked.db_type = Some(db_type);
         }
     }
+
+    pub fn set_connection_id(&self, connection_id: ConnectionId) {
+        if let Some(tracked) = lock_db_activities()
+            .iter_mut()
+            .find(|tracked| tracked.id == self.inner.id)
+        {
+            tracked.connection_id = Some(connection_id);
+        }
+    }
 }
 
 impl Drop for DbActivityGuardInner {
@@ -5940,6 +5977,7 @@ fn lock_db_activities() -> MutexGuard<'static, Vec<TrackedDbActivity>> {
 fn track_db_activity_entry(
     activity: String,
     db_type: Option<DatabaseType>,
+    connection_id: Option<ConnectionId>,
     kind: DbActivityKind,
 ) -> DbActivityGuard {
     let id = NEXT_DB_ACTIVITY_ID.fetch_add(1, Ordering::Relaxed);
@@ -5949,6 +5987,7 @@ fn track_db_activity_entry(
         activity,
         started_at: Instant::now(),
         db_type,
+        connection_id,
         kind,
         progress: DbActivityProgress::Indeterminate,
     });
@@ -5969,14 +6008,45 @@ pub fn track_pool_db_activity(
     activity: impl Into<String>,
     db_type: DatabaseType,
 ) -> DbActivityGuard {
-    track_db_activity_entry(activity.into(), Some(db_type), DbActivityKind::PoolSession)
+    track_db_activity_entry(
+        activity.into(),
+        Some(db_type),
+        None,
+        DbActivityKind::PoolSession,
+    )
+}
+
+pub fn track_pool_db_activity_for_connection(
+    activity: impl Into<String>,
+    db_type: DatabaseType,
+    connection_id: ConnectionId,
+) -> DbActivityGuard {
+    track_db_activity_entry(
+        activity.into(),
+        Some(db_type),
+        Some(connection_id),
+        DbActivityKind::PoolSession,
+    )
 }
 
 pub fn track_db_activity(
     activity: impl Into<String>,
     db_type: Option<DatabaseType>,
 ) -> DbActivityGuard {
-    track_db_activity_entry(activity.into(), db_type, DbActivityKind::Operation)
+    track_db_activity_entry(activity.into(), db_type, None, DbActivityKind::Operation)
+}
+
+pub fn track_db_activity_for_connection(
+    activity: impl Into<String>,
+    db_type: Option<DatabaseType>,
+    connection_id: ConnectionId,
+) -> DbActivityGuard {
+    track_db_activity_entry(
+        activity.into(),
+        db_type,
+        Some(connection_id),
+        DbActivityKind::Operation,
+    )
 }
 
 fn current_db_activity_for_kind(kind: Option<DbActivityKind>) -> Option<String> {
@@ -6010,6 +6080,7 @@ pub fn active_pool_db_activity_snapshots() -> Vec<DbActivitySnapshot> {
             activity: activity.activity.clone(),
             started_at: activity.started_at,
             db_type: activity.db_type,
+            connection_id: activity.connection_id,
             progress: activity.progress,
         })
         .collect()
@@ -6023,6 +6094,7 @@ pub fn active_db_activity_snapshots() -> Vec<DbActivitySnapshot> {
             activity: activity.activity.clone(),
             started_at: activity.started_at,
             db_type: activity.db_type,
+            connection_id: activity.connection_id,
             progress: activity.progress,
         })
         .collect()
@@ -6064,13 +6136,6 @@ impl<'a> DerefMut for ConnectionLockGuard<'a> {
 
 pub fn create_shared_connection() -> SharedConnection {
     Arc::new(Mutex::new(DatabaseConnection::new()))
-}
-
-pub(crate) fn shared_connection_identity_snapshot(
-    connection: &SharedConnection,
-) -> (DatabaseType, Arc<Mutex<SessionState>>) {
-    let connection = lock_database_connection_raw(connection);
-    (connection.db_type(), connection.session_state())
 }
 
 pub(crate) fn connect_shared_connection_with_policy(
@@ -6199,7 +6264,8 @@ pub fn lock_connection_with_activity(
     activity: impl Into<String>,
 ) -> ConnectionLockGuard<'_> {
     let activity = activity.into();
-    let activity_guard = track_db_activity_entry(activity, None, DbActivityKind::ConnectionLock);
+    let activity_guard =
+        track_db_activity_entry(activity, None, None, DbActivityKind::ConnectionLock);
     let mut connection_guard = lock_connection(connection);
     activity_guard.set_db_type(connection_guard.db_type());
     connection_guard.activity_guard = Some(activity_guard);
@@ -6240,6 +6306,7 @@ pub fn try_lock_connection_with_activity(
     let mut guard = try_lock_connection(connection)?;
     guard.activity_guard = Some(track_db_activity_entry(
         activity.into(),
+        None,
         None,
         DbActivityKind::ConnectionLock,
     ));
@@ -7381,6 +7448,7 @@ mod tests {
         let connection_activity = track_db_activity_entry(
             "Switching schema".to_string(),
             None,
+            None,
             DbActivityKind::ConnectionLock,
         );
         assert_eq!(
@@ -7395,6 +7463,26 @@ mod tests {
         drop(second_pool_activity);
         assert!(active_pool_db_activity_snapshots().is_empty());
         assert_eq!(current_db_activity(), None);
+        clear_tracked_db_activity();
+    }
+
+    #[test]
+    fn db_activity_tracking_preserves_connection_identity() {
+        let _activity_test_guard = db_activity_test_lock();
+        clear_tracked_db_activity();
+        let registry = crate::db::ConnectionRegistry::new();
+        let runtime = registry.register_unmanaged(create_shared_connection());
+        let activity = track_db_activity_for_connection(
+            "Executing on one runtime",
+            Some(DatabaseType::Oracle),
+            runtime.id(),
+        );
+
+        let snapshots = active_db_activity_snapshots();
+        assert_eq!(snapshots.len(), 1);
+        assert_eq!(snapshots[0].connection_id, Some(runtime.id()));
+
+        drop(activity);
         clear_tracked_db_activity();
     }
 
@@ -7776,6 +7864,7 @@ mod tests {
     fn database_form_specs_keep_connection_defaults_in_backend_metadata() {
         let oracle = DatabaseType::Oracle.connection_form_spec();
         assert_eq!(oracle.default_port, 1521);
+        assert!(oracle.default_service_name.is_empty());
         assert!(oracle.show_driver_mode);
         assert!(oracle.service_name_required);
         assert!(oracle.supports_tns_alias);

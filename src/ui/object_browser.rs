@@ -21,8 +21,9 @@ use std::time::Duration;
 
 use crate::db::{
     format_connection_busy_message, lock_connection_with_activity, try_lock_connection, ColumnInfo,
-    CompilationError, ConstraintInfo, IndexInfo, ObjectBrowser, PackageRoutine, ProcedureArgument,
-    QueryResult, SequenceInfo, SharedConnection, SynonymInfo, TableColumnDetail,
+    CompilationError, ConnectionId, ConnectionRuntime, ConnectionRuntimeState, ConstraintInfo,
+    IndexInfo, ObjectBrowser, PackageRoutine, ProcedureArgument, QueryResult, SequenceInfo,
+    SharedConnection, SynonymInfo, TableColumnDetail,
 };
 use crate::ui::constants::*;
 use crate::ui::font_settings::FontProfile;
@@ -253,6 +254,10 @@ pub type SqlExecuteCallback = Arc<Mutex<Option<Box<dyn FnMut(SqlAction)>>>>;
 type StatusCallback = Arc<Mutex<Option<Box<dyn FnMut(&str)>>>>;
 type ScopeChangeCallback = Arc<Mutex<Option<Box<dyn FnMut()>>>>;
 type ScopeSwitchPreflightCallback = Arc<Mutex<Option<Box<dyn FnMut() -> Result<(), String>>>>>;
+type ConnectionSqlExecuteCallback = Arc<Mutex<Option<Box<dyn FnMut(ConnectionId, SqlAction)>>>>;
+type ConnectionScopeChangeCallback = Arc<Mutex<Option<Box<dyn FnMut(ConnectionId)>>>>;
+type ConnectionScopeSwitchPreflightCallback =
+    Arc<Mutex<Option<Box<dyn FnMut(ConnectionId) -> Result<(), String>>>>>;
 type MetadataCallback = Arc<Mutex<Option<Box<dyn FnMut(ObjectBrowserMetadataSnapshot)>>>>;
 
 #[derive(Clone)]
@@ -560,6 +565,7 @@ pub struct ObjectBrowserWidget {
     active_scope_selector_popup: Arc<Mutex<Option<Window>>>,
     scope_generation: Arc<AtomicU64>,
     scope_switch_in_progress: Arc<AtomicBool>,
+    tab_local_scope_selection: Arc<AtomicBool>,
     refresh_connection_generation: Arc<AtomicU64>,
     pending_tree_refresh: Arc<Mutex<Option<PendingTreeRefresh>>>,
     poll_lifecycle: Arc<()>,
@@ -646,6 +652,7 @@ impl ObjectBrowserWidget {
         let active_scope_selector_popup = Arc::new(Mutex::new(None));
         let scope_generation = Arc::new(AtomicU64::new(0));
         let scope_switch_in_progress = Arc::new(AtomicBool::new(false));
+        let tab_local_scope_selection = Arc::new(AtomicBool::new(false));
         let refresh_connection_generation = Arc::new(AtomicU64::new(0));
         let pending_tree_refresh = Arc::new(Mutex::new(None));
         let poll_lifecycle = Arc::new(());
@@ -676,6 +683,7 @@ impl ObjectBrowserWidget {
             active_scope_selector_popup,
             scope_generation,
             scope_switch_in_progress,
+            tab_local_scope_selection,
             refresh_connection_generation,
             pending_tree_refresh,
             poll_lifecycle,
@@ -856,6 +864,11 @@ impl ObjectBrowserWidget {
             normalized_scope.as_deref(),
             self.scope_switch_in_progress.load(Ordering::Acquire),
         );
+    }
+
+    pub fn set_tab_local_scope_selection(&mut self, enabled: bool) {
+        self.tab_local_scope_selection
+            .store(enabled, Ordering::Release);
     }
 
     pub fn set_scope_change_callback<F>(&mut self, callback: F)
@@ -1763,6 +1776,7 @@ impl ObjectBrowserWidget {
         let scope_switch_preflight_callback = self.scope_switch_preflight_callback.clone();
         let scope_generation = self.scope_generation.clone();
         let scope_switch_in_progress = self.scope_switch_in_progress.clone();
+        let tab_local_scope_selection = self.tab_local_scope_selection.clone();
         let refresh_connection_generation = self.refresh_connection_generation.clone();
         let action_sender = self.action_sender.clone();
 
@@ -1794,9 +1808,6 @@ impl ObjectBrowserWidget {
             }
 
             if db_type.has_connection_scope() {
-                let Some(target_scope) = next_scope else {
-                    return;
-                };
                 let preflight_result =
                     Self::invoke_scope_switch_preflight_callback(&scope_switch_preflight_callback);
                 if let Err(err) = preflight_result {
@@ -1810,6 +1821,13 @@ impl ObjectBrowserWidget {
                     crate::ui::alert_on_main(&err);
                     return;
                 }
+            }
+
+            if db_type.has_connection_scope() && !tab_local_scope_selection.load(Ordering::Acquire)
+            {
+                let Some(target_scope) = next_scope else {
+                    return;
+                };
                 if scope_switch_in_progress.swap(true, Ordering::AcqRel) {
                     Self::restore_previous_scope_choice(
                         choice,
@@ -3369,35 +3387,43 @@ impl ObjectBrowserWidget {
 
     fn with_pooled_object_session<T>(
         connection: &SharedConnection,
+        selected_scope: Option<&str>,
         activity: String,
         action: impl FnOnce(
             &crate::db::DbPoolSessionContext,
             crate::db::DbPoolSession,
         ) -> Result<T, String>,
     ) -> Result<T, String> {
-        let context = Self::object_action_pool_session_context(connection)?;
+        let base_context = Self::object_action_pool_session_context(connection)?;
+        let context = base_context.for_scope(selected_scope);
         let db_type = context.connection_info.db_type;
         let _activity_guard = crate::db::track_pool_db_activity(activity, db_type);
-        Self::ensure_object_action_context_current(connection, &context)?;
+        Self::ensure_object_action_context_current(connection, &base_context)?;
         // session.md §3 / §27 — narrow the race between scope validation and
         // session acquire. `ensure_object_action_context_current` uses a
         // try_lock that silently passes when the connection mutex is held by
         // another caller, so an extra cache match check before acquire keeps
         // a disconnect that landed mid-call from leasing a stale pool session.
-        if !crate::db::cached_pool_session_context_matches_shared_connection(connection, &context) {
+        if !crate::db::cached_pool_session_context_matches_shared_connection(
+            connection,
+            &base_context,
+        ) {
             return Err(
                 "Connection scope changed before object metadata query started. Retry the action."
                     .to_string(),
             );
         }
-        let session = context.acquire_session_for_current_scope()?;
-        if !crate::db::cached_pool_session_context_matches_shared_connection(connection, &context) {
+        let session = base_context.acquire_session_for_scope(selected_scope)?;
+        if !crate::db::cached_pool_session_context_matches_shared_connection(
+            connection,
+            &base_context,
+        ) {
             return Err(
                 "Connection scope changed before object metadata query started. Retry the action."
                     .to_string(),
             );
         }
-        Self::ensure_object_action_context_current(connection, &context)?;
+        Self::ensure_object_action_context_current(connection, &base_context)?;
         action(&context, session)
     }
 
@@ -5133,6 +5159,7 @@ impl ObjectBrowserWidget {
                             let mut db_type = db_type;
                             let result = ObjectBrowserWidget::with_pooled_object_session(
                                 &connection,
+                                selected_scope.as_deref(),
                                 activity,
                                 |context, session| {
                                     db_type = context.connection_info.db_type;
@@ -5283,6 +5310,7 @@ impl ObjectBrowserWidget {
                         thread::spawn(move || {
                             let result = ObjectBrowserWidget::with_pooled_object_session(
                                 &connection,
+                                selected_scope.as_deref(),
                                 format!("Loading table structure for {}", table_name),
                                 |context, session| {
                                     object_browser_behavior_for(context.connection_info.db_type)
@@ -5311,6 +5339,7 @@ impl ObjectBrowserWidget {
                         thread::spawn(move || {
                             let result = ObjectBrowserWidget::with_pooled_object_session(
                                 &connection,
+                                selected_scope.as_deref(),
                                 format!("Loading indexes for {}", table_name),
                                 |context, session| {
                                     object_browser_behavior_for(context.connection_info.db_type)
@@ -5339,6 +5368,7 @@ impl ObjectBrowserWidget {
                         thread::spawn(move || {
                             let result = ObjectBrowserWidget::with_pooled_object_session(
                                 &connection,
+                                selected_scope.as_deref(),
                                 format!("Loading constraints for {}", table_name),
                                 |context, session| {
                                     object_browser_behavior_for(context.connection_info.db_type)
@@ -5396,6 +5426,7 @@ impl ObjectBrowserWidget {
 
                             let result = ObjectBrowserWidget::with_pooled_object_session(
                                 &connection,
+                                selected_scope.as_deref(),
                                 format!("Loading {} info for {}", obj_type, name),
                                 |context, session| {
                                     object_browser_behavior_for(context.connection_info.db_type)
@@ -5459,6 +5490,7 @@ impl ObjectBrowserWidget {
                                     format!("Generating {} DDL for {}", object_type, object_name);
                                 let result = ObjectBrowserWidget::with_pooled_object_session(
                                     &connection,
+                                    selected_scope.as_deref(),
                                     activity,
                                     |context, session| {
                                         object_browser_behavior_for(context.connection_info.db_type)
@@ -6504,6 +6536,7 @@ impl ObjectBrowserDbBehavior for OracleObjectBrowserBehavior {
         let qualified_package = self.qualify_object_name(selected_scope, package_name);
         ObjectBrowserWidget::with_pooled_object_session(
             connection,
+            selected_scope,
             activity,
             |_context, session| match session {
                 crate::db::DbPoolSession::Oracle(conn) => {
@@ -6535,6 +6568,7 @@ impl ObjectBrowserDbBehavior for OracleObjectBrowserBehavior {
         let package_qualified_name = self.qualify_object_name(selected_scope, package_name);
         ObjectBrowserWidget::with_pooled_object_session(
             connection,
+            selected_scope,
             activity,
             |_context, session| match session {
                 crate::db::DbPoolSession::Oracle(conn) => {
@@ -6626,6 +6660,7 @@ impl ObjectBrowserDbBehavior for OracleObjectBrowserBehavior {
         let qualified_name = self.qualify_object_name(selected_scope, object_name);
         ObjectBrowserWidget::with_pooled_object_session(
             connection,
+            selected_scope,
             activity,
             |_context, session| {
                 let (status, body_status, errors) = match session {
@@ -7609,6 +7644,562 @@ fn copy_text_for_object_item(item_info: &ObjectItem) -> String {
             routine_name,
             ..
         } => format!("{}.{}", package_name, routine_name),
+    }
+}
+
+#[derive(Clone)]
+struct ConnectionBrowserEntry {
+    connection_id: ConnectionId,
+    runtime: Arc<ConnectionRuntime>,
+    browser: ObjectBrowserWidget,
+}
+
+/// Connection-aware Object Browser host. Each open runtime keeps its own tree,
+/// scope selector, metadata cache, and worker lifecycle. The connection choice
+/// is a compact root selector; changing it never changes the active query tab.
+#[derive(Clone)]
+pub struct MultiObjectBrowserWidget {
+    flex: Flex,
+    connection_choice: Choice,
+    browser_stack: Group,
+    entries: Arc<Mutex<Vec<ConnectionBrowserEntry>>>,
+    visible_connection_id: Arc<Mutex<Option<ConnectionId>>>,
+    bound_tab_connection_id: Arc<Mutex<Option<ConnectionId>>>,
+    sql_callback: ConnectionSqlExecuteCallback,
+    status_callback: StatusCallback,
+    scope_change_callback: ConnectionScopeChangeCallback,
+    scope_switch_preflight_callback: ConnectionScopeSwitchPreflightCallback,
+    metadata_callback: MetadataCallback,
+    font_settings: Arc<Mutex<Option<(FontProfile, i32)>>>,
+}
+
+impl MultiObjectBrowserWidget {
+    pub fn new(x: i32, y: i32, w: i32, h: i32) -> Self {
+        let mut flex = Flex::default().with_pos(x, y).with_size(w, h);
+        flex.set_type(FlexType::Column);
+        flex.set_spacing(DIALOG_SPACING);
+
+        let mut connection_row = Flex::default();
+        connection_row.set_type(FlexType::Row);
+        connection_row.set_spacing(0);
+        let left_margin = Frame::default();
+        connection_row.fixed(&left_margin, TOOLBAR_SPACING);
+        let mut connection_choice = Choice::default();
+        connection_choice.set_color(theme::input_bg());
+        connection_choice.set_text_color(theme::text_primary());
+        connection_choice
+            .set_tooltip("Object Browser connection. Changing this does not rebind the query tab.");
+        connection_choice.deactivate();
+        connection_row.resizable(&connection_choice);
+        let right_margin = Frame::default();
+        connection_row.fixed(&right_margin, TOOLBAR_SPACING);
+        connection_row.end();
+        flex.fixed(&connection_row, FILTER_INPUT_HEIGHT);
+
+        let browser_stack = Group::default();
+        flex.resizable(&browser_stack);
+        flex.end();
+
+        let mut widget = Self {
+            flex,
+            connection_choice,
+            browser_stack,
+            entries: Arc::new(Mutex::new(Vec::new())),
+            visible_connection_id: Arc::new(Mutex::new(None)),
+            bound_tab_connection_id: Arc::new(Mutex::new(None)),
+            sql_callback: Arc::new(Mutex::new(None)),
+            status_callback: Arc::new(Mutex::new(None)),
+            scope_change_callback: Arc::new(Mutex::new(None)),
+            scope_switch_preflight_callback: Arc::new(Mutex::new(None)),
+            metadata_callback: Arc::new(Mutex::new(None)),
+            font_settings: Arc::new(Mutex::new(None)),
+        };
+        widget.setup_connection_choice_callback();
+        widget
+    }
+
+    fn runtime_label(runtime: &ConnectionRuntime) -> String {
+        let mut label = runtime.display_name().replace('|', "/");
+        match runtime.state() {
+            ConnectionRuntimeState::Connecting => label.push_str(" (connecting)"),
+            ConnectionRuntimeState::Transitioning => label.push_str(" (transitioning)"),
+            ConnectionRuntimeState::Disconnected => label.push_str(" (offline)"),
+            ConnectionRuntimeState::Failed(_) => label.push_str(" (failed)"),
+            ConnectionRuntimeState::Connected => {}
+        }
+        label
+    }
+
+    fn setup_connection_choice_callback(&mut self) {
+        let entries = self.entries.clone();
+        let visible_connection_id = self.visible_connection_id.clone();
+        self.connection_choice.set_callback(move |choice| {
+            let index = choice.value().max(0) as usize;
+            let entries_snapshot = entries
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .clone();
+            let selected_id = entries_snapshot.get(index).map(|entry| entry.connection_id);
+            *visible_connection_id
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()) = selected_id;
+            for (entry_index, entry) in entries_snapshot.iter().enumerate() {
+                let mut root = entry.browser.get_widget();
+                if entry_index == index {
+                    root.show();
+                } else {
+                    root.hide();
+                }
+            }
+            if let Some(mut browser) = entries_snapshot
+                .get(index)
+                .map(|entry| entry.browser.clone())
+            {
+                let _ = browser.refresh();
+            }
+            app::redraw();
+        });
+    }
+
+    fn wire_callbacks(&self, connection_id: ConnectionId, browser: &mut ObjectBrowserWidget) {
+        let sql_callback = self.sql_callback.clone();
+        browser.set_sql_callback(move |action| {
+            if let Some(callback) = sql_callback
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .as_mut()
+            {
+                callback(connection_id, action);
+            }
+        });
+
+        let status_callback = self.status_callback.clone();
+        let visible_connection_id = self.visible_connection_id.clone();
+        browser.set_status_callback(move |message| {
+            let visible_id = *visible_connection_id
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if visible_id == Some(connection_id) {
+                ObjectBrowserWidget::emit_status_callback(&status_callback, message);
+            }
+        });
+
+        let metadata_callback = self.metadata_callback.clone();
+        let bound_tab_connection_id = self.bound_tab_connection_id.clone();
+        browser.set_metadata_callback(move |snapshot| {
+            let bound_id = *bound_tab_connection_id
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if bound_id == Some(connection_id) {
+                ObjectBrowserWidget::emit_metadata_callback(&metadata_callback, snapshot);
+            }
+        });
+
+        let scope_change_callback = self.scope_change_callback.clone();
+        browser.set_scope_change_callback(move || {
+            if let Some(callback) = scope_change_callback
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .as_mut()
+            {
+                callback(connection_id);
+            }
+        });
+
+        let scope_switch_preflight_callback = self.scope_switch_preflight_callback.clone();
+        browser.set_scope_switch_preflight_callback(move || {
+            scope_switch_preflight_callback
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .as_mut()
+                .map_or(Ok(()), |callback| callback(connection_id))
+        });
+    }
+
+    pub fn add_runtime(&mut self, runtime: Arc<ConnectionRuntime>) {
+        if self
+            .entries
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .iter()
+            .any(|entry| entry.connection_id == runtime.id())
+        {
+            self.refresh_runtime_labels();
+            return;
+        }
+
+        let previous_group = Group::try_current();
+        self.browser_stack.begin();
+        let mut browser = ObjectBrowserWidget::new(
+            self.browser_stack.x(),
+            self.browser_stack.y(),
+            self.browser_stack.w(),
+            self.browser_stack.h(),
+            runtime.connection(),
+        );
+        browser.set_tab_local_scope_selection(true);
+        self.browser_stack.end();
+        if let Some(previous_group) = previous_group.as_ref() {
+            Group::set_current(Some(previous_group));
+        } else {
+            Group::set_current(None::<&Group>);
+        }
+        self.wire_callbacks(runtime.id(), &mut browser);
+        if let Some((profile, size)) = *self
+            .font_settings
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+        {
+            browser.apply_font_settings(profile, size);
+        }
+
+        let is_first = self
+            .entries
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .is_empty();
+        if !is_first {
+            browser.get_widget().hide();
+        } else {
+            *self
+                .visible_connection_id
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(runtime.id());
+        }
+        self.entries
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .push(ConnectionBrowserEntry {
+                connection_id: runtime.id(),
+                runtime,
+                browser,
+            });
+        self.refresh_runtime_labels();
+    }
+
+    pub fn remove_runtime(&mut self, connection_id: ConnectionId) -> bool {
+        let removed = {
+            let mut entries = self
+                .entries
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let Some(index) = entries
+                .iter()
+                .position(|entry| entry.connection_id == connection_id)
+            else {
+                return false;
+            };
+            entries.remove(index)
+        };
+
+        let mut root = removed.browser.get_widget();
+        root.hide();
+        drop(removed);
+        Flex::delete(root);
+
+        let entries = self
+            .entries
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        let next_id = entries.first().map(|entry| entry.connection_id);
+        {
+            let mut visible = self
+                .visible_connection_id
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if *visible == Some(connection_id) {
+                *visible = next_id;
+            }
+        }
+        {
+            let mut bound = self
+                .bound_tab_connection_id
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if *bound == Some(connection_id) {
+                *bound = None;
+            }
+        }
+        for (index, entry) in entries.iter().enumerate() {
+            let mut entry_root = entry.browser.get_widget();
+            if Some(entry.connection_id) == next_id {
+                entry_root.show();
+                self.connection_choice.set_value(index as i32);
+            } else {
+                entry_root.hide();
+            }
+        }
+        self.refresh_runtime_labels();
+        app::redraw();
+        true
+    }
+
+    pub fn refresh_runtime_labels(&mut self) {
+        let current_value = self.connection_choice.value();
+        self.connection_choice.clear();
+        for entry in self
+            .entries
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .iter()
+        {
+            self.connection_choice
+                .add_choice(&Self::runtime_label(&entry.runtime));
+        }
+        if self.connection_choice.size() > 0 {
+            self.connection_choice
+                .set_value(current_value.clamp(0, self.connection_choice.size() - 1));
+            self.connection_choice.activate();
+        } else {
+            self.connection_choice.deactivate();
+        }
+    }
+
+    pub fn selected_connection_context(&self) -> Option<(ConnectionId, Option<String>)> {
+        let connection_id = (*self
+            .visible_connection_id
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()))?;
+        let scope = self
+            .entries
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .iter()
+            .find(|entry| entry.connection_id == connection_id)
+            .and_then(|entry| entry.browser.selected_scope());
+        Some((connection_id, scope))
+    }
+
+    pub fn set_active_connection(&mut self, connection_id: Option<ConnectionId>) {
+        *self
+            .bound_tab_connection_id
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = connection_id;
+        let index = connection_id.and_then(|connection_id| {
+            self.entries
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .iter()
+                .position(|entry| entry.connection_id == connection_id)
+        });
+        let Some(index) = index else {
+            return;
+        };
+        self.connection_choice.set_value(index as i32);
+        *self
+            .visible_connection_id
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = connection_id;
+        let entries = self
+            .entries
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        for (entry_index, entry) in entries.iter().enumerate() {
+            let mut root = entry.browser.get_widget();
+            if entry_index == index {
+                root.show();
+            } else {
+                root.hide();
+            }
+        }
+        self.refresh_runtime_labels();
+    }
+
+    fn bound_browser(&self) -> Option<ObjectBrowserWidget> {
+        let connection_id = *self
+            .bound_tab_connection_id
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        self.entries
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .iter()
+            .find(|entry| Some(entry.connection_id) == connection_id)
+            .map(|entry| entry.browser.clone())
+    }
+
+    fn visible_browser(&self) -> Option<ObjectBrowserWidget> {
+        let connection_id = *self
+            .visible_connection_id
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        self.entries
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .iter()
+            .find(|entry| Some(entry.connection_id) == connection_id)
+            .map(|entry| entry.browser.clone())
+    }
+
+    pub fn get_widget(&self) -> Flex {
+        self.flex.clone()
+    }
+
+    pub fn apply_font_settings(&mut self, profile: FontProfile, ui_size: i32) {
+        *self
+            .font_settings
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some((profile, ui_size));
+        self.connection_choice.set_text_font(profile.normal);
+        self.connection_choice.set_text_size(ui_size);
+        for entry in self
+            .entries
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .iter_mut()
+        {
+            entry.browser.apply_font_settings(profile, ui_size);
+        }
+    }
+
+    pub fn selected_scope(&self) -> Option<String> {
+        self.bound_browser()
+            .and_then(|browser| browser.selected_scope())
+    }
+
+    pub fn selected_scope_for_connection(&self, connection_id: ConnectionId) -> Option<String> {
+        self.entries
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .iter()
+            .find(|entry| entry.connection_id == connection_id)
+            .and_then(|entry| entry.browser.selected_scope())
+    }
+
+    pub fn set_selected_scope_for_connection(
+        &mut self,
+        connection_id: ConnectionId,
+        scope: Option<String>,
+    ) -> bool {
+        let browser = self
+            .entries
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .iter()
+            .find(|entry| entry.connection_id == connection_id)
+            .map(|entry| entry.browser.clone());
+        let Some(mut browser) = browser else {
+            return false;
+        };
+        browser.set_selected_scope(scope);
+        true
+    }
+
+    pub fn reset_selected_scope(&mut self) {
+        if let Some(mut browser) = self.bound_browser() {
+            browser.reset_selected_scope();
+        }
+    }
+
+    pub fn set_selected_scope(&mut self, scope: Option<String>) {
+        if let Some(mut browser) = self.bound_browser() {
+            browser.set_selected_scope(scope);
+        }
+    }
+
+    pub fn clear_on_disconnect(&mut self) {
+        if let Some(mut browser) = self.bound_browser() {
+            browser.clear_on_disconnect();
+        }
+        self.refresh_runtime_labels();
+    }
+
+    pub fn refresh_with_context(&mut self, context: crate::db::DbPoolSessionContext) -> bool {
+        self.bound_browser()
+            .is_some_and(|mut browser| browser.refresh_with_context(context))
+    }
+
+    pub fn show_context_menu_for_sql_selection(
+        &self,
+        selected_text: &str,
+        intellisense_data: &IntellisenseData,
+    ) -> bool {
+        self.bound_browser().is_some_and(|browser| {
+            browser.show_context_menu_for_sql_selection(selected_text, intellisense_data)
+        })
+    }
+
+    pub fn hide_scope_selector_popup_if_outside(&self, root_x: i32, root_y: i32) {
+        for entry in self
+            .entries
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .iter()
+        {
+            entry
+                .browser
+                .hide_scope_selector_popup_if_outside(root_x, root_y);
+        }
+    }
+
+    pub fn has_focus(&self) -> bool {
+        widget_has_focus(&self.connection_choice)
+            || self
+                .visible_browser()
+                .is_some_and(|browser| browser.has_focus())
+    }
+
+    pub fn copy_focused_selection_to_clipboard(&self) -> bool {
+        self.visible_browser()
+            .is_some_and(|browser| browser.copy_focused_selection_to_clipboard())
+    }
+
+    pub fn capture_tour_set_example_metadata(&mut self) {
+        if let Some(mut browser) = self.bound_browser() {
+            browser.capture_tour_set_example_metadata();
+        }
+    }
+
+    pub fn set_sql_callback<F>(&mut self, callback: F)
+    where
+        F: FnMut(ConnectionId, SqlAction) + 'static,
+    {
+        *self
+            .sql_callback
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(Box::new(callback));
+    }
+
+    pub fn set_status_callback<F>(&mut self, callback: F)
+    where
+        F: FnMut(&str) + 'static,
+    {
+        *self
+            .status_callback
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(Box::new(callback));
+    }
+
+    pub fn set_metadata_callback<F>(&mut self, callback: F)
+    where
+        F: FnMut(ObjectBrowserMetadataSnapshot) + 'static,
+    {
+        *self
+            .metadata_callback
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(Box::new(callback));
+    }
+
+    pub fn set_scope_change_callback<F>(&mut self, callback: F)
+    where
+        F: FnMut(ConnectionId) + 'static,
+    {
+        *self
+            .scope_change_callback
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(Box::new(callback));
+    }
+
+    pub fn set_scope_switch_preflight_callback<F>(&mut self, callback: F)
+    where
+        F: FnMut(ConnectionId) -> Result<(), String> + 'static,
+    {
+        *self
+            .scope_switch_preflight_callback
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(Box::new(callback));
     }
 }
 

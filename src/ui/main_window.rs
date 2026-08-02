@@ -4,7 +4,7 @@ use fltk::{
     button::{Button, CheckButton},
     dialog::{FileDialog, FileDialogType},
     draw::{measure, set_cursor, set_font},
-    enums::{Align, Color, Cursor, FrameType},
+    enums::{Align, Color, Cursor, Event, FrameType},
     frame::Frame,
     group::{Flex, FlexType, Group, Tile},
     input::{Input, IntInput},
@@ -30,18 +30,19 @@ use crate::db::{
     connect_shared_connection_with_policy, connection_transition_activity,
     create_shared_connection, format_connection_busy_message,
     resize_shared_connection_pool_with_policy, try_lock_connection_with_activity, ColumnInfo,
-    ConnectionAttemptPolicy, DatabaseType, ObjectBrowser, QueryResult,
+    ConnectionAttemptPolicy, ConnectionId, ConnectionRegistry, ConnectionRuntime,
+    ConnectionRuntimeState, DatabaseType, ObjectBrowser, QueryResult,
     RetainedSessionMutationOutcome, RetainedSessionPreflightAction,
     RetainedSessionPreflightDecision, RetainedSessionResolutionAction, SharedConnection,
-    TransactionAccessMode, TransactionIsolation, TransactionMode,
+    TabConnectionBinding, TransactionAccessMode, TransactionIsolation, TransactionMode,
 };
 use crate::ui::constants::*;
 use crate::ui::result_table::{ResultGridSqlExecuteCallback, ResultTableContextAction};
 use crate::ui::theme;
 use crate::ui::{
     font_settings, show_settings_dialog, ConnectionDialog, FindReplaceDialog, FontSettings,
-    HighlightData, IntellisenseData, MenuBarBuilder, ObjectBrowserMetadataSnapshot,
-    ObjectBrowserWidget, QualifiedMemberKind, QueryCancelOutcome, QueryHistoryDialog,
+    HighlightData, IntellisenseData, MenuBarBuilder, MultiObjectBrowserWidget,
+    ObjectBrowserMetadataSnapshot, QualifiedMemberKind, QueryCancelOutcome, QueryHistoryDialog,
     QueryOperationToken, QueryProgress, QueryTabId, QueryTabsWidget, ResultMessageKind,
     ResultTabCloseTarget, ResultTabId, ResultTabRequest, ResultTabStatus, ResultTabsWidget,
     SqlAction, SqlEditorContextAction, SqlEditorWidget,
@@ -54,6 +55,11 @@ type MutexFlag = Arc<Mutex<Option<u64>>>;
 const RESULT_ONE_TAB_PER_QUERY_LABEL: &str = " One tab per query";
 const RESULT_CHECKBOX_GROUP_GAP: i32 = TOOLBAR_SPACING;
 const UI_SCALE_BUTTON_WIDTH: i32 = 32;
+const QUERY_TOOLBAR_COMPACT_BREAKPOINT: i32 = 1050;
+const QUERY_TOOLBAR_COMPACT_CHOICE_WIDTH: i32 = 185;
+const QUERY_TOOLBAR_COMPACT_ACCESS_WIDTH: i32 = 105;
+const QUERY_TOOLBAR_COMPACT_NUMERIC_WIDTH: i32 = 48;
+const QUERY_TOOLBAR_COMPACT_SCALE_BUTTON_WIDTH: i32 = 28;
 const UI_SCALE_EPSILON: f32 = 0.01;
 #[cfg(target_os = "macos")]
 const MACOS_FULLSCREEN_EXIT_POLL_SECONDS: f64 = 0.05;
@@ -242,9 +248,24 @@ fn next_active_editor_tab_id_after_close(
 struct SchemaUpdate {
     data: IntellisenseData,
     highlight_data: HighlightData,
+    query_tab_id: QueryTabId,
+    connection_id: ConnectionId,
     connection_generation: u64,
+    binding_revision: u64,
+    request_id: u64,
     db_type: DatabaseType,
-    selected_scope: Option<String>,
+    requested_scope: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ActiveSchemaUpdateTarget {
+    query_tab_id: QueryTabId,
+    connection_id: ConnectionId,
+    connection_generation: u64,
+    binding_revision: u64,
+    request_id: u64,
+    db_type: DatabaseType,
+    scope: Option<String>,
 }
 
 struct RetainedSessionOptionChangePlan {
@@ -768,8 +789,12 @@ fn pending_metadata_refresh_after_start_attempt(has_live_connection: bool, start
 struct QueryEditorTab {
     tab_id: QueryTabId,
     base_label: String,
+    connection_binding: TabConnectionBinding,
     sql_editor: SqlEditorWidget,
     sql_buffer: TextBuffer,
+    intellisense_data: Arc<Mutex<IntellisenseData>>,
+    highlight_data: HighlightData,
+    result_tabs: ResultTabsWidget,
     current_file: Option<PathBuf>,
     pristine_text: String,
     current_text_len: usize,
@@ -1143,13 +1168,30 @@ fn prune_abandoned_query_operations(operations: &mut HashSet<QueryOperationToken
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct SessionActivityEntry {
+    connection_id: Option<ConnectionId>,
+    connection_name: String,
+    connection_state: String,
+    scope: Option<String>,
+    pool_size: u32,
     tab_name: String,
     result_tab: Option<usize>,
     state: String,
     database: String,
+    current_activity: String,
     sql_preview: String,
     fetched_rows: usize,
     elapsed: String,
+    active: bool,
+}
+
+fn connection_runtime_state_label(state: ConnectionRuntimeState) -> &'static str {
+    match state {
+        ConnectionRuntimeState::Connecting => "Connecting",
+        ConnectionRuntimeState::Connected => "Connected",
+        ConnectionRuntimeState::Transitioning => "Transitioning",
+        ConnectionRuntimeState::Disconnected => "Disconnected",
+        ConnectionRuntimeState::Failed(_) => "Failed",
+    }
 }
 
 impl QueryProgressContext {
@@ -1192,10 +1234,14 @@ impl QueryProgressContext {
         &mut self,
         total_units: Option<usize>,
         db_type: Option<DatabaseType>,
+        connection_id: Option<ConnectionId>,
         status_activity: Option<crate::db::DbActivityGuard>,
     ) {
         let status_activity = status_activity
             .unwrap_or_else(|| crate::db::track_db_activity(&self.status_activity_label, db_type));
+        if let Some(connection_id) = connection_id {
+            status_activity.set_connection_id(connection_id);
+        }
         status_activity.set_activity(&self.status_activity_label);
         if let Some(total) = total_units {
             status_activity.set_progress(crate::db::DbActivityProgress::Determinate {
@@ -1418,6 +1464,7 @@ impl QueryProgressContext {
 
 pub struct AppState {
     pub connection: SharedConnection,
+    connection_registry: ConnectionRegistry,
     query_tabs: QueryTabsWidget,
     query_top_group: Group,
     pub query_split_bar: Frame,
@@ -1431,6 +1478,7 @@ pub struct AppState {
     query_timeout_input: IntInput,
     ui_scale_bases: Vec<f32>,
     pub result_tabs: ResultTabsWidget,
+    result_workspace_group: Group,
     result_toolbar: Flex,
     result_one_tab_per_query_check: CheckButton,
     result_one_tab_edit_gap: Frame,
@@ -1445,13 +1493,13 @@ pub struct AppState {
     rollback_btn: Button,
     transaction_isolation_choice: Choice,
     transaction_access_choice: Choice,
-    result_grid_execution_target: Option<ResultTabId>,
+    result_grid_execution_targets: HashMap<QueryTabId, ResultTabId>,
     progress_contexts: HashMap<QueryTabId, QueryProgressContext>,
     abandoned_query_operations: HashSet<QueryOperationToken>,
     pending_query_cancellations: HashMap<QueryOperationToken, QueryCancelPhase>,
     pending_lazy_fetch_canceling_sessions: HashSet<u64>,
     orphaned_lazy_fetch_missing_since: HashMap<u64, Instant>,
-    pub object_browser: ObjectBrowserWidget,
+    pub object_browser: MultiObjectBrowserWidget,
     status_bar: StatusBarWidget,
     pub current_file: Arc<Mutex<Option<PathBuf>>>,
     pub popups: Arc<Mutex<Vec<Window>>>,
@@ -1463,6 +1511,8 @@ pub struct AppState {
     pub connection_info: Arc<Mutex<Option<crate::db::ConnectionInfo>>>,
     has_live_connection: bool,
     pending_connection_metadata_refresh: bool,
+    pending_metadata_refresh_tabs: HashSet<QueryTabId>,
+    latest_schema_request_id: u64,
     pub config: Arc<Mutex<AppConfig>>,
     schema_sender: Option<std::sync::mpsc::Sender<SchemaUpdate>>,
     file_sender: Option<std::sync::mpsc::Sender<FileActionResult>>,
@@ -1543,7 +1593,7 @@ impl AppState {
     }
 
     fn tab_display_label(tab: &QueryEditorTab) -> String {
-        let mut label = match &tab.current_file {
+        let document_label = match &tab.current_file {
             Some(path) => path
                 .file_name()
                 .unwrap_or_default()
@@ -1551,10 +1601,50 @@ impl AppState {
                 .to_string(),
             None => tab.base_label.clone(),
         };
+        let binding = tab.connection_binding.snapshot();
+        let connection_prefix = binding
+            .runtime
+            .as_ref()
+            .map(|runtime| {
+                let mut connection = runtime.display_name();
+                match runtime.state() {
+                    ConnectionRuntimeState::Connecting => connection.push_str(" (connecting)"),
+                    ConnectionRuntimeState::Transitioning => {
+                        connection.push_str(" (transitioning)")
+                    }
+                    ConnectionRuntimeState::Disconnected => connection.push_str(" (offline)"),
+                    ConnectionRuntimeState::Failed(_) => connection.push_str(" (failed)"),
+                    ConnectionRuntimeState::Connected => {}
+                }
+                connection
+            })
+            .or_else(|| {
+                binding
+                    .detached_runtime
+                    .as_ref()
+                    .map(|runtime| format!("{} (detached)", runtime.display_name()))
+            });
+        let mut label = connection_prefix.map_or(document_label.clone(), |connection| {
+            format!("{connection} · {document_label}")
+        });
+        if tab.sql_editor.is_query_running() {
+            label.push_str(" · running");
+        }
         if tab.is_dirty {
             label.push('*');
         }
         label
+    }
+
+    fn refresh_tab_label(&mut self, tab_id: QueryTabId) {
+        let Some(index) = self.find_tab_index(tab_id) else {
+            return;
+        };
+        let label = Self::tab_display_label(&self.editor_tabs[index]);
+        self.query_tabs.set_tab_label(tab_id, &label);
+        if self.active_editor_tab_id == tab_id {
+            self.refresh_window_title();
+        }
     }
 
     fn refresh_window_title(&mut self) {
@@ -1620,39 +1710,66 @@ impl AppState {
         self.editor_tabs.iter().position(|tab| tab.tab_id == tab_id)
     }
 
+    fn result_tabs_for_tab(&self, tab_id: QueryTabId) -> Option<ResultTabsWidget> {
+        self.editor_tabs
+            .iter()
+            .find(|tab| tab.tab_id == tab_id)
+            .map(|tab| tab.result_tabs.clone())
+    }
+
+    fn abort_lazy_fetch_session_in_all_workspaces(&self, session_id: u64) -> bool {
+        self.editor_tabs.iter().fold(false, |aborted, tab| {
+            let mut result_tabs = tab.result_tabs.clone();
+            result_tabs.abort_lazy_fetch_session(session_id) || aborted
+        })
+    }
+
+    fn result_workspaces_contain_lazy_fetch(&self, session_id: u64) -> bool {
+        self.editor_tabs
+            .iter()
+            .any(|tab| tab.result_tabs.lazy_fetch_sessions().contains(&session_id))
+    }
+
     fn normalize_scope_name(scope: Option<String>) -> Option<String> {
         scope
             .map(|scope| scope.trim().to_string())
             .filter(|scope| !scope.is_empty())
     }
 
-    fn current_connection_scope(
-        conn_guard: &crate::db::DatabaseConnection,
-        db_type: DatabaseType,
-    ) -> Option<String> {
-        conn_guard
-            .db_type()
-            .is_same_type_as(db_type)
-            .then(|| conn_guard.current_scope_name())
-            .flatten()
-            .and_then(|scope| Self::normalize_scope_name(Some(scope)))
-    }
+    fn synchronize_scope_for_connection(
+        &mut self,
+        connection_id: ConnectionId,
+        scope: Option<String>,
+    ) -> bool {
+        let scope = Self::normalize_scope_name(scope);
+        let tab_ids = self
+            .editor_tabs
+            .iter()
+            .filter(|tab| tab.connection_binding.snapshot().connection_id() == Some(connection_id))
+            .map(|tab| tab.tab_id)
+            .collect::<Vec<_>>();
+        let changed = self.editor_tabs.iter().any(|tab| {
+            let binding = tab.connection_binding.snapshot();
+            binding.connection_id() == Some(connection_id) && binding.scope != scope
+        });
 
-    fn scope_matches_current_connection(&self, scope: &str) -> bool {
-        let scope = scope.trim();
-        if scope.is_empty() {
-            return false;
+        for tab in self
+            .editor_tabs
+            .iter()
+            .filter(|tab| tab.connection_binding.snapshot().connection_id() == Some(connection_id))
+        {
+            tab.connection_binding.set_scope(scope.clone());
         }
-        let Some(conn_guard) = crate::db::try_lock_connection(&self.connection) else {
-            return false;
-        };
-        if !conn_guard.is_connected() {
-            return false;
+        self.object_browser
+            .set_selected_scope_for_connection(connection_id, scope);
+
+        if changed {
+            self.clear_metadata_for_connection(connection_id);
+            for tab_id in tab_ids {
+                self.mark_metadata_refresh_pending(tab_id);
+            }
         }
-        let db_type = conn_guard.db_type();
-        Self::current_connection_scope(&conn_guard, db_type).is_some_and(|current_scope| {
-            db_type.scope_values_match(Some(&current_scope), Some(scope))
-        })
+        changed
     }
 
     fn set_active_editor_tab(&mut self, tab_id: QueryTabId) -> bool {
@@ -1667,8 +1784,64 @@ impl AppState {
         let Some(index) = self.find_tab_index(tab_id) else {
             return false;
         };
+        let previous_tab_id = self.active_editor_tab_id;
+        if previous_tab_id != tab_id && self.pending_connection_metadata_refresh {
+            self.pending_metadata_refresh_tabs.insert(previous_tab_id);
+        }
         let tab = self.editor_tabs[index].clone();
         self.active_editor_tab_id = tab_id;
+        for editor_tab in &self.editor_tabs {
+            let mut widget = editor_tab.result_tabs.get_widget();
+            if editor_tab.tab_id == tab_id {
+                widget.resize(
+                    self.result_workspace_group.x(),
+                    self.result_workspace_group.y(),
+                    self.result_workspace_group.w(),
+                    self.result_workspace_group.h(),
+                );
+                widget.show();
+            } else {
+                widget.hide();
+            }
+        }
+        self.result_tabs = tab.result_tabs.clone();
+        self.schema_intellisense_data = tab.intellisense_data.clone();
+        self.schema_highlight_data = tab.highlight_data.clone();
+        let binding_snapshot = tab.connection_binding.snapshot();
+        if let Some(runtime) = binding_snapshot
+            .runtime
+            .as_ref()
+            .or(binding_snapshot.detached_runtime.as_ref())
+        {
+            self.object_browser.add_runtime(runtime.clone());
+        }
+        self.object_browser
+            .set_active_connection(binding_snapshot.connection_id());
+        if let Some(connection) = binding_snapshot.connection() {
+            self.connection = connection.clone();
+            let connection_snapshot = crate::db::try_lock_connection(&connection).map(|guard| {
+                (
+                    guard.is_connected() && guard.has_connection_handle(),
+                    guard.get_info().clone(),
+                )
+            });
+            let (has_live_connection, connection_info) = connection_snapshot
+                .map(|(live, info)| (live, live.then_some(info)))
+                .unwrap_or((false, None));
+            self.has_live_connection = has_live_connection;
+            *self
+                .connection_info
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()) = connection_info;
+        } else {
+            self.has_live_connection = false;
+            *self
+                .connection_info
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+        }
+        self.pending_connection_metadata_refresh =
+            self.has_live_connection && self.pending_metadata_refresh_tabs.remove(&tab_id);
         self.sql_editor = tab.sql_editor;
         self.sql_editor.sync_db_type_from_connection();
         self.sql_editor.mark_display_metrics_pending();
@@ -1680,7 +1853,13 @@ impl AppState {
             .current_file
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = tab.current_file;
+        self.refresh_result_edit_controls();
+        self.refresh_tab_label(tab_id);
+        self.refresh_connection_dependent_controls();
+        self.sync_transaction_mode_controls();
+        self.render_status_bar();
         self.refresh_window_title();
+        self.start_pending_metadata_refresh_if_ready();
         true
     }
 
@@ -1692,12 +1871,113 @@ impl AppState {
                 .any(|tab| tab.sql_editor.is_query_running())
     }
 
-    fn is_query_running_for_tab(&self, tab_id: QueryTabId) -> bool {
+    fn active_connection_id(&self) -> Option<ConnectionId> {
         self.editor_tabs
             .iter()
-            .find(|tab| tab.tab_id == tab_id)
-            .map(|tab| tab.sql_editor.is_query_running())
-            .unwrap_or(false)
+            .find(|tab| tab.tab_id == self.active_editor_tab_id)
+            .and_then(|tab| tab.connection_binding.snapshot().connection_id())
+    }
+
+    fn active_connection_runtime(&self) -> Option<Arc<ConnectionRuntime>> {
+        self.active_connection_id()
+            .and_then(|id| self.connection_registry.get(id))
+    }
+
+    fn active_schema_update_target(&self) -> Result<Option<ActiveSchemaUpdateTarget>, ()> {
+        let Some(tab) = self
+            .editor_tabs
+            .iter()
+            .find(|tab| tab.tab_id == self.active_editor_tab_id)
+        else {
+            return Ok(None);
+        };
+        let binding = tab.connection_binding.snapshot();
+        let Some(runtime) = binding.runtime else {
+            return Ok(None);
+        };
+        let connection = runtime.connection();
+        let Some(connection) = crate::db::try_lock_connection(&connection) else {
+            return Err(());
+        };
+        Ok(Some(ActiveSchemaUpdateTarget {
+            query_tab_id: tab.tab_id,
+            connection_id: runtime.id(),
+            connection_generation: connection.connection_generation(),
+            binding_revision: binding.revision,
+            request_id: self.latest_schema_request_id,
+            db_type: connection.db_type(),
+            scope: binding.scope,
+        }))
+    }
+
+    fn remove_idle_transient_runtimes(&mut self) -> usize {
+        let runtime_ids = self
+            .connection_registry
+            .runtimes()
+            .into_iter()
+            .map(|runtime| runtime.id())
+            .collect::<Vec<_>>();
+        let mut removed = 0;
+        for connection_id in runtime_ids {
+            if self
+                .connection_registry
+                .remove_transient_if_idle(connection_id)
+            {
+                self.object_browser.remove_runtime(connection_id);
+                removed += 1;
+            }
+        }
+        removed
+    }
+
+    fn clear_metadata_for_connection(&mut self, connection_id: ConnectionId) {
+        let active_is_affected = self.active_connection_id() == Some(connection_id);
+        for tab in self
+            .editor_tabs
+            .iter_mut()
+            .filter(|tab| tab.connection_binding.snapshot().connection_id() == Some(connection_id))
+        {
+            *tab.intellisense_data
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()) = IntellisenseData::new();
+            tab.highlight_data = HighlightData::new();
+            tab.sql_editor
+                .update_highlight_data_deferred(HighlightData::new());
+        }
+        if active_is_affected {
+            self.schema_highlight_data = HighlightData::new();
+            self.sql_editor
+                .update_highlight_data_deferred(HighlightData::new());
+        }
+    }
+
+    fn mark_metadata_refresh_pending(&mut self, tab_id: QueryTabId) {
+        self.pending_metadata_refresh_tabs.insert(tab_id);
+        if self.active_editor_tab_id == tab_id {
+            self.pending_connection_metadata_refresh = self.has_live_connection;
+        }
+    }
+
+    fn clear_pending_metadata_for_connection(&mut self, connection_id: ConnectionId) {
+        let tab_ids = self
+            .editor_tabs
+            .iter()
+            .filter(|tab| tab.connection_binding.snapshot().connection_id() == Some(connection_id))
+            .map(|tab| tab.tab_id)
+            .collect::<Vec<_>>();
+        self.pending_metadata_refresh_tabs
+            .retain(|tab_id| !tab_ids.contains(tab_id));
+        if self.active_connection_id() == Some(connection_id) {
+            self.pending_connection_metadata_refresh = false;
+        }
+    }
+
+    fn has_work_for_connection(&self, connection_id: ConnectionId) -> bool {
+        self.editor_tabs.iter().any(|tab| {
+            tab.connection_binding.snapshot().connection_id() == Some(connection_id)
+                && (tab.sql_editor.is_query_running()
+                    || tab.sql_editor.active_lazy_fetch_session().is_some())
+        })
     }
 
     fn has_running_query_or_lazy_fetch_for_tab(&self, tab_id: QueryTabId) -> bool {
@@ -1719,7 +1999,7 @@ impl AppState {
     }
 
     fn should_show_progress_status_for_tab(&self, tab_id: QueryTabId) -> bool {
-        self.is_query_running_for_tab(tab_id) || !self.is_any_query_running()
+        self.active_editor_tab_id == tab_id
     }
 
     fn has_active_lazy_fetches(&self) -> bool {
@@ -1767,7 +2047,7 @@ impl AppState {
 
     fn mark_lazy_fetch_result_tab_cancelled(&mut self, session_id: u64) {
         let mut result_tab_ids = Vec::new();
-        for context in self.progress_contexts.values_mut() {
+        for (query_tab_id, context) in self.progress_contexts.iter_mut() {
             let Some(statement_index) = context.lazy_fetch_sessions.get(&session_id).copied()
             else {
                 continue;
@@ -1775,14 +2055,16 @@ impl AppState {
             context.active_statement_index = Some(statement_index);
             context.state_label = ResultTabStatus::Cancelled.label().to_string();
             context.update_status_activity(ResultTabStatus::Cancelled.label());
-            if let Some(tab_id) = context.result_tab_id_for_statement(statement_index) {
-                result_tab_ids.push(tab_id);
+            if let Some(result_tab_id) = context.result_tab_id_for_statement(statement_index) {
+                result_tab_ids.push((*query_tab_id, result_tab_id));
             }
         }
-        result_tab_ids.sort_by_key(|id| *id);
+        result_tab_ids.sort_unstable();
         result_tab_ids.dedup();
-        for tab_id in result_tab_ids {
-            self.result_tabs.mark_statement_cancelled_by_id(tab_id);
+        for (query_tab_id, result_tab_id) in result_tab_ids {
+            if let Some(mut result_tabs) = self.result_tabs_for_tab(query_tab_id) {
+                result_tabs.mark_statement_cancelled_by_id(result_tab_id);
+            }
         }
     }
 
@@ -1869,9 +2151,12 @@ impl AppState {
 
     fn abort_lazy_fetches_without_result_tab_mapping(&mut self) -> Vec<u64> {
         let mut sessions_to_cancel = Vec::new();
-        for context in self.progress_contexts.values() {
+        for (query_tab_id, context) in &self.progress_contexts {
+            let result_tabs = self.result_tabs_for_tab(*query_tab_id);
             let unmapped = context.lazy_fetch_sessions_without_result_tab_mapping(|tab_id| {
-                self.result_tabs.lazy_fetch_session_for_id(tab_id)
+                result_tabs
+                    .as_ref()
+                    .and_then(|result_tabs| result_tabs.lazy_fetch_session_for_id(tab_id))
             });
             for session_id in unmapped {
                 Self::push_unique_session_id(&mut sessions_to_cancel, session_id);
@@ -1899,7 +2184,7 @@ impl AppState {
             self.orphaned_lazy_fetch_missing_since.remove(session_id);
         }
         for session_id in &sessions_to_cancel {
-            self.result_tabs.abort_lazy_fetch_session(*session_id);
+            self.abort_lazy_fetch_session_in_all_workspaces(*session_id);
         }
         for tab_id in finished_contexts {
             self.finish_progress_context(tab_id);
@@ -1918,7 +2203,7 @@ impl AppState {
                 self.orphaned_lazy_fetch_missing_since.remove(session_id);
             }
         }
-        self.result_grid_execution_target = None;
+        self.result_grid_execution_targets.remove(&tab_id);
         self.start_pending_metadata_refresh_if_ready();
     }
 
@@ -2039,8 +2324,9 @@ impl AppState {
                 .and_then(|statement_index| context.result_tab_id_for_statement(statement_index))
         });
         if let Some(result_tab_id) = result_tab_id {
-            self.result_tabs
-                .mark_statement_cancelled_by_id(result_tab_id);
+            if let Some(mut result_tabs) = self.result_tabs_for_tab(tab_id) {
+                result_tabs.mark_statement_cancelled_by_id(result_tab_id);
+            }
         }
         if context_matches {
             self.finish_progress_context(tab_id);
@@ -2070,9 +2356,9 @@ impl AppState {
     }
 
     fn start_pending_metadata_refresh_if_ready(&mut self) {
-        if !self.progress_contexts.is_empty()
-            || !self.pending_connection_metadata_refresh
+        if !self.pending_connection_metadata_refresh
             || !self.has_live_connection
+            || self.has_running_query_or_lazy_fetch_for_tab(self.active_editor_tab_id)
         {
             return;
         }
@@ -2085,6 +2371,13 @@ impl AppState {
     fn update_pending_metadata_refresh_after_start_attempt(&mut self, started: bool) {
         self.pending_connection_metadata_refresh =
             pending_metadata_refresh_after_start_attempt(self.has_live_connection, started);
+        if self.pending_connection_metadata_refresh {
+            self.pending_metadata_refresh_tabs
+                .insert(self.active_editor_tab_id);
+        } else {
+            self.pending_metadata_refresh_tabs
+                .remove(&self.active_editor_tab_id);
+        }
     }
 
     fn mark_lazy_fetch_result_tabs_closed<I>(&mut self, session_ids: I)
@@ -2096,29 +2389,13 @@ impl AppState {
         }
     }
 
-    fn abort_lazy_fetch_result_tabs_for_connection_transition(&mut self) -> Vec<u64> {
-        let lazy_fetch_sessions = self.lazy_fetch_sessions_for_abort();
-        if lazy_fetch_sessions.is_empty() {
-            return lazy_fetch_sessions;
-        }
-
-        for session_id in &lazy_fetch_sessions {
-            self.mark_lazy_fetch_result_tab_cancelled(*session_id);
-        }
-        self.mark_lazy_fetch_result_tabs_closed(lazy_fetch_sessions.iter().copied());
-        for session_id in &lazy_fetch_sessions {
-            self.result_tabs.abort_lazy_fetch_session(*session_id);
-        }
-        self.refresh_result_edit_controls();
-        lazy_fetch_sessions
-    }
-
-    fn release_all_pooled_db_sessions(&self) -> bool {
-        let mut released_any = self.sql_editor.release_pooled_db_session();
-        for tab in &self.editor_tabs {
-            released_any |= tab.sql_editor.release_pooled_db_session();
-        }
-        released_any
+    fn release_pooled_db_sessions_for_connection(&self, connection_id: ConnectionId) -> bool {
+        self.editor_tabs
+            .iter()
+            .filter(|tab| tab.connection_binding.snapshot().connection_id() == Some(connection_id))
+            .fold(false, |released_any, tab| {
+                tab.sql_editor.release_pooled_db_session() || released_any
+            })
     }
 
     fn release_all_resolved_pooled_db_sessions(&self) -> Result<bool, String> {
@@ -2130,22 +2407,32 @@ impl AppState {
     }
 
     fn sync_mysql_auto_commit_overrides_with_global_setting(&self, enabled: bool) {
-        self.sql_editor
-            .sync_mysql_auto_commit_with_global_setting(enabled);
-        for tab in &self.editor_tabs {
+        let active_connection_id = self.active_connection_id();
+        for tab in self
+            .editor_tabs
+            .iter()
+            .filter(|tab| tab.connection_binding.snapshot().connection_id() == active_connection_id)
+        {
             tab.sql_editor
                 .sync_mysql_auto_commit_with_global_setting(enabled);
         }
     }
 
-    fn oldest_lazy_fetch_session(&self) -> Option<u64> {
-        self.lazy_fetch_sessions_for_abort().into_iter().min()
+    fn oldest_lazy_fetch_session_for_tab(&self, tab_id: QueryTabId) -> Option<u64> {
+        let connection_id = self
+            .editor_tabs
+            .iter()
+            .find(|tab| tab.tab_id == tab_id)
+            .and_then(|tab| tab.connection_binding.snapshot().connection_id())?;
+        self.lazy_fetch_sessions_for_connection(connection_id)
+            .into_iter()
+            .min()
     }
 
     fn mark_lazy_fetch_cancelled_without_status(&mut self, session_id: u64) {
         self.mark_lazy_fetch_result_tab_cancelled(session_id);
         self.mark_lazy_fetch_result_tab_closed(session_id);
-        self.result_tabs.abort_lazy_fetch_session(session_id);
+        self.abort_lazy_fetch_session_in_all_workspaces(session_id);
     }
 
     fn mark_lazy_fetch_cancelled(&mut self, session_id: u64, status_message: &str) {
@@ -2154,54 +2441,40 @@ impl AppState {
         self.refresh_result_edit_controls();
     }
 
-    fn mark_canceling_progress_contexts_cancelled(&mut self) {
-        let mut result_tab_ids = Vec::new();
-        self.pending_query_cancellations.clear();
-        for context in self.progress_contexts.values_mut() {
-            if context.state_label != ResultTabStatus::Canceling.label() {
-                continue;
-            }
-            context.state_label = ResultTabStatus::Cancelled.label().to_string();
-            if let Some(statement_index) = context.active_statement_index {
-                if let Some(tab_id) = context.result_tab_id_for_statement(statement_index) {
-                    result_tab_ids.push(tab_id);
-                }
-            }
-        }
-        result_tab_ids.sort_unstable();
-        result_tab_ids.dedup();
-        for tab_id in result_tab_ids {
-            self.result_tabs.mark_statement_cancelled_by_id(tab_id);
-        }
+    fn mark_all_result_tabs_closed_for_clear(&mut self) {
+        self.mark_result_tabs_closed_for_clear(self.active_editor_tab_id);
     }
 
-    fn mark_all_result_tabs_closed_for_clear(&mut self) {
-        let mut finished_contexts = Vec::new();
-        for (tab_id, context) in self.progress_contexts.iter_mut() {
+    fn mark_result_tabs_closed_for_clear(&mut self, query_tab_id: QueryTabId) {
+        let mut finished_context = false;
+        if let Some(context) = self.progress_contexts.get_mut(&query_tab_id) {
             context.mark_all_result_statements_closed();
             if context.batch_finished {
-                finished_contexts.push(*tab_id);
+                finished_context = true;
             }
         }
-        for tab_id in finished_contexts {
-            self.finish_progress_context(tab_id);
+        if finished_context {
+            self.finish_progress_context(query_tab_id);
         }
     }
 
-    fn clear_result_grids_for_new_query_batch(&mut self) -> Vec<u64> {
-        let had_tabs = self.result_tabs.tab_count() > 0;
+    fn clear_result_grids_for_new_query_batch(&mut self, query_tab_id: QueryTabId) -> Vec<u64> {
+        let Some(mut result_tabs) = self.result_tabs_for_tab(query_tab_id) else {
+            return Vec::new();
+        };
+        let had_tabs = result_tabs.tab_count() > 0;
         let mut lazy_fetch_sessions = Vec::new();
-        for session_id in self.result_tabs.lazy_fetch_sessions() {
+        for session_id in result_tabs.lazy_fetch_sessions() {
             Self::push_unique_session_id(&mut lazy_fetch_sessions, session_id);
         }
-        for context in self.progress_contexts.values() {
+        if let Some(context) = self.progress_contexts.get(&query_tab_id) {
             for session_id in context.lazy_fetch_sessions.keys().copied() {
                 Self::push_unique_session_id(&mut lazy_fetch_sessions, session_id);
             }
         }
-        self.result_tabs.clear_grids();
+        result_tabs.clear_grids();
         self.mark_lazy_fetch_result_tabs_closed(lazy_fetch_sessions.clone());
-        self.mark_all_result_tabs_closed_for_clear();
+        self.mark_result_tabs_closed_for_clear(query_tab_id);
         if had_tabs {
             malloc_trim_process();
         }
@@ -2217,8 +2490,10 @@ impl AppState {
 
     fn lazy_fetch_sessions_for_abort(&self) -> Vec<u64> {
         let mut session_ids = Vec::new();
-        for session_id in self.result_tabs.lazy_fetch_sessions() {
-            Self::push_unique_session_id(&mut session_ids, session_id);
+        for tab in &self.editor_tabs {
+            for session_id in tab.result_tabs.lazy_fetch_sessions() {
+                Self::push_unique_session_id(&mut session_ids, session_id);
+            }
         }
         for context in self.progress_contexts.values() {
             for session_id in context.lazy_fetch_sessions.keys().copied() {
@@ -2236,6 +2511,37 @@ impl AppState {
             &mut session_ids,
             self.sql_editor.active_lazy_fetch_session(),
         );
+        session_ids
+    }
+
+    fn lazy_fetch_sessions_for_connection(&self, connection_id: ConnectionId) -> Vec<u64> {
+        let query_tab_ids = self
+            .editor_tabs
+            .iter()
+            .filter(|tab| tab.connection_binding.snapshot().connection_id() == Some(connection_id))
+            .map(|tab| tab.tab_id)
+            .collect::<HashSet<_>>();
+        let mut session_ids = Vec::new();
+        for tab in self
+            .editor_tabs
+            .iter()
+            .filter(|tab| query_tab_ids.contains(&tab.tab_id))
+        {
+            for session_id in tab.result_tabs.lazy_fetch_sessions() {
+                Self::push_unique_session_id(&mut session_ids, session_id);
+            }
+            Self::push_unique_session_id_if_some(
+                &mut session_ids,
+                tab.sql_editor.active_lazy_fetch_session(),
+            );
+        }
+        for (tab_id, context) in &self.progress_contexts {
+            if query_tab_ids.contains(tab_id) {
+                for session_id in context.lazy_fetch_sessions.keys().copied() {
+                    Self::push_unique_session_id(&mut session_ids, session_id);
+                }
+            }
+        }
         session_ids
     }
 
@@ -2274,10 +2580,12 @@ impl AppState {
         let Some(statement_index) = context.canceling_statement_index() else {
             return false;
         };
-        let Some(tab_id) = context.result_tab_id_for_statement(statement_index) else {
+        let Some(result_tab_id) = context.result_tab_id_for_statement(statement_index) else {
             return false;
         };
-        self.result_tabs.mark_statement_canceling_by_id(tab_id);
+        if let Some(mut result_tabs) = self.result_tabs_for_tab(token.tab_id) {
+            result_tabs.mark_statement_canceling_by_id(result_tab_id);
+        }
         true
     }
 
@@ -2309,9 +2617,10 @@ impl AppState {
             }
         }
         if let Some(message) = query_cancel_failure_message(outcome) {
-            self.result_tabs
-                .append_message_lines(ResultMessageKind::Error, &[message]);
-            self.result_tabs.select_messages_errors();
+            if let Some(mut result_tabs) = self.result_tabs_for_tab(token.tab_id) {
+                result_tabs.append_message_lines(ResultMessageKind::Error, &[message]);
+                result_tabs.select_messages_errors();
+            }
         }
         true
     }
@@ -2337,8 +2646,9 @@ impl AppState {
                     .and_then(|index| context.result_tab_id_for_statement(index))
             });
         if let Some(result_tab_id) = result_tab_id {
-            self.result_tabs
-                .mark_statement_status_by_id(result_tab_id, status);
+            if let Some(mut result_tabs) = self.result_tabs_for_tab(token.tab_id) {
+                result_tabs.mark_statement_status_by_id(result_tab_id, status);
+            }
         }
     }
 
@@ -2348,7 +2658,7 @@ impl AppState {
             .progress_contexts
             .values()
             .any(|context| context.lazy_fetch_sessions.contains_key(&session_id));
-        let known_in_results = self.result_tabs.lazy_fetch_sessions().contains(&session_id);
+        let known_in_results = self.result_workspaces_contain_lazy_fetch(session_id);
         if active_lazy_fetch_tab_id.is_none() && !known_in_progress && !known_in_results {
             return false;
         }
@@ -2366,18 +2676,24 @@ impl AppState {
             context.active_statement_index = Some(statement_index);
             context.state_label = ResultTabStatus::Canceling.label().to_string();
             context.update_status_activity("Canceling lazy fetch");
-            if let Some(tab_id) = context.result_tab_id_for_statement(statement_index) {
-                result_tab_ids.push(tab_id);
+            if let Some(result_tab_id) = context.result_tab_id_for_statement(statement_index) {
+                result_tab_ids.push((*tab_id, result_tab_id));
             }
         }
         result_tab_ids.sort_unstable();
         result_tab_ids.dedup();
         let mut marked = false;
-        for tab_id in result_tab_ids {
-            self.result_tabs.mark_statement_canceling_by_id(tab_id);
-            marked = true;
+        for (query_tab_id, result_tab_id) in result_tab_ids {
+            if let Some(mut result_tabs) = self.result_tabs_for_tab(query_tab_id) {
+                result_tabs.mark_statement_canceling_by_id(result_tab_id);
+                marked = true;
+            }
         }
-        self.result_tabs.mark_lazy_fetch_canceling(session_id) || marked
+        for tab in &self.editor_tabs {
+            let mut result_tabs = tab.result_tabs.clone();
+            marked |= result_tabs.mark_lazy_fetch_canceling(session_id);
+        }
+        marked
     }
 
     fn mark_lazy_fetch_cancel_failed(&mut self, session_id: u64) -> bool {
@@ -2386,7 +2702,7 @@ impl AppState {
             .remove(&session_id);
         self.orphaned_lazy_fetch_missing_since.remove(&session_id);
         let mut result_tab_updates = Vec::new();
-        for context in self.progress_contexts.values_mut() {
+        for (query_tab_id, context) in self.progress_contexts.iter_mut() {
             let Some(statement_index) = context.lazy_fetch_sessions.get(&session_id).copied()
             else {
                 continue;
@@ -2399,12 +2715,13 @@ impl AppState {
             context.state_label = status.label().to_string();
             context.update_status_activity(status.label());
             if let Some(result_tab_id) = context.result_tab_id_for_statement(statement_index) {
-                result_tab_updates.push((result_tab_id, status));
+                result_tab_updates.push((*query_tab_id, result_tab_id, status));
             }
         }
-        for (result_tab_id, status) in result_tab_updates {
-            self.result_tabs
-                .mark_statement_status_by_id(result_tab_id, status);
+        for (query_tab_id, result_tab_id, status) in result_tab_updates {
+            if let Some(mut result_tabs) = self.result_tabs_for_tab(query_tab_id) {
+                result_tabs.mark_statement_status_by_id(result_tab_id, status);
+            }
         }
         was_pending
     }
@@ -2628,7 +2945,13 @@ impl AppState {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .clone();
         let activities = crate::db::active_db_activity_snapshots();
-        let selected_registry_activity = latest_status_activity(&activities);
+        let active_connection_id = self.active_connection_id();
+        let active_connection_activities = activities
+            .iter()
+            .filter(|activity| activity.connection_id == active_connection_id)
+            .cloned()
+            .collect::<Vec<_>>();
+        let selected_registry_activity = latest_status_activity(&active_connection_activities);
         let selected_registry_id = selected_registry_activity.map(|activity| activity.id);
         let selected_activity = selected_registry_activity.cloned();
         let displayed_registry_count = usize::from(selected_registry_id.is_some());
@@ -2742,38 +3065,38 @@ impl AppState {
         self.transaction_access_choice.activate();
     }
 
-    fn retained_session_preflight_blocker(
+    fn retained_scope_change_blocker_for_connection(
         &self,
-        action: RetainedSessionPreflightAction,
-        action_label: &str,
+        connection_id: ConnectionId,
     ) -> Option<String> {
-        if let Some(snapshot) = self.sql_editor.pooled_session_activity_snapshot() {
+        if self.has_work_for_connection(connection_id) {
+            return Some(
+                "Cannot change scope while a query or lazy fetch is active on this connection."
+                    .to_string(),
+            );
+        }
+        for tab in self
+            .editor_tabs
+            .iter()
+            .filter(|tab| tab.connection_binding.snapshot().connection_id() == Some(connection_id))
+        {
+            let Some(snapshot) = tab.sql_editor.pooled_session_activity_snapshot() else {
+                continue;
+            };
             let state = snapshot.retained_state;
-            if crate::db::retained_session_state_preflight_decision(action, state)
-                == RetainedSessionPreflightDecision::RequireResolution
+            if crate::db::retained_session_state_preflight_decision(
+                RetainedSessionPreflightAction::ScopeChange,
+                state,
+            ) == RetainedSessionPreflightDecision::RequireResolution
             {
                 return Some(format!(
-                    "Cannot {action_label} while tab 'Query' has a {} DB session. Commit, rollback, or discard it first.",
+                    "Cannot change scope while tab '{}' has a {} DB session. Commit, rollback, or discard it first.",
+                    Self::tab_display_label(tab),
                     state.label()
                 ));
             }
         }
-
-        self.editor_tabs.iter().find_map(|tab| {
-            let snapshot = tab.sql_editor.pooled_session_activity_snapshot()?;
-            let state = snapshot.retained_state;
-            if crate::db::retained_session_state_preflight_decision(action, state)
-                == RetainedSessionPreflightDecision::RequireResolution
-            {
-                Some(format!(
-                    "Cannot {action_label} while tab '{}' has a {} DB session. Commit, rollback, or discard it first.",
-                    Self::tab_display_label(tab),
-                    state.label()
-                ))
-            } else {
-                None
-            }
-        })
+        None
     }
 
     fn retained_transaction_option_blocker(&self, action: &str) -> Option<String> {
@@ -2781,25 +3104,16 @@ impl AppState {
         self.retained_session_transaction_option_blocker(action, &action_label)
     }
 
-    fn retained_scope_change_blocker(&self) -> Option<String> {
-        self.retained_session_preflight_blocker(
-            RetainedSessionPreflightAction::ScopeChange,
-            "change scope",
-        )
-    }
-
     fn retained_session_editors(&self) -> Vec<SqlEditorWidget> {
-        let mut editors = Vec::new();
-        if self.sql_editor.pooled_session_activity_snapshot().is_some() {
-            editors.push(self.sql_editor.clone());
-        }
-        editors.extend(
-            self.editor_tabs
-                .iter()
-                .filter(|tab| tab.sql_editor.pooled_session_activity_snapshot().is_some())
-                .map(|tab| tab.sql_editor.clone()),
-        );
-        editors
+        let active_connection_id = self.active_connection_id();
+        self.editor_tabs
+            .iter()
+            .filter(|tab| {
+                tab.connection_binding.snapshot().connection_id() == active_connection_id
+                    && tab.sql_editor.pooled_session_activity_snapshot().is_some()
+            })
+            .map(|tab| tab.sql_editor.clone())
+            .collect()
     }
 
     fn retained_session_transaction_option_decision(
@@ -2824,19 +3138,10 @@ impl AppState {
         action: &str,
         action_label: &str,
     ) -> Option<String> {
-        if let Some(snapshot) = self.sql_editor.pooled_session_activity_snapshot() {
-            let state = snapshot.retained_state;
-            if Self::retained_session_transaction_option_decision(action, snapshot)
-                == RetainedSessionPreflightDecision::RequireResolution
-            {
-                return Some(format!(
-                    "Cannot {action_label} while tab 'Query' has a {} DB session. Commit, rollback, or discard it first.",
-                    state.label()
-                ));
-            }
-        }
-
-        self.editor_tabs.iter().find_map(|tab| {
+        let active_connection_id = self.active_connection_id();
+        self.editor_tabs.iter().filter(|tab| {
+            tab.connection_binding.snapshot().connection_id() == active_connection_id
+        }).find_map(|tab| {
             let snapshot = tab.sql_editor.pooled_session_activity_snapshot()?;
             let state = snapshot.retained_state;
             if Self::retained_session_transaction_option_decision(action, snapshot)
@@ -2857,45 +3162,37 @@ impl AppState {
         &self,
         action: &str,
     ) -> Vec<SqlEditorWidget> {
-        let mut editors = Vec::new();
-        if self
-            .sql_editor
-            .pooled_session_activity_snapshot()
-            .is_some_and(|snapshot| {
-                Self::retained_session_transaction_option_decision(action, snapshot)
-                    == RetainedSessionPreflightDecision::Allow
-            })
-        {
-            editors.push(self.sql_editor.clone());
-        }
-        editors.extend(
-            self.editor_tabs
-                .iter()
-                .filter(|tab| {
-                    tab.sql_editor
+        let active_connection_id = self.active_connection_id();
+        self.editor_tabs
+            .iter()
+            .filter(|tab| {
+                tab.connection_binding.snapshot().connection_id() == active_connection_id
+                    && tab
+                        .sql_editor
                         .pooled_session_activity_snapshot()
                         .is_some_and(|snapshot| {
                             Self::retained_session_transaction_option_decision(action, snapshot)
                                 == RetainedSessionPreflightDecision::Allow
                         })
-                })
-                .map(|tab| tab.sql_editor.clone()),
-        );
-        editors
+            })
+            .map(|tab| tab.sql_editor.clone())
+            .collect()
     }
 
-    fn retained_scope_update(&self, scope: Option<String>) -> Option<RetainedScopeUpdate> {
+    fn retained_scope_update_for_connection(
+        &self,
+        connection_id: ConnectionId,
+        scope: Option<String>,
+    ) -> Option<RetainedScopeUpdate> {
         let scope = Self::normalize_scope_name(scope)?;
-        let conn_guard = crate::db::try_lock_connection(&self.connection)?;
+        let runtime = self.connection_registry.get(connection_id)?;
+        let connection = runtime.connection();
+        let conn_guard = crate::db::try_lock_connection(&connection)?;
         if !conn_guard.is_connected() {
             return None;
         }
         let db_type = conn_guard.db_type();
         if !db_type.has_connection_scope() {
-            return None;
-        }
-        let current_scope = Self::current_connection_scope(&conn_guard, db_type)?;
-        if !db_type.scope_values_match(Some(&current_scope), Some(&scope)) {
             return None;
         }
         Some((
@@ -2904,51 +3201,101 @@ impl AppState {
             conn_guard.pool_context_epoch(),
             conn_guard.get_info().advanced.clone(),
             scope,
-            self.retained_session_editors(),
+            self.editor_tabs
+                .iter()
+                .filter(|tab| {
+                    tab.connection_binding.snapshot().connection_id() == Some(connection_id)
+                        && tab.sql_editor.pooled_session_activity_snapshot().is_some()
+                })
+                .map(|tab| tab.sql_editor.clone())
+                .collect(),
         ))
     }
 
     fn append_result_tab_request(&mut self, request: ResultTabRequest) {
-        let mut result_tabs = self.result_tabs.clone();
+        self.append_result_tab_request_for_tab(self.active_editor_tab_id, request);
+    }
+
+    fn append_result_tab_request_for_tab(
+        &mut self,
+        query_tab_id: QueryTabId,
+        request: ResultTabRequest,
+    ) {
+        let Some(mut result_tabs) = self.result_tabs_for_tab(query_tab_id) else {
+            return;
+        };
         let tab_id = result_tabs.reserve_result_tab_id();
         let status_message = request.result.message.clone();
         result_tabs.ensure_statement_tab_by_id(tab_id, &request.label, true);
         result_tabs.display_result_by_id(tab_id, &request.result);
-        self.refresh_result_edit_controls();
-        self.set_status_message(&status_message);
+        if self.active_editor_tab_id == query_tab_id {
+            self.refresh_result_edit_controls();
+            self.set_status_message(&status_message);
+        }
     }
 
     fn build_session_activity_result_request(&self) -> ResultTabRequest {
-        let info = self
-            .connection_info
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .clone();
-        let connection_name = info
-            .as_ref()
-            .map(|info| info.name.as_str())
-            .unwrap_or("Not connected");
-        let db_type = info
-            .as_ref()
-            .map(|info| info.db_type.to_string())
-            .unwrap_or_else(|| "-".to_string());
         let pool_size = self
             .config
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .normalized_connection_pool_size();
-        let current_activity =
-            crate::db::current_db_activity().unwrap_or_else(|| "Idle".to_string());
+        let runtimes = self.connection_registry.runtimes();
+        let activities = crate::db::active_db_activity_snapshots();
+        let current_activity_for = |connection_id: Option<ConnectionId>| {
+            let labels = activities
+                .iter()
+                .filter(|activity| activity.connection_id == connection_id)
+                .map(|activity| activity.activity.as_str())
+                .collect::<Vec<_>>();
+            if labels.is_empty() {
+                "Idle".to_string()
+            } else {
+                labels.join("; ")
+            }
+        };
+        let runtime_fields = |runtime: &Arc<ConnectionRuntime>| {
+            let info = runtime.sanitized_info();
+            (
+                Some(runtime.id()),
+                runtime.display_name(),
+                connection_runtime_state_label(runtime.state()).to_string(),
+                info.db_type.to_string(),
+                current_activity_for(Some(runtime.id())),
+            )
+        };
         let mut entries = self
             .progress_contexts
             .iter()
-            .map(|(tab_id, context)| {
+            .filter_map(|(tab_id, context)| {
+                let tab = self.editor_tabs.iter().find(|tab| tab.tab_id == *tab_id)?;
+                let binding = tab.connection_binding.snapshot();
+                let runtime = binding
+                    .runtime
+                    .as_ref()
+                    .or(binding.detached_runtime.as_ref());
+                let (connection_id, connection_name, connection_state, database, current_activity) =
+                    runtime.map_or_else(
+                        || {
+                            (
+                                None,
+                                "Unbound".to_string(),
+                                "Unbound".to_string(),
+                                "-".to_string(),
+                                current_activity_for(None),
+                            )
+                        },
+                        &runtime_fields,
+                    );
                 let result_tab = context
                     .active_statement_index
                     .and_then(|statement_index| {
                         context
                             .result_tab_id_for_statement(statement_index)
-                            .and_then(|id| self.result_tabs.result_tab_index_for_id(id))
+                            .and_then(|id| {
+                                self.result_tabs_for_tab(*tab_id)
+                                    .and_then(|tabs| tabs.result_tab_index_for_id(id))
+                            })
                     })
                     .map(|tab_index| tab_index + 1);
                 let fetched_rows = context
@@ -2957,20 +3304,27 @@ impl AppState {
                         context.fetch_row_counts.get(&statement_index).copied()
                     })
                     .unwrap_or(0);
-                (
+                Some((
                     *tab_id,
                     SessionActivityEntry {
+                        connection_id,
+                        connection_name,
+                        connection_state,
+                        scope: binding.scope,
+                        pool_size,
                         tab_name: self
                             .tab_display_name(*tab_id)
                             .unwrap_or_else(|| format!("Tab {}", tab_id)),
                         result_tab,
                         state: context.state_label.clone(),
-                        database: db_type.clone(),
+                        database,
+                        current_activity,
                         sql_preview: context.activity_label.clone(),
                         fetched_rows,
                         elapsed: format_session_activity_elapsed(context.started_at.elapsed()),
+                        active: true,
                     },
-                )
+                ))
             })
             .collect::<Vec<_>>();
         let progress_tab_ids = entries
@@ -2982,6 +3336,24 @@ impl AppState {
                 return None;
             }
             let snapshot = tab.sql_editor.pooled_session_activity_snapshot()?;
+            let binding = tab.connection_binding.snapshot();
+            let runtime = binding
+                .runtime
+                .as_ref()
+                .or(binding.detached_runtime.as_ref());
+            let (connection_id, connection_name, connection_state, _, current_activity) = runtime
+                .map_or_else(
+                    || {
+                        (
+                            None,
+                            "Unbound".to_string(),
+                            "Unbound".to_string(),
+                            "-".to_string(),
+                            current_activity_for(None),
+                        )
+                    },
+                    &runtime_fields,
+                );
             let state = if snapshot.retained_state.requires_transaction_decision() {
                 "Pooled session (transaction decision required)"
             } else if snapshot
@@ -2995,13 +3367,20 @@ impl AppState {
             Some((
                 tab.tab_id,
                 SessionActivityEntry {
+                    connection_id,
+                    connection_name,
+                    connection_state,
+                    scope: binding.scope,
+                    pool_size,
                     tab_name: Self::tab_display_label(tab),
                     result_tab: None,
                     state: state.to_string(),
                     database: snapshot.db_type.to_string(),
+                    current_activity,
                     sql_preview: "Idle pooled database session".to_string(),
                     fetched_rows: 0,
                     elapsed: "-".to_string(),
+                    active: true,
                 },
             ))
         }));
@@ -3013,34 +3392,94 @@ impl AppState {
         entries.extend(
             crate::db::active_pool_db_activity_snapshots()
                 .into_iter()
-                .map(|activity| SessionActivityEntry {
-                    tab_name: "Background".to_string(),
-                    result_tab: None,
-                    state: "Pool session active".to_string(),
-                    database: activity
-                        .db_type
-                        .map(|db_type| db_type.to_string())
-                        .unwrap_or_else(|| db_type.clone()),
-                    sql_preview: activity.activity,
-                    fetched_rows: 0,
-                    elapsed: format_session_activity_elapsed(activity.started_at.elapsed()),
+                .map(|activity| {
+                    let runtime = activity
+                        .connection_id
+                        .and_then(|connection_id| self.connection_registry.get(connection_id));
+                    let (
+                        connection_id,
+                        connection_name,
+                        connection_state,
+                        database,
+                        current_activity,
+                    ) = runtime.as_ref().map_or_else(
+                        || {
+                            (
+                                activity.connection_id,
+                                "Unattributed".to_string(),
+                                "Unknown".to_string(),
+                                activity
+                                    .db_type
+                                    .map(|db_type| db_type.to_string())
+                                    .unwrap_or_else(|| "-".to_string()),
+                                current_activity_for(activity.connection_id),
+                            )
+                        },
+                        &runtime_fields,
+                    );
+                    SessionActivityEntry {
+                        connection_id,
+                        connection_name,
+                        connection_state,
+                        scope: None,
+                        pool_size,
+                        tab_name: "Background".to_string(),
+                        result_tab: None,
+                        state: "Pool session active".to_string(),
+                        database,
+                        current_activity,
+                        sql_preview: activity.activity,
+                        fetched_rows: 0,
+                        elapsed: format_session_activity_elapsed(activity.started_at.elapsed()),
+                        active: true,
+                    }
                 }),
         );
 
-        build_session_activity_result_request(
-            connection_name,
-            &db_type,
-            pool_size,
-            &current_activity,
-            entries,
-        )
+        let represented_connections = entries
+            .iter()
+            .filter_map(|entry| entry.connection_id)
+            .collect::<HashSet<_>>();
+        entries.extend(runtimes.iter().filter_map(|runtime| {
+            if represented_connections.contains(&runtime.id()) {
+                return None;
+            }
+            let (connection_id, connection_name, connection_state, database, current_activity) =
+                runtime_fields(runtime);
+            Some(SessionActivityEntry {
+                connection_id,
+                connection_name,
+                connection_state,
+                scope: None,
+                pool_size,
+                tab_name: "-".to_string(),
+                result_tab: None,
+                state: "Idle".to_string(),
+                database,
+                current_activity,
+                sql_preview: "-".to_string(),
+                fetched_rows: 0,
+                elapsed: "-".to_string(),
+                active: false,
+            })
+        }));
+        entries.sort_by(|left, right| {
+            (left.connection_id, left.tab_name.as_str(), left.result_tab).cmp(&(
+                right.connection_id,
+                right.tab_name.as_str(),
+                right.result_tab,
+            ))
+        });
+
+        build_session_activity_result_request(entries)
     }
 
     fn refresh_result_edit_controls(&mut self) {
-        let can_edit = self.result_tabs.can_current_begin_edit_mode();
+        let origin_is_current = self.active_result_origin_is_current();
+        let can_edit = origin_is_current && self.result_tabs.can_current_begin_edit_mode();
         let edit_active = self.result_tabs.is_current_edit_mode_enabled();
         let save_pending = self.result_tabs.is_current_save_pending();
-        let query_running = self.is_any_query_running();
+        let query_running = self.sql_editor.is_query_running();
         let show_edit_check = can_edit;
         if show_edit_check {
             self.result_toolbar
@@ -3115,6 +3554,25 @@ impl AppState {
         }
         self.result_toolbar.layout();
         self.result_toolbar.redraw();
+    }
+
+    fn result_origin_is_current_for_tab(
+        &self,
+        tab_id: QueryTabId,
+        result_tabs: &ResultTabsWidget,
+    ) -> bool {
+        let current_origin = self
+            .editor_tabs
+            .iter()
+            .find(|tab| tab.tab_id == tab_id)
+            .and_then(|tab| tab.connection_binding.snapshot().execution_origin());
+        result_tabs
+            .active_result_origin()
+            .is_some_and(|result_origin| current_origin.as_ref() == Some(&result_origin))
+    }
+
+    fn active_result_origin_is_current(&self) -> bool {
+        self.result_origin_is_current_for_tab(self.active_editor_tab_id, &self.result_tabs)
     }
 
     /// Enable or disable connection-dependent toolbar buttons and menu items.
@@ -3327,8 +3785,15 @@ pub struct MainWindow {
 
 #[derive(Clone)]
 enum ConnectionResult {
-    Success(Box<crate::db::ConnectionInfo>),
-    Failure(String),
+    Success {
+        connection_id: ConnectionId,
+        info: Box<crate::db::ConnectionInfo>,
+    },
+    Failure {
+        connection_id: ConnectionId,
+        message: String,
+        preserve_existing_connection: bool,
+    },
     PoolResize {
         settings: Box<FontSettings>,
         result: Result<(), String>,
@@ -3339,6 +3804,7 @@ enum FileActionResult {
     OpenInNewTab {
         path: PathBuf,
         result: Result<String, String>,
+        binding: TabConnectionBinding,
     },
     Export {
         path: PathBuf,
@@ -3351,13 +3817,6 @@ enum SaveTabOutcome {
     Saved,
     Cancelled,
     Failed(String),
-}
-
-fn should_ignore_query_progress_when_disconnected(
-    has_live_connection: bool,
-    has_running_queries: bool,
-) -> bool {
-    !has_live_connection && !has_running_queries
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -3401,7 +3860,8 @@ pub(crate) fn result_pane_routes_for_progress_with_script_context(
     script_transcript: bool,
 ) -> Vec<ResultPaneRoute> {
     match progress {
-        QueryProgress::Operation { progress, .. } => {
+        QueryProgress::Operation { progress, .. }
+        | QueryProgress::StatementOrigin { progress, .. } => {
             result_pane_routes_for_progress_with_script_context(progress, script_transcript)
         }
         QueryProgress::OperationAbandoned { .. }
@@ -3464,10 +3924,6 @@ fn should_select_support_result_pane(context: Option<&QueryProgressContext>) -> 
     !context.is_some_and(|context| {
         context.execution_target.is_some() || !context.result_tab_ids.is_empty()
     })
-}
-
-fn should_run_global_batch_cleanup(has_running_queries: bool) -> bool {
-    !has_running_queries
 }
 
 fn should_accept_lazy_fetch_session_event(
@@ -3649,8 +4105,11 @@ fn acquire_sql_editor_if_idle(state: &Arc<Mutex<AppState>>) -> Option<SqlEditorW
         let guard = state
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if guard.is_any_query_running() {
-            (None, Some(crate::db::format_connection_busy_message()))
+        if guard.sql_editor.is_query_running() {
+            (
+                None,
+                Some("The active query tab is already running a query.".to_string()),
+            )
         } else {
             (Some(guard.sql_editor.clone()), None)
         }
@@ -3664,16 +4123,19 @@ fn acquire_sql_editor_if_idle(state: &Arc<Mutex<AppState>>) -> Option<SqlEditorW
 }
 
 fn cancel_oldest_lazy_fetch_if_session_pool_full(state: &Arc<Mutex<AppState>>) -> bool {
-    let (connection, configured_pool_size) = {
+    let (connection_id, connection, configured_pool_size) = {
         let state = state
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let Some(runtime) = state.active_connection_runtime() else {
+            return false;
+        };
         let configured_pool_size = state
             .config
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .normalized_connection_pool_size();
-        (state.connection.clone(), configured_pool_size)
+        (runtime.id(), runtime.connection(), configured_pool_size)
     };
     let connection_pool_size = crate::db::try_lock_connection(&connection)
         .map(|connection| connection.connection_pool_size())
@@ -3683,12 +4145,12 @@ fn cancel_oldest_lazy_fetch_if_session_pool_full(state: &Arc<Mutex<AppState>>) -
         let guard = state
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let active_sessions = guard.lazy_fetch_sessions_for_abort();
+        let active_sessions = guard.lazy_fetch_sessions_for_connection(connection_id);
         match session_pool_slot_action(active_sessions.len(), connection_pool_size) {
             SessionPoolSlotAction::None => return false,
             SessionPoolSlotAction::CancelLazyFetch => {}
         }
-        let Some(session_id) = guard.oldest_lazy_fetch_session() else {
+        let Some(session_id) = active_sessions.into_iter().min() else {
             return false;
         };
         session_id
@@ -3727,9 +4189,16 @@ fn update_transaction_mode_from_controls(state: &Arc<Mutex<AppState>>) {
         let mut s = state
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let active_connection_id = s.active_connection_id();
+        let connection_has_running_work = active_connection_id
+            .is_some_and(|connection_id| s.has_work_for_connection(connection_id));
+        let connection_has_lazy_fetch = active_connection_id.is_some_and(|connection_id| {
+            !s.lazy_fetch_sessions_for_connection(connection_id)
+                .is_empty()
+        });
         if let Some(message) = transaction_option_block_message(
-            s.is_any_query_running(),
-            s.has_active_lazy_fetches(),
+            connection_has_running_work,
+            connection_has_lazy_fetch,
             "changing transaction mode",
         ) {
             crate::ui::alert_on_main(&message);
@@ -3817,18 +4286,6 @@ fn resolve_active_progress_tab_id(
     tab_id: QueryTabId,
     statement_index: usize,
 ) -> Option<ResultTabId> {
-    let has_running_queries = state.sql_editor.is_query_running()
-        || state
-            .editor_tabs
-            .iter()
-            .any(|tab| tab.sql_editor.is_query_running());
-    if should_ignore_query_progress_when_disconnected(
-        state.has_live_connection,
-        has_running_queries,
-    ) {
-        return None;
-    }
-
     let context = state.progress_contexts.get(&tab_id)?;
     if context.closed_statement_indices.contains(&statement_index) {
         return None;
@@ -3855,15 +4312,12 @@ fn session_activity_column(name: &str, data_type: &str) -> ColumnInfo {
     }
 }
 
-fn build_session_activity_result_request(
-    connection_name: &str,
-    db_type: &str,
-    pool_size: u32,
-    current_activity: &str,
-    entries: Vec<SessionActivityEntry>,
-) -> ResultTabRequest {
+fn build_session_activity_result_request(entries: Vec<SessionActivityEntry>) -> ResultTabRequest {
     let columns = vec![
+        session_activity_column("Connection ID", "NUMBER"),
         session_activity_column("Connection", "VARCHAR2"),
+        session_activity_column("Connection State", "VARCHAR2"),
+        session_activity_column("Scope", "VARCHAR2"),
         session_activity_column("Database", "VARCHAR2"),
         session_activity_column("Pool Size", "NUMBER"),
         session_activity_column("Tab", "VARCHAR2"),
@@ -3875,17 +4329,19 @@ fn build_session_activity_result_request(
         session_activity_column("Elapsed", "VARCHAR2"),
     ];
 
-    let pool_size = pool_size.to_string();
-    let has_active_entries = !entries.is_empty();
-    let rows = if !has_active_entries {
+    let has_active_entries = entries.iter().any(|entry| entry.active);
+    let rows = if entries.is_empty() {
         vec![vec![
-            connection_name.to_string(),
-            db_type.to_string(),
-            pool_size,
+            "-".to_string(),
+            "No connections".to_string(),
+            "Unbound".to_string(),
+            "-".to_string(),
+            "-".to_string(),
+            "-".to_string(),
             "-".to_string(),
             "-".to_string(),
             "Idle".to_string(),
-            current_activity.to_string(),
+            "Idle".to_string(),
             "-".to_string(),
             "-".to_string(),
             "-".to_string(),
@@ -3895,16 +4351,22 @@ fn build_session_activity_result_request(
             .into_iter()
             .map(|entry| {
                 vec![
-                    connection_name.to_string(),
+                    entry
+                        .connection_id
+                        .map(|connection_id| connection_id.to_string())
+                        .unwrap_or_else(|| "-".to_string()),
+                    entry.connection_name,
+                    entry.connection_state,
+                    entry.scope.unwrap_or_else(|| "-".to_string()),
                     entry.database,
-                    pool_size.clone(),
+                    entry.pool_size.to_string(),
                     entry.tab_name,
                     entry
                         .result_tab
                         .map(|index| index.to_string())
                         .unwrap_or_else(|| "-".to_string()),
                     entry.state,
-                    current_activity.to_string(),
+                    entry.current_activity,
                     entry.sql_preview,
                     entry.fetched_rows.to_string(),
                     entry.elapsed,
@@ -3940,7 +4402,15 @@ impl MainWindow {
         let mut guard = state
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if let Err(err) = validate_result_edit_action_allowed(guard.is_any_query_running()) {
+        if !guard.active_result_origin_is_current() {
+            let err =
+                "This result belongs to an older connection, reconnect, or scope and is read-only."
+                    .to_string();
+            guard.set_status_message(&err);
+            guard.refresh_result_edit_controls();
+            return Err(err);
+        }
+        if let Err(err) = validate_result_edit_action_allowed(guard.sql_editor.is_query_running()) {
             guard.set_status_message(&err);
             guard.refresh_result_edit_controls();
             return Err(err);
@@ -4003,7 +4473,7 @@ impl MainWindow {
             return;
         }
 
-        {
+        let binding = {
             let mut s = state
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -4021,12 +4491,17 @@ impl MainWindow {
                 &format!("Opening {} in new tab", file_label),
                 &conn_info,
             ));
-        }
+            MainWindow::binding_for_selected_database(&s)
+        };
 
         let sender = file_sender.clone();
         thread::spawn(move || {
             let result = fs::read_to_string(&path).map_err(|err| err.to_string());
-            let _ = sender.send(FileActionResult::OpenInNewTab { path, result });
+            let _ = sender.send(FileActionResult::OpenInNewTab {
+                path,
+                result,
+                binding,
+            });
             app::awake();
         });
     }
@@ -4041,7 +4516,7 @@ impl MainWindow {
             return;
         }
 
-        {
+        let binding = {
             let mut s = state
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -4059,7 +4534,8 @@ impl MainWindow {
                 &format!("Opening {} in new tab", file_label),
                 &conn_info,
             ));
-        }
+            MainWindow::binding_for_selected_database(&s)
+        };
 
         let result = fs::read_to_string(&path).map_err(|err| err.to_string());
         let mut created_tab: Option<QueryTabId> = None;
@@ -4078,7 +4554,9 @@ impl MainWindow {
                         return;
                     }
                     let normalized_content = MainWindow::normalize_line_endings_for_editor(content);
-                    if let Some(tab_id) = MainWindow::create_query_editor_tab(&mut s) {
+                    if let Some(tab_id) =
+                        MainWindow::create_query_editor_tab_for_binding(&mut s, binding, true)
+                    {
                         s.sql_buffer.set_text(&normalized_content);
                         s.sql_editor.reset_undo_redo_history();
                         s.set_tab_file_path(tab_id, Some(path.clone()));
@@ -4335,102 +4813,6 @@ impl MainWindow {
                 MainWindow::start_status_activity_timer(&state_for_tick);
             }
         });
-    }
-
-    fn transition_to_disconnected_state(
-        state: &mut AppState,
-        error_message: Option<&str>,
-    ) -> Vec<u64> {
-        let lazy_fetch_sessions = state.lazy_fetch_sessions_for_abort();
-        *state
-            .connection_info
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
-        state.has_live_connection = false;
-        state.pending_connection_metadata_refresh = false;
-        clear_mutex_flag(&state.schema_refresh_in_progress);
-        // Active lazy fetch cancellation is dispatched by the caller after the
-        // AppState lock is released; only drop idle/reusable leases here.
-        state.release_all_pooled_db_sessions();
-
-        for session_id in &lazy_fetch_sessions {
-            state.mark_lazy_fetch_result_tab_cancelled(*session_id);
-        }
-        state.mark_canceling_progress_contexts_cancelled();
-
-        // Disconnection can happen mid-stream (network drop,
-        // explicit disconnect while a worker is still unwinding). Ensure every
-        // result grid exits streaming mode immediately so edit controls are not
-        // left disabled waiting for a BatchFinished event that may never arrive.
-        state.result_tabs.clear_all_lazy_fetch_state_for_abort();
-        state.result_tabs.finish_all_streaming();
-        state.progress_contexts.clear();
-        state.pending_lazy_fetch_canceling_sessions.clear();
-        state.orphaned_lazy_fetch_missing_since.clear();
-        crate::db::clear_tracked_db_activity();
-
-        let recovered_save_states = state.result_tabs.clear_orphaned_save_requests();
-        let recovered_edit_states = state.result_tabs.clear_orphaned_query_edit_backups();
-        if recovered_save_states > 0 {
-            state.set_status_message("Disconnected (save interrupted; staged edits preserved)");
-        } else if recovered_edit_states > 0 {
-            state.set_status_message("Disconnected (staged result-grid edits restored)");
-        } else {
-            state.set_status_message("Disconnected");
-        }
-        Self::update_schema_snapshot(state, IntellisenseData::new(), HighlightData::new());
-
-        // Clear object browser cache and tree so stale metadata from the previous
-        // connection is not visible when connecting to a different database.
-        state.object_browser.clear_on_disconnect();
-
-        // DO NOT clear result_tabs on disconnect.
-        //
-        // Users frequently disconnect and reconnect (e.g. session timeout, switching
-        // environments) and still need to read the query results that were already
-        // fetched. Clearing tabs here would destroy that data silently.
-        //
-        // Staged edit data (pending INSERT/UPDATE/DELETE rows) must also survive
-        // across a disconnect so the user can reconnect and retry the save without
-        // losing their edits.
-        //
-        // If you are tempted to add result_tabs.clear() here — don't.
-        // Let the user close individual tabs manually when they are done with them.
-
-        // Reset session state (bind variables, settings, etc.) so they do not
-        // leak into a subsequent connection, e.g. when disconnected by the health
-        // disconnect path rather than via an explicit "Disconnect" menu action.
-        if let Ok(conn_guard) = state.connection.try_lock() {
-            let session = conn_guard.session_state();
-            // Drop the connection guard before locking the session to preserve
-            // the single-lock-at-a-time invariant.
-            drop(conn_guard);
-            let lock_result = session.lock();
-            match lock_result {
-                Ok(mut guard) => {
-                    guard.reset_for_connection(DatabaseType::default());
-                }
-                Err(poisoned) => {
-                    let mut guard = poisoned.into_inner();
-                    guard.reset_for_connection(DatabaseType::default());
-                }
-            }
-        }
-
-        if let Some(message) = error_message {
-            crate::utils::logging::log_error("connection", message);
-            state
-                .result_tabs
-                .append_message_lines(ResultMessageKind::Error, &[message.to_string()]);
-            state.result_tabs.select_messages_errors();
-        }
-
-        state.refresh_connection_dependent_controls();
-        // Refresh the result-grid edit toolbar after orphan recovery may have
-        // changed pending_save_request, ensuring buttons reflect the final state
-        // rather than any intermediate snapshot from before orphan cleanup.
-        state.refresh_result_edit_controls();
-        lazy_fetch_sessions
     }
 
     fn cancel_all_running_queries(state: &Arc<Mutex<AppState>>) {
@@ -4943,15 +5325,32 @@ impl MainWindow {
         true
     }
 
-    fn resolve_pooled_sessions_before_connection_transition(state: &Arc<Mutex<AppState>>) -> bool {
-        Self::resolve_pooled_sessions_before_retained_action(
-            state,
-            RetainedSessionPreflightAction::ConnectionTransition,
-            "change the connection",
-            "changing the connection",
-            "Commit and Continue",
-            "Rollback and Continue",
-        )
+    fn resolve_pooled_sessions_before_runtime_disconnect(
+        state: &Arc<Mutex<AppState>>,
+        connection_id: ConnectionId,
+    ) -> bool {
+        let tab_ids = state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .editor_tabs
+            .iter()
+            .filter(|tab| tab.connection_binding.snapshot().connection_id() == Some(connection_id))
+            .map(|tab| tab.tab_id)
+            .collect::<Vec<_>>();
+        for tab_id in tab_ids {
+            if !Self::resolve_pooled_session_before_action(
+                state,
+                tab_id,
+                RetainedSessionPreflightAction::ConnectionTransition,
+                "disconnect it",
+                "disconnecting",
+                "Commit and Disconnect",
+                "Rollback and Disconnect",
+            ) {
+                return false;
+            }
+        }
+        true
     }
 
     fn resolve_pooled_sessions_before_pool_resize(state: &Arc<Mutex<AppState>>) -> bool {
@@ -4976,6 +5375,8 @@ impl MainWindow {
             let mut guard = crate::db::lock_connection(&connection);
             guard.set_connection_pool_size(config.normalized_connection_pool_size());
         }
+        let connection_registry = ConnectionRegistry::new();
+        let initial_binding = TabConnectionBinding::unbound();
 
         let ui_scale_bases = (0..app::screen_count())
             .map(app::screen_scale)
@@ -4997,6 +5398,43 @@ impl MainWindow {
             config.normalized_ui_scale_percent(),
             Some(&window),
         );
+        let compact_query_toolbar = window.w() < QUERY_TOOLBAR_COMPACT_BREAKPOINT;
+        let query_toolbar_margin = if compact_query_toolbar {
+            4
+        } else {
+            TOOLBAR_SPACING
+        };
+        let query_toolbar_spacing = if compact_query_toolbar {
+            4
+        } else {
+            TOOLBAR_SPACING
+        };
+        let query_toolbar_button_width = if compact_query_toolbar {
+            BUTTON_WIDTH_SMALL
+        } else {
+            BUTTON_WIDTH
+        };
+        let query_toolbar_isolation_width = if compact_query_toolbar {
+            QUERY_TOOLBAR_COMPACT_CHOICE_WIDTH
+        } else {
+            TRANSACTION_ISOLATION_CHOICE_WIDTH
+        };
+        let query_toolbar_access_width = if compact_query_toolbar {
+            QUERY_TOOLBAR_COMPACT_ACCESS_WIDTH
+        } else {
+            TRANSACTION_ACCESS_CHOICE_WIDTH
+        };
+        let query_toolbar_timeout_label_width = if compact_query_toolbar { 0 } else { 85 };
+        let query_toolbar_timeout_width = if compact_query_toolbar {
+            QUERY_TOOLBAR_COMPACT_NUMERIC_WIDTH
+        } else {
+            NUMERIC_INPUT_WIDTH
+        };
+        let query_toolbar_scale_button_width = if compact_query_toolbar {
+            QUERY_TOOLBAR_COMPACT_SCALE_BUTTON_WIDTH
+        } else {
+            UI_SCALE_BUTTON_WIDTH
+        };
 
         let mut main_flex = Flex::default_fill();
         main_flex.set_type(FlexType::Column);
@@ -5006,8 +5444,8 @@ impl MainWindow {
 
         let mut query_toolbar = Flex::default();
         query_toolbar.set_type(FlexType::Row);
-        query_toolbar.set_margin(TOOLBAR_SPACING);
-        query_toolbar.set_spacing(TOOLBAR_SPACING);
+        query_toolbar.set_margin(query_toolbar_margin);
+        query_toolbar.set_spacing(query_toolbar_spacing);
 
         let mut execute_btn = Button::default()
             .with_size(BUTTON_WIDTH, BUTTON_HEIGHT)
@@ -5015,7 +5453,7 @@ impl MainWindow {
         execute_btn.set_color(theme::selection_soft());
         execute_btn.set_label_color(theme::text_primary());
         execute_btn.set_frame(FrameType::RFlatBox);
-        query_toolbar.fixed(&execute_btn, BUTTON_WIDTH);
+        query_toolbar.fixed(&execute_btn, query_toolbar_button_width);
 
         let mut cancel_btn = Button::default()
             .with_size(BUTTON_WIDTH, BUTTON_HEIGHT)
@@ -5023,7 +5461,7 @@ impl MainWindow {
         cancel_btn.set_color(theme::button_cancel());
         cancel_btn.set_label_color(theme::text_primary());
         cancel_btn.set_frame(FrameType::RFlatBox);
-        query_toolbar.fixed(&cancel_btn, BUTTON_WIDTH);
+        query_toolbar.fixed(&cancel_btn, query_toolbar_button_width);
 
         let mut commit_btn = Button::default()
             .with_size(BUTTON_WIDTH, BUTTON_HEIGHT)
@@ -5031,7 +5469,7 @@ impl MainWindow {
         commit_btn.set_color(theme::button_success());
         commit_btn.set_label_color(theme::text_primary());
         commit_btn.set_frame(FrameType::RFlatBox);
-        query_toolbar.fixed(&commit_btn, BUTTON_WIDTH);
+        query_toolbar.fixed(&commit_btn, query_toolbar_button_width);
 
         let mut rollback_btn = Button::default()
             .with_size(BUTTON_WIDTH, BUTTON_HEIGHT)
@@ -5039,7 +5477,7 @@ impl MainWindow {
         rollback_btn.set_color(theme::button_danger());
         rollback_btn.set_label_color(theme::text_primary());
         rollback_btn.set_frame(FrameType::RFlatBox);
-        query_toolbar.fixed(&rollback_btn, BUTTON_WIDTH);
+        query_toolbar.fixed(&rollback_btn, query_toolbar_button_width);
 
         let initial_db_type = DatabaseType::default();
         let mut transaction_isolation_choice =
@@ -5052,10 +5490,7 @@ impl MainWindow {
         transaction_isolation_choice.set_color(theme::input_bg());
         transaction_isolation_choice.set_text_color(theme::text_primary());
         transaction_isolation_choice.set_tooltip("Transaction isolation for new executions");
-        query_toolbar.fixed(
-            &transaction_isolation_choice,
-            TRANSACTION_ISOLATION_CHOICE_WIDTH,
-        );
+        query_toolbar.fixed(&transaction_isolation_choice, query_toolbar_isolation_width);
 
         let mut transaction_access_choice =
             Choice::default().with_size(TRANSACTION_ACCESS_CHOICE_WIDTH, BUTTON_HEIGHT);
@@ -5064,7 +5499,7 @@ impl MainWindow {
         transaction_access_choice.set_color(theme::input_bg());
         transaction_access_choice.set_text_color(theme::text_primary());
         transaction_access_choice.set_tooltip("Transaction access mode for new executions");
-        query_toolbar.fixed(&transaction_access_choice, TRANSACTION_ACCESS_CHOICE_WIDTH);
+        query_toolbar.fixed(&transaction_access_choice, query_toolbar_access_width);
 
         let toolbar_spacer = Frame::default();
         query_toolbar.resizable(&toolbar_spacer);
@@ -5072,14 +5507,17 @@ impl MainWindow {
         let mut timeout_label = Frame::default().with_size(85, BUTTON_HEIGHT);
         timeout_label.set_label("Timeout(s)");
         timeout_label.set_label_color(theme::text_muted());
-        query_toolbar.fixed(&timeout_label, 85);
+        if compact_query_toolbar {
+            timeout_label.hide();
+        }
+        query_toolbar.fixed(&timeout_label, query_toolbar_timeout_label_width);
 
         let mut timeout_input = IntInput::default().with_size(NUMERIC_INPUT_WIDTH, BUTTON_HEIGHT);
         timeout_input.set_color(theme::input_bg());
         timeout_input.set_text_color(theme::text_primary());
         timeout_input.set_tooltip("Call timeout in seconds (empty = no timeout)");
         timeout_input.set_value("60");
-        query_toolbar.fixed(&timeout_input, NUMERIC_INPUT_WIDTH);
+        query_toolbar.fixed(&timeout_input, query_toolbar_timeout_width);
 
         let mut zoom_out_btn = Button::default()
             .with_size(UI_SCALE_BUTTON_WIDTH, BUTTON_HEIGHT)
@@ -5088,7 +5526,7 @@ impl MainWindow {
         zoom_out_btn.set_label_color(theme::text_primary());
         zoom_out_btn.set_frame(FrameType::RFlatBox);
         zoom_out_btn.set_tooltip("Zoom out (Ctrl/Cmd+-)");
-        query_toolbar.fixed(&zoom_out_btn, UI_SCALE_BUTTON_WIDTH);
+        query_toolbar.fixed(&zoom_out_btn, query_toolbar_scale_button_width);
 
         let mut zoom_in_btn = Button::default()
             .with_size(UI_SCALE_BUTTON_WIDTH, BUTTON_HEIGHT)
@@ -5097,16 +5535,84 @@ impl MainWindow {
         zoom_in_btn.set_label_color(theme::text_primary());
         zoom_in_btn.set_frame(FrameType::RFlatBox);
         zoom_in_btn.set_tooltip("Zoom in (Ctrl/Cmd++)");
-        query_toolbar.fixed(&zoom_in_btn, UI_SCALE_BUTTON_WIDTH);
+        query_toolbar.fixed(&zoom_in_btn, query_toolbar_scale_button_width);
 
         query_toolbar.end();
+        let execute_btn_for_toolbar_resize = execute_btn.clone();
+        let cancel_btn_for_toolbar_resize = cancel_btn.clone();
+        let commit_btn_for_toolbar_resize = commit_btn.clone();
+        let rollback_btn_for_toolbar_resize = rollback_btn.clone();
+        let isolation_for_toolbar_resize = transaction_isolation_choice.clone();
+        let access_for_toolbar_resize = transaction_access_choice.clone();
+        let mut timeout_label_for_toolbar_resize = timeout_label.clone();
+        let timeout_input_for_toolbar_resize = timeout_input.clone();
+        let zoom_out_for_toolbar_resize = zoom_out_btn.clone();
+        let zoom_in_for_toolbar_resize = zoom_in_btn.clone();
+        query_toolbar.handle(move |toolbar, event| {
+            if event != Event::Resize {
+                return false;
+            }
+            let compact = toolbar.w() < QUERY_TOOLBAR_COMPACT_BREAKPOINT;
+            toolbar.set_margin(if compact { 4 } else { TOOLBAR_SPACING });
+            toolbar.set_spacing(if compact { 4 } else { TOOLBAR_SPACING });
+            let button_width = if compact {
+                BUTTON_WIDTH_SMALL
+            } else {
+                BUTTON_WIDTH
+            };
+            toolbar.fixed(&execute_btn_for_toolbar_resize, button_width);
+            toolbar.fixed(&cancel_btn_for_toolbar_resize, button_width);
+            toolbar.fixed(&commit_btn_for_toolbar_resize, button_width);
+            toolbar.fixed(&rollback_btn_for_toolbar_resize, button_width);
+            toolbar.fixed(
+                &isolation_for_toolbar_resize,
+                if compact {
+                    QUERY_TOOLBAR_COMPACT_CHOICE_WIDTH
+                } else {
+                    TRANSACTION_ISOLATION_CHOICE_WIDTH
+                },
+            );
+            toolbar.fixed(
+                &access_for_toolbar_resize,
+                if compact {
+                    QUERY_TOOLBAR_COMPACT_ACCESS_WIDTH
+                } else {
+                    TRANSACTION_ACCESS_CHOICE_WIDTH
+                },
+            );
+            if compact {
+                timeout_label_for_toolbar_resize.hide();
+            } else {
+                timeout_label_for_toolbar_resize.show();
+            }
+            toolbar.fixed(
+                &timeout_label_for_toolbar_resize,
+                if compact { 0 } else { 85 },
+            );
+            toolbar.fixed(
+                &timeout_input_for_toolbar_resize,
+                if compact {
+                    QUERY_TOOLBAR_COMPACT_NUMERIC_WIDTH
+                } else {
+                    NUMERIC_INPUT_WIDTH
+                },
+            );
+            let scale_button_width = if compact {
+                QUERY_TOOLBAR_COMPACT_SCALE_BUTTON_WIDTH
+            } else {
+                UI_SCALE_BUTTON_WIDTH
+            };
+            toolbar.fixed(&zoom_out_for_toolbar_resize, scale_button_width);
+            toolbar.fixed(&zoom_in_for_toolbar_resize, scale_button_width);
+            false
+        });
         main_flex.fixed(&query_toolbar, RESULT_TOOLBAR_HEIGHT);
 
         let mut content_flex = Flex::default();
         content_flex.set_type(FlexType::Row);
         content_flex.set_spacing(0);
 
-        let object_browser = ObjectBrowserWidget::new(0, 0, 250, 600, connection.clone());
+        let object_browser = MultiObjectBrowserWidget::new(0, 0, 250, 600);
         let obj_browser_widget = object_browser.get_widget();
         content_flex.fixed(&obj_browser_widget, 250);
 
@@ -5210,10 +5716,16 @@ impl MainWindow {
         let mut result_bottom_flex = Flex::new(tile_x, result_y, tile_w, result_h, None);
         result_bottom_flex.set_type(FlexType::Column);
 
-        let mut result_tabs = ResultTabsWidget::new(0, 0, 900, 400);
+        let mut result_workspace_group = Group::new(0, 0, 900, 400, None);
+        result_workspace_group.set_frame(FrameType::FlatBox);
+        result_workspace_group.set_color(theme::panel_bg());
+        result_workspace_group.begin();
+        let result_tabs = ResultTabsWidget::new(0, 0, 900, 400);
         let result_widget = result_tabs.get_widget();
-        result_bottom_flex.add(&result_widget);
-        result_bottom_flex.resizable(&result_widget);
+        result_workspace_group.resizable(&result_widget);
+        result_workspace_group.end();
+        result_bottom_flex.add(&result_workspace_group);
+        result_bottom_flex.resizable(&result_workspace_group);
 
         let mut result_toolbar = Flex::default();
         result_toolbar.set_type(FlexType::Row);
@@ -5447,8 +5959,8 @@ impl MainWindow {
         let first_tab_group = first_tab_group.unwrap_or_else(|| query_top_group.clone());
         first_tab_group.begin();
         let schema_intellisense_data = Arc::new(Mutex::new(IntellisenseData::new()));
-        let first_editor = SqlEditorWidget::new_with_intellisense_data(
-            connection.clone(),
+        let first_editor = SqlEditorWidget::new_with_binding_and_intellisense_data(
+            initial_binding.clone(),
             timeout_input.clone(),
             schema_intellisense_data.clone(),
         );
@@ -5469,8 +5981,12 @@ impl MainWindow {
         let editor_tabs = vec![QueryEditorTab {
             tab_id: first_tab_id,
             base_label: "Query 1".to_string(),
+            connection_binding: initial_binding,
             sql_editor: first_editor,
             sql_buffer: sql_buffer.clone(),
+            intellisense_data: schema_intellisense_data.clone(),
+            highlight_data: HighlightData::new(),
+            result_tabs: result_tabs.clone(),
             current_file: None,
             pristine_text: String::new(),
             current_text_len: 0,
@@ -5492,6 +6008,7 @@ impl MainWindow {
 
         let state = Arc::new(Mutex::new(AppState {
             connection,
+            connection_registry,
             query_tabs: query_tabs.clone(),
             query_top_group: query_top_group.clone(),
             query_split_bar: query_split_bar.clone(),
@@ -5505,6 +6022,7 @@ impl MainWindow {
             query_timeout_input: timeout_input.clone(),
             ui_scale_bases,
             result_tabs: result_tabs.clone(),
+            result_workspace_group: result_workspace_group.clone(),
             result_toolbar: result_toolbar.clone(),
             result_one_tab_per_query_check: one_tab_per_query_check.clone(),
             result_one_tab_edit_gap: one_tab_edit_gap.clone(),
@@ -5519,7 +6037,7 @@ impl MainWindow {
             rollback_btn: rollback_btn.clone(),
             transaction_isolation_choice: transaction_isolation_choice.clone(),
             transaction_access_choice: transaction_access_choice.clone(),
-            result_grid_execution_target: None,
+            result_grid_execution_targets: HashMap::new(),
             progress_contexts: HashMap::new(),
             abandoned_query_operations: HashSet::new(),
             pending_query_cancellations: HashMap::new(),
@@ -5535,6 +6053,8 @@ impl MainWindow {
             connection_info: Arc::new(Mutex::new(None)),
             has_live_connection: false,
             pending_connection_metadata_refresh: false,
+            pending_metadata_refresh_tabs: HashSet::new(),
+            latest_schema_request_id: 0,
             config: Arc::new(Mutex::new(config)),
             schema_sender: None,
             file_sender: None,
@@ -5561,54 +6081,6 @@ impl MainWindow {
             s.render_status_bar();
         }
         MainWindow::start_status_activity_timer(&state);
-
-        let weak_state_for_grid_edit = Arc::downgrade(&state);
-        let grid_edit_callback: ResultGridSqlExecuteCallback =
-            Arc::new(Mutex::new(Some(Box::new(move |sql: String| {
-                let Some(state_for_grid_edit) = weak_state_for_grid_edit.upgrade() else {
-                    return Err("Main window is no longer available.".to_string());
-                };
-                let mut guard = state_for_grid_edit
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner());
-                if guard.is_any_query_running() {
-                    return Err("Another query is already running.".to_string());
-                }
-                let target_tab = guard
-                    .result_tabs
-                    .active_result_id()
-                    .ok_or_else(|| "Open a result tab first.".to_string())?;
-                guard.result_grid_execution_target = Some(target_tab);
-                guard.sql_editor.execute_sql_text(&sql);
-                if !guard.sql_editor.is_query_running() {
-                    guard.result_grid_execution_target = None;
-                    return Err("Failed to start query execution for result-grid edit.".to_string());
-                }
-                Ok(())
-            }))));
-        {
-            state
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .result_tabs
-                .set_execute_sql_callback(grid_edit_callback);
-        }
-
-        let weak_state_for_lazy_fetch = Arc::downgrade(&state);
-        let lazy_fetch_callback = Arc::new(Mutex::new(Some(Box::new(move |session_id, request| {
-            let Some(state_for_lazy_fetch) = weak_state_for_lazy_fetch.upgrade() else {
-                return false;
-            };
-            AppState::request_lazy_fetch_on_editors(&state_for_lazy_fetch, session_id, request)
-        })
-            as Box<dyn FnMut(u64, crate::ui::sql_editor::LazyFetchRequest) -> bool>)));
-        {
-            state
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .result_tabs
-                .set_lazy_fetch_callback(lazy_fetch_callback);
-        }
 
         let weak_state_for_execute = Arc::downgrade(&state);
         execute_btn.set_callback(move |_| {
@@ -5695,14 +6167,6 @@ impl MainWindow {
             };
             MainWindow::close_query_editor_tab(&state_for_tab_close, tab_id);
             app::redraw();
-        });
-
-        let weak_state_for_result_tab_close = Arc::downgrade(&state);
-        result_tabs.set_on_close(move |target| {
-            let Some(state_for_result_tab_close) = weak_state_for_result_tab_close.upgrade() else {
-                return;
-            };
-            MainWindow::close_result_tab_by_target(&state_for_result_tab_close, target);
         });
 
         {
@@ -6047,12 +6511,12 @@ impl MainWindow {
                 .apply_font_settings(editor_profile, editor_size, ui_size);
         }
         state.query_tabs.refresh_tab_strip_overflow_mode();
-        state
-            .result_tabs
-            .apply_font_settings(result_profile, result_size);
-        state
-            .result_tabs
-            .set_max_cell_display_chars(result_cell_max_chars as usize);
+        for tab in &mut state.editor_tabs {
+            tab.result_tabs
+                .apply_font_settings(result_profile, result_size);
+            tab.result_tabs
+                .set_max_cell_display_chars(result_cell_max_chars as usize);
+        }
         state
             .object_browser
             .apply_font_settings(editor_profile, ui_size);
@@ -6330,15 +6794,122 @@ impl MainWindow {
         state: &mut AppState,
         stabilize_display: bool,
     ) -> Option<QueryTabId> {
-        let label = format!("Query {}", state.next_editor_tab_number);
+        let binding = state
+            .editor_tabs
+            .iter()
+            .find(|tab| tab.tab_id == state.active_editor_tab_id)
+            .map(|tab| tab.connection_binding.fork_for_new_tab())
+            .unwrap_or_else(TabConnectionBinding::unbound);
+        Self::create_query_editor_tab_for_binding(state, binding, stabilize_display)
+    }
+
+    fn create_query_editor_tab_for_selected_database(state: &mut AppState) -> Option<QueryTabId> {
+        Self::create_query_editor_tab_for_selected_database_with_display_stabilization(state, true)
+    }
+
+    fn create_query_editor_tab_for_selected_database_with_display_stabilization(
+        state: &mut AppState,
+        stabilize_display: bool,
+    ) -> Option<QueryTabId> {
+        let binding = Self::binding_for_selected_database(state);
+        Self::create_query_editor_tab_for_binding(state, binding, stabilize_display)
+    }
+
+    fn binding_for_selected_database(state: &AppState) -> TabConnectionBinding {
+        if let Some((connection_id, scope)) = state.object_browser.selected_connection_context() {
+            if let Some(runtime) = state.connection_registry.get(connection_id) {
+                return TabConnectionBinding::bound_in_registry(
+                    state.connection_registry.clone(),
+                    runtime,
+                    scope,
+                );
+            }
+        }
+        state
+            .editor_tabs
+            .iter()
+            .find(|tab| tab.tab_id == state.active_editor_tab_id)
+            .map(|tab| tab.connection_binding.fork_for_new_tab())
+            .unwrap_or_else(TabConnectionBinding::unbound)
+    }
+
+    fn create_query_editor_tab_for_runtime(
+        state: &mut AppState,
+        runtime: Arc<ConnectionRuntime>,
+    ) -> Option<QueryTabId> {
+        state.object_browser.add_runtime(runtime.clone());
+        Self::create_query_editor_tab_for_binding(
+            state,
+            TabConnectionBinding::bound_in_registry(
+                state.connection_registry.clone(),
+                runtime,
+                None,
+            ),
+            true,
+        )
+    }
+
+    fn select_or_create_query_editor_tab_for_connection(
+        state: &mut AppState,
+        connection_id: ConnectionId,
+    ) -> Option<(QueryTabId, bool)> {
+        if state.active_connection_id() == Some(connection_id) {
+            return Some((state.active_editor_tab_id, false));
+        }
+        if let Some(tab_id) = state
+            .editor_tabs
+            .iter()
+            .find(|tab| tab.connection_binding.snapshot().connection_id() == Some(connection_id))
+            .map(|tab| tab.tab_id)
+        {
+            return state
+                .set_active_editor_tab(tab_id)
+                .then_some((tab_id, false));
+        }
+        let runtime = state.connection_registry.get(connection_id)?;
+        Self::create_query_editor_tab_for_runtime(state, runtime).map(|tab_id| (tab_id, true))
+    }
+
+    fn create_query_editor_tab_for_binding(
+        state: &mut AppState,
+        binding: TabConnectionBinding,
+        stabilize_display: bool,
+    ) -> Option<QueryTabId> {
+        let query_number = state.next_editor_tab_number;
+        let binding_snapshot = binding.snapshot();
+        let connection_label = binding_snapshot.runtime.as_ref().and_then(|runtime| {
+            let label = runtime.display_name();
+            (!label.trim().is_empty()).then_some(label)
+        });
+        let label = connection_label.map_or_else(
+            || format!("Query {query_number}"),
+            |connection_label| format!("{connection_label} · Query {query_number}"),
+        );
+        let base_label = format!("Query {query_number}");
         state.next_editor_tab_number = state.next_editor_tab_number.saturating_add(1);
         let tab_id = state.query_tabs.add_tab(&label);
         let group = state.query_tabs.tab_group(tab_id)?;
+        let binding_connection_id = binding.snapshot().connection_id();
+        let (seed_data, seed_highlight_data) = state
+            .editor_tabs
+            .iter()
+            .find(|tab| tab.connection_binding.snapshot().connection_id() == binding_connection_id)
+            .map(|tab| {
+                (
+                    tab.intellisense_data
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .clone(),
+                    tab.highlight_data.clone(),
+                )
+            })
+            .unwrap_or_else(|| (IntellisenseData::new(), HighlightData::new()));
+        let intellisense_data = Arc::new(Mutex::new(seed_data));
         group.begin();
-        let mut editor = SqlEditorWidget::new_with_intellisense_data(
-            state.connection.clone(),
+        let mut editor = SqlEditorWidget::new_with_binding_and_intellisense_data(
+            binding.clone(),
             state.query_timeout_input.clone(),
-            state.schema_intellisense_data.clone(),
+            intellisense_data.clone(),
         );
         editor.set_owner_tab_id(tab_id);
         let mut editor_group = editor.get_group().clone();
@@ -6351,19 +6922,50 @@ impl MainWindow {
         } else {
             editor.mark_display_metrics_pending();
         }
-        editor.update_highlight_data(state.schema_highlight_data.clone());
+        editor.update_highlight_data(seed_highlight_data.clone());
         let buffer = editor.get_buffer();
+        let previous_group = fltk::group::Group::try_current();
+        state.result_workspace_group.begin();
+        let mut result_tabs = ResultTabsWidget::new(
+            state.result_workspace_group.x(),
+            state.result_workspace_group.y(),
+            state.result_workspace_group.w(),
+            state.result_workspace_group.h(),
+        );
+        let result_cell_max_chars = state
+            .config
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .result_cell_max_chars
+            .clamp(
+                RESULT_CELL_MAX_DISPLAY_CHARS_MIN,
+                RESULT_CELL_MAX_DISPLAY_CHARS_MAX,
+            );
+        result_tabs.set_max_cell_display_chars(result_cell_max_chars as usize);
+        let mut result_widget = result_tabs.get_widget();
+        result_widget.hide();
+        state.result_workspace_group.end();
+        if let Some(previous_group) = previous_group.as_ref() {
+            fltk::group::Group::set_current(Some(previous_group));
+        } else {
+            fltk::group::Group::set_current(None::<&fltk::group::Group>);
+        }
         state.editor_tabs.push(QueryEditorTab {
             tab_id,
-            base_label: label,
+            base_label,
+            connection_binding: binding,
             sql_editor: editor,
             sql_buffer: buffer,
+            intellisense_data,
+            highlight_data: seed_highlight_data,
+            result_tabs,
             current_file: None,
             pristine_text: String::new(),
             current_text_len: 0,
             is_dirty: false,
         });
         state.query_tabs.select(tab_id);
+        state.refresh_tab_label(tab_id);
         let _ = state.set_active_editor_tab_with_display_stabilization(tab_id, stabilize_display);
         Some(tab_id)
     }
@@ -6471,6 +7073,8 @@ impl MainWindow {
             lazy_fetch_sessions,
             deferred_display_tab_id,
             focus_after_close,
+            removed_connection_id,
+            connection_registry,
         ) = {
             let mut s = state
                 .lock()
@@ -6493,6 +7097,11 @@ impl MainWindow {
                 s.active_editor_tab_id,
             );
             let editor_to_cleanup = s.editor_tabs[index].sql_editor.clone();
+            let removed_connection_id = s.editor_tabs[index]
+                .connection_binding
+                .snapshot()
+                .connection_id();
+            let mut result_workspace_to_cleanup = s.editor_tabs[index].result_tabs.clone();
             let mut lazy_fetch_sessions = s
                 .progress_contexts
                 .get(&tab_id)
@@ -6514,21 +7123,25 @@ impl MainWindow {
             }
             for session_id in &lazy_fetch_sessions {
                 s.mark_lazy_fetch_result_tab_closed(*session_id);
-                s.result_tabs.abort_lazy_fetch_session(*session_id);
+                result_workspace_to_cleanup.abort_lazy_fetch_session(*session_id);
             }
             if !lazy_fetch_sessions.is_empty() {
                 s.refresh_result_edit_controls();
             }
             s.editor_tabs.remove(index);
+            s.pending_metadata_refresh_tabs.remove(&tab_id);
             s.finish_progress_context(tab_id);
             s.pending_query_cancellations
                 .retain(|token, _| token.tab_id != tab_id);
+            s.result_grid_execution_targets.remove(&tab_id);
 
             let mut created_tab_id = None;
             let mut deferred_display_tab_id = None;
             if s.editor_tabs.is_empty() {
-                created_tab_id =
-                    MainWindow::create_query_editor_tab_with_display_stabilization(&mut s, false);
+                created_tab_id = MainWindow::
+                    create_query_editor_tab_for_selected_database_with_display_stabilization(
+                        &mut s, false,
+                    );
             }
 
             let next_tab_id = created_tab_id
@@ -6581,6 +7194,8 @@ impl MainWindow {
                 }
             }
 
+            result_workspace_to_cleanup.delete_workspace();
+
             s.right_tile.redraw();
             app::redraw();
 
@@ -6595,6 +7210,8 @@ impl MainWindow {
                 lazy_fetch_sessions,
                 deferred_display_tab_id,
                 was_active,
+                removed_connection_id,
+                s.connection_registry.clone(),
             )
         };
 
@@ -6605,6 +7222,17 @@ impl MainWindow {
             );
         }
         editor_to_cleanup.cleanup_for_close();
+        drop(editor_to_cleanup);
+
+        if let Some(connection_id) = removed_connection_id {
+            if connection_registry.remove_transient_if_idle(connection_id) {
+                state
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .object_browser
+                    .remove_runtime(connection_id);
+            }
+        }
 
         if let Some(tab_id) = created_tab_id {
             if let Some(schema_sender) = schema_sender {
@@ -6648,6 +7276,7 @@ impl MainWindow {
         data: IntellisenseData,
         highlight_data: HighlightData,
     ) {
+        let active_connection_id = state.active_connection_id();
         let mut combined_highlight = highlight_data.clone();
         let columns_from_intellisense = Self::collect_highlight_columns(&data);
         if !columns_from_intellisense.is_empty() {
@@ -6664,15 +7293,37 @@ impl MainWindow {
             }
         }
 
+        let data_for_tabs = data.clone();
         *state
             .schema_intellisense_data
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = data;
         state.schema_highlight_data = combined_highlight;
-        for tab in &mut state.editor_tabs {
+        let target_tab_ids = state
+            .editor_tabs
+            .iter()
+            .filter(|tab| {
+                active_connection_id.map_or(tab.tab_id == state.active_editor_tab_id, |id| {
+                    tab.connection_binding.snapshot().connection_id() == Some(id)
+                })
+            })
+            .map(|tab| tab.tab_id)
+            .collect::<Vec<_>>();
+        for tab in state
+            .editor_tabs
+            .iter_mut()
+            .filter(|tab| target_tab_ids.contains(&tab.tab_id))
+        {
+            *tab.intellisense_data
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()) = data_for_tabs.clone();
+            tab.highlight_data = state.schema_highlight_data.clone();
             tab.sql_editor
                 .update_highlight_data_deferred(state.schema_highlight_data.clone());
         }
+        state
+            .pending_metadata_refresh_tabs
+            .retain(|tab_id| !target_tab_ids.contains(tab_id));
         state
             .sql_editor
             .update_highlight_data_deferred(state.schema_highlight_data.clone());
@@ -6795,6 +7446,24 @@ impl MainWindow {
             == 1
     }
 
+    fn schema_update_matches_target(
+        update: &SchemaUpdate,
+        target: &ActiveSchemaUpdateTarget,
+    ) -> bool {
+        update.query_tab_id == target.query_tab_id
+            && update.connection_id == target.connection_id
+            && update.connection_generation == target.connection_generation
+            && update.binding_revision == target.binding_revision
+            && update.request_id == target.request_id
+            && update.db_type.is_same_type_as(target.db_type)
+            && Self::schema_update_scope_matches(
+                update.db_type,
+                update.requested_scope.as_deref(),
+                target.scope.as_deref(),
+                &update.data.users,
+            )
+    }
+
     fn metadata_pool_session_context(
         connection: &SharedConnection,
         activity: &str,
@@ -6811,13 +7480,19 @@ impl MainWindow {
     fn load_schema_update_from_pool_context(
         context: crate::db::DbPoolSessionContext,
         requested_scope: Option<String>,
+        query_tab_id: QueryTabId,
+        connection_id: ConnectionId,
+        binding_revision: u64,
+        request_id: u64,
     ) -> Option<SchemaUpdate> {
         context.ensure_current().ok()?;
         let connection_generation = context.connection_generation;
         let db_type = context.connection_info.db_type;
         let activity = db_type.metadata_refresh_activity(requested_scope.as_deref());
-        let _activity_guard = crate::db::track_pool_db_activity(activity, db_type);
-        let data = schema_metadata_loader_for(db_type).load(context.clone(), requested_scope)?;
+        let _activity_guard =
+            crate::db::track_pool_db_activity_for_connection(activity, db_type, connection_id);
+        let data =
+            schema_metadata_loader_for(db_type).load(context.clone(), requested_scope.clone())?;
         context.ensure_current().ok()?;
 
         let mut highlight_data = HighlightData::new();
@@ -6840,14 +7515,15 @@ impl MainWindow {
         highlight_data.columns = MainWindow::collect_highlight_columns(&data);
 
         Some(SchemaUpdate {
-            selected_scope: data
-                .default_qualifier_name()
-                .or_else(|| data.default_qualifier())
-                .map(str::to_string),
+            query_tab_id,
+            connection_id,
             data,
             highlight_data,
             connection_generation,
+            binding_revision,
+            request_id,
             db_type,
+            requested_scope,
         })
     }
 
@@ -6860,11 +7536,31 @@ impl MainWindow {
             return false;
         };
 
-        let selected_scope = state.object_browser.selected_scope();
+        let Some((query_tab_id, binding_snapshot)) = state
+            .editor_tabs
+            .iter()
+            .find(|tab| tab.tab_id == state.active_editor_tab_id)
+            .map(|tab| (tab.tab_id, tab.connection_binding.snapshot()))
+        else {
+            clear_mutex_flag_if_token(&state.schema_refresh_in_progress, schema_refresh_token);
+            return false;
+        };
+        let Some(runtime) = binding_snapshot.runtime else {
+            clear_mutex_flag_if_token(&state.schema_refresh_in_progress, schema_refresh_token);
+            return false;
+        };
+        let connection_id = runtime.id();
+        let binding_revision = binding_snapshot.revision;
+        let selected_scope = binding_snapshot.scope;
+        state.latest_schema_request_id = schema_refresh_token;
+        state
+            .object_browser
+            .set_selected_scope(selected_scope.clone());
         let Some(context) = Self::metadata_pool_session_context(
-            &state.connection,
+            &runtime.connection(),
             "Preparing schema metadata refresh",
-        ) else {
+        )
+        .map(|context| context.for_scope(selected_scope.as_deref())) else {
             clear_mutex_flag_if_token(&state.schema_refresh_in_progress, schema_refresh_token);
             return false;
         };
@@ -6878,7 +7574,14 @@ impl MainWindow {
             let _schema_refresh_guard =
                 MutexFlagClearGuard::new(schema_refresh_guard, schema_refresh_token);
             let load_result = panic::catch_unwind(AssertUnwindSafe(|| {
-                MainWindow::load_schema_update_from_pool_context(context, selected_scope)
+                MainWindow::load_schema_update_from_pool_context(
+                    context,
+                    selected_scope,
+                    query_tab_id,
+                    connection_id,
+                    binding_revision,
+                    schema_refresh_token,
+                )
             }));
             match load_result {
                 Ok(Some(update)) => {
@@ -6900,10 +7603,26 @@ impl MainWindow {
     }
 
     fn start_object_browser_metadata_refresh(state: &mut AppState) -> bool {
+        let Some(binding_snapshot) = state
+            .editor_tabs
+            .iter()
+            .find(|tab| tab.tab_id == state.active_editor_tab_id)
+            .map(|tab| tab.connection_binding.snapshot())
+        else {
+            return false;
+        };
+        let Some(runtime) = binding_snapshot.runtime else {
+            return false;
+        };
+        let selected_scope = binding_snapshot.scope;
+        state
+            .object_browser
+            .set_selected_scope(selected_scope.clone());
         let Some(context) = Self::metadata_pool_session_context(
-            &state.connection,
+            &runtime.connection(),
             "Preparing object browser metadata refresh",
-        ) else {
+        )
+        .map(|context| context.for_scope(selected_scope.as_deref())) else {
             return false;
         };
         state.object_browser.refresh_with_context(context)
@@ -6921,11 +7640,141 @@ impl MainWindow {
         Self::start_connection_metadata_refresh(state, schema_sender)
     }
 
+    fn configure_result_workspace_callbacks(state: &Arc<Mutex<AppState>>, tab_id: QueryTabId) {
+        let Some(mut result_tabs) = state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .result_tabs_for_tab(tab_id)
+        else {
+            return;
+        };
+
+        let weak_state_for_change = Arc::downgrade(state);
+        result_tabs.set_on_change(move || {
+            let Some(state_for_change) = weak_state_for_change.upgrade() else {
+                return;
+            };
+            if let Ok(mut state) = state_for_change.try_lock() {
+                if state.active_editor_tab_id == tab_id {
+                    state.refresh_result_edit_controls();
+                }
+            };
+        });
+
+        let weak_state_for_grid_edit = Arc::downgrade(state);
+        let result_tabs_for_grid_edit = result_tabs.clone();
+        let grid_edit_callback: ResultGridSqlExecuteCallback = Arc::new(Mutex::new(Some(
+            Box::new(move |sql: String| {
+                let Some(state_for_grid_edit) = weak_state_for_grid_edit.upgrade() else {
+                    return Err("Main window is no longer available.".to_string());
+                };
+                let mut state = state_for_grid_edit
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                let editor = state
+                    .editor_tabs
+                    .iter()
+                    .find(|tab| tab.tab_id == tab_id)
+                    .map(|tab| tab.sql_editor.clone())
+                    .ok_or_else(|| "The owning query tab is closed.".to_string())?;
+                if editor.is_query_running() {
+                    return Err("The owning query tab is already running a query.".to_string());
+                }
+                if !state.result_origin_is_current_for_tab(tab_id, &result_tabs_for_grid_edit) {
+                    return Err(
+                        "This result belongs to an older connection, reconnect, or scope and is read-only."
+                            .to_string(),
+                    );
+                }
+                let target_tab = result_tabs_for_grid_edit
+                    .active_result_id()
+                    .ok_or_else(|| "Open a result tab first.".to_string())?;
+                state
+                    .result_grid_execution_targets
+                    .insert(tab_id, target_tab);
+                editor.execute_sql_text(&sql);
+                if !editor.is_query_running() {
+                    state.result_grid_execution_targets.remove(&tab_id);
+                    return Err("Failed to start query execution for result-grid edit.".to_string());
+                }
+                Ok(())
+            }) as Box<dyn FnMut(String) -> Result<(), String>>,
+        )));
+        result_tabs.set_execute_sql_callback(grid_edit_callback);
+
+        let weak_state_for_lazy_fetch = Arc::downgrade(state);
+        let lazy_fetch_callback = Arc::new(Mutex::new(Some(Box::new(move |session_id, request| {
+            let Some(state_for_lazy_fetch) = weak_state_for_lazy_fetch.upgrade() else {
+                return false;
+            };
+            AppState::request_lazy_fetch_on_editors(&state_for_lazy_fetch, session_id, request)
+        })
+            as Box<dyn FnMut(u64, crate::ui::sql_editor::LazyFetchRequest) -> bool>)));
+        result_tabs.set_lazy_fetch_callback(lazy_fetch_callback);
+
+        let weak_state_for_close = Arc::downgrade(state);
+        result_tabs.set_on_close(move |target| {
+            let Some(state_for_close) = weak_state_for_close.upgrade() else {
+                return;
+            };
+            {
+                let mut state = state_for_close
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                if state.active_editor_tab_id != tab_id {
+                    state.activate_editor_tab(tab_id);
+                }
+            }
+            MainWindow::close_result_tab_by_target(&state_for_close, target);
+        });
+
+        let file_sender = state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .file_sender
+            .clone();
+        if let Some(file_sender) = file_sender {
+            let weak_state_for_context = Arc::downgrade(state);
+            let callback = Arc::new(Mutex::new(Some(Box::new(
+                move |action: ResultTableContextAction| {
+                    let Some(state_for_context) = weak_state_for_context.upgrade() else {
+                        return;
+                    };
+                    {
+                        let mut state = state_for_context
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner());
+                        if state.active_editor_tab_id != tab_id {
+                            state.activate_editor_tab(tab_id);
+                        }
+                    }
+                    match action {
+                        ResultTableContextAction::ExportCsv => {
+                            MainWindow::export_current_results_to_csv(
+                                &state_for_context,
+                                &file_sender,
+                            );
+                        }
+                        ResultTableContextAction::Close => {
+                            MainWindow::close_current_result_tab(&state_for_context);
+                        }
+                        ResultTableContextAction::CloseAll => {
+                            MainWindow::close_all_result_tabs(&state_for_context);
+                        }
+                    }
+                },
+            )
+                as Box<dyn FnMut(ResultTableContextAction)>)));
+            result_tabs.set_context_action_callback(callback);
+        }
+    }
+
     fn attach_editor_callbacks(
         state: &Arc<Mutex<AppState>>,
         tab_id: QueryTabId,
         schema_sender: std::sync::mpsc::Sender<SchemaUpdate>,
     ) {
+        Self::configure_result_workspace_callbacks(state, tab_id);
         let Some(mut editor) = state
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -6945,6 +7794,9 @@ impl MainWindow {
             let mut s = state_for_execute
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if s.active_editor_tab_id != tab_id {
+                return;
+            }
             let base_msg = if query_result.success {
                 format!(
                     "{} | Time: {:.3}s",
@@ -6968,7 +7820,7 @@ impl MainWindow {
             let mut s = state_for_result_tab
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
-            s.append_result_tab_request(request);
+            s.append_result_tab_request_for_tab(tab_id, request);
         });
 
         let weak_state_for_status = Arc::downgrade(state);
@@ -6977,7 +7829,9 @@ impl MainWindow {
                 return;
             };
             if let Ok(mut s) = state_for_status.try_lock() {
-                s.set_status_message(message);
+                if s.active_editor_tab_id == tab_id {
+                    s.set_status_message(message);
+                }
             };
         });
 
@@ -7055,9 +7909,12 @@ impl MainWindow {
             let mut s = state_for_progress
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let Some(mut owning_result_tabs) = s.result_tabs_for_tab(tab_id) else {
+                return;
+            };
             let (progress, operation_token) = match progress {
                 QueryProgress::Operation { token, progress } => {
-                    if !s.operation_progress_matches(tab_id, token, &progress) {
+                    if !s.operation_progress_matches(tab_id, token, progress.inner()) {
                         return;
                     }
                     (*progress, Some(token))
@@ -7066,7 +7923,9 @@ impl MainWindow {
                     if s.operation_abandoned_matches(tab_id, token)
                         && s.mark_operation_abandoned_cancelled(tab_id, token)
                     {
-                        s.set_status_message(ResultTabStatus::Cancelled.status_bar_message());
+                        if s.should_show_progress_status_for_tab(tab_id) {
+                            s.set_status_message(ResultTabStatus::Cancelled.status_bar_message());
+                        }
                         s.refresh_result_edit_controls();
                         s.sync_transaction_mode_controls();
                         s.schedule_cursor_reset_when_tab_is_idle(tab_id);
@@ -7083,6 +7942,15 @@ impl MainWindow {
                     if token_matches_editor && s.clear_query_cancel_request(token) {
                         s.refresh_result_edit_controls();
                     }
+                    s.refresh_tab_label(tab_id);
+                    drop(s);
+                    let state_for_transient_cleanup = state_for_progress.clone();
+                    crate::ui::ui_timeout::schedule(0.0, move || {
+                        state_for_transient_cleanup
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner())
+                            .remove_idle_transient_runtimes();
+                    });
                     return;
                 }
                 QueryProgress::CancelOutcome { token, outcome } => {
@@ -7099,14 +7967,26 @@ impl MainWindow {
                 }
                 progress => (progress, None),
             };
+            let (progress, statement_origin) = match progress {
+                QueryProgress::StatementOrigin { origin, progress } => {
+                    (*progress, Some(origin))
+                }
+                progress => (progress, None),
+            };
+            if let Some(origin) = statement_origin {
+                owning_result_tabs.set_execution_origin(Some(origin));
+            }
             match progress {
                 QueryProgress::Operation { .. } => {}
+                QueryProgress::StatementOrigin { .. } => {}
                 QueryProgress::OperationAbandoned { token } => {
                     if operation_token == Some(token)
                         && s.operation_abandoned_matches(tab_id, token)
                         && s.mark_operation_abandoned_cancelled(tab_id, token)
                     {
-                        s.set_status_message(ResultTabStatus::Cancelled.status_bar_message());
+                        if s.should_show_progress_status_for_tab(tab_id) {
+                            s.set_status_message(ResultTabStatus::Cancelled.status_bar_message());
+                        }
                         s.refresh_result_edit_controls();
                         s.sync_transaction_mode_controls();
                         s.schedule_cursor_reset_when_tab_is_idle(tab_id);
@@ -7131,37 +8011,43 @@ impl MainWindow {
                     total_units,
                     status_activity,
                 } => {
-                    let has_live_connection = s.has_live_connection;
-                    let has_running_queries = s.sql_editor.is_query_running()
-                        || s.editor_tabs
-                            .iter()
-                            .any(|tab| tab.sql_editor.is_query_running());
-                    if should_ignore_query_progress_when_disconnected(
-                        has_live_connection,
-                        has_running_queries,
-                    ) {
-                        return;
-                    }
+                    let execution_origin = s
+                        .editor_tabs
+                        .iter()
+                        .find(|tab| tab.tab_id == tab_id)
+                        .and_then(|tab| tab.connection_binding.snapshot().execution_origin());
+                    owning_result_tabs.set_execution_origin(execution_origin);
+                    s.refresh_tab_label(tab_id);
                     let one_tab_per_query = s.result_one_tab_per_query_check.value();
+                    let grid_execution_target =
+                        s.result_grid_execution_targets.get(&tab_id).copied();
                     let lazy_fetch_sessions = if !one_tab_per_query
-                        && s.result_grid_execution_target.is_none()
+                        && grid_execution_target.is_none()
                     {
-                        s.clear_result_grids_for_new_query_batch()
+                        s.clear_result_grids_for_new_query_batch(tab_id)
                     } else {
                         Vec::new()
                     };
-                    let db_type = s
-                        .connection_info
-                        .lock()
-                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    let runtime = s
+                        .editor_tabs
+                        .iter()
+                        .find(|tab| tab.tab_id == tab_id)
+                        .and_then(|tab| tab.connection_binding.snapshot().runtime);
+                    let db_type = runtime
                         .as_ref()
-                        .map(|info| info.db_type);
+                        .map(|runtime| runtime.sanitized_info().db_type);
+                    let connection_id = runtime.as_ref().map(|runtime| runtime.id());
                     let mut context = QueryProgressContext::new(
-                        s.result_grid_execution_target,
+                        grid_execution_target,
                         activity,
                         operation_token,
                     );
-                    context.start_status_tracking(total_units, db_type, status_activity);
+                    context.start_status_tracking(
+                        total_units,
+                        db_type,
+                        connection_id,
+                        status_activity,
+                    );
                     if s.query_cancel_is_dispatched(operation_token) {
                         context.state_label = ResultTabStatus::Canceling.label().to_string();
                     }
@@ -7180,18 +8066,7 @@ impl MainWindow {
                     index,
                     result_tab_policy,
                 } => {
-                    let has_live_connection = s.has_live_connection;
-                    let has_running_queries = s.sql_editor.is_query_running()
-                        || s.editor_tabs
-                            .iter()
-                            .any(|tab| tab.sql_editor.is_query_running());
-                    if should_ignore_query_progress_when_disconnected(
-                        has_live_connection,
-                        has_running_queries,
-                    ) {
-                        return;
-                    }
-                    let mut result_tabs = s.result_tabs.clone();
+                    let mut result_tabs = owning_result_tabs.clone();
                     let query_canceling_pending = s.query_cancel_is_dispatched(operation_token);
                     let (result_tab_id, status, select_tab) = {
                         let Some(context) = s.progress_contexts.get_mut(&tab_id) else {
@@ -7234,18 +8109,7 @@ impl MainWindow {
                     if columns.is_empty() {
                         return;
                     }
-                    let has_live_connection = s.has_live_connection;
-                    let has_running_queries = s.sql_editor.is_query_running()
-                        || s.editor_tabs
-                            .iter()
-                            .any(|tab| tab.sql_editor.is_query_running());
-                    if should_ignore_query_progress_when_disconnected(
-                        has_live_connection,
-                        has_running_queries,
-                    ) {
-                        return;
-                    }
-                    let mut result_tabs = s.result_tabs.clone();
+                    let mut result_tabs = owning_result_tabs.clone();
                     let pending_canceling_sessions =
                         s.pending_lazy_fetch_canceling_sessions.clone();
                     let (result_tab_id, lazy_fetch_session, preserve_canceling, select_tab) = {
@@ -7296,7 +8160,7 @@ impl MainWindow {
                         return;
                     };
                     let rows_len = rows.len();
-                    let mut result_tabs = s.result_tabs.clone();
+                    let mut result_tabs = owning_result_tabs.clone();
                     let pending_canceling_sessions =
                         s.pending_lazy_fetch_canceling_sessions.clone();
                     let Some(context) = s.progress_contexts.get_mut(&tab_id) else {
@@ -7366,7 +8230,7 @@ impl MainWindow {
                     ) {
                         return;
                     }
-                    let mut result_tabs = s.result_tabs.clone();
+                    let mut result_tabs = owning_result_tabs.clone();
                     let preserve_canceling = s.lazy_fetch_canceling_is_pending(session_id);
                     let (result_tab_id, select_tab) = {
                         let Some(context) = s.progress_contexts.get_mut(&tab_id) else {
@@ -7430,7 +8294,7 @@ impl MainWindow {
                     } else {
                         return;
                     };
-                    let mut result_tabs = s.result_tabs.clone();
+                    let mut result_tabs = owning_result_tabs.clone();
                     if preserve_canceling {
                         if should_show_status {
                             s.set_status_message(&format!(
@@ -7449,7 +8313,7 @@ impl MainWindow {
                     }
                 }
                 QueryProgress::LazyFetchCanceling { session_id } => {
-                    let should_show_status = !s.is_any_query_running();
+                    let should_show_status = s.should_show_progress_status_for_tab(tab_id);
                     if s.mark_lazy_fetch_canceling(session_id) {
                         if should_show_status {
                             s.set_status_message(&format!(
@@ -7470,7 +8334,7 @@ impl MainWindow {
                     }
                     crate::utils::logging::log_error("lazy fetch cancel", &message);
                     if failure_is_current {
-                        let mut result_tabs = s.result_tabs.clone();
+                        let mut result_tabs = owning_result_tabs.clone();
                         drop(s);
                         result_tabs.append_message_lines(
                             ResultMessageKind::Error,
@@ -7569,7 +8433,7 @@ impl MainWindow {
                     let Some(result_tab_id) = result_tab_id else {
                         return;
                     };
-                    let mut result_tabs = s.result_tabs.clone();
+                    let mut result_tabs = owning_result_tabs.clone();
                     drop(s);
                     if should_abort_result_tab {
                         result_tabs.abort_lazy_fetch_session(session_id);
@@ -7593,7 +8457,7 @@ impl MainWindow {
                             && should_select_support_result_pane(
                                 s.progress_contexts.get(&tab_id),
                             );
-                    let mut result_tabs = s.result_tabs.clone();
+                    let mut result_tabs = owning_result_tabs.clone();
                     drop(s);
                     result_tabs.append_script_output_lines(&lines);
                     if should_select {
@@ -7606,7 +8470,7 @@ impl MainWindow {
                             && should_select_support_result_pane(
                                 s.progress_contexts.get(&tab_id),
                             );
-                    let mut result_tabs = s.result_tabs.clone();
+                    let mut result_tabs = owning_result_tabs.clone();
                     drop(s);
                     result_tabs.append_dbms_output_lines(&lines);
                     if should_select {
@@ -7617,7 +8481,7 @@ impl MainWindow {
                     let should_select_info = kind == ResultMessageKind::Info
                         && !lines.is_empty()
                         && should_select_support_result_pane(s.progress_contexts.get(&tab_id));
-                    let mut result_tabs = s.result_tabs.clone();
+                    let mut result_tabs = owning_result_tabs.clone();
                     drop(s);
                     result_tabs.append_message_lines(kind, &lines);
                     if kind == ResultMessageKind::Error {
@@ -7627,13 +8491,13 @@ impl MainWindow {
                     }
                 }
                 QueryProgress::ExplainPlanOutput { text } => {
-                    let mut result_tabs = s.result_tabs.clone();
+                    let mut result_tabs = owning_result_tabs.clone();
                     drop(s);
                     result_tabs.append_explain_plan_tab(&text);
                 }
                 QueryProgress::PromptInput { .. } => {}
                 QueryProgress::RequestCancelOldestLazyFetchForSessionPool { response } => {
-                    if let Some(session_id) = s.oldest_lazy_fetch_session() {
+                    if let Some(session_id) = s.oldest_lazy_fetch_session_for_tab(tab_id) {
                         drop(s);
                         let requested = request_lazy_fetch_cancel_for_session_pool(
                             &state_for_progress,
@@ -7646,7 +8510,7 @@ impl MainWindow {
                     }
                 }
                 QueryProgress::NotifyCancelOldestLazyFetchForSessionPool => {
-                    if let Some(session_id) = s.oldest_lazy_fetch_session() {
+                    if let Some(session_id) = s.oldest_lazy_fetch_session_for_tab(tab_id) {
                         drop(s);
                         let _ = request_lazy_fetch_cancel_for_session_pool(
                             &state_for_progress,
@@ -7655,88 +8519,78 @@ impl MainWindow {
                     }
                 }
                 QueryProgress::AutoCommitChanged { enabled } => {
-                    s.set_status_message(auto_commit_changed_progress_status(enabled));
+                    if s.should_show_progress_status_for_tab(tab_id) {
+                        s.set_status_message(auto_commit_changed_progress_status(enabled));
+                    }
                     drop(s);
                 }
                 QueryProgress::ConnectionChanged { info } => {
                     if let Some(info) = info {
-                        let lazy_fetch_sessions =
-                            s.abort_lazy_fetch_result_tabs_for_connection_transition();
-                        clear_mutex_flag(&s.schema_refresh_in_progress);
-                        s.release_all_pooled_db_sessions();
-                        let has_running_queries = s.sql_editor.is_query_running()
-                            || s.editor_tabs
-                                .iter()
-                                .any(|tab| tab.sql_editor.is_query_running());
-                        *s.connection_info
-                            .lock()
-                            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(info.clone());
-                        s.has_live_connection = true;
-                        s.object_browser.reset_selected_scope();
-                        s.set_status_message(&format!("Connected | {}", info.name));
-                        s.sync_transaction_mode_controls_for_connected_db(info.db_type);
-                        s.sql_editor.focus();
-                        s.refresh_connection_dependent_controls();
-                        s.sync_transaction_mode_controls();
-                        if has_running_queries {
-                            // CONNECT can appear mid-script. Deferring metadata fetch prevents
-                            // object-browser/schema workers from competing with the active batch.
-                            s.pending_connection_metadata_refresh = true;
-                        } else {
-                            let started = MainWindow::start_connection_metadata_refresh(
-                                &mut s,
-                                &schema_sender_for_progress,
-                            );
-                            s.update_pending_metadata_refresh_after_start_attempt(started);
+                        if let Some(runtime) = s
+                            .editor_tabs
+                            .iter()
+                            .find(|tab| tab.tab_id == tab_id)
+                            .and_then(|tab| tab.connection_binding.snapshot().runtime)
+                        {
+                            runtime.update_sanitized_info(info.clone());
+                            runtime.set_state(ConnectionRuntimeState::Connected);
+                            s.object_browser.add_runtime(runtime.clone());
+                            s.synchronize_scope_for_connection(runtime.id(), None);
+                            if s.active_editor_tab_id == tab_id {
+                                s.object_browser
+                                    .set_active_connection(Some(runtime.id()));
+                            }
                         }
-                        drop(s);
-                        for session_id in lazy_fetch_sessions {
-                            AppState::request_lazy_fetch_on_editors(
-                                &state_for_progress,
-                                session_id,
-                                crate::ui::sql_editor::LazyFetchRequest::CancelAndDiscard,
-                            );
+                        if s.active_editor_tab_id == tab_id {
+                            let _ = s.set_active_editor_tab(tab_id);
+                            s.set_status_message(&format!("Connected | {}", info.name));
                         }
+                        // CONNECT can appear mid-script. Deferring metadata fetch prevents
+                        // metadata workers from competing with the active batch.
+                        s.mark_metadata_refresh_pending(tab_id);
+                        let origin = s
+                            .editor_tabs
+                            .iter()
+                            .find(|tab| tab.tab_id == tab_id)
+                            .and_then(|tab| {
+                                tab.connection_binding.snapshot().execution_origin()
+                            });
+                        owning_result_tabs.set_execution_origin(origin);
+                        s.refresh_tab_label(tab_id);
                     } else {
-                        let lazy_fetch_sessions =
-                            Self::transition_to_disconnected_state(&mut s, None);
-                        drop(s);
-                        for session_id in lazy_fetch_sessions {
-                            AppState::request_lazy_fetch_on_editors(
-                                &state_for_progress,
-                                session_id,
-                                crate::ui::sql_editor::LazyFetchRequest::CancelAndDiscard,
-                            );
+                        owning_result_tabs.set_execution_origin(None);
+                        if s.active_editor_tab_id == tab_id {
+                            let _ = s.set_active_editor_tab(tab_id);
+                            s.set_status_message("Query tab detached");
                         }
+                        s.refresh_tab_label(tab_id);
                     }
+                    drop(s);
                 }
                 QueryProgress::DatabaseChanged { info } => {
                     let database = info.service_name.trim().to_string();
-                    if database.is_empty() || !s.scope_matches_current_connection(&database) {
-                        drop(s);
-                        return;
-                    }
-                    let has_running_queries = s.sql_editor.is_query_running()
-                        || s.editor_tabs
+                    let mut retained_scope_update = None;
+                    if !database.is_empty() {
+                        let connection_id = s
+                            .editor_tabs
                             .iter()
-                            .any(|tab| tab.sql_editor.is_query_running());
-                    *s.connection_info
-                        .lock()
-                        .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(info.clone());
-                    s.has_live_connection = true;
-                    s.object_browser.set_selected_scope(Some(database.clone()));
-                    let retained_scope_update = s.retained_scope_update(Some(database.clone()));
-                    s.set_status_message(&format!("Database selected | {}", database));
-                    s.refresh_connection_dependent_controls();
-                    s.sync_transaction_mode_controls();
-                    if has_running_queries {
-                        s.pending_connection_metadata_refresh = true;
-                    } else {
-                        let started = MainWindow::start_connection_metadata_refresh_for_scope_change(
-                            &mut s,
-                            &schema_sender_for_progress,
-                        );
-                        s.update_pending_metadata_refresh_after_start_attempt(started);
+                            .find(|tab| tab.tab_id == tab_id)
+                            .and_then(|tab| tab.connection_binding.snapshot().connection_id());
+                        if let Some(connection_id) = connection_id {
+                            let selected_scope = Some(database.clone());
+                            if s.synchronize_scope_for_connection(
+                                connection_id,
+                                selected_scope.clone(),
+                            ) {
+                                retained_scope_update = s.retained_scope_update_for_connection(
+                                    connection_id,
+                                    selected_scope,
+                                );
+                            }
+                        }
+                        if s.active_editor_tab_id == tab_id {
+                            s.set_status_message(&format!("Database selected | {}", database));
+                        }
                     }
                     drop(s);
                     if let Some(message) = retained_scope_update
@@ -7744,7 +8598,7 @@ impl MainWindow {
                         .and_then(|outcomes| first_retained_outcome_message(&outcomes))
                     {
                         crate::ui::alert_on_main(&format!(
-                            "Scope was changed, but a retained session could not be updated: \n{}",
+                            "Database changed for this connection, but a retained tab session could not be updated:\n{}",
                             message
                         ));
                     }
@@ -7753,46 +8607,48 @@ impl MainWindow {
                     message,
                     selected_scope,
                 } => {
-                    let retained_scope_update = if let Some(scope) = selected_scope
+                    let selected_scope = selected_scope
                         .map(|scope| scope.trim().to_string())
-                        .filter(|scope| !scope.is_empty())
-                    {
-                        if !s.scope_matches_current_connection(&scope) {
-                            drop(s);
-                            return;
-                        }
-                        s.object_browser.set_selected_scope(Some(scope.clone()));
-                        s.retained_scope_update(Some(scope))
-                    } else {
-                        None
-                    };
-                    let status = message.lines().next().unwrap_or(&message).to_string();
-                    s.set_status_message(&status);
+                        .filter(|scope| !scope.is_empty());
+                    let connection_id = s
+                        .editor_tabs
+                        .iter()
+                        .find(|tab| tab.tab_id == tab_id)
+                        .and_then(|tab| tab.connection_binding.snapshot().connection_id());
+                    let retained_scope_update = connection_id.and_then(|connection_id| {
+                        s.synchronize_scope_for_connection(
+                            connection_id,
+                            selected_scope.clone(),
+                        );
+                        s.retained_scope_update_for_connection(
+                            connection_id,
+                            selected_scope.clone(),
+                        )
+                    });
+                    let origin = s
+                        .editor_tabs
+                        .iter()
+                        .find(|tab| tab.tab_id == tab_id)
+                        .and_then(|tab| tab.connection_binding.snapshot().execution_origin());
+                    owning_result_tabs.set_execution_origin(origin);
+                    if s.active_editor_tab_id == tab_id {
+                        let status = message.lines().next().unwrap_or(&message).to_string();
+                        s.set_status_message(&status);
+                    }
                     drop(s);
                     if let Some(message) = retained_scope_update
                         .map(apply_retained_scope_update)
                         .and_then(|outcomes| first_retained_outcome_message(&outcomes))
                     {
                         crate::ui::alert_on_main(&format!(
-                            "Scope was changed, but a retained session could not be updated: \n{}",
+                            "Scope changed for this connection, but a retained tab session could not be updated:\n{}",
                             message
                         ));
                     }
                 }
                 QueryProgress::StatementFinished { index, result, .. } => {
                     let should_display_data_grid = should_display_result_in_data_grid(&result);
-                    let has_live_connection = s.has_live_connection;
-                    let has_running_queries = s.sql_editor.is_query_running()
-                        || s.editor_tabs
-                            .iter()
-                            .any(|tab| tab.sql_editor.is_query_running());
-                    if should_ignore_query_progress_when_disconnected(
-                        has_live_connection,
-                        has_running_queries,
-                    ) {
-                        return;
-                    }
-                    let mut result_tabs = s.result_tabs.clone();
+                    let mut result_tabs = owning_result_tabs.clone();
                     let (
                         result_tab_id,
                         script_transcript,
@@ -7935,16 +8791,18 @@ impl MainWindow {
                     if let Some(token) = operation_token {
                         s.clear_query_cancel_request(token);
                     }
-                    s.set_status_message(&message);
+                    if s.should_show_progress_status_for_tab(tab_id) {
+                        s.set_status_message(&message);
+                    }
                     s.refresh_result_edit_controls();
                     s.sync_transaction_mode_controls();
                 }
                 QueryProgress::MetadataRefreshNeeded => {
-                    if s.has_live_connection
-                        && (s.is_any_query_running() || !s.progress_contexts.is_empty())
+                    s.mark_metadata_refresh_pending(tab_id);
+                    if s.active_editor_tab_id == tab_id
+                        && s.has_live_connection
+                        && !s.has_running_query_or_lazy_fetch_for_tab(tab_id)
                     {
-                        s.pending_connection_metadata_refresh = true;
-                    } else {
                         let started = MainWindow::start_connection_metadata_refresh(
                             &mut s,
                             &schema_sender_for_progress,
@@ -7965,9 +8823,14 @@ impl MainWindow {
                                 last_completed_operation_id,
                             )
                         });
-                    let current_connection_generation =
-                        crate::db::try_lock_connection(&s.connection)
-                            .map(|connection| connection.connection_generation());
+                    let current_connection_generation = s
+                        .find_tab_index(tab_id)
+                        .and_then(|index| s.editor_tabs.get(index))
+                        .and_then(|tab| tab.connection_binding.snapshot().connection())
+                        .and_then(|connection| {
+                            crate::db::try_lock_connection(&connection)
+                                .map(|connection| connection.connection_generation())
+                        });
                     // ExecutionFinished can update status text after cleanup.
                     // This status-only path must neither block on the connection
                     // mutex nor apply an old connection's completion after a
@@ -8077,57 +8940,53 @@ impl MainWindow {
                             })
                         })
                     };
-                    if let Some(tab_id) = canceling_tab_id {
-                        s.result_tabs.mark_statement_cancelled_by_id(tab_id);
+                    if let Some(result_tab_id) = canceling_tab_id {
+                        owning_result_tabs.mark_statement_cancelled_by_id(result_tab_id);
                     }
                     s.finish_progress_context(tab_id);
-                    let has_running_queries = s.sql_editor.is_query_running()
-                        || s.editor_tabs
-                            .iter()
-                            .any(|tab| tab.sql_editor.is_query_running());
+                    let should_trim = !s.is_any_query_running();
+                    let mut result_tabs = owning_result_tabs.clone();
+                    drop(s);
 
-                    if should_run_global_batch_cleanup(has_running_queries) {
-                        let mut result_tabs = s.result_tabs.clone();
-                        drop(s);
+                    result_tabs.finish_non_lazy_streaming();
+                    let recovered_save_states = result_tabs.clear_orphaned_save_requests();
+                    let recovered_edit_states = result_tabs.clear_orphaned_query_edit_backups();
 
-                        result_tabs.finish_non_lazy_streaming();
-                        let recovered_save_states = result_tabs.clear_orphaned_save_requests();
-                        let recovered_edit_states = result_tabs.clear_orphaned_query_edit_backups();
-
-                        let mut s = state_for_progress
-                            .lock()
-                            .unwrap_or_else(|poisoned| poisoned.into_inner());
-                        s.result_grid_execution_target = None;
-                        if s.pending_connection_metadata_refresh && s.has_live_connection {
-                            let started = MainWindow::start_connection_metadata_refresh(
-                                &mut s,
-                                &schema_sender_for_progress,
-                            );
-                            s.update_pending_metadata_refresh_after_start_attempt(started);
-                        }
+                    let mut s = state_for_progress
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    s.result_grid_execution_targets.remove(&tab_id);
+                    if s.active_editor_tab_id == tab_id
+                        && s.pending_connection_metadata_refresh
+                        && s.has_live_connection
+                    {
+                        let started = MainWindow::start_connection_metadata_refresh(
+                            &mut s,
+                            &schema_sender_for_progress,
+                        );
+                        s.update_pending_metadata_refresh_after_start_attempt(started);
+                    }
+                    if should_trim {
                         // Query execution completed and large temporary buffers may
                         // have been released during result materialization.
                         malloc_trim_process();
-                        if recovered_save_states > 0 {
-                            s.result_tabs.append_message_lines(
-                                ResultMessageKind::Info,
-                                &["Save was interrupted. Staged edits are still available."
-                                    .to_string()],
-                            );
-                        } else if recovered_edit_states > 0 {
-                            s.result_tabs.append_message_lines(
-                                ResultMessageKind::Info,
-                                &["Query ended before completion. Restored staged result-grid edits."
-                                    .to_string()],
-                            );
-                        }
-                        s.render_status_bar();
-                        s.refresh_result_edit_controls();
-                        s.sync_transaction_mode_controls();
-                    } else {
-                        s.refresh_result_edit_controls();
-                        s.sync_transaction_mode_controls();
                     }
+                    if recovered_save_states > 0 {
+                        result_tabs.append_message_lines(
+                            ResultMessageKind::Info,
+                            &["Save was interrupted. Staged edits are still available."
+                                .to_string()],
+                        );
+                    } else if recovered_edit_states > 0 {
+                        result_tabs.append_message_lines(
+                            ResultMessageKind::Info,
+                            &["Query ended before completion. Restored staged result-grid edits."
+                                .to_string()],
+                        );
+                    }
+                    s.render_status_bar();
+                    s.refresh_result_edit_controls();
+                    s.sync_transaction_mode_controls();
                 }
             }
         });
@@ -8162,7 +9021,10 @@ impl MainWindow {
         let weak_state_for_file_drop = Arc::downgrade(state);
         let file_sender_for_drop = file_sender;
         editor.set_file_drop_callback(move |path| {
-            if let Some(state_for_drop) = weak_state_for_file_drop.upgrade() {
+            let Some(state_for_drop) = weak_state_for_file_drop.upgrade() else {
+                return;
+            };
+            let binding = {
                 let mut s = state_for_drop
                     .lock()
                     .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -8180,12 +9042,17 @@ impl MainWindow {
                     &format!("Opening {} in new tab", file_label),
                     &conn_info,
                 ));
-            }
+                MainWindow::binding_for_selected_database(&s)
+            };
 
             let sender = file_sender_for_drop.clone();
             thread::spawn(move || {
                 let result = fs::read_to_string(&path).map_err(|err| err.to_string());
-                let _ = sender.send(FileActionResult::OpenInNewTab { path, result });
+                let _ = sender.send(FileActionResult::OpenInNewTab {
+                    path,
+                    result,
+                    binding,
+                });
                 app::awake();
             });
         });
@@ -8200,22 +9067,7 @@ impl MainWindow {
     ) -> bool {
         match choice {
             "File/Connect" => {
-                let block_message = {
-                    let s = state
-                        .lock()
-                        .unwrap_or_else(|poisoned| poisoned.into_inner());
-                    connection_transition_block_message(
-                        s.is_any_query_running(),
-                        s.has_active_lazy_fetches(),
-                        "connecting",
-                    )
-                };
-                if let Some(message) = block_message {
-                    crate::ui::alert_on_main(&message);
-                    return true;
-                }
-
-                let (popups, connection, pool_size, connect_policy) = {
+                let (popups, registry, pool_size, connect_policy) = {
                     let s = state
                         .lock()
                         .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -8227,30 +9079,92 @@ impl MainWindow {
                     let connect_policy = ConnectionAttemptPolicy::from_config(&config);
                     (
                         s.popups.clone(),
-                        s.connection.clone(),
+                        s.connection_registry.clone(),
                         pool_size,
                         connect_policy,
                     )
                 };
-                if let Some(activity) = connection_transition_activity(&connection) {
-                    crate::ui::alert_on_main(&format!(
-                        "Connection is busy. Current DB activity: {activity}"
-                    ));
-                    return true;
-                }
                 if let Some(info) = ConnectionDialog::show_with_registry(popups) {
-                    if !Self::resolve_pooled_sessions_before_connection_transition(state) {
-                        return true;
+                    let profile_name = info.name.clone();
+                    let runtime = registry.saved_runtime(&profile_name).unwrap_or_else(|| {
+                        let connection = create_shared_connection();
+                        crate::db::lock_connection(&connection).set_connection_pool_size(pool_size);
+                        registry
+                            .register_saved(profile_name.clone(), connection)
+                            .runtime
+                    });
+                    let connection = runtime.connection();
+                    let already_connected = crate::db::try_lock_connection(&connection)
+                        .is_some_and(|guard| guard.is_connected() && guard.has_connection_handle());
+                    let connection_in_progress =
+                        matches!(runtime.state(), ConnectionRuntimeState::Connecting);
+                    if !already_connected && !connection_in_progress {
+                        runtime.update_sanitized_info(info.clone());
                     }
 
-                    let conn_sender = conn_sender.clone();
-                    {
+                    let (created_tab_id, created_editor, created_right_tile) = {
                         let mut s = state
                             .lock()
                             .unwrap_or_else(|poisoned| poisoned.into_inner());
                         s.status_bar
                             .set_label(&format!("Connecting to {}...", info.name));
+                        let tab_id =
+                            Self::create_query_editor_tab_for_runtime(&mut s, runtime.clone());
+                        (
+                            tab_id,
+                            tab_id.map(|_| s.sql_editor.clone()),
+                            tab_id.map(|_| s.right_tile.clone()),
+                        )
+                    };
+                    if let Some(tab_id) = created_tab_id {
+                        Self::attach_editor_callbacks(state, tab_id, schema_sender.clone());
+                        Self::attach_file_drop_callback(state, tab_id, file_sender.clone());
                     }
+                    if let Some(mut editor) = created_editor {
+                        editor.focus();
+                    }
+                    if let Some(mut right_tile) = created_right_tile {
+                        right_tile.redraw();
+                    }
+
+                    if already_connected {
+                        runtime.set_state(ConnectionRuntimeState::Connected);
+                        let sanitized_info = runtime.sanitized_info();
+                        let mut s = state
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner());
+                        *s.connection_info
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner()) =
+                            Some(sanitized_info.clone());
+                        s.has_live_connection = true;
+                        s.object_browser.add_runtime(runtime.clone());
+                        s.object_browser.refresh_runtime_labels();
+                        if let Some(tab_id) = created_tab_id {
+                            s.refresh_tab_label(tab_id);
+                        }
+                        s.status_bar.set_label(&format!(
+                            "Connected | {} ({})",
+                            sanitized_info.name, sanitized_info.db_type
+                        ));
+                        s.refresh_connection_dependent_controls();
+                        s.sync_transaction_mode_controls();
+                        return true;
+                    }
+                    if connection_in_progress {
+                        return true;
+                    }
+
+                    runtime.set_state(ConnectionRuntimeState::Connecting);
+                    if let Ok(mut s) = state.try_lock() {
+                        s.object_browser.refresh_runtime_labels();
+                        if let Some(tab_id) = created_tab_id {
+                            s.refresh_tab_label(tab_id);
+                        }
+                    }
+                    let connection_id = runtime.id();
+                    let runtime_for_worker = runtime.clone();
+                    let conn_sender = conn_sender.clone();
                     let spawn_failure_sender = conn_sender.clone();
                     if let Err(err) = thread::Builder::new()
                         .name("space-query-connect".to_string())
@@ -8271,53 +9185,199 @@ impl MainWindow {
                             });
                             match result {
                                 Ok(_) => {
+                                    runtime_for_worker.refresh_state_from_connection();
                                     let mut info = info;
                                     info.clear_password();
-                                    let _ =
-                                        conn_sender.send(ConnectionResult::Success(Box::new(info)));
+                                    let _ = conn_sender.send(ConnectionResult::Success {
+                                        connection_id,
+                                        info: Box::new(info),
+                                    });
                                     app::awake();
                                 }
                                 Err(e) => {
-                                    let _ =
-                                        conn_sender.send(ConnectionResult::Failure(e.to_string()));
+                                    let _ = conn_sender.send(ConnectionResult::Failure {
+                                        connection_id,
+                                        message: e.to_string(),
+                                        preserve_existing_connection: false,
+                                    });
                                     app::awake();
                                 }
                             }
                         })
                     {
-                        let _ = spawn_failure_sender.send(ConnectionResult::Failure(format!(
-                            "Could not start connection worker: {err}"
-                        )));
+                        let _ = spawn_failure_sender.send(ConnectionResult::Failure {
+                            connection_id,
+                            message: format!("Could not start connection worker: {err}"),
+                            preserve_existing_connection: false,
+                        });
                         app::awake();
                     }
                 }
                 true
             }
-            "File/Disconnect" => {
-                let block_message = {
+            "File/Reconnect Active Connection" => {
+                let (runtime, mut info, pool_size, policy) = {
                     let s = state
                         .lock()
                         .unwrap_or_else(|poisoned| poisoned.into_inner());
-                    connection_transition_block_message(
-                        s.is_any_query_running(),
-                        s.has_active_lazy_fetches(),
-                        "disconnecting",
+                    let Some(runtime) = s.active_connection_runtime() else {
+                        crate::ui::alert_on_main(
+                            "The active query tab has no database connection.",
+                        );
+                        return true;
+                    };
+                    let Some(profile_name) = s.connection_registry.profile_name_for(runtime.id())
+                    else {
+                        crate::ui::alert_on_main(
+                            "Transient script connections must be re-authenticated with CONNECT.",
+                        );
+                        return true;
+                    };
+                    let config = s
+                        .config
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    let Some(info) = config
+                        .recent_connections
+                        .iter()
+                        .find(|info| info.name == profile_name)
+                        .cloned()
+                    else {
+                        crate::ui::alert_on_main("The saved connection profile no longer exists.");
+                        return true;
+                    };
+                    (
+                        runtime,
+                        info,
+                        config.normalized_connection_pool_size(),
+                        ConnectionAttemptPolicy::from_config(&config),
                     )
                 };
-                if let Some(message) = block_message {
-                    crate::ui::alert_on_main(&message);
-                    return true;
-                }
-
-                if !Self::resolve_pooled_sessions_before_connection_transition(state) {
-                    return true;
-                }
-
-                let connection = state
+                if state
                     .lock()
                     .unwrap_or_else(|poisoned| poisoned.into_inner())
-                    .connection
-                    .clone();
+                    .has_work_for_connection(runtime.id())
+                {
+                    crate::ui::alert_on_main(
+                        "Finish or cancel work on the active connection before reconnecting.",
+                    );
+                    return true;
+                }
+                if !Self::resolve_pooled_sessions_before_runtime_disconnect(state, runtime.id()) {
+                    return true;
+                }
+                match AppConfig::get_password_for_connection(&info.name) {
+                    Ok(Some(password)) => info.password = password,
+                    Ok(None) => {
+                        crate::ui::alert_on_main(
+                            "No password is stored for this saved connection. Use Connect to enter it.",
+                        );
+                        return true;
+                    }
+                    Err(err) => {
+                        crate::ui::alert_on_main(&err);
+                        return true;
+                    }
+                }
+
+                runtime.set_state(ConnectionRuntimeState::Transitioning);
+                {
+                    let mut s = state
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    s.object_browser.refresh_runtime_labels();
+                    let matching_tab_ids = s
+                        .editor_tabs
+                        .iter()
+                        .filter(|tab| {
+                            tab.connection_binding.snapshot().connection_id() == Some(runtime.id())
+                        })
+                        .map(|tab| tab.tab_id)
+                        .collect::<Vec<_>>();
+                    for tab_id in matching_tab_ids {
+                        s.refresh_tab_label(tab_id);
+                    }
+                    s.set_status_message("Reconnecting active connection");
+                }
+                let connection_id = runtime.id();
+                let connection = runtime.connection();
+                let runtime_for_worker = runtime.clone();
+                let sender = conn_sender.clone();
+                let spawn_failure_sender = sender.clone();
+                if let Err(err) = thread::Builder::new()
+                    .name("space-query-reconnect".to_string())
+                    .spawn(move || {
+                        let result = panic::catch_unwind(AssertUnwindSafe(|| {
+                            connect_shared_connection_with_policy(
+                                &connection,
+                                info.clone(),
+                                pool_size,
+                                policy,
+                            )
+                        }))
+                        .unwrap_or_else(|payload| {
+                            Err(format!(
+                                "Reconnect worker terminated unexpectedly: {}",
+                                panic_payload_to_string(payload.as_ref())
+                            ))
+                        });
+                        match result {
+                            Ok(_) => {
+                                runtime_for_worker.refresh_state_from_connection();
+                                info.clear_password();
+                                let _ = sender.send(ConnectionResult::Success {
+                                    connection_id,
+                                    info: Box::new(info),
+                                });
+                            }
+                            Err(message) => {
+                                let _ = sender.send(ConnectionResult::Failure {
+                                    connection_id,
+                                    message,
+                                    preserve_existing_connection: true,
+                                });
+                            }
+                        }
+                        app::awake();
+                    })
+                {
+                    let _ = spawn_failure_sender.send(ConnectionResult::Failure {
+                        connection_id,
+                        message: format!("Could not start reconnect worker: {err}"),
+                        preserve_existing_connection: true,
+                    });
+                    app::awake();
+                }
+                true
+            }
+            "File/Disconnect" | "File/Disconnect Active Connection" => {
+                let Some(runtime) = ({
+                    let s = state
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    s.active_connection_runtime()
+                }) else {
+                    crate::ui::alert_on_main("The active query tab has no database connection.");
+                    return true;
+                };
+                let connection_id = runtime.id();
+
+                if state
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .has_work_for_connection(connection_id)
+                {
+                    crate::ui::alert_on_main(
+                        "A query or lazy fetch is active on this connection. Stop it before disconnecting.",
+                    );
+                    return true;
+                }
+
+                if !Self::resolve_pooled_sessions_before_runtime_disconnect(state, connection_id) {
+                    return true;
+                }
+
+                let connection = runtime.connection();
                 let Some(mut db_conn) =
                     try_lock_connection_with_activity(&connection, "Disconnecting session")
                 else {
@@ -8339,15 +9399,163 @@ impl MainWindow {
                 crate::utils::logging::log_info("connection", "Disconnected from database");
                 db_conn.disconnect();
                 db_conn.refresh_tracked_connection();
-                crate::db::clear_tracked_db_activity();
-                // Release the connection lock before locking AppState.
-                // Session reset is handled inside transition_to_disconnected_state.
                 drop(db_conn);
+                runtime.set_state(ConnectionRuntimeState::Disconnected);
 
                 let mut s = state
                     .lock()
                     .unwrap_or_else(|poisoned| poisoned.into_inner());
-                let _ = MainWindow::transition_to_disconnected_state(&mut s, None);
+                s.release_pooled_db_sessions_for_connection(connection_id);
+                s.has_live_connection = false;
+                *s.connection_info
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+                s.pending_connection_metadata_refresh = false;
+                s.clear_pending_metadata_for_connection(connection_id);
+                clear_mutex_flag(&s.schema_refresh_in_progress);
+                s.set_status_message("Disconnected active connection");
+                s.clear_metadata_for_connection(connection_id);
+                s.object_browser.refresh_runtime_labels();
+                let affected_tab_ids = s
+                    .editor_tabs
+                    .iter()
+                    .filter(|tab| {
+                        tab.connection_binding.snapshot().connection_id() == Some(connection_id)
+                    })
+                    .map(|tab| tab.tab_id)
+                    .collect::<Vec<_>>();
+                for tab_id in affected_tab_ids {
+                    s.refresh_tab_label(tab_id);
+                }
+                s.refresh_connection_dependent_controls();
+                s.sync_transaction_mode_controls();
+                true
+            }
+            "File/Disconnect All" => {
+                let runtimes = {
+                    let s = state
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    let runtimes = s.connection_registry.runtimes();
+                    if let Some(runtime) = runtimes.iter().find(|runtime| {
+                        matches!(
+                            runtime.state(),
+                            ConnectionRuntimeState::Connecting
+                                | ConnectionRuntimeState::Transitioning
+                        )
+                    }) {
+                        crate::ui::alert_on_main(&format!(
+                            "Connection '{}' is changing state. Wait for it to finish before disconnecting all connections.",
+                            runtime.display_name()
+                        ));
+                        return true;
+                    }
+                    if let Some(runtime) = runtimes
+                        .iter()
+                        .find(|runtime| s.has_work_for_connection(runtime.id()))
+                    {
+                        crate::ui::alert_on_main(&format!(
+                            "A query or lazy fetch is active on '{}'. Stop it before disconnecting all connections.",
+                            runtime.display_name()
+                        ));
+                        return true;
+                    }
+                    runtimes
+                        .into_iter()
+                        .filter(|runtime| {
+                            matches!(runtime.state(), ConnectionRuntimeState::Connected)
+                        })
+                        .collect::<Vec<_>>()
+                };
+
+                if runtimes.is_empty() {
+                    state
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .set_status_message("No connected databases");
+                    return true;
+                }
+                if !Self::resolve_pooled_sessions_before_exit(state) {
+                    return true;
+                }
+
+                for runtime in &runtimes {
+                    runtime.set_state(ConnectionRuntimeState::Transitioning);
+                }
+                {
+                    let mut s = state
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    s.object_browser.refresh_runtime_labels();
+                    let tab_ids = s
+                        .editor_tabs
+                        .iter()
+                        .map(|tab| tab.tab_id)
+                        .collect::<Vec<_>>();
+                    for tab_id in tab_ids {
+                        s.refresh_tab_label(tab_id);
+                    }
+                    s.set_status_message("Disconnecting all connections");
+                }
+
+                let mut disconnected = Vec::new();
+                let mut failures = Vec::new();
+                for runtime in runtimes {
+                    let connection = runtime.connection();
+                    let Some(mut db_conn) = try_lock_connection_with_activity(
+                        &connection,
+                        "Disconnecting all connections",
+                    ) else {
+                        runtime.set_state(ConnectionRuntimeState::Connected);
+                        failures.push(format!(
+                            "{}: {}",
+                            runtime.display_name(),
+                            format_connection_busy_message()
+                        ));
+                        continue;
+                    };
+                    crate::db::clear_pool_session_context_for_shared_connection(&connection);
+                    db_conn.disconnect();
+                    db_conn.refresh_tracked_connection();
+                    drop(db_conn);
+                    runtime.set_state(ConnectionRuntimeState::Disconnected);
+                    disconnected.push(runtime.id());
+                }
+
+                let mut s = state
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                for connection_id in disconnected.iter().copied() {
+                    s.release_pooled_db_sessions_for_connection(connection_id);
+                    s.clear_metadata_for_connection(connection_id);
+                    s.clear_pending_metadata_for_connection(connection_id);
+                }
+                s.pending_connection_metadata_refresh = false;
+                clear_mutex_flag(&s.schema_refresh_in_progress);
+                let active_tab_id = s.active_editor_tab_id;
+                let _ = s.set_active_editor_tab(active_tab_id);
+                s.object_browser.refresh_runtime_labels();
+                let tab_ids = s
+                    .editor_tabs
+                    .iter()
+                    .map(|tab| tab.tab_id)
+                    .collect::<Vec<_>>();
+                for tab_id in tab_ids {
+                    s.refresh_tab_label(tab_id);
+                }
+                if failures.is_empty() {
+                    s.set_status_message(&format!(
+                        "Disconnected {} connection(s)",
+                        disconnected.len()
+                    ));
+                } else {
+                    s.set_status_message("Some connections could not be disconnected");
+                    s.result_tabs
+                        .append_message_lines(ResultMessageKind::Error, &failures);
+                    s.result_tabs.select_messages_errors();
+                }
+                s.refresh_connection_dependent_controls();
+                s.sync_transaction_mode_controls();
                 true
             }
             "File/Open SQL File" => {
@@ -8547,7 +9755,7 @@ impl MainWindow {
                     let mut s = state
                         .lock()
                         .unwrap_or_else(|poisoned| poisoned.into_inner());
-                    let created = MainWindow::create_query_editor_tab(&mut s);
+                    let created = MainWindow::create_query_editor_tab_for_selected_database(&mut s);
                     s.right_tile.redraw();
                     created
                 };
@@ -8756,9 +9964,17 @@ impl MainWindow {
                     let mut s = state
                         .lock()
                         .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    let active_connection_id = s.active_connection_id();
+                    let connection_has_running_work = active_connection_id
+                        .is_some_and(|connection_id| s.has_work_for_connection(connection_id));
+                    let connection_has_lazy_fetch =
+                        active_connection_id.is_some_and(|connection_id| {
+                            !s.lazy_fetch_sessions_for_connection(connection_id)
+                                .is_empty()
+                        });
                     if let Some(message) = transaction_option_block_message(
-                        s.is_any_query_running(),
-                        s.has_active_lazy_fetches(),
+                        connection_has_running_work,
+                        connection_has_lazy_fetch,
                         "changing auto-commit",
                     ) {
                         crate::ui::alert_on_main(&message);
@@ -8888,7 +10104,7 @@ impl MainWindow {
                 true
             }
             "Settings/Preferences" => {
-                let (config_snapshot, connection) = {
+                let (config_snapshot, runtimes) = {
                     let s = state
                         .lock()
                         .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -8897,11 +10113,15 @@ impl MainWindow {
                         .lock()
                         .unwrap_or_else(|poisoned| poisoned.into_inner())
                         .clone();
-                    (config_snapshot, s.connection.clone())
+                    (config_snapshot, s.connection_registry.runtimes())
                 };
-                if let Some(activity) = connection_transition_activity(&connection) {
+                if let Some((runtime, activity)) = runtimes.iter().find_map(|runtime| {
+                    connection_transition_activity(&runtime.connection())
+                        .map(|activity| (runtime.clone(), activity))
+                }) {
                     crate::ui::alert_on_main(&format!(
-                        "Connection is busy. Current DB activity: {activity}"
+                        "Connection '{}' is busy. Current DB activity: {activity}",
+                        runtime.display_name()
                     ));
                     return true;
                 }
@@ -8955,7 +10175,27 @@ impl MainWindow {
                         .name("space-query-pool-resize".to_string())
                         .spawn(move || {
                             let result = panic::catch_unwind(AssertUnwindSafe(|| {
-                                resize_shared_connection_pool_with_policy(&connection, size, policy)
+                                let mut failures = Vec::new();
+                                for runtime in runtimes {
+                                    if let Err(err) = resize_shared_connection_pool_with_policy(
+                                        &runtime.connection(),
+                                        size,
+                                        policy,
+                                    ) {
+                                        failures.push(format!(
+                                            "{}: {}",
+                                            runtime.display_name(),
+                                            err
+                                        ));
+                                    } else {
+                                        runtime.refresh_state_from_connection();
+                                    }
+                                }
+                                if failures.is_empty() {
+                                    Ok(())
+                                } else {
+                                    Err(failures.join("\n"))
+                                }
                             }))
                             .unwrap_or_else(|payload| {
                                 Err(format!(
@@ -9323,7 +10563,7 @@ impl MainWindow {
                 && (k == fltk::enums::Key::from_char('d')
                     || k == fltk::enums::Key::from_char('D')) =>
             {
-                Some("File/Disconnect")
+                Some("File/Disconnect Active Connection")
             }
             k if ctrl_or_cmd
                 && (k == fltk::enums::Key::from_char('o')
@@ -9522,36 +10762,11 @@ impl MainWindow {
         let (file_sender, file_receiver) = std::sync::mpsc::channel::<FileActionResult>();
 
         {
-            let weak_state_for_result_context = Arc::downgrade(&state);
-            let file_sender_for_result_context = file_sender.clone();
-            let callback = Arc::new(Mutex::new(Some(Box::new(
-                move |action: ResultTableContextAction| {
-                    let Some(state_for_result_context) = weak_state_for_result_context.upgrade()
-                    else {
-                        return;
-                    };
-                    match action {
-                        ResultTableContextAction::ExportCsv => {
-                            MainWindow::export_current_results_to_csv(
-                                &state_for_result_context,
-                                &file_sender_for_result_context,
-                            );
-                        }
-                        ResultTableContextAction::Close => {
-                            MainWindow::close_current_result_tab(&state_for_result_context);
-                        }
-                        ResultTableContextAction::CloseAll => {
-                            MainWindow::close_all_result_tabs(&state_for_result_context);
-                        }
-                    }
-                },
-            )
-                as Box<dyn FnMut(ResultTableContextAction)>)));
-            state
+            let mut state = state
                 .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .result_tabs
-                .set_context_action_callback(callback);
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            state.schema_sender = Some(schema_sender.clone());
+            state.file_sender = Some(file_sender.clone());
         }
 
         let tab_ids: Vec<QueryTabId> = state
@@ -9602,25 +10817,32 @@ impl MainWindow {
                 return;
             }
 
-            let connection = s.connection.clone();
-            let current_generation = match try_lock_connection_with_activity(
-                &connection,
-                "Applying object browser metadata",
-            ) {
+            let Some(binding) = s
+                .editor_tabs
+                .iter()
+                .find(|tab| tab.tab_id == s.active_editor_tab_id)
+                .map(|tab| tab.connection_binding.snapshot())
+            else {
+                return;
+            };
+            let Some(connection) = binding.connection() else {
+                return;
+            };
+            let current_generation = match crate::db::try_lock_connection(&connection) {
                 Some(conn_guard) => conn_guard.connection_generation(),
                 None => {
-                    s.pending_connection_metadata_refresh = true;
+                    let tab_id = s.active_editor_tab_id;
+                    s.mark_metadata_refresh_pending(tab_id);
                     return;
                 }
             };
             if snapshot.connection_generation != current_generation {
                 return;
             }
-            let current_scope = s.object_browser.selected_scope();
             if !MainWindow::schema_update_scope_matches(
                 snapshot.db_type,
                 snapshot.selected_scope.as_deref(),
-                current_scope.as_deref(),
+                binding.scope.as_deref(),
                 &snapshot.available_scopes,
             ) {
                 return;
@@ -9632,29 +10854,48 @@ impl MainWindow {
         let weak_state_for_browser = Arc::downgrade(&state);
         let schema_sender_for_browser = schema_sender.clone();
         let file_sender_for_browser = file_sender.clone();
-        object_browser.set_sql_callback(move |action| {
+        object_browser.set_sql_callback(move |connection_id, action| {
             let Some(state_for_browser) = weak_state_for_browser.upgrade() else {
                 return;
             };
-            let mut created_tab_for_generated_sql: Option<QueryTabId> = None;
+            let mut created_tabs = Vec::new();
             let mut sql_to_execute: Option<String> = None;
             {
                 let mut s = state_for_browser
                     .lock()
                     .unwrap_or_else(|poisoned| poisoned.into_inner());
+                let Some((source_tab_id, source_tab_created)) =
+                    MainWindow::select_or_create_query_editor_tab_for_connection(
+                        &mut s,
+                        connection_id,
+                    )
+                else {
+                    s.set_status_message("Object action ignored: source connection is unavailable");
+                    return;
+                };
+                if source_tab_created {
+                    created_tabs.push(source_tab_id);
+                }
                 match action {
                     SqlAction::Insert(text) => {
                         s.sql_editor.insert_text_at_cursor_position(&text);
                     }
                     SqlAction::OpenInNewTab(sql) => {
-                        if let Some(tab_id) = MainWindow::create_query_editor_tab(&mut s) {
+                        let target_tab_id = if source_tab_created {
+                            Some(source_tab_id)
+                        } else {
+                            MainWindow::create_query_editor_tab(&mut s)
+                        };
+                        if let Some(tab_id) = target_tab_id {
                             s.sql_buffer.set_text(&sql);
                             s.sql_editor.reset_undo_redo_history();
                             s.set_tab_file_path(tab_id, None);
                             s.set_tab_pristine_text(tab_id, sql);
                             s.sql_editor.focus();
                             s.right_tile.redraw();
-                            created_tab_for_generated_sql = Some(tab_id);
+                            if !created_tabs.contains(&tab_id) {
+                                created_tabs.push(tab_id);
+                            }
                         }
                     }
                     SqlAction::Execute(sql) => {
@@ -9666,23 +10907,26 @@ impl MainWindow {
                 }
             }
 
+            for tab_id in &created_tabs {
+                MainWindow::attach_editor_callbacks(
+                    &state_for_browser,
+                    *tab_id,
+                    schema_sender_for_browser.clone(),
+                );
+                MainWindow::attach_file_drop_callback(
+                    &state_for_browser,
+                    *tab_id,
+                    file_sender_for_browser.clone(),
+                );
+            }
+
             if let Some(sql) = sql_to_execute {
                 if let Some(editor) = acquire_sql_editor_if_idle(&state_for_browser) {
                     editor.execute_sql_text(&sql);
                 }
             }
 
-            if let Some(tab_id) = created_tab_for_generated_sql {
-                MainWindow::attach_editor_callbacks(
-                    &state_for_browser,
-                    tab_id,
-                    schema_sender_for_browser.clone(),
-                );
-                MainWindow::attach_file_drop_callback(
-                    &state_for_browser,
-                    tab_id,
-                    file_sender_for_browser.clone(),
-                );
+            if !created_tabs.is_empty() {
                 state_for_browser
                     .lock()
                     .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -9694,7 +10938,7 @@ impl MainWindow {
 
         let weak_state_for_scope_change = Arc::downgrade(&state);
         let schema_sender_for_scope_change = schema_sender.clone();
-        object_browser.set_scope_change_callback(move || {
+        object_browser.set_scope_change_callback(move |connection_id| {
             let Some(state_for_scope_change) = weak_state_for_scope_change.upgrade() else {
                 return;
             };
@@ -9703,35 +10947,19 @@ impl MainWindow {
                 let mut s = state_for_scope_change
                     .lock()
                     .unwrap_or_else(|poisoned| poisoned.into_inner());
-                let connection_info_update = {
-                    let connection = s.connection.clone();
-                    let update = match try_lock_connection_with_activity(
-                        &connection,
-                        "Applying object browser scope change",
-                    ) {
-                        Some(conn_guard) if conn_guard.is_connected() => {
-                            Some(Some(conn_guard.get_info().clone()))
-                        }
-                        Some(_) => Some(None),
-                        None => {
-                            s.pending_connection_metadata_refresh = true;
-                            None
-                        }
-                    };
-                    update
-                };
-                if let Some(connection_info) = connection_info_update {
-                    *s.connection_info
-                        .lock()
-                        .unwrap_or_else(|poisoned| poisoned.into_inner()) = connection_info;
+                let selected_scope = s
+                    .object_browser
+                    .selected_scope_for_connection(connection_id);
+                s.synchronize_scope_for_connection(connection_id, selected_scope.clone());
+                let retained_scope_update =
+                    s.retained_scope_update_for_connection(connection_id, selected_scope);
+                if s.active_connection_id() == Some(connection_id) {
+                    let started = MainWindow::start_connection_metadata_refresh_for_scope_change(
+                        &mut s,
+                        &schema_sender_for_scope_change,
+                    );
+                    s.update_pending_metadata_refresh_after_start_attempt(started);
                 }
-                let selected_scope = s.object_browser.selected_scope();
-                let retained_scope_update = s.retained_scope_update(selected_scope);
-                let started = MainWindow::start_connection_metadata_refresh_for_scope_change(
-                    &mut s,
-                    &schema_sender_for_scope_change,
-                );
-                s.update_pending_metadata_refresh_after_start_attempt(started);
                 retained_scope_update
             };
 
@@ -9747,14 +10975,14 @@ impl MainWindow {
         });
 
         let weak_state_for_scope_preflight = Arc::downgrade(&state);
-        object_browser.set_scope_switch_preflight_callback(move || {
+        object_browser.set_scope_switch_preflight_callback(move |connection_id| {
             let Some(state_for_scope_preflight) = weak_state_for_scope_preflight.upgrade() else {
                 return Ok(());
             };
             let s = state_for_scope_preflight
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
-            if let Some(message) = s.retained_scope_change_blocker() {
+            if let Some(message) = s.retained_scope_change_blocker_for_connection(connection_id) {
                 Err(message)
             } else {
                 Ok(())
@@ -9908,55 +11136,36 @@ impl MainWindow {
                 let r = schema_receiver
                     .lock()
                     .unwrap_or_else(|poisoned| poisoned.into_inner());
-                let (current_generation, current_scope) = match state.try_lock() {
-                    Ok(s) => {
-                        let current_scope = s.object_browser.selected_scope();
-                        let guard = try_lock_connection_with_activity(
-                            &s.connection,
-                            "Checking schema update generation",
-                        );
-                        match guard {
-                            Some(connection_guard) => {
-                                (connection_guard.connection_generation(), current_scope)
-                            }
-                            None => {
-                                deferred_by_borrow_conflict = true;
-                                (0, current_scope)
-                            }
+                let current_target = match state.try_lock() {
+                    Ok(s) => match s.active_schema_update_target() {
+                        Ok(target) => target,
+                        Err(()) => {
+                            deferred_by_borrow_conflict = true;
+                            None
                         }
-                    }
+                    },
                     Err(_) => {
                         deferred_by_borrow_conflict = true;
-                        (0, None)
+                        None
                     }
                 };
 
                 if !deferred_by_borrow_conflict {
                     let mut latest_update = pending_schema_update.take().filter(|update| {
-                        update.connection_generation == current_generation
-                            && MainWindow::schema_update_scope_matches(
-                                update.db_type,
-                                update.selected_scope.as_deref(),
-                                current_scope.as_deref(),
-                                &update.data.users,
-                            )
+                        current_target.as_ref().is_some_and(|target| {
+                            MainWindow::schema_update_matches_target(update, target)
+                        })
                     });
                     loop {
                         match r.try_recv() {
                             Ok(update) => {
-                                if update.connection_generation != current_generation {
-                                    continue;
-                                }
-                                if !MainWindow::schema_update_scope_matches(
-                                    update.db_type,
-                                    update.selected_scope.as_deref(),
-                                    current_scope.as_deref(),
-                                    &update.data.users,
-                                ) {
+                                processed_message = true;
+                                if !current_target.as_ref().is_some_and(|target| {
+                                    MainWindow::schema_update_matches_target(&update, target)
+                                }) {
                                     continue;
                                 }
                                 latest_update = Some(update);
-                                processed_message = true;
                             }
                             Err(std::sync::mpsc::TryRecvError::Empty) => break,
                             Err(std::sync::mpsc::TryRecvError::Disconnected) => {
@@ -9968,13 +11177,24 @@ impl MainWindow {
 
                     if let Some(update) = latest_update {
                         match state.try_lock() {
-                            Ok(mut s) => {
-                                MainWindow::update_schema_snapshot(
-                                    &mut s,
-                                    update.data,
-                                    update.highlight_data,
-                                );
-                            }
+                            Ok(mut s) => match s.active_schema_update_target() {
+                                Ok(Some(target))
+                                    if MainWindow::schema_update_matches_target(
+                                        &update, &target,
+                                    ) =>
+                                {
+                                    MainWindow::update_schema_snapshot(
+                                        &mut s,
+                                        update.data,
+                                        update.highlight_data,
+                                    );
+                                }
+                                Ok(_) => {}
+                                Err(()) => {
+                                    pending_schema_update = Some(update);
+                                    deferred_by_borrow_conflict = true;
+                                }
+                            },
                             Err(_) => {
                                 pending_schema_update = Some(update);
                                 deferred_by_borrow_conflict = true;
@@ -10021,14 +11241,50 @@ impl MainWindow {
                         Ok(result) => {
                             processed_message = true;
                             match result {
-                                ConnectionResult::Success(info) => {
+                                ConnectionResult::Success {
+                                    connection_id,
+                                    info,
+                                } => {
                                     let info = *info;
+                                    let Some(runtime) = s.connection_registry.get(connection_id)
+                                    else {
+                                        continue;
+                                    };
+                                    runtime.update_sanitized_info(info.clone());
+                                    runtime.set_state(ConnectionRuntimeState::Connected);
+                                    s.object_browser.add_runtime(runtime.clone());
+                                    s.object_browser.refresh_runtime_labels();
+                                    s.synchronize_scope_for_connection(connection_id, None);
+                                    s.clear_metadata_for_connection(connection_id);
+                                    let matching_tab_ids = s
+                                        .editor_tabs
+                                        .iter()
+                                        .filter(|tab| {
+                                            tab.connection_binding.snapshot().connection_id()
+                                                == Some(connection_id)
+                                        })
+                                        .map(|tab| tab.tab_id)
+                                        .collect::<Vec<_>>();
+                                    for tab_id in matching_tab_ids {
+                                        s.mark_metadata_refresh_pending(tab_id);
+                                        s.refresh_tab_label(tab_id);
+                                    }
                                     crate::utils::logging::log_info(
                                         "connection",
                                         &format!("Connected to {} ({})", info.name, info.db_type),
                                     );
+                                    let active_matches = s
+                                        .editor_tabs
+                                        .iter()
+                                        .find(|tab| tab.tab_id == s.active_editor_tab_id)
+                                        .and_then(|tab| {
+                                            tab.connection_binding.snapshot().connection_id()
+                                        })
+                                        == Some(connection_id);
+                                    if !active_matches {
+                                        continue;
+                                    }
                                     clear_mutex_flag(&s.schema_refresh_in_progress);
-                                    s.release_all_pooled_db_sessions();
                                     // Drop the previous connection's schema snapshot before
                                     // touching editors. set_db_type below triggers a rehighlight,
                                     // and without this clear the highlighter would paint with the
@@ -10039,7 +11295,10 @@ impl MainWindow {
                                         IntellisenseData::new(),
                                         HighlightData::new(),
                                     );
-                                    for tab in &s.editor_tabs {
+                                    for tab in s.editor_tabs.iter().filter(|tab| {
+                                        tab.connection_binding.snapshot().connection_id()
+                                            == Some(connection_id)
+                                    }) {
                                         tab.sql_editor.set_db_type(info.db_type);
                                     }
                                     s.sql_editor.set_db_type(info.db_type);
@@ -10048,8 +11307,6 @@ impl MainWindow {
                                         .unwrap_or_else(|poisoned| poisoned.into_inner()) =
                                         Some(info.clone());
                                     s.has_live_connection = true;
-                                    s.pending_connection_metadata_refresh = false;
-                                    s.object_browser.reset_selected_scope();
                                     s.status_bar.set_label(&format!(
                                         "Connected | {} ({})",
                                         info.name, info.db_type
@@ -10064,45 +11321,92 @@ impl MainWindow {
                                     );
                                     s.update_pending_metadata_refresh_after_start_attempt(started);
                                 }
-                                ConnectionResult::Failure(err) => {
-                                    let current_connection = s
-                                        .connection_info
-                                        .lock()
-                                        .unwrap_or_else(|poisoned| poisoned.into_inner())
-                                        .clone();
-                                    let current_connection_label =
-                                        current_connection.as_ref().map(|info| info.name.clone());
-
-                                    if let Some(current_label) = current_connection_label {
+                                ConnectionResult::Failure {
+                                    connection_id,
+                                    message: err,
+                                    preserve_existing_connection,
+                                } => {
+                                    let mut connection_preserved = false;
+                                    if let Some(runtime) = s.connection_registry.get(connection_id)
+                                    {
+                                        let connection_is_still_live = preserve_existing_connection
+                                            && crate::db::try_lock_connection(
+                                                &runtime.connection(),
+                                            )
+                                            .is_some_and(|connection| {
+                                                connection.is_connected()
+                                                    && connection.has_connection_handle()
+                                            });
+                                        connection_preserved = connection_is_still_live;
+                                        runtime.set_state(if connection_is_still_live {
+                                            ConnectionRuntimeState::Connected
+                                        } else {
+                                            ConnectionRuntimeState::Failed(err.clone())
+                                        });
+                                        s.object_browser.add_runtime(runtime);
+                                    }
+                                    s.object_browser.refresh_runtime_labels();
+                                    let matching_tab_ids = s
+                                        .editor_tabs
+                                        .iter()
+                                        .filter(|tab| {
+                                            tab.connection_binding.snapshot().connection_id()
+                                                == Some(connection_id)
+                                        })
+                                        .map(|tab| tab.tab_id)
+                                        .collect::<Vec<_>>();
+                                    for tab_id in matching_tab_ids {
+                                        s.refresh_tab_label(tab_id);
+                                    }
+                                    let active_matches = s
+                                        .editor_tabs
+                                        .iter()
+                                        .find(|tab| tab.tab_id == s.active_editor_tab_id)
+                                        .and_then(|tab| {
+                                            tab.connection_binding.snapshot().connection_id()
+                                        })
+                                        == Some(connection_id);
+                                    if !active_matches {
+                                        continue;
+                                    }
+                                    if connection_preserved {
                                         crate::utils::logging::log_error(
                                             "connection",
                                             &format!(
-                                                "Connection failed: {} (keeping current connection: {})",
-                                                err, current_label
+                                                "Reconnect failed; the existing connection was preserved: {}",
+                                                err
                                             ),
                                         );
-                                        s.status_bar.set_label(&format_status(
-                                            "Connection failed; keeping current connection",
-                                            &current_connection,
-                                        ));
+                                        s.set_status_message(
+                                            "Reconnect failed; existing connection preserved",
+                                        );
                                         let lines = vec![
-                                            format!("Connection failed: {}", err),
-                                            format!(
-                                                "Keeping current connection: {}",
-                                                current_label
-                                            ),
+                                            format!("Reconnect failed: {}", err),
+                                            "The existing connection remains available."
+                                                .to_string(),
                                         ];
                                         s.result_tabs
                                             .append_message_lines(ResultMessageKind::Error, &lines);
                                     } else {
                                         crate::utils::logging::log_error(
                                             "connection",
-                                            &format!("Connection failed: {}", err),
+                                            &format!("Connection or reconnect failed: {}", err),
                                         );
-                                        s.status_bar.set_label("Connection failed");
+                                        s.status_bar.set_label(if preserve_existing_connection {
+                                            "Reconnect failed; connection is offline"
+                                        } else {
+                                            "Connection failed"
+                                        });
                                         s.result_tabs.append_message_lines(
                                             ResultMessageKind::Error,
-                                            &[format!("Connection failed: {}", err)],
+                                            &[if preserve_existing_connection {
+                                                format!(
+                                                    "Reconnect failed and the previous connection is no longer live: {}",
+                                                    err
+                                                )
+                                            } else {
+                                                format!("Connection failed: {}", err)
+                                            }],
                                         );
                                     }
                                     s.result_tabs.select_messages_errors();
@@ -10174,7 +11478,11 @@ impl MainWindow {
                             let mut created_editor_for_open: Option<SqlEditorWidget> = None;
                             let mut created_right_tile_for_open: Option<Tile> = None;
                             match result {
-                                FileActionResult::OpenInNewTab { path, result } => match result {
+                                FileActionResult::OpenInNewTab {
+                                    path,
+                                    result,
+                                    binding,
+                                } => match result {
                                     Ok(content) => {
                                         if MainWindow::focus_existing_tab_with_same_file_path(
                                             &mut s, &path,
@@ -10185,7 +11493,9 @@ impl MainWindow {
                                         let normalized_content =
                                             MainWindow::normalize_line_endings_for_editor(content);
                                         if let Some(tab_id) =
-                                            MainWindow::create_query_editor_tab(&mut s)
+                                            MainWindow::create_query_editor_tab_for_binding(
+                                                &mut s, binding, true,
+                                            )
                                         {
                                             s.sql_buffer.set_text(&normalized_content);
                                             s.sql_editor.reset_undo_redo_history();
@@ -10488,7 +11798,7 @@ impl MainWindow {
         Self::hide_all_visible_windows();
 
         crate::db::clear_tracked_db_activity();
-        let (popups, editor_tabs, mut result_tabs) = {
+        let (popups, editor_tabs, mut result_tabs, runtimes) = {
             let s = state
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -10496,6 +11806,7 @@ impl MainWindow {
                 s.popups.clone(),
                 s.editor_tabs.clone(),
                 s.result_tabs.clone(),
+                s.connection_registry.runtimes(),
             )
         };
         {
@@ -10512,6 +11823,23 @@ impl MainWindow {
         }
         for mut tab in editor_tabs {
             tab.sql_editor.cleanup_for_close();
+        }
+        for runtime in runtimes {
+            let connection = runtime.connection();
+            crate::db::clear_pool_session_context_for_shared_connection(&connection);
+            if let Some(mut db_conn) = crate::db::try_lock_connection(&connection) {
+                db_conn.disconnect();
+                db_conn.refresh_tracked_connection();
+                runtime.set_state(ConnectionRuntimeState::Disconnected);
+            } else {
+                crate::utils::logging::log_warning(
+                    "app",
+                    &format!(
+                        "Could not synchronously close connection '{}' during exit",
+                        runtime.display_name()
+                    ),
+                );
+            };
         }
         result_tabs.clear();
         crate::ui::sql_editor::SqlEditorWidget::shutdown_column_load_workers();
@@ -10593,6 +11921,52 @@ impl MainWindow {
             .state
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let oracle_runtime = state
+            .connection_registry
+            .register_saved("capture-local-oracle", create_shared_connection())
+            .runtime;
+        oracle_runtime.update_sanitized_info(crate::db::ConnectionInfo::new_with_type(
+            "Local Oracle",
+            "",
+            "",
+            "",
+            1521,
+            "",
+            DatabaseType::Oracle,
+        ));
+        oracle_runtime.set_state(ConnectionRuntimeState::Connected);
+        let maria_runtime = state
+            .connection_registry
+            .register_saved("capture-analytics-maria", create_shared_connection())
+            .runtime;
+        maria_runtime.update_sanitized_info(crate::db::ConnectionInfo::new_with_type(
+            "Analytics MariaDB",
+            "",
+            "",
+            "",
+            3306,
+            "",
+            DatabaseType::MariaDB,
+        ));
+        maria_runtime.set_state(ConnectionRuntimeState::Connected);
+        state.object_browser.add_runtime(oracle_runtime.clone());
+        state.object_browser.add_runtime(maria_runtime.clone());
+        let oracle_tab_id = state.active_editor_tab_id;
+        if let Some(binding) = state
+            .editor_tabs
+            .iter()
+            .find(|tab| tab.tab_id == oracle_tab_id)
+            .map(|tab| tab.connection_binding.clone())
+        {
+            binding.bind(oracle_runtime.clone(), Some("SYSTEM".to_string()));
+        }
+        let _ = Self::create_query_editor_tab_for_runtime(&mut state, maria_runtime.clone());
+        state.query_tabs.select(oracle_tab_id);
+        let _ = state.set_active_editor_tab(oracle_tab_id);
+        state.connection = oracle_runtime.connection();
+        state
+            .object_browser
+            .set_active_connection(Some(oracle_runtime.id()));
         state.object_browser.capture_tour_set_example_metadata();
         *state
             .connection_info
@@ -10608,6 +11982,7 @@ impl MainWindow {
                 DatabaseType::Oracle,
             ));
         state.has_live_connection = true;
+        state.refresh_tab_label(oracle_tab_id);
         state.render_status_bar();
         state.window.redraw();
     }
@@ -10886,6 +12261,7 @@ mod tests {
                 activity: "first".to_string(),
                 started_at: first_start,
                 db_type: Some(DatabaseType::Oracle),
+                connection_id: None,
                 progress: crate::db::DbActivityProgress::Indeterminate,
             },
             crate::db::DbActivitySnapshot {
@@ -10893,6 +12269,7 @@ mod tests {
                 activity: "second".to_string(),
                 started_at: second_start,
                 db_type: Some(DatabaseType::Oracle),
+                connection_id: None,
                 progress: crate::db::DbActivityProgress::Indeterminate,
             },
         ];
@@ -10952,6 +12329,7 @@ mod tests {
                 activity: "Executing SQL".to_string(),
                 started_at: now,
                 db_type: Some(DatabaseType::Oracle),
+                connection_id: None,
                 progress: crate::db::DbActivityProgress::Indeterminate,
             },
             crate::db::DbActivitySnapshot {
@@ -10959,6 +12337,7 @@ mod tests {
                 activity: "Refreshing metadata".to_string(),
                 started_at: now + Duration::from_millis(1),
                 db_type: Some(DatabaseType::Oracle),
+                connection_id: None,
                 progress: crate::db::DbActivityProgress::Indeterminate,
             },
         ];
@@ -11796,8 +13175,7 @@ mod tests {
 
     #[test]
     fn session_activity_result_request_uses_idle_row_when_no_active_entries() {
-        let request =
-            build_session_activity_result_request("Local", "Oracle", 4, "Idle", Vec::new());
+        let request = build_session_activity_result_request(Vec::new());
 
         assert_eq!(request.label, "Session Activity");
         assert_eq!(request.result.message, "No active sessions");
@@ -11810,7 +13188,10 @@ mod tests {
                 .map(|column| column.name.as_str())
                 .collect::<Vec<_>>(),
             vec![
+                "Connection ID",
                 "Connection",
+                "Connection State",
+                "Scope",
                 "Database",
                 "Pool Size",
                 "Tab",
@@ -11824,33 +13205,51 @@ mod tests {
         );
         assert_eq!(
             request.result.rows[0],
-            vec!["Local", "Oracle", "4", "-", "-", "Idle", "Idle", "-", "-", "-"]
+            vec![
+                "-",
+                "No connections",
+                "Unbound",
+                "-",
+                "-",
+                "-",
+                "-",
+                "-",
+                "Idle",
+                "Idle",
+                "-",
+                "-",
+                "-"
+            ]
         );
     }
 
     #[test]
     fn session_activity_result_request_formats_active_rows() {
-        let request = build_session_activity_result_request(
-            "Local",
-            "Oracle",
-            4,
-            "SELECT running",
-            vec![SessionActivityEntry {
-                tab_name: "Query 1".to_string(),
-                result_tab: Some(2),
-                state: ResultTabStatus::Fetching.label().to_string(),
-                database: "Oracle".to_string(),
-                sql_preview: "select * from employees".to_string(),
-                fetched_rows: 42,
-                elapsed: "3s".to_string(),
-            }],
-        );
+        let request = build_session_activity_result_request(vec![SessionActivityEntry {
+            connection_id: None,
+            connection_name: "Local".to_string(),
+            connection_state: "Connected".to_string(),
+            scope: Some("HR".to_string()),
+            pool_size: 4,
+            tab_name: "Query 1".to_string(),
+            result_tab: Some(2),
+            state: ResultTabStatus::Fetching.label().to_string(),
+            database: "Oracle".to_string(),
+            current_activity: "SELECT running".to_string(),
+            sql_preview: "select * from employees".to_string(),
+            fetched_rows: 42,
+            elapsed: "3s".to_string(),
+            active: true,
+        }]);
 
         assert_eq!(request.result.message, "1 session(s)");
         assert_eq!(
             request.result.rows[0],
             vec![
+                "-",
                 "Local",
+                "Connected",
+                "HR",
                 "Oracle",
                 "4",
                 "Query 1",
@@ -11862,6 +13261,53 @@ mod tests {
                 "3s"
             ]
         );
+    }
+
+    #[test]
+    fn schema_update_requires_exact_tab_connection_generation_revision_request_and_scope() {
+        let registry = ConnectionRegistry::new();
+        let first_runtime = registry.register_unmanaged(create_shared_connection());
+        let second_runtime = registry.register_unmanaged(create_shared_connection());
+        let mut data = IntellisenseData::new();
+        data.users = vec!["HR".to_string()];
+        let update = SchemaUpdate {
+            data,
+            highlight_data: HighlightData::new(),
+            query_tab_id: 7,
+            connection_id: first_runtime.id(),
+            connection_generation: 11,
+            binding_revision: 13,
+            request_id: 17,
+            db_type: DatabaseType::Oracle,
+            requested_scope: Some("HR".to_string()),
+        };
+        let target = ActiveSchemaUpdateTarget {
+            query_tab_id: 7,
+            connection_id: first_runtime.id(),
+            connection_generation: 11,
+            binding_revision: 13,
+            request_id: 17,
+            db_type: DatabaseType::Oracle,
+            scope: Some("HR".to_string()),
+        };
+
+        assert!(MainWindow::schema_update_matches_target(&update, &target));
+
+        let mut stale = update.clone();
+        stale.connection_id = second_runtime.id();
+        assert!(!MainWindow::schema_update_matches_target(&stale, &target));
+        stale = update.clone();
+        stale.connection_generation += 1;
+        assert!(!MainWindow::schema_update_matches_target(&stale, &target));
+        stale = update.clone();
+        stale.binding_revision += 1;
+        assert!(!MainWindow::schema_update_matches_target(&stale, &target));
+        stale = update.clone();
+        stale.request_id += 1;
+        assert!(!MainWindow::schema_update_matches_target(&stale, &target));
+        stale = update;
+        stale.requested_scope = Some("SALES".to_string());
+        assert!(!MainWindow::schema_update_matches_target(&stale, &target));
     }
 
     #[test]
