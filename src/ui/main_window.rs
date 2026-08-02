@@ -27,22 +27,24 @@ use std::time::{Duration, Instant};
 use crate::app_icon;
 use crate::db::session_policy::{CancelTargetSnapshot, ExecutionState};
 use crate::db::{
-    create_shared_connection, format_connection_busy_message, try_lock_connection_with_activity,
-    ColumnInfo, DatabaseType, ObjectBrowser, QueryResult, RetainedSessionMutationOutcome,
-    RetainedSessionPreflightAction, RetainedSessionPreflightDecision,
-    RetainedSessionResolutionAction, SharedConnection, TransactionAccessMode, TransactionIsolation,
-    TransactionMode,
+    connect_shared_connection_with_policy, connection_transition_activity,
+    create_shared_connection, format_connection_busy_message,
+    resize_shared_connection_pool_with_policy, try_lock_connection_with_activity, ColumnInfo,
+    ConnectionAttemptPolicy, DatabaseType, ObjectBrowser, QueryResult,
+    RetainedSessionMutationOutcome, RetainedSessionPreflightAction,
+    RetainedSessionPreflightDecision, RetainedSessionResolutionAction, SharedConnection,
+    TransactionAccessMode, TransactionIsolation, TransactionMode,
 };
 use crate::ui::constants::*;
 use crate::ui::result_table::{ResultGridSqlExecuteCallback, ResultTableContextAction};
 use crate::ui::theme;
 use crate::ui::{
-    font_settings, show_settings_dialog, ConnectionDialog, FindReplaceDialog, HighlightData,
-    IntellisenseData, MenuBarBuilder, ObjectBrowserMetadataSnapshot, ObjectBrowserWidget,
-    QualifiedMemberKind, QueryCancelOutcome, QueryHistoryDialog, QueryOperationToken,
-    QueryProgress, QueryTabId, QueryTabsWidget, ResultMessageKind, ResultTabCloseTarget,
-    ResultTabId, ResultTabRequest, ResultTabStatus, ResultTabsWidget, SqlAction,
-    SqlEditorContextAction, SqlEditorWidget,
+    font_settings, show_settings_dialog, ConnectionDialog, FindReplaceDialog, FontSettings,
+    HighlightData, IntellisenseData, MenuBarBuilder, ObjectBrowserMetadataSnapshot,
+    ObjectBrowserWidget, QualifiedMemberKind, QueryCancelOutcome, QueryHistoryDialog,
+    QueryOperationToken, QueryProgress, QueryTabId, QueryTabsWidget, ResultMessageKind,
+    ResultTabCloseTarget, ResultTabId, ResultTabRequest, ResultTabStatus, ResultTabsWidget,
+    SqlAction, SqlEditorContextAction, SqlEditorWidget,
 };
 use crate::utils::arithmetic::{safe_div, safe_div_f64_to_usize, safe_rem};
 use crate::utils::{malloc_trim_process, AppConfig, QueryHistory};
@@ -1641,10 +1643,9 @@ impl AppState {
         if scope.is_empty() {
             return false;
         }
-        let conn_guard = self
-            .connection
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let Some(conn_guard) = crate::db::try_lock_connection(&self.connection) else {
+            return false;
+        };
         if !conn_guard.is_connected() {
             return false;
         }
@@ -2885,10 +2886,7 @@ impl AppState {
 
     fn retained_scope_update(&self, scope: Option<String>) -> Option<RetainedScopeUpdate> {
         let scope = Self::normalize_scope_name(scope)?;
-        let conn_guard = self
-            .connection
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let conn_guard = crate::db::try_lock_connection(&self.connection)?;
         if !conn_guard.is_connected() {
             return None;
         }
@@ -3331,6 +3329,10 @@ pub struct MainWindow {
 enum ConnectionResult {
     Success(Box<crate::db::ConnectionInfo>),
     Failure(String),
+    PoolResize {
+        settings: Box<FontSettings>,
+        result: Result<(), String>,
+    },
 }
 
 enum FileActionResult {
@@ -3662,17 +3664,20 @@ fn acquire_sql_editor_if_idle(state: &Arc<Mutex<AppState>>) -> Option<SqlEditorW
 }
 
 fn cancel_oldest_lazy_fetch_if_session_pool_full(state: &Arc<Mutex<AppState>>) -> bool {
-    let connection = {
-        state
+    let (connection, configured_pool_size) = {
+        let state = state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let configured_pool_size = state
+            .config
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .connection
-            .clone()
+            .normalized_connection_pool_size();
+        (state.connection.clone(), configured_pool_size)
     };
-    let connection_pool_size = connection
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .connection_pool_size();
+    let connection_pool_size = crate::db::try_lock_connection(&connection)
+        .map(|connection| connection.connection_pool_size())
+        .unwrap_or(configured_pool_size);
 
     let session_id = {
         let guard = state
@@ -4402,9 +4407,12 @@ impl MainWindow {
             drop(conn_guard);
             let lock_result = session.lock();
             match lock_result {
-                Ok(mut guard) => guard.reset(),
+                Ok(mut guard) => {
+                    guard.reset_for_connection(DatabaseType::default());
+                }
                 Err(poisoned) => {
-                    poisoned.into_inner().reset();
+                    let mut guard = poisoned.into_inner();
+                    guard.reset_for_connection(DatabaseType::default());
                 }
             }
         }
@@ -6093,6 +6101,41 @@ impl MainWindow {
         state
             .sql_editor
             .set_intellisense_popup_delay_ms(intellisense_popup_delay_ms);
+    }
+
+    fn persist_settings(
+        state: &mut AppState,
+        settings: FontSettings,
+        pool_size_changed: bool,
+    ) -> Result<(), String> {
+        let save_result = {
+            let mut config = state
+                .config
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            config.editor_font = settings.font.clone();
+            config.ui_font_size = settings.ui_size;
+            config.ui_scale_percent = settings.ui_scale_percent;
+            config.editor_font_size = settings.editor_size;
+            config.result_font = settings.font;
+            config.result_font_size = settings.result_size;
+            config.result_cell_max_chars = settings.result_cell_max_chars;
+            config.lazy_fetch_batch_size = settings.lazy_fetch_batch_size;
+            config.intellisense_context_window_kib = settings.intellisense_context_window_kib;
+            config.intellisense_popup_delay_ms = settings.intellisense_popup_delay_ms;
+            config.connection_pool_size = settings.connection_pool_size;
+            config.connect_timeout_seconds = settings.connect_timeout_seconds;
+            config.cancel_timeout_seconds = settings.cancel_timeout_seconds;
+            config.sql_comma_list_layout = settings.sql_comma_list_layout;
+            config.sql_format_right_margin = settings.sql_format_right_margin;
+            config.save().map_err(|err| err.to_string())
+        };
+        if pool_size_changed {
+            state.release_all_resolved_pooled_db_sessions()?;
+        }
+        Self::apply_lazy_fetch_settings(state);
+        Self::apply_font_settings(state);
+        save_result
     }
 
     fn apply_runtime_ui_font(state: &mut AppState, font: fltk::enums::Font, ui_size: i32) {
@@ -8172,17 +8215,29 @@ impl MainWindow {
                     return true;
                 }
 
-                let (popups, connection, pool_size) = {
+                let (popups, connection, pool_size, connect_policy) = {
                     let s = state
                         .lock()
                         .unwrap_or_else(|poisoned| poisoned.into_inner());
-                    let pool_size = s
+                    let config = s
                         .config
                         .lock()
-                        .unwrap_or_else(|poisoned| poisoned.into_inner())
-                        .normalized_connection_pool_size();
-                    (s.popups.clone(), s.connection.clone(), pool_size)
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    let pool_size = config.normalized_connection_pool_size();
+                    let connect_policy = ConnectionAttemptPolicy::from_config(&config);
+                    (
+                        s.popups.clone(),
+                        s.connection.clone(),
+                        pool_size,
+                        connect_policy,
+                    )
                 };
+                if let Some(activity) = connection_transition_activity(&connection) {
+                    crate::ui::alert_on_main(&format!(
+                        "Connection is busy. Current DB activity: {activity}"
+                    ));
+                    return true;
+                }
                 if let Some(info) = ConnectionDialog::show_with_registry(popups) {
                     if !Self::resolve_pooled_sessions_before_connection_transition(state) {
                         return true;
@@ -8196,52 +8251,45 @@ impl MainWindow {
                         s.status_bar
                             .set_label(&format!("Connecting to {}...", info.name));
                     }
-                    thread::spawn(move || {
-                        let Some(mut db_conn) = try_lock_connection_with_activity(
-                            &connection,
-                            format!("Connecting to {}", info.name),
-                        ) else {
-                            let _ = conn_sender
-                                .send(ConnectionResult::Failure(format_connection_busy_message()));
-                            app::awake();
-                            return;
-                        };
-                        crate::db::clear_pool_session_context_for_shared_connection(&connection);
-                        db_conn.set_connection_pool_size(pool_size);
-                        match db_conn.connect(info.clone()) {
-                            Ok(_) => {
-                                db_conn.refresh_tracked_connection();
-                                crate::db::refresh_pool_session_context_cache_for_shared_connection(
+                    let spawn_failure_sender = conn_sender.clone();
+                    if let Err(err) = thread::Builder::new()
+                        .name("space-query-connect".to_string())
+                        .spawn(move || {
+                            let result = panic::catch_unwind(AssertUnwindSafe(|| {
+                                connect_shared_connection_with_policy(
                                     &connection,
-                                    &db_conn,
-                                );
-                                let session = db_conn.session_state();
-                                drop(db_conn);
-                                match session.lock() {
-                                    Ok(mut guard) => guard.reset(),
-                                    Err(poisoned) => {
-                                        eprintln!(
-                                            "Warning: session state lock was poisoned; recovering."
-                                        );
-                                        poisoned.into_inner().reset();
-                                    }
+                                    info.clone(),
+                                    pool_size,
+                                    connect_policy,
+                                )
+                            }))
+                            .unwrap_or_else(|payload| {
+                                Err(format!(
+                                    "Connection worker terminated unexpectedly: {}",
+                                    panic_payload_to_string(payload.as_ref())
+                                ))
+                            });
+                            match result {
+                                Ok(_) => {
+                                    let mut info = info;
+                                    info.clear_password();
+                                    let _ =
+                                        conn_sender.send(ConnectionResult::Success(Box::new(info)));
+                                    app::awake();
                                 }
-                                let mut info = info;
-                                info.clear_password();
-                                let _ = conn_sender.send(ConnectionResult::Success(Box::new(info)));
-                                app::awake();
+                                Err(e) => {
+                                    let _ =
+                                        conn_sender.send(ConnectionResult::Failure(e.to_string()));
+                                    app::awake();
+                                }
                             }
-                            Err(e) => {
-                                crate::db::refresh_pool_session_context_cache_for_shared_connection(
-                                    &connection,
-                                    &db_conn,
-                                );
-                                drop(db_conn);
-                                let _ = conn_sender.send(ConnectionResult::Failure(e.to_string()));
-                                app::awake();
-                            }
-                        }
-                    });
+                        })
+                    {
+                        let _ = spawn_failure_sender.send(ConnectionResult::Failure(format!(
+                            "Could not start connection worker: {err}"
+                        )));
+                        app::awake();
+                    }
                 }
                 true
             }
@@ -8840,7 +8888,7 @@ impl MainWindow {
                 true
             }
             "Settings/Preferences" => {
-                let config_snapshot = {
+                let (config_snapshot, connection) = {
                     let s = state
                         .lock()
                         .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -8849,92 +8897,84 @@ impl MainWindow {
                         .lock()
                         .unwrap_or_else(|poisoned| poisoned.into_inner())
                         .clone();
-                    config_snapshot
+                    (config_snapshot, s.connection.clone())
                 };
+                if let Some(activity) = connection_transition_activity(&connection) {
+                    crate::ui::alert_on_main(&format!(
+                        "Connection is busy. Current DB activity: {activity}"
+                    ));
+                    return true;
+                }
                 if let Some(settings) = show_settings_dialog(&config_snapshot) {
                     let pool_size_changed = settings.connection_pool_size
                         != config_snapshot.normalized_connection_pool_size();
-                    if pool_size_changed && !Self::resolve_pooled_sessions_before_pool_resize(state)
-                    {
-                        return true;
-                    }
-                    let resize_result = if pool_size_changed {
-                        let (connection, blocked) = {
-                            let s = state
+                    if !pool_size_changed {
+                        let save_result = {
+                            let mut s = state
                                 .lock()
                                 .unwrap_or_else(|poisoned| poisoned.into_inner());
-                            (
-                                s.connection.clone(),
-                                s.is_any_query_running() || s.has_active_lazy_fetches(),
-                            )
+                            MainWindow::persist_settings(&mut s, settings, false)
                         };
-                        if blocked {
-                            Err(
-                                "Finish or cancel running queries and lazy fetches before changing connection pool size."
-                                    .to_string(),
-                            )
-                        } else if let Some(mut connection_guard) = try_lock_connection_with_activity(
-                            &connection,
-                            "Updating session pool preference",
-                        ) {
-                            crate::db::clear_pool_session_context_for_shared_connection(
-                                &connection,
-                            );
-                            let resize_result = connection_guard
-                                .resize_current_connection_pool(settings.connection_pool_size);
-                            if resize_result.is_ok() {
-                                crate::db::refresh_pool_session_context_cache_for_shared_connection(
-                                    &connection,
-                                    &connection_guard,
-                                );
-                            }
-                            resize_result
-                        } else {
-                            Err(format_connection_busy_message())
+                        MainWindow::apply_configured_ui_scale(state);
+                        app::flush();
+                        if let Err(err) = save_result {
+                            crate::ui::alert_on_main(&format!("Failed to save settings: {}", err));
                         }
-                    } else {
-                        Ok(())
-                    };
+                        return true;
+                    }
 
-                    let save_result = resize_result.and_then(|_| {
+                    if !Self::resolve_pooled_sessions_before_pool_resize(state) {
+                        return true;
+                    }
+                    let blocked = {
+                        let s = state
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner());
+                        s.is_any_query_running() || s.has_active_lazy_fetches()
+                    };
+                    if blocked {
+                        crate::ui::alert_on_main(
+                            "Finish or cancel running queries and lazy fetches before changing connection pool size.",
+                        );
+                        return true;
+                    }
+
+                    {
                         let mut s = state
                             .lock()
                             .unwrap_or_else(|poisoned| poisoned.into_inner());
-                        let save_result = {
-                            let mut config = s
-                                .config
-                                .lock()
-                                .unwrap_or_else(|poisoned| poisoned.into_inner());
-                            config.editor_font = settings.font.clone();
-                            config.ui_font_size = settings.ui_size;
-                            config.ui_scale_percent = settings.ui_scale_percent;
-                            config.editor_font_size = settings.editor_size;
-                            config.result_font = settings.font;
-                            config.result_font_size = settings.result_size;
-                            config.result_cell_max_chars = settings.result_cell_max_chars;
-                            config.lazy_fetch_batch_size = settings.lazy_fetch_batch_size;
-                            config.intellisense_context_window_kib =
-                                settings.intellisense_context_window_kib;
-                            config.intellisense_popup_delay_ms =
-                                settings.intellisense_popup_delay_ms;
-                            config.connection_pool_size = settings.connection_pool_size;
-                            config.cancel_timeout_seconds = settings.cancel_timeout_seconds;
-                            config.sql_comma_list_layout = settings.sql_comma_list_layout;
-                            config.sql_format_right_margin = settings.sql_format_right_margin;
-                            config.save()
-                        };
-                        if pool_size_changed {
-                            s.release_all_resolved_pooled_db_sessions()?;
-                        }
-                        MainWindow::apply_lazy_fetch_settings(&mut s);
-                        MainWindow::apply_font_settings(&mut s);
-                        save_result.map_err(|err| err.to_string())
-                    });
-                    MainWindow::apply_configured_ui_scale(state);
-                    // Apply pending font and scale redraws only after releasing AppState.
-                    app::flush();
-                    if let Err(err) = save_result {
-                        crate::ui::alert_on_main(&format!("Failed to save settings: {}", err));
+                        s.status_bar.set_label("Rebuilding connection pool...");
+                    }
+                    let sender = conn_sender.clone();
+                    let spawn_failure_sender = sender.clone();
+                    let spawn_failure_settings = settings.clone();
+                    let size = settings.connection_pool_size;
+                    let policy =
+                        ConnectionAttemptPolicy::from_seconds(settings.connect_timeout_seconds);
+                    if let Err(err) = thread::Builder::new()
+                        .name("space-query-pool-resize".to_string())
+                        .spawn(move || {
+                            let result = panic::catch_unwind(AssertUnwindSafe(|| {
+                                resize_shared_connection_pool_with_policy(&connection, size, policy)
+                            }))
+                            .unwrap_or_else(|payload| {
+                                Err(format!(
+                                    "Connection pool resize worker terminated unexpectedly: {}",
+                                    panic_payload_to_string(payload.as_ref())
+                                ))
+                            });
+                            let _ = sender.send(ConnectionResult::PoolResize {
+                                settings: Box::new(settings),
+                                result,
+                            });
+                            app::awake();
+                        })
+                    {
+                        let _ = spawn_failure_sender.send(ConnectionResult::PoolResize {
+                            settings: Box::new(spawn_failure_settings),
+                            result: Err(format!("Could not start pool resize worker: {err}")),
+                        });
+                        app::awake();
                     }
                 }
                 true
@@ -10067,6 +10107,44 @@ impl MainWindow {
                                     }
                                     s.result_tabs.select_messages_errors();
                                 }
+                                ConnectionResult::PoolResize { settings, result } => match result {
+                                    Ok(()) => {
+                                        let save_result =
+                                            MainWindow::persist_settings(&mut s, *settings, true);
+                                        if let Err(err) = save_result {
+                                            crate::utils::logging::log_error(
+                                                "settings",
+                                                &format!("Failed to save settings: {err}"),
+                                            );
+                                            s.status_bar.set_label("Failed to save settings");
+                                            s.result_tabs.append_message_lines(
+                                                ResultMessageKind::Error,
+                                                &[format!("Failed to save settings: {err}")],
+                                            );
+                                            s.result_tabs.select_messages_errors();
+                                        } else {
+                                            s.status_bar
+                                                .set_label("Connection pool preference updated");
+                                        }
+                                        let state_for_scale = Arc::clone(&state);
+                                        crate::ui::ui_timeout::schedule(0.0, move || {
+                                            MainWindow::apply_configured_ui_scale(&state_for_scale);
+                                            app::flush();
+                                        });
+                                    }
+                                    Err(err) => {
+                                        crate::utils::logging::log_error(
+                                            "connection pool",
+                                            &format!("Failed to resize connection pool: {err}"),
+                                        );
+                                        s.status_bar.set_label("Connection pool update failed");
+                                        s.result_tabs.append_message_lines(
+                                            ResultMessageKind::Error,
+                                            &[format!("Failed to resize connection pool: {err}")],
+                                        );
+                                        s.result_tabs.select_messages_errors();
+                                    }
+                                },
                             }
                         }
                         Err(std::sync::mpsc::TryRecvError::Empty) => break,

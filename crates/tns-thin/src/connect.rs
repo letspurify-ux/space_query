@@ -136,6 +136,9 @@ pub struct ConnectOptions {
     pub desired_ttc_field_version: Option<u8>,
     pub disable_oob_probe: bool,
     pub tcp_connect_timeout: Duration,
+    /// Read/write timeout used only while establishing and authenticating a session.
+    /// `OracleThinSession::connect` clears it after login succeeds.
+    pub connect_io_timeout: Duration,
     pub retry_count: u32,
     pub retry_delay: Duration,
     pub expire_time: u32,
@@ -152,6 +155,7 @@ impl Default for ConnectOptions {
             desired_ttc_field_version: None,
             disable_oob_probe: false,
             tcp_connect_timeout: TNS_DEFAULT_TCP_CONNECT_TIMEOUT,
+            connect_io_timeout: TNS_DEFAULT_SOCKET_TIMEOUT,
             retry_count: 0,
             retry_delay: Duration::from_secs(1),
             expire_time: 0,
@@ -199,8 +203,10 @@ impl OracleNetConnector {
                     log_connect_phase("tcp-connect", &format!("{host}:{port}"));
                     let stream = connect_socket(&host, port, self.options.tcp_connect_timeout)?;
                     configure_socket(&stream, &self.options)?;
-                    let _ = stream.set_read_timeout(Some(TNS_DEFAULT_SOCKET_TIMEOUT));
-                    let _ = stream.set_write_timeout(Some(TNS_DEFAULT_SOCKET_TIMEOUT));
+                    let io_timeout = (!self.options.connect_io_timeout.is_zero())
+                        .then_some(self.options.connect_io_timeout);
+                    stream.set_read_timeout(io_timeout)?;
+                    stream.set_write_timeout(io_timeout)?;
                     match self.connect_tns(stream, &connect_data, packet_flags)? {
                         ConnectOutcome::Accepted(stream, accept) => return Ok((stream, accept)),
                         ConnectOutcome::Redirect(redirect_data) => {

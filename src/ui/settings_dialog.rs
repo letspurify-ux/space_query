@@ -20,13 +20,15 @@ use crate::ui::constants::*;
 use crate::ui::{available_font_names, center_on_main, resolved_font_name, theme};
 use crate::utils::{
     AppConfig, SqlCommaListLayout, MAX_CANCEL_TIMEOUT_SECONDS, MAX_CONNECTION_POOL_SIZE,
-    MAX_FONT_SIZE, MAX_INTELLISENSE_CONTEXT_WINDOW_KIB, MAX_INTELLISENSE_POPUP_DELAY_MS,
-    MAX_LAZY_FETCH_BATCH_SIZE, MAX_SQL_FORMAT_RIGHT_MARGIN, MAX_UI_FONT_SIZE, MAX_UI_SCALE_PERCENT,
-    MIN_CANCEL_TIMEOUT_SECONDS, MIN_CONNECTION_POOL_SIZE, MIN_FONT_SIZE,
-    MIN_INTELLISENSE_CONTEXT_WINDOW_KIB, MIN_INTELLISENSE_POPUP_DELAY_MS,
-    MIN_LAZY_FETCH_BATCH_SIZE, MIN_SQL_FORMAT_RIGHT_MARGIN, MIN_UI_FONT_SIZE, MIN_UI_SCALE_PERCENT,
+    MAX_CONNECT_TIMEOUT_SECONDS, MAX_FONT_SIZE, MAX_INTELLISENSE_CONTEXT_WINDOW_KIB,
+    MAX_INTELLISENSE_POPUP_DELAY_MS, MAX_LAZY_FETCH_BATCH_SIZE, MAX_SQL_FORMAT_RIGHT_MARGIN,
+    MAX_UI_FONT_SIZE, MAX_UI_SCALE_PERCENT, MIN_CANCEL_TIMEOUT_SECONDS, MIN_CONNECTION_POOL_SIZE,
+    MIN_CONNECT_TIMEOUT_SECONDS, MIN_FONT_SIZE, MIN_INTELLISENSE_CONTEXT_WINDOW_KIB,
+    MIN_INTELLISENSE_POPUP_DELAY_MS, MIN_LAZY_FETCH_BATCH_SIZE, MIN_SQL_FORMAT_RIGHT_MARGIN,
+    MIN_UI_FONT_SIZE, MIN_UI_SCALE_PERCENT,
 };
 
+#[derive(Clone)]
 pub struct FontSettings {
     pub font: String,
     pub ui_size: u32,
@@ -38,6 +40,7 @@ pub struct FontSettings {
     pub intellisense_context_window_kib: u32,
     pub intellisense_popup_delay_ms: u32,
     pub connection_pool_size: u32,
+    pub connect_timeout_seconds: u32,
     pub cancel_timeout_seconds: u32,
     pub sql_comma_list_layout: SqlCommaListLayout,
     pub sql_format_right_margin: u32,
@@ -179,6 +182,23 @@ fn validate_cancel_timeout_seconds(value: &str) -> Option<u32> {
             crate::ui::alert_on_main(&format!(
                 "Cancel timeout must be a number between {} and {} seconds.",
                 MIN_CANCEL_TIMEOUT_SECONDS, MAX_CANCEL_TIMEOUT_SECONDS
+            ));
+            None
+        }
+    }
+}
+
+fn validate_connect_timeout_seconds(value: &str) -> Option<u32> {
+    match value.trim().parse::<u32>() {
+        Ok(seconds)
+            if (MIN_CONNECT_TIMEOUT_SECONDS..=MAX_CONNECT_TIMEOUT_SECONDS).contains(&seconds) =>
+        {
+            Some(seconds)
+        }
+        _ => {
+            crate::ui::alert_on_main(&format!(
+                "Connect timeout must be a number between {} and {} seconds.",
+                MIN_CONNECT_TIMEOUT_SECONDS, MAX_CONNECT_TIMEOUT_SECONDS
             ));
             None
         }
@@ -563,6 +583,19 @@ pub fn show_settings_dialog(config: &AppConfig) -> Option<FontSettings> {
     pool_size_row.end();
     connection_flex.fixed(&pool_size_row, INPUT_ROW_HEIGHT);
 
+    let mut connect_timeout_row = Flex::default().with_size(0, INPUT_ROW_HEIGHT);
+    connect_timeout_row.set_type(FlexType::Row);
+    connect_timeout_row.set_spacing(DIALOG_SPACING);
+    let mut connect_timeout_label = Frame::default().with_label("Connect Timeout:");
+    connect_timeout_label.set_label_color(theme::text_primary());
+    connect_timeout_row.fixed(&connect_timeout_label, FORM_LABEL_WIDTH);
+    let mut connect_timeout_input = IntInput::default();
+    connect_timeout_input.set_value(&config.normalized_connect_timeout_seconds().to_string());
+    connect_timeout_input.set_color(theme::input_bg());
+    connect_timeout_input.set_text_color(theme::text_primary());
+    connect_timeout_row.end();
+    connection_flex.fixed(&connect_timeout_row, INPUT_ROW_HEIGHT);
+
     let mut cancel_timeout_row = Flex::default().with_size(0, INPUT_ROW_HEIGHT);
     cancel_timeout_row.set_type(FlexType::Row);
     cancel_timeout_row.set_spacing(DIALOG_SPACING);
@@ -582,6 +615,13 @@ pub fn show_settings_dialog(config: &AppConfig) -> Option<FontSettings> {
     ));
     pool_hint.set_label_color(theme::text_secondary());
     connection_flex.fixed(&pool_hint, LABEL_ROW_HEIGHT);
+
+    let mut connect_timeout_hint = Frame::default().with_label(&format!(
+        "Connect timeout: {} ~ {} sec",
+        MIN_CONNECT_TIMEOUT_SECONDS, MAX_CONNECT_TIMEOUT_SECONDS
+    ));
+    connect_timeout_hint.set_label_color(theme::text_secondary());
+    connection_flex.fixed(&connect_timeout_hint, LABEL_ROW_HEIGHT);
 
     let mut cancel_timeout_hint = Frame::default().with_label(&format!(
         "Cancel timeout: {} ~ {} sec",
@@ -767,6 +807,7 @@ pub fn show_settings_dialog(config: &AppConfig) -> Option<FontSettings> {
     let context_window_input_ok = context_window_input.clone();
     let popup_delay_input_ok = popup_delay_input.clone();
     let pool_size_input_ok = pool_size_input.clone();
+    let connect_timeout_input_ok = connect_timeout_input.clone();
     let cancel_timeout_input_ok = cancel_timeout_input.clone();
     let comma_layout_choice_ok = comma_layout_choice.clone();
     let right_margin_input_ok = right_margin_input.clone();
@@ -813,6 +854,11 @@ pub fn show_settings_dialog(config: &AppConfig) -> Option<FontSettings> {
             Some(size) => size,
             None => return,
         };
+        let connect_timeout_seconds =
+            match validate_connect_timeout_seconds(&connect_timeout_input_ok.value()) {
+                Some(seconds) => seconds,
+                None => return,
+            };
         let cancel_timeout_seconds =
             match validate_cancel_timeout_seconds(&cancel_timeout_input_ok.value()) {
                 Some(seconds) => seconds,
@@ -850,6 +896,7 @@ pub fn show_settings_dialog(config: &AppConfig) -> Option<FontSettings> {
             intellisense_context_window_kib,
             intellisense_popup_delay_ms,
             connection_pool_size,
+            connect_timeout_seconds,
             cancel_timeout_seconds,
             sql_comma_list_layout,
             sql_format_right_margin,

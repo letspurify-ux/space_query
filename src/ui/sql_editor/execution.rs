@@ -34,11 +34,11 @@ use tns_thin::{OracleDateTime, OracleThinCancelHandle, OracleThinSession};
 
 use crate::db::{
     cache_pool_session_context_for_shared_connection,
-    clear_pool_session_context_for_shared_connection, lock_connection_with_activity,
-    result_messages, BindDataType, BindValue, BindVar, ColumnInfo, CursorResult, DbPoolSession,
-    DbSessionLease, ObjectBrowser, QueryCell, QueryExecutor, QueryResult, ResolvedBind,
-    RetainedSessionState, ScriptItem, SessionState, SharedDbSessionLease, ToolCommand,
-    TransactionSessionState,
+    clear_pool_session_context_for_shared_connection, connect_shared_connection_with_policy,
+    lock_connection_with_activity, result_messages, BindDataType, BindValue, BindVar, ColumnInfo,
+    ConnectionAttemptPolicy, CursorResult, DbPoolSession, DbSessionLease, ObjectBrowser, QueryCell,
+    QueryExecutor, QueryResult, ResolvedBind, RetainedSessionState, ScriptItem, SessionState,
+    SharedDbSessionLease, ToolCommand, TransactionSessionState,
 };
 use crate::sql_text;
 use crate::utils::arithmetic::{safe_div, safe_rem};
@@ -9951,17 +9951,27 @@ impl SqlEditorWidget {
                                         );
                                         command_error = true;
                                     } else {
-                                        let connect_result = {
-                                            let mut conn_guard = lock_connection_with_activity(
+                                        let pool_size = {
+                                            let conn_guard = lock_connection_with_activity(
                                                 &shared_connection,
                                                 db_activity.clone(),
                                             );
-                                            clear_pool_session_context_for_shared_connection(
+                                            conn_guard.connection_pool_size()
+                                        };
+                                        let connect_attempt =
+                                            connect_shared_connection_with_policy(
                                                 &shared_connection,
+                                                conn_info.clone(),
+                                                pool_size,
+                                                ConnectionAttemptPolicy::runtime(),
                                             );
-                                            match conn_guard.connect(conn_info.clone()) {
+                                        let connect_result = {
+                                            let conn_guard = lock_connection_with_activity(
+                                                &shared_connection,
+                                                db_activity.clone(),
+                                            );
+                                            match connect_attempt {
                                                 Ok(_) => {
-                                                    conn_guard.refresh_tracked_connection();
                                                     let conn_opt_local = conn_guard.get_connection();
                                                     let sanitized =
                                                         SqlEditorWidget::connection_info_for_ui(
@@ -9973,10 +9983,6 @@ impl SqlEditorWidget {
                                                         } else {
                                                             String::new()
                                                         };
-                                                    crate::db::refresh_pool_session_context_cache_for_shared_connection(
-                                                        &shared_connection,
-                                                        &conn_guard,
-                                                    );
                                                     Ok((conn_opt_local, sanitized, conn_name_local))
                                                 }
                                                 Err(err) => {
@@ -9995,10 +10001,6 @@ impl SqlEditorWidget {
                                                     } else {
                                                         (None, String::new(), None)
                                                     };
-                                                    crate::db::refresh_pool_session_context_cache_for_shared_connection(
-                                                        &shared_connection,
-                                                        &conn_guard,
-                                                    );
                                                     Err((err, preserved))
                                                 }
                                             }
@@ -10021,15 +10023,6 @@ impl SqlEditorWidget {
                                                         &current_query_cancel_handle,
                                                         Some(Arc::clone(conn)),
                                                     );
-                                                }
-                                                match session.lock() {
-                                                    Ok(mut guard) => guard.reset(),
-                                                    Err(poisoned) => {
-                                                        eprintln!(
-                                                            "Warning: session state lock was poisoned; recovering."
-                                                        );
-                                                        poisoned.into_inner().reset();
-                                                    }
                                                 }
                                                 SqlEditorWidget::emit_script_message(
                                                     &sender,
@@ -10188,12 +10181,19 @@ impl SqlEditorWidget {
                                         conn_opt = next_conn_opt;
                                         conn_name = next_conn_name;
                                         match session.lock() {
-                                            Ok(mut guard) => guard.reset(),
+                                            Ok(mut guard) => {
+                                                guard.reset_for_connection(
+                                                    crate::db::DatabaseType::default(),
+                                                );
+                                            }
                                             Err(poisoned) => {
                                                 eprintln!(
                                                     "Warning: session state lock was poisoned; recovering."
                                                 );
-                                                poisoned.into_inner().reset();
+                                                let mut guard = poisoned.into_inner();
+                                                guard.reset_for_connection(
+                                                    crate::db::DatabaseType::default(),
+                                                );
                                             }
                                         }
                                         let disconnect_message = if had_connection {

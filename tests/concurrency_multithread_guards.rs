@@ -149,6 +149,45 @@ fn shared_connection_is_arc_mutex() {
 }
 
 #[test]
+fn connection_attempts_are_prepared_outside_the_shared_connection_mutex() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let connection = fs::read_to_string(root.join("src/db/connection.rs"))
+        .expect("connection source should be readable");
+    let main_window = fs::read_to_string(root.join("src/ui/main_window.rs"))
+        .expect("main window source should be readable");
+    let execution = fs::read_to_string(root.join("src/ui/sql_editor/execution.rs"))
+        .expect("execution source should be readable");
+
+    assert!(connection.contains("fn prepare_connection("));
+    assert!(connection.contains("fn install_prepared_connection("));
+    assert!(main_window.contains("connect_shared_connection_with_policy("));
+    assert!(execution.contains("connect_shared_connection_with_policy("));
+    assert!(!main_window.contains("db_conn.connect(info.clone())"));
+    assert!(!execution.contains("conn_guard.connect(conn_info.clone())"));
+    let compact_main_window = main_window.split_whitespace().collect::<String>();
+    assert!(!compact_main_window.contains(".connection.lock()"));
+}
+
+#[test]
+fn sql_editor_ui_connection_reads_do_not_block_on_the_shared_mutex() {
+    let file = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/ui/sql_editor/mod.rs");
+    let content = fs::read_to_string(&file)
+        .unwrap_or_else(|err| panic!("failed to read source file {}: {err}", file.display()));
+    let start = content
+        .find("fn current_db_type(&self)")
+        .expect("current_db_type should exist");
+    let end = content[start..]
+        .find("fn mysql_delimiter_before_offset")
+        .map(|offset| start + offset)
+        .expect("delimiter helper should follow current_db_type");
+    let helpers = &content[start..end];
+
+    assert!(helpers.contains("db_type_without_blocking(&self.connection)"));
+    assert!(helpers.contains("intellisense_runtime.session_state()"));
+    assert!(!helpers.contains("self.connection.lock()"));
+}
+
+#[test]
 fn oracle_execution_pool_acquire_happens_outside_connection_mutex() {
     let file = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/ui/sql_editor/execution.rs");
     let content = fs::read_to_string(&file)

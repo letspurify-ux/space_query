@@ -12,14 +12,15 @@ use fltk::{
     window::Window,
 };
 use std::cmp::Ordering;
+use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use std::thread;
 
 use crate::db::{
-    ConnectionAdvancedSettings, ConnectionInfo, ConnectionSslMode, DatabaseConnection,
-    DatabaseType, OracleDriverMode, OracleNetworkProtocol, TransactionAccessMode,
-    TransactionIsolation,
+    ConnectionAdvancedSettings, ConnectionAttemptPolicy, ConnectionInfo, ConnectionSslMode,
+    DatabaseConnection, DatabaseType, OracleDriverMode, OracleNetworkProtocol,
+    TransactionAccessMode, TransactionIsolation,
 };
 use crate::ui::constants::*;
 use crate::ui::theme;
@@ -1735,10 +1736,16 @@ impl ConnectionDialog {
         );
 
         let mut connect_btn_for_enter = connect_btn.clone();
+        let test_in_progress_for_enter = Arc::clone(&test_in_progress);
         dialog.handle(move |_, ev| match ev {
             Event::KeyDown => {
                 if matches!(app::event_key(), Key::Enter | Key::KPEnter) {
-                    connect_btn_for_enter.do_callback();
+                    let test_running = *test_in_progress_for_enter
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    if !test_running && connect_btn_for_enter.active() {
+                        connect_btn_for_enter.do_callback();
+                    }
                     true
                 } else {
                     false
@@ -1999,6 +2006,7 @@ impl ConnectionDialog {
         // Test button callback
         let sender_for_test = sender.clone();
         let mut test_btn_for_toggle = test_btn.clone();
+        let mut connect_btn_for_test = connect_btn.clone();
         let test_in_progress_for_test = test_in_progress.clone();
         let name_input_test = name_input.clone();
         let user_input_test = user_input.clone();
@@ -2073,6 +2081,7 @@ impl ConnectionDialog {
                 oracle_thin_protocol_from_choice_index(oracle_thin_protocol_choice_test.value());
 
             test_btn_for_toggle.deactivate();
+            connect_btn_for_test.deactivate();
             let _ = sender_for_test.send(DialogMessage::SetTestInProgress(true));
             let _ = sender_for_test.send(DialogMessage::Test(info));
             app::awake();
@@ -2101,8 +2110,15 @@ impl ConnectionDialog {
         let oracle_protocol_choice_conn = oracle_protocol_choice.clone();
         let oracle_nls_date_input_conn = oracle_nls_date_input.clone();
         let oracle_nls_timestamp_input_conn = oracle_nls_timestamp_input.clone();
+        let test_in_progress_for_connect = Arc::clone(&test_in_progress);
 
         connect_btn.set_callback(move |_| {
+            if *test_in_progress_for_connect
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+            {
+                return;
+            }
             let db_type = db_type_from_choice_index(dbtype_choice_conn.value());
             let advanced = advanced_settings_from_form(
                 db_type,
@@ -2185,16 +2201,39 @@ impl ConnectionDialog {
                     }
                     DialogMessage::Test(info) => {
                         let sender = sender.clone();
-                        thread::spawn(move || {
-                            let _activity_guard = crate::db::track_db_activity(
-                                format!("Testing connection to {}", info.name),
-                                Some(info.db_type),
-                            );
-                            let result = DatabaseConnection::test_connection(&info);
-                            let _ = sender.send(DialogMessage::TestResult(result));
-                            let _ = sender.send(DialogMessage::SetTestInProgress(false));
+                        let spawn_failure_sender = sender.clone();
+                        let policy = {
+                            let config = config
+                                .lock()
+                                .unwrap_or_else(|poisoned| poisoned.into_inner());
+                            ConnectionAttemptPolicy::from_config(&config)
+                        };
+                        if let Err(err) = thread::Builder::new()
+                            .name("space-query-connection-test".to_string())
+                            .spawn(move || {
+                                let _activity_guard = crate::db::track_db_activity(
+                                    format!("Testing connection to {}", info.name),
+                                    Some(info.db_type),
+                                );
+                                let result = catch_unwind(AssertUnwindSafe(|| {
+                                    DatabaseConnection::test_connection_with_policy(&info, policy)
+                                }))
+                                .unwrap_or_else(|_| {
+                                    Err("Connection test worker terminated unexpectedly"
+                                        .to_string())
+                                });
+                                let _ = sender.send(DialogMessage::TestResult(result));
+                                let _ = sender.send(DialogMessage::SetTestInProgress(false));
+                                app::awake();
+                            })
+                        {
+                            let _ = spawn_failure_sender.send(DialogMessage::TestResult(Err(
+                                format!("Could not start connection test worker: {err}"),
+                            )));
+                            let _ =
+                                spawn_failure_sender.send(DialogMessage::SetTestInProgress(false));
                             app::awake();
-                        });
+                        }
                     }
                     DialogMessage::SetTestInProgress(in_progress) => {
                         *test_in_progress
@@ -2202,8 +2241,10 @@ impl ConnectionDialog {
                             .unwrap_or_else(|poisoned| poisoned.into_inner()) = in_progress;
                         if in_progress {
                             test_btn.deactivate();
+                            connect_btn.deactivate();
                         } else {
                             test_btn.activate();
+                            connect_btn.activate();
                         }
                     }
                     DialogMessage::TestResult(result) => match result {

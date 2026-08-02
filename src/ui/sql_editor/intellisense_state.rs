@@ -760,18 +760,13 @@ impl IntellisenseRuntimeState {
         &self,
         connection: &SharedConnection,
     ) -> crate::db::connection::DatabaseType {
-        match connection.try_lock() {
-            Ok(conn_guard) => {
+        match crate::db::try_lock_connection(connection) {
+            Some(conn_guard) => {
                 let db_type = conn_guard.db_type();
                 self.update_cached_db_type(db_type);
                 db_type
             }
-            Err(std::sync::TryLockError::Poisoned(poisoned)) => {
-                let db_type = poisoned.into_inner().db_type();
-                self.update_cached_db_type(db_type);
-                db_type
-            }
-            Err(std::sync::TryLockError::WouldBlock) => self.cached_db_type(),
+            None => self.cached_db_type(),
         }
     }
 

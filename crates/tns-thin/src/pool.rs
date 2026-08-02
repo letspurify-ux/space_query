@@ -29,6 +29,12 @@ impl Default for PoolOptions {
     }
 }
 
+fn pool_acquire_deadline(timeout: Duration) -> Result<Instant, OracleThinError> {
+    Instant::now().checked_add(timeout).ok_or_else(|| {
+        OracleThinError::new("Oracle thin pool acquire timeout exceeds the supported range")
+    })
+}
+
 pub trait PoolableConnection: Sized {
     fn connect_for_pool(config: OracleThinConfig) -> Result<Self, OracleThinError>;
     fn begin_request_for_pool(&mut self) -> Result<(), OracleThinError>;
@@ -101,7 +107,7 @@ impl OracleThinSessionPool {
     }
 
     pub fn acquire(&self) -> Result<PooledThinConnection<OracleThinSession>, OracleThinError> {
-        let deadline = Instant::now() + self.inner.options.acquire_timeout;
+        let deadline = pool_acquire_deadline(self.inner.options.acquire_timeout)?;
         let mut guard = self
             .inner
             .mutex
@@ -210,7 +216,7 @@ impl OracleThinSessionPool {
 fn acquire_from_pool<T: PoolableConnection>(
     state: Arc<PoolShared<T>>,
 ) -> Result<PooledThinConnection<T>, OracleThinError> {
-    let deadline = Instant::now() + state.options.acquire_timeout;
+    let deadline = pool_acquire_deadline(state.options.acquire_timeout)?;
     let mut guard = state
         .mutex
         .lock()
@@ -372,7 +378,7 @@ impl<T: PoolableConnection> DerefMut for PooledThinConnection<T> {
 
 #[cfg(test)]
 mod tests {
-    use super::PoolOptions;
+    use super::{pool_acquire_deadline, PoolOptions};
     use std::time::Duration;
 
     #[test]
@@ -380,5 +386,15 @@ mod tests {
         let options = PoolOptions::default();
         assert_eq!(options.max_size, 4);
         assert_eq!(options.acquire_timeout, Duration::from_secs(5));
+    }
+
+    #[test]
+    fn oversized_pool_timeout_returns_an_error_instead_of_panicking() {
+        let outcome = std::panic::catch_unwind(|| pool_acquire_deadline(Duration::MAX));
+
+        assert!(outcome.is_ok());
+        if let Err(err) = outcome.expect("deadline calculation should not panic") {
+            assert!(err.to_string().contains("exceeds the supported range"));
+        }
     }
 }

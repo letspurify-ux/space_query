@@ -11,7 +11,7 @@ use std::fs;
 use std::ops::{Deref, DerefMut};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard, OnceLock, Weak};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock, Weak};
 use std::time::{Duration, Instant};
 use tns_thin::exec::{OracleValue, StatementRequest};
 use tns_thin::pool::{PoolOptions as OracleThinPoolOptions, PooledThinConnection};
@@ -28,7 +28,9 @@ use crate::db::transaction::{
 };
 use crate::utils::arithmetic::safe_div;
 use crate::utils::config::{
-    DEFAULT_CONNECTION_POOL_SIZE, MAX_CONNECTION_POOL_SIZE, MIN_CONNECTION_POOL_SIZE,
+    AppConfig, DEFAULT_CONNECTION_POOL_SIZE, DEFAULT_CONNECT_TIMEOUT_SECONDS,
+    MAX_CONNECTION_POOL_SIZE, MAX_CONNECT_TIMEOUT_SECONDS, MIN_CONNECTION_POOL_SIZE,
+    MIN_CONNECT_TIMEOUT_SECONDS,
 };
 use crate::utils::logging;
 
@@ -43,8 +45,207 @@ const POOL_SESSION_ACQUIRE_TIMEOUT: Duration = Duration::from_secs(5);
 const STALE_POOL_CONTEXT_MESSAGE: &str =
     "Connection changed before a pooled session could be acquired. Retry the action.";
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct ConnectionAttemptPolicy {
+    timeout: Duration,
+}
+
+impl ConnectionAttemptPolicy {
+    pub(crate) fn from_config(config: &AppConfig) -> Self {
+        Self::from_seconds(config.normalized_connect_timeout_seconds())
+    }
+
+    pub(crate) fn runtime() -> Self {
+        Self::from_config(&AppConfig::runtime())
+    }
+
+    pub(crate) fn from_seconds(seconds: u32) -> Self {
+        Self {
+            timeout: Duration::from_secs(
+                seconds.clamp(MIN_CONNECT_TIMEOUT_SECONDS, MAX_CONNECT_TIMEOUT_SECONDS) as u64,
+            ),
+        }
+    }
+
+    pub(crate) fn timeout(self) -> Duration {
+        self.timeout
+    }
+}
+
+impl Default for ConnectionAttemptPolicy {
+    fn default() -> Self {
+        Self::from_seconds(DEFAULT_CONNECT_TIMEOUT_SECONDS)
+    }
+}
+
+type ConnectionCleanupTask = Box<dyn FnOnce() + Send + 'static>;
+
+static PENDING_CONNECTION_CLEANUPS: OnceLock<Mutex<Vec<ConnectionCleanupTask>>> = OnceLock::new();
+
+fn run_connection_attempt<T, F>(
+    policy: ConnectionAttemptPolicy,
+    description: String,
+    task: F,
+) -> Result<T, String>
+where
+    T: Send + 'static,
+    F: FnOnce() -> Result<T, String> + Send + 'static,
+{
+    let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+    let worker_description = description.clone();
+    std::thread::Builder::new()
+        .name("space-query-connection-attempt".to_string())
+        .spawn(move || {
+            let worker = || {
+                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(task))
+                    .map_err(|_| format!("{worker_description} worker terminated unexpectedly"))
+                    .and_then(|result| result);
+                let _ = sender.send(result);
+            };
+            if std::panic::catch_unwind(std::panic::AssertUnwindSafe(worker)).is_err() {
+                logging::log_error(
+                    "db::connection",
+                    &format!("{worker_description} worker cleanup panicked"),
+                );
+            }
+        })
+        .map_err(|err| format!("{description} worker could not start: {err}"))?;
+
+    match receiver.recv_timeout(policy.timeout()) {
+        Ok(result) => result,
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => Err(format!(
+            "{description} timed out after {} seconds",
+            policy.timeout().as_secs()
+        )),
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+            Err(format!("{description} worker terminated unexpectedly"))
+        }
+    }
+}
+
+fn lock_pending_connection_cleanups() -> MutexGuard<'static, Vec<ConnectionCleanupTask>> {
+    PENDING_CONNECTION_CLEANUPS
+        .get_or_init(|| Mutex::new(Vec::new()))
+        .lock()
+        .unwrap_or_else(|poisoned| {
+            logging::log_warning(
+                "db::connection",
+                "pending connection cleanup lock was poisoned; recovering",
+            );
+            poisoned.into_inner()
+        })
+}
+
+fn run_connection_cleanup_task(task: Arc<Mutex<Option<ConnectionCleanupTask>>>) {
+    let task = task
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .take();
+    let Some(task) = task else {
+        return;
+    };
+    if std::panic::catch_unwind(std::panic::AssertUnwindSafe(task)).is_err() {
+        logging::log_error("db::connection", "Connection cleanup worker panicked");
+    }
+}
+
+fn try_start_connection_cleanup_with<E, F>(
+    task: ConnectionCleanupTask,
+    start: F,
+) -> Result<(), (E, Option<ConnectionCleanupTask>)>
+where
+    F: FnOnce(Arc<Mutex<Option<ConnectionCleanupTask>>>) -> Result<(), E>,
+{
+    let task = Arc::new(Mutex::new(Some(task)));
+    match start(Arc::clone(&task)) {
+        Ok(()) => Ok(()),
+        Err(err) => {
+            let pending = task
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .take();
+            Err((err, pending))
+        }
+    }
+}
+
+fn spawn_connection_cleanup(task: impl FnOnce() + Send + 'static) {
+    let mut tasks = {
+        let mut pending = lock_pending_connection_cleanups();
+        let mut tasks = std::mem::take(&mut *pending);
+        tasks.push(Box::new(task) as ConnectionCleanupTask);
+        tasks
+    };
+
+    while let Some(task) = tasks.pop() {
+        let start_result = try_start_connection_cleanup_with(task, |task| {
+            std::thread::Builder::new()
+                .name("space-query-connection-cleanup".to_string())
+                .spawn(move || run_connection_cleanup_task(task))
+                .map(|_| ())
+        });
+        if let Err((err, pending_task)) = start_result {
+            logging::log_error(
+                "db::connection",
+                &format!("Failed to start connection cleanup worker: {err}"),
+            );
+            let mut pending = lock_pending_connection_cleanups();
+            if let Some(task) = pending_task {
+                pending.push(task);
+            }
+            pending.append(&mut tasks);
+            return;
+        }
+    }
+}
+
+fn update_session_state_without_blocking<F>(
+    session: &Arc<Mutex<SessionState>>,
+    epoch_token: &Arc<AtomicU64>,
+    expected_epoch: u64,
+    update: F,
+) where
+    F: FnOnce(&mut SessionState) + Send + 'static,
+{
+    match session.try_lock() {
+        Ok(mut guard) => update(&mut guard),
+        Err(std::sync::TryLockError::Poisoned(poisoned)) => {
+            logging::log_warning(
+                "db::connection",
+                "session state lock was poisoned; recovering",
+            );
+            update(&mut poisoned.into_inner());
+        }
+        Err(std::sync::TryLockError::WouldBlock) => {
+            let session = Arc::clone(session);
+            let epoch_token = Arc::clone(epoch_token);
+            spawn_connection_cleanup(move || {
+                let mut guard = session.lock().unwrap_or_else(|poisoned| {
+                    logging::log_warning(
+                        "db::connection",
+                        "session state lock was poisoned; recovering deferred update",
+                    );
+                    poisoned.into_inner()
+                });
+                if epoch_token.load(Ordering::Acquire) == expected_epoch {
+                    update(&mut guard);
+                }
+            });
+        }
+    }
+}
+
 pub(crate) fn discard_mysql_pooled_connection(conn: mysql::PooledConn) {
-    drop(mysql::PooledConn::unwrap(conn));
+    if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        drop(mysql::PooledConn::unwrap(conn));
+    }))
+    .is_err()
+    {
+        logging::log_error(
+            "db::connection",
+            "MySQL pooled connection violated its internal unwrap invariant while being discarded",
+        );
+    }
 }
 
 /// Route oracle_thin connect/auth phase events into the app log so the user
@@ -970,6 +1171,20 @@ impl ConnectionInfo {
 
     pub fn connection_string(&self) -> String {
         backend_for(self.db_type).connection_string(self)
+    }
+
+    fn connection_attempt_description(&self, action: &str) -> String {
+        let endpoint = if self.uses_oracle_tns_alias() {
+            self.service_name.trim().to_string()
+        } else {
+            let service = self.service_name.trim();
+            if service.is_empty() {
+                format!("{}:{}", self.host, self.port)
+            } else {
+                format!("{}:{}/{}", self.host, self.port, service)
+            }
+        };
+        format!("{} {} connection to {}", action, self.db_type, endpoint)
     }
 
     pub fn default_for(db_type: DatabaseType) -> Self {
@@ -2016,9 +2231,14 @@ pub(crate) trait DbBackend: Sync {
         info: &ConnectionInfo,
         pool_size: u32,
         auto_commit: bool,
+        policy: ConnectionAttemptPolicy,
     ) -> Result<(DbConnection, DbConnectionPool), String>;
-    fn build_pool(&self, info: &ConnectionInfo, pool_size: u32)
-        -> Result<DbConnectionPool, String>;
+    fn build_pool(
+        &self,
+        info: &ConnectionInfo,
+        pool_size: u32,
+        policy: ConnectionAttemptPolicy,
+    ) -> Result<DbConnectionPool, String>;
     fn apply_pool_session_settings(
         &self,
         session: &mut DbPoolSession,
@@ -2029,7 +2249,11 @@ pub(crate) trait DbBackend: Sync {
         context: &DbPoolSessionContext,
         session: &mut DbPoolSession,
     ) -> Result<(), String>;
-    fn test_connection(&self, info: &ConnectionInfo) -> Result<(), String>;
+    fn test_connection(
+        &self,
+        info: &ConnectionInfo,
+        policy: ConnectionAttemptPolicy,
+    ) -> Result<(), String>;
     // Transaction/session behavior methods below have no default bodies on
     // purpose: a silent no-op default (e.g. auto-commit toggles that do
     // nothing) is exactly the kind of omission a new backend must not be able
@@ -2123,6 +2347,29 @@ pub(crate) trait DbBackend: Sync {
 }
 
 struct OracleBackend;
+
+impl OracleBackend {
+    fn connection_string_with_policy(
+        info: &ConnectionInfo,
+        policy: ConnectionAttemptPolicy,
+    ) -> String {
+        if info.uses_oracle_tns_alias() {
+            return info.service_name.trim().to_string();
+        }
+
+        let protocol = if info.advanced.oracle_effective_protocol() == OracleNetworkProtocol::Tcps {
+            "TCPS"
+        } else {
+            "TCP"
+        };
+        let timeout_seconds = policy.timeout().as_secs().max(1);
+        format!(
+            "(DESCRIPTION=(CONNECT_TIMEOUT={timeout_seconds}sec)(TRANSPORT_CONNECT_TIMEOUT={timeout_seconds}sec)(RETRY_COUNT=0)(ADDRESS=(PROTOCOL={protocol})(HOST={})(PORT={}))(CONNECT_DATA=(SERVICE_NAME={})))",
+            info.host, info.port, info.service_name
+        )
+    }
+}
+
 struct MysqlBackend {
     db_type: DatabaseType,
     display_name: &'static str,
@@ -2341,15 +2588,13 @@ impl DbBackend for OracleBackend {
         info: &ConnectionInfo,
         pool_size: u32,
         _auto_commit: bool,
+        policy: ConnectionAttemptPolicy,
     ) -> Result<(DbConnection, DbConnectionPool), String> {
         if info.advanced.oracle_driver_mode == OracleDriverMode::Thin {
-            let config = DatabaseConnection::build_oracle_thin_config(info)?;
+            let config = DatabaseConnection::build_oracle_thin_config(info, policy)?;
             let requested_minimum_protocol = config.connect_options.minimum_protocol_version;
             let requested_desired_protocol = config.connect_options.desired_protocol_version;
-            let mut session = OracleThinSession::connect(config).map_err(|err| {
-                eprintln!("Oracle thin connection error: {err}");
-                err.to_string()
-            })?;
+            let mut session = OracleThinSession::connect(config).map_err(|err| err.to_string())?;
             DatabaseConnection::log_oracle_thin_protocol_acceptance(
                 &session,
                 requested_minimum_protocol,
@@ -2358,24 +2603,21 @@ impl DbBackend for OracleBackend {
             DatabaseConnection::apply_oracle_thin_session_settings(&mut session, &info.advanced)?;
             return Ok((
                 DbConnection::OracleThin(Arc::new(Mutex::new(session))),
-                self.build_pool(info, pool_size)?,
+                self.build_pool(info, pool_size, policy)?,
             ));
         }
 
         ensure_oracle_client_initialized().map_err(|e| e.to_string())?;
-        let conn_str = info.connection_string();
+        let conn_str = Self::connection_string_with_policy(info, policy);
         let connection = Arc::new(
             Connector::new(&info.username, &info.password, &conn_str)
                 .connect()
-                .map_err(|err| {
-                    eprintln!("Connection error: {err}");
-                    err.to_string()
-                })?,
+                .map_err(|err| err.to_string())?,
         );
         DatabaseConnection::apply_oracle_session_settings(connection.as_ref(), &info.advanced)?;
         Ok((
             DbConnection::Oracle(connection),
-            self.build_pool(info, pool_size)?,
+            self.build_pool(info, pool_size, policy)?,
         ))
     }
 
@@ -2383,17 +2625,18 @@ impl DbBackend for OracleBackend {
         &self,
         info: &ConnectionInfo,
         pool_size: u32,
+        policy: ConnectionAttemptPolicy,
     ) -> Result<DbConnectionPool, String> {
         if info.advanced.oracle_driver_mode == OracleDriverMode::Thin {
-            return DatabaseConnection::build_oracle_thin_pool(info, pool_size).map(|pool| {
-                DbConnectionPool::OracleThin {
+            return DatabaseConnection::build_oracle_thin_pool(info, pool_size, policy).map(
+                |pool| DbConnectionPool::OracleThin {
                     pool: Arc::new(pool),
                     advanced: info.advanced.clone(),
-                }
-            });
+                },
+            );
         }
 
-        DatabaseConnection::build_oracle_pool(info, pool_size).map(|pool| {
+        DatabaseConnection::build_oracle_pool(info, pool_size, policy).map(|pool| {
             DbConnectionPool::Oracle {
                 pool,
                 advanced: info.advanced.clone(),
@@ -2459,15 +2702,16 @@ impl DbBackend for OracleBackend {
         }
     }
 
-    fn test_connection(&self, info: &ConnectionInfo) -> Result<(), String> {
+    fn test_connection(
+        &self,
+        info: &ConnectionInfo,
+        policy: ConnectionAttemptPolicy,
+    ) -> Result<(), String> {
         if info.advanced.oracle_driver_mode == OracleDriverMode::Thin {
-            let config = DatabaseConnection::build_oracle_thin_config(info)?;
+            let config = DatabaseConnection::build_oracle_thin_config(info, policy)?;
             let requested_minimum_protocol = config.connect_options.minimum_protocol_version;
             let requested_desired_protocol = config.connect_options.desired_protocol_version;
-            let mut session = OracleThinSession::connect(config).map_err(|err| {
-                eprintln!("Oracle thin connection error: {err}");
-                err.to_string()
-            })?;
+            let mut session = OracleThinSession::connect(config).map_err(|err| err.to_string())?;
             DatabaseConnection::log_oracle_thin_protocol_acceptance(
                 &session,
                 requested_minimum_protocol,
@@ -2478,13 +2722,10 @@ impl DbBackend for OracleBackend {
         }
 
         ensure_oracle_client_initialized().map_err(|e| e.to_string())?;
-        let conn_str = info.connection_string();
+        let conn_str = Self::connection_string_with_policy(info, policy);
         let connection = Connector::new(&info.username, &info.password, &conn_str)
             .connect()
-            .map_err(|err| {
-                eprintln!("Connection error: {err}");
-                err.to_string()
-            })?;
+            .map_err(|err| err.to_string())?;
         DatabaseConnection::apply_oracle_session_settings(&connection, &info.advanced)?;
         Ok(())
     }
@@ -2809,12 +3050,10 @@ impl DbBackend for MysqlBackend {
         info: &ConnectionInfo,
         pool_size: u32,
         auto_commit: bool,
+        policy: ConnectionAttemptPolicy,
     ) -> Result<(DbConnection, DbConnectionPool), String> {
-        let opts = DatabaseConnection::build_mysql_opts(info);
-        let mut conn = mysql::Conn::new(opts).map_err(|err| {
-            eprintln!("{} connection error: {err}", self.display_name());
-            err.to_string()
-        })?;
+        let opts = DatabaseConnection::build_mysql_opts(info, policy);
+        let mut conn = mysql::Conn::new(opts).map_err(|err| err.to_string())?;
         DatabaseConnection::apply_mysql_session_settings_for_db_type(
             &mut conn,
             &info.advanced,
@@ -2830,7 +3069,7 @@ impl DbBackend for MysqlBackend {
                 conn,
                 db_type: self.db_type,
             },
-            self.build_pool(info, pool_size)?,
+            self.build_pool(info, pool_size, policy)?,
         ))
     }
 
@@ -2838,11 +3077,14 @@ impl DbBackend for MysqlBackend {
         &self,
         info: &ConnectionInfo,
         pool_size: u32,
+        policy: ConnectionAttemptPolicy,
     ) -> Result<DbConnectionPool, String> {
-        DatabaseConnection::build_mysql_pool(info, pool_size).map(|pool| DbConnectionPool::MySQL {
-            pool,
-            advanced: info.advanced.clone(),
-            db_type: self.db_type,
+        DatabaseConnection::build_mysql_pool(info, pool_size, policy).map(|pool| {
+            DbConnectionPool::MySQL {
+                pool,
+                advanced: info.advanced.clone(),
+                db_type: self.db_type,
+            }
         })
     }
 
@@ -2927,12 +3169,13 @@ impl DbBackend for MysqlBackend {
         )
     }
 
-    fn test_connection(&self, info: &ConnectionInfo) -> Result<(), String> {
-        let opts = DatabaseConnection::build_mysql_opts(info);
-        let mut conn = mysql::Conn::new(opts).map_err(|err| {
-            eprintln!("{} connection error: {err}", self.display_name());
-            err.to_string()
-        })?;
+    fn test_connection(
+        &self,
+        info: &ConnectionInfo,
+        policy: ConnectionAttemptPolicy,
+    ) -> Result<(), String> {
+        let opts = DatabaseConnection::build_mysql_opts(info, policy);
+        let mut conn = mysql::Conn::new(opts).map_err(|err| err.to_string())?;
         DatabaseConnection::apply_mysql_session_settings_for_db_type(
             &mut conn,
             &info.advanced,
@@ -3179,35 +3422,50 @@ impl DatabaseConnection {
         size.clamp(MIN_CONNECTION_POOL_SIZE, MAX_CONNECTION_POOL_SIZE)
     }
 
-    fn build_mysql_opts(info: &ConnectionInfo) -> mysql::OptsBuilder {
-        Self::build_mysql_opts_with_pool_size(info, None)
+    fn build_mysql_opts(
+        info: &ConnectionInfo,
+        policy: ConnectionAttemptPolicy,
+    ) -> mysql::OptsBuilder {
+        Self::build_mysql_opts_with_pool_size(info, None, policy)
     }
 
     pub(crate) fn build_mysql_opts_without_database(info: &ConnectionInfo) -> mysql::OptsBuilder {
-        Self::build_mysql_opts_with_pool_size_and_database(info, None, false)
+        Self::build_mysql_opts_with_pool_size_and_database(
+            info,
+            None,
+            false,
+            ConnectionAttemptPolicy::runtime(),
+        )
     }
 
     fn build_mysql_opts_with_pool_size(
         info: &ConnectionInfo,
         pool_size: Option<u32>,
+        policy: ConnectionAttemptPolicy,
     ) -> mysql::OptsBuilder {
-        Self::build_mysql_opts_with_pool_size_and_database(info, pool_size, true)
+        Self::build_mysql_opts_with_pool_size_and_database(info, pool_size, true, policy)
     }
 
-    fn build_mysql_pool_opts(info: &ConnectionInfo, pool_size: u32) -> mysql::OptsBuilder {
-        Self::build_mysql_opts_with_pool_size_and_database(info, Some(pool_size), false)
+    fn build_mysql_pool_opts(
+        info: &ConnectionInfo,
+        pool_size: u32,
+        policy: ConnectionAttemptPolicy,
+    ) -> mysql::OptsBuilder {
+        Self::build_mysql_opts_with_pool_size_and_database(info, Some(pool_size), false, policy)
     }
 
     fn build_mysql_opts_with_pool_size_and_database(
         info: &ConnectionInfo,
         pool_size: Option<u32>,
         include_database: bool,
+        policy: ConnectionAttemptPolicy,
     ) -> mysql::OptsBuilder {
         let mut opts = mysql::OptsBuilder::new()
             .ip_or_hostname(Some(&info.host))
             .tcp_port(info.port)
             .user(Some(&info.username))
             .pass(Some(&info.password))
+            .tcp_connect_timeout(Some(policy.timeout()))
             .prefer_socket(false);
 
         let database = info.service_name.trim();
@@ -3255,8 +3513,9 @@ impl DatabaseConnection {
     fn build_oracle_pool(
         info: &ConnectionInfo,
         pool_size: u32,
+        policy: ConnectionAttemptPolicy,
     ) -> Result<oracle::pool::Pool, String> {
-        let conn_str = info.connection_string();
+        let conn_str = OracleBackend::connection_string_with_policy(info, policy);
         let pool_size = Self::clamp_connection_pool_size(pool_size);
         let mut builder =
             oracle::pool::PoolBuilder::new(info.username.clone(), info.password.clone(), conn_str);
@@ -3268,7 +3527,10 @@ impl DatabaseConnection {
         builder.build().map_err(|err| err.to_string())
     }
 
-    fn build_oracle_thin_config(info: &ConnectionInfo) -> Result<OracleThinConfig, String> {
+    fn build_oracle_thin_config(
+        info: &ConnectionInfo,
+        policy: ConnectionAttemptPolicy,
+    ) -> Result<OracleThinConfig, String> {
         if info.uses_oracle_tns_alias() {
             return Err(
                 "Oracle Thin currently supports Host + Port + Service connections only".to_string(),
@@ -3285,6 +3547,10 @@ impl DatabaseConnection {
             info.password.clone(),
         );
         config.program = "space-query-thin".to_string();
+        config.connect_options.tcp_connect_timeout = policy.timeout();
+        config.connect_options.connect_io_timeout = policy.timeout();
+        config.connect_options.retry_count = 0;
+        config.connect_options.retry_delay = Duration::ZERO;
         // Skip the connect-time out-of-band probe on the interactive connect
         // path. Some Oracle 318+ listeners advertise OOB (supports_oob_check)
         // but then stall the protocol handshake when the urgent-data probe is
@@ -3335,8 +3601,9 @@ impl DatabaseConnection {
     fn build_oracle_thin_pool(
         info: &ConnectionInfo,
         pool_size: u32,
+        policy: ConnectionAttemptPolicy,
     ) -> Result<OracleThinSessionPool, String> {
-        let config = Self::build_oracle_thin_config(info)?;
+        let config = Self::build_oracle_thin_config(info, policy)?;
         let options = OracleThinPoolOptions {
             max_size: Self::clamp_connection_pool_size(pool_size) as usize,
             acquire_timeout: POOL_SESSION_ACQUIRE_TIMEOUT,
@@ -3344,16 +3611,21 @@ impl DatabaseConnection {
         Ok(OracleThinSessionPool::new(config, options))
     }
 
-    fn build_mysql_pool(info: &ConnectionInfo, pool_size: u32) -> Result<mysql::Pool, String> {
-        let opts = Self::build_mysql_pool_opts(info, pool_size);
+    fn build_mysql_pool(
+        info: &ConnectionInfo,
+        pool_size: u32,
+        policy: ConnectionAttemptPolicy,
+    ) -> Result<mysql::Pool, String> {
+        let opts = Self::build_mysql_pool_opts(info, pool_size, policy);
         mysql::Pool::new(opts).map_err(|err| err.to_string())
     }
 
     fn build_pool_for_info(
         info: &ConnectionInfo,
         pool_size: u32,
+        policy: ConnectionAttemptPolicy,
     ) -> Result<DbConnectionPool, String> {
-        backend_for(info.db_type).build_pool(info, pool_size)
+        backend_for(info.db_type).build_pool(info, pool_size, policy)
     }
 
     pub fn new() -> Self {
@@ -3384,12 +3656,49 @@ impl DatabaseConnection {
     }
 
     pub fn connect(&mut self, info: ConnectionInfo) -> Result<(), String> {
+        self.connect_with_policy(info, ConnectionAttemptPolicy::runtime())
+    }
+
+    pub(crate) fn connect_with_policy(
+        &mut self,
+        info: ConnectionInfo,
+        policy: ConnectionAttemptPolicy,
+    ) -> Result<(), String> {
+        let prepared =
+            Self::prepare_connection(info, self.connection_pool_size, self.auto_commit, policy)?;
+        let retired = self.install_prepared_connection(prepared)?;
+        Self::retire_connection_in_background(retired);
+        Ok(())
+    }
+
+    fn prepare_connection(
+        info: ConnectionInfo,
+        pool_size: u32,
+        auto_commit: bool,
+        policy: ConnectionAttemptPolicy,
+    ) -> Result<Self, String> {
         info.advanced
             .validate_for_db(info.db_type, info.uses_oracle_tns_alias())?;
+        let description = info.connection_attempt_description("Establishing");
+        run_connection_attempt(policy, description, move || {
+            let mut prepared = Self::new();
+            prepared.connection_pool_size = Self::clamp_connection_pool_size(pool_size);
+            prepared.auto_commit = auto_commit;
+            prepared.connect_blocking_with_policy(info, policy)?;
+            Ok(prepared)
+        })
+    }
+
+    fn connect_blocking_with_policy(
+        &mut self,
+        info: ConnectionInfo,
+        policy: ConnectionAttemptPolicy,
+    ) -> Result<(), String> {
         let (db_conn, pool) = backend_for(info.db_type).connect(
             &info,
             self.connection_pool_size,
             self.auto_commit,
+            policy,
         )?;
 
         // Swap in the new connection only after a successful handshake.
@@ -3419,11 +3728,77 @@ impl DatabaseConnection {
         // backend here so delimiter/bind scanning and SQL*Plus substitution
         // defaults follow the live database.
         match self.session.lock() {
-            Ok(mut guard) => guard.set_connection_db_type(db_type),
-            Err(poisoned) => poisoned.into_inner().set_connection_db_type(db_type),
+            Ok(mut guard) => guard.reset_for_connection(db_type),
+            Err(poisoned) => poisoned.into_inner().reset_for_connection(db_type),
         }
 
         Ok(())
+    }
+
+    fn install_prepared_connection(&mut self, mut prepared: Self) -> Result<Self, String> {
+        if !prepared.connected || prepared.connection.is_none() || prepared.pool.is_none() {
+            Self::retire_connection_in_background(prepared);
+            return Err("Prepared database connection is incomplete".to_string());
+        }
+        std::mem::swap(&mut self.connection, &mut prepared.connection);
+        std::mem::swap(&mut self.pool, &mut prepared.pool);
+        std::mem::swap(&mut self.info, &mut prepared.info);
+        std::mem::swap(&mut self.session_password, &mut prepared.session_password);
+        std::mem::swap(
+            &mut self.oracle_current_schema,
+            &mut prepared.oracle_current_schema,
+        );
+        std::mem::swap(&mut self.connected, &mut prepared.connected);
+        std::mem::swap(&mut self.auto_commit, &mut prepared.auto_commit);
+        std::mem::swap(&mut self.transaction_mode, &mut prepared.transaction_mode);
+        std::mem::swap(
+            &mut self.default_transaction_isolation,
+            &mut prepared.default_transaction_isolation,
+        );
+        std::mem::swap(
+            &mut self.last_disconnect_reason,
+            &mut prepared.last_disconnect_reason,
+        );
+        std::mem::swap(
+            &mut self.connection_pool_size,
+            &mut prepared.connection_pool_size,
+        );
+
+        self.connection_generation = self.connection_generation.wrapping_add(1);
+        self.bump_pool_context_epoch();
+        let db_type = self.info.db_type;
+        update_session_state_without_blocking(
+            &self.session,
+            &self.pool_context_epoch,
+            self.current_pool_context_epoch(),
+            move |session| session.reset_for_connection(db_type),
+        );
+        Ok(prepared)
+    }
+
+    fn retire_connection_in_background(mut retired: Self) {
+        let connection = retired.connection.take();
+        let pool = retired.pool.take();
+        ConnectionInfo::clear_secret(&mut retired.session_password);
+        retired.info.clear_password();
+        drop(retired);
+        Self::retire_connection_resources_in_background(connection, pool);
+    }
+
+    fn retire_connection_resources_in_background(
+        connection: Option<DbConnection>,
+        pool: Option<DbConnectionPool>,
+    ) {
+        if connection.is_none() && pool.is_none() {
+            return;
+        }
+        spawn_connection_cleanup(move || {
+            if let Some(pool) = pool.as_ref() {
+                pool.close();
+            }
+            drop(connection);
+            drop(pool);
+        });
     }
 
     pub(crate) fn apply_oracle_session_settings(
@@ -4060,11 +4435,8 @@ impl DatabaseConnection {
 
     fn clear_connection_state(&mut self, disconnect_reason: Option<String>) {
         let had_connection = self.connection.is_some() || self.connected;
-        if let Some(pool) = &self.pool {
-            pool.close();
-        }
-        self.connection = None;
-        self.pool = None;
+        let retired_connection = self.connection.take();
+        let retired_pool = self.pool.take();
         self.connected = false;
         self.last_disconnect_reason = disconnect_reason;
         self.info.clear_password();
@@ -4074,21 +4446,17 @@ impl DatabaseConnection {
         self.auto_commit = false;
         self.transaction_mode = TransactionMode::default();
         self.default_transaction_isolation = TransactionIsolation::Default;
-        match self.session.lock() {
-            Ok(mut guard) => {
-                guard.reset();
-                guard.db_type = DatabaseType::default();
-            }
-            Err(poisoned) => {
-                let mut guard = poisoned.into_inner();
-                guard.reset();
-                guard.db_type = DatabaseType::default();
-            }
-        }
         if had_connection {
             self.connection_generation = self.connection_generation.wrapping_add(1);
             self.bump_pool_context_epoch();
         }
+        update_session_state_without_blocking(
+            &self.session,
+            &self.pool_context_epoch,
+            self.current_pool_context_epoch(),
+            |session| session.reset_for_connection(DatabaseType::default()),
+        );
+        Self::retire_connection_resources_in_background(retired_connection, retired_pool);
     }
 
     fn disconnect_message(&self) -> String {
@@ -4280,6 +4648,14 @@ impl DatabaseConnection {
     }
 
     pub fn resize_current_connection_pool(&mut self, size: u32) -> Result<(), String> {
+        self.resize_current_connection_pool_with_policy(size, ConnectionAttemptPolicy::runtime())
+    }
+
+    pub(crate) fn resize_current_connection_pool_with_policy(
+        &mut self,
+        size: u32,
+        policy: ConnectionAttemptPolicy,
+    ) -> Result<(), String> {
         let size = Self::clamp_connection_pool_size(size);
         if self.connection_pool_size == size {
             return Ok(());
@@ -4292,11 +4668,17 @@ impl DatabaseConnection {
 
         let mut info = self.info.clone();
         info.password = self.session_password.clone();
-        let pool = Self::build_pool_for_info(&info, size)?;
-        self.pool = Some(pool);
+        let description = info.connection_attempt_description("Rebuilding");
+        let pool = run_connection_attempt(policy, description, move || {
+            Self::build_pool_for_info(&info, size, policy)
+        })?;
+        let retired_pool = self.pool.replace(pool);
         self.connection_pool_size = size;
         self.connection_generation = self.connection_generation.wrapping_add(1);
         self.bump_pool_context_epoch();
+        if let Some(retired_pool) = retired_pool {
+            Self::retire_connection_resources_in_background(None, Some(retired_pool));
+        }
         Ok(())
     }
 
@@ -4792,9 +5174,20 @@ impl DatabaseConnection {
     }
 
     pub fn test_connection(info: &ConnectionInfo) -> Result<(), String> {
+        Self::test_connection_with_policy(info, ConnectionAttemptPolicy::runtime())
+    }
+
+    pub(crate) fn test_connection_with_policy(
+        info: &ConnectionInfo,
+        policy: ConnectionAttemptPolicy,
+    ) -> Result<(), String> {
         info.advanced
             .validate_for_db(info.db_type, info.uses_oracle_tns_alias())?;
-        backend_for(info.db_type).test_connection(info)
+        let info = info.clone();
+        let description = info.connection_attempt_description("Testing");
+        run_connection_attempt(policy, description, move || {
+            backend_for(info.db_type).test_connection(&info, policy)
+        })
     }
 
     #[cfg(test)]
@@ -4812,12 +5205,45 @@ impl Default for DatabaseConnection {
     }
 }
 
+impl Drop for DatabaseConnection {
+    fn drop(&mut self) {
+        let connection = self.connection.take();
+        let pool = self.pool.take();
+        ConnectionInfo::clear_secret(&mut self.session_password);
+        self.info.clear_password();
+        Self::retire_connection_resources_in_background(connection, pool);
+    }
+}
+
 pub type SharedConnection = Arc<Mutex<DatabaseConnection>>;
+
+#[derive(Clone)]
+struct ActiveConnectionTransition {
+    owner: Weak<Mutex<DatabaseConnection>>,
+    attempt_id: u64,
+    activity: String,
+}
+
+#[derive(Default)]
+struct ConnectionTransitionRegistry {
+    active: Mutex<HashMap<usize, ActiveConnectionTransition>>,
+    changed: Condvar,
+}
+
+struct ConnectionTransitionGuard {
+    connection: SharedConnection,
+    key: usize,
+    attempt_id: u64,
+    expected_generation: u64,
+    finished: bool,
+}
 
 static ACTIVE_DB_ACTIVITY: OnceLock<Mutex<Vec<TrackedDbActivity>>> = OnceLock::new();
 static DB_POOL_SESSION_CONTEXT_CACHE: OnceLock<Mutex<HashMap<usize, CachedDbPoolSessionContext>>> =
     OnceLock::new();
+static CONNECTION_TRANSITIONS: OnceLock<ConnectionTransitionRegistry> = OnceLock::new();
 static NEXT_DB_ACTIVITY_ID: AtomicU64 = AtomicU64::new(1);
+static NEXT_CONNECTION_ATTEMPT_ID: AtomicU64 = AtomicU64::new(1);
 static ORACLE_CLIENT_INIT_SUCCESS: OnceLock<()> = OnceLock::new();
 static ORACLE_CLIENT_INIT_ATTEMPT_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 
@@ -4829,6 +5255,182 @@ struct CachedDbPoolSessionContext {
 
 fn shared_connection_cache_key(connection: &SharedConnection) -> usize {
     Arc::as_ptr(connection) as usize
+}
+
+fn connection_transition_registry() -> &'static ConnectionTransitionRegistry {
+    CONNECTION_TRANSITIONS.get_or_init(ConnectionTransitionRegistry::default)
+}
+
+fn lock_connection_transition_state(
+) -> MutexGuard<'static, HashMap<usize, ActiveConnectionTransition>> {
+    connection_transition_registry()
+        .active
+        .lock()
+        .unwrap_or_else(|poisoned| {
+            logging::log_warning(
+                "db::connection",
+                "connection transition registry lock was poisoned; recovering",
+            );
+            poisoned.into_inner()
+        })
+}
+
+fn remove_stale_connection_transitions(
+    transitions: &mut HashMap<usize, ActiveConnectionTransition>,
+) {
+    transitions.retain(|_, transition| transition.owner.upgrade().is_some());
+}
+
+fn active_connection_transition(connection: &SharedConnection) -> Option<String> {
+    let key = shared_connection_cache_key(connection);
+    let mut transitions = lock_connection_transition_state();
+    remove_stale_connection_transitions(&mut transitions);
+    transitions.get(&key).map(|state| state.activity.clone())
+}
+
+pub(crate) fn connection_transition_activity(connection: &SharedConnection) -> Option<String> {
+    active_connection_transition(connection)
+}
+
+fn connection_transition_is_current(key: usize, attempt_id: u64) -> bool {
+    let mut transitions = lock_connection_transition_state();
+    remove_stale_connection_transitions(&mut transitions);
+    transitions
+        .get(&key)
+        .is_some_and(|state| state.attempt_id == attempt_id)
+}
+
+fn finish_connection_transition(key: usize, attempt_id: u64) {
+    let registry = connection_transition_registry();
+    let removed = {
+        let mut transitions = lock_connection_transition_state();
+        let should_remove = transitions
+            .get(&key)
+            .is_some_and(|state| state.attempt_id == attempt_id);
+        if should_remove {
+            transitions.remove(&key);
+        }
+        should_remove
+    };
+    if removed {
+        registry.changed.notify_all();
+    }
+}
+
+fn wait_for_connection_transition(connection: &SharedConnection) {
+    let key = shared_connection_cache_key(connection);
+    let registry = connection_transition_registry();
+    let mut transitions = lock_connection_transition_state();
+    loop {
+        remove_stale_connection_transitions(&mut transitions);
+        if !transitions.contains_key(&key) {
+            return;
+        }
+        transitions = registry
+            .changed
+            .wait(transitions)
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+    }
+}
+
+fn lock_database_connection_raw(
+    connection: &SharedConnection,
+) -> MutexGuard<'_, DatabaseConnection> {
+    match connection.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => {
+            logging::log_warning(
+                "db::connection",
+                "database connection lock was poisoned; recovering",
+            );
+            poisoned.into_inner()
+        }
+    }
+}
+
+fn begin_connection_transition(
+    connection: &SharedConnection,
+    activity: impl Into<String>,
+) -> Result<ConnectionTransitionGuard, String> {
+    let key = shared_connection_cache_key(connection);
+    let attempt_id = NEXT_CONNECTION_ATTEMPT_ID.fetch_add(1, Ordering::Relaxed);
+    let activity = activity.into();
+    {
+        let mut transitions = lock_connection_transition_state();
+        remove_stale_connection_transitions(&mut transitions);
+        if let Some(active) = transitions.get(&key) {
+            return Err(format!(
+                "Connection is busy. Current DB activity: {}",
+                active.activity
+            ));
+        }
+        transitions.insert(
+            key,
+            ActiveConnectionTransition {
+                owner: Arc::downgrade(connection),
+                attempt_id,
+                activity,
+            },
+        );
+    }
+
+    let connection_guard = match connection.try_lock() {
+        Ok(guard) => guard,
+        Err(std::sync::TryLockError::WouldBlock) => {
+            finish_connection_transition(key, attempt_id);
+            return Err(format_connection_busy_message());
+        }
+        Err(std::sync::TryLockError::Poisoned(poisoned)) => {
+            logging::log_warning(
+                "db::connection",
+                "database connection lock was poisoned; recovering",
+            );
+            poisoned.into_inner()
+        }
+    };
+    let expected_generation = connection_guard.connection_generation();
+    connection_guard.bump_pool_context_epoch();
+    clear_pool_session_context_for_shared_connection(connection);
+    drop(connection_guard);
+
+    Ok(ConnectionTransitionGuard {
+        connection: Arc::clone(connection),
+        key,
+        attempt_id,
+        expected_generation,
+        finished: false,
+    })
+}
+
+impl ConnectionTransitionGuard {
+    fn is_current(&self) -> bool {
+        connection_transition_is_current(self.key, self.attempt_id)
+    }
+
+    fn finish(mut self) {
+        finish_connection_transition(self.key, self.attempt_id);
+        self.finished = true;
+    }
+}
+
+impl Drop for ConnectionTransitionGuard {
+    fn drop(&mut self) {
+        if self.finished {
+            return;
+        }
+        // During panic unwinding, restoring this optional cache is not worth
+        // waiting for the database mutex. The cache was invalidated when the
+        // transition began and will be rebuilt on the next successful access.
+        if !std::thread::panicking() && self.is_current() {
+            let connection_guard = lock_database_connection_raw(&self.connection);
+            refresh_pool_session_context_cache_for_shared_connection(
+                &self.connection,
+                &connection_guard,
+            );
+            drop(connection_guard);
+        }
+        finish_connection_transition(self.key, self.attempt_id);
+    }
 }
 
 fn pool_context_cache_slot() -> &'static Mutex<HashMap<usize, CachedDbPoolSessionContext>> {
@@ -4941,6 +5543,11 @@ pub fn pool_session_context_for_shared_connection(
     connection: &SharedConnection,
     activity: Option<&str>,
 ) -> Result<DbPoolSessionContext, String> {
+    if let Some(activity) = active_connection_transition(connection) {
+        return Err(format!(
+            "Connection is busy. Current DB activity: {activity}"
+        ));
+    }
     let key = shared_connection_cache_key(connection);
     let conn_guard = match activity {
         Some(activity) => try_lock_connection_with_activity(connection, activity),
@@ -4948,6 +5555,11 @@ pub fn pool_session_context_for_shared_connection(
     };
 
     let Some(conn_guard) = conn_guard else {
+        if let Some(activity) = active_connection_transition(connection) {
+            return Err(format!(
+                "Connection is busy. Current DB activity: {activity}"
+            ));
+        }
         return cached_pool_session_context(key).ok_or_else(format_connection_busy_message);
     };
 
@@ -5450,30 +6062,135 @@ impl<'a> DerefMut for ConnectionLockGuard<'a> {
     }
 }
 
-impl<'a> Drop for ConnectionLockGuard<'a> {
-    fn drop(&mut self) {
-        self.activity_guard.take();
-    }
-}
-
 pub fn create_shared_connection() -> SharedConnection {
     Arc::new(Mutex::new(DatabaseConnection::new()))
 }
 
-pub fn lock_connection(connection: &SharedConnection) -> ConnectionLockGuard<'_> {
-    let guard = match connection.lock() {
-        Ok(guard) => guard,
-        Err(poisoned) => {
-            logging::log_warning(
-                "db::connection",
-                "database connection lock was poisoned; recovering",
-            );
-            poisoned.into_inner()
-        }
+pub(crate) fn shared_connection_identity_snapshot(
+    connection: &SharedConnection,
+) -> (DatabaseType, Arc<Mutex<SessionState>>) {
+    let connection = lock_database_connection_raw(connection);
+    (connection.db_type(), connection.session_state())
+}
+
+pub(crate) fn connect_shared_connection_with_policy(
+    connection: &SharedConnection,
+    info: ConnectionInfo,
+    pool_size: u32,
+    policy: ConnectionAttemptPolicy,
+) -> Result<(), String> {
+    info.advanced
+        .validate_for_db(info.db_type, info.uses_oracle_tns_alias())?;
+    let activity = format!("Connecting to {}", info.name);
+    let transition = begin_connection_transition(connection, activity.clone())?;
+    let _activity_guard = track_db_activity(activity, Some(info.db_type));
+    let auto_commit = {
+        let connection_guard = lock_database_connection_raw(connection);
+        connection_guard.auto_commit()
     };
-    ConnectionLockGuard {
-        guard,
-        activity_guard: None,
+
+    let prepared = DatabaseConnection::prepare_connection(info, pool_size, auto_commit, policy)?;
+    if !transition.is_current() {
+        DatabaseConnection::retire_connection_in_background(prepared);
+        return Err("Connection attempt is no longer current".to_string());
+    }
+
+    let retired = {
+        let mut connection_guard = lock_database_connection_raw(connection);
+        if connection_guard.connection_generation() != transition.expected_generation {
+            drop(connection_guard);
+            DatabaseConnection::retire_connection_in_background(prepared);
+            return Err(
+                "Connection changed before the new connection could be installed".to_string(),
+            );
+        }
+        let retired = connection_guard.install_prepared_connection(prepared)?;
+        refresh_pool_session_context_cache_for_shared_connection(connection, &connection_guard);
+        retired
+    };
+    transition.finish();
+    DatabaseConnection::retire_connection_in_background(retired);
+    Ok(())
+}
+
+pub(crate) fn resize_shared_connection_pool_with_policy(
+    connection: &SharedConnection,
+    size: u32,
+    policy: ConnectionAttemptPolicy,
+) -> Result<(), String> {
+    let size = DatabaseConnection::clamp_connection_pool_size(size);
+    let transition = begin_connection_transition(connection, "Rebuilding connection pool")?;
+    let (info, current_size, connected) = {
+        let connection_guard = lock_database_connection_raw(connection);
+        (
+            connection_guard.runtime_connection_info(),
+            connection_guard.connection_pool_size(),
+            connection_guard.is_connected() && connection_guard.has_connection_handle(),
+        )
+    };
+
+    if current_size == size {
+        let connection_guard = lock_database_connection_raw(connection);
+        refresh_pool_session_context_cache_for_shared_connection(connection, &connection_guard);
+        drop(connection_guard);
+        transition.finish();
+        return Ok(());
+    }
+    if !connected {
+        let mut connection_guard = lock_database_connection_raw(connection);
+        connection_guard.set_connection_pool_size(size);
+        refresh_pool_session_context_cache_for_shared_connection(connection, &connection_guard);
+        drop(connection_guard);
+        transition.finish();
+        return Ok(());
+    }
+
+    let info = info.ok_or_else(|| "Connected session credentials are unavailable".to_string())?;
+    let description = info.connection_attempt_description("Rebuilding");
+    let pool = run_connection_attempt(policy, description, move || {
+        DatabaseConnection::build_pool_for_info(&info, size, policy)
+    })?;
+    if !transition.is_current() {
+        DatabaseConnection::retire_connection_resources_in_background(None, Some(pool));
+        return Err("Connection pool resize attempt is no longer current".to_string());
+    }
+
+    let retired_pool = {
+        let mut connection_guard = lock_database_connection_raw(connection);
+        if connection_guard.connection_generation() != transition.expected_generation {
+            drop(connection_guard);
+            DatabaseConnection::retire_connection_resources_in_background(None, Some(pool));
+            return Err(
+                "Connection changed before the new connection pool could be installed".to_string(),
+            );
+        }
+        let retired_pool = connection_guard.pool.replace(pool);
+        connection_guard.connection_pool_size = size;
+        connection_guard.connection_generation =
+            connection_guard.connection_generation.wrapping_add(1);
+        connection_guard.bump_pool_context_epoch();
+        refresh_pool_session_context_cache_for_shared_connection(connection, &connection_guard);
+        retired_pool
+    };
+    transition.finish();
+    if let Some(retired_pool) = retired_pool {
+        DatabaseConnection::retire_connection_resources_in_background(None, Some(retired_pool));
+    }
+    Ok(())
+}
+
+pub fn lock_connection(connection: &SharedConnection) -> ConnectionLockGuard<'_> {
+    loop {
+        wait_for_connection_transition(connection);
+        let guard = lock_database_connection_raw(connection);
+        if active_connection_transition(connection).is_some() {
+            drop(guard);
+            continue;
+        }
+        return ConnectionLockGuard {
+            guard,
+            activity_guard: None,
+        };
     }
 }
 
@@ -5492,60 +6209,504 @@ pub fn lock_connection_with_activity(
 /// Try to acquire the connection lock without blocking.
 /// Returns None if the lock is already held (query is running).
 pub fn try_lock_connection(connection: &SharedConnection) -> Option<ConnectionLockGuard<'_>> {
-    match connection.try_lock() {
-        Ok(guard) => Some(ConnectionLockGuard {
-            guard,
-            activity_guard: None,
-        }),
-        Err(std::sync::TryLockError::WouldBlock) => None,
+    if active_connection_transition(connection).is_some() {
+        return None;
+    }
+    let guard = match connection.try_lock() {
+        Ok(guard) => guard,
+        Err(std::sync::TryLockError::WouldBlock) => return None,
         Err(std::sync::TryLockError::Poisoned(poisoned)) => {
             logging::log_warning(
                 "db::connection",
                 "database connection lock was poisoned; recovering",
             );
-            Some(ConnectionLockGuard {
-                guard: poisoned.into_inner(),
-                activity_guard: None,
-            })
+            poisoned.into_inner()
         }
+    };
+    if active_connection_transition(connection).is_some() {
+        drop(guard);
+        return None;
     }
+    Some(ConnectionLockGuard {
+        guard,
+        activity_guard: None,
+    })
 }
 
 pub fn try_lock_connection_with_activity(
     connection: &SharedConnection,
     activity: impl Into<String>,
 ) -> Option<ConnectionLockGuard<'_>> {
-    match connection.try_lock() {
-        Ok(guard) => Some(ConnectionLockGuard {
-            guard,
-            activity_guard: Some(track_db_activity_entry(
-                activity.into(),
-                None,
-                DbActivityKind::ConnectionLock,
-            )),
-        }),
-        Err(std::sync::TryLockError::WouldBlock) => None,
-        Err(std::sync::TryLockError::Poisoned(poisoned)) => {
-            logging::log_warning(
-                "db::connection",
-                "database connection lock was poisoned; recovering",
-            );
-            let guard = poisoned.into_inner();
-            Some(ConnectionLockGuard {
-                guard,
-                activity_guard: Some(track_db_activity_entry(
-                    activity.into(),
-                    None,
-                    DbActivityKind::ConnectionLock,
-                )),
-            })
-        }
-    }
+    let mut guard = try_lock_connection(connection)?;
+    guard.activity_guard = Some(track_db_activity_entry(
+        activity.into(),
+        None,
+        DbActivityKind::ConnectionLock,
+    ));
+    Some(guard)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn common_connection_deadline_returns_before_late_worker_result() {
+        let completed = Arc::new(AtomicBool::new(false));
+        let completed_for_worker = Arc::clone(&completed);
+        let policy = ConnectionAttemptPolicy {
+            timeout: Duration::from_millis(50),
+        };
+        let started = Instant::now();
+
+        let result = run_connection_attempt(policy, "test connection".to_string(), move || {
+            std::thread::sleep(Duration::from_millis(300));
+            completed_for_worker.store(true, Ordering::Release);
+            Ok(())
+        });
+
+        assert!(result
+            .expect_err("attempt should time out")
+            .contains("timed out"));
+        assert!(started.elapsed() < Duration::from_millis(250));
+        std::thread::sleep(Duration::from_millis(300));
+        assert!(completed.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn connection_attempt_worker_panic_is_returned_as_an_error() {
+        let result = run_connection_attempt(
+            ConnectionAttemptPolicy {
+                timeout: Duration::from_millis(250),
+            },
+            "panic test connection".to_string(),
+            || -> Result<(), String> { panic!("simulated connection worker panic") },
+        );
+
+        assert!(result
+            .expect_err("worker panic should become an ordinary error")
+            .contains("worker terminated unexpectedly"));
+    }
+
+    #[test]
+    fn cleanup_task_is_recovered_when_worker_start_fails() {
+        let executed = Arc::new(AtomicBool::new(false));
+        let executed_for_task = Arc::clone(&executed);
+        let task: ConnectionCleanupTask = Box::new(move || {
+            executed_for_task.store(true, Ordering::Release);
+        });
+
+        let result = try_start_connection_cleanup_with(task, |_task| {
+            Err::<(), _>("simulated worker start failure")
+        });
+        let (err, pending_task) = match result {
+            Ok(()) => panic!("simulated worker start should fail"),
+            Err(failure) => failure,
+        };
+
+        assert_eq!(err, "simulated worker start failure");
+        assert!(!executed.load(Ordering::Acquire));
+        let pending_task = pending_task.expect("failed start must return cleanup ownership");
+        pending_task();
+        assert!(executed.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn cleanup_task_panic_is_contained() {
+        let task: ConnectionCleanupTask = Box::new(|| panic!("simulated cleanup panic"));
+        let task = Arc::new(Mutex::new(Some(task)));
+
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            run_connection_cleanup_task(task);
+        }));
+
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn connection_transition_is_released_during_panic_unwind() {
+        let connection = create_shared_connection();
+        let unwind_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _transition = begin_connection_transition(&connection, "PANIC_TRANSITION")
+                .expect("transition should start");
+            panic!("simulated transition panic");
+        }));
+
+        assert!(unwind_result.is_err());
+        assert!(connection_transition_activity(&connection).is_none());
+        assert!(try_lock_connection(&connection).is_some());
+    }
+
+    #[test]
+    fn panicking_transition_drop_does_not_wait_for_database_mutex() {
+        let connection = create_shared_connection();
+        let transition = begin_connection_transition(&connection, "PANIC_WITH_BUSY_MUTEX")
+            .expect("transition should start");
+        let connection_for_holder = Arc::clone(&connection);
+        let (locked_sender, locked_receiver) = std::sync::mpsc::channel();
+        let (release_sender, release_receiver) = std::sync::mpsc::channel();
+        let holder = std::thread::spawn(move || {
+            let _guard = connection_for_holder
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            locked_sender.send(()).expect("report held database mutex");
+            let _ = release_receiver.recv_timeout(Duration::from_secs(2));
+        });
+        locked_receiver
+            .recv_timeout(Duration::from_secs(1))
+            .expect("holder should acquire database mutex");
+
+        let started = Instant::now();
+        let unwind_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+            let _transition = transition;
+            panic!("simulated panic while raw database mutex is held");
+        }));
+        let elapsed = started.elapsed();
+
+        let _ = release_sender.send(());
+        holder.join().expect("database mutex holder");
+        assert!(unwind_result.is_err());
+        assert!(
+            elapsed < Duration::from_millis(250),
+            "panic cleanup waited for the database mutex: {elapsed:?}"
+        );
+        assert!(connection_transition_activity(&connection).is_none());
+    }
+
+    #[test]
+    fn connection_lock_releases_database_mutex_before_activity_mutex() {
+        let _activity_test_guard = db_activity_test_lock();
+        clear_tracked_db_activity();
+        let connection = create_shared_connection();
+        let connection_for_worker = Arc::clone(&connection);
+        let (ready_sender, ready_receiver) = std::sync::mpsc::channel();
+        let (drop_sender, drop_receiver) = std::sync::mpsc::channel();
+        let (done_sender, done_receiver) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let guard =
+                lock_connection_with_activity(&connection_for_worker, "LOCK_DROP_ORDER_TEST");
+            ready_sender.send(()).expect("report acquired lock");
+            drop_receiver.recv().expect("wait for drop signal");
+            drop(guard);
+            done_sender.send(()).expect("report dropped lock");
+        });
+        ready_receiver
+            .recv_timeout(Duration::from_secs(1))
+            .expect("worker should acquire connection lock");
+
+        let activity_lock = lock_db_activities();
+        drop_sender.send(()).expect("request guard drop");
+        let deadline = Instant::now() + Duration::from_millis(500);
+        let database_lock_released = loop {
+            match connection.try_lock() {
+                Ok(guard) => {
+                    drop(guard);
+                    break true;
+                }
+                Err(std::sync::TryLockError::WouldBlock) if Instant::now() < deadline => {
+                    std::thread::yield_now();
+                }
+                Err(std::sync::TryLockError::WouldBlock) => break false,
+                Err(std::sync::TryLockError::Poisoned(poisoned)) => {
+                    drop(poisoned.into_inner());
+                    break true;
+                }
+            }
+        };
+        drop(activity_lock);
+
+        done_receiver
+            .recv_timeout(Duration::from_secs(1))
+            .expect("guard drop should finish after activity lock is released");
+        worker.join().expect("lock drop worker");
+        assert!(database_lock_released);
+        clear_tracked_db_activity();
+    }
+
+    #[test]
+    fn connection_transition_rejects_try_lock_and_releases_blocking_waiters() {
+        let connection = create_shared_connection();
+        let transition = begin_connection_transition(&connection, "TEST_CONNECT_TRANSITION")
+            .expect("transition should start");
+        assert!(try_lock_connection(&connection).is_none());
+
+        let acquired = Arc::new(AtomicBool::new(false));
+        let acquired_for_worker = Arc::clone(&acquired);
+        let connection_for_worker = Arc::clone(&connection);
+        let worker = std::thread::spawn(move || {
+            let _guard = lock_connection(&connection_for_worker);
+            acquired_for_worker.store(true, Ordering::Release);
+        });
+        std::thread::sleep(Duration::from_millis(25));
+        assert!(!acquired.load(Ordering::Acquire));
+
+        transition.finish();
+        worker.join().expect("waiting worker should finish");
+        assert!(acquired.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn incomplete_prepared_connection_returns_error_without_replacing_current_state() {
+        let mut connection = DatabaseConnection::new();
+        connection.simulate_connected_metadata_for_test(ConnectionInfo::new_with_type(
+            "preserved",
+            "system",
+            "old-password",
+            "old-host",
+            1521,
+            "OLD",
+            DatabaseType::Oracle,
+        ));
+        let generation = connection.connection_generation();
+
+        let result = connection.install_prepared_connection(DatabaseConnection::new());
+
+        let err = match result {
+            Ok(_) => panic!("incomplete prepared connection should be rejected"),
+            Err(err) => err,
+        };
+        assert!(err.contains("incomplete"));
+        assert_eq!(connection.get_info().name, "preserved");
+        assert_eq!(connection.connection_generation(), generation);
+        assert!(connection.is_connected());
+    }
+
+    #[test]
+    fn disconnect_does_not_wait_for_a_held_session_state_mutex() {
+        let connection = create_shared_connection();
+        let session = {
+            let mut guard = lock_connection(&connection);
+            guard.simulate_connected_metadata_for_test(ConnectionInfo::new_with_type(
+                "connected",
+                "root",
+                "password",
+                "localhost",
+                3306,
+                "test",
+                DatabaseType::MySQL,
+            ));
+            guard.session_state()
+        };
+        let mut held_session = session.lock().expect("session state lock");
+        held_session.set_connection_db_type(DatabaseType::MySQL);
+
+        let connection_for_worker = Arc::clone(&connection);
+        let (done_sender, done_receiver) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let mut guard = lock_connection(&connection_for_worker);
+            guard.disconnect();
+            done_sender.send(()).expect("report disconnect completion");
+        });
+
+        done_receiver
+            .recv_timeout(Duration::from_secs(2))
+            .expect("disconnect should not wait for the held session mutex");
+        drop(held_session);
+        worker.join().expect("disconnect worker");
+
+        let reset_deadline = Instant::now() + Duration::from_secs(1);
+        loop {
+            if let Ok(guard) = session.try_lock() {
+                if guard.db_type == DatabaseType::default() {
+                    break;
+                }
+            }
+            assert!(
+                Instant::now() < reset_deadline,
+                "deferred session reset should complete"
+            );
+            std::thread::yield_now();
+        }
+
+        let reset_session = session
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        assert!(reset_session.define_enabled);
+    }
+
+    #[test]
+    fn stale_deferred_session_update_cannot_overwrite_a_newer_epoch() {
+        struct CompletionOnDrop(Option<std::sync::mpsc::Sender<()>>);
+
+        impl Drop for CompletionOnDrop {
+            fn drop(&mut self) {
+                if let Some(sender) = self.0.take() {
+                    let _ = sender.send(());
+                }
+            }
+        }
+
+        let session = Arc::new(Mutex::new(SessionState::default()));
+        let epoch_token = Arc::new(AtomicU64::new(7));
+        let mut held_session = session.lock().expect("hold session state lock");
+        let (done_sender, done_receiver) = std::sync::mpsc::channel();
+        let completion = CompletionOnDrop(Some(done_sender));
+
+        update_session_state_without_blocking(&session, &epoch_token, 7, move |session| {
+            let _completion = completion;
+            session.reset_for_connection(DatabaseType::default());
+        });
+        epoch_token.store(8, Ordering::Release);
+        held_session.set_connection_db_type(DatabaseType::MySQL);
+        drop(held_session);
+
+        done_receiver
+            .recv_timeout(Duration::from_secs(2))
+            .expect("deferred update should finish or be discarded");
+        let session = session
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        assert_eq!(session.db_type, DatabaseType::MySQL);
+        assert!(!session.define_enabled);
+    }
+
+    #[test]
+    fn failed_shared_connect_preserves_existing_connection_metadata() {
+        let _activity_test_guard = db_activity_test_lock();
+        clear_tracked_db_activity();
+        let listener =
+            std::net::TcpListener::bind(("127.0.0.1", 0)).expect("bind stalled MariaDB server");
+        let port = listener.local_addr().expect("listener address").port();
+        let (accepted_sender, accepted_receiver) = std::sync::mpsc::channel();
+        let (release_sender, release_receiver) = std::sync::mpsc::channel::<()>();
+        let server = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().expect("accept MariaDB test client");
+            accepted_sender.send(()).expect("report accepted client");
+            let _ = release_receiver.recv_timeout(Duration::from_secs(4));
+            drop(stream);
+        });
+
+        let connection = create_shared_connection();
+        {
+            let mut guard = lock_connection(&connection);
+            guard.simulate_connected_metadata_for_test(ConnectionInfo::new_with_type(
+                "preserved",
+                "system",
+                "old-password",
+                "old-host",
+                1521,
+                "OLD",
+                DatabaseType::Oracle,
+            ));
+        }
+        let replacement = ConnectionInfo::new_with_type(
+            "replacement",
+            "root",
+            "bad-password",
+            "127.0.0.1",
+            port,
+            "test-service",
+            DatabaseType::MariaDB,
+        );
+
+        let connection_for_attempt = Arc::clone(&connection);
+        let attempt = std::thread::spawn(move || {
+            connect_shared_connection_with_policy(
+                &connection_for_attempt,
+                replacement,
+                MIN_CONNECTION_POOL_SIZE,
+                ConnectionAttemptPolicy::from_seconds(1),
+            )
+        });
+        accepted_receiver
+            .recv_timeout(Duration::from_secs(2))
+            .expect("MariaDB client should reach the stalled server");
+
+        let ui_probe_started = Instant::now();
+        assert!(try_lock_connection(&connection).is_none());
+        assert!(ui_probe_started.elapsed() < Duration::from_millis(250));
+
+        let result = attempt.join().expect("connection attempt worker");
+        let _ = release_sender.send(());
+        server.join().expect("stalled MariaDB server");
+        assert!(result
+            .expect_err("stalled MariaDB connection should time out")
+            .contains("timed out"));
+
+        let guard = lock_connection(&connection);
+        assert_eq!(guard.get_info().name, "preserved");
+        assert_eq!(guard.db_type(), DatabaseType::Oracle);
+        assert!(guard.is_connected());
+    }
+
+    fn assert_stalled_server_obeys_connection_deadline(db_type: DatabaseType) {
+        let listener =
+            std::net::TcpListener::bind(("127.0.0.1", 0)).expect("bind stalled test server");
+        listener
+            .set_nonblocking(true)
+            .expect("make stalled test server nonblocking");
+        let port = listener.local_addr().expect("listener address").port();
+        let (release_sender, release_receiver) = std::sync::mpsc::channel::<()>();
+        let server = std::thread::spawn(move || {
+            let accept_deadline = Instant::now() + Duration::from_secs(4);
+            loop {
+                match listener.accept() {
+                    Ok((stream, _)) => {
+                        let _ = release_receiver.recv_timeout(Duration::from_secs(4));
+                        drop(stream);
+                        return true;
+                    }
+                    Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
+                        match release_receiver.try_recv() {
+                            Ok(()) | Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                                return false;
+                            }
+                            Err(std::sync::mpsc::TryRecvError::Empty) => {}
+                        }
+                        if Instant::now() >= accept_deadline {
+                            return false;
+                        }
+                        std::thread::sleep(Duration::from_millis(5));
+                    }
+                    Err(_) => return false,
+                }
+            }
+        });
+
+        let mut info = ConnectionInfo::new_with_type(
+            "stalled",
+            "test-user",
+            "test-password",
+            "127.0.0.1",
+            port,
+            "test-service",
+            db_type,
+        );
+        if db_type == DatabaseType::Oracle {
+            info.advanced.oracle_driver_mode = OracleDriverMode::Thin;
+        }
+
+        let started = Instant::now();
+        let result = DatabaseConnection::test_connection_with_policy(
+            &info,
+            ConnectionAttemptPolicy::from_seconds(1),
+        );
+        let elapsed = started.elapsed();
+        drop(release_sender);
+        let accepted = server.join().expect("stalled test server");
+
+        assert!(accepted, "{db_type} client should reach the stalled server");
+        assert!(result.is_err(), "{db_type} stalled connection should fail");
+        assert!(
+            elapsed >= Duration::from_millis(700),
+            "{db_type} failed before exercising the deadline: {elapsed:?}"
+        );
+        assert!(
+            elapsed < Duration::from_secs(4),
+            "{db_type} exceeded the common connection deadline: {elapsed:?}"
+        );
+    }
+
+    #[test]
+    fn mysql_family_stalled_handshakes_obey_common_connection_deadline() {
+        assert_stalled_server_obeys_connection_deadline(DatabaseType::MySQL);
+        assert_stalled_server_obeys_connection_deadline(DatabaseType::MariaDB);
+    }
+
+    #[test]
+    fn oracle_thin_stalled_handshake_obeys_common_connection_deadline() {
+        assert_stalled_server_obeys_connection_deadline(DatabaseType::Oracle);
+    }
 
     #[test]
     fn blocking_connection_lock_registers_activity_before_waiting() {
@@ -5935,8 +7096,12 @@ mod tests {
             "cache_test",
             DatabaseType::MySQL,
         );
-        let pool = DatabaseConnection::build_mysql_pool(&connection_info, MIN_CONNECTION_POOL_SIZE)
-            .expect("create test MySQL pool without opening a connection");
+        let pool = DatabaseConnection::build_mysql_pool(
+            &connection_info,
+            MIN_CONNECTION_POOL_SIZE,
+            ConnectionAttemptPolicy::default(),
+        )
+        .expect("create test MySQL pool without opening a connection");
         DbPoolSessionContext {
             connection_generation: 1,
             pool: DbConnectionPool::MySQL {
@@ -5966,8 +7131,12 @@ mod tests {
             return;
         }
 
-        let pool = DatabaseConnection::build_mysql_pool(&info, MIN_CONNECTION_POOL_SIZE)
-            .expect("create MySQL pool");
+        let pool = DatabaseConnection::build_mysql_pool(
+            &info,
+            MIN_CONNECTION_POOL_SIZE,
+            ConnectionAttemptPolicy::default(),
+        )
+        .expect("create MySQL pool");
         let db_pool = DbConnectionPool::MySQL {
             pool,
             advanced: info.advanced.clone(),
@@ -6403,9 +7572,41 @@ mod tests {
             "initial_db",
             DatabaseType::MySQL,
         );
-        let opts = mysql::Opts::from(DatabaseConnection::build_mysql_opts(&info));
+        let opts = mysql::Opts::from(DatabaseConnection::build_mysql_opts(
+            &info,
+            ConnectionAttemptPolicy::default(),
+        ));
 
         assert_eq!(opts.get_db_name(), Some("initial_db"));
+    }
+
+    #[test]
+    fn mysql_family_connection_opts_use_common_transport_timeout_only() {
+        for db_type in [DatabaseType::MySQL, DatabaseType::MariaDB] {
+            let info = ConnectionInfo::new_with_type(
+                "local",
+                "root",
+                "pw",
+                "localhost",
+                3306,
+                "initial_db",
+                db_type,
+            );
+            let policy = ConnectionAttemptPolicy::from_seconds(7);
+            let opts = mysql::Opts::from(DatabaseConnection::build_mysql_opts(&info, policy));
+            let pool_opts =
+                mysql::Opts::from(DatabaseConnection::build_mysql_pool_opts(&info, 4, policy));
+
+            assert_eq!(opts.get_tcp_connect_timeout(), Some(Duration::from_secs(7)));
+            assert_eq!(
+                pool_opts.get_tcp_connect_timeout(),
+                Some(Duration::from_secs(7))
+            );
+            assert_eq!(opts.get_read_timeout(), None);
+            assert_eq!(opts.get_write_timeout(), None);
+            assert_eq!(pool_opts.get_read_timeout(), None);
+            assert_eq!(pool_opts.get_write_timeout(), None);
+        }
     }
 
     #[test]
@@ -6419,7 +7620,11 @@ mod tests {
             "initial_db",
             DatabaseType::MySQL,
         );
-        let opts = mysql::Opts::from(DatabaseConnection::build_mysql_pool_opts(&info, 4));
+        let opts = mysql::Opts::from(DatabaseConnection::build_mysql_pool_opts(
+            &info,
+            4,
+            ConnectionAttemptPolicy::default(),
+        ));
 
         assert_eq!(opts.get_db_name(), None);
     }
@@ -6639,11 +7844,42 @@ mod tests {
         info.advanced.oracle_driver_mode = OracleDriverMode::Thin;
         info.debug_oracle_thin_protocol_version = Some(314);
 
-        let config = DatabaseConnection::build_oracle_thin_config(&info)
-            .expect("debug protocol version should build a Thin config");
+        let config =
+            DatabaseConnection::build_oracle_thin_config(&info, ConnectionAttemptPolicy::default())
+                .expect("debug protocol version should build a Thin config");
 
         assert_eq!(config.connect_options.desired_protocol_version, 314);
         assert_eq!(config.connect_options.minimum_protocol_version, 314);
+    }
+
+    #[test]
+    fn oracle_thin_config_uses_common_connect_policy_without_retries() {
+        let mut info = ConnectionInfo::new_with_type(
+            "local",
+            "system",
+            "pw",
+            "localhost",
+            1521,
+            "FREE",
+            DatabaseType::Oracle,
+        );
+        info.advanced.oracle_driver_mode = OracleDriverMode::Thin;
+        let config = DatabaseConnection::build_oracle_thin_config(
+            &info,
+            ConnectionAttemptPolicy::from_seconds(9),
+        )
+        .expect("Thin config should build");
+
+        assert_eq!(
+            config.connect_options.tcp_connect_timeout,
+            Duration::from_secs(9)
+        );
+        assert_eq!(
+            config.connect_options.connect_io_timeout,
+            Duration::from_secs(9)
+        );
+        assert_eq!(config.connect_options.retry_count, 0);
+        assert_eq!(config.connect_options.retry_delay, Duration::ZERO);
     }
 
     #[test]
@@ -6681,8 +7917,9 @@ mod tests {
         info.advanced.oracle_driver_mode = OracleDriverMode::Thin;
         info.debug_oracle_thin_protocol_version = Some(313);
 
-        let err = DatabaseConnection::build_oracle_thin_config(&info)
-            .expect_err("unsupported debug protocol should be rejected");
+        let err =
+            DatabaseConnection::build_oracle_thin_config(&info, ConnectionAttemptPolicy::default())
+                .expect_err("unsupported debug protocol should be rejected");
 
         assert!(err.contains("between 314 and 319"));
     }
@@ -6943,6 +8180,37 @@ mod tests {
     }
 
     #[test]
+    fn oracle_oci_direct_descriptor_uses_common_timeout_and_no_retry() {
+        let mut info = ConnectionInfo::new_with_type(
+            "local",
+            "system",
+            "pw",
+            "dbhost",
+            1521,
+            "FREE",
+            DatabaseType::Oracle,
+        );
+        let policy = ConnectionAttemptPolicy::from_seconds(8);
+
+        let tcp = OracleBackend::connection_string_with_policy(&info, policy);
+        assert!(tcp.contains("(CONNECT_TIMEOUT=8sec)"));
+        assert!(tcp.contains("(TRANSPORT_CONNECT_TIMEOUT=8sec)"));
+        assert!(tcp.contains("(RETRY_COUNT=0)"));
+        assert!(tcp.contains("(PROTOCOL=TCP)"));
+
+        info.advanced.oracle_protocol = OracleNetworkProtocol::Tcps;
+        let tcps = OracleBackend::connection_string_with_policy(&info, policy);
+        assert!(tcps.contains("(PROTOCOL=TCPS)"));
+
+        info.host.clear();
+        info.service_name = "LOCAL_FREE".to_string();
+        assert_eq!(
+            OracleBackend::connection_string_with_policy(&info, policy),
+            "LOCAL_FREE"
+        );
+    }
+
+    #[test]
     fn mysql_driver_ssl_options_follow_advanced_mode() {
         let mut info = ConnectionInfo::new_with_type(
             "local",
@@ -6953,18 +8221,27 @@ mod tests {
             "initial_db",
             DatabaseType::MySQL,
         );
-        let opts = mysql::Opts::from(DatabaseConnection::build_mysql_opts(&info));
+        let opts = mysql::Opts::from(DatabaseConnection::build_mysql_opts(
+            &info,
+            ConnectionAttemptPolicy::default(),
+        ));
         assert!(opts.get_ssl_opts().is_none());
 
         info.advanced.ssl_mode = ConnectionSslMode::Required;
-        let opts = mysql::Opts::from(DatabaseConnection::build_mysql_opts(&info));
+        let opts = mysql::Opts::from(DatabaseConnection::build_mysql_opts(
+            &info,
+            ConnectionAttemptPolicy::default(),
+        ));
         let ssl = opts.get_ssl_opts().expect("required SSL should be enabled");
         assert!(ssl.skip_domain_validation());
         assert!(ssl.accept_invalid_certs());
 
         info.advanced.ssl_mode = ConnectionSslMode::VerifyCa;
         info.advanced.mysql_ssl_ca_path = "/tmp/mysql-ca.pem".to_string();
-        let opts = mysql::Opts::from(DatabaseConnection::build_mysql_opts(&info));
+        let opts = mysql::Opts::from(DatabaseConnection::build_mysql_opts(
+            &info,
+            ConnectionAttemptPolicy::default(),
+        ));
         let ssl = opts.get_ssl_opts().expect("Verify CA should enable SSL");
         assert!(ssl.skip_domain_validation());
         assert!(!ssl.accept_invalid_certs());
@@ -6974,7 +8251,10 @@ mod tests {
         );
 
         info.advanced.ssl_mode = ConnectionSslMode::VerifyIdentity;
-        let opts = mysql::Opts::from(DatabaseConnection::build_mysql_opts(&info));
+        let opts = mysql::Opts::from(DatabaseConnection::build_mysql_opts(
+            &info,
+            ConnectionAttemptPolicy::default(),
+        ));
         let ssl = opts
             .get_ssl_opts()
             .expect("Verify identity should enable SSL");

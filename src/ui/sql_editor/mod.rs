@@ -2705,13 +2705,8 @@ impl SqlEditorWidget {
             Arc::new(Mutex::new(None));
         let object_context_callback: ObjectContextCallback = Arc::new(Mutex::new(None));
         let context_action_callback: SqlEditorContextActionCallback = Arc::new(Mutex::new(None));
-        let (initial_db_type, session_state) = match connection.lock() {
-            Ok(conn_guard) => (conn_guard.db_type(), conn_guard.session_state()),
-            Err(poisoned) => {
-                let conn_guard = poisoned.into_inner();
-                (conn_guard.db_type(), conn_guard.session_state())
-            }
-        };
+        let (initial_db_type, session_state) =
+            crate::db::shared_connection_identity_snapshot(&connection);
         let intellisense_runtime = Arc::new(IntellisenseRuntimeState::new_for_connection(
             initial_db_type,
             session_state,
@@ -5513,28 +5508,19 @@ impl SqlEditorWidget {
     }
 
     fn current_db_type(&self) -> crate::db::connection::DatabaseType {
-        match self.connection.lock() {
-            Ok(conn_guard) => conn_guard.db_type(),
-            Err(poisoned) => poisoned.into_inner().db_type(),
-        }
+        self.intellisense_runtime
+            .db_type_without_blocking(&self.connection)
     }
 
     fn current_mysql_delimiter(&self) -> Option<String> {
-        let session = match self.connection.lock() {
-            Ok(conn_guard) => {
-                if !conn_guard.db_type().supports_mysql_delimiter_commands() {
-                    return None;
-                }
-                conn_guard.session_state()
-            }
-            Err(poisoned) => {
-                let conn_guard = poisoned.into_inner();
-                if !conn_guard.db_type().supports_mysql_delimiter_commands() {
-                    return None;
-                }
-                conn_guard.session_state()
-            }
-        };
+        if !self
+            .intellisense_runtime
+            .cached_db_type()
+            .supports_mysql_delimiter_commands()
+        {
+            return None;
+        }
+        let session = self.intellisense_runtime.session_state();
 
         let delimiter = match session.lock() {
             Ok(guard) => guard.mysql_delimiter.clone(),

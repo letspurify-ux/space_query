@@ -23,6 +23,9 @@ pub const UI_SCALE_INCREMENT_PERCENT: u32 = 10;
 pub const DEFAULT_CONNECTION_POOL_SIZE: u32 = 12;
 pub const MIN_CONNECTION_POOL_SIZE: u32 = 1;
 pub const MAX_CONNECTION_POOL_SIZE: u32 = 16;
+pub const DEFAULT_CONNECT_TIMEOUT_SECONDS: u32 = 10;
+pub const MIN_CONNECT_TIMEOUT_SECONDS: u32 = 1;
+pub const MAX_CONNECT_TIMEOUT_SECONDS: u32 = 120;
 pub const DEFAULT_LAZY_FETCH_BATCH_SIZE: u32 = 100;
 pub const MIN_LAZY_FETCH_BATCH_SIZE: u32 = 1;
 pub const MAX_LAZY_FETCH_BATCH_SIZE: u32 = 10_000;
@@ -74,6 +77,7 @@ pub struct AppConfig {
     pub max_rows: u32,
     pub auto_commit: bool,
     pub connection_pool_size: u32,
+    pub connect_timeout_seconds: u32,
     pub cancel_timeout_seconds: u32,
     pub sql_comma_list_layout: SqlCommaListLayout,
     pub sql_format_right_margin: u32,
@@ -114,6 +118,7 @@ impl AppConfig {
             max_rows: 1000,
             auto_commit: false,
             connection_pool_size: DEFAULT_CONNECTION_POOL_SIZE,
+            connect_timeout_seconds: DEFAULT_CONNECT_TIMEOUT_SECONDS,
             cancel_timeout_seconds: DEFAULT_CANCEL_TIMEOUT_SECONDS,
             sql_comma_list_layout: SqlCommaListLayout::Wrapped,
             sql_format_right_margin: DEFAULT_SQL_FORMAT_RIGHT_MARGIN,
@@ -166,6 +171,14 @@ impl AppConfig {
 
     pub fn normalized_connection_pool_size(&self) -> u32 {
         Self::clamp_connection_pool_size(self.connection_pool_size)
+    }
+
+    pub fn clamp_connect_timeout_seconds(seconds: u32) -> u32 {
+        seconds.clamp(MIN_CONNECT_TIMEOUT_SECONDS, MAX_CONNECT_TIMEOUT_SECONDS)
+    }
+
+    pub fn normalized_connect_timeout_seconds(&self) -> u32 {
+        Self::clamp_connect_timeout_seconds(self.connect_timeout_seconds)
     }
 
     pub fn clamp_lazy_fetch_batch_size(size: u32) -> u32 {
@@ -600,6 +613,14 @@ mod tests {
     }
 
     #[test]
+    fn app_config_defaults_connect_timeout_to_ten_seconds() {
+        assert_eq!(
+            AppConfig::new().connect_timeout_seconds,
+            super::DEFAULT_CONNECT_TIMEOUT_SECONDS
+        );
+    }
+
+    #[test]
     fn app_config_defaults_lazy_fetch_batch_size_to_one_hundred() {
         assert_eq!(
             AppConfig::new().lazy_fetch_batch_size,
@@ -760,6 +781,13 @@ mod tests {
     }
 
     #[test]
+    fn app_config_clamps_connect_timeout_to_supported_range() {
+        assert_eq!(AppConfig::clamp_connect_timeout_seconds(0), 1);
+        assert_eq!(AppConfig::clamp_connect_timeout_seconds(10), 10);
+        assert_eq!(AppConfig::clamp_connect_timeout_seconds(999), 120);
+    }
+
+    #[test]
     fn app_config_clamps_sql_format_right_margin_to_supported_range() {
         assert_eq!(AppConfig::clamp_sql_format_right_margin(0), 60);
         assert_eq!(AppConfig::clamp_sql_format_right_margin(120), 120);
@@ -804,6 +832,10 @@ mod tests {
         assert_eq!(
             restored.cancel_timeout_seconds,
             super::DEFAULT_CANCEL_TIMEOUT_SECONDS
+        );
+        assert_eq!(
+            restored.connect_timeout_seconds,
+            super::DEFAULT_CONNECT_TIMEOUT_SECONDS
         );
         assert_eq!(
             restored.sql_comma_list_layout,
@@ -914,6 +946,7 @@ mod tests {
         config.lazy_fetch_batch_size = 500;
         config.intellisense_context_window_kib = 256;
         config.intellisense_popup_delay_ms = 400;
+        config.connect_timeout_seconds = 11;
         config.cancel_timeout_seconds = 9;
         config.recent_connections.push(ConnectionInfo {
             name: "prod".to_string(),
@@ -933,6 +966,7 @@ mod tests {
         assert!(serialized.contains("\"lazy_fetch_batch_size\":500"));
         assert!(serialized.contains("\"intellisense_context_window_kib\":256"));
         assert!(serialized.contains("\"intellisense_popup_delay_ms\":400"));
+        assert!(serialized.contains("\"connect_timeout_seconds\":11"));
         assert!(serialized.contains("\"cancel_timeout_seconds\":9"));
         assert!(!serialized.contains("secret"));
         assert!(!serialized.contains("debug_oracle_thin_protocol_version"));

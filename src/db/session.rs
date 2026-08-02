@@ -199,12 +199,15 @@ impl SessionState {
 
     pub fn reset(&mut self) {
         // Reset is used for client-side SQL*Plus/session settings within the
-        // current backend. Connection transitions that change backend type set
-        // db_type explicitly after reset/connect, so preserving it here avoids
-        // briefly falling back to Oracle parsing on same-connection resets.
+        // current backend. Preserve the backend while restoring that backend's
+        // defaults, without briefly exposing Oracle defaults for MySQL/MariaDB.
         let db_type = self.db_type;
+        self.reset_for_connection(db_type);
+    }
+
+    pub fn reset_for_connection(&mut self, db_type: DatabaseType) {
         *self = Self::default();
-        self.db_type = db_type;
+        self.set_connection_db_type(db_type);
     }
 }
 
@@ -213,7 +216,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn reset_preserves_current_backend_until_connection_transition_restamps_it() {
+    fn reset_preserves_current_backend_and_restores_its_defaults() {
         let mut session = SessionState {
             db_type: DatabaseType::MySQL,
             continue_on_error: true,
@@ -226,13 +229,15 @@ mod tests {
         assert_eq!(session.db_type, DatabaseType::MySQL);
         assert!(!session.continue_on_error);
         assert_eq!(session.mysql_delimiter, None);
+        assert!(!session.define_enabled);
 
-        session.db_type = DatabaseType::Oracle;
+        session.reset_for_connection(DatabaseType::Oracle);
         assert_eq!(
             session.db_type,
             DatabaseType::Oracle,
-            "connection transition code must explicitly stamp the new backend after reset/connect"
+            "connection transitions must atomically reset and stamp the new backend"
         );
+        assert!(session.define_enabled);
     }
 
     #[test]
