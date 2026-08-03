@@ -1257,7 +1257,7 @@ impl ResultTableWidget {
 
     fn page_target_row(current_row: usize, unit: usize, forward: bool) -> usize {
         let unit = unit.max(1);
-        let current_page_start = current_row / unit * unit;
+        let current_page_start = safe_div(current_row, unit) * unit;
         if forward {
             current_page_start.saturating_add(unit)
         } else {

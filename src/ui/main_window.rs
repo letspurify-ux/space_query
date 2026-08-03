@@ -69,7 +69,6 @@ const QUERY_TOOLBAR_COMPACT_CHOICE_WIDTH: i32 = 185;
 const QUERY_TOOLBAR_COMPACT_ACCESS_WIDTH: i32 = 105;
 const QUERY_TOOLBAR_COMPACT_NUMERIC_WIDTH: i32 = 48;
 const QUERY_TOOLBAR_COMPACT_SCALE_BUTTON_WIDTH: i32 = 28;
-const TOOLBAR_CONTROL_VERTICAL_MARGIN: i32 = (RESULT_TOOLBAR_HEIGHT - BUTTON_HEIGHT) / 2;
 const UI_SCALE_EPSILON: f32 = 0.01;
 #[cfg(target_os = "macos")]
 const MACOS_FULLSCREEN_EXIT_POLL_SECONDS: f64 = 0.05;
@@ -5651,6 +5650,7 @@ impl MainWindow {
             UI_SCALE_BUTTON_WIDTH
         };
 
+        let toolbar_control_vertical_margin = safe_div(RESULT_TOOLBAR_HEIGHT - BUTTON_HEIGHT, 2);
         let mut main_flex = Flex::default_fill();
         main_flex.set_type(FlexType::Column);
 
@@ -5661,9 +5661,9 @@ impl MainWindow {
         query_toolbar.set_type(FlexType::Row);
         query_toolbar.set_margins(
             query_toolbar_margin,
-            TOOLBAR_CONTROL_VERTICAL_MARGIN,
+            toolbar_control_vertical_margin,
             query_toolbar_margin,
-            TOOLBAR_CONTROL_VERTICAL_MARGIN,
+            toolbar_control_vertical_margin,
         );
         query_toolbar.set_spacing(query_toolbar_spacing);
 
@@ -5800,9 +5800,9 @@ impl MainWindow {
             let horizontal_margin = if compact { 4 } else { TOOLBAR_SPACING };
             toolbar.set_margins(
                 horizontal_margin,
-                TOOLBAR_CONTROL_VERTICAL_MARGIN,
+                toolbar_control_vertical_margin,
                 horizontal_margin,
-                TOOLBAR_CONTROL_VERTICAL_MARGIN,
+                toolbar_control_vertical_margin,
             );
             toolbar.set_spacing(if compact { 4 } else { TOOLBAR_SPACING });
             let button_width = if compact {
@@ -5989,9 +5989,9 @@ impl MainWindow {
         result_toolbar.set_type(FlexType::Row);
         result_toolbar.set_margins(
             TOOLBAR_SPACING,
-            TOOLBAR_CONTROL_VERTICAL_MARGIN,
+            toolbar_control_vertical_margin,
             TOOLBAR_SPACING,
-            TOOLBAR_CONTROL_VERTICAL_MARGIN,
+            toolbar_control_vertical_margin,
         );
         result_toolbar.set_spacing(TOOLBAR_SPACING);
 

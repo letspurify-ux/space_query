@@ -10,6 +10,8 @@ use fltk::{
     valuator::Scrollbar,
 };
 
+use crate::utils::arithmetic::safe_div;
+
 // Windows 11-inspired dark palette tuned for FLTK widgets.
 
 pub const CHOICE_TEXT_LEFT_PADDING: i32 = 10;
@@ -173,8 +175,8 @@ fn style_choice_with_background(choice: &mut Choice, background: Color) {
             );
         }
 
-        let arrow_x = choice.x() + choice.w() - arrow_width / 2;
-        let arrow_y = choice.y() + choice.h() / 2;
+        let arrow_x = choice.x() + choice.w() - safe_div(arrow_width, 2);
+        let arrow_y = choice.y() + safe_div(choice.h(), 2);
         draw_polygon(
             arrow_x - 3,
             arrow_y - 2,
