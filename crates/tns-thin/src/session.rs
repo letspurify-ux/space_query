@@ -6251,8 +6251,8 @@ fn bind_column_metadata(bind: &BindValue) -> ThinColumn {
         }
     };
     let (precision, scale) = match column_type {
-        OracleColumnType::IntervalYearMonth => (2, 0),
-        OracleColumnType::IntervalDaySecond => (2, 6),
+        OracleColumnType::IntervalYearMonth => (9, 0),
+        OracleColumnType::IntervalDaySecond => (9, 9),
         _ => (0, 0),
     };
     ThinColumn {
@@ -17379,6 +17379,7 @@ mod tests {
         let metadata = bind_column_metadata(&ym_pos);
         assert_eq!(metadata.ora_type_num, ORA_TYPE_NUM_INTERVAL_YM);
         assert_eq!(metadata.buffer_size, 5);
+        assert_eq!((metadata.precision, metadata.scale), (9, 0));
         let mut payload = Vec::new();
         write_bind_value(&mut payload, &OracleThinCapabilities::default(), &ym_pos).unwrap();
         assert_eq!(payload, vec![5, 128, 0, 7, 229, 70]);
@@ -17406,6 +17407,7 @@ mod tests {
         let metadata = bind_column_metadata(&ds_pos);
         assert_eq!(metadata.ora_type_num, ORA_TYPE_NUM_INTERVAL_DS);
         assert_eq!(metadata.buffer_size, 11);
+        assert_eq!((metadata.precision, metadata.scale), (9, 9));
         let mut payload = Vec::new();
         write_bind_value(&mut payload, &OracleThinCapabilities::default(), &ds_pos).unwrap();
         assert_eq!(payload, vec![11, 128, 0, 0, 2, 72, 83, 94, 155, 46, 2, 0]);

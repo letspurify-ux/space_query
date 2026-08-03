@@ -1994,6 +1994,10 @@ pub(crate) fn validate_sql_expression_input(expr: &str) -> Result<String, String
         );
     }
 
+    if QueryExecutor::result_edit_expression_has_top_level_comma(normalized) {
+        return Err("SQL expression cannot contain a top-level comma.".to_string());
+    }
+
     Ok(normalized.to_string())
 }
 
@@ -2875,6 +2879,13 @@ END$$"#;
     #[test]
     fn validate_sql_expression_input_rejects_multi_statement_expression() {
         assert!(super::validate_sql_expression_input("sysdate; delete from emp").is_err());
+    }
+
+    #[test]
+    fn validate_sql_expression_input_rejects_extra_assignment_but_allows_function_arguments() {
+        assert!(super::validate_sql_expression_input("1, other_col = 2").is_err());
+        assert!(super::validate_sql_expression_input("COALESCE(value_col, 0)").is_ok());
+        assert!(super::validate_sql_expression_input("q'[a,b]'").is_ok());
     }
 
     #[test]

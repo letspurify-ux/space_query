@@ -6660,6 +6660,10 @@ impl QueryExecutor {
         None
     }
 
+    pub fn result_edit_expression_has_top_level_comma(sql: &str) -> bool {
+        Self::find_first_top_level_comma(sql).is_some()
+    }
+
     pub fn is_rowid_edit_eligible_query(sql: &str) -> bool {
         let trimmed = sql.trim();
         if trimmed.is_empty() {
@@ -6803,6 +6807,10 @@ impl QueryExecutor {
                 | "AVG"
                 | "MIN"
                 | "MAX"
+                | "BIT_AND"
+                | "BIT_OR"
+                | "BIT_XOR"
+                | "GROUP_CONCAT"
                 | "ANY_VALUE"
                 | "APPROX_COUNT_DISTINCT"
                 | "APPROX_MEDIAN"
@@ -6819,6 +6827,7 @@ impl QueryExecutor {
                 | "RANK"
                 | "STATS_MODE"
                 | "STDDEV"
+                | "STD"
                 | "STDDEV_POP"
                 | "STDDEV_SAMP"
                 | "SYS_XMLAGG"
@@ -6839,6 +6848,7 @@ impl QueryExecutor {
                 | "REGR_SXX"
                 | "REGR_SYY"
                 | "REGR_SXY"
+                | "ST_COLLECT"
         )
     }
 
@@ -7444,7 +7454,8 @@ impl QueryExecutor {
         if let Some(token) = TopLevelScanner::new(slice).next() {
             if let ScanToken::Word { text, .. } = token {
                 return text.eq_ignore_ascii_case("DISTINCT")
-                    || text.eq_ignore_ascii_case("UNIQUE");
+                    || text.eq_ignore_ascii_case("UNIQUE")
+                    || text.eq_ignore_ascii_case("DISTINCTROW");
             }
             return false;
         }
@@ -7456,7 +7467,7 @@ impl QueryExecutor {
         let select_end = select_idx.saturating_add("SELECT".len());
         let mut idx = Self::skip_select_prefix_whitespace_and_hint(sql, select_end);
 
-        for modifier in ["DISTINCT", "UNIQUE", "ALL"] {
+        for modifier in ["DISTINCT", "DISTINCTROW", "UNIQUE", "ALL"] {
             if Self::starts_with_keyword_at(sql, idx, modifier) {
                 idx = idx.saturating_add(modifier.len());
                 idx = Self::skip_ascii_whitespace(sql, idx);

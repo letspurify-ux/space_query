@@ -35,6 +35,25 @@ Besides ordinary query results, ref cursors, Quick Describe, object-browser
 queries, and Explain Plan can use Data Grid. `append_explain_plan_tab()` converts
 plan text to a one-column `QueryResult` whose column is named `Text`.
 
+## Grid editing
+
+`src/db/result_edit.rs` defines the backend-neutral edit descriptor, typed row
+snapshot, mutation request, and exact-row execution rules. An editable result
+must identify one base table and every existing row uniquely:
+
+- Oracle uses `ROWID`.
+- MySQL and MariaDB prefer the primary key, then a complete non-null unique
+  index. Nullable, functional, or incomplete unique indexes are not locators.
+- JOINs, CTEs, derived tables, and other ambiguous result shapes stay read-only.
+  Computed or duplicate source columns are not editable.
+
+MySQL/MariaDB save pre-locks and verifies affected rows against their original
+typed values. Oracle uses guarded `ROWID` DML and verifies `SQL%ROWCOUNT`.
+Every update or delete is constrained to one row. A stale row, missing row,
+duplicate locator, cancellation, or execution error rolls back the whole save
+(or only its savepoint inside an existing manual transaction), leaving the
+staged grid changes available for correction or retry.
+
 ## Support panes
 
 | Section | Inner structure | Input API |

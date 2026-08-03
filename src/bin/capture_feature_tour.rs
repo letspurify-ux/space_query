@@ -353,6 +353,108 @@ fn capture_object_browser(main_window: &mut MainWindow) {
     }
 }
 
+fn result_page_control_sizes() -> Vec<(i32, i32)> {
+    let mut sizes = [
+        "result_page_first",
+        "result_page_previous",
+        "result_page_next",
+        "result_page_last",
+    ]
+    .iter()
+    .map(|widget_id| {
+        let button = app::widget_from_id::<fltk::button::Button>(widget_id)
+            .unwrap_or_else(|| fail(format!("{widget_id} control is missing")));
+        (button.w(), button.h())
+    })
+    .collect::<Vec<_>>();
+    let unit = app::widget_from_id::<fltk::menu::Choice>("result_page_unit")
+        .unwrap_or_else(|| fail("result page unit control is missing"));
+    sizes.push((unit.w(), unit.h()));
+    sizes
+}
+
+fn assert_result_page_control_layout(expected_sizes: &[(i32, i32)]) {
+    let actual_sizes = result_page_control_sizes();
+    if actual_sizes != expected_sizes {
+        fail(format!(
+            "result page controls changed size: expected {expected_sizes:?}, got {actual_sizes:?}"
+        ));
+    }
+
+    let clear = app::widget_from_id::<fltk::button::Button>("result_clear_all")
+        .unwrap_or_else(|| fail("result clear button is missing"));
+    let page_control = app::widget_from_id::<fltk::group::Flex>("result_page_controls")
+        .unwrap_or_else(|| fail("result page control flex is missing"));
+    let first = app::widget_from_id::<fltk::button::Button>("result_page_first")
+        .unwrap_or_else(|| fail("result first-page button is missing"));
+    let last = app::widget_from_id::<fltk::button::Button>("result_page_last")
+        .unwrap_or_else(|| fail("result last-page button is missing"));
+    let unit = app::widget_from_id::<fltk::menu::Choice>("result_page_unit")
+        .unwrap_or_else(|| fail("result page unit control is missing"));
+    let one_tab = app::widget_from_id::<fltk::button::CheckButton>("result_one_tab_per_query")
+        .unwrap_or_else(|| fail("result one-tab-per-query control is missing"));
+    let available_center_twice = clear.x() + clear.w() + one_tab.x();
+    let flex_center_twice = page_control.x() * 2 + page_control.w();
+    if (available_center_twice - flex_center_twice).abs() > 1 {
+        fail("result page flex is not centered between the adjacent toolbar controls");
+    }
+
+    let required_width = expected_sizes.iter().map(|(width, _)| width).sum::<i32>()
+        + i32::try_from(expected_sizes.len().saturating_sub(1)).unwrap_or(0);
+    let should_show = page_control.w() >= required_width;
+    let buttons_visibility_matches = [
+        "result_page_first",
+        "result_page_previous",
+        "result_page_next",
+        "result_page_last",
+    ]
+    .iter()
+    .all(|widget_id| {
+        app::widget_from_id::<fltk::button::Button>(widget_id)
+            .is_some_and(|button| button.visible() == should_show)
+    });
+    if !buttons_visibility_matches || unit.visible() != should_show {
+        fail(format!(
+            "result page control visibility does not match available width {}",
+            page_control.w()
+        ));
+    }
+    if !should_show {
+        return;
+    }
+
+    let controls_center_twice = first.x() + last.x() + last.w();
+    if (flex_center_twice - controls_center_twice).abs() > 1 {
+        fail(format!(
+            "result page controls are not centered: flex center x2={flex_center_twice}, controls center x2={controls_center_twice}"
+        ));
+    }
+}
+
+fn capture_result_page_resizes(capture_paths: [&str; 2], expected_sizes: &[(i32, i32)]) {
+    let mut window =
+        app::widget_from_id::<Window>("main_window").unwrap_or_else(|| fail("main window"));
+    let original_bounds = (window.x(), window.y(), window.w(), window.h());
+    assert_result_page_control_layout(expected_sizes);
+
+    for ((width, height), capture_path) in [(1000, 700), (800, 600)].into_iter().zip(capture_paths)
+    {
+        window.resize(original_bounds.0, original_bounds.1, width, height);
+        pump(300);
+        assert_result_page_control_layout(expected_sizes);
+        save_main(capture_path);
+    }
+
+    window.resize(
+        original_bounds.0,
+        original_bounds.1,
+        original_bounds.2,
+        original_bounds.3,
+    );
+    pump(300);
+    assert_result_page_control_layout(expected_sizes);
+}
+
 fn capture_result_grid(main_window: &mut MainWindow) {
     let columns = [
         ("EMPNO", "NUMBER"),
@@ -373,6 +475,10 @@ fn capture_result_grid(main_window: &mut MainWindow) {
         &["7788", "SCOTT", "ANALYST", "20", "3000", "1987-04-19"],
         &["7839", "KING", "PRESIDENT", "10", "5000", "1981-11-17"],
         &["7844", "TURNER", "SALESMAN", "30", "1500", "1981-09-08"],
+        &["7876", "ADAMS", "CLERK", "20", "1100", "1987-05-23"],
+        &["7900", "JAMES", "CLERK", "30", "950", "1981-12-03"],
+        &["7902", "FORD", "ANALYST", "20", "3000", "1981-12-03"],
+        &["7934", "MILLER", "CLERK", "10", "1300", "1982-01-23"],
     ];
     main_window
         .capture_tour_show_result(
@@ -385,6 +491,43 @@ fn capture_result_grid(main_window: &mut MainWindow) {
     pump(350);
     save_main("/tmp/space-query-main.ppm");
     save_main("/tmp/space-query-result-grid.ppm");
+
+    let default_unit = app::widget_from_id::<fltk::menu::Choice>("result_page_unit")
+        .and_then(|choice| choice.choice());
+    if default_unit.as_deref() != Some("500") {
+        fail(format!(
+            "result page unit should default to 500, got {default_unit:?}"
+        ));
+    }
+    let expected_page_control_sizes = result_page_control_sizes();
+    capture_result_page_resizes(
+        [
+            "/tmp/space-query-result-resized-1000.ppm",
+            "/tmp/space-query-result-resized-800.ppm",
+        ],
+        &expected_page_control_sizes,
+    );
+
+    let mut unit = app::widget_from_id::<fltk::menu::Choice>("result_page_unit")
+        .unwrap_or_else(|| fail("result page unit control is missing"));
+    unit.set_value(0);
+    for (widget_id, capture_path) in [
+        (
+            "result_page_next",
+            Some("/tmp/space-query-result-paging.ppm"),
+        ),
+        ("result_page_previous", None),
+        ("result_page_last", None),
+        ("result_page_first", None),
+    ] {
+        let mut button = app::widget_from_id::<fltk::button::Button>(widget_id)
+            .unwrap_or_else(|| fail(format!("{widget_id} control is missing")));
+        button.do_callback();
+        pump(80);
+        if let Some(capture_path) = capture_path {
+            save_main(capture_path);
+        }
+    }
 }
 
 fn capture_result_editing(main_window: &mut MainWindow) {
@@ -439,12 +582,78 @@ fn capture_result_editing(main_window: &mut MainWindow) {
                 rows,
                 "SELECT ROWID, EMPNO, ENAME, JOB, SAL, DEPTNO FROM EMP",
             ),
-            true,
+            false,
             None,
         )
         .unwrap_or_else(|err| fail(format!("show editable result: {err}")));
     pump(350);
+
+    let mut edit_mode = app::widget_from_id::<fltk::button::CheckButton>("result_edit_mode")
+        .unwrap_or_else(|| fail("result edit-mode control is missing"));
+    if !edit_mode.visible() || edit_mode.value() {
+        fail("result edit mode should initially be visible and unchecked");
+    }
+    let expected_page_control_sizes = result_page_control_sizes();
+    save_main("/tmp/space-query-result-editing-off.ppm");
+    capture_result_page_resizes(
+        [
+            "/tmp/space-query-result-editing-off-resized-1000.ppm",
+            "/tmp/space-query-result-editing-off-resized-800.ppm",
+        ],
+        &expected_page_control_sizes,
+    );
+
+    edit_mode.set(true);
+    edit_mode.do_callback();
+    pump(300);
+    if !edit_mode.value() {
+        fail("result edit mode should be checked after enabling it");
+    }
+    for widget_id in [
+        "result_edit_insert",
+        "result_edit_delete",
+        "result_edit_save",
+        "result_edit_cancel",
+    ] {
+        let button = app::widget_from_id::<fltk::button::Button>(widget_id)
+            .unwrap_or_else(|| fail(format!("{widget_id} control is missing")));
+        if !button.visible() {
+            fail(format!(
+                "{widget_id} control should be visible in edit mode"
+            ));
+        }
+    }
     save_main("/tmp/space-query-result-editing.ppm");
+    capture_result_page_resizes(
+        [
+            "/tmp/space-query-result-editing-resized-1000.ppm",
+            "/tmp/space-query-result-editing-resized-800.ppm",
+        ],
+        &expected_page_control_sizes,
+    );
+
+    edit_mode.set(false);
+    edit_mode.do_callback();
+    pump(300);
+    if edit_mode.value() {
+        fail("result edit mode should be unchecked after disabling it");
+    }
+    for widget_id in [
+        "result_edit_insert",
+        "result_edit_delete",
+        "result_edit_save",
+        "result_edit_cancel",
+    ] {
+        let button = app::widget_from_id::<fltk::button::Button>(widget_id)
+            .unwrap_or_else(|| fail(format!("{widget_id} control is missing")));
+        if button.visible() {
+            fail(format!(
+                "{widget_id} control should be hidden outside edit mode"
+            ));
+        }
+    }
+    assert_result_page_control_layout(&expected_page_control_sizes);
+    save_main("/tmp/space-query-result-editing-off-again.ppm");
 }
 
 fn capture_session_activity(main_window: &mut MainWindow) {
@@ -569,6 +778,7 @@ fn capture_dialogs(config: &AppConfig) {
 }
 
 fn main() {
+    let capture_mode = std::env::args().nth(1);
     let ui_scale_percent = std::env::var("SPACE_QUERY_CAPTURE_UI_SCALE")
         .ok()
         .and_then(|value| value.parse::<u32>().ok())
@@ -583,9 +793,14 @@ fn main() {
         ui_scale_percent,
         ..AppConfig::default()
     };
-    config
-        .save()
-        .unwrap_or_else(|err| fail(format!("save isolated capture config: {err}")));
+    if !matches!(
+        capture_mode.as_deref(),
+        Some("result-paging" | "result-editing")
+    ) {
+        config
+            .save()
+            .unwrap_or_else(|err| fail(format!("save isolated capture config: {err}")));
+    }
 
     let _app = app::App::default()
         .with_scheme(app::Scheme::Gtk)
@@ -607,8 +822,20 @@ fn main() {
     main_window.show();
     pump(300);
 
-    if std::env::args().nth(1).as_deref() == Some("object-browser") {
+    if capture_mode.as_deref() == Some("object-browser") {
         capture_object_browser(&mut main_window);
+        app::quit();
+        return;
+    }
+    if capture_mode.as_deref() == Some("result-paging") {
+        capture_object_browser(&mut main_window);
+        capture_result_grid(&mut main_window);
+        app::quit();
+        return;
+    }
+    if capture_mode.as_deref() == Some("result-editing") {
+        capture_object_browser(&mut main_window);
+        capture_result_editing(&mut main_window);
         app::quit();
         return;
     }

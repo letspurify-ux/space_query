@@ -500,6 +500,7 @@ struct ExecutionWorkerContext<'a> {
     binding_revision: u64,
     sender: &'a QueryProgressSender,
     sql_text: &'a str,
+    result_edit_request: Option<crate::db::ResultEditRequest>,
     pooled_db_session: &'a SharedDbSessionLease,
     mysql_auto_commit_override: &'a Arc<Mutex<Option<bool>>>,
     active_lazy_fetch: &'a Arc<Mutex<Option<LazyFetchHandle>>>,
@@ -1079,6 +1080,7 @@ impl ExecutionWorkerBackend for MysqlExecutionWorkerBackend {
             connection_binding,
             sender,
             sql_text,
+            result_edit_request,
             pooled_db_session,
             mysql_auto_commit_override,
             active_lazy_fetch,
@@ -1136,6 +1138,36 @@ impl ExecutionWorkerBackend for MysqlExecutionWorkerBackend {
         }
 
         drop(conn_guard);
+        if let Some(request) = result_edit_request {
+            if let Some(message) = SqlEditorWidget::execute_mysql_result_edit_request(
+                shared_connection,
+                sender,
+                db_type,
+                sql_text,
+                &conn_name,
+                &session,
+                pooled_db_session,
+                current_mysql_cancel_context,
+                current_query_cancel_handle,
+                cancel_flag,
+                current_operation_id,
+                operation_id,
+                query_timeout,
+                auto_commit,
+                db_activity,
+                execution_scope.as_deref(),
+                &request,
+            ) {
+                QueryExecutionCleanupGuard::note_mysql_message(
+                    cleanup.execution_metadata_mut(),
+                    &message,
+                );
+            }
+            if let Some(runtime) = connection_binding.snapshot().runtime {
+                runtime.refresh_state_from_connection();
+            }
+            return ExecutionWorkerOutcome::Handled;
+        }
         SqlEditorWidget::execute_mysql_batch(
             shared_connection,
             sender,
@@ -2319,6 +2351,67 @@ impl SqlEditorWidget {
 
     pub fn execute_sql_text(&self, sql: &str) {
         self.execute_sql(sql, false);
+    }
+
+    pub fn execute_result_edit(&self, request: crate::db::ResultEditRequest) -> Result<(), String> {
+        if self.is_query_running() {
+            return Err("The owning query tab is already running a query.".to_string());
+        }
+        if !crate::db::result_edit_backend_policy(request.descriptor.db_type)
+            .supports_structured_requests()
+        {
+            return Err("This structured result-edit backend is not available.".to_string());
+        }
+        let request_id = request.request_id;
+        let request_tag = request.request_tag();
+        {
+            let mut pending = self
+                .pending_result_edit_request
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if pending.is_some() {
+                return Err("Another result edit is already being started.".to_string());
+            }
+            *pending = Some(request);
+        }
+        let marker = Self::internal_result_edit_marker(&request_tag);
+        if !self.try_execute_sql(&marker, false) {
+            let mut pending = self
+                .pending_result_edit_request
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if pending
+                .as_ref()
+                .is_some_and(|queued| queued.request_id == request_id)
+            {
+                *pending = None;
+            }
+            return Err("Failed to start result-grid edit execution.".to_string());
+        }
+        Ok(())
+    }
+
+    fn internal_result_edit_marker(request_tag: &str) -> String {
+        format!(
+            "UPDATE /* {} SQ_INTERNAL_RESULT_EDIT */ __sq_internal_result_edit SET value = value WHERE 1 = 0",
+            request_tag
+        )
+    }
+
+    fn internal_result_edit_request_id(sql: &str) -> Option<u64> {
+        if !sql.contains("SQ_INTERNAL_RESULT_EDIT") {
+            return None;
+        }
+        let marker = "SQ_SAVE_REQUEST:";
+        let start = sql.find(marker)?.saturating_add(marker.len());
+        let digits = sql
+            .get(start..)?
+            .chars()
+            .take_while(|ch| ch.is_ascii_digit())
+            .collect::<String>();
+        (!digits.is_empty())
+            .then(|| digits.parse::<u64>().ok())
+            .flatten()
     }
 
     pub fn focus(&mut self) {
@@ -5600,37 +5693,80 @@ impl SqlEditorWidget {
                                 Self::lazy_fetch_interrupt_kind_for_command(&command),
                             ));
                         }
-                        let mut result =
-                            conn.query_iter(sql_to_execute.as_str()).map_err(|err| {
+                        let edit_plan = crate::db::prepare_mysql_editable_select(
+                            conn,
+                            sql_to_execute.as_str(),
+                        );
+                        let execution_sql = edit_plan
+                            .as_ref()
+                            .map(|plan| plan.sql.as_str())
+                            .unwrap_or(sql_to_execute.as_str());
+                        let mut result = conn.query_iter(execution_sql).map_err(|err| {
                                 SqlEditorWidget::mysql_error_message(&err, lazy_fetch_timeout)
                             })?;
-                        let column_info: Vec<ColumnInfo> = result
-                            .columns()
+                        let wire_columns = result.columns().as_ref().to_vec();
+                        let visible_column_count = edit_plan
                             .as_ref()
+                            .and_then(|plan| {
+                                crate::db::mysql_original_column_count(plan, &wire_columns)
+                            })
+                            .unwrap_or(wire_columns.len());
+                        let edit_descriptor = edit_plan.as_ref().and_then(|plan| {
+                            crate::db::mysql_descriptor_from_columns(
+                                connection_info.db_type,
+                                plan,
+                                &wire_columns,
+                            )
+                        });
+                        let mut column_info: Vec<ColumnInfo> = wire_columns
+                            [..visible_column_count]
                             .iter()
                             .map(|col| ColumnInfo {
                                 name: col.name_str().to_string(),
                                 data_type: format!("{:?}", col.column_type()),
                             })
                             .collect();
-                        let raw_column_names = column_info
+                        if edit_descriptor.is_some() {
+                            column_info.push(ColumnInfo {
+                                name: crate::db::RESULT_EDIT_SNAPSHOT_COLUMN.to_string(),
+                                data_type: "INTERNAL".to_string(),
+                            });
+                        }
+                        let raw_column_names = wire_columns[..visible_column_count]
                             .iter()
-                            .map(|column| column.name.clone())
+                            .map(|column| column.name_str().to_string())
                             .collect::<Vec<String>>();
-                        let display_columns = SqlEditorWidget::apply_heading_setting(
-                            raw_column_names.clone(),
+                        let mut grid_column_names = raw_column_names.clone();
+                        if edit_descriptor.is_some() {
+                            grid_column_names
+                                .push(crate::db::RESULT_EDIT_SNAPSHOT_COLUMN.to_string());
+                        }
+                        let display_columns =
+                            SqlEditorWidget::apply_result_grid_heading_setting(
+                            grid_column_names,
                             heading_enabled,
+                            edit_descriptor.is_some(),
                         );
                         let _ = sender.send(QueryProgress::SelectStart {
                             index,
                             columns: display_columns.clone(),
                             null_text: null_text.clone(),
                         });
+                        if let Some(descriptor) = edit_descriptor.clone() {
+                            let _ = sender.send(QueryProgress::ResultEditMetadata {
+                                index,
+                                descriptor,
+                            });
+                        }
                         app::awake();
                         if !display_columns.is_empty() {
+                            let spool_columns = SqlEditorWidget::apply_heading_setting(
+                                raw_column_names.clone(),
+                                heading_enabled,
+                            );
                             SqlEditorWidget::append_spool_output(
                                 &session,
-                                &[display_columns.join(&colsep)],
+                                &[spool_columns.join(&colsep)],
                             );
                         }
                         if let Some(command) = Self::drain_lazy_cancel_request(
@@ -5647,7 +5783,7 @@ impl SqlEditorWidget {
                                 Self::lazy_fetch_interrupt_kind_for_command(&command),
                             ));
                         }
-                        let column_count = column_info.len();
+                        let wire_column_count = wire_columns.len();
                         macro_rules! fetch_rows {
                         ($limit:expr) => {{
                             let mut rows = Vec::new();
@@ -5660,14 +5796,29 @@ impl SqlEditorWidget {
                                 let row: mysql::Row = row_result.map_err(|err| {
                                     SqlEditorWidget::mysql_error_message(&err, lazy_fetch_timeout)
                                 })?;
-                                let mut row_data =
+                                if row.len() != wire_column_count {
+                                    return Err(
+                                        "MySQL returned a row with an unexpected column count."
+                                            .to_string(),
+                                    );
+                                }
+                                let mut raw_row_data =
                                     crate::db::query::mysql_executor::MysqlExecutor::row_to_strings(
                                         &row,
-                                        column_count,
+                                        visible_column_count,
                                     );
-                                last_select_row = Some(row_data.clone());
-                                SqlEditorWidget::apply_null_text_to_row(&mut row_data, &null_text);
-                                rows.push(row_data);
+                                last_select_row = Some(raw_row_data.clone());
+                                SqlEditorWidget::apply_null_text_to_row(
+                                    &mut raw_row_data,
+                                    &null_text,
+                                );
+                                if let Some(descriptor) = edit_descriptor.as_ref() {
+                                    let snapshot = crate::db::mysql_snapshot_for_row(descriptor, &row)?;
+                                    raw_row_data.push(crate::db::encode_result_edit_snapshot(
+                                        &snapshot,
+                                    )?);
+                                }
+                                rows.push(raw_row_data);
                                 fetched_rows = fetched_rows.saturating_add(1);
                             }
                             (rows, eof)
@@ -5675,7 +5826,11 @@ impl SqlEditorWidget {
                     }
                         let (rows, eof) = fetch_rows!(lazy_fetch_batch_size);
                         Self::set_lazy_fetch_in_progress(&active_lazy_fetch, session_id, false);
-                        SqlEditorWidget::append_spool_rows(&session, &rows);
+                        SqlEditorWidget::append_spool_rows_with_hidden_last(
+                            &session,
+                            &rows,
+                            edit_descriptor.is_some(),
+                        );
                         Self::emit_lazy_rows(&sender, index, rows);
                         if let Some(command) = Self::drain_lazy_cancel_request(
                             &command_receiver,
@@ -5737,7 +5892,11 @@ impl SqlEditorWidget {
                                         session_id,
                                         false,
                                     );
-                                    SqlEditorWidget::append_spool_rows(&session, &rows);
+                                    SqlEditorWidget::append_spool_rows_with_hidden_last(
+                                        &session,
+                                        &rows,
+                                        edit_descriptor.is_some(),
+                                    );
                                     Self::emit_lazy_rows(&sender, index, rows);
                                     if let Some(command) = Self::drain_lazy_cancel_request(
                                         &command_receiver,
@@ -5791,7 +5950,11 @@ impl SqlEditorWidget {
                                     );
                                     loop {
                                         let (rows, eof) = fetch_rows!(lazy_fetch_batch_size);
-                                        SqlEditorWidget::append_spool_rows(&session, &rows);
+                                        SqlEditorWidget::append_spool_rows_with_hidden_last(
+                                            &session,
+                                            &rows,
+                                            edit_descriptor.is_some(),
+                                        );
                                         Self::emit_lazy_rows(&sender, index, rows);
                                         if let Some(command) = Self::drain_lazy_cancel_request(
                                             &command_receiver,
@@ -6342,8 +6505,9 @@ impl SqlEditorWidget {
         )
     }
 
-    fn execute_mysql_batch_select_streaming<C: Queryable>(
-        conn: &mut C,
+    fn execute_mysql_batch_select_streaming(
+        conn: &mut mysql::PooledConn,
+        db_type: crate::db::DatabaseType,
         sender: &QueryProgressSender,
         session: &Arc<Mutex<SessionState>>,
         index: usize,
@@ -6351,70 +6515,138 @@ impl SqlEditorWidget {
         cancel_flag: &Arc<Mutex<bool>>,
         emit_statement_start_event: bool,
     ) -> Result<MySqlSelectStreamOutcome, MysqlError> {
+        let started = Instant::now();
         let (heading_enabled, feedback_enabled) = Self::current_output_settings(session);
         let (colsep, null_text, _trimspool_enabled) = Self::current_text_output_settings(session);
-        let mut raw_column_names: Vec<String> = Vec::new();
         let mut last_select_row: Option<Vec<String>> = None;
         let mut buffered_rows: Vec<Vec<String>> = Vec::new();
         let mut last_flush = Instant::now();
         let mut has_flushed_rows = false;
         let mut fetched_rows = 0usize;
 
-        let (mut result, stream_cancelled) =
-            crate::db::query::mysql_executor::MysqlExecutor::execute_select_streaming(
-                conn,
-                sql,
-                &mut |columns| {
-                    raw_column_names = columns
-                        .iter()
-                        .map(|column| column.name.clone())
-                        .collect::<Vec<String>>();
-                    let display_columns =
-                        Self::apply_heading_setting(raw_column_names.clone(), heading_enabled);
-                    if display_columns.is_empty() {
-                        return;
-                    }
-                    if emit_statement_start_event {
-                        Self::emit_statement_start(sender, index, ResultTabPolicy::Create);
-                    }
-                    let _ = sender.send(QueryProgress::SelectStart {
-                        index,
-                        columns: display_columns.clone(),
-                        null_text: null_text.clone(),
-                    });
-                    app::awake();
-                    Self::append_spool_output(session, &[display_columns.join(&colsep)]);
-                },
-                &mut |row| {
-                    if load_mutex_bool(cancel_flag) {
-                        return false;
-                    }
-                    last_select_row = Some(row.clone());
-                    buffered_rows.push(Self::display_row_values(&row, &null_text));
-                    fetched_rows = fetched_rows.saturating_add(1);
-                    if Self::should_flush_progress_rows(
-                        last_flush,
-                        buffered_rows.len(),
-                        has_flushed_rows,
-                    ) {
-                        Self::flush_buffered_rows(
-                            sender,
-                            session,
-                            index,
-                            &mut buffered_rows,
-                            false,
-                        );
-                        last_flush = Instant::now();
-                        has_flushed_rows = true;
-                    }
-                    !load_mutex_bool(cancel_flag)
-                },
-            )?;
+        let edit_plan = crate::db::prepare_mysql_editable_select(conn, sql);
+        let execution_sql = edit_plan
+            .as_ref()
+            .map(|plan| plan.sql.as_str())
+            .unwrap_or(sql);
+        let mut wire_result = conn.query_iter(execution_sql)?;
+        let wire_columns = wire_result.columns().as_ref().to_vec();
+        let visible_column_count = edit_plan
+            .as_ref()
+            .and_then(|plan| crate::db::mysql_original_column_count(plan, &wire_columns))
+            .unwrap_or(wire_columns.len());
+        let edit_descriptor = edit_plan.as_ref().and_then(|plan| {
+            crate::db::mysql_descriptor_from_columns(db_type, plan, &wire_columns)
+        });
+        let raw_column_names: Vec<String> = wire_columns[..visible_column_count]
+            .iter()
+            .map(|column| column.name_str().to_string())
+            .collect();
+        let mut result_columns = wire_columns[..visible_column_count]
+            .iter()
+            .map(|column| ColumnInfo {
+                name: column.name_str().to_string(),
+                data_type: format!("{:?}", column.column_type()),
+            })
+            .collect::<Vec<_>>();
+        let mut grid_column_names = raw_column_names.clone();
+        if edit_descriptor.is_some() {
+            grid_column_names.push(crate::db::RESULT_EDIT_SNAPSHOT_COLUMN.to_string());
+            result_columns.push(ColumnInfo {
+                name: crate::db::RESULT_EDIT_SNAPSHOT_COLUMN.to_string(),
+                data_type: "INTERNAL".to_string(),
+            });
+        }
+        let display_columns = Self::apply_result_grid_heading_setting(
+            grid_column_names,
+            heading_enabled,
+            edit_descriptor.is_some(),
+        );
+        if !display_columns.is_empty() {
+            if emit_statement_start_event {
+                Self::emit_statement_start(sender, index, ResultTabPolicy::Create);
+            }
+            let _ = sender.send(QueryProgress::SelectStart {
+                index,
+                columns: display_columns,
+                null_text: null_text.clone(),
+            });
+            if let Some(descriptor) = edit_descriptor.clone() {
+                let _ = sender.send(QueryProgress::ResultEditMetadata { index, descriptor });
+            }
+            app::awake();
+            let spool_columns =
+                Self::apply_heading_setting(raw_column_names.clone(), heading_enabled);
+            Self::append_spool_output(session, &[spool_columns.join(&colsep)]);
+        }
+
+        let mut stream_cancelled = false;
+        for row_result in wire_result.by_ref() {
+            if load_mutex_bool(cancel_flag) {
+                stream_cancelled = true;
+                break;
+            }
+            let row: mysql::Row = row_result?;
+            if row.len() != wire_columns.len() {
+                return Err(MysqlError::MySqlError(mysql::MySqlError {
+                    state: "HY000".to_string(),
+                    message: "MySQL returned a row with an unexpected column count.".to_string(),
+                    code: 1105,
+                }));
+            }
+            let raw_row = crate::db::query::mysql_executor::MysqlExecutor::row_to_strings(
+                &row,
+                visible_column_count,
+            );
+            last_select_row = Some(raw_row.clone());
+            let mut display_row = Self::display_row_values(&raw_row, &null_text);
+            if let Some(descriptor) = edit_descriptor.as_ref() {
+                let snapshot =
+                    crate::db::mysql_snapshot_for_row(descriptor, &row).map_err(|message| {
+                        MysqlError::MySqlError(mysql::MySqlError {
+                            state: "HY000".to_string(),
+                            message,
+                            code: 1105,
+                        })
+                    })?;
+                display_row.push(crate::db::encode_result_edit_snapshot(&snapshot).map_err(
+                    |message| {
+                        MysqlError::MySqlError(mysql::MySqlError {
+                            state: "HY000".to_string(),
+                            message,
+                            code: 1105,
+                        })
+                    },
+                )?);
+            }
+            buffered_rows.push(display_row);
+            fetched_rows = fetched_rows.saturating_add(1);
+            if Self::should_flush_progress_rows(last_flush, buffered_rows.len(), has_flushed_rows) {
+                Self::flush_buffered_rows_with_hidden_last(
+                    sender,
+                    session,
+                    index,
+                    &mut buffered_rows,
+                    false,
+                    edit_descriptor.is_some(),
+                );
+                last_flush = Instant::now();
+                has_flushed_rows = true;
+            }
+        }
+        drop(wire_result);
 
         let was_cancelled = stream_cancelled || load_mutex_bool(cancel_flag);
-        Self::flush_buffered_rows(sender, session, index, &mut buffered_rows, was_cancelled);
-        result.row_count = fetched_rows;
-        result.message = format!("{} rows fetched", fetched_rows);
+        Self::flush_buffered_rows_with_hidden_last(
+            sender,
+            session,
+            index,
+            &mut buffered_rows,
+            was_cancelled,
+            edit_descriptor.is_some(),
+        );
+        let mut result =
+            QueryResult::new_select_streamed(sql, result_columns, fetched_rows, started.elapsed());
         if was_cancelled {
             result.success = false;
             result.message = Self::cancel_message();
@@ -6430,6 +6662,91 @@ impl SqlEditorWidget {
             result,
             was_cancelled,
         })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn execute_mysql_result_edit_request(
+        shared_connection: &crate::db::SharedConnection,
+        sender: &QueryProgressSender,
+        db_type: crate::db::DatabaseType,
+        marker_sql: &str,
+        conn_name: &str,
+        session: &Arc<Mutex<SessionState>>,
+        pooled_db_session: &SharedDbSessionLease,
+        current_mysql_cancel_context: &Arc<Mutex<Option<MySqlQueryCancelContext>>>,
+        current_query_cancel_handle: &Arc<Mutex<Option<QueryCancelHandle>>>,
+        cancel_flag: &Arc<Mutex<bool>>,
+        current_operation_id: &Arc<AtomicU64>,
+        operation_id: u64,
+        query_timeout: Option<Duration>,
+        auto_commit: bool,
+        db_activity: &str,
+        execution_scope: Option<&str>,
+        request: &crate::db::ResultEditRequest,
+    ) -> Option<String> {
+        let _ = sender.send(QueryProgress::BatchStart {
+            activity: db_activity.to_string(),
+            total_units: Some(1),
+            status_activity: None,
+        });
+        Self::emit_statement_start(sender, 0, ResultTabPolicy::Defer);
+        let started = Instant::now();
+        let statement_effects =
+            Self::mysql_statement_session_effects_for_sql_for_db_type(db_type, marker_sql);
+        let execution = Self::run_mysql_pooled_action_with_timeout(
+            shared_connection,
+            pooled_db_session,
+            execution_scope,
+            Some(sender),
+            current_mysql_cancel_context,
+            current_query_cancel_handle,
+            cancel_flag,
+            Some(current_operation_id),
+            operation_id,
+            query_timeout,
+            db_activity,
+            auto_commit,
+            false,
+            false,
+            None,
+            marker_sql,
+            statement_effects,
+            |conn| {
+                crate::db::execute_mysql_result_edit(conn, request, auto_commit, || {
+                    load_mutex_bool(cancel_flag)
+                        || !Self::operation_snapshot_is_current(current_operation_id, operation_id)
+                })
+            },
+        );
+        let (message, success, timed_out, error_message) = match execution {
+            Ok(applied) => {
+                let base = format!("Saved {applied} staged row operation(s)");
+                let message = result_messages::apply_transaction_feedback(
+                    &base,
+                    db_type,
+                    Some(result_messages::TransactionFeedbackStatement::Dml),
+                    auto_commit,
+                );
+                (message, true, false, None)
+            }
+            Err(message) => {
+                let (_, timed_out) = Self::mysql_batch_interruption_flags(&message);
+                (format!("Error: {message}"), false, timed_out, Some(message))
+            }
+        };
+        if !message.trim().is_empty() {
+            Self::append_spool_output(session, std::slice::from_ref(&message));
+        }
+        let result =
+            QueryResult::new_non_select_message(marker_sql, message, started.elapsed(), success);
+        let _ = sender.send(QueryProgress::StatementFinished {
+            index: 0,
+            result,
+            connection_name: conn_name.to_string(),
+            timed_out,
+        });
+        app::awake();
+        error_message
     }
 
     fn execute_mysql_batch(
@@ -6653,6 +6970,7 @@ impl SqlEditorWidget {
                         mysql_batch_executed_sql_statement.set(true);
                         SqlEditorWidget::execute_mysql_batch_select_streaming(
                             mysql_conn,
+                            db_type,
                             sender,
                             session,
                             index,
@@ -8204,7 +8522,11 @@ impl SqlEditorWidget {
     }
 
     fn execute_sql(&self, sql: &str, script_mode: bool) {
-        self.execute_sql_with_mysql_delimiter(sql, script_mode, None);
+        let _ = self.try_execute_sql(sql, script_mode);
+    }
+
+    fn try_execute_sql(&self, sql: &str, script_mode: bool) -> bool {
+        self.try_execute_sql_with_mysql_delimiter(sql, script_mode, None)
     }
 
     #[doc(hidden)]
@@ -8218,13 +8540,23 @@ impl SqlEditorWidget {
         script_mode: bool,
         initial_mysql_delimiter: Option<String>,
     ) {
+        let _ =
+            self.try_execute_sql_with_mysql_delimiter(sql, script_mode, initial_mysql_delimiter);
+    }
+
+    fn try_execute_sql_with_mysql_delimiter(
+        &self,
+        sql: &str,
+        script_mode: bool,
+        initial_mysql_delimiter: Option<String>,
+    ) -> bool {
         self.execute_sql_with_mysql_delimiter_after_lazy_cancel(
             sql,
             script_mode,
             initial_mysql_delimiter,
             None,
             0,
-        );
+        )
     }
 
     fn lazy_fetch_cancel_before_execution_decision(
@@ -8269,9 +8601,9 @@ impl SqlEditorWidget {
         initial_mysql_delimiter: Option<String>,
         lazy_cancel_session_id: Option<u64>,
         lazy_cancel_retry_attempt: u32,
-    ) {
+    ) -> bool {
         if sql.trim().is_empty() {
-            return;
+            return false;
         }
 
         // All editor execution entry points funnel through this SQL-aware
@@ -8280,10 +8612,13 @@ impl SqlEditorWidget {
         // handled differently by current, selected, script, or tool-command
         // execution paths.
         if !self.resolve_required_transaction_decision("running the next query", Some(sql)) {
-            return;
+            return false;
         }
 
         if let Some(session_id) = self.active_lazy_fetch_session() {
+            if Self::internal_result_edit_request_id(sql).is_some() {
+                return false;
+            }
             let cancel_requested =
                 Self::lazy_fetch_cancel_requested(&self.active_lazy_fetch, session_id);
             match Self::lazy_fetch_cancel_before_execution_decision(
@@ -8318,7 +8653,7 @@ impl SqlEditorWidget {
                                 );
                             },
                         );
-                        return;
+                        return true;
                     }
                 }
                 LazyFetchCancelBeforeExecutionDecision::WaitForCancelAndRetry {
@@ -8342,13 +8677,13 @@ impl SqlEditorWidget {
                             );
                         },
                     );
-                    return;
+                    return true;
                 }
                 LazyFetchCancelBeforeExecutionDecision::GiveUp => {
                     self.emit_status(
                         "Previous lazy fetch cancellation is still pending; new query was not started.",
                     );
-                    return;
+                    return false;
                 }
             }
         }
@@ -8361,7 +8696,7 @@ impl SqlEditorWidget {
                         .ui_action_sender
                         .send(UiActionResult::QueryAlreadyRunning);
                     app::awake();
-                    return;
+                    return false;
                 }
             };
 
@@ -8381,7 +8716,7 @@ impl SqlEditorWidget {
                 .unwrap_or_else(|| Arc::new(Mutex::new(crate::db::DatabaseConnection::new()))),
             None => {
                 SqlEditorWidget::show_alert_dialog("This query tab is not bound to a database");
-                return;
+                return false;
             }
         };
         // Pre-check connection status without holding lock for long
@@ -8389,7 +8724,7 @@ impl SqlEditorWidget {
             let Some(conn_guard) = crate::db::try_lock_connection(&shared_connection) else {
                 let _ = self.ui_action_sender.send(UiActionResult::ConnectionBusy);
                 app::awake();
-                return;
+                return false;
             };
 
             operation_autocommit = SqlEditorWidget::mysql_auto_commit_for_execution(
@@ -8407,7 +8742,7 @@ impl SqlEditorWidget {
                 && (!conn_guard.is_connected() || !conn_guard.has_connection_handle())
             {
                 SqlEditorWidget::show_alert_dialog("Not connected to database");
-                return;
+                return false;
             }
         } // Release lock early for the pre-check
 
@@ -8424,6 +8759,21 @@ impl SqlEditorWidget {
             .map(|runtime| runtime.begin_work());
         let query_timeout = Self::parse_timeout(&self.timeout_input.value());
         let sql_text = sql.to_string();
+        let result_edit_request =
+            Self::internal_result_edit_request_id(&sql_text).and_then(|request_id| {
+                let mut pending = self
+                    .pending_result_edit_request
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                if pending
+                    .as_ref()
+                    .is_some_and(|request| request.request_id == request_id)
+                {
+                    pending.take()
+                } else {
+                    None
+                }
+            });
         let operation_id = self.next_operation_id();
         let operation_sql_kind =
             Self::operation_sql_kind(operation_db_type, &sql_text, script_mode);
@@ -8569,6 +8919,31 @@ impl SqlEditorWidget {
                 let selected_transaction_mode = conn_guard.transaction_mode();
                 let session = tab_session.clone();
 
+                let internal_result_edit_error = match result_edit_request.as_ref() {
+                    None if Self::internal_result_edit_request_id(&sql_text).is_some() => Some(
+                        "Internal result-grid edit request is unavailable; no SQL was executed.",
+                    ),
+                    Some(request)
+                        if db_type.cache_key() != request.descriptor.db_type.cache_key() =>
+                    {
+                        Some(
+                            "The result-grid edit belongs to a different database backend; no SQL was executed.",
+                        )
+                    }
+                    _ => None,
+                };
+                if let Some(message) = internal_result_edit_error {
+                    SqlEditorWidget::emit_execution_startup_error(
+                        &sender,
+                        script_mode,
+                        &sql_text,
+                        &conn_name,
+                        message,
+                        Some(&session),
+                    );
+                    return;
+                }
+
                 let startup = LockedExecutionStartup {
                     conn_guard,
                     conn_name,
@@ -8592,6 +8967,7 @@ impl SqlEditorWidget {
                         binding_revision,
                         sender: &sender,
                         sql_text: &sql_text,
+                        result_edit_request,
                         pooled_db_session: &pooled_db_session,
                         mysql_auto_commit_override: &mysql_auto_commit_override,
                         active_lazy_fetch: &active_lazy_fetch,
@@ -13090,6 +13466,7 @@ impl SqlEditorWidget {
                 eprintln!("Query thread panicked: {panic_payload}");
             }
         });
+        let spawn_succeeded = spawn_result.is_ok();
         if let Err(err) = spawn_result {
             let message = format!("Failed to start query execution thread: {err}");
             crate::utils::logging::log_error("sql_editor::execution", &message);
@@ -13131,6 +13508,7 @@ impl SqlEditorWidget {
             }
             if app::is_ui_thread() {}
         }
+        spawn_succeeded
     }
 
     fn emit_non_select_result(
@@ -18053,6 +18431,20 @@ impl SqlEditorWidget {
         }
     }
 
+    fn apply_result_grid_heading_setting(
+        column_names: Vec<String>,
+        heading_enabled: bool,
+        has_edit_snapshot: bool,
+    ) -> Vec<String> {
+        let mut columns = Self::apply_heading_setting(column_names, heading_enabled);
+        if has_edit_snapshot {
+            if let Some(internal_column) = columns.last_mut() {
+                *internal_column = crate::db::RESULT_EDIT_SNAPSHOT_COLUMN.to_string();
+            }
+        }
+        columns
+    }
+
     fn apply_heading_to_result(result: &mut QueryResult, heading_enabled: bool) {
         if heading_enabled {
             return;
@@ -18104,6 +18496,27 @@ impl SqlEditorWidget {
 
         let rows = std::mem::take(buffered_rows);
         SqlEditorWidget::append_spool_rows(session, &rows);
+        let _ = sender.send(QueryProgress::Rows { index, rows });
+        app::awake();
+    }
+
+    fn flush_buffered_rows_with_hidden_last(
+        sender: &QueryProgressSender,
+        session: &Arc<Mutex<SessionState>>,
+        index: usize,
+        buffered_rows: &mut Vec<Vec<String>>,
+        interrupted: bool,
+        hidden_last: bool,
+    ) {
+        if buffered_rows.is_empty() {
+            return;
+        }
+        if interrupted {
+            buffered_rows.clear();
+            return;
+        }
+        let rows = std::mem::take(buffered_rows);
+        Self::append_spool_rows_with_hidden_last(session, &rows, hidden_last);
         let _ = sender.send(QueryProgress::Rows { index, rows });
         app::awake();
     }
@@ -18500,6 +18913,29 @@ impl SqlEditorWidget {
             .map(|row| SqlEditorWidget::format_row_line(row, &colsep, &null_text))
             .collect();
         SqlEditorWidget::append_spool_output(session, &lines);
+    }
+
+    fn append_spool_rows_with_hidden_last(
+        session: &Arc<Mutex<SessionState>>,
+        rows: &[Vec<String>],
+        hidden_last: bool,
+    ) {
+        if !hidden_last {
+            Self::append_spool_rows(session, rows);
+            return;
+        }
+        if rows.is_empty() || !Self::has_spool_target(session) {
+            return;
+        }
+        let (colsep, null_text, _trimspool_enabled) = Self::current_text_output_settings(session);
+        let lines = rows
+            .iter()
+            .map(|row| {
+                let visible_end = row.len().saturating_sub(1);
+                Self::format_row_line(&row[..visible_end], &colsep, &null_text)
+            })
+            .collect::<Vec<_>>();
+        Self::append_spool_output(session, &lines);
     }
 
     fn apply_define_substitution(
@@ -30513,6 +30949,38 @@ mod mysql_batch_execution_regression_tests {
     use std::sync::{mpsc, Arc, Mutex};
     use std::time::Duration;
 
+    #[test]
+    fn result_edit_snapshot_heading_survives_heading_off() {
+        let columns = SqlEditorWidget::apply_result_grid_heading_setting(
+            vec![
+                "ID".to_string(),
+                crate::db::RESULT_EDIT_SNAPSHOT_COLUMN.to_string(),
+            ],
+            false,
+            true,
+        );
+
+        assert_eq!(columns[0], "");
+        assert_eq!(columns[1], crate::db::RESULT_EDIT_SNAPSHOT_COLUMN);
+    }
+
+    #[test]
+    fn internal_result_edit_marker_is_recognizable_and_cannot_target_rows() {
+        let marker = SqlEditorWidget::internal_result_edit_marker("SQ_SAVE_REQUEST:42");
+
+        assert_eq!(
+            SqlEditorWidget::internal_result_edit_request_id(&marker),
+            Some(42)
+        );
+        assert!(marker.ends_with("WHERE 1 = 0"));
+        assert_eq!(
+            SqlEditorWidget::internal_result_edit_request_id(
+                "/* SQ_SAVE_REQUEST:42 */ UPDATE items SET value = 'new' WHERE id = 1"
+            ),
+            None
+        );
+    }
+
     fn mysql_test_env(name: &str) -> Option<String> {
         env::var(name).ok().filter(|value| !value.trim().is_empty())
     }
@@ -31058,6 +31526,10 @@ mod mysql_batch_execution_regression_tests {
                 QueryProgress::SelectStart { index, columns, .. } => {
                     format!("SelectStart({index}, cols={})", columns.len())
                 }
+                QueryProgress::ResultEditMetadata { index, descriptor } => format!(
+                    "ResultEditMetadata({index}, table={}.{})",
+                    descriptor.schema_name, descriptor.table_name
+                ),
                 QueryProgress::Rows { index, rows } => {
                     format!("Rows({index}, count={})", rows.len())
                 }
@@ -31303,6 +31775,7 @@ mod mysql_batch_execution_regression_tests {
                     assert!(routes.is_empty(), "{label}\n{progress_summary}")
                 }
                 QueryProgress::SelectStart { .. }
+                | QueryProgress::ResultEditMetadata { .. }
                 | QueryProgress::Rows { .. }
                 | QueryProgress::LazyFetchSession { .. }
                 | QueryProgress::LazyFetchWaiting { .. }

@@ -89,10 +89,13 @@ Executors use the shared `QueryResult`, `QueryProgress`, and `result_messages`
 contracts. Lazy fetch must implement cursor cleanup, cancellation, fetch-all
 timeout, and retained-lease return.
 
-Grid editing requires injecting a stable row identifier and routing save-DML
-results back to the originating edit tab. If unsupported, do not inject an
-identifier; the edit action will remain hidden. Oracle's `SQ_INTERNAL_ROWID`
-flow is an example, not a universal backend contract.
+Grid editing extends the shared descriptor, typed snapshot, mutation request,
+and exact-row guard in `src/db/result_edit.rs`. A backend must inject a stable
+row locator, prove it is unique, preserve original typed values, implement
+atomic save or savepoint rollback, and route the result back to the originating
+edit tab. If any guarantee is unavailable, do not publish an edit descriptor;
+the edit action will remain hidden. Oracle `ROWID` and MySQL-family unique-key
+locators are backend implementations of this common contract.
 
 Register driver cancel, abort, and connection-loss text in the database-specific
 marker catalogs in `src/db/session_policy.rs`. Never place those strings in

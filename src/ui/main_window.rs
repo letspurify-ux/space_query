@@ -37,7 +37,9 @@ use crate::db::{
     TabConnectionBinding, TransactionAccessMode, TransactionIsolation, TransactionMode,
 };
 use crate::ui::constants::*;
-use crate::ui::result_table::{ResultGridSqlExecuteCallback, ResultTableContextAction};
+use crate::ui::result_table::{
+    ResultGridEditExecuteCallback, ResultGridSqlExecuteCallback, ResultTableContextAction,
+};
 use crate::ui::theme;
 use crate::ui::{
     font_settings, show_settings_dialog, ConnectionDialog, FindReplaceDialog, FontSettings,
@@ -54,6 +56,13 @@ type MutexFlag = Arc<Mutex<Option<u64>>>;
 
 const RESULT_ONE_TAB_PER_QUERY_LABEL: &str = " One tab per query";
 const RESULT_CHECKBOX_GROUP_GAP: i32 = TOOLBAR_SPACING;
+const RESULT_PAGE_UNITS: [usize; 5] = [10, 100, 250, 500, 1000];
+const RESULT_PAGE_DEFAULT_UNIT_INDEX: usize = 3;
+const RESULT_PAGE_NAV_BUTTON_WIDTH: i32 = 30;
+const RESULT_PAGE_UNIT_WIDTH: i32 = 66;
+const RESULT_PAGE_CONTROL_SPACING: i32 = 1;
+const RESULT_PAGE_CONTROL_WIDTH: i32 =
+    RESULT_PAGE_NAV_BUTTON_WIDTH * 4 + RESULT_PAGE_UNIT_WIDTH + RESULT_PAGE_CONTROL_SPACING * 4;
 const UI_SCALE_BUTTON_WIDTH: i32 = 32;
 const QUERY_TOOLBAR_COMPACT_BREAKPOINT: i32 = 1050;
 const QUERY_TOOLBAR_COMPACT_CHOICE_WIDTH: i32 = 185;
@@ -1548,6 +1557,26 @@ fn result_toolbar_checkbox_width_for_label(label_w: i32, min_width: i32) -> i32 
         .max(0)
         .saturating_add(CHECK_INDICATOR_AND_PADDING)
         .max(min_width)
+}
+
+fn result_page_unit_for_choice_index(index: i32) -> usize {
+    usize::try_from(index)
+        .ok()
+        .and_then(|index| RESULT_PAGE_UNITS.get(index))
+        .copied()
+        .unwrap_or(RESULT_PAGE_UNITS[RESULT_PAGE_DEFAULT_UNIT_INDEX])
+}
+
+fn result_page_control_center_offsets(available_width: i32) -> (i32, i32) {
+    let remaining_width = available_width
+        .saturating_sub(RESULT_PAGE_CONTROL_WIDTH)
+        .max(0);
+    let left = safe_div(remaining_width, 2);
+    (left, remaining_width - left)
+}
+
+fn result_page_controls_fit(available_width: i32) -> bool {
+    available_width >= RESULT_PAGE_CONTROL_WIDTH
 }
 
 fn transaction_isolation_choice_labels(
@@ -3834,6 +3863,7 @@ fn registered_lazy_fetch_progress_matches(
 
     match progress {
         QueryProgress::SelectStart { index, .. }
+        | QueryProgress::ResultEditMetadata { index, .. }
         | QueryProgress::Rows { index, .. }
         | QueryProgress::StatementFinished { index, .. } => context
             .lazy_fetch_sessions
@@ -3969,7 +3999,8 @@ pub(crate) fn result_pane_routes_for_progress_with_script_context(
                 vec![ResultPaneRoute::DataGrid]
             }
         }
-        QueryProgress::Rows { .. }
+        QueryProgress::ResultEditMetadata { .. }
+        | QueryProgress::Rows { .. }
         | QueryProgress::LazyFetchSession { .. }
         | QueryProgress::LazyFetchWaiting { .. }
         | QueryProgress::LazyFetchCanceling { .. }
@@ -4510,6 +4541,14 @@ fn build_session_activity_result_request(entries: Vec<SessionActivityEntry>) -> 
 }
 
 impl MainWindow {
+    fn clone_result_tabs_for_page_action(state: &Arc<Mutex<AppState>>) -> ResultTabsWidget {
+        state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .result_tabs
+            .clone()
+    }
+
     fn clone_result_tabs_for_edit_action(
         state: &Arc<Mutex<AppState>>,
     ) -> Result<ResultTabsWidget, String> {
@@ -5850,18 +5889,101 @@ impl MainWindow {
         let mut clear_all_btn = Button::default()
             .with_size(BUTTON_WIDTH_LARGE, BUTTON_HEIGHT)
             .with_label("Clear All");
+        clear_all_btn.set_id("result_clear_all");
         clear_all_btn.set_color(theme::button_subtle());
         clear_all_btn.set_label_color(theme::text_secondary());
         clear_all_btn.set_frame(FrameType::RFlatBox);
         clear_all_btn.set_tooltip("Clear all result grids, output, messages, and plans");
         result_toolbar.fixed(&clear_all_btn, BUTTON_WIDTH_LARGE);
 
-        let spacer = Frame::default();
-        result_toolbar.resizable(&spacer);
+        let mut page_control = Flex::default().with_size(RESULT_PAGE_CONTROL_WIDTH, BUTTON_HEIGHT);
+        page_control.set_id("result_page_controls");
+        page_control.set_type(FlexType::Row);
+        page_control.set_spacing(RESULT_PAGE_CONTROL_SPACING);
+
+        let mut page_first_btn = Button::default()
+            .with_size(RESULT_PAGE_NAV_BUTTON_WIDTH, BUTTON_HEIGHT)
+            .with_label("|<");
+        page_first_btn.set_id("result_page_first");
+        page_first_btn.set_tooltip("Move to the first result row (Ctrl/Cmd+Up)");
+        page_control.fixed(&page_first_btn, RESULT_PAGE_NAV_BUTTON_WIDTH);
+
+        let mut page_previous_btn = Button::default()
+            .with_size(RESULT_PAGE_NAV_BUTTON_WIDTH, BUTTON_HEIGHT)
+            .with_label("<");
+        page_previous_btn.set_id("result_page_previous");
+        page_previous_btn.set_tooltip("Move backward by the selected row unit");
+        page_control.fixed(&page_previous_btn, RESULT_PAGE_NAV_BUTTON_WIDTH);
+
+        let mut page_unit_choice =
+            Choice::default().with_size(RESULT_PAGE_UNIT_WIDTH, BUTTON_HEIGHT);
+        page_unit_choice.set_id("result_page_unit");
+        page_unit_choice.add_choice("10|100|250|500|1000");
+        page_unit_choice.set_value(RESULT_PAGE_DEFAULT_UNIT_INDEX as i32);
+        page_unit_choice.set_color(theme::input_bg());
+        page_unit_choice.set_text_color(theme::text_primary());
+        page_unit_choice.set_tooltip("Rows moved by the previous and next buttons");
+        page_control.fixed(&page_unit_choice, RESULT_PAGE_UNIT_WIDTH);
+
+        let mut page_next_btn = Button::default()
+            .with_size(RESULT_PAGE_NAV_BUTTON_WIDTH, BUTTON_HEIGHT)
+            .with_label(">");
+        page_next_btn.set_id("result_page_next");
+        page_next_btn.set_tooltip("Move forward by the selected row unit");
+        page_control.fixed(&page_next_btn, RESULT_PAGE_NAV_BUTTON_WIDTH);
+
+        let mut page_last_btn = Button::default()
+            .with_size(RESULT_PAGE_NAV_BUTTON_WIDTH, BUTTON_HEIGHT)
+            .with_label(">|");
+        page_last_btn.set_id("result_page_last");
+        page_last_btn.set_tooltip("Fetch remaining rows and move to the last row (Ctrl/Cmd+Down)");
+        page_control.fixed(&page_last_btn, RESULT_PAGE_NAV_BUTTON_WIDTH);
+
+        for button in [
+            &mut page_first_btn,
+            &mut page_previous_btn,
+            &mut page_next_btn,
+            &mut page_last_btn,
+        ] {
+            button.set_color(theme::button_subtle());
+            button.set_label_color(theme::text_primary());
+            button.set_frame(FrameType::FlatBox);
+        }
+        page_control.end();
+        page_control.resize_callback(|control, _, _, width, _| {
+            let should_show = result_page_controls_fit(width);
+            let mut visibility_changed = false;
+            for index in 0..control.children() {
+                if let Some(mut child) = control.child(index) {
+                    if child.visible() != should_show {
+                        visibility_changed = true;
+                        if should_show {
+                            child.show();
+                        } else {
+                            child.hide();
+                        }
+                    }
+                }
+            }
+            let (left, right) = if should_show {
+                result_page_control_center_offsets(width)
+            } else {
+                (0, 0)
+            };
+            let margins_changed = control.margins() != (left, 0, right, 0);
+            if margins_changed {
+                control.set_margins(left, 0, right, 0);
+            }
+            if visibility_changed || margins_changed {
+                control.layout();
+            }
+        });
+        result_toolbar.resizable(&page_control);
 
         let mut one_tab_per_query_check = CheckButton::default()
             .with_size(BUTTON_WIDTH_LARGE + 45, BUTTON_HEIGHT)
             .with_label(RESULT_ONE_TAB_PER_QUERY_LABEL);
+        one_tab_per_query_check.set_id("result_one_tab_per_query");
         one_tab_per_query_check.set_color(theme::button_secondary());
         one_tab_per_query_check.set_tooltip(
             "Unchecked: clear existing result tabs before each execution. Checked: append result tabs.",
@@ -5878,6 +6000,7 @@ impl MainWindow {
         let mut edit_mode_check = CheckButton::default()
             .with_size(BUTTON_WIDTH_SMALL, BUTTON_HEIGHT)
             .with_label(" Edit");
+        edit_mode_check.set_id("result_edit_mode");
         edit_mode_check.set_color(theme::button_secondary());
         edit_mode_check.set_tooltip("Enable staged edit mode for the current result tab");
         edit_mode_check.hide();
@@ -5886,6 +6009,7 @@ impl MainWindow {
         let mut edit_insert_btn = Button::default()
             .with_size(BUTTON_WIDTH_SMALL, BUTTON_HEIGHT)
             .with_label("Insert");
+        edit_insert_btn.set_id("result_edit_insert");
         edit_insert_btn.set_color(theme::button_secondary());
         edit_insert_btn.set_label_color(theme::text_primary());
         edit_insert_btn.set_frame(FrameType::RFlatBox);
@@ -5895,6 +6019,7 @@ impl MainWindow {
         let mut edit_delete_btn = Button::default()
             .with_size(BUTTON_WIDTH_SMALL, BUTTON_HEIGHT)
             .with_label("Delete");
+        edit_delete_btn.set_id("result_edit_delete");
         edit_delete_btn.set_color(theme::button_danger());
         edit_delete_btn.set_label_color(theme::text_primary());
         edit_delete_btn.set_frame(FrameType::RFlatBox);
@@ -5904,6 +6029,7 @@ impl MainWindow {
         let mut edit_save_btn = Button::default()
             .with_size(BUTTON_WIDTH_SMALL, BUTTON_HEIGHT)
             .with_label("Save");
+        edit_save_btn.set_id("result_edit_save");
         edit_save_btn.set_color(theme::button_success());
         edit_save_btn.set_label_color(theme::text_primary());
         edit_save_btn.set_frame(FrameType::RFlatBox);
@@ -5913,6 +6039,7 @@ impl MainWindow {
         let mut edit_cancel_btn = Button::default()
             .with_size(BUTTON_WIDTH_SMALL, BUTTON_HEIGHT)
             .with_label("Cancel");
+        edit_cancel_btn.set_id("result_edit_cancel");
         edit_cancel_btn.set_color(theme::button_cancel());
         edit_cancel_btn.set_label_color(theme::text_primary());
         edit_cancel_btn.set_frame(FrameType::RFlatBox);
@@ -6239,6 +6366,54 @@ impl MainWindow {
                 return;
             };
             MainWindow::clear_all_result_views(&state_for_result_clear_all);
+        });
+
+        let weak_state_for_page_first = Arc::downgrade(&state);
+        page_first_btn.set_callback(move |_| {
+            let Some(state_for_page_first) = weak_state_for_page_first.upgrade() else {
+                return;
+            };
+            let mut result_tabs =
+                MainWindow::clone_result_tabs_for_page_action(&state_for_page_first);
+            result_tabs.page_current_first();
+            app::redraw();
+        });
+
+        let weak_state_for_page_previous = Arc::downgrade(&state);
+        let page_unit_for_previous = page_unit_choice.clone();
+        page_previous_btn.set_callback(move |_| {
+            let Some(state_for_page_previous) = weak_state_for_page_previous.upgrade() else {
+                return;
+            };
+            let mut result_tabs =
+                MainWindow::clone_result_tabs_for_page_action(&state_for_page_previous);
+            let unit = result_page_unit_for_choice_index(page_unit_for_previous.value());
+            result_tabs.page_current_previous(unit);
+            app::redraw();
+        });
+
+        let weak_state_for_page_next = Arc::downgrade(&state);
+        let page_unit_for_next = page_unit_choice.clone();
+        page_next_btn.set_callback(move |_| {
+            let Some(state_for_page_next) = weak_state_for_page_next.upgrade() else {
+                return;
+            };
+            let mut result_tabs =
+                MainWindow::clone_result_tabs_for_page_action(&state_for_page_next);
+            let unit = result_page_unit_for_choice_index(page_unit_for_next.value());
+            result_tabs.page_current_next(unit);
+            app::redraw();
+        });
+
+        let weak_state_for_page_last = Arc::downgrade(&state);
+        page_last_btn.set_callback(move |_| {
+            let Some(state_for_page_last) = weak_state_for_page_last.upgrade() else {
+                return;
+            };
+            let mut result_tabs =
+                MainWindow::clone_result_tabs_for_page_action(&state_for_page_last);
+            result_tabs.page_current_last();
+            app::redraw();
         });
 
         let weak_state_for_tab_select = Arc::downgrade(&state);
@@ -7827,6 +8002,47 @@ impl MainWindow {
         )));
         result_tabs.set_execute_sql_callback(grid_edit_callback);
 
+        let weak_state_for_structured_edit = Arc::downgrade(state);
+        let result_tabs_for_structured_edit = result_tabs.clone();
+        let structured_edit_callback: ResultGridEditExecuteCallback = Arc::new(Mutex::new(Some(
+            Box::new(move |request: crate::db::ResultEditRequest| {
+                let Some(state_for_grid_edit) = weak_state_for_structured_edit.upgrade() else {
+                    return Err("Main window is no longer available.".to_string());
+                };
+                let mut state = state_for_grid_edit
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                let editor = state
+                    .editor_tabs
+                    .iter()
+                    .find(|tab| tab.tab_id == tab_id)
+                    .map(|tab| tab.sql_editor.clone())
+                    .ok_or_else(|| "The owning query tab is closed.".to_string())?;
+                if editor.is_query_running() {
+                    return Err("The owning query tab is already running a query.".to_string());
+                }
+                if !state.result_origin_is_current_for_tab(tab_id, &result_tabs_for_structured_edit)
+                {
+                    return Err(
+                        "This result belongs to an older connection, reconnect, or scope and is read-only."
+                            .to_string(),
+                    );
+                }
+                let target_tab = result_tabs_for_structured_edit
+                    .active_result_id()
+                    .ok_or_else(|| "Open a result tab first.".to_string())?;
+                state
+                    .result_grid_execution_targets
+                    .insert(tab_id, target_tab);
+                if let Err(error) = editor.execute_result_edit(request) {
+                    state.result_grid_execution_targets.remove(&tab_id);
+                    return Err(error);
+                }
+                Ok(())
+            }) as Box<dyn FnMut(crate::db::ResultEditRequest) -> Result<(), String>>,
+        )));
+        result_tabs.set_execute_edit_callback(structured_edit_callback);
+
         let weak_state_for_lazy_fetch = Arc::downgrade(state);
         let lazy_fetch_callback = Arc::new(Mutex::new(Some(Box::new(move |session_id, request| {
             let Some(state_for_lazy_fetch) = weak_state_for_lazy_fetch.upgrade() else {
@@ -8278,6 +8494,15 @@ impl MainWindow {
                     if preserve_canceling {
                         result_tabs.mark_statement_canceling_by_id(result_tab_id);
                     }
+                }
+                QueryProgress::ResultEditMetadata { index, descriptor } => {
+                    let Some(result_tab_id) = resolve_active_progress_tab_id(&s, tab_id, index)
+                    else {
+                        return;
+                    };
+                    let mut result_tabs = owning_result_tabs.clone();
+                    drop(s);
+                    result_tabs.set_result_edit_descriptor_by_id(result_tab_id, descriptor);
                 }
                 QueryProgress::Rows { index, rows } => {
                     let Some(result_tab_id) = resolve_active_progress_tab_id(&s, tab_id, index)
@@ -12139,6 +12364,12 @@ impl MainWindow {
             .state
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let execution_origin = state
+            .editor_tabs
+            .iter()
+            .find(|tab| tab.tab_id == state.active_editor_tab_id)
+            .and_then(|tab| tab.connection_binding.snapshot().execution_origin());
+        state.result_tabs.set_execution_origin(execution_origin);
         state.result_tabs.clear();
         state.append_result_tab_request(ResultTabRequest {
             label: label.to_string(),
@@ -12942,6 +13173,47 @@ mod tests {
             base_width
         );
         assert!(result_toolbar_checkbox_width_for_label(base_width, base_width) > base_width);
+    }
+
+    #[test]
+    fn result_page_unit_choice_supports_only_the_requested_units() {
+        assert_eq!(
+            (0..RESULT_PAGE_UNITS.len() as i32)
+                .map(result_page_unit_for_choice_index)
+                .collect::<Vec<_>>(),
+            RESULT_PAGE_UNITS
+        );
+        assert_eq!(
+            result_page_unit_for_choice_index(-1),
+            RESULT_PAGE_UNITS[RESULT_PAGE_DEFAULT_UNIT_INDEX]
+        );
+        assert_eq!(
+            result_page_unit_for_choice_index(99),
+            RESULT_PAGE_UNITS[RESULT_PAGE_DEFAULT_UNIT_INDEX]
+        );
+        assert_eq!(
+            RESULT_PAGE_UNITS[RESULT_PAGE_DEFAULT_UNIT_INDEX], 500,
+            "the page unit must default to 500 rows"
+        );
+    }
+
+    #[test]
+    fn result_page_control_centers_fixed_width_children() {
+        assert_eq!(result_page_control_center_offsets(100), (0, 0));
+        assert_eq!(
+            result_page_control_center_offsets(RESULT_PAGE_CONTROL_WIDTH),
+            (0, 0)
+        );
+        assert_eq!(
+            result_page_control_center_offsets(RESULT_PAGE_CONTROL_WIDTH + 1),
+            (0, 1)
+        );
+        assert_eq!(
+            result_page_control_center_offsets(RESULT_PAGE_CONTROL_WIDTH + 400),
+            (200, 200)
+        );
+        assert!(!result_page_controls_fit(RESULT_PAGE_CONTROL_WIDTH - 1));
+        assert!(result_page_controls_fit(RESULT_PAGE_CONTROL_WIDTH));
     }
 
     #[test]

@@ -11,13 +11,14 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use crate::db::query::result_messages;
-use crate::db::{ColumnInfo, ExecutionOrigin, QueryResult};
+use crate::db::{ColumnInfo, ExecutionOrigin, QueryResult, ResultEditDescriptor};
 use crate::ui::constants;
 use crate::ui::font_settings::{
     configured_result_font_size, configured_result_profile, FontProfile,
 };
 use crate::ui::result_table::{
-    LazyFetchCallback, ResultGridSqlExecuteCallback, ResultTableContextActionCallback,
+    LazyFetchCallback, ResultGridEditExecuteCallback, ResultGridSqlExecuteCallback,
+    ResultPageNavigationOutcome, ResultTableContextActionCallback,
 };
 use crate::ui::tab_strip;
 use crate::ui::text_buffer_access;
@@ -67,6 +68,7 @@ pub struct ResultTabsWidget {
     font_size: Arc<Mutex<u32>>,
     max_cell_display_chars: Arc<Mutex<usize>>,
     execute_sql_callback: Arc<Mutex<Option<ResultGridSqlExecuteCallback>>>,
+    execute_edit_callback: Arc<Mutex<Option<ResultGridEditExecuteCallback>>>,
     lazy_fetch_callback: LazyFetchCallback,
     context_action_callback: ResultTableContextActionCallback,
     on_change_callback: Arc<Mutex<Option<ResultTabsChangeCallback>>>,
@@ -539,16 +541,8 @@ impl ResultTabsWidget {
         if title.is_empty() || title == "Result" {
             Self::result_tab_label(index, status, row_count)
         } else {
-            format!(" {} ({}) ", title, row_count)
+            format!(" {} · {} ({}) ", title, status.label(), row_count)
         }
-    }
-
-    fn result_title_for_origin(label: &str, origin: Option<&ExecutionOrigin>) -> String {
-        let label = label.trim();
-        origin.map_or_else(
-            || label.to_string(),
-            |origin| format!("{} · {label}", origin.display_name),
-        )
     }
 
     fn tabs_contains_group(tabs: &Tabs, group: &Group) -> bool {
@@ -748,6 +742,8 @@ impl ResultTabsWidget {
             constants::RESULT_CELL_MAX_DISPLAY_CHARS_DEFAULT as usize,
         ));
         let execute_sql_callback: Arc<Mutex<Option<ResultGridSqlExecuteCallback>>> =
+            Arc::new(Mutex::new(None));
+        let execute_edit_callback: Arc<Mutex<Option<ResultGridEditExecuteCallback>>> =
             Arc::new(Mutex::new(None));
         let lazy_fetch_callback: LazyFetchCallback = Arc::new(Mutex::new(None));
         let context_action_callback: ResultTableContextActionCallback = Arc::new(Mutex::new(None));
@@ -1122,6 +1118,7 @@ impl ResultTabsWidget {
             font_size,
             max_cell_display_chars,
             execute_sql_callback,
+            execute_edit_callback,
             lazy_fetch_callback,
             context_action_callback,
             on_change_callback,
@@ -1418,7 +1415,10 @@ impl ResultTabsWidget {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .clone();
-        let title = Self::result_title_for_origin(label, origin.as_ref());
+        // Keep the typed origin as metadata for edit/routing safety, but do not
+        // put database information in the result-tab header. The header's
+        // primary job is to show the live execution state.
+        let title = label.trim().to_string();
         if let Some(tab) = self
             .data
             .lock()
@@ -1511,6 +1511,12 @@ impl ResultTabsWidget {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .clone();
         table.set_execute_sql_callback(execute_sql_callback);
+        let execute_edit_callback = self
+            .execute_edit_callback
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        table.set_execute_edit_callback(execute_edit_callback);
         table.set_lazy_fetch_callback(self.lazy_fetch_callback.clone());
         table.set_context_action_callback(self.context_action_callback.clone());
         let widget = table.get_widget();
@@ -1596,6 +1602,23 @@ impl ResultTabsWidget {
         }
     }
 
+    pub(crate) fn set_result_edit_descriptor_by_id(
+        &mut self,
+        id: ResultTabId,
+        descriptor: ResultEditDescriptor,
+    ) {
+        let table = self.result_tab_index_for_id(id).and_then(|index| {
+            self.data
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .get(index)
+                .map(|tab| tab.table.clone())
+        });
+        if let Some(mut table) = table {
+            table.set_result_edit_descriptor(descriptor);
+        }
+    }
+
     fn append_rows(&mut self, index: usize, rows: Vec<Vec<String>>) {
         let rows_len = rows.len();
         let table = {
@@ -1672,8 +1695,13 @@ impl ResultTabsWidget {
             .get(index)
             .map(|tab| (tab.row_count, tab.table.clone()));
         if let Some((row_count, mut table)) = tab_parts {
-            table.note_lazy_fetch_waiting(session_id);
-            self.set_result_tab_state(index, ResultTabStatus::Waiting, row_count);
+            let continued_page_fetch = table.note_lazy_fetch_waiting(session_id);
+            let status = if continued_page_fetch {
+                ResultTabStatus::Fetching
+            } else {
+                ResultTabStatus::Waiting
+            };
+            self.set_result_tab_state(index, status, row_count);
         }
         self.fire_on_change_callback();
     }
@@ -1991,6 +2019,21 @@ impl ResultTabsWidget {
         }
     }
 
+    pub fn set_execute_edit_callback(&mut self, callback: ResultGridEditExecuteCallback) {
+        *self
+            .execute_edit_callback
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(callback.clone());
+        let tabs = self
+            .data
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        for tab in tabs.iter() {
+            let mut table = tab.table.clone();
+            table.set_execute_edit_callback(Some(callback.clone()));
+        }
+    }
+
     pub fn set_lazy_fetch_callback(&mut self, callback: LazyFetchCallback) {
         *self
             .lazy_fetch_callback
@@ -2142,6 +2185,53 @@ impl ResultTabsWidget {
                     .cloned()
             })
             .map(|tab| tab.table)
+    }
+
+    fn navigate_current_page<F>(&mut self, navigate: F) -> bool
+    where
+        F: FnOnce(&mut ResultTableWidget) -> ResultPageNavigationOutcome,
+    {
+        let Some(id) = self.active_result_id() else {
+            return false;
+        };
+        let Some(index) = self.result_tab_index_for_id(id) else {
+            return false;
+        };
+        let Some((status, row_count, mut table)) = self
+            .data
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(index)
+            .map(|tab| (tab.status, tab.row_count, tab.table.clone()))
+        else {
+            return false;
+        };
+        let outcome = navigate(&mut table);
+        if outcome == ResultPageNavigationOutcome::FetchRequested {
+            self.set_result_tab_state(index, ResultTabStatus::for_stream_update(status), row_count);
+        }
+        if outcome != ResultPageNavigationOutcome::NoChange {
+            self.fire_on_change_callback();
+            true
+        } else {
+            false
+        }
+    }
+
+    pub(crate) fn page_current_first(&mut self) -> bool {
+        self.navigate_current_page(ResultTableWidget::page_first)
+    }
+
+    pub(crate) fn page_current_previous(&mut self, unit: usize) -> bool {
+        self.navigate_current_page(|table| table.page_previous(unit))
+    }
+
+    pub(crate) fn page_current_next(&mut self, unit: usize) -> bool {
+        self.navigate_current_page(|table| table.page_next(unit))
+    }
+
+    pub(crate) fn page_current_last(&mut self) -> bool {
+        self.navigate_current_page(ResultTableWidget::page_last)
     }
 
     pub fn copy(&self) -> usize {
@@ -2369,9 +2459,7 @@ impl Default for ResultTabsWidget {
 
 #[cfg(test)]
 mod tests {
-    use crate::db::{
-        create_shared_connection, ConnectionRegistry, QueryResult, TabConnectionBinding,
-    };
+    use crate::db::QueryResult;
     use crate::ui::result_table::LazyFetchCallback;
     use crate::ui::sql_editor::LazyFetchRequest;
     use fltk::enums::Event;
@@ -2479,32 +2567,11 @@ mod tests {
                 ResultTabStatus::Done,
                 12
             ),
-            " Explain Plan (12) "
+            " Explain Plan · Done (12) "
         );
         assert_eq!(
             ResultTabsWidget::result_tab_label_for_title("Result", 0, ResultTabStatus::Done, 12),
             " Done (12) "
-        );
-    }
-
-    #[test]
-    fn result_title_places_connection_before_the_result_label_without_scope() {
-        let registry = ConnectionRegistry::new();
-        let runtime = registry
-            .register_saved("analytics", create_shared_connection())
-            .runtime;
-        let mut info = runtime.sanitized_info();
-        info.name = "analytics".to_string();
-        runtime.update_sanitized_info(info);
-        let binding = TabConnectionBinding::bound(runtime, Some("REPORTING".to_string()));
-        let origin = binding
-            .snapshot()
-            .execution_origin()
-            .expect("bound tab should have an execution origin");
-
-        assert_eq!(
-            ResultTabsWidget::result_title_for_origin("Result", Some(&origin)),
-            "analytics · Result"
         );
     }
 

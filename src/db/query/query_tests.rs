@@ -2312,6 +2312,14 @@ fn test_maybe_inject_rowid_for_editing_skips_distinct() {
 }
 
 #[test]
+fn test_maybe_inject_rowid_for_editing_skips_mysql_distinctrow() {
+    let sql = "SELECT DISTINCTROW ENAME FROM EMP";
+    let rewritten = QueryExecutor::maybe_inject_rowid_for_editing(sql);
+    assert_eq!(rewritten, sql);
+    assert!(!QueryExecutor::is_rowid_edit_eligible_query(sql));
+}
+
+#[test]
 fn test_maybe_inject_rowid_for_editing_skips_distinct_with_comment_between_select_and_modifier() {
     let sql = "SELECT /* keep dedup */ DISTINCT ENAME FROM EMP";
     let rewritten = QueryExecutor::maybe_inject_rowid_for_editing(sql);
@@ -2579,6 +2587,22 @@ fn test_maybe_inject_rowid_for_editing_skips_nested_aggregate_wrappers() {
     ] {
         let rewritten = QueryExecutor::maybe_inject_rowid_for_editing(sql);
         assert_eq!(rewritten, sql);
+    }
+}
+
+#[test]
+fn test_maybe_inject_rowid_for_editing_skips_mysql_family_aggregates() {
+    for function in [
+        "BIT_AND",
+        "BIT_OR",
+        "BIT_XOR",
+        "GROUP_CONCAT",
+        "STD",
+        "ST_COLLECT",
+    ] {
+        let sql = format!("SELECT {function}(value_col) FROM metrics");
+        assert_eq!(QueryExecutor::maybe_inject_rowid_for_editing(&sql), sql);
+        assert!(!QueryExecutor::is_rowid_edit_eligible_query(&sql));
     }
 }
 

@@ -1052,10 +1052,10 @@ fn bind_interval_values_round_trip_vendor_formats() {
     assert_eq!(
         rows_to_strings(&result.rows),
         vec![vec![
-            "+2021-10".to_string(),
-            "-05-03".to_string(),
-            "+02 12:23:34.456000".to_string(),
-            "-00 10:20:30.456789".to_string(),
+            "+000002021-10".to_string(),
+            "-000000005-03".to_string(),
+            "+000000002 12:23:34.456000000".to_string(),
+            "-000000000 10:20:30.456789000".to_string(),
         ]]
     );
 }
@@ -4662,10 +4662,10 @@ fn plsql_interval_out_binds_return_values() {
     assert_eq!(
         rows_to_strings(&[values]),
         vec![vec![
-            "+2021-10".to_string(),
-            "-05-03".to_string(),
-            "+02 12:23:34.456000".to_string(),
-            "-00 10:20:30.456789".to_string(),
+            "+000002021-10".to_string(),
+            "-000000005-03".to_string(),
+            "+000000002 12:23:34.456000000".to_string(),
+            "-000000000 10:20:30.456789000".to_string(),
         ]]
     );
 }
@@ -6474,8 +6474,8 @@ fn plsql_procedure_ref_cursor_out_bind_fetches_mixed_wire_types() {
         timestamp_value_timezone_suffix(&row[5]),
         Some("+05:45".to_string())
     );
-    assert_eq!(value_to_string(&row[6]), "+2021-10");
-    assert_eq!(value_to_string(&row[7]), "+02 12:23:34.456789");
+    assert_eq!(value_to_string(&row[6]), "+000002021-10");
+    assert_eq!(value_to_string(&row[7]), "+000000002 12:23:34.456789000");
     assert_eq!(row[8], OracleValue::Bytes(vec![0xca, 0xfe]));
     assert_eq!(value_to_string(&row[9]).len(), 4005);
     assert!(value_to_string(&row[9]).starts_with("CLOB-"));

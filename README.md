@@ -217,10 +217,14 @@ triggers, and events, and shows sequences when the server exposes them.
 - Use the context menu to close a result, copy data, export CSV, or access
   available edit actions.
 
-For a safely identifiable Oracle single-table result with a usable `ROWID`,
-**Edit** mode can stage inserted, updated, deleted, or `NULL` values. Changes
-reach the database only after **Save**. JOINs, multi-table results, and results
-without a reliable `ROWID` remain read-only.
+For a safely identifiable Oracle, MySQL, or MariaDB single-table result,
+**Edit** mode can stage inserted, updated, deleted, or `NULL` values. Oracle
+uses `ROWID`; MySQL and MariaDB use a primary key or a non-null unique key.
+Changes reach the database only after **Save**. MySQL/MariaDB locks each
+existing target and checks its original values before mutation; Oracle uses
+guarded `ROWID` DML with the same one-row rule. The whole save is rolled back
+on a conflict. JOINs, multi-table results, and results without a reliable row
+identifier remain read-only.
 
 ![Oracle result grid in staged edit mode](docs/images/result-grid-editing.png)
 

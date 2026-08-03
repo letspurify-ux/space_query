@@ -45,6 +45,19 @@ fn count_script_tool_commands(items: &[ScriptItem]) -> usize {
         .count()
 }
 
+#[test]
+fn page_lazy_fetch_row_requests_are_bounded_like_configured_batches() {
+    assert_eq!(SqlEditorWidget::normalized_requested_lazy_fetch_rows(0), 1);
+    assert_eq!(
+        SqlEditorWidget::normalized_requested_lazy_fetch_rows(1000),
+        1000
+    );
+    assert_eq!(
+        SqlEditorWidget::normalized_requested_lazy_fetch_rows(usize::MAX),
+        crate::utils::MAX_LAZY_FETCH_BATCH_SIZE as usize
+    );
+}
+
 fn assert_contains_all(haystack: &str, needles: &[&str]) {
     for needle in needles {
         assert!(

@@ -1276,8 +1276,9 @@ fn mysql_and_mariadb_batch_select_streams_rows_instead_of_fetch_all() {
         .expect("MySQL/MariaDB batch executor should follow streaming helper");
     let streaming_helper = &content[streaming_helper_start..streaming_helper_end];
     assert!(
-        streaming_helper.contains("MysqlExecutor::execute_select_streaming(")
-            && streaming_helper.contains("flush_buffered_rows("),
+        streaming_helper.contains("conn.query_iter(execution_sql)")
+            && streaming_helper.contains("for row_result in wire_result.by_ref()")
+            && streaming_helper.contains("flush_buffered_rows_with_hidden_last("),
         "MySQL/MariaDB batch SELECT helper must flush rows through progress events while fetching"
     );
 

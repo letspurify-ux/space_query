@@ -457,6 +457,10 @@ pub enum QueryProgress {
         columns: Vec<String>,
         null_text: String,
     },
+    ResultEditMetadata {
+        index: usize,
+        descriptor: crate::db::ResultEditDescriptor,
+    },
     Rows {
         index: usize,
         rows: Vec<Vec<String>>,
@@ -592,6 +596,7 @@ pub enum InterruptKind {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum LazyFetchRequest {
     More,
+    MoreRows(usize),
     All,
     Cancel,
     CancelAndDiscard,
@@ -1936,6 +1941,7 @@ pub struct SqlEditorWidget {
     current_cancel_operation: Arc<Mutex<Option<CancelOperationMetadata>>>,
     current_mysql_cancel_context: Arc<Mutex<Option<MySqlQueryCancelContext>>>,
     mysql_auto_commit_override: Arc<Mutex<Option<bool>>>,
+    pending_result_edit_request: Arc<Mutex<Option<crate::db::ResultEditRequest>>>,
     cancel_flag: Arc<Mutex<bool>>,
     intellisense_data: Arc<Mutex<IntellisenseData>>,
     intellisense_popup: Arc<Mutex<IntellisensePopup>>,
@@ -2788,6 +2794,7 @@ impl SqlEditorWidget {
         let current_cancel_operation = Arc::new(Mutex::new(None));
         let current_mysql_cancel_context = Arc::new(Mutex::new(None));
         let mysql_auto_commit_override = Arc::new(Mutex::new(None));
+        let pending_result_edit_request = Arc::new(Mutex::new(None));
         let cancel_flag = Arc::new(Mutex::new(false));
 
         let intellisense_popup = Arc::new(Mutex::new(IntellisensePopup::new()));
@@ -2863,6 +2870,7 @@ impl SqlEditorWidget {
             current_cancel_operation,
             current_mysql_cancel_context,
             mysql_auto_commit_override,
+            pending_result_edit_request,
             cancel_flag,
             intellisense_data,
             intellisense_popup,
@@ -3276,6 +3284,9 @@ impl SqlEditorWidget {
         }
         let command = match request {
             LazyFetchRequest::More => LazyFetchCommand::FetchMore(self.lazy_fetch_batch_size()),
+            LazyFetchRequest::MoreRows(row_count) => {
+                LazyFetchCommand::FetchMore(Self::normalized_requested_lazy_fetch_rows(row_count))
+            }
             LazyFetchRequest::All => LazyFetchCommand::FetchAll,
             LazyFetchRequest::Cancel | LazyFetchRequest::CancelAndDiscard => {
                 LazyFetchCommand::GracefulClose
@@ -3288,6 +3299,10 @@ impl SqlEditorWidget {
             Self::mark_lazy_fetch_command_send_failed(&handle, &command);
             false
         }
+    }
+
+    fn normalized_requested_lazy_fetch_rows(row_count: usize) -> usize {
+        AppConfig::clamp_lazy_fetch_batch_size(row_count.min(u32::MAX as usize) as u32) as usize
     }
 
     fn lazy_fetch_command_starts_db_fetch(command: &LazyFetchCommand) -> bool {
