@@ -855,10 +855,10 @@ fn status_bar_pulse_value(pulse_frame: usize) -> f64 {
     value as f64
 }
 
-fn status_activity_pulse_color(pulse_frame: usize, active_color: Color) -> Color {
+fn activity_pulse_color(pulse_frame: usize, resting_color: Color, active_color: Color) -> Color {
     let progress = safe_div(status_bar_pulse_value(pulse_frame), 100.0);
     let eased_progress = progress * progress * (3.0 - 2.0 * progress);
-    let (start_r, start_g, start_b) = theme::status_bar_default().to_rgb();
+    let (start_r, start_g, start_b) = resting_color.to_rgb();
     let (end_r, end_g, end_b) = active_color.to_rgb();
     let interpolate = |start: u8, end: u8| {
         (f64::from(start) + (f64::from(end) - f64::from(start)) * eased_progress).round() as u8
@@ -1006,8 +1006,9 @@ impl StatusBarWidget {
             return;
         }
 
-        self.root.set_color(status_activity_pulse_color(
+        self.root.set_color(activity_pulse_color(
             self.pulse_frame,
+            theme::status_bar_default(),
             theme::accent(),
         ));
         self.pulse_frame = self.pulse_frame.wrapping_add(STATUS_ANIMATION_STEP);
@@ -1489,6 +1490,7 @@ pub struct AppState {
     result_cancel_btn: Button,
     execute_btn: Button,
     query_cancel_btn: Button,
+    query_cancel_pulse_frame: usize,
     commit_btn: Button,
     rollback_btn: Button,
     transaction_isolation_choice: Choice,
@@ -1871,6 +1873,13 @@ impl AppState {
                 .any(|tab| tab.sql_editor.is_query_running())
     }
 
+    fn has_cancelable_query_activity(&self) -> bool {
+        self.editor_tabs.iter().any(|tab| {
+            tab.sql_editor.is_query_running()
+                || tab.sql_editor.active_lazy_fetch_session().is_some()
+        })
+    }
+
     fn active_connection_id(&self) -> Option<ConnectionId> {
         self.editor_tabs
             .iter()
@@ -1881,6 +1890,64 @@ impl AppState {
     fn active_connection_runtime(&self) -> Option<Arc<ConnectionRuntime>> {
         self.active_connection_id()
             .and_then(|id| self.connection_registry.get(id))
+    }
+
+    fn bind_active_unbound_tab_to_selected_database(&mut self) -> Result<(), String> {
+        let tab_id = self.active_editor_tab_id;
+        let Some(tab_index) = self.find_tab_index(tab_id) else {
+            return Err("No query tab is open".to_string());
+        };
+        if self.editor_tabs[tab_index].sql_editor.is_query_running() {
+            return Ok(());
+        }
+        let binding = self.editor_tabs[tab_index].connection_binding.clone();
+        let binding_snapshot = binding.snapshot();
+        if binding_snapshot.runtime.is_some() {
+            return Ok(());
+        }
+
+        let Some((connection_id, scope)) = self.object_browser.selected_connection_context() else {
+            return Err(
+                "This query tab is not bound to a database, and no database is selected"
+                    .to_string(),
+            );
+        };
+        let Some(runtime) = self.connection_registry.get(connection_id) else {
+            return Err("The selected database is no longer available".to_string());
+        };
+        binding
+            .bind_if_revision(binding_snapshot.revision, runtime, scope)
+            .map_err(|_| "The query tab connection changed before execution".to_string())?;
+
+        let browser_snapshot = self
+            .object_browser
+            .metadata_snapshot_for_connection(connection_id);
+        let existing_metadata = {
+            let tab = &self.editor_tabs[tab_index];
+            (
+                tab.intellisense_data
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .clone(),
+                tab.highlight_data.clone(),
+            )
+        };
+        let (intellisense_data, highlight_data) =
+            MainWindow::editor_metadata_seed(Some(existing_metadata), browser_snapshot.as_ref());
+        {
+            let tab = &mut self.editor_tabs[tab_index];
+            *tab.intellisense_data
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()) = intellisense_data;
+            tab.highlight_data = highlight_data.clone();
+            tab.sql_editor
+                .update_highlight_data_deferred(highlight_data);
+        }
+        if browser_snapshot.is_none() {
+            self.pending_metadata_refresh_tabs.insert(tab_id);
+        }
+        let _ = self.set_active_editor_tab(tab_id);
+        Ok(())
     }
 
     fn active_schema_update_target(&self) -> Result<Option<ActiveSchemaUpdateTarget>, ()> {
@@ -2961,7 +3028,28 @@ impl AppState {
             selected_activity.as_ref(),
             activities.len().saturating_sub(displayed_registry_count),
         );
+        self.render_query_cancel_activity();
         true
+    }
+
+    fn render_query_cancel_activity(&mut self) {
+        if self.query_cancel_btn.was_deleted() {
+            return;
+        }
+        if self.has_cancelable_query_activity() {
+            self.query_cancel_btn.set_color(activity_pulse_color(
+                self.query_cancel_pulse_frame,
+                theme::button_cancel(),
+                theme::button_cancel_active(),
+            ));
+            self.query_cancel_pulse_frame = self
+                .query_cancel_pulse_frame
+                .wrapping_add(STATUS_ANIMATION_STEP);
+        } else {
+            self.query_cancel_btn.set_color(theme::button_cancel());
+            self.query_cancel_pulse_frame = 0;
+        }
+        self.query_cancel_btn.redraw();
     }
 
     fn set_status_message(&mut self, _message: &str) {
@@ -3588,13 +3676,20 @@ impl AppState {
             .map(|g| g.is_connected())
             .unwrap_or(true);
 
-        // Regression guard: keep Execute enabled even when disconnected.
-        // Script execution may begin with CONNECT (or @script that contains CONNECT),
-        // so re-coupling this button to `is_connected` would break reconnect workflows.
-        self.execute_btn.activate();
-        // Cancel targets an editor operation snapshot, which can still be active
-        // while the primary connection is disconnected or being replaced.
-        self.query_cancel_btn.activate();
+        let has_query_tab = !self.editor_tabs.is_empty();
+        // Regression guard: keep Execute enabled even when disconnected when a
+        // tab exists. Scripts may begin with CONNECT (or @script that contains
+        // CONNECT), so re-coupling this button to `is_connected` would break
+        // reconnect workflows.
+        if has_query_tab {
+            self.execute_btn.activate();
+            // Cancel targets an editor operation snapshot, which can still be
+            // active while the primary connection is disconnected or replaced.
+            self.query_cancel_btn.activate();
+        } else {
+            self.execute_btn.deactivate();
+            self.query_cancel_btn.deactivate();
+        }
 
         if is_connected {
             self.commit_btn.activate();
@@ -3619,7 +3714,7 @@ impl AppState {
 }
 
 const FETCH_STATUS_UPDATE_INTERVAL: Duration = Duration::from_millis(250);
-const STATUS_ANIMATION_INTERVAL: f64 = 0.06;
+const STATUS_ANIMATION_INTERVAL: f64 = 0.05;
 const STATUS_ANIMATION_STEP: usize = 2;
 const ORPHANED_LAZY_FETCH_GRACE_PERIOD: Duration = Duration::from_millis(250);
 const MAX_ABANDONED_QUERY_OPERATION_AGE: u64 = 1_024;
@@ -4105,7 +4200,9 @@ fn acquire_sql_editor_if_idle(state: &Arc<Mutex<AppState>>) -> Option<SqlEditorW
         let guard = state
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if guard.sql_editor.is_query_running() {
+        if guard.find_tab_index(guard.active_editor_tab_id).is_none() {
+            (None, Some("No query tab is open.".to_string()))
+        } else if guard.sql_editor.is_query_running() {
             (
                 None,
                 Some("The active query tab is already running a query.".to_string()),
@@ -4120,6 +4217,18 @@ fn acquire_sql_editor_if_idle(state: &Arc<Mutex<AppState>>) -> Option<SqlEditorW
     }
 
     editor
+}
+
+fn prepare_active_editor_for_execution(state: &Arc<Mutex<AppState>>) -> bool {
+    let result = state
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .bind_active_unbound_tab_to_selected_database();
+    if let Err(message) = result {
+        SqlEditorWidget::show_alert_dialog(&message);
+        return false;
+    }
+    true
 }
 
 fn cancel_oldest_lazy_fetch_if_session_pool_full(state: &Arc<Mutex<AppState>>) -> bool {
@@ -4160,6 +4269,9 @@ fn cancel_oldest_lazy_fetch_if_session_pool_full(state: &Arc<Mutex<AppState>>) -
 }
 
 fn run_sql_execution_request(state: &Arc<Mutex<AppState>>, request: SqlExecutionRequest) {
+    if !prepare_active_editor_for_execution(state) {
+        return;
+    }
     let Some(editor) = acquire_sql_editor_if_idle(state) else {
         return;
     };
@@ -4174,6 +4286,9 @@ fn execute_sql_request_with_session_pool_slot(
     state: &Arc<Mutex<AppState>>,
     request: SqlExecutionRequest,
 ) {
+    if !prepare_active_editor_for_execution(state) {
+        return;
+    }
     if cancel_oldest_lazy_fetch_if_session_pool_full(state) {
         let state_for_execute = Arc::clone(state);
         crate::ui::ui_timeout::schedule(0.2, move || {
@@ -5721,7 +5836,8 @@ impl MainWindow {
         result_workspace_group.set_color(theme::panel_bg());
         result_workspace_group.begin();
         let result_tabs = ResultTabsWidget::new(0, 0, 900, 400);
-        let result_widget = result_tabs.get_widget();
+        let mut result_widget = result_tabs.get_widget();
+        result_widget.hide();
         result_workspace_group.resizable(&result_widget);
         result_workspace_group.end();
         result_bottom_flex.add(&result_workspace_group);
@@ -5944,54 +6060,26 @@ impl MainWindow {
             }
         });
 
-        let mut first_tab_id = query_tabs.add_tab("Query 1");
-        let mut first_tab_group = query_tabs.tab_group(first_tab_id);
-        if first_tab_group.is_none() {
-            eprintln!(
-                "Warning: initial query tab group was missing; attempting recovery by creating a new tab."
-            );
-            let recovered_tab_id = query_tabs.add_tab("Query 1");
-            first_tab_group = query_tabs.tab_group(recovered_tab_id);
-            if first_tab_group.is_some() {
-                first_tab_id = recovered_tab_id;
-            }
-        }
-        let first_tab_group = first_tab_group.unwrap_or_else(|| query_top_group.clone());
-        first_tab_group.begin();
         let schema_intellisense_data = Arc::new(Mutex::new(IntellisenseData::new()));
-        let first_editor = SqlEditorWidget::new_with_binding_and_intellisense_data(
-            initial_binding.clone(),
+        let previous_group = Group::try_current();
+        query_top_group.begin();
+        let mut detached_editor_container = Group::new(0, 0, 1, 1, None);
+        detached_editor_container.hide();
+        detached_editor_container.begin();
+        let detached_editor = SqlEditorWidget::new_with_binding_and_intellisense_data(
+            initial_binding,
             timeout_input.clone(),
             schema_intellisense_data.clone(),
         );
-        first_editor.set_owner_tab_id(first_tab_id);
-        let mut first_editor_group = first_editor.get_group().clone();
-        first_editor_group.resize(
-            first_tab_group.x(),
-            first_tab_group.y(),
-            first_tab_group.w(),
-            first_tab_group.h(),
-        );
-        first_editor_group.layout();
-        first_tab_group.resizable(&first_editor_group);
-        first_tab_group.end();
-        query_tabs.select(first_tab_id);
-        let sql_editor = first_editor.clone();
-        let sql_buffer = first_editor.get_buffer();
-        let editor_tabs = vec![QueryEditorTab {
-            tab_id: first_tab_id,
-            base_label: "Query 1".to_string(),
-            connection_binding: initial_binding,
-            sql_editor: first_editor,
-            sql_buffer: sql_buffer.clone(),
-            intellisense_data: schema_intellisense_data.clone(),
-            highlight_data: HighlightData::new(),
-            result_tabs: result_tabs.clone(),
-            current_file: None,
-            pristine_text: String::new(),
-            current_text_len: 0,
-            is_dirty: false,
-        }];
+        detached_editor_container.end();
+        query_top_group.end();
+        if let Some(previous_group) = previous_group.as_ref() {
+            Group::set_current(Some(previous_group));
+        } else {
+            Group::set_current(None::<&Group>);
+        }
+        let sql_buffer = detached_editor.get_buffer();
+        let editor_tabs = Vec::new();
 
         right_flex.resizable(&right_tile);
         right_flex.end();
@@ -6013,9 +6101,9 @@ impl MainWindow {
             query_top_group: query_top_group.clone(),
             query_split_bar: query_split_bar.clone(),
             editor_tabs,
-            active_editor_tab_id: first_tab_id,
-            next_editor_tab_number: 2,
-            sql_editor,
+            active_editor_tab_id: 0,
+            next_editor_tab_number: 1,
+            sql_editor: detached_editor,
             sql_buffer,
             schema_intellisense_data,
             schema_highlight_data: HighlightData::new(),
@@ -6033,6 +6121,7 @@ impl MainWindow {
             result_cancel_btn: edit_cancel_btn.clone(),
             execute_btn: execute_btn.clone(),
             query_cancel_btn: cancel_btn.clone(),
+            query_cancel_pulse_frame: 0,
             commit_btn: commit_btn.clone(),
             rollback_btn: rollback_btn.clone(),
             transaction_isolation_choice: transaction_isolation_choice.clone(),
@@ -6798,8 +6887,9 @@ impl MainWindow {
             .editor_tabs
             .iter()
             .find(|tab| tab.tab_id == state.active_editor_tab_id)
+            .filter(|tab| tab.connection_binding.snapshot().connection_id().is_some())
             .map(|tab| tab.connection_binding.fork_for_new_tab())
-            .unwrap_or_else(TabConnectionBinding::unbound);
+            .unwrap_or_else(|| Self::binding_for_selected_database(state));
         Self::create_query_editor_tab_for_binding(state, binding, stabilize_display)
     }
 
@@ -6890,7 +6980,7 @@ impl MainWindow {
         let tab_id = state.query_tabs.add_tab(&label);
         let group = state.query_tabs.tab_group(tab_id)?;
         let binding_connection_id = binding.snapshot().connection_id();
-        let (seed_data, seed_highlight_data) = state
+        let existing_metadata = state
             .editor_tabs
             .iter()
             .find(|tab| tab.connection_binding.snapshot().connection_id() == binding_connection_id)
@@ -6902,8 +6992,14 @@ impl MainWindow {
                         .clone(),
                     tab.highlight_data.clone(),
                 )
-            })
-            .unwrap_or_else(|| (IntellisenseData::new(), HighlightData::new()));
+            });
+        let browser_snapshot = binding_connection_id.and_then(|connection_id| {
+            state
+                .object_browser
+                .metadata_snapshot_for_connection(connection_id)
+        });
+        let (seed_data, seed_highlight_data) =
+            Self::editor_metadata_seed(existing_metadata, browser_snapshot.as_ref());
         let intellisense_data = Arc::new(Mutex::new(seed_data));
         group.begin();
         let mut editor = SqlEditorWidget::new_with_binding_and_intellisense_data(
@@ -7375,6 +7471,44 @@ impl MainWindow {
         data
     }
 
+    fn merge_object_browser_snapshot_into_highlight_data(
+        mut highlight_data: HighlightData,
+        snapshot: &ObjectBrowserMetadataSnapshot,
+    ) -> HighlightData {
+        Self::merge_unique_names(&mut highlight_data.tables, &snapshot.tables);
+        Self::merge_unique_names(&mut highlight_data.views, &snapshot.views);
+        Self::merge_unique_names(&mut highlight_data.functions, &snapshot.functions);
+        Self::merge_unique_names(&mut highlight_data.procedures, &snapshot.procedures);
+        Self::merge_unique_names(&mut highlight_data.packages, &snapshot.packages);
+        Self::merge_unique_names(&mut highlight_data.sequences, &snapshot.sequences);
+        Self::merge_unique_names(&mut highlight_data.triggers, &snapshot.triggers);
+        Self::merge_unique_names(&mut highlight_data.events, &snapshot.events);
+        Self::merge_unique_names(&mut highlight_data.synonyms, &snapshot.synonyms);
+        Self::merge_unique_names(&mut highlight_data.schemas, &snapshot.available_scopes);
+        highlight_data
+    }
+
+    fn editor_metadata_seed(
+        existing: Option<(IntellisenseData, HighlightData)>,
+        browser_snapshot: Option<&ObjectBrowserMetadataSnapshot>,
+    ) -> (IntellisenseData, HighlightData) {
+        let (mut data, mut highlight_data) =
+            existing.unwrap_or_else(|| (IntellisenseData::new(), HighlightData::new()));
+        if let Some(snapshot) = browser_snapshot {
+            if Self::intellisense_scope_differs(&data, snapshot.selected_scope.as_deref()) {
+                data = snapshot.to_intellisense_data();
+                highlight_data = snapshot.to_highlight_data();
+            } else {
+                data = Self::merge_object_browser_snapshot_into_data(data, snapshot);
+                highlight_data = Self::merge_object_browser_snapshot_into_highlight_data(
+                    highlight_data,
+                    snapshot,
+                );
+            }
+        }
+        (data, highlight_data)
+    }
+
     fn apply_object_browser_metadata_snapshot(
         state: &mut AppState,
         snapshot: ObjectBrowserMetadataSnapshot,
@@ -7393,21 +7527,13 @@ impl MainWindow {
             Self::merge_object_browser_snapshot_into_data(current_data, &snapshot)
         };
 
-        let mut highlight_data = if replace_active_scope {
+        let highlight_data = if replace_active_scope {
             snapshot.to_highlight_data()
         } else {
             state.schema_highlight_data.clone()
         };
-        Self::merge_unique_names(&mut highlight_data.tables, &snapshot.tables);
-        Self::merge_unique_names(&mut highlight_data.views, &snapshot.views);
-        Self::merge_unique_names(&mut highlight_data.functions, &snapshot.functions);
-        Self::merge_unique_names(&mut highlight_data.procedures, &snapshot.procedures);
-        Self::merge_unique_names(&mut highlight_data.packages, &snapshot.packages);
-        Self::merge_unique_names(&mut highlight_data.sequences, &snapshot.sequences);
-        Self::merge_unique_names(&mut highlight_data.triggers, &snapshot.triggers);
-        Self::merge_unique_names(&mut highlight_data.events, &snapshot.events);
-        Self::merge_unique_names(&mut highlight_data.synonyms, &snapshot.synonyms);
-        Self::merge_unique_names(&mut highlight_data.schemas, &snapshot.available_scopes);
+        let highlight_data =
+            Self::merge_object_browser_snapshot_into_highlight_data(highlight_data, &snapshot);
 
         Self::update_schema_snapshot(state, data, highlight_data);
     }
@@ -11875,7 +12001,9 @@ impl MainWindow {
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
             MainWindow::adjust_query_layout(&mut s);
             s.window.redraw();
-            s.sql_editor.focus();
+            if !s.editor_tabs.is_empty() {
+                s.sql_editor.focus();
+            }
         }
     }
 
@@ -11889,6 +12017,9 @@ impl MainWindow {
             .state
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if state.editor_tabs.is_empty() {
+            let _ = Self::create_query_editor_tab(&mut state);
+        }
         state.sql_editor.set_text(sql);
         let mut editor = state.sql_editor.get_editor();
         let position = cursor.unwrap_or_else(|| state.sql_buffer.length());
@@ -11951,15 +12082,25 @@ impl MainWindow {
         maria_runtime.set_state(ConnectionRuntimeState::Connected);
         state.object_browser.add_runtime(oracle_runtime.clone());
         state.object_browser.add_runtime(maria_runtime.clone());
-        let oracle_tab_id = state.active_editor_tab_id;
-        if let Some(binding) = state
-            .editor_tabs
-            .iter()
-            .find(|tab| tab.tab_id == oracle_tab_id)
-            .map(|tab| tab.connection_binding.clone())
-        {
-            binding.bind(oracle_runtime.clone(), Some("SYSTEM".to_string()));
-        }
+        let oracle_tab_id = if state.editor_tabs.is_empty() {
+            let Some(tab_id) =
+                Self::create_query_editor_tab_for_runtime(&mut state, oracle_runtime.clone())
+            else {
+                return;
+            };
+            tab_id
+        } else {
+            let tab_id = state.active_editor_tab_id;
+            if let Some(binding) = state
+                .editor_tabs
+                .iter()
+                .find(|tab| tab.tab_id == tab_id)
+                .map(|tab| tab.connection_binding.clone())
+            {
+                binding.bind(oracle_runtime.clone(), Some("SYSTEM".to_string()));
+            }
+            tab_id
+        };
         let _ = Self::create_query_editor_tab_for_runtime(&mut state, maria_runtime.clone());
         state.query_tabs.select(oracle_tab_id);
         let _ = state.set_active_editor_tab(oracle_tab_id);
@@ -12232,23 +12373,65 @@ mod tests {
         let one_way_frames = 100 / STATUS_ANIMATION_STEP;
 
         assert_eq!(
-            status_activity_pulse_color(0, theme::accent()).to_rgb(),
+            activity_pulse_color(0, theme::status_bar_default(), theme::accent()).to_rgb(),
             theme::status_bar_default().to_rgb()
         );
         assert_eq!(
-            status_activity_pulse_color(one_way_frames * STATUS_ANIMATION_STEP, theme::accent())
-                .to_rgb(),
+            activity_pulse_color(
+                one_way_frames * STATUS_ANIMATION_STEP,
+                theme::status_bar_default(),
+                theme::accent()
+            )
+            .to_rgb(),
             theme::accent().to_rgb()
         );
         assert_eq!(
-            status_activity_pulse_color(
+            activity_pulse_color(
                 one_way_frames * STATUS_ANIMATION_STEP * 2,
+                theme::status_bar_default(),
                 theme::accent()
             )
             .to_rgb(),
             theme::status_bar_default().to_rgb()
         );
-        assert!((STATUS_ANIMATION_INTERVAL * one_way_frames as f64 - 3.0).abs() < 0.001);
+        assert!((STATUS_ANIMATION_INTERVAL * one_way_frames as f64 - 2.5).abs() < 0.001);
+
+        assert_eq!(
+            activity_pulse_color(
+                one_way_frames * STATUS_ANIMATION_STEP,
+                theme::button_cancel(),
+                theme::button_cancel_active()
+            )
+            .to_rgb(),
+            theme::button_cancel_active().to_rgb()
+        );
+    }
+
+    #[test]
+    fn new_editor_metadata_uses_object_browser_cache_without_an_existing_tab() {
+        let snapshot = ObjectBrowserMetadataSnapshot {
+            db_type: DatabaseType::Oracle,
+            connection_generation: 3,
+            available_scopes: vec!["SCOTT".to_string()],
+            selected_scope: Some("SCOTT".to_string()),
+            tables: vec!["EMP".to_string()],
+            views: vec!["EMP_VIEW".to_string()],
+            procedures: Vec::new(),
+            functions: Vec::new(),
+            sequences: Vec::new(),
+            triggers: Vec::new(),
+            events: Vec::new(),
+            synonyms: Vec::new(),
+            packages: Vec::new(),
+        };
+
+        let (data, highlight_data) = MainWindow::editor_metadata_seed(None, Some(&snapshot));
+
+        assert_eq!(data.default_qualifier(), Some("SCOTT"));
+        assert!(data.tables.contains(&"EMP".to_string()));
+        assert!(data.views.contains(&"EMP_VIEW".to_string()));
+        assert!(highlight_data.tables.contains(&"EMP".to_string()));
+        assert!(highlight_data.views.contains(&"EMP_VIEW".to_string()));
     }
 
     #[test]
@@ -14313,6 +14496,43 @@ mod tests {
 
         assert!(context.claim_result_tab_auto_select());
         assert!(!context.claim_result_tab_auto_select());
+    }
+
+    #[test]
+    #[cfg_attr(
+        any(target_os = "macos", target_os = "linux"),
+        ignore = "FLTK widget tests require a native UI test environment"
+    )]
+    fn initial_window_has_no_query_tab_and_execution_can_bind_the_selected_database() {
+        let _app = fltk::app::App::default();
+        configure_fltk_globals(&AppConfig::default());
+        let window = MainWindow::new_with_config(AppConfig::default());
+        let mut state = window
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+
+        assert!(state.editor_tabs.is_empty());
+        assert!(state.query_tabs.tab_ids().is_empty());
+        assert_eq!(state.active_editor_tab_id, 0);
+
+        let registry = state.connection_registry.clone();
+        let runtime = registry.register_unmanaged(create_shared_connection());
+        let connection_id = runtime.id();
+        state.object_browser.add_runtime(runtime);
+        let tab_id = MainWindow::create_query_editor_tab_for_binding(
+            &mut state,
+            TabConnectionBinding::unbound(),
+            true,
+        )
+        .expect("create unbound query tab");
+        assert_eq!(state.active_editor_tab_id, tab_id);
+        assert_eq!(state.active_connection_id(), None);
+
+        state
+            .bind_active_unbound_tab_to_selected_database()
+            .expect("bind selected database before execution");
+        assert_eq!(state.active_connection_id(), Some(connection_id));
     }
 
     #[test]

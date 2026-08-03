@@ -383,6 +383,7 @@ fn capture_result_grid(main_window: &mut MainWindow) {
         )
         .unwrap_or_else(|err| fail(format!("show result: {err}")));
     pump(350);
+    save_main("/tmp/space-query-main.ppm");
     save_main("/tmp/space-query-result-grid.ppm");
 }
 
@@ -605,7 +606,6 @@ fn main() {
     main_window.setup_callbacks();
     main_window.show();
     pump(300);
-    save_main("/tmp/space-query-main.ppm");
 
     if std::env::args().nth(1).as_deref() == Some("object-browser") {
         capture_object_browser(&mut main_window);
@@ -613,9 +613,9 @@ fn main() {
         return;
     }
 
+    capture_object_browser(&mut main_window);
     capture_intellisense(&mut main_window);
     capture_signature_popup(&mut main_window);
-    capture_object_browser(&mut main_window);
     capture_formatting(&mut main_window);
     capture_result_grid(&mut main_window);
     capture_result_editing(&mut main_window);

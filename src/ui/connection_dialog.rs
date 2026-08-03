@@ -49,7 +49,7 @@ fn db_selection_section_height(db_type: DatabaseType, driver_mode: OracleDriverM
 }
 const SAVE_CONNECTION_BUTTON_WIDTH: i32 = 170;
 const CONNECTION_ACTION_BUTTONS_WIDTH: i32 =
-    SAVE_CONNECTION_BUTTON_WIDTH + BUTTON_WIDTH * 2 + DIALOG_SPACING * 2;
+    SAVE_CONNECTION_BUTTON_WIDTH + BUTTON_WIDTH * 3 + DIALOG_SPACING * 3;
 const SESSION_TIME_ZONE_CHOICES: &[&str] = &[
     "", "+00:00", "+09:00", "+08:00", "+05:30", "+01:00", "-05:00", "-08:00",
 ];
@@ -1318,6 +1318,13 @@ impl ConnectionDialog {
         action_button_flex.set_type(fltk::group::FlexType::Row);
         action_button_flex.set_spacing(DIALOG_SPACING);
 
+        let mut cancel_btn = Button::default()
+            .with_size(BUTTON_WIDTH, BUTTON_HEIGHT)
+            .with_label("Cancel");
+        cancel_btn.set_color(theme::button_dark());
+        cancel_btn.set_label_color(theme::text_primary());
+        cancel_btn.set_frame(FrameType::RFlatBox);
+
         let mut save_btn = Button::default()
             .with_size(SAVE_CONNECTION_BUTTON_WIDTH, BUTTON_HEIGHT)
             .with_label("Save this connection");
@@ -1339,6 +1346,7 @@ impl ConnectionDialog {
         connect_btn.set_label_color(theme::text_primary());
         connect_btn.set_frame(FrameType::RFlatBox);
 
+        action_button_flex.fixed(&cancel_btn, BUTTON_WIDTH);
         action_button_flex.fixed(&save_btn, SAVE_CONNECTION_BUTTON_WIDTH);
         action_button_flex.fixed(&test_btn, BUTTON_WIDTH);
         action_button_flex.fixed(&connect_btn, BUTTON_WIDTH);
@@ -1362,6 +1370,11 @@ impl ConnectionDialog {
         root.end();
         dialog.end();
         fltk::group::Group::set_current(current_group.as_ref());
+
+        let mut dialog_for_cancel = dialog.clone();
+        cancel_btn.set_callback(move |_| {
+            dialog_for_cancel.hide();
+        });
 
         // DB Type change callback: update port and service_name label/defaults
         {

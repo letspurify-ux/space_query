@@ -802,6 +802,32 @@ impl ObjectBrowserWidget {
             .clone()
     }
 
+    fn metadata_snapshot(&self) -> ObjectBrowserMetadataSnapshot {
+        let db_type = *self
+            .current_db_type
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let connection_generation = self.refresh_connection_generation.load(Ordering::Acquire);
+        let available_scopes = self
+            .scope_options
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        let selected_scope = self.selected_scope();
+        let cache = self
+            .object_cache
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        ObjectBrowserMetadataSnapshot::from_cache(
+            db_type,
+            connection_generation,
+            available_scopes,
+            selected_scope,
+            &cache,
+        )
+    }
+
     pub fn reset_selected_scope(&mut self) {
         self.scope_switch_in_progress
             .store(false, Ordering::Release);
@@ -2783,11 +2809,27 @@ impl ObjectBrowserWidget {
                                 }
                             }
 
-                            // Double-click on other items: insert text into SQL editor
                             let db_type = *current_db_type
                                 .lock()
                                 .unwrap_or_else(|poisoned| poisoned.into_inner());
                             let scope = Self::scope_snapshot(&selected_scope);
+                            let double_click_sql =
+                                Self::get_item_info(&item).and_then(|item_info| {
+                                    Self::double_click_preview_sql(
+                                        &item_info,
+                                        db_type,
+                                        scope.as_deref(),
+                                    )
+                                });
+                            if let Some(sql) = double_click_sql {
+                                ObjectBrowserWidget::emit_sql_callback(
+                                    &sql_callback,
+                                    SqlAction::Execute(sql),
+                                );
+                                return true;
+                            }
+
+                            // Double-click on other items: insert text into SQL editor
                             if let Some(insert_text) =
                                 Self::get_insert_text(&item, db_type, scope.as_deref())
                             {
@@ -2918,6 +2960,22 @@ impl ObjectBrowserWidget {
         tree.get_item_focus()
             .or_else(|| tree.first_selected_item())
             .or_else(|| tree.first_visible_item())
+    }
+
+    fn double_click_preview_sql(
+        item: &ObjectItem,
+        db_type: crate::db::DatabaseType,
+        selected_scope: Option<&str>,
+    ) -> Option<String> {
+        let ObjectItem::Simple {
+            object_type,
+            object_name,
+        } = item
+        else {
+            return None;
+        };
+        (object_type == "TABLES")
+            .then(|| Self::preview_select_sql(db_type, selected_scope, object_name))
     }
 
     fn select_tree_item(tree: &mut Tree, item: &TreeItem) {
@@ -8068,6 +8126,22 @@ impl MultiObjectBrowserWidget {
             .and_then(|entry| entry.browser.selected_scope())
     }
 
+    pub fn metadata_snapshot_for_connection(
+        &self,
+        connection_id: ConnectionId,
+    ) -> Option<ObjectBrowserMetadataSnapshot> {
+        let entry = self
+            .entries
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .iter()
+            .find(|entry| entry.connection_id == connection_id)
+            .cloned()?;
+        let snapshot = entry.browser.metadata_snapshot();
+        (snapshot.connection_generation == entry.runtime.connection_generation())
+            .then_some(snapshot)
+    }
+
     pub fn set_selected_scope_for_connection(
         &mut self,
         connection_id: ConnectionId,
@@ -8653,6 +8727,33 @@ mod tests {
         );
 
         assert_eq!(sql, "SELECT * FROM `sales`.`orders` LIMIT 100");
+    }
+
+    #[test]
+    fn table_double_click_uses_the_top_100_execute_sql() {
+        let table = ObjectItem::Simple {
+            object_type: "TABLES".to_string(),
+            object_name: "EMP".to_string(),
+        };
+        let view = ObjectItem::Simple {
+            object_type: "VIEWS".to_string(),
+            object_name: "EMP_VIEW".to_string(),
+        };
+
+        assert_eq!(
+            ObjectBrowserWidget::double_click_preview_sql(
+                &table,
+                DatabaseType::Oracle,
+                Some("SCOTT")
+            ),
+            Some("SELECT * FROM SCOTT.EMP WHERE ROWNUM <= 100".to_string())
+        );
+        assert!(ObjectBrowserWidget::double_click_preview_sql(
+            &view,
+            DatabaseType::Oracle,
+            Some("SCOTT")
+        )
+        .is_none());
     }
 
     #[test]

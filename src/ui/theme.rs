@@ -97,6 +97,10 @@ pub fn button_cancel() -> Color {
     button_warning()
 }
 
+pub fn button_cancel_active() -> Color {
+    Color::from_rgb(202, 80, 16)
+}
+
 pub fn button_danger() -> Color {
     panel_raised()
 }
@@ -235,6 +239,11 @@ mod tests {
     #[test]
     fn dark_button_color_matches_input_background() {
         assert_eq!(button_dark().to_rgb(), (46, 46, 46));
+    }
+
+    #[test]
+    fn active_cancel_color_preserves_the_existing_orange() {
+        assert_eq!(button_cancel_active().to_rgb(), (202, 80, 16));
     }
 
     #[test]

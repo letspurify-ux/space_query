@@ -2470,7 +2470,7 @@ fn metadata_refresh_needed_defers_while_the_owning_tab_is_running() {
 }
 
 #[test]
-fn new_query_tab_reuses_only_same_connection_schema_metadata() {
+fn new_query_tab_reuses_same_connection_or_object_browser_schema_metadata() {
     let file = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/ui/main_window.rs");
     let content = fs::read_to_string(&file)
         .unwrap_or_else(|err| panic!("failed to read source file {}: {err}", file.display()));
@@ -2496,8 +2496,43 @@ fn new_query_tab_reuses_only_same_connection_schema_metadata() {
         "new tabs should copy both completion and highlight data from the same connection"
     );
     assert!(
-        helper.contains("unwrap_or_else(|| (IntellisenseData::new(), HighlightData::new()))"),
-        "new tabs must start with empty metadata when no same-connection tab exists"
+        helper.contains("metadata_snapshot_for_connection(connection_id)")
+            && helper.contains("editor_metadata_seed(existing_metadata, browser_snapshot.as_ref())"),
+        "new tabs should fall back to the same connection's object-browser metadata when no editor tab can seed them"
+    );
+}
+
+#[test]
+fn execution_binds_an_unbound_tab_to_the_selected_database_before_starting() {
+    let main_window = read_source("src/ui/main_window.rs");
+    let bind_start = main_window
+        .find("fn bind_active_unbound_tab_to_selected_database")
+        .expect("unbound-tab binding helper should exist");
+    let bind_end = main_window[bind_start..]
+        .find("fn active_schema_update_target")
+        .map(|offset| bind_start + offset)
+        .expect("unbound-tab binding helper should have an end marker");
+    let binding_helper = &main_window[bind_start..bind_end];
+
+    assert!(
+        binding_helper.contains("object_browser.selected_connection_context()")
+            && binding_helper.contains("connection_registry.get(connection_id)")
+            && binding_helper
+                .contains("bind_if_revision(binding_snapshot.revision, runtime, scope)"),
+        "an unbound tab should bind atomically to the selected object-browser database"
+    );
+
+    let execute_start = main_window
+        .find("fn execute_sql_request_with_session_pool_slot")
+        .expect("execution entry point should exist");
+    let execute_end = main_window[execute_start..]
+        .find("fn update_transaction_mode_from_controls")
+        .map(|offset| execute_start + offset)
+        .expect("execution entry point should have an end marker");
+    assert!(
+        main_window[execute_start..execute_end]
+            .contains("prepare_active_editor_for_execution(state)"),
+        "execution must prepare the selected database binding before checking pool capacity"
     );
 }
 
@@ -2512,6 +2547,12 @@ fn startup_has_no_placeholder_database_runtime() {
             && !main_window
                 .contains("let initial_runtime = connection_registry.register_unmanaged"),
         "startup must not expose a synthetic default ORCL runtime"
+    );
+    assert!(
+        main_window.contains("let editor_tabs = Vec::new();")
+            && main_window.contains("active_editor_tab_id: 0,")
+            && main_window.contains("next_editor_tab_number: 1,"),
+        "startup must not create or select a query editor tab"
     );
     assert!(
         object_browser.contains("visible_connection_id: Arc::new(Mutex::new(None))")
