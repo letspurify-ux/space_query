@@ -3,7 +3,7 @@ use fltk::{
     browser::Browser,
     button::{Button, CheckButton},
     dialog::{FileDialog, FileDialogType},
-    draw::{measure, set_cursor, set_font},
+    draw::{draw_box, draw_polygon, draw_text2, measure, set_cursor, set_draw_color, set_font},
     enums::{Align, Color, Cursor, Event, FrameType},
     frame::Frame,
     group::{Flex, FlexType, Group, Tile},
@@ -58,9 +58,9 @@ const RESULT_ONE_TAB_PER_QUERY_LABEL: &str = " One tab per query";
 const RESULT_CHECKBOX_GROUP_GAP: i32 = TOOLBAR_SPACING;
 const RESULT_PAGE_UNITS: [usize; 5] = [10, 100, 250, 500, 1000];
 const RESULT_PAGE_DEFAULT_UNIT_INDEX: usize = 3;
-const RESULT_PAGE_NAV_BUTTON_WIDTH: i32 = 30;
+const RESULT_PAGE_NAV_BUTTON_WIDTH: i32 = 32;
 const RESULT_PAGE_UNIT_WIDTH: i32 = 66;
-const RESULT_PAGE_CONTROL_SPACING: i32 = 1;
+const RESULT_PAGE_CONTROL_SPACING: i32 = TOOLBAR_SPACING;
 const RESULT_PAGE_CONTROL_WIDTH: i32 =
     RESULT_PAGE_NAV_BUTTON_WIDTH * 4 + RESULT_PAGE_UNIT_WIDTH + RESULT_PAGE_CONTROL_SPACING * 4;
 const UI_SCALE_BUTTON_WIDTH: i32 = 32;
@@ -1577,6 +1577,43 @@ fn result_page_control_center_offsets(available_width: i32) -> (i32, i32) {
 
 fn result_page_controls_fit(available_width: i32) -> bool {
     available_width >= RESULT_PAGE_CONTROL_WIDTH
+}
+
+fn result_page_control_feedback_color(event: Event, pointer_inside: bool) -> Option<Color> {
+    match event {
+        Event::Enter | Event::Move => Some(theme::border()),
+        Event::Push => Some(theme::selection_soft()),
+        Event::Drag => Some(if pointer_inside {
+            theme::selection_soft()
+        } else {
+            theme::button_subtle()
+        }),
+        Event::Released => Some(if pointer_inside {
+            theme::border()
+        } else {
+            theme::button_subtle()
+        }),
+        Event::Leave | Event::Unfocus => Some(theme::button_subtle()),
+        _ => None,
+    }
+}
+
+fn install_result_page_control_feedback<W: WidgetBase>(widget: &mut W) {
+    widget.handle(|widget, event| {
+        let event_x = app::event_x();
+        let event_y = app::event_y();
+        let pointer_inside = event_x >= widget.x()
+            && event_x < widget.x() + widget.w()
+            && event_y >= widget.y()
+            && event_y < widget.y() + widget.h();
+        if let Some(color) = result_page_control_feedback_color(event, pointer_inside) {
+            if widget.color() != color {
+                widget.set_color(color);
+                widget.redraw();
+            }
+        }
+        false
+    });
 }
 
 fn transaction_isolation_choice_labels(
@@ -5903,16 +5940,16 @@ impl MainWindow {
 
         let mut page_first_btn = Button::default()
             .with_size(RESULT_PAGE_NAV_BUTTON_WIDTH, BUTTON_HEIGHT)
-            .with_label("|<");
+            .with_label("«");
         page_first_btn.set_id("result_page_first");
         page_first_btn.set_tooltip("Move to the first result row (Ctrl/Cmd+Up)");
         page_control.fixed(&page_first_btn, RESULT_PAGE_NAV_BUTTON_WIDTH);
 
         let mut page_previous_btn = Button::default()
             .with_size(RESULT_PAGE_NAV_BUTTON_WIDTH, BUTTON_HEIGHT)
-            .with_label("<");
+            .with_label("‹");
         page_previous_btn.set_id("result_page_previous");
-        page_previous_btn.set_tooltip("Move backward by the selected row unit");
+        page_previous_btn.set_tooltip("Move to the previous page boundary");
         page_control.fixed(&page_previous_btn, RESULT_PAGE_NAV_BUTTON_WIDTH);
 
         let mut page_unit_choice =
@@ -5920,21 +5957,59 @@ impl MainWindow {
         page_unit_choice.set_id("result_page_unit");
         page_unit_choice.add_choice("10|100|250|500|1000");
         page_unit_choice.set_value(RESULT_PAGE_DEFAULT_UNIT_INDEX as i32);
-        page_unit_choice.set_color(theme::input_bg());
+        page_unit_choice.set_color(theme::button_subtle());
         page_unit_choice.set_text_color(theme::text_primary());
-        page_unit_choice.set_tooltip("Rows moved by the previous and next buttons");
+        page_unit_choice.set_selection_color(theme::selection_soft());
+        page_unit_choice.set_frame(FrameType::RFlatBox);
+        page_unit_choice.draw(|choice| {
+            const ARROW_WIDTH: i32 = 20;
+
+            draw_box(
+                choice.frame(),
+                choice.x(),
+                choice.y(),
+                choice.w(),
+                choice.h(),
+                choice.color(),
+            );
+            let arrow_width = ARROW_WIDTH.min(choice.w().max(0));
+            set_font(choice.text_font(), choice.text_size());
+            set_draw_color(choice.text_color());
+            if let Some(value) = choice.choice() {
+                draw_text2(
+                    &value,
+                    choice.x(),
+                    choice.y(),
+                    choice.w().saturating_sub(arrow_width),
+                    choice.h(),
+                    Align::Center,
+                );
+            }
+
+            let arrow_x = choice.x() + choice.w() - arrow_width / 2;
+            let arrow_y = choice.y() + choice.h() / 2;
+            draw_polygon(
+                arrow_x - 3,
+                arrow_y - 2,
+                arrow_x + 3,
+                arrow_y - 2,
+                arrow_x,
+                arrow_y + 2,
+            );
+        });
+        page_unit_choice.set_tooltip("Rows per page for the previous and next buttons");
         page_control.fixed(&page_unit_choice, RESULT_PAGE_UNIT_WIDTH);
 
         let mut page_next_btn = Button::default()
             .with_size(RESULT_PAGE_NAV_BUTTON_WIDTH, BUTTON_HEIGHT)
-            .with_label(">");
+            .with_label("›");
         page_next_btn.set_id("result_page_next");
-        page_next_btn.set_tooltip("Move forward by the selected row unit");
+        page_next_btn.set_tooltip("Move to the next page boundary");
         page_control.fixed(&page_next_btn, RESULT_PAGE_NAV_BUTTON_WIDTH);
 
         let mut page_last_btn = Button::default()
             .with_size(RESULT_PAGE_NAV_BUTTON_WIDTH, BUTTON_HEIGHT)
-            .with_label(">|");
+            .with_label("»");
         page_last_btn.set_id("result_page_last");
         page_last_btn.set_tooltip("Fetch remaining rows and move to the last row (Ctrl/Cmd+Down)");
         page_control.fixed(&page_last_btn, RESULT_PAGE_NAV_BUTTON_WIDTH);
@@ -5947,8 +6022,11 @@ impl MainWindow {
         ] {
             button.set_color(theme::button_subtle());
             button.set_label_color(theme::text_primary());
-            button.set_frame(FrameType::FlatBox);
+            button.set_selection_color(theme::selection_soft());
+            button.set_frame(FrameType::RFlatBox);
+            install_result_page_control_feedback(button);
         }
+        install_result_page_control_feedback(&mut page_unit_choice);
         page_control.end();
         page_control.resize_callback(|control, _, _, width, _| {
             let should_show = result_page_controls_fit(width);
@@ -13214,6 +13292,34 @@ mod tests {
         );
         assert!(!result_page_controls_fit(RESULT_PAGE_CONTROL_WIDTH - 1));
         assert!(result_page_controls_fit(RESULT_PAGE_CONTROL_WIDTH));
+    }
+
+    #[test]
+    fn result_page_control_feedback_distinguishes_hover_press_and_exit() {
+        assert_eq!(
+            result_page_control_feedback_color(Event::Enter, true),
+            Some(theme::border())
+        );
+        assert_eq!(
+            result_page_control_feedback_color(Event::Push, true),
+            Some(theme::selection_soft())
+        );
+        assert_eq!(
+            result_page_control_feedback_color(Event::Drag, false),
+            Some(theme::button_subtle())
+        );
+        assert_eq!(
+            result_page_control_feedback_color(Event::Released, true),
+            Some(theme::border())
+        );
+        assert_eq!(
+            result_page_control_feedback_color(Event::Leave, false),
+            Some(theme::button_subtle())
+        );
+        assert_eq!(
+            result_page_control_feedback_color(Event::KeyDown, true),
+            None
+        );
     }
 
     #[test]

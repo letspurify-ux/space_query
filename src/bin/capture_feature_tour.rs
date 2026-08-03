@@ -1,5 +1,11 @@
 use fltk::{
-    app, browser::HoldBrowser, draw, enums::FrameType, misc::Tooltip, prelude::*, window::Window,
+    app,
+    browser::HoldBrowser,
+    draw,
+    enums::{Event, FrameType},
+    misc::Tooltip,
+    prelude::*,
+    window::Window,
 };
 use space_query::{
     db::{ColumnInfo, QueryResult},
@@ -400,7 +406,8 @@ fn assert_result_page_control_layout(expected_sizes: &[(i32, i32)]) {
     }
 
     let required_width = expected_sizes.iter().map(|(width, _)| width).sum::<i32>()
-        + i32::try_from(expected_sizes.len().saturating_sub(1)).unwrap_or(0);
+        + page_control.spacing()
+            * i32::try_from(expected_sizes.len().saturating_sub(1)).unwrap_or(0);
     let should_show = page_control.w() >= required_width;
     let buttons_visibility_matches = [
         "result_page_first",
@@ -429,6 +436,31 @@ fn assert_result_page_control_layout(expected_sizes: &[(i32, i32)]) {
             "result page controls are not centered: flex center x2={flex_center_twice}, controls center x2={controls_center_twice}"
         ));
     }
+}
+
+fn assert_result_page_control_feedback() {
+    fn assert_control<W: WidgetBase>(control: &mut W) {
+        if control.color() != theme::button_subtle() {
+            fail("result page control did not start with its default color");
+        }
+        let _ = control.handle_event(Event::Enter);
+        pump(20);
+        if control.color() != theme::border() {
+            fail("result page control did not apply its hover color");
+        }
+        let _ = control.handle_event(Event::Leave);
+        pump(20);
+        if control.color() != theme::button_subtle() {
+            fail("result page control did not restore its default color");
+        }
+    }
+
+    let mut next = app::widget_from_id::<fltk::button::Button>("result_page_next")
+        .unwrap_or_else(|| fail("result next-page button is missing"));
+    let mut unit = app::widget_from_id::<fltk::menu::Choice>("result_page_unit")
+        .unwrap_or_else(|| fail("result page unit control is missing"));
+    assert_control(&mut next);
+    assert_control(&mut unit);
 }
 
 fn capture_result_page_resizes(capture_paths: [&str; 2], expected_sizes: &[(i32, i32)]) {
@@ -507,6 +539,7 @@ fn capture_result_grid(main_window: &mut MainWindow) {
         ],
         &expected_page_control_sizes,
     );
+    assert_result_page_control_feedback();
 
     let mut unit = app::widget_from_id::<fltk::menu::Choice>("result_page_unit")
         .unwrap_or_else(|| fail("result page unit control is missing"));

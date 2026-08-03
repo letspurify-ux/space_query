@@ -1253,10 +1253,12 @@ impl ResultTableWidget {
     }
 
     fn page_target_row(current_row: usize, unit: usize, forward: bool) -> usize {
+        let unit = unit.max(1);
+        let current_page_start = current_row / unit * unit;
         if forward {
-            current_row.saturating_add(unit)
+            current_page_start.saturating_add(unit)
         } else {
-            current_row.saturating_sub(unit)
+            current_page_start.saturating_sub(unit)
         }
     }
 
@@ -13849,9 +13851,10 @@ mod tests {
     }
 
     #[test]
-    fn page_targets_move_by_the_selected_unit_without_underflow() {
-        assert_eq!(ResultTableWidget::page_target_row(250, 100, true), 350);
-        assert_eq!(ResultTableWidget::page_target_row(250, 100, false), 150);
+    fn page_targets_move_to_adjacent_page_boundaries_without_underflow() {
+        assert_eq!(ResultTableWidget::page_target_row(3, 500, true), 500);
+        assert_eq!(ResultTableWidget::page_target_row(250, 100, true), 300);
+        assert_eq!(ResultTableWidget::page_target_row(250, 100, false), 100);
         assert_eq!(ResultTableWidget::page_target_row(50, 100, false), 0);
         assert_eq!(
             ResultTableWidget::page_target_row(usize::MAX - 5, 10, true),
@@ -13877,7 +13880,7 @@ mod tests {
         any(target_os = "macos", target_os = "linux"),
         ignore = "FLTK widget tests require a native UI test environment"
     )]
-    fn page_navigation_moves_exact_units_and_reuses_edge_navigation() {
+    fn page_navigation_moves_between_page_boundaries_and_reuses_edge_navigation() {
         let mut widget = ResultTableWidget::with_size(0, 0, 640, 320);
         widget.start_streaming(&["A".to_string()]);
         widget.append_rows(
@@ -13891,7 +13894,7 @@ mod tests {
             widget.page_previous(100),
             ResultPageNavigationOutcome::Moved
         );
-        assert_eq!(widget.table.get_selection(), (150, 0, 150, 0));
+        assert_eq!(widget.table.get_selection(), (100, 0, 100, 0));
         assert_eq!(widget.page_first(), ResultPageNavigationOutcome::Moved);
         assert_eq!(widget.table.get_selection(), (0, 0, 0, 0));
         assert_eq!(widget.page_next(100), ResultPageNavigationOutcome::Moved);
@@ -13937,16 +13940,12 @@ mod tests {
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .as_slice(),
-            &[(77, LazyFetchRequest::MoreRows(51))]
+            &[(77, LazyFetchRequest::MoreRows(1))]
         );
 
-        widget.append_rows(
-            (100..151)
-                .map(|row| vec![row.to_string()])
-                .collect::<Vec<_>>(),
-        );
+        widget.append_rows(vec![vec!["100".to_string()]]);
         assert!(!widget.note_lazy_fetch_waiting(77));
-        assert_eq!(widget.table.get_selection(), (150, 0, 150, 0));
+        assert_eq!(widget.table.get_selection(), (100, 0, 100, 0));
     }
 
     #[test]
