@@ -982,6 +982,7 @@ impl SqlEditorWidget {
             .with_label("Close");
         close_btn.set_color(theme::button_dark());
         close_btn.set_label_color(theme::text_primary());
+        theme::install_button_hover(&mut close_btn);
 
         let (sender, receiver) = mpsc::channel::<()>();
         close_btn.set_callback(move |_| {

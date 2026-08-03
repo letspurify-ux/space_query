@@ -19256,8 +19256,9 @@ impl SqlEditorWidget {
         let mut input = Input::default();
         input.set_color(theme::input_bg());
         input.set_text_color(theme::text_primary());
+        theme::apply_text_input_inset(&mut input);
         input.set_trigger(CallbackTrigger::EnterKeyAlways);
-        main_flex.fixed(&input, 30);
+        main_flex.fixed(&input, INPUT_ROW_HEIGHT);
 
         let mut button_flex = Flex::default();
         button_flex.set_type(FlexType::Row);
@@ -19271,6 +19272,7 @@ impl SqlEditorWidget {
         ok_btn.set_color(theme::button_dark());
         ok_btn.set_label_color(theme::text_primary());
         ok_btn.set_frame(FrameType::RFlatBox);
+        theme::install_button_hover(&mut ok_btn);
 
         let mut cancel_btn = Button::default()
             .with_size(BUTTON_WIDTH, BUTTON_HEIGHT)
@@ -19278,6 +19280,7 @@ impl SqlEditorWidget {
         cancel_btn.set_color(theme::button_dark());
         cancel_btn.set_label_color(theme::text_primary());
         cancel_btn.set_frame(FrameType::RFlatBox);
+        theme::install_button_hover(&mut cancel_btn);
 
         button_flex.fixed(&ok_btn, BUTTON_WIDTH);
         button_flex.fixed(&cancel_btn, BUTTON_WIDTH);

@@ -84,5 +84,6 @@ pub(crate) fn configure_fltk_globals(config: &AppConfig) {
 
     app::set_frame_type2(FrameType::UpBox, FrameType::RFlatBox);
     app::set_frame_type2(FrameType::DownBox, FrameType::RFlatBox);
+    theme::register_text_input_frame();
     app::set_frame_border_radius_max(8);
 }

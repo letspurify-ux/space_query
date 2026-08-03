@@ -17,22 +17,22 @@ pub const TRANSACTION_ISOLATION_CHOICE_WIDTH: i32 = 230;
 /// Width for the transaction access mode selector in the query toolbar.
 pub const TRANSACTION_ACCESS_CHOICE_WIDTH: i32 = 130;
 
-/// Uniform button height across the entire UI.
+/// Uniform height for buttons, choices, single-line inputs, and checkboxes.
 pub const BUTTON_HEIGHT: i32 = 28;
 
 // -- Form row heights --
 
 /// Height of a row containing a text input field.
-pub const INPUT_ROW_HEIGHT: i32 = 30;
+pub const INPUT_ROW_HEIGHT: i32 = BUTTON_HEIGHT;
 
 /// Height of a row containing action buttons at the bottom of a dialog.
-pub const BUTTON_ROW_HEIGHT: i32 = 28;
+pub const BUTTON_ROW_HEIGHT: i32 = BUTTON_HEIGHT;
 
 /// Height of a row containing only a label/frame.
 pub const LABEL_ROW_HEIGHT: i32 = 22;
 
 /// Height of a row containing a checkbox.
-pub const CHECKBOX_ROW_HEIGHT: i32 = 28;
+pub const CHECKBOX_ROW_HEIGHT: i32 = BUTTON_HEIGHT;
 
 // -- Spacing and margins --
 
@@ -64,7 +64,7 @@ pub const MENU_BAR_HEIGHT: i32 = 30;
 pub const STATUS_BAR_HEIGHT: i32 = 25;
 
 /// Height of the filter input in the object browser.
-pub const FILTER_INPUT_HEIGHT: i32 = 28;
+pub const FILTER_INPUT_HEIGHT: i32 = BUTTON_HEIGHT;
 
 // -- Table constants --
 
@@ -75,7 +75,7 @@ pub const TABLE_ROW_HEADER_WIDTH: i32 = 55;
 pub const TABLE_COL_HEADER_HEIGHT: i32 = 28;
 
 /// Default row height in result tables.
-pub const TABLE_ROW_HEIGHT: i32 = 26;
+pub const TABLE_ROW_HEIGHT: i32 = BUTTON_HEIGHT;
 
 /// Cell text padding (left/right) in result tables.
 pub const TABLE_CELL_PADDING: i32 = 4;

@@ -56,6 +56,7 @@ fn show_info_dialog(title: &str, content: &str, width: i32, height: i32) {
     close_btn.set_color(theme::button_dark());
     close_btn.set_label_color(theme::text_primary());
     close_btn.set_frame(FrameType::RFlatBox);
+    theme::install_button_hover(&mut close_btn);
 
     let mut dialog_handle = dialog.clone();
     close_btn.set_callback(move |_| {

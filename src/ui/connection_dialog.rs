@@ -299,6 +299,7 @@ fn style_input_choice(choice: &mut InputChoice) {
     let mut input = choice.input();
     input.set_color(theme::input_bg());
     input.set_text_color(theme::text_primary());
+    theme::apply_text_input_inset(&mut input);
 
     let mut menu_button = choice.menu_button();
     menu_button.set_color(theme::button_dark());
@@ -973,8 +974,8 @@ impl ConnectionDialog {
         dbtype_choice.add_choice(&db_choices);
         let initial_db_type = DatabaseType::default();
         dbtype_choice.set_value(choice_index_from_db_type(initial_db_type));
-        dbtype_choice.set_color(theme::input_bg());
-        dbtype_choice.set_text_color(theme::text_primary());
+        theme::style_choice(&mut dbtype_choice);
+        theme::install_choice_hover(&mut dbtype_choice);
         dbtype_flex.end();
         db_col.fixed(&dbtype_flex, INPUT_ROW_HEIGHT);
 
@@ -992,8 +993,8 @@ impl ConnectionDialog {
         oracle_driver_choice.set_value(choice_index_from_oracle_driver_mode(
             initial_advanced.oracle_driver_mode,
         ));
-        oracle_driver_choice.set_color(theme::input_bg());
-        oracle_driver_choice.set_text_color(theme::text_primary());
+        theme::style_choice(&mut oracle_driver_choice);
+        theme::install_choice_hover(&mut oracle_driver_choice);
         oracle_driver_flex.end();
         db_col.fixed(&oracle_driver_flex, INPUT_ROW_HEIGHT);
 
@@ -1005,8 +1006,8 @@ impl ConnectionDialog {
         let mut oracle_mode_choice = Choice::default();
         oracle_mode_choice.add_choice("Host + Port + Service|TNS Alias");
         oracle_mode_choice.set_value(0);
-        oracle_mode_choice.set_color(theme::input_bg());
-        oracle_mode_choice.set_text_color(theme::text_primary());
+        theme::style_choice(&mut oracle_mode_choice);
+        theme::install_choice_hover(&mut oracle_mode_choice);
         oracle_mode_flex.end();
         db_col.fixed(&oracle_mode_flex, INPUT_ROW_HEIGHT);
 
@@ -1035,6 +1036,7 @@ impl ConnectionDialog {
         name_input.set_value("My Connection");
         name_input.set_color(theme::input_bg());
         name_input.set_text_color(theme::text_primary());
+        theme::apply_text_input_inset(&mut name_input);
         name_flex.end();
         right_col.fixed(&name_flex, INPUT_ROW_HEIGHT);
 
@@ -1047,6 +1049,7 @@ impl ConnectionDialog {
         let mut user_input = Input::default();
         user_input.set_color(theme::input_bg());
         user_input.set_text_color(theme::text_primary());
+        theme::apply_text_input_inset(&mut user_input);
         user_flex.end();
         right_col.fixed(&user_flex, INPUT_ROW_HEIGHT);
 
@@ -1059,6 +1062,7 @@ impl ConnectionDialog {
         let mut pass_input = SecretInput::default();
         pass_input.set_color(theme::input_bg());
         pass_input.set_text_color(theme::text_primary());
+        theme::apply_text_input_inset(&mut pass_input);
         pass_flex.end();
         right_col.fixed(&pass_flex, INPUT_ROW_HEIGHT);
 
@@ -1074,6 +1078,7 @@ impl ConnectionDialog {
         host_input.set_value(initial_form.default_host);
         host_input.set_color(theme::input_bg());
         host_input.set_text_color(theme::text_primary());
+        theme::apply_text_input_inset(&mut host_input);
         host_flex.end();
         right_col.fixed(&host_flex, INPUT_ROW_HEIGHT);
 
@@ -1087,6 +1092,7 @@ impl ConnectionDialog {
         port_input.set_value(&initial_form.default_port.to_string());
         port_input.set_color(theme::input_bg());
         port_input.set_text_color(theme::text_primary());
+        theme::apply_text_input_inset(&mut port_input);
         port_flex.end();
         right_col.fixed(&port_flex, INPUT_ROW_HEIGHT);
 
@@ -1100,6 +1106,7 @@ impl ConnectionDialog {
         service_input.set_value(initial_form.default_service_name);
         service_input.set_color(theme::input_bg());
         service_input.set_text_color(theme::text_primary());
+        theme::apply_text_input_inset(&mut service_input);
         service_flex.end();
         right_col.fixed(&service_flex, INPUT_ROW_HEIGHT);
 
@@ -1130,8 +1137,8 @@ impl ConnectionDialog {
             initial_db_type,
             initial_advanced.ssl_mode,
         ));
-        ssl_choice.set_color(theme::input_bg());
-        ssl_choice.set_text_color(theme::text_primary());
+        theme::style_choice(&mut ssl_choice);
+        theme::install_choice_hover(&mut ssl_choice);
         ssl_flex.end();
         advanced_col.fixed(&ssl_flex, INPUT_ROW_HEIGHT);
 
@@ -1146,8 +1153,8 @@ impl ConnectionDialog {
             initial_db_type,
             initial_advanced.default_transaction_isolation,
         ));
-        isolation_choice.set_color(theme::input_bg());
-        isolation_choice.set_text_color(theme::text_primary());
+        theme::style_choice(&mut isolation_choice);
+        theme::install_choice_hover(&mut isolation_choice);
         isolation_flex.end();
         advanced_col.fixed(&isolation_flex, INPUT_ROW_HEIGHT);
 
@@ -1161,8 +1168,8 @@ impl ConnectionDialog {
         access_choice.set_value(choice_index_from_transaction_access(
             initial_advanced.default_transaction_access_mode,
         ));
-        access_choice.set_color(theme::input_bg());
-        access_choice.set_text_color(theme::text_primary());
+        theme::style_choice(&mut access_choice);
+        theme::install_choice_hover(&mut access_choice);
         access_flex.end();
         advanced_col.fixed(&access_flex, INPUT_ROW_HEIGHT);
 
@@ -1189,8 +1196,8 @@ impl ConnectionDialog {
         let mut oracle_thin_protocol_choice = Choice::default();
         oracle_thin_protocol_choice.add_choice(ORACLE_THIN_PROTOCOL_VERSION_LABELS);
         oracle_thin_protocol_choice.set_value(choice_index_from_oracle_thin_protocol(None));
-        oracle_thin_protocol_choice.set_color(theme::input_bg());
-        oracle_thin_protocol_choice.set_text_color(theme::text_primary());
+        theme::style_choice(&mut oracle_thin_protocol_choice);
+        theme::install_choice_hover(&mut oracle_thin_protocol_choice);
         oracle_thin_protocol_flex.end();
         advanced_col.fixed(&oracle_thin_protocol_flex, INPUT_ROW_HEIGHT);
 
@@ -1204,8 +1211,8 @@ impl ConnectionDialog {
         oracle_protocol_choice.set_value(choice_index_from_oracle_protocol(
             initial_advanced.oracle_protocol,
         ));
-        oracle_protocol_choice.set_color(theme::input_bg());
-        oracle_protocol_choice.set_text_color(theme::text_primary());
+        theme::style_choice(&mut oracle_protocol_choice);
+        theme::install_choice_hover(&mut oracle_protocol_choice);
         oracle_protocol_flex.end();
         advanced_col.fixed(&oracle_protocol_flex, INPUT_ROW_HEIGHT);
 
@@ -1218,6 +1225,7 @@ impl ConnectionDialog {
         oracle_nls_date_input.set_value(&initial_advanced.oracle_nls_date_format);
         oracle_nls_date_input.set_color(theme::input_bg());
         oracle_nls_date_input.set_text_color(theme::text_primary());
+        theme::apply_text_input_inset(&mut oracle_nls_date_input);
         oracle_nls_date_flex.end();
         advanced_col.fixed(&oracle_nls_date_flex, INPUT_ROW_HEIGHT);
 
@@ -1230,6 +1238,7 @@ impl ConnectionDialog {
         oracle_nls_timestamp_input.set_value(&initial_advanced.oracle_nls_timestamp_format);
         oracle_nls_timestamp_input.set_color(theme::input_bg());
         oracle_nls_timestamp_input.set_text_color(theme::text_primary());
+        theme::apply_text_input_inset(&mut oracle_nls_timestamp_input);
         oracle_nls_timestamp_flex.end();
         advanced_col.fixed(&oracle_nls_timestamp_flex, INPUT_ROW_HEIGHT);
 
@@ -1288,6 +1297,7 @@ impl ConnectionDialog {
         mysql_ssl_ca_input.set_value(&initial_advanced.mysql_ssl_ca_path);
         mysql_ssl_ca_input.set_color(theme::input_bg());
         mysql_ssl_ca_input.set_text_color(theme::text_primary());
+        theme::apply_text_input_inset(&mut mysql_ssl_ca_input);
         mysql_ssl_ca_flex.end();
         advanced_col.fixed(&mysql_ssl_ca_flex, INPUT_ROW_HEIGHT);
 
@@ -1312,6 +1322,7 @@ impl ConnectionDialog {
         delete_btn.set_color(theme::button_dark());
         delete_btn.set_label_color(theme::text_primary());
         delete_btn.set_frame(FrameType::RFlatBox);
+        theme::install_button_hover(&mut delete_btn);
 
         let button_spacer = Frame::default();
         let mut action_button_flex = Flex::default();
@@ -1324,6 +1335,7 @@ impl ConnectionDialog {
         cancel_btn.set_color(theme::button_dark());
         cancel_btn.set_label_color(theme::text_primary());
         cancel_btn.set_frame(FrameType::RFlatBox);
+        theme::install_button_hover(&mut cancel_btn);
 
         let mut save_btn = Button::default()
             .with_size(SAVE_CONNECTION_BUTTON_WIDTH, BUTTON_HEIGHT)
@@ -1331,6 +1343,7 @@ impl ConnectionDialog {
         save_btn.set_color(theme::button_dark());
         save_btn.set_label_color(theme::text_primary());
         save_btn.set_frame(FrameType::RFlatBox);
+        theme::install_button_hover(&mut save_btn);
 
         let mut test_btn = Button::default()
             .with_size(BUTTON_WIDTH, BUTTON_HEIGHT)
@@ -1338,6 +1351,7 @@ impl ConnectionDialog {
         test_btn.set_color(theme::button_dark());
         test_btn.set_label_color(theme::text_primary());
         test_btn.set_frame(FrameType::RFlatBox);
+        theme::install_button_hover(&mut test_btn);
 
         let mut connect_btn = Button::default()
             .with_size(BUTTON_WIDTH, BUTTON_HEIGHT)
@@ -1345,6 +1359,7 @@ impl ConnectionDialog {
         connect_btn.set_color(theme::selection_soft());
         connect_btn.set_label_color(theme::text_primary());
         connect_btn.set_frame(FrameType::RFlatBox);
+        theme::install_button_hover(&mut connect_btn);
 
         action_button_flex.fixed(&cancel_btn, BUTTON_WIDTH);
         action_button_flex.fixed(&save_btn, SAVE_CONNECTION_BUTTON_WIDTH);

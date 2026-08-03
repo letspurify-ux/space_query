@@ -1,6 +1,9 @@
 use fltk::{
+    app,
     browser::HoldBrowser,
-    enums::{Color, FrameType},
+    draw::{draw_box, draw_polygon, draw_text2, set_draw_color, set_font},
+    enums::{Align, Color, Event, FrameType},
+    menu::Choice,
     prelude::*,
     text::{TextDisplay, TextEditor},
     tree::Tree,
@@ -8,6 +11,31 @@ use fltk::{
 };
 
 // Windows 11-inspired dark palette tuned for FLTK widgets.
+
+pub const CHOICE_TEXT_LEFT_PADDING: i32 = 10;
+const INPUT_NATIVE_TEXT_LEFT_OFFSET: i32 = 1;
+const INPUT_TEXT_RIGHT_PADDING: i32 = 6;
+const INPUT_FRAME_LEFT_INSET: i32 = CHOICE_TEXT_LEFT_PADDING - INPUT_NATIVE_TEXT_LEFT_OFFSET;
+const INPUT_FRAME_WIDTH_INSET: i32 = INPUT_FRAME_LEFT_INSET + INPUT_TEXT_RIGHT_PADDING;
+
+fn draw_text_input_box(x: i32, y: i32, w: i32, h: i32, color: Color) {
+    draw_box(FrameType::RFlatBox, x, y, w, h, color);
+}
+
+pub fn register_text_input_frame() {
+    app::set_frame_type_cb(
+        FrameType::FreeBoxType,
+        draw_text_input_box,
+        INPUT_FRAME_LEFT_INSET,
+        0,
+        INPUT_FRAME_WIDTH_INSET,
+        0,
+    );
+}
+
+pub fn apply_text_input_inset<W: WidgetExt>(input: &mut W) {
+    input.set_frame(FrameType::FreeBoxType);
+}
 
 pub fn app_background() -> Color {
     Color::from_rgb(32, 32, 32)
@@ -107,6 +135,120 @@ pub fn button_danger() -> Color {
 
 pub fn button_dark() -> Color {
     input_bg()
+}
+
+fn style_choice_with_background(choice: &mut Choice, background: Color) {
+    const ARROW_WIDTH: i32 = 20;
+
+    choice.set_color(background);
+    choice.set_text_color(text_primary());
+    choice.set_selection_color(selection_soft());
+    choice.set_frame(FrameType::RFlatBox);
+    choice.draw(|choice| {
+        draw_box(
+            choice.frame(),
+            choice.x(),
+            choice.y(),
+            choice.w(),
+            choice.h(),
+            choice.color(),
+        );
+        let arrow_width = ARROW_WIDTH.min(choice.w().max(0));
+        set_font(choice.text_font(), choice.text_size());
+        set_draw_color(if choice.active_r() {
+            choice.text_color()
+        } else {
+            text_muted()
+        });
+        if let Some(value) = choice.choice() {
+            let content_width = choice.w().saturating_sub(arrow_width).max(0);
+            let text_left_padding = CHOICE_TEXT_LEFT_PADDING.min(content_width);
+            draw_text2(
+                &value,
+                choice.x().saturating_add(text_left_padding),
+                choice.y(),
+                content_width.saturating_sub(text_left_padding),
+                choice.h(),
+                Align::Left | Align::Inside,
+            );
+        }
+
+        let arrow_x = choice.x() + choice.w() - arrow_width / 2;
+        let arrow_y = choice.y() + choice.h() / 2;
+        draw_polygon(
+            arrow_x - 3,
+            arrow_y - 2,
+            arrow_x + 3,
+            arrow_y - 2,
+            arrow_x,
+            arrow_y + 2,
+        );
+    });
+}
+
+pub fn style_choice(choice: &mut Choice) {
+    style_choice_with_background(choice, input_bg());
+}
+
+pub fn hover_feedback_color(base: Color) -> Color {
+    const HOVER_CHANNEL_DELTA: u8 = 12;
+
+    let (red, green, blue) = base.to_rgb();
+    Color::from_rgb(
+        red.saturating_add(HOVER_CHANNEL_DELTA),
+        green.saturating_add(HOVER_CHANNEL_DELTA),
+        blue.saturating_add(HOVER_CHANNEL_DELTA),
+    )
+}
+
+#[derive(Default)]
+pub struct HoverFeedbackState {
+    base: Option<Color>,
+}
+
+impl HoverFeedbackState {
+    pub fn update<W: WidgetExt>(&mut self, widget: &mut W, event: Event) {
+        match event {
+            Event::Enter | Event::Move if widget.active_r() => {
+                let current = widget.color();
+                let base = self
+                    .base
+                    .filter(|base| current == hover_feedback_color(*base))
+                    .unwrap_or(current);
+                let hover = hover_feedback_color(base);
+                self.base = Some(base);
+                if current != hover {
+                    widget.set_color(hover);
+                    widget.redraw();
+                }
+            }
+            Event::Enter | Event::Move | Event::Leave | Event::Deactivate | Event::Hide => {
+                if let Some(base) = self.base.take() {
+                    if widget.color() == hover_feedback_color(base) {
+                        widget.set_color(base);
+                        widget.redraw();
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+fn install_hover_feedback<W: WidgetBase>(widget: &mut W) {
+    let mut state = HoverFeedbackState::default();
+    widget.handle(move |widget, event| {
+        state.update(widget, event);
+        false
+    });
+}
+
+pub fn install_button_hover<W: WidgetBase>(widget: &mut W) {
+    install_hover_feedback(widget);
+}
+
+pub fn install_choice_hover<W: WidgetBase>(widget: &mut W) {
+    install_hover_feedback(widget);
 }
 
 pub fn status_bar_default() -> Color {
@@ -239,6 +381,27 @@ mod tests {
     #[test]
     fn dark_button_color_matches_input_background() {
         assert_eq!(button_dark().to_rgb(), (46, 46, 46));
+    }
+
+    #[test]
+    fn text_input_frame_aligns_with_choice_text_padding() {
+        assert_eq!(
+            INPUT_FRAME_LEFT_INSET + INPUT_NATIVE_TEXT_LEFT_OFFSET,
+            CHOICE_TEXT_LEFT_PADDING
+        );
+        assert_eq!(
+            INPUT_FRAME_WIDTH_INSET - INPUT_FRAME_LEFT_INSET,
+            INPUT_TEXT_RIGHT_PADDING
+        );
+    }
+
+    #[test]
+    fn hover_feedback_color_brightens_each_channel() {
+        assert_eq!(hover_feedback_color(button_subtle()).to_rgb(), (64, 64, 64));
+        assert_eq!(
+            hover_feedback_color(Color::from_rgb(250, 1, 100)).to_rgb(),
+            (255, 13, 112)
+        );
     }
 
     #[test]

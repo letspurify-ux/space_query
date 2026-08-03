@@ -56,10 +56,10 @@ impl LogViewerDialog {
         filter_row.fixed(&filter_label, 80);
 
         let mut level_choice = Choice::default();
-        level_choice.set_color(theme::input_bg());
-        level_choice.set_text_color(theme::text_primary());
         level_choice.add_choice("All|Error|Warning|Info|Debug");
         level_choice.set_value(0);
+        theme::style_choice(&mut level_choice);
+        theme::install_choice_hover(&mut level_choice);
         filter_row.fixed(&level_choice, 120);
 
         let mut count_label = fltk::frame::Frame::default();
@@ -128,6 +128,7 @@ impl LogViewerDialog {
         export_btn.set_color(theme::button_dark());
         export_btn.set_label_color(theme::text_primary());
         export_btn.set_frame(FrameType::RFlatBox);
+        theme::install_button_hover(&mut export_btn);
 
         let mut clear_btn = Button::default()
             .with_size(BUTTON_WIDTH_LARGE, BUTTON_HEIGHT)
@@ -135,6 +136,7 @@ impl LogViewerDialog {
         clear_btn.set_color(theme::button_dark());
         clear_btn.set_label_color(theme::text_primary());
         clear_btn.set_frame(FrameType::RFlatBox);
+        theme::install_button_hover(&mut clear_btn);
 
         let mut close_btn = Button::default()
             .with_size(BUTTON_WIDTH, BUTTON_HEIGHT)
@@ -142,6 +144,7 @@ impl LogViewerDialog {
         close_btn.set_color(theme::button_dark());
         close_btn.set_label_color(theme::text_primary());
         close_btn.set_frame(FrameType::RFlatBox);
+        theme::install_button_hover(&mut close_btn);
 
         button_flex.fixed(&export_btn, BUTTON_WIDTH_LARGE);
         button_flex.fixed(&clear_btn, BUTTON_WIDTH_LARGE);

@@ -208,6 +208,7 @@ fn choice2_on_main_with_title(title: &str, txt: &str, b0: &str, b1: &str, b2: &s
         button.set_color(theme::button_dark());
         button.set_label_color(theme::text_primary());
         button.set_frame(FrameType::RFlatBox);
+        theme::install_button_hover(&mut button);
 
         let result_for_button = result.clone();
         let mut dialog_for_button = dialog.clone();
@@ -335,6 +336,7 @@ pub fn input_on_main(txt: &str, deflt: &str) -> Option<String> {
     let mut input = Input::default();
     input.set_color(theme::input_bg());
     input.set_text_color(theme::text_primary());
+    theme::apply_text_input_inset(&mut input);
     input.set_value(deflt);
     input.set_trigger(CallbackTrigger::EnterKeyAlways);
     main_flex.fixed(&input, constants::INPUT_ROW_HEIGHT);
@@ -353,6 +355,7 @@ pub fn input_on_main(txt: &str, deflt: &str) -> Option<String> {
     ok_btn.set_color(theme::button_dark());
     ok_btn.set_label_color(theme::text_primary());
     ok_btn.set_frame(FrameType::RFlatBox);
+    theme::install_button_hover(&mut ok_btn);
 
     let mut cancel_btn = Button::default()
         .with_size(cancel_button_width, constants::BUTTON_HEIGHT)
@@ -360,6 +363,7 @@ pub fn input_on_main(txt: &str, deflt: &str) -> Option<String> {
     cancel_btn.set_color(theme::button_dark());
     cancel_btn.set_label_color(theme::text_primary());
     cancel_btn.set_frame(FrameType::RFlatBox);
+    theme::install_button_hover(&mut cancel_btn);
 
     button_flex.fixed(&ok_btn, ok_button_width);
     button_flex.fixed(&cancel_btn, cancel_button_width);

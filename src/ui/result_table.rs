@@ -977,16 +977,18 @@ impl ResultTableWidget {
             return;
         };
 
-        let input_x = x + 1;
-        let input_y = y + 1;
-        let input_w = (w - 2).max(24);
-        let input_h = (h - 2).max(24);
+        let (input_x, input_y, input_w, input_h) = Self::inline_editor_geometry(x, y, w, h);
         // Clone only the lightweight FLTK widget handle, then drop the lock
         // before calling resize/redraw to minimize lock hold time.
         let mut input = active_editor.input.clone();
         drop(guard);
         input.resize(input_x, input_y, input_w, input_h);
         input.redraw();
+    }
+
+    fn inline_editor_geometry(x: i32, y: i32, w: i32, h: i32) -> (i32, i32, i32, i32) {
+        let input_y = y + safe_div(h.saturating_sub(BUTTON_HEIGHT), 2).max(0);
+        (x + 1, input_y, (w - 2).max(24), BUTTON_HEIGHT)
     }
 
     /// Returns the display column count for `text` using byte-level UTF-8 analysis.
@@ -1061,6 +1063,7 @@ impl ResultTableWidget {
         close_btn.set_color(theme::button_dark());
         close_btn.set_label_color(theme::text_primary());
         close_btn.set_frame(FrameType::RFlatBox);
+        theme::install_button_hover(&mut close_btn);
 
         let mut dialog_for_close = dialog.clone();
         close_btn.set_callback(move |_| {
@@ -3607,15 +3610,13 @@ impl ResultTableWidget {
             Group::set_current(None::<&Group>);
         }
 
-        let input_x = x + 1;
-        let input_y = y + 1;
-        let input_w = (w - 2).max(24);
-        let input_h = (h - 2).max(24);
+        let (input_x, input_y, input_w, input_h) = Self::inline_editor_geometry(x, y, w, h);
         let mut input = Input::new(input_x, input_y, input_w, input_h, None);
         Group::set_current(current_group.as_ref());
 
         input.set_color(theme::input_bg());
         input.set_text_color(theme::text_primary());
+        theme::apply_text_input_inset(&mut input);
         input.set_text_font(font_profile.normal);
         input.set_text_size(font_size as i32);
         input.set_value(current_value);
@@ -13791,6 +13792,18 @@ mod tests {
     use super::*;
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
+
+    #[test]
+    fn inline_editor_keeps_the_shared_control_height() {
+        assert_eq!(
+            ResultTableWidget::inline_editor_geometry(10, 20, 100, 40),
+            (11, 26, 98, BUTTON_HEIGHT)
+        );
+        assert_eq!(
+            ResultTableWidget::inline_editor_geometry(10, 20, 20, BUTTON_HEIGHT),
+            (11, 20, 24, BUTTON_HEIGHT)
+        );
+    }
 
     #[test]
     fn matches_shortcut_key_accepts_current_ascii_key() {

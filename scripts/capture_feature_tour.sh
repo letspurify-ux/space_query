@@ -11,10 +11,15 @@ fi
 
 cargo build --bin capture_feature_tour
 
-capture_home="${TMPDIR:-/tmp}/space-query-feature-tour"
-mkdir -p "$capture_home" docs/images
+capture_root="${TMPDIR:-/tmp}/space-query-feature-tour"
+capture_config_dir="$capture_root/config"
+capture_data_dir="$capture_root/data"
+capture_mode="${1:-readme}"
+mkdir -p "$capture_config_dir" "$capture_data_dir" docs/images
 
-HOME="$capture_home" target/debug/capture_feature_tour "${1:-}"
+SPACE_QUERY_CONFIG_DIR="$capture_config_dir" \
+  SPACE_QUERY_DATA_DIR="$capture_data_dir" \
+  target/debug/capture_feature_tour "$capture_mode"
 
 convert_capture() {
   local source_name="$1"
@@ -23,7 +28,7 @@ convert_capture() {
     --out "docs/images/${output_name}.png" >/dev/null
 }
 
-if [[ "${1:-}" == "object-browser" ]]; then
+if [[ "$capture_mode" == "object-browser" ]]; then
   convert_capture object-browser object-browser
   exit 0
 fi

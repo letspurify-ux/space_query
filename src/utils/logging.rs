@@ -17,6 +17,9 @@ const LOG_WRITER_RESPONSE_TIMEOUT_DEFAULT_SECS: u64 = 15;
 const LOG_WRITER_BATCH_DRAIN_LIMIT: usize = 64;
 
 fn app_data_base_dir() -> Option<PathBuf> {
+    if let Some(path) = std::env::var_os("SPACE_QUERY_DATA_DIR") {
+        return Some(PathBuf::from(path));
+    }
     if let Some(path) = dirs::data_dir() {
         return Some(path);
     }

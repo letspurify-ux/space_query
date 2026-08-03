@@ -3,7 +3,7 @@ use fltk::{
     browser::Browser,
     button::{Button, CheckButton},
     dialog::{FileDialog, FileDialogType},
-    draw::{draw_box, draw_polygon, draw_text2, measure, set_cursor, set_draw_color, set_font},
+    draw::{measure, set_cursor, set_font},
     enums::{Align, Color, Cursor, Event, FrameType},
     frame::Frame,
     group::{Flex, FlexType, Group, Tile},
@@ -18,7 +18,7 @@ use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::panic::{self, AssertUnwindSafe};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::thread;
@@ -69,6 +69,7 @@ const QUERY_TOOLBAR_COMPACT_CHOICE_WIDTH: i32 = 185;
 const QUERY_TOOLBAR_COMPACT_ACCESS_WIDTH: i32 = 105;
 const QUERY_TOOLBAR_COMPACT_NUMERIC_WIDTH: i32 = 48;
 const QUERY_TOOLBAR_COMPACT_SCALE_BUTTON_WIDTH: i32 = 28;
+const TOOLBAR_CONTROL_VERTICAL_MARGIN: i32 = (RESULT_TOOLBAR_HEIGHT - BUTTON_HEIGHT) / 2;
 const UI_SCALE_EPSILON: f32 = 0.01;
 #[cfg(target_os = "macos")]
 const MACOS_FULLSCREEN_EXIT_POLL_SECONDS: f64 = 0.05;
@@ -880,6 +881,23 @@ fn activity_pulse_color(pulse_frame: usize, resting_color: Color, active_color: 
     )
 }
 
+fn query_cancel_activity_color(pulse_frame: usize, active: bool, hovered: bool) -> Color {
+    let base = if active {
+        activity_pulse_color(
+            pulse_frame,
+            theme::button_cancel(),
+            theme::button_cancel_active(),
+        )
+    } else {
+        theme::button_cancel()
+    };
+    if hovered {
+        theme::hover_feedback_color(base)
+    } else {
+        base
+    }
+}
+
 fn latest_status_activity(
     activities: &[crate::db::DbActivitySnapshot],
 ) -> Option<&crate::db::DbActivitySnapshot> {
@@ -1499,6 +1517,7 @@ pub struct AppState {
     result_cancel_btn: Button,
     execute_btn: Button,
     query_cancel_btn: Button,
+    query_cancel_hovered: Arc<AtomicBool>,
     query_cancel_pulse_frame: usize,
     commit_btn: Button,
     rollback_btn: Button,
@@ -1579,34 +1598,39 @@ fn result_page_controls_fit(available_width: i32) -> bool {
     available_width >= RESULT_PAGE_CONTROL_WIDTH
 }
 
-fn result_page_control_feedback_color(event: Event, pointer_inside: bool) -> Option<Color> {
+fn result_page_control_feedback_color(
+    event: Event,
+    pointer_inside: bool,
+    base: Color,
+) -> Option<Color> {
     match event {
-        Event::Enter | Event::Move => Some(theme::border()),
+        Event::Enter | Event::Move => Some(theme::hover_feedback_color(base)),
         Event::Push => Some(theme::selection_soft()),
         Event::Drag => Some(if pointer_inside {
             theme::selection_soft()
         } else {
-            theme::button_subtle()
+            base
         }),
         Event::Released => Some(if pointer_inside {
-            theme::border()
+            theme::hover_feedback_color(base)
         } else {
-            theme::button_subtle()
+            base
         }),
-        Event::Leave | Event::Unfocus => Some(theme::button_subtle()),
+        Event::Leave | Event::Unfocus => Some(base),
         _ => None,
     }
 }
 
 fn install_result_page_control_feedback<W: WidgetBase>(widget: &mut W) {
-    widget.handle(|widget, event| {
+    let base = widget.color();
+    widget.handle(move |widget, event| {
         let event_x = app::event_x();
         let event_y = app::event_y();
         let pointer_inside = event_x >= widget.x()
             && event_x < widget.x() + widget.w()
             && event_y >= widget.y()
             && event_y < widget.y() + widget.h();
-        if let Some(color) = result_page_control_feedback_color(event, pointer_inside) {
+        if let Some(color) = result_page_control_feedback_color(event, pointer_inside, base) {
             if widget.color() != color {
                 widget.set_color(color);
                 widget.redraw();
@@ -3096,17 +3120,18 @@ impl AppState {
         }
         let was_active = self.query_cancel_pulse_frame != 0;
         let is_active = self.has_cancelable_query_activity();
+        let hovered =
+            self.query_cancel_hovered.load(Ordering::Relaxed) && self.query_cancel_btn.active_r();
+        self.query_cancel_btn.set_color(query_cancel_activity_color(
+            self.query_cancel_pulse_frame,
+            is_active,
+            hovered,
+        ));
         if is_active {
-            self.query_cancel_btn.set_color(activity_pulse_color(
-                self.query_cancel_pulse_frame,
-                theme::button_cancel(),
-                theme::button_cancel_active(),
-            ));
             self.query_cancel_pulse_frame = self
                 .query_cancel_pulse_frame
                 .wrapping_add(STATUS_ANIMATION_STEP);
         } else {
-            self.query_cancel_btn.set_color(theme::button_cancel());
             self.query_cancel_pulse_frame = 0;
         }
         self.query_cancel_btn.redraw();
@@ -5634,7 +5659,12 @@ impl MainWindow {
 
         let mut query_toolbar = Flex::default();
         query_toolbar.set_type(FlexType::Row);
-        query_toolbar.set_margin(query_toolbar_margin);
+        query_toolbar.set_margins(
+            query_toolbar_margin,
+            TOOLBAR_CONTROL_VERTICAL_MARGIN,
+            query_toolbar_margin,
+            TOOLBAR_CONTROL_VERTICAL_MARGIN,
+        );
         query_toolbar.set_spacing(query_toolbar_spacing);
 
         let mut execute_btn = Button::default()
@@ -5643,14 +5673,31 @@ impl MainWindow {
         execute_btn.set_color(theme::selection_soft());
         execute_btn.set_label_color(theme::text_primary());
         execute_btn.set_frame(FrameType::RFlatBox);
+        theme::install_button_hover(&mut execute_btn);
         query_toolbar.fixed(&execute_btn, query_toolbar_button_width);
 
         let mut cancel_btn = Button::default()
             .with_size(BUTTON_WIDTH, BUTTON_HEIGHT)
             .with_label("Cancel");
+        cancel_btn.set_id("query_cancel");
         cancel_btn.set_color(theme::button_cancel());
         cancel_btn.set_label_color(theme::text_primary());
         cancel_btn.set_frame(FrameType::RFlatBox);
+        let query_cancel_hovered = Arc::new(AtomicBool::new(false));
+        let query_cancel_hovered_for_handle = Arc::clone(&query_cancel_hovered);
+        cancel_btn.handle(move |button, event| {
+            let hovered = match event {
+                Event::Enter | Event::Move if button.active_r() => Some(true),
+                Event::Enter | Event::Move | Event::Leave | Event::Deactivate | Event::Hide => {
+                    Some(false)
+                }
+                _ => None,
+            };
+            if let Some(hovered) = hovered {
+                query_cancel_hovered_for_handle.store(hovered, Ordering::Relaxed);
+            }
+            false
+        });
         query_toolbar.fixed(&cancel_btn, query_toolbar_button_width);
 
         let mut commit_btn = Button::default()
@@ -5659,6 +5706,7 @@ impl MainWindow {
         commit_btn.set_color(theme::button_success());
         commit_btn.set_label_color(theme::text_primary());
         commit_btn.set_frame(FrameType::RFlatBox);
+        theme::install_button_hover(&mut commit_btn);
         query_toolbar.fixed(&commit_btn, query_toolbar_button_width);
 
         let mut rollback_btn = Button::default()
@@ -5667,6 +5715,7 @@ impl MainWindow {
         rollback_btn.set_color(theme::button_danger());
         rollback_btn.set_label_color(theme::text_primary());
         rollback_btn.set_frame(FrameType::RFlatBox);
+        theme::install_button_hover(&mut rollback_btn);
         query_toolbar.fixed(&rollback_btn, query_toolbar_button_width);
 
         let initial_db_type = DatabaseType::default();
@@ -5677,18 +5726,20 @@ impl MainWindow {
             TransactionIsolation::Default,
         ));
         transaction_isolation_choice.set_value(0);
-        transaction_isolation_choice.set_color(theme::input_bg());
-        transaction_isolation_choice.set_text_color(theme::text_primary());
+        transaction_isolation_choice.set_id("query_transaction_isolation");
+        theme::style_choice(&mut transaction_isolation_choice);
         transaction_isolation_choice.set_tooltip("Transaction isolation for new executions");
+        theme::install_choice_hover(&mut transaction_isolation_choice);
         query_toolbar.fixed(&transaction_isolation_choice, query_toolbar_isolation_width);
 
         let mut transaction_access_choice =
             Choice::default().with_size(TRANSACTION_ACCESS_CHOICE_WIDTH, BUTTON_HEIGHT);
         transaction_access_choice.add_choice("Read write|Read only");
         transaction_access_choice.set_value(0);
-        transaction_access_choice.set_color(theme::input_bg());
-        transaction_access_choice.set_text_color(theme::text_primary());
+        transaction_access_choice.set_id("query_transaction_access");
+        theme::style_choice(&mut transaction_access_choice);
         transaction_access_choice.set_tooltip("Transaction access mode for new executions");
+        theme::install_choice_hover(&mut transaction_access_choice);
         query_toolbar.fixed(&transaction_access_choice, query_toolbar_access_width);
 
         let toolbar_spacer = Frame::default();
@@ -5705,6 +5756,7 @@ impl MainWindow {
         let mut timeout_input = IntInput::default().with_size(NUMERIC_INPUT_WIDTH, BUTTON_HEIGHT);
         timeout_input.set_color(theme::input_bg());
         timeout_input.set_text_color(theme::text_primary());
+        theme::apply_text_input_inset(&mut timeout_input);
         timeout_input.set_tooltip("Call timeout in seconds (empty = no timeout)");
         timeout_input.set_value("60");
         query_toolbar.fixed(&timeout_input, query_toolbar_timeout_width);
@@ -5716,6 +5768,7 @@ impl MainWindow {
         zoom_out_btn.set_label_color(theme::text_primary());
         zoom_out_btn.set_frame(FrameType::RFlatBox);
         zoom_out_btn.set_tooltip("Zoom out (Ctrl/Cmd+-)");
+        theme::install_button_hover(&mut zoom_out_btn);
         query_toolbar.fixed(&zoom_out_btn, query_toolbar_scale_button_width);
 
         let mut zoom_in_btn = Button::default()
@@ -5725,6 +5778,7 @@ impl MainWindow {
         zoom_in_btn.set_label_color(theme::text_primary());
         zoom_in_btn.set_frame(FrameType::RFlatBox);
         zoom_in_btn.set_tooltip("Zoom in (Ctrl/Cmd++)");
+        theme::install_button_hover(&mut zoom_in_btn);
         query_toolbar.fixed(&zoom_in_btn, query_toolbar_scale_button_width);
 
         query_toolbar.end();
@@ -5743,7 +5797,13 @@ impl MainWindow {
                 return false;
             }
             let compact = toolbar.w() < QUERY_TOOLBAR_COMPACT_BREAKPOINT;
-            toolbar.set_margin(if compact { 4 } else { TOOLBAR_SPACING });
+            let horizontal_margin = if compact { 4 } else { TOOLBAR_SPACING };
+            toolbar.set_margins(
+                horizontal_margin,
+                TOOLBAR_CONTROL_VERTICAL_MARGIN,
+                horizontal_margin,
+                TOOLBAR_CONTROL_VERTICAL_MARGIN,
+            );
             toolbar.set_spacing(if compact { 4 } else { TOOLBAR_SPACING });
             let button_width = if compact {
                 BUTTON_WIDTH_SMALL
@@ -5808,6 +5868,7 @@ impl MainWindow {
 
         let splitter_width = MAIN_SPLITTER_WIDTH;
         let mut split_bar = Frame::default().with_size(splitter_width, 0);
+        split_bar.set_id("main_vertical_splitter");
         split_bar.set_frame(FrameType::FlatBox);
         split_bar.set_color(theme::border());
         split_bar.set_tooltip("Drag to resize panels");
@@ -5816,52 +5877,58 @@ impl MainWindow {
         let mut content_flex_for_split = content_flex.clone();
         let obj_browser_for_split = obj_browser_widget.clone();
         let drag_state_for_split = drag_state;
-        split_bar.handle(move |_bar, ev| match ev {
-            fltk::enums::Event::Enter | fltk::enums::Event::Move => {
-                set_cursor(Cursor::WE);
-                true
-            }
-            fltk::enums::Event::Push => {
-                *drag_state_for_split
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner()) =
-                    Some((app::event_x(), obj_browser_for_split.w()));
-                true
-            }
-            fltk::enums::Event::Drag => {
-                if let Some((start_x, start_w)) = *drag_state_for_split
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner())
-                {
-                    let delta = app::event_x() - start_x;
-                    let min_left = 180;
-                    let min_right = 320;
-                    let max_left =
-                        (content_flex_for_split.w() - splitter_width - min_right).max(min_left);
-                    let mut new_width = start_w + delta;
-                    if new_width < min_left {
-                        new_width = min_left;
-                    } else if new_width > max_left {
-                        new_width = max_left;
-                    }
-                    content_flex_for_split.fixed(&obj_browser_for_split, new_width);
-                    content_flex_for_split.layout();
-                    app::redraw();
+        let mut split_hover = theme::HoverFeedbackState::default();
+        split_bar.handle(move |bar, ev| {
+            split_hover.update(bar, ev);
+            match ev {
+                fltk::enums::Event::Enter | fltk::enums::Event::Move => {
+                    set_cursor(Cursor::WE);
+                    true
                 }
-                true
+                fltk::enums::Event::Push => {
+                    *drag_state_for_split
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner()) =
+                        Some((app::event_x(), obj_browser_for_split.w()));
+                    true
+                }
+                fltk::enums::Event::Drag => {
+                    if let Some((start_x, start_w)) = *drag_state_for_split
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    {
+                        let delta = app::event_x() - start_x;
+                        let min_left = 180;
+                        let min_right = 320;
+                        let max_left =
+                            (content_flex_for_split.w() - splitter_width - min_right).max(min_left);
+                        let mut new_width = start_w + delta;
+                        if new_width < min_left {
+                            new_width = min_left;
+                        } else if new_width > max_left {
+                            new_width = max_left;
+                        }
+                        content_flex_for_split.fixed(&obj_browser_for_split, new_width);
+                        content_flex_for_split.layout();
+                        app::redraw();
+                    }
+                    true
+                }
+                fltk::enums::Event::Released => {
+                    *drag_state_for_split
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+                    set_cursor(Cursor::WE);
+                    true
+                }
+                fltk::enums::Event::Leave
+                | fltk::enums::Event::Deactivate
+                | fltk::enums::Event::Hide => {
+                    set_cursor(Cursor::Default);
+                    true
+                }
+                _ => false,
             }
-            fltk::enums::Event::Released => {
-                *drag_state_for_split
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
-                set_cursor(Cursor::WE);
-                true
-            }
-            fltk::enums::Event::Leave => {
-                set_cursor(Cursor::Default);
-                true
-            }
-            _ => false,
         });
         content_flex.fixed(&split_bar, splitter_width);
 
@@ -5920,7 +5987,12 @@ impl MainWindow {
 
         let mut result_toolbar = Flex::default();
         result_toolbar.set_type(FlexType::Row);
-        result_toolbar.set_margin(TOOLBAR_SPACING);
+        result_toolbar.set_margins(
+            TOOLBAR_SPACING,
+            TOOLBAR_CONTROL_VERTICAL_MARGIN,
+            TOOLBAR_SPACING,
+            TOOLBAR_CONTROL_VERTICAL_MARGIN,
+        );
         result_toolbar.set_spacing(TOOLBAR_SPACING);
 
         let mut clear_all_btn = Button::default()
@@ -5931,6 +6003,7 @@ impl MainWindow {
         clear_all_btn.set_label_color(theme::text_secondary());
         clear_all_btn.set_frame(FrameType::RFlatBox);
         clear_all_btn.set_tooltip("Clear all result grids, output, messages, and plans");
+        theme::install_button_hover(&mut clear_all_btn);
         result_toolbar.fixed(&clear_all_btn, BUTTON_WIDTH_LARGE);
 
         let mut page_control = Flex::default().with_size(RESULT_PAGE_CONTROL_WIDTH, BUTTON_HEIGHT);
@@ -5957,46 +6030,7 @@ impl MainWindow {
         page_unit_choice.set_id("result_page_unit");
         page_unit_choice.add_choice("10|100|250|500|1000");
         page_unit_choice.set_value(RESULT_PAGE_DEFAULT_UNIT_INDEX as i32);
-        page_unit_choice.set_color(theme::button_subtle());
-        page_unit_choice.set_text_color(theme::text_primary());
-        page_unit_choice.set_selection_color(theme::selection_soft());
-        page_unit_choice.set_frame(FrameType::RFlatBox);
-        page_unit_choice.draw(|choice| {
-            const ARROW_WIDTH: i32 = 20;
-
-            draw_box(
-                choice.frame(),
-                choice.x(),
-                choice.y(),
-                choice.w(),
-                choice.h(),
-                choice.color(),
-            );
-            let arrow_width = ARROW_WIDTH.min(choice.w().max(0));
-            set_font(choice.text_font(), choice.text_size());
-            set_draw_color(choice.text_color());
-            if let Some(value) = choice.choice() {
-                draw_text2(
-                    &value,
-                    choice.x(),
-                    choice.y(),
-                    choice.w().saturating_sub(arrow_width),
-                    choice.h(),
-                    Align::Center,
-                );
-            }
-
-            let arrow_x = choice.x() + choice.w() - arrow_width / 2;
-            let arrow_y = choice.y() + choice.h() / 2;
-            draw_polygon(
-                arrow_x - 3,
-                arrow_y - 2,
-                arrow_x + 3,
-                arrow_y - 2,
-                arrow_x,
-                arrow_y + 2,
-            );
-        });
+        theme::style_choice(&mut page_unit_choice);
         page_unit_choice.set_tooltip("Rows per page for the previous and next buttons");
         page_control.fixed(&page_unit_choice, RESULT_PAGE_UNIT_WIDTH);
 
@@ -6066,6 +6100,7 @@ impl MainWindow {
         one_tab_per_query_check.set_tooltip(
             "Unchecked: clear existing result tabs before each execution. Checked: append result tabs.",
         );
+        theme::install_button_hover(&mut one_tab_per_query_check);
         result_toolbar.fixed(
             &one_tab_per_query_check,
             result_toolbar_checkbox_width(&one_tab_per_query_check, BUTTON_WIDTH_LARGE + 45),
@@ -6081,6 +6116,7 @@ impl MainWindow {
         edit_mode_check.set_id("result_edit_mode");
         edit_mode_check.set_color(theme::button_secondary());
         edit_mode_check.set_tooltip("Enable staged edit mode for the current result tab");
+        theme::install_button_hover(&mut edit_mode_check);
         edit_mode_check.hide();
         result_toolbar.fixed(&edit_mode_check, 0);
 
@@ -6092,6 +6128,7 @@ impl MainWindow {
         edit_insert_btn.set_label_color(theme::text_primary());
         edit_insert_btn.set_frame(FrameType::RFlatBox);
         edit_insert_btn.set_tooltip("Add a staged row (DB is not changed until Save)");
+        theme::install_button_hover(&mut edit_insert_btn);
         result_toolbar.fixed(&edit_insert_btn, BUTTON_WIDTH_SMALL);
 
         let mut edit_delete_btn = Button::default()
@@ -6102,6 +6139,7 @@ impl MainWindow {
         edit_delete_btn.set_label_color(theme::text_primary());
         edit_delete_btn.set_frame(FrameType::RFlatBox);
         edit_delete_btn.set_tooltip("Delete selected row(s) in staged edit mode");
+        theme::install_button_hover(&mut edit_delete_btn);
         result_toolbar.fixed(&edit_delete_btn, BUTTON_WIDTH_SMALL);
 
         let mut edit_save_btn = Button::default()
@@ -6112,6 +6150,7 @@ impl MainWindow {
         edit_save_btn.set_label_color(theme::text_primary());
         edit_save_btn.set_frame(FrameType::RFlatBox);
         edit_save_btn.set_tooltip("Apply staged edits to DB");
+        theme::install_button_hover(&mut edit_save_btn);
         result_toolbar.fixed(&edit_save_btn, BUTTON_WIDTH_SMALL);
 
         let mut edit_cancel_btn = Button::default()
@@ -6122,6 +6161,7 @@ impl MainWindow {
         edit_cancel_btn.set_label_color(theme::text_primary());
         edit_cancel_btn.set_frame(FrameType::RFlatBox);
         edit_cancel_btn.set_tooltip("Discard staged edits and restore rows");
+        theme::install_button_hover(&mut edit_cancel_btn);
         edit_insert_btn.hide();
         edit_delete_btn.hide();
         edit_save_btn.hide();
@@ -6138,6 +6178,7 @@ impl MainWindow {
         result_bottom_group.end();
 
         let mut query_split_bar = Frame::default().with_size(tile_w, QUERY_SPLIT_BAR_HEIGHT);
+        query_split_bar.set_id("query_result_splitter");
         query_split_bar.set_frame(FrameType::FlatBox);
         query_split_bar.set_color(theme::border());
         query_split_bar.set_tooltip("Drag to resize query and result panes");
@@ -6147,6 +6188,16 @@ impl MainWindow {
             tile_w,
             QUERY_SPLIT_BAR_HEIGHT,
         );
+        let mut query_split_hover = theme::HoverFeedbackState::default();
+        query_split_bar.handle(move |bar, event| {
+            query_split_hover.update(bar, event);
+            match event {
+                Event::Enter | Event::Move => set_cursor(Cursor::NS),
+                Event::Leave | Event::Deactivate | Event::Hide => set_cursor(Cursor::Default),
+                _ => {}
+            }
+            false
+        });
 
         right_tile.end();
 
@@ -6325,6 +6376,7 @@ impl MainWindow {
             result_cancel_btn: edit_cancel_btn.clone(),
             execute_btn: execute_btn.clone(),
             query_cancel_btn: cancel_btn.clone(),
+            query_cancel_hovered,
             query_cancel_pulse_frame: 0,
             commit_btn: commit_btn.clone(),
             rollback_btn: rollback_btn.clone(),
@@ -12713,6 +12765,15 @@ mod tests {
             .to_rgb(),
             theme::button_cancel_active().to_rgb()
         );
+        assert_eq!(
+            query_cancel_activity_color(one_way_frames * STATUS_ANIMATION_STEP, true, true)
+                .to_rgb(),
+            theme::hover_feedback_color(theme::button_cancel_active()).to_rgb()
+        );
+        assert_eq!(
+            query_cancel_activity_color(0, false, true).to_rgb(),
+            theme::hover_feedback_color(theme::button_cancel()).to_rgb()
+        );
     }
 
     #[test]
@@ -13296,28 +13357,29 @@ mod tests {
 
     #[test]
     fn result_page_control_feedback_distinguishes_hover_press_and_exit() {
+        let base = theme::input_bg();
         assert_eq!(
-            result_page_control_feedback_color(Event::Enter, true),
-            Some(theme::border())
+            result_page_control_feedback_color(Event::Enter, true, base),
+            Some(theme::hover_feedback_color(base))
         );
         assert_eq!(
-            result_page_control_feedback_color(Event::Push, true),
+            result_page_control_feedback_color(Event::Push, true, base),
             Some(theme::selection_soft())
         );
         assert_eq!(
-            result_page_control_feedback_color(Event::Drag, false),
-            Some(theme::button_subtle())
+            result_page_control_feedback_color(Event::Drag, false, base),
+            Some(base)
         );
         assert_eq!(
-            result_page_control_feedback_color(Event::Released, true),
-            Some(theme::border())
+            result_page_control_feedback_color(Event::Released, true, base),
+            Some(theme::hover_feedback_color(base))
         );
         assert_eq!(
-            result_page_control_feedback_color(Event::Leave, false),
-            Some(theme::button_subtle())
+            result_page_control_feedback_color(Event::Leave, false, base),
+            Some(base)
         );
         assert_eq!(
-            result_page_control_feedback_color(Event::KeyDown, true),
+            result_page_control_feedback_color(Event::KeyDown, true, base),
             None
         );
     }

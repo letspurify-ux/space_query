@@ -595,8 +595,7 @@ impl ObjectBrowserWidget {
         scope_row.fixed(&scope_label, 0);
 
         let mut scope_choice = Choice::default();
-        scope_choice.set_color(theme::input_bg());
-        scope_choice.set_text_color(theme::text_primary());
+        theme::style_choice(&mut scope_choice);
         scope_choice.deactivate();
         scope_row.resizable(&scope_choice);
         scope_row.end();
@@ -610,6 +609,7 @@ impl ObjectBrowserWidget {
         let mut filter_input = Input::default();
         filter_input.set_color(theme::input_bg());
         filter_input.set_text_color(theme::text_primary());
+        theme::apply_text_input_inset(&mut filter_input);
         filter_input.set_tooltip("Type to filter objects...");
         filter_row.resizable(&filter_input);
         filter_row.end();
@@ -955,27 +955,31 @@ impl ObjectBrowserWidget {
     fn setup_scope_choice_popup_handler(&mut self) {
         let scope_choice_menu_busy = self.scope_choice_menu_busy.clone();
         let active_scope_selector_popup = self.active_scope_selector_popup.clone();
+        let mut hover_feedback = theme::HoverFeedbackState::default();
 
         self.scope_choice.super_handle_first(false);
-        self.scope_choice.handle(move |choice, event| match event {
-            Event::Push if choice.active() => {
-                Self::show_scope_selector_popup(
-                    choice,
-                    &scope_choice_menu_busy,
-                    &active_scope_selector_popup,
-                );
-                true
+        self.scope_choice.handle(move |choice, event| {
+            hover_feedback.update(choice, event);
+            match event {
+                Event::Push if choice.active() => {
+                    Self::show_scope_selector_popup(
+                        choice,
+                        &scope_choice_menu_busy,
+                        &active_scope_selector_popup,
+                    );
+                    true
+                }
+                Event::KeyDown if choice.active() && Self::is_plain_space_key_event() => {
+                    Self::show_scope_selector_popup(
+                        choice,
+                        &scope_choice_menu_busy,
+                        &active_scope_selector_popup,
+                    );
+                    true
+                }
+                Event::Shortcut if choice.active() && Self::is_plain_space_key_event() => true,
+                _ => false,
             }
-            Event::KeyDown if choice.active() && Self::is_plain_space_key_event() => {
-                Self::show_scope_selector_popup(
-                    choice,
-                    &scope_choice_menu_busy,
-                    &active_scope_selector_popup,
-                );
-                true
-            }
-            Event::Shortcut if choice.active() && Self::is_plain_space_key_event() => true,
-            _ => false,
         });
     }
 
@@ -7743,10 +7747,10 @@ impl MultiObjectBrowserWidget {
         let left_margin = Frame::default();
         connection_row.fixed(&left_margin, TOOLBAR_SPACING);
         let mut connection_choice = Choice::default();
-        connection_choice.set_color(theme::input_bg());
-        connection_choice.set_text_color(theme::text_primary());
+        theme::style_choice(&mut connection_choice);
         connection_choice
             .set_tooltip("Object Browser connection. Changing this does not rebind the query tab.");
+        theme::install_choice_hover(&mut connection_choice);
         connection_choice.deactivate();
         connection_row.resizable(&connection_choice);
         let right_margin = Frame::default();

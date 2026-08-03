@@ -324,6 +324,7 @@ pub fn show_settings_dialog(config: &AppConfig) -> Option<FontSettings> {
     let mut search_input = Input::default();
     search_input.set_color(theme::input_bg());
     search_input.set_text_color(theme::text_primary());
+    theme::apply_text_input_inset(&mut search_input);
     search_input.set_trigger(CallbackTrigger::Changed);
     search_row.fixed(&search_label, FORM_LABEL_WIDTH);
     search_row.end();
@@ -364,6 +365,7 @@ pub fn show_settings_dialog(config: &AppConfig) -> Option<FontSettings> {
     editor_size_input.set_value(&config.normalized_editor_font_size().to_string());
     editor_size_input.set_color(theme::input_bg());
     editor_size_input.set_text_color(theme::text_primary());
+    theme::apply_text_input_inset(&mut editor_size_input);
     editor_size_row.end();
     font_flex.fixed(&editor_size_row, INPUT_ROW_HEIGHT);
 
@@ -377,6 +379,7 @@ pub fn show_settings_dialog(config: &AppConfig) -> Option<FontSettings> {
     result_size_input.set_value(&config.normalized_result_font_size().to_string());
     result_size_input.set_color(theme::input_bg());
     result_size_input.set_text_color(theme::text_primary());
+    theme::apply_text_input_inset(&mut result_size_input);
     result_size_row.end();
     font_flex.fixed(&result_size_row, INPUT_ROW_HEIGHT);
 
@@ -390,6 +393,7 @@ pub fn show_settings_dialog(config: &AppConfig) -> Option<FontSettings> {
     global_size_input.set_value(&config.normalized_ui_font_size().to_string());
     global_size_input.set_color(theme::input_bg());
     global_size_input.set_text_color(theme::text_primary());
+    theme::apply_text_input_inset(&mut global_size_input);
     global_size_row.end();
     font_flex.fixed(&global_size_row, INPUT_ROW_HEIGHT);
 
@@ -403,6 +407,7 @@ pub fn show_settings_dialog(config: &AppConfig) -> Option<FontSettings> {
     ui_scale_input.set_value(&config.normalized_ui_scale_percent().to_string());
     ui_scale_input.set_color(theme::input_bg());
     ui_scale_input.set_text_color(theme::text_primary());
+    theme::apply_text_input_inset(&mut ui_scale_input);
     ui_scale_input.set_tooltip("Application screen scale percentage");
     let mut ui_scale_unit = Frame::default().with_label("%");
     ui_scale_unit.set_label_color(theme::text_secondary());
@@ -452,6 +457,7 @@ pub fn show_settings_dialog(config: &AppConfig) -> Option<FontSettings> {
     result_cell_max_input.set_value(&config.result_cell_max_chars.to_string());
     result_cell_max_input.set_color(theme::input_bg());
     result_cell_max_input.set_text_color(theme::text_primary());
+    theme::apply_text_input_inset(&mut result_cell_max_input);
     result_cell_max_row.end();
     result_flex.fixed(&result_cell_max_row, INPUT_ROW_HEIGHT);
 
@@ -465,6 +471,7 @@ pub fn show_settings_dialog(config: &AppConfig) -> Option<FontSettings> {
     lazy_fetch_batch_input.set_value(&config.normalized_lazy_fetch_batch_size().to_string());
     lazy_fetch_batch_input.set_color(theme::input_bg());
     lazy_fetch_batch_input.set_text_color(theme::text_primary());
+    theme::apply_text_input_inset(&mut lazy_fetch_batch_input);
     lazy_fetch_batch_row.end();
     result_flex.fixed(&lazy_fetch_batch_row, INPUT_ROW_HEIGHT);
 
@@ -518,6 +525,7 @@ pub fn show_settings_dialog(config: &AppConfig) -> Option<FontSettings> {
     );
     context_window_input.set_color(theme::input_bg());
     context_window_input.set_text_color(theme::text_primary());
+    theme::apply_text_input_inset(&mut context_window_input);
     context_window_row.end();
     intellisense_flex.fixed(&context_window_row, INPUT_ROW_HEIGHT);
 
@@ -531,6 +539,7 @@ pub fn show_settings_dialog(config: &AppConfig) -> Option<FontSettings> {
     popup_delay_input.set_value(&config.normalized_intellisense_popup_delay_ms().to_string());
     popup_delay_input.set_color(theme::input_bg());
     popup_delay_input.set_text_color(theme::text_primary());
+    theme::apply_text_input_inset(&mut popup_delay_input);
     popup_delay_row.end();
     intellisense_flex.fixed(&popup_delay_row, INPUT_ROW_HEIGHT);
 
@@ -580,6 +589,7 @@ pub fn show_settings_dialog(config: &AppConfig) -> Option<FontSettings> {
     pool_size_input.set_value(&config.normalized_connection_pool_size().to_string());
     pool_size_input.set_color(theme::input_bg());
     pool_size_input.set_text_color(theme::text_primary());
+    theme::apply_text_input_inset(&mut pool_size_input);
     pool_size_row.end();
     connection_flex.fixed(&pool_size_row, INPUT_ROW_HEIGHT);
 
@@ -593,6 +603,7 @@ pub fn show_settings_dialog(config: &AppConfig) -> Option<FontSettings> {
     connect_timeout_input.set_value(&config.normalized_connect_timeout_seconds().to_string());
     connect_timeout_input.set_color(theme::input_bg());
     connect_timeout_input.set_text_color(theme::text_primary());
+    theme::apply_text_input_inset(&mut connect_timeout_input);
     connect_timeout_row.end();
     connection_flex.fixed(&connect_timeout_row, INPUT_ROW_HEIGHT);
 
@@ -606,6 +617,7 @@ pub fn show_settings_dialog(config: &AppConfig) -> Option<FontSettings> {
     cancel_timeout_input.set_value(&config.normalized_cancel_timeout_seconds().to_string());
     cancel_timeout_input.set_color(theme::input_bg());
     cancel_timeout_input.set_text_color(theme::text_primary());
+    theme::apply_text_input_inset(&mut cancel_timeout_input);
     cancel_timeout_row.end();
     connection_flex.fixed(&cancel_timeout_row, INPUT_ROW_HEIGHT);
 
@@ -665,8 +677,8 @@ pub fn show_settings_dialog(config: &AppConfig) -> Option<FontSettings> {
         SqlCommaListLayout::Stacked => 0,
         SqlCommaListLayout::Wrapped => 1,
     });
-    comma_layout_choice.set_color(theme::input_bg());
-    comma_layout_choice.set_text_color(theme::text_primary());
+    theme::style_choice(&mut comma_layout_choice);
+    theme::install_choice_hover(&mut comma_layout_choice);
     comma_layout_row.end();
     formatting_flex.fixed(&comma_layout_row, INPUT_ROW_HEIGHT);
 
@@ -680,6 +692,7 @@ pub fn show_settings_dialog(config: &AppConfig) -> Option<FontSettings> {
     right_margin_input.set_value(&config.normalized_sql_format_right_margin().to_string());
     right_margin_input.set_color(theme::input_bg());
     right_margin_input.set_text_color(theme::text_primary());
+    theme::apply_text_input_inset(&mut right_margin_input);
     if config.sql_comma_list_layout == SqlCommaListLayout::Stacked {
         right_margin_input.deactivate();
     }
@@ -718,12 +731,14 @@ pub fn show_settings_dialog(config: &AppConfig) -> Option<FontSettings> {
     cancel_btn.set_color(theme::button_dark());
     cancel_btn.set_label_color(theme::text_primary());
     cancel_btn.set_frame(FrameType::RFlatBox);
+    theme::install_button_hover(&mut cancel_btn);
     let mut ok_btn = Button::default()
         .with_size(BUTTON_WIDTH, BUTTON_HEIGHT)
         .with_label("Save");
     ok_btn.set_color(theme::selection_soft());
     ok_btn.set_label_color(theme::text_primary());
     ok_btn.set_frame(FrameType::RFlatBox);
+    theme::install_button_hover(&mut ok_btn);
     button_row.fixed(&cancel_btn, BUTTON_WIDTH);
     button_row.fixed(&ok_btn, BUTTON_WIDTH);
     button_row.end();

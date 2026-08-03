@@ -84,6 +84,12 @@ pub struct AppConfig {
 }
 
 impl AppConfig {
+    fn config_base_dir() -> Option<PathBuf> {
+        std::env::var_os("SPACE_QUERY_CONFIG_DIR")
+            .map(PathBuf::from)
+            .or_else(dirs::config_dir)
+    }
+
     fn app_file_path(base: Option<PathBuf>, app_dir: &str, file_name: &str) -> Option<PathBuf> {
         base.map(|mut path| {
             path.push(app_dir);
@@ -236,11 +242,11 @@ impl AppConfig {
     }
 
     pub fn config_path() -> Option<PathBuf> {
-        Self::app_file_path(dirs::config_dir(), APP_DIR_NAME, "config.json")
+        Self::app_file_path(Self::config_base_dir(), APP_DIR_NAME, "config.json")
     }
 
     fn legacy_config_path() -> Option<PathBuf> {
-        Self::app_file_path(dirs::config_dir(), LEGACY_APP_DIR_NAME, "config.json")
+        Self::app_file_path(Self::config_base_dir(), LEGACY_APP_DIR_NAME, "config.json")
     }
 
     pub fn load() -> Self {

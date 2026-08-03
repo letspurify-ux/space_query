@@ -10,9 +10,9 @@ use fltk::{
 use space_query::{
     db::{ColumnInfo, QueryResult},
     ui::{
-        apply_global_default_font, log_viewer::LogViewerDialog, profile_by_name,
-        show_settings_dialog, theme, ConnectionDialog, IntellisensePopup, MainWindow,
-        QueryHistoryDialog, SignatureLabel, SignatureOverload, SignaturePopup,
+        apply_global_default_font, constants::BUTTON_HEIGHT, log_viewer::LogViewerDialog,
+        profile_by_name, show_settings_dialog, theme, ConnectionDialog, IntellisensePopup,
+        MainWindow, QueryHistoryDialog, SignatureLabel, SignatureOverload, SignaturePopup,
     },
     utils::{arithmetic::safe_div, logging, AppConfig},
 };
@@ -134,9 +134,50 @@ fn window_by_label(label: &str) -> Option<Window> {
     None
 }
 
+fn verify_control_heights(group: fltk::group::Group, context: &str) {
+    fn verify<W: WidgetExt>(widget: &W, kind: &str, context: &str) {
+        if widget.w() > 0 && widget.h() > 0 && widget.h() != BUTTON_HEIGHT {
+            fail(format!(
+                "{context} {kind} {:?} has height {}, expected {BUTTON_HEIGHT}",
+                widget.label(),
+                widget.h()
+            ));
+        }
+    }
+
+    for child in group.into_iter() {
+        if let Some(choice) = fltk::misc::InputChoice::from_dyn_widget(&child) {
+            verify(&choice, "input choice", context);
+            verify(&choice.input(), "input choice text field", context);
+            verify(&choice.menu_button(), "input choice menu button", context);
+        } else if let Some(check) = fltk::button::CheckButton::from_dyn_widget(&child) {
+            verify(&check, "checkbox", context);
+        } else if let Some(button) = fltk::button::Button::from_dyn_widget(&child) {
+            verify(&button, "button", context);
+        } else if let Some(choice) = fltk::menu::Choice::from_dyn_widget(&child) {
+            verify(&choice, "choice", context);
+        } else if let Some(input) = fltk::input::SecretInput::from_dyn_widget(&child) {
+            verify(&input, "secret input", context);
+        } else if let Some(input) = fltk::input::IntInput::from_dyn_widget(&child) {
+            verify(&input, "integer input", context);
+        } else if let Some(input) = fltk::input::Input::from_dyn_widget(&child) {
+            verify(&input, "input", context);
+        } else if let Some(button) = fltk::menu::MenuButton::from_dyn_widget(&child) {
+            verify(&button, "menu button", context);
+        }
+
+        if let Some(group) = child.as_group() {
+            verify_control_heights(group, context);
+        }
+    }
+}
+
 fn capture_active_dialog(expected_label: &str, path: &str) {
     let mut window = window_by_label(expected_label)
         .unwrap_or_else(|| fail(format!("missing dialog: {expected_label}")));
+    if let Some(group) = window.as_group() {
+        verify_control_heights(group, expected_label);
+    }
     let (data, width, height) = capture_complete_rgb(&mut window);
     save_ppm(path, &data, width, height);
     window.hide();
@@ -343,6 +384,49 @@ fn capture_formatting(main_window: &mut MainWindow) {
 }
 
 fn capture_object_browser(main_window: &mut MainWindow) {
+    fn visible_filter_input(group: fltk::group::Group) -> Option<fltk::input::Input> {
+        for child in group.into_iter() {
+            if let Some(input) = fltk::input::Input::from_dyn_widget(&child) {
+                if input.visible_r()
+                    && input.tooltip().as_deref() == Some("Type to filter objects...")
+                {
+                    return Some(input);
+                }
+            }
+            if let Some(group) = child.as_group() {
+                if let Some(input) = visible_filter_input(group) {
+                    return Some(input);
+                }
+            }
+        }
+        None
+    }
+
+    fn nearest_aligned_choice_above(
+        group: fltk::group::Group,
+        filter: &fltk::input::Input,
+        candidate: &mut Option<fltk::menu::Choice>,
+    ) {
+        for child in group.into_iter() {
+            if let Some(choice) = fltk::menu::Choice::from_dyn_widget(&child) {
+                let aligned = choice.visible_r()
+                    && choice.x() + theme::CHOICE_TEXT_LEFT_PADDING
+                        == filter.x() + filter.frame().dx() + 1
+                    && choice.y() < filter.y();
+                if aligned
+                    && candidate
+                        .as_ref()
+                        .is_none_or(|current| choice.y() > current.y())
+                {
+                    *candidate = Some(choice);
+                }
+            }
+            if let Some(group) = child.as_group() {
+                nearest_aligned_choice_above(group, filter, candidate);
+            }
+        }
+    }
+
     let _ = main_window.capture_tour_set_sql(
         "SELECT e.empno, e.ename, e.job, e.sal\nFROM emp e\nORDER BY e.empno;",
         Some(0),
@@ -357,6 +441,36 @@ fn capture_object_browser(main_window: &mut MainWindow) {
     if capture_scale <= 100 {
         save_main_part("/tmp/space-query-object-browser.ppm", 0, 70, 250, 705);
     }
+
+    let main_window = app::widget_from_id::<Window>("main_window")
+        .unwrap_or_else(|| fail("main window is missing"));
+    let main_group = main_window
+        .as_group()
+        .unwrap_or_else(|| fail("main window group is missing"));
+    verify_control_heights(main_group.clone(), "main window");
+    let mut filter = visible_filter_input(main_group.clone())
+        .unwrap_or_else(|| fail("visible object browser filter input is missing"));
+    let mut scope = None;
+    nearest_aligned_choice_above(main_group, &filter, &mut scope);
+    let scope = scope.unwrap_or_else(|| fail("visible object browser scope choice is missing"));
+    if filter.frame() != FrameType::FreeBoxType
+        || filter.x() + filter.frame().dx() + 1 != scope.x() + theme::CHOICE_TEXT_LEFT_PADDING
+    {
+        fail("object browser filter text is not aligned with the scope choice");
+    }
+    filter.set_value("Filter");
+    filter.redraw();
+    pump(80);
+    save_main_part(
+        "/tmp/space-query-object-browser-filter-alignment.ppm",
+        0,
+        70,
+        250,
+        110,
+    );
+    filter.set_value("");
+    filter.redraw();
+    pump(40);
 }
 
 fn result_page_control_sizes() -> Vec<(i32, i32)> {
@@ -440,17 +554,15 @@ fn assert_result_page_control_layout(expected_sizes: &[(i32, i32)]) {
 
 fn assert_result_page_control_feedback() {
     fn assert_control<W: WidgetBase>(control: &mut W) {
-        if control.color() != theme::button_subtle() {
-            fail("result page control did not start with its default color");
-        }
+        let base = control.color();
         let _ = control.handle_event(Event::Enter);
         pump(20);
-        if control.color() != theme::border() {
+        if control.color() != theme::hover_feedback_color(base) {
             fail("result page control did not apply its hover color");
         }
         let _ = control.handle_event(Event::Leave);
         pump(20);
-        if control.color() != theme::button_subtle() {
+        if control.color() != base {
             fail("result page control did not restore its default color");
         }
     }
@@ -461,6 +573,83 @@ fn assert_result_page_control_feedback() {
         .unwrap_or_else(|| fail("result page unit control is missing"));
     assert_control(&mut next);
     assert_control(&mut unit);
+}
+
+fn assert_hover_feedback<W: WidgetBase>(control: &mut W, name: &str) {
+    let base = control.color();
+    let _ = control.handle_event(Event::Enter);
+    pump(20);
+    if control.color() != theme::hover_feedback_color(base) {
+        fail(format!("{name} did not apply its hover color"));
+    }
+    let _ = control.handle_event(Event::Leave);
+    pump(20);
+    if control.color() != base {
+        fail(format!("{name} did not restore its default color"));
+    }
+}
+
+fn assert_standard_button_hover_feedback() {
+    let mut clear = app::widget_from_id::<fltk::button::Button>("result_clear_all")
+        .unwrap_or_else(|| fail("result clear button is missing"));
+    let mut one_tab = app::widget_from_id::<fltk::button::CheckButton>("result_one_tab_per_query")
+        .unwrap_or_else(|| fail("result one-tab-per-query control is missing"));
+    assert_hover_feedback(&mut clear, "result clear button");
+    assert_hover_feedback(&mut one_tab, "result one-tab-per-query control");
+
+    let clear_base = clear.color();
+    let _ = clear.handle_event(Event::Enter);
+    clear.set_color(theme::selection_soft());
+    let _ = clear.handle_event(Event::Leave);
+    if clear.color() != theme::selection_soft() {
+        fail("button hover restored over a runtime color change");
+    }
+    clear.set_color(clear_base);
+    clear.redraw();
+}
+
+fn assert_additional_control_hover_feedback() {
+    let mut isolation = app::widget_from_id::<fltk::menu::Choice>("query_transaction_isolation")
+        .unwrap_or_else(|| fail("query transaction-isolation choice is missing"));
+    let unit = app::widget_from_id::<fltk::menu::Choice>("result_page_unit")
+        .unwrap_or_else(|| fail("result page unit control is missing"));
+    if isolation.color() != theme::input_bg()
+        || isolation.color() != unit.color()
+        || isolation.text_color() != unit.text_color()
+        || isolation.selection_color() != unit.selection_color()
+        || isolation.frame() != unit.frame()
+    {
+        fail("query choice styling does not match the result page unit choice");
+    }
+    let isolation_was_active = isolation.active();
+    if !isolation_was_active {
+        isolation.activate();
+    }
+    assert_hover_feedback(&mut isolation, "query transaction-isolation choice");
+    if !isolation_was_active {
+        isolation.deactivate();
+    }
+
+    let mut vertical_splitter = app::widget_from_id::<fltk::frame::Frame>("main_vertical_splitter")
+        .unwrap_or_else(|| fail("main vertical splitter is missing"));
+    let mut query_result_splitter =
+        app::widget_from_id::<fltk::frame::Frame>("query_result_splitter")
+            .unwrap_or_else(|| fail("query/result splitter is missing"));
+    assert_hover_feedback(&mut vertical_splitter, "main vertical splitter");
+    assert_hover_feedback(&mut query_result_splitter, "query/result splitter");
+
+    let mut cancel = app::widget_from_id::<fltk::button::Button>("query_cancel")
+        .unwrap_or_else(|| fail("query cancel button is missing"));
+    let _ = cancel.handle_event(Event::Enter);
+    pump(120);
+    if cancel.color() != theme::hover_feedback_color(theme::button_cancel()) {
+        fail("query cancel hover was not composed with its activity color");
+    }
+    let _ = cancel.handle_event(Event::Leave);
+    pump(120);
+    if cancel.color() != theme::button_cancel() {
+        fail("query cancel did not restore its activity color after hover");
+    }
 }
 
 fn capture_result_page_resizes(capture_paths: [&str; 2], expected_sizes: &[(i32, i32)]) {
@@ -540,6 +729,8 @@ fn capture_result_grid(main_window: &mut MainWindow) {
         &expected_page_control_sizes,
     );
     assert_result_page_control_feedback();
+    assert_standard_button_hover_feedback();
+    assert_additional_control_hover_feedback();
 
     let mut unit = app::widget_from_id::<fltk::menu::Choice>("result_page_unit")
         .unwrap_or_else(|| fail("result page unit control is missing"));
@@ -828,7 +1019,7 @@ fn main() {
     };
     if !matches!(
         capture_mode.as_deref(),
-        Some("result-paging" | "result-editing")
+        Some("result-paging" | "result-editing" | "connection-dialog" | "settings-dialog")
     ) {
         config
             .save()
@@ -848,6 +1039,7 @@ fn main() {
     app::foreground(fg_r, fg_g, fg_b);
     app::set_frame_type2(FrameType::UpBox, FrameType::RFlatBox);
     app::set_frame_type2(FrameType::DownBox, FrameType::RFlatBox);
+    theme::register_text_input_frame();
     app::set_frame_border_radius_max(8);
 
     let mut main_window = MainWindow::new_with_config(config.clone());
@@ -855,6 +1047,22 @@ fn main() {
     main_window.show();
     pump(300);
 
+    if capture_mode.as_deref() == Some("connection-dialog") {
+        app::add_timeout3(0.45, |_| {
+            capture_active_dialog("Connect to Database", "/tmp/space-query-connect.ppm")
+        });
+        let _ = ConnectionDialog::show_with_registry(Arc::new(Mutex::new(Vec::new())));
+        app::quit();
+        return;
+    }
+    if capture_mode.as_deref() == Some("settings-dialog") {
+        app::add_timeout3(0.45, |_| {
+            capture_active_dialog("Settings", "/tmp/space-query-settings.ppm")
+        });
+        let _ = show_settings_dialog(&config);
+        app::quit();
+        return;
+    }
     if capture_mode.as_deref() == Some("object-browser") {
         capture_object_browser(&mut main_window);
         app::quit();

@@ -403,12 +403,14 @@ impl QueryHistoryDialog {
         let mut search_input = Input::default();
         search_input.set_color(theme::input_bg());
         search_input.set_text_color(theme::text_primary());
+        theme::apply_text_input_inset(&mut search_input);
         search_input.set_tooltip("Filter by SQL text, connection, timestamp, or error");
         filter_row.fixed(&search_input, 224);
 
         let mut failed_only_check = CheckButton::default().with_label("Failed only");
         failed_only_check.set_color(theme::button_dark());
         failed_only_check.set_label_color(theme::text_primary());
+        theme::install_button_hover(&mut failed_only_check);
         filter_row.fixed(&failed_only_check, 114);
 
         filter_row.end();
@@ -482,6 +484,7 @@ impl QueryHistoryDialog {
         use_btn.set_color(theme::button_dark());
         use_btn.set_label_color(theme::text_primary());
         use_btn.set_frame(FrameType::RFlatBox);
+        theme::install_button_hover(&mut use_btn);
 
         let mut clear_btn = Button::default()
             .with_size(BUTTON_WIDTH_LARGE, BUTTON_HEIGHT)
@@ -489,6 +492,7 @@ impl QueryHistoryDialog {
         clear_btn.set_color(theme::button_dark());
         clear_btn.set_label_color(theme::text_primary());
         clear_btn.set_frame(FrameType::RFlatBox);
+        theme::install_button_hover(&mut clear_btn);
 
         let mut close_btn = Button::default()
             .with_size(BUTTON_WIDTH, BUTTON_HEIGHT)
@@ -496,6 +500,7 @@ impl QueryHistoryDialog {
         close_btn.set_color(theme::button_dark());
         close_btn.set_label_color(theme::text_primary());
         close_btn.set_frame(FrameType::RFlatBox);
+        theme::install_button_hover(&mut close_btn);
 
         button_flex.fixed(&use_btn, BUTTON_WIDTH_LARGE);
         button_flex.fixed(&clear_btn, BUTTON_WIDTH_LARGE);

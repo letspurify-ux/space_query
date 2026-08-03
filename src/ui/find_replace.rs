@@ -233,6 +233,7 @@ impl FindReplaceDialog {
         let mut find_input = Input::default();
         find_input.set_color(theme::input_bg());
         find_input.set_text_color(theme::text_primary());
+        theme::apply_text_input_inset(&mut find_input);
         find_input.set_trigger(CallbackTrigger::EnterKeyAlways);
         install_find_input_shortcuts(&mut find_input);
         find_flex.end();
@@ -248,6 +249,7 @@ impl FindReplaceDialog {
             let mut input = Input::default();
             input.set_color(theme::input_bg());
             input.set_text_color(theme::text_primary());
+            theme::apply_text_input_inset(&mut input);
             install_find_input_shortcuts(&mut input);
             replace_flex.end();
             main_flex.fixed(&replace_flex, INPUT_ROW_HEIGHT);
@@ -262,6 +264,7 @@ impl FindReplaceDialog {
         let mut case_check = CheckButton::default().with_label("Case sensitive");
         case_check.set_color(theme::button_dark());
         case_check.set_label_color(theme::text_secondary());
+        theme::install_button_hover(&mut case_check);
         options_flex.end();
         main_flex.fixed(&options_flex, CHECKBOX_ROW_HEIGHT);
 
@@ -278,6 +281,7 @@ impl FindReplaceDialog {
         find_next_btn.set_color(theme::button_dark());
         find_next_btn.set_label_color(theme::text_primary());
         find_next_btn.set_frame(FrameType::RFlatBox);
+        theme::install_button_hover(&mut find_next_btn);
 
         let replace_btn = if show_replace {
             let mut btn = Button::default()
@@ -286,6 +290,7 @@ impl FindReplaceDialog {
             btn.set_color(theme::button_dark());
             btn.set_label_color(theme::text_primary());
             btn.set_frame(FrameType::RFlatBox);
+            theme::install_button_hover(&mut btn);
             button_flex.fixed(&btn, BUTTON_WIDTH);
             Some(btn)
         } else {
@@ -299,6 +304,7 @@ impl FindReplaceDialog {
             btn.set_color(theme::button_dark());
             btn.set_label_color(theme::text_primary());
             btn.set_frame(FrameType::RFlatBox);
+            theme::install_button_hover(&mut btn);
             button_flex.fixed(&btn, BUTTON_WIDTH);
             Some(btn)
         } else {
@@ -311,6 +317,7 @@ impl FindReplaceDialog {
         close_btn.set_color(theme::button_dark());
         close_btn.set_label_color(theme::text_primary());
         close_btn.set_frame(FrameType::RFlatBox);
+        theme::install_button_hover(&mut close_btn);
 
         button_flex.fixed(&find_next_btn, BUTTON_WIDTH);
         button_flex.fixed(&close_btn, BUTTON_WIDTH_SMALL);
