@@ -17,7 +17,7 @@ pub const TRANSACTION_ISOLATION_CHOICE_WIDTH: i32 = 230;
 /// Width for the transaction access mode selector in the query toolbar.
 pub const TRANSACTION_ACCESS_CHOICE_WIDTH: i32 = 130;
 
-/// Uniform height for buttons, choices, single-line inputs, and checkboxes.
+/// Uniform height for interactive controls and tab headers across the app.
 pub const BUTTON_HEIGHT: i32 = 28;
 
 // -- Form row heights --
@@ -89,10 +89,10 @@ pub const RESULT_CELL_MAX_DISPLAY_CHARS_MIN: u32 = 8;
 /// Maximum allowed maximum for result cell preview length.
 pub const RESULT_CELL_MAX_DISPLAY_CHARS_MAX: u32 = 10_000;
 
-// -- Result tabs --
+// -- Tabs --
 
-/// Height of tab headers in the result tabs widget.
-pub const TAB_HEADER_HEIGHT: i32 = 25;
+/// Uniform height of every tab header in the app.
+pub const TAB_HEADER_HEIGHT: i32 = BUTTON_HEIGHT;
 
 /// Inner padding for the script output display.
 pub const SCRIPT_OUTPUT_PADDING: i32 = 6;

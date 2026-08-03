@@ -10,7 +10,9 @@ use fltk::{
 use space_query::{
     db::{ColumnInfo, QueryResult},
     ui::{
-        apply_global_default_font, constants::BUTTON_HEIGHT, log_viewer::LogViewerDialog,
+        apply_global_default_font,
+        constants::{BUTTON_HEIGHT, TAB_HEADER_HEIGHT},
+        log_viewer::LogViewerDialog,
         profile_by_name, show_settings_dialog, theme, ConnectionDialog, IntellisensePopup,
         MainWindow, QueryHistoryDialog, SignatureLabel, SignatureOverload, SignaturePopup,
     },
@@ -172,11 +174,32 @@ fn verify_control_heights(group: fltk::group::Group, context: &str) {
     }
 }
 
+fn verify_tab_header_heights(group: fltk::group::Group, context: &str) {
+    for child in group.into_iter() {
+        if let Some(tabs) = fltk::group::Tabs::from_dyn_widget(&child) {
+            for tab_child in tabs.clone().into_iter() {
+                let actual_height = tab_child.y().saturating_sub(tabs.y());
+                if actual_height != TAB_HEADER_HEIGHT {
+                    fail(format!(
+                        "{context} tab {:?} has header height {actual_height}, expected {TAB_HEADER_HEIGHT}",
+                        tab_child.label()
+                    ));
+                }
+            }
+        }
+
+        if let Some(group) = child.as_group() {
+            verify_tab_header_heights(group, context);
+        }
+    }
+}
+
 fn capture_active_dialog(expected_label: &str, path: &str) {
     let mut window = window_by_label(expected_label)
         .unwrap_or_else(|| fail(format!("missing dialog: {expected_label}")));
     if let Some(group) = window.as_group() {
-        verify_control_heights(group, expected_label);
+        verify_control_heights(group.clone(), expected_label);
+        verify_tab_header_heights(group, expected_label);
     }
     let (data, width, height) = capture_complete_rgb(&mut window);
     save_ppm(path, &data, width, height);
@@ -448,6 +471,7 @@ fn capture_object_browser(main_window: &mut MainWindow) {
         .as_group()
         .unwrap_or_else(|| fail("main window group is missing"));
     verify_control_heights(main_group.clone(), "main window");
+    verify_tab_header_heights(main_group.clone(), "main window");
     let mut filter = visible_filter_input(main_group.clone())
         .unwrap_or_else(|| fail("visible object browser filter input is missing"));
     let mut scope = None;
