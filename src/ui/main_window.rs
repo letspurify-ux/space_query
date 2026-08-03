@@ -3012,20 +3012,12 @@ impl AppState {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .clone();
         let activities = crate::db::active_db_activity_snapshots();
-        let active_connection_id = self.active_connection_id();
-        let active_connection_activities = activities
-            .iter()
-            .filter(|activity| activity.connection_id == active_connection_id)
-            .cloned()
-            .collect::<Vec<_>>();
-        let selected_registry_activity = latest_status_activity(&active_connection_activities);
-        let selected_registry_id = selected_registry_activity.map(|activity| activity.id);
-        let selected_activity = selected_registry_activity.cloned();
-        let displayed_registry_count = usize::from(selected_registry_id.is_some());
+        let selected_activity = latest_status_activity(&activities);
+        let displayed_registry_count = usize::from(selected_activity.is_some());
         self.status_bar.render(
             conn_info.as_ref(),
             self.has_live_connection,
-            selected_activity.as_ref(),
+            selected_activity,
             activities.len().saturating_sub(displayed_registry_count),
         );
         self.render_query_cancel_activity();
@@ -3036,7 +3028,9 @@ impl AppState {
         if self.query_cancel_btn.was_deleted() {
             return;
         }
-        if self.has_cancelable_query_activity() {
+        let was_active = self.query_cancel_pulse_frame != 0;
+        let is_active = self.has_cancelable_query_activity();
+        if is_active {
             self.query_cancel_btn.set_color(activity_pulse_color(
                 self.query_cancel_pulse_frame,
                 theme::button_cancel(),
@@ -3050,6 +3044,11 @@ impl AppState {
             self.query_cancel_pulse_frame = 0;
         }
         self.query_cancel_btn.redraw();
+        if was_active && !is_active {
+            if let Some(mut query_toolbar) = self.query_cancel_btn.parent() {
+                query_toolbar.redraw();
+            }
+        }
     }
 
     fn set_status_message(&mut self, _message: &str) {
@@ -12435,7 +12434,10 @@ mod tests {
     }
 
     #[test]
-    fn status_activity_selects_most_recent_start_and_falls_back() {
+    fn status_activity_selects_most_recent_start_across_connections_and_falls_back() {
+        let registry = ConnectionRegistry::new();
+        let first_connection_id = registry.register_unmanaged(create_shared_connection()).id();
+        let second_connection_id = registry.register_unmanaged(create_shared_connection()).id();
         let first_start = Instant::now();
         let second_start = first_start + Duration::from_millis(1);
         let activities = vec![
@@ -12444,7 +12446,7 @@ mod tests {
                 activity: "first".to_string(),
                 started_at: first_start,
                 db_type: Some(DatabaseType::Oracle),
-                connection_id: None,
+                connection_id: Some(first_connection_id),
                 progress: crate::db::DbActivityProgress::Indeterminate,
             },
             crate::db::DbActivitySnapshot {
@@ -12452,7 +12454,7 @@ mod tests {
                 activity: "second".to_string(),
                 started_at: second_start,
                 db_type: Some(DatabaseType::Oracle),
-                connection_id: None,
+                connection_id: Some(second_connection_id),
                 progress: crate::db::DbActivityProgress::Indeterminate,
             },
         ];
