@@ -7,6 +7,8 @@ use fltk::{
     input::Input,
     prelude::*,
 };
+use std::any::Any;
+use std::panic::{self, AssertUnwindSafe};
 use std::sync::{
     atomic::{AtomicBool, Ordering},
     Arc, Mutex,
@@ -137,6 +139,51 @@ impl TableBrowsePageRequest {
 
 pub(crate) type TableBrowseExecuteCallback =
     Arc<Mutex<Option<Box<dyn FnMut(TableBrowsePageRequest) -> Result<(), String>>>>>;
+
+fn panic_payload_to_string(payload: &(dyn Any + Send)) -> String {
+    if let Some(message) = payload.downcast_ref::<&str>() {
+        (*message).to_string()
+    } else if let Some(message) = payload.downcast_ref::<String>() {
+        message.clone()
+    } else {
+        "unknown panic payload".to_string()
+    }
+}
+
+pub(crate) fn invoke_table_browse_execute_callback(
+    callback: &TableBrowseExecuteCallback,
+    request: TableBrowsePageRequest,
+) -> Result<(), String> {
+    let callback_fn = callback
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .take();
+    let Some(mut callback_fn) = callback_fn else {
+        return Err("Table browse callback is unavailable.".to_string());
+    };
+
+    let call_result = panic::catch_unwind(AssertUnwindSafe(|| callback_fn(request)));
+    let mut callback_guard = callback
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if callback_guard.is_none() {
+        *callback_guard = Some(callback_fn);
+    }
+    drop(callback_guard);
+
+    match call_result {
+        Ok(result) => result,
+        Err(payload) => {
+            let message = panic_payload_to_string(payload.as_ref());
+            crate::utils::logging::log_error(
+                "table_browse::callback",
+                &format!("table browse callback panicked: {message}"),
+            );
+            eprintln!("table browse callback panicked: {message}");
+            Err("Internal error: table browse callback panicked.".to_string())
+        }
+    }
+}
 
 fn marked_materialized_sql(sql: &str) -> String {
     let trimmed_start = sql.len().saturating_sub(sql.trim_start().len());
@@ -603,6 +650,9 @@ impl TableBrowseFilterBar {
                 let input = input.clone();
                 let popup = popup.clone();
                 crate::ui::ui_timeout::schedule(0.0, move || {
+                    if input.was_deleted() {
+                        return;
+                    }
                     popup
                         .lock()
                         .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -760,22 +810,7 @@ impl TableBrowseFilterBar {
     }
 
     fn invoke_execute(callback: &TableBrowseExecuteCallback, request: TableBrowsePageRequest) {
-        let mut callback_fn = callback
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .take();
-        let result = callback_fn
-            .as_mut()
-            .map(|callback| callback(request))
-            .unwrap_or_else(|| Err("Table browse callback is unavailable.".to_string()));
-        let mut callback_guard = callback
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if callback_guard.is_none() {
-            *callback_guard = callback_fn;
-        }
-        drop(callback_guard);
-        if let Err(message) = result {
+        if let Err(message) = invoke_table_browse_execute_callback(callback, request) {
             crate::ui::alert_on_main(&message);
         }
     }
@@ -788,7 +823,7 @@ impl TableBrowseFilterBar {
         popup_showing: &AtomicBool,
         force: bool,
     ) {
-        if !input.has_focus() {
+        if input.was_deleted() || !input.has_focus() {
             popup
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -891,6 +926,9 @@ impl TableBrowseFilterBar {
     }
 
     fn replace_current_word(input: &mut Input, selected: &str) {
+        if input.was_deleted() {
+            return;
+        }
         let value = input.value();
         let cursor = usize::try_from(input.position())
             .unwrap_or_default()
@@ -978,6 +1016,22 @@ impl TableBrowseFilterBar {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .hide();
+    }
+
+    pub(crate) fn cleanup_for_close(&mut self) {
+        self.where_input.handle(|_, _| false);
+        self.order_input.handle(|_, _| false);
+        self.where_clear.set_callback(|_| {});
+        self.order_clear.set_callback(|_| {});
+
+        self.where_popup
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .delete_for_close();
+        self.order_popup
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .delete_for_close();
     }
 }
 
@@ -1175,5 +1229,37 @@ mod tests {
         assert!(!TableBrowseFilterBar::should_open_completion("", false));
         assert!(TableBrowseFilterBar::should_open_completion("E", false));
         assert!(TableBrowseFilterBar::should_open_completion("", true));
+    }
+
+    #[test]
+    fn table_browse_callback_is_unlocked_and_restored_after_panic() {
+        let callback: TableBrowseExecuteCallback = Arc::new(Mutex::new(None));
+        let callback_for_assert = callback.clone();
+        let calls = Arc::new(Mutex::new(0usize));
+        let calls_for_callback = calls.clone();
+        *callback
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(Box::new(move |_| {
+            assert!(callback_for_assert.try_lock().is_ok());
+            let mut calls = calls_for_callback
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            *calls += 1;
+            if *calls == 1 {
+                panic!("expected callback panic");
+            }
+            Ok(())
+        }));
+
+        let request =
+            TableBrowsePageRequest::first(ResultTabId::new(1), target(DatabaseType::MySQL));
+        assert!(invoke_table_browse_execute_callback(&callback, request.clone()).is_err());
+        assert!(invoke_table_browse_execute_callback(&callback, request).is_ok());
+        assert_eq!(
+            *calls
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()),
+            2
+        );
     }
 }

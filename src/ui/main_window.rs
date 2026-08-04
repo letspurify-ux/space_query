@@ -3995,6 +3995,13 @@ fn should_update_fetch_status(previous_count: usize, elapsed: Duration) -> bool 
     previous_count == 0 || elapsed >= FETCH_STATUS_UPDATE_INTERVAL
 }
 
+fn should_fail_table_browse_at_batch_end(
+    table_browse_loading: bool,
+    last_page_count_pending: bool,
+) -> bool {
+    table_browse_loading && !last_page_count_pending
+}
+
 pub struct MainWindow {
     state: Arc<Mutex<AppState>>,
 }
@@ -9502,11 +9509,24 @@ impl MainWindow {
                     if let Some(token) = operation_token {
                         s.clear_query_cancel_request(token);
                     }
+                    let table_browse_failure_target = s
+                        .result_grid_execution_targets
+                        .get(&tab_id)
+                        .copied()
+                        .filter(|target| owning_result_tabs.table_browse_is_loading(*target));
+                    if let Some(pending) = s.pending_table_browse_last.get_mut(&tab_id) {
+                        pending.error.get_or_insert_with(|| message.clone());
+                    }
                     if s.should_show_progress_status_for_tab(tab_id) {
                         s.set_status_message(&message);
                     }
                     s.refresh_result_edit_controls();
                     s.sync_transaction_mode_controls();
+                    drop(s);
+                    if let Some(result_tab_id) = table_browse_failure_target {
+                        let mut result_tabs = owning_result_tabs.clone();
+                        result_tabs.fail_table_browse_result_by_id(result_tab_id);
+                    }
                 }
                 QueryProgress::MetadataRefreshNeeded => {
                     s.mark_metadata_refresh_pending(tab_id);
@@ -9641,6 +9661,16 @@ impl MainWindow {
                             return;
                         }
                     }
+                    let unfinished_table_browse_target = s
+                        .result_grid_execution_targets
+                        .get(&tab_id)
+                        .copied()
+                        .filter(|target| {
+                            should_fail_table_browse_at_batch_end(
+                                owning_result_tabs.table_browse_is_loading(*target),
+                                s.pending_table_browse_last.contains_key(&tab_id),
+                            )
+                        });
                     let canceling_tab_id = {
                         s.progress_contexts.get(&tab_id).and_then(|context| {
                             if context.state_label != ResultTabStatus::Canceling.label() {
@@ -9660,6 +9690,9 @@ impl MainWindow {
                     drop(s);
 
                     result_tabs.finish_non_lazy_streaming();
+                    if let Some(result_tab_id) = unfinished_table_browse_target {
+                        result_tabs.fail_table_browse_result_by_id(result_tab_id);
+                    }
                     let recovered_save_states = result_tabs.clear_orphaned_save_requests();
                     let recovered_edit_states = result_tabs.clear_orphaned_query_edit_backups();
 
@@ -9750,11 +9783,19 @@ impl MainWindow {
                     } else if let Some(request) = last_page_followup {
                         let state_for_last_page = state_for_progress.clone();
                         crate::ui::ui_timeout::schedule(0.0, move || {
+                            let result_tab_id = request.result_tab_id;
                             if let Err(message) = MainWindow::execute_table_browse_request(
                                 &state_for_last_page,
                                 tab_id,
                                 request,
                             ) {
+                                let state = state_for_last_page
+                                    .lock()
+                                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                                if let Some(mut result_tabs) = state.result_tabs_for_tab(tab_id) {
+                                    result_tabs.fail_table_browse_result_by_id(result_tab_id);
+                                }
+                                drop(state);
                                 crate::ui::alert_on_main(&message);
                             }
                         });
@@ -13115,6 +13156,13 @@ mod tests {
 
         assert_eq!(status_connection_label(None, false), "not connected");
         assert_eq!(status_connection_label(Some(&info), true), "Local (Oracle)");
+    }
+
+    #[test]
+    fn batch_end_only_recovers_unfinished_materialized_page_queries() {
+        assert!(should_fail_table_browse_at_batch_end(true, false));
+        assert!(!should_fail_table_browse_at_batch_end(false, false));
+        assert!(!should_fail_table_browse_at_batch_end(true, true));
     }
 
     #[test]

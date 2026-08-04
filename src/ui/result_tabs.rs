@@ -23,8 +23,8 @@ use crate::ui::result_table::{
 };
 use crate::ui::tab_strip;
 use crate::ui::table_browse::{
-    TableBrowseExecuteCallback, TableBrowseFilterBar, TableBrowseNavigation,
-    TableBrowsePageRequest, TableBrowseTarget, TABLE_BROWSE_FILTER_HEIGHT,
+    invoke_table_browse_execute_callback, TableBrowseExecuteCallback, TableBrowseFilterBar,
+    TableBrowseNavigation, TableBrowsePageRequest, TableBrowseTarget, TABLE_BROWSE_FILTER_HEIGHT,
 };
 use crate::ui::text_buffer_access;
 use crate::ui::theme;
@@ -2694,24 +2694,7 @@ impl ResultTabsWidget {
     }
 
     fn invoke_table_browse_request(&self, request: TableBrowsePageRequest) -> bool {
-        let mut callback = self
-            .table_browse_callback
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .take();
-        let result = callback
-            .as_mut()
-            .map(|callback| callback(request))
-            .unwrap_or_else(|| Err("Table browse callback is unavailable.".to_string()));
-        let mut callback_guard = self
-            .table_browse_callback
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if callback_guard.is_none() {
-            *callback_guard = callback;
-        }
-        drop(callback_guard);
-        match result {
+        match invoke_table_browse_execute_callback(&self.table_browse_callback, request) {
             Ok(()) => true,
             Err(message) => {
                 crate::ui::alert_on_main(&message);
@@ -2914,8 +2897,12 @@ impl ResultTabsWidget {
 
         Self::record_data_tab_strip_removal_for(&tab.group, &self.data_tab_strip_state);
 
-        if let Some(filter_bar) = tab.filter_bar.as_ref() {
-            filter_bar.hide_popups();
+        let mut group = tab.group;
+        if !group.was_deleted() {
+            group.resize_callback(|_, _, _, _, _| {});
+        }
+        if let Some(filter_bar) = tab.filter_bar.as_mut() {
+            filter_bar.cleanup_for_close();
         }
 
         // Step 1: Cleanup the table widget (clears callbacks and data buffers)
@@ -2924,7 +2911,6 @@ impl ResultTabsWidget {
         // Step 2 & 3: Explicitly remove/delete the table widget first to ensure
         // callback closures are dropped immediately, then clear/delete any
         // additional child widgets that may be added to result tabs in the future.
-        let mut group = tab.group;
         let table_widget = tab.table.get_widget();
         if !group.was_deleted()
             && !table_widget.was_deleted()
@@ -3098,8 +3084,8 @@ mod tests {
     use fltk::enums::Event;
 
     use super::{
-        ResultTabId, ResultTabStatus, ResultTabsWidget, TableBrowsePageRequest, TableBrowseState,
-        TableBrowseTarget,
+        ResultTabId, ResultTabStatus, ResultTabsWidget, TableBrowseNavigation,
+        TableBrowsePageRequest, TableBrowseState, TableBrowseTarget,
     };
     use crate::ui::font_settings::FONT_PROFILES;
     use std::sync::{Arc, Mutex};
@@ -3317,6 +3303,54 @@ mod tests {
         inherited.page_size = 0;
         state.normalize_request(&mut inherited);
         assert_eq!(inherited.page_size, 500);
+    }
+
+    #[test]
+    #[cfg_attr(
+        any(target_os = "macos", target_os = "linux"),
+        ignore = "FLTK widget tests require a native UI test environment"
+    )]
+    fn table_browse_failure_and_close_release_loading_and_popup_resources() {
+        let _app = fltk::app::App::default();
+        let mut tabs = ResultTabsWidget::new(0, 0, 640, 360);
+        let id = tabs.reserve_result_tab_id();
+        let target = TableBrowseTarget::new(
+            crate::db::DatabaseType::MySQL,
+            Some("APP".to_string()),
+            "EMP".to_string(),
+            "`APP`.`EMP`".to_string(),
+            "APP.EMP".to_string(),
+        );
+        assert!(tabs
+            .ensure_table_browse_tab_by_id(
+                id,
+                target,
+                Arc::new(Mutex::new(crate::ui::IntellisenseData::new())),
+                500,
+                true,
+            )
+            .is_some());
+
+        let mut request = tabs.table_browse_initial_request(id).unwrap();
+        request.navigation = TableBrowseNavigation::Last;
+        tabs.begin_table_browse_request(request).unwrap();
+        assert!(tabs.table_browse_is_loading(id));
+        tabs.fail_table_browse_result_by_id(id);
+        assert!(!tabs.table_browse_is_loading(id));
+
+        let (_, popup) = tabs.capture_tour_show_table_browse_popup().unwrap();
+        assert!(popup
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .is_visible());
+        assert!(tabs.close_tab_by_id_and_take_lazy_fetch(id).is_some());
+        assert_eq!(
+            popup
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .popup_dimensions(),
+            (0, 0)
+        );
     }
 
     #[test]
