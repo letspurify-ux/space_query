@@ -171,7 +171,7 @@ fn style_choice_with_background(choice: &mut Choice, background: Color) {
                 choice.y(),
                 content_width.saturating_sub(text_left_padding),
                 choice.h(),
-                Align::Left | Align::Inside,
+                Align::Left | Align::Inside | Align::Clip,
             );
         }
 

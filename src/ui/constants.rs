@@ -17,8 +17,8 @@ pub const TRANSACTION_ISOLATION_CHOICE_WIDTH: i32 = 230;
 /// Width for the transaction access mode selector in the query toolbar.
 pub const TRANSACTION_ACCESS_CHOICE_WIDTH: i32 = 130;
 
-/// Uniform height for interactive controls and tab headers across the app.
-pub const BUTTON_HEIGHT: i32 = 28;
+/// Standard height for interactive controls across the app.
+pub const BUTTON_HEIGHT: i32 = 22;
 
 // -- Form row heights --
 
@@ -29,7 +29,7 @@ pub const INPUT_ROW_HEIGHT: i32 = BUTTON_HEIGHT;
 pub const BUTTON_ROW_HEIGHT: i32 = BUTTON_HEIGHT;
 
 /// Height of a row containing only a label/frame.
-pub const LABEL_ROW_HEIGHT: i32 = 22;
+pub const LABEL_ROW_HEIGHT: i32 = BUTTON_HEIGHT;
 
 /// Height of a row containing a checkbox.
 pub const CHECKBOX_ROW_HEIGHT: i32 = BUTTON_HEIGHT;
@@ -58,10 +58,10 @@ pub const NUMERIC_INPUT_WIDTH: i32 = 70;
 // -- Layout constants --
 
 /// Height of the application menu bar.
-pub const MENU_BAR_HEIGHT: i32 = 30;
+pub const MENU_BAR_HEIGHT: i32 = 28;
 
 /// Height of the application status bar.
-pub const STATUS_BAR_HEIGHT: i32 = 25;
+pub const STATUS_BAR_HEIGHT: i32 = 28;
 
 /// Height of the filter input in the object browser.
 pub const FILTER_INPUT_HEIGHT: i32 = BUTTON_HEIGHT;
@@ -75,7 +75,7 @@ pub const TABLE_ROW_HEADER_WIDTH: i32 = 55;
 pub const TABLE_COL_HEADER_HEIGHT: i32 = 28;
 
 /// Default row height in result tables.
-pub const TABLE_ROW_HEIGHT: i32 = BUTTON_HEIGHT;
+pub const TABLE_ROW_HEIGHT: i32 = 28;
 
 /// Cell text padding (left/right) in result tables.
 pub const TABLE_CELL_PADDING: i32 = 4;
@@ -112,7 +112,7 @@ pub const MAIN_SPLITTER_WIDTH: i32 = 6;
 pub const QUERY_SPLIT_BAR_HEIGHT: i32 = 6;
 
 /// Height of the result toolbar row.
-pub const RESULT_TOOLBAR_HEIGHT: i32 = 34;
+pub const RESULT_TOOLBAR_HEIGHT: i32 = 28;
 
 /// Minimum height for the query editor pane.
 pub const MIN_QUERY_HEIGHT: i32 = 160;
@@ -127,3 +127,34 @@ pub const MIN_RESULTS_HEIGHT: i32 = RESULT_TOOLBAR_HEIGHT + MIN_RESULTS_BODY_HEI
 
 /// Default font size used when no config value is available.
 pub const DEFAULT_FONT_SIZE: i32 = 16;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn shared_controls_are_22_while_table_and_bar_heights_are_28() {
+        assert_eq!(
+            [
+                BUTTON_HEIGHT,
+                INPUT_ROW_HEIGHT,
+                BUTTON_ROW_HEIGHT,
+                LABEL_ROW_HEIGHT,
+                CHECKBOX_ROW_HEIGHT,
+                FILTER_INPUT_HEIGHT,
+                TAB_HEADER_HEIGHT,
+            ],
+            [22; 7]
+        );
+        assert_eq!(
+            [
+                TABLE_COL_HEADER_HEIGHT,
+                TABLE_ROW_HEIGHT,
+                MENU_BAR_HEIGHT,
+                STATUS_BAR_HEIGHT,
+                RESULT_TOOLBAR_HEIGHT,
+            ],
+            [28; 5]
+        );
+    }
+}

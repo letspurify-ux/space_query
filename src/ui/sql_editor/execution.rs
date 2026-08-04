@@ -2175,6 +2175,11 @@ impl Drop for QueryExecutionCleanupGuard {
                 &self.current_query_cancel_handle,
                 None,
             );
+            store_mutex_bool(&self.cancel_flag, false);
+            // Terminal progress handlers derive the query-tab label from this
+            // flag, so publish the idle state before waking the UI with the
+            // completion events.
+            store_mutex_bool(&self.query_running, false);
         }
         let operation_token = QueryOperationToken {
             tab_id: self.execution_metadata.tab_id,
@@ -2186,12 +2191,6 @@ impl Drop for QueryExecutionCleanupGuard {
             token: operation_token,
         });
         let _ = self.sender.send(QueryProgress::BatchFinished);
-        if cleanup_owns_current_operation {
-            store_mutex_bool(&self.cancel_flag, false);
-            // Keep execution state fail-safe even if the UI progress poller has
-            // stopped (e.g. tab closed while worker thread is still unwinding).
-            store_mutex_bool(&self.query_running, false);
-        }
     }
 }
 

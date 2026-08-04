@@ -987,8 +987,7 @@ impl ResultTableWidget {
     }
 
     fn inline_editor_geometry(x: i32, y: i32, w: i32, h: i32) -> (i32, i32, i32, i32) {
-        let input_y = y + safe_div(h.saturating_sub(BUTTON_HEIGHT), 2).max(0);
-        (x + 1, input_y, (w - 2).max(24), BUTTON_HEIGHT)
+        (x + 1, y, (w - 2).max(24), h)
     }
 
     /// Returns the display column count for `text` using byte-level UTF-8 analysis.
@@ -13794,14 +13793,14 @@ mod tests {
     use std::time::Duration;
 
     #[test]
-    fn inline_editor_keeps_the_shared_control_height() {
+    fn inline_editor_matches_the_table_row_height() {
         assert_eq!(
             ResultTableWidget::inline_editor_geometry(10, 20, 100, 40),
-            (11, 26, 98, BUTTON_HEIGHT)
+            (11, 20, 98, 40)
         );
         assert_eq!(
-            ResultTableWidget::inline_editor_geometry(10, 20, 20, BUTTON_HEIGHT),
-            (11, 20, 24, BUTTON_HEIGHT)
+            ResultTableWidget::inline_editor_geometry(10, 20, 20, TABLE_ROW_HEIGHT),
+            (11, 20, 24, TABLE_ROW_HEIGHT)
         );
     }
 

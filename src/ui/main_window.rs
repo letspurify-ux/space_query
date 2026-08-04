@@ -8476,6 +8476,7 @@ impl MainWindow {
                     {
                         s.refresh_result_edit_controls();
                     }
+                    s.refresh_tab_label(tab_id);
                 }
                 QueryProgress::BatchStart {
                     activity,
