@@ -228,7 +228,9 @@ moves above the field or stays within the screen edge when space is limited.
 Use the first, previous, next, and last controls below the grid and choose a
 page size of 10, 100, 250, 500, or 1,000 rows. Table browsing issues a bounded
 query for each page—Oracle uses `ROWNUM`, while MySQL and MariaDB use
-`LIMIT/OFFSET`—and does not retain a lazy-fetch cursor between pages.
+`LIMIT/OFFSET`—and does not retain a lazy-fetch cursor between pages. Completed
+table tabs show `Page N` with the current page row count, and row headers retain
+their absolute positions across pages.
 
 ### Result grid
 

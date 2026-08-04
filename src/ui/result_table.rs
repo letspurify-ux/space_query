@@ -14,7 +14,7 @@ use fltk::{
 use std::any::Any;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::panic::{self, AssertUnwindSafe};
-use std::sync::atomic::{AtomicI32, AtomicU32, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicI32, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -40,6 +40,12 @@ fn byte_index_after_n_chars(s: &str, n: usize) -> usize {
         .nth(n)
         .map(|(idx, _)| idx)
         .unwrap_or_else(|| s.len())
+}
+
+fn displayed_row_number(row_number_offset: u64, row: i32) -> u64 {
+    row_number_offset
+        .saturating_add(u64::try_from(row.max(0)).unwrap_or_default())
+        .saturating_add(1)
 }
 
 fn truncated_content_end(text: &str, max_chars: usize) -> Option<usize> {
@@ -279,6 +285,9 @@ pub struct ResultTableWidget {
     max_cell_display_chars: Arc<Mutex<usize>>,
     /// Lock-free mirror of max_cell_display_chars for hot draw path reads.
     max_cell_display_chars_draw: Arc<AtomicUsize>,
+    /// First row number represented by this grid page. Query results keep zero;
+    /// bounded table-browse pages use their database offset.
+    row_number_offset: Arc<AtomicU64>,
     /// How many rows have been sampled for column width calculation
     width_sampled_rows: Arc<Mutex<usize>>,
     font_settings: Arc<SharedFontSettings>,
@@ -2157,6 +2166,7 @@ impl ResultTableWidget {
         let max_cell_display_chars_draw = Arc::new(AtomicUsize::new(
             RESULT_CELL_MAX_DISPLAY_CHARS_DEFAULT as usize,
         ));
+        let row_number_offset = Arc::new(AtomicU64::new(0));
         let null_text = Arc::new(Mutex::new("NULL".to_string()));
         let source_sql = Arc::new(Mutex::new(String::new()));
         let execute_sql_callback: Arc<Mutex<Option<ResultGridSqlExecuteCallback>>> =
@@ -2228,6 +2238,7 @@ impl ResultTableWidget {
         let table_for_draw = table.clone();
         let font_settings_for_draw = font_settings.clone();
         let max_cell_display_chars_for_draw = max_cell_display_chars_draw.clone();
+        let row_number_offset_for_draw = row_number_offset.clone();
         let edit_session_for_draw = edit_session.clone();
         let sort_state_for_draw = sort_state.clone();
 
@@ -2279,7 +2290,11 @@ impl ResultTableWidget {
                     draw::draw_box(FrameType::FlatBox, x, y, w, h, header_bg);
                     draw::set_draw_color(header_fg);
                     draw::set_font(normal_font, font_size);
-                    let text = (row + 1).to_string();
+                    let text = displayed_row_number(
+                        row_number_offset_for_draw.load(Ordering::Relaxed),
+                        row,
+                    )
+                    .to_string();
                     draw::draw_text2(&text, x, y, w - TABLE_CELL_PADDING, h, Align::Right);
                     draw::set_draw_color(border_color);
                     draw::draw_line(x + w - 1, y, x + w - 1, y + h);
@@ -3301,6 +3316,7 @@ impl ResultTableWidget {
             full_data,
             max_cell_display_chars,
             max_cell_display_chars_draw,
+            row_number_offset,
             width_sampled_rows: Arc::new(Mutex::new(0_usize)),
             font_settings,
             null_text,
@@ -9135,6 +9151,11 @@ impl ResultTableWidget {
         self.table.rows() as usize
     }
 
+    pub(crate) fn set_row_number_offset(&mut self, offset: u64) {
+        self.row_number_offset.store(offset, Ordering::Relaxed);
+        self.table.redraw();
+    }
+
     pub fn has_data(&self) -> bool {
         self.table.rows() > 0
     }
@@ -13859,6 +13880,14 @@ mod tests {
     use super::*;
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
+
+    #[test]
+    fn displayed_row_number_includes_the_table_browse_page_offset() {
+        assert_eq!(displayed_row_number(0, 0), 1);
+        assert_eq!(displayed_row_number(0, 499), 500);
+        assert_eq!(displayed_row_number(500, 0), 501);
+        assert_eq!(displayed_row_number(1_000, 499), 1_500);
+    }
 
     #[test]
     fn inline_editor_matches_the_table_row_height() {

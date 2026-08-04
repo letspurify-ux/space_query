@@ -29,6 +29,7 @@ use crate::ui::table_browse::{
 use crate::ui::text_buffer_access;
 use crate::ui::theme;
 use crate::ui::{IntellisensePopup, ResultTableWidget};
+use crate::utils::arithmetic::safe_div;
 
 type ResultTabsChangeCallback = Box<dyn FnMut()>;
 type ResultTabsCloseCallback = Box<dyn FnMut(ResultTabCloseTarget)>;
@@ -578,6 +579,20 @@ impl ResultTabsWidget {
         }
     }
 
+    fn table_browse_page_number(offset: u64, page_size: usize) -> u64 {
+        let page_size = u64::try_from(page_size).unwrap_or(u64::MAX).max(1);
+        safe_div(offset, page_size).saturating_add(1)
+    }
+
+    fn table_browse_tab_label_for_title(title: &str, page: u64, row_count: usize) -> String {
+        let title = title.trim();
+        if title.is_empty() || title == "Result" {
+            format!(" Page {page} ({row_count}) ")
+        } else {
+            format!(" {title} · Page {page} ({row_count}) ")
+        }
+    }
+
     fn tabs_contains_group(tabs: &Tabs, group: &Group) -> bool {
         !tabs.was_deleted() && !group.was_deleted() && tabs.find(group) < tabs.children()
     }
@@ -625,6 +640,24 @@ impl ResultTabsWidget {
         }
         group.set_label(&Self::result_tab_label_for_title(
             title, index, status, row_count,
+        ));
+        group.redraw();
+        self.sync_data_tab_strip_overflow_mode();
+        self.data_tabs.redraw();
+    }
+
+    fn update_table_browse_tab_group_label(
+        &mut self,
+        title: &str,
+        page: u64,
+        row_count: usize,
+        mut group: Group,
+    ) {
+        if self.data_tabs.was_deleted() || group.was_deleted() {
+            return;
+        }
+        group.set_label(&Self::table_browse_tab_label_for_title(
+            title, page, row_count,
         ));
         group.redraw();
         self.sync_data_tab_strip_overflow_mode();
@@ -2261,6 +2294,7 @@ impl ResultTabsWidget {
             )
         };
 
+        table.set_row_number_offset(request.offset);
         table.display_result(result);
         let logical_sql = request.logical_sql().unwrap_or_else(|_| result.sql.clone());
         let (displayed_rows, has_next) = table.postprocess_table_browse_page(
@@ -2274,7 +2308,8 @@ impl ResultTabsWidget {
         );
         let snapshot = table.snapshot_select_result();
         let descriptor = table.result_edit_descriptor_snapshot();
-        let mut filter_bar = {
+        let page_number = Self::table_browse_page_number(request.offset, request.page_size);
+        let (mut filter_bar, title, group) = {
             let mut data = self
                 .data
                 .lock()
@@ -2291,12 +2326,14 @@ impl ResultTabsWidget {
             state.loading = false;
             state.last_success = Some(snapshot);
             state.last_edit_descriptor = descriptor;
-            tab.filter_bar.clone()
+            tab.status = ResultTabStatus::Done;
+            tab.row_count = displayed_rows;
+            (tab.filter_bar.clone(), tab.title.clone(), tab.group.clone())
         };
         if let Some(filter_bar) = filter_bar.as_mut() {
             filter_bar.set_active(true);
         }
-        let _ = self.set_result_tab_state(index, ResultTabStatus::Done, displayed_rows);
+        self.update_table_browse_tab_group_label(&title, page_number, displayed_rows, group);
         self.fire_on_change_callback();
     }
 
@@ -3171,6 +3208,21 @@ mod tests {
         assert_eq!(
             ResultTabsWidget::result_tab_label_for_title("Result", 0, ResultTabStatus::Done, 12),
             " Done (12) "
+        );
+    }
+
+    #[test]
+    fn table_browse_tab_label_uses_page_number_and_current_page_row_count() {
+        assert_eq!(ResultTabsWidget::table_browse_page_number(0, 500), 1);
+        assert_eq!(ResultTabsWidget::table_browse_page_number(500, 500), 2);
+        assert_eq!(ResultTabsWidget::table_browse_page_number(1_000, 500), 3);
+        assert_eq!(
+            ResultTabsWidget::table_browse_tab_label_for_title("EMP", 2, 500),
+            " EMP · Page 2 (500) "
+        );
+        assert_eq!(
+            ResultTabsWidget::table_browse_tab_label_for_title("Result", 1, 42),
+            " Page 1 (42) "
         );
     }
 
