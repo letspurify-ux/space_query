@@ -12,7 +12,10 @@ script execution, result inspection, and session diagnostics into one app.
 - Edit SQL with syntax highlighting, IntelliSense, function signature hints,
   formatting, quick describe, file tabs, and query history.
 - Run one statement, a selection, or a complete database-aware script.
-- Inspect, sort, copy, export, and lazily fetch results in independent tabs.
+- Inspect, sort, copy, export, and lazily fetch query results in independent
+  tabs.
+- Browse tables with IntelliSense-aware WHERE and ORDER BY expressions and
+  bounded, database-side paging.
 - Track active sessions, view application logs, and recover crash details.
 
 ## Database support
@@ -202,6 +205,28 @@ constraint inspection, DDL generation, and package routine browsing. Oracle
 groups tables, views, procedures, functions, sequences, triggers, synonyms,
 and packages. MySQL/MariaDB groups tables, views, procedures, functions,
 triggers, and events, and shows sequences when the server exposes them.
+
+### Table browsing and bounded paging
+
+![Table browser with WHERE, ORDER BY, and paging controls](docs/images/table-browse.png)
+
+Double-click a table in the object browser to open its rows in a dedicated
+result tab. The filter bar above the grid keeps the **WHERE** and **ORDER BY**
+editors at equal widths as the window resizes. Enter expressions without the
+`WHERE` or `ORDER BY` keywords, press `Enter` to apply them, or use the clear
+button to reset a field.
+
+The same metadata-aware IntelliSense used by the SQL editor is available in
+both fields. Start typing or press `Ctrl+Space` (`Cmd+Space` on macOS); the
+suggestion popup opens against the active field and moves above it when there
+is not enough space below.
+
+![WHERE IntelliSense in the table browser](docs/images/table-browse-popup.png)
+
+Use the first, previous, next, and last controls below the grid and choose a
+page size of 10, 100, 250, 500, or 1,000 rows. Table browsing issues a bounded
+query for each page—Oracle uses `ROWNUM`, while MySQL and MariaDB use
+`LIMIT/OFFSET`—and does not retain a lazy-fetch cursor between pages.
 
 ### Result grid
 

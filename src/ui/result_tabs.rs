@@ -2,6 +2,7 @@ use fltk::{
     app,
     enums::{Align, CallbackReason, CallbackTrigger, Event, FrameType, Key},
     group::{Group, Tabs, TabsOverflow},
+    input::Input,
     prelude::*,
     text::{TextBuffer, TextDisplay},
 };
@@ -21,9 +22,13 @@ use crate::ui::result_table::{
     ResultPageNavigationOutcome, ResultTableContextActionCallback,
 };
 use crate::ui::tab_strip;
+use crate::ui::table_browse::{
+    TableBrowseExecuteCallback, TableBrowseFilterBar, TableBrowseNavigation,
+    TableBrowsePageRequest, TableBrowseTarget, TABLE_BROWSE_FILTER_HEIGHT,
+};
 use crate::ui::text_buffer_access;
 use crate::ui::theme;
-use crate::ui::ResultTableWidget;
+use crate::ui::{IntellisensePopup, ResultTableWidget};
 
 type ResultTabsChangeCallback = Box<dyn FnMut()>;
 type ResultTabsCloseCallback = Box<dyn FnMut(ResultTabCloseTarget)>;
@@ -71,6 +76,7 @@ pub struct ResultTabsWidget {
     execute_edit_callback: Arc<Mutex<Option<ResultGridEditExecuteCallback>>>,
     lazy_fetch_callback: LazyFetchCallback,
     context_action_callback: ResultTableContextActionCallback,
+    table_browse_callback: TableBrowseExecuteCallback,
     on_change_callback: Arc<Mutex<Option<ResultTabsChangeCallback>>>,
     on_close_callback: Arc<Mutex<Option<ResultTabsCloseCallback>>>,
     suppress_pointer_event_depth: Arc<Mutex<u32>>,
@@ -87,6 +93,33 @@ struct ResultTab {
     status: ResultTabStatus,
     row_count: usize,
     origin: Option<ExecutionOrigin>,
+    kind: ResultTabKind,
+    filter_bar: Option<TableBrowseFilterBar>,
+}
+
+#[derive(Clone)]
+enum ResultTabKind {
+    Query,
+    TableBrowse(Box<TableBrowseState>),
+}
+
+#[derive(Clone)]
+struct TableBrowseState {
+    applied_request: TableBrowsePageRequest,
+    pending_request: Option<TableBrowsePageRequest>,
+    has_next: bool,
+    loading: bool,
+    last_success: Option<QueryResult>,
+    last_edit_descriptor: Option<ResultEditDescriptor>,
+}
+
+impl TableBrowseState {
+    fn normalize_request(&self, request: &mut TableBrowsePageRequest) {
+        request.target = self.applied_request.target.clone();
+        if request.page_size == 0 {
+            request.page_size = self.applied_request.page_size;
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -747,6 +780,7 @@ impl ResultTabsWidget {
             Arc::new(Mutex::new(None));
         let lazy_fetch_callback: LazyFetchCallback = Arc::new(Mutex::new(None));
         let context_action_callback: ResultTableContextActionCallback = Arc::new(Mutex::new(None));
+        let table_browse_callback: TableBrowseExecuteCallback = Arc::new(Mutex::new(None));
         let on_change_callback: Arc<Mutex<Option<ResultTabsChangeCallback>>> =
             Arc::new(Mutex::new(None));
         let on_close_callback: Arc<Mutex<Option<ResultTabsCloseCallback>>> =
@@ -1121,6 +1155,7 @@ impl ResultTabsWidget {
             execute_edit_callback,
             lazy_fetch_callback,
             context_action_callback,
+            table_browse_callback,
             on_change_callback,
             on_close_callback,
             suppress_pointer_event_depth,
@@ -1264,6 +1299,10 @@ impl ResultTabsWidget {
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
         *self
             .context_action_callback
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+        *self
+            .table_browse_callback
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
         *self
@@ -1426,7 +1465,9 @@ impl ResultTabsWidget {
             .get_mut(index)
         {
             tab.origin = origin.clone();
-            tab.title = title.clone();
+            if matches!(tab.kind, ResultTabKind::Query) {
+                tab.title = title.clone();
+            }
         }
         let existing_group = self
             .set_result_tab_state(index, ResultTabStatus::Running, 0)
@@ -1537,6 +1578,8 @@ impl ResultTabsWidget {
                 status: ResultTabStatus::Running,
                 row_count: 0,
                 origin,
+                kind: ResultTabKind::Query,
+                filter_bar: None,
             });
             let idx = data.len().saturating_sub(1);
             let group = data.get(idx).map(|tab| tab.group.clone());
@@ -1572,6 +1615,245 @@ impl ResultTabsWidget {
         let index = self.tab_count();
         self.start_statement_with_selection(index, label, select_tab, Some(id));
         self.result_tab_index_for_id(id)
+    }
+
+    pub(crate) fn ensure_table_browse_tab_by_id(
+        &mut self,
+        id: ResultTabId,
+        target: TableBrowseTarget,
+        intellisense_data: Arc<Mutex<crate::ui::IntellisenseData>>,
+        page_size: usize,
+        select_tab: bool,
+    ) -> Option<usize> {
+        let label = target.table_name.clone();
+        let index = self.ensure_statement_tab_by_id(id, &label, select_tab)?;
+        let already_configured = self
+            .data
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(index)
+            .is_some_and(|tab| matches!(tab.kind, ResultTabKind::TableBrowse(_)));
+        if already_configured {
+            return Some(index);
+        }
+
+        let (mut group, table) = {
+            let data = self
+                .data
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let tab = data.get(index)?;
+            (tab.group.clone(), tab.table.clone())
+        };
+        let mut request = TableBrowsePageRequest::first(id, target.clone());
+        if page_size > 0 {
+            request.page_size = page_size;
+        }
+        let (x, y, w, h) = (group.x(), group.y(), group.w(), group.h());
+        group.begin();
+        let filter_bar = TableBrowseFilterBar::new(
+            x,
+            y,
+            w,
+            target,
+            intellisense_data,
+            id,
+            self.table_browse_callback.clone(),
+        );
+        group.end();
+
+        let mut table_widget = table.get_widget();
+        table_widget.resize(
+            x,
+            y + TABLE_BROWSE_FILTER_HEIGHT,
+            w,
+            (h - TABLE_BROWSE_FILTER_HEIGHT).max(1),
+        );
+        group.resizable(&table_widget);
+        let mut filter_for_resize = filter_bar.clone();
+        let mut table_for_resize = table_widget.clone();
+        group.resize_callback(move |group, x, y, w, h| {
+            filter_for_resize.layout(x, y, w);
+            table_for_resize.resize(
+                x,
+                y + TABLE_BROWSE_FILTER_HEIGHT,
+                w,
+                (h - TABLE_BROWSE_FILTER_HEIGHT).max(1),
+            );
+            group.redraw();
+        });
+
+        {
+            let mut data = self
+                .data
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if let Some(tab) = data.get_mut(index) {
+                tab.title = label;
+                tab.kind = ResultTabKind::TableBrowse(Box::new(TableBrowseState {
+                    applied_request: request,
+                    pending_request: None,
+                    has_next: false,
+                    loading: false,
+                    last_success: None,
+                    last_edit_descriptor: None,
+                }));
+                tab.filter_bar = Some(filter_bar);
+            }
+        }
+        let _ = self.set_result_tab_state(index, ResultTabStatus::Running, 0);
+        Some(index)
+    }
+
+    pub(crate) fn set_table_browse_callback(&mut self, callback: TableBrowseExecuteCallback) {
+        let mut callback_fn = callback
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take();
+        *self
+            .table_browse_callback
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = callback_fn.take();
+    }
+
+    pub(crate) fn is_table_browse_tab(&self, id: ResultTabId) -> bool {
+        self.result_tab_index_for_id(id).is_some_and(|index| {
+            self.data
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .get(index)
+                .is_some_and(|tab| matches!(tab.kind, ResultTabKind::TableBrowse(_)))
+        })
+    }
+
+    pub(crate) fn table_browse_is_loading(&self, id: ResultTabId) -> bool {
+        self.result_tab_index_for_id(id).is_some_and(|index| {
+            self.data
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .get(index)
+                .is_some_and(
+                    |tab| matches!(&tab.kind, ResultTabKind::TableBrowse(state) if state.loading),
+                )
+        })
+    }
+
+    pub(crate) fn table_browse_applied_request(
+        &self,
+        id: ResultTabId,
+    ) -> Option<TableBrowsePageRequest> {
+        let index = self.result_tab_index_for_id(id)?;
+        let data = self
+            .data
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let ResultTabKind::TableBrowse(state) = &data.get(index)?.kind else {
+            return None;
+        };
+        Some(state.applied_request.clone())
+    }
+
+    pub(crate) fn current_table_browse_page_size(&self) -> Option<usize> {
+        let index = (*self
+            .active_index
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()))?;
+        let data = self
+            .data
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let ResultTabKind::TableBrowse(state) = &data.get(index)?.kind else {
+            return None;
+        };
+        Some(state.applied_request.page_size)
+    }
+
+    pub(crate) fn capture_table_browse_current_page(&mut self, id: ResultTabId) -> bool {
+        let Some(index) = self.result_tab_index_for_id(id) else {
+            return false;
+        };
+        let mut data = self
+            .data
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let Some(tab) = data.get_mut(index) else {
+            return false;
+        };
+        if !matches!(&tab.kind, ResultTabKind::TableBrowse(_)) {
+            return false;
+        }
+        let snapshot = tab.table.snapshot_select_result();
+        let descriptor = tab.table.result_edit_descriptor_snapshot();
+        let ResultTabKind::TableBrowse(state) = &mut tab.kind else {
+            return false;
+        };
+        state.last_success = Some(snapshot);
+        if descriptor.is_some() {
+            state.last_edit_descriptor = descriptor;
+        }
+        true
+    }
+
+    pub(crate) fn normalize_table_browse_request(
+        &self,
+        request: &mut TableBrowsePageRequest,
+    ) -> bool {
+        let Some(index) = self.result_tab_index_for_id(request.result_tab_id) else {
+            return false;
+        };
+        let data = self
+            .data
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let Some(ResultTabKind::TableBrowse(state)) = data.get(index).map(|tab| &tab.kind) else {
+            return false;
+        };
+        state.normalize_request(request);
+        true
+    }
+
+    pub(crate) fn begin_table_browse_request(
+        &mut self,
+        request: TableBrowsePageRequest,
+    ) -> Result<(), String> {
+        let Some(index) = self.result_tab_index_for_id(request.result_tab_id) else {
+            return Err("The table result tab is closed.".to_string());
+        };
+        let (row_count, mut filter_bar) = {
+            let mut data = self
+                .data
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let Some(tab) = data.get_mut(index) else {
+                return Err("The table result tab is closed.".to_string());
+            };
+            let ResultTabKind::TableBrowse(state) = &mut tab.kind else {
+                return Err("The active result is not a table browse tab.".to_string());
+            };
+            state.pending_request = Some(request);
+            state.loading = true;
+            (tab.row_count, tab.filter_bar.clone())
+        };
+        if let Some(filter_bar) = filter_bar.as_mut() {
+            filter_bar.set_active(false);
+        }
+        let _ = self.set_result_tab_state(index, ResultTabStatus::Running, row_count);
+        Ok(())
+    }
+
+    pub(crate) fn table_browse_initial_request(
+        &self,
+        id: ResultTabId,
+    ) -> Option<TableBrowsePageRequest> {
+        let index = self.result_tab_index_for_id(id)?;
+        let data = self
+            .data
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let ResultTabKind::TableBrowse(state) = &data.get(index)?.kind else {
+            return None;
+        };
+        Some(state.applied_request.clone())
     }
 
     fn start_streaming(&mut self, index: usize, columns: &[String], null_text: &str) {
@@ -1933,6 +2215,16 @@ impl ResultTabsWidget {
     }
 
     fn display_result(&mut self, index: usize, result: &crate::db::QueryResult) {
+        let is_table_browse = self
+            .data
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(index)
+            .is_some_and(|tab| matches!(tab.kind, ResultTabKind::TableBrowse(_)));
+        if is_table_browse {
+            self.display_table_browse_result(index, result);
+            return;
+        }
         let status = ResultTabStatus::from_query_result(result);
         let table = self
             .set_result_tab_state(index, status, result.row_count)
@@ -1942,6 +2234,116 @@ impl ResultTabsWidget {
             table.display_result(result);
         }
         self.fire_on_change_callback();
+    }
+
+    fn display_table_browse_result(&mut self, index: usize, result: &QueryResult) {
+        if !result.success || !result.is_select {
+            self.fail_table_browse_result(index);
+            return;
+        }
+        let (request, mut table) = {
+            let data = self
+                .data
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let Some(tab) = data.get(index) else {
+                return;
+            };
+            let ResultTabKind::TableBrowse(state) = &tab.kind else {
+                return;
+            };
+            (
+                state
+                    .pending_request
+                    .clone()
+                    .unwrap_or_else(|| state.applied_request.clone()),
+                tab.table.clone(),
+            )
+        };
+
+        table.display_result(result);
+        let logical_sql = request.logical_sql().unwrap_or_else(|_| result.sql.clone());
+        let (displayed_rows, has_next) = table.postprocess_table_browse_page(
+            request.page_size,
+            request
+                .target
+                .db_type
+                .table_browse_spec()
+                .strips_page_helper_column,
+            &logical_sql,
+        );
+        let snapshot = table.snapshot_select_result();
+        let descriptor = table.result_edit_descriptor_snapshot();
+        let mut filter_bar = {
+            let mut data = self
+                .data
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let Some(tab) = data.get_mut(index) else {
+                return;
+            };
+            let ResultTabKind::TableBrowse(state) = &mut tab.kind else {
+                return;
+            };
+            state.applied_request = request;
+            state.pending_request = None;
+            state.has_next = has_next;
+            state.loading = false;
+            state.last_success = Some(snapshot);
+            state.last_edit_descriptor = descriptor;
+            tab.filter_bar.clone()
+        };
+        if let Some(filter_bar) = filter_bar.as_mut() {
+            filter_bar.set_active(true);
+        }
+        let _ = self.set_result_tab_state(index, ResultTabStatus::Done, displayed_rows);
+        self.fire_on_change_callback();
+    }
+
+    fn fail_table_browse_result(&mut self, index: usize) {
+        let (last_success, descriptor, row_count, mut table, mut filter_bar) = {
+            let mut data = self
+                .data
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let Some(tab) = data.get_mut(index) else {
+                return;
+            };
+            let ResultTabKind::TableBrowse(state) = &mut tab.kind else {
+                return;
+            };
+            state.pending_request = None;
+            state.loading = false;
+            let row_count = state
+                .last_success
+                .as_ref()
+                .map(|result| result.rows.len())
+                .unwrap_or(tab.row_count);
+            (
+                state.last_success.clone(),
+                state.last_edit_descriptor.clone(),
+                row_count,
+                tab.table.clone(),
+                tab.filter_bar.clone(),
+            )
+        };
+        if let Some(last_success) = last_success {
+            table.display_result(&last_success);
+            if let Some(descriptor) = descriptor {
+                table.set_result_edit_descriptor(descriptor);
+            }
+        }
+        if let Some(filter_bar) = filter_bar.as_mut() {
+            filter_bar.set_active(true);
+        }
+        let _ = self.set_result_tab_state(index, ResultTabStatus::Error, row_count);
+        self.fire_on_change_callback();
+    }
+
+    pub(crate) fn fail_table_browse_result_by_id(&mut self, id: ResultTabId) {
+        if let Some(index) = self.result_tab_index_for_id(id) {
+            self.fail_table_browse_result(index);
+        }
     }
 
     pub(crate) fn display_result_by_id(
@@ -2218,20 +2620,170 @@ impl ResultTabsWidget {
         }
     }
 
+    fn table_browse_navigation_request<F>(&mut self, build: F) -> Option<TableBrowsePageRequest>
+    where
+        F: FnOnce(&TableBrowseState) -> Option<TableBrowsePageRequest>,
+    {
+        let index = (*self
+            .active_index
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()))?;
+        let data = self
+            .data
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let tab = data.get(index)?;
+        let ResultTabKind::TableBrowse(state) = &tab.kind else {
+            return None;
+        };
+        if state.loading {
+            return None;
+        }
+        build(state)
+    }
+
+    fn current_is_table_browse(&self) -> bool {
+        let index = *self
+            .active_index
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        index.is_some_and(|index| {
+            self.data
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .get(index)
+                .is_some_and(|tab| matches!(tab.kind, ResultTabKind::TableBrowse(_)))
+        })
+    }
+
+    fn invoke_table_browse_request(&self, request: TableBrowsePageRequest) -> bool {
+        let mut callback = self
+            .table_browse_callback
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take();
+        let result = callback
+            .as_mut()
+            .map(|callback| callback(request))
+            .unwrap_or_else(|| Err("Table browse callback is unavailable.".to_string()));
+        let mut callback_guard = self
+            .table_browse_callback
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if callback_guard.is_none() {
+            *callback_guard = callback;
+        }
+        drop(callback_guard);
+        match result {
+            Ok(()) => true,
+            Err(message) => {
+                crate::ui::alert_on_main(&message);
+                false
+            }
+        }
+    }
+
     pub(crate) fn page_current_first(&mut self) -> bool {
+        let table_browse = self.current_is_table_browse();
+        if let Some(request) = self.table_browse_navigation_request(|state| {
+            let mut request = state.applied_request.clone();
+            request.offset = 0;
+            request.navigation = TableBrowseNavigation::Page;
+            Some(request)
+        }) {
+            return self.invoke_table_browse_request(request);
+        }
+        if table_browse {
+            return false;
+        }
         self.navigate_current_page(ResultTableWidget::page_first)
     }
 
     pub(crate) fn page_current_previous(&mut self, unit: usize) -> bool {
+        let table_browse = self.current_is_table_browse();
+        if let Some(request) = self.table_browse_navigation_request(|state| {
+            (state.applied_request.offset > 0).then(|| {
+                let mut request = state.applied_request.clone();
+                request.offset = request.offset.saturating_sub(request.page_size as u64);
+                request.navigation = TableBrowseNavigation::Page;
+                request
+            })
+        }) {
+            return self.invoke_table_browse_request(request);
+        }
+        if table_browse {
+            return false;
+        }
         self.navigate_current_page(|table| table.page_previous(unit))
     }
 
     pub(crate) fn page_current_next(&mut self, unit: usize) -> bool {
+        let table_browse = self.current_is_table_browse();
+        if let Some(request) = self.table_browse_navigation_request(|state| {
+            state.has_next.then(|| {
+                let mut request = state.applied_request.clone();
+                request.offset = request
+                    .offset
+                    .saturating_add(u64::try_from(request.page_size).unwrap_or(u64::MAX));
+                request.navigation = TableBrowseNavigation::Page;
+                request
+            })
+        }) {
+            return self.invoke_table_browse_request(request);
+        }
+        if table_browse {
+            return false;
+        }
         self.navigate_current_page(|table| table.page_next(unit))
     }
 
     pub(crate) fn page_current_last(&mut self) -> bool {
+        let table_browse = self.current_is_table_browse();
+        if let Some(request) = self.table_browse_navigation_request(|state| {
+            let mut request = state.applied_request.clone();
+            request.navigation = TableBrowseNavigation::Last;
+            Some(request)
+        }) {
+            return self.invoke_table_browse_request(request);
+        }
+        if table_browse {
+            return false;
+        }
         self.navigate_current_page(ResultTableWidget::page_last)
+    }
+
+    pub(crate) fn set_current_page_unit(&mut self, unit: usize) -> bool {
+        if unit == 0 {
+            return false;
+        }
+        let request = {
+            let Some(index) = *self
+                .active_index
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+            else {
+                return false;
+            };
+            let data = self
+                .data
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let Some(tab) = data.get(index) else {
+                return false;
+            };
+            let ResultTabKind::TableBrowse(state) = &tab.kind else {
+                return false;
+            };
+            if state.loading || state.applied_request.page_size == unit {
+                return false;
+            }
+            let mut request = state.applied_request.clone();
+            request.page_size = unit;
+            request.offset = 0;
+            request.navigation = TableBrowseNavigation::Page;
+            request
+        };
+        self.invoke_table_browse_request(request)
     }
 
     pub fn copy(&self) -> usize {
@@ -2267,6 +2819,26 @@ impl ResultTabsWidget {
         }
     }
 
+    pub(crate) fn capture_tour_show_table_browse_popup(
+        &mut self,
+    ) -> Option<(Input, Arc<Mutex<IntellisensePopup>>)> {
+        let index = {
+            let active_index = self
+                .active_index
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            (*active_index)?
+        };
+        let mut filter_bar = self
+            .data
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(index)?
+            .filter_bar
+            .clone()?;
+        Some(filter_bar.capture_tour_show_where_popup())
+    }
+
     pub fn paste_from_clipboard(&self) -> bool {
         if let Some(mut table) = self.current_table() {
             table.paste_from_clipboard();
@@ -2284,6 +2856,10 @@ impl ResultTabsWidget {
         // 4. Delete parent container
 
         Self::record_data_tab_strip_removal_for(&tab.group, &self.data_tab_strip_state);
+
+        if let Some(filter_bar) = tab.filter_bar.as_ref() {
+            filter_bar.hide_popups();
+        }
 
         // Step 1: Cleanup the table widget (clears callbacks and data buffers)
         tab.table.cleanup();
@@ -2464,7 +3040,10 @@ mod tests {
     use crate::ui::sql_editor::LazyFetchRequest;
     use fltk::enums::Event;
 
-    use super::{ResultTabStatus, ResultTabsWidget};
+    use super::{
+        ResultTabId, ResultTabStatus, ResultTabsWidget, TableBrowsePageRequest, TableBrowseState,
+        TableBrowseTarget,
+    };
     use crate::ui::font_settings::FONT_PROFILES;
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
@@ -2636,6 +3215,36 @@ mod tests {
             ResultTabStatus::Canceling.status_bar_message(),
             ResultTabStatus::Canceling.label()
         );
+    }
+
+    #[test]
+    fn table_browse_request_normalization_preserves_an_explicit_page_size() {
+        let target = TableBrowseTarget::new(
+            crate::db::DatabaseType::MySQL,
+            Some("APP".to_string()),
+            "EMP".to_string(),
+            "`APP`.`EMP`".to_string(),
+            "APP.EMP".to_string(),
+        );
+        let applied_request = TableBrowsePageRequest::first(ResultTabId::new(7), target);
+        let state = TableBrowseState {
+            applied_request: applied_request.clone(),
+            pending_request: None,
+            has_next: false,
+            loading: false,
+            last_success: None,
+            last_edit_descriptor: None,
+        };
+
+        let mut explicit = applied_request.clone();
+        explicit.page_size = 100;
+        state.normalize_request(&mut explicit);
+        assert_eq!(explicit.page_size, 100);
+
+        let mut inherited = applied_request;
+        inherited.page_size = 0;
+        state.normalize_request(&mut inherited);
+        assert_eq!(inherited.page_size, 500);
     }
 
     #[test]

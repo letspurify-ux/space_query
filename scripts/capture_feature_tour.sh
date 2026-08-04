@@ -33,6 +33,12 @@ if [[ "$capture_mode" == "object-browser" ]]; then
   exit 0
 fi
 
+if [[ "$capture_mode" == "table-browse-popup" ]]; then
+  convert_capture table-browse table-browse
+  convert_capture table-browse-popup-100 table-browse-popup
+  exit 0
+fi
+
 convert_capture main main-window
 convert_capture connect connection-dialog
 convert_capture intellisense intellisense
@@ -41,6 +47,8 @@ convert_capture object-browser object-browser
 convert_capture formatting-before sql-formatting-before
 convert_capture formatting-after sql-formatting-after
 convert_capture result-grid result-grid
+convert_capture table-browse table-browse
+convert_capture table-browse-popup-100 table-browse-popup
 convert_capture result-editing result-grid-editing
 convert_capture settings settings
 convert_capture query-history query-history

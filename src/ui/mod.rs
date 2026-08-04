@@ -23,6 +23,7 @@ pub(crate) mod sql_depth;
 pub mod sql_editor;
 pub mod syntax_highlight;
 pub(crate) mod tab_strip;
+pub mod table_browse;
 pub(crate) mod text_buffer_access;
 pub mod theme;
 pub(crate) mod ui_timeout;
@@ -57,6 +58,7 @@ pub use result_tabs::*;
 pub use settings_dialog::*;
 pub use sql_editor::*;
 pub use syntax_highlight::*;
+pub use table_browse::*;
 
 #[derive(Clone)]
 pub struct ResultTabRequest {

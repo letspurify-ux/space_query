@@ -2337,7 +2337,12 @@ impl SqlEditorWidget {
     }
 
     fn should_use_lazy_fetch_for_single_statement(items: &[ScriptItem]) -> bool {
-        items.len() == 1 && matches!(items[0], ScriptItem::Statement(_))
+        items.len() == 1
+            && matches!(
+                &items[0],
+                ScriptItem::Statement(sql)
+                    if !sql.contains(crate::ui::table_browse::TABLE_BROWSE_MATERIALIZE_MARKER)
+            )
     }
 
     fn determinate_batch_total(items: &[ScriptItem]) -> Option<usize> {
@@ -2350,6 +2355,13 @@ impl SqlEditorWidget {
 
     pub fn execute_sql_text(&self, sql: &str) {
         self.execute_sql(sql, false);
+    }
+
+    pub(crate) fn execute_materialized_sql_text(&self, sql: &str) -> bool {
+        if !sql.contains(crate::ui::table_browse::TABLE_BROWSE_MATERIALIZE_MARKER) {
+            return false;
+        }
+        self.try_execute_sql(sql, false)
     }
 
     pub fn execute_result_edit(&self, request: crate::db::ResultEditRequest) -> Result<(), String> {
@@ -26479,6 +26491,20 @@ mod query_execution_cleanup_tests {
             ScriptItem::Statement("select 1 from dual".to_string()),
             ScriptItem::Statement("select 2 from dual".to_string()),
         ];
+
+        assert!(!SqlEditorWidget::should_use_lazy_fetch_for_single_statement(&items));
+    }
+
+    #[test]
+    fn table_browse_marker_forces_single_statement_materialization() {
+        let sql = format!(
+            "SELECT /* {} */ * FROM EMP",
+            crate::ui::table_browse::TABLE_BROWSE_MATERIALIZE_MARKER
+        );
+        let items = crate::ui::sql_editor::query_text::split_script_items_for_db_type(
+            &sql,
+            Some(crate::db::DatabaseType::MySQL),
+        );
 
         assert!(!SqlEditorWidget::should_use_lazy_fetch_for_single_statement(&items));
     }

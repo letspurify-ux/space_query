@@ -136,6 +136,25 @@ fn window_by_label(label: &str) -> Option<Window> {
     None
 }
 
+fn window_by_root_bounds(
+    position: (i32, i32),
+    dimensions: (i32, i32),
+    excluded: &Window,
+) -> Option<Window> {
+    let excluded_ptr = excluded.as_widget_ptr();
+    let mut current = app::first_window().map(|window| unsafe { Window::from_widget(window) });
+    while let Some(window) = current {
+        current = app::next_window(&window).map(|next| unsafe { Window::from_widget(next) });
+        if window.as_widget_ptr() != excluded_ptr
+            && (window.x_root(), window.y_root()) == position
+            && (window.w(), window.h()) == dimensions
+        {
+            return Some(window);
+        }
+    }
+    None
+}
+
 fn verify_control_heights(group: fltk::group::Group, context: &str) {
     fn verify<W: WidgetExt>(widget: &W, kind: &str, context: &str) {
         if widget.w() > 0 && widget.h() > 0 && widget.h() != BUTTON_HEIGHT {
@@ -778,6 +797,89 @@ fn capture_result_grid(main_window: &mut MainWindow) {
     }
 }
 
+fn capture_table_browse_popup(main_window: &mut MainWindow) {
+    let columns = [
+        ("EMPNO", "NUMBER"),
+        ("ENAME", "VARCHAR2"),
+        ("JOB", "VARCHAR2"),
+        ("DEPTNO", "NUMBER"),
+        ("SAL", "NUMBER"),
+    ];
+    let rows: &[&[&str]] = &[
+        &["7369", "SMITH", "CLERK", "20", "800"],
+        &["7499", "ALLEN", "SALESMAN", "30", "1600"],
+        &["7521", "WARD", "SALESMAN", "30", "1250"],
+        &["7566", "JONES", "MANAGER", "20", "2975"],
+    ];
+    let (where_input, popup) = main_window
+        .capture_tour_show_table_browse_popup(make_result(
+            &columns,
+            rows,
+            "SELECT * FROM SCOTT.EMP ORDER BY EMPNO",
+        ))
+        .unwrap_or_else(|err| fail(format!("show table browse popup: {err}")));
+    pump(350);
+
+    let input_window = where_input
+        .window()
+        .unwrap_or_else(|| fail("WHERE input window is missing"));
+    let input_left = input_window.x_root() + where_input.x();
+    let input_top = input_window.y_root() + where_input.y();
+    let input_bottom = input_top + where_input.h();
+    let (actual_position, popup_dimensions, visible) = {
+        let popup = popup
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        (
+            popup.popup_position(),
+            popup.popup_dimensions(),
+            popup.is_visible(),
+        )
+    };
+    if !visible {
+        fail("table browse completion popup is not visible");
+    }
+    let aligned_below = actual_position.1 == input_bottom;
+    let aligned_above = actual_position.1 + popup_dimensions.1 == input_top;
+    if actual_position.0 != input_left || (!aligned_below && !aligned_above) {
+        fail(format!(
+            "table browse popup position {actual_position:?} size {popup_dimensions:?} is not aligned with WHERE input ({input_left}, {input_top})-({input_left}, {input_bottom})"
+        ));
+    }
+
+    let mut main =
+        app::widget_from_id::<Window>("main_window").unwrap_or_else(|| fail("main window"));
+    let main_x = main.x_root();
+    let main_y = main.y_root();
+    let (mut canvas, width, height) = capture_complete_rgb(&mut main);
+    let mut popup_window = window_by_root_bounds(actual_position, popup_dimensions, &main)
+        .unwrap_or_else(|| fail("table browse popup window"));
+    composite_popup(
+        &mut canvas,
+        width,
+        height,
+        main_x,
+        main_y,
+        &mut popup_window,
+    );
+    let scale = std::env::var("SPACE_QUERY_CAPTURE_UI_SCALE")
+        .ok()
+        .and_then(|value| value.parse::<u32>().ok())
+        .unwrap_or(100);
+    save_ppm(
+        &format!("/tmp/space-query-table-browse-popup-{scale}.ppm"),
+        &canvas,
+        width,
+        height,
+    );
+    popup
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .hide();
+    pump(120);
+    save_main("/tmp/space-query-table-browse.ppm");
+}
+
 fn capture_result_editing(main_window: &mut MainWindow) {
     let columns = [
         ("ROWID", "ROWID"),
@@ -1104,12 +1206,18 @@ fn main() {
         app::quit();
         return;
     }
+    if capture_mode.as_deref() == Some("table-browse-popup") {
+        capture_table_browse_popup(&mut main_window);
+        app::quit();
+        return;
+    }
 
     capture_object_browser(&mut main_window);
     capture_intellisense(&mut main_window);
     capture_signature_popup(&mut main_window);
     capture_formatting(&mut main_window);
     capture_result_grid(&mut main_window);
+    capture_table_browse_popup(&mut main_window);
     capture_result_editing(&mut main_window);
     capture_session_activity(&mut main_window);
     capture_dialogs(&config);

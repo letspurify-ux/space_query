@@ -47,7 +47,8 @@ use crate::ui::{
     ObjectBrowserMetadataSnapshot, QualifiedMemberKind, QueryCancelOutcome, QueryHistoryDialog,
     QueryOperationToken, QueryProgress, QueryTabId, QueryTabsWidget, ResultMessageKind,
     ResultTabCloseTarget, ResultTabId, ResultTabRequest, ResultTabStatus, ResultTabsWidget,
-    SqlAction, SqlEditorContextAction, SqlEditorWidget,
+    SqlAction, SqlEditorContextAction, SqlEditorWidget, TableBrowseExecuteCallback,
+    TableBrowseNavigation, TableBrowsePageRequest, TableBrowseTarget,
 };
 use crate::utils::arithmetic::{safe_div, safe_div_f64_to_usize, safe_rem};
 use crate::utils::{malloc_trim_process, AppConfig, QueryHistory};
@@ -833,6 +834,19 @@ struct QueryProgressContext {
     total_units: Option<usize>,
 }
 
+#[derive(Clone)]
+struct PendingTableBrowseLast {
+    request: TableBrowsePageRequest,
+    rows: Vec<Vec<String>>,
+    error: Option<String>,
+}
+
+#[derive(Clone)]
+struct PendingTableBrowseRefresh {
+    request: TableBrowsePageRequest,
+    error: Option<String>,
+}
+
 fn status_connection_label(
     connection_info: Option<&crate::db::ConnectionInfo>,
     has_live_connection: bool,
@@ -1514,6 +1528,7 @@ pub struct AppState {
     result_delete_btn: Button,
     result_save_btn: Button,
     result_cancel_btn: Button,
+    result_page_unit_choice: Choice,
     execute_btn: Button,
     query_cancel_btn: Button,
     query_cancel_hovered: Arc<AtomicBool>,
@@ -1523,6 +1538,8 @@ pub struct AppState {
     transaction_isolation_choice: Choice,
     transaction_access_choice: Choice,
     result_grid_execution_targets: HashMap<QueryTabId, ResultTabId>,
+    pending_table_browse_last: HashMap<QueryTabId, PendingTableBrowseLast>,
+    pending_table_browse_refresh: HashMap<QueryTabId, PendingTableBrowseRefresh>,
     progress_contexts: HashMap<QueryTabId, QueryProgressContext>,
     abandoned_query_operations: HashSet<QueryOperationToken>,
     pending_query_cancellations: HashMap<QueryOperationToken, QueryCancelPhase>,
@@ -1583,6 +1600,13 @@ fn result_page_unit_for_choice_index(index: i32) -> usize {
         .and_then(|index| RESULT_PAGE_UNITS.get(index))
         .copied()
         .unwrap_or(RESULT_PAGE_UNITS[RESULT_PAGE_DEFAULT_UNIT_INDEX])
+}
+
+fn result_page_choice_index_for_unit(unit: usize) -> Option<i32> {
+    RESULT_PAGE_UNITS
+        .iter()
+        .position(|candidate| *candidate == unit)
+        .and_then(|index| i32::try_from(index).ok())
 }
 
 fn result_page_control_center_offsets(available_width: i32) -> (i32, i32) {
@@ -3652,6 +3676,13 @@ impl AppState {
     }
 
     fn refresh_result_edit_controls(&mut self) {
+        if let Some(page_size) = self.result_tabs.current_table_browse_page_size() {
+            if let Some(index) = result_page_choice_index_for_unit(page_size) {
+                if self.result_page_unit_choice.value() != index {
+                    self.result_page_unit_choice.set_value(index);
+                }
+            }
+        }
         let origin_is_current = self.active_result_origin_is_current();
         let can_edit = origin_is_current && self.result_tabs.can_current_begin_edit_mode();
         let edit_active = self.result_tabs.is_current_edit_mode_enabled();
@@ -6374,6 +6405,7 @@ impl MainWindow {
             result_delete_btn: edit_delete_btn.clone(),
             result_save_btn: edit_save_btn.clone(),
             result_cancel_btn: edit_cancel_btn.clone(),
+            result_page_unit_choice: page_unit_choice.clone(),
             execute_btn: execute_btn.clone(),
             query_cancel_btn: cancel_btn.clone(),
             query_cancel_hovered,
@@ -6383,6 +6415,8 @@ impl MainWindow {
             transaction_isolation_choice: transaction_isolation_choice.clone(),
             transaction_access_choice: transaction_access_choice.clone(),
             result_grid_execution_targets: HashMap::new(),
+            pending_table_browse_last: HashMap::new(),
+            pending_table_browse_refresh: HashMap::new(),
             progress_contexts: HashMap::new(),
             abandoned_query_operations: HashSet::new(),
             pending_query_cancellations: HashMap::new(),
@@ -6543,6 +6577,18 @@ impl MainWindow {
             let mut result_tabs =
                 MainWindow::clone_result_tabs_for_page_action(&state_for_page_last);
             result_tabs.page_current_last();
+            app::redraw();
+        });
+
+        let weak_state_for_page_unit = Arc::downgrade(&state);
+        page_unit_choice.set_callback(move |choice| {
+            let Some(state_for_page_unit) = weak_state_for_page_unit.upgrade() else {
+                return;
+            };
+            let unit = result_page_unit_for_choice_index(choice.value());
+            let mut result_tabs =
+                MainWindow::clone_result_tabs_for_page_action(&state_for_page_unit);
+            result_tabs.set_current_page_unit(unit);
             app::redraw();
         });
 
@@ -7534,6 +7580,8 @@ impl MainWindow {
             s.pending_query_cancellations
                 .retain(|token, _| token.tab_id != tab_id);
             s.result_grid_execution_targets.remove(&tab_id);
+            s.pending_table_browse_last.remove(&tab_id);
+            s.pending_table_browse_refresh.remove(&tab_id);
 
             let mut created_tab_id = None;
             let mut deferred_display_tab_id = None;
@@ -8070,6 +8118,75 @@ impl MainWindow {
         Self::start_connection_metadata_refresh(state, schema_sender)
     }
 
+    fn execute_table_browse_request(
+        state: &Arc<Mutex<AppState>>,
+        tab_id: QueryTabId,
+        mut request: TableBrowsePageRequest,
+    ) -> Result<(), String> {
+        let (editor, sql) = {
+            let mut state_guard = state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let editor = state_guard
+                .editor_tabs
+                .iter()
+                .find(|tab| tab.tab_id == tab_id)
+                .map(|tab| tab.sql_editor.clone())
+                .ok_or_else(|| "The owning query tab is closed.".to_string())?;
+            if editor.is_query_running() {
+                return Err("The owning query tab is already running a query.".to_string());
+            }
+            let mut result_tabs = state_guard
+                .result_tabs_for_tab(tab_id)
+                .ok_or_else(|| "The result workspace is closed.".to_string())?;
+            if !result_tabs.is_table_browse_tab(request.result_tab_id) {
+                return Err("The table result tab is closed.".to_string());
+            }
+            if !state_guard.result_origin_is_current_for_tab(tab_id, &result_tabs) {
+                return Err(
+                    "This table result belongs to an older connection, reconnect, or scope."
+                        .to_string(),
+                );
+            }
+            if !result_tabs.normalize_table_browse_request(&mut request) {
+                return Err("The table result tab is closed.".to_string());
+            }
+            let sql = match request.navigation {
+                TableBrowseNavigation::Page => request.page_sql()?,
+                TableBrowseNavigation::Last => request.count_sql()?,
+            };
+            result_tabs.begin_table_browse_request(request.clone())?;
+            state_guard
+                .result_grid_execution_targets
+                .insert(tab_id, request.result_tab_id);
+            if request.navigation == TableBrowseNavigation::Last {
+                state_guard.pending_table_browse_last.insert(
+                    tab_id,
+                    PendingTableBrowseLast {
+                        request: request.clone(),
+                        rows: Vec::new(),
+                        error: None,
+                    },
+                );
+            }
+            (editor, sql)
+        };
+
+        if editor.execute_materialized_sql_text(&sql) {
+            Ok(())
+        } else {
+            let mut state_guard = state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            state_guard.result_grid_execution_targets.remove(&tab_id);
+            state_guard.pending_table_browse_last.remove(&tab_id);
+            if let Some(mut result_tabs) = state_guard.result_tabs_for_tab(tab_id) {
+                result_tabs.fail_table_browse_result_by_id(request.result_tab_id);
+            }
+            Err("Failed to start table page query execution.".to_string())
+        }
+    }
+
     fn configure_result_workspace_callbacks(state: &Arc<Mutex<AppState>>, tab_id: QueryTabId) {
         let Some(mut result_tabs) = state
             .lock()
@@ -8090,6 +8207,17 @@ impl MainWindow {
                 }
             };
         });
+
+        let weak_state_for_table_browse = Arc::downgrade(state);
+        let table_browse_callback: TableBrowseExecuteCallback = Arc::new(Mutex::new(Some(
+            Box::new(move |request: TableBrowsePageRequest| {
+                let Some(state_for_table_browse) = weak_state_for_table_browse.upgrade() else {
+                    return Err("Main window is no longer available.".to_string());
+                };
+                MainWindow::execute_table_browse_request(&state_for_table_browse, tab_id, request)
+            }),
+        )));
+        result_tabs.set_table_browse_callback(table_browse_callback);
 
         let weak_state_for_grid_edit = Arc::downgrade(state);
         let result_tabs_for_grid_edit = result_tabs.clone();
@@ -8119,12 +8247,25 @@ impl MainWindow {
                 let target_tab = result_tabs_for_grid_edit
                     .active_result_id()
                     .ok_or_else(|| "Open a result tab first.".to_string())?;
+                if let Some(mut request) =
+                    result_tabs_for_grid_edit.table_browse_applied_request(target_tab)
+                {
+                    request.navigation = TableBrowseNavigation::Page;
+                    state.pending_table_browse_refresh.insert(
+                        tab_id,
+                        PendingTableBrowseRefresh {
+                            request,
+                            error: None,
+                        },
+                    );
+                }
                 state
                     .result_grid_execution_targets
                     .insert(tab_id, target_tab);
                 editor.execute_sql_text(&sql);
                 if !editor.is_query_running() {
                     state.result_grid_execution_targets.remove(&tab_id);
+                    state.pending_table_browse_refresh.remove(&tab_id);
                     return Err("Failed to start query execution for result-grid edit.".to_string());
                 }
                 Ok(())
@@ -8161,11 +8302,24 @@ impl MainWindow {
                 let target_tab = result_tabs_for_structured_edit
                     .active_result_id()
                     .ok_or_else(|| "Open a result tab first.".to_string())?;
+                if let Some(mut page_request) =
+                    result_tabs_for_structured_edit.table_browse_applied_request(target_tab)
+                {
+                    page_request.navigation = TableBrowseNavigation::Page;
+                    state.pending_table_browse_refresh.insert(
+                        tab_id,
+                        PendingTableBrowseRefresh {
+                            request: page_request,
+                            error: None,
+                        },
+                    );
+                }
                 state
                     .result_grid_execution_targets
                     .insert(tab_id, target_tab);
                 if let Err(error) = editor.execute_result_edit(request) {
                     state.result_grid_execution_targets.remove(&tab_id);
+                    state.pending_table_browse_refresh.remove(&tab_id);
                     return Err(error);
                 }
                 Ok(())
@@ -8493,6 +8647,10 @@ impl MainWindow {
                     let one_tab_per_query = s.result_one_tab_per_query_check.value();
                     let grid_execution_target =
                         s.result_grid_execution_targets.get(&tab_id).copied();
+                    let table_browse_page_loading = grid_execution_target.is_some_and(|target| {
+                        owning_result_tabs.table_browse_is_loading(target)
+                    });
+                    let table_browse_counting = s.pending_table_browse_last.contains_key(&tab_id);
                     let lazy_fetch_sessions = if !one_tab_per_query
                         && grid_execution_target.is_none()
                     {
@@ -8520,6 +8678,11 @@ impl MainWindow {
                         connection_id,
                         status_activity,
                     );
+                    if table_browse_counting {
+                        context.update_status_activity("Counting rows for last page");
+                    } else if table_browse_page_loading {
+                        context.update_status_activity("Loading table page");
+                    }
                     if s.query_cancel_is_dispatched(operation_token) {
                         context.state_label = ResultTabStatus::Canceling.label().to_string();
                     }
@@ -8581,6 +8744,20 @@ impl MainWindow {
                     if columns.is_empty() {
                         return;
                     }
+                    if s.pending_table_browse_last.contains_key(&tab_id) {
+                        let result_tabs = owning_result_tabs.clone();
+                        let Some(context) = s.progress_contexts.get_mut(&tab_id) else {
+                            return;
+                        };
+                        let _ = context.ensure_result_tab_id(index, || {
+                            result_tabs.reserve_result_tab_id()
+                        });
+                        context.fetch_row_counts.insert(index, 0);
+                        context.active_statement_index = Some(index);
+                        context.state_label = ResultTabStatus::Fetching.label().to_string();
+                        context.update_status_activity("Counting rows for last page");
+                        return;
+                    }
                     let mut result_tabs = owning_result_tabs.clone();
                     let pending_canceling_sessions =
                         s.pending_lazy_fetch_canceling_sessions.clone();
@@ -8636,6 +8813,18 @@ impl MainWindow {
                     result_tabs.set_result_edit_descriptor_by_id(result_tab_id, descriptor);
                 }
                 QueryProgress::Rows { index, rows } => {
+                    if s.pending_table_browse_last.contains_key(&tab_id) {
+                        let rows_len = rows.len();
+                        if let Some(pending) = s.pending_table_browse_last.get_mut(&tab_id) {
+                            pending.rows.extend(rows);
+                        }
+                        if let Some(context) = s.progress_contexts.get_mut(&tab_id) {
+                            let count = context.fetch_row_counts.entry(index).or_insert(0);
+                            *count = count.saturating_add(rows_len);
+                            context.active_statement_index = Some(index);
+                        }
+                        return;
+                    }
                     let Some(result_tab_id) = resolve_active_progress_tab_id(&s, tab_id, index)
                     else {
                         return;
@@ -9128,6 +9317,25 @@ impl MainWindow {
                     }
                 }
                 QueryProgress::StatementFinished { index, result, .. } => {
+                    if s.pending_table_browse_last.contains_key(&tab_id) {
+                        if let Some(pending) = s.pending_table_browse_last.get_mut(&tab_id) {
+                            if pending.rows.is_empty() && !result.rows.is_empty() {
+                                pending.rows.extend(result.rows.clone());
+                            }
+                            if !result.success {
+                                pending.error = Some(result.message.clone());
+                            }
+                        }
+                        if let Some(context) = s.progress_contexts.get_mut(&tab_id) {
+                            context.fetch_row_counts.remove(&index);
+                            context.mark_statement_finished(index);
+                            context.mark_status_unit_complete(index);
+                            let status = ResultTabStatus::from_query_result(&result);
+                            context.state_label = status.label().to_string();
+                            context.update_status_activity(status.label());
+                        }
+                        return;
+                    }
                     let should_display_data_grid = should_display_result_in_data_grid(&result);
                     let mut result_tabs = owning_result_tabs.clone();
                     let (
@@ -9161,7 +9369,12 @@ impl MainWindow {
                                 context.claim_result_tab_auto_select(),
                             )
                         } else {
-                            (context.result_tab_id_for_statement(index), false)
+                            (
+                                context
+                                    .result_tab_id_for_statement(index)
+                                    .or(context.execution_target),
+                                false,
+                            )
                         };
                         (
                             result_tab_id,
@@ -9186,8 +9399,21 @@ impl MainWindow {
                     } else if route_to_info {
                         info_lines = result.message.lines().map(|l| l.to_string()).collect();
                     }
+                    let table_browse_result = result_tab_id
+                        .is_some_and(|result_tab_id| result_tabs.is_table_browse_tab(result_tab_id));
+                    let table_browse_page_loading = result_tab_id.is_some_and(|result_tab_id| {
+                        result_tabs.table_browse_is_loading(result_tab_id)
+                    });
+                    if !result.success {
+                        if let Some(pending) = s.pending_table_browse_refresh.get_mut(&tab_id) {
+                            if result_tab_id == Some(pending.request.result_tab_id) {
+                                pending.error = Some(result.message.clone());
+                            }
+                        }
+                    }
                     let remove_empty_error_grid = result_status == ResultTabStatus::Error
                         && result_tab_id.is_some()
+                        && !table_browse_result
                         && !has_fetched_rows;
                     let remove_empty_success_grid = result_status == ResultTabStatus::Done
                         && result_tab_id.is_some()
@@ -9223,7 +9449,11 @@ impl MainWindow {
                     s.refresh_result_edit_controls();
                     drop(s);
 
-                    if remove_empty_error_grid || remove_empty_success_grid {
+                    if table_browse_page_loading && !result.success {
+                        if let Some(result_tab_id) = result_tab_id {
+                            result_tabs.fail_table_browse_result_by_id(result_tab_id);
+                        }
+                    } else if remove_empty_error_grid || remove_empty_success_grid {
                         if let Some(result_tab_id) = result_tab_id {
                             let _ = result_tabs.close_tab_by_id_and_take_lazy_fetch(result_tab_id);
                         }
@@ -9437,6 +9667,8 @@ impl MainWindow {
                         .lock()
                         .unwrap_or_else(|poisoned| poisoned.into_inner());
                     s.result_grid_execution_targets.remove(&tab_id);
+                    let pending_last = s.pending_table_browse_last.remove(&tab_id);
+                    let pending_refresh = s.pending_table_browse_refresh.remove(&tab_id);
                     if s.active_editor_tab_id == tab_id
                         && s.pending_connection_metadata_refresh
                         && s.has_live_connection
@@ -9468,6 +9700,76 @@ impl MainWindow {
                     s.render_status_bar();
                     s.refresh_result_edit_controls();
                     s.sync_transaction_mode_controls();
+                    let mut last_page_followup = None;
+                    let mut last_page_failure = None;
+                    let mut edit_page_followup = None;
+                    if let Some(pending) = pending_last {
+                        if let Some(message) = pending.error {
+                            last_page_failure = Some((pending.request.result_tab_id, message));
+                        } else {
+                            let total_rows = pending
+                                .rows
+                                .first()
+                                .and_then(|row| row.first())
+                                .map(|value| value.trim().replace(',', ""))
+                                .and_then(|value| value.parse::<u64>().ok());
+                            if let Some(total_rows) = total_rows {
+                                let mut request = pending.request;
+                                request.offset = crate::ui::table_browse::last_page_offset(
+                                    total_rows,
+                                    request.page_size,
+                                );
+                                request.navigation = TableBrowseNavigation::Page;
+                                last_page_followup = Some(request);
+                            } else {
+                                last_page_failure = Some((
+                                    pending.request.result_tab_id,
+                                    "The last-page row count could not be read.".to_string(),
+                                ));
+                            }
+                        }
+                    }
+                    if recovered_save_states == 0 {
+                        if let Some(pending) = pending_refresh {
+                            if pending.error.is_none() {
+                                let _ = result_tabs.capture_table_browse_current_page(
+                                    pending.request.result_tab_id,
+                                );
+                                edit_page_followup = Some(pending.request);
+                            }
+                        }
+                    }
+                    drop(s);
+                    if let Some((result_tab_id, message)) = last_page_failure {
+                        result_tabs.fail_table_browse_result_by_id(result_tab_id);
+                        result_tabs.append_message_lines(
+                            ResultMessageKind::Error,
+                            std::slice::from_ref(&message),
+                        );
+                        result_tabs.select_messages_errors();
+                    } else if let Some(request) = last_page_followup {
+                        let state_for_last_page = state_for_progress.clone();
+                        crate::ui::ui_timeout::schedule(0.0, move || {
+                            if let Err(message) = MainWindow::execute_table_browse_request(
+                                &state_for_last_page,
+                                tab_id,
+                                request,
+                            ) {
+                                crate::ui::alert_on_main(&message);
+                            }
+                        });
+                    } else if let Some(request) = edit_page_followup {
+                        let state_for_refresh = state_for_progress.clone();
+                        crate::ui::ui_timeout::schedule(0.0, move || {
+                            if let Err(message) = MainWindow::execute_table_browse_request(
+                                &state_for_refresh,
+                                tab_id,
+                                request,
+                            ) {
+                                crate::ui::alert_on_main(&message);
+                            }
+                        });
+                    }
                 }
             }
         });
@@ -11341,6 +11643,7 @@ impl MainWindow {
             };
             let mut created_tabs = Vec::new();
             let mut sql_to_execute: Option<String> = None;
+            let mut table_browse_to_execute: Option<(QueryTabId, TableBrowsePageRequest)> = None;
             {
                 let mut s = state_for_browser
                     .lock()
@@ -11382,6 +11685,49 @@ impl MainWindow {
                     SqlAction::Execute(sql) => {
                         sql_to_execute = Some(sql);
                     }
+                    SqlAction::BrowseTable(target) => {
+                        let Some(tab) =
+                            s.editor_tabs.iter().find(|tab| tab.tab_id == source_tab_id)
+                        else {
+                            s.set_status_message(
+                                "Table action ignored: owning query tab is unavailable",
+                            );
+                            return;
+                        };
+                        let intellisense_data = tab.intellisense_data.clone();
+                        let editor = tab.sql_editor.clone();
+                        let page_size =
+                            result_page_unit_for_choice_index(s.result_page_unit_choice.value());
+                        let execution_origin = tab.connection_binding.snapshot().execution_origin();
+                        let mut result_tabs = tab.result_tabs.clone();
+                        if editor.is_query_running() {
+                            s.set_status_message(
+                                "Table data was not opened because the owning query tab is busy",
+                            );
+                            return;
+                        }
+                        result_tabs.set_execution_origin(execution_origin);
+                        let result_tab_id = result_tabs.reserve_result_tab_id();
+                        if result_tabs
+                            .ensure_table_browse_tab_by_id(
+                                result_tab_id,
+                                target.clone(),
+                                intellisense_data,
+                                page_size,
+                                true,
+                            )
+                            .is_none()
+                        {
+                            s.set_status_message("Failed to create the table data tab");
+                            return;
+                        }
+                        editor.prefetch_intellisense_table_columns(&target.completion_name);
+                        if let Some(request) =
+                            result_tabs.table_browse_initial_request(result_tab_id)
+                        {
+                            table_browse_to_execute = Some((source_tab_id, request));
+                        }
+                    }
                     SqlAction::DisplayResult(request) => {
                         s.append_result_tab_request(request);
                     }
@@ -11404,6 +11750,14 @@ impl MainWindow {
             if let Some(sql) = sql_to_execute {
                 if let Some(editor) = acquire_sql_editor_if_idle(&state_for_browser) {
                     editor.execute_sql_text(&sql);
+                }
+            }
+
+            if let Some((tab_id, request)) = table_browse_to_execute {
+                if let Err(message) =
+                    MainWindow::execute_table_browse_request(&state_for_browser, tab_id, request)
+                {
+                    crate::ui::alert_on_main(&message);
                 }
             }
 
@@ -12520,6 +12874,48 @@ impl MainWindow {
         Ok(())
     }
 
+    #[doc(hidden)]
+    pub fn capture_tour_show_table_browse_popup(
+        &mut self,
+        result: crate::db::QueryResult,
+    ) -> Result<(fltk::input::Input, Arc<Mutex<crate::ui::IntellisensePopup>>), String> {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if state.editor_tabs.is_empty() {
+            let _ = Self::create_query_editor_tab(&mut state);
+        }
+        let intellisense_data = state.schema_intellisense_data.clone();
+        let mut result_tabs = state.result_tabs.clone();
+        result_tabs.clear();
+        let result_tab_id = result_tabs.reserve_result_tab_id();
+        let target = TableBrowseTarget::new(
+            DatabaseType::Oracle,
+            Some("SCOTT".to_string()),
+            "EMP".to_string(),
+            "SCOTT.EMP".to_string(),
+            "SCOTT.EMP".to_string(),
+        );
+        let page_size = result_page_unit_for_choice_index(state.result_page_unit_choice.value());
+        result_tabs
+            .ensure_table_browse_tab_by_id(
+                result_tab_id,
+                target,
+                intellisense_data,
+                page_size,
+                true,
+            )
+            .ok_or_else(|| "Could not create the table browse capture tab.".to_string())?;
+        result_tabs.display_result_by_id(result_tab_id, &result);
+        state.refresh_result_edit_controls();
+        let popup = result_tabs
+            .capture_tour_show_table_browse_popup()
+            .ok_or_else(|| "Could not show the table browse completion popup.".to_string())?;
+        state.window.redraw();
+        Ok(popup)
+    }
+
     pub fn show_previous_crash_report(crash_report: &str) {
         crate::utils::logging::log_warning(
             "app",
@@ -13335,6 +13731,13 @@ mod tests {
             RESULT_PAGE_UNITS[RESULT_PAGE_DEFAULT_UNIT_INDEX], 500,
             "the page unit must default to 500 rows"
         );
+        for (index, unit) in RESULT_PAGE_UNITS.into_iter().enumerate() {
+            assert_eq!(
+                result_page_choice_index_for_unit(unit),
+                i32::try_from(index).ok()
+            );
+        }
+        assert_eq!(result_page_choice_index_for_unit(42), None);
     }
 
     #[test]

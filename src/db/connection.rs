@@ -763,6 +763,18 @@ pub struct DbAdvancedSettingsFormSpec {
     pub show_mysql_ssl_ca_path: bool,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DbTableBrowsePagination {
+    Rownum,
+    LimitOffset,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DbTableBrowseSpec {
+    pub pagination: DbTableBrowsePagination,
+    pub strips_page_helper_column: bool,
+}
+
 impl DatabaseType {
     pub const ALL: [Self; 3] = [Self::Oracle, Self::MySQL, Self::MariaDB];
 
@@ -784,6 +796,10 @@ impl DatabaseType {
 
     pub fn advanced_settings_form_spec(self) -> DbAdvancedSettingsFormSpec {
         backend_for(self).advanced_settings_form_spec()
+    }
+
+    pub fn table_browse_spec(self) -> DbTableBrowseSpec {
+        backend_for(self).table_browse_spec()
     }
 
     pub fn supports_tns_alias(self) -> bool {
@@ -2220,6 +2236,7 @@ pub(crate) trait DbBackend: Sync {
     }
     fn connection_form_spec(&self) -> DbConnectionFormSpec;
     fn advanced_settings_form_spec(&self) -> DbAdvancedSettingsFormSpec;
+    fn table_browse_spec(&self) -> DbTableBrowseSpec;
     fn sql_dialect(&self) -> SqlDialect;
     fn supports_mysql_delimiter_commands(&self) -> bool;
     fn supports_explicit_analytic_null_treatment(&self) -> bool;
@@ -2522,6 +2539,13 @@ impl DbBackend for OracleBackend {
             show_oracle_nls_formats: true,
             show_mysql_session_options: false,
             show_mysql_ssl_ca_path: false,
+        }
+    }
+
+    fn table_browse_spec(&self) -> DbTableBrowseSpec {
+        DbTableBrowseSpec {
+            pagination: DbTableBrowsePagination::Rownum,
+            strips_page_helper_column: true,
         }
     }
 
@@ -2985,6 +3009,13 @@ impl DbBackend for MysqlBackend {
             show_oracle_nls_formats: false,
             show_mysql_session_options: true,
             show_mysql_ssl_ca_path: true,
+        }
+    }
+
+    fn table_browse_spec(&self) -> DbTableBrowseSpec {
+        DbTableBrowseSpec {
+            pagination: DbTableBrowsePagination::LimitOffset,
+            strips_page_helper_column: false,
         }
     }
 
@@ -7873,6 +7904,13 @@ mod tests {
         assert!(oracle_advanced.show_oracle_nls_formats);
         assert!(!oracle_advanced.show_mysql_session_options);
         assert!(!oracle_advanced.show_mysql_ssl_ca_path);
+        assert_eq!(
+            DatabaseType::Oracle.table_browse_spec(),
+            DbTableBrowseSpec {
+                pagination: DbTableBrowsePagination::Rownum,
+                strips_page_helper_column: true,
+            }
+        );
 
         let mysql = DatabaseType::MySQL.connection_form_spec();
         assert_eq!(mysql.default_port, 3306);
@@ -7884,6 +7922,13 @@ mod tests {
         assert!(!mysql_advanced.show_oracle_nls_formats);
         assert!(mysql_advanced.show_mysql_session_options);
         assert!(mysql_advanced.show_mysql_ssl_ca_path);
+        assert_eq!(
+            DatabaseType::MySQL.table_browse_spec(),
+            DbTableBrowseSpec {
+                pagination: DbTableBrowsePagination::LimitOffset,
+                strips_page_helper_column: false,
+            }
+        );
 
         let mariadb = DatabaseType::MariaDB.connection_form_spec();
         assert_eq!(mariadb.default_port, 3306);
@@ -7892,6 +7937,10 @@ mod tests {
         assert!(!mariadb.supports_tns_alias);
         let mariadb_advanced = DatabaseType::MariaDB.advanced_settings_form_spec();
         assert_eq!(mariadb_advanced, mysql_advanced);
+        assert_eq!(
+            DatabaseType::MariaDB.table_browse_spec(),
+            DatabaseType::MySQL.table_browse_spec()
+        );
     }
 
     #[test]

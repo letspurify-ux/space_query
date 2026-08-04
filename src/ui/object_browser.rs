@@ -31,6 +31,7 @@ use crate::ui::object_drag_payload;
 use crate::ui::theme;
 use crate::ui::{
     HighlightData, IntellisenseData, PopupAnchorSnapshot, QualifiedMemberKind, ResultTabRequest,
+    TableBrowseTarget,
 };
 use crate::utils::arithmetic::safe_div;
 
@@ -86,6 +87,7 @@ pub enum SqlAction {
     Insert(String),
     OpenInNewTab(String),
     Execute(String),
+    BrowseTable(TableBrowseTarget),
     DisplayResult(ResultTabRequest),
 }
 
@@ -2817,18 +2819,18 @@ impl ObjectBrowserWidget {
                                 .lock()
                                 .unwrap_or_else(|poisoned| poisoned.into_inner());
                             let scope = Self::scope_snapshot(&selected_scope);
-                            let double_click_sql =
+                            let double_click_target =
                                 Self::get_item_info(&item).and_then(|item_info| {
-                                    Self::double_click_preview_sql(
+                                    Self::double_click_browse_target(
                                         &item_info,
                                         db_type,
                                         scope.as_deref(),
                                     )
                                 });
-                            if let Some(sql) = double_click_sql {
+                            if let Some(target) = double_click_target {
                                 ObjectBrowserWidget::emit_sql_callback(
                                     &sql_callback,
-                                    SqlAction::Execute(sql),
+                                    SqlAction::BrowseTable(target),
                                 );
                                 return true;
                             }
@@ -2966,11 +2968,11 @@ impl ObjectBrowserWidget {
             .or_else(|| tree.first_visible_item())
     }
 
-    fn double_click_preview_sql(
+    fn double_click_browse_target(
         item: &ObjectItem,
         db_type: crate::db::DatabaseType,
         selected_scope: Option<&str>,
-    ) -> Option<String> {
+    ) -> Option<TableBrowseTarget> {
         let ObjectItem::Simple {
             object_type,
             object_name,
@@ -2978,8 +2980,23 @@ impl ObjectBrowserWidget {
         else {
             return None;
         };
-        (object_type == "TABLES")
-            .then(|| Self::preview_select_sql(db_type, selected_scope, object_name))
+        if object_type != "TABLES" {
+            return None;
+        }
+        let completion_name =
+            Self::qualify_object_name_for_scope(db_type, selected_scope, object_name);
+        let relation_sql = if db_type.is_mysql_or_mariadb() {
+            Self::quote_mysql_identifier_path(&completion_name)
+        } else {
+            completion_name.clone()
+        };
+        Some(TableBrowseTarget::new(
+            db_type,
+            selected_scope.map(str::to_string),
+            object_name.clone(),
+            relation_sql,
+            completion_name,
+        ))
     }
 
     fn select_tree_item(tree: &mut Tree, item: &TreeItem) {
@@ -8734,7 +8751,7 @@ mod tests {
     }
 
     #[test]
-    fn table_double_click_uses_the_top_100_execute_sql() {
+    fn table_double_click_creates_a_bounded_table_browse_target() {
         let table = ObjectItem::Simple {
             object_type: "TABLES".to_string(),
             object_name: "EMP".to_string(),
@@ -8744,15 +8761,15 @@ mod tests {
             object_name: "EMP_VIEW".to_string(),
         };
 
-        assert_eq!(
-            ObjectBrowserWidget::double_click_preview_sql(
-                &table,
-                DatabaseType::Oracle,
-                Some("SCOTT")
-            ),
-            Some("SELECT * FROM SCOTT.EMP WHERE ROWNUM <= 100".to_string())
-        );
-        assert!(ObjectBrowserWidget::double_click_preview_sql(
+        let target = ObjectBrowserWidget::double_click_browse_target(
+            &table,
+            DatabaseType::Oracle,
+            Some("SCOTT"),
+        )
+        .expect("table browse target");
+        assert_eq!(target.table_name, "EMP");
+        assert_eq!(target.relation_sql, "SCOTT.EMP");
+        assert!(ObjectBrowserWidget::double_click_browse_target(
             &view,
             DatabaseType::Oracle,
             Some("SCOTT")

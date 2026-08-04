@@ -16,7 +16,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::panic::{self, AssertUnwindSafe};
 use std::sync::atomic::{AtomicI32, AtomicU32, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::db::query::result_messages;
 use crate::db::{
@@ -118,15 +118,9 @@ enum LazyFetchPendingAction {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum PendingPageNavigationTarget {
-    Row(usize),
-    Last,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct PendingPageNavigation {
     session_id: u64,
-    target: PendingPageNavigationTarget,
+    target_row: usize,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -7937,6 +7931,129 @@ impl ResultTableWidget {
         self.table.redraw();
     }
 
+    pub(crate) fn postprocess_table_browse_page(
+        &mut self,
+        page_size: usize,
+        strip_oracle_page_column: bool,
+        logical_source_sql: &str,
+    ) -> (usize, bool) {
+        self.finish_streaming();
+
+        if strip_oracle_page_column {
+            let remove_index = {
+                let headers = self
+                    .headers
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                headers.len().checked_sub(1).filter(|index| {
+                    headers.get(*index).is_some_and(|name| {
+                        name.eq_ignore_ascii_case(crate::ui::table_browse::TABLE_BROWSE_PAGE_COLUMN)
+                    })
+                })
+            };
+            if let Some(remove_index) = remove_index {
+                self.headers
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .remove(remove_index);
+                let mut rows = self
+                    .full_data
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                for row in rows.iter_mut() {
+                    if remove_index < row.len() {
+                        row.remove(remove_index);
+                    }
+                }
+            }
+        }
+
+        {
+            let mut headers = self
+                .headers
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if headers
+                .first()
+                .is_some_and(|name| name.eq_ignore_ascii_case("SQ_INTERNAL_ROWID"))
+            {
+                headers[0] = "ROWID".to_string();
+            }
+        }
+
+        let raw_row_count = self
+            .full_data
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .len();
+        let has_next = raw_row_count > page_size;
+        if has_next {
+            self.full_data
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .truncate(page_size);
+        }
+        let displayed_rows = raw_row_count.min(page_size);
+        let column_count = self
+            .headers
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .len();
+        self.set_table_rows_for_current_font(i32::try_from(displayed_rows).unwrap_or(i32::MAX));
+        self.table
+            .set_cols(i32::try_from(column_count).unwrap_or(i32::MAX));
+        *self
+            .source_sql
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = logical_source_sql.to_string();
+        self.recalculate_widths_for_current_font();
+        self.refresh_auto_rowid_visibility();
+        self.sync_table_viewport_state();
+        self.table.redraw();
+        (displayed_rows, has_next)
+    }
+
+    pub(crate) fn snapshot_select_result(&self) -> QueryResult {
+        let headers = self
+            .headers
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        let rows = self
+            .full_data
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        let sql = self
+            .source_sql
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        QueryResult {
+            sql,
+            columns: headers
+                .into_iter()
+                .map(|name| crate::db::ColumnInfo {
+                    name,
+                    data_type: String::new(),
+                })
+                .collect(),
+            row_count: rows.len(),
+            rows,
+            execution_time: Duration::ZERO,
+            message: "Page loaded".to_string(),
+            is_select: true,
+            success: true,
+        }
+    }
+
+    pub(crate) fn result_edit_descriptor_snapshot(&self) -> Option<ResultEditDescriptor> {
+        self.result_edit_descriptor
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+    }
+
     pub fn start_streaming(&mut self, headers: &[String]) {
         mutex_store_bool(&self.streaming_in_progress, true);
         *self
@@ -8281,22 +8398,8 @@ impl ResultTableWidget {
 
     fn apply_pending_page_navigation(&mut self, pending: PendingPageNavigation) -> bool {
         let hidden_col = self.hidden_auto_rowid_col_value();
-        let moved = match pending.target {
-            PendingPageNavigationTarget::Row(target_row) => {
-                Self::move_table_selection_to_row(&mut self.table, target_row, hidden_col)
-            }
-            PendingPageNavigationTarget::Last => {
-                let selection = self.table.get_selection();
-                let col_position = Some(self.table.col_position());
-                Self::move_table_selection_to_edge_from_selection(
-                    &mut self.table,
-                    selection,
-                    ResultTableEdge::Down,
-                    hidden_col,
-                    col_position,
-                )
-            }
-        };
+        let moved =
+            Self::move_table_selection_to_row(&mut self.table, pending.target_row, hidden_col);
         if moved {
             Self::sync_drag_selection_snapshot(&self.table, &self.drag_state);
         }
@@ -8377,15 +8480,13 @@ impl ResultTableWidget {
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
             match guard.as_mut() {
                 Some(pending) if pending.session_id == session_id => {
-                    if let PendingPageNavigationTarget::Row(row) = &mut pending.target {
-                        *row = row.saturating_add(unit);
-                    }
+                    pending.target_row = pending.target_row.saturating_add(unit);
                     None
                 }
                 _ => {
                     let pending = PendingPageNavigation {
                         session_id,
-                        target: PendingPageNavigationTarget::Row(target_row),
+                        target_row,
                     };
                     *guard = Some(pending);
                     Some(pending)
@@ -8434,34 +8535,13 @@ impl ResultTableWidget {
             self.clear_pending_page_navigation();
             return ResultPageNavigationOutcome::NoChange;
         }
-        let session_id = *self
-            .lazy_fetch_session
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let fetch_requested = session_id.is_some_and(|session_id| {
-            let pending = PendingPageNavigation {
-                session_id,
-                target: PendingPageNavigationTarget::Last,
-            };
-            *self
-                .pending_page_navigation
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(pending);
-            let accepted = Self::invoke_lazy_fetch_callback(
-                &self.lazy_fetch_callback,
-                session_id,
-                LazyFetchRequest::All,
-            );
-            if !accepted {
-                self.clear_matching_pending_page_navigation(pending);
-            }
-            accepted
-        });
-        if session_id.is_none() {
-            self.clear_pending_page_navigation();
-        }
-
+        self.clear_pending_page_navigation();
         let selection = self.table.get_selection();
+        let fetch_requested =
+            self.queue_action_after_fetch_all(LazyFetchPendingAction::MoveToEdge {
+                edge: ResultTableEdge::Down,
+                selection: Some(selection),
+            });
         let col_position = Some(self.table.col_position());
         let moved = Self::move_table_selection_to_edge_from_selection(
             &mut self.table,
@@ -8523,43 +8603,31 @@ impl ResultTableWidget {
         let Some(pending) = self.take_pending_page_navigation_for_session(session_id) else {
             return false;
         };
-        match pending.target {
-            PendingPageNavigationTarget::Last => {
-                *self
-                    .pending_page_navigation
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(pending);
-                true
+        let loaded_rows = self.table.rows().max(0) as usize;
+        if pending.target_row < loaded_rows {
+            self.apply_pending_page_navigation(pending);
+            return false;
+        }
+        let Some(row_count) = Self::page_fetch_request_count(pending.target_row, loaded_rows)
+        else {
+            self.apply_pending_page_navigation(pending);
+            return false;
+        };
+        *self
+            .pending_page_navigation
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(pending);
+        if Self::invoke_lazy_fetch_callback(
+            &self.lazy_fetch_callback,
+            session_id,
+            LazyFetchRequest::MoreRows(row_count),
+        ) {
+            true
+        } else {
+            if let Some(pending) = self.take_pending_page_navigation_for_session(session_id) {
+                self.apply_pending_page_navigation(pending);
             }
-            PendingPageNavigationTarget::Row(target_row) => {
-                let loaded_rows = self.table.rows().max(0) as usize;
-                if target_row < loaded_rows {
-                    self.apply_pending_page_navigation(pending);
-                    return false;
-                }
-                let Some(row_count) = Self::page_fetch_request_count(target_row, loaded_rows)
-                else {
-                    self.apply_pending_page_navigation(pending);
-                    return false;
-                };
-                *self
-                    .pending_page_navigation
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(pending);
-                if Self::invoke_lazy_fetch_callback(
-                    &self.lazy_fetch_callback,
-                    session_id,
-                    LazyFetchRequest::MoreRows(row_count),
-                ) {
-                    true
-                } else {
-                    if let Some(pending) = self.take_pending_page_navigation_for_session(session_id)
-                    {
-                        self.apply_pending_page_navigation(pending);
-                    }
-                    false
-                }
-            }
+            false
         }
     }
 
@@ -13965,7 +14033,7 @@ mod tests {
         any(target_os = "macos", target_os = "linux"),
         ignore = "FLTK widget tests require a native UI test environment"
     )]
-    fn page_last_fetches_all_lazy_rows_before_selecting_the_real_end() {
+    fn page_last_reaches_the_real_end_after_terminal_result_precedes_lazy_close() {
         let mut widget = ResultTableWidget::with_size(0, 0, 640, 160);
         widget.start_streaming(&["A".to_string()]);
         widget.append_rows((0..3).map(|row| vec![row.to_string()]).collect::<Vec<_>>());
@@ -13997,6 +14065,16 @@ mod tests {
         );
 
         widget.table.set_rows(6);
+        widget.finish_streaming();
+        widget.display_result(&QueryResult::new_select_streamed(
+            "SELECT A FROM T",
+            vec![crate::db::ColumnInfo {
+                name: "A".to_string(),
+                data_type: "NUMBER".to_string(),
+            }],
+            6,
+            Duration::from_millis(1),
+        ));
         widget.clear_lazy_fetch_session(88, true);
         assert_eq!(widget.table.get_selection(), (5, 0, 5, 0));
     }

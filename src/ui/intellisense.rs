@@ -2825,6 +2825,67 @@ pub struct IntellisensePopup {
     selected_callback: Arc<Mutex<Option<Box<dyn FnMut(String)>>>>,
 }
 
+fn popup_screen_anchor_below_bounds(
+    window_root_x: i32,
+    window_root_y: i32,
+    widget_x: i32,
+    widget_y: i32,
+    widget_height: i32,
+) -> (i32, i32) {
+    (
+        window_root_x.saturating_add(widget_x),
+        window_root_y
+            .saturating_add(widget_y)
+            .saturating_add(widget_height),
+    )
+}
+
+pub(crate) fn popup_screen_anchor_below_widget<W: WidgetExt>(widget: &W) -> (i32, i32) {
+    let (window_root_x, window_root_y) = widget
+        .window()
+        .map(|window| (window.x_root(), window.y_root()))
+        .unwrap_or((0, 0));
+    popup_screen_anchor_below_bounds(
+        window_root_x,
+        window_root_y,
+        widget.x(),
+        widget.y(),
+        widget.h(),
+    )
+}
+
+fn popup_position_below_or_above(
+    anchor_x: i32,
+    widget_top_y: i32,
+    widget_bottom_y: i32,
+    popup_width: i32,
+    popup_height: i32,
+    work_area: (i32, i32, i32, i32),
+) -> (i32, i32) {
+    let (screen_x, screen_y, screen_width, screen_height) = work_area;
+    let max_x = screen_x
+        .saturating_add(screen_width)
+        .saturating_sub(popup_width)
+        .max(screen_x);
+    let popup_x = anchor_x.clamp(screen_x, max_x);
+    let screen_bottom = screen_y.saturating_add(screen_height);
+    let below_bottom = widget_bottom_y.saturating_add(popup_height);
+    let popup_y = if below_bottom <= screen_bottom {
+        widget_bottom_y
+    } else {
+        let above_y = widget_top_y.saturating_sub(popup_height);
+        if above_y >= screen_y {
+            above_y
+        } else {
+            widget_bottom_y.clamp(
+                screen_y,
+                screen_bottom.saturating_sub(popup_height).max(screen_y),
+            )
+        }
+    };
+    (popup_x, popup_y)
+}
+
 #[derive(Clone, Debug, Default)]
 struct SuggestionPresentation {
     row: String,
@@ -3065,6 +3126,47 @@ impl IntellisensePopup {
 
     pub fn show_suggestions(&mut self, suggestions: Vec<String>, x: i32, y: i32) {
         self.show_suggestions_with_descriptions(suggestions, HashMap::new(), x, y);
+    }
+
+    pub(crate) fn show_suggestions_below_widget<W: WidgetExt>(
+        &mut self,
+        suggestions: Vec<String>,
+        widget: &W,
+    ) {
+        let (anchor_x, widget_bottom_y) = popup_screen_anchor_below_widget(widget);
+        let (window_root_x, window_root_y) = widget
+            .window()
+            .map(|window| (window.x_root(), window.y_root()))
+            .unwrap_or((0, 0));
+        let widget_top_y = window_root_y.saturating_add(widget.y());
+        let screen = fltk::app::screen_num(anchor_x, widget_bottom_y);
+        let work_area = fltk::app::screen_work_area(screen);
+        let expected_height = i32::try_from(suggestions.len().min(10))
+            .unwrap_or(10)
+            .saturating_mul(intellisense_popup_row_height(self.browser.text_size()))
+            .saturating_add(10);
+        let initial_position = popup_position_below_or_above(
+            anchor_x,
+            widget_top_y,
+            widget_bottom_y,
+            self.window.w(),
+            expected_height,
+            work_area,
+        );
+        self.show_suggestions(suggestions, initial_position.0, initial_position.1);
+        if !self.is_visible() {
+            return;
+        }
+
+        let position = popup_position_below_or_above(
+            window_root_x.saturating_add(widget.x()),
+            widget_top_y,
+            widget_bottom_y,
+            self.window.w(),
+            self.window.h(),
+            work_area,
+        );
+        self.window.set_pos(position.0, position.1);
     }
 
     /// Show suggestions with optional per-item display details (column type /
@@ -3438,6 +3540,14 @@ impl IntellisensePopup {
         }
 
         (self.window.w(), self.window.h())
+    }
+
+    pub fn popup_position(&self) -> (i32, i32) {
+        if self.is_deleted() {
+            return (0, 0);
+        }
+
+        (self.window.x_root(), self.window.y_root())
     }
 
     pub fn set_position(&mut self, x: i32, y: i32) {
@@ -5375,6 +5485,26 @@ mod intellisense_tests {
         assert_eq!(intellisense_popup_row_height(i32::MIN), 20);
         assert_eq!(intellisense_popup_row_height(16), 22);
         assert_eq!(intellisense_popup_row_height(i32::MAX), 30);
+    }
+
+    #[test]
+    fn popup_anchor_below_widget_converts_window_coordinates_to_screen_coordinates() {
+        assert_eq!(
+            popup_screen_anchor_below_bounds(320, 180, 74, 205, 26),
+            (394, 411)
+        );
+    }
+
+    #[test]
+    fn popup_position_uses_below_then_above_without_leaving_work_area() {
+        assert_eq!(
+            popup_position_below_or_above(394, 385, 411, 320, 120, (0, 0, 1440, 900)),
+            (394, 411)
+        );
+        assert_eq!(
+            popup_position_below_or_above(394, 720, 746, 320, 180, (0, 0, 1440, 900)),
+            (394, 540)
+        );
     }
 
     #[test]

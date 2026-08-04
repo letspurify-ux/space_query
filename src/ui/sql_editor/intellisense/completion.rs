@@ -76050,6 +76050,19 @@ impl SqlEditorWidget {
         );
     }
 
+    pub(crate) fn prefetch_intellisense_table_columns(&self, table_name: &str) {
+        let Some(connection) = self.connection_binding.metadata_connection() else {
+            return;
+        };
+        Self::request_table_columns_for_resolved_scope(
+            table_name,
+            &self.intellisense_data,
+            &self.column_sender,
+            &connection,
+            Some(self.current_db_type()),
+        );
+    }
+
     fn request_table_columns_for_db(
         table_name: &str,
         intellisense_data: &Arc<Mutex<IntellisenseData>>,
