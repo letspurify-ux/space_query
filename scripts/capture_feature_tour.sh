@@ -24,8 +24,34 @@ SPACE_QUERY_CONFIG_DIR="$capture_config_dir" \
 convert_capture() {
   local source_name="$1"
   local output_name="$2"
-  sips -s format png "/tmp/space-query-${source_name}.ppm" \
-    --out "docs/images/${output_name}.png" >/dev/null
+  local source_path="/tmp/space-query-${source_name}.ppm"
+  local output_path="docs/images/${output_name}.png"
+  local magic source_width source_height max_value
+  {
+    read -r magic
+    read -r source_width source_height
+    read -r max_value
+  } <"$source_path"
+  if [[ "$magic" != "P6" || "$max_value" != "255" ]]; then
+    echo "Unexpected PPM header in $source_path" >&2
+    exit 1
+  fi
+
+  # PNG compression is lossless. Do not resize the captured pixel buffer.
+  sips -s format png "$source_path" --out "$output_path" >/dev/null
+
+  local output_width=""
+  local output_height=""
+  while read -r property value; do
+    case "$property" in
+      pixelWidth:) output_width="$value" ;;
+      pixelHeight:) output_height="$value" ;;
+    esac
+  done < <(sips -g pixelWidth -g pixelHeight "$output_path")
+  if [[ "$output_width" != "$source_width" || "$output_height" != "$source_height" ]]; then
+    echo "Capture resolution changed: ${source_width}x${source_height} -> ${output_width}x${output_height}" >&2
+    exit 1
+  fi
 }
 
 if [[ "$capture_mode" == "object-browser" ]]; then
