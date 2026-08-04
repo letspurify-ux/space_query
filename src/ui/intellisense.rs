@@ -1,7 +1,9 @@
 use crate::sql_text;
 use crate::ui::theme;
+use crate::utils::arithmetic::safe_div;
 use fltk::{
-    browser::HoldBrowser, frame::Frame, group::Group, prelude::*, text::TextEditor, window::Window,
+    browser::HoldBrowser, draw, frame::Frame, group::Group, input::Input, prelude::*,
+    text::TextEditor, window::Window,
 };
 use std::any::Any;
 use std::borrow::Cow;
@@ -2825,32 +2827,105 @@ pub struct IntellisensePopup {
     selected_callback: Arc<Mutex<Option<Box<dyn FnMut(String)>>>>,
 }
 
-fn popup_screen_anchor_below_bounds(
+fn visible_input_caret_x(
+    caret_text_width: i32,
+    full_text_width: i32,
+    text_area_width: i32,
+    font_height: i32,
+) -> i32 {
+    let caret_text_width = caret_text_width.max(0);
+    let full_text_width = full_text_width.max(caret_text_width);
+    let text_area_width = text_area_width.max(1);
+    let threshold = safe_div(font_height.max(0), 2);
+    let right_trigger = text_area_width.saturating_sub(threshold);
+    let mut scroll = 0;
+    if caret_text_width > right_trigger {
+        scroll = caret_text_width
+            .saturating_add(threshold)
+            .saturating_sub(text_area_width);
+        let furthest_scroll = full_text_width
+            .saturating_add(4)
+            .saturating_sub(text_area_width);
+        scroll = scroll.min(furthest_scroll);
+    } else if caret_text_width < threshold {
+        scroll = caret_text_width.saturating_sub(threshold);
+    }
+    scroll = scroll.max(0);
+    caret_text_width
+        .saturating_sub(scroll)
+        .saturating_add(1)
+        .clamp(1, text_area_width)
+}
+
+fn input_caret_screen_bounds(
     window_root_x: i32,
     window_root_y: i32,
-    widget_x: i32,
-    widget_y: i32,
-    widget_height: i32,
-) -> (i32, i32) {
+    input_x: i32,
+    input_y: i32,
+    input_height: i32,
+    frame_left_inset: i32,
+    visible_caret_x: i32,
+) -> (i32, i32, i32) {
     (
-        window_root_x.saturating_add(widget_x),
+        window_root_x
+            .saturating_add(input_x)
+            .saturating_add(frame_left_inset)
+            .saturating_add(visible_caret_x),
+        window_root_y.saturating_add(input_y),
         window_root_y
-            .saturating_add(widget_y)
-            .saturating_add(widget_height),
+            .saturating_add(input_y)
+            .saturating_add(input_height),
     )
 }
 
-pub(crate) fn popup_screen_anchor_below_widget<W: WidgetExt>(widget: &W) -> (i32, i32) {
-    let (window_root_x, window_root_y) = widget
+#[doc(hidden)]
+pub fn input_caret_popup_anchor(input: &Input) -> (i32, i32, i32) {
+    let value = input.value();
+    let cursor = usize::try_from(input.position())
+        .unwrap_or_default()
+        .min(value.len());
+    let cursor = normalize_cursor_pos(&value, cursor);
+    draw::set_font(input.text_font(), input.text_size());
+    let caret_text_width = draw::measure(value.get(..cursor).unwrap_or(""), false).0;
+    let full_text_width = draw::measure(&value, false).0;
+    let frame = input.frame();
+    let frame_left_inset = frame.dx();
+    let text_area_width = input.w().saturating_sub(frame.dw()).max(1);
+    let visible_caret_x = visible_input_caret_x(
+        caret_text_width,
+        full_text_width,
+        text_area_width,
+        draw::height(),
+    );
+    let (window_root_x, window_root_y) = input
         .window()
         .map(|window| (window.x_root(), window.y_root()))
         .unwrap_or((0, 0));
-    popup_screen_anchor_below_bounds(
+    input_caret_screen_bounds(
         window_root_x,
         window_root_y,
-        widget.x(),
-        widget.y(),
-        widget.h(),
+        input.x(),
+        input.y(),
+        input.h(),
+        frame_left_inset,
+        visible_caret_x,
+    )
+}
+
+fn popup_position_for_input_caret(
+    input: &Input,
+    popup_width: i32,
+    popup_height: i32,
+) -> (i32, i32) {
+    let (anchor_x, input_top_y, input_bottom_y) = input_caret_popup_anchor(input);
+    let screen = fltk::app::screen_num(anchor_x, input_bottom_y);
+    popup_position_below_or_above(
+        anchor_x,
+        input_top_y,
+        input_bottom_y,
+        popup_width,
+        popup_height,
+        fltk::app::screen_work_area(screen),
     )
 }
 
@@ -3128,44 +3203,31 @@ impl IntellisensePopup {
         self.show_suggestions_with_descriptions(suggestions, HashMap::new(), x, y);
     }
 
-    pub(crate) fn show_suggestions_below_widget<W: WidgetExt>(
+    pub(crate) fn show_suggestions_below_input_caret(
         &mut self,
         suggestions: Vec<String>,
-        widget: &W,
+        input: &Input,
     ) {
-        let (anchor_x, widget_bottom_y) = popup_screen_anchor_below_widget(widget);
-        let (window_root_x, window_root_y) = widget
-            .window()
-            .map(|window| (window.x_root(), window.y_root()))
-            .unwrap_or((0, 0));
-        let widget_top_y = window_root_y.saturating_add(widget.y());
-        let screen = fltk::app::screen_num(anchor_x, widget_bottom_y);
-        let work_area = fltk::app::screen_work_area(screen);
         let expected_height = i32::try_from(suggestions.len().min(10))
             .unwrap_or(10)
             .saturating_mul(intellisense_popup_row_height(self.browser.text_size()))
             .saturating_add(10);
-        let initial_position = popup_position_below_or_above(
-            anchor_x,
-            widget_top_y,
-            widget_bottom_y,
-            self.window.w(),
-            expected_height,
-            work_area,
-        );
+        let initial_position =
+            popup_position_for_input_caret(input, self.window.w(), expected_height);
         self.show_suggestions(suggestions, initial_position.0, initial_position.1);
         if !self.is_visible() {
             return;
         }
 
-        let position = popup_position_below_or_above(
-            window_root_x.saturating_add(widget.x()),
-            widget_top_y,
-            widget_bottom_y,
-            self.window.w(),
-            self.window.h(),
-            work_area,
-        );
+        let position = popup_position_for_input_caret(input, self.window.w(), self.window.h());
+        self.window.set_pos(position.0, position.1);
+    }
+
+    pub(crate) fn position_below_input_caret(&mut self, input: &Input) {
+        if !self.is_visible() {
+            return;
+        }
+        let position = popup_position_for_input_caret(input, self.window.w(), self.window.h());
         self.window.set_pos(position.0, position.1);
     }
 
@@ -5488,11 +5550,18 @@ mod intellisense_tests {
     }
 
     #[test]
-    fn popup_anchor_below_widget_converts_window_coordinates_to_screen_coordinates() {
+    fn input_caret_anchor_converts_window_coordinates_to_screen_coordinates() {
         assert_eq!(
-            popup_screen_anchor_below_bounds(320, 180, 74, 205, 26),
-            (394, 411)
+            input_caret_screen_bounds(320, 180, 74, 205, 26, 9, 101),
+            (504, 385, 411)
         );
+    }
+
+    #[test]
+    fn input_caret_x_matches_unscrolled_and_end_scrolled_text() {
+        assert_eq!(visible_input_caret_x(0, 0, 300, 16), 1);
+        assert_eq!(visible_input_caret_x(100, 200, 300, 16), 101);
+        assert_eq!(visible_input_caret_x(500, 500, 300, 16), 297);
     }
 
     #[test]

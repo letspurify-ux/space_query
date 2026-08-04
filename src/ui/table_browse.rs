@@ -495,12 +495,15 @@ impl TableBrowseFilterBar {
             }
             Event::KeyUp => {
                 let key = app::event_key();
-                if !matches!(
+                if matches!(key, Key::Left | Key::Right) {
+                    popup
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .position_below_input_caret(input);
+                } else if !matches!(
                     key,
                     Key::Up
                         | Key::Down
-                        | Key::Left
-                        | Key::Right
                         | Key::PageUp
                         | Key::PageDown
                         | Key::Enter
@@ -519,6 +522,17 @@ impl TableBrowseFilterBar {
                 let target = target.clone();
                 crate::ui::ui_timeout::schedule(0.0, move || {
                     Self::show_suggestions(&mut input, &popup, &intellisense_data, &target, false);
+                });
+                false
+            }
+            Event::Released => {
+                let input = input.clone();
+                let popup = popup.clone();
+                crate::ui::ui_timeout::schedule(0.0, move || {
+                    popup
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .position_below_input_caret(&input);
                 });
                 false
             }
@@ -605,7 +619,7 @@ impl TableBrowseFilterBar {
         if suggestions.is_empty() {
             popup.hide();
         } else {
-            popup.show_suggestions_below_widget(suggestions, input);
+            popup.show_suggestions_below_input_caret(suggestions, input);
         }
     }
 
@@ -614,10 +628,13 @@ impl TableBrowseFilterBar {
     ) -> (Input, Arc<Mutex<IntellisensePopup>>) {
         self.where_input.set_value("DEPTNO = 20 AND E");
         self.order_input.set_value("EMPNO ASC");
+        let _ = self
+            .where_input
+            .set_position(i32::try_from(self.where_input.value().len()).unwrap_or(i32::MAX));
         self.where_popup
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .show_suggestions_below_widget(
+            .show_suggestions_below_input_caret(
                 vec![
                     "EMPNO".to_string(),
                     "ENAME".to_string(),
@@ -628,6 +645,32 @@ impl TableBrowseFilterBar {
                 &self.where_input,
             );
         (self.where_input.clone(), self.where_popup.clone())
+    }
+
+    pub(crate) fn capture_tour_show_order_popup(
+        &mut self,
+    ) -> (Input, Arc<Mutex<IntellisensePopup>>) {
+        self.where_popup
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .hide();
+        let _ = self
+            .order_input
+            .set_position(i32::try_from(self.order_input.value().len()).unwrap_or(i32::MAX));
+        self.order_popup
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .show_suggestions_below_input_caret(
+                vec![
+                    "EMPNO".to_string(),
+                    "ENAME".to_string(),
+                    "JOB".to_string(),
+                    "DEPTNO".to_string(),
+                    "SAL".to_string(),
+                ],
+                &self.order_input,
+            );
+        (self.order_input.clone(), self.order_popup.clone())
     }
 
     fn replace_current_word(input: &mut Input, selected: &str) {

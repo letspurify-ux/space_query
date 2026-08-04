@@ -36,6 +36,7 @@ fi
 if [[ "$capture_mode" == "table-browse-popup" ]]; then
   convert_capture table-browse table-browse
   convert_capture table-browse-popup-100 table-browse-popup
+  convert_capture table-browse-order-popup-100 table-browse-order-popup
   exit 0
 fi
 
@@ -49,6 +50,7 @@ convert_capture formatting-after sql-formatting-after
 convert_capture result-grid result-grid
 convert_capture table-browse table-browse
 convert_capture table-browse-popup-100 table-browse-popup
+convert_capture table-browse-order-popup-100 table-browse-order-popup
 convert_capture result-editing result-grid-editing
 convert_capture settings settings
 convert_capture query-history query-history

@@ -12916,6 +12916,22 @@ impl MainWindow {
         Ok(popup)
     }
 
+    #[doc(hidden)]
+    pub fn capture_tour_show_table_browse_order_popup(
+        &mut self,
+    ) -> Result<(fltk::input::Input, Arc<Mutex<crate::ui::IntellisensePopup>>), String> {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut result_tabs = state.result_tabs.clone();
+        let popup = result_tabs
+            .capture_tour_show_table_browse_order_popup()
+            .ok_or_else(|| "Could not show the ORDER BY completion popup.".to_string())?;
+        state.window.redraw();
+        Ok(popup)
+    }
+
     pub fn show_previous_crash_report(crash_report: &str) {
         crate::utils::logging::log_warning(
             "app",

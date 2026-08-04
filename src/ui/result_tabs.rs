@@ -2839,6 +2839,26 @@ impl ResultTabsWidget {
         Some(filter_bar.capture_tour_show_where_popup())
     }
 
+    pub(crate) fn capture_tour_show_table_browse_order_popup(
+        &mut self,
+    ) -> Option<(Input, Arc<Mutex<IntellisensePopup>>)> {
+        let index = {
+            let active_index = self
+                .active_index
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            (*active_index)?
+        };
+        let mut filter_bar = self
+            .data
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(index)?
+            .filter_bar
+            .clone()?;
+        Some(filter_bar.capture_tour_show_order_popup())
+    }
+
     pub fn paste_from_clipboard(&self) -> bool {
         if let Some(mut table) = self.current_table() {
             table.paste_from_clipboard();

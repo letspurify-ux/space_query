@@ -218,10 +218,12 @@ button to reset a field.
 
 The same metadata-aware IntelliSense used by the SQL editor is available in
 both fields. Start typing or press `Ctrl+Space` (`Cmd+Space` on macOS); the
-suggestion popup opens against the active field and moves above it when there
-is not enough space below.
+suggestion popup opens directly below the text cursor in the active field. It
+moves above the field or stays within the screen edge when space is limited.
 
-![WHERE IntelliSense in the table browser](docs/images/table-browse-popup.png)
+![WHERE IntelliSense positioned at the text cursor](docs/images/table-browse-popup.png)
+
+![ORDER BY IntelliSense positioned at the text cursor](docs/images/table-browse-order-popup.png)
 
 Use the first, previous, next, and last controls below the grid and choose a
 page size of 10, 100, 250, 500, or 1,000 rows. Table browsing issues a bounded

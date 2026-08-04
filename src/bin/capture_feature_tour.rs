@@ -12,6 +12,7 @@ use space_query::{
     ui::{
         apply_global_default_font,
         constants::{BUTTON_HEIGHT, TAB_HEADER_HEIGHT},
+        intellisense::input_caret_popup_anchor,
         log_viewer::LogViewerDialog,
         profile_by_name, show_settings_dialog, theme, ConnectionDialog, IntellisensePopup,
         MainWindow, QueryHistoryDialog, SignatureLabel, SignatureOverload, SignaturePopup,
@@ -797,6 +798,79 @@ fn capture_result_grid(main_window: &mut MainWindow) {
     }
 }
 
+fn capture_table_browse_input_popup(
+    input: &fltk::input::Input,
+    popup: &Arc<Mutex<IntellisensePopup>>,
+    label: &str,
+    capture_path: &str,
+) {
+    let input_window = input
+        .window()
+        .unwrap_or_else(|| fail(format!("{label} input window is missing")));
+    let input_left = input_window.x_root() + input.x();
+    let (caret_x, input_top, input_bottom) = input_caret_popup_anchor(input);
+    if caret_x
+        <= input_left
+            .saturating_add(input.frame().dx())
+            .saturating_add(1)
+    {
+        fail(format!(
+            "{label} caret anchor {caret_x} did not advance past the non-empty input's text origin"
+        ));
+    }
+    let (actual_position, popup_dimensions, visible) = {
+        let popup = popup
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        (
+            popup.popup_position(),
+            popup.popup_dimensions(),
+            popup.is_visible(),
+        )
+    };
+    if !visible {
+        fail(format!("{label} completion popup is not visible"));
+    }
+    let screen = app::screen_num(caret_x, input_bottom);
+    let (screen_x, _, screen_width, _) = app::screen_work_area(screen);
+    let max_x = screen_x
+        .saturating_add(screen_width)
+        .saturating_sub(popup_dimensions.0)
+        .max(screen_x);
+    let expected_x = caret_x.clamp(screen_x, max_x);
+    let aligned_below = actual_position.1 == input_bottom;
+    let aligned_above = actual_position.1 + popup_dimensions.1 == input_top;
+    println!(
+        "{label} input_left={input_left} caret_x={caret_x} popup={actual_position:?} size={popup_dimensions:?}"
+    );
+    if actual_position.0 != expected_x || (!aligned_below && !aligned_above) {
+        fail(format!(
+            "{label} popup position {actual_position:?} size {popup_dimensions:?} is not aligned with caret {caret_x} and input vertical bounds ({input_top}, {input_bottom})"
+        ));
+    }
+
+    let mut main =
+        app::widget_from_id::<Window>("main_window").unwrap_or_else(|| fail("main window"));
+    let main_x = main.x_root();
+    let main_y = main.y_root();
+    let (mut canvas, width, height) = capture_complete_rgb(&mut main);
+    let mut popup_window = window_by_root_bounds(actual_position, popup_dimensions, &main)
+        .unwrap_or_else(|| fail(format!("{label} popup window")));
+    composite_popup(
+        &mut canvas,
+        width,
+        height,
+        main_x,
+        main_y,
+        &mut popup_window,
+    );
+    save_ppm(capture_path, &canvas, width, height);
+    popup
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .hide();
+}
+
 fn capture_table_browse_popup(main_window: &mut MainWindow) {
     let columns = [
         ("EMPNO", "NUMBER"),
@@ -819,63 +893,26 @@ fn capture_table_browse_popup(main_window: &mut MainWindow) {
         ))
         .unwrap_or_else(|err| fail(format!("show table browse popup: {err}")));
     pump(350);
-
-    let input_window = where_input
-        .window()
-        .unwrap_or_else(|| fail("WHERE input window is missing"));
-    let input_left = input_window.x_root() + where_input.x();
-    let input_top = input_window.y_root() + where_input.y();
-    let input_bottom = input_top + where_input.h();
-    let (actual_position, popup_dimensions, visible) = {
-        let popup = popup
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        (
-            popup.popup_position(),
-            popup.popup_dimensions(),
-            popup.is_visible(),
-        )
-    };
-    if !visible {
-        fail("table browse completion popup is not visible");
-    }
-    let aligned_below = actual_position.1 == input_bottom;
-    let aligned_above = actual_position.1 + popup_dimensions.1 == input_top;
-    if actual_position.0 != input_left || (!aligned_below && !aligned_above) {
-        fail(format!(
-            "table browse popup position {actual_position:?} size {popup_dimensions:?} is not aligned with WHERE input ({input_left}, {input_top})-({input_left}, {input_bottom})"
-        ));
-    }
-
-    let mut main =
-        app::widget_from_id::<Window>("main_window").unwrap_or_else(|| fail("main window"));
-    let main_x = main.x_root();
-    let main_y = main.y_root();
-    let (mut canvas, width, height) = capture_complete_rgb(&mut main);
-    let mut popup_window = window_by_root_bounds(actual_position, popup_dimensions, &main)
-        .unwrap_or_else(|| fail("table browse popup window"));
-    composite_popup(
-        &mut canvas,
-        width,
-        height,
-        main_x,
-        main_y,
-        &mut popup_window,
-    );
     let scale = std::env::var("SPACE_QUERY_CAPTURE_UI_SCALE")
         .ok()
         .and_then(|value| value.parse::<u32>().ok())
         .unwrap_or(100);
-    save_ppm(
+    capture_table_browse_input_popup(
+        &where_input,
+        &popup,
+        "WHERE",
         &format!("/tmp/space-query-table-browse-popup-{scale}.ppm"),
-        &canvas,
-        width,
-        height,
     );
-    popup
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .hide();
+    let (order_input, order_popup) = main_window
+        .capture_tour_show_table_browse_order_popup()
+        .unwrap_or_else(|err| fail(format!("show ORDER BY popup: {err}")));
+    pump(250);
+    capture_table_browse_input_popup(
+        &order_input,
+        &order_popup,
+        "ORDER BY",
+        &format!("/tmp/space-query-table-browse-order-popup-{scale}.ppm"),
+    );
     pump(120);
     save_main("/tmp/space-query-table-browse.ppm");
 }
