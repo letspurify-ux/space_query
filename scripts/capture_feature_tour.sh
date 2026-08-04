@@ -66,6 +66,10 @@ if [[ "$capture_mode" == "table-browse-popup" ]]; then
   exit 0
 fi
 
+if [[ "$capture_mode" == "table-browse-input-regression" ]]; then
+  exit 0
+fi
+
 convert_capture main main-window
 convert_capture connect connection-dialog
 convert_capture intellisense intellisense

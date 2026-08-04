@@ -7,7 +7,10 @@ use fltk::{
     input::Input,
     prelude::*,
 };
-use std::sync::{Arc, Mutex};
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc, Mutex,
+};
 
 use crate::db::{DatabaseType, DbTableBrowsePagination, QueryExecutor};
 use crate::ui::intellisense::{get_word_at_cursor, IntellisenseData, IntellisensePopup};
@@ -18,7 +21,25 @@ use crate::utils::arithmetic::safe_div;
 pub(crate) const TABLE_BROWSE_MATERIALIZE_MARKER: &str = "SQ_INTERNAL_TABLE_BROWSE";
 pub(crate) const TABLE_BROWSE_PAGE_COLUMN: &str = "SQ_INTERNAL_PAGE_ROW";
 pub(crate) const TABLE_BROWSE_DEFAULT_PAGE_SIZE: usize = 500;
-pub(crate) const TABLE_BROWSE_FILTER_HEIGHT: i32 = 34;
+pub(crate) const TABLE_BROWSE_FILTER_HEIGHT: i32 = 42;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TableBrowsePopupKeyAction {
+    SelectPrev,
+    SelectNext,
+    SelectPrevPage,
+    SelectNextPage,
+    Confirm,
+    Dismiss,
+}
+
+struct TableBrowsePopupShowReset<'a>(&'a AtomicBool);
+
+impl Drop for TableBrowsePopupShowReset<'_> {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::Release);
+    }
+}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TableBrowseTarget {
@@ -281,6 +302,8 @@ impl TableBrowseFilterBar {
 
         let where_popup = Arc::new(Mutex::new(IntellisensePopup::new()));
         let order_popup = Arc::new(Mutex::new(IntellisensePopup::new()));
+        let where_popup_showing = Arc::new(AtomicBool::new(false));
+        let order_popup_showing = Arc::new(AtomicBool::new(false));
         Self::install_popup_selection(&where_input, &where_popup);
         Self::install_popup_selection(&order_input, &order_popup);
 
@@ -294,6 +317,7 @@ impl TableBrowseFilterBar {
             result_tab_id,
             callback.clone(),
             true,
+            where_popup_showing,
         );
         Self::install_input_handler(
             &mut order_input,
@@ -305,6 +329,7 @@ impl TableBrowseFilterBar {
             result_tab_id,
             callback.clone(),
             false,
+            order_popup_showing,
         );
 
         {
@@ -397,10 +422,12 @@ impl TableBrowseFilterBar {
         result_tab_id: ResultTabId,
         callback: TableBrowseExecuteCallback,
         is_where_input: bool,
+        popup_showing: Arc<AtomicBool>,
     ) {
         input.handle(move |input, event| match event {
             Event::KeyDown => {
-                let key = app::event_key();
+                let key =
+                    Self::shortcut_key_for_layout(app::event_key(), app::event_original_key());
                 let shortcut = app::event_state();
                 let ctrl_or_cmd =
                     shortcut.contains(Shortcut::Ctrl) || shortcut.contains(Shortcut::Command);
@@ -410,61 +437,76 @@ impl TableBrowseFilterBar {
                     .is_visible();
 
                 if ctrl_or_cmd && key == Key::from_char(' ') {
-                    Self::show_suggestions(input, &popup, &intellisense_data, &target, true);
+                    Self::show_suggestions(
+                        input,
+                        &popup,
+                        &intellisense_data,
+                        &target,
+                        &popup_showing,
+                        true,
+                    );
                     return true;
                 }
+                if Self::should_hide_popup_on_modifier_keydown(popup_visible, key) {
+                    popup
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .hide();
+                    return false;
+                }
                 if popup_visible {
-                    match key {
-                        Key::Up => {
+                    match Self::popup_key_action(key) {
+                        Some(TableBrowsePopupKeyAction::SelectPrev) => {
                             popup
                                 .lock()
                                 .unwrap_or_else(|poisoned| poisoned.into_inner())
                                 .select_prev();
                             return true;
                         }
-                        Key::Down => {
+                        Some(TableBrowsePopupKeyAction::SelectNext) => {
                             popup
                                 .lock()
                                 .unwrap_or_else(|poisoned| poisoned.into_inner())
                                 .select_next();
                             return true;
                         }
-                        Key::PageUp => {
+                        Some(TableBrowsePopupKeyAction::SelectPrevPage) => {
                             popup
                                 .lock()
                                 .unwrap_or_else(|poisoned| poisoned.into_inner())
                                 .select_prev_page();
                             return true;
                         }
-                        Key::PageDown => {
+                        Some(TableBrowsePopupKeyAction::SelectNextPage) => {
                             popup
                                 .lock()
                                 .unwrap_or_else(|poisoned| poisoned.into_inner())
                                 .select_next_page();
                             return true;
                         }
-                        Key::Enter | Key::KPEnter | Key::Tab => {
-                            let selected = popup
-                                .lock()
-                                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                                .get_selected();
+                        Some(TableBrowsePopupKeyAction::Confirm) => {
+                            let selected = {
+                                let mut popup = popup
+                                    .lock()
+                                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                                let selected = popup.get_selected();
+                                popup.hide();
+                                selected
+                            };
                             if let Some(selected) = selected {
                                 Self::replace_current_word(input, &selected);
-                                popup
-                                    .lock()
-                                    .unwrap_or_else(|poisoned| poisoned.into_inner())
-                                    .hide();
+                                let _ = input.take_focus();
                                 return true;
                             }
                         }
-                        Key::Escape => {
+                        Some(TableBrowsePopupKeyAction::Dismiss) => {
                             popup
                                 .lock()
                                 .unwrap_or_else(|poisoned| poisoned.into_inner())
                                 .hide();
                             return true;
                         }
-                        _ => {}
+                        None => {}
                     }
                 }
                 if matches!(key, Key::Enter | Key::KPEnter) {
@@ -493,8 +535,24 @@ impl TableBrowseFilterBar {
                 }
                 false
             }
+            Event::Shortcut => {
+                let key =
+                    Self::shortcut_key_for_layout(app::event_key(), app::event_original_key());
+                let popup_visible = popup
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .is_visible();
+                Self::should_consume_popup_shortcut(popup_visible, key)
+            }
             Event::KeyUp => {
-                let key = app::event_key();
+                let key =
+                    Self::shortcut_key_for_layout(app::event_key(), app::event_original_key());
+                let shortcut = app::event_state();
+                let ctrl_or_cmd =
+                    shortcut.contains(Shortcut::Ctrl) || shortcut.contains(Shortcut::Command);
+                if ctrl_or_cmd && key == Key::from_char(' ') {
+                    return true;
+                }
                 if matches!(key, Key::Left | Key::Right) {
                     popup
                         .lock()
@@ -510,8 +568,16 @@ impl TableBrowseFilterBar {
                         | Key::KPEnter
                         | Key::Escape
                         | Key::Tab
-                ) {
-                    Self::show_suggestions(input, &popup, &intellisense_data, &target, false);
+                ) && !Self::is_modifier_key(key)
+                {
+                    Self::show_suggestions(
+                        input,
+                        &popup,
+                        &intellisense_data,
+                        &target,
+                        &popup_showing,
+                        false,
+                    );
                 }
                 false
             }
@@ -520,8 +586,16 @@ impl TableBrowseFilterBar {
                 let popup = popup.clone();
                 let intellisense_data = intellisense_data.clone();
                 let target = target.clone();
+                let popup_showing = popup_showing.clone();
                 crate::ui::ui_timeout::schedule(0.0, move || {
-                    Self::show_suggestions(&mut input, &popup, &intellisense_data, &target, false);
+                    Self::show_suggestions(
+                        &mut input,
+                        &popup,
+                        &intellisense_data,
+                        &target,
+                        &popup_showing,
+                        false,
+                    );
                 });
                 false
             }
@@ -537,14 +611,136 @@ impl TableBrowseFilterBar {
                 false
             }
             Event::Unfocus => {
-                popup
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner())
-                    .hide();
+                if popup_showing.load(Ordering::Acquire) {
+                    return false;
+                }
+                let unfocus_x = app::event_x_root();
+                let unfocus_y = app::event_y_root();
+                // Showing the top-level popup can synchronously dispatch Unfocus
+                // while show_suggestions still holds this mutex. Never block on
+                // that reentrant event or the UI thread will deadlock itself.
+                match popup.try_lock() {
+                    Ok(mut popup) => {
+                        let popup_visible = popup.is_visible();
+                        let pointer_inside_popup =
+                            popup_visible && popup.contains_point(unfocus_x, unfocus_y);
+                        if Self::should_hide_popup_on_unfocus(popup_visible, pointer_inside_popup) {
+                            popup.hide();
+                        }
+                    }
+                    Err(std::sync::TryLockError::Poisoned(poisoned)) => {
+                        let mut popup = poisoned.into_inner();
+                        let popup_visible = popup.is_visible();
+                        let pointer_inside_popup =
+                            popup_visible && popup.contains_point(unfocus_x, unfocus_y);
+                        if Self::should_hide_popup_on_unfocus(popup_visible, pointer_inside_popup) {
+                            popup.hide();
+                        }
+                    }
+                    Err(std::sync::TryLockError::WouldBlock) => {}
+                }
                 false
             }
             _ => false,
         });
+    }
+
+    fn shortcut_key_for_layout(key: Key, original_key: Key) -> Key {
+        if (0..=0x7f).contains(&key.bits()) {
+            key
+        } else {
+            original_key
+        }
+    }
+
+    fn popup_key_action(key: Key) -> Option<TableBrowsePopupKeyAction> {
+        match key {
+            Key::Up => Some(TableBrowsePopupKeyAction::SelectPrev),
+            Key::Down => Some(TableBrowsePopupKeyAction::SelectNext),
+            Key::PageUp => Some(TableBrowsePopupKeyAction::SelectPrevPage),
+            Key::PageDown => Some(TableBrowsePopupKeyAction::SelectNextPage),
+            Key::Enter | Key::KPEnter | Key::Tab => Some(TableBrowsePopupKeyAction::Confirm),
+            Key::Escape => Some(TableBrowsePopupKeyAction::Dismiss),
+            _ => None,
+        }
+    }
+
+    fn should_consume_popup_shortcut(popup_visible: bool, key: Key) -> bool {
+        popup_visible
+            && matches!(
+                Self::popup_key_action(key),
+                Some(
+                    TableBrowsePopupKeyAction::SelectPrev
+                        | TableBrowsePopupKeyAction::SelectNext
+                        | TableBrowsePopupKeyAction::SelectPrevPage
+                        | TableBrowsePopupKeyAction::SelectNextPage
+                        | TableBrowsePopupKeyAction::Confirm
+                )
+            )
+    }
+
+    fn is_modifier_key(key: Key) -> bool {
+        matches!(
+            key,
+            Key::ShiftL
+                | Key::ShiftR
+                | Key::ControlL
+                | Key::ControlR
+                | Key::AltL
+                | Key::AltR
+                | Key::MetaL
+                | Key::MetaR
+                | Key::CapsLock
+        )
+    }
+
+    fn should_hide_popup_on_modifier_keydown(popup_visible: bool, key: Key) -> bool {
+        popup_visible
+            && matches!(
+                key,
+                Key::ShiftL
+                    | Key::ShiftR
+                    | Key::ControlL
+                    | Key::ControlR
+                    | Key::AltL
+                    | Key::AltR
+                    | Key::MetaL
+                    | Key::MetaR
+            )
+    }
+
+    fn should_hide_popup_on_unfocus(popup_visible: bool, pointer_inside_popup: bool) -> bool {
+        popup_visible && !pointer_inside_popup
+    }
+
+    fn completion_is_suppressed_at_cursor(
+        value: &str,
+        cursor: usize,
+        db_type: DatabaseType,
+    ) -> bool {
+        let mut cursor = cursor.min(value.len());
+        while cursor > 0 && !value.is_char_boundary(cursor) {
+            cursor -= 1;
+        }
+        let (_, lex_mode) = crate::sql_parser_engine::lexical_spans_with_initial_mode(
+            value.get(..cursor).unwrap_or(""),
+            db_type.is_mysql_or_mariadb(),
+            crate::sql_parser_engine::LexMode::Idle,
+        );
+        matches!(
+            lex_mode,
+            crate::sql_parser_engine::LexMode::SingleQuote
+                | crate::sql_parser_engine::LexMode::LineComment
+                | crate::sql_parser_engine::LexMode::BlockComment
+                | crate::sql_parser_engine::LexMode::QQuote { .. }
+                | crate::sql_parser_engine::LexMode::DollarQuote { .. }
+                | crate::sql_parser_engine::LexMode::ForeignModuleSource
+                | crate::sql_parser_engine::LexMode::ForeignInlineSource { .. }
+        )
+    }
+
+    fn should_open_completion(prefix: &str, force: bool) -> bool {
+        force || !prefix.is_empty()
     }
 
     fn first_page_request(
@@ -589,12 +785,29 @@ impl TableBrowseFilterBar {
         popup: &Arc<Mutex<IntellisensePopup>>,
         intellisense_data: &Arc<Mutex<IntellisenseData>>,
         target: &TableBrowseTarget,
+        popup_showing: &AtomicBool,
         force: bool,
     ) {
+        if !input.has_focus() {
+            popup
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .hide();
+            return;
+        }
         let value = input.value();
-        let cursor = usize::try_from(input.position()).unwrap_or_default();
-        let (prefix, _, _) = get_word_at_cursor(&value, cursor.min(value.len()));
-        if prefix.is_empty() && !force && value.is_empty() {
+        let cursor = usize::try_from(input.position())
+            .unwrap_or_default()
+            .min(value.len());
+        if Self::completion_is_suppressed_at_cursor(&value, cursor, target.db_type) {
+            popup
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .hide();
+            return;
+        }
+        let (prefix, _, _) = get_word_at_cursor(&value, cursor);
+        if !Self::should_open_completion(&prefix, force) {
             popup
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -619,7 +832,11 @@ impl TableBrowseFilterBar {
         if suggestions.is_empty() {
             popup.hide();
         } else {
+            popup_showing.store(true, Ordering::Release);
+            let _show_reset = TableBrowsePopupShowReset(popup_showing);
             popup.show_suggestions_below_input_caret(suggestions, input);
+            drop(popup);
+            let _ = input.take_focus();
         }
     }
 
@@ -698,7 +915,8 @@ impl TableBrowseFilterBar {
     }
 
     pub(crate) fn layout(&mut self, x: i32, y: i32, w: i32) {
-        const PADDING: i32 = 6;
+        const HORIZONTAL_PADDING: i32 = 8;
+        const VERTICAL_PADDING: i32 = 8;
         const GAP: i32 = 6;
         const WHERE_LABEL_WIDTH: i32 = 50;
         const ORDER_LABEL_WIDTH: i32 = 72;
@@ -706,11 +924,15 @@ impl TableBrowseFilterBar {
 
         self.group
             .resize(x, y, w.max(1), TABLE_BROWSE_FILTER_HEIGHT);
-        let control_y = y + 4;
-        let control_h = TABLE_BROWSE_FILTER_HEIGHT - 8;
-        let fixed = PADDING * 2 + WHERE_LABEL_WIDTH + ORDER_LABEL_WIDTH + CLEAR_WIDTH * 2 + GAP * 5;
+        let control_y = y + VERTICAL_PADDING;
+        let control_h = TABLE_BROWSE_FILTER_HEIGHT - VERTICAL_PADDING * 2;
+        let fixed = HORIZONTAL_PADDING * 2
+            + WHERE_LABEL_WIDTH
+            + ORDER_LABEL_WIDTH
+            + CLEAR_WIDTH * 2
+            + GAP * 5;
         let editor_width = safe_div((w - fixed).max(80), 2);
-        let mut cursor_x = x + PADDING;
+        let mut cursor_x = x + HORIZONTAL_PADDING;
         self.where_label
             .resize(cursor_x, control_y, WHERE_LABEL_WIDTH, control_h);
         cursor_x += WHERE_LABEL_WIDTH + GAP;
@@ -723,7 +945,7 @@ impl TableBrowseFilterBar {
         self.order_label
             .resize(cursor_x, control_y, ORDER_LABEL_WIDTH, control_h);
         cursor_x += ORDER_LABEL_WIDTH + GAP;
-        let remaining = (x + w - PADDING - CLEAR_WIDTH - GAP - cursor_x).max(40);
+        let remaining = (x + w - HORIZONTAL_PADDING - CLEAR_WIDTH - GAP - cursor_x).max(40);
         self.order_input
             .resize(cursor_x, control_y, remaining, control_h);
         cursor_x += remaining + GAP;
@@ -841,5 +1063,117 @@ mod tests {
         assert_eq!(last_page_offset(100, 100), 0);
         assert_eq!(last_page_offset(101, 100), 100);
         assert_eq!(last_page_offset(200, 100), 100);
+    }
+
+    #[test]
+    fn popup_keys_match_query_editor_navigation_and_confirmation() {
+        let expected = [
+            (Key::Up, TableBrowsePopupKeyAction::SelectPrev),
+            (Key::Down, TableBrowsePopupKeyAction::SelectNext),
+            (Key::PageUp, TableBrowsePopupKeyAction::SelectPrevPage),
+            (Key::PageDown, TableBrowsePopupKeyAction::SelectNextPage),
+            (Key::Enter, TableBrowsePopupKeyAction::Confirm),
+            (Key::KPEnter, TableBrowsePopupKeyAction::Confirm),
+            (Key::Tab, TableBrowsePopupKeyAction::Confirm),
+            (Key::Escape, TableBrowsePopupKeyAction::Dismiss),
+        ];
+        for (key, action) in expected {
+            assert_eq!(TableBrowseFilterBar::popup_key_action(key), Some(action));
+        }
+        assert_eq!(TableBrowseFilterBar::popup_key_action(Key::Left), None);
+    }
+
+    #[test]
+    fn popup_shortcuts_prevent_secondary_navigation_dispatch() {
+        for key in [
+            Key::Up,
+            Key::Down,
+            Key::PageUp,
+            Key::PageDown,
+            Key::Enter,
+            Key::KPEnter,
+            Key::Tab,
+        ] {
+            assert!(TableBrowseFilterBar::should_consume_popup_shortcut(
+                true, key
+            ));
+            assert!(!TableBrowseFilterBar::should_consume_popup_shortcut(
+                false, key
+            ));
+        }
+        assert!(!TableBrowseFilterBar::should_consume_popup_shortcut(
+            true,
+            Key::Escape
+        ));
+    }
+
+    #[test]
+    fn popup_unfocus_keeps_internal_click_available_for_selection() {
+        assert!(!TableBrowseFilterBar::should_hide_popup_on_unfocus(
+            true, true
+        ));
+        assert!(TableBrowseFilterBar::should_hide_popup_on_unfocus(
+            true, false
+        ));
+        assert!(!TableBrowseFilterBar::should_hide_popup_on_unfocus(
+            false, false
+        ));
+    }
+
+    #[test]
+    fn popup_modifier_handling_matches_query_editor() {
+        for key in [
+            Key::ShiftL,
+            Key::ShiftR,
+            Key::ControlL,
+            Key::ControlR,
+            Key::AltL,
+            Key::AltR,
+            Key::MetaL,
+            Key::MetaR,
+        ] {
+            assert!(TableBrowseFilterBar::should_hide_popup_on_modifier_keydown(
+                true, key
+            ));
+            assert!(TableBrowseFilterBar::is_modifier_key(key));
+        }
+        assert!(!TableBrowseFilterBar::should_hide_popup_on_modifier_keydown(true, Key::CapsLock));
+        assert!(TableBrowseFilterBar::is_modifier_key(Key::CapsLock));
+    }
+
+    #[test]
+    fn completion_stays_hidden_inside_literals_and_comments() {
+        for db_type in [
+            DatabaseType::Oracle,
+            DatabaseType::MySQL,
+            DatabaseType::MariaDB,
+        ] {
+            for value in [
+                "topic='",
+                "topic='news",
+                "topic=q'[news",
+                "topic=1 /* note",
+                "topic=1 -- note",
+            ] {
+                assert!(TableBrowseFilterBar::completion_is_suppressed_at_cursor(
+                    value,
+                    value.len(),
+                    db_type,
+                ));
+            }
+            let value = "topic='news' AND top";
+            assert!(!TableBrowseFilterBar::completion_is_suppressed_at_cursor(
+                value,
+                value.len(),
+                db_type,
+            ));
+        }
+    }
+
+    #[test]
+    fn automatic_completion_requires_at_least_one_prefix_character() {
+        assert!(!TableBrowseFilterBar::should_open_completion("", false));
+        assert!(TableBrowseFilterBar::should_open_completion("E", false));
+        assert!(TableBrowseFilterBar::should_open_completion("", true));
     }
 }

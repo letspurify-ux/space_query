@@ -223,8 +223,6 @@ moves above the field or stays within the screen edge when space is limited.
 
 ![WHERE IntelliSense positioned at the text cursor](docs/images/table-browse-popup.png)
 
-![ORDER BY IntelliSense positioned at the text cursor](docs/images/table-browse-order-popup.png)
-
 Use the first, previous, next, and last controls below the grid and choose a
 page size of 10, 100, 250, 500, or 1,000 rows. Table browsing issues a bounded
 query for each page—Oracle uses `ROWNUM`, while MySQL and MariaDB use

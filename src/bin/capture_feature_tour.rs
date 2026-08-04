@@ -871,7 +871,111 @@ fn capture_table_browse_input_popup(
         .hide();
 }
 
-fn capture_table_browse_popup(main_window: &mut MainWindow) {
+fn show_table_browse_popup_through_input_handler(
+    input: &fltk::input::Input,
+    popup: &Arc<Mutex<IntellisensePopup>>,
+    label: &str,
+) {
+    popup
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .hide();
+    let mut input = input.clone();
+    input
+        .take_focus()
+        .unwrap_or_else(|err| fail(format!("focus {label} input: {err}")));
+    pump(40);
+    // KeyUp intentionally returns false so FLTK may continue normal
+    // propagation after the completion popup has been refreshed.
+    let _ = input.handle_event(Event::KeyUp);
+    pump(80);
+    let popup_visible = popup
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .is_visible();
+    if !popup_visible {
+        fail(format!(
+            "{label} popup was not shown through the input key-up handler"
+        ));
+    }
+    if !input.has_focus() {
+        fail(format!(
+            "{label} input did not retain focus after showing the popup"
+        ));
+    }
+    let _ = input.handle_event(Event::KeyUp);
+    pump(80);
+    if !input.has_focus() {
+        fail(format!(
+            "{label} input lost focus before the next key-up event"
+        ));
+    }
+}
+
+fn assert_unfocused_table_browse_input_does_not_reclaim_focus(
+    unfocused_input: &fltk::input::Input,
+    unfocused_popup: &Arc<Mutex<IntellisensePopup>>,
+    focused_input: &fltk::input::Input,
+    label: &str,
+) {
+    unfocused_popup
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .hide();
+    let mut focused_input = focused_input.clone();
+    focused_input
+        .take_focus()
+        .unwrap_or_else(|err| fail(format!("focus peer input for {label}: {err}")));
+    pump(40);
+
+    let mut unfocused_input = unfocused_input.clone();
+    let _ = unfocused_input.handle_event(Event::Paste);
+    pump(80);
+    if unfocused_popup
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .is_visible()
+    {
+        fail(format!("unfocused {label} input reopened its popup"));
+    }
+    if !focused_input.has_focus() {
+        fail(format!(
+            "unfocused {label} input reclaimed focus from its peer"
+        ));
+    }
+}
+
+fn assert_table_browse_suppressed_contexts(
+    input: &fltk::input::Input,
+    popup: &Arc<Mutex<IntellisensePopup>>,
+    label: &str,
+) {
+    let mut input = input.clone();
+    input
+        .take_focus()
+        .unwrap_or_else(|err| fail(format!("focus {label} suppressed-context input: {err}")));
+    for (value, context) in [
+        ("topic='", "string literal"),
+        ("DEPTNO = 20 AND ", "empty identifier prefix"),
+    ] {
+        input.set_value(value);
+        let _ = input.set_position(i32::try_from(input.value().len()).unwrap_or(i32::MAX));
+        let _ = input.handle_event(Event::Paste);
+        pump(80);
+        if popup
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .is_visible()
+        {
+            fail(format!("{label} popup opened in {context}"));
+        }
+        if !input.has_focus() {
+            fail(format!("{label} {context} check lost input focus"));
+        }
+    }
+}
+
+fn capture_table_browse_popup(main_window: &mut MainWindow, verify_input_handlers: bool) {
     let columns = [
         ("EMPNO", "NUMBER"),
         ("ENAME", "VARCHAR2"),
@@ -892,6 +996,31 @@ fn capture_table_browse_popup(main_window: &mut MainWindow) {
             "SELECT * FROM SCOTT.EMP ORDER BY EMPNO",
         ))
         .unwrap_or_else(|err| fail(format!("show table browse popup: {err}")));
+    if verify_input_handlers {
+        show_table_browse_popup_through_input_handler(&where_input, &popup, "WHERE");
+        let (order_input, order_popup) = main_window
+            .capture_tour_show_table_browse_order_popup()
+            .unwrap_or_else(|err| fail(format!("show ORDER BY popup: {err}")));
+        show_table_browse_popup_through_input_handler(&order_input, &order_popup, "ORDER BY");
+        assert_unfocused_table_browse_input_does_not_reclaim_focus(
+            &where_input,
+            &popup,
+            &order_input,
+            "WHERE",
+        );
+        assert_unfocused_table_browse_input_does_not_reclaim_focus(
+            &order_input,
+            &order_popup,
+            &where_input,
+            "ORDER BY",
+        );
+        assert_table_browse_suppressed_contexts(&where_input, &popup, "WHERE");
+        order_popup
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .hide();
+        return;
+    }
     pump(350);
     let scale = std::env::var("SPACE_QUERY_CAPTURE_UI_SCALE")
         .ok()
@@ -906,6 +1035,13 @@ fn capture_table_browse_popup(main_window: &mut MainWindow) {
     let (order_input, order_popup) = main_window
         .capture_tour_show_table_browse_order_popup()
         .unwrap_or_else(|err| fail(format!("show ORDER BY popup: {err}")));
+    if (where_input.w() - order_input.w()).abs() > 1 {
+        fail(format!(
+            "table browse inputs are not evenly split: WHERE={} ORDER BY={}",
+            where_input.w(),
+            order_input.w()
+        ));
+    }
     pump(250);
     capture_table_browse_input_popup(
         &order_input,
@@ -1244,17 +1380,21 @@ fn main() {
         return;
     }
     if capture_mode.as_deref() == Some("table-browse-popup") {
-        capture_table_browse_popup(&mut main_window);
+        capture_table_browse_popup(&mut main_window, false);
         app::quit();
         return;
     }
-
+    if capture_mode.as_deref() == Some("table-browse-input-regression") {
+        capture_table_browse_popup(&mut main_window, true);
+        app::quit();
+        return;
+    }
     capture_object_browser(&mut main_window);
     capture_intellisense(&mut main_window);
     capture_signature_popup(&mut main_window);
     capture_formatting(&mut main_window);
     capture_result_grid(&mut main_window);
-    capture_table_browse_popup(&mut main_window);
+    capture_table_browse_popup(&mut main_window, false);
     capture_result_editing(&mut main_window);
     capture_session_activity(&mut main_window);
     capture_dialogs(&config);
