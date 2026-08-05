@@ -7908,8 +7908,50 @@ impl MultiObjectBrowserWidget {
         widget
     }
 
+    /// FLTK's `Fl_Menu_::add()` parses the label instead of taking it verbatim:
+    /// `|` splits it into several items, `/` builds a submenu path, a leading `_`
+    /// becomes a divider flag, `&` marks a mnemonic, `\` escapes the next
+    /// character and a tab cuts the label off at a shortcut. Every one of those
+    /// desynchronizes the flat menu index from `entries`, so a connection name
+    /// carrying them would select (or display) the wrong browser. `|` and tabs
+    /// are consumed before escapes are honoured, so they must be substituted.
+    fn escape_choice_label(label: &str) -> String {
+        let mut escaped = String::with_capacity(label.len());
+        for character in label.chars() {
+            match character {
+                '|' | '\t' => escaped.push(' '),
+                '/' | '\\' | '&' => {
+                    escaped.push('\\');
+                    escaped.push(character);
+                }
+                '_' if escaped.is_empty() => escaped.push_str("\\_"),
+                _ => escaped.push(character),
+            }
+        }
+        escaped
+    }
+
+    /// `Fl_Menu_::add()` reuses an existing item when the label matches exactly,
+    /// so two connections sharing a display name would collapse into one entry
+    /// and shift every following index. Keep the labels distinct instead.
+    fn disambiguate_choice_labels(labels: &mut [String]) {
+        let mut used = std::collections::HashSet::new();
+        for label in labels.iter_mut() {
+            if used.insert(label.clone()) {
+                continue;
+            }
+            let mut suffix = 2;
+            let mut candidate = format!("{label} #{suffix}");
+            while !used.insert(candidate.clone()) {
+                suffix += 1;
+                candidate = format!("{label} #{suffix}");
+            }
+            *label = candidate;
+        }
+    }
+
     fn runtime_label(runtime: &ConnectionRuntime) -> String {
-        let mut label = runtime.display_name().replace('|', "/");
+        let mut label = Self::escape_choice_label(&runtime.display_name());
         match runtime.state() {
             ConnectionRuntimeState::Connecting => label.push_str(" (connecting)"),
             ConnectionRuntimeState::Transitioning => label.push_str(" (transitioning)"),
@@ -8007,12 +8049,19 @@ impl MultiObjectBrowserWidget {
     }
 
     pub fn add_runtime(&mut self, runtime: Arc<ConnectionRuntime>) {
+        // A runtime is identified by its id, but an unmanaged or transient
+        // runtime can wrap a connection that a registered runtime already owns.
+        // Browsing the same connection twice would only duplicate the entry, so
+        // keep the one that is already installed.
         if self
             .entries
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .iter()
-            .any(|entry| entry.connection_id == runtime.id())
+            .any(|entry| {
+                entry.connection_id == runtime.id()
+                    || Arc::ptr_eq(&entry.runtime.connection(), &runtime.connection())
+            })
         {
             self.refresh_runtime_labels();
             return;
@@ -8093,7 +8142,10 @@ impl MultiObjectBrowserWidget {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .clone();
         let next_id = entries.first().map(|entry| entry.connection_id);
-        {
+        // Only the removed connection loses its selection. Falling back to the
+        // first entry unconditionally would show one connection's tree while
+        // `visible_connection_id` still reports another one.
+        let visible_id = {
             let mut visible = self
                 .visible_connection_id
                 .lock()
@@ -8101,7 +8153,8 @@ impl MultiObjectBrowserWidget {
             if *visible == Some(connection_id) {
                 *visible = next_id;
             }
-        }
+            *visible
+        };
         {
             let mut bound = self
                 .bound_tab_connection_id
@@ -8113,7 +8166,7 @@ impl MultiObjectBrowserWidget {
         }
         for (index, entry) in entries.iter().enumerate() {
             let mut entry_root = entry.browser.get_widget();
-            if Some(entry.connection_id) == next_id {
+            if Some(entry.connection_id) == visible_id {
                 entry_root.show();
                 self.connection_choice.set_value(index as i32);
             } else {
@@ -8127,23 +8180,41 @@ impl MultiObjectBrowserWidget {
 
     pub fn refresh_runtime_labels(&mut self) {
         let current_value = self.connection_choice.value();
-        self.connection_choice.clear();
-        for entry in self
-            .entries
+        let visible_id = *self
+            .visible_connection_id
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .iter()
-        {
-            self.connection_choice
-                .add_choice(&Self::runtime_label(&entry.runtime));
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let (mut labels, visible_index) = {
+            let entries = self
+                .entries
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let labels = entries
+                .iter()
+                .map(|entry| Self::runtime_label(&entry.runtime))
+                .collect::<Vec<_>>();
+            let visible_index = entries
+                .iter()
+                .position(|entry| Some(entry.connection_id) == visible_id);
+            (labels, visible_index)
+        };
+        Self::disambiguate_choice_labels(&mut labels);
+        self.connection_choice.clear();
+        for label in &labels {
+            self.connection_choice.add_choice(label);
         }
-        if self.connection_choice.size() > 0 {
-            self.connection_choice
-                .set_value(current_value.clamp(0, self.connection_choice.size() - 1));
-            self.connection_choice.activate();
-        } else {
+        if labels.is_empty() {
             self.connection_choice.deactivate();
+            return;
         }
+        // `Fl_Menu_::size()` counts the terminating item as well, so clamping
+        // against it can select a phantom entry that maps to no connection.
+        let last_index = labels.len() as i32 - 1;
+        let selected_index = visible_index
+            .map(|index| index as i32)
+            .unwrap_or_else(|| current_value.clamp(0, last_index));
+        self.connection_choice.set_value(selected_index);
+        self.connection_choice.activate();
     }
 
     pub fn selected_connection_context(&self) -> Option<(ConnectionId, Option<String>)> {
@@ -8412,9 +8483,9 @@ impl MultiObjectBrowserWidget {
 #[cfg(test)]
 mod tests {
     use super::{
-        consume_owned_key_up, copy_text_for_object_item, ObjectBrowserMetadataSnapshot,
-        ObjectBrowserWidget, ObjectCache, ObjectDefaultAction, ObjectItem,
-        ScopeSwitchPreflightCallback, SCOPE_SELECTOR_ROW_HEIGHT,
+        consume_owned_key_up, copy_text_for_object_item, MultiObjectBrowserWidget,
+        ObjectBrowserMetadataSnapshot, ObjectBrowserWidget, ObjectCache, ObjectDefaultAction,
+        ObjectItem, ScopeSwitchPreflightCallback, SCOPE_SELECTOR_ROW_HEIGHT,
         SCOPE_SELECTOR_TABLE_VERTICAL_PADDING,
     };
     use crate::db::{DatabaseType, OracleDriverMode};
@@ -8839,6 +8910,57 @@ mod tests {
 
         let result = ObjectBrowserWidget::invoke_scope_switch_preflight_callback(&callback_slot);
         assert_eq!(result, Err("blocked".to_string()));
+    }
+
+    #[test]
+    fn connection_choice_labels_escape_fltk_menu_syntax() {
+        assert_eq!(
+            MultiObjectBrowserWidget::escape_choice_label("dev/qa"),
+            "dev\\/qa"
+        );
+        assert_eq!(
+            MultiObjectBrowserWidget::escape_choice_label("dev|qa"),
+            "dev qa"
+        );
+        assert_eq!(
+            MultiObjectBrowserWidget::escape_choice_label("_staging"),
+            "\\_staging"
+        );
+        assert_eq!(
+            MultiObjectBrowserWidget::escape_choice_label("a&b\\c"),
+            "a\\&b\\\\c"
+        );
+        assert_eq!(
+            MultiObjectBrowserWidget::escape_choice_label("dev\tqa"),
+            "dev qa"
+        );
+        assert_eq!(
+            MultiObjectBrowserWidget::escape_choice_label("prod db_1"),
+            "prod db_1"
+        );
+    }
+
+    #[test]
+    fn connection_choice_labels_stay_distinct_for_equal_connection_names() {
+        let mut labels = vec![
+            "prod".to_string(),
+            "prod".to_string(),
+            "prod #2".to_string(),
+            "dev".to_string(),
+            "prod".to_string(),
+        ];
+        MultiObjectBrowserWidget::disambiguate_choice_labels(&mut labels);
+
+        assert_eq!(
+            labels,
+            vec![
+                "prod".to_string(),
+                "prod #2".to_string(),
+                "prod #2 #2".to_string(),
+                "dev".to_string(),
+                "prod #3".to_string(),
+            ]
+        );
     }
 
     #[test]

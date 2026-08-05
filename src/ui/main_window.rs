@@ -1762,6 +1762,21 @@ impl AppState {
         }
     }
 
+    /// Connection state lives on the runtime, so every tab bound to it renders a
+    /// stale label until it is redrawn. Refreshing only the tab that triggered
+    /// the state change leaves its siblings showing the previous state.
+    fn refresh_tab_labels_for_connection(&mut self, connection_id: ConnectionId) {
+        let tab_ids = self
+            .editor_tabs
+            .iter()
+            .filter(|tab| tab.connection_binding.snapshot().connection_id() == Some(connection_id))
+            .map(|tab| tab.tab_id)
+            .collect::<Vec<_>>();
+        for tab_id in tab_ids {
+            self.refresh_tab_label(tab_id);
+        }
+    }
+
     fn refresh_window_title(&mut self) {
         let base_title = Self::app_window_title();
         if let Some(index) = self.find_tab_index(self.active_editor_tab_id) {
@@ -9974,10 +9989,21 @@ impl MainWindow {
                             .runtime
                     });
                     let connection = runtime.connection();
-                    let already_connected = crate::db::try_lock_connection(&connection)
-                        .is_some_and(|guard| guard.is_connected() && guard.has_connection_handle());
-                    let connection_in_progress =
-                        matches!(runtime.state(), ConnectionRuntimeState::Connecting);
+                    // `try_lock_connection` also fails while a transition is in
+                    // flight or another worker holds the connection, so a
+                    // missing guard means "busy", not "not connected". Starting
+                    // a second connect worker there would pin the runtime at
+                    // "connecting" until the lock frees and then re-login a live
+                    // session, so treat it like a connect already in progress.
+                    let connection_liveness = crate::db::try_lock_connection(&connection)
+                        .map(|guard| guard.is_connected() && guard.has_connection_handle());
+                    let already_connected = connection_liveness == Some(true);
+                    let connection_in_progress = connection_liveness.is_none()
+                        || matches!(
+                            runtime.state(),
+                            ConnectionRuntimeState::Connecting
+                                | ConnectionRuntimeState::Transitioning
+                        );
                     if !already_connected && !connection_in_progress {
                         runtime.update_sanitized_info(info.clone());
                     }
@@ -10020,9 +10046,7 @@ impl MainWindow {
                         s.has_live_connection = true;
                         s.object_browser.add_runtime(runtime.clone());
                         s.object_browser.refresh_runtime_labels();
-                        if let Some(tab_id) = created_tab_id {
-                            s.refresh_tab_label(tab_id);
-                        }
+                        s.refresh_tab_labels_for_connection(runtime.id());
                         s.status_bar.set_label(&format!(
                             "Connected | {} ({})",
                             sanitized_info.name, sanitized_info.db_type
@@ -10032,15 +10056,23 @@ impl MainWindow {
                         return true;
                     }
                     if connection_in_progress {
+                        let mut s = state
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner());
+                        s.object_browser.add_runtime(runtime.clone());
+                        s.object_browser.refresh_runtime_labels();
+                        s.refresh_tab_labels_for_connection(runtime.id());
+                        s.status_bar.set_label(&format!(
+                            "{} is already changing connection state. The new tab is bound to it.",
+                            runtime.display_name()
+                        ));
                         return true;
                     }
 
                     runtime.set_state(ConnectionRuntimeState::Connecting);
                     if let Ok(mut s) = state.try_lock() {
                         s.object_browser.refresh_runtime_labels();
-                        if let Some(tab_id) = created_tab_id {
-                            s.refresh_tab_label(tab_id);
-                        }
+                        s.refresh_tab_labels_for_connection(runtime.id());
                     }
                     let connection_id = runtime.id();
                     let runtime_for_worker = runtime.clone();
