@@ -4002,6 +4002,22 @@ fn should_fail_table_browse_at_batch_end(
     table_browse_loading && !last_page_count_pending
 }
 
+/// Whether a finishing batch owns the per-tab table-browse state currently
+/// registered for its query tab.
+///
+/// The worker publishes `query_running = false` before it queues
+/// `BatchFinished`, so a table-browse or grid-edit request started in that
+/// window registers its own routing before the previous batch is finalized.
+/// Clearing that state by tab id alone strands the new result: with no
+/// execution target, `ensure_result_tab_id` reserves a fresh result tab and
+/// the table page renders as an ordinary query result.
+fn batch_owns_grid_target(
+    finished_target: Option<ResultTabId>,
+    registered_target: Option<ResultTabId>,
+) -> bool {
+    finished_target == registered_target
+}
+
 pub struct MainWindow {
     state: Arc<Mutex<AppState>>,
 }
@@ -9509,12 +9525,20 @@ impl MainWindow {
                     if let Some(token) = operation_token {
                         s.clear_query_cancel_request(token);
                     }
-                    let table_browse_failure_target = s
-                        .result_grid_execution_targets
+                    let panicked_grid_target = s
+                        .progress_contexts
                         .get(&tab_id)
-                        .copied()
+                        .and_then(|context| context.execution_target);
+                    let table_browse_failure_target = panicked_grid_target
                         .filter(|target| owning_result_tabs.table_browse_is_loading(*target));
-                    if let Some(pending) = s.pending_table_browse_last.get_mut(&tab_id) {
+                    if let Some(pending) =
+                        s.pending_table_browse_last.get_mut(&tab_id).filter(|pending| {
+                            batch_owns_grid_target(
+                                panicked_grid_target,
+                                Some(pending.request.result_tab_id),
+                            )
+                        })
+                    {
                         pending.error.get_or_insert_with(|| message.clone());
                     }
                     if s.should_show_progress_status_for_tab(tab_id) {
@@ -9661,16 +9685,23 @@ impl MainWindow {
                             return;
                         }
                     }
-                    let unfinished_table_browse_target = s
-                        .result_grid_execution_targets
+                    let finished_grid_target = s
+                        .progress_contexts
                         .get(&tab_id)
-                        .copied()
-                        .filter(|target| {
-                            should_fail_table_browse_at_batch_end(
-                                owning_result_tabs.table_browse_is_loading(*target),
-                                s.pending_table_browse_last.contains_key(&tab_id),
+                        .and_then(|context| context.execution_target);
+                    let batch_owns_pending_last =
+                        s.pending_table_browse_last.get(&tab_id).is_some_and(|pending| {
+                            batch_owns_grid_target(
+                                finished_grid_target,
+                                Some(pending.request.result_tab_id),
                             )
                         });
+                    let unfinished_table_browse_target = finished_grid_target.filter(|target| {
+                        should_fail_table_browse_at_batch_end(
+                            owning_result_tabs.table_browse_is_loading(*target),
+                            batch_owns_pending_last,
+                        )
+                    });
                     let canceling_tab_id = {
                         s.progress_contexts.get(&tab_id).and_then(|context| {
                             if context.state_label != ResultTabStatus::Canceling.label() {
@@ -9699,9 +9730,34 @@ impl MainWindow {
                     let mut s = state_for_progress
                         .lock()
                         .unwrap_or_else(|poisoned| poisoned.into_inner());
-                    s.result_grid_execution_targets.remove(&tab_id);
-                    let pending_last = s.pending_table_browse_last.remove(&tab_id);
-                    let pending_refresh = s.pending_table_browse_refresh.remove(&tab_id);
+                    if batch_owns_grid_target(
+                        finished_grid_target,
+                        s.result_grid_execution_targets.get(&tab_id).copied(),
+                    ) {
+                        s.result_grid_execution_targets.remove(&tab_id);
+                    }
+                    let pending_last = match s.pending_table_browse_last.get(&tab_id) {
+                        Some(pending)
+                            if batch_owns_grid_target(
+                                finished_grid_target,
+                                Some(pending.request.result_tab_id),
+                            ) =>
+                        {
+                            s.pending_table_browse_last.remove(&tab_id)
+                        }
+                        _ => None,
+                    };
+                    let pending_refresh = match s.pending_table_browse_refresh.get(&tab_id) {
+                        Some(pending)
+                            if batch_owns_grid_target(
+                                finished_grid_target,
+                                Some(pending.request.result_tab_id),
+                            ) =>
+                        {
+                            s.pending_table_browse_refresh.remove(&tab_id)
+                        }
+                        _ => None,
+                    };
                     if s.active_editor_tab_id == tab_id
                         && s.pending_connection_metadata_refresh
                         && s.has_live_connection
@@ -13163,6 +13219,20 @@ mod tests {
         assert!(should_fail_table_browse_at_batch_end(true, false));
         assert!(!should_fail_table_browse_at_batch_end(false, false));
         assert!(!should_fail_table_browse_at_batch_end(true, true));
+    }
+
+    #[test]
+    fn batch_end_keeps_table_browse_state_registered_by_a_newer_request() {
+        let finished = ResultTabId::new(1);
+        let newer = ResultTabId::new(2);
+
+        assert!(batch_owns_grid_target(Some(finished), Some(finished)));
+        assert!(batch_owns_grid_target(None, None));
+        // A browse started in the window between `query_running = false` and
+        // this BatchFinished owns the registration now.
+        assert!(!batch_owns_grid_target(Some(finished), Some(newer)));
+        assert!(!batch_owns_grid_target(None, Some(newer)));
+        assert!(!batch_owns_grid_target(Some(finished), None));
     }
 
     #[test]
