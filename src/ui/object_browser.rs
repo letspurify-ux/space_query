@@ -91,6 +91,21 @@ pub enum SqlAction {
     DisplayResult(ResultTabRequest),
 }
 
+/// What Enter and double-click do on a tree node. Both key paths resolve
+/// through this so the object browser has one default action per node.
+#[derive(Debug, PartialEq, Eq)]
+enum ObjectDefaultAction {
+    Browse(TableBrowseTarget),
+    GenerateDdl {
+        object_type: &'static str,
+        object_name: String,
+    },
+    /// Load package members on first activation, expand/collapse afterwards.
+    PackageNode,
+    ToggleNode,
+    None,
+}
+
 #[derive(Clone)]
 pub struct ObjectBrowserMetadataSnapshot {
     pub db_type: crate::db::DatabaseType,
@@ -2711,6 +2726,10 @@ impl ObjectBrowserWidget {
         let selected_scope = self.selected_scope.clone();
         let scope_generation = self.scope_generation.clone();
         let mut pending_drag_text: Option<String> = None;
+        // FLTK routes KeyUp to whatever holds focus at that moment, which is not
+        // necessarily the widget that received the matching KeyDown (Fl.cxx
+        // documents this). Only act on a KeyUp whose KeyDown this tree owned.
+        let mut owned_keydown: Option<Key> = None;
 
         self.tree.handle(move |t, ev| {
             if !t.active() {
@@ -2789,62 +2808,18 @@ impl ObjectBrowserWidget {
                                 return false;
                             }
 
-                            // Double-click on a package node: load sub-items
-                            if let Some(ObjectItem::Simple { object_type, .. }) =
-                                Self::get_item_info(&item)
-                            {
-                                if object_type == "PACKAGES" {
-                                    if let Some(package_name) =
-                                        Self::package_name_requiring_routine_load(
-                                            &item,
-                                            &object_cache,
-                                        )
-                                    {
-                                        Self::load_package_routines_async(
-                                            &connection,
-                                            &current_db_type,
-                                            &selected_scope,
-                                            &scope_generation,
-                                            &status_callback,
-                                            &action_sender,
-                                            package_name,
-                                            false,
-                                        );
-                                    }
-                                    return true;
-                                }
-                            }
-
-                            let db_type = *current_db_type
-                                .lock()
-                                .unwrap_or_else(|poisoned| poisoned.into_inner());
-                            let scope = Self::scope_snapshot(&selected_scope);
-                            let double_click_target =
-                                Self::get_item_info(&item).and_then(|item_info| {
-                                    Self::double_click_browse_target(
-                                        &item_info,
-                                        db_type,
-                                        scope.as_deref(),
-                                    )
-                                });
-                            if let Some(target) = double_click_target {
-                                ObjectBrowserWidget::emit_sql_callback(
-                                    &sql_callback,
-                                    SqlAction::BrowseTable(target),
-                                );
-                                return true;
-                            }
-
-                            // Double-click on other items: insert text into SQL editor
-                            if let Some(insert_text) =
-                                Self::get_insert_text(&item, db_type, scope.as_deref())
-                            {
-                                ObjectBrowserWidget::emit_sql_callback(
-                                    &sql_callback,
-                                    SqlAction::Insert(insert_text),
-                                );
-                                return true;
-                            }
+                            return Self::activate_tree_item(
+                                t,
+                                &item,
+                                &connection,
+                                &current_db_type,
+                                &selected_scope,
+                                &scope_generation,
+                                &object_cache,
+                                &status_callback,
+                                &action_sender,
+                                &sql_callback,
+                            );
                         }
                     }
 
@@ -2865,8 +2840,10 @@ impl ObjectBrowserWidget {
                 }
                 Event::KeyDown => {
                     if !widget_has_focus(t) {
+                        owned_keydown = None;
                         return false;
                     }
+                    owned_keydown = Some(fltk::app::event_key());
 
                     match fltk::app::event_key() {
                         Key::Up => {
@@ -2908,38 +2885,32 @@ impl ObjectBrowserWidget {
                     }
                 }
                 Event::KeyUp => {
-                    if matches!(fltk::app::event_key(), Key::Up | Key::Down)
-                        && widget_has_focus(t)
-                    {
+                    let key = fltk::app::event_key();
+                    if !consume_owned_key_up(&mut owned_keydown, key) {
+                        return false;
+                    }
+
+                    if matches!(key, Key::Up | Key::Down) && widget_has_focus(t) {
                         Self::select_focused_tree_item(t);
                         return true;
                     }
 
-                    // Enter/KPEnter key to generate SELECT - only if tree has focus
-                    if matches!(fltk::app::event_key(), Key::Enter | Key::KPEnter)
-                        && widget_has_focus(t)
-                    {
+                    // Enter/KPEnter runs the same default action as a
+                    // double-click - only if tree has focus
+                    if matches!(key, Key::Enter | Key::KPEnter) && widget_has_focus(t) {
                         if let Some(item) = t.first_selected_item() {
-                            if let Some(ObjectItem::Simple {
-                                object_type,
-                                object_name,
-                            }) = Self::get_item_info(&item)
-                            {
-                                if object_type == "TABLES" || object_type == "VIEWS" {
-                                    let db_type = *current_db_type
-                                        .lock()
-                                        .unwrap_or_else(|poisoned| poisoned.into_inner());
-                                    let sql = ObjectBrowserWidget::preview_select_sql(
-                                        db_type,
-                                        Self::scope_snapshot(&selected_scope).as_deref(),
-                                        &object_name,
-                                    );
-                                    ObjectBrowserWidget::emit_sql_callback(
-                                        &sql_callback,
-                                        SqlAction::OpenInNewTab(sql),
-                                    );
-                                }
-                            }
+                            Self::activate_tree_item(
+                                t,
+                                &item,
+                                &connection,
+                                &current_db_type,
+                                &selected_scope,
+                                &scope_generation,
+                                &object_cache,
+                                &status_callback,
+                                &action_sender,
+                                &sql_callback,
+                            );
                         }
                         return true;
                     }
@@ -2971,21 +2942,68 @@ impl ObjectBrowserWidget {
             .or_else(|| tree.first_visible_item())
     }
 
-    fn double_click_browse_target(
-        item: &ObjectItem,
+    /// Maps a tree category to the object type `generate_object_ddl` expects.
+    fn ddl_object_type(object_type: &str) -> Option<&'static str> {
+        match object_type {
+            "TABLES" => Some("TABLE"),
+            "VIEWS" => Some("VIEW"),
+            "MATERIALIZED VIEWS" => Some("MATERIALIZED_VIEW"),
+            "PROCEDURES" => Some("PROCEDURE"),
+            "FUNCTIONS" => Some("FUNCTION"),
+            "SEQUENCES" => Some("SEQUENCE"),
+            "TRIGGERS" => Some("TRIGGER"),
+            "EVENTS" => Some("EVENT"),
+            "TYPES" => Some("TYPE"),
+            "INDEXES" => Some("INDEX"),
+            "SYNONYMS" => Some("SYNONYM"),
+            "PACKAGES" => Some("PACKAGE"),
+            _ => None,
+        }
+    }
+
+    fn spawn_generate_ddl(
+        connection: &SharedConnection,
+        action_sender: &std::sync::mpsc::Sender<ObjectActionResult>,
+        status_callback: &StatusCallback,
+        selected_scope: Option<String>,
+        object_type: &str,
+        object_name: &str,
+    ) {
+        let connection = connection.clone();
+        let sender = action_sender.clone();
+        let object_type = object_type.to_string();
+        let object_name = object_name.to_string();
+        Self::emit_status_callback(
+            status_callback,
+            &format!("Generating {} DDL for {}", object_type, object_name),
+        );
+        thread::spawn(move || {
+            let activity = format!("Generating {} DDL for {}", object_type, object_name);
+            let result = ObjectBrowserWidget::with_pooled_object_session(
+                &connection,
+                selected_scope.as_deref(),
+                activity,
+                |context, session| {
+                    object_browser_behavior_for(context.connection_info.db_type)
+                        .generate_object_ddl(
+                            context,
+                            session,
+                            selected_scope.as_deref(),
+                            &object_type,
+                            &object_name,
+                        )
+                },
+            );
+            let _ = sender.send(ObjectActionResult::Ddl(result));
+            app::awake();
+        });
+    }
+
+    fn browse_target_for_object(
+        object_name: &str,
         db_type: crate::db::DatabaseType,
         selected_scope: Option<&str>,
-    ) -> Option<TableBrowseTarget> {
-        let ObjectItem::Simple {
-            object_type,
-            object_name,
-        } = item
-        else {
-            return None;
-        };
-        if object_type != "TABLES" {
-            return None;
-        }
+    ) -> TableBrowseTarget {
         let completion_name =
             Self::qualify_object_name_for_scope(db_type, selected_scope, object_name);
         let relation_sql = if db_type.is_mysql_or_mariadb() {
@@ -2993,13 +3011,132 @@ impl ObjectBrowserWidget {
         } else {
             completion_name.clone()
         };
-        Some(TableBrowseTarget::new(
+        TableBrowseTarget::new(
             db_type,
             selected_scope.map(str::to_string),
-            object_name.clone(),
+            object_name.to_string(),
             relation_sql,
             completion_name,
-        ))
+        )
+    }
+
+    /// The default action a tree node performs, shared by Enter and
+    /// double-click so the two can never drift apart.
+    fn default_action_for_item(
+        item_info: Option<&ObjectItem>,
+        db_type: crate::db::DatabaseType,
+        selected_scope: Option<&str>,
+    ) -> ObjectDefaultAction {
+        let Some(item_info) = item_info else {
+            // Category folders and package member groups carry no object info.
+            return ObjectDefaultAction::ToggleNode;
+        };
+
+        match item_info {
+            ObjectItem::Simple {
+                object_type,
+                object_name,
+            } => match object_type.as_str() {
+                "TABLES" => ObjectDefaultAction::Browse(Self::browse_target_for_object(
+                    object_name,
+                    db_type,
+                    selected_scope,
+                )),
+                "VIEWS" | "MATERIALIZED VIEWS" => ObjectDefaultAction::Browse(
+                    Self::browse_target_for_object(object_name, db_type, selected_scope)
+                        .read_only(),
+                ),
+                "PACKAGES" => ObjectDefaultAction::PackageNode,
+                other => match Self::ddl_object_type(other) {
+                    Some(ddl_type) => ObjectDefaultAction::GenerateDdl {
+                        object_type: ddl_type,
+                        object_name: object_name.clone(),
+                    },
+                    None => ObjectDefaultAction::None,
+                },
+            },
+            // A package routine has no DDL of its own: its source lives in the
+            // package, which is what DataGrip opens for a package member too.
+            ObjectItem::PackageRoutine { package_name, .. } => ObjectDefaultAction::GenerateDdl {
+                object_type: "PACKAGE",
+                object_name: package_name.clone(),
+            },
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn activate_tree_item(
+        tree: &mut Tree,
+        item: &TreeItem,
+        connection: &SharedConnection,
+        current_db_type: &Arc<Mutex<crate::db::DatabaseType>>,
+        selected_scope: &Arc<Mutex<Option<String>>>,
+        scope_generation: &Arc<AtomicU64>,
+        object_cache: &Arc<Mutex<ObjectCache>>,
+        status_callback: &StatusCallback,
+        action_sender: &std::sync::mpsc::Sender<ObjectActionResult>,
+        sql_callback: &SqlExecuteCallback,
+    ) -> bool {
+        let db_type = *current_db_type
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let scope = Self::scope_snapshot(selected_scope);
+        let item_info = Self::get_item_info(item);
+
+        match Self::default_action_for_item(item_info.as_ref(), db_type, scope.as_deref()) {
+            ObjectDefaultAction::Browse(target) => {
+                Self::emit_sql_callback(sql_callback, SqlAction::BrowseTable(target));
+                true
+            }
+            ObjectDefaultAction::GenerateDdl {
+                object_type,
+                object_name,
+            } => {
+                Self::spawn_generate_ddl(
+                    connection,
+                    action_sender,
+                    status_callback,
+                    scope,
+                    object_type,
+                    &object_name,
+                );
+                true
+            }
+            ObjectDefaultAction::PackageNode => {
+                match Self::package_name_requiring_routine_load(item, object_cache) {
+                    Some(package_name) => Self::load_package_routines_async(
+                        connection,
+                        current_db_type,
+                        selected_scope,
+                        scope_generation,
+                        status_callback,
+                        action_sender,
+                        package_name,
+                        false,
+                    ),
+                    None => {
+                        Self::toggle_tree_item(tree, item);
+                    }
+                }
+                true
+            }
+            ObjectDefaultAction::ToggleNode => Self::toggle_tree_item(tree, item),
+            ObjectDefaultAction::None => false,
+        }
+    }
+
+    fn toggle_tree_item(tree: &mut Tree, item: &TreeItem) -> bool {
+        if !item.has_children() {
+            return false;
+        }
+        let mut item = item.clone();
+        if item.is_close() {
+            item.open();
+        } else {
+            item.close();
+        }
+        tree.redraw();
+        true
     }
 
     fn select_tree_item(tree: &mut Tree, item: &TreeItem) {
@@ -5542,52 +5679,15 @@ impl ObjectBrowserWidget {
                             object_name,
                         },
                     ) => {
-                        let obj_type = match object_type.as_str() {
-                            "TABLES" => Some("TABLE"),
-                            "VIEWS" => Some("VIEW"),
-                            "MATERIALIZED VIEWS" => Some("MATERIALIZED_VIEW"),
-                            "PROCEDURES" => Some("PROCEDURE"),
-                            "FUNCTIONS" => Some("FUNCTION"),
-                            "SEQUENCES" => Some("SEQUENCE"),
-                            "TRIGGERS" => Some("TRIGGER"),
-                            "EVENTS" => Some("EVENT"),
-                            "TYPES" => Some("TYPE"),
-                            "INDEXES" => Some("INDEX"),
-                            "SYNONYMS" => Some("SYNONYM"),
-                            "PACKAGES" => Some("PACKAGE"),
-                            _ => None,
-                        };
-                        if let Some(obj_type) = obj_type {
-                            let connection = connection.clone();
-                            let sender = action_sender.clone();
-                            let object_type = obj_type.to_string();
-                            let object_name = object_name.clone();
-                            let selected_scope = selected_scope.clone();
-                            Self::emit_status_callback(
+                        if let Some(obj_type) = Self::ddl_object_type(object_type) {
+                            Self::spawn_generate_ddl(
+                                connection,
+                                action_sender,
                                 status_callback,
-                                &format!("Generating {} DDL for {}", object_type, object_name),
+                                selected_scope.clone(),
+                                obj_type,
+                                object_name,
                             );
-                            thread::spawn(move || {
-                                let activity =
-                                    format!("Generating {} DDL for {}", object_type, object_name);
-                                let result = ObjectBrowserWidget::with_pooled_object_session(
-                                    &connection,
-                                    selected_scope.as_deref(),
-                                    activity,
-                                    |context, session| {
-                                        object_browser_behavior_for(context.connection_info.db_type)
-                                            .generate_object_ddl(
-                                                context,
-                                                session,
-                                                selected_scope.as_deref(),
-                                                &object_type,
-                                                &object_name,
-                                            )
-                                    },
-                                );
-                                let _ = sender.send(ObjectActionResult::Ddl(result));
-                                app::awake();
-                            });
                         }
                     }
                     _ => {}
@@ -7718,6 +7818,14 @@ fn widget_has_focus<W: WidgetExt>(widget: &W) -> bool {
     false
 }
 
+/// FLTK delivers KeyUp to whatever holds focus at that moment, which need not
+/// be the widget that received the matching KeyDown (`Fl.cxx`, `case FL_KEYUP`
+/// documents this). Returns true only for a KeyUp whose KeyDown was recorded
+/// here, and clears the record either way so one KeyDown arms one KeyUp.
+fn consume_owned_key_up(owned_keydown: &mut Option<Key>, key: Key) -> bool {
+    owned_keydown.take() == Some(key)
+}
+
 fn copy_text_for_object_item(item_info: &ObjectItem) -> String {
     match item_info {
         ObjectItem::Simple { object_name, .. } => object_name.clone(),
@@ -8304,8 +8412,9 @@ impl MultiObjectBrowserWidget {
 #[cfg(test)]
 mod tests {
     use super::{
-        copy_text_for_object_item, ObjectBrowserMetadataSnapshot, ObjectBrowserWidget, ObjectCache,
-        ObjectItem, ScopeSwitchPreflightCallback, SCOPE_SELECTOR_ROW_HEIGHT,
+        consume_owned_key_up, copy_text_for_object_item, ObjectBrowserMetadataSnapshot,
+        ObjectBrowserWidget, ObjectCache, ObjectDefaultAction, ObjectItem,
+        ScopeSwitchPreflightCallback, SCOPE_SELECTOR_ROW_HEIGHT,
         SCOPE_SELECTOR_TABLE_VERTICAL_PADDING,
     };
     use crate::db::{DatabaseType, OracleDriverMode};
@@ -8314,6 +8423,29 @@ mod tests {
     use fltk::enums::Key;
     use std::sync::{Arc, Mutex};
     use tns_thin::exec::StatementRequest as OracleThinStatementRequest;
+
+    #[test]
+    fn key_up_without_matching_key_down_is_not_owned() {
+        // An Enter typed in the table browse filter bar deactivates the input,
+        // FLTK bounces focus back to this tree, and only the KeyUp arrives here.
+        let mut owned = None;
+        assert!(!consume_owned_key_up(&mut owned, Key::Enter));
+    }
+
+    #[test]
+    fn key_up_matching_recorded_key_down_is_owned_once() {
+        let mut owned = Some(Key::Enter);
+        assert!(consume_owned_key_up(&mut owned, Key::Enter));
+        assert_eq!(owned, None);
+        assert!(!consume_owned_key_up(&mut owned, Key::Enter));
+    }
+
+    #[test]
+    fn key_up_for_a_different_key_is_not_owned() {
+        let mut owned = Some(Key::Down);
+        assert!(!consume_owned_key_up(&mut owned, Key::Enter));
+        assert_eq!(owned, None);
+    }
 
     fn oracle_thin_live_connection_info() -> crate::db::ConnectionInfo {
         let host = std::env::var("ORACLE_TEST_HOST").unwrap_or_else(|_| "127.0.0.1".to_string());
@@ -8753,31 +8885,120 @@ mod tests {
         assert_eq!(sql, "SELECT * FROM `sales`.`orders` LIMIT 100");
     }
 
-    #[test]
-    fn table_double_click_creates_a_bounded_table_browse_target() {
-        let table = ObjectItem::Simple {
-            object_type: "TABLES".to_string(),
-            object_name: "EMP".to_string(),
-        };
-        let view = ObjectItem::Simple {
-            object_type: "VIEWS".to_string(),
-            object_name: "EMP_VIEW".to_string(),
-        };
+    fn simple_item(object_type: &str, object_name: &str) -> ObjectItem {
+        ObjectItem::Simple {
+            object_type: object_type.to_string(),
+            object_name: object_name.to_string(),
+        }
+    }
 
-        let target = ObjectBrowserWidget::double_click_browse_target(
-            &table,
+    fn default_action(
+        item: &ObjectItem,
+        db_type: DatabaseType,
+        scope: Option<&str>,
+    ) -> ObjectDefaultAction {
+        ObjectBrowserWidget::default_action_for_item(Some(item), db_type, scope)
+    }
+
+    #[test]
+    fn table_default_action_browses_an_editable_target() {
+        let ObjectDefaultAction::Browse(target) = default_action(
+            &simple_item("TABLES", "EMP"),
             DatabaseType::Oracle,
             Some("SCOTT"),
-        )
-        .expect("table browse target");
+        ) else {
+            panic!("tables should browse data");
+        };
+
         assert_eq!(target.table_name, "EMP");
         assert_eq!(target.relation_sql, "SCOTT.EMP");
-        assert!(ObjectBrowserWidget::double_click_browse_target(
-            &view,
+        assert!(target.editable);
+    }
+
+    #[test]
+    fn view_default_action_browses_read_only() {
+        let ObjectDefaultAction::Browse(target) = default_action(
+            &simple_item("VIEWS", "EMP_VIEW"),
             DatabaseType::Oracle,
-            Some("SCOTT")
-        )
-        .is_none());
+            Some("SCOTT"),
+        ) else {
+            panic!("views should browse data");
+        };
+
+        assert_eq!(target.relation_sql, "SCOTT.EMP_VIEW");
+        assert!(!target.editable);
+    }
+
+    #[test]
+    fn mysql_view_browse_target_quotes_the_relation() {
+        let ObjectDefaultAction::Browse(target) = default_action(
+            &simple_item("VIEWS", "order summary"),
+            DatabaseType::MySQL,
+            Some("sales"),
+        ) else {
+            panic!("views should browse data");
+        };
+
+        assert_eq!(target.relation_sql, "`sales`.`order summary`");
+        assert!(!target.editable);
+    }
+
+    #[test]
+    fn source_objects_default_to_opening_their_ddl() {
+        for (db_type, object_type, expected_ddl_type) in [
+            (DatabaseType::Oracle, "PROCEDURES", "PROCEDURE"),
+            (DatabaseType::Oracle, "FUNCTIONS", "FUNCTION"),
+            (DatabaseType::Oracle, "SEQUENCES", "SEQUENCE"),
+            (DatabaseType::Oracle, "TRIGGERS", "TRIGGER"),
+            (DatabaseType::Oracle, "SYNONYMS", "SYNONYM"),
+            (DatabaseType::MySQL, "PROCEDURES", "PROCEDURE"),
+            (DatabaseType::MySQL, "EVENTS", "EVENT"),
+            (DatabaseType::MariaDB, "SEQUENCES", "SEQUENCE"),
+            (DatabaseType::MariaDB, "TRIGGERS", "TRIGGER"),
+        ] {
+            assert_eq!(
+                default_action(&simple_item(object_type, "OBJ"), db_type, Some("APP")),
+                ObjectDefaultAction::GenerateDdl {
+                    object_type: expected_ddl_type,
+                    object_name: "OBJ".to_string(),
+                },
+                "{object_type} on {db_type:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn package_node_expands_and_its_routines_open_the_package_ddl() {
+        assert_eq!(
+            default_action(
+                &simple_item("PACKAGES", "DEMO_PKG"),
+                DatabaseType::Oracle,
+                Some("SCOTT")
+            ),
+            ObjectDefaultAction::PackageNode
+        );
+
+        let routine = ObjectItem::PackageRoutine {
+            package_name: "DEMO_PKG".to_string(),
+            routine_name: "RUN_JOB".to_string(),
+            routine_type: "PROCEDURE".to_string(),
+        };
+        assert_eq!(
+            default_action(&routine, DatabaseType::Oracle, Some("SCOTT")),
+            ObjectDefaultAction::GenerateDdl {
+                object_type: "PACKAGE",
+                object_name: "DEMO_PKG".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn category_nodes_toggle_instead_of_acting_on_an_object() {
+        // Category folders and package member groups carry no object info.
+        assert_eq!(
+            ObjectBrowserWidget::default_action_for_item(None, DatabaseType::Oracle, Some("SCOTT")),
+            ObjectDefaultAction::ToggleNode
+        );
     }
 
     #[test]

@@ -8,6 +8,7 @@ use fltk::{
     prelude::*,
 };
 use std::any::Any;
+use std::cell::Cell;
 use std::panic::{self, AssertUnwindSafe};
 use std::sync::{
     atomic::{AtomicBool, Ordering},
@@ -51,6 +52,9 @@ pub struct TableBrowseTarget {
     pub table_name: String,
     pub relation_sql: String,
     pub completion_name: String,
+    /// Whether the browsed relation may be edited in the grid. Views browse
+    /// read-only: without a ROWID column the grid offers no edit actions.
+    pub editable: bool,
 }
 
 impl TableBrowseTarget {
@@ -67,7 +71,13 @@ impl TableBrowseTarget {
             table_name,
             relation_sql,
             completion_name,
+            editable: true,
         }
+    }
+
+    pub(crate) fn read_only(mut self) -> Self {
+        self.editable = false;
+        self
     }
 
     pub(crate) fn completion_tables(&self) -> Vec<String> {
@@ -266,8 +276,12 @@ pub(crate) fn build_page_sql(request: &TableBrowsePageRequest) -> Result<String,
 
     match request.target.db_type.table_browse_spec().pagination {
         DbTableBrowsePagination::Rownum => {
-            let rowid_sql = QueryExecutor::maybe_inject_rowid_for_editing(&logical_sql);
-            let rowid_sql = QueryExecutor::rowid_safe_execution_sql(&logical_sql, &rowid_sql);
+            let rowid_sql = if request.target.editable {
+                let injected = QueryExecutor::maybe_inject_rowid_for_editing(&logical_sql);
+                QueryExecutor::rowid_safe_execution_sql(&logical_sql, &injected)
+            } else {
+                logical_sql.clone()
+            };
             let sql = format!(
                 "SELECT *\nFROM (\n  SELECT sq_page_source.*, ROWNUM AS {TABLE_BROWSE_PAGE_COLUMN}\n  FROM (\n{inner}\n  ) sq_page_source\n  WHERE ROWNUM <= {upper_bound}\n)\nWHERE {TABLE_BROWSE_PAGE_COLUMN} > {offset}",
                 inner = rowid_sql
@@ -299,6 +313,12 @@ pub(crate) fn last_page_offset(total_rows: u64, page_size: usize) -> u64 {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TableBrowseFilterFocus {
+    Where,
+    Order,
+}
+
 #[derive(Clone)]
 pub(crate) struct TableBrowseFilterBar {
     group: Group,
@@ -310,6 +330,10 @@ pub(crate) struct TableBrowseFilterBar {
     order_label: Frame,
     where_popup: Arc<Mutex<IntellisensePopup>>,
     order_popup: Arc<Mutex<IntellisensePopup>>,
+    // Shared so the clone that deactivates the bar and the clone that
+    // reactivates it agree on which input to hand focus back to, and on the
+    // widget FLTK bounced focus to in the meantime.
+    focus_restore: Arc<Mutex<Option<(TableBrowseFilterFocus, Option<usize>)>>>,
 }
 
 impl TableBrowseFilterBar {
@@ -426,6 +450,7 @@ impl TableBrowseFilterBar {
             order_label,
             where_popup,
             order_popup,
+            focus_restore: Arc::new(Mutex::new(None)),
         };
         bar.layout(x, y, w);
         bar
@@ -472,17 +497,12 @@ impl TableBrowseFilterBar {
         is_where_input: bool,
         popup_showing: Arc<AtomicBool>,
     ) {
+        // No Event::Push or Event::Focus arm: Fl_Input already takes focus on
+        // FL_PUSH and accepts it on FL_FOCUS, and its native handler runs first
+        // here. Calling take_focus() from a FL_FOCUS handler recurses without
+        // bound, because Fl_Widget::take_focus() dispatches FL_FOCUS before it
+        // sets Fl::focus(), leaving has_focus() false inside the handler.
         input.handle(move |input, event| match event {
-            Event::Push => {
-                let _ = input.take_focus();
-                false
-            }
-            Event::Focus => {
-                if !input.has_focus() {
-                    Self::retain_input_focus(input);
-                }
-                false
-            }
             Event::KeyDown => {
                 let key =
                     Self::shortcut_key_for_layout(app::event_key(), app::event_original_key());
@@ -584,7 +604,9 @@ impl TableBrowseFilterBar {
                     if !input_has_focus {
                         return false;
                     }
-                    Self::retain_input_focus(input);
+                    if Self::enter_commits_ime_composition(app::compose_state()) {
+                        return true;
+                    }
                     other_popup
                         .lock()
                         .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -625,13 +647,6 @@ impl TableBrowseFilterBar {
             Event::KeyUp => {
                 let key =
                     Self::shortcut_key_for_layout(app::event_key(), app::event_original_key());
-                if matches!(key, Key::Enter | Key::KPEnter) {
-                    if !input.has_focus() {
-                        return false;
-                    }
-                    Self::retain_input_focus(input);
-                    return true;
-                }
                 let shortcut = app::event_state();
                 let ctrl_or_cmd =
                     shortcut.contains(Shortcut::Ctrl) || shortcut.contains(Shortcut::Command);
@@ -741,6 +756,16 @@ impl TableBrowseFilterBar {
         }
     }
 
+    /// On macOS the Enter that commits an IME composition arrives as an
+    /// ordinary Enter while `Fl::compose_state` is still set. Running the
+    /// filter on it would fire the query mid-word, so let the composition
+    /// finish and apply the filter on the next Enter. Shares the editor's
+    /// rule so both typing paths agree on what an IME Enter is.
+    fn enter_commits_ime_composition(compose_state: i32) -> bool {
+        cfg!(target_os = "macos")
+            && crate::ui::SqlEditorWidget::should_handle_enter_during_ime_composition(compose_state)
+    }
+
     fn popup_key_action(key: Key) -> Option<TableBrowsePopupKeyAction> {
         match key {
             Key::Up => Some(TableBrowsePopupKeyAction::SelectPrev),
@@ -798,10 +823,27 @@ impl TableBrowseFilterBar {
     }
 
     fn retain_input_focus(input: &Input) {
+        // Fl_Widget::take_focus() dispatches FL_FOCUS to the widget before it
+        // sets Fl::focus(), so any handler that calls back here while the event
+        // is in flight would recurse until the stack overflows. Refuse to
+        // re-enter rather than trusting every future handler to be careful.
+        thread_local! {
+            static TAKING_FOCUS: Cell<bool> = const { Cell::new(false) };
+        }
+        if input.was_deleted() || TAKING_FOCUS.with(Cell::get) {
+            return;
+        }
+
         let mut immediate_focus = input.clone();
-        let mut delayed_focus = input.clone();
+        TAKING_FOCUS.with(|taking| taking.set(true));
         let _ = immediate_focus.take_focus();
+        TAKING_FOCUS.with(|taking| taking.set(false));
+
+        let mut delayed_focus = input.clone();
         ui_timeout::schedule(0.0, move || {
+            if delayed_focus.was_deleted() {
+                return;
+            }
             let _ = delayed_focus.take_focus();
         });
     }
@@ -1045,13 +1087,57 @@ impl TableBrowseFilterBar {
             self.order_input.activate();
             self.where_clear.activate();
             self.order_clear.activate();
+            self.restore_thrown_focus();
         } else {
+            // Fl_Widget::deactivate() throws focus, and FLTK then restores the
+            // enclosing group's savedfocus_ (typically the object browser tree
+            // the table was opened from). Remember the focused input so it can
+            // be handed focus back once the inputs accept focus again.
+            let focused = if self.where_input.has_focus() {
+                Some(TableBrowseFilterFocus::Where)
+            } else if self.order_input.has_focus() {
+                Some(TableBrowseFilterFocus::Order)
+            } else {
+                None
+            };
             self.hide_popups();
             self.where_input.deactivate();
             self.order_input.deactivate();
             self.where_clear.deactivate();
             self.order_clear.deactivate();
+            *self
+                .focus_restore
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()) =
+                focused.map(|target| (target, Self::current_focus_id()));
         }
+    }
+
+    /// Hands focus back to the input that lost it to `deactivate()`, but only
+    /// while focus still sits where FLTK bounced it. If the user moved focus
+    /// somewhere else while the page was loading, that choice wins.
+    fn restore_thrown_focus(&mut self) {
+        let Some((target, bounced_focus)) = self
+            .focus_restore
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take()
+        else {
+            return;
+        };
+        if Self::current_focus_id() != bounced_focus {
+            return;
+        }
+        match target {
+            TableBrowseFilterFocus::Where => Self::retain_input_focus(&self.where_input),
+            TableBrowseFilterFocus::Order => Self::retain_input_focus(&self.order_input),
+        }
+    }
+
+    /// Identity of the focused widget as a plain integer, so the filter bar
+    /// stays `Send` (a raw `Fl_Widget` pointer would not be).
+    fn current_focus_id() -> Option<usize> {
+        app::focus().map(|widget| widget.as_widget_ptr() as usize)
     }
 
     pub(crate) fn focus_where_input(&self) {
@@ -1089,6 +1175,17 @@ impl TableBrowseFilterBar {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn plain_enter_applies_the_filter() {
+        assert!(!TableBrowseFilterBar::enter_commits_ime_composition(0));
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn enter_during_ime_composition_does_not_apply_the_filter() {
+        assert!(TableBrowseFilterBar::enter_commits_ime_composition(1));
+    }
 
     fn target(db_type: DatabaseType) -> TableBrowseTarget {
         TableBrowseTarget::new(
@@ -1140,6 +1237,22 @@ mod tests {
         assert!(sql.contains("SQ_INTERNAL_PAGE_ROW > 100"));
         assert!(sql.contains("SQ_INTERNAL_ROWID"));
         assert!(!sql.contains(" OFFSET "));
+    }
+
+    #[test]
+    fn oracle_read_only_page_omits_the_rowid_edit_column() {
+        let request = TableBrowsePageRequest {
+            result_tab_id: ResultTabId::new(1),
+            target: target(DatabaseType::Oracle).read_only(),
+            clauses: TableBrowseClauses::default(),
+            offset: 100,
+            page_size: 10,
+            navigation: TableBrowseNavigation::Page,
+        };
+        let sql = request.page_sql().unwrap();
+        assert!(sql.contains("ROWNUM <= 111"));
+        assert!(sql.contains("SQ_INTERNAL_PAGE_ROW > 100"));
+        assert!(!sql.contains("SQ_INTERNAL_ROWID"));
     }
 
     #[test]
