@@ -2305,7 +2305,31 @@ impl ConnectionDialog {
                             populate_saved_connections(&mut saved_browser, &cfg);
                         }
                     }
-                    DialogMessage::Connect(info, save_connection) => {
+                    DialogMessage::Connect(info, mut save_connection) => {
+                        if !save_connection {
+                            let already_saved = {
+                                let cfg = config
+                                    .lock()
+                                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                                cfg.get_connection_by_name(&info.name).is_some()
+                            };
+                            if !already_saved {
+                                match crate::ui::choice2_on_main(
+                                    &format!(
+                                        "Connection '{}' is not saved. Save it before connecting?",
+                                        info.name
+                                    ),
+                                    "Cancel",
+                                    "Save and Connect",
+                                    "Connect Without Saving",
+                                ) {
+                                    Some(1) => save_connection = true,
+                                    Some(2) => {}
+                                    _ => continue,
+                                }
+                            }
+                        }
+
                         if save_connection {
                             let mut cfg = config
                                 .lock()
