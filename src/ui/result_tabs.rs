@@ -1667,6 +1667,18 @@ impl ResultTabsWidget {
             .get(index)
             .is_some_and(|tab| matches!(tab.kind, ResultTabKind::TableBrowse(_)));
         if already_configured {
+            if select_tab {
+                let filter_bar = {
+                    let data = self
+                        .data
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    data.get(index).and_then(|tab| tab.filter_bar.clone())
+                };
+                if let Some(filter_bar) = filter_bar {
+                    filter_bar.focus_where_input();
+                }
+            }
             return Some(index);
         }
 
@@ -1733,6 +1745,15 @@ impl ResultTabsWidget {
                 }));
                 tab.filter_bar = Some(filter_bar);
             }
+        }
+        if let Some(filter_bar) = {
+            self.data
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .get(index)
+                .and_then(|tab| tab.filter_bar.clone())
+        } {
+            filter_bar.focus_where_input();
         }
         let _ = self.set_result_tab_state(index, ResultTabStatus::Running, 0);
         Some(index)

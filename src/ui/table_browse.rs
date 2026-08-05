@@ -16,9 +16,9 @@ use std::sync::{
 
 use crate::db::{DatabaseType, DbTableBrowsePagination, QueryExecutor};
 use crate::ui::intellisense::{get_word_at_cursor, IntellisenseData, IntellisensePopup};
-use crate::ui::ui_timeout;
 use crate::ui::result_tabs::ResultTabId;
 use crate::ui::theme;
+use crate::ui::ui_timeout;
 use crate::utils::arithmetic::safe_div;
 
 pub(crate) const TABLE_BROWSE_MATERIALIZE_MARKER: &str = "SQ_INTERNAL_TABLE_BROWSE";
@@ -473,6 +473,16 @@ impl TableBrowseFilterBar {
         popup_showing: Arc<AtomicBool>,
     ) {
         input.handle(move |input, event| match event {
+            Event::Push => {
+                let _ = input.take_focus();
+                false
+            }
+            Event::Focus => {
+                if !input.has_focus() {
+                    Self::retain_input_focus(input);
+                }
+                false
+            }
             Event::KeyDown => {
                 let key =
                     Self::shortcut_key_for_layout(app::event_key(), app::event_original_key());
@@ -1042,6 +1052,10 @@ impl TableBrowseFilterBar {
             self.where_clear.deactivate();
             self.order_clear.deactivate();
         }
+    }
+
+    pub(crate) fn focus_where_input(&self) {
+        Self::retain_input_focus(&self.where_input);
     }
 
     pub(crate) fn hide_popups(&self) {
