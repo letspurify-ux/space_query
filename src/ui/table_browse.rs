@@ -16,6 +16,7 @@ use std::sync::{
 
 use crate::db::{DatabaseType, DbTableBrowsePagination, QueryExecutor};
 use crate::ui::intellisense::{get_word_at_cursor, IntellisenseData, IntellisensePopup};
+use crate::ui::ui_timeout;
 use crate::ui::result_tabs::ResultTabId;
 use crate::ui::theme;
 use crate::utils::arithmetic::safe_div;
@@ -478,12 +479,13 @@ impl TableBrowseFilterBar {
                 let shortcut = app::event_state();
                 let ctrl_or_cmd =
                     shortcut.contains(Shortcut::Ctrl) || shortcut.contains(Shortcut::Command);
+                let input_has_focus = input.has_focus();
                 let popup_visible = popup
                     .lock()
                     .unwrap_or_else(|poisoned| poisoned.into_inner())
                     .is_visible();
 
-                if ctrl_or_cmd && key == Key::from_char(' ') {
+                if ctrl_or_cmd && key == Key::from_char(' ') && input_has_focus {
                     Self::show_suggestions(
                         input,
                         &popup,
@@ -503,6 +505,15 @@ impl TableBrowseFilterBar {
                 }
                 if popup_visible {
                     match Self::popup_key_action(key) {
+                        Some(
+                            TableBrowsePopupKeyAction::SelectPrev
+                            | TableBrowsePopupKeyAction::SelectNext
+                            | TableBrowsePopupKeyAction::SelectPrevPage
+                            | TableBrowsePopupKeyAction::SelectNextPage
+                            | TableBrowsePopupKeyAction::Dismiss,
+                        ) if !input_has_focus => {
+                            return false;
+                        }
                         Some(TableBrowsePopupKeyAction::SelectPrev) => {
                             popup
                                 .lock()
@@ -532,6 +543,9 @@ impl TableBrowseFilterBar {
                             return true;
                         }
                         Some(TableBrowsePopupKeyAction::Confirm) => {
+                            if !input_has_focus {
+                                return false;
+                            }
                             let selected = {
                                 let mut popup = popup
                                     .lock()
@@ -542,7 +556,7 @@ impl TableBrowseFilterBar {
                             };
                             if let Some(selected) = selected {
                                 Self::replace_current_word(input, &selected);
-                                let _ = input.take_focus();
+                                Self::retain_input_focus(input);
                                 return true;
                             }
                         }
@@ -557,7 +571,10 @@ impl TableBrowseFilterBar {
                     }
                 }
                 if matches!(key, Key::Enter | Key::KPEnter) {
-                    let _ = input.take_focus();
+                    if !input_has_focus {
+                        return false;
+                    }
+                    Self::retain_input_focus(input);
                     other_popup
                         .lock()
                         .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -584,6 +601,9 @@ impl TableBrowseFilterBar {
                 false
             }
             Event::Shortcut => {
+                if !input.has_focus() {
+                    return false;
+                }
                 let key =
                     Self::shortcut_key_for_layout(app::event_key(), app::event_original_key());
                 let popup_visible = popup
@@ -596,7 +616,10 @@ impl TableBrowseFilterBar {
                 let key =
                     Self::shortcut_key_for_layout(app::event_key(), app::event_original_key());
                 if matches!(key, Key::Enter | Key::KPEnter) {
-                    let _ = input.take_focus();
+                    if !input.has_focus() {
+                        return false;
+                    }
+                    Self::retain_input_focus(input);
                     return true;
                 }
                 let shortcut = app::event_state();
@@ -762,6 +785,15 @@ impl TableBrowseFilterBar {
                     | Key::MetaL
                     | Key::MetaR
             )
+    }
+
+    fn retain_input_focus(input: &Input) {
+        let mut immediate_focus = input.clone();
+        let mut delayed_focus = input.clone();
+        let _ = immediate_focus.take_focus();
+        ui_timeout::schedule(0.0, move || {
+            let _ = delayed_focus.take_focus();
+        });
     }
 
     fn should_hide_popup_on_unfocus(popup_visible: bool, pointer_inside_popup: bool) -> bool {

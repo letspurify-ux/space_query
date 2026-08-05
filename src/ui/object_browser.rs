@@ -2864,7 +2864,7 @@ impl ObjectBrowserWidget {
                     false
                 }
                 Event::KeyDown => {
-                    if !t.has_focus() {
+                    if !widget_has_focus(t) {
                         return false;
                     }
 
@@ -2908,13 +2908,16 @@ impl ObjectBrowserWidget {
                     }
                 }
                 Event::KeyUp => {
-                    if matches!(fltk::app::event_key(), Key::Up | Key::Down) && t.has_focus() {
+                    if matches!(fltk::app::event_key(), Key::Up | Key::Down)
+                        && widget_has_focus(t)
+                    {
                         Self::select_focused_tree_item(t);
                         return true;
                     }
 
                     // Enter/KPEnter key to generate SELECT - only if tree has focus
-                    if matches!(fltk::app::event_key(), Key::Enter | Key::KPEnter) && t.has_focus()
+                    if matches!(fltk::app::event_key(), Key::Enter | Key::KPEnter)
+                        && widget_has_focus(t)
                     {
                         if let Some(item) = t.first_selected_item() {
                             if let Some(ObjectItem::Simple {
