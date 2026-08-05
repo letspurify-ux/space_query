@@ -557,6 +557,7 @@ impl TableBrowseFilterBar {
                     }
                 }
                 if matches!(key, Key::Enter | Key::KPEnter) {
+                    let _ = input.take_focus();
                     other_popup
                         .lock()
                         .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -594,6 +595,10 @@ impl TableBrowseFilterBar {
             Event::KeyUp => {
                 let key =
                     Self::shortcut_key_for_layout(app::event_key(), app::event_original_key());
+                if matches!(key, Key::Enter | Key::KPEnter) {
+                    let _ = input.take_focus();
+                    return true;
+                }
                 let shortcut = app::event_state();
                 let ctrl_or_cmd =
                     shortcut.contains(Shortcut::Ctrl) || shortcut.contains(Shortcut::Command);
