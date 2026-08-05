@@ -11,6 +11,7 @@ This directory documents the current implementation. Start with the repository
 | Editor | [Auto-format rules](auto_format_rule.md) | Normative frame ownership, child depth, close, and audit contract |
 | Editor | [SQL formatting](formatting.md) | Structural depth, formatter state, verification principles |
 | Results | [Result UI](result_ui.md) | Result tabs, support panes, selection and close rules |
+| UI | [FLTK event handling](fltk_handle_event.md) | Event routing, `handle()` semantics, event filtering, handler teardown |
 | Sessions | [Session lifecycle](session.md) | Execution, cancellation, timeout, lazy fetch, physical-session decisions |
 | Transactions | [Retained sessions](transaction.md) | Transactions, residue, locks, preflight, user resolution |
 | Connections | [Oracle](oracle.md) | Thin/OCI connections and Oracle live tests |
