@@ -8,7 +8,7 @@ use fltk::{
     window::Window,
 };
 use space_query::{
-    db::{ColumnInfo, QueryResult},
+    db::{ColumnInfo, DatabaseType, QueryResult, SqlValueKind},
     ui::{
         apply_global_default_font,
         constants::{BUTTON_HEIGHT, TAB_HEADER_HEIGHT},
@@ -252,6 +252,19 @@ fn select_first_browser_in_active_dialog(expected_label: &str) {
     }
 }
 
+/// The kind the Oracle drivers report for a declared column type. The SQL
+/// export builders read it to decide whether a value is quoted, so the captured
+/// grids carry the same kinds a real result set would.
+fn oracle_kind(data_type: &str) -> SqlValueKind {
+    match data_type.to_ascii_uppercase().as_str() {
+        "NUMBER" => SqlValueKind::Number,
+        "DATE" | "TIMESTAMP" => SqlValueKind::Temporal,
+        "RAW" => SqlValueKind::Binary,
+        "VARCHAR2" | "CHAR" | "ROWID" => SqlValueKind::String,
+        _ => SqlValueKind::Unknown,
+    }
+}
+
 fn make_result(columns: &[(&str, &str)], rows: &[&[&str]], sql: &str) -> QueryResult {
     QueryResult {
         sql: sql.to_string(),
@@ -260,7 +273,7 @@ fn make_result(columns: &[(&str, &str)], rows: &[&[&str]], sql: &str) -> QueryRe
             .map(|(name, data_type)| ColumnInfo {
                 name: (*name).to_string(),
                 data_type: (*data_type).to_string(),
-                kind: space_query::db::SqlValueKind::Unknown,
+                kind: oracle_kind(data_type),
             })
             .collect(),
         rows: rows
@@ -1054,6 +1067,70 @@ fn capture_table_browse_popup(main_window: &mut MainWindow, verify_input_handler
     save_main("/tmp/space-query-table-browse.ppm");
 }
 
+/// The Data Grid SQL export items, shown as the grid selection they came from
+/// and the SQL a user pastes afterwards.
+///
+/// The statements are not written by hand: they are generated from the captured
+/// selection by the production builders, so the screenshot cannot drift from
+/// what the menu actually copies.
+fn capture_grid_sql_export(main_window: &mut MainWindow) {
+    // EMPNO, ENAME, and HIREDATE sit next to each other so one selection
+    // rectangle covers a number, a string, and a date: the three literal rules
+    // the export applies from the driver's column kinds.
+    let columns = [
+        ("EMPNO", "NUMBER"),
+        ("ENAME", "VARCHAR2"),
+        ("HIREDATE", "DATE"),
+        ("JOB", "VARCHAR2"),
+        ("SAL", "NUMBER"),
+    ];
+    let rows: &[&[&str]] = &[
+        &["7369", "SMITH", "1980-12-17", "CLERK", "800"],
+        &["7499", "ALLEN", "1981-02-20", "SALESMAN", "1600"],
+        &["7521", "WARD", "1981-02-22", "SALESMAN", "1250"],
+        &["7566", "JONES", "1981-04-02", "MANAGER", "2975"],
+        &["7654", "MARTIN", "1981-09-28", "SALESMAN", "1250"],
+    ];
+    main_window
+        .capture_tour_show_result(
+            "Result",
+            make_result(
+                &columns,
+                rows,
+                "SELECT EMPNO, ENAME, HIREDATE, JOB, SAL FROM EMP ORDER BY EMPNO",
+            ),
+            false,
+            Some((0, 0, 1, 2)),
+        )
+        .unwrap_or_else(|err| fail(format!("show result: {err}")));
+    pump(300);
+
+    let (inserts, updates, where_clause) = main_window
+        .capture_tour_grid_sql_export(DatabaseType::Oracle, &["EMPNO".to_string()])
+        .unwrap_or_else(|err| fail(format!("grid SQL export: {err}")));
+    for (label, sql) in [
+        ("SQL Inserts", &inserts),
+        ("SQL Updates", &updates),
+        ("Where Clause", &where_clause),
+    ] {
+        if sql.trim().is_empty() {
+            fail(format!(
+                "{label} generated no SQL for the captured selection"
+            ));
+        }
+        if !sql.contains("EMP") && label != "Where Clause" {
+            fail(format!("{label} did not name the base table: {sql}"));
+        }
+    }
+
+    let pasted = format!(
+        "-- Data Grid > SQL Inserts\n{inserts}\n-- Data Grid > SQL Updates\n{updates}\n-- Data Grid > Where Clause\n{where_clause}\n"
+    );
+    main_window.capture_tour_set_sql(&pasted, Some(0));
+    pump(300);
+    save_main("/tmp/space-query-grid-sql-export.ppm");
+}
+
 fn capture_result_editing(main_window: &mut MainWindow) {
     let columns = [
         ("ROWID", "ROWID"),
@@ -1374,6 +1451,12 @@ fn main() {
         app::quit();
         return;
     }
+    if capture_mode.as_deref() == Some("grid-sql-export") {
+        capture_object_browser(&mut main_window);
+        capture_grid_sql_export(&mut main_window);
+        app::quit();
+        return;
+    }
     if capture_mode.as_deref() == Some("result-editing") {
         capture_object_browser(&mut main_window);
         capture_result_editing(&mut main_window);
@@ -1395,6 +1478,7 @@ fn main() {
     capture_signature_popup(&mut main_window);
     capture_formatting(&mut main_window);
     capture_result_grid(&mut main_window);
+    capture_grid_sql_export(&mut main_window);
     capture_table_browse_popup(&mut main_window, false);
     capture_result_editing(&mut main_window);
     capture_session_activity(&mut main_window);

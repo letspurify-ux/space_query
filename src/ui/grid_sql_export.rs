@@ -104,6 +104,17 @@ impl GridSqlSelection {
     }
 }
 
+/// The base table the generated SQL should name.
+///
+/// The grid-edit descriptor already names the exact table, so it wins.
+/// Otherwise the table is resolved from the SQL that produced the grid, which
+/// handles CTEs and `alias.ROWID` select lists. `None` renders as `MY_TABLE`.
+pub fn resolve_export_table(descriptor_table: Option<String>, source_sql: &str) -> Option<String> {
+    descriptor_table
+        .or_else(|| crate::ui::sql_editor::query_text::resolve_edit_target_table(source_sql).ok())
+        .filter(|table| !table.trim().is_empty())
+}
+
 /// `INSERT INTO <table> (<selected columns>) VALUES (…);` per selected row.
 pub fn build_sql_inserts(selection: &GridSqlSelection) -> String {
     if selection.selected_columns.is_empty() || selection.rows.is_empty() {

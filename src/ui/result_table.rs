@@ -304,6 +304,12 @@ pub struct ResultTableWidget {
     font_settings: Arc<SharedFontSettings>,
     null_text: Arc<Mutex<String>>,
     source_sql: Arc<Mutex<String>>,
+    /// The statement feeding this grid, known from the first column packet.
+    /// `source_sql` is only filled in when the statement finishes, which a grid
+    /// that is still streaming — or whose lazy fetch was cancelled — never
+    /// reaches, so this is what lets SQL export name the real table meanwhile.
+    /// Edit mode keeps reading `source_sql`: it must not turn on mid-statement.
+    streaming_source_sql: Arc<Mutex<String>>,
     execute_sql_callback: Arc<Mutex<Option<ResultGridSqlExecuteCallback>>>,
     execute_edit_callback: Arc<Mutex<Option<ResultGridEditExecuteCallback>>>,
     result_edit_descriptor: Arc<Mutex<Option<ResultEditDescriptor>>>,
@@ -2180,6 +2186,7 @@ impl ResultTableWidget {
         let row_number_offset = Arc::new(AtomicU64::new(0));
         let null_text = Arc::new(Mutex::new("NULL".to_string()));
         let source_sql = Arc::new(Mutex::new(String::new()));
+        let streaming_source_sql = Arc::new(Mutex::new(String::new()));
         let execute_sql_callback: Arc<Mutex<Option<ResultGridSqlExecuteCallback>>> =
             Arc::new(Mutex::new(None));
         let execute_edit_callback: Arc<Mutex<Option<ResultGridEditExecuteCallback>>> =
@@ -3333,6 +3340,7 @@ impl ResultTableWidget {
             font_settings,
             null_text,
             source_sql,
+            streaming_source_sql,
             execute_sql_callback,
             execute_edit_callback,
             result_edit_descriptor,
@@ -7861,6 +7869,7 @@ impl ResultTableWidget {
                 && self.table.rows() > 0
             {
                 self.clear_pending_stream_buffers();
+                self.set_streaming_source_sql(&result.sql);
                 *self
                     .source_sql
                     .lock()
@@ -7886,14 +7895,16 @@ impl ResultTableWidget {
                 .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
         }
         self.clear_sort_state();
-        *self
-            .source_sql
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner()) = if result.is_select {
+        let finished_sql = if result.is_select {
             result.sql.clone()
         } else {
             String::new()
         };
+        self.set_streaming_source_sql(&finished_sql);
+        *self
+            .source_sql
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = finished_sql;
         let should_render_message_only = !result.is_select
             || (!result.success && result.rows.is_empty() && result.columns.is_empty());
 
@@ -8190,6 +8201,11 @@ impl ResultTableWidget {
         mutex_store_u64(&self.last_flush_epoch_ms, Self::current_epoch_millis());
         mutex_store_usize(&self.width_sampled_rows, 0);
         self.source_sql
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clear();
+        // The caller installs the new statement's SQL right after this returns.
+        self.streaming_source_sql
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .clear();
@@ -8974,6 +8990,10 @@ impl ResultTableWidget {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .clear();
+        self.streaming_source_sql
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clear();
         *self
             .hidden_auto_rowid_col
             .lock()
@@ -9353,11 +9373,34 @@ impl ResultTableWidget {
     }
 
     /// The SQL text this grid was produced by, for base-table resolution.
-    pub(crate) fn source_sql_snapshot(&self) -> String {
-        self.source_sql
+    ///
+    /// Falls back to the streaming statement while the grid has no finished
+    /// result: rows that are still arriving, or that a cancelled lazy fetch left
+    /// behind, came from a real table and must resolve to its name.
+    #[doc(hidden)]
+    pub fn source_sql_snapshot(&self) -> String {
+        let finished = self
+            .source_sql
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        if !finished.trim().is_empty() {
+            return finished;
+        }
+        self.streaming_source_sql
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .clone()
+    }
+
+    /// Record the statement now feeding this grid. Called right after
+    /// [`Self::start_streaming`], which clears it.
+    #[doc(hidden)]
+    pub fn set_streaming_source_sql(&self, sql: &str) {
+        *self
+            .streaming_source_sql
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = sql.to_string();
     }
 
     /// Kinds to keep for `header_len` columns: all of them when the two agree,
@@ -9586,6 +9629,10 @@ impl ResultTableWidget {
             full_data.shrink_to_fit();
         }
         self.source_sql
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clear();
+        self.streaming_source_sql
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .clear();
@@ -13245,6 +13292,42 @@ UPDATE EMP SET ENAME = 'MILLER' WHERE ROWID = 'AAABBB';"
                 .as_slice(),
             &[vec!["7369".to_string(), "SMITH".to_string()]]
         );
+    }
+
+    #[test]
+    #[cfg_attr(
+        any(target_os = "macos", target_os = "linux"),
+        ignore = "FLTK widget tests require a native UI test environment"
+    )]
+    fn source_sql_reports_the_streaming_statement_until_a_result_finishes() {
+        let mut widget = ResultTableWidget::new();
+        let headers = vec!["EMPNO".to_string()];
+        widget.start_streaming(&headers);
+        widget.set_streaming_source_sql("SELECT EMPNO FROM HR.EMP");
+        widget.append_rows(vec![vec!["7369".to_string()]]);
+
+        // Still fetching, or left behind by a cancelled lazy fetch: no finished
+        // result has arrived, and SQL export still has a table to name.
+        assert_eq!(widget.source_sql_snapshot(), "SELECT EMPNO FROM HR.EMP");
+
+        widget.display_result(&QueryResult::new_select_streamed(
+            "SELECT EMPNO FROM HR.EMP ORDER BY EMPNO",
+            vec![crate::db::ColumnInfo {
+                name: "EMPNO".to_string(),
+                data_type: "NUMBER".to_string(),
+                kind: crate::db::SqlValueKind::Number,
+            }],
+            1,
+            Duration::from_millis(1),
+        ));
+        assert_eq!(
+            widget.source_sql_snapshot(),
+            "SELECT EMPNO FROM HR.EMP ORDER BY EMPNO"
+        );
+
+        // A new statement must not export under the previous one's table.
+        widget.start_streaming(&headers);
+        assert_eq!(widget.source_sql_snapshot(), "");
     }
 
     #[test]

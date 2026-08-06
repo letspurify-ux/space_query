@@ -1918,6 +1918,7 @@ impl ResultTabsWidget {
         columns: &[String],
         column_kinds: &[SqlValueKind],
         null_text: &str,
+        sql: &str,
     ) {
         let status = self
             .data
@@ -1932,8 +1933,10 @@ impl ResultTabsWidget {
             table.set_null_text(null_text);
             table.start_streaming(columns);
             // Must follow start_streaming: the setter validates the kinds
-            // against the header list that call just installed.
+            // against the header list that call just installed, and
+            // start_streaming clears the statement text this reinstalls.
             table.set_column_kinds(column_kinds);
+            table.set_streaming_source_sql(sql);
         }
         self.fire_on_change_callback();
     }
@@ -1944,9 +1947,10 @@ impl ResultTabsWidget {
         columns: &[String],
         column_kinds: &[SqlValueKind],
         null_text: &str,
+        sql: &str,
     ) {
         if let Some(index) = self.result_tab_index_for_id(id) {
-            self.start_streaming(index, columns, column_kinds, null_text);
+            self.start_streaming(index, columns, column_kinds, null_text, sql);
         }
     }
 
@@ -2859,22 +2863,26 @@ impl ResultTabsWidget {
         }
     }
 
-    /// Snapshot the visible grid's selection for SQL export, along with the SQL
-    /// that produced it.
+    /// Snapshot the visible grid's selection for SQL export, with its base table
+    /// already resolved.
     ///
-    /// The base table comes from the grid-edit descriptor when the result is
-    /// editable, since that is exact; otherwise the caller resolves it from the
-    /// returned SQL.
+    /// `source_sql_snapshot` reports the streaming statement while the grid has
+    /// no finished result, so a grid that is still fetching — or that a
+    /// cancelled lazy fetch left populated — still names its real table.
     pub(crate) fn sql_export_context(
         &self,
         db_type: crate::db::DatabaseType,
-    ) -> Option<(GridSqlSelection, String)> {
+    ) -> Option<GridSqlSelection> {
         let table = self.current_table()?;
-        let table_name = table
+        let descriptor_table = table
             .result_edit_descriptor_snapshot()
             .map(|descriptor| format!("{}.{}", descriptor.schema_name, descriptor.table_name));
-        let selection = table.sql_export_selection(db_type, table_name)?;
-        Some((selection, table.source_sql_snapshot()))
+        let mut selection = table.sql_export_selection(db_type, None)?;
+        selection.table = crate::ui::grid_sql_export::resolve_export_table(
+            descriptor_table,
+            &table.source_sql_snapshot(),
+        );
+        Some(selection)
     }
 
     #[doc(hidden)]

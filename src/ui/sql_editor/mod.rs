@@ -465,6 +465,12 @@ pub enum QueryProgress {
         /// column as `Unknown`, which renders as a quoted string.
         column_kinds: Vec<crate::db::SqlValueKind>,
         null_text: String,
+        /// The statement that produced this grid. `StatementFinished` carries it
+        /// too, but a grid that is still streaming — or whose lazy fetch was
+        /// cancelled — never sees that event, so SQL export would have no base
+        /// table to name. Empty when there is no statement text to attribute the
+        /// rows to, such as a REF CURSOR opened inside a PL/SQL block.
+        sql: String,
     },
     ResultEditMetadata {
         index: usize,

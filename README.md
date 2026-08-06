@@ -13,7 +13,7 @@ script execution, result inspection, and session diagnostics into one app.
   formatting, quick describe, file tabs, and query history.
 - Run one statement, a selection, or a complete database-aware script.
 - Inspect, sort, copy, export, and lazily fetch query results in independent
-  tabs.
+  tabs, and copy a selection as INSERT, UPDATE, or WHERE-clause SQL.
 - Browse tables with IntelliSense-aware WHERE and ORDER BY expressions and
   bounded, database-side paging.
 - Track active sessions, view application logs, and recover crash details.
@@ -110,7 +110,7 @@ The complete shortcut list is available under **Help > Keyboard Shortcuts**.
 The lower workspace keeps each output type separate:
 
 - **Data Grid** shows query rows and Explain Plan / EXPLAIN results, with
-  selection, copy, CSV export, sorting, and lazy-fetch controls.
+  selection, copy, SQL and CSV export, sorting, and lazy-fetch controls.
 - **Script Output** and **DBMS Output** retain script transcripts and server
   output.
 - **Messages** reports execution details, affected-row counts, and errors.
@@ -241,8 +241,8 @@ their absolute positions across pages.
 - Configure the maximum cell preview length and lazy-fetch batch size. Scrolling
   near the end fetches more rows, while full-result actions can fetch all
   remaining rows first.
-- Use the context menu to close a result, copy data, export CSV, or access
-  available edit actions.
+- Use the context menu to close a result, copy data as text or SQL, export CSV,
+  or access available edit actions.
 
 For a safely identifiable Oracle, MySQL, or MariaDB single-table result,
 **Edit** mode can stage inserted, updated, deleted, or `NULL` values. Oracle
@@ -254,6 +254,44 @@ on a conflict. JOINs, multi-table results, and results without a reliable row
 identifier remain read-only.
 
 ![Oracle result grid in staged edit mode](docs/images/result-grid-editing.png)
+
+### Copy a selection as SQL
+
+The Data Grid context menu also turns the selected cells into SQL on the
+clipboard, ready to paste and run:
+
+![A grid selection and the SQL Inserts, SQL Updates, and Where Clause it produces](docs/images/grid-sql-export.png)
+
+| Menu item | Clipboard contents |
+| --- | --- |
+| **SQL Inserts** | `INSERT INTO <table> (<selected columns>) VALUES (…);` per selected row |
+| **SQL Updates** | `UPDATE <table> SET <selected non-key columns> WHERE <primary key>;` per row |
+| **Where Clause** | `AND` within a row, `OR` between rows, and `IN` when one column is selected |
+
+Values are rendered from the column types the driver reported, not from how a
+value happens to look, so a `NUMBER` stays bare, a `DATE` becomes `TO_DATE(…)`
+on Oracle or a quoted ISO string on MySQL/MariaDB, and a zero-padded `CHAR` code
+such as `00123` keeps its quotes and its zeros. Oracle `RAW` becomes
+`HEXTORAW('…')`.
+
+```sql
+-- Data Grid > SQL Inserts, for two rows of EMPNO, ENAME, HIREDATE
+INSERT INTO EMP (EMPNO, ENAME, HIREDATE) VALUES (7369, 'SMITH', TO_DATE('1980-12-17','YYYY-MM-DD'));
+INSERT INTO EMP (EMPNO, ENAME, HIREDATE) VALUES (7499, 'ALLEN', TO_DATE('1981-02-20','YYYY-MM-DD'));
+
+-- Data Grid > Where Clause, for the EMPNO column alone
+EMPNO IN (7369, 7499)
+```
+
+Only what you selected is exported; helper columns the grid uses internally
+never appear. **SQL Updates** identifies rows by the table's real primary key,
+read from the database, and takes the key values from the whole row, so a key
+column outside the selection still identifies its row—if the table has no usable
+key, the `WHERE` clause is omitted and the status bar says so. Results whose base
+table cannot be determined, such as a join, fall back to `MY_TABLE`. A result
+that is still fetching, or one a cancelled fetch left on screen, exports under
+its real table name. See [docs/result_ui.md](docs/result_ui.md) for the per-type
+rules and their known limits.
 
 ### Settings and diagnostics
 

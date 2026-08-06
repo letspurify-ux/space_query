@@ -4429,6 +4429,7 @@ impl SqlEditorWidget {
                             columns: display_columns.clone(),
                             column_kinds: Self::column_kinds_of(&column_info),
                             null_text: null_text.clone(),
+                            sql: sql_to_execute.clone(),
                         });
                         app::awake();
                         if !display_columns.is_empty() {
@@ -5034,6 +5035,7 @@ impl SqlEditorWidget {
                             columns: display_columns.clone(),
                             column_kinds: Self::column_kinds_of(&column_info),
                             null_text: null_text.clone(),
+                            sql: sql_to_execute.clone(),
                         });
                         app::awake();
                         if !display_columns.is_empty() {
@@ -5838,6 +5840,7 @@ impl SqlEditorWidget {
                             columns: display_columns.clone(),
                             column_kinds: SqlEditorWidget::column_kinds_of(&column_info),
                             null_text: null_text.clone(),
+                            sql: sql_to_execute.clone(),
                         });
                         if let Some(descriptor) = edit_descriptor.clone() {
                             let _ = sender.send(QueryProgress::ResultEditMetadata {
@@ -6674,6 +6677,7 @@ impl SqlEditorWidget {
                 columns: display_columns,
                 column_kinds: Self::column_kinds_of(&result_columns),
                 null_text: null_text.clone(),
+                sql: sql.to_string(),
             });
             if let Some(descriptor) = edit_descriptor.clone() {
                 let _ = sender.send(QueryProgress::ResultEditMetadata { index, descriptor });
@@ -12133,6 +12137,7 @@ impl SqlEditorWidget {
                                                     columns,
                                                 ),
                                                 null_text: null_text.clone(),
+                                                sql: String::new(),
                                             });
                                             app::awake();
                                             if !display_columns.is_empty() {
@@ -12362,6 +12367,7 @@ impl SqlEditorWidget {
                                                     columns,
                                                 ),
                                                 null_text: null_text.clone(),
+                                                sql: String::new(),
                                             });
                                             app::awake();
                                             if !display_columns.is_empty() {
@@ -12773,6 +12779,7 @@ impl SqlEditorWidget {
                                                     columns,
                                                 ),
                                                 null_text: null_text.clone(),
+                                                sql: sql_to_execute.clone(),
                                             });
                                             app::awake();
                                             if !display_columns.is_empty() {
@@ -14568,6 +14575,7 @@ impl SqlEditorWidget {
             columns: display_columns.clone(),
             column_kinds: Self::column_kinds_of(&column_info),
             null_text: null_text.clone(),
+            sql: sql.to_string(),
         });
         app::awake();
         if !display_columns.is_empty() {
@@ -14818,6 +14826,9 @@ impl SqlEditorWidget {
                         columns: display_columns.clone(),
                         column_kinds: Self::column_kinds_of(&column_info),
                         null_text: null_text.clone(),
+                        // A REF CURSOR opened inside PL/SQL: the client never saw
+                        // the SELECT that produced these rows.
+                        sql: String::new(),
                     });
                     app::awake();
                     if !display_columns.is_empty() {
@@ -18726,6 +18737,7 @@ impl SqlEditorWidget {
                 columns: column_names.clone(),
                 column_kinds,
                 null_text: null_text.clone(),
+                sql: sql.to_string(),
             });
             app::awake();
             SqlEditorWidget::append_spool_output(session, &[column_names.join(&colsep)]);

@@ -28,7 +28,8 @@ use space_query::db::{
     ConnectionInfo, DatabaseConnection, DatabaseType, OracleDriverMode, SqlValueKind,
 };
 use space_query::ui::grid_sql_export::{
-    build_sql_inserts, build_sql_updates, build_where_clause, GridSqlSelection,
+    build_sql_inserts, build_sql_updates, build_where_clause, resolve_export_table,
+    GridSqlSelection,
 };
 use space_query::ui::sql_editor::{QueryProgress, SqlEditorWidget};
 use space_query::ui::ObjectBrowserWidget;
@@ -286,6 +287,17 @@ fn first_error(events: &[QueryProgress]) -> Option<String> {
     })
 }
 
+/// The statement text the first `SelectStart` carried.
+///
+/// The grid names the export table from this while the statement is unfinished,
+/// which is the only thing a cancelled lazy fetch ever leaves behind.
+fn select_start_sql(events: &[QueryProgress]) -> Option<String> {
+    events.iter().find_map(|event| match progress_inner(event) {
+        QueryProgress::SelectStart { columns, sql, .. } if !columns.is_empty() => Some(sql.clone()),
+        _ => None,
+    })
+}
+
 /// Columns, kinds, and rows exactly as the grid would receive them.
 ///
 /// Editable results carry extra columns the grid never exports: Oracle injects
@@ -449,6 +461,26 @@ fn verify(target: Target) -> Result<(), String> {
         }
     }
     println!("PASS: all fixture columns classified as expected");
+
+    // (1b) The base table must be resolvable from what `SelectStart` carried,
+    //      not only from the finished result: a lazy fetch that is still
+    //      running — or that the user cancelled — never sends one, and the
+    //      export would fall back to the MY_TABLE placeholder.
+    let start_sql = select_start_sql(&select_events)
+        .ok_or_else(|| "SELECT produced no SelectStart statement text".to_string())?;
+    let resolved = resolve_export_table(None, &start_sql);
+    let names_base_table = resolved.as_deref().is_some_and(|table| {
+        table
+            .rsplit('.')
+            .next()
+            .is_some_and(|name| name.eq_ignore_ascii_case(BASE_TABLE))
+    });
+    if !names_base_table {
+        return Err(format!(
+            "SelectStart SQL {start_sql:?} resolved to {resolved:?}, expected {BASE_TABLE}"
+        ));
+    }
+    println!("PASS: unfinished-statement export resolves the table as {resolved:?}");
 
     // (2) SQL Inserts must reproduce the rows verbatim in another table.
     let all_columns: Vec<usize> = (0..columns.len()).collect();

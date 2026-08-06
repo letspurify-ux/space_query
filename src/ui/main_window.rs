@@ -4970,18 +4970,9 @@ impl MainWindow {
             return;
         };
         let db_type = runtime.sanitized_info().db_type;
-        let Some((mut selection, source_sql)) = s.result_tabs.sql_export_context(db_type) else {
+        let Some(selection) = s.result_tabs.sql_export_context(db_type) else {
             return;
         };
-        // The grid-edit descriptor already names the exact base table. Otherwise
-        // fall back to resolving it from the SQL that produced the grid, which
-        // handles CTEs and `alias.ROWID` select lists.
-        if selection.table.is_none() {
-            selection.table =
-                crate::ui::sql_editor::query_text::resolve_edit_target_table(&source_sql)
-                    .ok()
-                    .filter(|table| !table.trim().is_empty());
-        }
         let row_count = selection.rows.len();
 
         let (sql, message) = match action {
@@ -8910,6 +8901,7 @@ impl MainWindow {
                     columns,
                     column_kinds,
                     null_text,
+                    sql,
                 } => {
                     if columns.is_empty() {
                         return;
@@ -8970,6 +8962,7 @@ impl MainWindow {
                         &columns,
                         &column_kinds,
                         &null_text,
+                        &sql,
                     );
                     if let Some(session_id) = lazy_fetch_session {
                         result_tabs.set_lazy_fetch_session_by_id(result_tab_id, session_id);
@@ -13153,6 +13146,33 @@ impl MainWindow {
         Ok(())
     }
 
+    /// What the three Data Grid SQL export items put on the clipboard for the
+    /// current selection, in menu order: inserts, updates, where clause.
+    ///
+    /// Same snapshot and builders `copy_result_selection_as_sql` uses; only the
+    /// clipboard write and the primary-key lookup, which needs a server, are
+    /// left to the caller.
+    #[doc(hidden)]
+    pub fn capture_tour_grid_sql_export(
+        &mut self,
+        db_type: crate::db::DatabaseType,
+        primary_key: &[String],
+    ) -> Result<(String, String, String), String> {
+        let state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let selection = state
+            .result_tabs
+            .sql_export_context(db_type)
+            .ok_or_else(|| "the result grid has no exportable selection".to_string())?;
+        Ok((
+            crate::ui::grid_sql_export::build_sql_inserts(&selection),
+            crate::ui::grid_sql_export::build_sql_updates(&selection, primary_key),
+            crate::ui::grid_sql_export::build_where_clause(&selection),
+        ))
+    }
+
     #[doc(hidden)]
     pub fn capture_tour_show_table_browse_popup(
         &mut self,
@@ -14737,6 +14757,7 @@ mod tests {
                 columns: vec!["VALUE".to_string()],
                 column_kinds: Vec::new(),
                 null_text: "<NULL>".to_string(),
+                sql: "select value from t".to_string(),
             },
             &[ResultPaneRoute::DataGrid],
         );
@@ -14881,6 +14902,7 @@ mod tests {
                 columns: Vec::new(),
                 column_kinds: Vec::new(),
                 null_text: "<NULL>".to_string(),
+                sql: "select value from t".to_string(),
             },
             &[],
         );
@@ -15723,9 +15745,13 @@ mod tests {
             guard
                 .result_tabs
                 .ensure_statement_tab_by_id(result_tab_id, "Result 1", true);
-            guard
-                .result_tabs
-                .start_streaming_by_id(result_tab_id, &["A".to_string()], &[], "NULL");
+            guard.result_tabs.start_streaming_by_id(
+                result_tab_id,
+                &["A".to_string()],
+                &[],
+                "NULL",
+                "",
+            );
             guard
                 .result_tabs
                 .append_rows_by_id(result_tab_id, vec![vec!["1".to_string()]]);

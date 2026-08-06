@@ -18,7 +18,9 @@
 
 use fltk::{app, prelude::*, window::Window};
 use space_query::db::{ColumnInfo, DatabaseType, QueryResult, SqlValueKind};
-use space_query::ui::grid_sql_export::{build_sql_inserts, build_sql_updates, build_where_clause};
+use space_query::ui::grid_sql_export::{
+    build_sql_inserts, build_sql_updates, build_where_clause, resolve_export_table,
+};
 use space_query::ui::ResultTableWidget;
 use std::process::Command;
 use std::time::Duration;
@@ -208,7 +210,79 @@ fn main() {
         None => failures.push("three-column selection snapshot was empty".into()),
     }
 
+    // (5) A grid that has not finished: rows are on screen, `StatementFinished`
+    //     has not arrived (still fetching, or a lazy fetch the user cancelled,
+    //     which closes without one). The table name must still be the real one,
+    //     resolved from the statement `SelectStart` carried.
+    check_streaming_grid(&mut grid, &mut failures);
+
     finish(&failures, win, app);
+}
+
+/// Drive the grid the way `SelectStart` + `Rows` do, with no `StatementFinished`
+/// after them, and resolve the export table exactly as `sql_export_context`
+/// does.
+fn check_streaming_grid(grid: &mut ResultTableWidget, failures: &mut Vec<String>) {
+    let headers = vec!["ID".to_string(), "NAME".to_string()];
+    grid.start_streaming(&headers);
+    // The same order `ResultTabsWidget::start_streaming` uses: both installs
+    // have to survive the clear that start_streaming does.
+    grid.set_column_kinds(&[SqlValueKind::Number, SqlValueKind::String]);
+    grid.set_streaming_source_sql("SELECT ID, NAME FROM HR.EMP ORDER BY ID");
+    grid.append_rows(vec![
+        vec!["7369".into(), "SMITH".into()],
+        vec!["7499".into(), "ALLEN".into()],
+    ]);
+    app::wait_for(0.2).ok();
+
+    let source_sql = grid.source_sql_snapshot();
+    if source_sql.is_empty() {
+        failures.push("a streaming grid reported no source SQL".into());
+        return;
+    }
+    let table = resolve_export_table(None, &source_sql);
+    if table.as_deref() != Some("HR.EMP") {
+        failures.push(format!(
+            "streaming grid resolved the table as {table:?}, expected Some(\"HR.EMP\")"
+        ));
+        return;
+    }
+
+    grid.select_all();
+    app::wait_for(0.1).ok();
+    match grid.sql_export_selection(DatabaseType::Oracle, table) {
+        Some(streaming) => check_clipboard(
+            "Oracle SQL Inserts (statement not finished)",
+            &build_sql_inserts(&streaming),
+            concat!(
+                "INSERT INTO HR.EMP (ID, NAME) VALUES (7369, 'SMITH');\n",
+                "INSERT INTO HR.EMP (ID, NAME) VALUES (7499, 'ALLEN');\n",
+            ),
+            failures,
+        ),
+        None => failures.push("streaming selection snapshot was empty".into()),
+    }
+
+    // The finished statement replaces the streaming one, and the next statement
+    // starts with no table at all rather than the previous one's.
+    grid.display_result(&sample_result());
+    app::wait_for(0.2).ok();
+    if grid.source_sql_snapshot() != sample_result().sql {
+        failures.push(format!(
+            "a finished result did not replace the streaming statement: {:?}",
+            grid.source_sql_snapshot()
+        ));
+    }
+    grid.start_streaming(&headers);
+    app::wait_for(0.1).ok();
+    if !grid.source_sql_snapshot().is_empty() {
+        failures.push(format!(
+            "a new statement kept the previous source SQL: {:?}",
+            grid.source_sql_snapshot()
+        ));
+    } else {
+        println!("PASS: source SQL follows the statement that produced the rows");
+    }
 }
 
 fn finish(failures: &[String], mut win: Window, app: app::App) {

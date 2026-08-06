@@ -76,6 +76,16 @@ column outside the selection still identifies the row; with no usable key the
 WHERE clause is omitted and the status bar says so. An unresolvable base table
 renders as `MY_TABLE`.
 
+`resolve_export_table` names the table from the grid-edit descriptor when there
+is one, otherwise from the SQL that produced the grid. That SQL is
+`ResultTableWidget::source_sql_snapshot`, which reports the finished statement
+when there is one and the streaming statement otherwise: a grid that is still
+fetching, and one a cancelled lazy fetch left populated, both keep their real
+table name — the cancelled lazy fetch never sends a `StatementFinished` at all.
+`QueryProgress::SelectStart` therefore carries `sql` alongside the column kinds.
+Edit mode deliberately keeps reading the finished `source_sql`, so it still
+cannot be entered mid-statement.
+
 `SQL Inserts` and `Where Clause` are immediate. `SQL Updates` first reads the
 table's primary key through `ObjectBrowserWidget::load_primary_key_columns`, so
 it completes asynchronously via `FileActionResult::CopySqlToClipboard`.
