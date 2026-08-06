@@ -260,14 +260,17 @@ identifier remain read-only.
 ![Application settings](docs/images/settings.png)
 
 **Settings > Preferences** controls editor/result fonts, global UI size, result
-preview and lazy-fetch limits, connection-pool size, and cancellation behavior.
-Settings persist between launches.
+preview and lazy-fetch limits, connection-pool size, cancellation behavior, and
+how many query-history and application-log entries are retained. Settings
+persist between launches.
 
 ![Query history with SQL and error preview](docs/images/query-history.png)
 
-**Tools > Query History** searches statements executed during the current app
-process, filters failures, shows SQL and error details, and sends a selected
-statement back to the editor.
+**Tools > Query History** searches executed statements, filters failures, shows
+SQL and error details, and sends a selected statement back to the editor.
+History is kept in a file and restored at the next launch; **Settings >
+Preferences > History & Log** sets how many query-history and application-log
+entries are retained.
 
 ![Session activity result](docs/images/session-activity.png)
 
@@ -333,7 +336,7 @@ library:
 | Application log | `data_dir()/space_query/app.log.json` |
 | Crash report | `data_dir()/space_query/crash.log` |
 | Saved passwords | `space_query` service in the OS keyring |
-| Query history | Memory of the current app process only |
+| Query history | `data_dir()/space_query/query_history.json` |
 
 Passwords are never written to `config.json`. Existing data in the legacy
 `oracle_query_tool` config and keyring namespaces is migrated when encountered.

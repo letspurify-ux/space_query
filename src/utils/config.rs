@@ -1,7 +1,8 @@
 use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
 use std::fs;
-use std::path::PathBuf;
+use std::io::Write;
+use std::path::{Path, PathBuf};
 use std::sync::{OnceLock, RwLock};
 
 #[cfg(unix)]
@@ -14,7 +15,13 @@ const APP_DIR_NAME: &str = "space_query";
 const LEGACY_APP_DIR_NAME: &str = "oracle_query_tool";
 const MAX_RECENT_CONNECTIONS: usize = 50;
 pub const MAX_RECENT_SQL_FILES: usize = 10;
-const MAX_QUERY_HISTORY_ENTRIES: usize = 100;
+const QUERY_HISTORY_FILE_NAME: &str = "query_history.json";
+pub const DEFAULT_QUERY_HISTORY_LIMIT: u32 = 100;
+pub const MIN_QUERY_HISTORY_LIMIT: u32 = 10;
+pub const MAX_QUERY_HISTORY_LIMIT: u32 = 1000;
+pub const DEFAULT_APP_LOG_LIMIT: u32 = 100;
+pub const MIN_APP_LOG_LIMIT: u32 = 10;
+pub const MAX_APP_LOG_LIMIT: u32 = 5000;
 const DEFAULT_RESULT_CELL_MAX_CHARS: u32 = 150;
 pub const DEFAULT_UI_SCALE_PERCENT: u32 = 100;
 pub const MIN_UI_SCALE_PERCENT: u32 = 50;
@@ -81,6 +88,8 @@ pub struct AppConfig {
     pub cancel_timeout_seconds: u32,
     pub sql_comma_list_layout: SqlCommaListLayout,
     pub sql_format_right_margin: u32,
+    pub query_history_limit: u32,
+    pub app_log_limit: u32,
 }
 
 impl AppConfig {
@@ -128,6 +137,8 @@ impl AppConfig {
             cancel_timeout_seconds: DEFAULT_CANCEL_TIMEOUT_SECONDS,
             sql_comma_list_layout: SqlCommaListLayout::Wrapped,
             sql_format_right_margin: DEFAULT_SQL_FORMAT_RIGHT_MARGIN,
+            query_history_limit: DEFAULT_QUERY_HISTORY_LIMIT,
+            app_log_limit: DEFAULT_APP_LOG_LIMIT,
         }
     }
 
@@ -239,6 +250,42 @@ impl AppConfig {
 
     pub fn normalized_sql_format_right_margin(&self) -> u32 {
         Self::clamp_sql_format_right_margin(self.sql_format_right_margin)
+    }
+
+    pub fn clamp_query_history_limit(limit: u32) -> u32 {
+        limit.clamp(MIN_QUERY_HISTORY_LIMIT, MAX_QUERY_HISTORY_LIMIT)
+    }
+
+    pub fn normalized_query_history_limit(&self) -> u32 {
+        Self::clamp_query_history_limit(self.query_history_limit)
+    }
+
+    /// Read only the history retention limit from the process-local config.
+    /// Avoids cloning the whole config on the history writer's hot path.
+    pub fn runtime_query_history_limit() -> usize {
+        RUNTIME_CONFIG
+            .get_or_init(|| RwLock::new(Self::new()))
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .normalized_query_history_limit() as usize
+    }
+
+    pub fn clamp_app_log_limit(limit: u32) -> u32 {
+        limit.clamp(MIN_APP_LOG_LIMIT, MAX_APP_LOG_LIMIT)
+    }
+
+    pub fn normalized_app_log_limit(&self) -> u32 {
+        Self::clamp_app_log_limit(self.app_log_limit)
+    }
+
+    /// Read only the log retention limit from the process-local config, for the
+    /// same reason as `runtime_query_history_limit`.
+    pub fn runtime_app_log_limit() -> usize {
+        RUNTIME_CONFIG
+            .get_or_init(|| RwLock::new(Self::new()))
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .normalized_app_log_limit() as usize
     }
 
     pub fn config_path() -> Option<PathBuf> {
@@ -495,14 +542,133 @@ impl QueryHistory {
         }
     }
 
-    pub fn load() -> Self {
-        Self::new()
+    pub fn history_path() -> Option<PathBuf> {
+        crate::utils::logging::app_data_base_dir().map(|mut path| {
+            path.push(APP_DIR_NAME);
+            path.push(QUERY_HISTORY_FILE_NAME);
+            path
+        })
     }
 
-    pub fn add_entry(&mut self, entry: QueryHistoryEntry) {
+    /// Keep a history file we could not parse so a user does not silently lose
+    /// past queries when the file is damaged.
+    fn preserve_corrupt_history_file(path: &Path) {
+        let timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|duration| duration.as_secs())
+            .unwrap_or_default();
+        let backup_path = path.with_extension(format!("corrupt.{}.json", timestamp));
+        match fs::rename(path, &backup_path) {
+            Ok(()) => eprintln!(
+                "Corrupt query history was moved to {}",
+                backup_path.display()
+            ),
+            Err(err) => eprintln!(
+                "Failed to preserve corrupt query history file {}: {}",
+                path.display(),
+                err
+            ),
+        }
+    }
+
+    /// Read the persisted history once, at history writer startup.
+    /// Every later read is served from memory.
+    pub fn load(limit: usize) -> Self {
+        let Some(path) = Self::history_path() else {
+            return Self::new();
+        };
+        if !path.exists() {
+            return Self::new();
+        }
+        match fs::read_to_string(&path) {
+            Ok(content) => match serde_json::from_str::<Self>(&content) {
+                Ok(mut history) => {
+                    history.queries.truncate(limit);
+                    history
+                }
+                Err(err) => {
+                    eprintln!(
+                        "Failed to parse query history file {}: {}",
+                        path.display(),
+                        err
+                    );
+                    Self::preserve_corrupt_history_file(&path);
+                    Self::new()
+                }
+            },
+            Err(err) => {
+                eprintln!(
+                    "Failed to read query history file {}: {}",
+                    path.display(),
+                    err
+                );
+                Self::new()
+            }
+        }
+    }
+
+    fn save_to_path(&self, path: &Path) -> Result<(), String> {
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).map_err(|err| err.to_string())?;
+        }
+
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|duration| duration.as_nanos())
+            .unwrap_or_default();
+        let tmp_path = path.with_file_name(format!(
+            "{}.tmp.{}.{}",
+            QUERY_HISTORY_FILE_NAME,
+            std::process::id(),
+            unique
+        ));
+
+        let write_result = (|| -> Result<(), String> {
+            let mut file = fs::File::create(&tmp_path).map_err(|err| err.to_string())?;
+            serde_json::to_writer(&mut file, self).map_err(|err| err.to_string())?;
+            file.flush().map_err(|err| err.to_string())?;
+            file.sync_all().map_err(|err| err.to_string())
+        })();
+
+        if let Err(err) = write_result {
+            let _ = fs::remove_file(&tmp_path);
+            return Err(err);
+        }
+
+        // Executed SQL can contain sensitive literals; keep it owner-only.
+        #[cfg(unix)]
+        if let Err(err) = fs::set_permissions(&tmp_path, fs::Permissions::from_mode(0o600)) {
+            eprintln!("Warning: could not set query history file permissions: {err}");
+        }
+
+        if let Err(err) = fs::rename(&tmp_path, path) {
+            let _ = fs::remove_file(&tmp_path);
+            return Err(err.to_string());
+        }
+
+        Ok(())
+    }
+
+    pub fn save(&self) -> Result<(), String> {
+        let path =
+            Self::history_path().ok_or_else(|| "History directory is unavailable".to_string())?;
+        self.save_to_path(&path)
+    }
+
+    pub fn add_entry(&mut self, entry: QueryHistoryEntry, limit: usize) {
         self.queries.push_front(entry);
-        // Keep only last 100 queries
-        self.queries.truncate(MAX_QUERY_HISTORY_ENTRIES);
+        self.queries.truncate(limit);
+    }
+
+    /// Apply a retention limit changed in preferences.
+    /// Returns true when entries were actually dropped, so the caller only
+    /// rewrites the file when the change is visible on disk.
+    pub fn apply_limit(&mut self, limit: usize) -> bool {
+        if self.queries.len() <= limit {
+            return false;
+        }
+        self.queries.truncate(limit);
+        true
     }
 }
 
@@ -630,6 +796,118 @@ mod tests {
         assert_eq!(restored.connection_id, None);
         assert_eq!(restored.scope, None);
         assert!(restored.success);
+    }
+
+    fn sample_history_entry(sql: &str) -> QueryHistoryEntry {
+        QueryHistoryEntry {
+            sql: sql.to_string(),
+            timestamp: "2026-08-06 09:00:00".to_string(),
+            execution_time_ms: 3,
+            row_count: 1,
+            connection_name: "DEV".to_string(),
+            connection_id: Some(1),
+            scope: None,
+            success: true,
+            error_message: None,
+            error_line: None,
+        }
+    }
+
+    #[test]
+    fn query_history_add_entry_keeps_newest_within_limit() {
+        let mut history = super::QueryHistory::new();
+        for index in 0..5 {
+            history.add_entry(sample_history_entry(&format!("SELECT {index}")), 3);
+        }
+
+        assert_eq!(history.queries.len(), 3);
+        assert_eq!(history.queries[0].sql, "SELECT 4");
+        assert_eq!(history.queries[2].sql, "SELECT 2");
+    }
+
+    #[test]
+    fn query_history_apply_limit_reports_only_real_truncation() {
+        let mut history = super::QueryHistory::new();
+        for index in 0..4 {
+            history.add_entry(sample_history_entry(&format!("SELECT {index}")), 100);
+        }
+
+        assert!(!history.apply_limit(4));
+        assert!(!history.apply_limit(10));
+        assert!(history.apply_limit(2));
+        assert_eq!(history.queries.len(), 2);
+        assert_eq!(history.queries[0].sql, "SELECT 3");
+    }
+
+    #[test]
+    fn query_history_save_writes_complete_json_without_tmp_file_leftover() {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|duration| duration.as_nanos())
+            .unwrap_or_default();
+        let dir = std::env::temp_dir().join(format!(
+            "space_query_history_save_test_{}_{}",
+            std::process::id(),
+            unique
+        ));
+        let path = dir.join(super::QUERY_HISTORY_FILE_NAME);
+        let mut history = super::QueryHistory::new();
+        history.add_entry(sample_history_entry("SELECT '한글' FROM dual"), 100);
+
+        history
+            .save_to_path(&path)
+            .expect("history save should succeed");
+
+        let saved = std::fs::read_to_string(&path).expect("saved history should be readable");
+        let parsed: super::QueryHistory =
+            serde_json::from_str(&saved).expect("saved history should be valid JSON");
+        assert_eq!(parsed.queries[0].sql, "SELECT '한글' FROM dual");
+        let leftovers = std::fs::read_dir(&dir)
+            .expect("history test dir should be readable")
+            .filter_map(Result::ok)
+            .filter(|entry| entry.file_name().to_string_lossy().contains(".tmp."))
+            .count();
+        assert_eq!(leftovers, 0);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn app_config_clamps_query_history_limit_to_supported_range() {
+        assert_eq!(
+            AppConfig::clamp_query_history_limit(0),
+            super::MIN_QUERY_HISTORY_LIMIT
+        );
+        assert_eq!(AppConfig::clamp_query_history_limit(250), 250);
+        assert_eq!(
+            AppConfig::clamp_query_history_limit(u32::MAX),
+            super::MAX_QUERY_HISTORY_LIMIT
+        );
+        assert_eq!(
+            AppConfig::new().query_history_limit,
+            super::DEFAULT_QUERY_HISTORY_LIMIT
+        );
+    }
+
+    #[test]
+    fn app_config_clamps_app_log_limit_to_supported_range() {
+        assert_eq!(AppConfig::clamp_app_log_limit(0), super::MIN_APP_LOG_LIMIT);
+        assert_eq!(AppConfig::clamp_app_log_limit(2000), 2000);
+        assert_eq!(
+            AppConfig::clamp_app_log_limit(u32::MAX),
+            super::MAX_APP_LOG_LIMIT
+        );
+        assert_eq!(AppConfig::new().app_log_limit, super::DEFAULT_APP_LOG_LIMIT);
+    }
+
+    #[test]
+    fn app_config_without_retention_fields_falls_back_to_defaults() {
+        let restored: AppConfig = serde_json::from_str("{}").expect("config should deserialize");
+
+        assert_eq!(
+            restored.query_history_limit,
+            super::DEFAULT_QUERY_HISTORY_LIMIT
+        );
+        assert_eq!(restored.app_log_limit, super::DEFAULT_APP_LOG_LIMIT);
     }
 
     #[test]

@@ -19,12 +19,14 @@ fn fold_for_case_insensitive(value: &str) -> String {
 use crate::ui::constants::*;
 use crate::ui::{available_font_names, center_on_main, resolved_font_name, theme};
 use crate::utils::{
-    AppConfig, SqlCommaListLayout, MAX_CANCEL_TIMEOUT_SECONDS, MAX_CONNECTION_POOL_SIZE,
-    MAX_CONNECT_TIMEOUT_SECONDS, MAX_FONT_SIZE, MAX_INTELLISENSE_CONTEXT_WINDOW_KIB,
-    MAX_INTELLISENSE_POPUP_DELAY_MS, MAX_LAZY_FETCH_BATCH_SIZE, MAX_SQL_FORMAT_RIGHT_MARGIN,
-    MAX_UI_FONT_SIZE, MAX_UI_SCALE_PERCENT, MIN_CANCEL_TIMEOUT_SECONDS, MIN_CONNECTION_POOL_SIZE,
-    MIN_CONNECT_TIMEOUT_SECONDS, MIN_FONT_SIZE, MIN_INTELLISENSE_CONTEXT_WINDOW_KIB,
-    MIN_INTELLISENSE_POPUP_DELAY_MS, MIN_LAZY_FETCH_BATCH_SIZE, MIN_SQL_FORMAT_RIGHT_MARGIN,
+    AppConfig, SqlCommaListLayout, MAX_APP_LOG_LIMIT, MAX_CANCEL_TIMEOUT_SECONDS,
+    MAX_CONNECTION_POOL_SIZE, MAX_CONNECT_TIMEOUT_SECONDS, MAX_FONT_SIZE,
+    MAX_INTELLISENSE_CONTEXT_WINDOW_KIB, MAX_INTELLISENSE_POPUP_DELAY_MS,
+    MAX_LAZY_FETCH_BATCH_SIZE, MAX_QUERY_HISTORY_LIMIT, MAX_SQL_FORMAT_RIGHT_MARGIN,
+    MAX_UI_FONT_SIZE, MAX_UI_SCALE_PERCENT, MIN_APP_LOG_LIMIT, MIN_CANCEL_TIMEOUT_SECONDS,
+    MIN_CONNECTION_POOL_SIZE, MIN_CONNECT_TIMEOUT_SECONDS, MIN_FONT_SIZE,
+    MIN_INTELLISENSE_CONTEXT_WINDOW_KIB, MIN_INTELLISENSE_POPUP_DELAY_MS,
+    MIN_LAZY_FETCH_BATCH_SIZE, MIN_QUERY_HISTORY_LIMIT, MIN_SQL_FORMAT_RIGHT_MARGIN,
     MIN_UI_FONT_SIZE, MIN_UI_SCALE_PERCENT,
 };
 
@@ -44,6 +46,8 @@ pub struct FontSettings {
     pub cancel_timeout_seconds: u32,
     pub sql_comma_list_layout: SqlCommaListLayout,
     pub sql_format_right_margin: u32,
+    pub query_history_limit: u32,
+    pub app_log_limit: u32,
 }
 
 fn validate_size(label: &str, value: &str) -> Option<u32> {
@@ -222,6 +226,34 @@ fn validate_sql_format_right_margin(value: &str) -> Option<u32> {
     }
 }
 
+fn validate_query_history_limit(value: &str) -> Option<u32> {
+    match value.trim().parse::<u32>() {
+        Ok(limit) if (MIN_QUERY_HISTORY_LIMIT..=MAX_QUERY_HISTORY_LIMIT).contains(&limit) => {
+            Some(limit)
+        }
+        _ => {
+            crate::ui::alert_on_main(&format!(
+                "Query history size must be a number between {} and {}.",
+                MIN_QUERY_HISTORY_LIMIT, MAX_QUERY_HISTORY_LIMIT
+            ));
+            None
+        }
+    }
+}
+
+fn validate_app_log_limit(value: &str) -> Option<u32> {
+    match value.trim().parse::<u32>() {
+        Ok(limit) if (MIN_APP_LOG_LIMIT..=MAX_APP_LOG_LIMIT).contains(&limit) => Some(limit),
+        _ => {
+            crate::ui::alert_on_main(&format!(
+                "Application log size must be a number between {} and {}.",
+                MIN_APP_LOG_LIMIT, MAX_APP_LOG_LIMIT
+            ));
+            None
+        }
+    }
+}
+
 fn refill_font_list(
     browser: &mut HoldBrowser,
     all_fonts: &[String],
@@ -270,7 +302,8 @@ pub fn show_settings_dialog(config: &AppConfig) -> Option<FontSettings> {
     };
     let current_font = resolved_font_name(configured_font);
 
-    let width = 520;
+    // Wide enough for every tab label to stay readable in the header.
+    let width = 660;
     let height = 560 + INPUT_ROW_HEIGHT + DIALOG_SPACING;
     let mut dialog = Window::default()
         .with_size(width, height)
@@ -712,6 +745,73 @@ pub fn show_settings_dialog(config: &AppConfig) -> Option<FontSettings> {
     formatting_group.resizable(&formatting_flex);
     formatting_group.end();
 
+    // These two labels are longer than the shared form label width.
+    const RETENTION_LABEL_WIDTH: i32 = FORM_LABEL_WIDTH + 60;
+
+    let mut history_group = Group::new(content_x, tab_body_y, content_w, tab_body_h, None);
+    history_group.set_label("History && Log");
+    history_group.set_color(theme::panel_bg());
+    history_group.set_label_color(theme::text_secondary());
+    history_group.begin();
+
+    let mut history_flex = Flex::new(
+        content_x + DIALOG_MARGIN,
+        tab_body_y + DIALOG_MARGIN,
+        content_w - DIALOG_MARGIN * 2,
+        tab_body_h - DIALOG_MARGIN * 2,
+        None,
+    );
+    history_flex.set_type(FlexType::Column);
+    history_flex.set_spacing(DIALOG_SPACING);
+
+    let mut history_limit_row = Flex::default().with_size(0, INPUT_ROW_HEIGHT);
+    history_limit_row.set_type(FlexType::Row);
+    history_limit_row.set_spacing(DIALOG_SPACING);
+    let mut history_limit_label = Frame::default().with_label("Query History:");
+    history_limit_label.set_label_color(theme::text_primary());
+    history_limit_row.fixed(&history_limit_label, RETENTION_LABEL_WIDTH);
+    let mut history_limit_input = IntInput::default();
+    history_limit_input.set_value(&config.normalized_query_history_limit().to_string());
+    history_limit_input.set_color(theme::input_bg());
+    history_limit_input.set_text_color(theme::text_primary());
+    theme::apply_text_input_inset(&mut history_limit_input);
+    history_limit_input.set_tooltip("Number of executed queries kept in the history file");
+    history_limit_row.end();
+    history_flex.fixed(&history_limit_row, INPUT_ROW_HEIGHT);
+
+    let mut app_log_limit_row = Flex::default().with_size(0, INPUT_ROW_HEIGHT);
+    app_log_limit_row.set_type(FlexType::Row);
+    app_log_limit_row.set_spacing(DIALOG_SPACING);
+    let mut app_log_limit_label = Frame::default().with_label("Application Log:");
+    app_log_limit_label.set_label_color(theme::text_primary());
+    app_log_limit_row.fixed(&app_log_limit_label, RETENTION_LABEL_WIDTH);
+    let mut app_log_limit_input = IntInput::default();
+    app_log_limit_input.set_value(&config.normalized_app_log_limit().to_string());
+    app_log_limit_input.set_color(theme::input_bg());
+    app_log_limit_input.set_text_color(theme::text_primary());
+    theme::apply_text_input_inset(&mut app_log_limit_input);
+    app_log_limit_input.set_tooltip("Number of entries kept in the application log file");
+    app_log_limit_row.end();
+    history_flex.fixed(&app_log_limit_row, INPUT_ROW_HEIGHT);
+
+    let mut history_limit_hint = Frame::default().with_label(&format!(
+        "Query history: {} ~ {} entries, application log: {} ~ {} entries",
+        MIN_QUERY_HISTORY_LIMIT, MAX_QUERY_HISTORY_LIMIT, MIN_APP_LOG_LIMIT, MAX_APP_LOG_LIMIT
+    ));
+    history_limit_hint.set_label_color(theme::text_secondary());
+    history_flex.fixed(&history_limit_hint, LABEL_ROW_HEIGHT);
+
+    let mut history_file_hint =
+        Frame::default().with_label("Both are stored on disk and restored at the next start");
+    history_file_hint.set_label_color(theme::text_secondary());
+    history_flex.fixed(&history_file_hint, LABEL_ROW_HEIGHT);
+
+    let history_filler = Frame::default();
+    history_flex.resizable(&history_filler);
+    history_flex.end();
+    history_group.resizable(&history_flex);
+    history_group.end();
+
     tabs.end();
 
     let mut button_row = Flex::new(
@@ -826,6 +926,8 @@ pub fn show_settings_dialog(config: &AppConfig) -> Option<FontSettings> {
     let cancel_timeout_input_ok = cancel_timeout_input.clone();
     let comma_layout_choice_ok = comma_layout_choice.clone();
     let right_margin_input_ok = right_margin_input.clone();
+    let history_limit_input_ok = history_limit_input.clone();
+    let app_log_limit_input_ok = app_log_limit_input.clone();
     let selected_font_ok = selected_font.clone();
     ok_btn.set_callback(move |_| {
         let ui_size = match validate_ui_size(&global_size_input_ok.value()) {
@@ -889,6 +991,15 @@ pub fn show_settings_dialog(config: &AppConfig) -> Option<FontSettings> {
                 Some(margin) => margin,
                 None => return,
             };
+        let query_history_limit =
+            match validate_query_history_limit(&history_limit_input_ok.value()) {
+                Some(limit) => limit,
+                None => return,
+            };
+        let app_log_limit = match validate_app_log_limit(&app_log_limit_input_ok.value()) {
+            Some(limit) => limit,
+            None => return,
+        };
         let font = selected_font_ok
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -915,6 +1026,8 @@ pub fn show_settings_dialog(config: &AppConfig) -> Option<FontSettings> {
             cancel_timeout_seconds,
             sql_comma_list_layout,
             sql_format_right_margin,
+            query_history_limit,
+            app_log_limit,
         });
         dialog_handle.hide();
         app::awake();

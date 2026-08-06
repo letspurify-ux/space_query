@@ -12,11 +12,16 @@ use std::time::{SystemTime, UNIX_EPOCH};
 const APP_DIR_NAME: &str = "space_query";
 const LOG_FILE_NAME: &str = "app.log.json";
 const CRASH_LOG_FILE_NAME: &str = "crash.log";
-const MAX_LOG_ENTRIES: usize = 100;
 const LOG_WRITER_RESPONSE_TIMEOUT_DEFAULT_SECS: u64 = 15;
 const LOG_WRITER_BATCH_DRAIN_LIMIT: usize = 64;
 
-fn app_data_base_dir() -> Option<PathBuf> {
+/// Retained entry count, configurable in preferences. Read from the
+/// process-local config, so no disk access on the logging path.
+fn app_log_limit() -> usize {
+    crate::utils::config::AppConfig::runtime_app_log_limit()
+}
+
+pub(crate) fn app_data_base_dir() -> Option<PathBuf> {
     if let Some(path) = std::env::var_os("SPACE_QUERY_DATA_DIR") {
         return Some(PathBuf::from(path));
     }
@@ -116,7 +121,7 @@ impl AppLog {
                 match fs::read_to_string(&path) {
                     Ok(content) => match serde_json::from_str::<Self>(&content) {
                         Ok(mut log) => {
-                            log.entries.truncate(MAX_LOG_ENTRIES);
+                            log.entries.truncate(app_log_limit());
                             return log;
                         }
                         Err(err) => {
@@ -179,7 +184,18 @@ impl AppLog {
 
     pub fn add_entry(&mut self, entry: LogEntry) {
         self.entries.push_front(entry);
-        self.entries.truncate(MAX_LOG_ENTRIES);
+        self.entries.truncate(app_log_limit());
+    }
+
+    /// Apply a retention limit changed in preferences. Returns true when
+    /// entries were actually dropped, so the caller only rewrites the file
+    /// when the change is visible on disk.
+    pub fn apply_limit(&mut self, limit: usize) -> bool {
+        if self.entries.len() <= limit {
+            return false;
+        }
+        self.entries.truncate(limit);
+        true
     }
 }
 
@@ -192,6 +208,7 @@ impl Default for AppLog {
 enum LogCommand {
     Write(LogEntry),
     Clear,
+    ApplyLimit,
     Flush(mpsc::Sender<Result<(), String>>),
 }
 
@@ -230,6 +247,11 @@ impl LogWriterState {
                 self.log.entries.clear();
                 self.dirty = true;
             }
+            LogCommand::ApplyLimit => {
+                if self.log.apply_limit(app_log_limit()) {
+                    self.dirty = true;
+                }
+            }
             LogCommand::Flush(reply) => {
                 let _ = reply.send(self.persist_if_dirty(persist));
             }
@@ -267,9 +289,23 @@ fn spawn_log_writer() -> mpsc::Sender<LogCommand> {
     sender
 }
 
+static LOG_WRITER: OnceLock<Mutex<mpsc::Sender<LogCommand>>> = OnceLock::new();
+
 fn log_writer_handle() -> &'static Mutex<mpsc::Sender<LogCommand>> {
-    static LOG_WRITER: OnceLock<Mutex<mpsc::Sender<LogCommand>>> = OnceLock::new();
     LOG_WRITER.get_or_init(|| Mutex::new(spawn_log_writer()))
+}
+
+/// Re-apply the retention limit after it changed in preferences. Skipped when
+/// no writer is running; the new limit then applies at the next load.
+pub fn apply_log_limit() {
+    if let Some(buffer) = LOG_BUFFER.get() {
+        if let Ok(mut buf) = buffer.lock() {
+            buf.truncate(app_log_limit());
+        }
+    }
+    if LOG_WRITER.get().is_some() {
+        let _ = send_log_command(LogCommand::ApplyLimit);
+    }
 }
 
 fn log_writer_sender() -> mpsc::Sender<LogCommand> {
@@ -324,9 +360,10 @@ pub fn flush_log_writer() -> Result<(), String> {
 
 /// In-memory ring buffer so the UI can show recent entries without
 /// re-reading the file every time the dialog is opened.
+static LOG_BUFFER: OnceLock<Mutex<VecDeque<LogEntry>>> = OnceLock::new();
+
 fn in_memory_log() -> &'static Mutex<VecDeque<LogEntry>> {
-    static BUFFER: OnceLock<Mutex<VecDeque<LogEntry>>> = OnceLock::new();
-    BUFFER.get_or_init(|| {
+    LOG_BUFFER.get_or_init(|| {
         let log = AppLog::load();
         Mutex::new(log.entries)
     })
@@ -352,7 +389,7 @@ pub fn log(level: LogLevel, source: &str, message: &str) {
     // Update in-memory buffer
     if let Ok(mut buf) = in_memory_log().lock() {
         buf.push_front(entry.clone());
-        buf.truncate(MAX_LOG_ENTRIES);
+        buf.truncate(app_log_limit());
     }
 
     // Persist via background writer
@@ -560,6 +597,20 @@ mod logging_tests {
         assert_eq!(log.entries.len(), 10);
         assert_eq!(log.entries[0].message, "msg9");
         assert_eq!(log.entries[9].message, "msg0");
+    }
+
+    #[test]
+    fn app_log_apply_limit_reports_only_real_truncation() {
+        let mut log = AppLog::new();
+        for i in 0..4 {
+            log.add_entry(test_log_entry(&format!("msg{i}")));
+        }
+
+        assert!(!log.apply_limit(4));
+        assert!(!log.apply_limit(10));
+        assert!(log.apply_limit(2));
+        assert_eq!(log.entries.len(), 2);
+        assert_eq!(log.entries[0].message, "msg3");
     }
 
     #[test]

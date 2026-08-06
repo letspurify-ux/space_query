@@ -25,6 +25,8 @@ enum HistoryCommand {
     Add(PendingHistoryEntry),
     Clear(mpsc::Sender<Result<(), String>>),
     Snapshot(mpsc::Sender<Vec<QueryHistoryEntry>>),
+    ApplyLimit,
+    Flush(mpsc::Sender<Result<(), String>>),
 }
 
 #[derive(Debug, Clone)]
@@ -41,6 +43,18 @@ struct PendingHistoryEntry {
 }
 
 const HISTORY_WRITER_RESPONSE_TIMEOUT_DEFAULT_SECS: u64 = 3;
+/// Wait for the command channel to go quiet before rewriting the history file,
+/// so a burst of statements (script run, batch) costs a single write.
+const HISTORY_WRITER_COALESCE_IDLE: std::time::Duration = std::time::Duration::from_secs(2);
+/// Upper bound on how long a pending entry may stay unwritten while commands
+/// keep arriving, so a long-running script still reaches disk periodically.
+const HISTORY_WRITER_COALESCE_MAX: std::time::Duration = std::time::Duration::from_secs(15);
+/// Floor on the interval between two automatic writes. A script executing tens
+/// of thousands of statements arrives as a steady trickle rather than one
+/// burst, so the idle window alone would still write per statement; this caps
+/// automatic writes at one per interval no matter how many queries run.
+/// Explicit writes (clear, flush on exit) ignore this floor.
+const HISTORY_WRITER_MIN_WRITE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum HistoryTextShortcutAction {
@@ -84,53 +98,166 @@ fn materialize_history_entry(entry: PendingHistoryEntry) -> QueryHistoryEntry {
     }
 }
 
+/// Owns the only in-memory copy of the history. Reads (dialog snapshots) never
+/// touch the disk, and writes are deferred until `persist_if_dirty` runs.
+struct HistoryWriterState {
+    history: QueryHistory,
+    dirty: bool,
+}
+
+impl HistoryWriterState {
+    fn new(history: QueryHistory) -> Self {
+        Self {
+            history,
+            dirty: false,
+        }
+    }
+
+    fn persist_if_dirty<F>(&mut self, persist: &mut F) -> Result<(), String>
+    where
+        F: FnMut(&QueryHistory) -> Result<(), String>,
+    {
+        if !self.dirty {
+            return Ok(());
+        }
+        persist(&self.history)?;
+        self.dirty = false;
+        Ok(())
+    }
+
+    fn process_command<F>(&mut self, command: HistoryCommand, persist: &mut F)
+    where
+        F: FnMut(&QueryHistory) -> Result<(), String>,
+    {
+        match command {
+            HistoryCommand::Add(entry) => {
+                self.history.add_entry(
+                    materialize_history_entry(entry),
+                    crate::utils::config::AppConfig::runtime_query_history_limit(),
+                );
+                self.dirty = true;
+            }
+            HistoryCommand::Clear(reply) => {
+                if !self.history.queries.is_empty() {
+                    self.history.queries.clear();
+                    self.dirty = true;
+                }
+                // A user-initiated clear must be durable before we report success.
+                let _ = reply.send(self.persist_if_dirty(persist));
+            }
+            HistoryCommand::Snapshot(reply) => {
+                let _ = reply.send(self.history.queries.iter().cloned().collect());
+            }
+            HistoryCommand::ApplyLimit => {
+                let limit = crate::utils::config::AppConfig::runtime_query_history_limit();
+                if self.history.apply_limit(limit) {
+                    self.dirty = true;
+                }
+            }
+            HistoryCommand::Flush(reply) => {
+                let _ = reply.send(self.persist_if_dirty(persist));
+            }
+        }
+    }
+}
+
+/// How long the writer should keep collecting commands before rewriting the
+/// file. `Duration::ZERO` means "write now".
+///
+/// Three rules combine:
+/// - write once the channel has been idle for `HISTORY_WRITER_COALESCE_IDLE`;
+/// - never hold a pending change longer than `HISTORY_WRITER_COALESCE_MAX`;
+/// - never write more often than `HISTORY_WRITER_MIN_WRITE_INTERVAL`, which
+///   dominates the other two and bounds total I/O under any query rate.
+fn history_write_wait(
+    now: std::time::Instant,
+    last_command_at: std::time::Instant,
+    dirty_since: std::time::Instant,
+    last_write: Option<std::time::Instant>,
+) -> std::time::Duration {
+    let idle_at = last_command_at + HISTORY_WRITER_COALESCE_IDLE;
+    let stale_at = dirty_since + HISTORY_WRITER_COALESCE_MAX;
+    let allowed_at = last_write
+        .map(|written| written + HISTORY_WRITER_MIN_WRITE_INTERVAL)
+        .unwrap_or(now);
+    let target = allowed_at.max(idle_at.min(stale_at));
+    target.saturating_duration_since(now)
+}
+
 fn spawn_history_writer() -> mpsc::Sender<HistoryCommand> {
     let (sender, receiver) = mpsc::channel::<HistoryCommand>();
     thread::spawn(move || {
-        let mut history = QueryHistory::load();
+        // The single disk read of the whole session.
+        let mut state = HistoryWriterState::new(QueryHistory::load(
+            crate::utils::config::AppConfig::runtime_query_history_limit(),
+        ));
+        let last_write = std::cell::Cell::new(None::<std::time::Instant>);
+        let mut persist = |history: &QueryHistory| {
+            let result = history.save();
+            // Pace retries too: a failing disk must not be hit every idle window.
+            last_write.set(Some(std::time::Instant::now()));
+            result
+        };
 
         loop {
-            let cmd = match receiver.recv() {
-                Ok(cmd) => cmd,
+            let command = match receiver.recv() {
+                Ok(command) => command,
                 Err(_) => break,
             };
+            let dirty_since = std::time::Instant::now();
+            let mut last_command_at = dirty_since;
+            state.process_command(command, &mut persist);
 
-            let mut snapshot_replies: Vec<mpsc::Sender<Vec<QueryHistoryEntry>>> = Vec::new();
-            let mut clear_replies: Vec<mpsc::Sender<Result<(), String>>> = Vec::new();
-
-            let mut apply_command = |command: HistoryCommand| match command {
-                HistoryCommand::Add(entry) => {
-                    history.add_entry(materialize_history_entry(entry));
+            let mut disconnected = false;
+            while state.dirty {
+                let wait = history_write_wait(
+                    std::time::Instant::now(),
+                    last_command_at,
+                    dirty_since,
+                    last_write.get(),
+                );
+                if wait.is_zero() {
+                    break;
                 }
-                HistoryCommand::Clear(reply) => {
-                    history.queries.clear();
-                    clear_replies.push(reply);
+                match receiver.recv_timeout(wait) {
+                    Ok(command) => {
+                        last_command_at = std::time::Instant::now();
+                        state.process_command(command, &mut persist);
+                    }
+                    Err(mpsc::RecvTimeoutError::Timeout) => {}
+                    Err(mpsc::RecvTimeoutError::Disconnected) => {
+                        disconnected = true;
+                        break;
+                    }
                 }
-                HistoryCommand::Snapshot(reply) => {
-                    snapshot_replies.push(reply);
-                }
-            };
-
-            apply_command(cmd);
-            while let Ok(next) = receiver.try_recv() {
-                apply_command(next);
             }
 
-            let snapshot: Vec<QueryHistoryEntry> = history.queries.iter().cloned().collect();
-            for reply in snapshot_replies {
-                let _ = reply.send(snapshot.clone());
+            if let Err(err) = state.persist_if_dirty(&mut persist) {
+                eprintln!("Query history save error: {err}");
             }
-            for reply in clear_replies {
-                let _ = reply.send(Ok(()));
+            if disconnected {
+                break;
             }
+        }
+
+        // Shutdown must be durable regardless of the write-rate floor.
+        if let Err(err) = state.persist_if_dirty(&mut persist) {
+            eprintln!("Query history save error: {err}");
         }
     });
     sender
 }
 
+static HISTORY_WRITER: OnceLock<Mutex<mpsc::Sender<HistoryCommand>>> = OnceLock::new();
+
 fn history_writer_handle() -> &'static Mutex<mpsc::Sender<HistoryCommand>> {
-    static HISTORY_WRITER: OnceLock<Mutex<mpsc::Sender<HistoryCommand>>> = OnceLock::new();
     HISTORY_WRITER.get_or_init(|| Mutex::new(spawn_history_writer()))
+}
+
+/// True once a command has been sent in this session. Callers use this to avoid
+/// starting the writer (and its file read) just to flush or re-apply a limit.
+fn history_writer_started() -> bool {
+    HISTORY_WRITER.get().is_some()
 }
 
 fn history_writer_sender() -> mpsc::Sender<HistoryCommand> {
@@ -342,6 +469,29 @@ pub fn history_snapshot() -> Result<Vec<QueryHistoryEntry>, String> {
         .map_err(|_| "Failed to fetch query history snapshot".to_string())?;
     rx.recv_timeout(history_writer_response_timeout())
         .map_err(|_| "Failed to fetch query history snapshot".to_string())
+}
+
+/// Persist any coalesced entries. Called on application shutdown.
+pub fn flush_history_writer() -> Result<(), String> {
+    if !history_writer_started() {
+        return Ok(());
+    }
+
+    let (tx, rx) = mpsc::channel::<Result<(), String>>();
+    send_history_command(HistoryCommand::Flush(tx))
+        .map_err(|_| "Failed to flush query history".to_string())?;
+    rx.recv_timeout(history_writer_response_timeout())
+        .map_err(|_| "Timed out while flushing query history".to_string())?
+}
+
+/// Re-apply the retention limit after it changed in preferences.
+/// Skipped when no history writer is running; the new limit is then applied
+/// when the history is next loaded.
+pub fn apply_history_limit() {
+    if !history_writer_started() {
+        return;
+    }
+    let _ = send_history_command(HistoryCommand::ApplyLimit);
 }
 
 pub fn clear_history() -> Result<(), String> {
@@ -867,6 +1017,162 @@ fn history_entry_matches_filter(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn pending_entry(sql: &str) -> PendingHistoryEntry {
+        PendingHistoryEntry {
+            sql: sql.to_string(),
+            timestamp: "2026-08-06 09:00:00".to_string(),
+            execution_time_ms: 1,
+            row_count: 0,
+            connection_name: "DEV".to_string(),
+            connection_id: None,
+            scope: None,
+            success: true,
+            message: String::new(),
+        }
+    }
+
+    fn earlier(base: std::time::Instant, seconds: u64) -> std::time::Instant {
+        base.checked_sub(std::time::Duration::from_secs(seconds))
+            .unwrap_or(base)
+    }
+
+    #[test]
+    fn history_write_waits_for_the_channel_to_go_idle() {
+        let now = std::time::Instant::now();
+
+        // A command just arrived: hold the write for the idle window.
+        assert_eq!(
+            history_write_wait(now, now, now, None),
+            HISTORY_WRITER_COALESCE_IDLE
+        );
+        // Idle window elapsed with no further command: write now.
+        assert!(history_write_wait(now, earlier(now, 3), earlier(now, 3), None).is_zero());
+    }
+
+    #[test]
+    fn history_write_is_forced_once_a_pending_change_gets_stale() {
+        let now = std::time::Instant::now();
+        // Commands keep arriving (never idle) but the oldest pending entry has
+        // waited past the staleness bound, and the last write is long past.
+        let dirty_since = earlier(now, HISTORY_WRITER_COALESCE_MAX.as_secs() + 1);
+        let last_write = earlier(now, HISTORY_WRITER_MIN_WRITE_INTERVAL.as_secs() + 1);
+
+        assert!(history_write_wait(now, now, dirty_since, Some(last_write)).is_zero());
+    }
+
+    #[test]
+    fn history_write_rate_floor_dominates_a_steady_query_stream() {
+        let now = std::time::Instant::now();
+        // Statements trickling in one at a time: each one is individually idle
+        // and stale, but a write happened 5s ago, so the floor still applies.
+        let wait = history_write_wait(
+            now,
+            earlier(now, 10),
+            earlier(now, 60),
+            Some(earlier(now, 5)),
+        );
+
+        assert_eq!(
+            wait,
+            HISTORY_WRITER_MIN_WRITE_INTERVAL - std::time::Duration::from_secs(5)
+        );
+        assert!(wait > HISTORY_WRITER_COALESCE_IDLE);
+    }
+
+    #[test]
+    fn history_writer_flush_persists_batched_adds_once() {
+        let mut state = HistoryWriterState::new(QueryHistory::new());
+        let mut save_count = 0usize;
+        let mut saved_sql = Vec::new();
+        let mut persist = |history: &QueryHistory| {
+            save_count += 1;
+            saved_sql = history
+                .queries
+                .iter()
+                .map(|entry| entry.sql.clone())
+                .collect::<Vec<_>>();
+            Ok(())
+        };
+
+        state.process_command(HistoryCommand::Add(pending_entry("SELECT 1")), &mut persist);
+        state.process_command(HistoryCommand::Add(pending_entry("SELECT 2")), &mut persist);
+        let (tx, rx) = mpsc::channel();
+        state.process_command(HistoryCommand::Flush(tx), &mut persist);
+
+        assert_eq!(rx.recv().unwrap(), Ok(()));
+        assert_eq!(save_count, 1);
+        assert_eq!(saved_sql, vec!["SELECT 2", "SELECT 1"]);
+        assert!(!state.dirty);
+    }
+
+    #[test]
+    fn history_writer_flush_without_pending_change_does_not_write() {
+        let mut state = HistoryWriterState::new(QueryHistory::new());
+        let mut save_count = 0usize;
+        let mut persist = |_history: &QueryHistory| {
+            save_count += 1;
+            Ok(())
+        };
+
+        let (tx, rx) = mpsc::channel();
+        state.process_command(HistoryCommand::Flush(tx), &mut persist);
+
+        assert_eq!(rx.recv().unwrap(), Ok(()));
+        assert_eq!(save_count, 0);
+    }
+
+    #[test]
+    fn history_writer_snapshot_is_served_from_memory() {
+        let mut state = HistoryWriterState::new(QueryHistory::new());
+        let mut save_count = 0usize;
+        let mut persist = |_history: &QueryHistory| {
+            save_count += 1;
+            Ok(())
+        };
+
+        state.process_command(HistoryCommand::Add(pending_entry("SELECT 1")), &mut persist);
+        let (tx, rx) = mpsc::channel();
+        state.process_command(HistoryCommand::Snapshot(tx), &mut persist);
+
+        let snapshot = rx.recv().unwrap();
+        assert_eq!(snapshot.len(), 1);
+        assert_eq!(snapshot[0].sql, "SELECT 1");
+        assert_eq!(save_count, 0);
+        assert!(state.dirty);
+    }
+
+    #[test]
+    fn history_writer_clear_persists_before_reporting_success() {
+        let mut state = HistoryWriterState::new(QueryHistory::new());
+        let mut save_count = 0usize;
+        let mut persist = |_history: &QueryHistory| {
+            save_count += 1;
+            Ok(())
+        };
+
+        state.process_command(HistoryCommand::Add(pending_entry("SELECT 1")), &mut persist);
+        let (tx, rx) = mpsc::channel();
+        state.process_command(HistoryCommand::Clear(tx), &mut persist);
+
+        assert_eq!(rx.recv().unwrap(), Ok(()));
+        assert_eq!(save_count, 1);
+        assert!(!state.dirty);
+        assert!(state.history.queries.is_empty());
+    }
+
+    #[test]
+    fn history_writer_keeps_change_pending_when_save_fails() {
+        let mut state = HistoryWriterState::new(QueryHistory::new());
+        let mut persist = |_history: &QueryHistory| Err("disk unavailable".to_string());
+
+        state.process_command(HistoryCommand::Add(pending_entry("SELECT 1")), &mut persist);
+        let (tx, rx) = mpsc::channel();
+        state.process_command(HistoryCommand::Flush(tx), &mut persist);
+
+        assert_eq!(rx.recv().unwrap(), Err("disk unavailable".to_string()));
+        assert!(state.dirty);
+    }
 
     #[test]
     fn history_shortcut_action_accepts_current_ascii_key() {

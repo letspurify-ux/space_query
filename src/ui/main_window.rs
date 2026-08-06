@@ -7069,8 +7069,13 @@ impl MainWindow {
             config.cancel_timeout_seconds = settings.cancel_timeout_seconds;
             config.sql_comma_list_layout = settings.sql_comma_list_layout;
             config.sql_format_right_margin = settings.sql_format_right_margin;
+            config.query_history_limit = settings.query_history_limit;
+            config.app_log_limit = settings.app_log_limit;
             config.save().map_err(|err| err.to_string())
         };
+        // `save` republishes the runtime config, so both writers read the new limits.
+        crate::ui::query_history::apply_history_limit();
+        crate::utils::logging::apply_log_limit();
         if pool_size_changed {
             state.release_all_resolved_pooled_db_sessions()?;
         }
@@ -13109,6 +13114,9 @@ The crash has been recorded in the application log.",
         }
         if let Err(err) = crate::utils::logging::flush_log_writer() {
             eprintln!("Application log flush on exit failed: {err}");
+        }
+        if let Err(err) = crate::ui::query_history::flush_history_writer() {
+            eprintln!("Query history flush on exit failed: {err}");
         }
         // Restore current group
         if let Some(ref group) = current_group {

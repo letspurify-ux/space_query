@@ -55,4 +55,7 @@ fn main() {
     if let Err(err) = logging::flush_log_writer() {
         eprintln!("Failed to flush application log before exit: {err}");
     }
+    if let Err(err) = space_query::ui::query_history::flush_history_writer() {
+        eprintln!("Failed to flush query history before exit: {err}");
+    }
 }
