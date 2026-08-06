@@ -79,7 +79,7 @@ fn read_clipboard() -> Result<String, String> {
         .map_err(|err| format!("pbpaste should run on macOS: {err}"))
 }
 
-/// Copy `sql` the way `MainWindow::finish_sql_clipboard_copy` does, read it back
+/// Copy `sql` the way `MainWindow::finish_clipboard_copy` does, read it back
 /// off the OS clipboard, and compare against `expected`.
 fn check_clipboard(label: &str, sql: &str, expected: &str, failures: &mut Vec<String>) {
     app::copy(sql);

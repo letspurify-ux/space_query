@@ -25,7 +25,7 @@ Each statement result has a `ResultTabId` and one `ResultTabStatus`:
 Running, Fetching, Waiting, Canceling, Done, Error, Cancelled
 ```
 
-Only Data Grid results provide lazy fetch, selection/copy, CSV export,
+Only Data Grid results provide lazy fetch, selection/copy, result export,
 supported grid editing, and individual tab close. `active_result_id()` returns
 an ID only when both the Data Grid section and a real inner result are selected.
 Editing, exporting, or closing a hidden grid while a support pane is selected
@@ -88,7 +88,7 @@ cannot be entered mid-statement.
 
 `SQL Inserts` and `Where Clause` are immediate. `SQL Updates` first reads the
 table's primary key through `ObjectBrowserWidget::load_primary_key_columns`, so
-it completes asynchronously via `FileActionResult::CopySqlToClipboard`.
+it completes asynchronously via `FileActionResult::CopyToClipboard`.
 
 ### Literals come from driver types, never value shapes
 
@@ -119,6 +119,89 @@ Known limits, all pre-existing display behaviour rather than export bugs:
   size). Long values are emitted verbatim, never truncated.
 - Client-built grids (`PRINT`, `SHOW ERRORS`, `COMPILE ERRORS`, …) have no driver
   types, so every value is quoted — correct, since they are text tables.
+
+## Result export
+
+> Implementation: `src/ui/result_export.rs` (serializers),
+> `src/ui/result_export_dialog.rs` (modal), `src/ui/result_table.rs`,
+> `src/ui/main_window.rs`
+
+`Ctrl+E`, **Tools > Export Results**, and the Data Grid popup's **Export Data**
+all open one modal that asks three things:
+
+| Choice | Values |
+| --- | --- |
+| Format | CSV, TSV, JSON, XML, HTML, Markdown, SQL Inserts |
+| Rows | All rows, Selected rows (disabled without a selection) |
+| Destination | File, Clipboard |
+
+`SQL Inserts` only appears while a connection is active: its literals depend on
+the dialect, and `grid_sql_export::build_sql_inserts` renders it — the serializers
+in `result_export.rs` deliberately produce nothing for that format so a mis-routed
+call yields nothing rather than wrong SQL. Everything else is dialect-neutral.
+
+Column scope differs by format on purpose. The data formats export what the grid
+shows and drop only the hidden auto-`ROWID` column, because the file should match
+the screen. `SQL Inserts` keeps the stricter internal-column rule above, because
+generated SQL needs legal column names.
+
+NULL follows each format's own vocabulary: CSV and TSV write the grid's NULL
+display text verbatim (a spreadsheet dump of what is on screen), JSON writes
+`null`, XML writes an empty element, and HTML and Markdown write an empty cell.
+JSON leaves a value unquoted only when the driver typed the column `Number` or
+`Boolean` *and* its text is already a valid JSON literal, so a zero-padded
+`00123` and a leading-dot `.5` both stay quoted strings while `1.2E+10` — which
+the JSON grammar does accept — stays a number.
+
+An **All rows** export first completes any open lazy fetch — the render is
+deferred into `LazyFetchPendingAction::Export` and runs when the fetch lands.
+A **Selected rows** export never waits, because a selection can only cover rows
+already on screen. Files are written off the main thread and reported through
+`FileActionResult::Export`; the clipboard path queues
+`FileActionResult::CopyToClipboard` so the copy happens on the main thread.
+
+### Characters the markup formats cannot carry
+
+XML 1.0's `Char` production excludes every C0 control except tab, newline, and
+carriage return, and unlike `<` they cannot be rescued by a character reference
+either — a `CHAR` column holding one would produce a document no parser accepts.
+`escape_markup` replaces them (and U+FFFE/U+FFFF) with U+FFFD in both XML and
+HTML, so the substitution is visible rather than a silently shortened value.
+Carriage return is written as `&#13;`: a literal CR is folded into a newline by
+the XML line-end rules and by the HTML5 input-stream preprocessor, and only a
+character reference, which is resolved after that folding, survives.
+
+Known limits, none of which the other formats share:
+
+- A duplicate column name produces duplicate JSON keys and duplicate XML
+  elements. Both are legal; a JSON parser keeps only the last occurrence.
+- A JSON number is emitted unquoted, so a consumer that parses numbers as IEEE
+  doubles loses precision on an Oracle `NUMBER` past 15–17 digits. The text
+  itself is exact.
+- A column name XML cannot start an element with (blank, or leading digit)
+  becomes `column_<n>`; other illegal characters become `_`, so two different
+  names can collapse onto the same element name.
+
+### Verification
+
+`cargo run --bin verify_result_export` renders one deliberately hostile grid —
+commas, tabs, quotes, embedded newlines, a bare CR, `|`, `\`, `]]>`, a C0
+control, Korean text, NULL, empty string, a zero-padded number, and column names
+that are blank, duplicated, punctuated, or digit-leading — in every format and
+hands the bytes to real parsers, comparing each cell back to what was written:
+
+| Format | Validator |
+| --- | --- |
+| JSON | `serde_json`, numeric-aware cell comparison |
+| XML | `xmllint --noout` for well-formedness, Python `ElementTree` for cells |
+| HTML | Python `html.parser` |
+| CSV / TSV | Python `csv`, `excel` and `excel-tab` dialects |
+| Markdown | cell-count and unescape round-trip |
+
+macOS's bundled HTML Tidy is deliberately unused: it dates from 2006, predates
+HTML5, and misreads UTF-8, so it rejects `<!DOCTYPE html>`, `<meta charset>`,
+and every Korean character. `SQL Inserts` is covered instead by
+`verify_grid_sql_export` and `verify_grid_sql_export_live`.
 
 ## Support panes
 
@@ -167,7 +250,11 @@ cargo test result_tabs --lib
 cargo test result_table --lib
 cargo test main_window --lib
 cargo test grid_sql_export --lib
+cargo test result_export --lib
 cargo test --test ui_dialog_guards
+
+# Every export format through real JSON/XML/HTML/CSV parsers, no database needed.
+cargo run --bin verify_result_export
 
 # Real widget + real OS clipboard, no database needed.
 cargo run --bin verify_grid_sql_export

@@ -30,7 +30,7 @@ extracted binary is enough to connect, run a script, and read the result.
 | --- | --- |
 | Editor | IntelliSense over live metadata, signature hints, SQL-aware formatter, multiple file tabs, find and replace, quick describe |
 | Execution | One statement, a selection, or a full script with SQL*Plus-style commands, bind variables, ref cursors, and per-statement timeouts |
-| Results | Independent result tabs, lazy fetch, sorting, CSV export, SQL export, and staged in-grid editing |
+| Results | Independent result tabs, lazy fetch, sorting, export to CSV/TSV/JSON/XML/HTML/Markdown/SQL, and staged in-grid editing |
 | Objects | Filterable object tree, structure/index/constraint inspection, DDL generation, and table browsing with database-side paging |
 | Operations | Session activity, persisted query history, application log, and crash reports |
 
@@ -126,7 +126,7 @@ The complete shortcut list is available under **Help > Keyboard Shortcuts**.
 The lower workspace keeps each output type separate:
 
 - **Data Grid** shows query rows and Explain Plan / EXPLAIN results, with
-  selection, copy, SQL and CSV export, sorting, and lazy-fetch controls.
+  selection, copy, data and SQL export, sorting, and lazy-fetch controls.
 - **Script Output** and **DBMS Output** retain script transcripts and server
   output.
 - **Messages** reports execution details, affected-row counts, and errors.
@@ -250,12 +250,11 @@ their absolute positions across pages.
 
 - Drag or use the keyboard to select cells; `Ctrl+C` copies the selection and
   `Ctrl+Shift+C` includes headers.
-- Resize columns, sort by a column header, or export the grid as CSV with
-  `Ctrl+E`.
+- Resize columns, sort by a column header, or export the result with `Ctrl+E`.
 - Configure the maximum cell preview length and lazy-fetch batch size. Scrolling
   near the end fetches more rows, while full-result actions can fetch all
   remaining rows first.
-- Use the context menu to close a result, copy data as text or SQL, export CSV,
+- Use the context menu to close a result, copy data as text or SQL, export data,
   or access available edit actions.
 
 ![Result grid with a multi-cell selection](docs/images/result-grid.png)
@@ -270,6 +269,28 @@ on a conflict. JOINs, multi-table results, and results without a reliable row
 identifier remain read-only.
 
 ![Oracle result grid in staged edit mode](docs/images/result-grid-editing.png)
+
+### Export a result
+
+`Ctrl+E`, **Tools > Export Results**, and the Data Grid context menu's
+**Export Data** all open the same dialog: pick a format, pick whether to export
+every row or just the selection, and pick a file or the clipboard.
+
+![The Export Results dialog: format, row scope, and destination](docs/images/result-export.png)
+
+| Format | Notes |
+| --- | --- |
+| **CSV**, **TSV** | UTF-8 with a BOM so Excel reads non-ASCII text correctly |
+| **JSON** | Array of objects; SQL `NULL` becomes `null`, and only genuinely numeric text stays unquoted |
+| **XML** | `<results><row>…`; illegal characters in a column name become `_` |
+| **HTML** | A standalone document with a plain bordered table |
+| **Markdown** | Pipe table; `\|` is escaped and line breaks become `<br>` |
+| **SQL Inserts** | The same statements the context menu copies, for the whole result and straight to a file |
+
+**SQL Inserts** needs a live connection, because its literals follow the
+connected dialect; the other formats do not care. Exporting every row finishes an
+open lazy fetch first, so the file has the whole result rather than the rows
+scrolled into view. Exporting a selection never triggers a fetch.
 
 ### Copy a selection as SQL
 

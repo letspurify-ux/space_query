@@ -1175,6 +1175,46 @@ fn capture_grid_sql_export(main_window: &mut MainWindow) {
     pump(200);
 }
 
+/// The export modal: format, row scope, and destination in one frame.
+///
+/// A result has to be on screen first, because the dialog is only reachable
+/// from one and the scene behind it is what makes the screenshot legible.
+fn capture_result_export(main_window: &mut MainWindow) {
+    let columns = [
+        ("EMPNO", "NUMBER"),
+        ("ENAME", "VARCHAR2"),
+        ("HIREDATE", "DATE"),
+        ("JOB", "VARCHAR2"),
+        ("SAL", "NUMBER"),
+    ];
+    let rows: &[&[&str]] = &[
+        &["7369", "SMITH", "1980-12-17", "CLERK", "800"],
+        &["7499", "ALLEN", "1981-02-20", "SALESMAN", "1600"],
+        &["7521", "WARD", "1981-02-22", "SALESMAN", "1250"],
+        &["7566", "JONES", "1981-04-02", "MANAGER", "2975"],
+        &["7654", "MARTIN", "1981-09-28", "SALESMAN", "1250"],
+    ];
+    main_window
+        .capture_tour_show_result(
+            "Result",
+            make_result(
+                &columns,
+                rows,
+                "SELECT EMPNO, ENAME, HIREDATE, JOB, SAL FROM EMP ORDER BY EMPNO",
+            ),
+            false,
+            Some((0, 0, 4, 4)),
+        )
+        .unwrap_or_else(|err| fail(format!("show result: {err}")));
+    pump(300);
+
+    app::add_timeout3(0.45, |_| {
+        capture_active_dialog("Export Results", "/tmp/space-query-result-export.ppm")
+    });
+    main_window.capture_tour_show_export_dialog();
+    pump(200);
+}
+
 /// Composite the open Data Grid menu onto the main window, save the frame, and
 /// dismiss the menu so its popup loop ends.
 fn capture_grid_context_menu(capture_path: &str) {
@@ -1578,6 +1618,12 @@ fn main() {
         app::quit();
         return;
     }
+    if capture_mode.as_deref() == Some("result-export") {
+        capture_object_browser(&mut main_window);
+        capture_result_export(&mut main_window);
+        app::quit();
+        return;
+    }
     if capture_mode.as_deref() == Some("result-editing") {
         capture_object_browser(&mut main_window);
         capture_result_editing(&mut main_window);
@@ -1600,6 +1646,7 @@ fn main() {
     capture_formatting(&mut main_window);
     capture_result_grid(&mut main_window);
     capture_grid_sql_export(&mut main_window);
+    capture_result_export(&mut main_window);
     capture_table_browse_popup(&mut main_window, false);
     capture_result_editing(&mut main_window);
     capture_session_activity(&mut main_window);

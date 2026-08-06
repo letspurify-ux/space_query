@@ -30,6 +30,7 @@ use crate::ui::font_settings::{
 };
 use crate::ui::grid_sort::{compare_cell_values, NullOrdering, SortColumn};
 use crate::ui::grid_sql_export::GridSqlSelection;
+use crate::ui::result_export::{ExportFormat, ExportGrid, ExportScope};
 use crate::ui::sql_editor::LazyFetchRequest;
 use crate::ui::theme;
 use crate::utils::arithmetic::safe_div;
@@ -112,7 +113,7 @@ pub type HeaderSortRedirectCallback = Arc<Mutex<Option<Box<dyn FnMut(String, boo
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ResultTableContextAction {
-    ExportCsv,
+    ExportData,
     Close,
     CloseAll,
     /// Copy the selection to the clipboard as SQL. Handled by the main window
@@ -135,7 +136,29 @@ enum LazyFetchPendingAction {
         edge: ResultTableEdge,
         selection: Option<(i32, i32, i32, i32)>,
     },
-    ExportCsv(Box<dyn FnMut(String, usize)>),
+    Export(ExportRequest, Box<dyn FnMut(String, usize)>),
+}
+
+/// What an export should produce, carried across a deferred full fetch so the
+/// render that finally runs is the one the user asked for.
+#[derive(Clone, Debug)]
+pub(crate) struct ExportRequest {
+    pub format: ExportFormat,
+    pub scope: ExportScope,
+    /// Only `SqlInserts` reads these; every other format is dialect-agnostic.
+    pub db_type: Option<crate::db::DatabaseType>,
+    pub table: Option<String>,
+}
+
+impl ExportRequest {
+    fn csv_all() -> Self {
+        Self {
+            format: ExportFormat::Csv,
+            scope: ExportScope::All,
+            db_type: None,
+            table: None,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -3554,10 +3577,6 @@ impl ResultTableWidget {
         } else {
             false
         }
-    }
-
-    fn current_csv_snapshot(&self) -> (String, usize) {
-        (self.build_csv_snapshot(), self.row_count())
     }
 
     fn is_table_near_bottom(table: &Table) -> bool {
@@ -7544,7 +7563,7 @@ impl ResultTableWidget {
         let mut menu_items = vec![
             "Close",
             "Close All",
-            "Save as CSV (Ctrl+E)",
+            "Export Data (Ctrl+E)",
             "Copy",
             "Copy with Headers",
             "Copy All",
@@ -7669,10 +7688,10 @@ impl ResultTableWidget {
                     }
                     Self::copy_all_to_clipboard(headers, full_data, hidden_col);
                 }
-                "Save as CSV (Ctrl+E)" => {
+                "Export Data (Ctrl+E)" => {
                     Self::schedule_context_action_callback(
                         context_action_callback,
-                        ResultTableContextAction::ExportCsv,
+                        ResultTableContextAction::ExportData,
                     );
                 }
                 "Close" => {
@@ -9003,9 +9022,9 @@ impl ResultTableWidget {
                         Self::store_drag_selection_snapshot(&self.drag_state, Some(next_selection));
                     }
                 }
-                LazyFetchPendingAction::ExportCsv(mut callback) => {
-                    let (csv, row_count) = self.current_csv_snapshot();
-                    callback(csv, row_count);
+                LazyFetchPendingAction::Export(request, mut callback) => {
+                    let (content, row_count) = self.current_export_snapshot(&request);
+                    callback(content, row_count);
                 }
             }
         }
@@ -9256,50 +9275,92 @@ impl ResultTableWidget {
         }
     }
 
-    fn build_csv_snapshot(&self) -> String {
-        let line_ending = Self::csv_line_ending();
+    /// The rows and columns an export covers, as the grid shows them.
+    ///
+    /// Column filtering is deliberately looser than
+    /// [`Self::sql_export_selection`]: what the user sees is what a data format
+    /// gets, so only the hidden auto-ROWID column is dropped. Generated SQL
+    /// needs legal column names and keeps the stricter rule.
+    fn export_grid_snapshot(&self, scope: ExportScope) -> ExportGrid {
         let hidden_col = self.hidden_auto_rowid_col_value();
-        let header_line = {
-            let headers = self
-                .headers
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            let escaped: Vec<String> = Self::visible_headers(&headers, hidden_col)
-                .iter()
-                .map(|h| Self::escape_csv_field(h))
-                .collect();
-            escaped.join(",")
-        };
-
-        let row_count = self
-            .full_data
+        let headers = self
+            .headers
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .len();
-        let mut csv = String::with_capacity(row_count * 20 + header_line.len() + 4);
-
-        // UTF-8 BOM so Excel detects the encoding and renders non-ASCII text
-        // (e.g. Korean) correctly instead of falling back to the system locale.
-        csv.push('\u{FEFF}');
-        csv.push_str(&header_line);
-        csv.push_str(line_ending);
-
+            .clone();
+        let kinds = self
+            .column_kinds
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        // Any disagreement with the header list means the two drifted apart, so
+        // fall back to "unknown" rather than pair a type with the wrong value.
+        let kinds_aligned = kinds.len() == headers.len();
+        // Read before the row lock: the sort path holds these two in the other
+        // order, and nothing here needs them held together.
+        let null_text = self.current_null_text();
         let full_data = self
             .full_data
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        for row in full_data.iter() {
-            let visible_row = Self::visible_row_values_internal(row, hidden_col);
-            for (i, cell) in visible_row.iter().enumerate() {
-                if i > 0 {
-                    csv.push(',');
-                }
-                csv.push_str(&Self::escape_csv_field(cell));
-            }
-            csv.push_str(line_ending);
-        }
 
-        csv
+        let (row_range, source_indices) = match scope {
+            ExportScope::All => (
+                0..full_data.len(),
+                (0..headers.len())
+                    .filter(|col| Some(*col) != hidden_col)
+                    .collect(),
+            ),
+            ExportScope::Selection => {
+                let Some((row_top, col_left, row_bot, col_right)) =
+                    Self::normalized_selection_bounds_with_limits(
+                        self.table.get_selection(),
+                        self.table.rows().max(0) as usize,
+                        self.table.cols().max(0) as usize,
+                    )
+                else {
+                    return ExportGrid::default();
+                };
+                (
+                    row_top..row_bot + 1,
+                    Self::visible_column_indices_in_range(col_left, col_right, hidden_col),
+                )
+            }
+        };
+
+        ExportGrid {
+            columns: source_indices
+                .iter()
+                .map(|index| headers.get(*index).cloned().unwrap_or_default())
+                .collect(),
+            column_kinds: source_indices
+                .iter()
+                .map(|index| {
+                    if kinds_aligned {
+                        kinds.get(*index).copied().unwrap_or(SqlValueKind::Unknown)
+                    } else {
+                        SqlValueKind::Unknown
+                    }
+                })
+                .collect(),
+            rows: row_range
+                .filter_map(|row| full_data.get(row))
+                .map(|row| {
+                    source_indices
+                        .iter()
+                        .map(|index| row.get(*index).cloned().unwrap_or_default())
+                        .collect()
+                })
+                .collect(),
+            null_text,
+        }
+    }
+
+    fn build_csv_snapshot(&self) -> String {
+        crate::ui::result_export::render(
+            ExportFormat::Csv,
+            &self.export_grid_snapshot(ExportScope::All),
+        )
     }
 
     /// Export all data to CSV format
@@ -9311,48 +9372,68 @@ impl ResultTableWidget {
         &self,
         callback: Box<dyn FnMut(String, usize)>,
     ) -> Option<(String, usize)> {
-        if self.queue_action_after_fetch_all(LazyFetchPendingAction::ExportCsv(callback)) {
-            None
-        } else {
-            Some(self.current_csv_snapshot())
+        self.export_after_fetch_all(ExportRequest::csv_all(), callback)
+    }
+
+    /// Render the grid in `request`'s format, fetching the rest of the rows
+    /// first when the export covers the whole result and a lazy fetch is still
+    /// open. Returns `None` when the render was deferred; the callback then
+    /// runs once the fetch completes.
+    ///
+    /// A selection export never waits: it can only cover rows already on
+    /// screen, so forcing a full fetch would be a surprise.
+    pub(crate) fn export_after_fetch_all(
+        &self,
+        request: ExportRequest,
+        callback: Box<dyn FnMut(String, usize)>,
+    ) -> Option<(String, usize)> {
+        match request.scope {
+            ExportScope::Selection => Some(self.current_export_snapshot(&request)),
+            ExportScope::All => {
+                if self.queue_action_after_fetch_all(LazyFetchPendingAction::Export(
+                    request.clone(),
+                    callback,
+                )) {
+                    None
+                } else {
+                    Some(self.current_export_snapshot(&request))
+                }
+            }
         }
     }
 
-    fn csv_line_ending() -> &'static str {
-        if cfg!(windows) {
-            "\r\n"
-        } else {
-            "\n"
-        }
-    }
-
-    fn escape_csv_field(field: &str) -> String {
-        if field.contains(',')
-            || field.contains('"')
-            || field.contains('\n')
-            || field.contains('\r')
-        {
-            format!("\"{}\"", field.replace('"', "\"\""))
-        } else {
-            field.to_string()
+    fn current_export_snapshot(&self, request: &ExportRequest) -> (String, usize) {
+        match request.format {
+            ExportFormat::SqlInserts => {
+                let Some(db_type) = request.db_type else {
+                    return (String::new(), 0);
+                };
+                let selection = match request.scope {
+                    ExportScope::All => self.sql_export_all_rows(db_type, request.table.clone()),
+                    ExportScope::Selection => {
+                        self.sql_export_selection(db_type, request.table.clone())
+                    }
+                };
+                match selection {
+                    Some(selection) => (
+                        crate::ui::grid_sql_export::build_sql_inserts(&selection),
+                        selection.rows.len(),
+                    ),
+                    None => (String::new(), 0),
+                }
+            }
+            format => {
+                let grid = self.export_grid_snapshot(request.scope);
+                let row_count = grid.rows.len();
+                (crate::ui::result_export::render(format, &grid), row_count)
+            }
         }
     }
 
     /// Escape a cell for tab-separated clipboard output so spreadsheet apps
     /// (Excel/Sheets) keep multiline and tab-containing values in a single cell.
-    /// Fields containing a tab, newline, carriage return, or quote are wrapped
-    /// in double quotes with embedded quotes doubled, matching the convention
-    /// those apps use when parsing pasted TSV text.
     fn escape_cell_for_clipboard(field: &str) -> String {
-        if field.contains('\t')
-            || field.contains('\n')
-            || field.contains('\r')
-            || field.contains('"')
-        {
-            format!("\"{}\"", field.replace('"', "\"\""))
-        } else {
-            field.to_string()
-        }
+        crate::ui::result_export::escape_tab_separated_field(field)
     }
 
     pub fn row_count(&self) -> usize {
@@ -9431,6 +9512,16 @@ impl ResultTableWidget {
             .any(|index| !Self::is_internal_export_column(&headers, index, hidden_col, rowid_col))
     }
 
+    /// Whether the grid currently has a selected cell range.
+    pub(crate) fn has_selection(&self) -> bool {
+        Self::normalized_selection_bounds_with_limits(
+            self.table.get_selection(),
+            self.table.rows().max(0) as usize,
+            self.table.cols().max(0) as usize,
+        )
+        .is_some()
+    }
+
     /// Snapshot the current selection for the SQL export menu items.
     ///
     /// The grid does not know which connection produced it, so the caller
@@ -9440,6 +9531,42 @@ impl ResultTableWidget {
         &self,
         db_type: crate::db::DatabaseType,
         table: Option<String>,
+    ) -> Option<GridSqlSelection> {
+        let bounds = Self::normalized_selection_bounds_with_limits(
+            self.table.get_selection(),
+            self.table.rows().max(0) as usize,
+            self.table.cols().max(0) as usize,
+        )?;
+        self.sql_export_snapshot(db_type, table, bounds)
+    }
+
+    /// The same snapshot over every fetched row and every exportable column,
+    /// for an export whose scope is the whole result rather than a selection.
+    fn sql_export_all_rows(
+        &self,
+        db_type: crate::db::DatabaseType,
+        table: Option<String>,
+    ) -> Option<GridSqlSelection> {
+        let row_bot = self
+            .full_data
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .len()
+            .checked_sub(1)?;
+        let col_right = self
+            .headers
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .len()
+            .checked_sub(1)?;
+        self.sql_export_snapshot(db_type, table, (0, 0, row_bot, col_right))
+    }
+
+    fn sql_export_snapshot(
+        &self,
+        db_type: crate::db::DatabaseType,
+        table: Option<String>,
+        (row_top, col_left, row_bot, col_right): (usize, usize, usize, usize),
     ) -> Option<GridSqlSelection> {
         let headers = self
             .headers
@@ -9462,12 +9589,6 @@ impl ResultTableWidget {
             .full_data
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let (row_top, col_left, row_bot, col_right) =
-            Self::normalized_selection_bounds_with_limits(
-                self.table.get_selection(),
-                self.table.rows().max(0) as usize,
-                self.table.cols().max(0) as usize,
-            )?;
 
         // `all_columns` keeps every exportable column so key columns outside the
         // selection still have values; `selected_columns` indexes into it.
@@ -15237,20 +15358,6 @@ mod tests {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .is_empty());
-    }
-
-    #[test]
-    fn escape_csv_field_quotes_carriage_return_values() {
-        assert_eq!(
-            ResultTableWidget::escape_csv_field("line1\rline2"),
-            "\"line1\rline2\""
-        );
-    }
-
-    #[test]
-    fn csv_line_ending_matches_target_platform() {
-        let expected = if cfg!(windows) { "\r\n" } else { "\n" };
-        assert_eq!(ResultTableWidget::csv_line_ending(), expected);
     }
 
     #[test]

@@ -21,6 +21,11 @@ pub mod object_browser;
 pub(crate) mod object_drag_payload;
 pub mod query_history;
 pub mod query_tabs;
+// Public only so `verify_result_export` can feed the exact bytes the app writes
+// to real JSON/XML/HTML/CSV parsers; not part of the supported surface.
+#[doc(hidden)]
+pub mod result_export;
+pub(crate) mod result_export_dialog;
 pub(crate) mod result_filter;
 pub mod result_table;
 pub mod result_tabs;

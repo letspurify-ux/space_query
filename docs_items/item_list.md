@@ -66,6 +66,62 @@ DB 없이 테스트할 수 있다는 장점이 있었다. 하지만 채택하지
   "전체 결과 → 파일"로 확장**하면 SQL Insert 파일 내보내기는 거의 공짜다.
   JSON/TSV/Markdown도 직렬화기 추가 수준. Excel(xlsx)만 별도 크레이트 필요.
 
+#### 구현 상태 (2026-08-07) — 완료 (Excel 제외)
+
+`Ctrl+E` / **Tools > Export Results** / 그리드 컨텍스트 메뉴 **Export Data**가
+모두 같은 모달을 연다: **포맷**(CSV/TSV/JSON/XML/HTML/Markdown/SQL Inserts) ×
+**행 범위**(전체 / 선택 영역) × **대상**(파일 / 클립보드).
+
+| 조각 | 위치 |
+| --- | --- |
+| 직렬화기 (순수 함수, 테스트 19개) | `src/ui/result_export.rs` |
+| 모달 | `src/ui/result_export_dialog.rs` |
+| 스냅샷 + 지연 렌더 (`ExportRequest`) | `ResultTableWidget::export_grid_snapshot` / `export_after_fetch_all` |
+| 진입점 | `MainWindow::export_current_results` |
+
+설계상 결정 세 가지:
+
+- **`SQL Inserts`만 `grid_sql_export`가 렌더한다.** 방언에 의존하므로 커넥션이
+  없으면 포맷 목록에서 아예 빠진다. `result_export::render`는 이 포맷에 대해
+  의도적으로 빈 문자열을 돌려주므로, 라우팅 실수가 *틀린 SQL*이 아니라
+  *아무것도 아닌 것*이 된다(테스트로 고정).
+- **컬럼 범위가 포맷별로 다르다.** 데이터 포맷은 화면에 보이는 것을 그대로
+  내보내고 숨은 auto-`ROWID`만 뺀다. `SQL Inserts`는 기존의 엄격한 내부 컬럼
+  규칙을 유지한다 — 생성된 SQL은 합법적인 컬럼명이 필요하기 때문.
+- **NULL은 포맷의 어휘를 따른다.** CSV/TSV는 그리드의 NULL 표시 텍스트를 그대로
+  쓰고(스프레드시트 덤프), JSON은 `null`, XML은 빈 엘리먼트, HTML/Markdown은 빈
+  셀. JSON에서 값이 따옴표 없이 나가는 건 드라이버가 `Number`/`Boolean`으로
+  타이핑했고 **동시에** 그 텍스트가 이미 유효한 JSON 리터럴일 때뿐이다
+  (`00123`, `.5`는 문자열로, `1.2E+10`은 숫자로).
+
+**전체 행** 내보내기는 열려 있는 lazy fetch를 먼저 끝낸다
+(`LazyFetchPendingAction::Export`). **선택 영역**은 화면에 이미 있는 행만
+대상이므로 절대 fetch를 유발하지 않는다.
+
+부수적으로 CSV 경로가 새 직렬화기 위로 합쳐졌다 — `build_csv_snapshot`이
+`result_export::render(Csv, ..)`를 호출하므로 CSV 구현이 하나가 됐고, BOM·플랫폼
+줄바꿈·이스케이프 규칙은 바이트 단위로 그대로다.
+
+**형식 검증 — 실제 파서로 확인.** 유닛 테스트는 "내가 기대한 바이트"만 고정하지
+"JSON 파서가 받아주는가"는 증명하지 못한다. `src/bin/verify_result_export.rs`가
+적대적 그리드 하나(쉼표·탭·따옴표·개행·단독 CR·`|`·`\`·`]]>`·C0 제어문자·한글·
+NULL·빈 문자열·0 패딩 숫자, 그리고 비어 있거나/중복이거나/구두점이 들어가거나/
+숫자로 시작하는 컬럼명)를 전 포맷으로 렌더해 **실제 파서**에 넣고 셀 단위로
+되돌려 비교한다 — JSON은 `serde_json`, XML은 `xmllint` + `ElementTree`,
+HTML은 파이썬 `html.parser`, CSV/TSV는 파이썬 `csv`(excel 방언).
+
+이 검증이 **실제 버그 하나를 잡았다**: 값에 C0 제어문자(U+0001 등)가 있으면
+XML 1.0이 그 문자를 문서에 담는 것 자체를 금지하므로 (`&#1;`로도 못 쓴다)
+`xmllint`가 문서를 거부했다. `escape_markup`이 XML/HTML 양쪽에서 U+FFFD로
+치환하도록 고쳤고, 덤으로 단독 CR은 `&#13;`으로 써서 XML 줄바꿈 정규화와
+HTML5 입력 전처리에 먹히지 않게 했다.
+
+(macOS 기본 `tidy`는 2006년판이라 HTML5도 UTF-8도 못 읽어 `<!DOCTYPE html>`과
+한글을 전부 오류로 보고한다 — 그래서 쓰지 않는다.)
+
+**남은 것**: Excel(xlsx)은 새 크레이트가 필요해 이번 범위에서 제외했다. 모달과
+파일 저장 경로는 FLTK 위젯이라 유닛 테스트가 없고, 실제 GUI 확인이 아직이다.
+
 ### 3. 파일 → 테이블 데이터 임포트 (CSV Import)
 
 - **DataGrip**: 테이블 우클릭 → Import Data from File. 컬럼 매핑, 타입 추론,
@@ -258,7 +314,7 @@ DB 없이 테스트할 수 있다는 장점이 있었다. 하지만 채택하지
 | 순서 | 항목 | 근거 |
 | --- | --- | --- |
 | 1 | 7. 선택 집계 표시 · 11. 커넥션 색상 | 하루 단위 작업, 즉시 체감, 사고 방지 |
-| 2 | 2. 내보내기 포맷 확장 | 기존 `grid_sql_export.rs` 재사용으로 비용 낮음 |
+| 2 | ~~2. 내보내기 포맷 확장~~ **완료** | 기존 `grid_sql_export.rs` 재사용으로 비용 낮음 |
 | 3 | 11-b. 그리드 내 텍스트 검색 | 재실행 없음, `text_search.rs` 재사용, 작음 |
 | 4 | **1. 결과 필터 (서버 재조회) + 헤더 정렬 개선** | 채택 결정됨. 부록 A·B를 함께 진행 |
 | 5 | 4. 값 에디터 패널 | 기존 모달 확장, LOB 편집 구멍 메움 |

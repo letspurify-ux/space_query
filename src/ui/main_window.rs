@@ -38,6 +38,8 @@ use crate::db::{
 };
 use crate::ui::constants::*;
 use crate::ui::grid_sort::NullOrdering;
+use crate::ui::result_export::{ExportDestination, ExportFormat};
+use crate::ui::result_export_dialog::ExportChoice;
 use crate::ui::result_table::{
     ResultGridEditExecuteCallback, ResultGridSqlExecuteCallback, ResultTableContextAction,
 };
@@ -4066,10 +4068,11 @@ enum FileActionResult {
         row_count: usize,
         result: Result<(), String>,
     },
-    /// Generated SQL from a result-grid export that had to read metadata first.
-    /// Carries `(sql, status message)`; the copy itself happens on the main
-    /// thread when this is drained.
-    CopySqlToClipboard {
+    /// Export text bound for the clipboard: generated SQL that had to read
+    /// metadata first, or any format the export dialog sent there. Carries
+    /// `(text, status message)`; the copy itself happens on the main thread
+    /// when this is drained.
+    CopyToClipboard {
         result: Result<(String, String), String>,
     },
 }
@@ -4712,6 +4715,8 @@ impl MainWindow {
 
     fn prepare_result_export(
         state: &Arc<Mutex<AppState>>,
+        choice: ExportChoice,
+        db_type: Option<DatabaseType>,
         callback: Box<dyn FnMut(String, usize)>,
     ) -> Result<Option<(String, usize)>, String> {
         let result_tabs = {
@@ -4724,7 +4729,7 @@ impl MainWindow {
             guard.result_tabs.clone()
         };
 
-        Ok(result_tabs.export_to_csv_after_fetch_all(callback))
+        Ok(result_tabs.export_after_fetch_all(choice.format, choice.scope, db_type, callback))
     }
 
     fn sync_recent_sql_file_menu(recent_sql_files: &[PathBuf]) {
@@ -4898,39 +4903,66 @@ impl MainWindow {
         path.with_extension(default_ext)
     }
 
-    fn export_current_results_to_csv(
+    /// Ask what to export, then write it to a file or put it on the clipboard.
+    ///
+    /// Both destinations go through the same deferred callback, because an
+    /// export of the whole result may have to finish a lazy fetch first and only
+    /// then knows what it is writing.
+    fn export_current_results(
         state: &Arc<Mutex<AppState>>,
         file_sender: &std::sync::mpsc::Sender<FileActionResult>,
     ) {
-        let mut dialog = FileDialog::new(FileDialogType::BrowseSaveFile);
-        dialog.set_filter("CSV Files\t*.csv");
-        dialog.show();
-        let filename = dialog.filename();
-        if filename.as_os_str().is_empty() {
+        let (db_type, has_selection) = {
+            let guard = state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if !guard.result_tabs.has_data() {
+                crate::ui::alert_on_main("No results to export");
+                return;
+            }
+            let has_selection = guard.result_tabs.has_grid_selection();
+            let db_type = guard
+                .active_connection_runtime()
+                .map(|runtime| runtime.sanitized_info().db_type);
+            (db_type, has_selection)
+        };
+
+        // `SQL Inserts` writes dialect-specific literals, so it is only on offer
+        // while a connection can say which dialect that is.
+        let formats: Vec<ExportFormat> = ExportFormat::ALL
+            .into_iter()
+            .filter(|format| db_type.is_some() || *format != ExportFormat::SqlInserts)
+            .collect();
+        let Some(choice) = crate::ui::result_export_dialog::show(&formats, has_selection) else {
             return;
-        }
-        // The native chooser auto-appends an "All Files" entry after our single
-        // "CSV Files" filter, so it sits at index 1 (skip); index 0 → force .csv.
-        let filename =
-            Self::apply_default_extension(filename, "csv", dialog.filter_value(), Some(1));
+        };
+
+        let destination = match choice.destination {
+            ExportDestination::Clipboard => None,
+            ExportDestination::File => {
+                let Some(path) = Self::ask_export_file_path(choice.format) else {
+                    return;
+                };
+                Some(path)
+            }
+        };
 
         let sender = file_sender.clone();
         let deferred_sender = sender.clone();
-        let deferred_filename = filename.clone();
+        let deferred_destination = destination.clone();
+        let format = choice.format;
         let export = match MainWindow::prepare_result_export(
             state,
-            Box::new(move |csv, row_count| {
-                let sender = deferred_sender.clone();
-                let filename = deferred_filename.clone();
-                thread::spawn(move || {
-                    let result = fs::write(&filename, csv).map_err(|err| err.to_string());
-                    let _ = sender.send(FileActionResult::Export {
-                        path: filename,
-                        row_count,
-                        result,
-                    });
-                    app::awake();
-                });
+            choice,
+            db_type,
+            Box::new(move |content, row_count| {
+                Self::deliver_export(
+                    &deferred_sender,
+                    deferred_destination.clone(),
+                    format,
+                    content,
+                    row_count,
+                );
             }),
         ) {
             Ok(export) => export,
@@ -4939,25 +4971,72 @@ impl MainWindow {
                 return;
             }
         };
-        let Some((csv, row_count)) = export else {
+        let Some((content, row_count)) = export else {
             return;
         };
-        thread::spawn(move || {
-            let result = fs::write(&filename, csv).map_err(|err| err.to_string());
-            let _ = sender.send(FileActionResult::Export {
-                path: filename,
-                row_count,
-                result,
-            });
-            app::awake();
-        });
+        Self::deliver_export(&sender, destination, format, content, row_count);
+    }
+
+    /// Where the exported text should go. `None` means the user cancelled the
+    /// save chooser.
+    fn ask_export_file_path(format: ExportFormat) -> Option<PathBuf> {
+        let mut dialog = FileDialog::new(FileDialogType::BrowseSaveFile);
+        dialog.set_filter(&format.file_filter());
+        dialog.show();
+        let filename = dialog.filename();
+        if filename.as_os_str().is_empty() {
+            return None;
+        }
+        // The native chooser auto-appends an "All Files" entry after our single
+        // filter, so it sits at index 1 (skip); index 0 → force the extension.
+        Some(Self::apply_default_extension(
+            filename,
+            format.extension(),
+            dialog.filter_value(),
+            Some(1),
+        ))
+    }
+
+    /// Hand finished export text to its destination. Writing runs off the main
+    /// thread; the clipboard copy is queued so it happens on it.
+    fn deliver_export(
+        sender: &std::sync::mpsc::Sender<FileActionResult>,
+        destination: Option<PathBuf>,
+        format: ExportFormat,
+        content: String,
+        row_count: usize,
+    ) {
+        match destination {
+            Some(path) => {
+                let sender = sender.clone();
+                thread::spawn(move || {
+                    let result = fs::write(&path, content).map_err(|err| err.to_string());
+                    let _ = sender.send(FileActionResult::Export {
+                        path,
+                        row_count,
+                        result,
+                    });
+                    app::awake();
+                });
+            }
+            None => {
+                let message = format!(
+                    "Copied {row_count} rows to clipboard as {}",
+                    format.label()
+                );
+                let _ = sender.send(FileActionResult::CopyToClipboard {
+                    result: Ok((content, message)),
+                });
+                app::awake();
+            }
+        }
     }
 
     /// Copy the visible grid's selection to the clipboard as SQL.
     ///
     /// `SQL Inserts` and `Where Clause` are immediate. `SQL Updates` needs the
     /// table's primary key for its WHERE clause, so it reads metadata on a worker
-    /// thread and finishes when `FileActionResult::CopySqlToClipboard` is drained.
+    /// thread and finishes when `FileActionResult::CopyToClipboard` is drained.
     fn copy_result_selection_as_sql(
         state: &Arc<Mutex<AppState>>,
         file_sender: &std::sync::mpsc::Sender<FileActionResult>,
@@ -4992,7 +5071,7 @@ impl MainWindow {
                     let message = format!(
                         "Copied {row_count} UPDATE statements (table unknown — WHERE omitted)"
                     );
-                    Self::finish_sql_clipboard_copy(&mut s, &sql, &message);
+                    Self::finish_clipboard_copy(&mut s, &sql, &message);
                     return;
                 };
                 let connection = runtime.connection();
@@ -5023,7 +5102,7 @@ impl MainWindow {
                         }
                         Err(err) => Err(err),
                     };
-                    let _ = sender.send(FileActionResult::CopySqlToClipboard { result });
+                    let _ = sender.send(FileActionResult::CopyToClipboard { result });
                     app::awake();
                 });
                 return;
@@ -5031,7 +5110,7 @@ impl MainWindow {
             _ => return,
         };
 
-        Self::finish_sql_clipboard_copy(&mut s, &sql, &message);
+        Self::finish_clipboard_copy(&mut s, &sql, &message);
     }
 
     /// Put generated SQL on the clipboard and report it in the status bar.
@@ -5081,7 +5160,7 @@ impl MainWindow {
         result_tabs.attach_result_filter_bar_by_id(result_tab_id, target, intellisense_data, false);
     }
 
-    fn finish_sql_clipboard_copy(state: &mut AppState, sql: &str, message: &str) {
+    fn finish_clipboard_copy(state: &mut AppState, sql: &str, message: &str) {
         if sql.is_empty() {
             return;
         }
@@ -8576,8 +8655,8 @@ impl MainWindow {
                         }
                     }
                     match action {
-                        ResultTableContextAction::ExportCsv => {
-                            MainWindow::export_current_results_to_csv(
+                        ResultTableContextAction::ExportData => {
+                            MainWindow::export_current_results(
                                 &state_for_context,
                                 &file_sender,
                             );
@@ -10976,7 +11055,7 @@ impl MainWindow {
                 true
             }
             "Tools/Export Results" => {
-                MainWindow::export_current_results_to_csv(state, file_sender);
+                MainWindow::export_current_results(state, file_sender);
                 true
             }
             "Edit/Find" => {
@@ -12723,12 +12802,12 @@ impl MainWindow {
                                     }
                                     Err(err) => {
                                         deferred_alert =
-                                            Some(format!("Failed to export CSV: {}", err));
+                                            Some(format!("Failed to export results: {}", err));
                                     }
                                 },
-                                FileActionResult::CopySqlToClipboard { result } => match result {
+                                FileActionResult::CopyToClipboard { result } => match result {
                                     Ok((sql, message)) => {
-                                        MainWindow::finish_sql_clipboard_copy(
+                                        MainWindow::finish_clipboard_copy(
                                             &mut s, &sql, &message,
                                         );
                                     }
@@ -13253,6 +13332,16 @@ impl MainWindow {
             state.result_tabs.clone()
         };
         result_tabs.capture_tour_show_context_menu()
+    }
+
+    /// Open the export modal exactly as `Ctrl+E` does, with every format on
+    /// offer and the selection scope enabled.
+    ///
+    /// Blocks in the modal's own event loop until it is hidden, so a capture has
+    /// to take its frame and hide it from a timeout.
+    #[doc(hidden)]
+    pub fn capture_tour_show_export_dialog(&mut self) {
+        let _ = crate::ui::result_export_dialog::show(&ExportFormat::ALL, true);
     }
 
     /// What the three Data Grid SQL export items put on the clipboard for the
@@ -15886,7 +15975,12 @@ mod tests {
             guard.result_tabs.set_lazy_fetch_callback(callback);
         }
 
-        let export = MainWindow::prepare_result_export(&state, Box::new(|_, _| {}))
+        let choice = ExportChoice {
+            format: ExportFormat::Csv,
+            scope: crate::ui::result_export::ExportScope::All,
+            destination: ExportDestination::File,
+        };
+        let export = MainWindow::prepare_result_export(&state, choice, None, Box::new(|_, _| {}))
             .expect("prepare export should succeed");
 
         assert!(export.is_none());

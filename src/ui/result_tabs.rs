@@ -19,8 +19,9 @@ use crate::ui::font_settings::{
 };
 use crate::ui::grid_sort::NullOrdering;
 use crate::ui::grid_sql_export::GridSqlSelection;
+use crate::ui::result_export::{ExportFormat, ExportScope};
 use crate::ui::result_table::{
-    HeaderSortRedirectCallback, LazyFetchCallback, ResultGridEditExecuteCallback,
+    ExportRequest, HeaderSortRedirectCallback, LazyFetchCallback, ResultGridEditExecuteCallback,
     ResultGridSqlExecuteCallback, ResultPageNavigationOutcome, ResultTableContextActionCallback,
 };
 use crate::ui::tab_strip;
@@ -2740,12 +2741,31 @@ impl ResultTabsWidget {
             .unwrap_or_default()
     }
 
-    pub fn export_to_csv_after_fetch_all(
+    /// Render the visible grid in `format` and hand the text to `callback`.
+    ///
+    /// Returns the text directly when it was ready; `None` means a full fetch
+    /// had to run first and the callback will fire when it finishes.
+    pub(crate) fn export_after_fetch_all(
         &self,
+        format: ExportFormat,
+        scope: ExportScope,
+        db_type: Option<crate::db::DatabaseType>,
         callback: Box<dyn FnMut(String, usize)>,
     ) -> Option<(String, usize)> {
+        let table = self.current_table()?;
+        let request = ExportRequest {
+            format,
+            scope,
+            db_type,
+            table: Self::resolve_grid_export_table(&table),
+        };
+        table.export_after_fetch_all(request, callback)
+    }
+
+    /// Whether the visible grid has a selection an export could be narrowed to.
+    pub(crate) fn has_grid_selection(&self) -> bool {
         self.current_table()
-            .and_then(|table| table.export_to_csv_after_fetch_all(callback))
+            .is_some_and(|table| table.has_selection())
     }
 
     pub fn row_count(&self) -> usize {
@@ -3050,15 +3070,20 @@ impl ResultTabsWidget {
         db_type: crate::db::DatabaseType,
     ) -> Option<GridSqlSelection> {
         let table = self.current_table()?;
+        let mut selection = table.sql_export_selection(db_type, None)?;
+        selection.table = Self::resolve_grid_export_table(&table);
+        Some(selection)
+    }
+
+    /// The base table generated SQL should name for this grid, if one exists.
+    fn resolve_grid_export_table(table: &ResultTableWidget) -> Option<String> {
         let descriptor_table = table
             .result_edit_descriptor_snapshot()
             .map(|descriptor| format!("{}.{}", descriptor.schema_name, descriptor.table_name));
-        let mut selection = table.sql_export_selection(db_type, None)?;
-        selection.table = crate::ui::grid_sql_export::resolve_export_table(
+        crate::ui::grid_sql_export::resolve_export_table(
             descriptor_table,
             &table.source_sql_snapshot(),
-        );
-        Some(selection)
+        )
     }
 
     #[doc(hidden)]

@@ -64,6 +64,11 @@ if [[ "$capture_mode" == "grid-sql-export" ]]; then
   exit 0
 fi
 
+if [[ "$capture_mode" == "result-export" ]]; then
+  convert_capture result-export result-export
+  exit 0
+fi
+
 if [[ "$capture_mode" == "table-browse-popup" ]]; then
   convert_capture table-browse table-browse
   convert_capture table-browse-popup-100 table-browse-popup
