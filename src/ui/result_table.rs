@@ -7361,6 +7361,96 @@ impl ResultTableWidget {
         }
     }
 
+    /// The Data Grid popup menu for the current selection, anchored at
+    /// `anchor_x`/`anchor_y`. Built but not shown, so the caller decides how to
+    /// run it.
+    fn selection_context_menu(
+        table: &Table,
+        headers: &Arc<Mutex<Vec<String>>>,
+        hidden_col: Option<usize>,
+        edit_session: &Arc<Mutex<Option<TableEditSession>>>,
+        pending_save_request: &Arc<Mutex<bool>>,
+        anchor_x: i32,
+        anchor_y: i32,
+    ) -> MenuButton {
+        // Prevent menu from being added to parent container
+        let current_group = fltk::group::Group::try_current();
+        fltk::group::Group::set_current(None::<&fltk::group::Group>);
+
+        let mut menu = MenuButton::new(anchor_x, anchor_y, 0, 0, None);
+        menu.set_color(theme::panel_raised());
+        menu.set_text_color(theme::text_primary());
+        let can_set_null = if *pending_save_request
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+        {
+            false
+        } else {
+            let session_guard = edit_session
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if let Some(session) = session_guard.as_ref() {
+                if let Some((row_start, col_start, row_end, col_end)) =
+                    Self::normalized_selection_bounds_with_limits(
+                        table.get_selection(),
+                        table.rows().max(0) as usize,
+                        table.cols().max(0) as usize,
+                    )
+                {
+                    let editable_cols: HashSet<usize> = session
+                        .editable_columns
+                        .iter()
+                        .map(|(idx, _)| *idx)
+                        .collect();
+                    let mut has_target = false;
+                    for row_idx in row_start..=row_end {
+                        if row_idx >= session.row_states.len() {
+                            continue;
+                        }
+                        for col_idx in col_start..=col_end {
+                            if col_idx == session.rowid_col || !editable_cols.contains(&col_idx) {
+                                continue;
+                            }
+                            has_target = true;
+                            break;
+                        }
+                        if has_target {
+                            break;
+                        }
+                    }
+                    has_target
+                } else {
+                    false
+                }
+            } else {
+                false
+            }
+        };
+
+        let mut menu_items = vec![
+            "Close",
+            "Close All",
+            "Save as CSV (Ctrl+E)",
+            "Copy",
+            "Copy with Headers",
+            "Copy All",
+        ];
+        if Self::selection_has_exportable_columns(table, headers, hidden_col) {
+            menu_items.push("SQL Inserts");
+            menu_items.push("SQL Updates");
+            menu_items.push("Where Clause");
+        }
+        if can_set_null {
+            menu_items.push("Set Null");
+        }
+        menu.add_choice(&menu_items.join("|"));
+
+        if let Some(ref group) = current_group {
+            fltk::group::Group::set_current(Some(group));
+        }
+        menu
+    }
+
     fn show_context_menu(
         table: &Table,
         headers: &Arc<Mutex<Vec<String>>>,
@@ -7434,81 +7524,15 @@ impl ResultTableWidget {
             }
         }
 
-        // Prevent menu from being added to parent container
-        let current_group = fltk::group::Group::try_current();
-        fltk::group::Group::set_current(None::<&fltk::group::Group>);
-
-        let mut menu = MenuButton::new(mouse_x, mouse_y, 0, 0, None);
-        menu.set_color(theme::panel_raised());
-        menu.set_text_color(theme::text_primary());
-        let can_set_null = if *pending_save_request
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-        {
-            false
-        } else {
-            let session_guard = edit_session
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            if let Some(session) = session_guard.as_ref() {
-                if let Some((row_start, col_start, row_end, col_end)) =
-                    Self::normalized_selection_bounds_with_limits(
-                        table.get_selection(),
-                        table.rows().max(0) as usize,
-                        table.cols().max(0) as usize,
-                    )
-                {
-                    let editable_cols: HashSet<usize> = session
-                        .editable_columns
-                        .iter()
-                        .map(|(idx, _)| *idx)
-                        .collect();
-                    let mut has_target = false;
-                    for row_idx in row_start..=row_end {
-                        if row_idx >= session.row_states.len() {
-                            continue;
-                        }
-                        for col_idx in col_start..=col_end {
-                            if col_idx == session.rowid_col || !editable_cols.contains(&col_idx) {
-                                continue;
-                            }
-                            has_target = true;
-                            break;
-                        }
-                        if has_target {
-                            break;
-                        }
-                    }
-                    has_target
-                } else {
-                    false
-                }
-            } else {
-                false
-            }
-        };
-
-        let mut menu_items = vec![
-            "Close",
-            "Close All",
-            "Save as CSV (Ctrl+E)",
-            "Copy",
-            "Copy with Headers",
-            "Copy All",
-        ];
-        if Self::selection_has_exportable_columns(&table, headers, hidden_col_for_hit) {
-            menu_items.push("SQL Inserts");
-            menu_items.push("SQL Updates");
-            menu_items.push("Where Clause");
-        }
-        if can_set_null {
-            menu_items.push("Set Null");
-        }
-        menu.add_choice(&menu_items.join("|"));
-
-        if let Some(ref group) = current_group {
-            fltk::group::Group::set_current(Some(group));
-        }
+        let menu = Self::selection_context_menu(
+            &table,
+            headers,
+            hidden_col_for_hit,
+            edit_session,
+            pending_save_request,
+            mouse_x,
+            mouse_y,
+        );
 
         if let Some(choice) = menu.popup() {
             let hidden_col = hidden_col_for_hit;
@@ -9391,6 +9415,42 @@ impl ResultTableWidget {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .clone()
+    }
+
+    /// Run the Data Grid popup menu for the current selection, anchored at the
+    /// last selected cell instead of at the mouse pointer.
+    ///
+    /// Same menu the right-click path shows; only the anchor differs, because a
+    /// capture has no pointer. Blocks in FLTK's popup loop until the menu is
+    /// dismissed, so the caller must arrange that from a timeout.
+    #[doc(hidden)]
+    pub fn capture_tour_show_context_menu(&self) -> Result<(), String> {
+        let (_, _, row_end, col_end) = Self::normalized_selection_bounds_with_limits(
+            self.table.get_selection(),
+            self.table.rows().max(0) as usize,
+            self.table.cols().max(0) as usize,
+        )
+        .ok_or_else(|| "the result grid has no selection".to_string())?;
+        let (cell_x, cell_y, cell_w, cell_h) = self
+            .table
+            .find_cell(
+                TableContext::Cell,
+                i32::try_from(row_end).map_err(|err| err.to_string())?,
+                i32::try_from(col_end).map_err(|err| err.to_string())?,
+            )
+            .ok_or_else(|| "the selected cell is not on screen".to_string())?;
+
+        let menu = Self::selection_context_menu(
+            &self.table,
+            &self.headers,
+            self.hidden_auto_rowid_col_value(),
+            &self.edit_session,
+            &self.pending_save_request,
+            cell_x + safe_div(cell_w, 2),
+            cell_y + cell_h,
+        );
+        menu.popup();
+        Ok(())
     }
 
     /// Record the statement now feeding this grid. Called right after

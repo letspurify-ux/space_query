@@ -2886,6 +2886,13 @@ impl ResultTabsWidget {
     }
 
     #[doc(hidden)]
+    pub(crate) fn capture_tour_show_context_menu(&self) -> Result<(), String> {
+        self.current_table()
+            .ok_or_else(|| "no visible result grid".to_string())?
+            .capture_tour_show_context_menu()
+    }
+
+    #[doc(hidden)]
     pub(crate) fn capture_tour_select_range(
         &self,
         row_start: i32,

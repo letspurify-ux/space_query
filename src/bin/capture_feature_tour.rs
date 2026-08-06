@@ -299,6 +299,35 @@ fn composite_popup<W: WindowExt>(
     let offset_x = popup_window.x_root() - main_x;
     let offset_y = popup_window.y_root() - main_y;
     let (popup_data, popup_width, popup_height) = capture_complete_rgb(popup_window);
+    blit_popup(
+        canvas,
+        canvas_width,
+        canvas_height,
+        offset_x,
+        offset_y,
+        &popup_data,
+        popup_width,
+        popup_height,
+    );
+}
+
+/// Draw an already-captured popup frame onto the main-window canvas.
+///
+/// Kept separate from the capture so a popup that owns the event loop, such as
+/// a menu, can be captured with a single frame grab instead of the redraw pass
+/// `capture_complete_rgb` performs — that pass re-enters FLTK and would never
+/// return from inside a popup loop.
+#[allow(clippy::too_many_arguments)]
+fn blit_popup(
+    canvas: &mut [u8],
+    canvas_width: i32,
+    canvas_height: i32,
+    offset_x: i32,
+    offset_y: i32,
+    popup_data: &[u8],
+    popup_width: i32,
+    popup_height: i32,
+) {
     for y in 0..popup_height {
         let target_y = offset_y + y;
         if !(0..canvas_height).contains(&target_y) {
@@ -1128,7 +1157,99 @@ fn capture_grid_sql_export(main_window: &mut MainWindow) {
     );
     main_window.capture_tour_set_sql(&pasted, Some(0));
     pump(300);
+
+    // Take a complete frame of this scene first: the menu capture that follows
+    // can only grab one frame, and this is what fills whatever macOS leaves out
+    // of it.
     save_main("/tmp/space-query-grid-sql-export.ppm");
+
+    // The menu runs FLTK's own popup loop, so its frame has to be taken from a
+    // timeout that also dismisses it — the same way the modal dialogs are
+    // captured.
+    app::add_timeout3(0.6, |_| {
+        capture_grid_context_menu("/tmp/space-query-grid-sql-export.ppm")
+    });
+    main_window
+        .capture_tour_show_result_context_menu()
+        .unwrap_or_else(|err| fail(format!("show grid context menu: {err}")));
+    pump(200);
+}
+
+/// Composite the open Data Grid menu onto the main window, save the frame, and
+/// dismiss the menu so its popup loop ends.
+fn capture_grid_context_menu(capture_path: &str) {
+    let mut main =
+        app::widget_from_id::<Window>("main_window").unwrap_or_else(|| fail("main window"));
+    let main_x = main.x_root();
+    let main_y = main.y_root();
+    let (mut canvas, width, height) = capture_rgb(&mut main);
+    // The main window keeps its last complete frame; the menu covers only a
+    // small part of it, so fill anything this single grab left blank.
+    if let Some((previous_data, previous_width, previous_height)) = LAST_MAIN_CAPTURE
+        .get_or_init(|| Mutex::new(None))
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .as_ref()
+    {
+        if *previous_width == width && *previous_height == height {
+            fill_missing_pixels(&mut canvas, previous_data);
+        }
+    }
+
+    let mut menu_window =
+        visible_popup_window(&main).unwrap_or_else(|| fail("grid context menu window"));
+    let (menu_data, menu_width, menu_height) = capture_popup_frame(&mut menu_window);
+    blit_popup(
+        &mut canvas,
+        width,
+        height,
+        menu_window.x_root() - main_x,
+        menu_window.y_root() - main_y,
+        &menu_data,
+        menu_width,
+        menu_height,
+    );
+    save_ppm(capture_path, &canvas, width, height);
+
+    // End the popup loop the way a click outside the menu would. Hiding the
+    // window alone leaves FLTK waiting for an event that will never arrive.
+    menu_window.hide();
+    let _ = app::handle_main(Event::Push);
+    let _ = app::handle_main(Event::Released);
+}
+
+/// A complete frame of a window that owns the event loop.
+///
+/// `capture_complete_rgb` gets its redraws by pumping events, which cannot be
+/// done from inside a popup loop. Flushing draws the damaged widgets without
+/// processing any event, so the menu paints its own background instead of
+/// leaving the window behind it showing through.
+fn capture_popup_frame<W: WindowExt>(window: &mut W) -> (Vec<u8>, i32, i32) {
+    let (mut canvas, width, height) = capture_rgb(window);
+    for _ in 0..3 {
+        window.set_damage(true);
+        window.redraw();
+        app::flush();
+        let (frame, frame_width, frame_height) = capture_rgb(window);
+        if frame_width != width || frame_height != height {
+            fail("popup capture dimensions changed while redrawing");
+        }
+        canvas = frame;
+    }
+    (canvas, width, height)
+}
+
+/// The only other window on screen: FLTK gives a popup menu its own window.
+fn visible_popup_window(excluded: &Window) -> Option<Window> {
+    let excluded_ptr = excluded.as_widget_ptr();
+    let mut current = app::first_window().map(|window| unsafe { Window::from_widget(window) });
+    while let Some(window) = current {
+        current = app::next_window(&window).map(|next| unsafe { Window::from_widget(next) });
+        if window.as_widget_ptr() != excluded_ptr && window.shown() && window.w() > 0 {
+            return Some(window);
+        }
+    }
+    None
 }
 
 fn capture_result_editing(main_window: &mut MainWindow) {

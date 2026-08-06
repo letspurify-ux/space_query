@@ -13146,6 +13146,22 @@ impl MainWindow {
         Ok(())
     }
 
+    /// Show the Data Grid popup menu over the current selection.
+    ///
+    /// Blocks in FLTK's popup loop until the menu is dismissed; a capture has to
+    /// take its frame and hide the menu window from a timeout.
+    #[doc(hidden)]
+    pub fn capture_tour_show_result_context_menu(&mut self) -> Result<(), String> {
+        let result_tabs = {
+            let state = self
+                .state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            state.result_tabs.clone()
+        };
+        result_tabs.capture_tour_show_context_menu()
+    }
+
     /// What the three Data Grid SQL export items put on the clipboard for the
     /// current selection, in menu order: inserts, updates, where clause.
     ///

@@ -4,19 +4,35 @@ SPACE Query is a desktop SQL client for Oracle, MySQL, and MariaDB, built with
 Rust and FLTK. It brings connection management, object-aware SQL editing,
 script execution, result inspection, and session diagnostics into one app.
 
+Oracle needs no Instant Client: Thin mode speaks the protocol directly, so one
+extracted binary is enough to connect, run a script, and read the result.
+
 ![SPACE Query main window](docs/images/main-window.png)
 
-## Highlights
+## Why SPACE Query
 
-- Connect through Oracle Thin or OCI, MySQL, and MariaDB profiles.
-- Edit SQL with syntax highlighting, IntelliSense, function signature hints,
-  formatting, quick describe, file tabs, and query history.
-- Run one statement, a selection, or a complete database-aware script.
-- Inspect, sort, copy, export, and lazily fetch query results in independent
-  tabs, and copy a selection as INSERT, UPDATE, or WHERE-clause SQL.
-- Browse tables with IntelliSense-aware WHERE and ORDER BY expressions and
-  bounded, database-side paging.
-- Track active sessions, view application logs, and recover crash details.
+- **One app, three databases.** Oracle, MySQL, and MariaDB share the same
+  editor, object browser, result grid, and diagnostics, while the SQL dialect,
+  metadata queries, and transaction rules follow the active connection.
+- **No Oracle client to install.** Thin mode connects over TCP with Host, Port,
+  and Service. OCI stays available when TCPS or a TNS alias is needed.
+- **Results you can work with.** Sort, page, and lazily fetch rows, edit a
+  single-table result back to the server under a safe row identifier, and copy
+  any selection as CSV or as SQL that runs unchanged.
+- **Nothing happens behind your back.** Session activity, query history, and an
+  application log show what each connection is doing, and disconnecting,
+  committing, or switching connections stops for anything still unresolved.
+- **A native desktop binary.** No runtime, no browser, no background service.
+
+## At a glance
+
+| Area | What you get |
+| --- | --- |
+| Editor | IntelliSense over live metadata, signature hints, SQL-aware formatter, multiple file tabs, find and replace, quick describe |
+| Execution | One statement, a selection, or a full script with SQL*Plus-style commands, bind variables, ref cursors, and per-statement timeouts |
+| Results | Independent result tabs, lazy fetch, sorting, CSV export, SQL export, and staged in-grid editing |
+| Objects | Filterable object tree, structure/index/constraint inspection, DDL generation, and table browsing with database-side paging |
+| Operations | Session activity, persisted query history, application log, and crash reports |
 
 ## Database support
 
@@ -81,12 +97,12 @@ Open **File > Connect** (`Ctrl+N`), select a database type, enter the connection
 details, and then test, save, or open the connection. Saved passwords go to the
 OS keyring rather than the configuration file.
 
-![Database connection dialog](docs/images/connection-dialog.png)
-
 - For Oracle, choose Thin or OCI. Thin uses Host, Port, and Service without an
   external client.
 - For MySQL or MariaDB, enter Host, Port, Username, Password, and an optional
   database, then adjust SSL or session options if necessary.
+
+![Database connection dialog](docs/images/connection-dialog.png)
 
 ### 2. Edit and execute SQL
 
@@ -124,19 +140,19 @@ cannot be closed safely.
 
 ### SQL editor and IntelliSense
 
-![SQL IntelliSense suggestions](docs/images/intellisense.png)
-
 IntelliSense uses the current SQL context and loaded database metadata to
 suggest keywords, schemas, tables, views, aliases, columns, routines, packages,
 and other objects. Use the arrow keys to select an item, `Enter` or `Tab` to
 insert it, and `Esc` to close the popup.
 
-![Function signature hint with the active argument emphasized](docs/images/signature-popup.png)
+![SQL IntelliSense suggestions](docs/images/intellisense.png)
 
 When the cursor is inside a function or procedure call, the signature hint
 shows the available parameters and emphasizes the active argument. It follows
 typing and mouse cursor movement, and closes when the application window moves
 or resizes so it cannot remain detached from the editor.
+
+![Function signature hint with the active argument emphasized](docs/images/signature-popup.png)
 
 The editor also supports multiple SQL file tabs, open/save/recent files,
 syntax highlighting, find and replace, undo/redo, comment toggling, selection
@@ -145,12 +161,12 @@ query-history navigation.
 
 ### SQL formatting
 
+The formatter applies SQL-aware line breaks and indentation in place. It uses
+the Oracle or MySQL/MariaDB dialect path of the active connection.
+
 | Before | After `Ctrl+Shift+F` |
 | --- | --- |
 | ![SQL before automatic formatting](docs/images/sql-formatting-before.png) | ![SQL after automatic formatting](docs/images/sql-formatting-after.png) |
-
-The formatter applies SQL-aware line breaks and indentation in place. It uses
-the Oracle or MySQL/MariaDB dialect path of the active connection.
 
 ### Script execution
 
@@ -198,23 +214,23 @@ MySQL / MariaDB family:
 
 ### Object browser
 
-![Object browser with example Oracle metadata](docs/images/object-browser.png)
-
 The filterable object tree supports refresh, data queries, structure/index/
 constraint inspection, DDL generation, and package routine browsing. Oracle
 groups tables, views, procedures, functions, sequences, triggers, synonyms,
 and packages. MySQL/MariaDB groups tables, views, procedures, functions,
 triggers, and events, and shows sequences when the server exposes them.
 
-### Table browsing and bounded paging
+![Object browser with example Oracle metadata](docs/images/object-browser.png)
 
-![Table browser with WHERE, ORDER BY, and paging controls](docs/images/table-browse.png)
+### Table browsing and bounded paging
 
 Double-click a table in the object browser to open its rows in a dedicated
 result tab. The filter bar above the grid keeps the **WHERE** and **ORDER BY**
 editors at equal widths as the window resizes. Enter expressions without the
 `WHERE` or `ORDER BY` keywords, press `Enter` to apply them, or use the clear
 button to reset a field.
+
+![Table browser with WHERE, ORDER BY, and paging controls](docs/images/table-browse.png)
 
 The same metadata-aware IntelliSense used by the SQL editor is available in
 both fields. Start typing or press `Ctrl+Space` (`Cmd+Space` on macOS); the
@@ -232,8 +248,6 @@ their absolute positions across pages.
 
 ### Result grid
 
-![Result grid with a multi-cell selection](docs/images/result-grid.png)
-
 - Drag or use the keyboard to select cells; `Ctrl+C` copies the selection and
   `Ctrl+Shift+C` includes headers.
 - Resize columns, sort by a column header, or export the grid as CSV with
@@ -243,6 +257,8 @@ their absolute positions across pages.
   remaining rows first.
 - Use the context menu to close a result, copy data as text or SQL, export CSV,
   or access available edit actions.
+
+![Result grid with a multi-cell selection](docs/images/result-grid.png)
 
 For a safely identifiable Oracle, MySQL, or MariaDB single-table result,
 **Edit** mode can stage inserted, updated, deleted, or `NULL` values. Oracle
@@ -257,16 +273,16 @@ identifier remain read-only.
 
 ### Copy a selection as SQL
 
-The Data Grid context menu also turns the selected cells into SQL on the
+Select cells in the Data Grid, right-click, and take the selection as SQL on the
 clipboard, ready to paste and run:
-
-![A grid selection and the SQL Inserts, SQL Updates, and Where Clause it produces](docs/images/grid-sql-export.png)
 
 | Menu item | Clipboard contents |
 | --- | --- |
 | **SQL Inserts** | `INSERT INTO <table> (<selected columns>) VALUES (…);` per selected row |
 | **SQL Updates** | `UPDATE <table> SET <selected non-key columns> WHERE <primary key>;` per row |
 | **Where Clause** | `AND` within a row, `OR` between rows, and `IN` when one column is selected |
+
+![The Data Grid menu over a selection, with the SQL it produces pasted in the editor](docs/images/grid-sql-export.png)
 
 Values are rendered from the column types the driver reported, not from how a
 value happens to look, so a `NUMBER` stays bare, a `DATE` becomes `TO_DATE(…)`
@@ -295,14 +311,12 @@ rules and their known limits.
 
 ### Settings and diagnostics
 
-![Application settings](docs/images/settings.png)
-
 **Settings > Preferences** controls editor/result fonts, global UI size, result
 preview and lazy-fetch limits, connection-pool size, cancellation behavior, and
 how many query-history and application-log entries are retained. Settings
 persist between launches.
 
-![Query history with SQL and error preview](docs/images/query-history.png)
+![Application settings](docs/images/settings.png)
 
 **Tools > Query History** searches executed statements, filters failures, shows
 SQL and error details, and sends a selected statement back to the editor.
@@ -310,16 +324,18 @@ History is kept in a file and restored at the next launch; **Settings >
 Preferences > History & Log** sets how many query-history and application-log
 entries are retained.
 
-![Session activity result](docs/images/session-activity.png)
+![Query history with SQL and error preview](docs/images/query-history.png)
 
 **Tools > Session Activity** shows active and retained sessions, running SQL,
 lazy fetches, result-tab ownership, fetched-row counts, and elapsed time.
 
-![Application log viewer](docs/images/application-log.png)
+![Session activity result](docs/images/session-activity.png)
 
 **Tools > Application Log** filters, inspects, exports, and clears log entries.
 If the app panics, it records `crash.log` and displays that report at the next
 launch.
+
+![Application log viewer](docs/images/application-log.png)
 
 ## Oracle connection modes
 
