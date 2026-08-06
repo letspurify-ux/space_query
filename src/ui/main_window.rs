@@ -4153,7 +4153,8 @@ pub(crate) fn result_pane_routes_for_progress_with_script_context(
             script_transcript,
             statement_finished_status(result, false),
         ),
-        QueryProgress::BatchStart { .. }
+        QueryProgress::StatementCancelledHistory { .. }
+        | QueryProgress::BatchStart { .. }
         | QueryProgress::PromptInput { .. }
         | QueryProgress::RequestCancelOldestLazyFetchForSessionPool { .. }
         | QueryProgress::NotifyCancelOldestLazyFetchForSessionPool
@@ -8769,6 +8770,9 @@ impl MainWindow {
             match progress {
                 QueryProgress::Operation { .. } => {}
                 QueryProgress::StatementOrigin { .. } => {}
+                // History-only event: recorded by the editor's progress
+                // handler, with no result pane to update here.
+                QueryProgress::StatementCancelledHistory { .. } => {}
                 QueryProgress::OperationAbandoned { token } => {
                     if operation_token == Some(token)
                         && s.operation_abandoned_matches(tab_id, token)

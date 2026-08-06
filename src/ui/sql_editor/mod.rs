@@ -376,7 +376,11 @@ impl QueryProgressSender {
             },
             progress => progress,
         };
-        let progress = if matches!(progress, QueryProgress::StatementFinished { .. }) {
+        let progress = if matches!(
+            progress,
+            QueryProgress::StatementFinished { .. }
+                | QueryProgress::StatementCancelledHistory { .. }
+        ) {
             let origin = self
                 .execution_origin
                 .lock()
@@ -546,6 +550,16 @@ pub enum QueryProgress {
         result: QueryResult,
         connection_name: String,
         timed_out: bool,
+    },
+    /// A statement that ended by cancellation without a `StatementFinished`
+    /// event: a lazy fetch session closes through `LazyFetchClosed`, so the
+    /// cancelled statement would otherwise be missing from query history.
+    /// History only - it carries no result and is routed to no result pane.
+    StatementCancelledHistory {
+        sql: String,
+        connection_name: String,
+        execution_time: Duration,
+        row_count: usize,
     },
     /// Single completion event carrying §27.4 policy metadata (db_type,
     /// sql_kind, editor_id, operation_id, connection_generation, cancelled,
@@ -3692,6 +3706,32 @@ impl SqlEditorWidget {
             .is_some()
     }
 
+    fn record_query_history(
+        sql: &str,
+        execution_time: Duration,
+        row_count: usize,
+        connection_name: &str,
+        origin: Option<&ExecutionOrigin>,
+        success: bool,
+        message: &str,
+    ) {
+        if let Err(history_err) = QueryHistoryDialog::add_to_history(
+            sql,
+            execution_time.as_millis() as u64,
+            row_count,
+            connection_name,
+            origin,
+            success,
+            message,
+        ) {
+            crate::utils::logging::log_error("history", &history_err);
+            SqlEditorWidget::show_alert_dialog(&format!(
+                "Failed to save query history: {}",
+                history_err
+            ));
+        }
+    }
+
     fn setup_progress_handler(
         &self,
         progress_receiver: mpsc::Receiver<QueryProgress>,
@@ -3781,24 +3821,34 @@ impl SqlEditorWidget {
                                         result.message
                                     ));
                                 }
-                                if let Err(history_err) = QueryHistoryDialog::add_to_history(
+                                SqlEditorWidget::record_query_history(
                                     &result.sql,
-                                    result.execution_time.as_millis() as u64,
+                                    result.execution_time,
                                     result.row_count,
                                     connection_name,
                                     execution_origin.as_ref(),
                                     result.success,
                                     &result.message,
-                                ) {
-                                    crate::utils::logging::log_error("history", &history_err);
-                                    SqlEditorWidget::show_alert_dialog(&format!(
-                                        "Failed to save query history: {}",
-                                        history_err
-                                    ));
-                                }
+                                );
                                 SqlEditorWidget::invoke_query_result_callback(
                                     &execute_callback,
                                     result,
+                                );
+                            }
+                            QueryProgress::StatementCancelledHistory {
+                                sql,
+                                connection_name,
+                                execution_time,
+                                row_count,
+                            } => {
+                                SqlEditorWidget::record_query_history(
+                                    sql,
+                                    *execution_time,
+                                    *row_count,
+                                    connection_name,
+                                    execution_origin.as_ref(),
+                                    false,
+                                    &SqlEditorWidget::cancel_message(),
                                 );
                             }
                             QueryProgress::BatchFinished => {

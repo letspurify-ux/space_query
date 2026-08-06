@@ -3662,6 +3662,24 @@ impl SqlEditorWidget {
         }
     }
 
+    /// An interrupted lazy fetch closes through `LazyFetchClosed` and emits no
+    /// `StatementFinished`, so query history would lose the statement entirely.
+    /// This history-only event records it the same way a cancelled non-lazy
+    /// statement is recorded: failed, with the rows fetched before the cancel.
+    fn cancelled_lazy_fetch_history_progress(
+        sql: &str,
+        connection_name: &str,
+        fetched_rows: usize,
+        elapsed: Duration,
+    ) -> QueryProgress {
+        QueryProgress::StatementCancelledHistory {
+            sql: sql.to_string(),
+            connection_name: connection_name.to_string(),
+            execution_time: elapsed,
+            row_count: fetched_rows,
+        }
+    }
+
     fn set_lazy_fetch_in_progress(
         active_lazy_fetch: &Arc<Mutex<Option<LazyFetchHandle>>>,
         session_id: u64,
@@ -4764,6 +4782,14 @@ impl SqlEditorWidget {
                     } else if let Some(success_result) = success_result {
                         let _ = sender.send(success_result);
                         app::awake();
+                    } else if close_cancelled {
+                        let _ = sender.send(Self::cancelled_lazy_fetch_history_progress(
+                            &sql_to_execute,
+                            &conn_name,
+                            fetched_rows,
+                            statement_start.elapsed(),
+                        ));
+                        app::awake();
                     }
                     Self::clear_lazy_fetch_and_emit_closed(
                         &sender,
@@ -5559,6 +5585,14 @@ impl SqlEditorWidget {
                     } else if let Some(success_result) = success_result {
                         let _ = sender.send(success_result);
                         app::awake();
+                    } else if close_cancelled {
+                        let _ = sender.send(Self::cancelled_lazy_fetch_history_progress(
+                            &sql_to_execute,
+                            &conn_name,
+                            fetched_rows,
+                            statement_start.elapsed(),
+                        ));
+                        app::awake();
                     }
                     let (close_cancelled, cursor_closed, close_error_kind) =
                         Self::oracle_thin_lazy_cleanup_close_flags(
@@ -5677,6 +5711,7 @@ impl SqlEditorWidget {
                 let mut close_error_kind = InterruptKind::None;
                 let mut error_result = None;
                 let mut success_result = None;
+                let mut cancelled_history_result = None;
                 let mut lazy_error_message: Option<String> = None;
                 let mut cursor_closed = false;
                 let mut fetch_worker_done = false;
@@ -6274,6 +6309,15 @@ impl SqlEditorWidget {
                         ));
                         success_result = None;
                     }
+                    if error_result.is_none() && success_result.is_none() && close_cancelled {
+                        cancelled_history_result =
+                            Some(Self::cancelled_lazy_fetch_history_progress(
+                                &sql_to_execute,
+                                &conn_name,
+                                fetched_rows,
+                                statement_start.elapsed(),
+                            ));
+                    }
                     *lazy_cancel_context
                         .lock()
                         .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
@@ -6303,6 +6347,9 @@ impl SqlEditorWidget {
                             app::awake();
                         } else if let Some(success_result) = success_result {
                             let _ = sender.send(success_result);
+                            app::awake();
+                        } else if let Some(cancelled_history_result) = cancelled_history_result {
+                            let _ = sender.send(cancelled_history_result);
                             app::awake();
                         }
                         Self::clear_lazy_fetch_and_emit_closed(
@@ -31032,6 +31079,43 @@ mod execution_startup_error_tests {
 }
 
 #[cfg(test)]
+mod cancelled_lazy_fetch_history_tests {
+    use super::SqlEditorWidget;
+    use crate::ui::main_window::result_pane_routes_for_progress;
+    use crate::ui::sql_editor::QueryProgress;
+    use std::time::Duration;
+
+    #[test]
+    fn cancelled_lazy_fetch_reports_the_statement_for_query_history() {
+        let progress = SqlEditorWidget::cancelled_lazy_fetch_history_progress(
+            "select * from big_table",
+            "DEV",
+            250,
+            Duration::from_millis(1200),
+        );
+
+        match &progress {
+            QueryProgress::StatementCancelledHistory {
+                sql,
+                connection_name,
+                execution_time,
+                row_count,
+            } => {
+                assert_eq!(sql, "select * from big_table");
+                assert_eq!(connection_name, "DEV");
+                assert_eq!(*execution_time, Duration::from_millis(1200));
+                assert_eq!(*row_count, 250);
+            }
+            _ => panic!("expected StatementCancelledHistory progress event"),
+        }
+
+        // The cancel already reached the result panes through LazyFetchClosed;
+        // this event exists only so query history keeps the statement.
+        assert!(result_pane_routes_for_progress(&progress).is_empty());
+    }
+}
+
+#[cfg(test)]
 mod mysql_batch_execution_regression_tests {
     use super::{
         LazyFetchCommand, LazyFetchHandle, MySqlQueryCancelContext, QueryCancelHandle,
@@ -31659,6 +31743,9 @@ mod mysql_batch_execution_regression_tests {
                     cancelled,
                     ..
                 } => format!("LazyFetchClosed({index}, {session_id}, {cancelled})"),
+                QueryProgress::StatementCancelledHistory { sql, row_count, .. } => {
+                    format!("StatementCancelledHistory({sql}, rows={row_count})")
+                }
                 QueryProgress::ScriptOutput { lines } => {
                     format!("ScriptOutput({})", lines.join(" | "))
                 }
@@ -31924,7 +32011,8 @@ mod mysql_batch_execution_regression_tests {
                         };
                     assert_eq!(routes, expected, "{label}\n{progress_summary}");
                 }
-                QueryProgress::BatchStart { .. }
+                QueryProgress::StatementCancelledHistory { .. }
+                | QueryProgress::BatchStart { .. }
                 | QueryProgress::PromptInput { .. }
                 | QueryProgress::RequestCancelOldestLazyFetchForSessionPool { .. }
                 | QueryProgress::NotifyCancelOldestLazyFetchForSessionPool
@@ -36545,6 +36633,47 @@ mod mysql_transaction_feedback_tests {
         assert!(
             snapshot.rows.len() > initial_batch_len,
             "FetchMore should append rows after the initial lazy batch"
+        );
+    }
+
+    #[test]
+    #[ignore = "requires local Oracle listener"]
+    fn oracle_thin_lazy_fetch_cancel_reports_the_statement_for_query_history() {
+        // A cancelled lazy fetch closes through LazyFetchClosed and emits no
+        // StatementFinished, so query history only keeps the statement if the
+        // worker reports it through the history-only event.
+        let sql = "select * from help a join help b on 1=1";
+        let progress = oracle_lazy_worker_progress_for_sql(OracleDriverMode::Thin, sql, 25, false);
+
+        let (history_sql, history_rows) = progress
+            .iter()
+            .find_map(|event| match event {
+                QueryProgress::StatementCancelledHistory { sql, row_count, .. } => {
+                    Some((sql.clone(), *row_count))
+                }
+                _ => None,
+            })
+            .expect("cancelled lazy fetch should report the statement for query history");
+        assert_eq!(history_sql, sql);
+        assert!(
+            history_rows > 0,
+            "history entry should keep the rows fetched before the cancel"
+        );
+        assert!(
+            !progress
+                .iter()
+                .any(|event| matches!(event, QueryProgress::StatementFinished { .. })),
+            "a cancelled lazy fetch must not also report a finished statement"
+        );
+
+        // A lazy fetch that runs to EOF already reports through
+        // StatementFinished, so it must not add a second history entry.
+        let completed = oracle_lazy_worker_progress_for_sql(OracleDriverMode::Thin, sql, 25, true);
+        assert!(
+            !completed
+                .iter()
+                .any(|event| matches!(event, QueryProgress::StatementCancelledHistory { .. })),
+            "a completed lazy fetch must not report a cancelled statement"
         );
     }
 
