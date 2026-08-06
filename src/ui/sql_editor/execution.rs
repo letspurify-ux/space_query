@@ -40,7 +40,7 @@ use crate::db::{
     lock_connection_with_activity, result_messages, BindDataType, BindValue, BindVar, ColumnInfo,
     ConnectionAttemptPolicy, CursorResult, DbPoolSession, DbSessionLease, ObjectBrowser, QueryCell,
     QueryExecutor, QueryResult, ResolvedBind, RetainedSessionState, ScriptItem, SessionState,
-    SharedDbSessionLease, ToolCommand, TransactionSessionState,
+    SharedDbSessionLease, SqlValueKind, ToolCommand, TransactionSessionState,
 };
 use crate::sql_text;
 use crate::utils::arithmetic::{safe_div, safe_rem};
@@ -4010,6 +4010,41 @@ impl SqlEditorWidget {
             .collect()
     }
 
+    /// Classify a thin-driver column type for SQL literal generation.
+    ///
+    /// Exhaustive on purpose: when `OracleColumnType` gains a variant the
+    /// compiler forces a decision here instead of silently defaulting.
+    fn oracle_thin_value_kind(column_type: &OracleColumnType) -> SqlValueKind {
+        match column_type {
+            OracleColumnType::Varchar
+            | OracleColumnType::Long
+            | OracleColumnType::Clob
+            | OracleColumnType::Nclob
+            | OracleColumnType::Json
+            | OracleColumnType::Xml
+            | OracleColumnType::Rowid
+            | OracleColumnType::Urowid => SqlValueKind::String,
+            OracleColumnType::Number
+            | OracleColumnType::BinaryFloat
+            | OracleColumnType::BinaryDouble => SqlValueKind::Number,
+            OracleColumnType::Boolean => SqlValueKind::Boolean,
+            OracleColumnType::Date
+            | OracleColumnType::Timestamp
+            | OracleColumnType::IntervalYearMonth
+            | OracleColumnType::IntervalDaySecond => SqlValueKind::Temporal,
+            OracleColumnType::Raw => SqlValueKind::Binary,
+            // Rendered as a placeholder, JSON, or hex that no literal can
+            // reconstruct, so quoting the displayed text is the honest answer.
+            OracleColumnType::Blob
+            | OracleColumnType::Bfile
+            | OracleColumnType::Cursor
+            | OracleColumnType::Vector
+            | OracleColumnType::Object
+            | OracleColumnType::ObjectRef
+            | OracleColumnType::Unsupported(_) => SqlValueKind::Unknown,
+        }
+    }
+
     fn oracle_thin_column_info(
         columns: &[OracleThinColumnMetadata],
         normalize_internal_rowid_alias: bool,
@@ -4025,6 +4060,7 @@ impl SqlEditorWidget {
                     column.name.clone()
                 },
                 data_type: format!("{:?}", column.column_type),
+                kind: Self::oracle_thin_value_kind(&column.column_type),
             })
             .collect()
     }
@@ -4373,6 +4409,7 @@ impl SqlEditorWidget {
                         let _ = sender.send(QueryProgress::SelectStart {
                             index,
                             columns: display_columns.clone(),
+                            column_kinds: Self::column_kinds_of(&column_info),
                             null_text: null_text.clone(),
                         });
                         app::awake();
@@ -4969,6 +5006,7 @@ impl SqlEditorWidget {
                         let _ = sender.send(QueryProgress::SelectStart {
                             index,
                             columns: display_columns.clone(),
+                            column_kinds: Self::column_kinds_of(&column_info),
                             null_text: null_text.clone(),
                         });
                         app::awake();
@@ -5735,12 +5773,14 @@ impl SqlEditorWidget {
                             .map(|col| ColumnInfo {
                                 name: col.name_str().to_string(),
                                 data_type: format!("{:?}", col.column_type()),
+                                kind: crate::db::query::mysql_executor::MysqlExecutor::mysql_value_kind(col.column_type()),
                             })
                             .collect();
                         if edit_descriptor.is_some() {
                             column_info.push(ColumnInfo {
                                 name: crate::db::RESULT_EDIT_SNAPSHOT_COLUMN.to_string(),
                                 data_type: "INTERNAL".to_string(),
+                                kind: SqlValueKind::Unknown,
                             });
                         }
                         let raw_column_names = wire_columns[..visible_column_count]
@@ -5761,6 +5801,7 @@ impl SqlEditorWidget {
                         let _ = sender.send(QueryProgress::SelectStart {
                             index,
                             columns: display_columns.clone(),
+                            column_kinds: SqlEditorWidget::column_kinds_of(&column_info),
                             null_text: null_text.clone(),
                         });
                         if let Some(descriptor) = edit_descriptor.clone() {
@@ -6558,6 +6599,9 @@ impl SqlEditorWidget {
             .map(|column| ColumnInfo {
                 name: column.name_str().to_string(),
                 data_type: format!("{:?}", column.column_type()),
+                kind: crate::db::query::mysql_executor::MysqlExecutor::mysql_value_kind(
+                    column.column_type(),
+                ),
             })
             .collect::<Vec<_>>();
         let mut grid_column_names = raw_column_names.clone();
@@ -6566,6 +6610,7 @@ impl SqlEditorWidget {
             result_columns.push(ColumnInfo {
                 name: crate::db::RESULT_EDIT_SNAPSHOT_COLUMN.to_string(),
                 data_type: "INTERNAL".to_string(),
+                kind: SqlValueKind::Unknown,
             });
         }
         let display_columns = Self::apply_result_grid_heading_setting(
@@ -6580,6 +6625,7 @@ impl SqlEditorWidget {
             let _ = sender.send(QueryProgress::SelectStart {
                 index,
                 columns: display_columns,
+                column_kinds: Self::column_kinds_of(&result_columns),
                 null_text: null_text.clone(),
             });
             if let Some(descriptor) = edit_descriptor.clone() {
@@ -8369,6 +8415,7 @@ impl SqlEditorWidget {
                                         result_index,
                                         &sql_text,
                                         column_names,
+                                        SqlEditorWidget::column_kinds_of(&result.columns),
                                         result.rows.clone(),
                                         result.success,
                                         feedback_enabled,
@@ -12035,6 +12082,9 @@ impl SqlEditorWidget {
                                             let _ = sender.send(QueryProgress::SelectStart {
                                                 index,
                                                 columns: display_columns.clone(),
+                                                column_kinds: SqlEditorWidget::column_kinds_of(
+                                                    columns,
+                                                ),
                                                 null_text: null_text.clone(),
                                             });
                                             app::awake();
@@ -12261,6 +12311,9 @@ impl SqlEditorWidget {
                                             let _ = sender.send(QueryProgress::SelectStart {
                                                 index,
                                                 columns: display_columns.clone(),
+                                                column_kinds: SqlEditorWidget::column_kinds_of(
+                                                    columns,
+                                                ),
                                                 null_text: null_text.clone(),
                                             });
                                             app::awake();
@@ -12669,6 +12722,9 @@ impl SqlEditorWidget {
                                             let _ = sender.send(QueryProgress::SelectStart {
                                                 index,
                                                 columns: display_columns.clone(),
+                                                column_kinds: SqlEditorWidget::column_kinds_of(
+                                                    columns,
+                                                ),
                                                 null_text: null_text.clone(),
                                             });
                                             app::awake();
@@ -14463,6 +14519,7 @@ impl SqlEditorWidget {
         let _ = sender.send(QueryProgress::SelectStart {
             index,
             columns: display_columns.clone(),
+            column_kinds: Self::column_kinds_of(&column_info),
             null_text: null_text.clone(),
         });
         app::awake();
@@ -14712,6 +14769,7 @@ impl SqlEditorWidget {
                     let _ = sender.send(QueryProgress::SelectStart {
                         index,
                         columns: display_columns.clone(),
+                        column_kinds: Self::column_kinds_of(&column_info),
                         null_text: null_text.clone(),
                     });
                     app::awake();
@@ -15684,6 +15742,7 @@ impl SqlEditorWidget {
             index,
             sql,
             columns,
+            Vec::new(),
             rows,
             true,
             feedback_enabled,
@@ -18434,6 +18493,16 @@ impl SqlEditorWidget {
         display_row.join(colsep)
     }
 
+    /// Literal-generation kinds for `SelectStart`, in column order.
+    ///
+    /// Callers must pass the same `ColumnInfo` list the grid's column names were
+    /// derived from; `apply_heading_setting` and
+    /// `apply_result_grid_heading_setting` both preserve length, so the two stay
+    /// aligned.
+    fn column_kinds_of(columns: &[ColumnInfo]) -> Vec<SqlValueKind> {
+        columns.iter().map(|column| column.kind).collect()
+    }
+
     fn apply_heading_setting(column_names: Vec<String>, heading_enabled: bool) -> Vec<String> {
         if heading_enabled {
             column_names
@@ -18562,6 +18631,9 @@ impl SqlEditorWidget {
         success: bool,
         feedback_enabled: bool,
     ) {
+        // Callers of this wrapper build their grids client-side (PRINT,
+        // SHOW ERRORS, COMPILE ERRORS, …), so there is no driver type to pass:
+        // every value is already display text and must be quoted as a string.
         Self::emit_select_result_with_start_option(
             sender,
             session,
@@ -18569,6 +18641,7 @@ impl SqlEditorWidget {
             index,
             sql,
             column_names,
+            Vec::new(),
             rows,
             success,
             feedback_enabled,
@@ -18583,6 +18656,7 @@ impl SqlEditorWidget {
         index: usize,
         sql: &str,
         column_names: Vec<String>,
+        column_kinds: Vec<SqlValueKind>,
         rows: Vec<Vec<String>>,
         success: bool,
         feedback_enabled: bool,
@@ -18603,6 +18677,7 @@ impl SqlEditorWidget {
             let _ = sender.send(QueryProgress::SelectStart {
                 index,
                 columns: column_names.clone(),
+                column_kinds,
                 null_text: null_text.clone(),
             });
             app::awake();
@@ -18647,6 +18722,7 @@ impl SqlEditorWidget {
             .map(|name| ColumnInfo {
                 name: name.clone(),
                 data_type: "VARCHAR2".to_string(),
+                kind: SqlValueKind::Unknown,
             })
             .collect();
         let mut result =
@@ -23359,6 +23435,7 @@ mod query_execution_cleanup_tests {
             "TEST_CONN",
             0,
             "EMPTY CURSOR",
+            Vec::new(),
             Vec::new(),
             vec![vec!["ignored".to_string()]],
             true,
@@ -34118,10 +34195,12 @@ join b
             ColumnInfo {
                 name: "EMPNO".to_string(),
                 data_type: "Number".to_string(),
+                kind: crate::db::SqlValueKind::Unknown,
             },
             ColumnInfo {
                 name: "ENAME".to_string(),
                 data_type: "Varchar2".to_string(),
+                kind: crate::db::SqlValueKind::Unknown,
             },
         ];
 

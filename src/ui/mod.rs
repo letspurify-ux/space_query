@@ -5,6 +5,10 @@ pub mod connection_dialog;
 pub mod constants;
 pub mod find_replace;
 pub mod font_settings;
+// Public only so `verify_grid_sql_export` can assert on the exact SQL the app
+// puts on the clipboard; not part of the supported surface.
+#[doc(hidden)]
+pub mod grid_sql_export;
 pub mod intellisense;
 pub mod intellisense_context;
 pub mod log_viewer;

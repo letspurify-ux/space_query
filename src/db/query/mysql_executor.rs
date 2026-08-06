@@ -10,7 +10,9 @@ use crate::sql_text;
 use super::executor::{
     ConstraintInfo, ForeignKeyInfo, IndexInfo, QueryExecutor, TableColumnDetail,
 };
-use super::types::{result_messages, ColumnInfo, ProcedureArgument, QueryCell, QueryResult};
+use super::types::{
+    result_messages, ColumnInfo, ProcedureArgument, QueryCell, QueryResult, SqlValueKind,
+};
 
 pub struct MysqlExecutor;
 
@@ -588,6 +590,55 @@ impl MysqlExecutor {
         }
     }
 
+    /// Classify a MySQL/MariaDB wire column type for SQL literal generation.
+    ///
+    /// Exhaustive on purpose: when `ColumnType` gains a variant the compiler
+    /// forces a decision here instead of silently defaulting.
+    ///
+    /// The protocol cannot separate TEXT from BLOB, or VARCHAR from VARBINARY —
+    /// both pairs share a type code and differ only by charset. That does not
+    /// matter here: `Binary` and `String` both render as a quoted literal on
+    /// this backend, because `value_to_string` has already put the bytes
+    /// through `String::from_utf8_lossy`.
+    pub(crate) fn mysql_value_kind(column_type: mysql::consts::ColumnType) -> SqlValueKind {
+        use mysql::consts::ColumnType as MysqlColumnType;
+        match column_type {
+            MysqlColumnType::MYSQL_TYPE_TINY
+            | MysqlColumnType::MYSQL_TYPE_SHORT
+            | MysqlColumnType::MYSQL_TYPE_LONG
+            | MysqlColumnType::MYSQL_TYPE_LONGLONG
+            | MysqlColumnType::MYSQL_TYPE_INT24
+            | MysqlColumnType::MYSQL_TYPE_FLOAT
+            | MysqlColumnType::MYSQL_TYPE_DOUBLE
+            | MysqlColumnType::MYSQL_TYPE_DECIMAL
+            | MysqlColumnType::MYSQL_TYPE_NEWDECIMAL
+            | MysqlColumnType::MYSQL_TYPE_YEAR => SqlValueKind::Number,
+            MysqlColumnType::MYSQL_TYPE_VARCHAR
+            | MysqlColumnType::MYSQL_TYPE_VAR_STRING
+            | MysqlColumnType::MYSQL_TYPE_STRING
+            | MysqlColumnType::MYSQL_TYPE_JSON
+            | MysqlColumnType::MYSQL_TYPE_ENUM
+            | MysqlColumnType::MYSQL_TYPE_SET => SqlValueKind::String,
+            MysqlColumnType::MYSQL_TYPE_DATE
+            | MysqlColumnType::MYSQL_TYPE_NEWDATE
+            | MysqlColumnType::MYSQL_TYPE_DATETIME
+            | MysqlColumnType::MYSQL_TYPE_DATETIME2
+            | MysqlColumnType::MYSQL_TYPE_TIMESTAMP
+            | MysqlColumnType::MYSQL_TYPE_TIMESTAMP2
+            | MysqlColumnType::MYSQL_TYPE_TIME
+            | MysqlColumnType::MYSQL_TYPE_TIME2 => SqlValueKind::Temporal,
+            MysqlColumnType::MYSQL_TYPE_BLOB
+            | MysqlColumnType::MYSQL_TYPE_TINY_BLOB
+            | MysqlColumnType::MYSQL_TYPE_MEDIUM_BLOB
+            | MysqlColumnType::MYSQL_TYPE_LONG_BLOB => SqlValueKind::Binary,
+            MysqlColumnType::MYSQL_TYPE_BIT
+            | MysqlColumnType::MYSQL_TYPE_GEOMETRY
+            | MysqlColumnType::MYSQL_TYPE_NULL
+            | MysqlColumnType::MYSQL_TYPE_TYPED_ARRAY
+            | MysqlColumnType::MYSQL_TYPE_UNKNOWN => SqlValueKind::Unknown,
+        }
+    }
+
     fn value_to_string(value: &MysqlValue) -> String {
         match value {
             MysqlValue::NULL => QueryCell::null_result_text(),
@@ -726,6 +777,7 @@ impl MysqlExecutor {
             .map(|col| ColumnInfo {
                 name: col.name_str().to_string(),
                 data_type: format!("{:?}", col.column_type()),
+                kind: Self::mysql_value_kind(col.column_type()),
             })
             .collect();
 
@@ -803,6 +855,7 @@ impl MysqlExecutor {
             .map(|col| ColumnInfo {
                 name: col.name_str().to_string(),
                 data_type: format!("{:?}", col.column_type()),
+                kind: Self::mysql_value_kind(col.column_type()),
             })
             .collect();
 
@@ -859,6 +912,7 @@ impl MysqlExecutor {
                 .map(|col| ColumnInfo {
                     name: col.name_str().to_string(),
                     data_type: format!("{:?}", col.column_type()),
+                    kind: Self::mysql_value_kind(col.column_type()),
                 })
                 .collect();
 
@@ -1008,6 +1062,7 @@ impl MysqlExecutor {
                 .map(|col| ColumnInfo {
                     name: col.name_str().to_string(),
                     data_type: format!("{:?}", col.column_type()),
+                    kind: Self::mysql_value_kind(col.column_type()),
                 })
                 .collect();
 
@@ -2451,7 +2506,11 @@ impl MysqlObjectBrowser {
 
         Ok(rows
             .into_iter()
-            .map(|(name, data_type)| ColumnInfo { name, data_type })
+            .map(|(name, data_type)| ColumnInfo {
+                name,
+                data_type,
+                kind: SqlValueKind::Unknown,
+            })
             .collect())
     }
 
@@ -2827,6 +2886,7 @@ mod tests {
         let columns = vec![ColumnInfo {
             name: "id".to_string(),
             data_type: "Long".to_string(),
+            kind: crate::db::SqlValueKind::Unknown,
         }];
         let rows = vec![vec!["1".to_string()]];
 
@@ -2908,14 +2968,17 @@ mod tests {
             ColumnInfo {
                 name: "id".to_string(),
                 data_type: "BIGINT".to_string(),
+                kind: crate::db::SqlValueKind::Unknown,
             },
             ColumnInfo {
                 name: "table".to_string(),
                 data_type: "VARCHAR".to_string(),
+                kind: crate::db::SqlValueKind::Unknown,
             },
             ColumnInfo {
                 name: "Extra".to_string(),
                 data_type: "VARCHAR".to_string(),
+                kind: crate::db::SqlValueKind::Unknown,
             },
         ];
         let rows = vec![vec![
@@ -3013,6 +3076,7 @@ mod tests {
                 columns: vec![ColumnInfo {
                     name: "id".to_string(),
                     data_type: "Long".to_string(),
+                    kind: crate::db::SqlValueKind::Unknown,
                 }],
                 rows: vec![vec!["1".to_string()]],
                 affected_rows: 1,
@@ -3064,10 +3128,12 @@ mod tests {
                         ColumnInfo {
                             name: "id".to_string(),
                             data_type: "Long".to_string(),
+                            kind: crate::db::SqlValueKind::Unknown,
                         },
                         ColumnInfo {
                             name: "name".to_string(),
                             data_type: "VarString".to_string(),
+                            kind: crate::db::SqlValueKind::Unknown,
                         },
                     ],
                     rows: vec![vec!["1".to_string(), "x".to_string()]],
@@ -3807,6 +3873,7 @@ mod tests {
                     columns: vec![ColumnInfo {
                         name: "user_name".to_string(),
                         data_type: "VARCHAR".to_string(),
+                        kind: crate::db::SqlValueKind::Unknown,
                     }],
                     rows: vec![vec!["alice".to_string()], vec!["bob".to_string()]],
                     affected_rows: 0,

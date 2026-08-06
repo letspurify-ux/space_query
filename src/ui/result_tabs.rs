@@ -12,11 +12,12 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use crate::db::query::result_messages;
-use crate::db::{ColumnInfo, ExecutionOrigin, QueryResult, ResultEditDescriptor};
+use crate::db::{ColumnInfo, ExecutionOrigin, QueryResult, ResultEditDescriptor, SqlValueKind};
 use crate::ui::constants;
 use crate::ui::font_settings::{
     configured_result_font_size, configured_result_profile, FontProfile,
 };
+use crate::ui::grid_sql_export::GridSqlSelection;
 use crate::ui::result_table::{
     LazyFetchCallback, ResultGridEditExecuteCallback, ResultGridSqlExecuteCallback,
     ResultPageNavigationOutcome, ResultTableContextActionCallback,
@@ -1456,6 +1457,7 @@ impl ResultTabsWidget {
             columns: vec![ColumnInfo {
                 name: "Text".to_string(),
                 data_type: "VARCHAR2".to_string(),
+                kind: crate::db::SqlValueKind::Unknown,
             }],
             row_count: rows.len(),
             rows,
@@ -1910,7 +1912,13 @@ impl ResultTabsWidget {
         Some(state.applied_request.clone())
     }
 
-    fn start_streaming(&mut self, index: usize, columns: &[String], null_text: &str) {
+    fn start_streaming(
+        &mut self,
+        index: usize,
+        columns: &[String],
+        column_kinds: &[SqlValueKind],
+        null_text: &str,
+    ) {
         let status = self
             .data
             .lock()
@@ -1923,6 +1931,9 @@ impl ResultTabsWidget {
         if let Some(mut table) = table {
             table.set_null_text(null_text);
             table.start_streaming(columns);
+            // Must follow start_streaming: the setter validates the kinds
+            // against the header list that call just installed.
+            table.set_column_kinds(column_kinds);
         }
         self.fire_on_change_callback();
     }
@@ -1931,10 +1942,11 @@ impl ResultTabsWidget {
         &mut self,
         id: ResultTabId,
         columns: &[String],
+        column_kinds: &[SqlValueKind],
         null_text: &str,
     ) {
         if let Some(index) = self.result_tab_index_for_id(id) {
-            self.start_streaming(index, columns, null_text);
+            self.start_streaming(index, columns, column_kinds, null_text);
         }
     }
 
@@ -2845,6 +2857,24 @@ impl ResultTabsWidget {
         if let Some(mut table) = self.current_table() {
             table.select_all();
         }
+    }
+
+    /// Snapshot the visible grid's selection for SQL export, along with the SQL
+    /// that produced it.
+    ///
+    /// The base table comes from the grid-edit descriptor when the result is
+    /// editable, since that is exact; otherwise the caller resolves it from the
+    /// returned SQL.
+    pub(crate) fn sql_export_context(
+        &self,
+        db_type: crate::db::DatabaseType,
+    ) -> Option<(GridSqlSelection, String)> {
+        let table = self.current_table()?;
+        let table_name = table
+            .result_edit_descriptor_snapshot()
+            .map(|descriptor| format!("{}.{}", descriptor.schema_name, descriptor.table_name));
+        let selection = table.sql_export_selection(db_type, table_name)?;
+        Some((selection, table.source_sql_snapshot()))
     }
 
     #[doc(hidden)]

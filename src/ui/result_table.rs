@@ -22,12 +22,13 @@ use crate::db::query::result_messages;
 use crate::db::{
     decode_result_edit_snapshot, QueryExecutor, QueryResult, ResultEditAssignment,
     ResultEditDescriptor, ResultEditMutation, ResultEditOriginalValue, ResultEditRequest,
-    ResultEditValue, RESULT_EDIT_SNAPSHOT_COLUMN,
+    ResultEditValue, SqlValueKind, MYSQL_EDIT_KEY_ALIAS_PREFIX, RESULT_EDIT_SNAPSHOT_COLUMN,
 };
 use crate::ui::constants::*;
 use crate::ui::font_settings::{
     configured_result_font_size, configured_result_profile, FontProfile,
 };
+use crate::ui::grid_sql_export::GridSqlSelection;
 use crate::ui::sql_editor::LazyFetchRequest;
 use crate::ui::theme;
 use crate::utils::arithmetic::safe_div;
@@ -106,6 +107,12 @@ pub enum ResultTableContextAction {
     ExportCsv,
     Close,
     CloseAll,
+    /// Copy the selection to the clipboard as SQL. Handled by the main window
+    /// because it needs the connection's database type, the base table, and —
+    /// for `SqlUpdates` — the table's primary key.
+    CopySqlInserts,
+    CopySqlUpdates,
+    CopyWhereClause,
 }
 
 enum LazyFetchPendingAction {
@@ -272,6 +279,10 @@ impl SharedFontSettings {
 pub struct ResultTableWidget {
     table: Table,
     headers: Arc<Mutex<Vec<String>>>,
+    /// Literal-generation kind per `headers` entry, used only by the SQL export
+    /// menu items. Empty means "no driver metadata": every column is treated as
+    /// `Unknown`, which renders as a quoted string literal.
+    column_kinds: Arc<Mutex<Vec<SqlValueKind>>>,
     /// Buffer for pending rows during streaming
     pending_rows: Arc<Mutex<Vec<Vec<String>>>>,
     /// Pending column width updates
@@ -581,7 +592,7 @@ impl ResultTableWidget {
         true
     }
 
-    fn value_represents_null(value: &str, null_text: &str) -> bool {
+    pub(crate) fn value_represents_null(value: &str, null_text: &str) -> bool {
         let trimmed = value.trim();
         value.is_empty()
             || trimmed.eq_ignore_ascii_case("NULL")
@@ -3310,6 +3321,7 @@ impl ResultTableWidget {
         Self {
             table,
             headers,
+            column_kinds: Arc::new(Mutex::new(Vec::new())),
             pending_rows: Arc::new(Mutex::new(Vec::new())),
             pending_widths: Arc::new(Mutex::new(Vec::new())),
             last_flush_epoch_ms: Arc::new(Mutex::new(Self::current_epoch_millis())),
@@ -5108,7 +5120,7 @@ impl ResultTableWidget {
         chars.all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '_' | '$' | '#'))
     }
 
-    fn quote_identifier_segment(text: &str) -> String {
+    pub(crate) fn quote_identifier_segment(text: &str) -> String {
         let trimmed = text.trim();
         if trimmed.is_empty() {
             return "\"\"".to_string();
@@ -5178,7 +5190,7 @@ impl ResultTableWidget {
         segments
     }
 
-    fn quote_qualified_identifier(name: &str) -> String {
+    pub(crate) fn quote_qualified_identifier(name: &str) -> String {
         let segments = Self::split_qualified_identifier(name);
         if segments.is_empty() {
             return Self::quote_identifier_segment(name);
@@ -7476,6 +7488,11 @@ impl ResultTableWidget {
             "Copy with Headers",
             "Copy All",
         ];
+        if Self::selection_has_exportable_columns(&table, headers, hidden_col_for_hit) {
+            menu_items.push("SQL Inserts");
+            menu_items.push("SQL Updates");
+            menu_items.push("Where Clause");
+        }
         if can_set_null {
             menu_items.push("Set Null");
         }
@@ -7522,6 +7539,24 @@ impl ResultTableWidget {
                     Self::schedule_context_action_callback(
                         context_action_callback,
                         ResultTableContextAction::CloseAll,
+                    );
+                }
+                "SQL Inserts" => {
+                    Self::schedule_context_action_callback(
+                        context_action_callback,
+                        ResultTableContextAction::CopySqlInserts,
+                    );
+                }
+                "SQL Updates" => {
+                    Self::schedule_context_action_callback(
+                        context_action_callback,
+                        ResultTableContextAction::CopySqlUpdates,
+                    );
+                }
+                "Where Clause" => {
+                    Self::schedule_context_action_callback(
+                        context_action_callback,
+                        ResultTableContextAction::CopyWhereClause,
                     );
                 }
                 "Set Null" => {
@@ -7879,6 +7914,7 @@ impl ResultTableWidget {
                 .headers
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner()) = vec!["Result".to_string()];
+            self.set_column_kinds(&[]);
             *self
                 .full_data
                 .lock()
@@ -7902,6 +7938,7 @@ impl ResultTableWidget {
                 .headers
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner()) = col_names;
+            self.set_column_kinds(&Self::result_column_kinds(result));
             self.refresh_auto_rowid_visibility();
             self.table.redraw();
             return;
@@ -7943,6 +7980,7 @@ impl ResultTableWidget {
             .headers
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = col_names;
+        self.set_column_kinds(&Self::result_column_kinds(result));
         self.refresh_auto_rowid_visibility();
         self.table.redraw();
     }
@@ -8052,6 +8090,7 @@ impl ResultTableWidget {
                 .map(|name| crate::db::ColumnInfo {
                     name,
                     data_type: String::new(),
+                    kind: crate::db::SqlValueKind::Unknown,
                 })
                 .collect(),
             row_count: rows.len(),
@@ -9169,6 +9208,187 @@ impl ResultTableWidget {
         Self::visible_headers(&headers, self.hidden_auto_rowid_col_value())
     }
 
+    fn result_column_kinds(result: &QueryResult) -> Vec<SqlValueKind> {
+        result.columns.iter().map(|column| column.kind).collect()
+    }
+
+    /// Columns that must never appear in generated SQL: the hidden auto-ROWID
+    /// column, a visible `ROWID` column (`INSERT`ing into it is not legal), the
+    /// edit snapshot column, and the MySQL edit-key aliases.
+    ///
+    /// A blank name counts too. `SET HEADING OFF` blanks every column name on
+    /// the way to the grid, and a nameless column cannot be written into an
+    /// INSERT column list or a WHERE predicate — better to export nothing than
+    /// to emit `INSERT INTO t ("", "")`.
+    fn is_internal_export_column(
+        headers: &[String],
+        index: usize,
+        hidden_col: Option<usize>,
+        rowid_col: Option<usize>,
+    ) -> bool {
+        if Some(index) == hidden_col || Some(index) == rowid_col {
+            return true;
+        }
+        let Some(name) = headers.get(index) else {
+            return true;
+        };
+        let normalized = Self::normalize_header_for_lookup(name);
+        normalized.is_empty()
+            || normalized == RESULT_EDIT_SNAPSHOT_COLUMN
+            || normalized.starts_with(MYSQL_EDIT_KEY_ALIAS_PREFIX)
+            || normalized == "SQ_INTERNAL_ROWID"
+    }
+
+    /// Whether the selection covers at least one column that can appear in
+    /// generated SQL. Gates the SQL export menu items so they never appear on a
+    /// selection that would produce nothing.
+    fn selection_has_exportable_columns(
+        table: &Table,
+        headers: &Arc<Mutex<Vec<String>>>,
+        hidden_col: Option<usize>,
+    ) -> bool {
+        let headers = headers
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let Some((_, col_left, _, col_right)) = Self::normalized_selection_bounds_with_limits(
+            table.get_selection(),
+            table.rows().max(0) as usize,
+            table.cols().max(0) as usize,
+        ) else {
+            return false;
+        };
+        let rowid_col = Self::find_rowid_column_index(&headers);
+        (col_left..=col_right)
+            .any(|index| !Self::is_internal_export_column(&headers, index, hidden_col, rowid_col))
+    }
+
+    /// Snapshot the current selection for the SQL export menu items.
+    ///
+    /// The grid does not know which connection produced it, so the caller
+    /// supplies `db_type` and the resolved base table.
+    #[doc(hidden)]
+    pub fn sql_export_selection(
+        &self,
+        db_type: crate::db::DatabaseType,
+        table: Option<String>,
+    ) -> Option<GridSqlSelection> {
+        let headers = self
+            .headers
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        let hidden_col = self.hidden_auto_rowid_col_value();
+        let rowid_col = Self::find_rowid_column_index(&headers);
+        let kinds = self
+            .column_kinds
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        // Any disagreement with the header list means the two drifted apart
+        // (a page transform removed a column, say). Fall back to "unknown" for
+        // every column rather than risk pairing a type with the wrong value.
+        let kinds_aligned = kinds.len() == headers.len();
+
+        let full_data = self
+            .full_data
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let (row_top, col_left, row_bot, col_right) =
+            Self::normalized_selection_bounds_with_limits(
+                self.table.get_selection(),
+                self.table.rows().max(0) as usize,
+                self.table.cols().max(0) as usize,
+            )?;
+
+        // `all_columns` keeps every exportable column so key columns outside the
+        // selection still have values; `selected_columns` indexes into it.
+        let mut all_columns: Vec<String> = Vec::with_capacity(headers.len());
+        let mut column_kinds: Vec<SqlValueKind> = Vec::with_capacity(headers.len());
+        let mut source_indices: Vec<usize> = Vec::with_capacity(headers.len());
+        for index in 0..headers.len() {
+            if Self::is_internal_export_column(&headers, index, hidden_col, rowid_col) {
+                continue;
+            }
+            all_columns.push(headers[index].clone());
+            column_kinds.push(if kinds_aligned {
+                kinds[index]
+            } else {
+                SqlValueKind::Unknown
+            });
+            source_indices.push(index);
+        }
+
+        let selected_columns: Vec<usize> = source_indices
+            .iter()
+            .enumerate()
+            .filter(|(_, source)| (col_left..=col_right).contains(*source))
+            .map(|(exported, _)| exported)
+            .collect();
+        if selected_columns.is_empty() {
+            return None;
+        }
+
+        let rows: Vec<Vec<String>> = (row_top..=row_bot)
+            .filter_map(|row| full_data.get(row))
+            .map(|row| {
+                source_indices
+                    .iter()
+                    .map(|source| row.get(*source).cloned().unwrap_or_default())
+                    .collect()
+            })
+            .collect();
+        if rows.is_empty() {
+            return None;
+        }
+
+        Some(GridSqlSelection {
+            db_type,
+            table,
+            all_columns,
+            column_kinds,
+            selected_columns,
+            rows,
+            null_text: self.current_null_text(),
+        })
+    }
+
+    /// The SQL text this grid was produced by, for base-table resolution.
+    pub(crate) fn source_sql_snapshot(&self) -> String {
+        self.source_sql
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+    }
+
+    /// Kinds to keep for `header_len` columns: all of them when the two agree,
+    /// nothing otherwise.
+    fn accepted_column_kinds(kinds: &[SqlValueKind], header_len: usize) -> Vec<SqlValueKind> {
+        if kinds.len() == header_len {
+            kinds.to_vec()
+        } else {
+            Vec::new()
+        }
+    }
+
+    /// Record the driver column types behind the current grid columns.
+    ///
+    /// A length that disagrees with `headers` is rejected outright rather than
+    /// zipped: assigning one column's type to another would silently generate
+    /// wrong SQL. Storing nothing means every column falls back to `Unknown`,
+    /// i.e. a quoted string literal, which is always safe.
+    pub fn set_column_kinds(&mut self, kinds: &[SqlValueKind]) {
+        let header_len = self
+            .headers
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .len();
+        let accepted = Self::accepted_column_kinds(kinds, header_len);
+        *self
+            .column_kinds
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = accepted;
+    }
+
     pub fn row_values(&self, row: usize) -> Option<Vec<String>> {
         self.full_data
             .lock()
@@ -9442,6 +9662,85 @@ mod row_edit_sql_tests {
         assert!(ResultTableWidget::sql_literal_from_input("=sysdate; delete from emp").is_err());
         assert!(ResultTableWidget::sql_literal_from_input("=sysdate --comment").is_err());
         assert!(ResultTableWidget::sql_literal_from_input("=/*hint*/sysdate").is_err());
+    }
+
+    #[test]
+    fn internal_export_columns_are_excluded_from_generated_sql() {
+        let headers = vec![
+            "ROWID".to_string(),
+            "ENAME".to_string(),
+            RESULT_EDIT_SNAPSHOT_COLUMN.to_string(),
+            format!("{}0", MYSQL_EDIT_KEY_ALIAS_PREFIX),
+            "SQ_INTERNAL_ROWID".to_string(),
+        ];
+        let rowid_col = ResultTableWidget::find_rowid_column_index(&headers);
+        let internal: Vec<bool> = (0..headers.len())
+            .map(|index| {
+                ResultTableWidget::is_internal_export_column(&headers, index, None, rowid_col)
+            })
+            .collect();
+        assert_eq!(internal, vec![true, false, true, true, true]);
+    }
+
+    #[test]
+    fn blank_column_names_are_excluded_from_generated_sql() {
+        // `SET HEADING OFF` blanks every name; exporting them would produce
+        // `INSERT INTO t ("", "")`.
+        let headers = vec![String::new(), "  ".to_string()];
+        assert!(ResultTableWidget::is_internal_export_column(
+            &headers, 0, None, None
+        ));
+        assert!(ResultTableWidget::is_internal_export_column(
+            &headers, 1, None, None
+        ));
+    }
+
+    #[test]
+    fn hidden_column_is_excluded_from_generated_sql() {
+        let headers = vec!["ROWID".to_string(), "ENAME".to_string()];
+        // Hidden auto-ROWID column, reported separately from the header scan.
+        assert!(ResultTableWidget::is_internal_export_column(
+            &headers,
+            0,
+            Some(0),
+            None
+        ));
+        assert!(!ResultTableWidget::is_internal_export_column(
+            &headers,
+            1,
+            Some(0),
+            None
+        ));
+    }
+
+    #[test]
+    fn quoted_internal_column_headers_are_still_excluded() {
+        let headers = vec![format!("\"{}\"", RESULT_EDIT_SNAPSHOT_COLUMN)];
+        assert!(ResultTableWidget::is_internal_export_column(
+            &headers, 0, None, None
+        ));
+    }
+
+    #[test]
+    fn out_of_range_export_column_is_treated_as_internal() {
+        let headers = vec!["ENAME".to_string()];
+        assert!(ResultTableWidget::is_internal_export_column(
+            &headers, 5, None, None
+        ));
+    }
+
+    #[test]
+    fn column_kinds_are_kept_only_when_they_match_the_headers() {
+        let kinds = vec![SqlValueKind::Number, SqlValueKind::String];
+        assert_eq!(
+            ResultTableWidget::accepted_column_kinds(&kinds, 2),
+            vec![SqlValueKind::Number, SqlValueKind::String]
+        );
+        // A mismatch must drop everything rather than pair a type with the
+        // wrong column.
+        assert!(ResultTableWidget::accepted_column_kinds(&kinds, 3).is_empty());
+        assert!(ResultTableWidget::accepted_column_kinds(&kinds, 1).is_empty());
+        assert!(ResultTableWidget::accepted_column_kinds(&[], 2).is_empty());
     }
 
     #[test]
@@ -12973,6 +13272,7 @@ UPDATE EMP SET ENAME = 'MILLER' WHERE ROWID = 'AAABBB';"
             vec![crate::db::ColumnInfo {
                 name: "EMPNO".to_string(),
                 data_type: "NUMBER".to_string(),
+                kind: crate::db::SqlValueKind::Unknown,
             }],
             3,
             Duration::from_millis(1),
@@ -14100,6 +14400,7 @@ mod tests {
             vec![crate::db::ColumnInfo {
                 name: "A".to_string(),
                 data_type: "NUMBER".to_string(),
+                kind: crate::db::SqlValueKind::Unknown,
             }],
             6,
             Duration::from_millis(1),
@@ -15336,6 +15637,7 @@ mod tests {
             columns: vec![crate::db::ColumnInfo {
                 name: "ENAME".to_string(),
                 data_type: "VARCHAR2".to_string(),
+                kind: crate::db::SqlValueKind::Unknown,
             }],
             rows: vec![vec!["SCOTT".to_string()]],
             row_count: 1,

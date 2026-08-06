@@ -8,7 +8,7 @@ use crate::utils::arithmetic::{safe_div, safe_rem};
 
 pub const RESULT_EDIT_SNAPSHOT_COLUMN: &str = "SQ_INTERNAL_EDIT_SNAPSHOT";
 const RESULT_EDIT_SNAPSHOT_PREFIX: &str = "\x1eSQ_EDIT_V1:";
-const MYSQL_EDIT_KEY_ALIAS_PREFIX: &str = "SQ_INTERNAL_EDIT_KEY_";
+pub(crate) const MYSQL_EDIT_KEY_ALIAS_PREFIX: &str = "SQ_INTERNAL_EDIT_KEY_";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ResultEditBackendPolicy {
@@ -1032,7 +1032,7 @@ fn quote_mysql_table(descriptor: &ResultEditDescriptor) -> String {
     )
 }
 
-fn quote_mysql_identifier(identifier: &str) -> String {
+pub(crate) fn quote_mysql_identifier(identifier: &str) -> String {
     format!("`{}`", identifier.replace('`', "``"))
 }
 

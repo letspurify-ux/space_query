@@ -27307,6 +27307,7 @@ END;"#;
                 index,
                 columns,
                 null_text: _,
+                ..
             } => {
                 assert_eq!(*index, 4);
                 assert_eq!(columns, &vec!["COL1".to_string()]);

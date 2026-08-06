@@ -54,6 +54,62 @@ duplicate locator, cancellation, or execution error rolls back the whole save
 (or only its savepoint inside an existing manual transaction), leaving the
 staged grid changes available for correction or retry.
 
+## Grid SQL export
+
+> Implementation: `src/ui/grid_sql_export.rs`, `src/ui/result_table.rs`,
+> `src/ui/main_window.rs`
+
+The Data Grid popup menu turns the selected cells into SQL on the clipboard,
+matching DataGrip's `SQL Inserts`, `SQL Updates`, and `Where Clause` extractors:
+
+| Item | Output |
+| --- | --- |
+| SQL Inserts | `INSERT INTO <table> (<selected columns>) VALUES (…);` per selected row |
+| SQL Updates | `UPDATE <table> SET <non-key columns> WHERE <primary key>;` per row |
+| Where Clause | AND within a row, OR between rows, `IN` for a single column |
+
+Only the selection is exported. Internal columns never appear: the hidden
+auto-`ROWID` column, a visible `ROWID`, `SQ_INTERNAL_EDIT_SNAPSHOT`,
+`SQ_INTERNAL_EDIT_KEY_*`, and blank names (which is what `SET HEADING OFF`
+produces). `SQL Updates` reads key values from the whole row, so a primary-key
+column outside the selection still identifies the row; with no usable key the
+WHERE clause is omitted and the status bar says so. An unresolvable base table
+renders as `MY_TABLE`.
+
+`SQL Inserts` and `Where Clause` are immediate. `SQL Updates` first reads the
+table's primary key through `ObjectBrowserWidget::load_primary_key_columns`, so
+it completes asynchronously via `FileActionResult::CopySqlToClipboard`.
+
+### Literals come from driver types, never value shapes
+
+Each backend classifies its own column-type enum into `SqlValueKind`
+(`src/db/query/types.rs`), carried to the grid on
+`QueryProgress::SelectStart { column_kinds }`. A kind list that disagrees with
+the header count is discarded rather than zipped, so a mismatch degrades to
+quoted strings instead of mislabelling a column.
+
+| Kind | Oracle | MySQL / MariaDB |
+| --- | --- | --- |
+| `Number`, `Boolean` | bare value | bare value |
+| `Temporal` | `TO_DATE` / `TO_TIMESTAMP` / `TO_TIMESTAMP_TZ` by rendered shape | quoted ISO text |
+| `Binary` | `HEXTORAW('…')` | quoted text (see below) |
+| `String`, `Unknown` | quoted, `''` escaped | quoted, `''` and `\\` escaped |
+
+Because the kind comes from metadata, a `VARCHAR2` holding `2024-01-01` stays a
+string and a zero-padded `00123` keeps its zeros.
+
+Known limits, all pre-existing display behaviour rather than export bugs:
+
+- MySQL/MariaDB binary values reach the grid through
+  `String::from_utf8_lossy`, so they cannot round-trip. `BINARY`/`VARBINARY`
+  also arrive as `VAR_STRING`; only `BLOB` classifies as `Binary`.
+- Oracle OCI renders LOBs as `[LOB]`; the thin driver carries real content.
+- A string whose text is `"NULL"` is indistinguishable from SQL NULL.
+- Oracle rejects string literals over 4000 bytes (32767 with extended string
+  size). Long values are emitted verbatim, never truncated.
+- Client-built grids (`PRINT`, `SHOW ERRORS`, `COMPILE ERRORS`, …) have no driver
+  types, so every value is quoted — correct, since they are text tables.
+
 ## Support panes
 
 | Section | Inner structure | Input API |
@@ -100,5 +156,16 @@ as compatibility surface, but those close methods currently return `false`.
 cargo test result_tabs --lib
 cargo test result_table --lib
 cargo test main_window --lib
+cargo test grid_sql_export --lib
 cargo test --test ui_dialog_guards
+
+# Real widget + real OS clipboard, no database needed.
+cargo run --bin verify_grid_sql_export
+
+# Live: real driver types and generated SQL executed on the server.
+# Run one Docker container at a time (MySQL and MariaDB both bind 3306).
+cargo run --bin verify_grid_sql_export_live thin
+cargo run --bin verify_grid_sql_export_live oci
+cargo run --bin verify_grid_sql_export_live mysql
+cargo run --bin verify_grid_sql_export_live mariadb
 ```

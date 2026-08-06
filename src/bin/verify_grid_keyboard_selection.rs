@@ -116,6 +116,7 @@ fn sample_result() -> QueryResult {
         .map(|idx| ColumnInfo {
             name: format!("COL{}", idx + 1),
             data_type: "VARCHAR2".into(),
+            kind: space_query::db::SqlValueKind::String,
         })
         .collect();
     let rows = (0..20)

@@ -14,7 +14,7 @@
 // Usage: cargo run --bin verify_grid_copy_csv
 
 use fltk::{app, prelude::*, window::Window};
-use space_query::db::{ColumnInfo, QueryResult};
+use space_query::db::{ColumnInfo, QueryResult, SqlValueKind};
 use space_query::ui::ResultTableWidget;
 use std::process::Command;
 use std::time::Duration;
@@ -29,10 +29,12 @@ fn sample_result() -> QueryResult {
             ColumnInfo {
                 name: "이름".into(),
                 data_type: "VARCHAR2".into(),
+                kind: SqlValueKind::String,
             },
             ColumnInfo {
                 name: "내용".into(),
                 data_type: "CLOB".into(),
+                kind: SqlValueKind::String,
             },
         ],
         rows: vec![

@@ -18,7 +18,7 @@ use crate::utils::logging;
 use super::script::MysqlDelimitedStatementState;
 use super::{
     result_messages, ColumnInfo, ProcedureArgument, QueryCell, QueryResult, ResolvedBind,
-    ScriptItem, StatementResultKind, ToolCommand,
+    ScriptItem, SqlValueKind, StatementResultKind, ToolCommand,
 };
 
 pub struct QueryExecutor;
@@ -183,6 +183,45 @@ impl QueryExecutor {
             "ROWID".to_string()
         } else {
             name.to_string()
+        }
+    }
+
+    /// Classify an OCI column type for SQL literal generation.
+    ///
+    /// Exhaustive on purpose: when `OracleType` gains a variant the compiler
+    /// forces a decision here instead of silently defaulting.
+    pub(crate) fn oracle_value_kind(oracle_type: &OracleType) -> SqlValueKind {
+        match oracle_type {
+            OracleType::Varchar2(_)
+            | OracleType::NVarchar2(_)
+            | OracleType::Char(_)
+            | OracleType::NChar(_)
+            | OracleType::Rowid
+            | OracleType::CLOB
+            | OracleType::NCLOB
+            | OracleType::Long
+            | OracleType::Json
+            | OracleType::Xml => SqlValueKind::String,
+            OracleType::Number(_, _)
+            | OracleType::Float(_)
+            | OracleType::BinaryFloat
+            | OracleType::BinaryDouble
+            | OracleType::Int64
+            | OracleType::UInt64 => SqlValueKind::Number,
+            OracleType::Boolean => SqlValueKind::Boolean,
+            OracleType::Date
+            | OracleType::Timestamp(_)
+            | OracleType::TimestampTZ(_)
+            | OracleType::TimestampLTZ(_)
+            | OracleType::IntervalDS(_, _)
+            | OracleType::IntervalYM(_) => SqlValueKind::Temporal,
+            OracleType::Raw(_) | OracleType::LongRaw => SqlValueKind::Binary,
+            // Rendered as a placeholder or JSON that no literal can
+            // reconstruct, so quoting the displayed text is the honest answer.
+            OracleType::BLOB
+            | OracleType::BFILE
+            | OracleType::RefCursor
+            | OracleType::Object(_) => SqlValueKind::Unknown,
         }
     }
 
@@ -2864,6 +2903,7 @@ impl QueryExecutor {
                     normalize_internal_rowid_alias,
                 ),
                 data_type: format!("{:?}", col.oracle_type()),
+                kind: Self::oracle_value_kind(col.oracle_type()),
             })
             .collect();
         let column_count = column_info.len();
@@ -2965,6 +3005,7 @@ impl QueryExecutor {
                     normalize_internal_rowid_alias,
                 ),
                 data_type: format!("{:?}", col.oracle_type()),
+                kind: Self::oracle_value_kind(col.oracle_type()),
             })
             .collect();
         let column_count = column_info.len();
@@ -3079,6 +3120,7 @@ impl QueryExecutor {
                     normalize_internal_rowid_alias,
                 ),
                 data_type: format!("{:?}", col.oracle_type()),
+                kind: Self::oracle_value_kind(col.oracle_type()),
             })
             .collect();
         let column_count = column_info.len();
@@ -3151,6 +3193,7 @@ impl QueryExecutor {
                     normalize_internal_rowid_alias,
                 ),
                 data_type: format!("{:?}", col.oracle_type()),
+                kind: Self::oracle_value_kind(col.oracle_type()),
             })
             .collect();
         Ok((result_set, column_info))
@@ -3181,6 +3224,7 @@ impl QueryExecutor {
             .map(|col| ColumnInfo {
                 name: Self::normalize_result_column_name(col.name(), false),
                 data_type: format!("{:?}", col.oracle_type()),
+                kind: Self::oracle_value_kind(col.oracle_type()),
             })
             .collect();
         let column_count = column_info.len();
@@ -4215,46 +4259,57 @@ ORDER BY
             ColumnInfo {
                 name: "INST_ID".to_string(),
                 data_type: "NUMBER".to_string(),
+                kind: crate::db::SqlValueKind::Unknown,
             },
             ColumnInfo {
                 name: "SID".to_string(),
                 data_type: "NUMBER".to_string(),
+                kind: crate::db::SqlValueKind::Unknown,
             },
             ColumnInfo {
                 name: "SERIAL#".to_string(),
                 data_type: "NUMBER".to_string(),
+                kind: crate::db::SqlValueKind::Unknown,
             },
             ColumnInfo {
                 name: "USERNAME".to_string(),
                 data_type: "VARCHAR2".to_string(),
+                kind: crate::db::SqlValueKind::Unknown,
             },
             ColumnInfo {
                 name: "STATUS".to_string(),
                 data_type: "VARCHAR2".to_string(),
+                kind: crate::db::SqlValueKind::Unknown,
             },
             ColumnInfo {
                 name: "WAIT_EVENT".to_string(),
                 data_type: "VARCHAR2".to_string(),
+                kind: crate::db::SqlValueKind::Unknown,
             },
             ColumnInfo {
                 name: "WAIT_SECS".to_string(),
                 data_type: "NUMBER".to_string(),
+                kind: crate::db::SqlValueKind::Unknown,
             },
             ColumnInfo {
                 name: "BLOCKING_SID".to_string(),
                 data_type: "NUMBER".to_string(),
+                kind: crate::db::SqlValueKind::Unknown,
             },
             ColumnInfo {
                 name: "BLOCKING_SERIAL#".to_string(),
                 data_type: "NUMBER".to_string(),
+                kind: crate::db::SqlValueKind::Unknown,
             },
             ColumnInfo {
                 name: "LOCK_STATE".to_string(),
                 data_type: "VARCHAR2".to_string(),
+                kind: crate::db::SqlValueKind::Unknown,
             },
             ColumnInfo {
                 name: "LOCK_TYPE".to_string(),
                 data_type: "VARCHAR2".to_string(),
+                kind: crate::db::SqlValueKind::Unknown,
             },
         ];
 
@@ -4368,54 +4423,67 @@ ORDER BY
             ColumnInfo {
                 name: "INST_ID".to_string(),
                 data_type: "NUMBER".to_string(),
+                kind: crate::db::SqlValueKind::Unknown,
             },
             ColumnInfo {
                 name: "SID".to_string(),
                 data_type: "NUMBER".to_string(),
+                kind: crate::db::SqlValueKind::Unknown,
             },
             ColumnInfo {
                 name: "SERIAL#".to_string(),
                 data_type: "NUMBER".to_string(),
+                kind: crate::db::SqlValueKind::Unknown,
             },
             ColumnInfo {
                 name: "USERNAME".to_string(),
                 data_type: "VARCHAR2".to_string(),
+                kind: crate::db::SqlValueKind::Unknown,
             },
             ColumnInfo {
                 name: "STATUS".to_string(),
                 data_type: "VARCHAR2".to_string(),
+                kind: crate::db::SqlValueKind::Unknown,
             },
             ColumnInfo {
                 name: "ELAPSED_SECS".to_string(),
                 data_type: "NUMBER".to_string(),
+                kind: crate::db::SqlValueKind::Unknown,
             },
             ColumnInfo {
                 name: "WAIT_EVENT".to_string(),
                 data_type: "VARCHAR2".to_string(),
+                kind: crate::db::SqlValueKind::Unknown,
             },
             ColumnInfo {
                 name: "SQL_ID".to_string(),
                 data_type: "VARCHAR2".to_string(),
+                kind: crate::db::SqlValueKind::Unknown,
             },
             ColumnInfo {
                 name: "SQL_ELAPSED_SECS".to_string(),
                 data_type: "NUMBER".to_string(),
+                kind: crate::db::SqlValueKind::Unknown,
             },
             ColumnInfo {
                 name: "BUFFER_GETS".to_string(),
                 data_type: "NUMBER".to_string(),
+                kind: crate::db::SqlValueKind::Unknown,
             },
             ColumnInfo {
                 name: "DISK_READS".to_string(),
                 data_type: "NUMBER".to_string(),
+                kind: crate::db::SqlValueKind::Unknown,
             },
             ColumnInfo {
                 name: "PROGRAM".to_string(),
                 data_type: "VARCHAR2".to_string(),
+                kind: crate::db::SqlValueKind::Unknown,
             },
             ColumnInfo {
                 name: "SQL_TEXT".to_string(),
                 data_type: "VARCHAR2".to_string(),
+                kind: crate::db::SqlValueKind::Unknown,
             },
         ];
 
@@ -4482,6 +4550,7 @@ ORDER BY
             vec![ColumnInfo {
                 name: "PLAN_TABLE_OUTPUT".to_string(),
                 data_type: "VARCHAR2".to_string(),
+                kind: SqlValueKind::Unknown,
             }],
             result_rows,
             start.elapsed(),
@@ -4652,34 +4721,42 @@ WHERE ROWNUM <= 5
                 ColumnInfo {
                     name: "INST_ID".to_string(),
                     data_type: "NUMBER".to_string(),
+                    kind: crate::db::SqlValueKind::Unknown,
                 },
                 ColumnInfo {
                     name: "SQL_ID".to_string(),
                     data_type: "VARCHAR2".to_string(),
+                    kind: crate::db::SqlValueKind::Unknown,
                 },
                 ColumnInfo {
                     name: "CHILD_NUMBER".to_string(),
                     data_type: "NUMBER".to_string(),
+                    kind: crate::db::SqlValueKind::Unknown,
                 },
                 ColumnInfo {
                     name: "PARSING_SCHEMA_NAME".to_string(),
                     data_type: "VARCHAR2".to_string(),
+                    kind: crate::db::SqlValueKind::Unknown,
                 },
                 ColumnInfo {
                     name: "LAST_ACTIVE_TIME".to_string(),
                     data_type: "DATE".to_string(),
+                    kind: crate::db::SqlValueKind::Unknown,
                 },
                 ColumnInfo {
                     name: "ELAPSED_SECS".to_string(),
                     data_type: "NUMBER".to_string(),
+                    kind: crate::db::SqlValueKind::Unknown,
                 },
                 ColumnInfo {
                     name: "EXECUTIONS".to_string(),
                     data_type: "NUMBER".to_string(),
+                    kind: crate::db::SqlValueKind::Unknown,
                 },
                 ColumnInfo {
                     name: "SQL_TEXT".to_string(),
                     data_type: "CLOB".to_string(),
+                    kind: crate::db::SqlValueKind::Unknown,
                 },
             ],
             result_rows,
@@ -4822,58 +4899,72 @@ WHERE NVL(m.elapsed_time, 0) >= :min_elapsed_us
             ColumnInfo {
                 name: "INST_ID".to_string(),
                 data_type: "NUMBER".to_string(),
+                kind: crate::db::SqlValueKind::Unknown,
             },
             ColumnInfo {
                 name: "SID".to_string(),
                 data_type: "NUMBER".to_string(),
+                kind: crate::db::SqlValueKind::Unknown,
             },
             ColumnInfo {
                 name: "SERIAL#".to_string(),
                 data_type: "NUMBER".to_string(),
+                kind: crate::db::SqlValueKind::Unknown,
             },
             ColumnInfo {
                 name: "STATUS".to_string(),
                 data_type: "VARCHAR2".to_string(),
+                kind: crate::db::SqlValueKind::Unknown,
             },
             ColumnInfo {
                 name: "USERNAME".to_string(),
                 data_type: "VARCHAR2".to_string(),
+                kind: crate::db::SqlValueKind::Unknown,
             },
             ColumnInfo {
                 name: "SQL_ID".to_string(),
                 data_type: "VARCHAR2".to_string(),
+                kind: crate::db::SqlValueKind::Unknown,
             },
             ColumnInfo {
                 name: "SQL_EXEC_ID".to_string(),
                 data_type: "NUMBER".to_string(),
+                kind: crate::db::SqlValueKind::Unknown,
             },
             ColumnInfo {
                 name: "SQL_EXEC_START".to_string(),
                 data_type: "DATE".to_string(),
+                kind: crate::db::SqlValueKind::Unknown,
             },
             ColumnInfo {
                 name: "ELAPSED_SECS".to_string(),
                 data_type: "NUMBER".to_string(),
+                kind: crate::db::SqlValueKind::Unknown,
             },
             ColumnInfo {
                 name: "CPU_SECS".to_string(),
                 data_type: "NUMBER".to_string(),
+                kind: crate::db::SqlValueKind::Unknown,
             },
             ColumnInfo {
                 name: "IO_WAIT_SECS".to_string(),
                 data_type: "NUMBER".to_string(),
+                kind: crate::db::SqlValueKind::Unknown,
             },
             ColumnInfo {
                 name: "BUFFER_GETS".to_string(),
                 data_type: "NUMBER".to_string(),
+                kind: crate::db::SqlValueKind::Unknown,
             },
             ColumnInfo {
                 name: "DISK_READS".to_string(),
                 data_type: "NUMBER".to_string(),
+                kind: crate::db::SqlValueKind::Unknown,
             },
             ColumnInfo {
                 name: "SQL_TEXT".to_string(),
                 data_type: "VARCHAR2".to_string(),
+                kind: crate::db::SqlValueKind::Unknown,
             },
         ];
 
@@ -9916,7 +10007,11 @@ impl ObjectBrowser {
                     return Err(err);
                 }
             };
-            columns.push(ColumnInfo { name, data_type });
+            columns.push(ColumnInfo {
+                name,
+                data_type,
+                kind: SqlValueKind::Unknown,
+            });
         }
 
         Ok(columns)
@@ -9944,6 +10039,7 @@ impl ObjectBrowser {
             .map(|row| ColumnInfo {
                 name: row.first().cloned().unwrap_or_default(),
                 data_type: row.get(1).cloned().unwrap_or_default(),
+                kind: SqlValueKind::Unknown,
             })
             .collect())
     }

@@ -2,11 +2,32 @@ use std::time::Duration;
 
 use crate::db::session::{BindDataType, ComputeMode};
 
+/// How a column's displayed text must be rendered when it is spliced into
+/// generated SQL (result-grid "SQL Inserts" / "SQL Updates" / "Where Clause").
+///
+/// Every driver classifies its own column-type enum into one of these, so the
+/// generator never has to guess a type from the value text. `Unknown` is the
+/// safe fallback: it renders as a quoted string literal, which is also the
+/// correct answer for client-built text grids (`PRINT`, `SHOW ERRORS`, …).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum SqlValueKind {
+    #[default]
+    Unknown,
+    String,
+    Number,
+    Boolean,
+    /// DATE / TIMESTAMP / TIMESTAMP WITH TIME ZONE / TIME.
+    Temporal,
+    /// Oracle RAW / LONG RAW; MySQL BINARY / BLOB.
+    Binary,
+}
+
 #[derive(Debug, Clone)]
 pub struct ColumnInfo {
     pub name: String,
     #[allow(dead_code)]
     pub data_type: String,
+    pub kind: SqlValueKind,
 }
 
 const QUERY_NULL_SENTINEL: &str = "\x1FQUERY_TOOL_NULL";

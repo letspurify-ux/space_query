@@ -44,11 +44,11 @@ use crate::ui::theme;
 use crate::ui::{
     font_settings, show_settings_dialog, ConnectionDialog, FindReplaceDialog, FontSettings,
     HighlightData, IntellisenseData, MenuBarBuilder, MultiObjectBrowserWidget,
-    ObjectBrowserMetadataSnapshot, QualifiedMemberKind, QueryCancelOutcome, QueryHistoryDialog,
-    QueryOperationToken, QueryProgress, QueryTabId, QueryTabsWidget, ResultMessageKind,
-    ResultTabCloseTarget, ResultTabId, ResultTabRequest, ResultTabStatus, ResultTabsWidget,
-    SqlAction, SqlEditorContextAction, SqlEditorWidget, TableBrowseExecuteCallback,
-    TableBrowseNavigation, TableBrowsePageRequest, TableBrowseTarget,
+    ObjectBrowserMetadataSnapshot, ObjectBrowserWidget, QualifiedMemberKind, QueryCancelOutcome,
+    QueryHistoryDialog, QueryOperationToken, QueryProgress, QueryTabId, QueryTabsWidget,
+    ResultMessageKind, ResultTabCloseTarget, ResultTabId, ResultTabRequest, ResultTabStatus,
+    ResultTabsWidget, SqlAction, SqlEditorContextAction, SqlEditorWidget,
+    TableBrowseExecuteCallback, TableBrowseNavigation, TableBrowsePageRequest, TableBrowseTarget,
 };
 use crate::utils::arithmetic::{safe_div, safe_div_f64_to_usize, safe_rem};
 use crate::utils::{malloc_trim_process, AppConfig, QueryHistory};
@@ -4065,6 +4065,12 @@ enum FileActionResult {
         row_count: usize,
         result: Result<(), String>,
     },
+    /// Generated SQL from a result-grid export that had to read metadata first.
+    /// Carries `(sql, status message)`; the copy itself happens on the main
+    /// thread when this is drained.
+    CopySqlToClipboard {
+        result: Result<(String, String), String>,
+    },
 }
 
 enum SaveTabOutcome {
@@ -4584,6 +4590,7 @@ fn session_activity_column(name: &str, data_type: &str) -> ColumnInfo {
     ColumnInfo {
         name: name.to_string(),
         data_type: data_type.to_string(),
+        kind: crate::db::SqlValueKind::Unknown,
     }
 }
 
@@ -4942,6 +4949,112 @@ impl MainWindow {
             });
             app::awake();
         });
+    }
+
+    /// Copy the visible grid's selection to the clipboard as SQL.
+    ///
+    /// `SQL Inserts` and `Where Clause` are immediate. `SQL Updates` needs the
+    /// table's primary key for its WHERE clause, so it reads metadata on a worker
+    /// thread and finishes when `FileActionResult::CopySqlToClipboard` is drained.
+    fn copy_result_selection_as_sql(
+        state: &Arc<Mutex<AppState>>,
+        file_sender: &std::sync::mpsc::Sender<FileActionResult>,
+        action: ResultTableContextAction,
+    ) {
+        let mut s = state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+
+        let Some(runtime) = s.active_connection_runtime() else {
+            return;
+        };
+        let db_type = runtime.sanitized_info().db_type;
+        let Some((mut selection, source_sql)) = s.result_tabs.sql_export_context(db_type) else {
+            return;
+        };
+        // The grid-edit descriptor already names the exact base table. Otherwise
+        // fall back to resolving it from the SQL that produced the grid, which
+        // handles CTEs and `alias.ROWID` select lists.
+        if selection.table.is_none() {
+            selection.table =
+                crate::ui::sql_editor::query_text::resolve_edit_target_table(&source_sql)
+                    .ok()
+                    .filter(|table| !table.trim().is_empty());
+        }
+        let row_count = selection.rows.len();
+
+        let (sql, message) = match action {
+            ResultTableContextAction::CopySqlInserts => (
+                crate::ui::grid_sql_export::build_sql_inserts(&selection),
+                format!("Copied {row_count} INSERT statements to clipboard"),
+            ),
+            ResultTableContextAction::CopyWhereClause => (
+                crate::ui::grid_sql_export::build_where_clause(&selection),
+                "Copied WHERE clause to clipboard".to_string(),
+            ),
+            ResultTableContextAction::CopySqlUpdates => {
+                let Some(table) = selection.table.clone() else {
+                    // No base table means no primary key to look up either.
+                    let sql = crate::ui::grid_sql_export::build_sql_updates(&selection, &[]);
+                    let message = format!(
+                        "Copied {row_count} UPDATE statements (table unknown — WHERE omitted)"
+                    );
+                    Self::finish_sql_clipboard_copy(&mut s, &sql, &message);
+                    return;
+                };
+                let connection = runtime.connection();
+                let scope = s
+                    .active_connection_id()
+                    .and_then(|id| s.object_browser.selected_scope_for_connection(id));
+                let sender = file_sender.clone();
+                drop(s);
+                thread::spawn(move || {
+                    let keys = ObjectBrowserWidget::load_primary_key_columns(
+                        &connection,
+                        scope.as_deref(),
+                        &table,
+                    );
+                    let result = match keys {
+                        Ok(keys) => {
+                            let sql =
+                                crate::ui::grid_sql_export::build_sql_updates(&selection, &keys);
+                            let message = if keys.is_empty() {
+                                format!(
+                                    "Copied {row_count} UPDATE statements \
+                                     (no primary key — WHERE omitted)"
+                                )
+                            } else {
+                                format!("Copied {row_count} UPDATE statements to clipboard")
+                            };
+                            Ok((sql, message))
+                        }
+                        Err(err) => Err(err),
+                    };
+                    let _ = sender.send(FileActionResult::CopySqlToClipboard { result });
+                    app::awake();
+                });
+                return;
+            }
+            _ => return,
+        };
+
+        Self::finish_sql_clipboard_copy(&mut s, &sql, &message);
+    }
+
+    /// Put generated SQL on the clipboard and report it in the status bar.
+    fn finish_sql_clipboard_copy(state: &mut AppState, sql: &str, message: &str) {
+        if sql.is_empty() {
+            return;
+        }
+        app::copy(sql);
+        let conn_info = state
+            .connection_info
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        state
+            .status_bar
+            .set_label(&format_status(message, &conn_info));
     }
 
     fn close_current_result_tab(state: &Arc<Mutex<AppState>>) {
@@ -8429,6 +8542,15 @@ impl MainWindow {
                         ResultTableContextAction::CloseAll => {
                             MainWindow::close_all_result_tabs(&state_for_context);
                         }
+                        ResultTableContextAction::CopySqlInserts
+                        | ResultTableContextAction::CopySqlUpdates
+                        | ResultTableContextAction::CopyWhereClause => {
+                            MainWindow::copy_result_selection_as_sql(
+                                &state_for_context,
+                                &file_sender,
+                                action,
+                            );
+                        }
                     }
                 },
             )
@@ -8782,6 +8904,7 @@ impl MainWindow {
                 QueryProgress::SelectStart {
                     index,
                     columns,
+                    column_kinds,
                     null_text,
                 } => {
                     if columns.is_empty() {
@@ -8838,7 +8961,12 @@ impl MainWindow {
                     s.refresh_result_edit_controls();
                     drop(s);
                     result_tabs.ensure_statement_tab_by_id(result_tab_id, "Result", select_tab);
-                    result_tabs.start_streaming_by_id(result_tab_id, &columns, &null_text);
+                    result_tabs.start_streaming_by_id(
+                        result_tab_id,
+                        &columns,
+                        &column_kinds,
+                        &null_text,
+                    );
                     if let Some(session_id) = lazy_fetch_session {
                         result_tabs.set_lazy_fetch_session_by_id(result_tab_id, session_id);
                     }
@@ -12508,6 +12636,19 @@ impl MainWindow {
                                             Some(format!("Failed to export CSV: {}", err));
                                     }
                                 },
+                                FileActionResult::CopySqlToClipboard { result } => match result {
+                                    Ok((sql, message)) => {
+                                        MainWindow::finish_sql_clipboard_copy(
+                                            &mut s, &sql, &message,
+                                        );
+                                    }
+                                    Err(err) => {
+                                        deferred_alert = Some(format!(
+                                            "Failed to read the primary key for SQL Updates: {}",
+                                            err
+                                        ));
+                                    }
+                                },
                             }
 
                             drop(s);
@@ -14579,6 +14720,7 @@ mod tests {
         ColumnInfo {
             name: name.to_string(),
             data_type: "NUMBER".to_string(),
+            kind: crate::db::SqlValueKind::Unknown,
         }
     }
 
@@ -14589,6 +14731,7 @@ mod tests {
             QueryProgress::SelectStart {
                 index: 0,
                 columns: vec!["VALUE".to_string()],
+                column_kinds: Vec::new(),
                 null_text: "<NULL>".to_string(),
             },
             &[ResultPaneRoute::DataGrid],
@@ -14732,6 +14875,7 @@ mod tests {
             QueryProgress::SelectStart {
                 index: 0,
                 columns: Vec::new(),
+                column_kinds: Vec::new(),
                 null_text: "<NULL>".to_string(),
             },
             &[],
@@ -15577,7 +15721,7 @@ mod tests {
                 .ensure_statement_tab_by_id(result_tab_id, "Result 1", true);
             guard
                 .result_tabs
-                .start_streaming_by_id(result_tab_id, &["A".to_string()], "NULL");
+                .start_streaming_by_id(result_tab_id, &["A".to_string()], &[], "NULL");
             guard
                 .result_tabs
                 .append_rows_by_id(result_tab_id, vec![vec!["1".to_string()]]);

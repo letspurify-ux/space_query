@@ -11379,6 +11379,7 @@ fn test_summarize_batch_results_marks_failure_when_select_batch_has_errors() {
         vec![ColumnInfo {
             name: "DUMMY".to_string(),
             data_type: "VARCHAR2".to_string(),
+            kind: crate::db::SqlValueKind::Unknown,
         }],
         vec![vec!["X".to_string()]],
         std::time::Duration::from_millis(2),

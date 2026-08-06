@@ -455,6 +455,11 @@ pub enum QueryProgress {
     SelectStart {
         index: usize,
         columns: Vec<String>,
+        /// Literal-generation kind per entry of `columns`, in the same order.
+        /// Empty when the producer has no driver metadata (client-built text
+        /// grids such as `PRINT` or `SHOW ERRORS`); the grid then treats every
+        /// column as `Unknown`, which renders as a quoted string.
+        column_kinds: Vec<crate::db::SqlValueKind>,
         null_text: String,
     },
     ResultEditMetadata {
@@ -4372,10 +4377,12 @@ impl SqlEditorWidget {
                 ColumnInfo {
                     name: "Line".to_string(),
                     data_type: "NUMBER".to_string(),
+                    kind: crate::db::SqlValueKind::Unknown,
                 },
                 ColumnInfo {
                     name: "Text".to_string(),
                     data_type: "VARCHAR2".to_string(),
+                    kind: crate::db::SqlValueKind::Unknown,
                 },
             ],
             row_count: rows.len(),
@@ -4408,6 +4415,7 @@ impl SqlEditorWidget {
                 columns: vec![ColumnInfo {
                     name: "Text".to_string(),
                     data_type: "VARCHAR2".to_string(),
+                    kind: crate::db::SqlValueKind::Unknown,
                 }],
                 row_count: rows.len(),
                 rows,
@@ -4448,18 +4456,22 @@ impl SqlEditorWidget {
                 ColumnInfo {
                     name: "Column Name".to_string(),
                     data_type: "VARCHAR2".to_string(),
+                    kind: crate::db::SqlValueKind::Unknown,
                 },
                 ColumnInfo {
                     name: "Data Type".to_string(),
                     data_type: "VARCHAR2".to_string(),
+                    kind: crate::db::SqlValueKind::Unknown,
                 },
                 ColumnInfo {
                     name: "Nullable".to_string(),
                     data_type: "VARCHAR2".to_string(),
+                    kind: crate::db::SqlValueKind::Unknown,
                 },
                 ColumnInfo {
                     name: "PK".to_string(),
                     data_type: "VARCHAR2".to_string(),
+                    kind: crate::db::SqlValueKind::Unknown,
                 },
             ],
             row_count: rows.len(),

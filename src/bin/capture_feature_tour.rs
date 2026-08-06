@@ -260,6 +260,7 @@ fn make_result(columns: &[(&str, &str)], rows: &[&[&str]], sql: &str) -> QueryRe
             .map(|(name, data_type)| ColumnInfo {
                 name: (*name).to_string(),
                 data_type: (*data_type).to_string(),
+                kind: space_query::db::SqlValueKind::Unknown,
             })
             .collect(),
         rows: rows

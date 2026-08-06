@@ -2999,6 +2999,47 @@ impl ObjectBrowserWidget {
         });
     }
 
+    /// Primary-key column names of `table_name`, in key order.
+    ///
+    /// Blocking: callers run it on a worker thread. Used by the result grid's
+    /// "SQL Updates" export to build the WHERE clause. Goes through the same
+    /// per-DB behavior the object browser uses for table structure, so Oracle
+    /// (OCI and thin), MySQL, and MariaDB all resolve the real key.
+    #[doc(hidden)]
+    pub fn load_primary_key_columns(
+        connection: &SharedConnection,
+        selected_scope: Option<&str>,
+        table_name: &str,
+    ) -> Result<Vec<String>, String> {
+        // A qualified name carries its own schema, which the per-DB loaders take
+        // as the scope rather than as part of the table name.
+        let (scope, table_name) = match table_name.trim().rsplit_once('.') {
+            Some((schema, table)) if !schema.trim().is_empty() && !table.trim().is_empty() => {
+                (Some(schema.trim().to_string()), table.trim().to_string())
+            }
+            _ => (
+                selected_scope.map(str::to_string),
+                table_name.trim().to_string(),
+            ),
+        };
+        let activity = format!("Reading primary key of {}", table_name);
+        let columns =
+            Self::with_pooled_object_session(
+                connection,
+                scope.as_deref(),
+                activity,
+                |context, session| {
+                    object_browser_behavior_for(context.connection_info.db_type)
+                        .load_table_structure(context, session, scope.as_deref(), &table_name)
+                },
+            )?;
+        Ok(columns
+            .into_iter()
+            .filter(|column| column.is_primary_key)
+            .map(|column| column.name)
+            .collect())
+    }
+
     fn browse_target_for_object(
         object_name: &str,
         db_type: crate::db::DatabaseType,
@@ -5747,6 +5788,7 @@ impl ObjectBrowserWidget {
         ColumnInfo {
             name: name.to_string(),
             data_type: data_type.to_string(),
+            kind: crate::db::SqlValueKind::Unknown,
         }
     }
 
