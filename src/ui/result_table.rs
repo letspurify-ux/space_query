@@ -28,6 +28,7 @@ use crate::ui::constants::*;
 use crate::ui::font_settings::{
     configured_result_font_size, configured_result_profile, FontProfile,
 };
+use crate::ui::grid_sort::{compare_cell_values, NullOrdering, SortColumn};
 use crate::ui::grid_sql_export::GridSqlSelection;
 use crate::ui::sql_editor::LazyFetchRequest;
 use crate::ui::theme;
@@ -101,6 +102,13 @@ pub type ResultGridEditExecuteCallback =
 pub type LazyFetchCallback = Arc<Mutex<Option<Box<dyn FnMut(u64, LazyFetchRequest) -> bool>>>>;
 pub type ResultTableContextActionCallback =
     Arc<Mutex<Option<Box<dyn FnMut(ResultTableContextAction)>>>>;
+/// Hands a header-sort click to the server instead of sorting the fetched rows.
+///
+/// Installed only on a result that carries a filter bar. Takes the clicked
+/// column name and whether the click asked for ascending order, and returns
+/// true when it took the sort — false falls back to the local sort, so a grid
+/// whose tab can no longer re-query still orders.
+pub type HeaderSortRedirectCallback = Arc<Mutex<Option<Box<dyn FnMut(String, bool) -> bool>>>>;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ResultTableContextAction {
@@ -283,6 +291,11 @@ pub struct ResultTableWidget {
     /// menu items. Empty means "no driver metadata": every column is treated as
     /// `Unknown`, which renders as a quoted string literal.
     column_kinds: Arc<Mutex<Vec<SqlValueKind>>>,
+    /// NULL placement for the local header sort, adopted from the backend that
+    /// produced the result.
+    sort_null_ordering: Arc<Mutex<NullOrdering>>,
+    /// Set when the tab can re-query, so the header sort goes to the server.
+    header_sort_redirect: HeaderSortRedirectCallback,
     /// Buffer for pending rows during streaming
     pending_rows: Arc<Mutex<Vec<Vec<String>>>>,
     /// Pending column width updates
@@ -753,33 +766,93 @@ impl ResultTableWidget {
         }
     }
 
-    fn parse_sort_number(value: &str) -> Option<f64> {
-        let trimmed = value.trim();
-        if trimmed.is_empty() {
-            return None;
+    /// Where NULLs go on an ascending local sort until the connection that
+    /// produced the result says otherwise.
+    ///
+    /// This matches what the grid has always done — an empty cell compared as
+    /// text sorts ahead of everything — so a result installed by a path that
+    /// does not yet report its backend keeps its previous order rather than
+    /// silently flipping. See docs_items/item_list.md appendix B.2 defect 3.
+    const DEFAULT_SORT_NULL_ORDERING: NullOrdering = NullOrdering::FirstOnAscending;
+
+    /// Adopt the NULL ordering of the backend that produced this result, so a
+    /// locally sorted column lands where the server would have put it.
+    pub(crate) fn set_sort_null_ordering(&mut self, ordering: NullOrdering) {
+        *self
+            .sort_null_ordering
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = ordering;
+    }
+
+    /// Send header sorts to the server for a result that can be re-queried.
+    pub(crate) fn set_header_sort_redirect(&mut self, callback: HeaderSortRedirectCallback) {
+        let taken = callback
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take();
+        *self
+            .header_sort_redirect
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = taken;
+    }
+
+    /// Offer the sort to the server. Returns true when it was taken, in which
+    /// case the rows on screen are left alone — the re-query replaces them.
+    ///
+    /// Columns with no usable name (the hidden ROWID helper, or headers blanked
+    /// by `SET HEADING OFF`) cannot appear in an `ORDER BY`, so those keep
+    /// sorting locally.
+    fn try_redirect_header_sort(
+        headers: &Arc<Mutex<Vec<String>>>,
+        redirect: &HeaderSortRedirectCallback,
+        col_idx: usize,
+        direction: SortDirection,
+    ) -> bool {
+        let column = headers
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(col_idx)
+            .map(|name| name.trim().to_string())
+            .unwrap_or_default();
+        if column.is_empty() {
+            return false;
         }
-        let parsed = trimmed.parse::<f64>().ok()?;
-        if !parsed.is_finite() {
-            return None;
+        let mut guard = redirect
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        match guard.as_mut() {
+            Some(callback) => callback(column, direction == SortDirection::Ascending),
+            None => false,
         }
-        Some(parsed)
+    }
+
+    fn sort_column_for(
+        column_kinds: &[SqlValueKind],
+        col_idx: usize,
+        nulls: NullOrdering,
+    ) -> SortColumn {
+        SortColumn {
+            kind: column_kinds.get(col_idx).copied().unwrap_or_default(),
+            nulls,
+        }
     }
 
     fn compare_row_values_for_sort(
         left: &[String],
         right: &[String],
         col_idx: usize,
+        column: SortColumn,
+        null_text: &str,
     ) -> std::cmp::Ordering {
         let left_value = left.get(col_idx).map(|value| value.as_str()).unwrap_or("");
         let right_value = right.get(col_idx).map(|value| value.as_str()).unwrap_or("");
-        let left_number = Self::parse_sort_number(left_value);
-        let right_number = Self::parse_sort_number(right_value);
-        match (left_number, right_number) {
-            (Some(lhs), Some(rhs)) => lhs.partial_cmp(&rhs).unwrap_or(std::cmp::Ordering::Equal),
-            (Some(_), None) => std::cmp::Ordering::Less,
-            (None, Some(_)) => std::cmp::Ordering::Greater,
-            (None, None) => left_value.cmp(right_value),
-        }
+        compare_cell_values(
+            left_value,
+            Self::value_represents_null(left_value, null_text),
+            right_value,
+            Self::value_represents_null(right_value, null_text),
+            column,
+        )
     }
 
     fn sort_row_entries(
@@ -787,7 +860,17 @@ impl ResultTableWidget {
         row_states: Option<&mut Vec<EditRowState>>,
         col_idx: usize,
         direction: SortDirection,
+        column: SortColumn,
+        null_text: &str,
     ) -> bool {
+        let compare = |left: &Vec<String>, right: &Vec<String>| {
+            let ordering =
+                Self::compare_row_values_for_sort(left, right, col_idx, column, null_text);
+            match direction {
+                SortDirection::Ascending => ordering,
+                SortDirection::Descending => ordering.reverse(),
+            }
+        };
         match row_states {
             Some(states) => {
                 if states.len() != rows.len() {
@@ -797,13 +880,7 @@ impl ResultTableWidget {
                 let moved_states = std::mem::take(states);
                 let mut paired: Vec<(Vec<String>, EditRowState)> =
                     moved_rows.into_iter().zip(moved_states).collect();
-                paired.sort_by(|(left, _), (right, _)| {
-                    let ordering = Self::compare_row_values_for_sort(left, right, col_idx);
-                    match direction {
-                        SortDirection::Ascending => ordering,
-                        SortDirection::Descending => ordering.reverse(),
-                    }
-                });
+                paired.sort_by(|(left, _), (right, _)| compare(left, right));
                 rows.reserve(paired.len());
                 states.reserve(paired.len());
                 for (row, state) in paired {
@@ -813,13 +890,7 @@ impl ResultTableWidget {
                 true
             }
             None => {
-                rows.sort_by(|left, right| {
-                    let ordering = Self::compare_row_values_for_sort(left, right, col_idx);
-                    match direction {
-                        SortDirection::Ascending => ordering,
-                        SortDirection::Descending => ordering.reverse(),
-                    }
-                });
+                rows.sort_by(compare);
                 true
             }
         }
@@ -828,9 +899,25 @@ impl ResultTableWidget {
     fn apply_sort_to_table_data(
         full_data: &Arc<Mutex<Vec<Vec<String>>>>,
         edit_session: &Arc<Mutex<Option<TableEditSession>>>,
+        column_kinds: &Arc<Mutex<Vec<SqlValueKind>>>,
+        null_text: &Arc<Mutex<String>>,
+        sort_null_ordering: &Arc<Mutex<NullOrdering>>,
         col_idx: usize,
         direction: SortDirection,
     ) -> bool {
+        let nulls = *sort_null_ordering
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let column = {
+            let kinds = column_kinds
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            Self::sort_column_for(&kinds, col_idx, nulls)
+        };
+        let null_text = null_text
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
         let mut session_guard = edit_session
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -840,7 +927,14 @@ impl ResultTableWidget {
         let row_states = session_guard
             .as_mut()
             .map(|session| &mut session.row_states);
-        Self::sort_row_entries(&mut rows_guard, row_states, col_idx, direction)
+        Self::sort_row_entries(
+            &mut rows_guard,
+            row_states,
+            col_idx,
+            direction,
+            column,
+            &null_text,
+        )
     }
 
     fn next_sort_state(current: Option<ColumnSortState>, col_idx: usize) -> ColumnSortState {
@@ -2185,6 +2279,9 @@ impl ResultTableWidget {
         ));
         let row_number_offset = Arc::new(AtomicU64::new(0));
         let null_text = Arc::new(Mutex::new("NULL".to_string()));
+        let column_kinds: Arc<Mutex<Vec<SqlValueKind>>> = Arc::new(Mutex::new(Vec::new()));
+        let sort_null_ordering = Arc::new(Mutex::new(Self::DEFAULT_SORT_NULL_ORDERING));
+        let header_sort_redirect: HeaderSortRedirectCallback = Arc::new(Mutex::new(None));
         let source_sql = Arc::new(Mutex::new(String::new()));
         let streaming_source_sql = Arc::new(Mutex::new(String::new()));
         let execute_sql_callback: Arc<Mutex<Option<ResultGridSqlExecuteCallback>>> =
@@ -2446,6 +2543,10 @@ impl ResultTableWidget {
 
         let mut table_for_handle = table.clone();
         let full_data_for_handle = full_data.clone();
+        let column_kinds_for_handle = column_kinds.clone();
+        let null_text_for_handle = null_text.clone();
+        let sort_null_ordering_for_handle = sort_null_ordering.clone();
+        let header_sort_redirect_for_handle = header_sort_redirect.clone();
         let font_settings_for_handle = font_settings.clone();
         let source_sql_for_handle = source_sql.clone();
         let execute_sql_callback_for_handle = execute_sql_callback.clone();
@@ -2860,9 +2961,20 @@ impl ResultTableWidget {
                                     .unwrap_or_else(|poisoned| poisoned.into_inner());
                                 Self::next_sort_state(current, col_idx)
                             };
+                            if Self::try_redirect_header_sort(
+                                &headers_for_handle,
+                                &header_sort_redirect_for_handle,
+                                col_idx,
+                                next_state.direction,
+                            ) {
+                                return true;
+                            }
                             if Self::apply_sort_to_table_data(
                                 &full_data_for_handle,
                                 &edit_session_for_handle,
+                                &column_kinds_for_handle,
+                                &null_text_for_handle,
+                                &sort_null_ordering_for_handle,
                                 col_idx,
                                 next_state.direction,
                             ) {
@@ -3328,7 +3440,9 @@ impl ResultTableWidget {
         Self {
             table,
             headers,
-            column_kinds: Arc::new(Mutex::new(Vec::new())),
+            column_kinds,
+            sort_null_ordering,
+            header_sort_redirect,
             pending_rows: Arc::new(Mutex::new(Vec::new())),
             pending_widths: Arc::new(Mutex::new(Vec::new())),
             last_flush_epoch_ms: Arc::new(Mutex::new(Self::current_epoch_millis())),
@@ -8799,9 +8913,20 @@ impl ResultTableWidget {
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
             Self::next_sort_state(current, col_idx)
         };
+        if Self::try_redirect_header_sort(
+            &self.headers,
+            &self.header_sort_redirect,
+            col_idx,
+            next_state.direction,
+        ) {
+            return;
+        }
         if Self::apply_sort_to_table_data(
             &self.full_data,
             &self.edit_session,
+            &self.column_kinds,
+            &self.null_text,
+            &self.sort_null_ordering,
             col_idx,
             next_state.direction,
         ) {
@@ -15178,12 +15303,89 @@ mod tests {
         );
     }
 
+    /// The NULL marker these sort tests run with. None of them exercise NULL
+    /// placement — `grid_sort` owns that — so any non-empty marker works.
+    const SORT_TEST_NULL_TEXT: &str = "NULL";
+
+    /// A column the driver could not classify, which is what these tests
+    /// predate `column_kinds` in asserting: numeric when both sides parse,
+    /// text otherwise.
+    fn unknown_sort_column() -> SortColumn {
+        ResultTableWidget::sort_column_for(&[], 0, ResultTableWidget::DEFAULT_SORT_NULL_ORDERING)
+    }
+
+    #[test]
+    fn sort_column_carries_the_kind_and_the_null_ordering_it_is_given() {
+        let kinds = vec![SqlValueKind::Temporal, SqlValueKind::Number];
+        let column = ResultTableWidget::sort_column_for(&kinds, 1, NullOrdering::LastOnAscending);
+        assert_eq!(column.kind, SqlValueKind::Number);
+        assert_eq!(column.nulls, NullOrdering::LastOnAscending);
+    }
+
+    #[test]
+    fn a_column_past_the_kind_list_falls_back_to_unknown() {
+        // Streaming installs kinds after headers, so a sort can race ahead of
+        // them; an unclassified column must still compare, not panic.
+        let column = ResultTableWidget::sort_column_for(&[], 7, NullOrdering::FirstOnAscending);
+        assert_eq!(column.kind, SqlValueKind::Unknown);
+    }
+
+    #[test]
+    fn null_ordering_decides_where_empty_cells_land() {
+        let rows = || {
+            vec![
+                vec!["b".to_string()],
+                vec![String::new()],
+                vec!["a".to_string()],
+            ]
+        };
+
+        let mut nulls_first = rows();
+        assert!(ResultTableWidget::sort_row_entries(
+            &mut nulls_first,
+            None,
+            0,
+            SortDirection::Ascending,
+            ResultTableWidget::sort_column_for(&[], 0, NullOrdering::FirstOnAscending),
+            SORT_TEST_NULL_TEXT,
+        ));
+        assert_eq!(nulls_first.first().unwrap()[0], "");
+
+        let mut nulls_last = rows();
+        assert!(ResultTableWidget::sort_row_entries(
+            &mut nulls_last,
+            None,
+            0,
+            SortDirection::Ascending,
+            ResultTableWidget::sort_column_for(&[], 0, NullOrdering::LastOnAscending),
+            SORT_TEST_NULL_TEXT,
+        ));
+        assert_eq!(nulls_last.last().unwrap()[0], "");
+    }
+
+    #[test]
+    fn the_default_null_ordering_preserves_the_previous_grid_behaviour() {
+        // Before column kinds reached the sort, an empty cell compared as text
+        // and led an ascending sort. A result whose backend never reported in
+        // must keep landing there.
+        assert_eq!(
+            ResultTableWidget::DEFAULT_SORT_NULL_ORDERING,
+            NullOrdering::FirstOnAscending
+        );
+    }
+
     #[test]
     fn compare_row_values_for_sort_uses_numeric_order_for_numbers() {
         let left = vec!["2".to_string()];
         let right = vec!["10".to_string()];
         assert_eq!(
-            ResultTableWidget::compare_row_values_for_sort(&left, &right, 0),
+            ResultTableWidget::compare_row_values_for_sort(
+                &left,
+                &right,
+                0,
+                unknown_sort_column(),
+                SORT_TEST_NULL_TEXT,
+            ),
             std::cmp::Ordering::Less
         );
     }
@@ -15193,11 +15395,23 @@ mod tests {
         let number_row = vec!["42".to_string()];
         let text_row = vec!["ABC".to_string()];
         assert_eq!(
-            ResultTableWidget::compare_row_values_for_sort(&number_row, &text_row, 0),
+            ResultTableWidget::compare_row_values_for_sort(
+                &number_row,
+                &text_row,
+                0,
+                unknown_sort_column(),
+                SORT_TEST_NULL_TEXT,
+            ),
             std::cmp::Ordering::Less
         );
         assert_eq!(
-            ResultTableWidget::compare_row_values_for_sort(&text_row, &number_row, 0),
+            ResultTableWidget::compare_row_values_for_sort(
+                &text_row,
+                &number_row,
+                0,
+                unknown_sort_column(),
+                SORT_TEST_NULL_TEXT,
+            ),
             std::cmp::Ordering::Greater
         );
     }
@@ -15232,6 +15446,8 @@ mod tests {
             Some(&mut states),
             1,
             SortDirection::Ascending,
+            unknown_sort_column(),
+            SORT_TEST_NULL_TEXT,
         ));
 
         assert_eq!(
@@ -15271,6 +15487,8 @@ mod tests {
             Some(&mut states),
             0,
             SortDirection::Ascending,
+            unknown_sort_column(),
+            SORT_TEST_NULL_TEXT,
         ));
 
         assert_eq!(rows, original_rows);
@@ -15289,6 +15507,8 @@ mod tests {
             None,
             0,
             SortDirection::Ascending,
+            unknown_sort_column(),
+            SORT_TEST_NULL_TEXT,
         ));
         assert_eq!(
             rows,

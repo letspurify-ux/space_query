@@ -5,6 +5,7 @@ pub mod connection_dialog;
 pub mod constants;
 pub mod find_replace;
 pub mod font_settings;
+pub(crate) mod grid_sort;
 // Public only so `verify_grid_sql_export` can assert on the exact SQL the app
 // puts on the clipboard; not part of the supported surface.
 #[doc(hidden)]
@@ -20,6 +21,7 @@ pub mod object_browser;
 pub(crate) mod object_drag_payload;
 pub mod query_history;
 pub mod query_tabs;
+pub(crate) mod result_filter;
 pub mod result_table;
 pub mod result_tabs;
 pub mod settings_dialog;

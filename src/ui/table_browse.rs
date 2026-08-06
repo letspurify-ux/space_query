@@ -55,6 +55,13 @@ pub struct TableBrowseTarget {
     /// Whether the browsed relation may be edited in the grid. Views browse
     /// read-only: without a ROWID column the grid offers no edit actions.
     pub editable: bool,
+    /// Column names to complete on when no metadata lookup can supply them.
+    ///
+    /// A browsed table resolves its columns through `completion_name`, but a
+    /// filtered query result is a derived table — it has no name to look up, so
+    /// the only place its columns exist is the result the grid is showing.
+    /// Empty for a real relation, which keeps the metadata path untouched.
+    pub result_columns: Vec<String>,
 }
 
 impl TableBrowseTarget {
@@ -72,6 +79,7 @@ impl TableBrowseTarget {
             relation_sql,
             completion_name,
             editable: true,
+            result_columns: Vec::new(),
         }
     }
 
@@ -882,6 +890,51 @@ impl TableBrowseFilterBar {
         force || !prefix.is_empty()
     }
 
+    /// What the filter popup shows: a derived relation's own columns first,
+    /// then everything the metadata engine offered.
+    ///
+    /// For a browsed table `result_columns` is empty and this is exactly the
+    /// engine's own answer, unchanged. For a filtered query result the engine
+    /// can contribute keywords but no columns — there is no table name for it
+    /// to resolve — so the result's headers have to lead.
+    fn merge_filter_suggestions(
+        result_columns: &[String],
+        prefix: &str,
+        from_metadata: Vec<String>,
+    ) -> Vec<String> {
+        let mut suggestions = Self::result_column_suggestions(result_columns, prefix);
+        let mut seen: std::collections::HashSet<String> =
+            suggestions.iter().map(|s| s.to_uppercase()).collect();
+        for suggestion in from_metadata {
+            if seen.insert(suggestion.to_uppercase()) {
+                suggestions.push(suggestion);
+            }
+        }
+        suggestions.truncate(crate::ui::intellisense::MAX_SUGGESTIONS);
+        suggestions
+    }
+
+    /// Prefix-match a result's own column names, keeping their reported
+    /// spelling and their result order.
+    ///
+    /// Blank names are skipped: `SET HEADING OFF` blanks them on the way to the
+    /// grid, and a blank cannot be typed into a filter anyway.
+    fn result_column_suggestions(columns: &[String], prefix: &str) -> Vec<String> {
+        if columns.is_empty() {
+            return Vec::new();
+        }
+        let prefix_upper = prefix.trim().to_uppercase();
+        let mut seen = std::collections::HashSet::new();
+        columns
+            .iter()
+            .map(|column| column.trim())
+            .filter(|column| !column.is_empty())
+            .filter(|column| column.to_uppercase().starts_with(&prefix_upper))
+            .filter(|column| seen.insert(column.to_uppercase()))
+            .map(str::to_string)
+            .collect()
+    }
+
     fn first_page_request(
         result_tab_id: ResultTabId,
         target: TableBrowseTarget,
@@ -939,7 +992,7 @@ impl TableBrowseFilterBar {
             return;
         }
         let tables = target.completion_tables();
-        let suggestions = intellisense_data
+        let from_metadata = intellisense_data
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .get_suggestions_for_db(
@@ -950,6 +1003,8 @@ impl TableBrowseFilterBar {
                 true,
                 Some(target.db_type),
             );
+        let suggestions =
+            Self::merge_filter_suggestions(&target.result_columns, &prefix, from_metadata);
         let mut popup = popup
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -1140,6 +1195,16 @@ impl TableBrowseFilterBar {
         app::focus().map(|widget| widget.as_widget_ptr() as usize)
     }
 
+    /// The current WHERE text, so a caller rebuilding the request keeps it.
+    pub(crate) fn where_text(&self) -> String {
+        self.where_input.value()
+    }
+
+    /// Show an ORDER BY the user did not type — a redirected header-sort click.
+    pub(crate) fn set_order_by_text(&mut self, expr: &str) {
+        self.order_input.set_value(expr);
+    }
+
     pub(crate) fn focus_where_input(&self) {
         Self::retain_input_focus(&self.where_input);
     }
@@ -1179,6 +1244,116 @@ mod tests {
     #[test]
     fn plain_enter_applies_the_filter() {
         assert!(!TableBrowseFilterBar::enter_commits_ime_composition(0));
+    }
+
+    fn result_columns() -> Vec<String> {
+        ["EMPNO", "ENAME", "ENAME_UPPER", "DEPTNO"]
+            .iter()
+            .map(|name| (*name).to_string())
+            .collect()
+    }
+
+    #[test]
+    fn a_filtered_result_completes_on_its_own_columns() {
+        // Regression: a derived relation has no name to look up, so the filter
+        // bar offered no columns at all until the target carried them.
+        assert_eq!(
+            TableBrowseFilterBar::result_column_suggestions(&result_columns(), "EN"),
+            vec!["ENAME".to_string(), "ENAME_UPPER".to_string()]
+        );
+    }
+
+    #[test]
+    fn result_column_matching_ignores_case_but_keeps_the_reported_spelling() {
+        let columns = vec!["HireDate".to_string()];
+        assert_eq!(
+            TableBrowseFilterBar::result_column_suggestions(&columns, "hire"),
+            vec!["HireDate".to_string()]
+        );
+    }
+
+    #[test]
+    fn an_empty_prefix_offers_every_result_column() {
+        assert_eq!(
+            TableBrowseFilterBar::result_column_suggestions(&result_columns(), ""),
+            result_columns()
+        );
+    }
+
+    #[test]
+    fn result_columns_drop_blanks_and_repeats() {
+        // SET HEADING OFF blanks names on the way to the grid, and a join can
+        // repeat one; neither should reach the popup twice or empty.
+        let columns = vec![
+            "DEPTNO".to_string(),
+            String::new(),
+            "  ".to_string(),
+            "deptno".to_string(),
+        ];
+        assert_eq!(
+            TableBrowseFilterBar::result_column_suggestions(&columns, ""),
+            vec!["DEPTNO".to_string()]
+        );
+    }
+
+    fn strings(values: &[&str]) -> Vec<String> {
+        values.iter().map(|value| (*value).to_string()).collect()
+    }
+
+    #[test]
+    fn a_filtered_results_columns_lead_the_popup() {
+        // The whole point of the fix: without this the popup held keywords
+        // only, because no table name can resolve a derived relation.
+        let merged = TableBrowseFilterBar::merge_filter_suggestions(
+            &result_columns(),
+            "E",
+            strings(&["ELSE", "EXISTS"]),
+        );
+        assert_eq!(
+            merged,
+            strings(&["EMPNO", "ENAME", "ENAME_UPPER", "ELSE", "EXISTS"])
+        );
+    }
+
+    #[test]
+    fn a_browsed_table_keeps_the_engine_answer_untouched() {
+        // No result columns means this must be a pass-through, so browsing a
+        // real table behaves exactly as it did before the filter feature.
+        let from_metadata = strings(&["EMPNO", "ENAME", "ELSE"]);
+        assert_eq!(
+            TableBrowseFilterBar::merge_filter_suggestions(&[], "E", from_metadata.clone()),
+            from_metadata
+        );
+    }
+
+    #[test]
+    fn a_column_the_engine_also_knows_is_not_offered_twice() {
+        let merged = TableBrowseFilterBar::merge_filter_suggestions(
+            &strings(&["DEPTNO"]),
+            "D",
+            strings(&["deptno", "DESC"]),
+        );
+        assert_eq!(merged, strings(&["DEPTNO", "DESC"]));
+    }
+
+    #[test]
+    fn the_merged_list_respects_the_suggestion_cap() {
+        let columns: Vec<String> = (0..crate::ui::intellisense::MAX_SUGGESTIONS + 50)
+            .map(|index| format!("C{index}"))
+            .collect();
+        let merged =
+            TableBrowseFilterBar::merge_filter_suggestions(&columns, "C", strings(&["CASE"]));
+        assert_eq!(merged.len(), crate::ui::intellisense::MAX_SUGGESTIONS);
+    }
+
+    #[test]
+    fn a_browsed_table_supplies_no_result_columns_so_metadata_still_answers() {
+        // The metadata path must stay the only source for a real relation.
+        let target = target(DatabaseType::Oracle);
+        assert!(target.result_columns.is_empty());
+        assert!(
+            TableBrowseFilterBar::result_column_suggestions(&target.result_columns, "E").is_empty()
+        );
     }
 
     #[test]

@@ -17,15 +17,17 @@ use crate::ui::constants;
 use crate::ui::font_settings::{
     configured_result_font_size, configured_result_profile, FontProfile,
 };
+use crate::ui::grid_sort::NullOrdering;
 use crate::ui::grid_sql_export::GridSqlSelection;
 use crate::ui::result_table::{
-    LazyFetchCallback, ResultGridEditExecuteCallback, ResultGridSqlExecuteCallback,
-    ResultPageNavigationOutcome, ResultTableContextActionCallback,
+    HeaderSortRedirectCallback, LazyFetchCallback, ResultGridEditExecuteCallback,
+    ResultGridSqlExecuteCallback, ResultPageNavigationOutcome, ResultTableContextActionCallback,
 };
 use crate::ui::tab_strip;
 use crate::ui::table_browse::{
-    invoke_table_browse_execute_callback, TableBrowseExecuteCallback, TableBrowseFilterBar,
-    TableBrowseNavigation, TableBrowsePageRequest, TableBrowseTarget, TABLE_BROWSE_FILTER_HEIGHT,
+    invoke_table_browse_execute_callback, TableBrowseClauses, TableBrowseExecuteCallback,
+    TableBrowseFilterBar, TableBrowseNavigation, TableBrowsePageRequest, TableBrowseTarget,
+    TABLE_BROWSE_FILTER_HEIGHT,
 };
 use crate::ui::text_buffer_access;
 use crate::ui::theme;
@@ -1684,7 +1686,7 @@ impl ResultTabsWidget {
             return Some(index);
         }
 
-        let (mut group, table) = {
+        let (group, table) = {
             let data = self
                 .data
                 .lock()
@@ -1696,39 +1698,7 @@ impl ResultTabsWidget {
         if page_size > 0 {
             request.page_size = page_size;
         }
-        let (x, y, w, h) = (group.x(), group.y(), group.w(), group.h());
-        group.begin();
-        let filter_bar = TableBrowseFilterBar::new(
-            x,
-            y,
-            w,
-            target,
-            intellisense_data,
-            id,
-            self.table_browse_callback.clone(),
-        );
-        group.end();
-
-        let mut table_widget = table.get_widget();
-        table_widget.resize(
-            x,
-            y + TABLE_BROWSE_FILTER_HEIGHT,
-            w,
-            (h - TABLE_BROWSE_FILTER_HEIGHT).max(1),
-        );
-        group.resizable(&table_widget);
-        let mut filter_for_resize = filter_bar.clone();
-        let mut table_for_resize = table_widget.clone();
-        group.resize_callback(move |group, x, y, w, h| {
-            filter_for_resize.layout(x, y, w);
-            table_for_resize.resize(
-                x,
-                y + TABLE_BROWSE_FILTER_HEIGHT,
-                w,
-                (h - TABLE_BROWSE_FILTER_HEIGHT).max(1),
-            );
-            group.redraw();
-        });
+        let filter_bar = self.build_filter_bar(&group, &table, id, target, intellisense_data);
 
         {
             let mut data = self
@@ -1759,6 +1729,193 @@ impl ResultTabsWidget {
         }
         let _ = self.set_result_tab_state(index, ResultTabStatus::Running, 0);
         Some(index)
+    }
+
+    /// Put a filter bar above a tab's grid and shrink the grid to fit.
+    ///
+    /// Shared by table browsing, which starts life with the bar, and by a
+    /// finished query result the user asks to filter.
+    fn build_filter_bar(
+        &self,
+        group: &Group,
+        table: &ResultTableWidget,
+        id: ResultTabId,
+        target: TableBrowseTarget,
+        intellisense_data: Arc<Mutex<crate::ui::IntellisenseData>>,
+    ) -> TableBrowseFilterBar {
+        let mut group = group.clone();
+        let (x, y, w, h) = (group.x(), group.y(), group.w(), group.h());
+        group.begin();
+        let filter_bar = TableBrowseFilterBar::new(
+            x,
+            y,
+            w,
+            target,
+            intellisense_data,
+            id,
+            self.table_browse_callback.clone(),
+        );
+        group.end();
+
+        let mut table_widget = table.get_widget();
+        table_widget.resize(
+            x,
+            y + TABLE_BROWSE_FILTER_HEIGHT,
+            w,
+            (h - TABLE_BROWSE_FILTER_HEIGHT).max(1),
+        );
+        group.resizable(&table_widget);
+        let mut filter_for_resize = filter_bar.clone();
+        let mut table_for_resize = table_widget;
+        group.resize_callback(move |group, x, y, w, h| {
+            filter_for_resize.layout(x, y, w);
+            table_for_resize.resize(
+                x,
+                y + TABLE_BROWSE_FILTER_HEIGHT,
+                w,
+                (h - TABLE_BROWSE_FILTER_HEIGHT).max(1),
+            );
+            group.redraw();
+        });
+        filter_bar
+    }
+
+    /// Give a finished query result a `WHERE` / `ORDER BY` bar, leaving the rows
+    /// it is already showing in place.
+    ///
+    /// The tab deliberately stays a `Query` tab. Result routing and
+    /// `execute_table_browse_request` both branch on the tab being a table
+    /// browse, so a tab that merely *offers* a filter must not claim to be one
+    /// — a statement result arriving in a tab already marked as browsing would
+    /// take the page-load path it was never meant to. The tab converts only when
+    /// a filter is actually applied, which is the moment a page query really is
+    /// in flight (see `promote_query_tab_to_table_browse`).
+    ///
+    /// `focus_input` belongs to a deliberate request to filter. A bar that
+    /// simply appears with a finished result must not take focus — the caret
+    /// stays in the editor the user is still typing in.
+    ///
+    /// Returns false when the tab is gone or already has a bar.
+    pub(crate) fn attach_result_filter_bar_by_id(
+        &mut self,
+        id: ResultTabId,
+        target: TableBrowseTarget,
+        intellisense_data: Arc<Mutex<crate::ui::IntellisenseData>>,
+        focus_input: bool,
+    ) -> bool {
+        let Some(index) = self.result_tab_index_for_id(id) else {
+            return false;
+        };
+        let parts = {
+            let data = self
+                .data
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let Some(tab) = data.get(index) else {
+                return false;
+            };
+            if tab.filter_bar.is_some() || !matches!(tab.kind, ResultTabKind::Query) {
+                return false;
+            }
+            (tab.group.clone(), tab.table.clone())
+        };
+        let filter_bar =
+            self.build_filter_bar(&parts.0, &parts.1, id, target.clone(), intellisense_data);
+        // With a filter bar in place the tab can order on the server, so a
+        // header click stops sorting the fetched rows — the two disagree about
+        // NULLs, collation, and (once paging starts) which rows are even in
+        // scope, and only the server's answer is the real one.
+        {
+            let callback = self.table_browse_callback.clone();
+            let mut bar = filter_bar.clone();
+            let redirect: HeaderSortRedirectCallback = Arc::new(Mutex::new(Some(Box::new(
+                move |column: String, ascending| {
+                    let order_by = if ascending {
+                        column
+                    } else {
+                        format!("{column} DESC")
+                    };
+                    bar.set_order_by_text(&order_by);
+                    let request = TableBrowsePageRequest {
+                        result_tab_id: id,
+                        target: target.clone(),
+                        clauses: TableBrowseClauses::new(bar.where_text(), order_by),
+                        offset: 0,
+                        page_size: 0,
+                        navigation: TableBrowseNavigation::Page,
+                    };
+                    if let Err(message) = invoke_table_browse_execute_callback(&callback, request) {
+                        crate::ui::alert_on_main(&message);
+                    }
+                    // Taken either way: a failed re-query must not silently fall
+                    // back to a local sort that means something different.
+                    true
+                },
+            ))));
+            let mut table = parts.1.clone();
+            table.set_header_sort_redirect(redirect);
+        }
+        {
+            let mut data = self
+                .data
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if let Some(tab) = data.get_mut(index) {
+                tab.filter_bar = Some(filter_bar.clone());
+            }
+        }
+        parts.0.clone().redraw();
+        if focus_input {
+            filter_bar.focus_where_input();
+        }
+        true
+    }
+
+    /// Whether this tab carries a filter bar, however it got one.
+    ///
+    /// The header sort asks this: a tab that can re-query orders on the server
+    /// instead of sorting the fetched rows locally.
+    pub(crate) fn result_tab_has_filter_bar(&self, id: ResultTabId) -> bool {
+        self.result_tab_index_for_id(id).is_some_and(|index| {
+            self.data
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .get(index)
+                .is_some_and(|tab| tab.filter_bar.is_some())
+        })
+    }
+
+    /// Turn a filter-bearing query tab into a table-browse tab, at the moment
+    /// its first filter is applied and a page query is about to run.
+    ///
+    /// Returns false if the tab is gone; a tab that is already browsing counts
+    /// as success so the caller can call this unconditionally.
+    pub(crate) fn promote_query_tab_to_table_browse(
+        &mut self,
+        request: &TableBrowsePageRequest,
+    ) -> bool {
+        let Some(index) = self.result_tab_index_for_id(request.result_tab_id) else {
+            return false;
+        };
+        let mut data = self
+            .data
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let Some(tab) = data.get_mut(index) else {
+            return false;
+        };
+        if matches!(tab.kind, ResultTabKind::TableBrowse(_)) {
+            return true;
+        }
+        tab.kind = ResultTabKind::TableBrowse(Box::new(TableBrowseState {
+            applied_request: request.clone(),
+            pending_request: None,
+            has_next: false,
+            loading: false,
+            last_success: None,
+            last_edit_descriptor: None,
+        }));
+        true
     }
 
     pub(crate) fn set_table_browse_callback(&mut self, callback: TableBrowseExecuteCallback) {
@@ -2036,6 +2193,25 @@ impl ResultTabsWidget {
     pub(crate) fn set_lazy_fetch_session_by_id(&mut self, id: ResultTabId, session_id: u64) {
         if let Some(index) = self.result_tab_index_for_id(id) {
             self.set_lazy_fetch_session(index, session_id);
+        }
+    }
+
+    /// Tell a result tab's grid where the backend that owns it puts NULLs on an
+    /// ascending sort, so the local header sort agrees with the server.
+    ///
+    /// Set on the tab rather than on a streaming batch: it belongs to the
+    /// connection, and every result the tab goes on to show comes from the same
+    /// one.
+    pub(crate) fn set_sort_null_ordering_by_id(&mut self, id: ResultTabId, ordering: NullOrdering) {
+        let table = self.result_tab_index_for_id(id).and_then(|index| {
+            self.data
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .get(index)
+                .map(|tab| tab.table.clone())
+        });
+        if let Some(mut table) = table {
+            table.set_sort_null_ordering(ordering);
         }
     }
 

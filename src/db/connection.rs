@@ -802,6 +802,10 @@ impl DatabaseType {
         backend_for(self).table_browse_spec()
     }
 
+    pub fn sorts_nulls_last_ascending(self) -> bool {
+        backend_for(self).sorts_nulls_last_ascending()
+    }
+
     pub fn supports_tns_alias(self) -> bool {
         self.connection_form_spec().supports_tns_alias
     }
@@ -2237,6 +2241,11 @@ pub(crate) trait DbBackend: Sync {
     fn connection_form_spec(&self) -> DbConnectionFormSpec;
     fn advanced_settings_form_spec(&self) -> DbAdvancedSettingsFormSpec;
     fn table_browse_spec(&self) -> DbTableBrowseSpec;
+    /// Where the server puts NULLs on an ascending `ORDER BY` with no explicit
+    /// `NULLS FIRST` / `NULLS LAST`. The result grid's local header sort mirrors
+    /// this so a locally sorted column lands in the same order the server would
+    /// have produced.
+    fn sorts_nulls_last_ascending(&self) -> bool;
     fn sql_dialect(&self) -> SqlDialect;
     fn supports_mysql_delimiter_commands(&self) -> bool;
     fn supports_explicit_analytic_null_treatment(&self) -> bool;
@@ -2547,6 +2556,10 @@ impl DbBackend for OracleBackend {
             pagination: DbTableBrowsePagination::Rownum,
             strips_page_helper_column: true,
         }
+    }
+
+    fn sorts_nulls_last_ascending(&self) -> bool {
+        true
     }
 
     fn sql_dialect(&self) -> SqlDialect {
@@ -3017,6 +3030,10 @@ impl DbBackend for MysqlBackend {
             pagination: DbTableBrowsePagination::LimitOffset,
             strips_page_helper_column: false,
         }
+    }
+
+    fn sorts_nulls_last_ascending(&self) -> bool {
+        false
     }
 
     fn sql_dialect(&self) -> SqlDialect {
@@ -6347,6 +6364,24 @@ pub fn try_lock_connection_with_activity(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn default_null_sort_order_matches_each_backend() {
+        // Oracle puts NULLs last on an ascending ORDER BY; the MySQL family
+        // puts them first. The result grid's local sort mirrors this.
+        assert!(DatabaseType::Oracle.sorts_nulls_last_ascending());
+        assert!(!DatabaseType::MySQL.sorts_nulls_last_ascending());
+        assert!(!DatabaseType::MariaDB.sorts_nulls_last_ascending());
+    }
+
+    #[test]
+    fn every_supported_backend_states_its_null_sort_order() {
+        // Exercises the accessor for every variant so a new backend cannot be
+        // added without deciding this.
+        for db_type in DatabaseType::ALL {
+            let _ = db_type.sorts_nulls_last_ascending();
+        }
+    }
 
     #[test]
     fn common_connection_deadline_returns_before_late_worker_result() {

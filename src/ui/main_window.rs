@@ -37,6 +37,7 @@ use crate::db::{
     TabConnectionBinding, TransactionAccessMode, TransactionIsolation, TransactionMode,
 };
 use crate::ui::constants::*;
+use crate::ui::grid_sort::NullOrdering;
 use crate::ui::result_table::{
     ResultGridEditExecuteCallback, ResultGridSqlExecuteCallback, ResultTableContextAction,
 };
@@ -5034,6 +5035,52 @@ impl MainWindow {
     }
 
     /// Put generated SQL on the clipboard and report it in the status bar.
+    /// Put a `WHERE` / `ORDER BY` bar on a result that this backend can
+    /// re-query, as the result arrives.
+    ///
+    /// Gating lives here rather than in the grid because the answer depends on
+    /// the connection — Oracle can wrap a result whose column names repeat, the
+    /// MySQL family cannot — and because a result that did not come from a
+    /// SELECT has nothing to re-run.
+    ///
+    /// Attaching only adds the bar. The tab stays a query tab and keeps the
+    /// rows and the grid editing it already had; nothing runs until a filter is
+    /// actually applied.
+    fn offer_result_filter(
+        result_tabs: &mut ResultTabsWidget,
+        result_tab_id: ResultTabId,
+        db_type: crate::db::DatabaseType,
+        scope: Option<String>,
+        sql: &str,
+        columns: &[String],
+        intellisense_data: Arc<Mutex<IntellisenseData>>,
+    ) {
+        use crate::ui::result_filter::{
+            derived_relation_sql, result_filter_support, ResultFilterSupport,
+        };
+
+        if matches!(
+            result_filter_support(sql, columns, db_type),
+            ResultFilterSupport::Blocked(_)
+        ) {
+            return;
+        }
+
+        let target = TableBrowseTarget {
+            db_type,
+            scope,
+            table_name: "Result".to_string(),
+            relation_sql: derived_relation_sql(sql),
+            completion_name: String::new(),
+            editable: false,
+            // A derived relation has no name for the metadata engine to
+            // resolve, so the result's own headers are what the filter fields
+            // complete on.
+            result_columns: columns.to_vec(),
+        };
+        result_tabs.attach_result_filter_bar_by_id(result_tab_id, target, intellisense_data, false);
+    }
+
     fn finish_sql_clipboard_copy(state: &mut AppState, sql: &str, message: &str) {
         if sql.is_empty() {
             return;
@@ -8287,7 +8334,14 @@ impl MainWindow {
             let mut result_tabs = state_guard
                 .result_tabs_for_tab(tab_id)
                 .ok_or_else(|| "The result workspace is closed.".to_string())?;
-            if !result_tabs.is_table_browse_tab(request.result_tab_id) {
+            // A query result the user asked to filter carries a filter bar
+            // while still being a plain query tab, so that statement results
+            // keep taking the statement path. Applying a filter is the moment a
+            // page query really starts, so convert it here.
+            if !result_tabs.is_table_browse_tab(request.result_tab_id)
+                && (!result_tabs.result_tab_has_filter_bar(request.result_tab_id)
+                    || !result_tabs.promote_query_tab_to_table_browse(&request))
+            {
                 return Err("The table result tab is closed.".to_string());
             }
             if !state_guard.result_origin_is_current_for_tab(tab_id, &result_tabs) {
@@ -8954,9 +9008,33 @@ impl MainWindow {
                             select_tab,
                         )
                     };
+                    // The grid sorts locally but must agree with the server on
+                    // where NULLs go, and it is never told which backend it is
+                    // showing — so resolve that from the tab's connection here.
+                    // The filter bar needs the same answer, plus the editor
+                    // tab's metadata for its own completion.
+                    let editor_tab = s.editor_tabs.iter().find(|tab| tab.tab_id == tab_id);
+                    let result_db_type = editor_tab
+                        .and_then(|tab| tab.connection_binding.snapshot().runtime)
+                        .map(|runtime| runtime.sanitized_info().db_type);
+                    let filter_intellisense =
+                        editor_tab.map(|tab| tab.intellisense_data.clone());
+                    let filter_scope = s
+                        .active_connection_id()
+                        .and_then(|id| s.object_browser.selected_scope_for_connection(id));
                     s.refresh_result_edit_controls();
                     drop(s);
                     result_tabs.ensure_statement_tab_by_id(result_tab_id, "Result", select_tab);
+                    if let Some(db_type) = result_db_type {
+                        result_tabs.set_sort_null_ordering_by_id(
+                            result_tab_id,
+                            if db_type.sorts_nulls_last_ascending() {
+                                NullOrdering::LastOnAscending
+                            } else {
+                                NullOrdering::FirstOnAscending
+                            },
+                        );
+                    }
                     result_tabs.start_streaming_by_id(
                         result_tab_id,
                         &columns,
@@ -8964,6 +9042,21 @@ impl MainWindow {
                         &null_text,
                         &sql,
                     );
+                    // Offer the filter only where it can actually run: a result
+                    // this backend cannot re-query gets no bar at all.
+                    if let (Some(db_type), Some(intellisense_data)) =
+                        (result_db_type, filter_intellisense)
+                    {
+                        MainWindow::offer_result_filter(
+                            &mut result_tabs,
+                            result_tab_id,
+                            db_type,
+                            filter_scope,
+                            &sql,
+                            &columns,
+                            intellisense_data,
+                        );
+                    }
                     if let Some(session_id) = lazy_fetch_session {
                         result_tabs.set_lazy_fetch_session_by_id(result_tab_id, session_id);
                     }
