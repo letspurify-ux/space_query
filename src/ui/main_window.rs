@@ -8674,6 +8674,12 @@ impl MainWindow {
                 if editor.is_query_running() {
                     return Err("The owning query tab is already running a query.".to_string());
                 }
+                if state.result_grid_execution_is_queued(tab_id) {
+                    return Err(
+                        "A refresh of this result has not started yet. Try again in a moment."
+                            .to_string(),
+                    );
+                }
                 if !state.result_origin_is_current_for_tab(tab_id, &result_tabs_for_grid_edit) {
                     return Err(
                         "This result belongs to an older connection, reconnect, or scope and is read-only."
@@ -8730,6 +8736,12 @@ impl MainWindow {
                     .ok_or_else(|| "The owning query tab is closed.".to_string())?;
                 if editor.is_query_running() {
                     return Err("The owning query tab is already running a query.".to_string());
+                }
+                if state.result_grid_execution_is_queued(tab_id) {
+                    return Err(
+                        "A refresh of this result has not started yet. Try again in a moment."
+                            .to_string(),
+                    );
                 }
                 if !state.result_origin_is_current_for_tab(tab_id, &result_tabs_for_structured_edit)
                 {
@@ -12350,7 +12362,9 @@ impl MainWindow {
                             result_page_unit_for_choice_index(s.result_page_unit_choice.value());
                         let execution_origin = tab.connection_binding.snapshot().execution_origin();
                         let mut result_tabs = tab.result_tabs.clone();
-                        if editor.is_query_running() {
+                        if editor.is_query_running()
+                            || s.result_grid_execution_is_queued(source_tab_id)
+                        {
                             s.set_status_message(
                                 "Table data was not opened because the owning query tab is busy",
                             );
