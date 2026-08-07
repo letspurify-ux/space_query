@@ -5992,6 +5992,51 @@ impl ResultTableWidget {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
+    /// Whether edit mode is holding changes the user has not saved: a staged
+    /// insert or delete, a cell marked NULL, or a value that no longer matches
+    /// the row it was read from.
+    pub fn has_staged_edits(&self) -> bool {
+        let Some(session) = self
+            .edit_session
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+        else {
+            return false;
+        };
+        let rows = self
+            .full_data
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        Self::edit_session_has_staged_changes(&session, &rows)
+    }
+
+    fn edit_session_has_staged_changes(session: &TableEditSession, rows: &[Vec<String>]) -> bool {
+        if !session.deleted_rowids.is_empty() {
+            return true;
+        }
+        session
+            .row_states
+            .iter()
+            .enumerate()
+            .any(|(row_idx, row_state)| match row_state {
+                EditRowState::Inserted { .. } => true,
+                EditRowState::Existing {
+                    rowid,
+                    explicit_null_cols,
+                    dirty_cols,
+                } => {
+                    if !explicit_null_cols.is_empty() || !dirty_cols.is_empty() {
+                        return true;
+                    }
+                    match (rows.get(row_idx), session.original_rows_by_rowid.get(rowid)) {
+                        (Some(current), Some(original)) => current != original,
+                        _ => false,
+                    }
+                }
+            })
+    }
+
     pub fn is_edit_mode_enabled(&self) -> bool {
         self.edit_session
             .lock()
@@ -14958,6 +15003,72 @@ mod tests {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .is_empty());
+    }
+
+    fn staged_edit_session(rows: &[Vec<String>]) -> TableEditSession {
+        TableEditSession {
+            rowid_col: 0,
+            table_name: "SCOTT.EMP".to_string(),
+            null_text: "NULL".to_string(),
+            editable_columns: vec![(1, "ENAME".to_string())],
+            original_rows_by_rowid: rows
+                .iter()
+                .map(|row| (row[0].clone(), row.clone()))
+                .collect(),
+            original_row_order: rows.iter().map(|row| row[0].clone()).collect(),
+            deleted_rowids: Vec::new(),
+            row_states: rows
+                .iter()
+                .map(|row| EditRowState::Existing {
+                    rowid: row[0].clone(),
+                    explicit_null_cols: HashSet::new(),
+                    dirty_cols: HashSet::new(),
+                })
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn staged_edits_are_the_changes_a_reload_would_throw_away() {
+        let rows = vec![
+            vec!["RID1".to_string(), "SMITH".to_string()],
+            vec!["RID2".to_string(), "ALLEN".to_string()],
+        ];
+        let session = staged_edit_session(&rows);
+        assert!(!ResultTableWidget::edit_session_has_staged_changes(
+            &session, &rows
+        ));
+
+        let mut edited = rows.clone();
+        edited[1][1] = "ALLENS".to_string();
+        assert!(ResultTableWidget::edit_session_has_staged_changes(
+            &session, &edited
+        ));
+
+        let mut deleted = staged_edit_session(&rows);
+        deleted.deleted_rowids.push("RID1".to_string());
+        assert!(ResultTableWidget::edit_session_has_staged_changes(
+            &deleted, &rows
+        ));
+
+        let mut inserted = staged_edit_session(&rows);
+        inserted.row_states.push(EditRowState::Inserted {
+            explicit_null_cols: HashSet::new(),
+        });
+        assert!(ResultTableWidget::edit_session_has_staged_changes(
+            &inserted, &rows
+        ));
+
+        let mut nulled = staged_edit_session(&rows);
+        if let Some(EditRowState::Existing {
+            explicit_null_cols, ..
+        }) = nulled.row_states.first_mut()
+        {
+            explicit_null_cols.insert(1);
+        }
+        assert!(ResultTableWidget::edit_session_has_staged_changes(
+            &nulled, &rows
+        ));
     }
 
     #[test]

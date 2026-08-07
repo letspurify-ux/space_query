@@ -8476,6 +8476,32 @@ impl MainWindow {
         Self::start_connection_metadata_refresh(state, schema_sender)
     }
 
+    /// Ask before a re-query throws away staged grid edits. True means go ahead:
+    /// either there was nothing staged, or the user said so.
+    fn confirm_discarding_staged_edits(
+        state: &Arc<Mutex<AppState>>,
+        tab_id: QueryTabId,
+        result_tab_id: ResultTabId,
+    ) -> bool {
+        let has_staged_edits = state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .result_tabs_for_tab(tab_id)
+            .is_some_and(|result_tabs| result_tabs.result_tab_has_staged_edits(result_tab_id));
+        if !has_staged_edits {
+            return true;
+        }
+        matches!(
+            crate::ui::choice2_on_main(
+                "This result has unsaved edits.\nReloading it will discard them.",
+                "Cancel",
+                "Discard edits",
+                "",
+            ),
+            Some(1)
+        )
+    }
+
     fn execute_table_browse_request(
         state: &Arc<Mutex<AppState>>,
         tab_id: QueryTabId,
@@ -8613,6 +8639,17 @@ impl MainWindow {
                 let Some(state_for_table_browse) = weak_state_for_table_browse.upgrade() else {
                     return Err("Main window is no longer available.".to_string());
                 };
+                // Refilling the grid drops whatever edit mode has staged, and
+                // the request came from the user — a filter, a page button — so
+                // this is the moment to say so. Internal refreshes call
+                // `execute_table_browse_request` directly and are not asked.
+                if !MainWindow::confirm_discarding_staged_edits(
+                    &state_for_table_browse,
+                    tab_id,
+                    request.result_tab_id,
+                ) {
+                    return Ok(());
+                }
                 MainWindow::execute_table_browse_request(&state_for_table_browse, tab_id, request)
             }),
         )));

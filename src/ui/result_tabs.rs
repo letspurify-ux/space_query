@@ -2711,6 +2711,17 @@ impl ResultTabsWidget {
             .unwrap_or(false)
     }
 
+    /// Whether this tab's grid holds unsaved edits.
+    pub(crate) fn result_tab_has_staged_edits(&self, id: ResultTabId) -> bool {
+        self.result_tab_index_for_id(id).is_some_and(|index| {
+            self.data
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .get(index)
+                .is_some_and(|tab| tab.table.has_staged_edits())
+        })
+    }
+
     pub fn is_current_edit_mode_enabled(&self) -> bool {
         self.current_table()
             .map(|table| table.is_edit_mode_enabled())
