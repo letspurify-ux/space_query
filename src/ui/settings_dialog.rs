@@ -50,6 +50,45 @@ pub struct FontSettings {
     pub app_log_limit: u32,
 }
 
+/// Every form label in this dialog, so one column width can fit them all.
+const FORM_LABELS: [&str; 13] = [
+    "Editor:",
+    "Result Font:",
+    "Global UI:",
+    "Screen Scale:",
+    "Cell Preview:",
+    "Lazy Fetch:",
+    "Context Window:",
+    "Popup Delay:",
+    "Session Pool:",
+    "Connect Timeout:",
+    "Cancel Timeout:",
+    "Comma Lists:",
+    "Right Margin:",
+];
+
+/// Width of the label column, wide enough for the longest label.
+///
+/// A `Frame` centers its label and clips both ends once the text outgrows its
+/// box, so a fixed [`FORM_LABEL_WIDTH`] silently ate the first character of
+/// `Connect Timeout:` and `Context Window:`. The UI font size is configurable,
+/// which is why the column is measured instead of assumed. `Font::Helvetica` is
+/// the slot [`apply_global_default_font`](crate::ui::font_settings) remaps to
+/// the configured UI font, so it measures what a label will actually draw with.
+fn form_label_width() -> i32 {
+    fltk::draw::set_font(fltk::enums::Font::Helvetica, fltk::app::font_size());
+    FORM_LABELS
+        .iter()
+        .map(|label| fltk::draw::measure(label, false).0)
+        .max()
+        .unwrap_or(0)
+        .saturating_add(FORM_LABEL_TEXT_GAP)
+        .max(FORM_LABEL_WIDTH)
+}
+
+/// Breathing room between the widest label and the input beside it.
+const FORM_LABEL_TEXT_GAP: i32 = 10;
+
 fn validate_size(label: &str, value: &str) -> Option<u32> {
     match value.trim().parse::<u32>() {
         Ok(size) if (MIN_FONT_SIZE..=MAX_FONT_SIZE).contains(&size) => Some(size),
@@ -312,6 +351,10 @@ pub fn show_settings_dialog(config: &AppConfig) -> Option<FontSettings> {
     dialog.set_color(theme::panel_raised());
     dialog.make_modal(true);
 
+    // One column width for every tab, so the inputs line up across them and no
+    // label is clipped at the configured UI font size.
+    let label_width = form_label_width();
+
     let content_margin = DIALOG_MARGIN + 4;
     let content_x = content_margin;
     let content_y = content_margin;
@@ -359,7 +402,7 @@ pub fn show_settings_dialog(config: &AppConfig) -> Option<FontSettings> {
     search_input.set_text_color(theme::text_primary());
     theme::apply_text_input_inset(&mut search_input);
     search_input.set_trigger(CallbackTrigger::Changed);
-    search_row.fixed(&search_label, FORM_LABEL_WIDTH);
+    search_row.fixed(&search_label, label_width);
     search_row.end();
     font_flex.fixed(&search_row, INPUT_ROW_HEIGHT);
 
@@ -384,7 +427,7 @@ pub fn show_settings_dialog(config: &AppConfig) -> Option<FontSettings> {
     }
     selected_value.set_label_color(theme::text_secondary());
     selected_value.set_align(Align::Left | Align::Inside);
-    selected_row.fixed(&selected_label, FORM_LABEL_WIDTH);
+    selected_row.fixed(&selected_label, label_width);
     selected_row.end();
     font_flex.fixed(&selected_row, CHECKBOX_ROW_HEIGHT);
 
@@ -393,7 +436,7 @@ pub fn show_settings_dialog(config: &AppConfig) -> Option<FontSettings> {
     editor_size_row.set_spacing(DIALOG_SPACING);
     let mut editor_size_label = Frame::default().with_label("Editor:");
     editor_size_label.set_label_color(theme::text_primary());
-    editor_size_row.fixed(&editor_size_label, FORM_LABEL_WIDTH);
+    editor_size_row.fixed(&editor_size_label, label_width);
     let mut editor_size_input = IntInput::default();
     editor_size_input.set_value(&config.normalized_editor_font_size().to_string());
     editor_size_input.set_color(theme::input_bg());
@@ -407,7 +450,7 @@ pub fn show_settings_dialog(config: &AppConfig) -> Option<FontSettings> {
     result_size_row.set_spacing(DIALOG_SPACING);
     let mut result_size_label = Frame::default().with_label("Result Font:");
     result_size_label.set_label_color(theme::text_primary());
-    result_size_row.fixed(&result_size_label, FORM_LABEL_WIDTH);
+    result_size_row.fixed(&result_size_label, label_width);
     let mut result_size_input = IntInput::default();
     result_size_input.set_value(&config.normalized_result_font_size().to_string());
     result_size_input.set_color(theme::input_bg());
@@ -421,7 +464,7 @@ pub fn show_settings_dialog(config: &AppConfig) -> Option<FontSettings> {
     global_size_row.set_spacing(DIALOG_SPACING);
     let mut global_size_label = Frame::default().with_label("Global UI:");
     global_size_label.set_label_color(theme::text_primary());
-    global_size_row.fixed(&global_size_label, FORM_LABEL_WIDTH);
+    global_size_row.fixed(&global_size_label, label_width);
     let mut global_size_input = IntInput::default();
     global_size_input.set_value(&config.normalized_ui_font_size().to_string());
     global_size_input.set_color(theme::input_bg());
@@ -435,7 +478,7 @@ pub fn show_settings_dialog(config: &AppConfig) -> Option<FontSettings> {
     ui_scale_row.set_spacing(DIALOG_SPACING);
     let mut ui_scale_label = Frame::default().with_label("Screen Scale:");
     ui_scale_label.set_label_color(theme::text_primary());
-    ui_scale_row.fixed(&ui_scale_label, FORM_LABEL_WIDTH);
+    ui_scale_row.fixed(&ui_scale_label, label_width);
     let mut ui_scale_input = IntInput::default();
     ui_scale_input.set_value(&config.normalized_ui_scale_percent().to_string());
     ui_scale_input.set_color(theme::input_bg());
@@ -485,7 +528,7 @@ pub fn show_settings_dialog(config: &AppConfig) -> Option<FontSettings> {
     result_cell_max_row.set_spacing(DIALOG_SPACING);
     let mut result_cell_max_label = Frame::default().with_label("Cell Preview:");
     result_cell_max_label.set_label_color(theme::text_primary());
-    result_cell_max_row.fixed(&result_cell_max_label, FORM_LABEL_WIDTH);
+    result_cell_max_row.fixed(&result_cell_max_label, label_width);
     let mut result_cell_max_input = IntInput::default();
     result_cell_max_input.set_value(&config.result_cell_max_chars.to_string());
     result_cell_max_input.set_color(theme::input_bg());
@@ -499,7 +542,7 @@ pub fn show_settings_dialog(config: &AppConfig) -> Option<FontSettings> {
     lazy_fetch_batch_row.set_spacing(DIALOG_SPACING);
     let mut lazy_fetch_batch_label = Frame::default().with_label("Lazy Fetch:");
     lazy_fetch_batch_label.set_label_color(theme::text_primary());
-    lazy_fetch_batch_row.fixed(&lazy_fetch_batch_label, FORM_LABEL_WIDTH);
+    lazy_fetch_batch_row.fixed(&lazy_fetch_batch_label, label_width);
     let mut lazy_fetch_batch_input = IntInput::default();
     lazy_fetch_batch_input.set_value(&config.normalized_lazy_fetch_batch_size().to_string());
     lazy_fetch_batch_input.set_color(theme::input_bg());
@@ -549,7 +592,7 @@ pub fn show_settings_dialog(config: &AppConfig) -> Option<FontSettings> {
     context_window_row.set_spacing(DIALOG_SPACING);
     let mut context_window_label = Frame::default().with_label("Context Window:");
     context_window_label.set_label_color(theme::text_primary());
-    context_window_row.fixed(&context_window_label, FORM_LABEL_WIDTH);
+    context_window_row.fixed(&context_window_label, label_width);
     let mut context_window_input = IntInput::default();
     context_window_input.set_value(
         &config
@@ -567,7 +610,7 @@ pub fn show_settings_dialog(config: &AppConfig) -> Option<FontSettings> {
     popup_delay_row.set_spacing(DIALOG_SPACING);
     let mut popup_delay_label = Frame::default().with_label("Popup Delay:");
     popup_delay_label.set_label_color(theme::text_primary());
-    popup_delay_row.fixed(&popup_delay_label, FORM_LABEL_WIDTH);
+    popup_delay_row.fixed(&popup_delay_label, label_width);
     let mut popup_delay_input = IntInput::default();
     popup_delay_input.set_value(&config.normalized_intellisense_popup_delay_ms().to_string());
     popup_delay_input.set_color(theme::input_bg());
@@ -617,7 +660,7 @@ pub fn show_settings_dialog(config: &AppConfig) -> Option<FontSettings> {
     pool_size_row.set_spacing(DIALOG_SPACING);
     let mut pool_size_label = Frame::default().with_label("Session Pool:");
     pool_size_label.set_label_color(theme::text_primary());
-    pool_size_row.fixed(&pool_size_label, FORM_LABEL_WIDTH);
+    pool_size_row.fixed(&pool_size_label, label_width);
     let mut pool_size_input = IntInput::default();
     pool_size_input.set_value(&config.normalized_connection_pool_size().to_string());
     pool_size_input.set_color(theme::input_bg());
@@ -631,7 +674,7 @@ pub fn show_settings_dialog(config: &AppConfig) -> Option<FontSettings> {
     connect_timeout_row.set_spacing(DIALOG_SPACING);
     let mut connect_timeout_label = Frame::default().with_label("Connect Timeout:");
     connect_timeout_label.set_label_color(theme::text_primary());
-    connect_timeout_row.fixed(&connect_timeout_label, FORM_LABEL_WIDTH);
+    connect_timeout_row.fixed(&connect_timeout_label, label_width);
     let mut connect_timeout_input = IntInput::default();
     connect_timeout_input.set_value(&config.normalized_connect_timeout_seconds().to_string());
     connect_timeout_input.set_color(theme::input_bg());
@@ -645,7 +688,7 @@ pub fn show_settings_dialog(config: &AppConfig) -> Option<FontSettings> {
     cancel_timeout_row.set_spacing(DIALOG_SPACING);
     let mut cancel_timeout_label = Frame::default().with_label("Cancel Timeout:");
     cancel_timeout_label.set_label_color(theme::text_primary());
-    cancel_timeout_row.fixed(&cancel_timeout_label, FORM_LABEL_WIDTH);
+    cancel_timeout_row.fixed(&cancel_timeout_label, label_width);
     let mut cancel_timeout_input = IntInput::default();
     cancel_timeout_input.set_value(&config.normalized_cancel_timeout_seconds().to_string());
     cancel_timeout_input.set_color(theme::input_bg());
@@ -703,7 +746,7 @@ pub fn show_settings_dialog(config: &AppConfig) -> Option<FontSettings> {
     comma_layout_row.set_spacing(DIALOG_SPACING);
     let mut comma_layout_label = Frame::default().with_label("Comma Lists:");
     comma_layout_label.set_label_color(theme::text_primary());
-    comma_layout_row.fixed(&comma_layout_label, FORM_LABEL_WIDTH);
+    comma_layout_row.fixed(&comma_layout_label, label_width);
     let mut comma_layout_choice = Choice::default();
     comma_layout_choice.add_choice("Stacked|Wrapped");
     comma_layout_choice.set_value(match config.sql_comma_list_layout {
@@ -720,7 +763,7 @@ pub fn show_settings_dialog(config: &AppConfig) -> Option<FontSettings> {
     right_margin_row.set_spacing(DIALOG_SPACING);
     let mut right_margin_label = Frame::default().with_label("Right Margin:");
     right_margin_label.set_label_color(theme::text_primary());
-    right_margin_row.fixed(&right_margin_label, FORM_LABEL_WIDTH);
+    right_margin_row.fixed(&right_margin_label, label_width);
     let mut right_margin_input = IntInput::default();
     right_margin_input.set_value(&config.normalized_sql_format_right_margin().to_string());
     right_margin_input.set_color(theme::input_bg());
