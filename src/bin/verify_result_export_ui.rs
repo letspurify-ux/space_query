@@ -248,7 +248,9 @@ fn main() {
             say("PASS: cancelling the modal exports nothing");
         }
         Ok(clipboard) => {
-            failures.push(format!("cancel still wrote to the clipboard: {clipboard:?}"));
+            failures.push(format!(
+                "cancel still wrote to the clipboard: {clipboard:?}"
+            ));
         }
         Err(err) => failures.push(format!("cancel: {err}")),
     }
@@ -284,7 +286,9 @@ fn run_export(
         set_clipboard("");
     }
     {
-        let mut plan = plan().lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut plan = plan()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         plan.format = format;
         plan.scope = scope;
         plan.cancel = cancel;
@@ -298,7 +302,9 @@ fn run_export(
     pump(1500);
 
     let (driven, refused) = {
-        let plan = plan().lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let plan = plan()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         (plan.driven, plan.refused)
     };
     if refused {
@@ -338,7 +344,9 @@ fn drive_modal() {
         }
         // The modal opens on a scheduled callback, so try again shortly, but
         // not forever.
-        let mut plan = plan().lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut plan = plan()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         plan.attempts += 1;
         if plan.attempts > 40 {
             return;
@@ -353,7 +361,9 @@ fn drive_modal() {
     let mut widgets = Vec::new();
     collect_widgets(&group, &mut widgets);
 
-    let mut plan = plan().lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    let mut plan = plan()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
 
     for widget in &widgets {
         if let Some(mut choice) = Choice::from_dyn_widget(widget) {

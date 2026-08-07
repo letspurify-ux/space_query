@@ -5026,10 +5026,7 @@ impl MainWindow {
                 });
             }
             None => {
-                let message = format!(
-                    "Copied {row_count} rows to clipboard as {}",
-                    format.label()
-                );
+                let message = format!("Copied {row_count} rows to clipboard as {}", format.label());
                 let _ = sender.send(FileActionResult::CopyToClipboard {
                     result: Ok((content, message)),
                 });
@@ -8662,10 +8659,7 @@ impl MainWindow {
                     }
                     match action {
                         ResultTableContextAction::ExportData => {
-                            MainWindow::export_current_results(
-                                &state_for_context,
-                                &file_sender,
-                            );
+                            MainWindow::export_current_results(&state_for_context, &file_sender);
                         }
                         ResultTableContextAction::Close => {
                             MainWindow::close_current_result_tab(&state_for_context);
@@ -12813,9 +12807,7 @@ impl MainWindow {
                                 },
                                 FileActionResult::CopyToClipboard { result } => match result {
                                     Ok((sql, message)) => {
-                                        MainWindow::finish_clipboard_copy(
-                                            &mut s, &sql, &message,
-                                        );
+                                        MainWindow::finish_clipboard_copy(&mut s, &sql, &message);
                                     }
                                     Err(err) => {
                                         deferred_alert = Some(format!(

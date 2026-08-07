@@ -95,7 +95,10 @@ fn rows() -> Vec<Vec<String>> {
 fn grid() -> ExportGrid {
     let columns = columns();
     ExportGrid {
-        columns: columns.iter().map(|(name, _)| (*name).to_string()).collect(),
+        columns: columns
+            .iter()
+            .map(|(name, _)| (*name).to_string())
+            .collect(),
         column_kinds: columns.iter().map(|(_, kind)| *kind).collect(),
         rows: rows(),
         null_text: NULL_TEXT.to_string(),
@@ -137,14 +140,14 @@ fn main() {
         }
         // What the app writes to disk: the rendered text behind the format's
         // file byte-order mark, so the parsers see real file bytes.
-        let text = format!(
-            "{}{}",
-            format.file_byte_order_mark(),
-            render(format, &grid)
-        );
+        let text = format!("{}{}", format.file_byte_order_mark(), render(format, &grid));
         let path = dir.join(format!("result.{}", format.extension()));
         if let Err(err) = std::fs::write(&path, text.as_bytes()) {
-            failures.push(format!("{}: write {}: {err}", format.label(), path.display()));
+            failures.push(format!(
+                "{}: write {}: {err}",
+                format.label(),
+                path.display()
+            ));
             continue;
         }
         println!("\n=== {} -> {} ===", format.label(), path.display());
@@ -208,7 +211,9 @@ fn check_json(text: &str) -> Result<(), String> {
             let expected = &source[row_index][col_index];
             if is_null_cell(row_index, col_index) {
                 if !parsed.is_null() {
-                    return Err(format!("row {row_index} key {name:?}: NULL became {parsed}"));
+                    return Err(format!(
+                        "row {row_index} key {name:?}: NULL became {parsed}"
+                    ));
                 }
                 continue;
             }
@@ -463,11 +468,7 @@ fn compare_table(
     Ok(())
 }
 
-fn run_python_rows(
-    script: &str,
-    args: &[&str],
-    stdin: &str,
-) -> Result<Vec<Vec<String>>, String> {
+fn run_python_rows(script: &str, args: &[&str], stdin: &str) -> Result<Vec<Vec<String>>, String> {
     let mut child = Command::new("python3")
         .arg("-c")
         .arg(script)

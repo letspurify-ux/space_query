@@ -652,7 +652,10 @@ mod tests {
 
     #[test]
     fn markup_escapes_quotes_only_for_html() {
-        assert_eq!(escape_xml_text("say \"hi\" & <bye>"), "say \"hi\" &amp; &lt;bye&gt;");
+        assert_eq!(
+            escape_xml_text("say \"hi\" & <bye>"),
+            "say \"hi\" &amp; &lt;bye&gt;"
+        );
         assert_eq!(
             escape_html_text("say \"hi\" & <bye>"),
             "say &quot;hi&quot; &amp; &lt;bye&gt;"
