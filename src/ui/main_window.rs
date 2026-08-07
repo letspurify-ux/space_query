@@ -819,6 +819,7 @@ struct QueryProgressContext {
     /// The `ResultGridExecution` this batch started with, so it retires that
     /// reservation and no later one.
     execution_reservation: Option<u64>,
+    execution_kind: Option<ResultGridExecutionKind>,
     result_tab_ids: HashMap<usize, ResultTabId>,
     fetch_row_counts: HashMap<usize, usize>,
     lazy_fetch_sessions: HashMap<u64, usize>,
@@ -839,10 +840,23 @@ struct QueryProgressContext {
     total_units: Option<usize>,
 }
 
+/// What a statement reserved an existing result tab for.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ResultGridExecutionKind {
+    /// A statement this window wrote to refill a grid the user is looking at:
+    /// a filtered re-query, or a table page. Its failure is that grid's
+    /// failure, not a reason to take the grid away.
+    Requery,
+    /// A result-grid edit save, whose terminal DML the grid itself must see to
+    /// resolve the pending save.
+    GridEdit,
+}
+
 /// A statement whose result must land in a result tab that already exists,
 /// instead of one reserved for it when the batch starts.
 #[derive(Clone)]
 struct ResultGridExecution {
+    kind: ResultGridExecutionKind,
     /// Distinguishes this reservation from the next one for the same result
     /// tab. Two filters applied to one tab reserve the same tab twice, and the
     /// first execution must not retire the second's routing on its way out.
@@ -1274,6 +1288,7 @@ impl QueryProgressContext {
             operation_token,
             execution_target,
             execution_reservation: execution.map(|execution| execution.id),
+            execution_kind: execution.map(|execution| execution.kind),
             result_tab_ids: HashMap::new(),
             fetch_row_counts: HashMap::new(),
             lazy_fetch_sessions: HashMap::new(),
@@ -2417,6 +2432,7 @@ impl AppState {
     fn reserve_result_grid_execution(
         &mut self,
         tab_id: QueryTabId,
+        kind: ResultGridExecutionKind,
         result_tab_id: ResultTabId,
         sql: Option<String>,
     ) {
@@ -2426,6 +2442,7 @@ impl AppState {
             tab_id,
             ResultGridExecution {
                 id,
+                kind,
                 result_tab_id,
                 sql,
             },
@@ -4113,7 +4130,7 @@ fn batch_owns_grid_reservation(
 /// bar filters: the page would be re-paged and the user's own query would be
 /// gone from the chain.
 fn result_can_carry_a_filter_bar(sql: &str) -> bool {
-    !crate::ui::table_browse::is_materialized_grid_statement(sql)
+    !crate::ui::table_browse::is_generated_grid_statement(sql)
 }
 
 pub struct MainWindow {
@@ -8471,13 +8488,14 @@ impl MainWindow {
                     TableBrowseNavigation::Last => request.count_sql()?,
                 }
             } else {
-                request.logical_sql()?
+                crate::ui::table_browse::marked_result_filter_sql(&request.logical_sql()?)
             };
             if browsing {
                 result_tabs.begin_table_browse_request(request.clone())?;
             }
             state_guard.reserve_result_grid_execution(
                 tab_id,
+                ResultGridExecutionKind::Requery,
                 request.result_tab_id,
                 Some(sql.clone()),
             );
@@ -8586,7 +8604,12 @@ impl MainWindow {
                         },
                     );
                 }
-                state.reserve_result_grid_execution(tab_id, target_tab, Some(sql.clone()));
+                state.reserve_result_grid_execution(
+                    tab_id,
+                    ResultGridExecutionKind::GridEdit,
+                    target_tab,
+                    Some(sql.clone()),
+                );
                 editor.execute_sql_text(&sql);
                 if !editor.is_query_running() {
                     state.result_grid_execution_targets.remove(&tab_id);
@@ -8639,7 +8662,12 @@ impl MainWindow {
                         },
                     );
                 }
-                state.reserve_result_grid_execution(tab_id, target_tab, None);
+                state.reserve_result_grid_execution(
+                    tab_id,
+                    ResultGridExecutionKind::GridEdit,
+                    target_tab,
+                    None,
+                );
                 if let Err(error) = editor.execute_result_edit(request) {
                     state.result_grid_execution_targets.remove(&tab_id);
                     state.pending_table_browse_refresh.remove(&tab_id);
@@ -9088,7 +9116,13 @@ impl MainWindow {
                     let mut result_tabs = owning_result_tabs.clone();
                     let pending_canceling_sessions =
                         s.pending_lazy_fetch_canceling_sessions.clone();
-                    let (result_tab_id, lazy_fetch_session, preserve_canceling, select_tab) = {
+                    let (
+                        result_tab_id,
+                        lazy_fetch_session,
+                        preserve_canceling,
+                        select_tab,
+                        batch_refills_a_grid,
+                    ) = {
                         let Some(context) = s.progress_contexts.get_mut(&tab_id) else {
                             return;
                         };
@@ -9117,6 +9151,7 @@ impl MainWindow {
                             lazy_fetch_session,
                             preserve_canceling,
                             select_tab,
+                            context.execution_target.is_some(),
                         )
                     };
                     // The grid sorts locally but must agree with the server on
@@ -9144,9 +9179,12 @@ impl MainWindow {
                         &sql,
                     );
                     // Offer the filter only where it can actually run: a result
-                    // this backend cannot re-query gets no bar at all.
-                    if let (Some(db_type), Some(intellisense_data)) =
-                        (result_db_type, filter_intellisense)
+                    // this backend cannot re-query gets no bar at all, and a
+                    // statement this window wrote to refill a grid is never
+                    // itself something to filter — a bar built on a filtered
+                    // re-query would filter the filter.
+                    if let (false, Some(db_type), Some(intellisense_data)) =
+                        (batch_refills_a_grid, result_db_type, filter_intellisense)
                     {
                         MainWindow::offer_result_filter(
                             &mut result_tabs,
@@ -9743,6 +9781,7 @@ impl MainWindow {
                         has_fetched_rows,
                         context_was_canceling,
                         grid_execution_target,
+                        grid_execution_kind,
                         should_select_info_pane,
                         select_tab,
                     ) = {
@@ -9781,6 +9820,7 @@ impl MainWindow {
                             context.fetch_row_counts.get(&index).copied().unwrap_or(0) > 0,
                             context.state_label == ResultTabStatus::Canceling.label(),
                             context.execution_target,
+                            context.execution_kind,
                             should_select_support_result_pane(Some(context)),
                             select_tab,
                         )
@@ -9813,6 +9853,11 @@ impl MainWindow {
                     let remove_empty_error_grid = result_status == ResultTabStatus::Error
                         && result_tab_id.is_some()
                         && !table_browse_result
+                        // The grid this failed statement was refilling — a
+                        // filtered re-query, a table page — belongs to the
+                        // user, along with the rows and the filter it still
+                        // shows. Only a tab this batch opened may be taken back.
+                        && grid_execution_target.is_none()
                         && !has_fetched_rows;
                     let remove_empty_success_grid = result_status == ResultTabStatus::Done
                         && result_tab_id.is_some()
@@ -9863,7 +9908,9 @@ impl MainWindow {
                         result_tabs.ensure_statement_tab_by_id(result_tab_id, "Result", select_tab);
                         result_tabs.finish_streaming_by_id(result_tab_id);
                         result_tabs.display_result_by_id(result_tab_id, &result);
-                    } else if let Some(target) = grid_execution_target {
+                    } else if let (Some(target), Some(ResultGridExecutionKind::GridEdit)) =
+                        (grid_execution_target, grid_execution_kind)
+                    {
                         // Result-grid edit saves execute only DML, so the
                         // terminal result is non-select and would otherwise be
                         // dropped here (no result-tab index is mapped for it).
@@ -9872,6 +9919,12 @@ impl MainWindow {
                         // staged rows; without this the save stays pending and
                         // is later recovered as "Save was interrupted".
                         result_tabs.deliver_result_grid_execution_result_by_id(target, &result);
+                    } else if let Some(target) = grid_execution_target {
+                        // A re-query that produced no grid — it failed, or the
+                        // filter was rejected — leaves the rows the tab is
+                        // showing alone and reports on the tab itself. The
+                        // message is already on its way to the Messages pane.
+                        result_tabs.mark_statement_status_by_id(target, result_status);
                     } else if let Some(result_tab_id) = result_tab_id {
                         result_tabs.finish_result_status_by_id(result_tab_id, &result);
                     }
@@ -13732,11 +13785,13 @@ mod tests {
         let tab = ResultTabId::new(4);
         let first = ResultGridExecution {
             id: 1,
+            kind: ResultGridExecutionKind::Requery,
             result_tab_id: tab,
             sql: Some("select 1".to_string()),
         };
         let second = ResultGridExecution {
             id: 2,
+            kind: ResultGridExecutionKind::Requery,
             result_tab_id: tab,
             sql: Some("select 2".to_string()),
         };
@@ -15050,6 +15105,7 @@ mod tests {
 
         let reservation = ResultGridExecution {
             id: 1,
+            kind: ResultGridExecutionKind::GridEdit,
             result_tab_id: ResultTabId::new(1),
             sql: None,
         };

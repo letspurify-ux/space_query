@@ -23,6 +23,7 @@ use crate::ui::ui_timeout;
 use crate::utils::arithmetic::safe_div;
 
 pub(crate) const TABLE_BROWSE_MATERIALIZE_MARKER: &str = "SQ_INTERNAL_TABLE_BROWSE";
+pub(crate) const RESULT_FILTER_MARKER: &str = "SQ_INTERNAL_RESULT_FILTER";
 pub(crate) const TABLE_BROWSE_PAGE_COLUMN: &str = "SQ_INTERNAL_PAGE_ROW";
 pub(crate) const TABLE_BROWSE_DEFAULT_PAGE_SIZE: usize = 500;
 pub(crate) const TABLE_BROWSE_FILTER_HEIGHT: i32 = 42;
@@ -32,6 +33,22 @@ pub(crate) const TABLE_BROWSE_FILTER_HEIGHT: i32 = 42;
 /// result-grid routing, and is never itself a relation to filter or re-page.
 pub(crate) fn is_materialized_grid_statement(sql: &str) -> bool {
     sql.contains(TABLE_BROWSE_MATERIALIZE_MARKER)
+}
+
+/// Whether this statement was written by this feature rather than by the user
+/// — a table page, or a re-query of a result the user filtered.
+///
+/// Such a statement already contains someone's filter, so it must never become
+/// the relation a new filter bar wraps: that would filter the filter, and every
+/// apply would nest one level deeper. The mark travels in the statement text so
+/// the answer holds however the result is routed.
+pub(crate) fn is_generated_grid_statement(sql: &str) -> bool {
+    is_materialized_grid_statement(sql) || sql.contains(RESULT_FILTER_MARKER)
+}
+
+/// The same statement, marked as one this feature wrote for a filtered result.
+pub(crate) fn marked_result_filter_sql(sql: &str) -> String {
+    marked_sql(sql, RESULT_FILTER_MARKER)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -212,6 +229,10 @@ pub(crate) fn invoke_table_browse_execute_callback(
 }
 
 fn marked_materialized_sql(sql: &str) -> String {
+    marked_sql(sql, TABLE_BROWSE_MATERIALIZE_MARKER)
+}
+
+fn marked_sql(sql: &str, marker: &str) -> String {
     let trimmed_start = sql.len().saturating_sub(sql.trim_start().len());
     let trimmed = sql.trim_start();
     if trimmed
@@ -219,12 +240,12 @@ fn marked_materialized_sql(sql: &str) -> String {
         .is_some_and(|head| head.eq_ignore_ascii_case("SELECT"))
     {
         format!(
-            "{}SELECT /* {TABLE_BROWSE_MATERIALIZE_MARKER} */{}",
+            "{}SELECT /* {marker} */{}",
             &sql[..trimmed_start],
             &trimmed[6..]
         )
     } else {
-        format!("/* {TABLE_BROWSE_MATERIALIZE_MARKER} */\n{sql}")
+        format!("/* {marker} */\n{sql}")
     }
 }
 
@@ -1374,6 +1395,20 @@ mod tests {
     }
 
     #[test]
+    fn a_filtered_re_query_is_recognizable_as_this_features_own() {
+        let user_sql = "SELECT * FROM EMP";
+        assert!(!is_generated_grid_statement(user_sql));
+
+        let filtered = marked_result_filter_sql(&format!(
+            "SELECT * FROM (\n{user_sql}\n) sq_src\nWHERE DEPTNO = 10"
+        ));
+        assert!(is_generated_grid_statement(&filtered));
+        // Lazy fetch stays on: only a page statement is materialized.
+        assert!(!is_materialized_grid_statement(&filtered));
+        assert!(filtered.starts_with("SELECT /*"));
+    }
+
+    #[test]
     fn every_page_and_count_statement_is_recognizable_as_this_features_own() {
         let request = TableBrowsePageRequest {
             result_tab_id: ResultTabId::new(1),
@@ -1392,6 +1427,7 @@ mod tests {
             &request.logical_sql().unwrap()
         ));
         assert!(!is_materialized_grid_statement("SELECT * FROM EMP"));
+        assert!(is_generated_grid_statement(&request.page_sql().unwrap()));
     }
 
     #[test]
