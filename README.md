@@ -28,9 +28,9 @@ extracted binary is enough to connect, run a script, and read the result.
 
 | Area | What you get |
 | --- | --- |
-| Editor | IntelliSense over live metadata, signature hints, SQL-aware formatter, multiple file tabs, find and replace, quick describe |
+| Editor | IntelliSense over live metadata, signature hints, code snippets, SQL-aware formatter, multiple file tabs, find and replace, quick describe |
 | Execution | One statement, a selection, or a full script with SQL*Plus-style commands, bind variables, ref cursors, and per-statement timeouts |
-| Results | Independent result tabs, lazy fetch, sorting, in-grid text search, export to CSV/TSV/JSON/XML/HTML/Markdown/SQL, and staged in-grid editing |
+| Results | Independent result tabs, lazy fetch, sorting, in-grid text search, selection totals, export to CSV/TSV/JSON/XML/HTML/Markdown/SQL, and staged in-grid editing |
 | Objects | Filterable object tree, structure/index/constraint inspection, DDL generation, confirmed drop/truncate, file import into a table, and table browsing with database-side paging |
 | Operations | Session activity, persisted query history, application log, and crash reports |
 
@@ -117,6 +117,7 @@ macOS, use `Cmd` where `Ctrl` is shown.
 | Explain Plan / EXPLAIN | `F6` |
 | Commit / roll back | `F7` / `F8` |
 | Open IntelliSense | `Ctrl+Space` |
+| Expand the code snippet at the cursor | `Tab` or `Ctrl+J` |
 | Format the selection or current statement | `Ctrl+Shift+F` |
 
 The complete shortcut list is available under **Help > Keyboard Shortcuts**.
@@ -158,6 +159,29 @@ The editor also supports multiple SQL file tabs, open/save/recent files,
 syntax highlighting, find and replace, undo/redo, comment toggling, selection
 case conversion, SQL block selection, execution timeouts, and previous/next
 query-history navigation.
+
+#### Code snippets (live templates)
+
+Type an abbreviation and press `Tab` to expand it into a statement skeleton.
+The first placeholder is selected, so typing replaces it; `Tab` again moves to
+the next one, and `Esc` leaves the template. Placeholders are found again by the
+literal text around them, so a name typed over the first placeholder does not
+throw off the ones after it.
+
+![The `sel` abbreviation expanded, with its first placeholder selected](docs/images/code-snippets.png)
+
+`Ctrl+J` (`Cmd+J` on macOS) expands the abbreviation too, and works while the
+completion popup is open — with the popup up, `Tab` still inserts the selected
+suggestion, as it always did. Pressing `Ctrl+J` where there is no abbreviation
+before the cursor opens the list of what can be typed, which is also under
+**Help > Code Snippets**.
+
+![The built-in code snippets and their bodies](docs/images/snippet-reference.png)
+
+The built-in templates cover `SELECT`, `SELECT COUNT(*)`, `INSERT`, `UPDATE`,
+`DELETE`, inner and left joins, `CASE`, `CREATE TABLE`, and the PL/SQL block,
+`IF`, and numeric `FOR` loop. A multi-line body is indented to match the line
+the abbreviation was typed on.
 
 ### SQL formatting
 
@@ -296,6 +320,23 @@ Matching covers the full stored value, not the shortened text a narrow cell
 draws, and it uses the same search the editor's **Find** uses.
 
 ![Find in Results highlighting every matching cell](docs/images/grid-search.png)
+
+#### Selection totals in the status bar
+
+Selecting more than one cell puts a count, sum, average, minimum, and maximum
+for that selection at the right end of the status bar. Nothing is sent to the
+server — it is the data the grid already holds — and the line disappears again
+as soon as the selection is a single cell.
+
+![Selection totals for a numeric column in the status bar](docs/images/selection-summary.png)
+
+The aggregate follows SQL semantics: NULLs are skipped, and **Count** is the
+number of non-NULL values in the selection rather than the number of cells.
+Sums are exact decimal arithmetic on the value the driver produced, so
+`0.1 + 0.2` is `0.3` and a long Oracle `NUMBER` keeps every digit. When any
+selected value is not a plain number — text, a date, a number with thousands
+separators — only **Count** is shown, because there is nothing meaningful to
+total. A selection too large to scan reports its size instead.
 
 For a safely identifiable Oracle, MySQL, or MariaDB single-table result,
 **Edit** mode can stage inserted, updated, deleted, or `NULL` values. Oracle

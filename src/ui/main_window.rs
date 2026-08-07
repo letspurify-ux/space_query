@@ -1015,6 +1015,10 @@ struct StatusBarWidget {
     root: Flex,
     connection_indicator: Frame,
     content: Frame,
+    /// Count/sum/average/min/max for the result grid's selection. Empty
+    /// whenever there is nothing to aggregate, so the bar reads exactly as it
+    /// did before when no selection is open.
+    selection_summary: Frame,
     additional_count: Frame,
     pulse_frame: usize,
 }
@@ -1045,6 +1049,11 @@ impl StatusBarWidget {
         content.set_label_color(theme::text_primary());
         content.set_align(Align::Inside | Align::Left);
 
+        let mut selection_summary = Frame::default();
+        selection_summary.set_frame(FrameType::NoBox);
+        selection_summary.set_label_color(theme::text_secondary());
+        selection_summary.set_align(Align::Inside | Align::Right);
+
         let mut additional_count = Frame::default();
         additional_count.set_frame(FrameType::NoBox);
         additional_count.set_label_color(theme::text_primary());
@@ -1052,6 +1061,7 @@ impl StatusBarWidget {
 
         root.fixed(&connection_indicator, 14);
         root.resizable(&content);
+        root.fixed(&selection_summary, 1);
         root.fixed(&additional_count, 1);
         root.end();
 
@@ -1059,6 +1069,7 @@ impl StatusBarWidget {
             root,
             connection_indicator,
             content,
+            selection_summary,
             additional_count,
             pulse_frame: 0,
         }
@@ -1070,6 +1081,7 @@ impl StatusBarWidget {
         has_live_connection: bool,
         activity: Option<&crate::db::DbActivitySnapshot>,
         additional_count: usize,
+        selection_summary: Option<&str>,
     ) {
         let is_connected = connection_info.is_some() && has_live_connection;
         self.connection_indicator
@@ -1081,6 +1093,7 @@ impl StatusBarWidget {
         );
         self.content.set_label(&content_label);
         self.content.set_tooltip(&content_label);
+        self.set_selection_summary(selection_summary.unwrap_or_default());
         let additional_count_label = if additional_count == 0 {
             String::new()
         } else {
@@ -1103,6 +1116,22 @@ impl StatusBarWidget {
         ));
         self.pulse_frame = self.pulse_frame.wrapping_add(STATUS_ANIMATION_STEP);
         self.redraw();
+    }
+
+    /// Give the summary exactly the width its text needs, so an empty summary
+    /// gives every pixel back to the connection/activity text.
+    fn set_selection_summary(&mut self, label: &str) {
+        if self.selection_summary.label() == label {
+            return;
+        }
+        self.selection_summary.set_label(label);
+        let width = if label.is_empty() {
+            1
+        } else {
+            Self::label_width(&self.selection_summary) + Self::TEXT_HORIZONTAL_PADDING
+        };
+        self.root.fixed(&self.selection_summary, width);
+        self.root.recalc();
     }
 
     fn resize_additional_count(&mut self) {
@@ -3408,11 +3437,13 @@ impl AppState {
         let activities = crate::db::active_db_activity_snapshots();
         let selected_activity = latest_status_activity(&activities);
         let displayed_registry_count = usize::from(selected_activity.is_some());
+        let selection_summary = self.result_tabs.selection_summary_label();
         self.status_bar.render(
             conn_info.as_ref(),
             self.has_live_connection,
             selected_activity,
             activities.len().saturating_sub(displayed_registry_count),
+            selection_summary.as_deref(),
         );
         self.render_query_cancel_activity();
         true
@@ -13954,6 +13985,42 @@ impl MainWindow {
         state
             .result_tabs
             .capture_tour_select_range(row_start, col_start, row_end, col_end);
+    }
+
+    /// What the status bar says about the result grid's selection.
+    #[doc(hidden)]
+    pub fn capture_tour_status_bar_selection_summary(&mut self) -> String {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        state.render_status_bar();
+        state.status_bar.selection_summary.label()
+    }
+
+    /// Expand the code snippet abbreviation before the editor's cursor, as
+    /// `Tab` does.
+    #[doc(hidden)]
+    pub fn capture_tour_expand_snippet(&mut self) -> bool {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let expanded = state.sql_editor.expand_snippet_at_cursor();
+        state.window.redraw();
+        expanded
+    }
+
+    /// Move to the code snippet's next placeholder, as `Tab` does.
+    #[doc(hidden)]
+    pub fn capture_tour_advance_snippet(&mut self) -> bool {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let advanced = state.sql_editor.advance_snippet_placeholder();
+        state.window.redraw();
+        advanced
     }
 
     /// Drop the visible result grid's selection, as a click outside it would.

@@ -76,6 +76,23 @@ fn show_info_dialog(title: &str, content: &str, width: i32, height: i32) {
     Window::delete(dialog);
 }
 
+/// The built-in code snippets and how to expand them.
+///
+/// Shared by `Help > Code Snippets` and by `Ctrl+J` pressed where there is no
+/// abbreviation to expand.
+///
+/// Public only so `capture_feature_tour` can shoot the same dialog the menu
+/// opens; not part of the supported surface.
+#[doc(hidden)]
+pub fn show_snippet_reference_dialog() {
+    show_info_dialog(
+        "Code Snippets",
+        &crate::ui::sql_editor::snippets::reference_text(),
+        640,
+        640,
+    );
+}
+
 fn build_about_dialog_content() -> String {
     let version = crate::version::display_version();
     let build_profile = if cfg!(debug_assertions) {
@@ -553,6 +570,14 @@ impl MenuBarBuilder {
             show_info_dialog("About", &content, 640, 430);
         });
         menu.add(
+            "&Help/&Code Snippets",
+            Shortcut::None,
+            MenuFlag::Normal,
+            |_| {
+                show_snippet_reference_dialog();
+            },
+        );
+        menu.add(
             "&Help/&Keyboard Shortcuts",
             Shortcut::None,
             MenuFlag::Normal,
@@ -586,6 +611,8 @@ impl MenuBarBuilder {
                     Ctrl+U - Uppercase Selection\n\
                     Ctrl+L - Lowercase Selection\n\
                     Ctrl+Space - Intellisense\n\
+                    Tab - Expand Code Snippet / Next Placeholder\n\
+                    Ctrl+J - Expand Code Snippet (or list them)\n\
                     Ctrl+Shift+Up/Down - Select SQL Block\n\
                     Ctrl+Click - Quick Describe at Cursor\n\n\
                     View:\n\

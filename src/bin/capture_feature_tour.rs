@@ -1600,6 +1600,140 @@ fn capture_session_activity(main_window: &mut MainWindow) {
     save_main("/tmp/space-query-session-activity.ppm");
 }
 
+/// A grid selection over a numeric column, with the aggregate the status bar
+/// derives from it.
+fn capture_selection_summary(main_window: &mut MainWindow) {
+    let columns = [
+        ("EMPNO", "NUMBER"),
+        ("ENAME", "VARCHAR2"),
+        ("JOB", "VARCHAR2"),
+        ("DEPTNO", "NUMBER"),
+        ("SAL", "NUMBER"),
+        ("HIREDATE", "DATE"),
+    ];
+    let rows: &[&[&str]] = &[
+        &["7369", "SMITH", "CLERK", "20", "800", "1980-12-17"],
+        &["7499", "ALLEN", "SALESMAN", "30", "1600", "1981-02-20"],
+        &["7521", "WARD", "SALESMAN", "30", "1250", "1981-02-22"],
+        &["7566", "JONES", "MANAGER", "20", "2975", "1981-04-02"],
+        &["7654", "MARTIN", "SALESMAN", "30", "1250", "1981-09-28"],
+        &["7698", "BLAKE", "MANAGER", "30", "2850", "1981-05-01"],
+        &["7782", "CLARK", "MANAGER", "10", "2450", "1981-06-09"],
+        &["7788", "SCOTT", "ANALYST", "20", "3000", "1987-04-19"],
+        &["7839", "KING", "PRESIDENT", "10", "5000", "1981-11-17"],
+        &["7844", "TURNER", "SALESMAN", "30", "1500", "1981-09-08"],
+        &["7876", "ADAMS", "CLERK", "20", "1100", "1987-05-23"],
+        &["7900", "JAMES", "CLERK", "30", "950", "1981-12-03"],
+        &["7902", "FORD", "ANALYST", "20", "3000", "1981-12-03"],
+        &["7934", "MILLER", "CLERK", "10", "1300", "1982-01-23"],
+    ];
+    main_window
+        .capture_tour_show_result(
+            "Result",
+            make_result(&columns, rows, "SELECT * FROM EMP ORDER BY EMPNO"),
+            false,
+            // The SAL column, every row: the drag a user makes to total a
+            // number column.
+            Some((0, 4, 13, 4)),
+        )
+        .unwrap_or_else(|err| fail(format!("show result: {err}")));
+    pump(350);
+
+    let summary = main_window.capture_tour_status_bar_selection_summary();
+    let expected = "Count: 14  Sum: 29025  Avg: 2073.214286  Min: 800  Max: 5000";
+    if summary != expected {
+        fail(format!(
+            "status bar selection summary was {summary:?}, expected {expected:?}"
+        ));
+    }
+
+    main_window.capture_tour_clear_result_selection();
+    pump(150);
+    let cleared = main_window.capture_tour_status_bar_selection_summary();
+    if !cleared.is_empty() {
+        fail(format!(
+            "status bar kept the selection summary {cleared:?} after the selection was dropped"
+        ));
+    }
+
+    main_window.capture_tour_select_result_range(0, 4, 13, 4);
+    pump(200);
+    save_main_bottom("/tmp/space-query-selection-summary.ppm", 300);
+}
+
+/// The bottom strip of the main window — the end of the result grid and the
+/// status bar under it.
+fn save_main_bottom(path: &str, height: i32) {
+    let window =
+        app::widget_from_id::<Window>("main_window").unwrap_or_else(|| fail("main window"));
+    let (width, window_height) = (window.width(), window.height());
+    save_main_part(path, 0, window_height - height, width, height);
+}
+
+/// A code snippet abbreviation expanded into its template, with the first
+/// placeholder selected.
+fn capture_code_snippets(main_window: &mut MainWindow) {
+    let editor = main_window.capture_tour_set_sql("sel", None);
+    let mut buffer = editor
+        .buffer()
+        .unwrap_or_else(|| fail("editor buffer is missing"));
+
+    if !main_window.capture_tour_expand_snippet() {
+        fail("the `sel` abbreviation did not expand");
+    }
+    pump(200);
+    let expanded = buffer.text();
+    if expanded != "SELECT *\nFROM table\nWHERE condition" {
+        fail(format!("`sel` expanded to {expanded:?}"));
+    }
+    if buffer.selection_text() != "table" {
+        fail(format!(
+            "the first placeholder was not selected, selection is {:?}",
+            buffer.selection_text()
+        ));
+    }
+    save_main_top("/tmp/space-query-code-snippets.ppm", 200);
+
+    // Typing over the placeholder and pressing Tab again finds the next one,
+    // even though everything before it just changed length.
+    let (selection_start, selection_end) = buffer
+        .selection_position()
+        .unwrap_or_else(|| fail("the placeholder selection is gone"));
+    buffer.replace(selection_start, selection_end, "warehouse_inventory");
+    if !main_window.capture_tour_advance_snippet() {
+        fail("Tab did not reach the next placeholder");
+    }
+    pump(150);
+    if buffer.selection_text() != "condition" {
+        fail(format!(
+            "the second placeholder was not selected, selection is {:?}",
+            buffer.selection_text()
+        ));
+    }
+    if buffer.text() != "SELECT *\nFROM warehouse_inventory\nWHERE condition" {
+        fail(format!("the template lost its text: {:?}", buffer.text()));
+    }
+
+    // The template is over once its last placeholder has been visited.
+    if main_window.capture_tour_advance_snippet() {
+        fail("Tab kept walking past the last placeholder");
+    }
+
+    app::add_timeout3(0.45, |_| {
+        capture_active_dialog("Code Snippets", "/tmp/space-query-snippet-reference.ppm")
+    });
+    space_query::ui::menu::show_snippet_reference_dialog();
+
+    let _ = main_window.capture_tour_set_sql("", Some(0));
+}
+
+/// The top strip of the main window — the SQL editor and the toolbar over it.
+fn save_main_top(path: &str, height: i32) {
+    let window =
+        app::widget_from_id::<Window>("main_window").unwrap_or_else(|| fail("main window"));
+    save_main_part(path, 0, 0, window.width(), height);
+}
+
 fn capture_dialogs(config: &AppConfig) {
     app::add_timeout3(0.45, |_| {
         capture_active_dialog("Connect to Database", "/tmp/space-query-connect.ppm")
@@ -1761,6 +1895,17 @@ fn main() {
         app::quit();
         return;
     }
+    if capture_mode.as_deref() == Some("selection-summary") {
+        capture_object_browser(&mut main_window);
+        capture_selection_summary(&mut main_window);
+        app::quit();
+        return;
+    }
+    if capture_mode.as_deref() == Some("code-snippets") {
+        capture_code_snippets(&mut main_window);
+        app::quit();
+        return;
+    }
     if capture_mode.as_deref() == Some("object-drop-confirmation") {
         capture_object_browser(&mut main_window);
         capture_object_drop_confirmation("/tmp/space-query-object-drop-confirmation.ppm");
@@ -1783,6 +1928,8 @@ fn main() {
     capture_formatting(&mut main_window);
     capture_result_grid(&mut main_window);
     capture_grid_search(&mut main_window);
+    capture_selection_summary(&mut main_window);
+    capture_code_snippets(&mut main_window);
     capture_object_drop_confirmation("/tmp/space-query-object-drop-confirmation.ppm");
     capture_grid_sql_export(&mut main_window);
     capture_result_export(&mut main_window);

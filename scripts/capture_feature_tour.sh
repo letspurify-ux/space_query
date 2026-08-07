@@ -79,6 +79,17 @@ if [[ "$capture_mode" == "grid-search" ]]; then
   exit 0
 fi
 
+if [[ "$capture_mode" == "selection-summary" ]]; then
+  convert_capture selection-summary selection-summary
+  exit 0
+fi
+
+if [[ "$capture_mode" == "code-snippets" ]]; then
+  convert_capture code-snippets code-snippets
+  convert_capture snippet-reference snippet-reference
+  exit 0
+fi
+
 if [[ "$capture_mode" == "object-drop-confirmation" ]]; then
   convert_capture object-drop-confirmation object-drop-confirmation
   exit 0
@@ -104,6 +115,9 @@ convert_capture formatting-before sql-formatting-before
 convert_capture formatting-after sql-formatting-after
 convert_capture result-grid result-grid
 convert_capture grid-search grid-search
+convert_capture selection-summary selection-summary
+convert_capture code-snippets code-snippets
+convert_capture snippet-reference snippet-reference
 convert_capture object-drop-confirmation object-drop-confirmation
 convert_capture grid-sql-export grid-sql-export
 convert_capture result-export result-export

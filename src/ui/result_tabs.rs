@@ -2712,6 +2712,17 @@ impl ResultTabsWidget {
         true
     }
 
+    /// The count/sum/average/min/max the status bar shows for the visible
+    /// grid's selection.
+    ///
+    /// `None` whenever there is nothing to report: no result grid, a grid that
+    /// is not the tab on screen, or a selection of a single cell.
+    pub(crate) fn selection_summary_label(&self) -> Option<String> {
+        self.current_table()
+            .filter(ResultTableWidget::is_on_screen)?
+            .selection_summary_label()
+    }
+
     /// Whether the visible grid has a selection an export could be narrowed to.
     pub(crate) fn has_grid_selection(&self) -> bool {
         self.current_table()

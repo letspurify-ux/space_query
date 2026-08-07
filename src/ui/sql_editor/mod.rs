@@ -57,6 +57,7 @@ mod intellisense_state;
 pub(crate) mod macos_ime;
 // 공통 파싱/토큰 유틸(실행, 인텔리센스, 포맷팅 공통 경로)
 pub(crate) mod query_text;
+pub(crate) mod snippets;
 
 use self::chunked_text::{ChunkedText, ChunkedTextSlice, ChunkedValues, RunValues};
 use self::intellisense_state::{
@@ -2020,6 +2021,9 @@ pub struct SqlEditorWidget {
     /// coming even though the editor looks idle and no batch has begun.
     deferred_executions: Arc<AtomicUsize>,
     display_metrics_ready: Arc<AtomicBool>,
+    /// The code snippet the cursor is currently inside, if any. See
+    /// `snippets::SnippetSession`.
+    snippet_session: Arc<Mutex<Option<snippets::SnippetSession>>>,
 }
 impl SqlEditorWidget {
     fn shared_editor_instance_counter() -> Arc<AtomicU64> {
@@ -2892,6 +2896,7 @@ impl SqlEditorWidget {
         )));
         let deferred_executions = Arc::new(AtomicUsize::new(0));
         let display_metrics_ready = Arc::new(AtomicBool::new(true));
+        let snippet_session = Arc::new(Mutex::new(None));
 
         let mut widget = Self {
             group,
@@ -2951,6 +2956,7 @@ impl SqlEditorWidget {
             cancel_timeout,
             deferred_executions,
             display_metrics_ready,
+            snippet_session,
         };
 
         widget.setup_intellisense();

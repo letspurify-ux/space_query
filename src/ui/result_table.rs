@@ -31,6 +31,7 @@ use crate::ui::font_settings::{
 use crate::ui::grid_search::{grid_matches, GridSearchHighlight};
 use crate::ui::grid_sql_export::GridSqlSelection;
 use crate::ui::result_export::{ExportDestination, ExportFormat, ExportGrid, ExportScope};
+use crate::ui::selection_summary::{summarize_selection, SelectionSummary};
 use crate::ui::sql_editor::LazyFetchRequest;
 use crate::ui::theme;
 use crate::utils::arithmetic::safe_div;
@@ -368,6 +369,20 @@ pub struct ResultTableWidget {
     /// dialog watches it so match coordinates collected before a result landed
     /// are never stepped through afterwards.
     data_generation: Arc<AtomicU64>,
+    /// Last status-bar aggregate and what it was computed from. The status bar
+    /// asks for the summary on every animation frame, so the scan must run only
+    /// when the selection or the rows underneath it actually changed.
+    selection_summary_cache: Arc<Mutex<SelectionSummaryCache>>,
+}
+
+/// See `ResultTableWidget::selection_summary_cache`.
+#[derive(Default)]
+struct SelectionSummaryCache {
+    /// Selection bounds, row-replacement generation, and fetched row count —
+    /// the three things that can change what the aggregate covers. The row
+    /// count is in there because streaming appends rows without replacing them.
+    key: Option<((i32, i32, i32, i32), u64, usize)>,
+    summary: Option<SelectionSummary>,
 }
 
 #[derive(Default)]
@@ -2095,6 +2110,7 @@ impl ResultTableWidget {
         let search_highlight: Arc<Mutex<GridSearchHighlight>> =
             Arc::new(Mutex::new(GridSearchHighlight::default()));
         let data_generation = Arc::new(AtomicU64::new(0));
+        let selection_summary_cache = Arc::new(Mutex::new(SelectionSummaryCache::default()));
 
         let mut table = Table::new(x, y, w, h, None);
 
@@ -3182,6 +3198,7 @@ impl ResultTableWidget {
             drag_state,
             search_highlight,
             data_generation,
+            selection_summary_cache,
         }
     }
 
@@ -9202,6 +9219,12 @@ impl ResultTableWidget {
             .any(|index| !Self::is_internal_export_column(&headers, index, hidden_col, rowid_col))
     }
 
+    /// Whether this grid is the one actually drawn right now — its result tab
+    /// is selected and every parent is showing.
+    pub(crate) fn is_on_screen(&self) -> bool {
+        self.table.visible_r()
+    }
+
     /// Whether the grid currently has a selected cell range.
     pub(crate) fn has_selection(&self) -> bool {
         Self::normalized_selection_bounds_with_limits(
@@ -9470,6 +9493,50 @@ impl ResultTableWidget {
             self.table.cols().max(0) as usize,
         )
         .map(|(row_top, col_left, _, _)| (row_top, col_left))
+    }
+
+    /// The aggregate the status bar shows for the current selection, or `None`
+    /// when the selection is a single cell (nothing to aggregate) or the grid
+    /// is empty.
+    ///
+    /// Memoized: the scan runs only when the selection, the row-replacement
+    /// generation, or the fetched row count changed since the last call.
+    pub(crate) fn selection_summary_label(&self) -> Option<String> {
+        let rows = self
+            .full_data
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let key = (
+            self.table.get_selection(),
+            self.data_generation.load(Ordering::Relaxed),
+            rows.len(),
+        );
+        let mut cache = self
+            .selection_summary_cache
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if cache.key != Some(key) {
+            let bounds = Self::normalized_selection_bounds_with_limits(
+                key.0,
+                rows.len(),
+                self.table.cols().max(0) as usize,
+            );
+            let null_text = self
+                .null_text
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .clone();
+            cache.summary = bounds.and_then(|bounds| {
+                summarize_selection(
+                    &rows,
+                    bounds,
+                    self.hidden_auto_rowid_col_value(),
+                    &null_text,
+                )
+            });
+            cache.key = Some(key);
+        }
+        cache.summary.as_ref().map(SelectionSummary::label)
     }
 
     pub(crate) fn set_search_highlight(

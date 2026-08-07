@@ -35,6 +35,25 @@ Besides ordinary query results, ref cursors, Quick Describe, object-browser
 queries, and Explain Plan can use Data Grid. `append_explain_plan_tab()` converts
 plan text to a one-column `QueryResult` whose column is named `Text`.
 
+## Selection totals
+
+`selection_summary.rs` aggregates the selected cells for the status bar. The
+rules it holds to:
+
+- Only the grid actually on screen reports a summary
+  (`ResultTabs::selection_summary_label` gates on `is_on_screen()`), and only
+  when the selection covers more than one cell.
+- SQL aggregate semantics: NULLs are skipped and `Count` is the number of
+  non-NULL values, not the number of selected cells. The zero-width auto-`ROWID`
+  column of edit mode is never aggregated.
+- Sums are exact decimal arithmetic over the driver's own spelling (`i128` at a
+  common scale), never `f64`. If a value is not a plain decimal, or the exact
+  arithmetic leaves `i128` range, the numeric part is dropped and only `Count`
+  is reported — an approximate total is never shown.
+- The status bar asks on every animation frame, so the scan is memoized on
+  (selection bounds, data generation, row count) and a selection above
+  `MAX_SCANNED_CELLS` reports its size without scanning.
+
 ## Grid editing
 
 `src/db/result_edit.rs` defines the backend-neutral edit descriptor, typed row

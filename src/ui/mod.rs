@@ -33,6 +33,7 @@ pub(crate) mod result_filter;
 pub mod result_import;
 pub mod result_table;
 pub mod result_tabs;
+pub(crate) mod selection_summary;
 pub mod settings_dialog;
 pub(crate) mod sql_depth;
 pub mod sql_editor;

@@ -564,6 +564,10 @@ impl SqlEditorWidget {
         let mut keydown_buffer_revision_for_handle =
             intellisense_runtime_for_handle.current_buffer_revision();
         let mut keydown_had_ctrl_or_cmd_for_handle = false;
+        // A Tab that KeyDown gave to a code snippet. Its KeyUp must not reach
+        // the completion path, or the popup would open over the placeholder
+        // the expansion just selected — and then own the next Tab.
+        let mut snippet_tab_keyup_for_handle = false;
         let mut keydown_had_alt_for_handle = false;
         let mut widget_for_shortcuts = self.clone();
         let find_callback_for_handle = self.find_callback.clone();
@@ -829,6 +833,7 @@ impl SqlEditorWidget {
                 }
                 Event::KeyDown => {
                     let key = fltk::app::event_key();
+                    snippet_tab_keyup_for_handle = false;
                     let original_key = fltk::app::event_original_key();
                     crate::ui::sql_editor::ime_trace(|| {
                         format!(
@@ -912,6 +917,7 @@ impl SqlEditorWidget {
                     }
 
                     if shortcut_key == Key::Escape {
+                        widget_for_shortcuts.cancel_snippet_session();
                         widget_for_shortcuts.dismiss_signature_popup();
                         if popup_visible {
                             Self::request_intellisense_popup_hide(
@@ -1141,6 +1147,25 @@ impl SqlEditorWidget {
                                 widget_for_shortcuts.execute_statement_at_cursor();
                                 return true;
                             }
+                            k if Self::matches_alpha_shortcut(k, 'j') => {
+                                // Expand a code snippet even while the
+                                // completion popup owns Tab. With no
+                                // abbreviation before the cursor there is
+                                // nothing to expand, so show what can be typed.
+                                if popup_visible {
+                                    Self::request_intellisense_popup_hide(
+                                        &intellisense_popup_for_handle,
+                                        &intellisense_runtime_for_handle,
+                                    );
+                                }
+                                Self::invalidate_and_clear_pending_intellisense_state(
+                                    &intellisense_runtime_for_handle,
+                                );
+                                if !widget_for_shortcuts.expand_snippet_at_cursor() {
+                                    crate::ui::menu::show_snippet_reference_dialog();
+                                }
+                                return true;
+                            }
                             k if Self::matches_alpha_shortcut(k, 'f') => {
                                 Self::invoke_void_callback(&find_callback_for_handle);
                                 return true;
@@ -1224,6 +1249,26 @@ impl SqlEditorWidget {
                                 &intellisense_runtime_for_handle,
                                 true,
                             );
+                            return true;
+                        }
+                    }
+
+                    // Tab belongs to the code snippet the cursor is inside,
+                    // and otherwise expands the abbreviation before it. The
+                    // completion popup was offered the key first (above), so a
+                    // visible popup still consumes Tab as it always did.
+                    if !ctrl_or_cmd && !alt && !shift && key == Key::Tab {
+                        if widget_for_shortcuts.snippet_session_is_active()
+                            && widget_for_shortcuts.advance_snippet_placeholder()
+                        {
+                            snippet_tab_keyup_for_handle = true;
+                            return true;
+                        }
+                        if widget_for_shortcuts.expand_snippet_at_cursor() {
+                            Self::invalidate_and_clear_pending_intellisense_state(
+                                &intellisense_runtime_for_handle,
+                            );
+                            snippet_tab_keyup_for_handle = true;
                             return true;
                         }
                     }
@@ -1329,6 +1374,12 @@ impl SqlEditorWidget {
                     // KeyUp fires AFTER the character is inserted into the buffer.
                     // Filter/show intellisense here.
                     let key = fltk::app::event_key();
+                    if key == Key::Tab && snippet_tab_keyup_for_handle {
+                        // KeyDown expanded a snippet or stepped to the next
+                        // placeholder. See `snippet_tab_keyup_for_handle`.
+                        snippet_tab_keyup_for_handle = false;
+                        return true;
+                    }
                     let original_key = fltk::app::event_original_key();
                     let event_text = fltk::app::event_text();
                     let state = fltk::app::event_state();
