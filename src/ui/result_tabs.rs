@@ -118,27 +118,6 @@ struct TableBrowseState {
 }
 
 impl TableBrowseState {
-    /// The state a filter-bearing query tab starts browsing with.
-    ///
-    /// A zero page size means "inherit the applied one", and a tab that has
-    /// never browsed has none to inherit — storing the zero would make its
-    /// every page query fail before it reaches the server. The caller's current
-    /// page-size setting stands in.
-    fn promoted(request: &TableBrowsePageRequest, fallback_page_size: usize) -> Self {
-        let mut applied_request = request.clone();
-        if applied_request.page_size == 0 {
-            applied_request.page_size = fallback_page_size;
-        }
-        Self {
-            applied_request,
-            pending_request: None,
-            has_next: false,
-            loading: false,
-            last_success: None,
-            last_edit_descriptor: None,
-        }
-    }
-
     fn normalize_request(&self, request: &mut TableBrowsePageRequest) {
         request.target = self.applied_request.target.clone();
         if request.page_size == 0 {
@@ -1849,13 +1828,12 @@ impl ResultTabsWidget {
         {
             let callback = self.table_browse_callback.clone();
             let mut bar = filter_bar.clone();
-            let redirect: HeaderSortRedirectCallback = Arc::new(Mutex::new(Some(Box::new(
-                move |column: String, ascending| {
-                    let order_by = if ascending {
-                        column
-                    } else {
-                        format!("{column} DESC")
-                    };
+            let redirect: HeaderSortRedirectCallback =
+                Arc::new(Mutex::new(Some(Box::new(move |column: String| {
+                    let order_by = crate::ui::table_browse::next_order_by_for_header_sort(
+                        &bar.order_by_text(),
+                        &column,
+                    );
                     bar.set_order_by_text(&order_by);
                     let request = TableBrowsePageRequest {
                         result_tab_id: id,
@@ -1871,8 +1849,7 @@ impl ResultTabsWidget {
                     // Taken either way: a failed re-query must not silently fall
                     // back to a local sort that means something different.
                     true
-                },
-            ))));
+                }))));
             let mut table = parts.1.clone();
             table.set_header_sort_redirect(redirect);
         }
@@ -1904,36 +1881,6 @@ impl ResultTabsWidget {
                 .get(index)
                 .is_some_and(|tab| tab.filter_bar.is_some())
         })
-    }
-
-    /// Turn a filter-bearing query tab into a table-browse tab, at the moment
-    /// its first filter is applied and a page query is about to run.
-    ///
-    /// Returns false if the tab is gone; a tab that is already browsing counts
-    /// as success so the caller can call this unconditionally.
-    pub(crate) fn promote_query_tab_to_table_browse(
-        &mut self,
-        request: &TableBrowsePageRequest,
-        fallback_page_size: usize,
-    ) -> bool {
-        let Some(index) = self.result_tab_index_for_id(request.result_tab_id) else {
-            return false;
-        };
-        let mut data = self
-            .data
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let Some(tab) = data.get_mut(index) else {
-            return false;
-        };
-        if matches!(tab.kind, ResultTabKind::TableBrowse(_)) {
-            return true;
-        }
-        tab.kind = ResultTabKind::TableBrowse(Box::new(TableBrowseState::promoted(
-            request,
-            fallback_page_size,
-        )));
-        true
     }
 
     pub(crate) fn set_table_browse_callback(&mut self, callback: TableBrowseExecuteCallback) {
@@ -3595,28 +3542,6 @@ mod tests {
         inherited.page_size = 0;
         state.normalize_request(&mut inherited);
         assert_eq!(inherited.page_size, 500);
-    }
-
-    #[test]
-    fn promoting_a_query_tab_seeds_the_page_size_the_request_has_none_of() {
-        let target = TableBrowseTarget::new(
-            crate::db::DatabaseType::MySQL,
-            Some("APP".to_string()),
-            "Result".to_string(),
-            "(SELECT * FROM `APP`.`EMP`) sq_result".to_string(),
-            String::new(),
-        );
-        // What the filter bar and the header-sort redirect send: "inherit the
-        // applied page size", which a query tab does not have yet.
-        let mut request = TableBrowsePageRequest::first(ResultTabId::new(3), target);
-        request.page_size = 0;
-
-        let state = TableBrowseState::promoted(&request, 100);
-        assert_eq!(state.applied_request.page_size, 100);
-
-        state.normalize_request(&mut request);
-        assert_eq!(request.page_size, 100);
-        assert!(request.page_sql().is_ok());
     }
 
     #[test]

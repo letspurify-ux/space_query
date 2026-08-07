@@ -109,7 +109,7 @@ pub type ResultTableContextActionCallback =
 /// column name and whether the click asked for ascending order, and returns
 /// true when it took the sort — false falls back to the local sort, so a grid
 /// whose tab can no longer re-query still orders.
-pub type HeaderSortRedirectCallback = Arc<Mutex<Option<Box<dyn FnMut(String, bool) -> bool>>>>;
+pub type HeaderSortRedirectCallback = Arc<Mutex<Option<Box<dyn FnMut(String) -> bool>>>>;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ResultTableContextAction {
@@ -831,7 +831,6 @@ impl ResultTableWidget {
         headers: &Arc<Mutex<Vec<String>>>,
         redirect: &HeaderSortRedirectCallback,
         col_idx: usize,
-        direction: SortDirection,
     ) -> bool {
         let column = headers
             .lock()
@@ -846,7 +845,7 @@ impl ResultTableWidget {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         match guard.as_mut() {
-            Some(callback) => callback(column, direction == SortDirection::Ascending),
+            Some(callback) => callback(column),
             None => false,
         }
     }
@@ -2980,20 +2979,21 @@ impl ResultTableWidget {
                             && !mutex_load_bool(&streaming_in_progress_for_handle)
                         {
                             let col_idx = col as usize;
+                            // The redirect owns its own direction; see
+                            // apply_header_sort_action.
+                            if Self::try_redirect_header_sort(
+                                &headers_for_handle,
+                                &header_sort_redirect_for_handle,
+                                col_idx,
+                            ) {
+                                return true;
+                            }
                             let next_state = {
                                 let current = *sort_state_for_handle
                                     .lock()
                                     .unwrap_or_else(|poisoned| poisoned.into_inner());
                                 Self::next_sort_state(current, col_idx)
                             };
-                            if Self::try_redirect_header_sort(
-                                &headers_for_handle,
-                                &header_sort_redirect_for_handle,
-                                col_idx,
-                                next_state.direction,
-                            ) {
-                                return true;
-                            }
                             if Self::apply_sort_to_table_data(
                                 &full_data_for_handle,
                                 &edit_session_for_handle,
@@ -8920,12 +8920,10 @@ impl ResultTableWidget {
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
             Self::next_sort_state(current, col_idx)
         };
-        if Self::try_redirect_header_sort(
-            &self.headers,
-            &self.header_sort_redirect,
-            col_idx,
-            next_state.direction,
-        ) {
+        // The redirect decides its own direction: it cycles the ORDER BY it
+        // owns, which the user can also type into, and the local sort state
+        // this reads is never advanced while sorting happens on the server.
+        if Self::try_redirect_header_sort(&self.headers, &self.header_sort_redirect, col_idx) {
             return;
         }
         if Self::apply_sort_to_table_data(

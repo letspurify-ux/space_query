@@ -559,9 +559,10 @@ pub enum QueryProgress {
     /// the attempt that fails. This carries the failure back, so state the
     /// caller reserved for the statement is released instead of stranded.
     ExecutionAbandoned {
-        /// Whether the abandoned statement was an internal materialized grid
-        /// statement — the only kind that reserves result-grid routing.
-        materialized_grid_statement: bool,
+        /// The statement that never ran, exactly as the caller handed it over,
+        /// so a caller can tell whether the failure is the one it is waiting
+        /// for.
+        sql: String,
         message: String,
     },
     StatementFinished {

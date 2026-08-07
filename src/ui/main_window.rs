@@ -837,6 +837,19 @@ struct QueryProgressContext {
     total_units: Option<usize>,
 }
 
+/// A statement whose result must land in a result tab that already exists,
+/// instead of one reserved for it when the batch starts.
+#[derive(Clone)]
+struct ResultGridExecution {
+    result_tab_id: ResultTabId,
+    /// The statement text, when the window is the one that wrote it. It
+    /// identifies this reservation if the execution is abandoned before it
+    /// starts, so a different statement's failure cannot retire it. `None` for
+    /// a structured result edit, whose statement the editor builds itself —
+    /// and which never defers, so it is never abandoned.
+    sql: Option<String>,
+}
+
 #[derive(Clone)]
 struct PendingTableBrowseLast {
     request: TableBrowsePageRequest,
@@ -1540,7 +1553,7 @@ pub struct AppState {
     rollback_btn: Button,
     transaction_isolation_choice: Choice,
     transaction_access_choice: Choice,
-    result_grid_execution_targets: HashMap<QueryTabId, ResultTabId>,
+    result_grid_execution_targets: HashMap<QueryTabId, ResultGridExecution>,
     pending_table_browse_last: HashMap<QueryTabId, PendingTableBrowseLast>,
     pending_table_browse_refresh: HashMap<QueryTabId, PendingTableBrowseRefresh>,
     progress_contexts: HashMap<QueryTabId, QueryProgressContext>,
@@ -2390,6 +2403,14 @@ impl AppState {
         sessions_to_cancel
     }
 
+    /// The result tab a statement running for `tab_id` must deliver to, if one
+    /// is reserved.
+    fn result_grid_execution_target(&self, tab_id: QueryTabId) -> Option<ResultTabId> {
+        self.result_grid_execution_targets
+            .get(&tab_id)
+            .map(|execution| execution.result_tab_id)
+    }
+
     fn finish_progress_context(&mut self, tab_id: QueryTabId) {
         let mut finished_target = None;
         if let Some(context) = self.progress_contexts.remove(&tab_id) {
@@ -2409,10 +2430,7 @@ impl AppState {
         // cancelled, say) is finalized here too, and clearing by tab id alone
         // would strand it: with no execution target the next batch clears the
         // result grids and renders the page as a brand-new query result.
-        if batch_owns_grid_target(
-            finished_target,
-            self.result_grid_execution_targets.get(&tab_id).copied(),
-        ) {
+        if batch_owns_grid_target(finished_target, self.result_grid_execution_target(tab_id)) {
             self.result_grid_execution_targets.remove(&tab_id);
         }
         self.start_pending_metadata_refresh_if_ready();
@@ -8375,7 +8393,7 @@ impl MainWindow {
         tab_id: QueryTabId,
         mut request: TableBrowsePageRequest,
     ) -> Result<(), String> {
-        let (editor, sql) = {
+        let (editor, sql, browsing) = {
             let mut state_guard = state
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -8391,19 +8409,8 @@ impl MainWindow {
             let mut result_tabs = state_guard
                 .result_tabs_for_tab(tab_id)
                 .ok_or_else(|| "The result workspace is closed.".to_string())?;
-            // A query result the user asked to filter carries a filter bar
-            // while still being a plain query tab, so that statement results
-            // keep taking the statement path. Applying a filter is the moment a
-            // page query really starts, so convert it here.
-            // The promoted tab has no applied page size to inherit, so it takes
-            // the page-size control's, exactly as opening a table from the
-            // object browser does.
-            let page_size =
-                result_page_unit_for_choice_index(state_guard.result_page_unit_choice.value());
-            if !result_tabs.is_table_browse_tab(request.result_tab_id)
-                && (!result_tabs.result_tab_has_filter_bar(request.result_tab_id)
-                    || !result_tabs.promote_query_tab_to_table_browse(&request, page_size))
-            {
+            let browsing = result_tabs.is_table_browse_tab(request.result_tab_id);
+            if !browsing && !result_tabs.result_tab_has_filter_bar(request.result_tab_id) {
                 return Err("The table result tab is closed.".to_string());
             }
             if !state_guard.result_origin_is_current_for_tab(tab_id, &result_tabs) {
@@ -8412,18 +8419,32 @@ impl MainWindow {
                         .to_string(),
                 );
             }
-            if !result_tabs.normalize_table_browse_request(&mut request) {
-                return Err("The table result tab is closed.".to_string());
-            }
-            let sql = match request.navigation {
-                TableBrowseNavigation::Page => request.page_sql()?,
-                TableBrowseNavigation::Last => request.count_sql()?,
+            // A browsed table is paged; a filtered query result is not. The
+            // filter re-runs the user's own statement as an ordinary query, so
+            // it keeps the statement path it already had — lazy fetch and all —
+            // and only its rows change.
+            let sql = if browsing {
+                if !result_tabs.normalize_table_browse_request(&mut request) {
+                    return Err("The table result tab is closed.".to_string());
+                }
+                match request.navigation {
+                    TableBrowseNavigation::Page => request.page_sql()?,
+                    TableBrowseNavigation::Last => request.count_sql()?,
+                }
+            } else {
+                request.logical_sql()?
             };
-            result_tabs.begin_table_browse_request(request.clone())?;
-            state_guard
-                .result_grid_execution_targets
-                .insert(tab_id, request.result_tab_id);
-            if request.navigation == TableBrowseNavigation::Last {
+            if browsing {
+                result_tabs.begin_table_browse_request(request.clone())?;
+            }
+            state_guard.result_grid_execution_targets.insert(
+                tab_id,
+                ResultGridExecution {
+                    result_tab_id: request.result_tab_id,
+                    sql: Some(sql.clone()),
+                },
+            );
+            if browsing && request.navigation == TableBrowseNavigation::Last {
                 state_guard.pending_table_browse_last.insert(
                     tab_id,
                     PendingTableBrowseLast {
@@ -8433,10 +8454,15 @@ impl MainWindow {
                     },
                 );
             }
-            (editor, sql)
+            (editor, sql, browsing)
         };
 
-        if editor.execute_materialized_sql_text(&sql) {
+        let started = if browsing {
+            editor.execute_materialized_sql_text(&sql)
+        } else {
+            editor.execute_generated_sql_text(&sql)
+        };
+        if started {
             Ok(())
         } else {
             let mut state_guard = state
@@ -8523,9 +8549,13 @@ impl MainWindow {
                         },
                     );
                 }
-                state
-                    .result_grid_execution_targets
-                    .insert(tab_id, target_tab);
+                state.result_grid_execution_targets.insert(
+                    tab_id,
+                    ResultGridExecution {
+                        result_tab_id: target_tab,
+                        sql: Some(sql.clone()),
+                    },
+                );
                 editor.execute_sql_text(&sql);
                 if !editor.is_query_running() {
                     state.result_grid_execution_targets.remove(&tab_id);
@@ -8578,9 +8608,13 @@ impl MainWindow {
                         },
                     );
                 }
-                state
-                    .result_grid_execution_targets
-                    .insert(tab_id, target_tab);
+                state.result_grid_execution_targets.insert(
+                    tab_id,
+                    ResultGridExecution {
+                        result_tab_id: target_tab,
+                        sql: None,
+                    },
+                );
                 if let Err(error) = editor.execute_result_edit(request) {
                     state.result_grid_execution_targets.remove(&tab_id);
                     state.pending_table_browse_refresh.remove(&tab_id);
@@ -8912,8 +8946,7 @@ impl MainWindow {
                     owning_result_tabs.set_execution_origin(execution_origin);
                     s.refresh_tab_label(tab_id);
                     let one_tab_per_query = s.result_one_tab_per_query_check.value();
-                    let grid_execution_target =
-                        s.result_grid_execution_targets.get(&tab_id).copied();
+                    let grid_execution_target = s.result_grid_execution_target(tab_id);
                     let table_browse_page_loading = grid_execution_target.is_some_and(|target| {
                         owning_result_tabs.table_browse_is_loading(target)
                     });
@@ -9327,18 +9360,23 @@ impl MainWindow {
                         result_tabs.select_messages_errors();
                     }
                 }
-                QueryProgress::ExecutionAbandoned {
-                    materialized_grid_statement,
-                    message,
-                } => {
+                QueryProgress::ExecutionAbandoned { sql, message } => {
                     // The statement was reported as started, so its routing and
                     // the browse tab it left loading are released here or not
                     // at all: nothing else will ever finish them, and a routing
-                    // left behind would capture the next query's result.
-                    let stranded_target = if materialized_grid_statement {
+                    // left behind would capture the next query's result. Only
+                    // this statement's own reservation may go — another
+                    // statement waiting behind it keeps its own.
+                    let abandoned_own_reservation = s
+                        .result_grid_execution_targets
+                        .get(&tab_id)
+                        .is_some_and(|execution| execution.sql.as_deref() == Some(sql.as_str()));
+                    let stranded_target = if abandoned_own_reservation {
                         s.pending_table_browse_last.remove(&tab_id);
                         s.pending_table_browse_refresh.remove(&tab_id);
-                        s.result_grid_execution_targets.remove(&tab_id)
+                        s.result_grid_execution_targets
+                            .remove(&tab_id)
+                            .map(|execution| execution.result_tab_id)
                     } else {
                         None
                     };
@@ -10048,7 +10086,7 @@ impl MainWindow {
                         .unwrap_or_else(|poisoned| poisoned.into_inner());
                     if batch_owns_grid_target(
                         finished_grid_target,
-                        s.result_grid_execution_targets.get(&tab_id).copied(),
+                        s.result_grid_execution_target(tab_id),
                     ) {
                         s.result_grid_execution_targets.remove(&tab_id);
                     }

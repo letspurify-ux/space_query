@@ -2364,6 +2364,13 @@ impl SqlEditorWidget {
         self.try_execute_sql(sql, false)
     }
 
+    /// Run a statement the app wrote on the user's behalf — a re-query of a
+    /// result the user filtered — as the ordinary query it is, reporting
+    /// whether it started.
+    pub(crate) fn execute_generated_sql_text(&self, sql: &str) -> bool {
+        self.try_execute_sql(sql, false)
+    }
+
     pub fn execute_result_edit(&self, request: crate::db::ResultEditRequest) -> Result<(), String> {
         if self.is_query_running() {
             return Err("The owning query tab is already running a query.".to_string());
@@ -8730,8 +8737,7 @@ impl SqlEditorWidget {
         let _ = self
             .progress_sender
             .send(QueryProgress::ExecutionAbandoned {
-                materialized_grid_statement:
-                    crate::ui::table_browse::is_materialized_grid_statement(sql),
+                sql: sql.to_string(),
                 message: "The queued query was not started.".to_string(),
             });
         app::awake();
@@ -31841,11 +31847,9 @@ mod mysql_batch_execution_regression_tests {
                     result.sql.lines().next().unwrap_or_default(),
                     result.message
                 ),
-                QueryProgress::ExecutionAbandoned {
-                    materialized_grid_statement,
-                    message,
-                } => format!(
-                    "ExecutionAbandoned(materialized={materialized_grid_statement}, {message})"
+                QueryProgress::ExecutionAbandoned { sql, message } => format!(
+                    "ExecutionAbandoned({}, {message})",
+                    sql.lines().next().unwrap_or_default()
                 ),
                 QueryProgress::BatchFinished => "BatchFinished".to_string(),
                 QueryProgress::MetadataRefreshNeeded => "MetadataRefreshNeeded".to_string(),

@@ -27,6 +27,31 @@ pub(crate) const TABLE_BROWSE_PAGE_COLUMN: &str = "SQ_INTERNAL_PAGE_ROW";
 pub(crate) const TABLE_BROWSE_DEFAULT_PAGE_SIZE: usize = 500;
 pub(crate) const TABLE_BROWSE_FILTER_HEIGHT: i32 = 42;
 
+/// The `ORDER BY` a header click leaves behind, toggling the clicked column
+/// between ascending and descending.
+///
+/// The bar's text is the state: the user can edit it, and a redirected sort
+/// runs on the server, so the grid's own sort state never advances. Anything
+/// the click does not recognize as "just this column" — a different column, a
+/// hand-written expression — is replaced by a plain ascending sort.
+pub(crate) fn next_order_by_for_header_sort(current: &str, column: &str) -> String {
+    let column = column.trim();
+    let current = current.trim();
+    let sorts_this_column_by = current
+        .get(..column.len())
+        .filter(|head| head.eq_ignore_ascii_case(column))
+        .and_then(|_| current.get(column.len()..))
+        .map(str::trim)
+        .filter(|tail| {
+            tail.is_empty() || tail.eq_ignore_ascii_case("ASC") || tail.eq_ignore_ascii_case("DESC")
+        });
+    match sorts_this_column_by {
+        Some(tail) if tail.eq_ignore_ascii_case("DESC") => column.to_string(),
+        Some(_) => format!("{column} DESC"),
+        None => column.to_string(),
+    }
+}
+
 /// Whether this statement is a table page this feature built, rather than
 /// something the user ran. Such a statement bypasses lazy fetch, reserves
 /// result-grid routing, and is never itself a relation to filter or re-page.
@@ -1207,6 +1232,12 @@ impl TableBrowseFilterBar {
         self.where_input.value()
     }
 
+    /// The current ORDER BY text, which is also the sort state a header click
+    /// advances.
+    pub(crate) fn order_by_text(&self) -> String {
+        self.order_input.value()
+    }
+
     /// Show an ORDER BY the user did not type — a redirected header-sort click.
     pub(crate) fn set_order_by_text(&mut self, expr: &str) {
         self.order_input.set_value(expr);
@@ -1381,6 +1412,39 @@ mod tests {
             },
             "APP.EMP".to_string(),
         )
+    }
+
+    #[test]
+    fn header_clicks_toggle_a_column_between_ascending_and_descending() {
+        let first = next_order_by_for_header_sort("", "ENAME");
+        assert_eq!(first, "ENAME");
+        let second = next_order_by_for_header_sort(&first, "ENAME");
+        assert_eq!(second, "ENAME DESC");
+        let third = next_order_by_for_header_sort(&second, "ENAME");
+        assert_eq!(third, "ENAME");
+    }
+
+    #[test]
+    fn header_clicks_read_the_order_by_the_user_may_have_typed() {
+        // Spelling and spacing of a typed clause do not hide the sort it is.
+        assert_eq!(
+            next_order_by_for_header_sort("  ename   asc ", "ENAME"),
+            "ENAME DESC"
+        );
+        assert_eq!(
+            next_order_by_for_header_sort("ename desc", "ENAME"),
+            "ENAME"
+        );
+        // Another column, or an expression this click cannot claim, restarts.
+        assert_eq!(next_order_by_for_header_sort("SAL DESC", "ENAME"), "ENAME");
+        assert_eq!(
+            next_order_by_for_header_sort("ENAME, SAL", "ENAME"),
+            "ENAME"
+        );
+        assert_eq!(
+            next_order_by_for_header_sort("ENAME NULLS FIRST", "ENAME"),
+            "ENAME"
+        );
     }
 
     #[test]
