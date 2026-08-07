@@ -130,6 +130,46 @@ fn locking_clause(sql: &str, db_type: DatabaseType) -> Option<&'static str> {
         .map(|(_, label)| label)
 }
 
+/// The statement terminator a filter clause carries, if it carries one.
+///
+/// The clause is spliced into a statement this window builds, so a terminator
+/// inside it ends that statement early: whatever follows is either dropped on
+/// the way to the server or would run as a second statement of its own. A
+/// filter runs one query or none, so the clause is refused before it is built.
+///
+/// Only code positions count — a `;` inside a string, a quoted identifier or a
+/// comment is text — and what terminates is per family: every backend here
+/// ends a statement on `;`, and the Oracle family ends one on a line that is
+/// nothing but `/` as well.
+pub(crate) fn clause_statement_terminator(
+    clause: &str,
+    db_type: DatabaseType,
+) -> Option<&'static str> {
+    let mysql = db_type.is_mysql_or_mariadb();
+    let spans = lexical_spans(clause, mysql);
+    let in_code = |offset: usize| !spans.iter().any(|span| span.contains(offset));
+
+    if clause
+        .bytes()
+        .enumerate()
+        .any(|(offset, byte)| byte == b';' && in_code(offset))
+    {
+        return Some(";");
+    }
+    if mysql {
+        return None;
+    }
+    let mut offset = 0usize;
+    for line in clause.split_inclusive('\n') {
+        let indent = line.len() - line.trim_start().len();
+        if line.trim() == "/" && in_code(offset + indent) {
+            return Some("/");
+        }
+        offset += line.len();
+    }
+    None
+}
+
 /// The statement's words, uppercased, with strings and comments left out.
 fn code_words(sql: &str, mysql: bool) -> Vec<String> {
     let spans = lexical_spans(sql, mysql);

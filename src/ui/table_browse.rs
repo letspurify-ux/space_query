@@ -249,6 +249,28 @@ fn marked_sql(sql: &str, marker: &str) -> String {
     }
 }
 
+/// Refuse a filter whose clauses would end the statement they are spliced
+/// into. A filter runs one query or none.
+fn validate_filter_clauses(
+    clauses: &TableBrowseClauses,
+    db_type: DatabaseType,
+) -> Result<(), String> {
+    for (label, clause) in [
+        ("WHERE", &clauses.where_expr),
+        ("ORDER BY", &clauses.order_by_expr),
+    ] {
+        if let Some(terminator) =
+            crate::ui::result_filter::clause_statement_terminator(clause, db_type)
+        {
+            return Err(format!(
+                "The {label} filter contains the statement terminator `{terminator}`. \
+                 A filter is one expression, not a statement of its own."
+            ));
+        }
+    }
+    Ok(())
+}
+
 fn validate_single_statement(sql: &str, db_type: DatabaseType) -> Result<(), String> {
     let items =
         crate::ui::sql_editor::query_text::split_script_items_for_db_type(sql, Some(db_type));
@@ -266,6 +288,7 @@ pub(crate) fn build_logical_sql(
     if target.relation_sql.trim().is_empty() {
         return Err("The table name is empty.".to_string());
     }
+    validate_filter_clauses(clauses, target.db_type)?;
     let mut sql = format!("SELECT * FROM {}", target.relation_sql);
     if !clauses.where_expr.is_empty() {
         sql.push_str("\nWHERE ");
@@ -283,6 +306,7 @@ pub(crate) fn build_count_sql(
     target: &TableBrowseTarget,
     clauses: &TableBrowseClauses,
 ) -> Result<String, String> {
+    validate_filter_clauses(clauses, target.db_type)?;
     let mut sql = format!(
         "SELECT COUNT(*) AS SQ_TOTAL_ROWS FROM {}",
         target.relation_sql
@@ -1330,6 +1354,71 @@ mod tests {
             TableBrowseFilterBar::result_column_suggestions(&columns, ""),
             vec!["DEPTNO".to_string()]
         );
+    }
+
+    fn filter_result(
+        db_type: DatabaseType,
+        where_expr: &str,
+        order_by_expr: &str,
+    ) -> Result<String, String> {
+        build_logical_sql(
+            &target(db_type),
+            &TableBrowseClauses::new(where_expr.to_string(), order_by_expr.to_string()),
+        )
+    }
+
+    /// A filter runs one query or none: a clause that ends the statement it is
+    /// spliced into is refused before anything is built.
+    #[test]
+    fn a_filter_clause_may_not_carry_a_statement_terminator() {
+        for db_type in [
+            DatabaseType::Oracle,
+            DatabaseType::MySQL,
+            DatabaseType::MariaDB,
+        ] {
+            // The reported shape: a terminator with only a comment behind it,
+            // which statement splitting drops — so nothing else would object.
+            assert!(
+                filter_result(db_type, "ABC = 123; -- 123;", "").is_err(),
+                "{db_type}"
+            );
+            assert!(
+                filter_result(db_type, "ABC = 123;", "").is_err(),
+                "{db_type}"
+            );
+            assert!(
+                filter_result(db_type, "ABC = 1", "ENAME; DROP TABLE T").is_err(),
+                "{db_type}"
+            );
+            // A terminator is only a terminator in code.
+            assert!(
+                filter_result(db_type, "ENAME = 'a;b'", "").is_ok(),
+                "{db_type}"
+            );
+            assert!(
+                filter_result(db_type, "ABC = 1 /* ; */", "").is_ok(),
+                "{db_type}"
+            );
+            assert!(
+                filter_result(db_type, "ABC = 1 -- ;", "").is_ok(),
+                "{db_type}"
+            );
+            // And an ordinary filter still builds.
+            assert!(
+                filter_result(db_type, "DEPTNO = 10", "ENAME DESC").is_ok(),
+                "{db_type}"
+            );
+        }
+    }
+
+    /// The Oracle family ends a statement on a line that is nothing but `/`;
+    /// the MySQL family does not.
+    #[test]
+    fn only_the_oracle_family_reads_a_lone_slash_as_a_terminator() {
+        assert!(filter_result(DatabaseType::Oracle, "ABC = 1\n/\n", "").is_err());
+        assert!(filter_result(DatabaseType::MySQL, "ABC = 1\n/\n", "").is_ok());
+        // Division is not a terminator on either.
+        assert!(filter_result(DatabaseType::Oracle, "SAL / 2 > 100", "").is_ok());
     }
 
     fn strings(values: &[&str]) -> Vec<String> {

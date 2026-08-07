@@ -20,7 +20,7 @@ use std::ops::Deref;
 use std::ops::DerefMut;
 use std::panic::{self, AssertUnwindSafe};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -896,7 +896,13 @@ impl ExecutionWorkerBackend for OracleExecutionWorkerBackend {
                             activity: db_activity.to_string(),
                             total_units: None,
                             status_activity: None,
-                            sql: sql_to_execute.clone(),
+                            // The batch reports the text it was handed, as
+                            // every other batch does. Reporting the statement
+                            // split out of it instead hides a trailing
+                            // terminator and everything after it, and a
+                            // reservation made for that text no longer
+                            // recognizes its own statement.
+                            sql: sql_text.to_string(),
                         });
                         SqlEditorWidget::emit_statement_start(
                             sender,
@@ -2270,6 +2276,27 @@ fn lazy_fetch_all_timeout_for_fetch_all(
         timeout.note_row_received();
     }
     timeout
+}
+
+/// Keeps an execution counted as deferred — accepted by the editor but not
+/// started yet — for as long as it lives.
+struct DeferredExecutionGuard {
+    deferred_executions: Arc<AtomicUsize>,
+}
+
+impl DeferredExecutionGuard {
+    fn new(deferred_executions: Arc<AtomicUsize>) -> Self {
+        deferred_executions.fetch_add(1, Ordering::AcqRel);
+        Self {
+            deferred_executions,
+        }
+    }
+}
+
+impl Drop for DeferredExecutionGuard {
+    fn drop(&mut self) {
+        self.deferred_executions.fetch_sub(1, Ordering::AcqRel);
+    }
 }
 
 struct QueryRunningReservation {
@@ -8713,6 +8740,22 @@ impl SqlEditorWidget {
         }
     }
 
+    /// Whether an execution this editor accepted is still waiting for a
+    /// previous lazy fetch to be cancelled before it can start.
+    ///
+    /// The editor reads as idle in that window — no query is running and no
+    /// batch has begun — but a statement is still coming, so what it reserved
+    /// must be left alone.
+    pub(crate) fn has_deferred_execution(&self) -> bool {
+        self.deferred_executions.load(Ordering::Acquire) > 0
+    }
+
+    /// Count one execution as deferred, from the moment it is scheduled until
+    /// the attempt that carries the returned guard has resolved it.
+    fn defer_execution(&self) -> DeferredExecutionGuard {
+        DeferredExecutionGuard::new(self.deferred_executions.clone())
+    }
+
     /// Retry an execution that was deferred until the previous lazy fetch
     /// could be cancelled, reporting the failure when this attempt is the one
     /// that gives up.
@@ -8793,6 +8836,12 @@ impl SqlEditorWidget {
                         let widget = self.clone();
                         let sql = sql.to_string();
                         let initial_mysql_delimiter_for_retry = initial_mysql_delimiter.clone();
+                        // The caller is about to be told the execution
+                        // started. It stays counted as deferred until an
+                        // attempt starts it or gives up on it — including the
+                        // wait before this retry runs — so nothing mistakes
+                        // this editor for one with no statement coming.
+                        let deferred = self.defer_execution();
                         crate::ui::ui_timeout::schedule(
                             LAZY_FETCH_CANCEL_RETRY_DELAY_SECONDS,
                             move || {
@@ -8803,6 +8852,7 @@ impl SqlEditorWidget {
                                     session_id,
                                     next_retry_attempt,
                                 );
+                                drop(deferred);
                             },
                         );
                         return true;
@@ -8817,6 +8867,7 @@ impl SqlEditorWidget {
                     let widget = self.clone();
                     let sql = sql.to_string();
                     let initial_mysql_delimiter_for_retry = initial_mysql_delimiter.clone();
+                    let deferred = self.defer_execution();
                     crate::ui::ui_timeout::schedule(
                         LAZY_FETCH_CANCEL_RETRY_DELAY_SECONDS,
                         move || {
@@ -8827,6 +8878,7 @@ impl SqlEditorWidget {
                                 session_id,
                                 next_retry_attempt,
                             );
+                            drop(deferred);
                         },
                     );
                     return true;

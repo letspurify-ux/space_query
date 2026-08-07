@@ -15,7 +15,7 @@ use std::any::Any;
 use std::collections::VecDeque;
 use std::panic::{self, AssertUnwindSafe};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc, Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -2013,6 +2013,12 @@ pub struct SqlEditorWidget {
     preferred_insert_position: Arc<Mutex<Option<i32>>>,
     lazy_fetch_batch_size: Arc<Mutex<usize>>,
     cancel_timeout: Arc<Mutex<Duration>>,
+    /// Executions handed to this editor that are waiting for a previous lazy
+    /// fetch to be cancelled before they can start.
+    ///
+    /// Their caller was told the execution started, so a statement is still
+    /// coming even though the editor looks idle and no batch has begun.
+    deferred_executions: Arc<AtomicUsize>,
     display_metrics_ready: Arc<AtomicBool>,
 }
 impl SqlEditorWidget {
@@ -2884,6 +2890,7 @@ impl SqlEditorWidget {
         let cancel_timeout = Arc::new(Mutex::new(Duration::from_secs(
             editor_config.normalized_cancel_timeout_seconds() as u64,
         )));
+        let deferred_executions = Arc::new(AtomicUsize::new(0));
         let display_metrics_ready = Arc::new(AtomicBool::new(true));
 
         let mut widget = Self {
@@ -2942,6 +2949,7 @@ impl SqlEditorWidget {
             preferred_insert_position,
             lazy_fetch_batch_size,
             cancel_timeout,
+            deferred_executions,
             display_metrics_ready,
         };
 

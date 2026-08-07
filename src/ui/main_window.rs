@@ -819,6 +819,13 @@ struct QueryProgressContext {
     /// The `ResultGridExecution` this batch started with, so it retires that
     /// reservation and no later one.
     execution_reservation: Option<u64>,
+    /// Whether this batch runs a statement this window wrote for a grid that
+    /// already exists. Such a statement may only use the tab it was routed to.
+    refills_existing_grid: bool,
+    /// The first reservation id that did not exist when this batch started.
+    /// A reservation at or above it was made after — by a request this batch
+    /// knows nothing about — so this batch's end says nothing about it.
+    reservation_floor: u64,
     execution_kind: Option<ResultGridExecutionKind>,
     result_tab_ids: HashMap<usize, ResultTabId>,
     fetch_row_counts: HashMap<usize, usize>,
@@ -868,6 +875,13 @@ struct ResultGridExecution {
     /// a structured result edit, whose statement the editor builds itself —
     /// and which never defers, so it is never abandoned.
     sql: Option<String>,
+    /// Whether the editor has taken the statement this reservation was made
+    /// for.
+    ///
+    /// A reservation is registered first and the statement handed over after,
+    /// and in between no execution exists for it yet. Only a reservation that
+    /// was handed over can be judged by what became of the execution.
+    handed_over: bool,
 }
 
 #[derive(Clone)]
@@ -1272,10 +1286,49 @@ fn connection_runtime_state_label(state: ConnectionRuntimeState) -> &'static str
 }
 
 impl QueryProgressContext {
+    /// An ordinary batch, whose statements each get a result tab of their own.
+    #[cfg(test)]
     fn new(
         execution: Option<&ResultGridExecution>,
         activity_label: String,
         operation_token: Option<QueryOperationToken>,
+    ) -> Self {
+        Self::new_for_batch(execution, activity_label, operation_token, false)
+    }
+
+    /// A batch with no reservation younger than itself to keep clear of.
+    #[cfg(test)]
+    fn new_for_batch(
+        execution: Option<&ResultGridExecution>,
+        activity_label: String,
+        operation_token: Option<QueryOperationToken>,
+        refills_existing_grid: bool,
+    ) -> Self {
+        Self::new_for_batch_with_floor(
+            execution,
+            activity_label,
+            operation_token,
+            refills_existing_grid,
+            u64::MAX,
+        )
+    }
+
+    /// The constructor every batch goes through in production.
+    ///
+    /// `refills_existing_grid` marks a batch running a statement this window
+    /// wrote to refill a grid that already exists — a table page, or a
+    /// re-query of a filtered result. Such a statement has one destination or
+    /// none; it never gets a result tab of its own.
+    ///
+    /// `reservation_floor` is the first reservation id that did not exist when
+    /// this batch started, so the end of this batch can tell a reservation it
+    /// may answer for from one made behind its back.
+    fn new_for_batch_with_floor(
+        execution: Option<&ResultGridExecution>,
+        activity_label: String,
+        operation_token: Option<QueryOperationToken>,
+        refills_existing_grid: bool,
+        reservation_floor: u64,
     ) -> Self {
         let now = Instant::now();
         let execution_target = execution.map(|execution| execution.result_tab_id);
@@ -1293,6 +1346,8 @@ impl QueryProgressContext {
             execution_target,
             execution_reservation: execution.map(|execution| execution.id),
             execution_kind: execution.map(|execution| execution.kind),
+            refills_existing_grid,
+            reservation_floor,
             result_tab_ids: HashMap::new(),
             fetch_row_counts: HashMap::new(),
             lazy_fetch_sessions: HashMap::new(),
@@ -1508,16 +1563,32 @@ impl QueryProgressContext {
         sessions
     }
 
-    fn ensure_result_tab_id<F>(&mut self, statement_index: usize, reserve_id: F) -> ResultTabId
+    /// The result tab this statement's output belongs in, reserving a new one
+    /// if it may have one.
+    ///
+    /// `None` means it may not: a statement this window wrote refills a grid
+    /// that already exists, so without the routing that says which grid it has
+    /// no destination at all. A tab of its own would put a filtered page
+    /// beside the very result it was meant to replace — a second tab the user
+    /// never asked for — so it gets none, whatever became of its reservation.
+    fn ensure_result_tab_id<F>(
+        &mut self,
+        statement_index: usize,
+        reserve_id: F,
+    ) -> Option<ResultTabId>
     where
         F: FnOnce() -> ResultTabId,
     {
         if let Some(tab_id) = self.result_tab_id_for_statement(statement_index) {
-            return tab_id;
+            return Some(tab_id);
         }
-        let tab_id = self.execution_target.unwrap_or_else(reserve_id);
+        let tab_id = match self.execution_target {
+            Some(target) => target,
+            None if self.refills_existing_grid => return None,
+            None => reserve_id(),
+        };
         self.result_tab_ids.insert(statement_index, tab_id);
-        tab_id
+        Some(tab_id)
     }
 
     fn claim_result_tab_auto_select(&mut self) -> bool {
@@ -2444,15 +2515,103 @@ impl AppState {
             != Some(execution.id)
     }
 
+    /// Let go of a reservation whose result tab the user just closed.
+    ///
+    /// A reservation that has not started yet blocks every later request for
+    /// its query tab, and nothing else retires one whose destination is gone:
+    /// the block would outlive the tab it was made for, and the filter bar of
+    /// every other result would keep refusing to run. The statement, if it is
+    /// still coming, lands as the ordinary query it now is.
+    fn release_result_grid_execution_for_closed_result_tab(
+        &mut self,
+        query_tab_id: QueryTabId,
+        result_tab_id: ResultTabId,
+    ) {
+        if !self.result_grid_execution_is_queued(query_tab_id)
+            || self
+                .result_grid_execution_targets
+                .get(&query_tab_id)
+                .is_none_or(|execution| execution.result_tab_id != result_tab_id)
+        {
+            return;
+        }
+        self.drop_result_grid_execution(query_tab_id, result_tab_id);
+    }
+
+    /// Retire a reservation no statement can reach any more.
+    ///
+    /// A reservation is registered before the statement is handed to the
+    /// editor, and only the batch that runs it, or the event that says it
+    /// never left, retires it. Neither is guaranteed: a worker that fails
+    /// before it starts a batch — a connection lost between the pre-check and
+    /// the worker, a pool session it could not take, a generation that moved
+    /// under it — reports the error and finishes, on every driver alike, and
+    /// the reservation it never claimed would then refuse every later request
+    /// for its query tab.
+    ///
+    /// So the end of any execution on that tab is also the moment to ask
+    /// whether anything can still claim it. Nothing can when the editor is
+    /// neither running a statement nor holding one back: the reserving caller
+    /// was told its execution started, and an execution that started is either
+    /// running, waiting to start, or over.
+    ///
+    /// Returns the result tab still expecting a statement, so it can be told.
+    fn release_stranded_result_grid_execution(
+        &mut self,
+        query_tab_id: QueryTabId,
+    ) -> Option<ResultTabId> {
+        if !self.result_grid_execution_is_queued(query_tab_id) {
+            return None;
+        }
+        let execution = self.result_grid_execution_targets.get(&query_tab_id)?;
+        let reservation_id = execution.id;
+        let handed_over = execution.handed_over;
+        let result_tab_id = execution.result_tab_id;
+        let batch_reservation_floor = self
+            .progress_contexts
+            .get(&query_tab_id)
+            .map(|context| context.reservation_floor);
+        let editor = self
+            .find_tab_index(query_tab_id)
+            .and_then(|index| self.editor_tabs.get(index))
+            .map(|tab| tab.sql_editor.clone())?;
+        let editor_has_statement_coming =
+            editor.is_query_running() || editor.has_deferred_execution();
+        if !execution_end_retires_reservation(
+            handed_over,
+            reservation_id,
+            batch_reservation_floor,
+            editor_has_statement_coming,
+        ) {
+            return None;
+        }
+        self.drop_result_grid_execution(query_tab_id, result_tab_id);
+        Some(result_tab_id)
+    }
+
+    /// Forget a reservation and whatever was staged to run once it landed.
+    fn drop_result_grid_execution(&mut self, query_tab_id: QueryTabId, result_tab_id: ResultTabId) {
+        self.result_grid_execution_targets.remove(&query_tab_id);
+        self.pending_table_browse_last.retain(|tab_id, pending| {
+            *tab_id != query_tab_id || pending.request.result_tab_id != result_tab_id
+        });
+        self.pending_table_browse_refresh.retain(|tab_id, pending| {
+            *tab_id != query_tab_id || pending.request.result_tab_id != result_tab_id
+        });
+    }
+
     /// Route the next statement started for `tab_id` to an existing result tab,
     /// replacing any reservation that never got to run.
+    ///
+    /// Returns the new reservation's id, which the caller hands back to
+    /// `confirm_result_grid_execution` once the editor has taken the statement.
     fn reserve_result_grid_execution(
         &mut self,
         tab_id: QueryTabId,
         kind: ResultGridExecutionKind,
         result_tab_id: ResultTabId,
         sql: Option<String>,
-    ) {
+    ) -> u64 {
         let id = self.next_result_grid_execution_id;
         self.next_result_grid_execution_id = id.saturating_add(1);
         self.result_grid_execution_targets.insert(
@@ -2462,8 +2621,23 @@ impl AppState {
                 kind,
                 result_tab_id,
                 sql,
+                handed_over: false,
             },
         );
+        id
+    }
+
+    /// Record that the editor accepted the statement `id` was reserved for.
+    ///
+    /// From here on the execution answers for the reservation: it is running,
+    /// waiting to start, or over — and if it is over without having claimed
+    /// the reservation, nothing else will.
+    fn confirm_result_grid_execution(&mut self, tab_id: QueryTabId, id: u64) {
+        if let Some(execution) = self.result_grid_execution_targets.get_mut(&tab_id) {
+            if execution.id == id {
+                execution.handed_over = true;
+            }
+        }
     }
 
     fn finish_progress_context(&mut self, tab_id: QueryTabId) {
@@ -4129,15 +4303,54 @@ fn batch_owns_grid_target(
 /// for.
 ///
 /// The text makes the round trip through statement splitting before it reaches
-/// the worker, which trims it and drops a trailing terminator, so the two
-/// spellings are compared with that much slack — and no more, since the point
-/// is to tell two statements apart.
+/// the worker, and a batch may report either spelling of it: the text it was
+/// handed, or the single statement that splitting produced from that text —
+/// which has lost its terminator, its comments, and anything trailing them.
+/// Both sides go through that same split, so the two spellings of one
+/// statement match — and no more slack than that, since the point is to tell
+/// two statements apart.
 fn batch_runs_reserved_statement(reserved: &str, batch: &str) -> bool {
-    normalized_statement_text(reserved) == normalized_statement_text(batch)
+    split_statement_text(reserved) == split_statement_text(batch)
+}
+
+/// The one statement `sql` splits into, or its trimmed text when it is not
+/// exactly one statement.
+fn split_statement_text(sql: &str) -> String {
+    let items = crate::ui::sql_editor::query_text::split_script_items_for_db_type(sql, None);
+    match items.as_slice() {
+        [crate::db::ScriptItem::Statement(statement)] => normalized_statement_text(statement),
+        _ => normalized_statement_text(sql),
+    }
+    .to_string()
 }
 
 fn normalized_statement_text(sql: &str) -> &str {
     sql.trim().trim_end_matches(';').trim()
+}
+
+/// Whether the execution ending now may retire a reservation no batch claimed.
+///
+/// Three things have to hold, and each rules out a statement that could still
+/// arrive for it:
+///
+/// * `handed_over` — the editor has actually been given the statement. A
+///   reservation registered a moment ago, with the hand-off still to come, has
+///   no execution to answer for it yet.
+/// * The reservation is older than the batch that is ending
+///   (`batch_reservation_floor`). A younger one belongs to a request that
+///   batch never saw, and its own statement is still on its way. No floor
+///   means no batch ever started here, so there is nothing to be younger than.
+/// * `editor_has_statement_coming` is false — nothing is running on that
+///   editor, and nothing is waiting behind a lazy fetch to start.
+fn execution_end_retires_reservation(
+    handed_over: bool,
+    reservation_id: u64,
+    batch_reservation_floor: Option<u64>,
+    editor_has_statement_coming: bool,
+) -> bool {
+    handed_over
+        && !editor_has_statement_coming
+        && batch_reservation_floor.is_none_or(|floor| reservation_id < floor)
 }
 
 /// Whether a finishing batch owns the routing currently registered for its
@@ -5319,6 +5532,17 @@ impl MainWindow {
             .set_label(&format_status(message, &conn_info));
     }
 
+    /// Tell a result tab that the statement it was told to expect is not
+    /// coming. A browse tab goes back to the page it had; a filtered query tab
+    /// keeps its rows and only stops reading as running.
+    fn report_lost_result_grid_execution(
+        result_tabs: &mut ResultTabsWidget,
+        result_tab_id: ResultTabId,
+    ) {
+        result_tabs.fail_table_browse_result_by_id(result_tab_id);
+        result_tabs.mark_statement_status_by_id(result_tab_id, ResultTabStatus::Error);
+    }
+
     fn close_result_tab_by_target(state: &Arc<Mutex<AppState>>, target: ResultTabCloseTarget) {
         let query_running = state
             .lock()
@@ -5338,6 +5562,11 @@ impl MainWindow {
                         .result_tabs
                         .close_tab_by_id_and_take_lazy_fetch(result_tab_id);
                     if let Some((closed_tab_id, lazy_fetch_session)) = closed {
+                        let active_tab_id = s.active_editor_tab_id;
+                        s.release_result_grid_execution_for_closed_result_tab(
+                            active_tab_id,
+                            closed_tab_id,
+                        );
                         let mut sessions_to_cancel = s.mark_result_tab_closed_by_id(closed_tab_id);
                         if let Some(session_id) = lazy_fetch_session {
                             s.mark_lazy_fetch_result_tab_closed(session_id);
@@ -5382,7 +5611,17 @@ impl MainWindow {
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
             let had_tabs = s.result_tabs.tab_count() > 0;
             let lazy_fetch_sessions = s.lazy_fetch_sessions_for_abort();
+            // Every grid of this workspace is going, the reserved one with
+            // them, so the reservation waiting on it goes too.
+            let active_tab_id = s.active_editor_tab_id;
+            let reserved_target = s
+                .result_grid_execution_targets
+                .get(&active_tab_id)
+                .map(|execution| execution.result_tab_id);
             s.result_tabs.clear();
+            if let Some(result_tab_id) = reserved_target {
+                s.release_result_grid_execution_for_closed_result_tab(active_tab_id, result_tab_id);
+            }
             s.mark_lazy_fetch_result_tabs_closed(lazy_fetch_sessions.clone());
             s.mark_all_result_tabs_closed_for_clear();
             if had_tabs {
@@ -8515,7 +8754,7 @@ impl MainWindow {
         tab_id: QueryTabId,
         mut request: TableBrowsePageRequest,
     ) -> Result<(), String> {
-        let (editor, sql, browsing) = {
+        let (editor, sql, browsing, reservation_id) = {
             let mut state_guard = state
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -8570,7 +8809,7 @@ impl MainWindow {
             if browsing {
                 result_tabs.begin_table_browse_request(request.clone())?;
             }
-            state_guard.reserve_result_grid_execution(
+            let reservation_id = state_guard.reserve_result_grid_execution(
                 tab_id,
                 ResultGridExecutionKind::Requery,
                 request.result_tab_id,
@@ -8593,7 +8832,7 @@ impl MainWindow {
                     },
                 );
             }
-            (editor, sql, browsing)
+            (editor, sql, browsing, reservation_id)
         };
 
         let started = if browsing {
@@ -8602,6 +8841,10 @@ impl MainWindow {
             editor.execute_generated_sql_text(&sql)
         };
         if started {
+            state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .confirm_result_grid_execution(tab_id, reservation_id);
             Ok(())
         } else {
             let mut state_guard = state
@@ -8709,7 +8952,7 @@ impl MainWindow {
                         },
                     );
                 }
-                state.reserve_result_grid_execution(
+                let reservation_id = state.reserve_result_grid_execution(
                     tab_id,
                     ResultGridExecutionKind::GridEdit,
                     target_tab,
@@ -8721,6 +8964,7 @@ impl MainWindow {
                     state.pending_table_browse_refresh.remove(&tab_id);
                     return Err("Failed to start query execution for result-grid edit.".to_string());
                 }
+                state.confirm_result_grid_execution(tab_id, reservation_id);
                 Ok(())
             }) as Box<dyn FnMut(String) -> Result<(), String>>,
         )));
@@ -8773,7 +9017,7 @@ impl MainWindow {
                         },
                     );
                 }
-                state.reserve_result_grid_execution(
+                let reservation_id = state.reserve_result_grid_execution(
                     tab_id,
                     ResultGridExecutionKind::GridEdit,
                     target_tab,
@@ -8784,6 +9028,7 @@ impl MainWindow {
                     state.pending_table_browse_refresh.remove(&tab_id);
                     return Err(error);
                 }
+                state.confirm_result_grid_execution(tab_id, reservation_id);
                 Ok(())
             }) as Box<dyn FnMut(crate::db::ResultEditRequest) -> Result<(), String>>,
         )));
@@ -9153,8 +9398,13 @@ impl MainWindow {
                         .as_ref()
                         .map(|runtime| runtime.sanitized_info().db_type);
                     let connection_id = runtime.as_ref().map(|runtime| runtime.id());
-                    let mut context =
-                        QueryProgressContext::new(grid_execution.as_ref(), activity, operation_token);
+                    let mut context = QueryProgressContext::new_for_batch_with_floor(
+                        grid_execution.as_ref(),
+                        activity,
+                        operation_token,
+                        crate::ui::table_browse::is_generated_grid_statement(&sql),
+                        s.next_result_grid_execution_id,
+                    );
                     context.start_status_tracking(
                         total_units,
                         db_type,
@@ -9193,10 +9443,14 @@ impl MainWindow {
                         context.fetch_row_counts.remove(&index);
                         context.mark_statement_running(index);
                         let create_result_tab = result_tab_policy.creates_result_tab();
-                        let result_tab_id = create_result_tab.then(|| {
-                            context.ensure_result_tab_id(index, || result_tabs.reserve_result_tab_id())
-                        });
-                        let select_tab = if create_result_tab {
+                        let result_tab_id = create_result_tab
+                            .then(|| {
+                                context.ensure_result_tab_id(index, || {
+                                    result_tabs.reserve_result_tab_id()
+                                })
+                            })
+                            .flatten();
+                        let select_tab = if result_tab_id.is_some() {
                             let _ = context.claim_result_tab_auto_select();
                             true
                         } else {
@@ -9259,8 +9513,22 @@ impl MainWindow {
                         if context.closed_statement_indices.contains(&index) {
                             return;
                         }
-                        let result_tab_id =
-                            context.ensure_result_tab_id(index, || result_tabs.reserve_result_tab_id());
+                        let Some(result_tab_id) = context
+                            .ensure_result_tab_id(index, || result_tabs.reserve_result_tab_id())
+                        else {
+                            // A refill whose grid is gone. These rows have
+                            // nowhere to go, and a tab of their own is the one
+                            // thing this must never create.
+                            drop(s);
+                            result_tabs.append_message_lines(
+                                ResultMessageKind::Info,
+                                &[
+                                    "The result this refresh was for is no longer open. Its rows were discarded."
+                                        .to_string(),
+                                ],
+                            );
+                            return;
+                        };
                         let select_tab = context.claim_result_tab_auto_select();
                         context.mark_lazy_fetch_active_for_statement(index);
                         context.fetch_row_counts.insert(index, 0);
@@ -9439,8 +9707,20 @@ impl MainWindow {
                         if context.closed_statement_indices.contains(&index) {
                             return;
                         }
-                        let result_tab_id =
-                            context.ensure_result_tab_id(index, || result_tabs.reserve_result_tab_id());
+                        let Some(result_tab_id) = context
+                            .ensure_result_tab_id(index, || result_tabs.reserve_result_tab_id())
+                        else {
+                            // Nothing is left for this fetch to fill, so stop
+                            // it rather than stream rows into a tab it must
+                            // not open.
+                            drop(s);
+                            AppState::request_lazy_fetch_on_editors(
+                                &state_for_progress,
+                                session_id,
+                                crate::ui::sql_editor::LazyFetchRequest::CancelAndDiscard,
+                            );
+                            return;
+                        };
                         let select_tab = context.claim_result_tab_auto_select();
                         (result_tab_id, select_tab)
                     };
@@ -9570,6 +9850,12 @@ impl MainWindow {
                     } else {
                         None
                     };
+                    // Giving up on a queued statement starts no batch, so
+                    // this is the only place its reservation can be retired —
+                    // by name above, or by the fact that nothing is left to
+                    // claim it here.
+                    let stranded_target = stranded_target
+                        .or_else(|| s.release_stranded_result_grid_execution(tab_id));
                     if s.should_show_progress_status_for_tab(tab_id) {
                         s.set_status_message(&message);
                     }
@@ -9577,10 +9863,10 @@ impl MainWindow {
                     let mut result_tabs = owning_result_tabs.clone();
                     drop(s);
                     if let Some(result_tab_id) = stranded_target {
-                        // Restores a browse tab's last page; a filtered query
-                        // tab keeps its rows and only stops reading as running.
-                        result_tabs.fail_table_browse_result_by_id(result_tab_id);
-                        result_tabs.mark_statement_status_by_id(result_tab_id, ResultTabStatus::Error);
+                        MainWindow::report_lost_result_grid_execution(
+                            &mut result_tabs,
+                            result_tab_id,
+                        );
                     }
                 }
                 QueryProgress::LazyFetchClosed {
@@ -9934,9 +10220,9 @@ impl MainWindow {
                         }
                         let (result_tab_id, select_tab) = if should_display_data_grid {
                             (
-                                Some(context.ensure_result_tab_id(index, || {
+                                context.ensure_result_tab_id(index, || {
                                     result_tabs.reserve_result_tab_id()
-                                })),
+                                }),
                                 context.claim_result_tab_auto_select(),
                             )
                         } else {
@@ -10213,6 +10499,11 @@ impl MainWindow {
                     if let Some(token) = operation_token {
                         s.clear_query_cancel_request(token);
                     }
+                    // Every execution ends here, on every driver, whether or
+                    // not it ever started a batch. A reservation this one
+                    // never claimed, with nothing left to claim it, is retired
+                    // now or never.
+                    let stranded_grid_target = s.release_stranded_result_grid_execution(tab_id);
                     let pending_canceling_sessions =
                         s.pending_lazy_fetch_canceling_sessions.clone();
                     let should_show_status = s.should_show_progress_status_for_tab(tab_id);
@@ -10244,6 +10535,14 @@ impl MainWindow {
                             }
                             s.refresh_result_edit_controls();
                             s.sync_transaction_mode_controls();
+                            if let Some(result_tab_id) = stranded_grid_target {
+                                let mut result_tabs = owning_result_tabs.clone();
+                                drop(s);
+                                MainWindow::report_lost_result_grid_execution(
+                                    &mut result_tabs,
+                                    result_tab_id,
+                                );
+                            }
                             return;
                         }
                     }
@@ -10285,6 +10584,12 @@ impl MainWindow {
                     result_tabs.finish_non_lazy_streaming();
                     if let Some(result_tab_id) = unfinished_table_browse_target {
                         result_tabs.fail_table_browse_result_by_id(result_tab_id);
+                    }
+                    if let Some(result_tab_id) = stranded_grid_target {
+                        MainWindow::report_lost_result_grid_execution(
+                            &mut result_tabs,
+                            result_tab_id,
+                        );
                     }
                     let recovered_save_states = result_tabs.clear_orphaned_save_requests();
                     let recovered_edit_states = result_tabs.clear_orphaned_query_edit_backups();
@@ -13982,6 +14287,62 @@ mod tests {
         assert!(batch_runs_reserved_statement(&reserved, statement));
     }
 
+    /// Regression: a batch may report the statement splitting produced from
+    /// the text it was handed — terminator gone, and with it the comment that
+    /// followed. That spelling was not recognized as the reserved re-query, so
+    /// the rows landed in a result tab of their own and the reservation
+    /// nothing retired then refused every later filter apply.
+    #[test]
+    fn a_batch_adopts_a_reservation_reported_as_the_statement_it_split_out() {
+        for (db_type, relation) in [
+            (DatabaseType::Oracle, "(\nSELECT * FROM EMP\n) sq_src"),
+            (DatabaseType::MySQL, "(\nSELECT * FROM `emp`\n) sq_src"),
+        ] {
+            let reserved = crate::ui::table_browse::marked_result_filter_sql(&format!(
+                "SELECT * FROM {relation}\nWHERE DEPTNO = 10; -- ten;"
+            ));
+
+            let items = crate::ui::sql_editor::query_text::split_script_items_for_db_type(
+                &reserved,
+                Some(db_type),
+            );
+            assert_eq!(items.len(), 1, "one statement: {db_type}");
+            let crate::db::ScriptItem::Statement(statement) = &items[0] else {
+                panic!("a filtered re-query must split into one statement: {db_type}");
+            };
+            assert_ne!(statement.as_str(), reserved.as_str(), "{db_type}");
+            assert!(
+                batch_runs_reserved_statement(&reserved, statement),
+                "{db_type}"
+            );
+            // Still no slack beyond that: two statements stay apart.
+            assert!(
+                !batch_runs_reserved_statement(&reserved, "SELECT * FROM DEPT"),
+                "{db_type}"
+            );
+        }
+    }
+
+    /// The sweep that guarantees no reservation outlives its statement, and
+    /// the three things that each mean one may still arrive.
+    #[test]
+    fn an_execution_ending_retires_only_a_reservation_nothing_can_reach() {
+        // The reported shape: a statement that was started and is over,
+        // without a batch that ever claimed what it reserved.
+        assert!(execution_end_retires_reservation(true, 5, Some(9), false));
+        // No batch started at all — a worker that failed on its way in.
+        assert!(execution_end_retires_reservation(true, 5, None, false));
+
+        // Registered, but the editor has not been given the statement yet.
+        assert!(!execution_end_retires_reservation(false, 5, Some(9), false));
+        // Made after this batch started: its own statement is still coming.
+        assert!(!execution_end_retires_reservation(true, 9, Some(9), false));
+        assert!(!execution_end_retires_reservation(true, 12, Some(9), false));
+        // Running, or queued behind a lazy fetch that is being cancelled.
+        assert!(!execution_end_retires_reservation(true, 5, Some(9), true));
+        assert!(!execution_end_retires_reservation(true, 5, None, true));
+    }
+
     #[test]
     fn a_finished_batch_keeps_a_newer_reservation_for_the_same_result_tab() {
         let tab = ResultTabId::new(4);
@@ -13990,12 +14351,14 @@ mod tests {
             kind: ResultGridExecutionKind::Requery,
             result_tab_id: tab,
             sql: Some("select 1".to_string()),
+            handed_over: true,
         };
         let second = ResultGridExecution {
             id: 2,
             kind: ResultGridExecutionKind::Requery,
             result_tab_id: tab,
             sql: Some("select 2".to_string()),
+            handed_over: true,
         };
 
         assert!(batch_owns_grid_reservation(Some(first.id), Some(&first)));
@@ -15310,6 +15673,7 @@ mod tests {
             kind: ResultGridExecutionKind::GridEdit,
             result_tab_id: ResultTabId::new(1),
             sql: None,
+            handed_over: true,
         };
         let context_with_grid_target =
             QueryProgressContext::new(Some(&reservation), "Saving result grid".to_string(), None);
@@ -16242,15 +16606,15 @@ mod tests {
 
         assert_eq!(
             context.ensure_result_tab_id(0, || ResultTabId::new(10)),
-            ResultTabId::new(10)
+            Some(ResultTabId::new(10))
         );
         assert_eq!(
             context.ensure_result_tab_id(0, || ResultTabId::new(11)),
-            ResultTabId::new(10)
+            Some(ResultTabId::new(10))
         );
         assert_eq!(
             context.ensure_result_tab_id(1, || ResultTabId::new(11)),
-            ResultTabId::new(11)
+            Some(ResultTabId::new(11))
         );
 
         assert_eq!(
@@ -16263,13 +16627,54 @@ mod tests {
         );
     }
 
+    /// A statement this window wrote refills a grid that already exists. It
+    /// takes the tab it was routed to, and if that routing is gone it takes
+    /// none: a tab of its own would put the filtered page beside the very
+    /// result it was meant to replace.
+    #[test]
+    fn a_refill_never_opens_a_result_tab_of_its_own() {
+        let reservation = ResultGridExecution {
+            id: 1,
+            kind: ResultGridExecutionKind::Requery,
+            result_tab_id: ResultTabId::new(7),
+            sql: Some("select 1".to_string()),
+            handed_over: true,
+        };
+        let mut routed = QueryProgressContext::new_for_batch(
+            Some(&reservation),
+            "Executing".to_string(),
+            None,
+            true,
+        );
+        assert_eq!(
+            routed.ensure_result_tab_id(0, || ResultTabId::new(99)),
+            Some(ResultTabId::new(7))
+        );
+
+        let mut unrouted =
+            QueryProgressContext::new_for_batch(None, "Executing".to_string(), None, true);
+        assert_eq!(
+            unrouted.ensure_result_tab_id(0, || ResultTabId::new(99)),
+            None
+        );
+        assert_eq!(unrouted.result_tab_id_for_statement(0), None);
+
+        // An ordinary query still gets one.
+        let mut ordinary =
+            QueryProgressContext::new_for_batch(None, "Executing".to_string(), None, false);
+        assert_eq!(
+            ordinary.ensure_result_tab_id(0, || ResultTabId::new(99)),
+            Some(ResultTabId::new(99))
+        );
+    }
+
     #[test]
     fn progress_context_removes_closed_statement_result_tab_id() {
         let mut context = QueryProgressContext::new(None, "Executing".to_string(), None);
 
         assert_eq!(
             context.ensure_result_tab_id(0, || ResultTabId::new(10)),
-            ResultTabId::new(10)
+            Some(ResultTabId::new(10))
         );
         context.mark_statement_closed(0);
 
