@@ -114,8 +114,6 @@ pub type HeaderSortRedirectCallback = Arc<Mutex<Option<Box<dyn FnMut(String, boo
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ResultTableContextAction {
     ExportData,
-    Close,
-    CloseAll,
     /// Copy the selection to the clipboard as SQL. Handled by the main window
     /// because it needs the connection's database type, the base table, and —
     /// for `SqlUpdates` — the table's primary key.
@@ -7565,8 +7563,6 @@ impl ResultTableWidget {
         };
 
         let mut menu_items = vec![
-            "Close",
-            "Close All",
             "Export Results (Ctrl+E)",
             "Copy",
             "Copy with Headers",
@@ -7696,18 +7692,6 @@ impl ResultTableWidget {
                     Self::schedule_context_action_callback(
                         context_action_callback,
                         ResultTableContextAction::ExportData,
-                    );
-                }
-                "Close" => {
-                    Self::schedule_context_action_callback(
-                        context_action_callback,
-                        ResultTableContextAction::Close,
-                    );
-                }
-                "Close All" => {
-                    Self::schedule_context_action_callback(
-                        context_action_callback,
-                        ResultTableContextAction::CloseAll,
                     );
                 }
                 "SQL Inserts" => {

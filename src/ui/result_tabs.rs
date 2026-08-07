@@ -50,7 +50,6 @@ impl ResultTabId {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum ResultTabCloseTarget {
     Result(ResultTabId),
-    ScriptOutput,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

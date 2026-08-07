@@ -5206,19 +5206,6 @@ impl MainWindow {
             .set_label(&format_status(message, &conn_info));
     }
 
-    fn close_current_result_tab(state: &Arc<Mutex<AppState>>) {
-        let target = {
-            let s = state
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            s.result_tabs
-                .active_result_id()
-                .map(ResultTabCloseTarget::Result)
-                .unwrap_or(ResultTabCloseTarget::ScriptOutput)
-        };
-        Self::close_result_tab_by_target(state, target);
-    }
-
     fn close_result_tab_by_target(state: &Arc<Mutex<AppState>>, target: ResultTabCloseTarget) {
         let query_running = state
             .lock()
@@ -5256,47 +5243,7 @@ impl MainWindow {
                         Vec::new()
                     }
                 }
-                ResultTabCloseTarget::ScriptOutput => {
-                    s.result_tabs.close_script_output_tab();
-                    s.refresh_result_edit_controls();
-                    app::redraw();
-                    Vec::new()
-                }
             }
-        };
-        for session_id in lazy_fetch_sessions {
-            AppState::request_lazy_fetch_on_editors(
-                state,
-                session_id,
-                crate::ui::sql_editor::LazyFetchRequest::CancelAndDiscard,
-            );
-        }
-    }
-
-    fn close_all_result_tabs(state: &Arc<Mutex<AppState>>) {
-        let query_running = state
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .is_any_query_running();
-        if query_running {
-            crate::ui::alert_on_main("A query is running. Stop it before closing grid tabs.");
-            return;
-        }
-        let lazy_fetch_sessions = {
-            let mut s = state
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            let had_tabs = s.result_tabs.tab_count() > 0;
-            let lazy_fetch_sessions = s.lazy_fetch_sessions_for_abort();
-            s.result_tabs.clear_grids();
-            s.mark_lazy_fetch_result_tabs_closed(lazy_fetch_sessions.clone());
-            s.mark_all_result_tabs_closed_for_clear();
-            if had_tabs {
-                malloc_trim_process();
-            }
-            s.refresh_result_edit_controls();
-            app::redraw();
-            lazy_fetch_sessions
         };
         for session_id in lazy_fetch_sessions {
             AppState::request_lazy_fetch_on_editors(
@@ -8693,12 +8640,6 @@ impl MainWindow {
                     match action {
                         ResultTableContextAction::ExportData => {
                             MainWindow::export_current_results(&state_for_context, &file_sender);
-                        }
-                        ResultTableContextAction::Close => {
-                            MainWindow::close_current_result_tab(&state_for_context);
-                        }
-                        ResultTableContextAction::CloseAll => {
-                            MainWindow::close_all_result_tabs(&state_for_context);
                         }
                         ResultTableContextAction::CopySqlInserts
                         | ResultTableContextAction::CopySqlUpdates
