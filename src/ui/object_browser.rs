@@ -87,6 +87,8 @@ pub enum SqlAction {
     Insert(String),
     OpenInNewTab(String),
     Execute(String),
+    /// Multi-statement SQL the app generated, run the way F5 runs a script.
+    ExecuteScript(String),
     BrowseTable(TableBrowseTarget),
     DisplayResult(ResultTabRequest),
 }
@@ -618,6 +620,15 @@ enum ObjectActionResult {
     TableStructure {
         table_name: String,
         result: Result<Vec<TableColumnDetail>, String>,
+    },
+    ImportTarget {
+        qualified_name: String,
+        file_label: String,
+        db_type: crate::db::DatabaseType,
+        format: crate::ui::result_export::ExportFormat,
+        /// The file's text and the table's columns, loaded together so one
+        /// failure reports one message.
+        result: Result<(String, Vec<TableColumnDetail>), String>,
     },
     TableIndexes {
         table_name: String,
@@ -2451,6 +2462,46 @@ impl ObjectBrowserWidget {
                             Err(err) => {
                                 crate::ui::alert_on_main(&format!(
                                     "Failed to get table structure: {}",
+                                    err
+                                ));
+                            }
+                        },
+                        ObjectActionResult::ImportTarget {
+                            qualified_name,
+                            file_label,
+                            db_type,
+                            format,
+                            result,
+                        } => match result {
+                            Ok((text, columns)) => {
+                                if let Some((sql, summary)) =
+                                    ObjectBrowserWidget::build_import_script_from_dialog(
+                                        &file_label,
+                                        &text,
+                                        &qualified_name,
+                                        db_type,
+                                        &columns,
+                                        format,
+                                    )
+                                {
+                                    ObjectBrowserWidget::emit_status_callback(
+                                        &status_callback,
+                                        &format!("Importing {file_label}: {summary}"),
+                                    );
+                                    ObjectBrowserWidget::emit_sql_callback(
+                                        &sql_callback,
+                                        SqlAction::ExecuteScript(sql),
+                                    );
+                                } else {
+                                    ObjectBrowserWidget::emit_status_callback(
+                                        &status_callback,
+                                        &format!("Cancelled: {} was not imported", file_label),
+                                    );
+                                }
+                            }
+                            Err(err) => {
+                                crate::ui::alert_on_main(&format!(
+                                    "Failed to prepare the import: {}",
                                     err
                                 ));
                             }
@@ -5426,6 +5477,80 @@ impl ObjectBrowserWidget {
         }
     }
 
+    /// Ask how to import, then build the script that does it.
+    ///
+    /// `None` means the user cancelled, or said yes to something the builder
+    /// refused — either way nothing runs.
+    ///
+    /// Public only so `verify_import_ui` can drive the production modal; not
+    /// part of the supported surface.
+    #[doc(hidden)]
+    pub fn build_import_script_from_dialog(
+        file_label: &str,
+        text: &str,
+        qualified_name: &str,
+        db_type: crate::db::DatabaseType,
+        columns: &[TableColumnDetail],
+        format: crate::ui::result_export::ExportFormat,
+    ) -> Option<(String, String)> {
+        let targets = Self::import_target_columns(db_type, columns);
+        let outcome = crate::ui::table_import_dialog::show(
+            file_label,
+            text,
+            qualified_name,
+            &targets,
+            format,
+        )?;
+        let request = crate::ui::table_import::ImportRequest {
+            db_type,
+            table: qualified_name,
+            targets: &targets,
+            mapping: &outcome.mapping,
+            data: &outcome.data,
+            batch_rows: crate::ui::table_import::DEFAULT_BATCH_ROWS,
+        };
+        match crate::ui::table_import::build_insert_script(&request) {
+            Ok(sql) => {
+                let summary = crate::ui::table_import::describe(&request)
+                    .unwrap_or_else(|_| qualified_name.to_string());
+                Some((sql, summary))
+            }
+            Err(error) => {
+                crate::ui::alert_on_main(&error);
+                None
+            }
+        }
+    }
+
+    /// The table's columns as the import builder needs them: the declared type
+    /// resolved to the literal kind it accepts.
+    #[doc(hidden)]
+    pub fn import_target_columns(
+        db_type: crate::db::DatabaseType,
+        columns: &[TableColumnDetail],
+    ) -> Vec<crate::ui::table_import::TargetColumn> {
+        columns
+            .iter()
+            .map(|column| crate::ui::table_import::TargetColumn {
+                name: column.name.clone(),
+                kind: crate::ui::table_import::column_kind_for_data_type(
+                    db_type,
+                    &column.data_type,
+                ),
+                nullable: column.nullable,
+            })
+            .collect()
+    }
+
+    /// Which file to import. `None` means the user cancelled the chooser.
+    fn ask_import_file_path() -> Option<std::path::PathBuf> {
+        let mut dialog = fltk::dialog::FileDialog::new(fltk::dialog::FileDialogType::BrowseFile);
+        dialog.set_filter(&crate::ui::result_import::open_file_filter());
+        dialog.show();
+        let filename = dialog.filename();
+        (!filename.as_os_str().is_empty()).then_some(filename)
+    }
+
     fn menu_choices_for_object_item(
         item_info: &ObjectItem,
         db_type: crate::db::DatabaseType,
@@ -5725,6 +5850,69 @@ impl ObjectBrowserWidget {
                                 object_name,
                                 object_type,
                                 status,
+                                result,
+                            });
+                            app::awake();
+                        });
+                    }
+                    (
+                        "Import Data...",
+                        ObjectItem::Simple {
+                            object_name,
+                            object_type,
+                        },
+                    ) if object_type == "TABLES" => {
+                        let qualified_name = Self::qualify_object_name_for_scope(
+                            db_type,
+                            selected_scope.as_deref(),
+                            object_name,
+                        );
+                        // The chooser runs here, on the UI thread, so the user
+                        // picks a file before any session is taken.
+                        let Some(path) = Self::ask_import_file_path() else {
+                            return;
+                        };
+                        let file_label = path
+                            .file_name()
+                            .map(|name| name.to_string_lossy().to_string())
+                            .unwrap_or_else(|| path.to_string_lossy().to_string());
+                        let format = crate::ui::result_import::detect_format(&path)
+                            .unwrap_or(crate::ui::result_export::ExportFormat::Csv);
+                        Self::emit_status_callback(
+                            status_callback,
+                            &format!("Reading {} for import into {}", file_label, qualified_name),
+                        );
+
+                        let connection = connection.clone();
+                        let sender = action_sender.clone();
+                        let table_name = object_name.clone();
+                        let selected_scope = selected_scope.clone();
+                        let qualified_for_thread = qualified_name.clone();
+                        let file_label_for_thread = file_label.clone();
+                        thread::spawn(move || {
+                            let activity = format!("Loading table structure for {}", table_name);
+                            let result = read_import_file(&path).and_then(|text| {
+                                ObjectBrowserWidget::with_pooled_object_session(
+                                    &connection,
+                                    selected_scope.as_deref(),
+                                    activity,
+                                    |context, session| {
+                                        object_browser_behavior_for(context.connection_info.db_type)
+                                            .load_table_structure(
+                                                context,
+                                                session,
+                                                selected_scope.as_deref(),
+                                                &table_name,
+                                            )
+                                    },
+                                )
+                                .map(|columns| (text, columns))
+                            });
+                            let _ = sender.send(ObjectActionResult::ImportTarget {
+                                qualified_name: qualified_for_thread,
+                                file_label: file_label_for_thread,
+                                db_type,
+                                format,
                                 result,
                             });
                             app::awake();
@@ -7178,7 +7366,8 @@ impl ObjectBrowserDbBehavior for OracleObjectBrowserBehavior {
     fn menu_choices_for_object_item(&self, item_info: &ObjectItem) -> Option<&'static str> {
         match item_info {
             ObjectItem::Simple { object_type, .. } if object_type == "TABLES" => Some(
-                "Select Data (Top 100)|View Structure|View Indexes|View Constraints|Generate                  DDL|Truncate...|Drop...",
+                "Select Data (Top 100)|Import Data...|View Structure|View Indexes|View \
+                 Constraints|Generate DDL|Truncate...|Drop...",
             ),
             ObjectItem::Simple { object_type, .. }
                 if object_type == "VIEWS" || object_type == "MATERIALIZED VIEWS" =>
@@ -7796,8 +7985,8 @@ impl ObjectBrowserDbBehavior for MysqlObjectBrowserBehavior {
     fn menu_choices_for_object_item(&self, item_info: &ObjectItem) -> Option<&'static str> {
         match item_info {
             ObjectItem::Simple { object_type, .. } if object_type == "TABLES" => Some(
-                "Select Data (Top 100)|View Structure|View Indexes|View Constraints|Generate \
-                 DDL|Truncate...|Drop...",
+                "Select Data (Top 100)|Import Data...|View Structure|View Indexes|View \
+                 Constraints|Generate DDL|Truncate...|Drop...",
             ),
             ObjectItem::Simple { object_type, .. } if object_type == "VIEWS" => {
                 Some("Select Data (Top 100)|Generate DDL|Drop...")
@@ -8765,6 +8954,21 @@ impl MultiObjectBrowserWidget {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(Box::new(callback));
     }
+}
+
+/// Read an import file as text.
+///
+/// Only UTF-8 is accepted, and a file that is not UTF-8 is refused by name
+/// rather than mangled into replacement characters that would then be inserted
+/// into a table.
+fn read_import_file(path: &std::path::Path) -> Result<String, String> {
+    let bytes = std::fs::read(path).map_err(|error| format!("{}: {error}", path.display()))?;
+    String::from_utf8(bytes).map_err(|_| {
+        format!(
+            "{} is not UTF-8 text. Save it as UTF-8 and import it again.",
+            path.display()
+        )
+    })
 }
 
 #[cfg(test)]

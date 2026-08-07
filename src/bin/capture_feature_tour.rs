@@ -1324,6 +1324,16 @@ fn capture_result_export(main_window: &mut MainWindow) {
     pump(200);
 }
 
+/// The import modal: format, header and NULL choices, and the file-to-table
+/// column mapping in one frame.
+fn capture_table_import(main_window: &mut MainWindow) {
+    app::add_timeout3(0.45, |_| {
+        capture_active_dialog("Import Data from File", "/tmp/space-query-table-import.ppm")
+    });
+    main_window.capture_tour_show_import_dialog();
+    pump(200);
+}
+
 /// Composite the open Data Grid menu onto the main window, save the frame, and
 /// dismiss the menu so its popup loop ends.
 fn capture_grid_context_menu(capture_path: &str) {
@@ -1733,6 +1743,12 @@ fn main() {
         app::quit();
         return;
     }
+    if capture_mode.as_deref() == Some("table-import") {
+        capture_object_browser(&mut main_window);
+        capture_table_import(&mut main_window);
+        app::quit();
+        return;
+    }
     if capture_mode.as_deref() == Some("result-editing") {
         capture_object_browser(&mut main_window);
         capture_result_editing(&mut main_window);
@@ -1770,6 +1786,7 @@ fn main() {
     capture_object_drop_confirmation("/tmp/space-query-object-drop-confirmation.ppm");
     capture_grid_sql_export(&mut main_window);
     capture_result_export(&mut main_window);
+    capture_table_import(&mut main_window);
     capture_table_browse_popup(&mut main_window, false);
     capture_result_editing(&mut main_window);
     capture_session_activity(&mut main_window);

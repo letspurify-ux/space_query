@@ -2385,6 +2385,12 @@ impl SqlEditorWidget {
         self.execute_sql(sql, false);
     }
 
+    /// Run multi-statement SQL the app generated on the user's behalf — a file
+    /// import, say — the way F5 runs a script, so every statement in it runs.
+    pub fn execute_script_text(&self, sql: &str) {
+        self.execute_sql(sql, true);
+    }
+
     pub(crate) fn execute_materialized_sql_text(&self, sql: &str) -> bool {
         if !crate::ui::table_browse::is_materialized_grid_statement(sql) {
             return false;

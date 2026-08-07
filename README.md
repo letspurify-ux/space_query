@@ -31,7 +31,7 @@ extracted binary is enough to connect, run a script, and read the result.
 | Editor | IntelliSense over live metadata, signature hints, SQL-aware formatter, multiple file tabs, find and replace, quick describe |
 | Execution | One statement, a selection, or a full script with SQL*Plus-style commands, bind variables, ref cursors, and per-statement timeouts |
 | Results | Independent result tabs, lazy fetch, sorting, in-grid text search, export to CSV/TSV/JSON/XML/HTML/Markdown/SQL, and staged in-grid editing |
-| Objects | Filterable object tree, structure/index/constraint inspection, DDL generation, confirmed drop/truncate, and table browsing with database-side paging |
+| Objects | Filterable object tree, structure/index/constraint inspection, DDL generation, confirmed drop/truncate, file import into a table, and table browsing with database-side paging |
 | Operations | Session activity, persisted query history, application log, and crash reports |
 
 ## Database support
@@ -330,6 +330,53 @@ connected dialect; the other formats do not care. Exporting every row finishes a
 open lazy fetch first, so the file has the whole result rather than the rows
 scrolled into view. Exporting a selection never triggers a fetch.
 
+### Import a file into a table
+
+Right-click a table in the object browser and choose **Import Data...**. Every
+format the export writes can be read back, so a result exported from one
+database goes straight into another.
+
+![The Import Data dialog: format, header and NULL choices, and the column mapping](docs/images/table-import.png)
+
+The dialog re-reads the file whenever a choice changes, so the column list, the
+row count, and the mapping on screen always describe what **Import** would
+actually run.
+
+| Choice | What it does |
+| --- | --- |
+| **Format** | Preselected from the file's extension; change it to read the same file another way |
+| **First row is a header** | CSV, TSV, and HTML only. On, the file names its columns; off, they are `COLUMN_1…n` |
+| **NULL text** | CSV and TSV only. A cell holding exactly this text becomes SQL `NULL`. Defaults to `NULL`, which is what the export writes |
+| **File column → table column** | One selector per file column, preset by matching names (or by position when there is no header). Send a column to `(skip)` to leave it out |
+
+Each format is read back the way it was written, so an export/import round trip
+returns the original values:
+
+| Format | `NULL` is |
+| --- | --- |
+| **CSV**, **TSV** | A cell whose text equals the NULL text; a UTF-8 BOM is stripped |
+| **JSON** | The `null` literal. Numbers keep their exact spelling, and a nested object or array is kept verbatim |
+| **XML** | An empty element written `<C/>`; `<C></C>` is the empty string |
+| **HTML**, **Markdown** | An empty cell |
+| **SQL Inserts** | The `NULL` keyword. `TO_DATE`, `TO_TIMESTAMP`, `TO_TIMESTAMP_TZ`, and `HEXTORAW` are unwrapped back to the value they wrap, and any other expression is refused by name rather than quoted into something else |
+
+Literals are built from the **target column's declared type**, not from how a
+value looks, exactly as the SQL export does — so a zero-padded code keeps its
+quotes and its zeros, and a date-shaped string going into a `VARCHAR2` stays a
+string. Rows are batched (100 per statement: a multi-row `VALUES` list on
+MySQL and MariaDB, `INSERT ALL` on Oracle) and run as an ordinary script, so the
+import commits exactly when the session's auto-commit setting says it does and a
+failure is reported like any other statement's.
+
+Two things the import will not do quietly: a file that is not UTF-8 is refused
+rather than mangled, and an `&` in a value is written as `CHR(38)` on Oracle so
+it cannot be read as a substitution variable.
+
+Formats that cannot express a value exactly are the documented edges: Markdown
+trims a cell and writes every line break as `<br>`, HTML and Markdown spell
+`NULL` and the empty string the same way, and a CSV cell holding the NULL text
+is indistinguishable from `NULL`.
+
 ### Copy a selection as SQL
 
 Select cells in the Data Grid, right-click, and take the selection as SQL on the
@@ -473,6 +520,17 @@ and comparison tests are available through:
 
 ```bash
 ./test_tns_thin.sh
+```
+
+Some behaviour can only be proven by running the application or a server. Those
+checks are separate binaries:
+
+```bash
+# The import modal, driven through its own event loop.
+cargo run --bin verify_import_ui
+
+# Export a table, import the file back, compare — every format, every backend.
+cargo run --bin verify_import_live all
 ```
 
 Pull requests and pushes to `main` run formatting, Clippy, both non-live test

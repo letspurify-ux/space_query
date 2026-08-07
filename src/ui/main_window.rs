@@ -12639,6 +12639,7 @@ impl MainWindow {
             };
             let mut created_tabs = Vec::new();
             let mut sql_to_execute: Option<String> = None;
+            let mut script_to_execute: Option<String> = None;
             let mut table_browse_to_execute: Option<(QueryTabId, TableBrowsePageRequest)> = None;
             {
                 let mut s = state_for_browser
@@ -12680,6 +12681,9 @@ impl MainWindow {
                     }
                     SqlAction::Execute(sql) => {
                         sql_to_execute = Some(sql);
+                    }
+                    SqlAction::ExecuteScript(sql) => {
+                        script_to_execute = Some(sql);
                     }
                     SqlAction::BrowseTable(target) => {
                         let Some(tab) =
@@ -12748,6 +12752,12 @@ impl MainWindow {
             if let Some(sql) = sql_to_execute {
                 if let Some(editor) = acquire_sql_editor_if_idle(&state_for_browser) {
                     editor.execute_sql_text(&sql);
+                }
+            }
+
+            if let Some(sql) = script_to_execute {
+                if let Some(editor) = acquire_sql_editor_if_idle(&state_for_browser) {
+                    editor.execute_script_text(&sql);
                 }
             }
 
@@ -13964,6 +13974,41 @@ impl MainWindow {
     #[doc(hidden)]
     pub fn capture_tour_show_export_dialog(&mut self) {
         let _ = crate::ui::result_export_dialog::show(&ExportFormat::ALL, true);
+    }
+
+    /// The import modal over a sample file, with one file column that has no
+    /// match in the table so the skip case is visible.
+    #[doc(hidden)]
+    pub fn capture_tour_show_import_dialog(&mut self) {
+        use crate::db::SqlValueKind;
+        use crate::ui::table_import::TargetColumn;
+
+        let column = |name: &str, kind: SqlValueKind, nullable: bool| TargetColumn {
+            name: name.to_string(),
+            kind,
+            nullable,
+        };
+        let targets = vec![
+            column("EMPNO", SqlValueKind::Number, false),
+            column("ENAME", SqlValueKind::String, true),
+            column("HIREDATE", SqlValueKind::Temporal, true),
+            column("JOB", SqlValueKind::String, true),
+            column("SAL", SqlValueKind::Number, true),
+            column("COMM", SqlValueKind::Number, true),
+        ];
+        let text = "EMPNO,ENAME,HIREDATE,JOB,SAL,DEPT_NAME\n\
+                    7369,SMITH,1980-12-17,CLERK,800,RESEARCH\n\
+                    7499,ALLEN,1981-02-20,SALESMAN,1600,SALES\n\
+                    7521,WARD,1981-02-22,SALESMAN,1250,SALES\n\
+                    7566,JONES,1981-04-02,MANAGER,2975,RESEARCH\n\
+                    7654,MARTIN,1981-09-28,SALESMAN,1250,SALES\n";
+        let _ = crate::ui::table_import_dialog::show(
+            "employees.csv",
+            text,
+            "HR.EMP",
+            &targets,
+            ExportFormat::Csv,
+        );
     }
 
     /// What the three Data Grid SQL export items put on the clipboard for the

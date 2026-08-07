@@ -27,6 +27,10 @@ pub mod query_tabs;
 pub mod result_export;
 pub(crate) mod result_export_dialog;
 pub(crate) mod result_filter;
+// Public only so `verify_import_live` can drive the same parsers the dialog
+// uses; not part of the supported surface.
+#[doc(hidden)]
+pub mod result_import;
 pub mod result_table;
 pub mod result_tabs;
 pub mod settings_dialog;
@@ -35,6 +39,11 @@ pub mod sql_editor;
 pub mod syntax_highlight;
 pub(crate) mod tab_strip;
 pub mod table_browse;
+// Public only so `verify_import_live` can build the same INSERT script the
+// dialog builds; not part of the supported surface.
+#[doc(hidden)]
+pub mod table_import;
+pub(crate) mod table_import_dialog;
 pub(crate) mod text_buffer_access;
 pub mod theme;
 pub(crate) mod ui_timeout;

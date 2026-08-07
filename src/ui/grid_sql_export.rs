@@ -49,25 +49,12 @@ impl GridSqlSelection {
 
     /// Quote a possibly dot-qualified name for this backend.
     fn quote_identifier(&self, name: &str) -> String {
-        if self.db_type.is_mysql_or_mariadb() {
-            name.split('.')
-                .map(|segment| quote_mysql_identifier(segment.trim()))
-                .collect::<Vec<_>>()
-                .join(".")
-        } else {
-            // Oracle: legal unquoted identifiers stay unquoted, so generated SQL
-            // reads the way a person would write it.
-            ResultTableWidget::quote_qualified_identifier(name)
-        }
+        quote_qualified_name(self.db_type, name)
     }
 
     fn quote_column(&self, index: usize) -> String {
         let name = self.all_columns.get(index).map_or("", String::as_str);
-        if self.db_type.is_mysql_or_mariadb() {
-            quote_mysql_identifier(name.trim())
-        } else {
-            ResultTableWidget::quote_identifier_segment(name)
-        }
+        quote_column_name(self.db_type, name)
     }
 
     fn kind(&self, index: usize) -> SqlValueKind {
@@ -109,6 +96,29 @@ impl GridSqlSelection {
 /// The grid-edit descriptor already names the exact table, so it wins.
 /// Otherwise the table is resolved from the SQL that produced the grid, which
 /// handles CTEs and `alias.ROWID` select lists. `None` renders as `MY_TABLE`.
+/// Quote a possibly dot-qualified object name for `db_type`.
+pub fn quote_qualified_name(db_type: DatabaseType, name: &str) -> String {
+    if db_type.is_mysql_or_mariadb() {
+        name.split('.')
+            .map(|segment| quote_mysql_identifier(segment.trim()))
+            .collect::<Vec<_>>()
+            .join(".")
+    } else {
+        // Oracle: legal unquoted identifiers stay unquoted, so generated SQL
+        // reads the way a person would write it.
+        ResultTableWidget::quote_qualified_identifier(name)
+    }
+}
+
+/// Quote a single column name for `db_type`.
+pub fn quote_column_name(db_type: DatabaseType, name: &str) -> String {
+    if db_type.is_mysql_or_mariadb() {
+        quote_mysql_identifier(name.trim())
+    } else {
+        ResultTableWidget::quote_identifier_segment(name)
+    }
+}
+
 pub fn resolve_export_table(descriptor_table: Option<String>, source_sql: &str) -> Option<String> {
     descriptor_table
         .or_else(|| crate::ui::sql_editor::query_text::resolve_edit_target_table(source_sql).ok())
@@ -292,6 +302,16 @@ pub fn sql_literal(
     if ResultTableWidget::value_represents_null(value, null_text) {
         return "NULL".to_string();
     }
+    sql_literal_for_value(db_type, kind, value)
+}
+
+/// Render `value` as a literal for `kind` with no NULL detection at all.
+///
+/// [`sql_literal`] reads the grid, where an empty cell and the text `NULL` both
+/// mean SQL NULL. A caller that already knows a value is not NULL — a file
+/// import, where the format said so explicitly — needs the empty string to stay
+/// the empty string, and this is that entry point.
+pub fn sql_literal_for_value(db_type: DatabaseType, kind: SqlValueKind, value: &str) -> String {
     let mysql_family = db_type.is_mysql_or_mariadb();
     match kind {
         SqlValueKind::Number | SqlValueKind::Boolean => value.trim().to_string(),
@@ -360,11 +380,15 @@ fn oracle_temporal_literal(value: &str) -> String {
         (Some(fraction), None) if is_all_digits(fraction) => {
             format!("TO_TIMESTAMP('{text}','YYYY-MM-DD HH24:MI:SS.FF')")
         }
-        (Some(fraction), Some(_)) if is_all_digits(fraction) => {
-            format!("TO_TIMESTAMP_TZ('{text}','YYYY-MM-DD HH24:MI:SS.FF TZH:TZM')")
+        // The zone is re-joined with an explicit space so the text matches the
+        // format model exactly. The drivers render the offset without one, and
+        // Oracle then reads `TZH` off a value whose sign is where the space
+        // should be — silently turning `-05:30` into `+05:30`.
+        (Some(fraction), Some(zone)) if is_all_digits(fraction) => {
+            format!("TO_TIMESTAMP_TZ('{datetime} {zone}','YYYY-MM-DD HH24:MI:SS.FF TZH:TZM')")
         }
-        (None, Some(_)) => {
-            format!("TO_TIMESTAMP_TZ('{text}','YYYY-MM-DD HH24:MI:SS TZH:TZM')")
+        (None, Some(zone)) => {
+            format!("TO_TIMESTAMP_TZ('{datetime} {zone}','YYYY-MM-DD HH24:MI:SS TZH:TZM')")
         }
         _ => quoted_string(value, false),
     }
@@ -543,13 +567,21 @@ mod tests {
             oracle_literal(SqlValueKind::Temporal, "1980-12-17 09:30:00.123456"),
             "TO_TIMESTAMP('1980-12-17 09:30:00.123456','YYYY-MM-DD HH24:MI:SS.FF')"
         );
+        // The offset is separated from the time by a space so it lines up
+        // with `TZH:TZM` in the format model. Without it Oracle reads the sign
+        // as the separator and a negative offset comes back positive.
         assert_eq!(
             oracle_literal(SqlValueKind::Temporal, "1980-12-17 09:30:00.123456+09:00"),
-            "TO_TIMESTAMP_TZ('1980-12-17 09:30:00.123456+09:00','YYYY-MM-DD HH24:MI:SS.FF TZH:TZM')"
+            "TO_TIMESTAMP_TZ('1980-12-17 09:30:00.123456 +09:00','YYYY-MM-DD HH24:MI:SS.FF TZH:TZM')"
         );
         assert_eq!(
             oracle_literal(SqlValueKind::Temporal, "1980-12-17 09:30:00-05:30"),
-            "TO_TIMESTAMP_TZ('1980-12-17 09:30:00-05:30','YYYY-MM-DD HH24:MI:SS TZH:TZM')"
+            "TO_TIMESTAMP_TZ('1980-12-17 09:30:00 -05:30','YYYY-MM-DD HH24:MI:SS TZH:TZM')"
+        );
+        // A driver that already renders the space produces the same literal.
+        assert_eq!(
+            oracle_literal(SqlValueKind::Temporal, "1980-12-17 09:30:00.123456 -05:30"),
+            "TO_TIMESTAMP_TZ('1980-12-17 09:30:00.123456 -05:30','YYYY-MM-DD HH24:MI:SS.FF TZH:TZM')"
         );
     }
 
