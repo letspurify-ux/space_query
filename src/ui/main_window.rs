@@ -4057,7 +4057,7 @@ fn batch_owns_grid_target(
 /// bar filters: the page would be re-paged and the user's own query would be
 /// gone from the chain.
 fn result_can_carry_a_filter_bar(sql: &str) -> bool {
-    !sql.contains(crate::ui::table_browse::TABLE_BROWSE_MATERIALIZE_MARKER)
+    !crate::ui::table_browse::is_materialized_grid_statement(sql)
 }
 
 pub struct MainWindow {
@@ -4192,6 +4192,7 @@ pub(crate) fn result_pane_routes_for_progress_with_script_context(
         | QueryProgress::DatabaseChanged { .. }
         | QueryProgress::ScopeChangedNotice { .. }
         | QueryProgress::WorkerPanicked { .. }
+        | QueryProgress::ExecutionAbandoned { .. }
         | QueryProgress::MetadataRefreshNeeded
         | QueryProgress::ExecutionFinished(_)
         | QueryProgress::BatchFinished => Vec::new(),
@@ -9383,6 +9384,31 @@ impl MainWindow {
                             &[format!("Cancel failed: {message}")],
                         );
                         result_tabs.select_messages_errors();
+                    }
+                }
+                QueryProgress::ExecutionAbandoned {
+                    materialized_grid_statement,
+                    message,
+                } => {
+                    // The statement was reported as started, so its routing and
+                    // the browse tab it left loading are released here or not
+                    // at all: nothing else will ever finish them, and a routing
+                    // left behind would capture the next query's result.
+                    let stranded_target = if materialized_grid_statement {
+                        s.pending_table_browse_last.remove(&tab_id);
+                        s.pending_table_browse_refresh.remove(&tab_id);
+                        s.result_grid_execution_targets.remove(&tab_id)
+                    } else {
+                        None
+                    };
+                    if s.should_show_progress_status_for_tab(tab_id) {
+                        s.set_status_message(&message);
+                    }
+                    s.refresh_result_edit_controls();
+                    let mut result_tabs = owning_result_tabs.clone();
+                    drop(s);
+                    if let Some(result_tab_id) = stranded_target {
+                        result_tabs.fail_table_browse_result_by_id(result_tab_id);
                     }
                 }
                 QueryProgress::LazyFetchClosed {

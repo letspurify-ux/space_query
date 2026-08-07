@@ -551,6 +551,19 @@ pub enum QueryProgress {
     WorkerPanicked {
         message: String,
     },
+    /// A deferred execution attempt ultimately failed to start.
+    ///
+    /// An execution that must wait for a previous lazy fetch to be cancelled
+    /// reports success to its caller and retries from a timeout, so the
+    /// caller's "did not start" cleanup can no longer run when that retry is
+    /// the attempt that fails. This carries the failure back, so state the
+    /// caller reserved for the statement is released instead of stranded.
+    ExecutionAbandoned {
+        /// Whether the abandoned statement was an internal materialized grid
+        /// statement — the only kind that reserves result-grid routing.
+        materialized_grid_statement: bool,
+        message: String,
+    },
     StatementFinished {
         index: usize,
         result: QueryResult,

@@ -27,6 +27,13 @@ pub(crate) const TABLE_BROWSE_PAGE_COLUMN: &str = "SQ_INTERNAL_PAGE_ROW";
 pub(crate) const TABLE_BROWSE_DEFAULT_PAGE_SIZE: usize = 500;
 pub(crate) const TABLE_BROWSE_FILTER_HEIGHT: i32 = 42;
 
+/// Whether this statement is a table page this feature built, rather than
+/// something the user ran. Such a statement bypasses lazy fetch, reserves
+/// result-grid routing, and is never itself a relation to filter or re-page.
+pub(crate) fn is_materialized_grid_statement(sql: &str) -> bool {
+    sql.contains(TABLE_BROWSE_MATERIALIZE_MARKER)
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum TableBrowsePopupKeyAction {
     SelectPrev,
@@ -1374,6 +1381,27 @@ mod tests {
             },
             "APP.EMP".to_string(),
         )
+    }
+
+    #[test]
+    fn every_page_and_count_statement_is_recognizable_as_this_features_own() {
+        let request = TableBrowsePageRequest {
+            result_tab_id: ResultTabId::new(1),
+            target: target(DatabaseType::Oracle),
+            clauses: TableBrowseClauses::new("DEPTNO = 10".into(), "ENAME".into()),
+            offset: 0,
+            page_size: 100,
+            navigation: TableBrowseNavigation::Page,
+        };
+
+        assert!(is_materialized_grid_statement(&request.page_sql().unwrap()));
+        assert!(is_materialized_grid_statement(
+            &request.count_sql().unwrap()
+        ));
+        assert!(!is_materialized_grid_statement(
+            &request.logical_sql().unwrap()
+        ));
+        assert!(!is_materialized_grid_statement("SELECT * FROM EMP"));
     }
 
     #[test]

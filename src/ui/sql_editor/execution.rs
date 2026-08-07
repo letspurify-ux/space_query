@@ -2358,7 +2358,7 @@ impl SqlEditorWidget {
     }
 
     pub(crate) fn execute_materialized_sql_text(&self, sql: &str) -> bool {
-        if !sql.contains(crate::ui::table_browse::TABLE_BROWSE_MATERIALIZE_MARKER) {
+        if !crate::ui::table_browse::is_materialized_grid_statement(sql) {
             return false;
         }
         self.try_execute_sql(sql, false)
@@ -8703,6 +8703,40 @@ impl SqlEditorWidget {
         }
     }
 
+    /// Retry an execution that was deferred until the previous lazy fetch
+    /// could be cancelled, reporting the failure when this attempt is the one
+    /// that gives up.
+    ///
+    /// The original caller was told the execution started, so only this event
+    /// can release what it reserved — a table page's result-grid routing and
+    /// the browse tab it left loading.
+    fn run_deferred_execution_retry(
+        &self,
+        sql: &str,
+        script_mode: bool,
+        initial_mysql_delimiter: Option<String>,
+        lazy_cancel_session_id: u64,
+        lazy_cancel_retry_attempt: u32,
+    ) {
+        if self.execute_sql_with_mysql_delimiter_after_lazy_cancel(
+            sql,
+            script_mode,
+            initial_mysql_delimiter,
+            Some(lazy_cancel_session_id),
+            lazy_cancel_retry_attempt,
+        ) {
+            return;
+        }
+        let _ = self
+            .progress_sender
+            .send(QueryProgress::ExecutionAbandoned {
+                materialized_grid_statement:
+                    crate::ui::table_browse::is_materialized_grid_statement(sql),
+                message: "The queued query was not started.".to_string(),
+            });
+        app::awake();
+    }
+
     fn execute_sql_with_mysql_delimiter_after_lazy_cancel(
         &self,
         sql: &str,
@@ -8753,11 +8787,11 @@ impl SqlEditorWidget {
                         crate::ui::ui_timeout::schedule(
                             LAZY_FETCH_CANCEL_RETRY_DELAY_SECONDS,
                             move || {
-                                widget.execute_sql_with_mysql_delimiter_after_lazy_cancel(
+                                widget.run_deferred_execution_retry(
                                     &sql,
                                     script_mode,
                                     initial_mysql_delimiter_for_retry.clone(),
-                                    Some(session_id),
+                                    session_id,
                                     next_retry_attempt,
                                 );
                             },
@@ -8777,11 +8811,11 @@ impl SqlEditorWidget {
                     crate::ui::ui_timeout::schedule(
                         LAZY_FETCH_CANCEL_RETRY_DELAY_SECONDS,
                         move || {
-                            widget.execute_sql_with_mysql_delimiter_after_lazy_cancel(
+                            widget.run_deferred_execution_retry(
                                 &sql,
                                 script_mode,
                                 initial_mysql_delimiter_for_retry.clone(),
-                                Some(session_id),
+                                session_id,
                                 next_retry_attempt,
                             );
                         },
@@ -31807,6 +31841,12 @@ mod mysql_batch_execution_regression_tests {
                     result.sql.lines().next().unwrap_or_default(),
                     result.message
                 ),
+                QueryProgress::ExecutionAbandoned {
+                    materialized_grid_statement,
+                    message,
+                } => format!(
+                    "ExecutionAbandoned(materialized={materialized_grid_statement}, {message})"
+                ),
                 QueryProgress::BatchFinished => "BatchFinished".to_string(),
                 QueryProgress::MetadataRefreshNeeded => "MetadataRefreshNeeded".to_string(),
                 QueryProgress::ExecutionFinished(event) => format!(
@@ -32034,6 +32074,7 @@ mod mysql_batch_execution_regression_tests {
                 | QueryProgress::DatabaseChanged { .. }
                 | QueryProgress::ScopeChangedNotice { .. }
                 | QueryProgress::WorkerPanicked { .. }
+                | QueryProgress::ExecutionAbandoned { .. }
                 | QueryProgress::ExecutionFinished(_)
                 | QueryProgress::BatchFinished
                 | QueryProgress::MetadataRefreshNeeded => assert!(
