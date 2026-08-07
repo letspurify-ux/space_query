@@ -28,7 +28,6 @@ use crate::ui::constants::*;
 use crate::ui::font_settings::{
     configured_result_font_size, configured_result_profile, FontProfile,
 };
-use crate::ui::grid_sort::{compare_cell_values, NullOrdering, SortColumn};
 use crate::ui::grid_sql_export::GridSqlSelection;
 use crate::ui::result_export::{ExportDestination, ExportFormat, ExportGrid, ExportScope};
 use crate::ui::sql_editor::LazyFetchRequest;
@@ -89,12 +88,9 @@ const WIDTH_SAMPLE_ROWS: usize = 5000;
 const MAX_HITTEST_ROW_BACKTRACK: i32 = 4096;
 /// Limit stale column-position fallback scans for very wide result sets.
 const MAX_HITTEST_COL_BACKTRACK: i32 = 512;
-const HEADER_SORT_CLICK_MOVE_TOLERANCE_PX: u32 = 4;
 const LAZY_FETCH_SCROLL_THRESHOLD_NUMERATOR: i64 = 1;
 const LAZY_FETCH_SCROLL_THRESHOLD_DENOMINATOR: i64 = 1;
 const LAZY_FETCH_SCROLLBAR_POLL_INTERVAL_SECONDS: f64 = 0.05;
-const SORT_ASC_MARK: &str = "▲";
-const SORT_DESC_MARK: &str = "▼";
 
 pub type ResultGridSqlExecuteCallback =
     Arc<Mutex<Option<Box<dyn FnMut(String) -> Result<(), String>>>>>;
@@ -109,7 +105,6 @@ pub type ResultTableContextActionCallback =
 /// column name and whether the click asked for ascending order, and returns
 /// true when it took the sort — false falls back to the local sort, so a grid
 /// whose tab can no longer re-query still orders.
-pub type HeaderSortRedirectCallback = Arc<Mutex<Option<Box<dyn FnMut(String) -> bool>>>>;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ResultTableContextAction {
@@ -123,7 +118,6 @@ pub enum ResultTableContextAction {
 }
 
 enum LazyFetchPendingAction {
-    HeaderSort(usize),
     CopyAll,
     SelectAll,
     MoveToEdge {
@@ -318,9 +312,7 @@ pub struct ResultTableWidget {
     column_kinds: Arc<Mutex<Vec<SqlValueKind>>>,
     /// NULL placement for the local header sort, adopted from the backend that
     /// produced the result.
-    sort_null_ordering: Arc<Mutex<NullOrdering>>,
     /// Set when the tab can re-query, so the header sort goes to the server.
-    header_sort_redirect: HeaderSortRedirectCallback,
     /// Buffer for pending rows during streaming
     pending_rows: Arc<Mutex<Vec<Vec<String>>>>,
     /// Pending column width updates
@@ -367,7 +359,6 @@ pub struct ResultTableWidget {
     pending_lazy_actions: Arc<Mutex<VecDeque<(u64, LazyFetchPendingAction)>>>,
     pending_page_navigation: Arc<Mutex<Option<PendingPageNavigation>>>,
     context_action_callback: ResultTableContextActionCallback,
-    sort_state: Arc<Mutex<Option<ColumnSortState>>>,
     drag_state: Arc<Mutex<DragState>>,
 }
 
@@ -378,10 +369,9 @@ struct DragState {
     vertical_scrollbar_sequence: bool,
     vertical_scrollbar_polling: bool,
     vertical_scrollbar_fetch_requested: bool,
-    header_sort_candidate_col: Option<i32>,
-    header_sort_requires_double_click: bool,
-    header_sort_start_x: i32,
-    header_sort_start_y: i32,
+    /// A press that landed on a column header, so the rest of that pointer
+    /// sequence does not turn into a cell drag-selection.
+    header_press_col: Option<i32>,
     last_selection: Option<(i32, i32, i32, i32)>,
     last_col_position: Option<i32>,
     shift_click_base_selection: Option<(i32, i32, i32, i32)>,
@@ -407,27 +397,6 @@ enum CanonicalJoinClass {
     Symbolic,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-enum SortDirection {
-    Ascending,
-    Descending,
-}
-
-impl SortDirection {
-    fn toggled(self) -> Self {
-        match self {
-            Self::Ascending => Self::Descending,
-            Self::Descending => Self::Ascending,
-        }
-    }
-}
-
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-struct ColumnSortState {
-    col_idx: usize,
-    direction: SortDirection,
-}
-
 #[derive(Clone)]
 struct TableEditSession {
     rowid_col: usize,
@@ -447,7 +416,6 @@ struct QueryEditBackupState {
     source_sql: String,
     edit_session: TableEditSession,
     result_edit_descriptor: Option<ResultEditDescriptor>,
-    sort_state: Option<ColumnSortState>,
 }
 
 struct EditModePreparation {
@@ -763,217 +731,6 @@ impl ResultTableWidget {
             .clone()
     }
 
-    fn current_sort_state(&self) -> Option<ColumnSortState> {
-        *self
-            .sort_state
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-    }
-
-    fn clear_sort_state(&self) {
-        *self
-            .sort_state
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
-    }
-
-    fn sort_marker_for_column(
-        sort_state: Option<ColumnSortState>,
-        col_idx: usize,
-    ) -> Option<&'static str> {
-        let state = sort_state?;
-        if state.col_idx != col_idx {
-            return None;
-        }
-        match state.direction {
-            SortDirection::Ascending => Some(SORT_ASC_MARK),
-            SortDirection::Descending => Some(SORT_DESC_MARK),
-        }
-    }
-
-    /// Where NULLs go on an ascending local sort until the connection that
-    /// produced the result says otherwise.
-    ///
-    /// This matches what the grid has always done — an empty cell compared as
-    /// text sorts ahead of everything — so a result installed by a path that
-    /// does not yet report its backend keeps its previous order rather than
-    /// silently flipping. See docs_items/item_list.md appendix B.2 defect 3.
-    const DEFAULT_SORT_NULL_ORDERING: NullOrdering = NullOrdering::FirstOnAscending;
-
-    /// Adopt the NULL ordering of the backend that produced this result, so a
-    /// locally sorted column lands where the server would have put it.
-    pub(crate) fn set_sort_null_ordering(&mut self, ordering: NullOrdering) {
-        *self
-            .sort_null_ordering
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner()) = ordering;
-    }
-
-    /// Send header sorts to the server for a result that can be re-queried.
-    pub(crate) fn set_header_sort_redirect(&mut self, callback: HeaderSortRedirectCallback) {
-        let taken = callback
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .take();
-        *self
-            .header_sort_redirect
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner()) = taken;
-    }
-
-    /// Offer the sort to the server. Returns true when it was taken, in which
-    /// case the rows on screen are left alone — the re-query replaces them.
-    ///
-    /// Columns with no usable name (the hidden ROWID helper, or headers blanked
-    /// by `SET HEADING OFF`) cannot appear in an `ORDER BY`, so those keep
-    /// sorting locally.
-    fn try_redirect_header_sort(
-        headers: &Arc<Mutex<Vec<String>>>,
-        redirect: &HeaderSortRedirectCallback,
-        col_idx: usize,
-    ) -> bool {
-        let column = headers
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .get(col_idx)
-            .map(|name| name.trim().to_string())
-            .unwrap_or_default();
-        if column.is_empty() {
-            return false;
-        }
-        let mut guard = redirect
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        match guard.as_mut() {
-            Some(callback) => callback(column),
-            None => false,
-        }
-    }
-
-    fn sort_column_for(
-        column_kinds: &[SqlValueKind],
-        col_idx: usize,
-        nulls: NullOrdering,
-    ) -> SortColumn {
-        SortColumn {
-            kind: column_kinds.get(col_idx).copied().unwrap_or_default(),
-            nulls,
-        }
-    }
-
-    fn compare_row_values_for_sort(
-        left: &[String],
-        right: &[String],
-        col_idx: usize,
-        column: SortColumn,
-        null_text: &str,
-    ) -> std::cmp::Ordering {
-        let left_value = left.get(col_idx).map(|value| value.as_str()).unwrap_or("");
-        let right_value = right.get(col_idx).map(|value| value.as_str()).unwrap_or("");
-        compare_cell_values(
-            left_value,
-            Self::value_represents_null(left_value, null_text),
-            right_value,
-            Self::value_represents_null(right_value, null_text),
-            column,
-        )
-    }
-
-    fn sort_row_entries(
-        rows: &mut Vec<Vec<String>>,
-        row_states: Option<&mut Vec<EditRowState>>,
-        col_idx: usize,
-        direction: SortDirection,
-        column: SortColumn,
-        null_text: &str,
-    ) -> bool {
-        let compare = |left: &Vec<String>, right: &Vec<String>| {
-            let ordering =
-                Self::compare_row_values_for_sort(left, right, col_idx, column, null_text);
-            match direction {
-                SortDirection::Ascending => ordering,
-                SortDirection::Descending => ordering.reverse(),
-            }
-        };
-        match row_states {
-            Some(states) => {
-                if states.len() != rows.len() {
-                    return false;
-                }
-                let moved_rows = std::mem::take(rows);
-                let moved_states = std::mem::take(states);
-                let mut paired: Vec<(Vec<String>, EditRowState)> =
-                    moved_rows.into_iter().zip(moved_states).collect();
-                paired.sort_by(|(left, _), (right, _)| compare(left, right));
-                rows.reserve(paired.len());
-                states.reserve(paired.len());
-                for (row, state) in paired {
-                    rows.push(row);
-                    states.push(state);
-                }
-                true
-            }
-            None => {
-                rows.sort_by(compare);
-                true
-            }
-        }
-    }
-
-    fn apply_sort_to_table_data(
-        full_data: &Arc<Mutex<Vec<Vec<String>>>>,
-        edit_session: &Arc<Mutex<Option<TableEditSession>>>,
-        column_kinds: &Arc<Mutex<Vec<SqlValueKind>>>,
-        null_text: &Arc<Mutex<String>>,
-        sort_null_ordering: &Arc<Mutex<NullOrdering>>,
-        col_idx: usize,
-        direction: SortDirection,
-    ) -> bool {
-        let nulls = *sort_null_ordering
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let column = {
-            let kinds = column_kinds
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            Self::sort_column_for(&kinds, col_idx, nulls)
-        };
-        let null_text = null_text
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .clone();
-        let mut session_guard = edit_session
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let mut rows_guard = full_data
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let row_states = session_guard
-            .as_mut()
-            .map(|session| &mut session.row_states);
-        Self::sort_row_entries(
-            &mut rows_guard,
-            row_states,
-            col_idx,
-            direction,
-            column,
-            &null_text,
-        )
-    }
-
-    fn next_sort_state(current: Option<ColumnSortState>, col_idx: usize) -> ColumnSortState {
-        match current {
-            Some(state) if state.col_idx == col_idx => ColumnSortState {
-                col_idx,
-                direction: state.direction.toggled(),
-            },
-            _ => ColumnSortState {
-                col_idx,
-                direction: SortDirection::Ascending,
-            },
-        }
-    }
-
     fn set_query_edit_backup(&self, backup: Option<QueryEditBackupState>) {
         *self
             .query_edit_backup
@@ -1011,10 +768,6 @@ impl ResultTableWidget {
             .result_edit_descriptor
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = backup.result_edit_descriptor;
-        *self
-            .sort_state
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner()) = backup.sort_state;
 
         let row_count = self
             .full_data
@@ -1061,7 +814,6 @@ impl ResultTableWidget {
             source_sql,
             edit_session,
             result_edit_descriptor,
-            sort_state: self.current_sort_state(),
         }));
     }
 
@@ -2304,8 +2056,6 @@ impl ResultTableWidget {
         let row_number_offset = Arc::new(AtomicU64::new(0));
         let null_text = Arc::new(Mutex::new("NULL".to_string()));
         let column_kinds: Arc<Mutex<Vec<SqlValueKind>>> = Arc::new(Mutex::new(Vec::new()));
-        let sort_null_ordering = Arc::new(Mutex::new(Self::DEFAULT_SORT_NULL_ORDERING));
-        let header_sort_redirect: HeaderSortRedirectCallback = Arc::new(Mutex::new(None));
         let source_sql = Arc::new(Mutex::new(String::new()));
         let streaming_source_sql = Arc::new(Mutex::new(String::new()));
         let execute_sql_callback: Arc<Mutex<Option<ResultGridSqlExecuteCallback>>> =
@@ -2333,7 +2083,6 @@ impl ResultTableWidget {
         let pending_lazy_actions: Arc<Mutex<VecDeque<(u64, LazyFetchPendingAction)>>> =
             Arc::new(Mutex::new(VecDeque::new()));
         let context_action_callback: ResultTableContextActionCallback = Arc::new(Mutex::new(None));
-        let sort_state: Arc<Mutex<Option<ColumnSortState>>> = Arc::new(Mutex::new(None));
         let drag_state = Arc::new(Mutex::new(DragState::default()));
 
         let mut table = Table::new(x, y, w, h, None);
@@ -2379,7 +2128,6 @@ impl ResultTableWidget {
         let max_cell_display_chars_for_draw = max_cell_display_chars_draw.clone();
         let row_number_offset_for_draw = row_number_offset.clone();
         let edit_session_for_draw = edit_session.clone();
-        let sort_state_for_draw = sort_state.clone();
 
         table.draw_cell(move |_t, ctx, row, col, x, y, w, h| {
             let normal_font = font_settings_for_draw.normal_font();
@@ -2394,8 +2142,6 @@ impl ResultTableWidget {
                     draw::draw_box(FrameType::FlatBox, x, y, w, h, header_bg);
                     draw::set_draw_color(header_fg);
                     draw::set_font(bold_font, font_size);
-                    let sort_snapshot =
-                        sort_state_for_draw.try_lock().ok().and_then(|guard| *guard);
                     if let Ok(hdrs) = headers_for_draw.try_lock() {
                         if let Some(text) = hdrs.get(col as usize) {
                             draw::draw_text2(
@@ -2406,18 +2152,6 @@ impl ResultTableWidget {
                                 h,
                                 Align::Left,
                             );
-                            if let Some(marker) =
-                                Self::sort_marker_for_column(sort_snapshot, col as usize)
-                            {
-                                draw::draw_text2(
-                                    marker,
-                                    x + TABLE_CELL_PADDING,
-                                    y,
-                                    w - TABLE_CELL_PADDING * 2,
-                                    h,
-                                    Align::Right,
-                                );
-                            }
                         }
                     }
                     draw::set_draw_color(border_color);
@@ -2567,10 +2301,6 @@ impl ResultTableWidget {
 
         let mut table_for_handle = table.clone();
         let full_data_for_handle = full_data.clone();
-        let column_kinds_for_handle = column_kinds.clone();
-        let null_text_for_handle = null_text.clone();
-        let sort_null_ordering_for_handle = sort_null_ordering.clone();
-        let header_sort_redirect_for_handle = header_sort_redirect.clone();
         let font_settings_for_handle = font_settings.clone();
         let source_sql_for_handle = source_sql.clone();
         let execute_sql_callback_for_handle = execute_sql_callback.clone();
@@ -2579,8 +2309,6 @@ impl ResultTableWidget {
         let hidden_auto_rowid_col_for_handle = hidden_auto_rowid_col.clone();
         let active_inline_edit_for_handle = active_inline_edit.clone();
         let active_inline_edit_for_resize = active_inline_edit.clone();
-        let sort_state_for_handle = sort_state.clone();
-        let streaming_in_progress_for_handle = streaming_in_progress.clone();
         let lazy_fetch_session_for_handle = lazy_fetch_session.clone();
         let lazy_fetch_callback_for_handle = lazy_fetch_callback.clone();
         let lazy_fetch_more_in_flight_for_handle = lazy_fetch_more_in_flight.clone();
@@ -2678,10 +2406,7 @@ impl ResultTableWidget {
                                 let mut state = drag_state_for_handle
                                     .lock()
                                     .unwrap_or_else(|poisoned| poisoned.into_inner());
-                                state.header_sort_candidate_col = Some(col);
-                                state.header_sort_requires_double_click = app::event_clicks();
-                                state.header_sort_start_x = app::event_x();
-                                state.header_sort_start_y = app::event_y();
+                                state.header_press_col = Some(col);
                                 state.is_dragging = false;
                                 state.consume_background_pointer_sequence = false;
                                 state.vertical_scrollbar_sequence = false;
@@ -2695,8 +2420,7 @@ impl ResultTableWidget {
                             let mut state = drag_state_for_handle
                                 .lock()
                                 .unwrap_or_else(|poisoned| poisoned.into_inner());
-                            state.header_sort_candidate_col = None;
-                            state.header_sort_requires_double_click = false;
+                            state.header_press_col = None;
                             state.consume_background_pointer_sequence = false;
                             state.vertical_scrollbar_sequence = false;
                             state.vertical_scrollbar_fetch_requested = false;
@@ -2842,10 +2566,7 @@ impl ResultTableWidget {
                         is_dragging,
                         consume_background_pointer_sequence,
                         vertical_scrollbar_sequence,
-                        header_sort_candidate,
-                        header_sort_requires_double_click,
-                        header_start_x,
-                        header_start_y,
+                        header_press,
                     ) = {
                         let state = drag_state_for_handle
                             .lock()
@@ -2854,10 +2575,7 @@ impl ResultTableWidget {
                             state.is_dragging,
                             state.consume_background_pointer_sequence,
                             state.vertical_scrollbar_sequence,
-                            state.header_sort_candidate_col,
-                            state.header_sort_requires_double_click,
-                            state.header_sort_start_x,
-                            state.header_sort_start_y,
+                            state.header_press_col,
                         )
                     };
                     if vertical_scrollbar_sequence {
@@ -2870,30 +2588,12 @@ impl ResultTableWidget {
                         );
                         return false;
                     }
-                    if header_sort_candidate.is_some() {
-                        if !header_sort_requires_double_click {
-                            let mut state = drag_state_for_handle
-                                .lock()
-                                .unwrap_or_else(|poisoned| poisoned.into_inner());
-                            state.header_sort_candidate_col = None;
-                            return true;
-                        }
-                        let moved_beyond = Self::pointer_moved_beyond_tolerance(
-                            header_start_x,
-                            header_start_y,
-                            app::event_x(),
-                            app::event_y(),
-                            HEADER_SORT_CLICK_MOVE_TOLERANCE_PX,
-                        );
-                        if moved_beyond {
-                            let mut state = drag_state_for_handle
-                                .lock()
-                                .unwrap_or_else(|poisoned| poisoned.into_inner());
-                            state.header_sort_candidate_col = None;
-                            state.header_sort_requires_double_click = false;
-                        } else {
-                            return true;
-                        }
+                    if header_press.is_some() {
+                        drag_state_for_handle
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner())
+                            .header_press_col = None;
+                        return true;
                     }
                     if consume_background_pointer_sequence {
                         return true;
@@ -2909,8 +2609,7 @@ impl ResultTableWidget {
                 }
                 Event::Released => {
                     let (
-                        header_sort_candidate,
-                        header_sort_requires_double_click,
+                        header_press,
                         was_dragging,
                         consumed_background_pointer_sequence,
                         vertical_scrollbar_sequence,
@@ -2920,9 +2619,7 @@ impl ResultTableWidget {
                         let mut state = drag_state_for_handle
                             .lock()
                             .unwrap_or_else(|poisoned| poisoned.into_inner());
-                        let header_candidate = state.header_sort_candidate_col.take();
-                        let header_is_double_click = state.header_sort_requires_double_click;
-                        state.header_sort_requires_double_click = false;
+                        let header_press = state.header_press_col.take();
                         let vertical_scrollbar_sequence = state.vertical_scrollbar_sequence;
                         let vertical_scrollbar_fetch_requested =
                             state.vertical_scrollbar_fetch_requested;
@@ -2938,8 +2635,7 @@ impl ResultTableWidget {
                             state.is_dragging = false;
                         }
                         (
-                            header_candidate,
-                            header_is_double_click,
+                            header_press,
                             dragging,
                             consumed_background,
                             vertical_scrollbar_sequence,
@@ -2958,58 +2654,10 @@ impl ResultTableWidget {
                         }
                         return false;
                     }
-                    if let Some(col) = header_sort_candidate {
-                        if col >= 0
-                            && header_sort_requires_double_click
-                            && Self::get_col_header_at_mouse(&table_for_handle) == Some(col)
-                            && Self::queue_lazy_action_if_active(
-                                &lazy_fetch_session_for_handle,
-                                &lazy_fetch_callback_for_handle,
-                                &pending_lazy_actions_for_handle,
-                                LazyFetchPendingAction::HeaderSort(col as usize),
-                            )
-                        {
-                            return true;
-                        }
-                        if col >= 0
-                            && header_sort_requires_double_click
-                            && Self::get_col_header_at_mouse(&table_for_handle) == Some(col)
-                            // Streaming append mutates full_data incrementally, so block
-                            // column sort until the result set is finalized.
-                            && !mutex_load_bool(&streaming_in_progress_for_handle)
-                        {
-                            let col_idx = col as usize;
-                            // The redirect owns its own direction; see
-                            // apply_header_sort_action.
-                            if Self::try_redirect_header_sort(
-                                &headers_for_handle,
-                                &header_sort_redirect_for_handle,
-                                col_idx,
-                            ) {
-                                return true;
-                            }
-                            let next_state = {
-                                let current = *sort_state_for_handle
-                                    .lock()
-                                    .unwrap_or_else(|poisoned| poisoned.into_inner());
-                                Self::next_sort_state(current, col_idx)
-                            };
-                            if Self::apply_sort_to_table_data(
-                                &full_data_for_handle,
-                                &edit_session_for_handle,
-                                &column_kinds_for_handle,
-                                &null_text_for_handle,
-                                &sort_null_ordering_for_handle,
-                                col_idx,
-                                next_state.direction,
-                            ) {
-                                *sort_state_for_handle
-                                    .lock()
-                                    .unwrap_or_else(|poisoned| poisoned.into_inner()) =
-                                    Some(next_state);
-                                table_for_handle.redraw();
-                            }
-                        }
+                    // A press that started on a column header ends there: the
+                    // grid has no header action left, and it must not fall
+                    // through to the cell-selection paths below.
+                    if header_press.is_some() {
                         return true;
                     }
                     if was_dragging || consumed_background_pointer_sequence {
@@ -3466,8 +3114,6 @@ impl ResultTableWidget {
             table,
             headers,
             column_kinds,
-            sort_null_ordering,
-            header_sort_redirect,
             pending_rows: Arc::new(Mutex::new(Vec::new())),
             pending_widths: Arc::new(Mutex::new(Vec::new())),
             last_flush_epoch_ms: Arc::new(Mutex::new(Self::current_epoch_millis())),
@@ -3499,7 +3145,6 @@ impl ResultTableWidget {
             pending_lazy_actions,
             pending_page_navigation: Arc::new(Mutex::new(None)),
             context_action_callback,
-            sort_state,
             drag_state,
         }
     }
@@ -4746,18 +4391,6 @@ impl ResultTableWidget {
         }
     }
 
-    fn pointer_moved_beyond_tolerance(
-        start_x: i32,
-        start_y: i32,
-        current_x: i32,
-        current_y: i32,
-        tolerance_px: u32,
-    ) -> bool {
-        start_x.abs_diff(current_x) > tolerance_px || start_y.abs_diff(current_y) > tolerance_px
-    }
-
-    /// Returns `true` when the mouse position falls inside one of the FLTK
-    /// Table's embedded scrollbar widgets (vertical or horizontal).
     fn is_mouse_on_table_scrollbar(table: &Table, mouse_x: i32, mouse_y: i32) -> bool {
         if Self::is_mouse_on_vertical_table_scrollbar(table, mouse_x, mouse_y) {
             return true;
@@ -8039,7 +7672,6 @@ impl ResultTableWidget {
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
         }
-        self.clear_sort_state();
         let finished_sql = if result.is_select {
             result.sql.clone()
         } else {
@@ -8325,7 +7957,6 @@ impl ResultTableWidget {
             self.set_query_edit_backup(None);
             Self::clear_active_inline_edit_widget(&self.active_inline_edit);
         }
-        self.clear_sort_state();
 
         *self
             .edit_session
@@ -8912,37 +8543,6 @@ impl ResultTableWidget {
         )
     }
 
-    fn apply_header_sort_action(&mut self, col_idx: usize) {
-        let next_state = {
-            let current = *self
-                .sort_state
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            Self::next_sort_state(current, col_idx)
-        };
-        // The redirect decides its own direction: it cycles the ORDER BY it
-        // owns, which the user can also type into, and the local sort state
-        // this reads is never advanced while sorting happens on the server.
-        if Self::try_redirect_header_sort(&self.headers, &self.header_sort_redirect, col_idx) {
-            return;
-        }
-        if Self::apply_sort_to_table_data(
-            &self.full_data,
-            &self.edit_session,
-            &self.column_kinds,
-            &self.null_text,
-            &self.sort_null_ordering,
-            col_idx,
-            next_state.direction,
-        ) {
-            *self
-                .sort_state
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(next_state);
-            self.table.redraw();
-        }
-    }
-
     fn clear_pending_lazy_actions_for_session(&self, session_id: u64) {
         let mut guard = self
             .pending_lazy_actions
@@ -8971,9 +8571,6 @@ impl ResultTableWidget {
         };
         for action in actions {
             match action {
-                LazyFetchPendingAction::HeaderSort(col_idx) => {
-                    self.apply_header_sort_action(col_idx)
-                }
                 LazyFetchPendingAction::CopyAll => {
                     let hidden_col = self.hidden_auto_rowid_col_value();
                     Self::copy_all_to_clipboard(&self.headers, &self.full_data, hidden_col);
@@ -9083,7 +8680,6 @@ impl ResultTableWidget {
         self.clear_lazy_fetch_state_for_abort();
         Self::clear_active_inline_edit_widget(&self.active_inline_edit);
         self.set_query_edit_backup(None);
-        self.clear_sort_state();
         *self
             .edit_session
             .lock()
@@ -9896,7 +9492,6 @@ impl ResultTableWidget {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
         self.set_query_edit_backup(None);
-        self.clear_sort_state();
         Self::clear_active_inline_edit_widget(&self.active_inline_edit);
 
         // Clear callbacks to release captured Arc<Mutex<T>> references.
@@ -11900,7 +11495,6 @@ UPDATE EMP SET ENAME = 'X' WHERE ROWID = 'AAABBB';"
             source_sql: "SELECT ROWID, ENAME FROM EMP".to_string(),
             edit_session: backup_session,
             result_edit_descriptor: None,
-            sort_state: None,
         }));
 
         *widget
@@ -12934,7 +12528,6 @@ UPDATE EMP SET ENAME = 'MILLER' WHERE ROWID = 'AAABBB';"
                 }],
             },
             result_edit_descriptor: None,
-            sort_state: None,
         }));
 
         assert!(!widget.clear_orphaned_query_edit_backup());
@@ -13787,7 +13380,6 @@ UPDATE EMP SET ENAME = 'MILLER' WHERE ROWID = 'AAABBB';"
                 }],
             },
             result_edit_descriptor: None,
-            sort_state: None,
         }));
 
         let headers = vec!["DEPTNO".to_string(), "DNAME".to_string()];
@@ -14284,7 +13876,6 @@ UPDATE EMP SET ENAME = 'MILLER' WHERE ROWID = 'AAABBB';"
                 row_states: Vec::new(),
             },
             result_edit_descriptor: None,
-            sort_state: None,
         }));
 
         let result = widget.cancel_edit_mode();
@@ -14327,7 +13918,6 @@ UPDATE EMP SET ENAME = 'MILLER' WHERE ROWID = 'AAABBB';"
                 row_states: Vec::new(),
             },
             result_edit_descriptor: None,
-            sort_state: None,
         }));
 
         let result = widget.cancel_edit_mode();
@@ -15368,286 +14958,6 @@ mod tests {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .is_empty());
-    }
-
-    #[test]
-    fn sort_marker_for_column_reflects_sort_direction() {
-        let asc = Some(ColumnSortState {
-            col_idx: 1,
-            direction: SortDirection::Ascending,
-        });
-        let desc = Some(ColumnSortState {
-            col_idx: 1,
-            direction: SortDirection::Descending,
-        });
-        assert_eq!(
-            ResultTableWidget::sort_marker_for_column(asc, 1),
-            Some(SORT_ASC_MARK)
-        );
-        assert_eq!(
-            ResultTableWidget::sort_marker_for_column(desc, 1),
-            Some(SORT_DESC_MARK)
-        );
-        assert_eq!(ResultTableWidget::sort_marker_for_column(desc, 0), None);
-        assert_eq!(ResultTableWidget::sort_marker_for_column(None, 1), None);
-    }
-
-    #[test]
-    fn next_sort_state_toggles_and_resets_for_new_column() {
-        let first = ResultTableWidget::next_sort_state(None, 2);
-        assert_eq!(
-            first,
-            ColumnSortState {
-                col_idx: 2,
-                direction: SortDirection::Ascending
-            }
-        );
-        let second = ResultTableWidget::next_sort_state(Some(first), 2);
-        assert_eq!(
-            second,
-            ColumnSortState {
-                col_idx: 2,
-                direction: SortDirection::Descending
-            }
-        );
-        let third = ResultTableWidget::next_sort_state(Some(second), 0);
-        assert_eq!(
-            third,
-            ColumnSortState {
-                col_idx: 0,
-                direction: SortDirection::Ascending
-            }
-        );
-    }
-
-    /// The NULL marker these sort tests run with. None of them exercise NULL
-    /// placement — `grid_sort` owns that — so any non-empty marker works.
-    const SORT_TEST_NULL_TEXT: &str = "NULL";
-
-    /// A column the driver could not classify, which is what these tests
-    /// predate `column_kinds` in asserting: numeric when both sides parse,
-    /// text otherwise.
-    fn unknown_sort_column() -> SortColumn {
-        ResultTableWidget::sort_column_for(&[], 0, ResultTableWidget::DEFAULT_SORT_NULL_ORDERING)
-    }
-
-    #[test]
-    fn sort_column_carries_the_kind_and_the_null_ordering_it_is_given() {
-        let kinds = vec![SqlValueKind::Temporal, SqlValueKind::Number];
-        let column = ResultTableWidget::sort_column_for(&kinds, 1, NullOrdering::LastOnAscending);
-        assert_eq!(column.kind, SqlValueKind::Number);
-        assert_eq!(column.nulls, NullOrdering::LastOnAscending);
-    }
-
-    #[test]
-    fn a_column_past_the_kind_list_falls_back_to_unknown() {
-        // Streaming installs kinds after headers, so a sort can race ahead of
-        // them; an unclassified column must still compare, not panic.
-        let column = ResultTableWidget::sort_column_for(&[], 7, NullOrdering::FirstOnAscending);
-        assert_eq!(column.kind, SqlValueKind::Unknown);
-    }
-
-    #[test]
-    fn null_ordering_decides_where_empty_cells_land() {
-        let rows = || {
-            vec![
-                vec!["b".to_string()],
-                vec![String::new()],
-                vec!["a".to_string()],
-            ]
-        };
-
-        let mut nulls_first = rows();
-        assert!(ResultTableWidget::sort_row_entries(
-            &mut nulls_first,
-            None,
-            0,
-            SortDirection::Ascending,
-            ResultTableWidget::sort_column_for(&[], 0, NullOrdering::FirstOnAscending),
-            SORT_TEST_NULL_TEXT,
-        ));
-        assert_eq!(nulls_first.first().unwrap()[0], "");
-
-        let mut nulls_last = rows();
-        assert!(ResultTableWidget::sort_row_entries(
-            &mut nulls_last,
-            None,
-            0,
-            SortDirection::Ascending,
-            ResultTableWidget::sort_column_for(&[], 0, NullOrdering::LastOnAscending),
-            SORT_TEST_NULL_TEXT,
-        ));
-        assert_eq!(nulls_last.last().unwrap()[0], "");
-    }
-
-    #[test]
-    fn the_default_null_ordering_preserves_the_previous_grid_behaviour() {
-        // Before column kinds reached the sort, an empty cell compared as text
-        // and led an ascending sort. A result whose backend never reported in
-        // must keep landing there.
-        assert_eq!(
-            ResultTableWidget::DEFAULT_SORT_NULL_ORDERING,
-            NullOrdering::FirstOnAscending
-        );
-    }
-
-    #[test]
-    fn compare_row_values_for_sort_uses_numeric_order_for_numbers() {
-        let left = vec!["2".to_string()];
-        let right = vec!["10".to_string()];
-        assert_eq!(
-            ResultTableWidget::compare_row_values_for_sort(
-                &left,
-                &right,
-                0,
-                unknown_sort_column(),
-                SORT_TEST_NULL_TEXT,
-            ),
-            std::cmp::Ordering::Less
-        );
-    }
-
-    #[test]
-    fn compare_row_values_for_sort_places_numbers_before_text() {
-        let number_row = vec!["42".to_string()];
-        let text_row = vec!["ABC".to_string()];
-        assert_eq!(
-            ResultTableWidget::compare_row_values_for_sort(
-                &number_row,
-                &text_row,
-                0,
-                unknown_sort_column(),
-                SORT_TEST_NULL_TEXT,
-            ),
-            std::cmp::Ordering::Less
-        );
-        assert_eq!(
-            ResultTableWidget::compare_row_values_for_sort(
-                &text_row,
-                &number_row,
-                0,
-                unknown_sort_column(),
-                SORT_TEST_NULL_TEXT,
-            ),
-            std::cmp::Ordering::Greater
-        );
-    }
-
-    #[test]
-    fn sort_row_entries_reorders_rows_and_row_states_together() {
-        let mut rows = vec![
-            vec!["2".to_string(), "B".to_string()],
-            vec!["1".to_string(), "A".to_string()],
-            vec!["3".to_string(), "A".to_string()],
-        ];
-        let mut states = vec![
-            EditRowState::Existing {
-                rowid: "RID2".to_string(),
-                explicit_null_cols: HashSet::new(),
-                dirty_cols: HashSet::new(),
-            },
-            EditRowState::Existing {
-                rowid: "RID1".to_string(),
-                explicit_null_cols: HashSet::new(),
-                dirty_cols: HashSet::new(),
-            },
-            EditRowState::Existing {
-                rowid: "RID3".to_string(),
-                explicit_null_cols: HashSet::new(),
-                dirty_cols: HashSet::new(),
-            },
-        ];
-
-        assert!(ResultTableWidget::sort_row_entries(
-            &mut rows,
-            Some(&mut states),
-            1,
-            SortDirection::Ascending,
-            unknown_sort_column(),
-            SORT_TEST_NULL_TEXT,
-        ));
-
-        assert_eq!(
-            rows,
-            vec![
-                vec!["1".to_string(), "A".to_string()],
-                vec!["3".to_string(), "A".to_string()],
-                vec!["2".to_string(), "B".to_string()],
-            ]
-        );
-        let rowids: Vec<String> = states
-            .iter()
-            .map(|state| match state {
-                EditRowState::Existing { rowid, .. } => rowid.clone(),
-                EditRowState::Inserted { .. } => "INSERTED".to_string(),
-            })
-            .collect();
-        assert_eq!(
-            rowids,
-            vec!["RID1".to_string(), "RID3".to_string(), "RID2".to_string()]
-        );
-    }
-
-    #[test]
-    fn sort_row_entries_rejects_out_of_sync_row_states() {
-        let mut rows = vec![vec!["2".to_string()], vec!["1".to_string()]];
-        let mut states = vec![EditRowState::Existing {
-            rowid: "RID2".to_string(),
-            explicit_null_cols: HashSet::new(),
-            dirty_cols: HashSet::new(),
-        }];
-        let original_rows = rows.clone();
-        let original_states_len = states.len();
-
-        assert!(!ResultTableWidget::sort_row_entries(
-            &mut rows,
-            Some(&mut states),
-            0,
-            SortDirection::Ascending,
-            unknown_sort_column(),
-            SORT_TEST_NULL_TEXT,
-        ));
-
-        assert_eq!(rows, original_rows);
-        assert_eq!(states.len(), original_states_len);
-    }
-
-    #[test]
-    fn sort_row_entries_sorts_numeric_values_numerically() {
-        let mut rows = vec![
-            vec!["10".to_string()],
-            vec!["2".to_string()],
-            vec!["1".to_string()],
-        ];
-        assert!(ResultTableWidget::sort_row_entries(
-            &mut rows,
-            None,
-            0,
-            SortDirection::Ascending,
-            unknown_sort_column(),
-            SORT_TEST_NULL_TEXT,
-        ));
-        assert_eq!(
-            rows,
-            vec![
-                vec!["1".to_string()],
-                vec!["2".to_string()],
-                vec!["10".to_string()]
-            ]
-        );
-    }
-
-    #[test]
-    fn pointer_moved_beyond_tolerance_uses_pixel_threshold() {
-        assert!(!ResultTableWidget::pointer_moved_beyond_tolerance(
-            100, 100, 103, 104, 4
-        ));
-        assert!(ResultTableWidget::pointer_moved_beyond_tolerance(
-            100, 100, 106, 100, 4
-        ));
-        assert!(ResultTableWidget::pointer_moved_beyond_tolerance(
-            100, 100, 100, 106, 4
-        ));
     }
 
     #[test]

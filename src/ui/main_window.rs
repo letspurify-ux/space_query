@@ -37,7 +37,6 @@ use crate::db::{
     TabConnectionBinding, TransactionAccessMode, TransactionIsolation, TransactionMode,
 };
 use crate::ui::constants::*;
-use crate::ui::grid_sort::NullOrdering;
 use crate::ui::result_export::{ExportDestination, ExportFormat};
 use crate::ui::result_export_dialog::ExportChoice;
 use crate::ui::result_table::{
@@ -817,6 +816,9 @@ struct QueryEditorTab {
 struct QueryProgressContext {
     operation_token: Option<QueryOperationToken>,
     execution_target: Option<ResultTabId>,
+    /// The `ResultGridExecution` this batch started with, so it retires that
+    /// reservation and no later one.
+    execution_reservation: Option<u64>,
     result_tab_ids: HashMap<usize, ResultTabId>,
     fetch_row_counts: HashMap<usize, usize>,
     lazy_fetch_sessions: HashMap<u64, usize>,
@@ -841,6 +843,10 @@ struct QueryProgressContext {
 /// instead of one reserved for it when the batch starts.
 #[derive(Clone)]
 struct ResultGridExecution {
+    /// Distinguishes this reservation from the next one for the same result
+    /// tab. Two filters applied to one tab reserve the same tab twice, and the
+    /// first execution must not retire the second's routing on its way out.
+    id: u64,
     result_tab_id: ResultTabId,
     /// The statement text, when the window is the one that wrote it. It
     /// identifies this reservation if the execution is abandoned before it
@@ -1253,11 +1259,12 @@ fn connection_runtime_state_label(state: ConnectionRuntimeState) -> &'static str
 
 impl QueryProgressContext {
     fn new(
-        execution_target: Option<ResultTabId>,
+        execution: Option<&ResultGridExecution>,
         activity_label: String,
         operation_token: Option<QueryOperationToken>,
     ) -> Self {
         let now = Instant::now();
+        let execution_target = execution.map(|execution| execution.result_tab_id);
         let status_activity_label = if execution_target.is_some() {
             "Saving result grid".to_string()
         } else {
@@ -1266,6 +1273,7 @@ impl QueryProgressContext {
         Self {
             operation_token,
             execution_target,
+            execution_reservation: execution.map(|execution| execution.id),
             result_tab_ids: HashMap::new(),
             fetch_row_counts: HashMap::new(),
             lazy_fetch_sessions: HashMap::new(),
@@ -1554,6 +1562,7 @@ pub struct AppState {
     transaction_isolation_choice: Choice,
     transaction_access_choice: Choice,
     result_grid_execution_targets: HashMap<QueryTabId, ResultGridExecution>,
+    next_result_grid_execution_id: u64,
     pending_table_browse_last: HashMap<QueryTabId, PendingTableBrowseLast>,
     pending_table_browse_refresh: HashMap<QueryTabId, PendingTableBrowseRefresh>,
     progress_contexts: HashMap<QueryTabId, QueryProgressContext>,
@@ -2403,18 +2412,30 @@ impl AppState {
         sessions_to_cancel
     }
 
-    /// The result tab a statement running for `tab_id` must deliver to, if one
-    /// is reserved.
-    fn result_grid_execution_target(&self, tab_id: QueryTabId) -> Option<ResultTabId> {
-        self.result_grid_execution_targets
-            .get(&tab_id)
-            .map(|execution| execution.result_tab_id)
+    /// Route the next statement started for `tab_id` to an existing result tab,
+    /// replacing any reservation that never got to run.
+    fn reserve_result_grid_execution(
+        &mut self,
+        tab_id: QueryTabId,
+        result_tab_id: ResultTabId,
+        sql: Option<String>,
+    ) {
+        let id = self.next_result_grid_execution_id;
+        self.next_result_grid_execution_id = id.saturating_add(1);
+        self.result_grid_execution_targets.insert(
+            tab_id,
+            ResultGridExecution {
+                id,
+                result_tab_id,
+                sql,
+            },
+        );
     }
 
     fn finish_progress_context(&mut self, tab_id: QueryTabId) {
-        let mut finished_target = None;
+        let mut finished_reservation = None;
         if let Some(context) = self.progress_contexts.remove(&tab_id) {
-            finished_target = context.execution_target;
+            finished_reservation = context.execution_reservation;
             if let Some(token) = context.operation_token {
                 self.pending_query_cancellations.remove(&token);
             }
@@ -2430,7 +2451,10 @@ impl AppState {
         // cancelled, say) is finalized here too, and clearing by tab id alone
         // would strand it: with no execution target the next batch clears the
         // result grids and renders the page as a brand-new query result.
-        if batch_owns_grid_target(finished_target, self.result_grid_execution_target(tab_id)) {
+        if batch_owns_grid_reservation(
+            finished_reservation,
+            self.result_grid_execution_targets.get(&tab_id),
+        ) {
             self.result_grid_execution_targets.remove(&tab_id);
         }
         self.start_pending_metadata_refresh_if_ready();
@@ -4065,6 +4089,20 @@ fn batch_owns_grid_target(
     registered_target: Option<ResultTabId>,
 ) -> bool {
     finished_target == registered_target
+}
+
+/// Whether a finishing batch owns the routing currently registered for its
+/// query tab.
+///
+/// Comparing result tabs is not enough: filtering the same result twice
+/// reserves the same tab twice, and the first execution — which may finish
+/// long after the second registers, once its lazy fetch closes — would retire
+/// the second's routing and strand it.
+fn batch_owns_grid_reservation(
+    finished_reservation: Option<u64>,
+    registered: Option<&ResultGridExecution>,
+) -> bool {
+    finished_reservation == registered.map(|execution| execution.id)
 }
 
 /// Whether a finished statement's result may be offered a `WHERE` / `ORDER BY`
@@ -6680,6 +6718,7 @@ impl MainWindow {
             transaction_isolation_choice: transaction_isolation_choice.clone(),
             transaction_access_choice: transaction_access_choice.clone(),
             result_grid_execution_targets: HashMap::new(),
+            next_result_grid_execution_id: 1,
             pending_table_browse_last: HashMap::new(),
             pending_table_browse_refresh: HashMap::new(),
             progress_contexts: HashMap::new(),
@@ -8437,12 +8476,10 @@ impl MainWindow {
             if browsing {
                 result_tabs.begin_table_browse_request(request.clone())?;
             }
-            state_guard.result_grid_execution_targets.insert(
+            state_guard.reserve_result_grid_execution(
                 tab_id,
-                ResultGridExecution {
-                    result_tab_id: request.result_tab_id,
-                    sql: Some(sql.clone()),
-                },
+                request.result_tab_id,
+                Some(sql.clone()),
             );
             if browsing && request.navigation == TableBrowseNavigation::Last {
                 state_guard.pending_table_browse_last.insert(
@@ -8549,13 +8586,7 @@ impl MainWindow {
                         },
                     );
                 }
-                state.result_grid_execution_targets.insert(
-                    tab_id,
-                    ResultGridExecution {
-                        result_tab_id: target_tab,
-                        sql: Some(sql.clone()),
-                    },
-                );
+                state.reserve_result_grid_execution(tab_id, target_tab, Some(sql.clone()));
                 editor.execute_sql_text(&sql);
                 if !editor.is_query_running() {
                     state.result_grid_execution_targets.remove(&tab_id);
@@ -8608,13 +8639,7 @@ impl MainWindow {
                         },
                     );
                 }
-                state.result_grid_execution_targets.insert(
-                    tab_id,
-                    ResultGridExecution {
-                        result_tab_id: target_tab,
-                        sql: None,
-                    },
-                );
+                state.reserve_result_grid_execution(tab_id, target_tab, None);
                 if let Err(error) = editor.execute_result_edit(request) {
                     state.result_grid_execution_targets.remove(&tab_id);
                     state.pending_table_browse_refresh.remove(&tab_id);
@@ -8946,7 +8971,10 @@ impl MainWindow {
                     owning_result_tabs.set_execution_origin(execution_origin);
                     s.refresh_tab_label(tab_id);
                     let one_tab_per_query = s.result_one_tab_per_query_check.value();
-                    let grid_execution_target = s.result_grid_execution_target(tab_id);
+                    let grid_execution = s.result_grid_execution_targets.get(&tab_id).cloned();
+                    let grid_execution_target = grid_execution
+                        .as_ref()
+                        .map(|execution| execution.result_tab_id);
                     let table_browse_page_loading = grid_execution_target.is_some_and(|target| {
                         owning_result_tabs.table_browse_is_loading(target)
                     });
@@ -8967,11 +8995,8 @@ impl MainWindow {
                         .as_ref()
                         .map(|runtime| runtime.sanitized_info().db_type);
                     let connection_id = runtime.as_ref().map(|runtime| runtime.id());
-                    let mut context = QueryProgressContext::new(
-                        grid_execution_target,
-                        activity,
-                        operation_token,
-                    );
+                    let mut context =
+                        QueryProgressContext::new(grid_execution.as_ref(), activity, operation_token);
                     context.start_status_tracking(
                         total_units,
                         db_type,
@@ -9111,16 +9136,6 @@ impl MainWindow {
                     s.refresh_result_edit_controls();
                     drop(s);
                     result_tabs.ensure_statement_tab_by_id(result_tab_id, "Result", select_tab);
-                    if let Some(db_type) = result_db_type {
-                        result_tabs.set_sort_null_ordering_by_id(
-                            result_tab_id,
-                            if db_type.sorts_nulls_last_ascending() {
-                                NullOrdering::LastOnAscending
-                            } else {
-                                NullOrdering::FirstOnAscending
-                            },
-                        );
-                    }
                     result_tabs.start_streaming_by_id(
                         result_tab_id,
                         &columns,
@@ -9367,10 +9382,17 @@ impl MainWindow {
                     // left behind would capture the next query's result. Only
                     // this statement's own reservation may go — another
                     // statement waiting behind it keeps its own.
+                    let started_reservation = s
+                        .progress_contexts
+                        .get(&tab_id)
+                        .and_then(|context| context.execution_reservation);
                     let abandoned_own_reservation = s
                         .result_grid_execution_targets
                         .get(&tab_id)
-                        .is_some_and(|execution| execution.sql.as_deref() == Some(sql.as_str()));
+                        .is_some_and(|execution| {
+                            execution.sql.as_deref() == Some(sql.as_str())
+                                && started_reservation != Some(execution.id)
+                        });
                     let stranded_target = if abandoned_own_reservation {
                         s.pending_table_browse_last.remove(&tab_id);
                         s.pending_table_browse_refresh.remove(&tab_id);
@@ -10084,12 +10106,6 @@ impl MainWindow {
                     let mut s = state_for_progress
                         .lock()
                         .unwrap_or_else(|poisoned| poisoned.into_inner());
-                    if batch_owns_grid_target(
-                        finished_grid_target,
-                        s.result_grid_execution_target(tab_id),
-                    ) {
-                        s.result_grid_execution_targets.remove(&tab_id);
-                    }
                     let pending_last = match s.pending_table_browse_last.get(&tab_id) {
                         Some(pending)
                             if batch_owns_grid_target(
@@ -13712,6 +13728,30 @@ mod tests {
     }
 
     #[test]
+    fn a_finished_batch_keeps_a_newer_reservation_for_the_same_result_tab() {
+        let tab = ResultTabId::new(4);
+        let first = ResultGridExecution {
+            id: 1,
+            result_tab_id: tab,
+            sql: Some("select 1".to_string()),
+        };
+        let second = ResultGridExecution {
+            id: 2,
+            result_tab_id: tab,
+            sql: Some("select 2".to_string()),
+        };
+
+        assert!(batch_owns_grid_reservation(Some(first.id), Some(&first)));
+        // Filtering the same result twice reserves the same tab twice: the
+        // first execution finishing (its lazy fetch closing, say) must leave
+        // the second's routing alone even though both name that one tab.
+        assert!(!batch_owns_grid_reservation(Some(first.id), Some(&second)));
+        assert!(!batch_owns_grid_reservation(None, Some(&second)));
+        assert!(!batch_owns_grid_reservation(Some(first.id), None));
+        assert!(batch_owns_grid_reservation(None, None));
+    }
+
+    #[test]
     fn a_table_page_statement_is_not_offered_a_filter_bar_of_its_own() {
         let page_sql = crate::ui::table_browse::build_page_sql(&TableBrowsePageRequest {
             result_tab_id: ResultTabId::new(1),
@@ -15008,11 +15048,13 @@ mod tests {
             .insert(0, ResultTabId::new(3));
         assert!(!should_select_support_result_pane(Some(&context_with_grid)));
 
-        let context_with_grid_target = QueryProgressContext::new(
-            Some(ResultTabId::new(1)),
-            "Saving result grid".to_string(),
-            None,
-        );
+        let reservation = ResultGridExecution {
+            id: 1,
+            result_tab_id: ResultTabId::new(1),
+            sql: None,
+        };
+        let context_with_grid_target =
+            QueryProgressContext::new(Some(&reservation), "Saving result grid".to_string(), None);
         assert!(!should_select_support_result_pane(Some(
             &context_with_grid_target
         )));

@@ -17,18 +17,16 @@ use crate::ui::constants;
 use crate::ui::font_settings::{
     configured_result_font_size, configured_result_profile, FontProfile,
 };
-use crate::ui::grid_sort::NullOrdering;
 use crate::ui::grid_sql_export::GridSqlSelection;
 use crate::ui::result_export::{ExportDestination, ExportFormat, ExportScope};
 use crate::ui::result_table::{
-    ExportRequest, HeaderSortRedirectCallback, LazyFetchCallback, ResultGridEditExecuteCallback,
-    ResultGridSqlExecuteCallback, ResultPageNavigationOutcome, ResultTableContextActionCallback,
+    ExportRequest, LazyFetchCallback, ResultGridEditExecuteCallback, ResultGridSqlExecuteCallback,
+    ResultPageNavigationOutcome, ResultTableContextActionCallback,
 };
 use crate::ui::tab_strip;
 use crate::ui::table_browse::{
-    invoke_table_browse_execute_callback, TableBrowseClauses, TableBrowseExecuteCallback,
-    TableBrowseFilterBar, TableBrowseNavigation, TableBrowsePageRequest, TableBrowseTarget,
-    TABLE_BROWSE_FILTER_HEIGHT,
+    invoke_table_browse_execute_callback, TableBrowseExecuteCallback, TableBrowseFilterBar,
+    TableBrowseNavigation, TableBrowsePageRequest, TableBrowseTarget, TABLE_BROWSE_FILTER_HEIGHT,
 };
 use crate::ui::text_buffer_access;
 use crate::ui::theme;
@@ -1821,38 +1819,6 @@ impl ResultTabsWidget {
         };
         let filter_bar =
             self.build_filter_bar(&parts.0, &parts.1, id, target.clone(), intellisense_data);
-        // With a filter bar in place the tab can order on the server, so a
-        // header click stops sorting the fetched rows — the two disagree about
-        // NULLs, collation, and (once paging starts) which rows are even in
-        // scope, and only the server's answer is the real one.
-        {
-            let callback = self.table_browse_callback.clone();
-            let mut bar = filter_bar.clone();
-            let redirect: HeaderSortRedirectCallback =
-                Arc::new(Mutex::new(Some(Box::new(move |column: String| {
-                    let order_by = crate::ui::table_browse::next_order_by_for_header_sort(
-                        &bar.order_by_text(),
-                        &column,
-                    );
-                    bar.set_order_by_text(&order_by);
-                    let request = TableBrowsePageRequest {
-                        result_tab_id: id,
-                        target: target.clone(),
-                        clauses: TableBrowseClauses::new(bar.where_text(), order_by),
-                        offset: 0,
-                        page_size: 0,
-                        navigation: TableBrowseNavigation::Page,
-                    };
-                    if let Err(message) = invoke_table_browse_execute_callback(&callback, request) {
-                        crate::ui::alert_on_main(&message);
-                    }
-                    // Taken either way: a failed re-query must not silently fall
-                    // back to a local sort that means something different.
-                    true
-                }))));
-            let mut table = parts.1.clone();
-            table.set_header_sort_redirect(redirect);
-        }
         {
             let mut data = self
                 .data
@@ -2167,19 +2133,6 @@ impl ResultTabsWidget {
     /// Set on the tab rather than on a streaming batch: it belongs to the
     /// connection, and every result the tab goes on to show comes from the same
     /// one.
-    pub(crate) fn set_sort_null_ordering_by_id(&mut self, id: ResultTabId, ordering: NullOrdering) {
-        let table = self.result_tab_index_for_id(id).and_then(|index| {
-            self.data
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .get(index)
-                .map(|tab| tab.table.clone())
-        });
-        if let Some(mut table) = table {
-            table.set_sort_null_ordering(ordering);
-        }
-    }
-
     fn mark_lazy_fetch_waiting(&mut self, index: usize, session_id: u64) {
         let tab_parts = self
             .data
