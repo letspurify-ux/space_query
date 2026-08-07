@@ -8420,9 +8420,14 @@ impl MainWindow {
             // while still being a plain query tab, so that statement results
             // keep taking the statement path. Applying a filter is the moment a
             // page query really starts, so convert it here.
+            // The promoted tab has no applied page size to inherit, so it takes
+            // the page-size control's, exactly as opening a table from the
+            // object browser does.
+            let page_size =
+                result_page_unit_for_choice_index(state_guard.result_page_unit_choice.value());
             if !result_tabs.is_table_browse_tab(request.result_tab_id)
                 && (!result_tabs.result_tab_has_filter_bar(request.result_tab_id)
-                    || !result_tabs.promote_query_tab_to_table_browse(&request))
+                    || !result_tabs.promote_query_tab_to_table_browse(&request, page_size))
             {
                 return Err("The table result tab is closed.".to_string());
             }
