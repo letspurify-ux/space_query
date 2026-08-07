@@ -68,7 +68,7 @@ DB 없이 테스트할 수 있다는 장점이 있었다. 하지만 채택하지
 
 #### 구현 상태 (2026-08-07) — 완료 (Excel 제외)
 
-`Ctrl+E` / **Tools > Export Results** / 그리드 컨텍스트 메뉴 **Export Data**가
+`Ctrl+E` / **Tools > Export Results** / 그리드 컨텍스트 메뉴 **Export Results**가
 모두 같은 모달을 연다: **포맷**(CSV/TSV/JSON/XML/HTML/Markdown/SQL Inserts) ×
 **행 범위**(전체 / 선택 영역) × **대상**(파일 / 클립보드).
 

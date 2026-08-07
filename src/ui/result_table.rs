@@ -7567,7 +7567,7 @@ impl ResultTableWidget {
         let mut menu_items = vec![
             "Close",
             "Close All",
-            "Export Data (Ctrl+E)",
+            "Export Results (Ctrl+E)",
             "Copy",
             "Copy with Headers",
             "Copy All",
@@ -7692,7 +7692,7 @@ impl ResultTableWidget {
                     }
                     Self::copy_all_to_clipboard(headers, full_data, hidden_col);
                 }
-                "Export Data (Ctrl+E)" => {
+                "Export Results (Ctrl+E)" => {
                     Self::schedule_context_action_callback(
                         context_action_callback,
                         ResultTableContextAction::ExportData,

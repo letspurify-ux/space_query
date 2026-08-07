@@ -273,8 +273,8 @@ identifier remain read-only.
 ### Export a result
 
 `Ctrl+E`, **Tools > Export Results**, and the Data Grid context menu's
-**Export Data** all open the same dialog: pick a format, pick whether to export
-every row or just the selection, and pick a file or the clipboard.
+**Export Results** all open the same dialog: pick a format, pick whether to
+export every row or just the selection, and pick a file or the clipboard.
 
 ![The Export Results dialog: format, row scope, and destination](docs/images/result-export.png)
 

@@ -126,8 +126,8 @@ Known limits, all pre-existing display behaviour rather than export bugs:
 > `src/ui/result_export_dialog.rs` (modal), `src/ui/result_table.rs`,
 > `src/ui/main_window.rs`
 
-`Ctrl+E`, **Tools > Export Results**, and the Data Grid popup's **Export Data**
-all open one modal that asks three things:
+`Ctrl+E`, **Tools > Export Results**, and the Data Grid popup's
+**Export Results** all open one modal that asks three things:
 
 | Choice | Values |
 | --- | --- |
