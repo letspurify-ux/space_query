@@ -19,7 +19,7 @@ use crate::ui::font_settings::{
 };
 use crate::ui::grid_sort::NullOrdering;
 use crate::ui::grid_sql_export::GridSqlSelection;
-use crate::ui::result_export::{ExportFormat, ExportScope};
+use crate::ui::result_export::{ExportDestination, ExportFormat, ExportScope};
 use crate::ui::result_table::{
     ExportRequest, HeaderSortRedirectCallback, LazyFetchCallback, ResultGridEditExecuteCallback,
     ResultGridSqlExecuteCallback, ResultPageNavigationOutcome, ResultTableContextActionCallback,
@@ -2749,6 +2749,7 @@ impl ResultTabsWidget {
         &self,
         format: ExportFormat,
         scope: ExportScope,
+        destination: ExportDestination,
         db_type: Option<crate::db::DatabaseType>,
         callback: Box<dyn FnMut(String, usize)>,
     ) -> Option<(String, usize)> {
@@ -2756,6 +2757,7 @@ impl ResultTabsWidget {
         let request = ExportRequest {
             format,
             scope,
+            destination,
             db_type,
             table: Self::resolve_grid_export_table(&table),
         };
@@ -3103,6 +3105,12 @@ impl ResultTabsWidget {
     ) {
         if let Some(mut table) = self.current_table() {
             table.capture_tour_select_range(row_start, col_start, row_end, col_end);
+        }
+    }
+
+    pub(crate) fn capture_tour_clear_selection(&self) {
+        if let Some(mut table) = self.current_table() {
+            table.capture_tour_clear_selection();
         }
     }
 

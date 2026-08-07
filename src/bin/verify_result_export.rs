@@ -22,6 +22,9 @@
 //   CSV/TSV   Python csv module   (cells, via the excel dialects)
 //   Markdown  cell-count and unescape round-trip
 //
+// Each file is written the way the app writes it, byte-order mark included, so
+// what the parsers see is what a user would open.
+//
 // macOS ships a 2006 HTML Tidy that predates HTML5 and misreads UTF-8, so it is
 // deliberately not used here: it reports our `<!DOCTYPE html>` and `<meta
 // charset>` as errors and every Korean character as an invalid code.
@@ -132,7 +135,13 @@ fn main() {
         if format == ExportFormat::SqlInserts {
             continue;
         }
-        let text = render(format, &grid);
+        // What the app writes to disk: the rendered text behind the format's
+        // file byte-order mark, so the parsers see real file bytes.
+        let text = format!(
+            "{}{}",
+            format.file_byte_order_mark(),
+            render(format, &grid)
+        );
         let path = dir.join(format!("result.{}", format.extension()));
         if let Err(err) = std::fs::write(&path, text.as_bytes()) {
             failures.push(format!("{}: write {}: {err}", format.label(), path.display()));

@@ -148,6 +148,12 @@ generated SQL needs legal column names.
 NULL follows each format's own vocabulary: CSV and TSV write the grid's NULL
 display text verbatim (a spreadsheet dump of what is on screen), JSON writes
 `null`, XML writes an empty element, and HTML and Markdown write an empty cell.
+
+The UTF-8 byte-order mark belongs to a *file*, not to the text.
+`ExportFormat::file_byte_order_mark` returns it for CSV and TSV only, and only
+the file destination prepends it: Excel decides a delimited file's encoding from
+it, while pasting `U+FEFF` into an editor just inserts an invisible character.
+`render` never emits one.
 JSON leaves a value unquoted only when the driver typed the column `Number` or
 `Boolean` *and* its text is already a valid JSON literal, so a zero-padded
 `00123` and a leading-dot `.5` both stay quoted strings while `1.2E+10` — which
@@ -203,6 +209,16 @@ HTML5, and misreads UTF-8, so it rejects `<!DOCTYPE html>`, `<meta charset>`,
 and every Korean character. `SQL Inserts` is covered instead by
 `verify_grid_sql_export` and `verify_grid_sql_export_live`.
 
+`cargo run --bin verify_result_export_ui` covers everything between the keystroke
+and that render, which no unit test reaches: it builds the real `MainWindow` with
+its real callbacks, starts the export from the application's own menu bar, and
+drives the production modal from a timeout inside the modal's own event loop —
+setting the format, the scope, and the destination, then clicking Export. The
+clipboard destination is checked byte for byte with `pbpaste` for every format,
+along with both scopes, the withheld `SQL Inserts` entry, and Cancel writing
+nothing. The file destination stops at the macOS save panel, which no in-process
+code can drive; everything before it is the same code the clipboard path runs.
+
 ## Support panes
 
 | Section | Inner structure | Input API |
@@ -255,6 +271,10 @@ cargo test --test ui_dialog_guards
 
 # Every export format through real JSON/XML/HTML/CSV parsers, no database needed.
 cargo run --bin verify_result_export
+
+# The real window, the real menu, and the real modal, end to end to the
+# clipboard. No database needed.
+cargo run --bin verify_result_export_ui
 
 # Real widget + real OS clipboard, no database needed.
 cargo run --bin verify_grid_sql_export

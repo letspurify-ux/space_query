@@ -64,6 +64,23 @@ impl ExportFormat {
     pub fn file_filter(self) -> String {
         format!("{} Files\t*.{}", self.label(), self.extension())
     }
+
+    /// What a *file* of this format starts with, before the rendered text.
+    ///
+    /// Excel decides a delimited file's encoding from a UTF-8 BOM and otherwise
+    /// falls back to the system locale, mangling non-ASCII text. Nothing else
+    /// needs it, and the clipboard must never carry one: pasting U+FEFF into an
+    /// editor inserts an invisible character nobody asked for.
+    pub fn file_byte_order_mark(self) -> &'static str {
+        match self {
+            ExportFormat::Csv | ExportFormat::Tsv => "\u{FEFF}",
+            ExportFormat::Json
+            | ExportFormat::Xml
+            | ExportFormat::Html
+            | ExportFormat::Markdown
+            | ExportFormat::SqlInserts => "",
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -127,13 +144,13 @@ pub fn render(format: ExportFormat, grid: &ExportGrid) -> String {
 
 /// CSV / TSV share everything but the separator and the escape rule.
 ///
-/// The leading UTF-8 BOM is what makes Excel detect the encoding instead of
-/// falling back to the system locale, and the line ending follows the platform
-/// for the same reason.
+/// The line ending follows the platform, because these two are what a
+/// spreadsheet opens. The UTF-8 BOM Excel needs is not here: it belongs to a
+/// file, not to the text, and [`ExportFormat::file_byte_order_mark`] adds it on
+/// the way to disk.
 fn render_separated(grid: &ExportGrid, separator: char, escape: fn(&str) -> String) -> String {
     let line_ending = csv_line_ending();
     let mut out = String::with_capacity(grid.rows.len() * 20 + grid.columns.len() * 16 + 4);
-    out.push('\u{FEFF}');
     for (index, column) in grid.columns.iter().enumerate() {
         if index > 0 {
             out.push(separator);
@@ -474,12 +491,40 @@ mod tests {
     }
 
     #[test]
-    fn csv_keeps_the_bom_header_and_platform_line_ending() {
+    fn csv_keeps_the_header_and_platform_line_ending() {
         let line_ending = csv_line_ending();
         assert_eq!(
             render(ExportFormat::Csv, &grid()),
-            format!("\u{FEFF}ID,NAME{line_ending}1,alpha{line_ending}2,NULL{line_ending}")
+            format!("ID,NAME{line_ending}1,alpha{line_ending}2,NULL{line_ending}")
         );
+    }
+
+    #[test]
+    fn only_the_spreadsheet_formats_carry_a_file_byte_order_mark() {
+        assert_eq!(ExportFormat::Csv.file_byte_order_mark(), "\u{FEFF}");
+        assert_eq!(ExportFormat::Tsv.file_byte_order_mark(), "\u{FEFF}");
+        for format in [
+            ExportFormat::Json,
+            ExportFormat::Xml,
+            ExportFormat::Html,
+            ExportFormat::Markdown,
+            ExportFormat::SqlInserts,
+        ] {
+            assert_eq!(format.file_byte_order_mark(), "", "{}", format.label());
+        }
+    }
+
+    #[test]
+    fn rendered_text_never_starts_with_a_byte_order_mark() {
+        // The BOM is a property of the file, not of the text: the clipboard
+        // must not receive one.
+        for format in ExportFormat::ALL {
+            assert!(
+                !render(format, &grid()).starts_with('\u{FEFF}'),
+                "{} rendered a BOM into its text",
+                format.label()
+            );
+        }
     }
 
     #[test]
@@ -501,7 +546,7 @@ mod tests {
         let line_ending = csv_line_ending();
         assert_eq!(
             render(ExportFormat::Tsv, &grid()),
-            format!("\u{FEFF}ID\tNAME{line_ending}1\talpha{line_ending}2\tNULL{line_ending}")
+            format!("ID\tNAME{line_ending}1\talpha{line_ending}2\tNULL{line_ending}")
         );
     }
 
@@ -514,7 +559,7 @@ mod tests {
         };
         assert_eq!(
             render(ExportFormat::Csv, &empty),
-            format!("\u{FEFF}A{}", csv_line_ending())
+            format!("A{}", csv_line_ending())
         );
     }
 

@@ -4729,7 +4729,13 @@ impl MainWindow {
             guard.result_tabs.clone()
         };
 
-        Ok(result_tabs.export_after_fetch_all(choice.format, choice.scope, db_type, callback))
+        Ok(result_tabs.export_after_fetch_all(
+            choice.format,
+            choice.scope,
+            choice.destination,
+            db_type,
+            callback,
+        ))
     }
 
     fn sync_recent_sql_file_menu(recent_sql_files: &[PathBuf]) {
@@ -13332,6 +13338,44 @@ impl MainWindow {
             state.result_tabs.clone()
         };
         result_tabs.capture_tour_show_context_menu()
+    }
+
+    /// Whether the visible result grid holds rows an export could cover.
+    #[doc(hidden)]
+    pub fn capture_tour_result_has_data(&self) -> bool {
+        self.state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .result_tabs
+            .has_data()
+    }
+
+    /// Select a cell range in the visible result grid, as a drag would.
+    #[doc(hidden)]
+    pub fn capture_tour_select_result_range(
+        &mut self,
+        row_start: i32,
+        col_start: i32,
+        row_end: i32,
+        col_end: i32,
+    ) {
+        let state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        state
+            .result_tabs
+            .capture_tour_select_range(row_start, col_start, row_end, col_end);
+    }
+
+    /// Drop the visible result grid's selection, as a click outside it would.
+    #[doc(hidden)]
+    pub fn capture_tour_clear_result_selection(&mut self) {
+        let state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        state.result_tabs.capture_tour_clear_selection();
     }
 
     /// Open the export modal exactly as `Ctrl+E` does, with every format on

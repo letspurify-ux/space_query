@@ -30,7 +30,7 @@ use crate::ui::font_settings::{
 };
 use crate::ui::grid_sort::{compare_cell_values, NullOrdering, SortColumn};
 use crate::ui::grid_sql_export::GridSqlSelection;
-use crate::ui::result_export::{ExportFormat, ExportGrid, ExportScope};
+use crate::ui::result_export::{ExportDestination, ExportFormat, ExportGrid, ExportScope};
 use crate::ui::sql_editor::LazyFetchRequest;
 use crate::ui::theme;
 use crate::utils::arithmetic::safe_div;
@@ -145,16 +145,20 @@ enum LazyFetchPendingAction {
 pub(crate) struct ExportRequest {
     pub format: ExportFormat,
     pub scope: ExportScope,
+    /// Decides the byte-order mark: a file may need one, the clipboard never
+    /// does.
+    pub destination: ExportDestination,
     /// Only `SqlInserts` reads these; every other format is dialect-agnostic.
     pub db_type: Option<crate::db::DatabaseType>,
     pub table: Option<String>,
 }
 
 impl ExportRequest {
-    fn csv_all() -> Self {
+    fn csv_file() -> Self {
         Self {
             format: ExportFormat::Csv,
             scope: ExportScope::All,
+            destination: ExportDestination::File,
             db_type: None,
             table: None,
         }
@@ -9229,6 +9233,12 @@ impl ResultTableWidget {
         self.table.redraw();
     }
 
+    pub(crate) fn capture_tour_clear_selection(&mut self) {
+        self.table.unset_selection();
+        Self::store_drag_selection_snapshot(&self.drag_state, None);
+        self.table.redraw();
+    }
+
     pub fn paste_from_clipboard(&mut self) {
         let _ = self.table.take_focus();
         app::paste_text(&self.table);
@@ -9356,10 +9366,15 @@ impl ResultTableWidget {
         }
     }
 
+    /// A CSV file's bytes, byte-order mark included.
     fn build_csv_snapshot(&self) -> String {
-        crate::ui::result_export::render(
-            ExportFormat::Csv,
-            &self.export_grid_snapshot(ExportScope::All),
+        format!(
+            "{}{}",
+            ExportFormat::Csv.file_byte_order_mark(),
+            crate::ui::result_export::render(
+                ExportFormat::Csv,
+                &self.export_grid_snapshot(ExportScope::All),
+            )
         )
     }
 
@@ -9372,7 +9387,7 @@ impl ResultTableWidget {
         &self,
         callback: Box<dyn FnMut(String, usize)>,
     ) -> Option<(String, usize)> {
-        self.export_after_fetch_all(ExportRequest::csv_all(), callback)
+        self.export_after_fetch_all(ExportRequest::csv_file(), callback)
     }
 
     /// Render the grid in `request`'s format, fetching the rest of the rows
@@ -9403,6 +9418,19 @@ impl ResultTableWidget {
     }
 
     fn current_export_snapshot(&self, request: &ExportRequest) -> (String, usize) {
+        let (text, row_count) = self.render_export(request);
+        let prelude = match request.destination {
+            ExportDestination::File => request.format.file_byte_order_mark(),
+            ExportDestination::Clipboard => "",
+        };
+        if prelude.is_empty() {
+            (text, row_count)
+        } else {
+            (format!("{prelude}{text}"), row_count)
+        }
+    }
+
+    fn render_export(&self, request: &ExportRequest) -> (String, usize) {
         match request.format {
             ExportFormat::SqlInserts => {
                 let Some(db_type) = request.db_type else {

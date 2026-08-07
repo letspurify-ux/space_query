@@ -280,7 +280,7 @@ every row or just the selection, and pick a file or the clipboard.
 
 | Format | Notes |
 | --- | --- |
-| **CSV**, **TSV** | UTF-8 with a BOM so Excel reads non-ASCII text correctly |
+| **CSV**, **TSV** | Files start with a UTF-8 BOM so Excel reads non-ASCII text correctly; the clipboard gets none |
 | **JSON** | Array of objects; SQL `NULL` becomes `null`, and only genuinely numeric text stays unquoted |
 | **XML** | `<results><row>…`; illegal characters in a column name become `_` |
 | **HTML** | A standalone document with a plain bordered table |
