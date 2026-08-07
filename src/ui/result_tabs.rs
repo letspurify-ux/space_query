@@ -17,6 +17,7 @@ use crate::ui::constants;
 use crate::ui::font_settings::{
     configured_result_font_size, configured_result_profile, FontProfile,
 };
+use crate::ui::grid_search::GridSearchDialog;
 use crate::ui::grid_sql_export::GridSqlSelection;
 use crate::ui::result_export::{ExportDestination, ExportFormat, ExportScope};
 use crate::ui::result_table::{
@@ -2697,6 +2698,18 @@ impl ResultTabsWidget {
             table: Self::resolve_grid_export_table(&table),
         };
         table.export_after_fetch_all(request, callback)
+    }
+
+    /// Find text in the rows the active result grid is already showing.
+    ///
+    /// Returns false when there is nothing to search, so the caller can say so
+    /// instead of opening a dialog over an empty grid.
+    pub(crate) fn show_grid_search(&mut self) -> bool {
+        let Some(mut table) = self.current_table().filter(|table| table.has_data()) else {
+            return false;
+        };
+        GridSearchDialog::show(&mut table);
+        true
     }
 
     /// Whether the visible grid has a selection an export could be narrowed to.

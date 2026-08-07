@@ -28,6 +28,7 @@ use crate::ui::constants::*;
 use crate::ui::font_settings::{
     configured_result_font_size, configured_result_profile, FontProfile,
 };
+use crate::ui::grid_search::{grid_matches, GridSearchHighlight};
 use crate::ui::grid_sql_export::GridSqlSelection;
 use crate::ui::result_export::{ExportDestination, ExportFormat, ExportGrid, ExportScope};
 use crate::ui::sql_editor::LazyFetchRequest;
@@ -360,6 +361,13 @@ pub struct ResultTableWidget {
     pending_page_navigation: Arc<Mutex<Option<PendingPageNavigation>>>,
     context_action_callback: ResultTableContextActionCallback,
     drag_state: Arc<Mutex<DragState>>,
+    /// Cells the in-grid find is pointing at. Owned by the find dialog, which
+    /// clears it when it closes; the grid only paints it.
+    search_highlight: Arc<Mutex<GridSearchHighlight>>,
+    /// Bumped whenever the rows are replaced rather than appended to. The find
+    /// dialog watches it so match coordinates collected before a result landed
+    /// are never stepped through afterwards.
+    data_generation: Arc<AtomicU64>,
 }
 
 #[derive(Default)]
@@ -2084,6 +2092,9 @@ impl ResultTableWidget {
             Arc::new(Mutex::new(VecDeque::new()));
         let context_action_callback: ResultTableContextActionCallback = Arc::new(Mutex::new(None));
         let drag_state = Arc::new(Mutex::new(DragState::default()));
+        let search_highlight: Arc<Mutex<GridSearchHighlight>> =
+            Arc::new(Mutex::new(GridSearchHighlight::default()));
+        let data_generation = Arc::new(AtomicU64::new(0));
 
         let mut table = Table::new(x, y, w, h, None);
 
@@ -2115,6 +2126,13 @@ impl ResultTableWidget {
         let null_edited_bg = fltk::enums::Color::from_rgb(50, 82, 56);
         let null_edited_sel_bg = fltk::enums::Color::from_rgb(66, 100, 72);
         let null_edited_fg = fltk::enums::Color::from_rgb(230, 255, 210);
+        // Soft yellow, the usual find colour on a dark editor. Red and green
+        // are kept level so it reads as yellow rather than as the browner,
+        // warmer khaki of the edited tint above.
+        let search_cell_bg = fltk::enums::Color::from_rgb(104, 98, 40);
+        let search_cell_fg = fltk::enums::Color::from_rgb(250, 246, 216);
+        let search_current_bg = fltk::enums::Color::from_rgb(222, 206, 110);
+        let search_current_fg = fltk::enums::Color::from_rgb(30, 28, 12);
         let header_bg = theme::table_header_bg();
         let header_fg = theme::text_primary();
         let border_color = theme::table_border();
@@ -2128,6 +2146,7 @@ impl ResultTableWidget {
         let max_cell_display_chars_for_draw = max_cell_display_chars_draw.clone();
         let row_number_offset_for_draw = row_number_offset.clone();
         let edit_session_for_draw = edit_session.clone();
+        let search_highlight_for_draw = search_highlight.clone();
 
         table.draw_cell(move |_t, ctx, row, col, x, y, w, h| {
             let normal_font = font_settings_for_draw.normal_font();
@@ -2180,13 +2199,28 @@ impl ResultTableWidget {
                     let mut is_edited_cell = false;
                     let mut is_explicit_null_cell = false;
                     let mut is_original_null_cell = false;
+                    // `Some(true)` is the match the find dialog is standing on.
+                    let search_state = match (usize::try_from(row), usize::try_from(col)) {
+                        (Ok(row_idx), Ok(col_idx)) => search_highlight_for_draw
+                            .try_lock()
+                            .ok()
+                            .filter(|highlight| highlight.matches.contains(&(row_idx, col_idx)))
+                            .map(|highlight| highlight.current == Some((row_idx, col_idx))),
+                        _ => None,
+                    };
                     let draw_cell_contents =
                         |cell_value: Option<&str>,
                          is_edited_cell: bool,
                          is_explicit_null_cell: bool,
                          is_original_null_cell: bool| {
                             let is_null_cell = is_explicit_null_cell || is_original_null_cell;
-                            let (bg, fg) = if is_null_cell && is_edited_cell {
+                            let (bg, fg) = if let Some(is_current_match) = search_state {
+                                if is_current_match {
+                                    (search_current_bg, search_current_fg)
+                                } else {
+                                    (search_cell_bg, search_cell_fg)
+                                }
+                            } else if is_null_cell && is_edited_cell {
                                 // Explicit null on a modified cell: use a distinct
                                 // hybrid tint so the user can tell apart "originally
                                 // null, untouched" from "explicitly set to null".
@@ -3146,6 +3180,8 @@ impl ResultTableWidget {
             pending_page_navigation: Arc::new(Mutex::new(None)),
             context_action_callback,
             drag_state,
+            search_highlight,
+            data_generation,
         }
     }
 
@@ -7570,6 +7606,7 @@ impl ResultTableWidget {
     }
 
     pub fn display_result(&mut self, result: &QueryResult) {
+        self.invalidate_search_for_new_data();
         mutex_store_bool(&self.streaming_in_progress, false);
         *self
             .lazy_fetch_session
@@ -7943,6 +7980,7 @@ impl ResultTableWidget {
     }
 
     pub fn start_streaming(&mut self, headers: &[String]) {
+        self.invalidate_search_for_new_data();
         mutex_store_bool(&self.streaming_in_progress, true);
         *self
             .lazy_fetch_session
@@ -8722,6 +8760,7 @@ impl ResultTableWidget {
 
     #[allow(dead_code)]
     pub fn clear(&mut self) {
+        self.invalidate_search_for_new_data();
         self.clear_lazy_fetch_state_for_abort();
         Self::clear_active_inline_edit_widget(&self.active_inline_edit);
         self.set_query_edit_backup(None);
@@ -9397,6 +9436,103 @@ impl ResultTableWidget {
             .map(|row_values| {
                 Self::visible_row_values_internal(row_values, self.hidden_auto_rowid_col_value())
             })
+    }
+
+    /// How many times these rows have been replaced. See `data_generation`.
+    pub(crate) fn data_generation(&self) -> u64 {
+        self.data_generation.load(Ordering::Relaxed)
+    }
+
+    /// Drop the search highlight because the rows underneath it are gone.
+    fn invalidate_search_for_new_data(&mut self) {
+        self.data_generation.fetch_add(1, Ordering::Relaxed);
+        self.clear_search_highlight();
+    }
+
+    /// Cells of the fetched rows whose value contains `needle`.
+    ///
+    /// Nothing is sent to the server: this is the data the grid already holds,
+    /// full values rather than the truncated text a cell draws.
+    pub(crate) fn search_matches(&self, needle: &str, case_sensitive: bool) -> Vec<(usize, usize)> {
+        let hidden_col = self.hidden_auto_rowid_col_value();
+        let data = self
+            .full_data
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        grid_matches(&data, needle, case_sensitive, hidden_col)
+    }
+
+    /// The cell a fresh search starts from — the top-left of the selection.
+    pub(crate) fn selected_cell(&self) -> Option<(usize, usize)> {
+        Self::normalized_selection_bounds_with_limits(
+            self.table.get_selection(),
+            self.table.rows().max(0) as usize,
+            self.table.cols().max(0) as usize,
+        )
+        .map(|(row_top, col_left, _, _)| (row_top, col_left))
+    }
+
+    pub(crate) fn set_search_highlight(
+        &mut self,
+        matches: &[(usize, usize)],
+        current: Option<(usize, usize)>,
+    ) {
+        {
+            let mut highlight = self
+                .search_highlight
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            highlight.matches = matches.iter().copied().collect();
+            highlight.current = current;
+        }
+        self.table.redraw();
+    }
+
+    pub(crate) fn clear_search_highlight(&mut self) {
+        {
+            let mut highlight = self
+                .search_highlight
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if highlight.matches.is_empty() && highlight.current.is_none() {
+                return;
+            }
+            highlight.clear();
+        }
+        self.table.redraw();
+    }
+
+    /// Select a match and scroll it into view.
+    pub(crate) fn focus_search_cell(&mut self, row: usize, col: usize) {
+        let rows = self.table.rows().max(0);
+        let cols = self.table.cols().max(0);
+        let (Ok(row), Ok(col)) = (i32::try_from(row), i32::try_from(col)) else {
+            return;
+        };
+        if row >= rows || col >= cols {
+            return;
+        }
+        self.table.set_selection(row, col, row, col);
+        let (row_top, col_left, row_bot, col_right) = self.table.visible_cells();
+        if let Some(position) = Self::scroll_position_for_match(row, row_top, row_bot) {
+            self.table.set_row_position(position);
+        }
+        if let Some(position) = Self::scroll_position_for_match(col, col_left, col_right) {
+            self.table.set_col_position(position);
+        }
+        self.table.redraw();
+    }
+
+    /// Where to scroll so `target` is on screen, or `None` when it already is.
+    ///
+    /// A match that is already visible must not move the viewport: stepping
+    /// through hits in one screenful should not jerk the grid on every step.
+    fn scroll_position_for_match(
+        target: i32,
+        first_visible: i32,
+        last_visible: i32,
+    ) -> Option<i32> {
+        (target < first_visible || target > last_visible).then_some(target.max(0))
     }
 
     pub fn get_widget(&self) -> Table {
@@ -14214,6 +14350,22 @@ mod tests {
     use super::*;
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
+
+    #[test]
+    fn a_search_match_already_on_screen_does_not_move_the_viewport() {
+        assert_eq!(
+            ResultTableWidget::scroll_position_for_match(12, 10, 20),
+            None
+        );
+        assert_eq!(
+            ResultTableWidget::scroll_position_for_match(4, 10, 20),
+            Some(4)
+        );
+        assert_eq!(
+            ResultTableWidget::scroll_position_for_match(31, 10, 20),
+            Some(31)
+        );
+    }
 
     #[test]
     fn displayed_row_number_includes_the_table_browse_page_offset() {

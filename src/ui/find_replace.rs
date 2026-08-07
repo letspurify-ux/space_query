@@ -123,7 +123,7 @@ fn resolve_find_input_shortcut_action(
     None
 }
 
-fn install_find_input_shortcuts(input: &mut Input) {
+pub(crate) fn install_find_input_shortcuts(input: &mut Input) {
     input.handle(move |widget, ev| match ev {
         // Handle only `Event::Shortcut` for Ctrl/Cmd combinations.
         // If we also process `Event::KeyDown`, some environments dispatch both
@@ -770,7 +770,10 @@ impl FindReplaceDialog {
     }
 }
 
-fn find_next_match(
+/// The one substring search in this app. The result grid's own find
+/// (`grid_search`) reuses it so a needle that matches in the editor matches in
+/// the grid — same case folding, same UTF-8 boundary handling.
+pub(crate) fn find_next_match(
     text: &str,
     search_text: &str,
     start_pos: i32,

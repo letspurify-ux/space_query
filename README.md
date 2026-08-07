@@ -30,8 +30,8 @@ extracted binary is enough to connect, run a script, and read the result.
 | --- | --- |
 | Editor | IntelliSense over live metadata, signature hints, SQL-aware formatter, multiple file tabs, find and replace, quick describe |
 | Execution | One statement, a selection, or a full script with SQL*Plus-style commands, bind variables, ref cursors, and per-statement timeouts |
-| Results | Independent result tabs, lazy fetch, sorting, export to CSV/TSV/JSON/XML/HTML/Markdown/SQL, and staged in-grid editing |
-| Objects | Filterable object tree, structure/index/constraint inspection, DDL generation, and table browsing with database-side paging |
+| Results | Independent result tabs, lazy fetch, sorting, in-grid text search, export to CSV/TSV/JSON/XML/HTML/Markdown/SQL, and staged in-grid editing |
+| Objects | Filterable object tree, structure/index/constraint inspection, DDL generation, confirmed drop/truncate, and table browsing with database-side paging |
 | Operations | Session activity, persisted query history, application log, and crash reports |
 
 ## Database support
@@ -222,6 +222,24 @@ triggers, and events, and shows sequences when the server exposes them.
 
 ![Object browser with example Oracle metadata](docs/images/object-browser.png)
 
+#### Drop and truncate
+
+The context menu ends with **Truncate...** on tables and **Drop...** on the
+object types each backend can drop by name — tables, views, procedures,
+functions, sequences and triggers on both families, materialized views,
+synonyms and packages on Oracle, and events on MySQL/MariaDB. Indexes are not
+offered: `DROP INDEX` needs the table the index belongs to, which a tree node
+does not carry.
+
+Neither runs on the click. A dialog first shows the exact statement that would
+be sent and asks for confirmation, and only then is that statement put in the
+editor and executed like any other — leaving you holding the SQL that ran. The
+statement is the plain one you read: no `CASCADE CONSTRAINTS`, no `PURGE`, and
+nothing else widened on your behalf. A drop that the database refuses reports
+its own error rather than being retried with a broader statement.
+
+![Confirming a drop with the statement it would run](docs/images/object-drop-confirmation.png)
+
 ### Table browsing and bounded paging
 
 Double-click a table in the object browser to open its rows in a dedicated
@@ -260,6 +278,24 @@ their absolute positions across pages.
   or access available edit actions.
 
 ![Result grid with a multi-cell selection](docs/images/result-grid.png)
+
+#### Find text in the rows on screen
+
+With the result grid focused, `Ctrl+F` (`Cmd+F` on macOS) searches the rows that
+have already been fetched. Nothing is sent to the server and no statement is
+re-run, so this stays available on a result the filter bar cannot re-query.
+
+Every matching cell is highlighted and the current match is picked out in a
+brighter shade; the counter shows where you are in the result. `Enter` and
+**Next** step forward, `Shift+Enter` and **Previous** step back, and both wrap
+around. A search starts from the selected cell rather than from the first row,
+and matching is case-insensitive unless **Case sensitive** is ticked. The
+highlight is cleared when the dialog closes.
+
+Matching covers the full stored value, not the shortened text a narrow cell
+draws, and it uses the same search the editor's **Find** uses.
+
+![Find in Results highlighting every matching cell](docs/images/grid-search.png)
 
 For a safely identifiable Oracle, MySQL, or MariaDB single-table result,
 **Edit** mode can stage inserted, updated, deleted, or `NULL` values. Oracle

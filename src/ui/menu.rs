@@ -578,7 +578,7 @@ impl MenuBarBuilder {
                     Ctrl+Shift+C - Copy with Headers\n\
                     Ctrl+V - Paste\n\
                     Ctrl+A - Select All\n\
-                    Ctrl+F - Find\n\
+                    Ctrl+F - Find (in the result grid when it has focus)\n\
                     F3 - Find Next\n\
                     Ctrl+H - Replace\n\
                     Ctrl+Shift+F - Format SQL\n\

@@ -91,6 +91,100 @@ pub enum SqlAction {
     DisplayResult(ResultTabRequest),
 }
 
+/// The object-browser actions that destroy something.
+///
+/// Both are shown with the exact statement they would run and are refused
+/// unless the user confirms that statement: this app does not change a schema
+/// out of sight of the editor.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum DestructiveObjectAction {
+    Drop,
+    Truncate,
+}
+
+impl DestructiveObjectAction {
+    /// The menu label. `...` says a dialog comes before anything runs.
+    const DROP_LABEL: &'static str = "Drop...";
+    const TRUNCATE_LABEL: &'static str = "Truncate...";
+
+    fn from_menu_label(label: &str) -> Option<Self> {
+        match label {
+            Self::DROP_LABEL => Some(Self::Drop),
+            Self::TRUNCATE_LABEL => Some(Self::Truncate),
+            _ => None,
+        }
+    }
+
+    fn confirm_button(self) -> &'static str {
+        match self {
+            Self::Drop => "Drop",
+            Self::Truncate => "Truncate",
+        }
+    }
+
+    /// What the user is agreeing to, above the statement itself.
+    fn confirm_prompt(self, qualified_name: &str) -> String {
+        match self {
+            Self::Drop => format!(
+                "Drop {}?\n\nThe object and everything in it are removed, and this cannot be \
+                 rolled back.",
+                qualified_name
+            ),
+            Self::Truncate => format!(
+                "Truncate {}?\n\nEvery row is removed, and this cannot be rolled back.",
+                qualified_name
+            ),
+        }
+    }
+}
+
+/// Whether the confirmation dialog for `action` on `sql` was accepted.
+fn confirm_destructive_object_action(
+    action: DestructiveObjectAction,
+    qualified_name: &str,
+    sql: &str,
+) -> bool {
+    let message = format!(
+        "{}\n\nThis statement will run:\n{}",
+        action.confirm_prompt(qualified_name),
+        sql
+    );
+    matches!(
+        crate::ui::choice2_on_main(&message, "Cancel", action.confirm_button(), ""),
+        Some(1)
+    )
+}
+
+/// Show the destructive-action confirmation the context menu shows, for the
+/// feature-tour capture.
+///
+/// It runs the real prompt over the real statement, so the screenshot cannot
+/// drift from what a right-click actually asks. Returns the built statement
+/// alongside the answer; hiding the window from a timeout reads as Cancel.
+#[doc(hidden)]
+pub fn capture_tour_confirm_destructive_object_action(
+    db_type: crate::db::DatabaseType,
+    menu_label: &str,
+    selected_scope: Option<&str>,
+    object_type: &str,
+    object_name: &str,
+) -> Result<(String, bool), String> {
+    let action = DestructiveObjectAction::from_menu_label(menu_label)
+        .ok_or_else(|| format!("{menu_label} is not a destructive action"))?;
+    let sql = ObjectBrowserWidget::destructive_object_sql(
+        db_type,
+        action,
+        selected_scope,
+        object_type,
+        object_name,
+    )
+    .ok_or_else(|| format!("{menu_label} has no statement for {object_type}"))?;
+    let qualified_name =
+        ObjectBrowserWidget::qualify_object_name_for_scope(db_type, selected_scope, object_name);
+    let accepted = confirm_destructive_object_action(action, &qualified_name, &sql);
+    Ok((sql, accepted))
+}
+
 /// What Enter and double-click do on a tree node. Both key paths resolve
 /// through this so the object browser has one default action per node.
 #[derive(Debug, PartialEq, Eq)]
@@ -331,6 +425,19 @@ trait ObjectBrowserDbBehavior: Sync {
         routine_name: &str,
     ) -> String;
     fn preview_select_sql(&self, selected_scope: Option<&str>, object_name: &str) -> String;
+    /// The statement `action` would run on this object, or `None` when the
+    /// backend has no such statement for that object type.
+    ///
+    /// This is the only place the DDL is spelled: the context menu offers the
+    /// action exactly when this returns `Some`, so the menu and what runs
+    /// cannot drift apart.
+    fn destructive_object_sql(
+        &self,
+        action: DestructiveObjectAction,
+        selected_scope: Option<&str>,
+        object_type: &str,
+        object_name: &str,
+    ) -> Option<String>;
     fn build_simple_procedure_script(&self, qualified_name: &str) -> String;
     fn build_simple_function_script(&self, qualified_name: &str) -> String;
     fn build_routine_script(
@@ -4042,6 +4149,21 @@ impl ObjectBrowserWidget {
         object_browser_behavior_for(db_type).preview_select_sql(selected_scope, object_name)
     }
 
+    fn destructive_object_sql(
+        db_type: crate::db::DatabaseType,
+        action: DestructiveObjectAction,
+        selected_scope: Option<&str>,
+        object_type: &str,
+        object_name: &str,
+    ) -> Option<String> {
+        object_browser_behavior_for(db_type).destructive_object_sql(
+            action,
+            selected_scope,
+            object_type,
+            object_name,
+        )
+    }
+
     fn quote_mysql_alias(alias: &str) -> String {
         format!("`{}`", alias.trim().trim_matches('`').replace('`', "``"))
     }
@@ -5370,6 +5492,56 @@ impl ObjectBrowserWidget {
 
             let handle_choice = || {
                 match (choice_label.as_str(), &item_info) {
+                    (
+                        label,
+                        ObjectItem::Simple {
+                            object_name,
+                            object_type,
+                        },
+                    ) if DestructiveObjectAction::from_menu_label(label).is_some() => {
+                        let Some(action) = DestructiveObjectAction::from_menu_label(label) else {
+                            return;
+                        };
+                        let qualified_name = Self::qualify_object_name_for_scope(
+                            db_type,
+                            selected_scope.as_deref(),
+                            object_name,
+                        );
+                        let Some(sql) = Self::destructive_object_sql(
+                            db_type,
+                            action,
+                            selected_scope.as_deref(),
+                            object_type,
+                            object_name,
+                        ) else {
+                            Self::emit_status_callback(
+                                status_callback,
+                                &format!("{} cannot be run on this object", label),
+                            );
+                            return;
+                        };
+                        if !confirm_destructive_object_action(action, &qualified_name, &sql) {
+                            Self::emit_status_callback(
+                                status_callback,
+                                &format!("Cancelled: {} was left alone", qualified_name),
+                            );
+                            return;
+                        }
+                        Self::emit_status_callback(
+                            status_callback,
+                            &format!(
+                                "Running {} for {}",
+                                label.trim_end_matches('.'),
+                                qualified_name
+                            ),
+                        );
+                        // Executed through the editor like any other statement,
+                        // so the user is left holding the exact SQL that ran.
+                        ObjectBrowserWidget::emit_sql_callback(
+                            sql_callback,
+                            SqlAction::Execute(sql),
+                        );
+                    }
                     ("Select Data (Top 100)", ObjectItem::Simple { object_name, .. }) => {
                         let qualified_name = Self::qualify_object_name_for_scope(
                             db_type,
@@ -6520,6 +6692,41 @@ impl ObjectBrowserDbBehavior for OracleObjectBrowserBehavior {
         format!("SELECT * FROM {} WHERE ROWNUM <= 100", qualified_name)
     }
 
+    fn destructive_object_sql(
+        &self,
+        action: DestructiveObjectAction,
+        selected_scope: Option<&str>,
+        object_type: &str,
+        object_name: &str,
+    ) -> Option<String> {
+        // No CASCADE CONSTRAINTS and no PURGE: a wider statement than the one
+        // the user read is exactly what the confirmation is there to prevent.
+        // A table that will not drop reports its own error instead.
+        let keyword = match action {
+            DestructiveObjectAction::Truncate => match object_type {
+                "TABLES" => "TABLE",
+                _ => return None,
+            },
+            DestructiveObjectAction::Drop => match object_type {
+                "TABLES" => "TABLE",
+                "VIEWS" => "VIEW",
+                "MATERIALIZED VIEWS" => "MATERIALIZED VIEW",
+                "PROCEDURES" => "PROCEDURE",
+                "FUNCTIONS" => "FUNCTION",
+                "SEQUENCES" => "SEQUENCE",
+                "TRIGGERS" => "TRIGGER",
+                "SYNONYMS" => "SYNONYM",
+                "PACKAGES" => "PACKAGE",
+                _ => return None,
+            },
+        };
+        let qualified_name = self.qualify_object_name(selected_scope, object_name);
+        Some(match action {
+            DestructiveObjectAction::Truncate => format!("TRUNCATE {} {}", keyword, qualified_name),
+            DestructiveObjectAction::Drop => format!("DROP {} {}", keyword, qualified_name),
+        })
+    }
+
     fn build_simple_procedure_script(&self, qualified_name: &str) -> String {
         ObjectBrowserWidget::build_simple_procedure_script(qualified_name)
     }
@@ -6971,24 +7178,24 @@ impl ObjectBrowserDbBehavior for OracleObjectBrowserBehavior {
     fn menu_choices_for_object_item(&self, item_info: &ObjectItem) -> Option<&'static str> {
         match item_info {
             ObjectItem::Simple { object_type, .. } if object_type == "TABLES" => Some(
-                "Select Data (Top 100)|View Structure|View Indexes|View Constraints|Generate DDL",
+                "Select Data (Top 100)|View Structure|View Indexes|View Constraints|Generate                  DDL|Truncate...|Drop...",
             ),
             ObjectItem::Simple { object_type, .. }
                 if object_type == "VIEWS" || object_type == "MATERIALIZED VIEWS" =>
             {
-                Some("Select Data (Top 100)|Generate DDL")
+                Some("Select Data (Top 100)|Generate DDL|Drop...")
             }
             ObjectItem::Simple { object_type, .. } if object_type == "PROCEDURES" => {
-                Some("Execute Procedure|Check Compilation|Generate DDL")
+                Some("Execute Procedure|Check Compilation|Generate DDL|Drop...")
             }
             ObjectItem::Simple { object_type, .. } if object_type == "FUNCTIONS" => {
-                Some("Execute Function|Check Compilation|Generate DDL")
+                Some("Execute Function|Check Compilation|Generate DDL|Drop...")
             }
             ObjectItem::Simple { object_type, .. } if object_type == "SEQUENCES" => {
-                Some("View Info|Generate DDL")
+                Some("View Info|Generate DDL|Drop...")
             }
             ObjectItem::Simple { object_type, .. } if object_type == "TRIGGERS" => {
-                Some("Check Compilation|Generate DDL")
+                Some("Check Compilation|Generate DDL|Drop...")
             }
             ObjectItem::Simple { object_type, .. } if object_type == "EVENTS" => {
                 Some("Generate DDL")
@@ -6999,7 +7206,7 @@ impl ObjectBrowserDbBehavior for OracleObjectBrowserBehavior {
                 Some("Generate DDL")
             }
             ObjectItem::Simple { object_type, .. } if object_type == "SYNONYMS" => {
-                Some("View Info|Generate DDL")
+                Some("View Info|Generate DDL|Drop...")
             }
             ObjectItem::PackageRoutine { routine_type, .. } => match routine_type.as_str() {
                 "FUNCTION" => Some("Execute Function"),
@@ -7007,7 +7214,7 @@ impl ObjectBrowserDbBehavior for OracleObjectBrowserBehavior {
                 _ => Some("Execute Routine"),
             },
             ObjectItem::Simple { object_type, .. } if object_type == "PACKAGES" => {
-                Some("Check Compilation|Generate DDL")
+                Some("Check Compilation|Generate DDL|Drop...")
             }
             _ => None,
         }
@@ -7356,6 +7563,40 @@ impl ObjectBrowserDbBehavior for MysqlObjectBrowserBehavior {
         )
     }
 
+    fn destructive_object_sql(
+        &self,
+        action: DestructiveObjectAction,
+        selected_scope: Option<&str>,
+        object_type: &str,
+        object_name: &str,
+    ) -> Option<String> {
+        // Indexes are deliberately absent: `DROP INDEX` needs the table the
+        // index belongs to, which a tree node does not carry.
+        let keyword = match action {
+            DestructiveObjectAction::Truncate => match object_type {
+                "TABLES" => "TABLE",
+                _ => return None,
+            },
+            DestructiveObjectAction::Drop => match object_type {
+                "TABLES" => "TABLE",
+                "VIEWS" => "VIEW",
+                "PROCEDURES" => "PROCEDURE",
+                "FUNCTIONS" => "FUNCTION",
+                "SEQUENCES" => "SEQUENCE",
+                "TRIGGERS" => "TRIGGER",
+                "EVENTS" => "EVENT",
+                _ => return None,
+            },
+        };
+        let qualified_name = ObjectBrowserWidget::quote_mysql_identifier_path(
+            &self.qualify_object_name(selected_scope, object_name),
+        );
+        Some(match action {
+            DestructiveObjectAction::Truncate => format!("TRUNCATE {} {}", keyword, qualified_name),
+            DestructiveObjectAction::Drop => format!("DROP {} {}", keyword, qualified_name),
+        })
+    }
+
     fn build_simple_procedure_script(&self, qualified_name: &str) -> String {
         format!(
             "CALL {}();\n",
@@ -7555,26 +7796,30 @@ impl ObjectBrowserDbBehavior for MysqlObjectBrowserBehavior {
     fn menu_choices_for_object_item(&self, item_info: &ObjectItem) -> Option<&'static str> {
         match item_info {
             ObjectItem::Simple { object_type, .. } if object_type == "TABLES" => Some(
-                "Select Data (Top 100)|View Structure|View Indexes|View Constraints|Generate DDL",
+                "Select Data (Top 100)|View Structure|View Indexes|View Constraints|Generate \
+                 DDL|Truncate...|Drop...",
             ),
-            ObjectItem::Simple { object_type, .. }
-                if object_type == "VIEWS" || object_type == "MATERIALIZED VIEWS" =>
-            {
+            ObjectItem::Simple { object_type, .. } if object_type == "VIEWS" => {
+                Some("Select Data (Top 100)|Generate DDL|Drop...")
+            }
+            // No `Drop...`: this family has no materialized views, so there is
+            // no statement to offer if such a node ever reaches here.
+            ObjectItem::Simple { object_type, .. } if object_type == "MATERIALIZED VIEWS" => {
                 Some("Select Data (Top 100)|Generate DDL")
             }
             ObjectItem::Simple { object_type, .. } if object_type == "PROCEDURES" => {
-                Some("Execute Procedure|Generate DDL")
+                Some("Execute Procedure|Generate DDL|Drop...")
             }
             ObjectItem::Simple { object_type, .. } if object_type == "FUNCTIONS" => {
-                Some("Execute Function|Generate DDL")
+                Some("Execute Function|Generate DDL|Drop...")
             }
             ObjectItem::Simple { object_type, .. } if object_type == "SEQUENCES" => {
-                Some("View Info|Generate DDL")
+                Some("View Info|Generate DDL|Drop...")
             }
             ObjectItem::Simple { object_type, .. }
                 if object_type == "TRIGGERS" || object_type == "EVENTS" =>
             {
-                Some("Generate DDL")
+                Some("Generate DDL|Drop...")
             }
             ObjectItem::Simple { object_type, .. } if object_type == "SYNONYMS" => {
                 Some("View Info|Generate DDL")
@@ -8525,9 +8770,9 @@ impl MultiObjectBrowserWidget {
 #[cfg(test)]
 mod tests {
     use super::{
-        consume_owned_key_up, copy_text_for_object_item, MultiObjectBrowserWidget,
-        ObjectBrowserMetadataSnapshot, ObjectBrowserWidget, ObjectCache, ObjectDefaultAction,
-        ObjectItem, ScopeSwitchPreflightCallback, SCOPE_SELECTOR_ROW_HEIGHT,
+        consume_owned_key_up, copy_text_for_object_item, DestructiveObjectAction,
+        MultiObjectBrowserWidget, ObjectBrowserMetadataSnapshot, ObjectBrowserWidget, ObjectCache,
+        ObjectDefaultAction, ObjectItem, ScopeSwitchPreflightCallback, SCOPE_SELECTOR_ROW_HEIGHT,
         SCOPE_SELECTOR_TABLE_VERTICAL_PADDING,
     };
     use crate::db::{DatabaseType, OracleDriverMode};
@@ -9047,6 +9292,161 @@ mod tests {
         );
 
         assert_eq!(sql, "SELECT * FROM `sales`.`orders` LIMIT 100");
+    }
+
+    #[test]
+    fn drop_statements_name_the_object_kind_per_backend() {
+        let oracle = |object_type: &str| {
+            ObjectBrowserWidget::destructive_object_sql(
+                DatabaseType::Oracle,
+                DestructiveObjectAction::Drop,
+                Some("SCOTT"),
+                object_type,
+                "EMP",
+            )
+        };
+
+        assert_eq!(oracle("TABLES").as_deref(), Some("DROP TABLE SCOTT.EMP"));
+        assert_eq!(oracle("VIEWS").as_deref(), Some("DROP VIEW SCOTT.EMP"));
+        assert_eq!(
+            oracle("MATERIALIZED VIEWS").as_deref(),
+            Some("DROP MATERIALIZED VIEW SCOTT.EMP")
+        );
+        assert_eq!(
+            oracle("PACKAGES").as_deref(),
+            Some("DROP PACKAGE SCOTT.EMP")
+        );
+
+        assert_eq!(
+            ObjectBrowserWidget::destructive_object_sql(
+                DatabaseType::MySQL,
+                DestructiveObjectAction::Drop,
+                Some("sales"),
+                "TABLES",
+                "orders",
+            )
+            .as_deref(),
+            Some("DROP TABLE `sales`.`orders`")
+        );
+        assert_eq!(
+            ObjectBrowserWidget::destructive_object_sql(
+                DatabaseType::MariaDB,
+                DestructiveObjectAction::Drop,
+                Some("sales"),
+                "EVENTS",
+                "nightly",
+            )
+            .as_deref(),
+            Some("DROP EVENT `sales`.`nightly`")
+        );
+    }
+
+    #[test]
+    fn truncate_is_offered_for_tables_only() {
+        for db_type in [DatabaseType::Oracle, DatabaseType::MySQL] {
+            assert!(ObjectBrowserWidget::destructive_object_sql(
+                db_type,
+                DestructiveObjectAction::Truncate,
+                None,
+                "VIEWS",
+                "v_sales",
+            )
+            .is_none());
+        }
+
+        assert_eq!(
+            ObjectBrowserWidget::destructive_object_sql(
+                DatabaseType::Oracle,
+                DestructiveObjectAction::Truncate,
+                Some("SCOTT"),
+                "TABLES",
+                "EMP",
+            )
+            .as_deref(),
+            Some("TRUNCATE TABLE SCOTT.EMP")
+        );
+        assert_eq!(
+            ObjectBrowserWidget::destructive_object_sql(
+                DatabaseType::MySQL,
+                DestructiveObjectAction::Truncate,
+                Some("sales"),
+                "TABLES",
+                "orders",
+            )
+            .as_deref(),
+            Some("TRUNCATE TABLE `sales`.`orders`")
+        );
+    }
+
+    #[test]
+    fn drop_statement_carries_no_cascade_or_purge_the_user_did_not_read() {
+        let sql = ObjectBrowserWidget::destructive_object_sql(
+            DatabaseType::Oracle,
+            DestructiveObjectAction::Drop,
+            Some("SCOTT"),
+            "TABLES",
+            "EMP",
+        )
+        .expect("oracle tables drop");
+
+        assert_eq!(sql, "DROP TABLE SCOTT.EMP");
+    }
+
+    /// The context menu must offer a destructive action exactly when there is a
+    /// statement behind it, or a user picks an item that can only fail.
+    #[test]
+    fn every_offered_destructive_menu_item_has_a_statement_behind_it() {
+        const OBJECT_TYPES: [&str; 12] = [
+            "TABLES",
+            "VIEWS",
+            "MATERIALIZED VIEWS",
+            "PROCEDURES",
+            "FUNCTIONS",
+            "SEQUENCES",
+            "TRIGGERS",
+            "SYNONYMS",
+            "PACKAGES",
+            "EVENTS",
+            "TYPES",
+            "INDEXES",
+        ];
+
+        for db_type in [
+            DatabaseType::Oracle,
+            DatabaseType::MySQL,
+            DatabaseType::MariaDB,
+        ] {
+            for object_type in OBJECT_TYPES {
+                let item = simple_item(object_type, "OBJ");
+                let choices = ObjectBrowserWidget::menu_choices_for_object_item(&item, db_type)
+                    .unwrap_or_default();
+                for (label, action) in [
+                    (
+                        DestructiveObjectAction::DROP_LABEL,
+                        DestructiveObjectAction::Drop,
+                    ),
+                    (
+                        DestructiveObjectAction::TRUNCATE_LABEL,
+                        DestructiveObjectAction::Truncate,
+                    ),
+                ] {
+                    let offered = choices.split('|').any(|choice| choice == label);
+                    let runnable = ObjectBrowserWidget::destructive_object_sql(
+                        db_type,
+                        action,
+                        None,
+                        object_type,
+                        "OBJ",
+                    )
+                    .is_some();
+                    assert_eq!(
+                        offered, runnable,
+                        "{:?} / {} / {}",
+                        db_type, object_type, label
+                    );
+                }
+            }
+        }
     }
 
     fn simple_item(object_type: &str, object_name: &str) -> ObjectItem {
@@ -10259,7 +10659,7 @@ mod tests {
                 &materialized_view,
                 DatabaseType::Oracle
             ),
-            Some("Select Data (Top 100)|Generate DDL")
+            Some("Select Data (Top 100)|Generate DDL|Drop...")
         );
 
         let type_item = ObjectItem::Simple {

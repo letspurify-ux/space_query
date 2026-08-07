@@ -841,6 +841,115 @@ fn capture_result_grid(main_window: &mut MainWindow) {
     }
 }
 
+/// The first text input inside a dialog window, by label.
+fn first_input_in_window(label: &str) -> Option<fltk::input::Input> {
+    fn visit(group: fltk::group::Group) -> Option<fltk::input::Input> {
+        for child in group.into_iter() {
+            if let Some(input) = fltk::input::Input::from_dyn_widget(&child) {
+                return Some(input);
+            }
+            if let Some(input) = child.as_group().and_then(visit) {
+                return Some(input);
+            }
+        }
+        None
+    }
+
+    window_by_label(label)?.as_group().and_then(visit)
+}
+
+/// Type a needle into the open Find in Results dialog, capture the grid with
+/// the dialog composited over it, then close the dialog.
+///
+/// Runs from a timeout inside the dialog's modal loop: hiding the window is
+/// what lets `capture_tour_show_grid_search` return.
+fn capture_grid_search_dialog(needle: &str, capture_path: &str) {
+    let mut input = first_input_in_window("Find in Results")
+        .unwrap_or_else(|| fail("Find in Results input is missing"));
+    input.set_value(needle);
+    input.do_callback();
+    pump(250);
+
+    let mut main =
+        app::widget_from_id::<Window>("main_window").unwrap_or_else(|| fail("main window"));
+    let main_x = main.x_root();
+    let main_y = main.y_root();
+    let (mut canvas, width, height) = capture_complete_rgb(&mut main);
+    let mut dialog =
+        window_by_label("Find in Results").unwrap_or_else(|| fail("Find in Results window"));
+    composite_popup(&mut canvas, width, height, main_x, main_y, &mut dialog);
+    save_ppm(capture_path, &canvas, width, height);
+    dialog.hide();
+}
+
+fn capture_grid_search(main_window: &mut MainWindow) {
+    let columns = [
+        ("EMPNO", "NUMBER"),
+        ("ENAME", "VARCHAR2"),
+        ("JOB", "VARCHAR2"),
+        ("DEPTNO", "NUMBER"),
+        ("SAL", "NUMBER"),
+        ("HIREDATE", "DATE"),
+    ];
+    let rows: &[&[&str]] = &[
+        &["7369", "SMITH", "CLERK", "20", "800", "1980-12-17"],
+        &["7499", "ALLEN", "SALESMAN", "30", "1600", "1981-02-20"],
+        &["7521", "WARD", "SALESMAN", "30", "1250", "1981-02-22"],
+        &["7566", "JONES", "MANAGER", "20", "2975", "1981-04-02"],
+        &["7654", "MARTIN", "SALESMAN", "30", "1250", "1981-09-28"],
+        &["7698", "BLAKE", "MANAGER", "30", "2850", "1981-05-01"],
+        &["7782", "CLARK", "MANAGER", "10", "2450", "1981-06-09"],
+        &["7788", "SCOTT", "ANALYST", "20", "3000", "1987-04-19"],
+        &["7839", "KING", "PRESIDENT", "10", "5000", "1981-11-17"],
+        &["7844", "TURNER", "SALESMAN", "30", "1500", "1981-09-08"],
+        &["7876", "ADAMS", "CLERK", "20", "1100", "1987-05-23"],
+        &["7900", "JAMES", "CLERK", "30", "950", "1981-12-03"],
+        &["7902", "FORD", "ANALYST", "20", "3000", "1981-12-03"],
+        &["7934", "MILLER", "CLERK", "10", "1300", "1982-01-23"],
+    ];
+    main_window
+        .capture_tour_show_result(
+            "Result",
+            make_result(&columns, rows, "SELECT * FROM EMP ORDER BY EMPNO"),
+            false,
+            // A search starts from the selected cell, so this is what puts the
+            // current match where the dialog does not cover it.
+            Some((4, 1, 4, 1)),
+        )
+        .unwrap_or_else(|err| fail(format!("show result: {err}")));
+    pump(350);
+
+    app::add_timeout3(0.45, |_| {
+        capture_grid_search_dialog("SALESMAN", "/tmp/space-query-grid-search.ppm")
+    });
+    main_window
+        .capture_tour_show_grid_search()
+        .unwrap_or_else(|err| fail(format!("show grid search: {err}")));
+}
+
+/// Capture the confirmation an object-browser Drop asks for.
+fn capture_object_drop_confirmation(capture_path: &str) {
+    let capture_path = capture_path.to_string();
+    app::add_timeout3(0.45, move |_| {
+        capture_active_dialog("Question", &capture_path)
+    });
+    let (sql, accepted) =
+        space_query::ui::object_browser::capture_tour_confirm_destructive_object_action(
+            DatabaseType::Oracle,
+            "Drop...",
+            Some("SCOTT"),
+            "TABLES",
+            "EMP",
+        )
+        .unwrap_or_else(|err| fail(format!("confirm drop: {err}")));
+    if sql != "DROP TABLE SCOTT.EMP" {
+        fail(format!("unexpected drop statement: {sql}"));
+    }
+    if accepted {
+        fail("a dismissed confirmation must not count as approval");
+    }
+}
+
 fn capture_table_browse_input_popup(
     input: &fltk::input::Input,
     popup: &Arc<Mutex<IntellisensePopup>>,
@@ -1630,6 +1739,18 @@ fn main() {
         app::quit();
         return;
     }
+    if capture_mode.as_deref() == Some("grid-search") {
+        capture_object_browser(&mut main_window);
+        capture_grid_search(&mut main_window);
+        app::quit();
+        return;
+    }
+    if capture_mode.as_deref() == Some("object-drop-confirmation") {
+        capture_object_browser(&mut main_window);
+        capture_object_drop_confirmation("/tmp/space-query-object-drop-confirmation.ppm");
+        app::quit();
+        return;
+    }
     if capture_mode.as_deref() == Some("table-browse-popup") {
         capture_table_browse_popup(&mut main_window, false);
         app::quit();
@@ -1645,6 +1766,8 @@ fn main() {
     capture_signature_popup(&mut main_window);
     capture_formatting(&mut main_window);
     capture_result_grid(&mut main_window);
+    capture_grid_search(&mut main_window);
+    capture_object_drop_confirmation("/tmp/space-query-object-drop-confirmation.ppm");
     capture_grid_sql_export(&mut main_window);
     capture_result_export(&mut main_window);
     capture_table_browse_popup(&mut main_window, false);

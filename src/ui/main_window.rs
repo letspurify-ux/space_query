@@ -11603,16 +11603,37 @@ impl MainWindow {
                 true
             }
             "Edit/Find" => {
-                let (mut editor, mut buffer, popups) = {
+                // Ctrl+F searches whatever the user is looking at: the rows of
+                // the result grid when focus is there, the statement text
+                // otherwise. The grid search runs a modal loop of its own, so
+                // the app state lock is released before it opens.
+                let (mut editor, mut buffer, popups, result_tabs, focus_in_results) = {
                     let s = state
                         .lock()
                         .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    let result_tabs_widget = s.result_tabs.get_widget();
+                    let focus_in_results = app::focus().is_some_and(|focus| {
+                        focus.as_widget_ptr() == result_tabs_widget.as_widget_ptr()
+                            || focus.inside(&result_tabs_widget)
+                    });
                     (
                         s.sql_editor.get_editor(),
                         s.sql_buffer.clone(),
                         s.popups.clone(),
+                        s.result_tabs.clone(),
+                        focus_in_results,
                     )
                 };
+                if focus_in_results {
+                    let mut result_tabs = result_tabs;
+                    if !result_tabs.show_grid_search() {
+                        state
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner())
+                            .set_status_message("This result has no rows to search");
+                    }
+                    return true;
+                }
                 FindReplaceDialog::show_find_with_registry(&mut editor, &mut buffer, popups);
                 true
             }
@@ -13859,6 +13880,25 @@ impl MainWindow {
         }
         state.refresh_result_edit_controls();
         state.window.redraw();
+        Ok(())
+    }
+
+    /// Open Find in Results over the visible grid.
+    ///
+    /// Runs the dialog's own modal loop, so a capture has to drive it and hide
+    /// its window from a timeout.
+    #[doc(hidden)]
+    pub fn capture_tour_show_grid_search(&mut self) -> Result<(), String> {
+        let mut result_tabs = {
+            let state = self
+                .state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            state.result_tabs.clone()
+        };
+        if !result_tabs.show_grid_search() {
+            return Err("the result grid has no rows to search".to_string());
+        }
         Ok(())
     }
 

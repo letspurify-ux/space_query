@@ -69,6 +69,16 @@ if [[ "$capture_mode" == "result-export" ]]; then
   exit 0
 fi
 
+if [[ "$capture_mode" == "grid-search" ]]; then
+  convert_capture grid-search grid-search
+  exit 0
+fi
+
+if [[ "$capture_mode" == "object-drop-confirmation" ]]; then
+  convert_capture object-drop-confirmation object-drop-confirmation
+  exit 0
+fi
+
 if [[ "$capture_mode" == "table-browse-popup" ]]; then
   convert_capture table-browse table-browse
   convert_capture table-browse-popup-100 table-browse-popup
@@ -88,6 +98,8 @@ convert_capture object-browser object-browser
 convert_capture formatting-before sql-formatting-before
 convert_capture formatting-after sql-formatting-after
 convert_capture result-grid result-grid
+convert_capture grid-search grid-search
+convert_capture object-drop-confirmation object-drop-confirmation
 convert_capture grid-sql-export grid-sql-export
 convert_capture result-export result-export
 convert_capture table-browse table-browse

@@ -5,6 +5,7 @@ pub mod connection_dialog;
 pub mod constants;
 pub mod find_replace;
 pub mod font_settings;
+pub(crate) mod grid_search;
 // Public only so `verify_grid_sql_export` can assert on the exact SQL the app
 // puts on the clipboard; not part of the supported surface.
 #[doc(hidden)]
