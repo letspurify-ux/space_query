@@ -92,6 +92,81 @@ pub(crate) fn duplicate_column_names(column_names: &[String]) -> Vec<String> {
 /// Only code positions count — a `'HH24:MI:SS'` format model or a `q'[a&b]'`
 /// literal is not a placeholder. `&` is checked on Oracle only: it is the
 /// bitwise AND operator in the MySQL family.
+/// The locking clause this statement ends with, if any.
+///
+/// Filtering re-runs the statement, and a locking read would take its locks
+/// again — silently, from a filter box. The clause is also the one shape the
+/// derived-table wrap cannot carry on Oracle, so this gate keeps that error
+/// from reaching the user as a driver message.
+///
+/// Only whole words outside strings and comments count, so a column named
+/// `SHARE` or a comment mentioning `FOR UPDATE` does not block anything.
+fn locking_clause(sql: &str, db_type: DatabaseType) -> Option<&'static str> {
+    const CLAUSES: [&[&str]; 4] = [
+        &["FOR", "UPDATE"],
+        &["FOR", "SHARE"],
+        &["FOR", "NO", "KEY", "UPDATE"],
+        &["LOCK", "IN", "SHARE", "MODE"],
+    ];
+    const LABELS: [&str; 4] = [
+        "FOR UPDATE",
+        "FOR SHARE",
+        "FOR NO KEY UPDATE",
+        "LOCK IN SHARE MODE",
+    ];
+
+    let words = code_words(sql, db_type.is_mysql_or_mariadb());
+    CLAUSES
+        .iter()
+        .zip(LABELS)
+        .find(|(clause, _)| {
+            words.windows(clause.len()).any(|window| {
+                window
+                    .iter()
+                    .zip(clause.iter())
+                    .all(|(word, keyword)| word == keyword)
+            })
+        })
+        .map(|(_, label)| label)
+}
+
+/// The statement's words, uppercased, with strings and comments left out.
+fn code_words(sql: &str, mysql: bool) -> Vec<String> {
+    let spans = lexical_spans(sql, mysql);
+    let bytes = sql.as_bytes();
+    let mut words = Vec::new();
+    let mut word = String::new();
+    let mut idx = 0usize;
+    let mut span_idx = 0usize;
+
+    while idx < bytes.len() {
+        while span_idx < spans.len() && spans[span_idx].end <= idx {
+            span_idx += 1;
+        }
+        if let Some(span) = spans.get(span_idx) {
+            if span.contains(idx) {
+                if !word.is_empty() {
+                    words.push(std::mem::take(&mut word));
+                }
+                idx = span.end;
+                continue;
+            }
+        }
+
+        let byte = bytes[idx];
+        if byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'$' || byte == b'#' {
+            word.push(byte.to_ascii_uppercase() as char);
+        } else if !word.is_empty() {
+            words.push(std::mem::take(&mut word));
+        }
+        idx += 1;
+    }
+    if !word.is_empty() {
+        words.push(word);
+    }
+    words
+}
+
 fn has_unreproducible_placeholder(sql: &str, db_type: DatabaseType) -> bool {
     let mysql = db_type.is_mysql_or_mariadb();
     let spans = lexical_spans(sql, mysql);
@@ -155,6 +230,13 @@ pub(crate) fn result_filter_support(
         );
     }
 
+    if let Some(clause) = locking_clause(trimmed, db_type) {
+        return ResultFilterSupport::Blocked(format!(
+            "This statement locks the rows it reads ({clause}), and filtering re-runs it. Remove \
+             the locking clause to filter the result."
+        ));
+    }
+
     let duplicates = duplicate_column_names(column_names);
     if duplicates.is_empty() {
         return ResultFilterSupport::Full;
@@ -185,6 +267,54 @@ mod tests {
 
     fn names(values: &[&str]) -> Vec<String> {
         values.iter().map(|value| (*value).to_string()).collect()
+    }
+
+    #[test]
+    fn a_locking_read_is_not_re_run_for_filtering() {
+        for db_type in [DatabaseType::Oracle, DatabaseType::MySQL] {
+            assert!(matches!(
+                result_filter_support("SELECT * FROM EMP FOR UPDATE", &names(&["EMPNO"]), db_type),
+                ResultFilterSupport::Blocked(_)
+            ));
+        }
+        assert!(matches!(
+            result_filter_support(
+                "SELECT * FROM EMP LOCK IN SHARE MODE",
+                &names(&["EMPNO"]),
+                DatabaseType::MySQL
+            ),
+            ResultFilterSupport::Blocked(_)
+        ));
+        assert!(matches!(
+            result_filter_support(
+                "SELECT * FROM EMP FOR UPDATE OF SAL NOWAIT",
+                &names(&["EMPNO"]),
+                DatabaseType::Oracle
+            ),
+            ResultFilterSupport::Blocked(_)
+        ));
+    }
+
+    #[test]
+    fn locking_words_only_count_as_code() {
+        // A column or alias that reads like the clause, and the clause inside a
+        // comment or a literal, leave the result filterable.
+        assert!(matches!(
+            result_filter_support(
+                "SELECT UPDATE_FOR, 'FOR UPDATE' FROM EMP -- FOR UPDATE",
+                &names(&["UPDATE_FOR", "LABEL"]),
+                DatabaseType::Oracle
+            ),
+            ResultFilterSupport::Full
+        ));
+        assert!(matches!(
+            result_filter_support(
+                "SELECT SHARE FROM EMP",
+                &names(&["SHARE"]),
+                DatabaseType::MySQL
+            ),
+            ResultFilterSupport::Full
+        ));
     }
 
     #[test]

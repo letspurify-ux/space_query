@@ -5274,10 +5274,8 @@ impl MainWindow {
         if !result_can_carry_a_filter_bar(sql) {
             return;
         }
-        if matches!(
-            result_filter_support(sql, columns, db_type),
-            ResultFilterSupport::Blocked(_)
-        ) {
+        let support = result_filter_support(sql, columns, db_type);
+        if matches!(support, ResultFilterSupport::Blocked(_)) {
             return;
         }
 
@@ -5293,7 +5291,17 @@ impl MainWindow {
             // complete on.
             result_columns: columns.to_vec(),
         };
-        result_tabs.attach_result_filter_bar_by_id(result_tab_id, target, intellisense_data, false);
+        if !result_tabs.attach_result_filter_bar_by_id(
+            result_tab_id,
+            target,
+            intellisense_data,
+            false,
+        ) {
+            return;
+        }
+        if let ResultFilterSupport::AmbiguousColumns(columns) = support {
+            result_tabs.note_result_filter_ambiguous_columns(result_tab_id, &columns);
+        }
     }
 
     fn finish_clipboard_copy(state: &mut AppState, sql: &str, message: &str) {

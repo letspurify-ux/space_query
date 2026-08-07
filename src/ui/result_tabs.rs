@@ -1835,6 +1835,24 @@ impl ResultTabsWidget {
         true
     }
 
+    /// Note on this tab's filter bar which columns the backend cannot resolve.
+    pub(crate) fn note_result_filter_ambiguous_columns(
+        &mut self,
+        id: ResultTabId,
+        columns: &[String],
+    ) {
+        let filter_bar = self.result_tab_index_for_id(id).and_then(|index| {
+            self.data
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .get(index)
+                .and_then(|tab| tab.filter_bar.clone())
+        });
+        if let Some(mut filter_bar) = filter_bar {
+            filter_bar.note_ambiguous_columns(columns);
+        }
+    }
+
     /// Whether this tab carries a filter bar, however it got one.
     ///
     /// The header sort asks this: a tab that can re-query orders on the server

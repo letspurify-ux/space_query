@@ -1223,6 +1223,24 @@ impl TableBrowseFilterBar {
         app::focus().map(|widget| widget.as_widget_ptr() as usize)
     }
 
+    /// Say which of the result's columns this backend cannot resolve in a
+    /// filter, so the user reads it before typing one rather than as a driver
+    /// error afterwards.
+    pub(crate) fn note_ambiguous_columns(&mut self, columns: &[String]) {
+        if columns.is_empty() {
+            return;
+        }
+        let note = format!(
+            "\n\nThis result repeats the column name {}, so naming one of them here fails. Every \
+             other column filters normally.",
+            columns.join(", ")
+        );
+        for input in [&mut self.where_input, &mut self.order_input] {
+            let tooltip = format!("{}{note}", input.tooltip().unwrap_or_default());
+            input.set_tooltip(&tooltip);
+        }
+    }
+
     pub(crate) fn focus_where_input(&self) {
         Self::retain_input_focus(&self.where_input);
     }
@@ -1392,6 +1410,37 @@ mod tests {
             },
             "APP.EMP".to_string(),
         )
+    }
+
+    #[test]
+    #[cfg_attr(
+        any(target_os = "macos", target_os = "linux"),
+        ignore = "FLTK widget tests require a native UI test environment"
+    )]
+    fn ambiguous_columns_are_named_in_the_filter_tooltips() {
+        let _app = fltk::app::App::default();
+        let mut bar = TableBrowseFilterBar::new(
+            0,
+            0,
+            600,
+            target(DatabaseType::Oracle),
+            Arc::new(Mutex::new(IntellisenseData::new())),
+            ResultTabId::new(1),
+            Arc::new(Mutex::new(None)),
+        );
+
+        let before = bar.where_input.tooltip().unwrap_or_default();
+        bar.note_ambiguous_columns(&[]);
+        assert_eq!(bar.where_input.tooltip().unwrap_or_default(), before);
+
+        bar.note_ambiguous_columns(&["ENAME".to_string(), "SAL".to_string()]);
+        for tooltip in [
+            bar.where_input.tooltip().unwrap_or_default(),
+            bar.order_input.tooltip().unwrap_or_default(),
+        ] {
+            assert!(tooltip.starts_with(&before));
+            assert!(tooltip.contains("ENAME, SAL"));
+        }
     }
 
     #[test]
