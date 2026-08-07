@@ -1279,7 +1279,11 @@ impl QueryProgressContext {
     ) -> Self {
         let now = Instant::now();
         let execution_target = execution.map(|execution| execution.result_tab_id);
-        let status_activity_label = if execution_target.is_some() {
+        // A grid-edit save says what it is doing; a re-query of a filtered
+        // result is an ordinary query and reads as one.
+        let status_activity_label = if execution
+            .is_some_and(|execution| execution.kind == ResultGridExecutionKind::GridEdit)
+        {
             "Saving result grid".to_string()
         } else {
             activity_label.clone()
@@ -8572,7 +8576,11 @@ impl MainWindow {
             state_guard.result_grid_execution_targets.remove(&tab_id);
             state_guard.pending_table_browse_last.remove(&tab_id);
             if let Some(mut result_tabs) = state_guard.result_tabs_for_tab(tab_id) {
+                // The tab was told a statement was on its way; nothing else
+                // will report that it never left.
                 result_tabs.fail_table_browse_result_by_id(request.result_tab_id);
+                result_tabs
+                    .mark_statement_status_by_id(request.result_tab_id, ResultTabStatus::Error);
             }
             Err("Failed to start table page query execution.".to_string())
         }
