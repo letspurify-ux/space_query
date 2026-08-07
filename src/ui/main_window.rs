@@ -2427,6 +2427,19 @@ impl AppState {
         sessions_to_cancel
     }
 
+    /// Whether a statement has reserved a result tab for this query tab but has
+    /// not started yet — it is still waiting for a previous lazy fetch to be
+    /// cancelled.
+    fn result_grid_execution_is_queued(&self, tab_id: QueryTabId) -> bool {
+        let Some(execution) = self.result_grid_execution_targets.get(&tab_id) else {
+            return false;
+        };
+        self.progress_contexts
+            .get(&tab_id)
+            .and_then(|context| context.execution_reservation)
+            != Some(execution.id)
+    }
+
     /// Route the next statement started for `tab_id` to an existing result tab,
     /// replacing any reservation that never got to run.
     fn reserve_result_grid_execution(
@@ -8477,6 +8490,17 @@ impl MainWindow {
             if editor.is_query_running() {
                 return Err("The owning query tab is already running a query.".to_string());
             }
+            // A statement waiting for a lazy fetch to be cancelled has not
+            // taken the tab's "a query is running" flag yet. Starting a second
+            // one would leave both running, and only one of them can have the
+            // result tab they both reserved.
+            if state_guard.result_grid_execution_is_queued(tab_id) {
+                return Err(
+                    "The previous refresh of this result has not started yet. Try again in a \
+                     moment."
+                        .to_string(),
+                );
+            }
             let mut result_tabs = state_guard
                 .result_tabs_for_tab(tab_id)
                 .ok_or_else(|| "The result workspace is closed.".to_string())?;
@@ -8514,6 +8538,13 @@ impl MainWindow {
                 request.result_tab_id,
                 Some(sql.clone()),
             );
+            if !browsing {
+                // A browse tab shows it is loading through its own state; a
+                // filtered query tab has only the badge, and the wait before a
+                // deferred statement starts is otherwise unreported.
+                result_tabs
+                    .mark_statement_status_by_id(request.result_tab_id, ResultTabStatus::Running);
+            }
             if browsing && request.navigation == TableBrowseNavigation::Last {
                 state_guard.pending_table_browse_last.insert(
                     tab_id,
@@ -9039,6 +9070,10 @@ impl MainWindow {
                     let table_browse_counting = s.pending_table_browse_last.contains_key(&tab_id);
                     let lazy_fetch_sessions = if !one_tab_per_query
                         && grid_execution_target.is_none()
+                        // A statement this window wrote refills one grid. If it
+                        // lost the reservation that says which, it still must
+                        // not clear the grids the user is looking at.
+                        && !crate::ui::table_browse::is_generated_grid_statement(&sql)
                     {
                         s.clear_result_grids_for_new_query_batch(tab_id)
                     } else {
@@ -9477,7 +9512,10 @@ impl MainWindow {
                     let mut result_tabs = owning_result_tabs.clone();
                     drop(s);
                     if let Some(result_tab_id) = stranded_target {
+                        // Restores a browse tab's last page; a filtered query
+                        // tab keeps its rows and only stops reading as running.
                         result_tabs.fail_table_browse_result_by_id(result_tab_id);
+                        result_tabs.mark_statement_status_by_id(result_tab_id, ResultTabStatus::Error);
                     }
                 }
                 QueryProgress::LazyFetchClosed {
@@ -13808,6 +13846,20 @@ mod tests {
         assert!(!batch_owns_grid_target(Some(finished), Some(newer)));
         assert!(!batch_owns_grid_target(None, Some(newer)));
         assert!(!batch_owns_grid_target(Some(finished), None));
+    }
+
+    #[test]
+    fn a_generated_statement_never_clears_the_grids_it_is_refilling() {
+        let filtered = crate::ui::table_browse::marked_result_filter_sql(
+            "SELECT * FROM (\nSELECT * FROM EMP\n) sq_src\nWHERE DEPTNO = 10",
+        );
+
+        assert!(crate::ui::table_browse::is_generated_grid_statement(
+            &filtered
+        ));
+        assert!(!crate::ui::table_browse::is_generated_grid_statement(
+            "SELECT * FROM EMP"
+        ));
     }
 
     #[test]
