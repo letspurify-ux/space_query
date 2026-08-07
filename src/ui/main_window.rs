@@ -2391,7 +2391,9 @@ impl AppState {
     }
 
     fn finish_progress_context(&mut self, tab_id: QueryTabId) {
+        let mut finished_target = None;
         if let Some(context) = self.progress_contexts.remove(&tab_id) {
+            finished_target = context.execution_target;
             if let Some(token) = context.operation_token {
                 self.pending_query_cancellations.remove(&token);
             }
@@ -2401,7 +2403,18 @@ impl AppState {
                 self.orphaned_lazy_fetch_missing_since.remove(session_id);
             }
         }
-        self.result_grid_execution_targets.remove(&tab_id);
+        // Only the execution this context belongs to may retire its routing.
+        // A table page or grid-edit request registered while an older
+        // execution was still winding down (its last lazy fetch being
+        // cancelled, say) is finalized here too, and clearing by tab id alone
+        // would strand it: with no execution target the next batch clears the
+        // result grids and renders the page as a brand-new query result.
+        if batch_owns_grid_target(
+            finished_target,
+            self.result_grid_execution_targets.get(&tab_id).copied(),
+        ) {
+            self.result_grid_execution_targets.remove(&tab_id);
+        }
         self.start_pending_metadata_refresh_if_ready();
     }
 
@@ -4036,6 +4049,17 @@ fn batch_owns_grid_target(
     finished_target == registered_target
 }
 
+/// Whether a finished statement's result may be offered a `WHERE` / `ORDER BY`
+/// bar of its own.
+///
+/// A table page is this feature's own statement, not a user query. Its
+/// filtered, ordered, page-bounded shape must never become the relation a new
+/// bar filters: the page would be re-paged and the user's own query would be
+/// gone from the chain.
+fn result_can_carry_a_filter_bar(sql: &str) -> bool {
+    !sql.contains(crate::ui::table_browse::TABLE_BROWSE_MATERIALIZE_MARKER)
+}
+
 pub struct MainWindow {
     state: Arc<Mutex<AppState>>,
 }
@@ -5141,6 +5165,9 @@ impl MainWindow {
             derived_relation_sql, result_filter_support, ResultFilterSupport,
         };
 
+        if !result_can_carry_a_filter_bar(sql) {
+            return;
+        }
         if matches!(
             result_filter_support(sql, columns, db_type),
             ResultFilterSupport::Blocked(_)
@@ -13677,6 +13704,31 @@ mod tests {
         assert!(!batch_owns_grid_target(Some(finished), Some(newer)));
         assert!(!batch_owns_grid_target(None, Some(newer)));
         assert!(!batch_owns_grid_target(Some(finished), None));
+    }
+
+    #[test]
+    fn a_table_page_statement_is_not_offered_a_filter_bar_of_its_own() {
+        let page_sql = crate::ui::table_browse::build_page_sql(&TableBrowsePageRequest {
+            result_tab_id: ResultTabId::new(1),
+            target: TableBrowseTarget::new(
+                DatabaseType::MySQL,
+                Some("APP".to_string()),
+                "Result".to_string(),
+                "(SELECT * FROM `APP`.`EMP`) sq_src".to_string(),
+                String::new(),
+            ),
+            clauses: crate::ui::table_browse::TableBrowseClauses::new(
+                "DEPTNO = 20".to_string(),
+                "EMPNO".to_string(),
+            ),
+            offset: 0,
+            page_size: 100,
+            navigation: TableBrowseNavigation::Page,
+        })
+        .unwrap();
+
+        assert!(!result_can_carry_a_filter_bar(&page_sql));
+        assert!(result_can_carry_a_filter_bar("SELECT * FROM emp"));
     }
 
     #[test]
