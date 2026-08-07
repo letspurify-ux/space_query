@@ -4108,6 +4108,21 @@ fn batch_owns_grid_target(
     finished_target == registered_target
 }
 
+/// Whether the statement a batch is starting is the one a reservation was made
+/// for.
+///
+/// The text makes the round trip through statement splitting before it reaches
+/// the worker, which trims it and drops a trailing terminator, so the two
+/// spellings are compared with that much slack — and no more, since the point
+/// is to tell two statements apart.
+fn batch_runs_reserved_statement(reserved: &str, batch: &str) -> bool {
+    normalized_statement_text(reserved) == normalized_statement_text(batch)
+}
+
+fn normalized_statement_text(sql: &str) -> &str {
+    sql.trim().trim_end_matches(';').trim()
+}
+
 /// Whether a finishing batch owns the routing currently registered for its
 /// query tab.
 ///
@@ -8990,6 +9005,7 @@ impl MainWindow {
                     activity,
                     total_units,
                     status_activity,
+                    sql,
                 } => {
                     let execution_origin = s
                         .editor_tabs
@@ -8999,7 +9015,21 @@ impl MainWindow {
                     owning_result_tabs.set_execution_origin(execution_origin);
                     s.refresh_tab_label(tab_id);
                     let one_tab_per_query = s.result_one_tab_per_query_check.value();
-                    let grid_execution = s.result_grid_execution_targets.get(&tab_id).cloned();
+                    // A reservation belongs to the statement that made it. An
+                    // execution the user started while that statement was still
+                    // waiting for a lazy fetch to be cancelled must not take
+                    // its result tab — the reserved statement is still coming,
+                    // and it would then have nowhere of its own to land.
+                    let grid_execution = s
+                        .result_grid_execution_targets
+                        .get(&tab_id)
+                        .filter(|execution| {
+                            execution
+                                .sql
+                                .as_deref()
+                                .is_none_or(|reserved| batch_runs_reserved_statement(reserved, &sql))
+                        })
+                        .cloned();
                     let grid_execution_target = grid_execution
                         .as_ref()
                         .map(|execution| execution.result_tab_id);
@@ -13778,6 +13808,59 @@ mod tests {
         assert!(!batch_owns_grid_target(Some(finished), Some(newer)));
         assert!(!batch_owns_grid_target(None, Some(newer)));
         assert!(!batch_owns_grid_target(Some(finished), None));
+    }
+
+    #[test]
+    fn a_batch_adopts_a_reservation_only_for_the_statement_it_was_made_for() {
+        let reserved = "SELECT /* SQ_INTERNAL_RESULT_FILTER */ *\nFROM (\nSELECT * FROM EMP\n) sq_src\nWHERE DEPTNO = 10";
+
+        assert!(batch_runs_reserved_statement(reserved, reserved));
+        // What statement splitting hands the worker: trimmed, terminator gone.
+        assert!(batch_runs_reserved_statement(
+            reserved,
+            &format!("  {reserved} ;  ")
+        ));
+        // A query the user started while the reserved one was still queued.
+        assert!(!batch_runs_reserved_statement(
+            reserved,
+            "SELECT * FROM DEPT"
+        ));
+        assert!(!batch_runs_reserved_statement(
+            reserved,
+            "SELECT * FROM EMP"
+        ));
+    }
+
+    /// The reserved text only identifies its execution if statement splitting —
+    /// which every execution path runs first — hands the worker the same
+    /// statement back.
+    #[test]
+    fn splitting_a_filtered_re_query_returns_the_statement_it_was_given() {
+        let target = TableBrowseTarget::new(
+            DatabaseType::Oracle,
+            Some("SCOTT".to_string()),
+            "Result".to_string(),
+            "(\nSELECT * FROM EMP\n) sq_src".to_string(),
+            String::new(),
+        );
+        let mut request = TableBrowsePageRequest::first(ResultTabId::new(1), target);
+        request.clauses = crate::ui::table_browse::TableBrowseClauses::new(
+            "DEPTNO = 10".to_string(),
+            "ENAME DESC".to_string(),
+        );
+        let reserved = crate::ui::table_browse::marked_result_filter_sql(
+            &request.logical_sql().expect("logical sql"),
+        );
+
+        let items = crate::ui::sql_editor::query_text::split_script_items_for_db_type(
+            &reserved,
+            Some(DatabaseType::Oracle),
+        );
+        assert_eq!(items.len(), 1);
+        let crate::db::ScriptItem::Statement(statement) = &items[0] else {
+            panic!("a filtered re-query must split into one statement");
+        };
+        assert!(batch_runs_reserved_statement(&reserved, statement));
     }
 
     #[test]

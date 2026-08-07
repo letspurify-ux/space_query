@@ -369,10 +369,12 @@ impl QueryProgressSender {
                 activity,
                 total_units,
                 status_activity,
+                sql,
             } => QueryProgress::BatchStart {
                 activity,
                 total_units,
                 status_activity: status_activity.or_else(|| self.status_activity.clone()),
+                sql,
             },
             progress => progress,
         };
@@ -451,6 +453,10 @@ pub enum QueryProgress {
         activity: String,
         total_units: Option<usize>,
         status_activity: Option<crate::db::DbActivityGuard>,
+        /// The text this batch was handed, so a caller that reserved a result
+        /// tab for a statement of its own can tell whether this is that
+        /// statement starting or somebody else's.
+        sql: String,
     },
     StatementStart {
         index: usize,
@@ -6281,6 +6287,7 @@ mod execution_state_tests {
                 activity: "Executing SQL".to_string(),
                 total_units: None,
                 status_activity: None,
+                sql: "SELECT 1".to_string(),
             })
             .expect("batch start");
         sender

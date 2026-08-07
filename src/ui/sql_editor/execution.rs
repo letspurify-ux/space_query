@@ -896,6 +896,7 @@ impl ExecutionWorkerBackend for OracleExecutionWorkerBackend {
                             activity: db_activity.to_string(),
                             total_units: None,
                             status_activity: None,
+                            sql: sql_to_execute.clone(),
                         });
                         SqlEditorWidget::emit_statement_start(
                             sender,
@@ -6803,6 +6804,7 @@ impl SqlEditorWidget {
             activity: db_activity.to_string(),
             total_units: Some(1),
             status_activity: None,
+            sql: marker_sql.to_string(),
         });
         Self::emit_statement_start(sender, 0, ResultTabPolicy::Defer);
         let started = Instant::now();
@@ -6909,6 +6911,7 @@ impl SqlEditorWidget {
             activity: db_activity.to_string(),
             total_units: Self::determinate_batch_total(&items),
             status_activity: None,
+            sql: sql_text.to_string(),
         });
         app::awake();
 
@@ -9042,6 +9045,7 @@ impl SqlEditorWidget {
                         activity: db_activity.clone(),
                         total_units: None,
                         status_activity: None,
+                        sql: sql_text.clone(),
                     });
                     SqlEditorWidget::emit_execution_startup_error(
                         &sender,
@@ -9241,6 +9245,7 @@ impl SqlEditorWidget {
                     activity: db_activity.clone(),
                     total_units: Self::determinate_batch_total(&items),
                     status_activity: None,
+                    sql: sql_text.clone(),
                 });
                 app::awake();
 
@@ -16066,6 +16071,7 @@ impl SqlEditorWidget {
             activity: db_activity.to_string(),
             total_units: Self::determinate_batch_total(&items),
             status_activity: None,
+            sql: sql_text.to_string(),
         });
         app::awake();
 
