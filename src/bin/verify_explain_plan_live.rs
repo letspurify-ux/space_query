@@ -171,6 +171,20 @@ impl Target {
         }
     }
 
+    /// Keep a blocked DROP from hanging the probe.
+    ///
+    /// The object browser loads several metadata categories in parallel, and a
+    /// job still in flight can hold a lock on the very objects the teardown
+    /// drops. Bounding the wait turns that into an ignorable error; the next
+    /// run's opening teardown clears whatever survived.
+    fn lock_timeout_sql(self) -> &'static str {
+        if self.is_oracle() {
+            "ALTER SESSION SET ddl_lock_timeout = 5"
+        } else {
+            "SET SESSION lock_wait_timeout = 5"
+        }
+    }
+
     fn teardown_sql(self) -> Vec<String> {
         if self.is_oracle() {
             vec![
@@ -429,6 +443,7 @@ fn verify(target: Target) -> Result<(), String> {
         done,
     };
 
+    let _ = h.run(target.lock_timeout_sql());
     for sql in target.teardown_sql() {
         let _ = h.run(&sql);
     }
@@ -515,6 +530,18 @@ fn verify(target: Target) -> Result<(), String> {
         }
     }
 
+    // A statement typed with its terminator is the normal case in the editor,
+    // and Oracle rejects `EXPLAIN PLAN FOR ... ;` outright. MySQL normalizes it
+    // away; Oracle has to too.
+    let terminated = format!("{};", target.explain_target_sql());
+    let terminated_plan = h
+        .explain(&terminated)
+        .map_err(|e| format!("explain of a statement ending in a semicolon: {e}"))?;
+    if terminated_plan.rows.is_empty() {
+        return Err("a statement ending in a semicolon produced no plan".to_string());
+    }
+    println!("a trailing semicolon still explains");
+
     // The same structural checks, on a plan whose parent links are known —
     // this is what proves the drawing, not just that a plan came back.
     let sample = vec![
@@ -558,6 +585,7 @@ fn verify(target: Target) -> Result<(), String> {
     // scope first keeps the DROPs from waiting on a lock the probe itself holds.
     verify_object_declarations(target, Arc::clone(&shared))?;
 
+    let _ = h.run(target.lock_timeout_sql());
     for sql in target.teardown_sql() {
         let _ = h.run(&sql);
     }

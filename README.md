@@ -211,8 +211,9 @@ what the tree would open for the same name — schema-qualified names and packag
 members included.
 
 `Ctrl+Shift+N` searches the objects of the current scope by name. Exact matches
-come first, then prefixes, then anything containing the text; `Enter` opens the
-highlighted object's source. The list is built from the metadata the object
+come first, then prefixes, then anything containing the text. The arrow keys
+move through the results while the caret stays in the search box, and `Enter`
+opens the highlighted object's source. The list is built from the metadata the object
 browser has already loaded, so it answers without a round trip and never shows
 something the tree does not.
 

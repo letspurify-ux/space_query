@@ -55,8 +55,25 @@ impl ObjectSearchHit {
     }
 
     /// One row of the results list.
+    ///
+    /// Object names are data, not markup, but FLTK's browser reads a leading
+    /// `@` in a field as a format code — a quoted identifier like `"@RATE"`
+    /// would lose its name. Doubling it is FLTK's own escape.
     pub fn browser_line(&self) -> String {
-        format!("{}\t{}", self.display_name, self.kind_label)
+        format!(
+            "{}\t{}",
+            escape_browser_field(&self.display_name),
+            escape_browser_field(&self.kind_label)
+        )
+    }
+}
+
+/// FLTK only parses format codes at the start of a field, so only a leading
+/// `@` needs doubling; escaping every one would show the extra characters.
+fn escape_browser_field(value: &str) -> String {
+    match value.strip_prefix('@') {
+        Some(rest) => format!("@@{rest}"),
+        None => value.to_string(),
     }
 }
 
@@ -374,6 +391,28 @@ mod tests {
     fn a_browser_line_is_name_then_kind() {
         let hit = search(&cache(), "orders", 1).remove(0);
         assert_eq!(hit.browser_line(), "ORDERS\tTable");
+    }
+
+    #[test]
+    fn a_name_starting_with_the_format_character_is_escaped() {
+        let hit = ObjectSearchHit {
+            category: "TABLES".to_string(),
+            display_name: "@RATE".to_string(),
+            kind_label: "Table".to_string(),
+        };
+        assert_eq!(hit.browser_line(), "@@RATE\tTable");
+    }
+
+    #[test]
+    fn a_format_character_inside_a_name_is_left_alone() {
+        // FLTK stops parsing at the first non-format character, so an interior
+        // `@` is already literal — doubling it would show two.
+        let hit = ObjectSearchHit {
+            category: "TABLES".to_string(),
+            display_name: "DB@LINK".to_string(),
+            kind_label: "Table".to_string(),
+        };
+        assert_eq!(hit.browser_line(), "DB@LINK\tTable");
     }
 
     #[test]

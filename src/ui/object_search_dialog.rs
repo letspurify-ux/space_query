@@ -64,6 +64,8 @@ pub fn show(cache: &ObjectCache, scope: Option<&str>) -> Option<ObjectSearchHit>
     // Name column, then kind. `browser_line` writes the same two fields, and
     // FLTK gives the last column whatever width is left.
     browser.set_column_widths(&[300]);
+    // `browser_line` escapes what FLTK would read as a format code; the format
+    // character itself cannot be turned off through this binding.
     browser.set_column_char('\t');
     theme::style_browser_scrollbars(&browser);
 
@@ -96,11 +98,14 @@ pub fn show(cache: &ObjectCache, scope: Option<&str>) -> Option<ObjectSearchHit>
     let hits: Arc<Mutex<Vec<ObjectSearchHit>>> = Arc::new(Mutex::new(Vec::new()));
     let result: Arc<Mutex<Option<ObjectSearchHit>>> = Arc::new(Mutex::new(None));
 
+    // Shared, not cloned: a scope with tens of thousands of objects would
+    // otherwise be copied once per closure.
+    let cache = Arc::new(cache.clone());
     let repopulate = {
         let hits = hits.clone();
         let cache = cache.clone();
         move |browser: &mut HoldBrowser, status: &mut Frame, query: &str| {
-            let found = search(&cache, query, MAX_OBJECT_SEARCH_HITS);
+            let found = search(cache.as_ref(), query, MAX_OBJECT_SEARCH_HITS);
             browser.clear();
             for hit in &found {
                 browser.add(&hit.browser_line());
@@ -183,16 +188,22 @@ pub fn show(cache: &ObjectCache, scope: Option<&str>) -> Option<ObjectSearchHit>
         });
     }
 
-    // Enter opens the highlighted row and the arrow keys move through the list
-    // while the caret stays in the search box — the whole point of the dialog is
-    // that the hands never leave the keyboard.
+    // The arrows have to be caught on the input itself. `Fl_Input` ignores Up
+    // and Down, and FLTK then offers the key to each parent in turn — where
+    // `Fl_Group::handle` reads it as focus navigation and moves focus into the
+    // list. A handler on the window would never see them. Claiming the key here
+    // is what keeps the caret in the search box while the selection moves.
     {
         let mut accept = accept.clone();
         let mut browser_for_keys = browser.clone();
-        dialog.handle(move |window, event| match event {
-            Event::KeyDown => match app::event_key() {
+        let mut dialog_for_keys = dialog.clone();
+        search_input.handle(move |_, event| {
+            if event != Event::KeyDown {
+                return false;
+            }
+            match app::event_key() {
                 Key::Escape => {
-                    window.hide();
+                    dialog_for_keys.hide();
                     app::awake();
                     true
                 }
@@ -206,6 +217,27 @@ pub fn show(cache: &ObjectCache, scope: Option<&str>) -> Option<ObjectSearchHit>
                 }
                 Key::Up => {
                     move_selection(&mut browser_for_keys, -1);
+                    true
+                }
+                _ => false,
+            }
+        });
+    }
+
+    // The same keys once focus has moved off the search box — onto the list or a
+    // button. Those widgets handle the arrows themselves, so only Enter and
+    // Escape are worth claiming here.
+    {
+        let mut accept = accept.clone();
+        dialog.handle(move |window, event| match event {
+            Event::KeyDown => match app::event_key() {
+                Key::Escape => {
+                    window.hide();
+                    app::awake();
+                    true
+                }
+                Key::Enter | Key::KPEnter => {
+                    accept();
                     true
                 }
                 _ => false,
@@ -246,6 +278,11 @@ fn move_selection(browser: &mut HoldBrowser, delta: i32) {
     }
     let next = (browser.value() + delta).clamp(1, size);
     browser.select(next);
+    // Selecting does not scroll, so arrowing past the last visible row would
+    // leave the highlight off screen. Only scroll when it actually left.
+    if !browser.displayed(next) {
+        browser.make_visible(next);
+    }
     browser.redraw();
 }
 

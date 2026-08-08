@@ -119,7 +119,12 @@ fn flat_grid(columns: &[String], rows: &[Vec<String>]) -> (Vec<String>, Vec<Vec<
         .zip(values)
         .map(|(row, value)| {
             let mut row = row.clone();
-            row.push(share_cell(value.unwrap_or(0), total));
+            // A row estimate the server did not give is left blank rather than
+            // drawn as 0%, which would read as "this step returns nothing".
+            row.push(match value {
+                Some(value) => share_cell(value, total),
+                None => String::new(),
+            });
             row
         })
         .collect();
@@ -187,9 +192,14 @@ fn connector_prefixes(nodes: &[PlanNode]) -> Vec<String> {
         });
 
         // Walk up the ancestors, prepending a trunk for each one that is itself
-        // followed by a sibling.
+        // followed by a sibling. The step count is bounded by the number of
+        // rows: the ids come from the server, and a row that claims itself (or
+        // an ancestor) as its parent would otherwise spin here forever.
         let mut current_id = parent_id;
-        while let Some(current_index) = nodes.iter().position(|other| other.id == current_id) {
+        for _ in 0..nodes.len() {
+            let Some(current_index) = nodes.iter().position(|other| other.id == current_id) else {
+                break;
+            };
             let Some(grandparent_id) = nodes[current_index].parent_id else {
                 break;
             };
@@ -388,6 +398,22 @@ mod tests {
     }
 
     #[test]
+    fn a_step_that_claims_itself_as_its_parent_does_not_spin() {
+        let nodes = vec![node(0, Some(0), "SELF PARENT", Some(1))];
+        // The point of the assertion is that this returns at all.
+        assert_eq!(operations(&nodes).len(), 1);
+    }
+
+    #[test]
+    fn a_cycle_between_two_steps_does_not_spin() {
+        let nodes = vec![
+            node(0, Some(1), "A", Some(1)),
+            node(1, Some(0), "B", Some(1)),
+        ];
+        assert_eq!(operations(&nodes).len(), 2);
+    }
+
+    #[test]
     fn an_empty_plan_produces_headers_but_no_rows() {
         let (columns, rows) = tree_grid(&[]);
         assert_eq!(columns.len(), 7);
@@ -523,6 +549,17 @@ mod tests {
         assert_eq!(columns, vec!["rows".to_string(), "Rows %".to_string()]);
         assert!(rows[0][1].ends_with(" 75%"), "{}", rows[0][1]);
         assert!(rows[1][1].ends_with(" 25%"), "{}", rows[1][1]);
+    }
+
+    #[test]
+    fn a_flat_row_with_no_estimate_gets_a_blank_share_not_a_zero() {
+        let data = ExplainPlanData::Flat {
+            columns: vec!["rows".to_string()],
+            rows: vec![vec!["300".to_string()], vec!["NULL".to_string()]],
+        };
+        let (_, rows) = plan_grid(&data);
+        assert!(rows[0][1].ends_with(" 100%"), "{}", rows[0][1]);
+        assert_eq!(rows[1][1], "");
     }
 
     #[test]

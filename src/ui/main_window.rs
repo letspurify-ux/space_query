@@ -13949,6 +13949,16 @@ impl MainWindow {
         editor.count_lines(0, buffer.length(), true)
     }
 
+    /// Whole editor buffer text.
+    #[doc(hidden)]
+    pub fn capture_tour_editor_text(&mut self) -> String {
+        let state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        state.sql_buffer.text()
+    }
+
     /// One-based line number of the editor caret.
     #[doc(hidden)]
     pub fn capture_tour_editor_caret_line(&mut self) -> usize {

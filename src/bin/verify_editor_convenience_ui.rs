@@ -160,6 +160,115 @@ fn drive_modal(label: &'static str) {
     dialog.hide();
 }
 
+#[cfg(target_os = "macos")]
+fn type_then_press_keys(label: &'static str) {
+    let Some(dialog) = window_by_label(label) else {
+        let mut plan = plan()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        plan.attempts += 1;
+        if plan.attempts > 60 {
+            return;
+        }
+        drop(plan);
+        app::add_timeout3(0.05, move |_| type_then_press_keys(label));
+        return;
+    };
+    let Some(group) = dialog.as_group() else {
+        return;
+    };
+    let mut widgets = Vec::new();
+    collect_widgets(&group, &mut widgets);
+    for widget in &widgets {
+        if let Some(mut input) = Input::from_dyn_widget(widget) {
+            input.set_value("order_");
+            input.do_callback();
+            let _ = input.take_focus();
+            break;
+        }
+    }
+    pump(200);
+
+    // First prove the posted keys arrive at all: a letter must land in the
+    // focused input. Without this, a silent Down/Enter is ambiguous.
+    real_keys::press(real_keys::LETTER_O);
+    let typed = input_value(label);
+    KEY_REPORT
+        .get_or_init(|| Mutex::new(Vec::new()))
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .push(format!("a posted letter made the input read {typed:?}"));
+    if let Some(mut input) = first_input(label) {
+        input.set_value("order_");
+        input.do_callback();
+    }
+    pump(150);
+
+    let selection_before = browser_selection(label);
+    real_keys::press(real_keys::DOWN_ARROW);
+    let selection_after = browser_selection(label);
+    KEY_REPORT
+        .get_or_init(|| Mutex::new(Vec::new()))
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .push(format!(
+            "Down moved the selection from {selection_before} to {selection_after}"
+        ));
+
+    real_keys::press(real_keys::RETURN);
+    pump(400);
+    plan()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .driven = true;
+
+    // If Enter did not close the dialog, say so and close it, rather than
+    // leaving the probe spinning in the modal loop forever.
+    if let Some(mut still_open) = window_by_label(label) {
+        KEY_REPORT
+            .get_or_init(|| Mutex::new(Vec::new()))
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .push("Enter did NOT close the dialog".to_string());
+        still_open.hide();
+        app::awake();
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn first_input(label: &str) -> Option<Input> {
+    let dialog = window_by_label(label)?;
+    let group = dialog.as_group()?;
+    let mut widgets = Vec::new();
+    collect_widgets(&group, &mut widgets);
+    widgets.iter().find_map(Input::from_dyn_widget)
+}
+
+#[cfg(target_os = "macos")]
+fn input_value(label: &str) -> String {
+    first_input(label)
+        .map(|input| input.value())
+        .unwrap_or_default()
+}
+
+#[cfg(target_os = "macos")]
+fn browser_selection(label: &str) -> i32 {
+    let Some(dialog) = window_by_label(label) else {
+        return -1;
+    };
+    let Some(group) = dialog.as_group() else {
+        return -1;
+    };
+    let mut widgets = Vec::new();
+    collect_widgets(&group, &mut widgets);
+    for widget in &widgets {
+        if let Some(browser) = HoldBrowser::from_dyn_widget(widget) {
+            return browser.value();
+        }
+    }
+    -1
+}
+
 fn collect_widgets(group: &Group, out: &mut Vec<fltk::widget::Widget>) {
     for child in group.clone().into_iter() {
         if let Some(child_group) = child.as_group() {
@@ -178,6 +287,60 @@ fn window_by_label(label: &str) -> Option<Window> {
         }
     }
     None
+}
+
+/// Real key presses, posted to this process so the dialog's own handlers see
+/// them exactly as they would from a user. Clicking a button proves the button;
+/// only this proves the keyboard.
+#[cfg(target_os = "macos")]
+mod real_keys {
+    use std::ffi::c_void;
+    use std::os::raw::c_int;
+
+    type CGEventRef = *mut c_void;
+    type CGEventSourceRef = *mut c_void;
+
+    const KEY_DOWN: bool = true;
+    const KEY_UP: bool = false;
+
+    pub const DOWN_ARROW: u16 = 125;
+    pub const RETURN: u16 = 36;
+    /// The `o` key, used only to prove that posted keys reach this process.
+    pub const LETTER_O: u16 = 31;
+
+    #[link(name = "CoreGraphics", kind = "framework")]
+    unsafe extern "C" {
+        fn CGEventCreateKeyboardEvent(
+            source: CGEventSourceRef,
+            keycode: u16,
+            keydown: bool,
+        ) -> CGEventRef;
+        fn CGEventPostToPid(pid: c_int, event: CGEventRef);
+    }
+
+    #[link(name = "CoreFoundation", kind = "framework")]
+    unsafe extern "C" {
+        fn CFRelease(cf: *const c_void);
+    }
+
+    fn post(code: u16, down: bool) {
+        // SAFETY: a null source requests CoreGraphics' default source, and the
+        // event is released exactly once after being posted.
+        unsafe {
+            let event = CGEventCreateKeyboardEvent(std::ptr::null_mut(), code, down);
+            if event.is_null() {
+                return;
+            }
+            CGEventPostToPid(std::process::id() as c_int, event);
+            CFRelease(event as *const c_void);
+        }
+        super::pump(150);
+    }
+
+    pub fn press(code: u16) {
+        post(code, KEY_DOWN);
+        post(code, KEY_UP);
+    }
 }
 
 fn pump(milliseconds: u64) {
@@ -364,6 +527,33 @@ fn main() {
         &format!("a line past the end clamps to the last line ({clamped})"),
     );
 
+    // Multi-byte text: the buffer offsets FLTK uses and the ones the highlight
+    // shadow uses have to agree, or Go to Line lands on the wrong line the
+    // moment a document is not pure ASCII.
+    let korean: String = (1..=8)
+        .map(|line| format!("-- 한국어 주석 {line}번째 줄\n"))
+        .collect::<String>();
+    main_window.capture_tour_set_sql(&korean, Some(0));
+    pump(300);
+    arm_modal("6", "OK");
+    app::add_timeout3(0.20, |_| drive_modal("Input"));
+    let _ = fire_menu(GO_TO_LINE_MENU, None);
+    pump(600);
+    let multibyte_line = main_window.capture_tour_editor_caret_line();
+    check(
+        &mut failures,
+        multibyte_line == 6,
+        &format!("Go to Line 6 in a multi-byte document lands on line {multibyte_line}"),
+    );
+
+    main_window.capture_tour_set_sql(&numbered, Some(0));
+    pump(300);
+    arm_modal("999", "OK");
+    app::add_timeout3(0.20, |_| drive_modal("Input"));
+    let _ = fire_menu(GO_TO_LINE_MENU, None);
+    pump(600);
+    let clamped = main_window.capture_tour_editor_caret_line();
+
     // Cancel must not move the caret.
     arm_modal("2", "Cancel");
     app::add_timeout3(0.20, |_| drive_modal("Input"));
@@ -432,6 +622,50 @@ fn main() {
         "Cancel returns nothing and opens nothing",
     );
 
+    // Can posted keys reach this process at all? If the app is not the active
+    // one, macOS has no key window to route them to, and a silent Down/Enter
+    // below would prove nothing. Establish delivery against the main editor
+    // first, and skip the keyboard section rather than lie about it.
+    #[cfg(target_os = "macos")]
+    let keys_are_delivered = {
+        main_window.capture_tour_set_sql("SELECT", None);
+        pump(300);
+        real_keys::press(real_keys::LETTER_O);
+        pump(200);
+        let landed = main_window.capture_tour_editor_text().contains("SELECTo");
+        say(&format!(
+            "  keyboard delivery probe: a posted letter {} reach the editor",
+            if landed { "did" } else { "did NOT" }
+        ));
+        landed
+    };
+
+    // The keyboard path: type, press Down once, press Enter. Nothing is clicked.
+    #[cfg(target_os = "macos")]
+    if keys_are_delivered {
+        app::add_timeout3(0.25, |_| type_then_press_keys("Go to Object — SCOTT"));
+        let by_keyboard = object_search_dialog::show(&cache, Some("SCOTT"));
+        pump(200);
+        for line in KEY_REPORT
+            .get_or_init(|| Mutex::new(Vec::new()))
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .iter()
+        {
+            say(&format!("  keyboard: {line}"));
+        }
+        check(
+            &mut failures,
+            by_keyboard
+                .as_ref()
+                .is_some_and(|hit| hit.display_name == "ORDER_ITEMS"),
+            &format!(
+                "Down then Enter opens the second match: {:?}",
+                by_keyboard.as_ref().map(|hit| hit.display_name.clone())
+            ),
+        );
+    }
+
     println!();
     if failures.is_empty() {
         say("ALL CHECKS PASSED");
@@ -445,3 +679,5 @@ fn main() {
 }
 
 static LISTED: OnceLock<Mutex<Vec<String>>> = OnceLock::new();
+#[cfg(target_os = "macos")]
+static KEY_REPORT: OnceLock<Mutex<Vec<String>>> = OnceLock::new();
