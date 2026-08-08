@@ -7,6 +7,7 @@
 //! reports. Nothing here guesses structure from indentation.
 
 use crate::utils::arithmetic::safe_div;
+use std::collections::{HashMap, HashSet};
 
 /// One step of an Oracle plan, straight out of `PLAN_TABLE`.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -68,20 +69,28 @@ fn tree_grid(nodes: &[PlanNode]) -> (Vec<String>, Vec<Vec<String>>) {
         "Predicates".to_string(),
     ];
 
-    let prefixes = connector_prefixes(nodes);
+    let index_of = index_by_id(nodes);
+    let last_child = last_child_flags(nodes);
+    let prefixes = connector_prefixes(nodes, &index_of, &last_child);
+    let children_cost = children_cost_by_parent(nodes);
     let total_cost = root_cost(nodes);
     let rows = nodes
         .iter()
         .enumerate()
         .map(|(index, node)| {
             let prefix = prefixes.get(index).cloned().unwrap_or_default();
+            let own_cost = node
+                .cost
+                .unwrap_or(0)
+                .saturating_sub(children_cost.get(&node.id).copied().unwrap_or(0))
+                .max(0);
             vec![
                 format!("{prefix}{}", node.operation),
                 node.object_name.clone(),
                 format_count(node.cardinality),
                 format_count(node.bytes),
                 format_count(node.cost),
-                share_cell(self_cost(nodes, node), total_cost),
+                share_cell(own_cost, total_cost),
                 node.predicates.clone(),
             ]
         })
@@ -131,18 +140,45 @@ fn flat_grid(columns: &[String], rows: &[Vec<String>]) -> (Vec<String>, Vec<Vec<
     (columns, rows)
 }
 
-/// Cost this step spends on itself: what it reports minus what its children
-/// already accounted for. Oracle's `COST` is cumulative, so without this
-/// subtraction every ancestor would look as expensive as the whole plan.
-fn self_cost(nodes: &[PlanNode], node: &PlanNode) -> i64 {
-    let own = node.cost.unwrap_or(0);
-    let children = nodes
-        .iter()
-        .filter(|candidate| candidate.parent_id == Some(node.id))
-        .fold(0i64, |total, child| {
-            total.saturating_add(child.cost.unwrap_or(0))
-        });
-    own.saturating_sub(children).max(0)
+/// Total reported cost of each step's direct children.
+///
+/// Subtracting this from a step's own cost is what turns Oracle's cumulative
+/// `COST` into the cost a step spends on itself — otherwise every ancestor
+/// looks as expensive as the whole plan simply for containing it.
+fn children_cost_by_parent(nodes: &[PlanNode]) -> HashMap<i64, i64> {
+    let mut totals: HashMap<i64, i64> = HashMap::with_capacity(nodes.len());
+    for node in nodes {
+        let Some(parent_id) = node.parent_id else {
+            continue;
+        };
+        let total = totals.entry(parent_id).or_insert(0);
+        *total = total.saturating_add(node.cost.unwrap_or(0));
+    }
+    totals
+}
+
+/// Row index of each step id. Plans can run to thousands of steps, and this is
+/// what keeps the walk below from rescanning the list for every ancestor.
+fn index_by_id(nodes: &[PlanNode]) -> HashMap<i64, usize> {
+    let mut index_of: HashMap<i64, usize> = HashMap::with_capacity(nodes.len());
+    for (index, node) in nodes.iter().enumerate() {
+        index_of.entry(node.id).or_insert(index);
+    }
+    index_of
+}
+
+/// Whether each step is the last of its parent's children, in display order.
+/// One reverse pass: the first time a parent is seen from the end, that row is
+/// its last child.
+fn last_child_flags(nodes: &[PlanNode]) -> Vec<bool> {
+    let mut flags = vec![false; nodes.len()];
+    let mut seen: HashSet<i64> = HashSet::with_capacity(nodes.len());
+    for (index, node) in nodes.iter().enumerate().rev() {
+        if let Some(parent_id) = node.parent_id {
+            flags[index] = seen.insert(parent_id);
+        }
+    }
+    flags
 }
 
 fn root_cost(nodes: &[PlanNode]) -> i64 {
@@ -177,15 +213,19 @@ fn share_cell(value: i64, total: i64) -> String {
 /// Rows arrive in the database's own display order, so the prefix only has to
 /// describe the parent chain: a vertical bar for every ancestor that still has
 /// a following sibling, then a corner for this row.
-fn connector_prefixes(nodes: &[PlanNode]) -> Vec<String> {
+fn connector_prefixes(
+    nodes: &[PlanNode],
+    index_of: &HashMap<i64, usize>,
+    last_child: &[bool],
+) -> Vec<String> {
     let mut prefixes = Vec::with_capacity(nodes.len());
     for (index, node) in nodes.iter().enumerate() {
-        let Some(parent_id) = node.parent_id else {
+        if node.parent_id.is_none() {
             prefixes.push(String::new());
             continue;
-        };
+        }
         let mut segments: Vec<&'static str> = Vec::new();
-        segments.push(if is_last_child(nodes, index, parent_id) {
+        segments.push(if last_child.get(index).copied().unwrap_or(true) {
             "\u{2514}\u{2500} "
         } else {
             "\u{251c}\u{2500} "
@@ -195,34 +235,34 @@ fn connector_prefixes(nodes: &[PlanNode]) -> Vec<String> {
         // followed by a sibling. The step count is bounded by the number of
         // rows: the ids come from the server, and a row that claims itself (or
         // an ancestor) as its parent would otherwise spin here forever.
-        let mut current_id = parent_id;
+        let mut current_index = index;
         for _ in 0..nodes.len() {
-            let Some(current_index) = nodes.iter().position(|other| other.id == current_id) else {
+            let Some(parent_index) = nodes
+                .get(current_index)
+                .and_then(|step| step.parent_id)
+                .and_then(|parent_id| index_of.get(&parent_id).copied())
+            else {
                 break;
             };
-            let Some(grandparent_id) = nodes[current_index].parent_id else {
+            if nodes
+                .get(parent_index)
+                .and_then(|step| step.parent_id)
+                .is_none()
+            {
                 break;
-            };
-            segments.push(if is_last_child(nodes, current_index, grandparent_id) {
+            }
+            segments.push(if last_child.get(parent_index).copied().unwrap_or(true) {
                 "   "
             } else {
                 "\u{2502}  "
             });
-            current_id = grandparent_id;
+            current_index = parent_index;
         }
 
         segments.reverse();
         prefixes.push(segments.concat());
     }
     prefixes
-}
-
-/// Is the row at `index` the last child of `parent_id` in display order?
-fn is_last_child(nodes: &[PlanNode], index: usize, parent_id: i64) -> bool {
-    !nodes
-        .iter()
-        .skip(index + 1)
-        .any(|other| other.parent_id == Some(parent_id))
 }
 
 fn format_count(value: Option<i64>) -> String {
@@ -411,6 +451,35 @@ mod tests {
             node(1, Some(0), "B", Some(1)),
         ];
         assert_eq!(operations(&nodes).len(), 2);
+    }
+
+    #[test]
+    fn a_large_plan_renders_quickly_enough_for_the_ui_thread() {
+        // A wide, deep plan: 200 levels of nesting, 10 siblings at each.
+        let mut nodes = vec![node(0, None, "SELECT STATEMENT", Some(100_000))];
+        let mut next_id = 1i64;
+        let mut parent = 0i64;
+        for _ in 0..200 {
+            let mut first = None;
+            for _ in 0..10 {
+                nodes.push(node(next_id, Some(parent), "TABLE ACCESS FULL", Some(10)));
+                if first.is_none() {
+                    first = Some(next_id);
+                }
+                next_id += 1;
+            }
+            parent = first.unwrap_or(parent);
+        }
+        let started = std::time::Instant::now();
+        let (_, rows) = tree_grid(&nodes);
+        let elapsed = started.elapsed();
+        assert_eq!(rows.len(), nodes.len());
+        println!("{} steps rendered in {elapsed:?}", nodes.len());
+        assert!(
+            elapsed < std::time::Duration::from_secs(2),
+            "rendering {} steps took {elapsed:?}",
+            nodes.len()
+        );
     }
 
     #[test]

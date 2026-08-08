@@ -10872,14 +10872,14 @@ impl MainWindow {
         if opened {
             return;
         }
-        let message = match candidates.first() {
-            Some(name) => format!("No object named {name} in this scope"),
-            None => "Put the cursor on an object name first".to_string(),
-        };
-        state
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .set_status_message(&message);
+        // An alert, not a status message: `set_status_message` renders the
+        // status bar from live state and drops the text, so anything said there
+        // is said to nobody. Quick Describe and Explain Plan report a miss the
+        // same way.
+        crate::ui::alert_on_main(&match candidates.first() {
+            Some(name) => format!("No object named {name} in this scope."),
+            None => "Put the cursor on an object name first.".to_string(),
+        });
     }
 
     fn open_object_search(state: &Arc<Mutex<AppState>>) {
@@ -10890,10 +10890,7 @@ impl MainWindow {
             s.object_browser.clone()
         };
         let Some((cache, scope)) = object_browser.object_cache_snapshot() else {
-            state
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .set_status_message("Connect first to search for objects");
+            crate::ui::alert_on_main("Connect to a database first to search its objects.");
             return;
         };
         // The dialog runs a modal loop of its own, so the app state lock is
@@ -10903,10 +10900,7 @@ impl MainWindow {
         };
         let item = hit.to_object_item();
         if !object_browser.open_declaration_for_object_item(&item, scope) {
-            state
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .set_status_message(&format!("{} has no source to open", hit.display_name));
+            crate::ui::alert_on_main(&format!("{} has no source to open.", hit.display_name));
         }
     }
 
@@ -11816,12 +11810,9 @@ impl MainWindow {
                     config.editor_soft_wrap = enabled;
                     let _ = config.save();
                 }
+                // No message: the menu item's check mark is the feedback, and
+                // `set_status_message` would drop the text anyway.
                 Self::apply_soft_wrap_setting(&mut s, enabled);
-                s.set_status_message(if enabled {
-                    "Soft wrap enabled"
-                } else {
-                    "Soft wrap disabled"
-                });
                 true
             }
             "Edit/Format SQL" => {

@@ -28,7 +28,7 @@ use fltk::{
 use space_query::db::PackageRoutine;
 use space_query::ui::object_browser::ObjectCache;
 use space_query::ui::object_search_dialog;
-use space_query::ui::MainWindow;
+use space_query::ui::{MainWindow, MenuBarBuilder};
 use space_query::utils::{arithmetic::safe_div, AppConfig};
 use std::collections::HashMap;
 use std::io::Write;
@@ -477,6 +477,22 @@ fn main() {
         "the Soft Wrap menu item shows its checked state",
     );
 
+    // Opening a file rebuilds the entire menu bar. The checked state has to be
+    // re-derived there, or it silently resets the moment the recent-files list
+    // changes.
+    if let Some(mut menu) = app::widget_from_id::<MenuBar>("main_menu") {
+        MenuBarBuilder::sync_recent_sql_file_items(
+            &mut menu,
+            &[std::path::PathBuf::from("/tmp/space-query-probe.sql")],
+        );
+    }
+    pump(300);
+    check(
+        &mut failures,
+        menu_item_is_checked(SOFT_WRAP_MENU),
+        "rebuilding the menu bar keeps Soft Wrap checked",
+    );
+
     if let Err(err) = fire_menu(SOFT_WRAP_MENU, Some(false)) {
         say(&format!("FAIL: {err}"));
         failures.push(err);
@@ -527,6 +543,19 @@ fn main() {
         &format!("a line past the end clamps to the last line ({clamped})"),
     );
 
+    // An empty buffer still has one line; asking to go anywhere must not panic.
+    main_window.capture_tour_set_sql("", None);
+    pump(200);
+    arm_modal("4", "OK");
+    app::add_timeout3(0.20, |_| drive_modal("Input"));
+    let _ = fire_menu(GO_TO_LINE_MENU, None);
+    pump(600);
+    check(
+        &mut failures,
+        main_window.capture_tour_editor_caret_line() == 1,
+        "Go to Line in an empty buffer lands on line 1",
+    );
+
     // Multi-byte text: the buffer offsets FLTK uses and the ones the highlight
     // shadow uses have to agree, or Go to Line lands on the wrong line the
     // moment a document is not pure ASCII.
@@ -567,16 +596,38 @@ fn main() {
     );
 
     // ---- Go to Object / Go to Declaration without a connection ------------
+    // Both must say something. `set_status_message` renders the status bar from
+    // live state and drops the text it is handed, so a status message here
+    // would leave the user pressing a key and seeing nothing at all.
     let tabs_before = main_window.capture_tour_editor_tab_count();
+
+    arm_modal("", "OK");
+    app::add_timeout3(0.20, |_| drive_modal("Alert"));
     let _ = fire_menu(GO_TO_OBJECT_MENU, None);
-    pump(400);
+    pump(600);
+    check(
+        &mut failures,
+        modal_was_driven(),
+        "Go to Object without a connection says so instead of doing nothing",
+    );
+
+    main_window.capture_tour_set_sql("SELECT * FROM NO_SUCH_TABLE_XYZ", None);
+    pump(200);
+    arm_modal("", "OK");
+    app::add_timeout3(0.20, |_| drive_modal("Alert"));
     let _ = fire_menu(GO_TO_DECLARATION_MENU, None);
-    pump(400);
+    pump(600);
+    check(
+        &mut failures,
+        modal_was_driven(),
+        "Go to Declaration on an unknown name says so instead of doing nothing",
+    );
+
     check(
         &mut failures,
         main_window.capture_tour_editor_tab_count() == tabs_before
             && window_by_label("Go to Object").is_none(),
-        "without a connection both object actions report and open nothing",
+        "neither opened a tab or a search dialog",
     );
 
     // ---- the search modal itself -----------------------------------------

@@ -5936,51 +5936,43 @@ impl SqlEditorWidget {
         Ok(requested.clamp(1, last_line).saturating_sub(1))
     }
 
-    /// Ask for a line number and move the caret there. Returns `false` when the
-    /// user cancelled.
-    pub fn prompt_go_to_line(&mut self) -> bool {
-        let line_count = self
-            .highlight_shadow
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .line_count()
-            .max(1);
+    /// Ask for a line number and move the caret there.
+    pub fn prompt_go_to_line(&mut self) {
+        // Through `text_buffer_access`, not the shadow directly: the shadow can
+        // lag the buffer after an edit, and a stale line count would send the
+        // caret to the wrong line.
+        let line_count = text_buffer_access::line_count(&self.buffer, Some(&self.highlight_shadow));
         let current_line = self.current_line_number();
         let Some(input) = crate::ui::input_on_main(
             &format!("Go to line (1-{line_count}):"),
             &current_line.to_string(),
         ) else {
-            return false;
+            return;
         };
         match Self::parse_goto_line_input(&input, line_count) {
-            Ok(line_index) => {
-                self.go_to_line_index(line_index);
-                true
-            }
-            Err(message) => {
-                Self::show_alert_dialog(&message);
-                false
-            }
+            Ok(line_index) => self.go_to_line_index(line_index),
+            Err(message) => Self::show_alert_dialog(&message),
         }
     }
 
     /// One-based line number the caret currently sits on.
     fn current_line_number(&self) -> usize {
         let (pos, _) = Self::editor_cursor_position(&self.editor, &self.buffer);
-        self.highlight_shadow
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .line_index_for_position(pos as usize)
+        text_buffer_access::line_index_for_position(&self.buffer, Some(&self.highlight_shadow), pos)
             .saturating_add(1)
     }
 
     fn go_to_line_index(&mut self, line_index: usize) {
-        let start = self
-            .highlight_shadow
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .line_start_for_index(line_index);
-        let (start, _) = Self::cursor_position(&self.buffer, start as i32);
+        // The prompt ran a modal loop, so the tab may be gone by now.
+        if self.editor.was_deleted() {
+            return;
+        }
+        let start = text_buffer_access::line_start_for_index(
+            &self.buffer,
+            Some(&self.highlight_shadow),
+            line_index,
+        );
+        let (start, _) = Self::cursor_position(&self.buffer, start);
         self.editor.set_insert_position(start);
         self.editor.show_insert_position();
         let _ = self.editor.take_focus();

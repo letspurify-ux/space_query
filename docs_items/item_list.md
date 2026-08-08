@@ -397,11 +397,12 @@ DROP할 수 있는 타입)이 붙었다 — `DestructiveObjectAction`
 
 | 조각 | 위치 |
 | --- | --- |
-| 이름 랭킹 (순수 함수, 테스트 17개) | `src/ui/object_search.rs` |
-| 검색 모달 | `src/ui/object_search_dialog.rs` |
+| 이름 랭킹 (순수 함수, 테스트 19개) | `src/ui/object_search.rs` |
+| 검색 모달 (테스트 4개) | `src/ui/object_search_dialog.rs` |
 | 커서 아래 이름 후보 | `SqlEditorWidget::object_context_candidates_at_cursor` |
 | 이름 → 객체 → 소스 | `ObjectBrowserWidget::open_declaration_for_sql_selection` / `declaration_target_for_item` |
 | 진입점 | `MainWindow::go_to_declaration_at_cursor` / `open_object_search` |
+| 라이브 검증 (4개 백엔드) | `src/bin/verify_explain_plan_live.rs` |
 | 캡쳐 검증 | `capture_feature_tour object-search` |
 
 설계상 결정 네 가지:
@@ -481,7 +482,7 @@ DROP할 수 있는 타입)이 붙었다 — `DestructiveObjectAction`
 
 | 조각 | 위치 |
 | --- | --- |
-| 계획 모델·연결선·비용 몫 (순수 함수, 테스트 28개) | `src/ui/explain_plan.rs` |
+| 계획 모델·연결선·비용 몫 (순수 함수, 테스트 31개) | `src/ui/explain_plan.rs` |
 | Oracle `PLAN_TABLE` 조회 (OCI / thin) | `QueryExecutor::get_explain_plan` / `get_thin_explain_plan` |
 | MySQL/MariaDB `EXPLAIN` 원본 결과 | `MysqlExecutor::get_explain_plan` |
 | 백엔드 분기 | `trait ExplainPlanBackend` (`sql_editor/mod.rs`) |

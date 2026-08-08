@@ -483,8 +483,8 @@ fn verify(target: Target) -> Result<(), String> {
         }
         // Re-derive the nodes the same way the UI did, then check the drawing
         // against them.
-        let nodes = oracle_plan_nodes_from_grid(&plan_result.rows);
-        if nodes.is_empty() {
+        let steps = plan_step_labels(&plan_result.rows);
+        if steps.is_empty() {
             return Err("Oracle plan rendered no steps".to_string());
         }
         if !plan_result.rows.iter().any(|row| {
@@ -672,12 +672,12 @@ fn verify_object_declarations(
     Ok(())
 }
 
-/// Rebuild the parent links from a rendered grid, using the connector prefixes.
+/// The non-blank Operation cells of a rendered plan.
 ///
-/// The grid is what the user sees, so checking the drawing against nodes parsed
-/// back out of it would be circular. This only recovers the step list so the
-/// count can be asserted.
-fn oracle_plan_nodes_from_grid(rows: &[Vec<String>]) -> Vec<String> {
+/// Only the step list: checking the drawing against values parsed back out of
+/// the same drawing would be circular, so the connector assertions run against
+/// nodes whose parent links are known instead.
+fn plan_step_labels(rows: &[Vec<String>]) -> Vec<String> {
     rows.iter()
         .filter_map(|row| row.first().cloned())
         .filter(|operation| !operation.trim().is_empty())

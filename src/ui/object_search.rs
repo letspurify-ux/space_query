@@ -416,6 +416,29 @@ mod tests {
     }
 
     #[test]
+    fn a_large_scope_searches_fast_enough_for_every_keystroke() {
+        // Some Oracle schemas really do hold tens of thousands of objects, and
+        // this runs on the UI thread once per keystroke.
+        let big = ObjectCache {
+            tables: (0..50_000).map(|n| format!("TBL_{n:06}")).collect(),
+            ..ObjectCache::default()
+        };
+        for (label, query) in [("empty", ""), ("prefix", "tbl_0001"), ("miss", "zzzz")] {
+            let started = std::time::Instant::now();
+            let hits = search(&big, query, MAX_OBJECT_SEARCH_HITS);
+            let elapsed = started.elapsed();
+            println!(
+                "{label:>6} query over 50k objects: {elapsed:?} ({} hits)",
+                hits.len()
+            );
+            assert!(
+                elapsed < std::time::Duration::from_secs(2),
+                "{label} query took {elapsed:?}"
+            );
+        }
+    }
+
+    #[test]
     fn an_empty_cache_searches_without_panicking() {
         assert!(search(&ObjectCache::default(), "anything", 10).is_empty());
         assert!(search(&ObjectCache::default(), "", 10).is_empty());

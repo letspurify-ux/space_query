@@ -44,6 +44,60 @@ pub(crate) fn line_end(
     .unwrap_or_else(|| buffer.line_end(pos.clamp(0, buffer_len)))
 }
 
+/// Number of lines in the buffer, never less than one.
+pub(crate) fn line_count(
+    buffer: &TextBuffer,
+    shadow: Option<&Arc<Mutex<HighlightShadowState>>>,
+) -> usize {
+    with_current_shadow(buffer, shadow, |shadow| Some(shadow.line_count()))
+        .unwrap_or_else(|| {
+            let length = buffer.length().max(0);
+            buffer.count_lines(0, length).max(0) as usize + 1
+        })
+        .max(1)
+}
+
+/// Zero-based line index the byte at `pos` sits on.
+pub(crate) fn line_index_for_position(
+    buffer: &TextBuffer,
+    shadow: Option<&Arc<Mutex<HighlightShadowState>>>,
+    pos: i32,
+) -> usize {
+    let buffer_len = buffer.length().max(0);
+    let clamped = pos.clamp(0, buffer_len);
+    with_current_shadow(buffer, shadow, |shadow| {
+        Some(shadow.line_index_for_position(clamped as usize))
+    })
+    .unwrap_or_else(|| buffer.count_lines(0, clamped).max(0) as usize)
+}
+
+/// Byte offset the zero-based `line_index` starts at.
+pub(crate) fn line_start_for_index(
+    buffer: &TextBuffer,
+    shadow: Option<&Arc<Mutex<HighlightShadowState>>>,
+    line_index: usize,
+) -> i32 {
+    let buffer_len = buffer.length().max(0);
+    with_current_shadow(buffer, shadow, |shadow| {
+        i32::try_from(shadow.line_start_for_index(line_index)).ok()
+    })
+    .unwrap_or_else(|| {
+        // FLTK has no "start of line N", so walk line ends. Only reached when
+        // the shadow is out of step with the buffer, which is rare, and the
+        // walk stops at the requested line rather than reading the document.
+        let mut start = 0;
+        for _ in 0..line_index {
+            let next = buffer.line_end(start).saturating_add(1);
+            if next > buffer_len {
+                return buffer_len;
+            }
+            start = next;
+        }
+        start
+    })
+    .clamp(0, buffer_len)
+}
+
 pub(crate) fn text_range(
     buffer: &TextBuffer,
     shadow: Option<&Arc<Mutex<HighlightShadowState>>>,
