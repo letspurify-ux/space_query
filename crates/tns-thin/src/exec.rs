@@ -215,6 +215,14 @@ pub struct ExecuteWithImplicitResult {
 #[derive(Debug, Clone, PartialEq)]
 pub struct OutBindResult {
     pub values: Vec<OracleValue>,
+    /// Index, in the request's bind list, of the bind each value belongs to.
+    ///
+    /// The server decides which binds come back: it answers with the real
+    /// parameter modes of the statement, so a bind sent as IN OUT that names an
+    /// `IN` parameter is not returned at all. Pairing values with binds by
+    /// position alone therefore shifts every value after the first IN-only
+    /// parameter onto the wrong bind.
+    pub value_bind_indices: Vec<usize>,
     pub rows: Vec<Vec<OracleValue>>,
     pub statement_cursor_id: Option<u32>,
     pub implicit_results: Vec<RefCursorValue>,

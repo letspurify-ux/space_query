@@ -1,6 +1,6 @@
 # DataGrip 대비 미구현 기능 목록 (시급도 순)
 
-작성일: 2026-08-06 · 갱신일: 2026-08-08 (항목 10·12·28 완료 기록. 그 전 갱신: 항목 7·8 완료 기록, 구현 상태 재확인, 항목 24~33 추가)
+작성일: 2026-08-06 · 갱신일: 2026-08-08 (항목 31 완료 기록. 그 전 갱신: 항목 10·12·28 완료 기록, 항목 7·8 완료 기록, 구현 상태 재확인, 항목 24~33 추가)
 
 ## 조사 범위와 기준
 
@@ -725,6 +725,77 @@ Oracle은 predicate와 cost 몫이 실려 오는지·MySQL 계열은 서버 컬�
   안의 `:`을 제외하는 처리 포함). 그 판정을 재사용해 프롬프트를 띄우고 선언+대입으로
   바꾸는 형태.
 
+#### 구현 상태 (2026-08-08) — 완료
+
+값이 없는 플레이스홀더를 실행 직전에 찾아 모달로 묻는다. `:name` / `:1` 이름 바인드와
+JDBC 철자 `?` 위치 지정자를 모두 처리한다. 파라미터마다 **타입**(String / Number /
+Date / Timestamp, Oracle은 + Ref Cursor) × **값** × **NULL** 체크박스.
+
+타입 선택이 필요한 이유는 문자열 리터럴이 값이 아니라 **문법 오류**가 되는 자리가
+있기 때문이다 — Oracle `FETCH FIRST :n ROWS ONLY`, MySQL `LIMIT :n`. Date/Timestamp
+값은 백엔드와 무관하게 `YYYY-MM-DD HH:MM:SS`로 쓴다. 빈 칸은 String을 제외한 모든
+타입에서 SQL NULL이다(빈 숫자·빈 날짜라는 것은 없으므로).
+
+**PL/SQL OUT 파라미터**도 같은 방식으로 답한다. 값을 비우고 타입만 고르면 되고,
+OUT `SYS_REFCURSOR`는 Oracle 전용 `Ref Cursor` 타입으로 답한다(그 행의 값·NULL
+컨트롤은 비활성). 즉 `BEGIN emps_by_dept(:dept, :cnt, :rc); END;`를 `VARIABLE` 선언
+없이 실행하고 커서 결과까지 볼 수 있다.
+
+**프로시저·함수 실행 방법 전부**를 커버한다.
+
+| | 프로시저 | 함수 |
+| --- | --- | --- |
+| Oracle | `BEGIN p(:a,:b); END;` · `EXEC` · `EXECUTE` · `CALL` · `DECLARE … BEGIN … END;` | `SELECT f(:a) FROM DUAL` · `BEGIN :r := f(:a); END;` · `EXEC :r := f(:a)` |
+| MySQL / MariaDB | `CALL p(:a, @out)` | `SELECT f(:a)` |
+
+`EXEC`가 관건이었다 — 실행 워커 깊은 곳에서 PL/SQL 블록으로 재작성되므로, 프롬프트는
+**사용자가 쓴 철자 그대로** 플레이스홀더를 찾아야 한다. MySQL의 OUT 인자는 사용자
+변수여야 하는데 `@out`은 플레이스홀더가 아니라 그대로 통과하고 옆의 IN 값만 치환된다.
+
+서버에 닿는 방식은 계열별로 갈린다.
+
+| | 실행 방식 | SQL 텍스트 |
+| --- | --- | --- |
+| Oracle thin / OCI | 값을 세션 바인드로 선언해 기존 `resolve_binds` 파이프라인에 태움 | 그대로. 단 `?`는 서버가 안 받으므로 생성 이름(`:SQ_P1`…)으로 치환 |
+| MySQL / MariaDB | 바인드 경로가 없어 리터럴로 치환 (`grid_sql_export::sql_literal_for_value` 재사용) | 치환된 텍스트. 히스토리에도 실제 실행된 SQL이 남는다 |
+
+**`VARIABLE` 선언과의 관계** — 선언된 바인드는 묻지 않는다. `BindVar.prompted`
+플래그로 "선언"과 "직전 답"을 구분하므로, 프롬프트가 쓴 값이 다음 실행에서 선언처럼
+보여 값이 얼어붙는 일이 없다. 선언된 것과 안 된 것이 한 문장에 섞여 있으면 안 된 것만
+묻고 선언된 값은 그대로 쓴다. 프롬프트 값은 매번 다시 묻되 직전 답이 채워져 있다.
+취소하면 아무것도 실행되지 않는다(예약도 히스토리도 남지 않음).
+
+- **진입점**: `execute_sql_with_mysql_delimiter_after_lazy_cancel`의 프리플라이트
+  (`src/ui/sql_editor/execution.rs`). 모든 에디터 실행 경로가 여기로 모이므로
+  Ctrl+Enter · 선택 실행 · F5 스크립트 · F6 실행 계획이 한 훅으로 덮인다.
+- **구성**: `src/ui/bind_prompt.rs`(FLTK 없는 판정·치환 로직 + 단위 테스트 30개),
+  `src/ui/bind_prompt_dialog.rs`(모달).
+- **검증**: `cargo run --bin verify_bind_prompt_ui`(모달 위젯 배선 10항목),
+  `cargo run --bin verify_bind_prompt_live all`(Oracle thin 36 · OCI 36 ·
+  MySQL 27 · MariaDB 27 전부 통과). 다루는 축: 선언·미선언·혼합, `?`, NULL,
+  Date/Timestamp, 행 제한 절, 리터럴 안 콜론, 재프롬프트, 취소, OUT 스칼라·OUT 커서,
+  프로시저·함수의 모든 호출 형태, 그리고 **데이터 타입 전수**(Oracle:
+  NUMBER · NUMBER(p,s) · BINARY_DOUBLE · VARCHAR2 · CHAR · NVARCHAR2 · DATE ·
+  TIMESTAMP · TIMESTAMP WITH TIME ZONE · CLOB · RAW / MySQL 계열: INT · BIGINT ·
+  DECIMAL · DOUBLE · VARCHAR · CHAR · TEXT · DATE · DATETIME · TIMESTAMP · TIME ·
+  BLOB · JSON). 값이 왕복에서 깨지면 행이 안 걸리므로 빈 결과가 곧 실패다.
+- **README**: `#### Bind parameter values` + `docs/images/bind-parameters.png`.
+
+**덤으로 고친 기존 결함 (2건, 둘 다 Oracle thin. OCI는 둘 다 영향 없음)**
+
+1. **TIMESTAMP 바인드가 같은 값과 비교되지 않았다.** 초 미만이 0인 TIMESTAMP를
+   11바이트(뒤 4바이트가 0)로 보냈다. Oracle은 같은 값을 7바이트로 저장하고 **저장
+   형태로 비교**하므로(`DUMP` 결과 `Typ=180 Len=7`) `col = :bind`가 명백히 같은
+   값에도 거짓이었다. 나노초가 0이면 7바이트로 인코딩하도록 고쳤다 — OSON 인코더는
+   이미 같은 규칙을 쓰고 있었다(`encode_oson_timestamp_json`).
+2. **PL/SQL OUT 바인드 결과가 한 칸씩 밀렸다.** 값 있는 IN 바인드와 섞이면 엉뚱한
+   바인드에 배정됐다. 서버는 **문장의 실제 파라미터 모드**로 답하므로 IN OUT으로
+   보낸 바인드라도 `IN` 파라미터면 되돌아오지 않는데, 앱은 위치로만 짝지었기
+   때문이다(`p(:dept,:cnt,:rc)` → `:DEPT`에 count, `:CNT`에 커서). 드라이버가
+   `OutBindResult.value_bind_indices`로 바인드 인덱스를 함께 돌려주도록 하고
+   그것으로 짝짓는다. `VARIABLE dept NUMBER; EXEC :dept := 30;
+   EXEC p(:dept,:cnt,:rc)`로 예전에도 재현되던 결함이다.
+
 ### 32. FK 기반 JOIN 조건 자동완성
 
 - **현재 상태**: 없음. IntelliSense는 테이블/컬럼/키워드까지 하고, `JOIN t2 ON `
@@ -772,6 +843,7 @@ Oracle은 predicate와 cost 몫이 실려 오는지·MySQL 계열은 서버 컬�
 | ✅ | ~~28. 소프트 랩 · Go to Line~~ | **완료** — 폴딩은 범위 밖 |
 | ✅ | ~~10. Go to Declaration / 전역 객체 검색~~ | **완료** — 서버 전역 검색은 범위 밖 |
 | ✅ | ~~12. 실행 계획 시각화~~ | **완료** — MySQL 계열은 트리 없이 서버 컬럼 그대로 |
+| ✅ | ~~31. 바인드 파라미터 값 입력 프롬프트~~ | **완료** — `:name` · `:1` · `?`, 4백엔드 라이브 검증 |
 | 1 | 25. 셀 값으로 빠른 필터 | 이미 있는 `grid_sql_export` 리터럴 생성을 그대로 쓴다 |
 | 2 | 26. 객체 트리 Export / Import | 3번이 끝난 지금 메뉴 항목 하나로 끝난다 |
 | 3 | 24. 결과 정렬 수단 | 헤더 정렬 제거로 생긴 구멍. (a)안이면 작다 |

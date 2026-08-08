@@ -12,7 +12,7 @@ use fltk::{
 };
 use mysql::prelude::Queryable;
 use std::any::Any;
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::panic::{self, AssertUnwindSafe};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
@@ -1999,6 +1999,10 @@ pub struct SqlEditorWidget {
     current_mysql_cancel_context: Arc<Mutex<Option<MySqlQueryCancelContext>>>,
     mysql_auto_commit_override: Arc<Mutex<Option<bool>>>,
     pending_result_edit_request: Arc<Mutex<Option<crate::db::ResultEditRequest>>>,
+    /// The last answer given for each bind placeholder in this tab, replayed
+    /// into the prompt on the next run. Kept out of `SessionState` on purpose:
+    /// a prompted value must never be mistaken for a `VARIABLE` declaration.
+    last_bind_prompt_values: Arc<Mutex<HashMap<String, crate::ui::bind_prompt::RememberedValue>>>,
     cancel_flag: Arc<Mutex<bool>>,
     intellisense_data: Arc<Mutex<IntellisenseData>>,
     intellisense_popup: Arc<Mutex<IntellisensePopup>>,
@@ -2865,6 +2869,7 @@ impl SqlEditorWidget {
         let current_mysql_cancel_context = Arc::new(Mutex::new(None));
         let mysql_auto_commit_override = Arc::new(Mutex::new(None));
         let pending_result_edit_request = Arc::new(Mutex::new(None));
+        let last_bind_prompt_values = Arc::new(Mutex::new(HashMap::new()));
         let cancel_flag = Arc::new(Mutex::new(false));
 
         let intellisense_popup = Arc::new(Mutex::new(IntellisensePopup::new()));
@@ -2945,6 +2950,7 @@ impl SqlEditorWidget {
             current_mysql_cancel_context,
             mysql_auto_commit_override,
             pending_result_edit_request,
+            last_bind_prompt_values,
             cancel_flag,
             intellisense_data,
             intellisense_popup,

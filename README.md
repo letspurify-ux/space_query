@@ -272,6 +272,71 @@ MySQL / MariaDB family:
 
 </details>
 
+#### Bind parameter values
+
+SQL copied out of application code keeps its placeholders. Running
+`SELECT * FROM EMP WHERE EMPNO = :id` — or the JDBC spelling,
+`... WHERE EMPNO = ?` — opens a prompt for the values instead of sending a
+statement the server cannot answer.
+
+![The bind-parameter prompt: one row per placeholder, each with a type, a value and a NULL box](docs/images/bind-parameters.png)
+
+Every placeholder gets a row: its name, a type, the value, and a `NULL` box that
+disables the value field. The type matters in the places where a quoted string
+is not merely a different value but a syntax error — Oracle
+`FETCH FIRST :n ROWS ONLY` and MySQL `LIMIT :n` need a number, not `'2'`. `Date`
+and `Timestamp` values are written as `YYYY-MM-DD HH:MM:SS` on every backend. An
+empty box means SQL NULL for every type but `String`, since there is no such
+thing as an empty number or an empty date.
+
+PL/SQL OUT parameters are answered the same way: leave the value empty and pick
+the type. Oracle adds a `Ref Cursor` type for an OUT `SYS_REFCURSOR`, which
+disables the value and `NULL` controls on that row — so
+`BEGIN emps_by_dept(:dept, :cnt, :rc); END;` runs and shows the cursor's rows
+without a `VARIABLE` line in front of it. The values the call assigns come back
+into the session and are reported the way `VARIABLE` binds always were.
+
+Every way of calling a routine is covered, for procedures and functions alike:
+
+| | Procedures | Functions |
+| --- | --- | --- |
+| Oracle | `BEGIN p(:a, :b); END;` · `EXEC` · `EXECUTE` · `CALL` · `DECLARE … BEGIN … END;` | `SELECT f(:a) FROM DUAL` · `BEGIN :r := f(:a); END;` · `EXEC :r := f(:a)` |
+| MySQL / MariaDB | `CALL p(:a, @out)` | `SELECT f(:a)` |
+
+`EXEC` is worth a note: it is rewritten into a PL/SQL block deep in the
+execution worker, long after the prompt reads the text you wrote, so the
+placeholders are recognized in the spelling you typed. On MySQL an OUT argument
+must be a user variable — `@out` is not a placeholder, so it passes through
+untouched while the IN value beside it is substituted.
+
+What reaches the server differs by family, because the two do not offer the same
+thing. On Oracle the values become real binds of the declared type and the
+statement text is sent exactly as written. MySQL and MariaDB have no bind path
+here, so the placeholders are replaced by properly quoted literals before the
+statement is sent — which is also the SQL the query history records, since it is
+what actually ran. Oracle `?` placeholders are rewritten to generated bind names
+(`:SQ_P1`, …), because the server does not accept `?` at all.
+
+Only placeholders with no value are asked about. A bind declared with
+`VARIABLE` is a standing declaration and is never prompted for, so
+`VARIABLE id NUMBER` + `EXEC :id := 7369` keeps working untouched, and a
+statement mixing a declared bind with an undeclared one asks only about the
+latter. A prompted value is *not* a declaration: it is offered again, prefilled,
+on the next run, so changing it takes one keystroke rather than a new
+declaration. Cancelling the prompt runs nothing at all.
+
+The answer is carried to the server as its declared type, not as text pasted
+into the statement, so it matches the column it is compared against whatever
+that column is — `NUMBER` / `NUMBER(p,s)` / `BINARY_DOUBLE`, `VARCHAR2` /
+`CHAR` / `NVARCHAR2`, `DATE` / `TIMESTAMP` / `TIMESTAMP WITH TIME ZONE`, `CLOB`
+and `RAW` on Oracle; `INT` / `BIGINT` / `DECIMAL` / `DOUBLE`, `VARCHAR` /
+`CHAR` / `TEXT`, `DATE` / `DATETIME` / `TIMESTAMP` / `TIME`, `BLOB` and `JSON`
+on MySQL and MariaDB. Non-ASCII text survives the round trip.
+
+Colons that are not placeholders are left alone — a `'HH24:MI:SS'` format model,
+a `q'[a:b]'` literal, a `:=` assignment, and the `:NEW` / `:OLD` correlation
+names in a `CREATE TRIGGER` body.
+
 ### Explain plan
 
 `F6` explains the statement at the cursor and shows the plan in its own Data
@@ -640,6 +705,12 @@ cargo run --bin verify_import_live all
 
 # Explain plan shape and Go to Declaration — every backend.
 cargo run --bin verify_explain_plan_live all
+
+# The bind-parameter modal, driven through its own event loop.
+cargo run --bin verify_bind_prompt_ui
+
+# Bind parameter values, declared and prompted — every backend.
+cargo run --bin verify_bind_prompt_live all
 ```
 
 Pull requests and pushes to `main` run formatting, Clippy, both non-live test

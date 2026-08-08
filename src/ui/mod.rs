@@ -1,6 +1,14 @@
 pub(crate) mod builtin_signatures;
 #[cfg(test)]
 mod builtin_signatures_live_tests;
+// Public only so `verify_bind_prompt_live` can build the same statements and
+// binds the editor builds; not part of the supported surface.
+#[doc(hidden)]
+pub mod bind_prompt;
+// Public only so `verify_bind_prompt_ui` can drive the same modal the editor
+// opens; not part of the supported surface.
+#[doc(hidden)]
+pub mod bind_prompt_dialog;
 pub mod connection_dialog;
 pub mod constants;
 pub mod find_replace;

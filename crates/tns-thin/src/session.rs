@@ -1544,6 +1544,7 @@ impl OracleThinSession {
         let Some(request) = self.execute_many_request(sql.into(), bind_rows, auto_commit)? else {
             return Ok(OutBindResult {
                 values: Vec::new(),
+                value_bind_indices: Vec::new(),
                 rows: Vec::new(),
                 statement_cursor_id: None,
                 implicit_results: Vec::new(),
@@ -1587,6 +1588,7 @@ impl OracleThinSession {
         let mut rows = Vec::with_capacity(request.bind_rows.len());
         let mut implicit_results = Vec::new();
         let mut statement_cursor_id = None;
+        let mut value_bind_indices = Vec::new();
         let last_index = request.bind_rows.len().checked_sub(1).ok_or_else(|| {
             OracleThinError::new("Oracle thin PL/SQL execute_many requires at least one bind row")
         })?;
@@ -1600,10 +1602,12 @@ impl OracleThinSession {
             rows.extend(result.rows);
             implicit_results.extend(result.implicit_results);
             statement_cursor_id = result.statement_cursor_id;
+            value_bind_indices = result.value_bind_indices;
         }
         let values = rows.first().cloned().unwrap_or_default();
         Ok(OutBindResult {
             values,
+            value_bind_indices,
             rows,
             statement_cursor_id,
             implicit_results,
@@ -1804,8 +1808,16 @@ impl OracleThinSession {
             response.out_bind_rows
         };
         let values = rows.first().cloned().unwrap_or_default();
+        let value_bind_indices = if response.out_bind_indices.is_empty() {
+            // No direction list came back, so the values line up with the
+            // request's own binds.
+            (0..values.len()).collect()
+        } else {
+            response.out_bind_indices.clone()
+        };
         Ok(OutBindResult {
             values,
+            value_bind_indices,
             rows,
             statement_cursor_id: response.result.cursor_id,
             implicit_results: response.implicit_results,
@@ -3977,6 +3989,7 @@ struct ExecuteResponse {
     thin_columns: Vec<ThinColumn>,
     result: QueryResult,
     out_bind_rows: Vec<Vec<OracleValue>>,
+    out_bind_indices: Vec<usize>,
     implicit_results: Vec<RefCursorValue>,
     cursor_columns: Vec<(u32, Vec<ThinColumn>)>,
 }
@@ -4007,6 +4020,8 @@ struct ExecuteReadState {
     rows: Vec<Vec<OracleValue>>,
     out_bind_columns: Vec<ThinColumn>,
     out_bind_array_flags: Vec<bool>,
+    /// Request-bind index of each column in `out_bind_columns`.
+    out_bind_indices: Vec<usize>,
     out_bind_rows: Vec<Vec<OracleValue>>,
     implicit_results: Vec<RefCursorValue>,
     cursor_columns: Vec<(u32, Vec<ThinColumn>)>,
@@ -6536,9 +6551,19 @@ fn write_oracle_number(payload: &mut Vec<u8>, value: &str) -> Result<(), OracleT
     write_bytes_with_length(payload, &bytes)
 }
 
+/// Wire form of a `TIMESTAMP` bind value.
+///
+/// A whole-second timestamp is written in seven bytes rather than eleven with
+/// four zero fraction bytes. Oracle stores it that way — `DUMP` of a stored
+/// `TIMESTAMP` with no fractional seconds reports `Len=7` — and compares the
+/// stored form, so the eleven-byte spelling makes `column = :bind` false for a
+/// value that is plainly equal. The OSON encoder already draws the same line
+/// (`encode_oson_timestamp_json`).
 fn encode_oracle_timestamp_bind(value: &crate::OracleDateTime) -> Vec<u8> {
     if oracle_datetime_has_timezone(value) {
         encode_oracle_date(value, 13)
+    } else if value.nanosecond == 0 {
+        encode_oracle_date(value, 7)
     } else {
         encode_oracle_date(value, 11)
     }
@@ -6779,16 +6804,18 @@ fn read_execute_response_with_state(
         let out_binds = request
             .binds
             .iter()
-            .filter(|bind| bind_can_return_value(bind))
+            .enumerate()
+            .filter(|(_, bind)| bind_can_return_value(bind))
             .collect::<Vec<_>>();
         state.out_bind_columns = out_binds
             .iter()
-            .map(|bind| bind_column_metadata(bind))
+            .map(|(_, bind)| bind_column_metadata(bind))
             .collect();
         state.out_bind_array_flags = out_binds
             .iter()
-            .map(|bind| matches!(bind, BindValue::Array { out: true, .. }))
+            .map(|(_, bind)| matches!(bind, BindValue::Array { out: true, .. }))
             .collect();
+        state.out_bind_indices = out_binds.iter().map(|(index, _)| *index).collect();
         state.reading_out_binds = !state.out_bind_columns.is_empty();
         state.reading_dml_returning = state.reading_out_binds;
         state.dml_returning_batch = request.bind_rows.len() > 1;
@@ -6976,6 +7003,7 @@ fn read_execute_response_with_state(
             row_count: state.row_count,
         },
         out_bind_rows: state.out_bind_rows,
+        out_bind_indices: state.out_bind_indices,
         implicit_results: state.implicit_results,
         cursor_columns: state.cursor_columns,
     })
@@ -7312,6 +7340,7 @@ fn process_io_vector(
 
     let mut out_bind_columns = Vec::new();
     let mut out_bind_array_flags = Vec::new();
+    let mut out_bind_indices = Vec::new();
     for index in 0..num_binds {
         let bind_dir = cursor.read_u8()?;
         if bind_dir == TNS_BIND_DIR_INPUT {
@@ -7322,9 +7351,11 @@ fn process_io_vector(
         };
         out_bind_columns.push(bind_column_metadata(bind));
         out_bind_array_flags.push(matches!(bind, BindValue::Array { out: true, .. }));
+        out_bind_indices.push(index);
     }
     state.out_bind_columns = out_bind_columns;
     state.out_bind_array_flags = out_bind_array_flags;
+    state.out_bind_indices = out_bind_indices;
     state.reading_out_binds = !state.out_bind_columns.is_empty();
     Ok(())
 }
@@ -17954,6 +17985,49 @@ mod tests {
             read_boolean_value(&mut false_cursor).unwrap(),
             OracleValue::Boolean(false)
         );
+    }
+
+    /// Oracle stores a whole-second TIMESTAMP in seven bytes and compares the
+    /// stored form, so an eleven-byte bind with four zero fraction bytes makes
+    /// `column = :bind` false for a value that is plainly equal.
+    #[test]
+    fn a_whole_second_timestamp_bind_is_written_in_seven_bytes() {
+        let value = crate::OracleDateTime {
+            year: 2026,
+            month: 8,
+            day: 8,
+            hour: 10,
+            minute: 11,
+            second: 12,
+            nanosecond: 0,
+            timezone_offset_minutes: None,
+            timezone_region_id: None,
+        };
+
+        assert_eq!(
+            encode_oracle_timestamp_bind(&value),
+            vec![120, 126, 8, 8, 11, 12, 13]
+        );
+    }
+
+    /// A fractional second still needs its four bytes.
+    #[test]
+    fn a_fractional_timestamp_bind_keeps_its_nanosecond_bytes() {
+        let value = crate::OracleDateTime {
+            year: 2026,
+            month: 8,
+            day: 8,
+            hour: 10,
+            minute: 11,
+            second: 12,
+            nanosecond: 123_456_000,
+            timezone_offset_minutes: None,
+            timezone_region_id: None,
+        };
+
+        let encoded = encode_oracle_timestamp_bind(&value);
+        assert_eq!(encoded.len(), 11);
+        assert_eq!(&encoded[7..], &123_456_000u32.to_be_bytes());
     }
 
     #[test]

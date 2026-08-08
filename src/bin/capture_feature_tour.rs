@@ -12,6 +12,8 @@ use space_query::{
     db::{ColumnInfo, DatabaseType, PackageRoutine, QueryResult, SqlValueKind},
     ui::{
         apply_global_default_font,
+        bind_prompt::{BindParam, BindParamType},
+        bind_prompt_dialog,
         constants::{BUTTON_HEIGHT, TAB_HEADER_HEIGHT},
         explain_plan::{plan_grid, ExplainPlanData, PlanNode},
         intellisense::input_caret_popup_anchor,
@@ -1329,6 +1331,34 @@ fn capture_result_export(main_window: &mut MainWindow) {
     pump(200);
 }
 
+/// The bind-parameter modal, as it opens for a statement pasted out of
+/// application code: one row per placeholder, prefilled from the previous run.
+fn capture_bind_parameters() {
+    fn param(label: &str, param_type: BindParamType, value: &str) -> BindParam {
+        BindParam {
+            label: label.to_string(),
+            memo_key: label.trim_start_matches(':').to_string(),
+            bind_name: label.trim_start_matches(':').to_string(),
+            param_type,
+            value: value.to_string(),
+            is_null: false,
+        }
+    }
+
+    app::add_timeout3(0.45, |_| {
+        capture_active_dialog("Bind Parameters", "/tmp/space-query-bind-parameters.ppm")
+    });
+    let _ = bind_prompt_dialog::show(
+        &[
+            param(":ID", BindParamType::Number, "7369"),
+            param(":HIRED", BindParamType::Date, "1981-02-20"),
+            param("? 1", BindParamType::String, "SALESMAN"),
+        ],
+        BindParamType::offered_for(DatabaseType::Oracle),
+    );
+    pump(200);
+}
+
 /// The import modal: format, header and NULL choices, and the file-to-table
 /// column mapping in one frame.
 fn capture_table_import(main_window: &mut MainWindow) {
@@ -2080,6 +2110,11 @@ fn main() {
         app::quit();
         return;
     }
+    if capture_mode.as_deref() == Some("bind-parameters") {
+        capture_bind_parameters();
+        app::quit();
+        return;
+    }
     if capture_mode.as_deref() == Some("result-editing") {
         capture_object_browser(&mut main_window);
         capture_result_editing(&mut main_window);
@@ -2151,6 +2186,7 @@ fn main() {
     capture_grid_sql_export(&mut main_window);
     capture_result_export(&mut main_window);
     capture_table_import(&mut main_window);
+    capture_bind_parameters();
     capture_table_browse_popup(&mut main_window, false);
     capture_result_editing(&mut main_window);
     capture_session_activity(&mut main_window);

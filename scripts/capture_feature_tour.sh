@@ -74,6 +74,11 @@ if [[ "$capture_mode" == "table-import" ]]; then
   exit 0
 fi
 
+if [[ "$capture_mode" == "bind-parameters" ]]; then
+  convert_capture bind-parameters bind-parameters
+  exit 0
+fi
+
 if [[ "$capture_mode" == "grid-search" ]]; then
   convert_capture grid-search grid-search
   exit 0
@@ -140,6 +145,7 @@ convert_capture object-drop-confirmation object-drop-confirmation
 convert_capture grid-sql-export grid-sql-export
 convert_capture result-export result-export
 convert_capture table-import table-import
+convert_capture bind-parameters bind-parameters
 convert_capture table-browse table-browse
 convert_capture table-browse-popup-100 table-browse-popup
 convert_capture table-browse-order-popup-100 table-browse-order-popup

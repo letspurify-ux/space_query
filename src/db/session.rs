@@ -26,6 +26,15 @@ pub enum BindValue {
 pub struct BindVar {
     pub data_type: BindDataType,
     pub value: BindValue,
+    /// True when the value came from the bind-parameter prompt rather than a
+    /// `VARIABLE` declaration.
+    ///
+    /// The two must stay distinguishable: a declaration is a standing statement
+    /// about the bind and is never asked about again, while a prompted value is
+    /// only the previous answer and is asked about on every run. Without this
+    /// flag the first prompt would look exactly like a declaration to the next
+    /// one, and the value would silently freeze.
+    pub prompted: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -210,7 +219,27 @@ impl BindVar {
             BindDataType::RefCursor => BindValue::Cursor(None),
             _ => BindValue::Scalar(None),
         };
-        Self { data_type, value }
+        Self {
+            data_type,
+            value,
+            prompted: false,
+        }
+    }
+
+    /// A bind carrying an answer from the bind-parameter prompt.
+    ///
+    /// A `REFCURSOR` answer names an OUT parameter rather than a value, so it
+    /// starts empty exactly as a `VARIABLE rc REFCURSOR` declaration does.
+    pub fn from_prompt(data_type: BindDataType, value: Option<String>) -> Self {
+        let value = match data_type {
+            BindDataType::RefCursor => BindValue::Cursor(None),
+            _ => BindValue::Scalar(value),
+        };
+        Self {
+            data_type,
+            value,
+            prompted: true,
+        }
     }
 }
 

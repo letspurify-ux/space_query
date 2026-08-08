@@ -17086,6 +17086,7 @@ fn session_bind_names_do_not_depend_on_connection_lock() {
             crate::db::BindVar {
                 data_type: crate::db::BindDataType::Number,
                 value: crate::db::BindValue::Scalar(Some("1".to_string())),
+                prompted: false,
             },
         );
     let runtime =

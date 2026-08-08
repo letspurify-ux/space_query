@@ -8795,6 +8795,78 @@ impl SqlEditorWidget {
         app::awake();
     }
 
+    /// Ask for the value of every placeholder the statement carries no value
+    /// for, and hand back the text to run.
+    ///
+    /// Returns `None` when the prompt was cancelled: nothing has been reserved
+    /// or recorded yet at this point, so the run simply does not happen.
+    ///
+    /// The two families part ways in [`crate::ui::bind_prompt::prepare`], not
+    /// here — Oracle gets session binds and its original text, the MySQL family
+    /// gets literals substituted into the text.
+    fn resolve_bind_parameter_values(&self, sql: &str) -> Option<String> {
+        // Statements this app generates for itself (a grid save, a browse page)
+        // carry no user placeholder, and their marker text must reach execution
+        // exactly as written.
+        if Self::internal_result_edit_request_id(sql).is_some() {
+            return Some(sql.to_string());
+        }
+
+        // Without a bound connection the run ends in "not connected" whatever
+        // the values are, so asking for them first would be a modal in the way
+        // of an error the user is about to get anyway. The run still proceeds
+        // and reports that error, as it did before this prompt existed.
+        if self.bound_connection().is_none() {
+            return Some(sql.to_string());
+        }
+
+        let db_type = self.current_db_type();
+        let session = self.connection_binding.session_state();
+
+        // The session lock is taken in short scopes and never held across the
+        // modal: the dialog runs its own event loop, and a worker thread waiting
+        // on the session behind it would deadlock the window.
+        let params = {
+            let guard = session
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let remembered = self
+                .last_bind_prompt_values
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            crate::ui::bind_prompt::collect_bind_params(sql, db_type, &guard, &remembered)
+        };
+        if params.is_empty() {
+            return Some(sql.to_string());
+        }
+
+        let answered = crate::ui::bind_prompt_dialog::show(
+            &params,
+            crate::ui::bind_prompt::BindParamType::offered_for(db_type),
+        )?;
+
+        {
+            let mut remembered = self
+                .last_bind_prompt_values
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            for param in &answered {
+                remembered.insert(param.memo_key.clone(), param.into());
+            }
+        }
+
+        let prepared = crate::ui::bind_prompt::prepare(sql, db_type, &answered);
+        if !prepared.session_binds.is_empty() {
+            let mut guard = session
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            for (name, bind) in prepared.session_binds {
+                guard.binds.insert(name, bind);
+            }
+        }
+        Some(prepared.sql)
+    }
+
     fn execute_sql_with_mysql_delimiter_after_lazy_cancel(
         &self,
         sql: &str,
@@ -8815,6 +8887,18 @@ impl SqlEditorWidget {
         if !self.resolve_required_transaction_decision("running the next query", Some(sql)) {
             return false;
         }
+
+        // Same reasoning as the preflight above: every entry point arrives here
+        // with the exact text that is about to run, so asking for placeholder
+        // values once here covers Ctrl+Enter, selection execution, F5 scripts
+        // and F6 explain without a hook in each of them. On MySQL the answers
+        // are substituted into the text, so `sql` below is what actually runs
+        // — the run reservation, the batch and the history row all agree.
+        let bind_prompted_sql = match self.resolve_bind_parameter_values(sql) {
+            Some(prepared) => prepared,
+            None => return false,
+        };
+        let sql = bind_prompted_sql.as_str();
 
         if let Some(session_id) = self.active_lazy_fetch_session() {
             if Self::internal_result_edit_request_id(sql).is_some() {
@@ -14078,6 +14162,7 @@ impl SqlEditorWidget {
                 session,
                 &resolved,
                 execution.values,
+                Some(&execution.value_bind_indices),
                 cancel_flag,
             ) {
                 Ok(updates) => updates,
@@ -14137,6 +14222,7 @@ impl SqlEditorWidget {
                 session,
                 &out_resolved,
                 execution.values,
+                None,
                 cancel_flag,
             ) {
                 Ok(updates) => updates,
@@ -14464,11 +14550,41 @@ impl SqlEditorWidget {
         })
     }
 
+    /// Pair each returned value with the bind it belongs to.
+    ///
+    /// See [`Self::oracle_thin_apply_bind_updates`] for why position alone is
+    /// not enough. A value naming a bind outside `resolved` is dropped rather
+    /// than shifting the ones after it.
+    fn oracle_thin_pair_bind_values<'a>(
+        resolved: &'a [ResolvedBind],
+        values: Vec<OracleValue>,
+        value_bind_indices: Option<&[usize]>,
+    ) -> Vec<(&'a ResolvedBind, OracleValue)> {
+        match value_bind_indices {
+            Some(indices) => indices
+                .iter()
+                .zip(values)
+                .filter_map(|(index, value)| resolved.get(*index).map(|bind| (bind, value)))
+                .collect(),
+            None => resolved.iter().zip(values).collect(),
+        }
+    }
+
+    /// Write the values a statement returned back onto their binds.
+    ///
+    /// `value_bind_indices` says which bind each value belongs to. The server
+    /// decides what comes back — it answers with the statement's real parameter
+    /// modes, so a bind sent as IN OUT that names an `IN` parameter is not
+    /// returned at all, and pairing by position alone would shift every later
+    /// value onto the wrong bind. `None` means the caller already filtered
+    /// `resolved` down to exactly the binds it expects values for, which is what
+    /// the DML `RETURNING` path does.
     fn oracle_thin_apply_bind_updates(
         conn: &mut OracleThinSession,
         session: &Arc<Mutex<SessionState>>,
         resolved: &[ResolvedBind],
         values: Vec<OracleValue>,
+        value_bind_indices: Option<&[usize]>,
         cancel_flag: Option<&Arc<Mutex<bool>>>,
     ) -> Result<OracleThinBindUpdateOutcome, String> {
         let (_colsep, null_text, _trimspool_enabled) =
@@ -14477,7 +14593,9 @@ impl SqlEditorWidget {
         let mut messages = Vec::new();
         let mut ref_cursor_results: Vec<(String, OracleThinRefCursorValue)> = Vec::new();
 
-        for (bind, value) in resolved.iter().zip(values.into_iter()) {
+        for (bind, value) in
+            Self::oracle_thin_pair_bind_values(resolved, values, value_bind_indices)
+        {
             if Self::execute_oracle_thin_cancel_requested(cancel_flag) {
                 Self::oracle_thin_close_cursor_values(
                     conn,
@@ -33997,6 +34115,7 @@ mod print_bind_state_tests {
                     columns: vec!["EMPNO".to_string()],
                     rows: vec![vec!["7369".to_string()]],
                 })),
+                prompted: false,
             },
         );
 
@@ -34030,6 +34149,7 @@ mod print_bind_state_tests {
                     columns: vec!["EMPNO".to_string()],
                     rows: vec![vec!["7369".to_string()]],
                 })),
+                prompted: false,
             },
         );
         session.displayed_cursor_binds.insert("V_RC".to_string());
@@ -34051,6 +34171,7 @@ mod print_bind_state_tests {
                     columns: vec!["ENAME".to_string()],
                     rows: vec![vec!["SMITH".to_string()]],
                 })),
+                prompted: false,
             },
         );
 
@@ -34483,7 +34604,10 @@ mod query_running_reservation_tests {
 
 #[cfg(test)]
 mod mysql_transaction_feedback_tests {
-    use super::{load_mutex_bool, store_mutex_bool, InterruptKind, QueryProgress, SqlEditorWidget};
+    use super::{
+        load_mutex_bool, store_mutex_bool, InterruptKind, OracleValue, QueryProgress,
+        SqlEditorWidget,
+    };
     use crate::db::{
         BindDataType, BindValue, BindVar, ConnectionInfo, DatabaseType, OracleDriverMode,
         QueryExecutor, QueryResult, ResolvedBind, RetainedSessionState, SessionState,
@@ -34638,6 +34762,90 @@ mod mysql_transaction_feedback_tests {
             QueryExecutor::extract_bind_names(sql),
             vec!["V_NUM".to_string(), "V_TXT".to_string()]
         );
+    }
+
+    /// The server answers with the statement's real parameter modes, so a call
+    /// like `p(:dept, :cnt, :rc)` where `p_dept` is `IN` returns two values for
+    /// three binds. Pairing them by position would put the count on `:DEPT` and
+    /// the cursor on `:CNT`.
+    #[test]
+    fn oracle_thin_out_bind_values_follow_the_indices_the_server_reported() {
+        let resolved = vec![
+            ResolvedBind {
+                name: "DEPT".to_string(),
+                data_type: BindDataType::Number,
+                value: Some("30".to_string()),
+            },
+            ResolvedBind {
+                name: "CNT".to_string(),
+                data_type: BindDataType::Number,
+                value: None,
+            },
+            ResolvedBind {
+                name: "RC".to_string(),
+                data_type: BindDataType::RefCursor,
+                value: None,
+            },
+        ];
+
+        let paired = SqlEditorWidget::oracle_thin_pair_bind_values(
+            &resolved,
+            vec![OracleValue::Number("2".to_string()), OracleValue::Null],
+            Some(&[1, 2]),
+        );
+
+        let names: Vec<&str> = paired.iter().map(|(bind, _)| bind.name.as_str()).collect();
+        assert_eq!(names, vec!["CNT", "RC"]);
+        assert!(matches!(paired[0].1, OracleValue::Number(ref text) if text == "2"));
+    }
+
+    /// Without indices the caller has already filtered `resolved` down to the
+    /// binds it expects values for, which is what the DML `RETURNING` path does.
+    #[test]
+    fn oracle_thin_out_bind_values_pair_by_position_when_no_indices_are_given() {
+        let resolved = vec![
+            ResolvedBind {
+                name: "ID_OUT".to_string(),
+                data_type: BindDataType::Number,
+                value: None,
+            },
+            ResolvedBind {
+                name: "NAME_OUT".to_string(),
+                data_type: BindDataType::Varchar2(30),
+                value: None,
+            },
+        ];
+
+        let paired = SqlEditorWidget::oracle_thin_pair_bind_values(
+            &resolved,
+            vec![
+                OracleValue::Number("7".to_string()),
+                OracleValue::Text("ann".to_string()),
+            ],
+            None,
+        );
+
+        let names: Vec<&str> = paired.iter().map(|(bind, _)| bind.name.as_str()).collect();
+        assert_eq!(names, vec!["ID_OUT", "NAME_OUT"]);
+    }
+
+    /// An index outside `resolved` drops its value instead of shifting the rest.
+    #[test]
+    fn oracle_thin_out_bind_values_drop_an_index_with_no_bind() {
+        let resolved = vec![ResolvedBind {
+            name: "CNT".to_string(),
+            data_type: BindDataType::Number,
+            value: None,
+        }];
+
+        let paired = SqlEditorWidget::oracle_thin_pair_bind_values(
+            &resolved,
+            vec![OracleValue::Number("2".to_string()), OracleValue::Null],
+            Some(&[0, 9]),
+        );
+
+        assert_eq!(paired.len(), 1);
+        assert_eq!(paired[0].0.name, "CNT");
     }
 
     #[test]
