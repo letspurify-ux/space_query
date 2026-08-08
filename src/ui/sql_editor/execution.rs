@@ -223,6 +223,11 @@ const PROGRESS_ROWS_MAX_BATCH: usize = 10_000;
 const ORACLE_THIN_LAZY_CLEANUP_FALLBACK_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_SCRIPT_INCLUDE_DEPTH: usize = 64;
 const SESSION_POOL_CANCEL_WAIT_TIMEOUT: Duration = Duration::from_secs(2);
+/// How long the bind prompt waits for the column metadata that names its
+/// parameter types. The user is watching an unopened dialog, so this is short:
+/// past it every unresolved parameter simply opens as `String`, which is where
+/// it opened before the catalog was consulted at all.
+const BIND_PROMPT_COLUMN_LOAD_TIMEOUT: Duration = Duration::from_secs(3);
 const SESSION_POOL_CANCEL_RESPONSE_TIMEOUT: Duration = Duration::from_millis(750);
 const SESSION_POOL_CANCEL_RETRY_INTERVAL: Duration = Duration::from_millis(100);
 const LAZY_FETCH_CANCEL_RETRY_DELAY_SECONDS: f64 = 0.2;
@@ -8756,6 +8761,189 @@ impl SqlEditorWidget {
     /// The two families part ways in [`crate::ui::bind_prompt::prepare`], not
     /// here — Oracle gets session binds and its original text, the MySQL family
     /// gets literals substituted into the text.
+    /// The prompt type each placeholder's column implies.
+    ///
+    /// The dialog cannot tell what `:id` is from its name, but the statement
+    /// names the column beside it and the catalog knows that column's type.
+    /// Metadata that is not loaded yet is fetched here rather than after the
+    /// modal is already on screen: the run is stopped for the dialog anyway,
+    /// and an answer that arrives late is an answer the user cannot see.
+    ///
+    /// Every failure is silent and means "unknown", which lands on the same
+    /// `String` the prompt opened with before any of this existed.
+    fn bind_catalog_param_types(
+        &self,
+        sql: &str,
+        db_type: crate::db::DatabaseType,
+    ) -> HashMap<String, crate::ui::bind_prompt::BindParamType> {
+        let anchors = crate::ui::bind_prompt::bind_anchors(sql, db_type);
+        if anchors.is_empty() {
+            return HashMap::new();
+        }
+
+        let token_spans = crate::ui::sql_editor::query_text::tokenize_sql_spanned(sql);
+        let tokens: std::sync::Arc<[SqlToken]> = token_spans
+            .iter()
+            .map(|span| span.token.clone())
+            .collect::<Vec<_>>()
+            .into();
+
+        // Resolve each anchor to the tables it could belong to before asking
+        // for any metadata, so one round of loading covers the whole statement.
+        let mut resolved: Vec<(String, String, Vec<String>)> = Vec::new();
+        let mut wanted: Vec<String> = Vec::new();
+        for (key, anchor) in anchors {
+            let cursor_token_len = token_spans.partition_point(|span| span.end <= anchor.offset);
+            let context = crate::ui::intellisense_context::analyze_cursor_context_arc(
+                tokens.clone(),
+                cursor_token_len,
+            );
+            let candidates =
+                Self::bind_anchor_candidate_tables(&context, anchor.qualifier.as_deref());
+            if candidates.is_empty() {
+                continue;
+            }
+            for candidate in &candidates {
+                if !wanted.iter().any(|table| table == candidate) {
+                    wanted.push(candidate.clone());
+                }
+            }
+            resolved.push((key, anchor.column, candidates));
+        }
+
+        self.load_column_meta_for_bind_prompt(&wanted, db_type);
+
+        let data = self
+            .intellisense_data
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut types = HashMap::new();
+        for (key, column, candidates) in resolved {
+            // A name that only one visible table carries is that table's; when
+            // several could answer, the first that has the column wins, which
+            // is the same order the completion popup resolves in.
+            let Some(meta) = candidates
+                .iter()
+                .find_map(|table| data.get_column_meta(table, &column))
+            else {
+                continue;
+            };
+            types.insert(
+                key,
+                crate::ui::bind_prompt::param_type_for_data_type(&meta.type_display),
+            );
+        }
+        types
+    }
+
+    /// Tables that could own an anchor's column: the one its qualifier names,
+    /// or every real relation in scope when it was written unqualified.
+    ///
+    /// CTEs and subquery aliases are left out — they have no catalog entry, so
+    /// asking for their columns would only cost a failed round trip.
+    fn bind_anchor_candidate_tables(
+        context: &crate::ui::intellisense_context::CursorContext,
+        qualifier: Option<&str>,
+    ) -> Vec<String> {
+        context
+            .tables_in_scope
+            .iter()
+            .filter(|table| !table.is_cte)
+            .filter(|table| match qualifier {
+                Some(qualifier) => {
+                    table
+                        .alias
+                        .as_deref()
+                        .is_some_and(|alias| alias.eq_ignore_ascii_case(qualifier))
+                        || table.name.eq_ignore_ascii_case(qualifier)
+                        || table
+                            .name
+                            .rsplit('.')
+                            .next()
+                            .is_some_and(|bare| bare.eq_ignore_ascii_case(qualifier))
+                }
+                None => true,
+            })
+            .map(|table| table.name.clone())
+            .collect()
+    }
+
+    /// Load column metadata for `tables` and wait for it, bounded.
+    ///
+    /// The loader normally answers on the editor's own channel, which the
+    /// column-poll timer drains. This takes a private one so the wait cannot
+    /// steal an update the editor is owed, and then applies what it receives
+    /// exactly as that timer would — otherwise the `columns_loading` flag it
+    /// set would never be cleared and the table would look permanently busy.
+    fn load_column_meta_for_bind_prompt(
+        &self,
+        tables: &[String],
+        db_type: crate::db::DatabaseType,
+    ) {
+        if tables.is_empty() {
+            return;
+        }
+        let Some(connection) = self.connection_binding.metadata_connection() else {
+            return;
+        };
+
+        let pending: Vec<String> = {
+            let data = self
+                .intellisense_data
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            tables
+                .iter()
+                .filter(|table| data.get_columns_for_table(table).is_empty())
+                .cloned()
+                .collect()
+        };
+        if pending.is_empty() {
+            return;
+        }
+
+        let (sender, receiver) = mpsc::channel::<ColumnLoadUpdate>();
+        for table in &pending {
+            Self::request_table_columns_for_resolved_scope(
+                table,
+                &self.intellisense_data,
+                &sender,
+                &connection,
+                Some(db_type),
+            );
+        }
+        drop(sender);
+
+        let deadline = Instant::now() + BIND_PROMPT_COLUMN_LOAD_TIMEOUT;
+        loop {
+            let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
+                break;
+            };
+            let Ok(update) = receiver.recv_timeout(remaining) else {
+                break;
+            };
+            let mut data = self
+                .intellisense_data
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if update.is_foreign_keys {
+                continue;
+            }
+            if update.cache_columns {
+                data.set_column_meta_for_table(&update.table, update.column_meta);
+                data.set_columns_for_table(&update.table, update.columns);
+            } else {
+                data.clear_columns_loading(&update.table);
+            }
+            if pending
+                .iter()
+                .all(|table| !data.get_columns_for_table(table).is_empty())
+            {
+                break;
+            }
+        }
+    }
+
     fn resolve_bind_parameter_values(&self, sql: &str) -> Option<String> {
         // Statements this app generates for itself (a grid save, a browse page)
         // carry no user placeholder, and their marker text must reach execution
@@ -8774,6 +8962,9 @@ impl SqlEditorWidget {
 
         let db_type = self.current_db_type();
         let session = self.connection_binding.session_state();
+        // Resolved before the session lock below, because loading metadata
+        // takes its own pooled session and must not do so holding this one.
+        let catalog_types = self.bind_catalog_param_types(sql, db_type);
 
         // The session lock is taken in short scopes and never held across the
         // modal: the dialog runs its own event loop, and a worker thread waiting
@@ -8786,7 +8977,13 @@ impl SqlEditorWidget {
                 .last_bind_prompt_values
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
-            crate::ui::bind_prompt::collect_bind_params(sql, db_type, &guard, &remembered)
+            crate::ui::bind_prompt::collect_bind_params(
+                sql,
+                db_type,
+                &guard,
+                &remembered,
+                &catalog_types,
+            )
         };
         if params.is_empty() {
             return Some(sql.to_string());

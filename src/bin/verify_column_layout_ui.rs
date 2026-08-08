@@ -167,6 +167,37 @@ fn main() {
         !exported.contains("a1") && exported.contains("c1"),
         format!("CSV was {exported:?}"),
     );
+    report.eq(
+        "a hidden column is drawn at zero width",
+        grid.capture_tour_column_width(1),
+        0,
+    );
+
+    // ---- Showing it again brings it back --------------------------------
+    // Hiding zeroes the width, so re-checking the column has to hand it a
+    // width back; without that it stays invisible while claiming to be shown.
+    let mut plan = grid
+        .column_layout_plan()
+        .unwrap_or_else(|err| fail(format!("layout plan: {err}")));
+    plan.set_visible(1, true)
+        .unwrap_or_else(|err| fail(format!("show: {err}")));
+    grid.apply_column_layout(&plan)
+        .unwrap_or_else(|err| fail(format!("apply show: {err}")));
+    app::check();
+    report.check(
+        "a column shown again is drawn with a real width",
+        grid.capture_tour_column_width(1) > 0,
+        format!(
+            "column 1 was {} pixels wide after being shown again",
+            grid.capture_tour_column_width(1)
+        ),
+    );
+    let exported = grid.export_to_csv();
+    report.check(
+        "a column shown again is exported again",
+        exported.contains("a1"),
+        format!("CSV was {exported:?}"),
+    );
 
     // ---- A new result does not inherit the old arrangement ---------------
     grid.display_result(&result(&["X", "Y", "Z"], &[&["x1", "y1", "z1"]]));

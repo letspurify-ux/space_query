@@ -997,6 +997,29 @@ impl SqlEditorWidget {
                                 return true;
                             }
                             Key::Enter | Key::KPEnter | Key::Tab => {
+                                // Tab belongs to a code snippet first, even
+                                // with the popup up: `sel` + Tab is the
+                                // template, `sel` + Enter is the completion.
+                                // The two features answer to the same word, so
+                                // one key each is what keeps both reachable.
+                                // Both calls report false and change nothing
+                                // when there is no template to act on, so the
+                                // completion below still gets the key.
+                                if key == Key::Tab
+                                    && ((widget_for_shortcuts.snippet_session_is_active()
+                                        && widget_for_shortcuts.advance_snippet_placeholder())
+                                        || widget_for_shortcuts.expand_snippet_at_cursor())
+                                {
+                                    Self::request_intellisense_popup_hide(
+                                        &intellisense_popup_for_handle,
+                                        &intellisense_runtime_for_handle,
+                                    );
+                                    Self::invalidate_and_clear_pending_intellisense_state(
+                                        &intellisense_runtime_for_handle,
+                                    );
+                                    snippet_tab_keyup_for_handle = true;
+                                    return true;
+                                }
                                 // Insert selected suggestion, consume event
                                 let selected = intellisense_popup_for_handle
                                     .lock()

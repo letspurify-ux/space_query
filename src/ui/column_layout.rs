@@ -235,6 +235,27 @@ pub fn permute<T>(values: &mut Vec<T>, order: &[usize]) -> bool {
     true
 }
 
+/// Give a column that is coming back into view a width again.
+///
+/// Hiding a column is "set its width to zero", so the widths a grid reads back
+/// off itself report zero for everything currently hidden. Writing those back
+/// verbatim leaves a column the user just re-checked invisible: listed by the
+/// dialog, present in every export, and zero pixels wide on screen. Any column
+/// without a width takes its measured one instead; the caller zeroes the
+/// still-hidden ones again afterwards, so this does not need to know which are
+/// which.
+pub fn restore_missing_widths(widths: &mut [i32], measured: &[i32], fallback: i32) {
+    for (index, width) in widths.iter_mut().enumerate() {
+        if *width <= 0 {
+            *width = measured
+                .get(index)
+                .copied()
+                .filter(|w| *w > 0)
+                .unwrap_or(fallback);
+        }
+    }
+}
+
 pub fn is_permutation(order: &[usize], len: usize) -> bool {
     if order.len() != len {
         return false;
@@ -252,6 +273,34 @@ pub fn is_permutation(order: &[usize], len: usize) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_column_coming_back_into_view_gets_its_width_back() {
+        // Hiding zeroes a width, so the grid reads zero back for column 1 on
+        // the next arrangement. Restoring that verbatim is what left a
+        // re-checked column invisible.
+        let mut widths = vec![80, 0, 120];
+        restore_missing_widths(&mut widths, &[80, 95, 120], 40);
+        assert_eq!(widths, vec![80, 95, 120]);
+    }
+
+    #[test]
+    fn a_width_the_user_dragged_survives_a_rearrangement() {
+        // Only missing widths are replaced: a column that is already showing
+        // keeps the width the user dragged it to.
+        let mut widths = vec![300, 40];
+        restore_missing_widths(&mut widths, &[80, 95], 40);
+        assert_eq!(widths, vec![300, 40]);
+    }
+
+    #[test]
+    fn a_revealed_column_without_a_measurement_still_gets_a_usable_width() {
+        // A measurement list that is short or itself zero must not hand back
+        // the zero we are here to remove.
+        let mut widths = vec![0, 0];
+        restore_missing_widths(&mut widths, &[0], 40);
+        assert_eq!(widths, vec![40, 40]);
+    }
 
     fn row(grid_index: usize, name: &str) -> ColumnLayoutRow {
         ColumnLayoutRow {

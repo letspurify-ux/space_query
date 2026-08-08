@@ -193,8 +193,16 @@ fn count_rust_tests_in_dir(
     let mut count = 0;
     for path in files {
         let source = fs::read_to_string(&path)?;
-        let parsed = syn::parse_file(&source)?;
-        count += count_test_items(&parsed.items, ctx)?;
+        // syn names neither the file nor, without `span-locations`, the line —
+        // and cargo prints only what this returns. A syntax error or an
+        // unsupported `cfg` anywhere under src/ or tests/ used to fail the
+        // build with nothing but the message, leaving 130-odd files to search.
+        // The path is added here rather than by turning on `span-locations`,
+        // which would slow this scan over every build.
+        let parsed =
+            syn::parse_file(&source).map_err(|err| format!("{}: {err}", path.display()))?;
+        count += count_test_items(&parsed.items, ctx)
+            .map_err(|err| format!("{}: {err}", path.display()))?;
     }
 
     Ok(count)

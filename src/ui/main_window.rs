@@ -11121,7 +11121,23 @@ impl MainWindow {
                         connect_policy,
                     )
                 };
-                if let Some(info) = ConnectionDialog::show_with_registry(popups) {
+                let chosen = ConnectionDialog::show_with_registry(popups);
+                // The dialog keeps its own copy of the config and writes the
+                // saved-connection list straight to disk, so anything saved,
+                // renamed or deleted in it is invisible to the copy this window
+                // loaded at startup. Reconnect looks the active profile up in
+                // that list, so it is brought back in step here rather than
+                // left to drift for the rest of the session.
+                {
+                    let s = state
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    s.config
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .adopt_saved_connections(AppConfig::load());
+                }
+                if let Some(info) = chosen {
                     let profile_name = info.name.clone();
                     let runtime = registry.saved_runtime(&profile_name).unwrap_or_else(|| {
                         let connection = create_shared_connection();
@@ -11297,7 +11313,10 @@ impl MainWindow {
                         .find(|info| info.name == profile_name)
                         .cloned()
                     else {
-                        crate::ui::alert_on_main("The saved connection profile no longer exists.");
+                        crate::ui::alert_on_main(&format!(
+                            "'{profile_name}' is not among the saved connections, so there \
+                             are no details to reconnect with. Use Connect to enter them."
+                        ));
                         return true;
                     };
                     (

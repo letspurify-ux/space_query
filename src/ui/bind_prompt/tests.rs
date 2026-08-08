@@ -8,7 +8,13 @@ fn session(db_type: DatabaseType) -> SessionState {
 }
 
 fn params(sql: &str, db_type: DatabaseType) -> Vec<BindParam> {
-    collect_bind_params(sql, db_type, &session(db_type), &HashMap::new())
+    collect_bind_params(
+        sql,
+        db_type,
+        &session(db_type),
+        &HashMap::new(),
+        &HashMap::new(),
+    )
 }
 
 fn labels(sql: &str, db_type: DatabaseType) -> Vec<String> {
@@ -37,6 +43,275 @@ fn filled(sql: &str, db_type: DatabaseType, values: &[(BindParamType, &str)]) ->
 const ORACLE: DatabaseType = DatabaseType::Oracle;
 const MYSQL: DatabaseType = DatabaseType::MySQL;
 const MARIADB: DatabaseType = DatabaseType::MariaDB;
+
+fn anchor(sql: &str, db_type: DatabaseType) -> Vec<(String, Option<String>, String)> {
+    bind_anchors(sql, db_type)
+        .into_iter()
+        .map(|(key, anchor)| (key, anchor.qualifier, anchor.column))
+        .collect()
+}
+
+#[test]
+fn a_comparison_names_the_column_the_placeholder_is_measured_against() {
+    for db_type in [ORACLE, MYSQL, MARIADB] {
+        assert_eq!(
+            anchor("SELECT * FROM emp WHERE hire_date = :d", db_type),
+            vec![("D".to_string(), None, "hire_date".to_string())],
+            "{db_type:?}"
+        );
+        assert_eq!(
+            anchor("SELECT * FROM emp e WHERE e.sal >= :low", db_type),
+            vec![("LOW".to_string(), Some("e".to_string()), "sal".to_string())],
+            "{db_type:?}"
+        );
+        assert_eq!(
+            anchor("UPDATE emp SET hired = :d WHERE id = :id", db_type),
+            vec![
+                ("D".to_string(), None, "hired".to_string()),
+                ("ID".to_string(), None, "id".to_string()),
+            ],
+            "{db_type:?}"
+        );
+        assert_eq!(
+            anchor("SELECT * FROM emp WHERE name LIKE :pattern", db_type),
+            vec![("PATTERN".to_string(), None, "name".to_string())],
+            "{db_type:?}"
+        );
+    }
+}
+
+#[test]
+fn a_range_and_a_list_name_their_column_too() {
+    assert_eq!(
+        anchor(
+            "SELECT * FROM emp WHERE hired BETWEEN :from AND :to",
+            ORACLE
+        ),
+        vec![
+            ("FROM".to_string(), None, "hired".to_string()),
+            ("TO".to_string(), None, "hired".to_string()),
+        ]
+    );
+    assert_eq!(
+        anchor("SELECT * FROM emp WHERE dept IN (:a, :b)", ORACLE),
+        vec![
+            ("A".to_string(), None, "dept".to_string()),
+            ("B".to_string(), None, "dept".to_string()),
+        ]
+    );
+}
+
+#[test]
+fn an_insert_pairs_each_value_with_its_own_column() {
+    assert_eq!(
+        anchor(
+            "INSERT INTO emp (id, name, hired) VALUES (:id, :name, :hired)",
+            ORACLE
+        ),
+        vec![
+            ("ID".to_string(), None, "id".to_string()),
+            ("NAME".to_string(), None, "name".to_string()),
+            ("HIRED".to_string(), None, "hired".to_string()),
+        ]
+    );
+    assert_eq!(
+        anchor("INSERT INTO emp (id, name) VALUES (?, ?)", MYSQL),
+        vec![
+            ("?1".to_string(), None, "id".to_string()),
+            ("?2".to_string(), None, "name".to_string()),
+        ]
+    );
+}
+
+#[test]
+fn a_quoted_column_and_a_quoted_alias_are_read_unquoted() {
+    assert_eq!(
+        anchor(r#"SELECT * FROM emp e WHERE e."Hire Date" = :d"#, ORACLE),
+        vec![(
+            "D".to_string(),
+            Some("e".to_string()),
+            "Hire Date".to_string()
+        )]
+    );
+    assert_eq!(
+        anchor("SELECT * FROM emp WHERE `hire date` = :d", MYSQL),
+        vec![("D".to_string(), None, "hire date".to_string())]
+    );
+}
+
+#[test]
+fn nothing_is_claimed_where_the_statement_names_no_column() {
+    // An expression has no catalog type, and reporting the column inside it
+    // would be a different claim than the statement makes.
+    assert!(anchor("SELECT * FROM emp WHERE UPPER(name) = :n", ORACLE).is_empty());
+    assert!(anchor("SELECT * FROM emp FETCH FIRST :n ROWS ONLY", ORACLE).is_empty());
+    // A literal that looks like syntax must not be read as syntax.
+    assert!(
+        anchor("SELECT 'hired =' AS a FROM emp WHERE x = :y", ORACLE)
+            .iter()
+            .all(|(_, _, column)| column == "x")
+    );
+    // A commented-out comparison is not the one in force.
+    assert_eq!(
+        anchor(
+            "SELECT * FROM emp\n-- WHERE hired =\nWHERE id = :id",
+            ORACLE
+        ),
+        vec![("ID".to_string(), None, "id".to_string())]
+    );
+}
+
+#[test]
+fn a_data_type_maps_to_the_prompt_type_that_can_carry_it() {
+    for (type_display, expected) in [
+        ("NUMBER(10,2)", BindParamType::Number),
+        ("NUMBER", BindParamType::Number),
+        ("BINARY_DOUBLE", BindParamType::Number),
+        ("int(11)", BindParamType::Number),
+        ("bigint unsigned", BindParamType::Number),
+        ("decimal(12,4)", BindParamType::Number),
+        ("DATE", BindParamType::Date),
+        ("date", BindParamType::Date),
+        ("TIMESTAMP(6)", BindParamType::Timestamp),
+        ("TIMESTAMP(6) WITH TIME ZONE", BindParamType::Timestamp),
+        ("datetime(3)", BindParamType::Timestamp),
+        ("timestamp", BindParamType::Timestamp),
+        ("VARCHAR2(64)", BindParamType::String),
+        ("varchar(64)", BindParamType::String),
+        ("CLOB", BindParamType::String),
+        ("text", BindParamType::String),
+        ("RAW(16)", BindParamType::String),
+        ("time", BindParamType::String),
+        ("REF CURSOR", BindParamType::RefCursor),
+        ("SYS_REFCURSOR", BindParamType::RefCursor),
+    ] {
+        assert_eq!(
+            param_type_for_data_type(type_display),
+            expected,
+            "{type_display}"
+        );
+    }
+}
+
+fn types(sql: &str, db_type: DatabaseType) -> Vec<BindParamType> {
+    params(sql, db_type)
+        .into_iter()
+        .map(|param| param.param_type)
+        .collect()
+}
+
+#[test]
+fn a_row_count_placeholder_opens_as_a_number() {
+    // A quoted value here is a parse error, not a wrong result, so the dialog
+    // must not open on String and wait to be corrected.
+    assert_eq!(
+        types("SELECT * FROM emp FETCH FIRST :n ROWS ONLY", ORACLE),
+        vec![BindParamType::Number]
+    );
+    assert_eq!(
+        types(
+            "SELECT * FROM emp OFFSET :skip ROWS FETCH NEXT :n ROWS ONLY",
+            ORACLE
+        ),
+        vec![BindParamType::Number, BindParamType::Number]
+    );
+    assert_eq!(
+        types("SELECT * FROM emp WHERE ROWNUM <= :n", ORACLE),
+        vec![BindParamType::Number]
+    );
+    for db_type in [MYSQL, MARIADB] {
+        assert_eq!(
+            types("SELECT * FROM emp LIMIT :n", db_type),
+            vec![BindParamType::Number],
+            "{db_type:?}"
+        );
+        assert_eq!(
+            types("SELECT * FROM emp LIMIT :n OFFSET :skip", db_type),
+            vec![BindParamType::Number, BindParamType::Number],
+            "{db_type:?}"
+        );
+    }
+}
+
+#[test]
+fn a_positional_row_count_opens_as_a_number_too() {
+    assert_eq!(
+        types("SELECT * FROM emp WHERE name = ? LIMIT ?", MYSQL),
+        vec![BindParamType::String, BindParamType::Number]
+    );
+}
+
+#[test]
+fn an_out_cursor_opens_as_a_ref_cursor() {
+    assert_eq!(
+        types("BEGIN OPEN :rc FOR SELECT * FROM emp; END;", ORACLE),
+        vec![BindParamType::RefCursor]
+    );
+    // The MySQL family is never offered the type, so it must not be guessed
+    // there even if the word shows up.
+    assert_eq!(
+        types("SELECT * FROM emp WHERE state = :open", MYSQL),
+        vec![BindParamType::String]
+    );
+}
+
+#[test]
+fn an_ordinary_value_is_left_as_a_string() {
+    // Nothing here says what `:id` is, and String is the only answer that
+    // cannot turn a working statement into a failing one.
+    for db_type in [ORACLE, MYSQL, MARIADB] {
+        assert_eq!(
+            types("SELECT * FROM emp WHERE id = :id AND name = :name", db_type),
+            vec![BindParamType::String, BindParamType::String],
+            "{db_type:?}"
+        );
+        // A format string is a string, and the default already says so.
+        assert_eq!(
+            types(
+                "SELECT * FROM emp WHERE hired = TO_DATE(:d, 'YYYY-MM-DD')",
+                db_type
+            ),
+            vec![BindParamType::String],
+            "{db_type:?}"
+        );
+    }
+}
+
+#[test]
+fn a_guess_never_overrides_the_answer_the_user_already_gave() {
+    let mut remembered = HashMap::new();
+    remembered.insert(
+        "N".to_string(),
+        RememberedValue {
+            param_type: BindParamType::String,
+            value: "10".to_string(),
+            is_null: false,
+        },
+    );
+    let collected = collect_bind_params(
+        "SELECT * FROM emp FETCH FIRST :n ROWS ONLY",
+        ORACLE,
+        &session(ORACLE),
+        &remembered,
+        &HashMap::new(),
+    );
+    assert_eq!(collected[0].param_type, BindParamType::String);
+    assert_eq!(collected[0].value, "10");
+}
+
+#[test]
+fn a_word_that_only_looks_like_a_clause_does_not_force_a_number() {
+    // `limit` as a column name, and the same word inside a literal, must not
+    // reach the placeholder beside it.
+    assert_eq!(
+        types("SELECT * FROM t WHERE limit_kind = :kind", MYSQL),
+        vec![BindParamType::String]
+    );
+    assert_eq!(
+        types("SELECT ':limit' AS a FROM t WHERE b = :c", MYSQL),
+        vec![BindParamType::String]
+    );
+}
 
 #[test]
 fn a_named_bind_is_prompted_once_per_name() {
@@ -110,6 +385,7 @@ fn a_bind_already_in_the_session_is_not_prompted() {
         ORACLE,
         &state,
         &HashMap::new(),
+        &HashMap::new(),
     );
     assert!(collected.is_empty());
 }
@@ -130,6 +406,7 @@ fn a_declared_bind_holding_a_value_is_not_prompted() {
         ORACLE,
         &state,
         &HashMap::new(),
+        &HashMap::new(),
     )
     .is_empty());
 }
@@ -149,7 +426,7 @@ fn a_declaration_matches_the_use_whatever_the_case() {
         "SELECT * FROM emp WHERE id = :Id",
     ] {
         assert!(
-            collect_bind_params(sql, ORACLE, &state, &HashMap::new()).is_empty(),
+            collect_bind_params(sql, ORACLE, &state, &HashMap::new(), &HashMap::new()).is_empty(),
             "{sql}"
         );
     }
@@ -173,6 +450,7 @@ fn a_declared_refcursor_bind_is_not_prompted() {
         ORACLE,
         &state,
         &HashMap::new(),
+        &HashMap::new(),
     )
     .is_empty());
 
@@ -192,7 +470,7 @@ fn a_prompted_bind_is_asked_about_again_on_the_next_run() {
     let sql = "SELECT * FROM emp WHERE id = :id";
     let mut state = session(ORACLE);
 
-    let mut first = collect_bind_params(sql, ORACLE, &state, &HashMap::new());
+    let mut first = collect_bind_params(sql, ORACLE, &state, &HashMap::new(), &HashMap::new());
     assert_eq!(first.len(), 1);
     first[0].param_type = BindParamType::Number;
     first[0].value = "7".to_string();
@@ -206,7 +484,7 @@ fn a_prompted_bind_is_asked_about_again_on_the_next_run() {
         .iter()
         .map(|param| (param.memo_key.clone(), RememberedValue::from(param)))
         .collect();
-    let second = collect_bind_params(sql, ORACLE, &state, &remembered);
+    let second = collect_bind_params(sql, ORACLE, &state, &remembered, &HashMap::new());
 
     assert_eq!(second.len(), 1, "the prompt must come back on the next run");
     assert_eq!(second[0].param_type, BindParamType::Number);
@@ -228,6 +506,7 @@ fn declaring_a_previously_prompted_bind_stops_the_prompt() {
             ORACLE,
             &state,
             &HashMap::new(),
+            &HashMap::new(),
         )
         .len(),
         1,
@@ -241,6 +520,7 @@ fn declaring_a_previously_prompted_bind_stops_the_prompt() {
         "SELECT * FROM emp WHERE id = :id",
         ORACLE,
         &state,
+        &HashMap::new(),
         &HashMap::new(),
     )
     .is_empty());
@@ -260,6 +540,7 @@ fn only_the_undeclared_names_are_prompted_when_a_statement_mixes_both() {
         ORACLE,
         &state,
         &HashMap::new(),
+        &HashMap::new(),
     );
 
     let names: Vec<&str> = collected.iter().map(|param| param.label.as_str()).collect();
@@ -276,7 +557,7 @@ fn preparing_a_mixed_statement_writes_back_only_the_prompted_names() {
     declared.value = BindValue::Scalar(Some("7".to_string()));
     state.binds.insert("ID".to_string(), declared);
 
-    let mut collected = collect_bind_params(sql, ORACLE, &state, &HashMap::new());
+    let mut collected = collect_bind_params(sql, ORACLE, &state, &HashMap::new(), &HashMap::new());
     assert_eq!(collected.len(), 1);
     collected[0].param_type = BindParamType::Number;
     collected[0].value = "3".to_string();
@@ -339,6 +620,7 @@ fn a_declared_bind_and_a_remembered_one_are_told_apart() {
         ORACLE,
         &state,
         &remembered,
+        &HashMap::new(),
     );
 
     assert_eq!(collected.len(), 1);
@@ -358,6 +640,7 @@ fn a_generated_name_avoids_a_declared_bind() {
         "SELECT * FROM emp WHERE id = :sq_p1 AND dept = ?",
         ORACLE,
         &state,
+        &HashMap::new(),
         &HashMap::new(),
     );
     assert_eq!(collected.len(), 1, "the declared name is not prompted");
@@ -589,6 +872,7 @@ fn a_remembered_answer_prefills_the_next_prompt() {
         ORACLE,
         &session(ORACLE),
         &remembered,
+        &HashMap::new(),
     );
 
     assert_eq!(collected[0].param_type, BindParamType::Number);

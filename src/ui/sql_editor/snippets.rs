@@ -600,6 +600,37 @@ mod tests {
     }
 
     #[test]
+    fn every_abbreviation_that_a_keyword_also_answers_to_is_reachable_by_tab() {
+        // `sel` is an abbreviation here and a prefix of SELECT in the
+        // completion popup, so both features want the same keystroke. They
+        // split it: Tab expands the template, Enter takes the completion.
+        // Listing the overlap here is what makes that split look deliberate to
+        // the next reader instead of arbitrary.
+        let overlapping: Vec<&str> = SNIPPETS
+            .iter()
+            .map(|snippet| snippet.abbreviation)
+            .filter(|abbreviation| {
+                let upper = abbreviation.to_ascii_uppercase();
+                crate::sql_text::ORACLE_SQL_KEYWORDS
+                    .iter()
+                    .any(|keyword| keyword.starts_with(&upper))
+            })
+            .collect();
+
+        assert!(
+            overlapping.contains(&"sel"),
+            "`sel` no longer collides with a keyword, so the Tab/Enter split \
+             would need a different reason: {overlapping:?}"
+        );
+        for abbreviation in overlapping {
+            assert!(
+                snippet_for(abbreviation).is_some(),
+                "`{abbreviation}` is shadowed by a keyword and has no template to reach"
+            );
+        }
+    }
+
+    #[test]
     fn the_reference_lists_every_snippet() {
         let text = reference_text();
         for snippet in SNIPPETS {

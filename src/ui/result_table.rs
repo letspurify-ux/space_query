@@ -10173,6 +10173,33 @@ impl ResultTableWidget {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = plan.hidden_positions();
 
+        // A column that was hidden reads back a width of zero, so one the user
+        // has just re-checked needs a real width before it is written back or
+        // it stays invisible. Measured the same way the grid measures on load.
+        if widths.iter().any(|width| *width <= 0) {
+            let font_size = self.font_settings.size();
+            let max_cell_display_chars = *self
+                .max_cell_display_chars
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let measured = {
+                let headers = self
+                    .headers
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                let rows = self
+                    .full_data
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                Self::compute_column_widths(&headers, &rows, font_size, max_cell_display_chars)
+            };
+            crate::ui::column_layout::restore_missing_widths(
+                &mut widths,
+                &measured,
+                Self::min_col_width_for_font(font_size),
+            );
+        }
+
         self.invalidate_search_for_new_data();
         self.table.set_selection(-1, -1, -1, -1);
         for (index, width) in widths.iter().enumerate() {
@@ -10760,6 +10787,15 @@ impl ResultTableWidget {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .clone()
+    }
+
+    /// What a column is actually drawn at, for the verification bins.
+    ///
+    /// Zero is how the grid hides a column, so this is what tells a hidden one
+    /// apart from a shown one.
+    #[doc(hidden)]
+    pub fn capture_tour_column_width(&self, column: usize) -> i32 {
+        self.table.col_width(column as i32)
     }
 
     /// One stored row, for the verification bins.

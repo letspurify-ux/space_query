@@ -466,6 +466,20 @@ impl AppConfig {
     pub fn get_all_connections(&self) -> &Vec<ConnectionInfo> {
         &self.recent_connections
     }
+
+    /// Take the saved-connection list from `saved`, leaving every other
+    /// setting on `self` alone.
+    ///
+    /// The connection dialog edits its own copy of the config and writes the
+    /// result to disk, so a window that loaded its copy at startup never sees
+    /// a connection saved, renamed or deleted since. Reconnect reads that list
+    /// to find the profile to re-authenticate and reports it missing. Only the
+    /// two fields the dialog owns are taken, because the caller's copy may
+    /// hold newer values for everything else.
+    pub fn adopt_saved_connections(&mut self, saved: AppConfig) {
+        self.recent_connections = saved.recent_connections;
+        self.last_connection = saved.last_connection;
+    }
 }
 
 impl AppConfig {
@@ -701,6 +715,40 @@ mod tests {
             read_only: false,
             debug_oracle_thin_protocol_version: None,
         }
+    }
+
+    #[test]
+    fn adopting_saved_connections_takes_the_list_without_the_other_settings() {
+        // The window's copy is a startup snapshot; the dialog's is what is on
+        // disk now. Reconnect reads the list, so the list has to come across —
+        // but a setting the window changed since must not be rolled back with
+        // it.
+        let mut window = AppConfig::new();
+        window.recent_connections.push(sample_connection("stale"));
+        window.last_connection = Some("stale".to_string());
+        window.editor_soft_wrap = !AppConfig::new().editor_soft_wrap;
+        let soft_wrap = window.editor_soft_wrap;
+
+        let mut disk = AppConfig::new();
+        disk.recent_connections
+            .push(sample_connection("saved-today"));
+        disk.last_connection = Some("saved-today".to_string());
+
+        window.adopt_saved_connections(disk);
+
+        assert_eq!(
+            window
+                .recent_connections
+                .iter()
+                .map(|info| info.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["saved-today"]
+        );
+        assert_eq!(window.last_connection.as_deref(), Some("saved-today"));
+        assert_eq!(
+            window.editor_soft_wrap, soft_wrap,
+            "a setting the window owns must survive the adoption"
+        );
     }
 
     #[test]

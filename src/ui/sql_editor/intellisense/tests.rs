@@ -11903,6 +11903,14 @@ fn delete_auto_trigger_does_not_require_an_already_visible_popup() {
     assert!(!SqlEditorWidget::should_auto_trigger_after_delete(""));
 }
 
+/// Column-load tests hand their task to the process-wide 4-worker pool in
+/// `COLUMN_LOAD_WORKER_POOL`, which every other test in this binary shares.
+/// A busy connection makes each task burn its `COLUMN_LOAD_CONTEXT_RETRY_DELAYS`
+/// budget before it answers, so under a saturated suite the queue behind those
+/// four workers — not the code under test — decides how long the update takes.
+/// A regression sends nothing at all, so a generous bound still fails it.
+const COLUMN_LOAD_UPDATE_TIMEOUT: Duration = Duration::from_secs(5);
+
 #[test]
 fn request_table_columns_releases_loading_when_connection_busy() {
     let data = Arc::new(Mutex::new(IntellisenseData::new()));
@@ -11919,7 +11927,7 @@ fn request_table_columns_releases_loading_when_connection_busy() {
     SqlEditorWidget::request_table_columns("EMP", &data, &sender, &connection);
 
     let update = receiver
-        .recv_timeout(Duration::from_secs(1))
+        .recv_timeout(COLUMN_LOAD_UPDATE_TIMEOUT)
         .expect("column loader should emit a completion update even when lock is busy");
     assert_eq!(update.table, "EMP");
     assert!(update.columns.is_empty());
@@ -11952,9 +11960,8 @@ fn mysql_virtual_wildcard_column_request_preserves_case_while_connection_busy() 
     );
 
     // The full library suite starts many background loader tests concurrently;
-    // keep the assertion bounded while allowing scheduler headroom.
     let update = receiver
-        .recv_timeout(Duration::from_secs(5))
+        .recv_timeout(COLUMN_LOAD_UPDATE_TIMEOUT)
         .expect("busy MySQL wildcard load should complete without losing catalog case");
     assert_eq!(update.table, "cfb_user");
     assert!(!update.cache_columns);
@@ -11981,7 +11988,7 @@ fn request_table_columns_handles_quoted_schema_and_table_names() {
     );
 
     let update = receiver
-        .recv_timeout(Duration::from_secs(1))
+        .recv_timeout(COLUMN_LOAD_UPDATE_TIMEOUT)
         .expect("quoted schema/table names should normalize before relation lookup");
     assert_eq!(update.table, "SCHEMA.TABLE.NAME");
     assert!(!update.cache_columns);
@@ -12003,7 +12010,7 @@ fn request_table_columns_handles_backtick_quoted_schema_and_table_names() {
     SqlEditorWidget::request_table_columns("`SCHEMA`.`TABLE.NAME`", &data, &sender, &connection);
 
     let update = receiver
-        .recv_timeout(Duration::from_secs(1))
+        .recv_timeout(COLUMN_LOAD_UPDATE_TIMEOUT)
         .expect("backtick-quoted schema/table names should normalize before relation lookup");
     assert_eq!(update.table, "SCHEMA.TABLE.NAME");
     assert!(!update.cache_columns);
@@ -12025,7 +12032,7 @@ fn request_table_columns_handles_bracket_quoted_schema_and_table_names() {
     SqlEditorWidget::request_table_columns("[SCHEMA].[TABLE.NAME]", &data, &sender, &connection);
 
     let update = receiver
-        .recv_timeout(Duration::from_secs(1))
+        .recv_timeout(COLUMN_LOAD_UPDATE_TIMEOUT)
         .expect("bracket-quoted schema/table names should normalize before relation lookup");
     assert_eq!(update.table, "SCHEMA.TABLE.NAME");
     assert!(!update.cache_columns);
@@ -12079,7 +12086,7 @@ fn request_table_columns_keeps_exact_dotted_relation_name() {
     SqlEditorWidget::request_table_columns("A.B", &data, &sender, &connection);
 
     let update = receiver
-        .recv_timeout(Duration::from_secs(1))
+        .recv_timeout(COLUMN_LOAD_UPDATE_TIMEOUT)
         .expect("known dotted relation name should still be used for column loading");
     assert_eq!(update.table, "A.B");
     assert!(!update.cache_columns);
@@ -12122,7 +12129,7 @@ fn request_table_columns_uses_default_qualifier_for_unqualified_name() {
     SqlEditorWidget::request_table_columns("EMP", &data, &sender, &connection);
 
     let update = receiver
-        .recv_timeout(Duration::from_secs(1))
+        .recv_timeout(COLUMN_LOAD_UPDATE_TIMEOUT)
         .expect("selected default qualifier should drive unqualified column loading");
     assert_eq!(update.table, "SCOTT.EMP");
     assert!(!update.cache_columns);
@@ -12176,7 +12183,7 @@ fn request_resolved_mysql_scope_columns_without_catalog_entry() {
     );
 
     let update = receiver
-        .recv_timeout(Duration::from_secs(1))
+        .recv_timeout(COLUMN_LOAD_UPDATE_TIMEOUT)
         .expect("resolved FROM-scope table should request columns even before catalog load");
     assert_eq!(update.table, "cfb_user");
     assert!(!update.cache_columns);
@@ -12200,7 +12207,7 @@ fn request_table_columns_keeps_selected_qualifier_for_qualified_name() {
     SqlEditorWidget::request_table_columns("SCOTT.EMP", &data, &sender, &connection);
 
     let update = receiver
-        .recv_timeout(Duration::from_secs(1))
+        .recv_timeout(COLUMN_LOAD_UPDATE_TIMEOUT)
         .expect("schema-qualified names should keep the explicit qualifier");
     assert_eq!(update.table, "SCOTT.EMP");
     assert!(!update.cache_columns);
@@ -53385,9 +53392,16 @@ fn oracle_test_all_intellisense_data() -> IntellisenseData {
 /// reports misses that are metadata artifacts rather than completion bugs.
 /// Overlay the file-local catalog on top of the shared one.
 fn oracle_test_file_scoped_intellisense_data(file_name: &str) -> IntellisenseData {
+    static CACHE: OnceLock<Mutex<HashMap<String, IntellisenseData>>> = OnceLock::new();
+    let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    if let Some(data) = lock_or_recover(cache).get(file_name) {
+        return data.clone();
+    }
     let mut catalog = oracle_catalog_from_test_all_scripts();
     oracle_collect_script_catalog_entries(load_intellisense_test_file(file_name), &mut catalog);
-    oracle_intellisense_data_from_catalog(&catalog)
+    let data = oracle_intellisense_data_from_catalog(&catalog);
+    lock_or_recover(cache).insert(file_name.to_string(), data.clone());
+    data
 }
 
 #[test]
@@ -55658,6 +55672,21 @@ fn is_mariadb_virtual_sequence_table_name(name: &str) -> bool {
 }
 
 fn mysql_family_test_intellisense_data(
+    file_name: &str,
+    db_type: crate::db::DatabaseType,
+) -> IntellisenseData {
+    static CACHE: OnceLock<Mutex<HashMap<String, IntellisenseData>>> = OnceLock::new();
+    let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    let key = format!("{db_type:?}/{file_name}");
+    if let Some(data) = lock_or_recover(cache).get(&key) {
+        return data.clone();
+    }
+    let data = mysql_family_test_intellisense_data_uncached(file_name, db_type);
+    lock_or_recover(cache).insert(key, data.clone());
+    data
+}
+
+fn mysql_family_test_intellisense_data_uncached(
     file_name: &str,
     db_type: crate::db::DatabaseType,
 ) -> IntellisenseData {

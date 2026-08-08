@@ -293,6 +293,45 @@ impl Target {
         }
     }
 
+    /// `(label, bare column, the type the prompt should open on)`.
+    ///
+    /// One entry per column of the types table, so every data type each backend
+    /// can hand back is covered — including the ones whose answer is `String`,
+    /// where the assertion is that nothing was guessed.
+    fn inference_cases(self) -> Vec<(&'static str, &'static str, BindParamType)> {
+        if self.is_oracle() {
+            vec![
+                ("NUMBER", "N_INT", BindParamType::Number),
+                ("NUMBER(9,2)", "N_DEC", BindParamType::Number),
+                ("BINARY_DOUBLE", "N_DBL", BindParamType::Number),
+                ("VARCHAR2", "V", BindParamType::String),
+                ("CHAR", "C", BindParamType::String),
+                ("NVARCHAR2", "NV", BindParamType::String),
+                ("DATE", "D", BindParamType::Date),
+                ("TIMESTAMP", "TS", BindParamType::Timestamp),
+                ("TIMESTAMP WITH TIME ZONE", "TSTZ", BindParamType::Timestamp),
+                ("CLOB", "CL", BindParamType::String),
+                ("RAW", "R", BindParamType::String),
+            ]
+        } else {
+            vec![
+                ("INT", "N_INT", BindParamType::Number),
+                ("BIGINT", "N_BIG", BindParamType::Number),
+                ("DECIMAL(9,2)", "N_DEC", BindParamType::Number),
+                ("DOUBLE", "N_DBL", BindParamType::Number),
+                ("VARCHAR", "V", BindParamType::String),
+                ("CHAR", "C", BindParamType::String),
+                ("TEXT", "T", BindParamType::String),
+                ("DATE", "D", BindParamType::Date),
+                ("DATETIME", "DT", BindParamType::Timestamp),
+                ("TIMESTAMP", "TS", BindParamType::Timestamp),
+                ("TIME", "TM", BindParamType::String),
+                ("BLOB", "B", BindParamType::String),
+                ("JSON", "J", BindParamType::String),
+            ]
+        }
+    }
+
     /// `(label, comparable expression, answer type, answer value)` per column.
     fn type_cases(self) -> Vec<(&'static str, &'static str, BindParamType, &'static str)> {
         if self.is_oracle() {
@@ -413,6 +452,9 @@ struct ModalPlan {
     seen_labels: Vec<String>,
     /// Values the modal already carried when it opened.
     seen_values: Vec<String>,
+    /// Types the modal already had selected when it opened, which is what the
+    /// inference chose.
+    seen_types: Vec<String>,
     appeared: bool,
     attempts: u32,
 }
@@ -427,6 +469,7 @@ fn plan() -> &'static Mutex<ModalPlan> {
             cancel: false,
             seen_labels: Vec::new(),
             seen_values: Vec::new(),
+            seen_types: Vec::new(),
             appeared: false,
             attempts: 0,
         })
@@ -441,6 +484,7 @@ fn arm_modal(answers: Vec<Answer>, cancel: bool) {
         plan.cancel = cancel;
         plan.seen_labels.clear();
         plan.seen_values.clear();
+        plan.seen_types.clear();
         plan.appeared = false;
         plan.attempts = 0;
     }
@@ -491,6 +535,12 @@ fn drive_modal() {
     plan.armed = false;
     plan.seen_labels = labels;
     plan.seen_values = inputs.iter().map(Input::value).collect();
+    // Read before the answers below overwrite them: this is the selection the
+    // prompt opened with, not the one this harness makes.
+    plan.seen_types = choices
+        .iter()
+        .map(|choice| choice.choice().unwrap_or_default())
+        .collect();
 
     let answers = plan.answers.clone();
     for (index, answer) in answers.iter().enumerate() {
@@ -629,6 +679,8 @@ struct RunOutcome {
     prompted: Vec<String>,
     /// Values the modal already carried when it opened.
     prefilled: Vec<String>,
+    /// Types the modal already had selected when it opened.
+    preselected: Vec<String>,
     modal_appeared: bool,
     /// The messages the run's statements reported, joined.
     message: String,
@@ -714,6 +766,7 @@ impl Harness {
             rows: collected_rows(&events),
             prompted: plan.seen_labels.clone(),
             prefilled: plan.seen_values.clone(),
+            preselected: plan.seen_types.clone(),
             modal_appeared: plan.appeared,
         })
     }
@@ -1211,6 +1264,83 @@ fn verify(target: Target) -> Result<(), String> {
             param_type.label()
         );
     }
+
+    // (21) The type the prompt opens on, for every data type the backend has.
+    //      Cancelled rather than answered: nothing needs to run for the modal
+    //      to have chosen, and cancelling keeps a column that cannot sit beside
+    //      `=` (a CLOB, a BLOB) out of the server's way.
+    for (label, column, expected) in target.inference_cases() {
+        // A name this run has not answered before: a remembered answer is the
+        // user's own decision and outranks the catalog, which is the right
+        // behaviour and the wrong thing to measure here.
+        let sql = format!("SELECT ID FROM {TYPES_TABLE} WHERE {column} = :chk_{column}");
+        let outcome = h.cancel(&sql)?;
+        if outcome.preselected != vec![expected.label().to_string()] {
+            return Err(format!(
+                "a {label} column opened the prompt on {:?}, expected {:?}",
+                outcome.preselected,
+                expected.label()
+            ));
+        }
+        println!(
+            "PASS: a {label} column opens the prompt on {}",
+            expected.label()
+        );
+    }
+
+    // (22) The same lookup through an alias, and through an INSERT's column
+    //      list, which pairs values with columns by position rather than by an
+    //      operator.
+    let alias_sql = format!(
+        "SELECT t.ID FROM {TYPES_TABLE} t WHERE t.D = :chk_alias_d AND t.N_INT = :chk_alias_n"
+    );
+    let outcome = h.cancel(&alias_sql)?;
+    if outcome.preselected
+        != vec![
+            BindParamType::Date.label().to_string(),
+            BindParamType::Number.label().to_string(),
+        ]
+    {
+        return Err(format!(
+            "an aliased comparison opened the prompt on {:?}",
+            outcome.preselected
+        ));
+    }
+    println!("PASS: an aliased column still names its own type");
+
+    let insert_sql = format!(
+        "INSERT INTO {TYPES_TABLE} (ID, V, D) VALUES (:chk_ins_id, :chk_ins_v, :chk_ins_d)"
+    );
+    let outcome = h.cancel(&insert_sql)?;
+    if outcome.preselected
+        != vec![
+            BindParamType::Number.label().to_string(),
+            BindParamType::String.label().to_string(),
+            BindParamType::Date.label().to_string(),
+        ]
+    {
+        return Err(format!(
+            "an INSERT opened the prompt on {:?}",
+            outcome.preselected
+        ));
+    }
+    println!("PASS: an INSERT pairs each value with its own column's type");
+
+    // (23) A row count has no column to look up and is settled by the syntax
+    //      alone — where a String answer would be a parse error.
+    let count_sql = if target.is_oracle() {
+        format!("SELECT ID FROM {TYPES_TABLE} FETCH FIRST :chk_rows ROWS ONLY")
+    } else {
+        format!("SELECT ID FROM {TYPES_TABLE} LIMIT :chk_rows")
+    };
+    let outcome = h.cancel(&count_sql)?;
+    if outcome.preselected != vec![BindParamType::Number.label().to_string()] {
+        return Err(format!(
+            "a row count opened the prompt on {:?}",
+            outcome.preselected
+        ));
+    }
+    println!("PASS: a row count opens the prompt on Number without a column to consult");
 
     let _ = h.run(&target.types_teardown_sql());
     for sql in target.teardown_sql() {

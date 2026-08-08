@@ -76080,7 +76080,7 @@ impl SqlEditorWidget {
         );
     }
 
-    fn request_table_columns_for_resolved_scope(
+    pub(crate) fn request_table_columns_for_resolved_scope(
         table_name: &str,
         intellisense_data: &Arc<Mutex<IntellisenseData>>,
         column_sender: &mpsc::Sender<ColumnLoadUpdate>,
