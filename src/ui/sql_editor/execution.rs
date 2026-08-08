@@ -8880,7 +8880,16 @@ impl SqlEditorWidget {
         initial_mysql_delimiter: Option<&str>,
     ) -> Option<String> {
         let snapshot = self.connection_binding.snapshot();
-        let info = snapshot.runtime.as_ref()?.sanitized_info();
+        // A detached runtime counts. It is still the connection this tab is
+        // about, and a guard that quietly stops applying the moment a
+        // connection drops is the wrong shape for a safety feature — the only
+        // failure it can add is refusing a write on a connection the user
+        // already marked read-only.
+        let info = snapshot
+            .runtime
+            .as_ref()
+            .or(snapshot.detached_runtime.as_ref())?
+            .sanitized_info();
         if !info.read_only {
             return None;
         }

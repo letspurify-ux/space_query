@@ -227,6 +227,27 @@ impl Harness {
     }
 }
 
+/// The declared type the driver reported for `col_name`, as the grid receives
+/// it.
+///
+/// The grid decides which columns need the LOB-safe guard predicate from these
+/// strings (`ResultTableWidget::character_lob_columns`). If a driver leaves
+/// them empty, that decision silently falls back to the plain `=` comparison
+/// Oracle refuses — so this is the link between the unit tests and the server.
+fn declared_type(events: &[QueryProgress], col_name: &str) -> Option<String> {
+    events
+        .iter()
+        .rev()
+        .find_map(|event| match progress_inner(event) {
+            QueryProgress::StatementFinished { result, .. } => result
+                .columns
+                .iter()
+                .find(|column| column.name.trim_matches('"').eq_ignore_ascii_case(col_name))
+                .map(|column| column.data_type.clone()),
+            _ => None,
+        })
+}
+
 fn first_error(events: &[QueryProgress]) -> Option<String> {
     events.iter().find_map(|event| match progress_inner(event) {
         QueryProgress::StatementFinished { result, .. } if !result.success => {
@@ -397,6 +418,30 @@ fn verify(target: Target) -> Result<(), String> {
     println!(
         "PASS(1): {} bytes written and read back unchanged",
         first.len()
+    );
+
+    // (1b) The grid can only choose the LOB-safe guard predicate if the driver
+    //      tells it the column is a LOB. Without this the Oracle checks above
+    //      would keep passing while the real grid quietly emitted the
+    //      comparison the server refuses.
+    let reported = declared_type(&read_back, "BODY").unwrap_or_default();
+    if reported.trim().is_empty() {
+        return Err(
+            "(1b) the driver reported no declared type for BODY, so the grid cannot tell \
+             a LOB from a VARCHAR2"
+                .to_string(),
+        );
+    }
+    let is_character_lob = ResultTableWidget::is_character_lob_type_for_verification(&reported);
+    if target.is_oracle() != is_character_lob {
+        return Err(format!(
+            "(1b) BODY was reported as {reported:?}, which the grid classifies as \
+             character LOB = {is_character_lob}; expected {} on this backend",
+            target.is_oracle()
+        ));
+    }
+    println!(
+        "PASS(1b): the driver reports BODY as {reported:?} (character LOB: {is_character_lob})"
     );
 
     // (2) Now replace it with a different long value, comparing against the

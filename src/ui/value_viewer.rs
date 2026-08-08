@@ -54,14 +54,19 @@ pub enum ValueFormat {
 /// text, so a value that is detected is a value that can be formatted.
 pub fn detect_value_format(value: &str) -> ValueFormat {
     let trimmed = value.trim_start();
+    // Validate only. Detection runs on the UI thread before the window is
+    // drawn, so building the whole indented copy here — and throwing it away —
+    // would pay for the formatting twice on exactly the large values this
+    // feature exists for. Anything that does not even start like JSON or XML
+    // costs one character.
     if trimmed.starts_with('{') || trimmed.starts_with('[') {
-        if format_json(value).is_some() {
+        if json_tokens(value).is_some() {
             return ValueFormat::Json;
         }
         return ValueFormat::Plain;
     }
     if trimmed.starts_with('<') {
-        if format_xml(value).is_some() {
+        if xml_nodes(value).is_some() {
             return ValueFormat::Xml;
         }
         return ValueFormat::Plain;
@@ -129,19 +134,50 @@ fn push_indent(out: &mut String, depth: usize) {
     }
 }
 
+/// What the scanner will accept next.
+///
+/// The `*OrClose` variants exist only right after an opening bracket: that is
+/// the one position where a closing bracket is legal, and separating it from
+/// "just past a comma" is what rejects a trailing comma.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum JsonExpect {
+    /// A value, and nothing else.
+    Value,
+    /// A value, or the `]` of an empty array.
+    ValueOrClose,
+    /// An object key, and nothing else.
+    Key,
+    /// An object key, or the `}` of an empty object.
+    KeyOrClose,
+    Colon,
+    CommaOrClose,
+    /// The one top-level value is complete; anything further is a second
+    /// document.
+    Done,
+}
+
 /// Splits `value` into JSON tokens, or `None` when it is not well-formed JSON.
 ///
-/// The scan validates structure as it goes (balanced containers, one top-level
-/// value, no trailing input) so a caller that gets `Some` is holding a token
-/// list it can re-space without inventing valid JSON out of invalid input.
+/// This validates as it goes so a caller holding `Some` can re-space the tokens
+/// without inventing structure that was not in the input. It is a state machine
+/// rather than a set of local checks because the states are what encode the
+/// rules that are easy to miss otherwise: an object member is `key : value`,
+/// and a closing bracket is legal after an opening one but not after a comma.
 fn json_tokens(value: &str) -> Option<Vec<String>> {
     let bytes = value.as_bytes();
     let mut tokens: Vec<String> = Vec::new();
     let mut stack: Vec<u8> = Vec::new();
     let mut index = 0usize;
-    // `true` when the next token must be a value (or a closing bracket).
-    let mut expect_value = true;
-    let mut seen_top_level = false;
+    let mut expect = JsonExpect::Value;
+
+    // Where the scanner goes after a completed value or container.
+    let after_value = |stack: &Vec<u8>| {
+        if stack.is_empty() {
+            JsonExpect::Done
+        } else {
+            JsonExpect::CommaOrClose
+        }
+    };
 
     while index < bytes.len() {
         let byte = bytes[index];
@@ -150,75 +186,76 @@ fn json_tokens(value: &str) -> Option<Vec<String>> {
             continue;
         }
 
-        if stack.is_empty() && seen_top_level {
-            // A second top-level value: not one JSON document.
-            return None;
-        }
-
         match byte {
             b'{' | b'[' => {
-                if !expect_value {
+                if !matches!(expect, JsonExpect::Value | JsonExpect::ValueOrClose) {
                     return None;
                 }
                 stack.push(byte);
                 tokens.push((byte as char).to_string());
-                expect_value = true;
+                expect = if byte == b'{' {
+                    JsonExpect::KeyOrClose
+                } else {
+                    JsonExpect::ValueOrClose
+                };
                 index += 1;
             }
-            b'}' | b']' => {
-                let opener = stack.pop()?;
-                let expected = if byte == b'}' { b'{' } else { b'[' };
-                if opener != expected {
-                    return None;
-                }
-                // A closing bracket right after `,` or `:` is a dangling comma
-                // or a missing value.
-                if !expect_value || tokens.last().map(String::as_str) == Some(",") {
-                    if tokens
-                        .last()
-                        .is_some_and(|last| matches!(last.as_str(), "," | ":"))
-                    {
-                        return None;
-                    }
-                } else if !tokens
-                    .last()
-                    .is_some_and(|last| matches!(last.as_str(), "{" | "["))
+            b'}' => {
+                if !matches!(expect, JsonExpect::KeyOrClose | JsonExpect::CommaOrClose)
+                    || stack.pop() != Some(b'{')
                 {
                     return None;
                 }
-                tokens.push((byte as char).to_string());
-                expect_value = false;
-                seen_top_level = stack.is_empty();
+                tokens.push("}".to_string());
+                expect = after_value(&stack);
+                index += 1;
+            }
+            b']' => {
+                if !matches!(expect, JsonExpect::ValueOrClose | JsonExpect::CommaOrClose)
+                    || stack.pop() != Some(b'[')
+                {
+                    return None;
+                }
+                tokens.push("]".to_string());
+                expect = after_value(&stack);
                 index += 1;
             }
             b',' => {
-                if expect_value || stack.is_empty() {
+                if expect != JsonExpect::CommaOrClose {
                     return None;
                 }
                 tokens.push(",".to_string());
-                expect_value = true;
+                expect = if stack.last() == Some(&b'{') {
+                    JsonExpect::Key
+                } else {
+                    JsonExpect::Value
+                };
                 index += 1;
             }
             b':' => {
-                if expect_value || stack.last() != Some(&b'{') {
+                if expect != JsonExpect::Colon {
                     return None;
                 }
                 tokens.push(":".to_string());
-                expect_value = true;
+                expect = JsonExpect::Value;
                 index += 1;
             }
             b'"' => {
-                if !expect_value {
+                let is_key = matches!(expect, JsonExpect::Key | JsonExpect::KeyOrClose);
+                if !is_key && !matches!(expect, JsonExpect::Value | JsonExpect::ValueOrClose) {
                     return None;
                 }
                 let end = json_string_end(bytes, index)?;
                 tokens.push(value.get(index..end)?.to_string());
-                expect_value = false;
-                seen_top_level = stack.is_empty();
+                expect = if is_key {
+                    JsonExpect::Colon
+                } else {
+                    after_value(&stack)
+                };
                 index = end;
             }
             _ => {
-                if !expect_value {
+                if !matches!(expect, JsonExpect::Value | JsonExpect::ValueOrClose) {
                     return None;
                 }
                 let end = json_scalar_end(bytes, index);
@@ -227,17 +264,13 @@ fn json_tokens(value: &str) -> Option<Vec<String>> {
                     return None;
                 }
                 tokens.push(literal.to_string());
-                expect_value = false;
-                seen_top_level = stack.is_empty();
+                expect = after_value(&stack);
                 index = end;
             }
         }
     }
 
-    if !stack.is_empty() || !seen_top_level {
-        return None;
-    }
-    Some(tokens)
+    (stack.is_empty() && expect == JsonExpect::Done).then_some(tokens)
 }
 
 /// The index just past the closing quote of the string literal at `start`.
@@ -807,6 +840,38 @@ mod tests {
         json_tokens(value).expect("value must tokenize as JSON")
     }
 
+    /// A multi-megabyte value is handled in one linear pass, not quadratically.
+    ///
+    /// Detection runs on the UI thread before the window is drawn, so this is
+    /// the size at which an accidental O(n²) would show up as a freeze. The
+    /// bound is deliberately loose — it is here to catch a change of complexity,
+    /// not to measure a machine. (Measured at ~65 ms detect / ~115 ms format for
+    /// 2.4 MB in an unoptimised build.)
+    #[test]
+    fn a_multi_megabyte_value_is_scanned_in_one_linear_pass() {
+        let unit = r#"{"id":123456,"name":"a name","tags":["x","y","z"],"ok":true},"#;
+        let big = format!("[{}]", unit.repeat(40_000).trim_end_matches(','));
+        assert!(big.len() > 2_000_000);
+
+        let start = std::time::Instant::now();
+        assert_eq!(detect_value_format(&big), ValueFormat::Json);
+        let formatted = format_json(&big).expect("valid JSON");
+        let elapsed = start.elapsed();
+        assert!(formatted.len() > big.len());
+        assert!(
+            elapsed < std::time::Duration::from_secs(10),
+            "detect + format of {} bytes took {elapsed:?}",
+            big.len()
+        );
+
+        // A value that does not even start like JSON or XML costs one character,
+        // however long it is.
+        let plain = "x".repeat(big.len());
+        let start = std::time::Instant::now();
+        assert_eq!(detect_value_format(&plain), ValueFormat::Plain);
+        assert!(start.elapsed() < std::time::Duration::from_millis(100));
+    }
+
     #[test]
     fn format_json_indents_nested_containers() {
         let formatted = format_json(r#"{"a":1,"b":[2,3]}"#).expect("valid JSON");
@@ -852,6 +917,90 @@ mod tests {
         let once = format_json(source).expect("valid JSON");
         let twice = format_json(&once).expect("formatted JSON stays valid");
         assert_eq!(once, twice);
+    }
+
+    #[test]
+    fn format_json_accepts_and_rejects_documents_by_json_grammar() {
+        // Documents that MUST be accepted.
+        for valid in [
+            r#"{}"#,
+            r#"[]"#,
+            r#"[[[[1]]]]"#,
+            r#"{"a":{"b":{"c":[]}}}"#,
+            r#"{"":""}"#,
+            r#"{"a":"\u00e9"}"#,
+            r#"{"a":-0}"#,
+            r#"{"a":0.0e-0}"#,
+            r#"{"a":"\\"}"#,
+            r#"{"a":"}"}"#,
+            r#"{"a":"[,:]"}"#,
+            "{\n\t\"a\" : 1\r\n}",
+            r#"[1,"two",true,false,null,{"k":[]}]"#,
+        ] {
+            assert!(format_json(valid).is_some(), "rejected valid JSON: {valid}");
+        }
+        // Documents that MUST be rejected.
+        for invalid in [
+            r#"{"a":1}x"#,
+            r#"{"a":1}{"b":2}"#,
+            r#"{"a"}"#,
+            r#"{"a":1,"b"}"#,
+            r#"[1:2]"#,
+            r#"{1:2}"#,
+            r#"{"a":"unterminated"#,
+            "{\"a\":\"raw\nnewline\"}",
+            r#"{"a":,}"#,
+            r#"[,]"#,
+            r#"{,}"#,
+            r#"{"a":1]"#,
+            r#"[1}"#,
+            r#"{"a":tru}"#,
+            r#"{"a":1e}"#,
+            r#"{"a":.5}"#,
+            r#"{"a":00}"#,
+        ] {
+            assert!(
+                format_json(invalid).is_none(),
+                "accepted invalid JSON: {invalid}"
+            );
+        }
+    }
+
+    #[test]
+    fn format_xml_accepts_and_rejects_documents_by_xml_wellformedness() {
+        for valid in [
+            "<a/>",
+            "<a></a>",
+            "<a><b/><c/></a>",
+            "<a x=\"&lt;\"/>",
+            "<?xml version=\"1.0\"?><a/>",
+            "<a><!-- c --><b/></a>",
+            "<a><![CDATA[<b>]]></a>",
+            "  <a/>  ",
+            "<a><b>text</b></a>",
+        ] {
+            assert!(
+                format_xml(valid).is_some(),
+                "rejected well-formed XML: {valid}"
+            );
+        }
+        for invalid in [
+            "<a><b></a></b>",
+            "<a>",
+            "</a>",
+            "<a/><b/>",
+            "<a/>tail",
+            "lead<a/>",
+            "<a><!-- unterminated",
+            "<a x=\"unterminated/>",
+            "",
+            "   ",
+        ] {
+            assert!(
+                format_xml(invalid).is_none(),
+                "accepted ill-formed XML: {invalid}"
+            );
+        }
     }
 
     #[test]

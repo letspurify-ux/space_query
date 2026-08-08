@@ -3683,17 +3683,27 @@ impl ResultTableWidget {
     fn value_window_target_cell(
         table: &Table,
         hidden_col: Option<usize>,
+        context_cell: Option<(usize, usize)>,
     ) -> Option<(usize, usize)> {
-        let (row_start, col_start, _, _) = Self::normalized_selection_bounds_with_limits(
-            table.get_selection(),
-            table.rows().max(0) as usize,
-            table.cols().max(0) as usize,
-        )?;
-        if Some(col_start) != hidden_col {
-            return Some((row_start, col_start));
+        // The cell the user pointed at wins over the selection's corner. Right
+        // clicking inside a block selection otherwise opens whichever cell
+        // happens to be top-left, which is not the one under the pointer.
+        let (row, col) = match context_cell {
+            Some(cell) => cell,
+            None => {
+                let (row_start, col_start, _, _) = Self::normalized_selection_bounds_with_limits(
+                    table.get_selection(),
+                    table.rows().max(0) as usize,
+                    table.cols().max(0) as usize,
+                )?;
+                (row_start, col_start)
+            }
+        };
+        if Some(col) != hidden_col {
+            return Some((row, col));
         }
         let max_cols = table.cols().max(0) as usize;
-        Self::nearest_visible_column(max_cols, col_start, hidden_col).map(|col| (row_start, col))
+        Self::nearest_visible_column(max_cols, col, hidden_col).map(|col| (row, col))
     }
 
     /// Whether the value window may write this cell back.
@@ -3733,10 +3743,13 @@ impl ResultTableWidget {
         edit_session: &Arc<Mutex<Option<TableEditSession>>>,
         pending_save_request: &Arc<Mutex<bool>>,
         hidden_col: Option<usize>,
+        context_cell: Option<(usize, usize)>,
         font_profile: FontProfile,
         font_size: u32,
     ) {
-        let Some((row_idx, col_idx)) = Self::value_window_target_cell(table, hidden_col) else {
+        let Some((row_idx, col_idx)) =
+            Self::value_window_target_cell(table, hidden_col, context_cell)
+        else {
             return;
         };
         let editable =
@@ -5217,6 +5230,13 @@ impl ResultTableWidget {
             .filter(|(_, data_type)| Self::is_character_lob_type(data_type))
             .map(|(index, _)| index)
             .collect()
+    }
+
+    /// Public only so `verify_value_edit_live` can ask the same question of a
+    /// type string a real driver reported; not part of the supported surface.
+    #[doc(hidden)]
+    pub fn is_character_lob_type_for_verification(data_type: &str) -> bool {
+        Self::is_character_lob_type(data_type)
     }
 
     fn is_character_lob_type(data_type: &str) -> bool {
@@ -7438,6 +7458,7 @@ impl ResultTableWidget {
         hidden_col: Option<usize>,
         edit_session: &Arc<Mutex<Option<TableEditSession>>>,
         pending_save_request: &Arc<Mutex<bool>>,
+        context_cell: Option<(usize, usize)>,
         anchor_x: i32,
         anchor_y: i32,
     ) -> MenuButton {
@@ -7498,8 +7519,8 @@ impl ResultTableWidget {
         // One label, two meanings: the window opens either way, but saying
         // "Edit" only when the value can actually be written back keeps the
         // menu from offering something that would be refused.
-        let value_window_item =
-            Self::value_window_target_cell(table, hidden_col).map(|(row_idx, col_idx)| {
+        let value_window_item = Self::value_window_target_cell(table, hidden_col, context_cell)
+            .map(|(row_idx, col_idx)| {
                 if Self::cell_value_is_editable(
                     edit_session,
                     pending_save_request,
@@ -7611,12 +7632,17 @@ impl ResultTableWidget {
             }
         }
 
+        // `clicked_cell` is None for a header or empty-body click; the menu
+        // then falls back to the selection, which is what those clicks just set.
+        let context_cell = clicked_cell
+            .and_then(|(row, col)| usize::try_from(row).ok().zip(usize::try_from(col).ok()));
         let menu = Self::selection_context_menu(
             &table,
             headers,
             hidden_col_for_hit,
             edit_session,
             pending_save_request,
+            context_cell,
             mouse_x,
             mouse_y,
         );
@@ -7674,6 +7700,7 @@ impl ResultTableWidget {
                         edit_session,
                         pending_save_request,
                         hidden_col,
+                        context_cell,
                         font_settings.profile(),
                         font_settings.size(),
                     );
@@ -8236,6 +8263,16 @@ impl ResultTableWidget {
 
     pub fn start_streaming(&mut self, headers: &[String]) {
         self.invalidate_search_for_new_data();
+        // The previous result's declared types must not survive into this one.
+        // Callers reinstall `column_kinds` right after this, but the declared
+        // types arrive later (with the terminal summary), so without this a new
+        // result would carry the old list until then — and a stale list that
+        // happens to match the new column count would be applied silently,
+        // marking a column a LOB that is not one.
+        *self
+            .column_data_types
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Vec::new();
         mutex_store_bool(&self.streaming_in_progress, true);
         *self
             .lazy_fetch_session
@@ -9651,6 +9688,7 @@ impl ResultTableWidget {
             self.hidden_auto_rowid_col_value(),
             &self.edit_session,
             &self.pending_save_request,
+            None,
             cell_x + safe_div(cell_w, 2),
             cell_y + cell_h,
         );
@@ -11210,6 +11248,18 @@ mod row_edit_sql_tests {
         assert!(predicate.starts_with("DBMS_LOB.COMPARE(BODY, TO_CLOB('"));
         assert!(predicate.ends_with(") = 0"));
         assert!(predicate.contains("') || TO_CLOB('"));
+    }
+
+    #[test]
+    fn character_lob_columns_ignore_a_type_list_that_does_not_match_the_headers() {
+        // set_column_data_types rejects a misaligned list, so a stale one can
+        // never mark the wrong column a LOB. This pins the classifier's half of
+        // that contract: an empty list marks nothing.
+        assert!(ResultTableWidget::character_lob_columns(&[]).is_empty());
+        assert_eq!(
+            ResultTableWidget::character_lob_columns(&["CLOB".to_string()]),
+            HashSet::from([0])
+        );
     }
 
     #[test]

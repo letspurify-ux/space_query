@@ -1035,7 +1035,7 @@ impl ObjectBrowserWidget {
 
     /// Tells this browser that its connection refuses writes, so the menus
     /// stop offering actions that would be refused.
-    pub fn set_connection_is_read_only(&mut self, read_only: bool) {
+    pub fn set_connection_is_read_only(&self, read_only: bool) {
         self.connection_is_read_only
             .store(read_only, Ordering::Release);
     }
@@ -8821,6 +8821,21 @@ impl MultiObjectBrowserWidget {
                 .position(|entry| Some(entry.connection_id) == visible_id);
             (labels, visible_index)
         };
+        // The read-only flag is a property of the saved profile, and a reconnect
+        // reuses the same runtime — so the browsers have to be re-told, or a
+        // connection the user just marked read-only would keep offering Drop
+        // and Truncate for the rest of the session.
+        {
+            let entries = self
+                .entries
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            for entry in entries.iter() {
+                entry
+                    .browser
+                    .set_connection_is_read_only(entry.runtime.sanitized_info().read_only);
+            }
+        }
         Self::disambiguate_choice_labels(&mut labels);
         self.connection_choice.clear();
         for label in &labels {
