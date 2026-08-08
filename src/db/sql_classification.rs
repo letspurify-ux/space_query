@@ -49,6 +49,92 @@ impl SqlKind {
     }
 }
 
+/// Why a read-only connection refused to run the text it was given, phrased so
+/// the caller can put it after the connection's name.
+///
+/// `None` means every statement in the text only reads.
+///
+/// The text is split into statements first, with the same splitter and the same
+/// MySQL delimiter the executor will use, and each one is classified on its own.
+/// Classifying the whole text at once would call three SELECTs run together a
+/// `Script` and refuse them — a read-only connection is exactly the one where
+/// running several queries at once is normal.
+///
+/// Anything not provably a read is refused, including a statement that cannot
+/// be classified at all. Guessing in the permissive direction is the one
+/// mistake this feature exists to prevent.
+pub(crate) fn read_only_block_reason(
+    db_type: DatabaseType,
+    sql: &str,
+    initial_mysql_delimiter: Option<&str>,
+) -> Option<String> {
+    use crate::db::query::{QueryExecutor, ScriptItem, ToolCommand};
+
+    let items = QueryExecutor::split_script_items_for_db_type_with_mysql_delimiter(
+        sql,
+        Some(db_type),
+        initial_mysql_delimiter,
+    );
+
+    for item in &items {
+        match item {
+            ScriptItem::Statement(statement) => {
+                let analysis = SqlStatementAnalysis::new_for_db_type(db_type, statement);
+                let kind = analysis.classify_for_db_type(db_type);
+                if read_only_allows(kind) {
+                    continue;
+                }
+                return Some(describe_blocked_statement(kind, analysis.leading_keyword()));
+            }
+            // `@file` runs SQL this process has not read, so there is nothing
+            // to classify; CONNECT would walk out of the read-only connection
+            // entirely. Every other tool command is display or session-local.
+            ScriptItem::ToolCommand(ToolCommand::RunScript { .. }) => {
+                return Some("a script include, whose contents it cannot check".to_string());
+            }
+            ScriptItem::ToolCommand(ToolCommand::Connect { .. }) => {
+                return Some(
+                    "a CONNECT command, which would leave this connection behind".to_string(),
+                );
+            }
+            ScriptItem::ToolCommand(_) => {}
+        }
+    }
+
+    None
+}
+
+/// The statement kinds a read-only connection lets through.
+///
+/// Transaction control is allowed because ending a transaction that wrote
+/// nothing is harmless, and refusing COMMIT would strand a session that had one
+/// open before the connection was marked read-only.
+fn read_only_allows(kind: SqlKind) -> bool {
+    match kind {
+        SqlKind::SelectLike | SqlKind::SessionControl | SqlKind::TransactionControl => true,
+        SqlKind::Dml
+        | SqlKind::Ddl
+        | SqlKind::PlsqlOrProcedure
+        | SqlKind::Script
+        | SqlKind::Unknown => false,
+    }
+}
+
+fn describe_blocked_statement(kind: SqlKind, leading_keyword: Option<&str>) -> String {
+    let keyword = leading_keyword.unwrap_or_default();
+    if kind == SqlKind::PlsqlOrProcedure && matches!(keyword, "BEGIN" | "DECLARE") {
+        return "a PL/SQL block".to_string();
+    }
+    match (kind, keyword.is_empty()) {
+        (SqlKind::Unknown, true) => "a statement it could not classify as read-only".to_string(),
+        (SqlKind::Unknown, false) => {
+            format!("a {keyword} statement it could not classify as read-only")
+        }
+        (_, true) => "a statement that writes".to_string(),
+        (_, false) => format!("a {keyword} statement"),
+    }
+}
+
 #[derive(Clone, Debug)]
 pub(crate) struct SqlStatementAnalysis<'a> {
     stripped_sql: Cow<'a, str>,
@@ -2152,5 +2238,210 @@ mod tests {
                 .classify_for_db_type(DatabaseType::MySQL),
             SqlKind::SelectLike
         );
+    }
+
+    const EVERY_DB_TYPE: [DatabaseType; 3] = [
+        DatabaseType::Oracle,
+        DatabaseType::MySQL,
+        DatabaseType::MariaDB,
+    ];
+
+    fn blocked(db_type: DatabaseType, sql: &str) -> Option<String> {
+        read_only_block_reason(db_type, sql, None)
+    }
+
+    #[test]
+    fn read_only_lets_reads_through_on_every_backend() {
+        for db_type in EVERY_DB_TYPE {
+            for sql in [
+                "SELECT * FROM orders",
+                "  -- a comment first\n SELECT 1",
+                "WITH t AS (SELECT 1 AS n FROM DUAL) SELECT n FROM t",
+                "SELECT 1; SELECT 2; SELECT 3",
+                "COMMIT",
+                "ROLLBACK",
+            ] {
+                assert_eq!(
+                    blocked(db_type, sql),
+                    None,
+                    "{db_type:?} refused a read: {sql:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn read_only_refuses_writes_on_every_backend() {
+        for db_type in EVERY_DB_TYPE {
+            for (sql, expected) in [
+                ("INSERT INTO t VALUES (1)", "an INSERT statement"),
+                ("UPDATE t SET a = 1", "an UPDATE statement"),
+                ("DELETE FROM t", "a DELETE statement"),
+                ("CREATE TABLE t (a INT)", "a CREATE statement"),
+                ("DROP TABLE t", "a DROP statement"),
+                ("TRUNCATE TABLE t", "a TRUNCATE statement"),
+                ("GRANT SELECT ON t TO u", "a GRANT statement"),
+            ] {
+                let expected = expected
+                    .replace("an INSERT", "a INSERT")
+                    .replace("an UPDATE", "a UPDATE");
+                assert_eq!(
+                    blocked(db_type, sql).as_deref(),
+                    Some(expected.as_str()),
+                    "{db_type:?} allowed a write: {sql:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn read_only_refuses_a_write_hidden_among_reads() {
+        // The whole point of splitting first: a script is not judged by its
+        // first statement.
+        for db_type in EVERY_DB_TYPE {
+            assert_eq!(
+                blocked(db_type, "SELECT 1; DELETE FROM t; SELECT 2").as_deref(),
+                Some("a DELETE statement")
+            );
+        }
+    }
+
+    #[test]
+    fn read_only_refuses_a_write_disguised_by_a_leading_comment() {
+        for db_type in EVERY_DB_TYPE {
+            assert_eq!(
+                blocked(db_type, "/* SELECT */ DELETE FROM t").as_deref(),
+                Some("a DELETE statement")
+            );
+        }
+    }
+
+    #[test]
+    fn read_only_refuses_stored_program_calls() {
+        assert_eq!(
+            blocked(DatabaseType::Oracle, "BEGIN pkg.do_it; END;").as_deref(),
+            Some("a PL/SQL block")
+        );
+        assert_eq!(
+            blocked(DatabaseType::Oracle, "CALL pkg.do_it()").as_deref(),
+            Some("a CALL statement")
+        );
+        assert_eq!(
+            blocked(DatabaseType::MySQL, "CALL do_it()").as_deref(),
+            Some("a CALL statement")
+        );
+    }
+
+    #[test]
+    fn read_only_refuses_what_it_cannot_classify() {
+        for db_type in EVERY_DB_TYPE {
+            let reason = blocked(db_type, "FROBNICATE t")
+                .expect("an unclassifiable statement must not be allowed through");
+            assert!(
+                reason.contains("could not classify"),
+                "unexpected reason: {reason}"
+            );
+        }
+    }
+
+    #[test]
+    fn read_only_allows_session_scope_changes() {
+        // Choosing which schema to read from is not a write.
+        assert_eq!(blocked(DatabaseType::MySQL, "USE shop"), None);
+        assert_eq!(
+            blocked(
+                DatabaseType::Oracle,
+                "ALTER SESSION SET CURRENT_SCHEMA = HR"
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn read_only_refuses_a_script_include_and_a_connect() {
+        let include = blocked(DatabaseType::Oracle, "@other.sql")
+            .expect("a script include must not be allowed through");
+        assert!(include.contains("script include"), "unexpected: {include}");
+
+        let connect = blocked(
+            DatabaseType::Oracle,
+            "CONNECT system/pw@localhost:1521/FREE",
+        )
+        .expect("a CONNECT must not be allowed through");
+        assert!(connect.contains("CONNECT"), "unexpected: {connect}");
+    }
+
+    #[test]
+    fn read_only_reads_a_mysql_delimiter_the_way_the_executor_will() {
+        // With `$$` in force the body is one statement, and it writes.
+        let sql = "CREATE PROCEDURE p() BEGIN INSERT INTO t VALUES (1); END$$";
+        assert!(blocked(DatabaseType::MySQL, sql).is_some());
+        assert!(read_only_block_reason(DatabaseType::MySQL, sql, Some("$$")).is_some());
+        // The same delimiter must not turn reads into something refused.
+        assert_eq!(
+            read_only_block_reason(DatabaseType::MySQL, "SELECT 1$$ SELECT 2$$", Some("$$")),
+            None
+        );
+    }
+
+    #[test]
+    fn read_only_refuses_statements_that_read_but_still_write() {
+        // Both of these look like reads and are not, which is exactly the kind
+        // of thing a guard built on "SELECT means safe" would wave through.
+        for db_type in EVERY_DB_TYPE {
+            assert!(
+                blocked(db_type, "SELECT * FROM t FOR UPDATE").is_some(),
+                "{db_type:?} allowed a locking SELECT"
+            );
+        }
+        // Oracle's EXPLAIN PLAN inserts rows into PLAN_TABLE.
+        assert!(blocked(DatabaseType::Oracle, "EXPLAIN PLAN FOR SELECT * FROM t").is_some());
+        // MySQL's EXPLAIN only reports, so it stays available.
+        assert_eq!(
+            blocked(DatabaseType::MySQL, "EXPLAIN SELECT * FROM t"),
+            None
+        );
+        assert_eq!(
+            blocked(DatabaseType::MariaDB, "EXPLAIN SELECT * FROM t"),
+            None
+        );
+    }
+
+    #[test]
+    fn read_only_allows_the_catalog_reads_the_object_browser_needs() {
+        assert_eq!(blocked(DatabaseType::MySQL, "SHOW TABLES"), None);
+        assert_eq!(blocked(DatabaseType::MariaDB, "DESCRIBE t"), None);
+        assert_eq!(blocked(DatabaseType::Oracle, "DESC t"), None);
+        assert_eq!(
+            blocked(
+                DatabaseType::Oracle,
+                "SELECT text FROM all_source WHERE name = 'P'"
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn read_only_refuses_the_grids_internal_save_marker() {
+        // The grid's structured save starts by running a tagged no-op UPDATE.
+        // The Edit checkbox is already hidden on a read-only connection, so
+        // this should be unreachable — but if it ever is reached, it must not
+        // be the one write that slips through.
+        let marker = "UPDATE /* SQ_SAVE_REQUEST:1 SQ_INTERNAL_RESULT_EDIT */ \
+                      __sq_internal_result_edit SET value = value WHERE 1 = 0";
+        for db_type in EVERY_DB_TYPE {
+            assert_eq!(
+                blocked(db_type, marker).as_deref(),
+                Some("a UPDATE statement")
+            );
+        }
+    }
+
+    #[test]
+    fn read_only_says_nothing_about_empty_text() {
+        for db_type in EVERY_DB_TYPE {
+            assert_eq!(blocked(db_type, ""), None);
+            assert_eq!(blocked(db_type, "   \n-- only a comment\n"), None);
+        }
     }
 }

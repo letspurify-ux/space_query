@@ -54,6 +54,19 @@ convert_capture() {
   fi
 }
 
+# Every single-scene mode needs a branch here. Without one it falls through to
+# the full list at the bottom, which converts whatever stale PPMs happen to be
+# left in /tmp and silently overwrites unrelated images.
+if [[ "$capture_mode" == "connection-dialog" ]]; then
+  convert_capture connect connection-dialog
+  exit 0
+fi
+
+if [[ "$capture_mode" == "settings-dialog" ]]; then
+  convert_capture settings settings
+  exit 0
+fi
+
 if [[ "$capture_mode" == "object-browser" ]]; then
   convert_capture object-browser object-browser
   exit 0
@@ -110,6 +123,16 @@ if [[ "$capture_mode" == "soft-wrap" ]]; then
   exit 0
 fi
 
+if [[ "$capture_mode" == "value-viewer" ]]; then
+  convert_capture value-viewer value-viewer
+  exit 0
+fi
+
+if [[ "$capture_mode" == "connection-color" ]]; then
+  convert_capture connection-color connection-color
+  exit 0
+fi
+
 if [[ "$capture_mode" == "object-drop-confirmation" ]]; then
   convert_capture object-drop-confirmation object-drop-confirmation
   exit 0
@@ -128,12 +151,14 @@ fi
 
 convert_capture main main-window
 convert_capture connect connection-dialog
+convert_capture connection-color connection-color
 convert_capture intellisense intellisense
 convert_capture signature signature-popup
 convert_capture object-browser object-browser
 convert_capture formatting-before sql-formatting-before
 convert_capture formatting-after sql-formatting-after
 convert_capture result-grid result-grid
+convert_capture value-viewer value-viewer
 convert_capture grid-search grid-search
 convert_capture selection-summary selection-summary
 convert_capture code-snippets code-snippets

@@ -142,6 +142,48 @@ cannot be closed safely.
 
 ## Features
 
+### Connection colors and read-only mode
+
+Every saved connection carries two client-side settings, next to its name and
+host rather than under Advanced Settings, because neither is a session option
+and neither is sent to the server.
+
+![The connection dialog with a color picked and Read-only ticked](docs/images/connection-color.png)
+
+**Color** tags the connection so the window says which database is on the other
+end before a statement runs. The tag colors the status bar's connection dot and
+the label of every query tab bound to that connection. A dropped connection
+always shows the disconnected color instead, so a tag can never be mistaken for
+a live session.
+
+**Read-only** refuses to send anything that writes. Each statement is classified
+on its own — a script of three `SELECT`s runs, a `DELETE` hidden among them does
+not — and anything that is not provably a read is refused, including a statement
+the classifier cannot place. `SELECT`, `WITH`, `DESCRIBE`, `SHOW`, session
+settings such as `USE` and `ALTER SESSION SET CURRENT_SCHEMA`, and
+`COMMIT`/`ROLLBACK` all still run. `INSERT`, `UPDATE`, `DELETE`, `MERGE`, DDL,
+PL/SQL blocks, and procedure calls do not. A `@file` include is refused because
+its contents cannot be checked first, and a SQL\*Plus `CONNECT` because it would
+leave the read-only connection behind.
+
+Two statements that look like reads are refused because they are not:
+`SELECT ... FOR UPDATE` takes row locks that outlive it, and Oracle's
+`EXPLAIN PLAN FOR` inserts rows into `PLAN_TABLE` — so `F6` Explain Plan is
+unavailable on a read-only Oracle connection. MySQL and MariaDB's `EXPLAIN` only
+reports and stays available.
+
+The controls that would start a write are removed rather than left to fail: the
+grid's **Edit** checkbox does not appear, and the object browser drops
+**Drop**, **Truncate**, **Import Data**, and **Execute Procedure/Function** from
+its menus. Reading the catalog — **Generate DDL**, **View Structure**,
+**Check Compilation** — is unaffected. The status bar reads
+`name (Oracle) · read-only`.
+
+This is a guard inside SPACE Query, not a server-side lock. It protects against
+a slip, not against a determined attempt. For a server-enforced restriction, use
+the connection's **Access: Read only** transaction mode or a database account
+without write privileges.
+
 ### SQL editor and IntelliSense
 
 IntelliSense uses the current SQL context and loaded database metadata to
@@ -447,6 +489,35 @@ draws, and it uses the same search the editor's **Find** uses.
 
 ![Find in Results highlighting every matching cell](docs/images/grid-search.png)
 
+#### View and edit a cell value
+
+A grid draws each cell as one clipped line, which is no use for a CLOB, a JSON
+document, or any long text. Double-click a cell, or pick **View Value** from the
+Data Grid context menu, to open it in a window with the whole value, soft
+wrapped, plus its length in characters and bytes.
+
+When the result is in **Edit** mode and the cell is one edit mode can write, the
+same window opens as an editor and the menu entry reads **Edit Value**. Saving
+stages the new value exactly as the inline editor would, so it reaches the
+database on the next **Save** and nowhere earlier.
+
+**Format** shows an indented copy of a JSON or XML value. It is a view and only
+a view: clearing it returns the exact bytes you were editing, and saving always
+writes those bytes, never the indented version. Formatting moves whitespace and
+nothing else — JSON keeps its key order and its numbers as written, and an XML
+element containing text is left alone, because in XML that whitespace is
+content. The box is disabled for a value that is neither.
+
+![The value window showing an indented JSON CLOB](docs/images/value-viewer.png)
+
+Long values now save on every backend. MySQL and MariaDB always could — their
+saves use binds — while Oracle rendered values as SQL literals, so a value over
+4000 bytes was `ORA-01704` and a `CLOB` column could be read but never written.
+Oracle values past that size are now written as concatenated `TO_CLOB` chunks,
+and the original-value guard compares character LOBs with `DBMS_LOB.COMPARE`,
+which is the comparison Oracle accepts (`clob_column = 'text'` is `ORA-22848` at
+any length).
+
 #### Selection totals in the status bar
 
 Selecting more than one cell puts a count, sum, average, minimum, and maximum
@@ -711,6 +782,16 @@ cargo run --bin verify_bind_prompt_ui
 
 # Bind parameter values, declared and prompted — every backend.
 cargo run --bin verify_bind_prompt_live all
+
+# The cell value window, driven through its own event loop.
+cargo run --bin verify_value_viewer_ui
+
+# A long CLOB/TEXT value edited and read back — every backend.
+cargo run --bin verify_value_edit_live all
+
+# A read-only connection refuses writes and the database is unchanged, with a
+# writable control group proving each statement is a real write — every backend.
+cargo run --bin verify_read_only_live all
 ```
 
 Pull requests and pushes to `main` run formatting, Clippy, both non-live test

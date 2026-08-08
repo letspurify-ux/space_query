@@ -903,7 +903,15 @@ fn status_connection_label(
 ) -> String {
     connection_info
         .filter(|_| has_live_connection)
-        .map(|info| format!("{} ({})", info.name, info.db_type))
+        .map(|info| {
+            let mut label = format!("{} ({})", info.name, info.db_type);
+            if info.read_only {
+                // Say it where the user is already looking for the connection
+                // name, not only when a statement is refused.
+                label.push_str(" · read-only");
+            }
+            label
+        })
         .unwrap_or_else(|| "not connected".to_string())
 }
 
@@ -914,12 +922,20 @@ fn status_bar_content_label(connection_label: &str, activity: Option<&str>) -> S
     )
 }
 
-fn status_connection_color(is_connected: bool) -> Color {
-    if is_connected {
-        theme::status_connected()
-    } else {
-        theme::status_disconnected()
+/// The colour of the status bar's connection dot.
+///
+/// A connection tag replaces the "connected" green, never the "disconnected"
+/// grey: whether there is a live session is the one thing the dot must always
+/// be able to say, and a colour preference does not get to hide it.
+fn status_connection_color(is_connected: bool, color: crate::db::ConnectionColor) -> Color {
+    if !is_connected {
+        return theme::status_disconnected();
     }
+    color
+        .rgb()
+        .map_or_else(theme::status_connected, |(red, green, blue)| {
+            Color::from_rgb(red, green, blue)
+        })
 }
 
 fn status_bar_pulse_value(pulse_frame: usize) -> f64 {
@@ -1084,8 +1100,9 @@ impl StatusBarWidget {
         selection_summary: Option<&str>,
     ) {
         let is_connected = connection_info.is_some() && has_live_connection;
+        let connection_color = connection_info.map(|info| info.color).unwrap_or_default();
         self.connection_indicator
-            .set_label_color(status_connection_color(is_connected));
+            .set_label_color(status_connection_color(is_connected, connection_color));
         let connection_label = status_connection_label(connection_info, has_live_connection);
         let content_label = status_bar_content_label(
             &connection_label,
@@ -1895,12 +1912,38 @@ impl AppState {
         label
     }
 
+    /// The colour a query tab's label is painted in: its connection's tag, or
+    /// `None` for the default when the connection has no tag.
+    ///
+    /// A detached runtime still counts. The tab is still about that database,
+    /// and losing the tag exactly when a connection drops is the moment the
+    /// reminder matters most.
+    fn tab_label_color(tab: &QueryEditorTab) -> Option<Color> {
+        let snapshot = tab.connection_binding.snapshot();
+        let runtime = snapshot
+            .runtime
+            .as_ref()
+            .or(snapshot.detached_runtime.as_ref())?;
+        let (red, green, blue) = runtime.sanitized_info().color.rgb()?;
+        Some(Color::from_rgb(red, green, blue))
+    }
+
+    /// Puts the tab's current name and its connection's colour on the strip.
+    ///
+    /// Every caller that changes what a tab is called goes through here, so the
+    /// colour can never be left behind by a rename.
+    fn apply_tab_label(&mut self, tab_id: QueryTabId, index: usize) {
+        let label = Self::tab_display_label(&self.editor_tabs[index]);
+        let color = Self::tab_label_color(&self.editor_tabs[index]);
+        self.query_tabs.set_tab_label(tab_id, &label);
+        self.query_tabs.set_tab_label_color(tab_id, color);
+    }
+
     fn refresh_tab_label(&mut self, tab_id: QueryTabId) {
         let Some(index) = self.find_tab_index(tab_id) else {
             return;
         };
-        let label = Self::tab_display_label(&self.editor_tabs[index]);
-        self.query_tabs.set_tab_label(tab_id, &label);
+        self.apply_tab_label(tab_id, index);
         if self.active_editor_tab_id == tab_id {
             self.refresh_window_title();
         }
@@ -2162,6 +2205,15 @@ impl AppState {
     fn active_connection_runtime(&self) -> Option<Arc<ConnectionRuntime>> {
         self.active_connection_id()
             .and_then(|id| self.connection_registry.get(id))
+    }
+
+    /// Whether the active tab's connection is marked read-only.
+    ///
+    /// Every control that would start a write consults this, so a read-only
+    /// connection never offers an action it is going to refuse.
+    fn active_connection_is_read_only(&self) -> bool {
+        self.active_connection_runtime()
+            .is_some_and(|runtime| runtime.sanitized_info().read_only)
     }
 
     fn bind_active_unbound_tab_to_selected_database(&mut self) -> Result<(), String> {
@@ -3288,8 +3340,7 @@ impl AppState {
             return;
         }
         self.editor_tabs[index].is_dirty = is_dirty;
-        let label = Self::tab_display_label(&self.editor_tabs[index]);
-        self.query_tabs.set_tab_label(tab_id, &label);
+        self.apply_tab_label(tab_id, index);
         if self.active_editor_tab_id == tab_id {
             self.refresh_window_title();
         }
@@ -3368,8 +3419,7 @@ impl AppState {
             return;
         };
         self.editor_tabs[index].current_file = path.clone();
-        let label = Self::tab_display_label(&self.editor_tabs[index]);
-        self.query_tabs.set_tab_label(tab_id, &label);
+        self.apply_tab_label(tab_id, index);
         if self.active_editor_tab_id == tab_id {
             *self
                 .current_file
@@ -3996,7 +4046,11 @@ impl AppState {
             }
         }
         let origin_is_current = self.active_result_origin_is_current();
-        let can_edit = origin_is_current && self.result_tabs.can_current_begin_edit_mode();
+        // A read-only connection hides the checkbox rather than letting the
+        // user stage edits and meet the refusal at Save.
+        let can_edit = origin_is_current
+            && !self.active_connection_is_read_only()
+            && self.result_tabs.can_current_begin_edit_mode();
         let edit_active = self.result_tabs.is_current_edit_mode_enabled();
         let save_pending = self.result_tabs.is_current_save_pending();
         let query_running = self.sql_editor.is_query_running();
@@ -7971,6 +8025,14 @@ impl MainWindow {
         let base_label = format!("Query {query_number}");
         state.next_editor_tab_number = state.next_editor_tab_number.saturating_add(1);
         let tab_id = state.query_tabs.add_tab(&label);
+        state.query_tabs.set_tab_label_color(
+            tab_id,
+            binding_snapshot
+                .runtime
+                .as_ref()
+                .and_then(|runtime| runtime.sanitized_info().color.rgb())
+                .map(|(red, green, blue)| Color::from_rgb(red, green, blue)),
+        );
         let group = state.query_tabs.tab_group(tab_id)?;
         let binding_connection_id = binding.snapshot().connection_id();
         let existing_metadata = state
@@ -14766,14 +14828,53 @@ mod tests {
 
     #[test]
     fn status_connection_color_uses_dark_theme_semantic_colors() {
+        use crate::db::ConnectionColor;
+
         assert_eq!(
-            status_connection_color(false).to_rgb(),
+            status_connection_color(false, ConnectionColor::None).to_rgb(),
             theme::status_disconnected().to_rgb()
         );
         assert_eq!(
-            status_connection_color(true).to_rgb(),
+            status_connection_color(true, ConnectionColor::None).to_rgb(),
             theme::status_connected().to_rgb()
         );
+    }
+
+    #[test]
+    fn status_connection_color_shows_the_tag_only_while_connected() {
+        use crate::db::ConnectionColor;
+
+        assert_eq!(
+            status_connection_color(true, ConnectionColor::Red).to_rgb(),
+            ConnectionColor::Red.rgb().expect("Red is a painted colour")
+        );
+        // Disconnected wins: a red production tag must not be mistaken for a
+        // live session.
+        assert_eq!(
+            status_connection_color(false, ConnectionColor::Red).to_rgb(),
+            theme::status_disconnected().to_rgb()
+        );
+    }
+
+    #[test]
+    fn status_connection_label_says_when_a_connection_is_read_only() {
+        let mut info = crate::db::ConnectionInfo::new_with_type(
+            "prod",
+            "system",
+            "pw",
+            "localhost",
+            1521,
+            "FREE",
+            crate::db::DatabaseType::Oracle,
+        );
+        assert_eq!(status_connection_label(Some(&info), true), "prod (Oracle)");
+        info.read_only = true;
+        assert_eq!(
+            status_connection_label(Some(&info), true),
+            "prod (Oracle) · read-only"
+        );
+        // Nothing is claimed about a connection that is not live.
+        assert_eq!(status_connection_label(Some(&info), false), "not connected");
     }
 
     #[test]

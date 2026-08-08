@@ -121,14 +121,44 @@ MySQL/MariaDB current database are reapplied to new sessions. A running worker
 is not mutated during a scope change; the scope takes effect at the next safe
 acquisition or reuse point.
 
+## Read-only connections
+
+`ConnectionInfo::read_only` is a guard inside this process, not a server-side
+lock. Note that two statement shapes classify as writes despite reading:
+`SELECT ... FOR UPDATE` (`classify_select_sql_for_db_type` returns `Dml` for a
+locking select) and Oracle `EXPLAIN PLAN FOR` (`classify_explain_sql_for_db_type`
+returns `Dml`, because it inserts into `PLAN_TABLE`). Both are therefore refused
+on a read-only connection, which also means F6 Explain Plan is unavailable there
+on Oracle. `sql_classification::read_only_block_reason` splits the text with the same
+splitter and MySQL delimiter the executor will use, classifies each statement on
+its own, and refuses anything that is not provably a read — including a
+statement it cannot classify. `SelectLike`, `SessionControl`, and
+`TransactionControl` pass; everything else does not. `ToolCommand::RunScript`
+(`@file`) is refused because its contents cannot be checked first, and
+`ToolCommand::Connect` because it would leave the connection behind.
+
+The check runs in `execute_sql_with_mysql_delimiter_after_lazy_cancel`, the one
+place every editor entry point funnels through, ahead of both the transaction
+preflight and the bind prompt — a refused statement must never ask for
+placeholder values first. Everything that reaches the database through the
+editor is therefore covered: `Ctrl+Enter`, F5 scripts, selection execution, F6
+explain, object-browser Drop/Truncate, CSV import, and the grid's staged save.
+
+For a restriction the server enforces, use the connection's `READ ONLY`
+transaction access mode or an account without write privileges.
+
 ## Verification
 
 ```sh
 cargo test session_policy --lib
 cargo test lazy_fetch --lib
 cargo test cancel --lib
+cargo test read_only --lib
 cargo test --test concurrency_multithread_guards
 cargo test --test db_dispatch_guards
+
+# Live: a read-only connection refuses writes and the database is unchanged.
+cargo run --bin verify_read_only_live all
 ```
 
 A new cancellation path needs tests for stale operation, stale generation,

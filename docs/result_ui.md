@@ -78,6 +78,52 @@ duplicate locator, cancellation, or execution error rolls back the whole save
 (or only its savepoint inside an existing manual transaction), leaving the
 staged grid changes available for correction or retry.
 
+## Cell value window
+
+`src/ui/value_viewer.rs`. Opened by double-clicking a cell, or by
+`View Value` / `Edit Value` in the Data Grid menu; the entry point is
+`ResultTableWidget::open_cell_value_window`, which targets the top-left cell of
+the selection and skips the hidden auto-`ROWID` column.
+
+A read-only value gets a `TextDisplay`, an editable one a `TextEditor`. FLTK has
+no read-only flag on the editor, and the display-only widget already selects,
+scrolls, and copies. Editability is decided by `cell_value_is_editable`, the
+same test the inline editor applies, and it is asked **again** after the window
+closes — a save can start while the window is open.
+
+A saved value goes through `apply_cell_edit_value`, shared with the inline
+editor, so the NULL decision, dirty-cell bookkeeping, and repaint cannot drift
+between the two ways of editing a cell.
+
+`Format` is a view, never an edit. The indented text lives only in the buffer
+while the box is ticked; the text being edited waits in `raw_text` and is what
+`Save` writes. Both formatters move whitespace and nothing else: `format_json`
+re-spaces a validated token list rather than round-tripping through a document
+model (which would reorder keys and reformat numbers), and `format_xml` indents
+only elements whose content is entirely other elements, because whitespace
+inside mixed content is content.
+
+## Long values in Oracle grid edits
+
+The MySQL family saves through binds, so length is not a concern there. Oracle
+renders values as SQL literals, which has two limits:
+
+- A string literal over 4000 bytes is `ORA-01704`.
+  `ResultTableWidget::oracle_text_literal` emits
+  `TO_CLOB('..') || TO_CLOB('..')` past a safe threshold. Chunks are cut from
+  the unescaped value, so a boundary can never land inside an escaped `''` pair
+  or mid-character. Below the threshold the literal is byte-for-byte what it
+  always was.
+- `clob_column = 'text'` is `ORA-22848` at any length, so a table with a `CLOB`
+  column could not be edited at all. `original_value_predicate` emits
+  `DBMS_LOB.COMPARE(col, ..) = 0` for character LOBs and `col = ..` for
+  everything else. The LOB columns are identified from the declared types the
+  driver reported (`column_data_types`), not guessed from value length.
+
+`src/bin/verify_value_edit_live.rs` drives both statement shapes against every
+backend with a multi-byte value containing quotes and newlines, and compares the
+value read back byte for byte.
+
 ## Grid SQL export
 
 > Implementation: `src/ui/grid_sql_export.rs`, `src/ui/result_table.rs`,
@@ -302,6 +348,12 @@ cargo run --bin verify_result_export_ui
 
 # Real widget + real OS clipboard, no database needed.
 cargo run --bin verify_grid_sql_export
+
+# The cell value window: read-only shape, Format round trip, Save/Cancel.
+cargo run --bin verify_value_viewer_ui
+
+# Live: a long CLOB/TEXT value edited and read back, every backend.
+cargo run --bin verify_value_edit_live all
 
 # Live: real driver types and generated SQL executed on the server.
 # Run one Docker container at a time (MySQL and MariaDB both bind 3306).

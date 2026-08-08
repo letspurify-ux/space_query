@@ -697,6 +697,8 @@ mod tests {
             advanced: crate::db::ConnectionAdvancedSettings::default_for(
                 crate::db::DatabaseType::Oracle,
             ),
+            color: crate::db::ConnectionColor::default(),
+            read_only: false,
             debug_oracle_thin_protocol_version: None,
         }
     }
@@ -770,6 +772,8 @@ mod tests {
             password: String::new(),
             db_type: DatabaseType::MySQL,
             advanced: crate::db::ConnectionAdvancedSettings::default_for(DatabaseType::MySQL),
+            color: crate::db::ConnectionColor::default(),
+            read_only: false,
             debug_oracle_thin_protocol_version: None,
         });
 
@@ -1265,6 +1269,8 @@ mod tests {
             password: "secret".to_string(),
             db_type: DatabaseType::Oracle,
             advanced: crate::db::ConnectionAdvancedSettings::default_for(DatabaseType::Oracle),
+            color: crate::db::ConnectionColor::default(),
+            read_only: false,
             debug_oracle_thin_protocol_version: Some(314),
         });
 

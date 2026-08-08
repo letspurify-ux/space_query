@@ -391,6 +391,75 @@ pub enum ConnectionSslMode {
     VerifyIdentity,
 }
 
+/// The colour a saved connection is tagged with, so the window says which
+/// database is on the other end before a statement runs.
+///
+/// This is a client-side label, not a session setting: it never reaches the
+/// server and it survives switching the connection's database type.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ConnectionColor {
+    #[default]
+    None,
+    Red,
+    Orange,
+    Yellow,
+    Green,
+    Blue,
+    Purple,
+    Gray,
+}
+
+impl ConnectionColor {
+    /// Every colour in menu order, `None` first.
+    pub const ALL: [Self; 8] = [
+        Self::None,
+        Self::Red,
+        Self::Orange,
+        Self::Yellow,
+        Self::Green,
+        Self::Blue,
+        Self::Purple,
+        Self::Gray,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::None => "None",
+            Self::Red => "Red",
+            Self::Orange => "Orange",
+            Self::Yellow => "Yellow",
+            Self::Green => "Green",
+            Self::Blue => "Blue",
+            Self::Purple => "Purple",
+            Self::Gray => "Gray",
+        }
+    }
+
+    /// The 24-bit value the UI paints with, or `None` for an untagged
+    /// connection, which keeps whatever colour it had before.
+    ///
+    /// The tones are picked to stay legible on the dark palette; the widgets
+    /// that use them are in `src/ui/theme.rs`.
+    pub fn rgb(self) -> Option<(u8, u8, u8)> {
+        match self {
+            Self::None => None,
+            Self::Red => Some((0xE8, 0x64, 0x64)),
+            Self::Orange => Some((0xE8, 0x95, 0x40)),
+            Self::Yellow => Some((0xE0, 0xC2, 0x4A)),
+            Self::Green => Some((0x5C, 0xC2, 0x7A)),
+            Self::Blue => Some((0x5A, 0x9E, 0xE8)),
+            Self::Purple => Some((0xA9, 0x7B, 0xE0)),
+            Self::Gray => Some((0x9A, 0xA0, 0xA8)),
+        }
+    }
+
+    pub fn from_label(label: &str) -> Option<Self> {
+        Self::ALL
+            .into_iter()
+            .find(|candidate| candidate.label() == label)
+    }
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum OracleNetworkProtocol {
     #[default]
@@ -1016,6 +1085,13 @@ pub struct ConnectionInfo {
     pub service_name: String,
     pub db_type: DatabaseType,
     pub advanced: ConnectionAdvancedSettings,
+    /// Client-side tag, not a session setting — see [`ConnectionColor`].
+    #[serde(default)]
+    pub color: ConnectionColor,
+    /// When set, the application refuses to send anything that writes over this
+    /// connection. It is a guard in this process, not a server-side lock.
+    #[serde(default)]
+    pub read_only: bool,
     #[serde(skip)]
     pub debug_oracle_thin_protocol_version: Option<u16>,
 }
@@ -1032,6 +1108,13 @@ struct ConnectionInfoSerde {
     #[serde(default)]
     db_type: DatabaseType,
     advanced: Option<ConnectionAdvancedSettingsPatch>,
+    // `ConnectionInfo` deserialises through this struct, so a field missing
+    // here is a field silently dropped on load no matter what the real struct
+    // says.
+    #[serde(default)]
+    color: ConnectionColor,
+    #[serde(default)]
+    read_only: bool,
 }
 
 #[derive(Default, Deserialize)]
@@ -1118,6 +1201,8 @@ impl<'de> Deserialize<'de> for ConnectionInfo {
                 fields.db_type,
                 fields.advanced,
             ),
+            color: fields.color,
+            read_only: fields.read_only,
             debug_oracle_thin_protocol_version: None,
         })
     }
@@ -1164,6 +1249,8 @@ impl ConnectionInfo {
             service_name: service_name.to_string(),
             db_type,
             advanced: ConnectionAdvancedSettings::default_for(db_type),
+            color: ConnectionColor::default(),
+            read_only: false,
             debug_oracle_thin_protocol_version: None,
         }
     }
@@ -1186,6 +1273,8 @@ impl ConnectionInfo {
             service_name: service_name.to_string(),
             db_type,
             advanced: ConnectionAdvancedSettings::default_for(db_type),
+            color: ConnectionColor::default(),
+            read_only: false,
             debug_oracle_thin_protocol_version: None,
         }
     }
@@ -2605,6 +2694,8 @@ impl DbBackend for OracleBackend {
             service_name: form.default_service_name.to_string(),
             db_type: self.db_type(),
             advanced: ConnectionAdvancedSettings::default_for(self.db_type()),
+            color: ConnectionColor::default(),
+            read_only: false,
             debug_oracle_thin_protocol_version: None,
         }
     }
@@ -3079,6 +3170,8 @@ impl DbBackend for MysqlBackend {
             service_name: form.default_service_name.to_string(),
             db_type: self.db_type(),
             advanced: ConnectionAdvancedSettings::default_for(self.db_type()),
+            color: ConnectionColor::default(),
+            read_only: false,
             debug_oracle_thin_protocol_version: None,
         }
     }
@@ -8053,6 +8146,60 @@ mod tests {
         );
         assert_eq!(config.connect_options.retry_count, 0);
         assert_eq!(config.connect_options.retry_delay, Duration::ZERO);
+    }
+
+    #[test]
+    fn connection_color_and_read_only_survive_a_save_and_load() {
+        // ConnectionInfo deserialises through ConnectionInfoSerde, so a field
+        // present on the struct but missing from that mirror would save fine
+        // and come back gone. This is the test that catches it.
+        let mut info = ConnectionInfo::new_with_type(
+            "prod",
+            "system",
+            "pw",
+            "localhost",
+            1521,
+            "FREE",
+            DatabaseType::Oracle,
+        );
+        info.color = ConnectionColor::Red;
+        info.read_only = true;
+
+        let serialized = serde_json::to_string(&info).expect("ConnectionInfo should serialize");
+        let restored: ConnectionInfo =
+            serde_json::from_str(&serialized).expect("ConnectionInfo should deserialize");
+
+        assert_eq!(restored.color, ConnectionColor::Red);
+        assert!(restored.read_only);
+    }
+
+    #[test]
+    fn connection_color_and_read_only_default_for_connections_saved_before_them() {
+        let stored = r#"{"name":"old","username":"u","host":"h","port":1521,
+            "service_name":"FREE","db_type":"Oracle"}"#;
+        let restored: ConnectionInfo =
+            serde_json::from_str(stored).expect("an older saved connection still loads");
+
+        assert_eq!(restored.color, ConnectionColor::None);
+        assert!(!restored.read_only);
+    }
+
+    #[test]
+    fn connection_colors_have_distinct_labels_and_only_none_is_unpainted() {
+        let mut labels: Vec<&str> = ConnectionColor::ALL.iter().map(|c| c.label()).collect();
+        labels.sort_unstable();
+        labels.dedup();
+        assert_eq!(labels.len(), ConnectionColor::ALL.len());
+
+        for color in ConnectionColor::ALL {
+            assert_eq!(ConnectionColor::from_label(color.label()), Some(color));
+            assert_eq!(
+                color.rgb().is_none(),
+                color == ConnectionColor::None,
+                "only None leaves the widget colour alone"
+            );
+        }
+        assert_eq!(ConnectionColor::from_label("Chartreuse"), None);
     }
 
     #[test]

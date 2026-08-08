@@ -693,6 +693,10 @@ pub struct ObjectBrowserWidget {
     filter_input: Input,
     object_cache: Arc<Mutex<ObjectCache>>,
     current_db_type: Arc<Mutex<crate::db::DatabaseType>>,
+    /// Mirrors the connection's read-only flag without ever locking the
+    /// connection: a menu that has to wait for a running query would either
+    /// hang the UI or, worse, guess "writable" while it waits.
+    connection_is_read_only: Arc<AtomicBool>,
     scope_options: Arc<Mutex<Vec<String>>>,
     selected_scope: Arc<Mutex<Option<String>>>,
     suppress_scope_events: Arc<Mutex<bool>>,
@@ -780,6 +784,7 @@ impl ObjectBrowserWidget {
         let metadata_callback: MetadataCallback = Arc::new(Mutex::new(None));
         let object_cache = Arc::new(Mutex::new(ObjectCache::default()));
         let current_db_type = Arc::new(Mutex::new(initial_db_type));
+        let connection_is_read_only = Arc::new(AtomicBool::new(false));
         let scope_options = Arc::new(Mutex::new(Vec::new()));
         let selected_scope = Arc::new(Mutex::new(None));
         let suppress_scope_events = Arc::new(Mutex::new(false));
@@ -811,6 +816,7 @@ impl ObjectBrowserWidget {
             filter_input,
             object_cache,
             current_db_type,
+            connection_is_read_only,
             scope_options,
             selected_scope,
             suppress_scope_events,
@@ -1025,6 +1031,13 @@ impl ObjectBrowserWidget {
             normalized_scope.as_deref(),
             self.scope_switch_in_progress.load(Ordering::Acquire),
         );
+    }
+
+    /// Tells this browser that its connection refuses writes, so the menus
+    /// stop offering actions that would be refused.
+    pub fn set_connection_is_read_only(&mut self, read_only: bool) {
+        self.connection_is_read_only
+            .store(read_only, Ordering::Release);
     }
 
     pub fn set_tab_local_scope_selection(&mut self, enabled: bool) {
@@ -2398,6 +2411,7 @@ impl ObjectBrowserWidget {
         let filter_input = self.filter_input.clone();
         let connection = self.connection.clone();
         let current_db_type = self.current_db_type.clone();
+        let connection_is_read_only = self.connection_is_read_only.clone();
         let action_sender = self.action_sender.clone();
         let selected_scope = self.selected_scope.clone();
         let scope_change_callback = self.scope_change_callback.clone();
@@ -2419,6 +2433,7 @@ impl ObjectBrowserWidget {
             filter_input: Input,
             connection: SharedConnection,
             current_db_type: Arc<Mutex<crate::db::DatabaseType>>,
+            connection_is_read_only: Arc<AtomicBool>,
             action_sender: std::sync::mpsc::Sender<ObjectActionResult>,
             selected_scope: Arc<Mutex<Option<String>>>,
             scope_change_callback: ScopeChangeCallback,
@@ -2722,6 +2737,7 @@ impl ObjectBrowserWidget {
                                 let _ = ObjectBrowserWidget::show_context_menu_for_object_item_at(
                                     &connection,
                                     &current_db_type,
+                                    &connection_is_read_only,
                                     item,
                                     &sql_callback,
                                     &status_callback,
@@ -2842,6 +2858,7 @@ impl ObjectBrowserWidget {
                     filter_input.clone(),
                     connection.clone(),
                     current_db_type.clone(),
+                    connection_is_read_only.clone(),
                     action_sender.clone(),
                     selected_scope.clone(),
                     scope_change_callback.clone(),
@@ -2863,6 +2880,7 @@ impl ObjectBrowserWidget {
             filter_input,
             connection,
             current_db_type,
+            connection_is_read_only,
             action_sender,
             selected_scope,
             scope_change_callback,
@@ -2881,6 +2899,7 @@ impl ObjectBrowserWidget {
         let action_sender = self.action_sender.clone();
         let object_cache = self.object_cache.clone();
         let current_db_type = self.current_db_type.clone();
+        let connection_is_read_only = self.connection_is_read_only.clone();
         let selected_scope = self.selected_scope.clone();
         let scope_generation = self.scope_generation.clone();
         let mut pending_drag_text: Option<String> = None;
@@ -2908,6 +2927,7 @@ impl ObjectBrowserWidget {
                             Self::show_context_menu(
                                 &connection,
                                 &current_db_type,
+                                &connection_is_read_only,
                                 &item,
                                 &sql_callback,
                                 &status_callback,
@@ -2918,6 +2938,7 @@ impl ObjectBrowserWidget {
                             Self::show_context_menu(
                                 &connection,
                                 &current_db_type,
+                                &connection_is_read_only,
                                 &item,
                                 &sql_callback,
                                 &status_callback,
@@ -4800,6 +4821,7 @@ impl ObjectBrowserWidget {
         Self::show_context_menu_for_object_item(
             &self.connection,
             &self.current_db_type,
+            &self.connection_is_read_only,
             resolved.item,
             &self.sql_callback,
             &self.status_callback,
@@ -5539,6 +5561,7 @@ impl ObjectBrowserWidget {
     fn show_context_menu(
         connection: &SharedConnection,
         current_db_type: &Arc<Mutex<crate::db::DatabaseType>>,
+        connection_is_read_only: &Arc<AtomicBool>,
         item: &TreeItem,
         sql_callback: &SqlExecuteCallback,
         status_callback: &StatusCallback,
@@ -5550,6 +5573,7 @@ impl ObjectBrowserWidget {
             let _ = Self::show_context_menu_for_object_item(
                 connection,
                 current_db_type,
+                connection_is_read_only,
                 item_info,
                 sql_callback,
                 status_callback,
@@ -5640,9 +5664,41 @@ impl ObjectBrowserWidget {
         object_browser_behavior_for(db_type).menu_choices_for_object_item(item_info)
     }
 
+    /// Menu entries that would send something the database has to write, or
+    /// run code that could.
+    ///
+    /// `Check Compilation`, `View Info`, `View Structure` and `Generate DDL`
+    /// are not here: they only read catalog metadata.
+    const WRITE_CAPABLE_MENU_LABELS: [&'static str; 6] = [
+        "Import Data...",
+        DestructiveObjectAction::TRUNCATE_LABEL,
+        DestructiveObjectAction::DROP_LABEL,
+        "Execute Procedure",
+        "Execute Function",
+        "Execute Routine",
+    ];
+
+    /// `choices` with the write-capable entries removed when the connection is
+    /// read-only, or `None` when nothing is left to show.
+    ///
+    /// The alternative — leaving them in and refusing on click — would put
+    /// items in the menu that are guaranteed to fail, which is the thing the
+    /// destructive-action design set out to avoid.
+    fn menu_choices_for_read_only(choices: &str, read_only: bool) -> Option<String> {
+        if !read_only {
+            return (!choices.is_empty()).then(|| choices.to_string());
+        }
+        let kept: Vec<&str> = choices
+            .split('|')
+            .filter(|label| !Self::WRITE_CAPABLE_MENU_LABELS.contains(label))
+            .collect();
+        (!kept.is_empty()).then(|| kept.join("|"))
+    }
+
     fn show_context_menu_for_object_item(
         connection: &SharedConnection,
         current_db_type: &Arc<Mutex<crate::db::DatabaseType>>,
+        connection_is_read_only: &Arc<AtomicBool>,
         item_info: ObjectItem,
         sql_callback: &SqlExecuteCallback,
         status_callback: &StatusCallback,
@@ -5652,6 +5708,7 @@ impl ObjectBrowserWidget {
         Self::show_context_menu_for_object_item_at(
             connection,
             current_db_type,
+            connection_is_read_only,
             item_info,
             sql_callback,
             status_callback,
@@ -5665,6 +5722,7 @@ impl ObjectBrowserWidget {
     fn show_context_menu_for_object_item_at(
         connection: &SharedConnection,
         current_db_type: &Arc<Mutex<crate::db::DatabaseType>>,
+        connection_is_read_only: &Arc<AtomicBool>,
         item_info: ObjectItem,
         sql_callback: &SqlExecuteCallback,
         status_callback: &StatusCallback,
@@ -5680,6 +5738,12 @@ impl ObjectBrowserWidget {
         let Some(menu_choices) = Self::menu_choices_for_object_item(&item_info, db_type) else {
             return false;
         };
+        let Some(menu_choices) = Self::menu_choices_for_read_only(
+            menu_choices,
+            connection_is_read_only.load(Ordering::Acquire),
+        ) else {
+            return false;
+        };
 
         // Prevent menu from being added to parent container
         let current_group = fltk::group::Group::try_current();
@@ -5688,7 +5752,7 @@ impl ObjectBrowserWidget {
         let mut menu = fltk::menu::MenuButton::new(mouse_x, mouse_y, 0, 0, None);
         menu.set_color(theme::panel_raised());
         menu.set_text_color(theme::text_primary());
-        menu.add_choice(menu_choices);
+        menu.add_choice(&menu_choices);
 
         if let Some(ref group) = current_group {
             fltk::group::Group::set_current(Some(group));
@@ -8635,6 +8699,7 @@ impl MultiObjectBrowserWidget {
             runtime.connection(),
         );
         browser.set_tab_local_scope_selection(true);
+        browser.set_connection_is_read_only(runtime.sanitized_info().read_only);
         self.browser_stack.end();
         if let Some(previous_group) = previous_group.as_ref() {
             Group::set_current(Some(previous_group));
@@ -9797,6 +9862,80 @@ mod tests {
         assert_eq!(target.table_name, "EMP");
         assert_eq!(target.relation_sql, "SCOTT.EMP");
         assert!(target.editable);
+    }
+
+    #[test]
+    fn read_only_menu_drops_every_write_capable_entry() {
+        let table_menu = "Select Data (Top 100)|Import Data...|View Structure|View Indexes|View \
+                          Constraints|Generate DDL|Truncate...|Drop...";
+        assert_eq!(
+            ObjectBrowserWidget::menu_choices_for_read_only(table_menu, true).as_deref(),
+            Some("Select Data (Top 100)|View Structure|View Indexes|View Constraints|Generate DDL")
+        );
+        // Reading the catalog is still on offer.
+        assert_eq!(
+            ObjectBrowserWidget::menu_choices_for_read_only(
+                "Check Compilation|Generate DDL|Drop...",
+                true
+            )
+            .as_deref(),
+            Some("Check Compilation|Generate DDL")
+        );
+        // Nothing left means no menu at all, rather than an empty one.
+        assert_eq!(
+            ObjectBrowserWidget::menu_choices_for_read_only("Execute Procedure", true),
+            None
+        );
+    }
+
+    #[test]
+    fn a_writable_connection_keeps_every_menu_entry() {
+        for db_type in [
+            crate::db::DatabaseType::Oracle,
+            crate::db::DatabaseType::MySQL,
+            crate::db::DatabaseType::MariaDB,
+        ] {
+            for object_type in [
+                "TABLES",
+                "VIEWS",
+                "PROCEDURES",
+                "FUNCTIONS",
+                "SEQUENCES",
+                "TRIGGERS",
+                "PACKAGES",
+                "SYNONYMS",
+            ] {
+                let item = ObjectItem::Simple {
+                    object_type: object_type.to_string(),
+                    object_name: "X".to_string(),
+                };
+                let Some(choices) =
+                    ObjectBrowserWidget::menu_choices_for_object_item(&item, db_type)
+                else {
+                    continue;
+                };
+                assert_eq!(
+                    ObjectBrowserWidget::menu_choices_for_read_only(choices, false).as_deref(),
+                    Some(choices),
+                    "{db_type:?}/{object_type} lost an entry while writable"
+                );
+                // And every read-only menu is a subset of the writable one.
+                if let Some(read_only) =
+                    ObjectBrowserWidget::menu_choices_for_read_only(choices, true)
+                {
+                    for label in read_only.split('|') {
+                        assert!(
+                            choices.split('|').any(|candidate| candidate == label),
+                            "{db_type:?}/{object_type} invented the entry {label:?}"
+                        );
+                        assert!(
+                            !ObjectBrowserWidget::WRITE_CAPABLE_MENU_LABELS.contains(&label),
+                            "{db_type:?}/{object_type} kept the write-capable entry {label:?}"
+                        );
+                    }
+                }
+            }
+        }
     }
 
     #[test]

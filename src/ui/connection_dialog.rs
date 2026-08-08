@@ -1,7 +1,7 @@
 use fltk::{
     app,
     browser::HoldBrowser,
-    button::Button,
+    button::{Button, CheckButton},
     enums::{CallbackTrigger, Event, FrameType, Key},
     frame::Frame,
     group::Flex,
@@ -18,8 +18,8 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 
 use crate::db::{
-    ConnectionAdvancedSettings, ConnectionAttemptPolicy, ConnectionInfo, ConnectionSslMode,
-    DatabaseConnection, DatabaseType, OracleDriverMode, OracleNetworkProtocol,
+    ConnectionAdvancedSettings, ConnectionAttemptPolicy, ConnectionColor, ConnectionInfo,
+    ConnectionSslMode, DatabaseConnection, DatabaseType, OracleDriverMode, OracleNetworkProtocol,
     TransactionAccessMode, TransactionIsolation,
 };
 use crate::ui::constants::*;
@@ -236,6 +236,30 @@ fn choice_index_from_oracle_thin_protocol(protocol_version: Option<u16>) -> i32 
         .iter()
         .position(|candidate| *candidate == protocol_version)
         .unwrap_or_default() as i32
+}
+
+fn connection_color_choice_labels() -> String {
+    ConnectionColor::ALL
+        .iter()
+        .map(|color| color.label())
+        .collect::<Vec<_>>()
+        .join("|")
+}
+
+fn connection_color_from_choice_index(idx: i32) -> ConnectionColor {
+    usize::try_from(idx)
+        .ok()
+        .and_then(|idx| ConnectionColor::ALL.get(idx))
+        .copied()
+        .unwrap_or_default()
+}
+
+fn choice_index_from_connection_color(color: ConnectionColor) -> i32 {
+    ConnectionColor::ALL
+        .iter()
+        .position(|candidate| *candidate == color)
+        .and_then(|index| i32::try_from(index).ok())
+        .unwrap_or(0)
 }
 
 fn transaction_isolation_from_choice_index(
@@ -1110,6 +1134,41 @@ impl ConnectionDialog {
         service_flex.end();
         right_col.fixed(&service_flex, INPUT_ROW_HEIGHT);
 
+        // Colour and Read-only sit here, not under Advanced Settings: neither
+        // one is a session option and neither is sent to the server. They are
+        // properties of the saved profile, so they survive a change of database
+        // type the way the name and host do.
+        let mut color_flex = Flex::default();
+        color_flex.set_type(fltk::group::FlexType::Row);
+        let mut color_label = Frame::default().with_label("Color:");
+        color_label.set_label_color(theme::text_primary());
+        color_flex.fixed(&color_label, FORM_LABEL_WIDTH);
+        let mut color_choice = Choice::default();
+        color_choice.add_choice(&connection_color_choice_labels());
+        color_choice.set_value(choice_index_from_connection_color(ConnectionColor::None));
+        color_choice.set_tooltip(
+            "Tags this connection in the status bar and on its query tabs. Nothing is sent to the server.",
+        );
+        theme::style_choice(&mut color_choice);
+        theme::install_choice_hover(&mut color_choice);
+        color_flex.end();
+        right_col.fixed(&color_flex, INPUT_ROW_HEIGHT);
+
+        let mut read_only_flex = Flex::default();
+        read_only_flex.set_type(fltk::group::FlexType::Row);
+        let mut read_only_label = Frame::default().with_label("Safety:");
+        read_only_label.set_label_color(theme::text_primary());
+        read_only_flex.fixed(&read_only_label, FORM_LABEL_WIDTH);
+        let mut read_only_check = CheckButton::default().with_label(" Read-only");
+        read_only_check.set_label_color(theme::text_primary());
+        read_only_check.set_color(theme::button_dark());
+        theme::install_button_hover(&mut read_only_check);
+        read_only_check.set_tooltip(
+            "Refuse to send anything that writes over this connection. A guard in this application, not a server-side lock.",
+        );
+        read_only_flex.end();
+        right_col.fixed(&read_only_flex, INPUT_ROW_HEIGHT);
+
         let connection_spacer = Frame::default();
         right_col.resizable(&connection_spacer);
         right_col.end();
@@ -1790,6 +1849,8 @@ impl ConnectionDialog {
         // Saved connection selection callback
         let config_cb = config.clone();
         let mut name_input_cb = name_input.clone();
+        let mut color_choice_cb = color_choice.clone();
+        let read_only_check_cb = read_only_check.clone();
         let mut user_input_cb = user_input.clone();
         let mut pass_input_cb = pass_input.clone();
         let mut host_input_cb = host_input.clone();
@@ -1885,6 +1946,8 @@ impl ConnectionDialog {
                         .lock()
                         .unwrap_or_else(|poisoned| poisoned.into_inner()) = conn.db_type;
                     dbtype_choice_cb.set_value(choice_index_from_db_type(conn.db_type));
+                    color_choice_cb.set_value(choice_index_from_connection_color(conn.color));
+                    read_only_check_cb.set_checked(conn.read_only);
                     if !conn.db_type.supports_tns_alias() {
                         service_input_cb.set_value(&conn.service_name);
                         host_input_cb.set_value(&conn.host);
@@ -1972,6 +2035,8 @@ impl ConnectionDialog {
         // Save button callback
         let sender_for_save = sender.clone();
         let name_input_save = name_input.clone();
+        let color_choice_save = color_choice.clone();
+        let read_only_check_save = read_only_check.clone();
         let user_input_save = user_input.clone();
         let pass_input_save = pass_input.clone();
         let host_input_save = host_input.clone();
@@ -2009,7 +2074,7 @@ impl ConnectionDialog {
                 &oracle_nls_date_input_save,
                 &oracle_nls_timestamp_input_save,
             );
-            let info = match build_connection_info(
+            let mut info = match build_connection_info(
                 &name_input_save.value(),
                 &user_input_save.value(),
                 &pass_input_save.value(),
@@ -2027,6 +2092,9 @@ impl ConnectionDialog {
                 }
             };
 
+            info.color = connection_color_from_choice_index(color_choice_save.value());
+            info.read_only = read_only_check_save.is_checked();
+
             let _ = sender_for_save.send(DialogMessage::Save(info));
             app::awake();
         });
@@ -2037,6 +2105,8 @@ impl ConnectionDialog {
         let mut connect_btn_for_test = connect_btn.clone();
         let test_in_progress_for_test = test_in_progress.clone();
         let name_input_test = name_input.clone();
+        let color_choice_test = color_choice.clone();
+        let read_only_check_test = read_only_check.clone();
         let user_input_test = user_input.clone();
         let pass_input_test = pass_input.clone();
         let host_input_test = host_input.clone();
@@ -2107,6 +2177,8 @@ impl ConnectionDialog {
             };
             info.debug_oracle_thin_protocol_version =
                 oracle_thin_protocol_from_choice_index(oracle_thin_protocol_choice_test.value());
+            info.color = connection_color_from_choice_index(color_choice_test.value());
+            info.read_only = read_only_check_test.is_checked();
 
             test_btn_for_toggle.deactivate();
             connect_btn_for_test.deactivate();
@@ -2118,6 +2190,8 @@ impl ConnectionDialog {
         // Connect button callback
         let sender_for_connect = sender.clone();
         let name_input_conn = name_input.clone();
+        let color_choice_conn = color_choice.clone();
+        let read_only_check_conn = read_only_check.clone();
         let user_input_conn = user_input.clone();
         let pass_input_conn = pass_input.clone();
         let host_input_conn = host_input.clone();
@@ -2182,6 +2256,8 @@ impl ConnectionDialog {
             };
             info.debug_oracle_thin_protocol_version =
                 oracle_thin_protocol_from_choice_index(oracle_thin_protocol_choice_conn.value());
+            info.color = connection_color_from_choice_index(color_choice_conn.value());
+            info.read_only = read_only_check_conn.is_checked();
 
             let _ = sender_for_connect.send(DialogMessage::Connect(info, false));
             app::awake();
@@ -2961,6 +3037,8 @@ mod tests {
             password: String::new(),
             db_type: DatabaseType::Oracle,
             advanced: ConnectionAdvancedSettings::default_for(DatabaseType::Oracle),
+            color: crate::db::ConnectionColor::default(),
+            read_only: false,
             debug_oracle_thin_protocol_version: None,
         };
         super::sync_oracle_mode_memory_from_info(&memory, &direct_conn);
@@ -2982,6 +3060,8 @@ mod tests {
             password: String::new(),
             db_type: DatabaseType::Oracle,
             advanced: ConnectionAdvancedSettings::default_for(DatabaseType::Oracle),
+            color: crate::db::ConnectionColor::default(),
+            read_only: false,
             debug_oracle_thin_protocol_version: None,
         };
         super::sync_oracle_mode_memory_from_info(&memory, &tns_conn);

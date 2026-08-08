@@ -3700,6 +3700,8 @@ mod tests {
             service_name: "possibly_dropped_database".to_string(),
             db_type: DatabaseType::MySQL,
             advanced: crate::db::ConnectionAdvancedSettings::default_for(DatabaseType::MySQL),
+            color: crate::db::ConnectionColor::default(),
+            read_only: false,
             debug_oracle_thin_protocol_version: None,
         }));
 

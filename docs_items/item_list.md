@@ -1,6 +1,6 @@
 # DataGrip 대비 미구현 기능 목록 (시급도 순)
 
-작성일: 2026-08-06 · 갱신일: 2026-08-08 (항목 31 완료 기록. 그 전 갱신: 항목 10·12·28 완료 기록, 항목 7·8 완료 기록, 구현 상태 재확인, 항목 24~33 추가)
+작성일: 2026-08-06 · 갱신일: 2026-08-08 (항목 4·11 완료 기록, 항목 28 재검증 기록. 그 전 갱신: 항목 31 완료 기록, 항목 10·12·28 완료 기록, 항목 7·8 완료 기록, 구현 상태 재확인, 항목 24~33 추가)
 
 ## 조사 범위와 기준
 
@@ -249,6 +249,57 @@ NULL 텍스트 반영, Cancel 무동작, 읽을 수 없는 파일에서 파서 �
 - **난이도**: 소~중. 기존 모달을 `TextEditor`로 바꾸고 staged edit에 값을
   되돌려주는 것부터. JSON 포맷팅과 Transpose 뷰는 후속.
 
+#### 구현 상태 (2026-08-08) — 완료 (뷰어 · 편집 · JSON/XML 포맷)
+
+셀 더블클릭 또는 그리드 컨텍스트 메뉴 **View Value...** / **Edit Value...** 가
+값 창을 연다.
+
+| 조각 | 위치 |
+| --- | --- |
+| 포맷터·탐지·크기 (순수 함수, 테스트 14개) | `src/ui/value_viewer.rs` |
+| 창 | `value_viewer::show` |
+| 진입점 | `ResultTableWidget::open_cell_value_window` |
+| 값 반영 (인라인 에디터와 공유) | `ResultTableWidget::apply_cell_edit_value` |
+| GUI 검증 | `src/bin/verify_value_viewer_ui.rs` |
+| 라이브 검증 | `src/bin/verify_value_edit_live.rs` (4 백엔드) |
+| 캡쳐 | `capture_feature_tour value-viewer` |
+
+설계상 결정 네 가지:
+
+- **읽기 전용은 `TextDisplay`, 편집 가능은 `TextEditor`.** FLTK `TextEditor`에는
+  읽기 전용 플래그가 없다. 키 바인딩을 걷어내 흉내 내는 대신, **이미 표시 전용인
+  위젯**을 쓴다 — 선택·스크롤·복사는 그대로 된다.
+- **Format은 편집이 아니라 보기다.** 정렬본은 체크가 켜져 있는 동안만 버퍼에
+  살고, 편집 중이던 원본은 따로 보관됐다가 저장된다. CLOB을 읽으려고 Format을
+  눌렀다가 저장해서 **DB의 공백이 바뀌는 일이 없다.** GUI 검증이 이걸 실제
+  위젯으로 고정한다.
+- **포맷터는 공백만 옮긴다.** JSON은 문서 모델로 왕복하지 않는다
+  (`serde_json::Value`를 거치면 키 순서가 바뀌고 큰 수가 `f64`를 통과한다).
+  검증된 토큰 목록을 다시 배치할 뿐이라 키 순서와 숫자 표기가 그대로다. XML은
+  **자식이 요소뿐인 요소만** 들여쓴다 — 텍스트가 섞인 요소의 공백은 내용이다.
+- **편집 가능 여부를 창이 닫힌 뒤 다시 묻는다.** 창이 열려 있는 동안 저장이
+  시작될 수 있다.
+
+**Oracle 긴 값 저장을 같이 고쳤다.** 이게 이 항목이 지목한 실제 통증이다.
+
+- 4000바이트를 넘는 문자열 리터럴은 `ORA-01704`다 →
+  `oracle_text_literal`이 `TO_CLOB('..') || TO_CLOB('..')`로 쪼갠다. 청크는
+  **이스케이프 전 값**에서 자르므로 경계가 `''` 쌍 가운데나 문자 중간에 떨어질
+  수 없다. 한계 아래에서는 바이트 단위로 예전과 같다.
+- **길이와 무관한 벽이 하나 더 있었다.** `clob_column = 'text'`는 길이에 관계없이
+  `ORA-22848`이라, **CLOB 컬럼이 있는 테이블은 애초에 편집이 안 됐다.**
+  라이브 검증이 이걸 잡았다. `original_value_predicate`가 문자 LOB에는
+  `DBMS_LOB.COMPARE(col, ..) = 0`을, 나머지에는 종전의 `col = ..`을 낸다.
+  LOB 판정은 드라이버가 보고한 **선언 타입**(`column_data_types`)으로 하며 값
+  길이로 추측하지 않는다. 가드를 버리지 않고 유지한다는 점이 중요하다.
+- MySQL/MariaDB는 바인드라 원래 문제가 없었다. 라이브 검증은 그래도 4개 백엔드
+  모두에서 11,200바이트 → 15,200바이트 → 짧은 값 왕복을 바이트 단위로 비교한다
+  (한글·작은따옴표·개행 포함).
+
+**남은 것**: Transpose(단일 레코드) 뷰와 값 창 내부 검색. 원래 계획대로 후속이다.
+BLOB 편집은 여전히 범위 밖이다 — 그리드가 보여주는 값이 자리표시자라 어떤 비교도
+옳을 수 없다.
+
 ### 5. 객체 브라우저에서의 파괴적/구조 변경 작업 (Drop / Truncate / Rename)
 
 - **DataGrip**: 객체 우클릭 → Drop, Truncate, Rename(리팩터링), 그리고
@@ -437,6 +488,84 @@ DROP할 수 있는 타입)이 붙었다 — `DestructiveObjectAction`
   낮아서 가성비가 가장 좋은 항목 중 하나.
 - **난이도**: 소(색상) / 소~중(read-only — 실행 전 문 분류로 DML/DDL 차단.
   `src/db/sql_classification.rs`가 이미 문 종류를 판정하므로 재사용 가능).
+
+#### 구현 상태 (2026-08-08) — 완료
+
+커넥션 다이얼로그 **Connection Info** 열에 `Color:`와 `Safety: Read-only` 두 줄.
+
+| 조각 | 위치 |
+| --- | --- |
+| 저장 | `ConnectionInfo::color` / `read_only` (`src/db/connection.rs`) |
+| 색 팔레트 | `ConnectionColor` (`label` / `rgb` / `ALL`) |
+| 폼 | `src/ui/connection_dialog.rs` |
+| 차단 판정 (순수 함수) | `sql_classification::read_only_block_reason` |
+| 관문 | `SqlEditorWidget::read_only_refusal` (에디터 단일 깔때기) |
+| 메뉴 필터 | `ObjectBrowserWidget::menu_choices_for_read_only` |
+| 라이브 검증 | `src/bin/verify_read_only_live.rs` (4 백엔드) |
+| 캡쳐 | `capture_feature_tour connection-color` |
+
+설계상 결정 다섯 가지:
+
+- **둘 다 Advanced Settings가 아니라 Connection Info에 있다.** 세션 옵션이 아니고
+  서버로 나가지도 않는다. 저장된 프로필의 성질이므로 DB 종류를 바꿔도 살아남는다.
+- **`ConnectionInfoSerde`에도 반드시 넣어야 한다.** `ConnectionInfo`의
+  `Deserialize`는 수동 구현이라 그 미러에 빠진 필드는 **저장은 되는데 다시 읽을 때
+  조용히 사라진다.** 왕복 테스트로 고정했다.
+- **끊긴 상태가 색상보다 우선한다.** 태그 색은 "connected" 초록만 대체하고
+  disconnected 회색은 절대 덮지 않는다. 살아 있는 세션인지가 표시등이 언제나 말할
+  수 있어야 하는 유일한 것이다.
+- **문장 단위로 판정한다.** 통짜 텍스트를 분류하면 SELECT 세 개짜리 F5 스크립트가
+  `Script`로 뭉뚱그려져 막힌다 — 읽기 전용 커넥션이야말로 여러 쿼리를 한꺼번에
+  돌리는 게 정상인 곳이다. 실행기가 쓸 것과 **같은** 스플리터·같은 MySQL
+  delimiter로 쪼갠 뒤 각각을 본다. 분류 못 한 문장은 통과시키지 않는다.
+  `@file` 인클루드(내용을 미리 볼 수 없다)와 `CONNECT`(커넥션 자체를 빠져나간다)도
+  막는다.
+- **막을 것은 애초에 띄우지 않는다.** 그리드 **Edit** 체크박스가 사라지고, 객체
+  브라우저에서 Drop/Truncate/Import Data/Execute Procedure·Function이 빠진다.
+  카탈로그를 읽는 Generate DDL·View Structure·Check Compilation은 그대로다.
+  Drop/Truncate 때 세운 "눌러도 반드시 실패하는 항목이 뜰 수 없다"와 같은 원칙.
+
+관문은 `execute_sql_with_mysql_delimiter_after_lazy_cancel` — 소스 주석이 이미
+"All editor execution entry points funnel through this SQL-aware preflight"라고
+못박은 자리다. **트랜잭션 preflight와 바인드 프롬프트보다 앞**에 둔다: 거절할
+문장의 플레이스홀더 값을 먼저 물어보는 일이 없어야 한다.
+
+**서버측 강제가 아니다.** 실수를 막는 장치이고, 작정한 시도를 막지는 못한다.
+README와 `docs/session.md`에 그렇게 적었다. 서버가 강제하길 원하면 커넥션의
+`Access: Read only` 트랜잭션 모드나 쓰기 권한 없는 계정을 쓰면 된다 — 둘 다 이미
+있다.
+
+**라이브 검증에는 대조군이 있다.** 거절 대상 문장을 **먼저 쓰기 가능 커넥션에서
+돌려 성공을 확인**한 뒤에야 읽기 전용 커넥션에서 거절을 확인한다. 대조군이 없으면
+백엔드가 어차피 거부했을 문장과 가드가 막은 문장이 구분되지 않는다 — 오타 하나가
+통과로 읽힌다. 이어서 **두 번째 쓰기 가능 커넥션**을 증인으로 세워 거절 뒤 행 수와
+스키마(생성/이름변경/컬럼추가/삭제)가 그대로인지 확인하고, 마지막으로 같은
+프로세스의 쓰기 가능 커넥션은 여전히 쓸 수 있는지 확인한다(가드가 전역 모드가
+아니라 **커넥션의 성질**임을 고정).
+
+백엔드별 방언까지 돈다 — Oracle은 MERGE·INSERT ALL·PL/SQL·DECLARE 블록·
+CREATE OR REPLACE PROCEDURE·GRANT·TRUNCATE·ALTER, MySQL 계열은 REPLACE INTO·
+ON DUPLICATE KEY UPDATE·실행 주석(`/*! ... */`) 속 DELETE·RENAME TABLE·
+CREATE PROCEDURE. 읽기 쪽은 SELECT·WITH·다중 SELECT·스칼라 서브쿼리+조인·
+COMMIT·ROLLBACK, Oracle은 ALTER SESSION SET CURRENT_SCHEMA, MySQL 계열은
+SHOW TABLES·DESCRIBE·USE·EXPLAIN.
+
+**읽기처럼 보이지만 거절되는 두 가지를 라이브 검증이 잡아냈다.**
+`SELECT ... FOR UPDATE`는 문장보다 오래 사는 행 잠금을 잡고,
+Oracle `EXPLAIN PLAN FOR`는 `PLAN_TABLE`에 행을 **삽입한다**. 분류기가 둘 다
+이미 `Dml`로 보고 있었고 그게 옳다 — 대신 **읽기 전용 Oracle 커넥션에서는 F6
+실행 계획을 쓸 수 없다.** MySQL 계열 `EXPLAIN`은 보고만 하므로 그대로 된다.
+README와 `docs/session.md`에 적었다.
+
+**부수적으로 캡쳐 스크립트 버그 하나를 고쳤다.** `scripts/capture_feature_tour.sh`에
+`connection-dialog`·`settings-dialog` 단일 씬 분기가 없어서, 그 모드로 돌리면 맨
+아래 전체 변환 목록으로 흘러 **`/tmp`에 남아 있던 오래된 PPM으로 무관한 이미지
+8개를 덮어썼다**(main-window와 result-grid가 같은 파일이 되는 식). 문서대로 캡쳐를
+돌리다 실제로 밟았다. 분기를 추가하고, 새 씬을 넣을 때 분기도 같이 넣어야 한다는
+주석을 달았다.
+
+**남은 것**: 색을 더 많은 곳(결과 탭, 객체 브라우저 트리)에 칠하는 것. 지금은
+상태바 표시등·상태바 텍스트·쿼리 탭 라벨 세 곳이다.
 
 ### 11-b. 그리드 내 텍스트 검색 (`Ctrl+F`)
 
@@ -641,6 +770,13 @@ Oracle은 predicate와 cost 몫이 실려 오는지·MySQL 계열은 서버 컬�
 
 **남은 것**: 코드 폴딩은 여전히 Tier 2다(FLTK `TextEditor`에 폴딩 개념이 없다).
 
+#### 재검증 (2026-08-08) — 이상 없음
+
+항목 4·11 작업 뒤 `verify_editor_convenience_ui`를 다시 돌렸다. 21개 확인이 모두
+통과한다 — 랩 토글, 열려 있던 탭과 이후 만든 탭 양쪽 적용, 설정 저장, 메뉴 체크
+상태, 메뉴 재생성 후에도 유지, 되돌리기, Go to Line의 이동·클램프·빈 버퍼·멀티바이트
+문서·취소까지. 새로 만든 값 창과 색상 표면이 겹쳐 깨뜨린 데는 없다. 새 코드 없음.
+
 ---
 
 ## Tier 2 — 있으면 좋음. 큰 기능이거나 사용 빈도가 낮음
@@ -844,13 +980,13 @@ OUT `SYS_REFCURSOR`는 Oracle 전용 `Ref Cursor` 타입으로 답한다(그 행
 | ✅ | ~~10. Go to Declaration / 전역 객체 검색~~ | **완료** — 서버 전역 검색은 범위 밖 |
 | ✅ | ~~12. 실행 계획 시각화~~ | **완료** — MySQL 계열은 트리 없이 서버 컬럼 그대로 |
 | ✅ | ~~31. 바인드 파라미터 값 입력 프롬프트~~ | **완료** — `:name` · `:1` · `?`, 4백엔드 라이브 검증 |
+| ✅ | ~~4. 값 뷰어/에디터 패널~~ | **완료** — Oracle 긴 값·CLOB 편집까지 뚫음. Transpose는 범위 밖 |
+| ✅ | ~~11. 커넥션 색상 + 읽기 전용~~ | **완료** — 클라이언트 가드, 4백엔드 라이브 검증 |
 | 1 | 25. 셀 값으로 빠른 필터 | 이미 있는 `grid_sql_export` 리터럴 생성을 그대로 쓴다 |
 | 2 | 26. 객체 트리 Export / Import | 3번이 끝난 지금 메뉴 항목 하나로 끝난다 |
 | 3 | 24. 결과 정렬 수단 | 헤더 정렬 제거로 생긴 구멍. (a)안이면 작다 |
-| 4 | 4. 값 에디터 패널 | 기존 모달 확장, LOB 편집 구멍을 메움 |
-| 5 | 11. 커넥션 색상 + 읽기 전용 | `sql_classification.rs` 재사용, 사고 방지 |
-| 6 | 16. 미저장 탭 복원 | 데이터 손실 방지 |
-| 7 | 6. 컬럼 숨김/순서 · 27. 트리 컬럼 노드 | 구조 변경 수반 |
+| 4 | 16. 미저장 탭 복원 | 데이터 손실 방지 |
+| 5 | 6. 컬럼 숨김/순서 · 27. 트리 컬럼 노드 | 구조 변경 수반 |
 
 ### 이 목록의 한계 (검토 요청)
 

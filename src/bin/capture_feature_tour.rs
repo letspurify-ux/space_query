@@ -1,6 +1,7 @@
 use fltk::{
     app,
     browser::HoldBrowser,
+    button::CheckButton,
     draw,
     enums::{Event, FrameType},
     menu::MenuBar,
@@ -19,9 +20,9 @@ use space_query::{
         intellisense::input_caret_popup_anchor,
         log_viewer::LogViewerDialog,
         object_browser::ObjectCache,
-        object_search_dialog, profile_by_name, show_settings_dialog, theme, ConnectionDialog,
-        IntellisensePopup, MainWindow, QueryHistoryDialog, SignatureLabel, SignatureOverload,
-        SignaturePopup,
+        object_search_dialog, profile_by_name, show_settings_dialog, theme, value_viewer,
+        ConnectionDialog, IntellisensePopup, MainWindow, QueryHistoryDialog, SignatureLabel,
+        SignatureOverload, SignaturePopup,
     },
     utils::{arithmetic::safe_div, logging, AppConfig},
 };
@@ -131,6 +132,15 @@ fn save_main_part(path: &str, x: i32, y: i32, width: i32, height: i32) {
         cropped[target..target + length].copy_from_slice(&data[source..source + length]);
     }
     save_ppm(path, &cropped, width, height);
+}
+
+fn collect_widgets(group: &fltk::group::Group, out: &mut Vec<fltk::widget::Widget>) {
+    for child in group.clone().into_iter() {
+        if let Some(child_group) = child.as_group() {
+            collect_widgets(&child_group, out);
+        }
+        out.push(child);
+    }
 }
 
 fn window_by_label(label: &str) -> Option<Window> {
@@ -1775,6 +1785,8 @@ fn capture_dialogs(config: &AppConfig) {
     });
     let _ = ConnectionDialog::show_with_registry(Arc::new(Mutex::new(Vec::new())));
 
+    capture_connection_color("/tmp/space-query-connection-color.ppm");
+
     app::add_timeout3(0.45, |_| {
         capture_active_dialog("Settings", "/tmp/space-query-settings.ppm")
     });
@@ -1989,6 +2001,102 @@ fn capture_object_search(main_window: &mut MainWindow) {
     let _ = object_search_dialog::show(&sample_object_cache(), Some("SCOTT"));
 }
 
+/// The connection dialog with a colour picked and Read-only ticked.
+///
+/// These two live under Connection Info rather than Advanced Settings because
+/// neither is a session option, and the shot is there to show that: they sit
+/// beside the name and host, not beside the isolation level.
+fn capture_connection_color(capture_path: &str) {
+    let capture_path = capture_path.to_string();
+    app::add_timeout3(0.45, move |_| {
+        let Some(window) = window_by_label("Connect to Database") else {
+            fail("the connection dialog is missing");
+        };
+        let Some(group) = window.as_group() else {
+            fail("the connection dialog has no children");
+        };
+        let mut widgets = Vec::new();
+        collect_widgets(&group, &mut widgets);
+
+        for widget in &widgets {
+            if let Some(mut input) = fltk::input::Input::from_dyn_widget(widget) {
+                if input.value() == "My Connection" {
+                    input.set_value("prod-oracle");
+                }
+            }
+            if let Some(mut choice) = fltk::menu::Choice::from_dyn_widget(widget) {
+                // The colour picker is the only Choice offering "Red".
+                if (0..choice.size()).any(|index| choice.text(index).as_deref() == Some("Red")) {
+                    let red = (0..choice.size())
+                        .find(|index| choice.text(*index).as_deref() == Some("Red"))
+                        .unwrap_or(0);
+                    choice.set_value(red);
+                }
+            }
+            if let Some(check) = CheckButton::from_dyn_widget(widget) {
+                if check.label().trim() == "Read-only" {
+                    check.set_checked(true);
+                }
+            }
+        }
+        pump(200);
+        capture_active_dialog("Connect to Database", &capture_path);
+    });
+    let _ = ConnectionDialog::show_with_registry(Arc::new(Mutex::new(Vec::new())));
+}
+
+/// The value window over a JSON CLOB, with `Format` on.
+///
+/// A grid cell draws one clipped line, so the point of the shot is what the
+/// window adds: the whole value, indented, and its size in characters and bytes.
+fn capture_value_viewer(capture_path: &str) {
+    // One line, the way a CLOB actually arrives — which is exactly why the
+    // grid cannot show it and this window exists.
+    const VALUE: &str = concat!(
+        r#"{"order_id":10248,"customer":{"id":"VINET","name":"Vins et alcools Chevalier","#,
+        r#""city":"Reims","country":"France"},"placed_at":"2026-08-08T10:11:12Z","#,
+        r#""lines":[{"sku":"CHAI-01","qty":12,"unit_price":18.00},"#,
+        r#"{"sku":"CHANG-02","qty":10,"unit_price":19.00},"#,
+        r#"{"sku":"ANISEED-03","qty":5,"unit_price":10.00}],"#,
+        r#""totals":{"net":476.00,"tax":47.60,"gross":523.60},"#,
+        r#""note":"Deliver to the loading bay. Ask for Paul."}"#
+    );
+    if value_viewer::detect_value_format(VALUE) != value_viewer::ValueFormat::Json {
+        fail("the sample value must be JSON, or the Format box would be disabled");
+    }
+
+    let capture_path = capture_path.to_string();
+    app::add_timeout3(0.45, move |_| {
+        let Some(window) = window_by_label("Cell Value — ORDER_DOC") else {
+            fail("the value window is missing");
+        };
+        let Some(group) = window.as_group() else {
+            fail("the value window has no children");
+        };
+        let mut widgets = Vec::new();
+        collect_widgets(&group, &mut widgets);
+        // Turn Format on for the shot: the indented view is what the window is
+        // for, and a wall of one-line JSON shows nothing.
+        for widget in &widgets {
+            if let Some(mut check) = CheckButton::from_dyn_widget(widget) {
+                if check.label().trim_start().starts_with("Format") {
+                    check.set_checked(true);
+                    check.do_callback();
+                }
+            }
+        }
+        pump(200);
+        capture_active_dialog("Cell Value — ORDER_DOC", &capture_path);
+    });
+    let _ = value_viewer::show(
+        "Cell Value — ORDER_DOC",
+        VALUE,
+        false,
+        profile_by_name("D2Coding"),
+        16,
+    );
+}
+
 fn capture_soft_wrap(main_window: &mut MainWindow) {
     let long_line = "SELECT o.ORDER_ID, o.CUSTOMER_ID, o.STATUS, o.TOTAL_AMOUNT, o.CREATED_AT \
 FROM ORDERS o WHERE o.ORDER_ID IN (1001,1002,1003,1004,1005,1006,1007,1008,1009,1010,1011,1012,\
@@ -2166,6 +2274,17 @@ fn main() {
         app::quit();
         return;
     }
+    if capture_mode.as_deref() == Some("connection-color") {
+        capture_connection_color("/tmp/space-query-connection-color.ppm");
+        app::quit();
+        return;
+    }
+    if capture_mode.as_deref() == Some("value-viewer") {
+        capture_object_browser(&mut main_window);
+        capture_value_viewer("/tmp/space-query-value-viewer.ppm");
+        app::quit();
+        return;
+    }
     if capture_mode.as_deref() == Some("soft-wrap") {
         capture_object_browser(&mut main_window);
         capture_soft_wrap(&mut main_window);
@@ -2178,6 +2297,7 @@ fn main() {
     capture_formatting(&mut main_window);
     capture_soft_wrap(&mut main_window);
     capture_result_grid(&mut main_window);
+    capture_value_viewer("/tmp/space-query-value-viewer.ppm");
     capture_grid_search(&mut main_window);
     capture_selection_summary(&mut main_window);
     capture_code_snippets(&mut main_window);

@@ -63,6 +63,10 @@ pub(crate) mod table_import_dialog;
 pub(crate) mod text_buffer_access;
 pub mod theme;
 pub(crate) mod ui_timeout;
+// Public only so `verify_value_viewer_ui` can drive the same modal the grid
+// opens; not part of the supported surface.
+#[doc(hidden)]
+pub mod value_viewer;
 
 use fltk::{
     app,

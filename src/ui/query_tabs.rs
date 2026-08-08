@@ -1,6 +1,6 @@
 use fltk::{
     app,
-    enums::{Align, CallbackReason, CallbackTrigger, Event, FrameType},
+    enums::{Align, CallbackReason, CallbackTrigger, Color, Event, FrameType},
     group::{Group, Tabs, TabsOverflow},
     prelude::*,
 };
@@ -482,6 +482,18 @@ impl QueryTabsWidget {
             group.set_label(&Self::display_label(label));
             group.set_align(Align::Center | Align::Inside);
             self.sync_tab_strip_overflow_mode();
+            self.tabs.redraw();
+        }
+    }
+
+    /// Paints one tab's label in `color`, or restores the default when `None`.
+    ///
+    /// FLTK's `Tabs` has no other per-tab colour that survives selection, so
+    /// this is where a connection's tag shows up on the tab strip.
+    pub fn set_tab_label_color(&mut self, tab_id: QueryTabId, color: Option<Color>) {
+        if let Some(group) = self.tab_group(tab_id) {
+            let mut group = group;
+            group.set_label_color(color.unwrap_or_else(theme::text_secondary));
             self.tabs.redraw();
         }
     }

@@ -1,15 +1,11 @@
 use fltk::{
-    app,
-    button::Button,
-    draw,
+    app, draw,
     enums::{Align, CallbackTrigger, Event, Font, FrameType, Key, Shortcut},
     group::Group,
     input::Input,
     menu::MenuButton,
     prelude::*,
     table::{Table, TableContext},
-    text::{TextBuffer, TextDisplay},
-    window::Window,
 };
 use std::any::Any;
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -240,6 +236,11 @@ fn mutex_store_usize(value: &Arc<Mutex<usize>>, next: usize) {
     }
 }
 
+/// Data Grid menu label for the value window when the cell cannot be written.
+const VALUE_WINDOW_VIEW_ITEM: &str = "View Value...";
+/// Data Grid menu label for the value window when the cell can be written.
+const VALUE_WINDOW_EDIT_ITEM: &str = "Edit Value...";
+
 struct SharedFontSettings {
     normal_font: AtomicI32,
     bold_font: AtomicI32,
@@ -312,6 +313,12 @@ pub struct ResultTableWidget {
     /// menu items. Empty means "no driver metadata": every column is treated as
     /// `Unknown`, which renders as a quoted string literal.
     column_kinds: Arc<Mutex<Vec<SqlValueKind>>>,
+    /// Declared column types as the driver reported them ("CLOB", "VARCHAR2").
+    ///
+    /// `column_kinds` says how a value is written; this says what the column
+    /// *is*, which is a different question and the only one that can tell a
+    /// CLOB from a VARCHAR2 — both arrive as text.
+    column_data_types: Arc<Mutex<Vec<String>>>,
     /// NULL placement for the local header sort, adopted from the backend that
     /// produced the result.
     /// Set when the tab can re-query, so the header sort goes to the server.
@@ -426,6 +433,12 @@ struct TableEditSession {
     table_name: String,
     null_text: String,
     editable_columns: Vec<(usize, String)>,
+    /// Grid column indexes whose Oracle column is a character LOB.
+    ///
+    /// Oracle refuses to use a character LOB as a comparison key at all, so the
+    /// guard predicate has to take a different shape for these — see
+    /// `original_value_predicate`. `docs/result_ui.md` names the server errors.
+    character_lob_columns: HashSet<usize>,
     original_rows_by_rowid: HashMap<String, Vec<String>>,
     original_row_order: Vec<String>,
     deleted_rowids: Vec<String>,
@@ -948,51 +961,12 @@ impl ResultTableWidget {
             .unwrap_or(0)
     }
 
+    /// The big view of one cell, read-only.
+    ///
+    /// `editable` is false here by construction: this is the double-click that
+    /// happens outside edit mode, or on a column edit mode cannot write.
     fn show_cell_text_dialog(value: &str, font_profile: FontProfile, font_size: u32) {
-        let current_group = Group::try_current();
-        Group::set_current(None::<&Group>);
-
-        let mut dialog = Window::default()
-            .with_size(760, 520)
-            .with_label("Cell Value");
-        crate::ui::center_on_main(&mut dialog);
-        dialog.set_color(theme::panel_raised());
-        dialog.make_modal(true);
-
-        let mut display = TextDisplay::new(10, 10, 740, 460, None);
-        display.set_color(theme::editor_bg());
-        display.set_text_color(theme::text_primary());
-        display.set_text_font(font_profile.normal);
-        display.set_text_size(font_size as i32);
-        display.wrap_mode(fltk::text::WrapMode::AtBounds, 0);
-        theme::style_text_display_scrollbars(&display);
-
-        let mut buf = TextBuffer::default();
-        buf.set_text(value);
-        display.set_buffer(buf);
-
-        let mut close_btn = Button::new(335, 480, BUTTON_WIDTH, BUTTON_HEIGHT, "Close");
-        close_btn.set_color(theme::button_dark());
-        close_btn.set_label_color(theme::text_primary());
-        close_btn.set_frame(FrameType::RFlatBox);
-        theme::install_button_hover(&mut close_btn);
-
-        let mut dialog_for_close = dialog.clone();
-        close_btn.set_callback(move |_| {
-            dialog_for_close.hide();
-            app::awake();
-        });
-
-        dialog.end();
-        dialog.show();
-        Group::set_current(current_group.as_ref());
-
-        while dialog.shown() {
-            app::wait();
-        }
-
-        // Explicitly destroy top-level dialog widgets to release native resources.
-        Window::delete(dialog);
+        let _ = crate::ui::value_viewer::show("Cell Value", value, false, font_profile, font_size);
     }
 
     fn try_clone_cell_value(
@@ -2079,6 +2053,7 @@ impl ResultTableWidget {
         let row_number_offset = Arc::new(AtomicU64::new(0));
         let null_text = Arc::new(Mutex::new("NULL".to_string()));
         let column_kinds: Arc<Mutex<Vec<SqlValueKind>>> = Arc::new(Mutex::new(Vec::new()));
+        let column_data_types: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
         let source_sql = Arc::new(Mutex::new(String::new()));
         let streaming_source_sql = Arc::new(Mutex::new(String::new()));
         let execute_sql_callback: Arc<Mutex<Option<ResultGridSqlExecuteCallback>>> =
@@ -2444,6 +2419,7 @@ impl ResultTableWidget {
                             &lazy_fetch_callback_for_handle,
                             &pending_lazy_actions_for_handle,
                             &context_action_callback_for_handle,
+                            &font_settings_for_handle,
                         );
                         return true;
                     }
@@ -3164,6 +3140,7 @@ impl ResultTableWidget {
             table,
             headers,
             column_kinds,
+            column_data_types,
             pending_rows: Arc::new(Mutex::new(Vec::new())),
             pending_widths: Arc::new(Mutex::new(Vec::new())),
             last_flush_epoch_ms: Arc::new(Mutex::new(Self::current_epoch_millis())),
@@ -3696,6 +3673,124 @@ impl ResultTableWidget {
             return true;
         }
 
+        Self::apply_cell_edit_value(table, full_data, edit_session, row_idx, col_idx, &new_value);
+        true
+    }
+
+    /// The single cell a cell-scoped action targets: the top-left of the
+    /// current selection, skipping the zero-width auto-`ROWID` column edit mode
+    /// adds (a value the user never sees).
+    fn value_window_target_cell(
+        table: &Table,
+        hidden_col: Option<usize>,
+    ) -> Option<(usize, usize)> {
+        let (row_start, col_start, _, _) = Self::normalized_selection_bounds_with_limits(
+            table.get_selection(),
+            table.rows().max(0) as usize,
+            table.cols().max(0) as usize,
+        )?;
+        if Some(col_start) != hidden_col {
+            return Some((row_start, col_start));
+        }
+        let max_cols = table.cols().max(0) as usize;
+        Self::nearest_visible_column(max_cols, col_start, hidden_col).map(|col| (row_start, col))
+    }
+
+    /// Whether the value window may write this cell back.
+    ///
+    /// This is the same test the inline editor applies, so a cell the grid
+    /// refuses to edit in place is not offered as editable in the window
+    /// either.
+    fn cell_value_is_editable(
+        edit_session: &Arc<Mutex<Option<TableEditSession>>>,
+        pending_save_request: &Arc<Mutex<bool>>,
+        row_idx: usize,
+        col_idx: usize,
+    ) -> bool {
+        if *pending_save_request
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+        {
+            return false;
+        }
+        let guard = edit_session
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let Some(session) = guard.as_ref() else {
+            return false;
+        };
+        col_idx != session.rowid_col
+            && row_idx < session.row_states.len()
+            && Self::is_editable_column(session, col_idx)
+    }
+
+    /// Opens the value window over the cell-scoped target and, when the user
+    /// saved a change, stages it exactly as the inline editor would.
+    fn open_cell_value_window(
+        table: &Table,
+        headers: &Arc<Mutex<Vec<String>>>,
+        full_data: &Arc<Mutex<Vec<Vec<String>>>>,
+        edit_session: &Arc<Mutex<Option<TableEditSession>>>,
+        pending_save_request: &Arc<Mutex<bool>>,
+        hidden_col: Option<usize>,
+        font_profile: FontProfile,
+        font_size: u32,
+    ) {
+        let Some((row_idx, col_idx)) = Self::value_window_target_cell(table, hidden_col) else {
+            return;
+        };
+        let editable =
+            Self::cell_value_is_editable(edit_session, pending_save_request, row_idx, col_idx);
+        let value = {
+            let data = full_data
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            data.get(row_idx)
+                .and_then(|row| row.get(col_idx))
+                .cloned()
+                .unwrap_or_default()
+        };
+        let column_name = headers
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(col_idx)
+            .cloned()
+            .unwrap_or_default();
+        let title = if column_name.trim().is_empty() {
+            "Cell Value".to_string()
+        } else {
+            format!("Cell Value — {column_name}")
+        };
+
+        let Some(new_value) =
+            crate::ui::value_viewer::show(&title, &value, editable, font_profile, font_size)
+        else {
+            return;
+        };
+        // The window can outlive the state that made the cell editable — a save
+        // may have started while it was open. Ask again before writing.
+        if !Self::cell_value_is_editable(edit_session, pending_save_request, row_idx, col_idx) {
+            crate::ui::alert_on_main(
+                "The cell is no longer editable, so the value was not staged.",
+            );
+            return;
+        }
+        Self::apply_cell_edit_value(table, full_data, edit_session, row_idx, col_idx, &new_value);
+    }
+
+    /// Writes an edited value into the grid and the staged-edit session.
+    ///
+    /// Both ways of editing a cell end here — the one-line inline editor and
+    /// the value window — so the NULL decision, the dirty-cell bookkeeping and
+    /// the repaint cannot drift apart between them.
+    fn apply_cell_edit_value(
+        table: &Table,
+        full_data: &Arc<Mutex<Vec<Vec<String>>>>,
+        edit_session: &Arc<Mutex<Option<TableEditSession>>>,
+        row_idx: usize,
+        col_idx: usize,
+        new_value: &str,
+    ) {
         {
             let mut data = full_data
                 .lock()
@@ -3703,12 +3798,12 @@ impl ResultTableWidget {
             let Some(row_data) = data.get_mut(row_idx) else {
                 drop(data);
                 crate::ui::alert_on_main("Selected row is out of range.");
-                return true;
+                return;
             };
             if col_idx >= row_data.len() {
                 row_data.resize(col_idx + 1, String::new());
             }
-            row_data[col_idx] = new_value.clone();
+            row_data[col_idx] = new_value.to_string();
         }
         {
             let mut guard = edit_session
@@ -3716,15 +3811,14 @@ impl ResultTableWidget {
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
             if let Some(session) = guard.as_mut() {
                 let is_explicit_null =
-                    Self::cell_input_maps_to_explicit_null(session, row_idx, col_idx, &new_value);
+                    Self::cell_input_maps_to_explicit_null(session, row_idx, col_idx, new_value);
                 let _ =
                     Self::set_row_cell_explicit_null(session, row_idx, col_idx, is_explicit_null);
-                Self::sync_existing_row_dirty_cell(session, row_idx, col_idx, &new_value);
+                Self::sync_existing_row_dirty_cell(session, row_idx, col_idx, new_value);
             }
         }
         let mut table = table.clone();
         table.redraw();
-        true
     }
 
     fn commit_active_inline_edit(&mut self) {
@@ -5112,11 +5206,119 @@ impl ResultTableWidget {
         format!("'{}'", value.replace('\'', "''"))
     }
 
+    /// Grid columns whose declared type is a character LOB.
+    ///
+    /// `LONG` is here too: it is not a LOB, but Oracle refuses to compare it in
+    /// a `WHERE` clause just the same.
+    fn character_lob_columns(column_data_types: &[String]) -> HashSet<usize> {
+        column_data_types
+            .iter()
+            .enumerate()
+            .filter(|(_, data_type)| Self::is_character_lob_type(data_type))
+            .map(|(index, _)| index)
+            .collect()
+    }
+
+    fn is_character_lob_type(data_type: &str) -> bool {
+        let normalized = data_type.trim().to_ascii_uppercase();
+        matches!(normalized.as_str(), "CLOB" | "NCLOB" | "LONG")
+    }
+
+    /// The `WHERE` fragment that pins one column to the value the grid read.
+    ///
+    /// Everything ordinary compares with `=`. A character LOB cannot: Oracle
+    /// rejects `clob_column = 'anything'` at any length, which is why editing a
+    /// row of a table with a CLOB column used to fail before the value even
+    /// mattered. `DBMS_LOB.COMPARE` is the comparison Oracle does accept, and
+    /// it keeps the guard rather than dropping the column from it.
+    fn original_value_predicate(
+        session: &TableEditSession,
+        column_index: usize,
+        column_id: &str,
+        original_value: &str,
+    ) -> String {
+        if Self::value_represents_null(original_value, &session.null_text) {
+            return format!("{column_id} IS NULL");
+        }
+        let literal = Self::oracle_text_literal(original_value);
+        if session.character_lob_columns.contains(&column_index) {
+            format!("DBMS_LOB.COMPARE({column_id}, {literal}) = 0")
+        } else {
+            format!("{column_id} = {literal}")
+        }
+    }
+
+    /// Oracle's limit on the bytes inside one SQL string literal.
+    ///
+    /// The real ceiling is 4000; the headroom keeps the escaped text clear of
+    /// it without needing to reason about where the last character lands.
+    const ORACLE_TEXT_LITERAL_CHUNK_BYTES: usize = 3900;
+
+    /// A text value as Oracle SQL: one literal when it fits, a chain of
+    /// `TO_CLOB` chunks when it does not.
+    ///
+    /// A plain `'...'` longer than 4000 bytes is rejected by the server, which
+    /// is what used to make the grid's staged edit a short-value-only feature:
+    /// a CLOB cell could be shown in full but never written back. Concatenated
+    /// `TO_CLOB` chunks have no such limit.
+    ///
+    /// The chunking cannot make a value fit where it did not fit before — past
+    /// 4000 bytes the only column that accepts it is a LOB either way — so the
+    /// length alone decides, with no column type needed. The Oracle edit
+    /// session does not carry one.
+    ///
+    /// Chunks are cut from the *unescaped* value, so a boundary can never land
+    /// between the two halves of an escaped `''`, and always on a character
+    /// boundary.
+    fn oracle_text_literal(value: &str) -> String {
+        if Self::escaped_byte_len(value) <= Self::ORACLE_TEXT_LITERAL_CHUNK_BYTES {
+            return Self::sql_string_literal(value);
+        }
+
+        let mut chunks: Vec<String> = Vec::new();
+        let mut chunk_start = 0usize;
+        let mut chunk_bytes = 0usize;
+        for (offset, character) in value.char_indices() {
+            let character_bytes = Self::escaped_char_byte_len(character);
+            if chunk_bytes + character_bytes > Self::ORACLE_TEXT_LITERAL_CHUNK_BYTES {
+                chunks.push(format!(
+                    "TO_CLOB({})",
+                    Self::sql_string_literal(&value[chunk_start..offset])
+                ));
+                chunk_start = offset;
+                chunk_bytes = 0;
+            }
+            chunk_bytes += character_bytes;
+        }
+        if chunk_start < value.len() {
+            chunks.push(format!(
+                "TO_CLOB({})",
+                Self::sql_string_literal(&value[chunk_start..])
+            ));
+        }
+        chunks.join(" || ")
+    }
+
+    fn escaped_char_byte_len(character: char) -> usize {
+        if character == '\'' {
+            2
+        } else {
+            character.len_utf8()
+        }
+    }
+
+    fn escaped_byte_len(value: &str) -> usize {
+        value.len() + value.bytes().filter(|byte| *byte == b'\'').count()
+    }
+
     fn validate_sql_expression_input(expr: &str) -> Result<String, String> {
         crate::ui::sql_editor::query_text::validate_sql_expression_input(expr)
     }
 
-    fn sql_literal_from_input_with_null_text(
+    /// Public only so `verify_value_edit_live` can build the exact literal the
+    /// grid's save path builds; not part of the supported surface.
+    #[doc(hidden)]
+    pub fn sql_literal_from_input_with_null_text(
         input: &str,
         null_text: &str,
     ) -> Result<String, String> {
@@ -5135,7 +5337,7 @@ impl ResultTableWidget {
         // Users can still force a numeric/expression assignment explicitly with
         // the documented '=expr' syntax.
         // Preserve user-entered leading/trailing whitespace for string literals.
-        Ok(Self::sql_string_literal(input))
+        Ok(Self::oracle_text_literal(input))
     }
 
     #[cfg(all(test, not(target_os = "linux")))]
@@ -6173,6 +6375,11 @@ impl ResultTableWidget {
         };
 
         let current_null_text = self.current_null_text();
+        let column_data_types_snapshot = self
+            .column_data_types
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
         let full_data_snapshot = self
             .full_data
             .lock()
@@ -6209,6 +6416,7 @@ impl ResultTableWidget {
             rowid_col,
             table_name,
             null_text: current_null_text,
+            character_lob_columns: Self::character_lob_columns(&column_data_types_snapshot),
             editable_columns,
             original_rows_by_rowid,
             original_row_order,
@@ -6702,11 +6910,12 @@ impl ResultTableWidget {
                         .get(*column_index)
                         .map(String::as_str)
                         .unwrap_or_default();
-                    predicates.push(if Self::value_represents_null(value, &session.null_text) {
-                        format!("{column_id} IS NULL")
-                    } else {
-                        format!("{column_id} = {}", Self::sql_string_literal(value))
-                    });
+                    predicates.push(Self::original_value_predicate(
+                        &session,
+                        *column_index,
+                        column_id,
+                        value,
+                    ));
                 }
                 statements.push(format!(
                     "DELETE FROM {} WHERE {}",
@@ -6752,16 +6961,9 @@ impl ResultTableWidget {
                                     )?
                                 }
                             ));
-                            original_predicates.push(
-                                if Self::value_represents_null(&old_value, &session.null_text) {
-                                    format!("{column_id} IS NULL")
-                                } else {
-                                    format!(
-                                        "{column_id} = {}",
-                                        Self::sql_string_literal(&old_value)
-                                    )
-                                },
-                            );
+                            original_predicates.push(Self::original_value_predicate(
+                                &session, *col_idx, column_id, &old_value,
+                            ));
                         }
                     }
                     if !assignments.is_empty() {
@@ -7293,12 +7495,32 @@ impl ResultTableWidget {
             }
         };
 
+        // One label, two meanings: the window opens either way, but saying
+        // "Edit" only when the value can actually be written back keeps the
+        // menu from offering something that would be refused.
+        let value_window_item =
+            Self::value_window_target_cell(table, hidden_col).map(|(row_idx, col_idx)| {
+                if Self::cell_value_is_editable(
+                    edit_session,
+                    pending_save_request,
+                    row_idx,
+                    col_idx,
+                ) {
+                    VALUE_WINDOW_EDIT_ITEM
+                } else {
+                    VALUE_WINDOW_VIEW_ITEM
+                }
+            });
+
         let mut menu_items = vec![
             "Export Results (Ctrl+E)",
             "Copy",
             "Copy with Headers",
             "Copy All",
         ];
+        if let Some(label) = value_window_item {
+            menu_items.push(label);
+        }
         if Self::selection_has_exportable_columns(table, headers, hidden_col) {
             menu_items.push("SQL Inserts");
             menu_items.push("SQL Updates");
@@ -7329,6 +7551,7 @@ impl ResultTableWidget {
         lazy_fetch_callback: &LazyFetchCallback,
         pending_lazy_actions: &Arc<Mutex<VecDeque<(u64, LazyFetchPendingAction)>>>,
         context_action_callback: &ResultTableContextActionCallback,
+        font_settings: &Arc<SharedFontSettings>,
     ) {
         let mouse_x = app::event_x();
         let mouse_y = app::event_y();
@@ -7441,6 +7664,18 @@ impl ResultTableWidget {
                     Self::schedule_context_action_callback(
                         context_action_callback,
                         ResultTableContextAction::CopyWhereClause,
+                    );
+                }
+                VALUE_WINDOW_VIEW_ITEM | VALUE_WINDOW_EDIT_ITEM => {
+                    Self::open_cell_value_window(
+                        &table,
+                        headers,
+                        full_data,
+                        edit_session,
+                        pending_save_request,
+                        hidden_col,
+                        font_settings.profile(),
+                        font_settings.size(),
                     );
                 }
                 "Set Null" => {
@@ -7802,6 +8037,7 @@ impl ResultTableWidget {
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner()) = vec!["Result".to_string()];
             self.set_column_kinds(&[]);
+            self.set_column_data_types(&[]);
             *self
                 .full_data
                 .lock()
@@ -7826,6 +8062,7 @@ impl ResultTableWidget {
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner()) = col_names;
             self.set_column_kinds(&Self::result_column_kinds(result));
+            self.set_column_data_types(&Self::result_column_data_types(result));
             self.refresh_auto_rowid_visibility();
             self.table.redraw();
             return;
@@ -7868,6 +8105,7 @@ impl ResultTableWidget {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = col_names;
         self.set_column_kinds(&Self::result_column_kinds(result));
+        self.set_column_data_types(&Self::result_column_data_types(result));
         self.refresh_auto_rowid_visibility();
         self.table.redraw();
     }
@@ -9169,6 +9407,14 @@ impl ResultTableWidget {
         result.columns.iter().map(|column| column.kind).collect()
     }
 
+    fn result_column_data_types(result: &QueryResult) -> Vec<String> {
+        result
+            .columns
+            .iter()
+            .map(|column| column.data_type.clone())
+            .collect()
+    }
+
     /// Columns that must never appear in generated SQL: the hidden auto-ROWID
     /// column, a visible `ROWID` column (`INSERT`ing into it is not legal), the
     /// edit snapshot column, and the MySQL edit-key aliases.
@@ -9447,6 +9693,29 @@ impl ResultTableWidget {
         let accepted = Self::accepted_column_kinds(kinds, header_len);
         *self
             .column_kinds
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = accepted;
+    }
+
+    /// Record the declared column types behind the current grid columns.
+    ///
+    /// Misaligned lengths are rejected for the same reason as `set_column_kinds`:
+    /// giving one column another's type would generate wrong SQL. Storing
+    /// nothing makes every column read as a non-LOB, which is the shape the
+    /// grid used before it knew any types.
+    pub fn set_column_data_types(&mut self, data_types: &[String]) {
+        let header_len = self
+            .headers
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .len();
+        let accepted = if data_types.len() == header_len {
+            data_types.to_vec()
+        } else {
+            Vec::new()
+        };
+        *self
+            .column_data_types
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = accepted;
     }
@@ -10571,6 +10840,7 @@ mod row_edit_sql_tests {
             rowid_col: 0,
             table_name: "EMP".to_string(),
             null_text: "NULL".to_string(),
+            character_lob_columns: HashSet::new(),
             editable_columns: vec![(1, "C1".to_string()), (2, "C2".to_string())],
             original_rows_by_rowid: original_rows,
             original_row_order: vec!["RID1".to_string()],
@@ -10608,6 +10878,7 @@ mod row_edit_sql_tests {
             rowid_col: 0,
             table_name: "EMP".to_string(),
             null_text: "NULL".to_string(),
+            character_lob_columns: HashSet::new(),
             editable_columns: vec![(1, "C1".to_string())],
             original_rows_by_rowid: original_rows,
             original_row_order: vec!["RID1".to_string()],
@@ -10654,6 +10925,7 @@ mod row_edit_sql_tests {
             rowid_col: 0,
             table_name: "EMP".to_string(),
             null_text: "NULL".to_string(),
+            character_lob_columns: HashSet::new(),
             editable_columns: vec![(1, "C1".to_string()), (2, "C2".to_string())],
             original_rows_by_rowid: HashMap::new(),
             original_row_order: Vec::new(),
@@ -10689,6 +10961,7 @@ mod row_edit_sql_tests {
             rowid_col: 0,
             table_name: "EMP".to_string(),
             null_text: "NULL".to_string(),
+            character_lob_columns: HashSet::new(),
             editable_columns: vec![(1, "C1".to_string())],
             original_rows_by_rowid: original_rows,
             original_row_order: vec!["RID1".to_string()],
@@ -10720,6 +10993,7 @@ mod row_edit_sql_tests {
             rowid_col: 0,
             table_name: "EMP".to_string(),
             null_text: "NULL".to_string(),
+            character_lob_columns: HashSet::new(),
             editable_columns: vec![(1, "C1".to_string())],
             original_rows_by_rowid: original_rows,
             original_row_order: vec!["RID1".to_string()],
@@ -10751,6 +11025,7 @@ mod row_edit_sql_tests {
             rowid_col: 0,
             table_name: "EMP".to_string(),
             null_text: "NULL".to_string(),
+            character_lob_columns: HashSet::new(),
             editable_columns: vec![(1, "C1".to_string())],
             original_rows_by_rowid: original_rows,
             original_row_order: vec!["RID1".to_string()],
@@ -10801,6 +11076,7 @@ mod row_edit_sql_tests {
             rowid_col: 0,
             table_name: "EMP".to_string(),
             null_text: "NULL".to_string(),
+            character_lob_columns: HashSet::new(),
             editable_columns: vec![(1, "C1".to_string())],
             original_rows_by_rowid: original_rows,
             original_row_order: vec!["RID1".to_string()],
@@ -10844,6 +11120,175 @@ mod row_edit_sql_tests {
         );
     }
 
+    /// Undoes `oracle_text_literal` so a test can compare against the value
+    /// that went in rather than against a hand-written expectation.
+    fn decode_oracle_text_literal(sql: &str) -> String {
+        sql.split(" || ")
+            .map(|piece| {
+                let body = piece
+                    .strip_prefix("TO_CLOB(")
+                    .and_then(|rest| rest.strip_suffix(')'))
+                    .unwrap_or(piece);
+                body.strip_prefix('\'')
+                    .and_then(|rest| rest.strip_suffix('\''))
+                    .expect("every piece is a quoted literal")
+                    .replace("''", "'")
+            })
+            .collect()
+    }
+
+    fn lob_session(character_lob_columns: HashSet<usize>) -> TableEditSession {
+        TableEditSession {
+            rowid_col: 0,
+            table_name: "T".to_string(),
+            null_text: "NULL".to_string(),
+            character_lob_columns,
+            editable_columns: vec![(1, "BODY".to_string())],
+            original_rows_by_rowid: HashMap::new(),
+            original_row_order: Vec::new(),
+            deleted_rowids: Vec::new(),
+            row_states: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn character_lob_columns_are_recognised_by_declared_type() {
+        let types = vec![
+            "NUMBER".to_string(),
+            "clob".to_string(),
+            "VARCHAR2".to_string(),
+            "NCLOB".to_string(),
+            " LONG ".to_string(),
+            "BLOB".to_string(),
+        ];
+        let lobs = ResultTableWidget::character_lob_columns(&types);
+        assert_eq!(lobs, HashSet::from([1, 3, 4]));
+        // A binary LOB is deliberately not here: its grid value is a
+        // placeholder, so no comparison against it could be right anyway.
+        assert!(!lobs.contains(&5));
+    }
+
+    #[test]
+    fn the_guard_predicate_compares_a_clob_the_only_way_oracle_accepts() {
+        // `clob_column = 'text'` is ORA-22848 at any length, which is what made
+        // a table with a CLOB column uneditable before this.
+        let session = lob_session(HashSet::from([1]));
+        assert_eq!(
+            ResultTableWidget::original_value_predicate(&session, 1, "BODY", "seed"),
+            "DBMS_LOB.COMPARE(BODY, 'seed') = 0"
+        );
+        // NULL still compares as NULL: DBMS_LOB.COMPARE against a NULL LOB
+        // returns NULL, never 0.
+        assert_eq!(
+            ResultTableWidget::original_value_predicate(&session, 1, "BODY", "NULL"),
+            "BODY IS NULL"
+        );
+    }
+
+    #[test]
+    fn the_guard_predicate_is_unchanged_for_ordinary_columns() {
+        let session = lob_session(HashSet::new());
+        assert_eq!(
+            ResultTableWidget::original_value_predicate(&session, 1, "BODY", "seed"),
+            "BODY = 'seed'"
+        );
+        assert_eq!(
+            ResultTableWidget::original_value_predicate(&session, 1, "BODY", "it's"),
+            "BODY = 'it''s'"
+        );
+        assert_eq!(
+            ResultTableWidget::original_value_predicate(&session, 1, "BODY", "NULL"),
+            "BODY IS NULL"
+        );
+    }
+
+    #[test]
+    fn a_long_clob_original_is_chunked_inside_the_lob_comparison() {
+        let session = lob_session(HashSet::from([1]));
+        let long = "값 'quote'\n".repeat(600);
+        let predicate = ResultTableWidget::original_value_predicate(&session, 1, "BODY", &long);
+        assert!(predicate.starts_with("DBMS_LOB.COMPARE(BODY, TO_CLOB('"));
+        assert!(predicate.ends_with(") = 0"));
+        assert!(predicate.contains("') || TO_CLOB('"));
+    }
+
+    #[test]
+    fn oracle_text_literal_keeps_short_values_as_one_literal() {
+        assert_eq!(
+            ResultTableWidget::oracle_text_literal("plain"),
+            "'plain'".to_string()
+        );
+        assert_eq!(
+            ResultTableWidget::oracle_text_literal("it's"),
+            "'it''s'".to_string()
+        );
+        // Right at the ceiling: still one literal, still no TO_CLOB.
+        let at_limit = "x".repeat(ResultTableWidget::ORACLE_TEXT_LITERAL_CHUNK_BYTES);
+        let rendered = ResultTableWidget::oracle_text_literal(&at_limit);
+        assert!(!rendered.contains("TO_CLOB"));
+        assert_eq!(decode_oracle_text_literal(&rendered), at_limit);
+    }
+
+    #[test]
+    fn oracle_text_literal_chunks_values_past_the_literal_limit() {
+        // Longer than 4000 bytes: a single 'literal' would be ORA-01704.
+        let long = "abcdefghij".repeat(1200);
+        let rendered = ResultTableWidget::oracle_text_literal(&long);
+        assert!(rendered.starts_with("TO_CLOB('"));
+        assert!(rendered.contains(" || "));
+        assert_eq!(decode_oracle_text_literal(&rendered), long);
+        for piece in rendered.split(" || ") {
+            let body = piece
+                .strip_prefix("TO_CLOB('")
+                .and_then(|rest| rest.strip_suffix("')"))
+                .expect("every piece is a TO_CLOB literal");
+            assert!(
+                body.len() <= ResultTableWidget::ORACLE_TEXT_LITERAL_CHUNK_BYTES,
+                "chunk of {} bytes exceeds the literal limit",
+                body.len()
+            );
+        }
+    }
+
+    #[test]
+    fn oracle_text_literal_never_splits_an_escaped_quote_pair() {
+        // Quotes double on escape, so a chunk boundary computed on the escaped
+        // text could land between the two halves and produce invalid SQL.
+        // Chunks are cut from the raw value, so they cannot.
+        let quoted = "'".repeat(4000);
+        let rendered = ResultTableWidget::oracle_text_literal(&quoted);
+        assert!(rendered.contains(" || "));
+        assert_eq!(decode_oracle_text_literal(&rendered), quoted);
+        for piece in rendered.split(" || ") {
+            let body = piece
+                .strip_prefix("TO_CLOB('")
+                .and_then(|rest| rest.strip_suffix("')"))
+                .expect("every piece is a TO_CLOB literal");
+            assert_eq!(body.len() % 2, 0, "an escaped quote pair was split");
+        }
+    }
+
+    #[test]
+    fn oracle_text_literal_cuts_only_on_character_boundaries() {
+        // Hangul is three bytes per character; a byte-counting cut would land
+        // mid-sequence and panic on the slice.
+        let hangul = "한글값".repeat(2000);
+        let rendered = ResultTableWidget::oracle_text_literal(&hangul);
+        assert!(rendered.contains(" || "));
+        assert_eq!(decode_oracle_text_literal(&rendered), hangul);
+    }
+
+    #[test]
+    fn sql_literal_from_input_chunks_a_long_edited_value() {
+        // The staged-edit path a CLOB cell takes: without chunking this is
+        // where ORA-01704 came from.
+        let long = "가나다ABC'".repeat(1000);
+        let literal = ResultTableWidget::sql_literal_from_input_with_null_text(&long, "NULL")
+            .expect("a long string value is a literal, not an error");
+        assert!(literal.starts_with("TO_CLOB('"));
+        assert_eq!(decode_oracle_text_literal(&literal), long);
+    }
+
     #[test]
     fn input_maps_to_explicit_null_does_not_treat_whitespace_as_null() {
         let row_state = EditRowState::Existing {
@@ -10879,6 +11324,7 @@ mod row_edit_sql_tests {
             rowid_col: 0,
             table_name: "EMP".to_string(),
             null_text: "(null)".to_string(),
+            character_lob_columns: HashSet::new(),
             editable_columns: vec![(1, "C1".to_string())],
             original_rows_by_rowid: original_rows,
             original_row_order: vec!["RID1".to_string()],
@@ -10910,6 +11356,7 @@ mod row_edit_sql_tests {
             rowid_col: 0,
             table_name: "EMP".to_string(),
             null_text: "(null)".to_string(),
+            character_lob_columns: HashSet::new(),
             editable_columns: vec![(1, "C1".to_string())],
             original_rows_by_rowid: original_rows,
             original_row_order: vec!["RID1".to_string()],
@@ -10960,6 +11407,7 @@ mod row_edit_sql_tests {
             rowid_col: 0,
             table_name: "EMP".to_string(),
             null_text: "NULL".to_string(),
+            character_lob_columns: HashSet::new(),
             editable_columns: vec![(1, "ENAME".to_string())],
             original_rows_by_rowid,
             original_row_order: vec!["AAABBB".to_string()],
@@ -11012,6 +11460,7 @@ mod row_edit_sql_tests {
             rowid_col: 0,
             table_name: "EMP".to_string(),
             null_text: "NULL".to_string(),
+            character_lob_columns: HashSet::new(),
             editable_columns: vec![(1, "ENAME".to_string())],
             original_rows_by_rowid,
             original_row_order: vec!["AAABBB".to_string()],
@@ -11661,6 +12110,7 @@ mod row_edit_sql_tests {
             rowid_col: 0,
             table_name: "EMP".to_string(),
             null_text: "NULL".to_string(),
+            character_lob_columns: HashSet::new(),
             editable_columns: vec![(1, "ENAME".to_string())],
             original_rows_by_rowid: HashMap::new(),
             original_row_order: Vec::new(),
@@ -11722,6 +12172,7 @@ UPDATE EMP SET ENAME = 'X' WHERE ROWID = 'AAABBB';"
             rowid_col: 0,
             table_name: "EMP".to_string(),
             null_text: "NULL".to_string(),
+            character_lob_columns: HashSet::new(),
             editable_columns: vec![(1, "ENAME".to_string())],
             original_rows_by_rowid: [(
                 "AAABBB".to_string(),
@@ -11837,6 +12288,7 @@ UPDATE EMP SET ENAME = 'MILLER' WHERE ROWID = 'AAABBB';"
             rowid_col: 0,
             table_name: "EMP".to_string(),
             null_text: "NULL".to_string(),
+            character_lob_columns: HashSet::new(),
             editable_columns: vec![(1, "ENAME".to_string())],
             original_rows_by_rowid: HashMap::new(),
             original_row_order: Vec::new(),
@@ -11914,6 +12366,7 @@ UPDATE EMP SET ENAME = 'MILLER' WHERE ROWID = 'AAABBB';"
             rowid_col: 0,
             table_name: "EMP".to_string(),
             null_text: "NULL".to_string(),
+            character_lob_columns: HashSet::new(),
             editable_columns: vec![(1, "ENAME".to_string())],
             original_rows_by_rowid: HashMap::new(),
             original_row_order: Vec::new(),
@@ -11983,6 +12436,7 @@ UPDATE EMP SET ENAME = 'MILLER' WHERE ROWID = 'AAABBB';"
             rowid_col: 0,
             table_name: "EMP".to_string(),
             null_text: "NULL".to_string(),
+            character_lob_columns: HashSet::new(),
             editable_columns: vec![(1, "ENAME".to_string())],
             original_rows_by_rowid: HashMap::new(),
             original_row_order: Vec::new(),
@@ -12071,6 +12525,7 @@ UPDATE EMP SET ENAME = 'MILLER' WHERE ROWID = 'AAABBB';"
             rowid_col: 0,
             table_name: "EMP".to_string(),
             null_text: "NULL".to_string(),
+            character_lob_columns: HashSet::new(),
             editable_columns: vec![(1, "ENAME".to_string())],
             original_rows_by_rowid: HashMap::new(),
             original_row_order: Vec::new(),
@@ -12154,6 +12609,7 @@ UPDATE EMP SET ENAME = 'MILLER' WHERE ROWID = 'AAABBB';"
             rowid_col: 0,
             table_name: "EMP".to_string(),
             null_text: "NULL".to_string(),
+            character_lob_columns: HashSet::new(),
             editable_columns: vec![(1, "ENAME".to_string())],
             original_rows_by_rowid: HashMap::new(),
             original_row_order: Vec::new(),
@@ -12225,6 +12681,7 @@ UPDATE EMP SET ENAME = 'MILLER' WHERE ROWID = 'AAABBB';"
             rowid_col: 0,
             table_name: "EMP".to_string(),
             null_text: "NULL".to_string(),
+            character_lob_columns: HashSet::new(),
             editable_columns: vec![(1, "ENAME".to_string())],
             original_rows_by_rowid: HashMap::new(),
             original_row_order: Vec::new(),
@@ -12307,6 +12764,7 @@ UPDATE EMP SET ENAME = 'MILLER' WHERE ROWID = 'AAABBB';"
             rowid_col: 0,
             table_name: "EMP".to_string(),
             null_text: "NULL".to_string(),
+            character_lob_columns: HashSet::new(),
             editable_columns: vec![(1, "ENAME".to_string())],
             original_rows_by_rowid: HashMap::new(),
             original_row_order: Vec::new(),
@@ -12380,6 +12838,7 @@ UPDATE EMP SET ENAME = 'MILLER' WHERE ROWID = 'AAABBB';"
             rowid_col: 0,
             table_name: "EMP".to_string(),
             null_text: "NULL".to_string(),
+            character_lob_columns: HashSet::new(),
             editable_columns: vec![(1, "ENAME".to_string())],
             original_rows_by_rowid: HashMap::new(),
             original_row_order: Vec::new(),
@@ -12464,6 +12923,7 @@ UPDATE EMP SET ENAME = 'MILLER' WHERE ROWID = 'AAABBB';"
             rowid_col: 0,
             table_name: "EMP".to_string(),
             null_text: "NULL".to_string(),
+            character_lob_columns: HashSet::new(),
             editable_columns: vec![(1, "ENAME".to_string())],
             original_rows_by_rowid: HashMap::new(),
             original_row_order: Vec::new(),
@@ -12548,6 +13008,7 @@ UPDATE EMP SET ENAME = 'MILLER' WHERE ROWID = 'AAABBB';"
             rowid_col: 0,
             table_name: "EMP".to_string(),
             null_text: "NULL".to_string(),
+            character_lob_columns: HashSet::new(),
             editable_columns: vec![(1, "ENAME".to_string())],
             original_rows_by_rowid,
             original_row_order: vec!["AAABBB".to_string()],
@@ -12685,6 +13146,7 @@ UPDATE EMP SET ENAME = 'MILLER' WHERE ROWID = 'AAABBB';"
             rowid_col: 0,
             table_name: "EMP".to_string(),
             null_text: "NULL".to_string(),
+            character_lob_columns: HashSet::new(),
             editable_columns: vec![(1, "ENAME".to_string())],
             original_rows_by_rowid: HashMap::new(),
             original_row_order: vec!["AAABBB".to_string()],
@@ -12735,6 +13197,7 @@ UPDATE EMP SET ENAME = 'MILLER' WHERE ROWID = 'AAABBB';"
             rowid_col: 0,
             table_name: "EMP".to_string(),
             null_text: "NULL".to_string(),
+            character_lob_columns: HashSet::new(),
             editable_columns: vec![(1, "ENAME".to_string())],
             original_rows_by_rowid: {
                 let mut map = HashMap::new();
@@ -12765,6 +13228,7 @@ UPDATE EMP SET ENAME = 'MILLER' WHERE ROWID = 'AAABBB';"
                 rowid_col: 0,
                 table_name: "EMP".to_string(),
                 null_text: "NULL".to_string(),
+                character_lob_columns: HashSet::new(),
                 editable_columns: vec![(1, "ENAME".to_string())],
                 original_rows_by_rowid: HashMap::new(),
                 original_row_order: vec!["OLD01".to_string()],
@@ -12810,6 +13274,7 @@ UPDATE EMP SET ENAME = 'MILLER' WHERE ROWID = 'AAABBB';"
             rowid_col: 0,
             table_name: "EMP".to_string(),
             null_text: "NULL".to_string(),
+            character_lob_columns: HashSet::new(),
             editable_columns: vec![(1, "ENAME".to_string())],
             original_rows_by_rowid: HashMap::new(),
             original_row_order: Vec::new(),
@@ -12879,6 +13344,7 @@ UPDATE EMP SET ENAME = 'MILLER' WHERE ROWID = 'AAABBB';"
             rowid_col: 0,
             table_name: "EMP".to_string(),
             null_text: "NULL".to_string(),
+            character_lob_columns: HashSet::new(),
             editable_columns: vec![(1, "ENAME".to_string())],
             original_rows_by_rowid,
             original_row_order: vec!["AAABBB".to_string()],
@@ -12960,6 +13426,7 @@ UPDATE EMP SET ENAME = 'MILLER' WHERE ROWID = 'AAABBB';"
             rowid_col: 0,
             table_name: "EMP".to_string(),
             null_text: "NULL".to_string(),
+            character_lob_columns: HashSet::new(),
             editable_columns: vec![(1, "ENAME".to_string())],
             original_rows_by_rowid,
             original_row_order: vec!["AAABBB".to_string()],
@@ -13041,6 +13508,7 @@ UPDATE EMP SET ENAME = 'MILLER' WHERE ROWID = 'AAABBB';"
             rowid_col: 0,
             table_name: "EMP".to_string(),
             null_text: "NULL".to_string(),
+            character_lob_columns: HashSet::new(),
             editable_columns: vec![(1, "ENAME".to_string())],
             original_rows_by_rowid,
             original_row_order: vec!["AAABBB".to_string()],
@@ -13272,6 +13740,7 @@ UPDATE EMP SET ENAME = 'MILLER' WHERE ROWID = 'AAABBB';"
             rowid_col: 0,
             table_name: "EMP".to_string(),
             null_text: "NULL".to_string(),
+            character_lob_columns: HashSet::new(),
             editable_columns: vec![(1, "ENAME".to_string())],
             original_rows_by_rowid: HashMap::new(),
             original_row_order: Vec::new(),
@@ -13343,6 +13812,7 @@ UPDATE EMP SET ENAME = 'MILLER' WHERE ROWID = 'AAABBB';"
             rowid_col: 0,
             table_name: "EMP".to_string(),
             null_text: "NULL".to_string(),
+            character_lob_columns: HashSet::new(),
             editable_columns: vec![(1, "ENAME".to_string())],
             original_rows_by_rowid,
             original_row_order: vec!["AAABBB".to_string()],
@@ -13393,6 +13863,7 @@ UPDATE EMP SET ENAME = 'MILLER' WHERE ROWID = 'AAABBB';"
             rowid_col: 0,
             table_name: String::new(),
             null_text: String::new(),
+            character_lob_columns: HashSet::new(),
             editable_columns: Vec::new(),
             original_rows_by_rowid: HashMap::new(),
             original_row_order: Vec::new(),
@@ -13617,6 +14088,7 @@ UPDATE EMP SET ENAME = 'MILLER' WHERE ROWID = 'AAABBB';"
                 rowid_col: 0,
                 table_name: "EMP".to_string(),
                 null_text: "NULL".to_string(),
+                character_lob_columns: HashSet::new(),
                 editable_columns: vec![(1, "ENAME".to_string())],
                 original_rows_by_rowid: HashMap::new(),
                 original_row_order: Vec::new(),
@@ -13688,6 +14160,7 @@ UPDATE EMP SET ENAME = 'MILLER' WHERE ROWID = 'AAABBB';"
             rowid_col: 0,
             table_name: "EMP".to_string(),
             null_text: "NULL".to_string(),
+            character_lob_columns: HashSet::new(),
             editable_columns: vec![(1, "ENAME".to_string())],
             original_rows_by_rowid: HashMap::new(),
             original_row_order: Vec::new(),
@@ -13722,6 +14195,7 @@ UPDATE EMP SET ENAME = 'MILLER' WHERE ROWID = 'AAABBB';"
             rowid_col: 0,
             table_name: "EMP".to_string(),
             null_text: "NULL".to_string(),
+            character_lob_columns: HashSet::new(),
             editable_columns: vec![(1, "ENAME".to_string())],
             original_rows_by_rowid: HashMap::new(),
             original_row_order: Vec::new(),
@@ -13762,6 +14236,7 @@ UPDATE EMP SET ENAME = 'MILLER' WHERE ROWID = 'AAABBB';"
             rowid_col: 0,
             table_name: "EMP".to_string(),
             null_text: "NULL".to_string(),
+            character_lob_columns: HashSet::new(),
             editable_columns: vec![(1, "ENAME".to_string())],
             original_rows_by_rowid: HashMap::new(),
             original_row_order: Vec::new(),
@@ -13794,6 +14269,7 @@ UPDATE EMP SET ENAME = 'MILLER' WHERE ROWID = 'AAABBB';"
             rowid_col: 0,
             table_name: "EMP".to_string(),
             null_text: "NULL".to_string(),
+            character_lob_columns: HashSet::new(),
             editable_columns: vec![(1, "ENAME".to_string())],
             original_rows_by_rowid: HashMap::new(),
             original_row_order: Vec::new(),
@@ -13826,6 +14302,7 @@ UPDATE EMP SET ENAME = 'MILLER' WHERE ROWID = 'AAABBB';"
             rowid_col: 0,
             table_name: "EMP".to_string(),
             null_text: "NULL".to_string(),
+            character_lob_columns: HashSet::new(),
             editable_columns: vec![(1, "ENAME".to_string())],
             original_rows_by_rowid: HashMap::new(),
             original_row_order: Vec::new(),
@@ -13861,6 +14338,7 @@ UPDATE EMP SET ENAME = 'MILLER' WHERE ROWID = 'AAABBB';"
             rowid_col: 0,
             table_name: "EMP".to_string(),
             null_text: "NULL".to_string(),
+            character_lob_columns: HashSet::new(),
             editable_columns: vec![(1, "ENAME".to_string())],
             original_rows_by_rowid: HashMap::new(),
             original_row_order: Vec::new(),
@@ -13905,6 +14383,7 @@ UPDATE EMP SET ENAME = 'MILLER' WHERE ROWID = 'AAABBB';"
             rowid_col: 0,
             table_name: "EMP".to_string(),
             null_text: "NULL".to_string(),
+            character_lob_columns: HashSet::new(),
             editable_columns: vec![(1, "ENAME".to_string())],
             original_rows_by_rowid: HashMap::new(),
             original_row_order: Vec::new(),
@@ -13997,6 +14476,7 @@ UPDATE EMP SET ENAME = 'MILLER' WHERE ROWID = 'AAABBB';"
             rowid_col: 0,
             table_name: "EMP".to_string(),
             null_text: "NULL".to_string(),
+            character_lob_columns: HashSet::new(),
             editable_columns: vec![(1, "ENAME".to_string())],
             original_rows_by_rowid: HashMap::new(),
             original_row_order: Vec::new(),
@@ -14032,6 +14512,7 @@ UPDATE EMP SET ENAME = 'MILLER' WHERE ROWID = 'AAABBB';"
             rowid_col: 0,
             table_name: "EMP".to_string(),
             null_text: "NULL".to_string(),
+            character_lob_columns: HashSet::new(),
             editable_columns: vec![(1, "ENAME".to_string())],
             original_rows_by_rowid: HashMap::new(),
             original_row_order: Vec::new(),
@@ -14069,6 +14550,7 @@ UPDATE EMP SET ENAME = 'MILLER' WHERE ROWID = 'AAABBB';"
             rowid_col: 0,
             table_name: "EMP".to_string(),
             null_text: "NULL".to_string(),
+            character_lob_columns: HashSet::new(),
             editable_columns: vec![(1, "ENAME".to_string())],
             original_rows_by_rowid: HashMap::new(),
             original_row_order: Vec::new(),
@@ -14103,6 +14585,7 @@ UPDATE EMP SET ENAME = 'MILLER' WHERE ROWID = 'AAABBB';"
             rowid_col: 0,
             table_name: "EMP".to_string(),
             null_text: "NULL".to_string(),
+            character_lob_columns: HashSet::new(),
             editable_columns: vec![(1, "ENAME".to_string())],
             original_rows_by_rowid: HashMap::new(),
             original_row_order: Vec::new(),
@@ -14117,6 +14600,7 @@ UPDATE EMP SET ENAME = 'MILLER' WHERE ROWID = 'AAABBB';"
                 rowid_col: 0,
                 table_name: "EMP".to_string(),
                 null_text: "NULL".to_string(),
+                character_lob_columns: HashSet::new(),
                 editable_columns: vec![(1, "ENAME".to_string())],
                 original_rows_by_rowid: HashMap::new(),
                 original_row_order: Vec::new(),
@@ -14159,6 +14643,7 @@ UPDATE EMP SET ENAME = 'MILLER' WHERE ROWID = 'AAABBB';"
                 rowid_col: 0,
                 table_name: "EMP".to_string(),
                 null_text: "NULL".to_string(),
+                character_lob_columns: HashSet::new(),
                 editable_columns: vec![(1, "ENAME".to_string())],
                 original_rows_by_rowid: HashMap::new(),
                 original_row_order: Vec::new(),
@@ -14210,6 +14695,7 @@ UPDATE EMP SET ENAME = 'MILLER' WHERE ROWID = 'AAABBB';"
             rowid_col: 0,
             table_name: "EMP".to_string(),
             null_text: "NULL".to_string(),
+            character_lob_columns: HashSet::new(),
             editable_columns: vec![(1, "ENAME".to_string())],
             original_rows_by_rowid: HashMap::new(),
             original_row_order: Vec::new(),
@@ -14313,6 +14799,7 @@ UPDATE EMP SET ENAME = 'MILLER' WHERE ROWID = 'AAABBB';"
             rowid_col: 3,
             table_name: "sqtest.items".to_string(),
             null_text: "NULL".to_string(),
+            character_lob_columns: HashSet::new(),
             editable_columns: vec![
                 (0, "id".to_string()),
                 (1, "value_text".to_string()),
@@ -15229,6 +15716,7 @@ mod tests {
             rowid_col: 0,
             table_name: "SCOTT.EMP".to_string(),
             null_text: "NULL".to_string(),
+            character_lob_columns: HashSet::new(),
             editable_columns: vec![(1, "ENAME".to_string())],
             original_rows_by_rowid: rows
                 .iter()
@@ -15692,6 +16180,7 @@ mod tests {
             rowid_col: 0,
             table_name: "EMP".to_string(),
             null_text: "NULL".to_string(),
+            character_lob_columns: HashSet::new(),
             editable_columns: vec![(1, "ENAME".to_string())],
             original_rows_by_rowid: HashMap::from([(
                 "AA".to_string(),

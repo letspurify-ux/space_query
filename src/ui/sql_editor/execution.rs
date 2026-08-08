@@ -8867,6 +8867,34 @@ impl SqlEditorWidget {
         Some(prepared.sql)
     }
 
+    /// The refusal message when this editor's connection is read-only and the
+    /// text about to run is not purely a read; `None` when there is nothing to
+    /// refuse.
+    ///
+    /// This is a guard inside this application. The server is not told the
+    /// connection is read-only, so it is protection against a slip, not against
+    /// a determined attempt.
+    fn read_only_refusal(
+        &self,
+        sql: &str,
+        initial_mysql_delimiter: Option<&str>,
+    ) -> Option<String> {
+        let snapshot = self.connection_binding.snapshot();
+        let info = snapshot.runtime.as_ref()?.sanitized_info();
+        if !info.read_only {
+            return None;
+        }
+        let reason = crate::db::sql_classification::read_only_block_reason(
+            info.db_type,
+            sql,
+            initial_mysql_delimiter,
+        )?;
+        Some(format!(
+            "Connection \"{}\" is read-only, so {} was not sent to the database.",
+            info.name, reason
+        ))
+    }
+
     fn execute_sql_with_mysql_delimiter_after_lazy_cancel(
         &self,
         sql: &str,
@@ -8876,6 +8904,16 @@ impl SqlEditorWidget {
         lazy_cancel_retry_attempt: u32,
     ) -> bool {
         if sql.trim().is_empty() {
+            return false;
+        }
+
+        // The read-only guard goes first, ahead of the transaction preflight
+        // and ahead of the bind prompt below. A connection marked read-only
+        // must never ask for placeholder values and then refuse the statement
+        // anyway.
+        if let Some(message) = self.read_only_refusal(sql, initial_mysql_delimiter.as_deref()) {
+            Self::show_alert_dialog(&message);
+            self.emit_status(&message);
             return false;
         }
 
@@ -10878,6 +10916,13 @@ impl SqlEditorWidget {
                                         advanced: crate::db::ConnectionAdvancedSettings::default_for(
                                             crate::db::DatabaseType::Oracle,
                                         ),
+                                        // A SQL*Plus CONNECT names a different
+                                        // target with different credentials, so
+                                        // it starts untagged and writable. A
+                                        // read-only connection never gets here:
+                                        // the guard refuses the command itself.
+                                        color: crate::db::ConnectionColor::default(),
+                                        read_only: false,
                                         debug_oracle_thin_protocol_version: None,
                                     };
 
@@ -16053,6 +16098,8 @@ impl SqlEditorWidget {
             service_name,
             db_type: crate::db::DatabaseType::Oracle,
             advanced,
+            color: crate::db::ConnectionColor::default(),
+            read_only: false,
             debug_oracle_thin_protocol_version: None,
         }
     }
