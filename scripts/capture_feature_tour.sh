@@ -62,6 +62,31 @@ if [[ "$capture_mode" == "connection-dialog" ]]; then
   exit 0
 fi
 
+if [[ "$capture_mode" == "column-layout" ]]; then
+  convert_capture column-layout column-layout
+  exit 0
+fi
+
+if [[ "$capture_mode" == "value-filter" ]]; then
+  convert_capture value-filter value-filter
+  exit 0
+fi
+
+if [[ "$capture_mode" == "grid-sort" ]]; then
+  convert_capture grid-sort grid-sort
+  exit 0
+fi
+
+if [[ "$capture_mode" == "tree-columns" ]]; then
+  convert_capture tree-columns tree-columns
+  exit 0
+fi
+
+if [[ "$capture_mode" == "restore-tabs" ]]; then
+  convert_capture restore-tabs restore-tabs
+  exit 0
+fi
+
 if [[ "$capture_mode" == "settings-dialog" ]]; then
   convert_capture settings settings
   exit 0
@@ -179,3 +204,8 @@ convert_capture settings settings
 convert_capture query-history query-history
 convert_capture session-activity session-activity
 convert_capture application-log application-log
+convert_capture column-layout column-layout
+convert_capture value-filter value-filter
+convert_capture grid-sort grid-sort
+convert_capture tree-columns tree-columns
+convert_capture restore-tabs restore-tabs

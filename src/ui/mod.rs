@@ -20,7 +20,11 @@ pub(crate) mod grid_search;
 // Public only so `verify_grid_sql_export` can assert on the exact SQL the app
 // puts on the clipboard; not part of the supported surface.
 #[doc(hidden)]
+pub mod column_layout;
+pub(crate) mod column_layout_dialog;
+pub mod grid_sort;
 pub mod grid_sql_export;
+pub mod grid_value_filter;
 pub mod intellisense;
 pub mod intellisense_context;
 pub mod log_viewer;

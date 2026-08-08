@@ -142,6 +142,55 @@ pub fn render(format: ExportFormat, grid: &ExportGrid) -> String {
     }
 }
 
+/// Render an export in `format`, choosing between the plain serializers above
+/// and the dialect-aware `SQL Inserts` builder.
+///
+/// The fork lives here rather than in the grid because the object browser
+/// exports a table without going through a grid at all. One fork means the two
+/// callers cannot disagree about which renderer a format belongs to — and in
+/// particular cannot route `SqlInserts` to [`render`], which deliberately
+/// answers with an empty string.
+///
+/// `sql_selection` is only read for `SqlInserts`; passing `None` for that format
+/// yields nothing rather than wrong SQL.
+pub fn render_export_content(
+    format: ExportFormat,
+    grid: &ExportGrid,
+    sql_selection: Option<&crate::ui::grid_sql_export::GridSqlSelection>,
+) -> (String, usize) {
+    match format {
+        ExportFormat::SqlInserts => match sql_selection {
+            Some(selection) => (
+                crate::ui::grid_sql_export::build_sql_inserts(selection),
+                selection.rows.len(),
+            ),
+            None => (String::new(), 0),
+        },
+        format => (render(format, grid), grid.rows.len()),
+    }
+}
+
+/// Put `format`'s byte-order mark in front of `text` when the bytes are headed
+/// for a file.
+///
+/// A BOM tells a spreadsheet how to decode a *file*; on the clipboard it just
+/// pastes an invisible `U+FEFF` wherever it lands.
+pub fn with_destination_prelude(
+    format: ExportFormat,
+    destination: ExportDestination,
+    text: String,
+) -> String {
+    let prelude = match destination {
+        ExportDestination::File => format.file_byte_order_mark(),
+        ExportDestination::Clipboard => "",
+    };
+    if prelude.is_empty() {
+        text
+    } else {
+        format!("{prelude}{text}")
+    }
+}
+
 /// CSV / TSV share everything but the separator and the escape rule.
 ///
 /// The line ending follows the platform, because these two are what a

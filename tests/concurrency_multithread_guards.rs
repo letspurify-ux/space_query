@@ -2799,9 +2799,10 @@ fn schema_poll_preserves_dequeued_update_across_state_contention() {
     assert!(
         poll.contains("pending_schema_update: Option<SchemaUpdate>")
             && poll.contains("pending_schema_update = Some(update);")
-            && poll.contains(
-                "idle_poll_cycles.clone(),\n                        pending_schema_update,"
-            ),
+            // The last argument of the deferred reschedule, so the carry-over is
+            // pinned without pinning which other state the poll happens to
+            // thread through alongside it.
+            && poll.contains("pending_schema_update,\n                    );"),
         "a dequeued schema update must be carried into the next timer poll when AppState is busy"
     );
 }

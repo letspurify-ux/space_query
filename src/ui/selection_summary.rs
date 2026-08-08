@@ -12,6 +12,8 @@
 //! NULLs follow SQL aggregate semantics: they are skipped, and `Count` is the
 //! number of non-NULL values, not the number of selected cells.
 
+use crate::ui::column_layout::HiddenColumns;
+
 /// A decimal number held exactly: `units` scaled down by `10^scale`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct Decimal {
@@ -296,7 +298,7 @@ impl NumericAccumulator {
 pub(crate) fn summarize_selection(
     rows: &[Vec<String>],
     bounds: (usize, usize, usize, usize),
-    hidden_col: Option<usize>,
+    hidden_col: &HiddenColumns,
     null_text: &str,
 ) -> Option<SelectionSummary> {
     let (row_start, col_start, row_end, col_end) = bounds;
@@ -304,7 +306,7 @@ pub(crate) fn summarize_selection(
         return None;
     }
     let selected_columns = (col_start..=col_end)
-        .filter(|col| hidden_col != Some(*col))
+        .filter(|col| !hidden_col.contains(*col))
         .count();
     if selected_columns == 0 {
         return None;
@@ -323,7 +325,7 @@ pub(crate) fn summarize_selection(
     let mut numeric_failed = false;
     for row in rows.iter().take(row_end + 1).skip(row_start) {
         for (col, value) in row.iter().enumerate().take(col_end + 1).skip(col_start) {
-            if hidden_col == Some(col) {
+            if hidden_col.contains(col) {
                 continue;
             }
             if crate::ui::result_table::ResultTableWidget::value_represents_null(value, null_text) {
@@ -381,7 +383,12 @@ mod tests {
         let rows = rows(values);
         let row_end = rows.len().saturating_sub(1);
         let col_end = rows.first().map_or(0, |row| row.len().saturating_sub(1));
-        summarize_selection(&rows, (0, 0, row_end, col_end), None, "NULL")
+        summarize_selection(
+            &rows,
+            (0, 0, row_end, col_end),
+            &HiddenColumns::default(),
+            "NULL",
+        )
     }
 
     #[test]
@@ -515,7 +522,12 @@ mod tests {
     fn the_hidden_rowid_column_is_not_aggregated() {
         let rows = rows(&[&["AAAR3s", "1"], &["AAAR3t", "2"]]);
         assert_eq!(
-            summarize_selection(&rows, (0, 0, 1, 1), Some(0), "NULL"),
+            summarize_selection(
+                &rows,
+                (0, 0, 1, 1),
+                &HiddenColumns::automatic(Some(0)),
+                "NULL"
+            ),
             Some(SelectionSummary::Numeric {
                 count: 2,
                 sum: "3".to_string(),
@@ -530,7 +542,12 @@ mod tests {
     fn a_selection_of_only_the_hidden_column_has_no_summary() {
         let rows = rows(&[&["AAAR3s", "1"], &["AAAR3t", "2"]]);
         assert_eq!(
-            summarize_selection(&rows, (0, 0, 1, 0), Some(0), "NULL"),
+            summarize_selection(
+                &rows,
+                (0, 0, 1, 0),
+                &HiddenColumns::automatic(Some(0)),
+                "NULL"
+            ),
             None
         );
     }
@@ -539,7 +556,8 @@ mod tests {
     fn a_huge_selection_reports_its_size_without_scanning() {
         let rows = rows(&[&["1", "2"]]);
         let row_end = MAX_SCANNED_CELLS;
-        let summary = summarize_selection(&rows, (0, 0, row_end, 1), None, "NULL");
+        let summary =
+            summarize_selection(&rows, (0, 0, row_end, 1), &HiddenColumns::default(), "NULL");
         assert_eq!(
             summary,
             Some(SelectionSummary::CellsOnly {
@@ -552,7 +570,7 @@ mod tests {
     fn selection_bounds_past_the_fetched_rows_only_see_what_exists() {
         let rows = rows(&[&["1", "2"]]);
         assert_eq!(
-            summarize_selection(&rows, (0, 0, 9, 1), None, "NULL"),
+            summarize_selection(&rows, (0, 0, 9, 1), &HiddenColumns::default(), "NULL"),
             Some(SelectionSummary::Numeric {
                 count: 2,
                 sum: "3".to_string(),
@@ -588,7 +606,7 @@ mod tests {
         let huge = "1".repeat(38);
         let rows = rows(&[&[huge.as_str(), huge.as_str(), huge.as_str()]]);
         assert_eq!(
-            summarize_selection(&rows, (0, 0, 0, 2), None, "NULL"),
+            summarize_selection(&rows, (0, 0, 0, 2), &HiddenColumns::default(), "NULL"),
             Some(SelectionSummary::Count { count: 3 })
         );
     }

@@ -37,6 +37,7 @@ use crate::db::{
     TabConnectionBinding, TransactionAccessMode, TransactionIsolation, TransactionMode,
 };
 use crate::ui::constants::*;
+use crate::ui::grid_sort::NullOrdering;
 use crate::ui::result_export::{ExportDestination, ExportFormat};
 use crate::ui::result_export_dialog::ExportChoice;
 use crate::ui::result_table::{
@@ -3326,6 +3327,23 @@ impl AppState {
             .map(|index| Self::tab_display_label(&self.editor_tabs[index]))
     }
 
+    /// Every tab holding text that is not on disk, for the crash snapshot.
+    ///
+    /// `pristine_text` is what the tab was last saved or opened as, so a tab is
+    /// unsaved exactly when the buffer differs from it — the same answer the
+    /// close prompt uses, rather than a second rule that could drift from it.
+    fn unsaved_tab_snapshots(&self) -> Vec<crate::utils::local_history::TabSnapshot> {
+        self.editor_tabs
+            .iter()
+            .filter(|tab| tab.is_dirty)
+            .map(|tab| crate::utils::local_history::TabSnapshot {
+                label: tab.base_label.clone(),
+                file_path: tab.current_file.clone(),
+                text: tab.sql_buffer.text(),
+            })
+            .collect()
+    }
+
     fn is_tab_dirty(&self, tab_id: QueryTabId) -> bool {
         self.find_tab_index(tab_id)
             .map(|index| self.editor_tabs[index].is_dirty)
@@ -3353,6 +3371,22 @@ impl AppState {
         self.editor_tabs[index].current_text_len = text.len();
         self.editor_tabs[index].pristine_text = text;
         self.set_tab_dirty(tab_id, false);
+    }
+
+    /// Mark a tab as holding text restored from a crash snapshot.
+    ///
+    /// The text was never saved, so there is no pristine version to compare
+    /// against and the tab must simply say it is dirty. `current_text_len` is
+    /// still set from the real buffer: the modify callback compares lengths
+    /// before it compares content, and a stale length would make the next
+    /// keystroke misjudge the tab.
+    fn set_tab_restored_unsaved_text(&mut self, tab_id: QueryTabId, text_len: usize) {
+        let Some(index) = self.find_tab_index(tab_id) else {
+            return;
+        };
+        self.editor_tabs[index].pristine_text = String::new();
+        self.editor_tabs[index].current_text_len = text_len;
+        self.set_tab_dirty(tab_id, true);
     }
 
     fn dirty_state_from_equal_length_local_edit(
@@ -5413,9 +5447,44 @@ impl MainWindow {
 
     /// Where the exported text should go. `None` means the user cancelled the
     /// save chooser.
+    /// Send a tree export to the destination the user already chose.
+    ///
+    /// Reuses the grid export's chooser and writer so both paths report through
+    /// `FileActionResult` and share the extension and BOM rules.
+    fn deliver_object_export(
+        sender: &std::sync::mpsc::Sender<FileActionResult>,
+        delivery: crate::ui::object_browser::ObjectExportDelivery,
+    ) {
+        let destination = match delivery.destination {
+            ExportDestination::Clipboard => None,
+            ExportDestination::File => {
+                let Some(path) =
+                    Self::ask_export_file_path_named(delivery.format, &delivery.suggested_name)
+                else {
+                    return;
+                };
+                Some(path)
+            }
+        };
+        Self::deliver_export(
+            sender,
+            destination,
+            delivery.format,
+            delivery.text,
+            delivery.row_count,
+        );
+    }
+
     fn ask_export_file_path(format: ExportFormat) -> Option<PathBuf> {
+        Self::ask_export_file_path_named(format, "")
+    }
+
+    fn ask_export_file_path_named(format: ExportFormat, suggested_name: &str) -> Option<PathBuf> {
         let mut dialog = FileDialog::new(FileDialogType::BrowseSaveFile);
         dialog.set_filter(&format.file_filter());
+        if !suggested_name.is_empty() {
+            dialog.set_preset_file(&format!("{suggested_name}.{}", format.extension()));
+        }
         dialog.show();
         let filename = dialog.filename();
         if filename.as_os_str().is_empty() {
@@ -5468,6 +5537,41 @@ impl MainWindow {
     /// `SQL Inserts` and `Where Clause` are immediate. `SQL Updates` needs the
     /// table's primary key for its WHERE clause, so it reads metadata on a worker
     /// thread and finishes when `FileActionResult::CopyToClipboard` is drained.
+    /// Narrow the visible result to the values its selection names.
+    ///
+    /// Nothing here needs a connection: this filters rows the grid already
+    /// holds, which is exactly why it is offered on results that cannot be
+    /// re-queried. The state lock is released before touching the grid because
+    /// applying a filter can run a deferred lazy fetch, whose callbacks take it
+    /// again.
+    /// Open the Columns dialog for the visible result and apply what it returns.
+    ///
+    /// The state lock is released first: the dialog runs its own event loop, and
+    /// anything it wakes would deadlock against a lock held across it.
+    fn arrange_result_columns(state: &Arc<Mutex<AppState>>) {
+        let mut result_tabs = {
+            let s = state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            s.result_tabs.clone()
+        };
+        if let Err(message) = result_tabs.arrange_visible_result_columns() {
+            crate::ui::alert_on_main(&message);
+        }
+    }
+
+    fn filter_result_by_selected_values(state: &Arc<Mutex<AppState>>, negate: bool) {
+        let mut result_tabs = {
+            let s = state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            s.result_tabs.clone()
+        };
+        if let Err(message) = result_tabs.apply_visible_value_filter(negate) {
+            crate::ui::alert_on_main(&message);
+        }
+    }
+
     fn copy_result_selection_as_sql(
         state: &Arc<Mutex<AppState>>,
         file_sender: &std::sync::mpsc::Sender<FileActionResult>,
@@ -9193,6 +9297,21 @@ impl MainWindow {
                                 action,
                             );
                         }
+                        ResultTableContextAction::FilterByValue { negate } => {
+                            MainWindow::filter_result_by_selected_values(
+                                &state_for_context,
+                                negate,
+                            );
+                        }
+                        ResultTableContextAction::ClearValueFilter => {
+                            let mut state = state_for_context
+                                .lock()
+                                .unwrap_or_else(|poisoned| poisoned.into_inner());
+                            state.result_tabs.clear_visible_value_filter();
+                        }
+                        ResultTableContextAction::ArrangeColumns => {
+                            MainWindow::arrange_result_columns(&state_for_context);
+                        }
                     }
                 },
             )
@@ -9685,6 +9804,16 @@ impl MainWindow {
                     s.refresh_result_edit_controls();
                     drop(s);
                     result_tabs.ensure_statement_tab_by_id(result_tab_id, "Result", select_tab);
+                    if let Some(db_type) = result_db_type {
+                        result_tabs.set_sort_null_ordering_by_id(
+                            result_tab_id,
+                            if db_type.sorts_nulls_last_ascending() {
+                                NullOrdering::LastOnAscending
+                            } else {
+                                NullOrdering::FirstOnAscending
+                            },
+                        );
+                    }
                     result_tabs.start_streaming_by_id(
                         result_tab_id,
                         &columns,
@@ -12869,6 +12998,8 @@ impl MainWindow {
             let mut sql_to_execute: Option<String> = None;
             let mut script_to_execute: Option<String> = None;
             let mut table_browse_to_execute: Option<(QueryTabId, TableBrowsePageRequest)> = None;
+            let mut export_to_deliver: Option<crate::ui::object_browser::ObjectExportDelivery> =
+                None;
             {
                 let mut s = state_for_browser
                     .lock()
@@ -12909,6 +13040,12 @@ impl MainWindow {
                     }
                     SqlAction::Execute(sql) => {
                         sql_to_execute = Some(sql);
+                    }
+                    SqlAction::ExportData(delivery) => {
+                        // Deferred like the two above: the save panel and the
+                        // clipboard both spin their own event loop, and the
+                        // state lock is still held here.
+                        export_to_deliver = Some(delivery);
                     }
                     SqlAction::ExecuteScript(sql) => {
                         script_to_execute = Some(sql);
@@ -12995,6 +13132,10 @@ impl MainWindow {
                 {
                     crate::ui::alert_on_main(&message);
                 }
+            }
+
+            if let Some(delivery) = export_to_deliver {
+                MainWindow::deliver_object_export(&file_sender_for_browser, delivery);
             }
 
             if !created_tabs.is_empty() {
@@ -13176,11 +13317,20 @@ impl MainWindow {
         let file_receiver: Arc<Mutex<std::sync::mpsc::Receiver<FileActionResult>>> =
             Arc::new(Mutex::new(file_receiver));
         let idle_poll_cycles = Arc::new(AtomicUsize::new(0));
+        let snapshot_cycles = Arc::new(AtomicUsize::new(0));
+        // Zero means "nothing written yet", which is also what an empty
+        // snapshot hashes to, so a run with no unsaved tabs never writes.
+        let last_snapshot_key = Arc::new(AtomicU64::new(0));
 
         const CHANNEL_POLL_ACTIVE_INTERVAL_SECONDS: f64 = 0.05;
         const CHANNEL_POLL_IDLE_INTERVAL_SECONDS: f64 = 0.25;
         const MEMORY_TRIM_IDLE_CYCLE_THRESHOLD: usize =
             safe_div_f64_to_usize(60.0, CHANNEL_POLL_IDLE_INTERVAL_SECONDS);
+        /// How often the unsaved-tab snapshot is reconsidered, in idle poll
+        /// cycles. Five seconds bounds what a crash can cost without making the
+        /// app touch the disk while someone is typing.
+        const UNSAVED_SNAPSHOT_IDLE_CYCLE_THRESHOLD: usize =
+            safe_div_f64_to_usize(5.0, CHANNEL_POLL_IDLE_INTERVAL_SECONDS);
 
         fn schedule_poll(
             schema_receiver: Arc<Mutex<std::sync::mpsc::Receiver<SchemaUpdate>>>,
@@ -13190,6 +13340,8 @@ impl MainWindow {
             schema_sender: std::sync::mpsc::Sender<SchemaUpdate>,
             file_sender: std::sync::mpsc::Sender<FileActionResult>,
             idle_poll_cycles: Arc<AtomicUsize>,
+            snapshot_cycles: Arc<AtomicUsize>,
+            last_snapshot_key: Arc<AtomicU64>,
             pending_schema_update: Option<SchemaUpdate>,
         ) {
             let Some(state) = state_weak.upgrade() else {
@@ -13668,6 +13820,8 @@ impl MainWindow {
                         schema_sender.clone(),
                         file_sender.clone(),
                         idle_poll_cycles.clone(),
+                        snapshot_cycles.clone(),
+                        last_snapshot_key.clone(),
                         pending_schema_update,
                     );
                 });
@@ -13677,6 +13831,14 @@ impl MainWindow {
             // Stop polling if all channels are disconnected
             if schema_disconnected && conn_disconnected && file_disconnected {
                 return;
+            }
+
+            snapshot_cycles.fetch_add(1, Ordering::Relaxed);
+            if snapshot_cycles.load(Ordering::Relaxed) >= UNSAVED_SNAPSHOT_IDLE_CYCLE_THRESHOLD {
+                snapshot_cycles.store(0, Ordering::Relaxed);
+                if let Some(state) = state_weak.upgrade() {
+                    MainWindow::write_unsaved_tab_snapshot(&state, &last_snapshot_key);
+                }
             }
 
             let delay = if processed_message {
@@ -13703,6 +13865,8 @@ impl MainWindow {
                     schema_sender.clone(),
                     file_sender.clone(),
                     idle_poll_cycles.clone(),
+                    snapshot_cycles.clone(),
+                    last_snapshot_key.clone(),
                     pending_schema_update,
                 );
             });
@@ -13726,6 +13890,8 @@ impl MainWindow {
             schema_sender_for_poll,
             file_sender.clone(),
             idle_poll_cycles,
+            snapshot_cycles,
+            last_snapshot_key,
             None,
         );
 
@@ -13872,12 +14038,70 @@ impl MainWindow {
         );
     }
 
+    /// Persist the unsaved editor tabs so a crash does not take them with it.
+    ///
+    /// Runs on the idle poll and does nothing in the common case: the snapshot
+    /// is hashed first, and an unchanged hash means neither serializing nor
+    /// touching the disk. `last_key` starts at zero, which is also what "no
+    /// unsaved tabs" hashes to, so a session that never dirties a tab never
+    /// writes a file.
+    fn write_unsaved_tab_snapshot(state: &Arc<Mutex<AppState>>, last_key: &Arc<AtomicU64>) {
+        use crate::utils::local_history::SessionSnapshot;
+
+        let tabs = {
+            let s = state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            s.unsaved_tab_snapshots()
+        };
+        let (snapshot, skipped) = SessionSnapshot::from_dirty_tabs(tabs);
+        let key = snapshot.change_key();
+        if key == last_key.load(Ordering::Relaxed) {
+            return;
+        }
+
+        match crate::utils::local_history::save(&snapshot) {
+            Ok(()) => {
+                last_key.store(key, Ordering::Relaxed);
+                if !skipped.is_empty() {
+                    // Saying it once per change beats silently dropping a tab
+                    // the user would only miss after a crash.
+                    crate::utils::logging::log_warning(
+                        "local_history",
+                        &format!(
+                            "Too large to keep for crash recovery, so not snapshotted: {}",
+                            skipped.join(", ")
+                        ),
+                    );
+                }
+            }
+            Err(err) => {
+                // Never interrupt: this is a background safety net, and a
+                // dialog here would fire on every tick that still fails.
+                crate::utils::logging::log_error(
+                    "local_history",
+                    &format!("Failed to snapshot unsaved tabs: {err}"),
+                );
+                last_key.store(key, Ordering::Relaxed);
+            }
+        }
+    }
+
     fn finish_application_exit(state: &Arc<Mutex<AppState>>, mut window: Window) {
         // FLTK's event loop returns only after every native top-level window is
         // hidden. Establish that exit condition before any resource cleanup
         // that could be delayed by a database driver or worker state.
         window.hide();
         Self::hide_all_visible_windows();
+
+        // A snapshot that outlives the process is how the next run knows this
+        // one died, so a clean exit must take it away.
+        if let Err(err) = crate::utils::local_history::clear() {
+            crate::utils::logging::log_error(
+                "local_history",
+                &format!("Failed to remove the unsaved-tab snapshot: {err}"),
+            );
+        }
 
         crate::db::clear_tracked_db_activity();
         let (popups, editor_tabs, mut result_tabs, runtimes) = {
@@ -14226,6 +14450,62 @@ impl MainWindow {
     /// Blocks in FLTK's popup loop until the menu is dismissed; a capture has to
     /// take its frame and hide the menu window from a timeout.
     #[doc(hidden)]
+    /// Open the Columns dialog on the visible result, for the capture tour.
+    #[doc(hidden)]
+    pub fn capture_tour_arrange_columns(&mut self) {
+        let mut result_tabs = {
+            let s = self
+                .state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            s.result_tabs.clone()
+        };
+        let _ = result_tabs.arrange_visible_result_columns();
+    }
+
+    /// Filter the visible result by its selected cells, for the capture tour.
+    #[doc(hidden)]
+    pub fn capture_tour_filter_by_selected_values(&mut self, negate: bool) -> Result<(), String> {
+        let mut result_tabs = {
+            let s = self
+                .state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            s.result_tabs.clone()
+        };
+        result_tabs.apply_visible_value_filter(negate)
+    }
+
+    /// Sort the visible result locally, for the capture tour.
+    #[doc(hidden)]
+    pub fn capture_tour_sort_result_column(&mut self, column: usize) {
+        let s = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        s.result_tabs.capture_tour_sort_column(column);
+    }
+
+    /// Every object-tree node path, for the capture tour.
+    #[doc(hidden)]
+    pub fn capture_tour_object_tree_paths(&self) -> Vec<String> {
+        let s = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        s.object_browser.capture_tour_tree_paths()
+    }
+
+    /// Expand a tree node by its path, for the capture tour.
+    #[doc(hidden)]
+    pub fn capture_tour_expand_object_path(&mut self, path: &str) -> bool {
+        let s = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        s.object_browser.capture_tour_expand_path(path)
+    }
+
     pub fn capture_tour_show_result_context_menu(&mut self) -> Result<(), String> {
         let result_tabs = {
             let state = self
@@ -14460,6 +14740,102 @@ The crash has been recorded in the application log.",
         );
     }
 
+    /// Offer to reopen the tabs the last run had unsaved when it died.
+    ///
+    /// The snapshot only exists after an abnormal exit, so reaching this at all
+    /// already means something was lost. Restoring puts each tab back dirty and
+    /// keeps the file it belonged to, so the very next Save writes where the
+    /// user expected — and the snapshot is dropped either way, so a declined
+    /// offer is not made twice.
+    pub fn offer_unsaved_tab_restore(
+        &mut self,
+        snapshot: &crate::utils::local_history::SessionSnapshot,
+    ) {
+        if snapshot.is_empty() {
+            return;
+        }
+        let names = snapshot
+            .tabs
+            .iter()
+            .map(crate::utils::local_history::TabSnapshot::display_name)
+            .collect::<Vec<_>>()
+            .join("\n  ");
+        let message = format!(
+            "The previous session ended without saving {} tab(s):\n\n  {names}\n\nReopen them?",
+            snapshot.tabs.len()
+        );
+        let restore = crate::ui::choice2_on_main_with_title(
+            "Restore Unsaved Tabs",
+            &message,
+            "Discard",
+            "Reopen",
+            "",
+        ) == Some(1);
+
+        // Cleared whichever way the user answered: keeping it would re-ask on
+        // every later start, and the answer has been given.
+        if let Err(err) = crate::utils::local_history::clear() {
+            crate::utils::logging::log_error(
+                "local_history",
+                &format!("Failed to remove the unsaved-tab snapshot: {err}"),
+            );
+        }
+        if !restore {
+            return;
+        }
+        self.restore_unsaved_tabs(snapshot);
+    }
+
+    fn restore_unsaved_tabs(&mut self, snapshot: &crate::utils::local_history::SessionSnapshot) {
+        // The senders live on the state once `setup_callbacks` has run, which
+        // it has: the restore prompt comes after the window is up. Without them
+        // a restored tab would have no callbacks, so say so rather than open
+        // tabs that do not work.
+        let senders = {
+            let s = self
+                .state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            s.schema_sender.clone().zip(s.file_sender.clone())
+        };
+        let Some((schema_sender, file_sender)) = senders else {
+            crate::utils::logging::log_error(
+                "local_history",
+                "Cannot reopen unsaved tabs before the window callbacks are installed",
+            );
+            return;
+        };
+        let mut restored = 0_usize;
+        for tab in &snapshot.tabs {
+            let created = {
+                let mut s = self
+                    .state
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                let Some(tab_id) = MainWindow::create_query_editor_tab(&mut s) else {
+                    continue;
+                };
+                s.sql_buffer.set_text(&tab.text);
+                s.sql_editor.reset_undo_redo_history();
+                s.set_tab_file_path(tab_id, tab.file_path.clone());
+                s.set_tab_restored_unsaved_text(tab_id, tab.text.len());
+                tab_id
+            };
+            MainWindow::attach_editor_callbacks(&self.state, created, schema_sender.clone());
+            MainWindow::attach_file_drop_callback(&self.state, created, file_sender.clone());
+            restored += 1;
+        }
+        if restored > 0 {
+            let mut s = self
+                .state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            s.set_status_message(&format!("Reopened {restored} unsaved tab(s)"));
+            s.sql_editor.focus();
+            app::redraw();
+        }
+    }
+
     pub fn run() {
         let app = app::App::default()
             .with_scheme(app::Scheme::Gtk)
@@ -14476,8 +14852,12 @@ The crash has been recorded in the application log.",
         main_window.show();
 
         // Check for crash log from a previous session
+        let unsaved_tabs = crate::utils::local_history::load();
         if let Some(crash_report) = crate::utils::logging::take_crash_log() {
             Self::show_previous_crash_report(&crash_report);
+        }
+        if let Some(snapshot) = unsaved_tabs.as_ref() {
+            main_window.offer_unsaved_tab_restore(snapshot);
         }
 
         match app.run() {

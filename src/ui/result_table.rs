@@ -10,7 +10,7 @@ use fltk::{
 use std::any::Any;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::panic::{self, AssertUnwindSafe};
-use std::sync::atomic::{AtomicI32, AtomicU32, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -20,12 +20,15 @@ use crate::db::{
     ResultEditDescriptor, ResultEditMutation, ResultEditOriginalValue, ResultEditRequest,
     ResultEditValue, SqlValueKind, MYSQL_EDIT_KEY_ALIAS_PREFIX, RESULT_EDIT_SNAPSHOT_COLUMN,
 };
+use crate::ui::column_layout::{ColumnLayoutPlan, ColumnLayoutRow, HiddenColumns};
 use crate::ui::constants::*;
 use crate::ui::font_settings::{
     configured_result_font_size, configured_result_profile, FontProfile,
 };
 use crate::ui::grid_search::{grid_matches, GridSearchHighlight};
+use crate::ui::grid_sort::{compare_cell_values, NullOrdering, SortColumn};
 use crate::ui::grid_sql_export::GridSqlSelection;
+use crate::ui::grid_value_filter::GridValueFilter;
 use crate::ui::result_export::{ExportDestination, ExportFormat, ExportGrid, ExportScope};
 use crate::ui::selection_summary::{summarize_selection, SelectionSummary};
 use crate::ui::sql_editor::LazyFetchRequest;
@@ -86,9 +89,12 @@ const WIDTH_SAMPLE_ROWS: usize = 5000;
 const MAX_HITTEST_ROW_BACKTRACK: i32 = 4096;
 /// Limit stale column-position fallback scans for very wide result sets.
 const MAX_HITTEST_COL_BACKTRACK: i32 = 512;
+const HEADER_SORT_CLICK_MOVE_TOLERANCE_PX: u32 = 4;
 const LAZY_FETCH_SCROLL_THRESHOLD_NUMERATOR: i64 = 1;
 const LAZY_FETCH_SCROLL_THRESHOLD_DENOMINATOR: i64 = 1;
 const LAZY_FETCH_SCROLLBAR_POLL_INTERVAL_SECONDS: f64 = 0.05;
+const SORT_ASC_MARK: &str = "▲";
+const SORT_DESC_MARK: &str = "▼";
 
 pub type ResultGridSqlExecuteCallback =
     Arc<Mutex<Option<Box<dyn FnMut(String) -> Result<(), String>>>>>;
@@ -103,6 +109,7 @@ pub type ResultTableContextActionCallback =
 /// column name and whether the click asked for ascending order, and returns
 /// true when it took the sort — false falls back to the local sort, so a grid
 /// whose tab can no longer re-query still orders.
+pub type HeaderSortRedirectCallback = Arc<Mutex<Option<Box<dyn FnMut(String) -> bool>>>>;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ResultTableContextAction {
@@ -113,9 +120,24 @@ pub enum ResultTableContextAction {
     CopySqlInserts,
     CopySqlUpdates,
     CopyWhereClause,
+    /// Narrow the rows already fetched to the ones matching the selection.
+    /// `negate` asks for the complement.
+    ///
+    /// Offered only on a result that has no `WHERE` / `ORDER BY` bar, because
+    /// exactly one filtering mechanism may be live on a grid at a time. Routed
+    /// through the main window so the strip that reports the filter and the
+    /// grid that applies it stay in step.
+    FilterByValue {
+        negate: bool,
+    },
+    /// Drop every value filter and put every fetched row back.
+    ClearValueFilter,
+    /// Open the Columns dialog to hide or reorder this result's columns.
+    ArrangeColumns,
 }
 
 enum LazyFetchPendingAction {
+    HeaderSort(usize),
     CopyAll,
     SelectAll,
     MoveToEdge {
@@ -127,6 +149,25 @@ enum LazyFetchPendingAction {
         selection: Option<(i32, i32, i32, i32)>,
     },
     Export(ExportRequest, Box<dyn FnMut(String, usize)>),
+    /// Apply a value filter once the rest of the rows are in.
+    ///
+    /// Filtering a partly fetched result would answer from whatever happened to
+    /// have arrived, so the filter is built from the selection immediately —
+    /// while the cells the user pointed at are still the cells on screen — and
+    /// only its application waits.
+    ValueFilter(
+        GridValueFilter,
+        Box<dyn FnMut(Result<ValueFilterOutcome, String>)>,
+    ),
+}
+
+/// What applying a value filter produced, for the strip that reports it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ValueFilterOutcome {
+    /// One line naming every filter now in force.
+    pub description: String,
+    pub kept_rows: usize,
+    pub total_rows: usize,
 }
 
 /// What an export should produce, carried across a deferred full fetch so the
@@ -240,6 +281,26 @@ fn mutex_store_usize(value: &Arc<Mutex<usize>>, next: usize) {
 const VALUE_WINDOW_VIEW_ITEM: &str = "View Value...";
 /// Data Grid menu label for the value window when the cell can be written.
 const VALUE_WINDOW_EDIT_ITEM: &str = "Edit Value...";
+/// Data Grid menu label that filters the result down to the selected values.
+const FILTER_BY_VALUE_ITEM: &str = "Filter by Value";
+/// Data Grid menu label for the complement of `FILTER_BY_VALUE_ITEM`.
+const EXCLUDE_VALUE_ITEM: &str = "Exclude Value";
+/// Data Grid menu label that puts every filtered-out row back.
+const CLEAR_VALUE_FILTER_ITEM: &str = "Clear Value Filter";
+/// Data Grid menu label for the column hide/reorder dialog.
+const COLUMNS_ITEM: &str = "Columns...";
+
+/// Which value-filter items the context menu should carry.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ValueFilterMenuOffer {
+    /// This grid filters locally, i.e. it has no `WHERE` bar to filter with.
+    can_filter: bool,
+    /// A value filter is in force, so it can be taken off again.
+    is_filtered: bool,
+    /// The columns can be rearranged right now — nothing else is holding their
+    /// indexes.
+    can_arrange_columns: bool,
+}
 
 struct SharedFontSettings {
     normal_font: AtomicI32,
@@ -321,7 +382,9 @@ pub struct ResultTableWidget {
     column_data_types: Arc<Mutex<Vec<String>>>,
     /// NULL placement for the local header sort, adopted from the backend that
     /// produced the result.
+    sort_null_ordering: Arc<Mutex<NullOrdering>>,
     /// Set when the tab can re-query, so the header sort goes to the server.
+    header_sort_redirect: HeaderSortRedirectCallback,
     /// Buffer for pending rows during streaming
     pending_rows: Arc<Mutex<Vec<Vec<String>>>>,
     /// Pending column width updates
@@ -360,6 +423,25 @@ pub struct ResultTableWidget {
     pending_save_statement_signatures: Arc<Mutex<Vec<String>>>,
     next_save_request_id: Arc<Mutex<u64>>,
     hidden_auto_rowid_col: Arc<Mutex<Option<usize>>>,
+    // Whether this grid's tab carries a `WHERE` / `ORDER BY` bar. The context
+    // menu asks before offering `Filter by Value`, which is the local filter
+    // for results the bar cannot serve: exactly one of the two is ever offered
+    // on a grid, so the rows on screen always have a single explanation.
+    filter_bar_present: Arc<AtomicBool>,
+    // Columns the user hid in the Columns dialog, by grid index. Kept apart
+    // from the technical column above because the two have different lifetimes:
+    // the technical one is re-derived from the headers, this one is the user's
+    // choice and survives until they change it or a new result arrives.
+    user_hidden_columns: Arc<Mutex<HashSet<usize>>>,
+    // Where each current column sat when the result arrived, so the Columns
+    // dialog's Reset can undo every rearrangement rather than just the last.
+    column_source_order: Arc<Mutex<Vec<usize>>>,
+    // Value filters in force, newest last. Each narrows what the previous ones
+    // left, which is how clicking through cells behaves.
+    value_filters: Arc<Mutex<Vec<GridValueFilter>>>,
+    // Every fetched row, kept while a value filter hides some of them. `None`
+    // means nothing is filtered and `full_data` is already everything.
+    unfiltered_data: Arc<Mutex<Option<Vec<Vec<String>>>>>,
     active_inline_edit: Arc<Mutex<Option<ActiveInlineEdit>>>,
     streaming_in_progress: Arc<Mutex<bool>>,
     lazy_fetch_session: Arc<Mutex<Option<u64>>>,
@@ -368,6 +450,7 @@ pub struct ResultTableWidget {
     pending_lazy_actions: Arc<Mutex<VecDeque<(u64, LazyFetchPendingAction)>>>,
     pending_page_navigation: Arc<Mutex<Option<PendingPageNavigation>>>,
     context_action_callback: ResultTableContextActionCallback,
+    sort_state: Arc<Mutex<Option<ColumnSortState>>>,
     drag_state: Arc<Mutex<DragState>>,
     /// Cells the in-grid find is pointing at. Owned by the find dialog, which
     /// clears it when it closes; the grid only paints it.
@@ -399,9 +482,10 @@ struct DragState {
     vertical_scrollbar_sequence: bool,
     vertical_scrollbar_polling: bool,
     vertical_scrollbar_fetch_requested: bool,
-    /// A press that landed on a column header, so the rest of that pointer
-    /// sequence does not turn into a cell drag-selection.
-    header_press_col: Option<i32>,
+    header_sort_candidate_col: Option<i32>,
+    header_sort_requires_double_click: bool,
+    header_sort_start_x: i32,
+    header_sort_start_y: i32,
     last_selection: Option<(i32, i32, i32, i32)>,
     last_col_position: Option<i32>,
     shift_click_base_selection: Option<(i32, i32, i32, i32)>,
@@ -425,6 +509,27 @@ enum CanonicalJoinClass {
     WordLike,
     Dot,
     Symbolic,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum SortDirection {
+    Ascending,
+    Descending,
+}
+
+impl SortDirection {
+    fn toggled(self) -> Self {
+        match self {
+            Self::Ascending => Self::Descending,
+            Self::Descending => Self::Ascending,
+        }
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+struct ColumnSortState {
+    col_idx: usize,
+    direction: SortDirection,
 }
 
 #[derive(Clone)]
@@ -452,6 +557,7 @@ struct QueryEditBackupState {
     source_sql: String,
     edit_session: TableEditSession,
     result_edit_descriptor: Option<ResultEditDescriptor>,
+    sort_state: Option<ColumnSortState>,
 }
 
 struct EditModePreparation {
@@ -760,11 +866,229 @@ impl ResultTableWidget {
         is_original_null
     }
 
+    /// What a grid shows for SQL NULL until a session's `SET NULL` says
+    /// otherwise.
+    ///
+    /// Exported so a path with no grid to ask — the object browser's table
+    /// export — writes the same word the grid would have written.
+    pub(crate) const DEFAULT_NULL_TEXT: &'static str = "NULL";
+
     fn current_null_text(&self) -> String {
         self.null_text
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .clone()
+    }
+
+    fn current_sort_state(&self) -> Option<ColumnSortState> {
+        *self
+            .sort_state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    fn clear_sort_state(&self) {
+        *self
+            .sort_state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+    }
+
+    fn sort_marker_for_column(
+        sort_state: Option<ColumnSortState>,
+        col_idx: usize,
+    ) -> Option<&'static str> {
+        let state = sort_state?;
+        if state.col_idx != col_idx {
+            return None;
+        }
+        match state.direction {
+            SortDirection::Ascending => Some(SORT_ASC_MARK),
+            SortDirection::Descending => Some(SORT_DESC_MARK),
+        }
+    }
+
+    /// Where NULLs go on an ascending local sort until the connection that
+    /// produced the result says otherwise.
+    ///
+    /// This matches what the grid has always done — an empty cell compared as
+    /// text sorts ahead of everything — so a result installed by a path that
+    /// does not yet report its backend keeps its previous order rather than
+    /// silently flipping. See docs_items/item_list.md appendix B.2 defect 3.
+    const DEFAULT_SORT_NULL_ORDERING: NullOrdering = NullOrdering::FirstOnAscending;
+
+    /// Adopt the NULL ordering of the backend that produced this result, so a
+    /// locally sorted column lands where the server would have put it.
+    pub(crate) fn set_sort_null_ordering(&mut self, ordering: NullOrdering) {
+        *self
+            .sort_null_ordering
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = ordering;
+    }
+
+    /// Send header sorts to the server for a result that can be re-queried.
+    pub(crate) fn set_header_sort_redirect(&mut self, callback: HeaderSortRedirectCallback) {
+        let taken = callback
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take();
+        *self
+            .header_sort_redirect
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = taken;
+    }
+
+    /// Offer the sort to the server. Returns true when it was taken, in which
+    /// case the rows on screen are left alone — the re-query replaces them.
+    ///
+    /// Columns with no usable name (the hidden ROWID helper, or headers blanked
+    /// by `SET HEADING OFF`) cannot appear in an `ORDER BY`, so those keep
+    /// sorting locally.
+    fn try_redirect_header_sort(
+        headers: &Arc<Mutex<Vec<String>>>,
+        redirect: &HeaderSortRedirectCallback,
+        col_idx: usize,
+    ) -> bool {
+        let column = headers
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(col_idx)
+            .map(|name| name.trim().to_string())
+            .unwrap_or_default();
+        if column.is_empty() {
+            return false;
+        }
+        let mut guard = redirect
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        match guard.as_mut() {
+            Some(callback) => callback(column),
+            None => false,
+        }
+    }
+
+    fn sort_column_for(
+        column_kinds: &[SqlValueKind],
+        col_idx: usize,
+        nulls: NullOrdering,
+    ) -> SortColumn {
+        SortColumn {
+            kind: column_kinds.get(col_idx).copied().unwrap_or_default(),
+            nulls,
+        }
+    }
+
+    fn compare_row_values_for_sort(
+        left: &[String],
+        right: &[String],
+        col_idx: usize,
+        column: SortColumn,
+        null_text: &str,
+    ) -> std::cmp::Ordering {
+        let left_value = left.get(col_idx).map(|value| value.as_str()).unwrap_or("");
+        let right_value = right.get(col_idx).map(|value| value.as_str()).unwrap_or("");
+        compare_cell_values(
+            left_value,
+            Self::value_represents_null(left_value, null_text),
+            right_value,
+            Self::value_represents_null(right_value, null_text),
+            column,
+        )
+    }
+
+    fn sort_row_entries(
+        rows: &mut Vec<Vec<String>>,
+        row_states: Option<&mut Vec<EditRowState>>,
+        col_idx: usize,
+        direction: SortDirection,
+        column: SortColumn,
+        null_text: &str,
+    ) -> bool {
+        let compare = |left: &Vec<String>, right: &Vec<String>| {
+            let ordering =
+                Self::compare_row_values_for_sort(left, right, col_idx, column, null_text);
+            match direction {
+                SortDirection::Ascending => ordering,
+                SortDirection::Descending => ordering.reverse(),
+            }
+        };
+        match row_states {
+            Some(states) => {
+                if states.len() != rows.len() {
+                    return false;
+                }
+                let moved_rows = std::mem::take(rows);
+                let moved_states = std::mem::take(states);
+                let mut paired: Vec<(Vec<String>, EditRowState)> =
+                    moved_rows.into_iter().zip(moved_states).collect();
+                paired.sort_by(|(left, _), (right, _)| compare(left, right));
+                rows.reserve(paired.len());
+                states.reserve(paired.len());
+                for (row, state) in paired {
+                    rows.push(row);
+                    states.push(state);
+                }
+                true
+            }
+            None => {
+                rows.sort_by(compare);
+                true
+            }
+        }
+    }
+
+    fn apply_sort_to_table_data(
+        full_data: &Arc<Mutex<Vec<Vec<String>>>>,
+        edit_session: &Arc<Mutex<Option<TableEditSession>>>,
+        column_kinds: &Arc<Mutex<Vec<SqlValueKind>>>,
+        null_text: &Arc<Mutex<String>>,
+        sort_null_ordering: &Arc<Mutex<NullOrdering>>,
+        col_idx: usize,
+        direction: SortDirection,
+    ) -> bool {
+        let nulls = *sort_null_ordering
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let column = {
+            let kinds = column_kinds
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            Self::sort_column_for(&kinds, col_idx, nulls)
+        };
+        let null_text = null_text
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        let mut session_guard = edit_session
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut rows_guard = full_data
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let row_states = session_guard
+            .as_mut()
+            .map(|session| &mut session.row_states);
+        Self::sort_row_entries(
+            &mut rows_guard,
+            row_states,
+            col_idx,
+            direction,
+            column,
+            &null_text,
+        )
+    }
+
+    fn next_sort_state(current: Option<ColumnSortState>, col_idx: usize) -> ColumnSortState {
+        match current {
+            Some(state) if state.col_idx == col_idx => ColumnSortState {
+                col_idx,
+                direction: state.direction.toggled(),
+            },
+            _ => ColumnSortState {
+                col_idx,
+                direction: SortDirection::Ascending,
+            },
+        }
     }
 
     fn set_query_edit_backup(&self, backup: Option<QueryEditBackupState>) {
@@ -804,6 +1128,10 @@ impl ResultTableWidget {
             .result_edit_descriptor
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = backup.result_edit_descriptor;
+        *self
+            .sort_state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = backup.sort_state;
 
         let row_count = self
             .full_data
@@ -850,6 +1178,7 @@ impl ResultTableWidget {
             source_sql,
             edit_session,
             result_edit_descriptor,
+            sort_state: self.current_sort_state(),
         }));
     }
 
@@ -980,20 +1309,23 @@ impl ResultTableWidget {
             .cloned()
     }
 
-    fn visible_column_bounds(max_cols: usize, hidden_col: Option<usize>) -> Option<(usize, usize)> {
+    fn visible_column_bounds(
+        max_cols: usize,
+        hidden_col: &HiddenColumns,
+    ) -> Option<(usize, usize)> {
         if max_cols == 0 {
             return None;
         }
 
-        let first_visible = (0..max_cols).find(|col| Some(*col) != hidden_col)?;
-        let last_visible = (0..max_cols).rev().find(|col| Some(*col) != hidden_col)?;
+        let first_visible = (0..max_cols).find(|col| !hidden_col.contains(*col))?;
+        let last_visible = (0..max_cols).rev().find(|col| !hidden_col.contains(*col))?;
         Some((first_visible, last_visible))
     }
 
     fn nearest_visible_column(
         max_cols: usize,
         preferred_col: usize,
-        hidden_col: Option<usize>,
+        hidden_col: &HiddenColumns,
     ) -> Option<usize> {
         if max_cols == 0 {
             return None;
@@ -1001,15 +1333,15 @@ impl ResultTableWidget {
 
         let max_col = max_cols.saturating_sub(1);
         let clamped_col = preferred_col.min(max_col);
-        if Some(clamped_col) != hidden_col {
+        if !hidden_col.contains(clamped_col) {
             return Some(clamped_col);
         }
 
         (0..clamped_col)
             .rev()
-            .find(|col| Some(*col) != hidden_col)
+            .find(|col| !hidden_col.contains(*col))
             .or_else(|| {
-                (clamped_col.saturating_add(1)..max_cols).find(|col| Some(*col) != hidden_col)
+                (clamped_col.saturating_add(1)..max_cols).find(|col| !hidden_col.contains(*col))
             })
     }
 
@@ -1042,7 +1374,7 @@ impl ResultTableWidget {
         selection: (i32, i32, i32, i32),
         max_rows: usize,
         max_cols: usize,
-        hidden_col: Option<usize>,
+        hidden_col: &HiddenColumns,
         edge: ResultTableEdge,
         fallback_row: usize,
         fallback_col: usize,
@@ -1077,7 +1409,7 @@ impl ResultTableWidget {
         table: &mut Table,
         selection: (i32, i32, i32, i32),
         edge: ResultTableEdge,
-        hidden_col: Option<usize>,
+        hidden_col: &HiddenColumns,
         preserve_col_position: Option<i32>,
     ) -> bool {
         let rows = table.rows().max(0) as usize;
@@ -1114,7 +1446,7 @@ impl ResultTableWidget {
         true
     }
 
-    fn current_page_cell(table: &Table, hidden_col: Option<usize>) -> Option<(usize, usize)> {
+    fn current_page_cell(table: &Table, hidden_col: &HiddenColumns) -> Option<(usize, usize)> {
         let rows = table.rows().max(0) as usize;
         let cols = table.cols().max(0) as usize;
         if rows == 0 || cols == 0 {
@@ -1154,7 +1486,7 @@ impl ResultTableWidget {
     fn move_table_selection_to_row(
         table: &mut Table,
         target_row: usize,
-        hidden_col: Option<usize>,
+        hidden_col: &HiddenColumns,
     ) -> bool {
         let Some((_, target_col)) = Self::current_page_cell(table, hidden_col) else {
             return false;
@@ -1301,7 +1633,7 @@ impl ResultTableWidget {
         table: &mut Table,
         selection: (i32, i32, i32, i32),
         edge: ResultTableEdge,
-        hidden_col: Option<usize>,
+        hidden_col: &HiddenColumns,
         preserve_col_position: Option<i32>,
     ) -> Option<(i32, i32, i32, i32)> {
         let max_rows = table.rows().max(0) as usize;
@@ -1442,7 +1774,7 @@ impl ResultTableWidget {
         selection: (i32, i32, i32, i32),
         max_rows: usize,
         max_cols: usize,
-        hidden_col: Option<usize>,
+        hidden_col: &HiddenColumns,
         edge: ResultTableEdge,
     ) -> Option<(i32, i32, i32, i32)> {
         let (anchor_row, raw_anchor_col, focus_row, raw_focus_col) =
@@ -1502,7 +1834,7 @@ impl ResultTableWidget {
         selection: (i32, i32, i32, i32),
         max_rows: usize,
         max_cols: usize,
-        hidden_col: Option<usize>,
+        hidden_col: &HiddenColumns,
         edge: ResultTableEdge,
     ) -> Option<(usize, usize, usize, usize)> {
         let (mut row_start, mut col_start, mut row_end, mut col_end) =
@@ -1526,7 +1858,7 @@ impl ResultTableWidget {
         table: &mut Table,
         key: Key,
         original_key: Key,
-        hidden_col: Option<usize>,
+        hidden_col: &HiddenColumns,
         previous_selection: Option<(i32, i32, i32, i32)>,
         previous_col_position: Option<i32>,
         lazy_fetch_session: &Arc<Mutex<Option<u64>>>,
@@ -1575,7 +1907,7 @@ impl ResultTableWidget {
         table: &mut Table,
         key: Key,
         original_key: Key,
-        hidden_col: Option<usize>,
+        hidden_col: &HiddenColumns,
         previous_selection: Option<(i32, i32, i32, i32)>,
         previous_col_position: Option<i32>,
         drag_state: &Arc<Mutex<DragState>>,
@@ -1646,7 +1978,7 @@ impl ResultTableWidget {
         selection: (i32, i32, i32, i32),
         max_rows: usize,
         max_cols: usize,
-        hidden_col: Option<usize>,
+        hidden_col: &HiddenColumns,
     ) -> Option<(usize, usize, usize, usize)> {
         let (row_start, col_start, row_end, col_end) =
             Self::normalized_selection_bounds_with_limits(selection, max_rows, max_cols)?;
@@ -1661,7 +1993,7 @@ impl ResultTableWidget {
         Some((row_start, fallback_col, row_end, fallback_col))
     }
 
-    fn clamp_selection_to_visible_columns(table: &mut Table, hidden_col: Option<usize>) -> bool {
+    fn clamp_selection_to_visible_columns(table: &mut Table, hidden_col: &HiddenColumns) -> bool {
         let max_rows = table.rows().max(0) as usize;
         let max_cols = table.cols().max(0) as usize;
         let Some(current_bounds) = Self::normalized_selection_bounds_with_limits(
@@ -1697,7 +2029,7 @@ impl ResultTableWidget {
         selection: (i32, i32, i32, i32),
         max_rows: usize,
         max_cols: usize,
-        hidden_col: Option<usize>,
+        hidden_col: &HiddenColumns,
         key: Key,
     ) -> bool {
         if max_rows == 0 || max_cols == 0 {
@@ -1726,7 +2058,7 @@ impl ResultTableWidget {
         }
     }
 
-    fn should_consume_boundary_arrow(table: &Table, key: Key, hidden_col: Option<usize>) -> bool {
+    fn should_consume_boundary_arrow(table: &Table, key: Key, hidden_col: &HiddenColumns) -> bool {
         let rows = table.rows();
         let cols = table.cols();
         if rows <= 0 || cols <= 0 {
@@ -1747,23 +2079,28 @@ impl ResultTableWidget {
         current_selection: (i32, i32, i32, i32),
         max_rows: usize,
         max_cols: usize,
-        hidden_col: Option<usize>,
+        hidden_col: &HiddenColumns,
         key: Key,
         original_key: Key,
     ) -> Option<(usize, usize, usize, usize)> {
-        let hidden_col = hidden_col?;
+        if hidden_col.is_empty() {
+            return None;
+        }
         if Self::edge_for_arrow_key(key, original_key)? != ResultTableEdge::Left {
             return None;
         }
 
-        let (first_visible_col, _) = Self::visible_column_bounds(max_cols, Some(hidden_col))?;
-        if hidden_col >= first_visible_col {
-            return None;
-        }
+        let (first_visible_col, _) = Self::visible_column_bounds(max_cols, hidden_col)?;
+        // The hidden column immediately left of the first visible one is the
+        // boundary a Shift+Left has to stop at. With several hidden columns in
+        // a run, that is the rightmost of them.
+        let boundary_col = first_visible_col
+            .checked_sub(1)
+            .filter(|column| hidden_col.contains(*column))?;
 
         let current_raw_bounds =
             Self::normalized_selection_bounds_with_limits(current_selection, max_rows, max_cols)?;
-        if current_raw_bounds.1 > hidden_col {
+        if current_raw_bounds.1 > boundary_col {
             return None;
         }
 
@@ -1771,7 +2108,7 @@ impl ResultTableWidget {
             previous_selection?,
             max_rows,
             max_cols,
-            Some(hidden_col),
+            hidden_col,
         )?;
         if previous_bounds.1 > first_visible_col {
             return None;
@@ -1781,7 +2118,7 @@ impl ResultTableWidget {
             current_selection,
             max_rows,
             max_cols,
-            Some(hidden_col),
+            hidden_col,
         )?;
         if current_bounds.1 > first_visible_col {
             return None;
@@ -2051,9 +2388,11 @@ impl ResultTableWidget {
             RESULT_CELL_MAX_DISPLAY_CHARS_DEFAULT as usize,
         ));
         let row_number_offset = Arc::new(AtomicU64::new(0));
-        let null_text = Arc::new(Mutex::new("NULL".to_string()));
+        let null_text = Arc::new(Mutex::new(Self::DEFAULT_NULL_TEXT.to_string()));
         let column_kinds: Arc<Mutex<Vec<SqlValueKind>>> = Arc::new(Mutex::new(Vec::new()));
         let column_data_types: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let sort_null_ordering = Arc::new(Mutex::new(Self::DEFAULT_SORT_NULL_ORDERING));
+        let header_sort_redirect: HeaderSortRedirectCallback = Arc::new(Mutex::new(None));
         let source_sql = Arc::new(Mutex::new(String::new()));
         let streaming_source_sql = Arc::new(Mutex::new(String::new()));
         let execute_sql_callback: Arc<Mutex<Option<ResultGridSqlExecuteCallback>>> =
@@ -2072,6 +2411,11 @@ impl ResultTableWidget {
             Arc::new(Mutex::new(Vec::new()));
         let next_save_request_id = Arc::new(Mutex::new(1_u64));
         let hidden_auto_rowid_col: Arc<Mutex<Option<usize>>> = Arc::new(Mutex::new(None));
+        let filter_bar_present = Arc::new(AtomicBool::new(false));
+        let user_hidden_columns: Arc<Mutex<HashSet<usize>>> = Arc::new(Mutex::new(HashSet::new()));
+        let column_source_order: Arc<Mutex<Vec<usize>>> = Arc::new(Mutex::new(Vec::new()));
+        let value_filters: Arc<Mutex<Vec<GridValueFilter>>> = Arc::new(Mutex::new(Vec::new()));
+        let unfiltered_data: Arc<Mutex<Option<Vec<Vec<String>>>>> = Arc::new(Mutex::new(None));
         let active_inline_edit: Arc<Mutex<Option<ActiveInlineEdit>>> = Arc::new(Mutex::new(None));
         let streaming_in_progress: Arc<Mutex<bool>> = Arc::new(Mutex::new(false));
         let lazy_fetch_session: Arc<Mutex<Option<u64>>> = Arc::new(Mutex::new(None));
@@ -2081,6 +2425,7 @@ impl ResultTableWidget {
         let pending_lazy_actions: Arc<Mutex<VecDeque<(u64, LazyFetchPendingAction)>>> =
             Arc::new(Mutex::new(VecDeque::new()));
         let context_action_callback: ResultTableContextActionCallback = Arc::new(Mutex::new(None));
+        let sort_state: Arc<Mutex<Option<ColumnSortState>>> = Arc::new(Mutex::new(None));
         let drag_state = Arc::new(Mutex::new(DragState::default()));
         let search_highlight: Arc<Mutex<GridSearchHighlight>> =
             Arc::new(Mutex::new(GridSearchHighlight::default()));
@@ -2137,6 +2482,7 @@ impl ResultTableWidget {
         let max_cell_display_chars_for_draw = max_cell_display_chars_draw.clone();
         let row_number_offset_for_draw = row_number_offset.clone();
         let edit_session_for_draw = edit_session.clone();
+        let sort_state_for_draw = sort_state.clone();
         let search_highlight_for_draw = search_highlight.clone();
 
         table.draw_cell(move |_t, ctx, row, col, x, y, w, h| {
@@ -2152,6 +2498,8 @@ impl ResultTableWidget {
                     draw::draw_box(FrameType::FlatBox, x, y, w, h, header_bg);
                     draw::set_draw_color(header_fg);
                     draw::set_font(bold_font, font_size);
+                    let sort_snapshot =
+                        sort_state_for_draw.try_lock().ok().and_then(|guard| *guard);
                     if let Ok(hdrs) = headers_for_draw.try_lock() {
                         if let Some(text) = hdrs.get(col as usize) {
                             draw::draw_text2(
@@ -2162,6 +2510,18 @@ impl ResultTableWidget {
                                 h,
                                 Align::Left,
                             );
+                            if let Some(marker) =
+                                Self::sort_marker_for_column(sort_snapshot, col as usize)
+                            {
+                                draw::draw_text2(
+                                    marker,
+                                    x + TABLE_CELL_PADDING,
+                                    y,
+                                    w - TABLE_CELL_PADDING * 2,
+                                    h,
+                                    Align::Right,
+                                );
+                            }
                         }
                     }
                     draw::set_draw_color(border_color);
@@ -2326,6 +2686,10 @@ impl ResultTableWidget {
 
         let mut table_for_handle = table.clone();
         let full_data_for_handle = full_data.clone();
+        let column_kinds_for_handle = column_kinds.clone();
+        let null_text_for_handle = null_text.clone();
+        let sort_null_ordering_for_handle = sort_null_ordering.clone();
+        let header_sort_redirect_for_handle = header_sort_redirect.clone();
         let font_settings_for_handle = font_settings.clone();
         let source_sql_for_handle = source_sql.clone();
         let execute_sql_callback_for_handle = execute_sql_callback.clone();
@@ -2334,11 +2698,16 @@ impl ResultTableWidget {
         let hidden_auto_rowid_col_for_handle = hidden_auto_rowid_col.clone();
         let active_inline_edit_for_handle = active_inline_edit.clone();
         let active_inline_edit_for_resize = active_inline_edit.clone();
+        let sort_state_for_handle = sort_state.clone();
         let lazy_fetch_session_for_handle = lazy_fetch_session.clone();
         let lazy_fetch_callback_for_handle = lazy_fetch_callback.clone();
         let lazy_fetch_more_in_flight_for_handle = lazy_fetch_more_in_flight.clone();
         let pending_lazy_actions_for_handle = pending_lazy_actions.clone();
         let context_action_callback_for_handle = context_action_callback.clone();
+        let filter_bar_present_for_handle = filter_bar_present.clone();
+        let user_hidden_columns_for_handle = user_hidden_columns.clone();
+        let value_filters_for_handle = value_filters.clone();
+        let streaming_in_progress_for_handle = streaming_in_progress.clone();
         table.handle(move |_, ev| {
             if !table_for_handle.active() {
                 return false;
@@ -2410,6 +2779,7 @@ impl ResultTableWidget {
                             &headers_for_handle,
                             &full_data_for_handle,
                             &hidden_auto_rowid_col_for_handle,
+                            &user_hidden_columns_for_handle,
                             &source_sql_for_handle,
                             &execute_sql_callback_for_handle,
                             &edit_session_for_handle,
@@ -2419,6 +2789,9 @@ impl ResultTableWidget {
                             &lazy_fetch_callback_for_handle,
                             &pending_lazy_actions_for_handle,
                             &context_action_callback_for_handle,
+                            &filter_bar_present_for_handle,
+                            &value_filters_for_handle,
+                            &streaming_in_progress_for_handle,
                             &font_settings_for_handle,
                         );
                         return true;
@@ -2432,7 +2805,10 @@ impl ResultTableWidget {
                                 let mut state = drag_state_for_handle
                                     .lock()
                                     .unwrap_or_else(|poisoned| poisoned.into_inner());
-                                state.header_press_col = Some(col);
+                                state.header_sort_candidate_col = Some(col);
+                                state.header_sort_requires_double_click = app::event_clicks();
+                                state.header_sort_start_x = app::event_x();
+                                state.header_sort_start_y = app::event_y();
                                 state.is_dragging = false;
                                 state.consume_background_pointer_sequence = false;
                                 state.vertical_scrollbar_sequence = false;
@@ -2446,7 +2822,8 @@ impl ResultTableWidget {
                             let mut state = drag_state_for_handle
                                 .lock()
                                 .unwrap_or_else(|poisoned| poisoned.into_inner());
-                            state.header_press_col = None;
+                            state.header_sort_candidate_col = None;
+                            state.header_sort_requires_double_click = false;
                             state.consume_background_pointer_sequence = false;
                             state.vertical_scrollbar_sequence = false;
                             state.vertical_scrollbar_fetch_requested = false;
@@ -2592,7 +2969,10 @@ impl ResultTableWidget {
                         is_dragging,
                         consume_background_pointer_sequence,
                         vertical_scrollbar_sequence,
-                        header_press,
+                        header_sort_candidate,
+                        header_sort_requires_double_click,
+                        header_start_x,
+                        header_start_y,
                     ) = {
                         let state = drag_state_for_handle
                             .lock()
@@ -2601,7 +2981,10 @@ impl ResultTableWidget {
                             state.is_dragging,
                             state.consume_background_pointer_sequence,
                             state.vertical_scrollbar_sequence,
-                            state.header_press_col,
+                            state.header_sort_candidate_col,
+                            state.header_sort_requires_double_click,
+                            state.header_sort_start_x,
+                            state.header_sort_start_y,
                         )
                     };
                     if vertical_scrollbar_sequence {
@@ -2614,12 +2997,30 @@ impl ResultTableWidget {
                         );
                         return false;
                     }
-                    if header_press.is_some() {
-                        drag_state_for_handle
-                            .lock()
-                            .unwrap_or_else(|poisoned| poisoned.into_inner())
-                            .header_press_col = None;
-                        return true;
+                    if header_sort_candidate.is_some() {
+                        if !header_sort_requires_double_click {
+                            let mut state = drag_state_for_handle
+                                .lock()
+                                .unwrap_or_else(|poisoned| poisoned.into_inner());
+                            state.header_sort_candidate_col = None;
+                            return true;
+                        }
+                        let moved_beyond = Self::pointer_moved_beyond_tolerance(
+                            header_start_x,
+                            header_start_y,
+                            app::event_x(),
+                            app::event_y(),
+                            HEADER_SORT_CLICK_MOVE_TOLERANCE_PX,
+                        );
+                        if moved_beyond {
+                            let mut state = drag_state_for_handle
+                                .lock()
+                                .unwrap_or_else(|poisoned| poisoned.into_inner());
+                            state.header_sort_candidate_col = None;
+                            state.header_sort_requires_double_click = false;
+                        } else {
+                            return true;
+                        }
                     }
                     if consume_background_pointer_sequence {
                         return true;
@@ -2635,7 +3036,8 @@ impl ResultTableWidget {
                 }
                 Event::Released => {
                     let (
-                        header_press,
+                        header_sort_candidate,
+                        header_sort_requires_double_click,
                         was_dragging,
                         consumed_background_pointer_sequence,
                         vertical_scrollbar_sequence,
@@ -2645,7 +3047,9 @@ impl ResultTableWidget {
                         let mut state = drag_state_for_handle
                             .lock()
                             .unwrap_or_else(|poisoned| poisoned.into_inner());
-                        let header_press = state.header_press_col.take();
+                        let header_candidate = state.header_sort_candidate_col.take();
+                        let header_is_double_click = state.header_sort_requires_double_click;
+                        state.header_sort_requires_double_click = false;
                         let vertical_scrollbar_sequence = state.vertical_scrollbar_sequence;
                         let vertical_scrollbar_fetch_requested =
                             state.vertical_scrollbar_fetch_requested;
@@ -2661,7 +3065,8 @@ impl ResultTableWidget {
                             state.is_dragging = false;
                         }
                         (
-                            header_press,
+                            header_candidate,
+                            header_is_double_click,
                             dragging,
                             consumed_background,
                             vertical_scrollbar_sequence,
@@ -2680,10 +3085,58 @@ impl ResultTableWidget {
                         }
                         return false;
                     }
-                    // A press that started on a column header ends there: the
-                    // grid has no header action left, and it must not fall
-                    // through to the cell-selection paths below.
-                    if header_press.is_some() {
+                    if let Some(col) = header_sort_candidate {
+                        if col >= 0
+                            && header_sort_requires_double_click
+                            && Self::get_col_header_at_mouse(&table_for_handle) == Some(col)
+                            && Self::queue_lazy_action_if_active(
+                                &lazy_fetch_session_for_handle,
+                                &lazy_fetch_callback_for_handle,
+                                &pending_lazy_actions_for_handle,
+                                LazyFetchPendingAction::HeaderSort(col as usize),
+                            )
+                        {
+                            return true;
+                        }
+                        if col >= 0
+                            && header_sort_requires_double_click
+                            && Self::get_col_header_at_mouse(&table_for_handle) == Some(col)
+                            // Streaming append mutates full_data incrementally, so block
+                            // column sort until the result set is finalized.
+                            && !mutex_load_bool(&streaming_in_progress_for_handle)
+                        {
+                            let col_idx = col as usize;
+                            // The redirect owns its own direction; see
+                            // apply_header_sort_action.
+                            if Self::try_redirect_header_sort(
+                                &headers_for_handle,
+                                &header_sort_redirect_for_handle,
+                                col_idx,
+                            ) {
+                                return true;
+                            }
+                            let next_state = {
+                                let current = *sort_state_for_handle
+                                    .lock()
+                                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                                Self::next_sort_state(current, col_idx)
+                            };
+                            if Self::apply_sort_to_table_data(
+                                &full_data_for_handle,
+                                &edit_session_for_handle,
+                                &column_kinds_for_handle,
+                                &null_text_for_handle,
+                                &sort_null_ordering_for_handle,
+                                col_idx,
+                                next_state.direction,
+                            ) {
+                                *sort_state_for_handle
+                                    .lock()
+                                    .unwrap_or_else(|poisoned| poisoned.into_inner()) =
+                                    Some(next_state);
+                                table_for_handle.redraw();
+                            }
+                        }
                         return true;
                     }
                     if was_dragging || consumed_background_pointer_sequence {
@@ -2727,9 +3180,10 @@ impl ResultTableWidget {
                             Some(arrow) => (arrow, arrow),
                             None => (key, original_key),
                         };
-                        let hidden_col = *hidden_auto_rowid_col_for_handle
-                            .lock()
-                            .unwrap_or_else(|poisoned| poisoned.into_inner());
+                        let hidden_col = Self::hidden_columns_from(
+                            &hidden_auto_rowid_col_for_handle,
+                            &user_hidden_columns_for_handle,
+                        );
                         let (previous_selection, previous_col_position) = {
                             let state = drag_state_for_handle
                                 .lock()
@@ -2741,7 +3195,7 @@ impl ResultTableWidget {
                                 &mut table_for_handle,
                                 nav_key,
                                 nav_original_key,
-                                hidden_col,
+                                &hidden_col,
                                 previous_selection,
                                 previous_col_position,
                                 &drag_state_for_handle,
@@ -2754,7 +3208,7 @@ impl ResultTableWidget {
                                 &mut table_for_handle,
                                 nav_key,
                                 nav_original_key,
-                                hidden_col,
+                                &hidden_col,
                                 previous_selection,
                                 previous_col_position,
                                 &lazy_fetch_session_for_handle,
@@ -2796,9 +3250,10 @@ impl ResultTableWidget {
                     }
 
                     if matches!(key, Key::Left | Key::Right | Key::Up | Key::Down) {
-                        let hidden_col = *hidden_auto_rowid_col_for_handle
-                            .lock()
-                            .unwrap_or_else(|poisoned| poisoned.into_inner());
+                        let hidden_col = Self::hidden_columns_from(
+                            &hidden_auto_rowid_col_for_handle,
+                            &user_hidden_columns_for_handle,
+                        );
                         if shift && !ctrl_or_cmd {
                             let previous_selection = drag_state_for_handle
                                 .lock()
@@ -2811,7 +3266,7 @@ impl ResultTableWidget {
                                 table_for_handle.get_selection(),
                                 max_rows,
                                 max_cols,
-                                hidden_col,
+                                &hidden_col,
                                 key,
                                 original_key,
                             ) {
@@ -2830,7 +3285,7 @@ impl ResultTableWidget {
                         }
                         if Self::clamp_selection_to_visible_columns(
                             &mut table_for_handle,
-                            hidden_col,
+                            &hidden_col,
                         ) {
                             Self::sync_drag_selection_snapshot(
                                 &table_for_handle,
@@ -2846,7 +3301,7 @@ impl ResultTableWidget {
                         return Self::should_consume_boundary_arrow(
                             &table_for_handle,
                             key,
-                            hidden_col,
+                            &hidden_col,
                         );
                     }
 
@@ -2874,9 +3329,10 @@ impl ResultTableWidget {
                                 &table_for_handle,
                                 &headers_for_handle,
                                 &full_data_for_handle,
-                                *hidden_auto_rowid_col_for_handle
-                                    .lock()
-                                    .unwrap_or_else(|poisoned| poisoned.into_inner()),
+                                &Self::hidden_columns_from(
+                                    &hidden_auto_rowid_col_for_handle,
+                                    &user_hidden_columns_for_handle,
+                                ),
                             );
                             return true;
                         }
@@ -2905,9 +3361,10 @@ impl ResultTableWidget {
                             Self::copy_selected_to_clipboard(
                                 &table_for_handle,
                                 &full_data_for_handle,
-                                *hidden_auto_rowid_col_for_handle
-                                    .lock()
-                                    .unwrap_or_else(|poisoned| poisoned.into_inner()),
+                                &Self::hidden_columns_from(
+                                    &hidden_auto_rowid_col_for_handle,
+                                    &user_hidden_columns_for_handle,
+                                ),
                             );
                             return true;
                         }
@@ -2975,9 +3432,10 @@ impl ResultTableWidget {
                             Some(arrow) => (arrow, arrow),
                             None => (key, original_key),
                         };
-                        let hidden_col = *hidden_auto_rowid_col_for_handle
-                            .lock()
-                            .unwrap_or_else(|poisoned| poisoned.into_inner());
+                        let hidden_col = Self::hidden_columns_from(
+                            &hidden_auto_rowid_col_for_handle,
+                            &user_hidden_columns_for_handle,
+                        );
                         let (previous_selection, previous_col_position) = {
                             let state = drag_state_for_handle
                                 .lock()
@@ -2989,7 +3447,7 @@ impl ResultTableWidget {
                                 &mut table_for_handle,
                                 nav_key,
                                 nav_original_key,
-                                hidden_col,
+                                &hidden_col,
                                 previous_selection,
                                 previous_col_position,
                                 &drag_state_for_handle,
@@ -3002,7 +3460,7 @@ impl ResultTableWidget {
                                 &mut table_for_handle,
                                 nav_key,
                                 nav_original_key,
-                                hidden_col,
+                                &hidden_col,
                                 previous_selection,
                                 previous_col_position,
                                 &lazy_fetch_session_for_handle,
@@ -3026,9 +3484,10 @@ impl ResultTableWidget {
                             &table_for_handle,
                             &headers_for_handle,
                             &full_data_for_handle,
-                            *hidden_auto_rowid_col_for_handle
-                                .lock()
-                                .unwrap_or_else(|poisoned| poisoned.into_inner()),
+                            &Self::hidden_columns_from(
+                                &hidden_auto_rowid_col_for_handle,
+                                &user_hidden_columns_for_handle,
+                            ),
                         );
                         return true;
                     }
@@ -3054,9 +3513,10 @@ impl ResultTableWidget {
                         Self::copy_selected_to_clipboard(
                             &table_for_handle,
                             &full_data_for_handle,
-                            *hidden_auto_rowid_col_for_handle
-                                .lock()
-                                .unwrap_or_else(|poisoned| poisoned.into_inner()),
+                            &Self::hidden_columns_from(
+                                &hidden_auto_rowid_col_for_handle,
+                                &user_hidden_columns_for_handle,
+                            ),
                         );
                         return true;
                     }
@@ -3141,6 +3601,8 @@ impl ResultTableWidget {
             headers,
             column_kinds,
             column_data_types,
+            sort_null_ordering,
+            header_sort_redirect,
             pending_rows: Arc::new(Mutex::new(Vec::new())),
             pending_widths: Arc::new(Mutex::new(Vec::new())),
             last_flush_epoch_ms: Arc::new(Mutex::new(Self::current_epoch_millis())),
@@ -3164,6 +3626,11 @@ impl ResultTableWidget {
             pending_save_statement_signatures,
             next_save_request_id,
             hidden_auto_rowid_col,
+            filter_bar_present,
+            user_hidden_columns,
+            column_source_order,
+            value_filters,
+            unfiltered_data,
             active_inline_edit,
             streaming_in_progress,
             lazy_fetch_session,
@@ -3172,6 +3639,7 @@ impl ResultTableWidget {
             pending_lazy_actions,
             pending_page_navigation: Arc::new(Mutex::new(None)),
             context_action_callback,
+            sort_state,
             drag_state,
             search_highlight,
             data_generation,
@@ -3682,7 +4150,7 @@ impl ResultTableWidget {
     /// adds (a value the user never sees).
     fn value_window_target_cell(
         table: &Table,
-        hidden_col: Option<usize>,
+        hidden_col: &HiddenColumns,
         context_cell: Option<(usize, usize)>,
     ) -> Option<(usize, usize)> {
         // The cell the user pointed at wins over the selection's corner. Right
@@ -3699,7 +4167,7 @@ impl ResultTableWidget {
                 (row_start, col_start)
             }
         };
-        if Some(col) != hidden_col {
+        if !hidden_col.contains(col) {
             return Some((row, col));
         }
         let max_cols = table.cols().max(0) as usize;
@@ -3742,7 +4210,7 @@ impl ResultTableWidget {
         full_data: &Arc<Mutex<Vec<Vec<String>>>>,
         edit_session: &Arc<Mutex<Option<TableEditSession>>>,
         pending_save_request: &Arc<Mutex<bool>>,
-        hidden_col: Option<usize>,
+        hidden_col: &HiddenColumns,
         context_cell: Option<(usize, usize)>,
         font_profile: FontProfile,
         font_size: u32,
@@ -4551,6 +5019,18 @@ impl ResultTableWidget {
         }
     }
 
+    fn pointer_moved_beyond_tolerance(
+        start_x: i32,
+        start_y: i32,
+        current_x: i32,
+        current_y: i32,
+        tolerance_px: u32,
+    ) -> bool {
+        start_x.abs_diff(current_x) > tolerance_px || start_y.abs_diff(current_y) > tolerance_px
+    }
+
+    /// Returns `true` when the mouse position falls inside one of the FLTK
+    /// Table's embedded scrollbar widgets (vertical or horizontal).
     fn is_mouse_on_table_scrollbar(table: &Table, mouse_x: i32, mouse_y: i32) -> bool {
         if Self::is_mouse_on_vertical_table_scrollbar(table, mouse_x, mouse_y) {
             return true;
@@ -4990,9 +5470,9 @@ impl ResultTableWidget {
         None
     }
 
-    fn has_visible_table_columns(table: &Table, hidden_col: Option<usize>) -> bool {
+    fn has_visible_table_columns(table: &Table, hidden_col: &HiddenColumns) -> bool {
         let cols = table.cols().max(0) as usize;
-        (0..cols).any(|col| Some(col) != hidden_col)
+        (0..cols).any(|col| !hidden_col.contains(col))
     }
 
     fn is_mouse_inside_table_body(table: &Table, mouse_x: i32, mouse_y: i32) -> bool {
@@ -5593,6 +6073,56 @@ impl ResultTableWidget {
         Some(rowid_col)
     }
 
+    /// Every column this grid is not drawing.
+    ///
+    /// Callers want both reasons at once, so they ask this rather than the two
+    /// fields; forgetting one of them at a call site is what this prevents.
+    fn hidden_columns(&self) -> HiddenColumns {
+        Self::hidden_columns_from(&self.hidden_auto_rowid_col, &self.user_hidden_columns)
+    }
+
+    /// The hidden set with the technical column replaced, for the moment
+    /// during a refresh when the field does not hold the new value yet.
+    fn hidden_columns_with_auto(&self, auto: Option<usize>) -> HiddenColumns {
+        HiddenColumns::new(
+            auto,
+            self.user_hidden_columns
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .clone(),
+        )
+    }
+
+    /// The menu-building form of [`Self::column_layout_refusal`].
+    ///
+    /// The context menu is built from the shared handles rather than `&self`,
+    /// and the two must agree — an item that appears and then refuses is the
+    /// thing this codebase tries not to ship.
+    fn columns_can_be_arranged(
+        streaming_in_progress: &Arc<Mutex<bool>>,
+        edit_session: &Arc<Mutex<Option<TableEditSession>>>,
+        pending_save_request: &Arc<Mutex<bool>>,
+    ) -> bool {
+        !mutex_load_bool(streaming_in_progress)
+            && !mutex_load_bool(pending_save_request)
+            && edit_session
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .is_none()
+    }
+
+    fn hidden_columns_from(
+        auto: &Arc<Mutex<Option<usize>>>,
+        user: &Arc<Mutex<HashSet<usize>>>,
+    ) -> HiddenColumns {
+        let auto = *auto.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let user = user
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        HiddenColumns::new(auto, user)
+    }
+
     fn hidden_auto_rowid_col_value(&self) -> Option<usize> {
         *self
             .hidden_auto_rowid_col
@@ -5601,13 +6131,10 @@ impl ResultTableWidget {
     }
 
     fn apply_hidden_rowid_column_width(&mut self) {
-        let Some(hidden_col) = self.hidden_auto_rowid_col_value() else {
-            return;
-        };
-        if hidden_col >= self.table.cols().max(0) as usize {
-            return;
-        }
-        self.table.set_col_width(hidden_col as i32, 0);
+        // Every hidden column, not only the technical one: a width recalculation
+        // gives them all a real width back, and user-hidden columns have to lose
+        // it again at the same moment.
+        self.apply_hidden_column_widths();
     }
 
     fn refresh_table_layout_geometry(&mut self) {
@@ -5672,7 +6199,8 @@ impl ResultTableWidget {
         let previous_hidden_col = self.hidden_auto_rowid_col_value();
         if previous_hidden_col == next_hidden_col {
             self.apply_hidden_rowid_column_width();
-            Self::clamp_selection_to_visible_columns(&mut self.table, next_hidden_col);
+            let hidden = self.hidden_columns_with_auto(next_hidden_col);
+            Self::clamp_selection_to_visible_columns(&mut self.table, &hidden);
             self.sync_table_viewport_state();
             return;
         }
@@ -5686,33 +6214,34 @@ impl ResultTableWidget {
             self.recalculate_widths_for_current_font();
         }
         self.apply_hidden_rowid_column_width();
-        Self::clamp_selection_to_visible_columns(&mut self.table, next_hidden_col);
+        let hidden = self.hidden_columns_with_auto(next_hidden_col);
+        Self::clamp_selection_to_visible_columns(&mut self.table, &hidden);
         self.sync_table_viewport_state();
     }
 
     fn visible_column_indices_in_range(
         col_left: usize,
         col_right: usize,
-        hidden_col: Option<usize>,
+        hidden_col: &HiddenColumns,
     ) -> Vec<usize> {
         (col_left..=col_right)
-            .filter(|col| Some(*col) != hidden_col)
+            .filter(|col| !hidden_col.contains(*col))
             .collect()
     }
 
-    fn visible_headers(headers: &[String], hidden_col: Option<usize>) -> Vec<String> {
+    fn visible_headers(headers: &[String], hidden_col: &HiddenColumns) -> Vec<String> {
         headers
             .iter()
             .enumerate()
-            .filter(|(idx, _)| Some(*idx) != hidden_col)
+            .filter(|(idx, _)| !hidden_col.contains(*idx))
             .map(|(_, header)| header.clone())
             .collect()
     }
 
-    fn visible_row_values_internal(row: &[String], hidden_col: Option<usize>) -> Vec<String> {
+    fn visible_row_values_internal(row: &[String], hidden_col: &HiddenColumns) -> Vec<String> {
         row.iter()
             .enumerate()
-            .filter(|(idx, _)| Some(*idx) != hidden_col)
+            .filter(|(idx, _)| !hidden_col.contains(*idx))
             .map(|(_, value)| value.clone())
             .collect()
     }
@@ -6324,6 +6853,14 @@ impl ResultTableWidget {
             return false;
         }
         if self.is_streaming_in_progress() {
+            return false;
+        }
+        // A value filter hides rows, and an edit session pairs its per-row
+        // state with the rows on screen. Editing a filtered view and then
+        // clearing the filter would leave that pairing pointing at the wrong
+        // rows, so the two are kept apart from both directions — the filter
+        // refuses while editing, and editing refuses while filtered.
+        if self.value_filter_is_active() {
             return false;
         }
 
@@ -7455,10 +7992,11 @@ impl ResultTableWidget {
     fn selection_context_menu(
         table: &Table,
         headers: &Arc<Mutex<Vec<String>>>,
-        hidden_col: Option<usize>,
+        hidden_col: &HiddenColumns,
         edit_session: &Arc<Mutex<Option<TableEditSession>>>,
         pending_save_request: &Arc<Mutex<bool>>,
         context_cell: Option<(usize, usize)>,
+        value_filter_offer: ValueFilterMenuOffer,
         anchor_x: i32,
         anchor_y: i32,
     ) -> MenuButton {
@@ -7546,6 +8084,16 @@ impl ResultTableWidget {
             menu_items.push("SQL Inserts");
             menu_items.push("SQL Updates");
             menu_items.push("Where Clause");
+            if value_filter_offer.can_filter {
+                menu_items.push(FILTER_BY_VALUE_ITEM);
+                menu_items.push(EXCLUDE_VALUE_ITEM);
+            }
+        }
+        if value_filter_offer.is_filtered {
+            menu_items.push(CLEAR_VALUE_FILTER_ITEM);
+        }
+        if value_filter_offer.can_arrange_columns {
+            menu_items.push(COLUMNS_ITEM);
         }
         if can_set_null {
             menu_items.push("Set Null");
@@ -7563,6 +8111,7 @@ impl ResultTableWidget {
         headers: &Arc<Mutex<Vec<String>>>,
         full_data: &Arc<Mutex<Vec<Vec<String>>>>,
         hidden_auto_rowid_col: &Arc<Mutex<Option<usize>>>,
+        user_hidden_columns: &Arc<Mutex<HashSet<usize>>>,
         _source_sql: &Arc<Mutex<String>>,
         _execute_sql_callback: &Arc<Mutex<Option<ResultGridSqlExecuteCallback>>>,
         edit_session: &Arc<Mutex<Option<TableEditSession>>>,
@@ -7572,15 +8121,17 @@ impl ResultTableWidget {
         lazy_fetch_callback: &LazyFetchCallback,
         pending_lazy_actions: &Arc<Mutex<VecDeque<(u64, LazyFetchPendingAction)>>>,
         context_action_callback: &ResultTableContextActionCallback,
+        filter_bar_present: &Arc<AtomicBool>,
+        value_filters: &Arc<Mutex<Vec<GridValueFilter>>>,
+        streaming_in_progress: &Arc<Mutex<bool>>,
         font_settings: &Arc<SharedFontSettings>,
     ) {
         let mouse_x = app::event_x();
         let mouse_y = app::event_y();
 
         let mut table = table.clone();
-        let hidden_col_for_hit = *hidden_auto_rowid_col
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let hidden_col_for_hit =
+            Self::hidden_columns_from(hidden_auto_rowid_col, user_hidden_columns);
         let clicked_cell = Self::get_cell_at_mouse(&table);
         let clicked_row_header = if clicked_cell.is_none() {
             Self::get_row_header_at_mouse(&table)
@@ -7596,7 +8147,7 @@ impl ResultTableWidget {
             && clicked_row_header.is_none()
             && clicked_col_header.is_none()
             && table.rows() <= 0
-            && Self::has_visible_table_columns(&table, hidden_col_for_hit)
+            && Self::has_visible_table_columns(&table, &hidden_col_for_hit)
             && Self::is_mouse_inside_table_body(&table, mouse_x, mouse_y);
 
         if !Self::should_show_context_menu_for_hit(
@@ -7639,10 +8190,24 @@ impl ResultTableWidget {
         let menu = Self::selection_context_menu(
             &table,
             headers,
-            hidden_col_for_hit,
+            &hidden_col_for_hit,
             edit_session,
             pending_save_request,
             context_cell,
+            ValueFilterMenuOffer {
+                // The `WHERE` bar and the local filter are alternatives, never
+                // both: a grid that can re-query filters on the server.
+                can_filter: !filter_bar_present.load(Ordering::Acquire),
+                is_filtered: !value_filters
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .is_empty(),
+                can_arrange_columns: Self::columns_can_be_arranged(
+                    streaming_in_progress,
+                    edit_session,
+                    pending_save_request,
+                ),
+            },
             mouse_x,
             mouse_y,
         );
@@ -7652,10 +8217,10 @@ impl ResultTableWidget {
             let choice_label = choice.label().unwrap_or_default();
             match choice_label.as_str() {
                 "Copy" => {
-                    Self::copy_selected_to_clipboard(&table, full_data, hidden_col);
+                    Self::copy_selected_to_clipboard(&table, full_data, &hidden_col);
                 }
                 "Copy with Headers" => {
-                    Self::copy_selected_with_headers(&table, headers, full_data, hidden_col);
+                    Self::copy_selected_with_headers(&table, headers, full_data, &hidden_col);
                 }
                 "Copy All" => {
                     if Self::queue_lazy_action_if_active(
@@ -7666,7 +8231,7 @@ impl ResultTableWidget {
                     ) {
                         return;
                     }
-                    Self::copy_all_to_clipboard(headers, full_data, hidden_col);
+                    Self::copy_all_to_clipboard(headers, full_data, &hidden_col);
                 }
                 "Export Results (Ctrl+E)" => {
                     Self::schedule_context_action_callback(
@@ -7692,6 +8257,30 @@ impl ResultTableWidget {
                         ResultTableContextAction::CopyWhereClause,
                     );
                 }
+                FILTER_BY_VALUE_ITEM => {
+                    Self::schedule_context_action_callback(
+                        context_action_callback,
+                        ResultTableContextAction::FilterByValue { negate: false },
+                    );
+                }
+                EXCLUDE_VALUE_ITEM => {
+                    Self::schedule_context_action_callback(
+                        context_action_callback,
+                        ResultTableContextAction::FilterByValue { negate: true },
+                    );
+                }
+                CLEAR_VALUE_FILTER_ITEM => {
+                    Self::schedule_context_action_callback(
+                        context_action_callback,
+                        ResultTableContextAction::ClearValueFilter,
+                    );
+                }
+                COLUMNS_ITEM => {
+                    Self::schedule_context_action_callback(
+                        context_action_callback,
+                        ResultTableContextAction::ArrangeColumns,
+                    );
+                }
                 VALUE_WINDOW_VIEW_ITEM | VALUE_WINDOW_EDIT_ITEM => {
                     Self::open_cell_value_window(
                         &table,
@@ -7699,7 +8288,7 @@ impl ResultTableWidget {
                         full_data,
                         edit_session,
                         pending_save_request,
-                        hidden_col,
+                        &hidden_col,
                         context_cell,
                         font_settings.profile(),
                         font_settings.size(),
@@ -7728,7 +8317,7 @@ impl ResultTableWidget {
     fn copy_selected_to_clipboard(
         table: &Table,
         full_data: &Arc<Mutex<Vec<Vec<String>>>>,
-        hidden_col: Option<usize>,
+        hidden_col: &HiddenColumns,
     ) -> usize {
         let Some((row_top, col_left, row_bot, col_right)) =
             Self::normalized_selection_bounds_with_limits(
@@ -7777,7 +8366,7 @@ impl ResultTableWidget {
         table: &Table,
         headers: &Arc<Mutex<Vec<String>>>,
         full_data: &Arc<Mutex<Vec<Vec<String>>>>,
-        hidden_col: Option<usize>,
+        hidden_col: &HiddenColumns,
     ) -> usize {
         let Some((row_top, col_left, row_bot, col_right)) =
             Self::normalized_selection_bounds_with_limits(
@@ -7842,7 +8431,7 @@ impl ResultTableWidget {
     fn copy_all_to_clipboard(
         headers: &Arc<Mutex<Vec<String>>>,
         full_data: &Arc<Mutex<Vec<Vec<String>>>>,
-        hidden_col: Option<usize>,
+        hidden_col: &HiddenColumns,
     ) {
         let header_values = {
             let headers = headers
@@ -8033,6 +8622,7 @@ impl ResultTableWidget {
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
         }
+        self.clear_sort_state();
         let finished_sql = if result.is_select {
             result.sql.clone()
         } else {
@@ -8263,6 +8853,12 @@ impl ResultTableWidget {
 
     pub fn start_streaming(&mut self, headers: &[String]) {
         self.invalidate_search_for_new_data();
+        // A value filter belongs to the rows it was built from. The row set is
+        // about to be replaced, so the filter goes with it rather than hiding
+        // rows of the new result by the old result's values.
+        self.reset_value_filter_state();
+        // Same for the column arrangement: these are different columns.
+        self.reset_column_layout_state(headers.len());
         // The previous result's declared types must not survive into this one.
         // Callers reinstall `column_kinds` right after this, but the declared
         // types arrive later (with the terminal summary), so without this a new
@@ -8332,6 +8928,7 @@ impl ResultTableWidget {
             self.set_query_edit_backup(None);
             Self::clear_active_inline_edit_widget(&self.active_inline_edit);
         }
+        self.clear_sort_state();
 
         *self
             .edit_session
@@ -8619,9 +9216,9 @@ impl ResultTableWidget {
     }
 
     fn apply_pending_page_navigation(&mut self, pending: PendingPageNavigation) -> bool {
-        let hidden_col = self.hidden_auto_rowid_col_value();
+        let hidden_col = self.hidden_columns();
         let moved =
-            Self::move_table_selection_to_row(&mut self.table, pending.target_row, hidden_col);
+            Self::move_table_selection_to_row(&mut self.table, pending.target_row, &hidden_col);
         if moved {
             Self::sync_drag_selection_snapshot(&self.table, &self.drag_state);
         }
@@ -8630,14 +9227,14 @@ impl ResultTableWidget {
 
     pub(crate) fn page_first(&mut self) -> ResultPageNavigationOutcome {
         self.clear_pending_page_navigation();
-        let hidden_col = self.hidden_auto_rowid_col_value();
+        let hidden_col = self.hidden_columns();
         let selection = self.table.get_selection();
         let col_position = Some(self.table.col_position());
         if Self::move_table_selection_to_edge_from_selection(
             &mut self.table,
             selection,
             ResultTableEdge::Up,
-            hidden_col,
+            &hidden_col,
             col_position,
         ) {
             Self::sync_drag_selection_snapshot(&self.table, &self.drag_state);
@@ -8649,12 +9246,12 @@ impl ResultTableWidget {
 
     pub(crate) fn page_previous(&mut self, unit: usize) -> ResultPageNavigationOutcome {
         self.clear_pending_page_navigation();
-        let hidden_col = self.hidden_auto_rowid_col_value();
-        let Some((current_row, _)) = Self::current_page_cell(&self.table, hidden_col) else {
+        let hidden_col = self.hidden_columns();
+        let Some((current_row, _)) = Self::current_page_cell(&self.table, &hidden_col) else {
             return ResultPageNavigationOutcome::NoChange;
         };
         let target_row = Self::page_target_row(current_row, unit.max(1), false);
-        if Self::move_table_selection_to_row(&mut self.table, target_row, hidden_col) {
+        if Self::move_table_selection_to_row(&mut self.table, target_row, &hidden_col) {
             Self::sync_drag_selection_snapshot(&self.table, &self.drag_state);
             ResultPageNavigationOutcome::Moved
         } else {
@@ -8663,8 +9260,8 @@ impl ResultTableWidget {
     }
 
     pub(crate) fn page_next(&mut self, unit: usize) -> ResultPageNavigationOutcome {
-        let hidden_col = self.hidden_auto_rowid_col_value();
-        let Some((current_row, _)) = Self::current_page_cell(&self.table, hidden_col) else {
+        let hidden_col = self.hidden_columns();
+        let Some((current_row, _)) = Self::current_page_cell(&self.table, &hidden_col) else {
             return ResultPageNavigationOutcome::NoChange;
         };
         let loaded_rows = self.table.rows().max(0) as usize;
@@ -8672,7 +9269,7 @@ impl ResultTableWidget {
         let target_row = Self::page_target_row(current_row, unit, true);
         if target_row < loaded_rows {
             self.clear_pending_page_navigation();
-            if Self::move_table_selection_to_row(&mut self.table, target_row, hidden_col) {
+            if Self::move_table_selection_to_row(&mut self.table, target_row, &hidden_col) {
                 Self::sync_drag_selection_snapshot(&self.table, &self.drag_state);
                 return ResultPageNavigationOutcome::Moved;
             }
@@ -8687,7 +9284,7 @@ impl ResultTableWidget {
             if Self::move_table_selection_to_row(
                 &mut self.table,
                 loaded_rows.saturating_sub(1),
-                hidden_col,
+                &hidden_col,
             ) {
                 Self::sync_drag_selection_snapshot(&self.table, &self.drag_state);
                 return ResultPageNavigationOutcome::Moved;
@@ -8719,7 +9316,7 @@ impl ResultTableWidget {
         let moved_to_loaded_end = Self::move_table_selection_to_row(
             &mut self.table,
             loaded_rows.saturating_sub(1),
-            hidden_col,
+            &hidden_col,
         );
         if moved_to_loaded_end {
             Self::sync_drag_selection_snapshot(&self.table, &self.drag_state);
@@ -8752,8 +9349,8 @@ impl ResultTableWidget {
     }
 
     pub(crate) fn page_last(&mut self) -> ResultPageNavigationOutcome {
-        let hidden_col = self.hidden_auto_rowid_col_value();
-        if Self::current_page_cell(&self.table, hidden_col).is_none() {
+        let hidden_col = self.hidden_columns();
+        if Self::current_page_cell(&self.table, &hidden_col).is_none() {
             self.clear_pending_page_navigation();
             return ResultPageNavigationOutcome::NoChange;
         }
@@ -8769,7 +9366,7 @@ impl ResultTableWidget {
             &mut self.table,
             selection,
             ResultTableEdge::Down,
-            hidden_col,
+            &hidden_col,
             col_position,
         );
         if moved {
@@ -8918,6 +9515,37 @@ impl ResultTableWidget {
         )
     }
 
+    fn apply_header_sort_action(&mut self, col_idx: usize) {
+        let next_state = {
+            let current = *self
+                .sort_state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            Self::next_sort_state(current, col_idx)
+        };
+        // The redirect decides its own direction: it cycles the ORDER BY it
+        // owns, which the user can also type into, and the local sort state
+        // this reads is never advanced while sorting happens on the server.
+        if Self::try_redirect_header_sort(&self.headers, &self.header_sort_redirect, col_idx) {
+            return;
+        }
+        if Self::apply_sort_to_table_data(
+            &self.full_data,
+            &self.edit_session,
+            &self.column_kinds,
+            &self.null_text,
+            &self.sort_null_ordering,
+            col_idx,
+            next_state.direction,
+        ) {
+            *self
+                .sort_state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(next_state);
+            self.table.redraw();
+        }
+    }
+
     fn clear_pending_lazy_actions_for_session(&self, session_id: u64) {
         let mut guard = self
             .pending_lazy_actions
@@ -8946,26 +9574,32 @@ impl ResultTableWidget {
         };
         for action in actions {
             match action {
+                LazyFetchPendingAction::HeaderSort(col_idx) => {
+                    self.apply_header_sort_action(col_idx)
+                }
                 LazyFetchPendingAction::CopyAll => {
-                    let hidden_col = self.hidden_auto_rowid_col_value();
-                    Self::copy_all_to_clipboard(&self.headers, &self.full_data, hidden_col);
+                    let hidden_col = self.hidden_columns();
+                    Self::copy_all_to_clipboard(&self.headers, &self.full_data, &hidden_col);
                 }
                 LazyFetchPendingAction::SelectAll => self.select_all(),
+                LazyFetchPendingAction::ValueFilter(filter, mut report) => {
+                    report(self.install_value_filter(filter));
+                }
                 LazyFetchPendingAction::MoveToEdge { edge, selection } => {
-                    let hidden_col = self.hidden_auto_rowid_col_value();
+                    let hidden_col = self.hidden_columns();
                     let selection = selection.unwrap_or_else(|| self.table.get_selection());
                     let col_position = Some(self.table.col_position());
                     Self::move_table_selection_to_edge_from_selection(
                         &mut self.table,
                         selection,
                         edge,
-                        hidden_col,
+                        &hidden_col,
                         col_position,
                     );
                     Self::sync_drag_selection_snapshot(&self.table, &self.drag_state);
                 }
                 LazyFetchPendingAction::ExtendSelectionToEdge { edge, selection } => {
-                    let hidden_col = self.hidden_auto_rowid_col_value();
+                    let hidden_col = self.hidden_columns();
                     let selection = selection.unwrap_or_else(|| self.table.get_selection());
                     let col_position = Some(self.table.col_position());
                     if let Some(next_selection) =
@@ -8973,7 +9607,7 @@ impl ResultTableWidget {
                             &mut self.table,
                             selection,
                             edge,
-                            hidden_col,
+                            &hidden_col,
                             col_position,
                         )
                     {
@@ -9053,9 +9687,11 @@ impl ResultTableWidget {
     #[allow(dead_code)]
     pub fn clear(&mut self) {
         self.invalidate_search_for_new_data();
+        self.reset_value_filter_state();
         self.clear_lazy_fetch_state_for_abort();
         Self::clear_active_inline_edit_widget(&self.active_inline_edit);
         self.set_query_edit_backup(None);
+        self.clear_sort_state();
         *self
             .edit_session
             .lock()
@@ -9141,11 +9777,12 @@ impl ResultTableWidget {
         else {
             return 0;
         };
-        let hidden_col = self.hidden_auto_rowid_col_value();
-        let count = Self::copy_selected_to_clipboard(&self.table, &self.full_data, hidden_col);
+        let hidden_col = self.hidden_columns();
+        let count = Self::copy_selected_to_clipboard(&self.table, &self.full_data, &hidden_col);
         if count > 0 {
             let rows = row_bot - row_top + 1;
-            let cols = Self::visible_column_indices_in_range(col_left, col_right, hidden_col).len();
+            let cols =
+                Self::visible_column_indices_in_range(col_left, col_right, &hidden_col).len();
             println!("Copied {} cells ({} rows x {} cols)", count, rows, cols);
         }
         count
@@ -9156,7 +9793,7 @@ impl ResultTableWidget {
             &self.table,
             &self.headers,
             &self.full_data,
-            self.hidden_auto_rowid_col_value(),
+            &self.hidden_columns(),
         );
     }
 
@@ -9212,8 +9849,8 @@ impl ResultTableWidget {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         let rows = row_bot - row_top + 1;
-        let hidden_col = self.hidden_auto_rowid_col_value();
-        let visible_cols = Self::visible_column_indices_in_range(col_left, col_right, hidden_col);
+        let hidden_col = self.hidden_columns();
+        let visible_cols = Self::visible_column_indices_in_range(col_left, col_right, &hidden_col);
         if visible_cols.is_empty() {
             return None;
         }
@@ -9246,7 +9883,7 @@ impl ResultTableWidget {
     /// gets, so only the hidden auto-ROWID column is dropped. Generated SQL
     /// needs legal column names and keeps the stricter rule.
     fn export_grid_snapshot(&self, scope: ExportScope) -> ExportGrid {
-        let hidden_col = self.hidden_auto_rowid_col_value();
+        let hidden_col = self.hidden_columns();
         let headers = self
             .headers
             .lock()
@@ -9272,7 +9909,7 @@ impl ResultTableWidget {
             ExportScope::All => (
                 0..full_data.len(),
                 (0..headers.len())
-                    .filter(|col| Some(*col) != hidden_col)
+                    .filter(|col| !hidden_col.contains(*col))
                     .collect(),
             ),
             ExportScope::Selection => {
@@ -9287,7 +9924,7 @@ impl ResultTableWidget {
                 };
                 (
                     row_top..row_bot + 1,
-                    Self::visible_column_indices_in_range(col_left, col_right, hidden_col),
+                    Self::visible_column_indices_in_range(col_left, col_right, &hidden_col),
                 )
             }
         };
@@ -9344,6 +9981,397 @@ impl ResultTableWidget {
         self.export_after_fetch_all(ExportRequest::csv_file(), callback)
     }
 
+    /// Describe the current column arrangement for the Columns dialog.
+    ///
+    /// `source_index` is where each column sat when the result arrived, which
+    /// is what lets Reset undo a rearrangement made on an earlier visit rather
+    /// than only the one being made now.
+    pub(crate) fn column_layout_plan(&self) -> Result<ColumnLayoutPlan, String> {
+        if let Some(reason) = self.column_layout_refusal() {
+            return Err(reason);
+        }
+        let headers = self
+            .headers
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        if headers.is_empty() {
+            return Err("This result has no columns to arrange.".to_string());
+        }
+        let hidden = self.hidden_columns();
+        let source_order = self.column_source_order_snapshot(headers.len());
+        let rows = headers
+            .iter()
+            .enumerate()
+            .map(|(index, name)| ColumnLayoutRow {
+                grid_index: index,
+                source_index: source_order.get(index).copied().unwrap_or(index),
+                name: name.clone(),
+                visible: !hidden.contains(index),
+                // The technical column belongs to the grid, not the user: it is
+                // not listed, and it keeps its index while the rest move.
+                locked: hidden.automatic_column() == Some(index),
+            })
+            .collect();
+        Ok(ColumnLayoutPlan::from_rows(rows))
+    }
+
+    /// Why the column arrangement cannot change right now, if it cannot.
+    ///
+    /// Both refusals name something else that is holding column indexes.
+    /// Rearranging underneath a staged edit would move the columns its per-cell
+    /// state is paired with, and rearranging mid-stream would leave arriving
+    /// rows in the old order.
+    fn column_layout_refusal(&self) -> Option<String> {
+        if self.is_streaming_in_progress() {
+            return Some(
+                "Wait for the result to finish loading before rearranging its columns.".to_string(),
+            );
+        }
+        if self.is_save_pending() || self.is_edit_mode_enabled() {
+            return Some(
+                "Turn Edit off before rearranging columns: staged edits are held against the \
+                 columns on screen."
+                    .to_string(),
+            );
+        }
+        None
+    }
+
+    fn column_source_order_snapshot(&self, len: usize) -> Vec<usize> {
+        let mut order = self
+            .column_source_order
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if order.len() != len {
+            *order = (0..len).collect();
+        }
+        order.clone()
+    }
+
+    /// Rearrange and re-hide the grid's columns to match `plan`.
+    ///
+    /// The columns are physically permuted rather than mapped, which is what
+    /// keeps "display column" and "data column" the same integer for the draw
+    /// callback, every hit test, the keyboard navigation helpers and the export
+    /// paths — none of which learn anything new here.
+    pub(crate) fn apply_column_layout(&mut self, plan: &ColumnLayoutPlan) -> Result<(), String> {
+        if let Some(reason) = self.column_layout_refusal() {
+            return Err(reason);
+        }
+        let order = plan.order();
+        let column_count = self
+            .headers
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .len();
+        if !crate::ui::column_layout::is_permutation(&order, column_count) {
+            return Err("The result's columns changed while the dialog was open.".to_string());
+        }
+
+        // Widths are read back from the table so a column keeps the width the
+        // user dragged it to when it moves.
+        let mut widths: Vec<i32> = (0..column_count)
+            .map(|index| self.table.col_width(index as i32))
+            .collect();
+
+        {
+            let mut headers = self
+                .headers
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let mut kinds = self
+                .column_kinds
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let mut types = self
+                .column_data_types
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let mut rows = self
+                .full_data
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let mut backup = self
+                .unfiltered_data
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let mut source_order = self
+                .column_source_order
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+
+            crate::ui::column_layout::permute(&mut headers, &order);
+            // The parallel lists are allowed to be empty ("unknown"); permuting
+            // one of the wrong length would be a silent mis-pairing, so the
+            // helper refuses and leaves it alone.
+            crate::ui::column_layout::permute(&mut kinds, &order);
+            crate::ui::column_layout::permute(&mut types, &order);
+            crate::ui::column_layout::permute(&mut widths, &order);
+            for row in rows.iter_mut() {
+                crate::ui::column_layout::permute(row, &order);
+            }
+            // The value filter's backup holds the same columns, so it moves too
+            // or clearing the filter would put the old order back.
+            if let Some(backup_rows) = backup.as_mut() {
+                for row in backup_rows.iter_mut() {
+                    crate::ui::column_layout::permute(row, &order);
+                }
+            }
+            if source_order.len() == column_count {
+                crate::ui::column_layout::permute(&mut source_order, &order);
+            }
+        }
+
+        *self
+            .user_hidden_columns
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = plan.hidden_positions();
+
+        self.invalidate_search_for_new_data();
+        self.table.set_selection(-1, -1, -1, -1);
+        for (index, width) in widths.iter().enumerate() {
+            self.table.set_col_width(index as i32, *width);
+        }
+        self.apply_hidden_column_widths();
+        self.sync_table_viewport_state();
+        self.table.redraw();
+        Ok(())
+    }
+
+    /// Give every hidden column zero width, which is how the grid has always
+    /// hidden its technical column.
+    fn apply_hidden_column_widths(&mut self) {
+        let hidden = self.hidden_columns();
+        let cols = self.table.cols().max(0) as usize;
+        for column in hidden.all() {
+            if column < cols {
+                self.table.set_col_width(column as i32, 0);
+            }
+        }
+    }
+
+    /// Say whether this grid's tab carries a `WHERE` / `ORDER BY` bar.
+    ///
+    /// The context menu reads it to decide which of the two filtering
+    /// mechanisms to offer; they are never offered together.
+    pub(crate) fn set_filter_bar_present(&self, present: bool) {
+        self.filter_bar_present.store(present, Ordering::Release);
+    }
+
+    /// Whether any value filter is hiding rows right now.
+    pub(crate) fn value_filter_is_active(&self) -> bool {
+        !self
+            .value_filters
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .is_empty()
+    }
+
+    /// Why this grid cannot take a value filter, if it cannot.
+    ///
+    /// Filtering swaps the row vector the grid draws from, and both refusals
+    /// below name something else that is holding row indexes at the same time.
+    /// Refusing is the honest answer: silently filtering around a staged edit
+    /// would move the row it belongs to.
+    fn value_filter_refusal(&self) -> Option<String> {
+        if self.is_streaming_in_progress() {
+            return Some("Wait for the result to finish loading before filtering it.".to_string());
+        }
+        if self.is_edit_mode_enabled() {
+            return Some(
+                "Turn Edit off before filtering: a value filter hides rows, and staged edits are \
+                 held against the rows on screen."
+                    .to_string(),
+            );
+        }
+        None
+    }
+
+    /// Build a filter from the current selection without applying it.
+    ///
+    /// Built now rather than after any pending fetch so the values it pins are
+    /// the ones the user actually pointed at.
+    pub(crate) fn value_filter_from_selection(
+        &self,
+        negate: bool,
+    ) -> Result<GridValueFilter, String> {
+        if let Some(reason) = self.value_filter_refusal() {
+            return Err(reason);
+        }
+        let rows = self
+            .full_data
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let bounds = Self::normalized_selection_bounds_with_limits(
+            self.table.get_selection(),
+            rows.len(),
+            self.table.cols().max(0) as usize,
+        )
+        .ok_or_else(|| "Select the cells to filter by first.".to_string())?;
+        crate::ui::grid_value_filter::build(
+            &rows,
+            bounds,
+            &self.hidden_columns(),
+            &self.current_null_text(),
+            negate,
+        )
+        .ok_or_else(|| "That selection holds nothing to filter by.".to_string())
+    }
+
+    /// Apply `filter`, first fetching the rest of the rows when a lazy fetch is
+    /// still open. Returns `None` when the work was deferred; `report` then runs
+    /// once the fetch completes.
+    pub(crate) fn apply_value_filter_after_fetch_all(
+        &mut self,
+        filter: GridValueFilter,
+        report: Box<dyn FnMut(Result<ValueFilterOutcome, String>)>,
+    ) -> Option<Result<ValueFilterOutcome, String>> {
+        // Ask whether a fetch is open *before* handing the filter to the queue:
+        // the queue takes the action by value and drops it when there is no
+        // session, so offering it first would lose the filter and silently do
+        // nothing — which is the common case, since most results are fully
+        // fetched by the time anyone right-clicks one.
+        if self.active_lazy_fetch_session().is_some()
+            && self.queue_action_after_fetch_all(LazyFetchPendingAction::ValueFilter(
+                filter.clone(),
+                report,
+            ))
+        {
+            return None;
+        }
+        Some(self.install_value_filter(filter))
+    }
+
+    /// Put every filtered-out row back. Returns false when nothing was hidden.
+    pub(crate) fn clear_value_filter(&mut self) -> bool {
+        let restored = self
+            .unfiltered_data
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take();
+        self.value_filters
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clear();
+        let Some(rows) = restored else {
+            return false;
+        };
+        self.replace_visible_rows(rows);
+        true
+    }
+
+    /// Drop any value filter without restoring rows, for a grid whose contents
+    /// are being replaced wholesale anyway.
+    /// Forget any rearrangement and start the new result in its arrival order.
+    fn reset_column_layout_state(&self, column_count: usize) {
+        self.user_hidden_columns
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clear();
+        *self
+            .column_source_order
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = (0..column_count).collect();
+    }
+
+    fn reset_value_filter_state(&self) {
+        self.value_filters
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clear();
+        *self
+            .unfiltered_data
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+    }
+
+    fn install_value_filter(
+        &mut self,
+        filter: GridValueFilter,
+    ) -> Result<ValueFilterOutcome, String> {
+        if let Some(reason) = self.value_filter_refusal() {
+            return Err(reason);
+        }
+        {
+            // The first filter saves the full row set; later ones narrow what
+            // is already on screen, so clicking through cells keeps narrowing
+            // instead of starting over.
+            let mut backup = self
+                .unfiltered_data
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if backup.is_none() {
+                *backup = Some(
+                    self.full_data
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .clone(),
+                );
+            }
+        }
+
+        let kept = {
+            let rows = self
+                .full_data
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            filter.retain(&rows)
+        };
+        self.value_filters
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .push(filter);
+
+        let kept_rows = kept.len();
+        self.replace_visible_rows(kept);
+        let total_rows = self
+            .unfiltered_data
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .as_ref()
+            .map_or(kept_rows, Vec::len);
+        Ok(ValueFilterOutcome {
+            description: self.describe_value_filters(),
+            kept_rows,
+            total_rows,
+        })
+    }
+
+    /// One line naming every filter in force, oldest first.
+    pub(crate) fn describe_value_filters(&self) -> String {
+        let headers = self
+            .headers
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        self.value_filters
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .iter()
+            .map(|filter| filter.describe(&headers))
+            .collect::<Vec<_>>()
+            .join(" \u{b7} ")
+    }
+
+    /// Swap the rows the grid draws, leaving the columns alone.
+    ///
+    /// Everything keyed to a row index is invalidated here rather than at each
+    /// call site: the search highlight holds coordinates, and the selection
+    /// summary is memoized against the row generation.
+    fn replace_visible_rows(&mut self, rows: Vec<Vec<String>>) {
+        self.invalidate_search_for_new_data();
+        let row_count = rows.len();
+        *self
+            .full_data
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = rows;
+        self.table.set_selection(-1, -1, -1, -1);
+        self.set_table_rows_for_current_font(i32::try_from(row_count).unwrap_or(i32::MAX));
+        self.sync_table_viewport_state();
+        self.table.redraw();
+    }
+
     /// Render the grid in `request`'s format, fetching the rest of the rows
     /// first when the export covers the whole result and a lazy fetch is still
     /// open. Returns `None` when the render was deferred; the callback then
@@ -9373,43 +10401,36 @@ impl ResultTableWidget {
 
     fn current_export_snapshot(&self, request: &ExportRequest) -> (String, usize) {
         let (text, row_count) = self.render_export(request);
-        let prelude = match request.destination {
-            ExportDestination::File => request.format.file_byte_order_mark(),
-            ExportDestination::Clipboard => "",
-        };
-        if prelude.is_empty() {
-            (text, row_count)
-        } else {
-            (format!("{prelude}{text}"), row_count)
-        }
+        (
+            crate::ui::result_export::with_destination_prelude(
+                request.format,
+                request.destination,
+                text,
+            ),
+            row_count,
+        )
     }
 
     fn render_export(&self, request: &ExportRequest) -> (String, usize) {
-        match request.format {
-            ExportFormat::SqlInserts => {
-                let Some(db_type) = request.db_type else {
-                    return (String::new(), 0);
-                };
-                let selection = match request.scope {
-                    ExportScope::All => self.sql_export_all_rows(db_type, request.table.clone()),
-                    ExportScope::Selection => {
-                        self.sql_export_selection(db_type, request.table.clone())
-                    }
-                };
-                match selection {
-                    Some(selection) => (
-                        crate::ui::grid_sql_export::build_sql_inserts(&selection),
-                        selection.rows.len(),
-                    ),
-                    None => (String::new(), 0),
-                }
-            }
-            format => {
-                let grid = self.export_grid_snapshot(request.scope);
-                let row_count = grid.rows.len();
-                (crate::ui::result_export::render(format, &grid), row_count)
-            }
+        // The two snapshots are built separately and only one is ever taken:
+        // both copy every exported row, and a large `SQL Inserts` export should
+        // not also materialize a grid snapshot it will not read.
+        if matches!(request.format, ExportFormat::SqlInserts) {
+            let sql_selection = request.db_type.and_then(|db_type| match request.scope {
+                ExportScope::All => self.sql_export_all_rows(db_type, request.table.clone()),
+                ExportScope::Selection => self.sql_export_selection(db_type, request.table.clone()),
+            });
+            return crate::ui::result_export::render_export_content(
+                request.format,
+                &ExportGrid::default(),
+                sql_selection.as_ref(),
+            );
         }
+        crate::ui::result_export::render_export_content(
+            request.format,
+            &self.export_grid_snapshot(request.scope),
+            None,
+        )
     }
 
     /// Escape a cell for tab-separated clipboard output so spreadsheet apps
@@ -9437,7 +10458,7 @@ impl ResultTableWidget {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .clone();
-        Self::visible_headers(&headers, self.hidden_auto_rowid_col_value())
+        Self::visible_headers(&headers, &self.hidden_columns())
     }
 
     fn result_column_kinds(result: &QueryResult) -> Vec<SqlValueKind> {
@@ -9463,10 +10484,10 @@ impl ResultTableWidget {
     fn is_internal_export_column(
         headers: &[String],
         index: usize,
-        hidden_col: Option<usize>,
+        hidden_col: &HiddenColumns,
         rowid_col: Option<usize>,
     ) -> bool {
-        if Some(index) == hidden_col || Some(index) == rowid_col {
+        if hidden_col.contains(index) || Some(index) == rowid_col {
             return true;
         }
         let Some(name) = headers.get(index) else {
@@ -9485,7 +10506,7 @@ impl ResultTableWidget {
     fn selection_has_exportable_columns(
         table: &Table,
         headers: &Arc<Mutex<Vec<String>>>,
-        hidden_col: Option<usize>,
+        hidden_col: &HiddenColumns,
     ) -> bool {
         let headers = headers
             .lock()
@@ -9569,7 +10590,7 @@ impl ResultTableWidget {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .clone();
-        let hidden_col = self.hidden_auto_rowid_col_value();
+        let hidden_col = self.hidden_columns();
         let rowid_col = Self::find_rowid_column_index(&headers);
         let kinds = self
             .column_kinds
@@ -9592,7 +10613,7 @@ impl ResultTableWidget {
         let mut column_kinds: Vec<SqlValueKind> = Vec::with_capacity(headers.len());
         let mut source_indices: Vec<usize> = Vec::with_capacity(headers.len());
         for index in 0..headers.len() {
-            if Self::is_internal_export_column(&headers, index, hidden_col, rowid_col) {
+            if Self::is_internal_export_column(&headers, index, &hidden_col, rowid_col) {
                 continue;
             }
             all_columns.push(headers[index].clone());
@@ -9685,15 +10706,27 @@ impl ResultTableWidget {
         let menu = Self::selection_context_menu(
             &self.table,
             &self.headers,
-            self.hidden_auto_rowid_col_value(),
+            &self.hidden_columns(),
             &self.edit_session,
             &self.pending_save_request,
             None,
+            ValueFilterMenuOffer {
+                can_filter: !self.filter_bar_present.load(Ordering::Acquire),
+                is_filtered: self.value_filter_is_active(),
+                can_arrange_columns: self.column_layout_refusal().is_none(),
+            },
             cell_x + safe_div(cell_w, 2),
             cell_y + cell_h,
         );
         menu.popup();
         Ok(())
+    }
+
+    /// Sort one column locally, the way a header trigger does, for the capture
+    /// tour.
+    #[doc(hidden)]
+    pub fn capture_tour_sort_column(&mut self, column: usize) {
+        self.apply_header_sort_action(column);
     }
 
     /// Record the statement now feeding this grid. Called right after
@@ -9763,9 +10796,7 @@ impl ResultTableWidget {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .get(row)
-            .map(|row_values| {
-                Self::visible_row_values_internal(row_values, self.hidden_auto_rowid_col_value())
-            })
+            .map(|row_values| Self::visible_row_values_internal(row_values, &self.hidden_columns()))
     }
 
     /// How many times these rows have been replaced. See `data_generation`.
@@ -9784,12 +10815,12 @@ impl ResultTableWidget {
     /// Nothing is sent to the server: this is the data the grid already holds,
     /// full values rather than the truncated text a cell draws.
     pub(crate) fn search_matches(&self, needle: &str, case_sensitive: bool) -> Vec<(usize, usize)> {
-        let hidden_col = self.hidden_auto_rowid_col_value();
+        let hidden_col = self.hidden_columns();
         let data = self
             .full_data
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        grid_matches(&data, needle, case_sensitive, hidden_col)
+        grid_matches(&data, needle, case_sensitive, &hidden_col)
     }
 
     /// The cell a fresh search starts from — the top-left of the selection.
@@ -9834,12 +10865,7 @@ impl ResultTableWidget {
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .clone();
             cache.summary = bounds.and_then(|bounds| {
-                summarize_selection(
-                    &rows,
-                    bounds,
-                    self.hidden_auto_rowid_col_value(),
-                    &null_text,
-                )
+                summarize_selection(&rows, bounds, &self.hidden_columns(), &null_text)
             });
             cache.key = Some(key);
         }
@@ -10047,6 +11073,7 @@ impl ResultTableWidget {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
         self.set_query_edit_backup(None);
+        self.clear_sort_state();
         Self::clear_active_inline_edit_widget(&self.active_inline_edit);
 
         // Clear callbacks to release captured Arc<Mutex<T>> references.
@@ -10189,7 +11216,12 @@ mod row_edit_sql_tests {
         let rowid_col = ResultTableWidget::find_rowid_column_index(&headers);
         let internal: Vec<bool> = (0..headers.len())
             .map(|index| {
-                ResultTableWidget::is_internal_export_column(&headers, index, None, rowid_col)
+                ResultTableWidget::is_internal_export_column(
+                    &headers,
+                    index,
+                    &HiddenColumns::default(),
+                    rowid_col,
+                )
             })
             .collect();
         assert_eq!(internal, vec![true, false, true, true, true]);
@@ -10201,10 +11233,16 @@ mod row_edit_sql_tests {
         // `INSERT INTO t ("", "")`.
         let headers = vec![String::new(), "  ".to_string()];
         assert!(ResultTableWidget::is_internal_export_column(
-            &headers, 0, None, None
+            &headers,
+            0,
+            &HiddenColumns::default(),
+            None
         ));
         assert!(ResultTableWidget::is_internal_export_column(
-            &headers, 1, None, None
+            &headers,
+            1,
+            &HiddenColumns::default(),
+            None
         ));
     }
 
@@ -10215,13 +11253,13 @@ mod row_edit_sql_tests {
         assert!(ResultTableWidget::is_internal_export_column(
             &headers,
             0,
-            Some(0),
+            &HiddenColumns::automatic(Some(0)),
             None
         ));
         assert!(!ResultTableWidget::is_internal_export_column(
             &headers,
             1,
-            Some(0),
+            &HiddenColumns::automatic(Some(0)),
             None
         ));
     }
@@ -10230,7 +11268,10 @@ mod row_edit_sql_tests {
     fn quoted_internal_column_headers_are_still_excluded() {
         let headers = vec![format!("\"{}\"", RESULT_EDIT_SNAPSHOT_COLUMN)];
         assert!(ResultTableWidget::is_internal_export_column(
-            &headers, 0, None, None
+            &headers,
+            0,
+            &HiddenColumns::default(),
+            None
         ));
     }
 
@@ -10238,7 +11279,10 @@ mod row_edit_sql_tests {
     fn out_of_range_export_column_is_treated_as_internal() {
         let headers = vec!["ENAME".to_string()];
         assert!(ResultTableWidget::is_internal_export_column(
-            &headers, 5, None, None
+            &headers,
+            5,
+            &HiddenColumns::default(),
+            None
         ));
     }
 
@@ -10510,10 +11554,13 @@ mod row_edit_sql_tests {
     #[test]
     fn visible_column_bounds_skip_hidden_rowid_column() {
         assert_eq!(
-            ResultTableWidget::visible_column_bounds(4, Some(0)),
+            ResultTableWidget::visible_column_bounds(4, &HiddenColumns::automatic(Some(0))),
             Some((1, 3))
         );
-        assert_eq!(ResultTableWidget::visible_column_bounds(1, Some(0)), None);
+        assert_eq!(
+            ResultTableWidget::visible_column_bounds(1, &HiddenColumns::automatic(Some(0))),
+            None
+        );
     }
 
     #[test]
@@ -10523,7 +11570,7 @@ mod row_edit_sql_tests {
                 (0, 0, 0, 0),
                 3,
                 4,
-                Some(0)
+                &HiddenColumns::automatic(Some(0))
             ),
             Some((0, 1, 0, 1))
         );
@@ -10536,7 +11583,7 @@ mod row_edit_sql_tests {
                 (1, 0, 1, 3),
                 4,
                 4,
-                Some(0)
+                &HiddenColumns::automatic(Some(0))
             ),
             Some((1, 1, 1, 3))
         );
@@ -10565,7 +11612,7 @@ mod row_edit_sql_tests {
                 (5, 2, 7, 2),
                 10,
                 4,
-                None,
+                &HiddenColumns::default(),
                 ResultTableEdge::Up,
             ),
             Some((5, 2, 0, 2))
@@ -10579,7 +11626,7 @@ mod row_edit_sql_tests {
                 (5, 2, 0, 2),
                 10,
                 4,
-                None,
+                &HiddenColumns::default(),
                 ResultTableEdge::Down,
             ),
             Some((5, 2, 9, 2))
@@ -10592,7 +11639,7 @@ mod row_edit_sql_tests {
             (2, 1, 2, 1),
             10,
             4,
-            None,
+            &HiddenColumns::default(),
             ResultTableEdge::Down,
         );
         assert_eq!(after_down, Some((2, 1, 9, 1)));
@@ -10601,7 +11648,7 @@ mod row_edit_sql_tests {
             after_down.unwrap(),
             10,
             4,
-            None,
+            &HiddenColumns::default(),
             ResultTableEdge::Up,
         );
         assert_eq!(after_up, Some((2, 1, 0, 1)));
@@ -10611,7 +11658,7 @@ mod row_edit_sql_tests {
                 after_up.unwrap(),
                 10,
                 4,
-                None,
+                &HiddenColumns::default(),
                 ResultTableEdge::Down,
             ),
             Some((2, 1, 9, 1))
@@ -10649,7 +11696,7 @@ mod row_edit_sql_tests {
                 (5, 3, 7, 1),
                 10,
                 4,
-                None,
+                &HiddenColumns::default(),
                 ResultTableEdge::Down,
             ),
             Some((5, 3, 9, 1))
@@ -10663,7 +11710,7 @@ mod row_edit_sql_tests {
                 (5, 0, 5, 0),
                 10,
                 4,
-                Some(0),
+                &HiddenColumns::automatic(Some(0)),
                 ResultTableEdge::Down,
             ),
             Some((5, 1, 9, 1))
@@ -10678,7 +11725,7 @@ mod row_edit_sql_tests {
                 (5, 0, 5, 0),
                 8,
                 4,
-                Some(0),
+                &HiddenColumns::automatic(Some(0)),
                 Key::Left,
                 Key::Left,
             ),
@@ -10694,7 +11741,7 @@ mod row_edit_sql_tests {
                 (2, 1, 5, 2),
                 8,
                 4,
-                Some(0),
+                &HiddenColumns::automatic(Some(0)),
                 Key::Left,
                 Key::Left,
             ),
@@ -10710,7 +11757,7 @@ mod row_edit_sql_tests {
                 (2, 1, 5, 3),
                 8,
                 4,
-                Some(0),
+                &HiddenColumns::automatic(Some(0)),
                 Key::Left,
                 Key::Left,
             ),
@@ -10725,7 +11772,7 @@ mod row_edit_sql_tests {
                 (0, 1, 0, 1),
                 3,
                 4,
-                Some(0),
+                &HiddenColumns::automatic(Some(0)),
                 Key::Left,
             )
         );
@@ -10734,7 +11781,7 @@ mod row_edit_sql_tests {
                 (0, 1, 0, 1),
                 3,
                 4,
-                Some(0),
+                &HiddenColumns::automatic(Some(0)),
                 Key::Right,
             )
         );
@@ -10747,7 +11794,7 @@ mod row_edit_sql_tests {
                 (2, 3, 2, 3),
                 5,
                 4,
-                Some(0),
+                &HiddenColumns::automatic(Some(0)),
                 ResultTableEdge::Left,
                 0,
                 0,
@@ -10763,7 +11810,7 @@ mod row_edit_sql_tests {
                 (2, 0, 2, 0),
                 6,
                 4,
-                Some(0),
+                &HiddenColumns::automatic(Some(0)),
                 ResultTableEdge::Down,
                 0,
                 0,
@@ -10779,7 +11826,7 @@ mod row_edit_sql_tests {
                 (2, 3, 4, 3),
                 6,
                 4,
-                Some(0),
+                &HiddenColumns::automatic(Some(0)),
                 ResultTableEdge::Left,
             ),
             Some((2, 1, 4, 3))
@@ -10793,7 +11840,7 @@ mod row_edit_sql_tests {
                 (2, 1, 4, 2),
                 8,
                 4,
-                Some(0),
+                &HiddenColumns::automatic(Some(0)),
                 ResultTableEdge::Down,
             ),
             Some((2, 1, 7, 2))
@@ -12244,6 +13291,7 @@ UPDATE EMP SET ENAME = 'X' WHERE ROWID = 'AAABBB';"
             source_sql: "SELECT ROWID, ENAME FROM EMP".to_string(),
             edit_session: backup_session,
             result_edit_descriptor: None,
+            sort_state: None,
         }));
 
         *widget
@@ -13290,6 +14338,7 @@ UPDATE EMP SET ENAME = 'MILLER' WHERE ROWID = 'AAABBB';"
                 }],
             },
             result_edit_descriptor: None,
+            sort_state: None,
         }));
 
         assert!(!widget.clear_orphaned_query_edit_backup());
@@ -14150,6 +15199,7 @@ UPDATE EMP SET ENAME = 'MILLER' WHERE ROWID = 'AAABBB';"
                 }],
             },
             result_edit_descriptor: None,
+            sort_state: None,
         }));
 
         let headers = vec!["DEPTNO".to_string(), "DNAME".to_string()];
@@ -14658,6 +15708,7 @@ UPDATE EMP SET ENAME = 'MILLER' WHERE ROWID = 'AAABBB';"
                 row_states: Vec::new(),
             },
             result_edit_descriptor: None,
+            sort_state: None,
         }));
 
         let result = widget.cancel_edit_mode();
@@ -14701,6 +15752,7 @@ UPDATE EMP SET ENAME = 'MILLER' WHERE ROWID = 'AAABBB';"
                 row_states: Vec::new(),
             },
             result_edit_descriptor: None,
+            sort_state: None,
         }));
 
         let result = widget.cancel_edit_mode();
@@ -15825,6 +16877,286 @@ mod tests {
         }
         assert!(ResultTableWidget::edit_session_has_staged_changes(
             &nulled, &rows
+        ));
+    }
+
+    #[test]
+    fn sort_marker_for_column_reflects_sort_direction() {
+        let asc = Some(ColumnSortState {
+            col_idx: 1,
+            direction: SortDirection::Ascending,
+        });
+        let desc = Some(ColumnSortState {
+            col_idx: 1,
+            direction: SortDirection::Descending,
+        });
+        assert_eq!(
+            ResultTableWidget::sort_marker_for_column(asc, 1),
+            Some(SORT_ASC_MARK)
+        );
+        assert_eq!(
+            ResultTableWidget::sort_marker_for_column(desc, 1),
+            Some(SORT_DESC_MARK)
+        );
+        assert_eq!(ResultTableWidget::sort_marker_for_column(desc, 0), None);
+        assert_eq!(ResultTableWidget::sort_marker_for_column(None, 1), None);
+    }
+
+    #[test]
+    fn next_sort_state_toggles_and_resets_for_new_column() {
+        let first = ResultTableWidget::next_sort_state(None, 2);
+        assert_eq!(
+            first,
+            ColumnSortState {
+                col_idx: 2,
+                direction: SortDirection::Ascending
+            }
+        );
+        let second = ResultTableWidget::next_sort_state(Some(first), 2);
+        assert_eq!(
+            second,
+            ColumnSortState {
+                col_idx: 2,
+                direction: SortDirection::Descending
+            }
+        );
+        let third = ResultTableWidget::next_sort_state(Some(second), 0);
+        assert_eq!(
+            third,
+            ColumnSortState {
+                col_idx: 0,
+                direction: SortDirection::Ascending
+            }
+        );
+    }
+
+    /// The NULL marker these sort tests run with. None of them exercise NULL
+    /// placement — `grid_sort` owns that — so any non-empty marker works.
+    const SORT_TEST_NULL_TEXT: &str = "NULL";
+
+    /// A column the driver could not classify, which is what these tests
+    /// predate `column_kinds` in asserting: numeric when both sides parse,
+    /// text otherwise.
+    fn unknown_sort_column() -> SortColumn {
+        ResultTableWidget::sort_column_for(&[], 0, ResultTableWidget::DEFAULT_SORT_NULL_ORDERING)
+    }
+
+    #[test]
+    fn sort_column_carries_the_kind_and_the_null_ordering_it_is_given() {
+        let kinds = vec![SqlValueKind::Temporal, SqlValueKind::Number];
+        let column = ResultTableWidget::sort_column_for(&kinds, 1, NullOrdering::LastOnAscending);
+        assert_eq!(column.kind, SqlValueKind::Number);
+        assert_eq!(column.nulls, NullOrdering::LastOnAscending);
+    }
+
+    #[test]
+    fn a_column_past_the_kind_list_falls_back_to_unknown() {
+        // Streaming installs kinds after headers, so a sort can race ahead of
+        // them; an unclassified column must still compare, not panic.
+        let column = ResultTableWidget::sort_column_for(&[], 7, NullOrdering::FirstOnAscending);
+        assert_eq!(column.kind, SqlValueKind::Unknown);
+    }
+
+    #[test]
+    fn null_ordering_decides_where_empty_cells_land() {
+        let rows = || {
+            vec![
+                vec!["b".to_string()],
+                vec![String::new()],
+                vec!["a".to_string()],
+            ]
+        };
+
+        let mut nulls_first = rows();
+        assert!(ResultTableWidget::sort_row_entries(
+            &mut nulls_first,
+            None,
+            0,
+            SortDirection::Ascending,
+            ResultTableWidget::sort_column_for(&[], 0, NullOrdering::FirstOnAscending),
+            SORT_TEST_NULL_TEXT,
+        ));
+        assert_eq!(nulls_first.first().unwrap()[0], "");
+
+        let mut nulls_last = rows();
+        assert!(ResultTableWidget::sort_row_entries(
+            &mut nulls_last,
+            None,
+            0,
+            SortDirection::Ascending,
+            ResultTableWidget::sort_column_for(&[], 0, NullOrdering::LastOnAscending),
+            SORT_TEST_NULL_TEXT,
+        ));
+        assert_eq!(nulls_last.last().unwrap()[0], "");
+    }
+
+    #[test]
+    fn the_default_null_ordering_preserves_the_previous_grid_behaviour() {
+        // Before column kinds reached the sort, an empty cell compared as text
+        // and led an ascending sort. A result whose backend never reported in
+        // must keep landing there.
+        assert_eq!(
+            ResultTableWidget::DEFAULT_SORT_NULL_ORDERING,
+            NullOrdering::FirstOnAscending
+        );
+    }
+
+    #[test]
+    fn compare_row_values_for_sort_uses_numeric_order_for_numbers() {
+        let left = vec!["2".to_string()];
+        let right = vec!["10".to_string()];
+        assert_eq!(
+            ResultTableWidget::compare_row_values_for_sort(
+                &left,
+                &right,
+                0,
+                unknown_sort_column(),
+                SORT_TEST_NULL_TEXT,
+            ),
+            std::cmp::Ordering::Less
+        );
+    }
+
+    #[test]
+    fn compare_row_values_for_sort_places_numbers_before_text() {
+        let number_row = vec!["42".to_string()];
+        let text_row = vec!["ABC".to_string()];
+        assert_eq!(
+            ResultTableWidget::compare_row_values_for_sort(
+                &number_row,
+                &text_row,
+                0,
+                unknown_sort_column(),
+                SORT_TEST_NULL_TEXT,
+            ),
+            std::cmp::Ordering::Less
+        );
+        assert_eq!(
+            ResultTableWidget::compare_row_values_for_sort(
+                &text_row,
+                &number_row,
+                0,
+                unknown_sort_column(),
+                SORT_TEST_NULL_TEXT,
+            ),
+            std::cmp::Ordering::Greater
+        );
+    }
+
+    #[test]
+    fn sort_row_entries_reorders_rows_and_row_states_together() {
+        let mut rows = vec![
+            vec!["2".to_string(), "B".to_string()],
+            vec!["1".to_string(), "A".to_string()],
+            vec!["3".to_string(), "A".to_string()],
+        ];
+        let mut states = vec![
+            EditRowState::Existing {
+                rowid: "RID2".to_string(),
+                explicit_null_cols: HashSet::new(),
+                dirty_cols: HashSet::new(),
+            },
+            EditRowState::Existing {
+                rowid: "RID1".to_string(),
+                explicit_null_cols: HashSet::new(),
+                dirty_cols: HashSet::new(),
+            },
+            EditRowState::Existing {
+                rowid: "RID3".to_string(),
+                explicit_null_cols: HashSet::new(),
+                dirty_cols: HashSet::new(),
+            },
+        ];
+
+        assert!(ResultTableWidget::sort_row_entries(
+            &mut rows,
+            Some(&mut states),
+            1,
+            SortDirection::Ascending,
+            unknown_sort_column(),
+            SORT_TEST_NULL_TEXT,
+        ));
+
+        assert_eq!(
+            rows,
+            vec![
+                vec!["1".to_string(), "A".to_string()],
+                vec!["3".to_string(), "A".to_string()],
+                vec!["2".to_string(), "B".to_string()],
+            ]
+        );
+        let rowids: Vec<String> = states
+            .iter()
+            .map(|state| match state {
+                EditRowState::Existing { rowid, .. } => rowid.clone(),
+                EditRowState::Inserted { .. } => "INSERTED".to_string(),
+            })
+            .collect();
+        assert_eq!(
+            rowids,
+            vec!["RID1".to_string(), "RID3".to_string(), "RID2".to_string()]
+        );
+    }
+
+    #[test]
+    fn sort_row_entries_rejects_out_of_sync_row_states() {
+        let mut rows = vec![vec!["2".to_string()], vec!["1".to_string()]];
+        let mut states = vec![EditRowState::Existing {
+            rowid: "RID2".to_string(),
+            explicit_null_cols: HashSet::new(),
+            dirty_cols: HashSet::new(),
+        }];
+        let original_rows = rows.clone();
+        let original_states_len = states.len();
+
+        assert!(!ResultTableWidget::sort_row_entries(
+            &mut rows,
+            Some(&mut states),
+            0,
+            SortDirection::Ascending,
+            unknown_sort_column(),
+            SORT_TEST_NULL_TEXT,
+        ));
+
+        assert_eq!(rows, original_rows);
+        assert_eq!(states.len(), original_states_len);
+    }
+
+    #[test]
+    fn sort_row_entries_sorts_numeric_values_numerically() {
+        let mut rows = vec![
+            vec!["10".to_string()],
+            vec!["2".to_string()],
+            vec!["1".to_string()],
+        ];
+        assert!(ResultTableWidget::sort_row_entries(
+            &mut rows,
+            None,
+            0,
+            SortDirection::Ascending,
+            unknown_sort_column(),
+            SORT_TEST_NULL_TEXT,
+        ));
+        assert_eq!(
+            rows,
+            vec![
+                vec!["1".to_string()],
+                vec!["2".to_string()],
+                vec!["10".to_string()]
+            ]
+        );
+    }
+
+    #[test]
+    fn pointer_moved_beyond_tolerance_uses_pixel_threshold() {
+        assert!(!ResultTableWidget::pointer_moved_beyond_tolerance(
+            100, 100, 103, 104, 4
+        ));
+        assert!(ResultTableWidget::pointer_moved_beyond_tolerance(
+            100, 100, 106, 100, 4
+        ));
+        assert!(ResultTableWidget::pointer_moved_beyond_tolerance(
+            100, 100, 100, 106, 4
         ));
     }
 

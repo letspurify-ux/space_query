@@ -91,6 +91,23 @@ pub enum SqlAction {
     ExecuteScript(String),
     BrowseTable(TableBrowseTarget),
     DisplayResult(ResultTabRequest),
+    /// Rendered export bytes looking for a destination.
+    ///
+    /// The object browser renders but does not deliver: the file chooser, the
+    /// write, the clipboard and the status line all stay in the main window, so
+    /// a table exported from the tree lands exactly the way a grid export does.
+    ExportData(ObjectExportDelivery),
+}
+
+/// A finished tree export, ready to be written or copied.
+#[derive(Clone, Debug)]
+pub struct ObjectExportDelivery {
+    pub text: String,
+    pub format: crate::ui::result_export::ExportFormat,
+    pub destination: crate::ui::result_export::ExportDestination,
+    pub row_count: usize,
+    /// Base name to offer in the save panel, without an extension.
+    pub suggested_name: String,
 }
 
 /// The object-browser actions that destroy something.
@@ -198,6 +215,9 @@ enum ObjectDefaultAction {
     },
     /// Load package members on first activation, expand/collapse afterwards.
     PackageNode,
+    /// Put text straight into the editor, for a node that names something
+    /// rather than being an object of its own.
+    InsertText(String),
     ToggleNode,
     None,
 }
@@ -384,6 +404,14 @@ pub enum ObjectItem {
         routine_name: String,
         routine_type: String,
     },
+    /// A column under a table node.
+    ///
+    /// It answers to Copy Name and to a drag into the editor, and to nothing
+    /// else: it is not an object the catalog can describe, drop or open.
+    Column {
+        table_name: String,
+        column_name: String,
+    },
 }
 
 #[derive(Clone)]
@@ -416,6 +444,12 @@ pub struct ObjectCache {
     pub synonyms: Vec<String>,
     pub packages: Vec<String>,
     pub package_routines: HashMap<String, Vec<PackageRoutine>>,
+    /// Columns per table, filled the first time a table node is expanded.
+    ///
+    /// Lives here rather than on the tree because the tree is rebuilt from this
+    /// cache on every filter keystroke and every refresh — anything added
+    /// straight to the widget would disappear on the next character typed.
+    pub table_columns: HashMap<String, Vec<TableColumnDetail>>,
 }
 
 trait ObjectBrowserDbBehavior: Sync {
@@ -427,6 +461,9 @@ trait ObjectBrowserDbBehavior: Sync {
         routine_name: &str,
     ) -> String;
     fn preview_select_sql(&self, selected_scope: Option<&str>, object_name: &str) -> String;
+    /// The statement `Export Data...` runs: the same relation the preview
+    /// shows, with no row limit.
+    fn export_select_sql(&self, selected_scope: Option<&str>, object_name: &str) -> String;
     /// The statement `action` would run on this object, or `None` when the
     /// backend has no such statement for that object type.
     ///
@@ -468,6 +505,17 @@ trait ObjectBrowserDbBehavior: Sync {
         selected_scope: Option<&str>,
         table_name: &str,
     ) -> Result<Vec<TableColumnDetail>, String>;
+    /// Read a whole table for `Export Data...`.
+    ///
+    /// Every row: an export that quietly stopped at some limit would produce a
+    /// file that looks complete and is not.
+    fn load_table_rows(
+        &self,
+        context: &crate::db::DbPoolSessionContext,
+        session: crate::db::DbPoolSession,
+        selected_scope: Option<&str>,
+        table_name: &str,
+    ) -> Result<crate::db::QueryResult, String>;
     fn load_table_indexes(
         &self,
         context: &crate::db::DbPoolSessionContext,
@@ -676,6 +724,17 @@ enum ObjectActionResult {
         status: String,
         result: Result<Vec<CompilationError>, String>,
     },
+    TableColumns {
+        table_name: String,
+        result: Result<Vec<TableColumnDetail>, String>,
+        scope_generation: u64,
+    },
+    ExportedTable {
+        qualified_name: String,
+        db_type: crate::db::DatabaseType,
+        choice: crate::ui::result_export_dialog::ExportChoice,
+        result: Result<crate::db::QueryResult, String>,
+    },
 }
 
 #[derive(Clone)]
@@ -881,6 +940,28 @@ impl ObjectBrowserWidget {
     }
 
     #[doc(hidden)]
+    fn example_column(
+        name: &str,
+        data_type: &str,
+        data_length: i32,
+        data_precision: Option<i32>,
+        data_scale: Option<i32>,
+        nullable: bool,
+        is_primary_key: bool,
+    ) -> TableColumnDetail {
+        TableColumnDetail {
+            name: name.to_string(),
+            data_type: data_type.to_string(),
+            data_length,
+            data_precision,
+            data_scale,
+            nullable,
+            default_value: None,
+            is_primary_key,
+        }
+    }
+
+    #[doc(hidden)]
     pub fn capture_tour_set_example_metadata(&mut self) {
         let cache = ObjectCache {
             tables: vec![
@@ -899,6 +980,22 @@ impl ObjectBrowserWidget {
             sequences: vec!["SQ_ORDER_SEQ".to_string()],
             triggers: vec!["EMP_AUDIT_TRG".to_string()],
             packages: vec!["EMP_API".to_string()],
+            // One expanded table, so the capture tour can show what a table
+            // node looks like once its columns have been read.
+            table_columns: [(
+                "EMP".to_string(),
+                vec![
+                    Self::example_column("EMPNO", "NUMBER", 22, Some(4), Some(0), false, true),
+                    Self::example_column("ENAME", "VARCHAR2", 10, None, None, true, false),
+                    Self::example_column("JOB", "VARCHAR2", 9, None, None, true, false),
+                    Self::example_column("MGR", "NUMBER", 22, Some(4), Some(0), true, false),
+                    Self::example_column("HIREDATE", "DATE", 7, None, None, true, false),
+                    Self::example_column("SAL", "NUMBER", 22, Some(7), Some(2), true, false),
+                    Self::example_column("DEPTNO", "NUMBER", 22, Some(2), Some(0), true, false),
+                ],
+            )]
+            .into_iter()
+            .collect(),
             ..Default::default()
         };
         *self
@@ -2481,6 +2578,38 @@ impl ObjectBrowserWidget {
                                 ));
                             }
                         },
+                        ObjectActionResult::ExportedTable {
+                            qualified_name,
+                            db_type,
+                            choice,
+                            result,
+                        } => match result {
+                            Ok(query_result) => {
+                                let delivery = ObjectBrowserWidget::render_table_export(
+                                    &qualified_name,
+                                    db_type,
+                                    choice,
+                                    &query_result,
+                                );
+                                ObjectBrowserWidget::emit_status_callback(
+                                    &status_callback,
+                                    &format!(
+                                        "Exporting {qualified_name}: {} rows as {}",
+                                        delivery.row_count,
+                                        choice.format.label()
+                                    ),
+                                );
+                                ObjectBrowserWidget::emit_sql_callback(
+                                    &sql_callback,
+                                    SqlAction::ExportData(delivery),
+                                );
+                            }
+                            Err(err) => {
+                                crate::ui::alert_on_main(&format!(
+                                    "Failed to read {qualified_name} for export: {err}"
+                                ));
+                            }
+                        },
                         ObjectActionResult::ImportTarget {
                             qualified_name,
                             file_label,
@@ -2643,6 +2772,49 @@ impl ObjectBrowserWidget {
                                 );
                             }
                         }
+                        ObjectActionResult::TableColumns {
+                            table_name,
+                            result,
+                            scope_generation: action_scope_generation,
+                        } => {
+                            if action_scope_generation != scope_generation.load(Ordering::Relaxed) {
+                                continue;
+                            }
+                            match result {
+                                Ok(columns) => {
+                                    let open_paths = ObjectBrowserWidget::open_tree_paths(&tree);
+                                    let mut cache = object_cache
+                                        .lock()
+                                        .unwrap_or_else(|poisoned| poisoned.into_inner());
+                                    cache.table_columns.insert(table_name.clone(), columns);
+                                    let filter_text = filter_input.value().to_lowercase();
+                                    ObjectBrowserWidget::populate_tree(
+                                        &mut tree,
+                                        &cache,
+                                        &filter_text,
+                                    );
+                                    drop(cache);
+                                    ObjectBrowserWidget::restore_tree_open_paths(
+                                        &mut tree,
+                                        &open_paths,
+                                    );
+                                    // The node the user pressed Right on is the
+                                    // one that should now be open.
+                                    if let Some(mut item) =
+                                        tree.find_item(&format!("Tables/{}", table_name))
+                                    {
+                                        item.open();
+                                    }
+                                    tree.redraw();
+                                }
+                                Err(err) => {
+                                    ObjectBrowserWidget::emit_status_callback(
+                                        &status_callback,
+                                        &format!("Failed to load columns for {table_name}: {err}"),
+                                    );
+                                }
+                            }
+                        }
                         ObjectActionResult::PackageRoutines {
                             package_name,
                             result,
@@ -2655,7 +2827,7 @@ impl ObjectBrowserWidget {
                             match result {
                                 Ok(routines) => {
                                     let package_open_paths =
-                                        ObjectBrowserWidget::open_package_tree_paths(&tree);
+                                        ObjectBrowserWidget::open_tree_paths(&tree);
                                     let mut cache = object_cache
                                         .lock()
                                         .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -2668,7 +2840,7 @@ impl ObjectBrowserWidget {
                                         &cache,
                                         &filter_text,
                                     );
-                                    ObjectBrowserWidget::restore_package_tree_open_paths(
+                                    ObjectBrowserWidget::restore_tree_open_paths(
                                         &mut tree,
                                         &package_open_paths,
                                     );
@@ -2963,9 +3135,12 @@ impl ObjectBrowserWidget {
                                 .lock()
                                 .unwrap_or_else(|poisoned| poisoned.into_inner());
                             let scope = Self::scope_snapshot(&selected_scope);
-                            if let Some(insert_text) =
-                                Self::get_insert_text(item, db_type, scope.as_deref())
-                            {
+                            if let Some(insert_text) = Self::get_insert_text(
+                                item,
+                                db_type,
+                                scope.as_deref(),
+                                &object_cache,
+                            ) {
                                 pending_drag_text = Some(insert_text);
                             }
                         }
@@ -3047,6 +3222,20 @@ impl ObjectBrowserWidget {
                                         &action_sender,
                                         package_name,
                                         true,
+                                    );
+                                } else if let Some(table_name) =
+                                    Self::table_requiring_column_load(&item, &object_cache)
+                                {
+                                    // Right expands; double-click still browses
+                                    // the rows, which is the more common thing
+                                    // to want from a table.
+                                    Self::load_table_columns_async(
+                                        &connection,
+                                        &selected_scope,
+                                        &scope_generation,
+                                        &status_callback,
+                                        &action_sender,
+                                        table_name,
                                     );
                                 } else {
                                     Self::select_first_child_item(t, &item);
@@ -3253,6 +3442,12 @@ impl ObjectBrowserWidget {
         };
 
         match item_info {
+            // A column drops its bare name into the editor, which is what the
+            // caret is usually waiting for; the table it belongs to is already
+            // in the statement by the time a column is being picked.
+            ObjectItem::Column { column_name, .. } => {
+                ObjectDefaultAction::InsertText(column_name.clone())
+            }
             ObjectItem::Simple {
                 object_type,
                 object_name,
@@ -3301,7 +3496,8 @@ impl ObjectBrowserWidget {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         let scope = Self::scope_snapshot(selected_scope);
-        let item_info = Self::get_item_info(item);
+        let item_info =
+            Self::get_item_info(item).or_else(|| Self::column_item_info(item, object_cache));
 
         match Self::default_action_for_item(item_info.as_ref(), db_type, scope.as_deref()) {
             ObjectDefaultAction::Browse(target) => {
@@ -3320,6 +3516,10 @@ impl ObjectBrowserWidget {
                     object_type,
                     &object_name,
                 );
+                true
+            }
+            ObjectDefaultAction::InsertText(text) => {
+                Self::emit_sql_callback(sql_callback, SqlAction::Insert(text));
                 true
             }
             ObjectDefaultAction::PackageNode => {
@@ -3392,25 +3592,25 @@ impl ObjectBrowserWidget {
         }
     }
 
-    fn open_package_tree_paths(tree: &Tree) -> HashSet<String> {
+    /// Every expanded node, so a rebuild can put the tree back as it was.
+    ///
+    /// Not limited to packages any more: expanded tables have children too, and
+    /// leaving them out would collapse them on every filter keystroke.
+    fn open_tree_paths(tree: &Tree) -> HashSet<String> {
         tree.get_items()
             .unwrap_or_default()
             .into_iter()
             .filter(|item| item.has_children() && item.is_open())
-            .filter_map(|item| {
-                tree.item_pathname(&item)
-                    .ok()
-                    .filter(|path| path.starts_with("Packages/"))
-            })
+            .filter_map(|item| tree.item_pathname(&item).ok())
             .collect()
     }
 
-    fn restore_package_tree_open_paths(tree: &mut Tree, open_paths: &HashSet<String>) {
+    fn restore_tree_open_paths(tree: &mut Tree, open_paths: &HashSet<String>) {
         for mut item in tree.get_items().unwrap_or_default() {
             let Ok(path) = tree.item_pathname(&item) else {
                 continue;
             };
-            if !path.starts_with("Packages/") || !item.has_children() {
+            if !item.has_children() {
                 continue;
             }
 
@@ -3564,18 +3764,120 @@ impl ObjectBrowserWidget {
         }
     }
 
+    /// A column node, resolved against the cache the tree was built from.
+    ///
+    /// Separate from [`Self::get_item_info`] so that callers which must not see
+    /// columns — the context menu, the package loader — keep getting `None` for
+    /// them without having to say so.
+    fn column_item_info(
+        item: &TreeItem,
+        object_cache: &Arc<Mutex<ObjectCache>>,
+    ) -> Option<ObjectItem> {
+        let label = item.label()?.trim().to_string();
+        let parent = item.parent()?;
+        let table_name = parent.label()?.trim().to_string();
+        let root_label = parent.parent()?.label()?;
+        if !root_label.trim().eq_ignore_ascii_case("Tables") {
+            return None;
+        }
+        let cache = object_cache
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let columns = cache.table_columns.get(&table_name)?;
+        let column_name = Self::column_name_for_node_label(columns, &label)?;
+        Some(ObjectItem::Column {
+            table_name,
+            column_name,
+        })
+    }
+
+    /// The table whose columns still have to be read before it can expand.
+    fn table_requiring_column_load(
+        item: &TreeItem,
+        object_cache: &Arc<Mutex<ObjectCache>>,
+    ) -> Option<String> {
+        let Some(ObjectItem::Simple {
+            object_type,
+            object_name,
+        }) = Self::get_item_info(item)
+        else {
+            return None;
+        };
+        if object_type != "TABLES" {
+            return None;
+        }
+        let cache = object_cache
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if cache.table_columns.contains_key(&object_name) {
+            None
+        } else {
+            Some(object_name)
+        }
+    }
+
+    /// Read a table's columns so its node can be expanded.
+    ///
+    /// Uses the same per-backend `load_table_structure` that `View Structure`
+    /// and `Import Data...` use, so the tree cannot disagree with them about
+    /// what the columns are.
+    fn load_table_columns_async(
+        connection: &SharedConnection,
+        selected_scope: &Arc<Mutex<Option<String>>>,
+        scope_generation: &Arc<AtomicU64>,
+        status_callback: &StatusCallback,
+        action_sender: &std::sync::mpsc::Sender<ObjectActionResult>,
+        table_name: String,
+    ) {
+        let connection = connection.clone();
+        let sender = action_sender.clone();
+        let selected_scope = selected_scope.clone();
+        let action_scope_generation = scope_generation.load(Ordering::Relaxed);
+        Self::emit_status_callback(
+            status_callback,
+            &format!("Loading columns for {}", table_name),
+        );
+        thread::spawn(move || {
+            let activity = format!("Loading columns for {}", table_name);
+            let scope = ObjectBrowserWidget::scope_snapshot(&selected_scope);
+            let result = ObjectBrowserWidget::with_pooled_object_session(
+                &connection,
+                scope.as_deref(),
+                activity,
+                |context, session| {
+                    object_browser_behavior_for(context.connection_info.db_type)
+                        .load_table_structure(context, session, scope.as_deref(), &table_name)
+                },
+            );
+            let _ = sender.send(ObjectActionResult::TableColumns {
+                table_name,
+                result,
+                scope_generation: action_scope_generation,
+            });
+            app::awake();
+        });
+    }
+
     fn get_insert_text(
         item: &TreeItem,
         db_type: crate::db::DatabaseType,
         selected_scope: Option<&str>,
+        object_cache: &Arc<Mutex<ObjectCache>>,
     ) -> Option<String> {
-        Self::get_item_info(item).as_ref().map(|item_info| {
-            Self::copy_text_for_object_item_with_scope(item_info, db_type, selected_scope)
-        })
+        Self::get_item_info(item)
+            .or_else(|| Self::column_item_info(item, object_cache))
+            .as_ref()
+            .map(|item_info| {
+                Self::copy_text_for_object_item_with_scope(item_info, db_type, selected_scope)
+            })
     }
 
-    fn copy_text_for_selected_item(item: &TreeItem) -> Option<String> {
+    fn copy_text_for_selected_item(
+        item: &TreeItem,
+        object_cache: &Arc<Mutex<ObjectCache>>,
+    ) -> Option<String> {
         Self::get_item_info(item)
+            .or_else(|| Self::column_item_info(item, object_cache))
             .as_ref()
             .map(copy_text_for_object_item)
             .or_else(|| {
@@ -4018,6 +4320,10 @@ impl ObjectBrowserWidget {
     fn merge_object_metadata_cache(target: &mut ObjectCache, partial: ObjectCache) {
         if !partial.tables.is_empty() {
             target.tables = partial.tables;
+            // A refresh is a request for current metadata, and a cached column
+            // list survives an ALTER without noticing. Dropping them costs one
+            // query the next time a table is expanded.
+            target.table_columns.clear();
         }
         if !partial.views.is_empty() {
             target.views = partial.views;
@@ -4045,6 +4351,9 @@ impl ObjectBrowserWidget {
         }
         if !partial.package_routines.is_empty() {
             target.package_routines.extend(partial.package_routines);
+        }
+        if !partial.table_columns.is_empty() {
+            target.table_columns.extend(partial.table_columns);
         }
     }
 
@@ -4197,6 +4506,9 @@ impl ObjectBrowserWidget {
         selected_scope: Option<&str>,
     ) -> String {
         match item_info {
+            // Not scope-qualified: a column name is only ever used inside a
+            // statement that has already named its table.
+            ObjectItem::Column { column_name, .. } => column_name.clone(),
             ObjectItem::Simple { object_name, .. } => {
                 Self::qualify_object_name_for_scope(db_type, selected_scope, object_name)
             }
@@ -4842,6 +5154,8 @@ impl ObjectBrowserWidget {
                 object_type,
                 object_name,
             } => Self::ddl_object_type(object_type).map(|ddl_type| (ddl_type, object_name.clone())),
+            // A column has no source of its own to open.
+            ObjectItem::Column { .. } => None,
             ObjectItem::PackageRoutine { package_name, .. } => {
                 Some(("PACKAGE", package_name.clone()))
             }
@@ -4937,6 +5251,8 @@ impl ObjectBrowserWidget {
         let object_name = match item {
             ObjectItem::Simple { object_name, .. } => object_name.as_str(),
             ObjectItem::PackageRoutine { package_name, .. } => package_name.as_str(),
+            // The scope belongs to the table, so resolve against that.
+            ObjectItem::Column { table_name, .. } => table_name.as_str(),
         };
 
         if !data.qualifier_has_member(qualifier, object_name, false) {
@@ -5591,6 +5907,93 @@ impl ObjectBrowserWidget {
     /// Public only so `verify_import_ui` can drive the production modal; not
     /// part of the supported surface.
     #[doc(hidden)]
+    /// Turn a freshly read table into export bytes.
+    ///
+    /// Goes through the same `render_export_content` the result grid uses, so a
+    /// table exported from the tree is byte-identical to the same table
+    /// exported from a `Select Data` grid. The one thing that has to be
+    /// translated is NULL: a driver reports it as a sentinel, and the
+    /// serializers expect the grid's NULL display text.
+    fn render_table_export(
+        qualified_name: &str,
+        db_type: crate::db::DatabaseType,
+        choice: crate::ui::result_export_dialog::ExportChoice,
+        result: &crate::db::QueryResult,
+    ) -> ObjectExportDelivery {
+        // No grid here to ask for its NULL text, so use the one a grid
+        // starts with; a session `SET NULL` cannot reach this path.
+        let null_text = crate::ui::result_table::ResultTableWidget::DEFAULT_NULL_TEXT.to_string();
+        let columns: Vec<String> = result
+            .columns
+            .iter()
+            .map(|column| column.name.clone())
+            .collect();
+        let column_kinds: Vec<crate::db::SqlValueKind> =
+            result.columns.iter().map(|column| column.kind).collect();
+        let rows: Vec<Vec<String>> = result
+            .rows
+            .iter()
+            .map(|row| {
+                row.iter()
+                    .map(|value| crate::db::QueryCell::display_result_text(value, &null_text))
+                    .collect()
+            })
+            .collect();
+        let grid = crate::ui::result_export::ExportGrid {
+            columns: columns.clone(),
+            column_kinds: column_kinds.clone(),
+            rows: rows.clone(),
+            null_text: null_text.clone(),
+        };
+        let sql_selection = crate::ui::grid_sql_export::GridSqlSelection {
+            db_type,
+            table: Some(qualified_name.to_string()),
+            selected_columns: (0..columns.len()).collect(),
+            all_columns: columns,
+            column_kinds,
+            rows,
+            null_text,
+        };
+        let (text, row_count) = crate::ui::result_export::render_export_content(
+            choice.format,
+            &grid,
+            Some(&sql_selection),
+        );
+        ObjectExportDelivery {
+            text: crate::ui::result_export::with_destination_prelude(
+                choice.format,
+                choice.destination,
+                text,
+            ),
+            format: choice.format,
+            destination: choice.destination,
+            row_count,
+            suggested_name: Self::export_file_stem(qualified_name),
+        }
+    }
+
+    /// A file name for an exported table: the object name with anything a file
+    /// system would argue about replaced.
+    fn export_file_stem(qualified_name: &str) -> String {
+        let base = qualified_name
+            .rsplit('.')
+            .next()
+            .unwrap_or(qualified_name)
+            .trim()
+            .trim_matches('"')
+            .trim_matches('`');
+        let cleaned: String = base
+            .chars()
+            .map(|ch| if ch.is_alphanumeric() { ch } else { '_' })
+            .collect();
+        let cleaned = cleaned.trim_matches('_').to_string();
+        if cleaned.is_empty() {
+            "export".to_string()
+        } else {
+            cleaned
+        }
+    }
+
     pub fn build_import_script_from_dialog(
         file_label: &str,
         text: &str,
@@ -6059,6 +6462,55 @@ impl ObjectBrowserWidget {
                                 file_label: file_label_for_thread,
                                 db_type,
                                 format,
+                                result,
+                            });
+                            app::awake();
+                        });
+                    }
+                    ("Export Data...", ObjectItem::Simple { object_name, .. }) => {
+                        let qualified_name = Self::qualify_object_name_for_scope(
+                            db_type,
+                            selected_scope.as_deref(),
+                            object_name,
+                        );
+                        // Ask before reading: a whole table is expensive, and a
+                        // cancelled dialog must cost nothing. The tree always
+                        // knows the dialect, so `SQL Inserts` is on offer here
+                        // even though a grid without a connection loses it.
+                        let formats = crate::ui::result_export::ExportFormat::ALL.to_vec();
+                        let Some(choice) = crate::ui::result_export_dialog::show(&formats, false)
+                        else {
+                            return;
+                        };
+                        let connection = connection.clone();
+                        let sender = action_sender.clone();
+                        let table_name = object_name.clone();
+                        let selected_scope = selected_scope.clone();
+                        let qualified_for_thread = qualified_name.clone();
+                        Self::emit_status_callback(
+                            status_callback,
+                            &format!("Reading {} for export", qualified_name),
+                        );
+                        thread::spawn(move || {
+                            let activity = format!("Exporting {}", table_name);
+                            let result = ObjectBrowserWidget::with_pooled_object_session(
+                                &connection,
+                                selected_scope.as_deref(),
+                                activity,
+                                |context, session| {
+                                    object_browser_behavior_for(context.connection_info.db_type)
+                                        .load_table_rows(
+                                            context,
+                                            session,
+                                            selected_scope.as_deref(),
+                                            &table_name,
+                                        )
+                                },
+                            );
+                            let _ = sender.send(ObjectActionResult::ExportedTable {
+                                qualified_name: qualified_for_thread,
+                                db_type,
+                                choice,
                                 result,
                             });
                             app::awake();
@@ -6890,11 +7342,47 @@ impl ObjectBrowserWidget {
         }
     }
 
+    /// What a column node reads as in the tree.
+    ///
+    /// The type is part of the label because seeing it is the reason to expand
+    /// a table at all — otherwise `View Structure` would still be the only way.
+    fn column_node_label(column: &TableColumnDetail) -> String {
+        let type_display = column.get_type_display();
+        if type_display.is_empty() {
+            column.name.clone()
+        } else {
+            format!("{}  {}", column.name, type_display)
+        }
+    }
+
+    /// The column a node label names, found by regenerating each cached
+    /// column's label and comparing.
+    ///
+    /// Deliberately not parsed back out of the label: a column name can contain
+    /// spaces, and a parsing rule would be a second definition of the format
+    /// that could drift from [`Self::column_node_label`].
+    fn column_name_for_node_label(columns: &[TableColumnDetail], label: &str) -> Option<String> {
+        columns
+            .iter()
+            .find(|column| Self::column_node_label(column) == label)
+            .map(|column| column.name.clone())
+    }
+
     fn collect_tree_paths(cache: &ObjectCache, filter_text: &str) -> Vec<String> {
         let mut paths: Vec<String> = Vec::new();
         for table in &cache.tables {
             if filter_text.is_empty() || table.to_lowercase().contains(filter_text) {
                 paths.push(format!("Tables/{}", table));
+                // Columns only exist here once the table has been expanded
+                // once. Emitting them from the cache is what keeps them alive
+                // across the rebuild that every filter keystroke triggers.
+                for column in cache.table_columns.get(table).into_iter().flatten() {
+                    paths.push(format!(
+                        "Tables/{}/{}",
+                        table,
+                        Self::column_node_label(column)
+                    ));
+                }
             }
         }
         for view in &cache.views {
@@ -6965,11 +7453,34 @@ impl ObjectBrowserWidget {
         paths
     }
 
+    /// Every node path in this browser's tree, for the capture tour.
+    #[doc(hidden)]
+    pub fn capture_tour_tree_paths(&self) -> Vec<String> {
+        self.tree
+            .get_items()
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|item| self.tree.item_pathname(&item).ok())
+            .collect()
+    }
+
+    /// Open one tree node by path, for the capture tour.
+    #[doc(hidden)]
+    pub fn capture_tour_expand_path(&self, path: &str) -> bool {
+        let Some(mut item) = self.tree.find_item(path) else {
+            return false;
+        };
+        item.open();
+        let mut tree = self.tree.clone();
+        tree.redraw();
+        true
+    }
+
     #[allow(dead_code)]
     pub fn get_selected_item(&self) -> Option<String> {
         self.tree
             .first_selected_item()
-            .and_then(|item| Self::copy_text_for_selected_item(&item))
+            .and_then(|item| Self::copy_text_for_selected_item(&item, &self.object_cache))
     }
 
     pub fn has_focus(&self) -> bool {
@@ -6989,7 +7500,7 @@ impl ObjectBrowserWidget {
         let Some(item) = self.tree.first_selected_item() else {
             return false;
         };
-        let Some(text) = Self::copy_text_for_selected_item(&item) else {
+        let Some(text) = Self::copy_text_for_selected_item(&item, &self.object_cache) else {
             return false;
         };
 
@@ -7024,6 +7535,13 @@ impl ObjectBrowserDbBehavior for OracleObjectBrowserBehavior {
     fn preview_select_sql(&self, selected_scope: Option<&str>, object_name: &str) -> String {
         let qualified_name = self.qualify_object_name(selected_scope, object_name);
         format!("SELECT * FROM {} WHERE ROWNUM <= 100", qualified_name)
+    }
+
+    fn export_select_sql(&self, selected_scope: Option<&str>, object_name: &str) -> String {
+        format!(
+            "SELECT * FROM {}",
+            self.qualify_object_name(selected_scope, object_name)
+        )
     }
 
     fn destructive_object_sql(
@@ -7132,6 +7650,28 @@ impl ObjectBrowserDbBehavior for OracleObjectBrowserBehavior {
             }
             crate::db::DbPoolSession::OracleThin(mut conn) => {
                 ObjectBrowser::get_thin_table_structure(&mut conn, &qualified_name)
+            }
+            unexpected @ crate::db::DbPoolSession::MySQL { .. } => Err(format!(
+                "Expected Oracle object action session but acquired {}",
+                unexpected.db_type()
+            )),
+        }
+    }
+
+    fn load_table_rows(
+        &self,
+        _context: &crate::db::DbPoolSessionContext,
+        session: crate::db::DbPoolSession,
+        selected_scope: Option<&str>,
+        table_name: &str,
+    ) -> Result<crate::db::QueryResult, String> {
+        let sql = self.export_select_sql(selected_scope, table_name);
+        match session {
+            crate::db::DbPoolSession::Oracle(conn) => {
+                crate::db::query::QueryExecutor::execute(&conn, &sql).map_err(|err| err.to_string())
+            }
+            crate::db::DbPoolSession::OracleThin(mut conn) => {
+                ObjectBrowser::execute_thin_query(&mut conn, &sql)
             }
             unexpected @ crate::db::DbPoolSession::MySQL { .. } => Err(format!(
                 "Expected Oracle object action session but acquired {}",
@@ -7512,8 +8052,8 @@ impl ObjectBrowserDbBehavior for OracleObjectBrowserBehavior {
     fn menu_choices_for_object_item(&self, item_info: &ObjectItem) -> Option<&'static str> {
         match item_info {
             ObjectItem::Simple { object_type, .. } if object_type == "TABLES" => Some(
-                "Select Data (Top 100)|Import Data...|View Structure|View Indexes|View \
-                 Constraints|Generate DDL|Truncate...|Drop...",
+                "Select Data (Top 100)|Import Data...|Export Data...|View Structure|View \
+                 Indexes|View Constraints|Generate DDL|Truncate...|Drop...",
             ),
             ObjectItem::Simple { object_type, .. }
                 if object_type == "VIEWS" || object_type == "MATERIALIZED VIEWS" =>
@@ -7898,6 +8438,14 @@ impl ObjectBrowserDbBehavior for MysqlObjectBrowserBehavior {
         )
     }
 
+    fn export_select_sql(&self, selected_scope: Option<&str>, object_name: &str) -> String {
+        let qualified_name = self.qualify_object_name(selected_scope, object_name);
+        format!(
+            "SELECT * FROM {}",
+            ObjectBrowserWidget::quote_mysql_identifier_path(&qualified_name)
+        )
+    }
+
     fn destructive_object_sql(
         &self,
         action: DestructiveObjectAction,
@@ -8008,6 +8556,31 @@ impl ObjectBrowserDbBehavior for MysqlObjectBrowserBehavior {
             table_name,
         )
         .map_err(|err| err.to_string())
+    }
+
+    fn load_table_rows(
+        &self,
+        context: &crate::db::DbPoolSessionContext,
+        session: crate::db::DbPoolSession,
+        selected_scope: Option<&str>,
+        table_name: &str,
+    ) -> Result<crate::db::QueryResult, String> {
+        let sql = self.export_select_sql(selected_scope, table_name);
+        // The concrete type, not the family: MariaDB and MySQL classify some
+        // statements differently, and defaulting to MySQL would quietly give a
+        // MariaDB connection MySQL's answer.
+        let db_type = context.connection_info.db_type;
+        let mut conn = self.take_object_action_session(context, session)?;
+        let results = crate::db::query::mysql_executor::MysqlExecutor::execute_for_db_type(
+            conn.as_mut(),
+            &sql,
+            db_type,
+        )
+        .map_err(|err| err.to_string())?;
+        results
+            .into_iter()
+            .find(|result| result.is_select)
+            .ok_or_else(|| format!("{sql} returned no result set"))
     }
 
     fn load_table_indexes(
@@ -8131,8 +8704,8 @@ impl ObjectBrowserDbBehavior for MysqlObjectBrowserBehavior {
     fn menu_choices_for_object_item(&self, item_info: &ObjectItem) -> Option<&'static str> {
         match item_info {
             ObjectItem::Simple { object_type, .. } if object_type == "TABLES" => Some(
-                "Select Data (Top 100)|Import Data...|View Structure|View Indexes|View \
-                 Constraints|Generate DDL|Truncate...|Drop...",
+                "Select Data (Top 100)|Import Data...|Export Data...|View Structure|View \
+                 Indexes|View Constraints|Generate DDL|Truncate...|Drop...",
             ),
             ObjectItem::Simple { object_type, .. } if object_type == "VIEWS" => {
                 Some("Select Data (Top 100)|Generate DDL|Drop...")
@@ -8450,6 +9023,7 @@ fn consume_owned_key_up(owned_keydown: &mut Option<Key>, key: Key) -> bool {
 
 fn copy_text_for_object_item(item_info: &ObjectItem) -> String {
     match item_info {
+        ObjectItem::Column { column_name, .. } => column_name.clone(),
         ObjectItem::Simple { object_name, .. } => object_name.clone(),
         ObjectItem::PackageRoutine {
             package_name,
@@ -8956,6 +9530,28 @@ impl MultiObjectBrowserWidget {
     pub fn selected_scope(&self) -> Option<String> {
         self.bound_browser()
             .and_then(|browser| browser.selected_scope())
+    }
+
+    /// Every node path across the connections' browsers, for the capture tour.
+    #[doc(hidden)]
+    pub fn capture_tour_tree_paths(&self) -> Vec<String> {
+        self.entries
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .iter()
+            .flat_map(|entry| entry.browser.capture_tour_tree_paths())
+            .collect()
+    }
+
+    /// Open one tree node by path on every connection's browser, for the
+    /// capture tour.
+    #[doc(hidden)]
+    pub fn capture_tour_expand_path(&self, path: &str) -> bool {
+        self.entries
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .iter()
+            .any(|entry| entry.browser.capture_tour_expand_path(path))
     }
 
     pub fn selected_scope_for_connection(&self, connection_id: ConnectionId) -> Option<String> {
@@ -9879,13 +10475,275 @@ mod tests {
         assert!(target.editable);
     }
 
+    fn column_detail(name: &str, data_type: &str) -> super::TableColumnDetail {
+        super::TableColumnDetail {
+            name: name.to_string(),
+            data_type: data_type.to_string(),
+            data_length: 0,
+            data_precision: None,
+            data_scale: None,
+            nullable: true,
+            default_value: None,
+            is_primary_key: false,
+        }
+    }
+
+    #[test]
+    fn a_column_node_reads_as_its_name_and_type() {
+        let column = column_detail("EMPNO", "NUMBER");
+        let label = ObjectBrowserWidget::column_node_label(&column);
+        assert!(label.starts_with("EMPNO"));
+        assert!(label.contains("NUMBER"));
+    }
+
+    #[test]
+    fn a_column_is_found_from_its_label_without_parsing_it() {
+        // A name holding the separator is exactly what a parsing rule would get
+        // wrong, so the lookup regenerates labels and compares instead.
+        let columns = vec![
+            column_detail("EMPNO", "NUMBER"),
+            column_detail("ODD  NAME", "VARCHAR2"),
+        ];
+        for column in &columns {
+            let label = ObjectBrowserWidget::column_node_label(column);
+            assert_eq!(
+                ObjectBrowserWidget::column_name_for_node_label(&columns, &label).as_deref(),
+                Some(column.name.as_str()),
+                "{label}"
+            );
+        }
+        assert!(
+            ObjectBrowserWidget::column_name_for_node_label(&columns, "NOT A COLUMN").is_none()
+        );
+    }
+
+    #[test]
+    fn only_expanded_tables_contribute_column_paths() {
+        let mut cache = ObjectCache {
+            tables: vec!["EMP".to_string(), "DEPT".to_string()],
+            ..ObjectCache::default()
+        };
+        let paths = ObjectBrowserWidget::collect_tree_paths(&cache, "");
+        assert!(paths.contains(&"Tables/EMP".to_string()));
+        assert!(!paths.iter().any(|path| path.starts_with("Tables/EMP/")));
+
+        cache.table_columns.insert(
+            "EMP".to_string(),
+            vec![
+                column_detail("EMPNO", "NUMBER"),
+                column_detail("ENAME", "VARCHAR2"),
+            ],
+        );
+        let paths = ObjectBrowserWidget::collect_tree_paths(&cache, "");
+        assert_eq!(
+            paths
+                .iter()
+                .filter(|path| path.starts_with("Tables/EMP/"))
+                .count(),
+            2
+        );
+        // A table that was never expanded still has no children.
+        assert!(!paths.iter().any(|path| path.starts_with("Tables/DEPT/")));
+    }
+
+    #[test]
+    fn filtering_a_table_out_takes_its_columns_with_it() {
+        let mut cache = ObjectCache {
+            tables: vec!["EMP".to_string(), "DEPT".to_string()],
+            ..ObjectCache::default()
+        };
+        cache
+            .table_columns
+            .insert("EMP".to_string(), vec![column_detail("EMPNO", "NUMBER")]);
+        let paths = ObjectBrowserWidget::collect_tree_paths(&cache, "dept");
+        assert!(!paths.iter().any(|path| path.starts_with("Tables/EMP")));
+    }
+
+    #[test]
+    fn refreshed_metadata_drops_cached_columns_so_an_alter_is_not_missed() {
+        let mut target = ObjectCache {
+            tables: vec!["EMP".to_string()],
+            ..ObjectCache::default()
+        };
+        target
+            .table_columns
+            .insert("EMP".to_string(), vec![column_detail("EMPNO", "NUMBER")]);
+        let partial = ObjectCache {
+            tables: vec!["EMP".to_string()],
+            ..ObjectCache::default()
+        };
+        ObjectBrowserWidget::merge_object_metadata_cache(&mut target, partial);
+        assert!(target.table_columns.is_empty());
+    }
+
+    #[test]
+    fn a_column_copies_and_drags_as_its_bare_name() {
+        let item = ObjectItem::Column {
+            table_name: "EMP".to_string(),
+            column_name: "ENAME".to_string(),
+        };
+        assert_eq!(copy_text_for_object_item(&item), "ENAME");
+        assert_eq!(
+            ObjectBrowserWidget::copy_text_for_object_item_with_scope(
+                &item,
+                crate::db::DatabaseType::Oracle,
+                Some("HR"),
+            ),
+            "ENAME"
+        );
+        // Not something "go to declaration" can open.
+        assert!(ObjectBrowserWidget::declaration_target_for_item(&item).is_none());
+    }
+
+    #[test]
+    fn export_file_stem_uses_the_object_name_and_stays_a_legal_file_name() {
+        assert_eq!(ObjectBrowserWidget::export_file_stem("HR.EMP"), "EMP");
+        assert_eq!(
+            ObjectBrowserWidget::export_file_stem("`shop`.`order items`"),
+            "order_items"
+        );
+        assert_eq!(
+            ObjectBrowserWidget::export_file_stem("\"odd/name\""),
+            "odd_name"
+        );
+        assert_eq!(ObjectBrowserWidget::export_file_stem("사원"), "사원");
+        // Nothing usable left is still a usable file name.
+        assert_eq!(ObjectBrowserWidget::export_file_stem("..."), "export");
+    }
+
+    #[test]
+    fn a_tree_export_renders_the_same_bytes_a_grid_export_would() {
+        use crate::db::{ColumnInfo, DatabaseType, QueryCell, QueryResult, SqlValueKind};
+        use crate::ui::result_export::{ExportDestination, ExportFormat, ExportGrid, ExportScope};
+        use crate::ui::result_export_dialog::ExportChoice;
+
+        let null_text = crate::ui::result_table::ResultTableWidget::DEFAULT_NULL_TEXT.to_string();
+        let result = QueryResult::new_select(
+            "SELECT * FROM HR.EMP",
+            vec![
+                ColumnInfo {
+                    name: "EMPNO".to_string(),
+                    data_type: "NUMBER".to_string(),
+                    kind: SqlValueKind::Number,
+                },
+                ColumnInfo {
+                    name: "ENAME".to_string(),
+                    data_type: "VARCHAR2".to_string(),
+                    kind: SqlValueKind::String,
+                },
+            ],
+            vec![
+                vec!["7369".to_string(), "SMITH".to_string()],
+                vec!["7499".to_string(), QueryCell::null_result_text()],
+            ],
+            std::time::Duration::from_millis(1),
+        );
+
+        for format in ExportFormat::ALL {
+            let delivery = ObjectBrowserWidget::render_table_export(
+                "HR.EMP",
+                DatabaseType::Oracle,
+                ExportChoice {
+                    format,
+                    scope: ExportScope::All,
+                    destination: ExportDestination::Clipboard,
+                },
+                &result,
+            );
+            let grid = ExportGrid {
+                columns: vec!["EMPNO".to_string(), "ENAME".to_string()],
+                column_kinds: vec![SqlValueKind::Number, SqlValueKind::String],
+                rows: vec![
+                    vec!["7369".to_string(), "SMITH".to_string()],
+                    vec!["7499".to_string(), null_text.clone()],
+                ],
+                null_text: null_text.clone(),
+            };
+            let selection = crate::ui::grid_sql_export::GridSqlSelection {
+                db_type: DatabaseType::Oracle,
+                table: Some("HR.EMP".to_string()),
+                all_columns: grid.columns.clone(),
+                column_kinds: grid.column_kinds.clone(),
+                selected_columns: vec![0, 1],
+                rows: grid.rows.clone(),
+                null_text: null_text.clone(),
+            };
+            let (expected, expected_rows) =
+                crate::ui::result_export::render_export_content(format, &grid, Some(&selection));
+            assert_eq!(delivery.text, expected, "{format:?} bytes differ");
+            assert_eq!(
+                delivery.row_count, expected_rows,
+                "{format:?} row count differs"
+            );
+        }
+    }
+
+    #[test]
+    fn a_file_export_carries_the_byte_order_mark_and_the_clipboard_does_not() {
+        use crate::db::{ColumnInfo, DatabaseType, QueryResult, SqlValueKind};
+        use crate::ui::result_export::{ExportDestination, ExportFormat, ExportScope};
+        use crate::ui::result_export_dialog::ExportChoice;
+
+        let result = QueryResult::new_select(
+            "SELECT * FROM HR.EMP",
+            vec![ColumnInfo {
+                name: "ENAME".to_string(),
+                data_type: "VARCHAR2".to_string(),
+                kind: SqlValueKind::String,
+            }],
+            vec![vec!["SMITH".to_string()]],
+            std::time::Duration::from_millis(1),
+        );
+        let choice = |destination| ExportChoice {
+            format: ExportFormat::Csv,
+            scope: ExportScope::All,
+            destination,
+        };
+        let to_file = ObjectBrowserWidget::render_table_export(
+            "HR.EMP",
+            DatabaseType::Oracle,
+            choice(ExportDestination::File),
+            &result,
+        );
+        let to_clipboard = ObjectBrowserWidget::render_table_export(
+            "HR.EMP",
+            DatabaseType::Oracle,
+            choice(ExportDestination::Clipboard),
+            &result,
+        );
+        assert_eq!(&to_file.text.as_bytes()[..3], &[0xEF, 0xBB, 0xBF]);
+        assert!(!to_clipboard.text.starts_with('\u{feff}'));
+    }
+
+    #[test]
+    fn every_backend_exports_the_whole_table_without_a_row_limit() {
+        // The preview caps rows on purpose; an export that inherited that cap
+        // would write a file that looks complete and is not.
+        for db_type in [
+            crate::db::DatabaseType::Oracle,
+            crate::db::DatabaseType::MySQL,
+            crate::db::DatabaseType::MariaDB,
+        ] {
+            let behavior = super::object_browser_behavior_for(db_type);
+            let export = behavior.export_select_sql(Some("HR"), "EMP");
+            let upper = export.to_uppercase();
+            assert!(!upper.contains("ROWNUM"), "{db_type:?}: {export}");
+            assert!(!upper.contains("LIMIT"), "{db_type:?}: {export}");
+            assert!(upper.starts_with("SELECT * FROM "), "{db_type:?}: {export}");
+        }
+    }
+
     #[test]
     fn read_only_menu_drops_every_write_capable_entry() {
-        let table_menu = "Select Data (Top 100)|Import Data...|View Structure|View Indexes|View \
-                          Constraints|Generate DDL|Truncate...|Drop...";
+        let table_menu = "Select Data (Top 100)|Import Data...|Export Data...|View Structure|\
+                          View Indexes|View Constraints|Generate DDL|Truncate...|Drop...";
         assert_eq!(
             ObjectBrowserWidget::menu_choices_for_read_only(table_menu, true).as_deref(),
-            Some("Select Data (Top 100)|View Structure|View Indexes|View Constraints|Generate DDL")
+            // Export survives: it only reads, so a read-only connection keeps it.
+            Some(
+                "Select Data (Top 100)|Export Data...|View Structure|View Indexes|View \
+                 Constraints|Generate DDL"
+            )
         );
         // Reading the catalog is still on offer.
         assert_eq!(

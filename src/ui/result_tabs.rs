@@ -17,16 +17,20 @@ use crate::ui::font_settings::{
     configured_result_font_size, configured_result_profile, FontProfile,
 };
 use crate::ui::grid_search::GridSearchDialog;
+use crate::ui::grid_sort::NullOrdering;
 use crate::ui::grid_sql_export::GridSqlSelection;
+use crate::ui::grid_value_filter::GridValueFilterBar;
 use crate::ui::result_export::{ExportDestination, ExportFormat, ExportScope};
+use crate::ui::result_table::ValueFilterOutcome;
 use crate::ui::result_table::{
-    ExportRequest, LazyFetchCallback, ResultGridEditExecuteCallback, ResultGridSqlExecuteCallback,
-    ResultPageNavigationOutcome, ResultTableContextActionCallback,
+    ExportRequest, HeaderSortRedirectCallback, LazyFetchCallback, ResultGridEditExecuteCallback,
+    ResultGridSqlExecuteCallback, ResultPageNavigationOutcome, ResultTableContextActionCallback,
 };
 use crate::ui::tab_strip;
 use crate::ui::table_browse::{
-    invoke_table_browse_execute_callback, TableBrowseExecuteCallback, TableBrowseFilterBar,
-    TableBrowseNavigation, TableBrowsePageRequest, TableBrowseTarget, TABLE_BROWSE_FILTER_HEIGHT,
+    invoke_table_browse_execute_callback, TableBrowseClauses, TableBrowseExecuteCallback,
+    TableBrowseFilterBar, TableBrowseNavigation, TableBrowsePageRequest, TableBrowseTarget,
+    TABLE_BROWSE_FILTER_HEIGHT,
 };
 use crate::ui::text_buffer_access;
 use crate::ui::theme;
@@ -97,6 +101,9 @@ struct ResultTab {
     origin: Option<ExecutionOrigin>,
     kind: ResultTabKind,
     filter_bar: Option<TableBrowseFilterBar>,
+    /// The strip reporting a local value filter. Mutually exclusive with
+    /// `filter_bar`: a result gets the server filter or the local one.
+    value_filter_bar: Option<GridValueFilterBar>,
 }
 
 #[derive(Clone)]
@@ -1592,6 +1599,7 @@ impl ResultTabsWidget {
                 origin,
                 kind: ResultTabKind::Query,
                 filter_bar: None,
+                value_filter_bar: None,
             });
             let idx = data.len().saturating_sub(1);
             let group = data.get(idx).map(|tab| tab.group.clone());
@@ -1720,6 +1728,7 @@ impl ResultTabsWidget {
     ) -> TableBrowseFilterBar {
         let mut group = group.clone();
         let (x, y, w, h) = (group.x(), group.y(), group.w(), group.h());
+        let target_for_sort = target.clone();
         group.begin();
         let filter_bar = TableBrowseFilterBar::new(
             x,
@@ -1731,6 +1740,42 @@ impl ResultTabsWidget {
             self.table_browse_callback.clone(),
         );
         group.end();
+
+        // With a server filter in place the grid must stop offering the local
+        // one, and a header sort must go to the server rather than reordering
+        // the fetched rows: the two disagree about NULLs and collation, and on
+        // a browse tab a local sort would only order the page on screen.
+        // Installing both here is what keeps every filter-bar tab — browsing or
+        // a filtered query result — on the same side of that split.
+        let mut table = table.clone();
+        table.set_filter_bar_present(true);
+        {
+            let callback = self.table_browse_callback.clone();
+            let mut bar = filter_bar.clone();
+            let redirect: HeaderSortRedirectCallback =
+                Arc::new(Mutex::new(Some(Box::new(move |column: String| {
+                    let order_by = crate::ui::table_browse::next_order_by_for_header_sort(
+                        &bar.order_by_text(),
+                        &column,
+                    );
+                    bar.set_order_by_text(&order_by);
+                    let request = TableBrowsePageRequest {
+                        result_tab_id: id,
+                        target: target_for_sort.clone(),
+                        clauses: TableBrowseClauses::new(bar.where_text(), order_by),
+                        offset: 0,
+                        page_size: 0,
+                        navigation: TableBrowseNavigation::Page,
+                    };
+                    if let Err(message) = invoke_table_browse_execute_callback(&callback, request) {
+                        crate::ui::alert_on_main(&message);
+                    }
+                    // Taken either way: a failed re-query must not silently fall
+                    // back to a local sort that means something different.
+                    true
+                }))));
+            table.set_header_sort_redirect(redirect);
+        }
 
         let mut table_widget = table.get_widget();
         table_widget.resize(
@@ -1794,8 +1839,7 @@ impl ResultTabsWidget {
             }
             (tab.group.clone(), tab.table.clone())
         };
-        let filter_bar =
-            self.build_filter_bar(&parts.0, &parts.1, id, target.clone(), intellisense_data);
+        let filter_bar = self.build_filter_bar(&parts.0, &parts.1, id, target, intellisense_data);
         {
             let mut data = self
                 .data
@@ -1828,6 +1872,193 @@ impl ResultTabsWidget {
         if let Some(mut filter_bar) = filter_bar {
             filter_bar.note_ambiguous_columns(columns);
         }
+    }
+
+    /// Filter the visible grid down to its selected values, or away from them.
+    ///
+    /// Only ever reached on a result with no `WHERE` bar — the menu item does
+    /// not exist otherwise — so there is never a moment when both mechanisms
+    /// are narrowing the same rows.
+    pub(crate) fn apply_visible_value_filter(&mut self, negate: bool) -> Result<(), String> {
+        let Some(mut table) = self.current_table() else {
+            return Err("There is no result grid to filter.".to_string());
+        };
+        let filter = table.value_filter_from_selection(negate)?;
+        let Some(id) = self.visible_result_tab_id() else {
+            return Err("There is no result grid to filter.".to_string());
+        };
+
+        let mut tabs_for_report = self.clone();
+        let report = move |outcome: Result<ValueFilterOutcome, String>| match outcome {
+            Ok(outcome) => tabs_for_report.show_value_filter_state(id, &outcome),
+            Err(message) => crate::ui::alert_on_main(&message),
+        };
+        match table.apply_value_filter_after_fetch_all(filter, Box::new(report)) {
+            // Deferred behind a lazy fetch; the report runs when it finishes.
+            None => Ok(()),
+            Some(Ok(outcome)) => {
+                self.show_value_filter_state(id, &outcome);
+                Ok(())
+            }
+            Some(Err(message)) => Err(message),
+        }
+    }
+
+    /// Let the user hide and reorder the visible grid's columns.
+    pub(crate) fn arrange_visible_result_columns(&mut self) -> Result<(), String> {
+        let Some(mut table) = self.current_table() else {
+            return Err("There is no result grid to arrange.".to_string());
+        };
+        let opened_with = table.column_layout_plan()?;
+        let Some(plan) = crate::ui::column_layout_dialog::show(opened_with.clone()) else {
+            return Ok(());
+        };
+        if plan == opened_with {
+            // Nothing to do, and doing it anyway would clear the selection and
+            // repaint for no reason.
+            return Ok(());
+        }
+        table.apply_column_layout(&plan)
+    }
+
+    /// Put every filtered-out row back and take the strip away.
+    pub(crate) fn clear_visible_value_filter(&mut self) {
+        let Some(mut table) = self.current_table() else {
+            return;
+        };
+        if !table.clear_value_filter() {
+            return;
+        }
+        if let Some(id) = self.visible_result_tab_id() {
+            self.hide_value_filter_state(id);
+        }
+    }
+
+    /// The visible tab's id, resolved the same way `current_table` resolves the
+    /// grid, so a filter and the strip reporting it never land on different
+    /// tabs.
+    fn visible_result_tab_id(&self) -> Option<ResultTabId> {
+        let index = *self
+            .active_index
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        index.and_then(|idx| {
+            self.data
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .get(idx)
+                .map(|tab| tab.id)
+        })
+    }
+
+    fn show_value_filter_state(&mut self, id: ResultTabId, outcome: &ValueFilterOutcome) {
+        let Some(index) = self.result_tab_index_for_id(id) else {
+            return;
+        };
+        let existing = {
+            let data = self
+                .data
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let Some(tab) = data.get(index) else {
+                return;
+            };
+            (
+                tab.value_filter_bar.clone(),
+                tab.group.clone(),
+                tab.table.clone(),
+            )
+        };
+        let mut bar = match existing.0 {
+            Some(bar) => bar,
+            None => {
+                let bar = self.build_value_filter_bar(&existing.1, &existing.2);
+                let mut data = self
+                    .data
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                if let Some(tab) = data.get_mut(index) {
+                    tab.value_filter_bar = Some(bar.clone());
+                }
+                bar
+            }
+        };
+        bar.set_state(&outcome.description, outcome.kept_rows, outcome.total_rows);
+        existing.1.clone().redraw();
+    }
+
+    fn hide_value_filter_state(&mut self, id: ResultTabId) {
+        let Some(index) = self.result_tab_index_for_id(id) else {
+            return;
+        };
+        let taken = {
+            let mut data = self
+                .data
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let Some(tab) = data.get_mut(index) else {
+                return;
+            };
+            tab.value_filter_bar
+                .take()
+                .map(|bar| (bar, tab.group.clone(), tab.table.clone()))
+        };
+        let Some((mut bar, mut group, table)) = taken else {
+            return;
+        };
+        bar.cleanup_for_close();
+        let (x, y, w, h) = (group.x(), group.y(), group.w(), group.h());
+        Group::delete(bar.take_group());
+        let mut table_widget = table.get_widget();
+        table_widget.resize(x, y, w, h.max(1));
+        group.resizable(&table_widget);
+        let mut table_for_resize = table_widget;
+        group.resize_callback(move |group, x, y, w, h| {
+            table_for_resize.resize(x, y, w, h.max(1));
+            group.redraw();
+        });
+        group.redraw();
+    }
+
+    fn build_value_filter_bar(
+        &self,
+        group: &Group,
+        table: &ResultTableWidget,
+    ) -> GridValueFilterBar {
+        let mut group = group.clone();
+        let (x, y, w, h) = (group.x(), group.y(), group.w(), group.h());
+        group.begin();
+        let mut bar = GridValueFilterBar::new(x, y, w);
+        group.end();
+
+        // Clicking clear acts on the visible grid, which is the grid this
+        // strip is sitting on for as long as it exists.
+        let mut tabs_for_clear = self.clone();
+        bar.set_clear_callback(move || {
+            tabs_for_clear.clear_visible_value_filter();
+        });
+
+        let mut table_widget = table.get_widget();
+        table_widget.resize(
+            x,
+            y + TABLE_BROWSE_FILTER_HEIGHT,
+            w,
+            (h - TABLE_BROWSE_FILTER_HEIGHT).max(1),
+        );
+        group.resizable(&table_widget);
+        let mut bar_for_resize = bar.clone();
+        let mut table_for_resize = table_widget;
+        group.resize_callback(move |group, x, y, w, h| {
+            bar_for_resize.layout(x, y, w);
+            table_for_resize.resize(
+                x,
+                y + TABLE_BROWSE_FILTER_HEIGHT,
+                w,
+                (h - TABLE_BROWSE_FILTER_HEIGHT).max(1),
+            );
+            group.redraw();
+        });
+        bar
     }
 
     /// Whether this tab carries a filter bar, however it got one.
@@ -2128,6 +2359,19 @@ impl ResultTabsWidget {
     /// Set on the tab rather than on a streaming batch: it belongs to the
     /// connection, and every result the tab goes on to show comes from the same
     /// one.
+    pub(crate) fn set_sort_null_ordering_by_id(&mut self, id: ResultTabId, ordering: NullOrdering) {
+        let table = self.result_tab_index_for_id(id).and_then(|index| {
+            self.data
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .get(index)
+                .map(|tab| tab.table.clone())
+        });
+        if let Some(mut table) = table {
+            table.set_sort_null_ordering(ordering);
+        }
+    }
+
     fn mark_lazy_fetch_waiting(&mut self, index: usize, session_id: u64) {
         let tab_parts = self
             .data
@@ -3035,6 +3279,13 @@ impl ResultTabsWidget {
     }
 
     #[doc(hidden)]
+    pub(crate) fn capture_tour_sort_column(&self, column: usize) {
+        if let Some(mut table) = self.current_table() {
+            table.capture_tour_sort_column(column);
+        }
+    }
+
+    #[doc(hidden)]
     pub(crate) fn capture_tour_show_context_menu(&self) -> Result<(), String> {
         self.current_table()
             .ok_or_else(|| "no visible result grid".to_string())?
@@ -3124,6 +3375,9 @@ impl ResultTabsWidget {
         }
         if let Some(filter_bar) = tab.filter_bar.as_mut() {
             filter_bar.cleanup_for_close();
+        }
+        if let Some(value_filter_bar) = tab.value_filter_bar.as_mut() {
+            value_filter_bar.cleanup_for_close();
         }
 
         // Step 1: Cleanup the table widget (clears callbacks and data buffers)

@@ -10,6 +10,7 @@
 //! identically in both places.
 
 use crate::ui::center_on_main;
+use crate::ui::column_layout::HiddenColumns;
 use crate::ui::constants::*;
 use crate::ui::find_replace::{find_next_match, install_find_input_shortcuts};
 use crate::ui::result_table::ResultTableWidget;
@@ -54,7 +55,7 @@ pub(crate) fn grid_matches(
     rows: &[Vec<String>],
     needle: &str,
     case_sensitive: bool,
-    hidden_col: Option<usize>,
+    hidden_col: &HiddenColumns,
 ) -> Vec<(usize, usize)> {
     if needle.is_empty() {
         return Vec::new();
@@ -62,7 +63,7 @@ pub(crate) fn grid_matches(
     let mut matches = Vec::new();
     for (row_index, row) in rows.iter().enumerate() {
         for (col_index, value) in row.iter().enumerate() {
-            if hidden_col == Some(col_index) {
+            if hidden_col.contains(col_index) {
                 continue;
             }
             if find_next_match(value, needle, 0, case_sensitive).is_some() {
@@ -345,6 +346,7 @@ impl GridSearchDialog {
 #[cfg(test)]
 mod tests {
     use super::{first_match_at_or_after, grid_matches, match_status, stepped_match};
+    use crate::ui::column_layout::HiddenColumns;
 
     fn sample_rows() -> Vec<Vec<String>> {
         vec![
@@ -360,35 +362,38 @@ mod tests {
 
     #[test]
     fn grid_matches_reports_cells_in_reading_order() {
-        let matches = grid_matches(&sample_rows(), "CLERK", true, None);
+        let matches = grid_matches(&sample_rows(), "CLERK", true, &HiddenColumns::default());
         assert_eq!(matches, vec![(0, 2), (2, 2)]);
     }
 
     #[test]
     fn grid_matches_folds_case_when_case_sensitivity_is_off() {
-        let matches = grid_matches(&sample_rows(), "smith", false, None);
+        let matches = grid_matches(&sample_rows(), "smith", false, &HiddenColumns::default());
         assert_eq!(matches, vec![(0, 1), (2, 1)]);
 
-        let case_sensitive = grid_matches(&sample_rows(), "smith", true, None);
+        let case_sensitive = grid_matches(&sample_rows(), "smith", true, &HiddenColumns::default());
         assert_eq!(case_sensitive, vec![(2, 1)]);
     }
 
     #[test]
     fn grid_matches_skips_the_zero_width_rowid_column() {
         let rows = vec![vec!["AAAR3s".to_string(), "AAAR3s-visible".to_string()]];
-        let matches = grid_matches(&rows, "AAAR3s", true, Some(0));
+        let matches = grid_matches(&rows, "AAAR3s", true, &HiddenColumns::automatic(Some(0)));
         assert_eq!(matches, vec![(0, 1)]);
     }
 
     #[test]
     fn grid_matches_is_empty_for_an_empty_needle() {
-        assert!(grid_matches(&sample_rows(), "", false, None).is_empty());
+        assert!(grid_matches(&sample_rows(), "", false, &HiddenColumns::default()).is_empty());
     }
 
     #[test]
     fn grid_matches_finds_substrings_inside_multibyte_values() {
         let rows = vec![vec!["서울특별시 강남구".to_string()]];
-        assert_eq!(grid_matches(&rows, "강남", true, None), vec![(0, 0)]);
+        assert_eq!(
+            grid_matches(&rows, "강남", true, &HiddenColumns::default()),
+            vec![(0, 0)]
+        );
     }
 
     #[test]

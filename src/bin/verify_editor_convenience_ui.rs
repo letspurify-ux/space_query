@@ -413,6 +413,7 @@ fn sample_cache() -> ObjectCache {
         synonyms: Vec::new(),
         packages: vec!["PKG_ORDERS".to_string()],
         package_routines,
+        table_columns: std::collections::HashMap::new(),
     }
 }
 

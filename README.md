@@ -546,6 +546,88 @@ identifier remain read-only.
 
 ![Oracle result grid in staged edit mode](docs/images/result-grid-editing.png)
 
+### Filter or sort a result the app cannot re-run
+
+Two ways to narrow a result, and a grid is offered exactly one of them.
+
+A result the app can re-run gets the **WHERE** / **ORDER BY** bar above the
+grid: what it produces is the server's answer, so it is right by definition. A
+result the app cannot re-run gets neither bar — a script product, a statement
+holding bind or substitution variables, a MySQL join repeating a column name, a
+grid whose connection has since dropped. Those results get the local pair below
+instead. Only one mechanism is ever live on a grid, so the rows on screen always
+have a single explanation.
+
+Right-click a cell and choose **Filter by Value** to keep the rows matching what
+you selected, or **Exclude Value** to keep the rest. A strip above the grid says
+what is filtered and how many rows survived, with a `×` to take it off again;
+**Clear Value Filter** in the context menu does the same.
+
+![A result filtered to one cell's value, with the strip reporting it](docs/images/value-filter.png)
+
+This filters rows already fetched and sends nothing to the server. Matching is
+exact and case-sensitive on the text the grid is showing, and an empty cell
+counts as `NULL` the same way it does everywhere else in the grid. The two
+directions always partition the result — every row is in one or the other, never
+both and never neither — which is why excluding a value keeps the `NULL` rows
+rather than quietly dropping them the way `NOT IN` would.
+
+Double-clicking a column header on such a result sorts it locally, and the header
+shows which column and which way. Where a filter bar is present the same click
+fills its **ORDER BY** instead and re-queries, so the server does the ordering.
+
+![A result sorted locally by SAL descending, with the sort marker on the header](docs/images/grid-sort.png)
+
+The local sort compares numbers exactly, by their digits rather than through
+`f64`, so a 38-digit Oracle `NUMBER` keeps every one of them. It puts `NULL`
+where the connected database would — last for Oracle, first for MySQL and
+MariaDB. It does not reproduce the server's collation: text compares by bytes,
+so `Z` sorts before `a`. Where exact ordering matters, use a result the
+**ORDER BY** bar can re-query.
+
+Editing and filtering are kept apart in both directions: a value filter hides
+rows, and staged edits are held against the rows on screen. Turn **Edit** off to
+filter, and clear the filter to edit.
+
+### Hide and reorder grid columns
+
+Right-click the grid and choose **Columns...** to pick which columns are shown
+and in what order.
+
+![The Columns dialog: a checkbox per column, with Move Up, Move Down and Reset](docs/images/column-layout.png)
+
+Double-click a column in the list, or use **Show / Hide**, to hide it; **Move
+Up** and **Move Down** reorder; **Reset** puts everything back the way the
+result arrived, undoing every change since — not just the ones made this time.
+At least one column has to stay visible, because an empty grid has no cell to
+right-click your way back from.
+
+Hiding a column takes it out of what the grid copies and exports too: what you
+see is what leaves. The arrangement belongs to the result and is dropped when a
+new one arrives. Columns cannot be rearranged while **Edit** is on or while a
+result is still loading, since both hold the columns' positions.
+
+Pinning a column to the left is not implemented.
+
+### Reopen tabs after a crash
+
+Editor tabs holding unsaved text are written to a snapshot every few seconds,
+and that snapshot is deleted on a normal exit. So it only survives an abnormal
+one — and finding it at startup is what prompts the offer.
+
+![The prompt offering back two unsaved tabs from a session that ended abnormally](docs/images/restore-tabs.png)
+
+**Reopen** puts each tab back, still unsaved and still pointing at the file it
+came from, so the next **Save** writes where you expected. **Discard** throws
+them away. The snapshot is removed either way, so a declined offer is not made
+twice. Quitting normally never shows any of this.
+
+Only tabs with unsaved changes are snapshotted, and only when their text has
+actually changed since the last one — a tab saved to disk needs no copy. A tab
+larger than 8 MB is skipped rather than shortened, and the application log says
+which one: restoring a silently truncated script would be worse than not
+restoring it.
+
 ### Export a result
 
 `Ctrl+E`, **Tools > Export Results**, and the Data Grid context menu's
@@ -567,6 +649,17 @@ export every row or just the selection, and pick a file or the clipboard.
 connected dialect; the other formats do not care. Exporting every row finishes an
 open lazy fetch first, so the file has the whole result rather than the rows
 scrolled into view. Exporting a selection never triggers a fetch.
+
+### Export a table from the object browser
+
+Right-click a table in the object browser and choose **Export Data...** to write
+the whole table out without opening it first. It opens the same dialog **Export
+Results** does, and produces byte-identical output — the row scope is fixed to
+every row, since there is no selection to narrow.
+
+The whole table is read, so a large one takes as long as reading it takes, and
+there is no way to cancel once it starts. A read-only connection keeps this
+entry: exporting only reads.
 
 ### Import a file into a table
 
@@ -614,6 +707,21 @@ Formats that cannot express a value exactly are the documented edges: Markdown
 trims a cell and writes every line break as `<br>`, HTML and Markdown spell
 `NULL` and the empty string the same way, and a CSV cell holding the NULL text
 is indistinguishable from `NULL`.
+
+### See a table's columns in the tree
+
+Press `→` on a table in the object browser, or click its expand arrow, to list
+its columns underneath with their types.
+
+![The object tree with a table expanded to show its columns and types](docs/images/tree-columns.png)
+
+The columns are read once, on the first expand, using the same query
+**View Structure** uses — so the two always agree. Dragging a column into the
+editor, or copying it, gives the bare column name, which is what a statement
+that already names its table needs. Refreshing the object browser drops the
+cached columns so an `ALTER TABLE` is picked up on the next expand.
+
+Double-clicking a table still browses its rows; expanding is `→` and the arrow.
 
 ### Copy a selection as SQL
 
@@ -735,6 +843,7 @@ library:
 | Crash report | `data_dir()/space_query/crash.log` |
 | Saved passwords | `space_query` service in the OS keyring |
 | Query history | `data_dir()/space_query/query_history.json` |
+| Unsaved editor tabs, kept only between an abnormal exit and the next start | `data_dir()/space_query/unsaved_tabs.json` |
 
 Passwords are never written to `config.json`. Existing data in the legacy
 `oracle_query_tool` config and keyring namespaces is migrated when encountered.
@@ -792,6 +901,10 @@ cargo run --bin verify_value_edit_live all
 # A read-only connection refuses writes and the database is unchanged, with a
 # writable control group proving each statement is a real write — every backend.
 cargo run --bin verify_read_only_live all
+
+# The value filter, the local sort, the column arrangement and the export
+# formats, each checked against the server's own answer — every backend.
+cargo run --bin verify_grid_features_live all
 ```
 
 Pull requests and pushes to `main` run formatting, Clippy, both non-live test

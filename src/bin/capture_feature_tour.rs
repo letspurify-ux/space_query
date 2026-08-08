@@ -1,7 +1,7 @@
 use fltk::{
     app,
     browser::HoldBrowser,
-    button::CheckButton,
+    button::{Button, CheckButton},
     draw,
     enums::{Event, FrameType},
     menu::MenuBar,
@@ -24,7 +24,11 @@ use space_query::{
         ConnectionDialog, IntellisensePopup, MainWindow, QueryHistoryDialog, SignatureLabel,
         SignatureOverload, SignaturePopup,
     },
-    utils::{arithmetic::safe_div, logging, AppConfig},
+    utils::{
+        arithmetic::safe_div,
+        local_history::{SessionSnapshot, TabSnapshot},
+        logging, AppConfig,
+    },
 };
 use std::{
     collections::HashMap,
@@ -1977,6 +1981,7 @@ fn sample_object_cache() -> ObjectCache {
         synonyms: Vec::new(),
         packages: vec!["PKG_ORDERS".to_string()],
         package_routines,
+        table_columns: std::collections::HashMap::new(),
     }
 }
 
@@ -2125,6 +2130,153 @@ ORDER BY o.CREATED_AT DESC;";
     menu.set_value(index);
     menu.do_callback();
     pump(250);
+}
+
+/// The EMP result the grid scenes are shot against.
+///
+/// The same rows the existing result-grid captures use, so a reader comparing
+/// two screenshots is looking at one change and not a different data set.
+fn show_employee_result(main_window: &mut MainWindow, selection: Option<(i32, i32, i32, i32)>) {
+    let columns = [
+        ("EMPNO", "NUMBER"),
+        ("ENAME", "VARCHAR2"),
+        ("JOB", "VARCHAR2"),
+        ("DEPTNO", "NUMBER"),
+        ("SAL", "NUMBER"),
+        ("HIREDATE", "DATE"),
+    ];
+    let rows: &[&[&str]] = &[
+        &["7369", "SMITH", "CLERK", "20", "800", "1980-12-17"],
+        &["7499", "ALLEN", "SALESMAN", "30", "1600", "1981-02-20"],
+        &["7521", "WARD", "SALESMAN", "30", "1250", "1981-02-22"],
+        &["7566", "JONES", "MANAGER", "20", "2975", "1981-04-02"],
+        &["7654", "MARTIN", "SALESMAN", "30", "1250", "1981-09-28"],
+        &["7698", "BLAKE", "MANAGER", "30", "2850", "1981-05-01"],
+        &["7782", "CLARK", "MANAGER", "10", "2450", "1981-06-09"],
+        &["7788", "SCOTT", "ANALYST", "20", "3000", "1987-04-19"],
+        &["7839", "KING", "PRESIDENT", "10", "5000", "1981-11-17"],
+        &["7844", "TURNER", "SALESMAN", "30", "1500", "1981-09-08"],
+        &["7876", "ADAMS", "CLERK", "20", "1100", "1987-05-23"],
+        &["7900", "JAMES", "CLERK", "30", "950", "1981-12-03"],
+        &["7902", "FORD", "ANALYST", "20", "3000", "1981-12-03"],
+        &["7934", "MILLER", "CLERK", "10", "1300", "1982-01-23"],
+    ];
+    main_window
+        .capture_tour_show_result(
+            "Result",
+            make_result(&columns, rows, "SELECT * FROM EMP ORDER BY EMPNO"),
+            false,
+            selection,
+        )
+        .unwrap_or_else(|err| fail(err));
+    pump(300);
+}
+
+/// The Columns dialog, which is how a wide result is narrowed down.
+fn capture_column_layout(main_window: &mut MainWindow) {
+    show_employee_result(main_window, None);
+    app::add_timeout3(0.45, |_| {
+        // Hide one column and move another so the shot shows the dialog doing
+        // something, not just listing.
+        let Some(window) = window_by_label("Columns") else {
+            fail("the Columns dialog is missing");
+        };
+        let Some(group) = window.as_group() else {
+            fail("the Columns dialog has no children");
+        };
+        let mut widgets = Vec::new();
+        collect_widgets(&group, &mut widgets);
+        let mut list = widgets
+            .iter()
+            .find_map(HoldBrowser::from_dyn_widget)
+            .unwrap_or_else(|| fail("the Columns dialog has no list"));
+        let click = |label: &str| {
+            for widget in &widgets {
+                if let Some(mut button) = Button::from_dyn_widget(widget) {
+                    if button.label() == label {
+                        button.do_callback();
+                        return;
+                    }
+                }
+            }
+            fail(format!("the Columns dialog has no {label} button"));
+        };
+        list.select(5);
+        click("Show / Hide");
+        list.select(6);
+        click("Move Up");
+        list.select(2);
+        pump(200);
+        capture_active_dialog("Columns", "/tmp/space-query-column-layout.ppm");
+    });
+    main_window.capture_tour_arrange_columns();
+    pump(200);
+}
+
+/// A result narrowed to one cell's value, with the strip that says so.
+fn capture_value_filter(main_window: &mut MainWindow) {
+    // Pick a JOB cell; several rows share it, so the filter visibly keeps more
+    // than the row that was clicked.
+    show_employee_result(main_window, Some((1, 2, 1, 2)));
+    if let Err(err) = main_window.capture_tour_filter_by_selected_values(false) {
+        fail(format!("value filter: {err}"));
+    }
+    pump(400);
+    save_main("/tmp/space-query-value-filter.ppm");
+}
+
+/// A locally sorted result, with the marker that says which column and which
+/// way.
+fn capture_grid_sort(main_window: &mut MainWindow) {
+    show_employee_result(main_window, None);
+    // SAL descending: two clicks, so the shot shows the descending marker.
+    main_window.capture_tour_sort_result_column(4);
+    main_window.capture_tour_sort_result_column(4);
+    pump(400);
+    save_main("/tmp/space-query-grid-sort.ppm");
+}
+
+/// A table expanded to its columns in the object tree.
+fn capture_tree_columns(main_window: &mut MainWindow) {
+    if !main_window.capture_tour_expand_object_path("Tables/EMP") {
+        fail(format!(
+            "the EMP table node is missing; the tree holds {:?}",
+            main_window.capture_tour_object_tree_paths()
+        ));
+    }
+    pump(400);
+    let capture_scale = std::env::var("SPACE_QUERY_CAPTURE_UI_SCALE")
+        .ok()
+        .and_then(|value| value.parse::<u32>().ok())
+        .unwrap_or(100);
+    if capture_scale <= 100 {
+        save_main_part("/tmp/space-query-tree-columns.ppm", 0, 70, 250, 705);
+    } else {
+        save_main("/tmp/space-query-tree-columns.ppm");
+    }
+}
+
+/// The prompt that offers back the tabs an abnormal exit took with it.
+fn capture_restore_tabs(main_window: &mut MainWindow) {
+    let snapshot = SessionSnapshot {
+        tabs: vec![
+            TabSnapshot {
+                label: "Query 2".to_string(),
+                file_path: Some(std::path::PathBuf::from("/Users/me/sql/monthly_close.sql")),
+                text: "SELECT * FROM ORDERS WHERE STATUS = 'OPEN';".to_string(),
+            },
+            TabSnapshot {
+                label: "Query 3".to_string(),
+                file_path: None,
+                text: "UPDATE ORDERS SET STATUS = 'CLOSED' WHERE ORDER_ID = 10248;".to_string(),
+            },
+        ],
+    };
+    app::add_timeout3(0.45, |_| {
+        capture_active_dialog("Restore Unsaved Tabs", "/tmp/space-query-restore-tabs.ppm");
+    });
+    main_window.offer_unsaved_tab_restore(&snapshot);
+    pump(200);
 }
 
 fn main() {
@@ -2282,6 +2434,35 @@ fn main() {
     if capture_mode.as_deref() == Some("value-viewer") {
         capture_object_browser(&mut main_window);
         capture_value_viewer("/tmp/space-query-value-viewer.ppm");
+        app::quit();
+        return;
+    }
+    if capture_mode.as_deref() == Some("column-layout") {
+        capture_object_browser(&mut main_window);
+        capture_column_layout(&mut main_window);
+        app::quit();
+        return;
+    }
+    if capture_mode.as_deref() == Some("value-filter") {
+        capture_object_browser(&mut main_window);
+        capture_value_filter(&mut main_window);
+        app::quit();
+        return;
+    }
+    if capture_mode.as_deref() == Some("grid-sort") {
+        capture_object_browser(&mut main_window);
+        capture_grid_sort(&mut main_window);
+        app::quit();
+        return;
+    }
+    if capture_mode.as_deref() == Some("tree-columns") {
+        capture_object_browser(&mut main_window);
+        capture_tree_columns(&mut main_window);
+        app::quit();
+        return;
+    }
+    if capture_mode.as_deref() == Some("restore-tabs") {
+        capture_restore_tabs(&mut main_window);
         app::quit();
         return;
     }

@@ -4069,59 +4069,11 @@ impl SqlEditorWidget {
             .collect()
     }
 
-    /// Classify a thin-driver column type for SQL literal generation.
-    ///
-    /// Exhaustive on purpose: when `OracleColumnType` gains a variant the
-    /// compiler forces a decision here instead of silently defaulting.
-    fn oracle_thin_value_kind(column_type: &OracleColumnType) -> SqlValueKind {
-        match column_type {
-            OracleColumnType::Varchar
-            | OracleColumnType::Long
-            | OracleColumnType::Clob
-            | OracleColumnType::Nclob
-            | OracleColumnType::Json
-            | OracleColumnType::Xml
-            | OracleColumnType::Rowid
-            | OracleColumnType::Urowid => SqlValueKind::String,
-            OracleColumnType::Number
-            | OracleColumnType::BinaryFloat
-            | OracleColumnType::BinaryDouble => SqlValueKind::Number,
-            OracleColumnType::Boolean => SqlValueKind::Boolean,
-            OracleColumnType::Date
-            | OracleColumnType::Timestamp
-            | OracleColumnType::IntervalYearMonth
-            | OracleColumnType::IntervalDaySecond => SqlValueKind::Temporal,
-            OracleColumnType::Raw => SqlValueKind::Binary,
-            // Rendered as a placeholder, JSON, or hex that no literal can
-            // reconstruct, so quoting the displayed text is the honest answer.
-            OracleColumnType::Blob
-            | OracleColumnType::Bfile
-            | OracleColumnType::Cursor
-            | OracleColumnType::Vector
-            | OracleColumnType::Object
-            | OracleColumnType::ObjectRef
-            | OracleColumnType::Unsupported(_) => SqlValueKind::Unknown,
-        }
-    }
-
     fn oracle_thin_column_info(
         columns: &[OracleThinColumnMetadata],
         normalize_internal_rowid_alias: bool,
     ) -> Vec<ColumnInfo> {
-        columns
-            .iter()
-            .map(|column| ColumnInfo {
-                name: if normalize_internal_rowid_alias
-                    && column.name.eq_ignore_ascii_case("SQ_INTERNAL_ROWID")
-                {
-                    "ROWID".to_string()
-                } else {
-                    column.name.clone()
-                },
-                data_type: format!("{:?}", column.column_type),
-                kind: Self::oracle_thin_value_kind(&column.column_type),
-            })
-            .collect()
+        crate::db::query::oracle_thin_column_info(columns, normalize_internal_rowid_alias)
     }
 
     fn oracle_thin_result_reached_eof(result: &OracleThinQueryResult) -> bool {

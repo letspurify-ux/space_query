@@ -426,8 +426,36 @@ fn main() {
     let _ = table.take_focus();
     pump_events();
 
+    // SAFETY: `AXIsProcessTrusted` takes no arguments, returns a plain boolean,
+    // and is provided by the linked ApplicationServices framework.
+    let trusted = unsafe { AXIsProcessTrusted() };
+
     let mut failures = Vec::new();
     failures.extend(run_mode_scenarios(CONTROL_MODE, &win, &mut table));
+
+    // Without accessibility trust macOS drops every synthetic event this
+    // harness posts, so no click lands anywhere and nothing about the code
+    // under test has been exercised. Reporting that as a failure would make an
+    // untrusted terminal look like a broken grid, and — worse — a real
+    // regression would be indistinguishable from it. Say what happened and
+    // stop, the way `verify_editor_convenience_ui` skips its keyboard section.
+    //
+    // A regression in the grid's column handling still moves the selection
+    // *somewhere*, so a selection that never moves at all under an untrusted
+    // process is the delivery problem, not the grid.
+    if !trusted && !failures.is_empty() && table.get_selection() == (-1, -1, -1, -1) {
+        win.hide();
+        app::wait_for(0.0).ok();
+        println!();
+        println!(
+            "SKIPPED: this process is not trusted for accessibility, so macOS discarded every \n\
+             synthetic click and keystroke. Nothing was verified.\n\
+             Grant Accessibility to the terminal (System Settings > Privacy & Security >\n\
+             Accessibility) and run this from a foreground session to exercise the real path."
+        );
+        return;
+    }
+
     if !failures.is_empty() {
         println!(
             "\nControl verification had failures; running Command fallback to separate app handler behavior from macOS Control-arrow shortcuts."

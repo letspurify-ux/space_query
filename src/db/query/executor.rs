@@ -5,8 +5,9 @@ use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
 use tns_thin::exec::{
-    BindValue as OracleThinBindValue, OracleColumnType as OracleThinColumnType,
-    OracleValue as OracleThinValue, StatementRequest as OracleThinStatementRequest,
+    BindValue as OracleThinBindValue, ColumnMetadata as OracleThinColumnMetadata,
+    OracleColumnType as OracleThinColumnType, OracleValue as OracleThinValue,
+    StatementRequest as OracleThinStatementRequest,
 };
 use tns_thin::OracleThinSession;
 
@@ -67,6 +68,67 @@ struct NestedCursorDisplay {
 enum NestedCursorDisplayValue {
     Scalar(String),
     Cursor(Box<NestedCursorDisplay>),
+}
+
+/// Thin-driver column metadata, shared by the statement pipeline and by the
+/// object browser's table export.
+///
+/// This lived on the editor until the object browser needed the same answer.
+/// Two mappings would mean a table exported from the tree could classify a
+/// column differently from the same table exported from a result grid.
+/// Classify a thin-driver column type for SQL literal generation.
+///
+/// Exhaustive on purpose: when `OracleThinColumnType` gains a variant the
+/// compiler forces a decision here instead of silently defaulting.
+pub(crate) fn oracle_thin_value_kind(column_type: &OracleThinColumnType) -> SqlValueKind {
+    match column_type {
+        OracleThinColumnType::Varchar
+        | OracleThinColumnType::Long
+        | OracleThinColumnType::Clob
+        | OracleThinColumnType::Nclob
+        | OracleThinColumnType::Json
+        | OracleThinColumnType::Xml
+        | OracleThinColumnType::Rowid
+        | OracleThinColumnType::Urowid => SqlValueKind::String,
+        OracleThinColumnType::Number
+        | OracleThinColumnType::BinaryFloat
+        | OracleThinColumnType::BinaryDouble => SqlValueKind::Number,
+        OracleThinColumnType::Boolean => SqlValueKind::Boolean,
+        OracleThinColumnType::Date
+        | OracleThinColumnType::Timestamp
+        | OracleThinColumnType::IntervalYearMonth
+        | OracleThinColumnType::IntervalDaySecond => SqlValueKind::Temporal,
+        OracleThinColumnType::Raw => SqlValueKind::Binary,
+        // Rendered as a placeholder, JSON, or hex that no literal can
+        // reconstruct, so quoting the displayed text is the honest answer.
+        OracleThinColumnType::Blob
+        | OracleThinColumnType::Bfile
+        | OracleThinColumnType::Cursor
+        | OracleThinColumnType::Vector
+        | OracleThinColumnType::Object
+        | OracleThinColumnType::ObjectRef
+        | OracleThinColumnType::Unsupported(_) => SqlValueKind::Unknown,
+    }
+}
+
+pub(crate) fn oracle_thin_column_info(
+    columns: &[OracleThinColumnMetadata],
+    normalize_internal_rowid_alias: bool,
+) -> Vec<ColumnInfo> {
+    columns
+        .iter()
+        .map(|column| ColumnInfo {
+            name: if normalize_internal_rowid_alias
+                && column.name.eq_ignore_ascii_case("SQ_INTERNAL_ROWID")
+            {
+                "ROWID".to_string()
+            } else {
+                column.name.clone()
+            },
+            data_type: format!("{:?}", column.column_type),
+            kind: oracle_thin_value_kind(&column.column_type),
+        })
+        .collect()
 }
 
 impl QueryExecutor {
@@ -8437,6 +8499,37 @@ impl ObjectBrowser {
             out.push_str(&line[cut..]);
         }
         out.trim_start_matches([' ', '\t']).to_string()
+    }
+
+    /// Run a SELECT on a thin session and return it shaped like every other
+    /// result, columns and literal kinds included.
+    ///
+    /// The OCI side already had [`QueryExecutor::execute`]; this is the thin
+    /// equivalent for callers outside the statement pipeline — the object
+    /// browser's table export — so an exported table carries the same column
+    /// classification whichever Oracle driver fetched it.
+    pub(crate) fn execute_thin_query(
+        conn: &mut OracleThinSession,
+        sql: &str,
+    ) -> Result<QueryResult, String> {
+        let start = Instant::now();
+        let mut request = OracleThinStatementRequest::query(sql, 500);
+        request.implicit_resultsets = false;
+        let described = conn
+            .query_described_fetch_all_request(&request)
+            .map_err(|err| err.to_string())?;
+        let columns = oracle_thin_column_info(&described.columns, false);
+        let rows: Vec<Vec<String>> = described
+            .result
+            .rows
+            .into_iter()
+            .map(|row| {
+                row.into_iter()
+                    .map(Self::thin_metadata_value_to_text)
+                    .collect()
+            })
+            .collect();
+        Ok(QueryResult::new_select(sql, columns, rows, start.elapsed()))
     }
 
     fn thin_metadata_value_to_text(value: OracleThinValue) -> String {
