@@ -3105,6 +3105,7 @@ impl ObjectBrowserWidget {
                                 &status_callback,
                                 &action_sender,
                                 &selected_scope,
+                                &object_cache,
                             );
                         } else if let Some(item) = t.first_selected_item() {
                             Self::show_context_menu(
@@ -3116,6 +3117,7 @@ impl ObjectBrowserWidget {
                                 &status_callback,
                                 &action_sender,
                                 &selected_scope,
+                                &object_cache,
                             );
                         }
                         return true;
@@ -3496,8 +3498,7 @@ impl ObjectBrowserWidget {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         let scope = Self::scope_snapshot(selected_scope);
-        let item_info =
-            Self::get_item_info(item).or_else(|| Self::column_item_info(item, object_cache));
+        let item_info = Self::resolve_tree_item(item, object_cache);
 
         match Self::default_action_for_item(item_info.as_ref(), db_type, scope.as_deref()) {
             ObjectDefaultAction::Browse(target) => {
@@ -3764,6 +3765,21 @@ impl ObjectBrowserWidget {
         }
     }
 
+    /// What a tree node is, columns included.
+    ///
+    /// Columns are resolved *first*. [`Self::get_item_info`] decides by the
+    /// parent's label alone, so a column of a table legitimately named `VIEWS`
+    /// would otherwise come back as a view — its parent's label is `VIEWS`,
+    /// which is also a category name. `column_item_info` is the specific test
+    /// (the grandparent must be `Tables`, and the label must be one this cache
+    /// generated), so asking it first settles the collision.
+    fn resolve_tree_item(
+        item: &TreeItem,
+        object_cache: &Arc<Mutex<ObjectCache>>,
+    ) -> Option<ObjectItem> {
+        Self::column_item_info(item, object_cache).or_else(|| Self::get_item_info(item))
+    }
+
     /// A column node, resolved against the cache the tree was built from.
     ///
     /// Separate from [`Self::get_item_info`] so that callers which must not see
@@ -3864,8 +3880,7 @@ impl ObjectBrowserWidget {
         selected_scope: Option<&str>,
         object_cache: &Arc<Mutex<ObjectCache>>,
     ) -> Option<String> {
-        Self::get_item_info(item)
-            .or_else(|| Self::column_item_info(item, object_cache))
+        Self::resolve_tree_item(item, object_cache)
             .as_ref()
             .map(|item_info| {
                 Self::copy_text_for_object_item_with_scope(item_info, db_type, selected_scope)
@@ -3876,8 +3891,7 @@ impl ObjectBrowserWidget {
         item: &TreeItem,
         object_cache: &Arc<Mutex<ObjectCache>>,
     ) -> Option<String> {
-        Self::get_item_info(item)
-            .or_else(|| Self::column_item_info(item, object_cache))
+        Self::resolve_tree_item(item, object_cache)
             .as_ref()
             .map(copy_text_for_object_item)
             .or_else(|| {
@@ -5883,8 +5897,14 @@ impl ObjectBrowserWidget {
         status_callback: &StatusCallback,
         action_sender: &std::sync::mpsc::Sender<ObjectActionResult>,
         selected_scope: &Arc<Mutex<Option<String>>>,
+        object_cache: &Arc<Mutex<ObjectCache>>,
     ) {
-        if let Some(item_info) = Self::get_item_info(item) {
+        // Resolved the same way every other tree action resolves it, so a
+        // column never reaches the object menu — including a column of a table
+        // whose name happens to match a category.
+        let item_info = Self::resolve_tree_item(item, object_cache);
+        if let Some(item_info) = item_info.filter(|info| !matches!(info, ObjectItem::Column { .. }))
+        {
             let selected_scope = Self::scope_snapshot(selected_scope);
             let _ = Self::show_context_menu_for_object_item(
                 connection,

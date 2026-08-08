@@ -1888,20 +1888,9 @@ impl ResultTabsWidget {
             return Err("There is no result grid to filter.".to_string());
         };
 
-        let mut tabs_for_report = self.clone();
-        let report = move |outcome: Result<ValueFilterOutcome, String>| match outcome {
-            Ok(outcome) => tabs_for_report.show_value_filter_state(id, &outcome),
-            Err(message) => crate::ui::alert_on_main(&message),
-        };
-        match table.apply_value_filter_after_fetch_all(filter, Box::new(report)) {
-            // Deferred behind a lazy fetch; the report runs when it finishes.
-            None => Ok(()),
-            Some(Ok(outcome)) => {
-                self.show_value_filter_state(id, &outcome);
-                Ok(())
-            }
-            Some(Err(message)) => Err(message),
-        }
+        let outcome = table.apply_value_filter(filter)?;
+        self.show_value_filter_state(id, &outcome);
+        Ok(())
     }
 
     /// Let the user hide and reorder the visible grid's columns.

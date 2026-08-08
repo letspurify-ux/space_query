@@ -13318,8 +13318,9 @@ impl MainWindow {
             Arc::new(Mutex::new(file_receiver));
         let idle_poll_cycles = Arc::new(AtomicUsize::new(0));
         let snapshot_cycles = Arc::new(AtomicUsize::new(0));
-        // Zero means "nothing written yet", which is also what an empty
-        // snapshot hashes to, so a run with no unsaved tabs never writes.
+        // Zero is "nothing written yet". It is not a hash any snapshot produces,
+        // so the first tick always reaches the writer once — which for a session
+        // with nothing unsaved means removing a file that is not there.
         let last_snapshot_key = Arc::new(AtomicU64::new(0));
 
         const CHANNEL_POLL_ACTIVE_INTERVAL_SECONDS: f64 = 0.05;
@@ -14042,9 +14043,9 @@ impl MainWindow {
     ///
     /// Runs on the idle poll and does nothing in the common case: the snapshot
     /// is hashed first, and an unchanged hash means neither serializing nor
-    /// touching the disk. `last_key` starts at zero, which is also what "no
-    /// unsaved tabs" hashes to, so a session that never dirties a tab never
-    /// writes a file.
+    /// touching the disk. A session that never dirties a tab settles after one
+    /// tick, because an empty snapshot removes the file rather than writing
+    /// one and its hash then stops changing.
     fn write_unsaved_tab_snapshot(state: &Arc<Mutex<AppState>>, last_key: &Arc<AtomicU64>) {
         use crate::utils::local_history::SessionSnapshot;
 

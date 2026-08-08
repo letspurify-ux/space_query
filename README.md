@@ -905,6 +905,10 @@ cargo run --bin verify_read_only_live all
 # The value filter, the local sort, the column arrangement and the export
 # formats, each checked against the server's own answer — every backend.
 cargo run --bin verify_grid_features_live all
+
+# The column arrangement and the value filter driven on a real grid: where the
+# rows and headers end up, and what a new result inherits from the last one.
+cargo run --bin verify_column_layout_ui
 ```
 
 Pull requests and pushes to `main` run formatting, Clippy, both non-live test

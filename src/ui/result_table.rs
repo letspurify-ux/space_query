@@ -149,21 +149,11 @@ enum LazyFetchPendingAction {
         selection: Option<(i32, i32, i32, i32)>,
     },
     Export(ExportRequest, Box<dyn FnMut(String, usize)>),
-    /// Apply a value filter once the rest of the rows are in.
-    ///
-    /// Filtering a partly fetched result would answer from whatever happened to
-    /// have arrived, so the filter is built from the selection immediately —
-    /// while the cells the user pointed at are still the cells on screen — and
-    /// only its application waits.
-    ValueFilter(
-        GridValueFilter,
-        Box<dyn FnMut(Result<ValueFilterOutcome, String>)>,
-    ),
 }
 
 /// What applying a value filter produced, for the strip that reports it.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct ValueFilterOutcome {
+pub struct ValueFilterOutcome {
     /// One line naming every filter now in force.
     pub description: String,
     pub kept_rows: usize,
@@ -8475,6 +8465,14 @@ impl ResultTableWidget {
 
     pub fn display_result(&mut self, result: &QueryResult) {
         self.invalidate_search_for_new_data();
+        // Not every result arrives through `start_streaming` — a browse page, a
+        // non-select, and the finished-batch path all land here — and this one
+        // replaces the headers and rows outright. The arrangement and the value
+        // filter describe the *previous* result's columns and rows, so they go
+        // with it. Left behind, the filter's saved rows would be restored into
+        // a grid showing a different query.
+        self.reset_value_filter_state();
+        self.reset_column_layout_state(result.columns.len());
         mutex_store_bool(&self.streaming_in_progress, false);
         *self
             .lazy_fetch_session
@@ -9002,6 +9000,27 @@ impl ResultTableWidget {
     pub fn append_rows(&mut self, mut rows: Vec<Vec<String>>) {
         if self.is_save_pending() {
             return;
+        }
+        // Rows arrive in the driver's column order, which is not the order the
+        // grid is in once its columns have been rearranged.
+        //
+        // No caller reaches this today: an open lazy fetch marks the grid as
+        // streaming, and a rearrangement is refused while that is true, so the
+        // last row lands before the first move. The placement lives here anyway
+        // because that guarantee is made two files away, in a refusal written
+        // for a different reason — and if it is ever relaxed, the failure this
+        // prevents is silent, with values sitting under the wrong headers and
+        // nothing to say so.
+        if let Some(order) = self.ingest_column_order() {
+            for row in rows.iter_mut() {
+                if row.len() != order.len() {
+                    // A short row is padded rather than skipped: the permutation
+                    // needs a full-width row, and a missing cell reads as NULL
+                    // either way.
+                    row.resize(order.len(), String::new());
+                }
+                crate::ui::column_layout::permute(row, &order);
+            }
         }
         let lazy_fetch_session_id = if rows.is_empty() {
             None
@@ -9582,9 +9601,6 @@ impl ResultTableWidget {
                     Self::copy_all_to_clipboard(&self.headers, &self.full_data, &hidden_col);
                 }
                 LazyFetchPendingAction::SelectAll => self.select_all(),
-                LazyFetchPendingAction::ValueFilter(filter, mut report) => {
-                    report(self.install_value_filter(filter));
-                }
                 LazyFetchPendingAction::MoveToEdge { edge, selection } => {
                     let hidden_col = self.hidden_columns();
                     let selection = selection.unwrap_or_else(|| self.table.get_selection());
@@ -9811,7 +9827,7 @@ impl ResultTableWidget {
     }
 
     #[doc(hidden)]
-    pub(crate) fn capture_tour_select_range(
+    pub fn capture_tour_select_range(
         &mut self,
         row_start: i32,
         col_start: i32,
@@ -9986,7 +10002,7 @@ impl ResultTableWidget {
     /// `source_index` is where each column sat when the result arrived, which
     /// is what lets Reset undo a rearrangement made on an earlier visit rather
     /// than only the one being made now.
-    pub(crate) fn column_layout_plan(&self) -> Result<ColumnLayoutPlan, String> {
+    pub fn column_layout_plan(&self) -> Result<ColumnLayoutPlan, String> {
         if let Some(reason) = self.column_layout_refusal() {
             return Err(reason);
         }
@@ -10038,6 +10054,35 @@ impl ResultTableWidget {
         None
     }
 
+    /// How an arriving row has to be rearranged to match what the grid is
+    /// showing, or `None` while the grid is still in the driver's own order.
+    ///
+    /// `column_source_order` maps each display position to the column the
+    /// result arrived with, which is exactly the permutation an incoming row
+    /// needs. A length that disagrees with the headers means the two have not
+    /// been re-synchronised yet, and rearranging on that basis would be worse
+    /// than not rearranging at all.
+    fn ingest_column_order(&self) -> Option<Vec<usize>> {
+        let order = self
+            .column_source_order
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let header_count = self
+            .headers
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .len();
+        if order.len() != header_count
+            || order
+                .iter()
+                .enumerate()
+                .all(|(position, source)| position == *source)
+        {
+            return None;
+        }
+        Some(order.clone())
+    }
+
     fn column_source_order_snapshot(&self, len: usize) -> Vec<usize> {
         let mut order = self
             .column_source_order
@@ -10055,7 +10100,7 @@ impl ResultTableWidget {
     /// keeps "display column" and "data column" the same integer for the draw
     /// callback, every hit test, the keyboard navigation helpers and the export
     /// paths — none of which learn anything new here.
-    pub(crate) fn apply_column_layout(&mut self, plan: &ColumnLayoutPlan) -> Result<(), String> {
+    pub fn apply_column_layout(&mut self, plan: &ColumnLayoutPlan) -> Result<(), String> {
         if let Some(reason) = self.column_layout_refusal() {
             return Err(reason);
         }
@@ -10160,7 +10205,7 @@ impl ResultTableWidget {
     }
 
     /// Whether any value filter is hiding rows right now.
-    pub(crate) fn value_filter_is_active(&self) -> bool {
+    pub fn value_filter_is_active(&self) -> bool {
         !self
             .value_filters
             .lock()
@@ -10192,10 +10237,7 @@ impl ResultTableWidget {
     ///
     /// Built now rather than after any pending fetch so the values it pins are
     /// the ones the user actually pointed at.
-    pub(crate) fn value_filter_from_selection(
-        &self,
-        negate: bool,
-    ) -> Result<GridValueFilter, String> {
+    pub fn value_filter_from_selection(&self, negate: bool) -> Result<GridValueFilter, String> {
         if let Some(reason) = self.value_filter_refusal() {
             return Err(reason);
         }
@@ -10219,32 +10261,21 @@ impl ResultTableWidget {
         .ok_or_else(|| "That selection holds nothing to filter by.".to_string())
     }
 
-    /// Apply `filter`, first fetching the rest of the rows when a lazy fetch is
-    /// still open. Returns `None` when the work was deferred; `report` then runs
-    /// once the fetch completes.
-    pub(crate) fn apply_value_filter_after_fetch_all(
+    /// Apply `filter` to the rows the grid is holding.
+    ///
+    /// There is no deferred form. An open lazy fetch marks the grid as
+    /// streaming, and [`Self::value_filter_refusal`] turns a filter away while
+    /// that is true — so by the time a filter can be built, every row it will
+    /// ever see has arrived.
+    pub fn apply_value_filter(
         &mut self,
         filter: GridValueFilter,
-        report: Box<dyn FnMut(Result<ValueFilterOutcome, String>)>,
-    ) -> Option<Result<ValueFilterOutcome, String>> {
-        // Ask whether a fetch is open *before* handing the filter to the queue:
-        // the queue takes the action by value and drops it when there is no
-        // session, so offering it first would lose the filter and silently do
-        // nothing — which is the common case, since most results are fully
-        // fetched by the time anyone right-clicks one.
-        if self.active_lazy_fetch_session().is_some()
-            && self.queue_action_after_fetch_all(LazyFetchPendingAction::ValueFilter(
-                filter.clone(),
-                report,
-            ))
-        {
-            return None;
-        }
-        Some(self.install_value_filter(filter))
+    ) -> Result<ValueFilterOutcome, String> {
+        self.install_value_filter(filter)
     }
 
     /// Put every filtered-out row back. Returns false when nothing was hidden.
-    pub(crate) fn clear_value_filter(&mut self) -> bool {
+    pub fn clear_value_filter(&mut self) -> bool {
         let restored = self
             .unfiltered_data
             .lock()
@@ -10720,6 +10751,34 @@ impl ResultTableWidget {
         );
         menu.popup();
         Ok(())
+    }
+
+    /// The headers this grid is currently showing, for the verification bins.
+    #[doc(hidden)]
+    pub fn capture_tour_headers(&self) -> Vec<String> {
+        self.headers
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+    }
+
+    /// One stored row, for the verification bins.
+    #[doc(hidden)]
+    pub fn capture_tour_row(&self, index: usize) -> Option<Vec<String>> {
+        self.full_data
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(index)
+            .cloned()
+    }
+
+    /// How many rows the grid is holding, for the verification bins.
+    #[doc(hidden)]
+    pub fn capture_tour_row_count(&self) -> usize {
+        self.full_data
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .len()
     }
 
     /// Sort one column locally, the way a header trigger does, for the capture
@@ -15091,6 +15150,97 @@ UPDATE EMP SET ENAME = 'MILLER' WHERE ROWID = 'AAABBB';"
 
         assert_eq!(widget.table.row_height(0), expected_height);
         assert_eq!(widget.table.row_height(2), expected_height);
+    }
+
+    #[test]
+    #[cfg_attr(
+        any(target_os = "macos", target_os = "linux"),
+        ignore = "FLTK widget tests require a native UI test environment"
+    )]
+    fn rows_arriving_after_a_rearrangement_follow_the_new_column_order() {
+        // A lazy fetch stays open on a large result, so rows keep arriving in
+        // the driver's column order long after the user has rearranged the
+        // grid. Without the ingest permutation they land under the wrong
+        // headers, which looks like corrupted data rather than a layout bug.
+        let mut widget = ResultTableWidget::new();
+        let headers = vec!["A".to_string(), "B".to_string(), "C".to_string()];
+        widget.start_streaming(&headers);
+        widget.append_rows(vec![vec![
+            "a1".to_string(),
+            "b1".to_string(),
+            "c1".to_string(),
+        ]]);
+        // A loading grid refuses to be rearranged, so the result has to land
+        // first — which is also why the ingest placement below is a guard
+        // rather than a path anyone reaches today.
+        widget.finish_streaming();
+
+        let mut plan = widget.column_layout_plan().expect("plan");
+        // Move C to the front: display order becomes C, A, B.
+        let mut at = 2;
+        while let Some(next) = plan.move_row(at, false) {
+            at = next;
+        }
+        widget.apply_column_layout(&plan).expect("apply");
+
+        // The row already on screen moved with the headers.
+        assert_eq!(
+            widget
+                .headers
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .clone(),
+            vec!["C".to_string(), "A".to_string(), "B".to_string()]
+        );
+        assert_eq!(
+            widget
+                .full_data
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())[0],
+            vec!["c1".to_string(), "a1".to_string(), "b1".to_string()]
+        );
+
+        // A later batch still arrives in driver order and has to be placed the
+        // same way.
+        widget.append_rows(vec![vec![
+            "a2".to_string(),
+            "b2".to_string(),
+            "c2".to_string(),
+        ]]);
+        assert_eq!(
+            widget
+                .full_data
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())[1],
+            vec!["c2".to_string(), "a2".to_string(), "b2".to_string()],
+            "a row appended after the rearrangement kept the driver's column order"
+        );
+    }
+
+    #[test]
+    #[cfg_attr(
+        any(target_os = "macos", target_os = "linux"),
+        ignore = "FLTK widget tests require a native UI test environment"
+    )]
+    fn a_new_result_ingests_in_its_own_order_after_an_earlier_rearrangement() {
+        let mut widget = ResultTableWidget::new();
+        widget.start_streaming(&["A".to_string(), "B".to_string()]);
+        widget.append_rows(vec![vec!["a".to_string(), "b".to_string()]]);
+        widget.finish_streaming();
+        let mut plan = widget.column_layout_plan().expect("plan");
+        plan.move_row(1, false);
+        widget.apply_column_layout(&plan).expect("apply");
+
+        // The next statement's columns have nothing to do with the old layout.
+        widget.start_streaming(&["X".to_string(), "Y".to_string()]);
+        widget.append_rows(vec![vec!["x".to_string(), "y".to_string()]]);
+        assert_eq!(
+            widget
+                .full_data
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())[0],
+            vec!["x".to_string(), "y".to_string()]
+        );
     }
 
     #[test]
