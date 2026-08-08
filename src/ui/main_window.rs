@@ -7595,6 +7595,13 @@ impl MainWindow {
         app::redraw();
     }
 
+    fn apply_soft_wrap_setting(state: &mut AppState, enabled: bool) {
+        for tab in &mut state.editor_tabs {
+            tab.sql_editor.set_soft_wrap(enabled);
+        }
+        state.right_tile.redraw();
+    }
+
     fn apply_lazy_fetch_settings(state: &mut AppState) {
         let (
             lazy_fetch_batch_size,
@@ -9227,6 +9234,22 @@ impl MainWindow {
             }
         });
 
+        let weak_state_for_menu_action = Arc::downgrade(state);
+        editor.set_menu_action_callback(move |action| {
+            let Some(state_for_menu_action) = weak_state_for_menu_action.upgrade() else {
+                return;
+            };
+            match action {
+                "Query/Go to Declaration" => {
+                    MainWindow::go_to_declaration_at_cursor(&state_for_menu_action);
+                }
+                "Query/Go to Object" => {
+                    MainWindow::open_object_search(&state_for_menu_action);
+                }
+                _ => {}
+            }
+        });
+
         let weak_state_for_find = Arc::downgrade(state);
         editor.set_find_callback(move || {
             let Some(state_for_find) = weak_state_for_find.upgrade() else {
@@ -10047,10 +10070,10 @@ impl MainWindow {
                         result_tabs.select_messages_info();
                     }
                 }
-                QueryProgress::ExplainPlanOutput { text } => {
+                QueryProgress::ExplainPlanOutput { result } => {
                     let mut result_tabs = owning_result_tabs.clone();
                     drop(s);
-                    result_tabs.append_explain_plan_tab(&text);
+                    result_tabs.append_explain_plan_tab(&result);
                 }
                 QueryProgress::PromptInput { .. } => {}
                 QueryProgress::RequestCancelOldestLazyFetchForSessionPool { response } => {
@@ -10830,6 +10853,63 @@ impl MainWindow {
         });
     }
 
+    /// Open the source of the object under the caret in a new editor tab.
+    ///
+    /// Resolution is the object browser's, so what opens is exactly what the
+    /// tree would open for the same name — no second name-matching rule.
+    fn go_to_declaration_at_cursor(state: &Arc<Mutex<AppState>>) {
+        let (editor, object_browser) = {
+            let s = state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            (s.sql_editor.clone(), s.object_browser.clone())
+        };
+        let data = editor.intellisense_data_snapshot();
+        let candidates = editor.object_context_candidates_at_cursor();
+        let opened = candidates
+            .iter()
+            .any(|candidate| object_browser.open_declaration_for_sql_selection(candidate, &data));
+        if opened {
+            return;
+        }
+        let message = match candidates.first() {
+            Some(name) => format!("No object named {name} in this scope"),
+            None => "Put the cursor on an object name first".to_string(),
+        };
+        state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .set_status_message(&message);
+    }
+
+    fn open_object_search(state: &Arc<Mutex<AppState>>) {
+        let object_browser = {
+            let s = state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            s.object_browser.clone()
+        };
+        let Some((cache, scope)) = object_browser.object_cache_snapshot() else {
+            state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .set_status_message("Connect first to search for objects");
+            return;
+        };
+        // The dialog runs a modal loop of its own, so the app state lock is
+        // released before it opens.
+        let Some(hit) = crate::ui::object_search_dialog::show(&cache, scope.as_deref()) else {
+            return;
+        };
+        let item = hit.to_object_item();
+        if !object_browser.open_declaration_for_object_item(&item, scope) {
+            state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .set_status_message(&format!("{} has no source to open", hit.display_name));
+        }
+    }
+
     fn execute_menu_action(
         state: &Arc<Mutex<AppState>>,
         schema_sender: &std::sync::mpsc::Sender<SchemaUpdate>,
@@ -11592,6 +11672,14 @@ impl MainWindow {
                 }
                 true
             }
+            "Query/Go to Declaration" => {
+                Self::go_to_declaration_at_cursor(state);
+                true
+            }
+            "Query/Go to Object" => {
+                Self::open_object_search(state);
+                true
+            }
             "Query/Explain Plan" => {
                 if let Some(editor) = acquire_sql_editor_if_idle(state) {
                     editor.explain_current();
@@ -11698,6 +11786,42 @@ impl MainWindow {
                     )
                 };
                 FindReplaceDialog::show_replace_with_registry(&mut editor, &mut buffer, popups);
+                true
+            }
+            "Edit/Go to Line" => {
+                let mut editor = {
+                    let s = state
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    s.sql_editor.clone()
+                };
+                // The prompt runs its own modal loop, so the app state lock is
+                // released before it opens.
+                editor.prompt_go_to_line();
+                true
+            }
+            "Edit/Soft Wrap" => {
+                let enabled = app::widget_from_id::<MenuBar>("main_menu")
+                    .and_then(|menu| menu.find_item("&Edit/Soft &Wrap"))
+                    .map(|item| item.value())
+                    .unwrap_or(false);
+                let mut s = state
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                {
+                    let mut config = s
+                        .config
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    config.editor_soft_wrap = enabled;
+                    let _ = config.save();
+                }
+                Self::apply_soft_wrap_setting(&mut s, enabled);
+                s.set_status_message(if enabled {
+                    "Soft wrap enabled"
+                } else {
+                    "Soft wrap disabled"
+                });
                 true
             }
             "Edit/Format SQL" => {
@@ -12364,10 +12488,23 @@ impl MainWindow {
 
         match key {
             k if ctrl_or_cmd
+                && shift
+                && (k == fltk::enums::Key::from_char('n')
+                    || k == fltk::enums::Key::from_char('N')) =>
+            {
+                Some("Query/Go to Object")
+            }
+            k if ctrl_or_cmd
                 && (k == fltk::enums::Key::from_char('n')
                     || k == fltk::enums::Key::from_char('N')) =>
             {
                 Some("File/Connect")
+            }
+            k if ctrl_or_cmd
+                && (k == fltk::enums::Key::from_char('b')
+                    || k == fltk::enums::Key::from_char('B')) =>
+            {
+                Some("Query/Go to Declaration")
             }
             k if ctrl_or_cmd
                 && (k == fltk::enums::Key::from_char('d')
@@ -12457,6 +12594,13 @@ impl MainWindow {
                     || k == fltk::enums::Key::from_char('H')) =>
             {
                 Some("Edit/Replace")
+            }
+            k if ctrl_or_cmd
+                && !shift
+                && (k == fltk::enums::Key::from_char('g')
+                    || k == fltk::enums::Key::from_char('G')) =>
+            {
+                Some("Edit/Go to Line")
             }
             k if ctrl_or_cmd
                 && shift
@@ -13787,6 +13931,77 @@ impl MainWindow {
         state.sql_editor.focus();
         state.window.redraw();
         editor
+    }
+
+    /// How many *display* rows the editor draws for its whole buffer.
+    ///
+    /// With soft wrap off this is the number of newlines; with it on, a long
+    /// line counts once per wrapped row. That difference is the only in-process
+    /// evidence that FLTK really changed its wrap mode.
+    #[doc(hidden)]
+    pub fn capture_tour_editor_display_line_count(&mut self) -> i32 {
+        let state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let editor = state.sql_editor.get_editor();
+        let buffer = state.sql_buffer.clone();
+        editor.count_lines(0, buffer.length(), true)
+    }
+
+    /// One-based line number of the editor caret.
+    #[doc(hidden)]
+    pub fn capture_tour_editor_caret_line(&mut self) -> usize {
+        let state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let editor = state.sql_editor.get_editor();
+        let position = editor.insert_position().max(0);
+        let text = state.sql_buffer.text();
+        text.char_indices()
+            .take_while(|(index, _)| (*index as i32) < position)
+            .filter(|(_, ch)| *ch == '\n')
+            .count()
+            .saturating_add(1)
+    }
+
+    /// Number of editor tabs, so a probe can prove a setting reached all of them.
+    #[doc(hidden)]
+    pub fn capture_tour_editor_tab_count(&mut self) -> usize {
+        let state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        state.editor_tabs.len()
+    }
+
+    /// Open a second editor tab, the way `File > New Tab` does.
+    #[doc(hidden)]
+    pub fn capture_tour_new_editor_tab(&mut self) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _ = Self::create_query_editor_tab(&mut state);
+    }
+
+    /// Display rows drawn by every editor tab, in tab order.
+    #[doc(hidden)]
+    pub fn capture_tour_all_editor_display_line_counts(&mut self) -> Vec<i32> {
+        let state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        state
+            .editor_tabs
+            .iter()
+            .map(|tab| {
+                let editor = tab.sql_editor.get_editor();
+                let buffer = tab.sql_editor.get_buffer();
+                editor.count_lines(0, buffer.length(), true)
+            })
+            .collect()
     }
 
     #[doc(hidden)]
@@ -15914,7 +16129,12 @@ mod tests {
         assert_progress_routes_only(
             "explain plan",
             QueryProgress::ExplainPlanOutput {
-                text: "plan".to_string(),
+                result: QueryResult::new_select(
+                    "",
+                    vec![result_test_column("Operation")],
+                    vec![vec!["SELECT STATEMENT".to_string()]],
+                    Duration::ZERO,
+                ),
             },
             &[ResultPaneRoute::DataGrid],
         );

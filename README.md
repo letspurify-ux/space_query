@@ -114,11 +114,14 @@ macOS, use `Cmd` where `Ctrl` is shown.
 | Execute the selection or statement at the cursor | `Ctrl+Enter` or `F9` |
 | Execute the complete script | `F5` |
 | Quick describe the object at the cursor | `F4` |
+| Open the definition of the object at the cursor | `Ctrl+B` |
+| Search objects by name | `Ctrl+Shift+N` |
 | Explain Plan / EXPLAIN | `F6` |
 | Commit / roll back | `F7` / `F8` |
 | Open IntelliSense | `Ctrl+Space` |
 | Expand the code snippet at the cursor | `Tab` or `Ctrl+J` |
 | Format the selection or current statement | `Ctrl+Shift+F` |
+| Go to a line number | `Ctrl+G` |
 
 The complete shortcut list is available under **Help > Keyboard Shortcuts**.
 
@@ -183,6 +186,38 @@ The built-in templates cover `SELECT`, `SELECT COUNT(*)`, `INSERT`, `UPDATE`,
 `IF`, and numeric `FOR` loop. A multi-line body is indented to match the line
 the abbreviation was typed on.
 
+#### Soft wrap and Go to Line
+
+**Edit > Soft Wrap** wraps long lines at the editor's right edge instead of
+scrolling sideways, which is what generated DDL and long `IN (...)` lists need.
+The setting is saved, so it applies to every tab — the ones already open, the
+ones opened afterwards, and the ones restored on the next start. The line-number
+gutter keeps numbering buffer lines, not wrapped rows.
+
+![A long statement wrapped at the editor's right edge](docs/images/soft-wrap.png)
+
+`Ctrl+G` asks for a line number and puts the caret there — the shortest path
+from a script error that names a line to the line itself. A number past the end
+of the buffer goes to the last line rather than being refused; anything that is
+not a plain number is reported instead of guessed at.
+
+#### Go to declaration and object search
+
+`Ctrl+B` resolves the object name under the caret and opens its source in a new
+editor tab: the body of a view, procedure, function or package, and the `CREATE`
+statement of a table. A package member opens its package, which is where its
+source lives. Resolution is the object browser's own, so `Ctrl+B` opens exactly
+what the tree would open for the same name — schema-qualified names and package
+members included.
+
+`Ctrl+Shift+N` searches the objects of the current scope by name. Exact matches
+come first, then prefixes, then anything containing the text; `Enter` opens the
+highlighted object's source. The list is built from the metadata the object
+browser has already loaded, so it answers without a round trip and never shows
+something the tree does not.
+
+![Searching objects by name, with each match labelled by kind](docs/images/object-search.png)
+
 ### SQL formatting
 
 The formatter applies SQL-aware line breaks and indentation in place. It uses
@@ -235,6 +270,31 @@ MySQL / MariaDB family:
 - `SOURCE`
 
 </details>
+
+### Explain plan
+
+`F6` explains the statement at the cursor and shows the plan in its own Data
+Grid tab.
+
+![An Oracle execution plan drawn as a tree, with per-step cost share](docs/images/explain-plan.png)
+
+On Oracle the plan is read out of `PLAN_TABLE`, not out of pre-rendered
+`DBMS_XPLAN` text, so every step keeps the values the optimizer produced. The
+connectors in the `Operation` column are drawn from each step's real parent, so
+the shape on screen is the one the database reported — nothing is inferred from
+indentation. `Cost` is the cumulative cost Oracle reports; `Cost %` is what the
+step spends *on itself* — its cost minus its children's — as a share of the
+plan's total, which is what makes an expensive step stand out from the
+ancestors that merely contain it. Access and filter predicates sit on the rows
+they belong to instead of in a footnote.
+
+MySQL and MariaDB keep the server's own `EXPLAIN` columns — `id`, `select_type`,
+`table`, `type`, `key`, `rows`, `Extra` and the rest — with a `Rows %` share
+added. No tree is drawn there: a classic `EXPLAIN` has no parent column, and
+deriving one from `id` and `select_type` would be a guess rather than a report.
+
+Because the plan is an ordinary grid, everything the grid does works on it:
+`Ctrl+F` to find a step, selection totals, copy, and export.
 
 ### Object browser
 
@@ -570,8 +630,15 @@ checks are separate binaries:
 # The import modal, driven through its own event loop.
 cargo run --bin verify_import_ui
 
+# Soft wrap, Go to Line and the object search modal, driven through the
+# application's own menu bar.
+cargo run --bin verify_editor_convenience_ui
+
 # Export a table, import the file back, compare — every format, every backend.
 cargo run --bin verify_import_live all
+
+# Explain plan shape and Go to Declaration — every backend.
+cargo run --bin verify_explain_plan_live all
 ```
 
 Pull requests and pushes to `main` run formatting, Clippy, both non-live test

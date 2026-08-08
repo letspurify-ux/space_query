@@ -32,8 +32,13 @@ Editing, exporting, or closing a hidden grid while a support pane is selected
 is forbidden by this rule.
 
 Besides ordinary query results, ref cursors, Quick Describe, object-browser
-queries, and Explain Plan can use Data Grid. `append_explain_plan_tab()` converts
-plan text to a one-column `QueryResult` whose column is named `Text`.
+queries, and Explain Plan can use Data Grid. `append_explain_plan_tab()` takes a
+`QueryResult` built by `SqlEditorWidget::build_explain_plan_result`, which renders
+`ExplainPlanData` through `explain_plan::plan_grid`. Oracle plans arrive as
+`ExplainPlanData::Tree` — `PLAN_TABLE` rows with real parent links, drawn with
+connector glyphs in the `Operation` column — and MySQL/MariaDB plans as
+`ExplainPlanData::Flat`, which keeps the server's own `EXPLAIN` columns. Every
+column is text, because the values are already formatted for reading.
 
 ## Selection totals
 

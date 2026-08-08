@@ -3,23 +3,28 @@ use fltk::{
     browser::HoldBrowser,
     draw,
     enums::{Event, FrameType},
+    menu::MenuBar,
     misc::Tooltip,
     prelude::*,
     window::Window,
 };
 use space_query::{
-    db::{ColumnInfo, DatabaseType, QueryResult, SqlValueKind},
+    db::{ColumnInfo, DatabaseType, PackageRoutine, QueryResult, SqlValueKind},
     ui::{
         apply_global_default_font,
         constants::{BUTTON_HEIGHT, TAB_HEADER_HEIGHT},
+        explain_plan::{plan_grid, ExplainPlanData, PlanNode},
         intellisense::input_caret_popup_anchor,
         log_viewer::LogViewerDialog,
-        profile_by_name, show_settings_dialog, theme, ConnectionDialog, IntellisensePopup,
-        MainWindow, QueryHistoryDialog, SignatureLabel, SignatureOverload, SignaturePopup,
+        object_browser::ObjectCache,
+        object_search_dialog, profile_by_name, show_settings_dialog, theme, ConnectionDialog,
+        IntellisensePopup, MainWindow, QueryHistoryDialog, SignatureLabel, SignatureOverload,
+        SignaturePopup,
     },
     utils::{arithmetic::safe_div, logging, AppConfig},
 };
 use std::{
+    collections::HashMap,
     fs::File,
     io::Write,
     sync::{Arc, Mutex, OnceLock},
@@ -1792,6 +1797,198 @@ fn capture_dialogs(config: &AppConfig) {
     LogViewerDialog::show(Arc::new(Mutex::new(Vec::new())));
 }
 
+/// The plan of a two-table join with a scalar subquery, in the shape Oracle
+/// reports it: cumulative costs, and a parent for every step but the root.
+fn sample_plan_nodes() -> Vec<PlanNode> {
+    fn node(
+        (id, parent_id): (i64, Option<i64>),
+        operation: &str,
+        object_name: &str,
+        (cardinality, bytes, cost): (Option<i64>, Option<i64>, Option<i64>),
+        predicates: &str,
+    ) -> PlanNode {
+        PlanNode {
+            id,
+            parent_id,
+            operation: operation.to_string(),
+            object_name: object_name.to_string(),
+            cardinality,
+            bytes,
+            cost,
+            predicates: predicates.to_string(),
+        }
+    }
+
+    vec![
+        node(
+            (0, None),
+            "SELECT STATEMENT",
+            "",
+            (Some(1420), Some(97980), Some(148)),
+            "",
+        ),
+        node(
+            (1, Some(0)),
+            "SORT ORDER BY",
+            "",
+            (Some(1420), Some(97980), Some(148)),
+            "",
+        ),
+        node(
+            (2, Some(1)),
+            "HASH JOIN",
+            "",
+            (Some(1420), Some(97980), Some(121)),
+            "access(\"E\".\"DEPTNO\"=\"D\".\"DEPTNO\")",
+        ),
+        node(
+            (3, Some(2)),
+            "TABLE ACCESS FULL",
+            "SCOTT.DEPT",
+            (Some(4), Some(88), Some(3)),
+            "",
+        ),
+        node(
+            (4, Some(2)),
+            "TABLE ACCESS FULL",
+            "SCOTT.EMP",
+            (Some(1420), Some(66740), Some(112)),
+            "filter(\"E\".\"SAL\">:B1)",
+        ),
+        node(
+            (5, Some(4)),
+            "SORT AGGREGATE",
+            "",
+            (Some(1), Some(13), None),
+            "",
+        ),
+        node(
+            (6, Some(5)),
+            "TABLE ACCESS FULL",
+            "SCOTT.EMP",
+            (Some(14000), Some(182000), Some(96)),
+            "",
+        ),
+    ]
+}
+
+fn capture_explain_plan(main_window: &mut MainWindow) {
+    main_window.capture_tour_set_sql(
+        "SELECT d.DNAME, e.ENAME, e.SAL\n  FROM DEPT d\n  JOIN EMP e ON e.DEPTNO = d.DEPTNO\n \
+         WHERE e.SAL > (SELECT AVG(SAL) FROM EMP)\n ORDER BY e.SAL DESC;",
+        None,
+    );
+    pump(200);
+
+    let (columns, rows) = plan_grid(&ExplainPlanData::Tree(sample_plan_nodes()));
+    let result = QueryResult {
+        sql: String::new(),
+        columns: columns
+            .into_iter()
+            .map(|name| ColumnInfo {
+                name,
+                data_type: "VARCHAR2".to_string(),
+                kind: SqlValueKind::Unknown,
+            })
+            .collect(),
+        row_count: rows.len(),
+        rows,
+        execution_time: Duration::from_millis(9),
+        message: "Explain plan loaded".to_string(),
+        is_select: true,
+        success: true,
+    };
+    main_window
+        .capture_tour_show_result("Explain Plan", result, false, None)
+        .unwrap_or_else(|err| fail(format!("show explain plan: {err}")));
+    pump(450);
+    save_main("/tmp/space-query-explain-plan.ppm");
+}
+
+fn sample_object_cache() -> ObjectCache {
+    let mut package_routines = HashMap::new();
+    package_routines.insert(
+        "PKG_ORDERS".to_string(),
+        vec![
+            PackageRoutine {
+                name: "PLACE_ORDER".to_string(),
+                routine_type: "PROCEDURE".to_string(),
+            },
+            PackageRoutine {
+                name: "ORDER_TOTAL".to_string(),
+                routine_type: "FUNCTION".to_string(),
+            },
+        ],
+    );
+    ObjectCache {
+        tables: vec![
+            "ORDERS".to_string(),
+            "ORDER_ITEMS".to_string(),
+            "CUSTOMERS".to_string(),
+        ],
+        views: vec!["V_ORDER_TOTALS".to_string()],
+        procedures: vec!["REBUILD_ORDER_INDEX".to_string()],
+        functions: vec!["ORDER_COUNT".to_string()],
+        sequences: vec!["ORDER_SEQ".to_string()],
+        triggers: vec!["TRG_ORDERS_AUDIT".to_string()],
+        events: Vec::new(),
+        synonyms: Vec::new(),
+        packages: vec!["PKG_ORDERS".to_string()],
+        package_routines,
+    }
+}
+
+fn capture_object_search_dialog(needle: &str, path: &str) {
+    let mut input = first_input_in_window("Go to Object — SCOTT")
+        .unwrap_or_else(|| fail("Go to Object input is missing"));
+    input.set_value(needle);
+    input.do_callback();
+    pump(250);
+    capture_active_dialog("Go to Object — SCOTT", path);
+}
+
+fn capture_object_search(main_window: &mut MainWindow) {
+    main_window.capture_tour_set_sql(
+        "SELECT * FROM ORDERS o\n WHERE o.STATUS = 'OPEN'\n ORDER BY o.CREATED_AT DESC;",
+        None,
+    );
+    pump(200);
+    app::add_timeout3(0.45, |_| {
+        capture_object_search_dialog("order", "/tmp/space-query-object-search.ppm")
+    });
+    let _ = object_search_dialog::show(&sample_object_cache(), Some("SCOTT"));
+}
+
+fn capture_soft_wrap(main_window: &mut MainWindow) {
+    let long_line = "SELECT o.ORDER_ID, o.CUSTOMER_ID, o.STATUS, o.TOTAL_AMOUNT, o.CREATED_AT \
+FROM ORDERS o WHERE o.ORDER_ID IN (1001,1002,1003,1004,1005,1006,1007,1008,1009,1010,1011,1012,\
+1013,1014,1015,1016,1017,1018,1019,1020,1021,1022,1023,1024,1025,1026,1027,1028,1029,1030) \
+ORDER BY o.CREATED_AT DESC;";
+    main_window.capture_tour_set_sql(long_line, Some(0));
+    pump(200);
+
+    let mut menu = app::widget_from_id::<MenuBar>("main_menu").unwrap_or_else(|| fail("main menu"));
+    let index = menu.find_index("&Edit/Soft &Wrap");
+    if index < 0 {
+        fail("the Soft Wrap menu item is missing");
+    }
+    if let Some(mut item) = menu.at(index) {
+        item.set();
+    }
+    menu.set_value(index);
+    menu.do_callback();
+    pump(400);
+    save_main("/tmp/space-query-soft-wrap.ppm");
+
+    // Leave the editor as it was, so later captures are unaffected.
+    if let Some(mut item) = menu.at(index) {
+        item.clear();
+    }
+    menu.set_value(index);
+    menu.do_callback();
+    pump(250);
+}
+
 fn main() {
     let capture_mode = std::env::args().nth(1);
     let ui_scale_percent = std::env::var("SPACE_QUERY_CAPTURE_UI_SCALE")
@@ -1922,14 +2119,34 @@ fn main() {
         app::quit();
         return;
     }
+    if capture_mode.as_deref() == Some("explain-plan") {
+        capture_object_browser(&mut main_window);
+        capture_explain_plan(&mut main_window);
+        app::quit();
+        return;
+    }
+    if capture_mode.as_deref() == Some("object-search") {
+        capture_object_browser(&mut main_window);
+        capture_object_search(&mut main_window);
+        app::quit();
+        return;
+    }
+    if capture_mode.as_deref() == Some("soft-wrap") {
+        capture_object_browser(&mut main_window);
+        capture_soft_wrap(&mut main_window);
+        app::quit();
+        return;
+    }
     capture_object_browser(&mut main_window);
     capture_intellisense(&mut main_window);
     capture_signature_popup(&mut main_window);
     capture_formatting(&mut main_window);
+    capture_soft_wrap(&mut main_window);
     capture_result_grid(&mut main_window);
     capture_grid_search(&mut main_window);
     capture_selection_summary(&mut main_window);
     capture_code_snippets(&mut main_window);
+    capture_explain_plan(&mut main_window);
     capture_object_drop_confirmation("/tmp/space-query-object-drop-confirmation.ppm");
     capture_grid_sql_export(&mut main_window);
     capture_result_export(&mut main_window);
@@ -1937,6 +2154,7 @@ fn main() {
     capture_table_browse_popup(&mut main_window, false);
     capture_result_editing(&mut main_window);
     capture_session_activity(&mut main_window);
+    capture_object_search(&mut main_window);
     capture_dialogs(&config);
     app::quit();
 }

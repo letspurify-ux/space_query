@@ -262,7 +262,7 @@ impl SqlEditorWidget {
             .is_some_and(|suffix| suffix.starts_with('.'))
     }
 
-    fn object_context_reference_at_position(
+    pub(crate) fn object_context_reference_at_position(
         buffer: &TextBuffer,
         text_shadow: &Arc<Mutex<HighlightShadowState>>,
         pos: i32,

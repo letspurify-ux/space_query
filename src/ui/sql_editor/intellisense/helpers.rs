@@ -591,6 +591,13 @@ impl SqlEditorWidget {
         Self::invoke_callback(callback_slot, "file drop callback", move |cb| cb(path))
     }
 
+    fn invoke_menu_action_callback(
+        callback_slot: &Arc<Mutex<Option<Box<dyn FnMut(&'static str)>>>>,
+        action: &'static str,
+    ) -> bool {
+        Self::invoke_callback(callback_slot, "menu action callback", move |cb| cb(action))
+    }
+
     fn invoke_object_context_callback(
         callback_slot: &ObjectContextCallback,
         selected_text: String,
@@ -620,7 +627,7 @@ impl SqlEditorWidget {
         }
     }
 
-    fn right_click_object_context_candidates(
+    pub(crate) fn right_click_object_context_candidates(
         clicked_reference: Option<&str>,
         selected_text: &str,
     ) -> Vec<String> {

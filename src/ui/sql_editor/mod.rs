@@ -7,7 +7,7 @@ use fltk::{
     input::IntInput,
     menu::MenuButton,
     prelude::*,
-    text::{TextBuffer, TextEditor, WrapMode},
+    text::{PositionType, TextBuffer, TextEditor, WrapMode},
     window::Window,
 };
 use mysql::prelude::Queryable;
@@ -29,6 +29,7 @@ use crate::db::{
     TransactionMode, TransactionSessionState,
 };
 use crate::ui::constants::*;
+use crate::ui::explain_plan::{self, ExplainPlanData};
 use crate::ui::font_settings::{
     configured_editor_font_size, configured_editor_profile, FontProfile,
 };
@@ -525,7 +526,7 @@ pub enum QueryProgress {
         lines: Vec<String>,
     },
     ExplainPlanOutput {
-        text: String,
+        result: QueryResult,
     },
     PromptInput {
         prompt: String,
@@ -840,7 +841,7 @@ pub(crate) enum QuickDescribeData {
 enum UiActionResult {
     ExplainPlan {
         token: QueryOperationToken,
-        result: Result<Vec<String>, String>,
+        result: Result<ExplainPlanData, String>,
     },
     QuickDescribe {
         object_name: String,
@@ -969,7 +970,7 @@ trait ExplainPlanBackend: Sync {
         current_query_cancel_handle: &Arc<Mutex<Option<QueryCancelHandle>>>,
         current_mysql_cancel_context: &Arc<Mutex<Option<MySqlQueryCancelContext>>>,
         cancel_flag: &Arc<Mutex<bool>>,
-    ) -> Result<Vec<String>, String>;
+    ) -> Result<ExplainPlanData, String>;
 }
 
 struct OracleExplainPlanBackend;
@@ -1713,7 +1714,7 @@ impl ExplainPlanBackend for OracleExplainPlanBackend {
         current_query_cancel_handle: &Arc<Mutex<Option<QueryCancelHandle>>>,
         _current_mysql_cancel_context: &Arc<Mutex<Option<MySqlQueryCancelContext>>>,
         cancel_flag: &Arc<Mutex<bool>>,
-    ) -> Result<Vec<String>, String> {
+    ) -> Result<ExplainPlanData, String> {
         let tracked_schema = conn_guard
             .tracked_oracle_current_schema()
             .map(str::to_string);
@@ -1736,6 +1737,7 @@ impl ExplainPlanBackend for OracleExplainPlanBackend {
                             .map_err(|err| err.to_string())
                     },
                 )
+                .map(|rows| ExplainPlanData::Tree(explain_plan::oracle_plan_nodes(&rows)))
             }
             Ok(DbConnection::OracleThin(db_conn)) => {
                 let mut session = db_conn
@@ -1756,6 +1758,7 @@ impl ExplainPlanBackend for OracleExplainPlanBackend {
                     let _ = cancel_handle.break_execution();
                 }
                 QueryExecutor::get_thin_explain_plan(&mut session, sql)
+                    .map(|rows| ExplainPlanData::Tree(explain_plan::oracle_plan_nodes(&rows)))
             }
             Ok(DbConnection::MySQL { .. }) => {
                 Err("Expected Oracle connection but found MySQL-family connection".to_string())
@@ -1776,7 +1779,7 @@ impl ExplainPlanBackend for MysqlExplainPlanBackend {
         current_query_cancel_handle: &Arc<Mutex<Option<QueryCancelHandle>>>,
         current_mysql_cancel_context: &Arc<Mutex<Option<MySqlQueryCancelContext>>>,
         cancel_flag: &Arc<Mutex<bool>>,
-    ) -> Result<Vec<String>, String> {
+    ) -> Result<ExplainPlanData, String> {
         SqlEditorWidget::run_mysql_action_with_timeout(
             conn_guard,
             current_mysql_cancel_context,
@@ -1788,6 +1791,14 @@ impl ExplainPlanBackend for MysqlExplainPlanBackend {
                 crate::db::query::mysql_executor::MysqlExecutor::get_explain_plan(mysql_conn, sql)
             },
         )
+        .map(|result| ExplainPlanData::Flat {
+            columns: result
+                .columns
+                .iter()
+                .map(|column| column.name.clone())
+                .collect(),
+            rows: result.rows,
+        })
     }
 }
 
@@ -1999,6 +2010,10 @@ pub struct SqlEditorWidget {
     timeout_input: IntInput,
     status_callback: Arc<Mutex<Option<Box<dyn FnMut(&str)>>>>,
     find_callback: Arc<Mutex<Option<Box<dyn FnMut()>>>>,
+    /// Editor shortcuts whose action lives outside the editor (the object
+    /// browser, for instance). Carries the menu path so there is exactly one
+    /// implementation of each action, in `MainWindow::execute_menu_action`.
+    menu_action_callback: Arc<Mutex<Option<Box<dyn FnMut(&'static str)>>>>,
     replace_callback: Arc<Mutex<Option<Box<dyn FnMut()>>>>,
     file_drop_callback: Arc<Mutex<Option<Box<dyn FnMut(PathBuf)>>>>,
     object_context_callback: ObjectContextCallback,
@@ -2799,7 +2814,7 @@ impl SqlEditorWidget {
         editor.set_text_font(editor_profile.normal);
         editor.set_text_size(editor_size as i32);
         editor.set_cursor_color(theme::text_primary());
-        editor.wrap_mode(WrapMode::None, 0);
+        editor.wrap_mode(Self::wrap_mode_for(editor_config.editor_soft_wrap), 0);
         editor.super_handle_first(false);
         editor.set_linenumber_width(48);
         editor.set_linenumber_fgcolor(theme::text_muted());
@@ -2860,6 +2875,8 @@ impl SqlEditorWidget {
         let deferred_semantic_rehighlight_handle = Arc::new(Mutex::new(None));
         let status_callback: Arc<Mutex<Option<Box<dyn FnMut(&str)>>>> = Arc::new(Mutex::new(None));
         let find_callback: Arc<Mutex<Option<Box<dyn FnMut()>>>> = Arc::new(Mutex::new(None));
+        let menu_action_callback: Arc<Mutex<Option<Box<dyn FnMut(&'static str)>>>> =
+            Arc::new(Mutex::new(None));
         let replace_callback: Arc<Mutex<Option<Box<dyn FnMut()>>>> = Arc::new(Mutex::new(None));
         let file_drop_callback: Arc<Mutex<Option<Box<dyn FnMut(PathBuf)>>>> =
             Arc::new(Mutex::new(None));
@@ -2939,6 +2956,7 @@ impl SqlEditorWidget {
             timeout_input,
             status_callback,
             find_callback,
+            menu_action_callback,
             replace_callback,
             file_drop_callback,
             object_context_callback,
@@ -4027,13 +4045,14 @@ impl SqlEditorWidget {
                         };
                         match action {
                             UiActionResult::ExplainPlan { token, result } => match result {
-                                Ok(plan_lines) => {
-                                    let plan_text =
-                                        SqlEditorWidget::render_explain_plan(&plan_lines);
-                                    let _ = widget
-                                        .progress_sender
-                                        .for_operation(token)
-                                        .send(QueryProgress::ExplainPlanOutput { text: plan_text });
+                                Ok(plan) => {
+                                    let plan_result =
+                                        SqlEditorWidget::build_explain_plan_result(&plan);
+                                    let _ = widget.progress_sender.for_operation(token).send(
+                                        QueryProgress::ExplainPlanOutput {
+                                            result: plan_result,
+                                        },
+                                    );
                                     if widget.operation_token_is_current_or_completed(token) {
                                         widget.emit_status("Explain plan loaded");
                                     }
@@ -4430,7 +4449,7 @@ impl SqlEditorWidget {
         current_query_cancel_handle: &Arc<Mutex<Option<QueryCancelHandle>>>,
         current_mysql_cancel_context: &Arc<Mutex<Option<MySqlQueryCancelContext>>>,
         cancel_flag: &Arc<Mutex<bool>>,
-    ) -> Result<Vec<String>, String> {
+    ) -> Result<ExplainPlanData, String> {
         explain_plan_backend_for(conn_guard.db_type()).get_explain_plan(
             &mut conn_guard,
             sql,
@@ -4443,12 +4462,34 @@ impl SqlEditorWidget {
         )
     }
 
-    fn render_explain_plan(plan_lines: &[String]) -> String {
-        if plan_lines.is_empty() {
-            return "No plan output.".to_string();
+    /// Turn a plan into the grid the Explain Plan tab shows.
+    ///
+    /// Every column is text: the values are already formatted for reading
+    /// (grouped digits, connector glyphs, share bars) and re-typing them would
+    /// only invite the grid to right-align or re-format them again.
+    fn build_explain_plan_result(plan: &ExplainPlanData) -> QueryResult {
+        let (column_names, rows) = explain_plan::plan_grid(plan);
+        QueryResult {
+            sql: String::new(),
+            columns: column_names
+                .into_iter()
+                .map(|name| ColumnInfo {
+                    name,
+                    data_type: "VARCHAR2".to_string(),
+                    kind: crate::db::SqlValueKind::Unknown,
+                })
+                .collect(),
+            row_count: rows.len(),
+            rows,
+            execution_time: Duration::from_secs(0),
+            message: if plan.is_empty() {
+                "No plan output.".to_string()
+            } else {
+                "Explain plan loaded".to_string()
+            },
+            is_select: true,
+            success: true,
         }
-
-        plan_lines.join("\n")
     }
 
     fn build_text_result_request(label: &str, content: &str, message: &str) -> ResultTabRequest {
@@ -4485,35 +4526,6 @@ impl SqlEditorWidget {
         ResultTabRequest {
             label: label.to_string(),
             result,
-        }
-    }
-
-    #[cfg(test)]
-    fn build_explain_plan_result_request(plan_text: &str) -> ResultTabRequest {
-        let rows = if plan_text.is_empty() {
-            Vec::new()
-        } else {
-            plan_text
-                .lines()
-                .map(|line| vec![line.to_string()])
-                .collect()
-        };
-        ResultTabRequest {
-            label: "Explain Plan".to_string(),
-            result: QueryResult {
-                sql: String::new(),
-                columns: vec![ColumnInfo {
-                    name: "Text".to_string(),
-                    data_type: "VARCHAR2".to_string(),
-                    kind: crate::db::SqlValueKind::Unknown,
-                }],
-                row_count: rows.len(),
-                rows,
-                execution_time: Duration::from_secs(0),
-                message: "Explain plan loaded".to_string(),
-                is_select: true,
-                success: true,
-            },
         }
     }
 
@@ -5701,6 +5713,16 @@ impl SqlEditorWidget {
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(Box::new(callback));
     }
 
+    pub fn set_menu_action_callback<F>(&mut self, callback: F)
+    where
+        F: FnMut(&'static str) + 'static,
+    {
+        *self
+            .menu_action_callback
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(Box::new(callback));
+    }
+
     pub fn set_find_callback<F>(&mut self, callback: F)
     where
         F: FnMut() + 'static,
@@ -5851,6 +5873,118 @@ impl SqlEditorWidget {
         Self::refresh_editor_display_metrics(&mut self.editor);
         self.editor.redraw();
         self.timeout_input.redraw();
+    }
+
+    /// Object names to try for a cursor-driven object action, best first.
+    ///
+    /// Same resolution the editor's right-click menu uses: the identifier under
+    /// the caret (with its qualifier, alias declarations excluded), then the
+    /// selected text. Returning candidates rather than one name lets the caller
+    /// fall back when the first does not resolve to anything.
+    pub fn object_context_candidates_at_cursor(&self) -> Vec<String> {
+        let (pos, _) = Self::editor_cursor_position(&self.editor, &self.buffer);
+        let reference =
+            Self::object_context_reference_at_position(&self.buffer, &self.highlight_shadow, pos)
+                .map(|(reference, _, _)| reference);
+        Self::right_click_object_context_candidates(
+            reference.as_deref(),
+            &self.buffer.selection_text(),
+        )
+    }
+
+    pub fn intellisense_data_snapshot(&self) -> IntellisenseData {
+        self.intellisense_data
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+    }
+
+    fn wrap_mode_for(soft_wrap: bool) -> WrapMode {
+        if soft_wrap {
+            WrapMode::AtBounds
+        } else {
+            WrapMode::None
+        }
+    }
+
+    pub fn set_soft_wrap(&mut self, enabled: bool) {
+        self.editor.wrap_mode(Self::wrap_mode_for(enabled), 0);
+        Self::refresh_editor_display_metrics(&mut self.editor);
+    }
+
+    /// Parse a Go to Line request. Returns a zero-based line index.
+    ///
+    /// Out-of-range numbers are clamped rather than rejected: the user asked to
+    /// go somewhere, and the nearest end of the buffer is the closest honest
+    /// answer. Anything that is not a plain decimal number is an error, because
+    /// guessing what `12a` meant would move the caret somewhere unasked.
+    fn parse_goto_line_input(input: &str, line_count: usize) -> Result<usize, String> {
+        let trimmed = input.trim();
+        if trimmed.is_empty() {
+            return Err("Enter a line number.".to_string());
+        }
+        if !trimmed.bytes().all(|byte| byte.is_ascii_digit()) {
+            return Err(format!("`{trimmed}` is not a line number."));
+        }
+        let requested: usize = trimmed.parse().map_err(|_| {
+            format!(
+                "`{trimmed}` is out of range. Enter a line between 1 and {}.",
+                line_count.max(1)
+            )
+        })?;
+        let last_line = line_count.max(1);
+        Ok(requested.clamp(1, last_line).saturating_sub(1))
+    }
+
+    /// Ask for a line number and move the caret there. Returns `false` when the
+    /// user cancelled.
+    pub fn prompt_go_to_line(&mut self) -> bool {
+        let line_count = self
+            .highlight_shadow
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .line_count()
+            .max(1);
+        let current_line = self.current_line_number();
+        let Some(input) = crate::ui::input_on_main(
+            &format!("Go to line (1-{line_count}):"),
+            &current_line.to_string(),
+        ) else {
+            return false;
+        };
+        match Self::parse_goto_line_input(&input, line_count) {
+            Ok(line_index) => {
+                self.go_to_line_index(line_index);
+                true
+            }
+            Err(message) => {
+                Self::show_alert_dialog(&message);
+                false
+            }
+        }
+    }
+
+    /// One-based line number the caret currently sits on.
+    fn current_line_number(&self) -> usize {
+        let (pos, _) = Self::editor_cursor_position(&self.editor, &self.buffer);
+        self.highlight_shadow
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .line_index_for_position(pos as usize)
+            .saturating_add(1)
+    }
+
+    fn go_to_line_index(&mut self, line_index: usize) {
+        let start = self
+            .highlight_shadow
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .line_start_for_index(line_index);
+        let (start, _) = Self::cursor_position(&self.buffer, start as i32);
+        self.editor.set_insert_position(start);
+        self.editor.show_insert_position();
+        let _ = self.editor.take_focus();
+        self.editor.redraw();
     }
 
     #[allow(dead_code)]
@@ -7898,31 +8032,80 @@ mod execution_state_tests {
 #[cfg(test)]
 mod explain_plan_tests {
     use super::SqlEditorWidget;
+    use crate::ui::explain_plan::{ExplainPlanData, PlanNode};
 
-    #[test]
-    fn render_explain_plan_keeps_plan_text_unprefixed() {
-        let plan = vec![
-            "Plan hash value: 1".to_string(),
-            "TABLE ACCESS FULL".to_string(),
-        ];
-        let rendered = SqlEditorWidget::render_explain_plan(&plan);
-        assert_eq!(rendered, "Plan hash value: 1\nTABLE ACCESS FULL");
+    fn tree() -> ExplainPlanData {
+        ExplainPlanData::Tree(vec![
+            PlanNode {
+                id: 0,
+                parent_id: None,
+                operation: "SELECT STATEMENT".to_string(),
+                cost: Some(10),
+                ..PlanNode::default()
+            },
+            PlanNode {
+                id: 1,
+                parent_id: Some(0),
+                operation: "TABLE ACCESS FULL".to_string(),
+                object_name: "SCOTT.EMP".to_string(),
+                cardinality: Some(1000),
+                cost: Some(10),
+                ..PlanNode::default()
+            },
+        ])
     }
 
     #[test]
-    fn build_explain_plan_result_uses_text_column_only() {
-        let result = SqlEditorWidget::build_explain_plan_result_request(
-            "Plan hash value: 1\nTABLE ACCESS FULL",
-        );
-
-        assert_eq!(result.result.columns.len(), 1);
-        assert_eq!(result.result.columns[0].name, "Text");
+    fn an_oracle_plan_becomes_a_tree_shaped_grid() {
+        let result = SqlEditorWidget::build_explain_plan_result(&tree());
+        let names: Vec<&str> = result
+            .columns
+            .iter()
+            .map(|column| column.name.as_str())
+            .collect();
         assert_eq!(
-            result.result.rows,
+            names,
             vec![
-                vec!["Plan hash value: 1".to_string()],
-                vec!["TABLE ACCESS FULL".to_string()],
+                "Operation",
+                "Object",
+                "Rows",
+                "Bytes",
+                "Cost",
+                "Cost %",
+                "Predicates"
             ]
+        );
+        assert_eq!(result.rows[0][0], "SELECT STATEMENT");
+        assert_eq!(result.rows[1][0], "\u{2514}\u{2500} TABLE ACCESS FULL");
+        assert_eq!(result.rows[1][1], "SCOTT.EMP");
+        assert_eq!(result.row_count, 2);
+        assert!(result.success);
+    }
+
+    #[test]
+    fn a_mysql_plan_keeps_the_servers_own_columns() {
+        let plan = ExplainPlanData::Flat {
+            columns: vec!["id".to_string(), "table".to_string()],
+            rows: vec![vec!["1".to_string(), "orders".to_string()]],
+        };
+        let result = SqlEditorWidget::build_explain_plan_result(&plan);
+        assert_eq!(result.columns[0].name, "id");
+        assert_eq!(result.columns[1].name, "table");
+        assert_eq!(result.rows[0], vec!["1".to_string(), "orders".to_string()]);
+    }
+
+    #[test]
+    fn an_empty_plan_says_so_in_the_message() {
+        let result = SqlEditorWidget::build_explain_plan_result(&ExplainPlanData::Tree(Vec::new()));
+        assert_eq!(result.message, "No plan output.");
+        assert!(result.rows.is_empty());
+    }
+
+    #[test]
+    fn a_plan_with_rows_reports_that_it_loaded() {
+        assert_eq!(
+            SqlEditorWidget::build_explain_plan_result(&tree()).message,
+            "Explain plan loaded"
         );
     }
 }
@@ -8352,3 +8535,71 @@ mod format_sweep_tests;
 
 #[cfg(test)]
 mod visual_format_regression_tests;
+
+#[cfg(test)]
+mod editor_convenience_tests {
+    use super::*;
+
+    fn goto(input: &str, line_count: usize) -> Result<usize, String> {
+        SqlEditorWidget::parse_goto_line_input(input, line_count)
+    }
+
+    #[test]
+    fn line_number_becomes_zero_based_index() {
+        assert_eq!(goto("1", 10), Ok(0));
+        assert_eq!(goto("7", 10), Ok(6));
+        assert_eq!(goto("10", 10), Ok(9));
+    }
+
+    #[test]
+    fn surrounding_whitespace_is_ignored() {
+        assert_eq!(goto("  4\t", 10), Ok(3));
+    }
+
+    #[test]
+    fn numbers_past_the_end_clamp_to_the_last_line() {
+        assert_eq!(goto("999", 10), Ok(9));
+    }
+
+    #[test]
+    fn zero_clamps_to_the_first_line() {
+        assert_eq!(goto("0", 10), Ok(0));
+    }
+
+    #[test]
+    fn an_empty_buffer_still_has_one_line() {
+        assert_eq!(goto("5", 0), Ok(0));
+    }
+
+    #[test]
+    fn an_empty_request_is_rejected() {
+        assert!(goto("", 10).is_err());
+        assert!(goto("   ", 10).is_err());
+    }
+
+    #[test]
+    fn non_numeric_input_is_rejected_rather_than_guessed() {
+        assert!(goto("12a", 10).is_err());
+        assert!(goto("-3", 10).is_err());
+        assert!(goto("1.5", 10).is_err());
+        assert!(goto("1e3", 10).is_err());
+    }
+
+    #[test]
+    fn a_number_too_large_for_usize_is_reported_not_panicked() {
+        let huge = "9".repeat(40);
+        assert!(goto(&huge, 10).is_err());
+    }
+
+    #[test]
+    fn soft_wrap_flag_selects_the_wrap_mode() {
+        assert!(matches!(
+            SqlEditorWidget::wrap_mode_for(true),
+            WrapMode::AtBounds
+        ));
+        assert!(matches!(
+            SqlEditorWidget::wrap_mode_for(false),
+            WrapMode::None
+        ));
+    }
+}

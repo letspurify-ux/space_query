@@ -352,7 +352,7 @@ impl HighlightShadowState {
         self.text.line_start(pos)
     }
 
-    fn line_start_for_index(&self, line_index: usize) -> usize {
+    pub(crate) fn line_start_for_index(&self, line_index: usize) -> usize {
         self.text.line_start_for_index(line_index)
     }
 
@@ -369,7 +369,7 @@ impl HighlightShadowState {
         self.text.line_end(pos)
     }
 
-    fn line_index_for_position(&self, pos: usize) -> usize {
+    pub(crate) fn line_index_for_position(&self, pos: usize) -> usize {
         self.text.line_index_for_position(pos)
     }
 
@@ -1295,24 +1295,44 @@ impl SqlEditorWidget {
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(handle);
     }
 
+    /// First visible buffer line and how many buffer lines the viewport covers.
+    ///
+    /// This must not use `scroll_row()`: with soft wrap on, FLTK counts *display*
+    /// rows there, so a single long line would push the re-highlight window off
+    /// the part of the document the user is actually looking at. Asking the
+    /// widget which character sits at the top and bottom of its own rectangle is
+    /// correct with wrapping on or off, so there is no branch here.
+    fn visible_buffer_line_window(&self, shadow: &HighlightShadowState) -> (usize, usize) {
+        let top_position = self
+            .editor
+            .xy_to_position(self.editor.x(), self.editor.y(), PositionType::Character)
+            .max(0) as usize;
+        let bottom_position = self
+            .editor
+            .xy_to_position(
+                self.editor.x(),
+                self.editor.y() + self.editor.h().max(1) - 1,
+                PositionType::Character,
+            )
+            .max(0) as usize;
+        let top_line = shadow.line_index_for_position(top_position);
+        let bottom_line = shadow
+            .line_index_for_position(bottom_position.max(top_position))
+            .max(top_line);
+        (top_line, bottom_line.saturating_sub(top_line).saturating_add(1))
+    }
+
     fn rehighlight_visible_semantic_window(&self) {
         if self.editor.was_deleted() {
             return;
         }
-        let top_line = self.editor.scroll_row().max(0) as usize;
-        let row_height = (self.editor.text_size() + 6).max(1);
-        let visible_line_count = crate::utils::arithmetic::safe_div(
-            self.editor.h().max(row_height),
-            row_height,
-        )
-        .max(1) as usize;
-
         let mut style_buffer = self.style_buffer.clone();
         let updated_range = {
             let mut shadow = self
                 .highlight_shadow
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let (top_line, visible_line_count) = self.visible_buffer_line_window(&shadow);
             let Some((start, end, entry_state)) =
                 shadow.visible_semantic_range(top_line, visible_line_count)
             else {

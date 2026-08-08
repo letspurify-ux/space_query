@@ -9,10 +9,9 @@ use fltk::{
 use std::any::Any;
 use std::panic::{self, AssertUnwindSafe};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
 
 use crate::db::query::result_messages;
-use crate::db::{ColumnInfo, ExecutionOrigin, QueryResult, ResultEditDescriptor, SqlValueKind};
+use crate::db::{ExecutionOrigin, QueryResult, ResultEditDescriptor, SqlValueKind};
 use crate::ui::constants;
 use crate::ui::font_settings::{
     configured_result_font_size, configured_result_profile, FontProfile,
@@ -1447,33 +1446,10 @@ impl ResultTabsWidget {
         Self::append_lines_to_pane(pane, lines);
     }
 
-    fn text_result(sql: &str, text: &str, message: &str) -> QueryResult {
-        let rows = if text.is_empty() {
-            Vec::new()
-        } else {
-            text.lines().map(|line| vec![line.to_string()]).collect()
-        };
-        QueryResult {
-            sql: sql.to_string(),
-            columns: vec![ColumnInfo {
-                name: "Text".to_string(),
-                data_type: "VARCHAR2".to_string(),
-                kind: crate::db::SqlValueKind::Unknown,
-            }],
-            row_count: rows.len(),
-            rows,
-            execution_time: Duration::ZERO,
-            message: message.to_string(),
-            is_select: true,
-            success: true,
-        }
-    }
-
-    pub fn append_explain_plan_tab(&mut self, text: &str) {
+    pub fn append_explain_plan_tab(&mut self, result: &QueryResult) {
         let tab_id = self.reserve_result_tab_id();
         self.ensure_statement_tab_by_id(tab_id, "Explain Plan", true);
-        let result = Self::text_result("Explain Plan", text, "Explain plan loaded");
-        self.display_result_by_id(tab_id, &result);
+        self.display_result_by_id(tab_id, result);
     }
 
     fn start_statement_with_selection(
@@ -3458,25 +3434,6 @@ mod tests {
     }
 
     #[test]
-    fn explain_plan_text_result_uses_text_column_only() {
-        let result = ResultTabsWidget::text_result(
-            "Explain Plan",
-            "Plan hash value: 1\nTABLE ACCESS FULL",
-            "loaded",
-        );
-
-        assert_eq!(result.columns.len(), 1);
-        assert_eq!(result.columns[0].name, "Text");
-        assert_eq!(
-            result.rows,
-            vec![
-                vec!["Plan hash value: 1".to_string()],
-                vec!["TABLE ACCESS FULL".to_string()],
-            ]
-        );
-    }
-
-    #[test]
     fn result_status_uses_shared_terminal_state_mapping() {
         let done = QueryResult::new_select("select 1", Vec::new(), Vec::new(), Duration::ZERO);
         let mut cancelled = QueryResult::new_error("select sleep", "Query cancelled");
@@ -3639,6 +3596,19 @@ mod tests {
         ResultTabsWidget::invoke_lazy_fetch_callback(&callback, 11, LazyFetchRequest::Cancel);
     }
 
+    fn explain_plan_result(operation: &str) -> QueryResult {
+        QueryResult::new_select(
+            "",
+            vec![crate::db::ColumnInfo {
+                name: "Operation".to_string(),
+                data_type: "VARCHAR2".to_string(),
+                kind: crate::db::SqlValueKind::Unknown,
+            }],
+            vec![vec![operation.to_string()]],
+            std::time::Duration::ZERO,
+        )
+    }
+
     #[test]
     #[cfg_attr(
         any(target_os = "macos", target_os = "linux"),
@@ -3646,10 +3616,10 @@ mod tests {
     )]
     fn font_changes_update_existing_and_future_result_tables() {
         let mut tabs = ResultTabsWidget::new(0, 0, 640, 360);
-        tabs.append_explain_plan_tab("first");
+        tabs.append_explain_plan_tab(&explain_plan_result("first"));
 
         tabs.apply_font_settings(FONT_PROFILES[1], 23);
-        tabs.append_explain_plan_tab("second");
+        tabs.append_explain_plan_tab(&explain_plan_result("second"));
 
         let sizes = tabs
             .data

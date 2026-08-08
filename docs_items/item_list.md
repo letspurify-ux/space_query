@@ -1,6 +1,6 @@
 # DataGrip 대비 미구현 기능 목록 (시급도 순)
 
-작성일: 2026-08-06 · 갱신일: 2026-08-08 (항목 7·8 완료 기록, 구현 상태 재확인, 항목 24~33 추가)
+작성일: 2026-08-06 · 갱신일: 2026-08-08 (항목 10·12·28 완료 기록. 그 전 갱신: 항목 7·8 완료 기록, 구현 상태 재확인, 항목 24~33 추가)
 
 ## 조사 범위와 기준
 
@@ -389,6 +389,42 @@ DROP할 수 있는 타입)이 붙었다 — `DestructiveObjectAction`
 - **난이도**: 중. Quick Describe 인프라(커서 위치 → 객체 해석)를 재사용해
   "정의 열기" 액션을 추가하는 형태.
 
+#### 구현 상태 (2026-08-08) — 완료
+
+`Ctrl+B`가 커서 아래 객체의 소스를 새 에디터 탭에 열고, `Ctrl+Shift+N`이 이름으로
+객체를 찾는다. 둘 다 같은 종착점(`spawn_generate_ddl` → `SqlAction::OpenInNewTab`)을
+쓴다.
+
+| 조각 | 위치 |
+| --- | --- |
+| 이름 랭킹 (순수 함수, 테스트 17개) | `src/ui/object_search.rs` |
+| 검색 모달 | `src/ui/object_search_dialog.rs` |
+| 커서 아래 이름 후보 | `SqlEditorWidget::object_context_candidates_at_cursor` |
+| 이름 → 객체 → 소스 | `ObjectBrowserWidget::open_declaration_for_sql_selection` / `declaration_target_for_item` |
+| 진입점 | `MainWindow::go_to_declaration_at_cursor` / `open_object_search` |
+| 캡쳐 검증 | `capture_feature_tour object-search` |
+
+설계상 결정 네 가지:
+
+- **해석기를 새로 만들지 않았다.** 우클릭 컨텍스트 메뉴가 이미 쓰는
+  `resolve_selected_object_context`(1·2·3부 이름, 패키지 루틴, 스코프 정규화)를
+  그대로 부른다. 그래서 `Ctrl+B`가 여는 것은 **같은 이름에 대해 트리가 여는 것과
+  정확히 같다.** 이름 판정 규칙이 두 벌 생기지 않는다.
+- **`default_action_for_item`은 일부러 쓰지 않았다.** 트리에서 테이블을 더블클릭하면
+  데이터를 보지만, "정의로 이동"은 언제나 정의여야 한다. 그래서 테이블도 DDL을 연다.
+  패키지 멤버는 자기 DDL이 없으므로 패키지를 연다 — 트리가 패키지 자식에 대해 하는
+  선택과 같다.
+- **전역 검색은 이미 캐시된 현재 스코프만 본다.** 서버로 조회하지 않으므로 즉시
+  답하고, 트리에 없는 것을 보여줄 수 없다. 트리 필터와 다른 점은 **평면 랭킹 목록 +
+  키보드로 바로 열기**다: 정확 일치 → 접두 일치 → 부분 일치 순, 같은 등급이면 짧은
+  이름이 위. 패키지 멤버는 맨이름으로도 `PKG.MEMBER`로도 찾히고 표시는 항상 한정된다.
+- **에디터 단축키는 메뉴 액션 하나를 부른다.** `Ctrl+B`/`Ctrl+Shift+N`은
+  `menu_action_callback`으로 메뉴 경로를 넘기므로 구현이 `execute_menu_action` 한
+  곳에만 있다. 메뉴에서 눌렀을 때와 키로 눌렀을 때가 갈릴 수 없다.
+
+**남은 것**: 서버 전역 검색(`ALL_OBJECTS` / `INFORMATION_SCHEMA` 질의)은 범위 밖.
+현재 스코프에 없는 객체는 스코프를 바꾼 뒤 찾아야 한다.
+
 ### 11. 커넥션 색상 구분 + 읽기 전용(프로덕션 보호) 모드
 
 - **DataGrip**: 데이터 소스마다 색을 지정해 에디터/탭에 표시. 데이터 소스를
@@ -438,6 +474,58 @@ DROP할 수 있는 타입)이 붙었다 — `DestructiveObjectAction`
 - **현재 상태**: `F6` Explain Plan 결과를 **일반 결과 그리드**로 표시한다.
 - **영향**: 계획 트리의 부모/자식 관계와 비용 비중을 눈으로 못 읽는다.
 - **난이도**: 중(트리 위젯 + 비용 비율 강조). 데이터는 이미 있으므로 표현 문제.
+
+#### 구현 상태 (2026-08-08) — 완료
+
+`F6` 결과가 한 컬럼짜리 텍스트가 아니라 **연결선이 그려진 계획 그리드**가 됐다.
+
+| 조각 | 위치 |
+| --- | --- |
+| 계획 모델·연결선·비용 몫 (순수 함수, 테스트 28개) | `src/ui/explain_plan.rs` |
+| Oracle `PLAN_TABLE` 조회 (OCI / thin) | `QueryExecutor::get_explain_plan` / `get_thin_explain_plan` |
+| MySQL/MariaDB `EXPLAIN` 원본 결과 | `MysqlExecutor::get_explain_plan` |
+| 백엔드 분기 | `trait ExplainPlanBackend` (`sql_editor/mod.rs`) |
+| 그리드 조립 | `SqlEditorWidget::build_explain_plan_result` |
+| 라이브 검증 | `src/bin/verify_explain_plan_live.rs` |
+| 캡쳐 검증 | `capture_feature_tour explain-plan` |
+
+**이 항목은 표현 문제가 아니었다.** 구조 정보가 UI에 닿기 *전에* 버려지고 있었다 —
+Oracle은 `PLAN_TABLE`을 아예 읽지 않고 `DBMS_XPLAN.DISPLAY`가 미리 그려 준 ASCII만
+받았고, MySQL은 진짜 컬럼과 행을 받아 놓고 `format_explain_lines`가 패딩 문자열로
+평탄화했다. 양쪽 다 조회와 반환 타입을 바꿔야 했다.
+
+설계상 결정 네 가지:
+
+- **그리드에 그렸다. FLTK `Tree` 위젯을 넣지 않았다.** `ResultTab.table`이
+  non-optional이라 트리를 넣으려면 `result_tabs.rs` 구조를 흔들어야 하고, 그 탭에서
+  그리드 검색(`Ctrl+F`)·선택 집계·복사·내보내기를 전부 잃는다. 대신 `Operation`
+  컬럼에 연결선을 그렸다 — 계획은 결국 "한 컬럼이 계층인 표"다.
+- **연결선은 `PARENT_ID`에서 나온다.** 들여쓰기를 세거나 추측하지 않는다. 형제
+  마지막이면 `└─`, 아니면 `├─`, 조상 줄기는 `│`. 라이브 게이트가 **그려진 연결선
+  깊이 == 실제 부모 체인 깊이**를 대조한다.
+- **`Cost`는 Oracle이 보고한 누적 비용 그대로, `Cost %`는 자기 비용 몫이다.**
+  자기 비용 = `cost - Σ자식 cost`(음수는 0). 누적 비용을 그대로 비율로 쓰면 부모가
+  자식을 품고 있다는 이유만으로 항상 비싸 보인다. 자기 비용이라야 "어느 단계가
+  비싼가"가 읽힌다. 비용이 NULL인 단계가 있으면 몫의 합은 100%가 되지 않는다 —
+  없는 값을 지어내지 않기 때문이고, 이는 의도된 결과다.
+- **MySQL/MariaDB에는 트리를 지어내지 않는다.** classic `EXPLAIN`에는 부모 컬럼이
+  없다. `id`/`select_type`으로 부모를 추정하는 것은 휴리스틱이고, 1번 항목에서 로컬
+  평가기를 기각한 것과 같은 이유로 거부했다. 대신 서버가 준 컬럼을 **그대로** 내고
+  `rows` 몫만 `Rows %`로 덧붙인다(정확한 산술, 추정 없음).
+
+부수적으로 **Predicate Information 각주가 사라지고 행 자체로 옮겨졌다.**
+`ACCESS_PREDICATES`/`FILTER_PREDICATES`가 그 단계의 `Predicates` 칸에 직접 들어가므로
+`DBMS_XPLAN`처럼 id를 보고 각주를 찾아갈 필요가 없다.
+
+**라이브 검증 — 4개 백엔드.** `verify_explain_plan_live`가 Oracle Thin / Oracle OCI /
+MySQL / MariaDB에서 조인 + 스칼라 서브쿼리 문장을 F6과 같은 경로로 설명시키고,
+루트가 하나인지·모든 `parent_id`가 실재하는지·사이클이 없는지·연결선 깊이가 맞는지·
+Oracle은 predicate와 cost 몫이 실려 오는지·MySQL 계열은 서버 컬럼이 그대로인지를
+확인한다. Thin과 OCI는 바이트 단위로 같은 계획을 낸다.
+
+**남은 것**: `DBMS_XPLAN`의 Note 각주(동적 통계 사용 등)는 `PLAN_TABLE`에 없으므로
+표시하지 않는다. MySQL `EXPLAIN FORMAT=JSON` 기반의 진짜 트리는 버전별 구조 차이가
+커서 범위 밖으로 뒀다(사용자가 직접 친 `EXPLAIN FORMAT=JSON`은 지금도 그냥 실행된다).
 
 ### 13. 외래키 기반 관련 데이터 이동 (Go to Referenced Data)
 
@@ -514,6 +602,43 @@ DROP할 수 있는 타입)이 붙었다 — `DestructiveObjectAction`
   스크립트 실행 에러는 줄 번호를 알려주는데 그 줄로 가는 최단 경로가 없다.
 - **난이도**: 소(랩 토글은 `wrap_mode` 한 줄 + 설정 저장, Go to Line은 작은 모달) /
   대(폴딩 — FLTK `TextEditor`에 폴딩 개념이 없어 사실상 직접 구현이라 Tier 2다).
+
+#### 구현 상태 (2026-08-08) — 완료 (소프트 랩 · Go to Line)
+
+**Edit > Soft Wrap** 토글과 `Ctrl+G` Go to Line.
+
+| 조각 | 위치 |
+| --- | --- |
+| 설정 | `AppConfig::editor_soft_wrap` (`src/utils/config.rs`) |
+| 적용 | `SqlEditorWidget::set_soft_wrap` · `MainWindow::apply_soft_wrap_setting` |
+| 줄 번호 파싱 (순수 함수, 테스트 9개) | `SqlEditorWidget::parse_goto_line_input` |
+| 이동 | `SqlEditorWidget::prompt_go_to_line` → `go_to_line_index` |
+| GUI 검증 | `src/bin/verify_editor_convenience_ui.rs` |
+| 캡쳐 검증 | `capture_feature_tour soft-wrap` |
+
+설계상 결정 네 가지:
+
+- **랩 상태는 생성자가 설정에서 읽는다.** 토글이 열려 있는 탭을 순회하는 것과 별개로
+  `SqlEditorWidget::new`가 `AppConfig::runtime()`을 보므로, **나중에 만들어지는 탭과
+  캡쳐 도구까지 자동으로 따라온다.** 새 탭이 랩되지 않는 버그가 생길 자리가 없다.
+- **메뉴 체크 상태는 `populate()`가 다시 만든다.** `sync_recent_sql_file_items`가
+  메뉴를 통째로 `clear()` + `populate()` 하므로, 최근 파일 목록이 바뀔 때마다 체크가
+  풀리는 일을 한 곳에서 막았다.
+- **래핑이 깨뜨리는 실제 로직이 하나 있어서 같이 고쳤다.**
+  `rehighlight_visible_semantic_window`가 `editor.scroll_row()`를 **버퍼 줄 번호**로
+  쓰고 있었다. 래핑을 켜면 그 값은 *표시 행* 번호가 되어 긴 줄이 하나만 있어도
+  하이라이트 창이 화면 밖을 겨냥한다. 이제 에디터 사각형의 위/아래 끝에 있는 문자를
+  물어 버퍼 줄로 바꾼다 — **래핑 여부와 무관하게 옳으므로 분기가 없다.**
+- **범위를 벗어난 줄 번호는 거절이 아니라 클램프다.** 사용자는 "어딘가로 가자"고
+  했으므로 가장 가까운 끝이 가장 정직한 답이다. 다만 숫자가 아닌 입력은 추측하지
+  않고 사유를 말한다 — `12a`를 12로 읽어 커서를 옮기면 시키지 않은 일이 된다.
+
+**GUI 검증**은 FLTK가 정말 랩 모드를 바꿨는지를 `count_lines`(표시 행 수)로 확인한다.
+"바꾸라고 시켰다"가 아니라 "긴 줄 하나가 4행으로 그려진다"를 본다. 열려 있던 탭과
+토글 이후 새로 만든 탭 양쪽, 설정 저장, 되돌리기, Go to Line의 이동/클램프/취소까지
+실제 메뉴 바와 실제 모달로 확인한다.
+
+**남은 것**: 코드 폴딩은 여전히 Tier 2다(FLTK `TextEditor`에 폴딩 개념이 없다).
 
 ---
 
@@ -642,15 +767,17 @@ DROP할 수 있는 타입)이 붙었다 — `DestructiveObjectAction`
 | ✅ | ~~11-b. 그리드 내 텍스트 검색~~ | **완료** |
 | ✅ | ~~5. Drop / Truncate~~ | **완료** — Rename/Modify Table은 범위 밖 |
 | ✅ | ~~7. 선택 집계 표시~~ · ~~8. 코드 스니펫~~ | **완료** |
-| 1 | **3. 파일 임포트 — UI 연결** | 엔진(`result_import` + `table_import`)이 이미 있고 진입점만 없다. 가장 먼저 끝낼 것 |
-| 2 | 25. 셀 값으로 빠른 필터 | 이미 있는 `grid_sql_export` 리터럴 생성을 그대로 쓴다 |
-| 3 | 26. 객체 트리 Export / Import | 3번이 끝나는 순간 메뉴 항목 두 개로 끝난다 |
-| 4 | 24. 결과 정렬 수단 | 헤더 정렬 제거로 생긴 구멍. (a)안이면 작다 |
-| 5 | 4. 값 에디터 패널 | 기존 모달 확장, LOB 편집 구멍을 메움 |
-| 6 | 11. 커넥션 색상 + 읽기 전용 | `sql_classification.rs` 재사용, 사고 방지 |
-| 7 | 28. 소프트 랩 · Go to Line | 각각 작고 매일 걸리는 마찰 |
-| 8 | 16. 미저장 탭 복원 | 데이터 손실 방지 |
-| 9 | 6. 컬럼 숨김/순서 · 27. 트리 컬럼 노드 | 구조 변경 수반 |
+| ✅ | ~~3. 파일 임포트~~ | **완료** — UI 연결까지 |
+| ✅ | ~~28. 소프트 랩 · Go to Line~~ | **완료** — 폴딩은 범위 밖 |
+| ✅ | ~~10. Go to Declaration / 전역 객체 검색~~ | **완료** — 서버 전역 검색은 범위 밖 |
+| ✅ | ~~12. 실행 계획 시각화~~ | **완료** — MySQL 계열은 트리 없이 서버 컬럼 그대로 |
+| 1 | 25. 셀 값으로 빠른 필터 | 이미 있는 `grid_sql_export` 리터럴 생성을 그대로 쓴다 |
+| 2 | 26. 객체 트리 Export / Import | 3번이 끝난 지금 메뉴 항목 하나로 끝난다 |
+| 3 | 24. 결과 정렬 수단 | 헤더 정렬 제거로 생긴 구멍. (a)안이면 작다 |
+| 4 | 4. 값 에디터 패널 | 기존 모달 확장, LOB 편집 구멍을 메움 |
+| 5 | 11. 커넥션 색상 + 읽기 전용 | `sql_classification.rs` 재사용, 사고 방지 |
+| 6 | 16. 미저장 탭 복원 | 데이터 손실 방지 |
+| 7 | 6. 컬럼 숨김/순서 · 27. 트리 컬럼 노드 | 구조 변경 수반 |
 
 ### 이 목록의 한계 (검토 요청)
 

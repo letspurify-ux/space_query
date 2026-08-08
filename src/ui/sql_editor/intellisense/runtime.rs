@@ -571,6 +571,7 @@ impl SqlEditorWidget {
         let mut keydown_had_alt_for_handle = false;
         let mut widget_for_shortcuts = self.clone();
         let find_callback_for_handle = self.find_callback.clone();
+        let menu_action_callback_for_handle = self.menu_action_callback.clone();
         let replace_callback_for_handle = self.replace_callback.clone();
         let file_drop_callback_for_handle = self.file_drop_callback.clone();
         let object_context_callback_for_handle = self.object_context_callback.clone();
@@ -1104,6 +1105,24 @@ impl SqlEditorWidget {
                             widget_for_shortcuts.format_selected_sql();
                             return true;
                         }
+                        if shift && Self::matches_alpha_shortcut(shortcut_key, 'n') {
+                            // The search opens a modal, so a floating completion
+                            // popup must not be left hanging over it.
+                            if popup_visible {
+                                Self::request_intellisense_popup_hide(
+                                    &intellisense_popup_for_handle,
+                                    &intellisense_runtime_for_handle,
+                                );
+                            }
+                            Self::invalidate_and_clear_pending_intellisense_state(
+                                &intellisense_runtime_for_handle,
+                            );
+                            Self::invoke_menu_action_callback(
+                                &menu_action_callback_for_handle,
+                                "Query/Go to Object",
+                            );
+                            return true;
+                        }
 
                         match shortcut_key {
                             k if Self::matches_alpha_shortcut(k, 'z') => {
@@ -1184,6 +1203,35 @@ impl SqlEditorWidget {
                             }
                             k if Self::matches_alpha_shortcut(k, 'h') => {
                                 Self::invoke_void_callback(&replace_callback_for_handle);
+                                return true;
+                            }
+                            k if Self::matches_alpha_shortcut(k, 'b') => {
+                                if popup_visible {
+                                    Self::request_intellisense_popup_hide(
+                                        &intellisense_popup_for_handle,
+                                        &intellisense_runtime_for_handle,
+                                    );
+                                }
+                                Self::invalidate_and_clear_pending_intellisense_state(
+                                    &intellisense_runtime_for_handle,
+                                );
+                                Self::invoke_menu_action_callback(
+                                    &menu_action_callback_for_handle,
+                                    "Query/Go to Declaration",
+                                );
+                                return true;
+                            }
+                            k if Self::matches_alpha_shortcut(k, 'g') => {
+                                if popup_visible {
+                                    Self::request_intellisense_popup_hide(
+                                        &intellisense_popup_for_handle,
+                                        &intellisense_runtime_for_handle,
+                                    );
+                                }
+                                Self::invalidate_and_clear_pending_intellisense_state(
+                                    &intellisense_runtime_for_handle,
+                                );
+                                widget_for_shortcuts.prompt_go_to_line();
                                 return true;
                             }
                             _ => {}

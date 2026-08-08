@@ -5,6 +5,9 @@ pub mod connection_dialog;
 pub mod constants;
 pub mod find_replace;
 pub mod font_settings;
+// Public only so `verify_explain_plan_live` can render the same plan grid the
+// app shows; not part of the supported surface.
+pub mod explain_plan;
 pub(crate) mod grid_search;
 // Public only so `verify_grid_sql_export` can assert on the exact SQL the app
 // puts on the clipboard; not part of the supported surface.
@@ -19,6 +22,10 @@ pub mod main_window;
 pub mod menu;
 pub mod object_browser;
 pub(crate) mod object_drag_payload;
+// Public only so the verification binaries can drive the same ranking and the
+// same modal the app uses; not part of the supported surface.
+pub mod object_search;
+pub mod object_search_dialog;
 pub mod query_history;
 pub mod query_tabs;
 // Public only so `verify_result_export` can feed the exact bytes the app writes

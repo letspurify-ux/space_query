@@ -88,6 +88,7 @@ pub struct AppConfig {
     pub cancel_timeout_seconds: u32,
     pub sql_comma_list_layout: SqlCommaListLayout,
     pub sql_format_right_margin: u32,
+    pub editor_soft_wrap: bool,
     pub query_history_limit: u32,
     pub app_log_limit: u32,
 }
@@ -137,6 +138,7 @@ impl AppConfig {
             cancel_timeout_seconds: DEFAULT_CANCEL_TIMEOUT_SECONDS,
             sql_comma_list_layout: SqlCommaListLayout::Wrapped,
             sql_format_right_margin: DEFAULT_SQL_FORMAT_RIGHT_MARGIN,
+            editor_soft_wrap: false,
             query_history_limit: DEFAULT_QUERY_HISTORY_LIMIT,
             app_log_limit: DEFAULT_APP_LOG_LIMIT,
         }

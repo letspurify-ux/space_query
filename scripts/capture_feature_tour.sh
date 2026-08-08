@@ -90,6 +90,21 @@ if [[ "$capture_mode" == "code-snippets" ]]; then
   exit 0
 fi
 
+if [[ "$capture_mode" == "explain-plan" ]]; then
+  convert_capture explain-plan explain-plan
+  exit 0
+fi
+
+if [[ "$capture_mode" == "object-search" ]]; then
+  convert_capture object-search object-search
+  exit 0
+fi
+
+if [[ "$capture_mode" == "soft-wrap" ]]; then
+  convert_capture soft-wrap soft-wrap
+  exit 0
+fi
+
 if [[ "$capture_mode" == "object-drop-confirmation" ]]; then
   convert_capture object-drop-confirmation object-drop-confirmation
   exit 0
@@ -118,6 +133,9 @@ convert_capture grid-search grid-search
 convert_capture selection-summary selection-summary
 convert_capture code-snippets code-snippets
 convert_capture snippet-reference snippet-reference
+convert_capture soft-wrap soft-wrap
+convert_capture explain-plan explain-plan
+convert_capture object-search object-search
 convert_capture object-drop-confirmation object-drop-confirmation
 convert_capture grid-sql-export grid-sql-export
 convert_capture result-export result-export

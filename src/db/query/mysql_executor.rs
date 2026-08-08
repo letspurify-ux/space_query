@@ -1112,62 +1112,6 @@ impl MysqlExecutor {
         results
     }
 
-    fn format_explain_lines(columns: &[ColumnInfo], rows: &[Vec<String>]) -> Vec<String> {
-        if columns.is_empty() {
-            return vec!["No EXPLAIN output.".to_string()];
-        }
-
-        let sanitize = |value: &str| value.replace(['\r', '\n'], " ");
-
-        let mut widths: Vec<usize> = columns
-            .iter()
-            .map(|column| sanitize(&column.name).len())
-            .collect();
-
-        for row in rows {
-            for (index, value) in row.iter().enumerate() {
-                if let Some(width) = widths.get_mut(index) {
-                    *width = (*width).max(sanitize(value).len());
-                }
-            }
-        }
-
-        let format_row = |values: Vec<String>| {
-            values
-                .into_iter()
-                .enumerate()
-                .map(|(index, value)| {
-                    let width = widths.get(index).copied().unwrap_or(value.len());
-                    format!("{value:<width$}")
-                })
-                .collect::<Vec<_>>()
-                .join(" | ")
-        };
-
-        let mut lines = Vec::with_capacity(rows.len().saturating_add(2));
-        lines.push(format_row(
-            columns
-                .iter()
-                .map(|column| sanitize(&column.name))
-                .collect::<Vec<_>>(),
-        ));
-        lines.push(
-            widths
-                .iter()
-                .map(|width| "-".repeat(*width))
-                .collect::<Vec<_>>()
-                .join("-+-"),
-        );
-
-        for row in rows {
-            lines.push(format_row(
-                row.iter().map(|value| sanitize(value)).collect::<Vec<_>>(),
-            ));
-        }
-
-        lines
-    }
-
     fn build_explain_sql(sql: &str) -> String {
         let normalized = QueryExecutor::normalize_sql_for_execute(sql);
         match QueryExecutor::leading_keyword(&normalized).as_deref() {
@@ -1176,13 +1120,14 @@ impl MysqlExecutor {
         }
     }
 
-    pub fn get_explain_plan(conn: &mut Conn, sql: &str) -> Result<Vec<String>, MysqlError> {
+    /// Run EXPLAIN and hand back the server's own result, columns and all.
+    ///
+    /// Nothing is reshaped here: classic `EXPLAIN` has no parent column, so the
+    /// caller renders the rows flat rather than inventing a tree out of
+    /// `id`/`select_type`.
+    pub fn get_explain_plan(conn: &mut Conn, sql: &str) -> Result<QueryResult, MysqlError> {
         let explain_sql = Self::build_explain_sql(sql);
-        let result = Self::execute_select(conn, &explain_sql)?;
-        Ok(Self::format_explain_lines(
-            result.columns.as_slice(),
-            result.rows.as_slice(),
-        ))
+        Self::execute_select(conn, &explain_sql)
     }
 
     fn build_cancel_opts(info: &ConnectionInfo) -> mysql::OptsBuilder {
@@ -2960,42 +2905,6 @@ mod tests {
             ),
             "ROLLBACK -- keep chaining\nAND CHAIN"
         );
-    }
-
-    #[test]
-    fn mysql_format_explain_lines_renders_table_output() {
-        let columns = vec![
-            ColumnInfo {
-                name: "id".to_string(),
-                data_type: "BIGINT".to_string(),
-                kind: crate::db::SqlValueKind::Unknown,
-            },
-            ColumnInfo {
-                name: "table".to_string(),
-                data_type: "VARCHAR".to_string(),
-                kind: crate::db::SqlValueKind::Unknown,
-            },
-            ColumnInfo {
-                name: "Extra".to_string(),
-                data_type: "VARCHAR".to_string(),
-                kind: crate::db::SqlValueKind::Unknown,
-            },
-        ];
-        let rows = vec![vec![
-            "1".to_string(),
-            "employees".to_string(),
-            "Using where".to_string(),
-        ]];
-
-        let lines = MysqlExecutor::format_explain_lines(columns.as_slice(), rows.as_slice());
-
-        assert_eq!(lines.len(), 3);
-        assert!(lines[0].contains("id"));
-        assert!(lines[0].contains("table"));
-        assert!(lines[0].contains("Extra"));
-        assert!(lines[1].contains("-+-"));
-        assert!(lines[2].contains("employees"));
-        assert!(lines[2].contains("Using where"));
     }
 
     #[test]

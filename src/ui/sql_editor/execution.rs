@@ -26194,7 +26194,11 @@ mod query_execution_cleanup_tests {
         )
         .expect("Oracle explain plan route monitor should succeed");
         let explain_event = QueryProgress::ExplainPlanOutput {
-            text: SqlEditorWidget::render_explain_plan(&plan),
+            result: SqlEditorWidget::build_explain_plan_result(
+                &crate::ui::explain_plan::ExplainPlanData::Tree(
+                    crate::ui::explain_plan::oracle_plan_nodes(&plan),
+                ),
+            ),
         };
         assert_result_routes_only(
             "Oracle explain output must route to Data Grid as a new explain tab",
@@ -31871,10 +31875,15 @@ mod mysql_batch_execution_regression_tests {
                 QueryProgress::Message { kind, lines } => {
                     format!("Message({kind:?}, {})", lines.join(" | "))
                 }
-                QueryProgress::ExplainPlanOutput { text } => {
+                QueryProgress::ExplainPlanOutput { result } => {
                     format!(
                         "ExplainPlanOutput({})",
-                        text.lines().next().unwrap_or_default()
+                        result
+                            .rows
+                            .first()
+                            .and_then(|row| row.first())
+                            .map(String::as_str)
+                            .unwrap_or_default()
                     )
                 }
                 QueryProgress::PromptInput { prompt, .. } => {
@@ -32166,7 +32175,16 @@ mod mysql_batch_execution_regression_tests {
             crate::db::query::mysql_executor::MysqlExecutor::get_explain_plan(conn, "SELECT 1")
                 .expect("MySQL/MariaDB explain route monitor should succeed");
         let explain_event = QueryProgress::ExplainPlanOutput {
-            text: SqlEditorWidget::render_explain_plan(&plan),
+            result: SqlEditorWidget::build_explain_plan_result(
+                &crate::ui::explain_plan::ExplainPlanData::Flat {
+                    columns: plan
+                        .columns
+                        .iter()
+                        .map(|column| column.name.clone())
+                        .collect(),
+                    rows: plan.rows.clone(),
+                },
+            ),
         };
         assert_result_routes_only(
             "MySQL/MariaDB explain progress",

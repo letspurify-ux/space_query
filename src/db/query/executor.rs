@@ -30,6 +30,20 @@ const LAZY_PREFETCH_ROWS: u32 = LAZY_FETCH_ARRAY_SIZE;
 const MAX_NESTED_CURSOR_DEPTH: usize = 8;
 const ORACLE_OBJECT_DDL_SQL: &str = "SELECT DBMS_METADATA.GET_DDL(:1, :2, :3) FROM DUAL";
 
+/// Reads back the plan `EXPLAIN PLAN FOR` just wrote.
+///
+/// `DBMS_XPLAN.DISPLAY` is deliberately not used: it returns the plan already
+/// drawn as ASCII, which throws away the parent links, the per-row estimates and
+/// the predicates as separate values. Reading `PLAN_TABLE` keeps them.
+/// Every column comes back as text so the OCI and thin paths parse identically.
+const ORACLE_EXPLAIN_PLAN_SQL: &str = "SELECT TO_CHAR(id), TO_CHAR(parent_id), operation, \
+options, object_owner, object_name, TO_CHAR(cardinality), TO_CHAR(bytes), TO_CHAR(cost), \
+access_predicates, filter_predicates FROM plan_table \
+WHERE plan_id = (SELECT MAX(plan_id) FROM plan_table) ORDER BY id";
+
+/// Number of columns `ORACLE_EXPLAIN_PLAN_SQL` selects.
+const ORACLE_EXPLAIN_PLAN_COLUMNS: usize = 11;
+
 /// Session-level DBMS_METADATA transform params applied before GET_DDL so the
 /// generated CREATE statement omits physical storage clauses that the user did
 /// not author (segment attributes, STORAGE, TABLESPACE). SQLTERMINATOR appends a
@@ -4094,7 +4108,11 @@ impl QueryExecutor {
         Ok(rows)
     }
 
-    pub fn get_explain_plan(conn: &Connection, sql: &str) -> Result<Vec<String>, OracleError> {
+    /// Explain `sql` and read the resulting plan back as text rows.
+    ///
+    /// Rows come back in `ID` order, which is the same order `DBMS_XPLAN`
+    /// displays, so the caller can draw connectors without re-sorting.
+    pub fn get_explain_plan(conn: &Connection, sql: &str) -> Result<Vec<Vec<String>>, OracleError> {
         let explain_sql = format!("EXPLAIN PLAN FOR {}", sql);
         match conn.execute(&explain_sql, &[]) {
             Ok(_stmt) => {}
@@ -4104,9 +4122,7 @@ impl QueryExecutor {
             }
         }
 
-        let plan_sql =
-            "SELECT plan_table_output FROM TABLE(DBMS_XPLAN.DISPLAY('PLAN_TABLE', NULL, 'ALL'))";
-        let mut stmt = match conn.statement(plan_sql).build() {
+        let mut stmt = match conn.statement(ORACLE_EXPLAIN_PLAN_SQL).build() {
             Ok(stmt) => stmt,
             Err(err) => {
                 logging::log_error("executor", &format!("Database operation failed: {err}"));
@@ -4121,7 +4137,7 @@ impl QueryExecutor {
             }
         };
 
-        let mut plan_lines: Vec<String> = Vec::new();
+        let mut plan_rows: Vec<Vec<String>> = Vec::new();
         for row_result in rows {
             let row: Row = match row_result {
                 Ok(row) => row,
@@ -4130,32 +4146,38 @@ impl QueryExecutor {
                     return Err(err);
                 }
             };
-            let line: Option<String> = match row.get(0) {
-                Ok(line) => line,
-                Err(err) => {
-                    logging::log_error("executor", &format!("Database operation failed: {err}"));
-                    return Err(err);
-                }
-            };
-            if let Some(l) = line {
-                plan_lines.push(l);
+            let mut values = Vec::with_capacity(ORACLE_EXPLAIN_PLAN_COLUMNS);
+            for index in 0..ORACLE_EXPLAIN_PLAN_COLUMNS {
+                let value: Option<String> = match row.get(index) {
+                    Ok(value) => value,
+                    Err(err) => {
+                        logging::log_error(
+                            "executor",
+                            &format!("Database operation failed: {err}"),
+                        );
+                        return Err(err);
+                    }
+                };
+                values.push(value.unwrap_or_default());
             }
+            plan_rows.push(values);
         }
 
-        Ok(plan_lines)
+        Ok(plan_rows)
     }
 
     pub fn get_thin_explain_plan(
         conn: &mut OracleThinSession,
         sql: &str,
-    ) -> Result<Vec<String>, String> {
+    ) -> Result<Vec<Vec<String>>, String> {
         let explain_sql = format!("EXPLAIN PLAN FOR {}", sql);
         conn.execute_typed(&OracleThinStatementRequest::statement(explain_sql), &[])
             .map_err(|err| err.to_string())?;
 
-        ObjectBrowser::thin_query_single_text_column(
+        ObjectBrowser::thin_query_text_rows(
             conn,
-            "SELECT plan_table_output FROM TABLE(DBMS_XPLAN.DISPLAY('PLAN_TABLE', NULL, 'ALL'))",
+            ORACLE_EXPLAIN_PLAN_SQL,
+            ORACLE_EXPLAIN_PLAN_COLUMNS,
             Vec::new(),
         )
     }
@@ -11508,9 +11530,14 @@ mod oracle_thin_object_metadata_live_tests {
         let plan = QueryExecutor::get_thin_explain_plan(&mut session, "SELECT * FROM dual")
             .expect("thin explain plan");
         assert!(
-            plan.iter().any(|line| line.contains("SELECT STATEMENT"))
-                || plan.iter().any(|line| line.contains("Plan hash value")),
-            "Thin explain plan should return DBMS_XPLAN output: {plan:?}"
+            plan.iter()
+                .any(|row| row.iter().any(|value| value.contains("SELECT STATEMENT"))),
+            "Thin explain plan should return PLAN_TABLE rows: {plan:?}"
+        );
+        assert!(
+            plan.iter()
+                .all(|row| row.len() == super::ORACLE_EXPLAIN_PLAN_COLUMNS),
+            "Every plan row should carry every selected column: {plan:?}"
         );
 
         let status = ObjectBrowser::get_thin_object_status(&mut session, &package, "PACKAGE")

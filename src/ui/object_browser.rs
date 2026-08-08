@@ -374,7 +374,7 @@ type ConnectionScopeSwitchPreflightCallback =
 type MetadataCallback = Arc<Mutex<Option<Box<dyn FnMut(ObjectBrowserMetadataSnapshot)>>>>;
 
 #[derive(Clone)]
-enum ObjectItem {
+pub enum ObjectItem {
     Simple {
         object_type: String,
         object_name: String,
@@ -405,17 +405,17 @@ enum ObjectInfoPayload {
 
 /// Stores original object lists for filtering
 #[derive(Clone, Default)]
-struct ObjectCache {
-    tables: Vec<String>,
-    views: Vec<String>,
-    procedures: Vec<String>,
-    functions: Vec<String>,
-    sequences: Vec<String>,
-    triggers: Vec<String>,
-    events: Vec<String>,
-    synonyms: Vec<String>,
-    packages: Vec<String>,
-    package_routines: HashMap<String, Vec<PackageRoutine>>,
+pub struct ObjectCache {
+    pub tables: Vec<String>,
+    pub views: Vec<String>,
+    pub procedures: Vec<String>,
+    pub functions: Vec<String>,
+    pub sequences: Vec<String>,
+    pub triggers: Vec<String>,
+    pub events: Vec<String>,
+    pub synonyms: Vec<String>,
+    pub packages: Vec<String>,
+    pub package_routines: HashMap<String, Vec<PackageRoutine>>,
 }
 
 trait ObjectBrowserDbBehavior: Sync {
@@ -4808,6 +4808,88 @@ impl ObjectBrowserWidget {
         )
     }
 
+    /// Object type and name whose source *is* the declaration of `item`.
+    ///
+    /// Deliberately not `default_action_for_item`: double-clicking a table in
+    /// the tree browses its rows, but "go to declaration" always wants the
+    /// definition. A package member has no DDL of its own, so the package is
+    /// what opens — the same choice the tree makes for package children.
+    fn declaration_target_for_item(item: &ObjectItem) -> Option<(&'static str, String)> {
+        match item {
+            ObjectItem::Simple {
+                object_type,
+                object_name,
+            } => Self::ddl_object_type(object_type).map(|ddl_type| (ddl_type, object_name.clone())),
+            ObjectItem::PackageRoutine { package_name, .. } => {
+                Some(("PACKAGE", package_name.clone()))
+            }
+        }
+    }
+
+    /// Resolve `selected_text` to an object and open its source in a new editor
+    /// tab. Returns `false` when the name matches nothing in the cached scope,
+    /// so the caller can try the next candidate.
+    pub fn open_declaration_for_sql_selection(
+        &self,
+        selected_text: &str,
+        intellisense_data: &IntellisenseData,
+    ) -> bool {
+        let db_type = match self.current_db_type.lock() {
+            Ok(guard) => *guard,
+            Err(poisoned) => *poisoned.into_inner(),
+        };
+        let current_scope = Self::scope_snapshot(&self.selected_scope);
+        let cache_snapshot = self
+            .object_cache
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        let Some(resolved) = Self::resolve_selected_object_context(
+            selected_text,
+            intellisense_data,
+            Some(&cache_snapshot),
+            db_type,
+            current_scope.as_deref(),
+        ) else {
+            return false;
+        };
+        let selected_scope = Self::scope_for_sql_selection_action(
+            &resolved.item,
+            resolved.selected_scope.as_deref(),
+            intellisense_data,
+            current_scope.as_deref(),
+        );
+        self.open_declaration_for_object_item(&resolved.item, selected_scope)
+    }
+
+    /// Object names cached for the current scope.
+    pub fn object_cache_snapshot(&self) -> ObjectCache {
+        self.object_cache
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+    }
+
+    /// Open the source of an already-resolved object in a new editor tab.
+    pub fn open_declaration_for_object_item(
+        &self,
+        item: &ObjectItem,
+        selected_scope: Option<String>,
+    ) -> bool {
+        let Some((object_type, object_name)) = Self::declaration_target_for_item(item) else {
+            return false;
+        };
+        Self::spawn_generate_ddl(
+            &self.connection,
+            &self.action_sender,
+            &self.status_callback,
+            selected_scope,
+            object_type,
+            &object_name,
+        );
+        true
+    }
+
     fn scope_for_sql_selection_action(
         item: &ObjectItem,
         resolved_scope: Option<&str>,
@@ -8872,6 +8954,40 @@ impl MultiObjectBrowserWidget {
         self.bound_browser().is_some_and(|browser| {
             browser.show_context_menu_for_sql_selection(selected_text, intellisense_data)
         })
+    }
+
+    pub fn open_declaration_for_sql_selection(
+        &self,
+        selected_text: &str,
+        intellisense_data: &IntellisenseData,
+    ) -> bool {
+        self.bound_browser().is_some_and(|browser| {
+            browser.open_declaration_for_sql_selection(selected_text, intellisense_data)
+        })
+    }
+
+    /// Cached object names of the bound connection's current scope, for the
+    /// object search dialog.
+    pub fn object_cache_snapshot(&self) -> Option<(ObjectCache, Option<String>)> {
+        self.bound_browser().map(|browser| {
+            (
+                browser
+                    .object_cache
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .clone(),
+                ObjectBrowserWidget::scope_snapshot(&browser.selected_scope),
+            )
+        })
+    }
+
+    pub fn open_declaration_for_object_item(
+        &self,
+        item: &ObjectItem,
+        selected_scope: Option<String>,
+    ) -> bool {
+        self.bound_browser()
+            .is_some_and(|browser| browser.open_declaration_for_object_item(item, selected_scope))
     }
 
     pub fn hide_scope_selector_popup_if_outside(&self, root_x: i32, root_y: i32) {

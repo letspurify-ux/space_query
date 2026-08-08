@@ -408,6 +408,12 @@ impl MenuBarBuilder {
             forward_menu_callback,
         );
         menu.add(
+            "&Edit/&Go to Line",
+            Shortcut::Command | 'g',
+            MenuFlag::Normal,
+            forward_menu_callback,
+        );
+        menu.add(
             "&Edit/",
             Shortcut::None,
             MenuFlag::MenuDivider,
@@ -443,6 +449,25 @@ impl MenuBarBuilder {
             MenuFlag::Normal,
             forward_menu_callback,
         );
+        menu.add(
+            "&Edit/",
+            Shortcut::None,
+            MenuFlag::MenuDivider,
+            forward_menu_callback,
+        );
+        let soft_wrap_index = menu.add(
+            "&Edit/Soft &Wrap",
+            Shortcut::None,
+            MenuFlag::Toggle,
+            forward_menu_callback,
+        );
+        // `sync_recent_sql_file_items` rebuilds the whole bar, so the checked
+        // state has to be re-derived here rather than set once at startup.
+        if crate::utils::config::AppConfig::runtime().editor_soft_wrap {
+            if let Some(mut item) = menu.at(soft_wrap_index) {
+                item.set();
+            }
+        }
 
         // Query menu
         menu.add(
@@ -472,6 +497,18 @@ impl MenuBarBuilder {
         menu.add(
             "&Query/&Quick Describe",
             Shortcut::from_key(fltk::enums::Key::F4),
+            MenuFlag::Normal,
+            forward_menu_callback,
+        );
+        menu.add(
+            "&Query/&Go to Declaration",
+            Shortcut::Command | 'b',
+            MenuFlag::Normal,
+            forward_menu_callback,
+        );
+        menu.add(
+            "&Query/Go to &Object",
+            Shortcut::Command | Shortcut::Shift | 'n',
             MenuFlag::Normal,
             forward_menu_callback,
         );
@@ -606,6 +643,7 @@ impl MenuBarBuilder {
                     Ctrl+F - Find (in the result grid when it has focus)\n\
                     F3 - Find Next\n\
                     Ctrl+H - Replace\n\
+                    Ctrl+G - Go to Line\n\
                     Ctrl+Shift+F - Format SQL\n\
                     Ctrl+/ - Toggle Comment\n\
                     Ctrl+U - Uppercase Selection\n\
@@ -617,7 +655,8 @@ impl MenuBarBuilder {
                     Ctrl+Click - Quick Describe at Cursor\n\n\
                     View:\n\
                     Ctrl++ - Zoom In\n\
-                    Ctrl+- - Zoom Out\n\n\
+                    Ctrl+- - Zoom Out\n\
+                    Soft Wrap - Edit menu, no shortcut\n\n\
                     Query:\n\
                     Ctrl+Enter - Execute Statement\n\
                     F5 - Execute Script\n\
@@ -625,7 +664,9 @@ impl MenuBarBuilder {
                     F6 - Explain Plan\n\
                     F7 - Commit\n\
                     F8 - Rollback\n\
-                    F4 - Quick Describe (Editor)\n\n\
+                    F4 - Quick Describe (Editor)\n\
+                    Ctrl+B - Go to Declaration\n\
+                    Ctrl+Shift+N - Go to Object\n\n\
                     Tools:\n\
                     Ctrl+E - Export Results\n\
                     Query History - no shortcut\n\n\
