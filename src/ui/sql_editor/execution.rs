@@ -12069,7 +12069,7 @@ impl SqlEditorWidget {
                             let cleaned = SqlEditorWidget::strip_leading_comments(&sql_text);
                             let upper = cleaned.to_uppercase();
 
-                            if transaction_mode.access_mode
+                            if active_transaction_mode.access_mode
                                 == crate::db::TransactionAccessMode::ReadOnly
                                 && !SqlEditorWidget::oracle_read_only_allows_statement(&sql_text)
                             {
@@ -18054,9 +18054,13 @@ impl SqlEditorWidget {
                                     script_mode,
                                 );
                                 result_index += 1;
-                                if statement_timed_out || !continue_on_error {
-                                    stop_execution = true;
-                                }
+                                // Applying the tab's transaction mode is app
+                                // infrastructure, not a user statement:
+                                // continue-on-error must not let the rest of
+                                // the batch run under a mode different from
+                                // what the toolbar shows (e.g. writes slipping
+                                // through a Read only tab).
+                                stop_execution = true;
                                 break;
                             } else {
                                 let tx_effects = post_processor.effects_for_sql(&tx_sql);
@@ -22572,12 +22576,30 @@ impl SqlEditorWidget {
             return crate::db::RetainedSessionMutationOutcome::BlockedRequiresResolution(err);
         }
 
-        match crate::db::DatabaseConnection::apply_mysql_transaction_mode_for_db_with_default(
-            &mut conn,
-            mode,
-            db_type,
-            default_transaction_isolation,
-        ) {
+        let apply_result = (|| {
+            // Replacing the mode clears the tracked override residue below, so
+            // a pending server-side one-shot SET TRANSACTION must actually be
+            // consumed first — a session-scope SET does not cancel it, and the
+            // next transaction would otherwise silently run under the stale
+            // one-shot instead of the mode the toolbar now shows. Safe here:
+            // the replaceable state carries no user work, so an empty
+            // rolled-back transaction discards nothing.
+            if prior_retained_state.may_have_transaction_mode_override() {
+                use mysql::prelude::Queryable;
+                for statement in ["ROLLBACK", "START TRANSACTION", "ROLLBACK"] {
+                    conn.query_drop(statement).map_err(|err| {
+                        format!("Failed to supersede the pending transaction mode: {err}")
+                    })?;
+                }
+            }
+            crate::db::DatabaseConnection::apply_mysql_transaction_mode_for_db_with_default(
+                &mut conn,
+                mode,
+                db_type,
+                default_transaction_isolation,
+            )
+        })();
+        match apply_result {
             Ok(()) => {
                 Self::retain_mysql_pooled_session_if_current_with_state(
                     shared_connection,

@@ -450,6 +450,59 @@ fn run_scenarios(target: Target, h: &mut Harness) -> Result<(), String> {
         h.run("ROLLBACK")?;
     }
 
+    // ---- S5 (MySQL family): toolbar change supersedes a pending one-shot ---
+    if !target.is_oracle() {
+        println!("  --- S5 toolbar change supersedes a pending one-shot SET TRANSACTION ---");
+        h.run("SET TRANSACTION ISOLATION LEVEL SERIALIZABLE")?;
+        let replacement = TransactionMode::new(
+            TransactionIsolation::ReadCommitted,
+            TransactionAccessMode::ReadWrite,
+        );
+        h.editor.set_tab_transaction_mode(replacement);
+        let (generation, epoch, db_type) = {
+            let guard = h.shared.lock().unwrap_or_else(|p| p.into_inner());
+            (
+                guard.connection_generation(),
+                guard.pool_context_epoch(),
+                guard.db_type(),
+            )
+        };
+        let outcome = h.editor.apply_transaction_mode_to_retained_session(
+            generation,
+            epoch,
+            db_type,
+            replacement,
+            "verify transaction mode",
+        );
+        h.check(
+            "S5 retained replace applied over the pending one-shot",
+            matches!(
+                outcome,
+                space_query::db::RetainedSessionMutationOutcome::Applied
+                    | space_query::db::RetainedSessionMutationOutcome::AppliedWithWarning(_)
+                    | space_query::db::RetainedSessionMutationOutcome::NoSession
+            ),
+            format!("outcome: {outcome:?}"),
+        );
+        // The decisive check: the NEXT transaction must run under the replaced
+        // mode, not the stale one-shot the server had pending.
+        h.run("START TRANSACTION")?;
+        h.run("INSERT INTO SQ_TM_T VALUES (5)")?;
+        let isolation = h.select_scalar(
+            "SELECT trx_isolation_level FROM information_schema.innodb_trx \
+             WHERE trx_mysql_thread_id = CONNECTION_ID()",
+        )?;
+        h.check(
+            "S5 next transaction runs under the replaced mode",
+            isolation
+                .replace(['-', '_'], " ")
+                .eq_ignore_ascii_case("READ COMMITTED"),
+            format!("trx_isolation_level = {isolation:?}"),
+        );
+        h.run("ROLLBACK")?;
+        h.editor.clear_tab_transaction_mode_override();
+    }
+
     Ok(())
 }
 

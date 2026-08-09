@@ -1874,7 +1874,7 @@ fn transaction_access_choice_index(access_mode: TransactionAccessMode) -> i32 {
 }
 
 fn transaction_mode_new_transaction_notice() -> &'static str {
-    "Isolation/access mode changes apply only to new transactions.\nExisting transactions keep their current transaction mode."
+    "Isolation/access mode is set for this query tab.\nIt applies from the tab's next transaction; other tabs are not affected."
 }
 
 impl AppState {
