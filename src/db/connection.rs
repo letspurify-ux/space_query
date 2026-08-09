@@ -396,7 +396,10 @@ pub enum ConnectionSslMode {
 ///
 /// This is a client-side label, not a session setting: it never reaches the
 /// server and it survives switching the connection's database type.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+///
+/// There is no blue: `theme::selection_soft()` already means "selected" here,
+/// so a blue tag stops reading as a tag on any surface the UI paints as chosen.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
 pub enum ConnectionColor {
     #[default]
     None,
@@ -404,20 +407,30 @@ pub enum ConnectionColor {
     Orange,
     Yellow,
     Green,
-    Blue,
     Purple,
     Gray,
 }
 
+/// A tag saved by a build that offered a colour this one does not loads as
+/// `None`, so one retired colour cannot make a saved connection unreadable.
+impl<'de> Deserialize<'de> for ConnectionColor {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let label = String::deserialize(deserializer)?;
+        Ok(Self::from_label(&label).unwrap_or_default())
+    }
+}
+
 impl ConnectionColor {
     /// Every colour in menu order, `None` first.
-    pub const ALL: [Self; 8] = [
+    pub const ALL: [Self; 7] = [
         Self::None,
         Self::Red,
         Self::Orange,
         Self::Yellow,
         Self::Green,
-        Self::Blue,
         Self::Purple,
         Self::Gray,
     ];
@@ -429,7 +442,6 @@ impl ConnectionColor {
             Self::Orange => "Orange",
             Self::Yellow => "Yellow",
             Self::Green => "Green",
-            Self::Blue => "Blue",
             Self::Purple => "Purple",
             Self::Gray => "Gray",
         }
@@ -447,7 +459,6 @@ impl ConnectionColor {
             Self::Orange => Some((0xE8, 0x95, 0x40)),
             Self::Yellow => Some((0xE0, 0xC2, 0x4A)),
             Self::Green => Some((0x5C, 0xC2, 0x7A)),
-            Self::Blue => Some((0x5A, 0x9E, 0xE8)),
             Self::Purple => Some((0xA9, 0x7B, 0xE0)),
             Self::Gray => Some((0x9A, 0xA0, 0xA8)),
         }
@@ -8182,6 +8193,16 @@ mod tests {
 
         assert_eq!(restored.color, ConnectionColor::None);
         assert!(!restored.read_only);
+    }
+
+    #[test]
+    fn a_connection_tagged_with_a_retired_colour_still_loads() {
+        let stored = r#"{"name":"old","username":"u","host":"h","port":1521,
+            "service_name":"FREE","db_type":"Oracle","color":"Blue"}"#;
+        let restored: ConnectionInfo =
+            serde_json::from_str(stored).expect("a retired tag must not fail the whole connection");
+
+        assert_eq!(restored.color, ConnectionColor::None);
     }
 
     #[test]

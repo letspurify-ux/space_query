@@ -103,6 +103,29 @@ pub fn selection_strong() -> Color {
     accent()
 }
 
+/// The surface a selected query tab wears when its connection carries a tag.
+///
+/// `Fl_Tabs` paints the selected tab with the strip's colours, not the tab's,
+/// so a tag can only reach it through this. The tag is blended down into the
+/// panel rather than used raw, and the weight is what keeps two promises: every
+/// result holds `text_primary` at or above the contrast it already has on
+/// [`selection_soft`], and every result stays under the CIELAB lightness where
+/// `Fl_Tabs` flips its close button from white to black. Both are locked by
+/// tests, so raise the weight only against them.
+pub fn tag_selected_surface(tag: Color) -> Color {
+    const TAG_WEIGHT: f32 = 0.35;
+    let (tag_r, tag_g, tag_b) = tag.to_rgb();
+    let (panel_r, panel_g, panel_b) = panel_bg().to_rgb();
+    let blend = |tag: u8, panel: u8| {
+        (f32::from(tag) * TAG_WEIGHT + f32::from(panel) * (1.0 - TAG_WEIGHT)).round() as u8
+    };
+    Color::from_rgb(
+        blend(tag_r, panel_r),
+        blend(tag_g, panel_g),
+        blend(tag_b, panel_b),
+    )
+}
+
 pub fn button_primary() -> Color {
     panel_raised()
 }
@@ -415,5 +438,105 @@ mod tests {
     fn connection_status_colors_match_dark_theme_palette() {
         assert_eq!(status_connected().to_rgb(), (74, 222, 128));
         assert_eq!(status_disconnected().to_rgb(), (255, 107, 107));
+    }
+
+    /// Relative luminance, WCAG 2.1.
+    fn luminance(color: Color) -> f64 {
+        let (red, green, blue) = color.to_rgb();
+        let channel = |value: u8| {
+            let value = f64::from(value) / 255.0;
+            if value <= 0.03928 {
+                value / 12.92
+            } else {
+                ((value + 0.055) / 1.055).powf(2.4)
+            }
+        };
+        0.2126 * channel(red) + 0.7152 * channel(green) + 0.0722 * channel(blue)
+    }
+
+    fn contrast(foreground: Color, background: Color) -> f64 {
+        let (first, second) = (luminance(foreground), luminance(background));
+        (first.max(second) + 0.05) / (first.min(second) + 0.05)
+    }
+
+    #[test]
+    fn every_tag_surface_reads_at_least_as_well_as_an_untagged_selection() {
+        // An untagged tab is the surface this replaces, so it is the bar a
+        // tagged one has to clear. Adding a colour that fails this makes the
+        // selected tab harder to read than the plain one it stands in for.
+        let baseline = contrast(text_secondary(), selection_soft());
+
+        for tag in crate::db::ConnectionColor::ALL {
+            let Some((red, green, blue)) = tag.rgb() else {
+                continue;
+            };
+            let surface = tag_selected_surface(Color::from_rgb(red, green, blue));
+            let measured = contrast(text_primary(), surface);
+            assert!(
+                measured >= baseline,
+                "{} reads at {measured:.2}, below the untagged {baseline:.2}",
+                tag.label()
+            );
+        }
+    }
+
+    /// Perceived lightness the way `fl_contrast.cxx` computes it — a plain
+    /// 2.4 power curve, not the piecewise sRGB one `contrast` above uses.
+    fn fltk_lightness(color: Color) -> f64 {
+        let (red, green, blue) = color.to_rgb();
+        let channel = |value: u8| (f64::from(value) / 255.0).powf(2.4);
+        let luminance = 0.212_672_9 * channel(red)
+            + 0.715_152_2 * channel(green)
+            + 0.072_175_0 * channel(blue);
+        if luminance <= 216.0 / 24389.0 {
+            luminance * (24389.0 / 27.0)
+        } else {
+            luminance.powf(1.0 / 3.0) * 116.0 - 16.0
+        }
+    }
+
+    #[test]
+    fn every_tag_surface_keeps_the_close_button_white() {
+        // `Fl_Tabs::draw_tab` paints the close button with
+        // `fl_contrast(FL_GRAY_RAMP+0, background)`, and in the default CIELAB
+        // mode that returns white only while the background stays under the
+        // contrast level of 39. Above it the button turns black and the tag
+        // colour, not the theme, decides what the strip's controls look like.
+        const CLOSE_BUTTON_FLIPS_AT: f64 = 39.0;
+
+        for tag in crate::db::ConnectionColor::ALL {
+            let Some((red, green, blue)) = tag.rgb() else {
+                continue;
+            };
+            let surface = tag_selected_surface(Color::from_rgb(red, green, blue));
+            let lightness = fltk_lightness(surface);
+            assert!(
+                lightness < CLOSE_BUTTON_FLIPS_AT,
+                "{} sits at L* {lightness:.2}, where the close button turns black",
+                tag.label()
+            );
+        }
+    }
+
+    #[test]
+    fn a_tag_surface_stays_clear_of_the_untagged_selection_colour() {
+        // A tag that lands on `selection_soft` cannot be told apart from a tab
+        // with no tag at all, which is what retired blue used to do.
+        for tag in crate::db::ConnectionColor::ALL {
+            let Some((red, green, blue)) = tag.rgb() else {
+                continue;
+            };
+            let surface = tag_selected_surface(Color::from_rgb(red, green, blue));
+            let (surface_r, surface_g, surface_b) = surface.to_rgb();
+            let (plain_r, plain_g, plain_b) = selection_soft().to_rgb();
+            let distance = i32::from(surface_r).abs_diff(i32::from(plain_r))
+                + i32::from(surface_g).abs_diff(i32::from(plain_g))
+                + i32::from(surface_b).abs_diff(i32::from(plain_b));
+            assert!(
+                distance >= 60,
+                "{} lands {distance} away from the untagged selection colour",
+                tag.label()
+            );
+        }
     }
 }

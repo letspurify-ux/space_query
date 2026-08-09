@@ -923,20 +923,18 @@ fn status_bar_content_label(connection_label: &str, activity: Option<&str>) -> S
     )
 }
 
-/// The colour of the status bar's connection dot.
+/// The colour of the status bar's connection dot: green with a live session,
+/// red without one.
 ///
-/// A connection tag replaces the "connected" green, never the "disconnected"
-/// grey: whether there is a live session is the one thing the dot must always
-/// be able to say, and a colour preference does not get to hide it.
-fn status_connection_color(is_connected: bool, color: crate::db::ConnectionColor) -> Color {
-    if !is_connected {
-        return theme::status_disconnected();
+/// The dot answers one question and a connection tag does not get a say in it.
+/// The tag has the query tab strip, where it can be read without costing the
+/// only place that reports whether a session exists at all.
+fn status_connection_color(is_connected: bool) -> Color {
+    if is_connected {
+        theme::status_connected()
+    } else {
+        theme::status_disconnected()
     }
-    color
-        .rgb()
-        .map_or_else(theme::status_connected, |(red, green, blue)| {
-            Color::from_rgb(red, green, blue)
-        })
 }
 
 fn status_bar_pulse_value(pulse_frame: usize) -> f64 {
@@ -1101,9 +1099,8 @@ impl StatusBarWidget {
         selection_summary: Option<&str>,
     ) {
         let is_connected = connection_info.is_some() && has_live_connection;
-        let connection_color = connection_info.map(|info| info.color).unwrap_or_default();
         self.connection_indicator
-            .set_label_color(status_connection_color(is_connected, connection_color));
+            .set_label_color(status_connection_color(is_connected));
         let connection_label = status_connection_label(connection_info, has_live_connection);
         let content_label = status_bar_content_label(
             &connection_label,
@@ -1913,13 +1910,13 @@ impl AppState {
         label
     }
 
-    /// The colour a query tab's label is painted in: its connection's tag, or
-    /// `None` for the default when the connection has no tag.
+    /// The colour a query tab is tagged with: its connection's tag, or `None`
+    /// for the default when the connection has no tag.
     ///
     /// A detached runtime still counts. The tab is still about that database,
     /// and losing the tag exactly when a connection drops is the moment the
     /// reminder matters most.
-    fn tab_label_color(tab: &QueryEditorTab) -> Option<Color> {
+    fn tab_tag_color(tab: &QueryEditorTab) -> Option<Color> {
         let snapshot = tab.connection_binding.snapshot();
         let runtime = snapshot
             .runtime
@@ -1929,15 +1926,17 @@ impl AppState {
         Some(Color::from_rgb(red, green, blue))
     }
 
-    /// Puts the tab's current name and its connection's colour on the strip.
+    /// Puts the tab's current name and its connection's colour on the strip,
+    /// and on the result panel that belongs to the tab.
     ///
     /// Every caller that changes what a tab is called goes through here, so the
     /// colour can never be left behind by a rename.
     fn apply_tab_label(&mut self, tab_id: QueryTabId, index: usize) {
         let label = Self::tab_display_label(&self.editor_tabs[index]);
-        let color = Self::tab_label_color(&self.editor_tabs[index]);
+        let color = Self::tab_tag_color(&self.editor_tabs[index]);
         self.query_tabs.set_tab_label(tab_id, &label);
-        self.query_tabs.set_tab_label_color(tab_id, color);
+        self.query_tabs.set_tab_tag_color(tab_id, color);
+        self.editor_tabs[index].result_tabs.set_tag_color(color);
     }
 
     fn refresh_tab_label(&mut self, tab_id: QueryTabId) {
@@ -8129,7 +8128,7 @@ impl MainWindow {
         let base_label = format!("Query {query_number}");
         state.next_editor_tab_number = state.next_editor_tab_number.saturating_add(1);
         let tab_id = state.query_tabs.add_tab(&label);
-        state.query_tabs.set_tab_label_color(
+        state.query_tabs.set_tab_tag_color(
             tab_id,
             binding_snapshot
                 .runtime
@@ -8197,6 +8196,15 @@ impl MainWindow {
                 RESULT_CELL_MAX_DISPLAY_CHARS_MAX,
             );
         result_tabs.set_max_cell_display_chars(result_cell_max_chars as usize);
+        // A result keeps the colour of the connection that produced it, which
+        // only the registry can name.
+        let registry_for_tags = state.connection_registry.clone();
+        result_tabs.set_tag_resolver(move |connection_id| {
+            registry_for_tags
+                .get(connection_id)
+                .and_then(|runtime| runtime.sanitized_info().color.rgb())
+                .map(|(red, green, blue)| Color::from_rgb(red, green, blue))
+        });
         let mut result_widget = result_tabs.get_widget();
         result_widget.hide();
         state.result_workspace_group.end();
@@ -14337,29 +14345,39 @@ impl MainWindow {
             .connection_registry
             .register_saved("capture-local-oracle", create_shared_connection())
             .runtime;
-        oracle_runtime.update_sanitized_info(crate::db::ConnectionInfo::new_with_type(
-            "Local Oracle",
-            "",
-            "",
-            "",
-            1521,
-            "",
-            DatabaseType::Oracle,
-        ));
+        oracle_runtime.update_sanitized_info({
+            // Tagged, so a capture shows what a connection colour looks like
+            // once it is applied rather than only in the connection dialog.
+            let mut info = crate::db::ConnectionInfo::new_with_type(
+                "Local Oracle",
+                "",
+                "",
+                "",
+                1521,
+                "",
+                DatabaseType::Oracle,
+            );
+            info.color = crate::db::ConnectionColor::Red;
+            info
+        });
         oracle_runtime.set_state(ConnectionRuntimeState::Connected);
         let maria_runtime = state
             .connection_registry
             .register_saved("capture-analytics-maria", create_shared_connection())
             .runtime;
-        maria_runtime.update_sanitized_info(crate::db::ConnectionInfo::new_with_type(
-            "Analytics MariaDB",
-            "",
-            "",
-            "",
-            3306,
-            "",
-            DatabaseType::MariaDB,
-        ));
+        maria_runtime.update_sanitized_info({
+            let mut info = crate::db::ConnectionInfo::new_with_type(
+                "Analytics MariaDB",
+                "",
+                "",
+                "",
+                3306,
+                "",
+                DatabaseType::MariaDB,
+            );
+            info.color = crate::db::ConnectionColor::Green;
+            info
+        });
         maria_runtime.set_state(ConnectionRuntimeState::Connected);
         state.object_browser.add_runtime(oracle_runtime.clone());
         state.object_browser.add_runtime(maria_runtime.clone());
@@ -14444,6 +14462,59 @@ impl MainWindow {
         state.refresh_result_edit_controls();
         state.window.redraw();
         Ok(())
+    }
+
+    /// Add a result next to the ones already open, instead of replacing them.
+    ///
+    /// `capture_tour_show_result` clears first, which is right for a scene about
+    /// one result and wrong for a scene about a strip holding several.
+    #[doc(hidden)]
+    pub fn capture_tour_append_result(&mut self, label: &str, result: crate::db::QueryResult) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let execution_origin = state
+            .editor_tabs
+            .iter()
+            .find(|tab| tab.tab_id == state.active_editor_tab_id)
+            .and_then(|tab| tab.connection_binding.snapshot().execution_origin());
+        state.result_tabs.set_execution_origin(execution_origin);
+        state.append_result_tab_request(ResultTabRequest {
+            label: label.to_string(),
+            result,
+        });
+        state.refresh_result_edit_controls();
+        state.window.redraw();
+    }
+
+    /// Bind the active editor tab to another registered connection.
+    ///
+    /// The application reaches this state when a tab loses its database and is
+    /// bound to a different one; a capture has to arrange it directly.
+    #[doc(hidden)]
+    pub fn capture_tour_rebind_active_tab(&mut self, saved_profile: &str) -> bool {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let Some(runtime) = state.connection_registry.saved_runtime(saved_profile) else {
+            return false;
+        };
+        let tab_id = state.active_editor_tab_id;
+        let Some(binding) = state
+            .editor_tabs
+            .iter()
+            .find(|tab| tab.tab_id == tab_id)
+            .map(|tab| tab.connection_binding.clone())
+        else {
+            return false;
+        };
+        binding.bind(runtime.clone(), None);
+        state.connection = runtime.connection();
+        state.refresh_tab_label(tab_id);
+        state.window.redraw();
+        true
     }
 
     /// Open Find in Results over the visible grid.
@@ -15227,31 +15298,15 @@ mod tests {
     }
 
     #[test]
-    fn status_connection_color_uses_dark_theme_semantic_colors() {
-        use crate::db::ConnectionColor;
-
+    fn status_connection_color_reports_the_session_and_nothing_else() {
+        // A tagged connection must not repaint the dot: the dot is the only
+        // place that says whether a session is live.
         assert_eq!(
-            status_connection_color(false, ConnectionColor::None).to_rgb(),
-            theme::status_disconnected().to_rgb()
-        );
-        assert_eq!(
-            status_connection_color(true, ConnectionColor::None).to_rgb(),
+            status_connection_color(true).to_rgb(),
             theme::status_connected().to_rgb()
         );
-    }
-
-    #[test]
-    fn status_connection_color_shows_the_tag_only_while_connected() {
-        use crate::db::ConnectionColor;
-
         assert_eq!(
-            status_connection_color(true, ConnectionColor::Red).to_rgb(),
-            ConnectionColor::Red.rgb().expect("Red is a painted colour")
-        );
-        // Disconnected wins: a red production tag must not be mistaken for a
-        // live session.
-        assert_eq!(
-            status_connection_color(false, ConnectionColor::Red).to_rgb(),
+            status_connection_color(false).to_rgb(),
             theme::status_disconnected().to_rgb()
         );
     }

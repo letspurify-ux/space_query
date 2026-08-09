@@ -2102,6 +2102,81 @@ fn capture_value_viewer(capture_path: &str) {
     );
 }
 
+/// The tag where it is read: the query tab strip and the result strip under it.
+///
+/// The dialog shot shows where a colour is picked; this one shows what picking
+/// it does, which is the part a reader cannot guess. The strip holds two
+/// connections' results on purpose — that is the case the colour exists for,
+/// and it is the only one a single colour could not tell you about.
+fn capture_connection_color_tabs(main_window: &mut MainWindow) {
+    let order_columns = [
+        ("ORDER_ID", "NUMBER"),
+        ("CUSTOMER", "VARCHAR2"),
+        ("STATUS", "VARCHAR2"),
+        ("TOTAL", "NUMBER"),
+    ];
+    let order_rows: &[&[&str]] = &[
+        &["10248", "VINET", "SHIPPED", "440.00"],
+        &["10249", "TOMSP", "SHIPPED", "1863.40"],
+        &["10250", "HANAR", "PACKING", "1552.60"],
+        &["10251", "VICTE", "PACKING", "654.06"],
+        &["10252", "SUPRD", "OPEN", "3597.90"],
+    ];
+    let emp_columns = [
+        ("EMPNO", "NUMBER"),
+        ("ENAME", "VARCHAR2"),
+        ("JOB", "VARCHAR2"),
+        ("SAL", "NUMBER"),
+    ];
+    let emp_rows: &[&[&str]] = &[
+        &["7839", "KING", "PRESIDENT", "5000"],
+        &["7788", "SCOTT", "ANALYST", "3000"],
+        &["7902", "FORD", "ANALYST", "3000"],
+        &["7566", "JONES", "MANAGER", "2975"],
+        &["7698", "BLAKE", "MANAGER", "2850"],
+    ];
+
+    // Run one result on each connection, from the same query tab. A tab reaches
+    // this after losing its database and being bound to another one.
+    if !main_window.capture_tour_rebind_active_tab("capture-analytics-maria") {
+        fail("the MariaDB example connection is missing");
+    }
+    pump(200);
+    main_window
+        .capture_tour_show_result(
+            "ORDERS",
+            make_result(&order_columns, order_rows, "SELECT * FROM ORDERS"),
+            false,
+            None,
+        )
+        .unwrap_or_else(|err| fail(format!("show MariaDB result: {err}")));
+    pump(250);
+
+    if !main_window.capture_tour_rebind_active_tab("capture-local-oracle") {
+        fail("the Oracle example connection is missing");
+    }
+    pump(200);
+    main_window.capture_tour_append_result(
+        "EMP",
+        make_result(&emp_columns, emp_rows, "SELECT * FROM EMP"),
+    );
+    pump(250);
+
+    // Fill the editor, so the crop is two tagged strips with work between them
+    // rather than two strips around an empty box.
+    main_window.capture_tour_set_sql(
+        "SELECT e.empno, e.ename, e.job, e.sal, d.dname\n\
+         FROM emp e\n\
+         JOIN dept d ON d.deptno = e.deptno\n\
+         WHERE e.sal >= 1500\n\
+           AND e.job <> 'PRESIDENT'\n\
+         ORDER BY e.sal DESC, e.ename;",
+        Some(0),
+    );
+    pump(250);
+    save_main_part("/tmp/space-query-connection-color-tabs.ppm", 250, 64, 950, 345);
+}
+
 fn capture_soft_wrap(main_window: &mut MainWindow) {
     let long_line = "SELECT o.ORDER_ID, o.CUSTOMER_ID, o.STATUS, o.TOTAL_AMOUNT, o.CREATED_AT \
 FROM ORDERS o WHERE o.ORDER_ID IN (1001,1002,1003,1004,1005,1006,1007,1008,1009,1010,1011,1012,\
@@ -2346,6 +2421,12 @@ fn main() {
         app::quit();
         return;
     }
+    if capture_mode.as_deref() == Some("connection-color-tabs") {
+        capture_object_browser(&mut main_window);
+        capture_connection_color_tabs(&mut main_window);
+        app::quit();
+        return;
+    }
     if capture_mode.as_deref() == Some("result-paging") {
         capture_object_browser(&mut main_window);
         capture_result_grid(&mut main_window);
@@ -2492,6 +2573,7 @@ fn main() {
     capture_result_editing(&mut main_window);
     capture_session_activity(&mut main_window);
     capture_object_search(&mut main_window);
+    capture_connection_color_tabs(&mut main_window);
     capture_dialogs(&config);
     app::quit();
 }

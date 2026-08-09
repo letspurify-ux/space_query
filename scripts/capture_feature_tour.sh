@@ -158,6 +158,11 @@ if [[ "$capture_mode" == "connection-color" ]]; then
   exit 0
 fi
 
+if [[ "$capture_mode" == "connection-color-tabs" ]]; then
+  convert_capture connection-color-tabs connection-color-tabs
+  exit 0
+fi
+
 if [[ "$capture_mode" == "object-drop-confirmation" ]]; then
   convert_capture object-drop-confirmation object-drop-confirmation
   exit 0
@@ -177,6 +182,7 @@ fi
 convert_capture main main-window
 convert_capture connect connection-dialog
 convert_capture connection-color connection-color
+convert_capture connection-color-tabs connection-color-tabs
 convert_capture intellisense intellisense
 convert_capture signature signature-popup
 convert_capture object-browser object-browser
