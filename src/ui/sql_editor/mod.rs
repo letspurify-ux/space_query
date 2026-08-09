@@ -228,6 +228,28 @@ fn store_mutex_bool_option(slot: &Arc<Mutex<Option<bool>>>, value: Option<bool>)
     }
 }
 
+fn load_mutex_transaction_mode_option(
+    slot: &Arc<Mutex<Option<TransactionMode>>>,
+) -> Option<TransactionMode> {
+    match slot.lock() {
+        Ok(guard) => *guard,
+        Err(poisoned) => *poisoned.into_inner(),
+    }
+}
+
+fn store_mutex_transaction_mode_option(
+    slot: &Arc<Mutex<Option<TransactionMode>>>,
+    value: Option<TransactionMode>,
+) {
+    match slot.lock() {
+        Ok(mut guard) => *guard = value,
+        Err(poisoned) => {
+            let mut guard = poisoned.into_inner();
+            *guard = value;
+        }
+    }
+}
+
 fn try_mark_query_running(query_running: &Arc<Mutex<bool>>) -> bool {
     match query_running.lock() {
         Ok(mut guard) => {
@@ -545,6 +567,12 @@ pub enum QueryProgress {
     // SET AUTOCOMMIT command or statement.
     AutoCommitChanged {
         enabled: bool,
+    },
+    // Tab-scoped transaction mode changed after a successful session-scoped
+    // statement (SET SESSION TRANSACTION ... / ALTER SESSION SET
+    // ISOLATION_LEVEL ...), so the toolbar controls can mirror it immediately.
+    TransactionModeChanged {
+        mode: TransactionMode,
     },
     ConnectionChanged {
         info: Option<ConnectionInfo>,
@@ -999,6 +1027,7 @@ struct TransactionActionRequest<'a> {
     current_query_cancel_handle: &'a Arc<Mutex<Option<QueryCancelHandle>>>,
     current_mysql_cancel_context: &'a Arc<Mutex<Option<MySqlQueryCancelContext>>>,
     tab_auto_commit_override: &'a Arc<Mutex<Option<bool>>>,
+    tab_transaction_mode_override: &'a Arc<Mutex<Option<TransactionMode>>>,
     cancel_flag: &'a Arc<Mutex<bool>>,
     query_timeout: Option<Duration>,
     activity_label: &'static str,
@@ -1531,6 +1560,7 @@ impl TransactionActionBackend for MysqlTransactionActionBackend {
             current_query_cancel_handle,
             current_mysql_cancel_context,
             tab_auto_commit_override,
+            tab_transaction_mode_override,
             cancel_flag,
             query_timeout,
             activity_label,
@@ -1542,6 +1572,10 @@ impl TransactionActionBackend for MysqlTransactionActionBackend {
         let auto_commit = SqlEditorWidget::auto_commit_for_execution(
             conn_guard.auto_commit(),
             tab_auto_commit_override,
+        );
+        let transaction_mode = SqlEditorWidget::transaction_mode_for_execution(
+            conn_guard.transaction_mode(),
+            tab_transaction_mode_override,
         );
         let db_type = conn_guard.db_type();
         let execution_scope = pooled_db_session
@@ -1561,6 +1595,7 @@ impl TransactionActionBackend for MysqlTransactionActionBackend {
             query_timeout,
             activity_label,
             auto_commit,
+            Some(transaction_mode),
             false,
             true,
             Some(resolution_action),
@@ -1998,12 +2033,23 @@ pub struct SqlEditorWidget {
     current_cancel_operation: Arc<Mutex<Option<CancelOperationMetadata>>>,
     current_mysql_cancel_context: Arc<Mutex<Option<MySqlQueryCancelContext>>>,
     tab_auto_commit_override: Arc<Mutex<Option<bool>>>,
+    /// Tab-scoped transaction mode (isolation + access mode). `None` means the
+    /// tab follows the connection's configured transaction mode; the toolbar
+    /// controls and successful session-scoped statements (`SET SESSION
+    /// TRANSACTION ...`, `ALTER SESSION SET ISOLATION_LEVEL ...`) pin it.
+    tab_transaction_mode_override: Arc<Mutex<Option<TransactionMode>>>,
     /// The effective auto-commit value this tab's UI last displayed (status
     /// bar), or `None` while nothing has been shown. Execution startup
     /// cross-checks its own resolution against this and refuses to run on a
     /// mismatch, so a statement can never behave differently from what the
     /// screen said.
     ui_displayed_auto_commit: Arc<Mutex<Option<bool>>>,
+    /// The effective transaction mode this tab's UI last displayed (toolbar
+    /// isolation/access choices), or `None` while nothing has been shown.
+    /// Execution startup cross-checks its own resolution against this and
+    /// refuses to run on a mismatch, so a statement can never run under a
+    /// transaction mode different from what the screen said.
+    ui_displayed_transaction_mode: Arc<Mutex<Option<TransactionMode>>>,
     pending_result_edit_request: Arc<Mutex<Option<crate::db::ResultEditRequest>>>,
     /// The last answer given for each bind placeholder in this tab, replayed
     /// into the prompt on the next run. Kept out of `SessionState` on purpose:
@@ -2362,6 +2408,44 @@ impl SqlEditorWidget {
         Self::update_current_operation_autocommit(&self.current_operation_autocommit, enabled);
     }
 
+    /// Public (with `set_tab_transaction_mode`) so the live verification
+    /// harness can drive the toolbar write path and assert the pinned value.
+    pub fn tab_transaction_mode_override_value(&self) -> Option<TransactionMode> {
+        load_mutex_transaction_mode_option(&self.tab_transaction_mode_override)
+    }
+
+    /// The toolbar write path: pins this tab's transaction mode, exactly like
+    /// a successful session-scoped `SET SESSION TRANSACTION ...` /
+    /// `ALTER SESSION SET ISOLATION_LEVEL ...` statement does.
+    pub fn set_tab_transaction_mode(&self, mode: TransactionMode) {
+        store_mutex_transaction_mode_option(&self.tab_transaction_mode_override, Some(mode));
+    }
+
+    /// Clears the tab's pinned transaction mode so it falls back to the
+    /// connection's configured transaction mode (new tabs start this way).
+    /// Public so the live verification harness can reset a tab between
+    /// scenarios.
+    pub fn clear_tab_transaction_mode_override(&self) {
+        store_mutex_transaction_mode_option(&self.tab_transaction_mode_override, None);
+    }
+
+    pub(super) fn effective_transaction_mode(
+        connection_mode: TransactionMode,
+        tab_transaction_mode_override: Option<TransactionMode>,
+    ) -> TransactionMode {
+        tab_transaction_mode_override.unwrap_or(connection_mode)
+    }
+
+    pub(super) fn transaction_mode_for_execution(
+        connection_mode: TransactionMode,
+        tab_transaction_mode_override: &Arc<Mutex<Option<TransactionMode>>>,
+    ) -> TransactionMode {
+        Self::effective_transaction_mode(
+            connection_mode,
+            load_mutex_transaction_mode_option(tab_transaction_mode_override),
+        )
+    }
+
     pub(crate) fn has_open_lazy_fetch(&self) -> bool {
         Self::has_active_lazy_fetch(&self.active_lazy_fetch)
     }
@@ -2372,6 +2456,14 @@ impl SqlEditorWidget {
     /// resolution disagrees with this value.
     pub(crate) fn record_displayed_auto_commit(&self, displayed: Option<bool>) {
         store_mutex_bool_option(&self.ui_displayed_auto_commit, displayed);
+    }
+
+    /// Called by the toolbar sync with the effective transaction mode it just
+    /// displayed for this tab (`None` when nothing is shown, e.g. while
+    /// disconnected). Execution startup refuses to run when its own
+    /// resolution disagrees with this value.
+    pub(crate) fn record_displayed_transaction_mode(&self, displayed: Option<TransactionMode>) {
+        store_mutex_transaction_mode_option(&self.ui_displayed_transaction_mode, displayed);
     }
 
     /// Clears the tab's pinned auto-commit so it falls back to the connection
@@ -2901,7 +2993,9 @@ impl SqlEditorWidget {
         let current_cancel_operation = Arc::new(Mutex::new(None));
         let current_mysql_cancel_context = Arc::new(Mutex::new(None));
         let tab_auto_commit_override = Arc::new(Mutex::new(None));
+        let tab_transaction_mode_override = Arc::new(Mutex::new(None));
         let ui_displayed_auto_commit = Arc::new(Mutex::new(None));
+        let ui_displayed_transaction_mode = Arc::new(Mutex::new(None));
         let pending_result_edit_request = Arc::new(Mutex::new(None));
         let last_bind_prompt_values = Arc::new(Mutex::new(HashMap::new()));
         let cancel_flag = Arc::new(Mutex::new(false));
@@ -2983,7 +3077,9 @@ impl SqlEditorWidget {
             current_cancel_operation,
             current_mysql_cancel_context,
             tab_auto_commit_override,
+            tab_transaction_mode_override,
             ui_displayed_auto_commit,
+            ui_displayed_transaction_mode,
             pending_result_edit_request,
             last_bind_prompt_values,
             cancel_flag,
@@ -4736,6 +4832,7 @@ impl SqlEditorWidget {
         let current_oracle_thin_cancel_context = self.current_oracle_thin_cancel_context.clone();
         let current_mysql_cancel_context = self.current_mysql_cancel_context.clone();
         let tab_auto_commit_override = self.tab_auto_commit_override.clone();
+        let tab_transaction_mode_override = self.tab_transaction_mode_override.clone();
         let cancel_flag = self.cancel_flag.clone();
         let pooled_db_session = self.pooled_db_session.clone();
         let active_lazy_fetch = self.active_lazy_fetch.clone();
@@ -4794,6 +4891,7 @@ impl SqlEditorWidget {
                             current_query_cancel_handle: &current_query_cancel_handle,
                             current_mysql_cancel_context: &current_mysql_cancel_context,
                             tab_auto_commit_override: &tab_auto_commit_override,
+                            tab_transaction_mode_override: &tab_transaction_mode_override,
                             cancel_flag: &cancel_flag,
                             query_timeout,
                             activity_label,

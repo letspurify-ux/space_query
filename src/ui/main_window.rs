@@ -288,17 +288,6 @@ struct RetainedSessionOptionChangePlan {
 }
 
 impl RetainedSessionOptionChangePlan {
-    fn new(
-        connection: &crate::db::DatabaseConnection,
-        retained_editors: Vec<SqlEditorWidget>,
-    ) -> Self {
-        Self {
-            connection_generation: connection.connection_generation(),
-            db_type: connection.db_type(),
-            retained_editors,
-        }
-    }
-
     /// Built from the runtime's lock-free identity snapshot, so an option
     /// change that only touches retained tab sessions does not have to wait
     /// for the connection mutex another tab's execution may be holding. Stale
@@ -3589,11 +3578,34 @@ impl AppState {
                 (
                     guard.db_type(),
                     guard.is_connected(),
-                    guard.transaction_mode(),
+                    // Tab-scoped: the toolbar shows the ACTIVE tab's effective
+                    // transaction mode (tab override over connection default).
+                    crate::ui::sql_editor::SqlEditorWidget::effective_transaction_mode(
+                        guard.transaction_mode(),
+                        self.sql_editor.tab_transaction_mode_override_value(),
+                    ),
                     guard.default_transaction_isolation(),
                 )
             })
             .ok()
+    }
+
+    /// The transaction-mode controls are disabled whenever the active tab's
+    /// session cannot accept a transaction-mode change right now: a query or
+    /// lazy fetch is running on the tab, or its retained DB session is in a
+    /// state that requires resolution first.
+    fn transaction_mode_change_blocked_for_active_tab(&self, db_type: DatabaseType) -> bool {
+        if self.sql_editor.is_query_running() || self.sql_editor.has_open_lazy_fetch() {
+            return true;
+        }
+        self.sql_editor
+            .pooled_session_activity_snapshot()
+            .is_some_and(|snapshot| {
+                crate::db::retained_session_state_transaction_mode_change_preflight_decision(
+                    db_type,
+                    snapshot.retained_state(),
+                ) == RetainedSessionPreflightDecision::RequireResolution
+            })
     }
 
     fn selected_transaction_mode_from_controls(&self, db_type: DatabaseType) -> TransactionMode {
@@ -3615,10 +3627,10 @@ impl AppState {
         let Some((db_type, is_connected, mode, default_isolation)) =
             self.transaction_control_state()
         else {
-            if self.has_live_connection {
-                self.transaction_isolation_choice.activate();
-                self.transaction_access_choice.activate();
-            } else {
+            // The connection mutex is busy (another tab's execution holds it):
+            // leave the controls and the recorded displayed mode untouched —
+            // nothing shown has changed.
+            if !self.has_live_connection {
                 self.transaction_isolation_choice.deactivate();
                 self.transaction_access_choice.deactivate();
             }
@@ -3634,8 +3646,12 @@ impl AppState {
             .set_value(transaction_isolation_choice_index(db_type, mode.isolation));
         self.transaction_access_choice
             .set_value(transaction_access_choice_index(mode.access_mode));
+        // Screen/behavior contract: execution startup refuses to run when its
+        // resolved mode disagrees with what was displayed here.
+        self.sql_editor
+            .record_displayed_transaction_mode(is_connected.then_some(mode));
 
-        if is_connected {
+        if is_connected && !self.transaction_mode_change_blocked_for_active_tab(db_type) {
             self.transaction_isolation_choice.activate();
             self.transaction_access_choice.activate();
         } else {
@@ -3702,74 +3718,6 @@ impl AppState {
             }
         }
         None
-    }
-
-    fn retained_transaction_option_blocker(&self, action: &str) -> Option<String> {
-        let action_label = format!("change {action}");
-        self.retained_session_transaction_option_blocker(action, &action_label)
-    }
-
-    fn retained_session_transaction_option_decision(
-        action: &str,
-        snapshot: crate::db::PooledSessionLeaseSnapshot,
-    ) -> RetainedSessionPreflightDecision {
-        if action == "transaction mode" {
-            crate::db::retained_session_state_transaction_mode_change_preflight_decision(
-                snapshot.db_type,
-                snapshot.retained_state(),
-            )
-        } else {
-            crate::db::retained_session_state_preflight_decision(
-                RetainedSessionPreflightAction::TransactionOptionChange,
-                snapshot.retained_state(),
-            )
-        }
-    }
-
-    fn retained_session_transaction_option_blocker(
-        &self,
-        action: &str,
-        action_label: &str,
-    ) -> Option<String> {
-        let active_connection_id = self.active_connection_id();
-        self.editor_tabs.iter().filter(|tab| {
-            tab.connection_binding.snapshot().connection_id() == active_connection_id
-        }).find_map(|tab| {
-            let snapshot = tab.sql_editor.pooled_session_activity_snapshot()?;
-            let state = snapshot.retained_state;
-            if Self::retained_session_transaction_option_decision(action, snapshot)
-                == RetainedSessionPreflightDecision::RequireResolution
-            {
-                Some(format!(
-                    "Cannot {action_label} while tab '{}' has a {} DB session. Commit, rollback, or discard it first.",
-                    Self::tab_display_label(tab),
-                    state.label()
-                ))
-            } else {
-                None
-            }
-        })
-    }
-
-    fn retained_session_editors_for_transaction_option_change(
-        &self,
-        action: &str,
-    ) -> Vec<SqlEditorWidget> {
-        let active_connection_id = self.active_connection_id();
-        self.editor_tabs
-            .iter()
-            .filter(|tab| {
-                tab.connection_binding.snapshot().connection_id() == active_connection_id
-                    && tab
-                        .sql_editor
-                        .pooled_session_activity_snapshot()
-                        .is_some_and(|snapshot| {
-                            Self::retained_session_transaction_option_decision(action, snapshot)
-                                == RetainedSessionPreflightDecision::Allow
-                        })
-            })
-            .map(|tab| tab.sql_editor.clone())
-            .collect()
     }
 
     fn retained_scope_update_for_connection(
@@ -4675,6 +4623,7 @@ pub(crate) fn result_pane_routes_for_progress_with_script_context(
         | QueryProgress::NotifyCancelOldestLazyFetchForSessionPool
         | QueryProgress::LazyFetchCancelFailed { .. }
         | QueryProgress::AutoCommitChanged { .. }
+        | QueryProgress::TransactionModeChanged { .. }
         | QueryProgress::ConnectionChanged { .. }
         | QueryProgress::DatabaseChanged { .. }
         | QueryProgress::ScopeChangedNotice { .. }
@@ -4983,20 +4932,16 @@ fn execute_sql_request_with_session_pool_slot(
 }
 
 fn update_transaction_mode_from_controls(state: &Arc<Mutex<AppState>>) {
-    let (connection, previous_mode, mode, retained_editors) = {
+    // Tab-scoped, exactly like a session-scoped SET TRANSACTION statement:
+    // the controls pin the ACTIVE tab's transaction mode and touch nothing
+    // else — not the shared connection, not other tabs.
+    let (editor, runtime, previous_mode, mode) = {
         let mut s = state
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let active_connection_id = s.active_connection_id();
-        let connection_has_running_work = active_connection_id
-            .is_some_and(|connection_id| s.has_work_for_connection(connection_id));
-        let connection_has_lazy_fetch = active_connection_id.is_some_and(|connection_id| {
-            !s.lazy_fetch_sessions_for_connection(connection_id)
-                .is_empty()
-        });
         if let Some(message) = transaction_option_block_message(
-            connection_has_running_work,
-            connection_has_lazy_fetch,
+            s.sql_editor.is_query_running(),
+            s.sql_editor.has_open_lazy_fetch(),
             "changing transaction mode",
         ) {
             crate::ui::alert_on_main(&message);
@@ -5004,79 +4949,72 @@ fn update_transaction_mode_from_controls(state: &Arc<Mutex<AppState>>) {
             s.set_status_message(&message);
             return;
         }
-        if let Some(message) = s.retained_transaction_option_blocker("transaction mode") {
-            crate::ui::alert_on_main(&message);
-            s.sync_transaction_mode_controls();
-            s.set_status_message(&message);
-            return;
-        }
-        let Some((db_type, _, current_mode, _)) = s.transaction_control_state() else {
+        let Some((db_type, is_connected, current_mode, _)) = s.transaction_control_state() else {
             crate::ui::alert_on_main(&format_connection_busy_message());
+            s.sync_transaction_mode_controls();
             return;
         };
+        if !is_connected {
+            s.sync_transaction_mode_controls();
+            return;
+        }
         (
-            s.connection.clone(),
+            s.sql_editor.clone(),
+            s.active_connection_runtime(),
             current_mode,
             s.selected_transaction_mode_from_controls(db_type),
-            s.retained_session_editors_for_transaction_option_change("transaction mode"),
         )
     };
 
-    let shared_connection = Arc::clone(&connection);
-    let (status, should_sync_controls, mode_applied) = if let Some(mut connection) =
-        try_lock_connection_with_activity(&connection, "Updating transaction mode")
-    {
-        let retained_plan = RetainedSessionOptionChangePlan::new(&connection, retained_editors);
+    if mode == previous_mode {
+        let mut s = state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        s.sync_transaction_mode_controls();
+        return;
+    }
+
+    // Guard and apply only for THIS tab's retained session; other tabs — even
+    // dirty or executing ones — are not involved, and the runtime's lock-free
+    // identity keeps the change from waiting on a connection mutex another
+    // tab's query holds.
+    let retained_plan = runtime.as_ref().map(|runtime| {
+        RetainedSessionOptionChangePlan::from_runtime(runtime, vec![editor.clone()])
+    });
+    if let Some(retained_plan) = retained_plan.as_ref() {
         if let Err(err) = retained_plan.validate_transaction_option_change("transaction mode") {
             crate::ui::alert_on_main(&err);
-            (format!("Transaction mode unchanged: {}", err), true, false)
-        } else {
-            crate::db::clear_pool_session_context_for_shared_connection(&shared_connection);
-            match connection.set_transaction_mode(mode) {
-                Ok(()) => {
-                    crate::db::refresh_pool_session_context_cache_for_shared_connection(
-                        &shared_connection,
-                        &connection,
-                    );
-                    let pool_context_epoch = connection.pool_context_epoch();
-                    drop(connection);
-                    let retained_outcomes = retained_plan.apply_transaction_mode(
-                        pool_context_epoch,
-                        mode,
-                        "Updating transaction mode",
-                    );
-                    if let Some(message) = first_retained_outcome_message(&retained_outcomes) {
-                        crate::ui::alert_on_main(&format!(
-                        "Transaction mode was changed, but a retained session could not be updated. It was restored or discarded according to session safety: {}",
-                        message
-                    ));
-                    }
-                    (format!("Transaction mode: {}", mode.label()), true, true)
-                }
-                Err(err) => {
-                    crate::ui::alert_on_main(&err);
-                    (format!("Transaction mode unchanged: {}", err), true, false)
-                }
-            }
+            let mut s = state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            s.sync_transaction_mode_controls();
+            s.set_status_message(&format!("Transaction mode unchanged: {}", err));
+            return;
         }
-    } else {
-        let busy_message = format_connection_busy_message();
-        crate::ui::alert_on_main(&busy_message);
-        (busy_message, false, false)
-    };
+    }
+    editor.set_tab_transaction_mode(mode);
+    if let (Some(retained_plan), Some(runtime)) = (retained_plan.as_ref(), runtime.as_ref()) {
+        let retained_outcomes = retained_plan.apply_transaction_mode(
+            runtime.pool_context_epoch(),
+            mode,
+            "Updating transaction mode",
+        );
+        if let Some(message) = first_retained_outcome_message(&retained_outcomes) {
+            crate::ui::alert_on_main(&format!(
+                "Transaction mode was changed, but the retained session could not be updated. It was restored or discarded according to session safety: {}",
+                message
+            ));
+        }
+    }
 
     let mut s = state
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
-    if should_sync_controls {
-        s.sync_transaction_mode_controls();
-    }
-    s.set_status_message(&status);
+    s.sync_transaction_mode_controls();
+    s.set_status_message(&format!("Transaction mode: {}", mode.label()));
     drop(s);
 
-    if mode_applied && mode != previous_mode {
-        crate::ui::message_on_main(transaction_mode_new_transaction_notice());
-    }
+    crate::ui::message_on_main(transaction_mode_new_transaction_notice());
 }
 
 fn resolve_active_progress_tab_id(
@@ -10355,6 +10293,16 @@ impl MainWindow {
                     s.sync_auto_commit_indicators();
                     if s.should_show_progress_status_for_tab(tab_id) {
                         s.set_status_message(auto_commit_changed_progress_status(enabled));
+                    }
+                    drop(s);
+                }
+                QueryProgress::TransactionModeChanged { mode } => {
+                    // The toolbar choices show the active tab's transaction
+                    // mode, so a successful session-scoped statement in the
+                    // active tab must re-sync them immediately.
+                    s.sync_transaction_mode_controls();
+                    if s.should_show_progress_status_for_tab(tab_id) {
+                        s.set_status_message(&format!("Transaction mode: {}", mode.label()));
                     }
                     drop(s);
                 }

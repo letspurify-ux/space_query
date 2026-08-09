@@ -509,6 +509,7 @@ struct ExecutionWorkerContext<'a> {
     result_edit_request: Option<crate::db::ResultEditRequest>,
     pooled_db_session: &'a SharedDbSessionLease,
     tab_auto_commit_override: &'a Arc<Mutex<Option<bool>>>,
+    tab_transaction_mode_override: &'a Arc<Mutex<Option<crate::db::TransactionMode>>>,
     active_lazy_fetch: &'a Arc<Mutex<Option<LazyFetchHandle>>>,
     next_lazy_fetch_session_id: &'a Arc<AtomicU64>,
     current_oracle_thin_cancel_context: &'a Arc<Mutex<Option<OracleThinCancelHandle>>>,
@@ -592,6 +593,7 @@ impl ExecutionWorkerBackend for OracleExecutionWorkerBackend {
             sql_text,
             pooled_db_session,
             tab_auto_commit_override,
+            tab_transaction_mode_override,
             active_lazy_fetch,
             next_lazy_fetch_session_id,
             current_oracle_thin_cancel_context,
@@ -843,7 +845,11 @@ impl ExecutionWorkerBackend for OracleExecutionWorkerBackend {
                     candidate.auto_commit,
                     load_mutex_bool_option(tab_auto_commit_override),
                 ),
-                candidate.transaction_mode,
+                // The tab's pinned transaction mode also survives CONNECT.
+                SqlEditorWidget::effective_transaction_mode(
+                    candidate.transaction_mode,
+                    load_mutex_transaction_mode_option(tab_transaction_mode_override),
+                ),
                 None,
                 candidate.binding_revision,
                 Some(candidate.sanitized_info),
@@ -1015,6 +1021,7 @@ impl ExecutionWorkerBackend for OracleExecutionWorkerBackend {
             db_activity,
             current_operation_autocommit,
             Some(tab_auto_commit_override),
+            Some(tab_transaction_mode_override),
             query_timeout,
             Some((active_connection, connection_generation)),
             Some(&mut transition_context),
@@ -1104,6 +1111,7 @@ impl ExecutionWorkerBackend for MysqlExecutionWorkerBackend {
             result_edit_request,
             pooled_db_session,
             tab_auto_commit_override,
+            tab_transaction_mode_override,
             active_lazy_fetch,
             next_lazy_fetch_session_id,
             current_query_cancel_handle,
@@ -1127,8 +1135,8 @@ impl ExecutionWorkerBackend for MysqlExecutionWorkerBackend {
             mut conn_name,
             db_type,
             auto_commit,
+            selected_transaction_mode,
             session,
-            ..
         } = startup;
 
         if startup_policy.requires_connected_session
@@ -1175,6 +1183,7 @@ impl ExecutionWorkerBackend for MysqlExecutionWorkerBackend {
                 operation_id,
                 query_timeout,
                 auto_commit,
+                selected_transaction_mode,
                 db_activity,
                 execution_scope.as_deref(),
                 &request,
@@ -1198,6 +1207,7 @@ impl ExecutionWorkerBackend for MysqlExecutionWorkerBackend {
             &session,
             pooled_db_session,
             tab_auto_commit_override,
+            tab_transaction_mode_override,
             active_lazy_fetch,
             next_lazy_fetch_session_id,
             current_mysql_cancel_context,
@@ -1208,6 +1218,7 @@ impl ExecutionWorkerBackend for MysqlExecutionWorkerBackend {
             query_timeout,
             lazy_fetch_batch_size,
             auto_commit,
+            selected_transaction_mode,
             db_activity,
             Some(cleanup.execution_metadata_mut()),
             Some(current_operation_autocommit),
@@ -1652,6 +1663,19 @@ impl QueryExecutionCleanupGuard {
         );
         self.oracle_pooled_session_state_delta = retained_delta;
         self.oracle_pooled_session_state_delta_recorded = true;
+    }
+
+    /// See [`RetainedSessionState::with_session_transaction_mode_override_adopted`]:
+    /// after the editor adopts a successful `ALTER SESSION SET
+    /// ISOLATION_LEVEL ...` into the tab's transaction-mode setting, the
+    /// recorded state delta must not keep the session-scope override residue
+    /// that would block the tab's next execution.
+    fn adopt_oracle_session_transaction_mode_override(&mut self) {
+        if self.oracle_pooled_session_state_delta_recorded {
+            self.oracle_pooled_session_state_delta = self
+                .oracle_pooled_session_state_delta
+                .with_session_transaction_mode_override_adopted();
+        }
     }
 
     fn clear_oracle_pooled_session_maybe_dirty(&mut self) {
@@ -6553,6 +6577,26 @@ impl SqlEditorWidget {
     }
 
     /// Defense-in-depth for the screen/behavior contract: `displayed` is the
+    /// effective transaction mode the toolbar choices last showed for this
+    /// tab; refuse to execute when the mode about to be applied differs.
+    /// `None` (nothing displayed — harness runs, or the controls hidden while
+    /// disconnected) skips the check.
+    pub(super) fn transaction_mode_display_mismatch_error(
+        displayed: Option<crate::db::TransactionMode>,
+        resolved: crate::db::TransactionMode,
+    ) -> Option<String> {
+        let displayed = displayed?;
+        (displayed != resolved).then(|| {
+            format!(
+                "Transaction mode mismatch: the toolbar showed \"{}\" but this execution would run with \"{}\". \
+                 Nothing was executed; the controls have been corrected — run the statement again.",
+                displayed.label(),
+                resolved.label()
+            )
+        })
+    }
+
+    /// Defense-in-depth for the screen/behavior contract: `displayed` is the
     /// effective auto-commit the status bar last showed for this tab; refuse
     /// to execute when the value about to be applied differs. `None` (nothing
     /// displayed — harness runs, or the indicator hidden while disconnected)
@@ -6829,6 +6873,7 @@ impl SqlEditorWidget {
         operation_id: u64,
         query_timeout: Option<Duration>,
         auto_commit: bool,
+        transaction_mode: crate::db::TransactionMode,
         db_activity: &str,
         execution_scope: Option<&str>,
         request: &crate::db::ResultEditRequest,
@@ -6856,6 +6901,7 @@ impl SqlEditorWidget {
             query_timeout,
             db_activity,
             auto_commit,
+            Some(transaction_mode),
             false,
             false,
             None,
@@ -6908,6 +6954,7 @@ impl SqlEditorWidget {
         session: &Arc<Mutex<SessionState>>,
         pooled_db_session: &SharedDbSessionLease,
         tab_auto_commit_override: &Arc<Mutex<Option<bool>>>,
+        tab_transaction_mode_override: &Arc<Mutex<Option<crate::db::TransactionMode>>>,
         active_lazy_fetch: &Arc<Mutex<Option<LazyFetchHandle>>>,
         next_lazy_fetch_session_id: &Arc<AtomicU64>,
         current_mysql_cancel_context: &Arc<Mutex<Option<MySqlQueryCancelContext>>>,
@@ -6918,6 +6965,7 @@ impl SqlEditorWidget {
         query_timeout: Option<Duration>,
         lazy_fetch_batch_size: usize,
         initial_auto_commit: bool,
+        initial_transaction_mode: crate::db::TransactionMode,
         db_activity: &str,
         mut execution_metadata: Option<&mut crate::db::session_policy::ExecutionFinishedEvent>,
         current_operation_autocommit: Option<&Arc<Mutex<bool>>>,
@@ -6951,6 +6999,10 @@ impl SqlEditorWidget {
         let mut conn_name = conn_name.to_string();
         let mut result_index = 0usize;
         let mut auto_commit = initial_auto_commit;
+        // Cell instead of a mut local so the statement-executing closures can
+        // read the batch's current transaction mode while a successful
+        // session-scoped statement updates it mid-batch.
+        let active_transaction_mode = std::cell::Cell::new(initial_transaction_mode);
         let execution_scope = Mutex::new(initial_scope);
         let current_execution_scope = || {
             execution_scope
@@ -7035,6 +7087,7 @@ impl SqlEditorWidget {
                 query_timeout,
                 db_activity,
                 auto_commit,
+                Some(active_transaction_mode.get()),
                 refresh_encoding_after,
                 false,
                 None,
@@ -7111,6 +7164,7 @@ impl SqlEditorWidget {
                     query_timeout,
                     db_activity,
                     auto_commit,
+                    Some(active_transaction_mode.get()),
                     false,
                     false,
                     None,
@@ -8101,6 +8155,7 @@ impl SqlEditorWidget {
                             current_execution_scope().as_deref(),
                             db_activity,
                             auto_commit,
+                            Some(active_transaction_mode.get()),
                             Some(sender),
                             false,
                             None,
@@ -8124,6 +8179,7 @@ impl SqlEditorWidget {
                                         db_activity,
                                         connection_generation,
                                         auto_commit,
+                                        Some(active_transaction_mode.get()),
                                         prior_retained_state
                                             .requires_physical_session_preservation(),
                                     )
@@ -8424,6 +8480,17 @@ impl SqlEditorWidget {
                                 success.effects,
                                 &mut mysql_batch_effects,
                             );
+                            let mut adopted_transaction_mode = active_transaction_mode.get();
+                            if SqlEditorWidget::adopt_session_transaction_mode_change_after_statement(
+                                db_type,
+                                &sql_text,
+                                &mut adopted_transaction_mode,
+                                Some(tab_transaction_mode_override),
+                                sender,
+                            ) {
+                                mysql_batch_effects.adopt_session_transaction_mode_override();
+                            }
+                            active_transaction_mode.set(adopted_transaction_mode);
                             let stop_after_success =
                                 SqlEditorWidget::mysql_batch_success_requires_stop(success.effects);
                             let results = success.results;
@@ -9494,7 +9561,9 @@ impl SqlEditorWidget {
         let current_operation_autocommit = self.current_operation_autocommit.clone();
         let current_cancel_operation = self.current_cancel_operation.clone();
         let tab_auto_commit_override = self.tab_auto_commit_override.clone();
+        let tab_transaction_mode_override = self.tab_transaction_mode_override.clone();
         let ui_displayed_auto_commit = self.ui_displayed_auto_commit.clone();
+        let ui_displayed_transaction_mode = self.ui_displayed_transaction_mode.clone();
         let active_lazy_fetch = self.active_lazy_fetch.clone();
         let next_lazy_fetch_session_id = self.next_lazy_fetch_session_id.clone();
         let current_mysql_cancel_context = self.current_mysql_cancel_context.clone();
@@ -9615,7 +9684,38 @@ impl SqlEditorWidget {
                     );
                     return;
                 }
-                let selected_transaction_mode = conn_guard.transaction_mode();
+                let selected_transaction_mode = SqlEditorWidget::transaction_mode_for_execution(
+                    conn_guard.transaction_mode(),
+                    &tab_transaction_mode_override,
+                );
+                if let Some(message) = SqlEditorWidget::transaction_mode_display_mismatch_error(
+                    load_mutex_transaction_mode_option(&ui_displayed_transaction_mode),
+                    selected_transaction_mode,
+                ) {
+                    // Self-heal so the corrected controls let the retry run.
+                    store_mutex_transaction_mode_option(
+                        &ui_displayed_transaction_mode,
+                        Some(selected_transaction_mode),
+                    );
+                    let _ = sender.send(QueryProgress::TransactionModeChanged {
+                        mode: selected_transaction_mode,
+                    });
+                    let _ = sender.send(QueryProgress::BatchStart {
+                        activity: db_activity.clone(),
+                        total_units: None,
+                        status_activity: None,
+                        sql: sql_text.clone(),
+                    });
+                    SqlEditorWidget::emit_execution_startup_error(
+                        &sender,
+                        script_mode,
+                        &sql_text,
+                        &conn_name,
+                        &message,
+                        Some(&tab_session),
+                    );
+                    return;
+                }
                 let session = tab_session.clone();
 
                 let internal_result_edit_error = match result_edit_request.as_ref() {
@@ -9669,6 +9769,7 @@ impl SqlEditorWidget {
                         result_edit_request,
                         pooled_db_session: &pooled_db_session,
                         tab_auto_commit_override: &tab_auto_commit_override,
+                        tab_transaction_mode_override: &tab_transaction_mode_override,
                         active_lazy_fetch: &active_lazy_fetch,
                         next_lazy_fetch_session_id: &next_lazy_fetch_session_id,
                         current_oracle_thin_cancel_context: &current_oracle_thin_cancel_context,
@@ -9872,6 +9973,10 @@ impl SqlEditorWidget {
 
                 let mut result_index = 0usize;
                 let mut auto_commit = auto_commit;
+                // The batch's current transaction mode: successful
+                // session-scoped statements (ALTER SESSION SET
+                // ISOLATION_LEVEL ...) merge into it and pin the tab.
+                let mut active_transaction_mode = transaction_mode;
                 let mut continue_on_error = match session.lock() {
                     Ok(guard) => guard.continue_on_error,
                     Err(poisoned) => {
@@ -11411,7 +11516,7 @@ impl SqlEditorWidget {
                                                 }
                                                 if let Err(err) = crate::db::DatabaseConnection::apply_oracle_transaction_mode(
                                                     prepared_conn.as_ref(),
-                                                    transaction_mode,
+                                                    active_transaction_mode,
                                                 ) {
                                                     if let Some(mut guard) =
                                                         crate::db::try_lock_connection(
@@ -11521,7 +11626,7 @@ impl SqlEditorWidget {
                                                 );
                                                 Self::record_applied_oracle_transaction_mode_effects(
                                                     &mut cleanup,
-                                                    transaction_mode,
+                                                    active_transaction_mode,
                                                 );
                                                 shared_connection = candidate_connection;
                                                 connection_generation =
@@ -14029,6 +14134,16 @@ impl SqlEditorWidget {
 
                                 if result.success {
                                     cleanup.clear_oracle_successful_statement_cancel_protection();
+                                    if Self::adopt_session_transaction_mode_change_after_statement(
+                                        crate::db::DatabaseType::Oracle,
+                                        &sql_to_execute,
+                                        &mut active_transaction_mode,
+                                        Some(&tab_transaction_mode_override),
+                                        &sender,
+                                    ) {
+                                        cleanup
+                                            .adopt_oracle_session_transaction_mode_override();
+                                    }
                                 }
 
                                 let current_schema_changed = result.success
@@ -16660,6 +16775,7 @@ impl SqlEditorWidget {
             db_activity,
             current_operation_autocommit,
             None,
+            None,
             query_timeout,
             scope_sync_context.map(|(connection, generation)| (connection.clone(), generation)),
             None,
@@ -16682,6 +16798,7 @@ impl SqlEditorWidget {
         db_activity: &str,
         current_operation_autocommit: &Arc<Mutex<bool>>,
         tab_auto_commit_override: Option<&Arc<Mutex<Option<bool>>>>,
+        tab_transaction_mode_override: Option<&Arc<Mutex<Option<crate::db::TransactionMode>>>>,
         query_timeout: Option<Duration>,
         mut scope_sync_context: Option<(crate::db::SharedConnection, u64)>,
         mut transition_context: Option<&mut OracleThinConnectionTransitionContext<'_>>,
@@ -17580,7 +17697,14 @@ impl SqlEditorWidget {
                                             .and_then(|slot| load_mutex_bool_option(slot)),
                                     );
                                     store_mutex_bool(current_operation_autocommit, auto_commit);
-                                    active_transaction_mode = candidate.transaction_mode;
+                                    // The tab's pinned transaction mode also
+                                    // survives CONNECT.
+                                    active_transaction_mode = Self::effective_transaction_mode(
+                                        candidate.transaction_mode,
+                                        tab_transaction_mode_override.and_then(|slot| {
+                                            load_mutex_transaction_mode_option(slot)
+                                        }),
+                                    );
                                     transaction_mode_applied = false;
                                     continue_on_error = session
                                         .lock()
@@ -18091,6 +18215,16 @@ impl SqlEditorWidget {
                                         false,
                                         false,
                                     );
+                                if Self::adopt_session_transaction_mode_change_after_statement(
+                                    crate::db::DatabaseType::Oracle,
+                                    &execution_sql,
+                                    &mut active_transaction_mode,
+                                    tab_transaction_mode_override,
+                                    sender,
+                                ) {
+                                    retained_state = retained_state
+                                        .with_session_transaction_mode_override_adopted();
+                                }
                                 let mut message = Self::oracle_thin_non_query_success_message(
                                     &head,
                                     has_exec_call,
@@ -20932,6 +21066,33 @@ impl SqlEditorWidget {
         batch_effects.apply_successful_statement_effects(sql, auto_commit, effects);
     }
 
+    /// Mirrors a successful session-scoped transaction-mode statement (`SET
+    /// SESSION TRANSACTION ...`, `ALTER SESSION SET ISOLATION_LEVEL ...`) into
+    /// the batch's active transaction mode, the tab's pinned mode, and the UI,
+    /// so the toolbar controls can never disagree with the session state the
+    /// statement just applied. Returns whether a change was adopted, so the
+    /// caller can drop the now-represented session-scope override residue.
+    fn adopt_session_transaction_mode_change_after_statement(
+        db_type: crate::db::DatabaseType,
+        sql: &str,
+        active_transaction_mode: &mut crate::db::TransactionMode,
+        tab_transaction_mode_override: Option<&Arc<Mutex<Option<crate::db::TransactionMode>>>>,
+        sender: &QueryProgressSender,
+    ) -> bool {
+        let Some(change) = crate::db::session_transaction_mode_change_for_statement(db_type, sql)
+        else {
+            return false;
+        };
+        let mode = change.applied_to(*active_transaction_mode);
+        *active_transaction_mode = mode;
+        if let Some(slot) = tab_transaction_mode_override {
+            store_mutex_transaction_mode_option(slot, Some(mode));
+        }
+        let _ = sender.send(QueryProgress::TransactionModeChanged { mode });
+        app::awake();
+        true
+    }
+
     fn mysql_batch_success_requires_stop(effects: crate::db::StatementSessionEffects) -> bool {
         effects.requires_transaction_decision_after_success()
             || effects
@@ -21625,6 +21786,7 @@ impl SqlEditorWidget {
         execution_scope: Option<&str>,
         db_activity: &str,
         auto_commit: bool,
+        transaction_mode: Option<crate::db::TransactionMode>,
         session_pool_sender: Option<&QueryProgressSender>,
         require_existing_session: bool,
         required_resolution_action: Option<RetainedSessionResolutionAction>,
@@ -21641,9 +21803,15 @@ impl SqlEditorWidget {
         let context = {
             let conn_guard =
                 lock_connection_with_activity(shared_connection, db_activity.to_string());
-            conn_guard
+            let mut context = conn_guard
                 .pool_session_context()?
-                .for_scope(execution_scope)
+                .for_scope(execution_scope);
+            // Tab-scoped transaction mode: the session is prepared with the
+            // requesting tab's effective mode, not the connection default.
+            if let Some(transaction_mode) = transaction_mode {
+                context.transaction_mode = transaction_mode;
+            }
+            context
         };
         let db_display_name = context.connection_info.db_type.display_name();
 
@@ -21901,6 +22069,11 @@ impl SqlEditorWidget {
         default_transaction_isolation: crate::db::TransactionIsolation,
         preserve_existing_session_state: bool,
     ) -> Result<(), String> {
+        if std::env::var("SQ_TRACE_TX_MODE").is_ok() {
+            eprintln!(
+                "(trace) apply settings mode={transaction_mode:?} preserve={preserve_existing_session_state}"
+            );
+        }
         for statement in Self::mysql_pooled_execution_session_setup_statements(
             db_type,
             auto_commit,
@@ -21931,11 +22104,21 @@ impl SqlEditorWidget {
             return Ok(Vec::new());
         }
 
-        let mut statements = vec![if auto_commit {
+        // preserve=false means the retained state carries no user work, but
+        // under autocommit=0 the app's own bookkeeping SELECTs (dirty probes,
+        // session-setting validation) have usually opened an implicit
+        // transaction on the session. MySQL fixes a transaction's access mode
+        // and isolation at transaction start, so without ending that residual
+        // transaction first, the SET SESSION TRANSACTION below would only
+        // take effect one transaction later — the user's statement would run
+        // under the previous mode (live-observed on MySQL 8.0: a READ ONLY
+        // pin let the next INSERT through and blocked the one after).
+        let mut statements = vec!["ROLLBACK".to_string()];
+        statements.push(if auto_commit {
             "SET autocommit=1".to_string()
         } else {
             "SET autocommit=0".to_string()
-        }];
+        });
         statements.extend(
             crate::db::DatabaseConnection::transaction_mode_statements_for_with_default(
                 db_type,
@@ -23062,6 +23245,7 @@ impl SqlEditorWidget {
         db_activity: &str,
         connection_generation: u64,
         operation_auto_commit: bool,
+        operation_transaction_mode: Option<crate::db::TransactionMode>,
         preserve_existing_session_state: bool,
     ) -> Result<(), String> {
         let (
@@ -23087,7 +23271,11 @@ impl SqlEditorWidget {
                 conn_guard.get_info().advanced.clone(),
                 conn_guard.pool_session_context().ok(),
                 db_type,
-                conn_guard.transaction_mode(),
+                // Tab-scoped transaction mode: the pre-action recheck must
+                // re-apply the requesting tab's effective mode, or it would
+                // overwrite the mode the acquisition just applied with the
+                // connection default.
+                operation_transaction_mode.unwrap_or_else(|| conn_guard.transaction_mode()),
                 conn_guard.default_transaction_isolation(),
             )
         };
@@ -23256,6 +23444,7 @@ impl SqlEditorWidget {
         query_timeout: Option<Duration>,
         log_context: &str,
         auto_commit: bool,
+        transaction_mode: Option<crate::db::TransactionMode>,
         refresh_encoding_after: bool,
         require_existing_session: bool,
         required_resolution_action: Option<RetainedSessionResolutionAction>,
@@ -23278,6 +23467,7 @@ impl SqlEditorWidget {
             execution_scope,
             log_context,
             auto_commit,
+            transaction_mode,
             session_pool_sender,
             require_existing_session,
             required_resolution_action,
@@ -23495,6 +23685,7 @@ impl SqlEditorWidget {
                 log_context,
                 connection_generation,
                 auto_commit,
+                transaction_mode,
                 prior_retained_state.requires_physical_session_preservation(),
             ) {
                 let timeout_reset_ok = match timeout_restore.as_ref() {
@@ -23535,6 +23726,12 @@ impl SqlEditorWidget {
             }
         }
 
+        if std::env::var("SQ_TRACE_TX_MODE").is_ok() {
+            use mysql::prelude::Queryable;
+            let probe: Result<Option<(u64, u64)>, _> =
+                conn.query_first("SELECT CONNECTION_ID(), @@transaction_read_only");
+            eprintln!("(trace) before action sql={statement_sql:?} probe={probe:?}");
+        }
         let result = panic::catch_unwind(AssertUnwindSafe(|| {
             action(&mut conn)
                 .map_err(|err| SqlEditorWidget::mysql_error_message(&err, effective_query_timeout))
@@ -23749,6 +23946,18 @@ impl SqlEditorWidget {
                 fallback_on_error,
                 interruption_requires_transaction_decision,
             );
+            if matches!(&result, Ok(Ok(_)))
+                && crate::db::session_transaction_mode_change_for_statement(db_type, statement_sql)
+                    .is_some()
+            {
+                // The batch adopts this successful session-scoped
+                // transaction-mode change into the tab's setting right after
+                // this call returns, so the session no longer holds state the
+                // app cannot represent; the session-scope override residue
+                // must not block the tab's next execution.
+                final_retained_state =
+                    final_retained_state.with_session_transaction_mode_override_adopted();
+            }
             if physical_session_resolution_required_by_policy {
                 // A central policy physical-resolution decision means the
                 // retained session is not transaction-dirty, but the interrupt
@@ -30140,6 +30349,9 @@ mod query_execution_cleanup_tests {
         assert_eq!(
             statements,
             vec![
+                // The residual app-internal transaction must end first, or
+                // MySQL applies the new characteristics one transaction late.
+                "ROLLBACK",
                 "SET autocommit=0",
                 "SET SESSION TRANSACTION ISOLATION LEVEL READ COMMITTED, READ ONLY"
             ]
@@ -30161,9 +30373,8 @@ mod query_execution_cleanup_tests {
         )
         .expect("scope recheck setup should be valid");
 
-        assert_eq!(
-            statements.first().map(String::as_str),
-            Some("SET autocommit=0"),
+        assert!(
+            statements.contains(&"SET autocommit=0".to_string()),
             "scope recheck must preserve the tab/batch operation auto-commit, not the global UI value",
         );
     }
@@ -30204,6 +30415,7 @@ mod query_execution_cleanup_tests {
         assert_eq!(
             statements,
             vec![
+                "ROLLBACK",
                 "SET autocommit=1",
                 "SET SESSION TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ WRITE"
             ]
@@ -32105,6 +32317,7 @@ mod mysql_batch_execution_regression_tests {
             "mysql empty scope recheck",
             connection_generation,
             true,
+            None,
             false,
         )
         .expect("empty global scope recheck should reset stale database state");
@@ -32226,6 +32439,7 @@ mod mysql_batch_execution_regression_tests {
         current_query_cancel_handle: Arc<Mutex<Option<QueryCancelHandle>>>,
         pooled_db_session: crate::db::SharedDbSessionLease,
         tab_auto_commit_override: Arc<Mutex<Option<bool>>>,
+        tab_transaction_mode_override: Arc<Mutex<Option<TransactionMode>>>,
         active_lazy_fetch: Arc<Mutex<Option<LazyFetchHandle>>>,
         next_lazy_fetch_session_id: Arc<AtomicU64>,
         cancel_flag: Arc<Mutex<bool>>,
@@ -32284,6 +32498,7 @@ mod mysql_batch_execution_regression_tests {
                 current_query_cancel_handle: Arc::new(Mutex::new(None)),
                 pooled_db_session: crate::db::SharedDbSessionLease::new(),
                 tab_auto_commit_override: Arc::new(Mutex::new(None)),
+                tab_transaction_mode_override: Arc::new(Mutex::new(None)),
                 active_lazy_fetch: Arc::new(Mutex::new(None)),
                 next_lazy_fetch_session_id: Arc::new(AtomicU64::new(1)),
                 cancel_flag: Arc::new(Mutex::new(false)),
@@ -32328,6 +32543,16 @@ mod mysql_batch_execution_regression_tests {
             progress_idle_timeout: Duration,
         ) -> Vec<QueryProgress> {
             let (sender, receiver) = super::test_query_progress_channel();
+            let initial_transaction_mode = {
+                let guard = self
+                    .shared_connection
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                SqlEditorWidget::transaction_mode_for_execution(
+                    guard.transaction_mode(),
+                    &self.tab_transaction_mode_override,
+                )
+            };
             SqlEditorWidget::execute_mysql_batch(
                 &self.shared_connection,
                 &sender,
@@ -32337,6 +32562,7 @@ mod mysql_batch_execution_regression_tests {
                 &self.session,
                 &self.pooled_db_session,
                 &self.tab_auto_commit_override,
+                &self.tab_transaction_mode_override,
                 &self.active_lazy_fetch,
                 &self.next_lazy_fetch_session_id,
                 &self.current_mysql_cancel_context,
@@ -32347,6 +32573,7 @@ mod mysql_batch_execution_regression_tests {
                 query_timeout,
                 crate::utils::DEFAULT_LAZY_FETCH_BATCH_SIZE as usize,
                 self.initial_auto_commit,
+                initial_transaction_mode,
                 db_activity,
                 None,
                 None,
@@ -32414,6 +32641,14 @@ mod mysql_batch_execution_regression_tests {
         let active_lazy_fetch: Arc<Mutex<Option<LazyFetchHandle>>> = Arc::new(Mutex::new(None));
         let next_lazy_fetch_session_id = Arc::new(AtomicU64::new(1));
         let cancel_flag = Arc::new(Mutex::new(false));
+        let tab_transaction_mode_override: Arc<Mutex<Option<crate::db::TransactionMode>>> =
+            Arc::new(Mutex::new(None));
+        let initial_transaction_mode = {
+            let guard = shared_connection
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            guard.transaction_mode()
+        };
         let (sender, receiver) = super::test_query_progress_channel();
 
         SqlEditorWidget::execute_mysql_batch(
@@ -32425,6 +32660,7 @@ mod mysql_batch_execution_regression_tests {
             session,
             pooled_db_session,
             tab_auto_commit_override,
+            &tab_transaction_mode_override,
             &active_lazy_fetch,
             &next_lazy_fetch_session_id,
             &current_mysql_cancel_context,
@@ -32435,6 +32671,7 @@ mod mysql_batch_execution_regression_tests {
             None,
             crate::utils::DEFAULT_LAZY_FETCH_BATCH_SIZE as usize,
             initial_auto_commit,
+            initial_transaction_mode,
             db_activity,
             None,
             None,
@@ -32557,6 +32794,9 @@ mod mysql_batch_execution_regression_tests {
                 }
                 QueryProgress::AutoCommitChanged { enabled } => {
                     format!("AutoCommitChanged({enabled})")
+                }
+                QueryProgress::TransactionModeChanged { mode } => {
+                    format!("TransactionModeChanged({})", mode.label())
                 }
                 QueryProgress::ConnectionChanged { info } => format!(
                     "ConnectionChanged({})",
@@ -32807,6 +33047,7 @@ mod mysql_batch_execution_regression_tests {
                 | QueryProgress::NotifyCancelOldestLazyFetchForSessionPool
                 | QueryProgress::LazyFetchCancelFailed { .. }
                 | QueryProgress::AutoCommitChanged { .. }
+                | QueryProgress::TransactionModeChanged { .. }
                 | QueryProgress::ConnectionChanged { .. }
                 | QueryProgress::DatabaseChanged { .. }
                 | QueryProgress::ScopeChangedNotice { .. }
@@ -32931,6 +33172,8 @@ mod mysql_batch_execution_regression_tests {
             Arc::new(Mutex::new(None));
         let pooled_db_session = crate::db::SharedDbSessionLease::new();
         let tab_auto_commit_override = Arc::new(Mutex::new(None));
+        let tab_transaction_mode_override: Arc<Mutex<Option<crate::db::TransactionMode>>> =
+            Arc::new(Mutex::new(None));
         let active_lazy_fetch: Arc<Mutex<Option<LazyFetchHandle>>> = Arc::new(Mutex::new(None));
         let next_lazy_fetch_session_id = Arc::new(AtomicU64::new(1));
         let cancel_flag = Arc::new(Mutex::new(false));
@@ -32945,6 +33188,7 @@ mod mysql_batch_execution_regression_tests {
             &session,
             &pooled_db_session,
             &tab_auto_commit_override,
+            &tab_transaction_mode_override,
             &active_lazy_fetch,
             &next_lazy_fetch_session_id,
             &current_mysql_cancel_context,
@@ -32955,6 +33199,7 @@ mod mysql_batch_execution_regression_tests {
             None,
             crate::utils::DEFAULT_LAZY_FETCH_BATCH_SIZE as usize,
             true,
+            crate::db::TransactionMode::default(),
             db_activity,
             None,
             None,
@@ -33053,6 +33298,8 @@ mod mysql_batch_execution_regression_tests {
             Arc::new(Mutex::new(None));
         let pooled_db_session = crate::db::SharedDbSessionLease::new();
         let tab_auto_commit_override = Arc::new(Mutex::new(None));
+        let tab_transaction_mode_override: Arc<Mutex<Option<crate::db::TransactionMode>>> =
+            Arc::new(Mutex::new(None));
         let active_lazy_fetch: Arc<Mutex<Option<LazyFetchHandle>>> = Arc::new(Mutex::new(None));
         let next_lazy_fetch_session_id = Arc::new(AtomicU64::new(1));
         let cancel_flag = Arc::new(Mutex::new(false));
@@ -33067,6 +33314,7 @@ mod mysql_batch_execution_regression_tests {
             &session,
             &pooled_db_session,
             &tab_auto_commit_override,
+            &tab_transaction_mode_override,
             &active_lazy_fetch,
             &next_lazy_fetch_session_id,
             &current_mysql_cancel_context,
@@ -33077,6 +33325,7 @@ mod mysql_batch_execution_regression_tests {
             None,
             crate::utils::DEFAULT_LAZY_FETCH_BATCH_SIZE as usize,
             true,
+            crate::db::TransactionMode::default(),
             db_activity,
             None,
             None,
@@ -33330,6 +33579,7 @@ mod mysql_batch_execution_regression_tests {
         expected_isolation: &str,
         expected_read_only: bool,
     ) {
+        let initial_transaction_mode = connection.transaction_mode();
         let shared_connection = Arc::new(Mutex::new(connection));
         let session = Arc::new(Mutex::new(SessionState {
             db_type,
@@ -33341,6 +33591,8 @@ mod mysql_batch_execution_regression_tests {
             Arc::new(Mutex::new(None));
         let pooled_db_session = crate::db::SharedDbSessionLease::new();
         let tab_auto_commit_override = Arc::new(Mutex::new(None));
+        let tab_transaction_mode_override: Arc<Mutex<Option<crate::db::TransactionMode>>> =
+            Arc::new(Mutex::new(None));
         let active_lazy_fetch: Arc<Mutex<Option<LazyFetchHandle>>> = Arc::new(Mutex::new(None));
         let next_lazy_fetch_session_id = Arc::new(AtomicU64::new(1));
         let cancel_flag = Arc::new(Mutex::new(false));
@@ -33356,6 +33608,7 @@ mod mysql_batch_execution_regression_tests {
                 &session,
                 &pooled_db_session,
                 &tab_auto_commit_override,
+                &tab_transaction_mode_override,
                 &active_lazy_fetch,
                 &next_lazy_fetch_session_id,
                 &current_mysql_cancel_context,
@@ -33366,6 +33619,7 @@ mod mysql_batch_execution_regression_tests {
                 None,
                 crate::utils::DEFAULT_LAZY_FETCH_BATCH_SIZE as usize,
                 true,
+                initial_transaction_mode,
                 "mysql transaction mode integration",
                 None,
                 None,
@@ -33443,6 +33697,7 @@ mod mysql_batch_execution_regression_tests {
                 &session,
                 &pooled_db_session,
                 &tab_auto_commit_override,
+                &tab_transaction_mode_override,
                 &active_lazy_fetch,
                 &next_lazy_fetch_session_id,
                 &current_mysql_cancel_context,
@@ -33453,6 +33708,7 @@ mod mysql_batch_execution_regression_tests {
                 None,
                 crate::utils::DEFAULT_LAZY_FETCH_BATCH_SIZE as usize,
                 true,
+                initial_transaction_mode,
                 "mysql lazy transaction mode integration",
                 None,
                 None,
@@ -33963,6 +34219,8 @@ SELECT 'FINAL_STATUS' AS section_name,
             Arc::new(Mutex::new(None));
         let pooled_db_session = crate::db::SharedDbSessionLease::new();
         let tab_auto_commit_override = Arc::new(Mutex::new(None));
+        let tab_transaction_mode_override: Arc<Mutex<Option<crate::db::TransactionMode>>> =
+            Arc::new(Mutex::new(None));
         let active_lazy_fetch: Arc<Mutex<Option<LazyFetchHandle>>> = Arc::new(Mutex::new(None));
         let next_lazy_fetch_session_id = Arc::new(AtomicU64::new(1));
         let cancel_flag = Arc::new(Mutex::new(false));
@@ -33996,6 +34254,7 @@ SELECT 'FINAL_STATUS' AS section_name,
             &session,
             &pooled_db_session,
             &tab_auto_commit_override,
+            &tab_transaction_mode_override,
             &active_lazy_fetch,
             &next_lazy_fetch_session_id,
             &current_mysql_cancel_context,
@@ -34006,6 +34265,7 @@ SELECT 'FINAL_STATUS' AS section_name,
             None,
             lazy_fetch_batch,
             true,
+            crate::db::TransactionMode::default(),
             "mysql lazy fetch integration",
             None,
             None,

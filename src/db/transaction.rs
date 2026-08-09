@@ -413,6 +413,21 @@ impl RetainedSessionState {
         }
     }
 
+    /// A successful session-scoped transaction-mode statement that the editor
+    /// adopted into the tab's transaction-mode setting no longer leaves the
+    /// session in a state the app cannot represent: the tab setting IS the
+    /// session state. Drop the session-scope override residue so it does not
+    /// block the tab's next execution; a pending one-shot next-transaction
+    /// override stays.
+    pub(crate) fn with_session_transaction_mode_override_adopted(self) -> Self {
+        Self {
+            session_residue_state: self
+                .session_residue_state
+                .with_session_transaction_mode_override_adopted(),
+            ..self
+        }
+    }
+
     pub(crate) fn conservative_merge(self, other: Self) -> Self {
         Self {
             transaction_state: self
@@ -630,6 +645,13 @@ impl SessionResidueState {
     fn with_next_transaction_mode_override_consumed(self) -> Self {
         Self {
             may_have_next_transaction_mode_override: false,
+            ..self
+        }
+    }
+
+    fn with_session_transaction_mode_override_adopted(self) -> Self {
+        Self {
+            may_have_transaction_mode_override: false,
             ..self
         }
     }
@@ -1363,6 +1385,16 @@ impl MySqlBatchSessionEffects {
             db_type,
             ..Self::default()
         }
+    }
+
+    /// See [`RetainedSessionState::with_session_transaction_mode_override_adopted`]:
+    /// the batch adopted a successful session-scoped transaction-mode change
+    /// into the tab's setting, so the accumulated session-scope override
+    /// residue must not gate later statements or the batch's final state.
+    pub(crate) fn adopt_session_transaction_mode_override(&mut self) {
+        self.session_residue_state = self
+            .session_residue_state
+            .with_session_transaction_mode_override_adopted();
     }
 
     fn mark_transaction_dirty(&mut self) {
@@ -2844,6 +2876,191 @@ impl TransactionMode {
 
     pub fn label(self) -> String {
         format!("{}, {}", self.isolation.label(), self.access_mode.label())
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct SessionTransactionModeChange {
+    pub isolation: Option<TransactionIsolation>,
+    pub access_mode: Option<TransactionAccessMode>,
+}
+
+impl SessionTransactionModeChange {
+    fn is_empty(self) -> bool {
+        self.isolation.is_none() && self.access_mode.is_none()
+    }
+
+    pub fn applied_to(self, mode: TransactionMode) -> TransactionMode {
+        TransactionMode::new(
+            self.isolation.unwrap_or(mode.isolation),
+            self.access_mode.unwrap_or(mode.access_mode),
+        )
+    }
+}
+
+/// Session-persistent transaction-mode change made by a successful user
+/// statement, so the query tab's transaction-mode setting (and the toolbar
+/// controls) can mirror it. One-shot changes that end with the current or
+/// next transaction (`SET TRANSACTION ...`, unqualified `@@` assignments)
+/// return `None`; so do statements whose target value is not recognized —
+/// those still leave the conservative session-residue tracking in place.
+pub fn session_transaction_mode_change_for_statement(
+    db_type: DatabaseType,
+    sql: &str,
+) -> Option<SessionTransactionModeChange> {
+    match db_type {
+        DatabaseType::Oracle => oracle_session_transaction_mode_change_for_statement(sql),
+        DatabaseType::MySQL | DatabaseType::MariaDB => {
+            mysql_session_transaction_mode_change_for_statement(db_type, sql)
+        }
+    }
+}
+
+fn oracle_session_transaction_mode_change_for_statement(
+    sql: &str,
+) -> Option<SessionTransactionModeChange> {
+    let analysis = SqlStatementAnalysis::new_for_db_type(DatabaseType::Oracle, sql);
+    let words = analysis.words();
+    if oracle_alter_session_set_target_for_words(words) != Some("ISOLATION_LEVEL") {
+        return None;
+    }
+    let isolation = match words.get(4).map(String::as_str) {
+        Some("SERIALIZABLE") if words.len() == 5 => TransactionIsolation::Serializable,
+        Some("READ")
+            if words.get(5).map(String::as_str) == Some("COMMITTED") && words.len() == 6 =>
+        {
+            TransactionIsolation::ReadCommitted
+        }
+        _ => return None,
+    };
+    Some(SessionTransactionModeChange {
+        isolation: Some(isolation),
+        access_mode: None,
+    })
+}
+
+fn mysql_session_transaction_mode_change_for_statement(
+    db_type: DatabaseType,
+    sql: &str,
+) -> Option<SessionTransactionModeChange> {
+    let effective_sql = mysql_effective_statement_sql_for_db_type(db_type, sql);
+    let sql = effective_sql.as_ref();
+    let analysis = SqlStatementAnalysis::new_for_db_type(db_type, sql);
+    if analysis.leading_keyword() != Some("SET") || mysql_set_account_ddl_statement(&analysis) {
+        return None;
+    }
+    if !mysql_set_body_starts_with_user_variable(sql)
+        && mysql_set_session_transaction_statement(&analysis)
+    {
+        return mysql_session_transaction_characteristics_change(&analysis);
+    }
+    mysql_session_transaction_mode_change_from_assignments(sql)
+}
+
+fn mysql_session_transaction_characteristics_change(
+    analysis: &SqlStatementAnalysis<'_>,
+) -> Option<SessionTransactionModeChange> {
+    let words = analysis.words();
+    let mut change = SessionTransactionModeChange::default();
+    let mut idx = 3usize;
+    while idx < words.len() {
+        match words[idx].as_str() {
+            "ISOLATION" if words.get(idx + 1).map(String::as_str) == Some("LEVEL") => {
+                let (isolation, consumed) = match (
+                    words.get(idx + 2).map(String::as_str),
+                    words.get(idx + 3).map(String::as_str),
+                ) {
+                    (Some("SERIALIZABLE"), _) => (TransactionIsolation::Serializable, 1),
+                    (Some("READ"), Some("COMMITTED")) => (TransactionIsolation::ReadCommitted, 2),
+                    (Some("READ"), Some("UNCOMMITTED")) => {
+                        (TransactionIsolation::ReadUncommitted, 2)
+                    }
+                    (Some("REPEATABLE"), Some("READ")) => (TransactionIsolation::RepeatableRead, 2),
+                    _ => return None,
+                };
+                change.isolation = Some(isolation);
+                idx += 2 + consumed;
+            }
+            "READ" if words.get(idx + 1).map(String::as_str) == Some("ONLY") => {
+                change.access_mode = Some(TransactionAccessMode::ReadOnly);
+                idx += 2;
+            }
+            "READ" if words.get(idx + 1).map(String::as_str) == Some("WRITE") => {
+                change.access_mode = Some(TransactionAccessMode::ReadWrite);
+                idx += 2;
+            }
+            _ => return None,
+        }
+    }
+    (!change.is_empty()).then_some(change)
+}
+
+fn mysql_session_transaction_mode_change_from_assignments(
+    sql: &str,
+) -> Option<SessionTransactionModeChange> {
+    let cleaned = mysql_statement_without_comments(sql);
+    let assignments = mysql_set_assignments_body(&cleaned)?;
+    let mut change = SessionTransactionModeChange::default();
+    for assignment in mysql_split_unquoted_assignments(assignments) {
+        if mysql_transaction_mode_assignment_scope(assignment)
+            != Some(MySqlTransactionModeAssignmentScope::Session)
+        {
+            continue;
+        }
+        let (target, value) = mysql_set_assignment_target_and_value(assignment)?;
+        let target = mysql_normalized_set_assignment_target(target);
+        let target = target
+            .strip_prefix("SESSION ")
+            .or_else(|| target.strip_prefix("LOCAL "))
+            .or_else(|| target.strip_prefix("@@SESSION."))
+            .or_else(|| target.strip_prefix("@@LOCAL."))
+            .unwrap_or(&target);
+        match target {
+            "TRANSACTION_ISOLATION" | "TX_ISOLATION" => {
+                change.isolation = Some(TransactionIsolation::from_sql_level(
+                    mysql_set_assignment_literal_value(value)?,
+                )?);
+            }
+            "TRANSACTION_READ_ONLY" | "TX_READ_ONLY" => {
+                change.access_mode = Some(
+                    if mysql_set_assignment_boolean_value(mysql_set_assignment_literal_value(
+                        value,
+                    )?)? {
+                        TransactionAccessMode::ReadOnly
+                    } else {
+                        TransactionAccessMode::ReadWrite
+                    },
+                );
+            }
+            _ => return None,
+        }
+    }
+    (!change.is_empty()).then_some(change)
+}
+
+fn mysql_set_assignment_literal_value(value: &str) -> Option<&str> {
+    let trimmed = value.trim();
+    let bytes = trimmed.as_bytes();
+    if let Some(quote @ (b'\'' | b'"' | b'`')) = bytes.first().copied() {
+        if trimmed.len() < 2 || bytes[trimmed.len() - 1] != quote {
+            return None;
+        }
+        let inner = &trimmed[1..trimmed.len() - 1];
+        // Escaped or doubled quotes inside the literal make this more than a
+        // simple value; refuse rather than mis-parse.
+        if inner.contains(char::from(quote)) || inner.contains('\\') {
+            return None;
+        }
+        return Some(inner);
+    }
+    (!trimmed.is_empty()).then_some(trimmed)
+}
+
+fn mysql_set_assignment_boolean_value(value: &str) -> Option<bool> {
+    match value.trim().to_ascii_uppercase().as_str() {
+        "ON" | "1" | "TRUE" => Some(true),
+        "OFF" | "0" | "FALSE" => Some(false),
+        _ => None,
     }
 }
 
@@ -10008,5 +10225,159 @@ mod tests {
         assert!(after_late_cancel.may_have_untracked_session_state());
         assert!(after_late_cancel.may_hold_named_lock());
         assert!(!after_late_cancel.may_hold_table_lock());
+    }
+
+    #[test]
+    fn session_transaction_mode_change_parses_session_scoped_statements() {
+        let change = |db_type: DatabaseType, sql: &str| {
+            session_transaction_mode_change_for_statement(db_type, sql)
+        };
+        let mysql = DatabaseType::MySQL;
+        let mariadb = DatabaseType::MariaDB;
+        let oracle = DatabaseType::Oracle;
+
+        // MySQL/MariaDB SET SESSION TRANSACTION characteristics.
+        for db_type in [mysql, mariadb] {
+            assert_eq!(
+                change(
+                    db_type,
+                    "SET SESSION TRANSACTION ISOLATION LEVEL SERIALIZABLE"
+                ),
+                Some(SessionTransactionModeChange {
+                    isolation: Some(TransactionIsolation::Serializable),
+                    access_mode: None,
+                })
+            );
+            assert_eq!(
+                change(db_type, "set session transaction read only"),
+                Some(SessionTransactionModeChange {
+                    isolation: None,
+                    access_mode: Some(TransactionAccessMode::ReadOnly),
+                })
+            );
+            assert_eq!(
+                change(
+                    db_type,
+                    "SET SESSION TRANSACTION ISOLATION LEVEL READ COMMITTED, READ WRITE"
+                ),
+                Some(SessionTransactionModeChange {
+                    isolation: Some(TransactionIsolation::ReadCommitted),
+                    access_mode: Some(TransactionAccessMode::ReadWrite),
+                })
+            );
+        }
+
+        // Variable-assignment forms with explicit or implicit session scope.
+        assert_eq!(
+            change(
+                mysql,
+                "SET @@session.transaction_isolation = 'READ-COMMITTED'"
+            ),
+            Some(SessionTransactionModeChange {
+                isolation: Some(TransactionIsolation::ReadCommitted),
+                access_mode: None,
+            })
+        );
+        assert_eq!(
+            change(mysql, "SET transaction_read_only = ON"),
+            Some(SessionTransactionModeChange {
+                isolation: None,
+                access_mode: Some(TransactionAccessMode::ReadOnly),
+            })
+        );
+        assert_eq!(
+            change(mariadb, "SET SESSION tx_isolation = 'REPEATABLE-READ'"),
+            Some(SessionTransactionModeChange {
+                isolation: Some(TransactionIsolation::RepeatableRead),
+                access_mode: None,
+            })
+        );
+        assert_eq!(
+            change(
+                mysql,
+                "SET @qt_note = 'kept', SESSION transaction_read_only = 0"
+            ),
+            Some(SessionTransactionModeChange {
+                isolation: None,
+                access_mode: Some(TransactionAccessMode::ReadWrite),
+            })
+        );
+
+        // Oracle session-level isolation.
+        assert_eq!(
+            change(oracle, "ALTER SESSION SET ISOLATION_LEVEL = SERIALIZABLE"),
+            Some(SessionTransactionModeChange {
+                isolation: Some(TransactionIsolation::Serializable),
+                access_mode: None,
+            })
+        );
+        assert_eq!(
+            change(oracle, "alter session set isolation_level = read committed"),
+            Some(SessionTransactionModeChange {
+                isolation: Some(TransactionIsolation::ReadCommitted),
+                access_mode: None,
+            })
+        );
+    }
+
+    #[test]
+    fn session_transaction_mode_change_ignores_one_shot_global_and_unknown_forms() {
+        let mysql = DatabaseType::MySQL;
+        let oracle = DatabaseType::Oracle;
+        for sql in [
+            // Next-transaction-only forms must not repin the tab setting.
+            "SET TRANSACTION ISOLATION LEVEL SERIALIZABLE",
+            "SET TRANSACTION READ ONLY",
+            "SET @@transaction_isolation = 'SERIALIZABLE'",
+            // Global/persist scopes do not touch this session.
+            "SET GLOBAL TRANSACTION ISOLATION LEVEL SERIALIZABLE",
+            "SET @@GLOBAL.transaction_read_only = ON",
+            "SET PERSIST transaction_isolation = 'SERIALIZABLE'",
+            // Unrelated SETs.
+            "SET autocommit = 1",
+            "SET @x := 1",
+            "SET sql_mode = 'ANSI'",
+            // Unrecognized values must not be adopted (residue tracking still
+            // covers them).
+            "SET SESSION transaction_isolation = @level",
+            "SET SESSION transaction_read_only = DEFAULT",
+        ] {
+            assert_eq!(
+                session_transaction_mode_change_for_statement(mysql, sql),
+                None,
+                "{sql} must not repin the tab transaction mode"
+            );
+        }
+        for sql in [
+            "SET TRANSACTION READ ONLY",
+            "SET TRANSACTION ISOLATION LEVEL SERIALIZABLE",
+            "ALTER SESSION SET CURRENT_SCHEMA = HR",
+            "ALTER SESSION SET ISOLATION_LEVEL = SERIALIZABLE NLS_DATE_FORMAT = 'YYYY'",
+        ] {
+            assert_eq!(
+                session_transaction_mode_change_for_statement(oracle, sql),
+                None,
+                "{sql} must not repin the tab transaction mode"
+            );
+        }
+    }
+
+    #[test]
+    fn session_transaction_mode_change_applies_partially_to_current_mode() {
+        let current = TransactionMode::new(
+            TransactionIsolation::Serializable,
+            TransactionAccessMode::ReadOnly,
+        );
+        let change = SessionTransactionModeChange {
+            isolation: Some(TransactionIsolation::ReadCommitted),
+            access_mode: None,
+        };
+        assert_eq!(
+            change.applied_to(current),
+            TransactionMode::new(
+                TransactionIsolation::ReadCommitted,
+                TransactionAccessMode::ReadOnly,
+            )
+        );
     }
 }

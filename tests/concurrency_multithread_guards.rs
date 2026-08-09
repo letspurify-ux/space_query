@@ -1550,13 +1550,18 @@ fn regression_04_global_transaction_options_validate_and_update_retained_session
     let mode_branch = &content[mode_start..mode_end];
     let mode_validate = mode_branch
         .find("retained_plan.validate_transaction_option_change(\"transaction mode\")")
-        .expect("transaction mode change should validate retained sessions");
+        .expect("transaction mode change should validate the tab's retained session");
+    // Tab-scoped: the controls pin the active tab, never the shared connection.
     let mode_set = mode_branch
-        .find("connection.set_transaction_mode(mode)")
-        .expect("transaction mode change should call the connection setter");
+        .find("editor.set_tab_transaction_mode(mode)")
+        .expect("transaction mode change should pin the active tab's value");
     assert!(
         mode_validate < mode_set && mode_branch.contains("retained_plan.apply_transaction_mode"),
-        "transaction mode changes must validate retained sessions before the global setter and then propagate to clean retained sessions"
+        "transaction mode changes must validate the tab's retained session before pinning the tab value and then propagate to its retained session"
+    );
+    assert!(
+        !mode_branch.contains("connection.set_transaction_mode("),
+        "the toolbar controls must not mutate the shared connection's transaction mode"
     );
 
     let auto_start = content
@@ -1660,13 +1665,11 @@ fn regression_07_oracle_transaction_mode_change_does_not_silently_clear_preserve
         "Oracle transaction mode changes must block preserved retained sessions before clear()"
     );
     assert!(
-        main_window.contains("fn retained_session_transaction_option_decision(")
-            && main_window.contains("action == \"transaction mode\"")
+        main_window.contains("fn transaction_mode_change_blocked_for_active_tab(")
             && main_window
                 .contains("retained_session_state_transaction_mode_change_preflight_decision(")
-            && main_window.contains("snapshot.db_type")
             && main_window.contains("snapshot.retained_state()"),
-        "main-window option preflight must route transaction mode changes through the DB-specific retained-session policy"
+        "main-window transaction-mode control gating must route through the DB-specific retained-session policy"
     );
 }
 
@@ -2843,6 +2846,100 @@ fn auto_commit_state_has_a_single_source_of_truth() {
     assert!(
         between.contains("emit_execution_startup_error("),
         "an auto-commit display mismatch must refuse the execution, not just log"
+    );
+}
+
+#[test]
+fn transaction_mode_state_has_a_single_source_of_truth() {
+    // Screen = in-memory = applied session state, per query tab. The toolbar
+    // choices, the tab override, and every backend's execution path must
+    // resolve the effective transaction mode through the same function chain,
+    // and a successful session-scoped statement must mirror its change into
+    // the tab override and the UI.
+    let execution = fs::read_to_string(
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("src/ui/sql_editor/execution.rs"),
+    )
+    .expect("read execution.rs");
+    let main_window =
+        fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("src/ui/main_window.rs"))
+            .expect("read main_window.rs");
+    let normalize = |text: &str| text.split_whitespace().collect::<String>();
+
+    // (1) The toolbar controls resolve through the shared resolver.
+    let control_state_start = main_window
+        .find("fn transaction_control_state(")
+        .expect("transaction_control_state should exist");
+    let control_state_body = &main_window[control_state_start..control_state_start + 1200];
+    assert!(
+        control_state_body.contains("SqlEditorWidget::effective_transaction_mode")
+            && control_state_body.contains("tab_transaction_mode_override_value()"),
+        "the toolbar controls must resolve through SqlEditorWidget::effective_transaction_mode with the active tab's override"
+    );
+
+    // (2) The toolbar sync records the displayed mode for the cross-check.
+    let sync_start = main_window
+        .find("fn sync_transaction_mode_controls(")
+        .expect("sync_transaction_mode_controls should exist");
+    let sync_body = &main_window[sync_start..sync_start + 2400];
+    assert!(
+        sync_body.contains("record_displayed_transaction_mode("),
+        "the toolbar sync must record the transaction mode it displayed"
+    );
+    // (2b) The controls are disabled whenever the active tab's session cannot
+    // accept a transaction-mode change right now.
+    assert!(
+        sync_body.contains("transaction_mode_change_blocked_for_active_tab("),
+        "the toolbar sync must disable the controls when the tab session blocks mode changes"
+    );
+
+    // (3) The worker startup resolves the mode only through the resolver
+    // (connection default + tab override in one place).
+    assert!(
+        normalize(&execution).contains(&normalize(
+            "let selected_transaction_mode = SqlEditorWidget::transaction_mode_for_execution( conn_guard.transaction_mode(), &tab_transaction_mode_override, );"
+        )),
+        "execution startup must resolve the effective transaction mode via transaction_mode_for_execution"
+    );
+
+    // (4) Execution startup cross-checks the resolved mode against what the
+    // toolbar displayed and refuses to run on a mismatch, before the backend
+    // dispatch so one checkpoint covers thin, OCI, MySQL, and MariaDB alike.
+    let resolve_at = execution
+        .find("let selected_transaction_mode = SqlEditorWidget::transaction_mode_for_execution(")
+        .expect("worker startup resolution should exist");
+    let dispatch_at = execution[resolve_at..]
+        .find("begin_execution_worker(")
+        .map(|offset| resolve_at + offset)
+        .expect("backend dispatch should follow the resolution");
+    let between = &execution[resolve_at..dispatch_at];
+    assert!(
+        between.contains("transaction_mode_display_mismatch_error("),
+        "execution startup must verify the displayed transaction mode before dispatching to any backend"
+    );
+    assert!(
+        between.contains("emit_execution_startup_error("),
+        "a transaction-mode display mismatch must refuse the execution, not just log"
+    );
+
+    // (5) A successful session-scoped statement mirrors its change into the
+    // batch mode, the tab override, and the UI, in one shared helper used by
+    // the MySQL/MariaDB, Oracle OCI, and Oracle thin batch loops.
+    let adopt_start = execution
+        .find("fn adopt_session_transaction_mode_change_after_statement(")
+        .expect("session transaction-mode adoption helper should exist");
+    let adopt_body = &execution[adopt_start..adopt_start + 1600];
+    assert!(
+        adopt_body.contains("session_transaction_mode_change_for_statement(")
+            && adopt_body.contains("store_mutex_transaction_mode_option(")
+            && adopt_body.contains("QueryProgress::TransactionModeChanged"),
+        "the adoption helper must parse the statement, pin the tab override, and notify the UI"
+    );
+    let adoption_calls = execution
+        .matches("adopt_session_transaction_mode_change_after_statement(")
+        .count();
+    assert!(
+        adoption_calls >= 4,
+        "the MySQL, Oracle OCI, and Oracle thin batch loops must all adopt session transaction-mode changes (definition + at least 3 call sites, found {adoption_calls})"
     );
 }
 
