@@ -299,6 +299,224 @@ fn a_guess_never_overrides_the_answer_the_user_already_gave() {
     assert_eq!(collected[0].value, "10");
 }
 
+fn call_anchor(
+    sql: &str,
+    db_type: DatabaseType,
+) -> Vec<(String, Option<String>, String, CallParameter)> {
+    bind_call_anchors(sql, db_type)
+        .into_iter()
+        .map(|(key, anchor)| (key, anchor.qualifier, anchor.routine, anchor.parameter))
+        .collect()
+}
+
+#[test]
+fn a_named_argument_names_the_parameter_the_placeholder_fills() {
+    assert_eq!(
+        call_anchor(
+            "BEGIN SYSTEM.GET_HELP(P_CURSOR => :v_p_cursor); END;",
+            ORACLE
+        ),
+        vec![(
+            "V_P_CURSOR".to_string(),
+            Some("SYSTEM".to_string()),
+            "GET_HELP".to_string(),
+            CallParameter::Named("P_CURSOR".to_string()),
+        )]
+    );
+}
+
+#[test]
+fn a_plain_argument_list_gives_the_parameter_by_position() {
+    assert_eq!(
+        call_anchor("BEGIN pkg.load(:a, 1, :b); END;", ORACLE),
+        vec![
+            (
+                "A".to_string(),
+                Some("pkg".to_string()),
+                "load".to_string(),
+                CallParameter::Position(1),
+            ),
+            (
+                "B".to_string(),
+                Some("pkg".to_string()),
+                "load".to_string(),
+                CallParameter::Position(3),
+            ),
+        ]
+    );
+    assert_eq!(
+        call_anchor("CALL load_batch(?, ?)", MYSQL),
+        vec![
+            (
+                "?1".to_string(),
+                None,
+                "load_batch".to_string(),
+                CallParameter::Position(1),
+            ),
+            (
+                "?2".to_string(),
+                None,
+                "load_batch".to_string(),
+                CallParameter::Position(2),
+            ),
+        ]
+    );
+}
+
+#[test]
+fn no_routine_is_claimed_where_the_statement_calls_none() {
+    // A built-in has no entry in any argument view, and its arguments are
+    // ordinary values the user types.
+    assert!(call_anchor("SELECT TO_DATE(:d, 'YYYY-MM-DD') FROM dual", ORACLE).is_empty());
+    // A value list and an `IN` list are not calls.
+    assert!(call_anchor("INSERT INTO t (a, b) VALUES (:a, :b)", ORACLE).is_empty());
+    assert!(call_anchor("SELECT * FROM t WHERE id IN (:a, :b)", ORACLE).is_empty());
+    assert!(call_anchor("SELECT * FROM emp WHERE id = :id", ORACLE).is_empty());
+    // A commented-out call is not the one in force.
+    assert!(call_anchor("-- pkg.load(:a)\nSELECT :a FROM dual", ORACLE).is_empty());
+}
+
+fn procedure_argument(
+    name: Option<&str>,
+    position: i32,
+    data_type: &str,
+    overload: Option<i32>,
+) -> crate::db::ProcedureArgument {
+    crate::db::ProcedureArgument {
+        name: name.map(str::to_string),
+        position,
+        sequence: position,
+        data_type: Some(data_type.to_string()),
+        in_out: Some("IN".to_string()),
+        data_length: None,
+        data_precision: None,
+        data_scale: None,
+        type_owner: None,
+        type_name: None,
+        pls_type: None,
+        overload,
+        default_value: None,
+    }
+}
+
+#[test]
+fn a_parameter_list_answers_by_name_and_by_position() {
+    let arguments = [
+        procedure_argument(None, 0, "VARCHAR2", None),
+        procedure_argument(Some("P_ID"), 1, "NUMBER", None),
+        procedure_argument(Some("P_CURSOR"), 2, "REF CURSOR", None),
+    ];
+    assert_eq!(
+        param_type_for_call_parameter(&arguments, &CallParameter::Named("p_cursor".to_string())),
+        Some(BindParamType::RefCursor)
+    );
+    assert_eq!(
+        param_type_for_call_parameter(&arguments, &CallParameter::Position(1)),
+        Some(BindParamType::Number)
+    );
+    // A function's return value is not a parameter the call passes, so
+    // position 1 is the first real one either way.
+    assert_eq!(
+        param_type_for_call_parameter(&arguments, &CallParameter::Position(2)),
+        Some(BindParamType::RefCursor)
+    );
+    // Nothing is claimed for a parameter the routine does not have.
+    assert_eq!(
+        param_type_for_call_parameter(&arguments, &CallParameter::Named("P_NAME".to_string())),
+        None
+    );
+    assert_eq!(
+        param_type_for_call_parameter(&arguments, &CallParameter::Position(3)),
+        None
+    );
+}
+
+#[test]
+fn overloads_that_disagree_leave_the_type_unset() {
+    let arguments = [
+        procedure_argument(Some("P_KEY"), 1, "NUMBER", Some(1)),
+        procedure_argument(Some("P_KEY"), 1, "VARCHAR2", Some(2)),
+    ];
+    assert_eq!(
+        param_type_for_call_parameter(&arguments, &CallParameter::Position(1)),
+        None
+    );
+    // Overloads that agree still answer.
+    let arguments = [
+        procedure_argument(Some("P_KEY"), 1, "NUMBER", Some(1)),
+        procedure_argument(Some("P_KEY"), 1, "INTEGER", Some(2)),
+    ];
+    assert_eq!(
+        param_type_for_call_parameter(&arguments, &CallParameter::Named("P_KEY".to_string())),
+        Some(BindParamType::Number)
+    );
+}
+
+#[test]
+fn a_remembered_answer_never_makes_a_cursor_a_value_or_the_reverse() {
+    // A `Ref Cursor` carries no value, so a remembered `String` is not a
+    // preference to honour here — it is an answer to a different question.
+    let mut remembered = HashMap::new();
+    remembered.insert(
+        "RC".to_string(),
+        RememberedValue {
+            param_type: BindParamType::String,
+            value: "x".to_string(),
+            is_null: false,
+        },
+    );
+    let catalog = HashMap::from([("RC".to_string(), BindParamType::RefCursor)]);
+    let collected = collect_bind_params(
+        "BEGIN pkg.report(:rc); END;",
+        ORACLE,
+        &session(ORACLE),
+        &remembered,
+        &catalog,
+    );
+    assert_eq!(collected[0].param_type, BindParamType::RefCursor);
+
+    // And the other way round: a value parameter answered as a cursor once.
+    let mut remembered = HashMap::new();
+    remembered.insert(
+        "ID".to_string(),
+        RememberedValue {
+            param_type: BindParamType::RefCursor,
+            value: String::new(),
+            is_null: false,
+        },
+    );
+    let catalog = HashMap::from([("ID".to_string(), BindParamType::Number)]);
+    let collected = collect_bind_params(
+        "SELECT * FROM emp WHERE id = :id",
+        ORACLE,
+        &session(ORACLE),
+        &remembered,
+        &catalog,
+    );
+    assert_eq!(collected[0].param_type, BindParamType::Number);
+
+    // A disagreement that is only about how a value is typed still leaves the
+    // user's own answer in place.
+    let mut remembered = HashMap::new();
+    remembered.insert(
+        "ID".to_string(),
+        RememberedValue {
+            param_type: BindParamType::String,
+            value: "7".to_string(),
+            is_null: false,
+        },
+    );
+    let catalog = HashMap::from([("ID".to_string(), BindParamType::Number)]);
+    let collected = collect_bind_params(
+        "SELECT * FROM emp WHERE id = :id",
+        ORACLE,
+        &session(ORACLE),
+        &remembered,
+        &catalog,
+    );
+    assert_eq!(collected[0].param_type, BindParamType::String);
+}
+
 #[test]
 fn a_word_that_only_looks_like_a_clause_does_not_force_a_number() {
     // `limit` as a column name, and the same word inside a literal, must not

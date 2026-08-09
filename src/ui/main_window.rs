@@ -12065,7 +12065,7 @@ impl MainWindow {
                     .convert_selection_case(false);
                 true
             }
-            "Edit/Intellisense" => {
+            "Edit/Code Completion" => {
                 state
                     .lock()
                     .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -12846,7 +12846,7 @@ impl MainWindow {
                 && (k == fltk::enums::Key::from_char(' ')
                     || k == fltk::enums::Key::from_char('\u{0020}')) =>
             {
-                Some("Edit/Intellisense")
+                Some("Edit/Code Completion")
             }
             k if ctrl_or_cmd
                 && (k == fltk::enums::Key::from_char('t')
@@ -14346,9 +14346,10 @@ impl MainWindow {
             .register_saved("capture-local-oracle", create_shared_connection())
             .runtime;
         oracle_runtime.update_sanitized_info({
-            // Tagged, so a capture shows what a connection colour looks like
-            // once it is applied rather than only in the connection dialog.
-            let mut info = crate::db::ConnectionInfo::new_with_type(
+            // Untagged, because that is what a connection looks like unless the
+            // reader asks for a colour. Only the connection-colour scene tags
+            // these two, through `capture_tour_set_connection_color`.
+            crate::db::ConnectionInfo::new_with_type(
                 "Local Oracle",
                 "",
                 "",
@@ -14356,9 +14357,7 @@ impl MainWindow {
                 1521,
                 "",
                 DatabaseType::Oracle,
-            );
-            info.color = crate::db::ConnectionColor::Red;
-            info
+            )
         });
         oracle_runtime.set_state(ConnectionRuntimeState::Connected);
         let maria_runtime = state
@@ -14366,7 +14365,7 @@ impl MainWindow {
             .register_saved("capture-analytics-maria", create_shared_connection())
             .runtime;
         maria_runtime.update_sanitized_info({
-            let mut info = crate::db::ConnectionInfo::new_with_type(
+            crate::db::ConnectionInfo::new_with_type(
                 "Analytics MariaDB",
                 "",
                 "",
@@ -14374,9 +14373,7 @@ impl MainWindow {
                 3306,
                 "",
                 DatabaseType::MariaDB,
-            );
-            info.color = crate::db::ConnectionColor::Green;
-            info
+            )
         });
         maria_runtime.set_state(ConnectionRuntimeState::Connected);
         state.object_browser.add_runtime(oracle_runtime.clone());
@@ -14486,6 +14483,33 @@ impl MainWindow {
         });
         state.refresh_result_edit_controls();
         state.window.redraw();
+    }
+
+    /// Tag a registered example connection, for the scene about connection
+    /// colours.
+    ///
+    /// The rest of the tour runs untagged, so a tag has to be applied here and
+    /// before the scene's results are produced: a result keeps the colour its
+    /// connection carried when it ran.
+    #[doc(hidden)]
+    pub fn capture_tour_set_connection_color(
+        &mut self,
+        saved_profile: &str,
+        color: crate::db::ConnectionColor,
+    ) -> bool {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let Some(runtime) = state.connection_registry.saved_runtime(saved_profile) else {
+            return false;
+        };
+        let mut info = runtime.sanitized_info();
+        info.color = color;
+        runtime.update_sanitized_info(info);
+        state.refresh_tab_labels_for_connection(runtime.id());
+        state.window.redraw();
+        true
     }
 
     /// Bind the active editor tab to another registered connection.

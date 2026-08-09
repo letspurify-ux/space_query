@@ -27,8 +27,8 @@
 use std::collections::{HashMap, HashSet};
 
 use crate::db::{
-    BindDataType, BindVar, DatabaseType, QueryExecutor, ScriptItem, SessionState, SqlValueKind,
-    ToolCommand,
+    BindDataType, BindVar, DatabaseType, ProcedureArgument, QueryExecutor, ScriptItem,
+    SessionState, SqlValueKind, ToolCommand,
 };
 use crate::sql_parser_engine::{lexical_spans, LexicalKind};
 use crate::sql_text::{is_identifier_char, is_identifier_start_byte};
@@ -283,15 +283,34 @@ fn new_param(
         label,
         memo_key,
         bind_name,
-        // A previous answer is the user's own decision and outranks the guess.
-        param_type: previous
-            .map(|value| value.param_type)
-            .or(suggested)
-            .unwrap_or_default(),
+        param_type: chosen_param_type(previous.map(|value| value.param_type), suggested),
         value: previous
             .map(|value| value.value.clone())
             .unwrap_or_default(),
         is_null: previous.is_some_and(|value| value.is_null),
+    }
+}
+
+/// Which type the dialog opens on when a remembered answer and the statement
+/// itself both have something to say.
+///
+/// A previous answer is the user's own decision and outranks the guess — but
+/// not about whether the parameter is a cursor at all, which is not a
+/// preference. A `Ref Cursor` carries no value, and no value bind can stand in
+/// for one, so either way round the disagreement the statement wins.
+fn chosen_param_type(
+    remembered: Option<BindParamType>,
+    suggested: Option<BindParamType>,
+) -> BindParamType {
+    match (remembered, suggested) {
+        (Some(remembered), Some(suggested))
+            if (remembered == BindParamType::RefCursor)
+                != (suggested == BindParamType::RefCursor) =>
+        {
+            suggested
+        }
+        (Some(remembered), _) => remembered,
+        (None, suggested) => suggested.unwrap_or_default(),
     }
 }
 
@@ -616,6 +635,134 @@ pub fn bind_anchors(sql: &str, db_type: DatabaseType) -> Vec<(String, BindAnchor
         anchors.push((key, anchor));
     }
     anchors
+}
+
+/// The routine parameter a placeholder is passed as, when the statement calls
+/// a routine.
+///
+/// This is the other half of [`BindAnchor`]: a placeholder inside
+/// `pkg.proc(:x)` is not compared with a column, but the routine's parameter
+/// list says exactly what it must be — and for an OUT `REF CURSOR` there is no
+/// other way to find out, because nothing in the text says so.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BindCallAnchor {
+    /// Package or schema[.package] written before the routine name, if any.
+    pub qualifier: Option<String>,
+    pub routine: String,
+    pub parameter: CallParameter,
+}
+
+/// Which parameter of the call a placeholder fills.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum CallParameter {
+    /// `p_cursor => :rc` names it outright.
+    Named(String),
+    /// A plain argument list gives it by 1-based position.
+    Position(usize),
+}
+
+/// The routine parameter each placeholder is passed as, keyed the way the
+/// dialog remembers answers.
+///
+/// Built-in functions are left out: no argument view describes them, and their
+/// arguments are ordinary values the user types anyway.
+pub fn bind_call_anchors(sql: &str, db_type: DatabaseType) -> Vec<(String, BindCallAnchor)> {
+    let mysql = db_type.is_mysql_or_mariadb();
+    let masked = mask_literals_and_comments(sql, mysql);
+    let mut anchors = Vec::new();
+    for placeholder in scan_all_placeholders(sql, db_type) {
+        let Some(anchor) = call_anchor_at(sql, &masked, placeholder.start, db_type) else {
+            continue;
+        };
+        let key = match &placeholder.key {
+            PlaceholderKey::Named(name) => name.clone(),
+            PlaceholderKey::Positional(ordinal) => format!("?{ordinal}"),
+        };
+        anchors.push((key, anchor));
+    }
+    anchors
+}
+
+fn call_anchor_at(
+    sql: &str,
+    masked: &str,
+    start: usize,
+    db_type: DatabaseType,
+) -> Option<BindCallAnchor> {
+    let mysql = db_type.is_mysql_or_mariadb();
+    let call = crate::ui::intellisense::enclosing_call_at_cursor_with_lexical_mode(
+        sql,
+        start,
+        mysql,
+        crate::sql_parser_engine::LexMode::Idle,
+    )?;
+    if call.qualifier.is_none()
+        && !call.name_quoted
+        && crate::ui::intellisense::is_builtin_function(&call.name)
+    {
+        return None;
+    }
+    let parameter = match named_association_before(masked, start) {
+        Some(name) => CallParameter::Named(name),
+        // `arg_index` counts the commas before the placeholder, which is the
+        // position only while the call is still positional — which it is, or
+        // the branch above would have taken it.
+        None => CallParameter::Position(call.arg_index + 1),
+    };
+    let (routine, qualifier) = if db_type.preserves_quoted_routine_lookup_spelling() {
+        (call.lookup_name, call.lookup_qualifier)
+    } else {
+        (call.name, call.qualifier)
+    };
+    Some(BindCallAnchor {
+        qualifier,
+        routine,
+        parameter,
+    })
+}
+
+/// The parameter name in `p_cursor => :rc`, when the argument was written with
+/// named association.
+fn named_association_before(masked: &str, start: usize) -> Option<String> {
+    let before = masked.get(..start)?.trim_end();
+    let head = before.strip_suffix("=>")?.trim_end();
+    trailing_identifier(head).map(|part| part.name)
+}
+
+/// The prompt type a routine's parameter list gives `parameter`.
+///
+/// `None` when the list has no such parameter, or when overloads disagree about
+/// its type: a guess that is wrong half the time is worse than the unset
+/// default the dialog opened with before.
+pub fn param_type_for_call_parameter(
+    arguments: &[ProcedureArgument],
+    parameter: &CallParameter,
+) -> Option<BindParamType> {
+    let mut found: Option<BindParamType> = None;
+    for argument in arguments {
+        // Position 0 with no name is a function's return value, not something
+        // the call passes.
+        if argument.position == 0 && argument.name.is_none() {
+            continue;
+        }
+        let matches = match parameter {
+            CallParameter::Named(name) => argument
+                .name
+                .as_deref()
+                .is_some_and(|argument_name| argument_name.eq_ignore_ascii_case(name)),
+            CallParameter::Position(position) => i64::from(argument.position) == *position as i64,
+        };
+        if !matches {
+            continue;
+        }
+        let param_type =
+            param_type_for_data_type(argument.data_type.as_deref().unwrap_or_default());
+        match found {
+            Some(existing) if existing != param_type => return None,
+            _ => found = Some(param_type),
+        }
+    }
+    found
 }
 
 fn anchor_at(masked: &str, start: usize) -> Option<BindAnchor> {

@@ -341,8 +341,19 @@ impl SqlEditorWidget {
         qualifier: Option<&str>,
         display_name: &str,
     ) -> Result<Option<SignatureLabel>, String> {
-        let args = signature_backend_for(db_type).resolve(session, name, qualifier)?;
+        let args = Self::resolve_routine_arguments(db_type, session, name, qualifier)?;
         Ok(args.map(|args| Self::build_signature_label(display_name, &args)))
+    }
+
+    /// The routine's parameter list itself, for the caller that needs the types
+    /// rather than a label to draw — the bind parameter prompt.
+    pub(crate) fn resolve_routine_arguments(
+        db_type: crate::db::DatabaseType,
+        session: crate::db::DbPoolSession,
+        name: &str,
+        qualifier: Option<&str>,
+    ) -> Result<Option<Vec<ProcedureArgument>>, String> {
+        signature_backend_for(db_type).resolve(session, name, qualifier)
     }
 
     pub(crate) fn hide_signature_popup(&self) {

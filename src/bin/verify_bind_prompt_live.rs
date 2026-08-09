@@ -1342,6 +1342,68 @@ fn verify(target: Target) -> Result<(), String> {
     }
     println!("PASS: a row count opens the prompt on Number without a column to consult");
 
+    // (24) A placeholder passed to a routine takes that parameter's own type.
+    //      This is the only way an OUT ref cursor can be recognized: nothing in
+    //      `p(:rc)` says the parameter is a cursor, and a String answer fails
+    //      the call.
+    let call_cases: Vec<(String, Vec<BindParamType>)> = if target.is_oracle() {
+        let owner = target.connection_info().username.to_uppercase();
+        vec![
+            (
+                format!("BEGIN {PROC}(:chk_call_dept, :chk_call_count, :chk_call_rows); END;"),
+                vec![
+                    BindParamType::Number,
+                    BindParamType::Number,
+                    BindParamType::RefCursor,
+                ],
+            ),
+            (
+                format!(
+                    "BEGIN {PROC}(p_rows => :chk_named_rows, p_dept => :chk_named_dept, \
+                     p_count => :chk_named_count); END;"
+                ),
+                vec![
+                    BindParamType::RefCursor,
+                    BindParamType::Number,
+                    BindParamType::Number,
+                ],
+            ),
+            (
+                format!("BEGIN {owner}.{PROC2}(:chk_owner_dept, :chk_owner_count); END;"),
+                vec![BindParamType::Number, BindParamType::Number],
+            ),
+            (
+                format!("SELECT {FUNC}(:chk_fn_dept) FROM DUAL"),
+                vec![BindParamType::Number],
+            ),
+        ]
+    } else {
+        vec![
+            (
+                format!("CALL {PROC2}(:chk_call_dept, @chk_call_out)"),
+                vec![BindParamType::Number],
+            ),
+            (
+                format!("SELECT {FUNC}(:chk_fn_dept)"),
+                vec![BindParamType::Number],
+            ),
+        ]
+    };
+    for (sql, expected) in call_cases {
+        let outcome = h.cancel(&sql)?;
+        let expected: Vec<String> = expected
+            .iter()
+            .map(|param_type| param_type.label().to_string())
+            .collect();
+        if outcome.preselected != expected {
+            return Err(format!(
+                "{sql} opened the prompt on {:?}, expected {expected:?}",
+                outcome.preselected
+            ));
+        }
+        println!("PASS: {sql} opens the prompt on {expected:?}");
+    }
+
     let _ = h.run(&target.types_teardown_sql());
     for sql in target.teardown_sql() {
         let _ = h.run(&sql);

@@ -223,11 +223,12 @@ const PROGRESS_ROWS_MAX_BATCH: usize = 10_000;
 const ORACLE_THIN_LAZY_CLEANUP_FALLBACK_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_SCRIPT_INCLUDE_DEPTH: usize = 64;
 const SESSION_POOL_CANCEL_WAIT_TIMEOUT: Duration = Duration::from_secs(2);
-/// How long the bind prompt waits for the column metadata that names its
-/// parameter types. The user is watching an unopened dialog, so this is short:
-/// past it every unresolved parameter simply opens as `String`, which is where
-/// it opened before the catalog was consulted at all.
-const BIND_PROMPT_COLUMN_LOAD_TIMEOUT: Duration = Duration::from_secs(3);
+/// How long the bind prompt waits for the metadata that names its parameter
+/// types — the columns they are compared with, the routines they are passed to.
+/// The user is watching an unopened dialog, so this is short: past it every
+/// unresolved parameter simply opens as `String`, which is where it opened
+/// before the catalog was consulted at all.
+const BIND_PROMPT_METADATA_TIMEOUT: Duration = Duration::from_secs(3);
 const SESSION_POOL_CANCEL_RESPONSE_TIMEOUT: Duration = Duration::from_millis(750);
 const SESSION_POOL_CANCEL_RETRY_INTERVAL: Duration = Duration::from_millis(100);
 const LAZY_FETCH_CANCEL_RETRY_DELAY_SECONDS: f64 = 0.2;
@@ -8761,7 +8762,9 @@ impl SqlEditorWidget {
     /// The two families part ways in [`crate::ui::bind_prompt::prepare`], not
     /// here — Oracle gets session binds and its original text, the MySQL family
     /// gets literals substituted into the text.
-    /// The prompt type each placeholder's column implies.
+    /// The prompt type each placeholder's surroundings imply, as far as the
+    /// database can say: the column it is compared with, or the routine
+    /// parameter it is passed as.
     ///
     /// The dialog cannot tell what `:id` is from its name, but the statement
     /// names the column beside it and the catalog knows that column's type.
@@ -8771,7 +8774,24 @@ impl SqlEditorWidget {
     ///
     /// Every failure is silent and means "unknown", which lands on the same
     /// `String` the prompt opened with before any of this existed.
-    fn bind_catalog_param_types(
+    fn bind_prompt_param_types(
+        &self,
+        sql: &str,
+        db_type: crate::db::DatabaseType,
+    ) -> HashMap<String, crate::ui::bind_prompt::BindParamType> {
+        let mut types = self.bind_column_param_types(sql, db_type);
+        // A column comparison is the more specific statement of the two, so it
+        // is not overwritten: `proc(x => :d)` inside a call whose argument is
+        // itself `col = :d` says both, and the column is what the value is
+        // measured against.
+        for (key, param_type) in self.bind_call_param_types(sql, db_type) {
+            types.entry(key).or_insert(param_type);
+        }
+        types
+    }
+
+    /// The prompt type each placeholder's column implies.
+    fn bind_column_param_types(
         &self,
         sql: &str,
         db_type: crate::db::DatabaseType,
@@ -8834,6 +8854,129 @@ impl SqlEditorWidget {
             );
         }
         types
+    }
+
+    /// The prompt type each placeholder's routine parameter declares.
+    ///
+    /// This is the only way an OUT `REF CURSOR` can be recognized: nothing in
+    /// `pkg.proc(p_cursor => :rc)` says the parameter is a cursor, and answering
+    /// it as text fails the call.
+    fn bind_call_param_types(
+        &self,
+        sql: &str,
+        db_type: crate::db::DatabaseType,
+    ) -> HashMap<String, crate::ui::bind_prompt::BindParamType> {
+        let anchors = crate::ui::bind_prompt::bind_call_anchors(sql, db_type);
+        if anchors.is_empty() {
+            return HashMap::new();
+        }
+
+        // One statement usually calls one routine, and the same routine may
+        // hold several placeholders. Fetch each parameter list once.
+        let mut routines: Vec<(Option<String>, String)> = Vec::new();
+        for (_, anchor) in &anchors {
+            let routine = (anchor.qualifier.clone(), anchor.routine.clone());
+            if !routines.contains(&routine) {
+                routines.push(routine);
+            }
+        }
+        let arguments = self.load_routine_arguments_for_bind_prompt(&routines);
+
+        let mut types = HashMap::new();
+        for (key, anchor) in anchors {
+            let Some(index) = routines.iter().position(|(qualifier, routine)| {
+                *qualifier == anchor.qualifier && *routine == anchor.routine
+            }) else {
+                continue;
+            };
+            let Some(param_type) = arguments.get(&index).and_then(|arguments| {
+                crate::ui::bind_prompt::param_type_for_call_parameter(arguments, &anchor.parameter)
+            }) else {
+                continue;
+            };
+            types.insert(key, param_type);
+        }
+        types
+    }
+
+    /// Parameter lists for `routines`, keyed by their index, on the same terms
+    /// as the column load below: off the UI thread, bounded, silent on failure.
+    fn load_routine_arguments_for_bind_prompt(
+        &self,
+        routines: &[(Option<String>, String)],
+    ) -> HashMap<usize, Vec<crate::db::ProcedureArgument>> {
+        let mut loaded = HashMap::new();
+        let Some(connection) = self.connection_binding.metadata_connection() else {
+            return loaded;
+        };
+
+        let (sender, receiver) = mpsc::channel::<(usize, Vec<crate::db::ProcedureArgument>)>();
+        let mut spawned = 0usize;
+        for (index, (qualifier, routine)) in routines.iter().enumerate() {
+            let sender = sender.clone();
+            let connection = connection.clone();
+            let qualifier = qualifier.clone();
+            let routine = routine.clone();
+            let task = move || {
+                let activity = format!("Bind parameter types {routine}");
+                let resolved = (|| {
+                    let context = crate::db::pool_session_context_for_shared_connection(
+                        &connection,
+                        Some(&activity),
+                    )?;
+                    let _activity_guard = crate::db::track_pool_db_activity(
+                        activity.clone(),
+                        context.connection_info.db_type,
+                    );
+                    let session = context.acquire_session_for_current_scope()?;
+                    if !crate::db::cached_pool_session_context_matches_shared_connection(
+                        &connection,
+                        &context,
+                    ) {
+                        return Err("Bind parameter connection changed during acquire".to_string());
+                    }
+                    SqlEditorWidget::resolve_routine_arguments(
+                        context.connection_info.db_type,
+                        session,
+                        &routine,
+                        qualifier.as_deref(),
+                    )
+                })();
+                let arguments = match resolved {
+                    Ok(arguments) => arguments.unwrap_or_default(),
+                    Err(message) => {
+                        crate::utils::logging::log_debug("bind prompt", &message);
+                        Vec::new()
+                    }
+                };
+                // Always answered, empty included, so the wait below ends as
+                // soon as every routine has reported rather than at the timeout.
+                let _ = sender.send((index, arguments));
+            };
+            match std::thread::Builder::new()
+                .name("bind-prompt-args".to_string())
+                .spawn(task)
+            {
+                Ok(_) => spawned += 1,
+                Err(err) => crate::utils::logging::log_error(
+                    "bind prompt",
+                    &format!("failed to spawn bind parameter metadata thread: {err}"),
+                ),
+            }
+        }
+        drop(sender);
+
+        let deadline = Instant::now() + BIND_PROMPT_METADATA_TIMEOUT;
+        while loaded.len() < spawned {
+            let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
+                break;
+            };
+            let Ok((index, arguments)) = receiver.recv_timeout(remaining) else {
+                break;
+            };
+            loaded.insert(index, arguments);
+        }
+        loaded
     }
 
     /// Tables that could own an anchor's column: the one its qualifier names,
@@ -8914,7 +9057,7 @@ impl SqlEditorWidget {
         }
         drop(sender);
 
-        let deadline = Instant::now() + BIND_PROMPT_COLUMN_LOAD_TIMEOUT;
+        let deadline = Instant::now() + BIND_PROMPT_METADATA_TIMEOUT;
         loop {
             let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
                 break;
@@ -8964,7 +9107,7 @@ impl SqlEditorWidget {
         let session = self.connection_binding.session_state();
         // Resolved before the session lock below, because loading metadata
         // takes its own pooled session and must not do so holding this one.
-        let catalog_types = self.bind_catalog_param_types(sql, db_type);
+        let catalog_types = self.bind_prompt_param_types(sql, db_type);
 
         // The session lock is taken in short scopes and never held across the
         // modal: the dialog runs its own event loop, and a worker thread waiting

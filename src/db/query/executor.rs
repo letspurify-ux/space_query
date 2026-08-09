@@ -2922,8 +2922,31 @@ impl QueryExecutor {
         sql: &str,
         start: Instant,
     ) -> Result<QueryResult, OracleError> {
+        Self::execute_select_with_rowid_policy(conn, sql, start, true)
+    }
+
+    /// The statement a SELECT actually runs: the caller's own SQL, or the
+    /// rewrite that carries the ROWID a grid needs to edit its rows.
+    fn select_execution_sql(sql: &str, inject_rowid_for_editing: bool) -> String {
+        if !inject_rowid_for_editing {
+            return sql.to_string();
+        }
         let sql_for_editing = Self::maybe_inject_rowid_for_editing(sql);
-        let sql_for_execution = Self::rowid_safe_execution_sql(sql, &sql_for_editing);
+        Self::rowid_safe_execution_sql(sql, &sql_for_editing)
+    }
+
+    /// The SELECT path, with the editing ROWID column made optional.
+    ///
+    /// `inject_rowid_for_editing` false runs `sql` exactly as written: a caller
+    /// with no grid behind it — the object browser's table export — would
+    /// otherwise get a ROWID column nobody asked for.
+    fn execute_select_with_rowid_policy(
+        conn: &Connection,
+        sql: &str,
+        start: Instant,
+        inject_rowid_for_editing: bool,
+    ) -> Result<QueryResult, OracleError> {
+        let sql_for_execution = Self::select_execution_sql(sql, inject_rowid_for_editing);
         // KNOWN EDGE CASE: if the caller's SQL already contains a column literally named
         // "SQ_INTERNAL_ROWID" (the internal alias injected by maybe_inject_rowid_for_editing),
         // the injected SQL will differ from the original, causing this flag to be true.
@@ -8095,6 +8118,25 @@ ORDER BY profile, resource_type, resource_name
 }
 
 #[cfg(test)]
+mod select_execution_sql_tests {
+    use super::QueryExecutor;
+
+    #[test]
+    fn editing_select_carries_the_rowid_column() {
+        let sql = QueryExecutor::select_execution_sql("SELECT * FROM EMP", true);
+        assert!(sql.contains("SQ_INTERNAL_ROWID"), "{sql}");
+    }
+
+    #[test]
+    fn export_select_runs_the_callers_own_statement() {
+        assert_eq!(
+            QueryExecutor::select_execution_sql("SELECT * FROM EMP", false),
+            "SELECT * FROM EMP"
+        );
+    }
+}
+
+#[cfg(test)]
 mod dba_feature_tests {
     use super::QueryExecutor;
     use oracle::Error as OracleError;
@@ -8501,14 +8543,23 @@ impl ObjectBrowser {
         out.trim_start_matches([' ', '\t']).to_string()
     }
 
+    /// Run a SELECT on an OCI connection for a caller outside the statement
+    /// pipeline — the object browser's table export.
+    ///
+    /// Deliberately not [`QueryExecutor::execute`]: that path injects the
+    /// ROWID column a grid needs to edit its rows, and an export has no grid,
+    /// so the column would land in the exported file.
+    pub fn execute_oci_query(conn: &Connection, sql: &str) -> Result<QueryResult, OracleError> {
+        QueryExecutor::execute_select_with_rowid_policy(conn, sql, Instant::now(), false)
+    }
+
     /// Run a SELECT on a thin session and return it shaped like every other
     /// result, columns and literal kinds included.
     ///
-    /// The OCI side already had [`QueryExecutor::execute`]; this is the thin
-    /// equivalent for callers outside the statement pipeline — the object
-    /// browser's table export — so an exported table carries the same column
-    /// classification whichever Oracle driver fetched it.
-    pub(crate) fn execute_thin_query(
+    /// The thin twin of [`ObjectBrowser::execute_oci_query`], so an exported
+    /// table carries the same column classification whichever Oracle driver
+    /// fetched it.
+    pub fn execute_thin_query(
         conn: &mut OracleThinSession,
         sql: &str,
     ) -> Result<QueryResult, String> {

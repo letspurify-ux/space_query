@@ -110,7 +110,7 @@ Desktop SQL client for Oracle® Database and MySQL/MariaDB built with Rust and F
 \n\
 Highlights\n\
 - Multi-tab SQL editor with execution history and result/message tabs\n\
-- Oracle and MySQL/MariaDB object browser, syntax highlighting, and IntelliSense\n\
+- Oracle and MySQL/MariaDB object browser, syntax highlighting, and code completion\n\
 - Automatic SQL formatting for Oracle SQL, PL/SQL, and MySQL scripts\n\
 - Explain Plan / EXPLAIN, SQL*Plus-style script execution, and transaction controls\n\
 - Saved connections, OS keyring password storage, and application log viewer\n\
@@ -444,7 +444,7 @@ impl MenuBarBuilder {
             forward_menu_callback,
         );
         menu.add(
-            "&Edit/&Intellisense",
+            "&Edit/Code Co&mpletion",
             Shortcut::Command | ' ',
             MenuFlag::Normal,
             forward_menu_callback,
@@ -648,7 +648,7 @@ impl MenuBarBuilder {
                     Ctrl+/ - Toggle Comment\n\
                     Ctrl+U - Uppercase Selection\n\
                     Ctrl+L - Lowercase Selection\n\
-                    Ctrl+Space - Intellisense\n\
+                    Ctrl+Space - Code Completion\n\
                     Tab - Expand Code Snippet / Next Placeholder\n\
                     Ctrl+J - Expand Code Snippet (or list them)\n\
                     Ctrl+Shift+Up/Down - Select SQL Block\n\

@@ -485,9 +485,8 @@ mod tests {
     fn fltk_lightness(color: Color) -> f64 {
         let (red, green, blue) = color.to_rgb();
         let channel = |value: u8| (f64::from(value) / 255.0).powf(2.4);
-        let luminance = 0.212_672_9 * channel(red)
-            + 0.715_152_2 * channel(green)
-            + 0.072_175_0 * channel(blue);
+        let luminance =
+            0.212_672_9 * channel(red) + 0.715_152_2 * channel(green) + 0.072_175_0 * channel(blue);
         if luminance <= 216.0 / 24389.0 {
             luminance * (24389.0 / 27.0)
         } else {

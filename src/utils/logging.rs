@@ -21,17 +21,22 @@ fn app_log_limit() -> usize {
     crate::utils::config::AppConfig::runtime_app_log_limit()
 }
 
+/// An explicit `SPACE_QUERY_DATA_DIR` always wins. Otherwise the user's real
+/// data directory is used only by a process that opted in; every other one gets
+/// a scratch directory. See `crate::utils::app_dirs`.
 pub(crate) fn app_data_base_dir() -> Option<PathBuf> {
     if let Some(path) = std::env::var_os("SPACE_QUERY_DATA_DIR") {
         return Some(PathBuf::from(path));
     }
-    if let Some(path) = dirs::data_dir() {
-        return Some(path);
-    }
-    if let Some(home) = dirs::home_dir() {
-        return Some(home.join(".local").join("share"));
-    }
-    None
+    crate::utils::app_dirs::base_dir_or_scratch(|| {
+        if let Some(path) = dirs::data_dir() {
+            return Some(path);
+        }
+        if let Some(home) = dirs::home_dir() {
+            return Some(home.join(".local").join("share"));
+        }
+        None
+    })
 }
 
 fn log_writer_response_timeout() -> Duration {

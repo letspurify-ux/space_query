@@ -11,9 +11,7 @@ use std::panic::{self, AssertUnwindSafe};
 use std::sync::{Arc, Mutex};
 
 use crate::db::query::result_messages;
-use crate::db::{
-    ConnectionId, ExecutionOrigin, QueryResult, ResultEditDescriptor, SqlValueKind,
-};
+use crate::db::{ConnectionId, ExecutionOrigin, QueryResult, ResultEditDescriptor, SqlValueKind};
 use crate::ui::constants;
 use crate::ui::font_settings::{
     configured_result_font_size, configured_result_profile, FontProfile,

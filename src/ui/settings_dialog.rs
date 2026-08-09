@@ -173,7 +173,7 @@ fn validate_intellisense_context_window_kib(value: &str) -> Option<u32> {
         }
         _ => {
             crate::ui::alert_on_main(&format!(
-                "IntelliSense context must be a number between {} and {} KiB.",
+                "Code completion context must be a number between {} and {} KiB.",
                 MIN_INTELLISENSE_CONTEXT_WINDOW_KIB, MAX_INTELLISENSE_CONTEXT_WINDOW_KIB
             ));
             None
@@ -191,7 +191,7 @@ fn validate_intellisense_popup_delay_ms(value: &str) -> Option<u32> {
         }
         _ => {
             crate::ui::alert_on_main(&format!(
-                "IntelliSense popup delay must be a number between {} and {} milliseconds.",
+                "Code completion popup delay must be a number between {} and {} milliseconds.",
                 MIN_INTELLISENSE_POPUP_DELAY_MS, MAX_INTELLISENSE_POPUP_DELAY_MS
             ));
             None
@@ -572,7 +572,7 @@ pub fn show_settings_dialog(config: &AppConfig) -> Option<FontSettings> {
     result_group.end();
 
     let mut intellisense_group = Group::new(content_x, tab_body_y, content_w, tab_body_h, None);
-    intellisense_group.set_label("IntelliSense");
+    intellisense_group.set_label("Code Completion");
     intellisense_group.set_color(theme::panel_bg());
     intellisense_group.set_label_color(theme::text_secondary());
     intellisense_group.begin();

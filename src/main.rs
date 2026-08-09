@@ -8,6 +8,12 @@ use space_query::app::App;
 use space_query::utils::logging;
 
 fn main() {
+    // The application is the only process allowed to read and write the user's
+    // real configuration and data directories. Harness binaries and tests run
+    // against a scratch directory instead, so they cannot overwrite saved
+    // connections. Must come before anything that touches either directory.
+    space_query::utils::app_dirs::enable_user_data_persistence();
+
     let previous_panic_hook = std::panic::take_hook();
 
     // Install custom panic hook for crash handling

@@ -7688,7 +7688,7 @@ impl ObjectBrowserDbBehavior for OracleObjectBrowserBehavior {
         let sql = self.export_select_sql(selected_scope, table_name);
         match session {
             crate::db::DbPoolSession::Oracle(conn) => {
-                crate::db::query::QueryExecutor::execute(&conn, &sql).map_err(|err| err.to_string())
+                ObjectBrowser::execute_oci_query(&conn, &sql).map_err(|err| err.to_string())
             }
             crate::db::DbPoolSession::OracleThin(mut conn) => {
                 ObjectBrowser::execute_thin_query(&mut conn, &sql)

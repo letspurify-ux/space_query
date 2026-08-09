@@ -1,7 +1,8 @@
 # Developer Documentation
 
 This directory documents the current implementation. Start with the repository
-[README](../README.md) for the user-facing feature overview and run instructions.
+[README](../README.md) for the tour and run instructions, and with
+[features.md](features.md) for the full user-facing feature reference.
 
 ## Reading order
 

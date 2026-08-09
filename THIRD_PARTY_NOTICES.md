@@ -141,7 +141,9 @@ binaries when dependencies change.
 
 ## Trademarks
 
-Oracle, Java, MySQL, and NetSuite are registered trademarks of Oracle and/or
-its affiliates. Other names may be trademarks of their respective owners.
-This project is independent and is not affiliated with, endorsed by, or
-sponsored by Oracle.
+Oracle, Java, MySQL, SQL*Plus, and NetSuite are trademarks or registered
+trademarks of Oracle and/or its affiliates. MariaDB is a trademark of MariaDB
+Corporation Ab. Other names may be trademarks of their respective owners.
+These names are used only to identify the software this project connects to or
+builds on. This project is independent and is not affiliated with, endorsed by,
+or sponsored by Oracle, MariaDB Corporation Ab, or any other vendor.

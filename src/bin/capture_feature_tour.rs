@@ -10,7 +10,7 @@ use fltk::{
     window::Window,
 };
 use space_query::{
-    db::{ColumnInfo, DatabaseType, PackageRoutine, QueryResult, SqlValueKind},
+    db::{ColumnInfo, ConnectionColor, DatabaseType, PackageRoutine, QueryResult, SqlValueKind},
     ui::{
         apply_global_default_font,
         bind_prompt::{BindParam, BindParamType},
@@ -420,7 +420,12 @@ fn capture_intellisense(main_window: &mut MainWindow) {
         main_y,
         &mut popup_window,
     );
-    save_ppm("/tmp/space-query-intellisense.ppm", &canvas, width, height);
+    save_ppm(
+        "/tmp/space-query-code-completion.ppm",
+        &canvas,
+        width,
+        height,
+    );
     popup.hide();
 }
 
@@ -2136,6 +2141,19 @@ fn capture_connection_color_tabs(main_window: &mut MainWindow) {
         &["7698", "BLAKE", "MANAGER", "2850"],
     ];
 
+    // The tour runs untagged; this is the one scene about the tag, so the two
+    // example connections are coloured here, before either produces a result.
+    if !main_window.capture_tour_set_connection_color("capture-local-oracle", ConnectionColor::Red)
+    {
+        fail("the Oracle example connection is missing");
+    }
+    if !main_window
+        .capture_tour_set_connection_color("capture-analytics-maria", ConnectionColor::Green)
+    {
+        fail("the MariaDB example connection is missing");
+    }
+    pump(200);
+
     // Run one result on each connection, from the same query tab. A tab reaches
     // this after losing its database and being bound to another one.
     if !main_window.capture_tour_rebind_active_tab("capture-analytics-maria") {
@@ -2174,7 +2192,13 @@ fn capture_connection_color_tabs(main_window: &mut MainWindow) {
         Some(0),
     );
     pump(250);
-    save_main_part("/tmp/space-query-connection-color-tabs.ppm", 250, 64, 950, 345);
+    save_main_part(
+        "/tmp/space-query-connection-color-tabs.ppm",
+        250,
+        64,
+        950,
+        345,
+    );
 }
 
 fn capture_soft_wrap(main_window: &mut MainWindow) {

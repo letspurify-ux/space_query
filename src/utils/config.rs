@@ -94,10 +94,15 @@ pub struct AppConfig {
 }
 
 impl AppConfig {
+    /// An explicit `SPACE_QUERY_CONFIG_DIR` always wins. Otherwise the user's
+    /// real config directory is used only by a process that opted in; every
+    /// other one gets a scratch directory, so a harness run cannot overwrite
+    /// saved connections. See `crate::utils::app_dirs`.
     fn config_base_dir() -> Option<PathBuf> {
-        std::env::var_os("SPACE_QUERY_CONFIG_DIR")
-            .map(PathBuf::from)
-            .or_else(dirs::config_dir)
+        if let Some(path) = std::env::var_os("SPACE_QUERY_CONFIG_DIR") {
+            return Some(PathBuf::from(path));
+        }
+        crate::utils::app_dirs::base_dir_or_scratch(dirs::config_dir)
     }
 
     fn app_file_path(base: Option<PathBuf>, app_dir: &str, file_name: &str) -> Option<PathBuf> {
