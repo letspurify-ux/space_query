@@ -1,6 +1,6 @@
 use fltk::{
     app,
-    enums::{Align, CallbackReason, CallbackTrigger, Event, FrameType, Key},
+    enums::{Align, CallbackReason, CallbackTrigger, Color, Event, FrameType, Key},
     group::{Group, Tabs, TabsOverflow},
     input::Input,
     prelude::*,
@@ -11,7 +11,9 @@ use std::panic::{self, AssertUnwindSafe};
 use std::sync::{Arc, Mutex};
 
 use crate::db::query::result_messages;
-use crate::db::{ExecutionOrigin, QueryResult, ResultEditDescriptor, SqlValueKind};
+use crate::db::{
+    ConnectionId, ExecutionOrigin, QueryResult, ResultEditDescriptor, SqlValueKind,
+};
 use crate::ui::constants;
 use crate::ui::font_settings::{
     configured_result_font_size, configured_result_profile, FontProfile,
@@ -88,6 +90,13 @@ pub struct ResultTabsWidget {
     suppress_pointer_event_depth: Arc<Mutex<u32>>,
     data_tab_strip_state: Arc<Mutex<tab_strip::TabStripState>>,
     execution_origin: Arc<Mutex<Option<ExecutionOrigin>>>,
+    /// The tag of the query tab this panel belongs to. Used for results that
+    /// carry no execution origin, and as the colour a new result starts from.
+    tag: Arc<Mutex<Option<Color>>>,
+    /// Looks up a connection's tag colour. A result keeps the colour of the
+    /// connection that produced it, which is not always the one the panel's
+    /// query tab is bound to now.
+    tag_resolver: Arc<Mutex<Option<Box<dyn Fn(ConnectionId) -> Option<Color>>>>>,
 }
 
 #[derive(Clone)]
@@ -99,6 +108,10 @@ struct ResultTab {
     status: ResultTabStatus,
     row_count: usize,
     origin: Option<ExecutionOrigin>,
+    /// The tag of the connection this result came from. Resolved from `origin`,
+    /// so a tab keeps its own colour when the panel's query tab is later bound
+    /// to a different database.
+    tag: Option<Color>,
     kind: ResultTabKind,
     filter_bar: Option<TableBrowseFilterBar>,
     /// The strip reporting a local value filter. Mutually exclusive with
@@ -829,6 +842,9 @@ impl ResultTabsWidget {
         let suppress_pointer_event_depth = Arc::new(Mutex::new(0u32));
         let data_tab_strip_state = Arc::new(Mutex::new(tab_strip::TabStripState::default()));
         let execution_origin = Arc::new(Mutex::new(None));
+        let tag: Arc<Mutex<Option<Color>>> = Arc::new(Mutex::new(None));
+        let tag_resolver: Arc<Mutex<Option<Box<dyn Fn(ConnectionId) -> Option<Color>>>>> =
+            Arc::new(Mutex::new(None));
 
         tabs.begin();
         let (section_x, section_y, section_w, section_h) = Self::content_bounds(&tabs);
@@ -1202,7 +1218,120 @@ impl ResultTabsWidget {
             suppress_pointer_event_depth,
             data_tab_strip_state,
             execution_origin,
+            tag,
+            tag_resolver,
         }
+    }
+
+    /// Teaches the panel how to turn a connection into its tag colour.
+    ///
+    /// Set once, from the owner that has the connection registry. Without it a
+    /// result falls back to the tag of the query tab that ran it.
+    pub fn set_tag_resolver<F>(&mut self, resolver: F)
+    where
+        F: Fn(ConnectionId) -> Option<Color> + 'static,
+    {
+        *self
+            .tag_resolver
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(Box::new(resolver));
+        self.apply_tag_color();
+    }
+
+    /// Tags this panel with its query tab's connection colour.
+    ///
+    /// This is the colour a result starts from, and the one used for results
+    /// that carry no origin. A result that does carry one keeps its own
+    /// connection's colour instead — a tab bound to a new database after its
+    /// old one went away must not repaint the results the old one produced.
+    ///
+    /// Only the per-result strip takes a tag: the section strip and the
+    /// Output/Errors strips inside it are fixed furniture that every panel has,
+    /// and colouring them says nothing about where a result came from while
+    /// making a red tag look like an error report.
+    pub fn set_tag_color(&mut self, color: Option<Color>) {
+        *self
+            .tag
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = color;
+        self.apply_tag_color();
+    }
+
+    fn tag_color(&self) -> Option<Color> {
+        *self
+            .tag
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// The colour a result produced by `origin` should wear.
+    fn tag_for_origin(&self, origin: Option<&ExecutionOrigin>) -> Option<Color> {
+        let resolved = origin.and_then(|origin| {
+            self.tag_resolver
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .as_ref()
+                .and_then(|resolve| resolve(origin.connection_id))
+        });
+        resolved.or_else(|| self.tag_color())
+    }
+
+    /// Re-reads every result's colour from the connection that produced it, and
+    /// dresses the strip in whichever one is selected.
+    fn apply_tag_color(&mut self) {
+        if self.data_tabs.was_deleted() {
+            return;
+        }
+        let repainted: Vec<(Group, Option<Color>)> = {
+            let origins: Vec<(Group, Option<ExecutionOrigin>)> = self
+                .data
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .iter()
+                .map(|tab| (tab.group.clone(), tab.origin.clone()))
+                .collect();
+            origins
+                .into_iter()
+                .map(|(group, origin)| {
+                    let tag = self.tag_for_origin(origin.as_ref());
+                    (group, tag)
+                })
+                .collect()
+        };
+        {
+            let mut data = self
+                .data
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            for (tab, (_, tag)) in data.iter_mut().zip(repainted.iter()) {
+                tab.tag = *tag;
+            }
+        }
+        for (group, tag) in repainted {
+            let mut group = group;
+            if !group.was_deleted() {
+                group.set_label_color(tag.unwrap_or_else(theme::text_secondary));
+            }
+        }
+        self.apply_selected_result_surface();
+        self.data_tabs.redraw();
+    }
+
+    /// Dresses the result strip in the tag of the result that is showing.
+    fn apply_selected_result_surface(&mut self) {
+        if self.data_tabs.was_deleted() {
+            return;
+        }
+        let tag = self.data_tabs.value().and_then(|selected| {
+            let selected_ptr = selected.as_widget_ptr();
+            self.data
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .iter()
+                .find(|tab| tab.group.as_widget_ptr() == selected_ptr)
+                .and_then(|tab| tab.tag)
+        });
+        tab_strip::apply_tag_surface(&mut self.data_tabs, tag);
     }
 
     pub(crate) fn set_execution_origin(&mut self, origin: Option<ExecutionOrigin>) {
@@ -1488,6 +1617,19 @@ impl ResultTabsWidget {
                 tab.title = title.clone();
             }
         }
+        let reused_tag = self.tag_for_origin(origin.as_ref());
+        if let Some(tab) = self
+            .data
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get_mut(index)
+        {
+            tab.tag = reused_tag;
+            if !tab.group.was_deleted() {
+                tab.group
+                    .set_label_color(reused_tag.unwrap_or_else(theme::text_secondary));
+            }
+        }
         let existing_group = self
             .set_result_tab_state(index, ResultTabStatus::Running, 0)
             .map(|(group, _)| group);
@@ -1505,6 +1647,7 @@ impl ResultTabsWidget {
                     .active_index
                     .lock()
                     .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(index);
+                self.apply_selected_result_surface();
             }
             return;
         }
@@ -1518,9 +1661,10 @@ impl ResultTabsWidget {
             ResultTabStatus::Running,
             0,
         ));
+        let result_tag = self.tag_for_origin(origin.as_ref());
         group.set_color(theme::panel_bg());
         group.set_selection_color(theme::panel_bg());
-        group.set_label_color(theme::text_secondary());
+        group.set_label_color(result_tag.unwrap_or_else(theme::text_secondary));
         group.set_align(Align::Center | Align::Inside);
         group.set_trigger(CallbackTrigger::Closed);
         let id = id.unwrap_or_else(|| self.reserve_result_tab_id());
@@ -1596,6 +1740,7 @@ impl ResultTabsWidget {
                 table,
                 status: ResultTabStatus::Running,
                 row_count: 0,
+                tag: result_tag,
                 origin,
                 kind: ResultTabKind::Query,
                 filter_bar: None,
@@ -1617,6 +1762,7 @@ impl ResultTabsWidget {
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(new_index);
         }
+        self.apply_selected_result_surface();
         self.sync_data_tab_strip_overflow_mode();
         self.fire_on_change_callback();
     }

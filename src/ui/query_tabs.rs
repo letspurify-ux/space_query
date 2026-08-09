@@ -32,6 +32,9 @@ pub struct QueryTabsWidget {
 struct TabEntry {
     id: QueryTabId,
     group: Group,
+    /// The connection's tag, or `None` when it has none. Kept here because the
+    /// selected tab's colours are read off the strip, not off the tab.
+    tag: Option<Color>,
 }
 
 struct CallbackSuppressGuard {
@@ -210,6 +213,28 @@ impl QueryTabsWidget {
         });
     }
 
+    /// Dresses the strip in the selected tab's tag.
+    ///
+    /// `Fl_Tabs` draws the selected tab with the strip's `selection_color` and
+    /// `labelcolor` and ignores the tab's own, so the tag has to be moved onto
+    /// the strip every time the selection changes. An untagged tab restores the
+    /// plain selection colours, or it would keep wearing the previous tab's tag.
+    fn apply_selected_tab_surface(tabs: &mut Tabs, entries: &Arc<Mutex<Vec<TabEntry>>>) {
+        if tabs.was_deleted() {
+            return;
+        }
+        let tag = tabs.value().and_then(|selected| {
+            let selected_ptr = selected.as_widget_ptr();
+            entries
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .iter()
+                .find(|entry| entry.group.as_widget_ptr() == selected_ptr)
+                .and_then(|entry| entry.tag)
+        });
+        tab_strip::apply_tag_surface(tabs, tag);
+    }
+
     fn record_tab_strip_removal_for(
         group: &Group,
         tab_strip_state: &Arc<Mutex<tab_strip::TabStripState>>,
@@ -274,6 +299,9 @@ impl QueryTabsWidget {
         let tab_strip_state_for_cb = tab_strip_state.clone();
         tabs.set_callback(move |tabs| {
             Self::record_tab_strip_selection_for(tabs, &tab_strip_state_for_cb);
+            // Before the suppression check: a suppressed callback still means
+            // the selection moved, and the strip has to follow it.
+            Self::apply_selected_tab_surface(tabs, &entries_for_cb);
             if *suppress_for_cb
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -439,12 +467,14 @@ impl QueryTabsWidget {
             .push(TabEntry {
                 id: tab_id,
                 group: group.clone(),
+                tag: None,
             });
         let _pointer_suppress_guard =
             PointerEventSuppressGuard::new(self.suppress_pointer_event_depth.clone());
         let _suppress_guard =
             CallbackSuppressGuard::new(self.suppress_select_callback_depth.clone());
         let _ = self.tabs.set_value(&group);
+        Self::apply_selected_tab_surface(&mut self.tabs, &self.entries);
         self.sync_tab_strip_overflow_mode();
         Self::layout_children(&self.tabs);
         self.tabs.redraw();
@@ -459,6 +489,7 @@ impl QueryTabsWidget {
                 CallbackSuppressGuard::new(self.suppress_select_callback_depth.clone());
             let _ = self.tabs.set_value(&group);
             Self::record_tab_strip_selection_for(&mut self.tabs, &self.tab_strip_state);
+            Self::apply_selected_tab_surface(&mut self.tabs, &self.entries);
             self.tabs.redraw();
         }
     }
@@ -486,16 +517,27 @@ impl QueryTabsWidget {
         }
     }
 
-    /// Paints one tab's label in `color`, or restores the default when `None`.
+    /// Tags one tab with its connection's colour, or clears the tag on `None`.
     ///
-    /// FLTK's `Tabs` has no other per-tab colour that survives selection, so
-    /// this is where a connection's tag shows up on the tab strip.
-    pub fn set_tab_label_color(&mut self, tab_id: QueryTabId, color: Option<Color>) {
-        if let Some(group) = self.tab_group(tab_id) {
-            let mut group = group;
-            group.set_label_color(color.unwrap_or_else(theme::text_secondary));
-            self.tabs.redraw();
-        }
+    /// An unselected tab wears the tag as its label colour. The selected one
+    /// cannot — see [`Self::apply_selected_tab_surface`] — so it wears it as a
+    /// background instead, which is why the tag is stored as well as painted.
+    pub fn set_tab_tag_color(&mut self, tab_id: QueryTabId, color: Option<Color>) {
+        let group = {
+            let mut entries = self
+                .entries
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let Some(entry) = entries.iter_mut().find(|entry| entry.id == tab_id) else {
+                return;
+            };
+            entry.tag = color;
+            entry.group.clone()
+        };
+        let mut group = group;
+        group.set_label_color(color.unwrap_or_else(theme::text_secondary));
+        Self::apply_selected_tab_surface(&mut self.tabs, &self.entries);
+        self.tabs.redraw();
     }
 
     pub fn close_tab(&mut self, tab_id: QueryTabId) -> bool {
@@ -542,6 +584,7 @@ impl QueryTabsWidget {
                 let _ = self.tabs.set_value(&replacement_group);
             }
         }
+        Self::apply_selected_tab_surface(&mut self.tabs, &self.entries);
         self.sync_tab_strip_overflow_mode_after_close();
         Self::layout_children(&self.tabs);
         self.tabs.redraw();

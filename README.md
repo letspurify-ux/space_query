@@ -151,10 +151,27 @@ and neither is sent to the server.
 ![The connection dialog with a color picked and Read-only ticked](docs/images/connection-color.png)
 
 **Color** tags the connection so the window says which database is on the other
-end before a statement runs. The tag colors the status bar's connection dot and
-the label of every query tab bound to that connection. A dropped connection
-always shows the disconnected color instead, so a tag can never be mistaken for
-a live session.
+end before a statement runs. The tag is worn by the tabs rather than by a small
+marker: a query tab bound to a tagged connection carries the color in its label,
+and the tab that is selected carries it as its background — so the tab you are
+about to run on is the one showing the color, not the one you have to hunt for.
+The result tabs under the editor follow the same rule.
+
+A result keeps the color of the connection that produced it. If a query tab
+loses its connection and is later bound to another database, the results the
+first one returned stay in its color instead of being repainted — the point of
+the tag is to say where a result came from, and that is exactly when it matters.
+
+![A red-tagged query tab whose result strip holds a green result from an earlier connection next to the selected red one](docs/images/connection-color-tabs.png)
+
+Connections with no color keep the default appearance, and the status bar's
+connection dot never carries a tag: it is green with a live session and red
+without one. Whether a session exists is the one thing the dot must always be
+able to say, and a color preference does not get to hide it.
+
+The choices are red, orange, yellow, green, purple, and gray. There is no blue:
+blue is what this window already uses to mean "selected", so a blue tag stops
+reading as a tag on any surface that is painted as chosen.
 
 **Read-only** refuses to send anything that writes. Each statement is classified
 on its own — a script of three `SELECT`s runs, a `DELETE` hidden among them does

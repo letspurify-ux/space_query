@@ -3,11 +3,12 @@ use std::sync::{Mutex, TryLockError};
 
 use fltk::{
     app, draw,
-    enums::{CallbackTrigger, Event, LabelType},
+    enums::{CallbackTrigger, Color, Event, LabelType},
     group::{Tabs, TabsOverflow},
     prelude::*,
 };
 
+use crate::ui::theme;
 use crate::utils::arithmetic::safe_div;
 
 // These values mirror Fl_Tabs.cxx in FLTK 1.5.x.
@@ -652,6 +653,26 @@ fn sync_overflow_mode_impl(
     state.geometry = Some(geometry);
     state.removed_widget_ptrs.clear();
     true
+}
+
+/// Dresses a strip in the connection tag its selected tab belongs to, or
+/// restores the plain selection colours when there is no tag.
+///
+/// `Fl_Tabs::draw_tab` paints the selected tab with the strip's
+/// `selection_color` and `labelcolor` and ignores the tab's own, so a tag can
+/// only reach the selected tab from here. Every strip that shows a tag goes
+/// through this, or two strips end up disagreeing about the same connection.
+pub(crate) fn apply_tag_surface(tabs: &mut Tabs, tag: Option<Color>) {
+    if tabs.was_deleted() {
+        return;
+    }
+    if let Some(tag) = tag {
+        tabs.set_selection_color(theme::tag_selected_surface(tag));
+        tabs.set_label_color(theme::text_primary());
+    } else {
+        tabs.set_selection_color(theme::selection_soft());
+        tabs.set_label_color(theme::text_secondary());
+    }
 }
 
 pub(crate) fn record_removed_tab(state: &mut TabStripState, widget_ptr: usize) {
