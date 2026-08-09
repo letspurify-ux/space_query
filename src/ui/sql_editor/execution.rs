@@ -22096,11 +22096,6 @@ impl SqlEditorWidget {
         default_transaction_isolation: crate::db::TransactionIsolation,
         preserve_existing_session_state: bool,
     ) -> Result<(), String> {
-        if std::env::var("SQ_TRACE_TX_MODE").is_ok() {
-            eprintln!(
-                "(trace) apply settings mode={transaction_mode:?} preserve={preserve_existing_session_state}"
-            );
-        }
         for statement in Self::mysql_pooled_execution_session_setup_statements(
             db_type,
             auto_commit,
@@ -23771,12 +23766,6 @@ impl SqlEditorWidget {
             }
         }
 
-        if std::env::var("SQ_TRACE_TX_MODE").is_ok() {
-            use mysql::prelude::Queryable;
-            let probe: Result<Option<(u64, u64)>, _> =
-                conn.query_first("SELECT CONNECTION_ID(), @@transaction_read_only");
-            eprintln!("(trace) before action sql={statement_sql:?} probe={probe:?}");
-        }
         let result = panic::catch_unwind(AssertUnwindSafe(|| {
             action(&mut conn)
                 .map_err(|err| SqlEditorWidget::mysql_error_message(&err, effective_query_timeout))
@@ -24599,6 +24588,40 @@ mod query_execution_cleanup_tests {
         assert!(message.contains("Nothing was executed"));
         assert!(
             SqlEditorWidget::auto_commit_display_mismatch_error(Some(false), true).is_some(),
+            "mismatch must refuse in both directions"
+        );
+    }
+
+    #[test]
+    fn transaction_mode_display_mismatch_blocks_only_real_disagreements() {
+        let read_only = crate::db::TransactionMode::new(
+            crate::db::TransactionIsolation::Serializable,
+            crate::db::TransactionAccessMode::ReadOnly,
+        );
+        let default_mode = crate::db::TransactionMode::default();
+        // Nothing displayed (harness runs, disconnected controls) => no block.
+        assert!(
+            SqlEditorWidget::transaction_mode_display_mismatch_error(None, read_only).is_none()
+        );
+        assert!(
+            SqlEditorWidget::transaction_mode_display_mismatch_error(None, default_mode).is_none()
+        );
+        // Agreement => no block.
+        assert!(SqlEditorWidget::transaction_mode_display_mismatch_error(
+            Some(read_only),
+            read_only
+        )
+        .is_none());
+        // Disagreement => refuse with both modes named.
+        let message =
+            SqlEditorWidget::transaction_mode_display_mismatch_error(Some(read_only), default_mode)
+                .expect("mismatch must refuse execution");
+        assert!(message.contains(&read_only.label()));
+        assert!(message.contains(&default_mode.label()));
+        assert!(message.contains("Nothing was executed"));
+        assert!(
+            SqlEditorWidget::transaction_mode_display_mismatch_error(Some(default_mode), read_only)
+                .is_some(),
             "mismatch must refuse in both directions"
         );
     }

@@ -4935,6 +4935,9 @@ fn update_transaction_mode_from_controls(state: &Arc<Mutex<AppState>>) {
     // Tab-scoped, exactly like a session-scoped SET TRANSACTION statement:
     // the controls pin the ACTIVE tab's transaction mode and touch nothing
     // else — not the shared connection, not other tabs.
+    // Blocked/busy alerts are raised only after the AppState lock is
+    // released: the alert runs a nested modal event loop, and callbacks
+    // firing inside it must never find the state mutex still held.
     let (editor, runtime, previous_mode, mode) = {
         let mut s = state
             .lock()
@@ -4944,14 +4947,16 @@ fn update_transaction_mode_from_controls(state: &Arc<Mutex<AppState>>) {
             s.sql_editor.has_open_lazy_fetch(),
             "changing transaction mode",
         ) {
-            crate::ui::alert_on_main(&message);
             s.sync_transaction_mode_controls();
             s.set_status_message(&message);
+            drop(s);
+            crate::ui::alert_on_main(&message);
             return;
         }
         let Some((db_type, is_connected, current_mode, _)) = s.transaction_control_state() else {
-            crate::ui::alert_on_main(&format_connection_busy_message());
             s.sync_transaction_mode_controls();
+            drop(s);
+            crate::ui::alert_on_main(&format_connection_busy_message());
             return;
         };
         if !is_connected {
