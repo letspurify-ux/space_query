@@ -17716,17 +17716,15 @@ impl SqlEditorWidget {
                                     // override instead of adopting it verbatim.
                                     auto_commit = Self::effective_auto_commit(
                                         candidate.auto_commit,
-                                        tab_auto_commit_override
-                                            .and_then(|slot| load_mutex_bool_option(slot)),
+                                        tab_auto_commit_override.and_then(load_mutex_bool_option),
                                     );
                                     store_mutex_bool(current_operation_autocommit, auto_commit);
                                     // The tab's pinned transaction mode also
                                     // survives CONNECT.
                                     active_transaction_mode = Self::effective_transaction_mode(
                                         candidate.transaction_mode,
-                                        tab_transaction_mode_override.and_then(|slot| {
-                                            load_mutex_transaction_mode_option(slot)
-                                        }),
+                                        tab_transaction_mode_override
+                                            .and_then(load_mutex_transaction_mode_option),
                                     );
                                     transaction_mode_applied = false;
                                     continue_on_error = session
