@@ -1103,6 +1103,7 @@ impl StatusBarWidget {
         additional_count: usize,
         selection_summary: Option<&str>,
         auto_commit_label: Option<&str>,
+        transaction_state_label: Option<&str>,
     ) {
         let is_connected = connection_info.is_some() && has_live_connection;
         self.connection_indicator
@@ -1110,6 +1111,10 @@ impl StatusBarWidget {
         let mut connection_label = status_connection_label(connection_info, has_live_connection);
         if is_connected {
             if let Some(label) = auto_commit_label {
+                connection_label.push_str(" · ");
+                connection_label.push_str(label);
+            }
+            if let Some(label) = transaction_state_label {
                 connection_label.push_str(" · ");
                 connection_label.push_str(label);
             }
@@ -3518,6 +3523,16 @@ impl AppState {
                     self.sql_editor.tab_auto_commit_override_value(),
                 )
             });
+        // The toolbar choices show the tab's transaction-mode SETTING. They
+        // cannot show what the session is actually carrying right now — an
+        // open transaction, or a one-shot SET TRANSACTION that the next
+        // transaction will run under but that is deliberately not pinned to
+        // the tab. Without this the screen can show "Read write" while the
+        // next transaction is read only, so the state goes here.
+        let transaction_state_label = indicator_visible
+            .then(|| self.sql_editor.pooled_session_activity_snapshot())
+            .flatten()
+            .and_then(|snapshot| Self::transaction_state_status_label(snapshot.retained_state()));
         self.status_bar.render(
             conn_info.as_ref(),
             self.has_live_connection,
@@ -3525,6 +3540,7 @@ impl AppState {
             activities.len().saturating_sub(displayed_registry_count),
             selection_summary.as_deref(),
             auto_commit_label.as_deref(),
+            transaction_state_label,
         );
         self.render_query_cancel_activity();
         true
@@ -4209,6 +4225,31 @@ impl AppState {
                     item.clear();
                 }
             }
+        }
+    }
+
+    /// Status-bar text for what the active tab's DB session is carrying right
+    /// now, or `None` when it is clean.
+    ///
+    /// This is the transaction STATE, not the tab's transaction-mode setting
+    /// the toolbar choices show. The two can legitimately disagree: a one-shot
+    /// `SET TRANSACTION ...` is not pinned to the tab (it ends with the next
+    /// transaction), yet it is what that next transaction will run under, so
+    /// leaving it invisible would let the screen imply a mode the DB will not
+    /// use.
+    fn transaction_state_status_label(
+        state: crate::db::RetainedSessionState,
+    ) -> Option<&'static str> {
+        if state.may_have_transaction_mode_override() {
+            // Ordered first on purpose: this is the case the toolbar cannot
+            // represent at all.
+            Some("SET TRANSACTION pending")
+        } else if state.requires_transaction_decision() {
+            Some("transaction: commit or rollback required")
+        } else if state.may_have_uncommitted_work() {
+            Some("transaction open")
+        } else {
+            None
         }
     }
 
@@ -16773,6 +16814,53 @@ mod tests {
         assert_eq!(
             AppState::auto_commit_status_label(true, Some(true)),
             "auto-commit on"
+        );
+    }
+
+    #[test]
+    fn transaction_state_status_label_surfaces_what_the_toolbar_cannot_show() {
+        use crate::db::{RetainedSessionState, TransactionSessionState};
+
+        // A clean session says nothing: the toolbar setting is the whole story.
+        assert_eq!(
+            AppState::transaction_state_status_label(RetainedSessionState::default()),
+            None
+        );
+
+        // A one-shot SET TRANSACTION is deliberately not pinned to the tab, so
+        // the toolbar keeps showing the tab setting while the NEXT transaction
+        // runs under the pending mode. That gap must be visible.
+        let post_processor =
+            crate::db::statement_session_post_processor_for(crate::db::DatabaseType::MySQL);
+        let pending_override = crate::db::retained_session_state_after_statement(
+            post_processor,
+            RetainedSessionState::default(),
+            post_processor.effects_for_sql("SET TRANSACTION ISOLATION LEVEL SERIALIZABLE"),
+            false,
+            false,
+            false,
+            false,
+        );
+        assert!(pending_override.may_have_transaction_mode_override());
+        assert_eq!(
+            AppState::transaction_state_status_label(pending_override),
+            Some("SET TRANSACTION pending")
+        );
+
+        // An unresolved transaction reports the decision the user still owes.
+        assert_eq!(
+            AppState::transaction_state_status_label(RetainedSessionState::from_transaction_state(
+                TransactionSessionState::DecisionRequired
+            )),
+            Some("transaction: commit or rollback required")
+        );
+
+        // An ordinary open transaction is reported without demanding one.
+        assert_eq!(
+            AppState::transaction_state_status_label(RetainedSessionState::from_transaction_state(
+                TransactionSessionState::MaybeDirty
+            )),
+            Some("transaction open")
         );
     }
 

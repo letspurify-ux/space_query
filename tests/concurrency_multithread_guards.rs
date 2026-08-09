@@ -2960,6 +2960,19 @@ fn transaction_mode_state_has_a_single_source_of_truth() {
         batch_finished_body.contains("s.sync_transaction_mode_controls();"),
         "the non-lazy BatchFinished handler must re-sync the transaction-mode controls so a query-driven change is reflected after completion"
     );
+
+    // (7) The toolbar choices show the tab's transaction-mode SETTING and
+    // cannot represent what the session is actually carrying — an open
+    // transaction, or a one-shot SET TRANSACTION that the next transaction
+    // runs under but that is deliberately not pinned to the tab. The status
+    // bar must surface that state, or the screen can imply a mode the DB will
+    // not use. It renders on the status timer, so it needs no extra wiring.
+    assert!(
+        main_window.contains("fn transaction_state_status_label(")
+            && main_window.contains("may_have_transaction_mode_override()")
+            && main_window.contains("let transaction_state_label = indicator_visible"),
+        "the status bar must surface the session's transaction state next to the auto-commit indicator"
+    );
 }
 
 #[test]
