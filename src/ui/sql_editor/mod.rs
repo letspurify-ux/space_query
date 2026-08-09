@@ -574,6 +574,11 @@ pub enum QueryProgress {
     TransactionModeChanged {
         mode: TransactionMode,
     },
+    // A toolbar/menu Commit or Rollback action finished (successfully or
+    // not). The retained session's state may have changed either way, so
+    // controls gated on it — e.g. the transaction-mode choices, disabled
+    // while the session is mid-transaction — must re-sync.
+    TransactionActionFinished,
     ConnectionChanged {
         info: Option<ConnectionInfo>,
     },
@@ -4281,42 +4286,53 @@ impl SqlEditorWidget {
                                 token,
                                 action,
                                 result,
-                            } => match result {
-                                Ok(()) => {
-                                    let progress_sender = token.map_or_else(
-                                        || widget.progress_sender.clone(),
-                                        |token| widget.progress_sender.for_operation(token),
-                                    );
-                                    let _ = progress_sender.send(QueryProgress::Message {
-                                        kind: ResultMessageKind::Info,
-                                        lines: vec![action.success_message().to_string()],
-                                    });
-                                    if token.is_none_or(|token| {
-                                        widget.operation_token_is_current_or_completed(token)
-                                    }) {
-                                        widget.emit_status(action.success_status());
+                            } => {
+                                match result {
+                                    Ok(()) => {
+                                        let progress_sender = token.map_or_else(
+                                            || widget.progress_sender.clone(),
+                                            |token| widget.progress_sender.for_operation(token),
+                                        );
+                                        let _ = progress_sender.send(QueryProgress::Message {
+                                            kind: ResultMessageKind::Info,
+                                            lines: vec![action.success_message().to_string()],
+                                        });
+                                        if token.is_none_or(|token| {
+                                            widget.operation_token_is_current_or_completed(token)
+                                        }) {
+                                            widget.emit_status(action.success_status());
+                                        }
+                                    }
+                                    Err(err) => {
+                                        let progress_sender = token.map_or_else(
+                                            || widget.progress_sender.clone(),
+                                            |token| widget.progress_sender.for_operation(token),
+                                        );
+                                        let _ = progress_sender.send(QueryProgress::Message {
+                                            kind: ResultMessageKind::Error,
+                                            lines: vec![format!(
+                                                "{}: {}",
+                                                action.failure_message_prefix(),
+                                                err
+                                            )],
+                                        });
+                                        if token.is_none_or(|token| {
+                                            widget.operation_token_is_current_or_completed(token)
+                                        }) {
+                                            widget.emit_status(action.failure_status());
+                                        }
                                     }
                                 }
-                                Err(err) => {
-                                    let progress_sender = token.map_or_else(
-                                        || widget.progress_sender.clone(),
-                                        |token| widget.progress_sender.for_operation(token),
-                                    );
-                                    let _ = progress_sender.send(QueryProgress::Message {
-                                        kind: ResultMessageKind::Error,
-                                        lines: vec![format!(
-                                            "{}: {}",
-                                            action.failure_message_prefix(),
-                                            err
-                                        )],
-                                    });
-                                    if token.is_none_or(|token| {
-                                        widget.operation_token_is_current_or_completed(token)
-                                    }) {
-                                        widget.emit_status(action.failure_status());
-                                    }
-                                }
-                            },
+                                // Success resolved the retained transaction and
+                                // failure may have restored or discarded the
+                                // session — either way the boundary-gated
+                                // controls (transaction-mode choices) must
+                                // re-sync from the new retained state.
+                                let _ = widget
+                                    .progress_sender
+                                    .send(QueryProgress::TransactionActionFinished);
+                                app::awake();
+                            }
                             UiActionResult::Cancel { token, outcome } => {
                                 let _ = widget
                                     .progress_sender

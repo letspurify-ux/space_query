@@ -196,6 +196,37 @@ impl Harness {
             .transaction_mode()
     }
 
+    /// Toolbar Rollback button (async transaction action), pumped to
+    /// completion — distinct from a typed ROLLBACK statement.
+    fn toolbar_rollback(&mut self) {
+        let before = self
+            .editor
+            .pooled_session_activity_snapshot()
+            .map(|s| s.retained_state());
+        self.editor.rollback();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while Instant::now() < deadline {
+            if !app::wait() {
+                app::check();
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            let now = self
+                .editor
+                .pooled_session_activity_snapshot()
+                .map(|s| s.retained_state());
+            if now != before {
+                break;
+            }
+        }
+        let drain = Instant::now() + Duration::from_millis(500);
+        while Instant::now() < drain {
+            if !app::wait() {
+                app::check();
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        }
+    }
+
     fn select_v(&mut self) -> Result<i64, String> {
         let capture = self.run("SELECT V FROM SQ_TM_T")?;
         let from_streamed = capture.rows.first().and_then(|row| row.last()).cloned();
@@ -498,6 +529,43 @@ fn run_scenarios(target: Target, h: &mut Harness) -> Result<(), String> {
                 .replace(['-', '_'], " ")
                 .eq_ignore_ascii_case("READ COMMITTED"),
             format!("trx_isolation_level = {isolation:?}"),
+        );
+        h.run("ROLLBACK")?;
+        h.editor.clear_tab_transaction_mode_override();
+    }
+
+    // ---- S6 (Oracle): query, TOOLBAR rollback, then a query-driven
+    //      transaction-mode change must not hit ORA-01453 "SET TRANSACTION
+    //      must be first statement of transaction" ------------------------------
+    if target.is_oracle() {
+        println!("  --- S6 query -> toolbar Rollback -> query-driven SET TRANSACTION ---");
+        // A non-default tab mode makes the app prepend SET TRANSACTION at every
+        // execution start; the SELECT then leaves that transaction open on the
+        // retained session. The toolbar Rollback (async action, distinct from a
+        // typed ROLLBACK statement) must actually close it, or the next
+        // user SET TRANSACTION is not the first statement -> ORA-01453.
+        h.editor.set_tab_transaction_mode(TransactionMode::new(
+            TransactionIsolation::Serializable,
+            TransactionAccessMode::ReadWrite,
+        ));
+        h.run("SELECT V FROM SQ_TM_T")?;
+        h.toolbar_rollback();
+        let capture = h.run("SET TRANSACTION READ ONLY")?;
+        let refused = capture
+            .results
+            .iter()
+            .any(|r| !r.success && r.message.to_ascii_uppercase().contains("ORA-01453"));
+        h.check(
+            "S6 query-driven SET TRANSACTION after toolbar Rollback is not ORA-01453",
+            !refused,
+            format!(
+                "results: {:?}",
+                capture
+                    .results
+                    .iter()
+                    .map(|r| (r.success, r.message.clone()))
+                    .collect::<Vec<_>>()
+            ),
         );
         h.run("ROLLBACK")?;
         h.editor.clear_tab_transaction_mode_override();

@@ -4624,6 +4624,7 @@ pub(crate) fn result_pane_routes_for_progress_with_script_context(
         | QueryProgress::LazyFetchCancelFailed { .. }
         | QueryProgress::AutoCommitChanged { .. }
         | QueryProgress::TransactionModeChanged { .. }
+        | QueryProgress::TransactionActionFinished
         | QueryProgress::ConnectionChanged { .. }
         | QueryProgress::DatabaseChanged { .. }
         | QueryProgress::ScopeChangedNotice { .. }
@@ -10311,6 +10312,14 @@ impl MainWindow {
                     }
                     drop(s);
                 }
+                QueryProgress::TransactionActionFinished => {
+                    // A Commit or Rollback resolved (or restored/discarded) the
+                    // retained session. The transaction-mode controls are gated
+                    // on that state — disabled while a transaction is open — so
+                    // they must re-sync now that the boundary has moved.
+                    s.sync_transaction_mode_controls();
+                    drop(s);
+                }
                 QueryProgress::ConnectionChanged { info } => {
                     if let Some(info) = info {
                         if let Some(runtime) = s
@@ -10838,6 +10847,18 @@ impl MainWindow {
                         owning_result_tabs.mark_statement_cancelled_by_id(result_tab_id);
                     }
                     s.finish_progress_context(tab_id);
+                    // Every execution ends here on every driver. The
+                    // transaction-mode controls are disabled while a query
+                    // runs and only best-effort updated mid-batch (the
+                    // connection mutex may be momentarily held by the worker),
+                    // so a query-driven session-mode change — SET SESSION
+                    // TRANSACTION ... / ALTER SESSION SET ISOLATION_LEVEL ... —
+                    // would otherwise leave the toolbar stale and greyed. The
+                    // query is already marked idle before BatchFinished is
+                    // emitted, so this re-sync reactivates the controls and
+                    // shows the adopted mode, and refreshes the recorded
+                    // displayed mode that the next execution cross-checks.
+                    s.sync_transaction_mode_controls();
                     let should_trim = !s.is_any_query_running();
                     let mut result_tabs = owning_result_tabs.clone();
                     drop(s);

@@ -32866,6 +32866,7 @@ mod mysql_batch_execution_regression_tests {
                 QueryProgress::TransactionModeChanged { mode } => {
                     format!("TransactionModeChanged({})", mode.label())
                 }
+                QueryProgress::TransactionActionFinished => "TransactionActionFinished".to_string(),
                 QueryProgress::ConnectionChanged { info } => format!(
                     "ConnectionChanged({})",
                     info.as_ref()
@@ -33116,6 +33117,7 @@ mod mysql_batch_execution_regression_tests {
                 | QueryProgress::LazyFetchCancelFailed { .. }
                 | QueryProgress::AutoCommitChanged { .. }
                 | QueryProgress::TransactionModeChanged { .. }
+                | QueryProgress::TransactionActionFinished
                 | QueryProgress::ConnectionChanged { .. }
                 | QueryProgress::DatabaseChanged { .. }
                 | QueryProgress::ScopeChangedNotice { .. }

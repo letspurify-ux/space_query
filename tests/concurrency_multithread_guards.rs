@@ -2941,6 +2941,25 @@ fn transaction_mode_state_has_a_single_source_of_truth() {
         adoption_calls >= 4,
         "the MySQL, Oracle OCI, and Oracle thin batch loops must all adopt session transaction-mode changes (definition + at least 3 call sites, found {adoption_calls})"
     );
+
+    // (6) The controls are disabled while a query runs and only best-effort
+    // synced mid-batch (the connection mutex may be momentarily held), so the
+    // universal BatchFinished handler MUST re-sync them: without it a
+    // query-driven session-mode change leaves the toolbar stale and greyed
+    // after the query completes. This is the backstop that makes the UI match
+    // the DB regardless of mid-batch lock contention.
+    let batch_finished_at = main_window
+        .find("QueryProgress::BatchFinished => {")
+        .expect("BatchFinished handler should exist");
+    let batch_finished_end = main_window[batch_finished_at..]
+        .find("let should_trim = !s.is_any_query_running();")
+        .map(|offset| batch_finished_at + offset)
+        .expect("non-lazy BatchFinished path should compute should_trim");
+    let batch_finished_body = &main_window[batch_finished_at..batch_finished_end];
+    assert!(
+        batch_finished_body.contains("s.sync_transaction_mode_controls();"),
+        "the non-lazy BatchFinished handler must re-sync the transaction-mode controls so a query-driven change is reflected after completion"
+    );
 }
 
 #[test]
