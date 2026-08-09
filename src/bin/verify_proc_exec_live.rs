@@ -160,7 +160,8 @@ impl Target {
 
 fn progress_inner(event: &QueryProgress) -> &QueryProgress {
     match event {
-        QueryProgress::Operation { progress, .. } => progress_inner(progress),
+        QueryProgress::Operation { progress, .. }
+        | QueryProgress::StatementOrigin { progress, .. } => progress_inner(progress),
         other => other,
     }
 }

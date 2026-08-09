@@ -998,7 +998,7 @@ struct TransactionActionRequest<'a> {
     current_oracle_thin_cancel_context: &'a Arc<Mutex<Option<OracleThinCancelHandle>>>,
     current_query_cancel_handle: &'a Arc<Mutex<Option<QueryCancelHandle>>>,
     current_mysql_cancel_context: &'a Arc<Mutex<Option<MySqlQueryCancelContext>>>,
-    mysql_auto_commit_override: &'a Arc<Mutex<Option<bool>>>,
+    tab_auto_commit_override: &'a Arc<Mutex<Option<bool>>>,
     cancel_flag: &'a Arc<Mutex<bool>>,
     query_timeout: Option<Duration>,
     activity_label: &'static str,
@@ -1530,7 +1530,7 @@ impl TransactionActionBackend for MysqlTransactionActionBackend {
             session_pool_sender,
             current_query_cancel_handle,
             current_mysql_cancel_context,
-            mysql_auto_commit_override,
+            tab_auto_commit_override,
             cancel_flag,
             query_timeout,
             activity_label,
@@ -1539,9 +1539,9 @@ impl TransactionActionBackend for MysqlTransactionActionBackend {
             ..
         } = request;
 
-        let auto_commit = SqlEditorWidget::mysql_auto_commit_for_execution(
+        let auto_commit = SqlEditorWidget::auto_commit_for_execution(
             conn_guard.auto_commit(),
-            mysql_auto_commit_override,
+            tab_auto_commit_override,
         );
         let db_type = conn_guard.db_type();
         let execution_scope = pooled_db_session
@@ -1997,7 +1997,13 @@ pub struct SqlEditorWidget {
     current_operation_autocommit: Arc<Mutex<bool>>,
     current_cancel_operation: Arc<Mutex<Option<CancelOperationMetadata>>>,
     current_mysql_cancel_context: Arc<Mutex<Option<MySqlQueryCancelContext>>>,
-    mysql_auto_commit_override: Arc<Mutex<Option<bool>>>,
+    tab_auto_commit_override: Arc<Mutex<Option<bool>>>,
+    /// The effective auto-commit value this tab's UI last displayed (status
+    /// bar), or `None` while nothing has been shown. Execution startup
+    /// cross-checks its own resolution against this and refuses to run on a
+    /// mismatch, so a statement can never behave differently from what the
+    /// screen said.
+    ui_displayed_auto_commit: Arc<Mutex<Option<bool>>>,
     pending_result_edit_request: Arc<Mutex<Option<crate::db::ResultEditRequest>>>,
     /// The last answer given for each bind placeholder in this tab, replayed
     /// into the prompt on the next run. Kept out of `SessionState` on purpose:
@@ -2223,9 +2229,9 @@ impl SqlEditorWidget {
             (
                 conn_guard.db_type(),
                 conn_guard.connection_generation(),
-                Self::mysql_auto_commit_for_execution(
+                Self::auto_commit_for_execution(
                     conn_guard.auto_commit(),
-                    &self.mysql_auto_commit_override,
+                    &self.tab_auto_commit_override,
                 ),
             )
         };
@@ -2336,18 +2342,45 @@ impl SqlEditorWidget {
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = enabled;
     }
 
-    fn follow_global_mysql_auto_commit_setting(
-        mysql_auto_commit_override: &Arc<Mutex<Option<bool>>>,
+    fn follow_global_auto_commit_setting(
+        tab_auto_commit_override: &Arc<Mutex<Option<bool>>>,
         current_operation_autocommit: &Arc<Mutex<bool>>,
         enabled: bool,
     ) {
-        store_mutex_bool_option(mysql_auto_commit_override, None);
+        store_mutex_bool_option(tab_auto_commit_override, None);
         Self::update_current_operation_autocommit(current_operation_autocommit, enabled);
     }
 
-    pub(crate) fn sync_mysql_auto_commit_with_global_setting(&self, enabled: bool) {
-        Self::follow_global_mysql_auto_commit_setting(
-            &self.mysql_auto_commit_override,
+    pub(crate) fn tab_auto_commit_override_value(&self) -> Option<bool> {
+        load_mutex_bool_option(&self.tab_auto_commit_override)
+    }
+
+    /// The menu-toggle write path: pins this tab's auto-commit, exactly like a
+    /// script `SET AUTOCOMMIT` does.
+    pub(crate) fn set_tab_auto_commit(&self, enabled: bool) {
+        store_mutex_bool_option(&self.tab_auto_commit_override, Some(enabled));
+        Self::update_current_operation_autocommit(&self.current_operation_autocommit, enabled);
+    }
+
+    pub(crate) fn has_open_lazy_fetch(&self) -> bool {
+        Self::has_active_lazy_fetch(&self.active_lazy_fetch)
+    }
+
+    /// Called by the status bar with the effective auto-commit it just
+    /// displayed for this tab (`None` when nothing is shown, e.g. while
+    /// disconnected). Execution startup refuses to run when its own
+    /// resolution disagrees with this value.
+    pub(crate) fn record_displayed_auto_commit(&self, displayed: Option<bool>) {
+        store_mutex_bool_option(&self.ui_displayed_auto_commit, displayed);
+    }
+
+    /// Clears the tab's pinned auto-commit so it falls back to the connection
+    /// birth default. The GUI no longer does this anywhere (the menu toggle is
+    /// tab-scoped); public so the live verification harness can reset a tab
+    /// between scenarios.
+    pub fn sync_tab_auto_commit_with_global_setting(&self, enabled: bool) {
+        Self::follow_global_auto_commit_setting(
+            &self.tab_auto_commit_override,
             &self.current_operation_autocommit,
             enabled,
         );
@@ -2867,7 +2900,8 @@ impl SqlEditorWidget {
         let current_operation_autocommit = Arc::new(Mutex::new(true));
         let current_cancel_operation = Arc::new(Mutex::new(None));
         let current_mysql_cancel_context = Arc::new(Mutex::new(None));
-        let mysql_auto_commit_override = Arc::new(Mutex::new(None));
+        let tab_auto_commit_override = Arc::new(Mutex::new(None));
+        let ui_displayed_auto_commit = Arc::new(Mutex::new(None));
         let pending_result_edit_request = Arc::new(Mutex::new(None));
         let last_bind_prompt_values = Arc::new(Mutex::new(HashMap::new()));
         let cancel_flag = Arc::new(Mutex::new(false));
@@ -2948,7 +2982,8 @@ impl SqlEditorWidget {
             current_operation_autocommit,
             current_cancel_operation,
             current_mysql_cancel_context,
-            mysql_auto_commit_override,
+            tab_auto_commit_override,
+            ui_displayed_auto_commit,
             pending_result_edit_request,
             last_bind_prompt_values,
             cancel_flag,
@@ -4700,7 +4735,7 @@ impl SqlEditorWidget {
         let current_query_connection = self.current_query_connection.clone();
         let current_oracle_thin_cancel_context = self.current_oracle_thin_cancel_context.clone();
         let current_mysql_cancel_context = self.current_mysql_cancel_context.clone();
-        let mysql_auto_commit_override = self.mysql_auto_commit_override.clone();
+        let tab_auto_commit_override = self.tab_auto_commit_override.clone();
         let cancel_flag = self.cancel_flag.clone();
         let pooled_db_session = self.pooled_db_session.clone();
         let active_lazy_fetch = self.active_lazy_fetch.clone();
@@ -4758,7 +4793,7 @@ impl SqlEditorWidget {
                             current_oracle_thin_cancel_context: &current_oracle_thin_cancel_context,
                             current_query_cancel_handle: &current_query_cancel_handle,
                             current_mysql_cancel_context: &current_mysql_cancel_context,
-                            mysql_auto_commit_override: &mysql_auto_commit_override,
+                            tab_auto_commit_override: &tab_auto_commit_override,
                             cancel_flag: &cancel_flag,
                             query_timeout,
                             activity_label,
@@ -6369,20 +6404,20 @@ mod execution_state_tests {
 
     #[test]
     fn global_auto_commit_sync_clears_tab_override() {
-        let mysql_auto_commit_override = Arc::new(Mutex::new(Some(false)));
+        let tab_auto_commit_override = Arc::new(Mutex::new(Some(false)));
         let current_operation_autocommit = Arc::new(Mutex::new(false));
 
-        SqlEditorWidget::follow_global_mysql_auto_commit_setting(
-            &mysql_auto_commit_override,
+        SqlEditorWidget::follow_global_auto_commit_setting(
+            &tab_auto_commit_override,
             &current_operation_autocommit,
             true,
         );
 
-        assert_eq!(load_mutex_bool_option(&mysql_auto_commit_override), None);
+        assert_eq!(load_mutex_bool_option(&tab_auto_commit_override), None);
         assert!(load_mutex_bool(&current_operation_autocommit));
-        assert!(SqlEditorWidget::mysql_auto_commit_for_execution(
+        assert!(SqlEditorWidget::auto_commit_for_execution(
             true,
-            &mysql_auto_commit_override
+            &tab_auto_commit_override
         ));
     }
 

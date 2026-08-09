@@ -288,7 +288,10 @@ Script execution uses a dedicated parser and retained session state rather
 than splitting text on every semicolon. Oracle bind variables, `PRINT`, and ref
 cursors can produce results; MySQL/MariaDB `SHOW`, `DESC`, and `EXPLAIN`
 statements are also handled as result sets. **Tools > Auto-Commit** controls
-automatic transaction commits for the active connection.
+automatic transaction commits for the active query tab: the menu toggle and a
+script `SET AUTOCOMMIT` do the same thing, every new tab starts with
+auto-commit off, and the checkbox and the status bar both always show the
+value the current tab will actually run with.
 
 <details>
 <summary>Supported script and tool commands</summary>

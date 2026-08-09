@@ -586,6 +586,9 @@ impl MenuBarBuilder {
             MenuFlag::MenuDivider,
             forward_menu_callback,
         );
+        // Auto-commit is tab-scoped and every tab starts OFF, so the item
+        // starts unchecked; `sync_auto_commit_indicators` keeps it tracking
+        // the active tab afterwards.
         menu.add(
             "&Tools/&Auto-Commit",
             Shortcut::None,

@@ -1569,13 +1569,18 @@ fn regression_04_global_transaction_options_validate_and_update_retained_session
     let auto_branch = &content[auto_start..auto_end];
     let auto_validate = auto_branch
         .find("retained_plan.validate_transaction_option_change(\"auto-commit\")")
-        .expect("auto-commit change should validate retained sessions");
+        .expect("auto-commit change should validate the tab's retained session");
+    // Tab-scoped: the toggle pins the active tab, never the shared connection.
     let auto_set = auto_branch
-        .find("connection.set_auto_commit(enabled)")
-        .expect("auto-commit change should call the connection setter");
+        .find("editor.set_tab_auto_commit(enabled)")
+        .expect("auto-commit change should pin the active tab's value");
     assert!(
         auto_validate < auto_set && auto_branch.contains("retained_plan.apply_auto_commit"),
-        "auto-commit changes must validate retained sessions before the global setter and then propagate to clean retained sessions"
+        "auto-commit changes must validate the tab's retained session before pinning the tab value and then propagate to its retained session"
+    );
+    assert!(
+        !auto_branch.contains("connection.set_auto_commit("),
+        "the menu toggle must not mutate the shared connection's auto-commit flag"
     );
 }
 
@@ -2704,13 +2709,179 @@ fn mysql_script_autocommit_changes_are_tab_local() {
 
     assert!(
         autocommit_branch
-            .contains("store_mutex_bool_option(mysql_auto_commit_override, Some(enabled))"),
+            .contains("store_mutex_bool_option(tab_auto_commit_override, Some(enabled))"),
         "MySQL/MariaDB script autocommit state should be stored on the editor tab"
     );
     assert!(
         !autocommit_branch.contains("conn_guard.set_auto_commit(enabled)"),
         "MySQL/MariaDB script autocommit changes must not mutate the shared connection default for other tabs"
     );
+}
+
+#[test]
+fn auto_commit_state_has_a_single_source_of_truth() {
+    // Screen = in-memory = applied server state, per connection. Every layer
+    // must resolve the effective auto-commit through the same function chain;
+    // a layer that re-derives it on its own can drift from what a statement
+    // actually does.
+    let execution = fs::read_to_string(
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("src/ui/sql_editor/execution.rs"),
+    )
+    .expect("read execution.rs");
+    let main_window =
+        fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("src/ui/main_window.rs"))
+            .expect("read main_window.rs");
+    let connection =
+        fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("src/db/connection.rs"))
+            .expect("read connection.rs");
+    let normalize = |text: &str| text.split_whitespace().collect::<String>();
+
+    // (1) The status-bar indicator resolves through the shared resolver, so
+    // the screen can never disagree with what execution will do.
+    let label_start = main_window
+        .find("fn auto_commit_status_label(")
+        .expect("status-bar auto-commit label helper should exist");
+    let label_body = &main_window[label_start..label_start + 1200];
+    assert!(
+        label_body.contains("SqlEditorWidget::effective_auto_commit"),
+        "the status-bar label must resolve through SqlEditorWidget::effective_auto_commit"
+    );
+
+    // (2) The per-tab execution resolution delegates to the same resolver.
+    let resolver_start = execution
+        .find("pub(super) fn auto_commit_for_execution(")
+        .expect("auto_commit_for_execution should exist");
+    let resolver_body = &execution[resolver_start..resolver_start + 600];
+    assert!(
+        resolver_body.contains("Self::effective_auto_commit("),
+        "auto_commit_for_execution must delegate to effective_auto_commit"
+    );
+
+    // (3) The worker startup reads the connection default only through the
+    // resolver (connection flag + tab override in one place).
+    assert!(
+        normalize(&execution).contains(&normalize(
+            "let auto_commit = SqlEditorWidget::auto_commit_for_execution( conn_guard.auto_commit(), &tab_auto_commit_override, );"
+        )),
+        "execution startup must resolve the effective auto-commit via auto_commit_for_execution"
+    );
+
+    // (4) The MySQL live (metadata-only) connection is pinned to autocommit=1;
+    // user SQL runs on pooled sessions which re-apply the logical setting on
+    // every acquisition. Without the pin, metadata reads under autocommit=0
+    // leave an implicitly opened transaction that permanently refuses the
+    // auto-commit toggle.
+    assert!(
+        normalize(&connection).contains(&normalize(
+            "DatabaseConnection::apply_mysql_autocommit_setting_for_db_type( &mut conn, true, self.db_type, )?;"
+        )),
+        "MysqlBackend::connect must pin the live metadata connection to autocommit=1"
+    );
+    let mysql_backend_impl = connection
+        .find("impl DbBackend for MysqlBackend")
+        .expect("MysqlBackend backend impl should exist");
+    let apply_start = connection[mysql_backend_impl..]
+        .find("fn apply_auto_commit(")
+        .map(|offset| mysql_backend_impl + offset)
+        .expect("MysqlBackend apply_auto_commit should exist");
+    let apply_end = connection[apply_start..]
+        .find("\n    fn ")
+        .map(|offset| apply_start + offset)
+        .expect("another method should follow MysqlBackend apply_auto_commit");
+    let apply_body = &connection[apply_start..apply_end];
+    assert!(
+        !apply_body.contains("apply_mysql_autocommit_setting_for_db_type"),
+        "toggling auto-commit must not flip the live metadata connection; pooled sessions carry the setting"
+    );
+
+    // (5) Every path that can change the active connection re-syncs the menu
+    // checkmark and the status-bar cache from the connection's actual flag.
+    let refresh_start = main_window
+        .find("fn refresh_connection_dependent_controls(")
+        .expect("refresh_connection_dependent_controls should exist");
+    let refresh_body = &main_window[refresh_start..refresh_start + 2500];
+    assert!(
+        refresh_body.contains("self.sync_auto_commit_indicators()"),
+        "connection-dependent control refresh must re-sync the auto-commit indicators"
+    );
+
+    // (5b) The menu toggle is tab-scoped like a script SET AUTOCOMMIT: it
+    // pins the active tab and never mutates the shared connection flag.
+    let menu_handler_start = main_window
+        .find("\"Tools/Auto-Commit\" => {")
+        .expect("Tools/Auto-Commit handler should exist");
+    let menu_handler_end = main_window[menu_handler_start..]
+        .find("\"Settings/Preferences\" => {")
+        .map(|offset| menu_handler_start + offset)
+        .expect("Preferences handler should follow Tools/Auto-Commit");
+    let menu_handler = &main_window[menu_handler_start..menu_handler_end];
+    assert!(
+        menu_handler.contains("set_tab_auto_commit("),
+        "the menu toggle must pin the active tab's auto-commit"
+    );
+    assert!(
+        !menu_handler.contains(".set_auto_commit("),
+        "the menu toggle must not mutate the shared connection's auto-commit flag"
+    );
+
+    // (6) Execution startup cross-checks the value it resolved against the
+    // value the status bar displayed, and refuses to run on a mismatch. The
+    // check sits before the backend dispatch, so one checkpoint covers Oracle
+    // thin, Oracle OCI, MySQL, and MariaDB alike.
+    let resolve_at = execution
+        .find("let auto_commit = SqlEditorWidget::auto_commit_for_execution(")
+        .expect("worker startup resolution should exist");
+    let dispatch_at = execution[resolve_at..]
+        .find("begin_execution_worker(")
+        .map(|offset| resolve_at + offset)
+        .expect("backend dispatch should follow the resolution");
+    let between = &execution[resolve_at..dispatch_at];
+    assert!(
+        between.contains("auto_commit_display_mismatch_error("),
+        "execution startup must verify the displayed auto-commit before dispatching to any backend"
+    );
+    assert!(
+        between.contains("emit_execution_startup_error("),
+        "an auto-commit display mismatch must refuse the execution, not just log"
+    );
+}
+
+#[test]
+fn script_autocommit_changes_are_tab_local_for_all_backends() {
+    let file = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/ui/sql_editor/execution.rs");
+    let content = fs::read_to_string(&file)
+        .unwrap_or_else(|err| panic!("failed to read source file {}: {err}", file.display()));
+
+    let marker = "ToolCommand::SetAutoCommit { enabled } =>";
+    let branch_starts: Vec<usize> = content
+        .match_indices(marker)
+        .map(|(index, _)| index)
+        .collect();
+    assert_eq!(
+        branch_starts.len(),
+        3,
+        "expected exactly the MySQL, Oracle OCI, and Oracle thin SET AUTOCOMMIT branches"
+    );
+    for start in branch_starts {
+        let rest = &content[start..];
+        let end = rest[marker.len()..]
+            .find("ToolCommand::")
+            .map(|offset| offset + marker.len())
+            .expect("another ToolCommand branch should follow SET AUTOCOMMIT");
+        let branch = &rest[..end];
+        assert!(
+            branch.contains("store_mutex_bool_option("),
+            "every SET AUTOCOMMIT branch must store the change as the editor tab's override: {branch}"
+        );
+        assert!(
+            branch.contains("_option_change_allowed"),
+            "every SET AUTOCOMMIT branch must refuse while the session may hold uncommitted work: {branch}"
+        );
+        assert!(
+            !branch.contains(".set_auto_commit(enabled)"),
+            "script autocommit changes must not mutate the shared connection default for other tabs: {branch}"
+        );
+    }
 }
 
 #[test]

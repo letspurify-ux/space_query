@@ -508,7 +508,7 @@ struct ExecutionWorkerContext<'a> {
     sql_text: &'a str,
     result_edit_request: Option<crate::db::ResultEditRequest>,
     pooled_db_session: &'a SharedDbSessionLease,
-    mysql_auto_commit_override: &'a Arc<Mutex<Option<bool>>>,
+    tab_auto_commit_override: &'a Arc<Mutex<Option<bool>>>,
     active_lazy_fetch: &'a Arc<Mutex<Option<LazyFetchHandle>>>,
     next_lazy_fetch_session_id: &'a Arc<AtomicU64>,
     current_oracle_thin_cancel_context: &'a Arc<Mutex<Option<OracleThinCancelHandle>>>,
@@ -591,6 +591,7 @@ impl ExecutionWorkerBackend for OracleExecutionWorkerBackend {
             sender,
             sql_text,
             pooled_db_session,
+            tab_auto_commit_override,
             active_lazy_fetch,
             next_lazy_fetch_session_id,
             current_oracle_thin_cancel_context,
@@ -835,7 +836,13 @@ impl ExecutionWorkerBackend for OracleExecutionWorkerBackend {
                 candidate.connection,
                 candidate.connection_generation,
                 candidate.pool_context_epoch,
-                candidate.auto_commit,
+                // Like SQL*Plus, a tab-level SET AUTOCOMMIT survives switching
+                // connections: resolve the new connection's default through
+                // the tab override instead of adopting it verbatim.
+                SqlEditorWidget::effective_auto_commit(
+                    candidate.auto_commit,
+                    load_mutex_bool_option(tab_auto_commit_override),
+                ),
                 candidate.transaction_mode,
                 None,
                 candidate.binding_revision,
@@ -1007,6 +1014,7 @@ impl ExecutionWorkerBackend for OracleExecutionWorkerBackend {
             selected_transaction_mode,
             db_activity,
             current_operation_autocommit,
+            Some(tab_auto_commit_override),
             query_timeout,
             Some((active_connection, connection_generation)),
             Some(&mut transition_context),
@@ -1095,7 +1103,7 @@ impl ExecutionWorkerBackend for MysqlExecutionWorkerBackend {
             sql_text,
             result_edit_request,
             pooled_db_session,
-            mysql_auto_commit_override,
+            tab_auto_commit_override,
             active_lazy_fetch,
             next_lazy_fetch_session_id,
             current_query_cancel_handle,
@@ -1189,7 +1197,7 @@ impl ExecutionWorkerBackend for MysqlExecutionWorkerBackend {
             &conn_name,
             &session,
             pooled_db_session,
-            mysql_auto_commit_override,
+            tab_auto_commit_override,
             active_lazy_fetch,
             next_lazy_fetch_session_id,
             current_mysql_cancel_context,
@@ -6524,11 +6532,45 @@ impl SqlEditorWidget {
         );
     }
 
-    pub(super) fn mysql_auto_commit_for_execution(
+    /// The single resolution rule for the effective auto-commit of a tab.
+    /// Execution paths and the status-bar indicator must both go through
+    /// here so what the screen shows is exactly what a statement will do.
+    pub(crate) fn effective_auto_commit(
         global_auto_commit: bool,
-        mysql_auto_commit_override: &Arc<Mutex<Option<bool>>>,
+        tab_auto_commit_override: Option<bool>,
     ) -> bool {
-        load_mutex_bool_option(mysql_auto_commit_override).unwrap_or(global_auto_commit)
+        tab_auto_commit_override.unwrap_or(global_auto_commit)
+    }
+
+    pub(super) fn auto_commit_for_execution(
+        global_auto_commit: bool,
+        tab_auto_commit_override: &Arc<Mutex<Option<bool>>>,
+    ) -> bool {
+        Self::effective_auto_commit(
+            global_auto_commit,
+            load_mutex_bool_option(tab_auto_commit_override),
+        )
+    }
+
+    /// Defense-in-depth for the screen/behavior contract: `displayed` is the
+    /// effective auto-commit the status bar last showed for this tab; refuse
+    /// to execute when the value about to be applied differs. `None` (nothing
+    /// displayed — harness runs, or the indicator hidden while disconnected)
+    /// skips the check.
+    pub(super) fn auto_commit_display_mismatch_error(
+        displayed: Option<bool>,
+        resolved: bool,
+    ) -> Option<String> {
+        let displayed = displayed?;
+        (displayed != resolved).then(|| {
+            let onoff = |value: bool| if value { "on" } else { "off" };
+            format!(
+                "Auto-commit state mismatch: the status bar showed auto-commit {} but this execution would run with auto-commit {}. \
+                 Nothing was executed; the indicator has been corrected — run the statement again.",
+                onoff(displayed),
+                onoff(resolved)
+            )
+        })
     }
 
     #[cfg(test)]
@@ -6865,7 +6907,7 @@ impl SqlEditorWidget {
         conn_name: &str,
         session: &Arc<Mutex<SessionState>>,
         pooled_db_session: &SharedDbSessionLease,
-        mysql_auto_commit_override: &Arc<Mutex<Option<bool>>>,
+        tab_auto_commit_override: &Arc<Mutex<Option<bool>>>,
         active_lazy_fetch: &Arc<Mutex<Option<LazyFetchHandle>>>,
         next_lazy_fetch_session_id: &Arc<AtomicU64>,
         current_mysql_cancel_context: &Arc<Mutex<Option<MySqlQueryCancelContext>>>,
@@ -7408,7 +7450,7 @@ impl SqlEditorWidget {
                                         SqlEditorWidget::autocommit_feedback(enabled),
                                     );
                                     #[rustfmt::skip]
-                                    store_mutex_bool_option(mysql_auto_commit_override, Some(enabled));
+                                    store_mutex_bool_option(tab_auto_commit_override, Some(enabled));
                                     auto_commit = enabled;
                                     if let Some(operation_autocommit) = current_operation_autocommit
                                     {
@@ -8500,7 +8542,7 @@ impl SqlEditorWidget {
                             }
                             if let Some(enabled) = autocommit_change {
                                 #[rustfmt::skip]
-                                store_mutex_bool_option(mysql_auto_commit_override, Some(enabled));
+                                store_mutex_bool_option(tab_auto_commit_override, Some(enabled));
                                 auto_commit = enabled;
                                 if let Some(operation_autocommit) = current_operation_autocommit {
                                     SqlEditorWidget::update_current_operation_autocommit(
@@ -9360,9 +9402,9 @@ impl SqlEditorWidget {
                 return false;
             };
 
-            operation_autocommit = SqlEditorWidget::mysql_auto_commit_for_execution(
+            operation_autocommit = SqlEditorWidget::auto_commit_for_execution(
                 conn_guard.auto_commit(),
-                &self.mysql_auto_commit_override,
+                &self.tab_auto_commit_override,
             );
             operation_db_type = conn_guard.db_type();
             operation_connection_generation = conn_guard.connection_generation();
@@ -9451,7 +9493,8 @@ impl SqlEditorWidget {
         let current_operation_sql_kind = self.current_operation_sql_kind.clone();
         let current_operation_autocommit = self.current_operation_autocommit.clone();
         let current_cancel_operation = self.current_cancel_operation.clone();
-        let mysql_auto_commit_override = self.mysql_auto_commit_override.clone();
+        let tab_auto_commit_override = self.tab_auto_commit_override.clone();
+        let ui_displayed_auto_commit = self.ui_displayed_auto_commit.clone();
         let active_lazy_fetch = self.active_lazy_fetch.clone();
         let next_lazy_fetch_session_id = self.next_lazy_fetch_session_id.clone();
         let current_mysql_cancel_context = self.current_mysql_cancel_context.clone();
@@ -9546,10 +9589,32 @@ impl SqlEditorWidget {
                     String::new()
                 };
 
-                let auto_commit = SqlEditorWidget::mysql_auto_commit_for_execution(
+                let auto_commit = SqlEditorWidget::auto_commit_for_execution(
                     conn_guard.auto_commit(),
-                    &mysql_auto_commit_override,
+                    &tab_auto_commit_override,
                 );
+                if let Some(message) = SqlEditorWidget::auto_commit_display_mismatch_error(
+                    load_mutex_bool_option(&ui_displayed_auto_commit),
+                    auto_commit,
+                ) {
+                    // Self-heal so the corrected indicator lets the retry run.
+                    store_mutex_bool_option(&ui_displayed_auto_commit, Some(auto_commit));
+                    let _ = sender.send(QueryProgress::BatchStart {
+                        activity: db_activity.clone(),
+                        total_units: None,
+                        status_activity: None,
+                        sql: sql_text.clone(),
+                    });
+                    SqlEditorWidget::emit_execution_startup_error(
+                        &sender,
+                        script_mode,
+                        &sql_text,
+                        &conn_name,
+                        &message,
+                        Some(&tab_session),
+                    );
+                    return;
+                }
                 let selected_transaction_mode = conn_guard.transaction_mode();
                 let session = tab_session.clone();
 
@@ -9603,7 +9668,7 @@ impl SqlEditorWidget {
                         sql_text: &sql_text,
                         result_edit_request,
                         pooled_db_session: &pooled_db_session,
-                        mysql_auto_commit_override: &mysql_auto_commit_override,
+                        tab_auto_commit_override: &tab_auto_commit_override,
                         active_lazy_fetch: &active_lazy_fetch,
                         next_lazy_fetch_session_id: &next_lazy_fetch_session_id,
                         current_oracle_thin_cancel_context: &current_oracle_thin_cancel_context,
@@ -10849,39 +10914,27 @@ impl SqlEditorWidget {
                                         );
                                         command_error = true;
                                     } else {
-                                        let mut conn_guard = lock_connection_with_activity(
-                                            &shared_connection,
-                                            db_activity.clone(),
+                                        // Tab-scoped, like the MySQL branch: the script
+                                        // changes this tab's auto-commit without touching
+                                        // the shared connection default other tabs use.
+                                        store_mutex_bool_option(
+                                            &tab_auto_commit_override,
+                                            Some(enabled),
                                         );
-                                        match conn_guard.set_auto_commit(enabled) {
-                                            Ok(()) => {
-                                                auto_commit = enabled;
-                                                SqlEditorWidget::update_current_operation_autocommit(
-                                                    &current_operation_autocommit,
-                                                    enabled,
-                                                );
-                                                SqlEditorWidget::emit_script_message(
-                                                    &sender,
-                                                    &session,
-                                                    "SET AUTOCOMMIT",
-                                                    SqlEditorWidget::autocommit_feedback(enabled),
-                                                );
-                                                let _ = sender
-                                                    .send(QueryProgress::AutoCommitChanged {
-                                                        enabled,
-                                                    });
-                                                app::awake();
-                                            }
-                                            Err(message) => {
-                                                SqlEditorWidget::emit_script_message(
-                                                    &sender,
-                                                    &session,
-                                                    "SET AUTOCOMMIT",
-                                                    &format!("Error: {}", message),
-                                                );
-                                                command_error = true;
-                                            }
-                                        }
+                                        auto_commit = enabled;
+                                        SqlEditorWidget::update_current_operation_autocommit(
+                                            &current_operation_autocommit,
+                                            enabled,
+                                        );
+                                        SqlEditorWidget::emit_script_message(
+                                            &sender,
+                                            &session,
+                                            "SET AUTOCOMMIT",
+                                            SqlEditorWidget::autocommit_feedback(enabled),
+                                        );
+                                        let _ = sender
+                                            .send(QueryProgress::AutoCommitChanged { enabled });
+                                        app::awake();
                                     }
                                 }
                                 ToolCommand::SetDefine {
@@ -11258,6 +11311,11 @@ impl SqlEditorWidget {
                                             );
                                             conn_guard.connection_pool_size()
                                         };
+                                        // Auto-commit is tab-scoped: the fresh
+                                        // candidate keeps the birth value (off)
+                                        // and the tab's own SET AUTOCOMMIT —
+                                        // which survives CONNECT — resolves on
+                                        // top of it.
                                         let candidate_connection: crate::db::SharedConnection =
                                             Arc::new(Mutex::new(
                                                 crate::db::DatabaseConnection::new(),
@@ -11294,6 +11352,7 @@ impl SqlEditorWidget {
                                                     sanitized_conn_info,
                                                     next_conn_name,
                                                     next_connection_generation,
+                                                    next_auto_commit,
                                                 ) = {
                                                     let conn_guard =
                                                         lock_connection_with_activity(
@@ -11307,6 +11366,7 @@ impl SqlEditorWidget {
                                                         ),
                                                         conn_guard.get_info().name.clone(),
                                                         conn_guard.connection_generation(),
+                                                        conn_guard.auto_commit(),
                                                     )
                                                 };
                                                 let Some(prepared_conn) =
@@ -11468,6 +11528,22 @@ impl SqlEditorWidget {
                                                     next_connection_generation;
                                                 conn_opt = next_conn_opt;
                                                 conn_name = next_conn_name;
+                                                // Like the thin CONNECT path: a
+                                                // tab-level SET AUTOCOMMIT survives
+                                                // switching connections, so resolve
+                                                // the new connection's default through
+                                                // the tab override for the rest of
+                                                // this batch.
+                                                auto_commit = Self::effective_auto_commit(
+                                                    next_auto_commit,
+                                                    load_mutex_bool_option(
+                                                        &tab_auto_commit_override,
+                                                    ),
+                                                );
+                                                SqlEditorWidget::update_current_operation_autocommit(
+                                                    &current_operation_autocommit,
+                                                    auto_commit,
+                                                );
                                                 // Update cancel connection so break_execution() uses the new connection
                                                 SqlEditorWidget::set_current_query_connection(
                                                     &current_query_connection,
@@ -11966,7 +12042,16 @@ impl SqlEditorWidget {
                                 result.execution_time = timing_duration;
                                 let result_success = result.success;
                                 if result_success {
-                                    cleanup.clear_oracle_pooled_session_maybe_dirty();
+                                    // Record the statement effects like the generic
+                                    // path does; clearing the dirty flags alone is
+                                    // not enough, because cleanup otherwise falls
+                                    // back to the lease's pre-batch (dirty) state
+                                    // and the tab keeps prompting for a commit
+                                    // that already happened.
+                                    SqlEditorWidget::apply_oracle_db_statement_effects(
+                                        &mut cleanup,
+                                        statement_effects,
+                                    );
                                 }
                                 if script_mode {
                                     if result_success {
@@ -12052,7 +12137,12 @@ impl SqlEditorWidget {
                                 result.execution_time = timing_duration;
                                 let result_success = result.success;
                                 if result_success {
-                                    cleanup.clear_oracle_pooled_session_maybe_dirty();
+                                    // Same as the COMMIT branch above: record the
+                                    // effects so cleanup sees the resolved state.
+                                    SqlEditorWidget::apply_oracle_db_statement_effects(
+                                        &mut cleanup,
+                                        statement_effects,
+                                    );
                                 }
                                 if script_mode {
                                     if result_success {
@@ -14243,6 +14333,18 @@ impl SqlEditorWidget {
         app::awake();
     }
 
+    // The wire flag piggybacks a server-side commit on the execute message, so
+    // it must stay off for the statements the OCI path excludes from its
+    // client-side auto-commit (SAVEPOINT, SET TRANSACTION, LOCK TABLE, ...):
+    // committing there would resolve unrelated prior work the statement was
+    // meant to preserve.
+    fn oracle_thin_effective_auto_commit(
+        auto_commit: bool,
+        statement_effects: crate::db::StatementSessionEffects,
+    ) -> bool {
+        auto_commit && !statement_effects.skip_auto_commit()
+    }
+
     fn oracle_thin_statement_request(
         sql: impl Into<String>,
         auto_commit: bool,
@@ -16416,6 +16518,9 @@ impl SqlEditorWidget {
         cancel_flag: &Arc<Mutex<bool>>,
         query_timeout: Option<Duration>,
     ) -> Result<OracleThinConnectedCandidate, String> {
+        // Auto-commit is tab-scoped: the fresh candidate keeps the birth value
+        // (off) and the tab's own SET AUTOCOMMIT — which survives CONNECT —
+        // resolves on top of it.
         let candidate_connection: crate::db::SharedConnection =
             Arc::new(Mutex::new(crate::db::DatabaseConnection::new()));
         connect_shared_connection_with_policy(
@@ -16554,6 +16659,7 @@ impl SqlEditorWidget {
             selected_transaction_mode,
             db_activity,
             current_operation_autocommit,
+            None,
             query_timeout,
             scope_sync_context.map(|(connection, generation)| (connection.clone(), generation)),
             None,
@@ -16575,6 +16681,7 @@ impl SqlEditorWidget {
         selected_transaction_mode: crate::db::TransactionMode,
         db_activity: &str,
         current_operation_autocommit: &Arc<Mutex<bool>>,
+        tab_auto_commit_override: Option<&Arc<Mutex<Option<bool>>>>,
         query_timeout: Option<Duration>,
         mut scope_sync_context: Option<(crate::db::SharedConnection, u64)>,
         mut transition_context: Option<&mut OracleThinConnectionTransitionContext<'_>>,
@@ -16882,16 +16989,40 @@ impl SqlEditorWidget {
                             }
                         },
                         ToolCommand::SetAutoCommit { enabled } => {
-                            auto_commit = enabled;
-                            store_mutex_bool(current_operation_autocommit, enabled);
-                            let _ = sender.send(QueryProgress::AutoCommitChanged { enabled });
-                            app::awake();
-                            Self::emit_script_message(
-                                sender,
-                                session,
-                                "SET AUTOCOMMIT",
-                                Self::autocommit_feedback(enabled),
-                            );
+                            // Same contract as the OCI and MySQL branches: refuse
+                            // while the session may hold uncommitted work, then store
+                            // the change as this tab's override so it outlives the
+                            // batch without touching the shared connection default.
+                            let guard_result = if enabled == auto_commit {
+                                Ok(())
+                            } else {
+                                Self::ensure_oracle_retained_option_change_allowed(
+                                    retained_state,
+                                    conn.transaction_in_progress(),
+                                    "auto-commit",
+                                )
+                            };
+                            match guard_result {
+                                Ok(()) => {
+                                    auto_commit = enabled;
+                                    store_mutex_bool(current_operation_autocommit, enabled);
+                                    if let Some(override_slot) = tab_auto_commit_override {
+                                        store_mutex_bool_option(override_slot, Some(enabled));
+                                    }
+                                    let _ =
+                                        sender.send(QueryProgress::AutoCommitChanged { enabled });
+                                    app::awake();
+                                    Self::emit_script_message(
+                                        sender,
+                                        session,
+                                        "SET AUTOCOMMIT",
+                                        Self::autocommit_feedback(enabled),
+                                    );
+                                }
+                                Err(message) => {
+                                    command_error = Some(message);
+                                }
+                            }
                         }
                         ToolCommand::SetErrorContinue { enabled } => {
                             continue_on_error = enabled;
@@ -17439,7 +17570,15 @@ impl SqlEditorWidget {
                                     interrupted_sql_kind = None;
                                     interrupted_state_hint = None;
                                     refreshed_pool_context_epoch = None;
-                                    auto_commit = candidate.auto_commit;
+                                    // Like SQL*Plus, a tab-level SET AUTOCOMMIT
+                                    // survives CONNECT: resolve the new
+                                    // connection's default through the tab
+                                    // override instead of adopting it verbatim.
+                                    auto_commit = Self::effective_auto_commit(
+                                        candidate.auto_commit,
+                                        tab_auto_commit_override
+                                            .and_then(|slot| load_mutex_bool_option(slot)),
+                                    );
                                     store_mutex_bool(current_operation_autocommit, auto_commit);
                                     active_transaction_mode = candidate.transaction_mode;
                                     transaction_mode_applied = false;
@@ -17933,7 +18072,7 @@ impl SqlEditorWidget {
                             conn,
                             &execution_sql,
                             session,
-                            auto_commit,
+                            Self::oracle_thin_effective_auto_commit(auto_commit, statement_effects),
                             Some(cancel_flag),
                         ) {
                             Ok(outcome) => {
@@ -20601,7 +20740,6 @@ impl SqlEditorWidget {
         Self::ensure_mysql_retained_session_statement_option_change_allowed(current_state, action)
     }
 
-    #[cfg(test)]
     fn oracle_retained_state_for_option_change(
         prior_retained_state: RetainedSessionState,
         live_may_have_uncommitted_work: bool,
@@ -20615,7 +20753,6 @@ impl SqlEditorWidget {
         }
     }
 
-    #[cfg(test)]
     fn ensure_oracle_retained_option_change_allowed(
         prior_retained_state: RetainedSessionState,
         live_may_have_uncommitted_work: bool,
@@ -24190,6 +24327,63 @@ mod query_execution_cleanup_tests {
         cleanup.protect_oracle_dirty_statement_on_cancel(false);
         assert!(!cleanup.oracle_pooled_session_invalidated_on_cancel);
         assert!(cleanup.oracle_pooled_session_transaction_decision_on_cancel);
+    }
+
+    #[test]
+    fn auto_commit_display_mismatch_blocks_only_real_disagreements() {
+        // Nothing displayed (harness runs, hidden indicator) => no block.
+        assert!(SqlEditorWidget::auto_commit_display_mismatch_error(None, true).is_none());
+        assert!(SqlEditorWidget::auto_commit_display_mismatch_error(None, false).is_none());
+        // Agreement => no block.
+        assert!(SqlEditorWidget::auto_commit_display_mismatch_error(Some(true), true).is_none());
+        assert!(SqlEditorWidget::auto_commit_display_mismatch_error(Some(false), false).is_none());
+        // Disagreement => refuse with both values named.
+        let message = SqlEditorWidget::auto_commit_display_mismatch_error(Some(true), false)
+            .expect("mismatch must refuse execution");
+        assert!(message.contains("auto-commit on"));
+        assert!(message.contains("auto-commit off"));
+        assert!(message.contains("Nothing was executed"));
+        assert!(
+            SqlEditorWidget::auto_commit_display_mismatch_error(Some(false), true).is_some(),
+            "mismatch must refuse in both directions"
+        );
+    }
+
+    #[test]
+    fn oracle_thin_effective_auto_commit_honors_skip_hints() {
+        let post_processor =
+            crate::db::statement_session_post_processor_for(crate::db::DatabaseType::Oracle);
+        for sql in [
+            "SAVEPOINT sp1",
+            "ROLLBACK TO SAVEPOINT sp1",
+            "SET TRANSACTION READ ONLY",
+            "LOCK TABLE t IN EXCLUSIVE MODE",
+            "ALTER SESSION SET CURRENT_SCHEMA = other",
+            "SET ROLE ALL",
+            "COMMIT COMMENT 'done'",
+        ] {
+            let effects = post_processor.effects_for_sql(sql);
+            assert!(
+                !SqlEditorWidget::oracle_thin_effective_auto_commit(true, effects),
+                "{sql} must not piggyback a wire commit on the thin execute message"
+            );
+        }
+        for sql in [
+            "INSERT INTO t VALUES (1)",
+            "UPDATE t SET id = 2",
+            "DELETE FROM t",
+            "BEGIN NULL; END;",
+        ] {
+            let effects = post_processor.effects_for_sql(sql);
+            assert!(
+                SqlEditorWidget::oracle_thin_effective_auto_commit(true, effects),
+                "{sql} should keep the wire auto-commit when enabled"
+            );
+            assert!(
+                !SqlEditorWidget::oracle_thin_effective_auto_commit(false, effects),
+                "{sql} must not commit when auto-commit is off"
+            );
+        }
     }
 
     #[test]
@@ -32031,7 +32225,7 @@ mod mysql_batch_execution_regression_tests {
         current_mysql_cancel_context: Arc<Mutex<Option<MySqlQueryCancelContext>>>,
         current_query_cancel_handle: Arc<Mutex<Option<QueryCancelHandle>>>,
         pooled_db_session: crate::db::SharedDbSessionLease,
-        mysql_auto_commit_override: Arc<Mutex<Option<bool>>>,
+        tab_auto_commit_override: Arc<Mutex<Option<bool>>>,
         active_lazy_fetch: Arc<Mutex<Option<LazyFetchHandle>>>,
         next_lazy_fetch_session_id: Arc<AtomicU64>,
         cancel_flag: Arc<Mutex<bool>>,
@@ -32089,7 +32283,7 @@ mod mysql_batch_execution_regression_tests {
                 current_mysql_cancel_context: Arc::new(Mutex::new(None)),
                 current_query_cancel_handle: Arc::new(Mutex::new(None)),
                 pooled_db_session: crate::db::SharedDbSessionLease::new(),
-                mysql_auto_commit_override: Arc::new(Mutex::new(None)),
+                tab_auto_commit_override: Arc::new(Mutex::new(None)),
                 active_lazy_fetch: Arc::new(Mutex::new(None)),
                 next_lazy_fetch_session_id: Arc::new(AtomicU64::new(1)),
                 cancel_flag: Arc::new(Mutex::new(false)),
@@ -32142,7 +32336,7 @@ mod mysql_batch_execution_regression_tests {
                 "MYSQL_TEST",
                 &self.session,
                 &self.pooled_db_session,
-                &self.mysql_auto_commit_override,
+                &self.tab_auto_commit_override,
                 &self.active_lazy_fetch,
                 &self.next_lazy_fetch_session_id,
                 &self.current_mysql_cancel_context,
@@ -32207,7 +32401,7 @@ mod mysql_batch_execution_regression_tests {
         shared_connection: &Arc<Mutex<DatabaseConnection>>,
         session: &Arc<Mutex<SessionState>>,
         pooled_db_session: &crate::db::SharedDbSessionLease,
-        mysql_auto_commit_override: &Arc<Mutex<Option<bool>>>,
+        tab_auto_commit_override: &Arc<Mutex<Option<bool>>>,
         db_type: DatabaseType,
         script: &str,
         initial_auto_commit: bool,
@@ -32230,7 +32424,7 @@ mod mysql_batch_execution_regression_tests {
             "MYSQL_TEST",
             session,
             pooled_db_session,
-            mysql_auto_commit_override,
+            tab_auto_commit_override,
             &active_lazy_fetch,
             &next_lazy_fetch_session_id,
             &current_mysql_cancel_context,
@@ -32736,7 +32930,7 @@ mod mysql_batch_execution_regression_tests {
         let current_query_cancel_handle: Arc<Mutex<Option<QueryCancelHandle>>> =
             Arc::new(Mutex::new(None));
         let pooled_db_session = crate::db::SharedDbSessionLease::new();
-        let mysql_auto_commit_override = Arc::new(Mutex::new(None));
+        let tab_auto_commit_override = Arc::new(Mutex::new(None));
         let active_lazy_fetch: Arc<Mutex<Option<LazyFetchHandle>>> = Arc::new(Mutex::new(None));
         let next_lazy_fetch_session_id = Arc::new(AtomicU64::new(1));
         let cancel_flag = Arc::new(Mutex::new(false));
@@ -32750,7 +32944,7 @@ mod mysql_batch_execution_regression_tests {
             "MYSQL_TEST",
             &session,
             &pooled_db_session,
-            &mysql_auto_commit_override,
+            &tab_auto_commit_override,
             &active_lazy_fetch,
             &next_lazy_fetch_session_id,
             &current_mysql_cancel_context,
@@ -32858,7 +33052,7 @@ mod mysql_batch_execution_regression_tests {
         let current_query_cancel_handle: Arc<Mutex<Option<QueryCancelHandle>>> =
             Arc::new(Mutex::new(None));
         let pooled_db_session = crate::db::SharedDbSessionLease::new();
-        let mysql_auto_commit_override = Arc::new(Mutex::new(None));
+        let tab_auto_commit_override = Arc::new(Mutex::new(None));
         let active_lazy_fetch: Arc<Mutex<Option<LazyFetchHandle>>> = Arc::new(Mutex::new(None));
         let next_lazy_fetch_session_id = Arc::new(AtomicU64::new(1));
         let cancel_flag = Arc::new(Mutex::new(false));
@@ -32872,7 +33066,7 @@ mod mysql_batch_execution_regression_tests {
             "MYSQL_TEST",
             &session,
             &pooled_db_session,
-            &mysql_auto_commit_override,
+            &tab_auto_commit_override,
             &active_lazy_fetch,
             &next_lazy_fetch_session_id,
             &current_mysql_cancel_context,
@@ -33146,7 +33340,7 @@ mod mysql_batch_execution_regression_tests {
         let current_query_cancel_handle: Arc<Mutex<Option<QueryCancelHandle>>> =
             Arc::new(Mutex::new(None));
         let pooled_db_session = crate::db::SharedDbSessionLease::new();
-        let mysql_auto_commit_override = Arc::new(Mutex::new(None));
+        let tab_auto_commit_override = Arc::new(Mutex::new(None));
         let active_lazy_fetch: Arc<Mutex<Option<LazyFetchHandle>>> = Arc::new(Mutex::new(None));
         let next_lazy_fetch_session_id = Arc::new(AtomicU64::new(1));
         let cancel_flag = Arc::new(Mutex::new(false));
@@ -33161,7 +33355,7 @@ mod mysql_batch_execution_regression_tests {
                 "MYSQL_TEST",
                 &session,
                 &pooled_db_session,
-                &mysql_auto_commit_override,
+                &tab_auto_commit_override,
                 &active_lazy_fetch,
                 &next_lazy_fetch_session_id,
                 &current_mysql_cancel_context,
@@ -33248,7 +33442,7 @@ mod mysql_batch_execution_regression_tests {
                 "MYSQL_TEST",
                 &session,
                 &pooled_db_session,
-                &mysql_auto_commit_override,
+                &tab_auto_commit_override,
                 &active_lazy_fetch,
                 &next_lazy_fetch_session_id,
                 &current_mysql_cancel_context,
@@ -33768,7 +33962,7 @@ SELECT 'FINAL_STATUS' AS section_name,
         let current_query_cancel_handle: Arc<Mutex<Option<QueryCancelHandle>>> =
             Arc::new(Mutex::new(None));
         let pooled_db_session = crate::db::SharedDbSessionLease::new();
-        let mysql_auto_commit_override = Arc::new(Mutex::new(None));
+        let tab_auto_commit_override = Arc::new(Mutex::new(None));
         let active_lazy_fetch: Arc<Mutex<Option<LazyFetchHandle>>> = Arc::new(Mutex::new(None));
         let next_lazy_fetch_session_id = Arc::new(AtomicU64::new(1));
         let cancel_flag = Arc::new(Mutex::new(false));
@@ -33801,7 +33995,7 @@ SELECT 'FINAL_STATUS' AS section_name,
             "MYSQL_TEST",
             &session,
             &pooled_db_session,
-            &mysql_auto_commit_override,
+            &tab_auto_commit_override,
             &active_lazy_fetch,
             &next_lazy_fetch_session_id,
             &current_mysql_cancel_context,

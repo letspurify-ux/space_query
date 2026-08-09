@@ -37,8 +37,11 @@ SET NAMES <charset> [COLLATE <collation>]
 
 Encoding and transaction options are reapplied after switching databases or
 returning to an empty database scope. Auto-commit is applied as an actual
-session option to MySQL live and execution sessions. Preflight rules for
-retained sessions and transaction-mode changes are defined in the
+session option to MySQL execution (pool) sessions from the executing tab's
+value; the live metadata connection stays pinned to `autocommit=1` because it
+never runs user SQL and an implicitly opened metadata transaction would
+otherwise be reported by the dirty probe. Preflight rules for retained
+sessions and transaction-mode changes are defined in the
 [transaction document](transaction.md).
 
 ## Input validation

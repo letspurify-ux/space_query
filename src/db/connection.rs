@@ -3227,7 +3227,7 @@ impl DbBackend for MysqlBackend {
         &self,
         info: &ConnectionInfo,
         pool_size: u32,
-        auto_commit: bool,
+        _auto_commit: bool,
         policy: ConnectionAttemptPolicy,
     ) -> Result<(DbConnection, DbConnectionPool), String> {
         let opts = DatabaseConnection::build_mysql_opts(info, policy);
@@ -3237,9 +3237,15 @@ impl DbBackend for MysqlBackend {
             &info.advanced,
             self.db_type,
         )?;
+        // The live connection only ever runs app metadata queries; user SQL
+        // always executes on pooled sessions, which apply the logical
+        // auto-commit setting on every acquisition. Keep the live session on
+        // autocommit=1: under autocommit=0 every metadata table read leaves an
+        // implicitly opened transaction on it, which the dirty probe then
+        // truthfully reports, permanently refusing the auto-commit toggle.
         DatabaseConnection::apply_mysql_autocommit_setting_for_db_type(
             &mut conn,
-            auto_commit,
+            true,
             self.db_type,
         )?;
         Ok((
@@ -3476,16 +3482,15 @@ impl DbBackend for MysqlBackend {
     fn apply_auto_commit(
         &self,
         connection: &mut DbConnection,
-        enabled: bool,
+        _enabled: bool,
     ) -> Result<(), String> {
         match connection {
-            DbConnection::MySQL { conn, db_type } => {
-                self.ensure_concrete_db_type(*db_type, "live connection")?;
-                DatabaseConnection::apply_mysql_autocommit_setting_for_db_type(
-                    conn,
-                    enabled,
-                    self.db_type,
-                )
+            DbConnection::MySQL { conn: _, db_type } => {
+                // The live connection stays on autocommit=1 (see `connect`):
+                // it only runs app metadata queries, and pooled sessions apply
+                // the logical setting on every acquisition. Only validate the
+                // dispatch here.
+                self.ensure_concrete_db_type(*db_type, "live connection")
             }
             unexpected @ (DbConnection::Oracle(_) | DbConnection::OracleThin(_)) => Err(format!(
                 "Expected {} live connection but found {}",
@@ -4481,51 +4486,104 @@ impl DatabaseConnection {
         db_type: DatabaseType,
     ) -> TransactionProbeResult {
         let display_name = db_type.display_name();
-        match conn.query_first::<u64, _>(Self::mysql_session_transaction_probe_sql()) {
-            Ok(Some(value)) => TransactionProbeResult {
-                may_have_uncommitted_work: value != 0,
-                used_fallback: false,
-            },
-            Ok(None) => TransactionProbeResult {
-                may_have_uncommitted_work: false,
-                used_fallback: false,
-            },
-            Err(primary_err) => {
-                match conn.query_first::<u64, _>(Self::mysql_innodb_transaction_probe_sql()) {
-                    Ok(Some(value)) => TransactionProbeResult {
+        let mut errors: Vec<String> = Vec::new();
+        for probe_sql in Self::mysql_transaction_probe_sql_order(db_type) {
+            match conn.query_first::<u64, _>(*probe_sql) {
+                Ok(Some(value)) => {
+                    return TransactionProbeResult {
                         may_have_uncommitted_work: value != 0,
                         used_fallback: false,
-                    },
-                    Ok(None) => TransactionProbeResult {
-                        may_have_uncommitted_work: false,
-                        used_fallback: false,
-                    },
-                    Err(fallback_err) => {
-                        logging::log_error(
-                            log_context,
-                            &format!(
-                                "Failed to inspect {display_name} session transaction state: {primary_err}; fallback probe failed: {fallback_err}"
-                            ),
-                        );
-                        TransactionProbeResult {
-                            may_have_uncommitted_work: fallback_on_error,
-                            used_fallback: true,
-                        }
                     }
                 }
+                // A probe that yields no row did not answer (the
+                // performance_schema probe fails closed this way when the
+                // instrumentation is unavailable) — try the next one.
+                Ok(None) => errors.push(format!("probe returned no row: {probe_sql}")),
+                Err(err) => errors.push(err.to_string()),
             }
+        }
+        logging::log_error(
+            log_context,
+            &format!(
+                "Failed to inspect {display_name} session transaction state; every probe failed ({}). \
+                 The probes need SELECT on performance_schema (MySQL) or the PROCESS privilege \
+                 (information_schema.innodb_trx); without one of them the session is treated as possibly dirty.",
+                errors.join("; ")
+            ),
+        );
+        TransactionProbeResult {
+            may_have_uncommitted_work: fallback_on_error,
+            used_fallback: true,
         }
     }
 
-    fn mysql_session_transaction_probe_sql() -> &'static str {
+    /// Dialect-ordered probes; the first that answers wins.
+    ///
+    /// - `@@in_transaction` exists only on MariaDB (accurate there; an
+    ///   implicit read-only transaction under `autocommit=0` reports 0).
+    /// - The `performance_schema` transaction event is the accurate MySQL
+    ///   equivalent (instrumentation is on by default since 8.0) — verified
+    ///   live: implicit read-only tx → 0, uncommitted DML → 1, no stale
+    ///   entries after COMMIT/ROLLBACK.
+    /// - `innodb_trx` is the last resort only: self-probing it from inside a
+    ///   transaction leaves a stale RUNNING entry on MySQL 8.0 that outlives
+    ///   ROLLBACK, so it must never rank above the accurate probes.
+    ///
+    /// Each dialect keeps the other's probe in its chain so a server
+    /// connected under the wrong profile type still gets an accurate answer.
+    ///
+    /// Public so the live verification harness probes with exactly the SQL
+    /// the app ships instead of a copy that could drift.
+    pub fn mysql_transaction_probe_sql_order(db_type: DatabaseType) -> &'static [&'static str] {
+        const MARIADB_PROBES: [&str; 3] = [
+            DatabaseConnection::mysql_session_transaction_probe_sql(),
+            DatabaseConnection::mysql_performance_schema_transaction_probe_sql(),
+            DatabaseConnection::mysql_innodb_transaction_probe_sql(),
+        ];
+        const MYSQL_PROBES: [&str; 3] = [
+            DatabaseConnection::mysql_performance_schema_transaction_probe_sql(),
+            DatabaseConnection::mysql_session_transaction_probe_sql(),
+            DatabaseConnection::mysql_innodb_transaction_probe_sql(),
+        ];
+        match db_type {
+            DatabaseType::MariaDB => &MARIADB_PROBES,
+            // Oracle never reaches the MySQL probe; listed only to keep the
+            // DatabaseType dispatch exhaustive.
+            DatabaseType::MySQL | DatabaseType::Oracle => &MYSQL_PROBES,
+        }
+    }
+
+    const fn mysql_session_transaction_probe_sql() -> &'static str {
         "SELECT @@in_transaction"
     }
 
-    fn mysql_innodb_transaction_probe_sql() -> &'static str {
+    /// The HAVING guard makes the probe fail closed: with the Performance
+    /// Schema disabled `PS_CURRENT_THREAD_ID()` is NULL and an unguarded
+    /// COUNT(*) would "answer" 0 — a false clean that would stop the probe
+    /// chain before the fallbacks run. With the guard the query returns no
+    /// row instead, which the caller treats as unanswered.
+    const fn mysql_performance_schema_transaction_probe_sql() -> &'static str {
+        "\
+            SELECT COUNT(*) \
+            FROM performance_schema.events_transactions_current \
+            WHERE THREAD_ID = PS_CURRENT_THREAD_ID() \
+              AND STATE = 'ACTIVE' \
+            HAVING PS_CURRENT_THREAD_ID() IS NOT NULL"
+    }
+
+    /// Counts only transactions with something to lose (modified rows or held
+    /// locks). Under `autocommit=0` every statement — including this probe —
+    /// registers an implicit read-only transaction in `innodb_trx`, so an
+    /// unfiltered count reports a permanently dirty session and the
+    /// auto-commit toggle can never be enabled again (verified live on MySQL
+    /// 8.0 and MariaDB; MariaDB's own `@@in_transaction` likewise reports 0
+    /// for such implicit read transactions).
+    const fn mysql_innodb_transaction_probe_sql() -> &'static str {
         "\
             SELECT COUNT(*) \
             FROM information_schema.innodb_trx \
-            WHERE trx_mysql_thread_id = CONNECTION_ID()"
+            WHERE trx_mysql_thread_id = CONNECTION_ID() \
+              AND (trx_rows_modified > 0 OR trx_rows_locked > 0)"
     }
 
     pub(crate) fn mysql_session_may_have_uncommitted_work<C: Queryable>(
@@ -7307,8 +7365,29 @@ mod tests {
         let sql = DatabaseConnection::mysql_innodb_transaction_probe_sql();
         assert!(sql.contains("COUNT(*)"));
         assert!(sql.contains("trx_mysql_thread_id = CONNECTION_ID()"));
-        assert!(!sql.contains("trx_rows_modified"));
-        assert!(!sql.contains("trx_rows_locked"));
+        // The work filter is required: under autocommit=0 the probe itself
+        // registers an implicit read-only transaction in innodb_trx, and an
+        // unfiltered count would block the auto-commit toggle forever
+        // (verified live on MySQL 8.0 / MariaDB).
+        assert!(sql.contains("trx_rows_modified > 0"));
+        assert!(sql.contains("trx_rows_locked > 0"));
+    }
+
+    #[test]
+    fn mysql_transaction_probe_order_matches_server_dialect() {
+        // Each dialect's accurate probe must come first; the stale-prone
+        // innodb_trx probe is strictly the last resort (live-verified: a
+        // self-probe of innodb_trx inside a transaction leaves a stale
+        // RUNNING entry on MySQL 8.0 that outlives ROLLBACK).
+        let mariadb = DatabaseConnection::mysql_transaction_probe_sql_order(DatabaseType::MariaDB);
+        assert!(mariadb[0].contains("@@in_transaction"));
+        assert!(mariadb.last().unwrap().contains("innodb_trx"));
+
+        let mysql = DatabaseConnection::mysql_transaction_probe_sql_order(DatabaseType::MySQL);
+        assert!(mysql[0].contains("performance_schema.events_transactions_current"));
+        assert!(mysql[0].contains("STATE = 'ACTIVE'"));
+        assert!(mysql[1].contains("@@in_transaction"));
+        assert!(mysql.last().unwrap().contains("innodb_trx"));
     }
 
     #[test]

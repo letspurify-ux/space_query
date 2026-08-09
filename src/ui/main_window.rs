@@ -299,6 +299,22 @@ impl RetainedSessionOptionChangePlan {
         }
     }
 
+    /// Built from the runtime's lock-free identity snapshot, so an option
+    /// change that only touches retained tab sessions does not have to wait
+    /// for the connection mutex another tab's execution may be holding. Stale
+    /// identity is safe: retained-session mutation validates the generation
+    /// against the lease and no-ops or discards on mismatch.
+    fn from_runtime(
+        runtime: &crate::db::ConnectionRuntime,
+        retained_editors: Vec<SqlEditorWidget>,
+    ) -> Self {
+        Self {
+            connection_generation: runtime.connection_generation(),
+            db_type: runtime.sanitized_info().db_type,
+            retained_editors,
+        }
+    }
+
     fn apply_auto_commit(
         &self,
         pool_context_epoch: u64,
@@ -1097,11 +1113,18 @@ impl StatusBarWidget {
         activity: Option<&crate::db::DbActivitySnapshot>,
         additional_count: usize,
         selection_summary: Option<&str>,
+        auto_commit_label: Option<&str>,
     ) {
         let is_connected = connection_info.is_some() && has_live_connection;
         self.connection_indicator
             .set_label_color(status_connection_color(is_connected));
-        let connection_label = status_connection_label(connection_info, has_live_connection);
+        let mut connection_label = status_connection_label(connection_info, has_live_connection);
+        if is_connected {
+            if let Some(label) = auto_commit_label {
+                connection_label.push_str(" · ");
+                connection_label.push_str(label);
+            }
+        }
         let content_label = status_bar_content_label(
             &connection_label,
             activity.map(|activity| activity.activity.as_str()),
@@ -1715,6 +1738,10 @@ pub struct AppState {
     pub query_split_ratio: Arc<Mutex<Option<f64>>>,
     pub connection_info: Arc<Mutex<Option<crate::db::ConnectionInfo>>>,
     has_live_connection: bool,
+    /// Last observed auto-commit default of the active connection. Kept as a
+    /// cache because the connection mutex is held for the whole run of a
+    /// query, and the status bar must not lose the indicator meanwhile.
+    cached_connection_auto_commit: Option<bool>,
     pending_connection_metadata_refresh: bool,
     pending_metadata_refresh_tabs: HashSet<QueryTabId>,
     latest_schema_request_id: u64,
@@ -2948,18 +2975,6 @@ impl AppState {
         Ok(released_any)
     }
 
-    fn sync_mysql_auto_commit_overrides_with_global_setting(&self, enabled: bool) {
-        let active_connection_id = self.active_connection_id();
-        for tab in self
-            .editor_tabs
-            .iter()
-            .filter(|tab| tab.connection_binding.snapshot().connection_id() == active_connection_id)
-        {
-            tab.sql_editor
-                .sync_mysql_auto_commit_with_global_setting(enabled);
-        }
-    }
-
     fn oldest_lazy_fetch_session_for_tab(&self, tab_id: QueryTabId) -> Option<u64> {
         let connection_id = self
             .editor_tabs
@@ -3488,12 +3503,39 @@ impl AppState {
         let selected_activity = latest_status_activity(&activities);
         let displayed_registry_count = usize::from(selected_activity.is_some());
         let selection_summary = self.result_tabs.selection_summary_label();
+        // Refresh the cached connection default on every render so the label
+        // tracks the connection while it is unlocked (while a query holds the
+        // lock the flag cannot change, so the cache stays accurate).
+        self.refresh_auto_commit_cache();
+        let indicator_visible = conn_info.is_some() && self.has_live_connection;
+        let displayed_auto_commit = self
+            .cached_connection_auto_commit
+            .filter(|_| indicator_visible)
+            .map(|connection_default| {
+                crate::ui::sql_editor::SqlEditorWidget::effective_auto_commit(
+                    connection_default,
+                    self.sql_editor.tab_auto_commit_override_value(),
+                )
+            });
+        // Hand the value the screen is about to show to the active tab, so
+        // execution startup can verify it acts on exactly this state.
+        self.sql_editor
+            .record_displayed_auto_commit(displayed_auto_commit);
+        let auto_commit_label = self
+            .cached_connection_auto_commit
+            .map(|connection_default| {
+                Self::auto_commit_status_label(
+                    connection_default,
+                    self.sql_editor.tab_auto_commit_override_value(),
+                )
+            });
         self.status_bar.render(
             conn_info.as_ref(),
             self.has_live_connection,
             selected_activity,
             activities.len().saturating_sub(displayed_registry_count),
             selection_summary.as_deref(),
+            auto_commit_label.as_deref(),
         );
         self.render_query_cancel_activity();
         true
@@ -3665,18 +3707,6 @@ impl AppState {
     fn retained_transaction_option_blocker(&self, action: &str) -> Option<String> {
         let action_label = format!("change {action}");
         self.retained_session_transaction_option_blocker(action, &action_label)
-    }
-
-    fn retained_session_editors(&self) -> Vec<SqlEditorWidget> {
-        let active_connection_id = self.active_connection_id();
-        self.editor_tabs
-            .iter()
-            .filter(|tab| {
-                tab.connection_binding.snapshot().connection_id() == active_connection_id
-                    && tab.sql_editor.pooled_session_activity_snapshot().is_some()
-            })
-            .map(|tab| tab.sql_editor.clone())
-            .collect()
     }
 
     fn retained_session_transaction_option_decision(
@@ -4195,7 +4225,61 @@ impl AppState {
                 }
             }
         }
+        self.sync_auto_commit_indicators();
         self.sync_transaction_mode_controls();
+    }
+
+    /// Re-read the active connection's auto-commit default and mirror it into
+    /// the Tools menu checkmark and the status-bar cache. Each connection has
+    /// its own flag, so this must run whenever the active connection can have
+    /// changed (tab switch, connect, disconnect) — the menu item otherwise
+    /// keeps showing whichever connection was toggled last.
+    fn refresh_auto_commit_cache(&mut self) {
+        if let Ok(guard) = self.connection.try_lock() {
+            self.cached_connection_auto_commit = Some(guard.auto_commit());
+        }
+    }
+
+    /// Auto-commit is tab-scoped: the checkmark and the status bar both show
+    /// the ACTIVE tab's effective value, so this must run whenever the active
+    /// tab (or its value) can have changed — tab switch, connect, disconnect,
+    /// the menu toggle, and a script `SET AUTOCOMMIT`.
+    fn sync_auto_commit_indicators(&mut self) {
+        self.refresh_auto_commit_cache();
+        let Some(connection_default) = self.cached_connection_auto_commit else {
+            return;
+        };
+        let effective = crate::ui::sql_editor::SqlEditorWidget::effective_auto_commit(
+            connection_default,
+            self.sql_editor.tab_auto_commit_override_value(),
+        );
+        if let Some(menu) = app::widget_from_id::<MenuBar>("main_menu") {
+            if let Some(mut item) = menu.find_item("&Tools/&Auto-Commit") {
+                if effective {
+                    item.set();
+                } else {
+                    item.clear();
+                }
+            }
+        }
+    }
+
+    /// Status-bar text for the active tab's effective auto-commit state.
+    fn auto_commit_status_label(
+        connection_auto_commit: bool,
+        tab_override: Option<bool>,
+    ) -> String {
+        // Resolved by the same function the execution paths use, so the
+        // indicator can never disagree with what a statement will do.
+        let effective = crate::ui::sql_editor::SqlEditorWidget::effective_auto_commit(
+            connection_auto_commit,
+            tab_override,
+        );
+        if effective {
+            "auto-commit on".to_string()
+        } else {
+            "auto-commit off".to_string()
+        }
     }
 }
 
@@ -7186,6 +7270,7 @@ impl MainWindow {
             query_split_ratio,
             connection_info: Arc::new(Mutex::new(None)),
             has_live_connection: false,
+            cached_connection_auto_commit: None,
             pending_connection_metadata_refresh: false,
             pending_metadata_refresh_tabs: HashSet::new(),
             latest_schema_request_id: 0,
@@ -10265,6 +10350,9 @@ impl MainWindow {
                     }
                 }
                 QueryProgress::AutoCommitChanged { enabled } => {
+                    // The menu checkmark shows the active tab's value, so a
+                    // script SET AUTOCOMMIT in the active tab must re-sync it.
+                    s.sync_auto_commit_indicators();
                     if s.should_show_progress_status_for_tab(tab_id) {
                         s.set_status_message(auto_commit_changed_progress_status(enabled));
                     }
@@ -12065,66 +12153,46 @@ impl MainWindow {
                 true
             }
             "Tools/Auto-Commit" => {
+                // Tab-scoped, exactly like a script SET AUTOCOMMIT: the toggle
+                // pins the ACTIVE tab's auto-commit and touches nothing else —
+                // not the shared connection, not other tabs.
                 let mut item = app::widget_from_id::<MenuBar>("main_menu")
                     .and_then(|menu| menu.find_item("&Tools/&Auto-Commit"));
                 let enabled = item.as_ref().map(|item| item.value()).unwrap_or(false);
-                let status = if enabled {
-                    "Auto-commit enabled"
-                } else {
-                    "Auto-commit disabled"
+                let status = auto_commit_changed_progress_status(enabled);
+                let revert_item = |item: &mut Option<fltk::menu::MenuItem>| {
+                    if let Some(item) = item.as_mut() {
+                        if enabled {
+                            item.clear();
+                        } else {
+                            item.set();
+                        }
+                    }
                 };
-                let connection = {
+                let (editor, runtime) = {
                     let mut s = state
                         .lock()
                         .unwrap_or_else(|poisoned| poisoned.into_inner());
-                    let active_connection_id = s.active_connection_id();
-                    let connection_has_running_work = active_connection_id
-                        .is_some_and(|connection_id| s.has_work_for_connection(connection_id));
-                    let connection_has_lazy_fetch =
-                        active_connection_id.is_some_and(|connection_id| {
-                            !s.lazy_fetch_sessions_for_connection(connection_id)
-                                .is_empty()
-                        });
                     if let Some(message) = transaction_option_block_message(
-                        connection_has_running_work,
-                        connection_has_lazy_fetch,
+                        s.sql_editor.is_query_running(),
+                        s.sql_editor.has_open_lazy_fetch(),
                         "changing auto-commit",
                     ) {
                         crate::ui::alert_on_main(&message);
                         s.set_status_message(&message);
-                        if let Some(mut item) = item.take() {
-                            if enabled {
-                                item.clear();
-                            } else {
-                                item.set();
-                            }
-                        }
+                        revert_item(&mut item);
                         return true;
                     }
-                    if let Some(message) = s.retained_transaction_option_blocker("auto-commit") {
-                        crate::ui::alert_on_main(&message);
-                        if let Some(mut item) = item.take() {
-                            if enabled {
-                                item.clear();
-                            } else {
-                                item.set();
-                            }
-                        }
-                        return true;
-                    }
-                    s.connection.clone()
+                    (s.sql_editor.clone(), s.active_connection_runtime())
                 };
-                let retained_editors = {
-                    let s = state
-                        .lock()
-                        .unwrap_or_else(|poisoned| poisoned.into_inner());
-                    s.retained_session_editors()
-                };
-                if let Some(mut connection) =
-                    try_lock_connection_with_activity(&connection, "Updating auto-commit setting")
-                {
-                    let retained_plan =
-                        RetainedSessionOptionChangePlan::new(&connection, retained_editors);
+                // Guard and apply only for THIS tab's retained session; other
+                // tabs — even dirty or executing ones — are not involved, and
+                // the runtime's lock-free identity keeps the toggle from
+                // waiting on a connection mutex another tab's query holds.
+                let retained_plan = runtime.as_ref().map(|runtime| {
+                    RetainedSessionOptionChangePlan::from_runtime(runtime, vec![editor.clone()])
+                });
+                if let Some(retained_plan) = retained_plan.as_ref() {
                     if let Err(err) =
                         retained_plan.validate_transaction_option_change("auto-commit")
                     {
@@ -12139,81 +12207,37 @@ impl MainWindow {
                             .clone();
                         s.status_bar
                             .set_label(&format_status("Auto-commit unchanged", &conn_info));
-                        if let Some(mut item) = item.take() {
-                            if enabled {
-                                item.clear();
-                            } else {
-                                item.set();
-                            }
-                        }
+                        revert_item(&mut item);
                         return true;
                     }
-                    if let Err(err) = connection.set_auto_commit(enabled) {
-                        crate::ui::alert_on_main(&err);
-                        let mut s = state
-                            .lock()
-                            .unwrap_or_else(|poisoned| poisoned.into_inner());
-                        let conn_info = s
-                            .connection_info
-                            .lock()
-                            .unwrap_or_else(|poisoned| poisoned.into_inner())
-                            .clone();
-                        s.status_bar
-                            .set_label(&format_status("Auto-commit unchanged", &conn_info));
-                        if let Some(mut item) = item.take() {
-                            if enabled {
-                                item.clear();
-                            } else {
-                                item.set();
-                            }
-                        }
-                        return true;
-                    }
-                    let pool_context_epoch = connection.pool_context_epoch();
-                    drop(connection);
+                }
+                editor.set_tab_auto_commit(enabled);
+                if let (Some(retained_plan), Some(runtime)) =
+                    (retained_plan.as_ref(), runtime.as_ref())
+                {
                     let retained_outcomes = retained_plan.apply_auto_commit(
-                        pool_context_epoch,
+                        runtime.pool_context_epoch(),
                         enabled,
                         "Updating auto-commit setting",
                     );
                     if let Some(message) = first_retained_outcome_message(&retained_outcomes) {
                         crate::ui::alert_on_main(&format!(
-                            "Auto-commit was changed, but a retained session could not be updated. It was restored or discarded according to session safety: {}",
+                            "Auto-commit was changed, but the retained session could not be updated. It was restored or discarded according to session safety: {}",
                             message
                         ));
                     }
-                } else {
-                    let busy_message = format_connection_busy_message();
-                    crate::ui::alert_on_main(&busy_message);
-                    let mut s = state
-                        .lock()
-                        .unwrap_or_else(|poisoned| poisoned.into_inner());
-                    let conn_info = s
-                        .connection_info
-                        .lock()
-                        .unwrap_or_else(|poisoned| poisoned.into_inner())
-                        .clone();
-                    s.status_bar
-                        .set_label(&format_status(&busy_message, &conn_info));
-                    if let Some(mut item) = item.take() {
-                        if enabled {
-                            item.clear();
-                        } else {
-                            item.set();
-                        }
-                    }
-                    return true;
                 }
                 let mut s = state
                     .lock()
                     .unwrap_or_else(|poisoned| poisoned.into_inner());
-                s.sync_mysql_auto_commit_overrides_with_global_setting(enabled);
+                s.sync_auto_commit_indicators();
                 let conn_info = s
                     .connection_info
                     .lock()
                     .unwrap_or_else(|poisoned| poisoned.into_inner())
                     .clone();
                 s.status_bar.set_label(&format_status(status, &conn_info));
+                s.render_status_bar();
                 true
             }
             "Settings/Preferences" => {
@@ -16751,6 +16775,30 @@ mod tests {
         assert_eq!(
             auto_commit_changed_progress_status(false),
             "Tab auto-commit disabled"
+        );
+    }
+
+    #[test]
+    fn auto_commit_status_label_shows_the_tab_effective_value() {
+        assert_eq!(
+            AppState::auto_commit_status_label(true, None),
+            "auto-commit on"
+        );
+        assert_eq!(
+            AppState::auto_commit_status_label(false, None),
+            "auto-commit off"
+        );
+        assert_eq!(
+            AppState::auto_commit_status_label(true, Some(false)),
+            "auto-commit off"
+        );
+        assert_eq!(
+            AppState::auto_commit_status_label(false, Some(true)),
+            "auto-commit on"
+        );
+        assert_eq!(
+            AppState::auto_commit_status_label(true, Some(true)),
+            "auto-commit on"
         );
     }
 
