@@ -11458,6 +11458,7 @@ impl SqlEditorWidget {
                                                     next_conn_name,
                                                     next_connection_generation,
                                                     next_auto_commit,
+                                                    next_transaction_mode,
                                                 ) = {
                                                     let conn_guard =
                                                         lock_connection_with_activity(
@@ -11472,8 +11473,28 @@ impl SqlEditorWidget {
                                                         conn_guard.get_info().name.clone(),
                                                         conn_guard.connection_generation(),
                                                         conn_guard.auto_commit(),
+                                                        conn_guard.transaction_mode(),
                                                     )
                                                 };
+                                                // Like the thin CONNECT path: the
+                                                // tab's pinned transaction mode
+                                                // survives CONNECT, resolved over
+                                                // the NEW connection's default
+                                                // instead of carrying the old
+                                                // connection's mode verbatim.
+                                                // Committed into
+                                                // active_transaction_mode only
+                                                // after CONNECT fully succeeds,
+                                                // because every failure below
+                                                // keeps the batch on the old
+                                                // connection.
+                                                let next_active_transaction_mode =
+                                                    Self::effective_transaction_mode(
+                                                        next_transaction_mode,
+                                                        load_mutex_transaction_mode_option(
+                                                            &tab_transaction_mode_override,
+                                                        ),
+                                                    );
                                                 let Some(prepared_conn) =
                                                     next_conn_opt.as_ref().cloned()
                                                 else {
@@ -11516,7 +11537,7 @@ impl SqlEditorWidget {
                                                 }
                                                 if let Err(err) = crate::db::DatabaseConnection::apply_oracle_transaction_mode(
                                                     prepared_conn.as_ref(),
-                                                    active_transaction_mode,
+                                                    next_active_transaction_mode,
                                                 ) {
                                                     if let Some(mut guard) =
                                                         crate::db::try_lock_connection(
@@ -11624,6 +11645,8 @@ impl SqlEditorWidget {
                                                     Arc::clone(&prepared_conn),
                                                     previous_timeout,
                                                 );
+                                                active_transaction_mode =
+                                                    next_active_transaction_mode;
                                                 Self::record_applied_oracle_transaction_mode_effects(
                                                     &mut cleanup,
                                                     active_transaction_mode,
