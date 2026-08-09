@@ -5,9 +5,6 @@ use fltk::{app, enums::FrameType};
 pub struct StartupContext {
     pub config: AppConfig,
     pub crash_report: Option<String>,
-    /// Unsaved editor tabs the last run left behind. Present only after an
-    /// abnormal exit — a clean shutdown deletes the snapshot.
-    pub unsaved_tabs: Option<utils::local_history::SessionSnapshot>,
 }
 
 pub struct App;
@@ -20,12 +17,10 @@ impl App {
     fn bootstrap() -> StartupContext {
         let config = AppConfig::load();
         let crash_report = utils::logging::take_crash_log();
-        let unsaved_tabs = utils::local_history::load();
 
         StartupContext {
             config,
             crash_report,
-            unsaved_tabs,
         }
     }
 
@@ -50,11 +45,6 @@ impl App {
 
         if let Some(crash_report) = startup.crash_report.as_deref() {
             MainWindow::show_previous_crash_report(crash_report);
-        }
-        // After the crash report, so the user reads what happened before being
-        // asked what to do about it.
-        if let Some(snapshot) = startup.unsaved_tabs.as_ref() {
-            main_window.offer_unsaved_tab_restore(snapshot);
         }
 
         match app.run() {

@@ -3326,23 +3326,6 @@ impl AppState {
             .map(|index| Self::tab_display_label(&self.editor_tabs[index]))
     }
 
-    /// Every tab holding text that is not on disk, for the crash snapshot.
-    ///
-    /// `pristine_text` is what the tab was last saved or opened as, so a tab is
-    /// unsaved exactly when the buffer differs from it — the same answer the
-    /// close prompt uses, rather than a second rule that could drift from it.
-    fn unsaved_tab_snapshots(&self) -> Vec<crate::utils::local_history::TabSnapshot> {
-        self.editor_tabs
-            .iter()
-            .filter(|tab| tab.is_dirty)
-            .map(|tab| crate::utils::local_history::TabSnapshot {
-                label: tab.base_label.clone(),
-                file_path: tab.current_file.clone(),
-                text: tab.sql_buffer.text(),
-            })
-            .collect()
-    }
-
     fn is_tab_dirty(&self, tab_id: QueryTabId) -> bool {
         self.find_tab_index(tab_id)
             .map(|index| self.editor_tabs[index].is_dirty)
@@ -3370,22 +3353,6 @@ impl AppState {
         self.editor_tabs[index].current_text_len = text.len();
         self.editor_tabs[index].pristine_text = text;
         self.set_tab_dirty(tab_id, false);
-    }
-
-    /// Mark a tab as holding text restored from a crash snapshot.
-    ///
-    /// The text was never saved, so there is no pristine version to compare
-    /// against and the tab must simply say it is dirty. `current_text_len` is
-    /// still set from the real buffer: the modify callback compares lengths
-    /// before it compares content, and a stale length would make the next
-    /// keystroke misjudge the tab.
-    fn set_tab_restored_unsaved_text(&mut self, tab_id: QueryTabId, text_len: usize) {
-        let Some(index) = self.find_tab_index(tab_id) else {
-            return;
-        };
-        self.editor_tabs[index].pristine_text = String::new();
-        self.editor_tabs[index].current_text_len = text_len;
-        self.set_tab_dirty(tab_id, true);
     }
 
     fn dirty_state_from_equal_length_local_edit(
@@ -11641,9 +11608,12 @@ impl MainWindow {
             }
             "File/Open SQL File" => {
                 let mut dialog = FileDialog::new(FileDialogType::BrowseFile);
-                // The native macOS open panel auto-appends an "All Files" entry,
-                // so listing it here would show it twice.
-                dialog.set_filter("SQL Files\t*.sql");
+                // Deliberately unfiltered. FLTK attaches its open-panel
+                // delegate only when a filter is set, and that delegate hands
+                // `[url path]` to `fl_filename_match` with no nil check, so a
+                // panel item that has no filesystem path (Recents, iCloud, a
+                // sidebar entry) is a null dereference. Restore the filter once
+                // FLTK guards it.
                 dialog.show();
                 let filename = dialog.filename();
                 MainWindow::open_sql_file_path(state, file_sender, filename);
@@ -13344,21 +13314,11 @@ impl MainWindow {
         let file_receiver: Arc<Mutex<std::sync::mpsc::Receiver<FileActionResult>>> =
             Arc::new(Mutex::new(file_receiver));
         let idle_poll_cycles = Arc::new(AtomicUsize::new(0));
-        let snapshot_cycles = Arc::new(AtomicUsize::new(0));
-        // Zero is "nothing written yet". It is not a hash any snapshot produces,
-        // so the first tick always reaches the writer once — which for a session
-        // with nothing unsaved means removing a file that is not there.
-        let last_snapshot_key = Arc::new(AtomicU64::new(0));
 
         const CHANNEL_POLL_ACTIVE_INTERVAL_SECONDS: f64 = 0.05;
         const CHANNEL_POLL_IDLE_INTERVAL_SECONDS: f64 = 0.25;
         const MEMORY_TRIM_IDLE_CYCLE_THRESHOLD: usize =
             safe_div_f64_to_usize(60.0, CHANNEL_POLL_IDLE_INTERVAL_SECONDS);
-        /// How often the unsaved-tab snapshot is reconsidered, in idle poll
-        /// cycles. Five seconds bounds what a crash can cost without making the
-        /// app touch the disk while someone is typing.
-        const UNSAVED_SNAPSHOT_IDLE_CYCLE_THRESHOLD: usize =
-            safe_div_f64_to_usize(5.0, CHANNEL_POLL_IDLE_INTERVAL_SECONDS);
 
         fn schedule_poll(
             schema_receiver: Arc<Mutex<std::sync::mpsc::Receiver<SchemaUpdate>>>,
@@ -13368,8 +13328,6 @@ impl MainWindow {
             schema_sender: std::sync::mpsc::Sender<SchemaUpdate>,
             file_sender: std::sync::mpsc::Sender<FileActionResult>,
             idle_poll_cycles: Arc<AtomicUsize>,
-            snapshot_cycles: Arc<AtomicUsize>,
-            last_snapshot_key: Arc<AtomicU64>,
             pending_schema_update: Option<SchemaUpdate>,
         ) {
             let Some(state) = state_weak.upgrade() else {
@@ -13848,8 +13806,6 @@ impl MainWindow {
                         schema_sender.clone(),
                         file_sender.clone(),
                         idle_poll_cycles.clone(),
-                        snapshot_cycles.clone(),
-                        last_snapshot_key.clone(),
                         pending_schema_update,
                     );
                 });
@@ -13859,14 +13815,6 @@ impl MainWindow {
             // Stop polling if all channels are disconnected
             if schema_disconnected && conn_disconnected && file_disconnected {
                 return;
-            }
-
-            snapshot_cycles.fetch_add(1, Ordering::Relaxed);
-            if snapshot_cycles.load(Ordering::Relaxed) >= UNSAVED_SNAPSHOT_IDLE_CYCLE_THRESHOLD {
-                snapshot_cycles.store(0, Ordering::Relaxed);
-                if let Some(state) = state_weak.upgrade() {
-                    MainWindow::write_unsaved_tab_snapshot(&state, &last_snapshot_key);
-                }
             }
 
             let delay = if processed_message {
@@ -13893,8 +13841,6 @@ impl MainWindow {
                     schema_sender.clone(),
                     file_sender.clone(),
                     idle_poll_cycles.clone(),
-                    snapshot_cycles.clone(),
-                    last_snapshot_key.clone(),
                     pending_schema_update,
                 );
             });
@@ -13918,8 +13864,6 @@ impl MainWindow {
             schema_sender_for_poll,
             file_sender.clone(),
             idle_poll_cycles,
-            snapshot_cycles,
-            last_snapshot_key,
             None,
         );
 
@@ -14066,70 +14010,12 @@ impl MainWindow {
         );
     }
 
-    /// Persist the unsaved editor tabs so a crash does not take them with it.
-    ///
-    /// Runs on the idle poll and does nothing in the common case: the snapshot
-    /// is hashed first, and an unchanged hash means neither serializing nor
-    /// touching the disk. A session that never dirties a tab settles after one
-    /// tick, because an empty snapshot removes the file rather than writing
-    /// one and its hash then stops changing.
-    fn write_unsaved_tab_snapshot(state: &Arc<Mutex<AppState>>, last_key: &Arc<AtomicU64>) {
-        use crate::utils::local_history::SessionSnapshot;
-
-        let tabs = {
-            let s = state
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            s.unsaved_tab_snapshots()
-        };
-        let (snapshot, skipped) = SessionSnapshot::from_dirty_tabs(tabs);
-        let key = snapshot.change_key();
-        if key == last_key.load(Ordering::Relaxed) {
-            return;
-        }
-
-        match crate::utils::local_history::save(&snapshot) {
-            Ok(()) => {
-                last_key.store(key, Ordering::Relaxed);
-                if !skipped.is_empty() {
-                    // Saying it once per change beats silently dropping a tab
-                    // the user would only miss after a crash.
-                    crate::utils::logging::log_warning(
-                        "local_history",
-                        &format!(
-                            "Too large to keep for crash recovery, so not snapshotted: {}",
-                            skipped.join(", ")
-                        ),
-                    );
-                }
-            }
-            Err(err) => {
-                // Never interrupt: this is a background safety net, and a
-                // dialog here would fire on every tick that still fails.
-                crate::utils::logging::log_error(
-                    "local_history",
-                    &format!("Failed to snapshot unsaved tabs: {err}"),
-                );
-                last_key.store(key, Ordering::Relaxed);
-            }
-        }
-    }
-
     fn finish_application_exit(state: &Arc<Mutex<AppState>>, mut window: Window) {
         // FLTK's event loop returns only after every native top-level window is
         // hidden. Establish that exit condition before any resource cleanup
         // that could be delayed by a database driver or worker state.
         window.hide();
         Self::hide_all_visible_windows();
-
-        // A snapshot that outlives the process is how the next run knows this
-        // one died, so a clean exit must take it away.
-        if let Err(err) = crate::utils::local_history::clear() {
-            crate::utils::logging::log_error(
-                "local_history",
-                &format!("Failed to remove the unsaved-tab snapshot: {err}"),
-            );
-        }
 
         crate::db::clear_tracked_db_activity();
         let (popups, editor_tabs, mut result_tabs, runtimes) = {
@@ -14855,102 +14741,6 @@ The crash has been recorded in the application log.",
         );
     }
 
-    /// Offer to reopen the tabs the last run had unsaved when it died.
-    ///
-    /// The snapshot only exists after an abnormal exit, so reaching this at all
-    /// already means something was lost. Restoring puts each tab back dirty and
-    /// keeps the file it belonged to, so the very next Save writes where the
-    /// user expected — and the snapshot is dropped either way, so a declined
-    /// offer is not made twice.
-    pub fn offer_unsaved_tab_restore(
-        &mut self,
-        snapshot: &crate::utils::local_history::SessionSnapshot,
-    ) {
-        if snapshot.is_empty() {
-            return;
-        }
-        let names = snapshot
-            .tabs
-            .iter()
-            .map(crate::utils::local_history::TabSnapshot::display_name)
-            .collect::<Vec<_>>()
-            .join("\n  ");
-        let message = format!(
-            "The previous session ended without saving {} tab(s):\n\n  {names}\n\nReopen them?",
-            snapshot.tabs.len()
-        );
-        let restore = crate::ui::choice2_on_main_with_title(
-            "Restore Unsaved Tabs",
-            &message,
-            "Discard",
-            "Reopen",
-            "",
-        ) == Some(1);
-
-        // Cleared whichever way the user answered: keeping it would re-ask on
-        // every later start, and the answer has been given.
-        if let Err(err) = crate::utils::local_history::clear() {
-            crate::utils::logging::log_error(
-                "local_history",
-                &format!("Failed to remove the unsaved-tab snapshot: {err}"),
-            );
-        }
-        if !restore {
-            return;
-        }
-        self.restore_unsaved_tabs(snapshot);
-    }
-
-    fn restore_unsaved_tabs(&mut self, snapshot: &crate::utils::local_history::SessionSnapshot) {
-        // The senders live on the state once `setup_callbacks` has run, which
-        // it has: the restore prompt comes after the window is up. Without them
-        // a restored tab would have no callbacks, so say so rather than open
-        // tabs that do not work.
-        let senders = {
-            let s = self
-                .state
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            s.schema_sender.clone().zip(s.file_sender.clone())
-        };
-        let Some((schema_sender, file_sender)) = senders else {
-            crate::utils::logging::log_error(
-                "local_history",
-                "Cannot reopen unsaved tabs before the window callbacks are installed",
-            );
-            return;
-        };
-        let mut restored = 0_usize;
-        for tab in &snapshot.tabs {
-            let created = {
-                let mut s = self
-                    .state
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner());
-                let Some(tab_id) = MainWindow::create_query_editor_tab(&mut s) else {
-                    continue;
-                };
-                s.sql_buffer.set_text(&tab.text);
-                s.sql_editor.reset_undo_redo_history();
-                s.set_tab_file_path(tab_id, tab.file_path.clone());
-                s.set_tab_restored_unsaved_text(tab_id, tab.text.len());
-                tab_id
-            };
-            MainWindow::attach_editor_callbacks(&self.state, created, schema_sender.clone());
-            MainWindow::attach_file_drop_callback(&self.state, created, file_sender.clone());
-            restored += 1;
-        }
-        if restored > 0 {
-            let mut s = self
-                .state
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            s.set_status_message(&format!("Reopened {restored} unsaved tab(s)"));
-            s.sql_editor.focus();
-            app::redraw();
-        }
-    }
-
     pub fn run() {
         let app = app::App::default()
             .with_scheme(app::Scheme::Gtk)
@@ -14967,12 +14757,8 @@ The crash has been recorded in the application log.",
         main_window.show();
 
         // Check for crash log from a previous session
-        let unsaved_tabs = crate::utils::local_history::load();
         if let Some(crash_report) = crate::utils::logging::take_crash_log() {
             Self::show_previous_crash_report(&crash_report);
-        }
-        if let Some(snapshot) = unsaved_tabs.as_ref() {
-            main_window.offer_unsaved_tab_restore(snapshot);
         }
 
         match app.run() {

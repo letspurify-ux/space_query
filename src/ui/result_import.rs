@@ -93,17 +93,6 @@ pub fn detect_format(path: &Path) -> Option<ExportFormat> {
         })
 }
 
-/// One filter line per format for the native open chooser, so a user can see
-/// everything that can be imported without switching filters.
-pub fn open_file_filter() -> String {
-    let mut extensions: Vec<&str> = ExportFormat::ALL
-        .into_iter()
-        .map(ExportFormat::extension)
-        .collect();
-    extensions.extend(["txt", "htm"]);
-    format!("Importable Files\t*.{{{}}}", extensions.join(","))
-}
-
 /// Parse `text` into columns and rows.
 pub fn parse(text: &str, options: &ImportOptions) -> Result<ImportedTable, String> {
     // A UTF-8 BOM is what `ExportFormat::file_byte_order_mark` puts in front of

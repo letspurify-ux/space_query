@@ -82,11 +82,6 @@ if [[ "$capture_mode" == "tree-columns" ]]; then
   exit 0
 fi
 
-if [[ "$capture_mode" == "restore-tabs" ]]; then
-  convert_capture restore-tabs restore-tabs
-  exit 0
-fi
-
 if [[ "$capture_mode" == "settings-dialog" ]]; then
   convert_capture settings settings
   exit 0
@@ -214,4 +209,3 @@ convert_capture column-layout column-layout
 convert_capture value-filter value-filter
 convert_capture grid-sort grid-sort
 convert_capture tree-columns tree-columns
-convert_capture restore-tabs restore-tabs

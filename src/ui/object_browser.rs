@@ -6074,7 +6074,9 @@ impl ObjectBrowserWidget {
     /// Which file to import. `None` means the user cancelled the chooser.
     fn ask_import_file_path() -> Option<std::path::PathBuf> {
         let mut dialog = fltk::dialog::FileDialog::new(fltk::dialog::FileDialogType::BrowseFile);
-        dialog.set_filter(&crate::ui::result_import::open_file_filter());
+        // Deliberately unfiltered, for the same reason as `File/Open SQL File`:
+        // a filter makes FLTK attach an open-panel delegate that dereferences a
+        // panel item's missing path and crashes.
         dialog.show();
         let filename = dialog.filename();
         (!filename.as_os_str().is_empty()).then_some(filename)

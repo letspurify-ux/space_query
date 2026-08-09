@@ -614,24 +614,6 @@ since both depend on the columns' positions.
 
 Pinning a column to the left is not implemented.
 
-### Reopen tabs after a crash
-
-Editor tabs holding unsaved text are written to a snapshot every few seconds,
-and the snapshot is deleted on a normal exit. It therefore survives only an
-abnormal exit, and finding it at startup produces the offer to reopen.
-
-![The prompt offering back two unsaved tabs from a session that ended abnormally](docs/images/restore-tabs.png)
-
-**Reopen** puts each tab back, still unsaved and still pointing at the file it
-came from, so the next **Save** writes to the expected path. **Discard** removes
-them. The snapshot is deleted either way, so a declined offer is not repeated. A
-normal exit never shows this prompt.
-
-Only tabs with unsaved changes are snapshotted, and only when their text has
-changed since the last snapshot. A tab larger than 8 MB is skipped rather than
-shortened, and the application log records which one, since a truncated script
-would restore incorrectly.
-
 ### Export a result
 
 `Ctrl+E`, **Tools > Export Results**, and the Data Grid context menu's
@@ -845,7 +827,6 @@ library:
 | Crash report | `data_dir()/space_query/crash.log` |
 | Saved passwords | `space_query` service in the OS keyring |
 | Query history | `data_dir()/space_query/query_history.json` |
-| Unsaved editor tabs, kept only between an abnormal exit and the next start | `data_dir()/space_query/unsaved_tabs.json` |
 
 Passwords are never written to `config.json`. Existing data in the legacy
 `oracle_query_tool` config and keyring namespaces is migrated when encountered.

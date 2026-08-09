@@ -24,11 +24,7 @@ use space_query::{
         ConnectionDialog, IntellisensePopup, MainWindow, QueryHistoryDialog, SignatureLabel,
         SignatureOverload, SignaturePopup,
     },
-    utils::{
-        arithmetic::safe_div,
-        local_history::{SessionSnapshot, TabSnapshot},
-        logging, AppConfig,
-    },
+    utils::{arithmetic::safe_div, logging, AppConfig},
 };
 use std::{
     collections::HashMap,
@@ -2355,29 +2351,6 @@ fn capture_tree_columns(main_window: &mut MainWindow) {
     }
 }
 
-/// The prompt that offers back the tabs an abnormal exit took with it.
-fn capture_restore_tabs(main_window: &mut MainWindow) {
-    let snapshot = SessionSnapshot {
-        tabs: vec![
-            TabSnapshot {
-                label: "Query 2".to_string(),
-                file_path: Some(std::path::PathBuf::from("/Users/me/sql/monthly_close.sql")),
-                text: "SELECT * FROM ORDERS WHERE STATUS = 'OPEN';".to_string(),
-            },
-            TabSnapshot {
-                label: "Query 3".to_string(),
-                file_path: None,
-                text: "UPDATE ORDERS SET STATUS = 'CLOSED' WHERE ORDER_ID = 10248;".to_string(),
-            },
-        ],
-    };
-    app::add_timeout3(0.45, |_| {
-        capture_active_dialog("Restore Unsaved Tabs", "/tmp/space-query-restore-tabs.ppm");
-    });
-    main_window.offer_unsaved_tab_restore(&snapshot);
-    pump(200);
-}
-
 fn main() {
     let capture_mode = std::env::args().nth(1);
     let ui_scale_percent = std::env::var("SPACE_QUERY_CAPTURE_UI_SCALE")
@@ -2563,11 +2536,6 @@ fn main() {
     if capture_mode.as_deref() == Some("tree-columns") {
         capture_object_browser(&mut main_window);
         capture_tree_columns(&mut main_window);
-        app::quit();
-        return;
-    }
-    if capture_mode.as_deref() == Some("restore-tabs") {
-        capture_restore_tabs(&mut main_window);
         app::quit();
         return;
     }
