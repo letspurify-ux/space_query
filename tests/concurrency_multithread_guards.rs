@@ -349,8 +349,18 @@ fn oracle_reused_open_transaction_skips_transaction_mode_reapply() {
     let content = fs::read_to_string(&file)
         .unwrap_or_else(|err| panic!("failed to read source file {}: {err}", file.display()));
 
+    // Pin the invariant, not the formatting: whatever else gates the reapply,
+    // a session that must be preserved always suppresses it.
+    let decision_start = content
+        .find("let should_apply_oracle_transaction_mode =")
+        .expect("Oracle transaction-mode reapply decision should exist");
+    let decision_end = content[decision_start..]
+        .find(';')
+        .map(|offset| decision_start + offset)
+        .expect("the reapply decision should be a single statement");
+    let decision = &content[decision_start..decision_end];
     assert!(
-        content.contains("let should_apply_oracle_transaction_mode =\n                    !oracle_prior_requires_physical_session_preservation;"),
+        decision.contains("!oracle_prior_requires_physical_session_preservation"),
         "Oracle execution must not reapply SET TRANSACTION on a pooled session with open work"
     );
     assert!(

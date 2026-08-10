@@ -272,14 +272,15 @@ impl Harness {
 
 fn run_scenarios(target: Target, h: &mut Harness) -> Result<(), String> {
     let initial_connection_mode = h.connection_transaction_mode();
-    // Oracle: either the server rejects the write inside the READ ONLY
-    // transaction (ORA-01456) or the app's own read-only gate refuses the
-    // non-query client-side before it reaches the server. MySQL family:
+    // Pin WHICH defense refused the write, per driver, so a regression in one
+    // cannot hide behind the other: Oracle OCI refuses non-queries in the
+    // client before they reach the server, Oracle thin has no such gate and
+    // must be refused by the server (ORA-01456), and the MySQL family reports
     // ER_CANT_EXECUTE_IN_READ_ONLY_TRANSACTION.
-    let read_only_errors: &[&str] = if target.is_oracle() {
-        &["ORA-01456", "read-only mode blocks"]
-    } else {
-        &["read only"]
+    let read_only_errors: &[&str] = match target {
+        Target::OracleOci => &["read-only mode blocks"],
+        Target::OracleThin => &["ORA-01456"],
+        Target::MySql | Target::MariaDb => &["read only"],
     };
 
     // ---- S1: tab-scoped READ ONLY via the toolbar write path --------------
@@ -424,12 +425,27 @@ fn run_scenarios(target: Target, h: &mut Harness) -> Result<(), String> {
         // a serializable transaction cannot see a row committed by another
         // session after the transaction began. Simpler smoke: the pinned
         // override survives and the next statement still succeeds.
-        println!("  --- S3 pinned isolation still lets statements run ---");
+        println!("  --- S3 pinned isolation is re-applied on the next execution ---");
         let v = h.select_v()?;
         h.check(
             "S3 SELECT under SERIALIZABLE works",
             v == 1,
             format!("V = {v}"),
+        );
+        // Oracle has no session view reporting the isolation level, but the
+        // application of it is observable: a non-default mode makes the app
+        // issue SET TRANSACTION ... at execution start, and that statement
+        // itself opens a transaction. So a plain SELECT on a pinned tab must
+        // leave the session holding one — evidence the mode really was
+        // re-applied rather than silently skipped.
+        let after_pinned_select = h
+            .editor
+            .pooled_session_activity_snapshot()
+            .map(|snapshot| snapshot.retained_state());
+        h.check(
+            "S3 pinned mode was issued (its SET TRANSACTION opened a transaction)",
+            after_pinned_select.is_some_and(|state| state.may_have_uncommitted_work()),
+            format!("retained state after SELECT on a pinned tab = {after_pinned_select:?}"),
         );
         if target.is_oracle() {
             h.run("COMMIT")?;
@@ -609,6 +625,100 @@ fn run_scenarios(target: Target, h: &mut Harness) -> Result<(), String> {
         }),
         format!("retained state after ROLLBACK = {after_rollback:?}"),
     );
+
+    // ---- S9: the toolbar gate opens and closes with the transaction --------
+    // The mode controls are disabled exactly when the tab's session cannot take
+    // a change. Uncommitted work blocks it on EVERY backend: replacement needs
+    // a clean transaction, so the family difference (the MySQL side can replace
+    // over a pending one-shot override) only shows on a clean session, which is
+    // what S5 covers.
+    println!("  --- S9 toolbar gate closes on uncommitted work and reopens after ROLLBACK ---");
+    h.run("UPDATE SQ_TM_T SET V = V + 1")?;
+    let dirty_decision = h.editor.pooled_session_activity_snapshot().map(|snapshot| {
+        space_query::db::retained_session_state_transaction_mode_change_preflight_decision(
+            snapshot.db_type,
+            snapshot.retained_state(),
+        )
+    });
+    h.check(
+        "S9 uncommitted work disables the controls",
+        dirty_decision
+            == Some(space_query::db::RetainedSessionPreflightDecision::RequireResolution),
+        format!("decision while dirty = {dirty_decision:?}"),
+    );
+    h.run("ROLLBACK")?;
+    let clean_decision = h.editor.pooled_session_activity_snapshot().map(|snapshot| {
+        space_query::db::retained_session_state_transaction_mode_change_preflight_decision(
+            snapshot.db_type,
+            snapshot.retained_state(),
+        )
+    });
+    h.check(
+        "S9 controls are allowed again once the transaction is resolved",
+        clean_decision
+            .is_none_or(|d| d == space_query::db::RetainedSessionPreflightDecision::Allow),
+        format!("decision after ROLLBACK = {clean_decision:?}"),
+    );
+    {
+        let mut guard = h.shared.lock().unwrap_or_else(|p| p.into_inner());
+        guard
+            .set_auto_commit(true)
+            .map_err(|e| format!("restore auto_commit: {e}"))?;
+    }
+    h.editor.sync_tab_auto_commit_with_global_setting(true);
+
+    // ---- S8 (Oracle): the tab's pinned mode survives script CONNECT ---------
+    // Runs LAST on purpose: CONNECT rebinds the tab to a transient connection,
+    // so the harness's own shared connection no longer drives the tab.
+    if target.is_oracle() {
+        println!("  --- S8 tab transaction mode survives script CONNECT ---");
+        h.editor.set_tab_transaction_mode(TransactionMode::new(
+            TransactionIsolation::Default,
+            TransactionAccessMode::ReadOnly,
+        ));
+        // CONNECT refuses to discard a session that may still need resolution
+        // — a separate, correct guard. Clear the tab's session first, the way
+        // the app tells the user to, so this scenario tests what it means to:
+        // whether the tab's pinned mode survives the reconnect.
+        let _ = h.editor.discard_pooled_session_for_close();
+        let info = target.connection_info();
+        let script = format!(
+            "CONNECT {}/{}@{}:{}/{}\nINSERT INTO SQ_TM_T VALUES (8);",
+            info.username, info.password, info.host, info.port, info.service_name
+        );
+        let capture = h.run(&script)?;
+        let insert = capture
+            .results
+            .iter()
+            .find(|result| result.sql.to_uppercase().contains("INSERT"))
+            .cloned();
+        // The new connection's own default is Read write. Only the tab pin,
+        // re-resolved over that default, can still refuse this write.
+        h.check(
+            "S8 pinned READ ONLY still refuses the write after CONNECT",
+            insert.as_ref().is_some_and(|result| {
+                !result.success
+                    && read_only_errors.iter().any(|needle| {
+                        result
+                            .message
+                            .to_ascii_lowercase()
+                            .contains(&needle.to_ascii_lowercase())
+                    })
+            }),
+            format!(
+                "insert after CONNECT: {:?}; all results: {:?}; messages: {:?}",
+                insert.map(|r| (r.success, r.message)),
+                capture
+                    .results
+                    .iter()
+                    .map(|r| (r.sql.clone(), r.success, r.message.clone()))
+                    .collect::<Vec<_>>(),
+                capture.messages
+            ),
+        );
+        h.run("ROLLBACK")?;
+        h.editor.clear_tab_transaction_mode_override();
+    }
 
     Ok(())
 }

@@ -9934,8 +9934,22 @@ impl SqlEditorWidget {
                 };
                 let requires_transaction_first_statement = explicit_transaction_first_statement
                     || db_type.transaction_mode_requires_first_statement(transaction_mode);
+                // A batch that opens with CONNECT must not have the tab's mode
+                // applied to the OUTGOING connection first: SET TRANSACTION
+                // opens a transaction, and CONNECT then refuses to discard a
+                // session that looks like it needs resolution — the tab would
+                // block its own reconnect purely because a non-default mode is
+                // pinned. The post-CONNECT path applies the mode to the new
+                // connection, so nothing is lost. (The thin path already
+                // behaves this way: it applies the mode lazily, before the
+                // first statement rather than before the first script item.)
+                let batch_starts_with_connect = matches!(
+                    items.first(),
+                    Some(ScriptItem::ToolCommand(ToolCommand::Connect { .. }))
+                );
                 let should_apply_oracle_transaction_mode =
-                    !oracle_prior_requires_physical_session_preservation;
+                    !oracle_prior_requires_physical_session_preservation
+                        && !batch_starts_with_connect;
 
                 if let Some(conn) = conn_opt.as_ref() {
                     if let Err(err) = conn.set_call_timeout(query_timeout) {
