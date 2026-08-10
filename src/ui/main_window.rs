@@ -395,6 +395,7 @@ trait SchemaMetadataLoader: Sync {
         &self,
         context: crate::db::DbPoolSessionContext,
         requested_scope: Option<String>,
+        activity: &crate::db::DbActivityGuard,
     ) -> Option<IntellisenseData>;
 }
 
@@ -544,10 +545,12 @@ impl SchemaMetadataLoader for OracleSchemaMetadataLoader {
         &self,
         context: crate::db::DbPoolSessionContext,
         requested_scope: Option<String>,
+        activity: &crate::db::DbActivityGuard,
     ) -> Option<IntellisenseData> {
         context.ensure_current().ok()?;
         let (current_schema, mut owners, schema_objects, relation_members) = match context
-            .acquire_session_for_current_scope()
+            .acquire_session_for_current_scope(activity)
+            .map(|(session, _cancel_registration)| session)
         {
             Ok(crate::db::DbPoolSession::Oracle(conn)) => {
                 let current_schema = context
@@ -703,11 +706,15 @@ impl SchemaMetadataLoader for MysqlSchemaMetadataLoader {
         &self,
         context: crate::db::DbPoolSessionContext,
         requested_scope: Option<String>,
+        activity: &crate::db::DbActivityGuard,
     ) -> Option<IntellisenseData> {
         let expected_db_type = context.connection_info.db_type;
         let display_name = expected_db_type.display_name();
         context.ensure_current().ok()?;
-        let mut mysql_conn = match context.acquire_session_for_current_scope() {
+        let mut mysql_conn = match context
+            .acquire_session_for_current_scope(activity)
+            .map(|(session, _cancel_registration)| session)
+        {
             Ok(crate::db::DbPoolSession::MySQL { conn, db_type })
                 if db_type.is_same_type_as(expected_db_type) =>
             {
@@ -2209,11 +2216,29 @@ impl AppState {
                 .any(|tab| tab.sql_editor.is_query_running())
     }
 
+    fn apply_pending_registry_cancels(&self) {
+        self.sql_editor.apply_pending_registry_cancel();
+        for tab in &self.editor_tabs {
+            tab.sql_editor.apply_pending_registry_cancel();
+        }
+    }
+
+    fn configured_cancel_timeout(&self) -> Duration {
+        let seconds = self
+            .config
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .normalized_cancel_timeout_seconds();
+        Duration::from_secs(seconds as u64)
+    }
+
     fn has_cancelable_query_activity(&self) -> bool {
         self.editor_tabs.iter().any(|tab| {
             tab.sql_editor.is_query_running()
                 || tab.sql_editor.active_lazy_fetch_session().is_some()
-        })
+        }) || crate::db::active_db_activity_snapshots()
+            .iter()
+            .any(|activity| activity.cancelable)
     }
 
     fn active_connection_id(&self) -> Option<ConnectionId> {
@@ -3493,6 +3518,16 @@ impl AppState {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .clone();
+        // Nothing may keep reading as "in progress" after its connection went
+        // away. The registry knows which activities those are, and this runs on
+        // every status tick, so a teardown clears within one frame no matter
+        // which code path started the work.
+        crate::db::sweep_stale_db_activities(self.configured_cancel_timeout());
+        // The sweep (and any other registry cancel) only raises a flag on the
+        // affected tab, because the real cancel path is not `Send`. Running it
+        // here puts a registry-initiated cancel on exactly the same path as the
+        // cancel button, so the user is told it was cancelled.
+        self.apply_pending_registry_cancels();
         let activities = crate::db::active_db_activity_snapshots();
         let selected_activity = latest_status_activity(&activities);
         let displayed_registry_count = usize::from(selected_activity.is_some());
@@ -5984,13 +6019,61 @@ impl MainWindow {
                 }
             }));
             let Some(target) = target else {
-                return false;
+                // Nothing is executing, but an object metadata load can still be
+                // holding the status bar. It is cancelable from the same button.
+                return Self::cancel_tracked_db_activity(state);
             };
             if Self::cancel_query_editor_target(state, target) {
                 return true;
             }
         }
-        false
+        Self::cancel_tracked_db_activity(state)
+    }
+
+    /// Stop whatever tracked DB work the status bar is showing.
+    ///
+    /// Most DB work in the app — object browser metadata, IntelliSense schema
+    /// and column loads, bind parameter probes — runs on pool sessions rather
+    /// than on a query tab, so it has no cancel target snapshot. The activity
+    /// registry is what makes it reachable: anything holding a session is
+    /// cancelable, so the button never leaves the user with a status entry they
+    /// cannot end.
+    fn cancel_tracked_db_activity(state: &Arc<Mutex<AppState>>) -> bool {
+        let mut s = state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let force_timeout = s.configured_cancel_timeout();
+        let active_connection_id = s.active_connection_id();
+        // Cancel belongs to what the user is looking at: prefer the active tab's
+        // connection so the button never reaches into a background connection's
+        // work, then untagged work, and only then anything else. Newest first
+        // within whichever group wins.
+        let Some(target) = crate::db::active_db_activity_snapshots()
+            .into_iter()
+            .filter(|activity| activity.cancelable)
+            .max_by_key(|activity| {
+                let ownership_rank = if active_connection_id.is_some()
+                    && activity.connection_id == active_connection_id
+                {
+                    2
+                } else if activity.connection_id.is_none() {
+                    1
+                } else {
+                    0
+                };
+                (ownership_rank, activity.started_at, activity.id)
+            })
+        else {
+            return false;
+        };
+        if !crate::db::cancel_db_activity(target.id, force_timeout) {
+            return false;
+        }
+        // Keep the object browser's own view of its refresh in step with the
+        // registry, so a cancelled load does not look cancelable again.
+        s.object_browser.forget_cancelled_metadata_refresh();
+        s.set_status_message(&format!("Cancelled: {}", target.activity));
+        true
     }
 
     fn cancel_query_editor_tab(state: &Arc<Mutex<AppState>>, tab_id: QueryTabId) -> bool {
@@ -7844,6 +7927,9 @@ impl MainWindow {
         state
             .sql_editor
             .set_intellisense_popup_delay_ms(intellisense_popup_delay_ms);
+        state
+            .object_browser
+            .set_cancel_timeout_seconds(cancel_timeout_seconds);
     }
 
     fn persist_settings(
@@ -8829,10 +8915,13 @@ impl MainWindow {
         let connection_generation = context.connection_generation;
         let db_type = context.connection_info.db_type;
         let activity = db_type.metadata_refresh_activity(requested_scope.as_deref());
-        let _activity_guard =
+        let activity_guard =
             crate::db::track_pool_db_activity_for_connection(activity, db_type, connection_id);
-        let data =
-            schema_metadata_loader_for(db_type).load(context.clone(), requested_scope.clone())?;
+        let data = schema_metadata_loader_for(db_type).load(
+            context.clone(),
+            requested_scope.clone(),
+            &activity_guard,
+        )?;
         context.ensure_current().ok()?;
 
         let mut highlight_data = HighlightData::new();
@@ -11574,7 +11663,14 @@ impl MainWindow {
                 clear_mutex_flag(&s.schema_refresh_in_progress);
                 s.set_status_message("Disconnected active connection");
                 s.clear_metadata_for_connection(connection_id);
-                s.object_browser.refresh_runtime_labels();
+                // The status tick would retire this connection's work anyway,
+                // but doing it here means the bar is already correct by the
+                // time the disconnect returns.
+                let force_timeout = s.configured_cancel_timeout();
+                crate::db::cancel_db_activities_for_connection(connection_id, force_timeout);
+                crate::db::sweep_stale_db_activities(force_timeout);
+                s.object_browser
+                    .clear_on_disconnect_for_connection(connection_id);
                 let affected_tab_ids = s
                     .editor_tabs
                     .iter()
@@ -11684,11 +11780,16 @@ impl MainWindow {
                 let mut s = state
                     .lock()
                     .unwrap_or_else(|poisoned| poisoned.into_inner());
+                let force_timeout = s.configured_cancel_timeout();
                 for connection_id in disconnected.iter().copied() {
                     s.release_pooled_db_sessions_for_connection(connection_id);
                     s.clear_metadata_for_connection(connection_id);
                     s.clear_pending_metadata_for_connection(connection_id);
+                    crate::db::cancel_db_activities_for_connection(connection_id, force_timeout);
+                    s.object_browser
+                        .clear_on_disconnect_for_connection(connection_id);
                 }
+                crate::db::sweep_stale_db_activities(force_timeout);
                 s.pending_connection_metadata_refresh = false;
                 clear_mutex_flag(&s.schema_refresh_in_progress);
                 let active_tab_id = s.active_editor_tab_id;
@@ -14066,9 +14167,12 @@ impl MainWindow {
 
         crate::db::clear_tracked_db_activity();
         let (popups, editor_tabs, mut result_tabs, runtimes) = {
-            let s = state
+            let mut s = state
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
+            // Break metadata sessions before tearing the connections down, so
+            // exit does not wait on a job blocked in a DB call.
+            s.object_browser.cancel_metadata_refresh();
             (
                 s.popups.clone(),
                 s.editor_tabs.clone(),
@@ -15291,6 +15395,7 @@ mod tests {
                 db_type: Some(DatabaseType::Oracle),
                 connection_id: Some(first_connection_id),
                 progress: crate::db::DbActivityProgress::Indeterminate,
+                cancelable: false,
             },
             crate::db::DbActivitySnapshot {
                 id: 11,
@@ -15299,6 +15404,7 @@ mod tests {
                 db_type: Some(DatabaseType::Oracle),
                 connection_id: Some(second_connection_id),
                 progress: crate::db::DbActivityProgress::Indeterminate,
+                cancelable: false,
             },
         ];
 
@@ -15359,6 +15465,7 @@ mod tests {
                 db_type: Some(DatabaseType::Oracle),
                 connection_id: None,
                 progress: crate::db::DbActivityProgress::Indeterminate,
+                cancelable: false,
             },
             crate::db::DbActivitySnapshot {
                 id: 43,
@@ -15367,6 +15474,7 @@ mod tests {
                 db_type: Some(DatabaseType::Oracle),
                 connection_id: None,
                 progress: crate::db::DbActivityProgress::Indeterminate,
+                cancelable: false,
             },
         ];
 

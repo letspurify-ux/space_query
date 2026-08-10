@@ -872,7 +872,7 @@ impl SqlEditorWidget {
                     &connection,
                     Some(&activity),
                 )?;
-                let _activity_guard = crate::db::track_pool_db_activity(
+                let activity_guard = crate::db::track_pool_db_activity(
                     activity,
                     context.connection_info.db_type,
                 );
@@ -882,7 +882,8 @@ impl SqlEditorWidget {
                 ) {
                     return Err("Signature metadata connection changed before acquire".to_string());
                 }
-                let session = context.acquire_session_for_current_scope()?;
+                let (session, _cancel_registration) =
+                    context.acquire_session_for_current_scope(&activity_guard)?;
                 if !crate::db::cached_pool_session_context_matches_shared_connection(
                     &connection,
                     &context,

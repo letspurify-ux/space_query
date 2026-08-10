@@ -307,10 +307,41 @@ pub(crate) struct QueryProgressSender {
     operation_token: Option<QueryOperationToken>,
     status_activity: Option<crate::db::DbActivityGuard>,
     execution_origin: Arc<Mutex<Option<ExecutionOrigin>>>,
+    /// Cancel registrations for the sessions this operation is running on.
+    ///
+    /// A session is acquired in one function and used by the rest of the
+    /// execution, so the registration cannot live in the acquiring frame — it
+    /// would detach while the query is still running. Parking it here gives it
+    /// exactly the operation's lifetime, which is what makes the cancel button
+    /// reach a query for its whole duration rather than only while it starts.
+    session_registrations: Arc<Mutex<Vec<crate::db::DbSessionCancelRegistration>>>,
 }
 
 #[derive(Debug)]
 pub(crate) struct QueryProgressSendError;
+
+/// Keeps the session this operation is running on reachable by the cancel
+/// button for as long as the operation runs.
+impl crate::db::HoldsSessionCancelRegistration for QueryProgressSender {
+    fn hold_session_registration(&self, registration: crate::db::DbSessionCancelRegistration) {
+        // REPLACES rather than appends. An execution uses one session at a time,
+        // and the retry paths discard a session and acquire another; keeping the
+        // old registration would leave a cancel able to break a session that has
+        // since gone back to the pool and been handed to someone else.
+        let replaced = {
+            let mut registrations = crate::db::lock_order::Tracked::new(
+                crate::db::lock_order::names::SENDER_REGISTRATIONS,
+                &self.session_registrations,
+            );
+            let replaced = std::mem::take(&mut *registrations);
+            registrations.push(registration);
+            replaced
+        };
+        // Dropped outside the lock: releasing a registration takes the activity
+        // registry lock.
+        drop(replaced);
+    }
+}
 
 impl QueryProgressSender {
     fn new(sender: mpsc::Sender<QueryProgress>) -> Self {
@@ -319,6 +350,7 @@ impl QueryProgressSender {
             operation_token: None,
             status_activity: None,
             execution_origin: Arc::new(Mutex::new(None)),
+            session_registrations: Arc::new(Mutex::new(Vec::new())),
         }
     }
 
@@ -333,6 +365,9 @@ impl QueryProgressSender {
             operation_token: Some(token),
             status_activity: self.status_activity.clone(),
             execution_origin: Arc::new(Mutex::new(execution_origin)),
+            // A fresh operation gets fresh registrations; the previous
+            // operation's sessions are not this one's to cancel.
+            session_registrations: Arc::new(Mutex::new(Vec::new())),
         }
     }
 
@@ -362,6 +397,13 @@ impl QueryProgressSender {
         {
             origin.scope = scope;
         }
+    }
+
+    /// The activity this operation is tracked under. Sessions acquired for the
+    /// operation hang off this, so the status entry the user sees and the thing
+    /// the cancel button ends are the same object.
+    pub(crate) fn operation_activity(&self) -> Option<crate::db::DbActivityGuard> {
+        self.status_activity.clone()
     }
 
     fn status_finish_handle(&self) -> Option<crate::db::DbActivityFinishHandle> {
@@ -1189,7 +1231,7 @@ impl TransactionActionBackend for OracleTransactionActionBackend {
 
     fn run_transaction_action(
         &self,
-        conn_guard: crate::db::ConnectionLockGuard<'_>,
+        mut conn_guard: crate::db::ConnectionLockGuard<'_>,
         request: TransactionActionRequest<'_>,
     ) -> Result<(), String> {
         let TransactionActionRequest {
@@ -1206,9 +1248,17 @@ impl TransactionActionBackend for OracleTransactionActionBackend {
         } = request;
 
         let connection_generation = conn_guard.connection_generation();
-        let Some(retained_session) = pooled_db_session
-            .take_reusable_lease_for_resolution(connection_generation, DatabaseType::Oracle)
-        else {
+        let resolution_activity = conn_guard.activity();
+        let resolution_connection_info = conn_guard
+            .pool_session_context()
+            .map(|context| context.connection_info)
+            .unwrap_or_default();
+        let Some(retained_session) = pooled_db_session.take_reusable_lease_for_resolution(
+            connection_generation,
+            DatabaseType::Oracle,
+            &resolution_connection_info,
+            &resolution_activity,
+        ) else {
             drop(conn_guard);
             return Err("No retained DB session for this tab.".to_string());
         };
@@ -1842,15 +1892,6 @@ impl ExplainPlanBackend for MysqlExplainPlanBackend {
     }
 }
 
-fn oracle_force_close_already_completed(error: &oracle::Error) -> bool {
-    if matches!(error.dpi_code(), Some(1002 | 1010 | 1080))
-        || matches!(error.oci_code(), Some(3113 | 3114 | 3135))
-    {
-        return true;
-    }
-    crate::db::session_policy::message_indicates_connection_loss(&error.to_string())
-}
-
 /// Two-tier cancellation contract shared by every DB backend.
 ///
 /// - [`QueryCanceler::interrupt`] (tier 1, graceful): ask the server to abort
@@ -1876,7 +1917,7 @@ impl QueryCanceler for Arc<Connection> {
     fn terminate(self) -> Result<(), String> {
         match self.close_with_mode(oracle::conn::CloseMode::Drop) {
             Ok(()) => Ok(()),
-            Err(error) if oracle_force_close_already_completed(&error) => Ok(()),
+            Err(error) if crate::db::oracle_force_close_already_completed(&error) => Ok(()),
             Err(error) => Err(format!("Oracle force close failed: {error}")),
         }
     }
@@ -1913,6 +1954,22 @@ impl QueryCanceler for MySqlQueryCancelContext {
     }
 }
 
+/// Lets the DB activity registry cancel anything that runs on a query session,
+/// so the cancel button reaches work that has no query tab behind it.
+impl crate::db::DbActivityCanceler for QueryCancelHandle {
+    fn interrupt(&self) -> Result<(), String> {
+        self.cancel_interrupt()
+    }
+
+    fn force(&self) -> Result<(), String> {
+        self.clone().force_cancel_blocking()
+    }
+
+    fn label(&self) -> &'static str {
+        QueryCancelHandle::label(self)
+    }
+}
+
 impl QueryCancelHandle {
     fn cancel(self) -> Result<(), String> {
         thread::Builder::new()
@@ -1931,7 +1988,7 @@ impl QueryCancelHandle {
         }
     }
 
-    fn cancel_interrupt(&self) -> Result<(), String> {
+    pub(crate) fn cancel_interrupt(&self) -> Result<(), String> {
         match self {
             QueryCancelHandle::Oracle(conn) => conn.interrupt(),
             QueryCancelHandle::OracleThin(cancel_handle) => cancel_handle.interrupt(),
@@ -1963,7 +2020,7 @@ impl QueryCancelHandle {
         self.force_cancel_blocking()
     }
 
-    fn force_cancel_blocking(self) -> Result<(), String> {
+    pub(crate) fn force_cancel_blocking(self) -> Result<(), String> {
         match self {
             QueryCancelHandle::Oracle(conn) => conn.terminate(),
             QueryCancelHandle::OracleThin(cancel_handle) => cancel_handle.terminate(),
@@ -1995,7 +2052,7 @@ impl QueryCancelHandle {
         }
     }
 
-    fn label(&self) -> &'static str {
+    pub(crate) fn label(&self) -> &'static str {
         match self {
             QueryCancelHandle::Oracle(_) => "Oracle",
             QueryCancelHandle::OracleThin(_) => "Oracle thin",
@@ -2061,6 +2118,14 @@ pub struct SqlEditorWidget {
     /// a prompted value must never be mistaken for a `VARIABLE` declaration.
     last_bind_prompt_values: Arc<Mutex<HashMap<String, crate::ui::bind_prompt::RememberedValue>>>,
     cancel_flag: Arc<Mutex<bool>>,
+    /// Raised when the activity registry cancels this tab's work — a
+    /// disconnect, or the stale sweep.
+    ///
+    /// The registry runs its hook off the UI thread and `SqlEditorWidget` is not
+    /// `Send`, so the hook only raises this flag and the UI tick performs the
+    /// real cancel. That keeps a registry-initiated cancel on the same path as
+    /// the cancel button, instead of letting the query surface a driver error.
+    registry_cancel_pending: Arc<AtomicBool>,
     intellisense_data: Arc<Mutex<IntellisenseData>>,
     intellisense_popup: Arc<Mutex<IntellisensePopup>>,
     signature_popup: Arc<Mutex<SignaturePopup>>,
@@ -3026,6 +3091,7 @@ impl SqlEditorWidget {
         let pending_result_edit_request = Arc::new(Mutex::new(None));
         let last_bind_prompt_values = Arc::new(Mutex::new(HashMap::new()));
         let cancel_flag = Arc::new(Mutex::new(false));
+        let registry_cancel_pending = Arc::new(AtomicBool::new(false));
 
         let intellisense_popup = Arc::new(Mutex::new(IntellisensePopup::new()));
         let signature_popup = Arc::new(Mutex::new(SignaturePopup::new()));
@@ -3110,6 +3176,7 @@ impl SqlEditorWidget {
             pending_result_edit_request,
             last_bind_prompt_values,
             cancel_flag,
+            registry_cancel_pending,
             intellisense_data,
             intellisense_popup,
             signature_popup,
@@ -3219,10 +3286,24 @@ impl SqlEditorWidget {
             return RetainedSessionMutationOutcome::NoSession;
         }
 
-        let Some(mut retained_session) = self
-            .pooled_db_session
-            .take_reusable_lease_for_context_update(connection_generation, db_type)
-        else {
+        let scope_activity = crate::db::track_db_activity(
+            format!("Applying scope to retained {db_type} session"),
+            Some(db_type),
+        );
+        let scope_connection_info =
+            self.bound_connection()
+                .ok_or_else(|| crate::db::NOT_CONNECTED_MESSAGE.to_string())
+                .and_then(|connection| {
+                    crate::db::pool_session_context_for_shared_connection(&connection, None)
+                })
+                .map(|context| context.connection_info)
+                .unwrap_or_default();
+        let Some(mut retained_session) = self.pooled_db_session.take_reusable_lease_for_context_update(
+            connection_generation,
+            db_type,
+            &scope_connection_info,
+            &scope_activity,
+        ) else {
             return RetainedSessionMutationOutcome::NoSession;
         };
         let retained_state = retained_session.retained_state();
@@ -3301,18 +3382,28 @@ impl SqlEditorWidget {
         let Some(connection) = self.bound_connection() else {
             return Err(crate::db::NOT_CONNECTED_MESSAGE.to_string());
         };
-        let (connection_generation, db_type) = {
-            let Some(conn_guard) =
+        let (connection_generation, db_type, close_activity, close_connection_info) = {
+            let Some(mut conn_guard) =
                 crate::db::try_lock_connection_with_activity(&connection, "Closing query tab")
             else {
                 return Err(crate::db::format_connection_busy_message());
             };
-            (conn_guard.connection_generation(), conn_guard.db_type())
+            (
+                conn_guard.connection_generation(),
+                conn_guard.db_type(),
+                conn_guard.activity(),
+                conn_guard
+                    .pool_session_context()
+                    .map(|context| context.connection_info)
+                    .unwrap_or_default(),
+            )
         };
-        let Some(retained_session) = self
-            .pooled_db_session
-            .take_reusable_lease_for_resolution(connection_generation, db_type)
-        else {
+        let Some(retained_session) = self.pooled_db_session.take_reusable_lease_for_resolution(
+            connection_generation,
+            db_type,
+            &close_connection_info,
+            &close_activity,
+        ) else {
             return Ok(());
         };
         let retained_pool_context_epoch = retained_session.pool_context_epoch();
@@ -3823,24 +3914,18 @@ impl SqlEditorWidget {
                 let watchdog_claim = AtomicFlagResetGuard {
                     flag: cancel_watchdog_started,
                 };
-                let force_deadline = Instant::now() + timeout;
-                while Instant::now() < force_deadline {
-                    let cancel_is_still_pending = active_lazy_fetch
+                let escalate = crate::db::wait_for_graceful_cancel(timeout, || {
+                    active_lazy_fetch
                         .lock()
                         .unwrap_or_else(|poisoned| poisoned.into_inner())
                         .as_ref()
                         .is_some_and(|handle| {
                             handle.session_id == session_id
                                 && handle.cancel_requested.load(Ordering::Relaxed)
-                        });
-                    if !cancel_is_still_pending {
-                        return;
-                    }
-                    thread::sleep(
-                        force_deadline
-                            .saturating_duration_since(Instant::now())
-                            .min(Duration::from_millis(100)),
-                    );
+                        })
+                });
+                if !escalate {
+                    return;
                 }
                 let handle = {
                     let guard = active_lazy_fetch
@@ -5233,6 +5318,21 @@ impl SqlEditorWidget {
         current_operation_id: u64,
     ) -> bool {
         lazy_operation_id != 0 && lazy_operation_id > current_operation_id
+    }
+
+    /// The handle the activity registry raises when it cancels this tab's work.
+    pub(crate) fn registry_cancel_flag(&self) -> Arc<AtomicBool> {
+        Arc::clone(&self.registry_cancel_pending)
+    }
+
+    /// Perform a cancel the registry asked for, if any. Driven from the UI tick
+    /// because the real cancel path is not `Send`.
+    pub fn apply_pending_registry_cancel(&self) -> bool {
+        if !self.registry_cancel_pending.swap(false, Ordering::AcqRel) {
+            return false;
+        }
+        self.cancel_current();
+        true
     }
 
     pub fn cancel_current(&self) {
@@ -8577,14 +8677,14 @@ mod cancel_watchdog_tests {
             "ORA-03135: connection lost contact",
         ] {
             let error = oracle::Error::new(oracle::ErrorKind::InternalError, message);
-            assert!(oracle_force_close_already_completed(&error), "{message}");
+            assert!(crate::db::oracle_force_close_already_completed(&error), "{message}");
         }
 
         let ordinary_error = oracle::Error::new(
             oracle::ErrorKind::InternalError,
             "ORA-01031: insufficient privileges",
         );
-        assert!(!oracle_force_close_already_completed(&ordinary_error));
+        assert!(!crate::db::oracle_force_close_already_completed(&ordinary_error));
     }
 
     #[test]

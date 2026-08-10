@@ -99,7 +99,7 @@ impl ConnectionRuntime {
     pub fn unmanaged(connection: SharedConnection) -> Arc<Self> {
         let (info, state, connection_generation, pool_context_epoch) =
             runtime_metadata(&connection);
-        Arc::new(Self::new(
+        let runtime = Arc::new(Self::new(
             next_connection_id(),
             ConnectionOrigin::Unmanaged,
             connection,
@@ -107,7 +107,21 @@ impl ConnectionRuntime {
             state,
             connection_generation,
             pool_context_epoch,
-        ))
+        ));
+        runtime.claim_connection();
+        runtime
+    }
+
+    /// Record this runtime's id on the connection, so work started on it is
+    /// attributed to this connection automatically.
+    ///
+    /// Deliberately NOT done in `new`: a registration path holds the registry
+    /// lock while constructing runtimes, and taking the connection mutex there
+    /// would invert the lock order the rest of the app uses (connection first,
+    /// then the activity registry). Claiming after the registry lock is
+    /// released keeps that ordering total.
+    fn claim_connection(&self) {
+        crate::db::stamp_connection_id(&self.connection, self.id);
     }
 
     pub fn id(&self) -> ConnectionId {
@@ -259,6 +273,15 @@ impl Default for ConnectionRegistry {
 }
 
 impl ConnectionRegistry {
+    /// The registry's own mutex, tracked so the app-wide lock order is
+    /// observable at runtime.
+    fn lock_inner(&self) -> crate::db::lock_order::Tracked<'_, ConnectionRegistryInner> {
+        crate::db::lock_order::Tracked::new(
+            crate::db::lock_order::names::CONNECTION_REGISTRY,
+            &self.inner,
+        )
+    }
+
     pub fn new() -> Self {
         Self {
             inner: Arc::new(Mutex::new(ConnectionRegistryInner::default())),
@@ -272,10 +295,7 @@ impl ConnectionRegistry {
     ) -> RuntimeRegistration {
         let profile_name = profile_name.into();
         {
-            let inner = self
-                .inner
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let inner = self.lock_inner();
             if let Some(runtime) = inner
                 .saved_profiles
                 .get(&profile_name)
@@ -292,9 +312,7 @@ impl ConnectionRegistry {
         let (info, state, connection_generation, pool_context_epoch) =
             runtime_metadata(&connection);
         let mut inner = self
-            .inner
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+            .lock_inner();
         if let Some(runtime) = inner
             .saved_profiles
             .get(&profile_name)
@@ -321,6 +339,8 @@ impl ConnectionRegistry {
         ));
         inner.saved_profiles.insert(profile_name, id);
         inner.runtimes.insert(id, runtime.clone());
+        drop(inner);
+        runtime.claim_connection();
         RuntimeRegistration {
             runtime,
             reused: false,
@@ -352,18 +372,15 @@ impl ConnectionRegistry {
             connection_generation,
             pool_context_epoch,
         ));
-        self.inner
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
+        runtime.claim_connection();
+        self.lock_inner()
             .runtimes
             .insert(id, runtime.clone());
         runtime
     }
 
     pub fn get(&self, id: ConnectionId) -> Option<Arc<ConnectionRuntime>> {
-        self.inner
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
+        self.lock_inner()
             .runtimes
             .get(&id)
             .cloned()
@@ -371,9 +388,7 @@ impl ConnectionRegistry {
 
     pub fn saved_runtime(&self, profile_name: &str) -> Option<Arc<ConnectionRuntime>> {
         let inner = self
-            .inner
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+            .lock_inner();
         inner
             .saved_profiles
             .get(profile_name)
@@ -383,9 +398,7 @@ impl ConnectionRegistry {
 
     pub fn runtimes(&self) -> Vec<Arc<ConnectionRuntime>> {
         let mut runtimes = self
-            .inner
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .lock_inner()
             .runtimes
             .values()
             .cloned()
@@ -396,9 +409,7 @@ impl ConnectionRegistry {
 
     pub fn remove_transient_if_idle(&self, id: ConnectionId) -> bool {
         let mut inner = self
-            .inner
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+            .lock_inner();
         let removable = inner.runtimes.get(&id).is_some_and(|runtime| {
             matches!(runtime.origin(), ConnectionOrigin::TransientScript) && runtime.is_idle()
         });
@@ -626,7 +637,7 @@ impl TabConnectionBinding {
         } else {
             let (info, state, connection_generation, pool_context_epoch) =
                 runtime_metadata(&connection);
-            Arc::new(ConnectionRuntime::new(
+            let runtime = Arc::new(ConnectionRuntime::new(
                 next_connection_id(),
                 ConnectionOrigin::TransientScript,
                 connection,
@@ -634,7 +645,9 @@ impl TabConnectionBinding {
                 state,
                 connection_generation,
                 pool_context_epoch,
-            ))
+            ));
+            runtime.claim_connection();
+            runtime
         }
     }
 

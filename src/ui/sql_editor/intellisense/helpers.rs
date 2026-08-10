@@ -485,7 +485,7 @@ impl SqlEditorWidget {
                 return;
             }
         };
-        let _activity_guard =
+        let activity_guard =
             crate::db::track_pool_db_activity(activity, context.connection_info.db_type);
 
         if !crate::db::cached_pool_session_context_matches_shared_connection(&connection, &context)
@@ -494,7 +494,11 @@ impl SqlEditorWidget {
             return;
         }
 
-        let pool_session = match context.acquire_session_for_current_scope() {
+        // `_cancel_registration` keeps this column load reachable by the cancel
+        // button for as long as it holds the session.
+        let (pool_session, _cancel_registration) = match context
+            .acquire_session_for_current_scope(&activity_guard)
+        {
             Ok(session) => session,
             Err(_) => {
                 Self::send_empty_column_load_update(&sender, &table_key, foreign_keys);

@@ -1907,6 +1907,13 @@ fn main() {
             }
         }
     }
+    // This harness drives the real editor through 20+ execution scenarios per
+    // backend, so it observes far more of the app's lock graph than a targeted
+    // run does. Fail on any inversion it saw.
+    all_failures.extend(space_query::db::lock_order::report_observed_lock_order(
+        "transaction mode harness",
+    ));
+
     if all_failures.is_empty() {
         println!("\nALL TRANSACTION-MODE LIVE CHECKS PASSED");
     } else {

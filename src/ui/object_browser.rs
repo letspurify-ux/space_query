@@ -577,6 +577,7 @@ trait ObjectBrowserDbBehavior: Sync {
         &self,
         context: crate::db::DbPoolSessionContext,
         requested_scope: Option<String>,
+        activity: &crate::db::DbActivityGuard,
     ) -> Option<(
         crate::db::DatabaseType,
         ObjectCache,
@@ -655,6 +656,7 @@ enum RefreshRequest {
     },
 }
 
+
 const REFRESH_TREE_BATCH_SIZE: usize = 300;
 type ObjectMetadataLoadJob = Box<dyn FnOnce() -> ObjectCache + Send + 'static>;
 
@@ -662,6 +664,16 @@ struct PendingTreeRefresh {
     paths: Vec<String>,
     next_index: usize,
     activity_guard: crate::db::DbActivityGuard,
+}
+
+/// The handles that let the UI end a metadata load it started.
+///
+/// `activity` doubles as the liveness flag: it reports active for exactly as
+/// long as the load still owns a status-bar entry, so a finished refresh needs
+/// no separate bookkeeping to stop looking cancelable.
+struct InFlightMetadataRefresh {
+    activity_id: u64,
+    activity: crate::db::DbActivityFinishHandle,
 }
 
 enum ObjectActionResult {
@@ -766,6 +778,10 @@ pub struct ObjectBrowserWidget {
     tab_local_scope_selection: Arc<AtomicBool>,
     refresh_connection_generation: Arc<AtomicU64>,
     pending_tree_refresh: Arc<Mutex<Option<PendingTreeRefresh>>>,
+    in_flight_metadata_refresh: Arc<Mutex<Option<InFlightMetadataRefresh>>>,
+    /// How long a metadata cancel waits for the graceful break before forcing
+    /// the session closed. Same user setting as the query cancel timeout.
+    cancel_timeout: Arc<Mutex<Duration>>,
     poll_lifecycle: Arc<()>,
     refresh_request_sender: Sender<RefreshRequest>,
     action_sender: std::sync::mpsc::Sender<ObjectActionResult>,
@@ -854,6 +870,10 @@ impl ObjectBrowserWidget {
         let tab_local_scope_selection = Arc::new(AtomicBool::new(false));
         let refresh_connection_generation = Arc::new(AtomicU64::new(0));
         let pending_tree_refresh = Arc::new(Mutex::new(None));
+        let in_flight_metadata_refresh = Arc::new(Mutex::new(None));
+        let cancel_timeout = Arc::new(Mutex::new(Duration::from_secs(
+            crate::utils::config::DEFAULT_CANCEL_TIMEOUT_SECONDS as u64,
+        )));
         let poll_lifecycle = Arc::new(());
 
         let (refresh_sender, refresh_receiver) = std::sync::mpsc::channel::<RefreshEvent>();
@@ -886,6 +906,8 @@ impl ObjectBrowserWidget {
             tab_local_scope_selection,
             refresh_connection_generation,
             pending_tree_refresh,
+            in_flight_metadata_refresh,
+            cancel_timeout,
             poll_lifecycle,
             sql_callback,
             status_callback,
@@ -4152,7 +4174,7 @@ impl ObjectBrowserWidget {
         let base_context = Self::object_action_pool_session_context(connection)?;
         let context = base_context.for_scope(selected_scope);
         let db_type = context.connection_info.db_type;
-        let _activity_guard = crate::db::track_pool_db_activity(activity, db_type);
+        let activity_guard = crate::db::track_pool_db_activity(activity, db_type);
         Self::ensure_object_action_context_current(connection, &base_context)?;
         // session.md §3 / §27 — narrow the race between scope validation and
         // session acquire. `ensure_object_action_context_current` uses a
@@ -4168,7 +4190,11 @@ impl ObjectBrowserWidget {
                     .to_string(),
             );
         }
-        let session = base_context.acquire_session_for_scope(selected_scope)?;
+        // The registration rides along to the end of the action, so the cancel
+        // button and the stale sweep can reach this session for as long as it
+        // is in use.
+        let (session, _cancel_registration) =
+            base_context.acquire_session_for_scope(selected_scope, &activity_guard)?;
         if !crate::db::cached_pool_session_context_matches_shared_connection(
             connection,
             &base_context,
@@ -4203,11 +4229,17 @@ impl ObjectBrowserWidget {
 
     fn acquire_oracle_metadata_session(
         context: &crate::db::DbPoolSessionContext,
-    ) -> Option<oracle::Connection> {
+        activity: &crate::db::DbActivityGuard,
+    ) -> Option<(Arc<oracle::Connection>, crate::db::DbSessionCancelRegistration)> {
+        if activity.is_finished() {
+            return None;
+        }
         context.ensure_current().ok()?;
-        match context.acquire_session_for_current_scope() {
-            Ok(crate::db::DbPoolSession::Oracle(conn)) => Some(conn),
-            Ok(other) => {
+        match context.acquire_session_for_current_scope(activity) {
+            Ok((crate::db::DbPoolSession::Oracle(conn), registration)) => {
+                Some((conn, registration))
+            }
+            Ok((other, _registration)) => {
                 eprintln!(
                     "Warning: expected Oracle object-browser metadata session but acquired {}",
                     other.db_type()
@@ -4225,11 +4257,20 @@ impl ObjectBrowserWidget {
 
     fn acquire_oracle_thin_metadata_session(
         context: &crate::db::DbPoolSessionContext,
-    ) -> Option<tns_thin::pool::PooledThinConnection<tns_thin::OracleThinSession>> {
+        activity: &crate::db::DbActivityGuard,
+    ) -> Option<(
+        tns_thin::pool::PooledThinConnection<tns_thin::OracleThinSession>,
+        crate::db::DbSessionCancelRegistration,
+    )> {
+        if activity.is_finished() {
+            return None;
+        }
         context.ensure_current().ok()?;
-        match context.acquire_session_for_current_scope() {
-            Ok(crate::db::DbPoolSession::OracleThin(conn)) => Some(*conn),
-            Ok(other) => {
+        match context.acquire_session_for_current_scope(activity) {
+            Ok((crate::db::DbPoolSession::OracleThin(conn), registration)) => {
+                Some((*conn, registration))
+            }
+            Ok((other, _registration)) => {
                 eprintln!(
                     "Warning: expected Oracle Thin object-browser metadata session but acquired {}",
                     other.db_type()
@@ -4248,17 +4289,23 @@ impl ObjectBrowserWidget {
     fn acquire_mysql_metadata_session(
         context: &crate::db::DbPoolSessionContext,
         selected_scope: &str,
-    ) -> Option<mysql::PooledConn> {
+        activity: &crate::db::DbActivityGuard,
+    ) -> Option<(mysql::PooledConn, crate::db::DbSessionCancelRegistration)> {
+        if activity.is_finished() {
+            return None;
+        }
         context.ensure_current().ok()?;
         let expected_db_type = context.connection_info.db_type;
         let display_name = expected_db_type.display_name();
-        let mut mysql_conn = match context.acquire_session_for_current_scope() {
-            Ok(crate::db::DbPoolSession::MySQL { conn, db_type })
+        let (mut mysql_conn, registration) = match context
+            .acquire_session_for_current_scope(activity)
+        {
+            Ok((crate::db::DbPoolSession::MySQL { conn, db_type }, registration))
                 if db_type.is_same_type_as(expected_db_type) =>
             {
-                conn
+                (conn, registration)
             }
-            Ok(other) => {
+            Ok((other, _registration)) => {
                 eprintln!(
                     "Warning: expected {display_name} object-browser metadata session but acquired {}",
                     other.db_type()
@@ -4293,7 +4340,7 @@ impl ObjectBrowserWidget {
             return None;
         }
 
-        Some(mysql_conn)
+        Some((mysql_conn, registration))
     }
 
     fn object_metadata_worker_limit(context: &crate::db::DbPoolSessionContext) -> usize {
@@ -4304,12 +4351,13 @@ impl ObjectBrowserWidget {
         context: &crate::db::DbPoolSessionContext,
         mut jobs: Vec<ObjectMetadataLoadJob>,
         worker_limit: usize,
+        activity: &crate::db::DbActivityGuard,
     ) -> ObjectCache {
         let worker_limit = worker_limit.max(1);
         let mut cache = ObjectCache::default();
         thread::scope(|scope| {
             while !jobs.is_empty() {
-                if !context.is_current() {
+                if !context.is_current() || activity.is_finished() {
                     break;
                 }
                 let batch_len = worker_limit.min(jobs.len());
@@ -4320,7 +4368,7 @@ impl ObjectBrowserWidget {
                 }
                 for handle in handles {
                     if let Ok(partial) = handle.join() {
-                        if !context.is_current() {
+                        if !context.is_current() || activity.is_finished() {
                             break;
                         }
                         ObjectBrowserWidget::merge_object_metadata_cache(&mut cache, partial);
@@ -7103,6 +7151,11 @@ impl ObjectBrowserWidget {
     /// Clear the object browser tree and cache without triggering a network refetch.
     /// Called when the database connection is closed or lost.
     pub fn clear_on_disconnect(&mut self) {
+        // A disconnect does not unblock a metadata job on its own: the job holds
+        // a leased session, and the OCI and MySQL pools close to a no-op. Break
+        // the sessions here so the load stops instead of running to completion
+        // against a connection the user already closed.
+        self.cancel_metadata_refresh();
         self.scope_generation.fetch_add(1, Ordering::Relaxed);
         self.scope_switch_in_progress
             .store(false, Ordering::Release);
@@ -7148,6 +7201,16 @@ impl ObjectBrowserWidget {
             Self::scope_refresh_status_message(db_type, requested_scope.as_deref()),
             db_type,
         );
+        // A refresh that is already running is superseded by this one, so it is
+        // cancelled rather than left to finish against the old scope.
+        self.cancel_metadata_refresh();
+        *self
+            .in_flight_metadata_refresh
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(InFlightMetadataRefresh {
+            activity_id: activity_guard.id(),
+            activity: activity_guard.finish_handle(),
+        });
         let connection_generation = context.connection_generation;
         self.refresh_connection_generation
             .store(connection_generation, Ordering::Relaxed);
@@ -7170,6 +7233,74 @@ impl ObjectBrowserWidget {
         true
     }
 
+    pub fn set_cancel_timeout_seconds(&self, seconds: u32) {
+        let seconds = crate::utils::config::AppConfig::clamp_cancel_timeout_seconds(seconds);
+        *self
+            .cancel_timeout
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Duration::from_secs(seconds as u64);
+    }
+
+    fn cancel_timeout(&self) -> Duration {
+        *self
+            .cancel_timeout
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// Drop the record of a refresh that the activity registry already retired,
+    /// so a load cancelled through the registry is not offered again.
+    pub fn forget_cancelled_metadata_refresh(&mut self) {
+        let mut in_flight = self
+            .in_flight_metadata_refresh
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if in_flight
+            .as_ref()
+            .is_some_and(|refresh| !refresh.activity.is_active())
+        {
+            *in_flight = None;
+            drop(in_flight);
+            self.clear_pending_tree_refresh();
+        }
+    }
+
+    /// Whether a metadata load is still running and still owns a status entry.
+    pub fn metadata_refresh_in_flight(&self) -> bool {
+        self.in_flight_metadata_refresh
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .as_ref()
+            .is_some_and(|refresh| refresh.activity.is_active())
+    }
+
+    /// Stop the in-flight metadata load. Returns whether there was one to stop.
+    ///
+    /// The status entry is released here rather than when the worker returns:
+    /// the worker can still be unwinding a broken session for a while, and the
+    /// user has already been told the load is over.
+    pub fn cancel_metadata_refresh(&mut self) -> bool {
+        let refresh = self
+            .in_flight_metadata_refresh
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take();
+        let Some(refresh) = refresh.filter(|refresh| refresh.activity.is_active()) else {
+            return false;
+        };
+        // The registry breaks every session still open under this activity and
+        // retires the entry, so the status bar stops showing the load even
+        // though the worker can still be unwinding a broken session.
+        crate::db::cancel_db_activity(refresh.activity_id, self.cancel_timeout());
+        refresh.activity.finish();
+        // Anything the worker still delivers belongs to a load the user ended,
+        // so make the result fail the generation check on arrival.
+        self.refresh_connection_generation
+            .fetch_add(1, Ordering::Relaxed);
+        self.clear_pending_tree_refresh();
+        true
+    }
+
     fn spawn_refresh_worker(
         refresh_request_receiver: Receiver<RefreshRequest>,
         refresh_sender: Sender<RefreshEvent>,
@@ -7185,7 +7316,7 @@ impl ObjectBrowserWidget {
                     } => {
                         let connection_generation = context.connection_generation;
                         match panic::catch_unwind(AssertUnwindSafe(|| {
-                            Self::load_metadata_cache(context, selected_scope)
+                            Self::load_metadata_cache(context, selected_scope, &activity_guard)
                         })) {
                             Ok(Some((db_type, cache, available_scopes, selected_scope))) => {
                                 let _ = refresh_sender.send(RefreshEvent::Finished {
@@ -7279,6 +7410,7 @@ impl ObjectBrowserWidget {
     fn load_metadata_cache(
         context: crate::db::DbPoolSessionContext,
         requested_scope: Option<String>,
+        activity: &crate::db::DbActivityGuard,
     ) -> Option<(
         crate::db::DatabaseType,
         ObjectCache,
@@ -7286,7 +7418,10 @@ impl ObjectBrowserWidget {
         Option<String>,
     )> {
         let db_type = context.connection_info.db_type;
-        object_browser_behavior_for(db_type).load_metadata_cache(context, requested_scope)
+        if activity.is_finished() {
+            return None;
+        }
+        object_browser_behavior_for(db_type).load_metadata_cache(context, requested_scope, activity)
     }
 
     fn clear_items(&mut self) {
@@ -8134,6 +8269,7 @@ impl ObjectBrowserDbBehavior for OracleObjectBrowserBehavior {
         &self,
         context: crate::db::DbPoolSessionContext,
         requested_scope: Option<String>,
+        activity: &crate::db::DbActivityGuard,
     ) -> Option<(
         crate::db::DatabaseType,
         ObjectCache,
@@ -8143,9 +8279,9 @@ impl ObjectBrowserDbBehavior for OracleObjectBrowserBehavior {
         let db_type = context.connection_info.db_type;
         context.ensure_current().ok()?;
         let (current_schema, mut available_scopes, use_thin_metadata) = match context
-            .acquire_session_for_current_scope()
+            .acquire_session_for_current_scope(activity)
         {
-            Ok(crate::db::DbPoolSession::Oracle(conn)) => {
+            Ok((crate::db::DbPoolSession::Oracle(conn), _cancel_registration)) => {
                 let current_schema = context
                     .oracle_current_schema
                     .clone()
@@ -8162,7 +8298,7 @@ impl ObjectBrowserDbBehavior for OracleObjectBrowserBehavior {
                 let available_scopes = ObjectBrowser::get_users(&conn).unwrap_or_default();
                 (current_schema, available_scopes, false)
             }
-            Ok(crate::db::DbPoolSession::OracleThin(mut conn)) => {
+            Ok((crate::db::DbPoolSession::OracleThin(mut conn), _cancel_registration)) => {
                 let current_schema = context
                     .oracle_current_schema
                     .clone()
@@ -8179,7 +8315,7 @@ impl ObjectBrowserDbBehavior for OracleObjectBrowserBehavior {
                 let available_scopes = ObjectBrowser::get_thin_users(&mut conn).unwrap_or_default();
                 (current_schema, available_scopes, true)
             }
-            Ok(other) => {
+            Ok((other, _cancel_registration)) => {
                 eprintln!(
                     "Warning: expected Oracle object-browser metadata session but acquired {}",
                     other.db_type()
@@ -8212,13 +8348,15 @@ impl ObjectBrowserDbBehavior for OracleObjectBrowserBehavior {
             let mut jobs: Vec<ObjectMetadataLoadJob> = Vec::new();
 
             let context_for_tables = context.clone();
+            let activity_for_tables = activity.clone();
             let scope_for_tables = selected_scope.clone();
             jobs.push(Box::new(move || {
                 let mut cache = ObjectCache::default();
                 cache.tables = if use_thin_metadata {
-                    let Some(mut db_conn) =
+                    let Some((mut db_conn, _cancel_registration)) =
                         ObjectBrowserWidget::acquire_oracle_thin_metadata_session(
                             &context_for_tables,
+                            &activity_for_tables,
                         )
                     else {
                         return cache;
@@ -8226,8 +8364,11 @@ impl ObjectBrowserDbBehavior for OracleObjectBrowserBehavior {
                     ObjectBrowser::get_thin_tables_by_owner(&mut db_conn, &scope_for_tables)
                         .unwrap_or_default()
                 } else {
-                    let Some(db_conn) =
-                        ObjectBrowserWidget::acquire_oracle_metadata_session(&context_for_tables)
+                    let Some((db_conn, _cancel_registration)) =
+                        ObjectBrowserWidget::acquire_oracle_metadata_session(
+                            &context_for_tables,
+                            &activity_for_tables,
+                        )
                     else {
                         return cache;
                     };
@@ -8238,13 +8379,15 @@ impl ObjectBrowserDbBehavior for OracleObjectBrowserBehavior {
             }));
 
             let context_for_views = context.clone();
+            let activity_for_views = activity.clone();
             let scope_for_views = selected_scope.clone();
             jobs.push(Box::new(move || {
                 let mut cache = ObjectCache::default();
                 cache.views = if use_thin_metadata {
-                    let Some(mut db_conn) =
+                    let Some((mut db_conn, _cancel_registration)) =
                         ObjectBrowserWidget::acquire_oracle_thin_metadata_session(
                             &context_for_views,
+                            &activity_for_views,
                         )
                     else {
                         return cache;
@@ -8252,8 +8395,11 @@ impl ObjectBrowserDbBehavior for OracleObjectBrowserBehavior {
                     ObjectBrowser::get_thin_views_by_owner(&mut db_conn, &scope_for_views)
                         .unwrap_or_default()
                 } else {
-                    let Some(db_conn) =
-                        ObjectBrowserWidget::acquire_oracle_metadata_session(&context_for_views)
+                    let Some((db_conn, _cancel_registration)) =
+                        ObjectBrowserWidget::acquire_oracle_metadata_session(
+                            &context_for_views,
+                            &activity_for_views,
+                        )
                     else {
                         return cache;
                     };
@@ -8264,13 +8410,15 @@ impl ObjectBrowserDbBehavior for OracleObjectBrowserBehavior {
             }));
 
             let context_for_procedures = context.clone();
+            let activity_for_procedures = activity.clone();
             let scope_for_procedures = selected_scope.clone();
             jobs.push(Box::new(move || {
                 let mut cache = ObjectCache::default();
                 cache.procedures = if use_thin_metadata {
-                    let Some(mut db_conn) =
+                    let Some((mut db_conn, _cancel_registration)) =
                         ObjectBrowserWidget::acquire_oracle_thin_metadata_session(
                             &context_for_procedures,
+                            &activity_for_procedures,
                         )
                     else {
                         return cache;
@@ -8278,9 +8426,10 @@ impl ObjectBrowserDbBehavior for OracleObjectBrowserBehavior {
                     ObjectBrowser::get_thin_procedures_by_owner(&mut db_conn, &scope_for_procedures)
                         .unwrap_or_default()
                 } else {
-                    let Some(db_conn) = ObjectBrowserWidget::acquire_oracle_metadata_session(
-                        &context_for_procedures,
-                    ) else {
+                    let Some((db_conn, _cancel_registration)) = ObjectBrowserWidget::acquire_oracle_metadata_session(
+                            &context_for_procedures,
+                            &activity_for_procedures,
+                        ) else {
                         return cache;
                     };
                     ObjectBrowser::get_procedures_by_owner(&db_conn, &scope_for_procedures)
@@ -8290,13 +8439,15 @@ impl ObjectBrowserDbBehavior for OracleObjectBrowserBehavior {
             }));
 
             let context_for_functions = context.clone();
+            let activity_for_functions = activity.clone();
             let scope_for_functions = selected_scope.clone();
             jobs.push(Box::new(move || {
                 let mut cache = ObjectCache::default();
                 cache.functions = if use_thin_metadata {
-                    let Some(mut db_conn) =
+                    let Some((mut db_conn, _cancel_registration)) =
                         ObjectBrowserWidget::acquire_oracle_thin_metadata_session(
                             &context_for_functions,
+                            &activity_for_functions,
                         )
                     else {
                         return cache;
@@ -8304,9 +8455,10 @@ impl ObjectBrowserDbBehavior for OracleObjectBrowserBehavior {
                     ObjectBrowser::get_thin_functions_by_owner(&mut db_conn, &scope_for_functions)
                         .unwrap_or_default()
                 } else {
-                    let Some(db_conn) = ObjectBrowserWidget::acquire_oracle_metadata_session(
-                        &context_for_functions,
-                    ) else {
+                    let Some((db_conn, _cancel_registration)) = ObjectBrowserWidget::acquire_oracle_metadata_session(
+                            &context_for_functions,
+                            &activity_for_functions,
+                        ) else {
                         return cache;
                     };
                     ObjectBrowser::get_functions_by_owner(&db_conn, &scope_for_functions)
@@ -8316,13 +8468,15 @@ impl ObjectBrowserDbBehavior for OracleObjectBrowserBehavior {
             }));
 
             let context_for_sequences = context.clone();
+            let activity_for_sequences = activity.clone();
             let scope_for_sequences = selected_scope.clone();
             jobs.push(Box::new(move || {
                 let mut cache = ObjectCache::default();
                 cache.sequences = if use_thin_metadata {
-                    let Some(mut db_conn) =
+                    let Some((mut db_conn, _cancel_registration)) =
                         ObjectBrowserWidget::acquire_oracle_thin_metadata_session(
                             &context_for_sequences,
+                            &activity_for_sequences,
                         )
                     else {
                         return cache;
@@ -8330,9 +8484,10 @@ impl ObjectBrowserDbBehavior for OracleObjectBrowserBehavior {
                     ObjectBrowser::get_thin_sequences_by_owner(&mut db_conn, &scope_for_sequences)
                         .unwrap_or_default()
                 } else {
-                    let Some(db_conn) = ObjectBrowserWidget::acquire_oracle_metadata_session(
-                        &context_for_sequences,
-                    ) else {
+                    let Some((db_conn, _cancel_registration)) = ObjectBrowserWidget::acquire_oracle_metadata_session(
+                            &context_for_sequences,
+                            &activity_for_sequences,
+                        ) else {
                         return cache;
                     };
                     ObjectBrowser::get_sequences_by_owner(&db_conn, &scope_for_sequences)
@@ -8342,13 +8497,15 @@ impl ObjectBrowserDbBehavior for OracleObjectBrowserBehavior {
             }));
 
             let context_for_triggers = context.clone();
+            let activity_for_triggers = activity.clone();
             let scope_for_triggers = selected_scope.clone();
             jobs.push(Box::new(move || {
                 let mut cache = ObjectCache::default();
                 cache.triggers = if use_thin_metadata {
-                    let Some(mut db_conn) =
+                    let Some((mut db_conn, _cancel_registration)) =
                         ObjectBrowserWidget::acquire_oracle_thin_metadata_session(
                             &context_for_triggers,
+                            &activity_for_triggers,
                         )
                     else {
                         return cache;
@@ -8356,8 +8513,11 @@ impl ObjectBrowserDbBehavior for OracleObjectBrowserBehavior {
                     ObjectBrowser::get_thin_triggers_by_owner(&mut db_conn, &scope_for_triggers)
                         .unwrap_or_default()
                 } else {
-                    let Some(db_conn) =
-                        ObjectBrowserWidget::acquire_oracle_metadata_session(&context_for_triggers)
+                    let Some((db_conn, _cancel_registration)) =
+                        ObjectBrowserWidget::acquire_oracle_metadata_session(
+                            &context_for_triggers,
+                            &activity_for_triggers,
+                        )
                     else {
                         return cache;
                     };
@@ -8368,13 +8528,15 @@ impl ObjectBrowserDbBehavior for OracleObjectBrowserBehavior {
             }));
 
             let context_for_synonyms = context.clone();
+            let activity_for_synonyms = activity.clone();
             let scope_for_synonyms = selected_scope.clone();
             jobs.push(Box::new(move || {
                 let mut cache = ObjectCache::default();
                 cache.synonyms = if use_thin_metadata {
-                    let Some(mut db_conn) =
+                    let Some((mut db_conn, _cancel_registration)) =
                         ObjectBrowserWidget::acquire_oracle_thin_metadata_session(
                             &context_for_synonyms,
+                            &activity_for_synonyms,
                         )
                     else {
                         return cache;
@@ -8382,8 +8544,11 @@ impl ObjectBrowserDbBehavior for OracleObjectBrowserBehavior {
                     ObjectBrowser::get_thin_synonyms_by_owner(&mut db_conn, &scope_for_synonyms)
                         .unwrap_or_default()
                 } else {
-                    let Some(db_conn) =
-                        ObjectBrowserWidget::acquire_oracle_metadata_session(&context_for_synonyms)
+                    let Some((db_conn, _cancel_registration)) =
+                        ObjectBrowserWidget::acquire_oracle_metadata_session(
+                            &context_for_synonyms,
+                            &activity_for_synonyms,
+                        )
                     else {
                         return cache;
                     };
@@ -8394,13 +8559,15 @@ impl ObjectBrowserDbBehavior for OracleObjectBrowserBehavior {
             }));
 
             let context_for_packages = context.clone();
+            let activity_for_packages = activity.clone();
             let scope_for_packages = selected_scope;
             jobs.push(Box::new(move || {
                 let mut cache = ObjectCache::default();
                 cache.packages = if use_thin_metadata {
-                    let Some(mut db_conn) =
+                    let Some((mut db_conn, _cancel_registration)) =
                         ObjectBrowserWidget::acquire_oracle_thin_metadata_session(
                             &context_for_packages,
+                            &activity_for_packages,
                         )
                     else {
                         return cache;
@@ -8408,8 +8575,11 @@ impl ObjectBrowserDbBehavior for OracleObjectBrowserBehavior {
                     ObjectBrowser::get_thin_packages_by_owner(&mut db_conn, &scope_for_packages)
                         .unwrap_or_default()
                 } else {
-                    let Some(db_conn) =
-                        ObjectBrowserWidget::acquire_oracle_metadata_session(&context_for_packages)
+                    let Some((db_conn, _cancel_registration)) =
+                        ObjectBrowserWidget::acquire_oracle_metadata_session(
+                            &context_for_packages,
+                            &activity_for_packages,
+                        )
                     else {
                         return cache;
                     };
@@ -8419,7 +8589,7 @@ impl ObjectBrowserDbBehavior for OracleObjectBrowserBehavior {
                 cache
             }));
 
-            ObjectBrowserWidget::load_object_metadata_jobs(&context, jobs, worker_limit)
+            ObjectBrowserWidget::load_object_metadata_jobs(&context, jobs, worker_limit, activity)
         } else {
             ObjectCache::default()
         };
@@ -8785,6 +8955,7 @@ impl ObjectBrowserDbBehavior for MysqlObjectBrowserBehavior {
         &self,
         context: crate::db::DbPoolSessionContext,
         requested_scope: Option<String>,
+        activity: &crate::db::DbActivityGuard,
     ) -> Option<(
         crate::db::DatabaseType,
         ObjectCache,
@@ -8799,12 +8970,17 @@ impl ObjectBrowserDbBehavior for MysqlObjectBrowserBehavior {
         let requested_scope = requested_scope
             .map(|scope| scope.trim().to_string())
             .filter(|scope| !scope.is_empty());
-        let mut mysql_conn = match context.acquire_session_for_current_scope() {
-            Ok(crate::db::DbPoolSession::MySQL {
-                conn,
-                db_type: session_db_type,
-            }) if session_db_type.is_same_type_as(db_type) => conn,
-            Ok(other) => {
+        let (mut mysql_conn, _cancel_registration) = match context
+            .acquire_session_for_current_scope(activity)
+        {
+            Ok((
+                crate::db::DbPoolSession::MySQL {
+                    conn,
+                    db_type: session_db_type,
+                },
+                registration,
+            )) if session_db_type.is_same_type_as(db_type) => (conn, registration),
+            Ok((other, _registration)) => {
                 eprintln!(
                     "Warning: expected {display_name} object-browser metadata session but acquired {}",
                     other.db_type()
@@ -8875,13 +9051,15 @@ impl ObjectBrowserDbBehavior for MysqlObjectBrowserBehavior {
             let mut jobs: Vec<ObjectMetadataLoadJob> = Vec::new();
 
             let context_for_tables = context.clone();
+            let activity_for_tables = activity.clone();
             let scope_for_tables = selected_scope.clone();
             jobs.push(Box::new(move || {
                 let mut cache = ObjectCache::default();
-                let Some(mut mysql_conn) = ObjectBrowserWidget::acquire_mysql_metadata_session(
-                    &context_for_tables,
-                    &scope_for_tables,
-                ) else {
+                let Some((mut mysql_conn, _cancel_registration)) = ObjectBrowserWidget::acquire_mysql_metadata_session(
+                            &context_for_tables,
+                            &scope_for_tables,
+                            &activity_for_tables,
+                        ) else {
                     return cache;
                 };
                 cache.tables =
@@ -8890,13 +9068,15 @@ impl ObjectBrowserDbBehavior for MysqlObjectBrowserBehavior {
             }));
 
             let context_for_views = context.clone();
+            let activity_for_views = activity.clone();
             let scope_for_views = selected_scope.clone();
             jobs.push(Box::new(move || {
                 let mut cache = ObjectCache::default();
-                let Some(mut mysql_conn) = ObjectBrowserWidget::acquire_mysql_metadata_session(
-                    &context_for_views,
-                    &scope_for_views,
-                ) else {
+                let Some((mut mysql_conn, _cancel_registration)) = ObjectBrowserWidget::acquire_mysql_metadata_session(
+                            &context_for_views,
+                            &scope_for_views,
+                            &activity_for_views,
+                        ) else {
                     return cache;
                 };
                 cache.views =
@@ -8905,13 +9085,15 @@ impl ObjectBrowserDbBehavior for MysqlObjectBrowserBehavior {
             }));
 
             let context_for_procedures = context.clone();
+            let activity_for_procedures = activity.clone();
             let scope_for_procedures = selected_scope.clone();
             jobs.push(Box::new(move || {
                 let mut cache = ObjectCache::default();
-                let Some(mut mysql_conn) = ObjectBrowserWidget::acquire_mysql_metadata_session(
-                    &context_for_procedures,
-                    &scope_for_procedures,
-                ) else {
+                let Some((mut mysql_conn, _cancel_registration)) = ObjectBrowserWidget::acquire_mysql_metadata_session(
+                            &context_for_procedures,
+                            &scope_for_procedures,
+                            &activity_for_procedures,
+                        ) else {
                     return cache;
                 };
                 cache.procedures =
@@ -8920,13 +9102,15 @@ impl ObjectBrowserDbBehavior for MysqlObjectBrowserBehavior {
             }));
 
             let context_for_functions = context.clone();
+            let activity_for_functions = activity.clone();
             let scope_for_functions = selected_scope.clone();
             jobs.push(Box::new(move || {
                 let mut cache = ObjectCache::default();
-                let Some(mut mysql_conn) = ObjectBrowserWidget::acquire_mysql_metadata_session(
-                    &context_for_functions,
-                    &scope_for_functions,
-                ) else {
+                let Some((mut mysql_conn, _cancel_registration)) = ObjectBrowserWidget::acquire_mysql_metadata_session(
+                            &context_for_functions,
+                            &scope_for_functions,
+                            &activity_for_functions,
+                        ) else {
                     return cache;
                 };
                 cache.functions =
@@ -8935,13 +9119,15 @@ impl ObjectBrowserDbBehavior for MysqlObjectBrowserBehavior {
             }));
 
             let context_for_sequences = context.clone();
+            let activity_for_sequences = activity.clone();
             let scope_for_sequences = selected_scope.clone();
             jobs.push(Box::new(move || {
                 let mut cache = ObjectCache::default();
-                let Some(mut mysql_conn) = ObjectBrowserWidget::acquire_mysql_metadata_session(
-                    &context_for_sequences,
-                    &scope_for_sequences,
-                ) else {
+                let Some((mut mysql_conn, _cancel_registration)) = ObjectBrowserWidget::acquire_mysql_metadata_session(
+                            &context_for_sequences,
+                            &scope_for_sequences,
+                            &activity_for_sequences,
+                        ) else {
                     return cache;
                 };
                 cache.sequences =
@@ -8950,13 +9136,15 @@ impl ObjectBrowserDbBehavior for MysqlObjectBrowserBehavior {
             }));
 
             let context_for_triggers = context.clone();
+            let activity_for_triggers = activity.clone();
             let scope_for_triggers = selected_scope.clone();
             jobs.push(Box::new(move || {
                 let mut cache = ObjectCache::default();
-                let Some(mut mysql_conn) = ObjectBrowserWidget::acquire_mysql_metadata_session(
-                    &context_for_triggers,
-                    &scope_for_triggers,
-                ) else {
+                let Some((mut mysql_conn, _cancel_registration)) = ObjectBrowserWidget::acquire_mysql_metadata_session(
+                            &context_for_triggers,
+                            &scope_for_triggers,
+                            &activity_for_triggers,
+                        ) else {
                     return cache;
                 };
                 cache.triggers =
@@ -8965,13 +9153,15 @@ impl ObjectBrowserDbBehavior for MysqlObjectBrowserBehavior {
             }));
 
             let context_for_events = context.clone();
+            let activity_for_events = activity.clone();
             let scope_for_events = selected_scope;
             jobs.push(Box::new(move || {
                 let mut cache = ObjectCache::default();
-                let Some(mut mysql_conn) = ObjectBrowserWidget::acquire_mysql_metadata_session(
-                    &context_for_events,
-                    &scope_for_events,
-                ) else {
+                let Some((mut mysql_conn, _cancel_registration)) = ObjectBrowserWidget::acquire_mysql_metadata_session(
+                            &context_for_events,
+                            &scope_for_events,
+                            &activity_for_events,
+                        ) else {
                     return cache;
                 };
                 cache.events =
@@ -8979,7 +9169,7 @@ impl ObjectBrowserDbBehavior for MysqlObjectBrowserBehavior {
                 cache
             }));
 
-            ObjectBrowserWidget::load_object_metadata_jobs(&context, jobs, worker_limit)
+            ObjectBrowserWidget::load_object_metadata_jobs(&context, jobs, worker_limit, activity)
         } else {
             ObjectCache::default()
         };
@@ -9639,6 +9829,62 @@ impl MultiObjectBrowserWidget {
         self.refresh_runtime_labels();
     }
 
+    fn browser_for_connection(&self, connection_id: ConnectionId) -> Option<ObjectBrowserWidget> {
+        self.entries
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .iter()
+            .find(|entry| entry.connection_id == connection_id)
+            .map(|entry| entry.browser.clone())
+    }
+
+    /// Clear the browser of the connection that just went away. Keyed by
+    /// connection rather than by what is bound or visible, so disconnecting a
+    /// background connection stops its metadata load too.
+    pub fn clear_on_disconnect_for_connection(&mut self, connection_id: ConnectionId) {
+        if let Some(mut browser) = self.browser_for_connection(connection_id) {
+            browser.clear_on_disconnect();
+        }
+        self.refresh_runtime_labels();
+    }
+
+    fn browsers(&self) -> Vec<ObjectBrowserWidget> {
+        self.entries
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .iter()
+            .map(|entry| entry.browser.clone())
+            .collect()
+    }
+
+    pub fn forget_cancelled_metadata_refresh(&mut self) {
+        for mut browser in self.browsers() {
+            browser.forget_cancelled_metadata_refresh();
+        }
+    }
+
+    /// Whether any connection's object browser is still loading metadata.
+    pub fn metadata_refresh_in_flight(&self) -> bool {
+        self.browsers()
+            .iter()
+            .any(ObjectBrowserWidget::metadata_refresh_in_flight)
+    }
+
+    /// Cancel every in-flight metadata load. Returns whether one was stopped.
+    pub fn cancel_metadata_refresh(&mut self) -> bool {
+        self.browsers()
+            .into_iter()
+            .fold(false, |cancelled, mut browser| {
+                browser.cancel_metadata_refresh() || cancelled
+            })
+    }
+
+    pub fn set_cancel_timeout_seconds(&self, seconds: u32) {
+        for browser in self.browsers() {
+            browser.set_cancel_timeout_seconds(seconds);
+        }
+    }
+
     pub fn refresh_with_context(&mut self, context: crate::db::DbPoolSessionContext) -> bool {
         self.bound_browser()
             .is_some_and(|mut browser| browser.refresh_with_context(context))
@@ -9798,6 +10044,7 @@ mod tests {
     use crate::ui::{IntellisenseData, QualifiedMemberKind};
     use fltk::enums::Key;
     use std::sync::{Arc, Mutex};
+
     use tns_thin::exec::StatementRequest as OracleThinStatementRequest;
 
     #[test]
@@ -10024,8 +10271,15 @@ mod tests {
         )
         .expect("load UI object browser pool context");
         let (db_type, cache, available_scopes, selected_scope) =
-            ObjectBrowserWidget::load_metadata_cache(context, None)
-                .expect("load UI object browser metadata cache");
+            ObjectBrowserWidget::load_metadata_cache(
+                context,
+                None,
+                &crate::db::track_pool_db_activity(
+                    "Load object browser metadata",
+                    DatabaseType::Oracle,
+                ),
+            )
+            .expect("load UI object browser metadata cache");
 
         assert_eq!(db_type, DatabaseType::Oracle);
         let selected_scope = selected_scope.expect("selected Oracle scope");

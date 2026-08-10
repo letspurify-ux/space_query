@@ -1,4 +1,5 @@
 pub mod connection;
+pub mod lock_order;
 pub mod query;
 pub mod result_edit;
 pub mod runtime;
