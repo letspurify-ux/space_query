@@ -3290,20 +3290,23 @@ impl SqlEditorWidget {
             format!("Applying scope to retained {db_type} session"),
             Some(db_type),
         );
-        let scope_connection_info =
-            self.bound_connection()
-                .ok_or_else(|| crate::db::NOT_CONNECTED_MESSAGE.to_string())
-                .and_then(|connection| {
-                    crate::db::pool_session_context_for_shared_connection(&connection, None)
-                })
-                .map(|context| context.connection_info)
-                .unwrap_or_default();
-        let Some(mut retained_session) = self.pooled_db_session.take_reusable_lease_for_context_update(
-            connection_generation,
-            db_type,
-            &scope_connection_info,
-            &scope_activity,
-        ) else {
+        let scope_connection_info = self
+            .bound_connection()
+            .ok_or_else(|| crate::db::NOT_CONNECTED_MESSAGE.to_string())
+            .and_then(|connection| {
+                crate::db::pool_session_context_for_shared_connection(&connection, None)
+            })
+            .map(|context| context.connection_info)
+            .unwrap_or_default();
+        let Some(mut retained_session) = self
+            .pooled_db_session
+            .take_reusable_lease_for_context_update(
+                connection_generation,
+                db_type,
+                &scope_connection_info,
+                &scope_activity,
+            )
+        else {
             return RetainedSessionMutationOutcome::NoSession;
         };
         let retained_state = retained_session.retained_state();
@@ -8677,14 +8680,19 @@ mod cancel_watchdog_tests {
             "ORA-03135: connection lost contact",
         ] {
             let error = oracle::Error::new(oracle::ErrorKind::InternalError, message);
-            assert!(crate::db::oracle_force_close_already_completed(&error), "{message}");
+            assert!(
+                crate::db::oracle_force_close_already_completed(&error),
+                "{message}"
+            );
         }
 
         let ordinary_error = oracle::Error::new(
             oracle::ErrorKind::InternalError,
             "ORA-01031: insufficient privileges",
         );
-        assert!(!crate::db::oracle_force_close_already_completed(&ordinary_error));
+        assert!(!crate::db::oracle_force_close_already_completed(
+            &ordinary_error
+        ));
     }
 
     #[test]

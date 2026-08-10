@@ -311,8 +311,7 @@ impl ConnectionRegistry {
 
         let (info, state, connection_generation, pool_context_epoch) =
             runtime_metadata(&connection);
-        let mut inner = self
-            .lock_inner();
+        let mut inner = self.lock_inner();
         if let Some(runtime) = inner
             .saved_profiles
             .get(&profile_name)
@@ -373,22 +372,16 @@ impl ConnectionRegistry {
             pool_context_epoch,
         ));
         runtime.claim_connection();
-        self.lock_inner()
-            .runtimes
-            .insert(id, runtime.clone());
+        self.lock_inner().runtimes.insert(id, runtime.clone());
         runtime
     }
 
     pub fn get(&self, id: ConnectionId) -> Option<Arc<ConnectionRuntime>> {
-        self.lock_inner()
-            .runtimes
-            .get(&id)
-            .cloned()
+        self.lock_inner().runtimes.get(&id).cloned()
     }
 
     pub fn saved_runtime(&self, profile_name: &str) -> Option<Arc<ConnectionRuntime>> {
-        let inner = self
-            .lock_inner();
+        let inner = self.lock_inner();
         inner
             .saved_profiles
             .get(profile_name)
@@ -408,8 +401,7 @@ impl ConnectionRegistry {
     }
 
     pub fn remove_transient_if_idle(&self, id: ConnectionId) -> bool {
-        let mut inner = self
-            .lock_inner();
+        let mut inner = self.lock_inner();
         let removable = inner.runtimes.get(&id).is_some_and(|runtime| {
             matches!(runtime.origin(), ConnectionOrigin::TransientScript) && runtime.is_idle()
         });

@@ -69,9 +69,7 @@ mod tracking {
                     .unwrap_or_else(|poisoned| poisoned.into_inner());
                 let mut inverted = Vec::new();
                 for held in &outer {
-                    observed
-                        .entry((held, name))
-                        .or_insert_with(|| site.clone());
+                    observed.entry((held, name)).or_insert_with(|| site.clone());
                     if held == &name {
                         inverted.push(format!(
                             "re-entrant acquire of {name} (already held) at {site}"
@@ -99,9 +97,7 @@ mod tracking {
                     // invert synthetic names on purpose.
                     let real: Vec<&String> = inverted
                         .iter()
-                        .filter(|entry| {
-                            super::names::ALL.iter().any(|name| entry.contains(name))
-                        })
+                        .filter(|entry| super::names::ALL.iter().any(|name| entry.contains(name)))
                         .collect();
                     if !real.is_empty() && strict() {
                         panic!(
@@ -365,9 +361,7 @@ mod app_lock_order {
     #[test]
     fn the_app_never_inverts_shared_lock_order() {
         if std::env::var("SPACE_QUERY_LOCK_ORDER_CHECK").is_err() {
-            println!(
-                "lock-order check skipped; set SPACE_QUERY_LOCK_ORDER_CHECK=1 to enable it"
-            );
+            println!("lock-order check skipped; set SPACE_QUERY_LOCK_ORDER_CHECK=1 to enable it");
             return;
         }
         for (outer, inner) in super::shared_observed_lock_order() {

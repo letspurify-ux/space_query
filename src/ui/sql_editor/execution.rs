@@ -791,8 +791,7 @@ impl ExecutionWorkerBackend for OracleExecutionWorkerBackend {
                                 cancel_registration,
                             );
                             session
-                        })
-                    {
+                        }) {
                         Ok(DbPoolSession::OracleThin(conn)) => {
                             (*conn, RetainedSessionState::default())
                         }
@@ -21588,11 +21587,19 @@ impl SqlEditorWidget {
         auto_commit: bool,
         db_activity: &str,
     ) {
-        let (connection_generation, pool_context_epoch, finalize_activity, finalize_connection_info) = {
+        let (
+            connection_generation,
+            pool_context_epoch,
+            finalize_activity,
+            finalize_connection_info,
+        ) = {
             let mut conn_guard =
                 lock_connection_with_activity(shared_connection, db_activity.to_string());
             let finalize_activity = conn_guard.activity();
-            let finalize_connection_info = conn_guard.pool_session_context().ok().map(|context| context.connection_info);
+            let finalize_connection_info = conn_guard
+                .pool_session_context()
+                .ok()
+                .map(|context| context.connection_info);
             (
                 conn_guard.connection_generation(),
                 conn_guard.pool_context_epoch(),
@@ -22281,18 +22288,17 @@ impl SqlEditorWidget {
                         if require_existing_session {
                             return Err("No reusable DB session for this tab.".to_string());
                         }
-                        let (conn, cancel_registration) =
-                            Self::acquire_fresh_mysql_pool_session(
-                                &context,
-                                session_pool_sender,
-                                &activity,
-                            )?;
-                if let Some(sender) = session_pool_sender {
-                    crate::db::HoldsSessionCancelRegistration::hold_session_registration(
-                        sender,
-                        cancel_registration,
-                    );
-                }
+                        let (conn, cancel_registration) = Self::acquire_fresh_mysql_pool_session(
+                            &context,
+                            session_pool_sender,
+                            &activity,
+                        )?;
+                        if let Some(sender) = session_pool_sender {
+                            crate::db::HoldsSessionCancelRegistration::hold_session_registration(
+                                sender,
+                                cancel_registration,
+                            );
+                        }
                         (
                             Self::prepare_mysql_pooled_session_or_retry_once(
                                 &context,
@@ -22315,18 +22321,17 @@ impl SqlEditorWidget {
                         if require_existing_session {
                             return Err(message);
                         }
-                        let (conn, cancel_registration) =
-                            Self::acquire_fresh_mysql_pool_session(
-                                &context,
-                                session_pool_sender,
-                                &activity,
-                            )?;
-                if let Some(sender) = session_pool_sender {
-                    crate::db::HoldsSessionCancelRegistration::hold_session_registration(
-                        sender,
-                        cancel_registration,
-                    );
-                }
+                        let (conn, cancel_registration) = Self::acquire_fresh_mysql_pool_session(
+                            &context,
+                            session_pool_sender,
+                            &activity,
+                        )?;
+                        if let Some(sender) = session_pool_sender {
+                            crate::db::HoldsSessionCancelRegistration::hold_session_registration(
+                                sender,
+                                cancel_registration,
+                            );
+                        }
                         (
                             Self::prepare_mysql_pooled_session_or_retry_once(
                                 &context,
@@ -22353,8 +22358,11 @@ impl SqlEditorWidget {
                 if require_existing_session {
                     return Err("No retained DB session for this tab.".to_string());
                 }
-                let (conn, cancel_registration) =
-                    Self::acquire_fresh_mysql_pool_session(&context, session_pool_sender, &activity)?;
+                let (conn, cancel_registration) = Self::acquire_fresh_mysql_pool_session(
+                    &context,
+                    session_pool_sender,
+                    &activity,
+                )?;
                 if let Some(sender) = session_pool_sender {
                     crate::db::HoldsSessionCancelRegistration::hold_session_registration(
                         sender,
@@ -22416,12 +22424,12 @@ impl SqlEditorWidget {
                             session_pool_sender,
                             &activity,
                         )?;
-                if let Some(sender) = session_pool_sender {
-                    crate::db::HoldsSessionCancelRegistration::hold_session_registration(
-                        sender,
-                        cancel_registration,
-                    );
-                }
+                    if let Some(sender) = session_pool_sender {
+                        crate::db::HoldsSessionCancelRegistration::hold_session_registration(
+                            sender,
+                            cancel_registration,
+                        );
+                    }
                     fresh_conn = Self::prepare_mysql_pooled_session_or_retry_once(
                         &context,
                         session_pool_sender,
@@ -22481,12 +22489,11 @@ impl SqlEditorWidget {
                     ),
                 );
                 Self::discard_mysql_pooled_connection(conn);
-                let (mut fresh_conn, cancel_registration) =
-                    Self::acquire_fresh_mysql_pool_session(
-                        &context,
-                        session_pool_sender,
-                        &activity,
-                    )?;
+                let (mut fresh_conn, cancel_registration) = Self::acquire_fresh_mysql_pool_session(
+                    &context,
+                    session_pool_sender,
+                    &activity,
+                )?;
                 if let Some(sender) = session_pool_sender {
                     crate::db::HoldsSessionCancelRegistration::hold_session_registration(
                         sender,
@@ -39341,27 +39348,24 @@ mod mysql_transaction_feedback_tests {
             events.len()
         );
 
-        let retained_session =
-            match pooled_db_session.take_reusable_lease(
-                1,
-                1,
-                crate::db::DatabaseType::Oracle,
-                &crate::db::ConnectionInfo::default(),
-                &crate::db::track_db_activity("test", Some(crate::db::DatabaseType::Oracle)),
-            ) {
-                crate::db::RetainedSessionTakeOutcome::Reusable(session) => session,
-                crate::db::RetainedSessionTakeOutcome::NoSession => {
-                    panic!(
-                        "same tab should still be able to take a retained session, got no session"
-                    )
-                }
-                crate::db::RetainedSessionTakeOutcome::DiscardedBecauseStale => {
-                    panic!("same tab retained session was discarded as stale")
-                }
-                crate::db::RetainedSessionTakeOutcome::BlockedContextMismatch(_) => {
-                    panic!("same tab retained session was blocked by context mismatch")
-                }
-            };
+        let retained_session = match pooled_db_session.take_reusable_lease(
+            1,
+            1,
+            crate::db::DatabaseType::Oracle,
+            &crate::db::ConnectionInfo::default(),
+            &crate::db::track_db_activity("test", Some(crate::db::DatabaseType::Oracle)),
+        ) {
+            crate::db::RetainedSessionTakeOutcome::Reusable(session) => session,
+            crate::db::RetainedSessionTakeOutcome::NoSession => {
+                panic!("same tab should still be able to take a retained session, got no session")
+            }
+            crate::db::RetainedSessionTakeOutcome::DiscardedBecauseStale => {
+                panic!("same tab retained session was discarded as stale")
+            }
+            crate::db::RetainedSessionTakeOutcome::BlockedContextMismatch(_) => {
+                panic!("same tab retained session was blocked by context mismatch")
+            }
+        };
         let (mut conn, _) = retained_session
             .into_oracle_thin_connection_with_retained_state()
             .expect("retained tab session should be Oracle thin");

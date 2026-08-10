@@ -656,7 +656,6 @@ enum RefreshRequest {
     },
 }
 
-
 const REFRESH_TREE_BATCH_SIZE: usize = 300;
 type ObjectMetadataLoadJob = Box<dyn FnOnce() -> ObjectCache + Send + 'static>;
 
@@ -4230,7 +4229,10 @@ impl ObjectBrowserWidget {
     fn acquire_oracle_metadata_session(
         context: &crate::db::DbPoolSessionContext,
         activity: &crate::db::DbActivityGuard,
-    ) -> Option<(Arc<oracle::Connection>, crate::db::DbSessionCancelRegistration)> {
+    ) -> Option<(
+        Arc<oracle::Connection>,
+        crate::db::DbSessionCancelRegistration,
+    )> {
         if activity.is_finished() {
             return None;
         }
@@ -8426,10 +8428,12 @@ impl ObjectBrowserDbBehavior for OracleObjectBrowserBehavior {
                     ObjectBrowser::get_thin_procedures_by_owner(&mut db_conn, &scope_for_procedures)
                         .unwrap_or_default()
                 } else {
-                    let Some((db_conn, _cancel_registration)) = ObjectBrowserWidget::acquire_oracle_metadata_session(
+                    let Some((db_conn, _cancel_registration)) =
+                        ObjectBrowserWidget::acquire_oracle_metadata_session(
                             &context_for_procedures,
                             &activity_for_procedures,
-                        ) else {
+                        )
+                    else {
                         return cache;
                     };
                     ObjectBrowser::get_procedures_by_owner(&db_conn, &scope_for_procedures)
@@ -8455,10 +8459,12 @@ impl ObjectBrowserDbBehavior for OracleObjectBrowserBehavior {
                     ObjectBrowser::get_thin_functions_by_owner(&mut db_conn, &scope_for_functions)
                         .unwrap_or_default()
                 } else {
-                    let Some((db_conn, _cancel_registration)) = ObjectBrowserWidget::acquire_oracle_metadata_session(
+                    let Some((db_conn, _cancel_registration)) =
+                        ObjectBrowserWidget::acquire_oracle_metadata_session(
                             &context_for_functions,
                             &activity_for_functions,
-                        ) else {
+                        )
+                    else {
                         return cache;
                     };
                     ObjectBrowser::get_functions_by_owner(&db_conn, &scope_for_functions)
@@ -8484,10 +8490,12 @@ impl ObjectBrowserDbBehavior for OracleObjectBrowserBehavior {
                     ObjectBrowser::get_thin_sequences_by_owner(&mut db_conn, &scope_for_sequences)
                         .unwrap_or_default()
                 } else {
-                    let Some((db_conn, _cancel_registration)) = ObjectBrowserWidget::acquire_oracle_metadata_session(
+                    let Some((db_conn, _cancel_registration)) =
+                        ObjectBrowserWidget::acquire_oracle_metadata_session(
                             &context_for_sequences,
                             &activity_for_sequences,
-                        ) else {
+                        )
+                    else {
                         return cache;
                     };
                     ObjectBrowser::get_sequences_by_owner(&db_conn, &scope_for_sequences)
@@ -9055,11 +9063,13 @@ impl ObjectBrowserDbBehavior for MysqlObjectBrowserBehavior {
             let scope_for_tables = selected_scope.clone();
             jobs.push(Box::new(move || {
                 let mut cache = ObjectCache::default();
-                let Some((mut mysql_conn, _cancel_registration)) = ObjectBrowserWidget::acquire_mysql_metadata_session(
-                            &context_for_tables,
-                            &scope_for_tables,
-                            &activity_for_tables,
-                        ) else {
+                let Some((mut mysql_conn, _cancel_registration)) =
+                    ObjectBrowserWidget::acquire_mysql_metadata_session(
+                        &context_for_tables,
+                        &scope_for_tables,
+                        &activity_for_tables,
+                    )
+                else {
                     return cache;
                 };
                 cache.tables =
@@ -9072,11 +9082,13 @@ impl ObjectBrowserDbBehavior for MysqlObjectBrowserBehavior {
             let scope_for_views = selected_scope.clone();
             jobs.push(Box::new(move || {
                 let mut cache = ObjectCache::default();
-                let Some((mut mysql_conn, _cancel_registration)) = ObjectBrowserWidget::acquire_mysql_metadata_session(
-                            &context_for_views,
-                            &scope_for_views,
-                            &activity_for_views,
-                        ) else {
+                let Some((mut mysql_conn, _cancel_registration)) =
+                    ObjectBrowserWidget::acquire_mysql_metadata_session(
+                        &context_for_views,
+                        &scope_for_views,
+                        &activity_for_views,
+                    )
+                else {
                     return cache;
                 };
                 cache.views =
@@ -9089,11 +9101,13 @@ impl ObjectBrowserDbBehavior for MysqlObjectBrowserBehavior {
             let scope_for_procedures = selected_scope.clone();
             jobs.push(Box::new(move || {
                 let mut cache = ObjectCache::default();
-                let Some((mut mysql_conn, _cancel_registration)) = ObjectBrowserWidget::acquire_mysql_metadata_session(
-                            &context_for_procedures,
-                            &scope_for_procedures,
-                            &activity_for_procedures,
-                        ) else {
+                let Some((mut mysql_conn, _cancel_registration)) =
+                    ObjectBrowserWidget::acquire_mysql_metadata_session(
+                        &context_for_procedures,
+                        &scope_for_procedures,
+                        &activity_for_procedures,
+                    )
+                else {
                     return cache;
                 };
                 cache.procedures =
@@ -9106,11 +9120,13 @@ impl ObjectBrowserDbBehavior for MysqlObjectBrowserBehavior {
             let scope_for_functions = selected_scope.clone();
             jobs.push(Box::new(move || {
                 let mut cache = ObjectCache::default();
-                let Some((mut mysql_conn, _cancel_registration)) = ObjectBrowserWidget::acquire_mysql_metadata_session(
-                            &context_for_functions,
-                            &scope_for_functions,
-                            &activity_for_functions,
-                        ) else {
+                let Some((mut mysql_conn, _cancel_registration)) =
+                    ObjectBrowserWidget::acquire_mysql_metadata_session(
+                        &context_for_functions,
+                        &scope_for_functions,
+                        &activity_for_functions,
+                    )
+                else {
                     return cache;
                 };
                 cache.functions =
@@ -9123,11 +9139,13 @@ impl ObjectBrowserDbBehavior for MysqlObjectBrowserBehavior {
             let scope_for_sequences = selected_scope.clone();
             jobs.push(Box::new(move || {
                 let mut cache = ObjectCache::default();
-                let Some((mut mysql_conn, _cancel_registration)) = ObjectBrowserWidget::acquire_mysql_metadata_session(
-                            &context_for_sequences,
-                            &scope_for_sequences,
-                            &activity_for_sequences,
-                        ) else {
+                let Some((mut mysql_conn, _cancel_registration)) =
+                    ObjectBrowserWidget::acquire_mysql_metadata_session(
+                        &context_for_sequences,
+                        &scope_for_sequences,
+                        &activity_for_sequences,
+                    )
+                else {
                     return cache;
                 };
                 cache.sequences =
@@ -9140,11 +9158,13 @@ impl ObjectBrowserDbBehavior for MysqlObjectBrowserBehavior {
             let scope_for_triggers = selected_scope.clone();
             jobs.push(Box::new(move || {
                 let mut cache = ObjectCache::default();
-                let Some((mut mysql_conn, _cancel_registration)) = ObjectBrowserWidget::acquire_mysql_metadata_session(
-                            &context_for_triggers,
-                            &scope_for_triggers,
-                            &activity_for_triggers,
-                        ) else {
+                let Some((mut mysql_conn, _cancel_registration)) =
+                    ObjectBrowserWidget::acquire_mysql_metadata_session(
+                        &context_for_triggers,
+                        &scope_for_triggers,
+                        &activity_for_triggers,
+                    )
+                else {
                     return cache;
                 };
                 cache.triggers =
@@ -9157,11 +9177,13 @@ impl ObjectBrowserDbBehavior for MysqlObjectBrowserBehavior {
             let scope_for_events = selected_scope;
             jobs.push(Box::new(move || {
                 let mut cache = ObjectCache::default();
-                let Some((mut mysql_conn, _cancel_registration)) = ObjectBrowserWidget::acquire_mysql_metadata_session(
-                            &context_for_events,
-                            &scope_for_events,
-                            &activity_for_events,
-                        ) else {
+                let Some((mut mysql_conn, _cancel_registration)) =
+                    ObjectBrowserWidget::acquire_mysql_metadata_session(
+                        &context_for_events,
+                        &scope_for_events,
+                        &activity_for_events,
+                    )
+                else {
                     return cache;
                 };
                 cache.events =

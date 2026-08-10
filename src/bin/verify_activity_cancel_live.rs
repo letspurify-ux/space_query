@@ -137,7 +137,10 @@ impl Target {
 
     fn setup_sql(self) -> Vec<&'static str> {
         if self.is_oracle() {
-            vec!["DROP TABLE SQ_CANCEL_T", "CREATE TABLE SQ_CANCEL_T (V NUMBER)"]
+            vec![
+                "DROP TABLE SQ_CANCEL_T",
+                "CREATE TABLE SQ_CANCEL_T (V NUMBER)",
+            ]
         } else {
             vec![
                 "DROP TABLE IF EXISTS SQ_CANCEL_T",
@@ -246,9 +249,7 @@ impl SlowStatement {
         });
 
         // Do not start asserting until the statement is genuinely in flight.
-        if !wait_until(Duration::from_secs(30), || {
-            acquired.load(Ordering::Acquire)
-        }) {
+        if !wait_until(Duration::from_secs(30), || acquired.load(Ordering::Acquire)) {
             return Err("slow statement never acquired its session".into());
         }
         thread::sleep(Duration::from_millis(400));
@@ -308,9 +309,7 @@ fn run_slow_statement(session: DbPoolSession, sql: &str) -> Result<(), String> {
         }
         DbPoolSession::MySQL { mut conn, .. } => {
             use mysql::prelude::Queryable;
-            conn.as_mut()
-                .query_drop(sql)
-                .map_err(|err| err.to_string())
+            conn.as_mut().query_drop(sql).map_err(|err| err.to_string())
         }
     }
 }
@@ -349,7 +348,8 @@ fn verify(target: Target) -> Result<Vec<String>, String> {
     // ---- A1..A3: the cancel button path -----------------------------------
     clear_tracked_db_activity();
     {
-        let activity = track_pool_db_activity("Live cancel probe", target.connection_info().db_type);
+        let activity =
+            track_pool_db_activity("Live cancel probe", target.connection_info().db_type);
         let activity_id = activity.id();
         let statement = SlowStatement::spawn(&harness, activity.clone())?;
 
@@ -361,7 +361,8 @@ fn verify(target: Target) -> Result<Vec<String>, String> {
             Some(_) => {}
         }
         if statement.is_finished() {
-            failures.push("A1: the probe statement finished on its own; it is not slow enough".into());
+            failures
+                .push("A1: the probe statement finished on its own; it is not slow enough".into());
         }
 
         let cancelled = cancel_db_activity(activity_id, PROBE_CANCEL_TIMEOUT);
@@ -525,7 +526,9 @@ fn verify(target: Target) -> Result<Vec<String>, String> {
                 let _ = editor.run(sql, Duration::from_secs(30));
             }
             if !editor.run(target.retain_session_sql(), Duration::from_secs(30)) {
-                failures.push(format!("{label}: could not open a transaction to retain the session"));
+                failures.push(format!(
+                    "{label}: could not open a transaction to retain the session"
+                ));
             }
             if editor.retained_session_state().is_none() {
                 failures.push(format!(
@@ -547,11 +550,15 @@ fn verify(target: Target) -> Result<Vec<String>, String> {
             )),
             Some(target_activity) => {
                 if editor.is_done() {
-                    failures.push(format!("{label}: the editor query finished before it could be cancelled"));
+                    failures.push(format!(
+                        "{label}: the editor query finished before it could be cancelled"
+                    ));
                 }
                 let started = Instant::now();
                 if !cancel_db_activity(target_activity.id, PROBE_CANCEL_TIMEOUT) {
-                    failures.push(format!("{label}: cancel_db_activity did not find the editor query"));
+                    failures.push(format!(
+                        "{label}: cancel_db_activity did not find the editor query"
+                    ));
                 }
                 if !editor.wait_done(cancel_deadline()) {
                     failures.push(format!(
@@ -567,13 +574,19 @@ fn verify(target: Target) -> Result<Vec<String>, String> {
                     }
                     println!(
                         "   {label} {} query ended after {:?} via {}",
-                        if retained { "retained-session" } else { "fresh-session" },
+                        if retained {
+                            "retained-session"
+                        } else {
+                            "fresh-session"
+                        },
                         started.elapsed(),
                         tier_label(started.elapsed())
                     );
                 }
                 if snapshot_for(target_activity.id).is_some() {
-                    failures.push(format!("{label}: the query's status entry survived the cancel"));
+                    failures.push(format!(
+                        "{label}: the query's status entry survived the cancel"
+                    ));
                 }
 
                 // A9: the user must be told this was a cancel, not a failure.
@@ -600,7 +613,6 @@ fn verify(target: Target) -> Result<Vec<String>, String> {
             }
         }
         let _ = editor.wait_done(Duration::from_secs(10));
-
     }
 
     clear_tracked_db_activity();
@@ -632,7 +644,8 @@ impl EditorHarness {
                         .unwrap_or_else(|poisoned| poisoned.into_inner())
                         .push(result.message.clone());
                 }
-                QueryProgress::Message { lines, .. } | QueryProgress::ScriptOutput { lines, .. } => {
+                QueryProgress::Message { lines, .. }
+                | QueryProgress::ScriptOutput { lines, .. } => {
                     messages
                         .lock()
                         .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -662,7 +675,8 @@ impl EditorHarness {
     }
 
     fn wait_done(&self, within: Duration) -> bool {
-        self.pump_until(within, || self.is_done().then_some(())).is_some()
+        self.pump_until(within, || self.is_done().then_some(()))
+            .is_some()
     }
 
     fn run(&mut self, sql: &str, within: Duration) -> bool {
@@ -709,7 +723,6 @@ fn progress_inner(event: &QueryProgress) -> &QueryProgress {
         other => other,
     }
 }
-
 
 fn main() {
     let _app = app::App::default();

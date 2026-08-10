@@ -1620,7 +1620,8 @@ impl DbPoolSessionContext {
         // Tie the activity to this connection before the session exists, so a
         // teardown that lands mid-acquire still retires this work.
         activity.bind_lifetime(self.activity_lifetime());
-        let (mut session, registration) = self.pool.acquire_session(&self.connection_info, activity)?;
+        let (mut session, registration) =
+            self.pool.acquire_session(&self.connection_info, activity)?;
         if let Err(err) = self.ensure_current() {
             Self::discard_stale_session(session);
             return Err(err);
@@ -2310,10 +2311,7 @@ impl SharedDbSessionLease {
     }
 
     pub fn clear(&self) -> bool {
-        let lease_to_drop = {
-            self.lock_inner()
-                .take()
-        };
+        let lease_to_drop = { self.lock_inner().take() };
         if let Some(entry) = lease_to_drop {
             entry.discard_physical("db::session_lease");
             true
@@ -2344,8 +2342,7 @@ impl SharedDbSessionLease {
     ) -> Option<TakenDbSessionLease> {
         let mut stale_lease_to_drop = None;
         let reusable_lease = {
-            let mut lease = self
-                .lock_inner();
+            let mut lease = self.lock_inner();
             let reusable = lease.as_ref().is_some_and(|existing| {
                 existing.matches_connection(connection_generation, db_type)
             });
@@ -2422,8 +2419,7 @@ impl SharedDbSessionLease {
     ) -> RetainedSessionTakeOutcome {
         let mut stale_lease_to_drop = None;
         let reusable_lease = {
-            let mut lease = self
-                .lock_inner();
+            let mut lease = self.lock_inner();
             let Some(existing) = lease.as_ref() else {
                 return RetainedSessionTakeOutcome::NoSession;
             };
@@ -2472,8 +2468,7 @@ impl SharedDbSessionLease {
         log_context: &str,
     ) -> bool {
         let lease_to_drop = {
-            let mut lease = self
-                .lock_inner();
+            let mut lease = self.lock_inner();
             let should_clear = lease.as_ref().is_some_and(|existing| {
                 existing.connection_generation == connection_generation
                     && match &existing.lease {
@@ -2565,8 +2560,7 @@ impl SharedDbSessionLease {
         let lease_db_type = lease_to_store.db_type();
         let mut lease_to_store = Some(lease_to_store);
         let old_lease_to_drop = {
-            let mut lease = self
-                .lock_inner();
+            let mut lease = self.lock_inner();
             let should_store = match lease.as_mut() {
                 None => true,
                 Some(existing) => {
@@ -6033,12 +6027,9 @@ fn wait_for_connection_transition(connection: &SharedConnection) {
     }
 }
 
-fn lock_database_connection_raw(
-    connection: &SharedConnection,
-) -> DatabaseConnectionGuard<'_> {
-    let _order = crate::db::lock_order::LockOrderScope::enter(
-        crate::db::lock_order::names::DB_CONNECTION,
-    );
+fn lock_database_connection_raw(connection: &SharedConnection) -> DatabaseConnectionGuard<'_> {
+    let _order =
+        crate::db::lock_order::LockOrderScope::enter(crate::db::lock_order::names::DB_CONNECTION);
     DatabaseConnectionGuard {
         guard: lock_database_connection_unchecked(connection),
         _order,
@@ -6178,8 +6169,8 @@ fn lock_pool_context_cache() -> TrackedGuard<'static, HashMap<usize, CachedDbPoo
     }
 }
 
-fn lock_pool_context_cache_raw(
-) -> MutexGuard<'static, HashMap<usize, CachedDbPoolSessionContext>> {
+fn lock_pool_context_cache_raw() -> MutexGuard<'static, HashMap<usize, CachedDbPoolSessionContext>>
+{
     match pool_context_cache_slot().lock() {
         Ok(guard) => guard,
         Err(poisoned) => {
@@ -7079,7 +7070,6 @@ struct DispatchedCancel {
     activity: String,
 }
 
-
 /// Break the sessions, then escalate to the force tier for whatever is still
 /// running at `force_timeout`. Runs off the caller's thread because both tiers
 /// make network calls.
@@ -7119,9 +7109,8 @@ fn spawn_force_cancel_watchdog(dispatched: Vec<DispatchedCancel>, force_timeout:
                 });
                 // The guard lives exactly as long as the operation holds it, so
                 // an upgrade that still succeeds means the break was ignored.
-                let escalate = wait_for_graceful_cancel(remaining, || {
-                    dispatched.guard.upgrade().is_some()
-                });
+                let escalate =
+                    wait_for_graceful_cancel(remaining, || dispatched.guard.upgrade().is_some());
                 if !escalate {
                     continue;
                 }
@@ -7488,10 +7477,8 @@ pub fn lock_connection_with_activity(
     if let Some(connection_id) = connection_guard.connection_id() {
         activity_guard.set_connection_id(connection_id);
     }
-    connection_guard.cancel_registration =
-        main_connection_canceler(&connection_guard).map(|canceler| {
-            activity_guard.attach_canceler(canceler)
-        });
+    connection_guard.cancel_registration = main_connection_canceler(&connection_guard)
+        .map(|canceler| activity_guard.attach_canceler(canceler));
     connection_guard.activity_guard = Some(activity_guard);
     connection_guard
 }
@@ -7502,9 +7489,8 @@ pub fn try_lock_connection(connection: &SharedConnection) -> Option<ConnectionLo
     if active_connection_transition(connection).is_some() {
         return None;
     }
-    let order = crate::db::lock_order::LockOrderScope::enter(
-        crate::db::lock_order::names::DB_CONNECTION,
-    );
+    let order =
+        crate::db::lock_order::LockOrderScope::enter(crate::db::lock_order::names::DB_CONNECTION);
     let guard = match connection.try_lock() {
         Ok(guard) => guard,
         Err(std::sync::TryLockError::WouldBlock) => return None,
@@ -8241,7 +8227,10 @@ mod tests {
             {
                 continue;
             }
-            if ALREADY_TRACKED.iter().any(|exempt| trimmed.contains(exempt)) {
+            if ALREADY_TRACKED
+                .iter()
+                .any(|exempt| trimmed.contains(exempt))
+            {
                 continue;
             }
             // Test-only helpers are not a production entry point.
@@ -8391,8 +8380,7 @@ mod tests {
         cancel_db_activity(activity.id(), Duration::from_secs(60));
 
         wait_for("both sessions to be broken", || {
-            first.interrupted.load(Ordering::Acquire)
-                && second.interrupted.load(Ordering::Acquire)
+            first.interrupted.load(Ordering::Acquire) && second.interrupted.load(Ordering::Acquire)
         });
         clear_tracked_db_activity();
     }
@@ -8690,9 +8678,10 @@ mod tests {
         activity.on_cancel(Arc::new(|| panic!("owner callback exploded")));
 
         assert!(cancel_db_activity(activity.id(), Duration::from_secs(60)));
-        wait_for("the session to be broken despite the panicking callback", || {
-            canceler.interrupted.load(Ordering::Acquire)
-        });
+        wait_for(
+            "the session to be broken despite the panicking callback",
+            || canceler.interrupted.load(Ordering::Acquire),
+        );
         clear_tracked_db_activity();
     }
 
