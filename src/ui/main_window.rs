@@ -16817,6 +16817,131 @@ mod tests {
         );
     }
 
+    /// Executable spec for what the status bar reports after each statement a
+    /// user can type. It walks the real classifier and the real state machine,
+    /// so it says what the indicator actually shows rather than what it was
+    /// meant to show.
+    #[test]
+    fn status_bar_reports_what_each_query_left_on_the_session() {
+        use crate::db::{DatabaseType, RetainedSessionState};
+
+        let post = crate::db::statement_session_post_processor_for(DatabaseType::MySQL);
+        let mut state = RetainedSessionState::default();
+        // `server_says_dirty` is the transaction probe: the app asks the server
+        // whether work is really outstanding instead of trusting the SQL text.
+        let run = |state: &mut RetainedSessionState, sql: &str, server_says_dirty: bool| {
+            *state = crate::db::retained_session_state_after_statement(
+                post,
+                *state,
+                post.effects_for_sql(sql),
+                server_says_dirty,
+                false,
+                false,
+                false,
+            );
+            AppState::transaction_state_status_label(*state)
+        };
+
+        // Opening a transaction by hand is reported immediately.
+        assert_eq!(
+            run(&mut state, "START TRANSACTION", false),
+            Some("transaction open")
+        );
+        // DML the server confirms as outstanding keeps it reported.
+        assert_eq!(
+            run(&mut state, "UPDATE EMP SET SAL = SAL + 1", true),
+            Some("transaction open")
+        );
+        // Resolving it clears the indicator.
+        assert_eq!(run(&mut state, "COMMIT", false), None);
+
+        // A one-shot SET TRANSACTION changes no session setting the toolbar can
+        // show, but the NEXT transaction runs under it, so the status bar says
+        // so until a statement consumes it.
+        assert_eq!(
+            run(
+                &mut state,
+                "SET TRANSACTION ISOLATION LEVEL SERIALIZABLE",
+                false
+            ),
+            Some("SET TRANSACTION pending")
+        );
+        assert_eq!(
+            run(&mut state, "START TRANSACTION", false),
+            Some("transaction open")
+        );
+        assert_eq!(run(&mut state, "ROLLBACK", false), None);
+
+        // A session-scoped change IS a setting the toolbar shows, so the editor
+        // adopts it into the tab and the status bar stays silent: the mode lives
+        // in the toolbar choices, not here.
+        let raw = crate::db::retained_session_state_after_statement(
+            post,
+            RetainedSessionState::default(),
+            post.effects_for_sql("SET SESSION TRANSACTION ISOLATION LEVEL SERIALIZABLE"),
+            false,
+            false,
+            false,
+            false,
+        );
+        assert_eq!(
+            AppState::transaction_state_status_label(raw),
+            Some("SET TRANSACTION pending"),
+            "before adoption the session carries a mode the toolbar does not show"
+        );
+        assert_eq!(
+            AppState::transaction_state_status_label(
+                raw.with_session_transaction_mode_override_adopted()
+            ),
+            None,
+            "after the editor adopts it into the tab setting the toolbar carries it"
+        );
+
+        // Oracle runs the same indicator off its own classifier.
+        let oracle = crate::db::statement_session_post_processor_for(DatabaseType::Oracle);
+        let mut state = RetainedSessionState::default();
+        let run_oracle = |state: &mut RetainedSessionState, sql: &str, server_says_dirty: bool| {
+            *state = crate::db::retained_session_state_after_statement(
+                oracle,
+                *state,
+                oracle.effects_for_sql(sql),
+                server_says_dirty,
+                false,
+                false,
+                false,
+            );
+            AppState::transaction_state_status_label(*state)
+        };
+        // Oracle's SET TRANSACTION is the CURRENT transaction's mode and opens
+        // it, so the open transaction is what the user must act on.
+        assert_eq!(
+            run_oracle(&mut state, "SET TRANSACTION READ ONLY", false),
+            Some("transaction open")
+        );
+        assert_eq!(run_oracle(&mut state, "COMMIT", false), None);
+        // ALTER SESSION SET ISOLATION_LEVEL is the session-scoped form, so it
+        // behaves like the MySQL SET SESSION case above.
+        let oracle_session_change = crate::db::retained_session_state_after_statement(
+            oracle,
+            RetainedSessionState::default(),
+            oracle.effects_for_sql("ALTER SESSION SET ISOLATION_LEVEL = SERIALIZABLE"),
+            false,
+            false,
+            false,
+            false,
+        );
+        assert_eq!(
+            AppState::transaction_state_status_label(oracle_session_change),
+            Some("SET TRANSACTION pending")
+        );
+        assert_eq!(
+            AppState::transaction_state_status_label(
+                oracle_session_change.with_session_transaction_mode_override_adopted()
+            ),
+            None
+        );
+    }
+
     #[test]
     fn transaction_state_status_label_surfaces_what_the_toolbar_cannot_show() {
         use crate::db::{RetainedSessionState, TransactionSessionState};

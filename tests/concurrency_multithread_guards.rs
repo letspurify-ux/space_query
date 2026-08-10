@@ -2973,6 +2973,28 @@ fn transaction_mode_state_has_a_single_source_of_truth() {
             && main_window.contains("let transaction_state_label = indicator_visible"),
         "the status bar must surface the session's transaction state next to the auto-commit indicator"
     );
+
+    // (8) Oracle accepts SET TRANSACTION only as a transaction's first
+    // statement. BOTH Oracle paths must therefore yield to a batch that opens
+    // with one, or the tab's mode is injected ahead of the user's statement and
+    // the server rejects it with ORA-01453. This was live-observed on thin,
+    // which lacked the guard the OCI path already had.
+    let thin_backend_start = execution
+        .find("impl ExecutionWorkerBackend for OracleExecutionWorkerBackend")
+        .expect("Oracle thin execution backend should exist");
+    let thin_backend_end = execution[thin_backend_start..]
+        .find("impl ExecutionWorkerBackend for MysqlExecutionWorkerBackend")
+        .map(|offset| thin_backend_start + offset)
+        .expect("MySQL execution backend should follow the Oracle one");
+    let thin_backend = &execution[thin_backend_start..thin_backend_end];
+    assert!(
+        thin_backend.contains("requires_transaction_first_statement("),
+        "the Oracle thin path must yield to a user's own transaction-first statement, as the OCI path does"
+    );
+    assert!(
+        execution.contains("let explicit_transaction_first_statement ="),
+        "the Oracle OCI path must keep its transaction-first-statement guard"
+    );
 }
 
 #[test]

@@ -1007,6 +1007,18 @@ impl ExecutionWorkerBackend for OracleExecutionWorkerBackend {
             preconnected_info,
             runtime_work_guard,
         };
+        // Oracle allows SET TRANSACTION only as a transaction's first
+        // statement. When the user's own batch opens with one, the tab's mode
+        // must not be injected ahead of it or theirs is no longer first
+        // (ORA-01453). The OCI path already yields this way; without the same
+        // rule here a thin tab pinned to a non-default mode could not run a
+        // SET TRANSACTION at all.
+        let selected_transaction_mode =
+            if SqlEditorWidget::requires_transaction_first_statement(&items) {
+                crate::db::TransactionMode::default()
+            } else {
+                selected_transaction_mode
+            };
         let batch_outcome = SqlEditorWidget::execute_oracle_thin_batch_with_connection(
             &mut thin_conn,
             sender,
