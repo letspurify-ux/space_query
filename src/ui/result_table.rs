@@ -2015,53 +2015,32 @@ impl ResultTableWidget {
         true
     }
 
-    fn should_consume_boundary_arrow_for_selection(
-        selection: (i32, i32, i32, i32),
-        max_rows: usize,
-        max_cols: usize,
-        hidden_col: &HiddenColumns,
-        key: Key,
-    ) -> bool {
-        if max_rows == 0 || max_cols == 0 {
-            return true;
-        }
-
-        let Some((row_start, col_start, row_end, col_end)) =
-            Self::selection_bounds_excluding_hidden_column(
-                selection, max_rows, max_cols, hidden_col,
+    /// Every key `Fl_Table::handle(FL_KEYBOARD)` navigates with.
+    ///
+    /// On the grid's edges `Fl_Table::move_cursor()` is a no-op and returns 0, so an
+    /// unconsumed key falls through to FLTK's FL_SHORTCUT broadcast. That phase starts
+    /// at `belowmouse()` and walks up, and `Fl_Scrollbar::handle()` acts on exactly
+    /// these keys with no focus check at all - so the pointer's pane (the object
+    /// browser tree, right after a double-click opened this grid) scrolls instead.
+    /// See docs/fltk_handle_event.md section 5.
+    ///
+    /// The focused grid therefore answers for all of them, moved or not. Tab is
+    /// deliberately absent: `Fl_Table` only navigates with it when `tab_cell_nav()` is
+    /// set, and consuming it would trap focus in the grid.
+    fn grid_owns_navigation_key(key: Key, original_key: Key) -> bool {
+        [key, original_key].into_iter().any(|event_key| {
+            matches!(
+                event_key,
+                Key::Left
+                    | Key::Right
+                    | Key::Up
+                    | Key::Down
+                    | Key::PageUp
+                    | Key::PageDown
+                    | Key::Home
+                    | Key::End
             )
-        else {
-            return false;
-        };
-        let Some((first_visible_col, last_visible_col)) =
-            Self::visible_column_bounds(max_cols, hidden_col)
-        else {
-            return true;
-        };
-
-        match key {
-            Key::Left => col_start <= first_visible_col,
-            Key::Right => col_end >= last_visible_col,
-            Key::Up => row_start == 0,
-            Key::Down => row_end >= max_rows.saturating_sub(1),
-            _ => false,
-        }
-    }
-
-    fn should_consume_boundary_arrow(table: &Table, key: Key, hidden_col: &HiddenColumns) -> bool {
-        let rows = table.rows();
-        let cols = table.cols();
-        if rows <= 0 || cols <= 0 {
-            return true;
-        }
-
-        Self::should_consume_boundary_arrow_for_selection(
-            table.get_selection(),
-            rows as usize,
-            cols as usize,
-            hidden_col,
-            key,
-        )
+        })
     }
 
     fn hidden_left_boundary_shift_restore_bounds(
@@ -3236,7 +3215,6 @@ impl ResultTableWidget {
                             &table_for_handle,
                             &drag_state_for_handle,
                         );
-                        return false;
                     }
 
                     if matches!(key, Key::Left | Key::Right | Key::Up | Key::Down) {
@@ -3288,11 +3266,8 @@ impl ResultTableWidget {
                             &table_for_handle,
                             &drag_state_for_handle,
                         );
-                        return Self::should_consume_boundary_arrow(
-                            &table_for_handle,
-                            key,
-                            &hidden_col,
-                        );
+                        // Falls through to grid_owns_navigation_key: an arrow that moved
+                        // nothing (grid edge, empty result) is still the grid's answer.
                     }
 
                     if ctrl_or_cmd {
@@ -3405,7 +3380,14 @@ impl ResultTableWidget {
                         }
                     }
 
-                    false
+                    // Nothing above claimed the key. If it is one the grid navigates
+                    // with, it is still ours: answering keeps it out of the
+                    // FL_SHORTCUT broadcast, where a foreign scrollbar would act on it
+                    // without ever checking focus (see grid_owns_navigation_key).
+                    Self::grid_owns_navigation_key(key, original_key)
+                        && app::focus()
+                            .map(|focused| focused.is_same(&table_for_handle))
+                            .unwrap_or(false)
                 }
                 Event::Shortcut => {
                     let key = app::event_key();
@@ -11861,25 +11843,46 @@ mod row_edit_sql_tests {
     }
 
     #[test]
-    fn boundary_arrow_uses_first_visible_column_when_rowid_is_hidden() {
-        assert!(
-            ResultTableWidget::should_consume_boundary_arrow_for_selection(
-                (0, 1, 0, 1),
-                3,
-                4,
-                &HiddenColumns::automatic(Some(0)),
-                Key::Left,
-            )
-        );
-        assert!(
-            !ResultTableWidget::should_consume_boundary_arrow_for_selection(
-                (0, 1, 0, 1),
-                3,
-                4,
-                &HiddenColumns::automatic(Some(0)),
-                Key::Right,
-            )
-        );
+    fn the_grid_answers_for_every_key_it_navigates_with() {
+        // An unconsumed key reaches FLTK's FL_SHORTCUT broadcast, where Fl_Scrollbar
+        // acts on exactly this set with no focus check - scrolling whichever pane the
+        // pointer sits over. The grid must answer for all of them.
+        for key in [
+            Key::Left,
+            Key::Right,
+            Key::Up,
+            Key::Down,
+            Key::PageUp,
+            Key::PageDown,
+            Key::Home,
+            Key::End,
+        ] {
+            assert!(
+                ResultTableWidget::grid_owns_navigation_key(key, key),
+                "{key:?} would leak to the FL_SHORTCUT broadcast"
+            );
+        }
+
+        // Either the layout-dependent key or the physical one is enough, so a
+        // non-US layout cannot smuggle a navigation key past the rule.
+        assert!(ResultTableWidget::grid_owns_navigation_key(
+            Key::from_char('x'),
+            Key::PageDown
+        ));
+
+        // Tab still navigates out of the grid, and plain typing stays untouched.
+        assert!(!ResultTableWidget::grid_owns_navigation_key(
+            Key::Tab,
+            Key::Tab
+        ));
+        assert!(!ResultTableWidget::grid_owns_navigation_key(
+            Key::Enter,
+            Key::Enter
+        ));
+        assert!(!ResultTableWidget::grid_owns_navigation_key(
+            Key::from_char('a'),
+            Key::from_char('a')
+        ));
     }
 
     #[test]

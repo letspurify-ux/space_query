@@ -188,6 +188,38 @@ Event::Shortcut => {
 }
 ```
 
+### An unconsumed navigation key scrolls a pane you never touched
+
+`Fl_Scrollbar::handle()` (`Fl_Scrollbar.cxx:80`) folds `FL_SHORTCUT` into the same
+branch as `FL_KEYBOARD`, and that branch acts on `Up`, `Down`, `Page_Up`,
+`Page_Down`, `Home`, `End` (vertical) or `Left`/`Right` (horizontal) **without
+checking focus at all**. Only `Page_Up`/`Page_Down` bail out early when there is
+nothing to scroll; `Home`/`End` return 1 unconditionally.
+
+So any navigation key the focused widget declines takes this route:
+
+1. `Fl.cxx` finishes the `FL_KEYBOARD` walk (focus → parents) with nothing handled.
+2. It re-enters as `FL_SHORTCUT`, starting at **`belowmouse()`** and walking up.
+3. Each group on that path broadcasts to all of its children (§5).
+4. The first scrollbar reached scrolls — in a pane the keystroke was never for.
+
+The pointer is what decides the victim, which is why this reproduces from one
+entry path and not another. `ResultTableWidget` hit it after a double-click in
+the object browser opened a table: the mouse was still resting over the tree, so
+the tree's scrollbar answered.
+
+`Fl_Table` makes it easy to trip. Its `FL_KEYBOARD` branch routes every
+navigation key through `move_cursor()`, which returns 0 when the target cell
+equals the current one (`Fl_Table.cxx`) — so the grid silently declines on its
+first/last row and first/last column, exactly where a user presses hardest.
+
+The sink cannot be fixed: fltk-rs `handle()` has no way to express "skip the
+native handler but do not consume" (§2), and `Fl_Tree`'s internal scrollbars are
+not derived widgets, so they cannot take a closure (§2.3). **The focused widget
+must consume the whole key set it navigates with, whether or not anything
+moved.** `ResultTableWidget::grid_owns_navigation_key` is that list, applied once
+at the end of the `KeyDown` arm and gated on the widget owning focus.
+
 ### Enter steals focus
 
 In `FL_SHORTCUT`, after all children decline, `Fl_Group::handle` runs
