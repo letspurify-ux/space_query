@@ -18,6 +18,18 @@
 //   S5  (MySQL family) the dirty-probe SQL of each dialect answers correctly
 //       on a live server: MariaDB @@in_transaction; MySQL innodb_trx (and
 //       @@in_transaction must error there).
+//   S9  the opposite pin: a tab pinned OFF over a connection default of ON
+//       must keep its work rollback-able, while a tab without an override on
+//       the same connection still commits.
+//   S10 the gate the MENU item obeys (the TransactionOptionChange preflight,
+//       not the script path of S3) closes on uncommitted work and reopens
+//       after ROLLBACK.
+//   S11 auto-commit ON and a script that fails in the middle: the successful
+//       work before the failure stays committed and nothing is left for the
+//       close prompt.
+//   S12 changing the CONNECTION default (what Preferences writes) leaves a
+//       pinned tab pinned, in both directions, while an unpinned neighbour
+//       tab follows the new default.
 //
 // Usage: verify_auto_commit_live <thin|oci|mysql|mariadb|all>
 
@@ -458,6 +470,198 @@ fn run_scenarios(target: Target, h: &mut Harness) -> Result<(), String> {
         ),
     );
     h.editor.sync_tab_auto_commit_with_global_setting(false);
+
+    // ---- S9: a tab pinned OFF over a connection default of ON --------------
+    // Every scenario so far pins ON over an OFF default. The other direction
+    // is a different code path on every backend (the Oracle thin wire's
+    // commit flag, OCI's autocommit attribute, the MySQL pooled session's
+    // `SET autocommit`), and it is the one that must NOT commit: a tab the
+    // user put into manual mode has to keep its work rollback-able even
+    // though the connection commits by default.
+    println!("  --- S9 tab pinned OFF over a connection default ON ---");
+    h.set_connection_auto_commit(true)
+        .map_err(|e| format!("set_auto_commit(true): {e}"))?;
+    h.editor.sync_tab_auto_commit_with_global_setting(true);
+    h.editor.set_tab_auto_commit(false);
+    h.check(
+        "S9 the menu path pinned this tab to manual",
+        h.editor.tab_auto_commit_override_value() == Some(false),
+        format!("override = {:?}", h.editor.tab_auto_commit_override_value()),
+    );
+    h.check(
+        "S9 the connection default stayed ON",
+        h.connection_auto_commit(),
+        "pinning the tab mutated the shared connection default".into(),
+    );
+    let before = h.select_v()?;
+    let capture = h.run(dml)?;
+    h.check(
+        "S9 the DML ran",
+        capture.results.first().map(|r| r.success).unwrap_or(false),
+        format!(
+            "dml result: {:?}",
+            capture
+                .results
+                .first()
+                .map(|r| (r.success, r.message.clone()))
+        ),
+    );
+    h.check(
+        "S9 the pinned-manual tab reports work that still needs a decision",
+        h.close_would_prompt(),
+        "close preflight sees nothing pending, so the DML was committed".into(),
+    );
+    h.run("ROLLBACK")?;
+    let after_manual = h.select_v()?;
+    h.check(
+        "S9 ROLLBACK really undid the DML (nothing was auto-committed)",
+        after_manual == before,
+        format!("expected {before}, got {after_manual}"),
+    );
+    {
+        let mut tab2 = attach_tab(Arc::clone(&h.shared));
+        tab2.run(dml)?;
+        tab2.run("ROLLBACK")?;
+    }
+    let after_two_tabs = h.select_v()?;
+    h.check(
+        "S9 a second tab with no override still follows the ON default",
+        after_two_tabs == before + 1,
+        format!("expected {}, got {after_two_tabs}", before + 1),
+    );
+    h.run("ROLLBACK")?;
+
+    // ---- S10: the option-change gate the menu item obeys, on a live session
+    // S3 proves a script `SET AUTOCOMMIT` is refused while dirty. The menu
+    // item does not go through the script path at all: it asks the retained
+    // session's preflight (`TransactionOptionChange`). Pin that gate against a
+    // real dirty session, and against a resolved one.
+    println!("  --- S10 the menu-path option-change gate closes on uncommitted work ---");
+    h.set_connection_auto_commit(false)
+        .map_err(|e| format!("set_auto_commit(false): {e}"))?;
+    h.editor.sync_tab_auto_commit_with_global_setting(false);
+    h.run(dml)?;
+    let option_change_decision = |h: &Harness| {
+        h.editor.pooled_session_activity_snapshot().map(|snap| {
+            retained_session_state_preflight_decision(
+                RetainedSessionPreflightAction::TransactionOptionChange,
+                snap.retained_state(),
+            )
+        })
+    };
+    let dirty_decision = option_change_decision(h);
+    h.check(
+        "S10 uncommitted work blocks an auto-commit change",
+        dirty_decision == Some(RetainedSessionPreflightDecision::RequireResolution),
+        format!("decision while dirty = {dirty_decision:?}"),
+    );
+    h.run("ROLLBACK")?;
+    let clean_decision = option_change_decision(h);
+    h.check(
+        "S10 the gate reopens once the transaction is resolved",
+        clean_decision.is_none_or(|d| d == RetainedSessionPreflightDecision::Allow),
+        format!("decision after ROLLBACK = {clean_decision:?}"),
+    );
+
+    // ---- S11: auto-commit ON and a script that fails in the middle ---------
+    // "Auto-commit" means each successful statement is durable on its own. A
+    // later failure must not take the earlier work with it, and it must not
+    // leave the tab holding a transaction the user has to resolve on close.
+    println!("  --- S11 auto-commit ON: a mid-script failure keeps earlier work ---");
+    h.set_connection_auto_commit(true)
+        .map_err(|e| format!("set_auto_commit(true): {e}"))?;
+    h.editor.sync_tab_auto_commit_with_global_setting(true);
+    let before = h.select_v()?;
+    let capture = h.run(
+        "UPDATE SQ_AC_T SET V = V + 1;\nSELECT * FROM SQ_AC_NO_SUCH_TABLE;\nSELECT V FROM SQ_AC_T;",
+    )?;
+    h.check(
+        "S11 the bad statement failed",
+        capture.results.iter().any(|r| !r.success),
+        format!(
+            "results: {:?}",
+            capture
+                .results
+                .iter()
+                .map(|r| (r.success, r.message.clone()))
+                .collect::<Vec<_>>()
+        ),
+    );
+    h.run("ROLLBACK")?;
+    let after_failure = h.select_v()?;
+    h.check(
+        "S11 the UPDATE before the failure was committed",
+        after_failure == before + 1,
+        format!("expected {}, got {after_failure}", before + 1),
+    );
+    h.check(
+        "S11 the failed script left nothing for the close prompt",
+        !h.close_would_prompt(),
+        "close preflight still requires resolution after an auto-commit script".into(),
+    );
+    h.editor.sync_tab_auto_commit_with_global_setting(false);
+    h.set_connection_auto_commit(false)
+        .map_err(|e| format!("set_auto_commit(false): {e}"))?;
+
+    // ---- S12: changing the CONNECTION default must not disturb a pinned tab
+    // The connection default is what Preferences / connection settings write.
+    // Nothing in production clears a tab's override when it changes (there is
+    // no production caller of `sync_tab_auto_commit_with_global_setting`), so
+    // the two-tier promise has to hold across the change in BOTH directions:
+    // the pinned tab keeps its own answer, the unpinned neighbour follows the
+    // new default.
+    println!("  --- S12 a connection-default change leaves a pinned tab alone ---");
+    h.set_connection_auto_commit(false)
+        .map_err(|e| format!("set_auto_commit(false): {e}"))?;
+    h.editor.sync_tab_auto_commit_with_global_setting(false);
+    h.editor.set_tab_auto_commit(false); // pinned MANUAL, same as the default
+    h.set_connection_auto_commit(true)
+        .map_err(|e| format!("set_auto_commit(true): {e}"))?;
+    h.check(
+        "S12 the tab's override survived the connection-default change",
+        h.editor.tab_auto_commit_override_value() == Some(false),
+        format!("override = {:?}", h.editor.tab_auto_commit_override_value()),
+    );
+    let before = h.select_v()?;
+    h.run(dml)?;
+    h.run("ROLLBACK")?;
+    let after_pinned = h.select_v()?;
+    h.check(
+        "S12 the pinned-manual tab still rolls back under the new ON default",
+        after_pinned == before,
+        format!("expected {before}, got {after_pinned}"),
+    );
+    {
+        let mut tab2 = attach_tab(Arc::clone(&h.shared));
+        tab2.run(dml)?;
+        tab2.run("ROLLBACK")?;
+    }
+    let after_neighbour = h.select_v()?;
+    h.check(
+        "S12 an unpinned neighbour tab picked the new ON default up",
+        after_neighbour == before + 1,
+        format!("expected {}, got {after_neighbour}", before + 1),
+    );
+    // ... and the same in the other direction: pinned ON over a default of OFF.
+    h.editor.set_tab_auto_commit(true);
+    h.set_connection_auto_commit(false)
+        .map_err(|e| format!("set_auto_commit(false): {e}"))?;
+    h.check(
+        "S12 the ON pin survived the default going OFF",
+        h.editor.tab_auto_commit_override_value() == Some(true),
+        format!("override = {:?}", h.editor.tab_auto_commit_override_value()),
+    );
+    let before = h.select_v()?;
+    h.run(dml)?;
+    h.run("ROLLBACK")?;
+    let after_pinned_on = h.select_v()?;
+    h.check(
+        "S12 the pinned-ON tab still commits under the new OFF default",
+        after_pinned_on == before + 1,
+        format!("expected {}, got {after_pinned_on}", before + 1),
+    );
+    h.editor.sync_tab_auto_commit_with_global_setting(false);
+    h.run("ROLLBACK")?;
 
     // ---- S6 (Oracle, runs last): script CONNECT resolves auto-commit from
     // the new connection's seeded default, not the old connection's value ----

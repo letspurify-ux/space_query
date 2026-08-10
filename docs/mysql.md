@@ -44,6 +44,25 @@ otherwise be reported by the dirty probe. Preflight rules for retained
 sessions and transaction-mode changes are defined in the
 [transaction document](transaction.md).
 
+### Scope preparation runs once per acquisition
+
+`acquire_mysql_pooled_session()` ends with a common tail that prepares the
+session's database scope (`prepare_mysql_pooled_session_database()` —
+`COM_INIT_DB` plus the encoding statements) and then applies the execution
+settings (`ROLLBACK`, `SET autocommit`, `SET SESSION TRANSACTION ...`).
+
+The branches that acquire a FRESH pooled session have already prepared the
+scope through `prepare_mysql_pooled_session_or_retry_once()`, with the same
+context and `preserve = false`. They therefore hand a `scope_already_prepared`
+flag to the tail, which skips its own call — without it the identical
+`COM_INIT_DB` + `SELECT DEFAULT_COLLATION_NAME` + `SET NAMES` trio went out
+twice on every fresh session.
+
+The tail still prepares the scope on a REUSED session, and still applies the
+execution settings in both cases. Neither is redundant: a database can be
+dropped while an idle pooled session still names it, and the tab's
+transaction mode only reaches a reused session through those settings.
+
 ## Input validation
 
 - A time zone is blank or has `+HH:MM`/`-HH:MM` form.

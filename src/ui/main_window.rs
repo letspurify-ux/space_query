@@ -5027,7 +5027,8 @@ fn update_transaction_mode_from_controls(state: &Arc<Mutex<AppState>>) {
     // READ ONLY with an explicit isolation level). Refuse it here: pinning it
     // on the tab would leave every later statement failing on a mode the user
     // can no longer see is impossible.
-    if let Some(reason) = crate::db::DatabaseConnection::transaction_mode_selection_error(db_type, mode)
+    if let Some(reason) =
+        crate::db::DatabaseConnection::transaction_mode_selection_error(db_type, mode)
     {
         crate::ui::alert_on_main(&reason);
         let mut s = state

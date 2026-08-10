@@ -214,6 +214,11 @@ cargo test --test concurrency_multithread_guards
 # Live, one Docker database at a time:
 cargo run --bin verify_transaction_mode_live -- <thin|oci|mysql|mariadb|all>
 cargo run --bin verify_auto_commit_live -- <thin|oci|mysql|mariadb|all>
+
+# The three consumer paths that reach the server on their own worker path:
+cargo run --bin verify_grid_save_live -- <thin|oci|mysql|mariadb|all>
+cargo run --bin verify_import_live -- <thin|oci|mysql|mariadb|all>
+cargo run --bin verify_proc_exec_live -- <thin|oci|mysql|mariadb|all>
 ```
 
 `verify_transaction_mode_live` drives the real editor per backend: a READ
@@ -226,14 +231,75 @@ pin still refuses the write after the batch's own `COMMIT` (S10), returning the
 tab to Default really puts the session back — read behaviourally on Oracle with
 a second session, from the session variable on MySQL/MariaDB (S11), a second
 tab on the same connection is unaffected by the pin (S12), and an unrunnable
-isolation/access pair is reported where it is selected (S13).
+isolation/access pair is reported where it is selected (S13). The pin also has
+to refuse DDL, not only DML, and leave no object behind (S14); a tab that
+pinned nothing must run under the CONNECTION default, which is the other branch
+of `effective_transaction_mode` and the one a user gets from advanced settings
+(S15); and on the MySQL family the pinned isolation must govern the FIRST
+transaction behaviourally, not just report itself in `@@transaction_isolation`
+— MySQL fixes isolation at transaction start, so "applied one transaction late"
+reads correct on the variable and behaves wrong (S16).
 
 `verify_auto_commit_live` covers the tab-scoped auto-commit model on the same
 four backends: the connection default really commits, the menu write path pins
 only the active tab, a second tab on the same connection stays manual, the
 dirty guard refuses a change and leaves it without effect, a Read only tab
 still refuses the write with auto-commit on, and (Oracle) a read-only
-transaction is not ended by a piggybacked wire commit.
+transaction is not ended by a piggybacked wire commit. It also covers the
+opposite pin — a tab pinned OFF over a connection default of ON keeps its work
+rollback-able while its neighbour tab still commits (S9) — the gate the menu
+item itself obeys (`TransactionOptionChange` preflight, not the script path of
+S3) on a live dirty session (S10), and a script that fails in the middle under
+auto-commit: the work before the failure stays committed and nothing is left
+for the close prompt (S11).
+
+Note when reading these: the connection's default isolation is READ COMMITTED
+(`ConnectionAdvancedSettings::default_transaction_isolation`), not the MySQL
+server's REPEATABLE READ, so "Default" on the toolbar is READ COMMITTED there.
+S16 derives its expectation from `default_transaction_isolation()` rather than
+assuming the server default.
+
+### The consumer paths carry the tab setting too
+
+Grid-edit save, file import, and the object browser's Execute
+Procedure/Function are not plain editor statements: the save runs its own
+worker (overriding `DbPoolSessionContext::transaction_mode`), the import runs
+as `SqlAction::ExecuteScript`, and Execute Procedure emits `SqlAction::Execute`
+onto the active tab. Each therefore has to obey the tab's transaction mode and
+auto-commit like any other statement, which their own live probes now pin:
+
+- `verify_grid_save_live` — a tab pinned READ ONLY refuses the save and leaves
+  the row untouched, unpinning lets the identical save through, and a save on
+  an auto-commit tab survives a later `ROLLBACK`.
+- `verify_import_live` — a READ ONLY tab refuses the generated import script
+  and the target table stays empty; the same script succeeds once unpinned.
+- `verify_proc_exec_live` — a READ ONLY tab refuses a routine that WRITES and
+  nothing is written, while a routine that only READS still runs (the pin must
+  not over-block), and the same call writes once unpinned.
+
+### Pinning a tab is only half of a mode change
+
+`set_tab_transaction_mode()` records the tab's choice; it does not travel to a
+physical session the tab is already holding. `update_transaction_mode_from_controls()`
+is therefore a three-step path, and all three steps matter:
+
+1. `validate_transaction_option_change()` — refuse the change outright when the
+   retained session cannot take it (this is what keeps the screen honest),
+2. `set_tab_transaction_mode()` — pin the tab,
+3. `RetainedSessionOptionChangePlan::apply_transaction_mode()` — push the mode
+   onto the tab's retained session.
+
+Skipping step 3 leaves the toolbar reading READ ONLY while the session is still
+READ WRITE, and skipping step 1 lets that happen whenever the push is blocked.
+Note that `transaction_mode_display_mismatch_error` does NOT catch this: it
+compares the displayed mode against the resolved tab mode, not against the
+physical session. Live probes that drive the controls must use all three steps
+(see `set_transaction_mode_like_the_toolbar` in the consumer-path harnesses),
+or they pass only when the tab happens to acquire a fresh pooled session.
+
+A routine call, a grid save, and other conservative statements leave session
+residue, so step 1 legitimately refuses a mode change right after them until
+the user commits, rolls back, or discards.
 
 When adding a SQL family, test classification, implicit commit,
 transaction/residue/lock effects, and cleanup-only preflight. Run the

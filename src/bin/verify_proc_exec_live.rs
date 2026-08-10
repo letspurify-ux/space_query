@@ -11,14 +11,21 @@
 //   - the retained pooled-session transaction state (DecisionRequired blocks the
 //     next Ctrl+Enter and pops the discard/commit/rollback prompt).
 //
-// Usage: verify_proc_exec_live <thin|oci|all>
+// It also covers what the object browser's "Execute Procedure"/"Execute
+// Function" action means for the transaction model: that action emits
+// `SqlAction::Execute` onto the ACTIVE tab, so a tab pinned READ ONLY must
+// refuse a routine that writes and leave the table untouched, while a routine
+// that only reads must still run.
+//
+// Usage: verify_proc_exec_live <thin|oci|mysql|mariadb|all>
 // Env: see docs/oracle.md.
 
 use fltk::{app, input::IntInput};
 use space_query::db::session_policy::ExecutionFinishedEvent;
 use space_query::db::{
     retained_session_state_execute_preflight_decision_for_sql, ConnectionInfo, DatabaseConnection,
-    DatabaseType, OracleDriverMode, RetainedSessionPreflightDecision, TransactionSessionState,
+    DatabaseType, OracleDriverMode, RetainedSessionPreflightDecision, TransactionAccessMode,
+    TransactionIsolation, TransactionMode, TransactionSessionState,
 };
 use space_query::ui::sql_editor::{QueryProgress, SqlEditorWidget};
 use std::env;
@@ -105,8 +112,13 @@ impl Target {
             vec![
                 "DROP PROCEDURE SQ_NOOP_PROC".into(),
                 "DROP FUNCTION SQ_NOOP_FUNC".into(),
+                "DROP PROCEDURE SQ_WRITE_PROC".into(),
+                "DROP TABLE SQ_RO_PROC_T".into(),
                 "CREATE OR REPLACE PROCEDURE SQ_NOOP_PROC AS BEGIN NULL; END;".into(),
                 "CREATE OR REPLACE FUNCTION SQ_NOOP_FUNC RETURN NUMBER AS BEGIN RETURN 42; END;"
+                    .into(),
+                "CREATE TABLE SQ_RO_PROC_T (V NUMBER)".into(),
+                "CREATE OR REPLACE PROCEDURE SQ_WRITE_PROC AS BEGIN INSERT INTO SQ_RO_PROC_T VALUES (1); END;"
                     .into(),
             ]
         } else {
@@ -114,8 +126,12 @@ impl Target {
             vec![
                 "DROP PROCEDURE IF EXISTS SQ_NOOP_PROC".into(),
                 "DROP FUNCTION IF EXISTS SQ_NOOP_FUNC".into(),
+                "DROP PROCEDURE IF EXISTS SQ_WRITE_PROC".into(),
+                "DROP TABLE IF EXISTS SQ_RO_PROC_T".into(),
                 "CREATE PROCEDURE SQ_NOOP_PROC() SELECT 1".into(),
                 "CREATE FUNCTION SQ_NOOP_FUNC() RETURNS INT DETERMINISTIC RETURN 42".into(),
+                "CREATE TABLE SQ_RO_PROC_T (V INT)".into(),
+                "CREATE PROCEDURE SQ_WRITE_PROC() INSERT INTO SQ_RO_PROC_T VALUES (1)".into(),
             ]
         }
     }
@@ -125,11 +141,15 @@ impl Target {
             vec![
                 "DROP PROCEDURE SQ_NOOP_PROC".into(),
                 "DROP FUNCTION SQ_NOOP_FUNC".into(),
+                "DROP PROCEDURE SQ_WRITE_PROC".into(),
+                "DROP TABLE SQ_RO_PROC_T".into(),
             ]
         } else {
             vec![
                 "DROP PROCEDURE IF EXISTS SQ_NOOP_PROC".into(),
                 "DROP FUNCTION IF EXISTS SQ_NOOP_FUNC".into(),
+                "DROP PROCEDURE IF EXISTS SQ_WRITE_PROC".into(),
+                "DROP TABLE IF EXISTS SQ_RO_PROC_T".into(),
             ]
         }
     }
@@ -170,6 +190,7 @@ struct Harness {
     editor: SqlEditorWidget,
     events: Arc<Mutex<Vec<QueryProgress>>>,
     done: Arc<AtomicBool>,
+    shared: space_query::db::SharedConnection,
 }
 
 impl Harness {
@@ -214,6 +235,44 @@ impl Harness {
         self.editor
             .pooled_session_activity_snapshot()
             .map(|s| s.retained_state().transaction_state())
+    }
+
+    /// The toolbar write path in full: `update_transaction_mode_from_controls`
+    /// pins the tab AND pushes the change onto the tab's retained session.
+    /// Pinning alone is not what a user does — on a session the tab is holding,
+    /// the pin never reaches the server by itself.
+    fn set_transaction_mode_like_the_toolbar(
+        &mut self,
+        mode: TransactionMode,
+    ) -> Result<(), String> {
+        self.editor.set_tab_transaction_mode(mode);
+        let (generation, epoch, db_type) = {
+            let guard = self.shared.lock().unwrap_or_else(|p| p.into_inner());
+            (
+                guard.connection_generation(),
+                guard.pool_context_epoch(),
+                guard.db_type(),
+            )
+        };
+        let outcome = self.editor.apply_transaction_mode_to_retained_session(
+            generation,
+            epoch,
+            db_type,
+            mode,
+            "verify proc exec",
+        );
+        // Production refuses the whole change when the retained session cannot
+        // take it (`validate_transaction_option_change` runs BEFORE the pin),
+        // so a blocked push here means the tab would be showing a mode its
+        // session is not running under.
+        match outcome {
+            space_query::db::RetainedSessionMutationOutcome::Applied
+            | space_query::db::RetainedSessionMutationOutcome::AppliedWithWarning(_)
+            | space_query::db::RetainedSessionMutationOutcome::NoSession => Ok(()),
+            other => Err(format!(
+                "the tab was pinned but its retained session refused the mode: {other:?}"
+            )),
+        }
     }
 
     /// Would running `next_sql` right now pop the discard/commit/rollback modal?
@@ -286,6 +345,121 @@ fn probe(h: &mut Harness, label: &str, sql: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// First data cell of the last streamed row set, as text.
+fn first_cell(events: &[QueryProgress]) -> Option<String> {
+    events.iter().rev().find_map(|e| match progress_inner(e) {
+        QueryProgress::Rows { rows, .. } => rows.first().and_then(|row| row.last().cloned()),
+        _ => None,
+    })
+}
+
+fn write_target_count(h: &mut Harness) -> Result<i64, String> {
+    let events = h.run("SELECT COUNT(*) AS N FROM SQ_RO_PROC_T")?;
+    let cell = first_cell(&events).ok_or("COUNT(*) returned no rows")?;
+    cell.trim()
+        .parse::<i64>()
+        .map_err(|e| format!("COUNT(*) returned {cell:?}: {e}"))
+}
+
+/// The object browser's "Execute Procedure"/"Execute Function" emits
+/// `SqlAction::Execute` onto the active tab, so the tab's transaction mode
+/// governs it like any other statement. A routine that WRITES must be refused
+/// on a tab pinned READ ONLY — and must not write — while a routine that only
+/// READS must still run.
+fn read_only_routine_scenario(h: &mut Harness, target: Target) -> Result<(), String> {
+    println!("  [read-only tab vs the object browser's Execute Procedure]");
+    let call = if target.is_oracle() {
+        "BEGIN SQ_WRITE_PROC; END;"
+    } else {
+        "CALL SQ_WRITE_PROC()"
+    };
+    let read_only_call = if target.is_oracle() {
+        "SELECT SQ_NOOP_FUNC() AS V FROM dual"
+    } else {
+        "SELECT SQ_NOOP_FUNC() AS V"
+    };
+    let needles: &[&str] = if target.is_oracle() {
+        &["read-only mode blocks", "ora-01456"]
+    } else {
+        &["read only"]
+    };
+
+    let _ = h.run("COMMIT");
+    let before = write_target_count(h)?;
+    let _ = h.run("COMMIT");
+    // A CALL leaves conservative session residue, and the toolbar refuses a
+    // transaction-mode change on a session that still needs a decision. Clear
+    // it the way the app tells the user to, so this scenario tests the
+    // read-only promise instead of that (separately covered) gate.
+    let _ = h.editor.discard_pooled_session_for_close();
+
+    h.set_transaction_mode_like_the_toolbar(TransactionMode::new(
+        TransactionIsolation::Default,
+        TransactionAccessMode::ReadOnly,
+    ))?;
+    let events = h.run(call)?;
+    let (success, msg) =
+        terminal_success(&events).ok_or("read-only routine call: no terminal result")?;
+    println!("    pinned READ ONLY: success={success} msg={msg:?}");
+    if success {
+        return Err("BUG: a writing routine executed on a tab pinned READ ONLY".into());
+    }
+    if !needles.iter().any(|needle| {
+        msg.to_ascii_lowercase()
+            .contains(&needle.to_ascii_lowercase())
+    }) {
+        return Err(format!(
+            "the routine was refused for the wrong reason: {msg:?}"
+        ));
+    }
+
+    // A routine that only reads must still be allowed on the same pinned tab.
+    let read_events = h.run(read_only_call)?;
+    let (read_success, read_msg) =
+        terminal_success(&read_events).ok_or("read-only function call: no terminal result")?;
+    println!("    pinned READ ONLY, reading routine: success={read_success} msg={read_msg:?}");
+    if !read_success {
+        return Err(format!(
+            "BUG: a READ ONLY pin also blocked a routine that only reads: {read_msg:?}"
+        ));
+    }
+
+    // Read back on this same session so even an uncommitted write shows up.
+    let after_refusal = write_target_count(h)?;
+    let _ = h.run("ROLLBACK");
+    if after_refusal != before {
+        return Err(format!(
+            "BUG: the refused routine wrote anyway (COUNT(*) {before} -> {after_refusal})"
+        ));
+    }
+    println!("    OK: refused, and nothing was written");
+
+    // Control: back on Read write through the same toolbar path, the identical
+    // call goes through and really writes. Selecting Default is a toolbar
+    // change like any other, so it has to travel to the session the same way.
+    let _ = h.editor.discard_pooled_session_for_close();
+    h.set_transaction_mode_like_the_toolbar(TransactionMode::default())?;
+    h.editor.clear_tab_transaction_mode_override();
+    let events = h.run(call)?;
+    let (success, msg) =
+        terminal_success(&events).ok_or("unpinned routine call: no terminal result")?;
+    if !success {
+        return Err(format!(
+            "unpinning did not let the same routine through: {msg:?}"
+        ));
+    }
+    let _ = h.run("COMMIT");
+    let after_allowed = write_target_count(h)?;
+    if after_allowed != before + 1 {
+        return Err(format!(
+            "the unpinned routine did not write (COUNT(*) {before} -> {after_allowed})"
+        ));
+    }
+    let _ = h.run("COMMIT");
+    println!("    OK: the same routine writes once the pin is removed");
+    Ok(())
+}
+
 fn verify(target: Target) -> Result<(), String> {
     println!("\n########## {} ##########", target.label());
 
@@ -313,6 +487,7 @@ fn verify(target: Target) -> Result<(), String> {
         editor,
         events,
         done,
+        shared: Arc::clone(&shared),
     };
 
     println!(
@@ -327,10 +502,10 @@ fn verify(target: Target) -> Result<(), String> {
     let _ = h.run("COMMIT");
 
     // DDL setup (DDL implicitly commits, so this leaves a clean session).
-    for (i, sql) in target.setup().into_iter().enumerate() {
+    for sql in target.setup() {
         let r = h.run(&sql);
-        // First two entries are best-effort drops; creates must succeed.
-        if i >= 2 {
+        // Drops are best-effort (the object may not exist); creates must work.
+        if !sql.trim_start().to_ascii_uppercase().starts_with("DROP") {
             r.map_err(|e| format!("setup {sql:?}: {e}"))?;
         }
     }
@@ -346,6 +521,8 @@ fn verify(target: Target) -> Result<(), String> {
     for (label, sql) in target.probes() {
         probe(&mut h, label, sql)?;
     }
+
+    read_only_routine_scenario(&mut h, target)?;
 
     // Cleanup.
     for sql in target.teardown() {

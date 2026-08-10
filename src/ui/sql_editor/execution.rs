@@ -22008,11 +22008,17 @@ impl SqlEditorWidget {
         };
         let db_display_name = context.connection_info.db_type.display_name();
 
-        let (mut conn, prior_retained_state) = match pooled_db_session.take_reusable_lease(
-            context.connection_generation,
-            context.pool_context_epoch(),
-            context.connection_info.db_type,
-        ) {
+        // `scope_already_prepared` is set by the branches that acquire a FRESH
+        // pooled session: `prepare_mysql_pooled_session_or_retry_once` has
+        // already run `prepare_mysql_pooled_session_database` on it with the
+        // same context and `preserve = false`, so the tail below must not
+        // repeat that work (COM_INIT_DB + encoding round trips).
+        let (mut conn, prior_retained_state, scope_already_prepared) = match pooled_db_session
+            .take_reusable_lease(
+                context.connection_generation,
+                context.pool_context_epoch(),
+                context.connection_info.db_type,
+            ) {
             crate::db::RetainedSessionTakeOutcome::Reusable(retained_session) => {
                 let Some((mut conn, prior_retained_state)) =
                     retained_session.into_mysql_connection_with_retained_state()
@@ -22048,7 +22054,7 @@ impl SqlEditorWidget {
                         .session_residue_state()
                         .may_have_statement_diagnostics(),
                 ) {
-                    Ok(true) => (conn, prior_retained_state),
+                    Ok(true) => (conn, prior_retained_state, false),
                     Ok(false) => {
                         Self::discard_mysql_pooled_connection(conn);
                         if require_existing_session {
@@ -22063,6 +22069,7 @@ impl SqlEditorWidget {
                                 conn,
                             )?,
                             RetainedSessionState::default(),
+                            true,
                         )
                     }
                     Err(message) if Self::mysql_pool_acquire_error_should_retry_fresh(&message) => {
@@ -22085,6 +22092,7 @@ impl SqlEditorWidget {
                                 conn,
                             )?,
                             RetainedSessionState::default(),
+                            true,
                         )
                     }
                     Err(message) => return Err(message),
@@ -22110,6 +22118,7 @@ impl SqlEditorWidget {
                         conn,
                     )?,
                     RetainedSessionState::default(),
+                    true,
                 )
             }
         };
@@ -22120,7 +22129,7 @@ impl SqlEditorWidget {
                 prior_retained_state,
                 required_resolution_action,
             );
-        if should_apply_current_scope {
+        if should_apply_current_scope && !scope_already_prepared {
             if let Err(message) = Self::prepare_mysql_pooled_session_database(
                 &mut conn,
                 &context.current_service_name,

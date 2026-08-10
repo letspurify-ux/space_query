@@ -24,6 +24,12 @@
 // plumbing F5 uses — with a small batch size, so the multi-statement path is
 // exercised rather than a single lucky statement.
 //
+// After the round-trip loop it also checks the one thing about an import that
+// belongs to the transaction model rather than to the parsers: an import runs
+// through `SqlAction::ExecuteScript` on the active tab, so a tab pinned READ
+// ONLY must refuse it and leave the target table empty, and unpinning must let
+// the very same script through.
+//
 // Usage: verify_import_live <thin|oci|mysql|mariadb|all>
 // Env: see docs/oracle.md, docs/mysql.md, docs/mariadb.md.
 //
@@ -32,6 +38,7 @@
 use fltk::{app, input::IntInput};
 use space_query::db::{
     ConnectionInfo, DatabaseConnection, DatabaseType, OracleDriverMode, SqlValueKind,
+    TransactionAccessMode, TransactionIsolation, TransactionMode,
 };
 use space_query::ui::grid_sql_export::{
     build_sql_inserts, sql_literal_for_value, GridSqlSelection,
@@ -282,6 +289,7 @@ struct Harness {
     editor: SqlEditorWidget,
     events: Arc<Mutex<Vec<QueryProgress>>>,
     done: Arc<AtomicBool>,
+    shared: space_query::db::SharedConnection,
 }
 
 impl Harness {
@@ -337,6 +345,57 @@ impl Harness {
     /// The path `SqlAction::ExecuteScript` takes, which is how an import runs.
     fn run_script(&mut self, sql: &str) -> Result<Vec<QueryProgress>, String> {
         self.dispatch(sql, true)
+    }
+
+    /// The toolbar write path in full: `update_transaction_mode_from_controls`
+    /// pins the tab AND pushes the change onto the tab's retained session.
+    /// Pinning alone never reaches a session the tab is already holding.
+    fn set_transaction_mode_like_the_toolbar(
+        &mut self,
+        mode: TransactionMode,
+    ) -> Result<(), String> {
+        self.editor.set_tab_transaction_mode(mode);
+        let (generation, epoch, db_type) = {
+            let guard = self.shared.lock().unwrap_or_else(|p| p.into_inner());
+            (
+                guard.connection_generation(),
+                guard.pool_context_epoch(),
+                guard.db_type(),
+            )
+        };
+        let outcome = self.editor.apply_transaction_mode_to_retained_session(
+            generation,
+            epoch,
+            db_type,
+            mode,
+            "verify import",
+        );
+        match outcome {
+            space_query::db::RetainedSessionMutationOutcome::Applied
+            | space_query::db::RetainedSessionMutationOutcome::AppliedWithWarning(_)
+            | space_query::db::RetainedSessionMutationOutcome::NoSession => Ok(()),
+            other => Err(format!(
+                "the tab was pinned but its retained session refused the mode: {other:?}"
+            )),
+        }
+    }
+
+    /// Same path, but a failing statement is the expected outcome rather than
+    /// an error to bail out on.
+    fn run_script_expecting_failure(&mut self, sql: &str) -> Result<Vec<QueryProgress>, String> {
+        self.events
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clear();
+        self.done.store(false, Ordering::SeqCst);
+        self.editor.execute_script_text(sql);
+        let done = Arc::clone(&self.done);
+        self.pump_until("script to finish", || done.load(Ordering::SeqCst))?;
+        Ok(self
+            .events
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone())
     }
 }
 
@@ -492,6 +551,7 @@ fn verify(target: Target) -> Result<(), String> {
         editor,
         events,
         done,
+        shared: Arc::clone(&shared),
     };
 
     let _ = h.run(&target.drop_sql(COPY_TABLE));
@@ -569,6 +629,8 @@ fn verify(target: Target) -> Result<(), String> {
     let directory = std::env::temp_dir().join("verify_import_live");
     std::fs::create_dir_all(&directory).map_err(|e| format!("{}: {e}", directory.display()))?;
 
+    // Kept so the read-only scenario below can re-run a real import script.
+    let mut last_script: Option<String> = None;
     for format in ExportFormat::ALL {
         println!("\n----- {} -----", format.label());
 
@@ -645,6 +707,7 @@ fn verify(target: Target) -> Result<(), String> {
         };
         let script =
             build_insert_script(&request).map_err(|e| format!("{} script: {e}", format.label()))?;
+        last_script = Some(script.clone());
         println!("{}", describe(&request).unwrap_or_default());
         let statements = script.matches(';').count();
         if statements < 2 {
@@ -682,6 +745,73 @@ fn verify(target: Target) -> Result<(), String> {
             statements
         );
     }
+
+    // An import is a script on the ACTIVE tab, so the tab's transaction mode
+    // governs it. A tab pinned READ ONLY must refuse the whole thing and leave
+    // the target empty; unpinning must let the identical script through.
+    let script = last_script.ok_or("no import script was built")?;
+    h.run(&target.delete_sql(COPY_TABLE))
+        .map_err(|e| format!("clear copy before the read-only import: {e}"))?;
+    let _ = h.run("COMMIT");
+    // The toolbar refuses a transaction-mode change on a session that still
+    // needs a decision; clear it the way the app tells the user to, so this
+    // scenario tests the read-only promise rather than that gate.
+    let _ = h.editor.discard_pooled_session_for_close();
+    h.set_transaction_mode_like_the_toolbar(TransactionMode::new(
+        TransactionIsolation::Default,
+        TransactionAccessMode::ReadOnly,
+    ))?;
+    let refused_events = h.run_script_expecting_failure(&script)?;
+    let refusal = first_error(&refused_events).ok_or(
+        "BUG: an import script ran to completion on a tab pinned READ ONLY (no statement failed)",
+    )?;
+    let needles: &[&str] = if target.is_oracle() {
+        &["read-only mode blocks", "ora-01456"]
+    } else {
+        &["read only"]
+    };
+    if !needles.iter().any(|needle| {
+        refusal
+            .to_ascii_lowercase()
+            .contains(&needle.to_ascii_lowercase())
+    }) {
+        return Err(format!(
+            "the read-only import failed for the wrong reason: {refusal}"
+        ));
+    }
+    let _ = h.run("ROLLBACK");
+    // Read back on the same session, so an uncommitted leak is visible too.
+    let leak_events = h
+        .run(&format!("SELECT COUNT(*) AS N FROM {COPY_TABLE}"))
+        .map_err(|e| format!("count after the read-only import: {e}"))?;
+    let leaked = grid_view(&leak_events)
+        .and_then(|(_, _, rows)| rows.first().and_then(|row| row.last().cloned()))
+        .unwrap_or_default();
+    if leaked.trim() != "0" {
+        return Err(format!(
+            "BUG: the refused import still landed rows (COUNT(*) = {leaked:?})"
+        ));
+    }
+    let _ = h.run("ROLLBACK");
+    println!("PASS: a READ ONLY tab refused the import and left the target empty");
+
+    // Back on Read write through the same toolbar path.
+    let _ = h.editor.discard_pooled_session_for_close();
+    h.set_transaction_mode_like_the_toolbar(TransactionMode::default())?;
+    h.editor.clear_tab_transaction_mode_override();
+    h.run_script(&script)
+        .map_err(|e| format!("unpinned import failed: {e}"))?;
+    let _ = h.run("COMMIT");
+    let restored_events = h
+        .run(&format!("SELECT COUNT(*) AS N FROM {COPY_TABLE}"))
+        .map_err(|e| format!("count after the unpinned import: {e}"))?;
+    let restored = grid_view(&restored_events)
+        .and_then(|(_, _, rows)| rows.first().and_then(|row| row.last().cloned()))
+        .unwrap_or_default();
+    if restored.trim() == "0" {
+        return Err("unpinning did not let the same import script through".into());
+    }
+    println!("PASS: the same import script succeeds once the pin is removed ({restored} rows)");
 
     let _ = h.run(&target.drop_sql(COPY_TABLE));
     let _ = h.run(&target.drop_sql(SOURCE_TABLE));

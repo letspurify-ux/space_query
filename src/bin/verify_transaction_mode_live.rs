@@ -18,6 +18,15 @@
 //       screen = tab state = applied session state.
 //   S4  one-shot SET TRANSACTION (next-transaction scope) must NOT repin the
 //       tab or emit TransactionModeChanged.
+//   S14 a READ ONLY pin refuses DDL too, not only DML, and leaves no object.
+//   S15 the OTHER branch of the resolver: a tab with no pin runs under the
+//       CONNECTION default, and restoring that default lets it write again.
+//   S16 (MySQL family) the pinned isolation is behaviourally in force from the
+//       FIRST transaction (Oracle gets this from S11), and returning to
+//       Default puts the connection's own isolation back on the session.
+//   S17 changing the CONNECTION default (what Preferences writes; it bumps the
+//       pool-context epoch) leaves a pinned tab pinned and behaving that way,
+//       while an unpinned neighbour tab picks the new default up.
 //
 // Usage: verify_transaction_mode_live <thin|oci|mysql|mariadb|all>
 
@@ -111,6 +120,7 @@ impl Target {
                 "DROP TABLE SQ_TM_T".into(),
                 "DROP TABLE SQ_TM_ISO".into(),
                 "DROP TABLE SQ_TM_TXN".into(),
+                "DROP TABLE SQ_TM_DDL".into(),
                 "CREATE TABLE SQ_TM_T (V NUMBER)".into(),
                 "INSERT INTO SQ_TM_T VALUES (1)".into(),
                 "CREATE TABLE SQ_TM_ISO (V NUMBER)".into(),
@@ -124,6 +134,7 @@ impl Target {
                 "DROP TABLE IF EXISTS SQ_TM_T".into(),
                 "DROP TABLE IF EXISTS SQ_TM_ISO".into(),
                 "DROP TABLE IF EXISTS SQ_TM_TXN".into(),
+                "DROP TABLE IF EXISTS SQ_TM_DDL".into(),
                 "CREATE TABLE SQ_TM_T (V INT)".into(),
                 "INSERT INTO SQ_TM_T VALUES (1)".into(),
                 "CREATE TABLE SQ_TM_ISO (V INT)".into(),
@@ -141,12 +152,14 @@ impl Target {
                 "DROP TABLE SQ_TM_T".into(),
                 "DROP TABLE SQ_TM_ISO".into(),
                 "DROP TABLE SQ_TM_TXN".into(),
+                "DROP TABLE SQ_TM_DDL".into(),
             ]
         } else {
             vec![
                 "DROP TABLE IF EXISTS SQ_TM_T".into(),
                 "DROP TABLE IF EXISTS SQ_TM_ISO".into(),
                 "DROP TABLE IF EXISTS SQ_TM_TXN".into(),
+                "DROP TABLE IF EXISTS SQ_TM_DDL".into(),
             ]
         }
     }
@@ -798,10 +811,7 @@ fn run_scenarios(target: Target, h: &mut Harness) -> Result<(), String> {
         TransactionAccessMode::ReadOnly,
     );
     let selection_error = space_query::db::DatabaseConnection::transaction_mode_selection_error(
-        h.shared
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .db_type(),
+        h.shared.lock().unwrap_or_else(|p| p.into_inner()).db_type(),
         awkward,
     );
     if target.is_oracle() {
@@ -872,6 +882,294 @@ fn run_scenarios(target: Target, h: &mut Harness) -> Result<(), String> {
         }),
         format!("retained state after ROLLBACK = {after_rollback:?}"),
     );
+
+    // ---- S14: a READ ONLY pin refuses DDL, not only DML --------------------
+    // The toolbar promise is "this tab does not write", and CREATE TABLE
+    // writes. Oracle expresses read-only per transaction, so its client gate
+    // has to refuse the statement itself; the MySQL family relies on the
+    // server. Both must reach the same answer, and neither may leave the
+    // object behind.
+    println!("  --- S14 a READ ONLY pin refuses DDL as well as DML ---");
+    h.editor.set_tab_transaction_mode(TransactionMode::new(
+        TransactionIsolation::Default,
+        TransactionAccessMode::ReadOnly,
+    ));
+    let ddl = if target.is_oracle() {
+        "CREATE TABLE SQ_TM_DDL (V NUMBER)"
+    } else {
+        "CREATE TABLE SQ_TM_DDL (V INT)"
+    };
+    let capture = h.run(ddl)?;
+    let ddl_refused = capture.results.first().is_some_and(|r| {
+        !r.success
+            && read_only_errors.iter().any(|needle| {
+                r.message
+                    .to_ascii_lowercase()
+                    .contains(&needle.to_ascii_lowercase())
+            })
+    });
+    h.check(
+        "S14 CREATE TABLE is refused on the read-only tab",
+        ddl_refused,
+        format!(
+            "ddl result: {:?}",
+            capture
+                .results
+                .first()
+                .map(|r| (r.success, r.message.clone()))
+        ),
+    );
+    h.run("ROLLBACK")?;
+    h.editor.clear_tab_transaction_mode_override();
+    let ddl_probe = if target.is_oracle() {
+        "SELECT COUNT(*) FROM USER_TABLES WHERE TABLE_NAME = 'SQ_TM_DDL'"
+    } else {
+        "SELECT COUNT(*) FROM information_schema.tables \
+         WHERE table_schema = DATABASE() AND table_name = 'SQ_TM_DDL'"
+    };
+    let created = h.select_scalar(ddl_probe)?;
+    h.check(
+        "S14 the refused DDL created nothing",
+        created.trim() == "0",
+        format!("{ddl_probe} = {created:?}"),
+    );
+    h.run("ROLLBACK")?;
+
+    // ---- S15: the CONNECTION default drives a tab that pinned nothing ------
+    // Every other scenario writes the tab override. The other branch of
+    // `effective_transaction_mode` — no override, connection default — is the
+    // one a user gets from the connection's advanced settings, and nothing
+    // else exercises it.
+    println!("  --- S15 the connection default applies to a tab with no pin ---");
+    h.editor.clear_tab_transaction_mode_override();
+    {
+        let mut guard = h.shared.lock().unwrap_or_else(|p| p.into_inner());
+        guard
+            .set_transaction_mode(TransactionMode::new(
+                TransactionIsolation::Default,
+                TransactionAccessMode::ReadOnly,
+            ))
+            .map_err(|e| format!("set connection transaction mode READ ONLY: {e}"))?;
+    }
+    let capture = h.run("INSERT INTO SQ_TM_T VALUES (15)")?;
+    let default_refused = capture.results.first().is_some_and(|r| {
+        !r.success
+            && read_only_errors.iter().any(|needle| {
+                r.message
+                    .to_ascii_lowercase()
+                    .contains(&needle.to_ascii_lowercase())
+            })
+    });
+    h.check(
+        "S15 the connection default READ ONLY refuses the write with no tab pin",
+        default_refused,
+        format!(
+            "insert result: {:?}",
+            capture
+                .results
+                .first()
+                .map(|r| (r.success, r.message.clone()))
+        ),
+    );
+    h.check(
+        "S15 no tab override was invented",
+        h.editor.tab_transaction_mode_override_value().is_none(),
+        format!(
+            "override: {:?}",
+            h.editor.tab_transaction_mode_override_value()
+        ),
+    );
+    h.run("ROLLBACK")?;
+    {
+        let mut guard = h.shared.lock().unwrap_or_else(|p| p.into_inner());
+        guard
+            .set_transaction_mode(initial_connection_mode)
+            .map_err(|e| format!("restore connection transaction mode: {e}"))?;
+    }
+    let capture = h.run("INSERT INTO SQ_TM_T VALUES (15)")?;
+    h.check(
+        "S15 restoring the connection default lets the same tab write again",
+        capture.results.first().map(|r| r.success).unwrap_or(false),
+        format!(
+            "insert result: {:?}",
+            capture
+                .results
+                .first()
+                .map(|r| (r.success, r.message.clone()))
+        ),
+    );
+    h.run("ROLLBACK")?;
+
+    // ---- S16 (MySQL family): the pinned isolation is behaviourally in force
+    //      from the FIRST transaction, and the app's own setup statements do
+    //      not roll the user's transaction back underneath them ---------------
+    // S3 reads @@transaction_isolation, which proves the SET arrived; it does
+    // not prove the running transaction obeys it. MySQL fixes isolation at
+    // transaction start, so "applied one transaction late" reads correct on
+    // the variable and behaves wrong — exactly the failure mode the READ ONLY
+    // pin had. Oracle gets this from S11; this is its MySQL-family twin.
+    if !target.is_oracle() {
+        println!("  --- S16 the pinned isolation really governs the first transaction ---");
+        let default_isolation = {
+            let guard = h.shared.lock().unwrap_or_else(|p| p.into_inner());
+            guard.default_transaction_isolation()
+        };
+        let default_holds_snapshot = matches!(
+            default_isolation,
+            TransactionIsolation::RepeatableRead | TransactionIsolation::Serializable
+        );
+        let isolation_var = if target == Target::MariaDb {
+            "SELECT @@tx_isolation"
+        } else {
+            "SELECT @@transaction_isolation"
+        };
+        let mut other = attach_tab(connect_target(target)?);
+
+        // A snapshot-holding level must hold it from the FIRST transaction.
+        h.editor.set_tab_transaction_mode(TransactionMode::new(
+            TransactionIsolation::RepeatableRead,
+            TransactionAccessMode::ReadWrite,
+        ));
+        let (first, second) = iso_snapshot_pair(h, &mut other)?;
+        h.check(
+            "S16 a REPEATABLE READ pin holds the snapshot in its first transaction",
+            first == second,
+            format!(
+                "reads inside one REPEATABLE READ transaction: {first} then {second} \
+                 (a change means the pin took effect a transaction too late)"
+            ),
+        );
+
+        // ... and a non-snapshot level must not, on the very next transaction.
+        h.editor.set_tab_transaction_mode(TransactionMode::new(
+            TransactionIsolation::ReadCommitted,
+            TransactionAccessMode::ReadWrite,
+        ));
+        let (third, fourth) = iso_snapshot_pair(h, &mut other)?;
+        h.check(
+            "S16 switching to READ COMMITTED takes effect on the next transaction",
+            fourth == third + 1,
+            format!(
+                "reads after switching to READ COMMITTED: {third} then {fourth} \
+                 (unchanged means the session is still REPEATABLE READ)"
+            ),
+        );
+
+        // Returning to Default must put the CONNECTION's isolation back on the
+        // session, not merely on the toolbar label.
+        h.editor
+            .set_tab_transaction_mode(TransactionMode::default());
+        let reported = h.select_scalar(isolation_var)?;
+        h.run("ROLLBACK")?;
+        h.check(
+            "S16 returning to Default puts the connection's own isolation back",
+            reported
+                .replace(['-', '_'], " ")
+                .eq_ignore_ascii_case(&default_isolation.label().replace(['-', '_'], " ")),
+            format!(
+                "{isolation_var} = {reported:?}, connection default = {:?}",
+                default_isolation.label()
+            ),
+        );
+        let (fifth, sixth) = iso_snapshot_pair(h, &mut other)?;
+        h.check(
+            "S16 on Default the tab behaves like the connection's isolation",
+            (fifth == sixth) == default_holds_snapshot,
+            format!(
+                "reads on Default: {fifth} then {sixth}; connection default = {} \
+                 (expected the snapshot to {} held)",
+                default_isolation.label(),
+                if default_holds_snapshot {
+                    "be"
+                } else {
+                    "not be"
+                }
+            ),
+        );
+        h.editor.clear_tab_transaction_mode_override();
+        h.run("ROLLBACK")?;
+    }
+
+    // ---- S17: changing the CONNECTION default must not disturb a pinned tab
+    // The connection default is what Preferences / connection settings write,
+    // and `set_transaction_mode` bumps the pool-context epoch — which
+    // invalidates retained sessions. A tab that pinned its own mode must come
+    // out the other side still pinned and still behaving that way, and a tab
+    // that pinned nothing must pick the new default up.
+    println!("  --- S17 a connection-default change leaves a pinned tab alone ---");
+    h.editor.clear_tab_transaction_mode_override();
+    h.run("ROLLBACK")?;
+    let pin = TransactionMode::new(
+        TransactionIsolation::Default,
+        TransactionAccessMode::ReadOnly,
+    );
+    h.editor.set_tab_transaction_mode(pin);
+    h.run("SELECT V FROM SQ_TM_T")?; // apply the pin to this tab's session
+    h.run("ROLLBACK")?;
+    {
+        let mut guard = h.shared.lock().unwrap_or_else(|p| p.into_inner());
+        guard
+            .set_transaction_mode(TransactionMode::new(
+                TransactionIsolation::Serializable,
+                TransactionAccessMode::ReadWrite,
+            ))
+            .map_err(|e| format!("set connection transaction mode SERIALIZABLE: {e}"))?;
+    }
+    h.check(
+        "S17 the tab's pin survived the connection-default change",
+        h.editor.tab_transaction_mode_override_value() == Some(pin),
+        format!(
+            "override after the connection change: {:?}",
+            h.editor.tab_transaction_mode_override_value()
+        ),
+    );
+    let capture = h.run("INSERT INTO SQ_TM_T VALUES (17)")?;
+    let still_read_only = capture.results.first().is_some_and(|r| {
+        !r.success
+            && read_only_errors.iter().any(|needle| {
+                r.message
+                    .to_ascii_lowercase()
+                    .contains(&needle.to_ascii_lowercase())
+            })
+    });
+    h.check(
+        "S17 the pinned tab still behaves READ ONLY over the new default",
+        still_read_only,
+        format!(
+            "insert result: {:?}",
+            capture
+                .results
+                .first()
+                .map(|r| (r.success, r.message.clone()))
+        ),
+    );
+    h.run("ROLLBACK")?;
+    // A neighbour tab that pinned nothing must follow the NEW default instead.
+    {
+        let mut tab2 = attach_tab(Arc::clone(&h.shared));
+        tab2.run("ROLLBACK")?;
+        let capture = tab2.run("INSERT INTO SQ_TM_T VALUES (17)")?;
+        h.check(
+            "S17 an unpinned neighbour tab writes under the new READ WRITE default",
+            capture.results.first().map(|r| r.success).unwrap_or(false),
+            format!(
+                "second tab insert: {:?}",
+                capture
+                    .results
+                    .first()
+                    .map(|r| (r.success, r.message.clone()))
+            ),
+        );
+        let _ = tab2.run("ROLLBACK");
+    }
+    h.editor.clear_tab_transaction_mode_override();
+    {
+        let mut guard = h.shared.lock().unwrap_or_else(|p| p.into_inner());
+        guard
+            .set_transaction_mode(initial_connection_mode)
+            .map_err(|e| format!("restore connection transaction mode: {e}"))?;
+    }
+    h.run("ROLLBACK")?;
 
     // ---- S9: the toolbar gate opens and closes with the transaction --------
     // The mode controls are disabled exactly when the tab's session cannot take

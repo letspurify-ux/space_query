@@ -11,6 +11,13 @@
 //   (2) in MANUAL transaction mode the editor's retained pooled session is left
 //       dirty (so the Rollback button is allowed), and an editor Rollback
 //       resolves the session back to a clean/released state.
+//   (5) a grid save obeys the tab's transaction mode: on a tab pinned READ
+//       ONLY the save is refused and the row is untouched, and unpinning lets
+//       the same save through. The save has its own worker path that
+//       overrides `DbPoolSessionContext::transaction_mode`, so the SQL-editor
+//       coverage does not settle this.
+//   (6) a grid save obeys the tab's auto-commit: with the tab pinned ON the
+//       saved value survives a later ROLLBACK.
 //
 // Usage: verify_grid_save_live <thin|oci|mysql|mariadb|all>
 // Env: see docs/oracle.md, docs/mysql.md, docs/mariadb.md.
@@ -20,7 +27,8 @@ use space_query::db::{
     compile_oracle_guarded_result_edit, ConnectionInfo, DatabaseConnection, DatabaseType,
     OracleDriverMode, ResultEditAssignment, ResultEditColumn, ResultEditDescriptor,
     ResultEditMutation, ResultEditOriginalValue, ResultEditRequest, ResultEditScalar,
-    ResultEditValue, TransactionSessionState,
+    ResultEditValue, TransactionAccessMode, TransactionIsolation, TransactionMode,
+    TransactionSessionState,
 };
 use space_query::ui::sql_editor::{QueryProgress, SqlEditorWidget};
 use std::env;
@@ -130,6 +138,7 @@ struct Harness {
     editor: SqlEditorWidget,
     events: Arc<Mutex<Vec<QueryProgress>>>,
     done: Arc<AtomicBool>,
+    shared: space_query::db::SharedConnection,
 }
 
 impl Harness {
@@ -192,6 +201,39 @@ impl Harness {
         self.pump_until("rollback to finish", move || !editor.is_query_running())
     }
 
+    /// The toolbar write path in full: `update_transaction_mode_from_controls`
+    /// pins the tab AND pushes the change onto the tab's retained session.
+    /// Pinning alone never reaches a session the tab is already holding.
+    fn set_transaction_mode_like_the_toolbar(
+        &mut self,
+        mode: TransactionMode,
+    ) -> Result<(), String> {
+        self.editor.set_tab_transaction_mode(mode);
+        let (generation, epoch, db_type) = {
+            let guard = self.shared.lock().unwrap_or_else(|p| p.into_inner());
+            (
+                guard.connection_generation(),
+                guard.pool_context_epoch(),
+                guard.db_type(),
+            )
+        };
+        let outcome = self.editor.apply_transaction_mode_to_retained_session(
+            generation,
+            epoch,
+            db_type,
+            mode,
+            "verify grid save",
+        );
+        match outcome {
+            space_query::db::RetainedSessionMutationOutcome::Applied
+            | space_query::db::RetainedSessionMutationOutcome::AppliedWithWarning(_)
+            | space_query::db::RetainedSessionMutationOutcome::NoSession => Ok(()),
+            other => Err(format!(
+                "the tab was pinned but its retained session refused the mode: {other:?}"
+            )),
+        }
+    }
+
     fn retained_state(&self) -> Option<TransactionSessionState> {
         self.editor
             .pooled_session_activity_snapshot()
@@ -238,6 +280,69 @@ fn oracle_rowid_for(harness: &mut Harness, table: &str, id: u32) -> Result<Strin
         .ok_or_else(|| format!("Oracle row {id} did not return a usable ROWID"))
 }
 
+/// One grid save through the real save path: the guarded anonymous block on
+/// Oracle (what `ResultTableWidget::save_edit_mode` compiles), the structured
+/// `ResultEditRequest` worker on the MySQL family.
+fn grid_save(
+    h: &mut Harness,
+    target: Target,
+    table: &str,
+    request_id: u64,
+    from_name: &str,
+    to_name: &str,
+) -> Result<Vec<QueryProgress>, String> {
+    if target.is_oracle() {
+        let rowid = oracle_rowid_for(h, table, 1)?;
+        let save_dml = compile_oracle_guarded_result_edit(&[format!(
+            "UPDATE {table} SET NAME = '{to_name}' WHERE ROWID = '{}' AND NAME = '{from_name}'",
+            rowid.replace('\'', "''")
+        )])?;
+        h.run(&format!("/* SQ_SAVE_REQUEST:{request_id} */\n{save_dml}"))
+    } else {
+        let info = target.connection_info();
+        h.run_edit(ResultEditRequest {
+            request_id,
+            descriptor: ResultEditDescriptor {
+                db_type: info.db_type,
+                schema_name: info.service_name,
+                table_name: table.to_string(),
+                locator_columns: vec!["ID".to_string()],
+                editable_columns: vec![
+                    ResultEditColumn {
+                        result_index: 0,
+                        source_name: "ID".to_string(),
+                    },
+                    ResultEditColumn {
+                        result_index: 1,
+                        source_name: "NAME".to_string(),
+                    },
+                ],
+                snapshot_column_index: 2,
+            },
+            mutations: vec![ResultEditMutation::Update {
+                locator_values: vec![ResultEditScalar::Int(1)],
+                original_values: vec![ResultEditOriginalValue {
+                    column_name: "NAME".to_string(),
+                    value: ResultEditScalar::text(from_name),
+                }],
+                assignments: vec![ResultEditAssignment {
+                    column_name: "NAME".to_string(),
+                    value: ResultEditValue::Text(to_name.to_string()),
+                }],
+            }],
+        })
+    }
+}
+
+/// The message a read-only tab is expected to refuse a write with, per family.
+fn read_only_needles(target: Target) -> &'static [&'static str] {
+    if target.is_oracle() {
+        &["read-only mode blocks", "ora-01456"]
+    } else {
+        &["read only"]
+    }
+}
+
 fn verify(target: Target) -> Result<(), String> {
     println!("\n########## {} ##########", target.label());
 
@@ -265,6 +370,7 @@ fn verify(target: Target) -> Result<(), String> {
         editor,
         events,
         done,
+        shared: Arc::clone(&shared),
     };
 
     let t = "OQT_GRID_SAVE_TEST";
@@ -300,48 +406,8 @@ fn verify(target: Target) -> Result<(), String> {
     // (1) The tagged grid-save statement. Oracle uses the same guarded
     // anonymous block generated by ResultTableWidget::save_edit_mode.
     let tag = "SQ_SAVE_REQUEST:42";
-    let save_events = if target.is_oracle() {
-        let rowid = oracle_rowid_for(&mut h, t, 1)?;
-        let save_dml = compile_oracle_guarded_result_edit(&[format!(
-            "UPDATE {t} SET NAME = 'SCOTT' WHERE ROWID = '{}' AND NAME = 'SMITH'",
-            rowid.replace('\'', "''")
-        )])?;
-        h.run(&format!("/* {tag} */\n{save_dml}"))
-    } else {
-        let info = target.connection_info();
-        h.run_edit(ResultEditRequest {
-            request_id: 42,
-            descriptor: ResultEditDescriptor {
-                db_type: info.db_type,
-                schema_name: info.service_name,
-                table_name: t.to_string(),
-                locator_columns: vec!["ID".to_string()],
-                editable_columns: vec![
-                    ResultEditColumn {
-                        result_index: 0,
-                        source_name: "ID".to_string(),
-                    },
-                    ResultEditColumn {
-                        result_index: 1,
-                        source_name: "NAME".to_string(),
-                    },
-                ],
-                snapshot_column_index: 2,
-            },
-            mutations: vec![ResultEditMutation::Update {
-                locator_values: vec![ResultEditScalar::Int(1)],
-                original_values: vec![ResultEditOriginalValue {
-                    column_name: "NAME".to_string(),
-                    value: ResultEditScalar::text("SMITH"),
-                }],
-                assignments: vec![ResultEditAssignment {
-                    column_name: "NAME".to_string(),
-                    value: ResultEditValue::Text("SCOTT".to_string()),
-                }],
-            }],
-        })
-    }
-    .map_err(|e| format!("grid-save UPDATE: {e}"))?;
+    let save_events = grid_save(&mut h, target, t, 42, "SMITH", "SCOTT")
+        .map_err(|e| format!("grid-save UPDATE: {e}"))?;
     let r = last_result(&save_events).ok_or("grid-save produced no terminal result")?;
 
     println!(
@@ -466,6 +532,99 @@ fn verify(target: Target) -> Result<(), String> {
             "    PASS(4): conflict rolled back the whole save and preserved prior transaction work"
         );
     }
+
+    // (5) A grid save must obey the tab's transaction mode. The save runs on
+    // its own worker path (it overrides DbPoolSessionContext::transaction_mode
+    // with the tab's value), so the SQL-editor read-only coverage says nothing
+    // about it: prove the refusal and the untouched row here.
+    let _ = h.run("COMMIT");
+    // A grid save leaves conservative session residue (the Oracle guarded
+    // block especially), and the toolbar refuses a transaction-mode change on
+    // a session that still needs a decision. Clear it the way the app tells
+    // the user to, so this scenario tests the read-only promise rather than
+    // that (separately covered) gate.
+    let _ = h.editor.discard_pooled_session_for_close();
+    h.set_transaction_mode_like_the_toolbar(TransactionMode::new(
+        TransactionIsolation::Default,
+        TransactionAccessMode::ReadOnly,
+    ))?;
+    let read_only_events = grid_save(&mut h, target, t, 45, "SMITH", "READONLY_LEAK")
+        .map_err(|e| format!("read-only grid save: {e}"))?;
+    let read_only_result =
+        last_result(&read_only_events).ok_or("read-only grid save produced no terminal result")?;
+    println!(
+        "(5) read-only grid save: success={} msg={:?}",
+        read_only_result.success, read_only_result.message
+    );
+    if read_only_result.success {
+        return Err("BUG: a grid save succeeded on a tab pinned READ ONLY".into());
+    }
+    let refused_for_read_only = read_only_needles(target).iter().any(|needle| {
+        read_only_result
+            .message
+            .to_ascii_lowercase()
+            .contains(&needle.to_ascii_lowercase())
+    });
+    if !refused_for_read_only {
+        return Err(format!(
+            "read-only grid save failed for the wrong reason: {:?}",
+            read_only_result.message
+        ));
+    }
+    let _ = h.run("ROLLBACK");
+    // Read back on this same session so even an uncommitted leak shows up.
+    let leak = h.run(&format!("SELECT ID, NAME FROM {t} WHERE ID = 1"))?;
+    let leaked_name = cell_by_col(&leak, "NAME").unwrap_or_default();
+    if leaked_name != "SMITH" {
+        return Err(format!(
+            "read-only grid save changed the row anyway (NAME={leaked_name:?}, expected SMITH)"
+        ));
+    }
+    let _ = h.run("ROLLBACK");
+    println!("    PASS(5): read-only pin refused the grid save and left the row alone");
+
+    // The control: back on Read write through the same toolbar path, the very
+    // same save goes through.
+    let _ = h.editor.discard_pooled_session_for_close();
+    h.set_transaction_mode_like_the_toolbar(TransactionMode::default())?;
+    h.editor.clear_tab_transaction_mode_override();
+    let allowed_events = grid_save(&mut h, target, t, 46, "SMITH", "SCOTT")
+        .map_err(|e| format!("unpinned grid save: {e}"))?;
+    let allowed_result =
+        last_result(&allowed_events).ok_or("unpinned grid save produced no terminal result")?;
+    if !allowed_result.success {
+        return Err(format!(
+            "unpinning did not let the same grid save through: {:?}",
+            allowed_result.message
+        ));
+    }
+    h.rollback()
+        .map_err(|e| format!("rollback after (5): {e}"))?;
+    println!("    PASS(5b): the same save succeeds once the pin is removed");
+
+    // (6) A grid save must obey the tab's auto-commit: pinned ON, the saved
+    // value has to survive a later ROLLBACK.
+    h.editor.set_tab_auto_commit(true);
+    let auto_events = grid_save(&mut h, target, t, 47, "SMITH", "AUTOCOMMITTED")
+        .map_err(|e| format!("auto-commit grid save: {e}"))?;
+    let auto_result =
+        last_result(&auto_events).ok_or("auto-commit grid save produced no terminal result")?;
+    if !auto_result.success {
+        return Err(format!(
+            "grid save failed with auto-commit pinned on: {:?}",
+            auto_result.message
+        ));
+    }
+    h.editor.set_tab_auto_commit(false);
+    let _ = h.run("ROLLBACK");
+    let durable = h.run(&format!("SELECT ID, NAME FROM {t} WHERE ID = 1"))?;
+    let durable_name = cell_by_col(&durable, "NAME").unwrap_or_default();
+    if durable_name != "AUTOCOMMITTED" {
+        return Err(format!(
+            "BUG: a grid save on an auto-commit tab did not commit (NAME={durable_name:?} after ROLLBACK)"
+        ));
+    }
+    println!("    PASS(6): grid save on an auto-commit tab survived a later ROLLBACK");
 
     // Cleanup.
     let _ = h.run("COMMIT");

@@ -8103,11 +8103,9 @@ mod tests {
             TransactionAccessMode::ReadOnly,
         );
 
-        let reason = DatabaseConnection::transaction_mode_selection_error(
-            DatabaseType::Oracle,
-            awkward,
-        )
-        .expect("Oracle cannot combine read-only with an explicit isolation level");
+        let reason =
+            DatabaseConnection::transaction_mode_selection_error(DatabaseType::Oracle, awkward)
+                .expect("Oracle cannot combine read-only with an explicit isolation level");
         assert!(reason.contains("READ ONLY"));
         // The MySQL family expresses the same pair in one statement, so
         // nothing is refused there.
