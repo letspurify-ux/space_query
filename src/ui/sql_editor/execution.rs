@@ -1764,6 +1764,15 @@ impl QueryExecutionCleanupGuard {
         }
     }
 
+    /// Whether the session is known to have been brought back to a clean
+    /// transaction by the statement that just ran (explicit COMMIT/ROLLBACK,
+    /// auto-commit, or a DDL's implicit commit). The Oracle batch uses it to
+    /// decide that the transaction its transaction mode was applied to has
+    /// ended, so the next statement needs the mode again.
+    fn oracle_pooled_session_transaction_known_clean(&self) -> bool {
+        self.oracle_pooled_session_known_transaction_clean
+    }
+
     fn clear_oracle_pooled_session_maybe_dirty(&mut self) {
         // All callers reach here only after the session has just been brought
         // back to a clean state — explicit COMMIT/ROLLBACK, successful auto
@@ -8245,6 +8254,7 @@ impl SqlEditorWidget {
                             Some(sender),
                             false,
                             None,
+                            false,
                         ) {
                             Ok((
                                 connection_generation,
@@ -8268,6 +8278,7 @@ impl SqlEditorWidget {
                                         Some(active_transaction_mode.get()),
                                         prior_retained_state
                                             .requires_physical_session_preservation(),
+                                        false,
                                     )
                                 {
                                     let message =
@@ -12185,6 +12196,59 @@ impl SqlEditorWidget {
 
                             let cleaned = SqlEditorWidget::strip_leading_comments(&sql_text);
                             let upper = cleaned.to_uppercase();
+
+                            // Oracle expresses a non-default transaction mode as
+                            // a property of the TRANSACTION, so it dies with the
+                            // transaction it was applied to: a COMMIT/ROLLBACK
+                            // inside the user's own batch, an auto-commit, or a
+                            // DDL's implicit commit all end it, and every
+                            // statement after that would run under the session
+                            // default while the toolbar still claims the pinned
+                            // mode. Re-apply it at the start of the next
+                            // transaction — but never in front of the user's own
+                            // transaction-first statement, which has to be first
+                            // in its transaction itself (ORA-01453). The thin
+                            // loop does the same, keyed off its retained state.
+                            if !active_transaction_mode.is_default()
+                                && cleanup.oracle_pooled_session_transaction_known_clean()
+                                && !SqlEditorWidget::is_transaction_first_statement(&sql_text)
+                            {
+                                let reapplication = OracleTransactionModeApplication {
+                                    mode: active_transaction_mode,
+                                    tab_selected: load_mutex_transaction_mode_option(
+                                        &tab_transaction_mode_override,
+                                    ),
+                                    default_isolation: default_transaction_isolation,
+                                };
+                                if let Err(err) =
+                                    SqlEditorWidget::apply_oracle_transaction_mode_statements(
+                                        conn.as_ref(),
+                                        reapplication,
+                                    )
+                                {
+                                    SqlEditorWidget::emit_non_select_result(
+                                        &sender,
+                                        &session,
+                                        &conn_name,
+                                        result_index,
+                                        &sql_text,
+                                        format!("Error: {err}"),
+                                        false,
+                                        false,
+                                        script_mode,
+                                    );
+                                    // Applying the tab's transaction mode is app
+                                    // infrastructure, not a user statement:
+                                    // continue-on-error must not let the rest of
+                                    // the batch run under a mode different from
+                                    // what the toolbar shows.
+                                    break;
+                                }
+                                SqlEditorWidget::record_applied_oracle_transaction_mode_effects(
+                                    &mut cleanup,
+                                    reapplication,
+                                );
+                            }
 
                             if active_transaction_mode.access_mode
                                 == crate::db::TransactionAccessMode::ReadOnly
@@ -18141,6 +18205,30 @@ impl SqlEditorWidget {
                         continue;
                     }
                     Self::remember_oracle_thin_compiled_object(session, &execution_sql);
+                    // Oracle expresses a non-default transaction mode as a
+                    // property of the TRANSACTION, so it dies with the
+                    // transaction it was applied to: a COMMIT/ROLLBACK inside
+                    // the user's own batch, an auto-commit, or a DDL's implicit
+                    // commit all end it, and every statement after that would
+                    // run under the session default while the toolbar still
+                    // claims the pinned mode. Re-apply it at the start of the
+                    // next transaction, which is what "applied from the next
+                    // transaction" means inside a batch too.
+                    if transaction_mode_applied
+                        && !active_transaction_mode.is_default()
+                        && !retained_state.may_have_uncommitted_work()
+                    {
+                        transaction_mode_applied = false;
+                    }
+                    // ... but never in front of the user's own transaction-first
+                    // statement: SET TRANSACTION / ALTER SESSION SET
+                    // ISOLATION_LEVEL must be first in its transaction, and an
+                    // injection ahead of it would fail it with ORA-01453.
+                    if !transaction_mode_applied
+                        && Self::is_transaction_first_statement(&execution_sql)
+                    {
+                        transaction_mode_applied = true;
+                    }
                     if !transaction_mode_applied {
                         let transaction_mode_application = OracleTransactionModeApplication {
                             mode: active_transaction_mode,
@@ -21929,7 +22017,13 @@ impl SqlEditorWidget {
         if preserve_existing_session_state {
             return Ok(true);
         }
-        crate::db::DatabaseConnection::apply_mysql_session_settings_for_db_type(
+        // Without the connection's default isolation: the caller applies the
+        // requesting tab's effective transaction mode straight after this, and
+        // resetting the level here would make that a real change — which ends
+        // the transaction this session may already be in (the setup statements
+        // start with ROLLBACK, because MySQL fixes a transaction's isolation at
+        // its start). A session that is already correct must be left alone.
+        crate::db::DatabaseConnection::apply_mysql_session_settings_without_default_isolation_for_db_type(
             conn, advanced, db_type,
         )?;
         Ok(true)
@@ -21983,6 +22077,7 @@ impl SqlEditorWidget {
         session_pool_sender: Option<&QueryProgressSender>,
         require_existing_session: bool,
         required_resolution_action: Option<RetainedSessionResolutionAction>,
+        statement_requires_transaction_boundary: bool,
     ) -> Result<
         (
             u64,
@@ -22173,6 +22268,7 @@ impl SqlEditorWidget {
                         context.transaction_mode,
                         context.default_transaction_isolation,
                         false,
+                        statement_requires_transaction_boundary,
                     )?;
                     return Ok((
                         context.connection_generation,
@@ -22204,6 +22300,7 @@ impl SqlEditorWidget {
             context.transaction_mode,
             context.default_transaction_isolation,
             preserve_existing_session_state,
+            statement_requires_transaction_boundary,
         ) {
             if Self::mysql_pool_acquire_error_should_retry_fresh(&message) {
                 if require_existing_session {
@@ -22231,6 +22328,7 @@ impl SqlEditorWidget {
                     context.transaction_mode,
                     context.default_transaction_isolation,
                     false,
+                    statement_requires_transaction_boundary,
                 )?;
                 return Ok((
                     context.connection_generation,
@@ -22263,6 +22361,70 @@ impl SqlEditorWidget {
         ))
     }
 
+    /// Whether the session already carries exactly the settings this execution
+    /// wants, so preparing it again would only cost the transaction it is in.
+    ///
+    /// Preparing is not a no-op: the setup statements open with `ROLLBACK`
+    /// (see `mysql_pooled_execution_session_setup_statements`), and the MySQL
+    /// family acquires the tab's pooled session once per statement — so
+    /// re-preparing an already-correct session ends the transaction the tab's
+    /// own reads opened, and two plain SELECTs of one script could never share
+    /// a snapshot under a pinned isolation level. Reading system variables
+    /// touches no table, so this probe neither starts a transaction nor
+    /// disturbs one; when anything differs the caller prepares the session as
+    /// before, ROLLBACK included (the mode has to be in force from the next
+    /// transaction, and MySQL fixes it at transaction start).
+    fn mysql_pooled_session_settings_already_applied(
+        conn: &mut mysql::PooledConn,
+        db_type: crate::db::DatabaseType,
+        auto_commit: bool,
+        transaction_mode: crate::db::TransactionMode,
+        default_transaction_isolation: crate::db::TransactionIsolation,
+    ) -> Result<bool, String> {
+        let wanted = crate::db::DatabaseConnection::transaction_mode_with_default_substituted(
+            db_type,
+            transaction_mode,
+            default_transaction_isolation,
+        );
+        // Older MariaDB servers only have the `tx_` spellings of these session
+        // variables, the same fallback `read_mysql_default_transaction_isolation`
+        // uses.
+        let probe = "SELECT CONCAT(@@autocommit), CONCAT(@@transaction_isolation), \
+                     CONCAT(@@transaction_read_only)";
+        let legacy_probe = "SELECT CONCAT(@@autocommit), CONCAT(@@tx_isolation), \
+                            CONCAT(@@tx_read_only)";
+        let row = match conn.query_first::<(String, String, String), _>(probe) {
+            Ok(row) => row,
+            Err(_) => conn
+                .query_first::<(String, String, String), _>(legacy_probe)
+                .map_err(|err| SqlEditorWidget::mysql_error_message(&err, None))?,
+        };
+        let (session_auto_commit, session_isolation, session_read_only) =
+            row.ok_or_else(|| "session settings probe returned no row".to_string())?;
+
+        let reads_as_on = |value: &str| matches!(value.trim(), "1" | "ON" | "on");
+        if reads_as_on(&session_auto_commit) != auto_commit {
+            return Ok(false);
+        }
+        if reads_as_on(&session_read_only)
+            != (wanted.access_mode == crate::db::TransactionAccessMode::ReadOnly)
+        {
+            return Ok(false);
+        }
+        if let Some(wanted_isolation) = wanted.isolation.sql_level() {
+            // An unparseable level is not "different"; treat it as unknown and
+            // prepare the session, which is what happened before this probe.
+            let applied = crate::db::TransactionIsolation::from_sql_level(&session_isolation);
+            if applied != crate::db::TransactionIsolation::from_sql_level(wanted_isolation) {
+                return Ok(false);
+            }
+            if applied.is_none() {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+
     fn apply_mysql_pooled_execution_session_settings(
         conn: &mut mysql::PooledConn,
         db_type: crate::db::DatabaseType,
@@ -22270,14 +22432,36 @@ impl SqlEditorWidget {
         transaction_mode: crate::db::TransactionMode,
         default_transaction_isolation: crate::db::TransactionIsolation,
         preserve_existing_session_state: bool,
+        statement_requires_transaction_boundary: bool,
     ) -> Result<(), String> {
-        for statement in Self::mysql_pooled_execution_session_setup_statements(
+        let statements = Self::mysql_pooled_execution_session_setup_statements(
             db_type,
             auto_commit,
             transaction_mode,
             default_transaction_isolation,
             preserve_existing_session_state,
-        )? {
+        )?;
+        if !statements.is_empty()
+            // A statement that has to be the first of its transaction (a
+            // one-shot `SET TRANSACTION ...`) needs the session brought back to
+            // a transaction boundary, even when its settings are already right
+            // — otherwise the reads before it leave a transaction in progress
+            // and the server refuses it (ER_CANT_CHANGE_TX_CHARACTERISTICS).
+            && !statement_requires_transaction_boundary
+            && Self::mysql_pooled_session_settings_already_applied(
+                conn,
+                db_type,
+                auto_commit,
+                transaction_mode,
+                default_transaction_isolation,
+            )
+            // A probe that cannot be answered means "prepare the session", the
+            // behaviour that predates it.
+            .unwrap_or(false)
+        {
+            return Ok(());
+        }
+        for statement in statements {
             conn.query_drop(statement.as_str()).map_err(|err| {
                 let message = SqlEditorWidget::mysql_error_message(&err, None);
                 if statement.starts_with("SET SESSION TRANSACTION") {
@@ -23462,6 +23646,7 @@ impl SqlEditorWidget {
         operation_auto_commit: bool,
         operation_transaction_mode: Option<crate::db::TransactionMode>,
         preserve_existing_session_state: bool,
+        statement_requires_transaction_boundary: bool,
     ) -> Result<(), String> {
         let (
             target_database,
@@ -23517,6 +23702,7 @@ impl SqlEditorWidget {
                         transaction_mode,
                         default_transaction_isolation,
                         false,
+                        statement_requires_transaction_boundary,
                     ) {
                         clear_pool_session_context_for_shared_connection(shared_connection);
                         return Err(format!(
@@ -23670,6 +23856,11 @@ impl SqlEditorWidget {
     where
         F: FnOnce(&mut mysql::PooledConn) -> Result<T, MysqlError>,
     {
+        // A one-shot `SET TRANSACTION ...` has to be the first statement of its
+        // transaction, so the session has to be prepared back to a boundary for
+        // it even when it already carries the wanted settings.
+        let statement_requires_transaction_boundary =
+            Self::is_transaction_first_statement(statement_sql);
         let (
             connection_generation,
             pool_context_epoch,
@@ -23686,6 +23877,7 @@ impl SqlEditorWidget {
             session_pool_sender,
             require_existing_session,
             required_resolution_action,
+            statement_requires_transaction_boundary,
         )?;
         let db_type = connection_info.db_type;
         let db_display_name = db_type.display_name();
@@ -23902,6 +24094,7 @@ impl SqlEditorWidget {
                 auto_commit,
                 transaction_mode,
                 prior_retained_state.requires_physical_session_preservation(),
+                statement_requires_transaction_boundary,
             ) {
                 let timeout_reset_ok = match timeout_restore.as_ref() {
                     Some(timeout_restore) => timeout_restore
@@ -32561,6 +32754,7 @@ mod mysql_batch_execution_regression_tests {
             connection_generation,
             true,
             None,
+            false,
             false,
         )
         .expect("empty global scope recheck should reset stale database state");

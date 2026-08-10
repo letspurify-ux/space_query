@@ -113,6 +113,20 @@ deliberately not recorded as session residue: it restores a state the tab
 already represents, so it must not make the next execution stop for a
 resolution decision.
 
+### Oracle: the mode is re-applied at every transaction boundary
+
+Oracle expresses both halves of the mode as properties of the TRANSACTION
+(`SET TRANSACTION READ ONLY` / `SET TRANSACTION ISOLATION LEVEL ...`), so the
+mode dies with the transaction it was applied to. A `COMMIT`/`ROLLBACK` inside
+the user's own batch, an auto-commit, or a DDL's implicit commit therefore ends
+it mid-batch, and applying the mode once per execution would leave every
+statement after that point running under the session default while the toolbar
+still claims the pinned mode. Both Oracle batch loops re-apply the mode at the
+start of the next transaction inside the same batch (the thin loop keys off its
+retained state, the OCI loop off the cleanup guard's known-clean flag), and
+neither injects it in front of the user's own transaction-first statement,
+which has to be first in its transaction itself (ORA-01453).
+
 ### Oracle: Read only is enforced in the client on both drivers
 
 Oracle expresses read-only as a property of the TRANSACTION
@@ -144,6 +158,32 @@ requires resolution). The guard test
 `transaction_mode_state_has_a_single_source_of_truth`
 (`tests/concurrency_multithread_guards.rs`) pins the resolver chain, the
 display cross-check, and the adoption wiring.
+
+### MySQL/MariaDB: an already-correct session is left alone
+
+The MySQL family acquires the tab's pooled session once per statement, and
+preparing it is not free of meaning: the setup statements below start with
+`ROLLBACK`, so preparing a session that is already correct ends the transaction
+the tab's own reads opened. Two plain `SELECT`s of one script could not share a
+snapshot under a pinned isolation level because of it — the level was in force,
+but each statement got a transaction of its own. Two rules keep the tab's
+transaction intact:
+
+- the reusable-session readiness check applies the connection's session
+  settings **without** its default isolation level
+  (`apply_mysql_session_settings_without_default_isolation_for_db_type`); the
+  execution applies the tab's effective mode straight after, and that mode
+  already resolves `Default` to the connection default, so re-asserting it
+  first only creates a change that has to be made,
+- `apply_mysql_pooled_execution_session_settings` reads the session's
+  `autocommit`, isolation level and read-only flag back and skips the setup
+  entirely when they already match. Reading system variables touches no table,
+  so the probe neither starts a transaction nor disturbs one.
+
+The exception is a statement that must be the first of its transaction (a
+one-shot `SET TRANSACTION ...`): the session is prepared back to a boundary for
+it even when its settings already match, or the server refuses it with
+ER_CANT_CHANGE_TX_CHARACTERISTICS.
 
 ### MySQL/MariaDB: end the residual transaction before applying mode
 
@@ -238,7 +278,17 @@ of `effective_transaction_mode` and the one a user gets from advanced settings
 (S15); and on the MySQL family the pinned isolation must govern the FIRST
 transaction behaviourally, not just report itself in `@@transaction_isolation`
 — MySQL fixes isolation at transaction start, so "applied one transaction late"
-reads correct on the variable and behaves wrong (S16).
+reads correct on the variable and behaves wrong (S16). The remaining scenarios
+settle what the pin means over time and against the connection: a
+connection-default change leaves a pinned tab pinned and behaving that way
+while an unpinned neighbour picks the new default up (S17); the pinned
+ISOLATION survives a `COMMIT` inside the user's own batch, read behaviourally
+with two reads of one transaction bracketing another session's commit — both
+with and without that `COMMIT` (S18a/S18b); a READ WRITE pin writes over a READ
+ONLY connection default while an unpinned tab is still refused (S19); and a
+locking read keeps its lock until the tab resolves it, which is the sharpest
+check that the app leaves the tab's own transaction alone between statements
+(S20).
 
 `verify_auto_commit_live` covers the tab-scoped auto-commit model on the same
 four backends: the connection default really commits, the menu write path pins
@@ -251,7 +301,12 @@ rollback-able while its neighbour tab still commits (S9) — the gate the menu
 item itself obeys (`TransactionOptionChange` preflight, not the script path of
 S3) on a live dirty session (S10), and a script that fails in the middle under
 auto-commit: the work before the failure stays committed and nothing is left
-for the close prompt (S11).
+for the close prompt (S11). A connection-default change leaves a pinned tab
+pinned in both directions while an unpinned neighbour follows the new default
+(S12), a `SET AUTOCOMMIT` inside a script governs the statements after it in
+the SAME script in both directions without touching the connection default
+(S13), and on the MySQL family an explicit `START TRANSACTION` survives
+auto-commit ON — its DML is still rollback-able (S14).
 
 Note when reading these: the connection's default isolation is READ COMMITTED
 (`ConnectionAdvancedSettings::default_transaction_isolation`), not the MySQL

@@ -4065,9 +4065,43 @@ impl DatabaseConnection {
         advanced: &ConnectionAdvancedSettings,
         db_type: DatabaseType,
     ) -> Result<(), String> {
+        Self::apply_mysql_session_settings_for_db_type_with_isolation(conn, advanced, db_type, true)
+    }
+
+    /// The same session settings without the connection's default isolation
+    /// level, for a session an execution is about to put into the requesting
+    /// tab's own transaction mode.
+    ///
+    /// The tab's mode already resolves `Default` to the connection default, so
+    /// re-asserting it here is redundant — and harmful: it leaves the session
+    /// on a level the execution then has to change, and changing it means
+    /// ending the transaction the tab's own reads had opened (MySQL fixes a
+    /// transaction's isolation at its start). Two plain SELECTs of one script
+    /// could not share a snapshot under a pinned isolation level because of it.
+    pub(crate) fn apply_mysql_session_settings_without_default_isolation_for_db_type<
+        C: Queryable,
+    >(
+        conn: &mut C,
+        advanced: &ConnectionAdvancedSettings,
+        db_type: DatabaseType,
+    ) -> Result<(), String> {
+        Self::apply_mysql_session_settings_for_db_type_with_isolation(
+            conn, advanced, db_type, false,
+        )
+    }
+
+    fn apply_mysql_session_settings_for_db_type_with_isolation<C: Queryable>(
+        conn: &mut C,
+        advanced: &ConnectionAdvancedSettings,
+        db_type: DatabaseType,
+        include_default_transaction_isolation: bool,
+    ) -> Result<(), String> {
         let display_name = db_type.display_name();
         Self::validate_mysql_session_time_zone_for_server(conn, advanced.session_time_zone.trim())?;
-        let statements = Self::mysql_session_setting_statements(advanced);
+        let statements = Self::mysql_session_setting_statements_with_isolation(
+            advanced,
+            include_default_transaction_isolation,
+        );
 
         for statement in statements {
             if let Err(err) = conn.query_drop(statement.as_str()) {
@@ -4128,7 +4162,15 @@ impl DatabaseConnection {
         ))
     }
 
+    #[cfg(test)]
     fn mysql_session_setting_statements(advanced: &ConnectionAdvancedSettings) -> Vec<String> {
+        Self::mysql_session_setting_statements_with_isolation(advanced, true)
+    }
+
+    fn mysql_session_setting_statements_with_isolation(
+        advanced: &ConnectionAdvancedSettings,
+        include_default_transaction_isolation: bool,
+    ) -> Vec<String> {
         let mut statements = Vec::new();
         statements.push(format!(
             "SET SESSION sql_mode = '{}'",
@@ -4138,8 +4180,10 @@ impl DatabaseConnection {
         if !time_zone.is_empty() {
             statements.push(format!("SET SESSION time_zone = '{time_zone}'"));
         }
-        if let Some(level) = advanced.default_transaction_isolation.sql_level() {
-            statements.push(format!("SET SESSION TRANSACTION ISOLATION LEVEL {level}"));
+        if include_default_transaction_isolation {
+            if let Some(level) = advanced.default_transaction_isolation.sql_level() {
+                statements.push(format!("SET SESSION TRANSACTION ISOLATION LEVEL {level}"));
+            }
         }
         statements
     }
@@ -5117,19 +5161,35 @@ impl DatabaseConnection {
         mode: TransactionMode,
         default_isolation: TransactionIsolation,
     ) -> Result<Vec<String>, String> {
+        Self::transaction_mode_statements_for(
+            db_type,
+            Self::transaction_mode_with_default_substituted(db_type, mode, default_isolation),
+        )
+    }
+
+    /// The mode the MySQL family will really SET: `Default` isolation means
+    /// "the connection's configured default", so it is substituted here rather
+    /// than left to the server's own default. Callers that need to know what a
+    /// session should already carry (see
+    /// `mysql_pooled_session_settings_already_applied`) must resolve it the
+    /// same way the statements do, so both go through this.
+    pub(crate) fn transaction_mode_with_default_substituted(
+        db_type: DatabaseType,
+        mode: TransactionMode,
+        default_isolation: TransactionIsolation,
+    ) -> TransactionMode {
         let mysql_family = match db_type {
             DatabaseType::MySQL | DatabaseType::MariaDB => true,
             DatabaseType::Oracle => false,
         };
-        let mode = if mysql_family
+        if mysql_family
             && mode.isolation == TransactionIsolation::Default
             && default_isolation != TransactionIsolation::Default
         {
             TransactionMode::new(default_isolation, mode.access_mode)
         } else {
             mode
-        };
-        Self::transaction_mode_statements_for(db_type, mode)
+        }
     }
 
     pub fn apply_oracle_transaction_mode(

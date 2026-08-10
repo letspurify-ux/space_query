@@ -27,6 +27,11 @@
 //   S17 changing the CONNECTION default (what Preferences writes; it bumps the
 //       pool-context epoch) leaves a pinned tab pinned and behaving that way,
 //       while an unpinned neighbour tab picks the new default up.
+//   S18 the pinned ISOLATION survives a COMMIT inside the user's own batch
+//       (the isolation twin of S10), read behaviourally: two reads in one
+//       post-COMMIT transaction with another session committing between them.
+//   S19 the other direction of the pin: a READ WRITE tab writes over a READ
+//       ONLY connection default, while an unpinned tab is still refused.
 //
 // Usage: verify_transaction_mode_live <thin|oci|mysql|mariadb|all>
 
@@ -211,6 +216,35 @@ impl Harness {
         Ok(())
     }
 
+    /// Pumps the event loop for a fixed time without waiting for anything —
+    /// used to let a batch that is already running reach a known point (a
+    /// sleeping statement) so another session can commit while it is there.
+    fn pump_for(&self, duration: Duration) {
+        let deadline = Instant::now() + duration;
+        while Instant::now() < deadline {
+            if !app::wait() {
+                app::check();
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        }
+    }
+
+    /// Starts a batch without waiting for it, so the caller can interleave
+    /// work from another session while it runs. Pair with `finish_started`.
+    fn start(&mut self, sql: &str) {
+        self.done.store(false, Ordering::SeqCst);
+        *self.capture.lock().unwrap_or_else(|p| p.into_inner()) = RunCapture::default();
+        self.editor.execute_sql_text(sql);
+    }
+
+    fn finish_started(&mut self) -> Result<RunCapture, String> {
+        let done = Arc::clone(&self.done);
+        self.pump_until("started batch to finish", || done.load(Ordering::SeqCst))?;
+        Ok(std::mem::take(
+            &mut *self.capture.lock().unwrap_or_else(|p| p.into_inner()),
+        ))
+    }
+
     fn run(&mut self, sql: &str) -> Result<RunCapture, String> {
         self.done.store(false, Ordering::SeqCst);
         *self.capture.lock().unwrap_or_else(|p| p.into_inner()) = RunCapture::default();
@@ -321,6 +355,51 @@ fn iso_snapshot_pair(h: &mut Harness, other: &mut Harness) -> Result<(i64, i64),
             .map_err(|e| format!("SQ_TM_ISO read {value:?}: {e}"))
     };
     Ok((parse(first)?, parse(second)?))
+}
+
+/// Runs one batch of the tab under test whose last two reads of `SQ_TM_ISO`
+/// bracket a committed change from `other`, and returns every value the batch
+/// read plus any failed statement. `lead` is script text placed before the
+/// bracketing pair (S18 uses it for the batch's own COMMIT). Two reads of one
+/// transaction must return the same value under a pinned isolation level.
+fn bracketed_reads_in_one_batch(
+    h: &mut Harness,
+    other: &mut Harness,
+    lead: &str,
+    sleep_statement: &str,
+) -> Result<(Vec<i64>, Vec<(String, String)>), String> {
+    let script = format!(
+        "{lead}SELECT V FROM SQ_TM_ISO;\n\
+         {sleep_statement}\n\
+         SELECT V FROM SQ_TM_ISO;"
+    );
+    h.start(&script);
+    // Reach the sleeping statement, so the other session's commit lands
+    // between the two bracketing reads.
+    h.pump_for(Duration::from_millis(2500));
+    other.run("UPDATE SQ_TM_ISO SET V = V + 1")?;
+    other.run("COMMIT")?;
+    let capture = h.finish_started()?;
+    let failed = capture
+        .results
+        .iter()
+        .filter(|r| !r.success)
+        .map(|r| (r.sql.clone(), r.message.clone()))
+        .collect();
+    let reads = capture
+        .rows
+        .iter()
+        .filter_map(|row| row.last())
+        .filter_map(|cell| cell.trim().parse::<i64>().ok())
+        .collect();
+    Ok((reads, failed))
+}
+
+fn last_pair(reads: &[i64]) -> Option<(i64, i64)> {
+    match reads {
+        [.., first, second] => Some((*first, *second)),
+        _ => None,
+    }
 }
 
 fn run_scenarios(target: Target, h: &mut Harness) -> Result<(), String> {
@@ -1171,6 +1250,229 @@ fn run_scenarios(target: Target, h: &mut Harness) -> Result<(), String> {
     }
     h.run("ROLLBACK")?;
 
+    // ---- S18: the pinned ISOLATION must survive the batch's own COMMIT -----
+    // The isolation twin of S10. The tab setting says "this tab runs
+    // SERIALIZABLE / REPEATABLE READ", and the promise cannot end halfway
+    // through a script: Oracle expresses isolation as a TRANSACTION property
+    // (SET TRANSACTION ISOLATION LEVEL ...), so a COMMIT inside the user's own
+    // batch ends it and everything after would run at the session default;
+    // the MySQL family applies a SESSION characteristic that survives by
+    // itself. Read behaviourally, because that is the only honest reading: two
+    // reads inside ONE transaction, with another session committing between
+    // them, must return the same value.
+    println!("  --- S18 the pinned isolation survives a COMMIT inside the batch ---");
+    h.editor.clear_tab_transaction_mode_override();
+    h.run("ROLLBACK")?;
+    {
+        let mut other = attach_tab(connect_target(target)?);
+        let pinned_isolation = if target.is_oracle() {
+            TransactionIsolation::Serializable
+        } else {
+            // REPEATABLE READ, not SERIALIZABLE: InnoDB's SERIALIZABLE turns
+            // plain reads into locking reads, which would block the other
+            // session's UPDATE instead of testing the snapshot.
+            TransactionIsolation::RepeatableRead
+        };
+        h.editor.set_tab_transaction_mode(TransactionMode::new(
+            pinned_isolation,
+            TransactionAccessMode::ReadWrite,
+        ));
+        let sleep_statement = if target.is_oracle() {
+            "BEGIN DBMS_SESSION.SLEEP(6); END;\n/"
+        } else {
+            "DO SLEEP(6);"
+        };
+
+        // S18a: the baseline claim, with no COMMIT anywhere in the batch — two
+        // reads of one transaction must not straddle another session's commit.
+        let (reads, failed) = bracketed_reads_in_one_batch(h, &mut other, "", sleep_statement)?;
+        h.check(
+            "S18a every statement of the plain batch ran",
+            failed.is_empty(),
+            format!("failed statements: {failed:?}"),
+        );
+        let plain_pair = last_pair(&reads);
+        h.check(
+            "S18a two reads of one batch see one transaction snapshot",
+            plain_pair.is_some_and(|(first, second)| first == second),
+            format!(
+                "reads in the batch: {reads:?} (different values mean the tab's \
+                 pinned isolation did not hold across the batch's statements)"
+            ),
+        );
+        h.run("ROLLBACK")?;
+        let _ = h.editor.discard_pooled_session_for_close();
+
+        // S18b: the same claim after the user's own COMMIT inside the batch.
+        let (reads, failed) = bracketed_reads_in_one_batch(
+            h,
+            &mut other,
+            "SELECT V FROM SQ_TM_ISO;\nCOMMIT;\n",
+            sleep_statement,
+        )?;
+        h.check(
+            "S18b every statement of the committing batch ran",
+            failed.is_empty(),
+            format!("failed statements: {failed:?}"),
+        );
+        let after_commit_pair = last_pair(&reads);
+        h.check(
+            "S18b both reads after the batch's COMMIT see one transaction snapshot",
+            after_commit_pair.is_some_and(|(first, second)| first == second),
+            format!(
+                "reads in the batch: {reads:?} (the last two bracket the other \
+                 session's commit; different values mean the pinned isolation \
+                 was dropped by the COMMIT)"
+            ),
+        );
+        h.run("ROLLBACK")?;
+        // Control: the other session really did commit, so the checks above
+        // cannot pass by nothing having happened.
+        h.editor.clear_tab_transaction_mode_override();
+        let now = h.select_scalar("SELECT V FROM SQ_TM_ISO")?;
+        h.check(
+            "S18 the other session's commits are visible to a new transaction",
+            now.trim()
+                .parse::<i64>()
+                .ok()
+                .zip(after_commit_pair)
+                .is_some_and(|(now, (first, _))| now > first),
+            format!("SQ_TM_ISO after the batch = {now:?}, in-batch reads {reads:?}"),
+        );
+        let _ = other.run("ROLLBACK");
+        let _ = other.editor.discard_pooled_session_for_close();
+    }
+    h.editor.clear_tab_transaction_mode_override();
+    h.run("ROLLBACK")?;
+    // The sleeping statement is a PL/SQL block (Oracle) / an unclassified
+    // command (MySQL family), so the app records conservative session residue
+    // for it — correct behaviour, but it would block the next scenario's
+    // execution. Discard the session the way the tab's close path does.
+    let _ = h.editor.discard_pooled_session_for_close();
+
+    // ---- S19: the OTHER direction of the pin — READ WRITE over a READ ONLY
+    // connection default. S15 covers a tab with no pin following a READ ONLY
+    // default; the tab pin has to be able to lift it again, or a connection
+    // configured read-only by default would have no per-tab escape at all.
+    println!("  --- S19 a READ WRITE pin lifts a READ ONLY connection default ---");
+    {
+        let mut guard = h.shared.lock().unwrap_or_else(|p| p.into_inner());
+        guard
+            .set_transaction_mode(TransactionMode::new(
+                TransactionIsolation::Default,
+                TransactionAccessMode::ReadOnly,
+            ))
+            .map_err(|e| format!("set connection default READ ONLY: {e}"))?;
+    }
+    {
+        // Control: with the new default really in force, a tab that pins
+        // nothing is refused.
+        let mut tab2 = attach_tab(Arc::clone(&h.shared));
+        let capture = tab2.run("INSERT INTO SQ_TM_T VALUES (19)")?;
+        let refused = capture.results.first().is_some_and(|r| {
+            !r.success
+                && read_only_errors.iter().any(|needle| {
+                    r.message
+                        .to_ascii_lowercase()
+                        .contains(&needle.to_ascii_lowercase())
+                })
+        });
+        h.check(
+            "S19 an unpinned tab follows the READ ONLY connection default",
+            refused,
+            format!(
+                "unpinned insert: {:?}",
+                capture
+                    .results
+                    .first()
+                    .map(|r| (r.success, r.message.clone()))
+            ),
+        );
+        let _ = tab2.run("ROLLBACK");
+        let _ = tab2.editor.discard_pooled_session_for_close();
+    }
+    h.editor.set_tab_transaction_mode(TransactionMode::new(
+        TransactionIsolation::Default,
+        TransactionAccessMode::ReadWrite,
+    ));
+    let capture = h.run("INSERT INTO SQ_TM_T VALUES (19)")?;
+    h.check(
+        "S19 the READ WRITE pin writes over the read-only default",
+        capture.results.first().map(|r| r.success).unwrap_or(false),
+        format!(
+            "pinned insert: {:?}",
+            capture
+                .results
+                .first()
+                .map(|r| (r.success, r.message.clone()))
+        ),
+    );
+    h.run("ROLLBACK")?;
+    h.editor.clear_tab_transaction_mode_override();
+    {
+        let mut guard = h.shared.lock().unwrap_or_else(|p| p.into_inner());
+        guard
+            .set_transaction_mode(initial_connection_mode)
+            .map_err(|e| format!("restore connection transaction mode: {e}"))?;
+    }
+    h.run("ROLLBACK")?;
+
+    // ---- S20: a locking read must keep its lock until the user resolves it -
+    // `SELECT ... FOR UPDATE` is the strongest statement of intent a read can
+    // make: the rows are held for the statement the user is about to write.
+    // The lock lives on the transaction, so it survives only as long as the
+    // tab's transaction does — which makes this the sharpest test of whether
+    // the app leaves the tab's transaction alone between executions.
+    println!("  --- S20 a locking read keeps its lock until the tab resolves it ---");
+    h.editor.clear_tab_transaction_mode_override();
+    h.run("ROLLBACK")?;
+    {
+        let mut other = attach_tab(connect_target(target)?);
+        let capture = h.run("SELECT V FROM SQ_TM_T FOR UPDATE")?;
+        h.check(
+            "S20 the locking read ran",
+            capture
+                .results
+                .iter()
+                .all(|r| r.success || r.message.is_empty()),
+            format!(
+                "locking read: {:?}",
+                capture
+                    .results
+                    .iter()
+                    .map(|r| (r.success, r.message.clone()))
+                    .collect::<Vec<_>>()
+            ),
+        );
+        let capture = other.run("SELECT V FROM SQ_TM_T FOR UPDATE NOWAIT")?;
+        let blocked = capture.results.iter().any(|r| !r.success)
+            || capture.messages.iter().any(|m| m.contains("Error"));
+        h.check(
+            "S20 another session cannot take the same rows",
+            blocked,
+            format!(
+                "the other session's locking read: {:?} (success means the tab's \
+                 transaction — and with it the lock — was already gone)",
+                capture
+                    .results
+                    .iter()
+                    .map(|r| (r.success, r.message.clone()))
+                    .collect::<Vec<_>>()
+            ),
+        );
+        // The refused locking read leaves the other session in a state the app
+        // conservatively wants resolved (MariaDB reports a lock error that a
+        // ROLLBACK statement is not allowed to answer on its own), so end that
+        // session the way the close path does instead of typing ROLLBACK into
+        // it — otherwise the harness meets the resolution dialog and blocks.
+        let _ = other.editor.discard_pooled_session_for_close();
+        h.run("ROLLBACK")?;
+    }
+    // A locking read is conservative session state on the MySQL family, and a
+    // ROLLBACK does not clear residue — leave the tab a clean session instead
+    // of letting the next scenario meet the resolution dialog.
+    let _ = h.editor.discard_pooled_session_for_close();
+
     // ---- S9: the toolbar gate opens and closes with the transaction --------
     // The mode controls are disabled exactly when the tab's session cannot take
     // a change. Uncommitted work blocks it on EVERY backend: replacement needs
@@ -1327,6 +1629,11 @@ fn attach_tab(shared: space_query::db::SharedConnection) -> Harness {
 
 fn connect_target(target: Target) -> Result<space_query::db::SharedConnection, String> {
     let mut connection = DatabaseConnection::new();
+    // The scenarios open several tabs on one connection, and each tab holds a
+    // pooled session of its own; the shipped default pool is smaller than this
+    // harness needs, and running out of it fails a scenario for a reason that
+    // has nothing to do with what it verifies.
+    connection.set_connection_pool_size(space_query::utils::config::MAX_CONNECTION_POOL_SIZE);
     connection
         .connect(target.connection_info())
         .map_err(|e| format!("connect: {e}"))?;

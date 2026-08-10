@@ -3065,6 +3065,64 @@ fn transaction_mode_state_has_a_single_source_of_truth() {
         controls_body.contains("transaction_mode_selection_error("),
         "the toolbar must refuse an isolation/access pair this database cannot run"
     );
+
+    // (12) Oracle's transaction mode is a property of the TRANSACTION, so it
+    // dies with the transaction it was applied to. Both Oracle batch loops must
+    // put it back at the start of the next transaction inside the same batch —
+    // after a COMMIT/ROLLBACK, an auto-commit, or a DDL's implicit commit —
+    // instead of applying it once per batch, and neither may inject it in front
+    // of the user's own transaction-first statement (ORA-01453).
+    let thin_start = execution
+        .find("fn execute_oracle_thin_batch_with_connection<")
+        .expect("the thin batch loop should exist");
+    let thin_end = execution[thin_start..]
+        .find("\n    fn ")
+        .map(|offset| thin_start + offset)
+        .unwrap_or(execution.len());
+    let thin_body = &execution[thin_start..thin_end];
+    assert!(
+        thin_body.contains("transaction_mode_applied = false")
+            && thin_body.contains("!retained_state.may_have_uncommitted_work()")
+            && thin_body.contains("is_transaction_first_statement("),
+        "the thin batch must re-apply the tab's transaction mode when the batch's own transaction ends, and yield to a transaction-first statement"
+    );
+    // The OCI batch runs inside the shared execution worker rather than a
+    // function of its own, so anchor on the re-apply itself.
+    let oci_reapply = execution
+        .find("cleanup.oracle_pooled_session_transaction_known_clean()")
+        .expect("the OCI batch must re-apply the transaction mode at the next transaction");
+    let oci_reapply_window = &execution[oci_reapply.saturating_sub(400)..oci_reapply + 900];
+    assert!(
+        oci_reapply_window.contains("!active_transaction_mode.is_default()")
+            && oci_reapply_window.contains("is_transaction_first_statement("),
+        "the OCI re-apply must be limited to a non-default mode and yield to a transaction-first statement"
+    );
+
+    // (13) The MySQL family acquires the tab's pooled session once per
+    // statement, so preparing an already-correct session again would end the
+    // transaction the tab's own reads opened (the setup statements start with
+    // ROLLBACK). The acquisition must not re-assert the connection's default
+    // isolation, and the setup must be skipped when the session already
+    // carries the wanted settings — except for a statement that has to be the
+    // first of its transaction.
+    let ready_start = execution
+        .find("fn reusable_mysql_pooled_session_is_ready(")
+        .expect("the reusable-session readiness check should exist");
+    let ready_body = &execution[ready_start..ready_start + 1600];
+    assert!(
+        ready_body
+            .contains("apply_mysql_session_settings_without_default_isolation_for_db_type("),
+        "a reusable MySQL pooled session must not have the connection's default isolation re-applied to it"
+    );
+    let settings_start = execution
+        .find("fn apply_mysql_pooled_execution_session_settings(")
+        .expect("the pooled session settings applier should exist");
+    let settings_body = &execution[settings_start..settings_start + 1600];
+    assert!(
+        settings_body.contains("mysql_pooled_session_settings_already_applied(")
+            && settings_body.contains("!statement_requires_transaction_boundary"),
+        "an already-correct MySQL session must be left alone, unless the statement must start a transaction"
+    );
 }
 
 /// The Oracle thin batch loop's own read-only gate, located without pinning

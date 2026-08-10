@@ -30,6 +30,11 @@
 //   S12 changing the CONNECTION default (what Preferences writes) leaves a
 //       pinned tab pinned, in both directions, while an unpinned neighbour
 //       tab follows the new default.
+//   S13 SET AUTOCOMMIT inside a script governs the statements after it in the
+//       SAME script, in both directions, without touching the connection
+//       default.
+//   S14 (MySQL family) an explicit START TRANSACTION survives auto-commit ON:
+//       the DML inside it is still rollback-able.
 //
 // Usage: verify_auto_commit_live <thin|oci|mysql|mariadb|all>
 
@@ -663,6 +668,97 @@ fn run_scenarios(target: Target, h: &mut Harness) -> Result<(), String> {
     h.editor.sync_tab_auto_commit_with_global_setting(false);
     h.run("ROLLBACK")?;
 
+    // ---- S13: SET AUTOCOMMIT inside a script governs the REST of that script
+    // S2 and S3 change auto-commit in their own execution, so the batch that
+    // follows starts with the new value already resolved. A script that
+    // changes it mid-way is the SQL*Plus shape users actually write, and it
+    // exercises the batch-local auto-commit variable instead: every statement
+    // after the change must run under the new value, in both directions.
+    println!("  --- S13 SET AUTOCOMMIT mid-script governs the statements after it ---");
+    h.set_connection_auto_commit(false)
+        .map_err(|e| format!("set_auto_commit(false): {e}"))?;
+    h.editor.sync_tab_auto_commit_with_global_setting(false);
+    let before = h.select_v()?;
+    let capture = h.run(&format!("SET AUTOCOMMIT ON;\n{dml};\nROLLBACK;"))?;
+    let failed: Vec<(String, String)> = capture
+        .results
+        .iter()
+        .filter(|r| !r.success)
+        .map(|r| (r.sql.clone(), r.message.clone()))
+        .collect();
+    h.check(
+        "S13 the ON script ran through",
+        failed.is_empty(),
+        format!("failed statements: {failed:?}"),
+    );
+    let after_on = h.select_v()?;
+    h.check(
+        "S13 the DML after SET AUTOCOMMIT ON survives the script's own ROLLBACK",
+        after_on == before + 1,
+        format!("expected {}, got {after_on}", before + 1),
+    );
+    // ... and the other direction: the tab is ON now, so a script that turns
+    // it OFF must leave its DML rollback-able again.
+    let capture = h.run(&format!("SET AUTOCOMMIT OFF;\n{dml};\nROLLBACK;"))?;
+    let failed: Vec<(String, String)> = capture
+        .results
+        .iter()
+        .filter(|r| !r.success)
+        .map(|r| (r.sql.clone(), r.message.clone()))
+        .collect();
+    h.check(
+        "S13 the OFF script ran through",
+        failed.is_empty(),
+        format!("failed statements: {failed:?}"),
+    );
+    let after_off = h.select_v()?;
+    h.check(
+        "S13 the DML after SET AUTOCOMMIT OFF was undone by the script's ROLLBACK",
+        after_off == after_on,
+        format!("expected {after_on}, got {after_off}"),
+    );
+    h.check(
+        "S13 the mid-script change left the connection default alone",
+        !h.connection_auto_commit(),
+        "a mid-script SET AUTOCOMMIT mutated the shared connection default".into(),
+    );
+    h.editor.sync_tab_auto_commit_with_global_setting(false);
+    h.run("ROLLBACK")?;
+
+    // ---- S14 (MySQL family): auto-commit must not break an explicit
+    // transaction the user opened. START TRANSACTION suspends autocommit on
+    // the server, and the tab holds one physical session across executions, so
+    // the app's per-statement session setup must not step in and end it.
+    // Oracle has no such statement: SET TRANSACTION only sets properties, and
+    // SQL*Plus-style auto-commit commits each DML by design.
+    if !target.is_oracle() {
+        println!("  --- S14 an explicit transaction survives auto-commit ON ---");
+        h.editor.set_tab_auto_commit(true);
+        let before = h.select_v()?;
+        h.run("START TRANSACTION")?;
+        let capture = h.run(dml)?;
+        h.check(
+            "S14 the DML inside the explicit transaction succeeded",
+            capture.results.first().map(|r| r.success).unwrap_or(false),
+            format!(
+                "dml result: {:?}",
+                capture
+                    .results
+                    .first()
+                    .map(|r| (r.success, r.message.clone()))
+            ),
+        );
+        h.run("ROLLBACK")?;
+        let after = h.select_v()?;
+        h.check(
+            "S14 ROLLBACK undid it (auto-commit did not commit inside the transaction)",
+            after == before,
+            format!("expected {before}, got {after}"),
+        );
+        h.editor.sync_tab_auto_commit_with_global_setting(false);
+        h.run("ROLLBACK")?;
+    }
+
     // ---- S6 (Oracle, runs last): script CONNECT resolves auto-commit from
     // the new connection's seeded default, not the old connection's value ----
     fn run_connect_scenario(target: Target, h: &mut Harness) -> Result<(), String> {
@@ -882,6 +978,11 @@ fn verify(target: Target) -> Result<Vec<String>, String> {
     println!("\n########## {} ##########", target.label());
 
     let mut connection = DatabaseConnection::new();
+    // The scenarios open several tabs on one connection, and each tab holds a
+    // pooled session of its own; the shipped default pool is smaller than this
+    // harness needs, and running out of it fails a scenario for a reason that
+    // has nothing to do with what it verifies.
+    connection.set_connection_pool_size(space_query::utils::config::MAX_CONNECTION_POOL_SIZE);
     connection
         .connect(target.connection_info())
         .map_err(|e| format!("connect: {e}"))?;
