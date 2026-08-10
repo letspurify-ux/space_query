@@ -26,7 +26,7 @@ use mysql::prelude::Queryable;
 use space_query::db::{
     retained_session_state_preflight_decision, ConnectionInfo, DatabaseConnection, DatabaseType,
     OracleDriverMode, QueryResult, RetainedSessionPreflightAction,
-    RetainedSessionPreflightDecision,
+    RetainedSessionPreflightDecision, TransactionAccessMode, TransactionIsolation, TransactionMode,
 };
 use space_query::ui::sql_editor::{QueryProgress, SqlEditorWidget};
 use std::env;
@@ -254,6 +254,16 @@ impl Harness {
     }
 }
 
+/// Which defense is expected to refuse a write on a read-only tab, per driver:
+/// both Oracle drivers refuse non-queries in the client, and the MySQL family
+/// reports its own error.
+fn read_only_errors(target: Target) -> &'static [&'static str] {
+    match target {
+        Target::OracleOci | Target::OracleThin => &["read-only mode blocks"],
+        Target::MySql | Target::MariaDb => &["read only"],
+    }
+}
+
 fn run_scenarios(target: Target, h: &mut Harness) -> Result<(), String> {
     let dml = "UPDATE SQ_AC_T SET V = V + 1";
 
@@ -344,6 +354,111 @@ fn run_scenarios(target: Target, h: &mut Harness) -> Result<(), String> {
         format!("expected 3, got {v}"),
     );
 
+    // ---- S7: the menu write path, and what wins over auto-commit ----------
+    // S2 drives auto-commit through a script statement. The menu item is the
+    // path users actually take, and it writes the same per-tab slot; a
+    // read-only tab must still refuse the write, auto-commit or not.
+    println!("  --- S7 menu-path tab auto-commit, and a read-only pin over it ---");
+    h.set_connection_auto_commit(false)
+        .map_err(|e| format!("set_auto_commit(false): {e}"))?;
+    h.editor.sync_tab_auto_commit_with_global_setting(false);
+    h.editor.set_tab_auto_commit(true);
+    h.check(
+        "S7 the menu path pinned this tab",
+        h.editor.tab_auto_commit_override_value() == Some(true),
+        format!("override = {:?}", h.editor.tab_auto_commit_override_value()),
+    );
+    h.check(
+        "S7 the menu path left the connection default alone",
+        !h.connection_auto_commit(),
+        "the menu path mutated the shared connection default".into(),
+    );
+    let before = h.select_v()?;
+    h.run(dml)?;
+    h.run("ROLLBACK")?;
+    let after_menu_toggle = h.select_v()?;
+    h.check(
+        "S7 the tab pinned through the menu really commits",
+        after_menu_toggle == before + 1,
+        format!("expected {}, got {after_menu_toggle}", before + 1),
+    );
+    h.editor.set_tab_transaction_mode(TransactionMode::new(
+        TransactionIsolation::Default,
+        TransactionAccessMode::ReadOnly,
+    ));
+    let capture = h.run(dml)?;
+    let refused = capture.results.iter().any(|r| {
+        !r.success
+            && read_only_errors(target).iter().any(|needle| {
+                r.message
+                    .to_ascii_lowercase()
+                    .contains(&needle.to_ascii_lowercase())
+            })
+    });
+    h.check(
+        "S7 a read-only tab refuses the write even with auto-commit on",
+        refused,
+        format!(
+            "results: {:?}",
+            capture
+                .results
+                .iter()
+                .map(|r| (r.success, r.message.clone()))
+                .collect::<Vec<_>>()
+        ),
+    );
+    h.run("ROLLBACK")?;
+    h.editor.clear_tab_transaction_mode_override();
+    let after_read_only = h.select_v()?;
+    h.check(
+        "S7 the refused write committed nothing",
+        after_read_only == after_menu_toggle,
+        format!("expected {after_menu_toggle}, got {after_read_only}"),
+    );
+
+    // ---- S8: auto-commit is scoped to ONE tab -----------------------------
+    // S2 only proves the shared connection's default is untouched. What the
+    // status bar promises is stronger: the tab next to this one, on the same
+    // connection, still runs in manual mode and its work can be rolled back.
+    println!("  --- S8 a second tab on the same connection stays manual ---");
+    let before = h.select_v()?;
+    {
+        let mut tab2 = attach_tab(Arc::clone(&h.shared));
+        h.check(
+            "S8 a new tab starts with no auto-commit override",
+            tab2.editor.tab_auto_commit_override_value().is_none(),
+            format!(
+                "override = {:?}",
+                tab2.editor.tab_auto_commit_override_value()
+            ),
+        );
+        h.run(dml)?; // this tab: pinned on, commits
+        let capture = tab2.run(dml)?; // second tab: connection default, manual
+        let wrote = capture.results.first().map(|r| r.success).unwrap_or(false);
+        h.check(
+            "S8 the second tab's DML ran",
+            wrote,
+            format!(
+                "second tab DML: {:?}",
+                capture
+                    .results
+                    .first()
+                    .map(|r| (r.success, r.message.clone()))
+            ),
+        );
+        tab2.run("ROLLBACK")?;
+    }
+    let after_two_tabs = h.select_v()?;
+    h.check(
+        "S8 only the pinned tab's DML survived",
+        after_two_tabs == before + 1,
+        format!(
+            "expected {} (this tab committed, the second tab rolled back), got {after_two_tabs}",
+            before + 1
+        ),
+    );
+    h.editor.sync_tab_auto_commit_with_global_setting(false);
+
     // ---- S6 (Oracle, runs last): script CONNECT resolves auto-commit from
     // the new connection's seeded default, not the old connection's value ----
     fn run_connect_scenario(target: Target, h: &mut Harness) -> Result<(), String> {
@@ -359,6 +474,7 @@ fn run_scenarios(target: Target, h: &mut Harness) -> Result<(), String> {
             "CONNECT {}/{}@{}:{}/{}\nUPDATE SQ_AC_T SET V = V + 1;",
             info.username, info.password, info.host, info.port, info.service_name
         );
+        let before_connect = h.select_v()?;
         let capture = h.run(&script)?;
         let dml_result = capture
             .results
@@ -379,8 +495,8 @@ fn run_scenarios(target: Target, h: &mut Harness) -> Result<(), String> {
         let v = h.select_v()?;
         h.check(
             "S6 ROLLBACK undid the DML (stale auto-commit did not leak across CONNECT)",
-            v == 3,
-            format!("expected 3, got {v}"),
+            v == before_connect,
+            format!("expected {before_connect}, got {v}"),
         );
         Ok(())
     }
@@ -388,6 +504,7 @@ fn run_scenarios(target: Target, h: &mut Harness) -> Result<(), String> {
     // ---- S4 (Oracle): READ ONLY transaction vs piggybacked commit ---------
     if target.is_oracle() {
         println!("  --- S4 SET TRANSACTION READ ONLY under auto-commit ON ---");
+        let before_read_only_txn = h.select_v()?;
         h.run("SET AUTOCOMMIT ON")?;
         let capture = h.run("SET TRANSACTION READ ONLY;\nINSERT INTO SQ_AC_T VALUES (99);")?;
         let set_txn_ok = capture.results.first().map(|r| r.success).unwrap_or(false);
@@ -410,7 +527,11 @@ fn run_scenarios(target: Target, h: &mut Harness) -> Result<(), String> {
         );
         h.run("COMMIT")?;
         let v = h.select_v()?;
-        h.check("S4 table unchanged", v == 3, format!("expected 3, got {v}"));
+        h.check(
+            "S4 table unchanged",
+            v == before_read_only_txn,
+            format!("expected {before_read_only_txn}, got {v}"),
+        );
 
         // Last on purpose: CONNECT rebinds the tab to a transient connection,
         // so the harness's original shared connection no longer matches the
@@ -487,15 +608,9 @@ fn verify_mysql_probe_sql(target: Target) -> Result<Vec<String>, String> {
     Ok(failures)
 }
 
-fn verify(target: Target) -> Result<Vec<String>, String> {
-    println!("\n########## {} ##########", target.label());
-
-    let mut connection = DatabaseConnection::new();
-    connection
-        .connect(target.connection_info())
-        .map_err(|e| format!("connect: {e}"))?;
-    let shared: space_query::db::SharedConnection = Arc::new(Mutex::new(connection));
-
+/// A second query tab on the same connection. Auto-commit is documented as a
+/// per-tab setting, and only a second tab can show that it really is one.
+fn attach_tab(shared: space_query::db::SharedConnection) -> Harness {
     let timeout_input = IntInput::default();
     let mut editor = SqlEditorWidget::new(Arc::clone(&shared), timeout_input);
     let done = Arc::new(AtomicBool::new(false));
@@ -550,13 +665,24 @@ fn verify(target: Target) -> Result<Vec<String>, String> {
             }
         });
     }
-    let mut h = Harness {
+    Harness {
         editor,
         done,
         capture,
         shared,
         failures: Vec::new(),
-    };
+    }
+}
+
+fn verify(target: Target) -> Result<Vec<String>, String> {
+    println!("\n########## {} ##########", target.label());
+
+    let mut connection = DatabaseConnection::new();
+    connection
+        .connect(target.connection_info())
+        .map_err(|e| format!("connect: {e}"))?;
+    let shared: space_query::db::SharedConnection = Arc::new(Mutex::new(connection));
+    let mut h = attach_tab(Arc::clone(&shared));
 
     for (i, sql) in target.setup().into_iter().enumerate() {
         let r = h.run(&sql);

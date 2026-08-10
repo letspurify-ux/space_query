@@ -109,15 +109,27 @@ impl Target {
         if self.is_oracle() {
             vec![
                 "DROP TABLE SQ_TM_T".into(),
+                "DROP TABLE SQ_TM_ISO".into(),
+                "DROP TABLE SQ_TM_TXN".into(),
                 "CREATE TABLE SQ_TM_T (V NUMBER)".into(),
                 "INSERT INTO SQ_TM_T VALUES (1)".into(),
+                "CREATE TABLE SQ_TM_ISO (V NUMBER)".into(),
+                "INSERT INTO SQ_TM_ISO VALUES (100)".into(),
+                "CREATE TABLE SQ_TM_TXN (V NUMBER)".into(),
+                "INSERT INTO SQ_TM_TXN VALUES (0)".into(),
                 "COMMIT".into(),
             ]
         } else {
             vec![
                 "DROP TABLE IF EXISTS SQ_TM_T".into(),
+                "DROP TABLE IF EXISTS SQ_TM_ISO".into(),
+                "DROP TABLE IF EXISTS SQ_TM_TXN".into(),
                 "CREATE TABLE SQ_TM_T (V INT)".into(),
                 "INSERT INTO SQ_TM_T VALUES (1)".into(),
+                "CREATE TABLE SQ_TM_ISO (V INT)".into(),
+                "INSERT INTO SQ_TM_ISO VALUES (100)".into(),
+                "CREATE TABLE SQ_TM_TXN (V INT)".into(),
+                "INSERT INTO SQ_TM_TXN VALUES (0)".into(),
                 "COMMIT".into(),
             ]
         }
@@ -125,9 +137,17 @@ impl Target {
 
     fn teardown(self) -> Vec<String> {
         if self.is_oracle() {
-            vec!["DROP TABLE SQ_TM_T".into()]
+            vec![
+                "DROP TABLE SQ_TM_T".into(),
+                "DROP TABLE SQ_TM_ISO".into(),
+                "DROP TABLE SQ_TM_TXN".into(),
+            ]
         } else {
-            vec!["DROP TABLE IF EXISTS SQ_TM_T".into()]
+            vec![
+                "DROP TABLE IF EXISTS SQ_TM_T".into(),
+                "DROP TABLE IF EXISTS SQ_TM_ISO".into(),
+                "DROP TABLE IF EXISTS SQ_TM_TXN".into(),
+            ]
         }
     }
 }
@@ -270,16 +290,36 @@ impl Harness {
     }
 }
 
+/// One transaction of the tab under test, reading `SQ_TM_ISO` before and after
+/// `other` commits a change to it. A DML on an unrelated table opens the
+/// transaction first, so the pair reports the isolation level and never the
+/// accident of there being no transaction at all.
+fn iso_snapshot_pair(h: &mut Harness, other: &mut Harness) -> Result<(i64, i64), String> {
+    h.run("UPDATE SQ_TM_TXN SET V = V + 1")?;
+    let first = h.select_scalar("SELECT V FROM SQ_TM_ISO")?;
+    other.run("UPDATE SQ_TM_ISO SET V = V + 1")?;
+    other.run("COMMIT")?;
+    let second = h.select_scalar("SELECT V FROM SQ_TM_ISO")?;
+    h.run("ROLLBACK")?;
+    let parse = |value: String| {
+        value
+            .trim()
+            .parse::<i64>()
+            .map_err(|e| format!("SQ_TM_ISO read {value:?}: {e}"))
+    };
+    Ok((parse(first)?, parse(second)?))
+}
+
 fn run_scenarios(target: Target, h: &mut Harness) -> Result<(), String> {
     let initial_connection_mode = h.connection_transaction_mode();
     // Pin WHICH defense refused the write, per driver, so a regression in one
-    // cannot hide behind the other: Oracle OCI refuses non-queries in the
-    // client before they reach the server, Oracle thin has no such gate and
-    // must be refused by the server (ORA-01456), and the MySQL family reports
+    // cannot hide behind the other: both Oracle drivers refuse non-queries in
+    // the client before they reach the server (the server's ORA-01456 is only
+    // the backstop, and it stops applying once the batch's own COMMIT ends the
+    // read-only transaction), and the MySQL family reports
     // ER_CANT_EXECUTE_IN_READ_ONLY_TRANSACTION.
     let read_only_errors: &[&str] = match target {
-        Target::OracleOci => &["read-only mode blocks"],
-        Target::OracleThin => &["ORA-01456"],
+        Target::OracleOci | Target::OracleThin => &["read-only mode blocks"],
         Target::MySql | Target::MariaDb => &["read only"],
     };
 
@@ -587,6 +627,213 @@ fn run_scenarios(target: Target, h: &mut Harness) -> Result<(), String> {
         h.editor.clear_tab_transaction_mode_override();
     }
 
+    // ---- S10: a READ ONLY pin must survive a COMMIT inside the batch -------
+    // The tab setting says "this tab does not write". Oracle can only express
+    // it as a TRANSACTION property (SET TRANSACTION READ ONLY), so the user's
+    // own COMMIT ends the read-only transaction and everything after it runs
+    // read-write unless the client refuses it; the MySQL family applies a
+    // SESSION characteristic, which survives the COMMIT by itself. Either way
+    // the promise the toolbar makes is the same, so the outcome must be too.
+    println!("  --- S10 READ ONLY pin survives a COMMIT inside the batch ---");
+    h.editor.clear_tab_transaction_mode_override();
+    h.run("DELETE FROM SQ_TM_T WHERE V = 77")?;
+    h.run("COMMIT")?;
+    h.editor.set_tab_transaction_mode(TransactionMode::new(
+        TransactionIsolation::Default,
+        TransactionAccessMode::ReadOnly,
+    ));
+    let capture = h.run("SELECT V FROM SQ_TM_T;\nCOMMIT;\nINSERT INTO SQ_TM_T VALUES (77);")?;
+    let insert_after_commit = capture
+        .results
+        .iter()
+        .find(|r| r.sql.to_uppercase().contains("INSERT"))
+        .cloned();
+    h.check(
+        "S10 the write after the batch's own COMMIT is still refused",
+        insert_after_commit.as_ref().is_some_and(|r| {
+            !r.success
+                && read_only_errors.iter().any(|needle| {
+                    r.message
+                        .to_ascii_lowercase()
+                        .contains(&needle.to_ascii_lowercase())
+                })
+        }),
+        format!(
+            "insert after COMMIT: {:?}; all results: {:?}",
+            insert_after_commit
+                .as_ref()
+                .map(|r| (r.success, r.message.clone())),
+            capture
+                .results
+                .iter()
+                .map(|r| (r.sql.clone(), r.success, r.message.clone()))
+                .collect::<Vec<_>>()
+        ),
+    );
+    // Read back on this same session, so even an uncommitted leak is visible.
+    h.editor.clear_tab_transaction_mode_override();
+    let leaked = h.select_scalar("SELECT COUNT(*) FROM SQ_TM_T WHERE V = 77")?;
+    h.check(
+        "S10 the refused write left no row on the session",
+        leaked.trim() == "0",
+        format!("COUNT(*) WHERE V = 77 = {leaked:?}"),
+    );
+    h.run("ROLLBACK")?;
+
+    // ---- S11: selecting Default again must really restore the session ------
+    // A session-scoped statement (ALTER SESSION SET ISOLATION_LEVEL / SET
+    // SESSION TRANSACTION) is adopted into the tab, so the toolbar shows the
+    // new level. Selecting "Default" afterwards must put the SESSION back, not
+    // only the label: otherwise the tab keeps running under the old isolation
+    // while the screen claims the connection default.
+    println!("  --- S11 selecting Default again restores the session isolation ---");
+    h.run(session_isolation_sql)?;
+    h.run("ROLLBACK")?;
+    h.check(
+        "S11 the session-scoped change is showing as the tab's mode",
+        h.editor
+            .tab_transaction_mode_override_value()
+            .is_some_and(|mode| mode.isolation == expected_isolation),
+        format!(
+            "tab override after the change: {:?}",
+            h.editor.tab_transaction_mode_override_value()
+        ),
+    );
+    h.editor
+        .set_tab_transaction_mode(TransactionMode::default());
+    if !target.is_oracle() {
+        let isolation_var = if target == Target::MariaDb {
+            "SELECT @@tx_isolation"
+        } else {
+            "SELECT @@transaction_isolation"
+        };
+        let value = h.select_scalar(isolation_var)?;
+        h.check(
+            "S11 the session no longer reports the abandoned isolation",
+            !value
+                .replace(['-', '_'], " ")
+                .eq_ignore_ascii_case("SERIALIZABLE"),
+            format!("{isolation_var} = {value:?} after returning to Default"),
+        );
+        h.run("ROLLBACK")?;
+    } else {
+        // Oracle exposes no session view for the isolation level, so read it
+        // behaviourally with a second, independent session: SERIALIZABLE fixes
+        // the snapshot for the whole transaction, READ COMMITTED refreshes it
+        // per statement. A DML on an unrelated table opens the transaction, so
+        // neither half can pass by simply never having one open.
+        let mut other = attach_tab(connect_target(target)?);
+        h.editor.set_tab_transaction_mode(TransactionMode::new(
+            expected_isolation,
+            TransactionAccessMode::ReadWrite,
+        ));
+        let (first, second) = iso_snapshot_pair(h, &mut other)?;
+        h.check(
+            "S11 SERIALIZABLE really holds the transaction snapshot",
+            first == second,
+            format!("reads inside one SERIALIZABLE transaction: {first} then {second}"),
+        );
+        h.editor
+            .set_tab_transaction_mode(TransactionMode::default());
+        let (third, fourth) = iso_snapshot_pair(h, &mut other)?;
+        h.check(
+            "S11 back on Default the session reads committed changes again",
+            fourth == third + 1,
+            format!(
+                "reads after returning to Default: {third} then {fourth} \
+                 (unchanged means the session is still SERIALIZABLE)"
+            ),
+        );
+    }
+    h.editor.clear_tab_transaction_mode_override();
+    h.run("ROLLBACK")?;
+
+    // ---- S12: the pin belongs to ONE tab, not to the connection ------------
+    // S1 proves the shared connection's default is untouched. That is a
+    // different claim from the one the user reads on screen: another tab of
+    // the same connection must keep working normally while this tab is pinned.
+    println!("  --- S12 a second tab on the same connection is unaffected ---");
+    h.editor.set_tab_transaction_mode(TransactionMode::new(
+        TransactionIsolation::Default,
+        TransactionAccessMode::ReadOnly,
+    ));
+    h.run("SELECT V FROM SQ_TM_T")?; // applies the pin to this tab's session
+    {
+        let mut tab2 = attach_tab(Arc::clone(&h.shared));
+        let capture = tab2.run("INSERT INTO SQ_TM_T VALUES (12)")?;
+        let wrote = capture.results.first().map(|r| r.success).unwrap_or(false);
+        h.check(
+            "S12 the second tab still writes while this tab is pinned READ ONLY",
+            wrote,
+            format!(
+                "second tab INSERT: {:?}",
+                capture
+                    .results
+                    .first()
+                    .map(|r| (r.success, r.message.clone()))
+            ),
+        );
+        h.check(
+            "S12 the second tab carries no pinned mode of its own",
+            tab2.editor.tab_transaction_mode_override_value().is_none(),
+            format!(
+                "second tab override: {:?}",
+                tab2.editor.tab_transaction_mode_override_value()
+            ),
+        );
+        let _ = tab2.run("ROLLBACK");
+    }
+    h.run("ROLLBACK")?;
+    h.editor.clear_tab_transaction_mode_override();
+
+    // ---- S13: every combination the toolbar offers must be executable ------
+    // The isolation and access-mode choices are independent controls, so the
+    // user can select any pair. Oracle cannot express READ ONLY together with
+    // an explicit isolation level; a pair that can never run must therefore be
+    // refused where it is chosen, not silently pinned onto the tab so that
+    // every later statement fails.
+    println!("  --- S13 an unsupported isolation/access pair cannot be pinned ---");
+    let awkward = TransactionMode::new(
+        TransactionIsolation::Serializable,
+        TransactionAccessMode::ReadOnly,
+    );
+    let selection_error = space_query::db::DatabaseConnection::transaction_mode_selection_error(
+        h.shared
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .db_type(),
+        awkward,
+    );
+    if target.is_oracle() {
+        h.check(
+            "S13 Oracle reports the unsupported pair when it is selected",
+            selection_error.is_some(),
+            "no error was reported for SERIALIZABLE + READ ONLY".into(),
+        );
+    } else {
+        h.check(
+            "S13 the MySQL family accepts the pair",
+            selection_error.is_none(),
+            format!("unexpected error: {selection_error:?}"),
+        );
+        h.editor.set_tab_transaction_mode(awkward);
+        let capture = h.run("SELECT V FROM SQ_TM_T")?;
+        h.check(
+            "S13 the accepted pair really runs",
+            capture.results.iter().all(|r| r.success),
+            format!(
+                "results: {:?}",
+                capture
+                    .results
+                    .iter()
+                    .map(|r| (r.success, r.message.clone()))
+                    .collect::<Vec<_>>()
+            ),
+        );
+        h.run("ROLLBACK")?;
+        h.editor.clear_tab_transaction_mode_override();
+    }
+
     // ---- S7: the status bar's transaction-state source -----------------------
     // The status bar reports the tab's retained-session state. Prove the source
     // actually carries it: with auto-commit off an UPDATE must leave a retained
@@ -723,15 +970,12 @@ fn run_scenarios(target: Target, h: &mut Harness) -> Result<(), String> {
     Ok(())
 }
 
-fn verify(target: Target) -> Result<Vec<String>, String> {
-    println!("\n########## {} ##########", target.label());
-
-    let mut connection = DatabaseConnection::new();
-    connection
-        .connect(target.connection_info())
-        .map_err(|e| format!("connect: {e}"))?;
-    let shared: space_query::db::SharedConnection = Arc::new(Mutex::new(connection));
-
+/// A second query tab on an existing connection, or (with a connection of its
+/// own) a second, independent database session. Both are needed to verify the
+/// claims the feature makes about *scope*: a tab-scoped setting must not reach
+/// another tab, and an isolation level can only be read behaviourally on
+/// Oracle, which needs a session that is not the one under test.
+fn attach_tab(shared: space_query::db::SharedConnection) -> Harness {
     let timeout_input = IntInput::default();
     let mut editor = SqlEditorWidget::new(Arc::clone(&shared), timeout_input);
     let done = Arc::new(AtomicBool::new(false));
@@ -774,17 +1018,32 @@ fn verify(target: Target) -> Result<Vec<String>, String> {
             _ => {}
         });
     }
-    let mut h = Harness {
+    Harness {
         editor,
         done,
         capture,
         shared,
         failures: Vec::new(),
-    };
+    }
+}
+
+fn connect_target(target: Target) -> Result<space_query::db::SharedConnection, String> {
+    let mut connection = DatabaseConnection::new();
+    connection
+        .connect(target.connection_info())
+        .map_err(|e| format!("connect: {e}"))?;
+    Ok(Arc::new(Mutex::new(connection)))
+}
+
+fn verify(target: Target) -> Result<Vec<String>, String> {
+    println!("\n########## {} ##########", target.label());
+
+    let shared = connect_target(target)?;
+    let mut h = attach_tab(Arc::clone(&shared));
 
     for (i, sql) in target.setup().into_iter().enumerate() {
         let r = h.run(&sql);
-        if i >= 1 {
+        if i >= 3 {
             r.map_err(|e| format!("setup {sql:?}: {e}"))?;
         }
     }

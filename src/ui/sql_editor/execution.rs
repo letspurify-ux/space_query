@@ -482,12 +482,63 @@ impl<'a> MySqlPooledSessionDisposition<'a> {
     }
 }
 
+/// Everything an Oracle execution needs to put a session into the tab's
+/// transaction mode. Carried as one value so the lazy-fetch path and the batch
+/// path cannot apply different rules.
+#[derive(Clone, Copy, Debug)]
+struct OracleTransactionModeApplication {
+    mode: crate::db::TransactionMode,
+    /// The tab's own selection, or `None` when the tab follows the connection
+    /// default (a tab that never selected anything cannot have adopted a
+    /// session-level isolation change, so it needs no reset).
+    tab_selected: Option<crate::db::TransactionMode>,
+    default_isolation: crate::db::TransactionIsolation,
+}
+
+impl OracleTransactionModeApplication {
+    #[cfg(test)]
+    fn plain(mode: crate::db::TransactionMode) -> Self {
+        Self {
+            mode,
+            tab_selected: None,
+            default_isolation: crate::db::TransactionIsolation::Default,
+        }
+    }
+
+    /// Each statement to issue, paired with whether it is the session-default
+    /// reset. The reset restores the connection default, so it leaves the
+    /// session in a state the tab already represents: its effects must NOT be
+    /// recorded as session residue, or the tab's next execution would stop to
+    /// ask the user to resolve a session the app itself just made clean.
+    fn statements(self) -> Result<Vec<(String, bool)>, String> {
+        let reset = crate::db::DatabaseConnection::oracle_session_isolation_reset_statement(
+            self.tab_selected,
+            self.default_isolation,
+        );
+        let mut statements: Vec<(String, bool)> =
+            reset.into_iter().map(|sql| (sql, true)).collect();
+        statements.extend(
+            crate::db::DatabaseConnection::transaction_mode_statements_for(
+                crate::db::DatabaseType::Oracle,
+                self.mode,
+            )?
+            .into_iter()
+            .map(|sql| (sql, false)),
+        );
+        Ok(statements)
+    }
+}
+
 struct LockedExecutionStartup<'a> {
     conn_guard: crate::db::ConnectionLockGuard<'a>,
     conn_name: String,
     db_type: crate::db::DatabaseType,
     auto_commit: bool,
     selected_transaction_mode: crate::db::TransactionMode,
+    /// The connection's own default isolation, resolved at connect. Oracle
+    /// needs it to express "put this session back to the default" — the
+    /// transaction-mode statements for the default mode are empty.
+    default_transaction_isolation: crate::db::TransactionIsolation,
     session: Arc<Mutex<SessionState>>,
 }
 
@@ -624,6 +675,7 @@ impl ExecutionWorkerBackend for OracleExecutionWorkerBackend {
             db_type,
             auto_commit: initial_auto_commit,
             selected_transaction_mode: initial_transaction_mode,
+            default_transaction_isolation,
             session,
         } = startup;
 
@@ -941,7 +993,16 @@ impl ExecutionWorkerBackend for OracleExecutionWorkerBackend {
                             connection_generation,
                             pool_context_epoch,
                             prior_retained_state,
-                            selected_transaction_mode,
+                            OracleTransactionModeApplication {
+                                mode: selected_transaction_mode,
+                                // A lazily streamed SELECT is never the
+                                // user's own transaction-first statement, so
+                                // the tab's selection applies unconditionally.
+                                tab_selected: load_mutex_transaction_mode_option(
+                                    tab_transaction_mode_override,
+                                ),
+                                default_isolation: default_transaction_isolation,
+                            },
                             current_scope,
                             sender.clone(),
                             session.clone(),
@@ -1013,12 +1074,20 @@ impl ExecutionWorkerBackend for OracleExecutionWorkerBackend {
         // (ORA-01453). The OCI path already yields this way; without the same
         // rule here a thin tab pinned to a non-default mode could not run a
         // SET TRANSACTION at all.
-        let selected_transaction_mode =
-            if SqlEditorWidget::requires_transaction_first_statement(&items) {
-                crate::db::TransactionMode::default()
-            } else {
-                selected_transaction_mode
-            };
+        let yields_to_user_transaction_statement =
+            SqlEditorWidget::requires_transaction_first_statement(&items);
+        let selected_transaction_mode = if yields_to_user_transaction_statement {
+            crate::db::TransactionMode::default()
+        } else {
+            selected_transaction_mode
+        };
+        // The session-level isolation reset is an injection too, so it yields
+        // to the user's own transaction-first statement for the same reason.
+        let tab_selected_transaction_mode = if yields_to_user_transaction_statement {
+            None
+        } else {
+            load_mutex_transaction_mode_option(tab_transaction_mode_override)
+        };
         let batch_outcome = SqlEditorWidget::execute_oracle_thin_batch_with_connection(
             &mut thin_conn,
             sender,
@@ -1030,6 +1099,8 @@ impl ExecutionWorkerBackend for OracleExecutionWorkerBackend {
             auto_commit,
             prior_retained_state,
             selected_transaction_mode,
+            tab_selected_transaction_mode,
+            default_transaction_isolation,
             db_activity,
             current_operation_autocommit,
             Some(tab_auto_commit_override),
@@ -1148,6 +1219,9 @@ impl ExecutionWorkerBackend for MysqlExecutionWorkerBackend {
             db_type,
             auto_commit,
             selected_transaction_mode,
+            // Oracle-only: the MySQL family carries its default isolation
+            // through the pool session context instead.
+            default_transaction_isolation: _,
             session,
         } = startup;
 
@@ -4888,7 +4962,7 @@ impl SqlEditorWidget {
         connection_generation: u64,
         pool_context_epoch: u64,
         prior_retained_state: RetainedSessionState,
-        selected_transaction_mode: crate::db::TransactionMode,
+        selected_transaction_mode: OracleTransactionModeApplication,
         current_scope: Option<String>,
         sender: QueryProgressSender,
         session: Arc<Mutex<SessionState>>,
@@ -9700,6 +9774,7 @@ impl SqlEditorWidget {
                     conn_guard.transaction_mode(),
                     &tab_transaction_mode_override,
                 );
+                let default_transaction_isolation = conn_guard.default_transaction_isolation();
                 if let Some(message) = SqlEditorWidget::transaction_mode_display_mismatch_error(
                     load_mutex_transaction_mode_option(&ui_displayed_transaction_mode),
                     selected_transaction_mode,
@@ -9761,6 +9836,7 @@ impl SqlEditorWidget {
                     db_type,
                     auto_commit,
                     selected_transaction_mode,
+                    default_transaction_isolation,
                     session,
                 };
                 let LockedExecutionStartup {
@@ -9769,6 +9845,7 @@ impl SqlEditorWidget {
                     db_type,
                     auto_commit,
                     selected_transaction_mode,
+                    default_transaction_isolation,
                     session,
                 } = match Self::begin_execution_worker(
                     startup,
@@ -9934,6 +10011,17 @@ impl SqlEditorWidget {
                 };
                 let requires_transaction_first_statement = explicit_transaction_first_statement
                     || db_type.transaction_mode_requires_first_statement(transaction_mode);
+                let transaction_mode_application = OracleTransactionModeApplication {
+                    mode: transaction_mode,
+                    // The session-level isolation reset is an injection too, so
+                    // it yields to the user's own transaction-first statement.
+                    tab_selected: if explicit_transaction_first_statement {
+                        None
+                    } else {
+                        load_mutex_transaction_mode_option(&tab_transaction_mode_override)
+                    },
+                    default_isolation: default_transaction_isolation,
+                };
                 // A batch that opens with CONNECT must not have the tab's mode
                 // applied to the OUTGOING connection first: SET TRANSACTION
                 // opens a transaction, and CONNECT then refuses to discard a
@@ -9965,12 +10053,10 @@ impl SqlEditorWidget {
                         return;
                     }
                     if should_apply_oracle_transaction_mode {
-                        if let Err(err) =
-                            crate::db::DatabaseConnection::apply_oracle_transaction_mode(
-                                conn.as_ref(),
-                                transaction_mode,
-                            )
-                        {
+                        if let Err(err) = SqlEditorWidget::apply_oracle_transaction_mode_statements(
+                            conn.as_ref(),
+                            transaction_mode_application,
+                        ) {
                             SqlEditorWidget::emit_execution_startup_error(
                                 &sender,
                                 script_mode,
@@ -9983,7 +10069,7 @@ impl SqlEditorWidget {
                         }
                         Self::record_applied_oracle_transaction_mode_effects(
                             &mut cleanup,
-                            transaction_mode,
+                            transaction_mode_application,
                         );
                     }
                     if !requires_transaction_first_statement {
@@ -11675,7 +11761,12 @@ impl SqlEditorWidget {
                                                     next_active_transaction_mode;
                                                 Self::record_applied_oracle_transaction_mode_effects(
                                                     &mut cleanup,
-                                                    active_transaction_mode,
+                                                    OracleTransactionModeApplication {
+                                                        mode: active_transaction_mode,
+                                                        tab_selected: None,
+                                                        default_isolation:
+                                                            crate::db::TransactionIsolation::Default,
+                                                    },
                                                 );
                                                 shared_connection = candidate_connection;
                                                 connection_generation =
@@ -15982,7 +16073,7 @@ impl SqlEditorWidget {
     fn apply_oracle_thin_transaction_mode_for_execution(
         conn: &mut OracleThinSession,
         prior_retained_state: RetainedSessionState,
-        transaction_mode: crate::db::TransactionMode,
+        transaction_mode: OracleTransactionModeApplication,
     ) -> Result<RetainedSessionState, String> {
         if !Self::should_apply_oracle_thin_transaction_mode(prior_retained_state) {
             return Ok(prior_retained_state);
@@ -15991,11 +16082,11 @@ impl SqlEditorWidget {
         let post_processor =
             crate::db::statement_session_post_processor_for(crate::db::DatabaseType::Oracle);
         let mut retained_state = prior_retained_state;
-        for statement in crate::db::DatabaseConnection::transaction_mode_statements_for(
-            crate::db::DatabaseType::Oracle,
-            transaction_mode,
-        )? {
+        for (statement, restores_session_default) in transaction_mode.statements()? {
             Self::execute_oracle_thin_statement(conn, &statement, false)?;
+            if restores_session_default {
+                continue;
+            }
             retained_state = Self::oracle_retained_state_after_statement_effects(
                 retained_state,
                 post_processor.effects_for_sql(&statement),
@@ -16821,6 +16912,8 @@ impl SqlEditorWidget {
             initial_auto_commit,
             prior_retained_state,
             selected_transaction_mode,
+            None,
+            crate::db::TransactionIsolation::Default,
             db_activity,
             current_operation_autocommit,
             None,
@@ -16844,6 +16937,8 @@ impl SqlEditorWidget {
         initial_auto_commit: bool,
         prior_retained_state: RetainedSessionState,
         selected_transaction_mode: crate::db::TransactionMode,
+        tab_selected_transaction_mode: Option<crate::db::TransactionMode>,
+        default_transaction_isolation: crate::db::TransactionIsolation,
         db_activity: &str,
         current_operation_autocommit: &Arc<Mutex<bool>>,
         tab_auto_commit_override: Option<&Arc<Mutex<Option<bool>>>>,
@@ -18047,11 +18142,13 @@ impl SqlEditorWidget {
                     }
                     Self::remember_oracle_thin_compiled_object(session, &execution_sql);
                     if !transaction_mode_applied {
-                        for tx_sql in
-                            crate::db::DatabaseConnection::transaction_mode_statements_for(
-                                crate::db::DatabaseType::Oracle,
-                                active_transaction_mode,
-                            )
+                        let transaction_mode_application = OracleTransactionModeApplication {
+                            mode: active_transaction_mode,
+                            tab_selected: tab_selected_transaction_mode,
+                            default_isolation: default_transaction_isolation,
+                        };
+                        for (tx_sql, restores_session_default) in transaction_mode_application
+                            .statements()
                             .unwrap_or_default()
                         {
                             if let Err(message) =
@@ -18086,7 +18183,7 @@ impl SqlEditorWidget {
                                 // through a Read only tab).
                                 stop_execution = true;
                                 break;
-                            } else {
+                            } else if !restores_session_default {
                                 let tx_effects = post_processor.effects_for_sql(&tx_sql);
                                 batch_may_report_transaction_work |= tx_effects
                                     .may_leave_uncommitted_work()
@@ -18107,6 +18204,37 @@ impl SqlEditorWidget {
                         if stop_execution {
                             break;
                         }
+                    }
+
+                    // A Read only tab must refuse writes on BOTH Oracle
+                    // drivers. The server's own ORA-01456 is not enough on its
+                    // own: READ ONLY is a property of the TRANSACTION, so a
+                    // COMMIT inside the user's own batch ends it and every
+                    // statement after would run read-write. This is the gate
+                    // the OCI path has always had, in the same position:
+                    // after the mode has been applied, so a refused batch
+                    // leaves the session in the same state on both drivers.
+                    if active_transaction_mode.access_mode
+                        == crate::db::TransactionAccessMode::ReadOnly
+                        && !Self::oracle_read_only_allows_statement(&execution_sql)
+                    {
+                        had_error = true;
+                        Self::emit_non_select_result(
+                            sender,
+                            session,
+                            conn_name,
+                            result_index,
+                            &display_sql,
+                            Self::oracle_read_only_block_message(),
+                            false,
+                            false,
+                            script_mode,
+                        );
+                        result_index += 1;
+                        if !continue_on_error {
+                            stop_execution = true;
+                        }
+                        continue;
                     }
 
                     let mut statement_error = None::<String>;
@@ -21089,17 +21217,31 @@ impl SqlEditorWidget {
         }
     }
 
+    /// Applies the tab's transaction mode to an OCI session: the session-level
+    /// isolation reset (when the tab asks for the connection default) followed
+    /// by the mode statements themselves.
+    fn apply_oracle_transaction_mode_statements(
+        conn: &Connection,
+        application: OracleTransactionModeApplication,
+    ) -> Result<(), String> {
+        for (statement, _) in application.statements()? {
+            conn.execute(&statement, &[])
+                .map_err(|err| format!("Failed to apply transaction mode: {err}"))?;
+        }
+        Ok(())
+    }
+
     fn record_applied_oracle_transaction_mode_effects(
         cleanup: &mut QueryExecutionCleanupGuard,
-        transaction_mode: crate::db::TransactionMode,
+        transaction_mode: OracleTransactionModeApplication,
     ) {
-        if let Ok(statements) = crate::db::DatabaseConnection::transaction_mode_statements_for(
-            crate::db::DatabaseType::Oracle,
-            transaction_mode,
-        ) {
+        if let Ok(statements) = transaction_mode.statements() {
             let post_processor =
                 crate::db::statement_session_post_processor_for(crate::db::DatabaseType::Oracle);
-            for statement in statements {
+            for (statement, restores_session_default) in statements {
+                if restores_session_default {
+                    continue;
+                }
                 Self::apply_oracle_db_statement_effects(
                     cleanup,
                     post_processor.effects_for_sql(&statement),
@@ -25357,10 +25499,10 @@ mod query_execution_cleanup_tests {
 
         SqlEditorWidget::record_applied_oracle_transaction_mode_effects(
             &mut cleanup,
-            crate::db::TransactionMode::new(
+            super::OracleTransactionModeApplication::plain(crate::db::TransactionMode::new(
                 crate::db::TransactionIsolation::Default,
                 crate::db::TransactionAccessMode::ReadOnly,
-            ),
+            )),
         );
 
         let current_state = cleanup.oracle_retained_state_for_connection_transition(false);
@@ -36585,7 +36727,7 @@ mod mysql_transaction_feedback_tests {
                     1,
                     1,
                     crate::db::RetainedSessionState::default(),
-                    transaction_mode,
+                    super::OracleTransactionModeApplication::plain(transaction_mode),
                     None,
                     sender.clone(),
                     session.clone(),
@@ -36808,7 +36950,7 @@ mod mysql_transaction_feedback_tests {
             1,
             1,
             crate::db::RetainedSessionState::default(),
-            TransactionMode::default(),
+            super::OracleTransactionModeApplication::plain(TransactionMode::default()),
             None,
             sender.clone(),
             session,
@@ -36928,7 +37070,7 @@ mod mysql_transaction_feedback_tests {
             1,
             1,
             crate::db::RetainedSessionState::default(),
-            TransactionMode::default(),
+            super::OracleTransactionModeApplication::plain(TransactionMode::default()),
             None,
             sender.clone(),
             session,
@@ -38721,7 +38863,7 @@ mod mysql_transaction_feedback_tests {
             1,
             1,
             crate::db::RetainedSessionState::default(),
-            TransactionMode::default(),
+            super::OracleTransactionModeApplication::plain(TransactionMode::default()),
             None,
             sender.clone(),
             session,

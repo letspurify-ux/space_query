@@ -363,8 +363,14 @@ fn oracle_reused_open_transaction_skips_transaction_mode_reapply() {
         decision.contains("!oracle_prior_requires_physical_session_preservation"),
         "Oracle execution must not reapply SET TRANSACTION on a pooled session with open work"
     );
+    // Pin that the application really sits inside that guard, without pinning
+    // how rustfmt wraps the call.
+    let guarded_start = content
+        .find("if should_apply_oracle_transaction_mode {")
+        .expect("the guarded Oracle transaction-mode application should exist");
+    let guarded_block = &content[guarded_start..(guarded_start + 400).min(content.len())];
     assert!(
-        content.contains("if should_apply_oracle_transaction_mode {\n                        if let Err(err) =\n                            crate::db::DatabaseConnection::apply_oracle_transaction_mode"),
+        guarded_block.contains("apply_oracle_transaction_mode_statements("),
         "Oracle transaction mode application should be guarded by the open-transaction check"
     );
     assert!(
@@ -2873,6 +2879,9 @@ fn transaction_mode_state_has_a_single_source_of_truth() {
     let main_window =
         fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("src/ui/main_window.rs"))
             .expect("read main_window.rs");
+    let connection =
+        fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("src/db/connection.rs"))
+            .expect("read connection.rs");
     let normalize = |text: &str| text.split_whitespace().collect::<String>();
 
     // (1) The toolbar controls resolve through the shared resolver.
@@ -3005,6 +3014,72 @@ fn transaction_mode_state_has_a_single_source_of_truth() {
         execution.contains("let explicit_transaction_first_statement ="),
         "the Oracle OCI path must keep its transaction-first-statement guard"
     );
+
+    // (9) A Read only tab must refuse writes on BOTH Oracle drivers. The
+    // server's ORA-01456 only covers the transaction the app opened: a COMMIT
+    // inside the user's own batch ends it, and everything after would run
+    // read-write. Live-observed on thin, which had no client gate.
+    let read_only_gates = execution
+        .matches("== crate::db::TransactionAccessMode::ReadOnly")
+        .count();
+    assert!(
+        read_only_gates >= 2,
+        "both Oracle batch loops must refuse non-queries on a read-only tab (found {read_only_gates} gates)"
+    );
+    assert!(
+        thin_backend_region_has_read_only_gate(&execution),
+        "the Oracle thin batch loop must refuse non-queries on a read-only tab, as the OCI loop does"
+    );
+
+    // (10) Oracle's ALTER SESSION SET ISOLATION_LEVEL is session persistent and
+    // the statement list for the default mode is empty, so returning the tab to
+    // "Default" would otherwise leave the session on the abandoned level while
+    // the toolbar claims the connection default. Both Oracle paths resolve the
+    // statements through one helper that adds the reset.
+    assert!(
+        connection.contains("fn oracle_session_isolation_reset_statement("),
+        "Oracle must be able to express \"put this session back to the connection default\""
+    );
+    let application_start = execution
+        .find("impl OracleTransactionModeApplication {")
+        .expect("the Oracle transaction-mode application helper should exist");
+    let application_body = &execution[application_start..application_start + 1400];
+    assert!(
+        application_body.contains("oracle_session_isolation_reset_statement("),
+        "the shared Oracle transaction-mode application must include the session-default reset"
+    );
+    let application_uses = execution.matches(".statements()").count();
+    assert!(
+        application_uses >= 3,
+        "the OCI apply, the thin batch and the thin lazy fetch must all go through the shared statement list (found {application_uses})"
+    );
+
+    // (11) Isolation and access mode are independent choices, so an
+    // unrunnable pair (Oracle READ ONLY with an explicit isolation level) must
+    // be refused where it is selected instead of pinned onto the tab.
+    let controls_start = main_window
+        .find("fn update_transaction_mode_from_controls(")
+        .expect("the toolbar write path should exist");
+    let controls_body = &main_window[controls_start..controls_start + 4000];
+    assert!(
+        controls_body.contains("transaction_mode_selection_error("),
+        "the toolbar must refuse an isolation/access pair this database cannot run"
+    );
+}
+
+/// The Oracle thin batch loop's own read-only gate, located without pinning
+/// formatting: the gate must appear inside `execute_oracle_thin_batch_with_connection`.
+fn thin_backend_region_has_read_only_gate(execution: &str) -> bool {
+    let Some(start) = execution.find("fn execute_oracle_thin_batch_with_connection<") else {
+        return false;
+    };
+    let end = execution[start..]
+        .find("\n    fn ")
+        .map(|offset| start + offset)
+        .unwrap_or(execution.len());
+    let body = &execution[start..end];
+    body.contains("== crate::db::TransactionAccessMode::ReadOnly")
+        && body.contains("oracle_read_only_allows_statement(")
 }
 
 #[test]

@@ -98,6 +98,40 @@ One-shot `SET TRANSACTION ...` forms, unqualified `@@` assignments,
 GLOBAL/PERSIST scopes, and unrecognized values are NOT adopted; they keep the
 conservative override-residue tracking described above.
 
+### Oracle: returning to Default resets the session
+
+`ALTER SESSION SET ISOLATION_LEVEL` is SESSION persistent, and Oracle's
+statement list for the default mode is empty — so selecting "Default" again
+after such a statement would leave the session on the abandoned level while the
+toolbar reads the connection default. Both Oracle drivers therefore resolve
+their statements through
+`DatabaseConnection::oracle_transaction_mode_statements_for_tab()`, which
+prepends `ALTER SESSION SET ISOLATION_LEVEL = <connection default>` whenever the
+tab has actively selected the default isolation. A tab that never touched the
+controls has adopted nothing and pays nothing. The reset's effects are
+deliberately not recorded as session residue: it restores a state the tab
+already represents, so it must not make the next execution stop for a
+resolution decision.
+
+### Oracle: Read only is enforced in the client on both drivers
+
+Oracle expresses read-only as a property of the TRANSACTION
+(`SET TRANSACTION READ ONLY`), so a `COMMIT` inside the user's own batch ends it
+and every statement after it would run read-write. Both Oracle batch loops
+therefore refuse non-queries client-side
+(`oracle_read_only_allows_statement()`) while the tab's access mode is Read
+only; the server's ORA-01456 is only the backstop. MySQL/MariaDB need no such
+gate — `SET SESSION TRANSACTION READ ONLY` survives the commit by itself.
+
+### Unrunnable isolation/access pairs are refused at selection
+
+Isolation and access mode are independent choices, so a user can select a pair
+a backend has no statement for (Oracle cannot combine READ ONLY with an
+explicit isolation level). `update_transaction_mode_from_controls()` checks
+`DatabaseConnection::transaction_mode_selection_error()` and refuses the pair
+where it is chosen, instead of pinning a mode that makes every later statement
+fail.
+
 ### Screen = session guarantee
 
 The toolbar sync records the mode it displayed
@@ -179,13 +213,27 @@ cargo test --test concurrency_multithread_guards
 
 # Live, one Docker database at a time:
 cargo run --bin verify_transaction_mode_live -- <thin|oci|mysql|mariadb|all>
+cargo run --bin verify_auto_commit_live -- <thin|oci|mysql|mariadb|all>
 ```
 
 `verify_transaction_mode_live` drives the real editor per backend: a READ
 ONLY tab pin blocks writes while the connection default stays untouched, a
 session-scoped statement adopts into the tab and emits
 `TransactionModeChanged`, the adopted mode is really applied on the next
-execution, and one-shot `SET TRANSACTION` does not repin the tab.
+execution, and one-shot `SET TRANSACTION` does not repin the tab. It also
+covers the scope and session claims that only a server can settle: a READ ONLY
+pin still refuses the write after the batch's own `COMMIT` (S10), returning the
+tab to Default really puts the session back — read behaviourally on Oracle with
+a second session, from the session variable on MySQL/MariaDB (S11), a second
+tab on the same connection is unaffected by the pin (S12), and an unrunnable
+isolation/access pair is reported where it is selected (S13).
+
+`verify_auto_commit_live` covers the tab-scoped auto-commit model on the same
+four backends: the connection default really commits, the menu write path pins
+only the active tab, a second tab on the same connection stays manual, the
+dirty guard refuses a change and leaves it without effect, a Read only tab
+still refuses the write with auto-commit on, and (Oracle) a read-only
+transaction is not ended by a piggybacked wire commit.
 
 When adding a SQL family, test classification, implicit commit,
 transaction/residue/lock effects, and cleanup-only preflight. Run the

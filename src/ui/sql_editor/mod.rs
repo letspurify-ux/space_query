@@ -2402,13 +2402,16 @@ impl SqlEditorWidget {
         Self::update_current_operation_autocommit(current_operation_autocommit, enabled);
     }
 
-    pub(crate) fn tab_auto_commit_override_value(&self) -> Option<bool> {
+    /// Public (with `set_tab_auto_commit`) so the live verification harness
+    /// can drive the menu write path and assert the pinned value, the same
+    /// way it drives the transaction-mode controls.
+    pub fn tab_auto_commit_override_value(&self) -> Option<bool> {
         load_mutex_bool_option(&self.tab_auto_commit_override)
     }
 
     /// The menu-toggle write path: pins this tab's auto-commit, exactly like a
     /// script `SET AUTOCOMMIT` does.
-    pub(crate) fn set_tab_auto_commit(&self, enabled: bool) {
+    pub fn set_tab_auto_commit(&self, enabled: bool) {
         store_mutex_bool_option(&self.tab_auto_commit_override, Some(enabled));
         Self::update_current_operation_autocommit(&self.current_operation_autocommit, enabled);
     }

@@ -4980,7 +4980,7 @@ fn update_transaction_mode_from_controls(state: &Arc<Mutex<AppState>>) {
     // Blocked/busy alerts are raised only after the AppState lock is
     // released: the alert runs a nested modal event loop, and callbacks
     // firing inside it must never find the state mutex still held.
-    let (editor, runtime, previous_mode, mode) = {
+    let (editor, runtime, previous_mode, mode, db_type) = {
         let mut s = state
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -5010,6 +5010,7 @@ fn update_transaction_mode_from_controls(state: &Arc<Mutex<AppState>>) {
             s.active_connection_runtime(),
             current_mode,
             s.selected_transaction_mode_from_controls(db_type),
+            db_type,
         )
     };
 
@@ -5018,6 +5019,22 @@ fn update_transaction_mode_from_controls(state: &Arc<Mutex<AppState>>) {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         s.sync_transaction_mode_controls();
+        return;
+    }
+
+    // Isolation and access mode are two independent choices, so a user can
+    // select a pair this database has no statement for (Oracle cannot combine
+    // READ ONLY with an explicit isolation level). Refuse it here: pinning it
+    // on the tab would leave every later statement failing on a mode the user
+    // can no longer see is impossible.
+    if let Some(reason) = crate::db::DatabaseConnection::transaction_mode_selection_error(db_type, mode)
+    {
+        crate::ui::alert_on_main(&reason);
+        let mut s = state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        s.sync_transaction_mode_controls();
+        s.set_status_message(&format!("Transaction mode unchanged: {reason}"));
         return;
     }
 

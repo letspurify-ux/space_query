@@ -5053,6 +5053,65 @@ impl DatabaseConnection {
         backend_for(db_type).transaction_mode_statements(mode)
     }
 
+    /// The statement that puts an Oracle session's isolation level back to the
+    /// connection default, when one is needed.
+    ///
+    /// `ALTER SESSION SET ISOLATION_LEVEL` is SESSION persistent, so a user
+    /// statement — which the tab adopts and shows on the toolbar — leaves the
+    /// session on that level for good. `SET TRANSACTION ISOLATION LEVEL`
+    /// cannot express "whatever the connection default is", and Oracle's
+    /// statement list for the default mode is empty, so without this the tab
+    /// would keep running on the abandoned level while the toolbar reads
+    /// "Default". Only a tab that has actively selected a mode can be in that
+    /// position: a tab that never touched the controls has adopted nothing.
+    pub fn oracle_session_isolation_reset_statement(
+        tab_selected_mode: Option<TransactionMode>,
+        default_isolation: TransactionIsolation,
+    ) -> Option<String> {
+        let mode = tab_selected_mode?;
+        if mode.isolation != TransactionIsolation::Default {
+            // A non-default isolation is issued per transaction anyway, and
+            // that overrides whatever the session carries.
+            return None;
+        }
+        let level = default_isolation.sql_level()?;
+        Some(format!("ALTER SESSION SET ISOLATION_LEVEL = {level}"))
+    }
+
+    /// Every statement an Oracle execution must issue to put the session into
+    /// the tab's transaction mode: the session-level reset above (when the tab
+    /// asks for the connection default) followed by the mode itself. Both
+    /// Oracle drivers go through here so they cannot drift apart.
+    pub fn oracle_transaction_mode_statements_for_tab(
+        tab_selected_mode: Option<TransactionMode>,
+        mode: TransactionMode,
+        default_isolation: TransactionIsolation,
+    ) -> Result<Vec<String>, String> {
+        let mut statements = Vec::new();
+        statements.extend(Self::oracle_session_isolation_reset_statement(
+            tab_selected_mode,
+            default_isolation,
+        ));
+        statements.extend(Self::transaction_mode_statements_for(
+            DatabaseType::Oracle,
+            mode,
+        )?);
+        Ok(statements)
+    }
+
+    /// Why this isolation/access pair cannot be applied on `db_type`, if it
+    /// cannot. The toolbar exposes isolation and access mode as two
+    /// independent choices, so a user can select a pair the backend has no
+    /// statement for (Oracle cannot combine READ ONLY with an explicit
+    /// isolation level). Reporting it where the pair is chosen keeps a mode
+    /// that can never run off the tab, instead of failing every statement.
+    pub fn transaction_mode_selection_error(
+        db_type: DatabaseType,
+        mode: TransactionMode,
+    ) -> Option<String> {
+        Self::transaction_mode_statements_for(db_type, mode).err()
+    }
+
     pub(crate) fn transaction_mode_statements_for_with_default(
         db_type: DatabaseType,
         mode: TransactionMode,
@@ -8034,6 +8093,100 @@ mod tests {
         assert!(
             DatabaseConnection::transaction_mode_statements_for(DatabaseType::Oracle, mode)
                 .is_err()
+        );
+    }
+
+    #[test]
+    fn unsupported_transaction_mode_pairs_are_reported_where_they_are_selected() {
+        let awkward = TransactionMode::new(
+            TransactionIsolation::Serializable,
+            TransactionAccessMode::ReadOnly,
+        );
+
+        let reason = DatabaseConnection::transaction_mode_selection_error(
+            DatabaseType::Oracle,
+            awkward,
+        )
+        .expect("Oracle cannot combine read-only with an explicit isolation level");
+        assert!(reason.contains("READ ONLY"));
+        // The MySQL family expresses the same pair in one statement, so
+        // nothing is refused there.
+        for db_type in [DatabaseType::MySQL, DatabaseType::MariaDB] {
+            assert_eq!(
+                DatabaseConnection::transaction_mode_selection_error(db_type, awkward),
+                None
+            );
+        }
+        assert_eq!(
+            DatabaseConnection::transaction_mode_selection_error(
+                DatabaseType::Oracle,
+                TransactionMode::default()
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn oracle_returning_a_tab_to_the_default_isolation_resets_the_session() {
+        let default_mode = TransactionMode::default();
+        let read_only = TransactionMode::new(
+            TransactionIsolation::Default,
+            TransactionAccessMode::ReadOnly,
+        );
+        let serializable = TransactionMode::new(
+            TransactionIsolation::Serializable,
+            TransactionAccessMode::ReadWrite,
+        );
+
+        // A tab that never selected anything cannot have adopted a session
+        // level change, so it needs no reset — and Oracle's statement list for
+        // the default mode stays empty.
+        assert_eq!(
+            DatabaseConnection::oracle_transaction_mode_statements_for_tab(
+                None,
+                default_mode,
+                TransactionIsolation::ReadCommitted,
+            )
+            .expect("the default mode is always supported"),
+            Vec::<String>::new()
+        );
+
+        // A tab that selected the default explicitly may be sitting on a
+        // session an ALTER SESSION left elsewhere; put it back.
+        assert_eq!(
+            DatabaseConnection::oracle_transaction_mode_statements_for_tab(
+                Some(default_mode),
+                default_mode,
+                TransactionIsolation::ReadCommitted,
+            )
+            .expect("the default mode is always supported"),
+            vec!["ALTER SESSION SET ISOLATION_LEVEL = READ COMMITTED"]
+        );
+
+        // The reset comes first, so the mode statements apply on top of it.
+        assert_eq!(
+            DatabaseConnection::oracle_transaction_mode_statements_for_tab(
+                Some(read_only),
+                read_only,
+                TransactionIsolation::ReadCommitted,
+            )
+            .expect("read-only with the default isolation is supported"),
+            vec![
+                "ALTER SESSION SET ISOLATION_LEVEL = READ COMMITTED",
+                "SET TRANSACTION READ ONLY",
+            ]
+        );
+
+        // An explicit isolation is issued per transaction and overrides the
+        // session anyway, so no reset is needed.
+        assert_eq!(
+            DatabaseConnection::oracle_transaction_mode_statements_for_tab(
+                Some(serializable),
+                serializable,
+                TransactionIsolation::ReadCommitted,
+            )
+            .expect("serializable is supported"),
+            vec!["SET TRANSACTION ISOLATION LEVEL SERIALIZABLE"]
         );
     }
 
