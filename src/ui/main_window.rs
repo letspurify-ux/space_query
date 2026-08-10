@@ -3611,17 +3611,7 @@ impl AppState {
     /// lazy fetch is running on the tab, or its retained DB session is in a
     /// state that requires resolution first.
     fn transaction_mode_change_blocked_for_active_tab(&self, db_type: DatabaseType) -> bool {
-        if self.sql_editor.is_query_running() || self.sql_editor.has_open_lazy_fetch() {
-            return true;
-        }
-        self.sql_editor
-            .pooled_session_activity_snapshot()
-            .is_some_and(|snapshot| {
-                crate::db::retained_session_state_transaction_mode_change_preflight_decision(
-                    db_type,
-                    snapshot.retained_state(),
-                ) == RetainedSessionPreflightDecision::RequireResolution
-            })
+        self.sql_editor.transaction_mode_change_blocked_now(db_type)
     }
 
     fn selected_transaction_mode_from_controls(&self, db_type: DatabaseType) -> TransactionMode {

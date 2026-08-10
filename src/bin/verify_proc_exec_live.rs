@@ -457,6 +457,33 @@ fn read_only_routine_scenario(h: &mut Harness, target: Target) -> Result<(), Str
     }
     let _ = h.run("COMMIT");
     println!("    OK: the same routine writes once the pin is removed");
+
+    // Execute Procedure must obey the tab's auto-commit as well: pinned ON,
+    // what the routine wrote has to survive a later ROLLBACK.
+    let before_auto_commit = write_target_count(h)?;
+    // A routine call leaves conservative session residue, and the app refuses
+    // an option change on a session that still needs a decision — the menu
+    // item would be closed here too (verify_auto_commit_live S10). Clear the
+    // session the way the app tells the user to, so this checks whether the
+    // pin governs the call rather than re-checking that gate.
+    let _ = h.editor.discard_pooled_session_for_close();
+    h.editor.set_tab_auto_commit(true);
+    let events = h.run(call)?;
+    let (success, msg) =
+        terminal_success(&events).ok_or("auto-commit routine call: no terminal result")?;
+    if !success {
+        return Err(format!("the routine failed on an auto-commit tab: {msg:?}"));
+    }
+    h.editor.set_tab_auto_commit(false);
+    let _ = h.run("ROLLBACK");
+    let after_auto_commit = write_target_count(h)?;
+    if after_auto_commit != before_auto_commit + 1 {
+        return Err(format!(
+            "BUG: a routine call on an auto-commit tab did not commit (COUNT(*) {before_auto_commit} -> {after_auto_commit} after ROLLBACK)"
+        ));
+    }
+    let _ = h.run("COMMIT");
+    println!("    OK: a routine call on an auto-commit tab survived a later ROLLBACK");
     Ok(())
 }
 

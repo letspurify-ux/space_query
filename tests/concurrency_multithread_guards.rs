@@ -1680,12 +1680,20 @@ fn regression_07_oracle_transaction_mode_change_does_not_silently_clear_preserve
         preservation_check < clear_call,
         "Oracle transaction mode changes must block preserved retained sessions before clear()"
     );
+    // The control gating routes through the DB-specific retained-session
+    // policy. It lives on the tab that owns the state; the toolbar delegates.
+    let editor_mod = read_source("src/ui/sql_editor/mod.rs");
     assert!(
         main_window.contains("fn transaction_mode_change_blocked_for_active_tab(")
-            && main_window
+            && main_window.contains("transaction_mode_change_blocked_now("),
+        "the main window's transaction-mode control gating must ask the tab that owns the state"
+    );
+    assert!(
+        editor_mod.contains("fn transaction_mode_change_blocked_now(")
+            && editor_mod
                 .contains("retained_session_state_transaction_mode_change_preflight_decision(")
-            && main_window.contains("snapshot.retained_state()"),
-        "main-window transaction-mode control gating must route through the DB-specific retained-session policy"
+            && editor_mod.contains("snapshot.retained_state()"),
+        "transaction-mode control gating must route through the DB-specific retained-session policy"
     );
 }
 
@@ -2909,6 +2917,31 @@ fn transaction_mode_state_has_a_single_source_of_truth() {
     assert!(
         sync_body.contains("transaction_mode_change_blocked_for_active_tab("),
         "the toolbar sync must disable the controls when the tab session blocks mode changes"
+    );
+    // ... and that answer has ONE source: the widget that owns the state. The
+    // toolbar only delegates, so a live probe asks the same question the user's
+    // controls do.
+    let editor_mod =
+        fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("src/ui/sql_editor/mod.rs"))
+            .expect("read sql_editor/mod.rs");
+    let blocked_start = editor_mod
+        .find("pub fn transaction_mode_change_blocked_now(")
+        .expect("the tab must own the mode-change gate");
+    let blocked_body = &editor_mod[blocked_start..blocked_start + 900];
+    assert!(
+        blocked_body.contains("is_query_running()")
+            && blocked_body.contains("has_open_lazy_fetch()")
+            && blocked_body
+                .contains("retained_session_state_transaction_mode_change_preflight_decision("),
+        "the gate must cover a running query, an open lazy fetch, and a session that needs resolution"
+    );
+    let blocked_delegate_start = main_window
+        .find("fn transaction_mode_change_blocked_for_active_tab(")
+        .expect("the toolbar's gate accessor should exist");
+    assert!(
+        main_window[blocked_delegate_start..blocked_delegate_start + 400]
+            .contains("transaction_mode_change_blocked_now("),
+        "the toolbar must delegate the gate to the tab instead of re-deriving it"
     );
 
     // (3) The worker startup resolves the mode only through the resolver

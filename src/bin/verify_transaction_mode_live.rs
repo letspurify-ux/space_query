@@ -32,6 +32,13 @@
 //       post-COMMIT transaction with another session committing between them.
 //   S19 the other direction of the pin: a READ WRITE tab writes over a READ
 //       ONLY connection default, while an unpinned tab is still refused.
+//   S20 a locking read keeps its lock until the tab resolves it.
+//   S21 a cancelled statement leaves the tab's pin in place, and it still
+//       governs the session the tab uses next.
+//   S22 the pin survives a disconnect + reconnect and is applied to the new
+//       connection's session.
+//   S23 an open lazy fetch holds the tab's session, so the transaction-mode
+//       controls are closed until it is fetched out or cancelled.
 //
 // Usage: verify_transaction_mode_live <thin|oci|mysql|mariadb|all>
 
@@ -132,6 +139,8 @@ impl Target {
                 "INSERT INTO SQ_TM_ISO VALUES (100)".into(),
                 "CREATE TABLE SQ_TM_TXN (V NUMBER)".into(),
                 "INSERT INTO SQ_TM_TXN VALUES (0)".into(),
+                "CREATE TABLE SQ_TM_BIG AS SELECT LEVEL AS V FROM DUAL CONNECT BY LEVEL <= 500"
+                    .into(),
                 "COMMIT".into(),
             ]
         } else {
@@ -146,6 +155,10 @@ impl Target {
                 "INSERT INTO SQ_TM_ISO VALUES (100)".into(),
                 "CREATE TABLE SQ_TM_TXN (V INT)".into(),
                 "INSERT INTO SQ_TM_TXN VALUES (0)".into(),
+                "CREATE TABLE SQ_TM_BIG (V INT)".into(),
+                "INSERT INTO SQ_TM_BIG (V) WITH RECURSIVE seq AS (SELECT 1 AS n UNION ALL \
+                 SELECT n + 1 FROM seq WHERE n < 500) SELECT n FROM seq"
+                    .into(),
                 "COMMIT".into(),
             ]
         }
@@ -158,6 +171,7 @@ impl Target {
                 "DROP TABLE SQ_TM_ISO".into(),
                 "DROP TABLE SQ_TM_TXN".into(),
                 "DROP TABLE SQ_TM_DDL".into(),
+                "DROP TABLE SQ_TM_BIG".into(),
             ]
         } else {
             vec![
@@ -165,6 +179,7 @@ impl Target {
                 "DROP TABLE IF EXISTS SQ_TM_ISO".into(),
                 "DROP TABLE IF EXISTS SQ_TM_TXN".into(),
                 "DROP TABLE IF EXISTS SQ_TM_DDL".into(),
+                "DROP TABLE IF EXISTS SQ_TM_BIG".into(),
             ]
         }
     }
@@ -357,6 +372,9 @@ fn iso_snapshot_pair(h: &mut Harness, other: &mut Harness) -> Result<(i64, i64),
     Ok((parse(first)?, parse(second)?))
 }
 
+/// Every value one batch read, and every statement of it that failed.
+type BracketedBatch = (Vec<i64>, Vec<(String, String)>);
+
 /// Runs one batch of the tab under test whose last two reads of `SQ_TM_ISO`
 /// bracket a committed change from `other`, and returns every value the batch
 /// read plus any failed statement. `lead` is script text placed before the
@@ -367,7 +385,7 @@ fn bracketed_reads_in_one_batch(
     other: &mut Harness,
     lead: &str,
     sleep_statement: &str,
-) -> Result<(Vec<i64>, Vec<(String, String)>), String> {
+) -> Result<BracketedBatch, String> {
     let script = format!(
         "{lead}SELECT V FROM SQ_TM_ISO;\n\
          {sleep_statement}\n\
@@ -1471,6 +1489,188 @@ fn run_scenarios(target: Target, h: &mut Harness) -> Result<(), String> {
     // A locking read is conservative session state on the MySQL family, and a
     // ROLLBACK does not clear residue — leave the tab a clean session instead
     // of letting the next scenario meet the resolution dialog.
+    let _ = h.editor.discard_pooled_session_for_close();
+
+    // ---- S21: a cancelled statement must not lose the tab's pin ------------
+    // Cancelling stops a statement; it is not a change of what the tab is set
+    // to. The pin has to survive it and to reach the session the tab uses next
+    // — which is usually a NEW one, because a cancelled statement leaves a
+    // session the app tells the user to resolve or discard.
+    println!("  --- S21 the tab's pin survives a cancelled statement ---");
+    h.editor.clear_tab_transaction_mode_override();
+    h.run("ROLLBACK")?;
+    let pin = TransactionMode::new(
+        TransactionIsolation::Default,
+        TransactionAccessMode::ReadOnly,
+    );
+    h.editor.set_tab_transaction_mode(pin);
+    // A long SELECT: a read is what a Read only tab is allowed to run, and it
+    // gives the cancel something to interrupt.
+    let long_select = if target.is_oracle() {
+        "SELECT COUNT(*) FROM all_objects a, all_objects b, all_objects c"
+    } else {
+        "SELECT SLEEP(20)"
+    };
+    h.start(long_select);
+    h.pump_for(Duration::from_millis(1500));
+    h.editor.cancel_current();
+    let capture = h.finish_started()?;
+    h.check(
+        "S21 the cancelled statement did not succeed",
+        capture.results.iter().all(|r| !r.success),
+        format!(
+            "results: {:?}",
+            capture
+                .results
+                .iter()
+                .map(|r| (r.success, r.message.clone()))
+                .collect::<Vec<_>>()
+        ),
+    );
+    h.check(
+        "S21 the tab is still pinned after the cancel",
+        h.editor.tab_transaction_mode_override_value() == Some(pin),
+        format!(
+            "override after cancel: {:?}",
+            h.editor.tab_transaction_mode_override_value()
+        ),
+    );
+    // Resolve the cancelled session the way the app asks the user to, then
+    // prove the pin still governs what the tab runs next.
+    let _ = h.editor.discard_pooled_session_for_close();
+    let capture = h.run("INSERT INTO SQ_TM_T VALUES (21)")?;
+    h.check(
+        "S21 the pin still refuses the write on the tab's next session",
+        capture.results.first().is_some_and(|r| {
+            !r.success
+                && read_only_errors.iter().any(|needle| {
+                    r.message
+                        .to_ascii_lowercase()
+                        .contains(&needle.to_ascii_lowercase())
+                })
+        }),
+        format!(
+            "insert after cancel: {:?}",
+            capture
+                .results
+                .first()
+                .map(|r| (r.success, r.message.clone()))
+        ),
+    );
+    h.run("ROLLBACK")?;
+    h.editor.clear_tab_transaction_mode_override();
+    let _ = h.editor.discard_pooled_session_for_close();
+
+    // ---- S22: the pin survives a disconnect and reconnect ------------------
+    // Reconnecting replaces every physical session and bumps the connection
+    // generation, so the tab's pin has to be re-applied to a session it has
+    // never seen. The setting belongs to the tab, not to the session it was
+    // last applied to.
+    println!("  --- S22 the tab's pin survives a reconnect ---");
+    h.editor.set_tab_transaction_mode(pin);
+    {
+        let mut guard = h.shared.lock().unwrap_or_else(|p| p.into_inner());
+        guard.disconnect();
+        guard
+            .connect(target.connection_info())
+            .map_err(|e| format!("reconnect: {e}"))?;
+    }
+    h.check(
+        "S22 the tab kept its pin across the reconnect",
+        h.editor.tab_transaction_mode_override_value() == Some(pin),
+        format!(
+            "override after reconnect: {:?}",
+            h.editor.tab_transaction_mode_override_value()
+        ),
+    );
+    let capture = h.run("INSERT INTO SQ_TM_T VALUES (22)")?;
+    h.check(
+        "S22 the pin is applied to the new connection's session",
+        capture.results.first().is_some_and(|r| {
+            !r.success
+                && read_only_errors.iter().any(|needle| {
+                    r.message
+                        .to_ascii_lowercase()
+                        .contains(&needle.to_ascii_lowercase())
+                })
+        }),
+        format!(
+            "insert after reconnect: {:?}",
+            capture
+                .results
+                .first()
+                .map(|r| (r.success, r.message.clone()))
+        ),
+    );
+    h.run("ROLLBACK")?;
+    h.editor.clear_tab_transaction_mode_override();
+    let capture = h.run("INSERT INTO SQ_TM_T VALUES (22)")?;
+    h.check(
+        "S22 the same tab writes again once unpinned",
+        capture.results.first().map(|r| r.success).unwrap_or(false),
+        format!(
+            "unpinned insert after reconnect: {:?}",
+            capture
+                .results
+                .first()
+                .map(|r| (r.success, r.message.clone()))
+        ),
+    );
+    h.run("ROLLBACK")?;
+
+    // ---- S23: an open lazy fetch holds the tab's session, so the mode
+    // controls must be closed until it is finished or cancelled -------------
+    println!("  --- S23 an open lazy fetch blocks a transaction-mode change ---");
+    let db_type = {
+        let guard = h.shared.lock().unwrap_or_else(|p| p.into_inner());
+        guard.db_type()
+    };
+    h.check(
+        "S23 the gate is open on an idle tab",
+        !h.editor.transaction_mode_change_blocked_now(db_type),
+        "the mode controls are already blocked before the lazy fetch".into(),
+    );
+    h.run("SELECT V FROM SQ_TM_BIG")?;
+    let lazy_session = h.editor.active_lazy_fetch_session();
+    h.check(
+        "S23 the big SELECT left a lazy fetch open",
+        h.editor.has_open_lazy_fetch() && lazy_session.is_some(),
+        format!("active lazy fetch session: {lazy_session:?}"),
+    );
+    h.check(
+        "S23 the open lazy fetch blocks a transaction-mode change",
+        h.editor.transaction_mode_change_blocked_now(db_type),
+        "the mode controls stayed open while a lazy fetch held the session".into(),
+    );
+    if let Some(session_id) = lazy_session {
+        h.editor.request_lazy_fetch(
+            session_id,
+            space_query::ui::sql_editor::LazyFetchRequest::Cancel,
+        );
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while h.editor.has_open_lazy_fetch() && Instant::now() < deadline {
+            if !app::wait() {
+                app::check();
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        }
+    }
+    h.check(
+        "S23 cancelling the lazy fetch closes it",
+        !h.editor.has_open_lazy_fetch(),
+        "the lazy fetch is still open after Cancel".into(),
+    );
+    h.run("ROLLBACK")?;
+    h.check(
+        "S23 the gate reopens once the lazy fetch is gone",
+        !h.editor.transaction_mode_change_blocked_now(db_type),
+        format!(
+            "still blocked: retained state = {:?}",
+            h.editor
+                .pooled_session_activity_snapshot()
+                .map(|s| s.retained_state())
+        ),
+    );
     let _ = h.editor.discard_pooled_session_for_close();
 
     // ---- S9: the toolbar gate opens and closes with the transaction --------

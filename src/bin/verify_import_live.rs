@@ -813,6 +813,31 @@ fn verify(target: Target) -> Result<(), String> {
     }
     println!("PASS: the same import script succeeds once the pin is removed ({restored} rows)");
 
+    // An import must obey the tab's auto-commit too: pinned ON, the imported
+    // rows have to survive a later ROLLBACK. (A grid save is covered by
+    // verify_grid_save_live; the import runs as its own script instead.)
+    h.run(&target.delete_sql(COPY_TABLE))
+        .map_err(|e| format!("clear copy before the auto-commit import: {e}"))?;
+    let _ = h.run("COMMIT");
+    h.editor.set_tab_auto_commit(true);
+    h.run_script(&script)
+        .map_err(|e| format!("import on an auto-commit tab failed: {e}"))?;
+    h.editor.set_tab_auto_commit(false);
+    let _ = h.run("ROLLBACK");
+    let durable_events = h
+        .run(&format!("SELECT COUNT(*) AS N FROM {COPY_TABLE}"))
+        .map_err(|e| format!("count after the auto-commit import: {e}"))?;
+    let durable = grid_view(&durable_events)
+        .and_then(|(_, _, rows)| rows.first().and_then(|row| row.last().cloned()))
+        .unwrap_or_default();
+    if durable.trim() == "0" {
+        return Err(
+            "BUG: an import on an auto-commit tab did not commit (COUNT(*) = 0 after ROLLBACK)"
+                .into(),
+        );
+    }
+    println!("PASS: an import on an auto-commit tab survived a later ROLLBACK ({durable} rows)");
+
     let _ = h.run(&target.drop_sql(COPY_TABLE));
     let _ = h.run(&target.drop_sql(SOURCE_TABLE));
     let _ = h.run("COMMIT");

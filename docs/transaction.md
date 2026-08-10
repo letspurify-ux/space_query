@@ -288,7 +288,14 @@ with and without that `COMMIT` (S18a/S18b); a READ WRITE pin writes over a READ
 ONLY connection default while an unpinned tab is still refused (S19); and a
 locking read keeps its lock until the tab resolves it, which is the sharpest
 check that the app leaves the tab's own transaction alone between statements
-(S20).
+(S20). Three more settle what the pin means around interruptions and session
+lifecycle: a cancelled statement leaves the pin in place and it still governs
+the session the tab uses next (S21), the pin survives a disconnect and
+reconnect and is applied to the new connection's session (S22), and an open
+lazy fetch — which holds the tab's session — closes the transaction-mode
+controls until it is fetched out or cancelled, through the same
+`SqlEditorWidget::transaction_mode_change_blocked_now()` the toolbar asks
+(S23).
 
 `verify_auto_commit_live` covers the tab-scoped auto-commit model on the same
 four backends: the connection default really commits, the menu write path pins
@@ -327,10 +334,17 @@ auto-commit like any other statement, which their own live probes now pin:
   the row untouched, unpinning lets the identical save through, and a save on
   an auto-commit tab survives a later `ROLLBACK`.
 - `verify_import_live` — a READ ONLY tab refuses the generated import script
-  and the target table stays empty; the same script succeeds once unpinned.
+  and the target table stays empty; the same script succeeds once unpinned, and
+  an import on an auto-commit tab survives a later `ROLLBACK`.
 - `verify_proc_exec_live` — a READ ONLY tab refuses a routine that WRITES and
   nothing is written, while a routine that only READS still runs (the pin must
-  not over-block), and the same call writes once unpinned.
+  not over-block), and the same call writes once unpinned; a call on an
+  auto-commit tab survives a later `ROLLBACK` too.
+
+A routine call and a grid save leave conservative session residue, so those
+probes discard the session before pinning auto-commit — on such a session the
+menu item itself would be closed, which is a different promise
+(`verify_auto_commit_live` S10).
 
 ### Pinning a tab is only half of a mode change
 

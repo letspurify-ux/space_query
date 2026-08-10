@@ -2454,8 +2454,27 @@ impl SqlEditorWidget {
         )
     }
 
-    pub(crate) fn has_open_lazy_fetch(&self) -> bool {
+    pub fn has_open_lazy_fetch(&self) -> bool {
         Self::has_active_lazy_fetch(&self.active_lazy_fetch)
+    }
+
+    /// Whether this tab cannot accept a transaction-mode change right now: a
+    /// query or lazy fetch of its own is still running, or its retained DB
+    /// session is in a state that has to be resolved first. The toolbar
+    /// deactivates the isolation/access choices on exactly this answer, so it
+    /// lives here — where the state does — instead of being re-derived by each
+    /// caller.
+    pub fn transaction_mode_change_blocked_now(&self, db_type: crate::db::DatabaseType) -> bool {
+        if self.is_query_running() || self.has_open_lazy_fetch() {
+            return true;
+        }
+        self.pooled_session_activity_snapshot()
+            .is_some_and(|snapshot| {
+                crate::db::retained_session_state_transaction_mode_change_preflight_decision(
+                    db_type,
+                    snapshot.retained_state(),
+                ) == crate::db::RetainedSessionPreflightDecision::RequireResolution
+            })
     }
 
     /// Called by the status bar with the effective auto-commit it just
