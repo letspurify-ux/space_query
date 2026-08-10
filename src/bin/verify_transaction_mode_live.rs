@@ -571,6 +571,45 @@ fn run_scenarios(target: Target, h: &mut Harness) -> Result<(), String> {
         h.editor.clear_tab_transaction_mode_override();
     }
 
+    // ---- S7: the status bar's transaction-state source -----------------------
+    // The status bar reports the tab's retained-session state. Prove the source
+    // actually carries it: with auto-commit off an UPDATE must leave a retained
+    // session that reports uncommitted work (the indicator's "transaction open"
+    // case), and a ROLLBACK must clear it again (indicator disappears).
+    println!("  --- S7 retained session reports transaction state for the status bar ---");
+    h.editor.clear_tab_transaction_mode_override();
+    {
+        let mut guard = h.shared.lock().unwrap_or_else(|p| p.into_inner());
+        guard
+            .set_auto_commit(false)
+            .map_err(|e| format!("set_auto_commit(false): {e}"))?;
+    }
+    h.editor.sync_tab_auto_commit_with_global_setting(false);
+    h.run("UPDATE SQ_TM_T SET V = V + 1")?;
+    let dirty = h
+        .editor
+        .pooled_session_activity_snapshot()
+        .map(|snapshot| snapshot.retained_state());
+    h.check(
+        "S7 retained session exists and reports uncommitted work",
+        dirty.is_some_and(|state| state.may_have_uncommitted_work()),
+        format!("retained state after DML = {dirty:?}"),
+    );
+    h.run("ROLLBACK")?;
+    let after_rollback = h
+        .editor
+        .pooled_session_activity_snapshot()
+        .map(|snapshot| snapshot.retained_state());
+    h.check(
+        "S7 state clears after ROLLBACK (indicator disappears)",
+        after_rollback.is_none_or(|state| {
+            !state.may_have_uncommitted_work()
+                && !state.requires_transaction_decision()
+                && !state.may_have_transaction_mode_override()
+        }),
+        format!("retained state after ROLLBACK = {after_rollback:?}"),
+    );
+
     Ok(())
 }
 
