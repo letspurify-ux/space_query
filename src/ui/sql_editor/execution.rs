@@ -1795,6 +1795,18 @@ impl QueryExecutionCleanupGuard {
         self.oracle_pooled_session_transaction_decision_on_cancel = false;
         self.oracle_pooled_session_invalidated_on_cancel = false;
         self.oracle_pooled_session_known_transaction_clean = true;
+        // The recorded state delta describes the transaction the commit just
+        // ended, so its dirtiness must end with it. Leaving it MaybeDirty made
+        // batch-end cleanup trust the delta over the (clean) server —
+        // live-observed as `SET TRANSACTION READ WRITE; UPDATE ...` under
+        // auto-commit ON prompting for a commit the server had already done.
+        // Residue and lock bits are deliberately kept: a commit releases the
+        // transaction, not session-scoped state.
+        if self.oracle_pooled_session_state_delta_recorded {
+            self.oracle_pooled_session_state_delta = self
+                .oracle_pooled_session_state_delta
+                .with_transaction_state(TransactionSessionState::Clean);
+        }
     }
 
     fn clear_oracle_successful_statement_cancel_protection(&mut self) {
@@ -25416,6 +25428,61 @@ mod query_execution_cleanup_tests {
                 "{sql} must still require transaction resolution even when row-change probes are clean",
             );
         }
+    }
+
+    #[test]
+    fn oracle_auto_commit_clears_recorded_transaction_delta() {
+        // `SET TRANSACTION READ WRITE; UPDATE ...` under auto-commit ON: the
+        // SET TRANSACTION marks the recorded delta dirty and skips its own
+        // auto-commit, the UPDATE keeps the dirty delta, and the UPDATE's
+        // successful auto-commit then ends that transaction. The clean-up
+        // choke point must clear the delta's transaction state with the
+        // flags, or batch-end cleanup reports MaybeDirty for a transaction
+        // the server has already committed.
+        let post_processor =
+            crate::db::statement_session_post_processor_for(crate::db::DatabaseType::Oracle);
+        let (sender, _receiver) = progress_channel();
+        let mut cleanup = new_test_cleanup_guard(
+            sender,
+            Arc::new(Mutex::new(None)),
+            Arc::new(Mutex::new(None)),
+            Arc::new(Mutex::new(false)),
+            Arc::new(Mutex::new(true)),
+        );
+
+        SqlEditorWidget::apply_oracle_db_statement_effects(
+            &mut cleanup,
+            post_processor.effects_for_sql("SET TRANSACTION READ WRITE"),
+        );
+        SqlEditorWidget::apply_oracle_db_statement_effects(
+            &mut cleanup,
+            post_processor.effects_for_sql("UPDATE t SET v = v + 1"),
+        );
+        assert_eq!(
+            cleanup
+                .oracle_pooled_session_state_delta
+                .transaction_state(),
+            TransactionSessionState::MaybeDirty,
+            "before the auto-commit the delta must still be dirty",
+        );
+
+        // What the successful auto-commit does.
+        cleanup.clear_oracle_pooled_session_maybe_dirty();
+
+        assert_eq!(
+            cleanup
+                .oracle_pooled_session_state_delta
+                .transaction_state(),
+            TransactionSessionState::Clean,
+            "the auto-commit ended the transaction the delta describes",
+        );
+        assert_eq!(
+            cleanup
+                .oracle_retained_state_for_connection_transition(false)
+                .transaction_state(),
+            TransactionSessionState::Clean,
+            "batch-end cleanup must not resurrect the committed transaction",
+        );
     }
 
     #[test]

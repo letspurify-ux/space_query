@@ -45,6 +45,17 @@
 //   S19 the menu item's OTHER half: the toggle pins the tab AND applies the
 //       change to the tab's retained session. Driven on a session the tab has
 //       already read on, in both directions.
+//   S21 the close preflight tells the truth about an EXPLICIT transaction
+//       under auto-commit ON: whatever the dialect's explicit-transaction form
+//       leaves open (MySQL family START TRANSACTION survives auto-commit; an
+//       Oracle SET TRANSACTION batch may not), the preflight's verdict must
+//       match the server's reality — prompt iff the work is still
+//       rollback-able.
+//   S22 ROLLBACK TO SAVEPOINT is a PARTIAL rollback: it must not clear the
+//       close prompt (the pre-savepoint work is still uncommitted), and the
+//       COMMIT after it must land exactly the pre-savepoint half.
+//   S23 the tab's auto-commit pin and its transaction-mode pin are independent:
+//       both apply at once, and unpinning one leaves the other in force.
 //
 // Usage: verify_auto_commit_live <thin|oci|mysql|mariadb|all>
 
@@ -1132,6 +1143,148 @@ fn run_scenarios(target: Target, h: &mut Harness) -> Result<(), String> {
         after_off == after_on,
         format!("expected {after_on}, got {after_off} (session mutation: {off_outcome})"),
     );
+
+    // ---- S21: the close preflight tells the truth under auto-commit ON ----
+    // Auto-commit ON is what lets S1 skip the close prompt — but an EXPLICIT
+    // transaction defeats auto-commit on the MySQL family (S14), so the
+    // preflight must not take "auto-commit tab" as "nothing to resolve" on
+    // faith. The uniform claim, provable on every backend: the preflight
+    // prompts if and only if the server really holds uncommitted work.
+    println!("  --- S21 the close preflight is truthful under auto-commit ON ---");
+    h.set_connection_auto_commit(true)
+        .map_err(|e| format!("set_auto_commit(true): {e}"))?;
+    h.editor.sync_tab_auto_commit_with_global_setting(true);
+    h.editor.clear_tab_transaction_mode_override();
+    h.run("ROLLBACK")?;
+    let before = h.select_v()?;
+    let explicit_txn_batch = if target.is_oracle() {
+        // Oracle's only explicit-transaction opener; the client-side
+        // auto-commit may still end it on the INSERT — S21 does not assume
+        // either way, it checks the verdict against what really happened.
+        format!("SET TRANSACTION READ WRITE;\n{dml};")
+    } else {
+        format!("START TRANSACTION;\n{dml};")
+    };
+    h.run(&explicit_txn_batch)?;
+    let prompts = h.close_would_prompt();
+    if !target.is_oracle() {
+        // On the MySQL family the answer is not merely consistent, it is
+        // known: START TRANSACTION survives auto-commit, so the work is open
+        // and the preflight MUST prompt — this is the data-loss case.
+        h.check(
+            "S21 an explicit transaction under auto-commit ON still prompts",
+            prompts,
+            "close preflight ignored an open explicit transaction".into(),
+        );
+    }
+    h.toolbar_rollback();
+    let after = h.select_v()?;
+    let expected = if prompts { before } else { before + 1 };
+    h.check(
+        "S21 the preflight verdict matches the server's transaction state",
+        after == expected,
+        format!("preflight prompt={prompts}, so V should be {expected}, got {after}"),
+    );
+    h.check(
+        "S21 nothing is left to resolve after the rollback",
+        !h.close_would_prompt(),
+        "close still prompts after the toolbar rollback".into(),
+    );
+    if !prompts {
+        // The write committed; put the table back where S21 found it.
+        h.run("UPDATE SQ_AC_T SET V = V - 1")?;
+        h.run("COMMIT")?;
+    }
+
+    // ---- S22: ROLLBACK TO SAVEPOINT must not clear the close prompt -------
+    // A partial rollback leaves the pre-savepoint half uncommitted. If the
+    // ROLLBACK prefix were taken as "transaction resolved", the close prompt
+    // would vanish and closing the tab would silently discard that half.
+    println!("  --- S22 ROLLBACK TO SAVEPOINT keeps the close prompt ---");
+    h.set_connection_auto_commit(false)
+        .map_err(|e| format!("set_auto_commit(false): {e}"))?;
+    h.editor.sync_tab_auto_commit_with_global_setting(false);
+    h.run("ROLLBACK")?;
+    let before = h.select_v()?;
+    h.run(dml)?;
+    h.run("SAVEPOINT SQ_AC_SP")?;
+    h.run(dml)?;
+    h.run("ROLLBACK TO SAVEPOINT SQ_AC_SP")?;
+    h.check(
+        "S22 the partial rollback keeps the close prompt",
+        h.close_would_prompt(),
+        "ROLLBACK TO SAVEPOINT cleared the close prompt over uncommitted work".into(),
+    );
+    h.run("COMMIT")?;
+    let after = h.select_v()?;
+    h.check(
+        "S22 the COMMIT lands exactly the pre-savepoint half",
+        after == before + 1,
+        format!("expected {}, got {after}", before + 1),
+    );
+    h.check(
+        "S22 the COMMIT resolves the prompt",
+        !h.close_would_prompt(),
+        "close still prompts after COMMIT".into(),
+    );
+    h.run("UPDATE SQ_AC_T SET V = V - 1")?;
+    h.run("COMMIT")?;
+
+    // ---- S23: the auto-commit pin and the mode pin are independent --------
+    // One tab, both pins: auto-commit OFF over a connection default of ON,
+    // plus a READ ONLY mode pin. The mode pin must refuse the write while the
+    // auto-commit pin is present, and unpinning the mode must leave the
+    // auto-commit pin in force — the write then runs but stays rollback-able,
+    // with the connection default still ON and untouched.
+    println!("  --- S23 the auto-commit pin and the mode pin are independent ---");
+    h.set_connection_auto_commit(true)
+        .map_err(|e| format!("set_auto_commit(true): {e}"))?;
+    let off_outcome = h.menu_auto_commit(false);
+    h.editor.set_tab_transaction_mode(TransactionMode::new(
+        TransactionIsolation::Default,
+        TransactionAccessMode::ReadOnly,
+    ));
+    let before = h.select_v()?;
+    let capture = h.run(dml)?;
+    let refused = capture.results.first().is_some_and(|r| {
+        !r.success
+            && read_only_errors(target).iter().any(|needle| {
+                r.message
+                    .to_ascii_lowercase()
+                    .contains(&needle.to_ascii_lowercase())
+            })
+    });
+    h.check(
+        "S23 the READ ONLY pin refuses the write while the auto-commit pin is on the tab",
+        refused,
+        format!(
+            "write under both pins: {:?} (auto-commit pin: {off_outcome})",
+            capture
+                .results
+                .first()
+                .map(|r| (r.success, r.message.clone()))
+        ),
+    );
+    h.run("ROLLBACK")?;
+    h.editor.clear_tab_transaction_mode_override();
+    h.run(dml)?;
+    h.toolbar_rollback();
+    let after = h.select_v()?;
+    h.check(
+        "S23 unpinning the mode leaves the auto-commit pin in force",
+        after == before,
+        format!("expected {before} after rollback, got {after}"),
+    );
+    h.check(
+        "S23 neither pin touched the connection default",
+        h.connection_auto_commit(),
+        "a tab pin mutated the shared connection default".into(),
+    );
+    h.set_connection_auto_commit(false)
+        .map_err(|e| format!("set_auto_commit(false): {e}"))?;
+    h.editor.sync_tab_auto_commit_with_global_setting(false);
+    h.editor.clear_tab_transaction_mode_override();
+    h.run("ROLLBACK")?;
 
     // ---- S6 (Oracle, runs last): script CONNECT resolves auto-commit from
     // the new connection's seeded default, not the old connection's value ----
