@@ -191,6 +191,10 @@ pub fn show(params: &[BindParam], types: &[BindParamType]) -> Option<Vec<BindPar
         let _ = row.value_input.take_focus();
     }
 
+    // Reachable from an awake continuation (the object browser's Execute
+    // Procedure loads arguments on a worker and prompts on completion),
+    // which can fire while a popup menu owns the FLTK grab.
+    crate::ui::break_active_grab_for_modal();
     while dialog.shown() {
         app::wait();
     }

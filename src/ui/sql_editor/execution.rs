@@ -20710,6 +20710,9 @@ impl SqlEditorWidget {
         dialog.show();
         input.take_focus().ok();
 
+        // Reached from the progress handler (a timer context), which can fire
+        // while a popup menu owns the FLTK grab.
+        crate::ui::break_active_grab_for_modal();
         while dialog.shown() {
             app::wait();
         }

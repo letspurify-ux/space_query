@@ -350,8 +350,29 @@ fn sql_editor_alert_calls_use_wrapper_function() {
             .expect("the shared modal wait helper must close");
         let finish_body = &ui_mod[finish_start..finish_end];
         assert!(
-            finish_body.contains("app::set_grab(None::<Window>)"),
+            finish_body.contains("break_active_grab_for_modal()"),
             "every modal dialog must break an active FLTK grab before waiting, or a popup menu and the modal freeze each other"
+        );
+    }
+    // The modals reachable from timers or awake handlers do not go through
+    // finish_modal_dialog and must call the shared grab-break themselves:
+    // the script substitution/ACCEPT prompt (progress handler), the bind
+    // prompt (Execute Procedure's awake continuation), and the describe/crash
+    // text dialog.
+    for (name, source) in [
+        ("execution.rs", include_str!("execution.rs")),
+        (
+            "bind_prompt_dialog.rs",
+            include_str!("../bind_prompt_dialog.rs"),
+        ),
+        (
+            "intellisense/popup.rs",
+            include_str!("intellisense/popup.rs"),
+        ),
+    ] {
+        assert!(
+            source.contains("crate::ui::break_active_grab_for_modal();"),
+            "{name}: a worker-reachable modal wait loop must break an active FLTK grab first"
         );
     }
     assert_eq!(

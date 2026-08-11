@@ -1028,6 +1028,7 @@ impl SqlEditorWidget {
         dialog.show();
         fltk::group::Group::set_current(current_group.as_ref());
 
+        crate::ui::break_active_grab_for_modal();
         while dialog.shown() {
             fltk::app::wait();
             if receiver.try_recv().is_ok() {
