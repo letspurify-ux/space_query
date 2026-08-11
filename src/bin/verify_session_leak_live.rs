@@ -14,6 +14,13 @@
 //   T4 repeated tab open/close leaves nothing behind
 //   T5 disconnecting closes the session of a statement still on the server
 //   T6 disconnecting closes every session the tab ever used
+//   T7 disconnecting closes the session an OPEN lazy fetch is holding
+//   T8 a tab closed mid-cancel (owner gone before the worker) leaves nothing
+//
+// T7 and T8 drive interleavings the app's own guards normally prevent (the
+// disconnect menu refuses while a lazy fetch is open; a close of a running tab
+// is deferred until idle). The engine guarantees must hold anyway: guards are
+// UI convention, and any new code path that skips one must still not leak.
 //
 // Every count is the server's own (`information_schema.processlist` /
 // `v$session`), taken through a second connection, and the probe connects
@@ -592,6 +599,63 @@ fn verify(target: Target) -> Result<bool, String> {
         observed,
         disconnected_baseline,
     );
+
+    // T7: an OPEN lazy fetch holds its session in the worker's own frame. The
+    // disconnect menu refuses while one is open, so nothing in the app ever
+    // exercises what happens if a disconnect lands anyway -- but the activity
+    // registry binds that session to the connection's generation, and the
+    // stale sweep must be able to retire it without the worker's cooperation.
+    println!("  --- T7 disconnecting closes an open lazy fetch's session ---");
+    connection_reconnect(&shared, target, &probe_user, &probe_service)?;
+    let mut tab = Tab::open(&shared);
+    tab.editor.set_lazy_fetch_batch_size(50);
+    tab.run(target.many_rows_sql())?;
+    let open = tab.editor.has_open_lazy_fetch();
+    println!("    lazy fetch open after the SELECT: {open}");
+    if !open {
+        println!("    (note) no lazy fetch stayed open; T7 degenerates into T6");
+    }
+    shared
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .disconnect();
+    // Exactly what main_window does after a disconnect.
+    space_query::db::sweep_stale_db_activities(Duration::from_secs(2));
+    let observed = settled_count(&mut census, disconnected_baseline)?;
+    report.check(
+        "T7 disconnecting closes an open lazy fetch's session",
+        observed,
+        disconnected_baseline,
+    );
+    tab.close();
+
+    // T8: the app defers a close while the tab still has running work, so the
+    // worker always outlives the close in practice. Drop the owner FIRST
+    // anyway: the worker must finish against a tab that no longer exists, and
+    // whatever it hands back has nobody left to hand it to -- the lease
+    // entry's own drop is the only thing standing between that session and a
+    // permanent leak.
+    println!("  --- T8 a tab closed mid-cancel leaves no session behind ---");
+    connection_reconnect(&shared, target, &probe_user, &probe_service)?;
+    let connected_before_t8 = stable_count(&mut census)?;
+    let mut tab = Tab::open(&shared);
+    tab.start(target.sleep_sql());
+    pump(Duration::from_millis(1500));
+    tab.editor.cancel_current();
+    // Deliberately NOT waiting for the batch: close and drop while the worker
+    // still owns the session.
+    tab.close();
+    drop(tab);
+    let observed = settled_count(&mut census, connected_before_t8)?;
+    report.check(
+        "T8 a tab closed mid-cancel leaves no session behind",
+        observed,
+        connected_before_t8,
+    );
+    shared
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .disconnect();
 
     if report.failures.is_empty() {
         println!("== {} PASSED ==", target.label());

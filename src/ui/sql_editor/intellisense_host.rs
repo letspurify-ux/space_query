@@ -322,7 +322,11 @@ impl SqlEditorWidget {
     pub fn cleanup_for_close(&mut self) {
         let query_was_running = self.is_query_running();
         self.cancel_active_lazy_fetch(false);
-        self.pooled_db_session.clear();
+        // Close, not clear: a statement that outlives this tab (a cancel that
+        // never landed) hands its session back later, and a closed slot is
+        // what makes that hand-back close the session instead of retaining it
+        // into a tab that no longer exists.
+        self.pooled_db_session.close_for_owner_shutdown();
         if !query_was_running {
             *self
                 .current_operation_cancel_handle

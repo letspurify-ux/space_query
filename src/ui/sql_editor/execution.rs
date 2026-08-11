@@ -9651,6 +9651,7 @@ impl SqlEditorWidget {
         let operation_autocommit;
         let operation_db_type;
         let operation_connection_generation;
+        let operation_connection_lifetime;
         let binding_snapshot = self.connection_binding.snapshot();
         let shared_connection = match binding_snapshot.connection() {
             Some(connection) => connection,
@@ -9678,6 +9679,7 @@ impl SqlEditorWidget {
             );
             operation_db_type = conn_guard.db_type();
             operation_connection_generation = conn_guard.connection_generation();
+            operation_connection_lifetime = conn_guard.activity_lifetime();
 
             // Keep UI responsive: avoid network round-trip checks (ping) on the UI thread.
             // The execution worker performs full liveness validation.
@@ -9747,14 +9749,39 @@ impl SqlEditorWidget {
                 )
             },
         );
+        // Bound to the connection generation from the start, so the stale
+        // sweep can retire this work even when it never acquires a pooled
+        // session. Work on the OCI main connection is exactly that: without
+        // this binding its activity has no lifetime, `is_stale` can never say
+        // yes, and a parked lazy fetch on a disconnected connection keeps its
+        // server session forever. A later pooled acquire re-binds to the pool
+        // context epoch, which is strictly newer information.
+        operation_activity.bind_lifetime(operation_connection_lifetime);
         // A cancel that comes from the registry — a disconnect, or the stale
         // sweep — goes through the editor's own cancel path, so it reports and
         // settles the session exactly like the cancel button does instead of
         // surfacing the broken session as a driver error.
         {
             let registry_cancel = self.registry_cancel_flag();
+            let lazy_fetch_for_registry_cancel = self.active_lazy_fetch.clone();
             operation_activity.on_cancel(Arc::new(move || {
                 registry_cancel.store(true, Ordering::Release);
+                // The flag above is applied on the next UI tick, but the
+                // session teardown must not depend on the UI thread: a parked
+                // lazy fetch holds its session with an OPEN cursor, and the
+                // OCI force tier cannot close such a session (ODPI refuses
+                // while statements are open). Waking the worker directly makes
+                // it close its cursor and discard the session itself — the one
+                // teardown that works on every backend.
+                let handle = lazy_fetch_for_registry_cancel
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                if let Some(handle) = handle.as_ref().filter(|handle| {
+                    handle.connection_generation == operation_connection_generation
+                }) {
+                    handle.cancel_requested.store(true, Ordering::Release);
+                    let _ = handle.sender.send(LazyFetchCommand::ForceCancel);
+                }
             }));
         }
         let current_query_cancel_handle = self

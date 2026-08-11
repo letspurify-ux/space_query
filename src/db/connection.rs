@@ -93,16 +93,15 @@ static NEXT_CONNECTION_GENERATION: AtomicU64 = AtomicU64::new(1);
 /// close the pool's IDLE sessions either, because the outstanding `PooledConn`
 /// owns a clone of the pool. This registry is what lets the teardown paths
 /// find those leases without every owner having to remember to hand them back.
-static RETAINED_POOL_SESSION_LEASES: OnceLock<
-    Mutex<Vec<Weak<Mutex<Option<DbSessionLeaseEntry>>>>>,
-> = OnceLock::new();
+static RETAINED_POOL_SESSION_LEASES: OnceLock<Mutex<Vec<Weak<Mutex<DbSessionLeaseSlot>>>>> =
+    OnceLock::new();
 
 fn next_connection_generation() -> u64 {
     NEXT_CONNECTION_GENERATION.fetch_add(1, Ordering::Relaxed)
 }
 
-fn lock_retained_pool_session_leases(
-) -> MutexGuard<'static, Vec<Weak<Mutex<Option<DbSessionLeaseEntry>>>>> {
+fn lock_retained_pool_session_leases() -> MutexGuard<'static, Vec<Weak<Mutex<DbSessionLeaseSlot>>>>
+{
     RETAINED_POOL_SESSION_LEASES
         .get_or_init(|| Mutex::new(Vec::new()))
         .lock()
@@ -1598,6 +1597,22 @@ pub enum RetainedSessionTakeOutcome {
     BlockedContextMismatch(RetainedSessionState),
 }
 
+/// What one lease slot holds, plus whether its owner still exists.
+///
+/// `closed` is the difference between "empty because idle" and "empty because
+/// the tab is gone". Work that outlives its tab (a statement whose cancel was
+/// requested but never landed) hands its session back through the same store
+/// path a live tab uses, and an `Option` alone cannot refuse it — the session
+/// would sit in a slot nobody will ever clear again, holding a server session
+/// for as long as any clone of the slot exists. Live-observed on Oracle thin:
+/// a `DBMS_SESSION.SLEEP` outlasting its cancelled tab came back healthy,
+/// was retained into the closed slot, and survived every teardown.
+#[derive(Default)]
+struct DbSessionLeaseSlot {
+    entry: Option<DbSessionLeaseEntry>,
+    closed: bool,
+}
+
 /// One editor tab's owned DB session slot.
 ///
 /// Oracle and MySQL/MariaDB both use this same lifecycle: take the lease for
@@ -1605,7 +1620,7 @@ pub enum RetainedSessionTakeOutcome {
 /// disconnect, cancel, or stale connection generation.
 #[derive(Clone, Default)]
 pub struct SharedDbSessionLease {
-    inner: Arc<Mutex<Option<DbSessionLeaseEntry>>>,
+    inner: Arc<Mutex<DbSessionLeaseSlot>>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -2454,7 +2469,7 @@ fn retained_lease_context_decision(
 
 impl SharedDbSessionLease {
     /// The lease's own mutex, tracked so the app-wide lock order is observable.
-    fn lock_inner(&self) -> TrackedGuard<'_, Option<DbSessionLeaseEntry>> {
+    fn lock_inner(&self) -> TrackedGuard<'_, DbSessionLeaseSlot> {
         let _order = crate::db::lock_order::LockOrderScope::enter(
             crate::db::lock_order::names::SESSION_LEASE,
         );
@@ -2469,11 +2484,11 @@ impl SharedDbSessionLease {
 
     pub fn new() -> Self {
         Self {
-            inner: Arc::new(Mutex::new(None)),
+            inner: Arc::new(Mutex::new(DbSessionLeaseSlot::default())),
         }
     }
 
-    fn from_inner(inner: Arc<Mutex<Option<DbSessionLeaseEntry>>>) -> Self {
+    fn from_inner(inner: Arc<Mutex<DbSessionLeaseSlot>>) -> Self {
         Self { inner }
     }
 
@@ -2498,17 +2513,39 @@ impl SharedDbSessionLease {
     ) -> Option<DbSessionLeaseEntry> {
         let mut lease = self.lock_inner();
         let matches = lease
+            .entry
             .as_ref()
             .is_some_and(|entry| entry.connection_generation == connection_generation);
         if matches {
-            lease.take()
+            lease.entry.take()
         } else {
             None
         }
     }
 
     pub fn clear(&self) -> bool {
-        let lease_to_drop = { self.lock_inner().take() };
+        let lease_to_drop = { self.lock_inner().entry.take() };
+        if let Some(entry) = lease_to_drop {
+            entry.discard_physical("db::session_lease");
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Close this slot for good: its owner is going away.
+    ///
+    /// Beyond `clear`, this refuses every store from now on. A cancelled
+    /// statement can outlive its tab, and when it finally hands its session
+    /// back there is nobody left to clear the slot again — so the store path
+    /// closes the session physically instead of retaining it. Every backend
+    /// shares this refusal because every backend shares the store path.
+    pub fn close_for_owner_shutdown(&self) -> bool {
+        let lease_to_drop = {
+            let mut lease = self.lock_inner();
+            lease.closed = true;
+            lease.entry.take()
+        };
         if let Some(entry) = lease_to_drop {
             entry.discard_physical("db::session_lease");
             true
@@ -2521,6 +2558,7 @@ impl SharedDbSessionLease {
         self.inner
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .entry
             .as_ref()
             .and_then(|entry| entry.lease().map(|lease| (entry, lease)))
             .map(|(entry, lease)| PooledSessionLeaseSnapshot {
@@ -2541,11 +2579,11 @@ impl SharedDbSessionLease {
         let mut stale_lease_to_drop = None;
         let reusable_lease = {
             let mut lease = self.lock_inner();
-            let reusable = lease.as_ref().is_some_and(|existing| {
+            let reusable = lease.entry.as_ref().is_some_and(|existing| {
                 existing.matches_connection(connection_generation, db_type)
             });
             if reusable {
-                lease.take().and_then(|mut entry| {
+                lease.entry.take().and_then(|mut entry| {
                     let pool_context_epoch = entry.pool_context_epoch;
                     let retained_state = entry.retained_state;
                     let current_scope = entry.current_scope.take();
@@ -2565,8 +2603,8 @@ impl SharedDbSessionLease {
                     })
                 })
             } else {
-                if lease.is_some() {
-                    stale_lease_to_drop = lease.take();
+                if lease.entry.is_some() {
+                    stale_lease_to_drop = lease.entry.take();
                 }
                 None
             }
@@ -2621,18 +2659,18 @@ impl SharedDbSessionLease {
         let mut stale_lease_to_drop = None;
         let reusable_lease = {
             let mut lease = self.lock_inner();
-            let Some(existing) = lease.as_ref() else {
+            let Some(existing) = lease.entry.as_ref() else {
                 return RetainedSessionTakeOutcome::NoSession;
             };
             if !existing.matches_connection(connection_generation, db_type) {
-                stale_lease_to_drop = lease.take();
+                stale_lease_to_drop = lease.entry.take();
                 None
             } else if retained_lease_context_decision(
                 existing.matches_context(connection_generation, pool_context_epoch, db_type),
                 existing.retained_state,
             ) == RetainedLeaseContextDecision::Reusable
             {
-                lease.take().and_then(|mut entry| {
+                lease.entry.take().and_then(|mut entry| {
                     let restore_epoch = if entry.pool_context_epoch == pool_context_epoch {
                         entry.pool_context_epoch
                     } else {
@@ -2674,7 +2712,7 @@ impl SharedDbSessionLease {
     ) -> bool {
         let lease_to_drop = {
             let mut lease = self.lock_inner();
-            let should_clear = lease.as_ref().is_some_and(|existing| {
+            let should_clear = lease.entry.as_ref().is_some_and(|existing| {
                 existing.connection_generation == connection_generation
                     && match existing.lease() {
                         Some(DbSessionLease::Oracle(conn)) => Arc::ptr_eq(conn, expected_conn),
@@ -2684,7 +2722,7 @@ impl SharedDbSessionLease {
                     }
             });
             if should_clear {
-                lease.take()
+                lease.entry.take()
             } else {
                 None
             }
@@ -2767,53 +2805,63 @@ impl SharedDbSessionLease {
         let lease_db_type = lease_to_store.db_type();
         let mut lease_to_store = Some(lease_to_store);
         let mut stored = false;
+        let mut refused_because_closed = false;
         let old_lease_to_drop = {
             let mut lease = self.lock_inner();
-            let should_store = match lease.as_mut() {
-                None => true,
-                Some(existing) => {
-                    if existing.connection_generation != connection_generation
-                        || existing.pool_context_epoch != pool_context_epoch
-                        || !existing
-                            .lease()
-                            .is_some_and(|lease| lease.is_db_type(lease_db_type))
-                    {
-                        true
-                    } else {
-                        match retained_lease_conflict_resolution(
-                            existing.retained_state,
-                            retained_state,
-                        ) {
-                            RetainedLeaseConflictResolution::KeepExisting => false,
-                            RetainedLeaseConflictResolution::ReplaceExisting => true,
-                            RetainedLeaseConflictResolution::KeepExistingMarkedInvalid => {
-                                existing.retained_state = existing
-                                    .retained_state
-                                    .conservative_merge(retained_state)
-                                    .with_transaction_state(
-                                        TransactionSessionState::InvalidSession,
-                                    );
-                                false
+            if lease.closed {
+                // The owner is gone. Retaining here would park a live server
+                // session in a slot nobody will ever clear again, so the
+                // session is closed instead — on every backend, because every
+                // backend hands sessions back through this one path.
+                refused_because_closed = true;
+                None
+            } else {
+                let should_store = match lease.entry.as_mut() {
+                    None => true,
+                    Some(existing) => {
+                        if existing.connection_generation != connection_generation
+                            || existing.pool_context_epoch != pool_context_epoch
+                            || !existing
+                                .lease()
+                                .is_some_and(|lease| lease.is_db_type(lease_db_type))
+                        {
+                            true
+                        } else {
+                            match retained_lease_conflict_resolution(
+                                existing.retained_state,
+                                retained_state,
+                            ) {
+                                RetainedLeaseConflictResolution::KeepExisting => false,
+                                RetainedLeaseConflictResolution::ReplaceExisting => true,
+                                RetainedLeaseConflictResolution::KeepExistingMarkedInvalid => {
+                                    existing.retained_state = existing
+                                        .retained_state
+                                        .conservative_merge(retained_state)
+                                        .with_transaction_state(
+                                            TransactionSessionState::InvalidSession,
+                                        );
+                                    false
+                                }
                             }
                         }
                     }
+                };
+                if should_store {
+                    let old_lease = lease.entry.take();
+                    if let Some(lease_to_store) = lease_to_store.take() {
+                        lease.entry = Some(DbSessionLeaseEntry::new_with_retained_state(
+                            connection_generation,
+                            pool_context_epoch,
+                            lease_to_store,
+                            retained_state,
+                            current_scope,
+                        ));
+                        stored = true;
+                    }
+                    old_lease
+                } else {
+                    None
                 }
-            };
-            if should_store {
-                let old_lease = lease.take();
-                if let Some(lease_to_store) = lease_to_store.take() {
-                    *lease = Some(DbSessionLeaseEntry::new_with_retained_state(
-                        connection_generation,
-                        pool_context_epoch,
-                        lease_to_store,
-                        retained_state,
-                        current_scope,
-                    ));
-                    stored = true;
-                }
-                old_lease
-            } else {
-                None
             }
         };
         if stored {
@@ -2824,17 +2872,22 @@ impl SharedDbSessionLease {
         if let Some(entry) = old_lease_to_drop {
             entry.discard_physical("db::session_lease");
         }
-        if lease_to_store.is_some() {
-            logging::log_warning(
-                "db::session_lease",
-                &format!(
-                    "Discarded conflicting retained {} session for generation {} because an active retained session already exists",
-                    lease_db_type, connection_generation
-                ),
-            );
-            if let Some(lease_to_store) = lease_to_store.take() {
-                lease_to_store.discard_physical("db::session_lease");
+        if let Some(lease_to_store) = lease_to_store.take() {
+            if refused_because_closed {
+                logging::log_info(
+                    "db::session_lease",
+                    &format!("Closing a {lease_db_type} session handed back to a closed query tab"),
+                );
+            } else {
+                logging::log_warning(
+                    "db::session_lease",
+                    &format!(
+                        "Discarded conflicting retained {} session for generation {} because an active retained session already exists",
+                        lease_db_type, connection_generation
+                    ),
+                );
             }
+            lease_to_store.discard_physical("db::session_lease");
             return false;
         }
         true
@@ -8850,6 +8903,35 @@ mod tests {
             census,
             pooled - 2,
             "L4 a retained session whose owner is gone is closed, not orphaned",
+        );
+
+        // L11: a session handed back to a slot that was CLOSED, not merely
+        // cleared. A cancelled statement can outlive its tab and hand its
+        // session back afterwards; the closed slot must close that session
+        // rather than retain it where nobody will ever clear it again.
+        // Live-observed on Oracle thin before the closed flag existed.
+        let before_late_handback = stable_server_session_count(census);
+        let late = acquire(&ctx);
+        let closed_tab_lease = SharedDbSessionLease::new();
+        closed_tab_lease.close_for_owner_shutdown();
+        assert!(
+            !closed_tab_lease.apply_retained_session_disposition(
+                ctx.connection_generation,
+                ctx.pool_context_epoch(),
+                late,
+                RetainedSessionDisposition::Retain(RetainedSessionState::default()),
+                "session census probe",
+            ),
+            "a closed slot must refuse to retain a session"
+        );
+        assert!(
+            closed_tab_lease.snapshot().is_none(),
+            "a closed slot must stay empty after a refused store"
+        );
+        assert_server_sessions_at_most(
+            census,
+            before_late_handback,
+            "L11 a session handed back to a closed tab slot is closed",
         );
 
         // L5: disconnect closes every session the connection opened, including
