@@ -305,7 +305,7 @@ impl SharedFontSettings {
             normal_font: AtomicI32::new(profile.normal.bits()),
             bold_font: AtomicI32::new(profile.bold.bits()),
             italic_font: AtomicI32::new(profile.italic.bits()),
-            font_size: AtomicU32::new(crate::utils::AppConfig::clamp_font_size(size)),
+            font_size: AtomicU32::new(size),
         }
     }
 
@@ -349,10 +349,7 @@ impl SharedFontSettings {
         self.bold_font.store(profile.bold.bits(), Ordering::Relaxed);
         self.italic_font
             .store(profile.italic.bits(), Ordering::Relaxed);
-        self.font_size.store(
-            crate::utils::AppConfig::clamp_font_size(size),
-            Ordering::Relaxed,
-        );
+        self.font_size.store(size, Ordering::Relaxed);
     }
 }
 
@@ -2151,12 +2148,12 @@ impl ResultTableWidget {
     }
 
     fn row_height_for_font(size: u32) -> i32 {
-        let size = crate::utils::AppConfig::clamp_font_size(size) as i32;
+        let size = size as i32;
         (size + TABLE_CELL_PADDING * 2 + 4).max(TABLE_ROW_HEIGHT)
     }
 
     fn header_height_for_font(size: u32) -> i32 {
-        let size = crate::utils::AppConfig::clamp_font_size(size) as i32;
+        let size = size as i32;
         (size + TABLE_CELL_PADDING * 2 + 6).max(TABLE_COL_HEADER_HEIGHT)
     }
 

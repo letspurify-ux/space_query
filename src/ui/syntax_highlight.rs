@@ -110,7 +110,6 @@ fn mysql_compatible_highlight_mode(db_type: DatabaseType) -> bool {
 }
 
 pub fn create_style_table_with(profile: FontProfile, size: u32) -> Vec<StyleTableEntry> {
-    let size = crate::utils::AppConfig::clamp_font_size(size);
     vec![
         // A - Default text (light gray)
         StyleTableEntry {

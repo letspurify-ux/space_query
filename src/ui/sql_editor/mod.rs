@@ -6129,7 +6129,6 @@ impl SqlEditorWidget {
     }
 
     pub fn apply_font_settings(&mut self, profile: FontProfile, size: u32, ui_size: i32) {
-        let size = AppConfig::clamp_font_size(size);
         let ui_size = ui_size.clamp(8, 24);
         let size_i32 = size as i32;
         self.editor.set_text_font(profile.normal);

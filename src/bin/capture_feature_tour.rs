@@ -14,7 +14,7 @@ use space_query::{
     ui::{
         apply_global_default_font,
         bind_prompt::{BindParam, BindParamType},
-        bind_prompt_dialog,
+        bind_prompt_dialog, configured_result_font_size, configured_ui_font_size,
         constants::{BUTTON_HEIGHT, TAB_HEADER_HEIGHT},
         explain_plan::{plan_grid, ExplainPlanData, PlanNode},
         intellisense::input_caret_popup_anchor,
@@ -2099,7 +2099,7 @@ fn capture_value_viewer(capture_path: &str) {
         VALUE,
         false,
         profile_by_name("D2Coding"),
-        16,
+        configured_result_font_size(),
     );
 }
 
@@ -2361,9 +2361,6 @@ fn main() {
     let config = AppConfig {
         editor_font: "D2Coding".to_string(),
         result_font: "D2Coding".to_string(),
-        ui_font_size: 16,
-        editor_font_size: 16,
-        result_font_size: 16,
         ui_scale_percent,
         ..AppConfig::default()
     };
@@ -2380,9 +2377,9 @@ fn main() {
         .with_scheme(app::Scheme::Gtk)
         .load_system_fonts();
     apply_global_default_font(profile_by_name("D2Coding").normal);
-    app::set_font_size(16);
+    app::set_font_size(configured_ui_font_size());
     Tooltip::set_font(profile_by_name("D2Coding").normal);
-    Tooltip::set_font_size(16);
+    Tooltip::set_font_size(configured_ui_font_size());
     let (bg_r, bg_g, bg_b) = theme::app_background().to_rgb();
     app::background(bg_r, bg_g, bg_b);
     let (fg_r, fg_g, fg_b) = theme::app_foreground().to_rgb();

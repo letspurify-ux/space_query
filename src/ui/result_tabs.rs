@@ -1378,7 +1378,6 @@ impl ResultTabsWidget {
     }
 
     pub fn apply_font_settings(&mut self, profile: FontProfile, size: u32) {
-        let size = crate::utils::AppConfig::clamp_font_size(size);
         *self
             .font_profile
             .lock()

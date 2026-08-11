@@ -4,7 +4,7 @@ use std::ffi::CString;
 use std::os::raw::{c_char, c_int};
 use std::sync::{OnceLock, RwLock};
 
-use crate::utils::AppConfig;
+use crate::utils::{AppConfig, DEFAULT_FONT_SIZE};
 
 #[derive(Clone, Copy)]
 pub struct FontProfile {
@@ -59,9 +59,6 @@ struct FontCatalog {
 struct RuntimeFontSettings {
     editor_profile: FontProfile,
     result_profile: FontProfile,
-    ui_size: i32,
-    editor_size: u32,
-    result_size: u32,
 }
 
 static FONT_CATALOG: OnceLock<FontCatalog> = OnceLock::new();
@@ -316,9 +313,6 @@ impl RuntimeFontSettings {
         Self {
             editor_profile: profile_by_name(&config.editor_font),
             result_profile: profile_by_name(&config.result_font),
-            ui_size: config.normalized_ui_font_size() as i32,
-            editor_size: config.normalized_editor_font_size(),
-            result_size: config.normalized_result_font_size(),
         }
     }
 }
@@ -341,15 +335,15 @@ pub fn configured_result_profile() -> FontProfile {
 }
 
 pub fn configured_ui_font_size() -> i32 {
-    runtime_font_settings().ui_size
+    DEFAULT_FONT_SIZE as i32
 }
 
 pub fn configured_editor_font_size() -> u32 {
-    runtime_font_settings().editor_size
+    DEFAULT_FONT_SIZE
 }
 
 pub fn configured_result_font_size() -> u32 {
-    runtime_font_settings().result_size
+    DEFAULT_FONT_SIZE
 }
 
 #[cfg(test)]

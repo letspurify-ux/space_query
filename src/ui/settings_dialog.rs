@@ -19,24 +19,20 @@ fn fold_for_case_insensitive(value: &str) -> String {
 use crate::ui::constants::*;
 use crate::ui::{available_font_names, center_on_main, resolved_font_name, theme};
 use crate::utils::{
-    AppConfig, SqlCommaListLayout, MAX_APP_LOG_LIMIT, MAX_CANCEL_TIMEOUT_SECONDS,
-    MAX_CONNECTION_POOL_SIZE, MAX_CONNECT_TIMEOUT_SECONDS, MAX_FONT_SIZE,
+    AppConfig, SqlCommaListLayout, DEFAULT_FONT_NAME, MAX_APP_LOG_LIMIT,
+    MAX_CANCEL_TIMEOUT_SECONDS, MAX_CONNECTION_POOL_SIZE, MAX_CONNECT_TIMEOUT_SECONDS,
     MAX_INTELLISENSE_CONTEXT_WINDOW_KIB, MAX_INTELLISENSE_POPUP_DELAY_MS,
     MAX_LAZY_FETCH_BATCH_SIZE, MAX_QUERY_HISTORY_LIMIT, MAX_SQL_FORMAT_RIGHT_MARGIN,
-    MAX_UI_FONT_SIZE, MAX_UI_SCALE_PERCENT, MIN_APP_LOG_LIMIT, MIN_CANCEL_TIMEOUT_SECONDS,
-    MIN_CONNECTION_POOL_SIZE, MIN_CONNECT_TIMEOUT_SECONDS, MIN_FONT_SIZE,
-    MIN_INTELLISENSE_CONTEXT_WINDOW_KIB, MIN_INTELLISENSE_POPUP_DELAY_MS,
-    MIN_LAZY_FETCH_BATCH_SIZE, MIN_QUERY_HISTORY_LIMIT, MIN_SQL_FORMAT_RIGHT_MARGIN,
-    MIN_UI_FONT_SIZE, MIN_UI_SCALE_PERCENT,
+    MAX_UI_SCALE_PERCENT, MIN_APP_LOG_LIMIT, MIN_CANCEL_TIMEOUT_SECONDS, MIN_CONNECTION_POOL_SIZE,
+    MIN_CONNECT_TIMEOUT_SECONDS, MIN_INTELLISENSE_CONTEXT_WINDOW_KIB,
+    MIN_INTELLISENSE_POPUP_DELAY_MS, MIN_LAZY_FETCH_BATCH_SIZE, MIN_QUERY_HISTORY_LIMIT,
+    MIN_SQL_FORMAT_RIGHT_MARGIN, MIN_UI_SCALE_PERCENT,
 };
 
 #[derive(Clone)]
 pub struct FontSettings {
     pub font: String,
-    pub ui_size: u32,
     pub ui_scale_percent: u32,
-    pub editor_size: u32,
-    pub result_size: u32,
     pub result_cell_max_chars: u32,
     pub lazy_fetch_batch_size: u32,
     pub intellisense_context_window_kib: u32,
@@ -51,10 +47,7 @@ pub struct FontSettings {
 }
 
 /// Every form label in this dialog, so one column width can fit them all.
-const FORM_LABELS: [&str; 13] = [
-    "Editor:",
-    "Result Font:",
-    "Global UI:",
+const FORM_LABELS: [&str; 10] = [
     "Screen Scale:",
     "Cell Preview:",
     "Lazy Fetch:",
@@ -71,10 +64,11 @@ const FORM_LABELS: [&str; 13] = [
 ///
 /// A `Frame` centers its label and clips both ends once the text outgrows its
 /// box, so a fixed [`FORM_LABEL_WIDTH`] silently ate the first character of
-/// `Connect Timeout:` and `Context Window:`. The UI font size is configurable,
-/// which is why the column is measured instead of assumed. `Font::Helvetica` is
-/// the slot [`apply_global_default_font`](crate::ui::font_settings) remaps to
-/// the configured UI font, so it measures what a label will actually draw with.
+/// `Connect Timeout:` and `Context Window:`. The configured UI font decides how
+/// wide a label draws, which is why the column is measured instead of assumed.
+/// `Font::Helvetica` is the slot
+/// [`apply_global_default_font`](crate::ui::font_settings) remaps to that font,
+/// so it measures what a label will actually draw with.
 fn form_label_width() -> i32 {
     fltk::draw::set_font(fltk::enums::Font::Helvetica, fltk::app::font_size());
     FORM_LABELS
@@ -88,32 +82,6 @@ fn form_label_width() -> i32 {
 
 /// Breathing room between the widest label and the input beside it.
 const FORM_LABEL_TEXT_GAP: i32 = 10;
-
-fn validate_size(label: &str, value: &str) -> Option<u32> {
-    match value.trim().parse::<u32>() {
-        Ok(size) if (MIN_FONT_SIZE..=MAX_FONT_SIZE).contains(&size) => Some(size),
-        _ => {
-            crate::ui::alert_on_main(&format!(
-                "{} size must be a number between {} and {}.",
-                label, MIN_FONT_SIZE, MAX_FONT_SIZE
-            ));
-            None
-        }
-    }
-}
-
-fn validate_ui_size(value: &str) -> Option<u32> {
-    match value.trim().parse::<u32>() {
-        Ok(size) if (MIN_UI_FONT_SIZE..=MAX_UI_FONT_SIZE).contains(&size) => Some(size),
-        _ => {
-            crate::ui::alert_on_main(&format!(
-                "Global UI size must be a number between {} and {}.",
-                MIN_UI_FONT_SIZE, MAX_UI_FONT_SIZE
-            ));
-            None
-        }
-    }
-}
 
 fn validate_ui_scale_percent(value: &str) -> Option<u32> {
     match value.trim().parse::<u32>() {
@@ -337,7 +305,7 @@ pub fn show_settings_dialog(config: &AppConfig) -> Option<FontSettings> {
     } else if !config.result_font.trim().is_empty() {
         config.result_font.as_str()
     } else {
-        "Courier"
+        DEFAULT_FONT_NAME
     };
     let current_font = resolved_font_name(configured_font);
 
@@ -431,48 +399,6 @@ pub fn show_settings_dialog(config: &AppConfig) -> Option<FontSettings> {
     selected_row.end();
     font_flex.fixed(&selected_row, CHECKBOX_ROW_HEIGHT);
 
-    let mut editor_size_row = Flex::default().with_size(0, INPUT_ROW_HEIGHT);
-    editor_size_row.set_type(FlexType::Row);
-    editor_size_row.set_spacing(DIALOG_SPACING);
-    let mut editor_size_label = Frame::default().with_label("Editor:");
-    editor_size_label.set_label_color(theme::text_primary());
-    editor_size_row.fixed(&editor_size_label, label_width);
-    let mut editor_size_input = IntInput::default();
-    editor_size_input.set_value(&config.normalized_editor_font_size().to_string());
-    editor_size_input.set_color(theme::input_bg());
-    editor_size_input.set_text_color(theme::text_primary());
-    theme::apply_text_input_inset(&mut editor_size_input);
-    editor_size_row.end();
-    font_flex.fixed(&editor_size_row, INPUT_ROW_HEIGHT);
-
-    let mut result_size_row = Flex::default().with_size(0, INPUT_ROW_HEIGHT);
-    result_size_row.set_type(FlexType::Row);
-    result_size_row.set_spacing(DIALOG_SPACING);
-    let mut result_size_label = Frame::default().with_label("Result Font:");
-    result_size_label.set_label_color(theme::text_primary());
-    result_size_row.fixed(&result_size_label, label_width);
-    let mut result_size_input = IntInput::default();
-    result_size_input.set_value(&config.normalized_result_font_size().to_string());
-    result_size_input.set_color(theme::input_bg());
-    result_size_input.set_text_color(theme::text_primary());
-    theme::apply_text_input_inset(&mut result_size_input);
-    result_size_row.end();
-    font_flex.fixed(&result_size_row, INPUT_ROW_HEIGHT);
-
-    let mut global_size_row = Flex::default().with_size(0, INPUT_ROW_HEIGHT);
-    global_size_row.set_type(FlexType::Row);
-    global_size_row.set_spacing(DIALOG_SPACING);
-    let mut global_size_label = Frame::default().with_label("Global UI:");
-    global_size_label.set_label_color(theme::text_primary());
-    global_size_row.fixed(&global_size_label, label_width);
-    let mut global_size_input = IntInput::default();
-    global_size_input.set_value(&config.normalized_ui_font_size().to_string());
-    global_size_input.set_color(theme::input_bg());
-    global_size_input.set_text_color(theme::text_primary());
-    theme::apply_text_input_inset(&mut global_size_input);
-    global_size_row.end();
-    font_flex.fixed(&global_size_row, INPUT_ROW_HEIGHT);
-
     let mut ui_scale_row = Flex::default().with_size(0, INPUT_ROW_HEIGHT);
     ui_scale_row.set_type(FlexType::Row);
     ui_scale_row.set_spacing(DIALOG_SPACING);
@@ -492,13 +418,8 @@ pub fn show_settings_dialog(config: &AppConfig) -> Option<FontSettings> {
     font_flex.fixed(&ui_scale_row, INPUT_ROW_HEIGHT);
 
     let mut size_hint = Frame::default().with_label(&format!(
-        "Font: {} ~ {}pt, Global UI: {} ~ {}pt, Scale: {} ~ {}%",
-        MIN_FONT_SIZE,
-        MAX_FONT_SIZE,
-        MIN_UI_FONT_SIZE,
-        MAX_UI_FONT_SIZE,
-        MIN_UI_SCALE_PERCENT,
-        MAX_UI_SCALE_PERCENT
+        "Scale: {} ~ {}%",
+        MIN_UI_SCALE_PERCENT, MAX_UI_SCALE_PERCENT
     ));
     size_hint.set_label_color(theme::text_secondary());
     font_flex.fixed(&size_hint, LABEL_ROW_HEIGHT);
@@ -956,9 +877,6 @@ pub fn show_settings_dialog(config: &AppConfig) -> Option<FontSettings> {
     let result = Arc::new(Mutex::new(None::<FontSettings>));
     let result_for_ok = result.clone();
     let mut dialog_handle = dialog.clone();
-    let editor_size_input_ok = editor_size_input.clone();
-    let result_size_input_ok = result_size_input.clone();
-    let global_size_input_ok = global_size_input.clone();
     let ui_scale_input_ok = ui_scale_input.clone();
     let result_cell_max_input_ok = result_cell_max_input.clone();
     let lazy_fetch_batch_input_ok = lazy_fetch_batch_input.clone();
@@ -973,20 +891,8 @@ pub fn show_settings_dialog(config: &AppConfig) -> Option<FontSettings> {
     let app_log_limit_input_ok = app_log_limit_input.clone();
     let selected_font_ok = selected_font.clone();
     ok_btn.set_callback(move |_| {
-        let ui_size = match validate_ui_size(&global_size_input_ok.value()) {
-            Some(size) => size,
-            None => return,
-        };
         let ui_scale_percent = match validate_ui_scale_percent(&ui_scale_input_ok.value()) {
             Some(percent) => percent,
-            None => return,
-        };
-        let editor_size = match validate_size("Editor", &editor_size_input_ok.value()) {
-            Some(size) => size,
-            None => return,
-        };
-        let result_size = match validate_size("Results", &result_size_input_ok.value()) {
-            Some(size) => size,
             None => return,
         };
         let result_cell_max_chars =
@@ -1056,10 +962,7 @@ pub fn show_settings_dialog(config: &AppConfig) -> Option<FontSettings> {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(FontSettings {
             font,
-            ui_size,
             ui_scale_percent,
-            editor_size,
-            result_size,
             result_cell_max_chars,
             lazy_fetch_batch_size,
             intellisense_context_window_kib,

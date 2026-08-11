@@ -7847,9 +7847,9 @@ impl MainWindow {
         let (editor_profile, result_profile, ui_size, editor_size, result_size) = (
             font_settings::profile_by_name(&config.editor_font),
             font_settings::profile_by_name(&config.result_font),
-            config.normalized_ui_font_size() as i32,
-            config.normalized_editor_font_size(),
-            config.normalized_result_font_size(),
+            font_settings::configured_ui_font_size(),
+            font_settings::configured_editor_font_size(),
+            font_settings::configured_result_font_size(),
         );
         let result_cell_max_chars = config.result_cell_max_chars.clamp(
             RESULT_CELL_MAX_DISPLAY_CHARS_MIN,
@@ -7943,11 +7943,8 @@ impl MainWindow {
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
             config.editor_font = settings.font.clone();
-            config.ui_font_size = settings.ui_size;
             config.ui_scale_percent = settings.ui_scale_percent;
-            config.editor_font_size = settings.editor_size;
             config.result_font = settings.font;
-            config.result_font_size = settings.result_size;
             config.result_cell_max_chars = settings.result_cell_max_chars;
             config.lazy_fetch_batch_size = settings.lazy_fetch_batch_size;
             config.intellisense_context_window_kib = settings.intellisense_context_window_kib;

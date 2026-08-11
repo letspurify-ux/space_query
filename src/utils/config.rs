@@ -48,12 +48,16 @@ pub const MAX_CANCEL_TIMEOUT_SECONDS: u32 = 120;
 pub const DEFAULT_SQL_FORMAT_RIGHT_MARGIN: u32 = 120;
 pub const MIN_SQL_FORMAT_RIGHT_MARGIN: u32 = 60;
 pub const MAX_SQL_FORMAT_RIGHT_MARGIN: u32 = 300;
-pub const DEFAULT_FONT_SIZE: u32 = 16;
-pub const MIN_FONT_SIZE: u32 = 8;
-pub const MAX_FONT_SIZE: u32 = 48;
-pub const DEFAULT_UI_FONT_SIZE: u32 = 16;
-pub const MIN_UI_FONT_SIZE: u32 = 8;
-pub const MAX_UI_FONT_SIZE: u32 = 24;
+/// The one font size the whole application draws with.
+pub const DEFAULT_FONT_SIZE: u32 = 14;
+
+/// The font used until one is configured. Windows always ships Consolas, which
+/// reads far better than FLTK's built-in Courier; every other platform keeps
+/// the built-in one, which is guaranteed to be there.
+#[cfg(windows)]
+pub const DEFAULT_FONT_NAME: &str = "Consolas";
+#[cfg(not(windows))]
+pub const DEFAULT_FONT_NAME: &str = "Courier";
 
 static RUNTIME_CONFIG: OnceLock<RwLock<AppConfig>> = OnceLock::new();
 
@@ -72,11 +76,8 @@ pub struct AppConfig {
     pub recent_sql_files: Vec<PathBuf>,
     pub last_connection: Option<String>,
     pub editor_font: String,
-    pub ui_font_size: u32,
     pub ui_scale_percent: u32,
-    pub editor_font_size: u32,
     pub result_font: String,
-    pub result_font_size: u32,
     pub result_cell_max_chars: u32,
     pub lazy_fetch_batch_size: u32,
     pub intellisense_context_window_kib: u32,
@@ -126,12 +127,9 @@ impl AppConfig {
             recent_connections: Vec::new(),
             recent_sql_files: Vec::new(),
             last_connection: None,
-            editor_font: "Courier".to_string(),
-            ui_font_size: DEFAULT_UI_FONT_SIZE,
+            editor_font: DEFAULT_FONT_NAME.to_string(),
             ui_scale_percent: DEFAULT_UI_SCALE_PERCENT,
-            editor_font_size: DEFAULT_FONT_SIZE,
-            result_font: "Courier".to_string(),
-            result_font_size: DEFAULT_FONT_SIZE,
+            result_font: DEFAULT_FONT_NAME.to_string(),
             result_cell_max_chars: DEFAULT_RESULT_CELL_MAX_CHARS,
             lazy_fetch_batch_size: DEFAULT_LAZY_FETCH_BATCH_SIZE,
             intellisense_context_window_kib: DEFAULT_INTELLISENSE_CONTEXT_WINDOW_KIB,
@@ -171,26 +169,6 @@ impl AppConfig {
 
     pub fn normalized_ui_scale_percent(&self) -> u32 {
         Self::clamp_ui_scale_percent(self.ui_scale_percent)
-    }
-
-    pub fn clamp_font_size(size: u32) -> u32 {
-        size.clamp(MIN_FONT_SIZE, MAX_FONT_SIZE)
-    }
-
-    pub fn normalized_editor_font_size(&self) -> u32 {
-        Self::clamp_font_size(self.editor_font_size)
-    }
-
-    pub fn normalized_result_font_size(&self) -> u32 {
-        Self::clamp_font_size(self.result_font_size)
-    }
-
-    pub fn clamp_ui_font_size(size: u32) -> u32 {
-        size.clamp(MIN_UI_FONT_SIZE, MAX_UI_FONT_SIZE)
-    }
-
-    pub fn normalized_ui_font_size(&self) -> u32 {
-        Self::clamp_ui_font_size(self.ui_font_size)
     }
 
     pub fn normalized_connection_pool_size(&self) -> u32 {
@@ -335,11 +313,8 @@ impl AppConfig {
     }
 
     fn normalize_font_settings(&mut self) {
-        self.ui_font_size = self.normalized_ui_font_size();
-        self.editor_font_size = self.normalized_editor_font_size();
-        self.result_font_size = self.normalized_result_font_size();
         if self.editor_font.trim().is_empty() {
-            self.editor_font = "Courier".to_string();
+            self.editor_font = DEFAULT_FONT_NAME.to_string();
         }
         if self.result_font.trim().is_empty() {
             self.result_font = self.editor_font.clone();
@@ -701,7 +676,7 @@ impl Default for QueryHistory {
 
 #[cfg(test)]
 mod tests {
-    use super::{AppConfig, QueryHistoryEntry};
+    use super::{AppConfig, QueryHistoryEntry, DEFAULT_FONT_NAME};
     use crate::db::{ConnectionInfo, DatabaseType};
 
     fn sample_connection(name: &str) -> ConnectionInfo {
@@ -1090,24 +1065,18 @@ mod tests {
         let mut config = AppConfig::new();
         config.editor_font.clear();
         config.result_font.clear();
-        config.ui_font_size = u32::MAX;
-        config.editor_font_size = 0;
-        config.result_font_size = u32::MAX;
 
         config.normalize_font_settings();
 
-        assert_eq!(config.editor_font, "Courier");
-        assert_eq!(config.result_font, "Courier");
-        assert_eq!(config.ui_font_size, super::MAX_UI_FONT_SIZE);
-        assert_eq!(config.editor_font_size, super::MIN_FONT_SIZE);
-        assert_eq!(config.result_font_size, super::MAX_FONT_SIZE);
+        assert_eq!(config.editor_font, DEFAULT_FONT_NAME);
+        assert_eq!(config.result_font, DEFAULT_FONT_NAME);
     }
 
     #[test]
     fn app_config_uses_a_cross_platform_builtin_font_by_default() {
         let config = AppConfig::new();
-        assert_eq!(config.editor_font, "Courier");
-        assert_eq!(config.result_font, "Courier");
+        assert_eq!(config.editor_font, DEFAULT_FONT_NAME);
+        assert_eq!(config.result_font, DEFAULT_FONT_NAME);
     }
 
     #[test]

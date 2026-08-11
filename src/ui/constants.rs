@@ -123,11 +123,6 @@ pub const MIN_RESULTS_BODY_HEIGHT: i32 = 160;
 /// Minimum total height for the results section.
 pub const MIN_RESULTS_HEIGHT: i32 = RESULT_TOOLBAR_HEIGHT + MIN_RESULTS_BODY_HEIGHT;
 
-// -- Default font size --
-
-/// Default font size used when no config value is available.
-pub const DEFAULT_FONT_SIZE: i32 = 16;
-
 #[cfg(test)]
 mod tests {
     use super::*;
