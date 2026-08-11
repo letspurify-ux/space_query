@@ -1,9 +1,12 @@
 trait QuickDescribeBackend: Sync {
+    /// `scope` is the schema/database the requesting query tab has selected,
+    /// which is what an unqualified name must resolve against.
     fn describe_object(
         &self,
         conn_guard: &mut crate::db::ConnectionLockGuard<'_>,
         object_name: &str,
         qualifier: Option<&str>,
+        scope: Option<&str>,
     ) -> Result<QuickDescribeData, String>;
 }
 
@@ -29,7 +32,14 @@ impl QuickDescribeBackend for OracleQuickDescribeBackend {
         conn_guard: &mut crate::db::ConnectionLockGuard<'_>,
         object_name: &str,
         qualifier: Option<&str>,
+        scope: Option<&str>,
     ) -> Result<QuickDescribeData, String> {
+        // The lookup name carries the schema, so the tab's scope only has to
+        // reach the name — the shared live session keeps its own tracked
+        // schema and nothing here has to change it.
+        let lookup_schema = conn_guard
+            .oracle_schema_for_scope(scope)
+            .map(str::to_string);
         let tracked_schema = conn_guard
             .tracked_oracle_current_schema()
             .map(str::to_string);
@@ -38,7 +48,7 @@ impl QuickDescribeBackend for OracleQuickDescribeBackend {
                 db_conn.as_ref(),
                 object_name,
                 qualifier,
-                tracked_schema.as_deref(),
+                lookup_schema.as_deref(),
             ),
             Ok(crate::db::DbConnection::OracleThin(db_conn)) => {
                 let mut session = db_conn
@@ -52,7 +62,7 @@ impl QuickDescribeBackend for OracleQuickDescribeBackend {
                     &mut session,
                     object_name,
                     qualifier,
-                    tracked_schema.as_deref(),
+                    lookup_schema.as_deref(),
                 )
             }
             Ok(crate::db::DbConnection::MySQL { .. }) => {
@@ -69,13 +79,25 @@ impl QuickDescribeBackend for MysqlQuickDescribeBackend {
         conn_guard: &mut crate::db::ConnectionLockGuard<'_>,
         object_name: &str,
         qualifier: Option<&str>,
+        scope: Option<&str>,
     ) -> Result<QuickDescribeData, String> {
-        conn_guard.apply_tracked_mysql_current_database()?;
+        // Name the database in the lookup instead of switching the session to
+        // it: MySQL 8 and MariaDB fold `DATABASE()` into a prepared
+        // INFORMATION_SCHEMA statement when it is first prepared, so a cached
+        // describe statement keeps answering for the database the session was
+        // in back then.
+        let lookup_database = conn_guard.mysql_database_for_scope(scope).to_string();
+        let lookup_database = (!lookup_database.is_empty()).then_some(lookup_database);
         conn_guard
             .get_mysql_connection_mut()
             .ok_or_else(|| crate::db::NOT_CONNECTED_MESSAGE.to_string())
             .and_then(|mysql_conn| {
-                SqlEditorWidget::describe_mysql_object(mysql_conn, object_name, qualifier)
+                SqlEditorWidget::describe_mysql_object(
+                    mysql_conn,
+                    object_name,
+                    qualifier,
+                    lookup_database.as_deref(),
+                )
             })
     }
 }
@@ -1169,6 +1191,7 @@ impl SqlEditorWidget {
             Self::show_alert_dialog("This query tab is not connected to a database");
             return;
         };
+        let tab_scope = self.connection_binding.snapshot().scope;
         let sender = self.ui_action_sender.clone();
         let sender_for_thread = sender.clone();
         set_cursor(Cursor::Wait);
@@ -1196,6 +1219,7 @@ impl SqlEditorWidget {
                         &mut conn_guard,
                         &raw_word,
                         describe_qualifier,
+                        tab_scope.as_deref(),
                     );
 
                     let _ = sender_for_thread.send(UiActionResult::QuickDescribe {
@@ -1229,22 +1253,27 @@ impl SqlEditorWidget {
         }
     }
 
-    fn describe_object_for_current_db(
+    pub(super) fn describe_object_for_current_db(
         conn_guard: &mut crate::db::ConnectionLockGuard<'_>,
         object_name: &str,
         qualifier: Option<&str>,
+        scope: Option<&str>,
     ) -> Result<QuickDescribeData, String> {
         quick_describe_backend_for(conn_guard.db_type()).describe_object(
             conn_guard,
             object_name,
             qualifier,
+            scope,
         )
     }
 
+    /// `scope` is the database the requesting query tab has selected; an
+    /// unqualified name is looked up there.
     fn describe_mysql_object(
         conn: &mut mysql::Conn,
         object_name: &str,
         qualifier: Option<&str>,
+        scope: Option<&str>,
     ) -> Result<QuickDescribeData, String> {
         use crate::db::query::mysql_executor::MysqlObjectBrowser;
 
@@ -1254,6 +1283,9 @@ impl SqlEditorWidget {
         let qualified_name = qualifier
             .map(|schema| format!("{schema}.{}", object_name))
             .unwrap_or_else(|| object_name.clone());
+        // What the name is written as stays the display name; what it is looked
+        // up in follows the tab.
+        let qualifier = qualifier.or(scope);
 
         if let Ok(columns) =
             MysqlObjectBrowser::get_table_structure_in_schema(conn, qualifier, &object_name)

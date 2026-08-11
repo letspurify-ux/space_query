@@ -121,6 +121,19 @@ MySQL/MariaDB current database are reapplied to new sessions. A running worker
 is not mutated during a scope change; the scope takes effect at the next safe
 acquisition or reuse point.
 
+The object browser's scope selection is tab-local: it moves each bound query
+tab's scope, not the connection's own current schema/database. Operations that
+run on the shared live connection instead of a pool session — Quick Describe
+and Explain Plan — therefore resolve names in the requesting tab's scope
+(`DatabaseConnection::oracle_schema_for_scope()` /
+`mysql_database_for_scope()`, the same "tab scope, else connection" rule as
+`DbPoolSessionContext::for_scope()`). Explain applies that scope to the live
+session, so the next operation must reapply its own; Quick Describe never
+switches the session — it names the schema/database in the lookup itself,
+because MySQL 8 and MariaDB fold `DATABASE()` into a prepared
+`INFORMATION_SCHEMA` statement at prepare time and a cached one would keep
+answering for the database the session was in then.
+
 ## Read-only connections
 
 `ConnectionInfo::read_only` is a guard inside this process, not a server-side

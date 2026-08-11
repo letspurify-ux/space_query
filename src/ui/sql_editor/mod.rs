@@ -1035,10 +1035,13 @@ impl Drop for MySqlQueryCancelContext {
 }
 
 trait ExplainPlanBackend: Sync {
+    /// `scope` is the schema/database the requesting query tab has selected;
+    /// the plan must be built where the tab's own statements would run.
     fn get_explain_plan(
         &self,
         conn_guard: &mut crate::db::ConnectionLockGuard<'_>,
         sql: &str,
+        scope: Option<&str>,
         query_timeout: Option<Duration>,
         current_query_connection: &Arc<Mutex<Option<Arc<Connection>>>>,
         current_oracle_thin_cancel_context: &Arc<Mutex<Option<OracleThinCancelHandle>>>,
@@ -1798,6 +1801,7 @@ impl ExplainPlanBackend for OracleExplainPlanBackend {
         &self,
         conn_guard: &mut crate::db::ConnectionLockGuard<'_>,
         sql: &str,
+        scope: Option<&str>,
         query_timeout: Option<Duration>,
         current_query_connection: &Arc<Mutex<Option<Arc<Connection>>>>,
         current_oracle_thin_cancel_context: &Arc<Mutex<Option<OracleThinCancelHandle>>>,
@@ -1805,8 +1809,8 @@ impl ExplainPlanBackend for OracleExplainPlanBackend {
         _current_mysql_cancel_context: &Arc<Mutex<Option<MySqlQueryCancelContext>>>,
         cancel_flag: &Arc<Mutex<bool>>,
     ) -> Result<ExplainPlanData, String> {
-        let tracked_schema = conn_guard
-            .tracked_oracle_current_schema()
+        let plan_schema = conn_guard
+            .oracle_schema_for_scope(scope)
             .map(str::to_string);
         match conn_guard.require_live_db_connection() {
             Ok(DbConnection::Oracle(db_conn)) => {
@@ -1818,6 +1822,10 @@ impl ExplainPlanBackend for OracleExplainPlanBackend {
                 if load_mutex_bool(cancel_flag) {
                     let _ = db_conn.break_execution();
                 }
+                crate::db::DatabaseConnection::apply_tracked_oracle_current_schema_on_session(
+                    db_conn.as_ref(),
+                    plan_schema.as_deref(),
+                )?;
                 SqlEditorWidget::run_oracle_action_with_timeout(
                     db_conn,
                     query_timeout,
@@ -1835,7 +1843,7 @@ impl ExplainPlanBackend for OracleExplainPlanBackend {
                     .map_err(|_| "Oracle Thin connection lock was poisoned".to_string())?;
                 crate::db::DatabaseConnection::apply_tracked_oracle_thin_current_schema(
                     &mut session,
-                    tracked_schema.as_deref(),
+                    plan_schema.as_deref(),
                 )?;
                 session.reset_pending_cancel();
                 let cancel_handle = session.cancel_handle();
@@ -1863,6 +1871,7 @@ impl ExplainPlanBackend for MysqlExplainPlanBackend {
         &self,
         conn_guard: &mut crate::db::ConnectionLockGuard<'_>,
         sql: &str,
+        scope: Option<&str>,
         query_timeout: Option<Duration>,
         _current_query_connection: &Arc<Mutex<Option<Arc<Connection>>>>,
         _current_oracle_thin_cancel_context: &Arc<Mutex<Option<OracleThinCancelHandle>>>,
@@ -1872,6 +1881,7 @@ impl ExplainPlanBackend for MysqlExplainPlanBackend {
     ) -> Result<ExplainPlanData, String> {
         SqlEditorWidget::run_mysql_action_with_timeout(
             conn_guard,
+            scope,
             current_mysql_cancel_context,
             current_query_cancel_handle,
             cancel_flag,
@@ -4534,6 +4544,7 @@ impl SqlEditorWidget {
             app::awake();
             return;
         };
+        let tab_scope = self.connection_binding.snapshot().scope;
         let sender = self.ui_action_sender.clone();
         let progress_sender =
             Self::operation_progress_sender(self.progress_sender.clone(), operation_token);
@@ -4584,6 +4595,7 @@ impl SqlEditorWidget {
                     let result = SqlEditorWidget::get_explain_plan_for_locked_connection(
                         conn_guard,
                         &sql,
+                        tab_scope.as_deref(),
                         query_timeout,
                         &current_query_connection,
                         &current_oracle_thin_cancel_context,
@@ -4706,6 +4718,7 @@ impl SqlEditorWidget {
     fn get_explain_plan_for_locked_connection(
         mut conn_guard: crate::db::ConnectionLockGuard<'_>,
         sql: &str,
+        scope: Option<&str>,
         query_timeout: Option<Duration>,
         current_query_connection: &Arc<Mutex<Option<Arc<Connection>>>>,
         current_oracle_thin_cancel_context: &Arc<Mutex<Option<OracleThinCancelHandle>>>,
@@ -4716,6 +4729,7 @@ impl SqlEditorWidget {
         explain_plan_backend_for(conn_guard.db_type()).get_explain_plan(
             &mut conn_guard,
             sql,
+            scope,
             query_timeout,
             current_query_connection,
             current_oracle_thin_cancel_context,

@@ -1380,8 +1380,8 @@ fn primary_mysql_actions_reselect_global_database_before_use() {
     let helper = &execution_content[start..end];
 
     assert!(
-        helper.contains("conn_guard.apply_tracked_mysql_current_database()?"),
-        "Primary MySQL/MariaDB actions should reselect the tracked global database before running"
+        helper.contains("conn_guard.apply_mysql_current_database_for_scope(scope)?"),
+        "Primary MySQL/MariaDB actions should select the requesting tab's database before running"
     );
 
     let start = connection_content
@@ -1394,8 +1394,9 @@ fn primary_mysql_actions_reselect_global_database_before_use() {
     let helper = &connection_content[start..end];
 
     assert!(
-        helper.contains("self.info.service_name.trim().to_string()"),
-        "MySQL current database helper should read the tracked global database"
+        helper.contains("self.mysql_database_for_scope(scope).to_string()")
+            && helper.contains("unwrap_or_else(|| self.info.service_name.trim())"),
+        "MySQL current database helper should prefer the tab's scope over the tracked global database"
     );
     assert!(
         helper.contains(".select_db(target_database.as_str())")

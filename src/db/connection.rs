@@ -5602,7 +5602,19 @@ impl DatabaseConnection {
     }
 
     pub fn apply_tracked_oracle_current_schema(&self, conn: &Connection) -> Result<(), String> {
-        match Self::apply_oracle_current_schema(conn, self.oracle_current_schema.as_deref()) {
+        Self::apply_tracked_oracle_current_schema_on_session(
+            conn,
+            self.oracle_current_schema.as_deref(),
+        )
+    }
+
+    /// Tracked-schema variant of `apply_oracle_current_schema`, the OCI twin of
+    /// [`Self::apply_tracked_oracle_thin_current_schema`].
+    pub(crate) fn apply_tracked_oracle_current_schema_on_session(
+        conn: &Connection,
+        schema: Option<&str>,
+    ) -> Result<(), String> {
+        match Self::apply_oracle_current_schema(conn, schema) {
             Err(message) if Self::oracle_missing_current_schema_error(&message) => {
                 // The tracked schema's user was dropped. The schema setting is
                 // only a name-resolution namespace and the session itself is
@@ -5613,13 +5625,22 @@ impl DatabaseConnection {
                     "oracle pool session",
                     &format!(
                         "Tracked Oracle current schema {:?} is not available; keeping the session without re-applying it",
-                        self.oracle_current_schema.as_deref().unwrap_or_default()
+                        schema.unwrap_or_default()
                     ),
                 );
                 Ok(())
             }
             other => other,
         }
+    }
+
+    /// The schema an operation runs under: the tab's selected scope when it
+    /// has one, otherwise this connection's tracked schema.
+    pub fn oracle_schema_for_scope<'a>(&'a self, scope: Option<&'a str>) -> Option<&'a str> {
+        scope
+            .map(str::trim)
+            .filter(|scope| !scope.is_empty())
+            .or(self.oracle_current_schema.as_deref())
     }
 
     pub(crate) fn oracle_missing_current_schema_error(message: &str) -> bool {
@@ -5631,10 +5652,22 @@ impl DatabaseConnection {
     }
 
     pub fn apply_tracked_mysql_current_database(&mut self) -> Result<(), String> {
+        self.apply_mysql_current_database_for_scope(None)
+    }
+
+    /// Point the live session at the database a tab-initiated operation must
+    /// run in. A query tab carries its own selected database, so the tab's
+    /// scope wins over the connection's tracked one. Applying it on every such
+    /// operation is also what keeps the shared live session honest: the next
+    /// operation re-applies its own scope instead of inheriting this one.
+    pub fn apply_mysql_current_database_for_scope(
+        &mut self,
+        scope: Option<&str>,
+    ) -> Result<(), String> {
         self.ensure_connected_mysql_family()?;
 
         let db_type = self.info.db_type;
-        let target_database = self.info.service_name.trim().to_string();
+        let target_database = self.mysql_database_for_scope(scope).to_string();
         let advanced = self.info.advanced.clone();
         let Some(conn) = self.get_mysql_connection_mut() else {
             return Err(self.expected_connection_missing_message());
@@ -5648,6 +5681,16 @@ impl DatabaseConnection {
         conn.select_db(target_database.as_str())
             .map_err(|err| err.to_string())?;
         Self::apply_mysql_connection_encoding_with_settings_for_db_type(conn, &advanced, db_type)
+    }
+
+    /// The database an operation runs in: the tab's selected scope when it has
+    /// one, otherwise this connection's tracked database. Same rule as
+    /// [`Self::oracle_schema_for_scope`] and `DbPoolSessionContext::for_scope`.
+    pub fn mysql_database_for_scope<'a>(&'a self, scope: Option<&'a str>) -> &'a str {
+        scope
+            .map(str::trim)
+            .filter(|scope| !scope.is_empty())
+            .unwrap_or_else(|| self.info.service_name.trim())
     }
 
     pub fn sync_mysql_current_database_name(&mut self) -> Result<String, String> {
@@ -9120,6 +9163,48 @@ mod tests {
         assert!(mysql[0].contains("STATE = 'ACTIVE'"));
         assert!(mysql[1].contains("@@in_transaction"));
         assert!(mysql.last().unwrap().contains("innodb_trx"));
+    }
+
+    // A query tab browses its own database/schema (the object browser's scope
+    // selection is tab-local), so every tab-initiated operation — quick
+    // describe, explain plan — must resolve names there and not in whatever
+    // the connection was opened with.
+    #[test]
+    fn mysql_operation_database_prefers_the_tabs_scope() {
+        let mut connection = DatabaseConnection::new();
+        connection.info.service_name = "connection_db".to_string();
+
+        assert_eq!(
+            connection.mysql_database_for_scope(Some("tab_db")),
+            "tab_db"
+        );
+        assert_eq!(connection.mysql_database_for_scope(None), "connection_db");
+        assert_eq!(
+            connection.mysql_database_for_scope(Some("   ")),
+            "connection_db"
+        );
+    }
+
+    #[test]
+    fn oracle_operation_schema_prefers_the_tabs_scope() {
+        let mut connection = DatabaseConnection::new();
+        connection.set_tracked_oracle_current_schema(Some("CONNECTION_SCHEMA".to_string()));
+
+        assert_eq!(
+            connection.oracle_schema_for_scope(Some("TAB_SCHEMA")),
+            Some("TAB_SCHEMA")
+        );
+        assert_eq!(
+            connection.oracle_schema_for_scope(None),
+            Some("CONNECTION_SCHEMA")
+        );
+        assert_eq!(
+            connection.oracle_schema_for_scope(Some("   ")),
+            Some("CONNECTION_SCHEMA")
+        );
+
+        connection.clear_tracked_oracle_current_schema();
+        assert_eq!(connection.oracle_schema_for_scope(None), None);
     }
 
     #[test]

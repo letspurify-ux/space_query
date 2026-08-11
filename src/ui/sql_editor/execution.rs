@@ -23961,6 +23961,7 @@ impl SqlEditorWidget {
 
     pub(super) fn run_mysql_action_with_timeout<T, F>(
         conn_guard: &mut crate::db::DatabaseConnection,
+        scope: Option<&str>,
         current_mysql_cancel_context: &Arc<Mutex<Option<MySqlQueryCancelContext>>>,
         current_query_cancel_handle: &Arc<Mutex<Option<QueryCancelHandle>>>,
         cancel_flag: &Arc<Mutex<bool>>,
@@ -23971,7 +23972,7 @@ impl SqlEditorWidget {
     where
         F: FnOnce(&mut mysql::Conn) -> Result<T, MysqlError>,
     {
-        conn_guard.apply_tracked_mysql_current_database()?;
+        conn_guard.apply_mysql_current_database_for_scope(scope)?;
         let db_type = conn_guard.db_type();
 
         let connection_id = match conn_guard.get_mysql_connection_mut() {
@@ -40603,5 +40604,262 @@ mod select_report_transform_tests {
             transformed.last(),
             Some(&vec!["".to_string(), "total".to_string(), "23".to_string()])
         );
+    }
+}
+
+/// The object browser's database/schema selection is tab-local: it moves the
+/// query tab's scope, not the connection's own current database or schema. So
+/// every tab-initiated lookup — quick describe (Ctrl+Q) and explain plan (F6) —
+/// has to resolve names in the tab's scope. These probes fail against a server
+/// if either feature falls back to the database or schema the connection was
+/// opened with.
+#[cfg(test)]
+mod tab_scope_live_tests {
+    use super::{lock_connection_with_activity, SqlEditorWidget};
+    use crate::db::{ConnectionInfo, DatabaseConnection, DatabaseType, OracleDriverMode};
+    use crate::ui::explain_plan::ExplainPlanData;
+    use crate::ui::sql_editor::QuickDescribeData;
+    use mysql::prelude::Queryable;
+    use std::env;
+    use std::sync::{Arc, Mutex};
+
+    const PROBE_DATABASE: &str = "sq_tab_scope_probe";
+    const PROBE_TABLE: &str = "sq_tab_scope_probe_t";
+    /// Owned by SYS, reachable for the test user, and — unlike DUAL — with no
+    /// public synonym, so it only resolves when the schema really is SYS.
+    const ORACLE_PROBE_TABLE: &str = "OBJ$";
+    const ORACLE_PROBE_SCHEMA: &str = "SYS";
+
+    fn describe(
+        connection: &crate::db::SharedConnection,
+        object_name: &str,
+        scope: Option<&str>,
+    ) -> Result<QuickDescribeData, String> {
+        let mut guard = lock_connection_with_activity(connection, "tab scope probe".to_string());
+        SqlEditorWidget::describe_object_for_current_db(&mut guard, object_name, None, scope)
+    }
+
+    fn explain(
+        connection: &crate::db::SharedConnection,
+        sql: &str,
+        scope: Option<&str>,
+    ) -> Result<ExplainPlanData, String> {
+        let guard = lock_connection_with_activity(connection, "tab scope probe".to_string());
+        SqlEditorWidget::get_explain_plan_for_locked_connection(
+            guard,
+            sql,
+            scope,
+            None,
+            &Arc::new(Mutex::new(None)),
+            &Arc::new(Mutex::new(None)),
+            &Arc::new(Mutex::new(None)),
+            &Arc::new(Mutex::new(None)),
+            &Arc::new(Mutex::new(false)),
+        )
+    }
+
+    fn mysql_test_env(name: &str) -> Option<String> {
+        env::var(name).ok().filter(|value| !value.trim().is_empty())
+    }
+
+    fn mysql_probe_connection(db_type: DatabaseType) -> Option<(DatabaseConnection, String)> {
+        let host = mysql_test_env("SPACE_QUERY_TEST_MYSQL_HOST")?;
+        let database = mysql_test_env("SPACE_QUERY_TEST_MYSQL_DATABASE")?;
+        let user = mysql_test_env("SPACE_QUERY_TEST_MYSQL_USER")?;
+        let password = mysql_test_env("SPACE_QUERY_TEST_MYSQL_PASSWORD")?;
+        let port = mysql_test_env("SPACE_QUERY_TEST_MYSQL_PORT")
+            .and_then(|value| value.parse::<u16>().ok())
+            .unwrap_or(3306);
+
+        let mut connection = DatabaseConnection::new();
+        connection
+            .connect(ConnectionInfo::new_with_type(
+                "TAB_SCOPE_PROBE",
+                &user,
+                &password,
+                &host,
+                port,
+                &database,
+                db_type,
+            ))
+            .expect("MySQL/MariaDB tab scope probe should connect");
+        Some((connection, database))
+    }
+
+    fn oracle_probe_connection(driver_mode: OracleDriverMode) -> Option<DatabaseConnection> {
+        let user = env::var("ORACLE_TEST_USERNAME")
+            .ok()
+            .filter(|value| !value.trim().is_empty())?;
+        let password = env::var("ORACLE_TEST_PASSWORD")
+            .ok()
+            .filter(|value| !value.trim().is_empty())?;
+        let service_name = env::var("ORACLE_TEST_SERVICE_NAME")
+            .ok()
+            .filter(|value| !value.trim().is_empty())?;
+        let host = env::var("ORACLE_TEST_HOST").unwrap_or_else(|_| "127.0.0.1".to_string());
+        let port = env::var("ORACLE_TEST_PORT")
+            .ok()
+            .and_then(|value| value.parse::<u16>().ok())
+            .unwrap_or(1521);
+
+        let mut info = ConnectionInfo::new_with_type(
+            "TAB_SCOPE_PROBE",
+            &user,
+            &password,
+            &host,
+            port,
+            &service_name,
+            DatabaseType::Oracle,
+        );
+        info.advanced.oracle_driver_mode = driver_mode;
+        let mut connection = DatabaseConnection::new();
+        connection
+            .connect(info)
+            .expect("Oracle tab scope probe should connect");
+        Some(connection)
+    }
+
+    fn assert_mysql_tab_scope_governs_describe_and_explain(db_type: DatabaseType) {
+        let Some((mut connection, connection_database)) = mysql_probe_connection(db_type) else {
+            eprintln!("skipping: SPACE_QUERY_TEST_MYSQL_* environment variables are not set");
+            return;
+        };
+        {
+            let conn = connection
+                .get_mysql_connection_mut()
+                .expect("probe connection should be live");
+            for statement in [
+                format!("DROP DATABASE IF EXISTS {PROBE_DATABASE}"),
+                format!("CREATE DATABASE {PROBE_DATABASE}"),
+                format!("CREATE TABLE {PROBE_DATABASE}.{PROBE_TABLE} (id INT PRIMARY KEY)"),
+            ] {
+                conn.query_drop(statement.as_str())
+                    .unwrap_or_else(|err| panic!("probe setup ({statement}): {err}"));
+            }
+        }
+
+        let connection: crate::db::SharedConnection = Arc::new(Mutex::new(connection));
+        let select_probe = format!("SELECT * FROM {PROBE_TABLE}");
+
+        // The table exists only in the other database, so the connection's own
+        // database must not find it.
+        assert!(
+            describe(&connection, PROBE_TABLE, None).is_err(),
+            "quick describe found {PROBE_TABLE} in the connection database {connection_database}"
+        );
+        assert!(
+            explain(&connection, &select_probe, None).is_err(),
+            "explain plan resolved {PROBE_TABLE} in the connection database {connection_database}"
+        );
+
+        match describe(&connection, PROBE_TABLE, Some(PROBE_DATABASE)) {
+            Ok(QuickDescribeData::TableColumns(columns)) => assert!(
+                columns
+                    .iter()
+                    .any(|column| column.name.eq_ignore_ascii_case("id")),
+                "quick describe of the tab's database returned {columns:?}"
+            ),
+            Ok(QuickDescribeData::Text { title, .. }) => {
+                panic!("quick describe of the tab's database returned text: {title}")
+            }
+            Err(message) => panic!("quick describe of the tab's database failed: {message}"),
+        }
+
+        match explain(&connection, &select_probe, Some(PROBE_DATABASE)) {
+            Ok(ExplainPlanData::Flat { rows, .. }) => {
+                assert!(
+                    !rows.is_empty(),
+                    "explain of the tab's database had no rows"
+                );
+            }
+            other => panic!("explain of the tab's database returned {other:?}"),
+        }
+
+        // A scoped operation must not leave the shared live session pointing at
+        // the tab's database: the next unscoped one re-applies the connection's.
+        {
+            let mut guard =
+                lock_connection_with_activity(&connection, "tab scope probe".to_string());
+            guard
+                .apply_tracked_mysql_current_database()
+                .expect("connection database should re-apply");
+            let current: Option<String> = guard
+                .get_mysql_connection_mut()
+                .expect("probe connection should be live")
+                .query_first("SELECT DATABASE()")
+                .expect("read current database");
+            assert_eq!(current.as_deref(), Some(connection_database.as_str()));
+            let _ = guard
+                .get_mysql_connection_mut()
+                .expect("probe connection should be live")
+                .query_drop(format!("DROP DATABASE IF EXISTS {PROBE_DATABASE}"));
+        }
+    }
+
+    fn assert_oracle_tab_scope_governs_describe_and_explain(driver_mode: OracleDriverMode) {
+        let Some(connection) = oracle_probe_connection(driver_mode) else {
+            eprintln!("skipping: ORACLE_TEST_* environment variables are not set");
+            return;
+        };
+        let connection: crate::db::SharedConnection = Arc::new(Mutex::new(connection));
+        let select_probe = format!("SELECT * FROM {ORACLE_PROBE_TABLE}");
+
+        // Unscoped first: the explain below moves the live session's schema,
+        // which is exactly the point of the fix.
+        assert!(
+            describe(&connection, ORACLE_PROBE_TABLE, None).is_err(),
+            "quick describe found {ORACLE_PROBE_TABLE} in the login schema"
+        );
+        assert!(
+            explain(&connection, &select_probe, None).is_err(),
+            "explain plan resolved {ORACLE_PROBE_TABLE} in the login schema"
+        );
+
+        match describe(&connection, ORACLE_PROBE_TABLE, Some(ORACLE_PROBE_SCHEMA)) {
+            Ok(QuickDescribeData::TableColumns(columns)) => {
+                assert!(
+                    !columns.is_empty(),
+                    "quick describe of the tab's schema returned no columns"
+                );
+            }
+            Ok(QuickDescribeData::Text { title, .. }) => {
+                panic!("quick describe of the tab's schema returned text: {title}")
+            }
+            Err(message) => panic!("quick describe of the tab's schema failed: {message}"),
+        }
+
+        match explain(&connection, &select_probe, Some(ORACLE_PROBE_SCHEMA)) {
+            Ok(ExplainPlanData::Tree(nodes)) => {
+                assert!(
+                    !nodes.is_empty(),
+                    "explain of the tab's schema had no steps"
+                );
+            }
+            other => panic!("explain of the tab's schema returned {other:?}"),
+        }
+    }
+
+    #[test]
+    #[ignore = "requires local MySQL test database via SPACE_QUERY_TEST_MYSQL_* env vars"]
+    fn mysql_tab_scope_governs_describe_and_explain() {
+        assert_mysql_tab_scope_governs_describe_and_explain(DatabaseType::MySQL);
+    }
+
+    #[test]
+    #[ignore = "requires local MariaDB test database via SPACE_QUERY_TEST_MYSQL_* env vars"]
+    fn mariadb_tab_scope_governs_describe_and_explain() {
+        assert_mysql_tab_scope_governs_describe_and_explain(DatabaseType::MariaDB);
+    }
+
+    #[test]
+    #[ignore = "requires local Oracle database via ORACLE_TEST_* env vars"]
+    fn oracle_thin_tab_scope_governs_describe_and_explain() {
+        assert_oracle_tab_scope_governs_describe_and_explain(OracleDriverMode::Thin);
+    }
+
+    #[test]
+    #[ignore = "requires local Oracle database and an Oracle client via ORACLE_TEST_* env vars"]
+    fn oracle_oci_tab_scope_governs_describe_and_explain() {
+        assert_oracle_tab_scope_governs_describe_and_explain(OracleDriverMode::Oci);
     }
 }
