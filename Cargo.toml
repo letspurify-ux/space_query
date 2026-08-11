@@ -15,6 +15,173 @@ name = "space_query"
 path = "src/main.rs"
 test = false
 
+# The verification harnesses in `src/bin` are programs, not test suites: they
+# are run by hand as `cargo run --bin <name>`, need a live database or a real
+# FLTK event loop, and report through their own exit codes. None of them
+# declares a `#[test]`, so the test target Cargo generates for each one only
+# ever prints "running 0 tests" — while still paying the full link and
+# first-run cost of a fresh binary. Turning those empty harnesses off keeps
+# `cargo test` on the code that actually has tests. `cargo run --bin` is
+# unaffected.
+#
+# `oracle_compare_test_all` is the exception: its tests are hermetic, so it
+# keeps the default `test = true`.
+
+[[bin]]
+name = "capture_feature_tour"
+path = "src/bin/capture_feature_tour.rs"
+test = false
+
+[[bin]]
+name = "mysql_fixture_snapshot"
+path = "src/bin/mysql_fixture_snapshot.rs"
+test = false
+
+[[bin]]
+name = "tns_thin_probe"
+path = "src/bin/tns_thin_probe.rs"
+test = false
+
+[[bin]]
+name = "verify_activity_cancel_live"
+path = "src/bin/verify_activity_cancel_live.rs"
+test = false
+
+[[bin]]
+name = "verify_auto_commit_live"
+path = "src/bin/verify_auto_commit_live.rs"
+test = false
+
+[[bin]]
+name = "verify_bind_prompt_live"
+path = "src/bin/verify_bind_prompt_live.rs"
+test = false
+
+[[bin]]
+name = "verify_bind_prompt_ui"
+path = "src/bin/verify_bind_prompt_ui.rs"
+test = false
+
+[[bin]]
+name = "verify_column_layout_ui"
+path = "src/bin/verify_column_layout_ui.rs"
+test = false
+
+[[bin]]
+name = "verify_commit_close_live"
+path = "src/bin/verify_commit_close_live.rs"
+test = false
+
+[[bin]]
+name = "verify_ddl_transform_live"
+path = "src/bin/verify_ddl_transform_live.rs"
+test = false
+
+[[bin]]
+name = "verify_derived_table_wrap"
+path = "src/bin/verify_derived_table_wrap.rs"
+test = false
+
+[[bin]]
+name = "verify_editor_convenience_ui"
+path = "src/bin/verify_editor_convenience_ui.rs"
+test = false
+
+[[bin]]
+name = "verify_explain_plan_live"
+path = "src/bin/verify_explain_plan_live.rs"
+test = false
+
+[[bin]]
+name = "verify_grid_copy_csv"
+path = "src/bin/verify_grid_copy_csv.rs"
+test = false
+
+[[bin]]
+name = "verify_grid_features_live"
+path = "src/bin/verify_grid_features_live.rs"
+test = false
+
+[[bin]]
+name = "verify_grid_keyboard_selection"
+path = "src/bin/verify_grid_keyboard_selection.rs"
+test = false
+
+[[bin]]
+name = "verify_grid_save_live"
+path = "src/bin/verify_grid_save_live.rs"
+test = false
+
+[[bin]]
+name = "verify_grid_shortcut_leak"
+path = "src/bin/verify_grid_shortcut_leak.rs"
+test = false
+
+[[bin]]
+name = "verify_grid_sql_export"
+path = "src/bin/verify_grid_sql_export.rs"
+test = false
+
+[[bin]]
+name = "verify_grid_sql_export_live"
+path = "src/bin/verify_grid_sql_export_live.rs"
+test = false
+
+[[bin]]
+name = "verify_ime_minimal"
+path = "src/bin/verify_ime_minimal.rs"
+test = false
+
+[[bin]]
+name = "verify_import_live"
+path = "src/bin/verify_import_live.rs"
+test = false
+
+[[bin]]
+name = "verify_import_ui"
+path = "src/bin/verify_import_ui.rs"
+test = false
+
+[[bin]]
+name = "verify_object_export_live"
+path = "src/bin/verify_object_export_live.rs"
+test = false
+
+[[bin]]
+name = "verify_proc_exec_live"
+path = "src/bin/verify_proc_exec_live.rs"
+test = false
+
+[[bin]]
+name = "verify_read_only_live"
+path = "src/bin/verify_read_only_live.rs"
+test = false
+
+[[bin]]
+name = "verify_result_export"
+path = "src/bin/verify_result_export.rs"
+test = false
+
+[[bin]]
+name = "verify_result_export_ui"
+path = "src/bin/verify_result_export_ui.rs"
+test = false
+
+[[bin]]
+name = "verify_transaction_mode_live"
+path = "src/bin/verify_transaction_mode_live.rs"
+test = false
+
+[[bin]]
+name = "verify_value_edit_live"
+path = "src/bin/verify_value_edit_live.rs"
+test = false
+
+[[bin]]
+name = "verify_value_viewer_ui"
+path = "src/bin/verify_value_viewer_ui.rs"
+test = false
+
 [dependencies]
 fltk = { version = "1.5", features = ["no-pango"] }
 oracle = "0.6"
