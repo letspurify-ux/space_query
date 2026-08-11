@@ -52,6 +52,11 @@
 //       manual commit still has a transaction open - in both directions.
 //   S27 that same mutation over uncommitted work: it must neither resolve nor
 //       discard the user's work.
+//   S31 a pin this database cannot express (what a tab bound to another
+//       database keeps) must not brick the tab: every isolation/access pair
+//       still reads, and still writes exactly when its access mode allows it.
+//   S32 the pin survives a change of the tab's scope (the object browser's
+//       database/schema selection), which re-applies the session context.
 //
 // Usage: verify_transaction_mode_live <thin|oci|mysql|mariadb|all>
 
@@ -344,6 +349,32 @@ impl Harness {
             db_type,
             mode,
             "Updating transaction mode",
+        );
+        format!("{outcome:?}")
+    }
+
+    /// A scope change the way the GUI makes one: the object browser sets the
+    /// tab's binding scope AND pushes it onto the tab's retained session
+    /// (`synchronize_scope_for_connection` + `apply_retained_scope_update`).
+    /// Driving only the binding half would leave a session the tab is already
+    /// holding on the old database/schema.
+    fn change_tab_scope(&mut self, scope: Option<&str>) -> String {
+        self.editor.set_tab_scope(scope.map(str::to_string));
+        let (db_type, connection_generation, pool_context_epoch, advanced) = {
+            let guard = self.shared.lock().unwrap_or_else(|p| p.into_inner());
+            (
+                guard.db_type(),
+                guard.connection_generation(),
+                guard.pool_context_epoch(),
+                guard.get_info().advanced.clone(),
+            )
+        };
+        let outcome = self.editor.apply_current_scope_to_retained_session(
+            connection_generation,
+            pool_context_epoch,
+            db_type,
+            scope.unwrap_or(""),
+            &advanced,
         );
         format!("{outcome:?}")
     }
@@ -2222,6 +2253,191 @@ fn run_scenarios(target: Target, h: &mut Harness) -> Result<(), String> {
     );
     h.run("ROLLBACK")?;
 
+    // ---- S31: a pin this database cannot express ---------------------------
+    // A tab keeps its pinned mode when it is bound to another database: a tab
+    // whose connection went away is bound to the one selected in the object
+    // browser on its next execution, and the pin is not part of what that
+    // rebinding resets. The isolation catalogs differ per family, so a MySQL
+    // tab pinned to Repeatable read can end up carrying a mode Oracle has no
+    // statement for. Running it anyway fails EVERY statement on that tab
+    // ("Oracle does not support ..."), while the toolbar — whose list only
+    // holds this database's levels — shows Default and cannot even send a
+    // change event to clear it: a tab the user cannot repair. So whatever a
+    // tab ends up pinned to, what it really runs must be a mode this database
+    // can express, the tab must keep working, and a READ ONLY pin — the one
+    // half every family can express — must still be kept.
+    println!("  --- S31 a pin this database cannot express does not brick the tab ---");
+    for isolation in [
+        TransactionIsolation::Default,
+        TransactionIsolation::ReadUncommitted,
+        TransactionIsolation::ReadCommitted,
+        TransactionIsolation::RepeatableRead,
+        TransactionIsolation::Serializable,
+    ] {
+        for access in [
+            TransactionAccessMode::ReadWrite,
+            TransactionAccessMode::ReadOnly,
+        ] {
+            h.editor.clear_tab_transaction_mode_override();
+            h.run("ROLLBACK")?;
+            let _ = h.editor.discard_pooled_session_for_close();
+            let pinned = TransactionMode::new(isolation, access);
+            let foreign = DatabaseConnection::transaction_mode_selection_error(db_type, pinned)
+                .map_or_else(String::new, |error| {
+                    format!(" (not expressible here: {error})")
+                });
+            h.editor.set_tab_transaction_mode(pinned);
+            let label = format!("{} + {}", isolation.label(), access.label());
+            let capture = h.run("SELECT V FROM SQ_TM_T")?;
+            h.check(
+                &format!("S31 the tab still reads while pinned to {label}"),
+                capture.results.first().is_some_and(|result| result.success),
+                format!(
+                    "select result: {:?}{foreign}",
+                    capture
+                        .results
+                        .first()
+                        .map(|r| (r.success, r.message.clone()))
+                ),
+            );
+            let capture = h.run("INSERT INTO SQ_TM_T VALUES (31)")?;
+            let wrote = capture.results.first().is_some_and(|result| result.success);
+            let expected_write = access == TransactionAccessMode::ReadWrite;
+            h.check(
+                &format!("S31 pinned to {label} the tab writes exactly when it may"),
+                wrote == expected_write,
+                format!(
+                    "write allowed = {wrote}, expected {expected_write}; result: {:?}{foreign}",
+                    capture
+                        .results
+                        .first()
+                        .map(|r| (r.success, r.message.clone()))
+                ),
+            );
+            h.run("ROLLBACK")?;
+        }
+    }
+    h.editor.clear_tab_transaction_mode_override();
+    let _ = h.editor.discard_pooled_session_for_close();
+    let leaked = h.select_scalar("SELECT COUNT(*) FROM SQ_TM_T WHERE V = 31")?;
+    h.check(
+        "S31 no row survived the pinned writes",
+        leaked.trim() == "0",
+        format!("COUNT(*) WHERE V = 31 = {leaked}"),
+    );
+    h.run("ROLLBACK")?;
+
+    // ---- S32: the pin survives a change of the tab's scope ------------------
+    // Selecting another database/schema in the object browser re-applies the
+    // tab's session context before the next statement runs, and that path has
+    // already overwritten the tab's mode once (the pre-action scope recheck
+    // used to re-apply the CONNECTION default). Change the scope under a pin
+    // and the pin must still be the thing that governs the next statement —
+    // and the release must still work in the new scope, so the refusal cannot
+    // be the scope's own doing.
+    println!("  --- S32 the tab's pinned mode survives a scope change ---");
+    h.editor.clear_tab_transaction_mode_override();
+    h.run("ROLLBACK")?;
+    let base_scope = base_scope(target);
+    let qualified_table = format!("{base_scope}.SQ_TM_T");
+    let scratch_scope = "SQ_TM_SCOPE";
+    let create_scope = if target.is_oracle() {
+        format!("CREATE USER {scratch_scope} IDENTIFIED BY pw1")
+    } else {
+        format!("CREATE DATABASE {scratch_scope}")
+    };
+    let _ = h.run(&if target.is_oracle() {
+        format!("DROP USER {scratch_scope} CASCADE")
+    } else {
+        format!("DROP DATABASE IF EXISTS {scratch_scope}")
+    });
+    let capture = h.run(&create_scope)?;
+    if !capture.results.first().is_some_and(|result| result.success) {
+        return Err(format!(
+            "S32 could not create the scratch scope: {:?}",
+            capture.results.first().map(|r| r.message.clone())
+        ));
+    }
+    h.toolbar_transaction_mode(TransactionMode::new(
+        TransactionIsolation::Default,
+        TransactionAccessMode::ReadOnly,
+    ));
+    let scope_outcome = h.change_tab_scope(Some(scratch_scope));
+    let current_scope_sql = if target.is_oracle() {
+        "SELECT SYS_CONTEXT('USERENV', 'CURRENT_SCHEMA') FROM DUAL"
+    } else {
+        "SELECT DATABASE()"
+    };
+    let scope_now = h.select_scalar(current_scope_sql)?;
+    h.check(
+        "S32 the tab's session really moved to the new scope",
+        scope_now.trim().eq_ignore_ascii_case(scratch_scope),
+        format!("{current_scope_sql} = {scope_now:?} (scope change: {scope_outcome})"),
+    );
+    if !target.is_oracle() {
+        let read_only_var = if target == Target::MariaDb {
+            "SELECT @@tx_read_only"
+        } else {
+            "SELECT @@transaction_read_only"
+        };
+        let value = h.select_scalar(read_only_var)?;
+        h.check(
+            "S32 the session still carries the pin after the scope change",
+            matches!(value.trim(), "1" | "ON"),
+            format!("{read_only_var} = {value:?}"),
+        );
+    }
+    let capture = h.run(&format!("INSERT INTO {qualified_table} VALUES (32)"))?;
+    h.check(
+        "S32 the write in the new scope is still refused",
+        capture.results.first().is_some_and(|result| {
+            !result.success
+                && read_only_errors.iter().any(|needle| {
+                    result
+                        .message
+                        .to_ascii_lowercase()
+                        .contains(&needle.to_ascii_lowercase())
+                })
+        }),
+        format!(
+            "insert in the new scope: {:?}",
+            capture
+                .results
+                .first()
+                .map(|r| (r.success, r.message.clone()))
+        ),
+    );
+    h.run("ROLLBACK")?;
+    h.editor.clear_tab_transaction_mode_override();
+    let _ = h.editor.discard_pooled_session_for_close();
+    let capture = h.run(&format!("INSERT INTO {qualified_table} VALUES (32)"))?;
+    h.check(
+        "S32 the same write runs in the new scope once the pin is gone",
+        capture.results.first().is_some_and(|result| result.success),
+        format!(
+            "insert after unpinning: {:?}",
+            capture
+                .results
+                .first()
+                .map(|r| (r.success, r.message.clone()))
+        ),
+    );
+    h.run("ROLLBACK")?;
+    h.change_tab_scope(Some(&base_scope));
+    let _ = h.editor.discard_pooled_session_for_close();
+    let restored_scope = h.select_scalar(current_scope_sql)?;
+    h.check(
+        "S32 the tab is back in its own scope",
+        restored_scope.trim().eq_ignore_ascii_case(&base_scope),
+        format!("{current_scope_sql} = {restored_scope:?}"),
+    );
+    let _ = h.run(&if target.is_oracle() {
+        format!("DROP USER {scratch_scope} CASCADE")
+    } else {
+        format!("DROP DATABASE IF EXISTS {scratch_scope}")
+    });
+    h.run("ROLLBACK")?;
+
     {
         let mut guard = h.shared.lock().unwrap_or_else(|p| p.into_inner());
         guard
@@ -2284,6 +2500,18 @@ fn run_scenarios(target: Target, h: &mut Harness) -> Result<(), String> {
     }
 
     Ok(())
+}
+
+/// The database (MySQL family) or schema (Oracle) a tab on this target runs
+/// in with no scope selected — what a scope change moves away from, and what
+/// qualifies a table name while the tab is somewhere else.
+fn base_scope(target: Target) -> String {
+    let info = target.connection_info();
+    if target.is_oracle() {
+        info.username.to_uppercase()
+    } else {
+        info.service_name
+    }
 }
 
 /// Every isolation level the toolbar offers for this backend, minus `Default`

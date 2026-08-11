@@ -56,6 +56,8 @@
 //       COMMIT after it must land exactly the pre-savepoint half.
 //   S23 the tab's auto-commit pin and its transaction-mode pin are independent:
 //       both apply at once, and unpinning one leaves the other in force.
+//   S24 the pin survives a change of the tab's scope (the object browser's
+//       database/schema selection), which re-applies the session context.
 //
 // Usage: verify_auto_commit_live <thin|oci|mysql|mariadb|all>
 
@@ -350,6 +352,32 @@ impl Harness {
         format!("{outcome:?}")
     }
 
+    /// A scope change the way the GUI makes one: the object browser sets the
+    /// tab's binding scope AND pushes it onto the tab's retained session
+    /// (`synchronize_scope_for_connection` + `apply_retained_scope_update`).
+    /// Driving only the binding half would leave a session the tab is already
+    /// holding on the old database/schema.
+    fn change_tab_scope(&mut self, scope: Option<&str>) -> String {
+        self.editor.set_tab_scope(scope.map(str::to_string));
+        let (db_type, connection_generation, pool_context_epoch, advanced) = {
+            let guard = self.shared.lock().unwrap_or_else(|p| p.into_inner());
+            (
+                guard.db_type(),
+                guard.connection_generation(),
+                guard.pool_context_epoch(),
+                guard.get_info().advanced.clone(),
+            )
+        };
+        let outcome = self.editor.apply_current_scope_to_retained_session(
+            connection_generation,
+            pool_context_epoch,
+            db_type,
+            scope.unwrap_or(""),
+            &advanced,
+        );
+        format!("{outcome:?}")
+    }
+
     fn select_v(&mut self) -> Result<i64, String> {
         let capture = self.run("SELECT V FROM SQ_AC_T")?;
         // The row may carry a leading hidden ROWID column; V is the last cell.
@@ -367,6 +395,21 @@ impl Harness {
         cell.trim()
             .parse::<i64>()
             .map_err(|e| format!("SELECT V returned {cell:?}: {e}"))
+    }
+
+    fn select_scalar(&mut self, sql: &str) -> Result<String, String> {
+        let capture = self.run(sql)?;
+        let from_streamed = capture.rows.first().and_then(|row| row.last()).cloned();
+        let from_result = capture
+            .results
+            .iter()
+            .find(|r| r.is_select)
+            .and_then(|r| r.rows.first())
+            .and_then(|row| row.last())
+            .cloned();
+        from_streamed
+            .or(from_result)
+            .ok_or_else(|| format!("{sql} returned no rows"))
     }
 
     fn check(&mut self, label: &str, ok: bool, detail: String) {
@@ -1371,6 +1414,97 @@ fn run_scenarios(target: Target, h: &mut Harness) -> Result<(), String> {
     h.editor.sync_tab_auto_commit_with_global_setting(false);
     let _ = h.editor.discard_pooled_session_for_close();
 
+    // ---- S24: the pin survives a change of the tab's scope ----------------
+    // Selecting another database/schema in the object browser re-applies the
+    // tab's session context before the next statement runs, and the MySQL
+    // family re-prepares its pooled session there — autocommit included. The
+    // transaction-mode twin of this path has already lost a tab's pin once,
+    // so pin the tab, move it to another scope, and check the write that
+    // follows still commits by itself.
+    println!("  --- S24 the auto-commit pin survives a scope change ---");
+    h.set_connection_auto_commit(false)
+        .map_err(|e| format!("set_auto_commit(false): {e}"))?;
+    h.editor.sync_tab_auto_commit_with_global_setting(false);
+    let _ = h.editor.discard_pooled_session_for_close();
+    let base_scope = base_scope(target);
+    let qualified_table = format!("{base_scope}.SQ_AC_T");
+    let scratch_scope = "SQ_AC_SCOPE";
+    let _ = h.run(&if target.is_oracle() {
+        format!("DROP USER {scratch_scope} CASCADE")
+    } else {
+        format!("DROP DATABASE IF EXISTS {scratch_scope}")
+    });
+    let create_scope = if target.is_oracle() {
+        format!("CREATE USER {scratch_scope} IDENTIFIED BY pw1")
+    } else {
+        format!("CREATE DATABASE {scratch_scope}")
+    };
+    let capture = h.run(&create_scope)?;
+    if !capture.results.first().is_some_and(|result| result.success) {
+        return Err(format!(
+            "S24 could not create the scratch scope: {:?}",
+            capture.results.first().map(|r| r.message.clone())
+        ));
+    }
+    let before_scope_change = h.select_v()?;
+    let menu_outcome = h.menu_auto_commit(true);
+    let scope_outcome = h.change_tab_scope(Some(scratch_scope));
+    let current_scope_sql = if target.is_oracle() {
+        "SELECT SYS_CONTEXT('USERENV', 'CURRENT_SCHEMA') FROM DUAL"
+    } else {
+        "SELECT DATABASE()"
+    };
+    let scope_now = h.select_scalar(current_scope_sql)?;
+    h.check(
+        "S24 the tab's session really moved to the new scope",
+        scope_now.trim().eq_ignore_ascii_case(scratch_scope),
+        format!("{current_scope_sql} = {scope_now:?} (scope change: {scope_outcome})"),
+    );
+    h.check(
+        "S24 the tab is still pinned to auto-commit after the scope change",
+        h.editor.tab_auto_commit_override_value() == Some(true),
+        format!(
+            "override = {:?} (menu outcome: {menu_outcome})",
+            h.editor.tab_auto_commit_override_value()
+        ),
+    );
+    let capture = h.run(&format!("UPDATE {qualified_table} SET V = V + 1"))?;
+    h.check(
+        "S24 the write in the new scope ran",
+        capture.results.first().is_some_and(|result| result.success),
+        format!(
+            "update in the new scope: {:?}",
+            capture
+                .results
+                .first()
+                .map(|r| (r.success, r.message.clone()))
+        ),
+    );
+    h.run("ROLLBACK")?;
+    h.change_tab_scope(Some(&base_scope));
+    let after_scope_change = h.select_v()?;
+    h.check(
+        "S24 the write in the new scope was really auto-committed",
+        after_scope_change == before_scope_change + 1,
+        format!(
+            "V {before_scope_change} -> {after_scope_change} (expected {})",
+            before_scope_change + 1
+        ),
+    );
+    h.check(
+        "S24 the connection default is still manual",
+        !h.connection_auto_commit(),
+        "the tab pin reached the connection default".into(),
+    );
+    h.editor.sync_tab_auto_commit_with_global_setting(false);
+    let _ = h.editor.discard_pooled_session_for_close();
+    let _ = h.run(&if target.is_oracle() {
+        format!("DROP USER {scratch_scope} CASCADE")
+    } else {
+        format!("DROP DATABASE IF EXISTS {scratch_scope}")
+    });
+    h.run("ROLLBACK")?;
+
     // ---- S4 (Oracle): READ ONLY transaction vs piggybacked commit ---------
     if target.is_oracle() {
         println!("  --- S4 SET TRANSACTION READ ONLY under auto-commit ON ---");
@@ -1410,6 +1544,18 @@ fn run_scenarios(target: Target, h: &mut Harness) -> Result<(), String> {
     }
 
     Ok(())
+}
+
+/// The database (MySQL family) or schema (Oracle) a tab on this target runs
+/// in with no scope selected — what a scope change moves away from, and what
+/// qualifies a table name while the tab is somewhere else.
+fn base_scope(target: Target) -> String {
+    let info = target.connection_info();
+    if target.is_oracle() {
+        info.username.to_uppercase()
+    } else {
+        info.service_name
+    }
 }
 
 fn verify_mysql_probe_sql(target: Target) -> Result<Vec<String>, String> {

@@ -2957,9 +2957,33 @@ fn transaction_mode_state_has_a_single_source_of_truth() {
     // (connection default + tab override in one place).
     assert!(
         normalize(&execution).contains(&normalize(
-            "let selected_transaction_mode = SqlEditorWidget::transaction_mode_for_execution( conn_guard.transaction_mode(), &tab_transaction_mode_override, );"
+            "let selected_transaction_mode = SqlEditorWidget::transaction_mode_for_execution( conn_guard.db_type(), conn_guard.transaction_mode(), &tab_transaction_mode_override, );"
         )),
-        "execution startup must resolve the effective transaction mode via transaction_mode_for_execution"
+        "execution startup must resolve the effective transaction mode via transaction_mode_for_execution, for the database the tab is bound to"
+    );
+
+    // (3b) That resolver refuses to hand any caller a mode the bound database
+    // cannot express: a tab keeps its pin when it is bound to another
+    // database, and the isolation catalogs differ per family, so an
+    // unexpressible pin would fail every statement on the tab while the
+    // toolbar (whose list only holds this database's levels) showed something
+    // else. READ ONLY is the half every family can express, so the fallback
+    // gives up the isolation before it gives up the access mode.
+    let editor_mod_resolver_start = editor_mod
+        .find("pub(super) fn effective_transaction_mode(")
+        .expect("the shared transaction-mode resolver should exist");
+    let editor_mod_resolver_body = &editor_mod[editor_mod_resolver_start
+        ..editor_mod_resolver_start
+            + editor_mod[editor_mod_resolver_start..]
+                .find("\n    pub(super) fn transaction_mode_for_execution(")
+                .expect("the execution resolver should follow it")];
+    assert!(
+        editor_mod_resolver_body.contains("db_type: DatabaseType,")
+            && editor_mod_resolver_body.contains("transaction_mode_selection_error(db_type, mode)")
+            && editor_mod_resolver_body.contains(
+                "TransactionMode::new(TransactionIsolation::Default, effective.access_mode)"
+            ),
+        "the resolver must drop a mode this database cannot express, keeping the access mode"
     );
 
     // (4) Execution startup cross-checks the resolved mode against what the

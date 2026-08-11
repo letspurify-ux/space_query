@@ -3632,6 +3632,7 @@ impl AppState {
                     // Tab-scoped: the toolbar shows the ACTIVE tab's effective
                     // transaction mode (tab override over connection default).
                     crate::ui::sql_editor::SqlEditorWidget::effective_transaction_mode(
+                        guard.db_type(),
                         guard.transaction_mode(),
                         self.sql_editor.tab_transaction_mode_override_value(),
                     ),

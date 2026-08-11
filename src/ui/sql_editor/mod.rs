@@ -26,7 +26,7 @@ use crate::db::{
     RetainedSessionMutationOutcome, RetainedSessionPreflightAction,
     RetainedSessionPreflightDecision, RetainedSessionResolutionAction, RetainedSessionState,
     ScriptItem, SharedConnection, SharedDbSessionLease, TabConnectionBinding, TableColumnDetail,
-    TransactionMode, TransactionSessionState,
+    TransactionIsolation, TransactionMode, TransactionSessionState,
 };
 use crate::ui::constants::*;
 use crate::ui::explain_plan::{self, ExplainPlanData};
@@ -1631,11 +1631,12 @@ impl TransactionActionBackend for MysqlTransactionActionBackend {
             conn_guard.auto_commit(),
             tab_auto_commit_override,
         );
+        let db_type = conn_guard.db_type();
         let transaction_mode = SqlEditorWidget::transaction_mode_for_execution(
+            db_type,
             conn_guard.transaction_mode(),
             tab_transaction_mode_override,
         );
-        let db_type = conn_guard.db_type();
         let execution_scope = pooled_db_session
             .snapshot()
             .and_then(|snapshot| snapshot.current_scope().map(str::to_string));
@@ -2512,18 +2513,61 @@ impl SqlEditorWidget {
         store_mutex_transaction_mode_option(&self.tab_transaction_mode_override, None);
     }
 
+    /// The tab's scope (the object browser's selected database or schema),
+    /// which every execution applies to the session it runs on. Public so the
+    /// live verification harness can drive a scope change the way the object
+    /// browser does and check what it leaves on the tab's session.
+    pub fn set_tab_scope(&self, scope: Option<String>) -> u64 {
+        self.connection_binding.set_scope(scope)
+    }
+
+    /// The effective transaction mode of a tab: its pin over the connection's
+    /// default — but never a mode the database it is bound to cannot express.
+    ///
+    /// A tab keeps its pin when it is rebound to another database (a tab whose
+    /// connection went away is bound to the selected one on its next
+    /// execution), and the isolation catalogs differ per family: a MySQL tab
+    /// pinned to Repeatable read carries a mode Oracle has no statement for.
+    /// Resolving it anyway would fail every statement on that tab with
+    /// "Oracle does not support ..." while the toolbar — whose choice list
+    /// only holds this database's levels — showed Default and could not even
+    /// send a change event to clear it. So a pin this database cannot express
+    /// falls back to the connection default here, in the one place both the
+    /// toolbar and execution read.
     pub(super) fn effective_transaction_mode(
+        db_type: DatabaseType,
         connection_mode: TransactionMode,
         tab_transaction_mode_override: Option<TransactionMode>,
     ) -> TransactionMode {
-        tab_transaction_mode_override.unwrap_or(connection_mode)
+        let effective = tab_transaction_mode_override.unwrap_or(connection_mode);
+        let expressible = |mode: TransactionMode| {
+            crate::db::DatabaseConnection::transaction_mode_selection_error(db_type, mode).is_none()
+        };
+        if expressible(effective) {
+            return effective;
+        }
+        // Only the isolation is family-specific; READ ONLY is a promise every
+        // family can keep, and dropping it would quietly hand a tab the user
+        // pinned read-only back its write access. So give up the isolation
+        // first and keep the access mode.
+        let access_only =
+            TransactionMode::new(TransactionIsolation::Default, effective.access_mode);
+        if expressible(access_only) {
+            return access_only;
+        }
+        if expressible(connection_mode) {
+            return connection_mode;
+        }
+        TransactionMode::default()
     }
 
     pub(super) fn transaction_mode_for_execution(
+        db_type: DatabaseType,
         connection_mode: TransactionMode,
         tab_transaction_mode_override: &Arc<Mutex<Option<TransactionMode>>>,
     ) -> TransactionMode {
         Self::effective_transaction_mode(
+            db_type,
             connection_mode,
             load_mutex_transaction_mode_option(tab_transaction_mode_override),
         )

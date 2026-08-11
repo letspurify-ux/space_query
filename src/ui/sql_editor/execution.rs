@@ -917,6 +917,7 @@ impl ExecutionWorkerBackend for OracleExecutionWorkerBackend {
                 ),
                 // The tab's pinned transaction mode also survives CONNECT.
                 SqlEditorWidget::effective_transaction_mode(
+                    crate::db::DatabaseType::Oracle,
                     candidate.transaction_mode,
                     load_mutex_transaction_mode_option(tab_transaction_mode_override),
                 ),
@@ -9925,6 +9926,7 @@ impl SqlEditorWidget {
                     return;
                 }
                 let selected_transaction_mode = SqlEditorWidget::transaction_mode_for_execution(
+                    conn_guard.db_type(),
                     conn_guard.transaction_mode(),
                     &tab_transaction_mode_override,
                 );
@@ -11757,6 +11759,7 @@ impl SqlEditorWidget {
                                                 // connection.
                                                 let next_active_transaction_mode =
                                                     Self::effective_transaction_mode(
+                                                        crate::db::DatabaseType::Oracle,
                                                         next_transaction_mode,
                                                         load_mutex_transaction_mode_option(
                                                             &tab_transaction_mode_override,
@@ -18056,6 +18059,7 @@ impl SqlEditorWidget {
                                     // The tab's pinned transaction mode also
                                     // survives CONNECT.
                                     active_transaction_mode = Self::effective_transaction_mode(
+                                        crate::db::DatabaseType::Oracle,
                                         candidate.transaction_mode,
                                         tab_transaction_mode_override
                                             .and_then(load_mutex_transaction_mode_option),
@@ -33348,6 +33352,7 @@ mod mysql_batch_execution_regression_tests {
                     .lock()
                     .unwrap_or_else(|poisoned| poisoned.into_inner());
                 SqlEditorWidget::transaction_mode_for_execution(
+                    guard.db_type(),
                     guard.transaction_mode(),
                     &self.tab_transaction_mode_override,
                 )
