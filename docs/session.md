@@ -160,6 +160,58 @@ explain, object-browser Drop/Truncate, CSV import, and the grid's staged save.
 For a restriction the server enforces, use the connection's `READ ONLY`
 transaction access mode or an account without write privileges.
 
+## Teardown closes every session
+
+A session the app has finished with must be gone from the *server*, not merely
+gone from the app's own bookkeeping. Two things make that non-obvious:
+
+- A retained session belongs to a query tab, not to the pool, so the pool
+  cannot reclaim it. On the MySQL family it also keeps its pool alive, because
+  an outstanding `PooledConn` owns a clone of the pool — one forgotten lease
+  therefore holds every idle session in that pool open as well.
+- The pool-context cache holds a clone of the pool too, so an entry left behind
+  by a disconnect does the same thing on its own.
+
+The guarantee is anchored on the connection generation, which moves exactly
+when the physical connection or its pool is replaced or closed (connect,
+reconnect, disconnect, pool resize):
+
+- Generations come from a process-wide counter, so a generation identifies one
+  incarnation of one connection and no teardown can match another connection's
+  sessions.
+- `bump_connection_generation()` reclaims what the ended incarnation leaves
+  behind, on the connection-cleanup worker: it drops every stale cached pool
+  context and discards every session retained under the retired generation,
+  through the same `DbSessionLease::discard_physical` choke point every other
+  discard uses. No call site can opt out of it.
+- `DbSessionLeaseEntry` closes its session on `Drop`, so a lease slot that goes
+  away without being cleared — a tab that vanished rather than closed — cannot
+  leave its session behind either.
+- A pool session that was acquired but could not be handed over
+  (`discard_stale_session`) is discarded on every backend rather than returned
+  to the pool half-configured.
+
+`assert_connection_lifecycle_closes_every_server_session` proves this against a
+live database by counting the server's own sessions (`information_schema.processlist`
+/ `v$session`) around each event: discard, return-and-reuse, tab close, an
+orphaned lease, disconnect, reconnect, pool resize, a connection dropped without
+being disconnected, a connection attempt that is thrown away, and three
+connect/disconnect cycles. Each backend joins by
+handing the engine a connection and a census; the probe connects through an
+identity of its own (a database of its own on the MySQL family, a user of its
+own on Oracle) so the count sees this test's sessions and nobody else's.
+
+`verify_session_leak_live` does the same for the holders that only exist once a
+real query tab is running, which the lease-level engine cannot see: the
+lazy-fetch worker owns its session in its own frame rather than in the tab's
+lease slot, a cancelled statement leaves the session wherever the force close
+left it, and a statement still on the server when the connection goes away is
+owned by nothing the teardown can reach — only the stale sweep can retire that
+work and take its session with it. It also runs five tab open/close rounds,
+because a leak of one session per tab is invisible in a single pass. A script CONNECT's own connection is torn down by dropping the
+tab's binding, which a harness cannot do (it cannot destroy the FLTK widget), so
+that path is covered by the engine's drop-without-disconnect case instead.
+
 ## Verification
 
 ```sh
@@ -169,6 +221,16 @@ cargo test cancel --lib
 cargo test read_only --lib
 cargo test --test concurrency_multithread_guards
 cargo test --test db_dispatch_guards
+
+# Live, one database container at a time: every lifecycle event closes every
+# session, and a discarded session hands its pool slot back.
+cargo test --lib -- --ignored --exact \
+  db::connection::tests::mysql_connection_lifecycle_closes_every_server_session \
+  db::connection::tests::mysql_discarded_sessions_release_their_pool_slots
+# ... and the mariadb_ / oracle_oci_ / oracle_thin_ forms of the same two names.
+
+# Live, same container: no query-tab lifecycle event leaves a session open.
+cargo run --bin verify_session_leak_live <thin|oci|mysql|mariadb>
 
 # Live: a read-only connection refuses writes and the database is unchanged.
 cargo run --bin verify_read_only_live all

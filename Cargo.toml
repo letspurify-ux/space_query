@@ -158,6 +158,11 @@ path = "src/bin/verify_read_only_live.rs"
 test = false
 
 [[bin]]
+name = "verify_session_leak_live"
+path = "src/bin/verify_session_leak_live.rs"
+test = false
+
+[[bin]]
 name = "verify_result_export"
 path = "src/bin/verify_result_export.rs"
 test = false

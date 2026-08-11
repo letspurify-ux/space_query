@@ -3494,6 +3494,107 @@ fn discarded_db_sessions_release_their_pool_slots_structurally() {
         "every backend's discard must use its pool's accounting-correct API"
     );
 
+    // (4) A session that was acquired but could not be handed over is thrown
+    // away the same way on every backend. Two of the three used to fall
+    // through to a bare drop, which returns a half-configured session to a
+    // pool that may already be on its way out.
+    let stale_start = connection
+        .find("fn discard_stale_session(session: DbPoolSession)")
+        .expect("DbPoolSessionContext::discard_stale_session should exist");
+    let stale_end = connection[stale_start..]
+        .find("\n    }\n")
+        .map(|offset| stale_start + offset)
+        .expect("discard_stale_session should close");
+    let stale_body = &connection[stale_start..stale_end];
+    assert!(
+        stale_body.contains("discard_physical"),
+        "a stale pool session must be discarded through the shared choke point on every backend"
+    );
+
+    // (5) A retained session is the one session a pool cannot reclaim by
+    // itself, and it keeps its whole pool alive with it. Ending a connection
+    // incarnation must therefore release the sessions retained under it, and
+    // the generation that identifies the incarnation must be process-wide
+    // unique or one connection's teardown would match another's leases.
+    let bump_start = connection
+        .find("fn bump_connection_generation(&mut self)")
+        .expect("bump_connection_generation should exist");
+    let bump_end = connection[bump_start..]
+        .find("\n    }\n")
+        .map(|offset| bump_start + offset)
+        .expect("bump_connection_generation should close");
+    let bump_body = &connection[bump_start..bump_end];
+    assert!(
+        bump_body.contains("next_connection_generation()"),
+        "connection generations must come from the process-wide counter, so a generation \
+         identifies one incarnation of one connection"
+    );
+    assert!(
+        bump_body.contains("reclaim_retired_connection_sessions_in_background("),
+        "ending a connection incarnation must release the sessions retained under it"
+    );
+
+    let reclaim_start = connection
+        .find("fn reclaim_retired_connection_sessions_in_background(retired_generation: u64)")
+        .expect("the retired-connection reclaim should exist");
+    let reclaim_end = connection[reclaim_start..]
+        .find("\n}\n")
+        .map(|offset| reclaim_start + offset)
+        .expect("the retired-connection reclaim should close");
+    let reclaim_body = &connection[reclaim_start..reclaim_end];
+    assert!(
+        reclaim_body.contains("release_retained_sessions_for_retired_connection("),
+        "the reclaim must release the sessions retained under the retired generation"
+    );
+
+    // (6) Retiring a connection's resources must drop the cached pool context
+    // with them. The cache holds a clone of the pool, and a pool with a clone
+    // outstanding keeps its sessions: ODPI will not destroy an OCI session
+    // pool that is still referenced, and the MySQL pool keeps its idle
+    // connections. Dropping a connection nobody disconnected is a real path —
+    // it is how a script CONNECT's connection goes away.
+    let retire_start = connection
+        .find("fn retire_connection_resources_in_background(")
+        .expect("the connection resource retire should exist");
+    let retire_end = connection[retire_start..]
+        .find("\n    }\n")
+        .map(|offset| retire_start + offset)
+        .expect("the connection resource retire should close");
+    let retire_body = &connection[retire_start..retire_end];
+    assert!(
+        retire_body.contains("prune_stale_pool_session_context_cache()"),
+        "retiring a connection's resources must drop the cached pool context that clones its pool"
+    );
+
+    let connection_drop_start = connection
+        .find("impl Drop for DatabaseConnection {")
+        .expect("DatabaseConnection should own a Drop");
+    let connection_drop_end = connection[connection_drop_start..]
+        .find("\n}\n")
+        .map(|offset| connection_drop_start + offset)
+        .expect("DatabaseConnection's Drop should close");
+    let connection_drop = &connection[connection_drop_start..connection_drop_end];
+    assert!(
+        connection_drop.contains("reclaim_retired_connection_sessions_in_background(")
+            && connection_drop.contains("retire_connection_resources_in_background("),
+        "a dropped connection must release its retained sessions and retire its resources"
+    );
+
+    // And the release must find them, which means the one place a session
+    // becomes retained is the place that registers the slot.
+    let store_start = connection
+        .find("pub fn store_if_empty_with_retained_state_and_scope(")
+        .expect("the retain choke point should exist");
+    let store_end = connection[store_start..]
+        .find("\n    }\n")
+        .map(|offset| store_start + offset)
+        .expect("the retain choke point should close");
+    let store_body = &connection[store_start..store_end];
+    assert!(
+        store_body.contains("register_for_connection_teardown()"),
+        "retaining a session must register its slot, or a teardown cannot reclaim it"
+    );
+
     // The thin pool's discard-on-drop branch itself must decrement.
     let thin_pool = read_source("crates/tns-thin/src/pool.rs");
     let drop_start = thin_pool

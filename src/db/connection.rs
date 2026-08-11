@@ -81,6 +81,97 @@ impl Default for ConnectionAttemptPolicy {
 
 type ConnectionCleanupTask = Box<dyn FnOnce() + Send + 'static>;
 
+/// Connection incarnations are numbered process-wide, so a generation names
+/// one incarnation of one connection. Zero is reserved for "never connected".
+static NEXT_CONNECTION_GENERATION: AtomicU64 = AtomicU64::new(1);
+
+/// Every lease slot that has ever held a retained session, weakly.
+///
+/// A retained session is the one physical session no pool can reclaim on its
+/// own: the pool handed it out and the tab is holding it, so tearing the
+/// connection down does not close it -- and on the MySQL family it does not
+/// close the pool's IDLE sessions either, because the outstanding `PooledConn`
+/// owns a clone of the pool. This registry is what lets the teardown paths
+/// find those leases without every owner having to remember to hand them back.
+static RETAINED_POOL_SESSION_LEASES: OnceLock<
+    Mutex<Vec<Weak<Mutex<Option<DbSessionLeaseEntry>>>>>,
+> = OnceLock::new();
+
+fn next_connection_generation() -> u64 {
+    NEXT_CONNECTION_GENERATION.fetch_add(1, Ordering::Relaxed)
+}
+
+fn lock_retained_pool_session_leases(
+) -> MutexGuard<'static, Vec<Weak<Mutex<Option<DbSessionLeaseEntry>>>>> {
+    RETAINED_POOL_SESSION_LEASES
+        .get_or_init(|| Mutex::new(Vec::new()))
+        .lock()
+        .unwrap_or_else(|poisoned| {
+            logging::log_warning(
+                "db::connection",
+                "retained session registry lock was poisoned; recovering",
+            );
+            poisoned.into_inner()
+        })
+}
+
+/// Release, physically, every retained session left over from a connection
+/// incarnation that has ended.
+///
+/// Backend-independent by construction: it goes through the same
+/// `discard_physical` choke point every other discard uses, so a backend
+/// cannot join the app without joining this guarantee.
+fn release_retained_sessions_for_retired_connection(retired_generation: u64) -> usize {
+    // Generation 0 is "never connected", so nothing can have been retained
+    // under it, and matching on it would hit every lease of a fresh slot.
+    if retired_generation == 0 {
+        return 0;
+    }
+    let leases = {
+        let mut registry = lock_retained_pool_session_leases();
+        registry.retain(|lease| lease.strong_count() > 0);
+        registry.clone()
+    };
+    // Collect first, discard after: closing a session talks to the server, and
+    // no registry or lease lock may be held while that happens.
+    let stale = leases
+        .iter()
+        .filter_map(|lease| lease.upgrade())
+        .map(SharedDbSessionLease::from_inner)
+        .filter_map(|lease| lease.take_entry_for_connection_generation(retired_generation))
+        .collect::<Vec<_>>();
+    let released = stale.len();
+    for entry in stale {
+        entry.discard_physical("db::session_lease");
+    }
+    released
+}
+
+/// Reclaim what a connection incarnation leaves behind.
+///
+/// The teardown paths run under the connection lock and closing a session does
+/// network I/O, so the work happens on the cleanup worker. Two things have to
+/// go, and neither can be left to whoever notices first: the sessions retained
+/// under the incarnation that ended, and any cached pool context still holding
+/// a clone of its pool.
+fn reclaim_retired_connection_sessions_in_background(retired_generation: u64) {
+    if retired_generation == 0 {
+        return;
+    }
+    spawn_connection_cleanup(move || {
+        prune_stale_pool_session_context_cache();
+        let released = release_retained_sessions_for_retired_connection(retired_generation);
+        if released > 0 {
+            logging::log_info(
+                "db::connection",
+                &format!(
+                    "Released {released} retained DB session(s) left by a replaced connection"
+                ),
+            );
+        }
+    });
+}
+
 static PENDING_CONNECTION_CLEANUPS: OnceLock<Mutex<Vec<ConnectionCleanupTask>>> = OnceLock::new();
 
 fn run_connection_attempt<T, F>(
@@ -1419,7 +1510,10 @@ pub enum DbSessionLease {
 pub struct DbSessionLeaseEntry {
     connection_generation: u64,
     pool_context_epoch: u64,
-    lease: DbSessionLease,
+    /// `None` only while the session is being handed out or discarded. It is
+    /// an `Option` so this entry can own a `Drop` that closes a session nobody
+    /// took responsibility for -- see that impl.
+    lease: Option<DbSessionLease>,
     retained_state: RetainedSessionState,
     current_scope: Option<String>,
 }
@@ -1677,14 +1771,17 @@ impl DbPoolSessionContext {
         backend_for(self.connection_info.db_type).apply_current_scope_to_session(self, session)
     }
 
+    /// Throw away a session that was acquired but could not be handed over.
+    ///
+    /// Either the connection it came from is already gone, or applying the
+    /// scope to it failed part way, so what the session carries is unknown.
+    /// Every backend gets rid of it the same way, through the one discard
+    /// choke point: returning a half-configured session to the pool would hand
+    /// the next caller state nobody has accounted for, and on a connection
+    /// that is being retired it would keep the pool -- and on the MySQL family
+    /// every idle session in it -- alive for as long as something holds it.
     fn discard_stale_session(session: DbPoolSession) {
-        match session {
-            DbPoolSession::OracleThin(conn) => {
-                let conn = *conn;
-                conn.discard();
-            }
-            DbPoolSession::Oracle(_) | DbPoolSession::MySQL { .. } => {}
-        }
+        session.into_lease().discard_physical("db::pool_session");
     }
 }
 
@@ -2272,14 +2369,23 @@ impl DbSessionLeaseEntry {
         Self {
             connection_generation,
             pool_context_epoch,
-            lease,
+            lease: Some(lease),
             retained_state,
             current_scope,
         }
     }
 
+    fn lease(&self) -> Option<&DbSessionLease> {
+        self.lease.as_ref()
+    }
+
+    fn take_lease(&mut self) -> Option<DbSessionLease> {
+        self.lease.take()
+    }
+
     fn matches_connection(&self, connection_generation: u64, db_type: DatabaseType) -> bool {
-        self.connection_generation == connection_generation && self.lease.is_db_type(db_type)
+        self.connection_generation == connection_generation
+            && self.lease().is_some_and(|lease| lease.is_db_type(db_type))
     }
 
     fn matches_context(
@@ -2292,8 +2398,32 @@ impl DbSessionLeaseEntry {
             && self.pool_context_epoch == pool_context_epoch
     }
 
-    fn discard_physical(self, log_context: &str) {
-        self.lease.discard_physical(log_context);
+    fn discard_physical(mut self, log_context: &str) {
+        if let Some(lease) = self.lease.take() {
+            lease.discard_physical(log_context);
+        }
+    }
+}
+
+/// The last resort for an orphaned session.
+///
+/// A retained session belongs to a query tab, and every ordinary path hands it
+/// back deliberately -- the tab closes it, a teardown releases it, a reuse
+/// takes it. If a slot is dropped with a session still in it, there is nobody
+/// left to do any of that: the tab is gone, so the session would drift back
+/// into the pool carrying whatever transaction, temporary table or lock it was
+/// holding, and on the MySQL family it would keep the pool it came from alive
+/// with it. Closing it here means no session can outlive its owner, on any
+/// backend, however the owner went away.
+impl Drop for DbSessionLeaseEntry {
+    fn drop(&mut self) {
+        if let Some(lease) = self.lease.take() {
+            logging::log_info(
+                "db::session_lease",
+                "Closing a retained DB session whose owner is gone",
+            );
+            lease.discard_physical("db::session_lease");
+        }
     }
 }
 
@@ -2343,6 +2473,40 @@ impl SharedDbSessionLease {
         }
     }
 
+    fn from_inner(inner: Arc<Mutex<Option<DbSessionLeaseEntry>>>) -> Self {
+        Self { inner }
+    }
+
+    /// Publish this slot to the retained-session registry.
+    ///
+    /// Called from the one place a session becomes retained, so a connection
+    /// teardown can reclaim it without the owner having to take part.
+    fn register_for_connection_teardown(&self) {
+        let handle = Arc::downgrade(&self.inner);
+        let mut registry = lock_retained_pool_session_leases();
+        registry.retain(|lease| lease.strong_count() > 0);
+        if !registry.iter().any(|lease| lease.ptr_eq(&handle)) {
+            registry.push(handle);
+        }
+    }
+
+    /// Take the retained session if it belongs to the given (ended) connection
+    /// incarnation. The caller discards it with no lock held.
+    fn take_entry_for_connection_generation(
+        &self,
+        connection_generation: u64,
+    ) -> Option<DbSessionLeaseEntry> {
+        let mut lease = self.lock_inner();
+        let matches = lease
+            .as_ref()
+            .is_some_and(|entry| entry.connection_generation == connection_generation);
+        if matches {
+            lease.take()
+        } else {
+            None
+        }
+    }
+
     pub fn clear(&self) -> bool {
         let lease_to_drop = { self.lock_inner().take() };
         if let Some(entry) = lease_to_drop {
@@ -2358,8 +2522,9 @@ impl SharedDbSessionLease {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .as_ref()
-            .map(|entry| PooledSessionLeaseSnapshot {
-                db_type: entry.lease.db_type(),
+            .and_then(|entry| entry.lease().map(|lease| (entry, lease)))
+            .map(|(entry, lease)| PooledSessionLeaseSnapshot {
+                db_type: lease.db_type(),
                 pool_context_epoch: entry.pool_context_epoch,
                 transaction_state: entry.retained_state.summary_transaction_state(),
                 retained_state: entry.retained_state,
@@ -2380,21 +2545,24 @@ impl SharedDbSessionLease {
                 existing.matches_connection(connection_generation, db_type)
             });
             if reusable {
-                lease.take().map(|entry| {
+                lease.take().and_then(|mut entry| {
+                    let pool_context_epoch = entry.pool_context_epoch;
+                    let retained_state = entry.retained_state;
+                    let current_scope = entry.current_scope.take();
                     let taken = TakenDbSessionLease::new_with_retained_state(
                         self.clone(),
                         connection_generation,
-                        entry.pool_context_epoch,
-                        entry.lease,
-                        entry.retained_state,
-                        entry.current_scope,
+                        pool_context_epoch,
+                        entry.take_lease()?,
+                        retained_state,
+                        current_scope,
                     );
-                    match tracking {
+                    Some(match tracking {
                         Some((connection_info, activity)) => {
                             taken.track_under(connection_info, activity)
                         }
                         None => taken,
-                    }
+                    })
                 })
             } else {
                 if lease.is_some() {
@@ -2464,21 +2632,25 @@ impl SharedDbSessionLease {
                 existing.retained_state,
             ) == RetainedLeaseContextDecision::Reusable
             {
-                lease.take().map(|entry| {
+                lease.take().and_then(|mut entry| {
                     let restore_epoch = if entry.pool_context_epoch == pool_context_epoch {
                         entry.pool_context_epoch
                     } else {
                         pool_context_epoch
                     };
-                    TakenDbSessionLease::new_with_retained_state(
-                        self.clone(),
-                        connection_generation,
-                        restore_epoch,
-                        entry.lease,
-                        entry.retained_state,
-                        entry.current_scope,
+                    let retained_state = entry.retained_state;
+                    let current_scope = entry.current_scope.take();
+                    Some(
+                        TakenDbSessionLease::new_with_retained_state(
+                            self.clone(),
+                            connection_generation,
+                            restore_epoch,
+                            entry.take_lease()?,
+                            retained_state,
+                            current_scope,
+                        )
+                        .track_under(connection_info, activity),
                     )
-                    .track_under(connection_info, activity)
                 })
             } else {
                 return RetainedSessionTakeOutcome::BlockedContextMismatch(existing.retained_state);
@@ -2504,9 +2676,11 @@ impl SharedDbSessionLease {
             let mut lease = self.lock_inner();
             let should_clear = lease.as_ref().is_some_and(|existing| {
                 existing.connection_generation == connection_generation
-                    && match &existing.lease {
-                        DbSessionLease::Oracle(conn) => Arc::ptr_eq(conn, expected_conn),
-                        DbSessionLease::OracleThin(_) | DbSessionLease::MySQL { .. } => false,
+                    && match existing.lease() {
+                        Some(DbSessionLease::Oracle(conn)) => Arc::ptr_eq(conn, expected_conn),
+                        Some(DbSessionLease::OracleThin(_))
+                        | Some(DbSessionLease::MySQL { .. })
+                        | None => false,
                     }
             });
             if should_clear {
@@ -2592,6 +2766,7 @@ impl SharedDbSessionLease {
     ) -> bool {
         let lease_db_type = lease_to_store.db_type();
         let mut lease_to_store = Some(lease_to_store);
+        let mut stored = false;
         let old_lease_to_drop = {
             let mut lease = self.lock_inner();
             let should_store = match lease.as_mut() {
@@ -2599,7 +2774,9 @@ impl SharedDbSessionLease {
                 Some(existing) => {
                     if existing.connection_generation != connection_generation
                         || existing.pool_context_epoch != pool_context_epoch
-                        || !existing.lease.is_db_type(lease_db_type)
+                        || !existing
+                            .lease()
+                            .is_some_and(|lease| lease.is_db_type(lease_db_type))
                     {
                         true
                     } else {
@@ -2632,12 +2809,18 @@ impl SharedDbSessionLease {
                         retained_state,
                         current_scope,
                     ));
+                    stored = true;
                 }
                 old_lease
             } else {
                 None
             }
         };
+        if stored {
+            // The one place a session becomes retained is the one place the
+            // teardown paths have to learn about it.
+            self.register_for_connection_teardown();
+        }
         if let Some(entry) = old_lease_to_drop {
             entry.discard_physical("db::session_lease");
         }
@@ -4173,10 +4356,28 @@ impl DatabaseConnection {
         }
     }
 
+    /// End this connection's current incarnation and start the next one.
+    ///
+    /// Called from exactly the places where the physical connection or its
+    /// pool is replaced or closed, so the generation is the app-wide answer to
+    /// "is this session still ours". Two things hang off that:
+    ///
+    /// * The new generation comes from a process-wide counter, so a
+    ///   generation identifies one incarnation of ONE connection — two
+    ///   connections can never hold the same value and be mistaken for each
+    ///   other.
+    /// * Every session retained from the incarnation that just ended is
+    ///   released here, physically, instead of being left for whichever tab
+    ///   happens to notice the mismatch next. A retained session keeps its
+    ///   whole pool alive (a `PooledConn` owns a clone of the MySQL pool, an
+    ///   `Arc<Connection>` keeps the OCI pool from being destroyed), so one
+    ///   forgotten lease pins every idle session in that pool on the server.
     fn bump_connection_generation(&mut self) {
-        self.connection_generation = self.connection_generation.wrapping_add(1);
+        let retired_generation = self.connection_generation;
+        self.connection_generation = next_connection_generation();
         self.connection_generation_token
             .store(self.connection_generation, Ordering::Release);
+        reclaim_retired_connection_sessions_in_background(retired_generation);
     }
 
     pub fn connection_id(&self) -> Option<ConnectionId> {
@@ -4329,6 +4530,16 @@ impl DatabaseConnection {
         Self::retire_connection_resources_in_background(connection, pool);
     }
 
+    /// The one place a connection's physical resources go away, whichever path
+    /// got here: disconnect, reconnect, pool resize, a failed install, or the
+    /// connection simply being dropped.
+    ///
+    /// Pruning the pool-context cache is part of retiring, not an extra: the
+    /// cache holds a CLONE of the pool, and a pool with a clone outstanding is
+    /// not destroyed -- ODPI keeps the OCI session pool (and every session in
+    /// it) alive on its own refcount, and the MySQL pool keeps its idle
+    /// connections. Live-observed as "dropping a connection nobody
+    /// disconnected leaves its sessions open" on Oracle OCI.
     fn retire_connection_resources_in_background(
         connection: Option<DbConnection>,
         pool: Option<DbConnectionPool>,
@@ -4337,6 +4548,7 @@ impl DatabaseConnection {
             return;
         }
         spawn_connection_cleanup(move || {
+            prune_stale_pool_session_context_cache();
             if let Some(pool) = pool.as_ref() {
                 pool.close();
             }
@@ -5977,6 +6189,11 @@ impl Drop for DatabaseConnection {
         let pool = self.pool.take();
         ConnectionInfo::clear_secret(&mut self.session_password);
         self.info.clear_password();
+        // Dropping is a teardown like any other -- a script CONNECT's
+        // connection is torn down this way, by the tab that owned it going
+        // away -- so the sessions retained from it have to go with it. There
+        // is no generation bump on this path to carry that for us.
+        reclaim_retired_connection_sessions_in_background(self.connection_generation);
         Self::retire_connection_resources_in_background(connection, pool);
     }
 }
@@ -6275,6 +6492,35 @@ fn cache_pool_session_context(connection: &SharedConnection, context: &DbPoolSes
             context: cached,
         },
     );
+}
+
+/// Drop every cached pool context whose connection has moved on.
+///
+/// The cache holds a CLONE of the connection's pool, so an entry left behind
+/// by a disconnect keeps that pool alive -- and with it every idle session the
+/// pool still owns, on a connection the user has already closed. Entries are
+/// checked on read too, but nothing guarantees another read ever comes.
+fn prune_stale_pool_session_context_cache() -> usize {
+    // Take the stale entries out under the lock and drop them outside it:
+    // dropping the last clone of a pool closes its sessions, which talks to
+    // the server.
+    let stale = {
+        let mut cache = lock_pool_context_cache();
+        let stale_keys = cache
+            .iter()
+            .filter(|(_, cached)| {
+                cached.owner.upgrade().is_none() || !cached.context.cache_epoch_is_current()
+            })
+            .map(|(key, _)| *key)
+            .collect::<Vec<_>>();
+        stale_keys
+            .into_iter()
+            .filter_map(|key| cache.remove(&key))
+            .collect::<Vec<_>>()
+    };
+    let pruned = stale.len();
+    drop(stale);
+    pruned
 }
 
 fn remove_cached_pool_session_context(key: usize) {
@@ -8324,6 +8570,540 @@ mod tests {
                 panic!("round {round} could not acquire a thin pooled session: {err}")
             })))
         });
+    }
+
+    /// The server's own view of how many sessions this app has open.
+    ///
+    /// Pool-slot accounting is the app's bookkeeping; this is the database's.
+    /// Only the server can prove that a lifecycle event actually *closed* a
+    /// session rather than merely losing track of it, which is why every
+    /// backend implements this the same way for the one lifecycle engine
+    /// below.
+    trait ServerSessionCensus {
+        fn count_sessions(&mut self) -> usize;
+    }
+
+    /// The census must see this test's sessions and nobody else's, or another
+    /// test opening a connection at the same time reads as a leak. Each entry
+    /// point therefore gives its probe connection an identity of its own and
+    /// counts by that: a database of its own on the MySQL family, a user of
+    /// its own on Oracle. The identity belongs to the entry point rather than
+    /// to the backend, so two of these can run side by side.
+    fn session_census_probe_name(entry_point: &str) -> String {
+        format!("sq_session_probe_{entry_point}")
+    }
+    const SESSION_CENSUS_PROBE_ORACLE_PASSWORD: &str = "sq_probe_2026";
+
+    struct MySqlFamilySessionCensus {
+        conn: mysql::Conn,
+        database: String,
+    }
+
+    impl ServerSessionCensus for MySqlFamilySessionCensus {
+        fn count_sessions(&mut self) -> usize {
+            use mysql::prelude::Queryable;
+            let database = self.database.replace('\'', "''");
+            let sql = format!(
+                "SELECT COUNT(*) FROM information_schema.processlist WHERE db = '{database}'"
+            );
+            self.conn
+                .query_first::<i64, _>(sql)
+                .expect("count MySQL-family server sessions")
+                .unwrap_or_default()
+                .max(0) as usize
+        }
+    }
+
+    struct OracleOciSessionCensus {
+        conn: Connection,
+        user: String,
+    }
+
+    /// Give the Oracle probe a user of its own. In a CDB root the name has to
+    /// be a common one, so fall back to the `C##` form and report which name
+    /// the census should count.
+    fn create_oracle_session_census_probe_user(
+        entry_point: &str,
+        mut execute: impl FnMut(&str) -> Result<(), String>,
+    ) -> String {
+        let mut user = session_census_probe_name(entry_point).to_uppercase();
+        let create = |user: &str| {
+            format!("CREATE USER {user} IDENTIFIED BY \"{SESSION_CENSUS_PROBE_ORACLE_PASSWORD}\"")
+        };
+        if let Err(err) = execute(&create(&user)) {
+            let message = err.to_ascii_lowercase();
+            if message.contains("ora-65096") {
+                // "invalid common user or role name": this is a CDB root.
+                user = format!("C##{user}");
+                if let Err(err) = execute(&create(&user)) {
+                    assert!(
+                        err.to_ascii_lowercase().contains("ora-01920"),
+                        "create the Oracle session census probe user: {err}"
+                    );
+                }
+            } else {
+                assert!(
+                    message.contains("ora-01920"),
+                    "create the Oracle session census probe user: {err}"
+                );
+            }
+        }
+        for grant in [
+            format!("GRANT CREATE SESSION TO {user}"),
+            format!("GRANT SELECT ANY DICTIONARY TO {user}"),
+        ] {
+            execute(&grant).unwrap_or_else(|err| panic!("{grant}: {err}"));
+        }
+        user
+    }
+
+    impl ServerSessionCensus for OracleOciSessionCensus {
+        fn count_sessions(&mut self) -> usize {
+            let count: i64 = self
+                .conn
+                .query_row_as(ORACLE_SESSION_CENSUS_SQL, &[&self.user.to_uppercase()])
+                .expect("count Oracle server sessions");
+            count.max(0) as usize
+        }
+    }
+
+    struct OracleThinSessionCensus {
+        session: OracleThinSession,
+        user: String,
+    }
+
+    impl ServerSessionCensus for OracleThinSessionCensus {
+        fn count_sessions(&mut self) -> usize {
+            let sql = format!(
+                "SELECT COUNT(*) FROM v$session WHERE username = '{}'",
+                self.user.to_uppercase().replace('\'', "''")
+            );
+            DatabaseConnection::oracle_thin_select_one_text(&mut self.session, &sql)
+                .expect("count Oracle server sessions")
+                .and_then(|value| value.trim().parse::<i64>().ok())
+                .unwrap_or_default()
+                .max(0) as usize
+        }
+    }
+
+    const ORACLE_SESSION_CENSUS_SQL: &str = "SELECT COUNT(*) FROM v$session WHERE username = :1";
+
+    /// Poll until the server's session count comes down to the limit, so a
+    /// backend that closes its sockets asynchronously (the server still has to
+    /// notice the FIN) is judged on where it ends up, not on the instant after
+    /// the call returned.
+    fn settled_server_session_count(census: &mut dyn ServerSessionCensus, limit: usize) -> usize {
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let mut observed = census.count_sessions();
+        while observed > limit && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(250));
+            observed = census.count_sessions();
+        }
+        observed
+    }
+
+    /// Read a count that has stopped moving, for the reference points the
+    /// engine measures rather than predicts.
+    fn stable_server_session_count(census: &mut dyn ServerSessionCensus) -> usize {
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let mut previous = census.count_sessions();
+        loop {
+            std::thread::sleep(Duration::from_millis(400));
+            let observed = census.count_sessions();
+            if observed == previous || Instant::now() >= deadline {
+                return observed;
+            }
+            previous = observed;
+        }
+    }
+
+    /// The leak claim is one-sided: after the event, no more than `limit`
+    /// sessions may still be open. Closing more than that is not a leak -- a
+    /// discard legitimately takes the pool below the size it kept idle before.
+    fn assert_server_sessions_at_most(
+        census: &mut dyn ServerSessionCensus,
+        limit: usize,
+        label: &str,
+    ) {
+        let observed = settled_server_session_count(census, limit);
+        assert!(
+            observed <= limit,
+            "{label}: the server still has {observed} sessions open, expected at most {limit}"
+        );
+    }
+
+    /// The second leak-freedom claim every backend must honour, and the one
+    /// pool-slot accounting cannot see: when a connection is torn down or
+    /// replaced, every session it opened is *closed on the server* — including
+    /// the pool's idle sessions and the one a query tab is still holding.
+    ///
+    /// A backend that violates it leaves real sessions on the database for as
+    /// long as the app runs: the user disconnects, reconnects or resizes the
+    /// pool and the server keeps counting connections nobody can reach any
+    /// more. Each backend joins by handing this engine a connection and a
+    /// census of the server's own session list.
+    fn assert_connection_lifecycle_closes_every_server_session(
+        info: ConnectionInfo,
+        census: &mut dyn ServerSessionCensus,
+    ) {
+        const POOL_SIZE: u32 = 4;
+        let policy = ConnectionAttemptPolicy::from_seconds(30);
+        let db_type = info.db_type;
+        let activity = track_pool_db_activity("server session census", db_type);
+
+        // Reference point 1: nothing of ours is connected but the census.
+        let disconnected_baseline = stable_server_session_count(census);
+
+        let shared = create_shared_connection();
+        connect_shared_connection_with_policy(&shared, info.clone(), POOL_SIZE, policy)
+            .expect("connect the probe connection");
+
+        // Reference point 2: connected, but no pooled work has run yet.
+        let connected_baseline = stable_server_session_count(census);
+        assert!(
+            connected_baseline > disconnected_baseline,
+            "connecting should open at least one server session ({disconnected_baseline} -> {connected_baseline})"
+        );
+
+        let context = |shared: &SharedConnection| {
+            shared
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .pool_session_context()
+                .expect("pool session context")
+        };
+        let acquire = |context: &DbPoolSessionContext| {
+            context
+                .acquire_session_for_current_scope(&activity)
+                .expect("acquire a pooled session")
+                .0
+                .into_lease()
+        };
+
+        // L1: a discarded session is gone from the server, not just from the
+        // pool's slot count.
+        let ctx = context(&shared);
+        let first = acquire(&ctx);
+        let second = acquire(&ctx);
+        let working = stable_server_session_count(census);
+        assert!(
+            working > connected_baseline,
+            "two pooled sessions should be visible on the server ({connected_baseline} -> {working})"
+        );
+        first.discard_physical("session census probe");
+        second.discard_physical("session census probe");
+        assert_server_sessions_at_most(
+            census,
+            connected_baseline,
+            "L1 discarding a pooled session closes it on the server",
+        );
+
+        // L2: a session returned to the pool stays open (that is the point of
+        // pooling) and is reused rather than re-opened.
+        let returned_first = acquire(&ctx);
+        let returned_second = acquire(&ctx);
+        let pooled = stable_server_session_count(census);
+        drop(returned_first);
+        drop(returned_second);
+        let reacquired_first = acquire(&ctx);
+        let reacquired_second = acquire(&ctx);
+        assert_server_sessions_at_most(
+            census,
+            pooled,
+            "L2 a returned pooled session is reused, not re-opened",
+        );
+
+        // L3: closing a query tab closes the session that tab was holding.
+        let tab_lease = SharedDbSessionLease::new();
+        assert!(
+            tab_lease.apply_retained_session_disposition(
+                ctx.connection_generation,
+                ctx.pool_context_epoch(),
+                reacquired_first,
+                RetainedSessionDisposition::Retain(RetainedSessionState::default()),
+                "session census probe",
+            ),
+            "the probe tab should retain its session"
+        );
+        tab_lease.clear();
+        assert_server_sessions_at_most(
+            census,
+            pooled - 1,
+            "L3 closing a query tab closes its retained session",
+        );
+
+        // L4: a tab that goes away WITHOUT closing its session leaves nobody
+        // to hand it back. The session must not drift on regardless.
+        let orphaned_tab_lease = SharedDbSessionLease::new();
+        assert!(
+            orphaned_tab_lease.apply_retained_session_disposition(
+                ctx.connection_generation,
+                ctx.pool_context_epoch(),
+                reacquired_second,
+                RetainedSessionDisposition::Retain(RetainedSessionState::default()),
+                "session census probe",
+            ),
+            "the probe tab should retain its session"
+        );
+        drop(orphaned_tab_lease);
+        assert_server_sessions_at_most(
+            census,
+            pooled - 2,
+            "L4 a retained session whose owner is gone is closed, not orphaned",
+        );
+
+        // L5: disconnect closes every session the connection opened, including
+        // the pool's idle ones and the one a query tab is still holding.
+        let retained = acquire(&ctx);
+        let idle = acquire(&ctx);
+        drop(idle);
+        let tab_lease = SharedDbSessionLease::new();
+        assert!(
+            tab_lease.apply_retained_session_disposition(
+                ctx.connection_generation,
+                ctx.pool_context_epoch(),
+                retained,
+                RetainedSessionDisposition::Retain(RetainedSessionState::default()),
+                "session census probe",
+            ),
+            "the probe tab should retain its session"
+        );
+        drop(ctx);
+        shared
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .disconnect();
+        assert_server_sessions_at_most(
+            census,
+            disconnected_baseline,
+            "L5 disconnect closes every session, including a tab's retained one",
+        );
+        tab_lease.clear();
+
+        // L6: reconnecting replaces the connection, and the replaced one must
+        // not keep sessions alive — again with a tab still holding one.
+        connect_shared_connection_with_policy(&shared, info.clone(), POOL_SIZE, policy)
+            .expect("reconnect the probe connection");
+        let ctx = context(&shared);
+        let retained = acquire(&ctx);
+        let idle = acquire(&ctx);
+        drop(idle);
+        let tab_lease = SharedDbSessionLease::new();
+        assert!(
+            tab_lease.apply_retained_session_disposition(
+                ctx.connection_generation,
+                ctx.pool_context_epoch(),
+                retained,
+                RetainedSessionDisposition::Retain(RetainedSessionState::default()),
+                "session census probe",
+            ),
+            "the probe tab should retain its session"
+        );
+        drop(ctx);
+        connect_shared_connection_with_policy(&shared, info.clone(), POOL_SIZE, policy)
+            .expect("reconnect the probe connection again");
+        assert_server_sessions_at_most(
+            census,
+            connected_baseline,
+            "L6 reconnecting closes the replaced connection's sessions",
+        );
+        tab_lease.clear();
+
+        // L7: resizing the pool retires the old pool, which must take its
+        // sessions with it — again with a tab still holding one.
+        let ctx = context(&shared);
+        let retained = acquire(&ctx);
+        let idle = acquire(&ctx);
+        drop(idle);
+        let tab_lease = SharedDbSessionLease::new();
+        assert!(
+            tab_lease.apply_retained_session_disposition(
+                ctx.connection_generation,
+                ctx.pool_context_epoch(),
+                retained,
+                RetainedSessionDisposition::Retain(RetainedSessionState::default()),
+                "session census probe",
+            ),
+            "the probe tab should retain its session"
+        );
+        drop(ctx);
+        resize_shared_connection_pool_with_policy(&shared, POOL_SIZE + 2, policy)
+            .expect("resize the probe connection pool");
+        assert_server_sessions_at_most(
+            census,
+            connected_baseline,
+            "L7 resizing the pool closes the retired pool's sessions",
+        );
+        tab_lease.clear();
+
+        // L10: a connection attempt that never becomes a live connection. The
+        // Test button opens one and throws it away, and an attempt that is no
+        // longer current is retired before it is ever installed -- neither has
+        // an owner to close it later, so neither may leave a session behind.
+        {
+            DatabaseConnection::test_connection_with_policy(&info, policy)
+                .expect("test the probe connection");
+            let abandoned =
+                DatabaseConnection::prepare_connection(info.clone(), POOL_SIZE, false, policy)
+                    .expect("prepare a connection the way a connect attempt does");
+            DatabaseConnection::retire_connection_in_background(abandoned);
+            assert_server_sessions_at_most(
+                census,
+                connected_baseline,
+                "L10 a connection attempt that is thrown away leaves no session",
+            );
+        }
+
+        // L9: a connection nobody disconnected. A script CONNECT builds a whole
+        // connection and pool behind a query tab, and closing the tab drops it
+        // rather than disconnecting it -- so dropping the last handle has to
+        // close its sessions just as thoroughly as a disconnect would.
+        {
+            let orphan = create_shared_connection();
+            connect_shared_connection_with_policy(&orphan, info.clone(), POOL_SIZE, policy)
+                .expect("connect the orphan probe connection");
+            let orphan_context = context(&orphan);
+            let first = acquire(&orphan_context);
+            let second = acquire(&orphan_context);
+            let working = stable_server_session_count(census);
+            assert!(
+                working > connected_baseline,
+                "the orphan connection should have opened sessions of its own \
+                 ({connected_baseline} -> {working})"
+            );
+            drop(first);
+            drop(second);
+            drop(orphan_context);
+            drop(orphan);
+            assert_server_sessions_at_most(
+                census,
+                connected_baseline,
+                "L9 dropping a connection nobody disconnected closes its sessions",
+            );
+        }
+
+        // L8: connect/disconnect cycles that do real pooled work leave nothing
+        // behind, so a session-per-cycle leak cannot hide under a single pass.
+        shared
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .disconnect();
+        assert_server_sessions_at_most(
+            census,
+            disconnected_baseline,
+            "L8 the probe connection is fully closed before the cycles",
+        );
+        for cycle in 0..3 {
+            connect_shared_connection_with_policy(&shared, info.clone(), POOL_SIZE, policy)
+                .unwrap_or_else(|err| panic!("cycle {cycle} connect: {err}"));
+            let ctx = context(&shared);
+            let held = acquire(&ctx);
+            let returned = acquire(&ctx);
+            drop(returned);
+            let tab_lease = SharedDbSessionLease::new();
+            tab_lease.apply_retained_session_disposition(
+                ctx.connection_generation,
+                ctx.pool_context_epoch(),
+                held,
+                RetainedSessionDisposition::Retain(RetainedSessionState::default()),
+                "session census probe",
+            );
+            drop(ctx);
+            shared
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .disconnect();
+            assert_server_sessions_at_most(
+                census,
+                disconnected_baseline,
+                &format!("L8 connect/disconnect cycle {cycle} leaves no session behind"),
+            );
+            tab_lease.clear();
+        }
+    }
+
+    fn assert_mysql_family_connection_lifecycle_closes_every_server_session(
+        db_type: DatabaseType,
+        entry_point: &str,
+    ) {
+        use mysql::prelude::Queryable;
+        let mut info = mysql_test_connection_info_from_env_for(db_type);
+        let opts =
+            DatabaseConnection::build_mysql_opts(&info, ConnectionAttemptPolicy::from_seconds(30));
+        let mut conn = mysql::Conn::new(opts).expect("connect the MySQL-family census");
+        let probe_database = session_census_probe_name(entry_point);
+        conn.query_drop(format!("CREATE DATABASE IF NOT EXISTS {probe_database}"))
+            .expect("create the MySQL-family session census probe database");
+        // The probe connection lives in a database of its own, so the census
+        // can count its sessions and only its sessions.
+        info.service_name = probe_database.clone();
+        let mut census = MySqlFamilySessionCensus {
+            conn,
+            database: probe_database,
+        };
+        assert_connection_lifecycle_closes_every_server_session(info, &mut census);
+    }
+
+    #[test]
+    #[ignore = "requires local MySQL test database via SPACE_QUERY_TEST_MYSQL_* env vars"]
+    fn mysql_connection_lifecycle_closes_every_server_session() {
+        assert_mysql_family_connection_lifecycle_closes_every_server_session(
+            DatabaseType::MySQL,
+            "mysql",
+        );
+    }
+
+    #[test]
+    #[ignore = "requires local MariaDB test database via SPACE_QUERY_TEST_MYSQL_* env vars"]
+    fn mariadb_connection_lifecycle_closes_every_server_session() {
+        assert_mysql_family_connection_lifecycle_closes_every_server_session(
+            DatabaseType::MariaDB,
+            "mariadb",
+        );
+    }
+
+    #[test]
+    #[ignore = "requires local Oracle database via ORACLE_TEST_* env vars and an Oracle client"]
+    fn oracle_oci_connection_lifecycle_closes_every_server_session() {
+        ensure_oracle_client_initialized().expect("Oracle client should initialize");
+        let mut info = oracle_test_connection_info_from_env();
+        let conn = Connection::connect(&info.username, &info.password, info.connection_string())
+            .expect("connect the Oracle OCI census");
+        let probe_user = create_oracle_session_census_probe_user("oci", |sql| {
+            conn.execute(sql, &[])
+                .map(|_| ())
+                .map_err(|err| err.to_string())
+        });
+        info.username = probe_user.clone();
+        info.password = SESSION_CENSUS_PROBE_ORACLE_PASSWORD.to_string();
+        let mut census = OracleOciSessionCensus {
+            conn,
+            user: probe_user,
+        };
+        assert_connection_lifecycle_closes_every_server_session(info, &mut census);
+    }
+
+    #[test]
+    #[ignore = "requires local Oracle database via ORACLE_TEST_* env vars"]
+    fn oracle_thin_connection_lifecycle_closes_every_server_session() {
+        let mut info = oracle_thin_test_connection_info_from_env();
+        let config = DatabaseConnection::build_oracle_thin_config(
+            &info,
+            ConnectionAttemptPolicy::from_seconds(30),
+        )
+        .expect("build Oracle thin census config");
+        let mut session =
+            OracleThinSession::connect(config).expect("connect the Oracle thin census");
+        let probe_user = create_oracle_session_census_probe_user("thin", |sql| {
+            session.query_drop(sql).map_err(|err| err.to_string())
+        });
+        info.username = probe_user.clone();
+        info.password = SESSION_CENSUS_PROBE_ORACLE_PASSWORD.to_string();
+        let mut census = OracleThinSessionCensus {
+            session,
+            user: probe_user,
+        };
+        assert_connection_lifecycle_closes_every_server_session(info, &mut census);
     }
 
     fn db_activity_test_lock() -> std::sync::MutexGuard<'static, ()> {
