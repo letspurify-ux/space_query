@@ -35,6 +35,14 @@
 //       default.
 //   S14 (MySQL family) an explicit START TRANSACTION survives auto-commit ON:
 //       the DML inside it is still rollback-able.
+//   S15 a query-driven session auto-commit change is adopted, notifies the UI
+//       and really applies, mid-script included.
+//   S16 the pin survives a disconnect + reconnect and reaches the new session.
+//   S17 a cancel keeps both the auto-committed work and the pin.
+//   S18 a DDL's implicit commit ends a manual tab's transaction.
+//   S19 the menu item's OTHER half: the toggle pins the tab AND applies the
+//       change to the tab's retained session. Driven on a session the tab has
+//       already read on, in both directions.
 //
 // Usage: verify_auto_commit_live <thin|oci|mysql|mariadb|all>
 
@@ -272,6 +280,29 @@ impl Harness {
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .set_auto_commit(enabled)
+    }
+
+    /// Everything the Tools > Auto-Commit item does, in the GUI's order: pin
+    /// the tab, then apply the change to the tab's retained DB session.
+    /// `set_tab_auto_commit` on its own is only the first half.
+    fn menu_auto_commit(&mut self, enabled: bool) -> String {
+        let (db_type, connection_generation, pool_context_epoch) = {
+            let guard = self.shared.lock().unwrap_or_else(|p| p.into_inner());
+            (
+                guard.db_type(),
+                guard.connection_generation(),
+                guard.pool_context_epoch(),
+            )
+        };
+        self.editor.set_tab_auto_commit(enabled);
+        let outcome = self.editor.apply_auto_commit_to_retained_session(
+            connection_generation,
+            pool_context_epoch,
+            db_type,
+            enabled,
+            "Updating auto-commit setting",
+        );
+        format!("{outcome:?}")
     }
 
     fn select_v(&mut self) -> Result<i64, String> {
@@ -1027,6 +1058,46 @@ fn run_scenarios(target: Target, h: &mut Harness) -> Result<(), String> {
     );
     let _ = h.run(&format!("DROP TABLE {ddl_table}"));
     h.run("ROLLBACK")?;
+
+    // ---- S19: the half of the menu write path nothing else drives ---------
+    // The menu item pins the tab AND applies the change to the tab's retained
+    // DB session; every scenario above drives only the pin. Drive both, on the
+    // state the menu meets in practice - a tab that has just read a table,
+    // which under manual commit leaves a transaction open on its session - and
+    // in both directions.
+    println!("  --- S19 the menu write path reaches the tab's live session ---");
+    h.set_connection_auto_commit(false)
+        .map_err(|e| format!("set_auto_commit(false): {e}"))?;
+    h.editor.sync_tab_auto_commit_with_global_setting(false);
+    h.editor.clear_tab_transaction_mode_override();
+    h.run("ROLLBACK")?;
+    let before = h.select_v()?;
+    let on_outcome = h.menu_auto_commit(true);
+    h.run(dml)?;
+    h.run("ROLLBACK")?;
+    let after_on = h.select_v()?;
+    h.check(
+        "S19 auto-commit ON through the whole menu path really commits",
+        after_on == before + 1,
+        format!(
+            "expected {}, got {after_on} (session mutation: {on_outcome})",
+            before + 1
+        ),
+    );
+    h.check(
+        "S19 the menu path left the connection default alone",
+        !h.connection_auto_commit(),
+        "the menu path mutated the shared connection default".into(),
+    );
+    let off_outcome = h.menu_auto_commit(false);
+    h.run(dml)?;
+    h.run("ROLLBACK")?;
+    let after_off = h.select_v()?;
+    h.check(
+        "S19 auto-commit OFF through the whole menu path keeps work rollback-able",
+        after_off == after_on,
+        format!("expected {after_on}, got {after_off} (session mutation: {off_outcome})"),
+    );
 
     // ---- S6 (Oracle, runs last): script CONNECT resolves auto-commit from
     // the new connection's seeded default, not the old connection's value ----

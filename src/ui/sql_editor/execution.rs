@@ -23170,7 +23170,23 @@ impl SqlEditorWidget {
                 mode,
                 db_type,
                 default_transaction_isolation,
-            )
+            )?;
+            // MySQL fixes a transaction's isolation and access mode at its
+            // START, and the statements this tab has already run have usually
+            // left a transaction open on this session (a plain read under
+            // manual commit is enough). The SET above changes the session, not
+            // that transaction — and the next statement's setup skips its own
+            // ROLLBACK precisely because the session now reads as correct, so
+            // the user's next statement would run under the mode the toolbar
+            // has just replaced (live-observed on MySQL 8.0: the INSERT after
+            // a Read only pin succeeded). End it here, on the same "no user
+            // work" condition the adopted-statement path uses.
+            Self::end_mysql_residual_transaction_after_session_mode_change(
+                &mut conn,
+                prior_retained_state,
+                db_activity,
+            );
+            Ok(())
         })();
         match apply_result {
             Ok(()) => {

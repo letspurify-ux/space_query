@@ -3196,6 +3196,25 @@ fn transaction_mode_state_has_a_single_source_of_truth() {
             && end_residual_body.contains("\"ROLLBACK\""),
         "the residual transaction may only be ended when the session carries no user work"
     );
+
+    // (15) The same claim for the TOOLBAR's half of the write path: it applies
+    // the mode to the tab's retained session, which has usually been used
+    // already, so a transaction started under the old mode is still open on it
+    // — and the next statement's setup skips its ROLLBACK because the session
+    // variables now read as correct. Live-observed on MySQL 8.0: the INSERT
+    // after a Read only pin succeeded.
+    let toolbar_start = execution
+        .find("fn apply_mysql_transaction_mode_to_reusable_pooled_session(")
+        .expect("the MySQL retained-session transaction-mode mutation should exist");
+    let toolbar_end = execution[toolbar_start..]
+        .find("\n    fn ")
+        .map(|offset| toolbar_start + offset)
+        .unwrap_or(execution.len());
+    let toolbar_body = &execution[toolbar_start..toolbar_end];
+    assert!(
+        toolbar_body.contains("end_mysql_residual_transaction_after_session_mode_change("),
+        "the toolbar's retained-session mode change must return the MySQL session to a transaction boundary"
+    );
 }
 
 /// The Oracle thin batch loop's own read-only gate, located without pinning

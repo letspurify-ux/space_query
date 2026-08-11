@@ -39,6 +39,16 @@
 //       connection's session.
 //   S23 an open lazy fetch holds the tab's session, so the transaction-mode
 //       controls are closed until it is fetched out or cancelled.
+//   S24 a pinned READ ONLY still refuses the write that follows an
+//       auto-committed read inside the same batch.
+//   S25 (MySQL family) the combined one-statement form adopts BOTH properties,
+//       notifies the UI, and both really apply.
+//   S26 the toolbar's OTHER half: picking a mode pins the tab AND applies the
+//       change to the tab's retained session. Driven on the state the toolbar
+//       meets in practice - a session the tab has already read on, which under
+//       manual commit still has a transaction open - in both directions.
+//   S27 that same mutation over uncommitted work: it must neither resolve nor
+//       discard the user's work.
 //
 // Usage: verify_transaction_mode_live <thin|oci|mysql|mariadb|all>
 
@@ -307,6 +317,32 @@ impl Harness {
                 std::thread::sleep(Duration::from_millis(5));
             }
         }
+    }
+
+    /// Everything the toolbar does when the user picks a mode, in the GUI's
+    /// order (`update_transaction_mode_from_controls`): pin the tab, then
+    /// apply the change to the tab's retained DB session.
+    /// `set_tab_transaction_mode` on its own is only the first half — the
+    /// second half is what makes the live session agree with the toolbar
+    /// before the next statement runs.
+    fn toolbar_transaction_mode(&mut self, mode: TransactionMode) -> String {
+        let (db_type, connection_generation, pool_context_epoch) = {
+            let guard = self.shared.lock().unwrap_or_else(|p| p.into_inner());
+            (
+                guard.db_type(),
+                guard.connection_generation(),
+                guard.pool_context_epoch(),
+            )
+        };
+        self.editor.set_tab_transaction_mode(mode);
+        let outcome = self.editor.apply_transaction_mode_to_retained_session(
+            connection_generation,
+            pool_context_epoch,
+            db_type,
+            mode,
+            "Updating transaction mode",
+        );
+        format!("{outcome:?}")
     }
 
     fn select_v(&mut self) -> Result<i64, String> {
@@ -1839,6 +1875,101 @@ fn run_scenarios(target: Target, h: &mut Harness) -> Result<(), String> {
             .is_none_or(|d| d == space_query::db::RetainedSessionPreflightDecision::Allow),
         format!("decision after ROLLBACK = {clean_decision:?}"),
     );
+    // ---- S26: the half of the toolbar write path nothing else drives ------
+    // The GUI does two things when a mode is picked: it pins the tab AND it
+    // applies the change to the tab's retained DB session. Every scenario
+    // above drives only the pin, so the session mutation - the half that runs
+    // against a session the tab has already used - was never exercised live.
+    // Drive it the way the toolbar does, on the state the toolbar meets in
+    // practice: a tab that has just read a table, which under manual commit
+    // leaves a transaction open on its session. Whatever the mutation reports,
+    // the tab must never write while it shows Read only.
+    println!("  --- S26 the toolbar write path reaches the tab's live session ---");
+    h.editor.clear_tab_transaction_mode_override();
+    h.run("ROLLBACK")?;
+    let before_rows = h.select_scalar("SELECT COUNT(*) FROM SQ_TM_T")?;
+    let pin_outcome = h.toolbar_transaction_mode(TransactionMode::new(
+        TransactionIsolation::Default,
+        TransactionAccessMode::ReadOnly,
+    ));
+    let capture = h.run("INSERT INTO SQ_TM_T VALUES (26)")?;
+    let refused = capture.results.first().is_some_and(|r| {
+        !r.success
+            && read_only_errors.iter().any(|needle| {
+                r.message
+                    .to_ascii_lowercase()
+                    .contains(&needle.to_ascii_lowercase())
+            })
+    });
+    h.check(
+        "S26 the write after the toolbar pin is refused",
+        refused,
+        format!(
+            "retained-session mutation: {pin_outcome}; insert result: {:?}",
+            capture
+                .results
+                .first()
+                .map(|r| (r.success, r.message.clone()))
+        ),
+    );
+    h.run("ROLLBACK")?;
+    let after_rows = h.select_scalar("SELECT COUNT(*) FROM SQ_TM_T")?;
+    h.check(
+        "S26 the refused write left no row behind",
+        after_rows == before_rows,
+        format!("row count {before_rows} -> {after_rows}"),
+    );
+    // The same path in the release direction: picking the connection default
+    // again has to hand the session back to read-write. A mode change is only
+    // taken at a transaction boundary, and on Oracle the read above is inside
+    // the transaction the app's own SET TRANSACTION opened - so end it first,
+    // exactly as the app tells the user to.
+    h.run("ROLLBACK")?;
+    let release_outcome = h.toolbar_transaction_mode(TransactionMode::default());
+    let capture = h.run("INSERT INTO SQ_TM_T VALUES (27)")?;
+    h.check(
+        "S26 the toolbar releases the pin on the same session",
+        capture.results.first().is_some_and(|r| r.success),
+        format!(
+            "retained-session mutation: {release_outcome}; insert result: {:?}",
+            capture
+                .results
+                .first()
+                .map(|r| (r.success, r.message.clone()))
+        ),
+    );
+    h.run("ROLLBACK")?;
+    h.editor.clear_tab_transaction_mode_override();
+
+    // ---- S27: the mutation's own gate over the user's work -----------------
+    // The toolbar checks the tab's session before it changes anything, but the
+    // mutation is a second, independent defense: it must not resolve, discard
+    // or silently keep running over work the user has not committed.
+    println!("  --- S27 the toolbar mutation leaves uncommitted work alone ---");
+    let baseline_v = h.select_v()?;
+    h.run("UPDATE SQ_TM_T SET V = V + 1")?;
+    let dirty_outcome = h.toolbar_transaction_mode(TransactionMode::new(
+        TransactionIsolation::Default,
+        TransactionAccessMode::ReadOnly,
+    ));
+    let still_dirty = h
+        .editor
+        .pooled_session_activity_snapshot()
+        .map(|snapshot| snapshot.retained_state());
+    h.check(
+        "S27 the work is still uncommitted after the attempt",
+        still_dirty.is_some_and(|state| state.may_have_uncommitted_work()),
+        format!("mutation: {dirty_outcome}; retained state = {still_dirty:?}"),
+    );
+    h.editor.clear_tab_transaction_mode_override();
+    h.run("ROLLBACK")?;
+    let restored_v = h.select_v()?;
+    h.check(
+        "S27 the work is still rollback-able after the attempt",
+        restored_v == baseline_v,
+        format!("V {baseline_v} -> {restored_v} (mutation: {dirty_outcome})"),
+    );
+
     {
         let mut guard = h.shared.lock().unwrap_or_else(|p| p.into_inner());
         guard
