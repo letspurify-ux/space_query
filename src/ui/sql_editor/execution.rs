@@ -22695,6 +22695,30 @@ impl SqlEditorWidget {
         Ok(statements)
     }
 
+    /// Ends the residual bookkeeping transaction left over from before a
+    /// session-scoped transaction-mode change, so the change takes effect from
+    /// the next statement instead of one transaction later. Only when the
+    /// session carries no user work — work belongs to the user, and MySQL
+    /// applies the new characteristics from their next transaction anyway.
+    fn end_mysql_residual_transaction_after_session_mode_change(
+        conn: &mut mysql::PooledConn,
+        retained_state: RetainedSessionState,
+        log_context: &str,
+    ) {
+        if retained_state.may_have_uncommitted_work() {
+            return;
+        }
+        if let Err(err) = conn.query_drop("ROLLBACK") {
+            crate::utils::logging::log_warning(
+                log_context,
+                &format!(
+                    "Could not end the residual transaction after a session transaction-mode change: {}",
+                    SqlEditorWidget::mysql_error_message(&err, None)
+                ),
+            );
+        }
+    }
+
     fn retain_mysql_pooled_session_with_state(
         pooled_db_session: &SharedDbSessionLease,
         connection_generation: u64,
@@ -24554,6 +24578,20 @@ impl SqlEditorWidget {
                 // must not block the tab's next execution.
                 final_retained_state =
                     final_retained_state.with_session_transaction_mode_override_adopted();
+                // MySQL latches isolation and access mode at TRANSACTION
+                // START, and under autocommit=0 the app's own bookkeeping
+                // reads leave a residual transaction that began under the OLD
+                // characteristics. Nothing else ends it: the next statement's
+                // session setup (which starts with ROLLBACK for exactly this
+                // reason) is legitimately skipped, because the session
+                // variables the user just set already match what the tab
+                // wants. Return the session to a transaction boundary here so
+                // the adopted mode governs the very next statement.
+                Self::end_mysql_residual_transaction_after_session_mode_change(
+                    &mut conn,
+                    final_retained_state,
+                    log_context,
+                );
             }
             if physical_session_resolution_required_by_policy {
                 // A central policy physical-resolution decision means the

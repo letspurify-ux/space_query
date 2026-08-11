@@ -870,10 +870,11 @@ fn object_metadata_refresh_aborts_when_scope_apply_fails() {
         .map(|offset| pooled_start + offset)
         .expect("context check helper should follow pooled object session helper");
     let pooled_helper = &object_content[pooled_start..pooled_end];
+    let compact_pooled_helper = pooled_helper.split_whitespace().collect::<String>();
     assert!(
-        pooled_helper.contains("let context = base_context.for_scope(selected_scope);")
-            && pooled_helper
-                .contains("base_context.acquire_session_for_scope(selected_scope)?"),
+        compact_pooled_helper.contains("letcontext=base_context.for_scope(selected_scope);")
+            && compact_pooled_helper
+                .contains("base_context.acquire_session_for_scope(selected_scope,&activity_guard)?"),
         "Object actions should acquire sessions for the selected connection root's explicit scope before querying metadata"
     );
 
@@ -885,8 +886,10 @@ fn object_metadata_refresh_aborts_when_scope_apply_fails() {
         .map(|offset| metadata_start + offset)
         .unwrap_or(object_content.len());
     let metadata_loader = &object_content[metadata_start..metadata_end];
+    // rustfmt wraps the call across lines here, so compare without whitespace.
+    let compact_metadata_loader = metadata_loader.split_whitespace().collect::<String>();
     assert!(
-        metadata_loader.contains("context.acquire_session_for_current_scope()")
+        compact_metadata_loader.contains("context.acquire_session_for_current_scope(activity)")
             && metadata_loader.contains("return None;"),
         "Object metadata refresh should stop when current-scope session acquire/apply fails"
     );
@@ -903,7 +906,7 @@ fn object_metadata_refresh_aborts_when_scope_apply_fails() {
         .unwrap_or(main_content.len());
     let schema_loader = &main_content[schema_start..schema_end];
     assert!(
-        schema_loader.contains("context.acquire_session_for_current_scope()")
+        schema_loader.contains("acquire_session_for_current_scope(activity)")
             && schema_loader.contains("return None;"),
         "Schema metadata refresh should stop when current-scope session acquire/apply fails"
     );
@@ -980,9 +983,14 @@ fn column_loader_applies_global_scope_before_unqualified_metadata_queries() {
     let content = fs::read_to_string(&file)
         .unwrap_or_else(|err| panic!("failed to read source file {}: {err}", file.display()));
 
+    // Assert the invariant, not the formatting: the acquire call now takes the
+    // activity guard, and rustfmt wraps it over several lines.
+    let compact = content.split_whitespace().collect::<String>();
     assert!(
-        content.contains("context.acquire_session_for_current_scope()")
-            && content.contains("Self::send_empty_column_load_update(&sender, &table_key, foreign_keys);"),
+        compact.contains("context.acquire_session_for_current_scope(&activity_guard)")
+            && compact.contains(
+                "Self::send_empty_column_load_update(&sender,&table_key,foreign_keys);"
+            ),
         "Column loading should abort with an empty update when current-scope session acquire/apply fails"
     );
 }
@@ -3155,6 +3163,38 @@ fn transaction_mode_state_has_a_single_source_of_truth() {
         settings_body.contains("mysql_pooled_session_settings_already_applied(")
             && settings_body.contains("!statement_requires_transaction_boundary"),
         "an already-correct MySQL session must be left alone, unless the statement must start a transaction"
+    );
+
+    // (14) The other side of that skip: when the USER's own statement changes
+    // the session characteristics, the session variables already match what the
+    // tab wants, so the next statement's setup — the ROLLBACK that ends the
+    // residual bookkeeping transaction included — is skipped. MySQL latches
+    // isolation and access mode at transaction start, so without ending that
+    // residual transaction here the adopted mode would only govern one
+    // statement later (live-observed: an adopted READ ONLY let the next INSERT
+    // through).
+    let mysql_action_start = execution
+        .find("fn run_mysql_pooled_action_with_timeout<")
+        .expect("the MySQL pooled action should exist");
+    let mysql_action_body = &execution[mysql_action_start..];
+    let adopted_start = mysql_action_start
+        + mysql_action_body
+            .find("with_session_transaction_mode_override_adopted()")
+            .expect("the MySQL adoption path should clear the session-scope residue");
+    let adopted_window = &execution[adopted_start..adopted_start + 900];
+    assert!(
+        adopted_window
+            .contains("end_mysql_residual_transaction_after_session_mode_change("),
+        "adopting a session-scoped transaction-mode change must return the MySQL session to a transaction boundary"
+    );
+    let end_residual_start = execution
+        .find("fn end_mysql_residual_transaction_after_session_mode_change(")
+        .expect("the residual-transaction helper should exist");
+    let end_residual_body = &execution[end_residual_start..end_residual_start + 900];
+    assert!(
+        end_residual_body.contains("may_have_uncommitted_work()")
+            && end_residual_body.contains("\"ROLLBACK\""),
+        "the residual transaction may only be ended when the session carries no user work"
     );
 }
 

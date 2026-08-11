@@ -218,6 +218,16 @@ impl Visit<'_> for PanicSyntaxVisitor<'_> {
     }
 }
 
+/// The debug-only lock-order detector is the one place where failing loudly IS
+/// the feature: it panics at the acquire site that inverted the order, because
+/// a deadlock precondition reported later (in a check test that may already
+/// have run) cannot be traced back to what caused it. The module is
+/// `#[cfg(debug_assertions)]`, so nothing of it reaches a release build, and
+/// the panic only arms under the opt-in `SPACE_QUERY_LOCK_ORDER_CHECK`.
+fn is_debug_only_diagnostic_file(path: &Path) -> bool {
+    path.ends_with(Path::new("db/lock_order.rs"))
+}
+
 fn is_test_source_file(path: &Path) -> bool {
     let file_name = path.file_name().and_then(|name| name.to_str());
     if matches!(file_name, Some("tests.rs")) {
@@ -239,7 +249,7 @@ fn collect_panic_syntax_offenders(
     let mut offenders = Vec::new();
 
     for file in collect_rust_files(src_root) {
-        if is_test_source_file(&file) {
+        if is_test_source_file(&file) || is_debug_only_diagnostic_file(&file) {
             continue;
         }
 

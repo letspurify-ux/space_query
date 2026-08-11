@@ -144,9 +144,12 @@ impl Target {
 
     fn teardown(self) -> Vec<String> {
         if self.is_oracle() {
-            vec!["DROP TABLE SQ_AC_T".into()]
+            vec!["DROP TABLE SQ_AC_T".into(), "DROP TABLE SQ_AC_DDL".into()]
         } else {
-            vec!["DROP TABLE IF EXISTS SQ_AC_T".into()]
+            vec![
+                "DROP TABLE IF EXISTS SQ_AC_T".into(),
+                "DROP TABLE IF EXISTS SQ_AC_DDL".into(),
+            ]
         }
     }
 }
@@ -164,6 +167,7 @@ struct RunCapture {
     results: Vec<QueryResult>,
     messages: Vec<String>,
     rows: Vec<Vec<String>>,
+    auto_commit_changes: Vec<bool>,
 }
 
 struct Harness {
@@ -211,6 +215,34 @@ impl Harness {
                     .map(|s| s.retained_state().transaction_state())
             );
         }
+        Ok(std::mem::take(
+            &mut *self.capture.lock().unwrap_or_else(|p| p.into_inner()),
+        ))
+    }
+
+    /// Pumps the event loop for a fixed time without waiting for anything —
+    /// used to let a batch that is already running reach a known point.
+    fn pump_for(&self, duration: Duration) {
+        let deadline = Instant::now() + duration;
+        while Instant::now() < deadline {
+            if !app::wait() {
+                app::check();
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        }
+    }
+
+    /// Starts a batch without waiting for it, so the caller can cancel it
+    /// while it runs. Pair with `finish_started`.
+    fn start(&mut self, sql: &str) {
+        self.done.store(false, Ordering::SeqCst);
+        *self.capture.lock().unwrap_or_else(|p| p.into_inner()) = RunCapture::default();
+        self.editor.execute_sql_text(sql);
+    }
+
+    fn finish_started(&mut self) -> Result<RunCapture, String> {
+        let done = Arc::clone(&self.done);
+        self.pump_until("started batch to finish", || done.load(Ordering::SeqCst))?;
         Ok(std::mem::take(
             &mut *self.capture.lock().unwrap_or_else(|p| p.into_inner()),
         ))
@@ -759,6 +791,243 @@ fn run_scenarios(target: Target, h: &mut Harness) -> Result<(), String> {
         h.run("ROLLBACK")?;
     }
 
+    // ---- S15: a session auto-commit change typed as SQL is adopted --------
+    // The transaction-mode twin of this (SET SESSION TRANSACTION ...) is
+    // covered by verify_transaction_mode_live S2. Auto-commit has the same
+    // promise: whatever the user types, the tab state and the indicator must
+    // agree with the session. The MySQL family really changes the server
+    // session variable; Oracle has no such statement, so the client's own
+    // SET AUTOCOMMIT is the query-driven path there.
+    println!("  --- S15 a query-driven session auto-commit change is adopted ---");
+    h.set_connection_auto_commit(false)
+        .map_err(|e| format!("set_auto_commit(false): {e}"))?;
+    h.editor.sync_tab_auto_commit_with_global_setting(false);
+    h.run("ROLLBACK")?;
+    let (on_sql, off_sql) = if target.is_oracle() {
+        ("SET AUTOCOMMIT ON", "SET AUTOCOMMIT OFF")
+    } else {
+        ("SET SESSION autocommit = 1", "SET @@session.autocommit = 0")
+    };
+    let capture = h.run(on_sql)?;
+    h.check(
+        "S15 the statement itself succeeded",
+        capture.results.iter().all(|r| r.success),
+        format!(
+            "results: {:?}",
+            capture
+                .results
+                .iter()
+                .map(|r| (r.success, r.message.clone()))
+                .collect::<Vec<_>>()
+        ),
+    );
+    h.check(
+        "S15 the tab adopted auto-commit ON",
+        h.editor.tab_auto_commit_override_value() == Some(true),
+        format!("override = {:?}", h.editor.tab_auto_commit_override_value()),
+    );
+    h.check(
+        "S15 the UI was notified of the adopted ON",
+        capture.auto_commit_changes.last() == Some(&true),
+        format!(
+            "AutoCommitChanged events: {:?}",
+            capture.auto_commit_changes
+        ),
+    );
+    h.check(
+        "S15 the connection default stayed OFF",
+        !h.connection_auto_commit(),
+        "a typed session change mutated the shared connection default".into(),
+    );
+    let before = h.select_v()?;
+    h.run(dml)?;
+    h.run("ROLLBACK")?;
+    let after = h.select_v()?;
+    h.check(
+        "S15 the adopted ON really commits (screen = session)",
+        after == before + 1,
+        format!("expected {}, got {after}", before + 1),
+    );
+    let capture = h.run(off_sql)?;
+    h.check(
+        "S15 the tab adopted auto-commit OFF",
+        h.editor.tab_auto_commit_override_value() == Some(false),
+        format!("override = {:?}", h.editor.tab_auto_commit_override_value()),
+    );
+    h.check(
+        "S15 the UI was notified of the adopted OFF",
+        capture.auto_commit_changes.last() == Some(&false),
+        format!(
+            "AutoCommitChanged events: {:?}",
+            capture.auto_commit_changes
+        ),
+    );
+    let before = h.select_v()?;
+    h.run(dml)?;
+    h.run("ROLLBACK")?;
+    let after = h.select_v()?;
+    h.check(
+        "S15 the adopted OFF keeps the work rollback-able",
+        after == before,
+        format!("expected {before}, got {after}"),
+    );
+    if !target.is_oracle() {
+        // The same statement INSIDE a script must govern the statements after
+        // it, like the SET AUTOCOMMIT tool command does in S13.
+        let before = h.select_v()?;
+        h.run(&format!("SET SESSION autocommit = 1;\n{dml};"))?;
+        h.run("ROLLBACK")?;
+        let after = h.select_v()?;
+        h.check(
+            "S15 a mid-script session change governs the statements after it",
+            after == before + 1,
+            format!("expected {}, got {after}", before + 1),
+        );
+    }
+    h.editor.sync_tab_auto_commit_with_global_setting(false);
+    h.run("ROLLBACK")?;
+
+    // ---- S16: the tab's pin survives a disconnect and reconnect -----------
+    // Reconnecting replaces every physical session, so the pin has to be
+    // re-applied to a session it has never seen (transaction mode has the
+    // same scenario in verify_transaction_mode_live S22).
+    println!("  --- S16 the tab's auto-commit pin survives a reconnect ---");
+    h.set_connection_auto_commit(false)
+        .map_err(|e| format!("set_auto_commit(false): {e}"))?;
+    h.editor.set_tab_auto_commit(true);
+    {
+        let mut guard = h.shared.lock().unwrap_or_else(|p| p.into_inner());
+        guard.disconnect();
+        guard
+            .connect(target.connection_info())
+            .map_err(|e| format!("reconnect: {e}"))?;
+    }
+    h.check(
+        "S16 the tab kept its pin across the reconnect",
+        h.editor.tab_auto_commit_override_value() == Some(true),
+        format!(
+            "override after reconnect: {:?}",
+            h.editor.tab_auto_commit_override_value()
+        ),
+    );
+    h.check(
+        "S16 the reconnected connection is back on its own default",
+        !h.connection_auto_commit(),
+        "the reconnect left the connection default ON".into(),
+    );
+    let before = h.select_v()?;
+    let capture = h.run(dml)?;
+    h.check(
+        "S16 the DML ran on the new connection",
+        capture.results.first().map(|r| r.success).unwrap_or(false),
+        format!(
+            "dml result: {:?}",
+            capture
+                .results
+                .first()
+                .map(|r| (r.success, r.message.clone()))
+        ),
+    );
+    h.run("ROLLBACK")?;
+    let after = h.select_v()?;
+    h.check(
+        "S16 the pin is applied to the new connection's session",
+        after == before + 1,
+        format!("expected {}, got {after}", before + 1),
+    );
+    h.editor.sync_tab_auto_commit_with_global_setting(false);
+    h.run("ROLLBACK")?;
+
+    // ---- S17: a cancel is not a change of what the tab is set to ----------
+    // Work that auto-commit already made durable must survive the cancel of a
+    // later statement, and the tab must still be pinned afterwards.
+    println!("  --- S17 a cancel keeps auto-committed work and the pin ---");
+    h.editor.set_tab_auto_commit(true);
+    let before = h.select_v()?;
+    let long_select = if target.is_oracle() {
+        "SELECT COUNT(*) FROM all_objects a, all_objects b, all_objects c"
+    } else {
+        "SELECT SLEEP(20)"
+    };
+    h.start(&format!("{dml};\n{long_select};"));
+    h.pump_for(Duration::from_millis(2500));
+    h.editor.cancel_current();
+    let capture = h.finish_started()?;
+    h.check(
+        "S17 the cancelled statement did not succeed",
+        capture.results.iter().any(|r| !r.success),
+        format!(
+            "results: {:?}",
+            capture
+                .results
+                .iter()
+                .map(|r| (r.success, r.message.clone()))
+                .collect::<Vec<_>>()
+        ),
+    );
+    h.check(
+        "S17 the tab is still pinned to auto-commit ON after the cancel",
+        h.editor.tab_auto_commit_override_value() == Some(true),
+        format!(
+            "override after cancel: {:?}",
+            h.editor.tab_auto_commit_override_value()
+        ),
+    );
+    // A cancelled statement leaves a session the app asks the user to resolve
+    // or discard; discard it the way the close path does before reading back.
+    let _ = h.editor.discard_pooled_session_for_close();
+    let after = h.select_v()?;
+    h.check(
+        "S17 the work auto-committed before the cancel survives",
+        after == before + 1,
+        format!("expected {}, got {after}", before + 1),
+    );
+    h.editor.sync_tab_auto_commit_with_global_setting(false);
+    h.run("ROLLBACK")?;
+
+    // ---- S18: a DDL's implicit commit ends the manual tab's transaction ----
+    // Both families commit the open transaction when a DDL runs. The tab is in
+    // manual mode, so the app's own bookkeeping has to follow the server: a
+    // ROLLBACK afterwards must not claim to undo work that is already durable,
+    // and the close prompt must not ask about it.
+    println!("  --- S18 a DDL implicitly commits the manual tab's work ---");
+    let ddl_table = "SQ_AC_DDL";
+    let _ = h.run(&format!("DROP TABLE {ddl_table}"));
+    let _ = h.editor.discard_pooled_session_for_close();
+    let before = h.select_v()?;
+    h.run(dml)?;
+    let create_ddl = if target.is_oracle() {
+        format!("CREATE TABLE {ddl_table} (V NUMBER)")
+    } else {
+        format!("CREATE TABLE {ddl_table} (V INT)")
+    };
+    let capture = h.run(&create_ddl)?;
+    h.check(
+        "S18 the DDL ran on the tab with uncommitted work",
+        capture.results.first().map(|r| r.success).unwrap_or(false),
+        format!(
+            "ddl result: {:?}",
+            capture
+                .results
+                .first()
+                .map(|r| (r.success, r.message.clone()))
+        ),
+    );
+    h.check(
+        "S18 the DDL's implicit commit left nothing for the close prompt",
+        !h.close_would_prompt(),
+        "the tab still reports work to resolve after a DDL committed it".into(),
+    );
+    h.run("ROLLBACK")?;
+    let after = h.select_v()?;
+    h.check(
+        "S18 the work before the DDL is durable (the ROLLBACK undid nothing)",
+        after == before + 1,
+        format!("expected {}, got {after}", before + 1),
+    );
+    let _ = h.run(&format!("DROP TABLE {ddl_table}"));
+    h.run("ROLLBACK")?;
+
     // ---- S6 (Oracle, runs last): script CONNECT resolves auto-commit from
     // the new connection's seeded default, not the old connection's value ----
     fn run_connect_scenario(target: Target, h: &mut Harness) -> Result<(), String> {
@@ -957,6 +1226,13 @@ fn attach_tab(shared: space_query::db::SharedConnection) -> Harness {
                         .unwrap_or_else(|p| p.into_inner())
                         .rows
                         .extend(rows.iter().cloned());
+                }
+                QueryProgress::AutoCommitChanged { enabled } => {
+                    capture
+                        .lock()
+                        .unwrap_or_else(|p| p.into_inner())
+                        .auto_commit_changes
+                        .push(*enabled);
                 }
                 QueryProgress::BatchFinished => {
                     done.store(true, Ordering::SeqCst);

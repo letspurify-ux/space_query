@@ -1673,6 +1673,139 @@ fn run_scenarios(target: Target, h: &mut Harness) -> Result<(), String> {
     );
     let _ = h.editor.discard_pooled_session_for_close();
 
+    // ---- S24: a pinned mode holds across an auto-committed statement -------
+    // Auto-commit ends the transaction after every statement, and on Oracle
+    // the access mode IS a transaction property — so a pinned READ ONLY tab
+    // with auto-commit ON has to re-establish the pin for the statement that
+    // follows an auto-commit inside the same batch. The two features are
+    // pinned per tab independently; this is where they meet.
+    println!("  --- S24 a pinned READ ONLY holds with auto-commit ON ---");
+    h.editor.clear_tab_transaction_mode_override();
+    h.run("ROLLBACK")?;
+    h.editor.set_tab_auto_commit(true);
+    h.editor.set_tab_transaction_mode(TransactionMode::new(
+        TransactionIsolation::Default,
+        TransactionAccessMode::ReadOnly,
+    ));
+    let capture = h.run("SELECT V FROM SQ_TM_T;\nINSERT INTO SQ_TM_T VALUES (24);")?;
+    let select_ok = capture
+        .results
+        .iter()
+        .find(|r| r.is_select)
+        .map(|r| r.success)
+        .unwrap_or(false);
+    h.check(
+        "S24 the read of the read-only tab ran",
+        select_ok,
+        format!(
+            "results: {:?}",
+            capture
+                .results
+                .iter()
+                .map(|r| (r.success, r.message.clone()))
+                .collect::<Vec<_>>()
+        ),
+    );
+    let insert_result = capture.results.iter().find(|r| r.sql.contains("INSERT"));
+    h.check(
+        "S24 the write after the auto-committed read is still refused",
+        insert_result.is_some_and(|r| {
+            !r.success
+                && read_only_errors.iter().any(|needle| {
+                    r.message
+                        .to_ascii_lowercase()
+                        .contains(&needle.to_ascii_lowercase())
+                })
+        }),
+        format!(
+            "insert result: {:?}",
+            insert_result.map(|r| (r.success, r.message.clone()))
+        ),
+    );
+    h.editor.clear_tab_transaction_mode_override();
+    h.editor.sync_tab_auto_commit_with_global_setting(false);
+    let _ = h.editor.discard_pooled_session_for_close();
+    let leaked = h.select_scalar("SELECT COUNT(*) FROM SQ_TM_T WHERE V = 24")?;
+    h.check(
+        "S24 the refused write left no row",
+        leaked.trim() == "0",
+        format!("COUNT(*) WHERE V = 24 = {leaked}"),
+    );
+    h.run("ROLLBACK")?;
+
+    // ---- S25: one statement that changes BOTH properties at once ----------
+    // (MySQL family) `SET SESSION TRANSACTION ISOLATION LEVEL x, READ ONLY`
+    // is a single statement carrying both halves of the mode. Adoption must
+    // take both, not the first one it recognises.
+    if !target.is_oracle() {
+        println!("  --- S25 a combined session characteristics change adopts both ---");
+        h.editor.clear_tab_transaction_mode_override();
+        h.run("ROLLBACK")?;
+        let combined = TransactionMode::new(
+            TransactionIsolation::Serializable,
+            TransactionAccessMode::ReadOnly,
+        );
+        let capture = h.run("SET SESSION TRANSACTION ISOLATION LEVEL SERIALIZABLE, READ ONLY")?;
+        h.check(
+            "S25 the combined statement succeeded",
+            capture.results.iter().all(|r| r.success),
+            format!(
+                "results: {:?}",
+                capture
+                    .results
+                    .iter()
+                    .map(|r| (r.success, r.message.clone()))
+                    .collect::<Vec<_>>()
+            ),
+        );
+        h.check(
+            "S25 the tab adopted both properties",
+            h.editor.tab_transaction_mode_override_value() == Some(combined),
+            format!(
+                "override = {:?}",
+                h.editor.tab_transaction_mode_override_value()
+            ),
+        );
+        h.check(
+            "S25 the UI was notified of the combined mode",
+            capture.mode_changes.last() == Some(&combined),
+            format!("TransactionModeChanged events: {:?}", capture.mode_changes),
+        );
+        let isolation_var = if target == Target::MariaDb {
+            "SELECT @@tx_isolation"
+        } else {
+            "SELECT @@transaction_isolation"
+        };
+        let isolation = h.select_scalar(isolation_var)?;
+        h.check(
+            "S25 the adopted isolation is really on the session",
+            isolation.to_ascii_uppercase().contains("SERIALIZABLE"),
+            format!("{isolation_var} = {isolation}"),
+        );
+        let capture = h.run("INSERT INTO SQ_TM_T VALUES (25)")?;
+        h.check(
+            "S25 the adopted READ ONLY really refuses a write",
+            capture.results.first().is_some_and(|r| {
+                !r.success
+                    && read_only_errors.iter().any(|needle| {
+                        r.message
+                            .to_ascii_lowercase()
+                            .contains(&needle.to_ascii_lowercase())
+                    })
+            }),
+            format!(
+                "insert result: {:?}",
+                capture
+                    .results
+                    .first()
+                    .map(|r| (r.success, r.message.clone()))
+            ),
+        );
+        h.editor.clear_tab_transaction_mode_override();
+        let _ = h.editor.discard_pooled_session_for_close();
+        h.run("ROLLBACK")?;
+    }
+
     // ---- S9: the toolbar gate opens and closes with the transaction --------
     // The mode controls are disabled exactly when the tab's session cannot take
     // a change. Uncommitted work blocks it on EVERY backend: replacement needs
