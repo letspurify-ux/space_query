@@ -3216,6 +3216,32 @@ fn mysql_load_index_statement(analysis: &SqlStatementAnalysis<'_>) -> bool {
     mysql_statement_starts_with_words(analysis, &["LOAD", "INDEX"])
 }
 
+/// True when `sql` explicitly puts the CURRENT transaction into READ WRITE on
+/// the MySQL family: a one-shot `SET TRANSACTION ... READ WRITE` (no
+/// SESSION/GLOBAL scope; consumed by the next transaction) or
+/// `START TRANSACTION ... READ WRITE`. The server honours both over a READ
+/// ONLY session characteristic, so a READ ONLY tab pin must refuse them
+/// client-side — the same promise the Oracle client gate keeps. The
+/// session-scoped forms are deliberately not escapes: they are adopted into
+/// the tab and re-pin it honestly.
+pub(crate) fn mysql_statement_escapes_read_only_transaction_for_db_type(
+    db_type: DatabaseType,
+    sql: &str,
+) -> bool {
+    let effective_sql = mysql_effective_statement_sql_for_db_type(db_type, sql);
+    let analysis = SqlStatementAnalysis::new_for_db_type(db_type, &effective_sql);
+    let words = analysis.words();
+    if mysql_statement_starts_with_words(&analysis, &["START", "TRANSACTION"])
+        || (!mysql_set_body_starts_with_user_variable(&effective_sql)
+            && mysql_set_next_transaction_statement(&analysis))
+    {
+        return words[2..]
+            .windows(2)
+            .any(|pair| pair[0] == "READ" && pair[1] == "WRITE");
+    }
+    false
+}
+
 fn mysql_set_transaction_statement_affects_physical_session(
     sql: &str,
     analysis: &SqlStatementAnalysis<'_>,
@@ -6682,6 +6708,58 @@ mod tests {
             );
             assert!(!released.requires_physical_session_preservation(), "{sql}");
         }
+    }
+
+    #[test]
+    fn mysql_read_only_escape_detects_only_per_transaction_read_write_forms() {
+        for db_type in [DatabaseType::MySQL, DatabaseType::MariaDB] {
+            for sql in [
+                "SET TRANSACTION READ WRITE",
+                "set transaction read write",
+                "/* c */ SET TRANSACTION READ WRITE",
+                "SET TRANSACTION ISOLATION LEVEL SERIALIZABLE, READ WRITE",
+                "START TRANSACTION READ WRITE",
+                "START TRANSACTION WITH CONSISTENT SNAPSHOT, READ WRITE",
+            ] {
+                assert!(
+                    mysql_statement_escapes_read_only_transaction_for_db_type(db_type, sql),
+                    "{sql} must be treated as a READ WRITE escape on {db_type}"
+                );
+            }
+            for sql in [
+                // Session-scoped forms are adopted and re-pin the tab; the
+                // toolbar stays honest, so they are not escapes.
+                "SET SESSION TRANSACTION READ WRITE",
+                "SET LOCAL TRANSACTION READ WRITE",
+                "SET SESSION transaction_read_only = OFF",
+                // Global scope does not touch this session's transaction.
+                "SET GLOBAL TRANSACTION READ WRITE",
+                // No explicit access mode: the session characteristic governs.
+                "SET TRANSACTION ISOLATION LEVEL SERIALIZABLE",
+                "START TRANSACTION",
+                "START TRANSACTION READ ONLY",
+                "START TRANSACTION WITH CONSISTENT SNAPSHOT",
+                "BEGIN",
+                // User-variable SETs are not transaction statements at all.
+                "SET @start = 'TRANSACTION READ WRITE'",
+                // Reads mentioning the words are not statements of intent.
+                "SELECT 'SET TRANSACTION READ WRITE'",
+                "INSERT INTO t VALUES (1)",
+            ] {
+                assert!(
+                    !mysql_statement_escapes_read_only_transaction_for_db_type(db_type, sql),
+                    "{sql} must not be treated as a READ WRITE escape on {db_type}"
+                );
+            }
+        }
+        // The MariaDB SET STATEMENT wrapper must not hide the escape.
+        assert!(
+            mysql_statement_escapes_read_only_transaction_for_db_type(
+                DatabaseType::MariaDB,
+                "SET STATEMENT max_statement_time=10 FOR START TRANSACTION READ WRITE",
+            ),
+            "a SET STATEMENT wrapper must not hide the READ WRITE escape"
+        );
     }
 
     #[test]

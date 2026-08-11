@@ -3036,10 +3036,11 @@ fn transaction_mode_state_has_a_single_source_of_truth() {
     );
 
     // (8) Oracle accepts SET TRANSACTION only as a transaction's first
-    // statement. BOTH Oracle paths must therefore yield to a batch that opens
-    // with one, or the tab's mode is injected ahead of the user's statement and
-    // the server rejects it with ORA-01453. This was live-observed on thin,
-    // which lacked the guard the OCI path already had.
+    // statement, so BOTH Oracle paths yield the mode INJECTION to a batch
+    // that opens with one (ORA-01453) — and only the injection. Replacing the
+    // batch's mode VALUE to express the yield disarmed the Read only gate and
+    // the boundary re-application for the whole batch (live-observed:
+    // `SET TRANSACTION READ WRITE; INSERT ...` wrote on a Read only tab).
     let thin_backend_start = execution
         .find("impl ExecutionWorkerBackend for OracleExecutionWorkerBackend")
         .expect("Oracle thin execution backend should exist");
@@ -3049,12 +3050,25 @@ fn transaction_mode_state_has_a_single_source_of_truth() {
         .expect("MySQL execution backend should follow the Oracle one");
     let thin_backend = &execution[thin_backend_start..thin_backend_end];
     assert!(
-        thin_backend.contains("requires_transaction_first_statement("),
-        "the Oracle thin path must yield to a user's own transaction-first statement, as the OCI path does"
+        !thin_backend.contains("requires_transaction_first_statement("),
+        "the thin backend must not replace the batch's transaction mode to express the yield"
     );
     assert!(
-        execution.contains("let explicit_transaction_first_statement ="),
-        "the Oracle OCI path must keep its transaction-first-statement guard"
+        execution.contains("&& Self::is_transaction_first_statement(&execution_sql)"),
+        "the thin loop must yield the mode injection per statement, keeping the tab's true mode"
+    );
+    assert!(
+        execution.contains("let explicit_transaction_first_statement =")
+            && execution.contains("&& !explicit_transaction_first_statement;"),
+        "the OCI path must skip only the batch-start injection for a transaction-first opener"
+    );
+    // The MySQL family's server honours per-transaction READ WRITE escapes
+    // (one-shot SET TRANSACTION, START TRANSACTION READ WRITE) over the READ
+    // ONLY session characteristic, so the batch loop must refuse them
+    // client-side while the tab is pinned Read only.
+    assert!(
+        execution.contains("mysql_statement_escapes_read_only_transaction_for_db_type("),
+        "the MySQL batch loop must refuse the per-transaction READ WRITE escapes on a Read only tab"
     );
 
     // (9) A Read only tab must refuse writes on BOTH Oracle drivers. The

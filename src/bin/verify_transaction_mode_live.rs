@@ -43,6 +43,9 @@
 //       auto-committed read inside the same batch.
 //   S25 (MySQL family) the combined one-statement form adopts BOTH properties,
 //       notifies the UI, and both really apply.
+//   S30 (MySQL family) the two per-transaction READ WRITE escape forms
+//       (one-shot SET TRANSACTION, START TRANSACTION READ WRITE) are refused
+//       on a READ ONLY tab; Oracle keeps the same promise via its client gate.
 //   S26 the toolbar's OTHER half: picking a mode pins the tab AND applies the
 //       change to the tab's retained session. Driven on the state the toolbar
 //       meets in practice - a session the tab has already read on, which under
@@ -2120,6 +2123,102 @@ fn run_scenarios(target: Target, h: &mut Harness) -> Result<(), String> {
                 .first()
                 .map(|r| (r.success, r.message.clone()))
         ),
+    );
+    h.run("ROLLBACK")?;
+
+    // ---- S30: explicit READ WRITE escapes cannot write on a READ ONLY tab --
+    // The MySQL family expresses the pin as a SESSION characteristic, and the
+    // server itself lets two per-transaction forms override it: a one-shot
+    // `SET TRANSACTION READ WRITE` (consumed by the next transaction) and
+    // `START TRANSACTION READ WRITE`. Without a client-side gate an INSERT
+    // rides them through while the toolbar reads READ ONLY. Oracle's client
+    // gate already keeps this promise: the escape statement runs, but the
+    // write after it is refused.
+    println!("  --- S30 explicit READ WRITE escapes cannot write on a READ ONLY tab ---");
+    h.toolbar_transaction_mode(TransactionMode::new(
+        TransactionIsolation::Default,
+        TransactionAccessMode::ReadOnly,
+    ));
+    if target.is_oracle() {
+        let capture = h.run("SET TRANSACTION READ WRITE;\nINSERT INTO SQ_TM_T VALUES (30);")?;
+        let insert_result = capture
+            .results
+            .iter()
+            .find(|result| result.sql.contains("INSERT"))
+            .cloned();
+        h.check(
+            "S30 the write after a one-shot READ WRITE is still refused",
+            insert_result.as_ref().is_some_and(|result| {
+                !result.success
+                    && read_only_errors.iter().any(|needle| {
+                        result
+                            .message
+                            .to_ascii_lowercase()
+                            .contains(&needle.to_ascii_lowercase())
+                    })
+            }),
+            format!(
+                "insert result: {:?}",
+                insert_result.map(|r| (r.success, r.message.clone()))
+            ),
+        );
+        h.run("ROLLBACK")?;
+    } else {
+        let capture = h.run("SET TRANSACTION READ WRITE")?;
+        h.check(
+            "S30 the one-shot READ WRITE escape is refused on a READ ONLY tab",
+            capture
+                .results
+                .first()
+                .is_some_and(|result| !result.success),
+            format!(
+                "one-shot escape: {:?}",
+                capture
+                    .results
+                    .first()
+                    .map(|r| (r.success, r.message.clone()))
+            ),
+        );
+        let capture = h.run("INSERT INTO SQ_TM_T VALUES (30)")?;
+        h.check(
+            "S30 the write after the one-shot attempt is refused",
+            capture
+                .results
+                .first()
+                .is_some_and(|result| !result.success),
+            format!(
+                "insert after one-shot: {:?}",
+                capture
+                    .results
+                    .first()
+                    .map(|r| (r.success, r.message.clone()))
+            ),
+        );
+        let capture =
+            h.run("START TRANSACTION READ WRITE;\nINSERT INTO SQ_TM_T VALUES (30);\nCOMMIT;")?;
+        h.check(
+            "S30 START TRANSACTION READ WRITE is refused on a READ ONLY tab",
+            capture
+                .results
+                .first()
+                .is_some_and(|result| !result.success),
+            format!(
+                "start-transaction escape: {:?}",
+                capture
+                    .results
+                    .first()
+                    .map(|r| (r.success, r.message.clone()))
+            ),
+        );
+        let _ = h.run("ROLLBACK");
+    }
+    h.editor.clear_tab_transaction_mode_override();
+    let _ = h.editor.discard_pooled_session_for_close();
+    let leaked = h.select_scalar("SELECT COUNT(*) FROM SQ_TM_T WHERE V = 30")?;
+    h.check(
+        "S30 no row landed through an explicit READ WRITE escape",
+        leaked.trim() == "0",
+        format!("COUNT(*) WHERE V = 30 = {leaked}"),
     );
     h.run("ROLLBACK")?;
 

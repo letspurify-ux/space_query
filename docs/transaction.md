@@ -305,6 +305,19 @@ transaction for READ COMMITTED, and one snapshot held for REPEATABLE READ and
 gone proves is the pin's doing (S29). S29 is also where the Oracle client gate
 does NOT act: a locking read reads like a query, so it is the server's
 ORA-01456 that refuses it — the backstop the gate's own comment promises.
+S30 closes the explicit per-transaction escapes: on the MySQL family the
+server honours a one-shot `SET TRANSACTION READ WRITE` and
+`START TRANSACTION READ WRITE` over a READ ONLY session characteristic, so a
+pinned tab refuses those two statements client-side
+(`mysql_statement_escapes_read_only_transaction_for_db_type`; the
+session-scoped forms stay allowed — they adopt and re-pin the tab honestly).
+On Oracle the same scenario exposed that a batch OPENING with a
+transaction-first statement replaced the whole batch's mode with the default
+to avoid ORA-01453 — which also disarmed the Read only gate and the
+re-application for every statement of that batch. Both Oracle loops now yield
+only the INJECTION to the user's transaction-first opener; the mode itself
+stays the tab's, so the gate still refuses writes inside the user's
+transaction and the pin re-applies once it ends.
 
 InnoDB's SERIALIZABLE turns plain reads into locking reads, so the snapshot
 pair cannot be used for it on the MySQL family (it would block the other

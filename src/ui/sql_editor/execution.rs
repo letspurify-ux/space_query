@@ -1089,23 +1089,15 @@ impl ExecutionWorkerBackend for OracleExecutionWorkerBackend {
         // Oracle allows SET TRANSACTION only as a transaction's first
         // statement. When the user's own batch opens with one, the tab's mode
         // must not be injected ahead of it or theirs is no longer first
-        // (ORA-01453). The OCI path already yields this way; without the same
-        // rule here a thin tab pinned to a non-default mode could not run a
-        // SET TRANSACTION at all.
-        let yields_to_user_transaction_statement =
-            SqlEditorWidget::requires_transaction_first_statement(&items);
-        let selected_transaction_mode = if yields_to_user_transaction_statement {
-            crate::db::TransactionMode::default()
-        } else {
-            selected_transaction_mode
-        };
-        // The session-level isolation reset is an injection too, so it yields
-        // to the user's own transaction-first statement for the same reason.
-        let tab_selected_transaction_mode = if yields_to_user_transaction_statement {
-            None
-        } else {
-            load_mutex_transaction_mode_option(tab_transaction_mode_override)
-        };
+        // (ORA-01453). The batch loop yields that injection per statement
+        // (`is_transaction_first_statement` marks the mode applied without
+        // issuing it), so the mode itself stays the tab's: replacing it with
+        // the default here disarmed the Read only client gate — and the
+        // re-application after the user's transaction ends — for the WHOLE
+        // batch (live-observed: `SET TRANSACTION READ WRITE; INSERT ...` wrote
+        // on a Read only tab).
+        let tab_selected_transaction_mode =
+            load_mutex_transaction_mode_option(tab_transaction_mode_override);
         let batch_outcome = SqlEditorWidget::execute_oracle_thin_batch_with_connection(
             &mut thin_conn,
             sender,
@@ -7250,6 +7242,18 @@ impl SqlEditorWidget {
                     statement_reached_server: false,
                 });
             }
+            if active_transaction_mode.get().access_mode
+                == crate::db::TransactionAccessMode::ReadOnly
+                && crate::db::transaction::mysql_statement_escapes_read_only_transaction_for_db_type(
+                    db_type, sql,
+                )
+            {
+                return Err(MySqlBatchStatementError {
+                    message: SqlEditorWidget::mysql_read_only_escape_block_message(),
+                    effects: statement_effects,
+                    statement_reached_server: false,
+                });
+            }
             let sql_to_execute = crate::db::query::mysql_executor::MysqlExecutor::statement_sql_preserving_found_rows_for_db_type(
                 db_type,
                 sql,
@@ -10115,22 +10119,14 @@ impl SqlEditorWidget {
                 }
                 let explicit_transaction_first_statement =
                     SqlEditorWidget::requires_transaction_first_statement(&items);
-                let transaction_mode = if explicit_transaction_first_statement {
-                    crate::db::TransactionMode::default()
-                } else {
-                    selected_transaction_mode
-                };
+                let transaction_mode = selected_transaction_mode;
                 let requires_transaction_first_statement = explicit_transaction_first_statement
                     || db_type.transaction_mode_requires_first_statement(transaction_mode);
                 let transaction_mode_application = OracleTransactionModeApplication {
                     mode: transaction_mode,
-                    // The session-level isolation reset is an injection too, so
-                    // it yields to the user's own transaction-first statement.
-                    tab_selected: if explicit_transaction_first_statement {
-                        None
-                    } else {
-                        load_mutex_transaction_mode_option(&tab_transaction_mode_override)
-                    },
+                    tab_selected: load_mutex_transaction_mode_option(
+                        &tab_transaction_mode_override,
+                    ),
                     default_isolation: default_transaction_isolation,
                 };
                 // A batch that opens with CONNECT must not have the tab's mode
@@ -10146,9 +10142,18 @@ impl SqlEditorWidget {
                     items.first(),
                     Some(ScriptItem::ToolCommand(ToolCommand::Connect { .. }))
                 );
+                // A batch whose first statement is the user's own
+                // transaction-first statement (SET TRANSACTION / ALTER SESSION
+                // SET ISOLATION_LEVEL) must not have the mode injected ahead of
+                // it (ORA-01453). Only the batch-start injection yields: the
+                // mode itself stays the tab's, so the Read only gate still
+                // refuses writes inside the user's transaction, and the
+                // mid-batch re-application restores the pin once that
+                // transaction ends.
                 let should_apply_oracle_transaction_mode =
                     !oracle_prior_requires_physical_session_preservation
-                        && !batch_starts_with_connect;
+                        && !batch_starts_with_connect
+                        && !explicit_transaction_first_statement;
 
                 if let Some(conn) = conn_opt.as_ref() {
                     if let Err(err) = conn.set_call_timeout(query_timeout) {
@@ -20814,6 +20819,16 @@ impl SqlEditorWidget {
 
     fn oracle_read_only_block_message() -> String {
         "Error: Oracle read-only mode blocks non-query statements. Switch to Read write to run this statement.".to_string()
+    }
+
+    /// The MySQL-family twin of the Oracle read-only client gate, for the one
+    /// hole the SESSION characteristic cannot cover: the server lets a
+    /// one-shot `SET TRANSACTION READ WRITE` and `START TRANSACTION READ
+    /// WRITE` override READ ONLY for their transaction, so a pinned tab must
+    /// refuse the escape statement itself.
+    fn mysql_read_only_escape_block_message() -> String {
+        "Read only mode blocks an explicit READ WRITE transaction. Switch to Read write to run this statement."
+            .to_string()
     }
 
     fn sync_serveroutput_with_session(
