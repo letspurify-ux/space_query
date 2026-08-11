@@ -16,6 +16,14 @@
 //   T6 disconnecting closes every session the tab ever used
 //   T7 disconnecting closes the session an OPEN lazy fetch is holding
 //   T8 a tab closed mid-cancel (owner gone before the worker) leaves nothing
+//   T9 Cancel-and-discard on an open lazy fetch closes its session with the
+//      tab still open -- the discard itself, with no tab close or disconnect
+//      standing behind it as a second net
+//   T10 disconnecting immediately after a cancel (no waiting) leaves nothing:
+//      the cancel watchdog and the teardown race, and both must lose to
+//      neither
+//   T11 reconnecting (connect over a live connection, no disconnect first)
+//      with an OPEN lazy fetch closes every replaced session
 //
 // T7 and T8 drive interleavings the app's own guards normally prevent (the
 // disconnect menu refuses while a lazy fetch is open; a close of a running tab
@@ -340,6 +348,27 @@ impl Report {
             self.failures.push(label.to_string());
         }
     }
+
+    fn check_flag(&mut self, label: &str, ok: bool) {
+        if ok {
+            println!("    OK  {label}");
+        } else {
+            println!("    FAIL {label}");
+            self.failures.push(label.to_string());
+        }
+    }
+}
+
+/// Pump the UI loop until the condition holds or the deadline passes.
+fn wait_until(timeout: Duration, mut condition: impl FnMut() -> bool) -> bool {
+    let deadline = Instant::now() + timeout;
+    while !condition() {
+        if Instant::now() >= deadline {
+            return false;
+        }
+        pump(Duration::from_millis(100));
+    }
+    true
 }
 
 fn oracle_probe_user(target: Target) -> Result<(String, Census), String> {
@@ -652,6 +681,97 @@ fn verify(target: Target) -> Result<bool, String> {
         observed,
         connected_before_t8,
     );
+    shared
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .disconnect();
+
+    // T9: cancel-and-discard on an OPEN lazy fetch with the tab left open.
+    // Everywhere else the discard runs, a tab close or a disconnect stands
+    // behind it as a second net; here the discard itself has to close the
+    // session, clear the worker's handle, and leave the tab's slot empty.
+    println!("  --- T9 cancel-and-discard closes an open lazy fetch's session ---");
+    connection_reconnect(&shared, target, &probe_user, &probe_service)?;
+    let connected_before_t9 = stable_count(&mut census)?;
+    let mut tab = Tab::open(&shared);
+    tab.editor.set_lazy_fetch_batch_size(50);
+    tab.run(target.many_rows_sql())?;
+    let open = tab.editor.has_open_lazy_fetch();
+    println!("    lazy fetch open after the SELECT: {open}");
+    if !open {
+        println!("    (note) no lazy fetch stayed open; T9's census check degenerates");
+    }
+    if let Some(session_id) = tab.editor.active_lazy_fetch_session() {
+        tab.editor
+            .request_lazy_fetch(session_id, LazyFetchRequest::CancelAndDiscard);
+    }
+    let worker_released = wait_until(Duration::from_secs(45), || {
+        !tab.editor.has_open_lazy_fetch()
+    });
+    report.check_flag(
+        "T9 the discarded lazy fetch clears its worker handle",
+        worker_released,
+    );
+    let observed = settled_count(&mut census, connected_before_t9)?;
+    report.check(
+        "T9 cancel-and-discard closes an open lazy fetch's session",
+        observed,
+        connected_before_t9,
+    );
+    report.check_flag(
+        "T9 the tab retains nothing after the discard",
+        tab.editor.pooled_session_activity_snapshot().is_none(),
+    );
+    tab.close();
+
+    // T10: disconnect the instant after a cancel, without waiting for the
+    // cancel to land. The cancel watchdog is escalating while the teardown
+    // runs; whichever finishes second must still find nothing left to leak.
+    println!("  --- T10 disconnecting right after a cancel leaves nothing ---");
+    let mut tab = Tab::open(&shared);
+    tab.start(target.sleep_sql());
+    pump(Duration::from_millis(1500));
+    tab.editor.cancel_current();
+    shared
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .disconnect();
+    // Exactly what main_window does after a disconnect.
+    space_query::db::sweep_stale_db_activities(Duration::from_secs(2));
+    let _ = tab.wait_for_batch(Duration::from_secs(60));
+    let observed = settled_count(&mut census, disconnected_baseline)?;
+    report.check(
+        "T10 disconnecting right after a cancel leaves nothing",
+        observed,
+        disconnected_baseline,
+    );
+    tab.close();
+
+    // T11: reconnect over a live connection -- connect() with no disconnect
+    // first, the way the reconnect menu does it -- while an OPEN lazy fetch
+    // still holds a session of the connection being replaced. The replaced
+    // pool, the tab's retained session and the parked worker's session must
+    // all go; the new connection's own baseline is all that may remain.
+    println!("  --- T11 reconnecting closes the replaced connection's sessions ---");
+    connection_reconnect(&shared, target, &probe_user, &probe_service)?;
+    let mut tab = Tab::open(&shared);
+    tab.editor.set_lazy_fetch_batch_size(50);
+    tab.run(target.many_rows_sql())?;
+    let open = tab.editor.has_open_lazy_fetch();
+    println!("    lazy fetch open after the SELECT: {open}");
+    if !open {
+        println!("    (note) no lazy fetch stayed open; T11 degenerates into a plain reconnect");
+    }
+    connection_reconnect(&shared, target, &probe_user, &probe_service)?;
+    // Exactly what main_window does after a reconnect.
+    space_query::db::sweep_stale_db_activities(Duration::from_secs(2));
+    let observed = settled_count(&mut census, connected_baseline)?;
+    report.check(
+        "T11 reconnecting closes the replaced connection's sessions",
+        observed,
+        connected_baseline,
+    );
+    tab.close();
     shared
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())

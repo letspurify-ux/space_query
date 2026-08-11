@@ -195,8 +195,10 @@ reconnect, disconnect, pool resize):
 live database by counting the server's own sessions (`information_schema.processlist`
 / `v$session`) around each event: discard, return-and-reuse, tab close, an
 orphaned lease, disconnect, reconnect, pool resize, a connection dropped without
-being disconnected, a connection attempt that is thrown away, and three
-connect/disconnect cycles. Each backend joins by
+being disconnected, a connection attempt that is thrown away, three
+connect/disconnect cycles, and two live connections at once — disconnecting one
+closes exactly its own sessions while the other's retained session stays put,
+which is the isolation the process-wide generation exists to provide. Each backend joins by
 handing the engine a connection and a census; the probe connects through an
 identity of its own (a database of its own on the MySQL family, a user of its
 own on Oracle) so the count sees this test's sessions and nobody else's.
@@ -208,7 +210,11 @@ lease slot, a cancelled statement leaves the session wherever the force close
 left it, and a statement still on the server when the connection goes away is
 owned by nothing the teardown can reach — only the stale sweep can retire that
 work and take its session with it. It also runs five tab open/close rounds,
-because a leak of one session per tab is invisible in a single pass. A script CONNECT's own connection is torn down by dropping the
+because a leak of one session per tab is invisible in a single pass; a
+cancel-and-discard with the tab left open, because everywhere else a tab close
+or disconnect stands behind the discard as a second net; a disconnect issued
+the instant after a cancel, so the cancel watchdog and the teardown race; and a
+reconnect over a live connection while a lazy fetch is still open. A script CONNECT's own connection is torn down by dropping the
 tab's binding, which a harness cannot do (it cannot destroy the FLTK widget), so
 that path is covered by the engine's drop-without-disconnect case instead.
 

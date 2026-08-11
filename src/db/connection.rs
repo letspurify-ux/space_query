@@ -9102,6 +9102,104 @@ mod tests {
             );
             tab_lease.clear();
         }
+
+        // L12: two live connections at once. Teardown is keyed on a
+        // process-wide connection generation precisely so that one
+        // connection's disconnect can never reach another connection's
+        // sessions -- and must still take every one of its own. Both claims
+        // in one event: the survivor's retained session stays, the departing
+        // connection's retained session is reclaimed, and the server count
+        // comes down to exactly the survivor's footprint.
+        {
+            let survivor = create_shared_connection();
+            connect_shared_connection_with_policy(&survivor, info.clone(), POOL_SIZE, policy)
+                .expect("connect the survivor connection");
+            let survivor_ctx = context(&survivor);
+            let survivor_retained = acquire(&survivor_ctx);
+            let survivor_lease = SharedDbSessionLease::new();
+            assert!(
+                survivor_lease.apply_retained_session_disposition(
+                    survivor_ctx.connection_generation,
+                    survivor_ctx.pool_context_epoch(),
+                    survivor_retained,
+                    RetainedSessionDisposition::Retain(RetainedSessionState::default()),
+                    "session census probe",
+                ),
+                "the survivor tab should retain its session"
+            );
+            let survivor_only = stable_server_session_count(census);
+
+            connect_shared_connection_with_policy(&shared, info.clone(), POOL_SIZE, policy)
+                .expect("connect the departing connection");
+            let departing_ctx = context(&shared);
+            let departing_retained = acquire(&departing_ctx);
+            let departing_lease = SharedDbSessionLease::new();
+            assert!(
+                departing_lease.apply_retained_session_disposition(
+                    departing_ctx.connection_generation,
+                    departing_ctx.pool_context_epoch(),
+                    departing_retained,
+                    RetainedSessionDisposition::Retain(RetainedSessionState::default()),
+                    "session census probe",
+                ),
+                "the departing tab should retain its session"
+            );
+            let both = stable_server_session_count(census);
+            assert!(
+                both > survivor_only,
+                "the departing connection should have opened sessions of its own \
+                 ({survivor_only} -> {both})"
+            );
+
+            drop(departing_ctx);
+            shared
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .disconnect();
+            assert_server_sessions_at_most(
+                census,
+                survivor_only,
+                "L12 disconnecting one connection closes only that connection's sessions",
+            );
+            wait_for_lease_reclaim(
+                &departing_lease,
+                "L12 the departing connection's retained session is reclaimed",
+            );
+            assert!(
+                survivor_lease.snapshot().is_some(),
+                "L12 the surviving connection's retained session must not be \
+                 reclaimed by another connection's teardown"
+            );
+
+            drop(survivor_ctx);
+            survivor
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .disconnect();
+            assert_server_sessions_at_most(
+                census,
+                disconnected_baseline,
+                "L12 disconnecting the second connection closes the rest",
+            );
+            wait_for_lease_reclaim(
+                &survivor_lease,
+                "L12 the surviving connection's retained session is reclaimed by its own teardown",
+            );
+        }
+    }
+
+    /// A retained lease is reclaimed by a background thread after its
+    /// connection's teardown; wait for that to land rather than asserting on
+    /// the instant after disconnect returned.
+    fn wait_for_lease_reclaim(lease: &SharedDbSessionLease, label: &str) {
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while lease.snapshot().is_some() {
+            assert!(
+                Instant::now() < deadline,
+                "{label}: the retained lease was never reclaimed"
+            );
+            std::thread::sleep(Duration::from_millis(100));
+        }
     }
 
     fn assert_mysql_family_connection_lifecycle_closes_every_server_session(
