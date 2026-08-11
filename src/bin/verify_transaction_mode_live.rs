@@ -1970,6 +1970,159 @@ fn run_scenarios(target: Target, h: &mut Harness) -> Result<(), String> {
         format!("V {baseline_v} -> {restored_v} (mutation: {dirty_outcome})"),
     );
 
+    // ---- S28: every isolation level the toolbar offers really applies ------
+    // The scenarios above pin one level each (SERIALIZABLE, REPEATABLE READ).
+    // A level the toolbar offers but nothing ever exercises could be spelled
+    // wrong, be rejected by the server, or land on the session as a different
+    // level, and the app would only find out in a user's hands. Walk every
+    // level each backend offers, through the toolbar's own write path, and
+    // read the result back where a level is observable.
+    println!("  --- S28 every offered isolation level really applies ---");
+    {
+        let mut other = attach_tab(connect_target(target)?);
+        let isolation_variable = match target {
+            Target::MariaDb => Some("SELECT @@tx_isolation"),
+            Target::MySql => Some("SELECT @@transaction_isolation"),
+            Target::OracleOci | Target::OracleThin => None,
+        };
+        for isolation in offered_isolations(target) {
+            h.editor.clear_tab_transaction_mode_override();
+            h.run("ROLLBACK")?;
+            let _ = h.editor.discard_pooled_session_for_close();
+            let outcome = h.toolbar_transaction_mode(TransactionMode::new(
+                isolation,
+                TransactionAccessMode::ReadWrite,
+            ));
+            let label = isolation.label();
+
+            if let Some(sql) = isolation_variable {
+                let applied = h.select_scalar(sql)?;
+                h.check(
+                    &format!("S28 {label} is on the session"),
+                    isolation_value_matches(&applied, isolation),
+                    format!("session reported {applied:?} (retained outcome: {outcome})"),
+                );
+            }
+
+            match isolation {
+                // The only level with a behaviour of its own that no other
+                // level shows: a read of another session's uncommitted work.
+                TransactionIsolation::ReadUncommitted => {
+                    other.run("UPDATE SQ_TM_ISO SET V = V + 1000")?;
+                    let seen = h.select_scalar("SELECT V FROM SQ_TM_ISO")?;
+                    let uncommitted = other.select_scalar("SELECT V FROM SQ_TM_ISO")?;
+                    other.run("ROLLBACK")?;
+                    h.run("ROLLBACK")?;
+                    h.check(
+                        "S28 READ UNCOMMITTED really reads uncommitted work",
+                        seen.trim() == uncommitted.trim(),
+                        format!(
+                            "the tab read {seen:?} while the other session held {uncommitted:?} \
+                             uncommitted"
+                        ),
+                    );
+                }
+                // Sees another session's commit inside its own transaction.
+                TransactionIsolation::ReadCommitted => {
+                    let (first, second) = iso_snapshot_pair(h, &mut other)?;
+                    h.run("ROLLBACK")?;
+                    h.check(
+                        "S28 READ COMMITTED sees a commit inside its transaction",
+                        second > first,
+                        format!("reads bracketing the other session's commit: {first} -> {second}"),
+                    );
+                }
+                // Must not: one transaction, one snapshot.
+                TransactionIsolation::RepeatableRead => {
+                    let (first, second) = iso_snapshot_pair(h, &mut other)?;
+                    h.run("ROLLBACK")?;
+                    h.check(
+                        "S28 REPEATABLE READ holds one snapshot",
+                        first == second,
+                        format!("reads bracketing the other session's commit: {first} -> {second}"),
+                    );
+                }
+                TransactionIsolation::Serializable => {
+                    if target.is_oracle() {
+                        let (first, second) = iso_snapshot_pair(h, &mut other)?;
+                        h.run("ROLLBACK")?;
+                        h.check(
+                            "S28 SERIALIZABLE holds one snapshot",
+                            first == second,
+                            format!(
+                                "reads bracketing the other session's commit: {first} -> {second}"
+                            ),
+                        );
+                    }
+                    // InnoDB's SERIALIZABLE turns plain reads into locking
+                    // reads, so the same pair would block the other session
+                    // instead of reporting a snapshot (see S18). The session
+                    // read-back above is the honest check there.
+                }
+                TransactionIsolation::Default => {}
+            }
+        }
+        h.editor.clear_tab_transaction_mode_override();
+        h.run("ROLLBACK")?;
+        let _ = h.editor.discard_pooled_session_for_close();
+    }
+
+    // ---- S29: a READ ONLY pin refuses a LOCKING read -----------------------
+    // The boundary of the read/write classification: `SELECT ... FOR UPDATE`
+    // reads like a query and writes like a lock. Oracle's client gate lets it
+    // past as a select and the server has to refuse it (ORA-01456); the MySQL
+    // family refuses it as a write. Either way a READ ONLY tab must not take
+    // a lock, and the same statement must run once the pin is gone — otherwise
+    // the check would pass on a statement that simply never works.
+    println!("  --- S29 a READ ONLY pin refuses a locking read ---");
+    h.toolbar_transaction_mode(TransactionMode::new(
+        TransactionIsolation::Default,
+        TransactionAccessMode::ReadOnly,
+    ));
+    let locking_read = "SELECT V FROM SQ_TM_T FOR UPDATE";
+    // A locking read is the one statement the Oracle client gate passes on
+    // (it reads like a query), so there the server's ORA-01456 is the refusal
+    // — the backstop doing its job, which is what this scenario is here for.
+    let locking_read_errors: &[&str] = match target {
+        Target::OracleOci | Target::OracleThin => &["read-only mode blocks", "ora-01456"],
+        Target::MySql | Target::MariaDb => &["read only"],
+    };
+    let capture = h.run(locking_read)?;
+    let refused = capture.results.first().cloned();
+    h.check(
+        "S29 the locking read is refused while the tab is READ ONLY",
+        refused.as_ref().is_some_and(|result| {
+            !result.success
+                && locking_read_errors.iter().any(|needle| {
+                    result
+                        .message
+                        .to_ascii_lowercase()
+                        .contains(&needle.to_ascii_lowercase())
+                })
+        }),
+        format!(
+            "locking read: {:?}; messages: {:?}",
+            refused.map(|r| (r.success, r.message)),
+            capture.messages
+        ),
+    );
+    h.run("ROLLBACK")?;
+    h.editor.clear_tab_transaction_mode_override();
+    let _ = h.editor.discard_pooled_session_for_close();
+    let capture = h.run(locking_read)?;
+    h.check(
+        "S29 the same locking read runs once the pin is gone",
+        capture.results.first().is_some_and(|result| result.success),
+        format!(
+            "locking read after unpinning: {:?}",
+            capture
+                .results
+                .first()
+                .map(|r| (r.success, r.message.clone()))
+        ),
+    );
+    h.run("ROLLBACK")?;
+
     {
         let mut guard = h.shared.lock().unwrap_or_else(|p| p.into_inner());
         guard
@@ -2032,6 +2185,39 @@ fn run_scenarios(target: Target, h: &mut Harness) -> Result<(), String> {
     }
 
     Ok(())
+}
+
+/// Every isolation level the toolbar offers for this backend, minus `Default`
+/// — which is not a level of its own but "whatever the connection default is",
+/// and is covered by S11/S16.
+fn offered_isolations(target: Target) -> Vec<TransactionIsolation> {
+    let db_type = match target {
+        Target::OracleOci | Target::OracleThin => DatabaseType::Oracle,
+        Target::MySql => DatabaseType::MySQL,
+        Target::MariaDb => DatabaseType::MariaDB,
+    };
+    db_type
+        .supported_transaction_isolations()
+        .iter()
+        .copied()
+        .filter(|isolation| *isolation != TransactionIsolation::Default)
+        .collect()
+}
+
+/// The MySQL family reports a level as `READ-COMMITTED`; the app's own label
+/// is `Read committed`. Compare them the way the app's parser does — on
+/// separators and case.
+fn isolation_value_matches(session_value: &str, expected: TransactionIsolation) -> bool {
+    let normalize = |value: &str| {
+        value
+            .trim()
+            .replace(['-', '_'], " ")
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+            .to_ascii_uppercase()
+    };
+    normalize(session_value) == normalize(expected.label())
 }
 
 /// A second query tab on an existing connection, or (with a connection of its

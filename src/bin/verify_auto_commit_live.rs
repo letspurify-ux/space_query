@@ -40,6 +40,8 @@
 //   S16 the pin survives a disconnect + reconnect and reaches the new session.
 //   S17 a cancel keeps both the auto-committed work and the pin.
 //   S18 a DDL's implicit commit ends a manual tab's transaction.
+//   S20 the toolbar's Rollback BUTTON on an auto-commit tab does not appear
+//       to take the committed write back, and leaves nothing to resolve.
 //   S19 the menu item's OTHER half: the toggle pins the tab AND applies the
 //       change to the tab's retained session. Driven on a session the tab has
 //       already read on, in both directions.
@@ -280,6 +282,38 @@ impl Harness {
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .set_auto_commit(enabled)
+    }
+
+    /// The toolbar's Rollback button (an async transaction action), pumped to
+    /// completion — a different path from a typed ROLLBACK statement, and the
+    /// one a user reaches for when they think they have work to undo.
+    fn toolbar_rollback(&mut self) {
+        let before = self
+            .editor
+            .pooled_session_activity_snapshot()
+            .map(|s| s.retained_state());
+        self.editor.rollback();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while Instant::now() < deadline {
+            if !app::wait() {
+                app::check();
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            let now = self
+                .editor
+                .pooled_session_activity_snapshot()
+                .map(|s| s.retained_state());
+            if now != before {
+                break;
+            }
+        }
+        let drain = Instant::now() + Duration::from_millis(500);
+        while Instant::now() < drain {
+            if !app::wait() {
+                app::check();
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        }
     }
 
     /// Everything the Tools > Auto-Commit item does, in the GUI's order: pin
@@ -1140,6 +1174,49 @@ fn run_scenarios(target: Target, h: &mut Harness) -> Result<(), String> {
         );
         Ok(())
     }
+
+    // ---- S20: the toolbar's Rollback button on an auto-commit tab ---------
+    // S1 undoes nothing with a TYPED `ROLLBACK`; the button is a different
+    // path (an async transaction action on the tab's retained session), and it
+    // is the one a user presses out of habit after a write. On an auto-commit
+    // tab the work is already committed, so the button must not appear to take
+    // it back — and must not leave the tab needing a resolution either.
+    println!("  --- S20 the toolbar Rollback button after an auto-committed write ---");
+    h.set_connection_auto_commit(false)
+        .map_err(|e| format!("set_auto_commit(false): {e}"))?;
+    h.editor.sync_tab_auto_commit_with_global_setting(false);
+    let _ = h.editor.discard_pooled_session_for_close();
+    let menu_outcome = h.menu_auto_commit(true);
+    let before = h.select_v()?;
+    let capture = h.run(dml)?;
+    h.check(
+        "S20 the write on the auto-commit tab succeeded",
+        capture.results.first().map(|r| r.success).unwrap_or(false),
+        format!(
+            "result: {:?} (menu outcome: {menu_outcome})",
+            capture
+                .results
+                .first()
+                .map(|r| (r.success, r.message.clone()))
+        ),
+    );
+    h.toolbar_rollback();
+    let after = h.select_v()?;
+    h.check(
+        "S20 the toolbar Rollback did not take the committed write back",
+        after == before + 1,
+        format!(
+            "V {before} -> {after} (expected {} after the write)",
+            before + 1
+        ),
+    );
+    h.check(
+        "S20 the tab needs no resolution after the button",
+        !h.close_would_prompt(),
+        "close preflight still requires resolution after Rollback on an auto-commit tab".into(),
+    );
+    h.editor.sync_tab_auto_commit_with_global_setting(false);
+    let _ = h.editor.discard_pooled_session_for_close();
 
     // ---- S4 (Oracle): READ ONLY transaction vs piggybacked commit ---------
     if target.is_oracle() {

@@ -295,7 +295,24 @@ reconnect and is applied to the new connection's session (S22), and an open
 lazy fetch — which holds the tab's session — closes the transaction-mode
 controls until it is fetched out or cancelled, through the same
 `SqlEditorWidget::transaction_mode_change_blocked_now()` the toolbar asks
-(S23).
+(S23). Finally, two settle the controls' own surface: every isolation level
+the toolbar offers for a backend really lands on the session, read back from
+`@@transaction_isolation` on the MySQL family and behaviourally everywhere —
+a dirty read for READ UNCOMMITTED, another session's commit seen inside the
+transaction for READ COMMITTED, and one snapshot held for REPEATABLE READ and
+(Oracle) SERIALIZABLE (S28); and a READ ONLY pin refuses a locking read
+(`SELECT ... FOR UPDATE`), which the same statement running once the pin is
+gone proves is the pin's doing (S29). S29 is also where the Oracle client gate
+does NOT act: a locking read reads like a query, so it is the server's
+ORA-01456 that refuses it — the backstop the gate's own comment promises.
+
+InnoDB's SERIALIZABLE turns plain reads into locking reads, so the snapshot
+pair cannot be used for it on the MySQL family (it would block the other
+session instead of reporting a snapshot); the session read-back is the honest
+check there. Both new scenarios run in the harness's manual-commit section: an
+auto-commit tab ends its transaction after every statement, so no scenario
+that reads a snapshot across two executions can live after the harness
+restores the connection's auto-commit.
 
 `verify_auto_commit_live` covers the tab-scoped auto-commit model on the same
 four backends: the connection default really commits, the menu write path pins
@@ -313,7 +330,11 @@ pinned in both directions while an unpinned neighbour follows the new default
 (S12), a `SET AUTOCOMMIT` inside a script governs the statements after it in
 the SAME script in both directions without touching the connection default
 (S13), and on the MySQL family an explicit `START TRANSACTION` survives
-auto-commit ON — its DML is still rollback-able (S14).
+auto-commit ON — its DML is still rollback-able (S14). The toolbar's Rollback
+BUTTON is its own path (an async transaction action on the tab's retained
+session, not the typed `ROLLBACK` of S1) and the one a user presses out of
+habit after a write: on an auto-commit tab it must not appear to take the
+committed work back, and must leave nothing for the close prompt (S20).
 
 Note when reading these: the connection's default isolation is READ COMMITTED
 (`ConnectionAdvancedSettings::default_transaction_isolation`), not the MySQL
