@@ -3424,3 +3424,88 @@ fn schema_metadata_load_aborts_on_object_query_errors_instead_of_emptying() {
         );
     }
 }
+
+/// Discarding a DB session must hand its pool slot back on every backend, or
+/// discards accumulate as ghost connections until `try_get_conn`/acquire times
+/// out with "pool appears exhausted" while almost no real sessions exist
+/// (live-observed on MariaDB with two query tabs open).
+#[test]
+fn discarded_db_sessions_release_their_pool_slots_structurally() {
+    // (1) `mysql::PooledConn::unwrap()` takes the connection out of the pool's
+    // Drop accounting: the slot stays counted as live forever. It must not be
+    // used anywhere — the accounting-correct discard breaks the connection and
+    // lets the pool's own Drop notice it.
+    let src_root = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    for file in collect_rust_files(&src_root) {
+        let content = fs::read_to_string(&file)
+            .unwrap_or_else(|err| panic!("failed to read {}: {err}", file.display()));
+        for (line_number, line) in content.lines().enumerate() {
+            let trimmed = line.trim_start();
+            if trimmed.starts_with("//") || trimmed.starts_with('*') {
+                continue;
+            }
+            assert!(
+                !trimmed.contains("PooledConn::unwrap("),
+                "{}:{} uses mysql::PooledConn::unwrap, which leaks the pool slot of every discarded session",
+                file.display(),
+                line_number + 1
+            );
+        }
+    }
+
+    // (2) The MySQL discard choke point must break the connection FIRST and
+    // then drop the `PooledConn` normally, so the pool's Drop takes its
+    // broken-connection branch — the one that decrements the live count.
+    let connection = read_source("src/db/connection.rs");
+    let discard_start = connection
+        .find("pub(crate) fn discard_mysql_pooled_connection(")
+        .expect("the MySQL discard choke point should exist");
+    let discard_end = connection[discard_start..]
+        .find("\n}\n")
+        .map(|offset| discard_start + offset)
+        .expect("the MySQL discard choke point should close");
+    let discard_body = &connection[discard_start..discard_end];
+    assert!(
+        discard_body.contains("libc::shutdown(conn.as_raw_fd()"),
+        "the unix MySQL discard must shut the socket down so pool cleanup fails and decrements"
+    );
+    assert!(
+        discard_body.contains("KILL {connection_id}"),
+        "the non-unix MySQL discard must make the server drop the session so pool cleanup fails and decrements"
+    );
+
+    // (3) Every backend's physical discard goes through its pool's own
+    // accounting-correct API: OCI drops through the pool, thin marks broken
+    // and discards (its Drop decrements open_count), MySQL goes through the
+    // choke point above.
+    let lease_discard_start = connection
+        .find("pub fn discard_physical(self, log_context: &str)")
+        .expect("DbSessionLease::discard_physical should exist");
+    let lease_discard_end = connection[lease_discard_start..]
+        .find("\n    }\n")
+        .map(|offset| lease_discard_start + offset)
+        .expect("DbSessionLease::discard_physical should close");
+    let lease_discard = &connection[lease_discard_start..lease_discard_end];
+    assert!(
+        lease_discard.contains("close_with_mode(oracle::conn::CloseMode::Drop)")
+            && lease_discard.contains("mark_broken()")
+            && lease_discard.contains(".discard()")
+            && lease_discard.contains("discard_mysql_pooled_connection(conn)"),
+        "every backend's discard must use its pool's accounting-correct API"
+    );
+
+    // The thin pool's discard-on-drop branch itself must decrement.
+    let thin_pool = read_source("crates/tns-thin/src/pool.rs");
+    let drop_start = thin_pool
+        .find("impl<T: PoolableConnection> Drop for PooledThinConnection<T>")
+        .expect("the thin pooled connection Drop should exist");
+    let drop_end = thin_pool[drop_start..]
+        .find("\n}\n")
+        .map(|offset| drop_start + offset)
+        .expect("the thin pooled connection Drop should close");
+    let drop_body = &thin_pool[drop_start..drop_end];
+    assert!(
+        drop_body.contains("guard.open_count = guard.open_count.saturating_sub(1)"),
+        "the thin pool must decrement open_count when a connection is not returned"
+    );
+}

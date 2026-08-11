@@ -2755,6 +2755,16 @@ impl SqlEditorWidget {
             Self::schedule_alert_pump(ALERT_RETRY_INTERVAL_SECONDS);
             return;
         }
+        // A popup menu owns an FLTK grab, and a grab redirects every event to
+        // the menu — a modal alert shown under it can never be clicked while
+        // the menu can no longer close, so both sit on screen frozen
+        // (live-observed with the object browser's context menu: FLTK timers
+        // fire inside `menu.popup()`'s recursive event loop, which is exactly
+        // where this pump runs). Hold the alert until the menu is gone.
+        if app::grab().is_some() {
+            Self::schedule_alert_pump(ALERT_RETRY_INTERVAL_SECONDS);
+            return;
+        }
 
         let (maybe_message, should_continue) = {
             let state = Self::pending_alert_state();

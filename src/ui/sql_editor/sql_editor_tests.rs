@@ -329,6 +329,31 @@ fn sql_editor_alert_calls_use_wrapper_function() {
         !mod_src.contains("fn show_alert_when_main_window_visible"),
         "legacy per-alert recursive retry helper should not remain"
     );
+    // A popup menu owns an FLTK grab, which redirects every event to the
+    // menu; a modal alert shown under it can never be clicked while the menu
+    // can no longer close (live-observed with the object browser's context
+    // menu: FLTK timers fire inside `menu.popup()`'s recursive loop, which is
+    // where the pump runs). The pump must hold alerts until the grab is gone,
+    // and the modal chokepoint breaks a grab that still slipped through.
+    assert!(
+        mod_src.contains("if app::grab().is_some() {"),
+        "the alert pump must defer while a popup menu owns the FLTK grab"
+    );
+    {
+        let ui_mod = include_str!("../mod.rs");
+        let finish_start = ui_mod
+            .find("fn finish_modal_dialog(")
+            .expect("the shared modal wait helper must exist");
+        let finish_end = ui_mod[finish_start..]
+            .find("\n}\n")
+            .map(|offset| finish_start + offset)
+            .expect("the shared modal wait helper must close");
+        let finish_body = &ui_mod[finish_start..finish_end];
+        assert!(
+            finish_body.contains("app::set_grab(None::<Window>)"),
+            "every modal dialog must break an active FLTK grab before waiting, or a popup menu and the modal freeze each other"
+        );
+    }
     assert_eq!(
         mod_src.matches("crate::ui::alert_on_main(").count(),
         1,

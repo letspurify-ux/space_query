@@ -186,6 +186,16 @@ fn dialog_button_width(label: &str) -> i32 {
 }
 
 fn finish_modal_dialog(dialog: Window) {
+    // Last-resort guard for a modal raised while a popup menu still owns the
+    // FLTK grab (a timer or awake handler can fire inside `menu.popup()`'s
+    // recursive event loop): the grab redirects every event to the menu, so
+    // the modal could never be dismissed while the menu could no longer
+    // close — both sit on screen frozen (live-observed with the object
+    // browser's context menu). Break the grab; the interrupted popup returns
+    // None, which every popup caller already handles as "no choice made".
+    if app::grab().is_some() {
+        app::set_grab(None::<Window>);
+    }
     while dialog.shown() {
         app::wait();
     }

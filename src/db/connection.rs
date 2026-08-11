@@ -237,14 +237,47 @@ fn update_session_state_without_blocking<F>(
 }
 
 pub(crate) fn discard_mysql_pooled_connection(conn: mysql::PooledConn) {
+    // `PooledConn::unwrap()` looks like the discard API but leaks the pool
+    // slot: it takes the `Conn` out, so the pool's `Drop` never runs its
+    // `decrease()` and the connection stays counted as live forever. Enough
+    // discards (every non-retained session takes this path) and the pool is
+    // permanently "full" of ghosts — `try_get_conn` then times out with
+    // "connection pool appears exhausted" while only a couple of real
+    // sessions exist. The correct discard is to make the pool's own cleanup
+    // fail: break the connection first, then drop the `PooledConn` normally,
+    // and the crate's Drop takes its broken-connection branch, which does
+    // decrement the count.
     if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        drop(mysql::PooledConn::unwrap(conn));
+        #[cfg(unix)]
+        {
+            use std::os::unix::io::AsRawFd;
+            // Kill the socket without touching the protocol state — safe on a
+            // connection in ANY state, including mid-resultset after a cancel.
+            // The fd stays owned by the `Conn`, so there is no double close;
+            // cleanup-for-pool then fails immediately on the dead socket.
+            unsafe { libc::shutdown(conn.as_raw_fd(), libc::SHUT_RDWR) };
+            drop(conn);
+        }
+        #[cfg(not(unix))]
+        {
+            // The mysql crate exposes no raw socket handle off unix. Ask the
+            // server to drop us instead: KILL of the connection's own id makes
+            // the server close the socket, after which cleanup-for-pool fails
+            // the same way. On a mid-protocol connection the KILL write itself
+            // errors (commands out of sync) and cleanup's reset then fails on
+            // the desynced stream — either way the pool's count is released.
+            let mut conn = conn;
+            let connection_id = conn.connection_id();
+            let _ =
+                mysql::prelude::Queryable::query_drop(&mut conn, format!("KILL {connection_id}"));
+            drop(conn);
+        }
     }))
     .is_err()
     {
         logging::log_error(
             "db::connection",
-            "MySQL pooled connection violated its internal unwrap invariant while being discarded",
+            "MySQL pooled connection panicked while being discarded",
         );
     }
 }
@@ -8188,6 +8221,109 @@ mod tests {
             .unwrap_or(3306);
 
         ConnectionInfo::new_with_type("local", &user, &password, &host, port, &database, db_type)
+    }
+
+    /// The one leak-freedom claim every backend must honour, proven through
+    /// the one discard choke point they all share
+    /// (`DbSessionLease::discard_physical`): a discarded session hands its
+    /// pool slot back. A backend that violates it accumulates ghost
+    /// connections until acquire times out with "pool appears exhausted"
+    /// while almost no real sessions exist — live-observed on the MySQL
+    /// family, whose `PooledConn::unwrap` discard skipped the pool's Drop
+    /// accounting. Each backend joins by handing this engine its acquire
+    /// function; the discard side is deliberately NOT pluggable.
+    fn assert_discarded_sessions_release_their_pool_slots(
+        label: &str,
+        acquire: &dyn Fn(usize) -> DbSessionLease,
+    ) {
+        // More discard rounds than the pool has slots (2): with a slot leak,
+        // round 3 already finds the pool full of ghosts and times out.
+        for round in 0..4 {
+            acquire(round).discard_physical("pool slot probe");
+        }
+
+        // And the freed slots must be genuinely usable, both at once.
+        let first = acquire(4);
+        let second = acquire(5);
+        drop(first);
+        drop(second);
+        let _ = label;
+    }
+
+    fn assert_mysql_family_discarded_sessions_release_their_pool_slots(db_type: DatabaseType) {
+        let info = mysql_test_connection_info_from_env_for(db_type);
+        let pool = DatabaseConnection::build_mysql_pool(
+            &info,
+            2,
+            ConnectionAttemptPolicy::from_seconds(5),
+        )
+        .expect("build MySQL-family test pool");
+
+        assert_discarded_sessions_release_their_pool_slots(db_type.display_name(), &|round| {
+            DbSessionLease::MySQL {
+                conn: pool
+                    .try_get_conn(Duration::from_secs(3))
+                    .unwrap_or_else(|err| {
+                        panic!("round {round} could not acquire a pooled connection: {err}")
+                    }),
+                db_type,
+            }
+        });
+    }
+
+    #[test]
+    #[ignore = "requires local MySQL test database via SPACE_QUERY_TEST_MYSQL_* env vars"]
+    fn mysql_discarded_sessions_release_their_pool_slots() {
+        assert_mysql_family_discarded_sessions_release_their_pool_slots(DatabaseType::MySQL);
+    }
+
+    #[test]
+    #[ignore = "requires local MariaDB test database via SPACE_QUERY_TEST_MYSQL_* env vars"]
+    fn mariadb_discarded_sessions_release_their_pool_slots() {
+        assert_mysql_family_discarded_sessions_release_their_pool_slots(DatabaseType::MariaDB);
+    }
+
+    #[test]
+    #[ignore = "requires local Oracle database via ORACLE_TEST_* env vars and an Oracle client"]
+    fn oracle_oci_discarded_sessions_release_their_pool_slots() {
+        ensure_oracle_client_initialized().expect("Oracle client should initialize");
+        let info = oracle_test_connection_info_from_env();
+        let pool = DatabaseConnection::build_oracle_pool(
+            &info,
+            2,
+            ConnectionAttemptPolicy::from_seconds(5),
+        )
+        .expect("build Oracle OCI test pool");
+
+        assert_discarded_sessions_release_their_pool_slots("Oracle OCI", &|round| {
+            DbSessionLease::Oracle(Arc::new(pool.get().unwrap_or_else(|err| {
+                panic!("round {round} could not acquire an OCI pooled session: {err}")
+            })))
+        });
+    }
+
+    #[test]
+    #[ignore = "requires local Oracle database via ORACLE_TEST_* env vars"]
+    fn oracle_thin_discarded_sessions_release_their_pool_slots() {
+        let info = oracle_test_connection_info_from_env();
+        let config = DatabaseConnection::build_oracle_thin_config(
+            &info,
+            ConnectionAttemptPolicy::from_seconds(5),
+        )
+        .expect("build Oracle thin config");
+        let pool = OracleThinSessionPool::new(
+            config,
+            tns_thin::pool::PoolOptions {
+                max_size: 2,
+                acquire_timeout: Duration::from_secs(3),
+            },
+        );
+
+        assert_discarded_sessions_release_their_pool_slots("Oracle thin", &|round| {
+            DbSessionLease::OracleThin(Box::new(pool.acquire().unwrap_or_else(|err| {
+                panic!("round {round} could not acquire a thin pooled session: {err}")
+            })))
+        });
     }
 
     fn db_activity_test_lock() -> std::sync::MutexGuard<'static, ()> {
