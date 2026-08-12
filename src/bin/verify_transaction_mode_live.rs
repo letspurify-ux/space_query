@@ -2454,6 +2454,100 @@ fn run_scenarios(target: Target, h: &mut Harness) -> Result<(), String> {
     });
     h.run("ROLLBACK")?;
 
+    // ---- S41: one tab's schema must not move another tab's queries ---------
+    // Reported from the running app: with several tabs on one connection, the
+    // schema picked in the last tab moved every other tab's execution too —
+    // the selectors stayed per tab, but the queries did not. The cause was
+    // execution resolving its schema from CONNECTION state (Oracle's tracked
+    // current schema, MySQL's connection database) instead of from the tab
+    // that is running. Both tabs here read back the scope their own statement
+    // actually ran in.
+    println!("  --- S41 a tab's scope governs only its own execution ---");
+    h.editor.clear_tab_transaction_mode_override();
+    h.run("ROLLBACK")?;
+    let scratch_scope = "SQ_TM_SCOPE3";
+    let _ = h.run(&if target.is_oracle() {
+        format!("DROP USER {scratch_scope} CASCADE")
+    } else {
+        format!("DROP DATABASE IF EXISTS {scratch_scope}")
+    });
+    let capture = h.run(&if target.is_oracle() {
+        format!("CREATE USER {scratch_scope} IDENTIFIED BY pw1")
+    } else {
+        format!("CREATE DATABASE {scratch_scope}")
+    })?;
+    if !capture.results.first().is_some_and(|result| result.success) {
+        return Err(format!(
+            "S41 could not create the scratch scope: {:?}",
+            capture.results.first().map(|r| r.message.clone())
+        ));
+    }
+    {
+        let mut other = attach_tab(h.shared.clone());
+        // The neighbour tab moves to the scratch schema; this tab stays where
+        // it is and must keep running there.
+        other.change_tab_scope(Some(scratch_scope));
+        let other_scope = other.select_scalar(current_scope_sql)?;
+        h.check(
+            "S41 the tab that moved runs in the new scope",
+            other_scope.trim().eq_ignore_ascii_case(scratch_scope),
+            format!("neighbour {current_scope_sql} = {other_scope:?}"),
+        );
+        let base = base_scope.clone();
+        let this_scope = h.select_scalar(current_scope_sql)?;
+        h.check(
+            "S41 the tab that did not move still runs in its own scope",
+            this_scope.trim().eq_ignore_ascii_case(&base),
+            format!("this tab {current_scope_sql} = {this_scope:?}, expected {base}"),
+        );
+        // And again after the neighbour has executed once more: a second
+        // statement must not drag this tab along either.
+        other.select_scalar(current_scope_sql)?;
+        let this_scope_again = h.select_scalar(current_scope_sql)?;
+        h.check(
+            "S41 a second statement in the moved tab still leaves this one alone",
+            this_scope_again.trim().eq_ignore_ascii_case(&base),
+            format!("this tab {current_scope_sql} = {this_scope_again:?}"),
+        );
+        // The sharper case: the neighbour moves its session with a STATEMENT.
+        // The app records that in the connection (it is how a reconnect
+        // restores the schema), and execution used to apply that connection
+        // value to every tab's session — which moved this tab too.
+        let move_statement = if target.is_oracle() {
+            format!("ALTER SESSION SET CURRENT_SCHEMA = {scratch_scope}")
+        } else {
+            format!("USE {scratch_scope}")
+        };
+        // `USE` on the MySQL family is a client command and produces no
+        // result row, so the neighbour's own read is what proves the move
+        // happened on both families.
+        other.run(&move_statement)?;
+        let neighbour_scope = other.select_scalar(current_scope_sql)?;
+        h.check(
+            "S41 the neighbour's schema statement moved the neighbour",
+            neighbour_scope.trim().eq_ignore_ascii_case(scratch_scope),
+            format!("neighbour {current_scope_sql} = {neighbour_scope:?}"),
+        );
+        let this_scope_after_statement = h.select_scalar(current_scope_sql)?;
+        h.check(
+            "S41 a schema statement in the neighbour does not move this tab",
+            this_scope_after_statement
+                .trim()
+                .eq_ignore_ascii_case(&base),
+            format!(
+                "this tab {current_scope_sql} = {this_scope_after_statement:?}, expected {base}"
+            ),
+        );
+        let _ = other.run("ROLLBACK");
+        let _ = other.editor.discard_pooled_session_for_close();
+    }
+    h.run("ROLLBACK")?;
+    let _ = h.run(&if target.is_oracle() {
+        format!("DROP USER {scratch_scope} CASCADE")
+    } else {
+        format!("DROP DATABASE IF EXISTS {scratch_scope}")
+    });
+
     // ---- S40: a dirty session does not gate a scope change ------------------
     // The commit/rollback/discard decision belongs to tab close. A scope
     // change is applied to the tab's retained session IN PLACE (MySQL `USE`,

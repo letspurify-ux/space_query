@@ -538,8 +538,10 @@ fn pooled_query_execution_rechecks_scope_immediately_before_action() {
         .expect("Oracle statement preparation should follow transaction control branches");
     let oracle_statement_setup = &content[oracle_start..oracle_end];
     assert!(
-        oracle_statement_setup.contains("Self::apply_oracle_tracked_schema_before_pooled_action("),
-        "Oracle statements should reapply the tracked global schema after transaction-control shortcuts and before execution"
+        oracle_statement_setup.contains("Self::apply_oracle_schema_before_pooled_action("),
+        "Oracle statements should put the session back in the REQUESTING TAB's schema after \
+         transaction-control shortcuts and before execution — applying the connection's tracked \
+         schema instead moved every other tab with it"
     );
 }
 
@@ -732,7 +734,7 @@ fn retained_scope_apply_failures_do_not_keep_mismatched_sessions() {
     );
 
     let oracle_start = content
-        .find("fn apply_oracle_tracked_schema_to_pooled_session_if_current(")
+        .find("fn apply_oracle_schema_to_pooled_session_if_current(")
         .expect("Oracle pooled session scope apply helper should exist");
     let oracle_end = content[oracle_start..]
         .find("pub(super) fn run_mysql_action_with_timeout")
@@ -740,8 +742,10 @@ fn retained_scope_apply_failures_do_not_keep_mismatched_sessions() {
         .expect("MySQL timeout helper should follow Oracle scope apply helper");
     let oracle_helper = &content[oracle_start..oracle_end];
     assert!(
-        oracle_helper.contains("conn_guard.apply_tracked_oracle_current_schema(conn.as_ref())"),
-        "Oracle retained sessions should actively apply the tracked global schema"
+        oracle_helper.contains(
+            "conn_guard.apply_oracle_current_schema_for_scope(conn.as_ref(), execution_scope)"
+        ),
+        "Oracle retained sessions should actively apply the requesting tab's schema"
     );
     assert!(
         oracle_helper.contains("false"),
@@ -3658,4 +3662,55 @@ fn discarded_db_sessions_release_their_pool_slots_structurally() {
         drop_body.contains("guard.open_count = guard.open_count.saturating_sub(1)"),
         "the thin pool must decrement open_count when a connection is not returned"
     );
+}
+
+/// The schema/database an operation runs in has ONE source of truth: the
+/// requesting tab's scope, resolved against the connection only as a fallback
+/// by `oracle_schema_for_scope` / `mysql_database_for_scope`. Reading
+/// connection state directly instead — the tracked Oracle schema, the
+/// connection's `service_name` — is what let one tab's schema pick move every
+/// other tab's queries while each selector still showed its own.
+#[test]
+fn execution_resolves_scope_from_the_requesting_tab_for_every_backend() {
+    let execution = read_source("src/ui/sql_editor/execution.rs");
+
+    // Oracle (OCI): the pre-execution schema application takes the tab's
+    // scope; the no-scope variant may not be used to prepare a tab's session.
+    assert!(
+        execution.contains("fn apply_oracle_schema_before_pooled_action(")
+            && execution.contains("execution_scope: Option<&str>,")
+            && execution
+                .contains("apply_oracle_current_schema_for_scope(conn.as_ref(), execution_scope)"),
+        "Oracle execution must put the pooled session in the REQUESTING TAB's schema"
+    );
+    assert!(
+        !execution.contains("apply_tracked_oracle_current_schema("),
+        "execution must not apply the connection's tracked schema to a tab's session: \
+         that is how one tab's pick moved every other tab"
+    );
+
+    // MySQL/MariaDB: no hand-rolled copy of the same rule.
+    assert!(
+        !execution.contains("unwrap_or(conn_guard.get_info().service_name.trim())"),
+        "the MySQL execution path must resolve its database through \
+         `mysql_database_for_scope`, not a copy of that rule"
+    );
+    assert!(
+        execution.contains("mysql_database_for_scope(execution_scope)"),
+        "the MySQL execution path must resolve its database from the tab's scope"
+    );
+
+    // The rule itself lives in one place, per backend, and both spell the
+    // same fallback.
+    let connection = read_source("src/db/connection.rs");
+    for helper in [
+        "pub fn oracle_schema_for_scope",
+        "pub fn mysql_database_for_scope",
+        "pub fn apply_oracle_current_schema_for_scope",
+    ] {
+        assert!(
+            connection.contains(helper),
+            "{helper} is the single source of truth for an operation's scope"
+        );
+    }
 }

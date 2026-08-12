@@ -1357,6 +1357,11 @@ struct QueryExecutionCleanupGuard {
         RetainedSessionState,
     )>,
     oracle_pooled_session_scope_connection: Option<crate::db::SharedConnection>,
+    /// The scope this pooled session is being used for — the requesting TAB's,
+    /// not the connection's. Kept next to the connection so every later
+    /// re-application (cleanup, lazy fetch) puts the session back where THIS
+    /// tab is looking rather than where the connection was last moved.
+    oracle_pooled_session_scope: Option<String>,
     oracle_pooled_session_invalidated: bool,
     oracle_pooled_session_invalidated_on_cancel: bool,
     oracle_pooled_session_requires_health_check: bool,
@@ -1540,6 +1545,7 @@ impl QueryExecutionCleanupGuard {
             previous_timeout: None,
             oracle_pooled_session: None,
             oracle_pooled_session_scope_connection: None,
+            oracle_pooled_session_scope: None,
             oracle_pooled_session_invalidated: false,
             oracle_pooled_session_invalidated_on_cancel: false,
             oracle_pooled_session_requires_health_check: false,
@@ -1692,8 +1698,10 @@ impl QueryExecutionCleanupGuard {
     fn track_oracle_pooled_session_scope_connection(
         &mut self,
         shared_connection: crate::db::SharedConnection,
+        scope: Option<String>,
     ) {
         self.oracle_pooled_session_scope_connection = Some(shared_connection);
+        self.oracle_pooled_session_scope = scope;
     }
 
     /// A schema sync/clear during this execution bumps the pool context
@@ -1882,6 +1890,7 @@ impl QueryExecutionCleanupGuard {
         self.oracle_interrupted_statement_sql_kind = None;
         self.oracle_interrupted_statement_state_hint = None;
         self.oracle_pooled_session_scope_connection = None;
+        self.oracle_pooled_session_scope = None;
     }
 
     fn oracle_retained_state_for_connection_transition(
@@ -2213,11 +2222,12 @@ impl Drop for QueryExecutionCleanupGuard {
                         .oracle_pooled_session_scope_connection
                         .as_ref()
                         .is_some_and(|shared_connection| {
-                            !SqlEditorWidget::apply_oracle_tracked_schema_to_pooled_session_if_current(
+                            !SqlEditorWidget::apply_oracle_schema_to_pooled_session_if_current(
                                 shared_connection,
                                 conn,
                                 "sql_editor::cleanup",
                                 *connection_generation,
+                                self.oracle_pooled_session_scope.as_deref(),
                             )
                         });
                 let policy_health_check_ok = health_check_ok && !scope_reapply_failed;
@@ -4587,6 +4597,7 @@ impl SqlEditorWidget {
         lazy_fetch_batch_size: usize,
         query_timeout: Option<Duration>,
         previous_timeout: Option<Duration>,
+        execution_scope: Option<String>,
     ) -> Result<(), OracleError> {
         let (command_sender, command_receiver) = mpsc::channel::<LazyFetchCommand>();
         Self::register_lazy_fetch_handle(
@@ -4943,11 +4954,12 @@ impl SqlEditorWidget {
                             conn.as_ref(),
                             "oracle lazy fetch cleanup",
                         )
-                        && Self::apply_oracle_tracked_schema_to_pooled_session_if_current(
+                        && Self::apply_oracle_schema_to_pooled_session_if_current(
                             &shared_connection,
                             &conn,
                             "oracle lazy fetch cleanup",
                             connection_generation,
+                            execution_scope.as_deref(),
                         )
                         && Self::lazy_fetch_can_keep_session(&active_lazy_fetch, session_id);
                     if should_keep_session {
@@ -10156,7 +10168,10 @@ impl SqlEditorWidget {
                         Arc::clone(conn),
                         oracle_prior_retained_state,
                     );
-                    cleanup.track_oracle_pooled_session_scope_connection(shared_connection.clone());
+                    cleanup.track_oracle_pooled_session_scope_connection(
+                        shared_connection.clone(),
+                        operation_scope.clone(),
+                    );
                 }
                 let explicit_transaction_first_statement =
                     SqlEditorWidget::requires_transaction_first_statement(&items);
@@ -12652,11 +12667,12 @@ impl SqlEditorWidget {
                             }
 
                             if let Err(message) =
-                                Self::apply_oracle_tracked_schema_before_pooled_action(
+                                Self::apply_oracle_schema_before_pooled_action(
                                     &shared_connection,
                                     conn,
                                     &db_activity,
                                     connection_generation,
+                                    operation_scope.as_deref(),
                                 )
                             {
                                 let emitted = SqlEditorWidget::emit_non_select_result(
@@ -13732,6 +13748,7 @@ impl SqlEditorWidget {
                                         lazy_fetch_batch_size,
                                         query_timeout,
                                         previous_timeout,
+                                        operation_scope.clone(),
                                     ) {
                                         Ok(()) => {
                                             // The lazy worker now owns this pooled connection and
@@ -23687,10 +23704,9 @@ impl SqlEditorWidget {
                 return true;
             }
 
-            let target_database = execution_scope
-                .map(str::trim)
-                .filter(|scope| !scope.is_empty())
-                .unwrap_or(conn_guard.get_info().service_name.trim())
+            // The one rule, never a hand-rolled copy of it.
+            let target_database = conn_guard
+                .mysql_database_for_scope(execution_scope)
                 .to_string();
             let advanced = conn_guard.get_info().advanced.clone();
             let current_database = match conn.query_first::<Option<String>, _>("SELECT DATABASE()")
@@ -23891,17 +23907,19 @@ impl SqlEditorWidget {
         }
     }
 
-    fn apply_oracle_tracked_schema_to_pooled_session_if_current(
+    fn apply_oracle_schema_to_pooled_session_if_current(
         shared_connection: &crate::db::SharedConnection,
         conn: &Arc<Connection>,
         db_activity: &str,
         connection_generation: u64,
+        execution_scope: Option<&str>,
     ) -> bool {
-        match Self::apply_oracle_tracked_schema_before_pooled_action(
+        match Self::apply_oracle_schema_before_pooled_action(
             shared_connection,
             conn,
             db_activity,
             connection_generation,
+            execution_scope,
         ) {
             Ok(()) => true,
             Err(message) => {
@@ -23913,11 +23931,19 @@ impl SqlEditorWidget {
         }
     }
 
-    fn apply_oracle_tracked_schema_before_pooled_action(
+    /// Put the tab's pooled session in the schema this operation runs in.
+    ///
+    /// `execution_scope` is the requesting TAB's scope; the connection's
+    /// tracked schema is only the fallback for a tab that has none. Applying
+    /// the tracked schema unconditionally would hand every tab the schema
+    /// whichever tab last moved its own session — the selectors would stay
+    /// per tab while the queries all ran somewhere else.
+    fn apply_oracle_schema_before_pooled_action(
         shared_connection: &crate::db::SharedConnection,
         conn: &Arc<Connection>,
         db_activity: &str,
         connection_generation: u64,
+        execution_scope: Option<&str>,
     ) -> Result<(), String> {
         let conn_guard = lock_connection_with_activity(shared_connection, db_activity.to_string());
         if !conn_guard
@@ -23926,7 +23952,7 @@ impl SqlEditorWidget {
             return Err(crate::db::NOT_CONNECTED_MESSAGE.to_string());
         }
 
-        match conn_guard.apply_tracked_oracle_current_schema(conn.as_ref()) {
+        match conn_guard.apply_oracle_current_schema_for_scope(conn.as_ref(), execution_scope) {
             Ok(()) => {
                 crate::db::refresh_pool_session_context_cache_for_shared_connection(
                     shared_connection,
@@ -23969,10 +23995,11 @@ impl SqlEditorWidget {
                 return Err(crate::db::NOT_CONNECTED_MESSAGE.to_string());
             }
             (
-                execution_scope
-                    .map(str::trim)
-                    .filter(|scope| !scope.is_empty())
-                    .unwrap_or(conn_guard.get_info().service_name.trim())
+                // The one rule, never a hand-rolled copy of it: the tab's
+                // scope when it has one, this connection's database
+                // otherwise.
+                conn_guard
+                    .mysql_database_for_scope(execution_scope)
                     .to_string(),
                 conn_guard.get_info().advanced.clone(),
                 conn_guard.pool_session_context().ok(),
@@ -37441,6 +37468,7 @@ mod mysql_transaction_feedback_tests {
                     active_lazy_fetch.clone(),
                     session_id,
                     lazy_fetch_batch_size as usize,
+                    None,
                     None,
                     None,
                 )

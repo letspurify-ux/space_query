@@ -842,6 +842,11 @@ struct QueryEditorTab {
     pristine_text: String,
     current_text_len: usize,
     is_dirty: bool,
+    /// The stamp of the card catalog this tab's editor was last filled from.
+    /// A card refreshed behind the tab's back carries a newer stamp, which is
+    /// how activation knows to copy it across instead of ordering another
+    /// load.
+    editor_metadata_serial: Arc<Mutex<u64>>,
 }
 
 struct QueryProgressContext {
@@ -2164,15 +2169,37 @@ impl AppState {
     /// data is empty or belongs to another scope is filled from the card
     /// instead of waiting for a database round trip.
     fn seed_active_tab_editor_metadata_from_browser(&mut self) {
-        let Some(snapshot) = self.object_browser.active_tab_metadata_snapshot() else {
+        let Some((serial, snapshot)) = self
+            .object_browser
+            .active_tab_metadata_snapshot_with_serial()
+        else {
             return;
         };
+        let active_editor_tab_id = self.active_editor_tab_id;
+        let editor_serial = self
+            .editor_tabs
+            .iter()
+            .find(|tab| tab.tab_id == active_editor_tab_id)
+            .map(|tab| {
+                *tab.editor_metadata_serial
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+            });
         let current = self
             .schema_intellisense_data
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .clone();
-        if !MainWindow::intellisense_scope_differs(&current, snapshot.selected_scope.as_deref())
+        // Seed when the editor has nothing usable for this scope, and ALSO
+        // when the card has been refreshed since the editor was last filled:
+        // a delivery can be dropped (the tab was not on screen when it
+        // landed), and the answer to that is to copy the catalog the card
+        // already holds — not to order another database round trip, which
+        // would clear the tree and the filter the user arranged.
+        let editor_is_behind_card =
+            editor_serial.is_some_and(|editor_serial| editor_serial < serial);
+        if !editor_is_behind_card
+            && !MainWindow::intellisense_scope_differs(&current, snapshot.selected_scope.as_deref())
             && !MainWindow::intellisense_data_has_no_objects(&current)
         {
             return;
@@ -2204,6 +2231,9 @@ impl AppState {
             tab.highlight_data = combined_highlight.clone();
             tab.sql_editor
                 .update_highlight_data_deferred(combined_highlight.clone());
+            *tab.editor_metadata_serial
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()) = serial;
         }
         self.sql_editor
             .update_highlight_data_deferred(combined_highlight);
@@ -8492,6 +8522,7 @@ impl MainWindow {
             pristine_text: String::new(),
             current_text_len: 0,
             is_dirty: false,
+            editor_metadata_serial: Arc::new(Mutex::new(0)),
         });
         state.query_tabs.select(tab_id);
         state.refresh_tab_label(tab_id);
@@ -9077,13 +9108,22 @@ impl MainWindow {
                 return;
             }
         };
-        if !s.has_live_connection {
-            return;
-        }
         // The card that produced this catalog belongs to ONE tab, and a
         // deferred delivery can land long after the user moved on. Only that
-        // tab's editor may take it.
+        // tab's editor may take it — and since the load that produced it has
+        // already been cleared from the pending set, the tab has to be marked
+        // again or its editor would keep the pre-refresh catalog for good.
         if s.active_editor_tab_id != tab_id {
+            // Nothing to schedule: the catalog is in that tab's own card, and
+            // activation copies it across because the card's stamp is newer
+            // than what the tab's editor holds
+            // (`seed_active_tab_editor_metadata_from_browser`). Ordering a
+            // reload here would clear the tree and filter the user arranged.
+            return;
+        }
+        // Checked AFTER the owner test: this describes the ACTIVE tab's
+        // connection, which is only the same thing once the owner matches.
+        if !s.has_live_connection {
             return;
         }
 
@@ -9119,6 +9159,15 @@ impl MainWindow {
         }
 
         MainWindow::apply_object_browser_metadata_snapshot(&mut s, snapshot);
+        // The editor now holds this card's catalog; record which one, so
+        // activation can tell whether the card has moved on since.
+        if let Some(serial) = s.object_browser.active_tab_metadata_serial() {
+            if let Some(tab) = s.editor_tabs.iter().find(|tab| tab.tab_id == tab_id) {
+                *tab.editor_metadata_serial
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner()) = serial;
+            }
+        }
     }
 
     fn apply_object_browser_metadata_snapshot(
@@ -9346,6 +9395,37 @@ impl MainWindow {
             }
         });
         true
+    }
+
+    /// Reload the preview card the user is looking at. Returns an alert to
+    /// show, or `None` when the reload started.
+    fn refresh_visible_preview_card(
+        state: &mut AppState,
+        connection_id: ConnectionId,
+        scope: Option<String>,
+    ) -> Option<String> {
+        let Some(runtime) = state.connection_registry.get(connection_id) else {
+            return Some("That connection is no longer open.".to_string());
+        };
+        let connection = runtime.connection();
+        if crate::db::try_lock_connection(&connection).is_some_and(|guard| !guard.is_connected()) {
+            return Some("That connection is not connected.".to_string());
+        }
+        let Some(context) = Self::metadata_pool_session_context(
+            &connection,
+            "Preparing object browser metadata refresh",
+        )
+        .map(|context| context.for_scope(scope.as_deref())) else {
+            return Some(crate::db::format_connection_busy_message());
+        };
+        if state
+            .object_browser
+            .refresh_visible_card_with_context(context)
+        {
+            None
+        } else {
+            Some("Object browser refresh already in progress.".to_string())
+        }
     }
 
     fn start_object_browser_metadata_refresh(state: &mut AppState) -> bool {
@@ -12407,6 +12487,15 @@ impl MainWindow {
                         .unwrap_or_else(|poisoned| poisoned.into_inner());
                     if s.is_any_query_running() {
                         Some(crate::db::format_connection_busy_message())
+                    } else if let Some((connection_id, scope)) =
+                        s.object_browser.visible_preview_context()
+                    {
+                        // What the user is looking at is another connection's
+                        // preview, which owns no tab — so the active tab's
+                        // refresh would leave exactly the tree they are
+                        // pointing at untouched, and nothing else in the UI
+                        // can reload it.
+                        MainWindow::refresh_visible_preview_card(&mut s, connection_id, scope)
                     } else if !MainWindow::start_connection_metadata_refresh(&mut s, schema_sender)
                     {
                         Some("Object browser refresh already in progress.".to_string())
@@ -15033,6 +15122,33 @@ impl MainWindow {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .object_browser
             .has_card_for_tab(tab_id)
+    }
+
+    /// Pick a schema/database in the object browser the way the user does.
+    #[doc(hidden)]
+    pub fn capture_tour_pick_object_browser_scope(&mut self, scope: Option<String>) {
+        let mut object_browser = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .object_browser
+            .clone();
+        object_browser.capture_tour_pick_scope(scope);
+    }
+
+    /// Every editor tab's BINDING scope — the value execution uses, as
+    /// opposed to what the object browser displays.
+    #[doc(hidden)]
+    pub fn capture_tour_tab_binding_scopes(
+        &self,
+    ) -> Vec<(crate::ui::query_tabs::QueryTabId, Option<String>)> {
+        self.state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .editor_tabs
+            .iter()
+            .map(|tab| (tab.tab_id, tab.connection_binding.snapshot().scope))
+            .collect()
     }
 
     /// Move the active tab to another schema/database the way the object

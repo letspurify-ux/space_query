@@ -319,6 +319,47 @@ fn main() {
         "the card still claims a catalog that describes the previous schema".into(),
     );
 
+    println!("  --- a scope pick moves ONLY the tab that made it ---");
+    // Reported from the running app: with several tabs on one database, the
+    // schema picked in the last tab changed the others too — the selector
+    // looked per tab, but the value execution uses did not.
+    let scope_tab = main_window
+        .capture_tour_editor_tab_ids()
+        .first()
+        .copied()
+        .unwrap_or(first_tab);
+    let _ = main_window.capture_tour_select_editor_tab(scope_tab);
+    pump(200);
+    main_window.capture_tour_new_editor_tab();
+    pump(300);
+    let tabs_before = main_window.capture_tour_tab_binding_scopes();
+    let Some(sibling_tab) = main_window.capture_tour_editor_tab_ids().last().copied() else {
+        eprintln!("the sibling tab is missing");
+        std::process::exit(2);
+    };
+    // Pick a schema through the real selector path on the sibling tab.
+    main_window.capture_tour_pick_object_browser_scope(Some("HR".to_string()));
+    pump(300);
+    let tabs_after = main_window.capture_tour_tab_binding_scopes();
+    let moved: Vec<_> = tabs_before
+        .iter()
+        .zip(tabs_after.iter())
+        .filter(|((_, before), (_, after))| before != after)
+        .map(|((tab_id, before), (_, after))| (*tab_id, before.clone(), after.clone()))
+        .collect();
+    report.check(
+        "the pick moves exactly one tab's scope",
+        moved.len() <= 1,
+        format!("tabs that moved: {moved:?} (picked on tab {sibling_tab})"),
+    );
+    report.check(
+        "the tab that moved is the one the pick was made on",
+        moved
+            .first()
+            .is_none_or(|(tab_id, _, _)| *tab_id == sibling_tab),
+        format!("moved: {moved:?}, expected only {sibling_tab}"),
+    );
+
     println!();
     if report.failures.is_empty() {
         println!("ALL PER-TAB OBJECT BROWSER CHECKS PASSED");

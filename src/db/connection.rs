@@ -5909,9 +5909,28 @@ impl DatabaseConnection {
     }
 
     pub fn apply_tracked_oracle_current_schema(&self, conn: &Connection) -> Result<(), String> {
+        self.apply_oracle_current_schema_for_scope(conn, None)
+    }
+
+    /// Put `conn` in the schema an operation with this `scope` runs in: the
+    /// scope when it has one, this connection's tracked schema otherwise —
+    /// the same rule as [`Self::oracle_schema_for_scope`],
+    /// `mysql_database_for_scope` and `DbPoolSessionContext::for_scope`.
+    ///
+    /// Executions MUST go through this rather than the tracked schema alone.
+    /// Scope is per query tab, and the tracked schema is per connection: a
+    /// session moved by one tab (an `ALTER SESSION SET CURRENT_SCHEMA`, whose
+    /// result is synced back here) would otherwise be forced onto every other
+    /// tab's session at its next statement, and those tabs would run
+    /// somewhere their own selector never pointed.
+    pub fn apply_oracle_current_schema_for_scope(
+        &self,
+        conn: &Connection,
+        scope: Option<&str>,
+    ) -> Result<(), String> {
         Self::apply_tracked_oracle_current_schema_on_session(
             conn,
-            self.oracle_current_schema.as_deref(),
+            self.oracle_schema_for_scope(scope),
         )
     }
 
