@@ -28,6 +28,7 @@ use crate::db::{
 use crate::ui::constants::*;
 use crate::ui::font_settings::FontProfile;
 use crate::ui::object_drag_payload;
+use crate::ui::query_tabs::QueryTabId;
 use crate::ui::theme;
 use crate::ui::{
     HighlightData, IntellisenseData, PopupAnchorSnapshot, QualifiedMemberKind, ResultTabRequest,
@@ -9267,24 +9268,38 @@ fn copy_text_for_object_item(item_info: &ObjectItem) -> String {
     }
 }
 
+/// Who a browser card belongs to. Every query editor tab gets its OWN card —
+/// tree, filter, scope selector, metadata cache, and worker lifecycle — so
+/// each tab keeps its expansion state and scope independently; the card is
+/// created when the tab first becomes active on a connection and torn down
+/// when the tab closes. Every connection additionally keeps one PREVIEW card,
+/// which the dropdown shows when the active tab is not bound to that
+/// connection; its selection only seeds what a new or unbound tab binds to.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum BrowserOwner {
+    Tab(QueryTabId),
+    ConnectionPreview(ConnectionId),
+}
+
 #[derive(Clone)]
 struct ConnectionBrowserEntry {
+    owner: BrowserOwner,
     connection_id: ConnectionId,
     runtime: Arc<ConnectionRuntime>,
     browser: ObjectBrowserWidget,
 }
 
-/// Connection-aware Object Browser host. Each open runtime keeps its own tree,
-/// scope selector, metadata cache, and worker lifecycle. The connection choice
-/// is a compact root selector; changing it never changes the active query tab.
+/// Tab- and connection-aware Object Browser host. Cards are per query tab
+/// (plus one preview per connection); the connection choice is a compact root
+/// selector and changing it never changes the active query tab.
 #[derive(Clone)]
 pub struct MultiObjectBrowserWidget {
     flex: Flex,
     connection_choice: Choice,
     browser_stack: Group,
     entries: Arc<Mutex<Vec<ConnectionBrowserEntry>>>,
-    visible_connection_id: Arc<Mutex<Option<ConnectionId>>>,
-    bound_tab_connection_id: Arc<Mutex<Option<ConnectionId>>>,
+    visible_owner: Arc<Mutex<Option<BrowserOwner>>>,
+    active_tab: Arc<Mutex<Option<(QueryTabId, ConnectionId)>>>,
     sql_callback: ConnectionSqlExecuteCallback,
     status_callback: StatusCallback,
     scope_change_callback: ConnectionScopeChangeCallback,
@@ -9325,8 +9340,8 @@ impl MultiObjectBrowserWidget {
             connection_choice,
             browser_stack,
             entries: Arc::new(Mutex::new(Vec::new())),
-            visible_connection_id: Arc::new(Mutex::new(None)),
-            bound_tab_connection_id: Arc::new(Mutex::new(None)),
+            visible_owner: Arc::new(Mutex::new(None)),
+            active_tab: Arc::new(Mutex::new(None)),
             sql_callback: Arc::new(Mutex::new(None)),
             status_callback: Arc::new(Mutex::new(None)),
             scope_change_callback: Arc::new(Mutex::new(None)),
@@ -9392,29 +9407,83 @@ impl MultiObjectBrowserWidget {
         label
     }
 
+    /// The dropdown lists CONNECTIONS (each once), not cards. Picking one
+    /// shows the active tab's own card when the active tab is bound to that
+    /// connection, and the connection's preview card otherwise.
+    fn dropdown_connections(entries: &[ConnectionBrowserEntry]) -> Vec<ConnectionId> {
+        let mut seen = std::collections::HashSet::new();
+        entries
+            .iter()
+            .filter(|entry| seen.insert(entry.connection_id))
+            .map(|entry| entry.connection_id)
+            .collect()
+    }
+
+    fn card_owner_for_connection(
+        entries: &[ConnectionBrowserEntry],
+        active_tab: Option<(QueryTabId, ConnectionId)>,
+        connection_id: ConnectionId,
+    ) -> Option<BrowserOwner> {
+        if let Some((tab_id, active_connection_id)) = active_tab {
+            if active_connection_id == connection_id
+                && entries
+                    .iter()
+                    .any(|entry| entry.owner == BrowserOwner::Tab(tab_id))
+            {
+                return Some(BrowserOwner::Tab(tab_id));
+            }
+        }
+        entries
+            .iter()
+            .find(|entry| entry.owner == BrowserOwner::ConnectionPreview(connection_id))
+            .or_else(|| {
+                entries
+                    .iter()
+                    .find(|entry| entry.connection_id == connection_id)
+            })
+            .map(|entry| entry.owner)
+    }
+
+    fn show_owner_card(entries: &[ConnectionBrowserEntry], owner: BrowserOwner) {
+        for entry in entries {
+            let mut root = entry.browser.get_widget();
+            if entry.owner == owner {
+                root.show();
+            } else {
+                root.hide();
+            }
+        }
+    }
+
     fn setup_connection_choice_callback(&mut self) {
         let entries = self.entries.clone();
-        let visible_connection_id = self.visible_connection_id.clone();
+        let visible_owner = self.visible_owner.clone();
+        let active_tab = self.active_tab.clone();
         self.connection_choice.set_callback(move |choice| {
             let index = choice.value().max(0) as usize;
             let entries_snapshot = entries
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .clone();
-            let selected_id = entries_snapshot.get(index).map(|entry| entry.connection_id);
-            *visible_connection_id
+            let connections = Self::dropdown_connections(&entries_snapshot);
+            let Some(connection_id) = connections.get(index).copied() else {
+                return;
+            };
+            let active = *active_tab
                 .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner()) = selected_id;
-            for (entry_index, entry) in entries_snapshot.iter().enumerate() {
-                let mut root = entry.browser.get_widget();
-                if entry_index == index {
-                    root.show();
-                } else {
-                    root.hide();
-                }
-            }
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let Some(owner) =
+                Self::card_owner_for_connection(&entries_snapshot, active, connection_id)
+            else {
+                return;
+            };
+            *visible_owner
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(owner);
+            Self::show_owner_card(&entries_snapshot, owner);
             if let Some(mut browser) = entries_snapshot
-                .get(index)
+                .iter()
+                .find(|entry| entry.owner == owner)
                 .map(|entry| entry.browser.clone())
             {
                 let _ = browser.refresh();
@@ -9423,7 +9492,12 @@ impl MultiObjectBrowserWidget {
         });
     }
 
-    fn wire_callbacks(&self, connection_id: ConnectionId, browser: &mut ObjectBrowserWidget) {
+    fn wire_callbacks(
+        &self,
+        owner: BrowserOwner,
+        connection_id: ConnectionId,
+        browser: &mut ObjectBrowserWidget,
+    ) {
         let sql_callback = self.sql_callback.clone();
         browser.set_sql_callback(move |action| {
             if let Some(callback) = sql_callback
@@ -9436,23 +9510,32 @@ impl MultiObjectBrowserWidget {
         });
 
         let status_callback = self.status_callback.clone();
-        let visible_connection_id = self.visible_connection_id.clone();
+        let visible_owner = self.visible_owner.clone();
         browser.set_status_callback(move |message| {
-            let visible_id = *visible_connection_id
+            let visible = *visible_owner
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
-            if visible_id == Some(connection_id) {
+            if visible == Some(owner) {
                 ObjectBrowserWidget::emit_status_callback(&status_callback, message);
             }
         });
 
+        // Metadata feeds the editor's intellisense, and every tab has its own
+        // card: only the ACTIVE TAB's card may deliver. Preview cards refresh
+        // their tree but never feed an editor.
         let metadata_callback = self.metadata_callback.clone();
-        let bound_tab_connection_id = self.bound_tab_connection_id.clone();
+        let active_tab = self.active_tab.clone();
         browser.set_metadata_callback(move |snapshot| {
-            let bound_id = *bound_tab_connection_id
+            let active = *active_tab
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
-            if bound_id == Some(connection_id) {
+            let delivers = match owner {
+                BrowserOwner::Tab(tab_id) => {
+                    active.is_some_and(|(active_tab_id, _)| active_tab_id == tab_id)
+                }
+                BrowserOwner::ConnectionPreview(_) => false,
+            };
+            if delivers {
                 ObjectBrowserWidget::emit_metadata_callback(&metadata_callback, snapshot);
             }
         });
@@ -9478,25 +9561,13 @@ impl MultiObjectBrowserWidget {
         });
     }
 
-    pub fn add_runtime(&mut self, runtime: Arc<ConnectionRuntime>) {
-        // A runtime is identified by its id, but an unmanaged or transient
-        // runtime can wrap a connection that a registered runtime already owns.
-        // Browsing the same connection twice would only duplicate the entry, so
-        // keep the one that is already installed.
-        if self
-            .entries
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .iter()
-            .any(|entry| {
-                entry.connection_id == runtime.id()
-                    || Arc::ptr_eq(&entry.runtime.connection(), &runtime.connection())
-            })
-        {
-            self.refresh_runtime_labels();
-            return;
-        }
-
+    /// Builds one browser card for `owner`, wired and font-styled, hidden by
+    /// default.
+    fn create_browser_entry(
+        &mut self,
+        owner: BrowserOwner,
+        runtime: Arc<ConnectionRuntime>,
+    ) -> ConnectionBrowserEntry {
         let previous_group = Group::try_current();
         self.browser_stack.begin();
         let mut browser = ObjectBrowserWidget::new(
@@ -9514,7 +9585,7 @@ impl MultiObjectBrowserWidget {
         } else {
             Group::set_current(None::<&Group>);
         }
-        self.wire_callbacks(runtime.id(), &mut browser);
+        self.wire_callbacks(owner, runtime.id(), &mut browser);
         if let Some((profile, size)) = *self
             .font_settings
             .lock()
@@ -9522,86 +9593,241 @@ impl MultiObjectBrowserWidget {
         {
             browser.apply_font_settings(profile, size);
         }
+        browser.get_widget().hide();
+        ConnectionBrowserEntry {
+            owner,
+            connection_id: runtime.id(),
+            runtime,
+            browser,
+        }
+    }
 
+    /// Ensures the CONNECTION's preview card exists (the card the dropdown
+    /// shows when the active tab is not bound to this connection, and the
+    /// place a new/unbound tab reads its binding from). Tab cards are created
+    /// by `set_active_tab`.
+    pub fn add_runtime(&mut self, runtime: Arc<ConnectionRuntime>) {
+        // A runtime is identified by its id, but an unmanaged or transient
+        // runtime can wrap a connection that a registered runtime already owns.
+        // Browsing the same connection twice would only duplicate the preview,
+        // so keep the one that is already installed.
+        if self
+            .entries
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .iter()
+            .any(|entry| {
+                matches!(entry.owner, BrowserOwner::ConnectionPreview(_))
+                    && (entry.connection_id == runtime.id()
+                        || Arc::ptr_eq(&entry.runtime.connection(), &runtime.connection()))
+            })
+        {
+            self.refresh_runtime_labels();
+            return;
+        }
+
+        let entry =
+            self.create_browser_entry(BrowserOwner::ConnectionPreview(runtime.id()), runtime);
         let is_first = self
             .entries
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .is_empty();
-        if !is_first {
-            browser.get_widget().hide();
-        } else {
+        if is_first {
+            entry.browser.get_widget().show();
             *self
-                .visible_connection_id
+                .visible_owner
                 .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(runtime.id());
+                .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(entry.owner);
         }
         self.entries
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .push(ConnectionBrowserEntry {
-                connection_id: runtime.id(),
-                runtime,
-                browser,
-            });
+            .push(entry);
         self.refresh_runtime_labels();
     }
 
-    pub fn remove_runtime(&mut self, connection_id: ConnectionId) -> bool {
-        let removed = {
-            let mut entries = self
+    /// The active query tab changed (or its binding did): make sure that tab
+    /// has its OWN card on its connection, show it, and route metadata to it.
+    /// An unbound tab (`None`) keeps the current card visible, like before.
+    /// Returns whether the tab's card was newly created (its tree is empty
+    /// until a metadata refresh fills it — the caller schedules one).
+    pub fn set_active_tab(
+        &mut self,
+        tab_id: QueryTabId,
+        runtime: Option<Arc<ConnectionRuntime>>,
+    ) -> bool {
+        let Some(runtime) = runtime else {
+            *self
+                .active_tab
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+            return false;
+        };
+        let connection_id = runtime.id();
+        *self
+            .active_tab
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some((tab_id, connection_id));
+
+        let owner = BrowserOwner::Tab(tab_id);
+        let stale_entry = {
+            let entries = self
                 .entries
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
-            let Some(index) = entries
+            entries
                 .iter()
-                .position(|entry| entry.connection_id == connection_id)
-            else {
-                return false;
-            };
-            entries.remove(index)
+                .find(|entry| entry.owner == owner)
+                .map(|entry| (entry.connection_id, entry.browser.get_widget()))
+        };
+        let created = match stale_entry {
+            Some((existing_connection_id, _)) if existing_connection_id == connection_id => false,
+            Some((_, root)) => {
+                // The tab moved to another connection: its old card shows the
+                // wrong server. Tear it down and start fresh.
+                self.remove_entry_widget(owner, root);
+                let entry = self.create_browser_entry(owner, runtime);
+                self.entries
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .push(entry);
+                true
+            }
+            None => {
+                let entry = self.create_browser_entry(owner, runtime);
+                self.entries
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .push(entry);
+                true
+            }
         };
 
-        let mut root = removed.browser.get_widget();
-        root.hide();
-        drop(removed);
-        Flex::delete(root);
-
+        *self
+            .visible_owner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(owner);
         let entries = self
             .entries
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .clone();
-        let next_id = entries.first().map(|entry| entry.connection_id);
-        // Only the removed connection loses its selection. Falling back to the
-        // first entry unconditionally would show one connection's tree while
-        // `visible_connection_id` still reports another one.
-        let visible_id = {
-            let mut visible = self
-                .visible_connection_id
+        Self::show_owner_card(&entries, owner);
+        self.refresh_runtime_labels();
+        app::redraw();
+        created
+    }
+
+    fn remove_entry_widget(&mut self, owner: BrowserOwner, mut root: Flex) {
+        let removed = {
+            let mut entries = self
+                .entries
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
-            if *visible == Some(connection_id) {
-                *visible = next_id;
-            }
-            *visible
+            entries
+                .iter()
+                .position(|entry| entry.owner == owner)
+                .map(|index| entries.remove(index))
         };
+        root.hide();
+        drop(removed);
+        Flex::delete(root);
+    }
+
+    /// A query tab closed: tear its card down (the drop stops the card's
+    /// worker and poll loop). The connection stays in the dropdown through
+    /// its preview card.
+    pub fn remove_tab(&mut self, tab_id: QueryTabId) {
+        let owner = BrowserOwner::Tab(tab_id);
+        let root = self
+            .entries
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .iter()
+            .find(|entry| entry.owner == owner)
+            .map(|entry| entry.browser.get_widget());
+        let Some(root) = root else {
+            return;
+        };
+        self.remove_entry_widget(owner, root);
         {
-            let mut bound = self
-                .bound_tab_connection_id
+            let mut active = self
+                .active_tab
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
-            if *bound == Some(connection_id) {
-                *bound = None;
+            if active.is_some_and(|(active_tab_id, _)| active_tab_id == tab_id) {
+                *active = None;
             }
         }
-        for (index, entry) in entries.iter().enumerate() {
-            let mut entry_root = entry.browser.get_widget();
-            if Some(entry.connection_id) == visible_id {
-                entry_root.show();
-                self.connection_choice.set_value(index as i32);
-            } else {
-                entry_root.hide();
+        let entries = self
+            .entries
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        let mut visible = self
+            .visible_owner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if *visible == Some(owner) {
+            *visible = entries.first().map(|entry| entry.owner);
+            if let Some(next_owner) = *visible {
+                Self::show_owner_card(&entries, next_owner);
+            }
+        }
+        drop(visible);
+        self.refresh_runtime_labels();
+        app::redraw();
+    }
+
+    /// A connection went away: tear down its preview card AND every tab card
+    /// on it.
+    pub fn remove_runtime(&mut self, connection_id: ConnectionId) -> bool {
+        let owners = self
+            .entries
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .iter()
+            .filter(|entry| entry.connection_id == connection_id)
+            .map(|entry| (entry.owner, entry.browser.get_widget()))
+            .collect::<Vec<_>>();
+        if owners.is_empty() {
+            return false;
+        }
+        for (owner, root) in owners {
+            self.remove_entry_widget(owner, root);
+        }
+
+        {
+            let mut active = self
+                .active_tab
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if active.is_some_and(|(_, active_connection_id)| active_connection_id == connection_id)
+            {
+                *active = None;
+            }
+        }
+        let entries = self
+            .entries
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        // Only the removed connection loses its selection. Falling back to
+        // the first remaining card unconditionally would show one
+        // connection's tree while `visible_owner` still reports another one.
+        {
+            let mut visible = self
+                .visible_owner
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let visible_is_gone =
+                !visible.is_some_and(|owner| entries.iter().any(|entry| entry.owner == owner));
+            if visible_is_gone {
+                *visible = entries.first().map(|entry| entry.owner);
+            }
+            if let Some(owner) = *visible {
+                Self::show_owner_card(&entries, owner);
             }
         }
         self.refresh_runtime_labels();
@@ -9611,8 +9837,8 @@ impl MultiObjectBrowserWidget {
 
     pub fn refresh_runtime_labels(&mut self) {
         let current_value = self.connection_choice.value();
-        let visible_id = *self
-            .visible_connection_id
+        let visible = *self
+            .visible_owner
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         let (mut labels, visible_index) = {
@@ -9620,13 +9846,25 @@ impl MultiObjectBrowserWidget {
                 .entries
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
-            let labels = entries
+            let connections = Self::dropdown_connections(&entries);
+            let labels = connections
                 .iter()
-                .map(|entry| Self::runtime_label(&entry.runtime))
+                .filter_map(|connection_id| {
+                    entries
+                        .iter()
+                        .find(|entry| entry.connection_id == *connection_id)
+                        .map(|entry| Self::runtime_label(&entry.runtime))
+                })
                 .collect::<Vec<_>>();
-            let visible_index = entries
+            let visible_connection_id = visible.and_then(|owner| {
+                entries
+                    .iter()
+                    .find(|entry| entry.owner == owner)
+                    .map(|entry| entry.connection_id)
+            });
+            let visible_index = connections
                 .iter()
-                .position(|entry| Some(entry.connection_id) == visible_id);
+                .position(|connection_id| Some(*connection_id) == visible_connection_id);
             (labels, visible_index)
         };
         // The read-only flag is a property of the saved profile, and a reconnect
@@ -9663,80 +9901,46 @@ impl MultiObjectBrowserWidget {
         self.connection_choice.activate();
     }
 
+    /// The connection and scope the VISIBLE card shows — what a new or
+    /// unbound tab binds to.
     pub fn selected_connection_context(&self) -> Option<(ConnectionId, Option<String>)> {
-        let connection_id = (*self
-            .visible_connection_id
+        let visible = (*self
+            .visible_owner
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner()))?;
-        let scope = self
-            .entries
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .iter()
-            .find(|entry| entry.connection_id == connection_id)
-            .and_then(|entry| entry.browser.selected_scope());
-        Some((connection_id, scope))
-    }
-
-    pub fn set_active_connection(&mut self, connection_id: Option<ConnectionId>) {
-        *self
-            .bound_tab_connection_id
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner()) = connection_id;
-        let index = connection_id.and_then(|connection_id| {
-            self.entries
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .iter()
-                .position(|entry| entry.connection_id == connection_id)
-        });
-        let Some(index) = index else {
-            return;
-        };
-        self.connection_choice.set_value(index as i32);
-        *self
-            .visible_connection_id
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner()) = connection_id;
         let entries = self
             .entries
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .clone();
-        for (entry_index, entry) in entries.iter().enumerate() {
-            let mut root = entry.browser.get_widget();
-            if entry_index == index {
-                root.show();
-            } else {
-                root.hide();
-            }
-        }
-        self.refresh_runtime_labels();
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let entry = entries.iter().find(|entry| entry.owner == visible)?;
+        Some((entry.connection_id, entry.browser.selected_scope()))
     }
 
+    /// The ACTIVE TAB's own card — where editor-driven reads and writes (its
+    /// scope, its metadata refresh) go.
     fn bound_browser(&self) -> Option<ObjectBrowserWidget> {
-        let connection_id = *self
-            .bound_tab_connection_id
+        let (tab_id, _) = (*self
+            .active_tab
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+            .unwrap_or_else(|poisoned| poisoned.into_inner()))?;
         self.entries
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .iter()
-            .find(|entry| Some(entry.connection_id) == connection_id)
+            .find(|entry| entry.owner == BrowserOwner::Tab(tab_id))
             .map(|entry| entry.browser.clone())
     }
 
     fn visible_browser(&self) -> Option<ObjectBrowserWidget> {
-        let connection_id = *self
-            .visible_connection_id
+        let owner = *self
+            .visible_owner
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         self.entries
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .iter()
-            .find(|entry| Some(entry.connection_id) == connection_id)
+            .find(|entry| Some(entry.owner) == owner)
             .map(|entry| entry.browser.clone())
     }
 
@@ -9788,34 +9992,42 @@ impl MultiObjectBrowserWidget {
             .any(|entry| entry.browser.capture_tour_expand_path(path))
     }
 
+    /// The card a CONNECTION-keyed read should answer from: the active tab's
+    /// own card when it is on this connection, else the connection's preview
+    /// card, else any card of the connection.
+    fn representative_entry_for_connection(
+        &self,
+        connection_id: ConnectionId,
+    ) -> Option<ConnectionBrowserEntry> {
+        let active = *self
+            .active_tab
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let entries = self
+            .entries
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        Self::card_owner_for_connection(&entries, active, connection_id)
+            .and_then(|owner| entries.iter().find(|entry| entry.owner == owner).cloned())
+    }
+
     pub fn selected_scope_for_connection(&self, connection_id: ConnectionId) -> Option<String> {
+        self.representative_entry_for_connection(connection_id)
+            .and_then(|entry| entry.browser.selected_scope())
+    }
+
+    pub fn selected_scope_for_tab(&self, tab_id: QueryTabId) -> Option<String> {
         self.entries
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .iter()
-            .find(|entry| entry.connection_id == connection_id)
+            .find(|entry| entry.owner == BrowserOwner::Tab(tab_id))
             .and_then(|entry| entry.browser.selected_scope())
     }
 
-    pub fn metadata_snapshot_for_connection(
-        &self,
-        connection_id: ConnectionId,
-    ) -> Option<ObjectBrowserMetadataSnapshot> {
-        let entry = self
-            .entries
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .iter()
-            .find(|entry| entry.connection_id == connection_id)
-            .cloned()?;
-        let snapshot = entry.browser.metadata_snapshot();
-        (snapshot.connection_generation == entry.runtime.connection_generation())
-            .then_some(snapshot)
-    }
-
-    pub fn set_selected_scope_for_connection(
+    pub fn set_selected_scope_for_tab(
         &mut self,
-        connection_id: ConnectionId,
+        tab_id: QueryTabId,
         scope: Option<String>,
     ) -> bool {
         let browser = self
@@ -9823,12 +10035,47 @@ impl MultiObjectBrowserWidget {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .iter()
-            .find(|entry| entry.connection_id == connection_id)
+            .find(|entry| entry.owner == BrowserOwner::Tab(tab_id))
             .map(|entry| entry.browser.clone());
         let Some(mut browser) = browser else {
             return false;
         };
         browser.set_selected_scope(scope);
+        true
+    }
+
+    pub fn metadata_snapshot_for_connection(
+        &self,
+        connection_id: ConnectionId,
+    ) -> Option<ObjectBrowserMetadataSnapshot> {
+        let entry = self.representative_entry_for_connection(connection_id)?;
+        let snapshot = entry.browser.metadata_snapshot();
+        (snapshot.connection_generation == entry.runtime.connection_generation())
+            .then_some(snapshot)
+    }
+
+    /// Connection-wide scope write: every card of the connection (each tab's
+    /// and the preview) takes the value. Used by connection lifecycle resets;
+    /// a user's scope pick goes through the visible card / the tab setter.
+    pub fn set_selected_scope_for_connection(
+        &mut self,
+        connection_id: ConnectionId,
+        scope: Option<String>,
+    ) -> bool {
+        let browsers = self
+            .entries
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .iter()
+            .filter(|entry| entry.connection_id == connection_id)
+            .map(|entry| entry.browser.clone())
+            .collect::<Vec<_>>();
+        if browsers.is_empty() {
+            return false;
+        }
+        for mut browser in browsers {
+            browser.set_selected_scope(scope.clone());
+        }
         true
     }
 
@@ -9851,20 +10098,20 @@ impl MultiObjectBrowserWidget {
         self.refresh_runtime_labels();
     }
 
-    fn browser_for_connection(&self, connection_id: ConnectionId) -> Option<ObjectBrowserWidget> {
-        self.entries
+    /// Clear every card of the connection that just went away — keyed by
+    /// connection rather than by what is bound or visible, so disconnecting a
+    /// background connection stops its metadata loads too (tab cards
+    /// included).
+    pub fn clear_on_disconnect_for_connection(&mut self, connection_id: ConnectionId) {
+        let browsers = self
+            .entries
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .iter()
-            .find(|entry| entry.connection_id == connection_id)
+            .filter(|entry| entry.connection_id == connection_id)
             .map(|entry| entry.browser.clone())
-    }
-
-    /// Clear the browser of the connection that just went away. Keyed by
-    /// connection rather than by what is bound or visible, so disconnecting a
-    /// background connection stops its metadata load too.
-    pub fn clear_on_disconnect_for_connection(&mut self, connection_id: ConnectionId) {
-        if let Some(mut browser) = self.browser_for_connection(connection_id) {
+            .collect::<Vec<_>>();
+        for mut browser in browsers {
             browser.clear_on_disconnect();
         }
         self.refresh_runtime_labels();

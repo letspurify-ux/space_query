@@ -2454,6 +2454,82 @@ fn run_scenarios(target: Target, h: &mut Harness) -> Result<(), String> {
     });
     h.run("ROLLBACK")?;
 
+    // ---- S40: a dirty session does not gate a scope change ------------------
+    // The commit/rollback/discard decision belongs to tab close. A scope
+    // change is applied to the tab's retained session IN PLACE (MySQL `USE`,
+    // Oracle `ALTER SESSION SET CURRENT_SCHEMA`), so uncommitted work must
+    // neither block it (the old ScopeChange preflight refused any preserved
+    // state) nor be silently committed or discarded by it: the open
+    // transaction simply continues in the new scope, still rollback-able.
+    println!("  --- S40 a dirty session does not gate a scope change ---");
+    h.editor.clear_tab_transaction_mode_override();
+    let scratch_scope = "SQ_TM_SCOPE2";
+    let _ = h.run(&if target.is_oracle() {
+        format!("DROP USER {scratch_scope} CASCADE")
+    } else {
+        format!("DROP DATABASE IF EXISTS {scratch_scope}")
+    });
+    let capture = h.run(&if target.is_oracle() {
+        format!("CREATE USER {scratch_scope} IDENTIFIED BY pw1")
+    } else {
+        format!("CREATE DATABASE {scratch_scope}")
+    })?;
+    if !capture.results.first().is_some_and(|result| result.success) {
+        return Err(format!(
+            "S40 could not create the scratch scope: {:?}",
+            capture.results.first().map(|r| r.message.clone())
+        ));
+    }
+    let capture = h.run(&format!("INSERT INTO {qualified_table} VALUES (4001)"))?;
+    h.check(
+        "S40 the uncommitted write before the scope change succeeds",
+        capture.results.first().is_some_and(|result| result.success),
+        format!(
+            "insert result: {:?}",
+            capture
+                .results
+                .first()
+                .map(|r| (r.success, r.message.clone()))
+        ),
+    );
+    let scope_outcome = h.change_tab_scope(Some(scratch_scope));
+    h.check(
+        "S40 the scope change is applied over the uncommitted work",
+        scope_outcome.contains("Applied"),
+        format!("scope change outcome: {scope_outcome}"),
+    );
+    let scope_now = h.select_scalar(current_scope_sql)?;
+    h.check(
+        "S40 the tab's session really moved while the transaction stayed open",
+        scope_now.trim().eq_ignore_ascii_case(scratch_scope),
+        format!("{current_scope_sql} = {scope_now:?}"),
+    );
+    let kept = h.select_scalar(&format!(
+        "SELECT COUNT(*) FROM {qualified_table} WHERE V = 4001"
+    ))?;
+    h.check(
+        "S40 the uncommitted work survived the scope change on the same session",
+        kept.trim() == "1",
+        format!("rows visible to the transaction = {kept:?}"),
+    );
+    h.run("ROLLBACK")?;
+    let remaining = h.select_scalar(&format!(
+        "SELECT COUNT(*) FROM {qualified_table} WHERE V = 4001"
+    ))?;
+    h.check(
+        "S40 the work stayed rollback-able: nothing was committed by the scope change",
+        remaining.trim() == "0",
+        format!("rows after ROLLBACK = {remaining:?}"),
+    );
+    h.change_tab_scope(Some(&base_scope));
+    let _ = h.editor.discard_pooled_session_for_close();
+    let _ = h.run(&if target.is_oracle() {
+        format!("DROP USER {scratch_scope} CASCADE")
+    } else {
+        format!("DROP DATABASE IF EXISTS {scratch_scope}")
+    });
+    h.run("ROLLBACK")?;
+
     // ---- S33 (MySQL family): XA transactions on a manual-commit tab ---------
     // `XA START` is the one transaction opener the server refuses over ANY
     // open transaction (XAER_OUTSIDE) instead of implicitly committing it —

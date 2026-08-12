@@ -133,11 +133,15 @@ pub fn retained_session_state_preflight_decision(
             }
         }
         RetainedSessionPreflightAction::ScopeChange => {
-            if state.requires_physical_session_preservation() {
-                RetainedSessionPreflightDecision::RequireResolution
-            } else {
-                RetainedSessionPreflightDecision::Allow
-            }
+            // Scope is applied to the retained session IN PLACE (MySQL
+            // `USE`, Oracle `ALTER SESSION SET CURRENT_SCHEMA`) — it neither
+            // commits, rolls back, nor discards, so an open transaction or
+            // session residue survives it and there is nothing a
+            // commit/rollback/discard prompt would protect. Failures surface
+            // as ordinary errors and the apply path preserves a session that
+            // still carries work (`apply_current_scope_to_retained_session`).
+            // The resolution decision belongs to tab close only.
+            RetainedSessionPreflightDecision::Allow
         }
         RetainedSessionPreflightAction::ConnectionTransition
         | RetainedSessionPreflightAction::PoolResize
@@ -2340,7 +2344,7 @@ mod tests {
                 RetainedSessionPreflightAction::ScopeChange,
                 state
             ),
-            RetainedSessionPreflightDecision::RequireResolution
+            RetainedSessionPreflightDecision::Allow
         );
         assert_eq!(
             retained_session_state_preflight_decision(
@@ -2400,7 +2404,6 @@ mod tests {
         for action in [
             RetainedSessionPreflightAction::ConnectionTransition,
             RetainedSessionPreflightAction::PoolResize,
-            RetainedSessionPreflightAction::ScopeChange,
             RetainedSessionPreflightAction::ReleaseClean,
         ] {
             assert_eq!(
@@ -2408,6 +2411,13 @@ mod tests {
                 RetainedSessionPreflightDecision::RequireResolution
             );
         }
+        assert_eq!(
+            retained_session_state_preflight_decision(
+                RetainedSessionPreflightAction::ScopeChange,
+                state
+            ),
+            RetainedSessionPreflightDecision::Allow
+        );
         assert_eq!(
             retained_session_state_preflight_decision(RetainedSessionPreflightAction::Close, state),
             RetainedSessionPreflightDecision::Allow
@@ -2764,15 +2774,13 @@ mod tests {
     }
 
     #[test]
-    fn retained_preflight_scope_change_blocks_preserved_session_state() {
-        assert_eq!(
-            retained_session_preflight_decision(
-                RetainedSessionPreflightAction::ScopeChange,
-                TransactionSessionState::Clean
-            ),
-            RetainedSessionPreflightDecision::Allow
-        );
+    fn retained_preflight_scope_change_is_always_allowed() {
+        // Scope is applied to the retained session in place (MySQL `USE`,
+        // Oracle `ALTER SESSION SET CURRENT_SCHEMA`): it neither commits,
+        // rolls back, nor discards, so no transaction state may gate it —
+        // the resolution decision belongs to tab close only.
         for state in [
+            TransactionSessionState::Clean,
             TransactionSessionState::MaybeDirty,
             TransactionSessionState::BlockedDirty,
             TransactionSessionState::DecisionRequired,
@@ -2783,13 +2791,13 @@ mod tests {
                     RetainedSessionPreflightAction::ScopeChange,
                     state
                 ),
-                RetainedSessionPreflightDecision::RequireResolution
+                RetainedSessionPreflightDecision::Allow
             );
         }
     }
 
     #[test]
-    fn retained_preflight_scope_change_blocks_session_bound_mysql_states() {
+    fn retained_preflight_scope_change_ignores_session_bound_mysql_states() {
         let post_processor = crate::db::statement_session_post_processor_for(DatabaseType::MySQL);
 
         for sql in [
@@ -2813,12 +2821,14 @@ mod tests {
                 state.requires_physical_session_preservation(),
                 "{sql} should preserve the physical session"
             );
+            // Session-bound residue rides along on the preserved session; the
+            // in-place scope change does not disturb it.
             assert_eq!(
                 retained_session_state_preflight_decision(
                     RetainedSessionPreflightAction::ScopeChange,
                     state,
                 ),
-                RetainedSessionPreflightDecision::RequireResolution,
+                RetainedSessionPreflightDecision::Allow,
                 "{sql}"
             );
         }

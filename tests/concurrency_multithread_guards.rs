@@ -1979,7 +1979,7 @@ fn mysql_plain_use_statement_updates_scope_and_refreshes_metadata() {
 }
 
 #[test]
-fn mysql_database_changed_updates_all_same_connection_tabs_without_releasing_sessions() {
+fn mysql_database_changed_updates_the_originating_tab_without_releasing_sessions() {
     let file = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/ui/main_window.rs");
     let content = fs::read_to_string(&file)
         .unwrap_or_else(|err| panic!("failed to read source file {}: {err}", file.display()));
@@ -1993,15 +1993,17 @@ fn mysql_database_changed_updates_all_same_connection_tabs_without_releasing_ses
         .expect("StatementFinished handler should follow DatabaseChanged");
     let handler = &content[start..end];
 
+    // Scope is TAB-scoped: a `USE` ran on ONE tab's session, so only that
+    // tab's binding, browser card, and retained session may move — sibling
+    // tabs on the same connection keep their own scope.
     assert!(
-        handler.contains("s.synchronize_scope_for_connection(")
-            && handler.contains("connection_id")
+        handler.contains("s.synchronize_scope_for_tab(tab_id")
             && handler.contains("selected_scope.clone()"),
-        "DatabaseChanged should synchronize the selected database by ConnectionId"
+        "DatabaseChanged should synchronize the selected database on the originating tab"
     );
     assert!(
-        handler.contains("s.retained_scope_update_for_connection("),
-        "DatabaseChanged should update retained sessions across the same connection"
+        handler.contains("s.retained_scope_update_for_tab(tab_id"),
+        "DatabaseChanged should update the originating tab's retained session"
     );
     assert!(
         handler.contains("if s.active_editor_tab_id == tab_id"),
@@ -2062,12 +2064,12 @@ fn oracle_current_schema_change_updates_object_browser_scope_before_refresh() {
         .expect("StatementFinished handler should follow ScopeChangedNotice");
     let handler = &main_window[handler_start..handler_end];
     assert!(
-        handler.contains("s.synchronize_scope_for_connection("),
-        "ScopeChangedNotice should synchronize the object-browser and every same-connection tab"
+        handler.contains("s.synchronize_scope_for_tab(tab_id"),
+        "ScopeChangedNotice should synchronize the originating tab's binding and browser card"
     );
     assert!(
-        handler.contains("s.retained_scope_update_for_connection("),
-        "ScopeChangedNotice should update retained sessions for the same ConnectionId"
+        handler.contains("s.retained_scope_update_for_tab(tab_id"),
+        "ScopeChangedNotice should update the originating tab's retained session"
     );
     assert!(
         handler.contains("owning_result_tabs.set_execution_origin(origin)"),
@@ -2397,10 +2399,14 @@ fn object_browser_scope_change_updates_same_connection_metadata_scope() {
         callback.contains("retained_scope_update"),
         "object browser scope changes should propagate to retained tab sessions"
     );
+    // Scope is TAB-scoped: a browser pick lands on the ACTIVE tab when it is
+    // bound to the source connection, and only stores the selection (for
+    // future/unbound tabs) otherwise.
     assert!(
-        callback.contains("s.synchronize_scope_for_connection(connection_id")
-            && callback.contains("s.retained_scope_update_for_connection("),
-        "object browser scope changes should update every tab and retained session for the source ConnectionId"
+        callback.contains("s.scope_target_tab_for_connection(connection_id)")
+            && callback.contains("s.synchronize_scope_for_tab(tab_id")
+            && callback.contains("s.retained_scope_update_for_tab(tab_id"),
+        "object browser scope changes should land on the active tab of the source ConnectionId only"
     );
     assert!(
         !callback.contains("try_lock_connection_with_activity")
@@ -2434,7 +2440,7 @@ fn object_browser_actions_are_routed_to_the_source_connection_tab() {
 
     let object_browser = read_source("src/ui/object_browser.rs");
     let wire_start = object_browser
-        .find("fn wire_callbacks(&self, connection_id: ConnectionId")
+        .find("fn wire_callbacks(")
         .expect("multi-connection browser callback wiring should exist");
     let wire_end = object_browser[wire_start..]
         .find("pub fn add_runtime")
@@ -2597,8 +2603,8 @@ fn startup_has_no_placeholder_database_runtime() {
         "startup must not create or select a query editor tab"
     );
     assert!(
-        object_browser.contains("visible_connection_id: Arc::new(Mutex::new(None))")
-            && object_browser.contains("bound_tab_connection_id: Arc::new(Mutex::new(None))")
+        object_browser.contains("visible_owner: Arc::new(Mutex::new(None))")
+            && object_browser.contains("active_tab: Arc::new(Mutex::new(None))")
             && object_browser.contains("connection_choice.deactivate();"),
         "the connection selector must start empty and disabled until a real runtime is opened"
     );

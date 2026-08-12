@@ -2117,6 +2117,46 @@ impl AppState {
         changed
     }
 
+    /// Tab-scoped scope write: sets the scope on ONE tab's binding, mirrors
+    /// it into the object browser when that tab is active (the browser shows
+    /// the active tab's scope), and schedules that tab's metadata refresh.
+    /// Other tabs on the same connection keep their own scope.
+    fn synchronize_scope_for_tab(&mut self, tab_id: QueryTabId, scope: Option<String>) -> bool {
+        let scope = Self::normalize_scope_name(scope);
+        let Some(tab) = self.editor_tabs.iter().find(|tab| tab.tab_id == tab_id) else {
+            return false;
+        };
+        let binding = tab.connection_binding.snapshot();
+        let changed = binding.scope != scope;
+        tab.connection_binding.set_scope(scope.clone());
+        // Every tab has its own browser card; mirror the scope onto it
+        // whether or not the tab is active.
+        self.object_browser
+            .set_selected_scope_for_tab(tab_id, scope);
+        if changed {
+            self.clear_metadata_for_tab(tab_id);
+            self.mark_metadata_refresh_pending(tab_id);
+        }
+        changed
+    }
+
+    fn clear_metadata_for_tab(&mut self, tab_id: QueryTabId) {
+        let active_is_affected = self.active_editor_tab_id == tab_id;
+        if let Some(tab) = self.editor_tabs.iter_mut().find(|tab| tab.tab_id == tab_id) {
+            *tab.intellisense_data
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()) = IntellisenseData::new();
+            tab.highlight_data = HighlightData::new();
+            tab.sql_editor
+                .update_highlight_data_deferred(HighlightData::new());
+        }
+        if active_is_affected {
+            self.schema_highlight_data = HighlightData::new();
+            self.sql_editor
+                .update_highlight_data_deferred(HighlightData::new());
+        }
+    }
+
     fn set_active_editor_tab(&mut self, tab_id: QueryTabId) -> bool {
         self.set_active_editor_tab_with_display_stabilization(tab_id, true)
     }
@@ -2160,8 +2200,9 @@ impl AppState {
         {
             self.object_browser.add_runtime(runtime.clone());
         }
-        self.object_browser
-            .set_active_connection(binding_snapshot.connection_id());
+        let tab_browser_created = self
+            .object_browser
+            .set_active_tab(tab_id, binding_snapshot.runtime.clone());
         if let Some(connection) = binding_snapshot.connection() {
             self.connection = connection.clone();
             let connection_snapshot = crate::db::try_lock_connection(&connection).map(|guard| {
@@ -2187,6 +2228,24 @@ impl AppState {
         }
         self.pending_connection_metadata_refresh =
             self.has_live_connection && self.pending_metadata_refresh_tabs.remove(&tab_id);
+        // Scope is per tab: the tab's own browser card (shown by
+        // set_active_tab above) must report this tab's scope. A newly created
+        // card starts scopeless with an EMPTY tree, so seed the scope and
+        // schedule this tab's metadata refresh unconditionally (picked up by
+        // start_pending_metadata_refresh_if_ready below); an existing card
+        // already tracks both via synchronize_scope_for_tab.
+        if binding_snapshot.connection_id().is_some() {
+            let displayed_scope = self.object_browser.selected_scope_for_tab(tab_id);
+            let tab_scope = Self::normalize_scope_name(binding_snapshot.scope.clone());
+            let scope_out_of_sync = displayed_scope != tab_scope;
+            if scope_out_of_sync {
+                self.object_browser
+                    .set_selected_scope_for_tab(tab_id, tab_scope);
+            }
+            if tab_browser_created || scope_out_of_sync {
+                self.mark_metadata_refresh_pending(tab_id);
+            }
+        }
         self.sql_editor = tab.sql_editor;
         self.sql_editor.sync_db_type_from_connection();
         self.sql_editor.mark_display_metrics_pending();
@@ -3728,48 +3787,42 @@ impl AppState {
         self.transaction_access_choice.activate();
     }
 
+    /// Scope is tab-scoped: a browser scope pick lands on the ACTIVE tab
+    /// only, so only that tab's in-flight work can block it. A retained
+    /// session never blocks a scope change — the scope is applied to the
+    /// session in place and the commit/rollback/discard decision belongs to
+    /// tab close (`RetainedSessionPreflightAction::ScopeChange` is always
+    /// allowed by policy).
     fn retained_scope_change_blocker_for_connection(
         &self,
         connection_id: ConnectionId,
     ) -> Option<String> {
-        if self.has_work_for_connection(connection_id) {
+        if self.active_connection_id() == Some(connection_id)
+            && self.has_running_query_or_lazy_fetch_for_tab(self.active_editor_tab_id)
+        {
             return Some(
-                "Cannot change scope while a query or lazy fetch is active on this connection."
+                "Cannot change scope while a query or lazy fetch is active on this tab."
                     .to_string(),
             );
-        }
-        for tab in self
-            .editor_tabs
-            .iter()
-            .filter(|tab| tab.connection_binding.snapshot().connection_id() == Some(connection_id))
-        {
-            let Some(snapshot) = tab.sql_editor.pooled_session_activity_snapshot() else {
-                continue;
-            };
-            let state = snapshot.retained_state;
-            if crate::db::retained_session_state_preflight_decision(
-                RetainedSessionPreflightAction::ScopeChange,
-                state,
-            ) == RetainedSessionPreflightDecision::RequireResolution
-            {
-                return Some(format!(
-                    "Cannot change scope while tab '{}' has a {} DB session. Commit, rollback, or discard it first.",
-                    Self::tab_display_label(tab),
-                    state.label()
-                ));
-            }
         }
         None
     }
 
-    fn retained_scope_update_for_connection(
+    /// The tab whose scope a browser pick on `connection_id` governs: the
+    /// active tab, when it is bound to that connection. A browser card shown
+    /// for another connection only stores its selection for new-tab binding.
+    fn scope_target_tab_for_connection(&self, connection_id: ConnectionId) -> Option<QueryTabId> {
+        (self.active_connection_id() == Some(connection_id)).then_some(self.active_editor_tab_id)
+    }
+
+    fn retained_scope_update_for_tab(
         &self,
-        connection_id: ConnectionId,
+        tab_id: QueryTabId,
         scope: Option<String>,
     ) -> Option<RetainedScopeUpdate> {
         let scope = Self::normalize_scope_name(scope)?;
-        let runtime = self.connection_registry.get(connection_id)?;
-        let connection = runtime.connection();
+        let tab = self.editor_tabs.iter().find(|tab| tab.tab_id == tab_id)?;
+        let connection = tab.connection_binding.snapshot().connection()?;
         let conn_guard = crate::db::try_lock_connection(&connection)?;
         if !conn_guard.is_connected() {
             return None;
@@ -3778,20 +3831,19 @@ impl AppState {
         if !db_type.has_connection_scope() {
             return None;
         }
+        let editors = tab
+            .sql_editor
+            .pooled_session_activity_snapshot()
+            .is_some()
+            .then(|| vec![tab.sql_editor.clone()])
+            .unwrap_or_default();
         Some((
             db_type,
             conn_guard.connection_generation(),
             conn_guard.pool_context_epoch(),
             conn_guard.get_info().advanced.clone(),
             scope,
-            self.editor_tabs
-                .iter()
-                .filter(|tab| {
-                    tab.connection_binding.snapshot().connection_id() == Some(connection_id)
-                        && tab.sql_editor.pooled_session_activity_snapshot().is_some()
-                })
-                .map(|tab| tab.sql_editor.clone())
-                .collect(),
+            editors,
         ))
     }
 
@@ -8521,6 +8573,7 @@ impl MainWindow {
                 s.refresh_result_edit_controls();
             }
             s.editor_tabs.remove(index);
+            s.object_browser.remove_tab(tab_id);
             s.pending_metadata_refresh_tabs.remove(&tab_id);
             s.finish_progress_context(tab_id);
             s.pending_query_cancellations
@@ -10467,10 +10520,12 @@ impl MainWindow {
                             runtime.update_sanitized_info(info.clone());
                             runtime.set_state(ConnectionRuntimeState::Connected);
                             s.object_browser.add_runtime(runtime.clone());
-                            s.synchronize_scope_for_connection(runtime.id(), None);
+                            // Script CONNECT rebuilt THIS tab's connection;
+                            // only this tab's scope resets.
+                            s.synchronize_scope_for_tab(tab_id, None);
                             if s.active_editor_tab_id == tab_id {
                                 s.object_browser
-                                    .set_active_connection(Some(runtime.id()));
+                                    .set_active_tab(tab_id, Some(runtime.clone()));
                             }
                         }
                         if s.active_editor_tab_id == tab_id {
@@ -10503,22 +10558,13 @@ impl MainWindow {
                     let database = info.service_name.trim().to_string();
                     let mut retained_scope_update = None;
                     if !database.is_empty() {
-                        let connection_id = s
-                            .editor_tabs
-                            .iter()
-                            .find(|tab| tab.tab_id == tab_id)
-                            .and_then(|tab| tab.connection_binding.snapshot().connection_id());
-                        if let Some(connection_id) = connection_id {
-                            let selected_scope = Some(database.clone());
-                            if s.synchronize_scope_for_connection(
-                                connection_id,
-                                selected_scope.clone(),
-                            ) {
-                                retained_scope_update = s.retained_scope_update_for_connection(
-                                    connection_id,
-                                    selected_scope,
-                                );
-                            }
+                        // A `USE` ran on THIS tab's session: the scope change
+                        // belongs to this tab alone. Sibling tabs on the same
+                        // connection keep their own scope.
+                        let selected_scope = Some(database.clone());
+                        if s.synchronize_scope_for_tab(tab_id, selected_scope.clone()) {
+                            retained_scope_update =
+                                s.retained_scope_update_for_tab(tab_id, selected_scope);
                         }
                         if s.active_editor_tab_id == tab_id {
                             s.set_status_message(&format!("Database selected | {}", database));
@@ -10542,21 +10588,11 @@ impl MainWindow {
                     let selected_scope = selected_scope
                         .map(|scope| scope.trim().to_string())
                         .filter(|scope| !scope.is_empty());
-                    let connection_id = s
-                        .editor_tabs
-                        .iter()
-                        .find(|tab| tab.tab_id == tab_id)
-                        .and_then(|tab| tab.connection_binding.snapshot().connection_id());
-                    let retained_scope_update = connection_id.and_then(|connection_id| {
-                        s.synchronize_scope_for_connection(
-                            connection_id,
-                            selected_scope.clone(),
-                        );
-                        s.retained_scope_update_for_connection(
-                            connection_id,
-                            selected_scope.clone(),
-                        )
-                    });
+                    // An ALTER SESSION ran on THIS tab's session: tab-scoped,
+                    // like DatabaseChanged above.
+                    s.synchronize_scope_for_tab(tab_id, selected_scope.clone());
+                    let retained_scope_update =
+                        s.retained_scope_update_for_tab(tab_id, selected_scope.clone());
                     let origin = s
                         .editor_tabs
                         .iter()
@@ -13305,17 +13341,23 @@ impl MainWindow {
                 let selected_scope = s
                     .object_browser
                     .selected_scope_for_connection(connection_id);
-                s.synchronize_scope_for_connection(connection_id, selected_scope.clone());
-                let retained_scope_update =
-                    s.retained_scope_update_for_connection(connection_id, selected_scope);
-                if s.active_connection_id() == Some(connection_id) {
+                // Scope is tab-scoped: the pick lands on the ACTIVE tab when
+                // it is bound to this connection. A pick on another
+                // connection's browser card only stores the selection for
+                // future/unbound tabs and moves no existing tab.
+                if let Some(tab_id) = s.scope_target_tab_for_connection(connection_id) {
+                    s.synchronize_scope_for_tab(tab_id, selected_scope.clone());
+                    let retained_scope_update =
+                        s.retained_scope_update_for_tab(tab_id, selected_scope);
                     let started = MainWindow::start_connection_metadata_refresh_for_scope_change(
                         &mut s,
                         &schema_sender_for_scope_change,
                     );
                     s.update_pending_metadata_refresh_after_start_attempt(started);
+                    retained_scope_update
+                } else {
+                    None
                 }
-                retained_scope_update
             };
 
             if let Some(message) = retained_scope_update
@@ -14438,7 +14480,7 @@ impl MainWindow {
         state.connection = oracle_runtime.connection();
         state
             .object_browser
-            .set_active_connection(Some(oracle_runtime.id()));
+            .set_active_tab(oracle_tab_id, Some(oracle_runtime.clone()));
         state.object_browser.capture_tour_set_example_metadata();
         *state
             .connection_info

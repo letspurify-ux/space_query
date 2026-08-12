@@ -221,6 +221,18 @@ The result is `Allow` or `RequireResolution`. An execution with SQL text uses
 state, it may allow the one statement proven to clean the relevant lock/residue
 or consume a pending transaction-mode override.
 
+The commit/rollback/discard PROMPT appears only for actions that end the
+session's life: tab close, app exit, disconnect/reconnect, and pool resize —
+never in the middle of normal work. `ScopeChange` is always `Allow` (scope is
+applied to the retained session in place and destroys nothing). An `Execute`
+that comes back `RequireResolution` no longer pops a modal either
+(`resolve_required_transaction_decision`): an `InvalidSession` — the one state
+execution cannot proceed on, and one with no user work a commit could reach —
+is discarded silently and the statement runs on a fresh session; every other
+blocked state keeps the preserved session and lets the statement run on it,
+surfacing problems as ordinary statement errors the user can resolve with
+Commit/Rollback.
+
 ## User resolution
 
 `RetainedSessionResolutionAction` has three variants:

@@ -3322,21 +3322,6 @@ impl SqlEditorWidget {
             .filter(|scope| !scope.is_empty())
     }
 
-    fn retained_scope_change_block_message(retained_state: RetainedSessionState) -> Option<String> {
-        if crate::db::retained_session_state_preflight_decision(
-            RetainedSessionPreflightAction::ScopeChange,
-            retained_state,
-        ) == RetainedSessionPreflightDecision::RequireResolution
-        {
-            Some(format!(
-                "Cannot change scope while the current DB session is {}. Resolve or discard it first.",
-                retained_state.label()
-            ))
-        } else {
-            None
-        }
-    }
-
     pub fn apply_current_scope_to_retained_session(
         &self,
         connection_generation: u64,
@@ -3387,11 +3372,12 @@ impl SqlEditorWidget {
             return RetainedSessionMutationOutcome::Applied;
         }
 
-        if let Some(message) = Self::retained_scope_change_block_message(retained_state) {
-            retained_session.restore();
-            return RetainedSessionMutationOutcome::BlockedRequiresResolution(message);
-        }
-
+        // Scope is applied in place (USE / ALTER SESSION SET CURRENT_SCHEMA):
+        // an open transaction or session residue survives it, so no retained
+        // state blocks the change — the resolution decision belongs to tab
+        // close. `apply_scope` receives the preservation flag and a failed
+        // apply on a work-carrying session restores it unless the error says
+        // the session itself is gone.
         let result = retained_session
             .lease_mut()
             .ok_or_else(|| "No retained DB session for this tab.".to_string())
@@ -3546,61 +3532,27 @@ impl SqlEditorWidget {
             return true;
         }
 
+        // No modal here: the commit/rollback/discard decision belongs to tab
+        // close only. An INVALID session is the one state execution cannot
+        // proceed on — the server side is gone or unrecoverable, so there is
+        // no user work commit/rollback could reach; discard it silently and
+        // let the statement run on a fresh session. Every other blocked state
+        // (uncertain transaction after a cancel, a held session lock, a
+        // pending one-shot transaction mode) keeps the preserved session and
+        // lets the statement run on it: problems surface as ordinary
+        // statement errors the user can act on with Commit/Rollback.
         let retained_state = snapshot.retained_state();
-        let transaction_action_allowed = crate::db::retained_session_resolution_action_allowed(
-            retained_state,
-            RetainedSessionResolutionAction::Commit,
-        );
-        let result = if transaction_action_allowed {
-            let choice = crate::ui::choice2_on_main(
-                &format!(
-                    "This tab has a cancelled statement with an uncertain transaction state.\nResolve it before {}.",
-                    action_verb
-                ),
-                "Cancel",
-                "Commit/Rollback",
-                "Discard Session",
-            );
-            match choice {
-                Some(1) => {
-                    let decision = crate::ui::choice2_on_main(
-                        "Choose how to resolve the retained transaction.",
-                        "Cancel",
-                        "Commit",
-                        "Rollback",
-                    );
-                    match decision {
-                        Some(1) => self.commit_pooled_session_for_close(),
-                        Some(2) => self.rollback_pooled_session_for_close(),
-                        _ => return false,
-                    }
-                }
-                Some(2) => self.discard_pooled_session_for_close(),
-                _ => return false,
+        if retained_state.transaction_state() == crate::db::TransactionSessionState::InvalidSession
+        {
+            if let Err(err) = self.discard_pooled_session_for_close() {
+                SqlEditorWidget::show_alert_dialog(&format!(
+                    "Failed to discard an unusable DB session before {}: {}",
+                    action_verb, err
+                ));
+                return false;
             }
-        } else {
-            let choice = crate::ui::choice2_on_main(
-                &format!(
-                    "This tab has a {} DB session that commit/rollback cannot resolve.\nDiscard it before {}.",
-                    retained_state.label(),
-                    action_verb
-                ),
-                "Cancel",
-                "Discard Session",
-                "",
-            );
-            match choice {
-                Some(1) => self.discard_pooled_session_for_close(),
-                _ => return false,
-            }
-        };
-
-        if let Err(err) = result {
-            SqlEditorWidget::show_alert_dialog(&format!("Failed to resolve DB session: {}", err));
-            return false;
+            self.emit_status("Discarded an unusable DB session");
         }
-
-        self.emit_status("Transaction decision resolved");
         true
     }
 
@@ -6616,17 +6568,25 @@ mod transaction_action_tests {
     }
 
     #[test]
-    fn retained_scope_change_guard_uses_central_preflight() {
-        let clean = RetainedSessionState::default();
-        assert!(SqlEditorWidget::retained_scope_change_block_message(clean).is_none());
-
-        let dirty =
-            RetainedSessionState::from_transaction_state(TransactionSessionState::MaybeDirty);
-        let message = SqlEditorWidget::retained_scope_change_block_message(dirty)
-            .expect("dirty retained session must block scope changes");
-
-        assert!(message.contains("Cannot change scope"));
-        assert!(message.contains(dirty.label()));
+    fn retained_scope_change_is_never_blocked_by_session_state() {
+        // Scope is applied to the retained session in place (USE / ALTER
+        // SESSION SET CURRENT_SCHEMA): an open transaction or session residue
+        // survives it, so no retained state may block a scope change — the
+        // commit/rollback/discard decision belongs to tab close only.
+        for state in [
+            RetainedSessionState::default(),
+            RetainedSessionState::from_transaction_state(TransactionSessionState::MaybeDirty),
+            RetainedSessionState::from_transaction_state(TransactionSessionState::DecisionRequired),
+        ] {
+            assert_eq!(
+                crate::db::retained_session_state_preflight_decision(
+                    crate::db::RetainedSessionPreflightAction::ScopeChange,
+                    state,
+                ),
+                crate::db::RetainedSessionPreflightDecision::Allow,
+                "scope change must stay allowed for {state:?}"
+            );
+        }
     }
 }
 

@@ -121,8 +121,15 @@ MySQL/MariaDB current database are reapplied to new sessions. A running worker
 is not mutated during a scope change; the scope takes effect at the next safe
 acquisition or reuse point.
 
-The object browser's scope selection is tab-local: it moves each bound query
-tab's scope, not the connection's own current schema/database. Operations that
+The object browser's scope selection is tab-local: a pick lands on the ACTIVE
+tab only (each query editor tab owns its own browser card — tree, filter, and
+scope — plus one preview card per connection for the dropdown), never on the
+connection's own current schema/database or on sibling tabs. A scope change is
+applied to the tab's retained session in place (MySQL `USE`, Oracle
+`ALTER SESSION SET CURRENT_SCHEMA`), so it is never gated on the session's
+transaction state — an open transaction simply continues in the new scope, and
+the commit/rollback/discard decision stays where it belongs, at tab close.
+Operations that
 run on the shared live connection instead of a pool session — Quick Describe
 and Explain Plan — therefore resolve names in the requesting tab's scope
 (`DatabaseConnection::oracle_schema_for_scope()` /
