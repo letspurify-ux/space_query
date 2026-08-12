@@ -1505,6 +1505,40 @@ fn run_scenarios(target: Target, h: &mut Harness) -> Result<(), String> {
     });
     h.run("ROLLBACK")?;
 
+    // ---- S25 (MySQL family): an XA transaction suspends auto-commit --------
+    // The auto-commit twin of TM S33. The server suspends autocommit for the
+    // span of an XA transaction, the same way it does for an explicit START
+    // TRANSACTION (S14) — so a write inside an XA transaction on an
+    // auto-commit-ON tab must still be rollback-able through the XA verbs,
+    // and nothing of it may survive the XA ROLLBACK.
+    if !target.is_oracle() {
+        println!("  --- S25 an XA transaction suspends auto-commit ON ---");
+        let before_xa = h.select_v()?;
+        let menu_outcome = h.menu_auto_commit(true);
+        let capture = h.run(
+            "XA START 'sqac25';\nUPDATE SQ_AC_T SET V = V + 1;\nXA END 'sqac25';\nXA ROLLBACK 'sqac25';",
+        )?;
+        let failed: Vec<_> = capture
+            .results
+            .iter()
+            .filter(|r| !r.success)
+            .map(|r| (r.sql.clone(), r.message.clone()))
+            .collect();
+        h.check(
+            "S25 the whole XA batch runs on the auto-commit tab",
+            failed.is_empty(),
+            format!("failed statements: {failed:?} (menu outcome: {menu_outcome})"),
+        );
+        let after_xa = h.select_v()?;
+        h.check(
+            "S25 the XA ROLLBACK really took the write back (auto-commit was suspended)",
+            after_xa == before_xa,
+            format!("V {before_xa} -> {after_xa} (an auto-committed write would survive)"),
+        );
+        h.menu_auto_commit(false);
+        h.run("ROLLBACK")?;
+    }
+
     // ---- S4 (Oracle): READ ONLY transaction vs piggybacked commit ---------
     if target.is_oracle() {
         println!("  --- S4 SET TRANSACTION READ ONLY under auto-commit ON ---");

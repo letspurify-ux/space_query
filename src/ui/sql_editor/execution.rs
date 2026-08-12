@@ -24155,9 +24155,14 @@ impl SqlEditorWidget {
     {
         // A one-shot `SET TRANSACTION ...` has to be the first statement of its
         // transaction, so the session has to be prepared back to a boundary for
-        // it even when it already carries the wanted settings.
+        // it even when it already carries the wanted settings. `XA START` has
+        // the same need with a harsher failure: the server refuses it over any
+        // open transaction (XAER_OUTSIDE) instead of implicitly committing,
+        // and the app's own bookkeeping reads leave one open under
+        // autocommit=0.
         let statement_requires_transaction_boundary =
-            Self::is_transaction_first_statement(statement_sql);
+            Self::is_transaction_first_statement(statement_sql)
+                || crate::db::transaction::mysql_statement_starts_xa_transaction(statement_sql);
         let (
             connection_generation,
             pool_context_epoch,

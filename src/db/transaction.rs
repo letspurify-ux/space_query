@@ -3242,6 +3242,26 @@ pub(crate) fn mysql_statement_escapes_read_only_transaction_for_db_type(
     false
 }
 
+/// True when `sql` starts an XA transaction (`XA START` / `XA BEGIN`) on the
+/// MySQL family. Unlike `START TRANSACTION`, which implicitly commits
+/// whatever transaction is already open, the server refuses `XA START` over
+/// ANY open transaction (XAER_OUTSIDE) — including the implicit one the
+/// app's own bookkeeping reads leave behind under autocommit=0. The
+/// pooled-session setup must therefore bring the session back to a
+/// transaction boundary for it, exactly like a one-shot `SET TRANSACTION`.
+/// The MariaDB `SET STATEMENT ... FOR` wrapper is unwrapped unconditionally:
+/// on MySQL that form is a syntax error anyway, and at worst the detection
+/// forces a harmless session prepare.
+pub(crate) fn mysql_statement_starts_xa_transaction(sql: &str) -> bool {
+    let effective_sql = match mariadb_set_statement_inner_sql(sql) {
+        Some(inner_sql) => Cow::Owned(inner_sql),
+        None => Cow::Borrowed(sql),
+    };
+    let analysis = SqlStatementAnalysis::new_for_db_type(DatabaseType::MySQL, &effective_sql);
+    mysql_statement_starts_with_words(&analysis, &["XA", "START"])
+        || mysql_statement_starts_with_words(&analysis, &["XA", "BEGIN"])
+}
+
 fn mysql_set_transaction_statement_affects_physical_session(
     sql: &str,
     analysis: &SqlStatementAnalysis<'_>,
@@ -6760,6 +6780,40 @@ mod tests {
             ),
             "a SET STATEMENT wrapper must not hide the READ WRITE escape"
         );
+    }
+
+    #[test]
+    fn mysql_xa_start_requires_a_transaction_boundary() {
+        for sql in [
+            "XA START 'x1'",
+            "xa begin 'x1'",
+            "/* c */ XA START 'x1'",
+            "SET STATEMENT max_statement_time=10 FOR XA START 'x1'",
+        ] {
+            assert!(
+                mysql_statement_starts_xa_transaction(sql),
+                "{sql} starts an XA transaction, which the server refuses over any \
+                 open transaction (XAER_OUTSIDE) — it needs a boundary prepare"
+            );
+        }
+        for sql in [
+            // Every other XA verb operates on an existing XA transaction.
+            "XA END 'x1'",
+            "XA PREPARE 'x1'",
+            "XA COMMIT 'x1' ONE PHASE",
+            "XA ROLLBACK 'x1'",
+            "XA RECOVER",
+            // START TRANSACTION implicitly commits; it self-heals.
+            "START TRANSACTION",
+            "BEGIN",
+            "SELECT 'XA START'",
+            "SET @xa = 'XA START'",
+        ] {
+            assert!(
+                !mysql_statement_starts_xa_transaction(sql),
+                "{sql} must not be treated as starting an XA transaction"
+            );
+        }
     }
 
     #[test]

@@ -2438,6 +2438,222 @@ fn run_scenarios(target: Target, h: &mut Harness) -> Result<(), String> {
     });
     h.run("ROLLBACK")?;
 
+    // ---- S33 (MySQL family): XA transactions on a manual-commit tab ---------
+    // `XA START` is the one transaction opener the server refuses over ANY
+    // open transaction (XAER_OUTSIDE) instead of implicitly committing it —
+    // and under autocommit=0 the app's own bookkeeping reads leave an
+    // implicit transaction on the session. The pooled-session setup must
+    // bring the session back to a boundary for it, the way it already does
+    // for a one-shot SET TRANSACTION. And once inside an XA transaction, a
+    // READ ONLY pin must still hold: the server refuses the write, so XA is
+    // not an escape route around the pin.
+    if !target.is_oracle() {
+        println!("  --- S33 XA transactions respect the boundary and the pin ---");
+        h.editor.clear_tab_transaction_mode_override();
+        h.run("ROLLBACK")?;
+        // Leave a read's implicit transaction on the session. MariaDB's dirty
+        // probe (@@in_transaction) truthfully reports it as possibly-dirty, so
+        // the app preserves it and XA START fails on the server — the user's
+        // documented way out is resolving it, so the scenario does what a user
+        // would and rolls back first; the boundary claim is still exercised by
+        // whatever the acquisition's own bookkeeping opens after the ROLLBACK.
+        // MySQL's probe answers "clean" for the implicit read-only
+        // transaction, so the XA script must survive it WITHOUT a user
+        // ROLLBACK — that is the exact sequence that used to die with
+        // XAER_OUTSIDE.
+        h.run("SELECT V FROM SQ_TM_T")?;
+        if target == Target::MariaDb {
+            h.run("ROLLBACK")?;
+        }
+        let capture = h.run(
+            "XA START 'sq33';\nINSERT INTO SQ_TM_T VALUES (33);\nXA END 'sq33';\nXA COMMIT 'sq33' ONE PHASE;",
+        )?;
+        let failed: Vec<_> = capture
+            .results
+            .iter()
+            .filter(|r| !r.success)
+            .map(|r| (r.sql.clone(), r.message.clone()))
+            .collect();
+        h.check(
+            "S33 the XA transaction runs over the session's residual read transaction",
+            failed.is_empty(),
+            format!("failed statements: {failed:?}"),
+        );
+        let landed = h.select_scalar("SELECT COUNT(*) FROM SQ_TM_T WHERE V = 33")?;
+        h.check(
+            "S33 the XA commit really landed",
+            landed.trim() == "1",
+            format!("rows with V=33: {landed:?}"),
+        );
+        h.run("DELETE FROM SQ_TM_T WHERE V = 33")?;
+        h.run("COMMIT")?;
+
+        // A READ ONLY pin must hold inside an XA transaction too. The refusal
+        // stops the batch (continue-on-error is off, the GUI default), which
+        // leaves the session inside the still-ACTIVE XA transaction — plain
+        // ROLLBACK cannot end one (XAER_RMFAIL), so the scenario must recover
+        // the way a user would, with the XA verbs themselves. That recovery
+        // path working IS part of the claim: the tab must not be bricked.
+        h.editor.set_tab_transaction_mode(TransactionMode::new(
+            TransactionIsolation::Default,
+            TransactionAccessMode::ReadOnly,
+        ));
+        let capture = h.run(
+            "XA START 'sq33ro';\nINSERT INTO SQ_TM_T VALUES (34);\nXA END 'sq33ro';\nXA ROLLBACK 'sq33ro';",
+        )?;
+        let insert = capture
+            .results
+            .iter()
+            .find(|r| r.sql.contains("INSERT"))
+            .ok_or("S33 XA read-only batch produced no INSERT result")?;
+        h.check(
+            "S33 the write inside the XA transaction is refused on the READ ONLY tab",
+            !insert.success
+                && read_only_errors.iter().any(|needle| {
+                    insert
+                        .message
+                        .to_ascii_lowercase()
+                        .contains(&needle.to_ascii_lowercase())
+                }),
+            format!(
+                "insert inside XA: ({}, {:?})",
+                insert.success, insert.message
+            ),
+        );
+        h.check(
+            "S33 the refusal stops the batch before the XA transaction ends",
+            !capture
+                .results
+                .iter()
+                .any(|r| r.sql.to_ascii_uppercase().contains("XA END")),
+            format!(
+                "batch results after the refusal: {:?}",
+                capture
+                    .results
+                    .iter()
+                    .map(|r| (r.sql.clone(), r.success))
+                    .collect::<Vec<_>>()
+            ),
+        );
+        let escaped = h.select_scalar("SELECT COUNT(*) FROM SQ_TM_T WHERE V = 34")?;
+        h.check(
+            "S33 no row escaped through the XA transaction",
+            escaped.trim() == "0",
+            format!("rows with V=34: {escaped:?}"),
+        );
+        let cleanup = h.run("XA END 'sq33ro';\nXA ROLLBACK 'sq33ro';")?;
+        h.check(
+            "S33 the XA verbs still recover the session after the refusal",
+            cleanup.results.len() >= 2 && cleanup.results.iter().all(|r| r.success),
+            format!(
+                "cleanup results: {:?}",
+                cleanup
+                    .results
+                    .iter()
+                    .map(|r| (r.sql.clone(), r.success, r.message.clone()))
+                    .collect::<Vec<_>>()
+            ),
+        );
+        h.editor.clear_tab_transaction_mode_override();
+        h.run("ROLLBACK")?;
+
+        // The tab-close discard must also free a session that is stuck inside
+        // an ACTIVE XA transaction: dropping the physical connection is the
+        // one resolution that always works, because the server rolls an
+        // ACTIVE XA transaction back on disconnect.
+        h.run("XA START 'sq33x'")?;
+        let _ = h.editor.discard_pooled_session_for_close();
+        let capture = h.run("SELECT V FROM SQ_TM_T")?;
+        h.check(
+            "S33 discarding the session frees a tab stuck inside an XA transaction",
+            capture.results.first().is_some_and(|result| result.success),
+            format!(
+                "first statement after the discard: {:?}",
+                capture
+                    .results
+                    .first()
+                    .map(|r| (r.success, r.message.clone()))
+            ),
+        );
+        h.run("ROLLBACK")?;
+    }
+
+    // ---- S34: the pinned isolation survives a DDL's implicit commit ---------
+    // The DDL twin of S18b. Oracle expresses isolation as a TRANSACTION
+    // property, and a DDL inside the user's batch commits implicitly — the
+    // pin has to be re-applied to the transaction that follows, or every
+    // statement after the DDL silently runs at the session default while the
+    // toolbar still shows the pin. The MySQL family's SESSION characteristic
+    // must survive the DDL on its own; asserting it keeps the claim honest on
+    // all four targets.
+    println!("  --- S34 the pinned isolation survives a DDL's implicit commit ---");
+    h.editor.clear_tab_transaction_mode_override();
+    h.run("ROLLBACK")?;
+    {
+        let mut other = attach_tab(connect_target(target)?);
+        let pinned_isolation = if target.is_oracle() {
+            TransactionIsolation::Serializable
+        } else {
+            // REPEATABLE READ, not SERIALIZABLE: InnoDB's SERIALIZABLE turns
+            // plain reads into locking reads, which would block the other
+            // session's UPDATE instead of testing the snapshot.
+            TransactionIsolation::RepeatableRead
+        };
+        h.editor.set_tab_transaction_mode(TransactionMode::new(
+            pinned_isolation,
+            TransactionAccessMode::ReadWrite,
+        ));
+        let sleep_statement = if target.is_oracle() {
+            "BEGIN DBMS_SESSION.SLEEP(6); END;\n/"
+        } else {
+            "DO SLEEP(6);"
+        };
+        let ddl = if target.is_oracle() {
+            "CREATE TABLE SQ_TM_DDL (V NUMBER);\n"
+        } else {
+            "CREATE TABLE SQ_TM_DDL (V INT);\n"
+        };
+        let (reads, failed) = bracketed_reads_in_one_batch(h, &mut other, ddl, sleep_statement)?;
+        h.check(
+            "S34 every statement of the DDL batch ran",
+            failed.is_empty(),
+            format!("failed statements: {failed:?}"),
+        );
+        let after_ddl_pair = last_pair(&reads);
+        h.check(
+            "S34 both reads after the DDL's implicit commit see one transaction snapshot",
+            after_ddl_pair.is_some_and(|(first, second)| first == second),
+            format!(
+                "reads in the batch: {reads:?} (the last two bracket the other \
+                 session's commit; different values mean the pinned isolation \
+                 was dropped by the DDL's implicit commit)"
+            ),
+        );
+        h.run("ROLLBACK")?;
+        // Control: the other session really did commit, so the check above
+        // cannot pass by nothing having happened.
+        h.editor.clear_tab_transaction_mode_override();
+        let now = h.select_scalar("SELECT V FROM SQ_TM_ISO")?;
+        h.check(
+            "S34 the other session's commit is visible to a new transaction",
+            now.trim()
+                .parse::<i64>()
+                .ok()
+                .zip(after_ddl_pair)
+                .is_some_and(|(now, (first, _))| now > first),
+            format!("SQ_TM_ISO after the batch = {now:?}, in-batch reads {reads:?}"),
+        );
+        let _ = other.run("ROLLBACK");
+        let _ = other.editor.discard_pooled_session_for_close();
+    }
+    h.editor.clear_tab_transaction_mode_override();
+    h.run("ROLLBACK")?;
+    // The sleeping statement leaves conservative session residue (a PL/SQL
+    // block on Oracle, an unclassified command on the MySQL family); discard
+    // the session the way the tab's close path does so it cannot block the
+    // scenario after this one.
+    let _ = h.editor.discard_pooled_session_for_close();
+
     {
         let mut guard = h.shared.lock().unwrap_or_else(|p| p.into_inner());
         guard
