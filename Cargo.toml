@@ -68,6 +68,11 @@ path = "src/bin/verify_column_layout_ui.rs"
 test = false
 
 [[bin]]
+name = "verify_object_browser_tabs_ui"
+path = "src/bin/verify_object_browser_tabs_ui.rs"
+test = false
+
+[[bin]]
 name = "verify_commit_close_live"
 path = "src/bin/verify_commit_close_live.rs"
 test = false

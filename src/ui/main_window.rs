@@ -810,6 +810,24 @@ fn pending_metadata_refresh_after_start_attempt(has_live_connection: bool, start
     !started && has_live_connection
 }
 
+/// How long a finished object-browser load waits for the AppState lock before
+/// giving up: 20 fast ticks (50 ms) for a dialog that is on its way out, then
+/// 100 slow ones (500 ms) for one a user is reading — a bit under a minute in
+/// all. Giving up after that costs only the delay: the catalog is in the card,
+/// and the tab takes it from there when it is next activated.
+const OBJECT_METADATA_DELIVERY_RETRIES: u32 = 120;
+const OBJECT_METADATA_DELIVERY_SLOW_RETRIES: u32 = 100;
+
+/// Which editor tabs a schema snapshot belongs to. Scope is per tab, so a
+/// catalog read in one database/schema is not the truth for a sibling tab
+/// sitting in another one — but a wipe (a connection replaced under the tabs)
+/// applies to all of them.
+#[derive(Clone, Copy)]
+enum SchemaSnapshotAudience {
+    TabsInLoadedScope(DatabaseType),
+    EveryTabOnConnection,
+}
+
 #[derive(Clone)]
 struct QueryEditorTab {
     tab_id: QueryTabId,
@@ -2140,6 +2158,57 @@ impl AppState {
         changed
     }
 
+    /// Hand the active tab's editor the metadata its own browser card is
+    /// already holding. A plain tab switch must restore what the tab had —
+    /// tree, expansion AND completion/highlighting — so a tab whose editor
+    /// data is empty or belongs to another scope is filled from the card
+    /// instead of waiting for a database round trip.
+    fn seed_active_tab_editor_metadata_from_browser(&mut self) {
+        let Some(snapshot) = self.object_browser.active_tab_metadata_snapshot() else {
+            return;
+        };
+        let current = self
+            .schema_intellisense_data
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        if !MainWindow::intellisense_scope_differs(&current, snapshot.selected_scope.as_deref())
+            && !MainWindow::intellisense_data_has_no_objects(&current)
+        {
+            return;
+        }
+        let (data, highlight_data) = MainWindow::editor_metadata_seed(
+            Some((current, self.schema_highlight_data.clone())),
+            Some(&snapshot),
+        );
+        // This is a cache copy, not a load: it may not stand in for one on
+        // any OTHER tab. `update_schema_snapshot` would both write it into
+        // every same-scope tab and clear their queued refreshes, which would
+        // hide a sibling's pending reload behind stale data.
+        let combined_highlight =
+            MainWindow::highlight_data_with_intellisense_columns(&data, highlight_data);
+        *self
+            .schema_intellisense_data
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = data.clone();
+        self.schema_highlight_data = combined_highlight.clone();
+        let active_editor_tab_id = self.active_editor_tab_id;
+        if let Some(tab) = self
+            .editor_tabs
+            .iter_mut()
+            .find(|tab| tab.tab_id == active_editor_tab_id)
+        {
+            *tab.intellisense_data
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()) = data;
+            tab.highlight_data = combined_highlight.clone();
+            tab.sql_editor
+                .update_highlight_data_deferred(combined_highlight.clone());
+        }
+        self.sql_editor
+            .update_highlight_data_deferred(combined_highlight);
+    }
+
     fn clear_metadata_for_tab(&mut self, tab_id: QueryTabId) {
         let active_is_affected = self.active_editor_tab_id == tab_id;
         if let Some(tab) = self.editor_tabs.iter_mut().find(|tab| tab.tab_id == tab_id) {
@@ -2200,9 +2269,11 @@ impl AppState {
         {
             self.object_browser.add_runtime(runtime.clone());
         }
-        let tab_browser_created = self
-            .object_browser
-            .set_active_tab(tab_id, binding_snapshot.runtime.clone());
+        let tab_browser_needs_metadata = self.object_browser.set_active_tab(
+            tab_id,
+            binding_snapshot.runtime.clone(),
+            binding_snapshot.scope.clone(),
+        );
         if let Some(connection) = binding_snapshot.connection() {
             self.connection = connection.clone();
             let connection_snapshot = crate::db::try_lock_connection(&connection).map(|guard| {
@@ -2228,24 +2299,6 @@ impl AppState {
         }
         self.pending_connection_metadata_refresh =
             self.has_live_connection && self.pending_metadata_refresh_tabs.remove(&tab_id);
-        // Scope is per tab: the tab's own browser card (shown by
-        // set_active_tab above) must report this tab's scope. A newly created
-        // card starts scopeless with an EMPTY tree, so seed the scope and
-        // schedule this tab's metadata refresh unconditionally (picked up by
-        // start_pending_metadata_refresh_if_ready below); an existing card
-        // already tracks both via synchronize_scope_for_tab.
-        if binding_snapshot.connection_id().is_some() {
-            let displayed_scope = self.object_browser.selected_scope_for_tab(tab_id);
-            let tab_scope = Self::normalize_scope_name(binding_snapshot.scope.clone());
-            let scope_out_of_sync = displayed_scope != tab_scope;
-            if scope_out_of_sync {
-                self.object_browser
-                    .set_selected_scope_for_tab(tab_id, tab_scope);
-            }
-            if tab_browser_created || scope_out_of_sync {
-                self.mark_metadata_refresh_pending(tab_id);
-            }
-        }
         self.sql_editor = tab.sql_editor;
         self.sql_editor.sync_db_type_from_connection();
         self.sql_editor.mark_display_metrics_pending();
@@ -2257,6 +2310,39 @@ impl AppState {
             .current_file
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = tab.current_file;
+        // Scope is per tab: the tab's own browser card (shown by
+        // set_active_tab above) must report this tab's scope. A card the tab
+        // already owns keeps its tree, expansion and filter untouched here —
+        // only a card with no metadata at all (the first one on a connection;
+        // later ones inherit from a sibling) or one whose scope no longer
+        // matches the tab needs a load. Runs after `self.sql_editor` has been
+        // switched, because seeding pushes highlight data into the editor.
+        if binding_snapshot.connection_id().is_some() {
+            let tab_scope = Self::normalize_scope_name(binding_snapshot.scope.clone());
+            let scope_out_of_sync = !self
+                .object_browser
+                .tab_scope_matches(tab_id, tab_scope.as_deref());
+            if scope_out_of_sync {
+                self.object_browser
+                    .set_selected_scope_for_tab(tab_id, tab_scope);
+            }
+            // A card that exists but never got a catalog (its load failed, or
+            // it was created while one was running and nothing filled it)
+            // needs one too, or the tab would stay blank until the user hit
+            // Refresh. A card whose load is still running does not.
+            if tab_browser_needs_metadata
+                || scope_out_of_sync
+                || self.object_browser.active_tab_needs_metadata_load()
+            {
+                self.mark_metadata_refresh_pending(tab_id);
+            } else {
+                // The card has metadata but this tab's editor may not (a tab
+                // that existed before the connection was loaded, or one whose
+                // data was cleared): give it the card's, so highlighting and
+                // completion work without waiting for a database round trip.
+                self.seed_active_tab_editor_metadata_from_browser();
+            }
+        }
         self.refresh_result_edit_controls();
         self.refresh_tab_label(tab_id);
         self.refresh_connection_dependent_controls();
@@ -8720,42 +8806,80 @@ impl MainWindow {
 
     fn update_schema_snapshot(
         state: &mut AppState,
+        audience: SchemaSnapshotAudience,
         data: IntellisenseData,
         highlight_data: HighlightData,
     ) {
         let active_connection_id = state.active_connection_id();
-        let mut combined_highlight = highlight_data.clone();
-        let columns_from_intellisense = Self::collect_highlight_columns(&data);
-        if !columns_from_intellisense.is_empty() {
-            let mut seen: HashSet<String> = combined_highlight
-                .columns
-                .iter()
-                .map(|name| name.to_uppercase())
-                .collect();
-            for name in columns_from_intellisense {
-                let upper = name.to_uppercase();
-                if seen.insert(upper) {
-                    combined_highlight.columns.push(name);
-                }
-            }
-        }
+        let combined_highlight =
+            Self::highlight_data_with_intellisense_columns(&data, highlight_data);
 
         let data_for_tabs = data.clone();
+        // Scope is per tab, so a load is only the truth for tabs that are in
+        // the scope it was read from. Sharing it with a sibling tab sitting
+        // on another database/schema would hand that tab the wrong catalog.
+        let active_editor_tab_id = state.active_editor_tab_id;
+        let target_tab_ids = state
+            .editor_tabs
+            .iter()
+            .filter(|tab| {
+                let binding = tab.connection_binding.snapshot();
+                let Some(connection_id) = active_connection_id else {
+                    // No active connection to attribute this to: it can only
+                    // belong to the tab that is on screen.
+                    return tab.tab_id == active_editor_tab_id;
+                };
+                if binding.connection_id() != Some(connection_id) {
+                    return false;
+                }
+                match audience {
+                    // A wipe or a connection-wide reset applies to the whole
+                    // connection whatever each tab is looking at.
+                    SchemaSnapshotAudience::EveryTabOnConnection => true,
+                    // A load was read in ONE scope, and scope is per tab, so
+                    // only tabs looking at that scope may take it — the same
+                    // comparison the load's own delivery check uses, which
+                    // tolerates the catalog reporting a different case than
+                    // the tab stored (MySQL) but refuses an ambiguous one.
+                    SchemaSnapshotAudience::TabsInLoadedScope(db_type) => {
+                        Self::schema_update_scope_matches(
+                            db_type,
+                            data_for_tabs.default_qualifier(),
+                            binding.scope.as_deref(),
+                            &data_for_tabs.users,
+                        )
+                    }
+                }
+            })
+            .map(|tab| tab.tab_id)
+            .collect::<Vec<_>>();
+        // `schema_intellisense_data` IS the active tab's data, and the editor
+        // on screen is the active tab's editor, so writing them when the
+        // active tab is not a target of this snapshot would hand it another
+        // scope's catalog.
+        if !target_tab_ids.contains(&active_editor_tab_id) {
+            for tab in state
+                .editor_tabs
+                .iter_mut()
+                .filter(|tab| target_tab_ids.contains(&tab.tab_id))
+            {
+                *tab.intellisense_data
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner()) = data_for_tabs.clone();
+                tab.highlight_data = combined_highlight.clone();
+                tab.sql_editor
+                    .update_highlight_data_deferred(combined_highlight.clone());
+            }
+            state
+                .pending_metadata_refresh_tabs
+                .retain(|tab_id| !target_tab_ids.contains(tab_id));
+            return;
+        }
         *state
             .schema_intellisense_data
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = data;
         state.schema_highlight_data = combined_highlight;
-        let target_tab_ids = state
-            .editor_tabs
-            .iter()
-            .filter(|tab| {
-                active_connection_id.map_or(tab.tab_id == state.active_editor_tab_id, |id| {
-                    tab.connection_binding.snapshot().connection_id() == Some(id)
-                })
-            })
-            .map(|tab| tab.tab_id)
-            .collect::<Vec<_>>();
         for tab in state
             .editor_tabs
             .iter_mut()
@@ -8776,6 +8900,32 @@ impl MainWindow {
             .update_highlight_data_deferred(state.schema_highlight_data.clone());
     }
 
+    /// Highlighting needs the column names the catalog knows about, which
+    /// only the intellisense data carries; every writer of a schema snapshot
+    /// folds them in the same way.
+    fn highlight_data_with_intellisense_columns(
+        data: &IntellisenseData,
+        highlight_data: HighlightData,
+    ) -> HighlightData {
+        let mut combined_highlight = highlight_data;
+        let columns_from_intellisense = Self::collect_highlight_columns(data);
+        if columns_from_intellisense.is_empty() {
+            return combined_highlight;
+        }
+        let mut seen: HashSet<String> = combined_highlight
+            .columns
+            .iter()
+            .map(|name| name.to_uppercase())
+            .collect();
+        for name in columns_from_intellisense {
+            let upper = name.to_uppercase();
+            if seen.insert(upper) {
+                combined_highlight.columns.push(name);
+            }
+        }
+        combined_highlight
+    }
+
     fn collect_highlight_columns(data: &IntellisenseData) -> Vec<String> {
         data.get_all_columns_for_highlighting()
     }
@@ -8787,6 +8937,21 @@ impl MainWindow {
                 target.push(name.clone());
             }
         }
+    }
+
+    /// Whether this editor metadata carries no schema objects at all — the
+    /// state a tab is in before its first metadata load, where highlighting
+    /// and completion have nothing to work with.
+    fn intellisense_data_has_no_objects(data: &IntellisenseData) -> bool {
+        data.tables.is_empty()
+            && data.views.is_empty()
+            && data.procedures.is_empty()
+            && data.functions.is_empty()
+            && data.packages.is_empty()
+            && data.sequences.is_empty()
+            && data.synonyms.is_empty()
+            && data.triggers.is_empty()
+            && data.events.is_empty()
     }
 
     fn intellisense_scope_differs(data: &IntellisenseData, selected_scope: Option<&str>) -> bool {
@@ -8860,6 +9025,106 @@ impl MainWindow {
         (data, highlight_data)
     }
 
+    /// Hand a finished object-browser load to the editor.
+    ///
+    /// `try_lock`, never `lock`: this runs from a card's poll timer, and a
+    /// modal dialog dispatches those timers while it waits (`app::wait()` in
+    /// `finish_modal_dialog`). Some callers open a modal while holding the
+    /// AppState guard, so blocking here would park the UI thread on a lock
+    /// only that same thread can release. Every editor tab now owns a card
+    /// with its own load, so that window is no longer rare. Re-deliver on the
+    /// next tick instead — the snapshot is already in the card, so a delayed
+    /// hand-off costs nothing but the delay.
+    fn deliver_object_browser_metadata(
+        state: &Arc<Mutex<AppState>>,
+        snapshot: ObjectBrowserMetadataSnapshot,
+    ) {
+        Self::deliver_object_browser_metadata_with_retries(
+            state,
+            snapshot,
+            OBJECT_METADATA_DELIVERY_RETRIES,
+        );
+    }
+
+    fn deliver_object_browser_metadata_with_retries(
+        state: &Arc<Mutex<AppState>>,
+        snapshot: ObjectBrowserMetadataSnapshot,
+        retries_left: u32,
+    ) {
+        let mut s = match state.try_lock() {
+            Ok(guard) => guard,
+            // Poisoned is NOT "busy": a panic under the guard left it that
+            // way permanently, and treating it as busy would re-arm this
+            // timer forever — one immortal 20 Hz chain per load, each pinning
+            // a whole catalog. Every other AppState lock in this file recovers
+            // the same way.
+            Err(std::sync::TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
+            Err(std::sync::TryLockError::WouldBlock) => {
+                if retries_left == 0 {
+                    // The card still holds this catalog, so the tab picks it
+                    // up from there on its next activation.
+                    return;
+                }
+                // A modal the user is reading holds the guard for as long as
+                // they take, so back off rather than spin at 20 Hz for the
+                // whole budget: the fast ticks cover a dialog that is closing,
+                // the slow ones a dialog someone is thinking about.
+                let delay = if retries_left > OBJECT_METADATA_DELIVERY_SLOW_RETRIES {
+                    0.05
+                } else {
+                    0.5
+                };
+                let weak_state = Arc::downgrade(state);
+                crate::ui::ui_timeout::schedule(delay, move || {
+                    if let Some(state) = weak_state.upgrade() {
+                        MainWindow::deliver_object_browser_metadata_with_retries(
+                            &state,
+                            snapshot,
+                            retries_left - 1,
+                        );
+                    }
+                });
+                return;
+            }
+        };
+        if !s.has_live_connection {
+            return;
+        }
+
+        let Some(binding) = s
+            .editor_tabs
+            .iter()
+            .find(|tab| tab.tab_id == s.active_editor_tab_id)
+            .map(|tab| tab.connection_binding.snapshot())
+        else {
+            return;
+        };
+        let Some(connection) = binding.connection() else {
+            return;
+        };
+        let current_generation = match crate::db::try_lock_connection(&connection) {
+            Some(conn_guard) => conn_guard.connection_generation(),
+            None => {
+                let tab_id = s.active_editor_tab_id;
+                s.mark_metadata_refresh_pending(tab_id);
+                return;
+            }
+        };
+        if snapshot.connection_generation != current_generation {
+            return;
+        }
+        if !MainWindow::schema_update_scope_matches(
+            snapshot.db_type,
+            snapshot.selected_scope.as_deref(),
+            binding.scope.as_deref(),
+            &snapshot.available_scopes,
+        ) {
+            return;
+        }
+
+        MainWindow::apply_object_browser_metadata_snapshot(&mut s, snapshot);
+    }
+
     fn apply_object_browser_metadata_snapshot(
         state: &mut AppState,
         snapshot: ObjectBrowserMetadataSnapshot,
@@ -8886,7 +9151,12 @@ impl MainWindow {
         let highlight_data =
             Self::merge_object_browser_snapshot_into_highlight_data(highlight_data, &snapshot);
 
-        Self::update_schema_snapshot(state, data, highlight_data);
+        Self::update_schema_snapshot(
+            state,
+            SchemaSnapshotAudience::TabsInLoadedScope(snapshot.db_type),
+            data,
+            highlight_data,
+        );
     }
 
     fn schema_update_scope_matches(
@@ -10523,9 +10793,17 @@ impl MainWindow {
                             // Script CONNECT rebuilt THIS tab's connection;
                             // only this tab's scope resets.
                             s.synchronize_scope_for_tab(tab_id, None);
+                            // The runtime id survives the reconnect, so the
+                            // cards on it still hold the PREVIOUS server's
+                            // catalog until the deferred refresh lands. Mark
+                            // it stale now, or a tab opened in that window
+                            // would inherit the old server's objects and
+                            // never load its own.
+                            s.object_browser
+                                .invalidate_metadata_for_connection(runtime.id());
                             if s.active_editor_tab_id == tab_id {
                                 s.object_browser
-                                    .set_active_tab(tab_id, Some(runtime.clone()));
+                                    .set_active_tab(tab_id, Some(runtime.clone()), None);
                             }
                         }
                         if s.active_editor_tab_id == tab_id {
@@ -13124,46 +13402,7 @@ impl MainWindow {
             let Some(state_for_metadata) = weak_state_for_browser_metadata.upgrade() else {
                 return;
             };
-
-            let mut s = state_for_metadata
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            if !s.has_live_connection {
-                return;
-            }
-
-            let Some(binding) = s
-                .editor_tabs
-                .iter()
-                .find(|tab| tab.tab_id == s.active_editor_tab_id)
-                .map(|tab| tab.connection_binding.snapshot())
-            else {
-                return;
-            };
-            let Some(connection) = binding.connection() else {
-                return;
-            };
-            let current_generation = match crate::db::try_lock_connection(&connection) {
-                Some(conn_guard) => conn_guard.connection_generation(),
-                None => {
-                    let tab_id = s.active_editor_tab_id;
-                    s.mark_metadata_refresh_pending(tab_id);
-                    return;
-                }
-            };
-            if snapshot.connection_generation != current_generation {
-                return;
-            }
-            if !MainWindow::schema_update_scope_matches(
-                snapshot.db_type,
-                snapshot.selected_scope.as_deref(),
-                binding.scope.as_deref(),
-                &snapshot.available_scopes,
-            ) {
-                return;
-            }
-
-            MainWindow::apply_object_browser_metadata_snapshot(&mut s, snapshot);
+            MainWindow::deliver_object_browser_metadata(&state_for_metadata, snapshot);
         });
 
         let weak_state_for_browser = Arc::downgrade(&state);
@@ -13582,6 +13821,7 @@ impl MainWindow {
                                 {
                                     MainWindow::update_schema_snapshot(
                                         &mut s,
+                                        SchemaSnapshotAudience::TabsInLoadedScope(update.db_type),
                                         update.data,
                                         update.highlight_data,
                                     );
@@ -13653,6 +13893,13 @@ impl MainWindow {
                                     s.object_browser.refresh_runtime_labels();
                                     s.synchronize_scope_for_connection(connection_id, None);
                                     s.clear_metadata_for_connection(connection_id);
+                                    // A reconnect keeps the runtime, so the
+                                    // cards on it still carry the previous
+                                    // server's catalog until their refresh
+                                    // lands. A tab opened in that window must
+                                    // load rather than inherit it.
+                                    s.object_browser
+                                        .invalidate_metadata_for_connection(connection_id);
                                     let matching_tab_ids = s
                                         .editor_tabs
                                         .iter()
@@ -13689,6 +13936,7 @@ impl MainWindow {
                                     // finishes.
                                     MainWindow::update_schema_snapshot(
                                         &mut s,
+                                        SchemaSnapshotAudience::EveryTabOnConnection,
                                         IntellisenseData::new(),
                                         HighlightData::new(),
                                     );
@@ -14478,9 +14726,11 @@ impl MainWindow {
         state.query_tabs.select(oracle_tab_id);
         let _ = state.set_active_editor_tab(oracle_tab_id);
         state.connection = oracle_runtime.connection();
-        state
-            .object_browser
-            .set_active_tab(oracle_tab_id, Some(oracle_runtime.clone()));
+        state.object_browser.set_active_tab(
+            oracle_tab_id,
+            Some(oracle_runtime.clone()),
+            Some("SYSTEM".to_string()),
+        );
         state.object_browser.capture_tour_set_example_metadata();
         *state
             .connection_info
@@ -14686,6 +14936,141 @@ impl MainWindow {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         s.object_browser.capture_tour_tree_paths()
+    }
+
+    /// The active tab's own object-browser card: its tree, the nodes it has
+    /// expanded, the scope its selector shows, and the tables its editor can
+    /// complete/highlight with. Together these are "what a tab switch must
+    /// bring back", so a harness can assert it without a database.
+    #[doc(hidden)]
+    pub fn capture_tour_active_tab_object_tree_paths(&self) -> Vec<String> {
+        self.state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .object_browser
+            .active_tab_tree_paths()
+    }
+
+    #[doc(hidden)]
+    pub fn capture_tour_active_tab_expanded_object_paths(&self) -> Vec<String> {
+        self.state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .object_browser
+            .active_tab_expanded_paths()
+    }
+
+    /// Whether the active tab's card holds a real catalog. A card that never
+    /// completed a load must answer `false` even though it may already show a
+    /// scope in its selector — that is what makes the tab schedule a load
+    /// instead of sitting on an empty tree.
+    #[doc(hidden)]
+    pub fn capture_tour_active_tab_has_object_metadata(&self) -> bool {
+        self.state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .object_browser
+            .active_tab_has_metadata()
+    }
+
+    #[doc(hidden)]
+    pub fn capture_tour_active_tab_displayed_scope(&self) -> Option<String> {
+        self.state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .object_browser
+            .active_tab_displayed_scope()
+    }
+
+    #[doc(hidden)]
+    pub fn capture_tour_active_tab_intellisense_tables(&self) -> Vec<String> {
+        let state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let tab_id = state.active_editor_tab_id;
+        state
+            .editor_tabs
+            .iter()
+            .find(|tab| tab.tab_id == tab_id)
+            .map(|tab| {
+                tab.intellisense_data
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .tables
+                    .clone()
+            })
+            .unwrap_or_default()
+    }
+
+    /// Editor tab ids in tab-strip order, and switching between them the way
+    /// clicking the tab strip does.
+    #[doc(hidden)]
+    pub fn capture_tour_editor_tab_ids(&self) -> Vec<crate::ui::query_tabs::QueryTabId> {
+        self.state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .editor_tabs
+            .iter()
+            .map(|tab| tab.tab_id)
+            .collect()
+    }
+
+    /// Object-browser cards that exist right now, and whether a tab still owns
+    /// one — a closed tab must leave neither behind.
+    #[doc(hidden)]
+    pub fn capture_tour_object_browser_card_count(&self) -> usize {
+        self.state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .object_browser
+            .card_count()
+    }
+
+    #[doc(hidden)]
+    pub fn capture_tour_tab_has_object_browser_card(
+        &self,
+        tab_id: crate::ui::query_tabs::QueryTabId,
+    ) -> bool {
+        self.state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .object_browser
+            .has_card_for_tab(tab_id)
+    }
+
+    /// Move the active tab to another schema/database the way the object
+    /// browser's selector does (binding + card), for harnesses.
+    #[doc(hidden)]
+    pub fn capture_tour_set_active_tab_scope(&mut self, scope: Option<String>) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let tab_id = state.active_editor_tab_id;
+        state.synchronize_scope_for_tab(tab_id, scope);
+    }
+
+    /// Close a tab the way the tab strip's X does, dirty checks included.
+    #[doc(hidden)]
+    pub fn capture_tour_close_editor_tab(
+        &mut self,
+        tab_id: crate::ui::query_tabs::QueryTabId,
+    ) -> bool {
+        Self::close_query_editor_tab(&self.state, tab_id)
+    }
+
+    #[doc(hidden)]
+    pub fn capture_tour_select_editor_tab(
+        &mut self,
+        tab_id: crate::ui::query_tabs::QueryTabId,
+    ) -> bool {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        state.query_tabs.select(tab_id);
+        state.set_active_editor_tab(tab_id)
     }
 
     /// Expand a tree node by its path, for the capture tour.

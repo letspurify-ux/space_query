@@ -779,6 +779,30 @@ pub struct ObjectBrowserWidget {
     refresh_connection_generation: Arc<AtomicU64>,
     pending_tree_refresh: Arc<Mutex<Option<PendingTreeRefresh>>>,
     in_flight_metadata_refresh: Arc<Mutex<Option<InFlightMetadataRefresh>>>,
+    /// Set when a metadata load has actually delivered a catalog for this
+    /// card, cleared when that catalog is thrown away (a new load, a
+    /// disconnect). It is what tells a new card whether a sibling has
+    /// anything worth inheriting — the object cache alone cannot say so, since
+    /// a schema may legitimately be empty, and the scope list cannot either,
+    /// because selecting a scope inserts it there before anything is loaded.
+    metadata_loaded: Arc<AtomicBool>,
+    /// What was ASKED for when the held catalog was read: `None` means "the
+    /// session's own default", which a load resolves into a concrete name.
+    /// Inheritance has to match on this, not on the resolved name — a tab
+    /// bound by connecting carries no scope, so it asks for the default, and
+    /// comparing its `None` against another card's resolved `SYSTEM` would
+    /// refuse every inheritance and reload instead.
+    metadata_requested_scope: Arc<Mutex<Option<String>>>,
+    /// When that catalog arrived, on a process-wide counter. Cards on one
+    /// connection can hold catalogs of different ages — one refreshed after a
+    /// DDL, another still on the older read — so a card that inherits must
+    /// take the NEWEST, not merely one that has something.
+    metadata_serial: Arc<AtomicU64>,
+    /// The card holds a catalog its tree has not been drawn from yet. Set
+    /// when a hidden card adopts one: drawing a whole schema is slow enough
+    /// that doing it for every hidden card the moment a load lands freezes
+    /// the UI, and nothing can see the tree until the card is shown anyway.
+    tree_rebuild_pending: Arc<AtomicBool>,
     /// How long a metadata cancel waits for the graceful break before forcing
     /// the session closed. Same user setting as the query cancel timeout.
     cancel_timeout: Arc<Mutex<Duration>>,
@@ -871,6 +895,10 @@ impl ObjectBrowserWidget {
         let refresh_connection_generation = Arc::new(AtomicU64::new(0));
         let pending_tree_refresh = Arc::new(Mutex::new(None));
         let in_flight_metadata_refresh = Arc::new(Mutex::new(None));
+        let metadata_loaded = Arc::new(AtomicBool::new(false));
+        let metadata_serial = Arc::new(AtomicU64::new(0));
+        let metadata_requested_scope = Arc::new(Mutex::new(None));
+        let tree_rebuild_pending = Arc::new(AtomicBool::new(false));
         let cancel_timeout = Arc::new(Mutex::new(Duration::from_secs(
             crate::utils::config::DEFAULT_CANCEL_TIMEOUT_SECONDS as u64,
         )));
@@ -907,6 +935,10 @@ impl ObjectBrowserWidget {
             refresh_connection_generation,
             pending_tree_refresh,
             in_flight_metadata_refresh,
+            metadata_loaded,
+            metadata_serial,
+            metadata_requested_scope,
+            tree_rebuild_pending,
             cancel_timeout,
             poll_lifecycle,
             sql_callback,
@@ -1041,6 +1073,17 @@ impl ObjectBrowserWidget {
         self.scope_choice.add_choice("SYSTEM|SYS");
         self.scope_choice.set_value(0);
         self.scope_choice.activate();
+        // The example catalog stands in for a completed load of the
+        // connection's default schema — which is what a tab bound by
+        // connecting asks for — so a new tab may inherit it instead of asking
+        // a database that does not exist here.
+        *self
+            .metadata_requested_scope
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+        self.metadata_serial
+            .store(next_metadata_serial(), Ordering::Release);
+        self.metadata_loaded.store(true, Ordering::Release);
         Self::rebuild_root_categories_for_db_type(
             &mut self.tree,
             crate::db::DatabaseType::Oracle,
@@ -1060,6 +1103,222 @@ impl ObjectBrowserWidget {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .clone()
+    }
+
+    /// Whether a metadata load has filled this card. A card that answers
+    /// `false` has an empty tree and nothing an editor can complete with.
+    fn has_loaded_metadata(&self) -> bool {
+        self.metadata_loaded.load(Ordering::Acquire)
+    }
+
+    fn metadata_requested_scope(&self) -> Option<String> {
+        self.metadata_requested_scope
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+    }
+
+    fn metadata_serial(&self) -> u64 {
+        self.metadata_serial.load(Ordering::Acquire)
+    }
+
+    /// Forget that this card's catalog is current, without disturbing what is
+    /// on screen. Used when the server behind the card changed.
+    fn invalidate_loaded_metadata(&self) {
+        self.metadata_loaded.store(false, Ordering::Release);
+    }
+
+    /// Whether this card is showing `scope`, by the database's own rule for
+    /// comparing schema/database names — the same comparison the retained
+    /// session and the scope selector use, so nothing can disagree about
+    /// whether two cards describe the same place.
+    /// Whether the catalog this card holds was read for `scope`.
+    fn requested_scope_matches(&self, scope: Option<&str>) -> bool {
+        let db_type = *self
+            .current_db_type
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        self.scope_names_match(db_type, self.metadata_requested_scope().as_deref(), scope)
+    }
+
+    /// Whether `other`'s current selection — which, for a card that has not
+    /// loaded, is the request it would make — names the same place this
+    /// card's catalog was read for. Judged entirely with THIS card's database
+    /// type and option list, since `other` may know neither yet.
+    fn selection_matches_request(&self, other: &ObjectBrowserWidget) -> bool {
+        let db_type = *self
+            .current_db_type
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        self.scope_names_match(
+            db_type,
+            self.metadata_requested_scope().as_deref(),
+            other.selected_scope().as_deref(),
+        )
+    }
+
+    fn scope_matches(&self, scope: Option<&str>) -> bool {
+        let db_type = *self
+            .current_db_type
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        self.scope_matches_for_db_type(db_type, scope)
+    }
+
+    fn scope_matches_for_db_type(
+        &self,
+        db_type: crate::db::DatabaseType,
+        scope: Option<&str>,
+    ) -> bool {
+        self.scope_names_match(db_type, self.selected_scope().as_deref(), scope)
+    }
+
+    /// Compare two schema/database names by this database's rule, with THIS
+    /// card's option list settling the MySQL case question — the caller may be
+    /// asking on behalf of a card that knows neither.
+    fn scope_names_match(
+        &self,
+        db_type: crate::db::DatabaseType,
+        card_scope: Option<&str>,
+        scope: Option<&str>,
+    ) -> bool {
+        if Self::scope_values_match_for_db_type(db_type, card_scope, scope) {
+            return true;
+        }
+        // MySQL and MariaDB report a database in the catalog's own case, which
+        // need not be the case the tab recorded, and the app's schema-update
+        // gate already accepts that difference when the name is unambiguous.
+        // Being stricter here would call a tab "out of sync" with its own card
+        // on every activation and reload the whole catalog each time.
+        if !db_type.is_mysql_or_mariadb() {
+            return false;
+        }
+        let trimmed = |scope: Option<&str>| {
+            scope
+                .map(str::trim)
+                .filter(|scope| !scope.is_empty())
+                .map(str::to_string)
+        };
+        let (Some(card_scope), Some(scope)) = (trimmed(card_scope), trimmed(scope)) else {
+            return false;
+        };
+        if !card_scope.eq_ignore_ascii_case(&scope) {
+            return false;
+        }
+        // Two databases differing only in case are two databases: refuse.
+        self.scope_options
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .iter()
+            .filter(|option| option.eq_ignore_ascii_case(&scope))
+            .take(2)
+            .count()
+            == 1
+    }
+
+    /// Copies another card's already-loaded metadata into this one and draws
+    /// the tree from it. A new query tab's card is born empty, and filling it
+    /// from the database would mean a second full metadata load plus an empty
+    /// tree until it lands; a sibling card on the same connection already
+    /// holds exactly the same server-side truth, so take it verbatim
+    /// (`object_cache` and not the lossy snapshot, so table columns that were
+    /// already expanded come along).
+    ///
+    /// Returns whether anything was adopted — `false` means the source is
+    /// itself empty and the caller still has to run a real refresh.
+    fn adopt_metadata_from(&mut self, source: &ObjectBrowserWidget) -> bool {
+        if !source.has_loaded_metadata() {
+            return false;
+        }
+        let db_type = *source
+            .current_db_type
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let cache = source
+            .object_cache
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        let scope_options = source
+            .scope_options
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        *self
+            .current_db_type
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = db_type;
+        *self
+            .object_cache
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = cache.clone();
+        *self
+            .scope_options
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = scope_options;
+        // `fetch_max`, never `store`: `cancel_metadata_refresh` invalidates a
+        // cancelled worker's late result by bumping this counter, and moving
+        // it back would let that result through.
+        self.refresh_connection_generation.fetch_max(
+            source.refresh_connection_generation.load(Ordering::Acquire),
+            Ordering::AcqRel,
+        );
+        *self
+            .metadata_requested_scope
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = source.metadata_requested_scope();
+        // Claim the scope FIRST: `set_selected_scope` treats a change of
+        // scope as "the catalog no longer describes this card" and clears the
+        // loaded flag, which would undo the stamp below.
+        self.set_selected_scope(source.selected_scope());
+        // The adopted catalog is as real as a loaded one: without this the
+        // card would show a full tree and still report itself empty, so the
+        // next tab switch would throw the tree away and reload it. It is
+        // exactly as fresh as what it was copied from.
+        self.metadata_serial
+            .store(source.metadata_serial(), Ordering::Release);
+        self.metadata_loaded.store(true, Ordering::Release);
+        if self.tree.visible_r() {
+            self.rebuild_tree_from_cache(db_type, &cache);
+        } else {
+            // Drawing a full catalog is the expensive half. A hidden card
+            // draws when it is shown, so a load landing with several empty
+            // sibling cards does not stall the UI thread once per card.
+            self.tree_rebuild_pending.store(true, Ordering::Release);
+        }
+        true
+    }
+
+    fn rebuild_tree_from_cache(&mut self, db_type: crate::db::DatabaseType, cache: &ObjectCache) {
+        Self::rebuild_root_categories_for_db_type(&mut self.tree, db_type, cache);
+        // The user may have typed a filter while this card was still empty;
+        // the adopted catalog has to arrive through it, exactly as a load
+        // would (`setup_filter_callback` uses the same pair).
+        let filter_text = self.filter_input.value().to_lowercase();
+        Self::populate_tree(&mut self.tree, cache, &filter_text);
+        self.tree.redraw();
+        self.tree_rebuild_pending.store(false, Ordering::Release);
+    }
+
+    /// Draw the adopted catalog if this card put it off while hidden. Called
+    /// when a card is shown.
+    fn rebuild_tree_if_pending(&mut self) {
+        if !self.tree_rebuild_pending.swap(false, Ordering::AcqRel) {
+            return;
+        }
+        if self.tree.was_deleted() {
+            return;
+        }
+        let db_type = *self
+            .current_db_type
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let cache = self
+            .object_cache
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        self.rebuild_tree_from_cache(db_type, &cache);
     }
 
     fn metadata_snapshot(&self) -> ObjectBrowserMetadataSnapshot {
@@ -1115,6 +1374,14 @@ impl ObjectBrowserWidget {
             self.scope_generation.fetch_add(1, Ordering::Relaxed);
             self.scope_switch_in_progress
                 .store(false, Ordering::Release);
+            // The catalog still describes the PREVIOUS database/schema, and
+            // until the reload lands this card is not a catalog of the scope
+            // it now claims — a tab opened in that window (the reload cannot
+            // even start while the connection is busy) would inherit one
+            // schema's objects under another schema's name and never correct
+            // itself. That holds for a move to "unspecified" too: a catalog
+            // read in a named schema is not "wherever the session lands".
+            self.metadata_loaded.store(false, Ordering::Release);
         }
         *self
             .selected_scope
@@ -2067,6 +2334,7 @@ impl ObjectBrowserWidget {
         let connection = self.connection.clone();
         let current_db_type = self.current_db_type.clone();
         let selected_scope = self.selected_scope.clone();
+        let metadata_loaded = self.metadata_loaded.clone();
         let suppress_scope_events = self.suppress_scope_events.clone();
         let status_callback = self.status_callback.clone();
         let scope_change_callback = self.scope_change_callback.clone();
@@ -2196,6 +2464,7 @@ impl ObjectBrowserWidget {
             scope_generation.fetch_add(1, Ordering::Relaxed);
             Self::complete_scope_change(
                 &selected_scope,
+                &metadata_loaded,
                 &status_callback,
                 &scope_change_callback,
                 db_type,
@@ -2219,6 +2488,8 @@ impl ObjectBrowserWidget {
         let refresh_connection_generation = self.refresh_connection_generation.clone();
         let filter_input = self.filter_input.clone();
         let pending_tree_refresh = self.pending_tree_refresh.clone();
+        let metadata_loaded = self.metadata_loaded.clone();
+        let metadata_serial = self.metadata_serial.clone();
         let metadata_callback = self.metadata_callback.clone();
 
         let lifecycle = Arc::downgrade(&self.poll_lifecycle);
@@ -2243,6 +2514,8 @@ impl ObjectBrowserWidget {
             refresh_connection_generation: Arc<AtomicU64>,
             filter_input: Input,
             pending_tree_refresh: Arc<Mutex<Option<PendingTreeRefresh>>>,
+            metadata_loaded: Arc<AtomicBool>,
+            metadata_serial: Arc<AtomicU64>,
             metadata_callback: MetadataCallback,
             status_callback: StatusCallback,
             lifecycle: Weak<()>,
@@ -2351,6 +2624,10 @@ impl ObjectBrowserWidget {
                         .unwrap_or_else(|poisoned| poisoned.into_inner());
                     *cache_guard = cache;
                 }
+                // This card now holds a real catalog, so a new card may
+                // inherit it instead of loading again.
+                metadata_serial.store(next_metadata_serial(), Ordering::Release);
+                metadata_loaded.store(true, Ordering::Release);
 
                 ObjectBrowserWidget::rebuild_root_categories_for_db_type(
                     &mut tree,
@@ -2378,6 +2655,12 @@ impl ObjectBrowserWidget {
                     &cache_snapshot,
                 );
                 ObjectBrowserWidget::emit_metadata_callback(&metadata_callback, snapshot);
+                // The delivery runs application code that can open a modal,
+                // and a modal pumps the timers that tear cards down. Anything
+                // below touches this card's widgets, so re-check them.
+                if tree.was_deleted() || scope_choice.was_deleted() {
+                    return;
+                }
                 ObjectBrowserWidget::clear_tree_items(&mut tree);
                 activity_guard.set_activity("Applying object browser metadata");
                 activity_guard.set_progress(crate::db::DbActivityProgress::Determinate {
@@ -2404,25 +2687,33 @@ impl ObjectBrowserWidget {
                 ObjectBrowserWidget::emit_status_callback(&status_callback, &message);
             }
 
-            let desired_scopes = scope_options
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .clone();
-            let desired_scope = selected_scope
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .clone();
-            ObjectBrowserWidget::sync_scope_choice_widget(
-                &mut scope_choice,
-                &suppress_scope_events,
-                &scope_choice_menu_busy,
-                *current_db_type
+            // Only the card on screen needs its selector kept in step. This
+            // runs 20 times a second per card, and reading the menu back to
+            // decide whether it changed costs one FFI call and one String per
+            // item — with a card per editor tab and a server full of
+            // databases, doing that for hidden cards is pure waste. A card
+            // that becomes visible is synced by its next tick.
+            if scope_choice.visible_r() {
+                let desired_scopes = scope_options
                     .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner()),
-                &desired_scopes,
-                desired_scope.as_deref(),
-                scope_switch_in_progress.load(Ordering::Acquire),
-            );
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .clone();
+                let desired_scope = selected_scope
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .clone();
+                ObjectBrowserWidget::sync_scope_choice_widget(
+                    &mut scope_choice,
+                    &suppress_scope_events,
+                    &scope_choice_menu_busy,
+                    *current_db_type
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner()),
+                    &desired_scopes,
+                    desired_scope.as_deref(),
+                    scope_switch_in_progress.load(Ordering::Acquire),
+                );
+            }
 
             let mut next_paths = Vec::new();
             let mut finished_refresh = false;
@@ -2489,6 +2780,8 @@ impl ObjectBrowserWidget {
                     refresh_connection_generation.clone(),
                     filter_input.clone(),
                     pending_tree_refresh.clone(),
+                    metadata_loaded.clone(),
+                    metadata_serial.clone(),
                     metadata_callback.clone(),
                     status_callback.clone(),
                     lifecycle.clone(),
@@ -2513,6 +2806,8 @@ impl ObjectBrowserWidget {
             refresh_connection_generation,
             filter_input,
             pending_tree_refresh,
+            metadata_loaded,
+            metadata_serial,
             metadata_callback,
             self.status_callback.clone(),
             lifecycle,
@@ -2533,6 +2828,7 @@ impl ObjectBrowserWidget {
         let connection_is_read_only = self.connection_is_read_only.clone();
         let action_sender = self.action_sender.clone();
         let selected_scope = self.selected_scope.clone();
+        let metadata_loaded = self.metadata_loaded.clone();
         let scope_change_callback = self.scope_change_callback.clone();
         let scope_choice = self.scope_choice.clone();
         let suppress_scope_events = self.suppress_scope_events.clone();
@@ -2555,6 +2851,7 @@ impl ObjectBrowserWidget {
             connection_is_read_only: Arc<AtomicBool>,
             action_sender: std::sync::mpsc::Sender<ObjectActionResult>,
             selected_scope: Arc<Mutex<Option<String>>>,
+            metadata_loaded: Arc<AtomicBool>,
             scope_change_callback: ScopeChangeCallback,
             mut scope_choice: Choice,
             suppress_scope_events: Arc<Mutex<bool>>,
@@ -2572,6 +2869,14 @@ impl ObjectBrowserWidget {
 
             let mut disconnected = false;
             loop {
+                // Re-check every round, not just once at the top: handling a
+                // message can open an alert or a context menu, and those pump
+                // the FLTK loop — which dispatches the deferred tab-close
+                // timer, which deletes this card's widgets. The next message
+                // would then draw into freed memory.
+                if tree.was_deleted() || filter_input.was_deleted() || scope_choice.was_deleted() {
+                    return;
+                }
                 let message = {
                     let r = receiver
                         .lock()
@@ -2968,6 +3273,7 @@ impl ObjectBrowserWidget {
                                 Ok(()) => {
                                     ObjectBrowserWidget::complete_scope_change(
                                         &selected_scope,
+                                        &metadata_loaded,
                                         &status_callback,
                                         &scope_change_callback,
                                         db_type,
@@ -3055,6 +3361,7 @@ impl ObjectBrowserWidget {
                     connection_is_read_only.clone(),
                     action_sender.clone(),
                     selected_scope.clone(),
+                    metadata_loaded.clone(),
                     scope_change_callback.clone(),
                     scope_choice.clone(),
                     suppress_scope_events.clone(),
@@ -3077,6 +3384,7 @@ impl ObjectBrowserWidget {
             connection_is_read_only,
             action_sender,
             selected_scope,
+            metadata_loaded,
             scope_change_callback,
             scope_choice,
             suppress_scope_events,
@@ -4011,6 +4319,11 @@ impl ObjectBrowserWidget {
         resolved_scope: Option<&str>,
         switch_in_progress: bool,
     ) {
+        // A card can be torn down while an alert or a popup pumps the event
+        // loop, and every line below writes to its widget.
+        if scope_choice.was_deleted() {
+            return;
+        }
         // Choice still owns the backing menu items, so avoid rebuilding them
         // while the custom selector popup or a FLTK grab is active.
         if Self::scope_choice_sync_should_defer(
@@ -4023,10 +4336,28 @@ impl ObjectBrowserWidget {
         let current_options = Self::scope_choice_values(scope_choice);
         let needs_rebuild =
             !Self::scope_options_match_for_db_type(db_type, &current_options, available_scopes);
+        // Falling straight through to the first option would make the
+        // selector announce the alphabetically first database whenever the
+        // caller has no scope to pass — a rebuild of the item list must not
+        // silently move the user's selection. Keep what is already selected
+        // as long as the new option list still contains it.
+        let previously_selected = scope_choice.choice().and_then(|selected| {
+            let selected = selected.trim().to_string();
+            (!selected.is_empty()
+                && available_scopes.iter().any(|option| {
+                    Self::scope_values_match_for_db_type(
+                        db_type,
+                        Some(option.as_str()),
+                        Some(selected.as_str()),
+                    )
+                }))
+            .then_some(selected)
+        });
         let desired_scope = resolved_scope
             .map(str::trim)
             .filter(|scope| !scope.is_empty())
             .map(str::to_string)
+            .or(previously_selected)
             .or_else(|| available_scopes.first().cloned());
 
         *suppress_scope_events
@@ -4064,6 +4395,11 @@ impl ObjectBrowserWidget {
     }
 
     fn apply_scope_choice_enabled_state(scope_choice: &mut Choice, switch_in_progress: bool) {
+        // Callers reach here after alerts, which pump the event loop and can
+        // take this card down with them.
+        if scope_choice.was_deleted() {
+            return;
+        }
         if Self::scope_choice_should_be_active(scope_choice.size(), switch_in_progress) {
             scope_choice.activate();
         } else {
@@ -4106,6 +4442,11 @@ impl ObjectBrowserWidget {
         db_type: crate::db::DatabaseType,
         previous_scope: Option<&str>,
     ) {
+        // Reached after an alert on the failure paths; the alert pumps the
+        // event loop, which can delete this card's widgets.
+        if scope_choice.was_deleted() {
+            return;
+        }
         let Some(previous_scope) = previous_scope else {
             return;
         };
@@ -4431,6 +4772,7 @@ impl ObjectBrowserWidget {
 
     fn complete_scope_change(
         selected_scope: &Arc<Mutex<Option<String>>>,
+        metadata_loaded: &Arc<AtomicBool>,
         status_callback: &StatusCallback,
         scope_change_callback: &ScopeChangeCallback,
         db_type: crate::db::DatabaseType,
@@ -4442,6 +4784,11 @@ impl ObjectBrowserWidget {
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
             *scope_guard = next_scope.clone();
         }
+        // The cache still holds the previous scope's objects; the refresh that
+        // replaces it is started by the app, and may not start at all while
+        // the connection is busy. Until then this card is not a catalog of
+        // the scope it now names, so no other card may inherit from it.
+        metadata_loaded.store(false, Ordering::Release);
 
         Self::emit_status_callback(
             status_callback,
@@ -7164,6 +7511,11 @@ impl ObjectBrowserWidget {
             .store(false, Ordering::Release);
         self.refresh_connection_generation
             .fetch_add(1, Ordering::Relaxed);
+        // The catalog goes away with the connection, so this card is no
+        // longer something a new card may inherit from, and there is nothing
+        // left for a deferred draw to draw.
+        self.metadata_loaded.store(false, Ordering::Release);
+        self.tree_rebuild_pending.store(false, Ordering::Release);
         self.clear_pending_tree_refresh();
         self.clear_items();
         self.filter_input.set_value("");
@@ -7215,9 +7567,20 @@ impl ObjectBrowserWidget {
             activity: activity_guard.finish_handle(),
         });
         let connection_generation = context.connection_generation;
+        *self
+            .metadata_requested_scope
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = requested_scope.clone();
         self.refresh_connection_generation
             .store(connection_generation, Ordering::Relaxed);
         self.clear_pending_tree_refresh();
+        // The catalog is about to be thrown away, so this card stops being a
+        // source another card can inherit from until the load lands. Any
+        // deferred draw of an ADOPTED catalog is cancelled with it: the poll
+        // fills the tree in batches from here on, and a deferred draw firing
+        // in the middle of that would double up its nodes.
+        self.metadata_loaded.store(false, Ordering::Release);
+        self.tree_rebuild_pending.store(false, Ordering::Release);
         // First clear items and filter
         self.clear_items();
         self.filter_input.set_value("");
@@ -9202,21 +9565,27 @@ impl ObjectBrowserDbBehavior for MysqlObjectBrowserBehavior {
     }
 }
 
-impl Drop for ObjectBrowserWidget {
-    fn drop(&mut self) {
-        // Clones share the same underlying FLTK widgets and callback slots.
-        // Only the last owner may detach handlers, otherwise dropping a
-        // temporary clone can disable interactions in the live widget.
-        if Arc::strong_count(&self.poll_lifecycle) != 1 {
-            return;
+impl ObjectBrowserWidget {
+    /// Release the card's callbacks. Safe to call more than once, and safe
+    /// after the widgets are gone: a clone can outlive the deletion (a card
+    /// torn down while a nested event loop holds one), and touching a deleted
+    /// FLTK widget asserts inside the wrapper — a panic that would land in a
+    /// `Drop`.
+    fn detach_callbacks(&mut self) {
+        if !self.filter_input.was_deleted() {
+            self.filter_input.set_callback(|_| {});
         }
+        if !self.scope_choice.was_deleted() {
+            self.scope_choice.set_callback(|_| {});
+            self.scope_choice.handle(|_, _| false);
+        }
+        if !self.tree.was_deleted() {
+            self.tree.handle(|_, _| false);
+        }
+        self.clear_callback_slots();
+    }
 
-        // Release callback closures early so captured state does not outlive
-        // the widget tree unnecessarily.
-        self.filter_input.set_callback(|_| {});
-        self.scope_choice.set_callback(|_| {});
-        self.scope_choice.handle(|_, _| false);
-        self.tree.handle(|_, _| false);
+    fn clear_callback_slots(&self) {
         *self
             .sql_callback
             .lock()
@@ -9237,6 +9606,18 @@ impl Drop for ObjectBrowserWidget {
             .metadata_callback
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+    }
+}
+
+impl Drop for ObjectBrowserWidget {
+    fn drop(&mut self) {
+        // Clones share the same underlying FLTK widgets and callback slots.
+        // Only the last owner may detach handlers, otherwise dropping a
+        // temporary clone can disable interactions in the live widget.
+        if Arc::strong_count(&self.poll_lifecycle) != 1 {
+            return;
+        }
+        self.detach_callbacks();
     }
 }
 
@@ -9268,6 +9649,12 @@ fn copy_text_for_object_item(item_info: &ObjectItem) -> String {
     }
 }
 
+/// Orders catalogs by when they were read, across every card in the process.
+fn next_metadata_serial() -> u64 {
+    static NEXT_METADATA_SERIAL: AtomicU64 = AtomicU64::new(1);
+    NEXT_METADATA_SERIAL.fetch_add(1, Ordering::Relaxed)
+}
+
 /// Who a browser card belongs to. Every query editor tab gets its OWN card —
 /// tree, filter, scope selector, metadata cache, and worker lifecycle — so
 /// each tab keeps its expansion state and scope independently; the card is
@@ -9287,6 +9674,10 @@ struct ConnectionBrowserEntry {
     connection_id: ConnectionId,
     runtime: Arc<ConnectionRuntime>,
     browser: ObjectBrowserWidget,
+    /// Whether this card was born with a sibling card's metadata. A card that
+    /// was not needs a real metadata load before its tab can show a tree or
+    /// highlight identifiers.
+    seeded_from_sibling: bool,
 }
 
 /// Tab- and connection-aware Object Browser host. Cards are per query tab
@@ -9449,6 +9840,9 @@ impl MultiObjectBrowserWidget {
             let mut root = entry.browser.get_widget();
             if entry.owner == owner {
                 root.show();
+                // A card that adopted a catalog while hidden put off drawing
+                // it; now that it is on screen it has to catch up.
+                entry.browser.clone().rebuild_tree_if_pending();
             } else {
                 root.hide();
             }
@@ -9525,7 +9919,19 @@ impl MultiObjectBrowserWidget {
         // their tree but never feed an editor.
         let metadata_callback = self.metadata_callback.clone();
         let active_tab = self.active_tab.clone();
+        // Weak, not strong: the card table owns the card, the card owns this
+        // callback, and a strong handle here would close that loop — every
+        // card (and its worker thread, parked on a channel whose sender never
+        // drops) would outlive the panel itself.
+        let entries = Arc::downgrade(&self.entries);
         browser.set_metadata_callback(move |snapshot| {
+            // A load is the truth for the whole connection at this scope, so
+            // hand it to the cards that are still empty — a tab created while
+            // this load was running never gets stuck with a blank tree
+            // waiting for a refresh of its own.
+            if let Some(entries) = entries.upgrade() {
+                Self::fill_empty_sibling_cards(&entries, owner, connection_id);
+            }
             let active = *active_tab
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -9561,12 +9967,60 @@ impl MultiObjectBrowserWidget {
         });
     }
 
+    /// Copies a card's freshly loaded metadata into every card of the same
+    /// connection that has none yet and is on the same scope. Called when a
+    /// load lands, so cards created while it was running do not each need a
+    /// load of their own.
+    fn fill_empty_sibling_cards(
+        entries: &Arc<Mutex<Vec<ConnectionBrowserEntry>>>,
+        source_owner: BrowserOwner,
+        connection_id: ConnectionId,
+    ) {
+        let (source, targets) = {
+            let entries = entries
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            // Match the connection too: a card can be torn down and rebuilt
+            // on another server under the same owner, and a late callback
+            // from the old one must not copy that server's catalog here.
+            let Some(source) = entries
+                .iter()
+                .find(|entry| entry.owner == source_owner && entry.connection_id == connection_id)
+                .map(|entry| entry.browser.clone())
+            else {
+                return;
+            };
+            let source_scope = source.metadata_requested_scope();
+            let targets = entries
+                .iter()
+                .filter(|entry| {
+                    entry.connection_id == connection_id
+                        && entry.owner != source_owner
+                        && !entry.browser.has_loaded_metadata()
+                        // An empty card has asked for nothing yet, so its
+                        // selection IS its request; compare that with what
+                        // produced the source's catalog. Judged with the
+                        // SOURCE's database type and option list: a card built
+                        // while the connection was locked still carries the
+                        // default type and knows only its own scope.
+                        && source.selection_matches_request(&entry.browser)
+                })
+                .map(|entry| entry.browser.clone())
+                .collect::<Vec<_>>();
+            (source, targets)
+        };
+        for mut target in targets {
+            target.adopt_metadata_from(&source);
+        }
+    }
+
     /// Builds one browser card for `owner`, wired and font-styled, hidden by
     /// default.
     fn create_browser_entry(
         &mut self,
         owner: BrowserOwner,
         runtime: Arc<ConnectionRuntime>,
+        scope: Option<String>,
     ) -> ConnectionBrowserEntry {
         let previous_group = Group::try_current();
         self.browser_stack.begin();
@@ -9594,12 +10048,64 @@ impl MultiObjectBrowserWidget {
             browser.apply_font_settings(profile, size);
         }
         browser.get_widget().hide();
+        // Start from what the connection already knows instead of an empty
+        // tree: the metadata is a property of the connection and the scope it
+        // was read in, not of the tab that first asked for it.
+        let source = self.metadata_source_for_scope(runtime.id(), scope.as_deref());
+        let seeded = source.is_some_and(|source| browser.adopt_metadata_from(&source));
+        if !seeded {
+            // Nothing to inherit: still make the card report the tab's scope,
+            // so the selector is right while the first load runs.
+            browser.set_selected_scope(scope);
+        }
         ConnectionBrowserEntry {
             owner,
             connection_id: runtime.id(),
             runtime,
             browser,
+            seeded_from_sibling: seeded,
         }
+    }
+
+    /// A card of the same connection AND the same scope whose metadata a new
+    /// card can inherit — the richest one, so an expanded table's columns are
+    /// carried over too. A card on another scope is not a source: its tree
+    /// describes a different database/schema.
+    fn metadata_source_for_scope(
+        &self,
+        connection_id: ConnectionId,
+        scope: Option<&str>,
+    ) -> Option<ObjectBrowserWidget> {
+        let scope = scope.map(str::trim).filter(|scope| !scope.is_empty());
+        let entries = self
+            .entries
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        entries
+            .iter()
+            .filter(|entry| {
+                entry.connection_id == connection_id
+                    // A catalog read before the connection was rebuilt
+                    // describes a server that may no longer be there.
+                    && entry
+                        .browser
+                        .refresh_connection_generation
+                        .load(Ordering::Acquire)
+                        == entry.runtime.connection_generation()
+            })
+            .map(|entry| entry.browser.clone())
+            .filter(|browser| browser.has_loaded_metadata())
+            // Match what was ASKED for. A tab bound by connecting has no
+            // scope and therefore asks for the session default; the card that
+            // already read that default resolved it to a concrete name, and
+            // comparing against the name would refuse the inheritance and
+            // force a redundant load.
+            .filter(|browser| browser.requested_scope_matches(scope))
+            // The NEWEST catalog, not the one with the most expanded tables:
+            // a sibling refreshed after a DDL must win over an older card
+            // that merely has more columns cached, or the new tab would
+            // inherit the pre-DDL catalog and schedule no load of its own.
+            .max_by_key(|browser| browser.metadata_serial())
     }
 
     /// Ensures the CONNECTION's preview card exists (the card the dropdown
@@ -9627,7 +10133,7 @@ impl MultiObjectBrowserWidget {
         }
 
         let entry =
-            self.create_browser_entry(BrowserOwner::ConnectionPreview(runtime.id()), runtime);
+            self.create_browser_entry(BrowserOwner::ConnectionPreview(runtime.id()), runtime, None);
         let is_first = self
             .entries
             .lock()
@@ -9650,12 +10156,14 @@ impl MultiObjectBrowserWidget {
     /// The active query tab changed (or its binding did): make sure that tab
     /// has its OWN card on its connection, show it, and route metadata to it.
     /// An unbound tab (`None`) keeps the current card visible, like before.
-    /// Returns whether the tab's card was newly created (its tree is empty
-    /// until a metadata refresh fills it — the caller schedules one).
+    /// Returns whether the tab's card still has to be loaded from the
+    /// database — true only when a card was created and had no sibling
+    /// catalog to inherit, so the caller must schedule a refresh.
     pub fn set_active_tab(
         &mut self,
         tab_id: QueryTabId,
         runtime: Option<Arc<ConnectionRuntime>>,
+        scope: Option<String>,
     ) -> bool {
         let Some(runtime) = runtime else {
             *self
@@ -9681,27 +10189,31 @@ impl MultiObjectBrowserWidget {
                 .find(|entry| entry.owner == owner)
                 .map(|entry| (entry.connection_id, entry.browser.get_widget()))
         };
-        let created = match stale_entry {
-            Some((existing_connection_id, _)) if existing_connection_id == connection_id => false,
+        let create_card = |host: &mut Self| {
+            let entry = host.create_browser_entry(owner, runtime.clone(), scope.clone());
+            // A card seeded from a sibling already shows the connection's
+            // metadata, so it needs no load; only a first card on a
+            // connection does.
+            let needs_refresh = !entry.seeded_from_sibling;
+            host.entries
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .push(entry);
+            needs_refresh
+        };
+        let needs_metadata_refresh = match stale_entry {
+            Some((existing_connection_id, _)) if existing_connection_id == connection_id => {
+                // The tab keeps the card it already arranged: same tree, same
+                // expansion, same filter, and no reload.
+                false
+            }
             Some((_, root)) => {
                 // The tab moved to another connection: its old card shows the
                 // wrong server. Tear it down and start fresh.
                 self.remove_entry_widget(owner, root);
-                let entry = self.create_browser_entry(owner, runtime);
-                self.entries
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner())
-                    .push(entry);
-                true
+                create_card(self)
             }
-            None => {
-                let entry = self.create_browser_entry(owner, runtime);
-                self.entries
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner())
-                    .push(entry);
-                true
-            }
+            None => create_card(self),
         };
 
         *self
@@ -9716,9 +10228,86 @@ impl MultiObjectBrowserWidget {
         Self::show_owner_card(&entries, owner);
         self.refresh_runtime_labels();
         app::redraw();
-        created
+        needs_metadata_refresh
     }
 
+    /// A connection was replaced under its cards (a script `CONNECT` keeps the
+    /// same runtime, so nothing else clears them): the catalogs they show
+    /// belong to the previous server. Stop them being inherited from — the
+    /// trees stay on screen until the reconnect's own refresh replaces them,
+    /// but a new tab must load rather than copy them.
+    pub fn invalidate_metadata_for_connection(&mut self, connection_id: ConnectionId) {
+        let browsers = self
+            .entries
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .iter()
+            .filter(|entry| entry.connection_id == connection_id)
+            .map(|entry| entry.browser.clone())
+            .collect::<Vec<_>>();
+        for browser in browsers {
+            browser.invalidate_loaded_metadata();
+        }
+    }
+
+    /// How many browser cards exist, and whether a given tab still owns one.
+    /// A closed tab must leave neither behind — its card owns a worker thread,
+    /// a poll timer and an FLTK widget tree.
+    pub fn card_count(&self) -> usize {
+        self.entries
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .len()
+    }
+
+    pub fn has_card_for_tab(&self, tab_id: QueryTabId) -> bool {
+        self.entries
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .iter()
+            .any(|entry| entry.owner == BrowserOwner::Tab(tab_id))
+    }
+
+    /// Whether the active tab's card has metadata to show. `false` means its
+    /// tree is empty and the editor has nothing to highlight with, so the
+    /// caller must run (or retry) a metadata refresh.
+    pub fn active_tab_has_metadata(&self) -> bool {
+        self.bound_browser()
+            .is_some_and(|browser| browser.has_loaded_metadata())
+    }
+
+    /// Whether the active tab's card still has to be loaded from the
+    /// database. A card that is empty *because its load is running* must
+    /// answer `false`: scheduling another one would cancel the load in
+    /// flight and start it over, so switching away and back during a load
+    /// would keep restarting it.
+    pub fn active_tab_needs_metadata_load(&self) -> bool {
+        self.bound_browser().is_some_and(|browser| {
+            !browser.has_loaded_metadata() && !browser.metadata_refresh_in_flight()
+        })
+    }
+
+    /// The metadata the ACTIVE tab's card holds, for seeding that tab's
+    /// editor (intellisense and highlighting) without a database round trip.
+    pub fn active_tab_metadata_snapshot(&self) -> Option<ObjectBrowserMetadataSnapshot> {
+        let browser = self.bound_browser()?;
+        browser
+            .has_loaded_metadata()
+            .then(|| browser.metadata_snapshot())
+    }
+
+    /// Tears one card down: stops what it is doing, then deletes its widgets.
+    ///
+    /// The cancel is the load-bearing part. A card's metadata load runs on its
+    /// own worker over a pooled DB session, and dropping the card only stops
+    /// the UI side of it (the poll loop's `Weak` fails to upgrade and the
+    /// callbacks are detached) — the session would stay checked out and
+    /// working for nobody until the load finished on its own. Cards used to be
+    /// removed only when a connection went away; they are now removed on every
+    /// tab close, so cancelling here is what keeps a closed tab from leaving a
+    /// server session behind. `cancel_db_activity` never blocks this thread:
+    /// it retires the registry entry and hands the actual break to the
+    /// watchdog.
     fn remove_entry_widget(&mut self, owner: BrowserOwner, mut root: Flex) {
         let removed = {
             let mut entries = self
@@ -9730,8 +10319,20 @@ impl MultiObjectBrowserWidget {
                 .position(|entry| entry.owner == owner)
                 .map(|index| entries.remove(index))
         };
-        root.hide();
+        let Some(mut removed) = removed else {
+            // Nothing was removed, so this owner's card is already gone (a
+            // re-entrant teardown through a nested event loop). Deleting the
+            // widget again would assert on a dangling pointer.
+            return;
+        };
+        removed.browser.cancel_metadata_refresh();
+        // Detach here rather than leaving it to `Drop`: a clone held across a
+        // nested event loop would make the card's own `Drop` run AFTER the
+        // widgets below are deleted, and its first widget touch would panic
+        // inside a destructor.
+        removed.browser.detach_callbacks();
         drop(removed);
+        root.hide();
         Flex::delete(root);
     }
 
@@ -9740,15 +10341,15 @@ impl MultiObjectBrowserWidget {
     /// its preview card.
     pub fn remove_tab(&mut self, tab_id: QueryTabId) {
         let owner = BrowserOwner::Tab(tab_id);
-        let root = self
-            .entries
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .iter()
-            .find(|entry| entry.owner == owner)
-            .map(|entry| entry.browser.get_widget());
-        let Some(root) = root else {
-            return;
+        let (root, connection_id) = {
+            let entries = self
+                .entries
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let Some(entry) = entries.iter().find(|entry| entry.owner == owner) else {
+                return;
+            };
+            (entry.browser.get_widget(), entry.connection_id)
         };
         self.remove_entry_widget(owner, root);
         {
@@ -9770,7 +10371,22 @@ impl MultiObjectBrowserWidget {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         if *visible == Some(owner) {
-            *visible = entries.first().map(|entry| entry.owner);
+            // Stay on the same connection if it still has a card, so closing
+            // a tab does not jump the panel to an unrelated server for the
+            // moment before the next tab is activated.
+            *visible = entries
+                .iter()
+                .find(|entry| {
+                    entry.connection_id == connection_id
+                        && matches!(entry.owner, BrowserOwner::ConnectionPreview(_))
+                })
+                .or_else(|| {
+                    entries
+                        .iter()
+                        .find(|entry| entry.connection_id == connection_id)
+                })
+                .or_else(|| entries.first())
+                .map(|entry| entry.owner);
             if let Some(next_owner) = *visible {
                 Self::show_owner_card(&entries, next_owner);
             }
@@ -9808,6 +10424,11 @@ impl MultiObjectBrowserWidget {
                 *active = None;
             }
         }
+        let active_owner = self
+            .active_tab
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .map(|(tab_id, _)| BrowserOwner::Tab(tab_id));
         let entries = self
             .entries
             .lock()
@@ -9815,7 +10436,9 @@ impl MultiObjectBrowserWidget {
             .clone();
         // Only the removed connection loses its selection. Falling back to
         // the first remaining card unconditionally would show one
-        // connection's tree while `visible_owner` still reports another one.
+        // connection's tree while `visible_owner` still reports another one —
+        // and it would drop the user out of the tab they are working in, so
+        // the active tab's own card is the first choice.
         {
             let mut visible = self
                 .visible_owner
@@ -9824,7 +10447,9 @@ impl MultiObjectBrowserWidget {
             let visible_is_gone =
                 !visible.is_some_and(|owner| entries.iter().any(|entry| entry.owner == owner));
             if visible_is_gone {
-                *visible = entries.first().map(|entry| entry.owner);
+                *visible = active_owner
+                    .filter(|owner| entries.iter().any(|entry| entry.owner == *owner))
+                    .or_else(|| entries.first().map(|entry| entry.owner));
             }
             if let Some(owner) = *visible {
                 Self::show_owner_card(&entries, owner);
@@ -9981,6 +10606,61 @@ impl MultiObjectBrowserWidget {
             .collect()
     }
 
+    /// The ACTIVE TAB's own card: what its tree holds and which of those nodes
+    /// are expanded. Cards are per tab, so a harness checking that a tab
+    /// switch restored a tab's view must ask this and not the flattened
+    /// all-cards list above.
+    pub fn active_tab_tree_paths(&self) -> Vec<String> {
+        self.bound_browser()
+            .map(|browser| browser.capture_tour_tree_paths())
+            .unwrap_or_default()
+    }
+
+    pub fn active_tab_expanded_paths(&self) -> Vec<String> {
+        let Some(browser) = self.bound_browser() else {
+            return Vec::new();
+        };
+        let mut paths = ObjectBrowserWidget::open_tree_paths(&browser.tree)
+            .into_iter()
+            .collect::<Vec<_>>();
+        paths.sort();
+        paths
+    }
+
+    /// Whether the tab's card is already on `scope`, by the database's own
+    /// name comparison. A tab whose card has no entry answers `true`: there is
+    /// nothing to bring in sync.
+    ///
+    /// A tab with NO scope of its own also answers `true`. Its binding says
+    /// "wherever the session lands", and a load resolves exactly that — the
+    /// server's default schema/database — into the card. Reporting those two
+    /// as different would push the resolved name back out of the card and
+    /// order a reload on EVERY activation of such a tab (which is every tab
+    /// that was bound by connecting), throwing the tree, the filter and the
+    /// expansion away each time and never converging, because the next load
+    /// resolves the same name again. `schema_update_scope_matches` treats an
+    /// unset scope the same way.
+    pub fn tab_scope_matches(&self, tab_id: QueryTabId, scope: Option<&str>) -> bool {
+        if scope.map(str::trim).is_none_or(str::is_empty) {
+            return true;
+        }
+        self.entries
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .iter()
+            .find(|entry| entry.owner == BrowserOwner::Tab(tab_id))
+            .is_none_or(|entry| entry.browser.scope_matches(scope))
+    }
+
+    /// The scope (Oracle schema / MySQL database) the active tab's card is
+    /// showing in its selector — the value the user reads, not the stored one.
+    pub fn active_tab_displayed_scope(&self) -> Option<String> {
+        self.bound_browser()
+            .and_then(|browser| browser.scope_choice.choice())
+            .map(|scope| scope.trim().to_string())
+            .filter(|scope| !scope.is_empty())
+    }
+
     /// Open one tree node by path on every connection's browser, for the
     /// capture tour.
     #[doc(hidden)]
@@ -10013,15 +10693,6 @@ impl MultiObjectBrowserWidget {
 
     pub fn selected_scope_for_connection(&self, connection_id: ConnectionId) -> Option<String> {
         self.representative_entry_for_connection(connection_id)
-            .and_then(|entry| entry.browser.selected_scope())
-    }
-
-    pub fn selected_scope_for_tab(&self, tab_id: QueryTabId) -> Option<String> {
-        self.entries
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .iter()
-            .find(|entry| entry.owner == BrowserOwner::Tab(tab_id))
             .and_then(|entry| entry.browser.selected_scope())
     }
 

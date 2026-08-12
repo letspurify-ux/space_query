@@ -129,6 +129,21 @@ applied to the tab's retained session in place (MySQL `USE`, Oracle
 `ALTER SESSION SET CURRENT_SCHEMA`), so it is never gated on the session's
 transaction state — an open transaction simply continues in the new scope, and
 the commit/rollback/discard decision stays where it belongs, at tab close.
+
+A card is loaded from the database only when there is nothing to inherit. The
+metadata belongs to the connection and the scope it was read in, not to the tab
+that asked first, so a new card copies a sibling card's `ObjectCache`, scope
+list and selection outright (`adopt_metadata_from`), and a load that lands
+fills every still-empty card of the same connection and scope
+(`fill_empty_sibling_cards`). A plain tab switch therefore reloads nothing and
+restores the tab as it was — tree, expansion, filter, scope selection — and the
+tab's editor takes its completion and highlighting metadata from its own card
+(`seed_active_tab_editor_metadata_from_browser`) instead of waiting for a
+refresh. Only a first card on a connection or a scope change triggers a load,
+and a schema load is written to the editor tabs that share its scope, never to
+a sibling tab sitting on another one. Regression harness:
+`cargo run --bin verify_object_browser_tabs_ui` (no database needed).
+
 Operations that
 run on the shared live connection instead of a pool session — Quick Describe
 and Explain Plan — therefore resolve names in the requesting tab's scope
