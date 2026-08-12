@@ -3012,12 +3012,31 @@ fn transaction_mode_state_has_a_single_source_of_truth() {
     let adopt_start = execution
         .find("fn adopt_session_transaction_mode_change_after_statement(")
         .expect("session transaction-mode adoption helper should exist");
-    let adopt_body = &execution[adopt_start..adopt_start + 1600];
+    let adopt_end = execution[adopt_start..]
+        .find("\n    fn ")
+        .map(|offset| adopt_start + offset)
+        .expect("adoption helper should be followed by another function");
+    let adopt_body = &execution[adopt_start..adopt_end];
     assert!(
         adopt_body.contains("session_transaction_mode_change_for_statement(")
             && adopt_body.contains("store_mutex_transaction_mode_option(")
             && adopt_body.contains("QueryProgress::TransactionModeChanged"),
         "the adoption helper must parse the statement, pin the tab override, and notify the UI"
+    );
+    // A merged mode the database cannot express (Oracle: an explicit isolation
+    // level over a READ ONLY pin) must be refused BEFORE the pin/UI writes:
+    // adopting it would pin a pair the toolbar refuses to select, kill the OCI
+    // batch at its next boundary re-application, and leave the session on the
+    // abandoned level with no reset path.
+    let adopt_refusal_at = adopt_body
+        .find("transaction_mode_selection_error(")
+        .expect("the adoption helper must refuse a merge the database cannot express");
+    let adopt_pin_at = adopt_body
+        .find("store_mutex_transaction_mode_option(")
+        .expect("checked above");
+    assert!(
+        adopt_refusal_at < adopt_pin_at,
+        "the expressibility check must run before the tab override is pinned"
     );
     let adoption_calls = execution
         .matches("adopt_session_transaction_mode_change_after_statement(")
@@ -3135,7 +3154,7 @@ fn transaction_mode_state_has_a_single_source_of_truth() {
     );
 
     // (11) Isolation and access mode are independent choices, so an
-    // unrunnable pair (Oracle READ ONLY with an explicit isolation level) must
+    // unrunnable pair (Oracle READ ONLY at Read committed isolation) must
     // be refused where it is selected instead of pinned onto the tab.
     let controls_start = main_window
         .find("fn update_transaction_mode_from_controls(")

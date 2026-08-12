@@ -782,13 +782,14 @@ impl ConnectionAdvancedSettings {
                     .to_string(),
             );
         }
-        if self.default_transaction_access_mode == TransactionAccessMode::ReadOnly
-            && self.default_transaction_isolation != TransactionIsolation::Default
-        {
-            return Err(
-                "Oracle does not support combining READ ONLY with an explicit transaction isolation level"
-                    .to_string(),
-            );
+        if let Some(reason) = DatabaseConnection::transaction_mode_selection_error(
+            DatabaseType::Oracle,
+            TransactionMode::new(
+                self.default_transaction_isolation,
+                self.default_transaction_access_mode,
+            ),
+        ) {
+            return Err(reason);
         }
         validate_oracle_nls_format("Oracle NLS date format", self.oracle_nls_date_format.trim())?;
         validate_oracle_nls_format(
@@ -3634,11 +3635,19 @@ impl DbBackend for OracleBackend {
         }
 
         if mode.access_mode == TransactionAccessMode::ReadOnly {
-            if mode.isolation != TransactionIsolation::Default {
-                return Err(
-                    "Oracle does not support combining READ ONLY with an explicit transaction isolation level"
-                        .to_string(),
-                );
+            // An Oracle read-only transaction reads one consistent snapshot —
+            // exactly the SERIALIZABLE read guarantee, with writes forbidden.
+            // So "Serializable + Read only" IS `SET TRANSACTION READ ONLY`,
+            // while statement-level Read committed consistency cannot exist
+            // inside one: that pair has no Oracle behavior to map to.
+            if !matches!(
+                mode.isolation,
+                TransactionIsolation::Default | TransactionIsolation::Serializable
+            ) {
+                return Err(format!(
+                    "Oracle cannot combine {} isolation with READ ONLY: a read-only transaction always reads a single consistent snapshot (Serializable)",
+                    mode.isolation.label()
+                ));
             }
             return Ok(vec![format!(
                 "SET TRANSACTION {}",
@@ -10929,14 +10938,33 @@ mod tests {
     }
 
     #[test]
-    fn oracle_transaction_mode_rejects_read_only_with_explicit_isolation() {
-        let mode = TransactionMode::new(
+    fn oracle_transaction_mode_read_only_isolation_pairs() {
+        // A read-only Oracle transaction IS a serializable snapshot, so the
+        // Serializable + Read only pair maps to SET TRANSACTION READ ONLY.
+        let serializable_read_only = TransactionMode::new(
             TransactionIsolation::Serializable,
             TransactionAccessMode::ReadOnly,
         );
+        assert_eq!(
+            DatabaseConnection::transaction_mode_statements_for(
+                DatabaseType::Oracle,
+                serializable_read_only
+            )
+            .expect("Serializable + Read only is expressible on Oracle"),
+            vec!["SET TRANSACTION READ ONLY"]
+        );
 
-        let err = DatabaseConnection::transaction_mode_statements_for(DatabaseType::Oracle, mode)
-            .expect_err("Oracle cannot combine read-only and explicit isolation");
+        // Statement-level Read committed consistency cannot exist inside a
+        // read-only transaction; that pair stays refused.
+        let read_committed_read_only = TransactionMode::new(
+            TransactionIsolation::ReadCommitted,
+            TransactionAccessMode::ReadOnly,
+        );
+        let err = DatabaseConnection::transaction_mode_statements_for(
+            DatabaseType::Oracle,
+            read_committed_read_only,
+        )
+        .expect_err("Oracle cannot run a read-committed read-only transaction");
         assert!(err.contains("READ ONLY"));
         assert!(err.contains("isolation"));
     }
@@ -10957,19 +10985,37 @@ mod tests {
     #[test]
     fn unsupported_transaction_mode_pairs_are_reported_where_they_are_selected() {
         let awkward = TransactionMode::new(
-            TransactionIsolation::Serializable,
+            TransactionIsolation::ReadCommitted,
             TransactionAccessMode::ReadOnly,
         );
 
         let reason =
             DatabaseConnection::transaction_mode_selection_error(DatabaseType::Oracle, awkward)
-                .expect("Oracle cannot combine read-only with an explicit isolation level");
+                .expect("Oracle cannot run a read-committed read-only transaction");
         assert!(reason.contains("READ ONLY"));
         // The MySQL family expresses the same pair in one statement, so
         // nothing is refused there.
         for db_type in [DatabaseType::MySQL, DatabaseType::MariaDB] {
             assert_eq!(
                 DatabaseConnection::transaction_mode_selection_error(db_type, awkward),
+                None
+            );
+        }
+        // Serializable + Read only is expressible everywhere: on Oracle it is
+        // exactly what SET TRANSACTION READ ONLY provides.
+        for db_type in [
+            DatabaseType::Oracle,
+            DatabaseType::MySQL,
+            DatabaseType::MariaDB,
+        ] {
+            assert_eq!(
+                DatabaseConnection::transaction_mode_selection_error(
+                    db_type,
+                    TransactionMode::new(
+                        TransactionIsolation::Serializable,
+                        TransactionAccessMode::ReadOnly,
+                    )
+                ),
                 None
             );
         }
@@ -11718,9 +11764,15 @@ mod tests {
 
         let err = oracle
             .validate_for_db(DatabaseType::Oracle, false)
-            .expect_err("Oracle READ ONLY must not be combined with explicit isolation");
+            .expect_err("Oracle cannot run a read-committed read-only transaction");
 
-        assert!(err.contains("combining READ ONLY with an explicit transaction isolation level"));
+        assert!(err.contains("READ ONLY"));
+        assert!(err.contains("isolation"));
+
+        // Serializable + Read only is what SET TRANSACTION READ ONLY provides,
+        // so it validates.
+        oracle.default_transaction_isolation = TransactionIsolation::Serializable;
+        assert!(oracle.validate_for_db(DatabaseType::Oracle, false).is_ok());
 
         oracle.default_transaction_isolation = TransactionIsolation::Default;
         assert!(oracle.validate_for_db(DatabaseType::Oracle, false).is_ok());

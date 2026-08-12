@@ -44,7 +44,11 @@ mode does not perform this discovery.
 
 Oracle accepts offsets from `-12:00` through `+14:00`. NLS formats must be
 non-empty and contain only characters accepted by the implementation.
-`READ ONLY` cannot be combined with explicit isolation.
+`READ ONLY` can be combined with `Serializable` isolation (a read-only Oracle
+transaction reads one consistent snapshot, which is exactly the serializable
+guarantee, so the pair maps to `SET TRANSACTION READ ONLY`) but not with
+`Read committed` — statement-level consistency cannot exist inside a
+read-only transaction.
 
 Settings are applied to both primary and pool sessions. Current schema is
 tracked through `ALTER SESSION SET CURRENT_SCHEMA` and reapplied to acquired or

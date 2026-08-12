@@ -974,47 +974,57 @@ fn run_scenarios(target: Target, h: &mut Harness) -> Result<(), String> {
 
     // ---- S13: every combination the toolbar offers must be executable ------
     // The isolation and access-mode choices are independent controls, so the
-    // user can select any pair. Oracle cannot express READ ONLY together with
-    // an explicit isolation level; a pair that can never run must therefore be
-    // refused where it is chosen, not silently pinned onto the tab so that
-    // every later statement fails.
+    // user can select any pair — and every pair the database can express must
+    // really run. Serializable + Read only runs everywhere (on Oracle it IS
+    // SET TRANSACTION READ ONLY: one consistent snapshot, writes forbidden).
+    // Oracle alone cannot run a READ COMMITTED read-only transaction; that
+    // pair must be refused where it is chosen, not silently pinned onto the
+    // tab so that every later statement fails.
     println!("  --- S13 an unsupported isolation/access pair cannot be pinned ---");
-    let awkward = TransactionMode::new(
+    let serializable_read_only = TransactionMode::new(
         TransactionIsolation::Serializable,
         TransactionAccessMode::ReadOnly,
     );
+    let db_type = h.shared.lock().unwrap_or_else(|p| p.into_inner()).db_type();
     let selection_error = space_query::db::DatabaseConnection::transaction_mode_selection_error(
-        h.shared.lock().unwrap_or_else(|p| p.into_inner()).db_type(),
-        awkward,
+        db_type,
+        serializable_read_only,
     );
+    h.check(
+        "S13 Serializable + Read only is accepted everywhere",
+        selection_error.is_none(),
+        format!("unexpected error: {selection_error:?}"),
+    );
+    h.editor.set_tab_transaction_mode(serializable_read_only);
+    let capture = h.run("SELECT V FROM SQ_TM_T")?;
+    h.check(
+        "S13 the accepted pair really runs",
+        capture.results.iter().all(|r| r.success),
+        format!(
+            "results: {:?}",
+            capture
+                .results
+                .iter()
+                .map(|r| (r.success, r.message.clone()))
+                .collect::<Vec<_>>()
+        ),
+    );
+    h.run("ROLLBACK")?;
+    h.editor.clear_tab_transaction_mode_override();
     if target.is_oracle() {
-        h.check(
-            "S13 Oracle reports the unsupported pair when it is selected",
-            selection_error.is_some(),
-            "no error was reported for SERIALIZABLE + READ ONLY".into(),
+        let unrunnable = TransactionMode::new(
+            TransactionIsolation::ReadCommitted,
+            TransactionAccessMode::ReadOnly,
         );
-    } else {
+        let unrunnable_error =
+            space_query::db::DatabaseConnection::transaction_mode_selection_error(
+                db_type, unrunnable,
+            );
         h.check(
-            "S13 the MySQL family accepts the pair",
-            selection_error.is_none(),
-            format!("unexpected error: {selection_error:?}"),
+            "S13 Oracle reports the read-committed read-only pair when it is selected",
+            unrunnable_error.is_some(),
+            "no error was reported for READ COMMITTED + READ ONLY".into(),
         );
-        h.editor.set_tab_transaction_mode(awkward);
-        let capture = h.run("SELECT V FROM SQ_TM_T")?;
-        h.check(
-            "S13 the accepted pair really runs",
-            capture.results.iter().all(|r| r.success),
-            format!(
-                "results: {:?}",
-                capture
-                    .results
-                    .iter()
-                    .map(|r| (r.success, r.message.clone()))
-                    .collect::<Vec<_>>()
-            ),
-        );
-        h.run("ROLLBACK")?;
-        h.editor.clear_tab_transaction_mode_override();
     }
 
     // ---- S7: the status bar's transaction-state source -----------------------
@@ -2837,6 +2847,318 @@ fn run_scenarios(target: Target, h: &mut Harness) -> Result<(), String> {
             ),
         );
         h.run("ROLLBACK")?;
+    }
+
+    // ---- S37 (Oracle): adoption over a READ ONLY pin, both directions ------
+    // Oracle's only query-driven session-persistent mode change is ALTER
+    // SESSION SET ISOLATION_LEVEL. Over a READ ONLY pin the merge lands on an
+    // (isolation, READ ONLY) pair, and those pairs split: Serializable IS
+    // what a read-only Oracle transaction provides (one consistent snapshot),
+    // so that adoption must go through; Read committed cannot exist inside a
+    // read-only transaction, so that adoption must be refused rather than
+    // pinning a pair the toolbar refuses to select — pre-fix it killed the
+    // OCI batch at its next boundary re-application and left the session on
+    // the abandoned level with the toolbar reading Default. The refusal keeps
+    // the conservative session residue instead, which the discard resolves.
+    if target.is_oracle() {
+        println!("  --- S37 an adoption the database cannot express is refused ---");
+        let read_only_pin = TransactionMode::new(
+            TransactionIsolation::Default,
+            TransactionAccessMode::ReadOnly,
+        );
+        h.editor.set_tab_transaction_mode(read_only_pin);
+        let capture = h.run("ALTER SESSION SET ISOLATION_LEVEL = READ COMMITTED")?;
+        h.check(
+            "S37 the ALTER SESSION statement itself succeeds",
+            capture.results.first().is_some_and(|r| r.success),
+            format!(
+                "result: {:?}",
+                capture
+                    .results
+                    .first()
+                    .map(|r| (r.success, r.message.clone()))
+            ),
+        );
+        h.check(
+            "S37 the tab override keeps the READ ONLY pin, not the merged pair",
+            h.editor.tab_transaction_mode_override_value() == Some(read_only_pin),
+            format!(
+                "override: {:?}",
+                h.editor.tab_transaction_mode_override_value()
+            ),
+        );
+        h.check(
+            "S37 no TransactionModeChanged event fires for the refused adoption",
+            capture.mode_changes.is_empty(),
+            format!("mode change events: {:?}", capture.mode_changes),
+        );
+        let residue = h
+            .editor
+            .pooled_session_activity_snapshot()
+            .map(|snapshot| snapshot.retained_state());
+        h.check(
+            "S37 the conservative session residue is kept",
+            residue.is_some_and(|state| {
+                state.may_have_transaction_mode_override() || state.requires_transaction_decision()
+            }),
+            format!("retained state after the refused adoption = {residue:?}"),
+        );
+        // The residue requires resolution, so a typed statement would pop the
+        // resolution dialog (and hang the harness). Resolve it the way the
+        // tab-close path does: discard the session, which also takes the
+        // session-persistent isolation with it.
+        let _ = h.editor.discard_pooled_session_for_close();
+        let v = h.select_v()?;
+        h.check(
+            "S37 the pinned tab still reads after the discard",
+            v >= 1,
+            format!("V = {v}"),
+        );
+        let refused = h.run("INSERT INTO SQ_TM_T VALUES (37)")?;
+        h.check(
+            "S37 the READ ONLY pin still refuses the write",
+            refused.results.first().is_some_and(|result| {
+                !result.success
+                    && read_only_errors.iter().any(|needle| {
+                        result
+                            .message
+                            .to_ascii_lowercase()
+                            .contains(&needle.to_ascii_lowercase())
+                    })
+            }),
+            format!(
+                "insert result: {:?}",
+                refused
+                    .results
+                    .first()
+                    .map(|r| (r.success, r.message.clone()))
+            ),
+        );
+        h.run("ROLLBACK")?;
+        let _ = h.editor.discard_pooled_session_for_close();
+
+        // The expressible direction: SERIALIZABLE over the same pin adopts,
+        // the pair reads, and the pin still refuses the write.
+        println!("  --- S37b a Serializable adoption over the READ ONLY pin goes through ---");
+        h.editor.set_tab_transaction_mode(read_only_pin);
+        let serializable_read_only = TransactionMode::new(
+            TransactionIsolation::Serializable,
+            TransactionAccessMode::ReadOnly,
+        );
+        let capture = h.run("ALTER SESSION SET ISOLATION_LEVEL = SERIALIZABLE")?;
+        h.check(
+            "S37b the ALTER SESSION statement succeeds",
+            capture.results.first().is_some_and(|r| r.success),
+            format!(
+                "result: {:?}",
+                capture
+                    .results
+                    .first()
+                    .map(|r| (r.success, r.message.clone()))
+            ),
+        );
+        h.check(
+            "S37b the tab adopts Serializable + Read only",
+            h.editor.tab_transaction_mode_override_value() == Some(serializable_read_only),
+            format!(
+                "override: {:?}",
+                h.editor.tab_transaction_mode_override_value()
+            ),
+        );
+        h.check(
+            "S37b the adoption notifies the UI",
+            capture.mode_changes.last() == Some(&serializable_read_only),
+            format!("mode change events: {:?}", capture.mode_changes),
+        );
+        let v = h.select_v()?;
+        h.check(
+            "S37b the adopted pair still reads",
+            v >= 1,
+            format!("V = {v}"),
+        );
+        let refused = h.run("INSERT INTO SQ_TM_T VALUES (37)")?;
+        h.check(
+            "S37b the adopted pair still refuses the write",
+            refused.results.first().is_some_and(|result| {
+                !result.success
+                    && read_only_errors.iter().any(|needle| {
+                        result
+                            .message
+                            .to_ascii_lowercase()
+                            .contains(&needle.to_ascii_lowercase())
+                    })
+            }),
+            format!(
+                "insert result: {:?}",
+                refused
+                    .results
+                    .first()
+                    .map(|r| (r.success, r.message.clone()))
+            ),
+        );
+        h.run("ROLLBACK")?;
+        // The adopted ALTER SESSION is session-persistent; the harness clear
+        // below skips the GUI's Default-selection reset, so discard the
+        // session to shed the abandoned level.
+        let _ = h.editor.discard_pooled_session_for_close();
+        h.editor.clear_tab_transaction_mode_override();
+    }
+
+    // ---- S38: a SAVEPOINT survives across executions under a pinned mode ---
+    // Savepoints only exist inside one continuous transaction on one session,
+    // so this is the sharpest cross-execution probe the feature has: if the
+    // app re-applies the pinned mode mid-transaction (Oracle: ORA-01453), or
+    // the MySQL family's per-statement session setup slips a ROLLBACK between
+    // the user's statements (the S18 BUG B shape), the second execution's
+    // ROLLBACK TO SAVEPOINT fails ("savepoint does not exist") instead of
+    // silently running under a broken transaction.
+    println!("  --- S38 a savepoint survives across executions under a pin ---");
+    h.editor.set_tab_transaction_mode(TransactionMode::new(
+        TransactionIsolation::Serializable,
+        TransactionAccessMode::ReadWrite,
+    ));
+    let first = h.run(
+        "INSERT INTO SQ_TM_T VALUES (3801);\n\
+         SAVEPOINT SQ_TM_SP;\n\
+         INSERT INTO SQ_TM_T VALUES (3802);\n",
+    )?;
+    h.check(
+        "S38 the batch that creates the savepoint runs whole",
+        first.results.len() >= 3 && first.results.iter().all(|r| r.success),
+        format!(
+            "results: {:?}",
+            first
+                .results
+                .iter()
+                .map(|r| (r.success, r.message.clone()))
+                .collect::<Vec<_>>()
+        ),
+    );
+    let second = h.run(
+        "ROLLBACK TO SAVEPOINT SQ_TM_SP;\n\
+         INSERT INTO SQ_TM_T VALUES (3803);\n",
+    )?;
+    h.check(
+        "S38 the next execution still sees the savepoint",
+        second.results.len() >= 2 && second.results.iter().all(|r| r.success),
+        format!(
+            "results: {:?}",
+            second
+                .results
+                .iter()
+                .map(|r| (r.success, r.message.clone()))
+                .collect::<Vec<_>>()
+        ),
+    );
+    let kept = h.select_scalar("SELECT COUNT(*) FROM SQ_TM_T WHERE V IN (3801, 3803)")?;
+    let discarded = h.select_scalar("SELECT COUNT(*) FROM SQ_TM_T WHERE V = 3802")?;
+    h.check(
+        "S38 the partial rollback kept exactly the rows outside the savepoint",
+        kept.trim() == "2" && discarded.trim() == "0",
+        format!("rows kept (3801,3803) = {kept:?}, rolled back (3802) = {discarded:?}"),
+    );
+    h.run("ROLLBACK")?;
+    let remaining =
+        h.select_scalar("SELECT COUNT(*) FROM SQ_TM_T WHERE V IN (3801, 3802, 3803)")?;
+    h.check(
+        "S38 everything was one open transaction: the rollback takes it all back",
+        remaining.trim() == "0",
+        format!("rows left after ROLLBACK = {remaining:?}"),
+    );
+    h.editor.clear_tab_transaction_mode_override();
+    // SAVEPOINT tracking leaves conservative session-bound residue on the
+    // MySQL family; discard the session the way the tab-close path does so it
+    // cannot block the next scenario.
+    let _ = h.editor.discard_pooled_session_for_close();
+
+    // ---- S39 (MySQL family): COMMIT AND CHAIN under the tab's pin ----------
+    // AND CHAIN is the one transaction OPENER the client gate deliberately
+    // lets through on every tab: the chained transaction inherits the
+    // isolation level AND access mode of the one it commits (raw-verified on
+    // both servers). Two halves: the chained transaction must be tracked as
+    // open user work (rollback-able, close prompt truthful), and it must NOT
+    // be an escape route around a READ ONLY pin.
+    if !target.is_oracle() {
+        println!("  --- S39 COMMIT AND CHAIN keeps the chain and the pin ---");
+        h.editor.set_tab_transaction_mode(TransactionMode::new(
+            TransactionIsolation::RepeatableRead,
+            TransactionAccessMode::ReadWrite,
+        ));
+        let capture = h.run(
+            "START TRANSACTION;\n\
+             INSERT INTO SQ_TM_T VALUES (3901);\n\
+             COMMIT AND CHAIN;\n\
+             INSERT INTO SQ_TM_T VALUES (3902);\n",
+        )?;
+        h.check(
+            "S39 the chained batch runs whole",
+            capture.results.len() >= 4 && capture.results.iter().all(|r| r.success),
+            format!(
+                "results: {:?}",
+                capture
+                    .results
+                    .iter()
+                    .map(|r| (r.success, r.message.clone()))
+                    .collect::<Vec<_>>()
+            ),
+        );
+        let chained_state = h
+            .editor
+            .pooled_session_activity_snapshot()
+            .map(|snapshot| snapshot.retained_state());
+        h.check(
+            "S39 the chained transaction is tracked as open user work",
+            chained_state.is_some_and(|state| state.may_have_uncommitted_work()),
+            format!("retained state after COMMIT AND CHAIN = {chained_state:?}"),
+        );
+        h.run("ROLLBACK")?;
+        let committed = h.select_scalar("SELECT COUNT(*) FROM SQ_TM_T WHERE V = 3901")?;
+        let chained = h.select_scalar("SELECT COUNT(*) FROM SQ_TM_T WHERE V = 3902")?;
+        h.check(
+            "S39 AND CHAIN committed the first transaction and the rollback took the second",
+            committed.trim() == "1" && chained.trim() == "0",
+            format!("committed (3901) = {committed:?}, chained (3902) = {chained:?}"),
+        );
+        h.run("DELETE FROM SQ_TM_T WHERE V = 3901")?;
+        h.run("COMMIT")?;
+
+        // The READ ONLY half: the chained transaction inherits the pinned
+        // access mode, so the write after AND CHAIN is refused by the server
+        // (ER 1792) — chaining is not an escape.
+        h.editor.set_tab_transaction_mode(TransactionMode::new(
+            TransactionIsolation::Default,
+            TransactionAccessMode::ReadOnly,
+        ));
+        let capture = h.run(
+            "SELECT V FROM SQ_TM_T;\n\
+             COMMIT AND CHAIN;\n\
+             INSERT INTO SQ_TM_T VALUES (3903);\n",
+        )?;
+        let insert_result = capture.results.last().cloned();
+        h.check(
+            "S39 the write after COMMIT AND CHAIN is still refused on a READ ONLY tab",
+            capture.results.len() >= 3
+                && insert_result.as_ref().is_some_and(|result| {
+                    !result.success
+                        && read_only_errors.iter().any(|needle| {
+                            result
+                                .message
+                                .to_ascii_lowercase()
+                                .contains(&needle.to_ascii_lowercase())
+                        })
+                }),
+            format!(
+                "results: {:?}",
+                capture
+                    .results
+                    .iter()
+                    .map(|r| (r.success, r.message.clone()))
+                    .collect::<Vec<_>>()
+            ),
+        );
+        h.run("ROLLBACK")?;
+        h.editor.clear_tab_transaction_mode_override();
+        let _ = h.editor.discard_pooled_session_for_close();
     }
 
     {

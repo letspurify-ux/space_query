@@ -21531,6 +21531,16 @@ impl SqlEditorWidget {
             return false;
         };
         let mode = change.applied_to(*active_transaction_mode);
+        // A merge this database cannot express (Oracle: an explicit isolation
+        // level over a READ ONLY pin) must not be adopted: the toolbar refuses
+        // to SELECT that pair, and the batch's boundary re-application has no
+        // statements for it. Returning false keeps the conservative
+        // session-residue tracking, the same treatment any unrepresentable
+        // session change gets.
+        if crate::db::DatabaseConnection::transaction_mode_selection_error(db_type, mode).is_some()
+        {
+            return false;
+        }
         *active_transaction_mode = mode;
         if let Some(slot) = tab_transaction_mode_override {
             store_mutex_transaction_mode_option(slot, Some(mode));
@@ -24828,6 +24838,67 @@ impl SqlEditorWidget {
 fn test_query_progress_channel() -> (QueryProgressSender, mpsc::Receiver<QueryProgress>) {
     let (sender, receiver) = mpsc::channel();
     (QueryProgressSender::new(sender), receiver)
+}
+
+#[cfg(test)]
+mod session_transaction_mode_adoption_tests {
+    use super::SqlEditorWidget;
+    use crate::db::{DatabaseType, TransactionAccessMode, TransactionIsolation, TransactionMode};
+    use std::sync::{Arc, Mutex};
+
+    #[test]
+    fn adoption_refuses_a_merge_the_database_cannot_express() {
+        let (sender, receiver) = super::test_query_progress_channel();
+        let read_only_pin = TransactionMode::new(
+            TransactionIsolation::Default,
+            TransactionAccessMode::ReadOnly,
+        );
+        let mut active = read_only_pin;
+        let pin = Arc::new(Mutex::new(Some(read_only_pin)));
+        let adopted = SqlEditorWidget::adopt_session_transaction_mode_change_after_statement(
+            DatabaseType::Oracle,
+            "ALTER SESSION SET ISOLATION_LEVEL = READ COMMITTED",
+            &mut active,
+            Some(&pin),
+            &sender,
+        );
+        assert!(
+            !adopted,
+            "Oracle cannot run a read-committed read-only transaction, \
+             so the merge must not be adopted"
+        );
+        assert_eq!(active, read_only_pin, "the active mode must stay untouched");
+        assert_eq!(
+            *pin.lock().expect("pin lock"),
+            Some(read_only_pin),
+            "the tab override must stay untouched"
+        );
+        assert!(
+            receiver.try_recv().is_err(),
+            "no UI event may fire for a refused adoption"
+        );
+
+        // Serializable over a READ ONLY pin IS expressible (a read-only
+        // Oracle transaction reads a serializable snapshot), so it adopts.
+        let mut active = read_only_pin;
+        let pin = Arc::new(Mutex::new(Some(read_only_pin)));
+        let adopted = SqlEditorWidget::adopt_session_transaction_mode_change_after_statement(
+            DatabaseType::Oracle,
+            "ALTER SESSION SET ISOLATION_LEVEL = SERIALIZABLE",
+            &mut active,
+            Some(&pin),
+            &sender,
+        );
+        assert!(adopted, "an expressible merge must still be adopted");
+        assert_eq!(
+            active,
+            TransactionMode::new(
+                TransactionIsolation::Serializable,
+                TransactionAccessMode::ReadOnly,
+            )
+        );
+        assert_eq!(*pin.lock().expect("pin lock"), Some(active));
+    }
 }
 
 #[cfg(test)]

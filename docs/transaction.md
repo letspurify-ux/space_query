@@ -140,11 +140,16 @@ gate — `SET SESSION TRANSACTION READ ONLY` survives the commit by itself.
 ### Unrunnable isolation/access pairs are refused at selection
 
 Isolation and access mode are independent choices, so a user can select a pair
-a backend has no statement for (Oracle cannot combine READ ONLY with an
-explicit isolation level). `update_transaction_mode_from_controls()` checks
-`DatabaseConnection::transaction_mode_selection_error()` and refuses the pair
-where it is chosen, instead of pinning a mode that makes every later statement
-fail.
+a backend has no statement for (Oracle cannot run a READ COMMITTED read-only
+transaction; Serializable + Read only IS expressible — it is exactly what
+`SET TRANSACTION READ ONLY` provides). `update_transaction_mode_from_controls()`
+checks `DatabaseConnection::transaction_mode_selection_error()` and refuses the
+pair where it is chosen, instead of pinning a mode that makes every later
+statement fail. The query-driven adoption path applies the same rule: a
+session-persistent statement whose merge with the tab's mode lands on an
+unexpressible pair is not adopted
+(`adopt_session_transaction_mode_change_after_statement`), leaving the
+conservative session residue in place.
 
 ### Screen = session guarantee
 
