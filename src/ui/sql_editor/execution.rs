@@ -24159,10 +24159,15 @@ impl SqlEditorWidget {
         // the same need with a harsher failure: the server refuses it over any
         // open transaction (XAER_OUTSIDE) instead of implicitly committing,
         // and the app's own bookkeeping reads leave one open under
-        // autocommit=0.
+        // autocommit=0. The assignment spelling of the one-shot
+        // (`SET @@transaction_isolation = ...`) hits the same ER 1568 as the
+        // word form and needs the same boundary.
         let statement_requires_transaction_boundary =
             Self::is_transaction_first_statement(statement_sql)
-                || crate::db::transaction::mysql_statement_starts_xa_transaction(statement_sql);
+                || crate::db::transaction::mysql_statement_starts_xa_transaction(statement_sql)
+                || crate::db::transaction::mysql_statement_sets_next_transaction_mode_override(
+                    statement_sql,
+                );
         let (
             connection_generation,
             pool_context_epoch,

@@ -269,6 +269,29 @@ fn mariadb_set_statement_inner_sql_from_prepared(sql: &str) -> Option<String> {
     (!inner_sql.is_empty()).then(|| inner_sql.to_string())
 }
 
+/// The assignment list of a MariaDB `SET STATEMENT <assignments> FOR <stmt>`
+/// wrapper — the statement-scoped system-variable values the server applies
+/// for the duration of the inner statement. `None` when `sql` is not a
+/// SET STATEMENT wrapper.
+pub(crate) fn mariadb_set_statement_assignments_sql(sql: &str) -> Option<String> {
+    let stripped_sql = strip_leading_comments_and_whitespace_with_mode(sql, true);
+    let stripped_sql = mysql_sql_with_executable_comments_expanded(stripped_sql);
+    let sql = stripped_sql.as_ref();
+    let (set_token, _, after_set) = next_top_level_word(sql, 0, true)?;
+    if set_token != "SET" {
+        return None;
+    }
+
+    let (statement_token, _, after_statement) = next_top_level_word(sql, after_set, true)?;
+    if statement_token != "STATEMENT" {
+        return None;
+    }
+
+    let for_start = find_top_level_word(sql, after_statement, "FOR", true)?;
+    let assignments = sql[after_statement..for_start].trim();
+    (!assignments.is_empty()).then(|| assignments.to_string())
+}
+
 fn find_top_level_word(
     sql: &str,
     mut idx: usize,

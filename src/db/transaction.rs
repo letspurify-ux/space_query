@@ -4,9 +4,9 @@ use serde::{Deserialize, Serialize};
 
 use crate::db::connection::DatabaseType;
 use crate::db::sql_classification::{
-    mariadb_set_statement_inner_sql, mysql_sql_with_executable_comments_expanded,
-    sql_contains_word_sequence_any_depth_for_db_type, strip_leading_comments_and_whitespace,
-    SqlKind, SqlStatementAnalysis,
+    mariadb_set_statement_assignments_sql, mariadb_set_statement_inner_sql,
+    mysql_sql_with_executable_comments_expanded, sql_contains_word_sequence_any_depth_for_db_type,
+    strip_leading_comments_and_whitespace, SqlKind, SqlStatementAnalysis,
 };
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -3224,10 +3224,26 @@ fn mysql_load_index_statement(analysis: &SqlStatementAnalysis<'_>) -> bool {
 /// client-side — the same promise the Oracle client gate keeps. The
 /// session-scoped forms are deliberately not escapes: they are adopted into
 /// the tab and re-pin it honestly.
+///
+/// The same one-shot exists in two more spellings the server honours over the
+/// session characteristic (both live-verified to land a write):
+/// `SET @@transaction_read_only = 0` (bare `@@` is next-transaction scope, and
+/// the pending value is invisible to a `@@transaction_read_only` readback), and
+/// MariaDB's statement-scoped `SET STATEMENT transaction_read_only=0 FOR
+/// <write>`. A value that is not literally true is refused conservatively: the
+/// server rejects invalid values anyway, so nothing runnable is lost.
 pub(crate) fn mysql_statement_escapes_read_only_transaction_for_db_type(
     db_type: DatabaseType,
     sql: &str,
 ) -> bool {
+    // The statement-scoped `SET STATEMENT ... FOR` wrapper is MariaDB-only.
+    let checks_set_statement_wrapper = match db_type {
+        DatabaseType::MariaDB => true,
+        DatabaseType::MySQL | DatabaseType::Oracle => false,
+    };
+    if checks_set_statement_wrapper && mariadb_set_statement_wrapper_forces_read_write(sql) {
+        return true;
+    }
     let effective_sql = mysql_effective_statement_sql_for_db_type(db_type, sql);
     let analysis = SqlStatementAnalysis::new_for_db_type(db_type, &effective_sql);
     let words = analysis.words();
@@ -3239,7 +3255,75 @@ pub(crate) fn mysql_statement_escapes_read_only_transaction_for_db_type(
             .windows(2)
             .any(|pair| pair[0] == "READ" && pair[1] == "WRITE");
     }
-    false
+    mysql_set_assignment_forces_next_transaction_read_write(&effective_sql)
+}
+
+/// True when a `SET` statement's assignments include a one-shot
+/// (next-transaction) `transaction_read_only`/`tx_read_only` whose value is
+/// not literally true — the assignment spelling of `SET TRANSACTION READ
+/// WRITE`.
+fn mysql_set_assignment_forces_next_transaction_read_write(sql: &str) -> bool {
+    let cleaned = mysql_statement_without_comments(sql);
+    let Some(assignments) = mysql_set_assignments_body(&cleaned) else {
+        return false;
+    };
+    mysql_split_unquoted_assignments(assignments)
+        .into_iter()
+        .any(|assignment| {
+            if mysql_transaction_mode_assignment_scope(assignment)
+                != Some(MySqlTransactionModeAssignmentScope::NextTransaction)
+            {
+                return false;
+            }
+            let Some((target, value)) = mysql_set_assignment_target_and_value(assignment) else {
+                return false;
+            };
+            let target = mysql_normalized_set_assignment_target(target);
+            let Some(target) = target.strip_prefix("@@") else {
+                return false;
+            };
+            matches!(target, "TRANSACTION_READ_ONLY" | "TX_READ_ONLY")
+                && mysql_set_assignment_literal_value(value)
+                    .and_then(mysql_set_assignment_boolean_value)
+                    != Some(true)
+        })
+}
+
+/// True when a MariaDB `SET STATEMENT ... FOR <stmt>` wrapper sets
+/// `transaction_read_only`/`tx_read_only` to a value that is not literally
+/// true — a statement-scoped READ WRITE the server honours over a READ ONLY
+/// session characteristic for the inner statement.
+fn mariadb_set_statement_wrapper_forces_read_write(sql: &str) -> bool {
+    let Some(assignments) = mariadb_set_statement_assignments_sql(sql) else {
+        return false;
+    };
+    mysql_split_unquoted_assignments(&assignments)
+        .into_iter()
+        .any(|assignment| {
+            let Some((target, value)) = mysql_set_assignment_target_and_value(assignment) else {
+                return false;
+            };
+            let target = mysql_normalized_set_assignment_target(target);
+            matches!(target.as_str(), "TRANSACTION_READ_ONLY" | "TX_READ_ONLY")
+                && mysql_set_assignment_literal_value(value)
+                    .and_then(mysql_set_assignment_boolean_value)
+                    != Some(true)
+        })
+}
+
+/// True when `sql` sets a one-shot (next-transaction) transaction-mode value
+/// through the assignment spelling (`SET @@transaction_isolation = ...`,
+/// `SET @@transaction_read_only = ...`). Like the `SET TRANSACTION` word form,
+/// the server refuses these while any transaction is open (ER 1568) —
+/// including the implicit one the app's own bookkeeping reads leave behind
+/// under autocommit=0 — so the pooled-session setup must bring the session
+/// back to a transaction boundary for them.
+pub(crate) fn mysql_statement_sets_next_transaction_mode_override(sql: &str) -> bool {
+    let effective_sql = match mariadb_set_statement_inner_sql(sql) {
+        Some(inner_sql) => Cow::Owned(inner_sql),
+        None => Cow::Borrowed(sql),
+    };
+    mysql_set_transaction_mode_assignment_sets_next_override(&effective_sql)
 }
 
 /// True when `sql` starts an XA transaction (`XA START` / `XA BEGIN`) on the
@@ -6746,22 +6830,45 @@ mod tests {
                     "{sql} must be treated as a READ WRITE escape on {db_type}"
                 );
             }
+            // The assignment spelling of the same one-shot: bare @@ is
+            // next-transaction scope, and the pending value is invisible to a
+            // readback, so it must be refused exactly like the word form. A
+            // non-literal value is refused conservatively.
+            for sql in [
+                "SET @@transaction_read_only = 0",
+                "set @@tx_read_only=OFF",
+                "SET @@transaction_read_only = FALSE",
+                "SET @x = 'a', @@transaction_read_only = 0",
+                "SET @@transaction_read_only = @rw",
+            ] {
+                assert!(
+                    mysql_statement_escapes_read_only_transaction_for_db_type(db_type, sql),
+                    "{sql} must be treated as a READ WRITE escape on {db_type}"
+                );
+            }
             for sql in [
                 // Session-scoped forms are adopted and re-pin the tab; the
                 // toolbar stays honest, so they are not escapes.
                 "SET SESSION TRANSACTION READ WRITE",
                 "SET LOCAL TRANSACTION READ WRITE",
                 "SET SESSION transaction_read_only = OFF",
+                "SET @@session.transaction_read_only = 0",
                 // Global scope does not touch this session's transaction.
                 "SET GLOBAL TRANSACTION READ WRITE",
+                "SET @@global.transaction_read_only = 0",
                 // No explicit access mode: the session characteristic governs.
                 "SET TRANSACTION ISOLATION LEVEL SERIALIZABLE",
+                "SET @@transaction_isolation = 'SERIALIZABLE'",
+                // Staying read-only is not an escape.
+                "SET @@transaction_read_only = 1",
+                "SET @@tx_read_only = ON",
                 "START TRANSACTION",
                 "START TRANSACTION READ ONLY",
                 "START TRANSACTION WITH CONSISTENT SNAPSHOT",
                 "BEGIN",
                 // User-variable SETs are not transaction statements at all.
                 "SET @start = 'TRANSACTION READ WRITE'",
+                "SET @ro = '@@transaction_read_only = 0'",
                 // Reads mentioning the words are not statements of intent.
                 "SELECT 'SET TRANSACTION READ WRITE'",
                 "INSERT INTO t VALUES (1)",
@@ -6780,6 +6887,69 @@ mod tests {
             ),
             "a SET STATEMENT wrapper must not hide the READ WRITE escape"
         );
+        // MariaDB's statement-scoped wrapper is itself an escape when it sets
+        // the read-only characteristic off for the inner statement
+        // (live-verified: the inner write lands over a READ ONLY session).
+        for sql in [
+            "SET STATEMENT transaction_read_only=0 FOR INSERT INTO t VALUES (1)",
+            "SET STATEMENT max_statement_time=10, tx_read_only=OFF FOR UPDATE t SET v = 1",
+        ] {
+            assert!(
+                mysql_statement_escapes_read_only_transaction_for_db_type(
+                    DatabaseType::MariaDB,
+                    sql
+                ),
+                "{sql} must be treated as a READ WRITE escape on MariaDB"
+            );
+        }
+        for sql in [
+            // The read-only direction and unrelated wrapper variables obey the
+            // session characteristic for the inner statement.
+            "SET STATEMENT transaction_read_only=1 FOR INSERT INTO t VALUES (1)",
+            "SET STATEMENT max_statement_time=10 FOR SELECT 1",
+            "SET STATEMENT sql_mode='ANSI' FOR SELECT 'tx_read_only=0'",
+        ] {
+            assert!(
+                !mysql_statement_escapes_read_only_transaction_for_db_type(
+                    DatabaseType::MariaDB,
+                    sql
+                ),
+                "{sql} must not be treated as a READ WRITE escape on MariaDB"
+            );
+        }
+    }
+
+    #[test]
+    fn mysql_one_shot_assignment_spellings_require_a_transaction_boundary() {
+        for sql in [
+            "SET @@transaction_isolation = 'SERIALIZABLE'",
+            "set @@TX_ISOLATION = 'READ-COMMITTED'",
+            "SET @@transaction_read_only = 1",
+            "SET @@tx_read_only = 0",
+            "/* c */ SET @x = 1, @@transaction_isolation = 'SERIALIZABLE'",
+        ] {
+            assert!(
+                mysql_statement_sets_next_transaction_mode_override(sql),
+                "{sql} sets a one-shot transaction mode, which the server refuses over \
+                 any open transaction (ER 1568) — it needs a boundary prepare"
+            );
+        }
+        for sql in [
+            // Session/global scopes are not one-shots; the word form is
+            // covered by is_transaction_first_statement instead.
+            "SET @@session.transaction_isolation = 'SERIALIZABLE'",
+            "SET SESSION transaction_read_only = 1",
+            "SET @@global.transaction_isolation = 'SERIALIZABLE'",
+            "SET autocommit = 0",
+            "SET @@transaction_isolation_extra = 1",
+            "SET @one = '@@transaction_isolation'",
+            "SELECT @@transaction_isolation",
+        ] {
+            assert!(
+                !mysql_statement_sets_next_transaction_mode_override(sql),
+                "{sql} must not force a transaction-boundary prepare"
+            );
+        }
     }
 
     #[test]

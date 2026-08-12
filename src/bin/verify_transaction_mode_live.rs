@@ -57,6 +57,12 @@
 //       still reads, and still writes exactly when its access mode allows it.
 //   S32 the pin survives a change of the tab's scope (the object browser's
 //       database/schema selection), which re-applies the session context.
+//   S35 (MySQL family) the assignment spellings of the READ WRITE escape
+//       (SET @@transaction_read_only = 0; MariaDB SET STATEMENT
+//       transaction_read_only=0 FOR <write>) are refused on a READ ONLY tab.
+//   S36 (MySQL family) the one-shot assignment spelling
+//       (SET @@transaction_isolation = ...) gets the same transaction-boundary
+//       prepare as the SET TRANSACTION word form, and stays a one-shot.
 //
 // Usage: verify_transaction_mode_live <thin|oci|mysql|mariadb|all>
 
@@ -2653,6 +2659,185 @@ fn run_scenarios(target: Target, h: &mut Harness) -> Result<(), String> {
     // the session the way the tab's close path does so it cannot block the
     // scenario after this one.
     let _ = h.editor.discard_pooled_session_for_close();
+
+    // ---- S35 (MySQL family): assignment spellings of the READ WRITE escape --
+    // The one-shot of S30 exists in two more spellings the server honours over
+    // the READ ONLY session characteristic (both raw-verified to land a
+    // write): `SET @@transaction_read_only = 0` — bare @@ is next-transaction
+    // scope, and the pending value is INVISIBLE to a readback of the same
+    // variable, so the settings fast path cannot catch it — and MariaDB's
+    // statement-scoped `SET STATEMENT transaction_read_only=0 FOR <write>`.
+    // The client gate must refuse them like the word forms, and pin WHICH
+    // defense refused: the client message, not a server error.
+    if !target.is_oracle() {
+        println!("  --- S35 assignment spellings cannot escape a READ ONLY tab ---");
+        h.toolbar_transaction_mode(TransactionMode::new(
+            TransactionIsolation::Default,
+            TransactionAccessMode::ReadOnly,
+        ));
+        let capture =
+            h.run("SET @@transaction_read_only = 0;\nINSERT INTO SQ_TM_T VALUES (35);")?;
+        let first = capture.results.first().cloned();
+        h.check(
+            "S35 the @@ one-shot escape is refused by the client gate",
+            first.as_ref().is_some_and(|result| {
+                !result.success
+                    && result
+                        .message
+                        .to_ascii_lowercase()
+                        .contains("read only mode blocks")
+            }),
+            format!(
+                "one-shot assignment escape: {:?}",
+                first.map(|r| (r.success, r.message))
+            ),
+        );
+        h.check(
+            "S35 the refusal stops the batch before the write",
+            !capture
+                .results
+                .iter()
+                .any(|result| result.sql.to_ascii_uppercase().contains("INSERT")),
+            format!(
+                "batch results: {:?}",
+                capture
+                    .results
+                    .iter()
+                    .map(|r| (r.sql.clone(), r.success))
+                    .collect::<Vec<_>>()
+            ),
+        );
+        if target == Target::MariaDb {
+            let capture =
+                h.run("SET STATEMENT transaction_read_only=0 FOR INSERT INTO SQ_TM_T VALUES (35)")?;
+            let first = capture.results.first().cloned();
+            h.check(
+                "S35 the SET STATEMENT escape is refused by the client gate",
+                first.as_ref().is_some_and(|result| {
+                    !result.success
+                        && result
+                            .message
+                            .to_ascii_lowercase()
+                            .contains("read only mode blocks")
+                }),
+                format!(
+                    "SET STATEMENT escape: {:?}",
+                    first.map(|r| (r.success, r.message))
+                ),
+            );
+        }
+        h.editor.clear_tab_transaction_mode_override();
+        let _ = h.editor.discard_pooled_session_for_close();
+        let leaked = h.select_scalar("SELECT COUNT(*) FROM SQ_TM_T WHERE V = 35")?;
+        h.check(
+            "S35 no row landed through an assignment-spelling escape",
+            leaked.trim() == "0",
+            format!("COUNT(*) WHERE V = 35 = {leaked}"),
+        );
+        h.run("ROLLBACK")?;
+    }
+
+    // ---- S36 (MySQL family): the @@ one-shot gets its transaction boundary --
+    // The word form `SET TRANSACTION ...` must be the first statement of its
+    // transaction and the pooled-session setup prepares a boundary for it; the
+    // assignment spelling `SET @@transaction_isolation = ...` hits the same
+    // ER 1568 over the implicit transaction the app's own bookkeeping reads
+    // leave behind under autocommit=0 — failing for a transaction the user
+    // never opened. It must run like the word form, and stay a one-shot: no
+    // tab pin, no UI event.
+    if !target.is_oracle() {
+        println!("  --- S36 the @@ one-shot works like SET TRANSACTION ---");
+        h.editor.clear_tab_transaction_mode_override();
+        let _ = h.editor.discard_pooled_session_for_close();
+        // Leave a read on the session, like S33: MariaDB's truthful probe
+        // preserves the read transaction (the user's documented way out is
+        // ROLLBACK), while MySQL's probe answers "clean" for it, so the
+        // one-shot must survive the session's residual transaction WITHOUT a
+        // user ROLLBACK — the exact sequence that used to die with ER 1568.
+        h.run("SELECT V FROM SQ_TM_T")?;
+        if target == Target::MariaDb {
+            h.run("ROLLBACK")?;
+        }
+        let capture = h.run("SET @@transaction_isolation = 'SERIALIZABLE'")?;
+        h.check(
+            "S36 the isolation one-shot runs over the session's residual transaction",
+            capture.results.first().is_some_and(|result| result.success),
+            format!(
+                "one-shot assignment: {:?}",
+                capture
+                    .results
+                    .first()
+                    .map(|r| (r.success, r.message.clone()))
+            ),
+        );
+        h.check(
+            "S36 the one-shot pins nothing on the tab",
+            h.editor.tab_transaction_mode_override_value().is_none()
+                && capture.mode_changes.is_empty(),
+            format!(
+                "override: {:?}, mode change events: {:?}",
+                h.editor.tab_transaction_mode_override_value(),
+                capture.mode_changes
+            ),
+        );
+        // Consume the pending one-shot the way S4 does (single statements on
+        // purpose: a script never classifies as the consumer).
+        h.run("START TRANSACTION")?;
+        h.run("ROLLBACK")?;
+        // The read-only direction proves the one-shot really reached the
+        // server: on an UNPINNED tab the client gate stays out of the way,
+        // its consumer is refused by the SERVER, and the transaction after
+        // that one runs read-write again — one-shot semantics end to end.
+        let capture = h.run("SET @@transaction_read_only = 1")?;
+        h.check(
+            "S36 the read-only one-shot runs on an unpinned tab",
+            capture.results.first().is_some_and(|result| result.success),
+            format!(
+                "read-only one-shot: {:?}",
+                capture
+                    .results
+                    .first()
+                    .map(|r| (r.success, r.message.clone()))
+            ),
+        );
+        let refused = h.run("INSERT INTO SQ_TM_T VALUES (36)")?;
+        h.check(
+            "S36 the server refuses the one-shot's consumer write",
+            refused.results.first().is_some_and(|result| {
+                !result.success
+                    && result
+                        .message
+                        .to_ascii_lowercase()
+                        .contains("read only transaction")
+            }),
+            format!(
+                "consumer write: {:?}",
+                refused
+                    .results
+                    .first()
+                    .map(|r| (r.success, r.message.clone()))
+            ),
+        );
+        // The refused consumer leaves the session inside the one-shot's
+        // read-only transaction with a failed DML on it — conservative
+        // residue that requires resolution, so ANY typed statement would pop
+        // the resolution dialog (and hang the harness). Resolve it the way
+        // the tab-close path does, like S18/S33: discard the session.
+        let _ = h.editor.discard_pooled_session_for_close();
+        let after = h.run("INSERT INTO SQ_TM_T VALUES (36)")?;
+        h.check(
+            "S36 the tab writes again once the one-shot's session is resolved",
+            after.results.first().is_some_and(|result| result.success),
+            format!(
+                "write after the one-shot: {:?}",
+                after
+                    .results
+                    .first()
+                    .map(|r| (r.success, r.message.clone()))
+            ),
+        );
+        h.run("ROLLBACK")?;
+    }
 
     {
         let mut guard = h.shared.lock().unwrap_or_else(|p| p.into_inner());
