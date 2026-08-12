@@ -6403,7 +6403,7 @@ mod transaction_action_tests {
     use super::{
         ensure_retained_session_resolution_action_allowed,
         ensure_retained_session_transaction_action_allowed,
-        retained_session_disposition_after_late_cancelled_transaction_action, SqlEditorWidget,
+        retained_session_disposition_after_late_cancelled_transaction_action,
     };
     use crate::db::{
         RetainedSessionDisposition, RetainedSessionResolutionAction, RetainedSessionState,

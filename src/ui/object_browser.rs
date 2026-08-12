@@ -393,6 +393,11 @@ type ConnectionScopeChangeCallback = Arc<Mutex<Option<Box<dyn FnMut(ConnectionId
 type ConnectionScopeSwitchPreflightCallback =
     Arc<Mutex<Option<Box<dyn FnMut(ConnectionId) -> Result<(), String>>>>>;
 type MetadataCallback = Arc<Mutex<Option<Box<dyn FnMut(ObjectBrowserMetadataSnapshot)>>>>;
+/// The app-facing metadata callback carries the tab whose card produced the
+/// catalog: delivery can be deferred, and by the time it lands the active tab
+/// may be another one.
+type TabMetadataCallback =
+    Arc<Mutex<Option<Box<dyn FnMut(QueryTabId, ObjectBrowserMetadataSnapshot)>>>>;
 
 #[derive(Clone)]
 pub enum ObjectItem {
@@ -1141,11 +1146,10 @@ impl ObjectBrowserWidget {
         self.scope_names_match(db_type, self.metadata_requested_scope().as_deref(), scope)
     }
 
-    /// Whether `other`'s current selection — which, for a card that has not
-    /// loaded, is the request it would make — names the same place this
-    /// card's catalog was read for. Judged entirely with THIS card's database
-    /// type and option list, since `other` may know neither yet.
-    fn selection_matches_request(&self, other: &ObjectBrowserWidget) -> bool {
+    /// Whether `other` is asking the same question this card's catalog
+    /// answers. Judged entirely with THIS card's database type and option
+    /// list, since `other` may know neither yet.
+    fn request_matches_request_of(&self, other: &ObjectBrowserWidget) -> bool {
         let db_type = *self
             .current_db_type
             .lock()
@@ -1153,7 +1157,7 @@ impl ObjectBrowserWidget {
         self.scope_names_match(
             db_type,
             self.metadata_requested_scope().as_deref(),
-            other.selected_scope().as_deref(),
+            other.metadata_requested_scope().as_deref(),
         )
     }
 
@@ -1263,10 +1267,6 @@ impl ObjectBrowserWidget {
             source.refresh_connection_generation.load(Ordering::Acquire),
             Ordering::AcqRel,
         );
-        *self
-            .metadata_requested_scope
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner()) = source.metadata_requested_scope();
         // Claim the scope FIRST: `set_selected_scope` treats a change of
         // scope as "the catalog no longer describes this card" and clears the
         // loaded flag, which would undo the stamp below.
@@ -1277,6 +1277,14 @@ impl ObjectBrowserWidget {
         // exactly as fresh as what it was copied from.
         self.metadata_serial
             .store(source.metadata_serial(), Ordering::Release);
+        // Inherit the source's REQUEST, not the name it resolved to. Taking
+        // the resolved name would turn "wherever the session lands" into an
+        // explicit schema, and the next card asking for the default would no
+        // longer recognise this one as an answer to the same question.
+        *self
+            .metadata_requested_scope
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = source.metadata_requested_scope();
         self.metadata_loaded.store(true, Ordering::Release);
         if self.tree.visible_r() {
             self.rebuild_tree_from_cache(db_type, &cache);
@@ -1361,14 +1369,24 @@ impl ObjectBrowserWidget {
         let normalized_scope = scope
             .map(|scope| scope.trim().to_string())
             .filter(|scope| !scope.is_empty());
-        let previous_scope = self.selected_scope();
         let db_type = *self
             .current_db_type
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if !Self::scope_values_match_for_db_type(
+        // Compared against what the held catalog was ASKED for, not against
+        // the name a load resolved that ask to. Writing a tab's own scope back
+        // into its card — which the refresh path and every scope
+        // synchronisation do — hands `None` to a card that resolved
+        // `SYSTEM`; judging that a change would throw away a catalog that
+        // still answers exactly the question it was asked, and the reload
+        // that was supposed to replace it does not even start while the
+        // connection is busy. The card would then sit there showing a full
+        // tree while reporting itself empty — and the next sibling load would
+        // "fill" it, collapsing the user's expanded tree under them.
+        let previous_request = self.metadata_requested_scope();
+        if !self.scope_names_match(
             db_type,
-            previous_scope.as_deref(),
+            previous_request.as_deref(),
             normalized_scope.as_deref(),
         ) {
             self.scope_generation.fetch_add(1, Ordering::Relaxed);
@@ -1385,6 +1403,10 @@ impl ObjectBrowserWidget {
         }
         *self
             .selected_scope
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = normalized_scope.clone();
+        *self
+            .metadata_requested_scope
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = normalized_scope.clone();
 
@@ -9695,7 +9717,7 @@ pub struct MultiObjectBrowserWidget {
     status_callback: StatusCallback,
     scope_change_callback: ConnectionScopeChangeCallback,
     scope_switch_preflight_callback: ConnectionScopeSwitchPreflightCallback,
-    metadata_callback: MetadataCallback,
+    metadata_callback: TabMetadataCallback,
     font_settings: Arc<Mutex<Option<(FontProfile, i32)>>>,
 }
 
@@ -9875,10 +9897,16 @@ impl MultiObjectBrowserWidget {
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(owner);
             Self::show_owner_card(&entries_snapshot, owner);
+            // Only a card with nothing to show is loaded here. Refreshing
+            // unconditionally would throw away the tree, filter and expansion
+            // of whichever card the dropdown lands on — including the active
+            // tab's own card, which is exactly what "a plain switch reloads
+            // nothing" promises not to do.
             if let Some(mut browser) = entries_snapshot
                 .iter()
                 .find(|entry| entry.owner == owner)
                 .map(|entry| entry.browser.clone())
+                .filter(|browser| !browser.has_loaded_metadata())
             {
                 let _ = browser.refresh();
             }
@@ -9941,8 +9969,22 @@ impl MultiObjectBrowserWidget {
                 }
                 BrowserOwner::ConnectionPreview(_) => false,
             };
-            if delivers {
-                ObjectBrowserWidget::emit_metadata_callback(&metadata_callback, snapshot);
+            if let (true, BrowserOwner::Tab(tab_id)) = (delivers, owner) {
+                let callback = {
+                    let mut slot = metadata_callback
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    slot.take()
+                };
+                if let Some(mut callback) = callback {
+                    callback(tab_id, snapshot);
+                    let mut slot = metadata_callback
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    if slot.is_none() {
+                        *slot = Some(callback);
+                    }
+                }
             }
         });
 
@@ -9990,20 +10032,22 @@ impl MultiObjectBrowserWidget {
             else {
                 return;
             };
-            let source_scope = source.metadata_requested_scope();
             let targets = entries
                 .iter()
                 .filter(|entry| {
                     entry.connection_id == connection_id
                         && entry.owner != source_owner
                         && !entry.browser.has_loaded_metadata()
-                        // An empty card has asked for nothing yet, so its
-                        // selection IS its request; compare that with what
-                        // produced the source's catalog. Judged with the
-                        // SOURCE's database type and option list: a card built
-                        // while the connection was locked still carries the
-                        // default type and knows only its own scope.
-                        && source.selection_matches_request(&entry.browser)
+                        // Ask against ask. A card that has loaded before keeps
+                        // the question it asked, which is not the name that
+                        // answer resolved to — comparing the source's request
+                        // with the target's RESOLVED name would refuse every
+                        // inheritance after a reconnect, and worse, could
+                        // match a card whose tab is really asking for
+                        // something else. Judged with the SOURCE's database
+                        // type and option list: a card built while the
+                        // connection was locked knows neither.
+                        && source.request_matches_request_of(&entry.browser)
                 })
                 .map(|entry| entry.browser.clone())
                 .collect::<Vec<_>>();
@@ -10055,7 +10099,8 @@ impl MultiObjectBrowserWidget {
         let seeded = source.is_some_and(|source| browser.adopt_metadata_from(&source));
         if !seeded {
             // Nothing to inherit: still make the card report the tab's scope,
-            // so the selector is right while the first load runs.
+            // so the selector is right while the first load runs. This is
+            // also the question the card is asking until a load answers it.
             browser.set_selected_scope(scope);
         }
         ConnectionBrowserEntry {
@@ -10927,7 +10972,7 @@ impl MultiObjectBrowserWidget {
 
     pub fn set_metadata_callback<F>(&mut self, callback: F)
     where
-        F: FnMut(ObjectBrowserMetadataSnapshot) + 'static,
+        F: FnMut(QueryTabId, ObjectBrowserMetadataSnapshot) + 'static,
     {
         *self
             .metadata_callback

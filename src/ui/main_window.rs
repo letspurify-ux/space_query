@@ -3917,12 +3917,11 @@ impl AppState {
         if !db_type.has_connection_scope() {
             return None;
         }
-        let editors = tab
-            .sql_editor
-            .pooled_session_activity_snapshot()
-            .is_some()
-            .then(|| vec![tab.sql_editor.clone()])
-            .unwrap_or_default();
+        let editors = if tab.sql_editor.pooled_session_activity_snapshot().is_some() {
+            vec![tab.sql_editor.clone()]
+        } else {
+            Vec::new()
+        };
         Some((
             db_type,
             conn_guard.connection_generation(),
@@ -8853,33 +8852,18 @@ impl MainWindow {
             })
             .map(|tab| tab.tab_id)
             .collect::<Vec<_>>();
-        // `schema_intellisense_data` IS the active tab's data, and the editor
-        // on screen is the active tab's editor, so writing them when the
-        // active tab is not a target of this snapshot would hand it another
-        // scope's catalog.
-        if !target_tab_ids.contains(&active_editor_tab_id) {
-            for tab in state
-                .editor_tabs
-                .iter_mut()
-                .filter(|tab| target_tab_ids.contains(&tab.tab_id))
-            {
-                *tab.intellisense_data
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner()) = data_for_tabs.clone();
-                tab.highlight_data = combined_highlight.clone();
-                tab.sql_editor
-                    .update_highlight_data_deferred(combined_highlight.clone());
-            }
-            state
-                .pending_metadata_refresh_tabs
-                .retain(|tab_id| !target_tab_ids.contains(tab_id));
-            return;
+        // `schema_intellisense_data` IS the active tab's data and
+        // `state.sql_editor` is its editor, so those two writes belong to this
+        // snapshot only when the active tab is one of its targets — otherwise
+        // they would hand the tab on screen another scope's catalog.
+        let reaches_active_tab = target_tab_ids.contains(&active_editor_tab_id);
+        if reaches_active_tab {
+            *state
+                .schema_intellisense_data
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()) = data;
+            state.schema_highlight_data = combined_highlight.clone();
         }
-        *state
-            .schema_intellisense_data
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner()) = data;
-        state.schema_highlight_data = combined_highlight;
         for tab in state
             .editor_tabs
             .iter_mut()
@@ -8888,16 +8872,18 @@ impl MainWindow {
             *tab.intellisense_data
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner()) = data_for_tabs.clone();
-            tab.highlight_data = state.schema_highlight_data.clone();
+            tab.highlight_data = combined_highlight.clone();
             tab.sql_editor
-                .update_highlight_data_deferred(state.schema_highlight_data.clone());
+                .update_highlight_data_deferred(combined_highlight.clone());
         }
         state
             .pending_metadata_refresh_tabs
             .retain(|tab_id| !target_tab_ids.contains(tab_id));
-        state
-            .sql_editor
-            .update_highlight_data_deferred(state.schema_highlight_data.clone());
+        if reaches_active_tab {
+            state
+                .sql_editor
+                .update_highlight_data_deferred(combined_highlight);
+        }
     }
 
     /// Highlighting needs the column names the catalog knows about, which
@@ -9037,10 +9023,12 @@ impl MainWindow {
     /// hand-off costs nothing but the delay.
     fn deliver_object_browser_metadata(
         state: &Arc<Mutex<AppState>>,
+        tab_id: QueryTabId,
         snapshot: ObjectBrowserMetadataSnapshot,
     ) {
         Self::deliver_object_browser_metadata_with_retries(
             state,
+            tab_id,
             snapshot,
             OBJECT_METADATA_DELIVERY_RETRIES,
         );
@@ -9048,6 +9036,7 @@ impl MainWindow {
 
     fn deliver_object_browser_metadata_with_retries(
         state: &Arc<Mutex<AppState>>,
+        tab_id: QueryTabId,
         snapshot: ObjectBrowserMetadataSnapshot,
         retries_left: u32,
     ) {
@@ -9079,6 +9068,7 @@ impl MainWindow {
                     if let Some(state) = weak_state.upgrade() {
                         MainWindow::deliver_object_browser_metadata_with_retries(
                             &state,
+                            tab_id,
                             snapshot,
                             retries_left - 1,
                         );
@@ -9088,6 +9078,12 @@ impl MainWindow {
             }
         };
         if !s.has_live_connection {
+            return;
+        }
+        // The card that produced this catalog belongs to ONE tab, and a
+        // deferred delivery can land long after the user moved on. Only that
+        // tab's editor may take it.
+        if s.active_editor_tab_id != tab_id {
             return;
         }
 
@@ -13398,11 +13394,11 @@ impl MainWindow {
         });
 
         let weak_state_for_browser_metadata = Arc::downgrade(&state);
-        object_browser.set_metadata_callback(move |snapshot| {
+        object_browser.set_metadata_callback(move |tab_id, snapshot| {
             let Some(state_for_metadata) = weak_state_for_browser_metadata.upgrade() else {
                 return;
             };
-            MainWindow::deliver_object_browser_metadata(&state_for_metadata, snapshot);
+            MainWindow::deliver_object_browser_metadata(&state_for_metadata, tab_id, snapshot);
         });
 
         let weak_state_for_browser = Arc::downgrade(&state);
