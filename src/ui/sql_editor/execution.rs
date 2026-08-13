@@ -17273,6 +17273,17 @@ impl SqlEditorWidget {
         let mut batch_may_report_transaction_work =
             prior_retained_state.may_have_uncommitted_work();
         let working_dir = env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+        // The schema this batch's session must be in before each statement.
+        // Resolved when the connection or the scope moves, not per statement,
+        // because the thin batch deliberately runs without the connection
+        // lock -- see `apply_oracle_thin_schema_before_statement`.
+        let mut session_schema = Self::oracle_thin_batch_session_schema(
+            scope_sync_context.as_ref(),
+            db_activity,
+            transition_context
+                .as_deref()
+                .and_then(|context| context.scope.as_deref()),
+        );
         let mut frames = vec![ScriptExecutionFrame {
             items,
             index: 0,
@@ -18083,6 +18094,14 @@ impl SqlEditorWidget {
                                         candidate.connection,
                                         candidate.connection_generation,
                                     ));
+                                    // A new server means a new schema to hold
+                                    // the session in; the tab has no scope of
+                                    // its own on it yet.
+                                    session_schema = Self::oracle_thin_batch_session_schema(
+                                        scope_sync_context.as_ref(),
+                                        db_activity,
+                                        None,
+                                    );
                                     retained_state = RetainedSessionState::default();
                                     batch_may_report_transaction_work = false;
                                     invalid_session = false;
@@ -18171,6 +18190,7 @@ impl SqlEditorWidget {
                             context.connected = false;
                             context.preconnected_info = None;
                             scope_sync_context = None;
+                            session_schema = None;
                             retained_state = RetainedSessionState::default();
                             batch_may_report_transaction_work = false;
                             continue_on_error = session
@@ -18520,6 +18540,30 @@ impl SqlEditorWidget {
                         continue;
                     }
 
+                    if let Err(message) = Self::apply_oracle_thin_schema_before_statement(
+                        conn,
+                        session_schema.as_deref(),
+                    ) {
+                        had_error = true;
+                        Self::emit_non_select_result(
+                            sender,
+                            session,
+                            conn_name,
+                            result_index,
+                            &display_sql,
+                            format!("Error: {message}"),
+                            false,
+                            false,
+                            script_mode,
+                        );
+                        result_index += 1;
+                        invalid_session |= conn.is_broken();
+                        if !continue_on_error {
+                            stop_execution = true;
+                        }
+                        continue;
+                    }
+
                     let mut statement_error = None::<String>;
                     if let Some(action) = CloseSessionAction::from_plain_sql(&execution_sql) {
                         match action.apply_oracle_thin(conn) {
@@ -18750,6 +18794,11 @@ impl SqlEditorWidget {
                                                             .set_scope(Some(scope.to_string()));
                                                         context.scope = Some(scope.to_string());
                                                     }
+                                                    // Where the statement put
+                                                    // the session is where the
+                                                    // rest of the batch must
+                                                    // be held.
+                                                    session_schema = Some(scope.to_string());
                                                 },
                                                 sender,
                                                 notice,
@@ -23968,6 +24017,61 @@ impl SqlEditorWidget {
                 false
             }
         }
+    }
+
+    /// Put THIS batch's Oracle Thin session in the schema the tab runs in.
+    ///
+    /// The thin twin of [`Self::apply_oracle_schema_before_pooled_action`].
+    /// Every other backend re-asserts the requesting tab's scope on its
+    /// session before each statement (OCI here, the MySQL family through
+    /// `apply_mysql_global_database_before_pooled_action`), so a session that
+    /// was retained from the tab's last run — or that a statement moved
+    /// without the app being able to see it, as `EXECUTE IMMEDIATE 'ALTER
+    /// SESSION SET CURRENT_SCHEMA ...'` does — is put back where the tab says
+    /// it is. Thin asserted nothing at all, so the same script answered
+    /// differently on the two Oracle drivers, and a scope change that failed
+    /// to reach the tab's retained session left that tab executing in the old
+    /// schema for good.
+    ///
+    /// Tolerant of a dropped schema for the same reason the tracked apply is:
+    /// the setting is only a name-resolution namespace, and failing every
+    /// statement on ORA-01435 would brick the tab.
+    fn apply_oracle_thin_schema_before_statement<C: OracleThinBatchConnection>(
+        conn: &mut C,
+        session_schema: Option<&str>,
+    ) -> Result<(), String> {
+        crate::db::DatabaseConnection::apply_tracked_oracle_thin_current_schema(
+            conn,
+            session_schema,
+        )
+        .map_err(|message| {
+            format!("Failed to apply Oracle current schema before execution: {message}")
+        })
+    }
+
+    /// The schema [`Self::apply_oracle_thin_schema_before_statement`] holds a
+    /// batch's session in: the requesting TAB's scope resolved through this
+    /// connection's own rule — `oracle_session_schema_for_scope`, the same one
+    /// the OCI path and every freshly acquired pool session use.
+    ///
+    /// Resolved when the connection or the scope moves rather than per
+    /// statement: the OCI twin takes the connection lock every time, and the
+    /// thin batch runs without holding it on purpose.
+    fn oracle_thin_batch_session_schema(
+        scope_sync_context: Option<&(crate::db::SharedConnection, u64)>,
+        db_activity: &str,
+        scope: Option<&str>,
+    ) -> Option<String> {
+        let Some((shared_connection, _)) = scope_sync_context else {
+            // No connection to resolve against (the test-only direct session):
+            // the tab's own scope is all there is.
+            return scope
+                .map(str::trim)
+                .filter(|scope| !scope.is_empty())
+                .map(str::to_string);
+        };
+        lock_connection_with_activity(shared_connection, db_activity.to_string())
+            .oracle_session_schema_for_scope(scope)
     }
 
     /// Put the tab's pooled session in the schema this operation runs in.

@@ -121,6 +121,28 @@ MySQL/MariaDB current database are reapplied to new sessions. A running worker
 is not mutated during a scope change; the scope takes effect at the next safe
 acquisition or reuse point.
 
+Every batch puts its session in the requesting tab's scope before it runs a
+statement — Oracle OCI through `apply_oracle_schema_before_pooled_action`,
+Oracle Thin through `apply_oracle_thin_schema_before_statement`, the MySQL
+family through `apply_mysql_global_database_before_pooled_action`, each
+resolving the target with its family's one rule. That assertion, not the eager
+push, is what makes the tab's scope the truth: a pooled session arrives
+carrying whatever its last user left on it, a session retained from the tab's
+previous run carries whatever THAT run left, and a statement can move it where
+the app cannot see it (`EXECUTE IMMEDIATE 'ALTER SESSION SET CURRENT_SCHEMA
+...'` is not the spelling the adopt path matches). Applying a scope change to
+the retained session immediately is therefore a convenience, not a correctness
+requirement — it needs the connection lock and gives up silently when it
+cannot take it. Thin used to assert nothing at all, applying a schema only when
+it acquired a fresh pool session, so the same script answered differently on
+the two Oracle drivers and a dropped scope change left that tab executing in
+the old schema for good. The thin target is resolved by
+`oracle_thin_batch_session_schema` when the run starts and again when a script
+`CONNECT` replaces the connection, rather than per statement, because the thin
+batch deliberately runs without the connection lock its OCI twin takes each
+time. Guard: `every_batch_holds_its_session_in_the_requesting_tabs_scope`;
+live check S44 in `verify_transaction_mode_live` (all four backends).
+
 The object browser's scope selection is tab-local: a pick lands on the ACTIVE
 tab only (each query editor tab owns its own browser card — tree, filter, and
 scope — plus one preview card per connection for the dropdown), never on the

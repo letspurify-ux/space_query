@@ -2688,6 +2688,126 @@ fn run_scenarios(target: Target, h: &mut Harness) -> Result<(), String> {
         });
     }
 
+    // ---- S44: the tab's scope governs every statement, on every backend -----
+    // A batch's session is shared property: it arrives carrying whatever its
+    // last user left on it, a session retained from this tab's previous run
+    // carries whatever THAT run left, and a statement can move it where the
+    // app cannot see it. Oracle's escape is real and reachable --
+    // `EXECUTE IMMEDIATE 'ALTER SESSION SET CURRENT_SCHEMA ...'` is not the
+    // spelling the adopt path matches -- so use it to move the session behind
+    // the app's back and check that the next statement is back in the TAB's
+    // scope. On the MySQL family no such escape exists (`USE` is neither
+    // preparable nor callable from a routine), so the same invariant is
+    // checked against a plain scope change.
+    //
+    // Before the fix this passed on Oracle OCI and failed on Oracle Thin: OCI
+    // re-asserts the tab's schema before every statement, thin asserted
+    // nothing at all -- one script, two answers.
+    {
+        println!("  --- S44 the tab's scope governs every statement ---");
+        h.editor.clear_tab_transaction_mode_override();
+        h.run("ROLLBACK")?;
+        let scratch_scope = "SQ_TM_SCOPE6";
+        let _ = h.run(&if target.is_oracle() {
+            format!("DROP USER {scratch_scope} CASCADE")
+        } else {
+            format!("DROP DATABASE IF EXISTS {scratch_scope}")
+        });
+        let capture = h.run(&if target.is_oracle() {
+            format!("CREATE USER {scratch_scope} IDENTIFIED BY pw1")
+        } else {
+            format!("CREATE DATABASE {scratch_scope}")
+        })?;
+        if !capture.results.first().is_some_and(|result| result.success) {
+            return Err(format!(
+                "S44 could not create the scratch scope: {:?}",
+                capture.results.first().map(|r| r.message.clone())
+            ));
+        }
+        let scope_outcome = h.change_tab_scope(Some(scratch_scope));
+        let landed = h.select_scalar(current_scope_sql)?;
+        h.check(
+            "S44 the tab starts in the scope it was moved to",
+            landed.trim().eq_ignore_ascii_case(scratch_scope),
+            format!("{current_scope_sql} = {landed:?} (scope change: {scope_outcome})"),
+        );
+
+        if target.is_oracle() {
+            // Same script: the escape, then a read of where the session is.
+            let script = format!(
+                "BEGIN EXECUTE IMMEDIATE 'ALTER SESSION SET CURRENT_SCHEMA = {base_scope}'; END;\n/\n{current_scope_sql};"
+            );
+            let ran = h.run(&script)?;
+            let reported = ran
+                .rows
+                .last()
+                .and_then(|row| row.last().cloned())
+                .or_else(|| {
+                    ran.results
+                        .iter()
+                        .rev()
+                        .find(|result| result.is_select)
+                        .and_then(|result| result.rows.first())
+                        .and_then(|row| row.last().cloned())
+                })
+                .unwrap_or_default();
+            h.check(
+                "S44 a statement the app cannot see does not redirect the rest of the script",
+                reported.trim().eq_ignore_ascii_case(scratch_scope),
+                format!("{current_scope_sql} after the hidden move = {reported:?}"),
+            );
+
+            // And the next run, which reuses this tab's retained session.
+            let next_run = h.select_scalar(current_scope_sql)?;
+            h.check(
+                "S44 the next run is in the tab's scope too, not where the session was left",
+                next_run.trim().eq_ignore_ascii_case(scratch_scope),
+                format!("{current_scope_sql} on the next run = {next_run:?}"),
+            );
+        } else {
+            // No hidden move exists here; the invariant is the same one.
+            let same_run = h.run(&format!("{current_scope_sql};\n{current_scope_sql};"))?;
+            // A MySQL-family SELECT is streamed, so its rows land in `rows`
+            // rather than inside the per-statement results; take both.
+            let reported = same_run
+                .rows
+                .iter()
+                .filter_map(|row| row.last().cloned())
+                .chain(
+                    same_run
+                        .results
+                        .iter()
+                        .filter(|result| result.is_select)
+                        .filter_map(|result| result.rows.first())
+                        .filter_map(|row| row.last().cloned()),
+                )
+                .collect::<Vec<_>>();
+            h.check(
+                "S44 every statement of the script runs in the tab's scope",
+                !reported.is_empty()
+                    && reported
+                        .iter()
+                        .all(|scope| scope.trim().eq_ignore_ascii_case(scratch_scope)),
+                format!("{current_scope_sql} per statement = {reported:?}"),
+            );
+            let next_run = h.select_scalar(current_scope_sql)?;
+            h.check(
+                "S44 the next run is in the tab's scope too, not where the session was left",
+                next_run.trim().eq_ignore_ascii_case(scratch_scope),
+                format!("{current_scope_sql} on the next run = {next_run:?}"),
+            );
+        }
+
+        h.change_tab_scope(Some(&base_scope));
+        let _ = h.editor.discard_pooled_session_for_close();
+        h.run("ROLLBACK")?;
+        let _ = h.run(&if target.is_oracle() {
+            format!("DROP USER {scratch_scope} CASCADE")
+        } else {
+            format!("DROP DATABASE IF EXISTS {scratch_scope}")
+        });
+    }
+
     // ---- S40: a dirty session does not gate a scope change ------------------
     // The commit/rollback/discard decision belongs to tab close. A scope
     // change is applied to the tab's retained session IN PLACE (MySQL `USE`,

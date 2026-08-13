@@ -3794,6 +3794,87 @@ fn a_mid_batch_scope_change_is_recorded_where_the_batch_reads_its_scope() {
     );
 }
 
+/// Every batch puts its session in the requesting tab's scope before it runs
+/// a statement — on all four backends.
+///
+/// Scope is per tab and a pooled session is shared property: it arrives
+/// carrying whatever the last user left on it, a session retained from this
+/// tab's previous run carries whatever THAT run left, and a statement can move
+/// it where the app cannot see it (`EXECUTE IMMEDIATE 'ALTER SESSION SET
+/// CURRENT_SCHEMA ...'`, which is not the spelling the adopt path matches).
+/// The only thing that makes the tab's scope the truth is the batch asserting
+/// it on the session before each statement.
+///
+/// Oracle OCI and the MySQL family always did. Oracle Thin asserted nothing
+/// at all: it applied a schema only when it acquired a fresh session from the
+/// pool, so the same script answered differently on the two Oracle drivers,
+/// and a scope change that failed to reach the tab's retained session (the
+/// push needs the connection lock and gives up silently when it cannot take
+/// it) left that tab executing in the old schema for good.
+///
+/// Each backend resolves the target with the ONE rule for its family --
+/// `oracle_session_schema_for_scope` / `mysql_database_for_scope`, both total,
+/// both "the tab's scope, else this connection's own".
+#[test]
+fn every_batch_holds_its_session_in_the_requesting_tabs_scope() {
+    let execution = read_source("src/ui/sql_editor/execution.rs");
+
+    for (batch, end_marker, assertion) in [
+        (
+            "fn execute_oracle_thin_batch_with_connection<C: OracleThinBatchConnection>(",
+            "\n    fn oracle_thin_can_emit_dbms_output(",
+            "Self::apply_oracle_thin_schema_before_statement(",
+        ),
+        (
+            "fn execute_sql_with_mysql_delimiter_after_lazy_cancel(",
+            "\n    fn emit_non_select_result(",
+            "Self::apply_oracle_schema_before_pooled_action(",
+        ),
+        (
+            "fn execute_mysql_batch(",
+            "\n    fn begin_execution_worker<'a>(",
+            "Self::apply_mysql_global_database_before_pooled_action(",
+        ),
+    ] {
+        let start = execution
+            .find(batch)
+            .unwrap_or_else(|| panic!("{batch} should exist"));
+        let end = execution[start..]
+            .find(end_marker)
+            .map(|offset| start + offset)
+            .unwrap_or_else(|| panic!("end marker for {batch} should follow it"));
+        let body = &execution[start..end];
+        assert!(
+            body.contains(assertion),
+            "{batch} must put its session in the tab's scope before a statement runs \
+             ({assertion} is missing)"
+        );
+    }
+
+    // The thin target is resolved by the one rule, and only where the
+    // connection or the scope moves -- the batch runs without the connection
+    // lock the OCI twin takes per statement.
+    let resolver = execution
+        .find("fn oracle_thin_batch_session_schema(")
+        .expect("the thin batch must resolve its target through one function");
+    let resolver_end = execution[resolver..]
+        .find("\n    fn ")
+        .map(|at| resolver + at)
+        .unwrap_or(execution.len());
+    assert!(
+        execution[resolver..resolver_end].contains("oracle_session_schema_for_scope(scope)"),
+        "the thin batch target must come from the one Oracle rule"
+    );
+    assert!(
+        execution
+            .matches("Self::oracle_thin_batch_session_schema(")
+            .count()
+            == 2,
+        "the thin batch target is resolved at the run's start and again when the \
+         connection changes -- nowhere else"
+    );
+}
+
 /// Metadata a tab asks for is looked up in THAT tab's scope.
 ///
 /// Signature hints and bind-parameter types resolve unqualified routine names
