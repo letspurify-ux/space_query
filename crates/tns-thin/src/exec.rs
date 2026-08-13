@@ -153,6 +153,25 @@ pub enum OracleVectorValue {
     },
 }
 
+/// Whether the server flagged a column as holding JSON, and in which encoding.
+///
+/// Oracle reports this out of band from the column's storage type: a
+/// `VARCHAR2` or `CLOB` carrying an `IS JSON` check constraint stays a
+/// `VARCHAR2`/`CLOB` on the wire and only sets a UDS flag saying its contents
+/// are JSON. Keeping the flag out of [`OracleColumnType`] is what stops the
+/// annotation from changing the wire type. python-oracledb models the same
+/// split with `FetchInfo.is_json` / `FetchInfo.is_oson`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum JsonEncoding {
+    /// The column is not flagged as JSON.
+    #[default]
+    None,
+    /// JSON held as text in a character column.
+    Text,
+    /// JSON held as binary OSON.
+    Oson,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ColumnMetadata {
     pub name: String,
@@ -164,6 +183,7 @@ pub struct ColumnMetadata {
     pub buffer_size: u32,
     pub schema_name: String,
     pub type_name: String,
+    pub json_encoding: JsonEncoding,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

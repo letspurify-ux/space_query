@@ -1373,6 +1373,84 @@ fn bind_sparse_vector_round_trips_vendor_formats() {
     );
 }
 
+// Upstream mapping: python-oracledb `TestJsonCols` (JsonVarchar / JsonClob /
+// JsonBlob) plus test_3900, which asserts `select JsonVarchar from TestJsonCols`
+// reports DB_TYPE_VARCHAR. An `IS JSON` check constraint sets a UDS flag on an
+// otherwise ordinary character or binary column; it must not change the wire
+// type the column is defined and decoded as.
+#[test]
+#[ignore = "requires local Oracle listener via ORACLE_THIN_TEST_* environment variables"]
+fn is_json_annotated_columns_keep_their_storage_wire_type() {
+    let config = live_config();
+    let table = unique_table_name("IS_JSON");
+    let _guard = TableDropGuard::new(config.clone(), table.clone());
+    let mut conn = connect_with_config(config);
+
+    match conn.query_drop(&format!(
+        "CREATE TABLE {table} (             id NUMBER PRIMARY KEY,              v_json VARCHAR2(4000),              nv_json NVARCHAR2(1000),              c_json CLOB,              b_json BLOB,              CONSTRAINT {table}_v CHECK (v_json IS JSON),              CONSTRAINT {table}_nv CHECK (nv_json IS JSON),              CONSTRAINT {table}_c CHECK (c_json IS JSON),              CONSTRAINT {table}_b CHECK (b_json IS JSON FORMAT OSON)         ) TABLESPACE USERS"
+    )) {
+        Ok(()) => {}
+        Err(err)
+            if err.to_string().contains("ORA-00902")
+                || err.to_string().contains("ORA-00907")
+                || err.to_string().contains("ORA-00959")
+                || err.to_string().contains("ORA-03001")
+                || err.to_string().contains("ORA-43853") =>
+        {
+            eprintln!("skipping IS JSON test: database does not support the storage form");
+            return;
+        }
+        Err(err) => panic!("create IS JSON test table: {err}"),
+    }
+    conn.query_drop(&format!(
+        "INSERT INTO {table} (id, v_json, nv_json, c_json, b_json)          SELECT 1, '{{\"a\":1}}', N'{{\"n\":\"한글\"}}', '{{\"b\":2}}',                 JSON('{{\"c\":3}}') FROM dual"
+    ))
+    .expect("insert IS JSON test row");
+
+    let result = conn
+        .query_described_fetch_all(
+            format!("SELECT v_json, nv_json, c_json, b_json FROM {table} WHERE id = 1"),
+            1,
+        )
+        .expect("fetch IS JSON annotated columns");
+
+    // The annotation leaves the reported storage type alone, exactly as
+    // python-oracledb's `FetchInfo.type_code` does.
+    assert_eq!(
+        result
+            .columns
+            .iter()
+            .map(|column| column.column_type)
+            .collect::<Vec<_>>(),
+        vec![
+            OracleColumnType::Varchar,
+            OracleColumnType::Varchar,
+            OracleColumnType::Clob,
+            // Binary OSON is handed back decoded, so it reports as JSON.
+            OracleColumnType::Json,
+        ]
+    );
+    // ... and it leaves the character set form alone, so NCHAR data still
+    // decodes with the national character set.
+    assert_eq!(
+        result
+            .columns
+            .iter()
+            .map(|column| column.charset_form)
+            .collect::<Vec<_>>(),
+        vec![1, 2, 1, 0]
+    );
+    assert_eq!(
+        rows_to_strings(&result.result.rows),
+        vec![vec![
+            r#"{"a":1}"#.to_string(),
+            r#"{"n":"한글"}"#.to_string(),
+            r#"{"b":2}"#.to_string(),
+            r#"{"c":3}"#.to_string(),
+        ]]
+    );
+}
+
 #[test]
 #[ignore = "requires local Oracle listener via ORACLE_THIN_TEST_* environment variables"]
 fn fetch_json_column_decodes_oson_payload_as_json_text() {

@@ -43,7 +43,7 @@ use crate::connect::{
 use crate::exec::{
     parse_sql_bind_names, sql_dml_returning_has_duplicate_bind, sql_is_dml_returning,
     BindInputValue, BindValue, ColumnMetadata, DescribedQueryResult, ExecuteWithImplicitResult,
-    OracleColumnType, OracleIntervalDaySecond, OracleIntervalYearMonth, OracleValue,
+    JsonEncoding, OracleColumnType, OracleIntervalDaySecond, OracleIntervalYearMonth, OracleValue,
     OracleVectorValue, OutBindResult, QueryResult, RefCursorValue, StatementRequest,
 };
 use crate::{log_connect_phase, OracleThinError};
@@ -2234,6 +2234,7 @@ impl OracleThinSession {
                 buffer_size: 0,
                 schema_name: String::new(),
                 type_name: String::new(),
+                json_encoding: JsonEncoding::None,
             })
             .collect::<Vec<_>>();
         self.fetch_ref_cursor_batch(cursor_id, &columns, row_count, true)
@@ -2258,6 +2259,7 @@ impl OracleThinSession {
                 buffer_size: 0,
                 schema_name: String::new(),
                 type_name: String::new(),
+                json_encoding: JsonEncoding::None,
             })
             .collect::<Vec<_>>();
         self.fetch_ref_cursor_batch(cursor_id, &columns, row_count, false)
@@ -4012,6 +4014,7 @@ struct ThinColumn {
     buffer_size: u32,
     schema_name: String,
     type_name: String,
+    json_encoding: JsonEncoding,
 }
 
 #[derive(Debug, Default)]
@@ -4240,6 +4243,7 @@ fn thin_column_from_object_attr(
             buffer_size,
             schema_name,
             type_name,
+            json_encoding: JsonEncoding::None,
         });
     }
     let (column_type, ora_type_num, schema_name, type_name) = match attr_type.as_str() {
@@ -4409,6 +4413,7 @@ fn thin_column_from_object_attr(
         buffer_size,
         schema_name,
         type_name,
+        json_encoding: JsonEncoding::None,
     })
 }
 
@@ -6280,6 +6285,7 @@ fn bind_column_metadata(bind: &BindValue) -> ThinColumn {
         buffer_size: max_len,
         schema_name: String::new(),
         type_name: String::new(),
+        json_encoding: JsonEncoding::None,
     }
 }
 
@@ -6334,6 +6340,7 @@ fn thin_column_from_column_metadata(column: &ColumnMetadata) -> ThinColumn {
             buffer_size: column.buffer_size,
             schema_name: column.schema_name.clone(),
             type_name: column.type_name.clone(),
+            json_encoding: column.json_encoding,
         };
     }
     let bind_like = match column.column_type {
@@ -6365,6 +6372,7 @@ fn thin_column_from_column_metadata(column: &ColumnMetadata) -> ThinColumn {
         }
     };
     let mut thin = bind_column_metadata(&bind_like);
+    thin.json_encoding = column.json_encoding;
     thin.name = column.name.clone();
     thin.precision = column.precision;
     thin.scale = column.scale;
@@ -6381,56 +6389,13 @@ fn thin_column_from_column_metadata(column: &ColumnMetadata) -> ThinColumn {
 
 fn define_column_metadata(column: &ColumnMetadata) -> ThinColumn {
     let mut thin = thin_column_from_column_metadata(column);
-    if column.ora_type_num == ORA_TYPE_NUM_LONG_RAW {
-        thin.ora_type_num = ORA_TYPE_NUM_LONG_RAW;
-        thin.buffer_size = TNS_MAX_LONG_LENGTH;
-        thin.charset_form = 0;
-        thin.column_type = OracleColumnType::Raw;
-        return thin;
+    if column.ora_type_num == 0 {
+        // No describe was available, so `thin_column_from_column_metadata`
+        // filled in a *bind* wire type (CLOB binds go out as VARCHAR, and so
+        // on). A define for a fetch needs the storage type instead.
+        thin.ora_type_num = storage_wire_type_for_column_type(column.column_type);
     }
-    match column.column_type {
-        OracleColumnType::Long => {
-            thin.ora_type_num = ORA_TYPE_NUM_LONG;
-            thin.buffer_size = TNS_MAX_LONG_LENGTH;
-            thin.charset_form = CS_FORM_IMPLICIT;
-        }
-        OracleColumnType::Clob => {
-            thin.ora_type_num = ORA_TYPE_NUM_LONG;
-            thin.buffer_size = TNS_MAX_LONG_LENGTH;
-            thin.charset_form = CS_FORM_IMPLICIT;
-            thin.column_type = OracleColumnType::Long;
-        }
-        OracleColumnType::Nclob => {
-            thin.ora_type_num = ORA_TYPE_NUM_LONG;
-            thin.buffer_size = TNS_MAX_LONG_LENGTH;
-            thin.charset_form = CS_FORM_NCHAR;
-            thin.column_type = OracleColumnType::Long;
-        }
-        OracleColumnType::Blob => {
-            thin.ora_type_num = ORA_TYPE_NUM_LONG_RAW;
-            thin.buffer_size = TNS_MAX_LONG_LENGTH;
-            thin.column_type = OracleColumnType::Raw;
-        }
-        OracleColumnType::Bfile => {}
-        OracleColumnType::Vector => {
-            thin.ora_type_num = ORA_TYPE_NUM_VECTOR;
-            thin.buffer_size = TNS_VECTOR_MAX_LENGTH;
-        }
-        OracleColumnType::Json => {
-            thin.ora_type_num = ORA_TYPE_NUM_JSON;
-            thin.buffer_size = TNS_JSON_MAX_LENGTH;
-        }
-        OracleColumnType::Xml => {
-            thin.ora_type_num = ORA_TYPE_NUM_OBJECT;
-        }
-        OracleColumnType::Object => {
-            thin.ora_type_num = ORA_TYPE_NUM_OBJECT;
-        }
-        OracleColumnType::ObjectRef => {
-            thin.ora_type_num = TNS_DATA_TYPE_INT_REF;
-        }
-        _ => {}
-    }
+    apply_define_wire_type(&mut thin);
     thin
 }
 
@@ -6446,56 +6411,102 @@ fn define_thin_column_metadata_for_capabilities(
     _capabilities: &OracleThinCapabilities,
 ) -> ThinColumn {
     let mut thin = column.clone();
-    if column.ora_type_num == ORA_TYPE_NUM_LONG_RAW {
-        thin.ora_type_num = ORA_TYPE_NUM_LONG_RAW;
-        thin.buffer_size = TNS_MAX_LONG_LENGTH;
+    apply_define_wire_type(&mut thin);
+    thin
+}
+
+/// The wire type a column is defined as so a fetch returns its value.
+///
+/// Decided purely from wire facts - `ora_type_num`, `charset_form` and the
+/// out-of-band [`JsonEncoding`] flag. `column_type` deliberately has no say,
+/// and no other code may pick a wire type either: `column_type` classifies the
+/// value the caller receives, so an annotation such as an `IS JSON` check
+/// constraint moves it without changing a single byte of what the server puts
+/// on the wire. Letting it choose the define is what desynchronises the TTC
+/// stream - the server keeps sending length-prefixed text while the reader
+/// expects the JSON layout.
+///
+/// python-oracledb draws the same line: `metadata.dbtype` comes from
+/// `(ora_type_num, csfrm)` alone, and `is_json`/`is_oson` only pick an
+/// out-converter. The LOB-to-LONG rewrites below mirror its `fetch_lobs=False`
+/// mode, which fetches LOB values inline instead of locators.
+fn apply_define_wire_type(thin: &mut ThinColumn) {
+    if thin.json_encoding == JsonEncoding::Oson && stores_binary_payload(thin.ora_type_num) {
+        // OSON is binary, so binary storage flagged as holding it is fetched
+        // as native JSON. Protocol 314 has no JSON wire type of its own and
+        // describes even a native JSON column as an OSON-flagged BLOB, which
+        // the server then refuses to hand over as LONG RAW (ORA-40569), so
+        // this is the one wire type that works on every protocol. (This is
+        // where we diverge from python-oracledb, which only speaks the newer
+        // protocols and fetches OSON as DB_TYPE_LONG_RAW to decode it itself.)
+        thin.ora_type_num = ORA_TYPE_NUM_JSON;
+        thin.buffer_size = TNS_JSON_MAX_LENGTH;
         thin.charset_form = 0;
-        thin.column_type = OracleColumnType::Raw;
-        return thin;
+        return;
     }
-    match column.column_type {
-        OracleColumnType::Long => {
+    match thin.ora_type_num {
+        ORA_TYPE_NUM_LONG => {
+            thin.buffer_size = TNS_MAX_LONG_LENGTH;
+            if thin.charset_form == 0 {
+                thin.charset_form = CS_FORM_IMPLICIT;
+            }
+        }
+        ORA_TYPE_NUM_LONG_RAW => {
+            thin.buffer_size = TNS_MAX_LONG_LENGTH;
+            thin.charset_form = 0;
+        }
+        ORA_TYPE_NUM_CLOB | TNS_DATA_TYPE_DCLOB => {
             thin.ora_type_num = ORA_TYPE_NUM_LONG;
             thin.buffer_size = TNS_MAX_LONG_LENGTH;
-            thin.charset_form = CS_FORM_IMPLICIT;
+            if thin.charset_form == 0 {
+                thin.charset_form = CS_FORM_IMPLICIT;
+            }
         }
-        OracleColumnType::Clob => {
-            thin.ora_type_num = ORA_TYPE_NUM_LONG;
-            thin.buffer_size = TNS_MAX_LONG_LENGTH;
-            thin.charset_form = CS_FORM_IMPLICIT;
-            thin.column_type = OracleColumnType::Long;
-        }
-        OracleColumnType::Nclob => {
-            thin.ora_type_num = ORA_TYPE_NUM_LONG;
-            thin.buffer_size = TNS_MAX_LONG_LENGTH;
-            thin.charset_form = CS_FORM_NCHAR;
-            thin.column_type = OracleColumnType::Long;
-        }
-        OracleColumnType::Blob => {
+        ORA_TYPE_NUM_BLOB | TNS_DATA_TYPE_DBLOB => {
             thin.ora_type_num = ORA_TYPE_NUM_LONG_RAW;
             thin.buffer_size = TNS_MAX_LONG_LENGTH;
-            thin.column_type = OracleColumnType::Raw;
+            thin.charset_form = 0;
         }
-        OracleColumnType::Vector => {
-            thin.ora_type_num = ORA_TYPE_NUM_VECTOR;
+        ORA_TYPE_NUM_VECTOR => {
             thin.buffer_size = TNS_VECTOR_MAX_LENGTH;
         }
-        OracleColumnType::Json => {
-            thin.ora_type_num = ORA_TYPE_NUM_JSON;
+        ORA_TYPE_NUM_JSON | ORA_TYPE_NUM_DJSON => {
             thin.buffer_size = TNS_JSON_MAX_LENGTH;
-        }
-        OracleColumnType::Xml => {
-            thin.ora_type_num = ORA_TYPE_NUM_OBJECT;
-        }
-        OracleColumnType::Object => {
-            thin.ora_type_num = ORA_TYPE_NUM_OBJECT;
-        }
-        OracleColumnType::ObjectRef => {
-            thin.ora_type_num = TNS_DATA_TYPE_INT_REF;
         }
         _ => {}
     }
-    thin
+}
+
+/// Whether a wire type carries bytes rather than characters.
+fn stores_binary_payload(ora_type_num: u8) -> bool {
+    matches!(
+        ora_type_num,
+        ORA_TYPE_NUM_JSON
+            | ORA_TYPE_NUM_DJSON
+            | ORA_TYPE_NUM_BLOB
+            | TNS_DATA_TYPE_DBLOB
+            | ORA_TYPE_NUM_RAW
+            | ORA_TYPE_NUM_LONG_RAW
+            | TNS_DATA_TYPE_LVB
+    )
+}
+
+/// The wire type Oracle stores a column of this public type as.
+///
+/// Only used when a caller names a column by [`OracleColumnType`] without ever
+/// having described it (`fetch_typed` and friends); a described column always
+/// carries the server's own `ora_type_num`.
+fn storage_wire_type_for_column_type(column_type: OracleColumnType) -> u8 {
+    match column_type {
+        OracleColumnType::Long => ORA_TYPE_NUM_LONG,
+        OracleColumnType::Clob | OracleColumnType::Nclob => ORA_TYPE_NUM_CLOB,
+        OracleColumnType::Blob => ORA_TYPE_NUM_BLOB,
+        OracleColumnType::Vector => ORA_TYPE_NUM_VECTOR,
+        OracleColumnType::Json => ORA_TYPE_NUM_JSON,
+        OracleColumnType::Xml | OracleColumnType::Object => ORA_TYPE_NUM_OBJECT,
+        OracleColumnType::ObjectRef => TNS_DATA_TYPE_INT_REF,
+        other => bind_column_metadata(&BindValue::Null(other)).ora_type_num,
+    }
 }
 
 fn fetch_state_column_metadata(
@@ -7437,9 +7448,14 @@ fn process_column_metadata(
         let _ = cursor.read_ub4()?;
         cursor.skip(2)?;
     }
+    let json_encoding = json_encoding_from_uds_flags(uds_flags);
     let column_type = if is_xmltype_metadata(ora_type_num, &schema_name, &type_name) {
         OracleColumnType::Xml
-    } else if uds_flags & (TNS_UDS_FLAGS_IS_JSON | TNS_UDS_FLAGS_IS_OSON) != 0 {
+    } else if json_encoding == JsonEncoding::Oson && stores_binary_payload(ora_type_num) {
+        // Binary OSON is handed back decoded, so the caller sees JSON however
+        // it is stored. Protocol 314 has no JSON wire type and describes even
+        // a native JSON column as a BLOB; this is what keeps such a column
+        // reported as JSON there.
         OracleColumnType::Json
     } else {
         oracle_column_type_from_ora_type_for_protocol(ora_type_num, capabilities.protocol_version)
@@ -7454,7 +7470,21 @@ fn process_column_metadata(
         buffer_size,
         schema_name,
         type_name,
+        json_encoding,
     })
+}
+
+/// The `IS JSON` / OSON annotations Oracle reports alongside a column's
+/// storage type. They never change the storage type, so they are kept out of
+/// `column_type`; see [`JsonEncoding`].
+fn json_encoding_from_uds_flags(uds_flags: u32) -> JsonEncoding {
+    if uds_flags & TNS_UDS_FLAGS_IS_OSON != 0 {
+        JsonEncoding::Oson
+    } else if uds_flags & TNS_UDS_FLAGS_IS_JSON != 0 {
+        JsonEncoding::Text
+    } else {
+        JsonEncoding::None
+    }
 }
 
 fn normalize_metadata_charset_form(column_type: OracleColumnType, charset_form: u8) -> u8 {
@@ -7769,13 +7799,16 @@ fn read_column_value(
                 };
                 OracleValue::Timestamp(decode_oracle_datetime(&bytes)?)
             }
-            ORA_TYPE_NUM_RAW | TNS_DATA_TYPE_LVB => cursor
-                .read_bytes()?
-                .map(OracleValue::Bytes)
-                .unwrap_or(OracleValue::Null),
+            ORA_TYPE_NUM_RAW | TNS_DATA_TYPE_LVB => match cursor.read_bytes()? {
+                Some(bytes) if column.json_encoding != JsonEncoding::None => {
+                    decode_json_payload_value(&bytes)?
+                }
+                Some(bytes) => OracleValue::Bytes(bytes),
+                None => OracleValue::Null,
+            },
             ORA_TYPE_NUM_LONG_RAW => {
                 let value = match cursor.read_bytes()? {
-                    Some(bytes) if column.column_type == OracleColumnType::Json => {
+                    Some(bytes) if column.json_encoding != JsonEncoding::None => {
                         decode_json_payload_value(&bytes)?
                     }
                     Some(bytes) => OracleValue::Bytes(bytes),
@@ -9736,6 +9769,7 @@ fn column_metadata_from_thin(column: &ThinColumn) -> ColumnMetadata {
         buffer_size: column.buffer_size,
         schema_name: column.schema_name.clone(),
         type_name: column.type_name.clone(),
+        json_encoding: column.json_encoding,
     }
 }
 
@@ -14553,7 +14587,7 @@ mod tests {
         adjust_columns_after_define, bind_column_metadata, column_metadata_from_thin,
         column_types_may_contain_ref_cursors, column_types_require_define_fetch_for_values,
         columns_may_contain_ref_cursors, columns_require_define_fetch_for_values,
-        oracle_thin_driver_name, put_u16_be_vec, write_auth_header,
+        json_encoding_from_uds_flags, oracle_thin_driver_name, put_u16_be_vec, write_auth_header,
         write_close_temp_lobs_piggyback, write_lob_operation_request, write_marker_packet,
         AuthSessionKeyParts, ExecuteReadState, WriteLobOperationArgs, DATA_TYPE_REPRESENTATIONS,
         ORA_TYPE_NUM_BFILE, ORA_TYPE_NUM_BINARY_DOUBLE, ORA_TYPE_NUM_BINARY_FLOAT,
@@ -14592,10 +14626,11 @@ mod tests {
         TNS_MSG_TYPE_FUNCTION, TNS_MSG_TYPE_PIGGYBACK, TNS_MSG_TYPE_STATUS,
         TNS_PACKET_TYPE_CONTROL, TNS_PACKET_TYPE_DATA, TNS_PACKET_TYPE_MARKER,
         TNS_SESSION_STATE_EXPLICIT_BOUNDARY, TNS_SESSION_STATE_REQUEST_BEGIN,
-        TNS_SESSION_STATE_REQUEST_END, TNS_VECTOR_FLAG_NORM, TNS_VECTOR_FLAG_NORM_RESERVED,
-        TNS_VECTOR_FLAG_SPARSE, TNS_VECTOR_FORMAT_BINARY, TNS_VECTOR_FORMAT_FLOAT32,
-        TNS_VECTOR_FORMAT_FLOAT64, TNS_VECTOR_FORMAT_INT8, TNS_VECTOR_MAGIC_BYTE,
-        TNS_VECTOR_VERSION_BASE, TNS_VECTOR_VERSION_WITH_BINARY, TNS_VECTOR_VERSION_WITH_SPARSE,
+        TNS_SESSION_STATE_REQUEST_END, TNS_UDS_FLAGS_IS_JSON, TNS_UDS_FLAGS_IS_OSON,
+        TNS_VECTOR_FLAG_NORM, TNS_VECTOR_FLAG_NORM_RESERVED, TNS_VECTOR_FLAG_SPARSE,
+        TNS_VECTOR_FORMAT_BINARY, TNS_VECTOR_FORMAT_FLOAT32, TNS_VECTOR_FORMAT_FLOAT64,
+        TNS_VECTOR_FORMAT_INT8, TNS_VECTOR_MAGIC_BYTE, TNS_VECTOR_VERSION_BASE,
+        TNS_VECTOR_VERSION_WITH_BINARY, TNS_VECTOR_VERSION_WITH_SPARSE,
     };
     use super::{
         adjust_for_server_compile_caps, adjust_for_server_runtime_caps,
@@ -14661,8 +14696,9 @@ mod tests {
     use crate::connect::TNS_DEFAULT_SOCKET_TIMEOUT;
     use crate::connect::{AcceptInfo, ConnectOptions, ConnectTarget, OracleNetServerType};
     use crate::exec::{
-        BindInputValue, BindValue, ColumnMetadata, OracleColumnType, OracleIntervalDaySecond,
-        OracleIntervalYearMonth, OracleVectorValue, RefCursorValue, StatementRequest,
+        BindInputValue, BindValue, ColumnMetadata, JsonEncoding, OracleColumnType,
+        OracleIntervalDaySecond, OracleIntervalYearMonth, OracleVectorValue, RefCursorValue,
+        StatementRequest,
     };
 
     fn execute_read_state_with_columns(columns: Vec<ThinColumn>) -> ExecuteReadState {
@@ -16793,6 +16829,7 @@ mod tests {
             buffer_size: 22,
             schema_name: String::new(),
             type_name: String::new(),
+            json_encoding: JsonEncoding::None,
         }];
         let ref_cursor_columns = [ColumnMetadata {
             name: "RC".to_string(),
@@ -16804,6 +16841,7 @@ mod tests {
             buffer_size: 4,
             schema_name: String::new(),
             type_name: String::new(),
+            json_encoding: JsonEncoding::None,
         }];
 
         assert!(!columns_may_contain_ref_cursors(&scalar_columns));
@@ -17672,6 +17710,7 @@ mod tests {
                 buffer_size: 10,
                 schema_name: String::new(),
                 type_name: String::new(),
+                json_encoding: JsonEncoding::None,
             },
             ThinColumn {
                 name: "C_VARCHAR".to_string(),
@@ -17683,6 +17722,7 @@ mod tests {
                 buffer_size: 10,
                 schema_name: String::new(),
                 type_name: String::new(),
+                json_encoding: JsonEncoding::None,
             },
             ThinColumn {
                 name: "B_RAW".to_string(),
@@ -17694,6 +17734,7 @@ mod tests {
                 buffer_size: 10,
                 schema_name: String::new(),
                 type_name: String::new(),
+                json_encoding: JsonEncoding::None,
             },
             ThinColumn {
                 name: "B_LONG_RAW".to_string(),
@@ -17705,6 +17746,7 @@ mod tests {
                 buffer_size: 10,
                 schema_name: String::new(),
                 type_name: String::new(),
+                json_encoding: JsonEncoding::None,
             },
         ];
         let mut columns = vec![
@@ -17718,6 +17760,7 @@ mod tests {
                 buffer_size: 112,
                 schema_name: String::new(),
                 type_name: String::new(),
+                json_encoding: JsonEncoding::None,
             },
             ThinColumn {
                 name: "C_VARCHAR".to_string(),
@@ -17729,6 +17772,7 @@ mod tests {
                 buffer_size: 112,
                 schema_name: String::new(),
                 type_name: String::new(),
+                json_encoding: JsonEncoding::None,
             },
             ThinColumn {
                 name: "B_RAW".to_string(),
@@ -17740,6 +17784,7 @@ mod tests {
                 buffer_size: 112,
                 schema_name: String::new(),
                 type_name: String::new(),
+                json_encoding: JsonEncoding::None,
             },
             ThinColumn {
                 name: "B_LONG_RAW".to_string(),
@@ -17751,6 +17796,7 @@ mod tests {
                 buffer_size: 112,
                 schema_name: String::new(),
                 type_name: String::new(),
+                json_encoding: JsonEncoding::None,
             },
         ];
 
@@ -18413,6 +18459,7 @@ mod tests {
             buffer_size: 11,
             schema_name: String::new(),
             type_name: String::new(),
+            json_encoding: JsonEncoding::None,
         }]);
         let mut row = vec![11];
         row.extend_from_slice(&[128, 0, 0, 2, 72, 83, 94, 155, 46, 2, 0]);
@@ -18438,6 +18485,7 @@ mod tests {
             buffer_size: 4,
             schema_name: String::new(),
             type_name: String::new(),
+            json_encoding: JsonEncoding::None,
         }]);
         let mut row = vec![4];
         row.extend_from_slice(&[195, 6, 115, 51]);
@@ -18464,6 +18512,7 @@ mod tests {
                 buffer_size: 4,
                 schema_name: String::new(),
                 type_name: String::new(),
+                json_encoding: JsonEncoding::None,
             },
             ThinColumn {
                 name: "BD".to_string(),
@@ -18475,6 +18524,7 @@ mod tests {
                 buffer_size: 8,
                 schema_name: String::new(),
                 type_name: String::new(),
+                json_encoding: JsonEncoding::None,
             },
         ]);
         let mut row = vec![4];
@@ -19216,6 +19266,7 @@ mod tests {
                 buffer_size: 22,
                 schema_name: String::new(),
                 type_name: String::new(),
+                json_encoding: JsonEncoding::None,
             },
             ThinColumn {
                 name: "S".to_string(),
@@ -19227,6 +19278,7 @@ mod tests {
                 buffer_size: 10,
                 schema_name: String::new(),
                 type_name: String::new(),
+                json_encoding: JsonEncoding::None,
             },
             ThinColumn {
                 name: "CLV".to_string(),
@@ -19238,6 +19290,7 @@ mod tests {
                 buffer_size: 10,
                 schema_name: String::new(),
                 type_name: String::new(),
+                json_encoding: JsonEncoding::None,
             },
             ThinColumn {
                 name: "R".to_string(),
@@ -19249,6 +19302,7 @@ mod tests {
                 buffer_size: 3,
                 schema_name: String::new(),
                 type_name: String::new(),
+                json_encoding: JsonEncoding::None,
             },
             ThinColumn {
                 name: "D".to_string(),
@@ -19260,6 +19314,7 @@ mod tests {
                 buffer_size: 7,
                 schema_name: String::new(),
                 type_name: String::new(),
+                json_encoding: JsonEncoding::None,
             },
             ThinColumn {
                 name: "C".to_string(),
@@ -19271,6 +19326,7 @@ mod tests {
                 buffer_size: 4,
                 schema_name: String::new(),
                 type_name: String::new(),
+                json_encoding: JsonEncoding::None,
             },
             ThinColumn {
                 name: "U".to_string(),
@@ -19282,6 +19338,7 @@ mod tests {
                 buffer_size: 8,
                 schema_name: String::new(),
                 type_name: String::new(),
+                json_encoding: JsonEncoding::None,
             },
             ThinColumn {
                 name: "T".to_string(),
@@ -19293,6 +19350,7 @@ mod tests {
                 buffer_size: 11,
                 schema_name: String::new(),
                 type_name: String::new(),
+                json_encoding: JsonEncoding::None,
             },
             ThinColumn {
                 name: "TTZ".to_string(),
@@ -19304,6 +19362,7 @@ mod tests {
                 buffer_size: 13,
                 schema_name: String::new(),
                 type_name: String::new(),
+                json_encoding: JsonEncoding::None,
             },
             ThinColumn {
                 name: "RID".to_string(),
@@ -19315,6 +19374,7 @@ mod tests {
                 buffer_size: 18,
                 schema_name: String::new(),
                 type_name: String::new(),
+                json_encoding: JsonEncoding::None,
             },
         ]);
         let caps = OracleThinCapabilities::default();
@@ -19388,6 +19448,7 @@ mod tests {
             buffer_size: 3,
             schema_name: String::new(),
             type_name: String::new(),
+            json_encoding: JsonEncoding::None,
         }]);
         let mut caps = OracleThinCapabilities {
             protocol_version: Some(314),
@@ -19418,6 +19479,7 @@ mod tests {
             buffer_size: 3,
             schema_name: String::new(),
             type_name: String::new(),
+            json_encoding: JsonEncoding::None,
         }]);
         let caps = OracleThinCapabilities {
             protocol_version: Some(315),
@@ -19446,6 +19508,7 @@ mod tests {
                 buffer_size: 3,
                 schema_name: String::new(),
                 type_name: String::new(),
+                json_encoding: JsonEncoding::None,
             }],
             ..ExecuteReadState::default()
         };
@@ -19477,6 +19540,7 @@ mod tests {
                 buffer_size: 4,
                 schema_name: String::new(),
                 type_name: String::new(),
+                json_encoding: JsonEncoding::None,
             }],
             ..ExecuteReadState::default()
         };
@@ -19501,6 +19565,7 @@ mod tests {
             buffer_size: 11,
             schema_name: String::new(),
             type_name: String::new(),
+            json_encoding: JsonEncoding::None,
         }]);
         let row = [11, 120, 124, 1, 2, 4, 5, 6, 0, 1, 226, 64];
         let mut cursor = PacketCursor::with_capabilities(&row, &OracleThinCapabilities::default());
@@ -19535,6 +19600,7 @@ mod tests {
             buffer_size: 13,
             schema_name: String::new(),
             type_name: String::new(),
+            json_encoding: JsonEncoding::None,
         }]);
         let row = [13, 120, 124, 1, 2, 4, 5, 6, 7, 91, 202, 0, 25, 105];
         let mut cursor = PacketCursor::with_capabilities(&row, &OracleThinCapabilities::default());
@@ -19569,6 +19635,7 @@ mod tests {
             buffer_size: 0,
             schema_name: String::new(),
             type_name: String::new(),
+            json_encoding: JsonEncoding::None,
         });
 
         assert_eq!(thin.charset_form, CS_FORM_NCHAR);
@@ -19587,11 +19654,14 @@ mod tests {
             buffer_size: 0,
             schema_name: String::new(),
             type_name: String::new(),
+            json_encoding: JsonEncoding::None,
         });
 
         assert_eq!(thin.charset_form, CS_FORM_NCHAR);
         assert_eq!(thin.ora_type_num, ORA_TYPE_NUM_LONG);
-        assert_eq!(thin.column_type, OracleColumnType::Long);
+        // A define rewrites the wire type only; `column_type` keeps describing
+        // what the column actually is.
+        assert_eq!(thin.column_type, OracleColumnType::Nclob);
     }
 
     #[test]
@@ -19634,6 +19704,7 @@ mod tests {
             buffer_size: 13,
             schema_name: "APP".to_string(),
             type_name: "EVENT_OBJ".to_string(),
+            json_encoding: JsonEncoding::None,
         };
         let public = column_metadata_from_thin(&original);
         let restored = thin_column_from_column_metadata(&public);
@@ -19672,6 +19743,7 @@ mod tests {
                 buffer_size: 13,
                 schema_name: String::new(),
                 type_name: String::new(),
+                json_encoding: JsonEncoding::None,
             }],
         );
 
@@ -19687,6 +19759,145 @@ mod tests {
         assert_eq!(define_columns[0].buffer_size, 13);
     }
 
+    fn described_column(
+        column_type: OracleColumnType,
+        ora_type_num: u8,
+        charset_form: u8,
+        json_encoding: JsonEncoding,
+    ) -> ColumnMetadata {
+        ColumnMetadata {
+            name: "PAYLOAD".to_string(),
+            column_type,
+            precision: 0,
+            scale: 0,
+            charset_form,
+            ora_type_num,
+            buffer_size: 4000,
+            schema_name: String::new(),
+            type_name: String::new(),
+            json_encoding,
+        }
+    }
+
+    #[test]
+    fn is_json_annotation_never_changes_the_define_wire_type() {
+        // A `VARCHAR2`/`CLOB` carrying an `IS JSON` check constraint stays a
+        // character column on the wire: python-oracledb reports
+        // DB_TYPE_VARCHAR / DB_TYPE_CLOB for these and only attaches an
+        // out-converter. Defining them as native JSON desynchronises the TTC
+        // stream, because the server keeps sending length-prefixed text.
+        let varchar = define_column_metadata(&described_column(
+            OracleColumnType::Varchar,
+            ORA_TYPE_NUM_VARCHAR,
+            CS_FORM_IMPLICIT,
+            JsonEncoding::Text,
+        ));
+        assert_eq!(varchar.ora_type_num, ORA_TYPE_NUM_VARCHAR);
+        assert_eq!(varchar.charset_form, CS_FORM_IMPLICIT);
+        assert_eq!(varchar.buffer_size, 4000);
+
+        let nvarchar = define_column_metadata(&described_column(
+            OracleColumnType::Varchar,
+            ORA_TYPE_NUM_VARCHAR,
+            CS_FORM_NCHAR,
+            JsonEncoding::Text,
+        ));
+        assert_eq!(nvarchar.ora_type_num, ORA_TYPE_NUM_VARCHAR);
+        assert_eq!(nvarchar.charset_form, CS_FORM_NCHAR);
+
+        let clob = define_column_metadata(&described_column(
+            OracleColumnType::Clob,
+            ORA_TYPE_NUM_CLOB,
+            CS_FORM_IMPLICIT,
+            JsonEncoding::Text,
+        ));
+        assert_eq!(clob.ora_type_num, ORA_TYPE_NUM_LONG);
+        assert_eq!(clob.charset_form, CS_FORM_IMPLICIT);
+        assert_eq!(clob.buffer_size, TNS_MAX_LONG_LENGTH);
+    }
+
+    #[test]
+    fn oson_annotation_defines_binary_columns_as_native_json() {
+        // Protocol 314 describes even a native JSON column as an OSON-flagged
+        // BLOB, so the JSON wire type is what has to be asked for.
+        for (column_type, ora_type_num) in [
+            (OracleColumnType::Blob, ORA_TYPE_NUM_BLOB),
+            (OracleColumnType::Raw, ORA_TYPE_NUM_RAW),
+            (OracleColumnType::Json, ORA_TYPE_NUM_JSON),
+        ] {
+            let thin = define_column_metadata(&described_column(
+                column_type,
+                ora_type_num,
+                0,
+                JsonEncoding::Oson,
+            ));
+            assert_eq!(thin.ora_type_num, ORA_TYPE_NUM_JSON, "{column_type:?}");
+            assert_eq!(thin.buffer_size, TNS_JSON_MAX_LENGTH, "{column_type:?}");
+            assert_eq!(thin.json_encoding, JsonEncoding::Oson, "{column_type:?}");
+        }
+
+        // Character storage cannot hold OSON, so its wire type is left alone
+        // whatever the flags say.
+        let varchar = define_column_metadata(&described_column(
+            OracleColumnType::Varchar,
+            ORA_TYPE_NUM_VARCHAR,
+            CS_FORM_IMPLICIT,
+            JsonEncoding::Oson,
+        ));
+        assert_eq!(varchar.ora_type_num, ORA_TYPE_NUM_VARCHAR);
+    }
+
+    #[test]
+    fn json_annotated_character_columns_keep_their_charset_form() {
+        // `normalize_metadata_charset_form` drops the charset form of
+        // non-character columns; when the `IS JSON` flag was folded into
+        // `column_type` it dropped it for JSON-annotated text columns too,
+        // which decoded NCHAR data with the database character set.
+        assert_eq!(
+            normalize_metadata_charset_form(OracleColumnType::Varchar, CS_FORM_NCHAR),
+            CS_FORM_NCHAR
+        );
+        assert_eq!(
+            normalize_metadata_charset_form(OracleColumnType::Clob, CS_FORM_IMPLICIT),
+            CS_FORM_IMPLICIT
+        );
+    }
+
+    #[test]
+    fn uds_flags_map_to_the_json_encoding_python_oracledb_reports() {
+        assert_eq!(json_encoding_from_uds_flags(0), JsonEncoding::None);
+        assert_eq!(
+            json_encoding_from_uds_flags(TNS_UDS_FLAGS_IS_JSON),
+            JsonEncoding::Text
+        );
+        assert_eq!(
+            json_encoding_from_uds_flags(TNS_UDS_FLAGS_IS_JSON | TNS_UDS_FLAGS_IS_OSON),
+            JsonEncoding::Oson
+        );
+    }
+
+    #[test]
+    fn json_annotated_text_columns_do_not_force_a_define_fetch() {
+        // python-oracledb only sets `_requires_define` / `_no_prefetch` for
+        // BLOB, CLOB, JSON and VECTOR wire types.
+        assert!(!columns_require_define_fetch_for_values(&[
+            described_column(
+                OracleColumnType::Varchar,
+                ORA_TYPE_NUM_VARCHAR,
+                CS_FORM_IMPLICIT,
+                JsonEncoding::Text,
+            )
+        ]));
+        assert!(columns_require_define_fetch_for_values(&[
+            described_column(
+                OracleColumnType::Clob,
+                ORA_TYPE_NUM_CLOB,
+                CS_FORM_IMPLICIT,
+                JsonEncoding::Text,
+            )
+        ]));
+    }
+
     #[test]
     fn long_raw_wire_type_requires_define_even_when_public_type_is_raw() {
         let column = ColumnMetadata {
@@ -19699,6 +19910,7 @@ mod tests {
             buffer_size: 0,
             schema_name: String::new(),
             type_name: String::new(),
+            json_encoding: JsonEncoding::None,
         };
 
         assert!(columns_require_define_fetch_for_values(
@@ -19730,6 +19942,7 @@ mod tests {
                 buffer_size: 4000,
                 schema_name: String::new(),
                 type_name: String::new(),
+                json_encoding: JsonEncoding::None,
             };
             let mut payload = Vec::new();
 
@@ -19765,6 +19978,7 @@ mod tests {
             buffer_size: TNS_JSON_MAX_LENGTH,
             schema_name: String::new(),
             type_name: String::new(),
+            json_encoding: JsonEncoding::None,
         };
         let mut payload = Vec::new();
 
@@ -19863,6 +20077,7 @@ mod tests {
                 buffer_size: 18,
                 schema_name: String::new(),
                 type_name: String::new(),
+                json_encoding: JsonEncoding::None,
             },
             ThinColumn {
                 name: "URID".to_string(),
@@ -19874,6 +20089,7 @@ mod tests {
                 buffer_size: 18,
                 schema_name: String::new(),
                 type_name: String::new(),
+                json_encoding: JsonEncoding::None,
             },
         ]);
         let row = [
@@ -19905,6 +20121,7 @@ mod tests {
                 buffer_size: 18,
                 schema_name: String::new(),
                 type_name: String::new(),
+                json_encoding: JsonEncoding::None,
             },
             ThinColumn {
                 name: "URID".to_string(),
@@ -19916,6 +20133,7 @@ mod tests {
                 buffer_size: 18,
                 schema_name: String::new(),
                 type_name: String::new(),
+                json_encoding: JsonEncoding::None,
             },
         ]);
         let row = [0, 0];
@@ -20370,6 +20588,7 @@ mod tests {
             buffer_size: TNS_JSON_MAX_LENGTH,
             schema_name: String::new(),
             type_name: String::new(),
+            json_encoding: JsonEncoding::None,
         }]);
         let oson = [
             0xff, 0x4a, 0x5a, 0x01, 0x00, 0x12, 0x00, 0x03, 0x02, b'o', b'k',
@@ -20412,6 +20631,7 @@ mod tests {
             buffer_size: TNS_JSON_MAX_LENGTH,
             schema_name: String::new(),
             type_name: String::new(),
+            json_encoding: JsonEncoding::None,
         }]);
         let json = br#"{"k":"v"}"#;
         let mut row = Vec::new();
@@ -20452,6 +20672,7 @@ mod tests {
             buffer_size: TNS_MAX_LONG_LENGTH,
             schema_name: String::new(),
             type_name: String::new(),
+            json_encoding: JsonEncoding::None,
         }]);
         let mut xml_payload = vec![TNS_OBJ_NO_PREFIX_SEG, 1, 0, 1];
         xml_payload.extend_from_slice(&TNS_XML_TYPE_STRING.to_be_bytes());
@@ -20492,6 +20713,7 @@ mod tests {
             buffer_size: TNS_MAX_LONG_LENGTH,
             schema_name: String::new(),
             type_name: String::new(),
+            json_encoding: JsonEncoding::None,
         }]);
         let mut xml_payload = vec![TNS_OBJ_NO_PREFIX_SEG, 1, 0, 1];
         xml_payload.extend_from_slice(&TNS_XML_TYPE_LOB.to_be_bytes());
@@ -20532,6 +20754,7 @@ mod tests {
             buffer_size: TNS_MAX_LONG_LENGTH,
             schema_name: String::new(),
             type_name: String::new(),
+            json_encoding: JsonEncoding::None,
         }]);
         let mut xml_payload = vec![TNS_OBJ_IS_DEGENERATE, 1, 0, 1];
         xml_payload.extend_from_slice(&TNS_XML_TYPE_LOB.to_be_bytes());
@@ -20572,6 +20795,7 @@ mod tests {
             buffer_size: 1,
             schema_name: "APP".to_string(),
             type_name: "OBJ_T".to_string(),
+            json_encoding: JsonEncoding::None,
         };
         let mut object_attrs_by_type = HashMap::new();
         object_attrs_by_type.insert(
@@ -20586,6 +20810,7 @@ mod tests {
                 buffer_size: 1,
                 schema_name: String::new(),
                 type_name: String::new(),
+                json_encoding: JsonEncoding::None,
             }],
         );
         let payload = vec![TNS_OBJ_IS_DEGENERATE, 1, 0, 1];
@@ -20632,6 +20857,7 @@ mod tests {
             buffer_size: 1,
             schema_name: String::new(),
             type_name: String::new(),
+            json_encoding: JsonEncoding::None,
         };
         let payload = vec![TNS_OBJ_IS_DEGENERATE, 1, 0, 1];
 
@@ -20662,6 +20888,7 @@ mod tests {
             buffer_size: 1,
             schema_name: String::new(),
             type_name: String::new(),
+            json_encoding: JsonEncoding::None,
         };
         let mut payload = vec![TNS_OBJ_NO_PREFIX_SEG, 1, 0, TNS_OBJ_HAS_INDEXES, 1];
         payload.extend_from_slice(&5_i32.to_be_bytes());
@@ -20696,6 +20923,7 @@ mod tests {
             buffer_size: 1,
             schema_name: "APP".to_string(),
             type_name: "OBJ_T".to_string(),
+            json_encoding: JsonEncoding::None,
         };
         let attr = ThinColumn {
             name: "BI".to_string(),
@@ -20707,6 +20935,7 @@ mod tests {
             buffer_size: 4,
             schema_name: String::new(),
             type_name: String::new(),
+            json_encoding: JsonEncoding::None,
         };
         let mut object_attrs_by_type = HashMap::new();
         object_attrs_by_type.insert(("APP".to_string(), "OBJ_T".to_string()), vec![attr]);
@@ -20744,6 +20973,7 @@ mod tests {
             buffer_size: 1,
             schema_name: "APP".to_string(),
             type_name: "OBJ_T".to_string(),
+            json_encoding: JsonEncoding::None,
         };
         let attrs = vec![
             ThinColumn {
@@ -20756,6 +20986,7 @@ mod tests {
                 buffer_size: 4,
                 schema_name: String::new(),
                 type_name: String::new(),
+                json_encoding: JsonEncoding::None,
             },
             ThinColumn {
                 name: "TRUE_VALUE".to_string(),
@@ -20767,6 +20998,7 @@ mod tests {
                 buffer_size: 4,
                 schema_name: String::new(),
                 type_name: String::new(),
+                json_encoding: JsonEncoding::None,
             },
         ];
         let mut object_attrs_by_type = HashMap::new();
@@ -20807,6 +21039,7 @@ mod tests {
             buffer_size: 1,
             schema_name: "APP".to_string(),
             type_name: "OBJ_T".to_string(),
+            json_encoding: JsonEncoding::None,
         };
         let attr = ThinColumn {
             name: "PAYLOAD".to_string(),
@@ -20818,6 +21051,7 @@ mod tests {
             buffer_size: TNS_MAX_LONG_LENGTH,
             schema_name: String::new(),
             type_name: String::new(),
+            json_encoding: JsonEncoding::None,
         };
         let mut object_attrs_by_type = HashMap::new();
         object_attrs_by_type.insert(("APP".to_string(), "OBJ_T".to_string()), vec![attr]);
@@ -20855,6 +21089,7 @@ mod tests {
             buffer_size: 1,
             schema_name: "APP".to_string(),
             type_name: "OBJ_T".to_string(),
+            json_encoding: JsonEncoding::None,
         };
         let attr = thin_column_from_object_attr(
             "PAYLOAD".to_string(),
@@ -20901,6 +21136,7 @@ mod tests {
             buffer_size: 1,
             schema_name: "APP".to_string(),
             type_name: "OBJ_T".to_string(),
+            json_encoding: JsonEncoding::None,
         };
         let attr = ThinColumn {
             name: "PAYLOAD".to_string(),
@@ -20912,6 +21148,7 @@ mod tests {
             buffer_size: TNS_MAX_LONG_LENGTH,
             schema_name: String::new(),
             type_name: String::new(),
+            json_encoding: JsonEncoding::None,
         };
         let mut object_attrs_by_type = HashMap::new();
         object_attrs_by_type.insert(("APP".to_string(), "OBJ_T".to_string()), vec![attr]);
@@ -20949,6 +21186,7 @@ mod tests {
             buffer_size: 1,
             schema_name: "APP".to_string(),
             type_name: "PARENT_T".to_string(),
+            json_encoding: JsonEncoding::None,
         };
         let child_attr = ThinColumn {
             name: "CHILD".to_string(),
@@ -20960,6 +21198,7 @@ mod tests {
             buffer_size: 1,
             schema_name: "APP".to_string(),
             type_name: "CHILD_T".to_string(),
+            json_encoding: JsonEncoding::None,
         };
         let child_value_attr = ThinColumn {
             name: "A".to_string(),
@@ -20971,6 +21210,7 @@ mod tests {
             buffer_size: 1,
             schema_name: String::new(),
             type_name: String::new(),
+            json_encoding: JsonEncoding::None,
         };
         let mut object_attrs_by_type = HashMap::new();
         object_attrs_by_type.insert(
@@ -21014,6 +21254,7 @@ mod tests {
             buffer_size: 4,
             schema_name: String::new(),
             type_name: String::new(),
+            json_encoding: JsonEncoding::None,
         };
         let mut payload = vec![TNS_OBJ_NO_PREFIX_SEG, 1, 0, 0, 2];
         payload.push(4);
@@ -21052,6 +21293,7 @@ mod tests {
             buffer_size: 1,
             schema_name: String::new(),
             type_name: String::new(),
+            json_encoding: JsonEncoding::None,
         }]);
         let mut row = Vec::new();
         write_ub4(&mut row, 1);
@@ -21083,6 +21325,7 @@ mod tests {
             buffer_size: 1,
             schema_name: String::new(),
             type_name: String::new(),
+            json_encoding: JsonEncoding::None,
         }]);
         let vector = [
             0xdb, 0, 0, 0x12, 2, 0, 0, 0, 2, 0, 0, 0, 0, 0, 0, 0, 0, 195, 6, 115, 51, 60, 249, 140,
@@ -22744,6 +22987,7 @@ mod tests {
                     buffer_size: 10,
                     schema_name: String::new(),
                     type_name: String::new(),
+                    json_encoding: JsonEncoding::None,
                 },
                 ThinColumn {
                     name: "B".to_string(),
@@ -22755,6 +22999,7 @@ mod tests {
                     buffer_size: 10,
                     schema_name: String::new(),
                     type_name: String::new(),
+                    json_encoding: JsonEncoding::None,
                 },
             ],
             last_row: Some(vec![
