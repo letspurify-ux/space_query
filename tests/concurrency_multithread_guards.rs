@@ -1926,13 +1926,9 @@ fn mysql_use_refreshes_metadata_without_connection_transition() {
         // from the connection's stored name would arrive right behind it and
         // overwrite that with another tab's database.
         assert!(
-            use_branch.contains("QueryProgress::ScopeChangedNotice")
+            use_branch.contains("note_batch_scope_change")
                 && !use_branch.contains("QueryProgress::DatabaseChanged"),
             "USE should report its scope once, from the statement's own target"
-        );
-        assert!(
-            use_branch.contains("QueryProgress::MetadataRefreshNeeded"),
-            "USE should refresh the catalog for the tab that moved"
         );
         if syncs_shared_connection {
             // This path runs the USE on the shared connection itself, so the
@@ -1952,8 +1948,8 @@ fn mysql_use_refreshes_metadata_without_connection_transition() {
             );
         }
         assert!(
-            use_branch.contains("selected_scope: Some"),
-            "USE should carry the selected database so the global selected scope can update"
+            use_branch.contains("Some(current_database.to_string())"),
+            "USE should carry the database it selected into the scope change"
         );
         assert!(
             !use_branch.contains("QueryProgress::ConnectionChanged"),
@@ -1983,11 +1979,11 @@ fn mysql_plain_use_statement_updates_scope_and_refreshes_metadata() {
     );
     assert!(
         branch.contains("selected_scope"),
-        "plain USE should include selected_scope in ScopeChangedNotice"
+        "plain USE should carry the selected database into the scope change"
     );
     assert!(
-        branch.contains("QueryProgress::MetadataRefreshNeeded"),
-        "plain USE should trigger metadata refresh after selecting the database"
+        branch.contains("note_batch_scope_change"),
+        "plain USE should record and report its scope change in one step"
     );
 }
 
@@ -2056,17 +2052,24 @@ fn oracle_current_schema_change_updates_object_browser_scope_before_refresh() {
         .expect("Oracle current schema branch end marker should exist");
     let branch = &execution[start..end];
     assert!(
-        branch.contains("selected_scope: Some(current_schema)"),
+        branch.contains("note_batch_scope_change") && branch.contains("Some(current_schema)"),
         "Oracle current schema change notice should carry the selected scope"
     );
+    // Ordering (scope first, then metadata refresh) now lives inside the one
+    // choke point, so every backend gets it: see
+    // `a_mid_batch_scope_change_is_recorded_where_the_batch_reads_its_scope`.
+    let notice = execution
+        .find("fn note_batch_scope_change(")
+        .expect("choke point should exist");
+    let notice_body = &execution[notice..];
     assert!(
-        branch
+        notice_body
             .find("QueryProgress::ScopeChangedNotice")
-            .expect("Oracle branch should send ScopeChangedNotice")
-            < branch
+            .expect("the choke point should send ScopeChangedNotice")
+            < notice_body
                 .find("QueryProgress::MetadataRefreshNeeded")
-                .expect("Oracle branch should request metadata refresh"),
-        "Oracle should update the UI selected scope before requesting metadata refresh"
+                .expect("the choke point should request metadata refresh"),
+        "the UI selected scope must be updated before the metadata refresh is requested"
     );
 
     let main_file = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/ui/main_window.rs");
@@ -3732,6 +3735,62 @@ fn execution_resolves_scope_from_the_requesting_tab_for_every_backend() {
     assert!(
         !connection.contains("pub fn oracle_schema_for_scope"),
         "a second Oracle scope rule is how the sessions drifted apart"
+    );
+}
+
+/// A scope change inside a batch is recorded where the batch reads its scope.
+///
+/// `USE` and `ALTER SESSION SET CURRENT_SCHEMA` move the session the batch is
+/// running on. Every later statement of the same batch is prepared from the
+/// batch's scope cell, so a site that reports the move without writing that
+/// cell leaves the rest of the script running where the tab was when the run
+/// started — silently, in another database. Recording and reporting are one
+/// step (`note_batch_scope_change`) so the two cannot drift apart again.
+#[test]
+fn a_mid_batch_scope_change_is_recorded_where_the_batch_reads_its_scope() {
+    let execution = read_source("src/ui/sql_editor/execution.rs");
+
+    assert!(
+        execution.contains("fn note_batch_scope_change(")
+            && execution.contains("record_scope: impl FnOnce(&str),"),
+        "the batch's scope change must have one choke point that records the new scope"
+    );
+
+    // Every report of a scope change from an executing batch goes through it.
+    let helper = execution
+        .find("fn note_batch_scope_change(")
+        .expect("choke point should exist");
+    let helper_end = execution[helper..]
+        .find("\n    fn ")
+        .map(|at| helper + at)
+        .unwrap_or(execution.len());
+    const NOTICE: &str = "send(QueryProgress::ScopeChangedNotice";
+    let mut raw_sends = 0usize;
+    let mut search_from = 0usize;
+    while let Some(offset) = execution[search_from..].find(NOTICE) {
+        let start = search_from + offset;
+        search_from = start + NOTICE.len();
+        if (helper..helper_end).contains(&start) {
+            continue;
+        }
+        raw_sends += 1;
+    }
+    assert_eq!(
+        raw_sends, 0,
+        "a batch must not report a scope change without recording it: \
+         send it through note_batch_scope_change"
+    );
+
+    // The Oracle batch's scope is a cell, not a start-of-run snapshot.
+    assert!(
+        execution.contains("let operation_scope = Mutex::new(binding_snapshot.scope.clone());")
+            && execution.contains("let current_operation_scope = ||"),
+        "the Oracle batch must read its CURRENT scope, not the one the run started with"
+    );
+    assert!(
+        !execution.contains("operation_scope.as_deref()")
+            && !execution.contains("operation_scope.clone(),"),
+        "reads of the Oracle batch scope must go through current_operation_scope()"
     );
 }
 

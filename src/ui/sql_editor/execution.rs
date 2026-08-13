@@ -2433,6 +2433,14 @@ impl LazyFetchAllTimeout {
     }
 }
 
+/// Write the scope a batch is now running in into the cell its statement loop
+/// reads. The recorder half of [`SqlEditorWidget::note_batch_scope_change`].
+fn store_batch_scope(execution_scope: &Mutex<Option<String>>, scope: &str) {
+    *execution_scope
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(scope.to_string());
+}
+
 fn lazy_fetch_all_timeout_for_fetch_all(
     query_timeout: Option<Duration>,
     already_fetched_rows: usize,
@@ -8096,12 +8104,12 @@ impl SqlEditorWidget {
                                         session,
                                         SqlEditorWidget::message_lines(&notice),
                                     );
-                                    let _ = sender.send(QueryProgress::ScopeChangedNotice {
-                                        message: notice,
-                                        selected_scope: Some(current_database.to_string()),
-                                    });
-                                    let _ = sender.send(QueryProgress::MetadataRefreshNeeded);
-                                    app::awake();
+                                    SqlEditorWidget::note_batch_scope_change(
+                                        |scope| store_batch_scope(&execution_scope, scope),
+                                        sender,
+                                        notice,
+                                        Some(current_database.to_string()),
+                                    );
                                 }
                                 Err(error) => {
                                     let MySqlBatchStatementError {
@@ -8759,12 +8767,6 @@ impl SqlEditorWidget {
                                 } else {
                                     None
                                 };
-                            if let Some((_, Some(scope))) = &current_database_notice {
-                                *execution_scope
-                                    .lock()
-                                    .unwrap_or_else(|poisoned| poisoned.into_inner()) =
-                                    Some(scope.clone());
-                            }
                             if load_mutex_bool(cancel_flag) {
                                 stop_execution = true;
                             }
@@ -8841,12 +8843,12 @@ impl SqlEditorWidget {
                                 app::awake();
                             }
                             if let Some((message, selected_scope)) = current_database_notice {
-                                let _ = sender.send(QueryProgress::ScopeChangedNotice {
+                                SqlEditorWidget::note_batch_scope_change(
+                                    |scope| store_batch_scope(&execution_scope, scope),
+                                    sender,
                                     message,
                                     selected_scope,
-                                });
-                                let _ = sender.send(QueryProgress::MetadataRefreshNeeded);
-                                app::awake();
+                                );
                             }
                             if stop_after_success {
                                 SqlEditorWidget::emit_script_message(
@@ -9718,7 +9720,11 @@ impl SqlEditorWidget {
         let tab_session = self.connection_binding.session_state();
         let connection_binding_for_worker = self.connection_binding.clone();
         let initial_binding_revision = binding_snapshot.revision;
-        let operation_scope = binding_snapshot.scope.clone();
+        // The scope this run is CURRENTLY in. It starts as the tab's, and a
+        // statement that moves the session (`ALTER SESSION SET CURRENT_SCHEMA`)
+        // updates it through `note_batch_scope_change`, so the rest of the run
+        // is prepared where that statement landed.
+        let operation_scope = Mutex::new(binding_snapshot.scope.clone());
         let runtime_work_guard = binding_snapshot
             .runtime
             .as_ref()
@@ -9847,6 +9853,12 @@ impl SqlEditorWidget {
             .name("query-execution".to_string())
             .spawn(move || {
             let mut runtime_work_guard = runtime_work_guard;
+            let current_operation_scope = || {
+                operation_scope
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .clone()
+            };
             let result = panic::catch_unwind(AssertUnwindSafe(|| {
                 let mut shared_connection = shared_connection;
                 let mut binding_revision = initial_binding_revision;
@@ -10048,7 +10060,7 @@ impl SqlEditorWidget {
                         lazy_fetch_batch_size,
                         db_activity: &db_activity,
                         current_operation_autocommit: &current_operation_autocommit,
-                        execution_scope: operation_scope.clone(),
+                        execution_scope: current_operation_scope(),
                         runtime_work_guard: &mut runtime_work_guard,
                     },
                     &mut cleanup,
@@ -10057,6 +10069,7 @@ impl SqlEditorWidget {
                     ExecutionWorkerOutcome::Handled => return,
                 };
 
+                let acquire_scope = current_operation_scope();
                 let (guard_after_acquire, acquire_result) =
                     Self::acquire_oracle_pooled_execution_connection(
                         conn_guard,
@@ -10065,7 +10078,7 @@ impl SqlEditorWidget {
                         &sender,
                         startup_policy.allows_disconnected_start,
                         &pooled_db_session,
-                        operation_scope.as_deref(),
+                        acquire_scope.as_deref(),
                     );
                 let conn_guard = guard_after_acquire;
                 let (mut conn_opt, oracle_prior_retained_state, oracle_pool_context_epoch) =
@@ -10176,7 +10189,7 @@ impl SqlEditorWidget {
                     );
                     cleanup.track_oracle_pooled_session_scope_connection(
                         shared_connection.clone(),
-                        operation_scope.clone(),
+                        current_operation_scope(),
                     );
                 }
                 let explicit_transaction_first_statement =
@@ -12204,16 +12217,14 @@ impl SqlEditorWidget {
                                                 &session,
                                                 SqlEditorWidget::message_lines(&notice),
                                             );
-                                            let _ =
-                                                sender.send(QueryProgress::ScopeChangedNotice {
-                                                    message: notice,
-                                                    selected_scope: Some(
-                                                        current_database.to_string(),
-                                                    ),
-                                                });
-                                            let _ = sender
-                                                .send(QueryProgress::MetadataRefreshNeeded);
-                                            app::awake();
+                                            SqlEditorWidget::note_batch_scope_change(
+                                                |scope| {
+                                                    store_batch_scope(&operation_scope, scope)
+                                                },
+                                                &sender,
+                                                notice,
+                                                Some(current_database.to_string()),
+                                            );
                                         }
                                         Err(msg) => {
                                             SqlEditorWidget::emit_script_message(
@@ -12672,13 +12683,14 @@ impl SqlEditorWidget {
                                 continue;
                             }
 
+                            let statement_scope = current_operation_scope();
                             if let Err(message) =
                                 Self::apply_oracle_schema_before_pooled_action(
                                     &shared_connection,
                                     conn,
                                     &db_activity,
                                     connection_generation,
-                                    operation_scope.as_deref(),
+                                    statement_scope.as_deref(),
                                 )
                             {
                                 let emitted = SqlEditorWidget::emit_non_select_result(
@@ -13754,7 +13766,7 @@ impl SqlEditorWidget {
                                         lazy_fetch_batch_size,
                                         query_timeout,
                                         previous_timeout,
-                                        operation_scope.clone(),
+                                        current_operation_scope(),
                                     ) {
                                         Ok(()) => {
                                             // The lazy worker now owns this pooled connection and
@@ -14572,14 +14584,21 @@ impl SqlEditorWidget {
                                                 }
                                             }
                                             result.message = notice.clone();
-                                            let _ =
-                                                sender.send(QueryProgress::ScopeChangedNotice {
-                                                    message: notice,
-                                                    selected_scope: Some(current_schema),
-                                                });
-                                            let _ =
-                                                sender.send(QueryProgress::MetadataRefreshNeeded);
-                                            app::awake();
+                                            SqlEditorWidget::note_batch_scope_change(
+                                                |scope| {
+                                                    store_batch_scope(&operation_scope, scope)
+                                                },
+                                                &sender,
+                                                notice,
+                                                Some(current_schema),
+                                            );
+                                            // The end-of-batch re-apply must
+                                            // aim at where the session now is,
+                                            // not where the run started.
+                                            cleanup.track_oracle_pooled_session_scope_connection(
+                                                shared_connection.clone(),
+                                                current_operation_scope(),
+                                            );
                                         }
                                         Err(message) => {
                                             cleanup.invalidate_oracle_pooled_session();
@@ -18721,21 +18740,21 @@ impl SqlEditorWidget {
                                                 }
                                             }
                                             message = notice.clone();
-                                            if let Some(context) = transition_context.as_deref_mut()
-                                            {
-                                                context.binding_revision = context
-                                                    .connection_binding
-                                                    .set_scope(Some(current_schema.clone()));
-                                                context.scope = Some(current_schema.clone());
-                                            }
-                                            let _ =
-                                                sender.send(QueryProgress::ScopeChangedNotice {
-                                                    message: notice,
-                                                    selected_scope: Some(current_schema),
-                                                });
-                                            let _ =
-                                                sender.send(QueryProgress::MetadataRefreshNeeded);
-                                            app::awake();
+                                            SqlEditorWidget::note_batch_scope_change(
+                                                |scope| {
+                                                    if let Some(context) =
+                                                        transition_context.as_deref_mut()
+                                                    {
+                                                        context.binding_revision = context
+                                                            .connection_binding
+                                                            .set_scope(Some(scope.to_string()));
+                                                        context.scope = Some(scope.to_string());
+                                                    }
+                                                },
+                                                sender,
+                                                notice,
+                                                Some(current_schema),
+                                            );
                                         }
                                         Err(message) => {
                                             invalid_session = true;
@@ -20179,6 +20198,38 @@ impl SqlEditorWidget {
             ),
             spool_line,
         ]
+    }
+
+    /// Record where a statement moved THIS batch's session to, and report it.
+    ///
+    /// A statement can move its own session mid-batch (`USE`,
+    /// `ALTER SESSION SET CURRENT_SCHEMA`). Everything the batch does after
+    /// that must happen where the statement landed: the per-statement session
+    /// preparation, the end-of-batch re-apply and a lazy fetch that takes the
+    /// session over all read the batch's own record of its scope. Recording
+    /// and reporting are therefore one step — when they were separate, two of
+    /// the four `USE`/`ALTER SESSION` sites reported the move without
+    /// recording it, and the rest of the same script ran in the scope the tab
+    /// had when the run started (`use db` on MySQL/MariaDB, and
+    /// `ALTER SESSION SET CURRENT_SCHEMA` on Oracle OCI).
+    ///
+    /// `record_scope` writes wherever this batch keeps that scope: a cell the
+    /// statement loop reads, or the transition context the thin batch carries.
+    fn note_batch_scope_change(
+        record_scope: impl FnOnce(&str),
+        sender: &QueryProgressSender,
+        message: String,
+        selected_scope: Option<String>,
+    ) {
+        if let Some(scope) = selected_scope.as_deref() {
+            record_scope(scope);
+        }
+        let _ = sender.send(QueryProgress::ScopeChangedNotice {
+            message,
+            selected_scope,
+        });
+        let _ = sender.send(QueryProgress::MetadataRefreshNeeded);
+        app::awake();
     }
 
     fn emit_script_output(

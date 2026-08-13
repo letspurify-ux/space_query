@@ -2625,6 +2625,69 @@ fn run_scenarios(target: Target, h: &mut Harness) -> Result<(), String> {
         h.run("ROLLBACK")?;
     }
 
+    // ---- S43: a mid-script scope change governs the REST of that script -----
+    // A script may move its own session (`use db` / `ALTER SESSION SET
+    // CURRENT_SCHEMA`). Everything after it in the SAME run must execute
+    // where the script put it — the per-statement session preparation reads
+    // the scope the batch is CURRENTLY in, not the one the tab had when the
+    // run started.
+    {
+        println!("  --- S43 a mid-script scope change governs the rest of the script ---");
+        h.editor.clear_tab_transaction_mode_override();
+        h.run("ROLLBACK")?;
+        let script_scope = "SQ_TM_SCOPE5";
+        let _ = h.run(&if target.is_oracle() {
+            format!("DROP USER {script_scope} CASCADE")
+        } else {
+            format!("DROP DATABASE IF EXISTS {script_scope}")
+        });
+        let capture = h.run(&if target.is_oracle() {
+            format!("CREATE USER {script_scope} IDENTIFIED BY pw1")
+        } else {
+            format!("CREATE DATABASE {script_scope}")
+        })?;
+        if !capture.results.first().is_some_and(|result| result.success) {
+            return Err(format!(
+                "S43 could not create the scratch scope: {:?}",
+                capture.results.first().map(|r| r.message.clone())
+            ));
+        }
+        let script = if target.is_oracle() {
+            format!("ALTER SESSION SET CURRENT_SCHEMA = {script_scope};\n{current_scope_sql};")
+        } else {
+            // The client spelling, which the script splitter turns into a
+            // tool command rather than a plain statement.
+            format!("use {script_scope}\n{current_scope_sql};")
+        };
+        let ran = h.run(&script)?;
+        let reported = ran
+            .rows
+            .last()
+            .and_then(|row| row.last().cloned())
+            .or_else(|| {
+                ran.results
+                    .iter()
+                    .rev()
+                    .find(|result| result.is_select)
+                    .and_then(|result| result.rows.first())
+                    .and_then(|row| row.last().cloned())
+            })
+            .unwrap_or_default();
+        h.check(
+            "S43 the statement after the scope change runs in the new scope",
+            reported.trim().eq_ignore_ascii_case(script_scope),
+            format!("{current_scope_sql} after the change = {reported:?}"),
+        );
+        h.editor.set_tab_scope(Some(base_scope.clone()));
+        let _ = h.editor.discard_pooled_session_for_close();
+        h.run("ROLLBACK")?;
+        let _ = h.run(&if target.is_oracle() {
+            format!("DROP USER {script_scope} CASCADE")
+        } else {
+            format!("DROP DATABASE IF EXISTS {script_scope}")
+        });
+    }
+
     // ---- S40: a dirty session does not gate a scope change ------------------
     // The commit/rollback/discard decision belongs to tab close. A scope
     // change is applied to the tab's retained session IN PLACE (MySQL `USE`,

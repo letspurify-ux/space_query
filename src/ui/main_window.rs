@@ -2270,7 +2270,7 @@ impl AppState {
         };
         let previous_tab_id = self.active_editor_tab_id;
         if previous_tab_id != tab_id && self.pending_connection_metadata_refresh {
-            self.pending_metadata_refresh_tabs.insert(previous_tab_id);
+            self.remember_pending_metadata_tab(previous_tab_id);
         }
         let tab = self.editor_tabs[index].clone();
         self.active_editor_tab_id = tab_id;
@@ -2489,7 +2489,7 @@ impl AppState {
                 .update_highlight_data_deferred(highlight_data);
         }
         if browser_snapshot.is_none() {
-            self.pending_metadata_refresh_tabs.insert(tab_id);
+            self.remember_pending_metadata_tab(tab_id);
         }
         let _ = self.set_active_editor_tab(tab_id);
         Ok(())
@@ -2563,8 +2563,22 @@ impl AppState {
         }
     }
 
-    fn mark_metadata_refresh_pending(&mut self, tab_id: QueryTabId) {
+    /// Remember that `tab_id` still owes a metadata load.
+    ///
+    /// The one writer of that set, so it can hold the one invariant that
+    /// matters: it only ever names tabs that still exist. A late progress
+    /// event from a closed tab's worker, or the switch away from the tab
+    /// being closed, would otherwise leave an id nothing can satisfy and
+    /// nothing will remove.
+    fn remember_pending_metadata_tab(&mut self, tab_id: QueryTabId) {
+        if self.find_tab_index(tab_id).is_none() {
+            return;
+        }
         self.pending_metadata_refresh_tabs.insert(tab_id);
+    }
+
+    fn mark_metadata_refresh_pending(&mut self, tab_id: QueryTabId) {
+        self.remember_pending_metadata_tab(tab_id);
         if self.active_editor_tab_id == tab_id {
             self.pending_connection_metadata_refresh = self.has_live_connection;
         }
@@ -3135,8 +3149,7 @@ impl AppState {
         self.pending_connection_metadata_refresh =
             pending_metadata_refresh_after_start_attempt(self.has_live_connection, started);
         if self.pending_connection_metadata_refresh {
-            self.pending_metadata_refresh_tabs
-                .insert(self.active_editor_tab_id);
+            self.remember_pending_metadata_tab(self.active_editor_tab_id);
         } else {
             self.pending_metadata_refresh_tabs
                 .remove(&self.active_editor_tab_id);

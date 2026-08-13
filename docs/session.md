@@ -131,13 +131,18 @@ transaction state — an open transaction simply continues in the new scope, and
 the commit/rollback/discard decision stays where it belongs, at tab close.
 
 The reverse direction — a statement that moves the session (`USE`,
-`ALTER SESSION SET CURRENT_SCHEMA`) — is reported to the window exactly once,
-by `QueryProgress::ScopeChangedNotice`, carrying the scope the statement itself
-selected. That report moves the originating tab and nothing else. A tab's `USE`
-deliberately does NOT write the connection's stored database (that name is the
-connection's own, and is what a tab with no scope of its own falls back to), so
-any second event built from it would name another tab's database and overwrite
-the correct one.
+`ALTER SESSION SET CURRENT_SCHEMA`) — goes through one choke point,
+`note_batch_scope_change`. It records the new scope where the running batch
+keeps it (the cell the statement loop, the end-of-batch re-apply and a lazy
+fetch handover all read, or the thin batch's transition context) and reports it
+to the window exactly once, by `QueryProgress::ScopeChangedNotice`, carrying the
+scope the statement itself selected. Recording and reporting are one step
+because they were two: sites that reported without recording left the rest of
+the script running in the scope the tab had when the run started. That report
+moves the originating tab and nothing else. A tab's `USE` deliberately does NOT
+write the connection's stored database (that name is the connection's own, and
+is what a tab with no scope of its own falls back to), so any second event built
+from it would name another tab's database and overwrite the correct one.
 
 A card is loaded from the database only when there is nothing to inherit. The
 metadata belongs to the connection and the scope it was read in, not to the tab
