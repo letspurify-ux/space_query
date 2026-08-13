@@ -63,6 +63,14 @@
 //   S36 (MySQL family) the one-shot assignment spelling
 //       (SET @@transaction_isolation = ...) gets the same transaction-boundary
 //       prepare as the SET TRANSACTION word form, and stays a one-shot.
+//   S45 a scope change whose eager push never reached the tab's session (the
+//       GUI is left with exactly this when the connection lock is busy, when
+//       the push fails, or when the scope is cleared) still governs the next
+//       statement, and moving the session neither commits nor discards the
+//       work it was carrying. Caught two real defects: the MySQL family
+//       skipped its per-statement scope assertion for any session it had to
+//       preserve, and a lazily streamed thin SELECT never asserted the scope
+//       at all.
 //
 // Usage: verify_transaction_mode_live <thin|oci|mysql|mariadb|all>
 
@@ -2799,6 +2807,92 @@ fn run_scenarios(target: Target, h: &mut Harness) -> Result<(), String> {
         }
 
         h.change_tab_scope(Some(&base_scope));
+        let _ = h.editor.discard_pooled_session_for_close();
+        h.run("ROLLBACK")?;
+        let _ = h.run(&if target.is_oracle() {
+            format!("DROP USER {scratch_scope} CASCADE")
+        } else {
+            format!("DROP DATABASE IF EXISTS {scratch_scope}")
+        });
+    }
+
+    // ---- S45: a scope change the push never reached still governs ----------
+    // The eager push onto the tab's retained session is a convenience, not the
+    // guarantee: `retained_scope_update_for_tab` needs the connection lock and
+    // returns `None` when another tab's work holds it, and it also gives up on
+    // an empty scope. The guarantee is the per-statement assertion each batch
+    // makes. So drive ONLY the binding half — exactly what the GUI is left
+    // with when the push cannot run — over a session that carries work, and
+    // the next statement must still run in the tab's scope.
+    //
+    // Before the fix this passed on both Oracle drivers and failed on the
+    // MySQL family: `prepare_mysql_pooled_session_database` returned early for
+    // any session requiring physical preservation (which a single DML is
+    // enough to cause), so the statement ran in the OLD database — and the
+    // lease still recorded the requested one, so nothing could notice.
+    {
+        println!("  --- S45 a scope change the push never reached still governs ---");
+        h.editor.clear_tab_transaction_mode_override();
+        h.run("ROLLBACK")?;
+        let scratch_scope = "SQ_TM_SCOPE7";
+        let _ = h.run(&if target.is_oracle() {
+            format!("DROP USER {scratch_scope} CASCADE")
+        } else {
+            format!("DROP DATABASE IF EXISTS {scratch_scope}")
+        });
+        let capture = h.run(&if target.is_oracle() {
+            format!("CREATE USER {scratch_scope} IDENTIFIED BY pw1")
+        } else {
+            format!("CREATE DATABASE {scratch_scope}")
+        })?;
+        if !capture.results.first().is_some_and(|result| result.success) {
+            return Err(format!(
+                "S45 could not create the scratch scope: {:?}",
+                capture.results.first().map(|r| r.message.clone())
+            ));
+        }
+        // Leave uncommitted work on the tab's session, so it is one the app
+        // must preserve rather than re-prepare.
+        let capture = h.run(&format!("INSERT INTO {qualified_table} VALUES (4501)"))?;
+        h.check(
+            "S45 the write that makes the session one to preserve succeeds",
+            capture.results.first().is_some_and(|result| result.success),
+            format!(
+                "insert result: {:?}",
+                capture
+                    .results
+                    .first()
+                    .map(|r| (r.success, r.message.clone()))
+            ),
+        );
+        // The binding half ONLY: no apply_current_scope_to_retained_session.
+        h.editor.set_tab_scope(Some(scratch_scope.to_string()));
+        let scope_now = h.select_scalar(current_scope_sql)?;
+        h.check(
+            "S45 the next statement runs in the tab's scope, not where the session was left",
+            scope_now.trim().eq_ignore_ascii_case(scratch_scope),
+            format!("{current_scope_sql} = {scope_now:?}"),
+        );
+        // And the work the session was carrying is still there, unresolved:
+        // moving the session must not have committed or discarded it.
+        h.editor.set_tab_scope(Some(base_scope.clone()));
+        let kept = h.select_scalar(&format!(
+            "SELECT COUNT(*) FROM {qualified_table} WHERE V = 4501"
+        ))?;
+        h.check(
+            "S45 the uncommitted work survived the move the assertion made",
+            kept.trim() == "1",
+            format!("rows visible to the transaction = {kept:?}"),
+        );
+        h.run("ROLLBACK")?;
+        let remaining = h.select_scalar(&format!(
+            "SELECT COUNT(*) FROM {qualified_table} WHERE V = 4501"
+        ))?;
+        h.check(
+            "S45 the work stayed rollback-able",
+            remaining.trim() == "0",
+            format!("rows after ROLLBACK = {remaining:?}"),
+        );
         let _ = h.editor.discard_pooled_session_for_close();
         h.run("ROLLBACK")?;
         let _ = h.run(&if target.is_oracle() {

@@ -441,8 +441,13 @@ impl<'a> MySqlPooledSessionDisposition<'a> {
         }
     }
 
-    fn apply(&self, conn: mysql::PooledConn, disposition: crate::db::RetainedSessionOutcome) {
-        SqlEditorWidget::apply_mysql_pooled_session_disposition_if_current(
+    fn apply_with_scope(
+        &self,
+        conn: mysql::PooledConn,
+        disposition: crate::db::RetainedSessionOutcome,
+        session_scope: Option<String>,
+    ) {
+        SqlEditorWidget::apply_mysql_pooled_session_disposition_if_current_with_scope(
             self.shared_connection,
             self.pooled_db_session,
             self.connection_generation,
@@ -450,13 +455,7 @@ impl<'a> MySqlPooledSessionDisposition<'a> {
             conn,
             disposition,
             self.db_activity,
-        );
-    }
-
-    fn retain(&self, conn: mysql::PooledConn, retained_state: RetainedSessionState) {
-        self.apply(
-            conn,
-            crate::db::RetainedSessionOutcome::Retain(retained_state),
+            session_scope,
         );
     }
 
@@ -466,6 +465,7 @@ impl<'a> MySqlPooledSessionDisposition<'a> {
         prior_retained_state: RetainedSessionState,
         policy: crate::db::RetainedSessionErrorPolicy,
         message: String,
+        session_scope: Option<String>,
     ) -> String {
         // This helper is only for pre-statement setup, scope recheck, and
         // option-change errors. Statement execution errors must go through
@@ -477,7 +477,7 @@ impl<'a> MySqlPooledSessionDisposition<'a> {
             SqlEditorWidget::mysql_error_allows_session_reuse(&message),
             policy,
         );
-        self.apply(conn, disposition);
+        self.apply_with_scope(conn, disposition, session_scope);
         message
     }
 }
@@ -596,6 +596,23 @@ trait ExecutionWorkerBackend: Sync {
         context: ExecutionWorkerContext<'_>,
         cleanup: &mut QueryExecutionCleanupGuard,
     ) -> ExecutionWorkerOutcome<'a>;
+}
+
+/// A pooled MySQL/MariaDB session handed to a statement, together with the
+/// database it is actually in.
+///
+/// `session_scope` is what the retained lease records when the session goes
+/// back to the tab, so it has to be the database the session is really in —
+/// not the one the tab asked for. The two differ whenever the session carries
+/// work that stopped it from being moved, and recording the request instead
+/// made that divergence invisible to every later check.
+struct AcquiredMySqlPooledSession {
+    connection_generation: u64,
+    pool_context_epoch: u64,
+    connection_info: ConnectionInfo,
+    conn: mysql::PooledConn,
+    prior_retained_state: RetainedSessionState,
+    session_scope: Option<String>,
 }
 
 struct OracleExecutionWorkerBackend;
@@ -1006,6 +1023,19 @@ impl ExecutionWorkerBackend for OracleExecutionWorkerBackend {
                         let session_id = next_lazy_fetch_session_id
                             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                         let current_scope = execution_scope.clone();
+                        // A lazily streamed SELECT is still a statement of
+                        // this tab, and it runs on a session the tab may have
+                        // been holding since its last run. Resolve the schema
+                        // it must be held in here, where the connection lock
+                        // can still be taken, exactly as the batch does at its
+                        // own start -- the fetch worker takes no lock.
+                        let lazy_scope_sync_context =
+                            (active_connection.clone(), connection_generation);
+                        let lazy_session_schema = SqlEditorWidget::oracle_thin_batch_session_schema(
+                            Some(&lazy_scope_sync_context),
+                            db_activity,
+                            current_scope.as_deref(),
+                        );
                         match SqlEditorWidget::start_oracle_thin_lazy_select(
                             thin_conn,
                             pooled_db_session.clone(),
@@ -1023,6 +1053,7 @@ impl ExecutionWorkerBackend for OracleExecutionWorkerBackend {
                                 default_isolation: default_transaction_isolation,
                             },
                             current_scope,
+                            lazy_session_schema,
                             sender.clone(),
                             session.clone(),
                             conn_name.clone(),
@@ -3319,22 +3350,58 @@ impl SqlEditorWidget {
         !preserve_existing_session_state
     }
 
+    /// Puts a pooled session in the database this execution runs in, and
+    /// reports the database it is in afterwards.
+    ///
+    /// The answer is the caller's, not a guess: it is what gets recorded on the
+    /// retained lease, and every later decision — the next statement's scope
+    /// check and the object browser's scope push — is made against that record.
+    /// Returning the requested name while the session stayed somewhere else is
+    /// what let a tab run in a database its selector never pointed at, with
+    /// nothing able to notice.
     fn prepare_mysql_pooled_session_database(
         conn: &mut mysql::PooledConn,
         current_service_name: &str,
         advanced: &crate::db::ConnectionAdvancedSettings,
         db_type: crate::db::DatabaseType,
         preserve_existing_session_state: bool,
-    ) -> Result<(), String> {
+        session_scope: Option<&str>,
+    ) -> Result<Option<String>, String> {
         let database = current_service_name.trim();
-        if preserve_existing_session_state {
-            // The retained physical session already has the tracked scope.
-            // COM_INIT_DB clears MySQL's diagnostics area, so re-selecting even
-            // the same database would change what SHOW WARNINGS/ERRORS sees.
-            return Ok(());
+        match crate::db::mysql_pooled_session_scope_application(
+            db_type,
+            preserve_existing_session_state,
+            session_scope,
+            database,
+        ) {
+            crate::db::MySqlSessionScopeApplication::LeaveAlone => {
+                return Ok(session_scope
+                    .map(str::trim)
+                    .filter(|scope| !scope.is_empty())
+                    .map(str::to_string));
+            }
+            crate::db::MySqlSessionScopeApplication::SelectDatabaseOnly => {
+                // The session carries work or residue, so only the database
+                // moves: `USE` neither commits nor rolls back, and a full
+                // preparation would reset settings this session still owns. A
+                // missing database is reported instead of silently falling back
+                // to "no database" — that fallback exists to keep a FRESH
+                // session usable, and applying it here would throw away the
+                // work this one is holding.
+                conn.as_mut().select_db(database).map_err(|err| {
+                    format!(
+                        "Failed to apply {} current database `{database}`: {}",
+                        db_type.display_name(),
+                        SqlEditorWidget::mysql_error_message(&err, None)
+                    )
+                })?;
+                return Ok(Some(database.to_string()));
+            }
+            crate::db::MySqlSessionScopeApplication::PrepareSession => {}
         }
         if database.is_empty() {
-            return Self::reset_mysql_pooled_session_to_no_database(conn, advanced, db_type);
+            Self::reset_mysql_pooled_session_to_no_database(conn, advanced, db_type)?;
+            return Ok(None);
         }
 
         // Re-select even when SELECT DATABASE() would report the same name.
@@ -3345,7 +3412,7 @@ impl SqlEditorWidget {
                 crate::db::DatabaseConnection::apply_mysql_connection_encoding_with_settings_for_db_type(
                     conn, advanced, db_type,
                 )?;
-                Ok(())
+                Ok(Some(database.to_string()))
             }
             Err(err) if Self::mysql_missing_current_database_error(&err) => {
                 crate::utils::logging::log_error(
@@ -3354,7 +3421,8 @@ impl SqlEditorWidget {
                         "Current database `{database}` is not available; continuing without a default database"
                     ),
                 );
-                Self::reset_mysql_pooled_session_to_no_database(conn, advanced, db_type)
+                Self::reset_mysql_pooled_session_to_no_database(conn, advanced, db_type)?;
+                Ok(None)
             }
             Err(err) => Err(SqlEditorWidget::mysql_error_message(&err, None)),
         }
@@ -5087,6 +5155,7 @@ impl SqlEditorWidget {
         prior_retained_state: RetainedSessionState,
         selected_transaction_mode: OracleTransactionModeApplication,
         current_scope: Option<String>,
+        session_schema: Option<String>,
         sender: QueryProgressSender,
         session: Arc<Mutex<SessionState>>,
         conn_name: String,
@@ -5177,6 +5246,15 @@ impl SqlEditorWidget {
                                 retained_state_before_select,
                                 selected_transaction_mode,
                             )?;
+                        // Same order as the batch: the mode first, then the
+                        // tab's schema. `ALTER SESSION SET CURRENT_SCHEMA`
+                        // starts no transaction, so it cannot displace a
+                        // `SET TRANSACTION` from being its transaction's first
+                        // statement.
+                        Self::apply_oracle_thin_schema_before_statement(
+                            conn,
+                            session_schema.as_deref(),
+                        )?;
 
                         let sql_for_editing =
                             QueryExecutor::maybe_inject_rowid_for_editing(&sql_to_execute);
@@ -8385,19 +8463,20 @@ impl SqlEditorWidget {
                             None,
                             false,
                         ) {
-                            Ok((
+                            Ok(AcquiredMySqlPooledSession {
                                 connection_generation,
                                 pool_context_epoch,
                                 connection_info,
                                 mut conn,
                                 prior_retained_state,
-                            )) => {
+                                session_scope,
+                            }) => {
                                 let (heading_enabled, feedback_enabled) =
                                     SqlEditorWidget::current_output_settings(session);
                                 let (colsep, null_text, _trimspool_enabled) =
                                     SqlEditorWidget::current_text_output_settings(session);
-                                if let Err(message) =
-                                    Self::apply_mysql_global_database_before_pooled_action(
+                                let lazy_session_scope =
+                                    match Self::apply_mysql_global_database_before_pooled_action(
                                         shared_connection,
                                         &mut conn,
                                         current_execution_scope().as_deref(),
@@ -8408,9 +8487,11 @@ impl SqlEditorWidget {
                                         prior_retained_state
                                             .requires_physical_session_preservation(),
                                         false,
-                                    )
-                                {
-                                    let message =
+                                        session_scope.as_deref(),
+                                    ) {
+                                        Ok(applied_scope) => applied_scope,
+                                        Err(message) => {
+                                            let message =
                                         Self::restore_or_discard_mysql_retained_session_after_scope_recheck_error(
                                             shared_connection,
                                             pooled_db_session,
@@ -8420,39 +8501,42 @@ impl SqlEditorWidget {
                                             prior_retained_state,
                                             db_activity,
                                             message,
+                                            session_scope,
                                         );
-                                    let index = result_index;
-                                    SqlEditorWidget::emit_statement_start(
-                                        sender,
-                                        index,
-                                        ResultTabPolicy::Create,
-                                    );
-                                    let mut result = QueryResult::new_error(&sql_text, &message);
-                                    result.is_select = true;
-                                    if !result.message.trim().is_empty() {
-                                        SqlEditorWidget::append_spool_output(
-                                            session,
-                                            std::slice::from_ref(&result.message),
-                                        );
-                                    }
-                                    let _ = sender.send(QueryProgress::StatementFinished {
-                                        index,
-                                        result,
-                                        connection_name: conn_name.clone(),
-                                        timed_out: false,
-                                    });
-                                    app::awake();
-                                    result_index += 1;
-                                    SqlEditorWidget::emit_timing_if_enabled(
-                                        sender,
-                                        session,
-                                        statement_start.elapsed(),
-                                    );
-                                    if !continue_on_error {
-                                        stop_execution = true;
-                                    }
-                                    continue;
-                                }
+                                            let index = result_index;
+                                            SqlEditorWidget::emit_statement_start(
+                                                sender,
+                                                index,
+                                                ResultTabPolicy::Create,
+                                            );
+                                            let mut result =
+                                                QueryResult::new_error(&sql_text, &message);
+                                            result.is_select = true;
+                                            if !result.message.trim().is_empty() {
+                                                SqlEditorWidget::append_spool_output(
+                                                    session,
+                                                    std::slice::from_ref(&result.message),
+                                                );
+                                            }
+                                            let _ = sender.send(QueryProgress::StatementFinished {
+                                                index,
+                                                result,
+                                                connection_name: conn_name.clone(),
+                                                timed_out: false,
+                                            });
+                                            app::awake();
+                                            result_index += 1;
+                                            SqlEditorWidget::emit_timing_if_enabled(
+                                                sender,
+                                                session,
+                                                statement_start.elapsed(),
+                                            );
+                                            if !continue_on_error {
+                                                stop_execution = true;
+                                            }
+                                            continue;
+                                        }
+                                    };
                                 let session_id = next_lazy_fetch_session_id
                                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                                 SqlEditorWidget::emit_statement_start(
@@ -8466,7 +8550,7 @@ impl SqlEditorWidget {
                                     Arc::clone(shared_connection),
                                     conn,
                                     connection_info,
-                                    current_execution_scope(),
+                                    lazy_session_scope,
                                     pooled_db_session.clone(),
                                     sender.clone(),
                                     session.clone(),
@@ -21822,8 +21906,8 @@ impl SqlEditorWidget {
             crate::db::RetainedSessionTakeOutcome::DiscardedBecauseStale
             | crate::db::RetainedSessionTakeOutcome::NoSession => return,
         };
-        let Some((mut conn, prior_retained_state)) =
-            retained_session.into_mysql_connection_with_retained_state()
+        let Some((mut conn, prior_retained_state, session_scope)) =
+            retained_session.into_mysql_connection_with_retained_state_and_scope()
         else {
             return;
         };
@@ -21842,11 +21926,12 @@ impl SqlEditorWidget {
                 conn,
                 decision,
                 db_activity,
+                session_scope,
             );
             return;
         }
         if batch_effects.releases_physical_session() {
-            Self::apply_mysql_pooled_session_disposition_if_current(
+            Self::apply_mysql_pooled_session_disposition_if_current_with_scope(
                 shared_connection,
                 pooled_db_session,
                 connection_generation,
@@ -21854,6 +21939,7 @@ impl SqlEditorWidget {
                 conn,
                 crate::db::RetainedSessionOutcome::DiscardPhysical,
                 db_activity,
+                session_scope,
             );
             return;
         }
@@ -21865,7 +21951,7 @@ impl SqlEditorWidget {
         );
         let outcome = batch_effects
             .outcome_after_successful_batch(prior_retained_state, server_reports_uncommitted_work);
-        Self::apply_mysql_pooled_session_disposition_if_current(
+        Self::apply_mysql_pooled_session_disposition_if_current_with_scope(
             shared_connection,
             pooled_db_session,
             connection_generation,
@@ -21873,6 +21959,7 @@ impl SqlEditorWidget {
             conn,
             outcome,
             db_activity,
+            session_scope,
         );
     }
 
@@ -21884,6 +21971,7 @@ impl SqlEditorWidget {
         mut conn: mysql::PooledConn,
         decision: crate::db::MySqlInterruptedBatchSessionDecision,
         db_activity: &str,
+        session_scope: Option<String>,
     ) {
         let mut outcome = decision.outcome;
         if decision.requires_session_info_sync {
@@ -21909,7 +21997,7 @@ impl SqlEditorWidget {
             }
         }
 
-        Self::apply_mysql_pooled_session_disposition_if_current(
+        Self::apply_mysql_pooled_session_disposition_if_current_with_scope(
             shared_connection,
             pooled_db_session,
             connection_generation,
@@ -21917,6 +22005,7 @@ impl SqlEditorWidget {
             conn,
             outcome,
             db_activity,
+            session_scope,
         );
     }
 
@@ -22347,15 +22436,16 @@ impl SqlEditorWidget {
         session_pool_sender: Option<&QueryProgressSender>,
         mut conn: mysql::PooledConn,
         activity: &crate::db::DbActivityGuard,
-    ) -> Result<mysql::PooledConn, String> {
+    ) -> Result<(mysql::PooledConn, Option<String>), String> {
         match Self::prepare_mysql_pooled_session_database(
             &mut conn,
             &context.current_service_name,
             &context.connection_info.advanced,
             context.connection_info.db_type,
             false,
+            None,
         ) {
-            Ok(()) => Ok(conn),
+            Ok(session_scope) => Ok((conn, session_scope)),
             Err(message) if !Self::mysql_error_allows_session_reuse(&message) => {
                 Self::discard_mysql_pooled_connection(conn);
                 let (mut conn, cancel_registration) =
@@ -22366,14 +22456,15 @@ impl SqlEditorWidget {
                         cancel_registration,
                     );
                 }
-                Self::prepare_mysql_pooled_session_database(
+                let session_scope = Self::prepare_mysql_pooled_session_database(
                     &mut conn,
                     &context.current_service_name,
                     &context.connection_info.advanced,
                     context.connection_info.db_type,
                     false,
+                    None,
                 )?;
-                Ok(conn)
+                Ok((conn, session_scope))
             }
             Err(message) => Err(message),
         }
@@ -22398,16 +22489,7 @@ impl SqlEditorWidget {
         require_existing_session: bool,
         required_resolution_action: Option<RetainedSessionResolutionAction>,
         statement_requires_transaction_boundary: bool,
-    ) -> Result<
-        (
-            u64,
-            u64,
-            ConnectionInfo,
-            mysql::PooledConn,
-            RetainedSessionState,
-        ),
-        String,
-    > {
+    ) -> Result<AcquiredMySqlPooledSession, String> {
         let (context, activity) = {
             let mut conn_guard =
                 lock_connection_with_activity(shared_connection, db_activity.to_string());
@@ -22431,150 +22513,152 @@ impl SqlEditorWidget {
         // already run `prepare_mysql_pooled_session_database` on it with the
         // same context and `preserve = false`, so the tail below must not
         // repeat that work (COM_INIT_DB + encoding round trips).
-        let (mut conn, prior_retained_state, scope_already_prepared) = match pooled_db_session
-            .take_reusable_lease(
-                context.connection_generation,
-                context.pool_context_epoch(),
-                context.connection_info.db_type,
-                &context.connection_info,
-                &activity,
-            )
-            .held_in(session_pool_sender)
-        {
-            crate::db::RetainedSessionTakeOutcome::Reusable(retained_session) => {
-                let Some((mut conn, prior_retained_state)) =
-                    retained_session.into_mysql_connection_with_retained_state()
-                else {
-                    return Err(format!(
-                        "Expected {} pool session",
-                        context.connection_info.db_type
-                    ));
-                };
-                if let Some(resolution_action) = required_resolution_action {
-                    if let Err(message) = ensure_retained_session_transaction_action_allowed(
-                        prior_retained_state,
-                        resolution_action,
-                    ) {
-                        Self::retain_mysql_pooled_session_if_current_with_state(
-                            shared_connection,
-                            pooled_db_session,
-                            context.connection_generation,
-                            context.pool_context_epoch(),
-                            conn,
-                            prior_retained_state,
-                            db_activity,
-                        );
-                        return Err(message);
-                    }
-                }
-                match Self::reusable_mysql_pooled_session_is_ready(
-                    &mut conn,
-                    &context.connection_info.advanced,
+        let (mut conn, prior_retained_state, mut session_scope, scope_already_prepared) =
+            match pooled_db_session
+                .take_reusable_lease(
+                    context.connection_generation,
+                    context.pool_context_epoch(),
                     context.connection_info.db_type,
-                    prior_retained_state.requires_physical_session_preservation(),
-                    prior_retained_state
-                        .session_residue_state()
-                        .may_have_statement_diagnostics(),
-                ) {
-                    Ok(true) => (conn, prior_retained_state, false),
-                    Ok(false) => {
-                        Self::discard_mysql_pooled_connection(conn);
-                        if require_existing_session {
-                            return Err("No reusable DB session for this tab.".to_string());
+                    &context.connection_info,
+                    &activity,
+                )
+                .held_in(session_pool_sender)
+            {
+                crate::db::RetainedSessionTakeOutcome::Reusable(retained_session) => {
+                    // The database this physical session is actually in. Every
+                    // scope decision below is made against it rather than against
+                    // what the tab asked for.
+                    let Some((mut conn, prior_retained_state, retained_scope)) =
+                        retained_session.into_mysql_connection_with_retained_state_and_scope()
+                    else {
+                        return Err(format!(
+                            "Expected {} pool session",
+                            context.connection_info.db_type
+                        ));
+                    };
+                    if let Some(resolution_action) = required_resolution_action {
+                        if let Err(message) = ensure_retained_session_transaction_action_allowed(
+                            prior_retained_state,
+                            resolution_action,
+                        ) {
+                            Self::retain_mysql_pooled_session_if_current_with_state_and_scope(
+                                shared_connection,
+                                pooled_db_session,
+                                context.connection_generation,
+                                context.pool_context_epoch(),
+                                conn,
+                                prior_retained_state,
+                                db_activity,
+                                retained_scope,
+                            );
+                            return Err(message);
                         }
-                        let (conn, cancel_registration) = Self::acquire_fresh_mysql_pool_session(
-                            &context,
-                            session_pool_sender,
-                            &activity,
-                        )?;
-                        if let Some(sender) = session_pool_sender {
-                            crate::db::HoldsSessionCancelRegistration::hold_session_registration(
+                    }
+                    match Self::reusable_mysql_pooled_session_is_ready(
+                        &mut conn,
+                        &context.connection_info.advanced,
+                        context.connection_info.db_type,
+                        prior_retained_state.requires_physical_session_preservation(),
+                        prior_retained_state
+                            .session_residue_state()
+                            .may_have_statement_diagnostics(),
+                    ) {
+                        Ok(true) => (conn, prior_retained_state, retained_scope, false),
+                        Ok(false) => {
+                            Self::discard_mysql_pooled_connection(conn);
+                            if require_existing_session {
+                                return Err("No reusable DB session for this tab.".to_string());
+                            }
+                            let (conn, cancel_registration) =
+                                Self::acquire_fresh_mysql_pool_session(
+                                    &context,
+                                    session_pool_sender,
+                                    &activity,
+                                )?;
+                            if let Some(sender) = session_pool_sender {
+                                crate::db::HoldsSessionCancelRegistration::hold_session_registration(
                                 sender,
                                 cancel_registration,
                             );
+                            }
+                            let (conn, session_scope) =
+                                Self::prepare_mysql_pooled_session_or_retry_once(
+                                    &context,
+                                    session_pool_sender,
+                                    conn,
+                                    &activity,
+                                )?;
+                            (conn, RetainedSessionState::default(), session_scope, true)
                         }
-                        (
-                            Self::prepare_mysql_pooled_session_or_retry_once(
-                                &context,
-                                session_pool_sender,
-                                conn,
-                                &activity,
-                            )?,
-                            RetainedSessionState::default(),
-                            true,
-                        )
-                    }
-                    Err(message) if Self::mysql_pool_acquire_error_should_retry_fresh(&message) => {
-                        crate::utils::logging::log_warning(
+                        Err(message)
+                            if Self::mysql_pool_acquire_error_should_retry_fresh(&message) =>
+                        {
+                            crate::utils::logging::log_warning(
                             "mysql pool session",
                             &format!(
                                 "Discarding stale reusable {db_display_name} pooled session and retrying with a fresh session: {message}"
                             ),
                         );
-                        Self::discard_mysql_pooled_connection(conn);
-                        if require_existing_session {
-                            return Err(message);
-                        }
-                        let (conn, cancel_registration) = Self::acquire_fresh_mysql_pool_session(
-                            &context,
-                            session_pool_sender,
-                            &activity,
-                        )?;
-                        if let Some(sender) = session_pool_sender {
-                            crate::db::HoldsSessionCancelRegistration::hold_session_registration(
+                            Self::discard_mysql_pooled_connection(conn);
+                            if require_existing_session {
+                                return Err(message);
+                            }
+                            let (conn, cancel_registration) =
+                                Self::acquire_fresh_mysql_pool_session(
+                                    &context,
+                                    session_pool_sender,
+                                    &activity,
+                                )?;
+                            if let Some(sender) = session_pool_sender {
+                                crate::db::HoldsSessionCancelRegistration::hold_session_registration(
                                 sender,
                                 cancel_registration,
                             );
+                            }
+                            let (conn, session_scope) =
+                                Self::prepare_mysql_pooled_session_or_retry_once(
+                                    &context,
+                                    session_pool_sender,
+                                    conn,
+                                    &activity,
+                                )?;
+                            (conn, RetainedSessionState::default(), session_scope, true)
                         }
-                        (
-                            Self::prepare_mysql_pooled_session_or_retry_once(
-                                &context,
-                                session_pool_sender,
-                                conn,
-                                &activity,
-                            )?,
-                            RetainedSessionState::default(),
-                            true,
-                        )
+                        Err(message) => return Err(message),
                     }
-                    Err(message) => return Err(message),
                 }
-            }
-            crate::db::RetainedSessionTakeOutcome::BlockedContextMismatch(retained_state) => {
-                return Err(format!(
+                crate::db::RetainedSessionTakeOutcome::BlockedContextMismatch(retained_state) => {
+                    return Err(format!(
                     "Cannot reuse retained {} DB session because its session context is stale while it is {}. Resolve or discard it first.",
                     context.connection_info.db_type,
                     retained_state.label()
                 ));
-            }
-            crate::db::RetainedSessionTakeOutcome::DiscardedBecauseStale
-            | crate::db::RetainedSessionTakeOutcome::NoSession => {
-                if require_existing_session {
-                    return Err("No retained DB session for this tab.".to_string());
                 }
-                let (conn, cancel_registration) = Self::acquire_fresh_mysql_pool_session(
-                    &context,
-                    session_pool_sender,
-                    &activity,
-                )?;
-                if let Some(sender) = session_pool_sender {
-                    crate::db::HoldsSessionCancelRegistration::hold_session_registration(
-                        sender,
-                        cancel_registration,
-                    );
-                }
-                (
-                    Self::prepare_mysql_pooled_session_or_retry_once(
+                crate::db::RetainedSessionTakeOutcome::DiscardedBecauseStale
+                | crate::db::RetainedSessionTakeOutcome::NoSession => {
+                    if require_existing_session {
+                        return Err("No retained DB session for this tab.".to_string());
+                    }
+                    let (conn, cancel_registration) = Self::acquire_fresh_mysql_pool_session(
+                        &context,
+                        session_pool_sender,
+                        &activity,
+                    )?;
+                    if let Some(sender) = session_pool_sender {
+                        crate::db::HoldsSessionCancelRegistration::hold_session_registration(
+                            sender,
+                            cancel_registration,
+                        );
+                    }
+                    let (conn, session_scope) = Self::prepare_mysql_pooled_session_or_retry_once(
                         &context,
                         session_pool_sender,
                         conn,
                         &activity,
-                    )?,
-                    RetainedSessionState::default(),
-                    true,
-                )
-            }
-        };
+                    )?;
+                    (conn, RetainedSessionState::default(), session_scope, true)
+                }
+            };
         let preserve_existing_session_state =
             prior_retained_state.requires_physical_session_preservation();
         let should_apply_current_scope =
@@ -22583,83 +22667,92 @@ impl SqlEditorWidget {
                 required_resolution_action,
             );
         if should_apply_current_scope && !scope_already_prepared {
-            if let Err(message) = Self::prepare_mysql_pooled_session_database(
+            match Self::prepare_mysql_pooled_session_database(
                 &mut conn,
                 &context.current_service_name,
                 &context.connection_info.advanced,
                 context.connection_info.db_type,
                 preserve_existing_session_state,
+                session_scope.as_deref(),
             ) {
-                if Self::mysql_pool_acquire_error_should_retry_fresh(&message) {
-                    if require_existing_session || preserve_existing_session_state {
-                        return Err(
-                            Self::restore_or_drop_dirty_mysql_retained_session_after_error(
-                                shared_connection,
-                                pooled_db_session,
-                                context.connection_generation,
-                                context.pool_context_epoch(),
-                                conn,
-                                prior_retained_state,
-                                db_activity,
-                                message,
-                            ),
-                        );
-                    }
-                    crate::utils::logging::log_warning(
+                Ok(applied_scope) => session_scope = applied_scope,
+                Err(message) => {
+                    if Self::mysql_pool_acquire_error_should_retry_fresh(&message) {
+                        if require_existing_session || preserve_existing_session_state {
+                            return Err(
+                                Self::restore_or_drop_dirty_mysql_retained_session_after_error(
+                                    shared_connection,
+                                    pooled_db_session,
+                                    context.connection_generation,
+                                    context.pool_context_epoch(),
+                                    conn,
+                                    prior_retained_state,
+                                    db_activity,
+                                    message,
+                                    session_scope,
+                                ),
+                            );
+                        }
+                        crate::utils::logging::log_warning(
                         "mysql pool session",
                         &format!(
                             "{db_display_name} pooled session database setup failed with a stale-session error; retrying once: {message}"
                         ),
                     );
-                    Self::discard_mysql_pooled_connection(conn);
-                    let (mut fresh_conn, cancel_registration) =
-                        Self::acquire_fresh_mysql_pool_session(
-                            &context,
-                            session_pool_sender,
-                            &activity,
+                        Self::discard_mysql_pooled_connection(conn);
+                        let (mut fresh_conn, cancel_registration) =
+                            Self::acquire_fresh_mysql_pool_session(
+                                &context,
+                                session_pool_sender,
+                                &activity,
+                            )?;
+                        if let Some(sender) = session_pool_sender {
+                            crate::db::HoldsSessionCancelRegistration::hold_session_registration(
+                                sender,
+                                cancel_registration,
+                            );
+                        }
+                        let fresh_scope;
+                        (fresh_conn, fresh_scope) =
+                            Self::prepare_mysql_pooled_session_or_retry_once(
+                                &context,
+                                session_pool_sender,
+                                fresh_conn,
+                                &activity,
+                            )?;
+                        Self::apply_mysql_pooled_execution_session_settings(
+                            &mut fresh_conn,
+                            context.connection_info.db_type,
+                            auto_commit,
+                            context.transaction_mode,
+                            context.default_transaction_isolation,
+                            false,
+                            statement_requires_transaction_boundary,
                         )?;
-                    if let Some(sender) = session_pool_sender {
-                        crate::db::HoldsSessionCancelRegistration::hold_session_registration(
-                            sender,
-                            cancel_registration,
-                        );
+                        return Ok(AcquiredMySqlPooledSession {
+                            connection_generation: context.connection_generation,
+                            pool_context_epoch: context.pool_context_epoch(),
+                            connection_info: context.connection_info,
+                            conn: fresh_conn,
+                            prior_retained_state: RetainedSessionState::default(),
+                            session_scope: fresh_scope,
+                        });
                     }
-                    fresh_conn = Self::prepare_mysql_pooled_session_or_retry_once(
-                        &context,
-                        session_pool_sender,
-                        fresh_conn,
-                        &activity,
-                    )?;
-                    Self::apply_mysql_pooled_execution_session_settings(
-                        &mut fresh_conn,
-                        context.connection_info.db_type,
-                        auto_commit,
-                        context.transaction_mode,
-                        context.default_transaction_isolation,
-                        false,
-                        statement_requires_transaction_boundary,
-                    )?;
-                    return Ok((
-                        context.connection_generation,
-                        context.pool_context_epoch(),
-                        context.connection_info,
-                        fresh_conn,
-                        RetainedSessionState::default(),
-                    ));
-                }
 
-                return Err(
-                    Self::restore_or_drop_dirty_mysql_retained_session_after_error(
-                        shared_connection,
-                        pooled_db_session,
-                        context.connection_generation,
-                        context.pool_context_epoch(),
-                        conn,
-                        prior_retained_state,
-                        db_activity,
-                        message,
-                    ),
-                );
+                    return Err(
+                        Self::restore_or_drop_dirty_mysql_retained_session_after_error(
+                            shared_connection,
+                            pooled_db_session,
+                            context.connection_generation,
+                            context.pool_context_epoch(),
+                            conn,
+                            prior_retained_state,
+                            db_activity,
+                            message,
+                            session_scope,
+                        ),
+                    );
+                }
             }
         }
         if let Err(message) = Self::apply_mysql_pooled_execution_session_settings(
@@ -22694,7 +22787,8 @@ impl SqlEditorWidget {
                         cancel_registration,
                     );
                 }
-                fresh_conn = Self::prepare_mysql_pooled_session_or_retry_once(
+                let fresh_scope;
+                (fresh_conn, fresh_scope) = Self::prepare_mysql_pooled_session_or_retry_once(
                     &context,
                     session_pool_sender,
                     fresh_conn,
@@ -22709,13 +22803,14 @@ impl SqlEditorWidget {
                     false,
                     statement_requires_transaction_boundary,
                 )?;
-                return Ok((
-                    context.connection_generation,
-                    context.pool_context_epoch(),
-                    context.connection_info,
-                    fresh_conn,
-                    RetainedSessionState::default(),
-                ));
+                return Ok(AcquiredMySqlPooledSession {
+                    connection_generation: context.connection_generation,
+                    pool_context_epoch: context.pool_context_epoch(),
+                    connection_info: context.connection_info,
+                    conn: fresh_conn,
+                    prior_retained_state: RetainedSessionState::default(),
+                    session_scope: fresh_scope,
+                });
             }
 
             return Err(
@@ -22728,16 +22823,18 @@ impl SqlEditorWidget {
                     prior_retained_state,
                     db_activity,
                     message,
+                    session_scope,
                 ),
             );
         }
-        Ok((
-            context.connection_generation,
-            context.pool_context_epoch(),
-            context.connection_info,
+        Ok(AcquiredMySqlPooledSession {
+            connection_generation: context.connection_generation,
+            pool_context_epoch: context.pool_context_epoch(),
+            connection_info: context.connection_info,
             conn,
             prior_retained_state,
-        ))
+            session_scope,
+        })
     }
 
     /// Whether the session already carries exactly the settings this execution
@@ -22966,27 +23063,6 @@ impl SqlEditorWidget {
         }
     }
 
-    fn apply_mysql_pooled_session_disposition_if_current(
-        shared_connection: &crate::db::SharedConnection,
-        pooled_db_session: &SharedDbSessionLease,
-        connection_generation: u64,
-        pool_context_epoch: u64,
-        conn: mysql::PooledConn,
-        disposition: crate::db::RetainedSessionOutcome,
-        db_activity: &str,
-    ) {
-        Self::apply_mysql_pooled_session_disposition_if_current_with_scope(
-            shared_connection,
-            pooled_db_session,
-            connection_generation,
-            pool_context_epoch,
-            conn,
-            disposition,
-            db_activity,
-            None,
-        );
-    }
-
     fn apply_mysql_pooled_session_disposition_if_current_with_scope(
         shared_connection: &crate::db::SharedConnection,
         pooled_db_session: &SharedDbSessionLease,
@@ -23029,25 +23105,6 @@ impl SqlEditorWidget {
         } else {
             Self::discard_mysql_pooled_connection(conn);
         }
-    }
-
-    fn retain_mysql_pooled_session_if_current_with_state(
-        shared_connection: &crate::db::SharedConnection,
-        pooled_db_session: &SharedDbSessionLease,
-        connection_generation: u64,
-        pool_context_epoch: u64,
-        conn: mysql::PooledConn,
-        retained_state: RetainedSessionState,
-        db_activity: &str,
-    ) {
-        MySqlPooledSessionDisposition::new(
-            shared_connection,
-            pooled_db_session,
-            connection_generation,
-            pool_context_epoch,
-            db_activity,
-        )
-        .retain(conn, retained_state);
     }
 
     fn retain_mysql_pooled_session_if_current_with_state_and_scope(
@@ -23115,6 +23172,7 @@ impl SqlEditorWidget {
         prior_retained_state: RetainedSessionState,
         db_activity: &str,
         message: String,
+        session_scope: Option<String>,
     ) -> String {
         MySqlPooledSessionDisposition::new(
             shared_connection,
@@ -23128,6 +23186,7 @@ impl SqlEditorWidget {
             prior_retained_state,
             crate::db::RetainedSessionErrorPolicy::RestoreIfReusableAndRequiresResolution,
             message,
+            session_scope,
         )
     }
 
@@ -23140,6 +23199,7 @@ impl SqlEditorWidget {
         prior_retained_state: RetainedSessionState,
         db_activity: &str,
         message: String,
+        session_scope: Option<String>,
     ) -> String {
         MySqlPooledSessionDisposition::new(
             shared_connection,
@@ -23153,6 +23213,7 @@ impl SqlEditorWidget {
             prior_retained_state,
             crate::db::RetainedSessionErrorPolicy::DiscardPhysical,
             message,
+            session_scope,
         )
     }
 
@@ -23176,6 +23237,7 @@ impl SqlEditorWidget {
         prior_retained_state: RetainedSessionState,
         db_activity: &str,
         message: String,
+        session_scope: Option<String>,
     ) -> String {
         let disposition = Self::mysql_retained_session_scope_recheck_error_outcome(
             prior_retained_state,
@@ -23188,7 +23250,7 @@ impl SqlEditorWidget {
             pool_context_epoch,
             db_activity,
         )
-        .apply(conn, disposition);
+        .apply_with_scope(conn, disposition, session_scope);
         message
     }
 
@@ -23217,8 +23279,8 @@ impl SqlEditorWidget {
         ) else {
             return crate::db::RetainedSessionMutationOutcome::NoSession;
         };
-        let Some((mut conn, prior_retained_state)) =
-            retained_session.into_mysql_connection_with_retained_state()
+        let Some((mut conn, prior_retained_state, session_scope)) =
+            retained_session.into_mysql_connection_with_retained_state_and_scope()
         else {
             return crate::db::RetainedSessionMutationOutcome::NoSession;
         };
@@ -23229,7 +23291,7 @@ impl SqlEditorWidget {
                 "auto-commit",
             )
         {
-            Self::retain_mysql_pooled_session_if_current_with_state(
+            Self::retain_mysql_pooled_session_if_current_with_state_and_scope(
                 shared_connection,
                 pooled_db_session,
                 connection_generation,
@@ -23237,6 +23299,7 @@ impl SqlEditorWidget {
                 conn,
                 prior_retained_state,
                 db_activity,
+                session_scope,
             );
             return crate::db::RetainedSessionMutationOutcome::BlockedRequiresResolution(err);
         }
@@ -23256,6 +23319,7 @@ impl SqlEditorWidget {
                 prior_retained_state,
                 db_activity,
                 message,
+                session_scope,
             );
             return crate::db::RetainedSessionMutationOutcome::FailedDiscarded(message);
         }
@@ -23281,7 +23345,7 @@ impl SqlEditorWidget {
             prior_retained_state.may_have_uncommitted_work(),
             false,
         );
-        Self::retain_mysql_pooled_session_if_current_with_state(
+        Self::retain_mysql_pooled_session_if_current_with_state_and_scope(
             shared_connection,
             pooled_db_session,
             connection_generation,
@@ -23289,6 +23353,7 @@ impl SqlEditorWidget {
             conn,
             retained_state,
             db_activity,
+            session_scope,
         );
         crate::db::RetainedSessionMutationOutcome::Applied
     }
@@ -23321,8 +23386,8 @@ impl SqlEditorWidget {
         ) else {
             return crate::db::RetainedSessionMutationOutcome::NoSession;
         };
-        let Some((mut conn, prior_retained_state)) =
-            retained_session.into_mysql_connection_with_retained_state()
+        let Some((mut conn, prior_retained_state, session_scope)) =
+            retained_session.into_mysql_connection_with_retained_state_and_scope()
         else {
             return crate::db::RetainedSessionMutationOutcome::NoSession;
         };
@@ -23331,7 +23396,7 @@ impl SqlEditorWidget {
             prior_retained_state,
             "transaction mode",
         ) {
-            Self::retain_mysql_pooled_session_if_current_with_state(
+            Self::retain_mysql_pooled_session_if_current_with_state_and_scope(
                 shared_connection,
                 pooled_db_session,
                 connection_generation,
@@ -23339,6 +23404,7 @@ impl SqlEditorWidget {
                 conn,
                 prior_retained_state,
                 db_activity,
+                session_scope,
             );
             return crate::db::RetainedSessionMutationOutcome::BlockedRequiresResolution(err);
         }
@@ -23384,7 +23450,7 @@ impl SqlEditorWidget {
         })();
         match apply_result {
             Ok(()) => {
-                Self::retain_mysql_pooled_session_if_current_with_state(
+                Self::retain_mysql_pooled_session_if_current_with_state_and_scope(
                     shared_connection,
                     pooled_db_session,
                     connection_generation,
@@ -23394,6 +23460,7 @@ impl SqlEditorWidget {
                         .with_transaction_state(TransactionSessionState::Clean)
                         .with_transaction_mode_override_cleared(),
                     db_activity,
+                    session_scope,
                 );
                 crate::db::RetainedSessionMutationOutcome::Applied
             }
@@ -23407,6 +23474,7 @@ impl SqlEditorWidget {
                     prior_retained_state,
                     db_activity,
                     message,
+                    session_scope,
                 );
                 crate::db::RetainedSessionMutationOutcome::FailedDiscarded(message)
             }
@@ -24122,7 +24190,8 @@ impl SqlEditorWidget {
         operation_transaction_mode: Option<crate::db::TransactionMode>,
         preserve_existing_session_state: bool,
         statement_requires_transaction_boundary: bool,
-    ) -> Result<(), String> {
+        session_scope: Option<&str>,
+    ) -> Result<Option<String>, String> {
         let (
             target_database,
             advanced,
@@ -24163,13 +24232,14 @@ impl SqlEditorWidget {
             &advanced,
             db_type,
             preserve_existing_session_state,
+            session_scope,
         )
         .map_err(|message| {
             format!("Failed to apply {display_name} current database before execution: {message}")
         });
 
         match result {
-            Ok(()) => {
+            Ok(applied_scope) => {
                 if !preserve_existing_session_state {
                     if let Err(message) = Self::apply_mysql_pooled_execution_session_settings(
                         conn,
@@ -24191,7 +24261,7 @@ impl SqlEditorWidget {
                 } else {
                     clear_pool_session_context_for_shared_connection(shared_connection);
                 }
-                Ok(())
+                Ok(applied_scope)
             }
             Err(message) => {
                 clear_pool_session_context_for_shared_connection(shared_connection);
@@ -24348,13 +24418,17 @@ impl SqlEditorWidget {
                 || crate::db::transaction::mysql_statement_sets_next_transaction_mode_override(
                     statement_sql,
                 );
-        let (
+        let AcquiredMySqlPooledSession {
             connection_generation,
             pool_context_epoch,
             connection_info,
             mut conn,
             prior_retained_state,
-        ) = Self::acquire_mysql_pooled_session(
+            // The database this session is really in. Every hand-back below
+            // records it, so a session that could not be moved is never filed
+            // under the scope the tab merely asked for.
+            mut session_scope,
+        } = Self::acquire_mysql_pooled_session(
             shared_connection,
             pooled_db_session,
             execution_scope,
@@ -24384,7 +24458,7 @@ impl SqlEditorWidget {
         if current_operation_id.is_some_and(|current_operation_id| {
             !Self::operation_snapshot_is_current(current_operation_id, operation_id)
         }) {
-            Self::retain_mysql_pooled_session_if_current_with_state(
+            Self::retain_mysql_pooled_session_if_current_with_state_and_scope(
                 shared_connection,
                 pooled_db_session,
                 connection_generation,
@@ -24392,6 +24466,7 @@ impl SqlEditorWidget {
                 conn,
                 prior_retained_state,
                 log_context,
+                session_scope.clone(),
             );
             return Err(Self::cancel_message());
         }
@@ -24401,7 +24476,7 @@ impl SqlEditorWidget {
                 prior_retained_state,
                 resolution_action,
             ) {
-                Self::retain_mysql_pooled_session_if_current_with_state(
+                Self::retain_mysql_pooled_session_if_current_with_state_and_scope(
                     shared_connection,
                     pooled_db_session,
                     connection_generation,
@@ -24409,6 +24484,7 @@ impl SqlEditorWidget {
                     conn,
                     prior_retained_state,
                     log_context,
+                    session_scope.clone(),
                 );
                 return Err(err);
             }
@@ -24418,7 +24494,7 @@ impl SqlEditorWidget {
             prior_retained_state,
             statement_effects,
         ) {
-            Self::retain_mysql_pooled_session_if_current_with_state(
+            Self::retain_mysql_pooled_session_if_current_with_state_and_scope(
                 shared_connection,
                 pooled_db_session,
                 connection_generation,
@@ -24426,6 +24502,7 @@ impl SqlEditorWidget {
                 conn,
                 prior_retained_state,
                 log_context,
+                session_scope.clone(),
             );
             return Err(err);
         }
@@ -24433,7 +24510,7 @@ impl SqlEditorWidget {
         if current_operation_id.is_some_and(|current_operation_id| {
             !Self::operation_snapshot_is_current(current_operation_id, operation_id)
         }) {
-            Self::retain_mysql_pooled_session_if_current_with_state(
+            Self::retain_mysql_pooled_session_if_current_with_state_and_scope(
                 shared_connection,
                 pooled_db_session,
                 connection_generation,
@@ -24441,6 +24518,7 @@ impl SqlEditorWidget {
                 conn,
                 prior_retained_state,
                 log_context,
+                session_scope.clone(),
             );
             return Err(Self::cancel_message());
         }
@@ -24461,7 +24539,7 @@ impl SqlEditorWidget {
                 current_query_cancel_handle,
                 None,
             );
-            Self::retain_mysql_pooled_session_if_current_with_state(
+            Self::retain_mysql_pooled_session_if_current_with_state_and_scope(
                 shared_connection,
                 pooled_db_session,
                 connection_generation,
@@ -24469,6 +24547,7 @@ impl SqlEditorWidget {
                 conn,
                 prior_retained_state,
                 log_context,
+                session_scope.clone(),
             );
             return Err(Self::cancel_message());
         }
@@ -24496,7 +24575,7 @@ impl SqlEditorWidget {
                         && prior_retained_state.requires_physical_session_preservation()
                         && Self::mysql_error_allows_session_reuse(&message)
                     {
-                        Self::retain_mysql_pooled_session_if_current_with_state(
+                        Self::retain_mysql_pooled_session_if_current_with_state_and_scope(
                             shared_connection,
                             pooled_db_session,
                             connection_generation,
@@ -24504,6 +24583,7 @@ impl SqlEditorWidget {
                             conn,
                             prior_retained_state,
                             log_context,
+                            session_scope.clone(),
                         );
                     } else {
                         // Timeout apply failure followed by restore failure
@@ -24560,7 +24640,7 @@ impl SqlEditorWidget {
                     conn,
                     prior_retained_state,
                     log_context,
-                    execution_scope.map(str::to_string),
+                    session_scope.clone(),
                 );
             } else {
                 Self::discard_mysql_pooled_connection(conn);
@@ -24572,7 +24652,7 @@ impl SqlEditorWidget {
             prior_retained_state,
             required_resolution_action,
         ) {
-            if let Err(message) = Self::apply_mysql_global_database_before_pooled_action(
+            match Self::apply_mysql_global_database_before_pooled_action(
                 shared_connection,
                 &mut conn,
                 execution_scope,
@@ -24582,8 +24662,11 @@ impl SqlEditorWidget {
                 transaction_mode,
                 prior_retained_state.requires_physical_session_preservation(),
                 statement_requires_transaction_boundary,
+                session_scope.as_deref(),
             ) {
-                let timeout_reset_ok = match timeout_restore.as_ref() {
+                Ok(applied_scope) => session_scope = applied_scope,
+                Err(message) => {
+                    let timeout_reset_ok = match timeout_restore.as_ref() {
                     Some(timeout_restore) => timeout_restore
                         .restore_for_db(&mut conn, db_type)
                         .map_err(|err| {
@@ -24597,13 +24680,13 @@ impl SqlEditorWidget {
                         .is_ok(),
                     None => true,
                 };
-                Self::set_current_mysql_cancel_context(
-                    current_mysql_cancel_context,
-                    current_query_cancel_handle,
-                    None,
-                );
-                if timeout_reset_ok {
-                    return Err(
+                    Self::set_current_mysql_cancel_context(
+                        current_mysql_cancel_context,
+                        current_query_cancel_handle,
+                        None,
+                    );
+                    if timeout_reset_ok {
+                        return Err(
                         Self::restore_or_discard_mysql_retained_session_after_scope_recheck_error(
                             shared_connection,
                             pooled_db_session,
@@ -24613,11 +24696,13 @@ impl SqlEditorWidget {
                             prior_retained_state,
                             log_context,
                             message,
+                            session_scope.clone(),
                         ),
                     );
+                    }
+                    Self::discard_mysql_pooled_connection(conn);
+                    return Err(message);
                 }
-                Self::discard_mysql_pooled_connection(conn);
-                return Err(message);
             }
         }
 
@@ -24646,7 +24731,7 @@ impl SqlEditorWidget {
                     load_mutex_bool(cancel_flag),
                     &result,
                 );
-                Self::apply_mysql_pooled_session_disposition_if_current(
+                Self::apply_mysql_pooled_session_disposition_if_current_with_scope(
                     shared_connection,
                     pooled_db_session,
                     connection_generation,
@@ -24654,6 +24739,7 @@ impl SqlEditorWidget {
                     conn,
                     disposition,
                     log_context,
+                    session_scope.clone(),
                 );
                 if Self::mysql_timeout_reset_failure_loses_required_session_state(
                     db_type,
@@ -24879,6 +24965,12 @@ impl SqlEditorWidget {
         } else {
             pool_context_epoch
         };
+        // A `USE` moves the tab's session out from under the scope this action
+        // was prepared in, and the sync above is the only thing that saw where
+        // it landed. Record that, not the database the statement started in.
+        if let Some(current_database) = session_current_database {
+            session_scope = Some(current_database);
+        }
         Self::apply_mysql_pooled_session_disposition_if_current_with_scope(
             shared_connection,
             pooled_db_session,
@@ -24887,7 +24979,7 @@ impl SqlEditorWidget {
             conn,
             disposition,
             log_context,
-            execution_scope.map(str::to_string),
+            session_scope,
         );
         if use_statement_scope_sync_required && !should_retain_session {
             return Err(Self::mysql_scope_sync_lost_after_success_message());
@@ -33217,6 +33309,7 @@ mod mysql_batch_execution_regression_tests {
             &advanced,
             DatabaseType::MySQL,
             false,
+            None,
         )
         .expect("empty execution scope should reset stale database state");
         let current_database = conn
@@ -33277,6 +33370,7 @@ mod mysql_batch_execution_regression_tests {
             None,
             false,
             false,
+            None,
         )
         .expect("empty global scope recheck should reset stale database state");
         let current_database = conn
@@ -37455,6 +37549,7 @@ mod mysql_transaction_feedback_tests {
                     crate::db::RetainedSessionState::default(),
                     super::OracleTransactionModeApplication::plain(transaction_mode),
                     None,
+                    None,
                     sender.clone(),
                     session.clone(),
                     "ORACLE_THIN_TEST".to_string(),
@@ -37679,6 +37774,7 @@ mod mysql_transaction_feedback_tests {
             crate::db::RetainedSessionState::default(),
             super::OracleTransactionModeApplication::plain(TransactionMode::default()),
             None,
+            None,
             sender.clone(),
             session,
             "ORACLE_THIN_CANCEL_TEST".to_string(),
@@ -37798,6 +37894,7 @@ mod mysql_transaction_feedback_tests {
             1,
             crate::db::RetainedSessionState::default(),
             super::OracleTransactionModeApplication::plain(TransactionMode::default()),
+            None,
             None,
             sender.clone(),
             session,
@@ -39591,6 +39688,7 @@ mod mysql_transaction_feedback_tests {
             1,
             crate::db::RetainedSessionState::default(),
             super::OracleTransactionModeApplication::plain(TransactionMode::default()),
+            None,
             None,
             sender.clone(),
             session,

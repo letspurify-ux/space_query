@@ -468,7 +468,7 @@ fn mysql_reused_tab_session_reselects_global_database_before_execution() {
     );
 
     let setup_start = helper
-        .find("if let Err(message) = Self::prepare_mysql_pooled_session_database(")
+        .find("match Self::prepare_mysql_pooled_session_database(")
         .expect("MySQL retained session database setup failure branch should exist");
     let setup_end = helper[setup_start..]
         .find("if let Err(message) = Self::apply_mysql_pooled_execution_session_settings(")
@@ -839,12 +839,21 @@ fn empty_mysql_scope_with_preserved_session_requires_resolution() {
     let helper = &execution_content[start..end];
 
     assert!(
-        helper.contains("if preserve_existing_session_state")
-            && helper.contains("// The retained physical session already has the tracked scope.")
+        helper.contains("crate::db::mysql_pooled_session_scope_application(")
+            && helper.contains("crate::db::MySqlSessionScopeApplication::LeaveAlone")
+            && helper.contains("crate::db::MySqlSessionScopeApplication::SelectDatabaseOnly")
             && helper
                 .contains("reset_mysql_pooled_session_to_no_database(conn, advanced, db_type)"),
-        "MySQL/MariaDB scope setup should reset an empty clean session but leave every preserved \
-         session untouched so internal scope SQL cannot alter its state"
+        "MySQL/MariaDB scope setup should reset an empty clean session, leave a preserved session \
+         that is already in the tab's scope untouched, and MOVE one that is not — deciding all \
+         three through the shared rule instead of skipping every preserved session"
+    );
+    assert!(
+        helper.contains("session_scope: Option<&str>")
+            && helper.contains("-> Result<Option<String>, String>"),
+        "MySQL/MariaDB scope setup must be told where the session actually is and report where it \
+         ended up: recording the requested scope instead is what hid a tab running in the wrong \
+         database"
     );
     assert!(
         editor_content.contains(
@@ -3851,6 +3860,25 @@ fn every_batch_holds_its_session_in_the_requesting_tabs_scope() {
         );
     }
 
+    // The call alone is not the guarantee. On the MySQL family it used to be a
+    // no-op for exactly the sessions that can drift -- anything carrying a
+    // transaction or session residue -- so the assertion has to reach the rule
+    // that decides, and that rule has to be told where the session really is.
+    let mysql_scope_setup = execution
+        .find("fn prepare_mysql_pooled_session_database(")
+        .expect("the MySQL scope setup should exist");
+    let mysql_scope_setup_end = execution[mysql_scope_setup..]
+        .find("\n    // Acquires the Oracle connection")
+        .map(|at| mysql_scope_setup + at)
+        .unwrap_or(execution.len());
+    let mysql_scope_setup = &execution[mysql_scope_setup..mysql_scope_setup_end];
+    assert!(
+        mysql_scope_setup.contains("crate::db::mysql_pooled_session_scope_application(")
+            && mysql_scope_setup.contains("session_scope"),
+        "the MySQL family's per-statement scope assertion must decide against the database the \
+         session is actually in, not skip every session that carries work"
+    );
+
     // The thin target is resolved by the one rule, and only where the
     // connection or the scope moves -- the batch runs without the connection
     // lock the OCI twin takes per statement.
@@ -3867,11 +3895,33 @@ fn every_batch_holds_its_session_in_the_requesting_tabs_scope() {
     );
     assert!(
         execution
-            .matches("Self::oracle_thin_batch_session_schema(")
+            .matches("::oracle_thin_batch_session_schema(")
             .count()
-            == 2,
-        "the thin batch target is resolved at the run's start and again when the \
-         connection changes -- nowhere else"
+            == 3,
+        "the thin target is resolved at the run's start, again when the connection \
+         changes, and once for a lazily streamed SELECT (which never enters the \
+         batch loop) -- nowhere else"
+    );
+
+    // A single-statement SELECT on thin skips the batch loop entirely and
+    // streams from its own worker. That worker holds no connection lock, so it
+    // is handed the resolved schema and must assert it like any other
+    // statement -- without this it ran wherever the tab's retained session had
+    // been left.
+    let lazy = execution
+        .find("fn start_oracle_thin_lazy_select(")
+        .expect("the thin lazy select should exist");
+    let lazy_end = execution[lazy..]
+        .find("\n    fn ")
+        .and_then(|at| {
+            execution[lazy + at + 1..]
+                .find("\n    fn ")
+                .map(|next| lazy + at + 1 + next)
+        })
+        .unwrap_or(execution.len());
+    assert!(
+        execution[lazy..lazy_end].contains("Self::apply_oracle_thin_schema_before_statement("),
+        "a lazily streamed thin SELECT must put its session in the tab's scope too"
     );
 }
 

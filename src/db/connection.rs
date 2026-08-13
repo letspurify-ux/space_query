@@ -2272,13 +2272,23 @@ impl TakenDbSessionLease {
         })
     }
 
-    pub fn into_mysql_connection_with_retained_state(
+    /// The MySQL/MariaDB session, its retained state, AND the database it is
+    /// in — the scope is part of the answer, not an optional extra.
+    ///
+    /// Every caller hands this session back through a retain path that records
+    /// a scope, and one that had forgotten this value recorded `None`: the
+    /// lease then claimed not to know where its own session was, and the next
+    /// execution had to move it (losing the diagnostics area) or trust the
+    /// tab's request instead. Returning it here is what makes forgetting it a
+    /// deliberate act.
+    pub fn into_mysql_connection_with_retained_state_and_scope(
         mut self,
-    ) -> Option<(mysql::PooledConn, RetainedSessionState)> {
+    ) -> Option<(mysql::PooledConn, RetainedSessionState, Option<String>)> {
+        let current_scope = self.current_scope.take();
         self.lease.take().and_then(|lease| {
             lease
                 .into_mysql_connection()
-                .map(|conn| (conn, self.retained_state))
+                .map(|conn| (conn, self.retained_state, current_scope))
         })
     }
 
@@ -3208,6 +3218,53 @@ pub(crate) fn retained_scope_matches_target(
     target_scope: &str,
 ) -> bool {
     retained_scope.is_some_and(|scope| db_type.scope_values_match(Some(scope), Some(target_scope)))
+}
+
+/// What a pooled MySQL/MariaDB session needs before a statement runs on it.
+///
+/// Scope is a property of the SESSION, so it has to be re-asserted where the
+/// session is handed to a statement, not only where the user picks it — the
+/// Oracle drivers both do exactly that before every statement. The MySQL
+/// family cannot simply repeat `COM_INIT_DB` though: it clears the diagnostics
+/// area, so a session that is ALREADY in the target database has to be left
+/// untouched or `SHOW WARNINGS` after a DML would come back empty.
+///
+/// The two are only compatible if the decision is made against the scope the
+/// physical session is actually in, which is what the retained lease records.
+/// A session that is somewhere else — or whose scope is unknown — is moved
+/// even when it carries work: `USE` neither commits nor rolls back, so the
+/// transaction continues in the new database, and leaving it behind would run
+/// the tab's statements in a database its selector never pointed at.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum MySqlSessionScopeApplication {
+    /// Already in the target database: touch nothing.
+    LeaveAlone,
+    /// Move the session, and only move it — it carries work or residue that a
+    /// full session preparation would disturb.
+    SelectDatabaseOnly,
+    /// Nothing to protect: select the database and re-apply session settings.
+    PrepareSession,
+}
+
+pub(crate) fn mysql_pooled_session_scope_application(
+    db_type: DatabaseType,
+    preserve_existing_session_state: bool,
+    session_scope: Option<&str>,
+    target_scope: &str,
+) -> MySqlSessionScopeApplication {
+    if !preserve_existing_session_state {
+        return MySqlSessionScopeApplication::PrepareSession;
+    }
+    // An empty target means "this connection has no database". Resetting a
+    // work-carrying session to that state is refused everywhere else
+    // (`mysql_empty_scope_requires_resolved_session_error`), so it stays where
+    // it is.
+    if target_scope.trim().is_empty()
+        || retained_scope_matches_target(db_type, session_scope, target_scope)
+    {
+        return MySqlSessionScopeApplication::LeaveAlone;
+    }
+    MySqlSessionScopeApplication::SelectDatabaseOnly
 }
 
 impl DbBackend for OracleBackend {
@@ -13178,6 +13235,58 @@ mod tests {
             Some("HR"),
             "SYS"
         ));
+    }
+
+    /// A work-carrying MySQL/MariaDB session used to be left exactly where it
+    /// was, on the assumption that a retained session already has the tab's
+    /// scope. It does not when the object browser's push could not reach it —
+    /// the connection mutex was busy, the apply failed, or the tab's scope was
+    /// cleared — and the statement then ran in a database the tab's selector
+    /// never pointed at, permanently.
+    #[test]
+    fn preserved_mysql_session_is_moved_when_it_is_not_in_the_tab_scope() {
+        for db_type in [DatabaseType::MySQL, DatabaseType::MariaDB] {
+            assert_eq!(
+                mysql_pooled_session_scope_application(db_type, true, Some("other"), "test"),
+                MySqlSessionScopeApplication::SelectDatabaseOnly,
+                "{db_type}: a preserved session in another database must be moved"
+            );
+            assert_eq!(
+                mysql_pooled_session_scope_application(db_type, true, None, "test"),
+                MySqlSessionScopeApplication::SelectDatabaseOnly,
+                "{db_type}: an unknown session scope must be re-asserted, not assumed correct"
+            );
+        }
+    }
+
+    /// The other half of the rule: re-selecting the SAME database clears the
+    /// diagnostics area, so `SHOW WARNINGS` after a DML would come back empty.
+    #[test]
+    fn preserved_mysql_session_already_in_the_tab_scope_is_left_alone() {
+        for db_type in [DatabaseType::MySQL, DatabaseType::MariaDB] {
+            assert_eq!(
+                mysql_pooled_session_scope_application(db_type, true, Some(" test "), "test"),
+                MySqlSessionScopeApplication::LeaveAlone,
+                "{db_type}: an already-current session must not be touched"
+            );
+            // "no database" cannot be applied to a session that carries work.
+            assert_eq!(
+                mysql_pooled_session_scope_application(db_type, true, Some("test"), "  "),
+                MySqlSessionScopeApplication::LeaveAlone,
+                "{db_type}: an empty target leaves a work-carrying session alone"
+            );
+        }
+    }
+
+    #[test]
+    fn mysql_session_without_work_is_always_fully_prepared() {
+        for db_type in [DatabaseType::MySQL, DatabaseType::MariaDB] {
+            assert_eq!(
+                mysql_pooled_session_scope_application(db_type, false, Some("test"), "test"),
+                MySqlSessionScopeApplication::PrepareSession,
+                "{db_type}: a session with nothing to protect is prepared as before"
+            );
+        }
     }
 
     #[test]

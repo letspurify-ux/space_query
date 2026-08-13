@@ -140,7 +140,16 @@ the old schema for good. The thin target is resolved by
 `oracle_thin_batch_session_schema` when the run starts and again when a script
 `CONNECT` replaces the connection, rather than per statement, because the thin
 batch deliberately runs without the connection lock its OCI twin takes each
-time. Guard: `every_batch_holds_its_session_in_the_requesting_tabs_scope`;
+time. A single-statement thin SELECT never enters that loop — it streams from
+its own lazy-fetch worker — so the schema is resolved for it at the same point
+and applied inside the worker (`start_oracle_thin_lazy_select`) right after the
+transaction mode; without that it ran wherever the tab's retained session had
+been left. On the MySQL family the assertion decides through
+`mysql_pooled_session_scope_application`: it must not repeat `COM_INIT_DB` on a
+session already in the target (that clears the diagnostics area), but a session
+that is somewhere else is moved even when it carries work — skipping every
+preserved session instead made the eager push a correctness requirement it
+cannot meet. Guard: `every_batch_holds_its_session_in_the_requesting_tabs_scope`;
 live check S44 in `verify_transaction_mode_live` (all four backends).
 
 The object browser's scope selection is tab-local: a pick lands on the ACTIVE

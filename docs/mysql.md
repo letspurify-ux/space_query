@@ -63,6 +63,27 @@ execution settings in both cases. Neither is redundant: a database can be
 dropped while an idle pooled session still names it, and the tab's
 transaction mode only reaches a reused session through those settings.
 
+`prepare_mysql_pooled_session_database()` decides through
+`mysql_pooled_session_scope_application()` and reports the database the session
+ended up in, which is what the retained lease records:
+
+- no work to protect — select the database and re-apply the session settings;
+- work or residue, and the session is already in the target — touch nothing:
+  `COM_INIT_DB` clears the diagnostics area, so `SHOW WARNINGS` after a DML
+  would come back empty;
+- work or residue, and the session is somewhere else (or its scope is unknown)
+  — `USE` alone. `USE` neither commits nor rolls back, so the tab's transaction
+  continues in the new database; a missing database is reported instead of
+  falling back to "no database", because that fallback exists to keep a FRESH
+  session usable and would throw away this one's work.
+
+Skipping every preserved session instead — which is what "the retained session
+already has the tracked scope" assumed — made the eager push a correctness
+requirement it cannot meet (it needs the connection lock and gives up
+silently). A tab whose push was missed ran every later statement in the old
+database, and the lease still recorded the requested one, so nothing could
+notice.
+
 ## Input validation
 
 - A time zone is blank or has `+HH:MM`/`-HH:MM` form.
