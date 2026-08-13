@@ -462,6 +462,7 @@ impl SqlEditorWidget {
         let ColumnLoadTask {
             table_key,
             connection,
+            scope,
             sender,
             foreign_keys,
         } = task;
@@ -496,8 +497,12 @@ impl SqlEditorWidget {
 
         // `_cancel_registration` keeps this column load reachable by the cancel
         // button for as long as it holds the session.
+        // The requesting TAB's scope, never the connection's: an unqualified
+        // table name must resolve where that tab's statements would. The two
+        // sibling metadata lookups (signature hints, bind-prompt routine
+        // arguments) already acquire this way.
         let (pool_session, _cancel_registration) = match context
-            .acquire_session_for_current_scope(&activity_guard)
+            .acquire_session_for_scope(scope.as_deref(), &activity_guard)
         {
             Ok(session) => session,
             Err(_) => {

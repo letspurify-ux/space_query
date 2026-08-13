@@ -175,6 +175,14 @@ struct NormalizedIntellisenseContext {
 struct ColumnLoadTask {
     table_key: String,
     connection: SharedConnection,
+    /// The scope the requesting tab's catalog describes, so this load resolves
+    /// an UNQUALIFIED table where the tab's own statements would.
+    ///
+    /// The load key is only case-normalized, never schema-qualified, and a
+    /// tab's catalog holds bare names — so without this the lookup ran against
+    /// whatever schema the CONNECTION happens to be in, and a tab pointed
+    /// somewhere else completed on another schema's columns.
+    scope: Option<String>,
     sender: mpsc::Sender<ColumnLoadUpdate>,
     /// When true the task loads the table's foreign keys instead of its
     /// columns. Foreign keys are fetched lazily (only for JOIN auto-join) so

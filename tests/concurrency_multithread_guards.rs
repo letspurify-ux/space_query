@@ -1006,22 +1006,35 @@ fn metadata_refresh_error_paths_finish_in_progress_state() {
     );
 }
 
+/// A column load resolves an UNQUALIFIED table name, so it needs a scope — and
+/// since per-tab scope landed, the only correct one is the REQUESTING TAB's.
+///
+/// This guard used to pin `acquire_session_for_current_scope`, from before a
+/// tab could point somewhere other than its connection. The load key is only
+/// case-normalized, never schema-qualified, and a tab's catalog holds bare
+/// names, so the connection's scope meant a tab pointed elsewhere completed on
+/// another schema's columns. The loader runs on a GLOBAL worker pool and cannot
+/// read the requesting tab, so the scope travels on the task.
 #[test]
-fn column_loader_applies_global_scope_before_unqualified_metadata_queries() {
+fn column_loader_applies_the_requesting_tabs_scope_before_unqualified_metadata_queries() {
     let file =
         Path::new(env!("CARGO_MANIFEST_DIR")).join("src/ui/sql_editor/intellisense/helpers.rs");
     let content = fs::read_to_string(&file)
         .unwrap_or_else(|err| panic!("failed to read source file {}: {err}", file.display()));
 
-    // Assert the invariant, not the formatting: the acquire call now takes the
+    // Assert the invariant, not the formatting: the acquire call also takes the
     // activity guard, and rustfmt wraps it over several lines.
     let compact = content.split_whitespace().collect::<String>();
     assert!(
-        compact.contains("context.acquire_session_for_current_scope(&activity_guard)")
-            && compact.contains(
-                "Self::send_empty_column_load_update(&sender,&table_key,foreign_keys);"
-            ),
-        "Column loading should abort with an empty update when current-scope session acquire/apply fails"
+        compact.contains("context.acquire_session_for_scope(scope.as_deref(),&activity_guard)")
+            && compact
+                .contains("Self::send_empty_column_load_update(&sender,&table_key,foreign_keys);"),
+        "Column loading should acquire for the requesting tab's scope and abort \
+         with an empty update when that acquire/apply fails"
+    );
+    assert!(
+        !compact.contains("acquire_session_for_current_scope("),
+        "the column loader must not fall back to the connection's scope"
     );
 }
 
@@ -3988,6 +4001,20 @@ fn tab_metadata_lookups_acquire_their_session_for_the_requesting_tabs_scope() {
             "{function} must not fall back to the connection's scope"
         );
     }
+
+    // The loader itself is guarded by
+    // `column_loader_applies_the_requesting_tabs_scope_before_unqualified_metadata_queries`;
+    // what belongs here is that the scope actually gets ONTO the task it
+    // queues, from the catalog being completed against.
+    let completion = read_source("src/ui/sql_editor/intellisense/completion.rs");
+    assert_eq!(
+        completion
+            .matches("data.default_qualifier_name().map(str::to_string)")
+            .count(),
+        2,
+        "both column-load task constructors (columns and foreign keys) must \
+         stamp the catalog's scope onto the task"
+    );
 }
 
 /// A UI timer closure may never block on the app state.

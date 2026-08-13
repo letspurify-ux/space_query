@@ -76105,7 +76105,7 @@ impl SqlEditorWidget {
         db_type: Option<crate::db::DatabaseType>,
         allow_resolved_uncataloged_table: bool,
     ) {
-        let table_key = {
+        let (table_key, scope) = {
             let mut data = intellisense_data
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -76122,12 +76122,15 @@ impl SqlEditorWidget {
             if !data.mark_columns_loading(&selected) {
                 return;
             }
-            selected
+            // The spelling, not the lookup key: this goes to the server as a
+            // scope, the same as the tab's own statements.
+            (selected, data.default_qualifier_name().map(str::to_string))
         };
 
         let task = ColumnLoadTask {
             table_key,
             connection: connection.clone(),
+            scope,
             sender: column_sender.clone(),
             foreign_keys: false,
         };
@@ -76173,7 +76176,7 @@ impl SqlEditorWidget {
         connection: &SharedConnection,
         db_type: Option<crate::db::DatabaseType>,
     ) {
-        let table_key = {
+        let (table_key, scope) = {
             let mut data = intellisense_data
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -76185,12 +76188,13 @@ impl SqlEditorWidget {
             if !data.mark_foreign_keys_loading(&selected) {
                 return;
             }
-            selected
+            (selected, data.default_qualifier_name().map(str::to_string))
         };
 
         let task = ColumnLoadTask {
             table_key,
             connection: connection.clone(),
+            scope,
             sender: column_sender.clone(),
             foreign_keys: true,
         };

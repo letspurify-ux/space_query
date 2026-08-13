@@ -7646,6 +7646,7 @@ fn column_load_worker_pool_enqueue_returns_err_when_worker_pool_is_empty() {
     let task = ColumnLoadTask {
         table_key: "EMP".to_string(),
         connection: create_shared_connection(),
+        scope: None,
         sender,
         foreign_keys: false,
     };
@@ -7696,6 +7697,7 @@ fn column_load_worker_pool_shutdown_does_not_wait_for_active_worker() {
     let task = ColumnLoadTask {
         table_key: "EMP".to_string(),
         connection: create_shared_connection(),
+        scope: None,
         sender: update_sender,
         foreign_keys: false,
     };
