@@ -3301,22 +3301,6 @@ impl SqlEditorWidget {
         transaction_action_backend_for(db_type).retained_scope_error_allows_session_reuse(message)
     }
 
-    fn current_scope_for_retained_session(
-        shared_connection: &SharedConnection,
-        connection_generation: u64,
-        db_type: DatabaseType,
-        db_activity: &str,
-    ) -> Option<String> {
-        let conn_guard =
-            crate::db::lock_connection_with_activity(shared_connection, db_activity.to_string());
-        conn_guard
-            .can_reuse_pool_session(connection_generation, db_type)
-            .then(|| conn_guard.current_scope_name())
-            .flatten()
-            .map(|scope| scope.trim().to_string())
-            .filter(|scope| !scope.is_empty())
-    }
-
     pub fn apply_current_scope_to_retained_session(
         &self,
         connection_generation: u64,

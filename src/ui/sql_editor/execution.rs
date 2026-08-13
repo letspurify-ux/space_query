@@ -2303,17 +2303,16 @@ impl Drop for QueryExecutionCleanupGuard {
                     session_decision,
                     crate::db::session_policy::SessionDecision::RequireCommitOrRollback
                 );
+            // The schema this session was just put in, which is the TAB's --
+            // the re-apply above uses `oracle_pooled_session_scope`. Reading
+            // the CONNECTION's tracked schema instead filed the lease under a
+            // schema the session is not in, and a later scope push to that
+            // name then short-circuits as "already there" and issues no
+            // ALTER SESSION at all.
             let current_scope = self
                 .oracle_pooled_session_scope_connection
                 .as_ref()
-                .and_then(|shared_connection| {
-                    SqlEditorWidget::current_scope_for_retained_session(
-                        shared_connection,
-                        *connection_generation,
-                        crate::db::DatabaseType::Oracle,
-                        "sql_editor::cleanup",
-                    )
-                });
+                .and_then(|_| self.oracle_pooled_session_scope.clone());
             let mut applier = OracleCleanupSessionDecisionApplier {
                 pooled_db_session,
                 connection_generation: *connection_generation,
@@ -3324,6 +3323,18 @@ impl SqlEditorWidget {
         }
     }
 
+    /// The database this session is actually in, or `None` when the server has
+    /// detached it. Needs no default database of its own, so it is safe on a
+    /// session whose database has just been dropped.
+    fn mysql_session_current_database(conn: &mut mysql::PooledConn) -> Option<String> {
+        conn.query_first::<Option<String>, _>("SELECT DATABASE()")
+            .ok()
+            .flatten()
+            .flatten()
+            .map(|database| database.trim().to_string())
+            .filter(|database| !database.is_empty())
+    }
+
     fn mysql_missing_current_database_error(err: &MysqlError) -> bool {
         matches!(err, MysqlError::MySqlError(server_err) if server_err.code == 1049)
             || err
@@ -3348,6 +3359,15 @@ impl SqlEditorWidget {
 
     fn mysql_should_refresh_connection_encoding(preserve_existing_session_state: bool) -> bool {
         !preserve_existing_session_state
+    }
+
+    /// The one spelling of "a scope is a non-empty trimmed name", so a branch
+    /// added next to the ones below cannot quietly re-introduce `Some("")`.
+    fn normalized_session_scope(scope: Option<&str>) -> Option<String> {
+        scope
+            .map(str::trim)
+            .filter(|scope| !scope.is_empty())
+            .map(str::to_string)
     }
 
     /// Puts a pooled session in the database this execution runs in, and
@@ -3375,27 +3395,51 @@ impl SqlEditorWidget {
             database,
         ) {
             crate::db::MySqlSessionScopeApplication::LeaveAlone => {
-                return Ok(session_scope
-                    .map(str::trim)
-                    .filter(|scope| !scope.is_empty())
-                    .map(str::to_string));
+                return Ok(Self::normalized_session_scope(session_scope));
             }
             crate::db::MySqlSessionScopeApplication::SelectDatabaseOnly => {
                 // The session carries work or residue, so only the database
                 // moves: `USE` neither commits nor rolls back, and a full
-                // preparation would reset settings this session still owns. A
-                // missing database is reported instead of silently falling back
-                // to "no database" — that fallback exists to keep a FRESH
-                // session usable, and applying it here would throw away the
-                // work this one is holding.
-                conn.as_mut().select_db(database).map_err(|err| {
-                    format!(
+                // preparation would reset settings this session still owns
+                // (the encoding statements would also clear the diagnostics
+                // area this session may be holding for `SHOW WARNINGS`).
+                return match conn.as_mut().select_db(database) {
+                    Ok(()) => Ok(Some(database.to_string())),
+                    // The target is gone. Whether that may be tolerated
+                    // depends on where this session actually is, so read it
+                    // rather than assume: a session the server has already
+                    // detached (its own database was dropped) has no database
+                    // to be wrong about, and failing here would refuse even the
+                    // COMMIT/ROLLBACK that resolves its work. A session sitting
+                    // in a DIFFERENT, valid database is the opposite case —
+                    // letting the statement through would run it somewhere the
+                    // tab's selector never pointed, which is exactly what this
+                    // whole choke point exists to prevent.
+                    Err(err) if Self::mysql_missing_current_database_error(&err) => {
+                        let landed = Self::mysql_session_current_database(conn);
+                        match landed.as_deref() {
+                            Some(landed) => Err(format!(
+                                "Failed to apply {} current database `{database}`: {}. The session is still in `{landed}`.",
+                                db_type.display_name(),
+                                SqlEditorWidget::mysql_error_message(&err, None)
+                            )),
+                            None => {
+                                crate::utils::logging::log_warning(
+                                    "mysql pool session",
+                                    &format!(
+                                        "Current database `{database}` is not available and this work-carrying session has none; leaving it detached"
+                                    ),
+                                );
+                                Ok(None)
+                            }
+                        }
+                    }
+                    Err(err) => Err(format!(
                         "Failed to apply {} current database `{database}`: {}",
                         db_type.display_name(),
                         SqlEditorWidget::mysql_error_message(&err, None)
-                    )
-                })?;
-                return Ok(Some(database.to_string()));
+                    )),
+                };
             }
             crate::db::MySqlSessionScopeApplication::PrepareSession => {}
         }
@@ -5053,12 +5097,12 @@ impl SqlEditorWidget {
                             prior_retained_state,
                             may_have_uncommitted_work,
                         );
-                        let current_scope = Self::current_scope_for_retained_session(
-                            &shared_connection,
-                            connection_generation,
-                            crate::db::DatabaseType::Oracle,
-                            "oracle lazy fetch cleanup",
-                        );
+                        // The schema the session was just put in above is the
+                        // TAB's (`apply_oracle_schema_to_pooled_session_if_current`
+                        // takes `execution_scope`), so that is what the lease
+                        // records -- not the connection's tracked schema, which
+                        // this session may well not be in.
+                        let current_scope = execution_scope.clone();
                         pooled_db_session.apply_retained_session_disposition_with_scope(
                             connection_generation,
                             pool_context_epoch,
@@ -23084,17 +23128,13 @@ impl SqlEditorWidget {
             let db_type = conn_guard.db_type();
             conn_guard
                 .can_reuse_pool_session(connection_generation, db_type)
-                .then(|| {
-                    (
-                        db_type,
-                        explicit_scope.or_else(|| {
-                            conn_guard
-                                .current_scope_name()
-                                .map(|scope| scope.trim().to_string())
-                                .filter(|scope| !scope.is_empty())
-                        }),
-                    )
-                })
+                // The scope recorded here is the database the SESSION is in,
+                // and every MySQL hand-back now says which one that is. `None`
+                // is that answer too — "this session has no default database" —
+                // so filling it in from the CONNECTION would file a session
+                // under a database it is not in, and the next statement would
+                // read that as "already there" and run with no database at all.
+                .then_some((db_type, explicit_scope))
         };
         if let Some((db_type, current_scope)) = scope_context {
             Self::apply_mysql_pooled_session_disposition(
@@ -23791,10 +23831,13 @@ impl SqlEditorWidget {
         preserve_existing_session_state: bool,
         preserve_statement_diagnostics: bool,
         execution_scope: Option<&str>,
-        // Set to the database the session reported, so callers name the
-        // place the statement really landed instead of re-deriving it from
-        // connection state that a tab's `USE` no longer touches.
-        session_current_database: &mut Option<String>,
+        // Where the session landed, when this sync was in a position to look.
+        // The outer `Option` is "did it answer", the inner one is the answer
+        // itself -- `None` meaning the server has detached the session. Folding
+        // the two together let "this session now has NO database" read as
+        // "nothing to report", and the caller then kept recording the database
+        // the session had before it was dropped.
+        session_current_database: &mut Option<Option<String>>,
     ) -> bool {
         // Internal protocol/SQL health commands change MySQL's statement
         // diagnostics. Skip them while ROW_COUNT()/FOUND_ROWS() is pending;
@@ -23841,7 +23884,10 @@ impl SqlEditorWidget {
                             );
                         }
                     }
-                    *session_current_database = Some(session_database);
+                    // Normalized so the lease has ONE spelling of "no
+                    // database": the inner `None`.
+                    *session_current_database =
+                        Some(Self::normalized_session_scope(Some(&session_database)));
                     crate::db::refresh_pool_session_context_cache_for_shared_connection(
                         shared_connection,
                         &conn_guard,
@@ -23912,6 +23958,14 @@ impl SqlEditorWidget {
             if !target_database.is_empty() && current_database != target_database {
                 match conn.as_mut().select_db(target_database.as_str()) {
                     Ok(()) => {
+                        // This moved the session, so it is where the caller
+                        // must record it. Leaving it unsaid filed the lease
+                        // under the database the session had BEFORE this
+                        // switch, and the next statement then moved it again
+                        // for nothing -- clearing the diagnostics area on the
+                        // way.
+                        *session_current_database =
+                            Some(Self::normalized_session_scope(Some(&target_database)));
                         if Self::mysql_should_refresh_connection_encoding(
                             preserve_existing_session_state,
                         ) {
@@ -24783,11 +24837,16 @@ impl SqlEditorWidget {
         let statement_failed = matches!(result, Ok(Err(_)));
         let action_released_physical_session =
             matches!(&result, Ok(Ok(_))) && statement_effects.releases_physical_session();
+        // Against the database this SESSION is in, not the connection's stored
+        // name: a tab with a scope of its own can drop the database it is
+        // sitting in, and asking the connection would answer about a database
+        // nobody dropped -- leaving the lease naming a database the server has
+        // just detached the session from.
         let statement_dropped_current_database = matches!(&result, Ok(Ok(_)))
             && Self::mysql_statement_drops_current_database(
                 db_type,
                 statement_sql,
-                &stored_current_database,
+                session_scope.as_deref().unwrap_or(&stored_current_database),
             );
         // USE statements require the post-success scope sync to land; a
         // DROP DATABASE of the current database also needs the stored name
@@ -24836,7 +24895,7 @@ impl SqlEditorWidget {
         // What the session itself says it is in after this statement. A `USE`
         // moves the tab's session, and nothing else knows where it landed —
         // the connection's stored database is deliberately untouched.
-        let mut session_current_database: Option<String> = None;
+        let mut session_current_database: Option<Option<String>> = None;
         let mut should_retain_session = match reuse_decision {
             crate::db::MySqlPooledSessionReuseDecision::RetainIfSessionInfoSynced => {
                 Self::sync_mysql_pooled_session_info(
@@ -24973,8 +25032,8 @@ impl SqlEditorWidget {
         // A `USE` moves the tab's session out from under the scope this action
         // was prepared in, and the sync above is the only thing that saw where
         // it landed. Record that, not the database the statement started in.
-        if let Some(current_database) = session_current_database {
-            session_scope = Some(current_database);
+        if let Some(landed) = session_current_database {
+            session_scope = landed;
         }
         Self::apply_mysql_pooled_session_disposition_if_current_with_scope(
             shared_connection,

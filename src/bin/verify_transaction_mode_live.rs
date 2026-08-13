@@ -2921,10 +2921,13 @@ fn run_scenarios(target: Target, h: &mut Harness) -> Result<(), String> {
     // the user run the statement that fixes the situation. So drop the scope a
     // tab is pointing at and the tab must keep executing.
     //
-    // The session is discarded first so this exercises the documented fallback
-    // rather than the work-carrying case: a MySQL session that carries work
-    // cannot be reset to "no database" (COM_CHANGE_USER would roll the work
-    // back), so there the honest answer is an error, not a silent fallback.
+    // The session is discarded first so this exercises the fresh-session
+    // fallback rather than the work-carrying case. That case is S49's: a
+    // session carrying work cannot be reset to "no database" (COM_CHANGE_USER
+    // would roll the work back), so it is left where it is -- detached when its
+    // own database was dropped, which is what keeps COMMIT/ROLLBACK reachable.
+    // A session sitting in a DIFFERENT valid database is refused instead, so a
+    // statement never runs somewhere the tab's selector never pointed.
     {
         println!("  --- S46 a tab whose scope was dropped keeps working ---");
         h.editor.clear_tab_transaction_mode_override();
@@ -3084,6 +3087,118 @@ fn run_scenarios(target: Target, h: &mut Harness) -> Result<(), String> {
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .disconnect();
+    }
+
+    // ---- S49 (MySQL family): dropping the tab's own database must not brick
+    // ---- the tab's ability to resolve its work ------------------------------
+    // A work-carrying session cannot be reset to "no database" -- that path
+    // uses COM_CHANGE_USER, which would roll the work back -- so when the
+    // database a tab points at is gone, the session stays where it is and the
+    // statement meets the server's own error. Failing the session SETUP
+    // instead refuses even the COMMIT/ROLLBACK that resolves the work, which
+    // is a deadlock: the tab can neither run nor finish.
+    if !target.is_oracle() {
+        println!("  --- S49 dropping the tab's own database leaves it resolvable ---");
+        h.editor.clear_tab_transaction_mode_override();
+        h.run("ROLLBACK")?;
+        let scratch_scope = "SQ_TM_SCOPE9";
+        let _ = h.run(&format!("DROP DATABASE IF EXISTS {scratch_scope}"));
+        let capture = h.run(&format!("CREATE DATABASE {scratch_scope}"))?;
+        if !capture.results.first().is_some_and(|result| result.success) {
+            return Err(format!(
+                "S49 could not create the scratch scope: {:?}",
+                capture.results.first().map(|r| r.message.clone())
+            ));
+        }
+        h.change_tab_scope(Some(scratch_scope));
+        // Work on the session, so it is one the app must preserve.
+        let capture = h.run(&format!("INSERT INTO {qualified_table} VALUES (4901)"))?;
+        h.check(
+            "S49 the write that makes the session one to preserve succeeds",
+            capture.results.first().is_some_and(|result| result.success),
+            format!(
+                "insert result: {:?}",
+                capture
+                    .results
+                    .first()
+                    .map(|r| (r.success, r.message.clone()))
+            ),
+        );
+        // Now the database the tab points at disappears under it.
+        let capture = h.run(&format!("DROP DATABASE {scratch_scope}"))?;
+        h.check(
+            "S49 the tab can drop the database it is pointing at",
+            capture.results.first().is_some_and(|result| result.success),
+            format!(
+                "drop result: {:?}",
+                capture
+                    .results
+                    .first()
+                    .map(|r| (r.success, r.message.clone()))
+            ),
+        );
+        // The tab must still be able to finish its transaction.
+        let capture = h.run("ROLLBACK")?;
+        h.check(
+            "S49 the tab can still resolve its work after its database went away",
+            capture.results.first().is_some_and(|result| result.success),
+            format!(
+                "rollback result: {:?}",
+                capture
+                    .results
+                    .first()
+                    .map(|r| (r.success, r.message.clone()))
+            ),
+        );
+        // Where the session actually is now. Every statement below this point
+        // was schema-qualified before, so the scenario passed whether the
+        // session had the right database, the wrong one, or none at all --
+        // it could not fail for the bug it exists to guard.
+        let landed = h.select_scalar("SELECT IFNULL(DATABASE(), '')")?;
+        h.check(
+            "S49 the server detached the session when its database went away",
+            landed.trim().is_empty(),
+            format!("DATABASE() after the drop = {landed:?}"),
+        );
+        // Re-create it and run an UNQUALIFIED statement: this is what a lease
+        // still naming the dropped database breaks, because the next statement
+        // reads target == recorded scope and issues no COM_INIT_DB at all.
+        h.run(&format!("CREATE DATABASE {scratch_scope}"))?;
+        let landed = h.select_scalar("SELECT IFNULL(DATABASE(), '')")?;
+        h.check(
+            "S49 the tab is put back in its scope once the database exists again",
+            landed.trim().eq_ignore_ascii_case(scratch_scope),
+            format!("DATABASE() after the re-create = {landed:?}"),
+        );
+        // `DROP DATABASE` is DDL, so the server implicitly committed the write
+        // before the database went away -- the rollback above has nothing left
+        // to take back, and that is MySQL's own semantics, not the app's. What
+        // matters here is that the tab is still usable afterwards.
+        let capture = h.run(&format!("DELETE FROM {qualified_table} WHERE V = 4901"))?;
+        h.check(
+            "S49 an ordinary statement still runs after the tab's database went away",
+            capture.results.first().is_some_and(|result| result.success),
+            format!(
+                "statement after the drop: {:?}",
+                capture
+                    .results
+                    .first()
+                    .map(|r| (r.success, r.message.clone()))
+            ),
+        );
+        h.run("COMMIT")?;
+        let remaining = h.select_scalar(&format!(
+            "SELECT COUNT(*) FROM {qualified_table} WHERE V = 4901"
+        ))?;
+        h.check(
+            "S49 that statement really reached the server",
+            remaining.trim() == "0",
+            format!("rows after the cleanup DELETE = {remaining:?}"),
+        );
+        h.change_tab_scope(Some(&base_scope));
+        let _ = h.editor.discard_pooled_session_for_close();
+        h.run("ROLLBACK")?;
+        let _ = h.run(&format!("DROP DATABASE IF EXISTS {scratch_scope}"));
     }
 
     // ---- S40: a dirty session does not gate a scope change ------------------
