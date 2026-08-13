@@ -4121,3 +4121,50 @@ fn every_oracle_auto_commit_site_consults_the_skip_rule() {
         "the thin wire flag must keep consulting the same skip rule"
     );
 }
+
+/// A batch that adopts a NEW connection mid-script must forget the scope it was
+/// running in, on BOTH Oracle drivers.
+///
+/// The tab's scope names a schema on the connection that went away. The thin
+/// loop resets its transition context (`context.scope = None`) and re-resolves
+/// the session schema through the new connection; the OCI loop kept its scope
+/// cell, so every statement after a `CONNECT` asserted the previous server's
+/// schema name on the new one — silently landing in a same-named schema when
+/// the new server happened to have it, while the execution origin the UI was
+/// just handed reported no scope at all.
+#[test]
+fn an_in_script_connect_forgets_the_previous_connections_scope() {
+    let execution = read_source("src/ui/sql_editor/execution.rs");
+
+    // OCI: the scope cell is cleared where the rest of the old connection's
+    // per-session tracking is dropped.
+    let oci = execution
+        .find("cleanup.clear_oracle_pooled_session_tracking();")
+        .expect("the OCI CONNECT path should drop the old session tracking");
+    let oci_window = &execution[oci..oci + 600];
+    assert!(
+        oci_window.contains("clear_batch_scope(&operation_scope);"),
+        "the OCI in-script CONNECT must clear the batch's scope cell: keeping it \
+         asserts the previous connection's schema name on the new server"
+    );
+
+    // Thin: the transition context's scope is reset, and the session schema is
+    // re-resolved right after it — anchored on the reset, because the batch
+    // START also calls the same resolver and must not be mistaken for this.
+    let thin = execution
+        .find("context.scope = None;")
+        .expect("the thin CONNECT path should reset its transition context's scope");
+    let thin_window = &execution[thin..thin + 900];
+    assert!(
+        thin_window.contains("session_schema = Self::oracle_thin_batch_session_schema("),
+        "the thin in-script CONNECT must re-resolve the session schema after          clearing the scope, so the new connection's own rule decides it"
+    );
+
+    // And the cell has exactly one clearing writer, so a third CONNECT path
+    // cannot invent its own.
+    assert_eq!(
+        execution.matches("fn clear_batch_scope(").count(),
+        1,
+        "the batch scope cell must keep a single named clearing writer"
+    );
+}

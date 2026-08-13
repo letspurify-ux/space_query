@@ -2471,6 +2471,22 @@ fn store_batch_scope(execution_scope: &Mutex<Option<String>>, scope: &str) {
         .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(scope.to_string());
 }
 
+/// Forget the scope a batch was running in because it just adopted a NEW
+/// connection.
+///
+/// The tab's scope named a schema on the connection that went away. Carrying it
+/// over would assert that name on the new server, which either fails (a schema
+/// that is not there) or -- worse, because nothing notices -- silently lands the
+/// session in a same-named schema the tab never chose, while the execution
+/// origin the UI was just handed says the tab has no scope at all. Clearing it
+/// resolves the next statement through the new connection's own rule, which is
+/// what the thin loop gets by resetting its transition context's scope.
+fn clear_batch_scope(execution_scope: &Mutex<Option<String>>) {
+    *execution_scope
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+}
+
 fn lazy_fetch_all_timeout_for_fetch_all(
     query_timeout: Option<Duration>,
     already_fetched_rows: usize,
@@ -12077,6 +12093,12 @@ impl SqlEditorWidget {
                                                 }));
                                                 pooled_db_session.clear();
                                                 cleanup.clear_oracle_pooled_session_tracking();
+                                                // The tab's scope belonged to
+                                                // the connection that just went
+                                                // away; the statements after
+                                                // this one resolve their schema
+                                                // through the new one.
+                                                clear_batch_scope(&operation_scope);
                                                 cleanup.clear_timeout_tracking();
                                                 cleanup.track_timeout(
                                                     Arc::clone(&prepared_conn),

@@ -3992,6 +3992,67 @@ fn run_scenarios(target: Target, h: &mut Harness) -> Result<(), String> {
     }
     h.editor.sync_tab_auto_commit_with_global_setting(true);
 
+    // ---- S50 (Oracle): script CONNECT forgets the tab's previous scope ------
+    // The tab's scope names a schema on the connection that CONNECT replaces.
+    // Carrying it into the new connection asserts that name on the new server:
+    // it either fails, or -- because the app tolerates a missing schema -- it
+    // silently lands the session in a same-named schema the tab never chose,
+    // while the execution origin the UI was just handed reports no scope at
+    // all. Thin reset its scope here from the start; OCI kept it.
+    if target.is_oracle() {
+        println!("  --- S50 script CONNECT forgets the tab's previous scope ---");
+        h.editor.clear_tab_transaction_mode_override();
+        h.run("ROLLBACK")?;
+        let scratch_scope = "SQ_TM_SCOPE10";
+        let _ = h.run(&format!("DROP USER {scratch_scope} CASCADE"));
+        let capture = h.run(&format!("CREATE USER {scratch_scope} IDENTIFIED BY pw1"))?;
+        if !capture.results.first().is_some_and(|result| result.success) {
+            return Err(format!(
+                "S50 could not create the scratch scope: {:?}",
+                capture.results.first().map(|r| r.message.clone())
+            ));
+        }
+        h.change_tab_scope(Some(scratch_scope));
+        let landed = h.select_scalar("SELECT SYS_CONTEXT('USERENV','CURRENT_SCHEMA') FROM DUAL")?;
+        h.check(
+            "S50 the tab's session is in its own scope before the CONNECT",
+            landed.trim().eq_ignore_ascii_case(scratch_scope),
+            format!("CURRENT_SCHEMA before CONNECT = {landed:?}"),
+        );
+        // CONNECT, then read the schema back IN THE SAME BATCH: a later run
+        // would re-seed the batch's scope from the tab binding and could not
+        // tell whether the statements after CONNECT were held in the old one.
+        let _ = h.editor.discard_pooled_session_for_close();
+        let info = target.connection_info();
+        let script = format!(
+            "CONNECT {}/{}@{}:{}/{}\n\
+             SELECT SYS_CONTEXT('USERENV','CURRENT_SCHEMA') AS S FROM DUAL;",
+            info.username, info.password, info.host, info.port, info.service_name
+        );
+        let capture = h.run(&script)?;
+        let after_connect = capture
+            .results
+            .iter()
+            .find(|result| result.is_select)
+            .and_then(|result| result.rows.first())
+            .and_then(|row| row.last())
+            .cloned()
+            .or_else(|| capture.rows.first().and_then(|row| row.last()).cloned())
+            .unwrap_or_default();
+        h.check(
+            "S50 the statement after CONNECT runs in the new connection's own schema",
+            after_connect.trim().eq_ignore_ascii_case(&base_scope),
+            format!(
+                "CURRENT_SCHEMA after CONNECT = {after_connect:?} (expected {base_scope:?}, \
+                 the stale tab scope would be {scratch_scope:?})"
+            ),
+        );
+        // Binding-only reset: CONNECT rebound the tab, so the harness's shared
+        // connection no longer drives it.
+        h.editor.set_tab_scope(None);
+        let _ = h.run(&format!("DROP USER {scratch_scope} CASCADE"));
+    }
+
     // ---- S8 (Oracle): the tab's pinned mode survives script CONNECT ---------
     // Runs LAST on purpose: CONNECT rebinds the tab to a transient connection,
     // so the harness's own shared connection no longer drives the tab.
