@@ -590,13 +590,21 @@ fn mysql_final_scope_recheck_reapplies_execution_options() {
         apply_options_failure_branch.contains("clear_pool_session_context_for_shared_connection"),
         "MySQL/MariaDB final scope recheck must clear cached context if final execution option setup fails"
     );
+    // Both tab-scoped settings must arrive as the operation's own values. The
+    // auto-commit half was always pinned that way; the transaction mode used to
+    // be an `Option` that fell back to `conn_guard.transaction_mode()`, which is
+    // precisely how a tab's pin can get overwritten by the connection default.
+    // The isolation DEFAULT stays a connection read: it is the server's own
+    // level, substituted for `Default`, not a tab pin.
     assert!(
         helper.contains("operation_auto_commit: bool")
             && !helper.contains("conn_guard.auto_commit()")
             && helper.contains("operation_auto_commit")
-            && helper.contains("conn_guard.transaction_mode()")
+            && helper.contains("operation_transaction_mode: crate::db::TransactionMode")
+            && !helper.contains("conn_guard.transaction_mode()")
             && helper.contains("conn_guard.default_transaction_isolation()"),
-        "MySQL/MariaDB final scope recheck should use the current operation auto-commit and global transaction options"
+        "MySQL/MariaDB final scope recheck must take BOTH the auto-commit and the \
+         transaction mode from the requesting operation, never from the connection"
     );
 }
 
@@ -4047,5 +4055,69 @@ fn ui_timer_closures_never_block_on_the_app_state() {
          `MainWindow::schedule_with_app_state` (or `try_lock` with the same \
          three-way handling), never a blocking lock. Offending \
          `ui_timeout::schedule` call sites at lines: {offenders:?}"
+    );
+}
+
+/// A statement's result belongs to the tab that ASKED for it, and every value
+/// the window derives while delivering that result must describe that same tab.
+///
+/// The backend and the completion metadata were already resolved from the
+/// originating tab's binding, but the scope handed to the filter bar was read
+/// from the ACTIVE tab. Switching tabs while a result was still streaming then
+/// produced a filter bar describing two tabs at once — this tab's backend and
+/// metadata, another tab's scope. Pinning the three to one snapshot is what
+/// makes that split unrepresentable.
+#[test]
+fn a_streamed_results_filter_bar_describes_the_tab_that_asked() {
+    let main_window = read_source("src/ui/main_window.rs");
+
+    let start = main_window
+        .find("let editor_tab = s.editor_tabs.iter().find(|tab| tab.tab_id == tab_id);")
+        .expect("the streaming-result handler should resolve its originating tab");
+    let body = &main_window[start..start + 900];
+
+    assert!(
+        body.contains("let tab_binding = editor_tab.map(|tab| tab.connection_binding.snapshot());"),
+        "the streaming-result handler must take ONE binding snapshot of the \
+         originating tab, so the backend, the metadata and the scope cannot \
+         come from different tabs"
+    );
+    assert!(
+        body.contains("let filter_scope = tab_binding.and_then(|binding| binding.scope);"),
+        "the filter bar's scope must come from the originating tab's binding"
+    );
+    assert!(
+        !body.contains("selected_scope_for_connection"),
+        "the filter bar's scope must not be read from the ACTIVE tab's \
+         connection card: a result that finishes after the user switched tabs \
+         would be given the other tab's scope"
+    );
+}
+
+/// Both Oracle drivers must answer the same statement the same way.
+///
+/// Client-side auto-commit is applied in three places on the OCI batch (the
+/// non-SELECT branch, the SELECT branch and the procedure-like branch) and in
+/// one place on thin (`oracle_thin_effective_auto_commit`). Every one of them
+/// has to consult the same skip rule, or a statement that merely opens or
+/// preserves transaction state would have its unrelated prior work committed
+/// on one driver and preserved on the other.
+#[test]
+fn every_oracle_auto_commit_site_consults_the_skip_rule() {
+    let execution = read_source("src/ui/sql_editor/execution.rs");
+
+    assert!(
+        execution.contains("if auto_commit && !statement_effects.skip_auto_commit() {"),
+        "the OCI procedure-like branch must skip the client auto-commit for a \
+         statement whose effects ask it to"
+    );
+    assert!(
+        !execution.contains("\n                                if auto_commit {\n"),
+        "no Oracle auto-commit site may commit on the logical setting alone; \
+         each must consult the statement's skip hint"
+    );
+    assert!(
+        execution.contains("auto_commit && !statement_effects.skip_auto_commit()"),
+        "the thin wire flag must keep consulting the same skip rule"
     );
 }

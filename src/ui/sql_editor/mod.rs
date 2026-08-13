@@ -1647,7 +1647,7 @@ impl TransactionActionBackend for MysqlTransactionActionBackend {
             query_timeout,
             activity_label,
             auto_commit,
-            Some(transaction_mode),
+            transaction_mode,
             false,
             true,
             Some(resolution_action),

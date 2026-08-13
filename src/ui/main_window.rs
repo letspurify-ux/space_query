@@ -10368,15 +10368,23 @@ impl MainWindow {
                     // showing — so resolve that from the tab's connection here.
                     // The filter bar needs the same answer, plus the editor
                     // tab's metadata for its own completion.
+                    //
+                    // All three describe the tab that ASKED, so all three come
+                    // from that tab's one binding snapshot. Reading the scope
+                    // from the active tab instead handed the filter bar the
+                    // scope of whichever tab the user had switched to while
+                    // this result was still streaming — the backend and the
+                    // metadata stayed with the originating tab, so the three
+                    // could describe two different tabs at once.
                     let editor_tab = s.editor_tabs.iter().find(|tab| tab.tab_id == tab_id);
-                    let result_db_type = editor_tab
-                        .and_then(|tab| tab.connection_binding.snapshot().runtime)
+                    let tab_binding = editor_tab.map(|tab| tab.connection_binding.snapshot());
+                    let result_db_type = tab_binding
+                        .as_ref()
+                        .and_then(|binding| binding.runtime.as_ref())
                         .map(|runtime| runtime.sanitized_info().db_type);
                     let filter_intellisense =
                         editor_tab.map(|tab| tab.intellisense_data.clone());
-                    let filter_scope = s
-                        .active_connection_id()
-                        .and_then(|id| s.object_browser.selected_scope_for_connection(id));
+                    let filter_scope = tab_binding.and_then(|binding| binding.scope);
                     s.refresh_result_edit_controls();
                     drop(s);
                     result_tabs.ensure_statement_tab_by_id(result_tab_id, "Result", select_tab);

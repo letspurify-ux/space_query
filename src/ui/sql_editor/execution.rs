@@ -7237,7 +7237,7 @@ impl SqlEditorWidget {
             query_timeout,
             db_activity,
             auto_commit,
-            Some(transaction_mode),
+            transaction_mode,
             false,
             false,
             None,
@@ -7435,7 +7435,7 @@ impl SqlEditorWidget {
                 query_timeout,
                 db_activity,
                 auto_commit,
-                Some(active_transaction_mode.get()),
+                active_transaction_mode.get(),
                 refresh_encoding_after,
                 false,
                 None,
@@ -7512,7 +7512,7 @@ impl SqlEditorWidget {
                     query_timeout,
                     db_activity,
                     auto_commit,
-                    Some(active_transaction_mode.get()),
+                    active_transaction_mode.get(),
                     false,
                     false,
                     None,
@@ -8506,7 +8506,7 @@ impl SqlEditorWidget {
                             current_execution_scope().as_deref(),
                             db_activity,
                             auto_commit,
-                            Some(active_transaction_mode.get()),
+                            active_transaction_mode.get(),
                             Some(sender),
                             false,
                             None,
@@ -8532,7 +8532,7 @@ impl SqlEditorWidget {
                                         db_activity,
                                         connection_generation,
                                         auto_commit,
-                                        Some(active_transaction_mode.get()),
+                                        active_transaction_mode.get(),
                                         prior_retained_state
                                             .requires_physical_session_preservation(),
                                         false,
@@ -13108,7 +13108,17 @@ impl SqlEditorWidget {
                                     &mut stop_execution,
                                 );
 
-                                if auto_commit {
+                                // Same skip rule as the other two auto-commit
+                                // sites on this driver (the non-SELECT branch
+                                // and the SELECT one) and as thin's
+                                // `oracle_thin_effective_auto_commit`: a
+                                // statement that only opens or preserves
+                                // transaction state must not have the client
+                                // auto-commit resolve unrelated prior work.
+                                // Stating it here too is what keeps the two
+                                // Oracle drivers from answering the same
+                                // statement differently.
+                                if auto_commit && !statement_effects.skip_auto_commit() {
                                     if let Err(err) = conn.commit() {
                                         cleanup.protect_oracle_session_after_auto_commit_error(&err);
                                         result = QueryResult::new_error(
@@ -22533,7 +22543,7 @@ impl SqlEditorWidget {
         execution_scope: Option<&str>,
         db_activity: &str,
         auto_commit: bool,
-        transaction_mode: Option<crate::db::TransactionMode>,
+        transaction_mode: crate::db::TransactionMode,
         session_pool_sender: Option<&QueryProgressSender>,
         require_existing_session: bool,
         required_resolution_action: Option<RetainedSessionResolutionAction>,
@@ -22549,10 +22559,11 @@ impl SqlEditorWidget {
                 .pool_session_context()?
                 .for_scope(execution_scope);
             // Tab-scoped transaction mode: the session is prepared with the
-            // requesting tab's effective mode, not the connection default.
-            if let Some(transaction_mode) = transaction_mode {
-                context.transaction_mode = transaction_mode;
-            }
+            // requesting tab's effective mode. Taking it as a plain value is
+            // what keeps the connection default out of reach here — the
+            // fallback this used to have is the door the "tab pin overwritten
+            // by the connection default" bug came through.
+            context.transaction_mode = transaction_mode;
             (context, activity)
         };
         let db_display_name = context.connection_info.db_type.display_name();
@@ -24246,7 +24257,7 @@ impl SqlEditorWidget {
         db_activity: &str,
         connection_generation: u64,
         operation_auto_commit: bool,
-        operation_transaction_mode: Option<crate::db::TransactionMode>,
+        operation_transaction_mode: crate::db::TransactionMode,
         preserve_existing_session_state: bool,
         statement_requires_transaction_boundary: bool,
         session_scope: Option<&str>,
@@ -24275,11 +24286,11 @@ impl SqlEditorWidget {
                 conn_guard.get_info().advanced.clone(),
                 conn_guard.pool_session_context().ok(),
                 db_type,
-                // Tab-scoped transaction mode: the pre-action recheck must
-                // re-apply the requesting tab's effective mode, or it would
-                // overwrite the mode the acquisition just applied with the
-                // connection default.
-                operation_transaction_mode.unwrap_or_else(|| conn_guard.transaction_mode()),
+                // Tab-scoped transaction mode: the pre-action recheck
+                // re-applies the requesting tab's effective mode. It is a
+                // plain value on purpose — resolving it from the connection
+                // here would overwrite the mode the acquisition just applied.
+                operation_transaction_mode,
                 conn_guard.default_transaction_isolation(),
             )
         };
@@ -24451,7 +24462,7 @@ impl SqlEditorWidget {
         query_timeout: Option<Duration>,
         log_context: &str,
         auto_commit: bool,
-        transaction_mode: Option<crate::db::TransactionMode>,
+        transaction_mode: crate::db::TransactionMode,
         refresh_encoding_after: bool,
         require_existing_session: bool,
         required_resolution_action: Option<RetainedSessionResolutionAction>,
@@ -33431,7 +33442,7 @@ mod mysql_batch_execution_regression_tests {
             "mysql empty scope recheck",
             connection_generation,
             true,
-            None,
+            TransactionMode::default(),
             false,
             false,
             None,
