@@ -5127,6 +5127,16 @@ impl DatabaseConnection {
         }
     }
 
+    /// Public twin of [`Self::oracle_thin_select_one_text`] for the live
+    /// verification harnesses, which drive raw pooled sessions the way the
+    /// product does and have to read a scalar back off one.
+    pub fn oracle_thin_select_one_text_for_test(
+        session: &mut OracleThinSession,
+        sql: &str,
+    ) -> Result<Option<String>, String> {
+        Self::oracle_thin_select_one_text(session, sql)
+    }
+
     pub(crate) fn oracle_thin_select_one_text(
         session: &mut OracleThinSession,
         sql: &str,

@@ -408,9 +408,20 @@ fn oracle_reused_tab_session_applies_tab_scope_before_execution() {
     );
     assert!(
         helper.contains("execution_scope: Option<&str>")
-            && helper.matches("apply_oracle_current_schema(").count() >= 2
+            && helper
+                .matches("apply_oracle_current_schema_for_scope(conn.as_ref(), execution_scope)")
+                .count()
+                >= 2
             && helper.contains("execution_scope"),
         "Reusable and fresh Oracle execution sessions must apply the owning tab's explicit scope before execution"
+    );
+    assert!(
+        !helper.contains("DatabaseConnection::apply_oracle_current_schema("),
+        "Oracle execution must resolve its schema through the connection's one rule \
+         (apply_oracle_current_schema_for_scope): the raw apply is neither total -- a tab with \
+         no scope of its own keeps whatever the last tab left on a recycled pooled session -- \
+         nor tolerant of a dropped schema, which bricked the OCI tab with ORA-01435 while thin \
+         carried on"
     );
     assert!(
         helper.contains("prior_retained_state.requires_physical_session_preservation()"),

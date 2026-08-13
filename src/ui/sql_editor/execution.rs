@@ -3486,18 +3486,26 @@ impl SqlEditorWidget {
                 if conn.ping().is_ok() {
                     let preserve_existing_session_state =
                         prior_retained_state.requires_physical_session_preservation();
+                    // The connection's own rule, not the raw scope: it resolves
+                    // a tab with no scope of its own to a concrete schema
+                    // (applying "no schema" is a no-op, and a recycled pooled
+                    // session keeps whatever the last tab left on it), and it
+                    // tolerates a schema that has been dropped. The setting is
+                    // only a name-resolution namespace and the session stays
+                    // valid without it, so failing here would brick the tab —
+                    // including the statement that would fix it — while the
+                    // thin driver, which has always gone through this rule,
+                    // carried on. Same function the per-statement apply uses.
                     let setup_result = if preserve_existing_session_state {
-                        crate::db::DatabaseConnection::apply_oracle_current_schema(
-                            conn.as_ref(),
-                            execution_scope,
-                        )
+                        conn_guard
+                            .apply_oracle_current_schema_for_scope(conn.as_ref(), execution_scope)
                     } else {
                         crate::db::DatabaseConnection::apply_oracle_session_settings(
                             conn.as_ref(),
                             &conn_guard.get_info().advanced,
                         )
                         .and_then(|_| {
-                            crate::db::DatabaseConnection::apply_oracle_current_schema(
+                            conn_guard.apply_oracle_current_schema_for_scope(
                                 conn.as_ref(),
                                 execution_scope,
                             )
@@ -3623,10 +3631,7 @@ impl SqlEditorWidget {
                 Some(conn) => conn,
                 None => return (conn_guard, Err("Expected Oracle pool session".to_string())),
             };
-            match crate::db::DatabaseConnection::apply_oracle_current_schema(
-                conn.as_ref(),
-                execution_scope,
-            ) {
+            match conn_guard.apply_oracle_current_schema_for_scope(conn.as_ref(), execution_scope) {
                 Ok(()) => {
                     return (
                         conn_guard,

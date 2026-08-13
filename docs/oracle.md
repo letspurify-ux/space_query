@@ -55,6 +55,46 @@ tracked through `ALTER SESSION SET CURRENT_SCHEMA` and reapplied to acquired or
 reused sessions. Transaction mode is not a session flag; `SET TRANSACTION` is
 issued as the first statement of each transaction.
 
+## Current schema is resolved by one rule, on both drivers
+
+Every place that puts an Oracle session in a schema goes through
+`DatabaseConnection::apply_oracle_current_schema_for_scope()` — the pooled
+acquisition on both drivers, the per-statement assertion each batch makes, and
+the thin lazy-fetch worker. The rule is total (the tab's scope, else the
+connection's tracked schema, else the login user: applying "no schema" is a
+no-op, and a recycled pooled session keeps whatever the last tab left on it)
+and tolerant of a schema that has been dropped (ORA-01435 is logged and the
+session carries on in the login schema).
+
+Both halves matter. The OCI execution acquisition used to call the raw
+`apply_oracle_current_schema()` instead, so dropping the schema a tab pointed
+at made every statement on that tab fail with ORA-01435 — including the
+statement that would have fixed it — while the same script on thin kept
+working. Live check S46 in `verify_transaction_mode_live` pins it on all four
+backends.
+
+## A pooled session never carries another tab's session state
+
+Oracle pools hand a session back exactly as its last user left it — unlike the
+MySQL family, whose driver resets every returned connection
+(`PoolOpts::reset_connection` is `true` by default, so `COM_RESET_CONNECTION`
+runs on return). What makes an Oracle session safe to recycle is that
+`oracle_session_setting_statements()` is applied on EVERY pool acquisition
+(`DbConnectionPool::acquire_session_untracked`) and is total: it re-issues the
+NLS formats, the time zone, and — the one that matters here —
+`ALTER SESSION SET ISOLATION_LEVEL = <connection default>`.
+
+That last statement is what stops a session-level isolation from leaking
+between tabs. `ALTER SESSION SET ISOLATION_LEVEL` is SESSION persistent, and
+the reset in `oracle_transaction_mode_statements_for_tab()` is deliberately
+issued only when a tab has actively selected the default isolation ("a tab that
+never touched the controls has adopted nothing and pays nothing") — so a tab
+that pinned nothing would otherwise inherit whatever the previous user of that
+physical session left on it. Live check S47 in `verify_transaction_mode_live`
+pins this on both drivers with a pool of exactly one session, and asserts the
+tab really received the same physical session (same `SID`) so it cannot pass by
+never meeting the hazard.
+
 ## Local test database
 
 These development-only credentials connect to the repository's local Oracle

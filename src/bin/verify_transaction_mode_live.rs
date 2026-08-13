@@ -71,6 +71,17 @@
 //       skipped its per-statement scope assertion for any session it had to
 //       preserve, and a lazily streamed thin SELECT never asserted the scope
 //       at all.
+//   S46 a tab whose scope was DROPPED keeps working: the current
+//       schema/database is only a name-resolution namespace, so the fallback
+//       has to keep the tab usable — including for the statement that fixes
+//       the situation. Caught the OCI acquisition applying the schema through
+//       the raw, intolerant call instead of the connection's one rule: the tab
+//       failed every statement with ORA-01435 while thin, which has always
+//       gone through that rule, carried on.
+//   S47 (Oracle) a pooled session recycled between tabs carries no foreign
+//       session-level isolation: driven with a pool of exactly one session and
+//       an assertion that the tab really got that physical session back, so it
+//       cannot pass by never meeting the hazard.
 //
 // Usage: verify_transaction_mode_live <thin|oci|mysql|mariadb|all>
 
@@ -2900,6 +2911,179 @@ fn run_scenarios(target: Target, h: &mut Harness) -> Result<(), String> {
         } else {
             format!("DROP DATABASE IF EXISTS {scratch_scope}")
         });
+    }
+
+    // ---- S46: a tab whose scope was dropped keeps working -------------------
+    // The current schema/database is only a name-resolution namespace: the
+    // session itself stays perfectly valid when the schema it names goes away.
+    // Every apply path says so in its own comment ("failing every statement on
+    // ORA-01435 would brick the tab"), and the tolerant fallback is what lets
+    // the user run the statement that fixes the situation. So drop the scope a
+    // tab is pointing at and the tab must keep executing.
+    //
+    // The session is discarded first so this exercises the documented fallback
+    // rather than the work-carrying case: a MySQL session that carries work
+    // cannot be reset to "no database" (COM_CHANGE_USER would roll the work
+    // back), so there the honest answer is an error, not a silent fallback.
+    {
+        println!("  --- S46 a tab whose scope was dropped keeps working ---");
+        h.editor.clear_tab_transaction_mode_override();
+        h.run("ROLLBACK")?;
+        let scratch_scope = "SQ_TM_SCOPE8";
+        let _ = h.run(&if target.is_oracle() {
+            format!("DROP USER {scratch_scope} CASCADE")
+        } else {
+            format!("DROP DATABASE IF EXISTS {scratch_scope}")
+        });
+        let capture = h.run(&if target.is_oracle() {
+            format!("CREATE USER {scratch_scope} IDENTIFIED BY pw1")
+        } else {
+            format!("CREATE DATABASE {scratch_scope}")
+        })?;
+        if !capture.results.first().is_some_and(|result| result.success) {
+            return Err(format!(
+                "S46 could not create the scratch scope: {:?}",
+                capture.results.first().map(|r| r.message.clone())
+            ));
+        }
+        h.change_tab_scope(Some(scratch_scope));
+        let landed = h.select_scalar(current_scope_sql)?;
+        h.check(
+            "S46 the tab is in the scope that is about to disappear",
+            landed.trim().eq_ignore_ascii_case(scratch_scope),
+            format!("{current_scope_sql} = {landed:?}"),
+        );
+        // Start from a session with nothing to protect, so the fallback is the
+        // path under test.
+        let _ = h.editor.discard_pooled_session_for_close();
+        let capture = h.run(&if target.is_oracle() {
+            format!("DROP USER {scratch_scope} CASCADE")
+        } else {
+            format!("DROP DATABASE {scratch_scope}")
+        })?;
+        h.check(
+            "S46 the tab's own scope can be dropped from the tab",
+            capture.results.first().is_some_and(|result| result.success),
+            format!(
+                "drop result: {:?}",
+                capture
+                    .results
+                    .first()
+                    .map(|r| (r.success, r.message.clone()))
+            ),
+        );
+        // `FROM DUAL` is legal on all four backends, so one statement covers
+        // them all.
+        let capture = h.run("SELECT 1 FROM DUAL")?;
+        h.check(
+            "S46 the tab still executes after the scope it named was dropped",
+            !capture.results.is_empty() && capture.results.iter().all(|result| result.success),
+            format!(
+                "result after the drop: {:?}",
+                capture
+                    .results
+                    .iter()
+                    .map(|r| (r.success, r.message.clone()))
+                    .collect::<Vec<_>>()
+            ),
+        );
+        h.change_tab_scope(Some(&base_scope));
+        let _ = h.editor.discard_pooled_session_for_close();
+        h.run("ROLLBACK")?;
+    }
+
+    // ---- S47 (Oracle): a recycled session must not carry a session-level
+    // ---- isolation into a tab that never asked for one ----------------------
+    // `ALTER SESSION SET ISOLATION_LEVEL` is SESSION persistent, and an Oracle
+    // pool hands a session back exactly as its last user left it (the MySQL
+    // family cannot have this problem: `PoolOpts::reset_connection` is true, so
+    // every returned connection is reset). The reset that neutralizes it is
+    // only issued when the TAB has actively selected the default isolation --
+    // "a tab that never touched the controls has adopted nothing and pays
+    // nothing" -- but the state being neutralized lives on the SESSION, which
+    // is shared through the pool. A pool of exactly one session makes the
+    // recycle deterministic: leave SERIALIZABLE on it, hand it back, and a tab
+    // that pinned nothing must still run under the connection's default.
+    if target.is_oracle() {
+        println!("  --- S47 a recycled session carries no foreign isolation ---");
+        let isolation_sql = "SELECT value FROM v$ses_optimizer_env \
+             WHERE sid = SYS_CONTEXT('USERENV', 'SID') \
+             AND name = 'transaction_isolation_level'";
+        let sid_sql = "SELECT TO_CHAR(SYS_CONTEXT('USERENV', 'SID')) FROM DUAL";
+        let seeded_sid: String;
+        let mut single = DatabaseConnection::new();
+        single.set_connection_pool_size(1);
+        single
+            .connect(target.connection_info())
+            .map_err(|e| format!("S47 connect: {e}"))?;
+        let single = Arc::new(Mutex::new(single));
+        {
+            // One raw pool session, left the way a previous tab would leave it.
+            let context = {
+                let guard = single.lock().unwrap_or_else(|p| p.into_inner());
+                guard
+                    .pool_session_context()
+                    .map_err(|e| format!("S47 pool context: {e}"))?
+            };
+            let activity = space_query::db::track_db_activity(
+                "S47 seeding a pooled session".to_string(),
+                Some(DatabaseType::Oracle),
+            );
+            let (session, _registration) = context
+                .acquire_session_for_current_scope(&activity)
+                .map_err(|e| format!("S47 acquire: {e}"))?;
+            match session {
+                space_query::db::DbPoolSession::Oracle(conn) => {
+                    conn.execute("ALTER SESSION SET ISOLATION_LEVEL = SERIALIZABLE", &[])
+                        .map_err(|e| format!("S47 alter session (oci): {e}"))?;
+                    let row = conn
+                        .query_row_as::<String>(sid_sql, &[])
+                        .map_err(|e| format!("S47 read sid (oci): {e}"))?;
+                    seeded_sid = row.trim().to_string();
+                }
+                space_query::db::DbPoolSession::OracleThin(mut conn) => {
+                    conn.query_drop("ALTER SESSION SET ISOLATION_LEVEL = SERIALIZABLE")
+                        .map_err(|e| format!("S47 alter session (thin): {e}"))?;
+                    seeded_sid =
+                        space_query::db::DatabaseConnection::oracle_thin_select_one_text_for_test(
+                            &mut conn, sid_sql,
+                        )
+                        .map_err(|e| format!("S47 read sid (thin): {e}"))?
+                        .unwrap_or_default();
+                }
+                session @ space_query::db::DbPoolSession::MySQL { .. } => {
+                    return Err(format!(
+                        "S47 expected an Oracle pool session but got {}",
+                        session.db_type()
+                    ));
+                }
+            }
+            // Dropped here: back into the pool, alive, still SERIALIZABLE.
+        }
+        let mut fresh = attach_tab(Arc::clone(&single));
+        // Pins nothing: this is the tab that "pays nothing".
+        fresh.editor.clear_tab_transaction_mode_override();
+        let tab_sid = fresh.select_scalar(sid_sql)?;
+        let level = fresh.select_scalar(isolation_sql)?;
+        // Without this the check could pass simply by never meeting the
+        // hazard: a pool that closes the returned session instead of handing
+        // it back has nothing to leak.
+        fresh.check(
+            "S47 the tab really got the physical session that was left SERIALIZABLE",
+            !seeded_sid.is_empty() && tab_sid.trim() == seeded_sid.trim(),
+            format!("seeded sid = {seeded_sid:?}, tab sid = {tab_sid:?}"),
+        );
+        fresh.check(
+            "S47 a tab that pinned nothing runs under the connection default, not the session's leftover",
+            !level.trim().eq_ignore_ascii_case("serializable"),
+            format!("session isolation = {level:?}"),
+        );
+        h.failures.extend(fresh.failures.iter().cloned());
+        let _ = fresh.editor.discard_pooled_session_for_close();
+        single
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .disconnect();
     }
 
     // ---- S40: a dirty session does not gate a scope change ------------------
