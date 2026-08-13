@@ -1749,7 +1749,14 @@ impl DbPoolSessionContext {
                 .unwrap_or(self.connection_info.service_name.trim())
                 .to_string();
         } else {
-            scoped.oracle_current_schema = scope.map(str::to_string);
+            // Resolved to a concrete schema, never left empty: pooled
+            // sessions are recycled between query tabs, and applying "no
+            // schema" is a no-op — so a tab with no scope of its own would
+            // keep whichever schema the previous tab left on the session it
+            // just picked up. The MySQL branch above has always been total
+            // for the same reason.
+            scoped.oracle_current_schema =
+                oracle_session_schema(scope, self.oracle_current_schema.as_deref());
         }
         scoped
     }
@@ -3167,6 +3174,26 @@ pub(crate) fn backend_for(db_type: DatabaseType) -> &'static dyn DbBackend {
     }
 }
 
+/// The schema a session prepared for `scope` must be put in: the tab's scope,
+/// else the connection's own schema (read from the server at connect).
+///
+/// One rule, used by session acquisition (both Oracle drivers) and by the
+/// per-statement application, so a tab's session can never be left in the
+/// schema another tab put it in. It resolves to a concrete name because the
+/// connection always knows its own — applying nothing would be a no-op, and a
+/// pooled session is recycled between tabs.
+fn oracle_session_schema(scope: Option<&str>, connection_schema: Option<&str>) -> Option<String> {
+    scope
+        .map(str::trim)
+        .filter(|scope| !scope.is_empty())
+        .or_else(|| {
+            connection_schema
+                .map(str::trim)
+                .filter(|schema| !schema.is_empty())
+        })
+        .map(str::to_string)
+}
+
 fn scope_values_match_exact(left: Option<&str>, right: Option<&str>) -> bool {
     match (left, right) {
         (Some(left), Some(right)) => left.trim() == right.trim(),
@@ -3543,7 +3570,18 @@ impl DbBackend for OracleBackend {
         trimmed.contains("DPI-1067") || lower.contains("dpi-1067")
     }
 
-    fn after_connect(&self, _connection: &mut DatabaseConnection) {}
+    fn after_connect(&self, connection: &mut DatabaseConnection) {
+        // Read the schema the session actually logged into, the twin of the
+        // MySQL branch below. Without it this connection has no schema of its
+        // own, and preparing a session for a tab with no scope would have
+        // nothing concrete to apply — leaving a recycled pooled session in
+        // whichever schema the previous tab put it in. Guessing from the
+        // typed username does not work: it is quoted when it contains
+        // lowercase, so `system` becomes `"system"`, which Oracle rejects.
+        if let Err(err) = connection.sync_oracle_current_schema_after_connect() {
+            eprintln!("Warning: failed to read Oracle current schema after connect: {err}");
+        }
+    }
 
     fn apply_auto_commit(
         &self,
@@ -5914,7 +5952,7 @@ impl DatabaseConnection {
 
     /// Put `conn` in the schema an operation with this `scope` runs in: the
     /// scope when it has one, this connection's tracked schema otherwise —
-    /// the same rule as [`Self::oracle_schema_for_scope`],
+    /// the same rule as [`Self::oracle_session_schema_for_scope`],
     /// `mysql_database_for_scope` and `DbPoolSessionContext::for_scope`.
     ///
     /// Executions MUST go through this rather than the tracked schema alone.
@@ -5930,8 +5968,21 @@ impl DatabaseConnection {
     ) -> Result<(), String> {
         Self::apply_tracked_oracle_current_schema_on_session(
             conn,
-            self.oracle_schema_for_scope(scope),
+            self.oracle_session_schema_for_scope(scope).as_deref(),
         )
+    }
+
+    /// The schema a session prepared for `scope` must be put in: the tab's
+    /// scope, else this connection's own schema, else the login user.
+    ///
+    /// The last fallback is what makes preparation total. A pooled session is
+    /// recycled between tabs and keeps whatever schema its previous user left
+    /// it in, and applying "no schema" is a no-op — so without a concrete
+    /// name a tab with no scope of its own would silently inherit the last
+    /// tab's schema. The MySQL twin has always been total for the same
+    /// reason: `mysql_database_for_scope` never resolves to nothing.
+    pub fn oracle_session_schema_for_scope(&self, scope: Option<&str>) -> Option<String> {
+        oracle_session_schema(scope, self.oracle_current_schema.as_deref())
     }
 
     /// Tracked-schema variant of `apply_oracle_current_schema`, the OCI twin of
@@ -5962,13 +6013,6 @@ impl DatabaseConnection {
 
     /// The schema an operation runs under: the tab's selected scope when it
     /// has one, otherwise this connection's tracked schema.
-    pub fn oracle_schema_for_scope<'a>(&'a self, scope: Option<&'a str>) -> Option<&'a str> {
-        scope
-            .map(str::trim)
-            .filter(|scope| !scope.is_empty())
-            .or(self.oracle_current_schema.as_deref())
-    }
-
     pub(crate) fn oracle_missing_current_schema_error(message: &str) -> bool {
         message.to_ascii_lowercase().contains("ora-01435")
     }
@@ -6011,7 +6055,8 @@ impl DatabaseConnection {
 
     /// The database an operation runs in: the tab's selected scope when it has
     /// one, otherwise this connection's tracked database. Same rule as
-    /// [`Self::oracle_schema_for_scope`] and `DbPoolSessionContext::for_scope`.
+    /// [`Self::oracle_session_schema_for_scope`] and
+    /// `DbPoolSessionContext::for_scope`.
     pub fn mysql_database_for_scope<'a>(&'a self, scope: Option<&'a str>) -> &'a str {
         scope
             .map(str::trim)
@@ -6042,8 +6087,19 @@ impl DatabaseConnection {
         Ok(current_database)
     }
 
-    pub fn sync_mysql_current_database_name_from_session<C: Queryable>(
-        &mut self,
+    /// The database a TAB's session is now in, read from that session, with
+    /// its encoding refreshed.
+    ///
+    /// Read-only with respect to this connection: a tab's `USE` moves that
+    /// tab's session, not the connection's. The connection's stored database
+    /// is its own (the profile's), and it is what a tab with NO scope of its
+    /// own falls back to — so recording one tab's `USE` there, and moving the
+    /// shared live connection with it, dragged every such tab along. When an
+    /// event really is the connection's (its database was dropped), the
+    /// caller records it with
+    /// [`Self::sync_mysql_current_database_name_from_known_name`].
+    pub fn read_mysql_session_current_database<C: Queryable>(
+        &self,
         conn: &mut C,
         refresh_encoding: bool,
     ) -> Result<String, String> {
@@ -6061,25 +6117,6 @@ impl DatabaseConnection {
             Self::apply_mysql_connection_encoding_with_settings_for_db_type(
                 conn, &advanced, db_type,
             )?;
-        }
-        let Some(primary_conn) = self.get_mysql_connection_mut() else {
-            return Err(self.expected_connection_missing_message());
-        };
-        if current_database.is_empty() {
-            Self::reset_mysql_session_to_no_database_for_db_type(primary_conn, db_type)?;
-        } else {
-            primary_conn
-                .select_db(current_database.as_str())
-                .map_err(|err| err.to_string())?;
-        }
-        Self::apply_mysql_connection_encoding_with_settings_for_db_type(
-            primary_conn,
-            &advanced,
-            db_type,
-        )?;
-        if self.info.service_name != current_database {
-            self.info.service_name = current_database.clone();
-            self.bump_pool_context_epoch();
         }
         Ok(current_database)
     }
@@ -6148,50 +6185,48 @@ impl DatabaseConnection {
         Ok(())
     }
 
-    pub fn sync_oracle_current_schema_from_session(
-        &mut self,
-        conn: &Connection,
-    ) -> Result<String, String> {
+    /// The schema a TAB's session is now in, read from that session.
+    ///
+    /// Deliberately read-only: a tab moving its own session must not write
+    /// this connection's schema. That value is the connection's own (its
+    /// login/configured schema), and it is what a tab with no scope of its
+    /// own falls back to — so recording one tab's `ALTER SESSION` there
+    /// dragged every scope-less tab along with it.
+    pub fn read_oracle_session_current_schema(&self, conn: &Connection) -> Result<String, String> {
         self.ensure_connected_db_type(DatabaseType::Oracle)?;
-
-        let current_schema = Self::read_oracle_current_schema(conn)?;
-        self.set_tracked_oracle_current_schema(Some(current_schema.clone()));
-        self.require_live_connection()?;
-
-        Ok(current_schema)
+        Self::read_oracle_current_schema(conn)
     }
 
-    pub fn sync_oracle_thin_current_schema_from_session(
-        &mut self,
+    pub fn read_oracle_thin_session_current_schema(
+        &self,
         session: &mut OracleThinSession,
     ) -> Result<String, String> {
         self.ensure_connected_db_type(DatabaseType::Oracle)?;
+        Self::read_oracle_thin_current_schema(session)
+    }
 
-        let current_schema = Self::read_oracle_thin_current_schema(session)?;
-        self.set_tracked_oracle_current_schema(Some(current_schema.clone()));
+    /// Record the schema this connection logged into, read from the server.
+    pub fn sync_oracle_current_schema_after_connect(&mut self) -> Result<(), String> {
         match self.require_live_db_connection()? {
-            DbConnection::OracleThin(conn) => {
-                let mut primary_session = conn
-                    .lock()
-                    .map_err(|_| "Oracle Thin connection lock was poisoned".to_string())?;
-                Self::apply_oracle_thin_current_schema(
-                    &mut primary_session,
-                    self.oracle_current_schema.as_deref(),
-                )?;
+            DbConnection::Oracle(conn) => {
+                let schema = Self::read_oracle_current_schema(conn.as_ref())?;
+                self.set_tracked_oracle_current_schema(Some(schema));
+                Ok(())
             }
-            DbConnection::Oracle(_) => {
-                return Err(
-                    "Expected Oracle Thin connection but found Oracle OCI connection".to_string(),
-                );
+            DbConnection::OracleThin(conn) => {
+                let schema = {
+                    let mut session = conn
+                        .lock()
+                        .map_err(|_| "Oracle Thin connection lock was poisoned".to_string())?;
+                    Self::read_oracle_thin_current_schema(&mut session)?
+                };
+                self.set_tracked_oracle_current_schema(Some(schema));
+                Ok(())
             }
             DbConnection::MySQL { .. } => {
-                return Err(
-                    "Expected Oracle connection but found MySQL-family connection".to_string(),
-                );
+                Err("Expected Oracle connection but found MySQL-family connection".to_string())
             }
         }
-
-        Ok(current_schema)
     }
 
     /// Switches the primary Oracle connection's `CURRENT_SCHEMA`. Per
@@ -10315,20 +10350,20 @@ mod tests {
         connection.set_tracked_oracle_current_schema(Some("CONNECTION_SCHEMA".to_string()));
 
         assert_eq!(
-            connection.oracle_schema_for_scope(Some("TAB_SCHEMA")),
-            Some("TAB_SCHEMA")
+            connection.oracle_session_schema_for_scope(Some("TAB_SCHEMA")),
+            Some("TAB_SCHEMA".to_string())
         );
         assert_eq!(
-            connection.oracle_schema_for_scope(None),
-            Some("CONNECTION_SCHEMA")
+            connection.oracle_session_schema_for_scope(None),
+            Some("CONNECTION_SCHEMA".to_string())
         );
         assert_eq!(
-            connection.oracle_schema_for_scope(Some("   ")),
-            Some("CONNECTION_SCHEMA")
+            connection.oracle_session_schema_for_scope(Some("   ")),
+            Some("CONNECTION_SCHEMA".to_string())
         );
 
         connection.clear_tracked_oracle_current_schema();
-        assert_eq!(connection.oracle_schema_for_scope(None), None);
+        assert_eq!(connection.oracle_session_schema_for_scope(None), None);
     }
 
     #[test]

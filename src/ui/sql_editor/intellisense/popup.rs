@@ -36,10 +36,11 @@ impl QuickDescribeBackend for OracleQuickDescribeBackend {
     ) -> Result<QuickDescribeData, String> {
         // The lookup name carries the schema, so the tab's scope only has to
         // reach the name — the shared live session keeps its own tracked
-        // schema and nothing here has to change it.
-        let lookup_schema = conn_guard
-            .oracle_schema_for_scope(scope)
-            .map(str::to_string);
+        // schema and nothing here has to change it. The name resolves the
+        // same way a session does (tab scope, else this connection's own
+        // schema), so it never lands in whatever schema another tab left the
+        // shared session in.
+        let lookup_schema = conn_guard.oracle_session_schema_for_scope(scope);
         let tracked_schema = conn_guard
             .tracked_oracle_current_schema()
             .map(str::to_string);
@@ -884,6 +885,9 @@ impl SqlEditorWidget {
             app::awake();
             return;
         };
+        // Same scope the tab's statements run in: an unqualified routine's
+        // signature must come from where the call would actually resolve.
+        let tab_scope = self.connection_binding.snapshot().scope;
         let sender = self.ui_action_sender.clone();
         let runtime = self.intellisense_runtime.clone();
         let key_fallback = key.clone();
@@ -905,7 +909,7 @@ impl SqlEditorWidget {
                     return Err("Signature metadata connection changed before acquire".to_string());
                 }
                 let (session, _cancel_registration) =
-                    context.acquire_session_for_current_scope(&activity_guard)?;
+                    context.acquire_session_for_scope(tab_scope.as_deref(), &activity_guard)?;
                 if !crate::db::cached_pool_session_context_matches_shared_connection(
                     &connection,
                     &context,

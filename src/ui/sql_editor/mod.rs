@@ -421,10 +421,6 @@ impl QueryProgressSender {
     pub(crate) fn send(&self, progress: QueryProgress) -> Result<(), QueryProgressSendError> {
         match &progress {
             QueryProgress::ConnectionChanged { info: None } => self.set_execution_origin(None),
-            QueryProgress::DatabaseChanged { info } => {
-                let scope = info.service_name.trim();
-                self.set_execution_scope((!scope.is_empty()).then(|| scope.to_string()));
-            }
             QueryProgress::ScopeChangedNotice { selected_scope, .. } => {
                 self.set_execution_scope(selected_scope.clone());
             }
@@ -623,9 +619,6 @@ pub enum QueryProgress {
     TransactionActionFinished,
     ConnectionChanged {
         info: Option<ConnectionInfo>,
-    },
-    DatabaseChanged {
-        info: ConnectionInfo,
     },
     ScopeChangedNotice {
         message: String,
@@ -1810,9 +1803,11 @@ impl ExplainPlanBackend for OracleExplainPlanBackend {
         _current_mysql_cancel_context: &Arc<Mutex<Option<MySqlQueryCancelContext>>>,
         cancel_flag: &Arc<Mutex<bool>>,
     ) -> Result<ExplainPlanData, String> {
-        let plan_schema = conn_guard
-            .oracle_schema_for_scope(scope)
-            .map(str::to_string);
+        // The same rule session acquisition uses: the tab's scope, else this
+        // connection's own schema. It resolves to a concrete name so an
+        // Explain never inherits — or leaves behind — the schema another tab
+        // put this shared session in.
+        let plan_schema = conn_guard.oracle_session_schema_for_scope(scope);
         match conn_guard.require_live_db_connection() {
             Ok(DbConnection::Oracle(db_conn)) => {
                 SqlEditorWidget::set_current_query_connection(

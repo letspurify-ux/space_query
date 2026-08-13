@@ -223,6 +223,7 @@ struct RunCapture {
     messages: Vec<String>,
     rows: Vec<Vec<String>>,
     mode_changes: Vec<TransactionMode>,
+    scope_changes: Vec<Option<String>>,
 }
 
 struct Harness {
@@ -2538,6 +2539,18 @@ fn run_scenarios(target: Target, h: &mut Harness) -> Result<(), String> {
                 "this tab {current_scope_sql} = {this_scope_after_statement:?}, expected {base}"
             ),
         );
+        // The same question for a tab with NO scope of its own: it means
+        // "wherever my session lands", which is this tab's own session — not
+        // whatever schema some other tab last moved ITS session to.
+        h.editor.set_tab_scope(None);
+        let _ = h.editor.discard_pooled_session_for_close();
+        let scopeless = h.select_scalar(current_scope_sql)?;
+        h.check(
+            "S41 a tab with no scope of its own is not dragged along either",
+            scopeless.trim().eq_ignore_ascii_case(&base),
+            format!("scope-less tab {current_scope_sql} = {scopeless:?}, expected {base}"),
+        );
+        h.editor.set_tab_scope(Some(base.clone()));
         let _ = other.run("ROLLBACK");
         let _ = other.editor.discard_pooled_session_for_close();
     }
@@ -2547,6 +2560,70 @@ fn run_scenarios(target: Target, h: &mut Harness) -> Result<(), String> {
     } else {
         format!("DROP DATABASE IF EXISTS {scratch_scope}")
     });
+
+    // ---- S42 (MySQL family): a typed USE moves THIS tab, and it sticks ----
+    // The tab's own `USE` is the tab's truth: the statement must land, the
+    // message and the selector must name where it landed, and the NEXT
+    // statement of the same tab must still be there. Deriving any of that
+    // from the connection's stored database — which a tab's `USE`
+    // deliberately no longer touches — would name the wrong place and move
+    // the session back on the following statement.
+    if !target.is_oracle() {
+        println!("  --- S42 a typed USE moves this tab and stays put ---");
+        h.editor.clear_tab_transaction_mode_override();
+        h.run("ROLLBACK")?;
+        let scratch_scope = "SQ_TM_SCOPE4";
+        let _ = h.run(&format!("DROP DATABASE IF EXISTS {scratch_scope}"));
+        let capture = h.run(&format!("CREATE DATABASE {scratch_scope}"))?;
+        if !capture.results.first().is_some_and(|result| result.success) {
+            return Err(format!(
+                "S42 could not create the scratch database: {:?}",
+                capture.results.first().map(|r| r.message.clone())
+            ));
+        }
+        // A tab with NO scope of its own: the connection's database is the
+        // only other candidate, so a wrong source shows up immediately.
+        h.editor.set_tab_scope(None);
+        let _ = h.editor.discard_pooled_session_for_close();
+        let notice = h.run(&format!("USE {scratch_scope}"))?;
+        h.check(
+            "S42 the USE reports the database it moved to",
+            notice
+                .messages
+                .iter()
+                .any(|line| line.to_ascii_uppercase().contains(scratch_scope)),
+            format!("messages: {:?}", notice.messages),
+        );
+        // The scope the UI is handed. This is the one report of where the
+        // session went, so it must name the statement's own target and not
+        // the connection's stored database.
+        let reported_scope = notice.scope_changes.last().cloned().flatten();
+        h.check(
+            "S42 the reported scope is the statement's own target",
+            reported_scope
+                .as_deref()
+                .is_some_and(|scope| scope.trim().eq_ignore_ascii_case(scratch_scope)),
+            format!("scope events: {:?}", notice.scope_changes),
+        );
+        // What the window does with that report: the tab moves there.
+        h.editor.set_tab_scope(reported_scope);
+        let after_use = h.select_scalar(current_scope_sql)?;
+        h.check(
+            "S42 the session really moved",
+            after_use.trim().eq_ignore_ascii_case(scratch_scope),
+            format!("{current_scope_sql} = {after_use:?}"),
+        );
+        let still_there = h.select_scalar(current_scope_sql)?;
+        h.check(
+            "S42 the next statement is still there",
+            still_there.trim().eq_ignore_ascii_case(scratch_scope),
+            format!("{current_scope_sql} = {still_there:?}"),
+        );
+        h.editor.set_tab_scope(Some(base_scope.clone()));
+        let _ = h.editor.discard_pooled_session_for_close();
+        let _ = h.run(&format!("DROP DATABASE IF EXISTS {scratch_scope}"));
+        h.run("ROLLBACK")?;
+    }
 
     // ---- S40: a dirty session does not gate a scope change ------------------
     // The commit/rollback/discard decision belongs to tab close. A scope
@@ -3481,6 +3558,13 @@ fn attach_tab(shared: space_query::db::SharedConnection) -> Harness {
                     .unwrap_or_else(|p| p.into_inner())
                     .mode_changes
                     .push(*mode);
+            }
+            QueryProgress::ScopeChangedNotice { selected_scope, .. } => {
+                capture
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .scope_changes
+                    .push(selected_scope.clone());
             }
             QueryProgress::BatchFinished => {
                 done.store(true, Ordering::SeqCst);

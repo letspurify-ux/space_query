@@ -4860,7 +4860,6 @@ pub(crate) fn result_pane_routes_for_progress_with_script_context(
         | QueryProgress::TransactionModeChanged { .. }
         | QueryProgress::TransactionActionFinished
         | QueryProgress::ConnectionChanged { .. }
-        | QueryProgress::DatabaseChanged { .. }
         | QueryProgress::ScopeChangedNotice { .. }
         | QueryProgress::WorkerPanicked { .. }
         | QueryProgress::ExecutionAbandoned { .. }
@@ -8560,22 +8559,48 @@ impl MainWindow {
         app::redraw();
     }
 
+    /// Run `action` with the app state from a UI timer.
+    ///
+    /// Timer closures may never BLOCK on the app state: a modal dialog runs a
+    /// nested `app::wait()` that dispatches them, and callers open modals
+    /// while holding the guard — blocking would park the UI thread on a lock
+    /// only that same thread can release. They may not simply give up either:
+    /// the work would be lost with nothing to re-schedule it. And a poisoned
+    /// guard is NOT "busy": a panic under it makes it poisoned forever, so
+    /// retrying would never end. This is the one place all three are decided.
+    fn schedule_with_app_state<F>(state: &Arc<Mutex<AppState>>, delay_seconds: f64, action: F)
+    where
+        F: FnOnce(&mut AppState) + 'static,
+    {
+        let state_for_timer = Arc::clone(state);
+        crate::ui::ui_timeout::schedule(delay_seconds, move || match state_for_timer.try_lock() {
+            Ok(mut guard) => action(&mut guard),
+            Err(std::sync::TryLockError::Poisoned(poisoned)) => action(&mut poisoned.into_inner()),
+            Err(std::sync::TryLockError::WouldBlock) => {
+                Self::schedule_with_app_state(&state_for_timer, delay_seconds, action);
+            }
+        });
+    }
+
     fn defer_close_query_editor_tab_until_idle(state: &Arc<Mutex<AppState>>, tab_id: QueryTabId) {
         let state_for_retry = Arc::clone(state);
-        crate::ui::ui_timeout::schedule(0.2, move || {
-            let should_wait = {
-                let s = state_for_retry
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner());
-                s.find_tab_index(tab_id).is_some()
-                    && s.has_running_query_or_lazy_fetch_for_tab(tab_id)
-            };
-            if should_wait {
-                MainWindow::cancel_query_editor_tab(&state_for_retry, tab_id);
-                MainWindow::defer_close_query_editor_tab_until_idle(&state_for_retry, tab_id);
-                return;
-            }
-            MainWindow::close_query_editor_tab_with_dirty_check(&state_for_retry, tab_id, false);
+        Self::schedule_with_app_state(state, 0.2, move |s| {
+            let should_wait = s.find_tab_index(tab_id).is_some()
+                && s.has_running_query_or_lazy_fetch_for_tab(tab_id);
+            // The rest re-enters the app state, so it must run after the
+            // guard this closure was handed is released.
+            crate::ui::ui_timeout::schedule(0.0, move || {
+                if should_wait {
+                    MainWindow::cancel_query_editor_tab(&state_for_retry, tab_id);
+                    MainWindow::defer_close_query_editor_tab_until_idle(&state_for_retry, tab_id);
+                    return;
+                }
+                MainWindow::close_query_editor_tab_with_dirty_check(
+                    &state_for_retry,
+                    tab_id,
+                    false,
+                );
+            });
         });
     }
 
@@ -8723,21 +8748,17 @@ impl MainWindow {
                 .unwrap_or(false);
 
             if !switched_to_next {
-                if let Some(fallback_tab) = s.editor_tabs.first().cloned() {
-                    // Defensive fallback: if tab/widget selection loses sync, still point
-                    // app state to a live editor tab so closed-tab resources are not held
-                    // by stale SqlEditorWidget/TextBuffer handles.
-                    s.active_editor_tab_id = fallback_tab.tab_id;
-                    s.sql_editor = fallback_tab.sql_editor;
-                    s.sql_editor.mark_display_metrics_pending();
-                    s.sql_buffer = fallback_tab.sql_buffer;
-                    *s.current_file
-                        .lock()
-                        .unwrap_or_else(|poisoned| poisoned.into_inner()) =
-                        fallback_tab.current_file;
-                    s.query_tabs.select(fallback_tab.tab_id);
-                    s.refresh_window_title();
-                    deferred_display_tab_id = Some(fallback_tab.tab_id);
+                if let Some(fallback_tab_id) = s.editor_tabs.first().map(|tab| tab.tab_id) {
+                    // Defensive fallback: if tab/widget selection loses sync,
+                    // still point app state to a live editor tab so closed-tab
+                    // resources are not held by stale SqlEditorWidget/
+                    // TextBuffer/result-workspace handles. It activates the
+                    // tab the same way every other switch does, so this branch
+                    // cannot drift from it and leave the window half-switched.
+                    if s.set_active_editor_tab_with_display_stabilization(fallback_tab_id, false) {
+                        s.query_tabs.select(fallback_tab_id);
+                        deferred_display_tab_id = Some(fallback_tab_id);
+                    }
                 } else if was_active {
                     // Defensive fallback: if tab selection cannot be resolved,
                     // clear active editor references so closed-tab resources are
@@ -8810,9 +8831,11 @@ impl MainWindow {
             let state_for_deferred_display = Arc::clone(state);
             crate::ui::ui_timeout::schedule(0.0, move || {
                 let editor = {
-                    let s = state_for_deferred_display
-                        .lock()
-                        .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    // Timer closures may not block on the app state: a modal
+                    // pumps them while a caller holds the guard.
+                    let Ok(s) = state_for_deferred_display.try_lock() else {
+                        return;
+                    };
                     if s.active_editor_tab_id == tab_id {
                         Some(s.sql_editor.clone())
                     } else {
@@ -10051,12 +10074,13 @@ impl MainWindow {
                     s.refresh_tab_label(tab_id);
                     drop(s);
                     let state_for_transient_cleanup = state_for_progress.clone();
-                    crate::ui::ui_timeout::schedule(0.0, move || {
-                        state_for_transient_cleanup
-                            .lock()
-                            .unwrap_or_else(|poisoned| poisoned.into_inner())
-                            .remove_idle_transient_runtimes();
-                    });
+                    MainWindow::schedule_with_app_state(
+                        &state_for_transient_cleanup,
+                        0.0,
+                        |state| {
+                            state.remove_idle_transient_runtimes();
+                        },
+                    );
                     return;
                 }
                 QueryProgress::CancelOutcome { token, outcome } => {
@@ -10908,33 +10932,6 @@ impl MainWindow {
                     }
                     drop(s);
                 }
-                QueryProgress::DatabaseChanged { info } => {
-                    let database = info.service_name.trim().to_string();
-                    let mut retained_scope_update = None;
-                    if !database.is_empty() {
-                        // A `USE` ran on THIS tab's session: the scope change
-                        // belongs to this tab alone. Sibling tabs on the same
-                        // connection keep their own scope.
-                        let selected_scope = Some(database.clone());
-                        if s.synchronize_scope_for_tab(tab_id, selected_scope.clone()) {
-                            retained_scope_update =
-                                s.retained_scope_update_for_tab(tab_id, selected_scope);
-                        }
-                        if s.active_editor_tab_id == tab_id {
-                            s.set_status_message(&format!("Database selected | {}", database));
-                        }
-                    }
-                    drop(s);
-                    if let Some(message) = retained_scope_update
-                        .map(apply_retained_scope_update)
-                        .and_then(|outcomes| first_retained_outcome_message(&outcomes))
-                    {
-                        crate::ui::alert_on_main(&format!(
-                            "Database changed for this connection, but a retained tab session could not be updated:\n{}",
-                            message
-                        ));
-                    }
-                }
                 QueryProgress::ScopeChangedNotice {
                     message,
                     selected_scope,
@@ -10942,8 +10939,8 @@ impl MainWindow {
                     let selected_scope = selected_scope
                         .map(|scope| scope.trim().to_string())
                         .filter(|scope| !scope.is_empty());
-                    // An ALTER SESSION ran on THIS tab's session: tab-scoped,
-                    // like DatabaseChanged above.
+                    // The one report of a scope change: an ALTER SESSION or a
+                    // `USE` ran on THIS tab's session, so only this tab moves.
                     s.synchronize_scope_for_tab(tab_id, selected_scope.clone());
                     let retained_scope_update =
                         s.retained_scope_update_for_tab(tab_id, selected_scope.clone());
@@ -11514,13 +11511,20 @@ impl MainWindow {
                                 tab_id,
                                 request,
                             ) {
-                                let state = state_for_last_page
-                                    .lock()
-                                    .unwrap_or_else(|poisoned| poisoned.into_inner());
-                                if let Some(mut result_tabs) = state.result_tabs_for_tab(tab_id) {
-                                    result_tabs.fail_table_browse_result_by_id(result_tab_id);
-                                }
-                                drop(state);
+                                // Never a blocking lock from a timer, and the
+                                // alert below pumps these timers itself.
+                                MainWindow::schedule_with_app_state(
+                                    &state_for_last_page,
+                                    0.0,
+                                    move |state| {
+                                        if let Some(mut result_tabs) =
+                                            state.result_tabs_for_tab(tab_id)
+                                        {
+                                            result_tabs
+                                                .fail_table_browse_result_by_id(result_tab_id);
+                                        }
+                                    },
+                                );
                                 crate::ui::alert_on_main(&message);
                             }
                         });
@@ -12956,11 +12960,18 @@ impl MainWindow {
             let Some(state) = weak_state.upgrade() else {
                 return;
             };
-            let window = state
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .window
-                .clone();
+            let window = match state.try_lock() {
+                Ok(state) => state.window.clone(),
+                Err(std::sync::TryLockError::Poisoned(poisoned)) => {
+                    poisoned.into_inner().window.clone()
+                }
+                Err(std::sync::TryLockError::WouldBlock) => {
+                    // Nothing else re-arms this chain, so come back rather
+                    // than dropping the pending scale change.
+                    Self::schedule_ui_scale_after_fullscreen_exit(weak_state, retries_remaining);
+                    return;
+                }
+            };
             if !window.shown() {
                 return;
             }
@@ -13113,11 +13124,12 @@ impl MainWindow {
             let Some(state) = weak_state.upgrade() else {
                 return;
             };
-            let (mut query_tabs, mut result_tabs) = {
-                let state = state
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner());
-                (state.query_tabs.clone(), state.result_tabs.clone())
+            let Some((mut query_tabs, mut result_tabs)) = state
+                .try_lock()
+                .ok()
+                .map(|state| (state.query_tabs.clone(), state.result_tabs.clone()))
+            else {
+                return;
             };
             query_tabs.refresh_tab_strip_overflow_mode();
             result_tabs.refresh_tab_strip_overflow_mode();
@@ -14490,11 +14502,21 @@ impl MainWindow {
         started_at: Instant,
     ) {
         crate::ui::ui_timeout::schedule(APPLICATION_EXIT_POLL_SECONDS, move || {
-            let has_running_work = {
-                let s = state
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner());
-                s.has_running_query_or_lazy_fetch()
+            let running_work = match state.try_lock() {
+                Ok(s) => Some(s.has_running_query_or_lazy_fetch()),
+                // A panic under the guard poisons it for good: treating that
+                // as "busy" would re-arm this poll forever and the app could
+                // never be quit.
+                Err(std::sync::TryLockError::Poisoned(poisoned)) => {
+                    Some(poisoned.into_inner().has_running_query_or_lazy_fetch())
+                }
+                // The exit dialogs pump these timers while the guard is held;
+                // come back on the next poll, same deadline.
+                Err(std::sync::TryLockError::WouldBlock) => None,
+            };
+            let Some(has_running_work) = running_work else {
+                Self::defer_application_exit_until_idle(state, window, started_at);
+                return;
             };
             match application_exit_wait_decision(has_running_work, started_at.elapsed()) {
                 ApplicationExitWaitDecision::Continue => {

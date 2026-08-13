@@ -130,6 +130,15 @@ applied to the tab's retained session in place (MySQL `USE`, Oracle
 transaction state — an open transaction simply continues in the new scope, and
 the commit/rollback/discard decision stays where it belongs, at tab close.
 
+The reverse direction — a statement that moves the session (`USE`,
+`ALTER SESSION SET CURRENT_SCHEMA`) — is reported to the window exactly once,
+by `QueryProgress::ScopeChangedNotice`, carrying the scope the statement itself
+selected. That report moves the originating tab and nothing else. A tab's `USE`
+deliberately does NOT write the connection's stored database (that name is the
+connection's own, and is what a tab with no scope of its own falls back to), so
+any second event built from it would name another tab's database and overwrite
+the correct one.
+
 A card is loaded from the database only when there is nothing to inherit. The
 metadata belongs to the connection and the scope it was read in, not to the tab
 that asked first, so a new card copies a sibling card's `ObjectCache`, scope
@@ -147,11 +156,13 @@ a sibling tab sitting on another one. Regression harness:
 Operations that
 run on the shared live connection instead of a pool session — Quick Describe
 and Explain Plan — therefore resolve names in the requesting tab's scope
-(`DatabaseConnection::oracle_schema_for_scope()` /
+(`DatabaseConnection::oracle_session_schema_for_scope()` /
 `mysql_database_for_scope()`, the same "tab scope, else connection" rule as
-`DbPoolSessionContext::for_scope()`). Explain applies that scope to the live
-session, so the next operation must reapply its own; Quick Describe never
-switches the session — it names the schema/database in the lookup itself,
+`DbPoolSessionContext::for_scope()`). The Oracle rule resolves to a concrete
+name rather than to "leave the session alone", so neither operation can inherit
+the schema another tab left the shared session in. Explain applies that scope to
+the live session, so the next operation must reapply its own; Quick Describe
+never switches the session — it names the schema/database in the lookup itself,
 because MySQL 8 and MariaDB fold `DATABASE()` into a prepared
 `INFORMATION_SCHEMA` statement at prepare time and a cached one would keep
 answering for the database the session was in then.

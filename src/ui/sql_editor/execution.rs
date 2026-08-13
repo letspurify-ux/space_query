@@ -6473,8 +6473,8 @@ impl SqlEditorWidget {
                             false,
                             preserve_session_state_after_action,
                             statement_effects.preserves_statement_diagnostics(),
-                            None,
                             execution_scope.as_deref(),
+                            &mut None,
                         );
                         should_retain_session = health_check_ok;
                     }
@@ -8075,11 +8075,19 @@ impl SqlEditorWidget {
                                         shared_connection,
                                         db_activity,
                                     );
-                                    let current_database = info
-                                        .as_ref()
-                                        .map(|info| info.service_name.trim())
+                                    // The database this `USE` moved THIS
+                                    // tab's session to. The connection's
+                                    // stored name is another tab's business
+                                    // and is deliberately left alone, so it
+                                    // is only a last resort here.
+                                    let current_database = Some(database.trim())
                                         .filter(|database| !database.is_empty())
-                                        .unwrap_or(database.trim());
+                                        .or_else(|| {
+                                            info.as_ref()
+                                                .map(|info| info.service_name.trim())
+                                                .filter(|database| !database.is_empty())
+                                        })
+                                        .unwrap_or_default();
                                     let notice = SqlEditorWidget::current_database_changed_message(
                                         current_database,
                                     );
@@ -8092,12 +8100,7 @@ impl SqlEditorWidget {
                                         message: notice,
                                         selected_scope: Some(current_database.to_string()),
                                     });
-                                    if let Some(info) = info {
-                                        let _ =
-                                            sender.send(QueryProgress::DatabaseChanged { info });
-                                    } else {
-                                        let _ = sender.send(QueryProgress::MetadataRefreshNeeded);
-                                    }
+                                    let _ = sender.send(QueryProgress::MetadataRefreshNeeded);
                                     app::awake();
                                 }
                                 Err(error) => {
@@ -8739,22 +8742,24 @@ impl SqlEditorWidget {
                                                         db_type,
                                                         &sql_text,
                                                     ));
+                                            // The statement's own target, not
+                                            // the connection's database: a
+                                            // successful `USE` moved THIS
+                                            // tab's session there, and the
+                                            // connection's stored name is
+                                            // deliberately left alone.
                                             let selected_scope =
-                                                current_database.clone().or(parsed_database);
+                                                parsed_database.or_else(|| current_database.clone());
                                             let message = selected_scope
                                                 .as_deref()
                                                 .map(SqlEditorWidget::current_database_changed_message)
                                                 .unwrap_or_else(|| result.message.clone());
-                                            (
-                                                message,
-                                                selected_scope,
-                                                info.clone(),
-                                            )
+                                            (message, selected_scope)
                                         })
                                 } else {
                                     None
                                 };
-                            if let Some((_, Some(scope), _)) = &current_database_notice {
+                            if let Some((_, Some(scope))) = &current_database_notice {
                                 *execution_scope
                                     .lock()
                                     .unwrap_or_else(|poisoned| poisoned.into_inner()) =
@@ -8835,16 +8840,12 @@ impl SqlEditorWidget {
                                 let _ = sender.send(QueryProgress::AutoCommitChanged { enabled });
                                 app::awake();
                             }
-                            if let Some((message, selected_scope, info)) = current_database_notice {
+                            if let Some((message, selected_scope)) = current_database_notice {
                                 let _ = sender.send(QueryProgress::ScopeChangedNotice {
                                     message,
                                     selected_scope,
                                 });
-                                if let Some(info) = info {
-                                    let _ = sender.send(QueryProgress::DatabaseChanged { info });
-                                } else {
-                                    let _ = sender.send(QueryProgress::MetadataRefreshNeeded);
-                                }
+                                let _ = sender.send(QueryProgress::MetadataRefreshNeeded);
                                 app::awake();
                             }
                             if stop_after_success {
@@ -9234,6 +9235,10 @@ impl SqlEditorWidget {
             return loaded;
         };
 
+        // An unqualified routine is looked up in THIS tab's scope, the same
+        // one its statements run in — not in the connection's, which belongs
+        // to no tab in particular.
+        let tab_scope = self.connection_binding.snapshot().scope;
         let (sender, receiver) = mpsc::channel::<(usize, Vec<crate::db::ProcedureArgument>)>();
         let mut spawned = 0usize;
         for (index, (qualifier, routine)) in routines.iter().enumerate() {
@@ -9241,6 +9246,7 @@ impl SqlEditorWidget {
             let connection = connection.clone();
             let qualifier = qualifier.clone();
             let routine = routine.clone();
+            let tab_scope = tab_scope.clone();
             let task = move || {
                 let activity = format!("Bind parameter types {routine}");
                 let resolved = (|| {
@@ -9253,7 +9259,7 @@ impl SqlEditorWidget {
                         context.connection_info.db_type,
                     );
                     let (session, _cancel_registration) =
-                        context.acquire_session_for_current_scope(&activity_guard)?;
+                        context.acquire_session_for_scope(tab_scope.as_deref(), &activity_guard)?;
                     if !crate::db::cached_pool_session_context_matches_shared_connection(
                         &connection,
                         &context,
@@ -12205,8 +12211,8 @@ impl SqlEditorWidget {
                                                         current_database.to_string(),
                                                     ),
                                                 });
-                                            let _ =
-                                                sender.send(QueryProgress::DatabaseChanged { info });
+                                            let _ = sender
+                                                .send(QueryProgress::MetadataRefreshNeeded);
                                             app::awake();
                                         }
                                         Err(msg) => {
@@ -21794,7 +21800,7 @@ impl SqlEditorWidget {
                         .session_residue_state()
                         .may_have_statement_diagnostics(),
                     None,
-                    None,
+                    &mut None,
                 );
                 outcome = crate::db::retained_session_outcome_after_session_info_sync(
                     retained_state,
@@ -23602,36 +23608,6 @@ impl SqlEditorWidget {
         .is_some_and(|dropped| dropped == stored)
     }
 
-    fn mysql_known_current_database_after_successful_statement(
-        db_type: crate::db::DatabaseType,
-        statement_sql: &str,
-        allow_global_database_update: bool,
-        preserve_existing_session_state: bool,
-        stored_current_database: &str,
-    ) -> Option<String> {
-        if !allow_global_database_update || !preserve_existing_session_state {
-            return None;
-        }
-        if let Some(database) =
-            crate::db::query::mysql_executor::MysqlExecutor::use_statement_database_name_for_db_type(
-                db_type,
-                statement_sql,
-            )
-        {
-            return Some(database);
-        }
-        if Self::mysql_statement_drops_current_database(
-            db_type,
-            statement_sql,
-            stored_current_database,
-        ) {
-            // Dropping the current database leaves the session without a
-            // default schema; record that instead of keeping the stale name.
-            return Some(String::new());
-        }
-        None
-    }
-
     fn sync_mysql_pooled_session_info(
         shared_connection: &crate::db::SharedConnection,
         conn: &mut mysql::PooledConn,
@@ -23641,8 +23617,11 @@ impl SqlEditorWidget {
         allow_global_database_update: bool,
         preserve_existing_session_state: bool,
         preserve_statement_diagnostics: bool,
-        known_current_database: Option<&str>,
         execution_scope: Option<&str>,
+        // Set to the database the session reported, so callers name the
+        // place the statement really landed instead of re-deriving it from
+        // connection state that a tab's `USE` no longer touches.
+        session_current_database: &mut Option<String>,
     ) -> bool {
         // Internal protocol/SQL health commands change MySQL's statement
         // diagnostics. Skip them while ROW_COUNT()/FOUND_ROWS() is pending;
@@ -23669,18 +23648,27 @@ impl SqlEditorWidget {
         if allow_global_database_update {
             let refresh_encoding = refresh_encoding
                 && Self::mysql_should_refresh_connection_encoding(preserve_existing_session_state);
-            let sync_result = if preserve_existing_session_state {
-                if let Some(database) = known_current_database {
-                    conn_guard.sync_mysql_current_database_name_from_known_name(database)
-                } else {
-                    conn_guard.sync_mysql_current_database_name_from_session(conn, refresh_encoding)
-                }
-            } else {
-                conn_guard.sync_mysql_current_database_name_from_session(conn, refresh_encoding)
-            };
+            // A `USE` moved THIS TAB's session; the connection's own database
+            // is untouched, so read the session back (refreshing its
+            // encoding) and let that answer stand for everything downstream.
+            // An EMPTY answer is the one event that really is the
+            // connection's — its database is gone — and only then is the
+            // connection's own name rewritten.
+            let sync_result =
+                conn_guard.read_mysql_session_current_database(conn, refresh_encoding);
 
             match sync_result {
-                Ok(_) => {
+                Ok(session_database) => {
+                    if session_database.is_empty() {
+                        if let Err(err) = conn_guard
+                            .sync_mysql_current_database_name_from_known_name(&session_database)
+                        {
+                            eprintln!(
+                                "Warning: failed to clear the {display_name} current database: {err}"
+                            );
+                        }
+                    }
+                    *session_current_database = Some(session_database);
                     crate::db::refresh_pool_session_context_cache_for_shared_connection(
                         shared_connection,
                         &conn_guard,
@@ -23806,15 +23794,15 @@ impl SqlEditorWidget {
         if !Self::oracle_pooled_session_health_check(conn.as_ref(), db_activity) {
             return None;
         }
-        let mut conn_guard =
-            lock_connection_with_activity(shared_connection, db_activity.to_string());
+        let conn_guard = lock_connection_with_activity(shared_connection, db_activity.to_string());
         if !conn_guard
             .can_reuse_pool_session(connection_generation, crate::db::DatabaseType::Oracle)
         {
             return None;
         }
 
-        let sync_result = conn_guard.sync_oracle_current_schema_from_session(conn.as_ref());
+        // Read, never write: the tab's session moved, not the connection's.
+        let sync_result = conn_guard.read_oracle_session_current_schema(conn.as_ref());
 
         match sync_result {
             Ok(current_schema) => {
@@ -23881,15 +23869,15 @@ impl SqlEditorWidget {
         if !Self::oracle_thin_pooled_session_health_check(conn, db_activity) {
             return None;
         }
-        let mut conn_guard =
-            lock_connection_with_activity(shared_connection, db_activity.to_string());
+        let conn_guard = lock_connection_with_activity(shared_connection, db_activity.to_string());
         if !conn_guard
             .can_reuse_pool_session(connection_generation, crate::db::DatabaseType::Oracle)
         {
             return None;
         }
 
-        let sync_result = conn_guard.sync_oracle_thin_current_schema_from_session(conn);
+        // Read, never write: the tab's session moved, not the connection's.
+        let sync_result = conn_guard.read_oracle_thin_session_current_schema(conn);
 
         match sync_result {
             Ok(current_schema) => {
@@ -24405,8 +24393,8 @@ impl SqlEditorWidget {
                     prior_retained_state
                         .session_residue_state()
                         .may_have_statement_diagnostics(),
-                    None,
                     execution_scope,
+                    &mut None,
                 )
             {
                 Self::retain_mysql_pooled_session_if_current_with_state_and_scope(
@@ -24599,16 +24587,12 @@ impl SqlEditorWidget {
             || Self::mysql_statement_effects_may_preserve_session_state_after_action(
                 statement_effects,
             );
+        // What the session itself says it is in after this statement. A `USE`
+        // moves the tab's session, and nothing else knows where it landed —
+        // the connection's stored database is deliberately untouched.
+        let mut session_current_database: Option<String> = None;
         let mut should_retain_session = match reuse_decision {
             crate::db::MySqlPooledSessionReuseDecision::RetainIfSessionInfoSynced => {
-                let known_current_database =
-                    Self::mysql_known_current_database_after_successful_statement(
-                        db_type,
-                        statement_sql,
-                        allow_global_database_update,
-                        preserve_session_state_after_action,
-                        &stored_current_database,
-                    );
                 Self::sync_mysql_pooled_session_info(
                     shared_connection,
                     &mut conn,
@@ -24619,8 +24603,8 @@ impl SqlEditorWidget {
                     preserve_session_state_after_action,
                     matches!(&result, Ok(Ok(_)))
                         && statement_effects.preserves_statement_diagnostics(),
-                    known_current_database.as_deref(),
                     execution_scope,
+                    &mut session_current_database,
                 )
             }
             crate::db::MySqlPooledSessionReuseDecision::DropPhysicalSession => false,
@@ -31491,98 +31475,6 @@ mod query_execution_cleanup_tests {
     }
 
     #[test]
-    fn mysql_use_preserved_session_sync_uses_known_database_name() {
-        let effects = SqlEditorWidget::mysql_statement_session_effects_for_sql("USE qt_reporting");
-        assert!(
-            SqlEditorWidget::mysql_statement_effects_may_preserve_session_state_after_action(
-                effects
-            ),
-            "USE changes the current database on the physical session, so post-action sync must avoid internal SQL before the known database name is recorded"
-        );
-        assert!(
-            !SqlEditorWidget::mysql_success_requires_retained_session_after_action(
-                DatabaseType::MySQL,
-                RetainedSessionState::default(),
-                effects,
-                true,
-                false,
-            ),
-            "successful USE is a tracked scope change and must not require commit/rollback"
-        );
-        assert_eq!(
-            SqlEditorWidget::mysql_known_current_database_after_successful_statement(
-                DatabaseType::MySQL,
-                "USE `qt reporting`",
-                true,
-                true,
-                "qt_sales",
-            ),
-            Some("qt reporting".to_string())
-        );
-        assert_eq!(
-            SqlEditorWidget::mysql_known_current_database_after_successful_statement(
-                DatabaseType::MySQL,
-                "SELECT 1",
-                true,
-                true,
-                "qt_sales",
-            ),
-            None
-        );
-        assert_eq!(
-            SqlEditorWidget::mysql_known_current_database_after_successful_statement(
-                DatabaseType::MySQL,
-                "USE qt_reporting",
-                true,
-                false,
-                "qt_sales",
-            ),
-            None
-        );
-    }
-
-    #[test]
-    fn mysql_drop_current_database_clears_known_database_name() {
-        // Dropping the current database must record "no default database";
-        // dropping any other database must leave the stored name alone.
-        assert_eq!(
-            SqlEditorWidget::mysql_known_current_database_after_successful_statement(
-                DatabaseType::MySQL,
-                "DROP DATABASE qt_sales",
-                true,
-                true,
-                "qt_sales",
-            ),
-            Some(String::new())
-        );
-        assert_eq!(
-            SqlEditorWidget::mysql_known_current_database_after_successful_statement(
-                DatabaseType::MySQL,
-                "DROP DATABASE qt_other",
-                true,
-                true,
-                "qt_sales",
-            ),
-            None
-        );
-        assert!(SqlEditorWidget::mysql_statement_drops_current_database(
-            DatabaseType::MariaDB,
-            "drop schema if exists `qt sales`;",
-            " qt sales ",
-        ));
-        assert!(!SqlEditorWidget::mysql_statement_drops_current_database(
-            DatabaseType::MySQL,
-            "DROP TABLE qt_sales",
-            "qt_sales",
-        ));
-        assert!(!SqlEditorWidget::mysql_statement_drops_current_database(
-            DatabaseType::MySQL,
-            "DROP DATABASE qt_sales",
-            "",
-        ));
-    }
-
-    #[test]
     fn mysql_pooled_action_reuses_session_after_success_or_nonfatal_sql_error() {
         let ok_result: std::thread::Result<Result<(), String>> = Ok(Ok(()));
         let sql_error: std::thread::Result<Result<(), String>> = Ok(Err(
@@ -33722,9 +33614,6 @@ mod mysql_batch_execution_regression_tests {
                         .map(|value| value.connection_string())
                         .unwrap_or_else(|| "None".to_string())
                 ),
-                QueryProgress::DatabaseChanged { info } => {
-                    format!("DatabaseChanged({})", info.service_name)
-                }
                 QueryProgress::ScopeChangedNotice { message, .. } => format!(
                     "ScopeChangedNotice({})",
                     message.lines().next().unwrap_or_default()
@@ -33968,7 +33857,6 @@ mod mysql_batch_execution_regression_tests {
                 | QueryProgress::TransactionModeChanged { .. }
                 | QueryProgress::TransactionActionFinished
                 | QueryProgress::ConnectionChanged { .. }
-                | QueryProgress::DatabaseChanged { .. }
                 | QueryProgress::ScopeChangedNotice { .. }
                 | QueryProgress::WorkerPanicked { .. }
                 | QueryProgress::ExecutionAbandoned { .. }

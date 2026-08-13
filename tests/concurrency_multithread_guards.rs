@@ -684,22 +684,20 @@ fn oracle_primary_connection_reapplies_tracked_schema_before_direct_use() {
         "Direct Oracle primary connection use should reapply the tracked global schema"
     );
 
-    let sync_start = content
-        .find("pub fn sync_oracle_current_schema_from_session(")
-        .expect("Oracle current schema sync helper should exist");
-    let sync_end = content[sync_start..]
-        .find("pub fn switch_oracle_current_schema(")
-        .map(|offset| sync_start + offset)
-        .expect("Oracle schema switch helper should follow sync helper");
-    let sync_helper = &content[sync_start..sync_end];
-    assert!(
-        sync_helper.contains("self.require_live_connection()?"),
-        "Syncing Oracle schema from a pooled session should fail if the primary session cannot mirror it"
-    );
-    assert!(
-        !sync_helper.contains("failed to mirror Oracle current schema to primary connection"),
-        "Oracle schema sync should not silently ignore primary-session mirror failures"
-    );
+    // A pooled session's schema is THAT TAB's, so nothing may copy it back
+    // onto the connection — from where every scope-less tab would inherit it.
+    // The helpers that did are gone; reading a session stays read-only
+    // (`read_oracle_session_current_schema` and its twins).
+    for writer in [
+        "pub fn sync_oracle_current_schema_from_session(",
+        "pub fn sync_oracle_thin_current_schema_from_session(",
+        "pub fn sync_mysql_current_database_name_from_session(",
+    ] {
+        assert!(
+            !content.contains(writer),
+            "a session's scope belongs to its tab and must not be written back to the connection: {writer}"
+        );
+    }
 }
 
 #[test]
@@ -1902,16 +1900,16 @@ fn mysql_use_refreshes_metadata_without_connection_transition() {
     let content = fs::read_to_string(&file)
         .unwrap_or_else(|err| panic!("failed to read source file {}: {err}", file.display()));
 
-    for (start_marker, end_marker, expects_metadata_fallback) in [
+    for (start_marker, end_marker, syncs_shared_connection) in [
         (
             "ToolCommand::Use { database } =>",
             "ToolCommand::MysqlDelimiter",
-            true,
+            false,
         ),
         (
             "ToolCommand::Use { ref database } =>",
             "// MySQL-specific commands",
-            false,
+            true,
         ),
     ] {
         let start = content
@@ -1923,16 +1921,22 @@ fn mysql_use_refreshes_metadata_without_connection_transition() {
             .unwrap_or_else(|| panic!("USE branch end marker should exist: {end_marker}"));
         let use_branch = &content[start..end];
 
+        // ONE report of where the session went: ScopeChangedNotice carries
+        // the database the statement itself selected. A second event built
+        // from the connection's stored name would arrive right behind it and
+        // overwrite that with another tab's database.
         assert!(
-            use_branch.contains("QueryProgress::DatabaseChanged"),
-            "USE should update the selected database without being treated as a connection transition"
+            use_branch.contains("QueryProgress::ScopeChangedNotice")
+                && !use_branch.contains("QueryProgress::DatabaseChanged"),
+            "USE should report its scope once, from the statement's own target"
         );
-        if expects_metadata_fallback {
-            assert!(
-                use_branch.contains("QueryProgress::MetadataRefreshNeeded"),
-                "pooled USE should still fall back to metadata refresh when no UI connection info is available"
-            );
-        } else {
+        assert!(
+            use_branch.contains("QueryProgress::MetadataRefreshNeeded"),
+            "USE should refresh the catalog for the tab that moved"
+        );
+        if syncs_shared_connection {
+            // This path runs the USE on the shared connection itself, so the
+            // connection's stored database really did move with it.
             assert!(
                 use_branch.contains("sync_mysql_current_database_name"),
                 "direct USE should synchronize the global database before reporting success"
@@ -1940,6 +1944,11 @@ fn mysql_use_refreshes_metadata_without_connection_transition() {
             assert!(
                 use_branch.contains("global database selection could not be synchronized"),
                 "direct USE should fail instead of emitting a stale scope event when global sync fails"
+            );
+        } else {
+            assert!(
+                !use_branch.contains("sync_mysql_current_database_name"),
+                "a pooled tab's USE moves only that tab, not the connection's stored database"
             );
         }
         assert!(
@@ -1983,18 +1992,22 @@ fn mysql_plain_use_statement_updates_scope_and_refreshes_metadata() {
 }
 
 #[test]
-fn mysql_database_changed_updates_the_originating_tab_without_releasing_sessions() {
+fn a_scope_change_updates_the_originating_tab_without_releasing_sessions() {
     let file = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/ui/main_window.rs");
     let content = fs::read_to_string(&file)
         .unwrap_or_else(|err| panic!("failed to read source file {}: {err}", file.display()));
 
+    assert!(
+        !content.contains("QueryProgress::DatabaseChanged"),
+        "a scope change has one spelling; a second event carrying the connection's stored database would overwrite it"
+    );
     let start = content
-        .find("QueryProgress::DatabaseChanged { info } =>")
-        .expect("DatabaseChanged handler should exist");
+        .find("QueryProgress::ScopeChangedNotice {")
+        .expect("ScopeChangedNotice handler should exist");
     let end = content[start..]
         .find("QueryProgress::StatementFinished")
         .map(|offset| start + offset)
-        .expect("StatementFinished handler should follow DatabaseChanged");
+        .expect("StatementFinished handler should follow ScopeChangedNotice");
     let handler = &content[start..end];
 
     // Scope is TAB-scoped: a `USE` ran on ONE tab's session, so only that
@@ -2003,11 +2016,11 @@ fn mysql_database_changed_updates_the_originating_tab_without_releasing_sessions
     assert!(
         handler.contains("s.synchronize_scope_for_tab(tab_id")
             && handler.contains("selected_scope.clone()"),
-        "DatabaseChanged should synchronize the selected database on the originating tab"
+        "A scope change should synchronize the selected scope on the originating tab"
     );
     assert!(
         handler.contains("s.retained_scope_update_for_tab(tab_id"),
-        "DatabaseChanged should update the originating tab's retained session"
+        "A scope change should update the originating tab's retained session"
     );
     assert!(
         handler.contains("if s.active_editor_tab_id == tab_id"),
@@ -2019,7 +2032,7 @@ fn mysql_database_changed_updates_the_originating_tab_without_releasing_sessions
     );
     assert!(
         !handler.contains("release_all_pooled_db_sessions"),
-        "DatabaseChanged must not clear tab-owned DB sessions"
+        "A scope change must not clear tab-owned DB sessions"
     );
 }
 
@@ -3704,7 +3717,7 @@ fn execution_resolves_scope_from_the_requesting_tab_for_every_backend() {
     // same fallback.
     let connection = read_source("src/db/connection.rs");
     for helper in [
-        "pub fn oracle_schema_for_scope",
+        "pub fn oracle_session_schema_for_scope",
         "pub fn mysql_database_for_scope",
         "pub fn apply_oracle_current_schema_for_scope",
     ] {
@@ -3713,4 +3726,125 @@ fn execution_resolves_scope_from_the_requesting_tab_for_every_backend() {
             "{helper} is the single source of truth for an operation's scope"
         );
     }
+    // One Oracle rule, not two: the earlier non-total spelling resolved to
+    // "leave the session where it is", which on a recycled pooled session
+    // means "wherever another tab left it".
+    assert!(
+        !connection.contains("pub fn oracle_schema_for_scope"),
+        "a second Oracle scope rule is how the sessions drifted apart"
+    );
+}
+
+/// Metadata a tab asks for is looked up in THAT tab's scope.
+///
+/// Signature hints and bind-parameter types resolve unqualified routine names
+/// on a pooled session of their own. Acquiring it "for the current scope"
+/// means the CONNECTION's scope, which belongs to no tab in particular — so a
+/// tab sitting on another schema/database was told about the wrong routine, or
+/// about none at all. Both must acquire for the requesting tab's scope, the
+/// same one the call itself would run in.
+#[test]
+fn tab_metadata_lookups_acquire_their_session_for_the_requesting_tabs_scope() {
+    for (path, function, end_marker) in [
+        (
+            "src/ui/sql_editor/intellisense/popup.rs",
+            "fn spawn_signature_fetch(",
+            "fn schedule_signature_retry(",
+        ),
+        (
+            "src/ui/sql_editor/execution.rs",
+            "fn load_routine_arguments_for_bind_prompt(",
+            "fn bind_anchor_candidate_tables(",
+        ),
+    ] {
+        let content = read_source(path);
+        let start = content
+            .find(function)
+            .unwrap_or_else(|| panic!("{function} should exist in {path}"));
+        let end = content[start..]
+            .find(end_marker)
+            .map(|offset| start + offset)
+            .unwrap_or_else(|| panic!("{end_marker} should follow {function} in {path}"));
+        let body = &content[start..end];
+        assert!(
+            body.contains("self.connection_binding.snapshot().scope"),
+            "{function} must take the requesting tab's scope"
+        );
+        assert!(
+            body.contains("acquire_session_for_scope(tab_scope.as_deref()"),
+            "{function} must acquire its session for that scope"
+        );
+        assert!(
+            !body.contains("acquire_session_for_current_scope("),
+            "{function} must not fall back to the connection's scope"
+        );
+    }
+}
+
+/// A UI timer closure may never block on the app state.
+///
+/// Modal dialogs run a nested `app::wait()` loop that dispatches these
+/// timers, and callers open modals while holding the `AppState` guard — so a
+/// timer that blocks on it parks the UI thread on a lock only that same
+/// thread can release, behind a dialog the user cannot dismiss. A poisoned
+/// guard must not be treated as "busy" either, or the retry never ends.
+/// `MainWindow::schedule_with_app_state` decides all of that in one place.
+#[test]
+fn ui_timer_closures_never_block_on_the_app_state() {
+    let main_window = read_source("src/ui/main_window.rs");
+    assert!(
+        main_window.contains("fn schedule_with_app_state<F>(")
+            && main_window.contains("Err(std::sync::TryLockError::Poisoned(poisoned)) => {")
+            && main_window.contains("Err(std::sync::TryLockError::WouldBlock) => {"),
+        "the one helper that takes the app state from a timer must handle \
+         WouldBlock and Poisoned differently"
+    );
+
+    const PATTERN: &str = "ui_timeout::schedule(";
+    let mut offenders = Vec::new();
+    let mut search_from = 0usize;
+    while let Some(offset) = main_window[search_from..].find(PATTERN) {
+        let start = search_from + offset;
+        search_from = start + PATTERN.len();
+        // The closure body, bounded by its own braces rather than by a byte
+        // count, so a short closure cannot be judged by the code after it.
+        let Some(body_start) = main_window[start..].find("move ||").map(|at| start + at) else {
+            continue;
+        };
+        let Some(open_brace) = main_window[body_start..]
+            .find('{')
+            .map(|at| body_start + at)
+        else {
+            continue;
+        };
+        let mut depth = 0usize;
+        let mut body_end = open_brace;
+        for (index, character) in main_window[open_brace..].char_indices() {
+            match character {
+                '{' => depth += 1,
+                '}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        body_end = open_brace + index;
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        let body = &main_window[open_brace..body_end];
+        let blocks_on_state = body.contains("poisoned.into_inner()")
+            && !body.contains("try_lock()")
+            && !body.contains("schedule_with_app_state");
+        if blocks_on_state {
+            offenders.push(main_window[..start].matches('\n').count() + 1);
+        }
+    }
+    assert!(
+        offenders.is_empty(),
+        "UI timer closures must take the app state through \
+         `MainWindow::schedule_with_app_state` (or `try_lock` with the same \
+         three-way handling), never a blocking lock. Offending \
+         `ui_timeout::schedule` call sites at lines: {offenders:?}"
+    );
 }
