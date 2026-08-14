@@ -388,7 +388,17 @@ pub type SqlExecuteCallback = Arc<Mutex<Option<Box<dyn FnMut(SqlAction)>>>>;
 type StatusCallback = Arc<Mutex<Option<Box<dyn FnMut(&str)>>>>;
 type ScopeChangeCallback = Arc<Mutex<Option<Box<dyn FnMut()>>>>;
 type ScopeSwitchPreflightCallback = Arc<Mutex<Option<Box<dyn FnMut() -> Result<(), String>>>>>;
-type ConnectionSqlExecuteCallback = Arc<Mutex<Option<Box<dyn FnMut(ConnectionId, SqlAction)>>>>;
+/// The tab whose card raised an action, when the card belongs to one.
+///
+/// An object-browser action can be delivered LONG after the click (the import
+/// dialog reads a file and loads the target's columns on a worker first), and
+/// the user may have switched tabs meanwhile. Resolving the target tab from
+/// "whichever is active on delivery" put one tab's INSERTs inside another
+/// tab's open transaction, so the raising tab travels with the action.
+/// `None` is a connection-preview card, which owns no tab and keeps the
+/// connection-level routing.
+type ConnectionSqlExecuteCallback =
+    Arc<Mutex<Option<Box<dyn FnMut(Option<QueryTabId>, ConnectionId, SqlAction)>>>>;
 type ConnectionScopeChangeCallback = Arc<Mutex<Option<Box<dyn FnMut(ConnectionId)>>>>;
 type ConnectionScopeSwitchPreflightCallback =
     Arc<Mutex<Option<Box<dyn FnMut(ConnectionId) -> Result<(), String>>>>>;
@@ -10031,13 +10041,20 @@ impl MultiObjectBrowserWidget {
         browser: &mut ObjectBrowserWidget,
     ) {
         let sql_callback = self.sql_callback.clone();
+        // Captured now, not read at delivery: this card's tab is the one the
+        // user acted from, whatever tab is active by the time an async action
+        // (Import Data...) comes back.
+        let owner_tab_id = match owner {
+            BrowserOwner::Tab(tab_id) => Some(tab_id),
+            BrowserOwner::ConnectionPreview(_) => None,
+        };
         browser.set_sql_callback(move |action| {
             if let Some(callback) = sql_callback
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .as_mut()
             {
-                callback(connection_id, action);
+                callback(owner_tab_id, connection_id, action);
             }
         });
 
@@ -11125,7 +11142,7 @@ impl MultiObjectBrowserWidget {
 
     pub fn set_sql_callback<F>(&mut self, callback: F)
     where
-        F: FnMut(ConnectionId, SqlAction) + 'static,
+        F: FnMut(Option<QueryTabId>, ConnectionId, SqlAction) + 'static,
     {
         *self
             .sql_callback

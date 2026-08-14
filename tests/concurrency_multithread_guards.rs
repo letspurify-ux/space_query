@@ -1724,13 +1724,20 @@ fn regression_07_oracle_transaction_mode_change_does_not_silently_clear_preserve
     let preservation_check = oracle_backend
         .find("retained_state.requires_physical_session_preservation()")
         .expect("Oracle retained transaction-mode apply should check preserved session state");
+    // The clear is generation-checked: the toolbar reads the generation
+    // lock-free and applies later, so an unvalidated clear could close the
+    // fresh session the tab was already handed on a NEW generation.
     let clear_call = oracle_backend
-        .find("pooled_db_session.clear()")
+        .find("pooled_db_session.clear_if_generation_matches(connection_generation)")
         .expect("Oracle retained transaction-mode apply may clear only after the guard");
 
     assert!(
         preservation_check < clear_call,
         "Oracle transaction mode changes must block preserved retained sessions before clear()"
+    );
+    assert!(
+        !oracle_backend.contains("pooled_db_session.clear();"),
+        "the retained clear must validate the connection generation"
     );
     // The control gating routes through the DB-specific retained-session
     // policy. It lives on the tab that owns the state; the toolbar delegates.
@@ -2498,18 +2505,44 @@ fn object_browser_scope_change_updates_same_connection_metadata_scope() {
 }
 
 #[test]
-fn object_browser_actions_are_routed_to_the_source_connection_tab() {
+fn object_browser_actions_are_routed_to_the_tab_that_raised_them() {
+    // An object-browser action can be delivered long after the click — the
+    // import dialog reads the file and loads the target's columns on a worker
+    // first — so resolving the target tab from "whichever is active now" put
+    // one tab's INSERTs inside another tab's open transaction, under its
+    // auto-commit and its Read only pin. The raising tab travels WITH the
+    // action; a connection-preview card owns no tab and keeps the
+    // connection-level routing.
     let main_window = read_source("src/ui/main_window.rs");
     let callback_start = main_window
-        .find("object_browser.set_sql_callback(move |connection_id, action|")
-        .expect("connection-aware object action callback should exist");
+        .find("object_browser.set_sql_callback(move |source_tab_id_hint, connection_id, action|")
+        .expect("the object action callback should receive the raising tab");
     let callback_end = main_window[callback_start..]
         .find("object_browser.set_scope_change_callback")
         .map(|offset| callback_start + offset)
         .expect("scope callback should follow the object action callback");
     let callback = &main_window[callback_start..callback_end];
-    assert!(callback.contains("select_or_create_query_editor_tab_for_connection("));
-    assert!(callback.contains("connection_id"));
+    assert!(
+        callback.contains("select_or_create_query_editor_tab_for_object_action("),
+        "the handler must resolve the target tab from the raising card"
+    );
+    assert!(
+        !callback.contains("select_or_create_query_editor_tab_for_connection("),
+        "connection-only routing is what delivered the action to the wrong tab"
+    );
+
+    // The resolver prefers the raising tab, and only while that tab still runs
+    // on the connection the action was built against.
+    let resolver = main_window
+        .find("fn select_or_create_query_editor_tab_for_object_action(")
+        .expect("the object-action tab resolver should exist");
+    let resolver_body = &main_window[resolver..resolver + 1400];
+    assert!(
+        resolver_body.contains("source_tab_id_hint")
+            && resolver_body
+                .contains("connection_binding.snapshot().connection_id() == Some(connection_id)"),
+        "the resolver must verify the raising tab is still bound to the same connection"
+    );
 
     let object_browser = read_source("src/ui/object_browser.rs");
     let wire_start = object_browser
@@ -2520,7 +2553,12 @@ fn object_browser_actions_are_routed_to_the_source_connection_tab() {
         .map(|offset| wire_start + offset)
         .expect("runtime registration should follow callback wiring");
     let wiring = &object_browser[wire_start..wire_end];
-    assert!(wiring.contains("callback(connection_id, action)"));
+    assert!(
+        wiring.contains("BrowserOwner::Tab(tab_id) => Some(tab_id)")
+            && wiring.contains("BrowserOwner::ConnectionPreview(_) => None"),
+        "the card's owner must be captured at wiring time, not read at delivery"
+    );
+    assert!(wiring.contains("callback(owner_tab_id, connection_id, action)"));
     assert!(!wiring.contains("Object action blocked"));
 }
 
@@ -3269,8 +3307,13 @@ fn transaction_mode_state_has_a_single_source_of_truth() {
     );
     // The OCI batch runs inside the shared execution worker rather than a
     // function of its own, so anchor on the re-apply itself.
+    // "Possibly ended", not "known clean": a FAILED implicit-commit statement
+    // may or may not have ended the transaction the mode was applied to, and
+    // re-stating defensively is safe (a still-open transaction refuses SET
+    // TRANSACTION and stops the batch) while skipping it would run a statement
+    // outside the tab's pinned mode.
     let oci_reapply = execution
-        .find("cleanup.oracle_pooled_session_transaction_known_clean()")
+        .find("cleanup.oracle_pooled_session_transaction_possibly_ended()")
         .expect("the OCI batch must re-apply the transaction mode at the next transaction");
     let oci_reapply_window = &execution[oci_reapply.saturating_sub(400)..oci_reapply + 900];
     assert!(
@@ -4582,5 +4625,370 @@ fn an_in_script_connect_forgets_the_previous_connections_scope() {
         execution.matches("fn clear_batch_scope(").count(),
         1,
         "the batch scope cell must keep a single named clearing writer"
+    );
+}
+
+#[test]
+fn pool_resize_gates_on_running_work_before_prompting_session_resolution() {
+    // Settings > Connection pool size: the retained-session prompt performs a
+    // real COMMIT/ROLLBACK, so it must come AFTER the running-work refusal —
+    // otherwise a user commits a transaction for a resize that is then
+    // refused. File/Disconnect and application exit already order it this way.
+    let content = read_source("src/ui/main_window.rs");
+    let gate = content
+        .find("Finish or cancel running queries and lazy fetches before changing connection pool size.")
+        .expect("the pool-resize running-work refusal should exist");
+    let prompt = content
+        .find("Self::resolve_pooled_sessions_before_pool_resize(state)")
+        .expect("the pool-resize session-resolution prompt should exist");
+    assert!(
+        gate < prompt,
+        "the pool-resize handler must refuse running work BEFORE prompting to \
+         commit/rollback retained sessions; the inverted order commits user \
+         transactions for a resize that is then aborted"
+    );
+}
+
+#[test]
+fn a_failed_implicit_commit_statement_defers_dirtiness_to_the_server_probe() {
+    // A statement whose SUCCESS would implicitly commit (DDL) proves nothing
+    // when it FAILS: parse errors commit nothing, execution errors follow
+    // Oracle/MySQL's commit-before-DDL. Every backend must leave the answer
+    // to the live server probe instead of assuming the commit happened.
+
+    // OCI: the failed path defers, it does not clear.
+    let execution = read_source("src/ui/sql_editor/execution.rs");
+    let failed_fn = execution
+        .find("fn apply_failed_oracle_db_statement_effects(")
+        .expect("the OCI failed-statement effects fn should exist");
+    let failed_body = &execution[failed_fn..failed_fn + 500];
+    assert!(
+        failed_body.contains("defer_oracle_pooled_session_dirtiness_to_probe()"),
+        "a failed OCI implicit-commit statement must defer to the batch-end probe"
+    );
+    assert!(
+        !failed_body.contains("clear_oracle_pooled_session_maybe_dirty()"),
+        "a failed OCI implicit-commit statement must not claim the session clean: \
+         that also erased DecisionRequired, which no probe can restore"
+    );
+
+    // Thin: the failed-statement fold passes a REAL probe answer for
+    // implicit-commit failures instead of the constant `false`.
+    let thin_probe = execution
+        .find("let server_reports_uncommitted_work = statement_effects")
+        .expect("the thin failed-statement path should compute a probe answer");
+    let thin_window = &execution[thin_probe..thin_probe + 700];
+    assert!(
+        thin_window.contains("oracle_thin_session_may_have_uncommitted_work")
+            && thin_window.contains("has_implicit_commit()"),
+        "the thin failed-statement fold must consult the wire transaction flag \
+         for implicit-commit failures"
+    );
+
+    // MySQL/MariaDB batch: the probe gate consults the RAW prior state for a
+    // failed implicit commit — the batch-adjusted state is exactly the clear
+    // that could not be confirmed.
+    let transaction = read_source("src/db/transaction.rs");
+    let gate = transaction
+        .find("fn server_transaction_probe_reports_uncommitted_work_after_batch(")
+        .expect("the MySQL batch probe gate should exist");
+    let gate_body = &transaction[gate..gate + 1600];
+    let deferral_term = gate_body
+        .find("failed_implicit_commit_defers_to_probe")
+        .expect("the batch probe gate should have a failed-implicit-commit deferral term");
+    assert!(
+        gate_body[deferral_term..deferral_term + 200]
+            .contains("prior_state.may_have_uncommitted_work()"),
+        "the deferral term must use the RAW prior state (MaybeDirty included), \
+         not the batch-adjusted state the failed statement already cleared"
+    );
+
+    // ...and the interrupted path (which never reaches the probe) falls back
+    // to preserving the prior work possibility.
+    let interrupted = transaction
+        .find("fn retained_state_after_interrupted_batch(")
+        .expect("the interrupted-batch fold should exist");
+    let interrupted_body = &transaction[interrupted..interrupted + 2400];
+    assert!(
+        interrupted_body.contains("failed_implicit_commit_defers_to_probe"),
+        "an interrupted batch has no probe: a failed implicit commit must \
+         preserve the prior work possibility instead of trusting its clear"
+    );
+}
+
+#[test]
+fn oracle_thin_transaction_actions_run_under_the_tabs_query_timeout() {
+    // A retained thin session sits at NO call timeout (reset_before_reuse
+    // clears the socket timeout), so a commit/rollback issued without the
+    // tab's query timeout blocks unboundedly — on the tab-close prompt path
+    // that block lands on the FLTK UI thread. OCI wraps the same actions in
+    // run_oracle_action_with_timeout; thin must go through its twin.
+    let content = read_source("src/ui/sql_editor/mod.rs");
+    assert!(
+        content.contains("fn run_oracle_thin_action_with_timeout"),
+        "the thin timeout wrapper should exist"
+    );
+    let wrapper_calls = content
+        .matches("SqlEditorWidget::run_oracle_thin_action_with_timeout(")
+        .count();
+    assert!(
+        wrapper_calls >= 3,
+        "the close action and both toolbar commit/rollback arms must route \
+         through run_oracle_thin_action_with_timeout; found {wrapper_calls} call(s)"
+    );
+    assert!(
+        !content.contains("thin_conn.commit()") && !content.contains("thin_conn.rollback()"),
+        "no thin commit/rollback may bypass the timeout wrapper"
+    );
+}
+
+#[test]
+fn disconnect_all_asks_each_tab_the_same_question_a_single_disconnect_does() {
+    // File/Disconnect uses the ConnectionTransition preflight (which requires
+    // resolution for any session needing physical preservation) and disconnect
+    // wording. Disconnect All must not fall back to the Close policy: that
+    // tears a residue/lock-carrying clean session down with no prompt, and
+    // labels the buttons "Commit and Close" for a disconnect.
+    let content = read_source("src/ui/main_window.rs");
+    let handler = content
+        .find("\"File/Disconnect All\"")
+        .expect("the Disconnect All handler should exist");
+    let handler_body = &content[handler..handler + 4000];
+    assert!(
+        handler_body.contains(
+            "Self::resolve_pooled_sessions_before_runtime_disconnect(state, runtime.id())"
+        ),
+        "Disconnect All must resolve each connection's tabs with the disconnect preflight"
+    );
+    assert!(
+        !handler_body.contains("resolve_pooled_sessions_before_exit"),
+        "Disconnect All must not use the exit/Close preflight"
+    );
+
+    // And the exit-only preflight keeps a single caller: application exit.
+    assert_eq!(
+        content
+            .matches("Self::resolve_pooled_sessions_before_exit(&state)")
+            .count()
+            + content
+                .matches("Self::resolve_pooled_sessions_before_exit(state)")
+                .count(),
+        1,
+        "the Close-policy preflight belongs to application exit alone"
+    );
+}
+
+#[test]
+fn every_retained_session_mutation_validates_the_connection_generation() {
+    // A retained mutation reads the connection generation lock-free and
+    // applies later, so a connect/reconnect/pool resize can land in between.
+    // The contract the toolbar relies on ("stale identity is safe: retained
+    // mutation validates the generation against the lease") only holds if
+    // every mutation actually checks. The Oracle transaction-mode apply used a
+    // bare clear(), which closed whatever session the slot held — including a
+    // fresh one from the NEW generation.
+    let content = read_source("src/ui/sql_editor/mod.rs");
+    let oracle_mode = content
+        .find("impl TransactionActionBackend for OracleTransactionActionBackend")
+        .expect("the Oracle transaction-action backend should exist");
+    let oracle_body = &content[oracle_mode..];
+    let apply = oracle_body
+        .find("fn apply_transaction_mode_to_retained_session(")
+        .expect("the Oracle transaction-mode apply should exist");
+    let apply_body = &oracle_body[apply..apply + 1800];
+    assert!(
+        apply_body.contains("clear_if_generation_matches(connection_generation)"),
+        "the Oracle transaction-mode apply must validate the generation before \
+         discarding the tab's retained session"
+    );
+    assert!(
+        !apply_body.contains("pooled_db_session.clear();"),
+        "no retained mutation may clear the lease without a generation check"
+    );
+
+    // And the generation-checked clear keeps a single implementation.
+    let connection = read_source("src/db/connection.rs");
+    assert_eq!(
+        connection
+            .matches("pub fn clear_if_generation_matches(")
+            .count(),
+        1,
+        "the generation-checked clear must have a single definition"
+    );
+}
+
+#[test]
+fn a_busy_connection_mutex_is_never_read_as_a_dead_connection() {
+    // `try_lock_connection` returns None while a transition is in flight or
+    // another worker holds the connection, so a missing guard means "busy",
+    // not "not connected". The reconnect-failure handler used to read it as
+    // dead: a wrong-password reconnect racing an object-browser metadata load
+    // marked the runtime Failed and told the user the previous connection was
+    // gone while it was still serving queries.
+    let content = read_source("src/ui/main_window.rs");
+    let failure = content
+        .find("let mut connection_preserved = false;")
+        .expect("the connect/reconnect failure handler should exist");
+    let failure_body = &content[failure..failure + 8000];
+    assert!(
+        failure_body.contains("connection_is_known_dead"),
+        "the failure handler must distinguish a KNOWN-dead connection from a busy one"
+    );
+    assert!(
+        !failure_body.contains("is_some_and(|connection| {"),
+        "collapsing the busy answer into `false` is exactly the misclassification"
+    );
+    // ...and when the connection really is dead, the controls that gate DB
+    // work come down with it.
+    assert!(
+        failure_body.contains("s.has_live_connection = false;")
+            && failure_body.contains("s.refresh_connection_dependent_controls();"),
+        "a genuinely dead active connection must reset the connection-dependent UI"
+    );
+}
+
+#[test]
+fn both_oracle_drivers_record_transaction_mode_effects_per_applied_statement() {
+    // Recording only after the WHOLE list succeeded lost the effects of the
+    // statements that did reach the server: a cancel between
+    // `ALTER SESSION SET ISOLATION_LEVEL` and `SET TRANSACTION READ ONLY`
+    // leaves an open read-only transaction that the OCI probe
+    // (DBMS_TRANSACTION.LOCAL_TRANSACTION_ID) does not report, so the session
+    // filed clean and every later batch hit ORA-01453. The thin loop records
+    // per applied statement; OCI must too.
+    let content = read_source("src/ui/sql_editor/execution.rs");
+    let apply = content
+        .find("fn apply_oracle_transaction_mode_statements(")
+        .expect("the OCI transaction-mode apply should exist");
+    let apply_body = &content[apply..apply + 1400];
+    assert!(
+        apply_body.contains("cleanup: &mut QueryExecutionCleanupGuard"),
+        "the OCI apply must own the recording, not leave it to its callers"
+    );
+    let execute = apply_body
+        .find("conn.execute(&statement, &[])")
+        .expect("the OCI apply should execute each statement");
+    assert!(
+        apply_body[execute..].contains("Self::apply_oracle_db_statement_effects("),
+        "each applied statement's effects must be recorded inside the loop, \
+         right after the statement lands"
+    );
+
+    // Thin's twin keeps the same shape.
+    let thin = content
+        .find("fn apply_oracle_thin_transaction_mode_for_execution(")
+        .expect("the thin transaction-mode apply should exist");
+    let thin_body = &content[thin..thin + 1200];
+    let thin_execute = thin_body
+        .find("Self::execute_oracle_thin_statement(conn, &statement, false)?")
+        .expect("the thin apply should execute each statement");
+    assert!(
+        thin_body[thin_execute..].contains("Self::oracle_retained_state_after_statement_effects("),
+        "the thin apply must keep recording per applied statement"
+    );
+}
+
+#[test]
+fn pool_session_work_is_bound_to_the_connection_generation_not_the_epoch() {
+    // The pool-context epoch is bumped by ordinary operations that run while
+    // work is in flight — including ones the running batch itself causes
+    // (a `DROP DATABASE <current>` makes sync_mysql_pooled_session_info rewrite
+    // the connection's stored database, which bumps it). An activity bound to
+    // the epoch therefore reads stale to the status-tick sweep, which then
+    // cancels the very batch that moved it. The main connection already binds
+    // to the generation for exactly this reason; pool sessions must too.
+    let content = read_source("src/db/connection.rs");
+    let context = content
+        .find("impl DbPoolSessionContext {")
+        .expect("the pool-session context should exist");
+    let lifetime = content[context..]
+        .find("pub fn activity_lifetime(&self) -> DbActivityLifetime {")
+        .map(|offset| context + offset)
+        .expect("the pool-session context should expose an activity lifetime");
+    let lifetime_end = content[lifetime..]
+        .find("\n    }\n")
+        .map(|offset| lifetime + offset)
+        .expect("the activity-lifetime fn should end");
+    let lifetime_body: String = content[lifetime..lifetime_end]
+        .lines()
+        .filter(|line| !line.trim_start().starts_with("//"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        lifetime_body.contains("connection_generation_token")
+            && lifetime_body.contains("epoch: self.connection_generation"),
+        "pool-session work must be bound to the connection generation"
+    );
+    assert!(
+        !lifetime_body.contains("cache_epoch_token"),
+        "binding pool-session work to the pool-context epoch lets the stale \
+         sweep cancel a batch that bumped the epoch itself"
+    );
+
+    // Session VALIDITY still checks the epoch — the two questions stay separate.
+    assert!(
+        content.contains("fn cache_epoch_is_current(&self) -> bool {")
+            && content
+                .contains("self.cache_epoch_token.load(Ordering::Acquire) == self.cache_epoch"),
+        "the epoch must still decide whether a cached pool context is current"
+    );
+}
+
+#[test]
+fn an_abandoned_mysql_batch_does_not_finalize_a_newer_operations_session() {
+    // A force-cancelled batch is abandoned, not joined: the tab is marked idle
+    // and the user can start a new execution while the old worker unwinds.
+    // Its finalization must not take the lease out from under the NEW batch —
+    // generation and epoch cannot see the difference, because both run on the
+    // same connection.
+    let content = read_source("src/ui/sql_editor/execution.rs");
+    let finalize = content
+        .find("fn finalize_mysql_batch_pooled_session(")
+        .expect("the MySQL batch finalization should exist");
+    let finalize_body = &content[finalize..finalize + 3400];
+    assert!(
+        finalize_body.contains("current_operation_id: Option<&Arc<AtomicU64>>"),
+        "the batch finalization must receive the operation identity"
+    );
+    let take = finalize_body
+        .find("pooled_db_session.take_reusable_lease(")
+        .expect("the finalization should take the tab's lease");
+    let currency = finalize_body
+        .find("Self::operation_snapshot_is_current(current_operation_id, operation_id)")
+        .expect("the finalization must check operation currency");
+    assert!(
+        currency < take,
+        "operation currency must be checked BEFORE the lease is taken"
+    );
+}
+
+#[test]
+fn losing_a_work_carrying_session_is_reported_not_swallowed() {
+    // When the tab's retained session is found dead at the next acquisition,
+    // replacing it is right — but the recorded state resets to clean, so the
+    // toolbar simply stops offering the commit it offered a moment ago. Both
+    // replace-and-reset sites (MySQL family, Oracle OCI) must say so, with the
+    // one shared catalog text; a clean session dying stays silent.
+    let types = read_source("src/db/query/types.rs");
+    assert!(
+        types.contains("pub const RETAINED_SESSION_LOST_WITH_WORK: &str ="),
+        "the notice belongs in the shared result-message catalog"
+    );
+
+    let content = read_source("src/ui/sql_editor/execution.rs");
+    let helper = content
+        .find("fn report_retained_session_lost_with_work(")
+        .expect("the shared reporter should exist");
+    let helper_body = &content[helper..helper + 1200];
+    assert!(
+        helper_body.contains("if !prior_retained_state.may_have_uncommitted_work()"),
+        "the notice must fire only when there was work to lose"
+    );
+    assert_eq!(
+        content
+            .matches("Self::report_retained_session_lost_with_work(")
+            .count(),
+        2,
+        "both replace-and-reset sites (MySQL family and Oracle OCI) must report"
     );
 }

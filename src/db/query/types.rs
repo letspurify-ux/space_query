@@ -101,6 +101,14 @@ pub mod result_messages {
     pub const COMMIT_REQUIRED: &str = "Commit required";
     pub const ROWS_AFFECTED_FRAGMENT: &str = "row(s) affected";
 
+    /// The tab's retained session was found dead when its next statement went
+    /// to use it, and the app recorded work on it that commit/rollback would
+    /// have resolved. Replacing it silently let the user keep believing the
+    /// work was pending; the server ended it when the session died.
+    pub const RETAINED_SESSION_LOST_WITH_WORK: &str =
+        "The DB session holding this tab's uncommitted work was lost (the server closed it). \
+         That work is gone; this statement runs on a new session.";
+
     /// Feedback for session-scope switches: Oracle `ALTER SESSION SET
     /// CURRENT_SCHEMA` ("schema") and MySQL/MariaDB `USE` ("database").
     pub fn current_scope_changed_without_name(scope: &str) -> String {

@@ -194,7 +194,16 @@ impl ConnectionRuntime {
     pub fn refresh_state_from_connection(&self) -> ConnectionRuntimeState {
         let (info, state, connection_generation, pool_context_epoch) =
             runtime_metadata(&self.connection);
-        self.update_sanitized_info(info);
+        // A runtime's IDENTITY may only come from a live connection. After a
+        // disconnect (script DISCONNECT, a failed timeout restore) the
+        // underlying connection's info is reset to the db-type default —
+        // adopting that would relabel every bound tab to "Oracle connection N",
+        // drop the connection colour, and, worst, turn the connection's
+        // read-only flag off while it is offline. State, generation and epoch
+        // still refresh: they describe the connection, not who it is.
+        if matches!(state, ConnectionRuntimeState::Connected) {
+            self.update_sanitized_info(info);
+        }
         self.connection_generation
             .store(connection_generation, Ordering::Release);
         self.pool_context_epoch
@@ -897,6 +906,41 @@ mod tests {
 
         assert!(runtime.sanitized_info().password.is_empty());
         assert!(!format!("{runtime:?}").contains("top-secret"));
+    }
+
+    #[test]
+    fn refresh_from_a_disconnected_connection_keeps_the_runtimes_identity() {
+        // After a mid-batch disconnect (script DISCONNECT, failed timeout
+        // restore) the underlying connection's info is reset to the db-type
+        // default. Refreshing must propagate the Disconnected STATE without
+        // adopting that default as the runtime's identity: the tab labels,
+        // the connection colour and — critically — the read-only flag belong
+        // to the runtime until a successful connect replaces them.
+        let info = ConnectionInfo {
+            name: "prod".to_string(),
+            db_type: crate::db::DatabaseType::MySQL,
+            read_only: true,
+            ..ConnectionInfo::default()
+        };
+        let runtime = Arc::new(ConnectionRuntime::new(
+            next_connection_id(),
+            ConnectionOrigin::SavedProfile {
+                profile_name: "prod".to_string(),
+            },
+            connection(),
+            info,
+            ConnectionRuntimeState::Connected,
+            0,
+            0,
+        ));
+
+        let state = runtime.refresh_state_from_connection();
+
+        assert_eq!(state, ConnectionRuntimeState::Disconnected);
+        let kept = runtime.sanitized_info();
+        assert_eq!(kept.name, "prod");
+        assert_eq!(kept.db_type, crate::db::DatabaseType::MySQL);
+        assert!(kept.read_only, "read-only must survive a disconnect");
     }
 
     #[test]

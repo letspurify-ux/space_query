@@ -1686,6 +1686,7 @@ pub struct DbPoolSessionContext {
     pub default_transaction_isolation: TransactionIsolation,
     cache_epoch: u64,
     cache_epoch_token: Arc<AtomicU64>,
+    connection_generation_token: Arc<AtomicU64>,
 }
 
 impl DbPoolSessionContext {
@@ -1695,10 +1696,21 @@ impl DbPoolSessionContext {
 
     /// The lifetime an activity running on this context should be bound to, so
     /// the registry retires it once this connection's sessions are gone.
+    ///
+    /// Bound to the connection GENERATION, not to the pool-context epoch, for
+    /// the reason `connection_generation_token` states: the epoch is bumped by
+    /// ordinary operations that run while the work is in flight — including
+    /// ones the batch itself causes, such as a `DROP DATABASE <current>` that
+    /// makes `sync_mysql_pooled_session_info` rewrite the connection's stored
+    /// database. Binding to the epoch let the status-tick stale sweep cancel
+    /// the very batch that moved it. The generation moves only when the
+    /// connection is replaced or closed, which is the real "these sessions are
+    /// gone" signal; session VALIDITY still checks the epoch through
+    /// `ensure_current`.
     pub fn activity_lifetime(&self) -> DbActivityLifetime {
         DbActivityLifetime {
-            epoch_token: Arc::clone(&self.cache_epoch_token),
-            epoch: self.cache_epoch,
+            epoch_token: Arc::clone(&self.connection_generation_token),
+            epoch: self.connection_generation,
         }
     }
 
@@ -2571,6 +2583,35 @@ impl SharedDbSessionLease {
 
     pub fn clear(&self) -> bool {
         let lease_to_drop = { self.lock_inner().entry.take() };
+        if let Some(entry) = lease_to_drop {
+            entry.discard_physical("db::session_lease");
+            true
+        } else {
+            false
+        }
+    }
+
+    /// `clear`, but only when the slot still holds the generation the caller
+    /// resolved. A retained mutation reads the generation lock-free and applies
+    /// later, so a connect/reconnect/pool resize can land in between; without
+    /// this check the pending mutation closes the session the tab has ALREADY
+    /// been handed on the new generation.
+    ///
+    /// Returns `false` when the slot is empty or belongs to another
+    /// generation — the caller distinguishes the two.
+    pub fn clear_if_generation_matches(&self, connection_generation: u64) -> bool {
+        let lease_to_drop = {
+            let mut lease = self.lock_inner();
+            let matches = lease
+                .entry
+                .as_ref()
+                .is_some_and(|entry| entry.connection_generation == connection_generation);
+            if matches {
+                lease.entry.take()
+            } else {
+                None
+            }
+        };
         if let Some(entry) = lease_to_drop {
             entry.discard_physical("db::session_lease");
             true
@@ -5666,6 +5707,7 @@ impl DatabaseConnection {
             default_transaction_isolation: self.default_transaction_isolation,
             cache_epoch: self.current_pool_context_epoch(),
             cache_epoch_token: Arc::clone(&self.pool_context_epoch),
+            connection_generation_token: Arc::clone(&self.connection_generation_token),
         })
     }
 
@@ -10675,6 +10717,7 @@ mod tests {
             connection_info,
             cache_epoch,
             cache_epoch_token,
+            connection_generation_token: Arc::new(AtomicU64::new(1)),
         }
     }
 
@@ -10730,6 +10773,7 @@ mod tests {
             default_transaction_isolation: TransactionIsolation::RepeatableRead,
             cache_epoch: 0,
             cache_epoch_token: Arc::new(AtomicU64::new(0)),
+            connection_generation_token: Arc::new(AtomicU64::new(1)),
         };
         backend_for(DatabaseType::MySQL)
             .apply_current_scope_to_session(&context, &mut session)

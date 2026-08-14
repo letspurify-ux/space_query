@@ -1240,7 +1240,7 @@ pub(crate) struct MySqlBatchSessionEffects {
     may_have_uncommitted_work: bool,
     transaction_state_cleared: bool,
     requires_transaction_decision_after_success: bool,
-    preserve_decision_after_failed_implicit_commit: bool,
+    failed_implicit_commit_defers_to_probe: bool,
     server_transaction_probe_requires_preservation: bool,
     physical_session_released: bool,
     interrupted_statement_requires_physical_discard: bool,
@@ -1261,7 +1261,7 @@ impl Default for MySqlBatchSessionEffects {
             may_have_uncommitted_work: false,
             transaction_state_cleared: false,
             requires_transaction_decision_after_success: false,
-            preserve_decision_after_failed_implicit_commit: false,
+            failed_implicit_commit_defers_to_probe: false,
             server_transaction_probe_requires_preservation: false,
             physical_session_released: false,
             interrupted_statement_requires_physical_discard: false,
@@ -1400,7 +1400,7 @@ impl MySqlBatchSessionEffects {
     fn mark_transaction_dirty(&mut self) {
         self.may_have_uncommitted_work = true;
         self.transaction_state_cleared = false;
-        self.preserve_decision_after_failed_implicit_commit = false;
+        self.failed_implicit_commit_defers_to_probe = false;
         self.prior_transaction_effect = self
             .prior_transaction_effect
             .with_dirty_work_after_conditional_clear();
@@ -1410,7 +1410,7 @@ impl MySqlBatchSessionEffects {
         self.may_have_uncommitted_work = false;
         self.transaction_state_cleared = true;
         self.prior_transaction_effect = BatchPriorTransactionEffect::Clear;
-        self.preserve_decision_after_failed_implicit_commit = false;
+        self.failed_implicit_commit_defers_to_probe = false;
     }
 
     fn mark_prior_transaction_clean(&mut self) {
@@ -1611,7 +1611,7 @@ impl MySqlBatchSessionEffects {
         let state_hint = self.apply_statement_effects(sql, auto_commit, effects, false);
         if effects.has_implicit_commit() {
             self.mark_transaction_clean();
-            self.preserve_decision_after_failed_implicit_commit = true;
+            self.failed_implicit_commit_defers_to_probe = true;
             self.requires_transaction_decision_after_success = false;
             if effects
                 .session_residue
@@ -1718,8 +1718,13 @@ impl MySqlBatchSessionEffects {
                 || self.may_have_uncommitted_work_after_batch(prior_state)
                 || prior_transaction_state.requires_transaction_decision()
                 || self.requires_transaction_decision_after_success
-                || (self.preserve_decision_after_failed_implicit_commit
-                    && prior_transaction_state.requires_transaction_decision()))
+                // A failed implicit-commit statement left the outcome to this
+                // probe: the RAW prior state decides whether the reported open
+                // transaction can be the user's — the batch-adjusted state
+                // cannot, because the failed statement is exactly what marked
+                // it clean.
+                || (self.failed_implicit_commit_defers_to_probe
+                    && prior_state.may_have_uncommitted_work()))
     }
 
     pub(crate) fn retained_state_after_successful_batch(
@@ -1734,7 +1739,7 @@ impl MySqlBatchSessionEffects {
                 server_reports_uncommitted_work,
             );
         let decision_preserved_after_failed_implicit_commit = server_reports_uncommitted_work
-            && self.preserve_decision_after_failed_implicit_commit
+            && self.failed_implicit_commit_defers_to_probe
             && prior_state
                 .transaction_state()
                 .requires_transaction_decision();
@@ -1785,12 +1790,17 @@ impl MySqlBatchSessionEffects {
         _auto_commit: bool,
     ) -> Option<RetainedSessionState> {
         let prior_transaction_state = self.prior_transaction_state_after_batch(prior_state);
+        // An interrupted batch never reaches the final server probe, so a
+        // failed implicit-commit statement that deferred to it must fall back
+        // to preserving the prior work possibility instead of trusting the
+        // clear it could not confirm.
         let prior_may_have_uncommitted_work =
-            !self.prior_transaction_effect.clears_prior(prior_state)
+            (!self.prior_transaction_effect.clears_prior(prior_state)
+                || self.failed_implicit_commit_defers_to_probe)
                 && prior_state.may_have_uncommitted_work();
         let transaction_requires_decision = prior_transaction_state.requires_transaction_decision()
             || self.requires_transaction_decision_after_success
-            || (self.preserve_decision_after_failed_implicit_commit
+            || (self.failed_implicit_commit_defers_to_probe
                 && prior_state
                     .transaction_state()
                     .requires_transaction_decision())
@@ -1802,7 +1812,11 @@ impl MySqlBatchSessionEffects {
             } else if transaction_requires_decision {
                 TransactionSessionState::DecisionRequired
             } else if prior_may_have_uncommitted_work {
-                prior_transaction_state
+                // The RAW prior state: when the failed-implicit-commit deferral
+                // forced preservation, the batch-adjusted state is exactly the
+                // clear that could not be confirmed. Without the deferral the
+                // effect never cleared, so the two spellings agree.
+                prior_state.transaction_state()
             } else {
                 TransactionSessionState::Clean
             };
@@ -1935,6 +1949,12 @@ pub(crate) trait StatementSessionPostProcessor: Sync {
         if interruption_requires_transaction_decision {
             return true;
         }
+        // CONTRACT: `server_reports_uncommitted_work` is an authoritative live
+        // probe answer at every call site that passes `statement_failed` with
+        // implicit-commit effects. A failed DDL is resolved by that probe (the
+        // rescue term in `transaction_session_state_after_statement`), never
+        // assumed committed on its own — a statement rejected at parse time
+        // commits nothing.
         if effects.has_implicit_commit() {
             return false;
         }
@@ -3210,6 +3230,12 @@ fn mysql_replication_control_statement(analysis: &SqlStatementAnalysis<'_>) -> b
         || mysql_statement_starts_with_words(analysis, &["STOP", "SLAVE"])
         || mysql_statement_starts_with_words(analysis, &["RESET", "SLAVE"])
         || mysql_statement_starts_with_words(analysis, &["CHANGE", "MASTER"])
+        // Group Replication control, which shares the START/STOP verbs with
+        // START TRANSACTION. Without these the leading `START` alone made the
+        // statement look like a transaction opener and stuck the tab's session
+        // MaybeDirty over work it never did.
+        || mysql_statement_starts_with_words(analysis, &["START", "GROUP_REPLICATION"])
+        || mysql_statement_starts_with_words(analysis, &["STOP", "GROUP_REPLICATION"])
 }
 
 fn mysql_load_index_statement(analysis: &SqlStatementAnalysis<'_>) -> bool {
@@ -4217,7 +4243,11 @@ fn oracle_statement_has_implicit_commit_for_words(words: &[String]) -> bool {
         }
         Some("CREATE") | Some("ALTER") | Some("DROP") | Some("TRUNCATE") | Some("RENAME")
         | Some("GRANT") | Some("REVOKE") | Some("COMMENT") | Some("ANALYZE") | Some("AUDIT")
-        | Some("NOAUDIT") | Some("PURGE") | Some("FLASHBACK") => true,
+        | Some("NOAUDIT") | Some("PURGE") | Some("FLASHBACK")
+        // The rest of Oracle's DDL list, which shares no leading keyword with
+        // the statements above: each commits before and after itself, so a tab
+        // that ran one stayed falsely MaybeDirty for the rest of its life.
+        | Some("ASSOCIATE") | Some("DISASSOCIATE") | Some("ADMINISTER") => true,
         _ => false,
     }
 }
@@ -5095,25 +5125,46 @@ mod tests {
         let post_processor = statement_session_post_processor_for(DatabaseType::Oracle);
         let prior =
             RetainedSessionState::from_transaction_state(TransactionSessionState::DecisionRequired);
+        let effects =
+            post_processor.effects_for_sql("CREATE TABLE qt_implicit_commit_probe (id NUMBER)");
 
+        // With the probe reporting no open transaction, the implicit commit is
+        // trusted whether the statement succeeded or failed at execution time.
         for statement_failed in [false, true] {
             let retained = retained_session_state_after_statement(
                 post_processor,
                 prior,
-                post_processor.effects_for_sql("CREATE TABLE qt_implicit_commit_probe (id NUMBER)"),
+                effects,
                 false,
                 statement_failed,
                 false,
                 false,
             );
-
             assert_eq!(
                 retained.transaction_state(),
                 TransactionSessionState::Clean,
-                "Oracle implicit commit should clear prior transaction state even when statement_failed={statement_failed}"
+                "probe-clean resolves the implicit commit, statement_failed={statement_failed}"
             );
             assert!(!retained.requires_transaction_decision());
         }
+
+        // A FAILED implicit-commit statement with the probe still reporting an
+        // open transaction committed nothing (parse errors never commit) — the
+        // pending decision must survive.
+        let after_failure_probe_dirty = retained_session_state_after_statement(
+            post_processor,
+            prior,
+            effects,
+            true,
+            true,
+            false,
+            false,
+        );
+        assert_eq!(
+            after_failure_probe_dirty.transaction_state(),
+            TransactionSessionState::DecisionRequired,
+        );
+        assert!(after_failure_probe_dirty.requires_transaction_decision());
     }
 
     #[test]
@@ -9589,6 +9640,120 @@ mod tests {
             retained.transaction_state(),
             TransactionSessionState::DecisionRequired,
             "a failed implicit-commit statement must not weaken an already decision-required session when the final probe still reports an open transaction",
+        );
+    }
+
+    #[test]
+    fn oracle_keyword_only_ddl_statements_are_implicit_commits() {
+        // ASSOCIATE/DISASSOCIATE STATISTICS and ADMINISTER KEY MANAGEMENT are
+        // Oracle DDL: each commits before and after itself. Missing from the
+        // list, they were neither dirty nor clearing — so a tab that ran one
+        // stayed falsely MaybeDirty and refused later option changes.
+        let post_processor = statement_session_post_processor_for(DatabaseType::Oracle);
+        for sql in [
+            "ASSOCIATE STATISTICS WITH FUNCTIONS my_fn USING my_stats_pkg",
+            "DISASSOCIATE STATISTICS FROM FUNCTIONS my_fn",
+            "ADMINISTER KEY MANAGEMENT SET KEYSTORE OPEN IDENTIFIED BY \"pw\"",
+        ] {
+            let effects = post_processor.effects_for_sql(sql);
+            assert!(
+                effects.has_implicit_commit(),
+                "{sql} should implicitly commit"
+            );
+
+            let retained = retained_session_state_after_statement(
+                post_processor,
+                RetainedSessionState::from_transaction_state(TransactionSessionState::MaybeDirty),
+                effects,
+                false,
+                false,
+                false,
+                false,
+            );
+            assert_eq!(
+                retained.transaction_state(),
+                TransactionSessionState::Clean,
+                "{sql} should resolve the tab's prior transaction state"
+            );
+        }
+    }
+
+    #[test]
+    fn mysql_group_replication_control_opens_no_transaction() {
+        // START/STOP GROUP_REPLICATION share their verb with START
+        // TRANSACTION; without the carve-out the leading START alone marked
+        // the tab's session dirty over work it never did.
+        for db_type in [DatabaseType::MySQL, DatabaseType::MariaDB] {
+            let post_processor = statement_session_post_processor_for(db_type);
+            for sql in ["START GROUP_REPLICATION", "STOP GROUP_REPLICATION"] {
+                let effects = post_processor.effects_for_sql(sql);
+                assert!(
+                    !effects.starts_transaction_state(),
+                    "{sql} on {db_type} should not start a transaction"
+                );
+                assert!(
+                    !effects.may_leave_uncommitted_work(),
+                    "{sql} on {db_type} should leave no uncommitted work"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn failed_mysql_batch_implicit_commit_preserves_prior_maybe_dirty_when_probe_still_dirty() {
+        // A parse-rejected DDL commits nothing on the server. The retained
+        // session entered this batch MaybeDirty (an INSERT from an earlier
+        // execution); the batch-end probe truthfully reports the still-open
+        // transaction, and that answer must win over the failed statement's
+        // implicit-commit classification — otherwise the session files as
+        // Clean and the user's work is dropped without a prompt.
+        let post_processor = statement_session_post_processor_for(DatabaseType::MySQL);
+        let mut batch_effects = MySqlBatchSessionEffects::default();
+        batch_effects.apply_failed_statement_effects(
+            "CREATE TABLE  (id INT)",
+            false,
+            post_processor.effects_for_sql("CREATE TABLE  (id INT)"),
+        );
+        let prior =
+            RetainedSessionState::from_transaction_state(TransactionSessionState::MaybeDirty);
+
+        let probe_dirty = batch_effects.retained_state_after_successful_batch(prior, true);
+        assert_eq!(
+            probe_dirty.transaction_state(),
+            TransactionSessionState::MaybeDirty,
+            "the probe's open-transaction answer must survive a failed implicit-commit statement",
+        );
+
+        // When the probe reports clean, the implicit commit really happened
+        // (or there was nothing) — trusting it keeps the execution-stage
+        // failure case free of false-dirty prompts.
+        let probe_clean = batch_effects.retained_state_after_successful_batch(prior, false);
+        assert_eq!(
+            probe_clean.transaction_state(),
+            TransactionSessionState::Clean
+        );
+    }
+
+    #[test]
+    fn interrupted_mysql_batch_after_failed_implicit_commit_preserves_prior_maybe_dirty() {
+        // An interrupted batch never reaches the final probe, so the deferral
+        // must fall back to preserving the prior work possibility.
+        let post_processor = statement_session_post_processor_for(DatabaseType::MySQL);
+        let mut batch_effects = MySqlBatchSessionEffects::default();
+        batch_effects.apply_failed_statement_effects(
+            "CREATE TABLE  (id INT)",
+            false,
+            post_processor.effects_for_sql("CREATE TABLE  (id INT)"),
+        );
+        let prior =
+            RetainedSessionState::from_transaction_state(TransactionSessionState::MaybeDirty);
+
+        let retained = batch_effects
+            .retained_state_after_interrupted_batch(prior, true, false)
+            .expect("interrupted batch must yield a retained state");
+        assert!(
+            retained.transaction_state().may_have_uncommitted_work(),
+            "without a probe, a failed implicit-commit statement must not lower prior dirty state",
         );
     }
 

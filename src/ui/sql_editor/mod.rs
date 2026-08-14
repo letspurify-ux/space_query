@@ -1306,10 +1306,18 @@ impl TransactionActionBackend for OracleTransactionActionBackend {
                 }
                 let result = match resolution_action {
                     RetainedSessionResolutionAction::Commit => {
-                        thin_conn.commit().map_err(|err| err.to_string())
+                        SqlEditorWidget::run_oracle_thin_action_with_timeout(
+                            &mut thin_conn,
+                            query_timeout,
+                            |session| session.commit().map_err(|err| err.to_string()),
+                        )
                     }
                     RetainedSessionResolutionAction::Rollback => {
-                        thin_conn.rollback().map_err(|err| err.to_string())
+                        SqlEditorWidget::run_oracle_thin_action_with_timeout(
+                            &mut thin_conn,
+                            query_timeout,
+                            |session| session.rollback().map_err(|err| err.to_string()),
+                        )
                     }
                     RetainedSessionResolutionAction::DiscardPhysical => {
                         thin_conn.mark_broken();
@@ -1541,7 +1549,11 @@ impl TransactionActionBackend for OracleTransactionActionBackend {
                 }
             }
             DbSessionLease::OracleThin(mut conn) => {
-                let result = action.apply_oracle_thin(&mut conn);
+                let result = SqlEditorWidget::run_oracle_thin_action_with_timeout(
+                    &mut conn,
+                    query_timeout,
+                    |session| action.apply_oracle_thin(session),
+                );
                 match result {
                     Ok(()) => {
                         if crate::db::retained_session_transaction_resolution_should_discard_after_success(
@@ -1583,7 +1595,7 @@ impl TransactionActionBackend for OracleTransactionActionBackend {
         &self,
         _connection: &SharedConnection,
         pooled_db_session: &SharedDbSessionLease,
-        _connection_generation: u64,
+        connection_generation: u64,
         _pool_context_epoch: u64,
         _mode: TransactionMode,
         _db_activity: &str,
@@ -1597,8 +1609,21 @@ impl TransactionActionBackend for OracleTransactionActionBackend {
                 ));
             }
         }
-        pooled_db_session.clear();
-        RetainedSessionMutationOutcome::Applied
+        // Oracle applies the mode to the NEXT transaction, so dropping the
+        // clean retained session is how the change takes effect. The
+        // generation is validated because the toolbar reads it lock-free and
+        // applies later: without the check a connect/reconnect/pool resize
+        // landing in between would close the fresh session the tab was already
+        // handed on the new generation.
+        if pooled_db_session.clear_if_generation_matches(connection_generation) {
+            RetainedSessionMutationOutcome::Applied
+        } else if pooled_db_session.snapshot().is_some() {
+            RetainedSessionMutationOutcome::DiscardedBecauseStale
+        } else {
+            // Nothing retained: the tab's next acquisition prepares a session
+            // at the new mode anyway.
+            RetainedSessionMutationOutcome::Applied
+        }
     }
 }
 
@@ -4894,6 +4919,38 @@ impl SqlEditorWidget {
 
     fn emit_status(&self, message: &str) {
         Self::invoke_status_callback(&self.status_callback, message);
+    }
+
+    /// The thin twin of [`Self::run_oracle_action_with_timeout`]: apply the
+    /// tab's query timeout around a single call on a retained thin session,
+    /// then restore whatever was set before. A retained thin session sits at
+    /// NO call timeout (`reset_before_reuse` clears the socket timeout), so a
+    /// commit/rollback issued without this blocks unboundedly — on the
+    /// tab-close path that block lands on the FLTK UI thread.
+    fn run_oracle_thin_action_with_timeout<T, F>(
+        conn: &mut tns_thin::OracleThinSession,
+        query_timeout: Option<Duration>,
+        action: F,
+    ) -> Result<T, String>
+    where
+        F: FnOnce(&mut tns_thin::OracleThinSession) -> Result<T, String>,
+    {
+        let previous_timeout = conn
+            .call_timeout()
+            .map_err(|err| format!("Failed to read Oracle thin call timeout: {err}"))?;
+        conn.set_call_timeout(query_timeout)
+            .map_err(|err| format!("Failed to apply Oracle thin call timeout: {err}"))?;
+        let result = action(conn);
+        let reset_result = conn
+            .set_call_timeout(previous_timeout)
+            .map_err(|err| format!("Failed to reset Oracle thin call timeout: {err}"));
+        match result {
+            Ok(value) => reset_result.map(|_| value),
+            Err(message) => match reset_result {
+                Ok(()) => Err(message),
+                Err(reset_message) => Err(format!("{message}; {reset_message}")),
+            },
+        }
     }
 
     fn run_oracle_action_with_timeout<T, F>(

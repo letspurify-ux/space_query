@@ -459,6 +459,9 @@ fn classify_first_word_for_db_type(db_type: DatabaseType, first_word: &str, sql:
         "CREATE" | "DROP" | "TRUNCATE" | "RENAME" | "COMMENT" | "GRANT" | "REVOKE" => SqlKind::Ddl,
         "ALTER" => classify_alter_sql_for_db_type(db_type, sql, mysql_compatible_comments),
         "ANALYZE" | "AUDIT" | "NOAUDIT" | "PURGE" | "FLASHBACK" if oracle_family => SqlKind::Ddl,
+        // Oracle DDL whose leading keyword appears nowhere else:
+        // ASSOCIATE/DISASSOCIATE STATISTICS and ADMINISTER KEY MANAGEMENT.
+        "ASSOCIATE" | "DISASSOCIATE" | "ADMINISTER" if oracle_family => SqlKind::Ddl,
         "FLUSH" if mysql_family => SqlKind::Ddl,
         "CACHE" | "INSTALL" | "UNINSTALL" if mysql_family => SqlKind::Ddl,
         "LOCK" if oracle_family => classify_oracle_lock_sql(sql),
@@ -1266,12 +1269,16 @@ fn mysql_replication_words(words: &[String]) -> bool {
     matches!(
         words.first().map(String::as_str),
         Some("START" | "STOP" | "RESET")
-    ) && matches!(words.get(1).map(String::as_str), Some("REPLICA" | "SLAVE"))
-        || words.first().is_some_and(|word| word == "CHANGE")
-            && matches!(
-                words.get(1).map(String::as_str),
-                Some("REPLICATION" | "MASTER")
-            )
+    ) && matches!(
+        words.get(1).map(String::as_str),
+        // GROUP_REPLICATION shares the START/STOP verbs with START
+        // TRANSACTION but starts no transaction of the user's.
+        Some("REPLICA" | "SLAVE" | "GROUP_REPLICATION")
+    ) || words.first().is_some_and(|word| word == "CHANGE")
+        && matches!(
+            words.get(1).map(String::as_str),
+            Some("REPLICATION" | "MASTER")
+        )
 }
 
 fn classify_release_sql(sql: &str, mysql_compatible_comments: bool) -> SqlKind {

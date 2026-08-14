@@ -1260,10 +1260,14 @@ fn apply_retained_scope_update(update: RetainedScopeUpdate) -> Vec<RetainedSessi
     // UI scope changes must pair the primary connection switch with this
     // retained-session update so pooled editors cannot keep running against
     // the previous database/schema.
-    // Preserved sessions are rejected by retained_scope_change_blocker()
-    // before this runs; if an apply failure still happens, the editor helper
-    // restores only reusable preserved state and otherwise discards the stale
-    // physical session so a retained tab is not silently left on the old scope.
+    // A work-carrying session is NOT rejected before this runs: scope is
+    // applied in place (`USE` / `ALTER SESSION SET CURRENT_SCHEMA`), which an
+    // open transaction survives, so the resolution decision belongs to tab
+    // close. The only preflight is `retained_scope_change_blocker_for_connection`,
+    // which refuses while a query or lazy fetch is in flight. When an apply
+    // fails, the editor helper restores a preserved session whose error allows
+    // reuse and otherwise discards the stale physical session, so a retained
+    // tab is never silently left on the old scope.
     let (db_type, connection_generation, pool_context_epoch, advanced, selected_scope, editors) =
         update;
     let mut retained_outcomes = Vec::new();
@@ -8397,6 +8401,40 @@ impl MainWindow {
         )
     }
 
+    /// Where an object-browser action runs.
+    ///
+    /// A card that belongs to a TAB delivers to that tab, not to whichever tab
+    /// happens to be active when the action arrives: `Import Data...` reads the
+    /// file and loads the target's columns on a worker first, so the user can
+    /// switch tabs in between — and the INSERTs would then join the OTHER tab's
+    /// open transaction, be attributed to its auto-commit and Read only pin,
+    /// and be rolled back by its ROLLBACK. A connection-preview card owns no
+    /// tab and keeps the connection-level routing.
+    fn select_or_create_query_editor_tab_for_object_action(
+        state: &mut AppState,
+        source_tab_id_hint: Option<QueryTabId>,
+        connection_id: ConnectionId,
+    ) -> Option<(QueryTabId, bool)> {
+        if let Some(tab_id) = source_tab_id_hint {
+            // Only while the tab still exists AND still runs on the connection
+            // the action was built against; a rebound or closed tab falls back
+            // to the connection's own routing.
+            let tab_still_bound = state.editor_tabs.iter().any(|tab| {
+                tab.tab_id == tab_id
+                    && tab.connection_binding.snapshot().connection_id() == Some(connection_id)
+            });
+            if tab_still_bound {
+                if state.active_editor_tab_id == tab_id {
+                    return Some((tab_id, false));
+                }
+                return state
+                    .set_active_editor_tab(tab_id)
+                    .then_some((tab_id, false));
+            }
+        }
+        Self::select_or_create_query_editor_tab_for_connection(state, connection_id)
+    }
+
     fn select_or_create_query_editor_tab_for_connection(
         state: &mut AppState,
         connection_id: ConnectionId,
@@ -12146,7 +12184,15 @@ impl MainWindow {
                         .set_status_message("No connected databases");
                     return true;
                 }
-                if !Self::resolve_pooled_sessions_before_exit(state) {
+                // Disconnecting many connections is still a DISCONNECT, so it
+                // asks each affected tab the same question File/Disconnect
+                // does. Using the Close policy here let a session that
+                // commit/rollback cannot resolve (residue, session locks) be
+                // torn down with no prompt at all, and offered "Commit and
+                // Close" wording for a disconnect.
+                if !runtimes.iter().all(|runtime| {
+                    Self::resolve_pooled_sessions_before_runtime_disconnect(state, runtime.id())
+                }) {
                     return true;
                 }
 
@@ -12829,9 +12875,32 @@ impl MainWindow {
                         return true;
                     }
 
-                    if !Self::resolve_pooled_sessions_before_pool_resize(state) {
-                        return true;
+                    // The pool rebuild can still be refused or fail below; the
+                    // user's OTHER preference edits must not be held hostage to
+                    // it. Persist everything except the pool size now — the new
+                    // size becomes config only when the rebuild succeeds.
+                    {
+                        let mut immediate_settings = settings.clone();
+                        immediate_settings.connection_pool_size =
+                            config_snapshot.normalized_connection_pool_size();
+                        let save_result = {
+                            let mut s = state
+                                .lock()
+                                .unwrap_or_else(|poisoned| poisoned.into_inner());
+                            MainWindow::persist_settings(&mut s, immediate_settings, false)
+                        };
+                        MainWindow::apply_configured_ui_scale(state);
+                        app::flush();
+                        if let Err(err) = save_result {
+                            crate::ui::alert_on_main(&format!("Failed to save settings: {}", err));
+                            return true;
+                        }
                     }
+
+                    // Gate on running work BEFORE prompting to resolve retained
+                    // sessions, matching File/Disconnect and application exit:
+                    // the prompt performs a real COMMIT/ROLLBACK, so it must
+                    // never run for a resize that is then refused.
                     let blocked = {
                         let s = state
                             .lock()
@@ -12842,6 +12911,9 @@ impl MainWindow {
                         crate::ui::alert_on_main(
                             "Finish or cancel running queries and lazy fetches before changing connection pool size.",
                         );
+                        return true;
+                    }
+                    if !Self::resolve_pooled_sessions_before_pool_resize(state) {
                         return true;
                     }
 
@@ -13529,7 +13601,7 @@ impl MainWindow {
         let weak_state_for_browser = Arc::downgrade(&state);
         let schema_sender_for_browser = schema_sender.clone();
         let file_sender_for_browser = file_sender.clone();
-        object_browser.set_sql_callback(move |connection_id, action| {
+        object_browser.set_sql_callback(move |source_tab_id_hint, connection_id, action| {
             let Some(state_for_browser) = weak_state_for_browser.upgrade() else {
                 return;
             };
@@ -13544,8 +13616,9 @@ impl MainWindow {
                     .lock()
                     .unwrap_or_else(|poisoned| poisoned.into_inner());
                 let Some((source_tab_id, source_tab_created)) =
-                    MainWindow::select_or_create_query_editor_tab_for_connection(
+                    MainWindow::select_or_create_query_editor_tab_for_object_action(
                         &mut s,
+                        source_tab_id_hint,
                         connection_id,
                     )
                 else {
@@ -14095,19 +14168,38 @@ impl MainWindow {
                                     let mut connection_preserved = false;
                                     if let Some(runtime) = s.connection_registry.get(connection_id)
                                     {
-                                        let connection_is_still_live = preserve_existing_connection
-                                            && crate::db::try_lock_connection(
-                                                &runtime.connection(),
-                                            )
-                                            .is_some_and(|connection| {
-                                                connection.is_connected()
-                                                    && connection.has_connection_handle()
-                                            });
-                                        connection_preserved = connection_is_still_live;
-                                        runtime.set_state(if connection_is_still_live {
-                                            ConnectionRuntimeState::Connected
+                                        // `try_lock_connection` also fails while
+                                        // a transition is in flight or another
+                                        // worker holds the connection, so a
+                                        // missing guard means "busy", not "not
+                                        // connected" — the same rule File/Connect
+                                        // states. Declaring the connection Failed
+                                        // on a busy answer relabels every bound
+                                        // tab "(failed)" and tells the user the
+                                        // previous connection is gone while it is
+                                        // still serving queries.
+                                        let connection_liveness = if preserve_existing_connection {
+                                            crate::db::try_lock_connection(&runtime.connection())
+                                                .map(|connection| {
+                                                    connection.is_connected()
+                                                        && connection.has_connection_handle()
+                                                })
                                         } else {
+                                            // A plain connect attempt has no
+                                            // previous connection to preserve.
+                                            Some(false)
+                                        };
+                                        let connection_is_known_dead =
+                                            connection_liveness == Some(false);
+                                        // Live and busy answer the same way:
+                                        // the connection was NOT declared dead,
+                                        // so the runtime state and the message
+                                        // the user reads stay in step.
+                                        connection_preserved = !connection_is_known_dead;
+                                        runtime.set_state(if connection_is_known_dead {
                                             ConnectionRuntimeState::Failed(err.clone())
+                                        } else {
+                                            ConnectionRuntimeState::Connected
                                         });
                                         s.object_browser.add_runtime(runtime);
                                     }
@@ -14174,6 +14266,19 @@ impl MainWindow {
                                                 format!("Connection failed: {}", err)
                                             }],
                                         );
+                                        // The active tab's connection really is
+                                        // gone: bring the controls that gate DB
+                                        // work down with it, or Commit/Rollback
+                                        // and File/Disconnect stay enabled and
+                                        // the status bar keeps painting the
+                                        // connected dot for a dead connection.
+                                        s.has_live_connection = false;
+                                        *s.connection_info
+                                            .lock()
+                                            .unwrap_or_else(|poisoned| poisoned.into_inner()) =
+                                            None;
+                                        s.refresh_connection_dependent_controls();
+                                        s.sync_transaction_mode_controls();
                                     }
                                     s.result_tabs.select_messages_errors();
                                 }

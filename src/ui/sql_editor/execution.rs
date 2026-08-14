@@ -1416,6 +1416,11 @@ struct QueryExecutionCleanupGuard {
     oracle_pooled_session_transaction_decision_required: bool,
     oracle_pooled_session_forced_maybe_dirty: bool,
     oracle_pooled_session_known_transaction_clean: bool,
+    /// A FAILED implicit-commit statement (DDL) left it to the batch-end
+    /// server probe whether the prior transaction is still open: Oracle
+    /// commits before *executing* DDL, but a statement rejected at parse time
+    /// commits nothing, so neither "clean" nor "dirty" can be claimed here.
+    oracle_pooled_session_transaction_deferred_to_probe: bool,
     oracle_pooled_session_state_delta: RetainedSessionState,
     oracle_pooled_session_state_delta_recorded: bool,
     oracle_interrupted_statement_sql_kind: Option<crate::db::session_policy::SqlKind>,
@@ -1600,6 +1605,7 @@ impl QueryExecutionCleanupGuard {
             oracle_pooled_session_transaction_decision_required: false,
             oracle_pooled_session_forced_maybe_dirty: false,
             oracle_pooled_session_known_transaction_clean: false,
+            oracle_pooled_session_transaction_deferred_to_probe: false,
             oracle_pooled_session_state_delta: RetainedSessionState::default(),
             oracle_pooled_session_state_delta_recorded: false,
             oracle_interrupted_statement_sql_kind: None,
@@ -1785,6 +1791,9 @@ impl QueryExecutionCleanupGuard {
     fn mark_oracle_pooled_session_maybe_dirty(&mut self) {
         self.oracle_pooled_session_forced_maybe_dirty = true;
         self.oracle_pooled_session_known_transaction_clean = false;
+        // New dirty work supersedes a failed-DDL deferral: the probe would
+        // report this statement's own transaction anyway.
+        self.oracle_pooled_session_transaction_deferred_to_probe = false;
     }
 
     fn record_confirmed_oracle_pooled_session_statement_effects(
@@ -1830,13 +1839,17 @@ impl QueryExecutionCleanupGuard {
         }
     }
 
-    /// Whether the session is known to have been brought back to a clean
-    /// transaction by the statement that just ran (explicit COMMIT/ROLLBACK,
-    /// auto-commit, or a DDL's implicit commit). The Oracle batch uses it to
-    /// decide that the transaction its transaction mode was applied to has
-    /// ended, so the next statement needs the mode again.
-    fn oracle_pooled_session_transaction_known_clean(&self) -> bool {
+    /// Whether the transaction the batch's transaction mode was applied to
+    /// may have ended with the statement that just ran — an explicit
+    /// COMMIT/ROLLBACK, a successful auto-commit, a DDL's implicit commit, or
+    /// a FAILED DDL whose implicit commit cannot be ruled out. The Oracle
+    /// batch uses it to re-state a non-default mode before the next statement;
+    /// re-stating defensively is safe (a still-open transaction refuses
+    /// SET TRANSACTION and stops the batch), while skipping it could run a
+    /// statement outside the tab's pinned mode.
+    fn oracle_pooled_session_transaction_possibly_ended(&self) -> bool {
         self.oracle_pooled_session_known_transaction_clean
+            || self.oracle_pooled_session_transaction_deferred_to_probe
     }
 
     fn clear_oracle_pooled_session_maybe_dirty(&mut self) {
@@ -1851,6 +1864,7 @@ impl QueryExecutionCleanupGuard {
         self.oracle_pooled_session_transaction_decision_on_cancel = false;
         self.oracle_pooled_session_invalidated_on_cancel = false;
         self.oracle_pooled_session_known_transaction_clean = true;
+        self.oracle_pooled_session_transaction_deferred_to_probe = false;
         // The recorded state delta describes the transaction the commit just
         // ended, so its dirtiness must end with it. Leaving it MaybeDirty made
         // batch-end cleanup trust the delta over the (clean) server —
@@ -1863,6 +1877,35 @@ impl QueryExecutionCleanupGuard {
                 .oracle_pooled_session_state_delta
                 .with_transaction_state(TransactionSessionState::Clean);
         }
+    }
+
+    fn defer_oracle_pooled_session_dirtiness_to_probe(&mut self) {
+        // A FAILED implicit-commit statement (DDL) may or may not have
+        // committed the prior transaction: Oracle commits before *executing*
+        // DDL, but a statement rejected at parse time never commits. Drop this
+        // batch's own dirty claim and file the recorded delta as Clean so
+        // batch-end cleanup consults the server probe instead of trusting
+        // either answer. Deliberately NOT touched, unlike
+        // `clear_oracle_pooled_session_maybe_dirty`:
+        // - the decision-required flags — the probe can restore MaybeDirty but
+        //   never DecisionRequired, so lowering one here would erase a prompt
+        //   the user may still need;
+        // - `known_transaction_clean` — it suppresses the commit-or-rollback
+        //   prompt when the session must be invalidated, which is only correct
+        //   when the clean state is a fact, not a possibility.
+        self.oracle_pooled_session_forced_maybe_dirty = false;
+        self.oracle_pooled_session_transaction_deferred_to_probe = true;
+        let base = if self.oracle_pooled_session_state_delta_recorded {
+            self.oracle_pooled_session_state_delta
+        } else {
+            self.oracle_pooled_session
+                .as_ref()
+                .map(|(_, _, _, _, prior_retained_state)| *prior_retained_state)
+                .unwrap_or_default()
+        };
+        self.oracle_pooled_session_state_delta =
+            base.with_transaction_state(TransactionSessionState::Clean);
+        self.oracle_pooled_session_state_delta_recorded = true;
     }
 
     fn clear_oracle_successful_statement_cancel_protection(&mut self) {
@@ -1932,6 +1975,7 @@ impl QueryExecutionCleanupGuard {
         self.oracle_pooled_session_transaction_decision_required = false;
         self.oracle_pooled_session_forced_maybe_dirty = false;
         self.oracle_pooled_session_known_transaction_clean = false;
+        self.oracle_pooled_session_transaction_deferred_to_probe = false;
         self.oracle_pooled_session_state_delta = RetainedSessionState::default();
         self.oracle_pooled_session_state_delta_recorded = false;
         self.oracle_interrupted_statement_sql_kind = None;
@@ -2149,6 +2193,12 @@ impl QueryExecutionCleanupGuard {
         interrupted: bool,
         interrupt_decision: Option<crate::db::session_policy::SessionDecision>,
     ) -> bool {
+        if self.oracle_pooled_session_transaction_deferred_to_probe {
+            // A failed implicit-commit statement explicitly left the answer to
+            // this probe; skipping it would turn the deferral into a silent
+            // "clean".
+            return true;
+        }
         if !interrupted {
             return true;
         }
@@ -3638,6 +3688,11 @@ impl SqlEditorWidget {
                         pool_context_epoch,
                         DbSessionLease::Oracle(conn),
                         crate::db::RetainedSessionDisposition::DiscardPhysical,
+                        "oracle pool session",
+                    );
+                    Self::report_retained_session_lost_with_work(
+                        Some(sender),
+                        prior_retained_state,
                         "oracle pool session",
                     );
                 }
@@ -9142,6 +9197,8 @@ impl SqlEditorWidget {
             script_mode,
             auto_commit,
             db_activity,
+            current_operation_id,
+            operation_id,
         );
     }
 
@@ -10443,6 +10500,7 @@ impl SqlEditorWidget {
                     }
                     if should_apply_oracle_transaction_mode {
                         if let Err(err) = SqlEditorWidget::apply_oracle_transaction_mode_statements(
+                            &mut cleanup,
                             conn.as_ref(),
                             transaction_mode_application,
                         ) {
@@ -10456,10 +10514,6 @@ impl SqlEditorWidget {
                             );
                             return;
                         }
-                        Self::record_applied_oracle_transaction_mode_effects(
-                            &mut cleanup,
-                            transaction_mode_application,
-                        );
                     }
                     if !requires_transaction_first_statement {
                         if let Err(err) =
@@ -12619,7 +12673,7 @@ impl SqlEditorWidget {
                             // in its transaction itself (ORA-01453). The thin
                             // loop does the same, keyed off its retained state.
                             if !active_transaction_mode.is_default()
-                                && cleanup.oracle_pooled_session_transaction_known_clean()
+                                && cleanup.oracle_pooled_session_transaction_possibly_ended()
                                 && !SqlEditorWidget::is_transaction_first_statement(&sql_text)
                             {
                                 let reapplication = OracleTransactionModeApplication {
@@ -12631,6 +12685,7 @@ impl SqlEditorWidget {
                                 };
                                 if let Err(err) =
                                     SqlEditorWidget::apply_oracle_transaction_mode_statements(
+                                        &mut cleanup,
                                         conn.as_ref(),
                                         reapplication,
                                     )
@@ -12653,10 +12708,6 @@ impl SqlEditorWidget {
                                     // what the toolbar shows.
                                     break;
                                 }
-                                SqlEditorWidget::record_applied_oracle_transaction_mode_effects(
-                                    &mut cleanup,
-                                    reapplication,
-                                );
                             }
 
                             if let Some(message) =
@@ -19396,12 +19447,26 @@ impl SqlEditorWidget {
                             interrupted_sql_kind = Some(statement_sql_kind);
                             interrupted_state_hint = Some(statement_effects.state_hint);
                         }
+                        // A FAILED implicit-commit statement (DDL) is resolved
+                        // by the server, not assumed committed: a parse error
+                        // commits nothing, an execution error follows Oracle's
+                        // commit-before-DDL. The thin driver tracks the
+                        // transaction-in-progress flag from the wire, so this
+                        // probe costs no round trip. Non-implicit failures keep
+                        // the constant `false`, where the folder never treats
+                        // it as a clearing authority.
+                        let server_reports_uncommitted_work = statement_effects
+                            .has_implicit_commit()
+                            && crate::db::DatabaseConnection::oracle_thin_session_may_have_uncommitted_work(
+                                conn,
+                                "oracle thin batch",
+                            );
                         retained_state = Self::oracle_retained_state_after_statement_effects(
                             retained_state,
                             statement_effects,
                             auto_commit,
                             true,
-                            false,
+                            server_reports_uncommitted_work,
                             (load_mutex_bool(cancel_flag) || statement_timed_out)
                                 && statement_effects
                                     .requires_transaction_decision_after_interrupt(auto_commit),
@@ -21904,8 +21969,7 @@ impl SqlEditorWidget {
         statement_effects: crate::db::StatementSessionEffects,
     ) {
         if statement_effects.has_implicit_commit() {
-            cleanup.record_confirmed_oracle_pooled_session_statement_effects(statement_effects);
-            cleanup.clear_oracle_pooled_session_maybe_dirty();
+            cleanup.defer_oracle_pooled_session_dirtiness_to_probe();
         }
     }
 
@@ -21986,13 +22050,33 @@ impl SqlEditorWidget {
     /// Applies the tab's transaction mode to an OCI session: the session-level
     /// isolation reset (when the tab asks for the connection default) followed
     /// by the mode statements themselves.
+    /// Apply the tab's transaction mode to an OCI session AND record each
+    /// statement's session effects as it lands, in one step.
+    ///
+    /// Recording only after the whole list succeeded lost the effects of the
+    /// statements that DID reach the server when a later one failed or was
+    /// cancelled: `SET TRANSACTION READ ONLY` opens a read-only transaction
+    /// that `DBMS_TRANSACTION.LOCAL_TRANSACTION_ID` does not report, so the
+    /// session filed as clean and the next batch's re-application hit
+    /// ORA-01453 for the rest of the tab's life. The thin loop has always
+    /// recorded per applied statement; this is the same shape.
     fn apply_oracle_transaction_mode_statements(
+        cleanup: &mut QueryExecutionCleanupGuard,
         conn: &Connection,
         application: OracleTransactionModeApplication,
     ) -> Result<(), String> {
-        for (statement, _) in application.statements()? {
+        let post_processor =
+            crate::db::statement_session_post_processor_for(crate::db::DatabaseType::Oracle);
+        for (statement, restores_session_default) in application.statements()? {
             conn.execute(&statement, &[])
                 .map_err(|err| format!("Failed to apply transaction mode: {err}"))?;
+            if restores_session_default {
+                continue;
+            }
+            Self::apply_oracle_db_statement_effects(
+                cleanup,
+                post_processor.effects_for_sql(&statement),
+            );
         }
         Ok(())
     }
@@ -22169,7 +22253,26 @@ impl SqlEditorWidget {
         script_mode: bool,
         auto_commit: bool,
         db_activity: &str,
+        current_operation_id: Option<&Arc<AtomicU64>>,
+        operation_id: u64,
     ) {
+        // A force-cancelled batch is ABANDONED, not joined: the tab is marked
+        // idle and the user can start a new execution while this worker is
+        // still unwinding. Finalizing then would take the lease out from under
+        // the NEW batch and file it with the dead one's disposition — up to
+        // discarding the session the new batch is running on. The per-statement
+        // path already refuses on this exact check; the batch's own ending must
+        // too. Generation and epoch cannot see it: the new execution runs on
+        // the same connection.
+        if current_operation_id.is_some_and(|current_operation_id| {
+            !Self::operation_snapshot_is_current(current_operation_id, operation_id)
+        }) {
+            crate::utils::logging::log_warning(
+                db_activity,
+                "Skipped MySQL batch retained-session finalization: the tab has moved on to a newer operation",
+            );
+            return;
+        }
         let (
             connection_generation,
             pool_context_epoch,
@@ -22783,6 +22886,36 @@ impl SqlEditorWidget {
             && prior_retained_state.requires_physical_session_preservation()
     }
 
+    /// Tell the user when the retained session the app recorded work on was
+    /// found dead and replaced with a fresh one.
+    ///
+    /// The replacement itself is right — the tab must keep working — but the
+    /// recorded state resets to clean, so without this the toolbar simply
+    /// stops offering the commit it was offering a moment ago and the user is
+    /// left believing the work is still pending. Every backend reports the
+    /// same text (`result_messages`), and only when there was work to lose:
+    /// a clean session dying is not the user's business.
+    fn report_retained_session_lost_with_work(
+        sender: Option<&QueryProgressSender>,
+        prior_retained_state: RetainedSessionState,
+        log_context: &str,
+    ) {
+        if !prior_retained_state.may_have_uncommitted_work() {
+            return;
+        }
+        crate::utils::logging::log_warning(
+            log_context,
+            result_messages::RETAINED_SESSION_LOST_WITH_WORK,
+        );
+        if let Some(sender) = sender {
+            let _ = sender.send(QueryProgress::Message {
+                kind: ResultMessageKind::Error,
+                lines: vec![result_messages::RETAINED_SESSION_LOST_WITH_WORK.to_string()],
+            });
+            app::awake();
+        }
+    }
+
     fn acquire_mysql_pooled_session(
         shared_connection: &crate::db::SharedConnection,
         pooled_db_session: &SharedDbSessionLease,
@@ -22875,6 +23008,11 @@ impl SqlEditorWidget {
                             if require_existing_session {
                                 return Err("No reusable DB session for this tab.".to_string());
                             }
+                            Self::report_retained_session_lost_with_work(
+                                session_pool_sender,
+                                prior_retained_state,
+                                db_activity,
+                            );
                             let (conn, cancel_registration) =
                                 Self::acquire_fresh_mysql_pool_session(
                                     &context,
@@ -26293,7 +26431,7 @@ mod query_execution_cleanup_tests {
     }
 
     #[test]
-    fn oracle_failed_implicit_commit_effect_clears_prior_dirty_state() {
+    fn oracle_failed_implicit_commit_defers_dirtiness_to_probe_and_keeps_decision() {
         let (sender, _receiver) = progress_channel();
         let mut cleanup = new_test_cleanup_guard(
             sender,
@@ -26313,19 +26451,25 @@ mod query_execution_cleanup_tests {
         assert!(effects.has_implicit_commit());
         SqlEditorWidget::apply_failed_oracle_db_statement_effects(&mut cleanup, effects);
 
+        // The batch's own dirty claim yields to the server probe...
         assert!(!cleanup.oracle_pooled_session_forced_maybe_dirty);
-        assert!(!cleanup.oracle_pooled_session_transaction_decision_required);
-        assert!(!cleanup.oracle_pooled_session_transaction_decision_on_cancel);
+        assert!(cleanup.oracle_pooled_session_transaction_deferred_to_probe);
         assert_eq!(
             cleanup
                 .oracle_pooled_session_state_delta
                 .transaction_state(),
             TransactionSessionState::Clean,
         );
+        // ...but a pending decision survives (the probe cannot restore it),
+        // and the clean state is a possibility, not a fact.
+        assert!(cleanup.oracle_pooled_session_transaction_decision_required);
+        assert!(cleanup.oracle_pooled_session_transaction_decision_on_cancel);
+        assert!(!cleanup.oracle_pooled_session_known_transaction_clean);
+        assert!(cleanup.oracle_pooled_session_transaction_possibly_ended());
     }
 
     #[test]
-    fn oracle_failed_implicit_commit_effect_wins_over_lock_wait_dirty_mark() {
+    fn oracle_failed_implicit_commit_keeps_lock_wait_decision_while_deferring_dirtiness() {
         let (sender, _receiver) = progress_channel();
         let mut cleanup = new_test_cleanup_guard(
             sender,
@@ -26353,9 +26497,14 @@ mod query_execution_cleanup_tests {
         assert!(effects.has_implicit_commit());
         SqlEditorWidget::apply_failed_oracle_db_statement_effects(&mut cleanup, effects);
 
+        // Dirtiness is the probe's to answer; the decision the lock wait
+        // demanded is not — a failed DDL cannot prove the user's transaction
+        // was resolved.
         assert!(!cleanup.oracle_pooled_session_forced_maybe_dirty);
-        assert!(!cleanup.oracle_pooled_session_transaction_decision_required);
-        assert!(!cleanup.oracle_pooled_session_transaction_decision_on_cancel);
+        assert!(cleanup.oracle_pooled_session_transaction_deferred_to_probe);
+        assert!(cleanup.oracle_pooled_session_transaction_decision_required);
+        assert!(cleanup.oracle_pooled_session_transaction_decision_on_cancel);
+        assert!(!cleanup.oracle_pooled_session_known_transaction_clean);
         assert_eq!(
             cleanup
                 .oracle_pooled_session_state_delta
