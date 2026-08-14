@@ -101,10 +101,64 @@ dropdown) hit exactly that. `sync_default_transaction_isolation()` therefore
 resolves the level (configured, else read from the server, else the backend
 fallback) and records it on the pool in one step
 (`DbConnectionPool::set_session_default_transaction_isolation`), so `Default`
-can never reach session preparation. Live checks S47 (configured level) and
-S51 (`Default`) in `verify_transaction_mode_live` pin this on both drivers with
-a pool of exactly one session, and assert the tab really received the same
-physical session (same `SID`) so they cannot pass by never meeting the hazard.
+can never reach session preparation.
+
+It has to be stated on EVERY pool the connection ever holds, not only the one
+built at connect. A pool carries a copy of `ConnectionAdvancedSettings`, so any
+pool arrives holding the raw level — and the connection builds a second one
+whenever Settings > Connection pool size changes. Installing a pool and stating
+the resolved level on it is therefore a single step,
+`DatabaseConnection::install_pool()`, and it is the only place a pool is
+assigned; when the two were separate, a pool-size change silently returned that
+connection to preparing sessions with no isolation statement for the rest of
+its life.
+
+A connection-pool size change has TWO implementations: the method
+`DatabaseConnection::resize_current_connection_pool_with_policy` and the free
+`resize_shared_connection_pool_with_policy`, which is the one the UI drives (it
+builds the replacement outside the connection mutex and carries the
+connection-transition bookkeeping). Routing only the method through
+`install_pool` left the hole open on exactly the path the fix was written for,
+and the guard missed it because it pinned the receiver name (`self.pool`) rather
+than the operation — the free function holds a guard and writes
+`connection_guard.pool`. Both now install through `install_pool`, the guard
+counts `.pool.replace(` whatever the receiver is called, and the live check
+`oracle_{oci,thin}_rebuilt_connection_pool_states_the_default_isolation` drives
+the free function directly. Live checks S47 (configured level), S51 (`Default`) and S52
+(`Default`, after a pool rebuild) in `verify_transaction_mode_live` pin this on
+both drivers with a pool of exactly one session, and assert the tab really
+received the same physical session (same `SID`) so they cannot pass by never
+meeting the hazard.
+
+`DBMS_OUTPUT` is the third piece of session state on this axis, and it does not
+come from an `ALTER SESSION` at all — the app sets it, from the tab's
+`SessionState`, so the residue classifier never sees it. A tab's SERVEROUTPUT
+setting and the physical session's `DBMS_OUTPUT.ENABLE` therefore part company
+whenever the tab's session is replaced: a fresh pool session after the retained
+one was discarded (an Oracle transaction-mode change discards it), or one
+recycled from a tab that left it enabled. Both drivers state it at the start of
+every batch — OCI through `sync_serveroutput_with_session`, Thin through
+`sync_oracle_thin_serveroutput_with_session` — and both state DISABLE as well as
+ENABLE, so it is total in the same sense the isolation is. Thin used to state
+nothing, so `SET SERVEROUTPUT ON` silently stopped producing output there while
+it kept working on OCI. Neither injects it in front of the user's own
+transaction-first statement (it is PL/SQL: ORA-01453). Guard
+`both_oracle_drivers_state_serveroutput_on_the_session_they_run_on`; live check
+`oracle_thin_serveroutput_reaches_the_session_this_batch_runs_on`.
+
+`DBMS_METADATA` is the fourth, and the app used to leave it behind: generating
+an object's DDL set `SEGMENT_ATTRIBUTES`/`STORAGE`/`TABLESPACE`/`SQLTERMINATOR`
+on `DBMS_METADATA.SESSION_TRANSFORM` — which is what `GET_DDL` obeys — on the
+POOLED session the object browser was handed, and never put them back. A query
+tab that later picked that session up got the app's preference applied to its
+own `DBMS_METADATA.GET_DDL`. The params now ride on a metadata HANDLE
+(`DBMS_METADATA.OPEN` + `ADD_TRANSFORM`, wrapped in a `WITH FUNCTION` so the
+statement keeps the shape both drivers already speak: three text binds in, one
+text column out, ORA-31603 for a missing object). Nothing touches the session,
+so there is nothing to state away. `verify_ddl_transform_live` checks both
+halves on OCI and Thin 314/315/318/319: the generated DDL has no storage
+clauses, and a plain `GET_DDL` on the SAME session right afterwards still has
+them.
 
 Isolation and `CURRENT_SCHEMA` are the only two `ALTER SESSION SET` targets
 that need this. They are also the only two the residue classifier treats as

@@ -28,7 +28,9 @@
 // Run one Oracle container at a time.
 
 use fltk::{app, input::IntInput};
-use space_query::db::{ConnectionInfo, DatabaseConnection, DatabaseType, OracleDriverMode};
+use space_query::db::{
+    ConnectionInfo, DatabaseConnection, DatabaseType, DbConnection, OracleDriverMode,
+};
 use space_query::ui::explain_plan::{plan_grid, ExplainPlanData, PlanNode};
 use space_query::ui::intellisense::IntellisenseData;
 use space_query::ui::object_browser::{ObjectBrowserWidget, ObjectCache, SqlAction};
@@ -414,6 +416,45 @@ fn check_connector_depth(nodes: &[PlanNode], rows: &[Vec<String>]) -> Result<(),
     Ok(())
 }
 
+/// How many transactions the connection's SHARED LIVE session is carrying,
+/// read on that very session.
+///
+/// `EXPLAIN PLAN FOR` writes into `PLAN_TABLE` on this session, which no query
+/// tab owns: the tab's auto-commit governs its own pooled session and the
+/// Commit/Rollback buttons act on the tab's retained session by design, so
+/// nothing else in the app would ever resolve that write. Reading system views
+/// starts no transaction of its own, so this probe cannot create what it looks
+/// for.
+fn live_session_open_transactions(shared: &Arc<Mutex<DatabaseConnection>>) -> Result<u32, String> {
+    const SQL: &str = "SELECT TO_CHAR(COUNT(*)) FROM v$transaction t, v$session s \
+                       WHERE s.sid = SYS_CONTEXT('USERENV', 'SID') AND t.ses_addr = s.saddr";
+    let db_conn = {
+        let guard = shared.lock().unwrap_or_else(|p| p.into_inner());
+        guard
+            .get_db_connection()
+            .ok_or_else(|| "no live connection to probe".to_string())?
+    };
+    let text = match db_conn {
+        DbConnection::Oracle(conn) => conn
+            .query_row_as::<String>(SQL, &[])
+            .map_err(|err| format!("live transaction probe (oci): {err}"))?,
+        DbConnection::OracleThin(session) => {
+            let mut session = session
+                .lock()
+                .map_err(|_| "Oracle Thin connection lock was poisoned".to_string())?;
+            DatabaseConnection::oracle_thin_select_one_text_for_test(&mut session, SQL)
+                .map_err(|err| format!("live transaction probe (thin): {err}"))?
+                .unwrap_or_default()
+        }
+        DbConnection::MySQL { .. } => {
+            return Err("live transaction probe is Oracle-only".to_string())
+        }
+    };
+    text.trim()
+        .parse::<u32>()
+        .map_err(|err| format!("live transaction probe returned {text:?}: {err}"))
+}
+
 fn verify(target: Target) -> Result<(), String> {
     println!("\n########## {} ##########", target.label());
     let info = target.connection_info();
@@ -513,6 +554,20 @@ fn verify(target: Target) -> Result<(), String> {
         {
             return Err("Oracle plan carried no cost share".to_string());
         }
+        // The plan came from an INSERT into PLAN_TABLE on the shared live
+        // session. Nothing in the app would ever commit or roll that back —
+        // auto-commit belongs to the tab's own pooled session and the
+        // Commit/Rollback buttons deliberately act on the tab's retained
+        // session — so the statement that wrote has to take it back before it
+        // returns, or every F6 adds rows and locks to one transaction that
+        // stays open for the life of the connection.
+        let open_transactions = live_session_open_transactions(&shared)?;
+        if open_transactions != 0 {
+            return Err(format!(
+                "the explain left {open_transactions} open transaction(s) on the shared live session"
+            ));
+        }
+        println!("  OK  the explain left no open transaction on the shared live session");
     } else {
         for expected in ["id", "select_type", "table"] {
             if !column_names
@@ -578,6 +633,48 @@ fn verify(target: Target) -> Result<(), String> {
     let (_, sample_rows) = plan_grid(&ExplainPlanData::Tree(sample.clone()));
     check_connector_depth(&sample, &sample_rows)?;
     println!("connector depth matches the parent chain");
+
+    // ---- the tab's Read only pin governs F6 too --------------------------
+    // `EXPLAIN PLAN FOR` inserts into PLAN_TABLE, so on Oracle a tab pinned
+    // Read only must be refused exactly as Ctrl+Enter would refuse a write —
+    // the pin cannot mean one thing for one button and another for the next.
+    // On the MySQL family `EXPLAIN` is a read, so the same pin must NOT block
+    // it: over-blocking would be its own bug.
+    h.editor
+        .set_tab_transaction_mode(space_query::db::TransactionMode::new(
+            space_query::db::TransactionIsolation::Default,
+            space_query::db::TransactionAccessMode::ReadOnly,
+        ));
+    let pinned = h.explain(&target.explain_target_sql());
+    h.editor.clear_tab_transaction_mode_override();
+    if target.is_oracle() {
+        match pinned {
+            Ok(_) => {
+                return Err(
+                    "a Read only tab explained anyway: EXPLAIN PLAN writes to PLAN_TABLE"
+                        .to_string(),
+                )
+            }
+            Err(message) if message.to_lowercase().contains("read-only mode blocks") => {
+                println!("  OK  a Read only tab refuses F6 with the same message as a write");
+            }
+            Err(message) => {
+                return Err(format!(
+                    "a Read only tab refused F6, but not with the read-only message: {message}"
+                ))
+            }
+        }
+        // ... and the identical explain runs once the pin is gone, which is
+        // what proves the refusal was the pin's doing.
+        h.explain(&target.explain_target_sql())
+            .map_err(|e| format!("explain after unpinning: {e}"))?;
+        println!("  OK  the same explain runs once the pin is gone");
+    } else {
+        pinned.map_err(|e| {
+            format!("a Read only pin blocked a MySQL-family EXPLAIN, which is a read: {e}")
+        })?;
+        println!("  OK  a Read only tab still explains (EXPLAIN is a read here)");
+    }
 
     // ---- item 10: object search + go to declaration -----------------------
     // Scoped: the browser holds a pooled metadata session, and the teardown

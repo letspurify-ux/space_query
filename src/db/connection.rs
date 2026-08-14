@@ -4635,7 +4635,7 @@ impl DatabaseConnection {
         // This preserves the active session when users mistype credentials
         // during reconnect attempts.
         self.connection = Some(db_conn);
-        self.pool = Some(pool);
+        let _ = self.install_pool(pool);
         let db_type = info.db_type;
         let new_session_password = info.password.clone();
         ConnectionInfo::clear_secret(&mut self.session_password);
@@ -4693,6 +4693,10 @@ impl DatabaseConnection {
             &mut self.connection_pool_size,
             &mut prepared.connection_pool_size,
         );
+        // The pool and the resolved level arrived together from the prepared
+        // connection, so they already agree — stated again here so no future
+        // change to this swap can separate them.
+        self.state_pool_default_transaction_isolation();
 
         self.bump_connection_generation();
         self.bump_pool_context_epoch();
@@ -5727,7 +5731,7 @@ impl DatabaseConnection {
         let pool = run_connection_attempt(policy, description, move || {
             Self::build_pool_for_info(&info, size, policy)
         })?;
-        let retired_pool = self.pool.replace(pool);
+        let retired_pool = self.install_pool(pool);
         self.connection_pool_size = size;
         self.bump_connection_generation();
         self.bump_pool_context_epoch();
@@ -5794,6 +5798,39 @@ impl DatabaseConnection {
         // two: the pool prepares every session it hands out, and a session it
         // recycles between tabs carries the previous tab's level until this
         // one is stated on it.
+        self.state_pool_default_transaction_isolation();
+    }
+
+    /// Install a pool on this connection, stating the level its sessions run
+    /// at, and hand back the one it replaced.
+    ///
+    /// The pool and the connection's RESOLVED default isolation are one unit.
+    /// A pool is built from `ConnectionAdvancedSettings`, where the level may
+    /// be `TransactionIsolation::Default` — which has no `sql_level()`, so
+    /// preparing a session with it emits no isolation statement at all, i.e.
+    /// "leave this session wherever the last tab left it". A pooled session is
+    /// recycled between query tabs, so that is how one tab's
+    /// `ALTER SESSION SET ISOLATION_LEVEL` reaches a tab that pinned nothing.
+    ///
+    /// Installing and stating are therefore one step. Splitting them left the
+    /// level stated at connect only, and a pool REBUILT by a connection-pool
+    /// size change re-opened the hole for the rest of that connection's life.
+    ///
+    /// A connection-pool size change has TWO implementations — the method
+    /// [`Self::resize_current_connection_pool_with_policy`] and the free
+    /// [`resize_shared_connection_pool_with_policy`], which is the one the UI
+    /// drives (it builds the replacement outside the connection mutex and
+    /// carries the connection-transition bookkeeping). Both install through
+    /// here; fixing only one of them is how the hole stayed open once already.
+    fn install_pool(&mut self, pool: DbConnectionPool) -> Option<DbConnectionPool> {
+        let retired = self.pool.replace(pool);
+        self.state_pool_default_transaction_isolation();
+        retired
+    }
+
+    /// Record the connection's resolved default isolation as the level this
+    /// connection's pool prepares its sessions with. See [`Self::install_pool`].
+    fn state_pool_default_transaction_isolation(&mut self) {
         let resolved = self.default_transaction_isolation;
         if let Some(pool) = self.pool.as_mut() {
             pool.set_session_default_transaction_isolation(resolved);
@@ -7966,7 +8003,7 @@ pub(crate) fn resize_shared_connection_pool_with_policy(
                 "Connection changed before the new connection pool could be installed".to_string(),
             );
         }
-        let retired_pool = connection_guard.pool.replace(pool);
+        let retired_pool = connection_guard.install_pool(pool);
         connection_guard.connection_pool_size = size;
         connection_guard.bump_connection_generation();
         connection_guard.bump_pool_context_epoch();
@@ -8634,6 +8671,131 @@ mod tests {
         let mut info = oracle_test_connection_info_from_env();
         info.advanced.oracle_driver_mode = OracleDriverMode::Thin;
         info
+    }
+
+    /// A pool REBUILT by a connection-pool size change still states the
+    /// connection's resolved default isolation on every session it hands out.
+    ///
+    /// Driven through `resize_shared_connection_pool_with_policy` — the free
+    /// function Settings > Connection pool size actually calls, and a second
+    /// implementation beside `DatabaseConnection::resize_current_connection_pool`.
+    /// Fixing only the method left this one installing a pool that still
+    /// carried `TransactionIsolation::Default`, which has no `sql_level()`, so
+    /// session preparation emitted no isolation statement at all and a
+    /// recycled session carried the previous tab's level into the next one.
+    ///
+    /// A pool of exactly one session makes the recycle deterministic, and the
+    /// SID assert keeps the check from passing by never meeting the hazard.
+    fn assert_rebuilt_connection_pool_states_the_default_isolation(mut info: ConnectionInfo) {
+        const ISOLATION_SQL: &str = "SELECT value FROM v$ses_optimizer_env \
+             WHERE sid = SYS_CONTEXT('USERENV', 'SID') \
+             AND name = 'transaction_isolation_level'";
+        const SID_SQL: &str = "SELECT TO_CHAR(SYS_CONTEXT('USERENV', 'SID')) FROM DUAL";
+        let _activity_test_guard = db_activity_test_lock();
+        // "Follow the server": the first entry of the advanced dropdown, and
+        // the one with no SQL spelling of its own.
+        info.advanced.default_transaction_isolation = TransactionIsolation::Default;
+        let policy = ConnectionAttemptPolicy::from_seconds(30);
+        let shared = create_shared_connection();
+        // Connect at a different size, or the resize returns without building
+        // anything.
+        connect_shared_connection_with_policy(&shared, info, 2, policy).expect("connect");
+        resize_shared_connection_pool_with_policy(&shared, 1, policy)
+            .expect("rebuild the connection pool");
+
+        let read_one = |session: DbPoolSession, sql: &str| -> String {
+            match session {
+                DbPoolSession::Oracle(conn) => conn
+                    .query_row_as::<String>(sql, &[])
+                    .expect("read from the Oracle OCI pool session"),
+                DbPoolSession::OracleThin(mut conn) => {
+                    DatabaseConnection::oracle_thin_select_one_text(&mut conn, sql)
+                        .expect("read from the Oracle thin pool session")
+                        .unwrap_or_default()
+                }
+                other => panic!(
+                    "expected an Oracle pool session but got {}",
+                    other.db_type()
+                ),
+            }
+        };
+        // Everything an acquisition holds is dropped before this returns: on
+        // OCI the cancel registration keeps a clone of the session handle, so
+        // a lingering one exhausts a pool of one and the next acquire times
+        // out with ORA-24496 instead of handing back the recycled session.
+        let with_session = |label: &str, use_session: &dyn Fn(DbPoolSession) -> String| -> String {
+            let context = pool_session_context_for_shared_connection(&shared, Some(label))
+                .expect("pool session context");
+            let activity = track_pool_db_activity(label.to_string(), DatabaseType::Oracle);
+            let (session, registration) = context
+                .acquire_session_for_current_scope(&activity)
+                .expect("acquire a pooled session");
+            let answer = use_session(session);
+            drop(registration);
+            drop(activity);
+            answer
+        };
+
+        // Leave the session the way a previous tab would leave it, then let it
+        // go back into the one-session pool alive.
+        let seeded_sid = with_session("seed the rebuilt pool", &|session| match session {
+            DbPoolSession::Oracle(conn) => {
+                conn.execute("ALTER SESSION SET ISOLATION_LEVEL = SERIALIZABLE", &[])
+                    .expect("set the OCI session isolation");
+                conn.query_row_as::<String>(SID_SQL, &[])
+                    .expect("read the OCI session sid")
+                    .trim()
+                    .to_string()
+            }
+            DbPoolSession::OracleThin(mut conn) => {
+                conn.query_drop("ALTER SESSION SET ISOLATION_LEVEL = SERIALIZABLE")
+                    .expect("set the thin session isolation");
+                DatabaseConnection::oracle_thin_select_one_text(&mut conn, SID_SQL)
+                    .expect("read the thin session sid")
+                    .unwrap_or_default()
+                    .trim()
+                    .to_string()
+            }
+            other => panic!(
+                "expected an Oracle pool session but got {}",
+                other.db_type()
+            ),
+        });
+
+        let recycled_sid = with_session("reuse the rebuilt pool", &|session| {
+            read_one(session, SID_SQL).trim().to_string()
+        });
+        assert_eq!(
+            recycled_sid, seeded_sid,
+            "the check needs the same physical session back, or it never meets the hazard"
+        );
+        let level = with_session("read the recycled isolation", &|session| {
+            read_one(session, ISOLATION_SQL)
+        });
+        assert!(
+            !level.trim().eq_ignore_ascii_case("serializable"),
+            "a rebuilt pool must state the connection's default isolation on the sessions it \
+             hands out; this one still reads {level:?}"
+        );
+
+        lock_database_connection_raw(&shared).disconnect();
+    }
+
+    #[test]
+    #[ignore = "requires local Oracle database via ORACLE_TEST_* env vars and an Oracle client"]
+    fn oracle_oci_rebuilt_connection_pool_states_the_default_isolation() {
+        ensure_oracle_client_initialized().expect("Oracle client should initialize");
+        assert_rebuilt_connection_pool_states_the_default_isolation(
+            oracle_test_connection_info_from_env(),
+        );
+    }
+
+    #[test]
+    #[ignore = "requires local Oracle database via ORACLE_TEST_* env vars"]
+    fn oracle_thin_rebuilt_connection_pool_states_the_default_isolation() {
+        assert_rebuilt_connection_pool_states_the_default_isolation(
+            oracle_thin_test_connection_info_from_env(),
+        );
     }
 
     fn read_oracle_thin_session_parameter(
@@ -11745,6 +11907,71 @@ mod tests {
         assert_eq!(
             connection.default_transaction_isolation(),
             TransactionIsolation::Serializable
+        );
+    }
+
+    /// Every pool this connection installs prepares its sessions at the
+    /// RESOLVED default isolation — the one built at connect and the one a
+    /// pool-size change rebuilds alike. A pool carries the raw advanced
+    /// setting, where `Default` has no SQL spelling and therefore leaves each
+    /// recycled session on the level its last tab left.
+    #[test]
+    fn an_installed_pool_prepares_sessions_at_the_connections_resolved_isolation() {
+        let mut info = ConnectionInfo::new_with_type(
+            "pool-install",
+            "root",
+            "secret",
+            "127.0.0.1",
+            3306,
+            "pool_install",
+            DatabaseType::MySQL,
+        );
+        // The first entry of the advanced "default transaction isolation"
+        // dropdown: follow the server, no level of its own.
+        info.advanced.default_transaction_isolation = TransactionIsolation::Default;
+        let build_pool = |info: &ConnectionInfo| DbConnectionPool::MySQL {
+            pool: DatabaseConnection::build_mysql_pool(
+                info,
+                MIN_CONNECTION_POOL_SIZE,
+                ConnectionAttemptPolicy::default(),
+            )
+            .expect("create test MySQL pool without opening a connection"),
+            advanced: info.advanced.clone(),
+            db_type: info.db_type,
+        };
+        assert_eq!(
+            build_pool(&info).advanced().default_transaction_isolation,
+            TransactionIsolation::Default,
+            "a freshly built pool carries the unresolved advanced level; that is what install_pool has to state away"
+        );
+
+        let mut connection = DatabaseConnection::new();
+        connection.info = info.clone();
+        connection.default_transaction_isolation = TransactionIsolation::ReadCommitted;
+
+        let retired = connection.install_pool(build_pool(&info));
+        assert!(retired.is_none());
+        assert_eq!(
+            connection
+                .pool
+                .as_ref()
+                .expect("pool installed")
+                .advanced()
+                .default_transaction_isolation,
+            TransactionIsolation::ReadCommitted
+        );
+
+        // A rebuild — what a connection-pool size change does — states it too.
+        let retired = connection.install_pool(build_pool(&info));
+        assert!(retired.is_some());
+        assert_eq!(
+            connection
+                .pool
+                .as_ref()
+                .expect("pool installed")
+                .advanced()
+                .default_transaction_isolation,
+            TransactionIsolation::ReadCommitted
         );
     }
 

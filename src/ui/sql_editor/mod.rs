@@ -1028,6 +1028,14 @@ impl Drop for MySqlQueryCancelContext {
 }
 
 trait ExplainPlanBackend: Sync {
+    /// The statement this backend will actually send to build the plan.
+    ///
+    /// The tab's transaction-mode gate has to be asked about THIS, not about
+    /// the SQL the user typed: Oracle's `EXPLAIN PLAN FOR ...` inserts into
+    /// `PLAN_TABLE`, so a read-only tab must be refused even though the
+    /// statement being explained is a plain `SELECT`.
+    fn explain_statement(&self, sql: &str) -> String;
+
     /// `scope` is the schema/database the requesting query tab has selected;
     /// the plan must be built where the tab's own statements would run.
     fn get_explain_plan(
@@ -1791,6 +1799,10 @@ impl TransactionActionBackend for MysqlTransactionActionBackend {
 }
 
 impl ExplainPlanBackend for OracleExplainPlanBackend {
+    fn explain_statement(&self, sql: &str) -> String {
+        QueryExecutor::oracle_explain_plan_sql(sql)
+    }
+
     fn get_explain_plan(
         &self,
         conn_guard: &mut crate::db::ConnectionLockGuard<'_>,
@@ -1863,6 +1875,10 @@ impl ExplainPlanBackend for OracleExplainPlanBackend {
 }
 
 impl ExplainPlanBackend for MysqlExplainPlanBackend {
+    fn explain_statement(&self, sql: &str) -> String {
+        crate::db::query::mysql_executor::MysqlExecutor::explain_plan_sql(sql)
+    }
+
     fn get_explain_plan(
         &self,
         conn_guard: &mut crate::db::ConnectionLockGuard<'_>,
@@ -4530,6 +4546,9 @@ impl SqlEditorWidget {
             return;
         };
         let tab_scope = self.connection_binding.snapshot().scope;
+        // A snapshot is enough: this tab is already marked query-running, and
+        // the toolbar refuses a mode change while it is.
+        let tab_transaction_mode_override = self.tab_transaction_mode_override_value();
         let sender = self.ui_action_sender.clone();
         let progress_sender =
             Self::operation_progress_sender(self.progress_sender.clone(), operation_token);
@@ -4574,6 +4593,28 @@ impl SqlEditorWidget {
                             token: operation_token,
                             result: Err("Connection changed before explain plan execution started"
                                 .to_string()),
+                        };
+                    }
+
+                    // `EXPLAIN PLAN FOR` writes into PLAN_TABLE, so a tab
+                    // pinned Read only must be refused here exactly as it is
+                    // in the batch loops — same resolver, same answer, same
+                    // message. Without this the pin meant one thing for
+                    // Ctrl+Enter and another for F6.
+                    let explain_db_type = conn_guard.db_type();
+                    let explain_mode = SqlEditorWidget::effective_transaction_mode(
+                        explain_db_type,
+                        conn_guard.transaction_mode(),
+                        tab_transaction_mode_override,
+                    );
+                    if let Some(message) = SqlEditorWidget::transaction_mode_refusal_for_statement(
+                        explain_db_type,
+                        explain_mode,
+                        &explain_plan_backend_for(explain_db_type).explain_statement(&sql),
+                    ) {
+                        return UiActionResult::ExplainPlan {
+                            token: operation_token,
+                            result: Err(message),
                         };
                     }
 

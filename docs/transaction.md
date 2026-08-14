@@ -148,15 +148,25 @@ retained state, the OCI loop off the cleanup guard's known-clean flag), and
 neither injects it in front of the user's own transaction-first statement,
 which has to be first in its transaction itself (ORA-01453).
 
-### Oracle: Read only is enforced in the client on both drivers
+### Read only is one answer, asked by every path that writes
 
 Oracle expresses read-only as a property of the TRANSACTION
 (`SET TRANSACTION READ ONLY`), so a `COMMIT` inside the user's own batch ends it
 and every statement after it would run read-write. Both Oracle batch loops
-therefore refuse non-queries client-side
-(`oracle_read_only_allows_statement()`) while the tab's access mode is Read
+therefore refuse non-queries client-side while the tab's access mode is Read
 only; the server's ORA-01456 is only the backstop. MySQL/MariaDB need no such
 gate — `SET SESSION TRANSACTION READ ONLY` survives the commit by itself.
+
+That answer lives in one place, `SqlEditorWidget::transaction_mode_refusal_for_statement()`,
+because it has to be the same whichever button was pressed. It asks the backend
+whether the mode is a property of the TRANSACTION here
+(`DatabaseType::transaction_mode_requires_first_statement`) and then the
+statement classifier (`oracle_read_only_allows_statement`). F6 Explain Plan is
+the path that showed why: `EXPLAIN PLAN FOR` inserts into `PLAN_TABLE`, and it
+ran without asking, so a Read only tab could still write through it. Every
+caller asks about the statement that will actually be sent, which for Explain is
+`ExplainPlanBackend::explain_statement()` rather than the `SELECT` being
+explained.
 
 ### Unrunnable isolation/access pairs are refused at selection
 

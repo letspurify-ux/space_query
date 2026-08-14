@@ -29,7 +29,56 @@ const STREAM_PREFETCH_ROWS: u32 = STREAM_FETCH_ARRAY_SIZE + 1;
 const LAZY_FETCH_ARRAY_SIZE: u32 = 100;
 const LAZY_PREFETCH_ROWS: u32 = LAZY_FETCH_ARRAY_SIZE;
 const MAX_NESTED_CURSOR_DEPTH: usize = 8;
-const ORACLE_OBJECT_DDL_SQL: &str = "SELECT DBMS_METADATA.GET_DDL(:1, :2, :3) FROM DUAL";
+/// Generate an object's DDL with the app's transform params scoped to the
+/// METADATA HANDLE instead of the session.
+///
+/// The params below (no segment attributes, no STORAGE, no TABLESPACE, and a
+/// statement terminator) are what makes the generated `CREATE` the DDL the user
+/// authored rather than the physical layout the database chose. Setting them
+/// with `DBMS_METADATA.SET_TRANSFORM_PARAM(DBMS_METADATA.SESSION_TRANSFORM, ...)`
+/// — which is what `GET_DDL` obeys — writes them onto the SESSION, and an
+/// Oracle pool hands a session back exactly as its last user left it. A query
+/// tab that later picked up that pooled session got the app's preference
+/// applied to its OWN `DBMS_METADATA.GET_DDL`: storage clauses silently missing
+/// and a `;` appended, from a setting it never made.
+///
+/// `DBMS_METADATA.OPEN` + `ADD_TRANSFORM` return handles, and params set on a
+/// transform handle die with it, so nothing is left on the session. The
+/// `WITH FUNCTION` wrapper keeps the statement the same shape the drivers
+/// already speak — three text binds in (type, name, owner), one text column out
+/// — so both the OCI and the thin path are unchanged, and a missing object
+/// still raises the ORA-31603 both of them already key on.
+///
+/// The physical-clause params are set one at a time and tolerate ORA-31600,
+/// because they only exist for object types that HAVE segments: a VIEW or a
+/// PROCEDURE rejects `SEGMENT_ATTRIBUTES` outright with ORA-31600.
+/// `SESSION_TRANSFORM` hid that — Oracle silently ignores a session param an
+/// object type does not understand — so moving the params onto a handle made it
+/// visible, and the first VIEW after the move stopped producing DDL at all.
+const ORACLE_OBJECT_DDL_SQL: &str = "WITH FUNCTION scoped_object_ddl( \
+p_object_type IN VARCHAR2, p_object_name IN VARCHAR2, p_owner IN VARCHAR2) RETURN CLOB IS \
+metadata_handle NUMBER; \
+transform_handle NUMBER; \
+generated CLOB; \
+PROCEDURE drop_physical_clause(p_name IN VARCHAR2) IS \
+BEGIN \
+DBMS_METADATA.SET_TRANSFORM_PARAM(transform_handle, p_name, FALSE); \
+EXCEPTION WHEN OTHERS THEN IF SQLCODE != -31600 THEN RAISE; END IF; \
+END; \
+BEGIN \
+metadata_handle := DBMS_METADATA.OPEN(p_object_type); \
+DBMS_METADATA.SET_FILTER(metadata_handle, 'NAME', p_object_name); \
+DBMS_METADATA.SET_FILTER(metadata_handle, 'SCHEMA', p_owner); \
+transform_handle := DBMS_METADATA.ADD_TRANSFORM(metadata_handle, 'DDL'); \
+drop_physical_clause('SEGMENT_ATTRIBUTES'); \
+drop_physical_clause('STORAGE'); \
+drop_physical_clause('TABLESPACE'); \
+DBMS_METADATA.SET_TRANSFORM_PARAM(transform_handle, 'SQLTERMINATOR', TRUE); \
+generated := DBMS_METADATA.FETCH_CLOB(metadata_handle); \
+DBMS_METADATA.CLOSE(metadata_handle); \
+RETURN generated; \
+END; \
+SELECT scoped_object_ddl(:1, :2, :3) FROM DUAL";
 
 /// Reads back the plan `EXPLAIN PLAN FOR` just wrote.
 ///
@@ -44,18 +93,6 @@ WHERE plan_id = (SELECT MAX(plan_id) FROM plan_table) ORDER BY id";
 
 /// Number of columns `ORACLE_EXPLAIN_PLAN_SQL` selects.
 const ORACLE_EXPLAIN_PLAN_COLUMNS: usize = 11;
-
-/// Session-level DBMS_METADATA transform params applied before GET_DDL so the
-/// generated CREATE statement omits physical storage clauses that the user did
-/// not author (segment attributes, STORAGE, TABLESPACE). SQLTERMINATOR appends a
-/// statement terminator to each emitted statement so multi-statement DDL (a
-/// table plus its CREATE INDEX / ALTER TABLE ... ADD CONSTRAINT) runs as-is.
-const ORACLE_DDL_TRANSFORM_PLSQL: &str = "BEGIN \
-DBMS_METADATA.SET_TRANSFORM_PARAM(DBMS_METADATA.SESSION_TRANSFORM, 'SEGMENT_ATTRIBUTES', FALSE); \
-DBMS_METADATA.SET_TRANSFORM_PARAM(DBMS_METADATA.SESSION_TRANSFORM, 'STORAGE', FALSE); \
-DBMS_METADATA.SET_TRANSFORM_PARAM(DBMS_METADATA.SESSION_TRANSFORM, 'TABLESPACE', FALSE); \
-DBMS_METADATA.SET_TRANSFORM_PARAM(DBMS_METADATA.SESSION_TRANSFORM, 'SQLTERMINATOR', TRUE); \
-END;";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 struct NestedCursorDisplay {
@@ -4198,7 +4235,46 @@ impl QueryExecutor {
     /// Rows come back in `ID` order, which is the same order `DBMS_XPLAN`
     /// displays, so the caller can draw connectors without re-sorting.
     pub fn get_explain_plan(conn: &Connection, sql: &str) -> Result<Vec<Vec<String>>, OracleError> {
-        let explain_sql = format!("EXPLAIN PLAN FOR {}", sql);
+        let plan = Self::read_oracle_explain_plan(conn, sql);
+        Self::end_oracle_explain_plan_transaction(conn.rollback());
+        plan
+    }
+
+    /// Take back what `EXPLAIN PLAN FOR` wrote.
+    ///
+    /// It is an INSERT into `PLAN_TABLE`, and it runs on the connection's
+    /// SHARED LIVE session — the one no query tab owns. A tab's auto-commit
+    /// governs its own pooled session, and Commit/Rollback deliberately act on
+    /// the tab's retained session and never on this one, so nothing else in the
+    /// app would ever resolve this write: it stayed an open transaction on that
+    /// session, holding its rows and their locks, for the life of the
+    /// connection and growing with every F6. The statement that wrote is
+    /// therefore the one that takes it back, in the function that issues it, so
+    /// no call site can forget. The plan rows are already materialized by then,
+    /// and a failure to roll back must not fail an otherwise correct plan.
+    fn end_oracle_explain_plan_transaction(result: Result<(), impl std::fmt::Display>) {
+        if let Err(err) = result {
+            logging::log_warning(
+                "executor",
+                &format!("Failed to roll back the EXPLAIN PLAN write on the live session: {err}"),
+            );
+        }
+    }
+
+    /// The statement the Oracle explain path will send.
+    ///
+    /// One spelling, because the tab's transaction-mode gate is asked about it
+    /// before it runs: it is an INSERT into `PLAN_TABLE`, so a read-only tab
+    /// must be refused even though what is being explained is a `SELECT`.
+    pub fn oracle_explain_plan_sql(sql: &str) -> String {
+        format!("EXPLAIN PLAN FOR {}", sql)
+    }
+
+    fn read_oracle_explain_plan(
+        conn: &Connection,
+        sql: &str,
+    ) -> Result<Vec<Vec<String>>, OracleError> {
+        let explain_sql = Self::oracle_explain_plan_sql(sql);
         match conn.execute(&explain_sql, &[]) {
             Ok(_stmt) => {}
             Err(err) => {
@@ -4255,7 +4331,18 @@ impl QueryExecutor {
         conn: &mut OracleThinSession,
         sql: &str,
     ) -> Result<Vec<Vec<String>>, String> {
-        let explain_sql = format!("EXPLAIN PLAN FOR {}", sql);
+        let plan = Self::read_oracle_thin_explain_plan(conn, sql);
+        // The thin twin of the OCI path: see
+        // `end_oracle_explain_plan_transaction`.
+        Self::end_oracle_explain_plan_transaction(conn.rollback());
+        plan
+    }
+
+    fn read_oracle_thin_explain_plan(
+        conn: &mut OracleThinSession,
+        sql: &str,
+    ) -> Result<Vec<Vec<String>>, String> {
+        let explain_sql = Self::oracle_explain_plan_sql(sql);
         conn.execute_typed(&OracleThinStatementRequest::statement(explain_sql), &[])
             .map_err(|err| err.to_string())?;
 
@@ -11060,10 +11147,9 @@ impl ObjectBrowser {
     ) -> Result<String, OracleError> {
         let (owner, object_name) =
             QueryExecutor::split_current_schema_owner_object_name(conn, object_name)?;
-        if let Err(err) = conn.execute(ORACLE_DDL_TRANSFORM_PLSQL, &[]) {
-            logging::log_error("executor", &format!("Database operation failed: {err}"));
-            return Err(err);
-        }
+        // No session-level transform to set: `ORACLE_OBJECT_DDL_SQL` scopes the
+        // params to the metadata handle, so this session goes back to the pool
+        // exactly as it arrived.
         let mut stmt = match conn.statement(ORACLE_OBJECT_DDL_SQL).build() {
             Ok(stmt) => stmt,
             Err(err) => {
@@ -11115,11 +11201,9 @@ impl ObjectBrowser {
     ) -> Result<String, String> {
         let (owner, object_name) =
             Self::thin_split_current_schema_owner_object_name(conn, object_name)?;
-        conn.execute_typed(
-            &OracleThinStatementRequest::statement(ORACLE_DDL_TRANSFORM_PLSQL),
-            &[],
-        )
-        .map_err(|err| err.to_string())?;
+        // The thin twin of the OCI path: the transform params ride on the
+        // metadata handle inside `ORACLE_OBJECT_DDL_SQL`, so nothing is left on
+        // this pooled session for the next tab to inherit.
         let object_type = Self::metadata_object_type(object_type);
         let binds = || {
             vec![

@@ -87,6 +87,11 @@
 //       dropdown). `Default` has no `sql_level()`, so session preparation used
 //       to emit no isolation statement at all and one tab's ALTER SESSION
 //       governed the next tab to be handed that session.
+//   S52 (Oracle) the same again, after a connection-pool SIZE CHANGE. A pool
+//       is built from the raw advanced settings, so a REBUILT pool arrives
+//       carrying `Default` again: the resolved level has to be stated on
+//       every pool the connection installs, not only on the one built at
+//       connect.
 //
 // Usage: verify_transaction_mode_live <thin|oci|mysql|mariadb|all>
 
@@ -3019,15 +3024,22 @@ fn run_scenarios(target: Target, h: &mut Harness) -> Result<(), String> {
     // entry of that dropdown, "follow the server") has no `sql_level()` and
     // used to make preparation emit no isolation statement at all, i.e. "leave
     // the session wherever the last tab left it".
+    //
+    // S52 runs the `Default` case again over a REBUILT pool (a connection-pool
+    // size change), because a pool is built from the raw advanced settings:
+    // the resolved level has to be stated on every pool the connection
+    // installs, not only on the one that exists at connect.
     if target.is_oracle() {
-        for (scenario, configured_isolation) in [
-            ("S47", TransactionIsolation::ReadCommitted),
-            ("S51", TransactionIsolation::Default),
+        for (scenario, configured_isolation, rebuild_pool) in [
+            ("S47", TransactionIsolation::ReadCommitted, false),
+            ("S51", TransactionIsolation::Default, false),
+            ("S52", TransactionIsolation::Default, true),
         ] {
             h.failures.extend(check_recycled_session_isolation(
                 target,
                 scenario,
                 configured_isolation,
+                rebuild_pool,
             )?);
         }
     }
@@ -4114,8 +4126,13 @@ fn check_recycled_session_isolation(
     target: Target,
     scenario: &str,
     configured_isolation: TransactionIsolation,
+    rebuild_pool: bool,
 ) -> Result<Vec<String>, String> {
-    println!("  --- {scenario} a recycled session carries no foreign isolation (connection default = {}) ---", configured_isolation.label());
+    println!(
+        "  --- {scenario} a recycled session carries no foreign isolation (connection default = {}{}) ---",
+        configured_isolation.label(),
+        if rebuild_pool { ", pool rebuilt" } else { "" }
+    );
     let isolation_sql = "SELECT value FROM v$ses_optimizer_env \
          WHERE sid = SYS_CONTEXT('USERENV', 'SID') \
          AND name = 'transaction_isolation_level'";
@@ -4124,10 +4141,21 @@ fn check_recycled_session_isolation(
     let mut info = target.connection_info();
     info.advanced.default_transaction_isolation = configured_isolation;
     let mut single = DatabaseConnection::new();
-    single.set_connection_pool_size(1);
+    // A pool of exactly one session makes the recycle deterministic. The
+    // rebuild case has to arrive there from a different size, or the resize
+    // returns without building anything.
+    single.set_connection_pool_size(if rebuild_pool { 2 } else { 1 });
     single
         .connect(info)
         .map_err(|e| format!("{scenario} connect: {e}"))?;
+    if rebuild_pool {
+        // Settings > Connection pool size, on a live connection: the pool is
+        // rebuilt from the connection's advanced settings, where the level may
+        // be `Default`.
+        single
+            .resize_current_connection_pool(1)
+            .map_err(|e| format!("{scenario} pool resize: {e}"))?;
+    }
     let single = Arc::new(Mutex::new(single));
     {
         // One raw pool session, left the way a previous tab would leave it.

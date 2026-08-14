@@ -1156,10 +1156,10 @@ fn oracle_unqualified_object_metadata_resolves_current_schema_owner() {
 fn oracle_thin_get_ddl_uses_same_direct_query_for_all_protocol_versions() {
     let content = read_source("src/db/query/executor.rs");
     assert!(
-        content.contains(
-            "const ORACLE_OBJECT_DDL_SQL: &str = \"SELECT DBMS_METADATA.GET_DDL(:1, :2, :3) FROM DUAL\""
-        ),
-        "Oracle object DDL should have one shared DBMS_METADATA.GET_DDL query"
+        content.contains("const ORACLE_OBJECT_DDL_SQL: &str = \"WITH FUNCTION scoped_object_ddl(")
+            && content.contains("SELECT scoped_object_ddl(:1, :2, :3) FROM DUAL"),
+        "Oracle object DDL should have one shared query, and it must scope its DBMS_METADATA \
+         transform to a handle instead of the session"
     );
 
     let thick_start = content
@@ -1187,7 +1187,7 @@ fn oracle_thin_get_ddl_uses_same_direct_query_for_all_protocol_versions() {
         thin_body.contains("thin_query_one_typed_text(")
             && thin_body.contains("ORACLE_OBJECT_DDL_SQL")
             && thin_body.contains("OracleThinColumnType::Long"),
-        "Thin Oracle DDL generation should directly fetch DBMS_METADATA.GET_DDL as LONG"
+        "Thin Oracle DDL generation should directly fetch the shared DDL query as LONG"
     );
     for forbidden in [
         "uses_legacy_ttc_byte_chunks",
@@ -3197,12 +3197,15 @@ fn transaction_mode_state_has_a_single_source_of_truth() {
     // server's ORA-01456 only covers the transaction the app opened: a COMMIT
     // inside the user's own batch ends it, and everything after would run
     // read-write. Live-observed on thin, which had no client gate.
+    // Both now ask the ONE shared answer rather than re-deriving it; see
+    // `every_write_path_asks_the_tab_whether_its_mode_allows_the_statement`.
     let read_only_gates = execution
-        .matches("== crate::db::TransactionAccessMode::ReadOnly")
+        .matches("transaction_mode_refusal_for_statement(")
         .count();
     assert!(
-        read_only_gates >= 2,
-        "both Oracle batch loops must refuse non-queries on a read-only tab (found {read_only_gates} gates)"
+        read_only_gates >= 3,
+        "both Oracle batch loops must refuse non-queries on a read-only tab through the shared \
+         answer (found {read_only_gates} references, including its own definition)"
     );
     assert!(
         thin_backend_region_has_read_only_gate(&execution),
@@ -3406,9 +3409,82 @@ fn transaction_mode_state_has_a_single_source_of_truth() {
         .expect("sync_default_transaction_isolation should end");
     let sync_body = &connection[sync_start..sync_end];
     assert!(
-        sync_body.contains("set_session_default_transaction_isolation"),
+        sync_body.contains("state_pool_default_transaction_isolation"),
         "resolving the connection's default isolation must record it as the level the pool prepares its sessions with"
     );
+
+    // (18) ... and it stays stated for every pool this connection ever holds.
+    // A pool carries a copy of `ConnectionAdvancedSettings`, so a pool built
+    // anywhere arrives with the RAW level — `Default` included. Installing a
+    // pool and stating the resolved level on it must therefore be one step:
+    // when they were two, the level was stated at connect only and a pool
+    // REBUILT by a connection-pool size change silently went back to
+    // preparing sessions with no isolation statement at all.
+    assert!(
+        !connection.contains(".pool = Some("),
+        "a pool must be installed through DatabaseConnection::install_pool, which states the level its sessions are prepared with"
+    );
+    // Receiver-agnostic on purpose. Pinning `self.pool.replace(` missed the
+    // free `resize_shared_connection_pool_with_policy` — the resize the UI
+    // actually drives — because it holds a guard and writes
+    // `connection_guard.pool.replace(`. The hole stayed open on the very path
+    // the fix was written for.
+    assert_eq!(
+        connection.matches(".pool.replace(").count(),
+        1,
+        "install_pool must be the only place a pool is installed on a connection, whatever the receiver is called"
+    );
+    // The third spelling: a pool can also arrive by swapping a prepared
+    // connection's in. That one carries its resolved level with it, and the
+    // swap has to be followed by stating it, or a later change to either half
+    // separates them again.
+    let swap_start = connection
+        .find("std::mem::swap(&mut self.pool,")
+        .expect("the prepared-connection pool swap should exist");
+    assert!(
+        connection[swap_start..]
+            .find("state_pool_default_transaction_isolation()")
+            .is_some_and(|offset| offset
+                < connection[swap_start..]
+                    .find("self.bump_connection_generation()")
+                    .unwrap_or(usize::MAX)),
+        "swapping a prepared connection's pool in must state the resolved isolation on it"
+    );
+    let install_start = connection
+        .find("fn install_pool(")
+        .expect("install_pool should exist");
+    let install_end = connection[install_start..]
+        .find("\n    fn ")
+        .map(|offset| install_start + offset)
+        .expect("install_pool should end");
+    let install_body = &connection[install_start..install_end];
+    assert!(
+        install_body.contains("self.pool.replace(")
+            && install_body.contains("state_pool_default_transaction_isolation"),
+        "install_pool must state the connection's resolved default isolation on the pool it installs: {install_body}"
+    );
+    // Both implementations of a connection-pool size change, not just the one
+    // the previous fix was written against.
+    for (resize_fn, ends_at) in [
+        (
+            "fn resize_current_connection_pool_with_policy(",
+            "\n    pub fn ",
+        ),
+        ("fn resize_shared_connection_pool_with_policy(", "\n}\n"),
+    ] {
+        let resize_start = connection
+            .find(resize_fn)
+            .unwrap_or_else(|| panic!("{resize_fn} should exist"));
+        let resize_end = connection[resize_start..]
+            .find(ends_at)
+            .map(|offset| resize_start + offset)
+            .unwrap_or_else(|| panic!("{resize_fn} should end"));
+        assert!(
+            connection[resize_start..resize_end].contains(".install_pool("),
+            "a rebuilt connection pool must be installed through install_pool, or its sessions \
+             stop stating the connection's isolation: {resize_fn}"
+        );
+    }
 }
 
 /// The Oracle thin batch loop's own read-only gate, located without pinning
@@ -3422,8 +3498,7 @@ fn thin_backend_region_has_read_only_gate(execution: &str) -> bool {
         .map(|offset| start + offset)
         .unwrap_or(execution.len());
     let body = &execution[start..end];
-    body.contains("== crate::db::TransactionAccessMode::ReadOnly")
-        && body.contains("oracle_read_only_allows_statement(")
+    body.contains("transaction_mode_refusal_for_statement(")
 }
 
 #[test]
@@ -4287,6 +4362,180 @@ fn every_oracle_auto_commit_site_consults_the_skip_rule() {
         execution.contains("auto_commit && !statement_effects.skip_auto_commit()"),
         "the thin wire flag must keep consulting the same skip rule"
     );
+}
+
+/// Every path that writes on a tab's behalf asks ONE question about the tab's
+/// transaction mode, and the app leaves no DBMS_METADATA transform on a pooled
+/// session.
+///
+/// A tab pinned Read only must not write, whichever button was pressed. Both
+/// Oracle batch loops refused writes client-side from the start — Oracle
+/// expresses read-only as a property of the TRANSACTION, so a `COMMIT` inside
+/// the user's own batch ends it and the server's ORA-01456 is only a backstop —
+/// but F6 Explain Plan never asked, and `EXPLAIN PLAN FOR` is a write
+/// (`classify_explain_sql_for_db_type` calls it one because it inserts into
+/// `PLAN_TABLE`). The answer now lives in one place so a new write path cannot
+/// have an opinion of its own.
+#[test]
+fn every_write_path_asks_the_tab_whether_its_mode_allows_the_statement() {
+    let execution = read_source("src/ui/sql_editor/execution.rs");
+    let editor = read_source("src/ui/sql_editor/mod.rs");
+    let executor = read_source("src/db/query/executor.rs");
+
+    // One answer, and it is db-dispatched rather than hand-rolled per family.
+    let helper_start = execution
+        .find("pub(super) fn transaction_mode_refusal_for_statement(")
+        .expect("the shared transaction-mode refusal should exist");
+    let helper_end = execution[helper_start..]
+        .find("\n    }\n")
+        .map(|offset| helper_start + offset)
+        .expect("the shared refusal should end");
+    let helper = &execution[helper_start..helper_end];
+    assert!(
+        helper.contains("transaction_mode_requires_first_statement")
+            && helper.contains("oracle_read_only_allows_statement"),
+        "the shared refusal must ask the backend whether the mode is a transaction property, \
+         then the statement classifier: {helper}"
+    );
+
+    // Nobody re-derives it. The MySQL escape gate is a different question (an
+    // explicit READ WRITE statement), so it keeps its own comparison.
+    assert!(
+        !execution.contains("&& !SqlEditorWidget::oracle_read_only_allows_statement(")
+            && !execution.contains("&& !Self::oracle_read_only_allows_statement("),
+        "the Oracle read-only gates must go through transaction_mode_refusal_for_statement"
+    );
+    // Production code only: the unit tests below call it too. The test modules
+    // of this file all sit after the last production item, so the prefix before
+    // the first of them is the production half.
+    let execution_production = execution
+        .split_once("\nmod session_transaction_mode_adoption_tests {")
+        .map(|(before, _)| before.to_string())
+        .unwrap_or_else(|| execution.clone());
+    assert_eq!(
+        execution_production
+            .matches("transaction_mode_refusal_for_statement(")
+            .count(),
+        3,
+        "both Oracle batch loops and the shared answer itself, and nothing else in execution.rs"
+    );
+    assert!(
+        editor.contains("SqlEditorWidget::transaction_mode_refusal_for_statement("),
+        "F6 Explain Plan must ask the same question before it writes to PLAN_TABLE"
+    );
+
+    // The app's DDL transform params ride on a metadata HANDLE, never on the
+    // session: an Oracle pool hands a session back exactly as its last user
+    // left it, so a session-level transform reached the next tab's own
+    // `DBMS_METADATA.GET_DDL`.
+    // Comments may name it — that is where the reason lives — so ask the code.
+    let executor_code = executor
+        .lines()
+        .filter(|line| !line.trim_start().starts_with("//"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        !executor_code.contains("SESSION_TRANSFORM"),
+        "generating DDL must not set DBMS_METADATA.SESSION_TRANSFORM on a pooled session"
+    );
+    assert!(
+        executor.contains("DBMS_METADATA.ADD_TRANSFORM(metadata_handle")
+            && executor.contains("SET_TRANSFORM_PARAM(transform_handle"),
+        "the DDL transform params must be set on the transform handle"
+    );
+}
+
+/// Both Oracle drivers state the tab's SERVEROUTPUT setting on the session the
+/// batch is about to run on.
+///
+/// `DBMS_OUTPUT.ENABLE` is SESSION state; the tab's setting lives on its
+/// `SessionState`. The two part company whenever the tab's physical session is
+/// replaced — a fresh pool session after the retained one was discarded (an
+/// Oracle transaction-mode change does exactly that), or one recycled from
+/// another tab that left it enabled. The OCI worker had stated it at every
+/// batch start from the beginning; the thin batch stated nothing, so
+/// `SET SERVEROUTPUT ON` silently stopped producing output there while it kept
+/// working on OCI. Both must also yield to the user's own transaction-first
+/// opener: this is PL/SQL and would take its place at the head of the
+/// transaction (ORA-01453).
+#[test]
+fn both_oracle_drivers_state_serveroutput_on_the_session_they_run_on() {
+    let execution = read_source("src/ui/sql_editor/execution.rs");
+
+    for (driver, call) in [
+        (
+            "OCI",
+            "sync_serveroutput_with_session(conn.as_ref(), &session)",
+        ),
+        (
+            "thin",
+            "sync_oracle_thin_serveroutput_with_session(conn, session)",
+        ),
+    ] {
+        assert!(
+            execution.contains(call),
+            "the {driver} batch must state the tab's SERVEROUTPUT setting on the session it runs on"
+        );
+    }
+    // The yield, both sides: the call is guarded by the transaction-first check.
+    assert_eq!(
+        execution
+            .matches("if !requires_transaction_first_statement {")
+            .count()
+            + execution
+                .matches("if !Self::requires_transaction_first_statement(&items) {")
+                .count(),
+        3,
+        "each SERVEROUTPUT sync must yield to a batch that opens with the user's own \
+         transaction-first statement (OCI: batch start + after CONNECT, thin: batch start)"
+    );
+    // Total in both directions, or a tab that wants no output inherits another
+    // tab's enabled buffer through the pool.
+    let thin_sync_start = execution
+        .find("fn sync_oracle_thin_serveroutput_with_session")
+        .expect("the thin SERVEROUTPUT sync should exist");
+    let thin_sync_end = execution[thin_sync_start..]
+        .find("\n    }\n")
+        .map(|offset| thin_sync_start + offset)
+        .expect("the thin SERVEROUTPUT sync should end");
+    let thin_sync = &execution[thin_sync_start..thin_sync_end];
+    assert!(
+        thin_sync.contains("DBMS_OUTPUT.DISABLE") && thin_sync.contains("DBMS_OUTPUT.ENABLE"),
+        "the thin SERVEROUTPUT sync must state DISABLE as well as ENABLE: {thin_sync}"
+    );
+}
+
+/// The one write the app issues on the SHARED LIVE Oracle session resolves
+/// itself, on both drivers.
+///
+/// `EXPLAIN PLAN FOR` is an INSERT into `PLAN_TABLE`, and F6 runs it on the
+/// connection's live session rather than on a pooled one. No query tab owns
+/// that session: auto-commit governs the tab's own pooled session, and the
+/// Commit/Rollback buttons act on the tab's retained session by design
+/// (`regression_08_commit_rollback_require_retained_tab_session_not_live_fallback`).
+/// So nothing else in the app would ever resolve this write — it stayed an
+/// open transaction on that session, holding its rows and their locks, for the
+/// life of the connection and growing with every F6 (live-reproduced on both
+/// drivers). The function that issues the statement takes it back, so no call
+/// site can forget.
+#[test]
+fn oracle_explain_plan_resolves_the_write_it_leaves_on_the_shared_session() {
+    let executor = read_source("src/db/query/executor.rs");
+
+    for entry_point in ["fn get_explain_plan(", "fn get_thin_explain_plan("] {
+        let start = executor
+            .find(entry_point)
+            .unwrap_or_else(|| panic!("{entry_point} should exist"));
+        let end = executor[start..]
+            .find("\n    }\n")
+            .map(|offset| start + offset)
+            .unwrap_or_else(|| panic!("{entry_point} should end"));
+        let body = &executor[start..end];
+        assert!(
+            body.contains("end_oracle_explain_plan_transaction(conn.rollback())"),
+            "{entry_point} must take back the PLAN_TABLE write it leaves on the shared live session: {body}"
+        );
+    }
 }
 
 /// A batch that adopts a NEW connection mid-script must forget the scope it was

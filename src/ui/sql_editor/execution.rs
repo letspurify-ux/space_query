@@ -12659,11 +12659,13 @@ impl SqlEditorWidget {
                                 );
                             }
 
-                            if active_transaction_mode.access_mode
-                                == crate::db::TransactionAccessMode::ReadOnly
-                                && !SqlEditorWidget::oracle_read_only_allows_statement(&sql_text)
+                            if let Some(message) =
+                                SqlEditorWidget::transaction_mode_refusal_for_statement(
+                                    crate::db::DatabaseType::Oracle,
+                                    active_transaction_mode,
+                                    &sql_text,
+                                )
                             {
-                                let message = SqlEditorWidget::oracle_read_only_block_message();
                                 let emitted = SqlEditorWidget::emit_non_select_result(
                                     &sender,
                                     &session,
@@ -17527,6 +17529,26 @@ impl SqlEditorWidget {
                 .as_deref()
                 .and_then(|context| context.scope.as_deref()),
         );
+        // The tab's SERVEROUTPUT setting has to reach the session this batch
+        // runs on, not only the one it was typed on. `DBMS_OUTPUT.ENABLE` is
+        // SESSION state and the tab's setting lives on its `SessionState`, so
+        // the two part company whenever the tab's physical session is replaced
+        // — a fresh pool session after the retained one was discarded (a
+        // transaction-mode change on Oracle does exactly that), or one
+        // recycled from another tab that left it enabled. The OCI worker
+        // states it at the start of every batch for that reason; without the
+        // same statement here `SET SERVEROUTPUT ON` silently stopped producing
+        // output on thin while it kept working on OCI — one script, two
+        // answers.
+        //
+        // Never in front of the user's own transaction-first statement: this
+        // is PL/SQL and it would take that statement's place at the head of
+        // its transaction (ORA-01453). The same yield the OCI path makes.
+        if !Self::requires_transaction_first_statement(&items) {
+            if let Err(err) = Self::sync_oracle_thin_serveroutput_with_session(conn, session) {
+                eprintln!("Failed to apply SERVEROUTPUT setting on session start: {err}");
+            }
+        }
         let mut frames = vec![ScriptExecutionFrame {
             items,
             index: 0,
@@ -18347,6 +18369,19 @@ impl SqlEditorWidget {
                                         db_activity,
                                         None,
                                     );
+                                    // A new server means a new session, and
+                                    // SERVEROUTPUT is session state: the tab's
+                                    // setting has to be stated on it as well,
+                                    // exactly as the OCI CONNECT path does.
+                                    if let Err(err) =
+                                        Self::sync_oracle_thin_serveroutput_with_session(
+                                            conn, session,
+                                        )
+                                    {
+                                        eprintln!(
+                                            "Failed to apply SERVEROUTPUT setting after CONNECT: {err}"
+                                        );
+                                    }
                                     retained_state = RetainedSessionState::default();
                                     batch_may_report_transaction_work = false;
                                     invalid_session = false;
@@ -18714,10 +18749,37 @@ impl SqlEditorWidget {
                                 .and_then(load_mutex_transaction_mode_option),
                             default_isolation: default_transaction_isolation,
                         };
-                        for (tx_sql, restores_session_default) in transaction_mode_application
-                            .statements()
-                            .unwrap_or_default()
-                        {
+                        // A mode this database cannot express is a batch
+                        // stopper, not something to apply nothing for. Both
+                        // Oracle loops answer the same way: applying the tab's
+                        // mode is app infrastructure, so silently running the
+                        // rest of the batch under a mode the toolbar does not
+                        // show — writes slipping through a Read only tab — is
+                        // the one outcome neither may produce. This used to be
+                        // `unwrap_or_default()`, which did exactly that while
+                        // the OCI twin stopped.
+                        let transaction_mode_statements =
+                            match transaction_mode_application.statements() {
+                                Ok(statements) => statements,
+                                Err(message) => {
+                                    had_error = true;
+                                    Self::emit_non_select_result(
+                                        sender,
+                                        session,
+                                        conn_name,
+                                        result_index,
+                                        &display_sql,
+                                        format!("Error: {message}"),
+                                        false,
+                                        false,
+                                        script_mode,
+                                    );
+                                    // Leaves the batch loop itself, like the OCI
+                                    // twin's `break` at the same point.
+                                    break;
+                                }
+                            };
+                        for (tx_sql, restores_session_default) in transaction_mode_statements {
                             if let Err(message) =
                                 Self::execute_oracle_thin_statement(conn, &tx_sql, false)
                             {
@@ -18781,10 +18843,11 @@ impl SqlEditorWidget {
                     // the OCI path has always had, in the same position:
                     // after the mode has been applied, so a refused batch
                     // leaves the session in the same state on both drivers.
-                    if active_transaction_mode.access_mode
-                        == crate::db::TransactionAccessMode::ReadOnly
-                        && !Self::oracle_read_only_allows_statement(&execution_sql)
-                    {
+                    if let Some(message) = Self::transaction_mode_refusal_for_statement(
+                        crate::db::DatabaseType::Oracle,
+                        active_transaction_mode,
+                        &execution_sql,
+                    ) {
                         had_error = true;
                         Self::emit_non_select_result(
                             sender,
@@ -18792,7 +18855,7 @@ impl SqlEditorWidget {
                             conn_name,
                             result_index,
                             &display_sql,
-                            Self::oracle_read_only_block_message(),
+                            message,
                             false,
                             false,
                             script_mode,
@@ -21254,6 +21317,39 @@ impl SqlEditorWidget {
         "Error: Oracle read-only mode blocks non-query statements. Switch to Read write to run this statement.".to_string()
     }
 
+    /// The ONE answer to "does this tab's transaction mode refuse this
+    /// statement?", for every path that writes on the tab's behalf.
+    ///
+    /// It exists because the answer has to be the same whichever button was
+    /// pressed. Where the mode is a property of the TRANSACTION rather than of
+    /// the session — which is exactly what
+    /// `DatabaseType::transaction_mode_requires_first_statement` reports — a
+    /// `COMMIT` inside the user's own batch ends the read-only transaction and
+    /// everything after it would run read-write, so the server's own refusal
+    /// (ORA-01456) is a backstop the app cannot lean on. Both Oracle batch
+    /// loops have always refused writes client-side for that reason; F6 Explain
+    /// Plan did not, and `EXPLAIN PLAN FOR` is a write — it inserts into
+    /// `PLAN_TABLE`, which is why `classify_explain_sql_for_db_type` has always
+    /// called it one. A tab pinned Read only could still write through it.
+    ///
+    /// Where the SESSION carries the mode (the MySQL family) this answers None
+    /// and lets the server refuse: `SET SESSION TRANSACTION READ ONLY` survives
+    /// a commit there, and their `EXPLAIN` is a read anyway. The one hole that
+    /// leaves — an explicit READ WRITE escape statement — has its own gate.
+    pub(super) fn transaction_mode_refusal_for_statement(
+        db_type: crate::db::DatabaseType,
+        mode: crate::db::TransactionMode,
+        sql: &str,
+    ) -> Option<String> {
+        if mode.access_mode != crate::db::TransactionAccessMode::ReadOnly {
+            return None;
+        }
+        if !db_type.transaction_mode_requires_first_statement(mode) {
+            return None;
+        }
+        (!Self::oracle_read_only_allows_statement(sql)).then(Self::oracle_read_only_block_message)
+    }
+
     /// The MySQL-family twin of the Oracle read-only client gate, for the one
     /// hole the SESSION characteristic cannot cover: the server lets a
     /// one-shot `SET TRANSACTION READ WRITE` and `START TRANSACTION READ
@@ -21283,6 +21379,35 @@ impl SqlEditorWidget {
         } else {
             QueryExecutor::disable_dbms_output(conn)
         }
+    }
+
+    /// The thin twin of [`Self::sync_serveroutput_with_session`].
+    ///
+    /// Total on purpose — it states DISABLE as well as ENABLE. A pooled Oracle
+    /// session comes back carrying whatever its last user left on it, and
+    /// `DBMS_OUTPUT` is session state the residue classifier never sees,
+    /// because the app sets it rather than the user's own statement. Stating
+    /// only one direction would let a tab that wants no output inherit another
+    /// tab's enabled buffer.
+    fn sync_oracle_thin_serveroutput_with_session<C: OracleThinBatchConnection>(
+        conn: &mut C,
+        session: &Arc<Mutex<SessionState>>,
+    ) -> Result<(), String> {
+        let (enabled, size) = match session.lock() {
+            Ok(guard) => (guard.server_output.enabled, guard.server_output.size),
+            Err(poisoned) => {
+                eprintln!("Warning: session state lock was poisoned; recovering.");
+                let guard = poisoned.into_inner();
+                (guard.server_output.enabled, guard.server_output.size)
+            }
+        };
+
+        let sql = match (enabled, size) {
+            (false, _) => "BEGIN DBMS_OUTPUT.DISABLE; END;".to_string(),
+            (true, 0) => "BEGIN DBMS_OUTPUT.ENABLE(NULL); END;".to_string(),
+            (true, size) => format!("BEGIN DBMS_OUTPUT.ENABLE({size}); END;"),
+        };
+        Self::execute_oracle_thin_statement(conn, sql, false)
     }
 
     fn current_scope_changed_message(scope: &str, name: &str) -> String {
@@ -29074,6 +29199,70 @@ mod query_execution_cleanup_tests {
             assert!(
                 !SqlEditorWidget::oracle_read_only_allows_statement(sql),
                 "expected Oracle read-only mode to block: {sql}"
+            );
+        }
+    }
+
+    /// The tab's Read only pin is asked about the statement that will RUN, not
+    /// about the one the user typed.
+    ///
+    /// `EXPLAIN PLAN FOR <select>` inserts into `PLAN_TABLE`; the `<select>` it
+    /// explains is a read. Asking with the user's text let F6 write on a
+    /// read-only tab, which is why each backend states the statement it will
+    /// send in one place.
+    #[test]
+    fn a_read_only_tab_refuses_the_explain_statement_but_not_the_query_it_explains() {
+        let read_only = crate::db::TransactionMode::new(
+            crate::db::TransactionIsolation::Default,
+            crate::db::TransactionAccessMode::ReadOnly,
+        );
+        let read_write = crate::db::TransactionMode::default();
+        let select = "SELECT 1 FROM DUAL";
+        let oracle_explain = QueryExecutor::oracle_explain_plan_sql(select);
+
+        assert!(
+            SqlEditorWidget::transaction_mode_refusal_for_statement(
+                crate::db::DatabaseType::Oracle,
+                read_only,
+                select,
+            )
+            .is_none(),
+            "the query being explained is a read"
+        );
+        assert!(
+            SqlEditorWidget::transaction_mode_refusal_for_statement(
+                crate::db::DatabaseType::Oracle,
+                read_only,
+                &oracle_explain,
+            )
+            .is_some(),
+            "the statement that explains it writes to PLAN_TABLE"
+        );
+        assert!(
+            SqlEditorWidget::transaction_mode_refusal_for_statement(
+                crate::db::DatabaseType::Oracle,
+                read_write,
+                &oracle_explain,
+            )
+            .is_none(),
+            "a Read write tab refuses nothing"
+        );
+
+        // The MySQL family carries the mode on the SESSION, so the server
+        // answers — and its EXPLAIN is a read either way. Over-blocking here
+        // would be its own bug.
+        for db_type in [
+            crate::db::DatabaseType::MySQL,
+            crate::db::DatabaseType::MariaDB,
+        ] {
+            assert!(
+                SqlEditorWidget::transaction_mode_refusal_for_statement(
+                    db_type,
+                    read_only,
+                    &crate::db::query::mysql_executor::MysqlExecutor::explain_plan_sql(select),
+                )
+                .is_none(),
+                "{db_type} EXPLAIN is a read"
             );
         }
     }
@@ -37543,12 +37732,29 @@ mod mysql_transaction_feedback_tests {
         config: tns_thin::OracleThinConfig,
         initial_auto_commit: bool,
     ) -> Vec<QueryProgress> {
+        oracle_thin_run_script_with_session_state(
+            sql_text,
+            config,
+            initial_auto_commit,
+            SessionState {
+                db_type: DatabaseType::Oracle,
+                ..SessionState::default()
+            },
+        )
+    }
+
+    /// The same live scaffold, with the tab's `SessionState` supplied by the
+    /// caller — the only way to model a tab whose setting was made on an
+    /// EARLIER physical session than the one this batch runs on.
+    fn oracle_thin_run_script_with_session_state(
+        sql_text: &str,
+        config: tns_thin::OracleThinConfig,
+        initial_auto_commit: bool,
+        session_state: SessionState,
+    ) -> Vec<QueryProgress> {
         let _oracle_schema_guard = oracle_thin_shared_schema_test_guard();
         let mut conn = tns_thin::OracleThinSession::connect(config).expect("thin login");
-        let session = Arc::new(Mutex::new(SessionState {
-            db_type: DatabaseType::Oracle,
-            ..SessionState::default()
-        }));
+        let session = Arc::new(Mutex::new(session_state));
         let cancel_flag = Arc::new(Mutex::new(false));
         let current_operation_autocommit = Arc::new(Mutex::new(true));
         let (sender, receiver) = super::test_query_progress_channel();
@@ -38738,6 +38944,57 @@ mod mysql_transaction_feedback_tests {
             .expect("drain dbms output");
 
         assert_eq!(lines, vec!["thin output".to_string()]);
+    }
+
+    /// A tab whose SERVEROUTPUT is on gets its output from the session this
+    /// batch runs on, even though nothing enabled it on THAT session.
+    ///
+    /// The tab's setting lives on its `SessionState`; `DBMS_OUTPUT.ENABLE`
+    /// lives on the physical session. They part company whenever the tab's
+    /// session is replaced — a fresh pool session after the retained one was
+    /// discarded (an Oracle transaction-mode change does exactly that), or one
+    /// recycled from another tab. The OCI worker states the setting at every
+    /// batch start; the thin batch did not, so `SET SERVEROUTPUT ON` silently
+    /// stopped producing output there while it kept working on OCI.
+    ///
+    /// The fresh connection this scaffold makes IS the "session the tab never
+    /// enabled it on", so the setting arriving only through `SessionState` is
+    /// exactly the case under test.
+    #[test]
+    #[ignore = "requires local Oracle listener"]
+    fn oracle_thin_serveroutput_reaches_the_session_this_batch_runs_on() {
+        let progress = oracle_thin_run_script_with_session_state(
+            "BEGIN DBMS_OUTPUT.PUT_LINE('carried output'); END;\n/\n",
+            oracle_thin_live_config(),
+            true,
+            SessionState {
+                db_type: DatabaseType::Oracle,
+                server_output: crate::db::session::ServerOutputConfig {
+                    enabled: true,
+                    size: 0,
+                },
+                ..SessionState::default()
+            },
+        );
+
+        let failures = oracle_thin_progress_failures(&progress);
+        assert!(
+            failures.is_empty(),
+            "statement failed:\n{}",
+            failures.join("\n")
+        );
+        let lines = progress
+            .iter()
+            .filter_map(|event| match event {
+                QueryProgress::DbmsOutput { lines } => Some(lines.clone()),
+                _ => None,
+            })
+            .flatten()
+            .collect::<Vec<_>>();
+        assert!(
+            lines.iter().any(|line| line.contains("carried output")),
+            "the tab's SERVEROUTPUT setting never reached the session this batch ran on: {lines:?}"
+        );
     }
 
     #[test]

@@ -1112,6 +1112,12 @@ impl MysqlExecutor {
         results
     }
 
+    /// The statement the explain path will send, so the tab's transaction-mode
+    /// gate can be asked about what actually runs.
+    pub fn explain_plan_sql(sql: &str) -> String {
+        Self::build_explain_sql(sql)
+    }
+
     fn build_explain_sql(sql: &str) -> String {
         let normalized = QueryExecutor::normalize_sql_for_execute(sql);
         match QueryExecutor::leading_keyword(&normalized).as_deref() {

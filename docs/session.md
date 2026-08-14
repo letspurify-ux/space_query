@@ -211,6 +211,27 @@ because MySQL 8 and MariaDB fold `DATABASE()` into a prepared
 `INFORMATION_SCHEMA` statement at prepare time and a cached one would keep
 answering for the database the session was in then.
 
+Oracle's Explain also *writes* there: `EXPLAIN PLAN FOR` is an INSERT into
+`PLAN_TABLE`. A tab pinned **Read only** therefore refuses F6 exactly as it
+refuses a write from the editor — the explain path asks the same
+`SqlEditorWidget::transaction_mode_refusal_for_statement` both Oracle batch
+loops ask, about the statement the backend will actually send
+(`ExplainPlanBackend::explain_statement`), not about the `SELECT` being
+explained. Asking with the user's text would answer "this is a read" and let
+the write through, which is what it used to do. MySQL/MariaDB `EXPLAIN` is a
+read and their mode lives on the session, so the same call answers `None` there
+and the pin does not block it. No query tab owns the live session, so nothing in the transaction
+model would ever resolve that write — a tab's auto-commit governs its own pooled
+session, and Commit/Rollback act on the tab's retained session by design — and
+it stayed an open transaction holding its rows and their locks for the life of
+the connection, growing with every F6. `QueryExecutor::get_explain_plan` and
+`get_thin_explain_plan` therefore roll it back themselves, in the function that
+issues the statement, after the plan rows have been read: user work never lives
+on this session, so there is nothing else for that rollback to reach. Guard
+`oracle_explain_plan_resolves_the_write_it_leaves_on_the_shared_session`; live
+check in `verify_explain_plan_live` (both Oracle drivers), which reads
+`v$transaction` on that very session after an F6.
+
 ## Read-only connections
 
 `ConnectionInfo::read_only` is a guard inside this process, not a server-side
