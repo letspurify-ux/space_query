@@ -58,6 +58,9 @@
 //       both apply at once, and unpinning one leaves the other in force.
 //   S24 the pin survives a change of the tab's scope (the object browser's
 //       database/schema selection), which re-applies the session context.
+//   S26 the other half of S3: a script SET AUTOCOMMIT that names the value the
+//       tab already has changes nothing, so it must NOT be refused over
+//       uncommitted work and must not stop the script that contains it.
 //
 // Usage: verify_auto_commit_live <thin|oci|mysql|mariadb|all>
 
@@ -520,6 +523,64 @@ fn run_scenarios(target: Target, h: &mut Harness) -> Result<(), String> {
         "S3 refused change had no effect (ROLLBACK undid the DML)",
         v == 3,
         format!("expected 3, got {v}"),
+    );
+
+    // ---- S26: a SET AUTOCOMMIT that changes nothing is never refused ------
+    // The other half of S3's rule. Only a real change is an option change, so
+    // a script that repeats the value the tab already has must run straight
+    // through even over uncommitted work. The OCI branch used to guard
+    // unconditionally while Thin and the MySQL family compared first, so this
+    // script stopped on one of the four backends and ran on the other three.
+    println!("  --- S26 a no-op SET AUTOCOMMIT over uncommitted work ---");
+    h.run("SET AUTOCOMMIT OFF")?;
+    let before = h.select_v()?;
+    h.run(dml)?; // open transaction, manual mode
+    let capture = h.run(&format!("SET AUTOCOMMIT OFF;\n{dml};"))?;
+    let refused = capture
+        .results
+        .iter()
+        .any(|r| !r.success && r.message.contains("auto-commit"))
+        || capture
+            .messages
+            .iter()
+            .any(|m| m.contains("Cannot change auto-commit"));
+    h.check(
+        "S26 a no-op SET AUTOCOMMIT is not refused",
+        !refused,
+        format!(
+            "results={:?} messages={:?}",
+            capture
+                .results
+                .iter()
+                .map(|r| (r.success, r.message.clone()))
+                .collect::<Vec<_>>(),
+            capture.messages
+        ),
+    );
+    let ran_after: Vec<(String, String)> = capture
+        .results
+        .iter()
+        .filter(|r| !r.success)
+        .map(|r| (r.sql.clone(), r.message.clone()))
+        .collect();
+    h.check(
+        "S26 the statement after the no-op still ran",
+        ran_after.is_empty() && !capture.results.is_empty(),
+        format!(
+            "failed={ran_after:?} results={:?}",
+            capture
+                .results
+                .iter()
+                .map(|r| (r.success, r.message.clone()))
+                .collect::<Vec<_>>()
+        ),
+    );
+    h.run("ROLLBACK")?;
+    let v = h.select_v()?;
+    h.check(
+        "S26 the tab stayed manual: both DMLs rolled back",
+        v == before,
+        format!("expected {before}, got {v}"),
     );
 
     // ---- S7: the menu write path, and what wins over auto-commit ----------

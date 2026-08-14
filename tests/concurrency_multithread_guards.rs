@@ -3340,6 +3340,41 @@ fn transaction_mode_state_has_a_single_source_of_truth() {
         toolbar_body.contains("end_mysql_residual_transaction_after_session_mode_change("),
         "the toolbar's retained-session mode change must return the MySQL session to a transaction boundary"
     );
+
+    // (16) The tab's own selection — the half of the application that decides
+    // whether the session-level isolation is reset — has ONE source: the tab's
+    // override slot, read where it is used. The thin batch used to take a
+    // snapshot of it at the batch's start while the OCI loop re-read the slot
+    // at every re-application, so after an adoption earlier in the same batch
+    // the two drivers issued different statements for the same script. A
+    // literal `None` stays legal: it is what a fresh CONNECT session and the
+    // test-only `plain` constructor mean — nothing has been adopted to reset.
+    assert!(
+        !execution.contains("tab_selected_transaction_mode"),
+        "the tab's selection must be read where it is used, not carried as a start-of-batch snapshot"
+    );
+    let compact_execution = compact_for_pattern(&execution);
+    let selections = compact_execution.match_indices("tab_selected:").count();
+    assert!(
+        selections >= 5,
+        "expected every Oracle transaction-mode application to name its tab selection (found {selections})"
+    );
+    for (index, _) in compact_execution.match_indices("tab_selected:") {
+        let tail_start = index + "tab_selected:".len();
+        let tail = &compact_execution[tail_start..(tail_start + 90).min(compact_execution.len())];
+        if tail.starts_with("Option<") {
+            // The field's own declaration, not a construction.
+            continue;
+        }
+        // Assert the invariant, not the formatting: rustfmt wraps the call and
+        // adds a trailing comma at some of these sites.
+        assert!(
+            tail.starts_with("None,")
+                || (tail.contains("load_mutex_transaction_mode_option")
+                    && tail.contains("tab_transaction_mode_override")),
+            "an Oracle transaction-mode application must read the tab override slot (or state None): {tail}"
+        );
+    }
 }
 
 /// The Oracle thin batch loop's own read-only gate, located without pinning
@@ -3392,7 +3427,63 @@ fn script_autocommit_changes_are_tab_local_for_all_backends() {
             !branch.contains(".set_auto_commit(enabled)"),
             "script autocommit changes must not mutate the shared connection default for other tabs: {branch}"
         );
+        // Only a real change is an option change. Two branches compared the
+        // requested value with the current one inline and the third did not,
+        // so a script repeating `SET AUTOCOMMIT OFF` after a DML stopped on
+        // OCI and ran on Oracle Thin and the MySQL family. The rule lives in
+        // one helper now, and every branch has to reach it through that helper
+        // rather than restate it.
+        assert!(
+            branch.contains("ensure_script_auto_commit_change_allowed("),
+            "every SET AUTOCOMMIT branch must decide through the shared no-op rule: {branch}"
+        );
+        assert!(
+            !branch.contains("if enabled == "),
+            "the no-op comparison belongs to ensure_script_auto_commit_change_allowed, not to a branch copy: {branch}"
+        );
     }
+}
+
+/// A script `CONNECT` replaces the connection, and the connection is where
+/// "the default isolation" comes from: it is what a tab that selected
+/// `Default` isolation asks the session to be put back to
+/// (`oracle_session_isolation_reset_statement`). Both Oracle drivers used to
+/// keep the value they read at execution start, so every statement after a
+/// CONNECT expressed the REPLACED server's level on the new one while the
+/// toolbar showed the new connection's.
+#[test]
+fn an_in_script_connect_adopts_the_new_connections_default_isolation() {
+    let compact = compact_for_pattern(&read_source("src/ui/sql_editor/execution.rs"));
+
+    // Both loops must be able to move it at all.
+    assert_eq!(
+        compact.matches("mutdefault_transaction_isolation").count(),
+        2,
+        "the OCI worker and the thin batch must each own a default isolation a CONNECT can replace"
+    );
+
+    // OCI: read from the candidate connection next to the other values the
+    // CONNECT adopts, then committed with them.
+    assert!(
+        compact
+            .contains("conn_guard.transaction_mode(),conn_guard.default_transaction_isolation(),"),
+        "the OCI CONNECT must read the new connection's default isolation with its other state"
+    );
+    assert!(
+        compact.contains("default_transaction_isolation=next_default_transaction_isolation;"),
+        "the OCI CONNECT must adopt the new connection's default isolation"
+    );
+
+    // Thin: carried on the candidate beside its auto-commit and transaction
+    // mode, and adopted where those are.
+    assert!(
+        compact.contains("guard.transaction_mode(),guard.default_transaction_isolation(),"),
+        "the thin CONNECT candidate must read the new connection's default isolation"
+    );
+    assert!(
+        compact.contains("default_transaction_isolation=candidate.default_transaction_isolation;"),
+        "the thin CONNECT must adopt the new connection's default isolation"
+    );
 }
 
 #[test]

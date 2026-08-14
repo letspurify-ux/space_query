@@ -78,7 +78,12 @@ setting, like auto-commit:
   acquire, the pre-action scope recheck, and grid-edit saves all override
   `DbPoolSessionContext::transaction_mode` with the tab's value.
 - The tab pin survives an in-script `CONNECT`, resolved over the new
-  connection's default.
+  connection's default. Everything else the mode is expressed with comes from
+  the new connection too — including its default isolation, which is what a tab
+  that selected `Default` asks the session to be put back to (see below).
+  Keeping the value read at execution start made both Oracle drivers express
+  the REPLACED server's level on the new one while the toolbar showed the new
+  connection's.
 
 ### Query-driven changes mirror into the tab and the UI
 
@@ -97,6 +102,22 @@ execution is not blocked.
 One-shot `SET TRANSACTION ...` forms, unqualified `@@` assignments,
 GLOBAL/PERSIST scopes, and unrecognized values are NOT adopted; they keep the
 conservative override-residue tracking described above.
+
+### A setting change that changes nothing is not a change
+
+Auto-commit and transaction mode are both refused while the session may hold
+uncommitted work, and both therefore have to agree on what a change is: a
+command or a selection that names the value already in force changes nothing,
+so it is neither guarded nor refused. The toolbar states this for transaction
+mode (`update_transaction_mode_from_controls` returns before its guard when the
+mode is unchanged) and
+`SqlEditorWidget::ensure_script_auto_commit_change_allowed` states it once for
+every backend's script `SET AUTOCOMMIT`. It used to be stated inline in the
+MySQL-family and Oracle Thin branches and was missing from the OCI one, so a
+script that repeats `SET AUTOCOMMIT OFF` after a DML stopped on OCI
+(continue-on-error is off by default) and ran everywhere else. The guard is
+passed as a closure so a no-op also skips the OCI branch's server round trip
+asking whether the session holds uncommitted work.
 
 ### Oracle: returning to Default resets the session
 

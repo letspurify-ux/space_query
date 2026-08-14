@@ -340,6 +340,12 @@ struct OracleThinConnectedCandidate {
     binding_revision: u64,
     auto_commit: bool,
     transaction_mode: crate::db::TransactionMode,
+    /// The new connection's own default isolation. `CONNECT` replaces the
+    /// connection, and "the connection default" is what a tab that selected
+    /// `Default` isolation asks the session to be put back to — resolved
+    /// against the connection the statements now run on, never the one that
+    /// was replaced.
+    default_transaction_isolation: crate::db::TransactionIsolation,
     connection_id: crate::db::ConnectionId,
     work_guard: crate::db::ConnectionWorkGuard,
 }
@@ -1118,18 +1124,16 @@ impl ExecutionWorkerBackend for OracleExecutionWorkerBackend {
             preconnected_info,
             runtime_work_guard,
         };
-        // Oracle allows SET TRANSACTION only as a transaction's first
-        // statement. When the user's own batch opens with one, the tab's mode
-        // must not be injected ahead of it or theirs is no longer first
-        // (ORA-01453). The batch loop yields that injection per statement
+        // `selected_transaction_mode` below stays the TAB's mode even when this
+        // batch opens with the user's own transaction-first statement. Oracle
+        // allows SET TRANSACTION only as a transaction's first statement, so an
+        // injection ahead of theirs would fail it with ORA-01453 — but the batch
+        // loop yields only the INJECTION for such a statement
         // (`is_transaction_first_statement` marks the mode applied without
-        // issuing it), so the mode itself stays the tab's: replacing it with
-        // the default here disarmed the Read only client gate — and the
-        // re-application after the user's transaction ends — for the WHOLE
-        // batch (live-observed: `SET TRANSACTION READ WRITE; INSERT ...` wrote
-        // on a Read only tab).
-        let tab_selected_transaction_mode =
-            load_mutex_transaction_mode_option(tab_transaction_mode_override);
+        // issuing it). Replacing the mode with the default here instead disarmed
+        // the Read only client gate — and the re-application after the user's
+        // transaction ends — for the WHOLE batch (live-observed:
+        // `SET TRANSACTION READ WRITE; INSERT ...` wrote on a Read only tab).
         let batch_outcome = SqlEditorWidget::execute_oracle_thin_batch_with_connection(
             &mut thin_conn,
             sender,
@@ -1141,7 +1145,6 @@ impl ExecutionWorkerBackend for OracleExecutionWorkerBackend {
             auto_commit,
             prior_retained_state,
             selected_transaction_mode,
-            tab_selected_transaction_mode,
             default_transaction_isolation,
             db_activity,
             current_operation_autocommit,
@@ -6928,6 +6931,34 @@ impl SqlEditorWidget {
         )
     }
 
+    /// The one rule every backend's script `SET AUTOCOMMIT` obeys: a command
+    /// that names the value the tab already has changes nothing, so it is not
+    /// an option change and the backend guard must not run — and must not
+    /// refuse it — over uncommitted work.
+    ///
+    /// Stated here because it used to be stated twice and missed once. The
+    /// MySQL-family and Oracle Thin branches compared the requested value with
+    /// the current one before guarding; the OCI branch always guarded, so a
+    /// script that repeats `SET AUTOCOMMIT OFF` after a DML stopped on OCI
+    /// (continue-on-error is off by default) while the same script ran on the
+    /// other three backends. The toolbar states the same rule for transaction
+    /// mode — `update_transaction_mode_from_controls` returns before its guard
+    /// when the mode is unchanged.
+    ///
+    /// The guard is a closure so a no-op costs nothing: the OCI branch asks the
+    /// server whether the session holds uncommitted work, and that round trip
+    /// is skipped along with the refusal.
+    fn ensure_script_auto_commit_change_allowed(
+        requested: bool,
+        current: bool,
+        guard: impl FnOnce() -> Result<(), String>,
+    ) -> Result<(), String> {
+        if requested == current {
+            return Ok(());
+        }
+        guard()
+    }
+
     /// Defense-in-depth for the screen/behavior contract: `displayed` is the
     /// effective transaction mode the toolbar choices last showed for this
     /// tab; refuse to execute when the mode about to be applied differs.
@@ -7810,15 +7841,17 @@ impl SqlEditorWidget {
                         }
                         ToolCommand::SetAutoCommit { enabled } => {
                             let prior_auto_commit = auto_commit;
-                            let apply_result = if enabled == prior_auto_commit {
-                                Ok(())
-                            } else {
-                                let statement_effects =
+                            let apply_result =
+                                SqlEditorWidget::ensure_script_auto_commit_change_allowed(
+                                    enabled,
+                                    prior_auto_commit,
+                                    || {
+                                        let statement_effects =
                                     SqlEditorWidget::mysql_statement_session_effects_for_sql_for_db_type(
                                         db_type,
                                         SqlEditorWidget::mysql_autocommit_command_sql(enabled),
                                     );
-                                match SqlEditorWidget::ensure_mysql_batch_transaction_option_change_allowed(
+                                        match SqlEditorWidget::ensure_mysql_batch_transaction_option_change_allowed(
                                     &mysql_batch_effects,
                                     statement_effects,
                                 ) {
@@ -7852,7 +7885,8 @@ impl SqlEditorWidget {
                                     }
                                     Err(message) => Err(message),
                                 }
-                            };
+                                    },
+                                );
                             match apply_result {
                                 Ok(()) => {
                                     SqlEditorWidget::apply_successful_mysql_autocommit_command_effects(
@@ -10180,7 +10214,9 @@ impl SqlEditorWidget {
                     db_type,
                     auto_commit,
                     selected_transaction_mode,
-                    default_transaction_isolation,
+                    // Reassigned by a script `CONNECT`: it is the CONNECTION's
+                    // default, and CONNECT replaces the connection.
+                    mut default_transaction_isolation,
                     session,
                 } = match Self::begin_execution_worker(
                     startup,
@@ -11450,19 +11486,30 @@ impl SqlEditorWidget {
 
                                 }
                                 ToolCommand::SetAutoCommit { enabled } => {
-                                    let live_may_have_uncommitted_work =
-                                        conn_opt.as_ref().is_some_and(|conn| {
-                                            SqlEditorWidget::oracle_session_may_have_uncommitted_work(
-                                                conn.as_ref(),
-                                                &db_activity,
+                                    // Same rule as the Thin and MySQL-family
+                                    // branches: a command that names the value
+                                    // the tab already has is not an option
+                                    // change, so it neither asks the server
+                                    // about uncommitted work nor is refused
+                                    // over it.
+                                    let guard_result = SqlEditorWidget::ensure_script_auto_commit_change_allowed(
+                                        enabled,
+                                        auto_commit,
+                                        || {
+                                            let live_may_have_uncommitted_work =
+                                                conn_opt.as_ref().is_some_and(|conn| {
+                                                    SqlEditorWidget::oracle_session_may_have_uncommitted_work(
+                                                        conn.as_ref(),
+                                                        &db_activity,
+                                                    )
+                                                });
+                                            cleanup.ensure_oracle_retained_option_change_allowed(
+                                                live_may_have_uncommitted_work,
+                                                "auto-commit",
                                             )
-                                        });
-                                    if let Err(message) = cleanup
-                                        .ensure_oracle_retained_option_change_allowed(
-                                            live_may_have_uncommitted_work,
-                                            "auto-commit",
-                                        )
-                                    {
+                                        },
+                                    );
+                                    if let Err(message) = guard_result {
                                         SqlEditorWidget::emit_script_message(
                                             &sender,
                                             &session,
@@ -11911,6 +11958,7 @@ impl SqlEditorWidget {
                                                     next_connection_generation,
                                                     next_auto_commit,
                                                     next_transaction_mode,
+                                                    next_default_transaction_isolation,
                                                 ) = {
                                                     let mut conn_guard =
                                                         lock_connection_with_activity(
@@ -11926,6 +11974,7 @@ impl SqlEditorWidget {
                                                         conn_guard.connection_generation(),
                                                         conn_guard.auto_commit(),
                                                         conn_guard.transaction_mode(),
+                                                        conn_guard.default_transaction_isolation(),
                                                     )
                                                 };
                                                 // Like the thin CONNECT path: the
@@ -12120,6 +12169,19 @@ impl SqlEditorWidget {
                                                     next_connection_generation;
                                                 conn_opt = next_conn_opt;
                                                 conn_name = next_conn_name;
+                                                // "The connection default" that a
+                                                // tab selecting `Default` isolation
+                                                // is put back to belongs to the
+                                                // connection, not to the tab, so it
+                                                // has to come from the one the rest
+                                                // of this batch runs on: the
+                                                // mid-batch re-application below
+                                                // would otherwise set the REPLACED
+                                                // server's level on the new session
+                                                // while the toolbar reads the new
+                                                // connection's.
+                                                default_transaction_isolation =
+                                                    next_default_transaction_isolation;
                                                 // Like the thin CONNECT path: a
                                                 // tab-level SET AUTOCOMMIT survives
                                                 // switching connections, so resolve
@@ -17210,6 +17272,7 @@ impl SqlEditorWidget {
             pool_context_epoch,
             auto_commit,
             transaction_mode,
+            default_transaction_isolation,
             activity_guard,
         ) = {
             let mut guard = lock_connection_with_activity(&candidate_connection, db_activity);
@@ -17221,6 +17284,7 @@ impl SqlEditorWidget {
                 guard.pool_context_epoch(),
                 guard.auto_commit(),
                 guard.transaction_mode(),
+                guard.default_transaction_isolation(),
                 activity_guard,
             )
         };
@@ -17296,6 +17360,7 @@ impl SqlEditorWidget {
             binding_revision,
             auto_commit,
             transaction_mode,
+            default_transaction_isolation,
             connection_id: candidate_runtime_id,
             work_guard: candidate_work_guard,
         })
@@ -17335,7 +17400,6 @@ impl SqlEditorWidget {
             initial_auto_commit,
             prior_retained_state,
             selected_transaction_mode,
-            None,
             crate::db::TransactionIsolation::Default,
             db_activity,
             current_operation_autocommit,
@@ -17360,8 +17424,9 @@ impl SqlEditorWidget {
         initial_auto_commit: bool,
         prior_retained_state: RetainedSessionState,
         selected_transaction_mode: crate::db::TransactionMode,
-        tab_selected_transaction_mode: Option<crate::db::TransactionMode>,
-        default_transaction_isolation: crate::db::TransactionIsolation,
+        // Reassigned by a script `CONNECT`: it is the CONNECTION's default, and
+        // CONNECT replaces the connection.
+        mut default_transaction_isolation: crate::db::TransactionIsolation,
         db_activity: &str,
         current_operation_autocommit: &Arc<Mutex<bool>>,
         tab_auto_commit_override: Option<&Arc<Mutex<Option<bool>>>>,
@@ -17688,15 +17753,17 @@ impl SqlEditorWidget {
                             // while the session may hold uncommitted work, then store
                             // the change as this tab's override so it outlives the
                             // batch without touching the shared connection default.
-                            let guard_result = if enabled == auto_commit {
-                                Ok(())
-                            } else {
-                                Self::ensure_oracle_retained_option_change_allowed(
-                                    retained_state,
-                                    conn.transaction_in_progress(),
-                                    "auto-commit",
-                                )
-                            };
+                            let guard_result = Self::ensure_script_auto_commit_change_allowed(
+                                enabled,
+                                auto_commit,
+                                || {
+                                    Self::ensure_oracle_retained_option_change_allowed(
+                                        retained_state,
+                                        conn.transaction_in_progress(),
+                                        "auto-commit",
+                                    )
+                                },
+                            );
                             match guard_result {
                                 Ok(()) => {
                                     auto_commit = enabled;
@@ -18290,6 +18357,16 @@ impl SqlEditorWidget {
                                         tab_transaction_mode_override
                                             .and_then(load_mutex_transaction_mode_option),
                                     );
+                                    // ... but "the connection default" that a
+                                    // tab selecting `Default` isolation is put
+                                    // back to belongs to the connection, not to
+                                    // the tab: it has to come from the one the
+                                    // statements after this run on, or the
+                                    // session-level reset would set the
+                                    // REPLACED server's level while the toolbar
+                                    // reads the new one's.
+                                    default_transaction_isolation =
+                                        candidate.default_transaction_isolation;
                                     transaction_mode_applied = false;
                                     continue_on_error = session
                                         .lock()
@@ -18612,7 +18689,16 @@ impl SqlEditorWidget {
                     if !transaction_mode_applied {
                         let transaction_mode_application = OracleTransactionModeApplication {
                             mode: active_transaction_mode,
-                            tab_selected: tab_selected_transaction_mode,
+                            // Read here, not captured at the batch's start, so
+                            // both Oracle loops answer from the same place: the
+                            // OCI loop re-reads this slot at every
+                            // re-application, and an adoption earlier in THIS
+                            // batch has already re-pinned it (a merged mode the
+                            // session now really carries). A snapshot would keep
+                            // asking for a session-level reset the tab no longer
+                            // wants.
+                            tab_selected: tab_transaction_mode_override
+                                .and_then(load_mutex_transaction_mode_option),
                             default_isolation: default_transaction_isolation,
                         };
                         for (tx_sql, restores_session_default) in transaction_mode_application
@@ -25685,6 +25771,54 @@ mod query_execution_cleanup_tests {
         cleanup.protect_oracle_dirty_statement_on_cancel(false);
         assert!(!cleanup.oracle_pooled_session_invalidated_on_cancel);
         assert!(cleanup.oracle_pooled_session_transaction_decision_on_cancel);
+    }
+
+    #[test]
+    fn a_script_set_autocommit_that_changes_nothing_is_never_refused() {
+        // The rule every backend's `SET AUTOCOMMIT` branch obeys: only a real
+        // change is an option change. The OCI branch used to guard
+        // unconditionally, so `SET AUTOCOMMIT OFF` on an already-manual tab
+        // stopped a script that had uncommitted work, while Oracle Thin and the
+        // MySQL family ran it.
+        let mut guard_calls = 0usize;
+        for (requested, current) in [(true, true), (false, false)] {
+            let result = SqlEditorWidget::ensure_script_auto_commit_change_allowed(
+                requested,
+                current,
+                || {
+                    guard_calls += 1;
+                    Err("the session may hold uncommitted work".to_string())
+                },
+            );
+            assert!(
+                result.is_ok(),
+                "a SET AUTOCOMMIT naming the current value must not be refused"
+            );
+        }
+        assert_eq!(
+            guard_calls, 0,
+            "a no-op must not even ask the backend guard: the OCI guard is a server round trip"
+        );
+
+        // A real change still goes through the backend guard, in both
+        // directions, and its refusal is reported verbatim.
+        for (requested, current) in [(true, false), (false, true)] {
+            let message = SqlEditorWidget::ensure_script_auto_commit_change_allowed(
+                requested,
+                current,
+                || {
+                    guard_calls += 1;
+                    Err("the session may hold uncommitted work".to_string())
+                },
+            )
+            .expect_err("a real change must be refused when the guard refuses");
+            assert_eq!(message, "the session may hold uncommitted work");
+        }
+        assert_eq!(guard_calls, 2, "every real change must consult the guard");
+        assert!(
+            SqlEditorWidget::ensure_script_auto_commit_change_allowed(true, false, || Ok(()))
+                .is_ok()
+        );
     }
 
     #[test]
