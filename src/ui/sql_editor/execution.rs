@@ -420,6 +420,76 @@ struct MySqlPooledSessionDisposition<'a> {
     connection_generation: u64,
     pool_context_epoch: u64,
     db_activity: &'a str,
+    hand_back: BatchSessionHandBack<'a>,
+}
+
+/// A worker's claim on its tab's session slot: which execution is handing the
+/// session back, and where to tell the user when that hand-back loses work.
+///
+/// Every backend's worker hands its session back through this one value, so
+/// none of them can forget to say whose session it is. A force-cancelled batch
+/// is ABANDONED, not joined — the tab reads idle while the worker is still
+/// unwinding — and `SharedDbSessionLease::hand_back_worker_session` closes such
+/// a batch's session instead of filing it over the session the tab's NEW batch
+/// is running on.
+#[derive(Clone, Copy)]
+pub(super) struct BatchSessionHandBack<'a> {
+    owner: &'a crate::db::SessionHandBackOwner,
+    sender: Option<&'a QueryProgressSender>,
+}
+
+impl<'a> BatchSessionHandBack<'a> {
+    fn new(
+        owner: &'a crate::db::SessionHandBackOwner,
+        sender: Option<&'a QueryProgressSender>,
+    ) -> Self {
+        Self { owner, sender }
+    }
+
+    /// Whether the tab is still on the execution this value speaks for.
+    ///
+    /// Asked before TAKING the tab's lease as well as before handing a session
+    /// back: an abandoned batch must not take the newer batch's session out of
+    /// the slot either.
+    fn is_current(&self) -> bool {
+        self.owner.is_current()
+    }
+
+    /// Hand the session back to the tab. Answers whether it reached the slot.
+    fn apply(
+        &self,
+        pooled_db_session: &SharedDbSessionLease,
+        connection_generation: u64,
+        pool_context_epoch: u64,
+        lease: crate::db::DbSessionLease,
+        disposition: crate::db::RetainedSessionDisposition,
+        log_context: &str,
+        current_scope: Option<String>,
+    ) -> bool {
+        let retained_state = match disposition {
+            crate::db::RetainedSessionDisposition::Retain(retained_state) => retained_state,
+            crate::db::RetainedSessionDisposition::DiscardPhysical => {
+                RetainedSessionState::default()
+            }
+        };
+        let outcome = pooled_db_session.hand_back_worker_session(
+            self.owner,
+            connection_generation,
+            pool_context_epoch,
+            lease,
+            disposition,
+            log_context,
+            current_scope,
+        );
+        if outcome.abandoned_work() {
+            SqlEditorWidget::report_retained_session_lost_with_work(
+                self.sender,
+                retained_state,
+                log_context,
+            );
+        }
+        outcome.stored()
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -437,6 +507,7 @@ impl<'a> MySqlPooledSessionDisposition<'a> {
         connection_generation: u64,
         pool_context_epoch: u64,
         db_activity: &'a str,
+        hand_back: BatchSessionHandBack<'a>,
     ) -> Self {
         Self {
             shared_connection,
@@ -444,6 +515,7 @@ impl<'a> MySqlPooledSessionDisposition<'a> {
             connection_generation,
             pool_context_epoch,
             db_activity,
+            hand_back,
         }
     }
 
@@ -462,6 +534,7 @@ impl<'a> MySqlPooledSessionDisposition<'a> {
             disposition,
             self.db_activity,
             session_scope,
+            self.hand_back,
         );
     }
 
@@ -966,6 +1039,17 @@ impl ExecutionWorkerBackend for OracleExecutionWorkerBackend {
         if preconnected_info.is_none()
             && !SqlEditorWidget::operation_snapshot_is_current(current_operation_id, operation_id)
         {
+            SqlEditorWidget::abandon_oracle_thin_batch_session(
+                pooled_db_session,
+                sender,
+                current_operation_id,
+                operation_id,
+                connection_generation,
+                pool_context_epoch,
+                thin_conn,
+                prior_retained_state,
+                active_scope.clone(),
+            );
             return ExecutionWorkerOutcome::Handled;
         }
 
@@ -987,6 +1071,17 @@ impl ExecutionWorkerBackend for OracleExecutionWorkerBackend {
                 current_oracle_thin_cancel_context,
                 current_query_cancel_handle,
                 None,
+            );
+            SqlEditorWidget::abandon_oracle_thin_batch_session(
+                pooled_db_session,
+                sender,
+                current_operation_id,
+                operation_id,
+                connection_generation,
+                pool_context_epoch,
+                thin_conn,
+                prior_retained_state,
+                active_scope.clone(),
             );
             return ExecutionWorkerOutcome::Handled;
         }
@@ -1202,7 +1297,12 @@ impl ExecutionWorkerBackend for OracleExecutionWorkerBackend {
             health_check_ok,
         );
         if transition_context.connected {
-            pooled_db_session.apply_retained_session_disposition_with_scope(
+            let owner = crate::db::SessionHandBackOwner::for_operation(
+                Some(current_operation_id),
+                operation_id,
+            );
+            BatchSessionHandBack::new(&owner, Some(sender)).apply(
+                pooled_db_session,
                 transition_context.connection_generation,
                 batch_outcome
                     .refreshed_pool_context_epoch
@@ -1440,6 +1540,7 @@ struct OracleCleanupSessionDecisionApplier<'a> {
     reuse_state: TransactionSessionState,
     force_discard_after_transaction_resolution: bool,
     log_context: &'a str,
+    hand_back: BatchSessionHandBack<'a>,
 }
 
 impl OracleCleanupSessionDecisionApplier<'_> {
@@ -1501,15 +1602,15 @@ impl OracleCleanupSessionDecisionApplier<'_> {
     }
 
     fn store_retained_state(&mut self, retained_state: RetainedSessionState) {
-        self.pooled_db_session
-            .apply_retained_session_disposition_with_scope(
-                self.connection_generation,
-                self.pool_context_epoch,
-                DbSessionLease::Oracle(Arc::clone(self.conn)),
-                crate::db::RetainedSessionDisposition::Retain(retained_state),
-                self.log_context,
-                self.current_scope.clone(),
-            );
+        self.hand_back.apply(
+            self.pooled_db_session,
+            self.connection_generation,
+            self.pool_context_epoch,
+            DbSessionLease::Oracle(Arc::clone(self.conn)),
+            crate::db::RetainedSessionDisposition::Retain(retained_state),
+            self.log_context,
+            self.current_scope.clone(),
+        );
     }
 
     fn store_state(&mut self, transaction_state: TransactionSessionState) {
@@ -2379,6 +2480,14 @@ impl Drop for QueryExecutionCleanupGuard {
                 .oracle_pooled_session_scope_connection
                 .as_ref()
                 .and_then(|_| self.oracle_pooled_session_scope.clone());
+            // Which execution this session belongs to. A force-cancelled batch
+            // unwinds while the tab is already running the next one, and filing
+            // this session then costs that batch its own — see
+            // `SharedDbSessionLease::hand_back_worker_session`.
+            let owner = crate::db::SessionHandBackOwner::for_operation(
+                Some(&self.current_operation_id),
+                self.execution_metadata.operation_id,
+            );
             let mut applier = OracleCleanupSessionDecisionApplier {
                 pooled_db_session,
                 connection_generation: *connection_generation,
@@ -2391,6 +2500,7 @@ impl Drop for QueryExecutionCleanupGuard {
                 reuse_state,
                 force_discard_after_transaction_resolution,
                 log_context: "sql_editor::cleanup",
+                hand_back: BatchSessionHandBack::new(&owner, Some(&self.sender)),
             };
             crate::db::session_policy::apply_session_decision(session_decision, &mut applier);
         }
@@ -6130,6 +6240,12 @@ impl SqlEditorWidget {
             statement_effects,
         );
         let state_hint = statement_effects.state_hint;
+        // A lazy fetch deliberately OUTLIVES the operation that started it —
+        // rows keep streaming after the batch reports finished — so its
+        // hand-back cannot be judged by operation currency. Its own gate
+        // (`lazy_fetch_can_keep_session`) is what says whether this fetch is
+        // still the tab's.
+        let lazy_fetch_hand_back_owner = crate::db::SessionHandBackOwner::untracked();
         let db_display_name = connection_info.db_type.display_name();
         let (command_sender, command_receiver) = mpsc::channel::<LazyFetchCommand>();
         let lazy_cancel_context: Arc<Mutex<Option<MySqlQueryCancelContext>>> =
@@ -6794,6 +6910,10 @@ impl SqlEditorWidget {
                                     retained_state,
                                     "mysql lazy fetch cleanup",
                                     execution_scope.clone(),
+                                    BatchSessionHandBack::new(
+                                        &lazy_fetch_hand_back_owner,
+                                        Some(&sender),
+                                    ),
                                 );
                             } else {
                                 Self::discard_mysql_pooled_connection(conn);
@@ -7438,6 +7558,13 @@ impl SqlEditorWidget {
             return;
         }
         let lazy_fetch_single_statement = Self::should_use_lazy_fetch_for_single_statement(&items);
+        // Whose session this batch is holding. A force-cancelled batch keeps
+        // unwinding after the tab has started the next one, and every hand-back
+        // below is refused once that happens rather than filing this batch's
+        // session over the newer one's.
+        let hand_back_owner =
+            crate::db::SessionHandBackOwner::for_operation(current_operation_id, operation_id);
+        let hand_back = BatchSessionHandBack::new(&hand_back_owner, Some(sender));
 
         let _ = sender.send(QueryProgress::BatchStart {
             activity: db_activity.to_string(),
@@ -8629,6 +8756,7 @@ impl SqlEditorWidget {
                             false,
                             None,
                             false,
+                            hand_back,
                         ) {
                             Ok(AcquiredMySqlPooledSession {
                                 connection_generation,
@@ -8669,6 +8797,7 @@ impl SqlEditorWidget {
                                             db_activity,
                                             message,
                                             session_scope,
+                                            hand_back,
                                         );
                                             let index = result_index;
                                             SqlEditorWidget::emit_statement_start(
@@ -9197,8 +9326,7 @@ impl SqlEditorWidget {
             script_mode,
             auto_commit,
             db_activity,
-            current_operation_id,
-            operation_id,
+            hand_back,
         );
     }
 
@@ -10358,8 +10486,10 @@ impl SqlEditorWidget {
                         return;
                     }
                     };
-                let oracle_prior_requires_physical_session_preservation =
-                    oracle_prior_retained_state.requires_physical_session_preservation();
+                let oracle_session_may_state_transaction_mode =
+                    SqlEditorWidget::oracle_session_may_state_transaction_mode(
+                        oracle_prior_retained_state,
+                    );
 
                 let mut connection_generation = conn_guard.connection_generation();
 
@@ -10481,7 +10611,7 @@ impl SqlEditorWidget {
                 // mid-batch re-application restores the pin once that
                 // transaction ends.
                 let should_apply_oracle_transaction_mode =
-                    !oracle_prior_requires_physical_session_preservation
+                    oracle_session_may_state_transaction_mode
                         && !batch_starts_with_connect
                         && !explicit_transaction_first_statement;
 
@@ -16610,10 +16740,38 @@ impl SqlEditorWidget {
         retained_state
     }
 
+    /// Whether this batch may state the tab's transaction mode on the session
+    /// it was handed, before its first statement.
+    ///
+    /// Oracle expresses the mode as a property of the TRANSACTION, so the
+    /// statements that express it (`SET TRANSACTION`, `ALTER SESSION SET
+    /// ISOLATION_LEVEL`) have to be first in their transaction: a session that
+    /// may still hold one refuses them with ORA-01453, and the mode waits for
+    /// the next boundary inside the batch instead. That open transaction is the
+    /// ONLY reason to wait.
+    ///
+    /// Session RESIDUE is not: a `SET ROLE`, an unknown `ALTER SESSION`, a
+    /// temporary table or statement diagnostics all preserve the physical
+    /// session for its tab while opening no transaction at all. Asking the
+    /// broader `requires_physical_session_preservation` here ran every
+    /// statement of the batch at the SESSION DEFAULT while the toolbar showed
+    /// the pin — for the whole batch on OCI and on thin's lazy SELECT path,
+    /// while thin's own batch loop corrected itself at its first statement.
+    /// One script, two answers.
+    ///
+    /// Both Oracle drivers ask this one function; the MySQL family needs no
+    /// equivalent because it states the mode as SESSION state when it prepares
+    /// the session, which a preserved session still carries.
+    fn oracle_session_may_state_transaction_mode(
+        prior_retained_state: RetainedSessionState,
+    ) -> bool {
+        !prior_retained_state.may_have_uncommitted_work()
+    }
+
     fn should_apply_oracle_thin_transaction_mode(
         prior_retained_state: RetainedSessionState,
     ) -> bool {
-        !prior_retained_state.requires_physical_session_preservation()
+        Self::oracle_session_may_state_transaction_mode(prior_retained_state)
     }
 
     fn apply_oracle_thin_transaction_mode_for_execution(
@@ -22253,8 +22411,7 @@ impl SqlEditorWidget {
         script_mode: bool,
         auto_commit: bool,
         db_activity: &str,
-        current_operation_id: Option<&Arc<AtomicU64>>,
-        operation_id: u64,
+        hand_back: BatchSessionHandBack<'_>,
     ) {
         // A force-cancelled batch is ABANDONED, not joined: the tab is marked
         // idle and the user can start a new execution while this worker is
@@ -22264,9 +22421,7 @@ impl SqlEditorWidget {
         // path already refuses on this exact check; the batch's own ending must
         // too. Generation and epoch cannot see it: the new execution runs on
         // the same connection.
-        if current_operation_id.is_some_and(|current_operation_id| {
-            !Self::operation_snapshot_is_current(current_operation_id, operation_id)
-        }) {
+        if !hand_back.is_current() {
             crate::utils::logging::log_warning(
                 db_activity,
                 "Skipped MySQL batch retained-session finalization: the tab has moved on to a newer operation",
@@ -22335,6 +22490,7 @@ impl SqlEditorWidget {
                 decision,
                 db_activity,
                 session_scope,
+                hand_back,
             );
             return;
         }
@@ -22348,6 +22504,7 @@ impl SqlEditorWidget {
                 crate::db::RetainedSessionOutcome::DiscardPhysical,
                 db_activity,
                 session_scope,
+                hand_back,
             );
             return;
         }
@@ -22368,6 +22525,7 @@ impl SqlEditorWidget {
             outcome,
             db_activity,
             session_scope,
+            hand_back,
         );
     }
 
@@ -22380,6 +22538,7 @@ impl SqlEditorWidget {
         decision: crate::db::MySqlInterruptedBatchSessionDecision,
         db_activity: &str,
         session_scope: Option<String>,
+        hand_back: BatchSessionHandBack<'_>,
     ) {
         let mut outcome = decision.outcome;
         if decision.requires_session_info_sync {
@@ -22414,6 +22573,7 @@ impl SqlEditorWidget {
             outcome,
             db_activity,
             session_scope,
+            hand_back,
         );
     }
 
@@ -22886,6 +23046,40 @@ impl SqlEditorWidget {
             && prior_retained_state.requires_physical_session_preservation()
     }
 
+    /// Give up a thin batch's session because the tab has moved on to a newer
+    /// execution.
+    ///
+    /// The session was already taken OUT of the tab's slot, so simply returning
+    /// drops it into the pool, where `reset_before_reuse` rolls back whatever
+    /// the user had not committed — in silence, which is exactly what
+    /// `RETAINED_SESSION_LOST_WITH_WORK` exists to prevent. Handing it back
+    /// through the one door closes it deliberately and says so.
+    fn abandon_oracle_thin_batch_session(
+        pooled_db_session: &SharedDbSessionLease,
+        sender: &QueryProgressSender,
+        current_operation_id: &Arc<AtomicU64>,
+        operation_id: u64,
+        connection_generation: u64,
+        pool_context_epoch: u64,
+        thin_conn: PooledThinConnection<OracleThinSession>,
+        prior_retained_state: RetainedSessionState,
+        current_scope: Option<String>,
+    ) {
+        let owner = crate::db::SessionHandBackOwner::for_operation(
+            Some(current_operation_id),
+            operation_id,
+        );
+        BatchSessionHandBack::new(&owner, Some(sender)).apply(
+            pooled_db_session,
+            connection_generation,
+            pool_context_epoch,
+            DbSessionLease::OracleThin(Box::new(thin_conn)),
+            crate::db::RetainedSessionDisposition::Retain(prior_retained_state),
+            "oracle thin execution",
+            current_scope,
+        );
+    }
+
     /// Tell the user when the retained session the app recorded work on was
     /// found dead and replaced with a fresh one.
     ///
@@ -22927,6 +23121,7 @@ impl SqlEditorWidget {
         require_existing_session: bool,
         required_resolution_action: Option<RetainedSessionResolutionAction>,
         statement_requires_transaction_boundary: bool,
+        hand_back: BatchSessionHandBack<'_>,
     ) -> Result<AcquiredMySqlPooledSession, String> {
         let (context, activity) = {
             let mut conn_guard =
@@ -22989,6 +23184,7 @@ impl SqlEditorWidget {
                                 prior_retained_state,
                                 db_activity,
                                 retained_scope,
+                                hand_back,
                             );
                             return Err(message);
                         }
@@ -23134,6 +23330,7 @@ impl SqlEditorWidget {
                                     db_activity,
                                     message,
                                     session_scope,
+                                    hand_back,
                                 ),
                             );
                         }
@@ -23194,6 +23391,7 @@ impl SqlEditorWidget {
                             db_activity,
                             message,
                             session_scope,
+                            hand_back,
                         ),
                     );
                 }
@@ -23268,6 +23466,7 @@ impl SqlEditorWidget {
                     db_activity,
                     message,
                     session_scope,
+                    hand_back,
                 ),
             );
         }
@@ -23463,8 +23662,10 @@ impl SqlEditorWidget {
         retained_state: RetainedSessionState,
         current_scope: Option<String>,
         log_context: &str,
+        hand_back: BatchSessionHandBack<'_>,
     ) {
-        pooled_db_session.apply_retained_session_disposition_with_scope(
+        hand_back.apply(
+            pooled_db_session,
             connection_generation,
             pool_context_epoch,
             DbSessionLease::MySQL { conn, db_type },
@@ -23487,6 +23688,7 @@ impl SqlEditorWidget {
         disposition: crate::db::RetainedSessionOutcome,
         current_scope: Option<String>,
         log_context: &str,
+        hand_back: BatchSessionHandBack<'_>,
     ) {
         match disposition {
             crate::db::RetainedSessionOutcome::Retain(retained_state) => {
@@ -23499,6 +23701,7 @@ impl SqlEditorWidget {
                     retained_state,
                     current_scope,
                     log_context,
+                    hand_back,
                 );
             }
             crate::db::RetainedSessionOutcome::DiscardPhysical => {
@@ -23516,6 +23719,7 @@ impl SqlEditorWidget {
         disposition: crate::db::RetainedSessionOutcome,
         db_activity: &str,
         explicit_scope: Option<String>,
+        hand_back: BatchSessionHandBack<'_>,
     ) {
         let scope_context = {
             let conn_guard =
@@ -23541,6 +23745,7 @@ impl SqlEditorWidget {
                 disposition,
                 current_scope,
                 db_activity,
+                hand_back,
             );
         } else {
             Self::discard_mysql_pooled_connection(conn);
@@ -23556,6 +23761,7 @@ impl SqlEditorWidget {
         retained_state: RetainedSessionState,
         db_activity: &str,
         explicit_scope: Option<String>,
+        hand_back: BatchSessionHandBack<'_>,
     ) {
         Self::apply_mysql_pooled_session_disposition_if_current_with_scope(
             shared_connection,
@@ -23566,6 +23772,7 @@ impl SqlEditorWidget {
             crate::db::RetainedSessionOutcome::Retain(retained_state),
             db_activity,
             explicit_scope,
+            hand_back,
         );
     }
 
@@ -23613,6 +23820,7 @@ impl SqlEditorWidget {
         db_activity: &str,
         message: String,
         session_scope: Option<String>,
+        hand_back: BatchSessionHandBack<'_>,
     ) -> String {
         MySqlPooledSessionDisposition::new(
             shared_connection,
@@ -23620,6 +23828,7 @@ impl SqlEditorWidget {
             connection_generation,
             pool_context_epoch,
             db_activity,
+            hand_back,
         )
         .apply_error_policy(
             conn,
@@ -23640,6 +23849,7 @@ impl SqlEditorWidget {
         db_activity: &str,
         message: String,
         session_scope: Option<String>,
+        hand_back: BatchSessionHandBack<'_>,
     ) -> String {
         MySqlPooledSessionDisposition::new(
             shared_connection,
@@ -23647,6 +23857,7 @@ impl SqlEditorWidget {
             connection_generation,
             pool_context_epoch,
             db_activity,
+            hand_back,
         )
         .apply_error_policy(
             conn,
@@ -23678,6 +23889,7 @@ impl SqlEditorWidget {
         db_activity: &str,
         message: String,
         session_scope: Option<String>,
+        hand_back: BatchSessionHandBack<'_>,
     ) -> String {
         let disposition = Self::mysql_retained_session_scope_recheck_error_outcome(
             prior_retained_state,
@@ -23689,6 +23901,7 @@ impl SqlEditorWidget {
             connection_generation,
             pool_context_epoch,
             db_activity,
+            hand_back,
         )
         .apply_with_scope(conn, disposition, session_scope);
         message
@@ -23702,6 +23915,12 @@ impl SqlEditorWidget {
         enabled: bool,
         db_activity: &str,
     ) -> crate::db::RetainedSessionMutationOutcome {
+        // A toolbar/menu option change runs on the UI thread with no batch of
+        // its own: the option gate has already refused it while the tab is
+        // executing, so there is no newer operation this session could belong
+        // to.
+        let hand_back_owner = crate::db::SessionHandBackOwner::untracked();
+        let hand_back = BatchSessionHandBack::new(&hand_back_owner, None);
         let Some(db_type) = Self::mysql_pooled_session_db_type_for_generation(
             shared_connection,
             connection_generation,
@@ -23740,6 +23959,7 @@ impl SqlEditorWidget {
                 prior_retained_state,
                 db_activity,
                 session_scope,
+                hand_back,
             );
             return crate::db::RetainedSessionMutationOutcome::BlockedRequiresResolution(err);
         }
@@ -23760,6 +23980,7 @@ impl SqlEditorWidget {
                 db_activity,
                 message,
                 session_scope,
+                hand_back,
             );
             return crate::db::RetainedSessionMutationOutcome::FailedDiscarded(message);
         }
@@ -23794,6 +24015,7 @@ impl SqlEditorWidget {
             retained_state,
             db_activity,
             session_scope,
+            hand_back,
         );
         crate::db::RetainedSessionMutationOutcome::Applied
     }
@@ -23806,6 +24028,12 @@ impl SqlEditorWidget {
         mode: crate::db::TransactionMode,
         db_activity: &str,
     ) -> crate::db::RetainedSessionMutationOutcome {
+        // A toolbar/menu option change runs on the UI thread with no batch of
+        // its own: the option gate has already refused it while the tab is
+        // executing, so there is no newer operation this session could belong
+        // to.
+        let hand_back_owner = crate::db::SessionHandBackOwner::untracked();
+        let hand_back = BatchSessionHandBack::new(&hand_back_owner, None);
         let Some((db_type, default_transaction_isolation)) = ({
             let conn_guard =
                 lock_connection_with_activity(shared_connection, db_activity.to_string());
@@ -23845,6 +24073,7 @@ impl SqlEditorWidget {
                 prior_retained_state,
                 db_activity,
                 session_scope,
+                hand_back,
             );
             return crate::db::RetainedSessionMutationOutcome::BlockedRequiresResolution(err);
         }
@@ -23901,6 +24130,7 @@ impl SqlEditorWidget {
                         .with_transaction_mode_override_cleared(),
                     db_activity,
                     session_scope,
+                    hand_back,
                 );
                 crate::db::RetainedSessionMutationOutcome::Applied
             }
@@ -23915,6 +24145,7 @@ impl SqlEditorWidget {
                     db_activity,
                     message,
                     session_scope,
+                    hand_back,
                 );
                 crate::db::RetainedSessionMutationOutcome::FailedDiscarded(message)
             }
@@ -24872,6 +25103,13 @@ impl SqlEditorWidget {
                 || crate::db::transaction::mysql_statement_sets_next_transaction_mode_override(
                     statement_sql,
                 );
+        // Which execution owns this session. The MySQL family re-acquires the
+        // tab's session per statement, so an abandoned batch that reaches one
+        // of the hand-backs below would otherwise file its session over the one
+        // the tab's newer batch is running on.
+        let hand_back_owner =
+            crate::db::SessionHandBackOwner::for_operation(current_operation_id, operation_id);
+        let hand_back = BatchSessionHandBack::new(&hand_back_owner, session_pool_sender);
         let AcquiredMySqlPooledSession {
             connection_generation,
             pool_context_epoch,
@@ -24893,6 +25131,7 @@ impl SqlEditorWidget {
             require_existing_session,
             required_resolution_action,
             statement_requires_transaction_boundary,
+            hand_back,
         )?;
         let db_type = connection_info.db_type;
         let db_display_name = db_type.display_name();
@@ -24921,6 +25160,7 @@ impl SqlEditorWidget {
                 prior_retained_state,
                 log_context,
                 session_scope.clone(),
+                hand_back,
             );
             return Err(Self::cancel_message());
         }
@@ -24939,6 +25179,7 @@ impl SqlEditorWidget {
                     prior_retained_state,
                     log_context,
                     session_scope.clone(),
+                    hand_back,
                 );
                 return Err(err);
             }
@@ -24957,6 +25198,7 @@ impl SqlEditorWidget {
                 prior_retained_state,
                 log_context,
                 session_scope.clone(),
+                hand_back,
             );
             return Err(err);
         }
@@ -24973,6 +25215,7 @@ impl SqlEditorWidget {
                 prior_retained_state,
                 log_context,
                 session_scope.clone(),
+                hand_back,
             );
             return Err(Self::cancel_message());
         }
@@ -25002,6 +25245,7 @@ impl SqlEditorWidget {
                 prior_retained_state,
                 log_context,
                 session_scope.clone(),
+                hand_back,
             );
             return Err(Self::cancel_message());
         }
@@ -25038,6 +25282,7 @@ impl SqlEditorWidget {
                             prior_retained_state,
                             log_context,
                             session_scope.clone(),
+                            hand_back,
                         );
                     } else {
                         // Timeout apply failure followed by restore failure
@@ -25095,6 +25340,7 @@ impl SqlEditorWidget {
                     prior_retained_state,
                     log_context,
                     session_scope.clone(),
+                    hand_back,
                 );
             } else {
                 Self::discard_mysql_pooled_connection(conn);
@@ -25151,6 +25397,7 @@ impl SqlEditorWidget {
                             log_context,
                             message,
                             session_scope.clone(),
+                            hand_back,
                         ),
                     );
                     }
@@ -25194,6 +25441,7 @@ impl SqlEditorWidget {
                     disposition,
                     log_context,
                     session_scope.clone(),
+                    hand_back,
                 );
                 if Self::mysql_timeout_reset_failure_loses_required_session_state(
                     db_type,
@@ -25439,6 +25687,7 @@ impl SqlEditorWidget {
             disposition,
             log_context,
             session_scope,
+            hand_back,
         );
         if use_statement_scope_sync_required && !should_retain_session {
             return Err(Self::mysql_scope_sync_lost_after_success_message());
@@ -34258,6 +34507,7 @@ mod mysql_batch_execution_regression_tests {
                     &current_database,
                     &advanced,
                     retained_state.requires_physical_session_preservation(),
+                    None,
                 )
                 .expect("retained MySQL session should switch back to the initial database");
             retained_session.restore_with_context_epoch(pool_context_epoch, retained_state);

@@ -1266,15 +1266,25 @@ fn classify_mysql_replication_sql(sql: &str, mysql_compatible_comments: bool) ->
 }
 
 fn mysql_replication_words(words: &[String]) -> bool {
-    matches!(
+    if matches!(
         words.first().map(String::as_str),
         Some("START" | "STOP" | "RESET")
-    ) && matches!(
-        words.get(1).map(String::as_str),
-        // GROUP_REPLICATION shares the START/STOP verbs with START
-        // TRANSACTION but starts no transaction of the user's.
-        Some("REPLICA" | "SLAVE" | "GROUP_REPLICATION")
-    ) || words.first().is_some_and(|word| word == "CHANGE")
+    ) {
+        // `ALL` is MariaDB's multi-source qualifier (`START ALL SLAVES`), so
+        // the noun is not always the second word. These verbs are shared with
+        // START TRANSACTION, and a spelling that falls through is read as a
+        // transaction of the user's.
+        let noun = if words.get(1).is_some_and(|word| word == "ALL") {
+            words.get(2)
+        } else {
+            words.get(1)
+        };
+        return matches!(
+            noun.map(String::as_str),
+            Some("REPLICA" | "REPLICAS" | "SLAVE" | "SLAVES" | "GROUP_REPLICATION")
+        );
+    }
+    words.first().is_some_and(|word| word == "CHANGE")
         && matches!(
             words.get(1).map(String::as_str),
             Some("REPLICATION" | "MASTER")

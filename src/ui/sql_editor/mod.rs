@@ -3350,6 +3350,9 @@ impl SqlEditorWidget {
         target_scope: &str,
         advanced: &ConnectionAdvancedSettings,
     ) -> RetainedSessionMutationOutcome {
+        // This runs on the FLTK thread, so the tab's timeout has to bound it
+        // like it bounds the close-path commit/rollback.
+        let query_timeout = Self::parse_timeout(&self.timeout_input.value());
         let target_scope = target_scope.trim();
         if target_scope.is_empty() && !db_type.can_apply_empty_scope_to_retained_session() {
             return RetainedSessionMutationOutcome::NoSession;
@@ -3407,6 +3410,7 @@ impl SqlEditorWidget {
                     target_scope,
                     advanced,
                     retained_state.requires_physical_session_preservation(),
+                    query_timeout,
                 )
             });
         match result {

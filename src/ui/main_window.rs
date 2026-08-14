@@ -1746,6 +1746,15 @@ pub struct AppState {
     rollback_btn: Button,
     transaction_isolation_choice: Choice,
     transaction_access_choice: Choice,
+    /// This state's own handle, so a UI sync that cannot run right now can
+    /// re-arm itself on the UI thread. See
+    /// `sync_transaction_mode_controls`: an open pulldown owns the FLTK grab
+    /// and menus cannot be rebuilt under it, and simply dropping the sync left
+    /// the mode controls greyed and stale after a batch that finished while a
+    /// menu was open.
+    self_handle: std::sync::Weak<Mutex<AppState>>,
+    /// A re-arm is already in flight, so deferrals do not pile up chains.
+    transaction_mode_sync_retry_armed: bool,
     result_grid_execution_targets: HashMap<QueryTabId, ResultGridExecution>,
     next_result_grid_execution_id: u64,
     pending_table_browse_last: HashMap<QueryTabId, PendingTableBrowseLast>,
@@ -3853,10 +3862,18 @@ impl AppState {
     }
 
     fn sync_transaction_mode_controls(&mut self) {
-        // FLTK Choice menus cannot be rebuilt while a pulldown owns the grab.
+        // FLTK Choice menus cannot be rebuilt while a pulldown owns the grab —
+        // but the request must not be lost with it. This sync is what
+        // reactivates the combos and shows a mode the batch just adopted, and
+        // what records the displayed mode the next execution is checked
+        // against, so dropping it (a batch finishing while any menu is open)
+        // left the controls greyed and stale, and refused the next Ctrl+Enter
+        // once. Re-arm on the UI thread instead, one chain at a time.
         if app::grab().is_some() {
+            self.arm_transaction_mode_sync_retry();
             return;
         }
+        self.transaction_mode_sync_retry_armed = false;
 
         let Some((db_type, is_connected, mode, default_isolation)) =
             self.transaction_control_state()
@@ -3894,9 +3911,34 @@ impl AppState {
         }
     }
 
+    /// Ask the UI thread to run the deferred sync shortly. Single-flight: a
+    /// chain already waiting covers every deferral until it lands.
+    fn arm_transaction_mode_sync_retry(&mut self) {
+        if self.transaction_mode_sync_retry_armed {
+            return;
+        }
+        let Some(state) = self.self_handle.upgrade() else {
+            return;
+        };
+        self.transaction_mode_sync_retry_armed = true;
+        MainWindow::schedule_with_app_state(
+            &state,
+            TRANSACTION_MODE_SYNC_RETRY_SECONDS,
+            |s: &mut AppState| {
+                // Clear first: the sync itself re-arms while the grab is still
+                // held, which is how a menu held open keeps the request alive.
+                s.transaction_mode_sync_retry_armed = false;
+                s.sync_transaction_mode_controls();
+            },
+        );
+    }
+
     fn sync_transaction_mode_controls_for_connected_db(&mut self, db_type: DatabaseType) {
-        // FLTK Choice menus cannot be rebuilt while a pulldown owns the grab.
+        // FLTK Choice menus cannot be rebuilt while a pulldown owns the grab;
+        // the tab-aware sync that follows every connect re-states these labels,
+        // and it re-arms itself when it has to wait.
         if app::grab().is_some() {
+            self.arm_transaction_mode_sync_retry();
             return;
         }
 
@@ -4484,6 +4526,10 @@ impl AppState {
 
 const FETCH_STATUS_UPDATE_INTERVAL: Duration = Duration::from_millis(250);
 const STATUS_ANIMATION_INTERVAL: f64 = 0.05;
+/// How soon a transaction-mode control sync deferred by an open pulldown tries
+/// again. Long enough not to spin while a menu is held open, short enough that
+/// the combos are correct by the time the user looks back at them.
+const TRANSACTION_MODE_SYNC_RETRY_SECONDS: f64 = 0.2;
 const STATUS_ANIMATION_STEP: usize = 2;
 const ORPHANED_LAZY_FETCH_GRACE_PERIOD: Duration = Duration::from_millis(250);
 const MAX_ABANDONED_QUERY_OPERATION_AGE: u64 = 1_024;
@@ -5223,7 +5269,18 @@ fn update_transaction_mode_from_controls(state: &Arc<Mutex<AppState>>) {
         )
     };
 
-    if mode == previous_mode {
+    // Two different questions, and answering the second one for both is what
+    // made a foreign-family pin unclearable:
+    //  - does the tab's PIN change? `previous_mode` is the SANITIZED effective
+    //    mode, so a tab carrying a MySQL-only isolation on an Oracle connection
+    //    displays "Default"; picking Default explicitly then looked like a
+    //    no-op and left the raw pin in place, to resurrect on the next rebind.
+    //  - does the SESSION have to be told anything? Only when the effective
+    //    mode really changes — and only then may the dirty guard refuse, which
+    //    is what keeps a genuine no-op from being refused on a dirty session.
+    let pin_unchanged = editor.tab_transaction_mode_override_value() == Some(mode);
+    let session_mode_unchanged = mode == previous_mode;
+    if pin_unchanged && session_mode_unchanged {
         let mut s = state
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -5251,10 +5308,16 @@ fn update_transaction_mode_from_controls(state: &Arc<Mutex<AppState>>) {
     // Guard and apply only for THIS tab's retained session; other tabs — even
     // dirty or executing ones — are not involved, and the runtime's lock-free
     // identity keeps the change from waiting on a connection mutex another
-    // tab's query holds.
-    let retained_plan = runtime.as_ref().map(|runtime| {
-        RetainedSessionOptionChangePlan::from_runtime(runtime, vec![editor.clone()])
-    });
+    // tab's query holds. A pin-only correction (the sanitized display already
+    // showed this mode) tells the session nothing, so it neither asks the
+    // guard nor touches the session.
+    let retained_plan = (!session_mode_unchanged)
+        .then(|| {
+            runtime.as_ref().map(|runtime| {
+                RetainedSessionOptionChangePlan::from_runtime(runtime, vec![editor.clone()])
+            })
+        })
+        .flatten();
     if let Some(retained_plan) = retained_plan.as_ref() {
         if let Err(err) = retained_plan.validate_transaction_option_change("transaction mode") {
             crate::ui::alert_on_main(&err);
@@ -5288,7 +5351,9 @@ fn update_transaction_mode_from_controls(state: &Arc<Mutex<AppState>>) {
     s.set_status_message(&format!("Transaction mode: {}", mode.label()));
     drop(s);
 
-    crate::ui::message_on_main(transaction_mode_new_transaction_notice());
+    if !session_mode_unchanged {
+        crate::ui::message_on_main(transaction_mode_new_transaction_notice());
+    }
 }
 
 fn resolve_active_progress_tab_id(
@@ -5404,6 +5469,21 @@ fn build_session_activity_result_request(entries: Vec<SessionActivityEntry>) -> 
             success: true,
         },
     }
+}
+
+/// What the user chose for ONE tab's session before a session-ending action.
+///
+/// Deciding is separated from doing so that a multi-tab action asks every tab
+/// BEFORE it commits anything: answering "Commit and Disconnect" for the first
+/// tab and then Cancel for the second used to leave the first tab's transaction
+/// committed for a disconnect that never happened.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PooledSessionResolution {
+    /// Nothing to resolve — no session, or a state this action allows.
+    Nothing,
+    Commit,
+    Rollback,
+    Discard,
 }
 
 impl MainWindow {
@@ -6505,7 +6585,10 @@ impl MainWindow {
         )
     }
 
-    fn resolve_pooled_session_before_action(
+    /// Ask how one tab's session should be resolved. `None` means the user
+    /// cancelled, which cancels the whole action; nothing has been done to any
+    /// session yet at this point.
+    fn ask_pooled_session_resolution(
         state: &Arc<Mutex<AppState>>,
         tab_id: QueryTabId,
         action: RetainedSessionPreflightAction,
@@ -6513,29 +6596,29 @@ impl MainWindow {
         resolution_context: &str,
         commit_button: &str,
         rollback_button: &str,
-    ) -> bool {
-        let Some((tab_label, editor, snapshot)) = ({
+    ) -> Option<PooledSessionResolution> {
+        let Some((tab_label, snapshot)) = ({
             let s = state
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
             s.find_tab_index(tab_id).and_then(|index| {
-                let editor = s.editor_tabs[index].sql_editor.clone();
-                let snapshot = editor.pooled_session_activity_snapshot()?;
+                let snapshot = s.editor_tabs[index]
+                    .sql_editor
+                    .pooled_session_activity_snapshot()?;
                 Some((
                     s.tab_display_name(tab_id)
                         .unwrap_or_else(|| "Query".to_string()),
-                    editor,
                     snapshot,
                 ))
             })
         }) else {
-            return true;
+            return Some(PooledSessionResolution::Nothing);
         };
 
         if crate::db::retained_session_state_preflight_decision(action, snapshot.retained_state)
             != RetainedSessionPreflightDecision::RequireResolution
         {
-            return true;
+            return Some(PooledSessionResolution::Nothing);
         }
 
         let retained_state = snapshot.retained_state();
@@ -6543,7 +6626,7 @@ impl MainWindow {
             retained_state,
             RetainedSessionResolutionAction::Commit,
         );
-        let result = if transaction_action_allowed {
+        if transaction_action_allowed {
             let choice = crate::ui::choice2_on_main(
                 &format!(
                     "Tab '{}' has a DB session that may need commit, rollback, or discard.\nChoose how to {}.",
@@ -6565,13 +6648,13 @@ impl MainWindow {
                         rollback_button,
                     );
                     match decision {
-                        Some(1) => editor.commit_pooled_session_for_close(),
-                        Some(2) => editor.rollback_pooled_session_for_close(),
-                        _ => return false,
+                        Some(1) => Some(PooledSessionResolution::Commit),
+                        Some(2) => Some(PooledSessionResolution::Rollback),
+                        _ => None,
                     }
                 }
-                Some(2) => editor.discard_pooled_session_for_close(),
-                _ => return false,
+                Some(2) => Some(PooledSessionResolution::Discard),
+                _ => None,
             }
         } else {
             let choice = crate::ui::choice2_on_main(
@@ -6586,17 +6669,98 @@ impl MainWindow {
                 "",
             );
             match choice {
-                Some(1) => editor.discard_pooled_session_for_close(),
-                _ => return false,
+                Some(1) => Some(PooledSessionResolution::Discard),
+                _ => None,
             }
-        };
+        }
+    }
 
+    /// Carry out a decision the user already gave. Only reached once EVERY tab
+    /// of the action has answered, so no session is resolved for an action the
+    /// user then cancels.
+    fn apply_pooled_session_resolution(
+        state: &Arc<Mutex<AppState>>,
+        tab_id: QueryTabId,
+        resolution: PooledSessionResolution,
+    ) -> bool {
+        if resolution == PooledSessionResolution::Nothing {
+            return true;
+        }
+        let Some(editor) = ({
+            let s = state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            s.find_tab_index(tab_id)
+                .map(|index| s.editor_tabs[index].sql_editor.clone())
+        }) else {
+            // The tab went away while the other tabs were being asked; there is
+            // no session left to resolve and its own teardown closed it.
+            return true;
+        };
+        let result = match resolution {
+            PooledSessionResolution::Nothing => return true,
+            PooledSessionResolution::Commit => editor.commit_pooled_session_for_close(),
+            PooledSessionResolution::Rollback => editor.rollback_pooled_session_for_close(),
+            PooledSessionResolution::Discard => editor.discard_pooled_session_for_close(),
+        };
         if let Err(err) = result {
             crate::ui::alert_on_main(&format!("Failed to resolve DB session: {}", err));
             return false;
         }
-
         true
+    }
+
+    /// Ask every tab first, then act. See [`PooledSessionResolution`].
+    fn resolve_pooled_sessions_for_tabs(
+        state: &Arc<Mutex<AppState>>,
+        tab_ids: Vec<QueryTabId>,
+        action: RetainedSessionPreflightAction,
+        action_prompt: &str,
+        resolution_context: &str,
+        commit_button: &str,
+        rollback_button: &str,
+    ) -> bool {
+        let mut plan = Vec::with_capacity(tab_ids.len());
+        for tab_id in tab_ids {
+            let Some(resolution) = Self::ask_pooled_session_resolution(
+                state,
+                tab_id,
+                action,
+                action_prompt,
+                resolution_context,
+                commit_button,
+                rollback_button,
+            ) else {
+                return false;
+            };
+            plan.push((tab_id, resolution));
+        }
+        for (tab_id, resolution) in plan {
+            if !Self::apply_pooled_session_resolution(state, tab_id, resolution) {
+                return false;
+            }
+        }
+        true
+    }
+
+    fn resolve_pooled_session_before_action(
+        state: &Arc<Mutex<AppState>>,
+        tab_id: QueryTabId,
+        action: RetainedSessionPreflightAction,
+        action_prompt: &str,
+        resolution_context: &str,
+        commit_button: &str,
+        rollback_button: &str,
+    ) -> bool {
+        Self::resolve_pooled_sessions_for_tabs(
+            state,
+            vec![tab_id],
+            action,
+            action_prompt,
+            resolution_context,
+            commit_button,
+            rollback_button,
+        )
     }
 
     fn resolve_pooled_session_before_close(
@@ -6652,20 +6816,15 @@ impl MainWindow {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .query_tabs
             .tab_ids();
-        for tab_id in tab_ids {
-            if !Self::resolve_pooled_session_before_action(
-                state,
-                tab_id,
-                action,
-                action_prompt,
-                resolution_context,
-                commit_button,
-                rollback_button,
-            ) {
-                return false;
-            }
-        }
-        true
+        Self::resolve_pooled_sessions_for_tabs(
+            state,
+            tab_ids,
+            action,
+            action_prompt,
+            resolution_context,
+            commit_button,
+            rollback_button,
+        )
     }
 
     fn resolve_pooled_sessions_before_runtime_disconnect(
@@ -6680,20 +6839,15 @@ impl MainWindow {
             .filter(|tab| tab.connection_binding.snapshot().connection_id() == Some(connection_id))
             .map(|tab| tab.tab_id)
             .collect::<Vec<_>>();
-        for tab_id in tab_ids {
-            if !Self::resolve_pooled_session_before_action(
-                state,
-                tab_id,
-                RetainedSessionPreflightAction::ConnectionTransition,
-                "disconnect it",
-                "disconnecting",
-                "Commit and Disconnect",
-                "Rollback and Disconnect",
-            ) {
-                return false;
-            }
-        }
-        true
+        Self::resolve_pooled_sessions_for_tabs(
+            state,
+            tab_ids,
+            RetainedSessionPreflightAction::ConnectionTransition,
+            "disconnect it",
+            "disconnecting",
+            "Commit and Disconnect",
+            "Rollback and Disconnect",
+        )
     }
 
     fn resolve_pooled_sessions_before_pool_resize(state: &Arc<Mutex<AppState>>) -> bool {
@@ -7479,6 +7633,8 @@ impl MainWindow {
         window.make_resizable(true);
 
         let state = Arc::new(Mutex::new(AppState {
+            self_handle: std::sync::Weak::new(),
+            transaction_mode_sync_retry_armed: false,
             connection,
             connection_registry,
             query_tabs: query_tabs.clone(),
@@ -7570,6 +7726,11 @@ impl MainWindow {
                 );
             }
         });
+
+        state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .self_handle = Arc::downgrade(&state);
 
         let weak_state_for_zoom_out = Arc::downgrade(&state);
         zoom_out_btn.set_callback(move |_| {
@@ -8431,6 +8592,14 @@ impl MainWindow {
                     .set_active_editor_tab(tab_id)
                     .then_some((tab_id, false));
             }
+            // The tab the user acted from is gone or now runs on another
+            // connection, and no OTHER tab may inherit its statements: they
+            // would join whatever transaction that tab has open, under its
+            // auto-commit and its Read only pin, and its ROLLBACK would discard
+            // them. A tab-owned action that loses its tab gets a NEW one.
+            let runtime = state.connection_registry.get(connection_id)?;
+            return Self::create_query_editor_tab_for_runtime(state, runtime)
+                .map(|tab_id| (tab_id, true));
         }
         Self::select_or_create_query_editor_tab_for_connection(state, connection_id)
     }
@@ -10727,6 +10896,10 @@ impl MainWindow {
                         s.set_status_message(&message);
                     }
                     s.refresh_result_edit_controls();
+                    // An abandoned execution ends without a BatchFinished, and
+                    // the mode controls are deactivated while a tab is running:
+                    // nothing else would give them back.
+                    s.sync_transaction_mode_controls();
                     let mut result_tabs = owning_result_tabs.clone();
                     drop(s);
                     if let Some(result_tab_id) = stranded_target {
@@ -11965,9 +12138,10 @@ impl MainWindow {
                     );
                     return true;
                 }
-                if !Self::resolve_pooled_sessions_before_runtime_disconnect(state, runtime.id()) {
-                    return true;
-                }
+                // The stored password is a reason to refuse the reconnect, so it
+                // is read before anything asks the user to resolve a session:
+                // otherwise a missing password aborted the reconnect after the
+                // commit it had just asked for.
                 match AppConfig::get_password_for_connection(&info.name) {
                     Ok(Some(password)) => info.password = password,
                     Ok(None) => {
@@ -11980,6 +12154,9 @@ impl MainWindow {
                         crate::ui::alert_on_main(&err);
                         return true;
                     }
+                }
+                if !Self::resolve_pooled_sessions_before_runtime_disconnect(state, runtime.id()) {
+                    return true;
                 }
 
                 runtime.set_state(ConnectionRuntimeState::Transitioning);
@@ -12075,11 +12252,33 @@ impl MainWindow {
                     return true;
                 }
 
+                // Every reason this disconnect can be refused has to be spent
+                // BEFORE the prompts: a resolution prompt runs a nested event
+                // loop in which a metadata load can take the connection mutex,
+                // and refusing afterwards leaves the user's transaction
+                // committed for a disconnect that never happened.
+                let connection = runtime.connection();
+                if try_lock_connection_with_activity(&connection, "Disconnecting session").is_none()
+                {
+                    let busy_message = format_connection_busy_message();
+                    crate::ui::alert_on_main(&busy_message);
+                    let mut s = state
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    let conn_info = s
+                        .connection_info
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .clone();
+                    s.status_bar
+                        .set_label(&format_status(&busy_message, &conn_info));
+                    return true;
+                }
+
                 if !Self::resolve_pooled_sessions_before_runtime_disconnect(state, connection_id) {
                     return true;
                 }
 
-                let connection = runtime.connection();
                 let Some(mut db_conn) =
                     try_lock_connection_with_activity(&connection, "Disconnecting session")
                 else {
@@ -12190,9 +12389,40 @@ impl MainWindow {
                 // commit/rollback cannot resolve (residue, session locks) be
                 // torn down with no prompt at all, and offered "Commit and
                 // Close" wording for a disconnect.
-                if !runtimes.iter().all(|runtime| {
-                    Self::resolve_pooled_sessions_before_runtime_disconnect(state, runtime.id())
-                }) {
+                //
+                // Every tab of every connection is asked BEFORE any of them is
+                // resolved: asking connection by connection committed the first
+                // connection's tabs and then let a Cancel on the second abort
+                // the disconnect, leaving work committed for an action that
+                // never happened.
+                let disconnect_tab_ids = {
+                    let s = state
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    let connection_ids = runtimes
+                        .iter()
+                        .map(|runtime| runtime.id())
+                        .collect::<Vec<_>>();
+                    s.editor_tabs
+                        .iter()
+                        .filter(|tab| {
+                            tab.connection_binding
+                                .snapshot()
+                                .connection_id()
+                                .is_some_and(|id| connection_ids.contains(&id))
+                        })
+                        .map(|tab| tab.tab_id)
+                        .collect::<Vec<_>>()
+                };
+                if !Self::resolve_pooled_sessions_for_tabs(
+                    state,
+                    disconnect_tab_ids,
+                    RetainedSessionPreflightAction::ConnectionTransition,
+                    "disconnect it",
+                    "disconnecting",
+                    "Commit and Disconnect",
+                    "Rollback and Disconnect",
+                ) {
                     return true;
                 }
 
@@ -12780,13 +13010,37 @@ impl MainWindow {
                     }
                     (s.sql_editor.clone(), s.active_connection_runtime())
                 };
+                // Asking for the value the tab already has changes nothing, so
+                // it must not be refused by the dirty guard — the same rule the
+                // script spelling states in `ensure_script_auto_commit_change_allowed`
+                // and the transaction-mode toolbar states for its own no-op.
+                let auto_commit_unchanged = {
+                    let mut s = state
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    s.refresh_auto_commit_cache();
+                    s.cached_connection_auto_commit
+                        .is_some_and(|connection_default| {
+                            crate::ui::sql_editor::SqlEditorWidget::effective_auto_commit(
+                                connection_default,
+                                editor.tab_auto_commit_override_value(),
+                            ) == enabled
+                        })
+                };
                 // Guard and apply only for THIS tab's retained session; other
                 // tabs — even dirty or executing ones — are not involved, and
                 // the runtime's lock-free identity keeps the toggle from
                 // waiting on a connection mutex another tab's query holds.
-                let retained_plan = runtime.as_ref().map(|runtime| {
-                    RetainedSessionOptionChangePlan::from_runtime(runtime, vec![editor.clone()])
-                });
+                let retained_plan = (!auto_commit_unchanged)
+                    .then(|| {
+                        runtime.as_ref().map(|runtime| {
+                            RetainedSessionOptionChangePlan::from_runtime(
+                                runtime,
+                                vec![editor.clone()],
+                            )
+                        })
+                    })
+                    .flatten();
                 if let Some(retained_plan) = retained_plan.as_ref() {
                     if let Err(err) =
                         retained_plan.validate_transaction_option_change("auto-commit")
@@ -12923,6 +13177,23 @@ impl MainWindow {
                             .unwrap_or_else(|poisoned| poisoned.into_inner());
                         s.status_bar.set_label("Rebuilding connection pool...");
                     }
+                    // The rebuild runs on a worker and walks EVERY connection,
+                    // while the gates above ran once on the UI thread. Without
+                    // saying the connections are in transition, an execution
+                    // started in that gap loses its session to the generation
+                    // and epoch bump the rebuild makes — silently, because an
+                    // InvalidSession is auto-discarded. Every other
+                    // connection-wide change publishes the same state first.
+                    for runtime in &runtimes {
+                        runtime.set_state(ConnectionRuntimeState::Transitioning);
+                    }
+                    {
+                        let mut s = state
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner());
+                        s.object_browser.refresh_runtime_labels();
+                        s.refresh_connection_dependent_controls();
+                    }
                     let sender = conn_sender.clone();
                     let spawn_failure_sender = sender.clone();
                     let spawn_failure_settings = settings.clone();
@@ -12945,9 +13216,12 @@ impl MainWindow {
                                             runtime.display_name(),
                                             err
                                         ));
-                                    } else {
-                                        runtime.refresh_state_from_connection();
                                     }
+                                    // Whether it succeeded or not, the
+                                    // connection is no longer in transition:
+                                    // its own state is read back from the
+                                    // connection it belongs to.
+                                    runtime.refresh_state_from_connection();
                                 }
                                 if failures.is_empty() {
                                     Ok(())

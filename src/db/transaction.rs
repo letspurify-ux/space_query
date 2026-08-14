@@ -642,13 +642,6 @@ impl SessionResidueState {
         }
     }
 
-    fn with_next_transaction_mode_override_consumed(self) -> Self {
-        Self {
-            may_have_next_transaction_mode_override: false,
-            ..self
-        }
-    }
-
     fn with_session_transaction_mode_override_adopted(self) -> Self {
         Self {
             may_have_transaction_mode_override: false,
@@ -1197,6 +1190,18 @@ enum BatchPriorTransactionEffect {
     #[default]
     Preserve,
     Clear,
+    /// A FAILED implicit-commit statement ran: both servers commit before
+    /// EXECUTING a DDL statement, but one rejected at PARSE time commits
+    /// nothing, so the batch can claim neither. The clear is recorded as
+    /// TENTATIVE — the batch-end server probe decides, and where no probe runs
+    /// (an interrupted batch) it falls back to preserving.
+    ///
+    /// Keeping the tentativeness IN the effect is what stops a failure from
+    /// speaking for a commit it did not make: a real COMMIT earlier in the same
+    /// batch has already recorded `Clear`, and `tentatively_cleared` leaves
+    /// that alone, so the work it committed can never be resurrected by a
+    /// parse error that follows it.
+    ClearUnlessServerDisagrees,
     ClearIfPriorTableLock {
         may_have_uncommitted_work_after_clear: bool,
     },
@@ -1240,7 +1245,6 @@ pub(crate) struct MySqlBatchSessionEffects {
     may_have_uncommitted_work: bool,
     transaction_state_cleared: bool,
     requires_transaction_decision_after_success: bool,
-    failed_implicit_commit_defers_to_probe: bool,
     server_transaction_probe_requires_preservation: bool,
     physical_session_released: bool,
     interrupted_statement_requires_physical_discard: bool,
@@ -1261,7 +1265,6 @@ impl Default for MySqlBatchSessionEffects {
             may_have_uncommitted_work: false,
             transaction_state_cleared: false,
             requires_transaction_decision_after_success: false,
-            failed_implicit_commit_defers_to_probe: false,
             server_transaction_probe_requires_preservation: false,
             physical_session_released: false,
             interrupted_statement_requires_physical_discard: false,
@@ -1281,7 +1284,7 @@ impl BatchPriorTransactionEffect {
     fn clears_prior(self, prior_state: RetainedSessionState) -> bool {
         match self {
             Self::Preserve => false,
-            Self::Clear => true,
+            Self::Clear | Self::ClearUnlessServerDisagrees => true,
             // Conditional clears are tied to statements that release ordinary
             // LOCK TABLES state. FLUSH TABLES read/export locks are tracked in
             // a separate bit because START TRANSACTION does not release them,
@@ -1291,13 +1294,37 @@ impl BatchPriorTransactionEffect {
         }
     }
 
+    /// Whether the batch ended the prior transaction as a FACT rather than
+    /// tentatively. Asked where no server probe will run to settle it.
+    fn clears_prior_confirmed(self, prior_state: RetainedSessionState) -> bool {
+        match self {
+            Self::ClearUnlessServerDisagrees => false,
+            other => other.clears_prior(prior_state),
+        }
+    }
+
+    /// Whether the recorded clear still needs the server's word for it.
+    fn clear_is_tentative(self) -> bool {
+        matches!(self, Self::ClearUnlessServerDisagrees)
+    }
+
+    /// Record that a failed implicit-commit statement may have ended the prior
+    /// transaction. It upgrades nothing already settled: a confirmed `Clear`
+    /// stays confirmed, and a conditional clear keeps its condition.
+    fn tentatively_cleared(self) -> Self {
+        match self {
+            Self::Clear | Self::ClearIfPriorTableLock { .. } => self,
+            Self::Preserve | Self::ClearUnlessServerDisagrees => Self::ClearUnlessServerDisagrees,
+        }
+    }
+
     fn may_have_uncommitted_work_after_batch(
         self,
         prior_state: RetainedSessionState,
         batch_may_have_uncommitted_work: bool,
     ) -> bool {
         match self {
-            Self::Clear => batch_may_have_uncommitted_work,
+            Self::Clear | Self::ClearUnlessServerDisagrees => batch_may_have_uncommitted_work,
             Self::ClearIfPriorTableLock {
                 may_have_uncommitted_work_after_clear,
             } if prior_state.lock_state().may_hold_table_lock => {
@@ -1400,7 +1427,6 @@ impl MySqlBatchSessionEffects {
     fn mark_transaction_dirty(&mut self) {
         self.may_have_uncommitted_work = true;
         self.transaction_state_cleared = false;
-        self.failed_implicit_commit_defers_to_probe = false;
         self.prior_transaction_effect = self
             .prior_transaction_effect
             .with_dirty_work_after_conditional_clear();
@@ -1410,7 +1436,6 @@ impl MySqlBatchSessionEffects {
         self.may_have_uncommitted_work = false;
         self.transaction_state_cleared = true;
         self.prior_transaction_effect = BatchPriorTransactionEffect::Clear;
-        self.failed_implicit_commit_defers_to_probe = false;
     }
 
     fn mark_prior_transaction_clean(&mut self) {
@@ -1610,19 +1635,31 @@ impl MySqlBatchSessionEffects {
         );
         let state_hint = self.apply_statement_effects(sql, auto_commit, effects, false);
         if effects.has_implicit_commit() {
-            self.mark_transaction_clean();
-            self.failed_implicit_commit_defers_to_probe = true;
-            self.requires_transaction_decision_after_success = false;
-            if effects
-                .session_residue
-                .consumes_next_transaction_mode_override
-            {
-                self.session_residue_state = self
-                    .session_residue_state
-                    .with_next_transaction_mode_override_consumed();
-            }
+            self.defer_batch_dirtiness_to_server_probe();
         }
         state_hint
+    }
+
+    /// A statement that FAILED withdraws this batch's own dirty claim and says
+    /// nothing else.
+    ///
+    /// Both servers commit before EXECUTING a DDL statement, but a statement
+    /// rejected at PARSE time commits nothing — so a failure can claim neither
+    /// that the transaction ended nor that it is still open, and the batch-end
+    /// server probe is the only thing that knows. What it must never do is
+    /// speak for anything it did not do:
+    /// - the PRIOR transaction is not its to end (`prior_transaction_effect`
+    ///   stays where the batch's own COMMIT/ROLLBACK left it, so an earlier
+    ///   real commit still counts and an unresolved one still preserves);
+    /// - a pending one-shot `SET TRANSACTION` is not its to consume — the
+    ///   server still holds it armed, and no probe can ask about it, so
+    ///   clearing it here let the next transaction run a mode the toolbar had
+    ///   already replaced.
+    fn defer_batch_dirtiness_to_server_probe(&mut self) {
+        self.may_have_uncommitted_work = false;
+        self.transaction_state_cleared = true;
+        self.prior_transaction_effect = self.prior_transaction_effect.tentatively_cleared();
+        self.requires_transaction_decision_after_success = false;
     }
 
     pub(crate) fn may_have_uncommitted_work(&self) -> bool {
@@ -1719,11 +1756,11 @@ impl MySqlBatchSessionEffects {
                 || prior_transaction_state.requires_transaction_decision()
                 || self.requires_transaction_decision_after_success
                 // A failed implicit-commit statement left the outcome to this
-                // probe: the RAW prior state decides whether the reported open
-                // transaction can be the user's — the batch-adjusted state
-                // cannot, because the failed statement is exactly what marked
-                // it clean.
-                || (self.failed_implicit_commit_defers_to_probe
+                // probe: while its clear is only tentative, the RAW prior state
+                // decides whether the reported open transaction can be the
+                // user's — the batch-adjusted state cannot, because that
+                // failure is exactly what marked it clean.
+                || (self.prior_transaction_effect.clear_is_tentative()
                     && prior_state.may_have_uncommitted_work()))
     }
 
@@ -1738,8 +1775,11 @@ impl MySqlBatchSessionEffects {
                 prior_state,
                 server_reports_uncommitted_work,
             );
+        // A tentative clear cannot resolve a decision the prior state still
+        // required: if the server says the transaction is still open, the
+        // prompt the failed statement appeared to remove is still owed.
         let decision_preserved_after_failed_implicit_commit = server_reports_uncommitted_work
-            && self.failed_implicit_commit_defers_to_probe
+            && self.prior_transaction_effect.clear_is_tentative()
             && prior_state
                 .transaction_state()
                 .requires_transaction_decision();
@@ -1790,17 +1830,17 @@ impl MySqlBatchSessionEffects {
         _auto_commit: bool,
     ) -> Option<RetainedSessionState> {
         let prior_transaction_state = self.prior_transaction_state_after_batch(prior_state);
-        // An interrupted batch never reaches the final server probe, so a
-        // failed implicit-commit statement that deferred to it must fall back
-        // to preserving the prior work possibility instead of trusting the
-        // clear it could not confirm.
-        let prior_may_have_uncommitted_work =
-            (!self.prior_transaction_effect.clears_prior(prior_state)
-                || self.failed_implicit_commit_defers_to_probe)
-                && prior_state.may_have_uncommitted_work();
+        // An interrupted batch never reaches the final server probe, so only a
+        // CONFIRMED clear counts here: a failed implicit-commit statement's
+        // tentative one falls back to preserving the prior work possibility,
+        // while a real COMMIT earlier in the batch still ends it.
+        let prior_may_have_uncommitted_work = !self
+            .prior_transaction_effect
+            .clears_prior_confirmed(prior_state)
+            && prior_state.may_have_uncommitted_work();
         let transaction_requires_decision = prior_transaction_state.requires_transaction_decision()
             || self.requires_transaction_decision_after_success
-            || (self.failed_implicit_commit_defers_to_probe
+            || (self.prior_transaction_effect.clear_is_tentative()
                 && prior_state
                     .transaction_state()
                     .requires_transaction_decision())
@@ -1812,10 +1852,10 @@ impl MySqlBatchSessionEffects {
             } else if transaction_requires_decision {
                 TransactionSessionState::DecisionRequired
             } else if prior_may_have_uncommitted_work {
-                // The RAW prior state: when the failed-implicit-commit deferral
-                // forced preservation, the batch-adjusted state is exactly the
-                // clear that could not be confirmed. Without the deferral the
-                // effect never cleared, so the two spellings agree.
+                // The RAW prior state: when a tentative clear forced
+                // preservation, the batch-adjusted state is exactly the clear
+                // that could not be confirmed. Where nothing cleared, the two
+                // spellings agree.
                 prior_state.transaction_state()
             } else {
                 TransactionSessionState::Clean
@@ -2062,18 +2102,17 @@ pub(crate) fn retained_session_state_after_statement(
         };
 
     let session_residue_state = if statement_failed {
-        let prior_residue = if effects.has_implicit_commit()
-            && effects
-                .session_residue
-                .consumes_next_transaction_mode_override
-        {
-            prior_state
-                .session_residue_state()
-                .with_next_transaction_mode_override_consumed()
-        } else {
-            prior_state.session_residue_state()
-        };
-        prior_residue
+        // A statement that FAILED consumes no pending one-shot
+        // `SET TRANSACTION`. Whether its implicit commit ran before it (which
+        // would consume the one-shot) or it was rejected at parse time (which
+        // consumes nothing) cannot be told apart here, and unlike transaction
+        // dirtiness no server probe can ask: the server simply keeps it armed
+        // for the next transaction. Clearing the tracked flag on a guess let
+        // the toolbar's own mode replace skip the server-side consumption, and
+        // the next transaction then ran the stale one-shot straight through a
+        // Read only pin.
+        prior_state
+            .session_residue_state()
             .with_statement_diagnostics_cleared()
             .merged_with(SessionResidueState::from_effects(
                 effects.session_residue.without_statement_diagnostics(),
@@ -2941,18 +2980,13 @@ fn oracle_session_transaction_mode_change_for_statement(
 ) -> Option<SessionTransactionModeChange> {
     let analysis = SqlStatementAnalysis::new_for_db_type(DatabaseType::Oracle, sql);
     let words = analysis.words();
-    if oracle_alter_session_set_target_for_words(words) != Some("ISOLATION_LEVEL") {
+    if oracle_alter_session_set_target_for_words(words) != OracleAlterSessionTarget::IsolationLevel
+    {
         return None;
     }
-    let isolation = match words.get(4).map(String::as_str) {
-        Some("SERIALIZABLE") if words.len() == 5 => TransactionIsolation::Serializable,
-        Some("READ")
-            if words.get(5).map(String::as_str) == Some("COMMITTED") && words.len() == 6 =>
-        {
-            TransactionIsolation::ReadCommitted
-        }
-        _ => return None,
-    };
+    // The same reading the residue rule made: a statement that sets anything
+    // besides this level is not an isolation change to adopt.
+    let isolation = oracle_alter_session_isolation_level_value(words.get(4..).unwrap_or_default())?;
     Some(SessionTransactionModeChange {
         isolation: Some(isolation),
         access_mode: None,
@@ -3222,20 +3256,42 @@ fn mysql_reset_persist_statement(analysis: &SqlStatementAnalysis<'_>) -> bool {
 }
 
 fn mysql_replication_control_statement(analysis: &SqlStatementAnalysis<'_>) -> bool {
-    mysql_statement_starts_with_words(analysis, &["START", "REPLICA"])
-        || mysql_statement_starts_with_words(analysis, &["STOP", "REPLICA"])
-        || mysql_statement_starts_with_words(analysis, &["RESET", "REPLICA"])
-        || mysql_statement_starts_with_words(analysis, &["CHANGE", "REPLICATION", "SOURCE"])
-        || mysql_statement_starts_with_words(analysis, &["START", "SLAVE"])
-        || mysql_statement_starts_with_words(analysis, &["STOP", "SLAVE"])
-        || mysql_statement_starts_with_words(analysis, &["RESET", "SLAVE"])
+    mysql_statement_starts_with_words(analysis, &["CHANGE", "REPLICATION", "SOURCE"])
         || mysql_statement_starts_with_words(analysis, &["CHANGE", "MASTER"])
-        // Group Replication control, which shares the START/STOP verbs with
-        // START TRANSACTION. Without these the leading `START` alone made the
-        // statement look like a transaction opener and stuck the tab's session
-        // MaybeDirty over work it never did.
-        || mysql_statement_starts_with_words(analysis, &["START", "GROUP_REPLICATION"])
-        || mysql_statement_starts_with_words(analysis, &["STOP", "GROUP_REPLICATION"])
+        || mysql_replication_verb_statement(analysis)
+}
+
+/// True for the `START`/`STOP`/`RESET` family of replication control, whatever
+/// noun and multi-source spelling it uses.
+///
+/// These share their verb with `START TRANSACTION`, so a statement this misses
+/// is read as a transaction opener and sticks the tab's session MaybeDirty over
+/// work it never did — indefinitely, since nothing the user can type resolves a
+/// transaction that was never opened. Matching the NOUN rather than a list of
+/// exact word pairs is what makes MariaDB's multi-source forms
+/// (`START ALL SLAVES`, `STOP ALL REPLICAS`) land here with the rest instead of
+/// waiting to be enumerated one by one.
+fn mysql_replication_verb_statement(analysis: &SqlStatementAnalysis<'_>) -> bool {
+    let words = analysis.words();
+    if !words
+        .first()
+        .is_some_and(|word| matches!(word.as_str(), "START" | "STOP" | "RESET"))
+    {
+        return false;
+    }
+    // `ALL` is MariaDB's multi-source qualifier (`START ALL SLAVES`); the noun
+    // is the word after it.
+    let noun = if words.get(1).is_some_and(|word| word == "ALL") {
+        words.get(2)
+    } else {
+        words.get(1)
+    };
+    noun.is_some_and(|word| {
+        matches!(
+            word.as_str(),
+            "SLAVE" | "SLAVES" | "REPLICA" | "REPLICAS" | "GROUP_REPLICATION"
+        )
+    })
 }
 
 fn mysql_load_index_statement(analysis: &SqlStatementAnalysis<'_>) -> bool {
@@ -4281,14 +4337,62 @@ fn oracle_statement_should_skip_auto_commit_for_words(words: &[String]) -> bool 
     false
 }
 
-fn oracle_alter_session_set_target_for_words(words: &[String]) -> Option<&str> {
-    if words.first().is_some_and(|word| word == "ALTER")
-        && words.get(1).is_some_and(|word| word == "SESSION")
-        && words.get(2).is_some_and(|word| word == "SET")
-    {
-        return words.get(3).map(String::as_str);
+/// What an `ALTER SESSION SET` statement leaves behind on the session.
+///
+/// `CURRENT_SCHEMA` and `ISOLATION_LEVEL` are the only two targets that leave a
+/// session fit for the next tab: session preparation states both of them
+/// TOTALLY on every pool acquisition, so whatever this statement set is stated
+/// away again. Every other parameter is session state nobody restates, which is
+/// why it has to preserve the session for its own tab and be discarded with it.
+///
+/// The judgement is about the WHOLE statement, not its first parameter: Oracle
+/// takes several `parameter = value` pairs in one statement, so a trailing
+/// `OPTIMIZER_MODE = FIRST_ROWS_1` is exactly the state the pool would carry
+/// into another tab, wherever in the statement it appears. Reading only
+/// `words[3]` filed `ALTER SESSION SET CURRENT_SCHEMA = HR OPTIMIZER_MODE =
+/// FIRST_ROWS_1` as clean and recycled that OPTIMIZER_MODE to a stranger.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OracleAlterSessionTarget {
+    CurrentSchema,
+    IsolationLevel,
+    /// Anything else — including any statement that sets a second parameter,
+    /// because the value words each known target allows are counted and a
+    /// further pair cannot fit inside them.
+    NotRestatedByPoolSetup,
+}
+
+/// The isolation level an `ALTER SESSION SET ISOLATION_LEVEL = ...` states,
+/// read from the value words that follow the parameter name. `None` means the
+/// value is not one Oracle spells this way — or that more words follow it, in
+/// which case the statement sets something else too.
+fn oracle_alter_session_isolation_level_value(value: &[String]) -> Option<TransactionIsolation> {
+    match value {
+        [level] if level == "SERIALIZABLE" => Some(TransactionIsolation::Serializable),
+        [first, second] if first == "READ" && second == "COMMITTED" => {
+            Some(TransactionIsolation::ReadCommitted)
+        }
+        _ => None,
     }
-    None
+}
+
+fn oracle_alter_session_set_target_for_words(words: &[String]) -> OracleAlterSessionTarget {
+    if !(words.first().is_some_and(|word| word == "ALTER")
+        && words.get(1).is_some_and(|word| word == "SESSION")
+        && words.get(2).is_some_and(|word| word == "SET"))
+    {
+        return OracleAlterSessionTarget::NotRestatedByPoolSetup;
+    }
+    // The tokenizer drops `=` and skips quoted values, so a single-parameter
+    // statement leaves at most the value words its own target allows.
+    let value = words.get(4..).unwrap_or_default();
+    match words.get(3).map(String::as_str) {
+        // A schema name is one word, or none at all when it is quoted.
+        Some("CURRENT_SCHEMA") if value.len() <= 1 => OracleAlterSessionTarget::CurrentSchema,
+        Some("ISOLATION_LEVEL") if oracle_alter_session_isolation_level_value(value).is_some() => {
+            OracleAlterSessionTarget::IsolationLevel
+        }
+        _ => OracleAlterSessionTarget::NotRestatedByPoolSetup,
+    }
 }
 
 fn oracle_session_residue_effects_for_words(words: &[String]) -> StatementSessionResidueEffects {
@@ -4314,16 +4418,12 @@ fn oracle_session_residue_effects_for_words(words: &[String]) -> StatementSessio
 
     match words.get(2).map(String::as_str) {
         Some("SET") => match oracle_alter_session_set_target_for_words(words) {
-            Some("CURRENT_SCHEMA") => StatementSessionResidueEffects::default(),
-            Some("ISOLATION_LEVEL") => StatementSessionResidueEffects {
+            OracleAlterSessionTarget::CurrentSchema => StatementSessionResidueEffects::default(),
+            OracleAlterSessionTarget::IsolationLevel => StatementSessionResidueEffects {
                 sets_transaction_mode_override: true,
                 ..StatementSessionResidueEffects::default()
             },
-            Some(_) => StatementSessionResidueEffects {
-                may_leave_unknown_state: true,
-                ..StatementSessionResidueEffects::default()
-            },
-            None => StatementSessionResidueEffects {
+            OracleAlterSessionTarget::NotRestatedByPoolSetup => StatementSessionResidueEffects {
                 may_leave_unknown_state: true,
                 ..StatementSessionResidueEffects::default()
             },
@@ -5349,6 +5449,96 @@ mod tests {
         );
         assert_eq!(retained, RetainedSessionState::default());
         assert!(!retained.requires_physical_session_preservation());
+    }
+
+    #[test]
+    fn oracle_alter_session_setting_a_second_parameter_is_never_clean() {
+        // Oracle takes several `parameter = value` pairs in one statement, and
+        // the pool restates only CURRENT_SCHEMA and ISOLATION_LEVEL. A second
+        // parameter is state nobody restates, so the session belongs to its own
+        // tab whichever position that parameter is in — reading only the first
+        // one recycled an OPTIMIZER_MODE to the next tab.
+        let post_processor = statement_session_post_processor_for(DatabaseType::Oracle);
+        for sql in [
+            "ALTER SESSION SET CURRENT_SCHEMA = HR OPTIMIZER_MODE = FIRST_ROWS_1",
+            "ALTER SESSION SET CURRENT_SCHEMA = HR NLS_DATE_FORMAT = 'YYYY-MM-DD'",
+            "ALTER SESSION SET ISOLATION_LEVEL = SERIALIZABLE OPTIMIZER_MODE = ALL_ROWS",
+            "ALTER SESSION SET ISOLATION_LEVEL = READ COMMITTED DDL_LOCK_TIMEOUT = 10",
+        ] {
+            let retained = retained_session_state_after_statement(
+                post_processor,
+                RetainedSessionState::default(),
+                post_processor.effects_for_sql(sql),
+                false,
+                false,
+                false,
+                false,
+            );
+            assert!(
+                retained.requires_physical_session_preservation(),
+                "{sql} leaves state the pool does not restate, so the session must stay with its tab"
+            );
+        }
+
+        // ...while the single-parameter forms keep their meaning.
+        let schema_only = retained_session_state_after_statement(
+            post_processor,
+            RetainedSessionState::default(),
+            post_processor.effects_for_sql("ALTER SESSION SET CURRENT_SCHEMA = HR"),
+            false,
+            false,
+            false,
+            false,
+        );
+        assert!(!schema_only.requires_physical_session_preservation());
+        for sql in [
+            "ALTER SESSION SET ISOLATION_LEVEL = SERIALIZABLE",
+            "ALTER SESSION SET ISOLATION_LEVEL = READ COMMITTED",
+        ] {
+            assert!(
+                post_processor
+                    .effects_for_sql(sql)
+                    .session_residue
+                    .sets_transaction_mode_override,
+                "{sql} is still a session-scoped transaction-mode change"
+            );
+        }
+    }
+
+    #[test]
+    fn mariadb_multi_source_replication_control_is_not_a_transaction() {
+        // `START ALL SLAVES` shares its verb with START TRANSACTION. Read as a
+        // transaction opener it stuck the tab's session MaybeDirty over work it
+        // never did, with nothing the user could type to resolve it.
+        for db_type in [DatabaseType::MariaDB, DatabaseType::MySQL] {
+            let post_processor = statement_session_post_processor_for(db_type);
+            for sql in [
+                "START ALL SLAVES",
+                "STOP ALL SLAVES",
+                "START ALL REPLICAS",
+                "STOP ALL REPLICAS",
+                "START SLAVE",
+                "START GROUP_REPLICATION",
+            ] {
+                let effects = post_processor.effects_for_sql(sql);
+                assert!(
+                    !effects.may_leave_uncommitted_work(),
+                    "{sql} on {db_type} opens no transaction of the user's"
+                );
+                assert!(
+                    !effects.starts_transaction_state(),
+                    "{sql} on {db_type} must not be read as START TRANSACTION"
+                );
+            }
+        }
+        // The verb still belongs to START TRANSACTION when it really is one.
+        let post_processor = statement_session_post_processor_for(DatabaseType::MySQL);
+        assert!(
+            post_processor
+                .effects_for_sql("START TRANSACTION")
+                .starts_transaction_state(),
+            "START TRANSACTION must keep its meaning"
+        );
     }
 
     #[test]
@@ -7200,7 +7390,7 @@ mod tests {
     }
 
     #[test]
-    fn mysql_next_transaction_mode_override_clears_after_failed_implicit_commit() {
+    fn mysql_next_transaction_mode_override_survives_a_failed_implicit_commit() {
         let post_processor = statement_session_post_processor_for(DatabaseType::MySQL);
 
         for sql in [
@@ -7234,8 +7424,9 @@ mod tests {
             );
 
             assert!(
-                !retained.may_have_transaction_mode_override(),
-                "{sql} should consume a pending SET TRANSACTION override when its implicit commit has already happened"
+                retained.may_have_transaction_mode_override(),
+                "a FAILED {sql} cannot be known to have consumed the pending SET TRANSACTION \
+                 override — the server may still hold it armed, and no probe can ask"
             );
         }
     }
@@ -9530,7 +9721,7 @@ mod tests {
     }
 
     #[test]
-    fn failed_mysql_batch_implicit_commit_consumes_pending_transaction_mode_override() {
+    fn failed_mysql_batch_implicit_commit_keeps_pending_transaction_mode_override() {
         let post_processor = statement_session_post_processor_for(DatabaseType::MySQL);
         let mut batch_effects = MySqlBatchSessionEffects::default();
         batch_effects.apply_successful_statement_effects(
@@ -9550,8 +9741,62 @@ mod tests {
         let retained = batch_effects
             .retained_state_after_successful_batch(RetainedSessionState::default(), false);
 
+        // The transaction half defers to the server probe, which answered
+        // clean; the ONE-SHOT half cannot: the server keeps it armed for the
+        // next transaction whether or not this statement ever ran, and nothing
+        // can ask it. Consuming it on a guess let the toolbar's mode replace
+        // skip its server-side consumption, so the next transaction ran the
+        // stale one-shot through whatever pin had replaced it.
         assert_eq!(retained.transaction_state(), TransactionSessionState::Clean);
-        assert!(!retained.requires_physical_session_preservation());
+        assert!(
+            retained.may_have_transaction_mode_override(),
+            "a failed statement must not consume the pending SET TRANSACTION override"
+        );
+        assert!(retained.requires_physical_session_preservation());
+    }
+
+    #[test]
+    fn an_interrupted_batch_keeps_the_commit_it_really_made_before_a_failed_ddl() {
+        // `COMMIT; <parse-rejected DDL>;` then a cancel. The COMMIT ended the
+        // prior transaction as a FACT; the failed statement that follows can
+        // only be tentative about it. Treating both the same way asked the user
+        // to resolve work their own COMMIT had already finished.
+        let post_processor = statement_session_post_processor_for(DatabaseType::MySQL);
+        let mut batch_effects = MySqlBatchSessionEffects::default();
+        batch_effects.apply_successful_statement_effects(
+            "COMMIT",
+            false,
+            post_processor.effects_for_sql("COMMIT"),
+        );
+        batch_effects.apply_failed_statement_effects(
+            "CREATE TABLE malformed",
+            false,
+            post_processor.effects_for_sql("CREATE TABLE malformed"),
+        );
+        let prior =
+            RetainedSessionState::from_transaction_state(TransactionSessionState::MaybeDirty);
+
+        assert_eq!(
+            batch_effects.retained_state_after_interrupted_batch(prior, false, false),
+            None,
+            "the batch's own COMMIT ended the prior transaction, so an interrupt \
+             after a failed DDL has nothing left to preserve"
+        );
+
+        // Without the COMMIT, the same failed DDL preserves it: nothing
+        // confirmed that the transaction ended.
+        let mut without_commit = MySqlBatchSessionEffects::default();
+        without_commit.apply_failed_statement_effects(
+            "CREATE TABLE malformed",
+            false,
+            post_processor.effects_for_sql("CREATE TABLE malformed"),
+        );
+        assert!(
+            without_commit
+                .retained_state_after_interrupted_batch(prior, false, false)
+                .is_some_and(|state| state.may_have_uncommitted_work()),
+            "an interrupted batch has no probe, so an unconfirmed clear must preserve"
+        );
     }
 
     #[test]
@@ -9780,7 +10025,7 @@ mod tests {
     }
 
     #[test]
-    fn failed_mysql_batch_implicit_commit_does_not_preserve_decision_after_later_dirty_work() {
+    fn later_dirty_work_does_not_settle_a_failed_implicit_commits_tentative_clear() {
         let post_processor = statement_session_post_processor_for(DatabaseType::MySQL);
         let mut batch_effects = MySqlBatchSessionEffects::default();
         batch_effects.apply_failed_statement_effects(
@@ -9798,12 +10043,18 @@ mod tests {
 
         let retained = batch_effects.retained_state_after_successful_batch(prior, true);
 
+        // Work done AFTER the failed statement says nothing about whether the
+        // earlier transaction ended: if the DDL was rejected at parse time it
+        // committed nothing and the decision the prior state required is still
+        // owed, and if it committed, being asked once more costs the user a
+        // prompt. Only the confirmed spellings — the batch's own
+        // COMMIT/ROLLBACK — end that requirement.
         assert_eq!(
             retained.transaction_state(),
-            TransactionSessionState::MaybeDirty,
-            "new dirty work after a failed implicit-commit statement must not resurrect the prior decision-required state",
+            TransactionSessionState::DecisionRequired,
+            "a failed implicit commit cannot resolve the decision the prior state required, and a later INSERT is not evidence that it did",
         );
-        assert!(!retained.requires_transaction_decision());
+        assert!(retained.requires_transaction_decision());
     }
 
     #[test]

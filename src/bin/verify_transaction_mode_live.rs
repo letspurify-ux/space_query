@@ -3044,6 +3044,71 @@ fn run_scenarios(target: Target, h: &mut Harness) -> Result<(), String> {
         }
     }
 
+    // ---- S53 (Oracle): a session carrying only RESIDUE still gets the pin ---
+    // A preserved session is not necessarily a session with an open
+    // transaction. `SET ROLE`, an unknown `ALTER SESSION`, a temporary table —
+    // all of them keep the physical session with its tab while the transaction
+    // is clean. Oracle expresses the mode as a property of the TRANSACTION and
+    // has to state it before the batch's first statement, and skipping that
+    // for RESIDUE ran the whole batch at the session default while the toolbar
+    // showed the pin (OCI for the whole batch, thin for its lazy SELECT path).
+    //
+    // The evidence is S3's: a non-default mode makes the app issue
+    // SET TRANSACTION at execution start, and that statement itself opens a
+    // transaction. So a plain SELECT on a pinned tab whose session carries
+    // residue must leave the session holding one.
+    if target.is_oracle() {
+        println!("  --- S53 a residue-carrying clean session still gets the tab's pin ---");
+        h.editor.clear_tab_transaction_mode_override();
+        h.run("ROLLBACK")?;
+        let _ = h.editor.discard_pooled_session_for_close();
+        h.editor.set_tab_transaction_mode(TransactionMode::new(
+            TransactionIsolation::Serializable,
+            TransactionAccessMode::ReadWrite,
+        ));
+        // Leave session residue and END the transaction the pin opened, so the
+        // next execution starts from "clean transaction + residue".
+        let capture = h.run("ALTER SESSION SET NLS_DATE_FORMAT = 'YYYY-MM-DD';\nCOMMIT;")?;
+        h.check(
+            "S53 the residue-leaving batch ran whole",
+            capture.results.len() >= 2 && capture.results.iter().all(|result| result.success),
+            format!(
+                "results: {:?}",
+                capture
+                    .results
+                    .iter()
+                    .map(|r| (r.success, r.message.clone()))
+                    .collect::<Vec<_>>()
+            ),
+        );
+        let before = h
+            .editor
+            .pooled_session_activity_snapshot()
+            .map(|snapshot| snapshot.retained_state());
+        h.check(
+            "S53 the session is preserved for its tab with a CLEAN transaction",
+            before.is_some_and(|state| {
+                !state.may_have_uncommitted_work() && state.may_have_untracked_session_state()
+            }),
+            format!("retained state after the residue batch = {before:?}"),
+        );
+
+        let v = h.select_v()?;
+        h.check("S53 the SELECT after it works", v == 1, format!("V = {v}"));
+        let after = h
+            .editor
+            .pooled_session_activity_snapshot()
+            .map(|snapshot| snapshot.retained_state());
+        h.check(
+            "S53 the pin was issued on the residue-carrying session",
+            after.is_some_and(|state| state.may_have_uncommitted_work()),
+            format!("retained state after the pinned SELECT = {after:?}"),
+        );
+        h.run("COMMIT")?;
+        h.editor.clear_tab_transaction_mode_override();
+        let _ = h.editor.discard_pooled_session_for_close();
+    }
+
     // ---- S49 (MySQL family): dropping the tab's own database must not brick
     // ---- the tab's ability to resolve its work ------------------------------
     // A work-carrying session cannot be reset to "no database" -- that path

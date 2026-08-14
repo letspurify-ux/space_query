@@ -148,6 +148,15 @@ retained state, the OCI loop off the cleanup guard's known-clean flag), and
 neither injects it in front of the user's own transaction-first statement,
 which has to be first in its transaction itself (ORA-01453).
 
+The same rule decides whether a batch may state the mode BEFORE its first
+statement: `oracle_session_may_state_transaction_mode()` asks only whether the
+session it was handed may still hold a transaction. Session RESIDUE is not a
+reason to wait — a `SET ROLE`, an unknown `ALTER SESSION` or a temporary table
+keeps the physical session with its tab while opening no transaction — and
+treating it as one ran the whole batch at the session default under a pinned
+tab. The MySQL family needs no equivalent: it states the mode as SESSION state
+when it prepares the session, and a preserved session still carries it.
+
 ### Read only is one answer, asked by every path that writes
 
 Oracle expresses read-only as a property of the TRANSACTION
@@ -220,6 +229,25 @@ The exception is a statement that must be the first of its transaction (a
 one-shot `SET TRANSACTION ...`): the session is prepared back to a boundary for
 it even when its settings already match, or the server refuses it with
 ER_CANT_CHANGE_TX_CHARACTERISTICS.
+
+### A failed statement states nothing it did not do
+
+Both servers commit before EXECUTING a DDL statement, but a statement rejected
+at PARSE time commits nothing, so a failure can claim neither that the
+transaction ended nor that it is still open. It therefore withdraws only the
+BATCH's own dirty claim, which the batch-end server probe can restore, and
+records the clear as tentative
+(`BatchPriorTransactionEffect::ClearUnlessServerDisagrees`). Two things follow
+from keeping the tentativeness in the recorded effect rather than beside it:
+
+- a real `COMMIT` earlier in the same batch stays a fact, so a parse error
+  after it cannot resurrect the work it committed (an interrupted batch, which
+  never reaches a probe, preserves only what was never confirmed),
+- a pending one-shot `SET TRANSACTION` is NOT consumed by a failure, on either
+  the batch or the per-statement fold. No probe can ask whether the server
+  still holds it armed, and clearing the flag on a guess let the toolbar's own
+  mode replace skip its server-side consumption — after which the next
+  transaction ran the stale one-shot through the pin that had replaced it.
 
 ### MySQL/MariaDB: end the residual transaction before applying mode
 

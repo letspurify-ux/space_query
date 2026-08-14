@@ -288,6 +288,16 @@ reconnect, disconnect, pool resize):
 - A pool session that was acquired but could not be handed over
   (`discard_stale_session`) is discarded on every backend rather than returned
   to the pool half-configured.
+- A worker hands the session it was holding back through one door,
+  `SharedDbSessionLease::hand_back_worker_session`, which names the execution it
+  belongs to (`SessionHandBackOwner`). A force-cancelled batch is ABANDONED, not
+  joined — the tab publishes idle while the worker is still unwinding — so the
+  generation and the pool epoch cannot tell the dead batch from the new one:
+  both run on the same connection. A hand-back whose tab has moved on closes the
+  session instead of filing it, because filing it costs the NEWER batch its own
+  session (the lease's conflict resolution keeps whichever arrived first), and
+  it answers whether the session it closed carried uncommitted work so the
+  caller can say so rather than lose it in silence.
 
 `assert_connection_lifecycle_closes_every_server_session` proves this against a
 live database by counting the server's own sessions (`information_schema.processlist`

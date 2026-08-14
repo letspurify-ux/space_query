@@ -2213,19 +2213,85 @@ impl DbSessionLease {
         }
     }
 
+    /// Move this retained session to `target_scope`.
+    ///
+    /// `query_timeout` is the tab's, and it is applied to the CALL rather than
+    /// left to the caller: this runs on the FLTK thread (the object browser's
+    /// scope pick), and an Oracle session whose server has gone away answers
+    /// no `ALTER SESSION` at all — a retained session sits at no call timeout
+    /// after `reset_before_reuse`, so without this the whole UI waits forever
+    /// with no cancel handle. Same reason the close-path commit/rollback are
+    /// wrapped.
     pub fn apply_scope(
         &mut self,
         db_type: DatabaseType,
         target_scope: &str,
         advanced: &ConnectionAdvancedSettings,
         preserve_existing_session_state: bool,
+        query_timeout: Option<Duration>,
     ) -> Result<(), String> {
-        backend_for(db_type).apply_scope_to_lease(
-            self,
-            target_scope,
-            advanced,
-            preserve_existing_session_state,
-        )
+        self.with_call_timeout(query_timeout, |lease| {
+            backend_for(db_type).apply_scope_to_lease(
+                lease,
+                target_scope,
+                advanced,
+                preserve_existing_session_state,
+            )
+        })
+    }
+
+    /// Run `action` on this session under `query_timeout`, restoring whatever
+    /// timeout the session had.
+    ///
+    /// Oracle expresses it per call on both drivers, which is what makes this
+    /// bounded. The MySQL family has no per-call equivalent: its sessions
+    /// deliberately carry no socket read timeout (that would cut off a long
+    /// query on the same session), and `MAX_EXECUTION_TIME` covers only
+    /// statements — a `USE` is not one. Its calls here therefore stay
+    /// unbounded, which is a documented limitation rather than a claim.
+    fn with_call_timeout<T>(
+        &mut self,
+        query_timeout: Option<Duration>,
+        action: impl FnOnce(&mut Self) -> Result<T, String>,
+    ) -> Result<T, String> {
+        let previous_timeout = match self {
+            DbSessionLease::Oracle(conn) => Some(
+                conn.call_timeout()
+                    .map_err(|err| format!("Failed to read Oracle call timeout: {err}"))?,
+            ),
+            DbSessionLease::OracleThin(conn) => Some(
+                conn.call_timeout()
+                    .map_err(|err| format!("Failed to read Oracle thin call timeout: {err}"))?,
+            ),
+            DbSessionLease::MySQL { .. } => None,
+        };
+        if previous_timeout.is_some() {
+            self.set_call_timeout(query_timeout)?;
+        }
+        let result = action(self);
+        let reset_result = match previous_timeout {
+            Some(previous_timeout) => self.set_call_timeout(previous_timeout),
+            None => Ok(()),
+        };
+        match result {
+            Ok(value) => reset_result.map(|_| value),
+            Err(message) => match reset_result {
+                Ok(()) => Err(message),
+                Err(reset_message) => Err(format!("{message}; {reset_message}")),
+            },
+        }
+    }
+
+    fn set_call_timeout(&mut self, timeout: Option<Duration>) -> Result<(), String> {
+        match self {
+            DbSessionLease::Oracle(conn) => conn
+                .set_call_timeout(timeout)
+                .map_err(|err| format!("Failed to apply Oracle call timeout: {err}")),
+            DbSessionLease::OracleThin(conn) => conn
+                .set_call_timeout(timeout)
+                .map_err(|err| format!("Failed to apply Oracle thin call timeout: {err}")),
+            DbSessionLease::MySQL { .. } => Ok(()),
+        }
     }
 
     pub fn discard_physical(self, log_context: &str) {
@@ -2497,6 +2563,67 @@ impl Drop for DbSessionLeaseEntry {
             );
             lease.discard_physical("db::session_lease");
         }
+    }
+}
+
+/// Names the execution a worker's session hand-back belongs to.
+///
+/// A tab runs one execution at a time, but a force-cancelled one is abandoned
+/// rather than joined, so an old worker and a new batch can be alive together.
+/// Every hand-back from a worker states which of them it comes from; see
+/// [`SharedDbSessionLease::hand_back_worker_session`].
+#[derive(Clone, Debug, Default)]
+pub struct SessionHandBackOwner {
+    current_operation_id: Option<Arc<AtomicU64>>,
+    operation_id: u64,
+}
+
+impl SessionHandBackOwner {
+    pub fn for_operation(current_operation_id: Option<&Arc<AtomicU64>>, operation_id: u64) -> Self {
+        Self {
+            current_operation_id: current_operation_id.cloned(),
+            operation_id,
+        }
+    }
+
+    /// A hand-back from a path that runs outside any tab operation — a
+    /// UI-thread transaction action, an internal execution, a test. There is no
+    /// newer execution that could own the slot, so every hand-back is current.
+    pub fn untracked() -> Self {
+        Self::default()
+    }
+
+    pub fn is_current(&self) -> bool {
+        match self.current_operation_id.as_ref() {
+            None => true,
+            // An operation id of 0 means the caller never recorded one, so
+            // there is nothing to compare and nothing newer to lose to.
+            Some(_) if self.operation_id == 0 => true,
+            Some(current) => current.load(Ordering::Relaxed) == self.operation_id,
+        }
+    }
+}
+
+/// What became of a worker's session hand-back.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[must_use]
+pub enum SessionHandBack {
+    /// It reached the tab's slot, or the session was discarded as asked.
+    /// `stored` is false when the slot refused it (another session is already
+    /// retained there, or the tab is closed).
+    Applied { stored: bool },
+    /// The tab had moved on to a newer execution, so the session was closed
+    /// instead. `carried_work` is what the caller must report to the user.
+    Abandoned { carried_work: bool },
+}
+
+impl SessionHandBack {
+    pub fn stored(self) -> bool {
+        matches!(self, Self::Applied { stored: true })
+    }
+
+    pub fn abandoned_work(self) -> bool {
+        matches!(self, Self::Abandoned { carried_work: true })
     }
 }
 
@@ -2819,6 +2946,57 @@ impl SharedDbSessionLease {
             true
         } else {
             false
+        }
+    }
+
+    /// The one door a WORKER hands the session it has been holding back
+    /// through, on every backend.
+    ///
+    /// A force-cancelled batch is ABANDONED, not joined: the tab is published
+    /// idle while its worker is still unwinding, so the user's next execution
+    /// can already own this slot. Connection generation and pool epoch cannot
+    /// see that — the newer batch runs on the same connection — so the
+    /// hand-back names its own operation here and a session whose tab has moved
+    /// on is CLOSED instead of filed. Filing it costs the newer batch its
+    /// session: `retained_lease_conflict_resolution` keeps whichever arrived
+    /// first and discards the other, taking the user's just-typed work with it.
+    ///
+    /// The answer says whether work was lost, because a session carrying
+    /// uncommitted work must never disappear in silence — see
+    /// `RETAINED_SESSION_LOST_WITH_WORK`.
+    pub fn hand_back_worker_session(
+        &self,
+        owner: &SessionHandBackOwner,
+        connection_generation: u64,
+        pool_context_epoch: u64,
+        lease: DbSessionLease,
+        disposition: RetainedSessionDisposition,
+        log_context: &str,
+        current_scope: Option<String>,
+    ) -> SessionHandBack {
+        if !owner.is_current() {
+            let carried_work = match disposition {
+                RetainedSessionDisposition::Retain(retained_state) => {
+                    retained_state.may_have_uncommitted_work()
+                }
+                RetainedSessionDisposition::DiscardPhysical => false,
+            };
+            logging::log_warning(
+                log_context,
+                "Closing an abandoned batch's DB session: the tab has moved on to a newer execution",
+            );
+            lease.discard_physical(log_context);
+            return SessionHandBack::Abandoned { carried_work };
+        }
+        SessionHandBack::Applied {
+            stored: self.apply_retained_session_disposition_with_scope(
+                connection_generation,
+                pool_context_epoch,
+                lease,
+                disposition,
+                log_context,
+                current_scope,
+            ),
         }
     }
 
@@ -8161,6 +8339,55 @@ pub fn try_lock_connection_with_activity(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_session_hand_back_names_the_execution_it_belongs_to() {
+        // A force-cancelled batch keeps unwinding while the tab is already
+        // running the next one. Its hand-back must be judged against the
+        // operation the tab is on now, not against the connection generation,
+        // which both batches share.
+        let current_operation_id = Arc::new(AtomicU64::new(7));
+        let owner = SessionHandBackOwner::for_operation(Some(&current_operation_id), 7);
+        assert!(owner.is_current(), "the running batch owns the slot");
+
+        current_operation_id.store(8, Ordering::Relaxed);
+        assert!(
+            !owner.is_current(),
+            "a batch the tab has moved past must not reach the slot"
+        );
+
+        // Paths outside any tab operation (a UI-thread transaction action, an
+        // internal execution, a test) have nothing newer to lose to.
+        assert!(SessionHandBackOwner::untracked().is_current());
+        assert!(
+            SessionHandBackOwner::for_operation(Some(&current_operation_id), 0).is_current(),
+            "an unrecorded operation id is not a stale one"
+        );
+    }
+
+    #[test]
+    fn an_abandoned_hand_back_reports_the_work_it_closes() {
+        // Losing a session is sometimes right; losing the work on it in
+        // silence never is.
+        let carrying_work =
+            RetainedSessionState::from_transaction_state(TransactionSessionState::MaybeDirty);
+        assert!(
+            SessionHandBack::Abandoned {
+                carried_work: carrying_work.may_have_uncommitted_work()
+            }
+            .abandoned_work(),
+            "an abandoned session that carried work must be reported"
+        );
+        assert!(
+            !SessionHandBack::Abandoned {
+                carried_work: RetainedSessionState::default().may_have_uncommitted_work()
+            }
+            .abandoned_work(),
+            "a clean session going away is not the user's business"
+        );
+        assert!(SessionHandBack::Applied { stored: true }.stored());
+        assert!(!SessionHandBack::Applied { stored: false }.stored());
+    }
 
     #[test]
     fn default_null_sort_order_matches_each_backend() {

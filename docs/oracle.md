@@ -169,6 +169,13 @@ and is discarded at close rather than returned to the pool. A setting that can
 travel back into the pool is exactly a setting session preparation must state
 totally.
 
+The judgement is about the WHOLE statement, not its first parameter. Oracle
+takes several `parameter = value` pairs in one `ALTER SESSION SET`, so
+`OracleAlterSessionTarget` counts the value words each known target allows and
+answers `NotRestatedByPoolSetup` for anything else: a trailing
+`OPTIMIZER_MODE = FIRST_ROWS_1` is state nobody restates wherever in the
+statement it appears.
+
 ## Local test database
 
 These development-only credentials connect to the repository's local Oracle
