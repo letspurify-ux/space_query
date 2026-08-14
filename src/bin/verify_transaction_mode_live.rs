@@ -82,6 +82,11 @@
 //       session-level isolation: driven with a pool of exactly one session and
 //       an assertion that the tab really got that physical session back, so it
 //       cannot pass by never meeting the hazard.
+//   S51 (Oracle) the same, with the connection's advanced default isolation
+//       left at `Default` ("follow the server", the first entry of that
+//       dropdown). `Default` has no `sql_level()`, so session preparation used
+//       to emit no isolation statement at all and one tab's ALTER SESSION
+//       governed the next tab to be handed that session.
 //
 // Usage: verify_transaction_mode_live <thin|oci|mysql|mariadb|all>
 
@@ -2995,8 +3000,8 @@ fn run_scenarios(target: Target, h: &mut Harness) -> Result<(), String> {
         h.run("ROLLBACK")?;
     }
 
-    // ---- S47 (Oracle): a recycled session must not carry a session-level
-    // ---- isolation into a tab that never asked for one ----------------------
+    // ---- S47 / S51 (Oracle): a recycled session must not carry a
+    // ---- session-level isolation into a tab that never asked for one --------
     // `ALTER SESSION SET ISOLATION_LEVEL` is SESSION persistent, and an Oracle
     // pool hands a session back exactly as its last user left it (the MySQL
     // family cannot have this problem: `PoolOpts::reset_connection` is true, so
@@ -3007,86 +3012,24 @@ fn run_scenarios(target: Target, h: &mut Harness) -> Result<(), String> {
     // is shared through the pool. A pool of exactly one session makes the
     // recycle deterministic: leave SERIALIZABLE on it, hand it back, and a tab
     // that pinned nothing must still run under the connection's default.
+    //
+    // Run for BOTH values the connection's advanced "default transaction
+    // isolation" can take, because they reach session preparation differently:
+    // a concrete level (S47) states itself, while `Default` (S51 -- the first
+    // entry of that dropdown, "follow the server") has no `sql_level()` and
+    // used to make preparation emit no isolation statement at all, i.e. "leave
+    // the session wherever the last tab left it".
     if target.is_oracle() {
-        println!("  --- S47 a recycled session carries no foreign isolation ---");
-        let isolation_sql = "SELECT value FROM v$ses_optimizer_env \
-             WHERE sid = SYS_CONTEXT('USERENV', 'SID') \
-             AND name = 'transaction_isolation_level'";
-        let sid_sql = "SELECT TO_CHAR(SYS_CONTEXT('USERENV', 'SID')) FROM DUAL";
-        let seeded_sid: String;
-        let mut single = DatabaseConnection::new();
-        single.set_connection_pool_size(1);
-        single
-            .connect(target.connection_info())
-            .map_err(|e| format!("S47 connect: {e}"))?;
-        let single = Arc::new(Mutex::new(single));
-        {
-            // One raw pool session, left the way a previous tab would leave it.
-            let context = {
-                let guard = single.lock().unwrap_or_else(|p| p.into_inner());
-                guard
-                    .pool_session_context()
-                    .map_err(|e| format!("S47 pool context: {e}"))?
-            };
-            let activity = space_query::db::track_db_activity(
-                "S47 seeding a pooled session".to_string(),
-                Some(DatabaseType::Oracle),
-            );
-            let (session, _registration) = context
-                .acquire_session_for_current_scope(&activity)
-                .map_err(|e| format!("S47 acquire: {e}"))?;
-            match session {
-                space_query::db::DbPoolSession::Oracle(conn) => {
-                    conn.execute("ALTER SESSION SET ISOLATION_LEVEL = SERIALIZABLE", &[])
-                        .map_err(|e| format!("S47 alter session (oci): {e}"))?;
-                    let row = conn
-                        .query_row_as::<String>(sid_sql, &[])
-                        .map_err(|e| format!("S47 read sid (oci): {e}"))?;
-                    seeded_sid = row.trim().to_string();
-                }
-                space_query::db::DbPoolSession::OracleThin(mut conn) => {
-                    conn.query_drop("ALTER SESSION SET ISOLATION_LEVEL = SERIALIZABLE")
-                        .map_err(|e| format!("S47 alter session (thin): {e}"))?;
-                    seeded_sid =
-                        space_query::db::DatabaseConnection::oracle_thin_select_one_text_for_test(
-                            &mut conn, sid_sql,
-                        )
-                        .map_err(|e| format!("S47 read sid (thin): {e}"))?
-                        .unwrap_or_default();
-                }
-                session @ space_query::db::DbPoolSession::MySQL { .. } => {
-                    return Err(format!(
-                        "S47 expected an Oracle pool session but got {}",
-                        session.db_type()
-                    ));
-                }
-            }
-            // Dropped here: back into the pool, alive, still SERIALIZABLE.
+        for (scenario, configured_isolation) in [
+            ("S47", TransactionIsolation::ReadCommitted),
+            ("S51", TransactionIsolation::Default),
+        ] {
+            h.failures.extend(check_recycled_session_isolation(
+                target,
+                scenario,
+                configured_isolation,
+            )?);
         }
-        let mut fresh = attach_tab(Arc::clone(&single));
-        // Pins nothing: this is the tab that "pays nothing".
-        fresh.editor.clear_tab_transaction_mode_override();
-        let tab_sid = fresh.select_scalar(sid_sql)?;
-        let level = fresh.select_scalar(isolation_sql)?;
-        // Without this the check could pass simply by never meeting the
-        // hazard: a pool that closes the returned session instead of handing
-        // it back has nothing to leak.
-        fresh.check(
-            "S47 the tab really got the physical session that was left SERIALIZABLE",
-            !seeded_sid.is_empty() && tab_sid.trim() == seeded_sid.trim(),
-            format!("seeded sid = {seeded_sid:?}, tab sid = {tab_sid:?}"),
-        );
-        fresh.check(
-            "S47 a tab that pinned nothing runs under the connection default, not the session's leftover",
-            !level.trim().eq_ignore_ascii_case("serializable"),
-            format!("session isolation = {level:?}"),
-        );
-        h.failures.extend(fresh.failures.iter().cloned());
-        let _ = fresh.editor.discard_pooled_session_for_close();
-        single
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .disconnect();
     }
 
     // ---- S49 (MySQL family): dropping the tab's own database must not brick
@@ -4159,6 +4102,103 @@ fn isolation_value_matches(session_value: &str, expected: TransactionIsolation) 
 /// claims the feature makes about *scope*: a tab-scoped setting must not reach
 /// another tab, and an isolation level can only be read behaviourally on
 /// Oracle, which needs a session that is not the one under test.
+/// One round of the recycled-session isolation check, run once per value the
+/// connection's advanced "default transaction isolation" can hold.
+///
+/// A pool of exactly one session makes the recycle deterministic: seed that
+/// session with a session-persistent SERIALIZABLE the way a previous tab would
+/// leave it, hand it back, and require a tab that pinned nothing to still run
+/// under the connection's default. The SID assertion is what stops the check
+/// passing by never meeting the hazard, i.e. by getting a different session.
+fn check_recycled_session_isolation(
+    target: Target,
+    scenario: &str,
+    configured_isolation: TransactionIsolation,
+) -> Result<Vec<String>, String> {
+    println!("  --- {scenario} a recycled session carries no foreign isolation (connection default = {}) ---", configured_isolation.label());
+    let isolation_sql = "SELECT value FROM v$ses_optimizer_env \
+         WHERE sid = SYS_CONTEXT('USERENV', 'SID') \
+         AND name = 'transaction_isolation_level'";
+    let sid_sql = "SELECT TO_CHAR(SYS_CONTEXT('USERENV', 'SID')) FROM DUAL";
+    let seeded_sid: String;
+    let mut info = target.connection_info();
+    info.advanced.default_transaction_isolation = configured_isolation;
+    let mut single = DatabaseConnection::new();
+    single.set_connection_pool_size(1);
+    single
+        .connect(info)
+        .map_err(|e| format!("{scenario} connect: {e}"))?;
+    let single = Arc::new(Mutex::new(single));
+    {
+        // One raw pool session, left the way a previous tab would leave it.
+        let context = {
+            let guard = single.lock().unwrap_or_else(|p| p.into_inner());
+            guard
+                .pool_session_context()
+                .map_err(|e| format!("{scenario} pool context: {e}"))?
+        };
+        let activity = space_query::db::track_db_activity(
+            format!("{scenario} seeding a pooled session"),
+            Some(DatabaseType::Oracle),
+        );
+        let (session, _registration) = context
+            .acquire_session_for_current_scope(&activity)
+            .map_err(|e| format!("{scenario} acquire: {e}"))?;
+        match session {
+            space_query::db::DbPoolSession::Oracle(conn) => {
+                conn.execute("ALTER SESSION SET ISOLATION_LEVEL = SERIALIZABLE", &[])
+                    .map_err(|e| format!("{scenario} alter session (oci): {e}"))?;
+                let row = conn
+                    .query_row_as::<String>(sid_sql, &[])
+                    .map_err(|e| format!("{scenario} read sid (oci): {e}"))?;
+                seeded_sid = row.trim().to_string();
+            }
+            space_query::db::DbPoolSession::OracleThin(mut conn) => {
+                conn.query_drop("ALTER SESSION SET ISOLATION_LEVEL = SERIALIZABLE")
+                    .map_err(|e| format!("{scenario} alter session (thin): {e}"))?;
+                seeded_sid =
+                    space_query::db::DatabaseConnection::oracle_thin_select_one_text_for_test(
+                        &mut conn, sid_sql,
+                    )
+                    .map_err(|e| format!("{scenario} read sid (thin): {e}"))?
+                    .unwrap_or_default();
+            }
+            session @ space_query::db::DbPoolSession::MySQL { .. } => {
+                return Err(format!(
+                    "{scenario} expected an Oracle pool session but got {}",
+                    session.db_type()
+                ));
+            }
+        }
+        // Dropped here: back into the pool, alive, still SERIALIZABLE.
+    }
+    let mut fresh = attach_tab(Arc::clone(&single));
+    // Pins nothing: this is the tab that "pays nothing".
+    fresh.editor.clear_tab_transaction_mode_override();
+    let tab_sid = fresh.select_scalar(sid_sql)?;
+    let level = fresh.select_scalar(isolation_sql)?;
+    // Without this the check could pass simply by never meeting the
+    // hazard: a pool that closes the returned session instead of handing
+    // it back has nothing to leak.
+    fresh.check(
+        &format!("{scenario} the tab really got the physical session that was left SERIALIZABLE"),
+        !seeded_sid.is_empty() && tab_sid.trim() == seeded_sid.trim(),
+        format!("seeded sid = {seeded_sid:?}, tab sid = {tab_sid:?}"),
+    );
+    fresh.check(
+        &format!("{scenario} a tab that pinned nothing runs under the connection default, not the session's leftover"),
+        !level.trim().eq_ignore_ascii_case("serializable"),
+        format!("session isolation = {level:?}"),
+    );
+    let failures = fresh.failures.clone();
+    let _ = fresh.editor.discard_pooled_session_for_close();
+    single
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .disconnect();
+    Ok(failures)
+}
+
 fn attach_tab(shared: space_query::db::SharedConnection) -> Harness {
     let timeout_input = IntInput::default();
     let mut editor = SqlEditorWidget::new(Arc::clone(&shared), timeout_input);

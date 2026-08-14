@@ -80,9 +80,9 @@ MySQL family, whose driver resets every returned connection
 (`PoolOpts::reset_connection` is `true` by default, so `COM_RESET_CONNECTION`
 runs on return). What makes an Oracle session safe to recycle is that
 `oracle_session_setting_statements()` is applied on EVERY pool acquisition
-(`DbConnectionPool::acquire_session_untracked`) and is total: it re-issues the
-NLS formats, the time zone, and — the one that matters here —
-`ALTER SESSION SET ISOLATION_LEVEL = <connection default>`.
+(`DbConnectionPool::acquire_session_untracked`) and states the NLS formats and
+— the one that matters here — `ALTER SESSION SET ISOLATION_LEVEL = <connection
+default>`.
 
 That last statement is what stops a session-level isolation from leaking
 between tabs. `ALTER SESSION SET ISOLATION_LEVEL` is SESSION persistent, and
@@ -90,10 +90,30 @@ the reset in `oracle_transaction_mode_statements_for_tab()` is deliberately
 issued only when a tab has actively selected the default isolation ("a tab that
 never touched the controls has adopted nothing and pays nothing") — so a tab
 that pinned nothing would otherwise inherit whatever the previous user of that
-physical session left on it. Live check S47 in `verify_transaction_mode_live`
-pins this on both drivers with a pool of exactly one session, and asserts the
-tab really received the same physical session (same `SID`) so it cannot pass by
-never meeting the hazard.
+physical session left on it.
+
+For that to hold, the level the pool states has to be a CONCRETE one.
+`TransactionIsolation::Default` has no `sql_level()`, so a pool still holding
+it prepares its sessions with no isolation statement at all — "leave the
+session wherever the last tab left it" — and a connection whose advanced
+*Default transaction isolation* is left at `Default` (the first entry of that
+dropdown) hit exactly that. `sync_default_transaction_isolation()` therefore
+resolves the level (configured, else read from the server, else the backend
+fallback) and records it on the pool in one step
+(`DbConnectionPool::set_session_default_transaction_isolation`), so `Default`
+can never reach session preparation. Live checks S47 (configured level) and
+S51 (`Default`) in `verify_transaction_mode_live` pin this on both drivers with
+a pool of exactly one session, and assert the tab really received the same
+physical session (same `SID`) so they cannot pass by never meeting the hazard.
+
+Isolation and `CURRENT_SCHEMA` are the only two `ALTER SESSION SET` targets
+that need this. They are also the only two the residue classifier treats as
+leaving a session CLEAN (`statement_session_post_processor_for`): every other
+target — `TIME_ZONE` included — sets `may_leave_unknown_state`, which makes the
+session `requires_physical_session_preservation()`, so it stays with its tab
+and is discarded at close rather than returned to the pool. A setting that can
+travel back into the pool is exactly a setting session preparation must state
+totally.
 
 ## Local test database
 

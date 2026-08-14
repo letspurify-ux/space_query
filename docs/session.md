@@ -170,7 +170,15 @@ to the window exactly once, by `QueryProgress::ScopeChangedNotice`, carrying the
 scope the statement itself selected. Recording and reporting are one step
 because they were two: sites that reported without recording left the rest of
 the script running in the scope the tab had when the run started. That report
-moves the originating tab and nothing else. A tab's `USE` deliberately does NOT
+moves the originating tab's BINDING and browser card, and nothing else — it
+must not re-apply the scope to the session, which the statement that emitted it
+has already moved. Doing so took the tab's retained lease out of its slot from
+the UI thread while the batch that owns it was still running, and the MySQL
+family re-acquires that lease per statement: the next statement could find no
+session, run on a fresh one, and split the user's open transaction across two
+physical sessions. The two sibling per-tab options, auto-commit and transaction
+mode, already refuse to touch a session while its tab is executing
+(`transaction_option_block_message`). A tab's `USE` deliberately does NOT
 write the connection's stored database (that name is the connection's own, and
 is what a tab with no scope of its own falls back to), so any second event built
 from it would name another tab's database and overwrite the correct one.

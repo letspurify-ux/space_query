@@ -2037,11 +2037,39 @@ impl DbConnectionPool {
         }
     }
 
+    /// The settings every session handed out by this pool is prepared with.
+    ///
+    /// Its `default_transaction_isolation` is the connection's RESOLVED level,
+    /// never `Default` — see
+    /// [`Self::set_session_default_transaction_isolation`].
     fn advanced(&self) -> &ConnectionAdvancedSettings {
         match self {
             DbConnectionPool::Oracle { advanced, .. }
             | DbConnectionPool::OracleThin { advanced, .. }
             | DbConnectionPool::MySQL { advanced, .. } => advanced,
+        }
+    }
+
+    /// Records the connection's resolved default isolation as the level this
+    /// pool prepares its sessions with.
+    ///
+    /// Session preparation has to STATE the level rather than leave it. A
+    /// pooled session is recycled between tabs and comes back carrying
+    /// whatever its last user left on it, and `TransactionIsolation::Default`
+    /// has no `sql_level()`, so preparing with it emits no statement at all —
+    /// "leave the session wherever it was". That is how a session-persistent
+    /// `ALTER SESSION SET ISOLATION_LEVEL` run by one tab reached a tab that
+    /// pinned nothing: the reset that neutralizes it is only issued for a tab
+    /// which actively selected the default, while the state being neutralized
+    /// lives on the shared session. Same reason
+    /// [`DatabaseConnection::oracle_session_schema_for_scope`] is total.
+    fn set_session_default_transaction_isolation(&mut self, isolation: TransactionIsolation) {
+        match self {
+            DbConnectionPool::Oracle { advanced, .. }
+            | DbConnectionPool::OracleThin { advanced, .. }
+            | DbConnectionPool::MySQL { advanced, .. } => {
+                advanced.default_transaction_isolation = isolation;
+            }
         }
     }
 
@@ -5749,20 +5777,27 @@ impl DatabaseConnection {
 
     fn sync_default_transaction_isolation(&mut self, db_type: DatabaseType) {
         let configured = self.info.advanced.default_transaction_isolation;
-        if configured != TransactionIsolation::Default
+        self.default_transaction_isolation = if configured != TransactionIsolation::Default
             && db_type
                 .supported_transaction_isolations()
                 .contains(&configured)
         {
-            self.default_transaction_isolation = configured;
-            return;
-        }
+            configured
+        } else {
+            self.read_current_default_transaction_isolation(db_type)
+                .ok()
+                .flatten()
+                .unwrap_or_else(|| db_type.fallback_default_transaction_isolation())
+        };
 
-        self.default_transaction_isolation = self
-            .read_current_default_transaction_isolation(db_type)
-            .ok()
-            .flatten()
-            .unwrap_or_else(|| db_type.fallback_default_transaction_isolation());
+        // Resolving the level and telling the pool about it is one step, not
+        // two: the pool prepares every session it hands out, and a session it
+        // recycles between tabs carries the previous tab's level until this
+        // one is stated on it.
+        let resolved = self.default_transaction_isolation;
+        if let Some(pool) = self.pool.as_mut() {
+            pool.set_session_default_transaction_isolation(resolved);
+        }
     }
 
     fn read_current_default_transaction_isolation(

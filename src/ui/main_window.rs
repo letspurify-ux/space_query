@@ -10962,9 +10962,21 @@ impl MainWindow {
                         .filter(|scope| !scope.is_empty());
                     // The one report of a scope change: an ALTER SESSION or a
                     // `USE` ran on THIS tab's session, so only this tab moves.
+                    //
+                    // Only the tab's binding and its browser card are updated
+                    // here. The SESSION needs nothing: this notice is emitted
+                    // by `note_batch_scope_change`, i.e. by the statement that
+                    // just moved that very session, and the batch records the
+                    // new scope where it reads it. Re-applying it from the UI
+                    // thread would take the tab's retained lease out of its
+                    // slot while the batch that owns it is still running — on
+                    // the MySQL family, which re-acquires per statement, the
+                    // next statement would then find no session, run on a
+                    // FRESH one, and split the user's open transaction across
+                    // two physical sessions. The two sibling option changes
+                    // (auto-commit, transaction mode) already refuse to touch
+                    // a session while its tab is executing.
                     s.synchronize_scope_for_tab(tab_id, selected_scope.clone());
-                    let retained_scope_update =
-                        s.retained_scope_update_for_tab(tab_id, selected_scope.clone());
                     let origin = s
                         .editor_tabs
                         .iter()
@@ -10976,15 +10988,6 @@ impl MainWindow {
                         s.set_status_message(&status);
                     }
                     drop(s);
-                    if let Some(message) = retained_scope_update
-                        .map(apply_retained_scope_update)
-                        .and_then(|outcomes| first_retained_outcome_message(&outcomes))
-                    {
-                        crate::ui::alert_on_main(&format!(
-                            "Scope changed for this connection, but a retained tab session could not be updated:\n{}",
-                            message
-                        ));
-                    }
                 }
                 QueryProgress::StatementFinished { index, result, .. } => {
                     if s.pending_table_browse_last.contains_key(&tab_id) {

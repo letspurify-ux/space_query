@@ -2048,16 +2048,24 @@ fn a_scope_change_updates_the_originating_tab_without_releasing_sessions() {
     let handler = &content[start..end];
 
     // Scope is TAB-scoped: a `USE` ran on ONE tab's session, so only that
-    // tab's binding, browser card, and retained session may move — sibling
-    // tabs on the same connection keep their own scope.
+    // tab's binding and browser card move — sibling tabs on the same
+    // connection keep their own scope.
     assert!(
         handler.contains("s.synchronize_scope_for_tab(tab_id")
             && handler.contains("selected_scope.clone()"),
         "A scope change should synchronize the selected scope on the originating tab"
     );
+    // ...and only those. This notice is emitted by `note_batch_scope_change`,
+    // i.e. by the statement that just moved the tab's own session, so the
+    // session needs nothing here. Taking its retained lease out of the slot
+    // from the UI thread while the batch that owns it is still running is what
+    // would hurt: the MySQL family re-acquires per statement, so the next
+    // statement would find no session, run on a FRESH one, and split the
+    // user's open transaction across two physical sessions.
     assert!(
-        handler.contains("s.retained_scope_update_for_tab(tab_id"),
-        "A scope change should update the originating tab's retained session"
+        !handler.contains("retained_scope_update_for_tab")
+            && !handler.contains("apply_retained_scope_update"),
+        "A reported scope change must not re-apply the scope to the session the running batch owns"
     );
     assert!(
         handler.contains("if s.active_editor_tab_id == tab_id"),
@@ -2128,9 +2136,13 @@ fn oracle_current_schema_change_updates_object_browser_scope_before_refresh() {
         handler.contains("s.synchronize_scope_for_tab(tab_id"),
         "ScopeChangedNotice should synchronize the originating tab's binding and browser card"
     );
+    // The session itself is already there: the statement that moved it is
+    // what emitted this notice. See
+    // `a_scope_change_updates_the_originating_tab_without_releasing_sessions`
+    // for why re-applying it from the UI thread is the harmful half.
     assert!(
-        handler.contains("s.retained_scope_update_for_tab(tab_id"),
-        "ScopeChangedNotice should update the originating tab's retained session"
+        !handler.contains("retained_scope_update_for_tab"),
+        "ScopeChangedNotice must not re-apply the scope to the session the running batch owns"
     );
     assert!(
         handler.contains("owning_result_tabs.set_execution_origin(origin)"),
@@ -3375,6 +3387,28 @@ fn transaction_mode_state_has_a_single_source_of_truth() {
             "an Oracle transaction-mode application must read the tab override slot (or state None): {tail}"
         );
     }
+
+    // (17) That reset is the tab's half of the answer; the pool owns the
+    // other half. A pooled session is recycled between tabs and comes back
+    // carrying whatever level its last user left on it, and the reset above
+    // is issued only for a tab that actively selected the default — so the
+    // pool must state the level on every session it hands out. Resolving the
+    // connection's default and telling the pool about it is therefore ONE
+    // step: `TransactionIsolation::Default` has no `sql_level()`, so a pool
+    // still holding it prepares its sessions with no isolation statement at
+    // all, i.e. "leave the session wherever the last tab left it".
+    let sync_start = connection
+        .find("fn sync_default_transaction_isolation(")
+        .expect("sync_default_transaction_isolation should exist");
+    let sync_end = connection[sync_start..]
+        .find("\n    fn ")
+        .map(|offset| sync_start + offset)
+        .expect("sync_default_transaction_isolation should end");
+    let sync_body = &connection[sync_start..sync_end];
+    assert!(
+        sync_body.contains("set_session_default_transaction_isolation"),
+        "resolving the connection's default isolation must record it as the level the pool prepares its sessions with"
+    );
 }
 
 /// The Oracle thin batch loop's own read-only gate, located without pinning
@@ -3483,6 +3517,21 @@ fn an_in_script_connect_adopts_the_new_connections_default_isolation() {
     assert!(
         compact.contains("default_transaction_isolation=candidate.default_transaction_isolation;"),
         "the thin CONNECT must adopt the new connection's default isolation"
+    );
+
+    // The third CONNECT site: a thin tab whose connection is GONE starts its
+    // script with CONNECT, so the batch never sees a live connection to read
+    // this from. Disconnecting resets the field to `Default`, a level with no
+    // SQL spelling — keeping it would silently emit no session-level isolation
+    // reset for the whole batch. It comes from the candidate, next to the
+    // auto-commit and transaction mode the same branch already resolves there.
+    let anchor = compact
+        .find("candidate.transaction_mode,load_mutex_transaction_mode_option(tab_transaction_mode_override),),")
+        .expect("the disconnected-tab CONNECT branch should resolve the tab's mode over the candidate");
+    let branch = &compact[anchor..(anchor + 800).min(compact.len())];
+    assert!(
+        branch.contains("candidate.default_transaction_isolation,"),
+        "a leading CONNECT on a disconnected thin tab must take the new connection's default isolation too"
     );
 }
 

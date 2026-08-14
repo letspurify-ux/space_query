@@ -698,7 +698,7 @@ impl ExecutionWorkerBackend for OracleExecutionWorkerBackend {
             db_type,
             auto_commit: initial_auto_commit,
             selected_transaction_mode: initial_transaction_mode,
-            default_transaction_isolation,
+            default_transaction_isolation: initial_default_transaction_isolation,
             session,
         } = startup;
         // The operation's own activity — the entry the user sees in the status
@@ -742,6 +742,11 @@ impl ExecutionWorkerBackend for OracleExecutionWorkerBackend {
             pool_context_epoch,
             auto_commit,
             selected_transaction_mode,
+            // Chosen by the branch, not carried in from the startup: a
+            // leading `CONNECT` on a disconnected tab decides which connection
+            // the rest of this batch runs on, and this is that connection's
+            // default.
+            default_transaction_isolation,
             active_scope,
             active_binding_revision,
             preconnected_info,
@@ -854,6 +859,7 @@ impl ExecutionWorkerBackend for OracleExecutionWorkerBackend {
                 pool_context_epoch,
                 initial_auto_commit,
                 initial_transaction_mode,
+                initial_default_transaction_isolation,
                 execution_scope.clone(),
                 binding_revision,
                 None,
@@ -944,6 +950,13 @@ impl ExecutionWorkerBackend for OracleExecutionWorkerBackend {
                     candidate.transaction_mode,
                     load_mutex_transaction_mode_option(tab_transaction_mode_override),
                 ),
+                // ... but "the connection default" a tab selecting `Default`
+                // isolation is put back to belongs to the CONNECTION, not to
+                // the tab, so it comes from the one this batch now runs on.
+                // The tab's own connection was disconnected, which resets its
+                // default to `Default` — a level with no SQL spelling, so
+                // keeping it would silently emit no reset at all.
+                candidate.default_transaction_isolation,
                 None,
                 candidate.binding_revision,
                 Some(candidate.sanitized_info),
