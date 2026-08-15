@@ -375,7 +375,14 @@ back user work.
   database type is not reusable.
 - Changing current schema/database never lowers retained state to clean.
 - Retained-lease conflicts use `conservative_merge()` and the central conflict
-  policy.
+  policy. When BOTH the retained session and the incoming one carry work, the
+  tab's existing session is kept and marked `DecisionRequired` — not
+  `InvalidSession`. The kept session is live and its `COMMIT` would succeed;
+  `InvalidSession` means the server side is gone, which is why it is the one
+  state `resolve_required_transaction_decision` discards without asking and
+  `capabilities()` never offers commit or rollback for. Marking a live
+  work-carrying session with it satisfied the rule the branch was written for
+  ("a conflict must not look clean") and cost the user the work anyway.
 
 For the effect of cancellation and timeout on this state, see the
 [session lifecycle](session.md).

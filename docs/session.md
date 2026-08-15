@@ -310,6 +310,21 @@ reconnect, disconnect, pool resize):
   caller can say so rather than lose it in silence — including when the SLOT
   refused a session it was asked to retain because the tab had closed, which
   closes it just as surely.
+- TAKING the session is the third discard road, and it needed the same answer.
+  An entry that belongs to another incarnation of this connection is CLOSED by
+  the take, and answering `None` for that made it indistinguishable from an
+  empty slot — so every caller read "there was nothing to do" about a session it
+  had just destroyed. The close prompt's **Commit** reported success for a
+  commit it never ran and then closed the tab; the scope, auto-commit and
+  transaction-mode pushes answered `NoSession`, which does not alert. Rollback
+  and Discard hid it, because for them the destruction happens to be the outcome
+  the user asked for, so the answer was true by accident.
+  `RetainedLeaseTake::{Empty, Taken, Unreachable}` now says which of the three
+  happened, `lost_work()` answers the same question `SessionHandBack::lost_work`
+  does, and `RetainedSessionCloseOutcome` gives a session-ending action the
+  third answer a `Result<(), String>` had no room for. An action that could not
+  reach the session REPORTS and carries on: nothing is left to retry, and
+  refusing would leave the loss unexplained and the close half done.
 - The DISCARD direction has the same door,
   `SharedDbSessionLease::clear_worker_session`. A worker leaving a connection
   (script `CONNECT`/`DISCONNECT`, or a batch that ended disconnected) drops

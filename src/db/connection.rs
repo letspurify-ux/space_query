@@ -1546,6 +1546,23 @@ impl RetainedSessionMutationOutcome {
         }
     }
 
+    /// The answer for a take that CLOSED the tab's session instead of handing
+    /// it over — see [`RetainedLeaseTake::Unreachable`].
+    ///
+    /// Stated once because it is the same answer for every push (scope,
+    /// auto-commit, transaction mode) and all three used to say `NoSession`,
+    /// which does not alert, about a session the take had just destroyed with
+    /// the user's work in it.
+    pub fn for_unreachable_take(retained_state: RetainedSessionState) -> Self {
+        if retained_state.may_have_uncommitted_work() {
+            Self::FailedDiscarded(
+                crate::db::query::result_messages::RETAINED_SESSION_LOST_WITH_WORK.to_string(),
+            )
+        } else {
+            Self::DiscardedBecauseStale
+        }
+    }
+
     pub fn should_alert_user(&self) -> bool {
         !matches!(self, Self::NoSession | Self::Applied)
     }
@@ -1628,7 +1645,7 @@ pub struct SharedDbSessionLease {
 enum RetainedLeaseConflictResolution {
     KeepExisting,
     ReplaceExisting,
-    KeepExistingMarkedInvalid,
+    KeepExistingRequiringDecision,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -2663,6 +2680,52 @@ impl SessionHandBack {
     }
 }
 
+/// What taking the tab's retained session for an action found.
+///
+/// The third discard road, beside
+/// [`SharedDbSessionLease::hand_back_worker_session`] and
+/// [`SharedDbSessionLease::clear_worker_session`], and it needed the same
+/// answer they have: an entry that belongs to another incarnation of this
+/// connection is CLOSED by the take, and the user's uncommitted work goes with
+/// it. Answering `None` for that made it indistinguishable from an empty slot,
+/// so every caller read "there was nothing to do" — the close prompt's
+/// **Commit** reported success for a commit it never ran and then closed the
+/// tab, and the scope/auto-commit/transaction-mode pushes answered `NoSession`
+/// about a session they had just destroyed. Rollback and Discard hid it: for
+/// them the destruction happens to be the outcome the user asked for, so the
+/// answer was true by accident.
+#[must_use]
+pub enum RetainedLeaseTake {
+    /// The slot was empty. There was nothing to act on and nothing was lost —
+    /// the one case where "nothing happened" is the whole truth.
+    Empty,
+    /// The tab's session, ready for the action that asked for it.
+    Taken(TakenDbSessionLease),
+    /// The slot held a session this identity cannot act on (another connection
+    /// generation, another database type), so the take closed it. The state it
+    /// was carrying is what the caller has to tell the user about.
+    Unreachable {
+        retained_state: RetainedSessionState,
+    },
+}
+
+impl RetainedLeaseTake {
+    // Deliberately no `taken() -> Option<TakenDbSessionLease>`: an accessor
+    // that collapses `Empty` and `Unreachable` into `None` is the very shape
+    // this type replaced, and every caller would be free to drop the loss
+    // again. Callers match the three answers.
+
+    /// Whether this take closed a session that was carrying uncommitted work.
+    /// The same question [`SessionHandBack::lost_work`] answers, so a session
+    /// with work never disappears in silence down any of the three roads.
+    pub fn lost_work(&self) -> bool {
+        match self {
+            Self::Unreachable { retained_state } => retained_state.may_have_uncommitted_work(),
+            Self::Empty | Self::Taken(_) => false,
+        }
+    }
+}
+
 /// What a worker's attempt to clear the tab's session slot did.
 ///
 /// The discard direction of [`SharedDbSessionLease::hand_back_worker_session`]:
@@ -2688,7 +2751,7 @@ fn retained_lease_conflict_resolution(
         incoming_state.requires_physical_session_preservation(),
     ) {
         (false, true) => RetainedLeaseConflictResolution::ReplaceExisting,
-        (true, true) => RetainedLeaseConflictResolution::KeepExistingMarkedInvalid,
+        (true, true) => RetainedLeaseConflictResolution::KeepExistingRequiringDecision,
         _ => RetainedLeaseConflictResolution::KeepExisting,
     }
 }
@@ -2841,9 +2904,9 @@ impl SharedDbSessionLease {
         connection_generation: u64,
         db_type: DatabaseType,
         tracking: Option<(&ConnectionInfo, &DbActivityGuard)>,
-    ) -> Option<TakenDbSessionLease> {
+    ) -> RetainedLeaseTake {
         let mut stale_lease_to_drop = None;
-        let reusable_lease = {
+        let taken = {
             let mut lease = self.lock_inner();
             let reusable = lease.entry.as_ref().is_some_and(|existing| {
                 existing.matches_connection(connection_generation, db_type)
@@ -2876,9 +2939,19 @@ impl SharedDbSessionLease {
             }
         };
         if let Some(entry) = stale_lease_to_drop {
+            // A take is a DISCARD road like the hand-back and the worker clear,
+            // and it has to answer the same question they do: the session the
+            // caller asked for belongs to another incarnation of this
+            // connection, so it is CLOSED and the user's uncommitted work goes
+            // with it.
+            let retained_state = entry.retained_state;
             entry.discard_physical("db::session_lease");
+            return RetainedLeaseTake::Unreachable { retained_state };
         }
-        reusable_lease
+        match taken {
+            Some(taken) => RetainedLeaseTake::Taken(taken),
+            None => RetainedLeaseTake::Empty,
+        }
     }
 
     pub fn take_reusable_lease_for_context_update(
@@ -2887,7 +2960,7 @@ impl SharedDbSessionLease {
         db_type: DatabaseType,
         connection_info: &ConnectionInfo,
         activity: &DbActivityGuard,
-    ) -> Option<TakenDbSessionLease> {
+    ) -> RetainedLeaseTake {
         self.take_reusable_lease_matching_connection(
             connection_generation,
             db_type,
@@ -2901,7 +2974,7 @@ impl SharedDbSessionLease {
         db_type: DatabaseType,
         connection_info: &ConnectionInfo,
         activity: &DbActivityGuard,
-    ) -> Option<TakenDbSessionLease> {
+    ) -> RetainedLeaseTake {
         self.take_reusable_lease_matching_connection(
             connection_generation,
             db_type,
@@ -3188,12 +3261,28 @@ impl SharedDbSessionLease {
                             ) {
                                 RetainedLeaseConflictResolution::KeepExisting => false,
                                 RetainedLeaseConflictResolution::ReplaceExisting => true,
-                                RetainedLeaseConflictResolution::KeepExistingMarkedInvalid => {
+                                RetainedLeaseConflictResolution::KeepExistingRequiringDecision => {
+                                    // The KEPT session is the tab's own and is
+                                    // still live; only the incoming one is
+                                    // discarded. `InvalidSession` is reserved
+                                    // for a session whose server side is gone,
+                                    // and it is the one state the app resolves
+                                    // by discarding WITHOUT asking
+                                    // (`resolve_required_transaction_decision`)
+                                    // and never offers commit or rollback for
+                                    // (`capabilities`). Filing a live,
+                                    // work-carrying session under it meant the
+                                    // user was never asked about work whose
+                                    // COMMIT would have succeeded.
+                                    // `DecisionRequired` says the same "this is
+                                    // not clean and must not be reused blindly"
+                                    // — which is what this branch exists to say
+                                    // — while leaving the work reachable.
                                     existing.retained_state = existing
                                         .retained_state
                                         .conservative_merge(retained_state)
                                         .with_transaction_state(
-                                            TransactionSessionState::InvalidSession,
+                                            TransactionSessionState::DecisionRequired,
                                         );
                                     false
                                 }
@@ -10778,7 +10867,60 @@ mod tests {
     }
 
     #[test]
-    fn retained_session_lease_conflict_invalidates_when_both_sessions_need_preservation() {
+    fn a_take_that_cannot_reach_the_tabs_session_says_it_closed_one() {
+        // The defect this pins: the take CLOSES an entry that belongs to
+        // another incarnation of the connection, and it used to answer `None` —
+        // the same answer as an empty slot. Every caller then reported "there
+        // was nothing to do" about a session it had just destroyed, and the one
+        // the user cared about was the close prompt's Commit. (Storing a real
+        // session needs a server, so the take's own branch is pinned in the
+        // source by `every_backend_hands_a_batch_session_back_...`; what the
+        // answers MEAN is pinned here.)
+        let lease = SharedDbSessionLease::new();
+        let activity = track_db_activity("test", None);
+        let info = ConnectionInfo::default();
+
+        // Nothing retained: nothing to act on and nothing lost. This is the one
+        // case where "nothing happened" is the whole truth.
+        let take =
+            lease.take_reusable_lease_for_resolution(1, DatabaseType::MySQL, &info, &activity);
+        assert!(matches!(take, RetainedLeaseTake::Empty));
+        assert!(!take.lost_work());
+
+        // A session this identity could not reach was CLOSED by the take, and
+        // the work it carried is what the caller has to report.
+        let dirty = RetainedLeaseTake::Unreachable {
+            retained_state: RetainedSessionState::from_transaction_state(
+                TransactionSessionState::MaybeDirty,
+            ),
+        };
+        assert!(dirty.lost_work());
+        assert!(
+            !matches!(dirty, RetainedLeaseTake::Taken(_)),
+            "there is no session to act on"
+        );
+        let clean = RetainedLeaseTake::Unreachable {
+            retained_state: RetainedSessionState::default(),
+        };
+        assert!(
+            !clean.lost_work(),
+            "a clean session closing is not a loss to report"
+        );
+
+        // Every push that meets it must alert instead of answering NoSession,
+        // which does not.
+        assert!(RetainedSessionMutationOutcome::for_unreachable_take(
+            RetainedSessionState::from_transaction_state(TransactionSessionState::MaybeDirty),
+        )
+        .should_alert_user());
+        assert!(
+            !RetainedSessionMutationOutcome::NoSession.should_alert_user(),
+            "which is exactly what the old answer did not do"
+        );
+    }
+
+    #[test]
+    fn retained_session_lease_conflict_requires_a_decision_when_both_need_preservation() {
         let existing =
             RetainedSessionState::from_transaction_state(TransactionSessionState::MaybeDirty);
         let incoming =
@@ -10786,7 +10928,33 @@ mod tests {
 
         assert_eq!(
             retained_lease_conflict_resolution(existing, incoming),
-            RetainedLeaseConflictResolution::KeepExistingMarkedInvalid
+            RetainedLeaseConflictResolution::KeepExistingRequiringDecision
+        );
+    }
+
+    #[test]
+    fn the_session_a_lease_conflict_keeps_is_still_offered_to_the_user() {
+        // The kept session is the tab's OWN and is still live — only the
+        // incoming one is discarded. Filing it as `InvalidSession` satisfied
+        // the rule it was written for ("must not look clean") and cost the user
+        // the work anyway: that state is the one the app resolves by discarding
+        // without asking, and the one it never offers commit or rollback for.
+        let conflicted =
+            RetainedSessionState::from_transaction_state(TransactionSessionState::DecisionRequired);
+        assert!(
+            conflicted.requires_resolution(),
+            "it must still not look clean — that is what the branch exists for"
+        );
+        assert!(
+            conflicted.transaction_resolution_action_allowed(),
+            "and the user must be able to commit or roll back work that is still there"
+        );
+
+        let dead =
+            RetainedSessionState::from_transaction_state(TransactionSessionState::InvalidSession);
+        assert!(
+            !dead.transaction_resolution_action_allowed(),
+            "which `InvalidSession` — the state for a session whose server side is gone —              deliberately does not allow"
         );
     }
 

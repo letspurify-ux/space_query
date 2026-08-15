@@ -109,6 +109,16 @@ pub mod result_messages {
         "The DB session holding this tab's uncommitted work was lost (the server closed it). \
          That work is gone; this statement runs on a new session.";
 
+    /// An object-browser read (Export Data, View Structure) runs on a pool
+    /// session of its own so it never blocks the tab, which also means it
+    /// cannot see what the tab has not committed. `Select Data (Top 100)` is
+    /// delivered to the tab and runs on the tab's own session, so the two
+    /// adjacent menu items answer differently about the same table — and only
+    /// one of them said so.
+    pub const OBJECT_READ_EXCLUDES_UNCOMMITTED_WORK: &str =
+        "This read ran on a separate DB session, so it does not include this tab's uncommitted \
+         changes. Commit them first to include them.";
+
     /// Feedback for session-scope switches: Oracle `ALTER SESSION SET
     /// CURRENT_SCHEMA` ("schema") and MySQL/MariaDB `USE` ("database").
     pub fn current_scope_changed_without_name(scope: &str) -> String {
@@ -155,10 +165,27 @@ pub mod result_messages {
                 // the block may not have touched the transaction at all.
                 TransactionFeedbackStatement::ProcedureLike => auto_commit.then_some(true),
             },
-            // MySQL DML and CALL both leave commit-or-rollback work pending
-            // when autocommit is off, so both report either state.
-            DatabaseType::MySQL => Some(auto_commit),
-            DatabaseType::MariaDB => Some(auto_commit),
+            DatabaseType::MySQL | DatabaseType::MariaDB => match statement {
+                // MySQL DML leaves commit-or-rollback work pending when
+                // autocommit is off, so it reports either state.
+                TransactionFeedbackStatement::Dml => Some(auto_commit),
+                // A routine's body is not something the app can read. Under
+                // autocommit the server commits each statement INSIDE it, but a
+                // procedure that runs `START TRANSACTION` and returns suspends
+                // that and hands the transaction back still open — so "committed"
+                // is a claim the app cannot make. The tracked state already says
+                // so conservatively (`may_open_untracked_transaction`), and the
+                // toolbar offers Commit/Rollback accordingly; saying
+                // "Auto-commit applied" here contradicted it on the very
+                // statement that caused it.
+                //
+                // Under manual commit there is nothing to guess: work either
+                // needs a commit or there was none, and the prompt is right
+                // either way. This is the same shape as Oracle's arm above,
+                // which already omits the feedback in the direction it cannot
+                // vouch for.
+                TransactionFeedbackStatement::ProcedureLike => (!auto_commit).then_some(false),
+            },
         }
     }
 

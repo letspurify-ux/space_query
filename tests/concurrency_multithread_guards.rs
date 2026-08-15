@@ -1699,11 +1699,34 @@ fn regression_06_late_or_conflicting_retained_cleanup_is_not_treated_as_clean_re
     let connection = read_source("src/db/connection.rs");
     let editor = read_source("src/ui/sql_editor/mod.rs");
 
+    // The invariant is that a conflict between two work-carrying sessions must
+    // not leave a state that looks CLEAN. This clause used to spell that as
+    // "it must be `InvalidSession`", which satisfied the invariant and then
+    // cost the user their work: `InvalidSession` means the server side is gone,
+    // so it is the one state `resolve_required_transaction_decision` discards
+    // WITHOUT asking and `capabilities` never offers commit or rollback for —
+    // and the session this branch keeps is the tab's own, still live, whose
+    // COMMIT would have succeeded. `DecisionRequired` satisfies the same
+    // invariant (it requires resolution and blocks execution) while leaving the
+    // work reachable, so the clause now pins the invariant instead of the
+    // spelling.
+    let conflict_branch = connection
+        .find("RetainedLeaseConflictResolution::KeepExistingRequiringDecision => {")
+        .expect("the two-dirty-sessions conflict branch should exist");
+    let conflict_body = slice_from(&connection, conflict_branch, 2400);
     assert!(
-        connection.contains("RetainedLeaseConflictResolution::KeepExistingMarkedInvalid")
-            && connection.contains("TransactionSessionState::InvalidSession")
-            && connection.contains("Discarded conflicting retained"),
-        "conflicting dirty retained-session stores must surface an invalid session instead of looking clean"
+        conflict_body.contains("TransactionSessionState::DecisionRequired"),
+        "a conflict between two work-carrying sessions must leave a state that requires \
+         resolution, so the user is asked about the work that is still there"
+    );
+    assert!(
+        !conflict_body.contains("TransactionSessionState::InvalidSession"),
+        "and must NOT be `InvalidSession`: that state means the server side is gone, and it \
+         is discarded without asking"
+    );
+    assert!(
+        connection.contains("Discarded conflicting retained"),
+        "the session that lost the conflict is still reported"
     );
     assert!(
         editor.contains("fn cancel_snapshot_matches(")
@@ -3088,7 +3111,7 @@ fn transaction_mode_state_has_a_single_source_of_truth() {
     let sync_start = main_window
         .find("fn sync_transaction_mode_controls(")
         .expect("sync_transaction_mode_controls should exist");
-    let sync_body = &main_window[sync_start..sync_start + 2400];
+    let sync_body = slice_from(&main_window, sync_start, 3400);
     assert!(
         sync_body.contains("record_displayed_transaction_mode("),
         "the toolbar sync must record the transaction mode it displayed"
@@ -5245,6 +5268,59 @@ fn a_session_ending_action_asks_every_tab_before_it_resolves_any() {
         !disconnect_all_body.contains("runtimes.iter().all(|runtime| {"),
         "asking connection by connection is what committed work for a cancelled disconnect"
     );
+
+    // The prompt asks about the user's uncommitted data, and it asks TWICE in a
+    // row, so an affirmative `Enter` default meant `Enter` `Enter` committed
+    // work whose prompt was never read. Resolving a session is a deliberate
+    // click; every other dialog keeps the default it has always had.
+    let ui = read_source("src/ui/mod.rs");
+    assert!(
+        ui.contains("pub fn choice2_on_main_defaulting_to_cancel(")
+            && ui.contains("enum DialogEnterDefault"),
+        "the Enter default must be a per-call choice, not one rule for every dialog"
+    );
+    let ask = main_window
+        .find("fn ask_pooled_session_resolution(")
+        .expect("the per-tab session prompt should exist");
+    let ask_body = slice_from(&main_window, ask, 3000);
+    assert_eq!(
+        ask_body.matches("crate::ui::choice2_on_main(").count(),
+        0,
+        "no session-resolution prompt may keep the affirmative Enter default"
+    );
+    assert!(
+        ask_body
+            .matches("crate::ui::choice2_on_main_defaulting_to_cancel(")
+            .count()
+            >= 2,
+        "both prompts of the two-step question must cancel on Enter"
+    );
+
+    // The FORCED exit skips the prompt by design — the query that would not
+    // stop cannot be committed either, and a modal there would block the quit
+    // the force exists to guarantee. What it may not do is lose the work in
+    // silence.
+    let forced = main_window
+        .find("ApplicationExitWaitDecision::Force => {")
+        .expect("the forced exit branch should exist");
+    let forced_body = slice_from(&main_window, forced, 900);
+    let report = forced_body
+        .find("Self::report_unresolved_sessions_before_forced_exit(&state);")
+        .expect("a forced exit must say which tabs' work it could not resolve");
+    let finish = forced_body
+        .find("Self::finish_application_exit(")
+        .expect("the forced exit must still finish");
+    assert!(
+        report < finish,
+        "the user hears about the work BEFORE the app goes away"
+    );
+    let reporter = main_window
+        .find("fn report_unresolved_sessions_before_forced_exit(")
+        .expect("the reporter should exist");
+    assert!(
+        slice_from(&main_window, reporter, 1800).contains("may_have_uncommitted_work()"),
+        "and only when there was work to lose"
+    );
 }
 
 #[test]
@@ -5388,6 +5464,86 @@ fn every_backend_hands_a_batch_session_back_through_the_door_that_names_its_oper
     assert!(
         currency < take,
         "operation currency must be checked BEFORE the lease is taken"
+    );
+
+    // The THIRD discard road is the take. An entry that belongs to another
+    // incarnation of this connection is CLOSED by it, and answering `None` for
+    // that made it indistinguishable from an empty slot: the close prompt's
+    // Commit reported success for a commit it never ran, and the scope,
+    // auto-commit and transaction-mode pushes answered `NoSession` about a
+    // session they had just destroyed. Rollback and Discard hid it, because for
+    // them destruction happens to be what the user asked for.
+    // Whitespace-insensitive: rustfmt decides how a variant is broken across
+    // lines, and a clause that pins the layout tests the formatter, not the
+    // rule.
+    let connection_flat = connection.split_whitespace().collect::<Vec<_>>().join(" ");
+    assert!(
+        connection_flat.contains("pub enum RetainedLeaseTake {")
+            && connection_flat.contains("Unreachable { retained_state: RetainedSessionState, }"),
+        "the take must say whether it closed a session, not just whether it has one"
+    );
+    let take = connection
+        .find("fn take_reusable_lease_matching_connection(")
+        .expect("the shared take should exist");
+    let take_body = slice_from(&connection, take, 2600);
+    let discard = take_body
+        .find("entry.discard_physical(\"db::session_lease\")")
+        .expect("a non-matching entry is closed by the take");
+    assert!(
+        slice_from(take_body, discard.saturating_sub(300), 700)
+            .contains("RetainedLeaseTake::Unreachable { retained_state }"),
+        "and the closing must be answered, so the caller can report the loss"
+    );
+    assert_eq!(
+        take_body.matches("-> Option<TakenDbSessionLease>").count(),
+        0,
+        "no take may answer with a bare Option again — that is the shape that lost the work"
+    );
+    // Every caller turns the answer into something the user can see.
+    for (source, callers) in [
+        ("src/ui/sql_editor/mod.rs", 3usize),
+        ("src/ui/sql_editor/execution.rs", 2usize),
+    ] {
+        assert_eq!(
+            read_source(source)
+                .matches("crate::db::RetainedLeaseTake::Unreachable { retained_state }")
+                .count(),
+            callers,
+            "{source} must handle the unreachable answer at every take"
+        );
+    }
+    let editor = read_source("src/ui/sql_editor/mod.rs");
+    assert!(
+        editor.contains("pub enum RetainedSessionCloseOutcome {")
+            && editor.contains("Unreachable(String)"),
+        "a session-ending action must be able to say it could not reach the session; \
+         `Result<(), String>` could only carry two of the three answers"
+    );
+    assert!(
+        !editor.contains("fn commit_pooled_session_for_close(&self) -> Result<(), String>"),
+        "and Commit must not go back to answering with the type that could not say it"
+    );
+
+    // The thin worker's window between taking the session out of the tab's slot
+    // and handing it to the batch has an OWNER. Every explicit exit in that
+    // window hands the session back itself; a panic had none, so the session
+    // went to the pool through `Drop` where `reset_before_reuse` rolls the
+    // tab's work back in silence.
+    assert!(
+        execution.contains("struct OracleThinWorkerSessionOwner<'a> {"),
+        "the thin worker's pre-batch window must own its session"
+    );
+    let owner_drop = execution
+        .find("impl Drop for OracleThinWorkerSessionOwner<'_> {")
+        .expect("the owner must hand the session back when it is dropped");
+    let owner_drop_body = slice_from(&execution, owner_drop, 1200);
+    assert!(
+        owner_drop_body.contains("if !std::thread::panicking()"),
+        "only a PANIC is handled: a normal exit has already taken the session"
+    );
+    assert!(
+        owner_drop_body.contains("BatchSessionHandBack::new("),
+        "and it hands back through the same door every other exit uses"
     );
 
     // The BINDING has the same rule, and it has to be unspellable rather than

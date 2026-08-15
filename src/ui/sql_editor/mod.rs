@@ -1135,6 +1135,27 @@ trait TransactionActionBackend: Sync {
     ) -> RetainedSessionMutationOutcome;
 }
 
+/// What a session-ending action (tab close, exit, disconnect, pool resize) did
+/// with the tab's retained session.
+///
+/// It is three answers because the situation has three shapes and a
+/// `Result<(), String>` could only carry two. `Ok(())` used to mean all of
+/// "there was nothing to resolve", "your commit ran" and "the session was
+/// closed before I could commit it" — and the caller, which is the prompt the
+/// user pressed **Commit** on, read every one of them as success.
+#[must_use]
+pub enum RetainedSessionCloseOutcome {
+    /// The slot was empty. Nothing to do and nothing lost.
+    NothingToResolve,
+    /// The action ran on the tab's session.
+    Resolved,
+    /// The session could not be reached and is now closed. There is nothing
+    /// left to retry, so the caller REPORTS this and carries on rather than
+    /// refusing the action the user asked for — refusing would leave the loss
+    /// unexplained and the action half done.
+    Unreachable(String),
+}
+
 struct RetainedSessionRestore<'a> {
     pooled_db_session: &'a SharedDbSessionLease,
     connection_generation: u64,
@@ -1303,14 +1324,26 @@ impl TransactionActionBackend for OracleTransactionActionBackend {
             .pool_session_context()
             .map(|context| context.connection_info)
             .unwrap_or_default();
-        let Some(retained_session) = pooled_db_session.take_reusable_lease_for_resolution(
+        let retained_session = match pooled_db_session.take_reusable_lease_for_resolution(
             connection_generation,
             DatabaseType::Oracle,
             &resolution_connection_info,
             &resolution_activity,
-        ) else {
-            drop(conn_guard);
-            return Err("No retained DB session for this tab.".to_string());
+        ) {
+            crate::db::RetainedLeaseTake::Taken(retained_session) => retained_session,
+            crate::db::RetainedLeaseTake::Empty => {
+                drop(conn_guard);
+                return Err("No retained DB session for this tab.".to_string());
+            }
+            // There WAS one, and this take closed it. Saying "no retained DB
+            // session" would describe the slot after the loss rather than the
+            // loss, on the very button the user pressed to keep their work.
+            crate::db::RetainedLeaseTake::Unreachable { retained_state } => {
+                drop(conn_guard);
+                return Err(SqlEditorWidget::retained_session_unreachable_message(
+                    retained_state,
+                ));
+            }
         };
         let pool_context_epoch = retained_session.pool_context_epoch();
         let current_scope = retained_session.current_scope().map(str::to_string);
@@ -3441,16 +3474,24 @@ impl SqlEditorWidget {
             })
             .map(|context| context.connection_info)
             .unwrap_or_default();
-        let Some(mut retained_session) = self
+        // Same rule as the auto-commit and transaction-mode pushes: a take that
+        // could not reach the tab's session closed it, and saying `NoSession`
+        // about that loses the user's work in silence.
+        let mut retained_session = match self
             .pooled_db_session
             .take_reusable_lease_for_context_update(
                 connection_generation,
                 db_type,
                 &scope_connection_info,
                 &scope_activity,
-            )
-        else {
-            return RetainedSessionMutationOutcome::NoSession;
+            ) {
+            crate::db::RetainedLeaseTake::Taken(retained_session) => retained_session,
+            crate::db::RetainedLeaseTake::Empty => {
+                return RetainedSessionMutationOutcome::NoSession;
+            }
+            crate::db::RetainedLeaseTake::Unreachable { retained_state } => {
+                return RetainedSessionMutationOutcome::for_unreachable_take(retained_state);
+            }
         };
         let retained_state = retained_session.retained_state();
         if crate::db::retained_scope_matches_target(
@@ -3543,7 +3584,10 @@ impl SqlEditorWidget {
         );
     }
 
-    fn run_pooled_session_close_action(&self, action: CloseSessionAction) -> Result<(), String> {
+    fn run_pooled_session_close_action(
+        &self,
+        action: CloseSessionAction,
+    ) -> Result<RetainedSessionCloseOutcome, String> {
         let query_timeout = Self::parse_timeout(&self.timeout_input.value());
         let Some(connection) = self.bound_connection() else {
             return Err(crate::db::NOT_CONNECTED_MESSAGE.to_string());
@@ -3564,19 +3608,38 @@ impl SqlEditorWidget {
                     .unwrap_or_default(),
             )
         };
-        let Some(retained_session) = self.pooled_db_session.take_reusable_lease_for_resolution(
+        // Three different situations used to answer `Ok(())` here, and the
+        // caller could not tell them apart: an empty slot (nothing to do), a
+        // session this identity cannot reach (which the take CLOSES, taking the
+        // user's work with it), and a lease that could not be unwrapped. The
+        // user pressed **Commit** on a prompt whose whole purpose is not to
+        // lose their work, and the second case answered success for a commit
+        // that never ran, then closed the tab.
+        let retained_session = match self.pooled_db_session.take_reusable_lease_for_resolution(
             connection_generation,
             db_type,
             &close_connection_info,
             &close_activity,
-        ) else {
-            return Ok(());
+        ) {
+            crate::db::RetainedLeaseTake::Taken(retained_session) => retained_session,
+            crate::db::RetainedLeaseTake::Empty => {
+                return Ok(RetainedSessionCloseOutcome::NothingToResolve);
+            }
+            crate::db::RetainedLeaseTake::Unreachable { retained_state } => {
+                return Ok(RetainedSessionCloseOutcome::Unreachable(
+                    Self::retained_session_unreachable_message(retained_state),
+                ));
+            }
         };
         let retained_pool_context_epoch = retained_session.pool_context_epoch();
         let current_scope = retained_session.current_scope().map(str::to_string);
         let Some((lease, retained_state)) = retained_session.into_lease_with_retained_state()
         else {
-            return Ok(());
+            // The take handed over a lease that is not there any more. Nothing
+            // was committed, so this must not read as success either.
+            return Ok(RetainedSessionCloseOutcome::Unreachable(
+                Self::retained_session_unreachable_message(RetainedSessionState::default()),
+            ));
         };
         if let Err(message) = ensure_retained_session_resolution_action_allowed(
             retained_state,
@@ -3593,32 +3656,50 @@ impl SqlEditorWidget {
             return Err(message);
         }
 
-        transaction_action_backend_for(db_type).run_retained_session_close_action(
-            lease,
-            db_type,
-            action,
-            query_timeout,
-            RetainedSessionRestore {
-                pooled_db_session: &self.pooled_db_session,
-                connection_generation,
-                pool_context_epoch: retained_pool_context_epoch,
-                retained_state,
-                current_scope,
-            },
-        )
+        transaction_action_backend_for(db_type)
+            .run_retained_session_close_action(
+                lease,
+                db_type,
+                action,
+                query_timeout,
+                RetainedSessionRestore {
+                    pooled_db_session: &self.pooled_db_session,
+                    connection_generation,
+                    pool_context_epoch: retained_pool_context_epoch,
+                    retained_state,
+                    current_scope,
+                },
+            )
+            .map(|()| RetainedSessionCloseOutcome::Resolved)
     }
 
-    pub fn commit_pooled_session_for_close(&self) -> Result<(), String> {
+    /// What a session-ending action must say when the tab's session could not
+    /// be reached — it was closed by the take, so this is a report of a loss
+    /// and not a description of an empty slot.
+    pub(crate) fn retained_session_unreachable_message(
+        retained_state: crate::db::RetainedSessionState,
+    ) -> String {
+        if retained_state.may_have_uncommitted_work() {
+            crate::db::query::result_messages::RETAINED_SESSION_LOST_WITH_WORK.to_string()
+        } else {
+            "This tab's DB session belonged to a previous connection and was closed.".to_string()
+        }
+    }
+
+    pub fn commit_pooled_session_for_close(&self) -> Result<RetainedSessionCloseOutcome, String> {
         self.run_pooled_session_close_action(CloseSessionAction::Commit)
     }
 
-    pub fn rollback_pooled_session_for_close(&self) -> Result<(), String> {
+    pub fn rollback_pooled_session_for_close(&self) -> Result<RetainedSessionCloseOutcome, String> {
         self.run_pooled_session_close_action(CloseSessionAction::Rollback)
     }
 
-    pub fn discard_pooled_session_for_close(&self) -> Result<(), String> {
+    pub fn discard_pooled_session_for_close(&self) -> Result<RetainedSessionCloseOutcome, String> {
+        // Discard is the one action the take's own closing already performs, so
+        // it has nothing to distinguish: whatever was there is gone, which is
+        // what was asked for.
         self.release_pooled_db_session();
-        Ok(())
+        Ok(RetainedSessionCloseOutcome::Resolved)
     }
 
     pub fn resolve_required_transaction_decision(

@@ -782,7 +782,7 @@ pub struct ObjectBrowserWidget {
     /// Mirrors the connection's read-only flag without ever locking the
     /// connection: a menu that has to wait for a running query would either
     /// hang the UI or, worse, guess "writable" while it waits.
-    connection_is_read_only: Arc<AtomicBool>,
+    writes_are_refused: Arc<AtomicBool>,
     scope_options: Arc<Mutex<Vec<String>>>,
     selected_scope: Arc<Mutex<Option<String>>>,
     suppress_scope_events: Arc<Mutex<bool>>,
@@ -888,7 +888,7 @@ impl ObjectBrowserWidget {
         let metadata_callback: MetadataCallback = Arc::new(Mutex::new(None));
         let object_cache = Arc::new(Mutex::new(ObjectCache::default()));
         let current_db_type = Arc::new(Mutex::new(initial_db_type));
-        let connection_is_read_only = Arc::new(AtomicBool::new(false));
+        let writes_are_refused = Arc::new(AtomicBool::new(false));
         let scope_options = Arc::new(Mutex::new(Vec::new()));
         let selected_scope = Arc::new(Mutex::new(None));
         let suppress_scope_events = Arc::new(Mutex::new(false));
@@ -926,7 +926,7 @@ impl ObjectBrowserWidget {
             filter_input,
             object_cache,
             current_db_type,
-            connection_is_read_only,
+            writes_are_refused,
             scope_options,
             selected_scope,
             suppress_scope_events,
@@ -1419,11 +1419,17 @@ impl ObjectBrowserWidget {
         );
     }
 
-    /// Tells this browser that its connection refuses writes, so the menus
-    /// stop offering actions that would be refused.
-    pub fn set_connection_is_read_only(&self, read_only: bool) {
-        self.connection_is_read_only
-            .store(read_only, Ordering::Release);
+    /// Tells this card that a write from it would be refused, so the menus
+    /// stop offering actions that are going to fail.
+    ///
+    /// TWO sources, which is why the name is about the answer and not about one
+    /// of them: the connection's read-only flag, and the READ ONLY transaction
+    /// mode pinned on the tab this card belongs to. It used to be called
+    /// `connection_is_read_only` and was fed only the first, so a tab pinned
+    /// READ ONLY was still offered Drop, Truncate and Import — and then refused
+    /// by `transaction_mode_refusal_for_statement` once the statement was built.
+    pub fn set_writes_are_refused(&self, refused: bool) {
+        self.writes_are_refused.store(refused, Ordering::Release);
     }
 
     pub fn set_tab_local_scope_selection(&mut self, enabled: bool) {
@@ -2820,7 +2826,7 @@ impl ObjectBrowserWidget {
         let filter_input = self.filter_input.clone();
         let connection = self.connection.clone();
         let current_db_type = self.current_db_type.clone();
-        let connection_is_read_only = self.connection_is_read_only.clone();
+        let writes_are_refused = self.writes_are_refused.clone();
         let action_sender = self.action_sender.clone();
         let selected_scope = self.selected_scope.clone();
         let catalog = self.catalog.clone();
@@ -2843,7 +2849,7 @@ impl ObjectBrowserWidget {
             filter_input: Input,
             connection: SharedConnection,
             current_db_type: Arc<Mutex<crate::db::DatabaseType>>,
-            connection_is_read_only: Arc<AtomicBool>,
+            writes_are_refused: Arc<AtomicBool>,
             action_sender: std::sync::mpsc::Sender<ObjectActionResult>,
             selected_scope: Arc<Mutex<Option<String>>>,
             catalog: CardCatalogState,
@@ -3231,7 +3237,7 @@ impl ObjectBrowserWidget {
                                 let _ = ObjectBrowserWidget::show_context_menu_for_object_item_at(
                                     &connection,
                                     &current_db_type,
-                                    &connection_is_read_only,
+                                    &writes_are_refused,
                                     item,
                                     &sql_callback,
                                     &status_callback,
@@ -3353,7 +3359,7 @@ impl ObjectBrowserWidget {
                     filter_input.clone(),
                     connection.clone(),
                     current_db_type.clone(),
-                    connection_is_read_only.clone(),
+                    writes_are_refused.clone(),
                     action_sender.clone(),
                     selected_scope.clone(),
                     catalog.clone(),
@@ -3376,7 +3382,7 @@ impl ObjectBrowserWidget {
             filter_input,
             connection,
             current_db_type,
-            connection_is_read_only,
+            writes_are_refused,
             action_sender,
             selected_scope,
             catalog,
@@ -3396,7 +3402,7 @@ impl ObjectBrowserWidget {
         let action_sender = self.action_sender.clone();
         let object_cache = self.object_cache.clone();
         let current_db_type = self.current_db_type.clone();
-        let connection_is_read_only = self.connection_is_read_only.clone();
+        let writes_are_refused = self.writes_are_refused.clone();
         let selected_scope = self.selected_scope.clone();
         let scope_generation = self.scope_generation.clone();
         let mut pending_drag_text: Option<String> = None;
@@ -3424,7 +3430,7 @@ impl ObjectBrowserWidget {
                             Self::show_context_menu(
                                 &connection,
                                 &current_db_type,
-                                &connection_is_read_only,
+                                &writes_are_refused,
                                 &item,
                                 &sql_callback,
                                 &status_callback,
@@ -3436,7 +3442,7 @@ impl ObjectBrowserWidget {
                             Self::show_context_menu(
                                 &connection,
                                 &current_db_type,
-                                &connection_is_read_only,
+                                &writes_are_refused,
                                 &item,
                                 &sql_callback,
                                 &status_callback,
@@ -5541,7 +5547,7 @@ impl ObjectBrowserWidget {
         Self::show_context_menu_for_object_item(
             &self.connection,
             &self.current_db_type,
-            &self.connection_is_read_only,
+            &self.writes_are_refused,
             resolved.item,
             &self.sql_callback,
             &self.status_callback,
@@ -6285,7 +6291,7 @@ impl ObjectBrowserWidget {
     fn show_context_menu(
         connection: &SharedConnection,
         current_db_type: &Arc<Mutex<crate::db::DatabaseType>>,
-        connection_is_read_only: &Arc<AtomicBool>,
+        writes_are_refused: &Arc<AtomicBool>,
         item: &TreeItem,
         sql_callback: &SqlExecuteCallback,
         status_callback: &StatusCallback,
@@ -6303,7 +6309,7 @@ impl ObjectBrowserWidget {
             let _ = Self::show_context_menu_for_object_item(
                 connection,
                 current_db_type,
-                connection_is_read_only,
+                writes_are_refused,
                 item_info,
                 sql_callback,
                 status_callback,
@@ -6517,7 +6523,7 @@ impl ObjectBrowserWidget {
     fn show_context_menu_for_object_item(
         connection: &SharedConnection,
         current_db_type: &Arc<Mutex<crate::db::DatabaseType>>,
-        connection_is_read_only: &Arc<AtomicBool>,
+        writes_are_refused: &Arc<AtomicBool>,
         item_info: ObjectItem,
         sql_callback: &SqlExecuteCallback,
         status_callback: &StatusCallback,
@@ -6527,7 +6533,7 @@ impl ObjectBrowserWidget {
         Self::show_context_menu_for_object_item_at(
             connection,
             current_db_type,
-            connection_is_read_only,
+            writes_are_refused,
             item_info,
             sql_callback,
             status_callback,
@@ -6541,7 +6547,7 @@ impl ObjectBrowserWidget {
     fn show_context_menu_for_object_item_at(
         connection: &SharedConnection,
         current_db_type: &Arc<Mutex<crate::db::DatabaseType>>,
-        connection_is_read_only: &Arc<AtomicBool>,
+        writes_are_refused: &Arc<AtomicBool>,
         item_info: ObjectItem,
         sql_callback: &SqlExecuteCallback,
         status_callback: &StatusCallback,
@@ -6559,7 +6565,7 @@ impl ObjectBrowserWidget {
         };
         let Some(menu_choices) = Self::menu_choices_for_read_only(
             menu_choices,
-            connection_is_read_only.load(Ordering::Acquire),
+            writes_are_refused.load(Ordering::Acquire),
         ) else {
             return false;
         };
@@ -10189,7 +10195,7 @@ impl MultiObjectBrowserWidget {
             runtime.connection(),
         );
         browser.set_tab_local_scope_selection(true);
-        browser.set_connection_is_read_only(runtime.sanitized_info().read_only);
+        browser.set_writes_are_refused(runtime.sanitized_info().read_only);
         self.browser_stack.end();
         if let Some(previous_group) = previous_group.as_ref() {
             Group::set_current(Some(previous_group));
@@ -10684,7 +10690,7 @@ impl MultiObjectBrowserWidget {
             for entry in entries.iter() {
                 entry
                     .browser
-                    .set_connection_is_read_only(entry.runtime.sanitized_info().read_only);
+                    .set_writes_are_refused(entry.runtime.sanitized_info().read_only);
             }
         }
         Self::disambiguate_choice_labels(&mut labels);
@@ -10885,6 +10891,28 @@ impl MultiObjectBrowserWidget {
     pub fn selected_scope_for_connection(&self, connection_id: ConnectionId) -> Option<String> {
         self.representative_entry_for_connection(connection_id)
             .and_then(|entry| entry.browser.selected_scope())
+    }
+
+    /// Tells ONE tab's card whether a write from it would be refused.
+    ///
+    /// Per tab because the READ ONLY transaction mode is per tab: the
+    /// connection's own read-only flag is the same for every card, the pin is
+    /// not. `create_browser_entry` seeds the card with the connection's flag
+    /// alone, and the caller corrects it whenever the tab's mode is
+    /// resynchronised — which is the same moment the toolbar learns it.
+    pub fn set_tab_writes_are_refused(&mut self, tab_id: QueryTabId, refused: bool) -> bool {
+        let browser = self
+            .entries
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .iter()
+            .find(|entry| entry.owner == BrowserOwner::Tab(tab_id))
+            .map(|entry| entry.browser.clone());
+        let Some(browser) = browser else {
+            return false;
+        };
+        browser.set_writes_are_refused(refused);
+        true
     }
 
     pub fn set_selected_scope_for_tab(

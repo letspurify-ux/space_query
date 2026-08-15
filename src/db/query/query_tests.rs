@@ -18404,21 +18404,39 @@ fn transaction_feedback_policy_is_single_sourced_per_database_type() {
         None
     );
 
-    // MySQL and MariaDB: DML and procedure calls both report either state.
+    // MySQL and MariaDB DML reports either state: with autocommit off the work
+    // needs a commit, with it on the server made one.
     for db_type in [DatabaseType::MySQL, DatabaseType::MariaDB] {
-        for statement in [
-            TransactionFeedbackStatement::Dml,
-            TransactionFeedbackStatement::ProcedureLike,
-        ] {
-            assert_eq!(
-                transaction_feedback_flag(db_type, statement, true),
-                Some(true)
-            );
-            assert_eq!(
-                transaction_feedback_flag(db_type, statement, false),
-                Some(false)
-            );
-        }
+        assert_eq!(
+            transaction_feedback_flag(db_type, TransactionFeedbackStatement::Dml, true),
+            Some(true)
+        );
+        assert_eq!(
+            transaction_feedback_flag(db_type, TransactionFeedbackStatement::Dml, false),
+            Some(false)
+        );
+
+        // INVERTED for `ProcedureLike` under autocommit ON (was: `Some(true)`).
+        // The old expectation carried the DML reasoning onto a statement it does
+        // not fit: a routine's body is not something the app can read, and one
+        // that runs `START TRANSACTION` and returns hands the transaction back
+        // still open with autocommit suspended. The ninth round already inverted
+        // the LEDGER test for this same fact
+        // (`may_open_untracked_transaction`), leaving the message as the last
+        // place the disproved assumption survived — so the tab's own state said
+        // "commit required" while the statement that caused it said
+        // "Auto-commit applied".
+        assert_eq!(
+            transaction_feedback_flag(db_type, TransactionFeedbackStatement::ProcedureLike, true),
+            None,
+            "{db_type} must not claim a commit it cannot vouch for"
+        );
+        // Manual commit needs no guess: the work either needs a commit or there
+        // was none, and the prompt is right either way.
+        assert_eq!(
+            transaction_feedback_flag(db_type, TransactionFeedbackStatement::ProcedureLike, false),
+            Some(false)
+        );
     }
 }
 

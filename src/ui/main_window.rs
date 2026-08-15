@@ -3906,6 +3906,17 @@ impl AppState {
         // resolved mode disagrees with what was displayed here.
         self.sql_editor
             .record_displayed_transaction_mode(is_connected.then_some(mode));
+        // The tab's object-browser card offers writes, and this is the moment
+        // the app learns whether they would be refused. The card used to ask
+        // only the CONNECTION's read-only flag, so a tab pinned READ ONLY was
+        // offered Drop, Truncate and Import and then refused once the statement
+        // reached `transaction_mode_refusal_for_statement`. Both sources answer
+        // the same question, so the card is told the answer, not one source.
+        let writes_are_refused = self.active_connection_is_read_only()
+            || (is_connected && mode.access_mode == TransactionAccessMode::ReadOnly);
+        let active_tab_id = self.active_editor_tab_id;
+        self.object_browser
+            .set_tab_writes_are_refused(active_tab_id, writes_are_refused);
 
         if is_connected && !self.transaction_mode_change_blocked_for_active_tab(db_type) {
             self.transaction_isolation_choice.activate();
@@ -6632,7 +6643,11 @@ impl MainWindow {
             RetainedSessionResolutionAction::Commit,
         );
         if transaction_action_allowed {
-            let choice = crate::ui::choice2_on_main(
+            // `Enter` cancels here, in both prompts. They ask about the user's
+            // uncommitted data and they ask TWICE in a row, so an affirmative
+            // default meant `Enter` `Enter` committed work whose prompt was
+            // never read. Resolving a session is a deliberate click.
+            let choice = crate::ui::choice2_on_main_defaulting_to_cancel(
                 &format!(
                     "Tab '{}' has a DB session that may need commit, rollback, or discard.\nChoose how to {}.",
                     tab_label, action_prompt
@@ -6643,7 +6658,7 @@ impl MainWindow {
             );
             match choice {
                 Some(1) => {
-                    let decision = crate::ui::choice2_on_main(
+                    let decision = crate::ui::choice2_on_main_defaulting_to_cancel(
                         &format!(
                             "Choose how to resolve the DB session before {}.",
                             resolution_context
@@ -6662,7 +6677,7 @@ impl MainWindow {
                 _ => None,
             }
         } else {
-            let choice = crate::ui::choice2_on_main(
+            let choice = crate::ui::choice2_on_main_defaulting_to_cancel(
                 &format!(
                     "Tab '{}' has a {} DB session that commit/rollback cannot resolve.\nDiscard it to {}.",
                     tab_label,
@@ -6708,11 +6723,22 @@ impl MainWindow {
             PooledSessionResolution::Rollback => editor.rollback_pooled_session_for_close(),
             PooledSessionResolution::Discard => editor.discard_pooled_session_for_close(),
         };
-        if let Err(err) = result {
-            crate::ui::alert_on_main(&format!("Failed to resolve DB session: {}", err));
-            return false;
+        match result {
+            Err(err) => {
+                crate::ui::alert_on_main(&format!("Failed to resolve DB session: {}", err));
+                false
+            }
+            // The session was closed before the action could reach it. Nothing
+            // is left to retry, so tell the user what happened and let the
+            // close/disconnect they asked for finish — refusing here would
+            // leave the loss unexplained AND the action half done, with the
+            // tabs that were already resolved staying resolved.
+            Ok(crate::ui::sql_editor::RetainedSessionCloseOutcome::Unreachable(message)) => {
+                crate::ui::alert_on_main(&message);
+                true
+            }
+            Ok(_) => true,
         }
-        true
     }
 
     /// Ask every tab first, then act. See [`PooledSessionResolution`].
@@ -6795,6 +6821,46 @@ impl MainWindow {
             }
         }
         true
+    }
+
+    /// Tell the user, once, which tabs had uncommitted work when the app had
+    /// to quit without asking them.
+    ///
+    /// The forced exit is reached only when a cancel did NOT land inside its
+    /// grace: the query is still on the server, so the session cannot be asked
+    /// to commit either — a prompt here would block the quit the user just
+    /// asked for, which is what the force exists to prevent. What the app can
+    /// do is not lose the work in silence, which is the rule every other path
+    /// that closes a work-carrying session already keeps
+    /// (`RETAINED_SESSION_LOST_WITH_WORK`).
+    fn report_unresolved_sessions_before_forced_exit(state: &Arc<Mutex<AppState>>) {
+        let tabs_with_work = {
+            let s = state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            s.editor_tabs
+                .iter()
+                .filter_map(|tab| {
+                    let snapshot = tab.sql_editor.pooled_session_activity_snapshot()?;
+                    snapshot
+                        .retained_state()
+                        .may_have_uncommitted_work()
+                        .then(|| {
+                            s.tab_display_name(tab.tab_id)
+                                .unwrap_or_else(|| "Query".to_string())
+                        })
+                })
+                .collect::<Vec<_>>()
+        };
+        if tabs_with_work.is_empty() {
+            return;
+        }
+        let message = format!(
+            "Quitting could not resolve these tabs' DB sessions because a query would not stop:\n  {}\n\n             Their uncommitted work was rolled back by the server when the sessions closed.",
+            tabs_with_work.join("\n  ")
+        );
+        crate::utils::logging::log_warning("app", &message);
+        crate::ui::alert_on_main(&message);
     }
 
     fn resolve_pooled_sessions_before_exit(state: &Arc<Mutex<AppState>>) -> bool {
@@ -13879,6 +13945,7 @@ impl MainWindow {
             let mut sql_to_execute: Option<String> = None;
             let mut script_to_execute: Option<String> = None;
             let mut table_browse_to_execute: Option<(QueryTabId, TableBrowsePageRequest)> = None;
+            let mut export_excludes_uncommitted_work = false;
             let mut export_to_deliver: Option<crate::ui::object_browser::ObjectExportDelivery> =
                 None;
             {
@@ -13927,6 +13994,21 @@ impl MainWindow {
                         // Deferred like the two above: the save panel and the
                         // clipboard both spin their own event loop, and the
                         // state lock is still held here.
+                        //
+                        // The rows were read on a pool session of this action's
+                        // own, so they cannot include what the requesting tab
+                        // has not committed — while `Select Data (Top 100)`,
+                        // one menu item away, is delivered to the tab and does
+                        // include it. Asked HERE because the tab's state is
+                        // reachable here and not from the deferred delivery.
+                        export_excludes_uncommitted_work = s
+                            .editor_tabs
+                            .iter()
+                            .find(|tab| tab.tab_id == source_tab_id)
+                            .and_then(|tab| tab.sql_editor.pooled_session_activity_snapshot())
+                            .is_some_and(|snapshot| {
+                                snapshot.retained_state().may_have_uncommitted_work()
+                            });
                         export_to_deliver = Some(delivery);
                     }
                     SqlAction::ExecuteScript(sql) => {
@@ -14018,6 +14100,14 @@ impl MainWindow {
 
             if let Some(delivery) = export_to_deliver {
                 MainWindow::deliver_object_export(&file_sender_for_browser, delivery);
+                // Reported after the delivery, so the user is told about the
+                // file they now have rather than about one they may still
+                // cancel out of the save panel.
+                if export_excludes_uncommitted_work {
+                    crate::ui::alert_on_main(
+                        crate::db::query::result_messages::OBJECT_READ_EXCLUDES_UNCOMMITTED_WORK,
+                    );
+                }
             }
 
             if !created_tabs.is_empty() {
@@ -14946,6 +15036,10 @@ impl MainWindow {
                         "app",
                         "Forcing application exit after query cancellation did not become idle",
                     );
+                    // The per-tab prompt is skipped on this path by design —
+                    // the session that will not stop cannot be committed
+                    // either — but the work must not go in silence.
+                    Self::report_unresolved_sessions_before_forced_exit(&state);
                     Self::finish_application_exit(&state, window.clone());
                 }
             }

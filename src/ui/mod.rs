@@ -211,7 +211,56 @@ fn finish_modal_dialog(dialog: Window) {
     Window::delete(dialog);
 }
 
-fn choice2_on_main_with_title(title: &str, txt: &str, b0: &str, b1: &str, b2: &str) -> Option<i32> {
+/// Which button `Enter` picks in a two/three-choice dialog.
+///
+/// A default is a convenience, and convenience is the wrong thing to give a
+/// question about the user's uncommitted data: the session-resolution prompt
+/// asks twice in a row and both defaults landed on the affirmative button, so
+/// `Enter` `Enter` committed work the user never read the prompt for. Callers
+/// that ask such a question pass [`DialogEnterDefault::Cancel`]; everything else
+/// keeps the affirmative default it has always had.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DialogEnterDefault {
+    /// `Enter` picks the affirmative button (index 1 when present, else 0).
+    Affirmative,
+    /// `Enter` picks the first button, which is `Cancel` in every prompt that
+    /// asks this way.
+    Cancel,
+}
+
+/// Which button `Enter` picks, for the buttons a dialog actually has.
+///
+/// Stated as its own function because it is a policy and not a detail: the
+/// affirmative default is a convenience everywhere except a question about the
+/// user's uncommitted data, where the session-resolution prompt asks twice in a
+/// row and `Enter` `Enter` used to commit work whose prompt was never read.
+fn dialog_enter_choice(enter_default: DialogEnterDefault, choice_indices: &[i32]) -> Option<i32> {
+    let has = |wanted: i32| choice_indices.contains(&wanted);
+    match enter_default {
+        // Index 0 is `Cancel` in every prompt that asks this way.
+        DialogEnterDefault::Cancel => has(0)
+            .then_some(0)
+            .or_else(|| choice_indices.first().copied()),
+        DialogEnterDefault::Affirmative => {
+            if has(1) {
+                Some(1)
+            } else if has(0) {
+                Some(0)
+            } else {
+                choice_indices.first().copied()
+            }
+        }
+    }
+}
+
+fn choice2_on_main_with_title_and_default(
+    title: &str,
+    txt: &str,
+    b0: &str,
+    b1: &str,
+    b2: &str,
+    enter_default: DialogEnterDefault,
+) -> Option<i32> {
     let choices = [(2, b2), (1, b1), (0, b0)]
         .into_iter()
         .filter(|(_, label)| !label.is_empty())
@@ -307,13 +356,8 @@ fn choice2_on_main_with_title(title: &str, txt: &str, b0: &str, b1: &str, b2: &s
 
     {
         let result = result.clone();
-        let default_choice = if buttons.iter().any(|(index, _)| *index == 1) {
-            Some(1)
-        } else if buttons.iter().any(|(index, _)| *index == 0) {
-            Some(0)
-        } else {
-            buttons.first().map(|(index, _)| *index)
-        };
+        let choice_indices = buttons.iter().map(|(index, _)| *index).collect::<Vec<_>>();
+        let default_choice = dialog_enter_choice(enter_default, &choice_indices);
         dialog.handle(move |window, event| match event {
             Event::KeyDown if matches!(app::event_key(), Key::Enter | Key::KPEnter) => {
                 *result
@@ -359,8 +403,23 @@ pub fn message_on_main(txt: &str) {
     let _ = choice2_on_main_with_title("Message", txt, "Close", "", "");
 }
 
+fn choice2_on_main_with_title(title: &str, txt: &str, b0: &str, b1: &str, b2: &str) -> Option<i32> {
+    choice2_on_main_with_title_and_default(title, txt, b0, b1, b2, DialogEnterDefault::Affirmative)
+}
+
 pub fn choice2_on_main(txt: &str, b0: &str, b1: &str, b2: &str) -> Option<i32> {
     choice2_on_main_with_title("Question", txt, b0, b1, b2)
+}
+
+/// A question about the user's uncommitted data: `Enter` cancels rather than
+/// agreeing, so resolving a session is always a deliberate click.
+pub fn choice2_on_main_defaulting_to_cancel(
+    txt: &str,
+    b0: &str,
+    b1: &str,
+    b2: &str,
+) -> Option<i32> {
+    choice2_on_main_with_title_and_default("Question", txt, b0, b1, b2, DialogEnterDefault::Cancel)
 }
 
 pub fn input_on_main(txt: &str, deflt: &str) -> Option<String> {
@@ -551,7 +610,39 @@ impl PopupAnchorSnapshot {
 
 #[cfg(test)]
 mod tests {
-    use super::dialog_prompt_height;
+    use super::{dialog_enter_choice, dialog_prompt_height, DialogEnterDefault};
+
+    #[test]
+    fn enter_agrees_everywhere_except_where_the_question_is_about_uncommitted_work() {
+        // The three-button session prompt: Cancel / Commit-Rollback / Discard.
+        let three = [2, 1, 0];
+        assert_eq!(
+            dialog_enter_choice(DialogEnterDefault::Affirmative, &three),
+            Some(1),
+            "every other dialog keeps the affirmative default it has always had"
+        );
+        assert_eq!(
+            dialog_enter_choice(DialogEnterDefault::Cancel, &three),
+            Some(0),
+            "a prompt about uncommitted work must not agree on Enter"
+        );
+
+        // Two buttons, and the degenerate one-button case.
+        assert_eq!(
+            dialog_enter_choice(DialogEnterDefault::Cancel, &[1, 0]),
+            Some(0)
+        );
+        assert_eq!(
+            dialog_enter_choice(DialogEnterDefault::Affirmative, &[1, 0]),
+            Some(1)
+        );
+        assert_eq!(
+            dialog_enter_choice(DialogEnterDefault::Cancel, &[2]),
+            Some(2),
+            "with no Cancel to fall back to, Enter picks the only button there is"
+        );
+        assert_eq!(dialog_enter_choice(DialogEnterDefault::Cancel, &[]), None);
+    }
 
     #[test]
     fn dialog_prompt_height_keeps_short_text_compact() {
