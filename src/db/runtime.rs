@@ -212,6 +212,28 @@ impl ConnectionRuntime {
         state
     }
 
+    /// Say that these connections are changing state, and make sure they stop
+    /// saying it.
+    ///
+    /// A connection-wide change (a pool rebuild) publishes `Transitioning`
+    /// before the work starts, so an execution that begins in the gap does not
+    /// lose its session to the generation bump. Only the work itself knows when
+    /// a connection is out of transition — and if that work never runs (the
+    /// worker thread could not be spawned) or dies halfway (a panic), the
+    /// connections it never reached would keep claiming they are transitioning
+    /// for the life of the process: every tab labelled "(transitioning)",
+    /// reconnect refused as "already in progress", Disconnect All refused,
+    /// preferences refused, and no way back but a restart.
+    ///
+    /// Announcing and taking it back are therefore one value: whatever this
+    /// guard still holds when it drops is put back where it came from.
+    pub fn announce_transition(runtimes: Vec<Arc<ConnectionRuntime>>) -> ConnectionTransition {
+        for runtime in &runtimes {
+            runtime.set_state(ConnectionRuntimeState::Transitioning);
+        }
+        ConnectionTransition { pending: runtimes }
+    }
+
     pub fn bound_tab_count(&self) -> usize {
         self.bound_tabs.load(Ordering::Acquire)
     }
@@ -497,6 +519,39 @@ impl Drop for TabConnectionBindingInner {
     }
 }
 
+/// The connections a caller has announced as `Transitioning`, and the promise
+/// that every one of them comes back out of it.
+///
+/// See [`ConnectionRuntime::announce_transition`]. Call [`Self::finished`] as
+/// each connection's work completes; anything still pending when this drops —
+/// because the work never started, or panicked partway — is read back from its
+/// own connection, which is the only place the truth was ever kept.
+pub struct ConnectionTransition {
+    pending: Vec<Arc<ConnectionRuntime>>,
+}
+
+impl ConnectionTransition {
+    /// The connections still waiting for their work, in order.
+    pub fn pending(&self) -> Vec<Arc<ConnectionRuntime>> {
+        self.pending.clone()
+    }
+
+    /// This connection's work is done: read its state back and stop holding it.
+    pub fn finished(&mut self, runtime: &Arc<ConnectionRuntime>) {
+        runtime.refresh_state_from_connection();
+        self.pending
+            .retain(|pending| !Arc::ptr_eq(pending, runtime));
+    }
+}
+
+impl Drop for ConnectionTransition {
+    fn drop(&mut self) {
+        for runtime in self.pending.drain(..) {
+            runtime.refresh_state_from_connection();
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct TabConnectionBinding {
     inner: Arc<TabConnectionBindingInner>,
@@ -726,6 +781,37 @@ impl TabConnectionBinding {
             .state
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
+        Self::detach_locked(&mut session, &mut state)
+    }
+
+    /// `detach`, but only while the binding still reads the revision the caller
+    /// resolved -- the twin of [`Self::bind_if_revision`].
+    ///
+    /// A force-cancelled batch is abandoned rather than joined, so its script
+    /// `DISCONNECT` cleanup can run after the tab has been bound somewhere
+    /// else. An unconditional detach would unbind the connection the user is
+    /// working on now and wipe that tab's scope with it.
+    ///
+    /// Answers the binding's revision either way: `Ok` when the detach
+    /// happened, `Err` with the revision that made this one stale.
+    pub fn detach_if_revision(&self, expected_revision: u64) -> Result<u64, u64> {
+        let mut session = self
+            .inner
+            .session
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut state = self
+            .inner
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if state.revision != expected_revision {
+            return Err(state.revision);
+        }
+        Ok(Self::detach_locked(&mut session, &mut state))
+    }
+
+    fn detach_locked(session: &mut SessionState, state: &mut TabConnectionBindingState) -> u64 {
         if let Some(runtime) = state.runtime.take() {
             runtime.detach_tab();
             state.detached_runtime = Some(runtime);
@@ -906,6 +992,86 @@ mod tests {
 
         assert!(runtime.sanitized_info().password.is_empty());
         assert!(!format!("{runtime:?}").contains("top-secret"));
+    }
+
+    #[test]
+    fn a_transition_nobody_finishes_puts_every_connection_back() {
+        // The announcement and taking it back are one value. A worker that
+        // never starts (thread spawn failed) or dies partway would otherwise
+        // leave its connections claiming they are transitioning for the life of
+        // the process: tabs labelled "(transitioning)", reconnect refused as
+        // "already in progress", Disconnect All refused, and no way back but a
+        // restart.
+        let runtime = |name: &str| {
+            Arc::new(ConnectionRuntime::new(
+                next_connection_id(),
+                ConnectionOrigin::SavedProfile {
+                    profile_name: name.to_string(),
+                },
+                connection(),
+                ConnectionInfo {
+                    name: name.to_string(),
+                    ..ConnectionInfo::default()
+                },
+                ConnectionRuntimeState::Connected,
+                0,
+                0,
+            ))
+        };
+        let first = runtime("first");
+        let second = runtime("second");
+
+        let mut transition =
+            ConnectionRuntime::announce_transition(vec![first.clone(), second.clone()]);
+        assert_eq!(first.state(), ConnectionRuntimeState::Transitioning);
+        assert_eq!(second.state(), ConnectionRuntimeState::Transitioning);
+
+        // The work reached the first connection...
+        transition.finished(&first);
+        assert_ne!(first.state(), ConnectionRuntimeState::Transitioning);
+        assert_eq!(second.state(), ConnectionRuntimeState::Transitioning);
+
+        // ... and then stopped. Dropping what it never reached restores it.
+        drop(transition);
+        assert_ne!(
+            second.state(),
+            ConnectionRuntimeState::Transitioning,
+            "a connection the work never reached must not stay in transition"
+        );
+    }
+
+    #[test]
+    fn a_stale_worker_may_not_detach_a_binding_that_moved_on() {
+        // A force-cancelled batch is abandoned rather than joined, so its
+        // script DISCONNECT cleanup can run after the tab has been bound
+        // somewhere else. An unconditional detach would unbind the connection
+        // the user is working on now and wipe that tab's scope with it.
+        let runtime = Arc::new(ConnectionRuntime::new(
+            next_connection_id(),
+            ConnectionOrigin::SavedProfile {
+                profile_name: "bound".to_string(),
+            },
+            connection(),
+            ConnectionInfo::default(),
+            ConnectionRuntimeState::Connected,
+            0,
+            0,
+        ));
+        let binding = TabConnectionBinding::bound(runtime.clone(), Some("HR".to_string()));
+        let revision = binding.snapshot().revision;
+
+        assert_eq!(
+            binding.detach_if_revision(revision.wrapping_sub(1)),
+            Err(revision)
+        );
+        assert_eq!(
+            binding.snapshot().scope.as_deref(),
+            Some("HR"),
+            "a stale detach must leave the tab where the user put it"
+        );
+
+        assert!(binding.detach_if_revision(revision).is_ok());
+        assert!(binding.snapshot().scope.is_none());
     }
 
     #[test]

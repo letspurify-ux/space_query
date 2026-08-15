@@ -143,10 +143,31 @@ the user's own batch, an auto-commit, or a DDL's implicit commit therefore ends
 it mid-batch, and applying the mode once per execution would leave every
 statement after that point running under the session default while the toolbar
 still claims the pinned mode. Both Oracle batch loops re-apply the mode at the
-start of the next transaction inside the same batch (the thin loop keys off its
-retained state, the OCI loop off the cleanup guard's known-clean flag), and
-neither injects it in front of the user's own transaction-first statement,
-which has to be first in its transaction itself (ORA-01453).
+start of the next transaction inside the same batch, and neither injects it in
+front of the user's own transaction-first statement, which has to be first in
+its transaction itself (ORA-01453). That yield is the same at all three
+injection sites — batch start, the boundary re-application, and after a script
+`CONNECT` — because a mode stated ahead of the user's own `SET TRANSACTION`
+fails THEIRS.
+
+"Has this transaction ended?" is answered from what the app tracked, until that
+answer stops being knowledge. A PL/SQL block or a `CALL` may commit internally,
+which ends the transaction the mode was attached to with nothing else to notice,
+so after a statement the app cannot see into both drivers ask the SERVER through
+one shared predicate (`oracle_transaction_mode_boundary_needs_server_answer`) —
+thin from the wire flag it already carries, OCI from a probe, which is what that
+answer costs there.
+
+A boundary re-application refused with **ORA-01453 is an answer, not a failure**:
+it says a transaction is still running, so the pin belongs to the next one,
+which is what "applied from the next transaction" has always meant. Reading it
+as an error stopped the batch on OCI (after a parse-failed DDL, whose implicit
+commit never happened) while thin ran the same script to the end. The mode
+statements' effects are also recorded BEFORE the round trip, not after it: a
+cancel that lands between the server running `SET TRANSACTION` and the app
+reading the answer would otherwise leave an open read-only transaction that
+`DBMS_TRANSACTION.LOCAL_TRANSACTION_ID` cannot see, and every later batch would
+fail with ORA-01453.
 
 The same rule decides whether a batch may state the mode BEFORE its first
 statement: `oracle_session_may_state_transaction_mode()` asks only whether the
@@ -176,6 +197,16 @@ ran without asking, so a Read only tab could still write through it. Every
 caller asks about the statement that will actually be sent, which for Explain is
 `ExplainPlanBackend::explain_statement()` rather than the `SELECT` being
 explained.
+
+The gate refuses WRITES, not everything Oracle happens to allow. Oracle's own
+list of what a read-only transaction permits is SELECT (without FOR UPDATE),
+`LOCK TABLE`, `SET ROLE`, `ALTER SESSION`, `ALTER SYSTEM`, COMMIT, ROLLBACK and
+SAVEPOINT, and the client allowlist follows it — refusing `ALTER SESSION SET
+NLS_DATE_FORMAT` while the app issues `ALTER SESSION SET CURRENT_SCHEMA` on that
+same session, and while allowing the ISOLATION_LEVEL form, was an arbitrary line.
+`ALTER SYSTEM` is the one exception kept out: the pin is the user saying this tab
+changes nothing, and reconfiguring the instance is a change whatever the
+transaction semantics say.
 
 ### Unrunnable isolation/access pairs are refused at selection
 

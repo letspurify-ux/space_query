@@ -6,7 +6,8 @@ use crate::db::connection::DatabaseType;
 use crate::db::sql_classification::{
     mariadb_set_statement_assignments_sql, mariadb_set_statement_inner_sql,
     mysql_sql_with_executable_comments_expanded, sql_contains_word_sequence_any_depth_for_db_type,
-    strip_leading_comments_and_whitespace, SqlKind, SqlStatementAnalysis,
+    statement_assignment_count, strip_leading_comments_and_whitespace, SqlKind,
+    SqlStatementAnalysis,
 };
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -931,6 +932,7 @@ pub(crate) struct StatementTransactionEffects {
     rollback_targets_savepoint: bool,
     control_starts_chain: bool,
     releases_physical_session: bool,
+    may_open_untracked_transaction: bool,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -1114,8 +1116,30 @@ impl StatementSessionEffects {
         self.transaction.may_leave_uncommitted_work
     }
 
+    /// Whether the app cannot see what this statement did to the session -- a
+    /// PL/SQL block, `CALL`, `EXEC`. Everything the app tracks about such a
+    /// statement is a guess from here on, including whether the transaction it
+    /// was told about is still open.
+    pub(crate) fn may_leave_unknown_session_state(self) -> bool {
+        self.session_residue.may_leave_unknown_state
+    }
+
     pub(crate) fn releases_physical_session(self) -> bool {
         self.transaction.releases_physical_session
+    }
+
+    /// Whether this statement can leave a transaction open that the app never
+    /// saw start.
+    ///
+    /// A stored PROCEDURE body may run `START TRANSACTION` (or `SET autocommit
+    /// = 0`) and return without ending it, and the server keeps that
+    /// transaction across the call boundary with auto-commit suspended for it —
+    /// so "auto-commit was on" is not an answer about this statement. Stored
+    /// functions and triggers may not contain transaction control, which is why
+    /// this is about calls and anonymous blocks and not about every statement
+    /// whose body the app cannot read.
+    pub(crate) fn may_open_untracked_transaction(self) -> bool {
+        self.transaction.may_open_untracked_transaction
     }
 }
 
@@ -2980,8 +3004,7 @@ fn oracle_session_transaction_mode_change_for_statement(
 ) -> Option<SessionTransactionModeChange> {
     let analysis = SqlStatementAnalysis::new_for_db_type(DatabaseType::Oracle, sql);
     let words = analysis.words();
-    if oracle_alter_session_set_target_for_words(words) != OracleAlterSessionTarget::IsolationLevel
-    {
+    if oracle_alter_session_set_target(sql, words) != OracleAlterSessionTarget::IsolationLevel {
         return None;
     }
     // The same reading the residue rule made: a statement that sets anything
@@ -3591,6 +3614,23 @@ fn mysql_transaction_control_starts_chain_for_analysis(
         words.first().map(String::as_str),
         Some("COMMIT") | Some("ROLLBACK")
     ) && mysql_transaction_control_outcome_for_analysis(analysis).starts_transaction_state()
+}
+
+/// Statements whose body the app cannot read AND which may contain transaction
+/// control: a stored procedure call, an anonymous `BEGIN ... NOT ATOMIC` block,
+/// and an `EXECUTE` of a prepared statement (whose text is a runtime value).
+///
+/// `DO` is not one of them even though its body is just as opaque: it can only
+/// call stored FUNCTIONS, and MySQL forbids transaction control there.
+fn mysql_statement_may_open_untracked_transaction_for_analysis(
+    analysis: &SqlStatementAnalysis<'_>,
+) -> bool {
+    let words = analysis.words();
+    match words.first().map(String::as_str) {
+        Some("CALL") | Some("EXECUTE") => true,
+        Some("BEGIN") => mysql_statement_is_begin_not_atomic_for_words(words),
+        _ => false,
+    }
 }
 
 fn mysql_statement_opens_transaction_state_for_analysis(
@@ -4272,6 +4312,37 @@ fn oracle_select_has_locking_clause(sql: &str) -> bool {
     sql_contains_word_sequence_any_depth_for_db_type(DatabaseType::Oracle, sql, &["FOR", "UPDATE"])
 }
 
+/// Whether the server refused a statement because a transaction is already
+/// open (`ORA-01453`).
+///
+/// The app states a tab's non-default transaction mode with `SET TRANSACTION`,
+/// which Oracle allows only as the first statement of a transaction. When a
+/// boundary re-application is refused this way the answer is information, not a
+/// failure: the transaction the pin was aimed at is still running, so the pin
+/// belongs to the NEXT one — which is exactly what "applied from the next
+/// transaction" means. Both Oracle drivers read the refusal through here so
+/// neither can decide on its own to fail a batch over it.
+pub(crate) fn oracle_error_says_transaction_still_open(message: &str) -> bool {
+    message.to_ascii_lowercase().contains("ora-01453")
+}
+
+/// Whether the app has to ASK the server if a transaction is still open before
+/// it decides NOT to re-state the tab's transaction mode.
+///
+/// The tracked answer is deliberately conservative: a PL/SQL block "may leave
+/// uncommitted work" because the app cannot see inside it. That is the right
+/// answer to "must this session be preserved?" and the wrong answer to "did the
+/// transaction the mode was attached to end?" — a block that commits internally
+/// ends it, and nothing else notices. So when the claim rests on a statement
+/// the app could not see into, the server gets the last word.
+pub(crate) fn oracle_transaction_mode_boundary_needs_server_answer(
+    mode: TransactionMode,
+    tracked_transaction_open: bool,
+    last_statement_was_opaque: bool,
+) -> bool {
+    !mode.is_default() && tracked_transaction_open && last_statement_was_opaque
+}
+
 fn oracle_statement_may_leave_uncommitted_work_for_analysis(
     sql: &str,
     analysis: &SqlStatementAnalysis<'_>,
@@ -4375,19 +4446,26 @@ fn oracle_alter_session_isolation_level_value(value: &[String]) -> Option<Transa
     }
 }
 
-fn oracle_alter_session_set_target_for_words(words: &[String]) -> OracleAlterSessionTarget {
+fn oracle_alter_session_set_target(sql: &str, words: &[String]) -> OracleAlterSessionTarget {
     if !(words.first().is_some_and(|word| word == "ALTER")
         && words.get(1).is_some_and(|word| word == "SESSION")
         && words.get(2).is_some_and(|word| word == "SET"))
     {
         return OracleAlterSessionTarget::NotRestatedByPoolSetup;
     }
-    // The tokenizer drops `=` and skips quoted values, so a single-parameter
-    // statement leaves at most the value words its own target allows.
+    // Whether this statement sets ONE parameter is asked of the statement, not
+    // of its words: the tokenizer drops every quoted and numeric value, so
+    // `CURRENT_SCHEMA = "HR" NLS_DATE_FORMAT = 'DD-MON-RR'` leaves exactly as
+    // many words behind as `CURRENT_SCHEMA = HR`. Reading that as a
+    // single-parameter statement filed the session CLEAN, and the pool then
+    // handed the next tab a session carrying the second parameter -- the leak
+    // this target enum exists to stop.
+    if statement_assignment_count(sql) != 1 {
+        return OracleAlterSessionTarget::NotRestatedByPoolSetup;
+    }
     let value = words.get(4..).unwrap_or_default();
     match words.get(3).map(String::as_str) {
-        // A schema name is one word, or none at all when it is quoted.
-        Some("CURRENT_SCHEMA") if value.len() <= 1 => OracleAlterSessionTarget::CurrentSchema,
+        Some("CURRENT_SCHEMA") => OracleAlterSessionTarget::CurrentSchema,
         Some("ISOLATION_LEVEL") if oracle_alter_session_isolation_level_value(value).is_some() => {
             OracleAlterSessionTarget::IsolationLevel
         }
@@ -4395,7 +4473,7 @@ fn oracle_alter_session_set_target_for_words(words: &[String]) -> OracleAlterSes
     }
 }
 
-fn oracle_session_residue_effects_for_words(words: &[String]) -> StatementSessionResidueEffects {
+fn oracle_session_residue_effects(sql: &str, words: &[String]) -> StatementSessionResidueEffects {
     let alter_session = words.first().is_some_and(|word| word == "ALTER")
         && words.get(1).is_some_and(|word| word == "SESSION");
     if !alter_session {
@@ -4417,7 +4495,7 @@ fn oracle_session_residue_effects_for_words(words: &[String]) -> StatementSessio
     }
 
     match words.get(2).map(String::as_str) {
-        Some("SET") => match oracle_alter_session_set_target_for_words(words) {
+        Some("SET") => match oracle_alter_session_set_target(sql, words) {
             OracleAlterSessionTarget::CurrentSchema => StatementSessionResidueEffects::default(),
             OracleAlterSessionTarget::IsolationLevel => StatementSessionResidueEffects {
                 sets_transaction_mode_override: true,
@@ -4863,7 +4941,7 @@ impl StatementSessionPostProcessor for OracleStatementSessionPostProcessor {
                     oracle_statement_may_leave_uncommitted_work_for_analysis(sql, &analysis),
                 ..StatementTransactionEffects::default()
             },
-            session_residue: oracle_session_residue_effects_for_words(words),
+            session_residue: oracle_session_residue_effects(sql, words),
             ..StatementSessionEffects::default()
         }
     }
@@ -4928,6 +5006,8 @@ impl StatementSessionPostProcessor for MysqlStatementSessionPostProcessor {
                     &analysis,
                 ),
                 releases_physical_session: transaction_control_outcome.releases_physical_session(),
+                may_open_untracked_transaction:
+                    mysql_statement_may_open_untracked_transaction_for_analysis(&analysis),
                 ..StatementTransactionEffects::default()
             },
             session_residue: mysql_session_residue_effects_for_analysis(
@@ -5452,6 +5532,84 @@ mod tests {
     }
 
     #[test]
+    fn an_ora_01453_answers_that_the_transaction_is_still_open() {
+        // A boundary re-application of the tab's mode is refused with ORA-01453
+        // when a transaction is still running. That is information, not a
+        // failure: the pin belongs to the NEXT transaction, which is what
+        // "applied from the next transaction" has always meant. Reading it as
+        // an error stopped the batch on OCI while thin ran the same script to
+        // the end.
+        assert!(oracle_error_says_transaction_still_open(
+            "ORA-01453: SET TRANSACTION must be first statement of transaction"
+        ));
+        assert!(oracle_error_says_transaction_still_open(
+            "ora-01453: set transaction must be first statement of transaction"
+        ));
+        assert!(!oracle_error_says_transaction_still_open(
+            "ORA-01456: may not perform insert/delete/update operation inside a READ ONLY transaction"
+        ));
+    }
+
+    #[test]
+    fn only_an_opaque_statement_sends_the_mode_boundary_to_the_server() {
+        let pinned = TransactionMode::new(
+            TransactionIsolation::Serializable,
+            TransactionAccessMode::ReadWrite,
+        );
+        // The tracked answer is a guess after a PL/SQL block or CALL: it may
+        // have committed internally and ended the transaction the mode was
+        // attached to, with nothing else to notice.
+        assert!(oracle_transaction_mode_boundary_needs_server_answer(
+            pinned, true, true
+        ));
+        // Nothing to ask when the app watched the transaction itself...
+        assert!(!oracle_transaction_mode_boundary_needs_server_answer(
+            pinned, true, false
+        ));
+        // ... when it already knows the transaction ended ...
+        assert!(!oracle_transaction_mode_boundary_needs_server_answer(
+            pinned, false, true
+        ));
+        // ... or when there is no pin to re-state, which is the common case and
+        // must never cost a round trip.
+        assert!(!oracle_transaction_mode_boundary_needs_server_answer(
+            TransactionMode::default(),
+            true,
+            true
+        ));
+    }
+
+    #[test]
+    fn oracle_alter_session_single_parameter_forms_are_still_restated_by_the_pool() {
+        // The other half of the rule: the two parameters session preparation
+        // DOES restate must keep being recognised, quoted value or not, or
+        // every scope change would start preserving its session for its tab.
+        let post_processor = statement_session_post_processor_for(DatabaseType::Oracle);
+        for sql in [
+            "ALTER SESSION SET CURRENT_SCHEMA = HR",
+            "ALTER SESSION SET CURRENT_SCHEMA = \"MixedCase\"",
+            "ALTER SESSION SET ISOLATION_LEVEL = SERIALIZABLE",
+            "ALTER SESSION SET ISOLATION_LEVEL = READ COMMITTED",
+        ] {
+            let retained = retained_session_state_after_statement(
+                post_processor,
+                RetainedSessionState::default(),
+                post_processor.effects_for_sql(sql),
+                false,
+                false,
+                false,
+                false,
+            );
+            assert!(
+                !retained
+                    .session_residue_state()
+                    .may_have_untracked_session_state(),
+                "`{sql}` sets only what the pool restates, so its session is recyclable"
+            );
+        }
+    }
+
+    #[test]
     fn oracle_alter_session_setting_a_second_parameter_is_never_clean() {
         // Oracle takes several `parameter = value` pairs in one statement, and
         // the pool restates only CURRENT_SCHEMA and ISOLATION_LEVEL. A second
@@ -5464,6 +5622,14 @@ mod tests {
             "ALTER SESSION SET CURRENT_SCHEMA = HR NLS_DATE_FORMAT = 'YYYY-MM-DD'",
             "ALTER SESSION SET ISOLATION_LEVEL = SERIALIZABLE OPTIMIZER_MODE = ALL_ROWS",
             "ALTER SESSION SET ISOLATION_LEVEL = READ COMMITTED DDL_LOCK_TIMEOUT = 10",
+            // The word list drops every QUOTED and NUMERIC value, so these
+            // leave exactly as many words behind as a single-parameter
+            // statement. Counting words read them as one parameter and filed
+            // the session clean, and the pool then handed the next tab a
+            // session carrying the second parameter.
+            "ALTER SESSION SET CURRENT_SCHEMA = \"HR\" NLS_DATE_FORMAT = 'DD-MON-RR'",
+            "ALTER SESSION SET CURRENT_SCHEMA = \"HR\" DDL_LOCK_TIMEOUT = 30",
+            "ALTER SESSION SET CURRENT_SCHEMA = HR DDL_LOCK_TIMEOUT = 30",
         ] {
             let retained = retained_session_state_after_statement(
                 post_processor,

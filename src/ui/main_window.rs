@@ -2165,6 +2165,11 @@ impl AppState {
         let binding = tab.connection_binding.snapshot();
         let changed = binding.scope != scope;
         tab.connection_binding.set_scope(scope.clone());
+        // A grid that is being edited names its table the way the user's SELECT
+        // did, so it has to learn that the tab moved: saving after a scope
+        // change would write to a same-named table in the new scope.
+        let mut result_tabs = tab.result_tabs.clone();
+        result_tabs.set_current_tab_scope(scope.as_deref());
         // Every tab has its own browser card; mirror the scope onto it
         // whether or not the tab is active.
         self.object_browser
@@ -10611,6 +10616,11 @@ impl MainWindow {
                         &column_kinds,
                         &null_text,
                         &sql,
+                        // Where these rows were READ. The same binding snapshot
+                        // the filter bar and the backend come from, so an edit
+                        // session cannot end up naming a table in a schema the
+                        // tab merely moved to later.
+                        filter_scope.as_deref(),
                     );
                     // Offer the filter only where it can actually run: a result
                     // this backend cannot re-query gets no bar at all, and a
@@ -12279,23 +12289,18 @@ impl MainWindow {
                     return true;
                 }
 
-                let Some(mut db_conn) =
-                    try_lock_connection_with_activity(&connection, "Disconnecting session")
-                else {
-                    let busy_message = format_connection_busy_message();
-                    crate::ui::alert_on_main(&busy_message);
-                    let mut s = state
-                        .lock()
-                        .unwrap_or_else(|poisoned| poisoned.into_inner());
-                    let conn_info = s
-                        .connection_info
-                        .lock()
-                        .unwrap_or_else(|poisoned| poisoned.into_inner())
-                        .clone();
-                    s.status_bar
-                        .set_label(&format_status(&busy_message, &conn_info));
-                    return true;
-                };
+                // WAITS for the connection rather than refusing. Every reason
+                // to refuse was spent above, before the prompts: refusing here
+                // would leave the user's transaction COMMITTED for a disconnect
+                // that never happened. The probe above is only a fast exit for
+                // the common busy case; nothing that holds this mutex for long
+                // can still be running (a query or lazy fetch on this
+                // connection was refused, and the resolution's own lock is
+                // released before its commit).
+                let mut db_conn = crate::db::lock_connection_with_activity(
+                    &connection,
+                    "Disconnecting session".to_string(),
+                );
                 crate::db::clear_pool_session_context_for_shared_connection(&connection);
                 crate::utils::logging::log_info("connection", "Disconnected from database");
                 db_conn.disconnect();
@@ -12446,21 +12451,16 @@ impl MainWindow {
                 }
 
                 let mut disconnected = Vec::new();
-                let mut failures = Vec::new();
                 for runtime in runtimes {
                     let connection = runtime.connection();
-                    let Some(mut db_conn) = try_lock_connection_with_activity(
+                    // Waits, like the single-connection disconnect: every tab on
+                    // every one of these connections has already been asked and
+                    // its transaction resolved, so refusing here would leave
+                    // those commits done for a disconnect that never happened.
+                    let mut db_conn = crate::db::lock_connection_with_activity(
                         &connection,
-                        "Disconnecting all connections",
-                    ) else {
-                        runtime.set_state(ConnectionRuntimeState::Connected);
-                        failures.push(format!(
-                            "{}: {}",
-                            runtime.display_name(),
-                            format_connection_busy_message()
-                        ));
-                        continue;
-                    };
+                        "Disconnecting all connections".to_string(),
+                    );
                     crate::db::clear_pool_session_context_for_shared_connection(&connection);
                     db_conn.disconnect();
                     db_conn.refresh_tracked_connection();
@@ -12495,17 +12495,10 @@ impl MainWindow {
                 for tab_id in tab_ids {
                     s.refresh_tab_label(tab_id);
                 }
-                if failures.is_empty() {
-                    s.set_status_message(&format!(
-                        "Disconnected {} connection(s)",
-                        disconnected.len()
-                    ));
-                } else {
-                    s.set_status_message("Some connections could not be disconnected");
-                    s.result_tabs
-                        .append_message_lines(ResultMessageKind::Error, &failures);
-                    s.result_tabs.select_messages_errors();
-                }
+                s.set_status_message(&format!(
+                    "Disconnected {} connection(s)",
+                    disconnected.len()
+                ));
                 s.refresh_connection_dependent_controls();
                 s.sync_transaction_mode_controls();
                 true
@@ -13184,9 +13177,12 @@ impl MainWindow {
                     // and epoch bump the rebuild makes — silently, because an
                     // InvalidSession is auto-discarded. Every other
                     // connection-wide change publishes the same state first.
-                    for runtime in &runtimes {
-                        runtime.set_state(ConnectionRuntimeState::Transitioning);
-                    }
+                    // Announced and taken back as one value: a worker that
+                    // never starts, or dies partway, would otherwise leave its
+                    // connections claiming they are transitioning for the life
+                    // of the process, with reconnect, Disconnect All and
+                    // preferences all refusing them.
+                    let mut transition = ConnectionRuntime::announce_transition(runtimes);
                     {
                         let mut s = state
                             .lock()
@@ -13205,7 +13201,7 @@ impl MainWindow {
                         .spawn(move || {
                             let result = panic::catch_unwind(AssertUnwindSafe(|| {
                                 let mut failures = Vec::new();
-                                for runtime in runtimes {
+                                for runtime in transition.pending() {
                                     if let Err(err) = resize_shared_connection_pool_with_policy(
                                         &runtime.connection(),
                                         size,
@@ -13217,11 +13213,11 @@ impl MainWindow {
                                             err
                                         ));
                                     }
-                                    // Whether it succeeded or not, the
-                                    // connection is no longer in transition:
-                                    // its own state is read back from the
-                                    // connection it belongs to.
-                                    runtime.refresh_state_from_connection();
+                                    // Whether it succeeded or not, this
+                                    // connection is out of transition: its own
+                                    // state is read back from the connection it
+                                    // belongs to.
+                                    transition.finished(&runtime);
                                 }
                                 if failures.is_empty() {
                                     Ok(())
@@ -14063,6 +14059,19 @@ impl MainWindow {
                     s.update_pending_metadata_refresh_after_start_attempt(started);
                     retained_scope_update
                 } else {
+                    // No tab follows this card (a connection preview, or the
+                    // active tab is bound elsewhere), but the pick still threw
+                    // the card's catalog away and told the user a load was
+                    // starting. Load it: otherwise the panel keeps showing the
+                    // OLD scope's objects under the NEW scope's name, for as
+                    // long as the user leaves the dropdown where it is.
+                    if let Some(message) = MainWindow::refresh_visible_preview_card(
+                        &mut s,
+                        connection_id,
+                        selected_scope,
+                    ) {
+                        s.set_status_message(&message);
+                    }
                     None
                 }
             };
@@ -18804,6 +18813,7 @@ mod tests {
                 &[],
                 "NULL",
                 "",
+                None,
             );
             guard
                 .result_tabs

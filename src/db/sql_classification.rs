@@ -1703,6 +1703,47 @@ fn skip_comment(sql: &str, idx: usize, mysql_compatible_comments: bool) -> Optio
     None
 }
 
+/// How many `parameter = value` assignments a statement makes, counted in the
+/// statement itself rather than in its word list.
+///
+/// The word list is the wrong place to ask: it drops every quoted string and
+/// every numeric literal, so `SET CURRENT_SCHEMA = "HR" NLS_DATE_FORMAT =
+/// 'DD-MON-RR'` and `SET CURRENT_SCHEMA = HR` leave the same number of words
+/// behind. Oracle's session-residue rule decides from this whether a statement
+/// sets ONLY the one parameter the pool restates on every session it hands out,
+/// and reading the shorter form as single-parameter files a session as clean
+/// while it carries the second parameter into the next tab.
+pub(crate) fn statement_assignment_count(sql: &str) -> usize {
+    let bytes = sql.as_bytes();
+    let mut idx = 0usize;
+    let mut count = 0usize;
+    while idx < bytes.len() {
+        if let Some(next) = skip_comment(sql, idx, false) {
+            idx = next;
+            continue;
+        }
+        if let Some(next) = skip_q_quote(sql, idx) {
+            idx = next;
+            continue;
+        }
+        if let Some(next) = skip_quoted(sql, idx) {
+            idx = next;
+            continue;
+        }
+        if bytes[idx] == b'=' {
+            // Only a plain assignment: `:=`, `!=`, `>=`, `<=` and `==` are
+            // comparisons or PL/SQL, none of which sets a session parameter.
+            let previous = idx.checked_sub(1).map(|prev| bytes[prev]);
+            let next = bytes.get(idx + 1).copied();
+            if !matches!(previous, Some(b':' | b'!' | b'>' | b'<' | b'=')) && next != Some(b'=') {
+                count = count.saturating_add(1);
+            }
+        }
+        idx += 1;
+    }
+    count
+}
+
 fn skip_quoted(sql: &str, idx: usize) -> Option<usize> {
     let bytes = sql.as_bytes();
     let quote = *bytes.get(idx)?;

@@ -399,6 +399,12 @@ pub struct ResultTableWidget {
     /// reaches, so this is what lets SQL export name the real table meanwhile.
     /// Edit mode keeps reading `source_sql`: it must not turn on mid-statement.
     streaming_source_sql: Arc<Mutex<String>>,
+    /// The database or schema the rows in this grid were read in. See
+    /// [`ResultTableWidget::set_source_scope`].
+    source_scope: Arc<Mutex<Option<String>>>,
+    /// The database or schema the owning tab is in NOW. See
+    /// [`ResultTableWidget::set_current_tab_scope`].
+    current_tab_scope: Arc<Mutex<Option<String>>>,
     execute_sql_callback: Arc<Mutex<Option<ResultGridSqlExecuteCallback>>>,
     execute_edit_callback: Arc<Mutex<Option<ResultGridEditExecuteCallback>>>,
     result_edit_descriptor: Arc<Mutex<Option<ResultEditDescriptor>>>,
@@ -2361,6 +2367,8 @@ impl ResultTableWidget {
         let header_sort_redirect: HeaderSortRedirectCallback = Arc::new(Mutex::new(None));
         let source_sql = Arc::new(Mutex::new(String::new()));
         let streaming_source_sql = Arc::new(Mutex::new(String::new()));
+        let source_scope = Arc::new(Mutex::new(None::<String>));
+        let current_tab_scope = Arc::new(Mutex::new(None::<String>));
         let execute_sql_callback: Arc<Mutex<Option<ResultGridSqlExecuteCallback>>> =
             Arc::new(Mutex::new(None));
         let execute_edit_callback: Arc<Mutex<Option<ResultGridEditExecuteCallback>>> =
@@ -3584,6 +3592,8 @@ impl ResultTableWidget {
             null_text,
             source_sql,
             streaming_source_sql,
+            source_scope,
+            current_tab_scope,
             execute_sql_callback,
             execute_edit_callback,
             result_edit_descriptor,
@@ -7422,6 +7432,19 @@ impl ResultTableWidget {
             return self.save_structured_edit_mode(&descriptor, &session, &rows);
         }
 
+        // The ROWID path names the table exactly as the user's SELECT did, so
+        // it is only the same table while the tab is in the same scope.
+        if Self::rowid_edit_scope_moved(
+            self.source_scope_snapshot().as_deref(),
+            self.current_tab_scope_snapshot().as_deref(),
+        ) {
+            return Err(
+                "The database or schema changed since these rows were read, so this edit \
+                 would be saved somewhere else. Re-run the query and edit it again."
+                    .to_string(),
+            );
+        }
+
         let mut statements = Vec::new();
 
         if !session.deleted_rowids.is_empty() {
@@ -10813,6 +10836,77 @@ impl ResultTableWidget {
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = sql.to_string();
     }
 
+    /// The database or schema this result was READ in.
+    ///
+    /// A ROWID edit session keeps the table name the user's own SELECT used,
+    /// and that name is resolved again when the save runs — by then the tab may
+    /// be scoped somewhere else, and an unqualified name would resolve against
+    /// the new schema. Recording where the rows came from lets the save name
+    /// the same table the grid is showing, the way the MySQL-family editable
+    /// results already do (their descriptor carries the schema).
+    pub fn set_source_scope(&self, scope: Option<&str>) {
+        *self
+            .source_scope
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Self::normalized_scope(scope);
+        // At read time the two agree by definition; only a later scope change
+        // moves the tab away from where these rows came from.
+        self.set_current_tab_scope(scope);
+    }
+
+    fn source_scope_snapshot(&self) -> Option<String> {
+        self.source_scope
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+    }
+
+    fn current_tab_scope_snapshot(&self) -> Option<String> {
+        self.current_tab_scope
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+    }
+
+    /// The scope the OWNING TAB is in now, as opposed to the one these rows
+    /// were read in.
+    pub fn set_current_tab_scope(&self, scope: Option<&str>) {
+        *self
+            .current_tab_scope
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Self::normalized_scope(scope);
+    }
+
+    fn normalized_scope(scope: Option<&str>) -> Option<String> {
+        scope
+            .map(str::trim)
+            .filter(|scope| !scope.is_empty())
+            .map(str::to_string)
+    }
+
+    /// Whether a ROWID edit may still be saved: the tab must be in the scope
+    /// its rows were read in.
+    ///
+    /// A ROWID edit session keeps the table name the user's own SELECT used,
+    /// and the save runs later through the tab's own execute path, which
+    /// asserts whatever scope the tab has THEN. An unqualified name plus a
+    /// schema change in between resolved against the NEW schema: a staged
+    /// INSERT landed in a same-named table in another schema and was reported
+    /// as success. Qualifying the name instead would change how it resolves --
+    /// a public synonym stops resolving once a schema is put in front of it --
+    /// so the save says no rather than writing somewhere else.
+    fn rowid_edit_scope_moved(source_scope: Option<&str>, current_tab_scope: Option<&str>) -> bool {
+        match (
+            Self::normalized_scope(source_scope),
+            Self::normalized_scope(current_tab_scope),
+        ) {
+            // Nothing recorded: this result predates the scope being tracked,
+            // or the tab never had one. Nothing to disagree with.
+            (None, _) | (_, None) => false,
+            (Some(source), Some(current)) => !source.eq_ignore_ascii_case(&current),
+        }
+    }
+
     /// Kinds to keep for `header_len` columns: all of them when the two agree,
     /// nothing otherwise.
     fn accepted_column_kinds(kinds: &[SqlValueKind], header_len: usize) -> Vec<SqlValueKind> {
@@ -11387,6 +11481,38 @@ mod row_edit_sql_tests {
     fn find_rowid_column_index_rejects_internal_rowid_alias_without_normalization() {
         let headers = vec!["SQ_INTERNAL_ROWID".to_string(), "ENAME".to_string()];
         assert_eq!(ResultTableWidget::find_rowid_column_index(&headers), None);
+    }
+
+    #[test]
+    fn a_rowid_edit_refuses_to_save_after_the_tab_moved_to_another_scope() {
+        // The ROWID path names the table exactly as the user's SELECT did, so
+        // it is only the same table while the tab is in the same scope. The
+        // save runs later through the tab's own execute path, which asserts
+        // whatever scope the tab has THEN -- a staged INSERT landed in a
+        // same-named table in another schema and was reported as success.
+        assert!(ResultTableWidget::rowid_edit_scope_moved(
+            Some("SCHEMA_A"),
+            Some("SCHEMA_B")
+        ));
+        // Still where the rows came from: nothing to refuse. Oracle uppercases
+        // its schema names, so the comparison cannot be case-sensitive.
+        assert!(!ResultTableWidget::rowid_edit_scope_moved(
+            Some("SCHEMA_A"),
+            Some("SCHEMA_A")
+        ));
+        assert!(!ResultTableWidget::rowid_edit_scope_moved(
+            Some("schema_a"),
+            Some("SCHEMA_A")
+        ));
+        // Nothing recorded on one side or the other: the tab follows the
+        // connection's own default, which the execution path asserts for every
+        // statement anyway.
+        assert!(!ResultTableWidget::rowid_edit_scope_moved(None, Some("HR")));
+        assert!(!ResultTableWidget::rowid_edit_scope_moved(Some("HR"), None));
+        assert!(!ResultTableWidget::rowid_edit_scope_moved(
+            Some("  "),
+            Some("HR")
+        ));
     }
 
     #[test]

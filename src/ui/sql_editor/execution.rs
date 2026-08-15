@@ -368,6 +368,93 @@ struct OracleThinConnectionTransitionContext<'a> {
     runtime_work_guard: &'a mut Option<crate::db::ConnectionWorkGuard>,
 }
 
+/// What the app may learn from reading a MySQL-family session's database back
+/// after a statement.
+///
+/// Scope is per TAB: the database a session sits in and the database the
+/// connection hands to tabs that asked for none are two different values, and a
+/// statement that ends one does not end the other. Saying which one moved here
+/// is what keeps a `DROP DATABASE` run in a scoped tab from clearing the
+/// default every other tab on that connection follows.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum MysqlSessionDatabaseUpdate {
+    /// Nothing moved: leave both alone.
+    None,
+    /// This session moved (a `USE`, or a drop of the database only this tab was
+    /// in). The answer is this tab's.
+    Session,
+    /// The connection's own database is gone, so its stored name goes too.
+    SessionAndConnection,
+}
+
+impl MysqlSessionDatabaseUpdate {
+    fn reads_session_database(self) -> bool {
+        !matches!(self, Self::None)
+    }
+
+    fn clears_connection_database(self) -> bool {
+        matches!(self, Self::SessionAndConnection)
+    }
+}
+
+/// What a transaction-mode application did, from the server's point of view.
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[must_use]
+enum OracleTransactionModeApplied {
+    /// The session now runs at the tab's mode.
+    Yes,
+    /// The transaction the pin was aimed at is still open (`ORA-01453`), so the
+    /// pin belongs to the next one. Not an error, and not a reason to stop.
+    TransactionStillOpen,
+    Failed(String),
+}
+
+/// Whether the app still knows what the tab's transaction is doing.
+///
+/// Both Oracle drivers re-state a pinned mode at the start of the next
+/// transaction, and both decide "is a transaction open?" from what they
+/// tracked. That tracked answer stops being knowledge the moment a statement
+/// the app cannot see into runs — a PL/SQL block or `CALL` that commits
+/// internally ends the transaction the mode was attached to, and every
+/// statement after it would run at the session default while the toolbar keeps
+/// claiming the pin. This is the one place that says so, for both drivers.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct OracleTransactionBoundaryTracker {
+    last_statement_was_opaque: bool,
+}
+
+impl OracleTransactionBoundaryTracker {
+    fn note_statement(&mut self, effects: crate::db::StatementSessionEffects) {
+        self.last_statement_was_opaque = effects.may_leave_unknown_session_state();
+    }
+
+    /// The app knows the transaction state again — it just stated the mode, or
+    /// a statement whose effect it can see resolved the transaction.
+    fn note_known_transaction_state(&mut self) {
+        self.last_statement_was_opaque = false;
+    }
+
+    fn needs_server_answer(&self, mode: TransactionMode, tracked_transaction_open: bool) -> bool {
+        crate::db::oracle_transaction_mode_boundary_needs_server_answer(
+            mode,
+            tracked_transaction_open,
+            self.last_statement_was_opaque,
+        )
+    }
+}
+
+impl OracleThinConnectionTransitionContext<'_> {
+    /// Which execution the tab's session slot and binding belong to right now.
+    /// A script CONNECT/DISCONNECT mutates both, and an abandoned batch reaches
+    /// them after the tab has moved on.
+    fn session_owner(&self) -> crate::db::SessionHandBackOwner {
+        crate::db::SessionHandBackOwner::for_operation(
+            Some(self.current_operation_id),
+            self.operation_id,
+        )
+    }
+}
+
 struct OracleThinCursorStreamOutcome {
     cursor_result: CursorResult,
     was_cancelled: bool,
@@ -481,7 +568,7 @@ impl<'a> BatchSessionHandBack<'a> {
             log_context,
             current_scope,
         );
-        if outcome.abandoned_work() {
+        if outcome.lost_work() {
             SqlEditorWidget::report_retained_session_lost_with_work(
                 self.sender,
                 retained_state,
@@ -489,6 +576,19 @@ impl<'a> BatchSessionHandBack<'a> {
             );
         }
         outcome.stored()
+    }
+
+    /// Drop the tab's retained session because this batch is leaving the
+    /// connection it belongs to (script CONNECT / DISCONNECT, or a batch that
+    /// ended disconnected). Same currency rule as `apply`: an abandoned batch
+    /// must not clear the slot a newer execution already owns.
+    fn clear(&self, pooled_db_session: &SharedDbSessionLease, log_context: &str) {
+        SqlEditorWidget::clear_worker_session_for_batch(
+            pooled_db_session,
+            self.sender,
+            self.owner,
+            log_context,
+        );
     }
 }
 
@@ -938,7 +1038,15 @@ impl ExecutionWorkerBackend for OracleExecutionWorkerBackend {
                 None,
             )
         } else {
-            pooled_db_session.clear();
+            SqlEditorWidget::clear_worker_session_for_batch(
+                pooled_db_session,
+                Some(sender),
+                &crate::db::SessionHandBackOwner::for_operation(
+                    Some(current_operation_id),
+                    operation_id,
+                ),
+                db_activity,
+            );
             drop(conn_guard);
             let Some(ScriptItem::ToolCommand(ToolCommand::Connect {
                 username,
@@ -1212,6 +1320,21 @@ impl ExecutionWorkerBackend for OracleExecutionWorkerBackend {
                 &err.to_string(),
                 Some(&session),
             );
+            // The tab's session is already out of its slot here. Dropping it
+            // would return it to the pool, where `reset_before_reuse` rolls
+            // back whatever the tab had open -- silently. Hand it back instead,
+            // through the door that states whose execution it belongs to.
+            SqlEditorWidget::abandon_oracle_thin_batch_session(
+                pooled_db_session,
+                sender,
+                current_operation_id,
+                operation_id,
+                connection_generation,
+                pool_context_epoch,
+                thin_conn,
+                prior_retained_state,
+                execution_scope.clone(),
+            );
             return ExecutionWorkerOutcome::Handled;
         }
 
@@ -1313,7 +1436,16 @@ impl ExecutionWorkerBackend for OracleExecutionWorkerBackend {
                 transition_context.scope,
             );
         } else {
-            pooled_db_session.clear();
+            let owner = crate::db::SessionHandBackOwner::for_operation(
+                Some(current_operation_id),
+                operation_id,
+            );
+            SqlEditorWidget::clear_worker_session_for_batch(
+                pooled_db_session,
+                Some(sender),
+                &owner,
+                "oracle thin execution",
+            );
             drop(thin_conn);
         }
         ExecutionWorkerOutcome::Handled
@@ -3676,13 +3808,19 @@ impl SqlEditorWidget {
         sender: &QueryProgressSender,
         allows_disconnected_start: bool,
         pooled_db_session: &SharedDbSessionLease,
+        session_owner: &crate::db::SessionHandBackOwner,
         execution_scope: Option<&str>,
     ) -> (
         crate::db::ConnectionLockGuard<'a>,
         Result<Option<(Arc<Connection>, RetainedSessionState, u64)>, String>,
     ) {
         if !conn_guard.is_connected() || !conn_guard.has_connection_handle() {
-            pooled_db_session.clear();
+            Self::clear_worker_session_for_batch(
+                pooled_db_session,
+                Some(sender),
+                session_owner,
+                db_activity,
+            );
             let pool_context_epoch = conn_guard.pool_context_epoch();
             let result = Self::acquire_execution_connection(
                 &mut conn_guard,
@@ -6808,7 +6946,7 @@ impl SqlEditorWidget {
                             "mysql lazy fetch cleanup",
                             connection_generation,
                             false,
-                            false,
+                            MysqlSessionDatabaseUpdate::None,
                             preserve_session_state_after_action,
                             statement_effects.preserves_statement_diagnostics(),
                             execution_scope.as_deref(),
@@ -8345,7 +8483,7 @@ impl SqlEditorWidget {
                                     conn_guard.disconnect();
                                     had_connection
                                 };
-                                pooled_db_session.clear();
+                                hand_back.clear(pooled_db_session, db_activity);
                                 conn_name.clear();
                                 let _ =
                                     sender.send(QueryProgress::ConnectionChanged { info: None });
@@ -10461,6 +10599,10 @@ impl SqlEditorWidget {
                         &sender,
                         startup_policy.allows_disconnected_start,
                         &pooled_db_session,
+                        &crate::db::SessionHandBackOwner::for_operation(
+                            Some(&current_operation_id),
+                            operation_id,
+                        ),
                         acquire_scope.as_deref(),
                     );
                 let conn_guard = guard_after_acquire;
@@ -10577,11 +10719,20 @@ impl SqlEditorWidget {
                         current_operation_scope(),
                     );
                 }
+                // Only the USER's own transaction-first statement makes the app
+                // hold back its own session statements: `DBMS_OUTPUT.ENABLE` is
+                // PL/SQL, so running it in front of a `SET TRANSACTION` would
+                // take that statement's place at the head of its transaction
+                // (ORA-01453). A mode PINNED on the tab is not that question —
+                // the app states the pin itself, right above, and the thin twin
+                // has always asked only about the items. Asking the pin here too
+                // meant a Serializable or Read only tab never had its
+                // SERVEROUTPUT setting stated on the session it ran on: output
+                // vanished, and a tab that wanted none inherited another tab's.
                 let explicit_transaction_first_statement =
                     SqlEditorWidget::requires_transaction_first_statement(&items);
                 let transaction_mode = selected_transaction_mode;
-                let requires_transaction_first_statement = explicit_transaction_first_statement
-                    || db_type.transaction_mode_requires_first_statement(transaction_mode);
+                let mut oracle_transaction_boundary = OracleTransactionBoundaryTracker::default();
                 let transaction_mode_application = OracleTransactionModeApplication {
                     mode: transaction_mode,
                     tab_selected: load_mutex_transaction_mode_option(
@@ -10629,11 +10780,24 @@ impl SqlEditorWidget {
                         return;
                     }
                     if should_apply_oracle_transaction_mode {
-                        if let Err(err) = SqlEditorWidget::apply_oracle_transaction_mode_statements(
+                        let applied = SqlEditorWidget::apply_oracle_transaction_mode_statements(
                             &mut cleanup,
                             conn.as_ref(),
                             transaction_mode_application,
-                        ) {
+                        );
+                        let failure = match applied {
+                            Ok(OracleTransactionModeApplied::Yes) => {
+                                oracle_transaction_boundary.note_known_transaction_state();
+                                None
+                            }
+                            // A transaction is already open on this session, so
+                            // the pin belongs to the next one. The batch loop
+                            // states it there.
+                            Ok(OracleTransactionModeApplied::TransactionStillOpen) => None,
+                            Ok(OracleTransactionModeApplied::Failed(message)) => Some(message),
+                            Err(message) => Some(message),
+                        };
+                        if let Some(err) = failure {
                             SqlEditorWidget::emit_execution_startup_error(
                                 &sender,
                                 script_mode,
@@ -10645,7 +10809,7 @@ impl SqlEditorWidget {
                             return;
                         }
                     }
-                    if !requires_transaction_first_statement {
+                    if !explicit_transaction_first_statement {
                         if let Err(err) =
                             SqlEditorWidget::sync_serveroutput_with_session(conn.as_ref(), &session)
                         {
@@ -12234,28 +12398,48 @@ impl SqlEditorWidget {
                                                     );
                                                     continue;
                                                 }
-                                                if let Err(err) = crate::db::DatabaseConnection::apply_oracle_transaction_mode(
-                                                    prepared_conn.as_ref(),
-                                                    next_active_transaction_mode,
-                                                ) {
-                                                    if let Some(mut guard) =
-                                                        crate::db::try_lock_connection(
-                                                            &candidate_connection,
-                                                        )
-                                                    {
-                                                        guard.disconnect();
-                                                    }
-                                                    SqlEditorWidget::emit_script_message(
-                                                        &sender,
-                                                        &session,
-                                                        "CONNECT",
-                                                        &format!(
-                                                            "Error: Failed to apply transaction mode before CONNECT: {err}"
-                                                        ),
+                                                // The third place the tab's mode
+                                                // is stated, and it yields like
+                                                // the other two: Oracle allows
+                                                // `SET TRANSACTION` only as the
+                                                // first statement of a
+                                                // transaction, so stating the
+                                                // pin here in front of the
+                                                // user's own transaction-first
+                                                // statement fails THEIRS with
+                                                // ORA-01453. The batch loop
+                                                // states the pin at the end of
+                                                // that transaction instead —
+                                                // which is what "applied from
+                                                // the next transaction" means.
+                                                let next_statement_opens_its_own_transaction =
+                                                    Self::next_batch_statement_requires_transaction_first(
+                                                        &frames,
                                                     );
-                                                    continue;
+                                                if !next_statement_opens_its_own_transaction {
+                                                    if let Err(err) = crate::db::DatabaseConnection::apply_oracle_transaction_mode(
+                                                        prepared_conn.as_ref(),
+                                                        next_active_transaction_mode,
+                                                    ) {
+                                                        if let Some(mut guard) =
+                                                            crate::db::try_lock_connection(
+                                                                &candidate_connection,
+                                                            )
+                                                        {
+                                                            guard.disconnect();
+                                                        }
+                                                        SqlEditorWidget::emit_script_message(
+                                                            &sender,
+                                                            &session,
+                                                            "CONNECT",
+                                                            &format!(
+                                                                "Error: Failed to apply transaction mode before CONNECT: {err}"
+                                                            ),
+                                                        );
+                                                        continue;
+                                                    }
                                                 }
-                                                if !requires_transaction_first_statement {
+                                                if !next_statement_opens_its_own_transaction {
                                                     if let Err(err) =
                                                         SqlEditorWidget::sync_serveroutput_with_session(
                                                             prepared_conn.as_ref(),
@@ -12337,7 +12521,15 @@ impl SqlEditorWidget {
                                                     scope: None,
                                                     display_name: sanitized_conn_info.name.clone(),
                                                 }));
-                                                pooled_db_session.clear();
+                                                Self::clear_worker_session_for_batch(
+                                                    &pooled_db_session,
+                                                    Some(&sender),
+                                                    &crate::db::SessionHandBackOwner::for_operation(
+                                                        Some(&current_operation_id),
+                                                        operation_id,
+                                                    ),
+                                                    &db_activity,
+                                                );
                                                 cleanup.clear_oracle_pooled_session_tracking();
                                                 // The tab's scope belonged to
                                                 // the connection that just went
@@ -12352,15 +12544,27 @@ impl SqlEditorWidget {
                                                 );
                                                 active_transaction_mode =
                                                     next_active_transaction_mode;
-                                                Self::record_applied_oracle_transaction_mode_effects(
-                                                    &mut cleanup,
-                                                    OracleTransactionModeApplication {
-                                                        mode: active_transaction_mode,
-                                                        tab_selected: None,
-                                                        default_isolation:
-                                                            crate::db::TransactionIsolation::Default,
-                                                    },
-                                                );
+                                                // CONNECT hands the tab a FRESH
+                                                // session, so no transaction is
+                                                // open on it. Saying so is what
+                                                // lets the loop state the pin at
+                                                // the end of the user's own
+                                                // transaction when the yield
+                                                // above held it back.
+                                                cleanup.clear_oracle_pooled_session_maybe_dirty();
+                                                oracle_transaction_boundary
+                                                    .note_known_transaction_state();
+                                                if !next_statement_opens_its_own_transaction {
+                                                    Self::record_applied_oracle_transaction_mode_effects(
+                                                        &mut cleanup,
+                                                        OracleTransactionModeApplication {
+                                                            mode: active_transaction_mode,
+                                                            tab_selected: None,
+                                                            default_isolation:
+                                                                crate::db::TransactionIsolation::Default,
+                                                        },
+                                                    );
+                                                }
                                                 shared_connection = candidate_connection;
                                                 connection_generation =
                                                     next_connection_generation;
@@ -12450,7 +12654,15 @@ impl SqlEditorWidget {
                                         command_error = true;
                                     } else {
                                         let had_connection = conn_opt.is_some();
-                                        pooled_db_session.clear();
+                                        Self::clear_worker_session_for_batch(
+                                            &pooled_db_session,
+                                            Some(&sender),
+                                            &crate::db::SessionHandBackOwner::for_operation(
+                                                Some(&current_operation_id),
+                                                operation_id,
+                                            ),
+                                            &db_activity,
+                                        );
 
                                         // SQL*Plus DISCONNECT is tab-local: other tabs sharing the
                                         // runtime and its pool remain connected.
@@ -12461,8 +12673,13 @@ impl SqlEditorWidget {
                                         );
                                         conn_opt = None;
                                         conn_name.clear();
-                                        binding_revision =
-                                            connection_binding_for_worker.detach();
+                                        // Keeps the STALE revision when the
+                                        // detach is refused, so a superseded
+                                        // batch's later CONNECT cannot rebind a
+                                        // tab that has moved on.
+                                        binding_revision = connection_binding_for_worker
+                                            .detach_if_revision(binding_revision)
+                                            .unwrap_or(binding_revision);
                                         let disconnect_message = if had_connection {
                                             "Disconnected from database"
                                         } else {
@@ -12802,8 +13019,29 @@ impl SqlEditorWidget {
                             // transaction-first statement, which has to be first
                             // in its transaction itself (ORA-01453). The thin
                             // loop does the same, keyed off its retained state.
+                            let tracked_transaction_open =
+                                !cleanup.oracle_pooled_session_transaction_possibly_ended();
+                            // The tracked answer is a GUESS once a statement the
+                            // app cannot see into has run: a PL/SQL block or
+                            // CALL that commits internally ends the transaction
+                            // the mode was attached to, and nothing else
+                            // notices. Ask the server rather than run the rest
+                            // of the batch at the session default while the
+                            // toolbar claims the pin.
+                            let transaction_open = if oracle_transaction_boundary
+                                .needs_server_answer(
+                                    active_transaction_mode,
+                                    tracked_transaction_open,
+                                ) {
+                                SqlEditorWidget::oracle_session_may_have_uncommitted_work(
+                                    conn.as_ref(),
+                                    &db_activity,
+                                )
+                            } else {
+                                tracked_transaction_open
+                            };
                             if !active_transaction_mode.is_default()
-                                && cleanup.oracle_pooled_session_transaction_possibly_ended()
+                                && !transaction_open
                                 && !SqlEditorWidget::is_transaction_first_statement(&sql_text)
                             {
                                 let reapplication = OracleTransactionModeApplication {
@@ -12813,13 +13051,35 @@ impl SqlEditorWidget {
                                     ),
                                     default_isolation: default_transaction_isolation,
                                 };
-                                if let Err(err) =
+                                let applied =
                                     SqlEditorWidget::apply_oracle_transaction_mode_statements(
                                         &mut cleanup,
                                         conn.as_ref(),
                                         reapplication,
-                                    )
-                                {
+                                    );
+                                let failure = match applied {
+                                    Ok(OracleTransactionModeApplied::Yes) => {
+                                        oracle_transaction_boundary.note_known_transaction_state();
+                                        None
+                                    }
+                                    // The server says a transaction is still
+                                    // running here, so this was not a boundary
+                                    // after all — a statement rejected at parse
+                                    // time commits nothing, and a read-only
+                                    // transaction carries no work to see. The
+                                    // pin applies from the next transaction,
+                                    // which is the model everywhere else; the
+                                    // batch has no reason to stop.
+                                    Ok(OracleTransactionModeApplied::TransactionStillOpen) => {
+                                        oracle_transaction_boundary.note_known_transaction_state();
+                                        None
+                                    }
+                                    Ok(OracleTransactionModeApplied::Failed(message)) => {
+                                        Some(message)
+                                    }
+                                    Err(message) => Some(message),
+                                };
+                                if let Some(err) = failure {
                                     SqlEditorWidget::emit_non_select_result(
                                         &sender,
                                         &session,
@@ -12872,6 +13132,10 @@ impl SqlEditorWidget {
                                     crate::db::DatabaseType::Oracle,
                                 )
                                 .effects_for_sql(&sql_text);
+                            // Whether the app still knows what this session's
+                            // transaction is doing after this statement. The
+                            // boundary decision above reads it on the NEXT one.
+                            oracle_transaction_boundary.note_statement(statement_effects);
                             let statement_sql_kind =
                                 crate::db::session_policy::classify_sql_for_db_type(
                                     crate::db::DatabaseType::Oracle,
@@ -17724,6 +17988,10 @@ impl SqlEditorWidget {
         let mut active_transaction_mode = selected_transaction_mode;
         let mut transaction_mode_applied =
             !Self::should_apply_oracle_thin_transaction_mode(prior_retained_state);
+        // Shared with the OCI loop: whether the app still knows what this
+        // session's transaction is doing, which is what the boundary
+        // re-application below is allowed to decide from.
+        let mut oracle_transaction_boundary = OracleTransactionBoundaryTracker::default();
         let mut batch_may_report_transaction_work =
             prior_retained_state.may_have_uncommitted_work();
         let working_dir = env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
@@ -18534,7 +18802,12 @@ impl SqlEditorWidget {
                                 query_timeout,
                             ) {
                                 Ok(candidate) => {
-                                    context.pooled_db_session.clear();
+                                    Self::clear_worker_session_for_batch(
+                                        context.pooled_db_session,
+                                        Some(sender),
+                                        &context.session_owner(),
+                                        "oracle thin execution",
+                                    );
                                     if let Err(message) = conn.replace_pooled(candidate.session) {
                                         context.connection_binding.detach();
                                         if let Some(mut guard) =
@@ -18581,15 +18854,24 @@ impl SqlEditorWidget {
                                     // A new server means a new session, and
                                     // SERVEROUTPUT is session state: the tab's
                                     // setting has to be stated on it as well,
-                                    // exactly as the OCI CONNECT path does.
-                                    if let Err(err) =
-                                        Self::sync_oracle_thin_serveroutput_with_session(
-                                            conn, session,
-                                        )
-                                    {
-                                        eprintln!(
-                                            "Failed to apply SERVEROUTPUT setting after CONNECT: {err}"
-                                        );
+                                    // exactly as the OCI CONNECT path does --
+                                    // including the yield. This is PL/SQL, so
+                                    // running it in front of the user's own
+                                    // transaction-first statement would take
+                                    // that statement's place at the head of its
+                                    // transaction (ORA-01453).
+                                    if !Self::next_batch_statement_requires_transaction_first(
+                                        &frames,
+                                    ) {
+                                        if let Err(err) =
+                                            Self::sync_oracle_thin_serveroutput_with_session(
+                                                conn, session,
+                                            )
+                                        {
+                                            eprintln!(
+                                                "Failed to apply SERVEROUTPUT setting after CONNECT: {err}"
+                                            );
+                                        }
                                     }
                                     retained_state = RetainedSessionState::default();
                                     batch_may_report_transaction_work = false;
@@ -18625,6 +18907,10 @@ impl SqlEditorWidget {
                                     default_transaction_isolation =
                                         candidate.default_transaction_isolation;
                                     transaction_mode_applied = false;
+                                    // A CONNECT hands the tab a FRESH session:
+                                    // the app knows no transaction is open on
+                                    // it.
+                                    oracle_transaction_boundary.note_known_transaction_state();
                                     continue_on_error = session
                                         .lock()
                                         .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -18683,8 +18969,21 @@ impl SqlEditorWidget {
                             }
 
                             let had_connection = context.connected;
-                            context.pooled_db_session.clear();
-                            context.binding_revision = context.connection_binding.detach();
+                            Self::clear_worker_session_for_batch(
+                                context.pooled_db_session,
+                                Some(sender),
+                                &context.session_owner(),
+                                "oracle thin execution",
+                            );
+                            // Keeps the STALE revision when the detach is
+                            // refused: this batch has been superseded, and
+                            // adopting the binding's current revision would let
+                            // its later `bind_if_revision` calls succeed and
+                            // rebind a tab that has moved on.
+                            context.binding_revision = context
+                                .connection_binding
+                                .detach_if_revision(context.binding_revision)
+                                .unwrap_or(context.binding_revision);
                             context.scope = None;
                             context.connected = false;
                             context.preconnected_info = None;
@@ -18855,6 +19154,10 @@ impl SqlEditorWidget {
                     let execution_sql = exec_call.unwrap_or_else(|| sql_to_execute.clone());
                     let head = Self::oracle_thin_statement_head(&execution_sql);
                     let statement_effects = post_processor.effects_for_sql(&execution_sql);
+                    // Whether the app still knows what this session's
+                    // transaction is doing after this statement. The boundary
+                    // decision reads it on the NEXT one.
+                    oracle_transaction_boundary.note_statement(statement_effects);
                     let statement_sql_kind = crate::db::session_policy::classify_sql_for_db_type(
                         crate::db::DatabaseType::Oracle,
                         &execution_sql,
@@ -18928,9 +19231,26 @@ impl SqlEditorWidget {
                     // claims the pinned mode. Re-apply it at the start of the
                     // next transaction, which is what "applied from the next
                     // transaction" means inside a batch too.
+                    let tracked_transaction_open = retained_state.may_have_uncommitted_work();
+                    // The tracked answer is a GUESS once a statement the app
+                    // cannot see into has run — a PL/SQL block or CALL that
+                    // commits internally ends the transaction the mode was
+                    // attached to. The wire says whether one is really open, so
+                    // ask it rather than run the rest of the batch at the
+                    // session default while the toolbar claims the pin. The OCI
+                    // twin asks the same question through the same predicate;
+                    // only the answer is driver-specific (there it costs a round
+                    // trip, here it is a flag the protocol already carries).
+                    let transaction_open = if oracle_transaction_boundary
+                        .needs_server_answer(active_transaction_mode, tracked_transaction_open)
+                    {
+                        conn.transaction_in_progress()
+                    } else {
+                        tracked_transaction_open
+                    };
                     if transaction_mode_applied
                         && !active_transaction_mode.is_default()
-                        && !retained_state.may_have_uncommitted_work()
+                        && !transaction_open
                     {
                         transaction_mode_applied = false;
                     }
@@ -18989,9 +19309,42 @@ impl SqlEditorWidget {
                                 }
                             };
                         for (tx_sql, restores_session_default) in transaction_mode_statements {
+                            // Recorded BEFORE the round trip, exactly like the
+                            // OCI twin: `SET TRANSACTION` opens a transaction
+                            // that carries no work of its own, so a cancel
+                            // landing between the server running it and the app
+                            // reading the answer would leave an open
+                            // transaction nothing knows about. Recording first
+                            // is true whether it ran, was refused because one
+                            // was open already, or may have run.
+                            if !restores_session_default {
+                                let tx_effects = post_processor.effects_for_sql(&tx_sql);
+                                batch_may_report_transaction_work |= tx_effects
+                                    .may_leave_uncommitted_work()
+                                    || tx_effects.opens_or_preserves_transaction_state()
+                                    || tx_effects.requires_transaction_decision_after_success();
+                                retained_state =
+                                    Self::oracle_retained_state_after_statement_effects(
+                                        retained_state,
+                                        tx_effects,
+                                        false,
+                                        false,
+                                        false,
+                                        false,
+                                    );
+                            }
                             if let Err(message) =
                                 Self::execute_oracle_thin_statement(conn, &tx_sql, false)
                             {
+                                // A transaction is still running on this
+                                // session, so this was not a boundary after
+                                // all: the pin applies from the next
+                                // transaction, and the batch has no reason to
+                                // stop. The OCI twin reads the same refusal the
+                                // same way.
+                                if crate::db::oracle_error_says_transaction_still_open(&message) {
+                                    break;
+                                }
                                 had_error = true;
                                 let (error_message, statement_timed_out) =
                                     Self::oracle_thin_message_after_interrupt(
@@ -19021,24 +19374,10 @@ impl SqlEditorWidget {
                                 // through a Read only tab).
                                 stop_execution = true;
                                 break;
-                            } else if !restores_session_default {
-                                let tx_effects = post_processor.effects_for_sql(&tx_sql);
-                                batch_may_report_transaction_work |= tx_effects
-                                    .may_leave_uncommitted_work()
-                                    || tx_effects.opens_or_preserves_transaction_state()
-                                    || tx_effects.requires_transaction_decision_after_success();
-                                retained_state =
-                                    Self::oracle_retained_state_after_statement_effects(
-                                        retained_state,
-                                        tx_effects,
-                                        false,
-                                        false,
-                                        false,
-                                        false,
-                                    );
                             }
                         }
                         transaction_mode_applied = true;
+                        oracle_transaction_boundary.note_known_transaction_state();
                         if stop_execution {
                             break;
                         }
@@ -21502,6 +21841,30 @@ impl SqlEditorWidget {
             .unwrap_or(false)
     }
 
+    /// The same question as [`Self::requires_transaction_first_statement`],
+    /// asked in the MIDDLE of a batch: does the statement that runs next have
+    /// to open its own transaction?
+    ///
+    /// A script `CONNECT` states the tab's mode on the connection it just
+    /// opened, and that mode statement must yield to the user's own
+    /// transaction-first statement exactly like the batch-start injection does.
+    /// Innermost frame first — that is the order the batch will run them in.
+    fn next_batch_statement_requires_transaction_first(frames: &[ScriptExecutionFrame]) -> bool {
+        frames
+            .iter()
+            .rev()
+            .find_map(|frame| {
+                frame.items[frame.index.min(frame.items.len())..]
+                    .iter()
+                    .find_map(|item| match item {
+                        ScriptItem::Statement(statement) => Some(statement.as_str()),
+                        ScriptItem::ToolCommand(_) => None,
+                    })
+            })
+            .map(Self::is_transaction_first_statement)
+            .unwrap_or(false)
+    }
+
     fn is_transaction_first_statement(statement: &str) -> bool {
         let stripped = QueryExecutor::strip_leading_comments(statement);
         let trimmed = stripped.trim().trim_end_matches(';').trim();
@@ -21523,10 +21886,28 @@ impl SqlEditorWidget {
             return true;
         }
 
+        let upper = trimmed.to_ascii_uppercase();
         QueryExecutor::is_select_statement(trimmed)
             || QueryExecutor::is_plain_commit(trimmed)
             || QueryExecutor::is_plain_rollback(trimmed)
             || Self::is_transaction_first_statement(trimmed)
+            // Oracle's own list of what a read-only transaction permits is
+            // SELECT (without FOR UPDATE), LOCK TABLE, SET ROLE, ALTER SESSION,
+            // ALTER SYSTEM, COMMIT, ROLLBACK and SAVEPOINT. This gate exists to
+            // refuse WRITES the server would let through once the user's own
+            // COMMIT ends the read-only transaction — not to refuse what the
+            // server itself allows and no write can hide behind. Refusing these
+            // three read as arbitrary next to the `ALTER SESSION SET
+            // CURRENT_SCHEMA` the app issues on this very session and the
+            // ISOLATION_LEVEL form it already allows.
+            //
+            // `ALTER SYSTEM` is deliberately NOT on this list even though
+            // Oracle permits it: the pin is the user saying "this tab changes
+            // nothing", and reconfiguring the instance is a change whatever the
+            // transaction semantics say.
+            || crate::sql_text::starts_with_keyword_token(&upper, "LOCK TABLE")
+            || crate::sql_text::starts_with_keyword_token(&upper, "SET ROLE")
+            || crate::sql_text::starts_with_keyword_token(&upper, "ALTER SESSION")
             || matches!(
                 crate::db::session_policy::classify_sql_for_db_type(
                     crate::db::DatabaseType::Oracle,
@@ -21968,6 +22349,16 @@ impl SqlEditorWidget {
             may_have_uncommitted_work: ((!clears_prior_transaction || statement_failed)
                 && prior_state.may_have_uncommitted_work())
                 || statement_effects.starts_transaction_state()
+                // Auto-commit does not answer for a statement that can open a
+                // transaction the app never saw start. A stored procedure may
+                // run `START TRANSACTION` and return without committing, and
+                // the server keeps that transaction across the CALL boundary
+                // with auto-commit suspended for it, exactly like an explicit
+                // one the user typed. Reading the server directly is not an
+                // option here — this shortcut exists because a probe would
+                // clobber the ROW_COUNT()/SHOW WARNINGS the statement just
+                // produced — so the answer has to be the conservative one.
+                || statement_effects.may_open_untracked_transaction()
                 || (!auto_commit && statement_effects.may_leave_uncommitted_work()),
             used_fallback: false,
         })
@@ -22222,21 +22613,35 @@ impl SqlEditorWidget {
         cleanup: &mut QueryExecutionCleanupGuard,
         conn: &Connection,
         application: OracleTransactionModeApplication,
-    ) -> Result<(), String> {
+    ) -> Result<OracleTransactionModeApplied, String> {
         let post_processor =
             crate::db::statement_session_post_processor_for(crate::db::DatabaseType::Oracle);
         for (statement, restores_session_default) in application.statements()? {
-            conn.execute(&statement, &[])
-                .map_err(|err| format!("Failed to apply transaction mode: {err}"))?;
-            if restores_session_default {
-                continue;
+            // Recorded BEFORE the round trip, not after it. `SET TRANSACTION`
+            // opens a transaction that `DBMS_TRANSACTION.LOCAL_TRANSACTION_ID`
+            // cannot see when it carries no work, so a cancel that lands
+            // between the server running this statement and the app reading the
+            // answer would leave an open transaction nothing knows about, and
+            // every later batch would fail with ORA-01453. Recording first is
+            // true whatever the outcome: it ran (transaction open), or it was
+            // refused because one was open already, or it may have run.
+            if !restores_session_default {
+                Self::apply_oracle_db_statement_effects(
+                    cleanup,
+                    post_processor.effects_for_sql(&statement),
+                );
             }
-            Self::apply_oracle_db_statement_effects(
-                cleanup,
-                post_processor.effects_for_sql(&statement),
-            );
+            if let Err(err) = conn.execute(&statement, &[]) {
+                let message = err.to_string();
+                if crate::db::oracle_error_says_transaction_still_open(&message) {
+                    return Ok(OracleTransactionModeApplied::TransactionStillOpen);
+                }
+                return Ok(OracleTransactionModeApplied::Failed(format!(
+                    "Failed to apply transaction mode: {message}"
+                )));
+            }
         }
-        Ok(())
+        Ok(OracleTransactionModeApplied::Yes)
     }
 
     fn record_applied_oracle_transaction_mode_effects(
@@ -22549,7 +22954,7 @@ impl SqlEditorWidget {
                     db_activity,
                     connection_generation,
                     false,
-                    false,
+                    MysqlSessionDatabaseUpdate::None,
                     retained_state.requires_physical_session_preservation(),
                     retained_state
                         .session_residue_state()
@@ -22722,7 +23127,7 @@ impl SqlEditorWidget {
         }
     }
 
-    fn oracle_error_message_has_connection_error(message: &str) -> bool {
+    pub(super) fn oracle_error_message_has_connection_error(message: &str) -> bool {
         let trimmed = message.trim();
         if crate::db::session_policy::message_has_fatal_connection_marker(trimmed) {
             return true;
@@ -22785,16 +23190,26 @@ impl SqlEditorWidget {
     }
 
     pub(super) fn oracle_error_message_allows_session_reuse(message: &str) -> bool {
-        let trimmed = message.trim();
-        let lower = trimmed.to_ascii_lowercase();
-        if trimmed == Self::cancel_message()
-            || lower.contains("ora-01013")
-            || Self::timeout_error_message_contains_timeout_signal(trimmed)
-        {
+        if Self::oracle_error_message_is_interrupted(message) {
             return false;
         }
 
-        !Self::oracle_error_message_has_connection_error(trimmed)
+        !Self::oracle_error_message_has_connection_error(message.trim())
+    }
+
+    /// Whether the statement was stopped rather than answered: a cancel, an
+    /// `ORA-01013`, or a call timeout.
+    ///
+    /// What the SERVER did with it is unknown from here — it may have finished
+    /// the work and lost the race to the interrupt. Callers that only ask "may
+    /// this session be used again?" treat that as no; callers deciding the fate
+    /// of a TRANSACTION have to treat it as "unknown", which is not the same
+    /// answer.
+    pub(super) fn oracle_error_message_is_interrupted(message: &str) -> bool {
+        let trimmed = message.trim();
+        trimmed == Self::cancel_message()
+            || trimmed.to_ascii_lowercase().contains("ora-01013")
+            || Self::timeout_error_message_contains_timeout_signal(trimmed)
     }
 
     fn oracle_batch_statement_error_requires_stop(
@@ -23054,6 +23469,30 @@ impl SqlEditorWidget {
     /// the user had not committed — in silence, which is exactly what
     /// `RETAINED_SESSION_LOST_WITH_WORK` exists to prevent. Handing it back
     /// through the one door closes it deliberately and says so.
+    /// Drop the tab's retained session on the way out of a connection, through
+    /// the door that names the execution it belongs to, and tell the user when
+    /// the session that went away was carrying work.
+    ///
+    /// Every backend's script CONNECT / DISCONNECT and every "this batch ended
+    /// disconnected" path answers here, so none of them can grow its own rule
+    /// about whose session it is allowed to close.
+    fn clear_worker_session_for_batch(
+        pooled_db_session: &SharedDbSessionLease,
+        sender: Option<&QueryProgressSender>,
+        owner: &crate::db::SessionHandBackOwner,
+        log_context: &str,
+    ) {
+        if let crate::db::WorkerSlotClear::Cleared { carried_work: true } =
+            pooled_db_session.clear_worker_session(owner, log_context)
+        {
+            Self::report_retained_session_lost_with_work(
+                sender,
+                RetainedSessionState::from_transaction_state(TransactionSessionState::MaybeDirty),
+                log_context,
+            );
+        }
+    }
+
     fn abandon_oracle_thin_batch_session(
         pooled_db_session: &SharedDbSessionLease,
         sender: &QueryProgressSender,
@@ -24447,13 +24886,53 @@ impl SqlEditorWidget {
         .is_some_and(|dropped| dropped == stored)
     }
 
+    /// Which databases a successful statement moved, asked once so the read
+    /// and the record cannot answer differently.
+    ///
+    /// Scope is per TAB. A tab with a scope of its own can drop the database it
+    /// is SITTING in while the connection's own database is untouched, and the
+    /// two answers are not interchangeable: recording the session's move on the
+    /// connection clears the default every scope-less tab follows, which then
+    /// gets "No database selected" for a database nobody dropped; recording the
+    /// connection's move only on the session leaves the lease naming a database
+    /// the server has detached it from.
+    fn mysql_session_database_update_after_statement(
+        db_type: crate::db::DatabaseType,
+        statement_sql: &str,
+        session_scope: Option<&str>,
+        stored_current_database: &str,
+        moved_this_session: bool,
+    ) -> MysqlSessionDatabaseUpdate {
+        if Self::mysql_statement_drops_current_database(
+            db_type,
+            statement_sql,
+            stored_current_database,
+        ) {
+            return MysqlSessionDatabaseUpdate::SessionAndConnection;
+        }
+        let session_database = session_scope
+            .map(str::trim)
+            .filter(|scope| !scope.is_empty())
+            .unwrap_or(stored_current_database);
+        if moved_this_session
+            || Self::mysql_statement_drops_current_database(
+                db_type,
+                statement_sql,
+                session_database,
+            )
+        {
+            return MysqlSessionDatabaseUpdate::Session;
+        }
+        MysqlSessionDatabaseUpdate::None
+    }
+
     fn sync_mysql_pooled_session_info(
         shared_connection: &crate::db::SharedConnection,
         conn: &mut mysql::PooledConn,
         db_activity: &str,
         connection_generation: u64,
         refresh_encoding: bool,
-        allow_global_database_update: bool,
+        session_database_update: MysqlSessionDatabaseUpdate,
         preserve_existing_session_state: bool,
         preserve_statement_diagnostics: bool,
         execution_scope: Option<&str>,
@@ -24487,21 +24966,28 @@ impl SqlEditorWidget {
         let db_type = conn_guard.db_type();
         let display_name = db_type.display_name();
 
-        if allow_global_database_update {
+        if session_database_update.reads_session_database() {
             let refresh_encoding = refresh_encoding
                 && Self::mysql_should_refresh_connection_encoding(preserve_existing_session_state);
             // A `USE` moved THIS TAB's session; the connection's own database
             // is untouched, so read the session back (refreshing its
-            // encoding) and let that answer stand for everything downstream.
-            // An EMPTY answer is the one event that really is the
-            // connection's — its database is gone — and only then is the
-            // connection's own name rewritten.
+            // encoding) and let that answer stand for this tab.
             let sync_result =
                 conn_guard.read_mysql_session_current_database(conn, refresh_encoding);
 
             match sync_result {
                 Ok(session_database) => {
-                    if session_database.is_empty() {
+                    // An empty answer means the server detached this SESSION
+                    // from its database. Whose database that was is decided
+                    // where the statement was read, not here: a tab with a
+                    // scope of its own can drop the database it is sitting in
+                    // while the connection's own database is untouched, and
+                    // clearing the connection then breaks every OTHER tab that
+                    // was following it ("No database selected" on a database
+                    // nobody dropped).
+                    if session_database.is_empty()
+                        && session_database_update.clears_connection_database()
+                    {
                         if let Err(err) = conn_guard
                             .sync_mysql_current_database_name_from_known_name(&session_database)
                         {
@@ -25322,7 +25808,7 @@ impl SqlEditorWidget {
                     log_context,
                     connection_generation,
                     false,
-                    false,
+                    MysqlSessionDatabaseUpdate::None,
                     prior_retained_state.requires_physical_session_preservation(),
                     prior_retained_state
                         .session_residue_state()
@@ -25480,25 +25966,30 @@ impl SqlEditorWidget {
         let statement_failed = matches!(result, Ok(Err(_)));
         let action_released_physical_session =
             matches!(&result, Ok(Ok(_))) && statement_effects.releases_physical_session();
-        // Against the database this SESSION is in, not the connection's stored
-        // name: a tab with a scope of its own can drop the database it is
-        // sitting in, and asking the connection would answer about a database
-        // nobody dropped -- leaving the lease naming a database the server has
-        // just detached the session from.
-        let statement_dropped_current_database = matches!(&result, Ok(Ok(_)))
-            && Self::mysql_statement_drops_current_database(
-                db_type,
-                statement_sql,
-                session_scope.as_deref().unwrap_or(&stored_current_database),
-            );
+        // Asked twice, because the two databases are not the same thing and
+        // only one of them belongs to every other tab. A tab with a scope of
+        // its own can drop the database it is SITTING in while the connection's
+        // own database is untouched; asking only the connection would leave the
+        // lease naming a database the server has just detached the session
+        // from, and asking only the session would let one tab's DROP clear the
+        // default every scope-less tab follows.
+        let statement_succeeded = matches!(&result, Ok(Ok(_)));
         // USE statements require the post-success scope sync to land; a
         // DROP DATABASE of the current database also needs the stored name
         // cleared, but losing that sync is recoverable (the missing-database
         // fallback handles it), so it must not fail the statement.
-        let use_statement_scope_sync_required =
-            refresh_encoding_after && matches!(&result, Ok(Ok(_)));
-        let allow_global_database_update =
-            use_statement_scope_sync_required || statement_dropped_current_database;
+        let use_statement_scope_sync_required = refresh_encoding_after && statement_succeeded;
+        let session_database_update = if statement_succeeded {
+            Self::mysql_session_database_update_after_statement(
+                db_type,
+                statement_sql,
+                session_scope.as_deref(),
+                &stored_current_database,
+                use_statement_scope_sync_required,
+            )
+        } else {
+            MysqlSessionDatabaseUpdate::None
+        };
         let interruption_requires_transaction_decision =
             crate::db::statement_interruption_requires_transaction_decision(
                 crate::db::StatementInterruption {
@@ -25547,7 +26038,7 @@ impl SqlEditorWidget {
                     log_context,
                     connection_generation,
                     refresh_encoding_after,
-                    allow_global_database_update,
+                    session_database_update,
                     preserve_session_state_after_action,
                     matches!(&result, Ok(Ok(_)))
                         && statement_effects.preserves_statement_diagnostics(),
@@ -25662,16 +26153,17 @@ impl SqlEditorWidget {
         } else {
             crate::db::RetainedSessionOutcome::DiscardPhysical
         };
-        let retain_pool_context_epoch = if should_retain_session && allow_global_database_update {
-            Self::pool_context_epoch_for_generation(
-                shared_connection,
-                connection_generation,
-                log_context,
-            )
-            .unwrap_or(pool_context_epoch)
-        } else {
-            pool_context_epoch
-        };
+        let retain_pool_context_epoch =
+            if should_retain_session && session_database_update.reads_session_database() {
+                Self::pool_context_epoch_for_generation(
+                    shared_connection,
+                    connection_generation,
+                    log_context,
+                )
+                .unwrap_or(pool_context_epoch)
+            } else {
+                pool_context_epoch
+            };
         // A `USE` moves the tab's session out from under the scope this action
         // was prepared in, and the sync above is the only thing that saw where
         // it landed. Record that, not the database the statement started in.
@@ -27962,12 +28454,21 @@ mod query_execution_cleanup_tests {
             crate::db::DatabaseType::MariaDB,
         ] {
             let post_processor = crate::db::statement_session_post_processor_for(db_type);
-            for (sql, manual_commit_is_dirty) in [
-                ("UPDATE t SET value = value + 1", true),
-                ("SELECT SQL_CALC_FOUND_ROWS id FROM t LIMIT 1", false),
-                ("CALL p_capture_warning()", true),
-                ("SHOW COUNT(*) WARNINGS", false),
-                ("SHOW WARNINGS LIMIT 1", false),
+            // INVERTED for `CALL` (was: "auto-commit statement should remain
+            // clean"). Auto-commit does not answer for a statement the app
+            // cannot see into: a procedure may run `START TRANSACTION` and
+            // return without committing, and the server then keeps that
+            // transaction open across the CALL boundary with autocommit
+            // suspended. Filing the session clean made the tab report
+            // "Auto-commit applied" over an open transaction and let an
+            // interrupted batch -- which has no probe to correct it -- discard
+            // the session, and the user's rows with it, without a prompt.
+            for (sql, auto_commit_is_dirty, manual_commit_is_dirty) in [
+                ("UPDATE t SET value = value + 1", false, true),
+                ("SELECT SQL_CALC_FOUND_ROWS id FROM t LIMIT 1", false, false),
+                ("CALL p_capture_warning()", true, true),
+                ("SHOW COUNT(*) WARNINGS", false, false),
+                ("SHOW WARNINGS LIMIT 1", false, false),
             ] {
                 let effects = post_processor.effects_for_sql(sql);
                 let auto_commit_probe =
@@ -27978,9 +28479,9 @@ mod query_execution_cleanup_tests {
                         false,
                     )
                     .unwrap_or_else(|| panic!("{db_type} should infer state after `{sql}`"));
-                assert!(
-                    !auto_commit_probe.may_have_uncommitted_work,
-                    "{db_type} auto-commit statement should remain clean after `{sql}`"
+                assert_eq!(
+                    auto_commit_probe.may_have_uncommitted_work, auto_commit_is_dirty,
+                    "{db_type} auto-commit state after `{sql}`"
                 );
 
                 let manual_commit_probe =
@@ -29558,6 +30059,152 @@ mod query_execution_cleanup_tests {
     }
 
     #[test]
+    fn auto_commit_answers_for_every_statement_except_the_ones_that_can_open_a_transaction() {
+        // The narrow half of the CALL rule. A stored PROCEDURE body may run
+        // `START TRANSACTION` and return without committing, so auto-commit
+        // does not answer for it -- but a `DO` can only call stored FUNCTIONS,
+        // where MySQL forbids transaction control, and `HANDLER OPEN` opens no
+        // transaction at all. Being conservative about those would prompt the
+        // user to resolve transactions that cannot exist.
+        for db_type in [DatabaseType::MySQL, DatabaseType::MariaDB] {
+            let post_processor = crate::db::statement_session_post_processor_for(db_type);
+            for (sql, opens_untracked_transaction) in [
+                ("CALL p_do_work()", true),
+                ("EXECUTE stmt", true),
+                ("BEGIN NOT ATOMIC SELECT 1; END", true),
+                ("DO SLEEP(1)", false),
+                ("HANDLER t OPEN", false),
+                ("INSERT INTO t VALUES (1)", false),
+                ("SELECT 1", false),
+            ] {
+                let probe = SqlEditorWidget::mysql_statement_diagnostic_safe_transaction_probe(
+                    RetainedSessionState::default(),
+                    post_processor.effects_for_sql(sql),
+                    true,
+                    false,
+                );
+                if let Some(probe) = probe {
+                    assert_eq!(
+                        probe.may_have_uncommitted_work, opens_untracked_transaction,
+                        "{db_type} auto-commit state after `{sql}`"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn dropping_the_database_a_scoped_tab_sits_in_leaves_the_connections_own_alone() {
+        use super::MysqlSessionDatabaseUpdate;
+
+        for db_type in [DatabaseType::MySQL, DatabaseType::MariaDB] {
+            // A tab scoped to `db1` drops it. The connection still has `dbX`,
+            // and every scope-less tab is still following it -- clearing it
+            // here is what used to answer them "No database selected" for a
+            // database nobody dropped.
+            assert_eq!(
+                SqlEditorWidget::mysql_session_database_update_after_statement(
+                    db_type,
+                    "DROP DATABASE db1",
+                    Some("db1"),
+                    "dbX",
+                    false,
+                ),
+                MysqlSessionDatabaseUpdate::Session,
+                "{db_type}: only the tab's own session lost its database"
+            );
+            // The connection's own database really is gone: its stored name
+            // has to go with it.
+            assert_eq!(
+                SqlEditorWidget::mysql_session_database_update_after_statement(
+                    db_type,
+                    "DROP DATABASE dbX",
+                    Some("dbX"),
+                    "dbX",
+                    false,
+                ),
+                MysqlSessionDatabaseUpdate::SessionAndConnection,
+                "{db_type}: the connection's database was dropped"
+            );
+            // ... including when the tab that dropped it was scoped elsewhere.
+            assert_eq!(
+                SqlEditorWidget::mysql_session_database_update_after_statement(
+                    db_type,
+                    "DROP DATABASE dbX",
+                    Some("db1"),
+                    "dbX",
+                    false,
+                ),
+                MysqlSessionDatabaseUpdate::SessionAndConnection,
+                "{db_type}: whose session ran it does not change whose database it was"
+            );
+            assert_eq!(
+                SqlEditorWidget::mysql_session_database_update_after_statement(
+                    db_type,
+                    "SELECT 1",
+                    Some("db1"),
+                    "dbX",
+                    false,
+                ),
+                MysqlSessionDatabaseUpdate::None
+            );
+            assert_eq!(
+                SqlEditorWidget::mysql_session_database_update_after_statement(
+                    db_type,
+                    "USE db2",
+                    Some("db1"),
+                    "dbX",
+                    true,
+                ),
+                MysqlSessionDatabaseUpdate::Session,
+                "{db_type}: a USE moves this tab's session and nothing else"
+            );
+        }
+    }
+
+    #[test]
+    fn a_connect_states_the_pinned_mode_unless_the_next_statement_opens_its_own_transaction() {
+        let frame = |items: Vec<ScriptItem>, index: usize| ScriptExecutionFrame {
+            items,
+            index,
+            base_dir: std::path::PathBuf::from("."),
+            source_path: None,
+        };
+        // The statement after the CONNECT is the user's own transaction-first
+        // one: stating the pin here fails THEIRS with ORA-01453, so the loop
+        // states it at the end of their transaction instead.
+        let frames = vec![frame(
+            vec![
+                ScriptItem::ToolCommand(crate::db::ToolCommand::ShowAll),
+                ScriptItem::Statement("SET TRANSACTION READ ONLY".to_string()),
+            ],
+            1,
+        )];
+        assert!(SqlEditorWidget::next_batch_statement_requires_transaction_first(&frames));
+        // An ordinary statement follows: state the pin now, as the batch-start
+        // injection would have.
+        let frames = vec![frame(
+            vec![
+                ScriptItem::ToolCommand(crate::db::ToolCommand::ShowAll),
+                ScriptItem::Statement("SELECT 1 FROM dual".to_string()),
+            ],
+            1,
+        )];
+        assert!(!SqlEditorWidget::next_batch_statement_requires_transaction_first(&frames));
+        // Nothing left to run in this frame: the outer one answers.
+        let frames = vec![
+            frame(
+                vec![ScriptItem::Statement(
+                    "ALTER SESSION SET ISOLATION_LEVEL = SERIALIZABLE".to_string(),
+                )],
+                0,
+            ),
+            frame(vec![], 0),
+        ];
+        assert!(SqlEditorWidget::next_batch_statement_requires_transaction_first(&frames));
+    }
+
+    #[test]
     fn oracle_read_only_statement_guard_allows_queries_and_transaction_control() {
         for sql in [
             "select * from dual",
@@ -29571,6 +30218,15 @@ mod query_execution_cleanup_tests {
             "set transaction read only",
             "set constraints all deferred",
             "alter session set isolation_level = read committed",
+            // Oracle's own list of what a read-only transaction permits, which
+            // the gate used to refuse: the pin exists to stop WRITES the server
+            // would let through once the user's COMMIT ends the transaction,
+            // not to refuse what the server itself allows. Refusing these read
+            // as arbitrary next to the `ALTER SESSION SET CURRENT_SCHEMA` the
+            // app issues on that very session.
+            "lock table t in exclusive mode",
+            "set role dba",
+            "alter session set nls_date_format = 'YYYY-MM-DD'",
         ] {
             assert!(
                 SqlEditorWidget::oracle_read_only_allows_statement(sql),
@@ -29588,9 +30244,12 @@ mod query_execution_cleanup_tests {
             "merge into t using dual on (1 = 1) when matched then update set id = 1",
             "create table t (id number)",
             "truncate table t",
-            "lock table t in exclusive mode",
             "analyze table emp compute statistics",
             "audit select table",
+            // Permitted by Oracle inside a read-only transaction, refused here
+            // on purpose: the pin is the user saying this tab changes nothing,
+            // and reconfiguring the instance is a change.
+            "alter system flush shared_pool",
             "begin insert into t values (1); end;",
             "call p_write_data()",
         ] {

@@ -2222,6 +2222,23 @@ impl DbSessionLease {
     /// after `reset_before_reuse`, so without this the whole UI waits forever
     /// with no cancel handle. Same reason the close-path commit/rollback are
     /// wrapped.
+    /// Whether this session can still be spoken to, asked of the SESSION
+    /// rather than guessed from an error message.
+    ///
+    /// The two questions an error raises are different: "what happened to the
+    /// statement?" and "is this connection still good?". A call that was
+    /// cancelled or timed out answers the first with "unknown" — and on the
+    /// thin driver it may also have left the wire mid-message, which is the
+    /// only thing that makes the session itself unusable. The OCI driver's
+    /// `ORA-01013` leaves a healthy session, and a connection that really died
+    /// says so in the error text every caller checks.
+    pub fn session_is_usable(&self) -> bool {
+        match self {
+            DbSessionLease::Oracle(_) | DbSessionLease::MySQL { .. } => true,
+            DbSessionLease::OracleThin(conn) => !conn.is_broken(),
+        }
+    }
+
     pub fn apply_scope(
         &mut self,
         db_type: DatabaseType,
@@ -2344,6 +2361,14 @@ impl TakenDbSessionLease {
                 Some(activity.attach_canceler(session_lease_canceler(lease, connection_info)));
         }
         self
+    }
+
+    /// Whether the session this lease holds can still be spoken to. See
+    /// [`DbSessionLease::session_is_usable`].
+    pub fn session_is_usable(&self) -> bool {
+        self.lease
+            .as_ref()
+            .is_some_and(DbSessionLease::session_is_usable)
     }
 
     pub fn retained_state(&self) -> RetainedSessionState {
@@ -2610,8 +2635,9 @@ impl SessionHandBackOwner {
 pub enum SessionHandBack {
     /// It reached the tab's slot, or the session was discarded as asked.
     /// `stored` is false when the slot refused it (another session is already
-    /// retained there, or the tab is closed).
-    Applied { stored: bool },
+    /// retained there, or the tab is closed); `discarded_work` says the session
+    /// the slot refused was carrying uncommitted work when it was closed.
+    Applied { stored: bool, discarded_work: bool },
     /// The tab had moved on to a newer execution, so the session was closed
     /// instead. `carried_work` is what the caller must report to the user.
     Abandoned { carried_work: bool },
@@ -2619,12 +2645,38 @@ pub enum SessionHandBack {
 
 impl SessionHandBack {
     pub fn stored(self) -> bool {
-        matches!(self, Self::Applied { stored: true })
+        matches!(self, Self::Applied { stored: true, .. })
     }
 
-    pub fn abandoned_work(self) -> bool {
-        matches!(self, Self::Abandoned { carried_work: true })
+    /// Whether a session carrying uncommitted work was closed instead of
+    /// retained. Every way that can happen answers here, so the caller reports
+    /// the loss once — a session with work never disappears in silence.
+    pub fn lost_work(self) -> bool {
+        matches!(
+            self,
+            Self::Abandoned { carried_work: true }
+                | Self::Applied {
+                    discarded_work: true,
+                    ..
+                }
+        )
     }
+}
+
+/// What a worker's attempt to clear the tab's session slot did.
+///
+/// The discard direction of [`SharedDbSessionLease::hand_back_worker_session`]:
+/// a worker that is leaving the connection (script CONNECT / DISCONNECT, a
+/// batch that ended disconnected) drops whatever session the tab had for it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[must_use]
+pub enum WorkerSlotClear {
+    /// The slot is empty now. `carried_work` says whether the session that went
+    /// away may have held uncommitted work.
+    Cleared { carried_work: bool },
+    /// The tab has moved on to a newer execution, so the slot belongs to that
+    /// one and nothing was touched.
+    NotOurs,
 }
 
 fn retained_lease_conflict_resolution(
@@ -2974,13 +3026,13 @@ impl SharedDbSessionLease {
         log_context: &str,
         current_scope: Option<String>,
     ) -> SessionHandBack {
+        let carried_work = match disposition {
+            RetainedSessionDisposition::Retain(retained_state) => {
+                retained_state.may_have_uncommitted_work()
+            }
+            RetainedSessionDisposition::DiscardPhysical => false,
+        };
         if !owner.is_current() {
-            let carried_work = match disposition {
-                RetainedSessionDisposition::Retain(retained_state) => {
-                    retained_state.may_have_uncommitted_work()
-                }
-                RetainedSessionDisposition::DiscardPhysical => false,
-            };
             logging::log_warning(
                 log_context,
                 "Closing an abandoned batch's DB session: the tab has moved on to a newer execution",
@@ -2988,16 +3040,54 @@ impl SharedDbSessionLease {
             lease.discard_physical(log_context);
             return SessionHandBack::Abandoned { carried_work };
         }
+        let stored = self.apply_retained_session_disposition_with_scope(
+            connection_generation,
+            pool_context_epoch,
+            lease,
+            disposition,
+            log_context,
+            current_scope,
+        );
         SessionHandBack::Applied {
-            stored: self.apply_retained_session_disposition_with_scope(
-                connection_generation,
-                pool_context_epoch,
-                lease,
-                disposition,
-                log_context,
-                current_scope,
-            ),
+            stored,
+            // The slot can refuse a session it was asked to RETAIN — the tab
+            // closed while this batch ran, or another session got there first.
+            // The refusal closes it physically, so work it was carrying is
+            // gone and the user has to hear about it here too, not only on the
+            // abandoned path.
+            discarded_work: carried_work && !stored,
         }
+    }
+
+    /// The one door a WORKER clears the tab's session slot through.
+    ///
+    /// The discard twin of [`Self::hand_back_worker_session`], and it exists
+    /// for the same reason: a force-cancelled batch is ABANDONED, not joined,
+    /// so by the time it runs its script `DISCONNECT`/`CONNECT` cleanup — or
+    /// reaches the end of a batch that ended disconnected — the tab may already
+    /// have reconnected and filed a NEWER session in this slot. A bare
+    /// `clear()` takes whatever is in the slot now, so it would close the
+    /// user's just-typed work with no message at all.
+    pub fn clear_worker_session(
+        &self,
+        owner: &SessionHandBackOwner,
+        log_context: &str,
+    ) -> WorkerSlotClear {
+        if !owner.is_current() {
+            logging::log_warning(
+                log_context,
+                "Leaving the tab's DB session alone: an abandoned batch may not clear the slot a newer execution owns",
+            );
+            return WorkerSlotClear::NotOurs;
+        }
+        let lease_to_drop = { self.lock_inner().entry.take() };
+        let carried_work = lease_to_drop
+            .as_ref()
+            .is_some_and(|entry| entry.retained_state.may_have_uncommitted_work());
+        if let Some(entry) = lease_to_drop {
+            entry.discard_physical(log_context);
+        }
+        WorkerSlotClear::Cleared { carried_work }
     }
 
     pub fn apply_retained_session_disposition(
@@ -8366,27 +8456,73 @@ mod tests {
     }
 
     #[test]
-    fn an_abandoned_hand_back_reports_the_work_it_closes() {
+    fn every_hand_back_that_closes_work_reports_it() {
         // Losing a session is sometimes right; losing the work on it in
-        // silence never is.
+        // silence never is -- and the slot has TWO ways to close one: the tab
+        // moved on (abandoned), or the tab is gone and the slot refuses the
+        // session it was asked to retain.
         let carrying_work =
             RetainedSessionState::from_transaction_state(TransactionSessionState::MaybeDirty);
         assert!(
             SessionHandBack::Abandoned {
                 carried_work: carrying_work.may_have_uncommitted_work()
             }
-            .abandoned_work(),
+            .lost_work(),
             "an abandoned session that carried work must be reported"
         );
         assert!(
             !SessionHandBack::Abandoned {
                 carried_work: RetainedSessionState::default().may_have_uncommitted_work()
             }
-            .abandoned_work(),
+            .lost_work(),
             "a clean session going away is not the user's business"
         );
-        assert!(SessionHandBack::Applied { stored: true }.stored());
-        assert!(!SessionHandBack::Applied { stored: false }.stored());
+        assert!(
+            SessionHandBack::Applied {
+                stored: false,
+                discarded_work: true,
+            }
+            .lost_work(),
+            "a refused hand-back closes the session too, so its work is just as gone"
+        );
+        assert!(!SessionHandBack::Applied {
+            stored: true,
+            discarded_work: false,
+        }
+        .lost_work());
+        assert!(SessionHandBack::Applied {
+            stored: true,
+            discarded_work: false,
+        }
+        .stored());
+        assert!(!SessionHandBack::Applied {
+            stored: false,
+            discarded_work: false,
+        }
+        .stored());
+    }
+
+    #[test]
+    fn a_worker_may_not_clear_a_slot_its_tab_has_moved_on_from() {
+        // The discard twin of the hand-back door. A force-cancelled batch keeps
+        // running its script CONNECT/DISCONNECT cleanup after the tab has
+        // started -- and filed a session for -- a newer execution.
+        let lease = SharedDbSessionLease::default();
+        let current_operation_id = Arc::new(AtomicU64::new(7));
+        let stale = SessionHandBackOwner::for_operation(Some(&current_operation_id), 4);
+        let current = SessionHandBackOwner::for_operation(Some(&current_operation_id), 7);
+        assert_eq!(
+            lease.clear_worker_session(&stale, "test"),
+            WorkerSlotClear::NotOurs,
+            "an abandoned batch must leave the newer execution's slot alone"
+        );
+        assert_eq!(
+            lease.clear_worker_session(&current, "test"),
+            WorkerSlotClear::Cleared {
+                carried_work: false
+            },
+            "the execution the tab is on still clears its own slot"
+        );
     }
 
     #[test]

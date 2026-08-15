@@ -142,7 +142,11 @@ every batch — OCI through `sync_serveroutput_with_session`, Thin through
 ENABLE, so it is total in the same sense the isolation is. Thin used to state
 nothing, so `SET SERVEROUTPUT ON` silently stopped producing output there while
 it kept working on OCI. Neither injects it in front of the user's own
-transaction-first statement (it is PL/SQL: ORA-01453). Guard
+transaction-first statement (it is PL/SQL: ORA-01453) — and that is the ONLY
+question either of them asks. Folding in "does the tab have a mode pinned" meant
+a Serializable or Read only tab on OCI never had its setting stated at all:
+output vanished, and a tab that wanted none inherited another tab's enabled
+buffer through the pool. Guard
 `both_oracle_drivers_state_serveroutput_on_the_session_they_run_on`; live check
 `oracle_thin_serveroutput_reaches_the_session_this_batch_runs_on`.
 

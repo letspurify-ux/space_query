@@ -1088,7 +1088,16 @@ struct TransactionActionRequest<'a> {
 }
 
 trait TransactionActionBackend: Sync {
-    fn retained_scope_error_allows_session_reuse(&self, message: &str) -> bool;
+    /// Whether a failed scope apply leaves a session the tab may keep.
+    ///
+    /// `session_is_usable` is the DRIVER's answer about the physical session,
+    /// which no error text can give: a thin call that timed out may have left
+    /// the wire mid-message.
+    fn retained_scope_error_allows_session_reuse(
+        &self,
+        message: &str,
+        session_is_usable: bool,
+    ) -> bool;
 
     fn run_transaction_action(
         &self,
@@ -1200,6 +1209,7 @@ fn retained_session_disposition_after_transaction_action_success(
 fn retained_session_disposition_after_late_cancelled_transaction_action(
     prior_retained_state: RetainedSessionState,
     result: &Result<(), String>,
+    session_is_usable: bool,
 ) -> RetainedSessionDisposition {
     match result {
         Ok(()) => retained_session_disposition_after_transaction_action_success(
@@ -1207,6 +1217,28 @@ fn retained_session_disposition_after_late_cancelled_transaction_action(
         ),
         Err(message) if SqlEditorWidget::oracle_error_message_allows_session_reuse(message) => {
             RetainedSessionDisposition::Retain(prior_retained_state)
+        }
+        // A COMMIT or ROLLBACK that was cancelled or timed out is IN DOUBT: the
+        // server may have completed it, or may never have seen it. Throwing the
+        // session away resolves the doubt by destroying the transaction — the
+        // one outcome the user did not ask for, taken without telling them, on
+        // the very action they used to keep their work. Keep the session and
+        // say a decision is still required, so they can commit again.
+        //
+        // Only while the session can still be SPOKEN to. That is the driver's
+        // answer, not this message's: a thin call that timed out may have left
+        // the wire mid-message, and retaining that would hand the tab a session
+        // whose next answer cannot be trusted.
+        Err(message)
+            if session_is_usable
+                && prior_retained_state.may_have_uncommitted_work()
+                && SqlEditorWidget::oracle_error_message_is_interrupted(message)
+                && !SqlEditorWidget::oracle_error_message_has_connection_error(message.trim()) =>
+        {
+            RetainedSessionDisposition::Retain(
+                prior_retained_state
+                    .with_transaction_state(TransactionSessionState::DecisionRequired),
+            )
         }
         Err(_) => RetainedSessionDisposition::DiscardPhysical,
     }
@@ -1229,8 +1261,22 @@ fn transaction_action_backend_for(db_type: DatabaseType) -> &'static dyn Transac
 }
 
 impl TransactionActionBackend for OracleTransactionActionBackend {
-    fn retained_scope_error_allows_session_reuse(&self, message: &str) -> bool {
+    fn retained_scope_error_allows_session_reuse(
+        &self,
+        message: &str,
+        session_is_usable: bool,
+    ) -> bool {
+        // Wider than the statement rule on purpose. Moving a session to another
+        // schema is a request about WHERE the tab works, never about the fate
+        // of what it has open, and every executor asserts the scope again
+        // before each statement -- so a scope that did not land is repaired by
+        // the next run, while discarding the session rolls back a transaction
+        // the user never asked to end. An interrupted or timed-out apply
+        // therefore keeps the session, as long as it can still be spoken to.
         SqlEditorWidget::oracle_error_message_allows_session_reuse(message)
+            || (session_is_usable
+                && SqlEditorWidget::oracle_error_message_is_interrupted(message)
+                && !SqlEditorWidget::oracle_error_message_has_connection_error(message.trim()))
     }
 
     fn run_transaction_action(
@@ -1335,6 +1381,9 @@ impl TransactionActionBackend for OracleTransactionActionBackend {
                         retained_session_disposition_after_late_cancelled_transaction_action(
                             prior_retained_state,
                             &result,
+                            // The thin driver knows whether the interrupt left
+                            // the wire mid-message; no error text does.
+                            !thin_conn.is_broken(),
                         );
                     let _ = pooled_db_session.apply_retained_session_disposition_with_scope(
                         connection_generation,
@@ -1451,6 +1500,10 @@ impl TransactionActionBackend for OracleTransactionActionBackend {
             let disposition = retained_session_disposition_after_late_cancelled_transaction_action(
                 prior_retained_state,
                 &result,
+                // An OCI call that was cancelled or timed out leaves the
+                // session itself healthy (ORA-01013); a connection that really
+                // died is read out of the message by the rule itself.
+                true,
             );
             let _ = pooled_db_session.apply_retained_session_disposition_with_scope(
                 connection_generation,
@@ -1628,7 +1681,14 @@ impl TransactionActionBackend for OracleTransactionActionBackend {
 }
 
 impl TransactionActionBackend for MysqlTransactionActionBackend {
-    fn retained_scope_error_allows_session_reuse(&self, message: &str) -> bool {
+    fn retained_scope_error_allows_session_reuse(
+        &self,
+        message: &str,
+        _session_is_usable: bool,
+    ) -> bool {
+        // The MySQL family has no per-call timeout to be interrupted by: its
+        // sessions carry no socket read timeout by design, so there is no
+        // in-doubt apply to keep a session for.
         SqlEditorWidget::mysql_error_allows_session_reuse(message)
     }
 
@@ -3338,8 +3398,13 @@ impl SqlEditorWidget {
         Ok(self.release_pooled_db_session())
     }
 
-    fn retained_scope_error_allows_session_reuse(db_type: DatabaseType, message: &str) -> bool {
-        transaction_action_backend_for(db_type).retained_scope_error_allows_session_reuse(message)
+    fn retained_scope_error_allows_session_reuse(
+        db_type: DatabaseType,
+        message: &str,
+        session_is_usable: bool,
+    ) -> bool {
+        transaction_action_backend_for(db_type)
+            .retained_scope_error_allows_session_reuse(message, session_is_usable)
     }
 
     pub fn apply_current_scope_to_retained_session(
@@ -3423,14 +3488,32 @@ impl SqlEditorWidget {
                 RetainedSessionMutationOutcome::Applied
             }
             Err(message) => {
+                let session_is_usable = retained_session.session_is_usable();
                 if retained_state.requires_physical_session_preservation()
-                    && Self::retained_scope_error_allows_session_reuse(db_type, &message)
+                    && Self::retained_scope_error_allows_session_reuse(
+                        db_type,
+                        &message,
+                        session_is_usable,
+                    )
                 {
                     retained_session.restore();
                     RetainedSessionMutationOutcome::FailedRestored(message)
                 } else {
+                    let discarded_work = retained_state.may_have_uncommitted_work();
                     retained_session.discard();
-                    RetainedSessionMutationOutcome::FailedDiscarded(message)
+                    // Picking a schema in the object browser is not a request to
+                    // throw a transaction away. When the session really cannot
+                    // be kept, the user hears that the work went with it — the
+                    // same promise every other path that closes a work-carrying
+                    // session makes.
+                    RetainedSessionMutationOutcome::FailedDiscarded(if discarded_work {
+                        format!(
+                            "{message}\n{}",
+                            crate::db::query::result_messages::RETAINED_SESSION_LOST_WITH_WORK
+                        )
+                    } else {
+                        message
+                    })
                 }
             }
         }
@@ -6586,7 +6669,9 @@ mod transaction_action_tests {
         let success = Ok(());
 
         assert_eq!(
-            retained_session_disposition_after_late_cancelled_transaction_action(dirty, &success),
+            retained_session_disposition_after_late_cancelled_transaction_action(
+                dirty, &success, true
+            ),
             RetainedSessionDisposition::Retain(RetainedSessionState::from_transaction_state(
                 TransactionSessionState::Clean
             ))
@@ -6602,6 +6687,7 @@ mod transaction_action_tests {
             retained_session_disposition_after_late_cancelled_transaction_action(
                 dirty_with_session_residue,
                 &success,
+                true,
             ),
             RetainedSessionDisposition::Retain(
                 dirty_with_session_residue.with_transaction_state(TransactionSessionState::Clean)
@@ -6622,6 +6708,7 @@ mod transaction_action_tests {
             retained_session_disposition_after_late_cancelled_transaction_action(
                 prior,
                 &reusable_error,
+                true,
             ),
             RetainedSessionDisposition::Retain(prior)
         );
@@ -6629,21 +6716,80 @@ mod transaction_action_tests {
 
     #[test]
     fn late_cancelled_transaction_action_nonreusable_error_discards_physical_session() {
-        let prior =
-            RetainedSessionState::from_transaction_state(TransactionSessionState::DecisionRequired);
-
+        // A session with nothing to lose is thrown away as before...
+        let clean = RetainedSessionState::default();
         for message in [
             "ORA-01013: user requested cancel of current operation",
             "ORA-03114: not connected to ORACLE",
         ] {
-            let nonreusable_error = Err(message.to_string());
+            assert_eq!(
+                retained_session_disposition_after_late_cancelled_transaction_action(
+                    clean,
+                    &Err(message.to_string()),
+                    true,
+                ),
+                RetainedSessionDisposition::DiscardPhysical
+            );
+        }
 
+        // ...and so is one whose connection is gone: there is no session left
+        // to keep.
+        let prior =
+            RetainedSessionState::from_transaction_state(TransactionSessionState::DecisionRequired);
+        assert_eq!(
+            retained_session_disposition_after_late_cancelled_transaction_action(
+                prior,
+                &Err("ORA-03114: not connected to ORACLE".to_string()),
+                true,
+            ),
+            RetainedSessionDisposition::DiscardPhysical
+        );
+    }
+
+    #[test]
+    fn an_interrupted_action_on_a_broken_session_still_discards_it() {
+        // The limit of keeping an in-doubt transaction: a thin call that timed
+        // out may have left the wire mid-message, and the driver is the only
+        // one that knows. Retaining that would hand the tab a session whose
+        // next answer cannot be trusted.
+        let prior =
+            RetainedSessionState::from_transaction_state(TransactionSessionState::MaybeDirty);
+        assert_eq!(
+            retained_session_disposition_after_late_cancelled_transaction_action(
+                prior,
+                &Err("Query timed out".to_string()),
+                false,
+            ),
+            RetainedSessionDisposition::DiscardPhysical
+        );
+    }
+
+    /// INVERTED (was: an interrupted transaction action discards the session).
+    ///
+    /// A COMMIT or ROLLBACK that was cancelled or timed out is IN DOUBT -- the
+    /// server may have completed it, or may never have seen it. Discarding the
+    /// session resolves the doubt by destroying the transaction, which is the
+    /// one outcome the user did not ask for, taken silently on the very action
+    /// they used to keep their work. The session is kept and still says a
+    /// decision is required, so they can commit again.
+    #[test]
+    fn an_interrupted_transaction_action_keeps_the_work_it_cannot_account_for() {
+        let prior =
+            RetainedSessionState::from_transaction_state(TransactionSessionState::MaybeDirty);
+        for message in [
+            "ORA-01013: user requested cancel of current operation",
+            "Query timed out",
+        ] {
             assert_eq!(
                 retained_session_disposition_after_late_cancelled_transaction_action(
                     prior,
-                    &nonreusable_error,
+                    &Err(message.to_string()),
+                    true,
                 ),
-                RetainedSessionDisposition::DiscardPhysical
+                RetainedSessionDisposition::Retain(
+                    prior.with_transaction_state(TransactionSessionState::DecisionRequired)
+                ),
+                "an in-doubt `{message}` must not decide the transaction by destroying it"
             );
         }
     }
@@ -6772,11 +6918,13 @@ mod execution_state_tests {
     fn retained_scope_error_policy_discards_connection_errors() {
         assert!(!SqlEditorWidget::retained_scope_error_allows_session_reuse(
             crate::db::DatabaseType::MySQL,
-            "Error 2013: Lost connection to MySQL server during query"
+            "Error 2013: Lost connection to MySQL server during query",
+            true,
         ));
         assert!(!SqlEditorWidget::retained_scope_error_allows_session_reuse(
             crate::db::DatabaseType::Oracle,
-            "ORA-03114: not connected to ORACLE"
+            "ORA-03114: not connected to ORACLE",
+            true,
         ));
     }
 
@@ -6784,8 +6932,38 @@ mod execution_state_tests {
     fn retained_scope_error_policy_restores_reusable_errors() {
         assert!(SqlEditorWidget::retained_scope_error_allows_session_reuse(
             crate::db::DatabaseType::MySQL,
-            "Error 1049: Unknown database 'missing_db'"
+            "Error 1049: Unknown database 'missing_db'",
+            true,
         ));
+    }
+
+    #[test]
+    fn an_interrupted_scope_apply_keeps_a_session_that_can_still_be_used() {
+        // Picking a schema in the object browser is not a request to end a
+        // transaction. The scope is asserted again before every statement, so a
+        // move that did not land repairs itself -- but discarding the session
+        // rolls the tab's work back, on a gesture that was about WHERE the tab
+        // works.
+        for message in [
+            "ORA-01013: user requested cancel of current operation",
+            "Query timed out",
+        ] {
+            assert!(
+                SqlEditorWidget::retained_scope_error_allows_session_reuse(
+                    crate::db::DatabaseType::Oracle,
+                    message,
+                    true,
+                ),
+                "`{message}` on a usable session must keep the tab's work"
+            );
+            // Unless the driver says the session itself cannot be spoken to:
+            // a thin call that timed out may have left the wire mid-message.
+            assert!(!SqlEditorWidget::retained_scope_error_allows_session_reuse(
+                crate::db::DatabaseType::Oracle,
+                message,
+                false,
+            ));
+        }
     }
 
     #[test]

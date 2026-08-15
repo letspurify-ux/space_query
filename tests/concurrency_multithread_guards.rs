@@ -3315,9 +3315,25 @@ fn transaction_mode_state_has_a_single_source_of_truth() {
     let thin_body = &execution[thin_start..thin_end];
     assert!(
         thin_body.contains("transaction_mode_applied = false")
-            && thin_body.contains("!retained_state.may_have_uncommitted_work()")
+            && thin_body.contains("!transaction_open")
             && thin_body.contains("is_transaction_first_statement("),
         "the thin batch must re-apply the tab's transaction mode when the batch's own transaction ends, and yield to a transaction-first statement"
+    );
+    // And "is a transaction open" is asked of the SERVER once the tracked
+    // answer stops being knowledge. A PL/SQL block or CALL that commits
+    // internally ends the transaction the mode was attached to and nothing else
+    // notices, so both drivers ask through the same predicate -- only the
+    // answer is driver-specific (thin reads the wire flag it already has, OCI
+    // pays for a probe).
+    let thin_body_flat = thin_body.split_whitespace().collect::<Vec<_>>().join(" ");
+    assert!(
+        thin_body_flat.contains("oracle_transaction_boundary .needs_server_answer(")
+            || thin_body_flat.contains("oracle_transaction_boundary.needs_server_answer("),
+        "the thin re-apply must ask the shared predicate whether the tracked answer is a guess"
+    );
+    assert!(
+        thin_body.contains("conn.transaction_in_progress()"),
+        "and answer it from the wire flag the protocol already carries"
     );
     // The OCI batch runs inside the shared execution worker rather than a
     // function of its own, so anchor on the re-apply itself.
@@ -3329,11 +3345,32 @@ fn transaction_mode_state_has_a_single_source_of_truth() {
     let oci_reapply = execution
         .find("cleanup.oracle_pooled_session_transaction_possibly_ended()")
         .expect("the OCI batch must re-apply the transaction mode at the next transaction");
-    let oci_reapply_window = &execution[oci_reapply.saturating_sub(400)..oci_reapply + 900];
+    let oci_reapply_window = slice_from(&execution, oci_reapply.saturating_sub(400), 1900);
     assert!(
         oci_reapply_window.contains("!active_transaction_mode.is_default()")
             && oci_reapply_window.contains("is_transaction_first_statement("),
         "the OCI re-apply must be limited to a non-default mode and yield to a transaction-first statement"
+    );
+    let oci_reapply_flat = oci_reapply_window
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    assert!(
+        oci_reapply_flat.contains("oracle_transaction_boundary .needs_server_answer(")
+            || oci_reapply_flat.contains("oracle_transaction_boundary.needs_server_answer("),
+        "the OCI re-apply must ask the same shared predicate as the thin loop"
+    );
+    assert!(
+        oci_reapply_window.contains("oracle_session_may_have_uncommitted_work("),
+        "and answer it with the probe, which is what that answer costs on OCI"
+    );
+    // A refusal with ORA-01453 says the transaction is still open, which is an
+    // answer and not a failure: the pin belongs to the next transaction, and
+    // the batch has no reason to stop. Reading it as an error stopped OCI on a
+    // script thin ran to the end.
+    assert!(
+        execution.contains("OracleTransactionModeApplied::TransactionStillOpen"),
+        "a boundary re-application refused because a transaction is open must not fail the batch"
     );
 
     // (13) The MySQL family acquires the tab's pooled session once per
@@ -4534,18 +4571,41 @@ fn both_oracle_drivers_state_serveroutput_on_the_session_they_run_on() {
             "the {driver} batch must state the tab's SERVEROUTPUT setting on the session it runs on"
         );
     }
-    // The yield, both sides: the call is guarded by the transaction-first check.
+    // The yield, at every sync site: the call is guarded by the
+    // transaction-first check -- and by THAT question only. Whether the tab has
+    // a mode PINNED is a different question with a different answer, and
+    // folding it in meant a Serializable or Read only tab never had its
+    // SERVEROUTPUT stated on the session it ran on: output vanished on OCI
+    // while the same script printed on thin, and a tab that wanted none
+    // inherited another tab's enabled buffer through the pool.
+    let sync_sites: Vec<usize> = execution
+        .match_indices("serveroutput_with_session(")
+        .map(|(index, _)| index)
+        .filter(|index| {
+            let head = &execution[index.saturating_sub(24)..*index];
+            head.contains("Self::sync_") || head.contains("SqlEditorWidget::sync_")
+        })
+        .collect();
     assert_eq!(
-        execution
-            .matches("if !requires_transaction_first_statement {")
-            .count()
-            + execution
-                .matches("if !Self::requires_transaction_first_statement(&items) {")
-                .count(),
-        3,
-        "each SERVEROUTPUT sync must yield to a batch that opens with the user's own \
-         transaction-first statement (OCI: batch start + after CONNECT, thin: batch start)"
+        sync_sites.len(),
+        4,
+        "both drivers state SERVEROUTPUT at batch start and again after a script CONNECT"
     );
+    for site in sync_sites {
+        let preceding = &execution[site.saturating_sub(600)..site];
+        assert!(
+            preceding.contains("if !explicit_transaction_first_statement {")
+                || preceding.contains("if !next_statement_opens_its_own_transaction {")
+                || preceding.contains("if !Self::requires_transaction_first_statement(&items) {")
+                || preceding.contains("if !Self::next_batch_statement_requires_transaction_first("),
+            "every SERVEROUTPUT sync must yield to the USER's own transaction-first statement"
+        );
+        assert!(
+            !preceding.contains("transaction_mode_requires_first_statement("),
+            "a mode pinned on the tab is not a reason to skip the app's own session \
+             statements: the pin is stated by the app itself, right above them"
+        );
+    }
     // Total in both directions, or a tab that wants no output inherits another
     // tab's enabled buffer through the pool.
     let thin_sync_start = execution
@@ -4879,43 +4939,58 @@ fn a_busy_connection_mutex_is_never_read_as_a_dead_connection() {
 }
 
 #[test]
-fn both_oracle_drivers_record_transaction_mode_effects_per_applied_statement() {
+fn both_oracle_drivers_record_transaction_mode_effects_before_the_round_trip() {
     // Recording only after the WHOLE list succeeded lost the effects of the
     // statements that did reach the server: a cancel between
     // `ALTER SESSION SET ISOLATION_LEVEL` and `SET TRANSACTION READ ONLY`
     // leaves an open read-only transaction that the OCI probe
     // (DBMS_TRANSACTION.LOCAL_TRANSACTION_ID) does not report, so the session
-    // filed clean and every later batch hit ORA-01453. The thin loop records
-    // per applied statement; OCI must too.
+    // filed clean and every later batch hit ORA-01453.
+    //
+    // Recording per applied statement was not enough either: the interrupt can
+    // land between the SERVER running the statement and the app reading the
+    // answer, and then nothing is recorded for a transaction that is open. The
+    // record therefore goes in BEFORE the round trip, where it is true whatever
+    // comes back -- it ran (transaction open), it was refused because one was
+    // open already (ORA-01453), or it may have run.
     let content = read_source("src/ui/sql_editor/execution.rs");
     let apply = content
         .find("fn apply_oracle_transaction_mode_statements(")
         .expect("the OCI transaction-mode apply should exist");
-    let apply_body = &content[apply..apply + 1400];
+    let apply_body = &content[apply..apply + 2200];
     assert!(
         apply_body.contains("cleanup: &mut QueryExecutionCleanupGuard"),
         "the OCI apply must own the recording, not leave it to its callers"
     );
+    let record = apply_body
+        .find("Self::apply_oracle_db_statement_effects(")
+        .expect("the OCI apply should record each statement's effects");
     let execute = apply_body
         .find("conn.execute(&statement, &[])")
         .expect("the OCI apply should execute each statement");
     assert!(
-        apply_body[execute..].contains("Self::apply_oracle_db_statement_effects("),
-        "each applied statement's effects must be recorded inside the loop, \
-         right after the statement lands"
+        record < execute,
+        "the OCI apply must record the effects BEFORE the statement is issued"
     );
 
     // Thin's twin keeps the same shape.
     let thin = content
-        .find("fn apply_oracle_thin_transaction_mode_for_execution(")
-        .expect("the thin transaction-mode apply should exist");
-    let thin_body = &content[thin..thin + 1200];
+        .find("for (tx_sql, restores_session_default) in transaction_mode_statements {")
+        .expect("the thin transaction-mode apply loop should exist");
+    let thin_body = &content[thin..thin + 2600];
+    let thin_record = thin_body
+        .find("Self::oracle_retained_state_after_statement_effects(")
+        .expect("the thin apply should record each statement's effects");
     let thin_execute = thin_body
-        .find("Self::execute_oracle_thin_statement(conn, &statement, false)?")
+        .find("Self::execute_oracle_thin_statement(conn, &tx_sql, false)")
         .expect("the thin apply should execute each statement");
     assert!(
-        thin_body[thin_execute..].contains("Self::oracle_retained_state_after_statement_effects("),
-        "the thin apply must keep recording per applied statement"
+        thin_record < thin_execute,
+        "the thin apply must record the effects BEFORE the statement is issued"
+    );
+    assert!(
+        thin_body.contains("oracle_error_says_transaction_still_open"),
+        "and read an ORA-01453 as `the transaction is still open`, not as a batch stopper"
     );
 }
 
@@ -5152,8 +5227,10 @@ fn every_backend_hands_a_batch_session_back_through_the_door_that_names_its_oper
         execution
             .matches("SqlEditorWidget::abandon_oracle_thin_batch_session(")
             .count(),
-        2,
-        "both superseded-operation returns in the thin worker hand the session back"
+        3,
+        "every thin worker return that still holds the session hands it back: the two \
+         superseded-operation returns and the failed call-timeout start (dropping the lease \
+         there returned it to the pool, where reset_before_reuse rolled the user's work back)"
     );
     // Oracle OCI: the cleanup guard's store.
     let applier = execution
@@ -5220,7 +5297,23 @@ fn losing_a_work_carrying_session_is_reported_not_swallowed() {
         content
             .matches("Self::report_retained_session_lost_with_work(")
             .count(),
-        2,
-        "both replace-and-reset sites (MySQL family and Oracle OCI) must report"
+        3,
+        "every site that loses a work-carrying session reports it: the two replace-and-reset \
+         sites (MySQL family, Oracle OCI) and the one door a worker clears the tab's slot \
+         through on the way out of a connection"
+    );
+    // The hand-back answer covers BOTH ways a session with work can be closed:
+    // the tab moved on (abandoned) and the slot refused to keep it (the tab is
+    // gone). Reporting only the first left a closed tab's rolled-back work
+    // announced nowhere but an info log.
+    let connection = read_source("src/db/connection.rs");
+    let lost = connection
+        .find("pub fn lost_work(self) -> bool {")
+        .expect("the hand-back answer should say whether work was lost");
+    let lost_body = &connection[lost..lost + 400];
+    assert!(
+        lost_body.contains("Abandoned { carried_work: true }")
+            && lost_body.contains("discarded_work: true"),
+        "both ways a work-carrying session is closed must answer `lost_work`"
     );
 }

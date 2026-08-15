@@ -2365,6 +2365,7 @@ impl ResultTabsWidget {
         column_kinds: &[SqlValueKind],
         null_text: &str,
         sql: &str,
+        source_scope: Option<&str>,
     ) {
         let status = self
             .data
@@ -2383,6 +2384,7 @@ impl ResultTabsWidget {
             // start_streaming clears the statement text this reinstalls.
             table.set_column_kinds(column_kinds);
             table.set_streaming_source_sql(sql);
+            table.set_source_scope(source_scope);
         }
         self.fire_on_change_callback();
     }
@@ -2394,9 +2396,28 @@ impl ResultTabsWidget {
         column_kinds: &[SqlValueKind],
         null_text: &str,
         sql: &str,
+        source_scope: Option<&str>,
     ) {
         if let Some(index) = self.result_tab_index_for_id(id) {
-            self.start_streaming(index, columns, column_kinds, null_text, sql);
+            self.start_streaming(index, columns, column_kinds, null_text, sql, source_scope);
+        }
+    }
+
+    /// Tell every grid in this tab where the tab is NOW.
+    ///
+    /// A ROWID edit session names its table exactly as the user's SELECT did,
+    /// so it stays the same table only while the tab stays in the scope those
+    /// rows were read in.
+    pub(crate) fn set_current_tab_scope(&mut self, scope: Option<&str>) {
+        let tables: Vec<_> = self
+            .data
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .iter()
+            .map(|tab| tab.table.clone())
+            .collect();
+        for table in tables {
+            table.set_current_tab_scope(scope);
         }
     }
 

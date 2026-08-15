@@ -121,6 +121,16 @@ MySQL/MariaDB current database are reapplied to new sessions. A running worker
 is not mutated during a scope change; the scope takes effect at the next safe
 acquisition or reuse point.
 
+The database a SESSION sits in and the database the CONNECTION hands to tabs
+that asked for none are two different values, and a statement that ends one does
+not end the other. A tab with a scope of its own can `DROP DATABASE` the one it
+is sitting in while the connection's own database is untouched, so the answer to
+"whose database just went away?" is decided where the statement is read
+(`mysql_session_database_update_after_statement`) and travels to the sync as a
+value. Recording the session's move on the connection cleared the default every
+scope-less tab followed, and those tabs then answered "No database selected" for
+a database nobody dropped.
+
 Every batch puts its session in the requesting tab's scope before it runs a
 statement — Oracle OCI through `apply_oracle_schema_before_pooled_action`,
 Oracle Thin through `apply_oracle_thin_schema_before_statement`, the MySQL
@@ -297,7 +307,18 @@ reconnect, disconnect, pool resize):
   session instead of filing it, because filing it costs the NEWER batch its own
   session (the lease's conflict resolution keeps whichever arrived first), and
   it answers whether the session it closed carried uncommitted work so the
-  caller can say so rather than lose it in silence.
+  caller can say so rather than lose it in silence — including when the SLOT
+  refused a session it was asked to retain because the tab had closed, which
+  closes it just as surely.
+- The DISCARD direction has the same door,
+  `SharedDbSessionLease::clear_worker_session`. A worker leaving a connection
+  (script `CONNECT`/`DISCONNECT`, or a batch that ended disconnected) drops
+  whatever session the tab had for it, and an abandoned batch reaching that code
+  after the tab reconnected would otherwise close the session the user is
+  working on now, with no message at all. The binding has the same rule:
+  `detach_if_revision` refuses to unbind a tab that has moved on, and a refused
+  detach keeps the STALE revision so the superseded batch's later `CONNECT`
+  cannot rebind the tab either.
 
 `assert_connection_lifecycle_closes_every_server_session` proves this against a
 live database by counting the server's own sessions (`information_schema.processlist`
