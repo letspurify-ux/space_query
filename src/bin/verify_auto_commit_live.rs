@@ -62,6 +62,13 @@
 //       tab already has changes nothing, so it must NOT be refused over
 //       uncommitted work and must not stop the script that contains it.
 //
+//   S27 (MySQL family) auto-commit does not answer for a statement whose body
+//       the app cannot read: a stored procedure may START TRANSACTION and
+//       return without committing. Driven both ways -- a batch that ENDS
+//       normally is corrected by the batch-end server probe, so only the
+//       INTERRUPTED half shows the mis-ledgering, where the cancelled batch
+//       filed the session Clean and discarded the procedure's rows with it.
+//
 // Usage: verify_auto_commit_live <thin|oci|mysql|mariadb|all>
 
 use fltk::{app, input::IntInput};
@@ -1598,6 +1605,106 @@ fn run_scenarios(target: Target, h: &mut Harness) -> Result<(), String> {
         );
         h.menu_auto_commit(false);
         h.run("ROLLBACK")?;
+    }
+
+    // ---- S27 (MySQL family): a CALL that opens a transaction is not clean ---
+    // Auto-commit does not answer for a statement whose body the app cannot
+    // read. A stored procedure may run `START TRANSACTION` and return without
+    // committing, and the server keeps that transaction open across the CALL
+    // boundary with auto-commit suspended for it. The tab used to file the
+    // session CLEAN, which meant an interrupted batch — whose path runs no
+    // server probe — discarded the session, and the procedure's rows with it,
+    // without ever offering the commit.
+    if !target.is_oracle() {
+        println!("  --- S27 a CALL that leaves a transaction open is tracked as work ---");
+        let before_call = h.select_v()?;
+        let _ = h.run("DROP PROCEDURE IF EXISTS sq_ac_open_txn");
+        h.run(
+            "CREATE PROCEDURE sq_ac_open_txn() BEGIN START TRANSACTION;              UPDATE SQ_AC_T SET V = V + 1; END",
+        )?;
+        let menu_outcome = h.menu_auto_commit(true);
+        let capture = h.run("CALL sq_ac_open_txn();")?;
+        let call_ok = capture.results.iter().all(|result| result.success);
+        h.check(
+            "S27 the CALL itself succeeds on an auto-commit tab",
+            call_ok,
+            format!(
+                "menu={menu_outcome:?}; results: {:?}",
+                capture
+                    .results
+                    .iter()
+                    .map(|r| (r.sql.clone(), r.success, r.message.clone()))
+                    .collect::<Vec<_>>()
+            ),
+        );
+        h.check(
+            "S27 the tab holds the transaction the procedure left open",
+            h.close_would_prompt(),
+            format!(
+                "retained state: {:?}",
+                h.editor
+                    .pooled_session_activity_snapshot()
+                    .map(|snap| snap.retained_state())
+            ),
+        );
+        // And it really is open: a rollback takes the procedure's write back,
+        // which auto-commit would have made impossible.
+        h.run("ROLLBACK")?;
+        let after_rollback = h.select_v()?;
+        h.check(
+            "S27 the rollback takes the procedure's write back",
+            after_rollback == before_call,
+            format!("expected {before_call}, got {after_rollback}"),
+        );
+
+        // The half that only an INTERRUPTED batch can show. A batch that ends
+        // normally asks the server before filing its session, and that probe
+        // hid the mis-ledgering; the interrupted path has no probe, so it acts
+        // on what the statements recorded. With the CALL filed CLEAN, the
+        // cancelled batch's session was DISCARDED — the procedure's rows going
+        // with it, without a prompt and without a message.
+        let before_interrupted = h.select_v()?;
+        h.start("CALL sq_ac_open_txn();\nSELECT SLEEP(20);");
+        h.pump_for(Duration::from_millis(3000));
+        h.editor.cancel_current();
+        let capture = h.finish_started()?;
+        let call_landed = capture
+            .results
+            .iter()
+            .any(|result| result.sql.to_uppercase().contains("CALL") && result.success);
+        h.check(
+            "S27 the CALL ran before the cancel",
+            call_landed,
+            format!(
+                "results: {:?}",
+                capture
+                    .results
+                    .iter()
+                    .map(|r| (r.sql.clone(), r.success))
+                    .collect::<Vec<_>>()
+            ),
+        );
+        h.check(
+            "S27 the cancelled batch keeps the transaction rather than discarding it",
+            h.close_would_prompt(),
+            format!(
+                "retained state after cancel: {:?}",
+                h.editor
+                    .pooled_session_activity_snapshot()
+                    .map(|snap| snap.retained_state())
+            ),
+        );
+        // The work is still there to resolve: the rollback can still reach it.
+        h.run("ROLLBACK")?;
+        let after_interrupted = h.select_v()?;
+        h.check(
+            "S27 the work the cancel left is still the user's to resolve",
+            after_interrupted == before_interrupted,
+            format!("expected {before_interrupted}, got {after_interrupted}"),
+        );
+
+        let _ = h.run("DROP PROCEDURE IF EXISTS sq_ac_open_txn");
+        let _ = h.menu_auto_commit(false);
     }
 
     // ---- S4 (Oracle): READ ONLY transaction vs piggybacked commit ---------

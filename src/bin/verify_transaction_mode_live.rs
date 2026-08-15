@@ -93,6 +93,16 @@
 //       every pool the connection installs, not only on the one built at
 //       connect.
 //
+//   S54 (Oracle) a DDL rejected at PARSE time commits nothing, so the
+//       transaction is still open: the boundary re-application of the pin is
+//       refused with ORA-01453, which is an answer and not a failure. The
+//       statement after it must still run under continue-on-error -- OCI used
+//       to stop the batch there while thin ran the same script to the end.
+//   S55 (Oracle) a script CONNECT states the tab's pin only when the statement
+//       that runs next is not the user's own transaction-first one. Stating it
+//       first opened a transaction that failed THEIRS with ORA-01453 and, with
+//       the session then reading dirty, the app's own guard refused it.
+//
 // Usage: verify_transaction_mode_live <thin|oci|mysql|mariadb|all>
 
 use fltk::{app, input::IntInput};
@@ -4073,6 +4083,131 @@ fn run_scenarios(target: Target, h: &mut Harness) -> Result<(), String> {
         let _ = h.run(&format!("DROP USER {scratch_scope} CASCADE"));
     }
 
+    // ---- S56 (MySQL family): one tab dropping ITS OWN scope's database leaves
+    // every other tab on the connection alone.
+    //
+    // The database a SESSION sits in and the database the CONNECTION hands to
+    // tabs that asked for none are two different values. Recording the
+    // session's loss on the connection cleared the default every scope-less tab
+    // was following, and those tabs then answered "No database selected" for a
+    // database nobody dropped.
+    if !target.is_oracle() {
+        println!("  --- S56 dropping a tab's own scope leaves the other tabs alone ---");
+        let scoped_scope = "SQ_TM_DROPOWN";
+        let mut other = attach_tab(Arc::clone(&h.shared));
+        // The neighbour follows the connection's own database, like a tab the
+        // user never picked a scope for.
+        other.editor.set_tab_scope(None);
+        let before = other.run("SELECT COUNT(*) AS C FROM SQ_TM_T")?;
+        h.check(
+            "S56 the neighbouring tab reads through the connection's database first",
+            before.results.iter().all(|result| result.success),
+            format!(
+                "results: {:?}",
+                before
+                    .results
+                    .iter()
+                    .map(|r| (r.sql.clone(), r.success, r.message.clone()))
+                    .collect::<Vec<_>>()
+            ),
+        );
+
+        let _ = h.run(&format!("DROP DATABASE IF EXISTS {scoped_scope}"));
+        h.run(&format!("CREATE DATABASE {scoped_scope}"))?;
+        let scope_outcome = h.change_tab_scope(Some(scoped_scope));
+        let dropped = h.run(&format!("DROP DATABASE {scoped_scope}"))?;
+        h.check(
+            "S56 the scoped tab drops the database it is sitting in",
+            dropped.results.iter().all(|result| result.success),
+            format!(
+                "scope outcome: {scope_outcome}; results: {:?}",
+                dropped
+                    .results
+                    .iter()
+                    .map(|r| (r.sql.clone(), r.success, r.message.clone()))
+                    .collect::<Vec<_>>()
+            ),
+        );
+
+        let after = other.run("SELECT COUNT(*) AS C FROM SQ_TM_T")?;
+        h.check(
+            "S56 the neighbouring tab still has the connection's database",
+            after.results.iter().all(|result| result.success),
+            format!(
+                "results: {:?}; messages: {:?}",
+                after
+                    .results
+                    .iter()
+                    .map(|r| (r.sql.clone(), r.success, r.message.clone()))
+                    .collect::<Vec<_>>(),
+                after.messages
+            ),
+        );
+        let _ = other.editor.discard_pooled_session_for_close();
+        h.editor.set_tab_scope(None);
+        let _ = h.editor.discard_pooled_session_for_close();
+    }
+
+    // ---- S54 (Oracle): a parse-failed DDL under a pin does not stop the batch
+    // Both drivers re-state the pinned mode at the next transaction boundary,
+    // and a FAILED implicit-commit statement makes them think the boundary may
+    // have arrived. A DDL rejected at PARSE time commits nothing, so the
+    // transaction is still open and the re-application is refused with
+    // ORA-01453 — which is an answer, not a failure: the pin applies from the
+    // next transaction. OCI used to read it as an error and stop the batch,
+    // ignoring continue-on-error, while thin ran the same script to the end.
+    if target.is_oracle() {
+        println!("  --- S54 a parse-failed DDL under a pin does not stop the batch ---");
+        h.run("ROLLBACK")?;
+        let _ = h.editor.discard_pooled_session_for_close();
+        h.editor.set_tab_transaction_mode(TransactionMode::new(
+            TransactionIsolation::Serializable,
+            TransactionAccessMode::ReadWrite,
+        ));
+        let capture = h.run(
+            "SET ERRORCONTINUE ON\n\
+             UPDATE SQ_TM_T SET V = V;\n\
+             CREATE TABEL SQ_TM_NEVER (V NUMBER);\n\
+             SELECT COUNT(*) AS C FROM SQ_TM_T;",
+        )?;
+        let typo_failed = capture
+            .results
+            .iter()
+            .any(|result| result.sql.to_uppercase().contains("TABEL") && !result.success);
+        let select_ran = capture
+            .results
+            .iter()
+            .any(|result| result.sql.to_uppercase().contains("COUNT(*)") && result.success);
+        h.check(
+            "S54 the typo is reported as the failure it is",
+            typo_failed,
+            format!(
+                "results: {:?}",
+                capture
+                    .results
+                    .iter()
+                    .map(|r| (r.sql.clone(), r.success, r.message.clone()))
+                    .collect::<Vec<_>>()
+            ),
+        );
+        h.check(
+            "S54 the statement after it still runs under continue-on-error",
+            select_ran,
+            format!(
+                "results: {:?}; messages: {:?}",
+                capture
+                    .results
+                    .iter()
+                    .map(|r| (r.sql.clone(), r.success, r.message.clone()))
+                    .collect::<Vec<_>>(),
+                capture.messages
+            ),
+        );
+        h.run("ROLLBACK")?;
+        h.editor.clear_tab_transaction_mode_override();
+        let _ = h.editor.discard_pooled_session_for_close();
+    }
+
     // ---- S8 (Oracle): the tab's pinned mode survives script CONNECT ---------
     // Runs LAST on purpose: CONNECT rebinds the tab to a transient connection,
     // so the harness's own shared connection no longer drives the tab.
@@ -4114,6 +4249,68 @@ fn run_scenarios(target: Target, h: &mut Harness) -> Result<(), String> {
             format!(
                 "insert after CONNECT: {:?}; all results: {:?}; messages: {:?}",
                 insert.map(|r| (r.success, r.message)),
+                capture
+                    .results
+                    .iter()
+                    .map(|r| (r.sql.clone(), r.success, r.message.clone()))
+                    .collect::<Vec<_>>(),
+                capture.messages
+            ),
+        );
+        h.run("ROLLBACK")?;
+        h.editor.clear_tab_transaction_mode_override();
+    }
+
+    // ---- S55 (Oracle): CONNECT yields to the user's own transaction-first
+    // statement, like the other two injection sites. Oracle allows
+    // `SET TRANSACTION` only as the first statement of a transaction, so
+    // stating the tab's pin right after a CONNECT failed THEIRS with
+    // ORA-01453 and stopped the batch on OCI, while thin — which states the
+    // pin lazily — ran the same script to the end.
+    //
+    // Runs after S8, which already rebound the tab to a transient connection.
+    if target.is_oracle() {
+        println!("  --- S55 a CONNECT yields to the user's own SET TRANSACTION ---");
+        h.editor.set_tab_transaction_mode(TransactionMode::new(
+            TransactionIsolation::Serializable,
+            TransactionAccessMode::ReadWrite,
+        ));
+        let _ = h.editor.discard_pooled_session_for_close();
+        let info = target.connection_info();
+        let script = format!(
+            "CONNECT {}/{}@{}:{}/{}\nSET TRANSACTION READ ONLY;\nSELECT COUNT(*) AS C FROM SQ_TM_T;",
+            info.username, info.password, info.host, info.port, info.service_name
+        );
+        let capture = h.run(&script)?;
+        let user_set_transaction = capture
+            .results
+            .iter()
+            .find(|result| result.sql.to_uppercase().contains("SET TRANSACTION"))
+            .cloned();
+        let select_ran = capture
+            .results
+            .iter()
+            .any(|result| result.sql.to_uppercase().contains("COUNT(*)") && result.success);
+        h.check(
+            "S55 the user's own SET TRANSACTION is not pre-empted by the pin",
+            user_set_transaction
+                .as_ref()
+                .is_some_and(|result| result.success),
+            format!(
+                "set transaction after CONNECT: {:?}; all: {:?}",
+                user_set_transaction.map(|r| (r.success, r.message)),
+                capture
+                    .results
+                    .iter()
+                    .map(|r| (r.sql.clone(), r.success, r.message.clone()))
+                    .collect::<Vec<_>>()
+            ),
+        );
+        h.check(
+            "S55 the batch runs on past it",
+            select_ran,
+            format!(
+                "results: {:?}; messages: {:?}",
                 capture
                     .results
                     .iter()
