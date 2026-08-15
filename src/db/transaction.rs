@@ -73,7 +73,7 @@ pub struct SessionResidueState {
     may_have_statement_diagnostics: bool,
     may_have_next_transaction_mode_override: bool,
     may_have_transaction_mode_override: bool,
-    may_have_untracked_session_state: bool,
+    may_have_unknown_session_state: bool,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -429,6 +429,46 @@ impl RetainedSessionState {
         }
     }
 
+    /// Settle a transaction claim the app could not read with the server's own
+    /// answer, at the point the session is filed for the tab.
+    ///
+    /// `conservative_merge` can only RAISE a claim, which is right for a claim
+    /// the app made from a statement it understands — a failure states nothing
+    /// it did not do. It is wrong for a claim that was never knowledge: a
+    /// PL/SQL block or `CALL` that commits internally ends the transaction with
+    /// nothing else to notice, and the batch then files "may have uncommitted
+    /// work" over a session that has none. That guess outlives the batch —
+    /// Oracle's pre-batch gate never states the tab's pinned mode over a
+    /// session that may hold a transaction, and no later batch asks — so the
+    /// tab silently runs at the session default while the toolbar keeps
+    /// claiming the pin, until the user commits or rolls back. Asking the
+    /// server once, here, is what keeps a guess from governing the tab.
+    ///
+    /// Deliberately narrow:
+    /// - a claim the app READ is never lowered (`claim_is_a_guess == false`),
+    ///   which is the failed-statement rule this must not undo;
+    /// - no probe, no change (`None`) — an interrupted batch has no answer;
+    /// - only `MaybeDirty` is lowered. `DecisionRequired`, `BlockedDirty` and
+    ///   `InvalidSession` are not transactions a probe can see: Oracle's
+    ///   `DBMS_TRANSACTION.LOCAL_TRANSACTION_ID` does not report a read-only
+    ///   transaction at all, so "no transaction" is never proof that there is
+    ///   nothing left to resolve;
+    /// - residue and locks are untouched — they are not the transaction, and
+    ///   they are why the session stays with its tab.
+    pub(crate) fn with_transaction_claim_settled_by_server(
+        self,
+        claim_is_a_guess: bool,
+        server_reports_transaction_open: Option<bool>,
+    ) -> Self {
+        if !claim_is_a_guess || server_reports_transaction_open != Some(false) {
+            return self;
+        }
+        if self.transaction_state != TransactionSessionState::MaybeDirty {
+            return self;
+        }
+        self.with_transaction_state(TransactionSessionState::Clean)
+    }
+
     pub(crate) fn conservative_merge(self, other: Self) -> Self {
         Self {
             transaction_state: self
@@ -508,9 +548,9 @@ impl RetainedSessionState {
 
 impl SessionResidueState {
     #[cfg(test)]
-    pub(crate) fn new(may_have_untracked_session_state: bool) -> Self {
+    pub(crate) fn new(may_have_unknown_session_state: bool) -> Self {
         Self {
-            may_have_untracked_session_state,
+            may_have_unknown_session_state,
             ..Self::default()
         }
     }
@@ -532,7 +572,7 @@ impl SessionResidueState {
             may_have_statement_diagnostics: effects.sets_statement_diagnostics,
             may_have_next_transaction_mode_override: effects.sets_next_transaction_mode_override,
             may_have_transaction_mode_override: effects.sets_transaction_mode_override,
-            may_have_untracked_session_state: effects.may_leave_unknown_state,
+            may_have_unknown_session_state: effects.may_leave_unknown_state,
         }
     }
 
@@ -551,8 +591,8 @@ impl SessionResidueState {
                 || other.may_have_next_transaction_mode_override,
             may_have_transaction_mode_override: self.may_have_transaction_mode_override
                 || other.may_have_transaction_mode_override,
-            may_have_untracked_session_state: self.may_have_untracked_session_state
-                || other.may_have_untracked_session_state,
+            may_have_unknown_session_state: self.may_have_unknown_session_state
+                || other.may_have_unknown_session_state,
         }
     }
 
@@ -579,13 +619,22 @@ impl SessionResidueState {
         state.merged_with(Self::from_effects(effects))
     }
 
+    /// Whether this session carries residue of ANY kind — the union of every
+    /// field below.
+    ///
+    /// Distinct from [`Self::may_have_unknown_session_state`], which is the one
+    /// field for residue the app could not read. The two used to be a method
+    /// and a field of the SAME name, told apart only by a pair of parentheses:
+    /// `requires_resolution()` reads the union, `can_change_transaction_options`
+    /// reads the single field, and which one a site meant was a matter of
+    /// typing.
     pub fn may_have_untracked_session_state(self) -> bool {
         self.may_have_temporary_table
             || self.may_have_prepared_statement
             || self.may_have_user_variable
             || self.may_have_session_setting
             || self.may_have_statement_diagnostics
-            || self.may_have_untracked_session_state
+            || self.may_have_unknown_session_state
     }
 
     pub fn may_have_temporary_table(self) -> bool {
@@ -609,7 +658,7 @@ impl SessionResidueState {
     }
 
     fn may_have_unknown_session_state(self) -> bool {
-        self.may_have_untracked_session_state
+        self.may_have_unknown_session_state
     }
 
     fn has_only_next_transaction_mode_override(self) -> bool {
@@ -624,7 +673,7 @@ impl SessionResidueState {
 
     fn with_untracked_session_state(self) -> Self {
         Self {
-            may_have_untracked_session_state: true,
+            may_have_unknown_session_state: true,
             ..self
         }
     }
@@ -5577,6 +5626,64 @@ mod tests {
             true,
             true
         ));
+    }
+
+    #[test]
+    fn only_a_guess_is_settled_by_the_servers_answer() {
+        let dirty =
+            RetainedSessionState::from_transaction_state(TransactionSessionState::MaybeDirty);
+
+        // What the fix is for: a claim the app could not read, and a server
+        // that says there is no transaction.
+        assert!(!dirty
+            .with_transaction_claim_settled_by_server(true, Some(false))
+            .may_have_uncommitted_work());
+
+        // A claim the app READ is knowledge, not a guess. Lowering it here
+        // would undo the rule that a failed statement states nothing it did not
+        // do — the server probe is the compensation for that rule, not a way
+        // around it.
+        assert!(dirty
+            .with_transaction_claim_settled_by_server(false, Some(false))
+            .may_have_uncommitted_work());
+
+        // No probe, no change: an interrupted batch has no answer to settle
+        // with, and a statement it cancelled may still be on the server.
+        assert!(dirty
+            .with_transaction_claim_settled_by_server(true, None)
+            .may_have_uncommitted_work());
+
+        // The probe raising a claim is the pre-existing conservative merge;
+        // this rule only ever lowers.
+        assert!(dirty
+            .with_transaction_claim_settled_by_server(true, Some(true))
+            .may_have_uncommitted_work());
+
+        // Nothing but MaybeDirty is lowered. Oracle's own probe
+        // (`DBMS_TRANSACTION.LOCAL_TRANSACTION_ID`) does not report a read-only
+        // transaction at all, so "no transaction" is never proof that there is
+        // nothing left for the user to decide.
+        for state in [
+            TransactionSessionState::DecisionRequired,
+            TransactionSessionState::BlockedDirty,
+            TransactionSessionState::InvalidSession,
+        ] {
+            let blocked = RetainedSessionState::from_transaction_state(state);
+            assert_eq!(
+                blocked
+                    .with_transaction_claim_settled_by_server(true, Some(false))
+                    .transaction_state(),
+                state,
+                "a probe must not resolve a decision the user still owes"
+            );
+        }
+
+        // Residue is not the transaction: it is why the session stays with its
+        // tab, and settling the transaction must not release it.
+        let with_residue = dirty.with_untracked_session_state();
+        let settled = with_residue.with_transaction_claim_settled_by_server(true, Some(false));
+        assert!(!settled.may_have_uncommitted_work());
+        assert!(settled.may_have_untracked_session_state());
     }
 
     #[test]

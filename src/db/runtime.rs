@@ -770,27 +770,17 @@ impl TabConnectionBinding {
         Ok(state.revision)
     }
 
-    pub fn detach(&self) -> u64 {
-        let mut session = self
-            .inner
-            .session
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let mut state = self
-            .inner
-            .state
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        Self::detach_locked(&mut session, &mut state)
-    }
-
-    /// `detach`, but only while the binding still reads the revision the caller
-    /// resolved -- the twin of [`Self::bind_if_revision`].
+    /// Unbind the tab, but only while the binding still reads the revision the
+    /// caller resolved -- the twin of [`Self::bind_if_revision`].
     ///
-    /// A force-cancelled batch is abandoned rather than joined, so its script
-    /// `DISCONNECT` cleanup can run after the tab has been bound somewhere
-    /// else. An unconditional detach would unbind the connection the user is
-    /// working on now and wipe that tab's scope with it.
+    /// There is deliberately no unconditional `detach()` beside this. A
+    /// force-cancelled batch is abandoned rather than joined, so its script
+    /// `CONNECT`/`DISCONNECT` cleanup can run after the tab has been bound
+    /// somewhere else: an unconditional detach would unbind the connection the
+    /// user is working on now and wipe that tab's scope with it. The last
+    /// caller that still spelled it that way -- the thin script `CONNECT` whose
+    /// `replace_pooled` failed -- sat between two siblings that held the
+    /// revision, which is the gap removing the method closes.
     ///
     /// Answers the binding's revision either way: `Ok` when the detach
     /// happened, `Err` with the revision that made this one stale.
@@ -1169,7 +1159,9 @@ mod tests {
         let registry = ConnectionRegistry::new();
         let runtime = registry.register_transient(connection());
         let first = TabConnectionBinding::bound_in_registry(registry, runtime.clone(), None);
-        first.detach();
+        first
+            .detach_if_revision(first.snapshot().revision)
+            .expect("a binding nobody else moved detaches");
 
         let second = first.fork_for_new_tab();
 

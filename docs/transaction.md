@@ -158,6 +158,36 @@ one shared predicate (`oracle_transaction_mode_boundary_needs_server_answer`) �
 thin from the wire flag it already carries, OCI from a probe, which is what that
 answer costs there.
 
+Deciding that and recording what the current statement leaves behind are ONE
+call, `OracleTransactionBoundaryTracker::transaction_open_before_statement`,
+because they were two and the two loops ordered them oppositely: OCI recorded
+after its decision, thin before it. Thin therefore read the opacity of the
+statement it was about to run instead of the one that had just run, so
+`INSERT; BEGIN COMMIT; END; SELECT …` made OCI ask the server and re-apply the
+pin while thin asked nothing and ran the rest of the batch at the session
+default — one script, two answers, from a predicate both drivers shared. The
+recorded claim is also monotone: a plain `SELECT` after the block does not make
+the block's commit visible, so nothing a readable statement does may clear the
+guess. Only learning the truth does.
+
+That correction reaches the statements of one batch, and the guess is filed with
+the session. Oracle's pre-batch gate never states the pin over a session that may
+hold a transaction and no later batch has a reason to ask, so a guess that
+survives the batch governs every later batch on the tab — the toolbar keeps
+claiming the pin while the tab runs at the session default until the user commits
+or rolls back. Both drivers therefore settle it with the server before they file:
+thin reads its wire flag at batch end, OCI probes once in the same position, and
+both hand the answer to one rule,
+`RetainedSessionState::with_transaction_claim_settled_by_server`. It is
+deliberately narrow — it lowers only a claim the app could not READ (the
+failed-statement rule above stays intact), only on an answer (an interrupted
+batch has none), and only from `MaybeDirty`, because
+`DBMS_TRANSACTION.LOCAL_TRANSACTION_ID` cannot see a read-only transaction and
+"no transaction" is therefore never proof that nothing is left to resolve.
+Session residue is untouched: it is not the transaction, and it is why the
+session stays with its tab. The MySQL family has asked the same closing question
+since the failed-implicit-commit round; this is Oracle joining it.
+
 A boundary re-application refused with **ORA-01453 is an answer, not a failure**:
 it says a transaction is still running, so the pin belongs to the next one,
 which is what "applied from the next transaction" has always meant. Reading it
@@ -495,6 +525,16 @@ is therefore a three-step path, and all three steps matter:
 
 1. `validate_transaction_option_change()` — refuse the change outright when the
    retained session cannot take it (this is what keeps the screen honest),
+   through `SqlEditorWidget::ensure_retained_session_option_change_allowed`,
+   which every backend's step 3 asks as well. Steps 1 and 3 are the same
+   question about the same session, so they must not be two rules: the Oracle
+   branch used to ask `requires_physical_session_preservation()` instead, and
+   the two agreed only because Oracle's statement classifier happens to produce
+   a narrower kind of residue than the MySQL one. A step 1 that allows what
+   step 3 refuses leaves the toolbar showing a mode the session never got,
+   explained by a message that contradicts itself. Only the backend-specific
+   part stays dispatched: the MySQL family may REPLACE a pending one-shot on a
+   session it would otherwise refuse, because the replacement consumes it.
 2. `set_tab_transaction_mode()` — pin the tab,
 3. `RetainedSessionOptionChangePlan::apply_transaction_mode()` — push the mode
    onto the tab's retained session.

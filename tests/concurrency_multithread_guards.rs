@@ -1733,9 +1733,15 @@ fn regression_07_oracle_transaction_mode_change_does_not_silently_clear_preserve
         .map(|offset| oracle_start + offset)
         .expect("MySQL transaction action backend should follow Oracle backend");
     let oracle_backend = &sql_editor[oracle_start..oracle_end];
+    // The check is anchored on the OPERATION, not on one spelling of it. This
+    // clause used to name `requires_physical_session_preservation()`, which was
+    // the Oracle branch's own second copy of a rule the MySQL branch asked
+    // through the shared gate — the two agreed only because Oracle's statement
+    // classifier happens to produce a narrower kind of residue. Both branches
+    // now ask what step 1 asked before the tab was pinned.
     let preservation_check = oracle_backend
-        .find("retained_state.requires_physical_session_preservation()")
-        .expect("Oracle retained transaction-mode apply should check preserved session state");
+        .find("SqlEditorWidget::ensure_retained_session_option_change_allowed(")
+        .expect("Oracle retained transaction-mode apply should ask the shared option-change gate");
     // The clear is generation-checked: the toolbar reads the generation
     // lock-free and applies later, so an unvalidated clear could close the
     // fresh session the tab was already handed on a NEW generation.
@@ -1746,6 +1752,38 @@ fn regression_07_oracle_transaction_mode_change_does_not_silently_clear_preserve
     assert!(
         preservation_check < clear_call,
         "Oracle transaction mode changes must block preserved retained sessions before clear()"
+    );
+    // ...and it is the SAME gate the MySQL family passes, so a step 1 that
+    // allows can never meet a step 3 that refuses.
+    let execution = read_source("src/ui/sql_editor/execution.rs");
+    let gate = execution
+        .find("pub(super) fn ensure_retained_session_option_change_allowed(")
+        .expect("the shared option-change gate should exist");
+    let gate_body = &execution[gate..gate + 700];
+    assert!(
+        gate_body.contains("db_type.can_replace_retained_transaction_mode(prior_retained_state)")
+            && gate_body.contains(
+                "crate::db::DatabaseConnection::ensure_retained_session_option_change_allowed("
+            ),
+        "the shared gate dispatches only the backend-specific part (a one-shot the \
+         MySQL family can replace) and asks the common rule for the rest"
+    );
+    // Scoped to the transaction-action backends: "must this session stay with
+    // its tab?" is a real and separate question elsewhere. What may not come
+    // back is answering the OPTION-CHANGE question with it.
+    let mysql_backend_start = sql_editor
+        .find("impl TransactionActionBackend for MysqlTransactionActionBackend")
+        .expect("the MySQL transaction action backend should exist");
+    let backends_end = sql_editor[mysql_backend_start..]
+        .find("\nimpl ExplainPlanBackend")
+        .map(|offset| mysql_backend_start + offset)
+        .unwrap_or(sql_editor.len());
+    assert_eq!(
+        sql_editor[oracle_start..backends_end]
+            .matches("requires_physical_session_preservation()")
+            .count(),
+        0,
+        "no backend may re-derive the option-change rule from preservation"
     );
     assert!(
         !oracle_backend.contains("pooled_db_session.clear();"),
@@ -3030,6 +3068,9 @@ fn transaction_mode_state_has_a_single_source_of_truth() {
     let connection =
         fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("src/db/connection.rs"))
             .expect("read connection.rs");
+    let transaction =
+        fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("src/db/transaction.rs"))
+            .expect("read transaction.rs");
     let normalize = |text: &str| text.split_whitespace().collect::<String>();
 
     // (1) The toolbar controls resolve through the shared resolver.
@@ -3325,11 +3366,22 @@ fn transaction_mode_state_has_a_single_source_of_truth() {
     // notices, so both drivers ask through the same predicate -- only the
     // answer is driver-specific (thin reads the wire flag it already has, OCI
     // pays for a probe).
+    //
+    // Pinned as ONE call, not as two that a loop orders for itself. Deciding
+    // and recording used to be `needs_server_answer` plus `note_statement`, and
+    // the two loops ordered them oppositely: OCI recorded after its decision
+    // and thin before it, so thin read the opacity of the statement it was
+    // about to run instead of the one that had just run and never asked the
+    // server after a PL/SQL block. The previous version of this clause only
+    // checked that each loop CALLED the predicate, which both did -- pinning
+    // the call and not the operation is how that survived. `note_statement`
+    // must therefore not be reachable from either loop.
     let thin_body_flat = thin_body.split_whitespace().collect::<Vec<_>>().join(" ");
     assert!(
-        thin_body_flat.contains("oracle_transaction_boundary .needs_server_answer(")
-            || thin_body_flat.contains("oracle_transaction_boundary.needs_server_answer("),
-        "the thin re-apply must ask the shared predicate whether the tracked answer is a guess"
+        thin_body_flat.contains("oracle_transaction_boundary .transaction_open_before_statement(")
+            || thin_body_flat
+                .contains("oracle_transaction_boundary.transaction_open_before_statement("),
+        "the thin re-apply must decide and record through the one call that fixes their order"
     );
     assert!(
         thin_body.contains("conn.transaction_in_progress()"),
@@ -3345,7 +3397,7 @@ fn transaction_mode_state_has_a_single_source_of_truth() {
     let oci_reapply = execution
         .find("cleanup.oracle_pooled_session_transaction_possibly_ended()")
         .expect("the OCI batch must re-apply the transaction mode at the next transaction");
-    let oci_reapply_window = slice_from(&execution, oci_reapply.saturating_sub(400), 1900);
+    let oci_reapply_window = slice_from(&execution, oci_reapply.saturating_sub(400), 2900);
     assert!(
         oci_reapply_window.contains("!active_transaction_mode.is_default()")
             && oci_reapply_window.contains("is_transaction_first_statement("),
@@ -3356,13 +3408,37 @@ fn transaction_mode_state_has_a_single_source_of_truth() {
         .collect::<Vec<_>>()
         .join(" ");
     assert!(
-        oci_reapply_flat.contains("oracle_transaction_boundary .needs_server_answer(")
-            || oci_reapply_flat.contains("oracle_transaction_boundary.needs_server_answer("),
-        "the OCI re-apply must ask the same shared predicate as the thin loop"
+        oci_reapply_flat
+            .contains("oracle_transaction_boundary .transaction_open_before_statement(")
+            || oci_reapply_flat
+                .contains("oracle_transaction_boundary.transaction_open_before_statement("),
+        "the OCI re-apply must make the same single call as the thin loop"
     );
     assert!(
         oci_reapply_window.contains("oracle_session_may_have_uncommitted_work("),
         "and answer it with the probe, which is what that answer costs on OCI"
+    );
+    // The order the two loops used to spell for themselves now lives inside the
+    // tracker, so neither loop may record on its own.
+    assert_eq!(
+        execution
+            .matches("oracle_transaction_boundary.note_statement(")
+            .count(),
+        0,
+        "recording what a statement leaves behind must not be reachable outside \
+         `transaction_open_before_statement`, which is what fixes its order"
+    );
+    // The claim survives a statement the app CAN read: a plain SELECT after a
+    // PL/SQL block does not make the block's commit visible, so a later
+    // readable statement must not clear the guess. `|=`, never `=`.
+    let tracker_start = execution
+        .find("fn note_statement(&mut self, effects: crate::db::StatementSessionEffects)")
+        .expect("the tracker must record what a statement leaves behind");
+    let tracker_body = slice_from(&execution, tracker_start, 320);
+    assert!(
+        tracker_body.contains("self.transaction_claim_is_a_guess |="),
+        "a guess must be monotone: only learning the truth may clear it, never a \
+         statement the app happens to be able to read"
     );
     // A refusal with ORA-01453 says the transaction is still open, which is an
     // answer and not a failure: the pin belongs to the next transaction, and
@@ -3371,6 +3447,50 @@ fn transaction_mode_state_has_a_single_source_of_truth() {
     assert!(
         execution.contains("OracleTransactionModeApplied::TransactionStillOpen"),
         "a boundary re-application refused because a transaction is open must not fail the batch"
+    );
+    // (12b) The correction above only reaches the statements of ONE batch. The
+    // guess it corrects is filed with the session, and Oracle's pre-batch gate
+    // never states the pin over a session that may hold a transaction -- so a
+    // guess that survives the batch governs every LATER batch on the tab, with
+    // nothing left to ask. Both drivers therefore settle it with the server
+    // before they file, through the one shared rule, which is the same closing
+    // question the MySQL family's batch-end probe has always asked.
+    assert!(
+        transaction.contains("fn with_transaction_claim_settled_by_server("),
+        "the rule that settles an unreadable transaction claim must live in one place"
+    );
+    let settle_start = transaction
+        .find("fn with_transaction_claim_settled_by_server(")
+        .expect("the shared settling rule should exist");
+    let settle_body = slice_from(&transaction, settle_start, 900);
+    assert!(
+        settle_body
+            .contains("if !claim_is_a_guess || server_reports_transaction_open != Some(false)")
+            && settle_body
+                .contains("if self.transaction_state != TransactionSessionState::MaybeDirty"),
+        "settling may lower only a GUESS, only on a server answer, and only from \
+         MaybeDirty -- a claim the app read is knowledge, and a decision the user \
+         owes is not a transaction the probe can see"
+    );
+    // Both batch ends, pinned by where they are rather than by a count: the
+    // thin batch reads its wire flag inline, and the OCI batch carries its
+    // answer into the cleanup guard that files the session.
+    assert!(
+        thin_body.contains("with_transaction_claim_settled_by_server(")
+            && thin_body.contains("oracle_transaction_boundary.transaction_claim_is_a_guess()"),
+        "the thin batch must settle its closing claim with the wire flag"
+    );
+    let oci_settle = execution
+        .find("fn settle_oracle_transaction_claim_with_server(")
+        .expect("the OCI batch must settle its own closing claim");
+    assert!(
+        slice_from(&execution, oci_settle, 900)
+            .contains("with_transaction_claim_settled_by_server("),
+        "and it must do it through the shared rule, not a second copy of it"
+    );
+    assert!(
+        execution.contains("cleanup.settle_oracle_transaction_claim_with_server("),
+        "called from the batch that is about to file the session"
     );
 
     // (13) The MySQL family acquires the tab's pooled session once per
@@ -5268,6 +5388,41 @@ fn every_backend_hands_a_batch_session_back_through_the_door_that_names_its_oper
     assert!(
         currency < take,
         "operation currency must be checked BEFORE the lease is taken"
+    );
+
+    // The BINDING has the same rule, and it has to be unspellable rather than
+    // remembered: an unconditional `detach()` in a worker takes the tab off the
+    // connection the user reconnected to while the abandoned batch was
+    // unwinding. Two of the three script CONNECT/DISCONNECT undo paths held the
+    // revision and the third did not, so the unguarded spelling is gone.
+    let runtime = read_source("src/db/runtime.rs");
+    assert!(
+        runtime.contains("pub fn detach_if_revision(&self, expected_revision: u64)"),
+        "the guarded unbind must exist"
+    );
+    assert!(
+        !runtime.contains("pub fn detach(&self)"),
+        "and it must be the ONLY one: an unconditional unbind is a discard road \
+         with no door on it"
+    );
+    for source in ["src/ui/sql_editor/execution.rs", "src/ui/main_window.rs"] {
+        assert_eq!(
+            read_source(source).matches("_binding.detach()").count(),
+            0,
+            "{source} must not unbind a tab without holding its revision"
+        );
+    }
+    // The thin script CONNECT is the one place a bind can be undone, so it is
+    // also the one place the guarded unbind has to be reached with the
+    // CANDIDATE's revision: the context still carries the one from before the
+    // bind, and holding that would refuse every undo.
+    let thin_connect = execution
+        .find("if let Err(message) = conn.replace_pooled(candidate.session)")
+        .expect("the thin script CONNECT should swap the session");
+    assert!(
+        slice_from(&execution, thin_connect, 1600)
+            .contains("detach_if_revision(candidate.binding_revision)"),
+        "undoing the candidate bind must hold the revision that bind produced"
     );
 }
 

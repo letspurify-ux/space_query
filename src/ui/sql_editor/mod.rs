@@ -1654,12 +1654,18 @@ impl TransactionActionBackend for OracleTransactionActionBackend {
         _db_activity: &str,
     ) -> RetainedSessionMutationOutcome {
         if let Some(snapshot) = pooled_db_session.snapshot() {
-            let retained_state = snapshot.retained_state();
-            if retained_state.requires_physical_session_preservation() {
-                return RetainedSessionMutationOutcome::BlockedRequiresResolution(format!(
-                    "Cannot change transaction mode while the retained Oracle DB session is {}. Resolve or discard it first.",
-                    retained_state.label()
-                ));
+            // The same question step 1 asked before the tab was pinned. Asking a
+            // different one here (this used to be
+            // `requires_physical_session_preservation`) is how a step 1 that
+            // allows and a step 3 that refuses get written, and the two only
+            // agreed because Oracle's classifier happens to produce a narrower
+            // kind of residue than the MySQL one.
+            if let Err(message) = SqlEditorWidget::ensure_retained_session_option_change_allowed(
+                DatabaseType::Oracle,
+                snapshot.retained_state(),
+                "transaction mode",
+            ) {
+                return RetainedSessionMutationOutcome::BlockedRequiresResolution(message);
             }
         }
         // Oracle applies the mode to the NEXT transaction, so dropping the

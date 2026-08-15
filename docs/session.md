@@ -318,7 +318,13 @@ reconnect, disconnect, pool resize):
   working on now, with no message at all. The binding has the same rule:
   `detach_if_revision` refuses to unbind a tab that has moved on, and a refused
   detach keeps the STALE revision so the superseded batch's later `CONNECT`
-  cannot rebind the tab either.
+  cannot rebind the tab either. There is no unconditional `detach()` beside it,
+  because remembering to hold the revision is not a rule that holds: two of the
+  three script CONNECT/DISCONNECT undo paths held it and the third — the thin
+  `CONNECT` whose `replace_pooled` failed — did not, and an abandoned batch
+  reaching it after the tab reconnected would take the tab off the connection
+  the user is working on now. Undoing a bind holds the revision that BIND
+  produced, not the one the worker started with.
 
 `assert_connection_lifecycle_closes_every_server_session` proves this against a
 live database by counting the server's own sessions (`information_schema.processlist`

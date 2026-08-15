@@ -102,6 +102,16 @@
 //       that runs next is not the user's own transaction-first one. Stating it
 //       first opened a transaction that failed THEIRS with ORA-01453 and, with
 //       the session then reading dirty, the app's own guard refused it.
+//   S57 (Oracle) the statement AFTER a PL/SQL block that commits internally
+//       still runs under the pin. Deciding "is a transaction open?" and
+//       recording what the current statement leaves behind were two calls the
+//       two loops ordered oppositely, so thin read the opacity of the statement
+//       it was about to run and asked the server nothing.
+//   S58 (Oracle) the guess that block leaves does not outlive its batch. It is
+//       filed with the SESSION, and the pre-batch gate obeys it, so it unpinned
+//       every later batch on the tab. Two batches on purpose: inside one, S57's
+//       correction already covers it and the scenario would pass against the
+//       bug.
 //
 // Usage: verify_transaction_mode_live <thin|oci|mysql|mariadb|all>
 
@@ -1483,6 +1493,124 @@ fn run_scenarios(target: Target, h: &mut Harness) -> Result<(), String> {
                 .is_some_and(|(now, (first, _))| now > first),
             format!("SQ_TM_ISO after the batch = {now:?}, in-batch reads {reads:?}"),
         );
+
+        // ---- S57 (Oracle): the statement after one the app cannot READ still
+        // runs under the pin.
+        // A PL/SQL block that COMMITs internally ends the transaction the mode
+        // was attached to, with nothing else to notice, so the next statement
+        // has to open a new one under the pin — which means asking the server
+        // whether the old one is gone. Deciding that and recording what the
+        // current statement leaves behind used to be two calls, and the two
+        // Oracle loops ordered them oppositely: thin read the opacity of the
+        // statement it was ABOUT to run instead of the one that had just run,
+        // asked nothing here, and ran the rest of the batch at the session
+        // default while the toolbar still showed the pin. FAILS on thin before
+        // the fix; OCI passed, which is what made it one script with two
+        // answers.
+        if target.is_oracle() {
+            println!("  --- S57 the statement after a PL/SQL commit still runs under the pin ---");
+            h.run("ROLLBACK")?;
+            let _ = h.editor.discard_pooled_session_for_close();
+            h.editor.set_tab_transaction_mode(TransactionMode::new(
+                pinned_isolation,
+                TransactionAccessMode::ReadWrite,
+            ));
+            // S18b's script with ONE word changed: its visible `COMMIT`
+            // becomes a COMMIT the app cannot see. Keeping S18b's shape keeps
+            // its timing, and the other session's commit has to land BETWEEN
+            // the two bracketing reads.
+            //
+            // The sleep has to be a plain SELECT here, and that is the whole
+            // trap this scenario was written around: S18's sleep is
+            // `BEGIN DBMS_SESSION.SLEEP(6); END;`, which is itself a statement
+            // the app cannot read. With the defect in place, THAT block asks
+            // the server on the second read's behalf and re-applies the pin one
+            // statement late — late enough to still take its snapshot before
+            // the other session commits, so both reads matched and the
+            // scenario passed against the bug. Verified: this scenario passes
+            // with the fix reverted while it uses the PL/SQL sleep.
+            // `DBMS_PIPE.RECEIVE_MESSAGE` blocks for its timeout inside an
+            // ordinary SELECT, and the predicate is false afterwards so it
+            // returns no rows and adds nothing to `reads`.
+            let sql_sleep_statement =
+                "SELECT 1 FROM DUAL WHERE DBMS_PIPE.RECEIVE_MESSAGE('SQ_TM_S57', 6) = 99;";
+            let (reads, failed) = bracketed_reads_in_one_batch(
+                h,
+                &mut other,
+                "SELECT V FROM SQ_TM_ISO;\nBEGIN COMMIT; END;\n/\n",
+                sql_sleep_statement,
+            )?;
+            h.check(
+                "S57 every statement of the batch ran",
+                failed.is_empty(),
+                format!("failed statements: {failed:?}"),
+            );
+            let pair = last_pair(&reads);
+            h.check(
+                "S57 both reads after the block's internal COMMIT see one snapshot",
+                pair.is_some_and(|(first, second)| first == second),
+                format!(
+                    "reads in the batch: {reads:?} (different values mean the pin was \
+                     not re-applied after a statement the app cannot see into)"
+                ),
+            );
+            h.run("ROLLBACK")?;
+            h.editor.clear_tab_transaction_mode_override();
+            let _ = h.editor.discard_pooled_session_for_close();
+        }
+
+        // ---- S58 (Oracle): the guess does not outlive the batch that made it.
+        // The correction S57 checks reaches the statements of ONE batch. The
+        // claim is filed with the SESSION, and the pre-batch gate never states
+        // the pin over a session that may hold a transaction — so a guess that
+        // survives the batch silently unpins every LATER batch on the tab until
+        // the user commits or rolls back. Nothing in the second batch is opaque,
+        // so only the FIRST batch's closing question to the server can make this
+        // pass. FAILS on both drivers before the fix.
+        //
+        // It has to be two batches: inside one, S57's correction already covers
+        // it, and the scenario would pass against the bug.
+        if target.is_oracle() {
+            println!("  --- S58 a PL/SQL commit in one batch does not unpin the next ---");
+            h.run("ROLLBACK")?;
+            let _ = h.editor.discard_pooled_session_for_close();
+            h.editor.set_tab_transaction_mode(TransactionMode::new(
+                pinned_isolation,
+                TransactionAccessMode::ReadWrite,
+            ));
+            let first_batch = h.run("UPDATE SQ_TM_TXN SET V = V + 1;\nBEGIN COMMIT; END;\n/")?;
+            let first_batch_failed = first_batch
+                .results
+                .iter()
+                .filter(|result| !result.success)
+                .map(|result| (result.sql.clone(), result.message.clone()))
+                .collect::<Vec<_>>();
+            h.check(
+                "S58 the batch that ends on an unreadable statement ran",
+                first_batch_failed.is_empty(),
+                format!("failed statements: {first_batch_failed:?}"),
+            );
+            let (reads, failed) = bracketed_reads_in_one_batch(h, &mut other, "", sleep_statement)?;
+            h.check(
+                "S58 every statement of the NEXT batch ran",
+                failed.is_empty(),
+                format!("failed statements: {failed:?}"),
+            );
+            let pair = last_pair(&reads);
+            h.check(
+                "S58 the next batch still runs under the tab's pinned isolation",
+                pair.is_some_and(|(first, second)| first == second),
+                format!(
+                    "reads in the next batch: {reads:?} (different values mean the \
+                     previous batch filed a guess the pre-batch gate then obeyed \
+                     for the life of the session)"
+                ),
+            );
+            h.run("ROLLBACK")?;
+            h.editor.clear_tab_transaction_mode_override();
+            let _ = h.editor.discard_pooled_session_for_close();
+        }
+
         let _ = other.run("ROLLBACK");
         let _ = other.editor.discard_pooled_session_for_close();
     }
