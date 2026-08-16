@@ -183,6 +183,8 @@ impl<'a> SqlStatementAnalysis<'a> {
     }
 
     fn from_prepared_sql(stripped_sql: Cow<'a, str>, mysql_compatible_comments: bool) -> Self {
+        let stripped_sql =
+            strip_leading_plsql_block_labels(stripped_sql, mysql_compatible_comments);
         let words = statement_words(stripped_sql.as_ref(), mysql_compatible_comments);
         let has_multiple_statements =
             contains_multiple_statements(stripped_sql.as_ref(), mysql_compatible_comments);
@@ -342,6 +344,62 @@ fn strip_leading_comments_and_whitespace_with_mode(
 
         return trimmed;
     }
+}
+
+/// The statement with its leading PL/SQL block labels removed, for
+/// CLASSIFICATION only.
+///
+/// A label names a block; it does not change what the statement IS. Every rule
+/// in this module reads the leading WORDS, so a label in front of them made a
+/// labelled anonymous block answer as an unknown statement:
+/// `<<outer>> BEGIN UPDATE ... END;` was filed as opening no transaction,
+/// leaving no session residue and carrying no uncommitted work, while the
+/// script splitter recognised the block and ran it. Under manual commit that
+/// filed the user's open transaction as clean, offered no Commit or Rollback
+/// for it, and let the session go back to the pool with it still open.
+///
+/// Deliberately NOT part of `strip_leading_comments_and_whitespace`: that text
+/// is what the script splitter EXECUTES, and a block whose label is removed
+/// while its `END <label>;` remains is rejected by the server (PLS-00113).
+///
+/// Applied for every database because a statement can only start with `<<` in
+/// Oracle — in the MySQL family `<<` is a shift operator, which no statement
+/// begins with — so one rule serves all four backends.
+fn strip_leading_plsql_block_labels(
+    sql: Cow<'_, str>,
+    mysql_compatible_comments: bool,
+) -> Cow<'_, str> {
+    let mut remaining = sql.as_ref();
+    let mut stripped_any = false;
+    while let Some(after_label) = strip_leading_plsql_block_label(remaining) {
+        remaining =
+            strip_leading_comments_and_whitespace_with_mode(after_label, mysql_compatible_comments);
+        stripped_any = true;
+    }
+    if !stripped_any {
+        return sql;
+    }
+    Cow::Owned(remaining.to_string())
+}
+
+fn strip_leading_plsql_block_label(sql: &str) -> Option<&str> {
+    let rest = sql.strip_prefix("<<")?;
+    let end = rest.find(">>")?;
+    let name = rest[..end].trim();
+    if name.is_empty() {
+        return None;
+    }
+    // A label is one identifier, quoted or not. Anything else is not a label,
+    // and skipping it would hide a statement instead of its name.
+    let is_identifier = if let Some(quoted) = name.strip_prefix('"') {
+        quoted.strip_suffix('"').is_some_and(|inner| {
+            !inner.is_empty() && !inner.contains('"') && !inner.contains(char::is_whitespace)
+        })
+    } else {
+        name.chars()
+            .all(|ch| ch.is_alphanumeric() || ch == '_' || ch == '$' || ch == '#')
+    };
+    is_identifier.then(|| &rest[end + 2..])
 }
 
 fn line_comment_starts(line: &str, mysql_compatible_comments: bool) -> bool {
@@ -2041,6 +2099,59 @@ mod tests {
                 .classify_for_db_type(DatabaseType::Oracle),
             SqlKind::Ddl
         );
+    }
+
+    #[test]
+    fn a_labelled_block_is_classified_as_the_block_it_labels() {
+        // A label names a block; it does not change what the statement is. The
+        // script splitter has always recognised `<<outer>> BEGIN … END;` and
+        // run it as a block, while every classification rule read the leading
+        // WORDS and saw an unknown statement: no PL/SQL kind, no session
+        // residue, no uncommitted work. Under manual commit that filed the
+        // user's open transaction as clean.
+        for (labelled, bare) in [
+            ("<<outer>> BEGIN NULL; END;", "BEGIN NULL; END;"),
+            ("<<outer>>\nBEGIN NULL; END;", "BEGIN NULL; END;"),
+            ("  <<\"Mixed Case\">>\nBEGIN NULL; END;", "BEGIN NULL; END;"),
+            (
+                "<<outer>> DECLARE v NUMBER; BEGIN v := 1; END;",
+                "DECLARE v NUMBER; BEGIN v := 1; END;",
+            ),
+            (
+                "/* why */ <<outer>> -- and\nBEGIN NULL; END;",
+                "BEGIN NULL; END;",
+            ),
+            (
+                "<<outer>> BEGIN NULL; END;\nSELECT 1 FROM dual",
+                "BEGIN NULL; END;\nSELECT 1 FROM dual",
+            ),
+        ] {
+            let labelled_analysis =
+                SqlStatementAnalysis::new_for_db_type(DatabaseType::Oracle, labelled);
+            let bare_analysis = SqlStatementAnalysis::new_for_db_type(DatabaseType::Oracle, bare);
+            assert_eq!(
+                labelled_analysis.leading_keyword(),
+                bare_analysis.leading_keyword(),
+                "{labelled}"
+            );
+            assert_eq!(
+                labelled_analysis.classify_for_db_type(DatabaseType::Oracle),
+                bare_analysis.classify_for_db_type(DatabaseType::Oracle),
+                "{labelled}"
+            );
+        }
+
+        // Only a LABEL is skipped. Anything else that starts with `<<` is a
+        // statement the app does not know, and skipping it would hide the
+        // statement instead of its name.
+        for not_a_label in ["<<outer BEGIN NULL; END;", "<<a b>> BEGIN NULL; END;"] {
+            assert_ne!(
+                SqlStatementAnalysis::new_for_db_type(DatabaseType::Oracle, not_a_label)
+                    .leading_keyword(),
+                Some("BEGIN"),
+                "{not_a_label}"
+            );
+        }
     }
 
     #[test]

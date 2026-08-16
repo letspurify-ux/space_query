@@ -864,6 +864,11 @@ impl TabConnectionBinding {
     /// same script was then refused with "the query tab connection changed
     /// while CONNECT was authenticating" — for a connection that had not
     /// changed — and a later `DISCONNECT` silently refused to detach.
+    ///
+    /// This is the UI THREAD's door, and it owns the tab: nothing else is
+    /// running on it when a scope pick, a connect or a scope notice lands
+    /// here. A WORKER must use [`Self::set_scope_if_revision`] instead — see
+    /// its comment for what a bare write from a worker thread did.
     pub fn set_scope(&self, scope: Option<String>) -> u64 {
         let mut state = self
             .inner
@@ -872,6 +877,38 @@ impl TabConnectionBinding {
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         state.scope = normalize_scope(scope);
         state.revision
+    }
+
+    /// A worker's door: move the tab only while it is still bound to what the
+    /// worker resolved.
+    ///
+    /// The binding is the TAB's, and a batch keeps running after the tab has
+    /// left it — a script `CONNECT` rebinds it, a force-cancelled batch unwinds
+    /// while the next one owns the tab. An unguarded write from there left the
+    /// tab naming a schema its current session was not in, and Oracle asserts
+    /// the tab's scope before every statement, so the next statement carried
+    /// the user's open transaction into it.
+    ///
+    /// The revision answers IDENTITY only, which is why the caller also has to
+    /// ask whether it is still the tab's current execution
+    /// (`SessionHandBackOwner::is_current`): a new execution on the same
+    /// binding does not move the revision, and a rebind does not move the
+    /// operation id. Two questions, two answers, both required.
+    pub fn set_scope_if_revision(
+        &self,
+        expected_revision: u64,
+        scope: Option<String>,
+    ) -> Result<u64, u64> {
+        let mut state = self
+            .inner
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if state.revision != expected_revision {
+            return Err(state.revision);
+        }
+        state.scope = normalize_scope(scope);
+        Ok(state.revision)
     }
 }
 
@@ -1268,6 +1305,43 @@ mod tests {
                 .bind_if_revision(held, runtime, Some("beta".to_string()))
                 .is_err(),
             "a stale token must still be refused"
+        );
+    }
+
+    #[test]
+    fn a_worker_cannot_move_the_scope_of_a_tab_that_has_been_rebound() {
+        // `set_scope` is the UI thread's door: it owns the tab. A WORKER holds
+        // the revision it resolved, and a batch outlives its claim on the tab —
+        // a script CONNECT rebinds it, a force-cancelled batch keeps running
+        // while the next one owns it. Writing the scope from there anyway left
+        // the tab naming a schema its session was not in, and Oracle asserts
+        // the tab's scope before every statement.
+        let registry = ConnectionRegistry::new();
+        let runtime = registry.register_saved("saved", connection()).runtime;
+        let binding = TabConnectionBinding::bound(runtime.clone(), Some("alpha".to_string()));
+        let held = binding.snapshot().revision;
+
+        assert_eq!(
+            binding.set_scope_if_revision(held, Some("beta".to_string())),
+            Ok(held),
+            "the worker that still holds the tab's revision may move it"
+        );
+        assert_eq!(binding.snapshot().scope.as_deref(), Some("beta"));
+
+        // The tab is rebound (a script CONNECT), which is what the revision is
+        // for.
+        let rebound = binding
+            .bind_if_revision(held, runtime, Some("beta".to_string()))
+            .expect("the rebind should succeed");
+        assert_eq!(
+            binding.set_scope_if_revision(held, Some("gamma".to_string())),
+            Err(rebound),
+            "and the old revision must be refused, with the revision that made it stale"
+        );
+        assert_eq!(
+            binding.snapshot().scope.as_deref(),
+            Some("beta"),
+            "a refused write must leave the tab where it is"
         );
     }
 

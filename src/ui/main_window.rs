@@ -3195,11 +3195,24 @@ impl AppState {
             // while the next statement's scope assertion moved the user's open
             // transaction back to it.
             //
-            // Safe to apply late: every scope notice for a tab arrives on that
-            // tab's own channel in the order the sessions really moved, so the
-            // last one to be handled is where the session really is. The tab
-            // and editor identity above still has to match.
-            QueryProgress::ScopeChangedNotice { .. } => return true,
+            // Abandoned is therefore not stale. SUPERSEDED is: a force-cancelled
+            // batch keeps unwinding while the NEXT execution owns the tab, and
+            // that execution's session is the one the tab is in. Its own
+            // notices describe where the tab really is, and letting the dead
+            // batch's notice land after them named a schema this session had
+            // never been in — which the next statement's assertion would then
+            // make true, carrying the user's open transaction into it. The
+            // worker half of the same rule is
+            // `SqlEditorWidget::record_batch_scope_on_tab_binding`.
+            QueryProgress::ScopeChangedNotice { .. } => {
+                let (current_operation_id, last_completed_operation_id) =
+                    editor.operation_lifecycle_ids();
+                return !query_operation_was_superseded(
+                    token,
+                    current_operation_id,
+                    last_completed_operation_id,
+                );
+            }
             _ => {}
         }
         if self.abandoned_query_operations.contains(&token) {
@@ -4685,19 +4698,48 @@ impl AppState {
     /// with.
     fn sync_auto_commit_indicators(&mut self) {
         self.refresh_active_connection_view();
-        let Some(connection_default) = self.active_connection_auto_commit() else {
+        // FLTK menu items belong to the pulldown while one is open, and this
+        // now runs on every status tick. Nothing is lost by waiting: the next
+        // tick states the item again.
+        if app::grab().is_some() {
+            return;
+        }
+        let Some(menu) = app::widget_from_id::<MenuBar>("main_menu") else {
             return;
         };
-        let effective = crate::ui::sql_editor::SqlEditorWidget::effective_auto_commit(
-            connection_default,
-            self.sql_editor.tab_auto_commit_override_value(),
-        );
-        if let Some(menu) = app::widget_from_id::<MenuBar>("main_menu") {
-            if let Some(mut item) = menu.find_item("&Tools/&Auto-Commit") {
-                if effective {
-                    item.set();
-                } else {
+        let Some(mut item) = menu.find_item("&Tools/&Auto-Commit") else {
+            return;
+        };
+        // Shown only for a connection this tab is really on and that was really
+        // read — the same filter the status-bar indicator applies, because the
+        // two are one value.
+        let effective = self
+            .active_connection_auto_commit()
+            .filter(|_| self.has_live_connection)
+            .map(|connection_default| {
+                crate::ui::sql_editor::SqlEditorWidget::effective_auto_commit(
+                    connection_default,
+                    self.sql_editor.tab_auto_commit_override_value(),
+                )
+            });
+        match effective {
+            Some(true) => {
+                item.set();
+                item.activate();
+            }
+            Some(false) => {
+                item.clear();
+                item.activate();
+            }
+            // No live connection: there is no session for the toggle to act on
+            // and no auto-commit in effect to show, so the item says neither —
+            // the transaction-mode combos beside it answer a missing connection
+            // the same way. A connection that merely could not be READ this
+            // tick keeps what it had; the next tick fills it in.
+            None => {
+                if !self.has_live_connection {
                     item.clear();
+                    item.deactivate();
                 }
             }
         }
@@ -4838,6 +4880,21 @@ fn unregistered_lazy_fetch_session_matches_context(
         && session_id != 0
         && operation_id == session_id
         && connection_generation == token.connection_generation
+}
+
+/// Whether a LATER execution has since started on this tab, which is what makes
+/// a report from `token` stale even though it was true when it was sent.
+///
+/// Operation ids come from one monotonic counter shared by statements, toolbar
+/// actions and lazy cursors, so "greater" means "later" across all of them.
+/// Both ids are asked because an execution that has already finished leaves
+/// `current_operation_id` at 0 and only `last_completed_operation_id` behind.
+fn query_operation_was_superseded(
+    token: QueryOperationToken,
+    current_operation_id: u64,
+    last_completed_operation_id: u64,
+) -> bool {
+    current_operation_id > token.operation_id || last_completed_operation_id > token.operation_id
 }
 
 fn operation_progress_token_matches_current_editor(

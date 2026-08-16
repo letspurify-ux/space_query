@@ -198,8 +198,28 @@ fetch handover all read, or the thin batch's transition context) and reports it
 to the window exactly once, by `QueryProgress::ScopeChangedNotice`, carrying the
 scope the statement itself selected. Recording and reporting are one step
 because they were two: sites that reported without recording left the rest of
-the script running in the scope the tab had when the run started. That report
-moves the originating tab's BINDING and browser card, and nothing else — it
+the script running in the scope the tab had when the run started.
+
+Both Oracle drivers also write the new scope onto the tab's BINDING from the
+worker, through `record_batch_scope_on_tab_binding`, which asks the two
+questions that make a worker's write the tab's to make: is this execution still
+the one the tab is on (`SessionHandBackOwner::is_current`), and is the tab still
+bound to what this batch resolved (`TabConnectionBinding::set_scope_if_revision`
+— the worker's door; the bare `set_scope` belongs to the UI thread, which owns
+the tab). Neither question implies the other: a rebind does not move the
+operation id, and a new execution does not move the revision. The MySQL family
+records only its own batch cell and leaves the binding to the window. The batch's
+own record of the scope is never gated on either question — the session really
+did move, so the rest of that batch must assert the new scope whatever the tab
+has since done.
+
+The window applies the report unless a LATER execution already owns the tab: an
+abandoned operation's notice is still a FACT about the tab's session and must
+land (a terminate racing the worker otherwise left the tab naming a schema its
+session had left, which the next statement's assertion made true again), while a
+superseded one describes a session the tab no longer has
+(`query_operation_was_superseded`). That report moves the originating tab's
+BINDING and browser card, and nothing else — it
 must not re-apply the scope to the session, which the statement that emitted it
 has already moved. Doing so took the tab's retained lease out of its slot from
 the UI thread while the batch that owns it was still running, and the MySQL

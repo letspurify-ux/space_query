@@ -152,41 +152,52 @@ fails THEIRS.
 
 "Has this transaction ended?" is answered from what the app tracked, until that
 answer stops being knowledge. A PL/SQL block or a `CALL` may commit internally,
-which ends the transaction the mode was attached to with nothing else to notice,
-so after a statement the app cannot see into both drivers ask the SERVER through
-one shared predicate (`oracle_transaction_mode_boundary_needs_server_answer`) —
-thin from the wire flag it already carries, OCI from a probe, which is what that
-answer costs there.
+which ends the transaction the mode was attached to with nothing else to notice.
+From that point the app does not ask a probe, because **no Oracle probe can
+answer**: OCI's `DBMS_TRANSACTION.LOCAL_TRANSACTION_ID` and the thin driver's
+status flag both report the transaction id Oracle assigns on the first WRITE, so
+neither can see the transaction a pinned tab's own `SET TRANSACTION` opens. It
+STATES the mode instead and reads the server's reply, through one shared
+predicate (`oracle_transaction_mode_boundary_must_be_restated`): the statement
+applies, or ORA-01453 says a transaction is already open and the pin belongs to
+the next one. Both replies are knowledge, and the round trip is the one the
+probe used to cost.
 
 Deciding that and recording what the current statement leaves behind are ONE
-call, `OracleTransactionBoundaryTracker::transaction_open_before_statement`,
-because they were two and the two loops ordered them oppositely: OCI recorded
-after its decision, thin before it. Thin therefore read the opacity of the
-statement it was about to run instead of the one that had just run, so
-`INSERT; BEGIN COMMIT; END; SELECT …` made OCI ask the server and re-apply the
-pin while thin asked nothing and ran the rest of the batch at the session
+call, `OracleTransactionBoundaryTracker::begin_statement`, because they were two
+and the two loops ordered them oppositely: OCI recorded after its decision, thin
+before it. Thin therefore read the opacity of the statement it was about to run
+instead of the one that had just run, so `INSERT; BEGIN COMMIT; END; SELECT …`
+made OCI re-apply the pin while thin ran the rest of the batch at the session
 default — one script, two answers, from a predicate both drivers shared. The
-recorded claim is also monotone: a plain `SELECT` after the block does not make
-the block's commit visible, so nothing a readable statement does may clear the
-guess. Only learning the truth does.
+decision hands out a `#[must_use]` step that is spent where the statement's fate
+is known — `ran` past every refusal (the last of which is the per-statement
+scope assertion), `refused` at each one — so a statement that never reached the
+server records nothing.
+
+Everything the tracker records is MONOTONE, and for two reasons. A plain
+`SELECT` after the block does not make the block's commit visible, so no
+readable statement may clear the guess. And a statement is recorded BEFORE it is
+sent, so nothing at that point knows whether it reached the server or what it
+did there: a write refused at parse time wrote nothing, and lowering "this
+transaction may be invisible to a write probe" from it let the batch end file a
+pinned tab's open transaction as clean. Claims are lowered only by an ANSWER —
+the server stating the mode, a replaced session, or the batch-end probe.
 
 That correction reaches the statements of one batch, and the guess is filed with
-the session. Oracle's pre-batch gate never states the pin over a session that may
-hold a transaction and no later batch has a reason to ask, so a guess that
-survives the batch governs every later batch on the tab — the toolbar keeps
-claiming the pin while the tab runs at the session default until the user commits
-or rolls back. Both drivers therefore settle it with the server before they file:
-thin reads its wire flag at batch end, OCI probes once in the same position, and
-both hand the answer to one rule,
+the session, so both drivers settle it with the server before they file:
 `RetainedSessionState::with_transaction_claim_settled_by_server`. It is
 deliberately narrow — it lowers only a claim the app could not READ (the
 failed-statement rule above stays intact), only on an answer (an interrupted
-batch has none), and only from `MaybeDirty`, because
-`DBMS_TRANSACTION.LOCAL_TRANSACTION_ID` cannot see a read-only transaction and
-"no transaction" is therefore never proof that nothing is left to resolve.
-Session residue is untouched: it is not the transaction, and it is why the
-session stays with its tab. The MySQL family has asked the same closing question
-since the failed-implicit-commit round; this is Oracle joining it.
+batch has none), only from `MaybeDirty`, and only when the probe could have SEEN
+the transaction in question (`ServerTransactionAnswer::NoWriteTransaction`
+settles nothing about a claim the batch flagged as possibly write-less). A claim
+left standing is safe because it no longer governs the next batch: every batch
+states the tab's mode and lets the server answer, so a stale "a transaction may
+be open" costs one round trip and is corrected rather than obeyed. Session
+residue is untouched: it is not the transaction, and it is why the session stays
+with its tab. The MySQL family has asked the same closing question since the
+failed-implicit-commit round; this is Oracle joining it.
 
 A boundary re-application refused with **ORA-01453 is an answer, not a failure**:
 it says a transaction is still running, so the pin belongs to the next one,
@@ -199,14 +210,21 @@ reading the answer would otherwise leave an open read-only transaction that
 `DBMS_TRANSACTION.LOCAL_TRANSACTION_ID` cannot see, and every later batch would
 fail with ORA-01453.
 
-The same rule decides whether a batch may state the mode BEFORE its first
-statement: `oracle_session_may_state_transaction_mode()` asks only whether the
-session it was handed may still hold a transaction. Session RESIDUE is not a
-reason to wait — a `SET ROLE`, an unknown `ALTER SESSION` or a temporary table
-keeps the physical session with its tab while opening no transaction — and
-treating it as one ran the whole batch at the session default under a pinned
-tab. The MySQL family needs no equivalent: it states the mode as SESSION state
-when it prepares the session, and a preserved session still carries it.
+**Nothing the session carries delays stating the mode.** A batch states the
+tab's pinned mode before its first statement whatever the session it was handed
+holds, and the two exceptions are about the batch's own STATEMENTS: a leading
+script `CONNECT` (the mode belongs to the new connection) and the user's own
+transaction-first statement (which must be first in its transaction itself).
+There used to be a third, a gate that skipped the mode over a session that "may
+have uncommitted work" — from the era when ORA-01453 failed the batch. Once that
+refusal became an answer the gate only did harm: "may have uncommitted work" is
+a GUESS after any statement whose body the app cannot read, and it is filed with
+the session, so a single `BEGIN … COMMIT; END;` made every LATER batch of a
+pinned tab skip the pin as well. The tab ran at the session default for the rest
+of its life while the toolbar showed Serializable or Read only, and nothing
+would ever ask again. The MySQL family needs no equivalent either way: it states
+the mode as SESSION state when it prepares the session, and a preserved session
+still carries it.
 
 ### Read only is one answer, asked by every path that writes
 

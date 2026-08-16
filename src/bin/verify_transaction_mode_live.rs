@@ -107,6 +107,10 @@
 //       recording what the current statement leaves behind were two calls the
 //       two loops ordered oppositely, so thin read the opacity of the statement
 //       it was about to run and asked the server nothing.
+//   S59 (Oracle) the same as S58 for a tab that only READS: the only
+//       transaction on the session is the one the pin itself opened, which no
+//       Oracle probe can see, so the tab must not be filed as still holding it
+//       and every later batch must still state the pin.
 //   S58 (Oracle) the guess that block leaves does not outlive its batch. It is
 //       filed with the SESSION, and the pre-batch gate obeys it, so it unpinned
 //       every later batch on the tab. Two batches on purpose: inside one, S57's
@@ -1604,6 +1608,61 @@ fn run_scenarios(target: Target, h: &mut Harness) -> Result<(), String> {
                     "reads in the next batch: {reads:?} (different values mean the \
                      previous batch filed a guess the pre-batch gate then obeyed \
                      for the life of the session)"
+                ),
+            );
+            h.run("ROLLBACK")?;
+            h.editor.clear_tab_transaction_mode_override();
+            let _ = h.editor.discard_pooled_session_for_close();
+        }
+
+        // ---- S59 (Oracle): the same question as S58 for a tab that only
+        // READS. S58 leads with an `UPDATE`, and that one word is why it passed
+        // against the defect this scenario exists for: a write gives the
+        // transaction the id Oracle assigns on the first write, so the batch-end
+        // probe could see it and settle the guess honestly. Take the write away
+        // and the only transaction on the session is the one the PIN itself
+        // opened with `SET TRANSACTION` — which has written nothing, and which
+        // neither Oracle driver's probe can see. Filing the session on that
+        // answer left the tab MaybeDirty forever, and a pre-batch gate that
+        // skipped the pin over exactly that state ran every LATER batch at the
+        // session default while the toolbar kept showing the pin.
+        //
+        // Derived from S58 by changing ONE thing (the first batch's lead
+        // statement), so the rest of its shape and timing still hold.
+        if target.is_oracle() {
+            println!("  --- S59 a read-only batch that ends on a PL/SQL commit keeps the pin ---");
+            h.run("ROLLBACK")?;
+            let _ = h.editor.discard_pooled_session_for_close();
+            h.editor.set_tab_transaction_mode(TransactionMode::new(
+                pinned_isolation,
+                TransactionAccessMode::ReadWrite,
+            ));
+            let first_batch = h.run("SELECT V FROM SQ_TM_ISO;\nBEGIN COMMIT; END;\n/")?;
+            let first_batch_failed = first_batch
+                .results
+                .iter()
+                .filter(|result| !result.success)
+                .map(|result| (result.sql.clone(), result.message.clone()))
+                .collect::<Vec<_>>();
+            h.check(
+                "S59 the read-only batch that ends on an unreadable statement ran",
+                first_batch_failed.is_empty(),
+                format!("failed statements: {first_batch_failed:?}"),
+            );
+            let (reads, failed) = bracketed_reads_in_one_batch(h, &mut other, "", sleep_statement)?;
+            h.check(
+                "S59 every statement of the NEXT batch ran",
+                failed.is_empty(),
+                format!("failed statements: {failed:?}"),
+            );
+            let pair = last_pair(&reads);
+            h.check(
+                "S59 the next batch still runs under the tab's pinned isolation",
+                pair.is_some_and(|(first, second)| first == second),
+                format!(
+                    "reads in the next batch: {reads:?} (different values mean the tab \
+                     was filed as still holding the transaction its own pin opened, and \
+                     every later batch skipped the pin over it)"
                 ),
             );
             h.run("ROLLBACK")?;

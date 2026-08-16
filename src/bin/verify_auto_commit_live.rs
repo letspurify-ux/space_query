@@ -62,6 +62,10 @@
 //       tab already has changes nothing, so it must NOT be refused over
 //       uncommitted work and must not stop the script that contains it.
 //
+//   S28 (Oracle) a labelled anonymous block (`<<outer>> BEGIN … END;`) is the
+//       block it labels: it is executed as one, so under manual commit its
+//       write is uncommitted work the tab still owns and can roll back.
+//
 //   S27 (MySQL family) auto-commit does not answer for a statement whose body
 //       the app cannot read: a stored procedure may START TRANSACTION and
 //       return without committing. Driven both ways -- a batch that ENDS
@@ -1705,6 +1709,80 @@ fn run_scenarios(target: Target, h: &mut Harness) -> Result<(), String> {
 
         let _ = h.run("DROP PROCEDURE IF EXISTS sq_ac_open_txn");
         let _ = h.menu_auto_commit(false);
+    }
+
+    // ---- S28 (Oracle): a LABELLED block is the block it labels ------------
+    // The script splitter has always recognised `<<outer>> BEGIN … END;` and
+    // run it as a block, while every classification rule read the leading WORDS
+    // and saw a statement it did not know: no PL/SQL kind, no session residue,
+    // no uncommitted work. Under manual commit that filed the user's open
+    // transaction as CLEAN — the close prompt never armed, the toolbar offered
+    // no Commit or Rollback for it, and the session was free to go back to the
+    // pool with the transaction still open (Oracle pools do not reset a
+    // returned session). Same script, one label of difference.
+    if target.is_oracle() {
+        println!("  --- S28 a labelled PL/SQL block leaves the work it really left ---");
+        h.set_connection_auto_commit(false)
+            .map_err(|e| format!("set_auto_commit(false): {e}"))?;
+        h.editor.sync_tab_auto_commit_with_global_setting(false);
+        h.run("ROLLBACK")?;
+        let before_labelled = h.select_v()?;
+        let capture = h.run("<<sq_ac_outer>>\nBEGIN\n  UPDATE SQ_AC_T SET V = V + 1;\nEND;\n/")?;
+        let block_ok = capture.results.iter().all(|result| result.success);
+        h.check(
+            "S28 the labelled block ran",
+            block_ok,
+            format!(
+                "results={:?}",
+                capture
+                    .results
+                    .iter()
+                    .map(|r| (r.success, r.message.clone()))
+                    .collect::<Vec<_>>()
+            ),
+        );
+        // Both halves of what a block leaves. OCI's cleanup probe can see a
+        // transaction that WROTE, so it repairs the transaction half on its
+        // own — the residue half is where the misclassification shows on both
+        // drivers: a body the app cannot read may leave session state the pool
+        // cannot restate, so the session must stay with its tab instead of
+        // going back to the pool.
+        h.check(
+            "S28 the labelled block's session stays with its tab",
+            h.editor
+                .pooled_session_activity_snapshot()
+                .is_some_and(|snap| snap.retained_state().may_have_untracked_session_state()),
+            format!(
+                "retained state: {:?}",
+                h.editor
+                    .pooled_session_activity_snapshot()
+                    .map(|snap| snap.retained_state())
+            ),
+        );
+        h.check(
+            "S28 the labelled block's write is the tab's to resolve",
+            h.close_would_prompt(),
+            format!(
+                "close preflight saw nothing to resolve; retained state: {:?}",
+                h.editor
+                    .pooled_session_activity_snapshot()
+                    .map(|snap| snap.retained_state())
+            ),
+        );
+        h.toolbar_rollback();
+        let after_labelled = h.select_v()?;
+        h.check(
+            "S28 the rollback takes the labelled block's write back",
+            after_labelled == before_labelled,
+            format!("expected {before_labelled}, got {after_labelled}"),
+        );
+        // The block leaves session state the pool cannot restate — which is
+        // half of what this scenario checks — so the session is now the tab's
+        // until it is resolved. Hand it back the way the tab's close path does,
+        // or the next scenario's script `CONNECT` refuses to discard it and
+        // runs on a tab that is no longer connected. Every scenario that leaves
+        // residue behind ends this way.
+        let _ = h.editor.discard_pooled_session_for_close();
     }
 
     // ---- S4 (Oracle): READ ONLY transaction vs piggybacked commit ---------

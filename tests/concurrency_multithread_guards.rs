@@ -354,13 +354,24 @@ fn db_tab_session_slot_is_shared_abstraction_not_raw_arc_alias() {
 }
 
 #[test]
-fn oracle_reused_open_transaction_skips_transaction_mode_reapply() {
+fn oracle_states_the_tabs_transaction_mode_over_a_reused_session() {
     let file = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/ui/sql_editor/execution.rs");
     let content = fs::read_to_string(&file)
         .unwrap_or_else(|err| panic!("failed to read source file {}: {err}", file.display()));
 
-    // Pin the invariant, not the formatting: whatever else gates the reapply,
-    // a session that must be preserved always suppresses it.
+    // RENAMED AND INVERTED, with its reason. This used to pin that a reused
+    // session which "may still hold a transaction" SKIPS the mode application,
+    // from the era when ORA-01453 failed the batch. Round 9 made that refusal
+    // an answer, and the skip then did the damage on its own: "may hold a
+    // transaction" is a GUESS after any statement whose body the app cannot
+    // read, and it is filed with the session, so one `BEGIN … COMMIT; END;`
+    // made every LATER batch of a pinned tab skip the pin too — the tab ran at
+    // the session default while the toolbar showed Serializable or Read only.
+    //
+    // What the app does now: it states the mode and lets the server answer.
+    // The decision may therefore ask about the batch's own STATEMENTS (a
+    // leading CONNECT, the user's own transaction-first statement) and about
+    // nothing the session carries.
     let decision_start = content
         .find("let should_apply_oracle_transaction_mode =")
         .expect("Oracle transaction-mode reapply decision should exist");
@@ -370,10 +381,42 @@ fn oracle_reused_open_transaction_skips_transaction_mode_reapply() {
         .expect("the reapply decision should be a single statement");
     let decision = &content[decision_start..decision_end];
     assert!(
-        decision.contains("oracle_session_may_state_transaction_mode"),
-        "Oracle execution must not state SET TRANSACTION on a session that may still \
-         hold a transaction — and must ask the shared rule, which reads the \
-         TRANSACTION half of the retained state rather than session residue"
+        decision.contains("!batch_starts_with_connect")
+            && decision.contains("!explicit_transaction_first_statement"),
+        "the decision may only yield to the batch's own statements"
+    );
+    for retained_state_question in [
+        "retained_state",
+        "may_have_uncommitted_work",
+        "requires_physical_session_preservation",
+        "oracle_session_may_state_transaction_mode",
+    ] {
+        assert!(
+            !decision.contains(retained_state_question),
+            "nothing the session carries may decide it: `{retained_state_question}` is a claim \
+             the app cannot vouch for, and skipping the pin over it cost the tab its mode for \
+             the rest of its life"
+        );
+    }
+    // The rule is gone everywhere, not just here.
+    assert!(
+        !content.contains("fn oracle_session_may_state_transaction_mode(")
+            && !content.contains("fn should_apply_oracle_thin_transaction_mode("),
+        "the retained-state gate must not come back on either driver"
+    );
+    // What makes stating it always safe: the refusal is read as an ANSWER at
+    // every application site, on both drivers.
+    assert_eq!(
+        content
+            .matches("Ok(OracleTransactionModeApplied::TransactionStillOpen) => {")
+            .count(),
+        2,
+        "both OCI application sites must read ORA-01453 as the pin belonging to the next \
+         transaction, and record that the server just answered"
+    );
+    assert!(
+        content.contains("if crate::db::oracle_error_says_transaction_still_open(&message) {"),
+        "and the thin loop must read the same refusal the same way"
     );
     // Pin that the application really sits inside that guard, without pinning
     // how rustfmt wraps the call.
@@ -2117,6 +2160,58 @@ fn mysql_plain_use_statement_updates_scope_and_refreshes_metadata() {
 }
 
 #[test]
+fn a_worker_moves_its_tabs_scope_only_while_it_still_owns_the_tab() {
+    // The binding is the TAB's and the batch is not the tab: a script `CONNECT`
+    // rebinds it, and a force-cancelled batch keeps unwinding while the NEXT
+    // execution owns it. Both Oracle drivers write the scope from their worker
+    // thread (the MySQL family records only its own batch cell and leaves the
+    // binding to the UI thread), and an unguarded write there left the tab
+    // naming a schema its current session was not in — which the next
+    // statement's scope assertion then made true, carrying the user's open
+    // transaction into it.
+    let execution = read_source("src/ui/sql_editor/execution.rs");
+    let runtime = read_source("src/db/runtime.rs");
+
+    // One door for a worker, and it is the guarded one.
+    assert_eq!(
+        execution.matches(".set_scope(").count(),
+        0,
+        "a worker must not write the tab's scope through the UI thread's door"
+    );
+    let helper = execution
+        .find("fn record_batch_scope_on_tab_binding(")
+        .map(|offset| slice_from(&execution, offset, 900))
+        .expect("both drivers must share one rule for recording the scope on the binding");
+    assert!(
+        helper.contains("if !session_owner.is_current()"),
+        "it must refuse once a LATER execution owns the tab"
+    );
+    assert!(
+        helper.contains("set_scope_if_revision(binding_revision"),
+        "and refuse once the tab is bound to something else — neither question implies the \
+         other: a rebind does not move the operation id, and a new execution does not move \
+         the revision"
+    );
+    assert_eq!(
+        execution
+            .matches("record_batch_scope_on_tab_binding(")
+            .count(),
+        4,
+        "the two OCI sites and the thin site must all go through it (plus its definition)"
+    );
+
+    // And the door itself compares before it writes.
+    let door = runtime
+        .find("pub fn set_scope_if_revision(")
+        .map(|offset| slice_from(&runtime, offset, 700))
+        .expect("the revision-checked scope door should exist");
+    assert!(
+        door.contains("if state.revision != expected_revision") && door.contains("return Err("),
+        "a stale revision must be refused, not written"
+    );
+}
+
+#[test]
 fn a_scope_change_updates_the_originating_tab_without_releasing_sessions() {
     let file = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/ui/main_window.rs");
     let content = fs::read_to_string(&file)
@@ -2158,10 +2253,36 @@ fn a_scope_change_updates_the_originating_tab_without_releasing_sessions() {
         })
         .unwrap_or(content.len());
     let currency_body = &content[currency..currency_end];
+    // Two answers, not one. ABANDONED is not stale: the notice reports what
+    // already happened on the tab's session, so a terminate landing in the gap
+    // must not drop it — that left the tab naming a scope its session had
+    // left, and the next statement's assertion moved the user's open
+    // transaction back to it. SUPERSEDED is stale: a force-cancelled batch
+    // keeps unwinding while the NEXT execution owns the tab, and that
+    // execution's session is where the tab really is.
+    let notice_arm = currency_body
+        .find("QueryProgress::ScopeChangedNotice { .. } =>")
+        .map(|offset| &currency_body[offset..])
+        .expect("the currency filter must answer for a scope notice");
     assert!(
-        currency_body.contains("QueryProgress::ScopeChangedNotice { .. } => return true,"),
-        "a scope change already happened on the session: the currency filter must let it \
-         through, or a terminate landing in the gap leaves the tab naming a scope it left"
+        notice_arm.contains("query_operation_was_superseded("),
+        "a scope notice is refused only when a LATER execution owns the tab"
+    );
+    assert!(
+        !notice_arm[..notice_arm
+            .find("            _ => {}")
+            .unwrap_or(notice_arm.len())]
+            .contains("abandoned_query_operations"),
+        "and never for an abandoned operation: what it reports already happened"
+    );
+    let superseded = content
+        .find("fn query_operation_was_superseded(")
+        .map(|offset| &content[offset..offset + 700])
+        .expect("the supersession rule should be named once");
+    assert!(
+        superseded.contains("current_operation_id > token.operation_id")
+            && superseded.contains("last_completed_operation_id > token.operation_id"),
+        "a later execution that has already FINISHED supersedes it too"
     );
 
     // Scope is TAB-scoped: a `USE` ran on ONE tab's session, so only that
@@ -3458,9 +3579,17 @@ fn transaction_mode_state_has_a_single_source_of_truth() {
         thin_body.contains("boundary_step.ran(") && thin_body.contains("boundary_step.refused()"),
         "and the thin loop must spend that obligation: recorded once the statement is really          going to the server, discarded at every refusal"
     );
+    // CHANGED, with its reason: this used to require the thin loop to answer
+    // the boundary question from the wire flag. That flag reports the
+    // transaction id Oracle assigns on the first WRITE, exactly like OCI's
+    // probe, so neither can see the transaction a pinned tab's own
+    // `SET TRANSACTION` opens — and answering "none" from it filed the tab's
+    // open transaction as clean. Neither driver asks a probe any more: they
+    // state the mode, and ORA-01453 is the server's answer.
     assert!(
-        thin_body.contains("conn.transaction_in_progress()"),
-        "and answer it from the wire flag the protocol already carries"
+        !thin_body.contains("|| conn.transaction_in_progress()"),
+        "the thin boundary decision must not answer from a flag that cannot see a \
+         transaction which has only read"
     );
     // The OCI batch runs inside the shared execution worker rather than a
     // function of its own, so anchor on the re-apply itself.
@@ -3491,9 +3620,23 @@ fn transaction_mode_state_has_a_single_source_of_truth() {
         oci_reapply_window.contains("boundary_step.transaction_open()"),
         "and read its answer from the token rather than from a second question"
     );
+    // Same for OCI, whose probe is `DBMS_TRANSACTION.LOCAL_TRANSACTION_ID`:
+    // the boundary decision costs no round trip at all now, because stating the
+    // mode is the question.
     assert!(
-        oci_reapply_window.contains("oracle_session_may_have_uncommitted_work("),
-        "and answer it with the probe, which is what that answer costs on OCI"
+        !oci_reapply_window.contains("SqlEditorWidget::oracle_session_may_have_uncommitted_work(\n                                        conn.as_ref(),"),
+        "the OCI boundary decision must not answer from a write probe either"
+    );
+    let boundary_rule = transaction
+        .find("pub(crate) fn oracle_transaction_mode_boundary_must_be_restated(")
+        .map(|offset| slice_from(&transaction, offset, 400))
+        .expect("one shared rule must decide when the tracked answer stops being knowledge");
+    assert!(
+        boundary_rule.contains(
+            "!mode.is_default() && tracked_transaction_open && last_statement_was_opaque"
+        ),
+        "and both drivers must decide it the same way: a pinned tab whose claim rests on a \
+         statement the app could not read re-states the mode"
     );
     // The order the two loops used to spell for themselves now lives in the
     // token, so neither loop may record on its own.
@@ -3510,29 +3653,100 @@ fn transaction_mode_state_has_a_single_source_of_truth() {
     // cannot read — which is why recording a refused one was the bug.
     assert_eq!(
         execution.matches("boundary_step.refused();").count(),
-        6,
+        7,
         "each refusal path between the boundary decision and the statement must say the \
-         statement never ran: three per Oracle loop (the mode could not be stated, the tab's \
-         mode refuses the statement, the tab's scope could not be asserted). A path that \
-         stops saying so is a statement recorded as having run when it never reached the \
-         server, which is the shape this whole clause exists for"
+         statement never ran: the mode could not be stated, the tab's mode refuses the \
+         statement, and the tab's scope could not be asserted, on both loops — plus the \
+         OCI-only statement option-change gate. A path that stops saying so is a statement \
+         recorded as having run when it never reached the server, which is the shape this \
+         whole clause exists for"
     );
     assert_eq!(
         execution.matches("boundary_step.ran(").count(),
-        2,
-        "and exactly one place per Oracle loop records, past every refusal"
+        4,
+        "and every path that really reaches the server records: the main one in each loop, \
+         plus the OCI branches that run a plain COMMIT/ROLLBACK and leave the loop"
     );
+    // ORDER, not just existence — the failure this clause was blind to. The
+    // scope assertion is the LAST gate before a statement is sent, and OCI
+    // recorded above it, so a statement skipped because the tab's scope was
+    // gone still counted as having run (the thin loop, which records below it,
+    // answered the same script differently). Recording must sit below the
+    // assertion in both loops.
+    // The OCI statement loop is not a function of its own, so take a window
+    // long enough to hold one statement's whole path from the boundary
+    // decision to the send.
+    let oci_statement_path = slice_from(&execution, oci_reapply, 40_000);
+    for (loop_name, body, assertion) in [
+        (
+            "thin",
+            thin_body,
+            "Self::apply_oracle_thin_schema_before_statement(",
+        ),
+        (
+            "OCI",
+            oci_statement_path,
+            "Self::apply_oracle_schema_before_pooled_action(",
+        ),
+    ] {
+        let asserted = body
+            .find(assertion)
+            .unwrap_or_else(|| panic!("the {loop_name} loop must assert the tab's scope"));
+        assert!(
+            body[asserted..].contains("boundary_step.ran("),
+            "the {loop_name} loop must record the statement AFTER the scope assertion, or a \
+             statement it skips is recorded as having run"
+        );
+        // A record ABOVE the assertion is only honest for a branch that runs
+        // the statement itself and leaves the loop — OCI answers a plain
+        // COMMIT/ROLLBACK there, and asserts no scope for them because they do
+        // not resolve names.
+        let mut before = &body[..asserted];
+        while let Some(offset) = before.find("boundary_step.ran(") {
+            let tail = &before[offset..];
+            assert!(
+                tail[..tail.len().min(300)].contains("continue;"),
+                "a {loop_name} record above the scope assertion must belong to a branch that \
+                 ran the statement itself and left the loop"
+            );
+            before = &before[offset + "boundary_step.ran(".len()..];
+        }
+    }
     // The claim survives a statement the app CAN read: a plain SELECT after a
     // PL/SQL block does not make the block's commit visible, so a later
     // readable statement must not clear the guess. `|=`, never `=`.
     let tracker_start = execution
         .find("fn note_statement(&mut self, effects: crate::db::StatementSessionEffects)")
         .expect("the tracker must record what a statement leaves behind");
-    let tracker_body = slice_from(&execution, tracker_start, 320);
+    // Bounded by the function's own END, not by a byte count: the next
+    // function down is `note_known_transaction_state`, whose whole job is to
+    // lower a claim, and a window that overran into it would report the
+    // opposite of what this clause checks.
+    let tracker_body = {
+        let body = slice_from(&execution, tracker_start, 2_000);
+        let end = body
+            .find("\n    }\n")
+            .expect("the tracker's record function should end");
+        &body[..end]
+    };
     assert!(
         tracker_body.contains("self.transaction_claim_is_a_guess |="),
         "a guess must be monotone: only learning the truth may clear it, never a \
          statement the app happens to be able to read"
+    );
+    // EVERY claim recorded here is monotone, for a second reason: a statement
+    // is recorded BEFORE it is sent, so nothing here knows whether it reached
+    // the server. A write that failed at parse time lowered "this transaction
+    // may be invisible to a write probe" and let the batch end file a pinned
+    // tab's open transaction as clean.
+    assert!(
+        !tracker_body.contains("= false"),
+        "nothing a statement recorded before it runs may LOWER; only an answer does"
+    );
+    assert!(
+        tracker_body.contains("self.open_transaction_may_be_invisible = true"),
+        "and the one claim it raises is that the pin's own SET TRANSACTION opened a \
+         transaction no write probe can see"
     );
     // And the guess is about the TRANSACTION, so it reads the transaction's own
     // opacity — the question the MySQL family has always asked. Reading the
@@ -5447,46 +5661,75 @@ fn pool_session_work_is_bound_to_the_connection_generation_not_the_epoch() {
 }
 
 #[test]
-fn only_an_open_transaction_delays_stating_the_tabs_transaction_mode() {
-    // Oracle expresses the mode as a property of the TRANSACTION, so the
-    // statements that express it must be first in their transaction: a session
-    // that may still hold one refuses them (ORA-01453) and the mode waits for
-    // the next boundary inside the batch. That is the ONLY reason to wait.
-    // Session RESIDUE — a SET ROLE, an unknown ALTER SESSION, a temporary
-    // table — preserves the session for its tab but opens no transaction, and
-    // waiting for it ran the whole batch at the session default while the
-    // toolbar showed the pin (OCI and thin's lazy SELECT; thin's batch loop
-    // corrected itself — one script, two answers).
+fn nothing_the_session_carries_delays_stating_the_tabs_transaction_mode() {
+    // RENAMED AND INVERTED, with its reason. The rule used to be "only an OPEN
+    // TRANSACTION delays the mode" — session residue does not — and it was
+    // right about residue. It was wrong that an open transaction should delay
+    // anything: "a transaction may be open" is a GUESS after any statement
+    // whose body the app cannot read (`BEGIN … END`, `CALL`), the guess is
+    // filed with the session, and Oracle has no probe that can settle it (both
+    // drivers see only the transaction id assigned on the first WRITE, so
+    // neither can see the transaction a pinned tab's own `SET TRANSACTION`
+    // opens). A pinned tab that ran one PL/SQL block therefore skipped the pin
+    // in that batch AND in every later one, running at the session default
+    // while the toolbar showed Serializable or Read only.
+    //
+    // Since round 9 the server answers the question directly: `SET TRANSACTION`
+    // either applies, or is refused with ORA-01453 because a transaction is
+    // open — which means the pin belongs to the next transaction. So the app
+    // states the mode and reads the answer, on both drivers, for every batch.
     let execution = read_source("src/ui/sql_editor/execution.rs");
-    let rule = execution
-        .find("fn oracle_session_may_state_transaction_mode(")
-        .expect("both Oracle drivers should ask one rule");
-    let rule_body = &execution[rule..rule + 400];
+
+    // No gate, on either driver, under any name.
+    for gone in [
+        "fn oracle_session_may_state_transaction_mode(",
+        "fn should_apply_oracle_thin_transaction_mode(",
+        "oracle_prior_requires_physical_session_preservation",
+    ] {
+        assert!(
+            !execution.contains(gone),
+            "`{gone}` decided whether to state the tab's mode from a claim the app cannot \
+             vouch for; the server decides now"
+        );
+    }
+
+    // The thin loop starts every batch owing the mode, exactly like OCI, which
+    // states it before its first statement.
+    let thin_start = execution
+        .find("fn execute_oracle_thin_batch_with_connection<")
+        .expect("the thin batch loop should exist");
+    let thin_end = execution[thin_start..]
+        .find("\n    fn ")
+        .map(|offset| thin_start + offset)
+        .unwrap_or(execution.len());
+    let thin_body = &execution[thin_start..thin_end];
     assert!(
-        rule_body.contains("!prior_retained_state.may_have_uncommitted_work()"),
-        "the rule must key on the TRANSACTION half of the retained state"
+        thin_body.contains("let mut transaction_mode_applied = false;"),
+        "the thin batch must owe the tab's mode at its first statement, whatever the session \
+         it was handed carries"
     );
-    assert!(
-        !rule_body.contains("requires_physical_session_preservation"),
-        "session residue is not an open transaction and must not delay the mode"
-    );
-    // The thin batch, the thin lazy SELECT and the OCI batch all ask it.
-    assert!(
-        execution.contains(
-            "fn should_apply_oracle_thin_transaction_mode(\n        prior_retained_state: RetainedSessionState,\n    ) -> bool {\n        Self::oracle_session_may_state_transaction_mode(prior_retained_state)"
-        ),
-        "the thin gate must delegate to the shared rule"
-    );
-    let oci = execution
-        .find("let should_apply_oracle_transaction_mode =")
-        .expect("the OCI batch should decide whether to state the mode");
-    assert!(
-        execution[oci..oci + 300].contains("oracle_session_may_state_transaction_mode"),
-        "the OCI batch must ask the same rule as thin"
-    );
-    assert!(
-        !execution.contains("oracle_prior_requires_physical_session_preservation"),
-        "the old preservation-based gate must not come back"
+
+    // And the answer is recorded in BOTH directions at every application site:
+    // "applied" and "a transaction was already open" are both knowledge, and
+    // the second one also says the open transaction may be one no write probe
+    // can see — which is what keeps the batch end from filing it clean.
+    let production = execution
+        .find("mod query_execution_cleanup_tests")
+        .map(|offset| &execution[..offset])
+        .expect("the execution module should end with its tests");
+    // Whitespace-insensitive: rustfmt decides where this call wraps, and a
+    // clause that counts one spelling tests the formatter instead of the rule.
+    let production_flat = production.split_whitespace().collect::<Vec<_>>().join(" ");
+    assert_eq!(
+        production_flat
+            .matches("oracle_transaction_boundary .note_transaction_mode_stated(")
+            .count()
+            + production_flat
+                .matches("oracle_transaction_boundary.note_transaction_mode_stated(")
+                .count(),
+        5,
+        "every site that states the mode must record the server's answer: OCI pre-batch \
+         (applied / already open), OCI in-batch (applied / already open) and thin in-batch"
     );
 }
 
@@ -6381,6 +6624,38 @@ fn the_transaction_option_indicators_settle_themselves() {
     assert!(
         render_body.contains("self.sync_auto_commit_indicators();"),
         "the status tick must settle the auto-commit menu item, not only the status label"
+    );
+    // (1b) Running on every tick makes the item's whole appearance this
+    // function's answer, and it has THREE cases, not two. A value is shown only
+    // for a connection this tab is really on and that was really read — the
+    // same filter the status-bar indicator applies, because the two are one
+    // value. With no live connection there is no session for the toggle to act
+    // on and no auto-commit to show, so the item says neither, exactly as the
+    // transaction-mode combos beside it answer a missing connection. A
+    // connection that merely could not be READ this tick keeps what it had,
+    // because the next tick fills it in. And a pulldown owning the FLTK grab
+    // owns the menu's items while it is open, so this yields to it — the
+    // sibling sync has always done the same.
+    let indicators = main_window
+        .find("fn sync_auto_commit_indicators(&mut self) {")
+        .expect("the auto-commit indicator sync should exist");
+    let indicators_end = main_window[indicators..]
+        .find("\n    /// ")
+        .map(|offset| indicators + offset)
+        .unwrap_or(main_window.len());
+    let indicators_body = &main_window[indicators..indicators_end];
+    assert!(
+        indicators_body.contains("if app::grab().is_some() {"),
+        "the tick must not restate a menu item while a pulldown owns it"
+    );
+    assert!(
+        indicators_body.contains(".filter(|_| self.has_live_connection)"),
+        "a value may only be shown for a connection that is really there"
+    );
+    assert!(
+        indicators_body.contains("if !self.has_live_connection {")
+            && indicators_body.contains("item.deactivate();"),
+        "and with no live connection the item must show and offer nothing"
     );
 
     // (2) A connect states the isolation LABELS in the new database's

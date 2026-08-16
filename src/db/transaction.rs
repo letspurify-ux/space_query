@@ -4480,16 +4480,24 @@ pub(crate) fn oracle_error_says_transaction_still_open(message: &str) -> bool {
     message.to_ascii_lowercase().contains("ora-01453")
 }
 
-/// Whether the app has to ASK the server if a transaction is still open before
-/// it decides NOT to re-state the tab's transaction mode.
+/// Whether the app must RE-STATE the tab's transaction mode instead of trusting
+/// its own answer about whether a transaction is still open.
 ///
 /// The tracked answer is deliberately conservative: a PL/SQL block "may leave
 /// uncommitted work" because the app cannot see inside it. That is the right
 /// answer to "must this session be preserved?" and the wrong answer to "did the
 /// transaction the mode was attached to end?" — a block that commits internally
-/// ends it, and nothing else notices. So when the claim rests on a statement
-/// the app could not see into, the server gets the last word.
-pub(crate) fn oracle_transaction_mode_boundary_needs_server_answer(
+/// ends it, and nothing else notices.
+///
+/// The app does not ask a probe about it, because no Oracle probe can answer:
+/// `DBMS_TRANSACTION.LOCAL_TRANSACTION_ID` and the thin driver's status flag
+/// both report the transaction ID Oracle assigns on the first WRITE, so neither
+/// can see the transaction a pinned tab's own `SET TRANSACTION` opens. It
+/// states the mode and reads the server's reply instead: it applies, or
+/// ORA-01453 says a transaction was already open and the pin belongs to the
+/// next one ([`oracle_error_says_transaction_still_open`]). That answer is
+/// knowledge in both directions, and it costs the round trip the probe cost.
+pub(crate) fn oracle_transaction_mode_boundary_must_be_restated(
     mode: TransactionMode,
     tracked_transaction_open: bool,
     last_statement_was_opaque: bool,
@@ -5724,7 +5732,14 @@ mod tests {
     }
 
     #[test]
-    fn only_an_opaque_statement_sends_the_mode_boundary_to_the_server() {
+    fn only_an_opaque_statement_makes_the_app_restate_the_mode() {
+        // RENAMED, with its reason: the boundary used to be sent to a SERVER
+        // PROBE, and no Oracle probe can answer it — both drivers report the
+        // transaction id assigned on the first WRITE, so neither sees the
+        // transaction a pinned tab's own `SET TRANSACTION` opens. The app
+        // states the mode instead and reads ORA-01453 as "a transaction is
+        // already open". The cases below are unchanged: only a claim the app
+        // cannot vouch for, on a tab that has a pin, is worth a round trip.
         let pinned = TransactionMode::new(
             TransactionIsolation::Serializable,
             TransactionAccessMode::ReadWrite,
@@ -5732,20 +5747,21 @@ mod tests {
         // The tracked answer is a guess after a PL/SQL block or CALL: it may
         // have committed internally and ended the transaction the mode was
         // attached to, with nothing else to notice.
-        assert!(oracle_transaction_mode_boundary_needs_server_answer(
+        assert!(oracle_transaction_mode_boundary_must_be_restated(
             pinned, true, true
         ));
-        // Nothing to ask when the app watched the transaction itself...
-        assert!(!oracle_transaction_mode_boundary_needs_server_answer(
+        // Nothing to re-state when the app watched the transaction itself...
+        assert!(!oracle_transaction_mode_boundary_must_be_restated(
             pinned, true, false
         ));
-        // ... when it already knows the transaction ended ...
-        assert!(!oracle_transaction_mode_boundary_needs_server_answer(
+        // ... when it already knows the transaction ended, because the ordinary
+        // boundary re-application covers that ...
+        assert!(!oracle_transaction_mode_boundary_must_be_restated(
             pinned, false, true
         ));
         // ... or when there is no pin to re-state, which is the common case and
         // must never cost a round trip.
-        assert!(!oracle_transaction_mode_boundary_needs_server_answer(
+        assert!(!oracle_transaction_mode_boundary_must_be_restated(
             TransactionMode::default(),
             true,
             true
@@ -5875,6 +5891,68 @@ mod tests {
             ServerTransactionAnswer::from_oracle_probe(true),
             ServerTransactionAnswer::TransactionOpen
         );
+    }
+
+    #[test]
+    fn a_labelled_block_carries_the_session_effects_of_the_block_it_labels() {
+        // The session half of the same defect: the script splitter runs
+        // `<<outer>> BEGIN UPDATE … END;` as a block, so under manual commit it
+        // leaves an open transaction and session state the pool cannot restate
+        // — while the effects said it opened nothing, left nothing, and could
+        // not commit. The tab was filed CLEAN over the user's open
+        // transaction: no Commit or Rollback offered for it, and the session
+        // free to go back to the pool with it still open.
+        let post_processor = statement_session_post_processor_for(DatabaseType::Oracle);
+        for (labelled, bare) in [
+            (
+                "<<outer>> BEGIN UPDATE t SET c = 1; END;",
+                "BEGIN UPDATE t SET c = 1; END;",
+            ),
+            (
+                "<<outer>>\nDECLARE v NUMBER; BEGIN COMMIT; END;",
+                "DECLARE v NUMBER; BEGIN COMMIT; END;",
+            ),
+        ] {
+            let labelled_effects = post_processor.effects_for_sql(labelled);
+            let bare_effects = post_processor.effects_for_sql(bare);
+            assert_eq!(
+                labelled_effects.may_open_untracked_transaction(),
+                bare_effects.may_open_untracked_transaction(),
+                "{labelled}"
+            );
+            assert_eq!(
+                labelled_effects.may_leave_uncommitted_work(),
+                bare_effects.may_leave_uncommitted_work(),
+                "{labelled}"
+            );
+            assert_eq!(
+                labelled_effects.may_leave_session_residue(),
+                bare_effects.may_leave_session_residue(),
+                "{labelled}"
+            );
+
+            let after = |effects| {
+                retained_session_state_after_statement(
+                    post_processor,
+                    RetainedSessionState::default(),
+                    effects,
+                    false,
+                    false,
+                    false,
+                    false,
+                )
+            };
+            assert_eq!(
+                after(labelled_effects).transaction_state(),
+                after(bare_effects).transaction_state(),
+                "{labelled} must leave the session in the state its block really left it"
+            );
+            assert!(
+                after(labelled_effects).requires_physical_session_preservation(),
+                "{labelled} leaves state the pool cannot restate, so its session stays with \
+                 its tab"
+            );
+        }
     }
 
     #[test]
