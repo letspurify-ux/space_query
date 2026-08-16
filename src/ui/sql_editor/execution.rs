@@ -566,46 +566,90 @@ struct MySqlPooledSessionDisposition<'a> {
 /// unwinding — and `SharedDbSessionLease::hand_back_worker_session` closes such
 /// a batch's session instead of filing it over the session the tab's NEW batch
 /// is running on.
-/// Owns the thin batch's session for the window between taking it out of the
-/// tab's slot and handing it to the batch.
+/// The driver session behind a worker window, and the one way it becomes a
+/// lease the tab's slot can hold.
 ///
-/// Every explicit exit in that window hands the session back itself (the two
-/// superseded-operation returns, the lazy select, the failed call-timeout
-/// start). A PANIC had no owner at all: the session went back to the pool
-/// through `Drop`, where `reset_before_reuse` rolls back whatever the tab had
-/// open — silently, on a path the user never sees. The OCI twin has had this
-/// since its cleanup guard learned to check `panicking()`.
+/// One implementation per backend so [`WorkerSessionOwner`] can be the same
+/// value on all four: Oracle OCI, Oracle Thin, MySQL and MariaDB.
+pub(super) trait WorkerSessionLease: Sized {
+    fn into_db_session_lease(self, db_type: crate::db::DatabaseType) -> crate::db::DbSessionLease;
+}
+
+impl WorkerSessionLease for Arc<Connection> {
+    fn into_db_session_lease(self, _db_type: crate::db::DatabaseType) -> crate::db::DbSessionLease {
+        crate::db::DbSessionLease::Oracle(self)
+    }
+}
+
+impl WorkerSessionLease for PooledThinConnection<OracleThinSession> {
+    fn into_db_session_lease(self, _db_type: crate::db::DatabaseType) -> crate::db::DbSessionLease {
+        crate::db::DbSessionLease::OracleThin(Box::new(self))
+    }
+}
+
+impl WorkerSessionLease for mysql::PooledConn {
+    fn into_db_session_lease(self, db_type: crate::db::DatabaseType) -> crate::db::DbSessionLease {
+        crate::db::DbSessionLease::MySQL {
+            conn: self,
+            db_type,
+        }
+    }
+}
+
+/// Owns a session that has left the tab's lease slot but has not yet reached
+/// the code that will run on it.
 ///
-/// Only a panic is handled. A normal exit has already taken the session, and
-/// taking it away from an exit that knows what it is doing would be wrong. The
-/// window ends where the batch begins, which is exactly the gap this closes:
-/// inside the batch the state has moved on and `prior_retained_state` would no
-/// longer describe the session.
-struct OracleThinWorkerSessionOwner<'a> {
-    session: Option<PooledThinConnection<OracleThinSession>>,
-    pooled_db_session: &'a SharedDbSessionLease,
-    sender: &'a QueryProgressSender,
+/// The window exists on every backend — a batch resolves timeouts, cancel
+/// handles and lazy-fetch handover before the first statement, and a lazy fetch
+/// registers its handle and spawns a worker thread — and every way OUT of it
+/// that is not "the next owner took it" used to be spelled by hand at the exit:
+/// `thread::Builder::spawn` failing dropped the session into the pool, where
+/// `reset_before_reuse` rolls back whatever the tab had open, silently; a panic
+/// did the same. Hand-written exits also picked the scope to file the session
+/// under, and one of them picked the scope of the connection a script `CONNECT`
+/// had already replaced.
+///
+/// So the rule is the value, not the call sites: while this owner holds the
+/// session, dropping it hands the session back to the tab through the one door
+/// (`SharedDbSessionLease::hand_back_worker_session`, which reports the loss
+/// when a hand-back cannot reach the tab), under the state and scope this window
+/// began with — no statement has run, so nothing has moved either. An exit that
+/// knows better calls [`WorkerSessionOwner::take`] and owns the session from
+/// there.
+pub(super) struct WorkerSessionOwner<S: WorkerSessionLease> {
+    session: Option<S>,
+    db_type: crate::db::DatabaseType,
+    pooled_db_session: SharedDbSessionLease,
+    sender: QueryProgressSender,
     hand_back_owner: crate::db::SessionHandBackOwner,
     connection_generation: u64,
     pool_context_epoch: u64,
     prior_retained_state: RetainedSessionState,
     current_scope: Option<String>,
+    log_context: &'static str,
 }
 
-impl<'a> OracleThinWorkerSessionOwner<'a> {
-    fn new(
-        session: PooledThinConnection<OracleThinSession>,
-        pooled_db_session: &'a SharedDbSessionLease,
-        sender: &'a QueryProgressSender,
+impl<S: WorkerSessionLease> WorkerSessionOwner<S> {
+    /// The window a tab's EXECUTION opens: the hand-back names the operation,
+    /// so an abandoned batch reaching it after the tab moved on closes the
+    /// session instead of filing it over the newer batch's own.
+    #[allow(clippy::too_many_arguments)]
+    fn for_operation(
+        session: S,
+        db_type: crate::db::DatabaseType,
+        pooled_db_session: SharedDbSessionLease,
+        sender: QueryProgressSender,
         current_operation_id: &Arc<AtomicU64>,
         operation_id: u64,
         connection_generation: u64,
         pool_context_epoch: u64,
         prior_retained_state: RetainedSessionState,
         current_scope: Option<String>,
+        log_context: &'static str,
     ) -> Self {
         Self {
             session: Some(session),
+            db_type,
             pooled_db_session,
             sender,
             hand_back_owner: crate::db::SessionHandBackOwner::for_operation(
@@ -616,41 +660,67 @@ impl<'a> OracleThinWorkerSessionOwner<'a> {
             pool_context_epoch,
             prior_retained_state,
             current_scope,
+            log_context,
         }
     }
 
-    /// The session, for the calls this window makes on it.
-    fn session_mut(&mut self) -> &mut PooledThinConnection<OracleThinSession> {
-        self.session
-            .as_mut()
-            .expect("the thin worker session is taken only by an exit that returns")
+    /// The window a LAZY FETCH opens. Untracked for the same reason the lazy
+    /// worker's own hand-back is: a lazy fetch outlives the execution that
+    /// started it, and `lazy_fetch_can_keep_session` is its currency.
+    #[allow(clippy::too_many_arguments)]
+    fn for_lazy_fetch(
+        session: S,
+        db_type: crate::db::DatabaseType,
+        pooled_db_session: SharedDbSessionLease,
+        sender: QueryProgressSender,
+        connection_generation: u64,
+        pool_context_epoch: u64,
+        prior_retained_state: RetainedSessionState,
+        current_scope: Option<String>,
+        log_context: &'static str,
+    ) -> Self {
+        Self {
+            session: Some(session),
+            db_type,
+            pooled_db_session,
+            sender,
+            hand_back_owner: crate::db::SessionHandBackOwner::untracked(),
+            connection_generation,
+            pool_context_epoch,
+            prior_retained_state,
+            current_scope,
+            log_context,
+        }
     }
 
-    /// Hand ownership on: the caller is an exit that knows what to do with it.
-    fn take(&mut self) -> PooledThinConnection<OracleThinSession> {
-        self.session
-            .take()
-            .expect("the thin worker session is taken only once")
+    /// The session, for the calls this window makes on it. `None` once an exit
+    /// has taken it — the window is over and there is nothing to run on.
+    fn session_mut(&mut self) -> Option<&mut S> {
+        self.session.as_mut()
+    }
+
+    /// Hand ownership on: the caller runs on the session from here, and this
+    /// owner has nothing left to give back.
+    fn take_session(&mut self) -> Option<S> {
+        self.session.take()
     }
 }
 
-impl Drop for OracleThinWorkerSessionOwner<'_> {
+impl<S: WorkerSessionLease> Drop for WorkerSessionOwner<S> {
     fn drop(&mut self) {
-        if !std::thread::panicking() {
-            return;
-        }
         let Some(session) = self.session.take() else {
             return;
         };
-        // The state is the one this window started with: no statement of the
-        // batch has run yet, so nothing has moved it.
-        BatchSessionHandBack::new(&self.hand_back_owner, Some(self.sender)).apply(
-            self.pooled_db_session,
+        // Nobody took responsibility for it — a panic, or an exit that returned
+        // without taking. Either way the tab's session must not fall into the
+        // pool, which would roll its transaction back without telling anyone.
+        BatchSessionHandBack::new(&self.hand_back_owner, Some(&self.sender)).apply(
+            &self.pooled_db_session,
             self.connection_generation,
             self.pool_context_epoch,
-            crate::db::DbSessionLease::OracleThin(Box::new(session)),
+            session.into_db_session_lease(self.db_type),
             crate::db::RetainedSessionDisposition::Retain(self.prior_retained_state),
-            "oracle thin execution",
+            self.log_context,
             self.current_scope.clone(),
         );
     }
@@ -677,6 +747,11 @@ impl<'a> BatchSessionHandBack<'a> {
     /// the slot either.
     fn is_current(&self) -> bool {
         self.owner.is_current()
+    }
+
+    /// Where to tell the user about a session that went away with work in it.
+    fn sender(&self) -> Option<&'a QueryProgressSender> {
+        self.sender
     }
 
     /// Hand the session back to the tab. Answers whether it reached the slot.
@@ -1281,35 +1356,28 @@ impl ExecutionWorkerBackend for OracleExecutionWorkerBackend {
             )
         };
 
-        // From here until the batch takes it, the session has an owner: a panic
-        // in this window used to drop it into the pool, where
-        // `reset_before_reuse` rolls the tab's work back in silence.
-        let mut thin_session = OracleThinWorkerSessionOwner::new(
+        // From here until the batch takes it, the session has an owner: every
+        // way out of this window that is not "the batch took it" hands the
+        // session back to the tab, under the state and the scope this window
+        // began with. Naming either at an exit is what filed a session under
+        // the scope of the connection a script `CONNECT` had just replaced.
+        let mut thin_session = WorkerSessionOwner::for_operation(
             thin_conn,
-            pooled_db_session,
-            sender,
+            crate::db::DatabaseType::Oracle,
+            pooled_db_session.clone(),
+            sender.clone(),
             current_operation_id,
             operation_id,
             connection_generation,
             pool_context_epoch,
             prior_retained_state,
             active_scope.clone(),
+            "oracle thin execution",
         );
 
         if preconnected_info.is_none()
             && !SqlEditorWidget::operation_snapshot_is_current(current_operation_id, operation_id)
         {
-            SqlEditorWidget::abandon_oracle_thin_batch_session(
-                pooled_db_session,
-                sender,
-                current_operation_id,
-                operation_id,
-                connection_generation,
-                pool_context_epoch,
-                thin_session.take(),
-                prior_retained_state,
-                active_scope.clone(),
-            );
             return ExecutionWorkerOutcome::Handled;
         }
 
@@ -1317,8 +1385,11 @@ impl ExecutionWorkerBackend for OracleExecutionWorkerBackend {
         // session. Without this, a click that races with the previous query's
         // natural completion can leak `requested=true` into the cancel handle,
         // causing this fresh query to be aborted with ORA-01013.
-        thin_session.session_mut().reset_pending_cancel();
-        let cancel_handle = thin_session.session_mut().cancel_handle();
+        let Some(thin_conn) = thin_session.session_mut() else {
+            return ExecutionWorkerOutcome::Handled;
+        };
+        thin_conn.reset_pending_cancel();
+        let cancel_handle = thin_conn.cancel_handle();
         SqlEditorWidget::set_current_oracle_thin_cancel_context(
             current_oracle_thin_cancel_context,
             current_query_cancel_handle,
@@ -1331,17 +1402,6 @@ impl ExecutionWorkerBackend for OracleExecutionWorkerBackend {
                 current_oracle_thin_cancel_context,
                 current_query_cancel_handle,
                 None,
-            );
-            SqlEditorWidget::abandon_oracle_thin_batch_session(
-                pooled_db_session,
-                sender,
-                current_operation_id,
-                operation_id,
-                connection_generation,
-                pool_context_epoch,
-                thin_session.take(),
-                prior_retained_state,
-                active_scope.clone(),
             );
             return ExecutionWorkerOutcome::Handled;
         }
@@ -1410,8 +1470,11 @@ impl ExecutionWorkerBackend for OracleExecutionWorkerBackend {
                             db_activity,
                             current_scope.as_deref(),
                         );
+                        let Some(lazy_conn) = thin_session.take_session() else {
+                            return ExecutionWorkerOutcome::Handled;
+                        };
                         match SqlEditorWidget::start_oracle_thin_lazy_select(
-                            thin_session.take(),
+                            lazy_conn,
                             pooled_db_session.clone(),
                             connection_generation,
                             pool_context_epoch,
@@ -1463,7 +1526,11 @@ impl ExecutionWorkerBackend for OracleExecutionWorkerBackend {
             }
         }
 
-        if let Err(err) = thin_session.session_mut().set_call_timeout(query_timeout) {
+        let call_timeout_result = match thin_session.session_mut() {
+            Some(thin_conn) => thin_conn.set_call_timeout(query_timeout),
+            None => return ExecutionWorkerOutcome::Handled,
+        };
+        if let Err(err) = call_timeout_result {
             SqlEditorWidget::emit_execution_startup_error(
                 sender,
                 script_mode,
@@ -1472,21 +1539,10 @@ impl ExecutionWorkerBackend for OracleExecutionWorkerBackend {
                 &err.to_string(),
                 Some(&session),
             );
-            // The tab's session is already out of its slot here. Dropping it
-            // would return it to the pool, where `reset_before_reuse` rolls
-            // back whatever the tab had open -- silently. Hand it back instead,
-            // through the door that states whose execution it belongs to.
-            SqlEditorWidget::abandon_oracle_thin_batch_session(
-                pooled_db_session,
-                sender,
-                current_operation_id,
-                operation_id,
-                connection_generation,
-                pool_context_epoch,
-                thin_session.take(),
-                prior_retained_state,
-                execution_scope.clone(),
-            );
+            // The tab's session is already out of its slot here, and its owner
+            // hands it back on the way out -- under the scope this window began
+            // with, which after a leading script `CONNECT` is the NEW
+            // connection's, not the replaced one's.
             return ExecutionWorkerOutcome::Handled;
         }
 
@@ -1520,7 +1576,9 @@ impl ExecutionWorkerBackend for OracleExecutionWorkerBackend {
         // The window closes here: the batch runs the tab's statements, so from
         // now on `prior_retained_state` no longer describes the session and the
         // batch's own end-of-run hand-back is what files it.
-        let mut thin_conn = thin_session.take();
+        let Some(mut thin_conn) = thin_session.take_session() else {
+            return ExecutionWorkerOutcome::Handled;
+        };
         let batch_outcome = SqlEditorWidget::execute_oracle_thin_batch_with_connection(
             &mut thin_conn,
             sender,
@@ -5255,6 +5313,25 @@ impl SqlEditorWidget {
         execution_scope: Option<String>,
     ) -> Result<(), OracleError> {
         let (command_sender, command_receiver) = mpsc::channel::<LazyFetchCommand>();
+        // The cancel handle is a clone of the session handle, taken before the
+        // owner below has it: the fetch has to be cancellable from the moment
+        // it is registered.
+        let cancel_conn = Arc::clone(&conn);
+        // The tab's session is out of its slot from here until the fetch worker
+        // takes it INSIDE its own thread; a worker that never starts must not
+        // let it fall into the pool, where `reset_before_reuse` rolls back
+        // whatever the tab had open, in silence.
+        let lazy_session = WorkerSessionOwner::for_lazy_fetch(
+            conn,
+            crate::db::DatabaseType::Oracle,
+            pooled_db_session.clone(),
+            sender.clone(),
+            connection_generation,
+            pool_context_epoch,
+            prior_retained_state,
+            execution_scope.clone(),
+            "oracle lazy fetch start",
+        );
         Self::register_lazy_fetch_handle(
             &active_lazy_fetch,
             index,
@@ -5262,7 +5339,7 @@ impl SqlEditorWidget {
             connection_generation,
             crate::db::DatabaseType::Oracle,
             command_sender,
-            Some(LazyFetchCancelHandle::Oracle(Arc::clone(&conn))),
+            Some(LazyFetchCancelHandle::Oracle(cancel_conn)),
             sender.status_finish_handle(),
         );
         let _ = sender.send(QueryProgress::LazyFetchSession {
@@ -5277,6 +5354,10 @@ impl SqlEditorWidget {
         let spawn_result = thread::Builder::new()
             .name("oracle-lazy-fetch".to_string())
             .spawn(move || {
+                let mut lazy_session = lazy_session;
+                let Some(conn) = lazy_session.take_session() else {
+                    return;
+                };
                 let worker_result = panic::catch_unwind(AssertUnwindSafe(|| {
                     let statement_start = Instant::now();
                     let mut fetched_rows = 0usize;
@@ -5751,11 +5832,30 @@ impl SqlEditorWidget {
         query_timeout: Option<Duration>,
     ) -> Result<(), String> {
         let (command_sender, command_receiver) = mpsc::channel::<LazyFetchCommand>();
+        // The tab's session is out of its slot from here until the fetch worker
+        // takes it INSIDE its own thread, and the two ways out of that window
+        // are a panic and a worker that never starts. Both used to drop the
+        // session into the pool, where `reset_before_reuse` rolls back whatever
+        // the tab had open, in silence.
+        let mut lazy_session = WorkerSessionOwner::for_lazy_fetch(
+            conn,
+            crate::db::DatabaseType::Oracle,
+            pooled_db_session.clone(),
+            sender.clone(),
+            connection_generation,
+            pool_context_epoch,
+            prior_retained_state,
+            current_scope.clone(),
+            "oracle thin lazy fetch start",
+        );
         // See comment in OracleExecutionWorkerBackend::begin_execution: clear
         // any stale cancel that raced with the previous operation's completion
         // before publishing a new cancel handle for this fetch.
-        conn.reset_pending_cancel();
-        let cancel_handle = conn.cancel_handle();
+        let Some(lazy_conn) = lazy_session.session_mut() else {
+            return Err("Oracle thin lazy fetch lost its session before it started".to_string());
+        };
+        lazy_conn.reset_pending_cancel();
+        let cancel_handle = lazy_conn.cancel_handle();
         Self::register_lazy_fetch_handle(
             &active_lazy_fetch,
             index,
@@ -5778,6 +5878,10 @@ impl SqlEditorWidget {
         let spawn_result = thread::Builder::new()
             .name("oracle-thin-lazy-fetch".to_string())
             .spawn(move || {
+                let mut lazy_session = lazy_session;
+                let Some(conn) = lazy_session.take_session() else {
+                    return;
+                };
                 let mut conn_slot = Some(conn);
                 let worker_result = panic::catch_unwind(AssertUnwindSafe(|| {
                     let Some(conn) = conn_slot.as_mut() else {
@@ -6583,6 +6687,21 @@ impl SqlEditorWidget {
         let (command_sender, command_receiver) = mpsc::channel::<LazyFetchCommand>();
         let lazy_cancel_context: Arc<Mutex<Option<MySqlQueryCancelContext>>> =
             Arc::new(Mutex::new(None));
+        // The tab's session is out of its slot from here until the fetch worker
+        // takes it INSIDE its own thread; a worker that never starts must not
+        // let it fall into the pool, where the connection reset rolls back
+        // whatever the tab had open, in silence.
+        let lazy_session = WorkerSessionOwner::for_lazy_fetch(
+            conn,
+            connection_info.db_type,
+            pooled_db_session.clone(),
+            sender.clone(),
+            connection_generation,
+            pool_context_epoch,
+            prior_retained_state,
+            execution_scope.clone(),
+            "mysql lazy fetch start",
+        );
         Self::register_lazy_fetch_handle(
             &active_lazy_fetch,
             index,
@@ -6609,7 +6728,11 @@ impl SqlEditorWidget {
         let spawn_result = thread::Builder::new()
             .name("mysql-lazy-fetch".to_string())
             .spawn(move || {
-                let mut conn = Some(conn);
+                let mut lazy_session = lazy_session;
+                let Some(pooled_conn) = lazy_session.take_session() else {
+                    return;
+                };
+                let mut conn = Some(pooled_conn);
                 let mut should_retain_session = false;
                 let mut retained_state = prior_retained_state;
                 let mut close_cancelled = false;
@@ -12754,8 +12877,6 @@ impl SqlEditorWidget {
                                                 // CONNECT already says this; the
                                                 // tracker is part of the state
                                                 // this branch drops.
-                                                oracle_transaction_boundary
-                                                    .note_known_transaction_state();
                                                 oracle_transaction_boundary
                                                     .note_known_transaction_state();
                                                 if !next_statement_opens_its_own_transaction {
@@ -23179,9 +23300,21 @@ impl SqlEditorWidget {
             crate::db::RetainedSessionTakeOutcome::DiscardedBecauseStale
             | crate::db::RetainedSessionTakeOutcome::NoSession => return,
         };
+        // Out of the slot and not a MySQL session after all: it is gone, and a
+        // bare `return` would leave the tab believing it still has one.
+        let taken_retained_state = retained_session.retained_state();
         let Some((mut conn, prior_retained_state, session_scope)) =
             retained_session.into_mysql_connection_with_retained_state_and_scope()
         else {
+            crate::utils::logging::log_error(
+                db_activity,
+                "MySQL batch retained-session finalization took a lease that is not a MySQL session",
+            );
+            Self::report_retained_session_lost_with_work(
+                hand_back.sender(),
+                taken_retained_state,
+                db_activity,
+            );
             return;
         };
         let prior_may_have_uncommitted_work = prior_retained_state.may_have_uncommitted_work();
@@ -23798,32 +23931,6 @@ impl SqlEditorWidget {
         }
     }
 
-    fn abandon_oracle_thin_batch_session(
-        pooled_db_session: &SharedDbSessionLease,
-        sender: &QueryProgressSender,
-        current_operation_id: &Arc<AtomicU64>,
-        operation_id: u64,
-        connection_generation: u64,
-        pool_context_epoch: u64,
-        thin_conn: PooledThinConnection<OracleThinSession>,
-        prior_retained_state: RetainedSessionState,
-        current_scope: Option<String>,
-    ) {
-        let owner = crate::db::SessionHandBackOwner::for_operation(
-            Some(current_operation_id),
-            operation_id,
-        );
-        BatchSessionHandBack::new(&owner, Some(sender)).apply(
-            pooled_db_session,
-            connection_generation,
-            pool_context_epoch,
-            DbSessionLease::OracleThin(Box::new(thin_conn)),
-            crate::db::RetainedSessionDisposition::Retain(prior_retained_state),
-            "oracle thin execution",
-            current_scope,
-        );
-    }
-
     /// Tell the user when the retained session the app recorded work on was
     /// found dead and replaced with a fresh one.
     ///
@@ -23906,9 +24013,17 @@ impl SqlEditorWidget {
                     // The database this physical session is actually in. Every
                     // scope decision below is made against it rather than against
                     // what the tab asked for.
+                    // Out of the slot and not a MySQL session after all: report
+                    // the work that went with it, then say what happened.
+                    let taken_retained_state = retained_session.retained_state();
                     let Some((mut conn, prior_retained_state, retained_scope)) =
                         retained_session.into_mysql_connection_with_retained_state_and_scope()
                     else {
+                        Self::report_retained_session_lost_with_work(
+                            hand_back.sender(),
+                            taken_retained_state,
+                            db_activity,
+                        );
                         return Err(format!(
                             "Expected {} pool session",
                             context.connection_info.db_type
@@ -24693,10 +24808,18 @@ impl SqlEditorWidget {
                 );
             }
         };
+        // The take handed the session over, so it is out of the slot: a lease
+        // that is not a MySQL session after all is GONE, and answering
+        // `NoSession` — the one answer that does not alert — would describe an
+        // empty slot instead of the loss. Same answer the unreachable take
+        // gives, stated once.
+        let taken_retained_state = retained_session.retained_state();
         let Some((mut conn, prior_retained_state, session_scope)) =
             retained_session.into_mysql_connection_with_retained_state_and_scope()
         else {
-            return crate::db::RetainedSessionMutationOutcome::NoSession;
+            return crate::db::RetainedSessionMutationOutcome::for_unreachable_take(
+                taken_retained_state,
+            );
         };
 
         if let Err(err) =
@@ -24820,10 +24943,18 @@ impl SqlEditorWidget {
                 );
             }
         };
+        // The take handed the session over, so it is out of the slot: a lease
+        // that is not a MySQL session after all is GONE, and answering
+        // `NoSession` — the one answer that does not alert — would describe an
+        // empty slot instead of the loss. Same answer the unreachable take
+        // gives, stated once.
+        let taken_retained_state = retained_session.retained_state();
         let Some((mut conn, prior_retained_state, session_scope)) =
             retained_session.into_mysql_connection_with_retained_state_and_scope()
         else {
-            return crate::db::RetainedSessionMutationOutcome::NoSession;
+            return crate::db::RetainedSessionMutationOutcome::for_unreachable_take(
+                taken_retained_state,
+            );
         };
 
         if let Err(err) = Self::ensure_mysql_retained_session_statement_option_change_allowed(

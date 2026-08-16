@@ -4682,6 +4682,91 @@ fn every_write_path_asks_the_tab_whether_its_mode_allows_the_statement() {
     );
 }
 
+/// The object-browser menus stop offering writes a tab's READ ONLY pin would
+/// refuse — and no other writer may erase that answer.
+///
+/// The card's refusal has TWO sources with different owners and different
+/// moments: the connection's read-only flag, re-stated for EVERY card whenever
+/// the runtimes are re-labelled, and the tab's pin, known only where the tab's
+/// mode is resolved. One combined flag meant the connection-wide writer wiped
+/// the pin's answer every time it ran, and the menus offered Drop, Truncate and
+/// Import that `transaction_mode_refusal_for_statement` then refused. So the
+/// halves are separate, the join has no setter, and the tab's half is stated
+/// where the toolbar learns it.
+#[test]
+fn a_tabs_read_only_pin_cannot_be_erased_from_its_browser_card() {
+    let object_browser = read_source("src/ui/object_browser.rs");
+    let main_window = read_source("src/ui/main_window.rs");
+
+    let refusal = object_browser
+        .find("pub struct CardWriteRefusal {")
+        .expect("the card's write refusal should be its own value");
+    let refusal_body = slice_from(&object_browser, refusal, 1400);
+    assert!(
+        refusal_body.contains("connection: Arc<AtomicBool>")
+            && refusal_body.contains("tab_mode: Arc<AtomicBool>"),
+        "the two sources must be held apart, so neither can be spelled over the other"
+    );
+    assert!(
+        refusal_body.contains(
+            "self.connection.load(Ordering::Acquire) || self.tab_mode.load(Ordering::Acquire)"
+        ),
+        "and the menus ask for the JOIN of the two"
+    );
+    assert!(
+        !object_browser.contains("fn set_writes_are_refused("),
+        "there must be no setter for the combined answer: that is the shape that lost the pin"
+    );
+
+    // The connection-wide re-labelling states the connection's half only.
+    let relabel = object_browser
+        .find("pub fn refresh_runtime_labels(&mut self) {")
+        .expect("the runtime re-labelling should exist");
+    let relabel_body = slice_from(&object_browser, relabel, 2400);
+    assert!(
+        relabel_body.contains("set_connection_refuses_writes("),
+        "re-labelling must re-state the connection's own flag on every card"
+    );
+    assert!(
+        !relabel_body.contains("set_tab_mode_refuses_writes("),
+        "and it must never answer for a tab"
+    );
+
+    // The tab's half is stated where the tab's mode is resolved, and nowhere
+    // is it folded together with the connection's flag again.
+    let sync = main_window
+        .find("fn sync_transaction_mode_controls(&mut self) {")
+        .expect("the transaction-mode sync should exist");
+    let sync_body = slice_from(&main_window, sync, 4200);
+    let push = sync_body
+        .find("set_tab_mode_refuses_writes(")
+        .expect("the sync must tell the tab's card about the pin");
+    assert!(
+        sync_body[push..]
+            .lines()
+            .take(4)
+            .any(|line| line.contains("TransactionAccessMode::ReadOnly")),
+        "with the tab's own access mode"
+    );
+    assert!(
+        !sync_body[push..sync_body.len().min(push + 300)]
+            .contains("active_connection_is_read_only"),
+        "not OR-ed with the connection's flag: the card already holds that half"
+    );
+
+    // And the sync itself may be DEFERRED but never dropped. A batch that
+    // adopts a mode reaches the toolbar and the card only through it, and the
+    // connection mutex is routinely held by another tab's query.
+    let busy = sync_body
+        .find("let Some((db_type, is_connected, mode, default_isolation)) =")
+        .expect("the sync should resolve the tab's mode");
+    assert!(
+        sync_body[busy..sync_body.len().min(busy + 900)]
+            .contains("self.arm_transaction_mode_sync_retry();"),
+        "a sync that cannot read the connection re-arms itself, as the FLTK-grab one does"
+    );
+}
+
 /// Both Oracle drivers state the tab's SERVEROUTPUT setting on the session the
 /// batch is about to run on.
 ///
@@ -5321,6 +5406,30 @@ fn a_session_ending_action_asks_every_tab_before_it_resolves_any() {
         slice_from(&main_window, reporter, 1800).contains("may_have_uncommitted_work()"),
         "and only when there was work to lose"
     );
+
+    // Close All is a session-ending action for several tabs too, and it was the
+    // one outside this rule: it asked and RESOLVED tab by tab, so a Cancel on
+    // the second tab stopped the close with the first tab's transaction already
+    // committed for it.
+    let close_all = main_window
+        .find("fn close_all_query_editor_tabs(")
+        .expect("Close All should exist");
+    let close_all_body = slice_from(&main_window, close_all, 3600);
+    let plan = close_all_body
+        .find("Self::resolve_pooled_sessions_for_tabs(")
+        .expect("Close All must resolve every tab's session in ONE plan");
+    let close = close_all_body
+        .find("Self::close_query_editor_tab_with_dirty_check(")
+        .expect("Close All should then close the tabs");
+    assert!(
+        plan < close,
+        "every tab is asked before any tab's session is resolved or closed"
+    );
+    assert!(
+        close_all_body.contains("has_running_query_or_lazy_fetch_for_tab"),
+        "a tab whose worker still owns its session is not part of that plan: its session is \
+         resolved on its own deferred close, after the query stops"
+    );
 }
 
 #[test]
@@ -5413,21 +5522,62 @@ fn every_backend_hands_a_batch_session_back_through_the_door_that_names_its_oper
     );
 
     let execution = read_source("src/ui/sql_editor/execution.rs");
-    // Oracle thin: batch end and both superseded-operation early returns.
+    // A session that has left the tab's slot but has not reached the code that
+    // will run on it belongs to `WorkerSessionOwner`, on EVERY backend. The
+    // exits used to hand it back one by one, which is a rule that has to be
+    // remembered: `thread::Builder::spawn` failing and a panic both dropped the
+    // session into the pool, where `reset_before_reuse` rolls the tab's work
+    // back in silence, and one hand-written exit filed the session under the
+    // scope of the connection a script CONNECT had already replaced.
+    let owner_drop = execution
+        .find("impl<S: WorkerSessionLease> Drop for WorkerSessionOwner<S> {")
+        .expect("the worker-session owner should hand the session back on Drop");
+    let owner_drop_body = slice_from(&execution, owner_drop, 900);
     assert!(
-        execution.contains("fn abandon_oracle_thin_batch_session("),
-        "a superseded thin batch must hand its session back, not drop it into \
-         the pool where reset_before_reuse rolls the user's work back in silence"
+        owner_drop_body.contains("BatchSessionHandBack::new(&self.hand_back_owner")
+            && owner_drop_body.contains(".apply("),
+        "the owner must hand back through the same door every other worker uses"
     );
-    assert_eq!(
-        execution
-            .matches("SqlEditorWidget::abandon_oracle_thin_batch_session(")
-            .count(),
-        3,
-        "every thin worker return that still holds the session hands it back: the two \
-         superseded-operation returns and the failed call-timeout start (dropping the lease \
-         there returned it to the pool, where reset_before_reuse rolled the user's work back)"
+    assert!(
+        !owner_drop_body.contains("std::thread::panicking()"),
+        "a drop that only acts on a panic leaves the spawn-failure road open: an exit that \
+         returns without taking is exactly the case this owner exists for"
     );
+    assert!(
+        !execution.contains("fn abandon_oracle_thin_batch_session("),
+        "no exit may spell the hand-back — and its state and scope — by hand again; the owner \
+         states them once, from the values the window began with"
+    );
+    // All four backends: the lazy-fetch starters put the session in the owner
+    // BEFORE the thread that will take it is spawned.
+    for starter in [
+        "fn start_oracle_lazy_select(",
+        "fn start_oracle_thin_lazy_select(",
+        "fn start_mysql_lazy_select(",
+    ] {
+        let start = execution
+            .find(starter)
+            .unwrap_or_else(|| panic!("{starter} should exist"));
+        let body = slice_from(&execution, start, 4000);
+        let wrap = body
+            .find("WorkerSessionOwner::for_lazy_fetch(")
+            .unwrap_or_else(|| panic!("{starter} must own its session before spawning"));
+        let spawn = body
+            .find("thread::Builder::new()")
+            .unwrap_or_else(|| panic!("{starter} should spawn a fetch worker"));
+        assert!(
+            wrap < spawn,
+            "{starter} must own the session BEFORE the spawn that can fail"
+        );
+        let take = body
+            .find("lazy_session.take_session()")
+            .unwrap_or_else(|| panic!("{starter} must take the session from its owner"));
+        assert!(
+            spawn < take,
+            "{starter} must take the session INSIDE its worker thread, so a worker that never \
+             starts hands it back"
+        );
+    }
     // Oracle OCI: the cleanup guard's store.
     let applier = execution
         .find("fn store_retained_state(&mut self, retained_state: RetainedSessionState) {")
@@ -5525,25 +5675,15 @@ fn every_backend_hands_a_batch_session_back_through_the_door_that_names_its_oper
     );
 
     // The thin worker's window between taking the session out of the tab's slot
-    // and handing it to the batch has an OWNER. Every explicit exit in that
-    // window hands the session back itself; a panic had none, so the session
-    // went to the pool through `Drop` where `reset_before_reuse` rolls the
-    // tab's work back in silence.
+    // and handing it to the batch has the same owner, built the other way: this
+    // one belongs to an EXECUTION, so its hand-back names the operation and an
+    // abandoned batch cannot file its session over the newer batch's.
+    let thin_window = execution
+        .find("WorkerSessionOwner::for_operation(")
+        .expect("the thin worker's pre-batch window must own its session");
     assert!(
-        execution.contains("struct OracleThinWorkerSessionOwner<'a> {"),
-        "the thin worker's pre-batch window must own its session"
-    );
-    let owner_drop = execution
-        .find("impl Drop for OracleThinWorkerSessionOwner<'_> {")
-        .expect("the owner must hand the session back when it is dropped");
-    let owner_drop_body = slice_from(&execution, owner_drop, 1200);
-    assert!(
-        owner_drop_body.contains("if !std::thread::panicking()"),
-        "only a PANIC is handled: a normal exit has already taken the session"
-    );
-    assert!(
-        owner_drop_body.contains("BatchSessionHandBack::new("),
-        "and it hands back through the same door every other exit uses"
+        slice_from(&execution, thin_window, 600).contains("current_operation_id"),
+        "an execution's window names the operation it hands back for"
     );
 
     // The BINDING has the same rule, and it has to be unspellable rather than
@@ -5604,14 +5744,38 @@ fn losing_a_work_carrying_session_is_reported_not_swallowed() {
         helper_body.contains("if !prior_retained_state.may_have_uncommitted_work()"),
         "the notice must fire only when there was work to lose"
     );
+    // TAKING the lease empties the slot, so a take that then cannot use what it
+    // got has already lost the session: `NoSession` (the one answer that does
+    // not alert) or a bare `return` would describe an empty slot instead of the
+    // loss. Every unwrap of a taken lease answers a loss.
+    for (offset, _) in
+        content.match_indices("into_mysql_connection_with_retained_state_and_scope()")
+    {
+        let branch = slice_from(&content, offset, 700);
+        let end = branch.find("};").unwrap_or(branch.len());
+        let branch = &branch[..end];
+        assert!(
+            branch.contains("for_unreachable_take(")
+                || branch.contains("report_retained_session_lost_with_work("),
+            "a take that could not use the session it got must answer the loss, not describe an \
+             empty slot: {branch}"
+        );
+        assert!(
+            !branch.contains("RetainedSessionMutationOutcome::NoSession"),
+            "and `NoSession` is exactly the answer that does not alert: {branch}"
+        );
+    }
     assert_eq!(
         content
             .matches("Self::report_retained_session_lost_with_work(")
             .count(),
-        3,
+        5,
         "every site that loses a work-carrying session reports it: the two replace-and-reset \
-         sites (MySQL family, Oracle OCI) and the one door a worker clears the tab's slot \
-         through on the way out of a connection"
+         sites (MySQL family, Oracle OCI), the one door a worker clears the tab's slot through \
+         on the way out of a connection, and the two sites that TOOK a lease and found it was \
+         not a MySQL session after all (batch finalization, scope recheck) — the take had \
+         already emptied the slot there, so a bare return left the tab believing it still had \
+         a session"
     );
     // The hand-back answer covers BOTH ways a session with work can be closed:
     // the tab moved on (abandoned) and the slot refused to keep it (the tab is

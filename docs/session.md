@@ -325,6 +325,21 @@ reconnect, disconnect, pool resize):
   third answer a `Result<(), String>` had no room for. An action that could not
   reach the session REPORTS and carries on: nothing is left to retry, and
   refusing would leave the loss unexplained and the close half done.
+- Between the two there is a WINDOW, and it has an owner. A session that has
+  left the tab's slot but has not yet reached the code that will run on it —
+  a batch resolving its cancel handle and call timeout, a lazy fetch registering
+  its handle and spawning a worker thread — belongs to `WorkerSessionOwner`, on
+  every backend. Dropping that owner with the session still in it hands the
+  session back through the door above, under the state and the scope the window
+  began with; an exit that knows better calls `take()` and owns it from there.
+  It is a value and not a rule at each exit because the exits could not keep the
+  rule: `thread::Builder::spawn` failing dropped the session into the pool,
+  where `reset_before_reuse` rolls the tab's transaction back in silence and the
+  user is told only that a worker could not start, and a panic did the same. One
+  hand-written exit also picked the scope to file the session under, and picked
+  the one belonging to the connection a script `CONNECT` had already replaced.
+  Nothing at an exit names the state or the scope now, so neither can be named
+  wrongly.
 - The DISCARD direction has the same door,
   `SharedDbSessionLease::clear_worker_session`. A worker leaving a connection
   (script `CONNECT`/`DISCONNECT`, or a batch that ended disconnected) drops

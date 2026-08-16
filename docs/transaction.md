@@ -228,6 +228,18 @@ caller asks about the statement that will actually be sent, which for Explain is
 `ExplainPlanBackend::explain_statement()` rather than the `SELECT` being
 explained.
 
+The object browser's menus stop OFFERING what that gate would refuse, and the
+answer they ask has two sources with different owners: the connection's
+read-only flag and the tab's READ ONLY pin. `CardWriteRefusal` holds them apart
+and joins them, because a single combined flag has two writers — the runtime
+re-labelling re-states the connection's flag on every card whenever a connection
+changes state, and the tab's mode sync states the pin on one card — and the
+first erased the second's answer every time it ran. There is deliberately no
+setter for the combined value. The sync that carries the pin also re-arms itself
+when it cannot read the connection (another tab's query holds the mutex) instead
+of dropping the request, because a mode a batch just ADOPTED reaches the toolbar
+and the card through it and nothing else.
+
 The gate refuses WRITES, not everything Oracle happens to allow. Oracle's own
 list of what a read-only transaction permits is SELECT (without FOR UPDATE),
 `LOCK TABLE`, `SET ROLE`, `ALTER SESSION`, `ALTER SYSTEM`, COMMIT, ROLLBACK and
@@ -343,7 +355,14 @@ or consume a pending transaction-mode override.
 
 The commit/rollback/discard PROMPT appears only for actions that end the
 session's life: tab close, app exit, disconnect/reconnect, and pool resize —
-never in the middle of normal work. `ScopeChange` is always `Allow` (scope is
+never in the middle of normal work. When one action ends SEVERAL tabs' sessions
+(exit, Disconnect All, Close All), every tab is asked before any session is
+resolved (`resolve_pooled_sessions_for_tabs`): the prompt runs a real COMMIT, so
+asking tab by tab and acting on each answer as it arrived let a Cancel on the
+second tab stop the action with the first tab's transaction already committed
+for it. A tab whose query is still running is not part of that plan — its
+session belongs to its worker until the query stops, and it is resolved on its
+own deferred close. `ScopeChange` is always `Allow` (scope is
 applied to the retained session in place and destroys nothing). An `Execute`
 that comes back `RequireResolution` no longer pops a modal either
 (`resolve_required_transaction_decision`): an `InvalidSession` — the one state

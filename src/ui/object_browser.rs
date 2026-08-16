@@ -764,6 +764,46 @@ enum ObjectActionResult {
     },
 }
 
+/// Whether a write started from one browser card would be refused — and the
+/// two independent sources that can say so.
+///
+/// They are kept apart because they are written by different people at
+/// different times: the connection's read-only flag belongs to the saved
+/// profile and is re-stated for EVERY card whenever the runtimes are
+/// re-labelled, while the READ ONLY transaction mode is pinned per TAB and is
+/// only known where the tab's mode is resolved. Holding one combined flag meant
+/// the connection-wide writer erased the tab's answer every time it ran, and
+/// the menus offered Drop, Truncate and Import on a tab whose next write the
+/// statement gate was going to refuse. There is deliberately no setter for the
+/// combined value: neither source can be spelled over the other.
+///
+/// Both halves are atomics because a context menu must never wait on the
+/// connection mutex — it would hang the UI while a query runs, or guess
+/// "writable" while it waits.
+#[derive(Clone, Default)]
+pub struct CardWriteRefusal {
+    connection: Arc<AtomicBool>,
+    tab_mode: Arc<AtomicBool>,
+}
+
+impl CardWriteRefusal {
+    /// The connection's own read-only flag: the same answer for every card on
+    /// that connection.
+    fn set_connection(&self, refused: bool) {
+        self.connection.store(refused, Ordering::Release);
+    }
+
+    /// The READ ONLY transaction mode pinned on the tab this card belongs to.
+    fn set_tab_mode(&self, refused: bool) {
+        self.tab_mode.store(refused, Ordering::Release);
+    }
+
+    /// The answer the menus ask for.
+    fn writes_are_refused(&self) -> bool {
+        self.connection.load(Ordering::Acquire) || self.tab_mode.load(Ordering::Acquire)
+    }
+}
+
 #[derive(Clone)]
 pub struct ObjectBrowserWidget {
     flex: Flex,
@@ -779,10 +819,7 @@ pub struct ObjectBrowserWidget {
     filter_input: Input,
     object_cache: Arc<Mutex<ObjectCache>>,
     current_db_type: Arc<Mutex<crate::db::DatabaseType>>,
-    /// Mirrors the connection's read-only flag without ever locking the
-    /// connection: a menu that has to wait for a running query would either
-    /// hang the UI or, worse, guess "writable" while it waits.
-    writes_are_refused: Arc<AtomicBool>,
+    write_refusal: CardWriteRefusal,
     scope_options: Arc<Mutex<Vec<String>>>,
     selected_scope: Arc<Mutex<Option<String>>>,
     suppress_scope_events: Arc<Mutex<bool>>,
@@ -888,7 +925,7 @@ impl ObjectBrowserWidget {
         let metadata_callback: MetadataCallback = Arc::new(Mutex::new(None));
         let object_cache = Arc::new(Mutex::new(ObjectCache::default()));
         let current_db_type = Arc::new(Mutex::new(initial_db_type));
-        let writes_are_refused = Arc::new(AtomicBool::new(false));
+        let write_refusal = CardWriteRefusal::default();
         let scope_options = Arc::new(Mutex::new(Vec::new()));
         let selected_scope = Arc::new(Mutex::new(None));
         let suppress_scope_events = Arc::new(Mutex::new(false));
@@ -926,7 +963,7 @@ impl ObjectBrowserWidget {
             filter_input,
             object_cache,
             current_db_type,
-            writes_are_refused,
+            write_refusal,
             scope_options,
             selected_scope,
             suppress_scope_events,
@@ -1419,17 +1456,18 @@ impl ObjectBrowserWidget {
         );
     }
 
-    /// Tells this card that a write from it would be refused, so the menus
-    /// stop offering actions that are going to fail.
-    ///
-    /// TWO sources, which is why the name is about the answer and not about one
-    /// of them: the connection's read-only flag, and the READ ONLY transaction
-    /// mode pinned on the tab this card belongs to. It used to be called
-    /// `connection_is_read_only` and was fed only the first, so a tab pinned
-    /// READ ONLY was still offered Drop, Truncate and Import — and then refused
-    /// by `transaction_mode_refusal_for_statement` once the statement was built.
-    pub fn set_writes_are_refused(&self, refused: bool) {
-        self.writes_are_refused.store(refused, Ordering::Release);
+    /// Tells this card that its CONNECTION refuses writes (the saved profile's
+    /// read-only flag). The tab's own READ ONLY pin is the other half of the
+    /// answer and is stated separately — see [`CardWriteRefusal`].
+    pub fn set_connection_refuses_writes(&self, refused: bool) {
+        self.write_refusal.set_connection(refused);
+    }
+
+    /// Tells this card that the tab it belongs to is pinned READ ONLY, so a
+    /// write from its menus would be refused by
+    /// `transaction_mode_refusal_for_statement` once the statement was built.
+    pub fn set_tab_mode_refuses_writes(&self, refused: bool) {
+        self.write_refusal.set_tab_mode(refused);
     }
 
     pub fn set_tab_local_scope_selection(&mut self, enabled: bool) {
@@ -2826,7 +2864,7 @@ impl ObjectBrowserWidget {
         let filter_input = self.filter_input.clone();
         let connection = self.connection.clone();
         let current_db_type = self.current_db_type.clone();
-        let writes_are_refused = self.writes_are_refused.clone();
+        let write_refusal = self.write_refusal.clone();
         let action_sender = self.action_sender.clone();
         let selected_scope = self.selected_scope.clone();
         let catalog = self.catalog.clone();
@@ -2849,7 +2887,7 @@ impl ObjectBrowserWidget {
             filter_input: Input,
             connection: SharedConnection,
             current_db_type: Arc<Mutex<crate::db::DatabaseType>>,
-            writes_are_refused: Arc<AtomicBool>,
+            write_refusal: CardWriteRefusal,
             action_sender: std::sync::mpsc::Sender<ObjectActionResult>,
             selected_scope: Arc<Mutex<Option<String>>>,
             catalog: CardCatalogState,
@@ -3237,7 +3275,7 @@ impl ObjectBrowserWidget {
                                 let _ = ObjectBrowserWidget::show_context_menu_for_object_item_at(
                                     &connection,
                                     &current_db_type,
-                                    &writes_are_refused,
+                                    &write_refusal,
                                     item,
                                     &sql_callback,
                                     &status_callback,
@@ -3359,7 +3397,7 @@ impl ObjectBrowserWidget {
                     filter_input.clone(),
                     connection.clone(),
                     current_db_type.clone(),
-                    writes_are_refused.clone(),
+                    write_refusal.clone(),
                     action_sender.clone(),
                     selected_scope.clone(),
                     catalog.clone(),
@@ -3382,7 +3420,7 @@ impl ObjectBrowserWidget {
             filter_input,
             connection,
             current_db_type,
-            writes_are_refused,
+            write_refusal,
             action_sender,
             selected_scope,
             catalog,
@@ -3402,7 +3440,7 @@ impl ObjectBrowserWidget {
         let action_sender = self.action_sender.clone();
         let object_cache = self.object_cache.clone();
         let current_db_type = self.current_db_type.clone();
-        let writes_are_refused = self.writes_are_refused.clone();
+        let write_refusal = self.write_refusal.clone();
         let selected_scope = self.selected_scope.clone();
         let scope_generation = self.scope_generation.clone();
         let mut pending_drag_text: Option<String> = None;
@@ -3430,7 +3468,7 @@ impl ObjectBrowserWidget {
                             Self::show_context_menu(
                                 &connection,
                                 &current_db_type,
-                                &writes_are_refused,
+                                &write_refusal,
                                 &item,
                                 &sql_callback,
                                 &status_callback,
@@ -3442,7 +3480,7 @@ impl ObjectBrowserWidget {
                             Self::show_context_menu(
                                 &connection,
                                 &current_db_type,
-                                &writes_are_refused,
+                                &write_refusal,
                                 &item,
                                 &sql_callback,
                                 &status_callback,
@@ -5547,7 +5585,7 @@ impl ObjectBrowserWidget {
         Self::show_context_menu_for_object_item(
             &self.connection,
             &self.current_db_type,
-            &self.writes_are_refused,
+            &self.write_refusal,
             resolved.item,
             &self.sql_callback,
             &self.status_callback,
@@ -6291,7 +6329,7 @@ impl ObjectBrowserWidget {
     fn show_context_menu(
         connection: &SharedConnection,
         current_db_type: &Arc<Mutex<crate::db::DatabaseType>>,
-        writes_are_refused: &Arc<AtomicBool>,
+        write_refusal: &CardWriteRefusal,
         item: &TreeItem,
         sql_callback: &SqlExecuteCallback,
         status_callback: &StatusCallback,
@@ -6309,7 +6347,7 @@ impl ObjectBrowserWidget {
             let _ = Self::show_context_menu_for_object_item(
                 connection,
                 current_db_type,
-                writes_are_refused,
+                write_refusal,
                 item_info,
                 sql_callback,
                 status_callback,
@@ -6523,7 +6561,7 @@ impl ObjectBrowserWidget {
     fn show_context_menu_for_object_item(
         connection: &SharedConnection,
         current_db_type: &Arc<Mutex<crate::db::DatabaseType>>,
-        writes_are_refused: &Arc<AtomicBool>,
+        write_refusal: &CardWriteRefusal,
         item_info: ObjectItem,
         sql_callback: &SqlExecuteCallback,
         status_callback: &StatusCallback,
@@ -6533,7 +6571,7 @@ impl ObjectBrowserWidget {
         Self::show_context_menu_for_object_item_at(
             connection,
             current_db_type,
-            writes_are_refused,
+            write_refusal,
             item_info,
             sql_callback,
             status_callback,
@@ -6547,7 +6585,7 @@ impl ObjectBrowserWidget {
     fn show_context_menu_for_object_item_at(
         connection: &SharedConnection,
         current_db_type: &Arc<Mutex<crate::db::DatabaseType>>,
-        writes_are_refused: &Arc<AtomicBool>,
+        write_refusal: &CardWriteRefusal,
         item_info: ObjectItem,
         sql_callback: &SqlExecuteCallback,
         status_callback: &StatusCallback,
@@ -6563,10 +6601,9 @@ impl ObjectBrowserWidget {
         let Some(menu_choices) = Self::menu_choices_for_object_item(&item_info, db_type) else {
             return false;
         };
-        let Some(menu_choices) = Self::menu_choices_for_read_only(
-            menu_choices,
-            writes_are_refused.load(Ordering::Acquire),
-        ) else {
+        let Some(menu_choices) =
+            Self::menu_choices_for_read_only(menu_choices, write_refusal.writes_are_refused())
+        else {
             return false;
         };
 
@@ -10195,7 +10232,7 @@ impl MultiObjectBrowserWidget {
             runtime.connection(),
         );
         browser.set_tab_local_scope_selection(true);
-        browser.set_writes_are_refused(runtime.sanitized_info().read_only);
+        browser.set_connection_refuses_writes(runtime.sanitized_info().read_only);
         self.browser_stack.end();
         if let Some(previous_group) = previous_group.as_ref() {
             Group::set_current(Some(previous_group));
@@ -10690,7 +10727,7 @@ impl MultiObjectBrowserWidget {
             for entry in entries.iter() {
                 entry
                     .browser
-                    .set_writes_are_refused(entry.runtime.sanitized_info().read_only);
+                    .set_connection_refuses_writes(entry.runtime.sanitized_info().read_only);
             }
         }
         Self::disambiguate_choice_labels(&mut labels);
@@ -10893,14 +10930,14 @@ impl MultiObjectBrowserWidget {
             .and_then(|entry| entry.browser.selected_scope())
     }
 
-    /// Tells ONE tab's card whether a write from it would be refused.
+    /// Tells ONE tab's card that its tab is pinned READ ONLY.
     ///
-    /// Per tab because the READ ONLY transaction mode is per tab: the
-    /// connection's own read-only flag is the same for every card, the pin is
-    /// not. `create_browser_entry` seeds the card with the connection's flag
-    /// alone, and the caller corrects it whenever the tab's mode is
-    /// resynchronised — which is the same moment the toolbar learns it.
-    pub fn set_tab_writes_are_refused(&mut self, tab_id: QueryTabId, refused: bool) -> bool {
+    /// Per tab because the pin is per tab, and stated on its own half of
+    /// [`CardWriteRefusal`] because the connection-wide re-labelling states the
+    /// other half for every card — including this one — whenever a connection
+    /// changes state. Writing one combined answer meant that re-labelling
+    /// erased the pin and the card started offering writes again.
+    pub fn set_tab_mode_refuses_writes(&mut self, tab_id: QueryTabId, refused: bool) -> bool {
         let browser = self
             .entries
             .lock()
@@ -10911,7 +10948,7 @@ impl MultiObjectBrowserWidget {
         let Some(browser) = browser else {
             return false;
         };
-        browser.set_writes_are_refused(refused);
+        browser.set_tab_mode_refuses_writes(refused);
         true
     }
 
@@ -11237,7 +11274,7 @@ fn read_import_file(path: &std::path::Path) -> Result<String, String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        consume_owned_key_up, copy_text_for_object_item, DestructiveObjectAction,
+        consume_owned_key_up, copy_text_for_object_item, CardWriteRefusal, DestructiveObjectAction,
         MultiObjectBrowserWidget, ObjectBrowserMetadataSnapshot, ObjectBrowserWidget, ObjectCache,
         ObjectDefaultAction, ObjectItem, ScopeSwitchPreflightCallback, SCOPE_SELECTOR_ROW_HEIGHT,
         SCOPE_SELECTOR_TABLE_VERTICAL_PADDING,
@@ -11249,6 +11286,37 @@ mod tests {
     use std::sync::{Arc, Mutex};
 
     use tns_thin::exec::StatementRequest as OracleThinStatementRequest;
+
+    #[test]
+    fn neither_source_of_a_write_refusal_can_erase_the_other() {
+        // The connection's read-only flag is re-stated for EVERY card whenever
+        // the runtimes are re-labelled (a connect, a reconnect, a card added, a
+        // disconnect elsewhere). The tab's READ ONLY pin is stated only where
+        // the tab's mode is resolved. While they shared one flag, the first
+        // writer erased the second's answer and the card started offering
+        // Drop, Truncate and Import that the statement gate then refused.
+        let refusal = CardWriteRefusal::default();
+        assert!(!refusal.writes_are_refused(), "nothing refuses writes yet");
+
+        refusal.set_tab_mode(true);
+        assert!(refusal.writes_are_refused(), "the tab is pinned READ ONLY");
+
+        refusal.set_connection(false);
+        assert!(
+            refusal.writes_are_refused(),
+            "re-stating the connection's own flag must not answer for the tab"
+        );
+
+        refusal.set_tab_mode(false);
+        assert!(!refusal.writes_are_refused(), "the pin is gone");
+
+        refusal.set_connection(true);
+        refusal.set_tab_mode(false);
+        assert!(
+            refusal.writes_are_refused(),
+            "and a read-only CONNECTION still refuses writes on an unpinned tab"
+        );
+    }
 
     #[test]
     fn key_up_without_matching_key_down_is_not_owned() {

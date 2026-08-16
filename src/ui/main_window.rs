@@ -3885,10 +3885,16 @@ impl AppState {
         else {
             // The connection mutex is busy (another tab's execution holds it):
             // leave the controls and the recorded displayed mode untouched —
-            // nothing shown has changed.
+            // nothing shown has changed. But the request is not lost with it:
+            // a mode a batch just ADOPTED reaches the toolbar and the tab's
+            // browser card only through this sync, so giving up here left both
+            // showing the mode the tab had before. Re-arm on the UI thread,
+            // same single-flight chain the FLTK grab uses.
             if !self.has_live_connection {
                 self.transaction_isolation_choice.deactivate();
                 self.transaction_access_choice.deactivate();
+            } else {
+                self.arm_transaction_mode_sync_retry();
             }
             return;
         };
@@ -3907,16 +3913,17 @@ impl AppState {
         self.sql_editor
             .record_displayed_transaction_mode(is_connected.then_some(mode));
         // The tab's object-browser card offers writes, and this is the moment
-        // the app learns whether they would be refused. The card used to ask
-        // only the CONNECTION's read-only flag, so a tab pinned READ ONLY was
-        // offered Drop, Truncate and Import and then refused once the statement
-        // reached `transaction_mode_refusal_for_statement`. Both sources answer
-        // the same question, so the card is told the answer, not one source.
-        let writes_are_refused = self.active_connection_is_read_only()
-            || (is_connected && mode.access_mode == TransactionAccessMode::ReadOnly);
+        // the app learns whether the tab's own PIN refuses them. Only that half
+        // is stated here: the connection's read-only flag is the card's other
+        // half and is re-stated for every card by the runtime re-labelling, so
+        // an answer combining the two would be erased by it (and the menus
+        // would offer Drop, Truncate and Import that the statement gate then
+        // refuses).
         let active_tab_id = self.active_editor_tab_id;
-        self.object_browser
-            .set_tab_writes_are_refused(active_tab_id, writes_are_refused);
+        self.object_browser.set_tab_mode_refuses_writes(
+            active_tab_id,
+            is_connected && mode.access_mode == TransactionAccessMode::ReadOnly,
+        );
 
         if is_connected && !self.transaction_mode_change_blocked_for_active_tab(db_type) {
             self.transaction_isolation_choice.activate();
@@ -8825,6 +8832,20 @@ impl MainWindow {
             == QueryEditorCloseOutcome::Closed
     }
 
+    /// Close every query tab, asking everything BEFORE resolving anything.
+    ///
+    /// This is a session-ending action for several tabs at once, so it obeys
+    /// the rule the other three (File/Disconnect, Disconnect All, exit) obey:
+    /// a prompt runs a real COMMIT or ROLLBACK, and asking tab by tab while
+    /// acting on each answer as it arrived meant a Cancel on the second tab
+    /// stopped the action with the first tab's transaction already committed
+    /// for it. Unsaved editor text is asked for first, then every idle tab's
+    /// session in ONE plan.
+    ///
+    /// A tab with a running query is deliberately not in that plan: its session
+    /// belongs to its worker until the query stops, so it is asked about,
+    /// cancelled and closed on its own deferred path — the same one a single
+    /// tab close uses.
     fn close_all_query_editor_tabs(state: &Arc<Mutex<AppState>>) {
         let tab_ids = state
             .lock()
@@ -8833,6 +8854,35 @@ impl MainWindow {
             .iter()
             .map(|tab| tab.tab_id)
             .collect::<Vec<_>>();
+        for tab_id in &tab_ids {
+            if !Self::confirm_save_if_dirty(state, *tab_id, "closing this tab") {
+                return;
+            }
+        }
+        let idle_tab_ids = {
+            let s = state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            tab_ids
+                .iter()
+                .copied()
+                .filter(|tab_id| {
+                    s.find_tab_index(*tab_id).is_some()
+                        && !s.has_running_query_or_lazy_fetch_for_tab(*tab_id)
+                })
+                .collect::<Vec<_>>()
+        };
+        if !Self::resolve_pooled_sessions_for_tabs(
+            state,
+            idle_tab_ids,
+            RetainedSessionPreflightAction::Close,
+            "close it",
+            "closing",
+            "Commit and Close",
+            "Rollback and Close",
+        ) {
+            return;
+        }
         for tab_id in tab_ids {
             let tab_exists = state
                 .lock()
@@ -8842,7 +8892,10 @@ impl MainWindow {
             if !tab_exists {
                 continue;
             }
-            match Self::close_query_editor_tab_with_dirty_check(state, tab_id, true) {
+            // The two questions this close could still ask have been answered:
+            // unsaved text above, and the session in the plan — which leaves
+            // its tab's slot with nothing to resolve, so no tab is asked twice.
+            match Self::close_query_editor_tab_with_dirty_check(state, tab_id, false) {
                 QueryEditorCloseOutcome::Closed | QueryEditorCloseOutcome::Deferred => {}
                 QueryEditorCloseOutcome::Cancelled => break,
             }

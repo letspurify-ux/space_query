@@ -165,27 +165,39 @@ pub mod result_messages {
                 // the block may not have touched the transaction at all.
                 TransactionFeedbackStatement::ProcedureLike => auto_commit.then_some(true),
             },
-            DatabaseType::MySQL | DatabaseType::MariaDB => match statement {
-                // MySQL DML leaves commit-or-rollback work pending when
-                // autocommit is off, so it reports either state.
-                TransactionFeedbackStatement::Dml => Some(auto_commit),
-                // A routine's body is not something the app can read. Under
-                // autocommit the server commits each statement INSIDE it, but a
-                // procedure that runs `START TRANSACTION` and returns suspends
-                // that and hands the transaction back still open — so "committed"
-                // is a claim the app cannot make. The tracked state already says
-                // so conservatively (`may_open_untracked_transaction`), and the
-                // toolbar offers Commit/Rollback accordingly; saying
-                // "Auto-commit applied" here contradicted it on the very
-                // statement that caused it.
-                //
-                // Under manual commit there is nothing to guess: work either
-                // needs a commit or there was none, and the prompt is right
-                // either way. This is the same shape as Oracle's arm above,
-                // which already omits the feedback in the direction it cannot
-                // vouch for.
-                TransactionFeedbackStatement::ProcedureLike => (!auto_commit).then_some(false),
-            },
+            // Stated once, chosen per variant: the two answer alike today, and
+            // the registry rule is that each concrete database type says so
+            // itself, so a future divergence between them is a decision rather
+            // than a family shortcut nobody had to look at.
+            DatabaseType::MySQL => mysql_family_transaction_feedback_flag(statement, auto_commit),
+            DatabaseType::MariaDB => mysql_family_transaction_feedback_flag(statement, auto_commit),
+        }
+    }
+
+    fn mysql_family_transaction_feedback_flag(
+        statement: TransactionFeedbackStatement,
+        auto_commit: bool,
+    ) -> Option<bool> {
+        match statement {
+            // MySQL DML leaves commit-or-rollback work pending when
+            // autocommit is off, so it reports either state.
+            TransactionFeedbackStatement::Dml => Some(auto_commit),
+            // A routine's body is not something the app can read. Under
+            // autocommit the server commits each statement INSIDE it, but a
+            // procedure that runs `START TRANSACTION` and returns suspends
+            // that and hands the transaction back still open — so "committed"
+            // is a claim the app cannot make. The tracked state already says
+            // so conservatively (`may_open_untracked_transaction`), and the
+            // toolbar offers Commit/Rollback accordingly; saying
+            // "Auto-commit applied" here contradicted it on the very
+            // statement that caused it.
+            //
+            // Under manual commit there is nothing to guess: work either
+            // needs a commit or there was none, and the prompt is right
+            // either way. This is the same shape as Oracle's arm above,
+            // which already omits the feedback in the direction it cannot
+            // vouch for.
+            TransactionFeedbackStatement::ProcedureLike => (!auto_commit).then_some(false),
         }
     }
 
