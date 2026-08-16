@@ -881,10 +881,12 @@ fn empty_mysql_scope_with_preserved_session_requires_resolution() {
     );
     assert!(
         helper.contains("session_scope: Option<&str>")
-            && helper.contains("-> Result<Option<String>, String>"),
+            && helper
+                .contains("-> Result<(Option<String>, crate::db::SessionScopeAssertion), String>"),
         "MySQL/MariaDB scope setup must be told where the session actually is and report where it \
-         ended up: recording the requested scope instead is what hid a tab running in the wrong \
-         database"
+         ended up — recording the requested scope instead is what hid a tab running in the wrong \
+         database — AND whether that is where the tab asked to be: a database the server no \
+         longer has leaves the session with none at all, which used to be visible only in the log"
     );
     assert!(
         editor_content.contains(
@@ -1628,8 +1630,14 @@ fn regression_04_global_transaction_options_validate_and_update_retained_session
         .map(|offset| mode_start + offset)
         .expect("transaction mode helper should have an end marker");
     let mode_branch = &content[mode_start..mode_end];
+    // Anchored on the OPTION rather than on the noun the user reads: the rule
+    // the gate applies is selected by `TransactionOptionKind`, because
+    // comparing the message text was one reworded string away from taking the
+    // wrong branch in silence.
     let mode_validate = mode_branch
-        .find("retained_plan.validate_transaction_option_change(\"transaction mode\")")
+        .find(
+            "retained_plan.validate_transaction_option_change(TransactionOptionKind::TransactionMode)",
+        )
         .expect("transaction mode change should validate the tab's retained session");
     // Tab-scoped: the controls pin the active tab, never the shared connection.
     let mode_set = mode_branch
@@ -1653,7 +1661,7 @@ fn regression_04_global_transaction_options_validate_and_update_retained_session
         .expect("menu availability table should follow Tools/Auto-Commit branch");
     let auto_branch = &content[auto_start..auto_end];
     let auto_validate = auto_branch
-        .find("retained_plan.validate_transaction_option_change(\"auto-commit\")")
+        .find(".validate_transaction_option_change(TransactionOptionKind::AutoCommit)")
         .expect("auto-commit change should validate the tab's retained session");
     // Tab-scoped: the toggle pins the active tab, never the shared connection.
     let auto_set = auto_branch
@@ -4760,10 +4768,31 @@ fn a_tabs_read_only_pin_cannot_be_erased_from_its_browser_card() {
     let busy = sync_body
         .find("let Some((db_type, is_connected, mode, default_isolation)) =")
         .expect("the sync should resolve the tab's mode");
+    // Anchored on the code that follows the arm rather than on a byte count:
+    // a fixed window tests how long the comment above the call is, not the
+    // rule. (This clause failed for exactly that reason once.)
+    let unreadable_arm_end = sync_body[busy..]
+        .find("let labels = transaction_isolation_choice_labels(")
+        .map(|offset| busy + offset)
+        .expect("the label rebuild should follow the unreadable-connection arm");
+    let unreadable_arm = &sync_body[busy..unreadable_arm_end];
     assert!(
-        sync_body[busy..sync_body.len().min(busy + 900)]
-            .contains("self.arm_transaction_mode_sync_retry();"),
+        unreadable_arm.contains("self.arm_transaction_mode_sync_retry();"),
         "a sync that cannot read the connection re-arms itself, as the FLTK-grab one does"
+    );
+    // Comment lines stripped: the arm EXPLAINS why it no longer decides from
+    // `has_live_connection`, and a guard that cannot tell code from prose
+    // forbids saying so.
+    let unreadable_arm_code = unreadable_arm
+        .lines()
+        .filter(|line| !line.trim_start().starts_with("//"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        !unreadable_arm_code.contains("has_live_connection"),
+        "and it re-arms UNCONDITIONALLY: deciding here from `has_live_connection` greyed the \
+         combos out with no retry armed whenever a tab switch had itself been unable to read \
+         the connection"
     );
 }
 
@@ -5160,9 +5189,20 @@ fn a_busy_connection_mutex_is_never_read_as_a_dead_connection() {
     // ...and when the connection really is dead, the controls that gate DB
     // work come down with it.
     assert!(
-        failure_body.contains("s.has_live_connection = false;")
-            && failure_body.contains("s.refresh_connection_dependent_controls();"),
+        failure_body.contains("s.refresh_connection_dependent_controls();"),
         "a genuinely dead active connection must reset the connection-dependent UI"
+    );
+    // Rewritten from pinning the literal `s.has_live_connection = false;`: that
+    // is a SPELLING of the fix, and the same handler proved why spellings are
+    // the wrong thing to pin. The screen's picture of the active tab's
+    // connection now has one writer, which re-reads the very evidence this
+    // branch used to declare the runtime Failed, so a second copy of the fact
+    // here could only drift from it.
+    assert!(
+        !failure_body.contains("s.has_live_connection = "),
+        "the failure handler must bring the UI down by re-learning the connection \
+         (`refresh_active_connection_view`, reached through the controls refresh), not by \
+         asserting liveness itself"
     );
 }
 
@@ -5790,5 +5830,325 @@ fn losing_a_work_carrying_session_is_reported_not_swallowed() {
         lost_body.contains("Abandoned { carried_work: true }")
             && lost_body.contains("discarded_work: true"),
         "both ways a work-carrying session is closed must answer `lost_work`"
+    );
+}
+
+/// The window's picture of the ACTIVE TAB's connection has ONE writer, and it
+/// never lowers what it shows because the connection could not be READ.
+///
+/// `try_lock_connection` answers `None` for two situations that are not the
+/// same — another tab's query holds the mutex, and a
+/// connect/reconnect/disconnect/pool-resize transition is in flight — and four
+/// fields were written from that answer by four different places. A tab switch
+/// during a neighbour tab's query therefore filed a perfectly live tab as
+/// disconnected (status bar, greyed transaction-mode controls with no retry
+/// armed, dropped metadata refresh), while the branch for a tab bound to NO
+/// connection left `AppState::connection` pointing at the previous tab's, so
+/// the toolbar and the auto-commit indicator described a connection the active
+/// tab was not on.
+#[test]
+fn the_active_tabs_connection_view_has_one_writer_and_three_answers() {
+    let content = read_source("src/ui/main_window.rs");
+    let start = content
+        .find("fn refresh_active_connection_view(&mut self)")
+        .expect("the active tab's connection view should have one writer");
+    let end = content[start..]
+        .find("fn active_connection_auto_commit")
+        .map(|offset| start + offset)
+        .expect("the view's reader should follow its writer");
+    let writer = &content[start..end];
+
+    // The three answers. `Unbound` points at a connection that is not
+    // connected instead of leaving the previous tab's in place; an unreadable
+    // connection is answered by the runtime, which needs no mutex; and a
+    // transition in flight lowers nothing.
+    assert!(
+        writer.contains("self.connection = self.unbound_connection.clone()"),
+        "a tab bound to no connection must point at the never-connected placeholder, or every \
+         reader of `AppState::connection` describes whichever connection was active before it"
+    );
+    assert!(
+        writer.contains("liveness_without_connection_lock()")
+            && writer.contains("RuntimeLiveness::InFlight"),
+        "an unreadable connection must be answered by the runtime's own state, and a transition \
+         in flight must not lower what the screen shows"
+    );
+    assert!(
+        writer.contains("describes_same_connection"),
+        "a value may only be KEPT for the connection it was learned from: keeping one \
+         connection's auto-commit default for another connection's tab is what made the status \
+         bar and the Tools menu describe a tab that was not on it"
+    );
+
+    // One writer. Every field of the view is written here and nowhere else.
+    for (field, description) in [
+        ("self.connection = ", "the active tab's connection"),
+        ("has_live_connection = ", "whether it is live"),
+        (
+            "cached_connection_auto_commit = ",
+            "its auto-commit default",
+        ),
+    ] {
+        let total = content.matches(field).count();
+        let inside = writer.matches(field).count();
+        assert_eq!(
+            total, inside,
+            "{description} (`{field}`) must be written only by `refresh_active_connection_view`: \
+             {total} assignments in main_window.rs, {inside} of them inside the writer"
+        );
+    }
+    // The connection IDENTITY the status bar shows travels with the rest: it
+    // is behind an `Arc<Mutex<_>>`, so it is pinned by counting the writes that
+    // name it. All of them are in the writer.
+    let identity_writes = content
+        .matches(".connection_info\n            .lock()")
+        .count()
+        + content
+            .matches(".connection_info\n                            .lock()")
+            .count();
+    let identity_writes_in_writer = writer.matches(".connection_info").count();
+    assert!(
+        identity_writes_in_writer >= 4,
+        "the writer states the connection identity on every road out of it (unbound, read, \
+         runtime-live, runtime-dead), or one of them leaves the previous tab's name on screen"
+    );
+    assert!(
+        identity_writes > 0,
+        "the connection identity should still be written through the mutex it lives behind"
+    );
+
+    // The screenshot harness is the ONE exception, and it is a named door
+    // rather than raw field writes.
+    assert!(
+        writer.contains("capture_tour_presented_connection"),
+        "the capture tour must present a connected window through the writer, not behind its back"
+    );
+
+    // The deferral that made the fix necessary: an unreadable connection must
+    // re-arm the toolbar sync instead of greying the controls out on it.
+    let sync_start = content
+        .find("fn sync_transaction_mode_controls(&mut self)")
+        .expect("the transaction-mode sync should exist");
+    let sync_end = content[sync_start..]
+        .find("fn arm_transaction_mode_sync_retry")
+        .map(|offset| sync_start + offset)
+        .expect("the retry arm should follow the sync");
+    let sync = &content[sync_start..sync_end];
+    let unreadable = sync
+        .find("self.transaction_control_state()")
+        .expect("the sync should read the connection through one accessor");
+    let unreadable_arm = slice_from(sync, unreadable, 1400);
+    assert!(
+        !unreadable_arm.contains("if !self.has_live_connection"),
+        "the sync's `could not read the connection` arm must not decide from `has_live_connection`: \
+         a tab switch that could not take the mutex set it false, so the combos went grey with no \
+         retry armed in exactly the case that needed one"
+    );
+    assert!(
+        unreadable_arm.contains("self.arm_transaction_mode_sync_retry();"),
+        "an unreadable connection must re-arm the sync: an adopted mode reaches the toolbar and \
+         the tab's browser card through it and nothing else"
+    );
+
+    // The busy-vs-dead rule the connection-dependent controls have always
+    // stated now comes from the view instead of a second try_lock.
+    let controls_start = content
+        .find("fn refresh_connection_dependent_controls(&mut self)")
+        .expect("connection-dependent controls should exist");
+    let controls = slice_from(&content, controls_start, 900);
+    assert!(
+        controls.contains("let is_connected = self.has_live_connection;"),
+        "the connection-dependent controls must read the one view, not re-derive liveness from a \
+         second `try_lock` that cannot tell an unbound tab from a busy connection"
+    );
+}
+
+/// Which transaction option is changing is a TYPE, not the noun in the message.
+///
+/// Two of the rules in the option-change gate belong to the transaction mode
+/// alone, and they used to be selected by comparing the user-facing noun
+/// (`action == "transaction mode"`). A third caller, a reworded string or a
+/// translated one would have taken the wrong branch in silence.
+#[test]
+fn the_transaction_option_gate_selects_its_rule_by_type_not_by_message() {
+    let content = read_source("src/ui/main_window.rs");
+    assert!(
+        content.contains("enum TransactionOptionKind"),
+        "the two per-tab transaction options should be a type"
+    );
+    let start = content
+        .find("fn validate_transaction_option_change(")
+        .expect("the option-change gate should exist");
+    let gate = slice_from(&content, start, 1800);
+    assert!(
+        gate.contains("option: TransactionOptionKind"),
+        "the gate must be told WHICH option is changing, as a value it can match on"
+    );
+    assert!(
+        !gate.contains(r#"action == ""#),
+        "the gate must not select its rule by comparing the noun it prints to the user"
+    );
+    assert!(
+        gate.contains(
+            "let is_transaction_mode = option == TransactionOptionKind::TransactionMode;"
+        ),
+        "the mode-only rules must be gated on the option type"
+    );
+    assert!(
+        gate.contains("option.label()"),
+        "the message keeps the noun; the rule no longer does"
+    );
+}
+
+/// A session-ending plan tells a user's CANCEL from a session it could not
+/// resolve.
+///
+/// Both used to be one `false`. Stopping the apply loop on a failed
+/// commit/rollback left the tabs before it resolved for an action that then did
+/// not happen, and threw away the answers the user had already given for the
+/// tabs behind it — the shape "ask everything, then act" exists to prevent,
+/// moved one phase later.
+#[test]
+fn a_session_ending_plan_tells_a_cancel_from_a_session_it_could_not_resolve() {
+    let content = read_source("src/ui/main_window.rs");
+    assert!(
+        content.contains("enum PooledSessionPlanOutcome"),
+        "the plan should answer with a type, not a bool"
+    );
+    for variant in [
+        "Completed",
+        "CancelledBeforeAnyChange",
+        "Unresolved(Vec<QueryTabId>)",
+    ] {
+        assert!(
+            content.contains(variant),
+            "the plan outcome must keep its three answers apart, including `{variant}`"
+        );
+    }
+    let start = content
+        .find("fn resolve_pooled_sessions_for_tabs(")
+        .expect("the plan runner should exist");
+    let end = content[start..]
+        .find("fn resolve_pooled_session_before_action(")
+        .map(|offset| start + offset)
+        .expect("the single-tab wrapper should follow the plan runner");
+    let runner = &content[start..end];
+    let apply_loop = runner
+        .find("for (tab_id, resolution) in plan")
+        .expect("the plan must be applied after every tab has answered");
+    let apply_body = slice_from(runner, apply_loop, 400);
+    assert!(
+        !apply_body.contains("return"),
+        "the apply loop must carry out EVERY answer the user gave: returning on the first \
+         failure left the tabs behind it unresolved and the tabs before it committed for an \
+         action that was then abandoned"
+    );
+    assert!(
+        apply_body.contains("unresolved.push(tab_id)"),
+        "a session that could not be resolved must be named in the answer"
+    );
+
+    // Close All is the action where the difference shows: a tab whose session
+    // could not be resolved still holds the user's work, so closing it would
+    // take that work down with it.
+    let close_all = content
+        .find("fn close_all_query_editor_tabs(")
+        .expect("Close All should exist");
+    let close_all_body = slice_from(&content, close_all, 2600);
+    assert!(
+        close_all_body.contains("plan.action_may_proceed()")
+            && close_all_body.contains("plan.tab_was_resolved(tab_id)"),
+        "Close All must stop only for a CANCEL, and must leave a tab whose session could not be \
+         resolved open rather than closing it over the work"
+    );
+}
+
+/// A scope the server no longer has is ANSWERED by every backend's assertion,
+/// and said once by the batch — never swallowed into a log line.
+///
+/// All four backends tolerate it on purpose (the current schema/database is a
+/// name-resolution namespace, the session stays valid, and failing every
+/// statement would leave the tab unable to run the one that fixes it — live
+/// scenario TM S46). Tolerating it silently is the part that was wrong: Oracle
+/// then resolves unqualified names in the LOGIN schema and the MySQL family in
+/// no database at all, while the tab's own selector still shows the scope.
+#[test]
+fn a_scope_the_server_lost_is_answered_by_every_backend_and_said_once() {
+    let connection = read_source("src/db/connection.rs");
+    assert!(
+        connection.contains("pub enum SessionScopeAssertion"),
+        "whether a session is in its tab's scope should be a value"
+    );
+    assert!(
+        connection.contains("#[must_use = \"an unavailable scope must be reported, refused or explicitly ignored\"]"),
+        "the answer must be impossible to drop by accident: every future caller has to decide"
+    );
+
+    // Both Oracle tolerance sites answer instead of returning Ok(()).
+    for anchor in [
+        "pub(crate) fn apply_tracked_oracle_current_schema_on_session(",
+        "pub(crate) fn apply_tracked_oracle_thin_current_schema(",
+    ] {
+        let start = connection
+            .find(anchor)
+            .unwrap_or_else(|| panic!("{anchor} should exist"));
+        let body = slice_from(&connection, start, 1400);
+        assert!(
+            body.contains("Ok(SessionScopeAssertion::unavailable(schema))"),
+            "{anchor} must ANSWER a dropped schema, not swallow it into a warning"
+        );
+    }
+
+    // Both MySQL tolerance sites do the same.
+    let execution = read_source("src/ui/sql_editor/execution.rs");
+    let prepare = execution
+        .find("fn prepare_mysql_pooled_session_database(")
+        .expect("the MySQL database preparation should exist");
+    // Anchored on the function that follows, not on a byte count: the two
+    // tolerance roads are ~140 lines apart and a window is one edit away from
+    // reaching only the first.
+    let prepare_end = execution[prepare..]
+        .find("fn acquire_oracle_pooled_execution_connection")
+        .map(|offset| prepare + offset)
+        .expect("the Oracle acquisition helper should follow the MySQL database preparation");
+    let prepare_body = &execution[prepare..prepare_end];
+    assert_eq!(
+        prepare_body
+            .matches("SessionScopeAssertion::unavailable(Some(database))")
+            .count(),
+        2,
+        "both MySQL roads that leave a session without the database its tab asked for (a \
+         work-carrying session left detached, and a fresh session reset to no database) must \
+         answer that the scope is gone"
+    );
+
+    // One message, dispatched per family so each says its own noun.
+    let types = read_source("src/db/query/types.rs");
+    assert!(
+        types.contains("pub fn session_scope_unavailable(scope_noun: &str, scope: &str)"),
+        "the text belongs to the result-message catalog, like every other message all four \
+         backends share"
+    );
+    assert!(
+        connection.contains("fn scope_unavailable_message(&self, scope: &str) -> String {")
+            && connection.contains("self.switch_scope_noun()"),
+        "the message must be built once and dispatched per backend, so Oracle says `current \
+         schema` and the MySQL family says `database`"
+    );
+
+    // Said ONCE per run, by every backend's per-statement assertion.
+    assert!(
+        execution.contains("pub(super) struct SessionScopeReport"),
+        "the once-per-run latch should be a value shared by all four backends"
+    );
+    assert_eq!(
+        execution.matches("scope_report.note(").count(),
+        4,
+        "every per-statement assertion reports through the same latch: Oracle OCI batch, Oracle \
+         Thin batch, the MySQL statement runner and the MySQL lazy SELECT"
+    );
+    assert!(
+        execution.contains("SessionScopeReport::default().note("),
+        "the Oracle Thin lazy SELECT is a statement of its tab too, and says the same thing"
     );
 }

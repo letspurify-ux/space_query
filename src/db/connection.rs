@@ -1146,6 +1146,10 @@ impl DatabaseType {
         backend_for(self).scope_switch_activity_message(target_scope)
     }
 
+    pub(crate) fn scope_unavailable_message(self, scope: &str) -> String {
+        backend_for(self).scope_unavailable_message(scope)
+    }
+
     pub(crate) fn scope_switch_failure_message(self, target_scope: &str, err: &str) -> String {
         backend_for(self).scope_switch_failure_message(target_scope, err)
     }
@@ -3465,6 +3469,15 @@ pub(crate) trait DbBackend: Sync {
     fn scope_switch_activity_message(&self, target_scope: &str) -> String {
         format!("Switching {} to {}", self.switch_scope_noun(), target_scope)
     }
+    /// What the user is told when a tab's scope is no longer on the server.
+    /// One body, one catalog string, the family's own noun — so all four
+    /// backends say the same thing about the same situation.
+    fn scope_unavailable_message(&self, scope: &str) -> String {
+        crate::db::query::result_messages::session_scope_unavailable(
+            self.switch_scope_noun(),
+            scope,
+        )
+    }
     fn scope_switch_failure_message(&self, target_scope: &str, err: &str) -> String {
         format!(
             "Failed to switch {} to {}: {}",
@@ -3644,6 +3657,67 @@ pub(crate) fn retained_scope_matches_target(
     target_scope: &str,
 ) -> bool {
     retained_scope.is_some_and(|scope| db_type.scope_values_match(Some(scope), Some(target_scope)))
+}
+
+/// Whether a session really is in the scope its tab asked for.
+///
+/// Every backend's scope application is deliberately TOLERANT of a scope the
+/// server no longer has: the current schema/database is only a name-resolution
+/// namespace, the physical session stays perfectly usable, and failing every
+/// statement — including the one that would fix the situation — would brick the
+/// tab (live scenario TM S46 pins that on all four backends).
+///
+/// Tolerated is not the same as unnoticed, and it used to be: all four
+/// backends wrote a log line and answered `Ok`, so the one thing the tab
+/// promises about a statement — the scope it runs in — was broken with nothing
+/// on screen. Oracle then resolves unqualified names in the LOGIN schema, and
+/// the MySQL family in no database at all. The answer therefore travels back to
+/// the executor as a value, and the batch says it once.
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[must_use = "an unavailable scope must be reported, refused or explicitly ignored"]
+pub enum SessionScopeAssertion {
+    /// The session is where its tab says it is.
+    Applied,
+    /// The scope the tab names is not available on the server; the statements
+    /// that follow do not run in it.
+    ScopeUnavailable { scope: String },
+}
+
+impl SessionScopeAssertion {
+    /// The tolerated answer, for a scope that may or may not have a name.
+    pub(crate) fn unavailable(scope: Option<&str>) -> Self {
+        Self::ScopeUnavailable {
+            scope: scope.unwrap_or_default().to_string(),
+        }
+    }
+
+    /// The scope that did not apply, or `None` when the session is where it
+    /// should be.
+    pub fn unavailable_scope(&self) -> Option<&str> {
+        match self {
+            Self::Applied => None,
+            Self::ScopeUnavailable { scope } => Some(scope.as_str()),
+        }
+    }
+
+    /// Discard the answer, for a caller that runs no tab's statements: the
+    /// shared live connection, and the metadata/completion loaders that name
+    /// their own scope in every lookup. Named so that the discard reads as a
+    /// decision rather than an oversight.
+    pub(crate) fn ignored_without_a_tab(self) {}
+
+    /// The answer for a path whose only channel to the user is its own error:
+    /// a one-shot lookup (explain, describe) that would otherwise resolve
+    /// unqualified names somewhere the tab never pointed and hand back a
+    /// confident answer about the wrong object. Nothing is bricked by refusing
+    /// one of these — the tab keeps executing, and picking another scope fixes
+    /// it — which is why they answer rather than tolerate.
+    pub(crate) fn require_applied(self, db_type: DatabaseType) -> Result<(), String> {
+        match self {
+            Self::Applied => Ok(()),
+            Self::ScopeUnavailable { scope } => Err(db_type.scope_unavailable_message(&scope)),
+        }
+    }
 }
 
 /// What a pooled MySQL/MariaDB session needs before a statement runs on it.
@@ -5541,8 +5615,9 @@ impl DatabaseConnection {
     pub(crate) fn apply_tracked_oracle_thin_current_schema(
         session: &mut OracleThinSession,
         schema: Option<&str>,
-    ) -> Result<(), String> {
+    ) -> Result<SessionScopeAssertion, String> {
         match Self::apply_oracle_thin_current_schema(session, schema) {
+            Ok(()) => Ok(SessionScopeAssertion::Applied),
             Err(message) if Self::oracle_missing_current_schema_error(&message) => {
                 logging::log_warning(
                     "oracle pool session",
@@ -5551,9 +5626,9 @@ impl DatabaseConnection {
                         schema.unwrap_or_default()
                     ),
                 );
-                Ok(())
+                Ok(SessionScopeAssertion::unavailable(schema))
             }
-            other => other,
+            Err(message) => Err(message),
         }
     }
 
@@ -6486,6 +6561,10 @@ impl DatabaseConnection {
 
     pub fn apply_tracked_oracle_current_schema(&self, conn: &Connection) -> Result<(), String> {
         self.apply_oracle_current_schema_for_scope(conn, None)
+            // The shared LIVE session, which no query tab owns: there is no
+            // tab whose promise about where its statements run this could
+            // break, and no tab to report it to.
+            .map(SessionScopeAssertion::ignored_without_a_tab)
     }
 
     /// Put `conn` in the schema an operation with this `scope` runs in: the
@@ -6503,7 +6582,7 @@ impl DatabaseConnection {
         &self,
         conn: &Connection,
         scope: Option<&str>,
-    ) -> Result<(), String> {
+    ) -> Result<SessionScopeAssertion, String> {
         Self::apply_tracked_oracle_current_schema_on_session(
             conn,
             self.oracle_session_schema_for_scope(scope).as_deref(),
@@ -6528,14 +6607,17 @@ impl DatabaseConnection {
     pub(crate) fn apply_tracked_oracle_current_schema_on_session(
         conn: &Connection,
         schema: Option<&str>,
-    ) -> Result<(), String> {
+    ) -> Result<SessionScopeAssertion, String> {
         match Self::apply_oracle_current_schema(conn, schema) {
+            Ok(()) => Ok(SessionScopeAssertion::Applied),
             Err(message) if Self::oracle_missing_current_schema_error(&message) => {
                 // The tracked schema's user was dropped. The schema setting is
                 // only a name-resolution namespace and the session itself is
                 // still valid, so keep using it instead of failing every
                 // statement (including the recovery ALTER SESSION) on
-                // ORA-01435.
+                // ORA-01435. Tolerated, not unnoticed: the caller is told which
+                // scope did not apply, because from here on unqualified names
+                // resolve in the LOGIN schema instead.
                 logging::log_warning(
                     "oracle pool session",
                     &format!(
@@ -6543,9 +6625,9 @@ impl DatabaseConnection {
                         schema.unwrap_or_default()
                     ),
                 );
-                Ok(())
+                Ok(SessionScopeAssertion::unavailable(schema))
             }
-            other => other,
+            Err(message) => Err(message),
         }
     }
 
@@ -8518,6 +8600,46 @@ pub fn try_lock_connection_with_activity(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A scope the server no longer has is tolerated, and the toleration is an
+    /// ANSWER — the caller decides what to do with it, and cannot drop it by
+    /// accident (`#[must_use]`).
+    ///
+    /// Before this, all four backends wrote a log line and returned `Ok`, so
+    /// the one promise a tab makes about a statement — the scope it runs in —
+    /// was broken with nothing on screen: Oracle resolves unqualified names in
+    /// the LOGIN schema from there, the MySQL family in no database at all.
+    #[test]
+    fn a_tolerated_missing_scope_is_an_answer_not_a_log_line() {
+        assert_eq!(SessionScopeAssertion::Applied.unavailable_scope(), None);
+
+        let gone = SessionScopeAssertion::unavailable(Some("SQ_SCOPE"));
+        assert_eq!(gone.unavailable_scope(), Some("SQ_SCOPE"));
+
+        // A path with no messages pane of its own refuses instead of answering
+        // confidently about the wrong object, and says the family's own noun.
+        let refusal = gone
+            .clone()
+            .require_applied(DatabaseType::Oracle)
+            .expect_err("an unavailable scope must not read as applied");
+        assert!(
+            refusal.contains("SQ_SCOPE") && refusal.contains("current schema"),
+            "Oracle names the schema and calls it a current schema: {refusal}"
+        );
+        let mysql_refusal = SessionScopeAssertion::unavailable(Some("sq_db"))
+            .require_applied(DatabaseType::MySQL)
+            .expect_err("an unavailable database must not read as applied");
+        assert!(
+            mysql_refusal.contains("sq_db") && mysql_refusal.contains("database"),
+            "the MySQL family calls it a database: {mysql_refusal}"
+        );
+        assert!(
+            SessionScopeAssertion::Applied
+                .require_applied(DatabaseType::MariaDB)
+                .is_ok(),
+            "a session that IS where its tab says it is refuses nothing"
+        );
+    }
 
     #[test]
     fn a_session_hand_back_names_the_execution_it_belongs_to() {

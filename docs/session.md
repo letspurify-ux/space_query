@@ -162,6 +162,25 @@ preserved session instead made the eager push a correctness requirement it
 cannot meet. Guard: `every_batch_holds_its_session_in_the_requesting_tabs_scope`;
 live check S44 in `verify_transaction_mode_live` (all four backends).
 
+A scope the server no longer has is TOLERATED on every backend and no longer
+tolerated in silence. The current schema/database is only a name-resolution
+namespace, the physical session stays valid, and failing every statement —
+including the one that would fix the situation — would brick the tab, which is
+what live scenario TM S46 pins on all four backends. But tolerating it left the
+one promise a tab makes about a statement broken with nothing on screen: Oracle
+resolves unqualified names in the LOGIN schema from that point and the MySQL
+family in no database at all, while the tab's selector still shows the scope.
+Every apply path therefore answers `SessionScopeAssertion` instead of `Ok(())`
+— `#[must_use]`, so a caller has to decide — and the batch says it once through
+`SessionScopeReport` and the shared catalog message
+(`result_messages::session_scope_unavailable`, given the family's own noun by
+`DbBackend::scope_unavailable_message`). Latched on the scope NAME, because a
+script can move the session and then lose the new scope too. Paths with no
+messages pane of their own — Explain, Go to Declaration — refuse instead
+(`require_applied`), rather than answering confidently about an object in
+another schema; the callers that run no tab's statements say so with
+`ignored_without_a_tab`.
+
 The object browser's scope selection is tab-local: a pick lands on the ACTIVE
 tab only (each query editor tab owns its own browser card — tree, filter, and
 scope — plus one preview card per connection for the dropdown), never on the

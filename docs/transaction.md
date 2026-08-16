@@ -264,6 +264,35 @@ unexpressible pair is not adopted
 (`adopt_session_transaction_mode_change_after_statement`), leaving the
 conservative session residue in place.
 
+### The screen's picture of the active tab's connection has one writer
+
+Everything the window shows about the ACTIVE TAB's connection — which
+connection it is, whether it is live, its name, and the auto-commit default the
+indicator resolves the tab's pin against — is learned in one place,
+`AppState::refresh_active_connection_view()`, and nowhere else writes those
+fields. It answers THREE things, not two, because `try_lock_connection` says
+`None` both while another tab's query holds the connection mutex and while a
+connect/reconnect/disconnect/pool-resize transition is in flight:
+
+- the active tab is bound to no connection: `AppState::connection` points at a
+  never-connected placeholder, so every reader answers "not connected" for such
+  a tab instead of describing whichever connection was active before it,
+- the connection was read: that is the truth,
+- the connection could not be read: the runtime answers instead
+  (`ConnectionRuntimeState::liveness_without_connection_lock`), a transition in
+  flight lowers nothing, and a value may only be KEPT for the connection it was
+  learned from.
+
+Reading the unreadable answer as "not connected" filed a live tab as
+disconnected whenever a NEIGHBOUR tab was running a query: the status bar lost
+its connection, the transaction-mode combos went grey with no retry armed
+(exactly the case the deferred re-arm exists for), and the tab's metadata
+refresh was dropped. Keeping an auto-commit default across a switch to another
+connection made the status bar and the Tools menu show one connection's default
+under another connection's tab. The view is re-learned on every status tick as
+well as on every tab switch, so a window in which the connection could not be
+read closes by itself.
+
 ### Screen = session guarantee
 
 The toolbar sync records the mode it displayed
@@ -360,7 +389,14 @@ never in the middle of normal work. When one action ends SEVERAL tabs' sessions
 resolved (`resolve_pooled_sessions_for_tabs`): the prompt runs a real COMMIT, so
 asking tab by tab and acting on each answer as it arrived let a Cancel on the
 second tab stop the action with the first tab's transaction already committed
-for it. A tab whose query is still running is not part of that plan — its
+for it. The plan answers with `PooledSessionPlanOutcome`, which keeps a user's
+CANCEL apart from a session it could not resolve: both used to be one `false`,
+so a failed commit on the third tab aborted an action the first two had already
+been committed for AND threw away the answers given for the tabs behind it. A
+cancel stops the action; a failure carries every remaining answer out, reports
+each one, and lets the action finish — except that a tab whose session could not
+be resolved is left OPEN by Close All, because its work is still on that
+session. A tab whose query is still running is not part of that plan — its
 session belongs to its worker until the query stops, and it is resolved on its
 own deferred close. `ScopeChange` is always `Allow` (scope is
 applied to the retained session in place and destroys nothing). An `Execute`
@@ -550,7 +586,11 @@ physical session the tab is already holding. `update_transaction_mode_from_contr
 is therefore a three-step path, and all three steps matter:
 
 1. `validate_transaction_option_change()` — refuse the change outright when the
-   retained session cannot take it (this is what keeps the screen honest),
+   retained session cannot take it (this is what keeps the screen honest). It
+   is told WHICH option is changing as a `TransactionOptionKind`, because two
+   of its rules belong to the transaction mode alone and used to be selected by
+   comparing the noun the message prints (`action == "transaction mode"`) — one
+   reworded string away from taking the wrong branch in silence,
    through `SqlEditorWidget::ensure_retained_session_option_change_allowed`,
    which every backend's step 3 asks as well. Steps 1 and 3 are the same
    question about the same session, so they must not be two rules: the Oracle

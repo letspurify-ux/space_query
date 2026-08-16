@@ -1766,11 +1766,15 @@ impl TransactionActionBackend for MysqlTransactionActionBackend {
             .snapshot()
             .and_then(|snapshot| snapshot.current_scope().map(str::to_string));
         drop(conn_guard);
+        // A transaction action of its own: one call, so its report has nothing
+        // to latch against but itself.
+        let scope_report = crate::ui::sql_editor::execution::SessionScopeReport::default();
         SqlEditorWidget::run_mysql_pooled_action_with_timeout(
             connection,
             pooled_db_session,
             execution_scope.as_deref(),
             Some(session_pool_sender),
+            &scope_report,
             current_mysql_cancel_context,
             current_query_cancel_handle,
             cancel_flag,
@@ -1954,10 +1958,14 @@ impl ExplainPlanBackend for OracleExplainPlanBackend {
                 if load_mutex_bool(cancel_flag) {
                     let _ = db_conn.break_execution();
                 }
+                // Explain has no messages pane of its own: a plan built in the
+                // login schema because the tab's is gone would name the wrong
+                // objects with no way to say so.
                 crate::db::DatabaseConnection::apply_tracked_oracle_current_schema_on_session(
                     db_conn.as_ref(),
                     plan_schema.as_deref(),
-                )?;
+                )?
+                .require_applied(crate::db::DatabaseType::Oracle)?;
                 SqlEditorWidget::run_oracle_action_with_timeout(
                     db_conn,
                     query_timeout,
@@ -1973,10 +1981,12 @@ impl ExplainPlanBackend for OracleExplainPlanBackend {
                 let mut session = db_conn
                     .lock()
                     .map_err(|_| "Oracle Thin connection lock was poisoned".to_string())?;
+                // Same answer as the OCI branch above.
                 crate::db::DatabaseConnection::apply_tracked_oracle_thin_current_schema(
                     &mut session,
                     plan_schema.as_deref(),
-                )?;
+                )?
+                .require_applied(crate::db::DatabaseType::Oracle)?;
                 session.reset_pending_cancel();
                 let cancel_handle = session.cancel_handle();
                 SqlEditorWidget::set_current_oracle_thin_cancel_context(

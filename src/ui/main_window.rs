@@ -281,6 +281,31 @@ struct ActiveSchemaUpdateTarget {
     scope: Option<String>,
 }
 
+/// Which of the two per-tab transaction options a change is about.
+///
+/// The rules below differ between them — only the transaction mode can be
+/// blocked by a backend-specific retained state, and only it may REPLACE a
+/// pending one-shot on a session that would otherwise refuse — and those rules
+/// used to be selected by comparing the noun that goes into the user-facing
+/// message (`action == "transaction mode"`). The message is a label of the
+/// choice; it must not BE the choice, or a third caller, a reworded string or a
+/// translated one silently takes the wrong branch.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TransactionOptionKind {
+    AutoCommit,
+    TransactionMode,
+}
+
+impl TransactionOptionKind {
+    /// The noun the user reads in a refusal.
+    fn label(self) -> &'static str {
+        match self {
+            Self::AutoCommit => "auto-commit",
+            Self::TransactionMode => "transaction mode",
+        }
+    }
+}
+
 struct RetainedSessionOptionChangePlan {
     connection_generation: u64,
     db_type: DatabaseType,
@@ -338,37 +363,42 @@ impl RetainedSessionOptionChangePlan {
         })
     }
 
-    fn validate_transaction_option_change(&self, action: &str) -> Result<(), String> {
+    fn validate_transaction_option_change(
+        &self,
+        option: TransactionOptionKind,
+    ) -> Result<(), String> {
         // This is the atomicity gate for global option changes: every retained
         // editor session is checked before the primary connection setter runs.
         // Per-editor apply failures after that point discard failed MySQL
         // sessions instead of leaving old option state retained beside updated
         // sessions.
+        let is_transaction_mode = option == TransactionOptionKind::TransactionMode;
         for editor in &self.retained_editors {
             let Some(snapshot) = editor.pooled_session_activity_snapshot() else {
                 continue;
             };
-            if self
-                .db_type
-                .retained_session_blocks_transaction_mode_change(snapshot.retained_state())
-                && action == "transaction mode"
+            if is_transaction_mode
+                && self
+                    .db_type
+                    .retained_session_blocks_transaction_mode_change(snapshot.retained_state())
             {
                 return Err(format!(
-                    "Cannot change {action} while a retained {} DB session is {}. Resolve or discard it first.",
+                    "Cannot change {} while a retained {} DB session is {}. Resolve or discard it first.",
+                    option.label(),
                     self.db_type.display_name(),
                     snapshot.retained_state().label()
                 ));
             }
-            if self
-                .db_type
-                .can_replace_retained_transaction_mode(snapshot.retained_state())
-                && action == "transaction mode"
+            if is_transaction_mode
+                && self
+                    .db_type
+                    .can_replace_retained_transaction_mode(snapshot.retained_state())
             {
                 continue;
             }
             crate::db::DatabaseConnection::ensure_retained_session_option_change_allowed(
                 snapshot.retained_state(),
-                action,
+                option.label(),
             )?;
         }
         Ok(())
@@ -1713,7 +1743,28 @@ impl QueryProgressContext {
 }
 
 pub struct AppState {
+    /// The connection the ACTIVE TAB is bound to, or [`Self::unbound_connection`]
+    /// while it is bound to none. Written only by
+    /// [`AppState::refresh_active_connection_view`].
     pub connection: SharedConnection,
+    /// The stand-in for "this tab has no connection": a real, permanently
+    /// disconnected `DatabaseConnection`, so every reader of `connection`
+    /// answers "not connected" for an unbound tab without having to remember
+    /// to ask whether there is one. Leaving the previous tab's connection here
+    /// made the toolbar, the status bar and the auto-commit indicator describe
+    /// a connection the active tab is not on.
+    unbound_connection: SharedConnection,
+    /// Which connection the connection-derived screen state below was learned
+    /// from. `None` while the active tab is unbound. It is what makes "keep
+    /// what we have" safe when the connection cannot be read: kept values are
+    /// only ever kept for the same connection.
+    active_connection_view_id: Option<ConnectionId>,
+    /// The screenshot harness's one door to a connected-looking window without
+    /// a server (see [`AppState::capture_tour_present_connected`]). It exists
+    /// as an explicit override so the harness does not have to write the view's
+    /// fields behind its writer's back, which is how those fields drifted apart
+    /// in the first place.
+    capture_tour_presented_connection: Option<crate::db::ConnectionInfo>,
     connection_registry: ConnectionRegistry,
     query_tabs: QueryTabsWidget,
     query_top_group: Group,
@@ -1773,11 +1824,19 @@ pub struct AppState {
     /// Saved query/result split ratio (0.0–1.0).  `None` means the user has
     /// not adjusted the split bar yet (use default 40%).
     pub query_split_ratio: Arc<Mutex<Option<f64>>>,
+    /// The ACTIVE TAB's connection identity, or `None` when it has none.
+    /// Written only by [`AppState::refresh_active_connection_view`].
     pub connection_info: Arc<Mutex<Option<crate::db::ConnectionInfo>>>,
+    /// Whether the ACTIVE TAB has a live connection behind it. Written only by
+    /// [`AppState::refresh_active_connection_view`], which never lowers it on
+    /// an answer that is not knowledge.
     has_live_connection: bool,
-    /// Last observed auto-commit default of the active connection. Kept as a
-    /// cache because the connection mutex is held for the whole run of a
-    /// query, and the status bar must not lose the indicator meanwhile.
+    /// Last observed auto-commit default of the active tab's connection, kept
+    /// because the connection mutex is held for the whole run of a query and
+    /// the status bar must not lose the indicator meanwhile. Valid only for
+    /// [`AppState::active_connection_view_id`]: a cache that outlived its
+    /// connection showed one connection's default on another connection's tab.
+    /// Written only by [`AppState::refresh_active_connection_view`].
     cached_connection_auto_commit: Option<bool>,
     pending_connection_metadata_refresh: bool,
     pending_metadata_refresh_tabs: HashSet<QueryTabId>,
@@ -2274,6 +2333,141 @@ impl AppState {
         }
     }
 
+    /// Re-learn everything the screen shows about the ACTIVE TAB's connection,
+    /// from that tab's binding, in one step.
+    ///
+    /// This is the ONLY writer of `connection`, `connection_info`,
+    /// `has_live_connection`, `cached_connection_auto_commit` and
+    /// `active_connection_view_id`, because they are one answer and were four:
+    /// a tab switch wrote three of them from one read while the auto-commit
+    /// cache kept whatever the previous connection had, and the branch for a
+    /// tab with no connection left `connection` pointing at the previous tab's.
+    ///
+    /// There are THREE answers, not two. `try_lock_connection` says `None`
+    /// while another tab's query holds the mutex and while a
+    /// connect/reconnect/disconnect/pool-resize transition is in flight, so
+    /// reading that as "not connected" filed a perfectly live tab as
+    /// disconnected — the status bar lost its connection, the transaction-mode
+    /// controls went grey with no retry armed, and the tab's metadata refresh
+    /// was dropped. Nothing is lowered on an answer that is not knowledge: the
+    /// runtime's own state answers instead, and a value may only be KEPT when
+    /// it was learned from the same connection.
+    ///
+    /// Runs on every status tick as well as on every tab switch, so a window
+    /// in which the connection could not be read closes by itself.
+    fn refresh_active_connection_view(&mut self) {
+        if let Some(info) = self.capture_tour_presented_connection.clone() {
+            // Screenshot harness: there is no server, and every road below
+            // would correctly answer "not connected".
+            self.has_live_connection = true;
+            self.cached_connection_auto_commit = Some(false);
+            *self
+                .connection_info
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(info);
+            return;
+        }
+        let binding = self
+            .editor_tabs
+            .iter()
+            .find(|tab| tab.tab_id == self.active_editor_tab_id)
+            .map(|tab| tab.connection_binding.snapshot());
+        let Some(runtime) = binding.and_then(|binding| binding.runtime) else {
+            // Bound to nothing: definite, and the only honest connection to
+            // point at is one that is not connected.
+            self.connection = self.unbound_connection.clone();
+            self.active_connection_view_id = None;
+            self.has_live_connection = false;
+            self.cached_connection_auto_commit = None;
+            *self
+                .connection_info
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+            return;
+        };
+        let connection_id = runtime.id();
+        let describes_same_connection = self.active_connection_view_id == Some(connection_id);
+        self.connection = runtime.connection();
+        self.active_connection_view_id = Some(connection_id);
+        match crate::db::try_lock_connection(&self.connection) {
+            Some(guard) => {
+                let is_live = guard.is_connected() && guard.has_connection_handle();
+                // Sanitized like the runtime's own copy: this value is read for
+                // display, and the two roads out of this function must not
+                // differ in what they carry.
+                let info = is_live.then(|| {
+                    let mut info = guard.get_info().clone();
+                    info.clear_password();
+                    info
+                });
+                let auto_commit = guard.auto_commit();
+                drop(guard);
+                self.has_live_connection = is_live;
+                self.cached_connection_auto_commit = Some(auto_commit);
+                *self
+                    .connection_info
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner()) = info;
+            }
+            None => {
+                // The connection itself cannot be read. The runtime answers
+                // without it; a transition in flight answers "do not lower".
+                match runtime.state().liveness_without_connection_lock() {
+                    crate::db::RuntimeLiveness::Live => {
+                        self.has_live_connection = true;
+                        *self
+                            .connection_info
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner()) =
+                            Some(runtime.sanitized_info());
+                    }
+                    crate::db::RuntimeLiveness::NotLive => {
+                        self.has_live_connection = false;
+                        *self
+                            .connection_info
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+                    }
+                    crate::db::RuntimeLiveness::InFlight => {
+                        if !describes_same_connection {
+                            // Nothing known about THIS connection yet, and the
+                            // previous tab's answer describes another one.
+                            self.has_live_connection = false;
+                            *self
+                                .connection_info
+                                .lock()
+                                .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+                        }
+                    }
+                }
+                if !describes_same_connection {
+                    // A default read from another connection is worse than no
+                    // indicator at all; the next successful read fills it in.
+                    self.cached_connection_auto_commit = None;
+                }
+            }
+        }
+    }
+
+    /// The auto-commit default of the connection the ACTIVE TAB is on, or
+    /// `None` when it has not been read yet (or there is no connection).
+    fn active_connection_auto_commit(&self) -> Option<bool> {
+        self.cached_connection_auto_commit
+    }
+
+    /// Screenshot harness only: present the window as if the active tab's
+    /// connection were up, with no server behind it.
+    ///
+    /// A named door instead of raw field writes: the capture tour is the one
+    /// caller that legitimately wants the view to say something the connection
+    /// does not, and letting it write the fields directly is what made them
+    /// four values that could disagree.
+    #[doc(hidden)]
+    fn capture_tour_present_connected(&mut self, info: crate::db::ConnectionInfo) {
+        self.capture_tour_presented_connection = Some(info);
+        self.refresh_active_connection_view();
+    }
+
     fn set_active_editor_tab(&mut self, tab_id: QueryTabId) -> bool {
         self.set_active_editor_tab_with_display_stabilization(tab_id, true)
     }
@@ -2322,29 +2516,7 @@ impl AppState {
             binding_snapshot.runtime.clone(),
             binding_snapshot.scope.clone(),
         );
-        if let Some(connection) = binding_snapshot.connection() {
-            self.connection = connection.clone();
-            let connection_snapshot = crate::db::try_lock_connection(&connection).map(|guard| {
-                (
-                    guard.is_connected() && guard.has_connection_handle(),
-                    guard.get_info().clone(),
-                )
-            });
-            let (has_live_connection, connection_info) = connection_snapshot
-                .map(|(live, info)| (live, live.then_some(info)))
-                .unwrap_or((false, None));
-            self.has_live_connection = has_live_connection;
-            *self
-                .connection_info
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner()) = connection_info;
-        } else {
-            self.has_live_connection = false;
-            *self
-                .connection_info
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
-        }
+        self.refresh_active_connection_view();
         self.pending_connection_metadata_refresh =
             self.has_live_connection && self.pending_metadata_refresh_tabs.remove(&tab_id);
         self.sql_editor = tab.sql_editor;
@@ -3719,6 +3891,12 @@ impl AppState {
         if self.reconcile_orphaned_canceling_lazy_fetches() {
             self.refresh_result_edit_controls();
         }
+        // Re-learn the active tab's connection on every render, before anything
+        // is read from it: a tab switch that could not take the connection
+        // mutex (a neighbour tab was executing, or a transition was running)
+        // leaves the view unsettled on purpose, and this is what settles it
+        // without waiting for another user action.
+        self.refresh_active_connection_view();
         let conn_info = self
             .connection_info
             .lock()
@@ -3738,13 +3916,9 @@ impl AppState {
         let selected_activity = latest_status_activity(&activities);
         let displayed_registry_count = usize::from(selected_activity.is_some());
         let selection_summary = self.result_tabs.selection_summary_label();
-        // Refresh the cached connection default on every render so the label
-        // tracks the connection while it is unlocked (while a query holds the
-        // lock the flag cannot change, so the cache stays accurate).
-        self.refresh_auto_commit_cache();
         let indicator_visible = conn_info.is_some() && self.has_live_connection;
         let displayed_auto_commit = self
-            .cached_connection_auto_commit
+            .active_connection_auto_commit()
             .filter(|_| indicator_visible)
             .map(|connection_default| {
                 crate::ui::sql_editor::SqlEditorWidget::effective_auto_commit(
@@ -3756,8 +3930,11 @@ impl AppState {
         // execution startup can verify it acts on exactly this state.
         self.sql_editor
             .record_displayed_auto_commit(displayed_auto_commit);
+        // Shown only for a connection this tab is really on and that was really
+        // read: a default carried over from another connection made the bar
+        // claim an auto-commit state no statement of this tab would use.
         let auto_commit_label = self
-            .cached_connection_auto_commit
+            .active_connection_auto_commit()
             .map(|connection_default| {
                 Self::auto_commit_status_label(
                     connection_default,
@@ -3883,19 +4060,17 @@ impl AppState {
         let Some((db_type, is_connected, mode, default_isolation)) =
             self.transaction_control_state()
         else {
-            // The connection mutex is busy (another tab's execution holds it):
-            // leave the controls and the recorded displayed mode untouched —
-            // nothing shown has changed. But the request is not lost with it:
-            // a mode a batch just ADOPTED reaches the toolbar and the tab's
-            // browser card only through this sync, so giving up here left both
-            // showing the mode the tab had before. Re-arm on the UI thread,
-            // same single-flight chain the FLTK grab uses.
-            if !self.has_live_connection {
-                self.transaction_isolation_choice.deactivate();
-                self.transaction_access_choice.deactivate();
-            } else {
-                self.arm_transaction_mode_sync_retry();
-            }
+            // The connection could not be READ — another tab's execution holds
+            // the mutex, or a transition is in flight. That is the ONLY reason
+            // for this answer: a tab with no connection at all points at the
+            // unbound placeholder, which reads as "not connected" and takes the
+            // normal path below. So leave the controls and the recorded
+            // displayed mode untouched — nothing shown has changed — and re-arm,
+            // because a mode a batch just ADOPTED reaches the toolbar and the
+            // tab's browser card only through this sync. Deciding here from
+            // `has_live_connection` instead greyed the combos out with no retry
+            // armed, in exactly the case that needed one.
+            self.arm_transaction_mode_sync_retry();
             return;
         };
         let labels = transaction_isolation_choice_labels(db_type, default_isolation);
@@ -4423,13 +4598,13 @@ impl AppState {
     /// Call this whenever the connection state changes
     /// (connect, disconnect, or connection lost).
     fn refresh_connection_dependent_controls(&mut self) {
-        // If the connection lock is held (query is running) treat the state as
-        // connected so we never disable buttons mid-execution.
-        let is_connected = self
-            .connection
-            .try_lock()
-            .map(|g| g.is_connected())
-            .unwrap_or(true);
+        // The active tab's connection, from the one place that learns it —
+        // which never lowers the answer because the mutex was busy, so the
+        // buttons cannot go down mid-execution, and never keeps a previous
+        // tab's answer, so an unbound tab is not offered Commit/Rollback and
+        // Disconnect for a connection it is not on.
+        self.refresh_active_connection_view();
+        let is_connected = self.has_live_connection;
 
         let has_query_tab = !self.editor_tabs.is_empty();
         // Regression guard: keep Execute enabled even when disconnected when a
@@ -4468,24 +4643,18 @@ impl AppState {
         self.sync_transaction_mode_controls();
     }
 
-    /// Re-read the active connection's auto-commit default and mirror it into
-    /// the Tools menu checkmark and the status-bar cache. Each connection has
-    /// its own flag, so this must run whenever the active connection can have
-    /// changed (tab switch, connect, disconnect) — the menu item otherwise
-    /// keeps showing whichever connection was toggled last.
-    fn refresh_auto_commit_cache(&mut self) {
-        if let Ok(guard) = self.connection.try_lock() {
-            self.cached_connection_auto_commit = Some(guard.auto_commit());
-        }
-    }
-
     /// Auto-commit is tab-scoped: the checkmark and the status bar both show
     /// the ACTIVE tab's effective value, so this must run whenever the active
     /// tab (or its value) can have changed — tab switch, connect, disconnect,
     /// the menu toggle, and a script `SET AUTOCOMMIT`.
+    ///
+    /// The connection default it resolves against comes from the one place
+    /// that learns it, keyed to the connection it was read from: showing one
+    /// connection's default under another connection's tab is worse than
+    /// showing no checkmark change at all, and the next status tick fills it in.
     fn sync_auto_commit_indicators(&mut self) {
-        self.refresh_auto_commit_cache();
-        let Some(connection_default) = self.cached_connection_auto_commit else {
+        self.refresh_active_connection_view();
+        let Some(connection_default) = self.active_connection_auto_commit() else {
             return;
         };
         let effective = crate::ui::sql_editor::SqlEditorWidget::effective_auto_commit(
@@ -5342,7 +5511,9 @@ fn update_transaction_mode_from_controls(state: &Arc<Mutex<AppState>>) {
         })
         .flatten();
     if let Some(retained_plan) = retained_plan.as_ref() {
-        if let Err(err) = retained_plan.validate_transaction_option_change("transaction mode") {
+        if let Err(err) =
+            retained_plan.validate_transaction_option_change(TransactionOptionKind::TransactionMode)
+        {
             crate::ui::alert_on_main(&err);
             let mut s = state
                 .lock()
@@ -5507,6 +5678,48 @@ enum PooledSessionResolution {
     Commit,
     Rollback,
     Discard,
+}
+
+/// How a whole session-ending action's plan ended.
+///
+/// Three answers, because the caller has to tell them apart: a Cancel during
+/// the ASK phase means nothing was touched and the action must not happen,
+/// while a failure during the APPLY phase means the user's answers were already
+/// being carried out. Collapsing both into `false` made a failed commit on the
+/// third tab abort a disconnect the first two tabs had already been committed
+/// for — and silently drop the answers given for the tabs behind it.
+#[derive(Clone, PartialEq, Eq, Debug)]
+enum PooledSessionPlanOutcome {
+    /// Every tab's session was resolved as the user asked.
+    Completed,
+    /// The user cancelled while being asked. No session was resolved.
+    CancelledBeforeAnyChange,
+    /// The plan ran in full; these tabs' sessions could not be resolved and the
+    /// failure was reported. Their work is still on their sessions, so an
+    /// action that would DESTROY it (closing the tab) must leave them alone,
+    /// while an action that is already irreversible for the rest carries on.
+    Unresolved(Vec<QueryTabId>),
+}
+
+impl PooledSessionPlanOutcome {
+    /// Whether the action this plan belongs to may go ahead.
+    ///
+    /// Only a Cancel stops it: after the apply phase has begun there is nothing
+    /// left to retry for the tabs that succeeded, and refusing would leave the
+    /// action half done with the loss unexplained — the same rule an
+    /// unreachable session already follows.
+    fn action_may_proceed(&self) -> bool {
+        !matches!(self, Self::CancelledBeforeAnyChange)
+    }
+
+    /// Whether this tab's session came through the plan resolved.
+    fn tab_was_resolved(&self, tab_id: QueryTabId) -> bool {
+        match self {
+            Self::Completed => true,
+            Self::CancelledBeforeAnyChange => false,
+            Self::Unresolved(tab_ids) => !tab_ids.contains(&tab_id),
+        }
+    }
 }
 
 impl MainWindow {
@@ -6749,6 +6962,15 @@ impl MainWindow {
     }
 
     /// Ask every tab first, then act. See [`PooledSessionResolution`].
+    ///
+    /// Answers all three outcomes separately, because two of them used to be
+    /// one `false`: a user who cancelled BEFORE anything was resolved, and a
+    /// tab whose commit or rollback FAILED after other tabs had already been
+    /// resolved for this action. Stopping the apply loop on the second one left
+    /// the earlier tabs' transactions committed for an action that then did not
+    /// happen, and threw away the answers the user had already given for the
+    /// tabs behind it — the very shape the "ask everything, then act" rule
+    /// exists to prevent, moved one phase later.
     fn resolve_pooled_sessions_for_tabs(
         state: &Arc<Mutex<AppState>>,
         tab_ids: Vec<QueryTabId>,
@@ -6757,7 +6979,7 @@ impl MainWindow {
         resolution_context: &str,
         commit_button: &str,
         rollback_button: &str,
-    ) -> bool {
+    ) -> PooledSessionPlanOutcome {
         let mut plan = Vec::with_capacity(tab_ids.len());
         for tab_id in tab_ids {
             let Some(resolution) = Self::ask_pooled_session_resolution(
@@ -6769,18 +6991,32 @@ impl MainWindow {
                 commit_button,
                 rollback_button,
             ) else {
-                return false;
+                return PooledSessionPlanOutcome::CancelledBeforeAnyChange;
             };
             plan.push((tab_id, resolution));
         }
+        // Every answer is carried out, including the ones behind a failure: the
+        // user gave them for this action, and a session left unresolved is
+        // reported by the apply itself.
+        let mut unresolved = Vec::new();
         for (tab_id, resolution) in plan {
             if !Self::apply_pooled_session_resolution(state, tab_id, resolution) {
-                return false;
+                unresolved.push(tab_id);
             }
         }
-        true
+        if unresolved.is_empty() {
+            PooledSessionPlanOutcome::Completed
+        } else {
+            PooledSessionPlanOutcome::Unresolved(unresolved)
+        }
     }
 
+    /// One tab's session, resolved before an action that ends it.
+    ///
+    /// `false` means the tab's session is NOT resolved — the user cancelled, or
+    /// the commit/rollback failed and was reported. With a single tab the two
+    /// are the same answer for the caller: nothing else was resolved for this
+    /// action, so it must not go ahead and destroy the work.
     fn resolve_pooled_session_before_action(
         state: &Arc<Mutex<AppState>>,
         tab_id: QueryTabId,
@@ -6799,6 +7035,7 @@ impl MainWindow {
             commit_button,
             rollback_button,
         )
+        .tab_was_resolved(tab_id)
     }
 
     fn resolve_pooled_session_before_close(
@@ -6881,6 +7118,11 @@ impl MainWindow {
         )
     }
 
+    /// Every tab's session, resolved before an action that ends them all.
+    ///
+    /// `false` only for a Cancel: a session that could not be resolved was
+    /// reported, and the tabs behind it were still resolved as the user asked,
+    /// so stopping the action here is what would leave it half done.
     fn resolve_pooled_sessions_before_retained_action(
         state: &Arc<Mutex<AppState>>,
         action: RetainedSessionPreflightAction,
@@ -6903,6 +7145,7 @@ impl MainWindow {
             commit_button,
             rollback_button,
         )
+        .action_may_proceed()
     }
 
     fn resolve_pooled_sessions_before_runtime_disconnect(
@@ -6926,6 +7169,7 @@ impl MainWindow {
             "Commit and Disconnect",
             "Rollback and Disconnect",
         )
+        .action_may_proceed()
     }
 
     fn resolve_pooled_sessions_before_pool_resize(state: &Arc<Mutex<AppState>>) -> bool {
@@ -6945,9 +7189,13 @@ impl MainWindow {
 
     pub fn new_with_config(config: AppConfig) -> Self {
         font_settings::update_runtime_font_settings(&config);
-        let connection = create_shared_connection();
+        // Never connected, and never connected TO: it is what
+        // `AppState::connection` points at while the active tab is bound to no
+        // connection, so every reader answers "not connected" for such a tab
+        // instead of describing whichever connection was active before it.
+        let unbound_connection = create_shared_connection();
         {
-            let mut guard = crate::db::lock_connection(&connection);
+            let mut guard = crate::db::lock_connection(&unbound_connection);
             guard.set_connection_pool_size(config.normalized_connection_pool_size());
         }
         let connection_registry = ConnectionRegistry::new();
@@ -7713,7 +7961,12 @@ impl MainWindow {
         let state = Arc::new(Mutex::new(AppState {
             self_handle: std::sync::Weak::new(),
             transaction_mode_sync_retry_armed: false,
-            connection,
+            // The window opens with no tab bound to anything, which is exactly
+            // what the placeholder means.
+            connection: unbound_connection.clone(),
+            unbound_connection,
+            active_connection_view_id: None,
+            capture_tour_presented_connection: None,
             connection_registry,
             query_tabs: query_tabs.clone(),
             query_top_group: query_top_group.clone(),
@@ -8872,7 +9125,7 @@ impl MainWindow {
                 })
                 .collect::<Vec<_>>()
         };
-        if !Self::resolve_pooled_sessions_for_tabs(
+        let plan = Self::resolve_pooled_sessions_for_tabs(
             state,
             idle_tab_ids,
             RetainedSessionPreflightAction::Close,
@@ -8880,7 +9133,8 @@ impl MainWindow {
             "closing",
             "Commit and Close",
             "Rollback and Close",
-        ) {
+        );
+        if !plan.action_may_proceed() {
             return;
         }
         for tab_id in tab_ids {
@@ -8890,6 +9144,12 @@ impl MainWindow {
                 .find_tab_index(tab_id)
                 .is_some();
             if !tab_exists {
+                continue;
+            }
+            // A session the plan could not resolve still holds the tab's work,
+            // and closing the tab would take it down with it. The failure was
+            // reported; leave that tab open and close the rest.
+            if !plan.tab_was_resolved(tab_id) {
                 continue;
             }
             // The two questions this close could still ask have been answered:
@@ -12128,11 +12388,10 @@ impl MainWindow {
                         let mut s = state
                             .lock()
                             .unwrap_or_else(|poisoned| poisoned.into_inner());
-                        *s.connection_info
-                            .lock()
-                            .unwrap_or_else(|poisoned| poisoned.into_inner()) =
-                            Some(sanitized_info.clone());
-                        s.has_live_connection = true;
+                        // The tab created above is bound to this runtime and is
+                        // the active one, so the view learns exactly this
+                        // connection — from the one place that learns it.
+                        s.refresh_active_connection_view();
                         s.object_browser.add_runtime(runtime.clone());
                         s.object_browser.refresh_runtime_labels();
                         s.refresh_tab_labels_for_connection(runtime.id());
@@ -12431,10 +12690,9 @@ impl MainWindow {
                     .lock()
                     .unwrap_or_else(|poisoned| poisoned.into_inner());
                 s.release_pooled_db_sessions_for_connection(connection_id);
-                s.has_live_connection = false;
-                *s.connection_info
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+                // The connection is disconnected and the runtime says so, so
+                // the view settles on "not connected" whichever way it reads.
+                s.refresh_active_connection_view();
                 s.pending_connection_metadata_refresh = false;
                 s.clear_pending_metadata_for_connection(connection_id);
                 clear_mutex_flag(&s.schema_refresh_in_progress);
@@ -12546,7 +12804,9 @@ impl MainWindow {
                     "disconnecting",
                     "Commit and Disconnect",
                     "Rollback and Disconnect",
-                ) {
+                )
+                .action_may_proceed()
+                {
                     return true;
                 }
 
@@ -13130,8 +13390,8 @@ impl MainWindow {
                     let mut s = state
                         .lock()
                         .unwrap_or_else(|poisoned| poisoned.into_inner());
-                    s.refresh_auto_commit_cache();
-                    s.cached_connection_auto_commit
+                    s.refresh_active_connection_view();
+                    s.active_connection_auto_commit()
                         .is_some_and(|connection_default| {
                             crate::ui::sql_editor::SqlEditorWidget::effective_auto_commit(
                                 connection_default,
@@ -13154,8 +13414,8 @@ impl MainWindow {
                     })
                     .flatten();
                 if let Some(retained_plan) = retained_plan.as_ref() {
-                    if let Err(err) =
-                        retained_plan.validate_transaction_option_change("auto-commit")
+                    if let Err(err) = retained_plan
+                        .validate_transaction_option_change(TransactionOptionKind::AutoCommit)
                     {
                         crate::ui::alert_on_main(&err);
                         let mut s = state
@@ -14567,11 +14827,11 @@ impl MainWindow {
                                         tab.sql_editor.set_db_type(info.db_type);
                                     }
                                     s.sql_editor.set_db_type(info.db_type);
-                                    *s.connection_info
-                                        .lock()
-                                        .unwrap_or_else(|poisoned| poisoned.into_inner()) =
-                                        Some(info.clone());
-                                    s.has_live_connection = true;
+                                    // Reached only when the ACTIVE tab is bound
+                                    // to the connection that just came up
+                                    // (`active_matches` above), so the one
+                                    // place that learns the view learns it.
+                                    s.refresh_active_connection_view();
                                     s.status_bar.set_label(&format!(
                                         "Connected | {} ({})",
                                         info.name, info.db_type
@@ -14698,11 +14958,9 @@ impl MainWindow {
                                         // and File/Disconnect stay enabled and
                                         // the status bar keeps painting the
                                         // connected dot for a dead connection.
-                                        s.has_live_connection = false;
-                                        *s.connection_info
-                                            .lock()
-                                            .unwrap_or_else(|poisoned| poisoned.into_inner()) =
-                                            None;
+                                        // The runtime was just marked `Failed`
+                                        // on the same evidence, so both roads
+                                        // through the view agree here.
                                         s.refresh_connection_dependent_controls();
                                         s.sync_transaction_mode_controls();
                                     }
@@ -15391,27 +15649,21 @@ impl MainWindow {
         let _ = Self::create_query_editor_tab_for_runtime(&mut state, maria_runtime.clone());
         state.query_tabs.select(oracle_tab_id);
         let _ = state.set_active_editor_tab(oracle_tab_id);
-        state.connection = oracle_runtime.connection();
         state.object_browser.set_active_tab(
             oracle_tab_id,
             Some(oracle_runtime.clone()),
             Some("SYSTEM".to_string()),
         );
         state.object_browser.capture_tour_set_example_metadata();
-        *state
-            .connection_info
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner()) =
-            Some(crate::db::ConnectionInfo::new_with_type(
-                "Local Oracle",
-                "",
-                "",
-                "",
-                1521,
-                "",
-                DatabaseType::Oracle,
-            ));
-        state.has_live_connection = true;
+        state.capture_tour_present_connected(crate::db::ConnectionInfo::new_with_type(
+            "Local Oracle",
+            "",
+            "",
+            "",
+            1521,
+            "",
+            DatabaseType::Oracle,
+        ));
         state.refresh_tab_label(oracle_tab_id);
         state.render_status_bar();
         state.window.redraw();
@@ -15528,7 +15780,7 @@ impl MainWindow {
             return false;
         };
         binding.bind(runtime.clone(), None);
-        state.connection = runtime.connection();
+        state.refresh_active_connection_view();
         state.refresh_tab_label(tab_id);
         state.window.redraw();
         true
@@ -18024,6 +18276,47 @@ mod tests {
         assert_eq!(
             auto_commit_changed_progress_status(false),
             "Tab auto-commit disabled"
+        );
+    }
+
+    #[test]
+    fn a_plan_tells_a_cancel_from_a_session_it_could_not_resolve() {
+        let tab_a: QueryTabId = 1;
+        let tab_b: QueryTabId = 2;
+
+        // Everything the user asked for happened.
+        let completed = PooledSessionPlanOutcome::Completed;
+        assert!(completed.action_may_proceed());
+        assert!(completed.tab_was_resolved(tab_a));
+
+        // A Cancel during the ASK phase touched nothing, so the action stops
+        // and no tab may be treated as resolved.
+        let cancelled = PooledSessionPlanOutcome::CancelledBeforeAnyChange;
+        assert!(!cancelled.action_may_proceed());
+        assert!(!cancelled.tab_was_resolved(tab_a));
+
+        // A failure during the APPLY phase is the other answer: the tabs that
+        // succeeded really are resolved, so the action carries on — refusing
+        // would leave it half done — while the tab whose work is still on its
+        // session is left alone.
+        let unresolved = PooledSessionPlanOutcome::Unresolved(vec![tab_b]);
+        assert!(unresolved.action_may_proceed());
+        assert!(unresolved.tab_was_resolved(tab_a));
+        assert!(!unresolved.tab_was_resolved(tab_b));
+    }
+
+    #[test]
+    fn the_transaction_option_kind_labels_what_it_selects() {
+        assert_eq!(TransactionOptionKind::AutoCommit.label(), "auto-commit");
+        assert_eq!(
+            TransactionOptionKind::TransactionMode.label(),
+            "transaction mode"
+        );
+        // The rule is chosen by the value, not by the noun: two options that
+        // print differently must still be two distinct values.
+        assert_ne!(
+            TransactionOptionKind::AutoCommit,
+            TransactionOptionKind::TransactionMode
         );
     }
 

@@ -2154,6 +2154,12 @@ fn core_backend_traits_allow_only_documented_derived_default_methods() {
                     "metadata_refresh_activity_with_base",
                     "scope_switch_activity_message",
                     "scope_switch_failure_message",
+                    // Derived exactly like its two siblings above: one catalog
+                    // string plus the family's own `switch_scope_noun()`, which
+                    // every backend states. There is no decision here to leave
+                    // to a new DB kind — only the noun, which it must implement
+                    // anyway.
+                    "scope_unavailable_message",
                     "normalize_ssl_mode",
                 ],
             )],

@@ -726,6 +726,62 @@ impl<S: WorkerSessionLease> Drop for WorkerSessionOwner<S> {
     }
 }
 
+/// Says, once per run, that this tab's scope could not be put on the session
+/// its statements are running on.
+///
+/// The assertion itself happens before EVERY statement on every backend — that
+/// is what makes the tab's scope the truth rather than a hope — so the answer
+/// arrives once per statement and the user must not read the same line a
+/// hundred times for one script. Latched on the scope name, so a script that
+/// moves the session (`USE`, `ALTER SESSION SET CURRENT_SCHEMA`) and then loses
+/// the new one is told about that one too.
+///
+/// Shared rather than mutable-borrowed because a batch hands it to several
+/// closures that are alive at the same time. A `Cell` and not a borrow-checked
+/// cell: this file spawns threads, and the guard
+/// `thread_spawn_files_do_not_use_rc_or_refcell` keeps every value in it to
+/// the kinds that stay safe when one is held across a spawn.
+#[derive(Default)]
+pub(super) struct SessionScopeReport {
+    reported_scope: std::cell::Cell<Option<String>>,
+}
+
+impl SessionScopeReport {
+    /// Report `assertion` if it is the first time this run has seen this scope
+    /// go missing. Answers whether anything was said.
+    fn note(
+        &self,
+        assertion: &crate::db::SessionScopeAssertion,
+        db_type: crate::db::DatabaseType,
+        sender: Option<&QueryProgressSender>,
+        log_context: &str,
+    ) -> bool {
+        let Some(scope) = assertion.unavailable_scope() else {
+            return false;
+        };
+        let previously_reported = self.reported_scope.take();
+        if previously_reported.as_deref() == Some(scope) {
+            self.reported_scope.set(previously_reported);
+            return false;
+        }
+        self.reported_scope.set(Some(scope.to_string()));
+        let message = db_type.scope_unavailable_message(scope);
+        crate::utils::logging::log_warning(log_context, &message);
+        if let Some(sender) = sender {
+            // Reported the same way a lost work-carrying session is
+            // (`RETAINED_SESSION_LOST_WITH_WORK`): the statements ran, but not
+            // where the tab says they did, and that has to reach the messages
+            // pane rather than only the log.
+            let _ = sender.send(QueryProgress::Message {
+                kind: ResultMessageKind::Error,
+                lines: vec![message],
+            });
+            app::awake();
+        }
+        true
+    }
+}
+
 #[derive(Clone, Copy)]
 pub(super) struct BatchSessionHandBack<'a> {
     owner: &'a crate::db::SessionHandBackOwner,
@@ -3956,6 +4012,14 @@ impl SqlEditorWidget {
     /// Returning the requested name while the session stayed somewhere else is
     /// what let a tab run in a database its selector never pointed at, with
     /// nothing able to notice.
+    /// Put a pooled MySQL/MariaDB session in the database the tab asked for.
+    ///
+    /// Answers WHERE the session ended up and WHETHER that is what was asked,
+    /// because the two can differ without an error: a database the server no
+    /// longer has leaves the session with none at all, which is tolerated for
+    /// the same reason Oracle tolerates a dropped schema (the session is still
+    /// valid, and failing every statement would brick the tab) and which used
+    /// to be visible only in the log.
     fn prepare_mysql_pooled_session_database(
         conn: &mut mysql::PooledConn,
         current_service_name: &str,
@@ -3963,7 +4027,7 @@ impl SqlEditorWidget {
         db_type: crate::db::DatabaseType,
         preserve_existing_session_state: bool,
         session_scope: Option<&str>,
-    ) -> Result<Option<String>, String> {
+    ) -> Result<(Option<String>, crate::db::SessionScopeAssertion), String> {
         let database = current_service_name.trim();
         match crate::db::mysql_pooled_session_scope_application(
             db_type,
@@ -3972,7 +4036,10 @@ impl SqlEditorWidget {
             database,
         ) {
             crate::db::MySqlSessionScopeApplication::LeaveAlone => {
-                return Ok(Self::normalized_session_scope(session_scope));
+                return Ok((
+                    Self::normalized_session_scope(session_scope),
+                    crate::db::SessionScopeAssertion::Applied,
+                ));
             }
             crate::db::MySqlSessionScopeApplication::SelectDatabaseOnly => {
                 // The session carries work or residue, so only the database
@@ -3981,7 +4048,10 @@ impl SqlEditorWidget {
                 // (the encoding statements would also clear the diagnostics
                 // area this session may be holding for `SHOW WARNINGS`).
                 return match conn.as_mut().select_db(database) {
-                    Ok(()) => Ok(Some(database.to_string())),
+                    Ok(()) => Ok((
+                        Some(database.to_string()),
+                        crate::db::SessionScopeAssertion::Applied,
+                    )),
                     // The target is gone. Whether that may be tolerated
                     // depends on where this session actually is, so read it
                     // rather than assume: a session the server has already
@@ -4007,7 +4077,10 @@ impl SqlEditorWidget {
                                         "Current database `{database}` is not available and this work-carrying session has none; leaving it detached"
                                     ),
                                 );
-                                Ok(None)
+                                Ok((
+                                    None,
+                                    crate::db::SessionScopeAssertion::unavailable(Some(database)),
+                                ))
                             }
                         }
                     }
@@ -4021,8 +4094,10 @@ impl SqlEditorWidget {
             crate::db::MySqlSessionScopeApplication::PrepareSession => {}
         }
         if database.is_empty() {
+            // The connection itself has no database and the tab asked for none,
+            // so "nowhere" IS the scope this session should be in.
             Self::reset_mysql_pooled_session_to_no_database(conn, advanced, db_type)?;
-            return Ok(None);
+            return Ok((None, crate::db::SessionScopeAssertion::Applied));
         }
 
         // Re-select even when SELECT DATABASE() would report the same name.
@@ -4033,7 +4108,10 @@ impl SqlEditorWidget {
                 crate::db::DatabaseConnection::apply_mysql_connection_encoding_with_settings_for_db_type(
                     conn, advanced, db_type,
                 )?;
-                Ok(Some(database.to_string()))
+                Ok((
+                    Some(database.to_string()),
+                    crate::db::SessionScopeAssertion::Applied,
+                ))
             }
             Err(err) if Self::mysql_missing_current_database_error(&err) => {
                 crate::utils::logging::log_error(
@@ -4043,7 +4121,10 @@ impl SqlEditorWidget {
                     ),
                 );
                 Self::reset_mysql_pooled_session_to_no_database(conn, advanced, db_type)?;
-                Ok(None)
+                Ok((
+                    None,
+                    crate::db::SessionScopeAssertion::unavailable(Some(database)),
+                ))
             }
             Err(err) => Err(SqlEditorWidget::mysql_error_message(&err, None)),
         }
@@ -4139,7 +4220,10 @@ impl SqlEditorWidget {
                         })
                     };
                     match setup_result {
-                        Ok(()) => {
+                        // A scope the server no longer has is reported by the
+                        // per-statement assertion, which runs for every
+                        // statement of the batch this acquisition serves.
+                        Ok(_) => {
                             return (
                                 conn_guard,
                                 Ok(Some((conn, prior_retained_state, pool_context_epoch))),
@@ -4264,7 +4348,9 @@ impl SqlEditorWidget {
                 None => return (conn_guard, Err("Expected Oracle pool session".to_string())),
             };
             match conn_guard.apply_oracle_current_schema_for_scope(conn.as_ref(), execution_scope) {
-                Ok(()) => {
+                // As above: the per-statement assertion is what reports a
+                // scope this session could not be put in.
+                Ok(_) => {
                     return (
                         conn_guard,
                         Ok(Some((
@@ -5934,10 +6020,18 @@ impl SqlEditorWidget {
                         // starts no transaction, so it cannot displace a
                         // `SET TRANSACTION` from being its transaction's first
                         // statement.
-                        Self::apply_oracle_thin_schema_before_statement(
-                            conn,
-                            session_schema.as_deref(),
-                        )?;
+                        // One statement, one report: the lazy SELECT is this
+                        // tab's statement and must say the same thing the batch
+                        // would about a scope the server no longer has.
+                        SessionScopeReport::default().note(
+                            &Self::apply_oracle_thin_schema_before_statement(
+                                conn,
+                                session_schema.as_deref(),
+                            )?,
+                            crate::db::DatabaseType::Oracle,
+                            Some(&sender),
+                            "oracle thin lazy fetch",
+                        );
 
                         let sql_for_editing =
                             QueryExecutor::maybe_inject_rowid_for_editing(&sql_to_execute);
@@ -7915,11 +8009,13 @@ impl SqlEditorWidget {
         let started = Instant::now();
         let statement_effects =
             Self::mysql_statement_session_effects_for_sql_for_db_type(db_type, marker_sql);
+        let scope_report = SessionScopeReport::default();
         let execution = Self::run_mysql_pooled_action_with_timeout(
             shared_connection,
             pooled_db_session,
             execution_scope,
             Some(sender),
+            &scope_report,
             current_mysql_cancel_context,
             current_query_cancel_handle,
             cancel_flag,
@@ -8061,6 +8157,10 @@ impl SqlEditorWidget {
         }];
 
         let mut mysql_batch_effects = crate::db::MySqlBatchSessionEffects::for_db_type(db_type);
+        // The tab's database is asserted per statement here (the session is
+        // re-acquired per statement too), so this latch is what keeps one
+        // missing database from being reported once per statement of a script.
+        let scope_report = &SessionScopeReport::default();
         let mysql_batch_interrupted = std::cell::Cell::new(false);
         let mysql_batch_executed_sql_statement = std::cell::Cell::new(false);
 
@@ -8125,6 +8225,7 @@ impl SqlEditorWidget {
                 pooled_db_session,
                 statement_scope.as_deref(),
                 Some(sender),
+                scope_report,
                 current_mysql_cancel_context,
                 current_query_cancel_handle,
                 cancel_flag,
@@ -8202,6 +8303,7 @@ impl SqlEditorWidget {
                     pooled_db_session,
                     statement_scope.as_deref(),
                     Some(sender),
+                    scope_report,
                     current_mysql_cancel_context,
                     current_query_cancel_handle,
                     cancel_flag,
@@ -9240,7 +9342,18 @@ impl SqlEditorWidget {
                                         false,
                                         session_scope.as_deref(),
                                     ) {
-                                        Ok(applied_scope) => applied_scope,
+                                        Ok((applied_scope, assertion)) => {
+                                            // Same answer as the statement
+                                            // path: a lazily streamed SELECT
+                                            // is still a statement of this tab.
+                                            scope_report.note(
+                                                &assertion,
+                                                db_type,
+                                                Some(sender),
+                                                db_activity,
+                                            );
+                                            applied_scope
+                                        }
                                         Err(message) => {
                                             let message =
                                         Self::restore_or_discard_mysql_retained_session_after_scope_recheck_error(
@@ -11152,6 +11265,10 @@ impl SqlEditorWidget {
                     }
                 };
                 let mut stop_execution = false;
+                // The tab's scope is asserted before every statement; this is
+                // what keeps a scope the server no longer has from being
+                // reported once per statement of a script.
+                let scope_report = SessionScopeReport::default();
                 let working_dir = env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
                 let mut frames = vec![ScriptExecutionFrame {
                     items,
@@ -13691,15 +13808,25 @@ impl SqlEditorWidget {
                             }
 
                             let statement_scope = current_operation_scope();
-                            if let Err(message) =
-                                Self::apply_oracle_schema_before_pooled_action(
-                                    &shared_connection,
-                                    conn,
-                                    &db_activity,
-                                    connection_generation,
-                                    statement_scope.as_deref(),
-                                )
-                            {
+                            match Self::apply_oracle_schema_before_pooled_action(
+                                &shared_connection,
+                                conn,
+                                &db_activity,
+                                connection_generation,
+                                statement_scope.as_deref(),
+                            ) {
+                                Ok(assertion) => {
+                                    // Tolerated, and said out loud once: the
+                                    // statements below do NOT run in the scope
+                                    // this tab shows.
+                                    scope_report.note(
+                                        &assertion,
+                                        crate::db::DatabaseType::Oracle,
+                                        Some(&sender),
+                                        &db_activity,
+                                    );
+                                }
+                                Err(message) => {
                                 let emitted = SqlEditorWidget::emit_non_select_result(
                                     &sender,
                                     &session,
@@ -13718,6 +13845,7 @@ impl SqlEditorWidget {
                                     stop_execution = true;
                                 }
                                 continue;
+                                }
                             }
 
                             let compiled_object = QueryExecutor::parse_compiled_object(&sql_text);
@@ -18365,6 +18493,10 @@ impl SqlEditorWidget {
                 .as_deref()
                 .and_then(|context| context.scope.as_deref()),
         );
+        // The schema is asserted before every statement; this is what keeps a
+        // schema the server no longer has from being reported once per
+        // statement of a script.
+        let scope_report = SessionScopeReport::default();
         // The tab's SERVEROUTPUT setting has to reach the session this batch
         // runs on, not only the one it was typed on. `DBMS_OUTPUT.ENABLE` is
         // SESSION state and the tab's setting lives on its `SessionState`, so
@@ -19796,28 +19928,40 @@ impl SqlEditorWidget {
                         continue;
                     }
 
-                    if let Err(message) = Self::apply_oracle_thin_schema_before_statement(
+                    match Self::apply_oracle_thin_schema_before_statement(
                         conn,
                         session_schema.as_deref(),
                     ) {
-                        had_error = true;
-                        Self::emit_non_select_result(
-                            sender,
-                            session,
-                            conn_name,
-                            result_index,
-                            &display_sql,
-                            format!("Error: {message}"),
-                            false,
-                            false,
-                            script_mode,
-                        );
-                        result_index += 1;
-                        invalid_session |= conn.is_broken();
-                        if !continue_on_error {
-                            stop_execution = true;
+                        Ok(assertion) => {
+                            // Tolerated, and said out loud once: the statements
+                            // below do NOT run in the scope this tab shows.
+                            scope_report.note(
+                                &assertion,
+                                crate::db::DatabaseType::Oracle,
+                                Some(sender),
+                                db_activity,
+                            );
                         }
-                        continue;
+                        Err(message) => {
+                            had_error = true;
+                            Self::emit_non_select_result(
+                                sender,
+                                session,
+                                conn_name,
+                                result_index,
+                                &display_sql,
+                                format!("Error: {message}"),
+                                false,
+                                false,
+                                script_mode,
+                            );
+                            result_index += 1;
+                            invalid_session |= conn.is_broken();
+                            if !continue_on_error {
+                                stop_execution = true;
+                            }
+                            continue;
+                        }
                     }
 
                     let mut statement_error = None::<String>;
@@ -23866,7 +24010,10 @@ impl SqlEditorWidget {
             false,
             None,
         ) {
-            Ok(session_scope) => Ok((conn, session_scope)),
+            // The per-statement assertion this session is handed to reports a
+            // database the server no longer has; here only WHERE it landed
+            // matters.
+            Ok((session_scope, _)) => Ok((conn, session_scope)),
             Err(message) if !Self::mysql_error_allows_session_reuse(&message) => {
                 Self::discard_mysql_pooled_connection(conn);
                 let (mut conn, cancel_registration) =
@@ -23877,7 +24024,7 @@ impl SqlEditorWidget {
                         cancel_registration,
                     );
                 }
-                let session_scope = Self::prepare_mysql_pooled_session_database(
+                let (session_scope, _) = Self::prepare_mysql_pooled_session_database(
                     &mut conn,
                     &context.current_service_name,
                     &context.connection_info.advanced,
@@ -24174,7 +24321,7 @@ impl SqlEditorWidget {
                 preserve_existing_session_state,
                 session_scope.as_deref(),
             ) {
-                Ok(applied_scope) => session_scope = applied_scope,
+                Ok((applied_scope, _)) => session_scope = applied_scope,
                 Err(message) => {
                     if Self::mysql_pool_acquire_error_should_retry_fresh(&message) {
                         if require_existing_session || preserve_existing_session_state {
@@ -25706,7 +25853,12 @@ impl SqlEditorWidget {
             connection_generation,
             execution_scope,
         ) {
-            Ok(()) => true,
+            // The lazy-fetch cleanup path: it runs no statement of the user's,
+            // so an unavailable scope has nothing here to mis-resolve.
+            Ok(assertion) => {
+                assertion.ignored_without_a_tab();
+                true
+            }
             Err(message) => {
                 eprintln!(
                     "Warning: failed to apply tracked Oracle current schema to pooled session: {message}"
@@ -25732,11 +25884,13 @@ impl SqlEditorWidget {
     ///
     /// Tolerant of a dropped schema for the same reason the tracked apply is:
     /// the setting is only a name-resolution namespace, and failing every
-    /// statement on ORA-01435 would brick the tab.
+    /// statement on ORA-01435 would brick the tab. It ANSWERS which of the two
+    /// happened, so the batch can say that the statements that follow are not
+    /// running in the scope the tab shows.
     fn apply_oracle_thin_schema_before_statement<C: OracleThinBatchConnection>(
         conn: &mut C,
         session_schema: Option<&str>,
-    ) -> Result<(), String> {
+    ) -> Result<crate::db::SessionScopeAssertion, String> {
         crate::db::DatabaseConnection::apply_tracked_oracle_thin_current_schema(
             conn,
             session_schema,
@@ -25784,7 +25938,7 @@ impl SqlEditorWidget {
         db_activity: &str,
         connection_generation: u64,
         execution_scope: Option<&str>,
-    ) -> Result<(), String> {
+    ) -> Result<crate::db::SessionScopeAssertion, String> {
         let conn_guard = lock_connection_with_activity(shared_connection, db_activity.to_string());
         if !conn_guard
             .can_reuse_pool_session(connection_generation, crate::db::DatabaseType::Oracle)
@@ -25793,12 +25947,12 @@ impl SqlEditorWidget {
         }
 
         match conn_guard.apply_oracle_current_schema_for_scope(conn.as_ref(), execution_scope) {
-            Ok(()) => {
+            Ok(assertion) => {
                 crate::db::refresh_pool_session_context_cache_for_shared_connection(
                     shared_connection,
                     &conn_guard,
                 );
-                Ok(())
+                Ok(assertion)
             }
             Err(message) => {
                 clear_pool_session_context_for_shared_connection(shared_connection);
@@ -25820,7 +25974,7 @@ impl SqlEditorWidget {
         preserve_existing_session_state: bool,
         statement_requires_transaction_boundary: bool,
         session_scope: Option<&str>,
-    ) -> Result<Option<String>, String> {
+    ) -> Result<(Option<String>, crate::db::SessionScopeAssertion), String> {
         let (
             target_database,
             advanced,
@@ -26008,11 +26162,16 @@ impl SqlEditorWidget {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn run_mysql_pooled_action_with_timeout<T, F>(
         shared_connection: &crate::db::SharedConnection,
         pooled_db_session: &SharedDbSessionLease,
         execution_scope: Option<&str>,
         session_pool_sender: Option<&QueryProgressSender>,
+        // Says once, not once per statement, that this tab's database is not on
+        // the server any more: the MySQL family re-acquires and re-asserts per
+        // statement, so the latch belongs to the run, not to this call.
+        scope_report: &SessionScopeReport,
         current_mysql_cancel_context: &Arc<Mutex<Option<MySqlQueryCancelContext>>>,
         current_query_cancel_handle: &Arc<Mutex<Option<QueryCancelHandle>>>,
         cancel_flag: &Arc<Mutex<bool>>,
@@ -26308,7 +26467,12 @@ impl SqlEditorWidget {
                 statement_requires_transaction_boundary,
                 session_scope.as_deref(),
             ) {
-                Ok(applied_scope) => session_scope = applied_scope,
+                Ok((applied_scope, assertion)) => {
+                    session_scope = applied_scope;
+                    // Tolerated by the assertion, never silent: from here the
+                    // statement runs with no database at all.
+                    scope_report.note(&assertion, db_type, session_pool_sender, log_context);
+                }
                 Err(message) => {
                     let timeout_reset_ok = match timeout_restore.as_ref() {
                     Some(timeout_restore) => timeout_restore
@@ -27293,6 +27457,52 @@ mod query_execution_cleanup_tests {
         assert!(
             SqlEditorWidget::ensure_script_auto_commit_change_allowed(true, false, || Ok(()))
                 .is_ok()
+        );
+    }
+
+    /// The scope report says it ONCE per run, and again only if a different
+    /// scope goes missing.
+    ///
+    /// The assertion runs before every statement on all four backends — that
+    /// is what makes the tab's scope the truth rather than a hope — so an
+    /// unlatched report would print the same line for every statement of a
+    /// script.
+    #[test]
+    fn a_missing_scope_is_reported_once_per_run_and_again_for_a_different_one() {
+        let report = super::SessionScopeReport::default();
+        let db_type = crate::db::DatabaseType::Oracle;
+
+        assert!(
+            !report.note(
+                &crate::db::SessionScopeAssertion::Applied,
+                db_type,
+                None,
+                "test",
+            ),
+            "a session that is where its tab says it is has nothing to report"
+        );
+
+        let gone = crate::db::SessionScopeAssertion::unavailable(Some("SQ_A"));
+        assert!(
+            report.note(&gone, db_type, None, "test"),
+            "the first statement that could not be put in the tab's scope says so"
+        );
+        assert!(
+            !report.note(&gone, db_type, None, "test"),
+            "every statement after it asserts the same scope and must stay quiet"
+        );
+
+        // A script can MOVE the session (`USE`, `ALTER SESSION SET
+        // CURRENT_SCHEMA`) and then lose the new scope too; that is a different
+        // fact and the user has not been told it.
+        assert!(
+            report.note(
+                &crate::db::SessionScopeAssertion::unavailable(Some("SQ_B")),
+                db_type,
+                None,
+                "test",
+            ),
+            "a different scope going missing is a different report"
         );
     }
 
@@ -35397,7 +35607,7 @@ mod mysql_batch_execution_regression_tests {
             Some(database.as_str())
         );
 
-        SqlEditorWidget::prepare_mysql_pooled_session_database(
+        let (_, assertion) = SqlEditorWidget::prepare_mysql_pooled_session_database(
             &mut conn,
             "",
             &advanced,
@@ -35406,6 +35616,9 @@ mod mysql_batch_execution_regression_tests {
             None,
         )
         .expect("empty execution scope should reset stale database state");
+        // "No database" is where a connection with no database belongs, so
+        // this is the scope applying, not a scope that went missing.
+        assert_eq!(assertion, crate::db::SessionScopeAssertion::Applied);
         let current_database = conn
             .query_first::<Option<String>, _>("SELECT DATABASE()")
             .expect("read database after empty-scope reset")
@@ -35454,7 +35667,7 @@ mod mysql_batch_execution_regression_tests {
             Some(database.as_str())
         );
 
-        SqlEditorWidget::apply_mysql_global_database_before_pooled_action(
+        let (_, assertion) = SqlEditorWidget::apply_mysql_global_database_before_pooled_action(
             &shared_connection,
             &mut conn,
             None,
@@ -35467,6 +35680,7 @@ mod mysql_batch_execution_regression_tests {
             None,
         )
         .expect("empty global scope recheck should reset stale database state");
+        assert_eq!(assertion, crate::db::SessionScopeAssertion::Applied);
         let current_database = conn
             .query_first::<Option<String>, _>("SELECT DATABASE()")
             .expect("read database after empty-scope recheck")

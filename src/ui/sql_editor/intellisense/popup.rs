@@ -55,10 +55,14 @@ impl QuickDescribeBackend for OracleQuickDescribeBackend {
                 let mut session = db_conn
                     .lock()
                     .map_err(|_| "Oracle Thin connection lock was poisoned".to_string())?;
+                // Go to Declaration describes ONE object by name: resolving it
+                // in the login schema because the tab's is gone would describe
+                // a different object of the same name and say nothing.
                 crate::db::DatabaseConnection::apply_tracked_oracle_thin_current_schema(
                     &mut session,
                     tracked_schema.as_deref(),
-                )?;
+                )?
+                .require_applied(crate::db::DatabaseType::Oracle)?;
                 SqlEditorWidget::describe_thin_object(
                     &mut session,
                     object_name,

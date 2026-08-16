@@ -47,6 +47,40 @@ pub enum ConnectionRuntimeState {
     Failed(String),
 }
 
+/// Whether a tab bound to a runtime has a connection behind it, answered
+/// WITHOUT the connection mutex.
+///
+/// `try_lock_connection` is the only way to read the connection itself, and it
+/// answers `None` for two reasons that are not the same: another tab's query
+/// holds the mutex, or a connect/reconnect/disconnect/pool-resize transition is
+/// in flight. Reading that `None` as "not connected" is what filed a tab as
+/// disconnected because a NEIGHBOUR tab was running a query. This is the
+/// fallback the screen uses in exactly that window.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RuntimeLiveness {
+    /// The connection is up.
+    Live,
+    /// The connection is definitely down (disconnected, or a failed attempt
+    /// with nothing preserved).
+    NotLive,
+    /// A transition is running. Nothing displayed may be LOWERED on this
+    /// answer: the previous connection may still be serving queries, and the
+    /// next successful read settles it either way.
+    InFlight,
+}
+
+impl ConnectionRuntimeState {
+    /// The runtime's own answer to "is there a connection behind this?", for
+    /// the window in which the connection itself cannot be read.
+    pub fn liveness_without_connection_lock(&self) -> RuntimeLiveness {
+        match self {
+            Self::Connected => RuntimeLiveness::Live,
+            Self::Disconnected | Self::Failed(_) => RuntimeLiveness::NotLive,
+            Self::Connecting | Self::Transitioning => RuntimeLiveness::InFlight,
+        }
+    }
+}
+
 pub struct ConnectionRuntime {
     id: ConnectionId,
     origin: ConnectionOrigin,
@@ -899,6 +933,38 @@ mod tests {
     use std::time::Duration;
 
     use super::*;
+
+    /// The runtime answers liveness for the window in which the connection
+    /// itself cannot be read, and a transition in flight is NOT an answer.
+    ///
+    /// Reading "I could not take the connection mutex" as "not connected" is
+    /// what filed a live tab as disconnected because a neighbour tab was
+    /// running a query.
+    #[test]
+    fn a_transition_in_flight_lowers_nothing_the_screen_shows() {
+        assert_eq!(
+            ConnectionRuntimeState::Connected.liveness_without_connection_lock(),
+            RuntimeLiveness::Live
+        );
+        assert_eq!(
+            ConnectionRuntimeState::Disconnected.liveness_without_connection_lock(),
+            RuntimeLiveness::NotLive
+        );
+        assert_eq!(
+            ConnectionRuntimeState::Failed("boom".to_string()).liveness_without_connection_lock(),
+            RuntimeLiveness::NotLive
+        );
+        // A reconnect over a live connection and a pool rebuild both publish
+        // these, and the previous connection may still be serving queries.
+        assert_eq!(
+            ConnectionRuntimeState::Connecting.liveness_without_connection_lock(),
+            RuntimeLiveness::InFlight
+        );
+        assert_eq!(
+            ConnectionRuntimeState::Transitioning.liveness_without_connection_lock(),
+            RuntimeLiveness::InFlight
+        );
+    }
     use crate::db::DatabaseConnection;
 
     fn connection() -> SharedConnection {

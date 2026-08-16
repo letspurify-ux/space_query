@@ -119,6 +119,24 @@ pub mod result_messages {
         "This read ran on a separate DB session, so it does not include this tab's uncommitted \
          changes. Commit them first to include them.";
 
+    /// The tab's scope could not be put on the session its statements run on,
+    /// because the server does not have it any more.
+    ///
+    /// Every backend TOLERATES this — the current schema/database is only a
+    /// name-resolution namespace, the session stays valid, and failing every
+    /// statement would leave the tab unable to run the one that fixes the
+    /// situation — but tolerating it silently let the statements that follow
+    /// resolve unqualified names somewhere the tab's own selector never
+    /// pointed: the login schema on Oracle, no database at all on the MySQL
+    /// family. Reported once per batch, by the assertion that had to give up.
+    pub fn session_scope_unavailable(scope_noun: &str, scope: &str) -> String {
+        format!(
+            "This tab's {scope_noun} `{scope}` is not available on the server, so the statements \
+             below did not run in it. Unqualified names resolve elsewhere until this tab's \
+             {scope_noun} is changed."
+        )
+    }
+
     /// Feedback for session-scope switches: Oracle `ALTER SESSION SET
     /// CURRENT_SCHEMA` ("schema") and MySQL/MariaDB `USE` ("database").
     pub fn current_scope_changed_without_name(scope: &str) -> String {
