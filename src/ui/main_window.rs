@@ -35,6 +35,7 @@ use crate::db::{
     RetainedSessionMutationOutcome, RetainedSessionPreflightAction,
     RetainedSessionPreflightDecision, RetainedSessionResolutionAction, SharedConnection,
     TabConnectionBinding, TransactionAccessMode, TransactionIsolation, TransactionMode,
+    TransactionOptionKind,
 };
 use crate::ui::constants::*;
 use crate::ui::grid_sort::NullOrdering;
@@ -279,31 +280,6 @@ struct ActiveSchemaUpdateTarget {
     request_id: u64,
     db_type: DatabaseType,
     scope: Option<String>,
-}
-
-/// Which of the two per-tab transaction options a change is about.
-///
-/// The rules below differ between them — only the transaction mode can be
-/// blocked by a backend-specific retained state, and only it may REPLACE a
-/// pending one-shot on a session that would otherwise refuse — and those rules
-/// used to be selected by comparing the noun that goes into the user-facing
-/// message (`action == "transaction mode"`). The message is a label of the
-/// choice; it must not BE the choice, or a third caller, a reworded string or a
-/// translated one silently takes the wrong branch.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum TransactionOptionKind {
-    AutoCommit,
-    TransactionMode,
-}
-
-impl TransactionOptionKind {
-    /// The noun the user reads in a refusal.
-    fn label(self) -> &'static str {
-        match self {
-            Self::AutoCommit => "auto-commit",
-            Self::TransactionMode => "transaction mode",
-        }
-    }
 }
 
 struct RetainedSessionOptionChangePlan {
@@ -3209,6 +3185,21 @@ impl AppState {
             QueryProgress::CancelOutcome {
                 token: inner_token, ..
             } => return *inner_token == token,
+            // Not a report of PROGRESS but of something that already happened
+            // on the tab's own session: a `USE` or `ALTER SESSION SET
+            // CURRENT_SCHEMA` moved it, and the screen has to follow whether or
+            // not the operation was abandoned afterwards. Terminate enqueues
+            // `OperationAbandoned` from the UI thread while the worker enqueues
+            // this from its own, so whichever won that race decided whether the
+            // tab's card kept naming a schema its session had already left —
+            // while the next statement's scope assertion moved the user's open
+            // transaction back to it.
+            //
+            // Safe to apply late: every scope notice for a tab arrives on that
+            // tab's own channel in the order the sessions really moved, so the
+            // last one to be handled is where the session really is. The tab
+            // and editor identity above still has to match.
+            QueryProgress::ScopeChangedNotice { .. } => return true,
             _ => {}
         }
         if self.abandoned_query_operations.contains(&token) {
@@ -3896,7 +3887,12 @@ impl AppState {
         // mutex (a neighbour tab was executing, or a transition was running)
         // leaves the view unsettled on purpose, and this is what settles it
         // without waiting for another user action.
-        self.refresh_active_connection_view();
+        //
+        // The auto-commit menu item is settled on the same tick and from the
+        // same read, because it and the status-bar label below are two showings
+        // of ONE value: healing the label alone left the menu — the control the
+        // user actually acts on — contradicting it.
+        self.sync_auto_commit_indicators();
         let conn_info = self
             .connection_info
             .lock()
@@ -4003,26 +3999,32 @@ impl AppState {
             .join("|")
     }
 
+    /// What the toolbar should show for the active tab's connection, or `None`
+    /// while the connection cannot be read.
+    ///
+    /// Through `crate::db::try_lock_connection`, not a raw `try_lock`: the free
+    /// mutex is not the whole question. A connect/reconnect/pool-rebuild spends
+    /// its long network phase WITHOUT the connection guard, and a raw lock
+    /// succeeds there and reads state that is half replaced — the very window
+    /// the rest of the window treats as unreadable and re-arms for. One door,
+    /// one answer.
     fn transaction_control_state(
         &self,
     ) -> Option<(DatabaseType, bool, TransactionMode, TransactionIsolation)> {
-        self.connection
-            .try_lock()
-            .map(|guard| {
-                (
+        crate::db::try_lock_connection(&self.connection).map(|guard| {
+            (
+                guard.db_type(),
+                guard.is_connected(),
+                // Tab-scoped: the toolbar shows the ACTIVE tab's effective
+                // transaction mode (tab override over connection default).
+                crate::ui::sql_editor::SqlEditorWidget::effective_transaction_mode(
                     guard.db_type(),
-                    guard.is_connected(),
-                    // Tab-scoped: the toolbar shows the ACTIVE tab's effective
-                    // transaction mode (tab override over connection default).
-                    crate::ui::sql_editor::SqlEditorWidget::effective_transaction_mode(
-                        guard.db_type(),
-                        guard.transaction_mode(),
-                        self.sql_editor.tab_transaction_mode_override_value(),
-                    ),
-                    guard.default_transaction_isolation(),
-                )
-            })
-            .ok()
+                    guard.transaction_mode(),
+                    self.sql_editor.tab_transaction_mode_override_value(),
+                ),
+                guard.default_transaction_isolation(),
+            )
+        })
     }
 
     /// The transaction-mode controls are disabled whenever the active tab's
@@ -4070,6 +4072,24 @@ impl AppState {
             // tab's browser card only through this sync. Deciding here from
             // `has_live_connection` instead greyed the combos out with no retry
             // armed, in exactly the case that needed one.
+            //
+            // One thing IS knowable without the connection, and must be said
+            // now: the tab's own Read only pin. A card is created at tab
+            // activation with writes allowed, so a pinned tab activated while a
+            // neighbour held the mutex offered Drop, Truncate and Import until
+            // the retry landed. The pin is the tab's own value and the access
+            // half of it survives every sanitization, so it can be stated
+            // here — and only ever RAISED, because the connection's own
+            // read-only flag is the half this cannot read.
+            if self
+                .sql_editor
+                .tab_transaction_mode_override_value()
+                .is_some_and(|mode| mode.access_mode == TransactionAccessMode::ReadOnly)
+            {
+                let active_tab_id = self.active_editor_tab_id;
+                self.object_browser
+                    .set_tab_mode_refuses_writes(active_tab_id, true);
+            }
             self.arm_transaction_mode_sync_retry();
             return;
         };
@@ -4131,7 +4151,19 @@ impl AppState {
         );
     }
 
-    fn sync_transaction_mode_controls_for_connected_db(&mut self, db_type: DatabaseType) {
+    /// Put the isolation choice's LABELS in the new database's vocabulary, and
+    /// nothing else.
+    ///
+    /// The VALUES and whether the controls are usable belong to
+    /// [`Self::sync_transaction_mode_controls`], which reads the active tab.
+    /// This used to paint "Default / Read write" and `activate()` both controls
+    /// as well, so between a connect and the tab-aware sync that follows it a
+    /// pinned tab's toolbar claimed a mode the tab did not have — and the
+    /// screen/behaviour check could not catch it, because nothing recorded what
+    /// was shown. The tab-aware sync early-returns whenever the connection
+    /// cannot be read, which is exactly when a connect is still settling, so
+    /// that window is not rare.
+    fn sync_transaction_mode_control_labels_for_db(&mut self, db_type: DatabaseType) {
         // FLTK Choice menus cannot be rebuilt while a pulldown owns the grab;
         // the tab-aware sync that follows every connect re-states these labels,
         // and it re-arms itself when it has to wait.
@@ -4146,18 +4178,6 @@ impl AppState {
             self.transaction_isolation_choice.clear();
             self.transaction_isolation_choice.add_choice(&labels);
         }
-
-        self.transaction_isolation_choice
-            .set_value(transaction_isolation_choice_index(
-                db_type,
-                TransactionIsolation::Default,
-            ));
-        self.transaction_access_choice
-            .set_value(transaction_access_choice_index(
-                TransactionAccessMode::ReadWrite,
-            ));
-        self.transaction_isolation_choice.activate();
-        self.transaction_access_choice.activate();
     }
 
     /// Scope is tab-scoped: a browser scope pick lands on the ACTIVE tab
@@ -4651,7 +4671,18 @@ impl AppState {
     /// The connection default it resolves against comes from the one place
     /// that learns it, keyed to the connection it was read from: showing one
     /// connection's default under another connection's tab is worse than
-    /// showing no checkmark change at all, and the next status tick fills it in.
+    /// showing no checkmark change at all.
+    ///
+    /// So this can answer "not yet" — and when it does, the checkmark keeps
+    /// whatever the PREVIOUS tab put there until something calls this again.
+    /// Its callers are all events (tab switch, connect, the menu itself, an
+    /// adopted `SET AUTOCOMMIT`), and none of them fires when the connection
+    /// becomes readable again: switching onto a tab whose connection was busy
+    /// with a neighbour's query left the menu showing the other tab's value for
+    /// as long as the user stayed on it, while the status bar — refreshed every
+    /// tick — told the truth beside it. `render_status_bar` therefore calls
+    /// this too, so the menu heals on the same tick as the label it must agree
+    /// with.
     fn sync_auto_commit_indicators(&mut self) {
         self.refresh_active_connection_view();
         let Some(connection_default) = self.active_connection_auto_commit() else {
@@ -5702,14 +5733,34 @@ enum PooledSessionPlanOutcome {
 }
 
 impl PooledSessionPlanOutcome {
-    /// Whether the action this plan belongs to may go ahead.
+    /// Whether an action that will DESTROY every session in the plan may go
+    /// ahead — quitting, disconnecting, rebuilding the pool.
     ///
-    /// Only a Cancel stops it: after the apply phase has begun there is nothing
-    /// left to retry for the tabs that succeeded, and refusing would leave the
-    /// action half done with the loss unexplained — the same rule an
-    /// unreachable session already follows.
-    fn action_may_proceed(&self) -> bool {
-        !matches!(self, Self::CancelledBeforeAnyChange)
+    /// A Cancel stops it because nothing was touched. An unresolved tab stops
+    /// it because its work is still on its session, and these actions end that
+    /// session: the user asked for a commit, the commit failed and was
+    /// reported, and carrying on would have the server roll back the very work
+    /// they asked to keep. Stopping costs nothing — the tabs that were resolved
+    /// got what the user asked for, and the action can be retried once the
+    /// failure is dealt with. Close All says the same thing per tab, by leaving
+    /// the unresolved ones open.
+    fn action_may_destroy_sessions(&self) -> bool {
+        matches!(self, Self::Completed)
+    }
+
+    /// Whether the user stopped the plan themselves while being asked, which
+    /// means no session was touched.
+    fn user_cancelled(&self) -> bool {
+        matches!(self, Self::CancelledBeforeAnyChange)
+    }
+
+    /// The tabs whose sessions could not be resolved, for the message that says
+    /// why the action did not happen.
+    fn unresolved_tabs(&self) -> &[QueryTabId] {
+        match self {
+            Self::Completed | Self::CancelledBeforeAnyChange => &[],
+            Self::Unresolved(tab_ids) => tab_ids,
+        }
     }
 
     /// Whether this tab's session came through the plan resolved.
@@ -7115,14 +7166,51 @@ impl MainWindow {
             "closing",
             "Commit and Close",
             "Rollback and Close",
+            "quitting",
         )
     }
 
-    /// Every tab's session, resolved before an action that ends them all.
+    /// Whether an action that ENDS every session in the plan may go ahead, and
+    /// the one place that says why it may not.
     ///
-    /// `false` only for a Cancel: a session that could not be resolved was
-    /// reported, and the tabs behind it were still resolved as the user asked,
-    /// so stopping the action here is what would leave it half done.
+    /// The user is told which tabs still hold work, because the alternative —
+    /// carrying on — ends those sessions and has the server roll that work back
+    /// after the app has just reported that it could not commit it.
+    fn session_ending_action_may_proceed(
+        state: &Arc<Mutex<AppState>>,
+        outcome: &PooledSessionPlanOutcome,
+        action_description: &str,
+    ) -> bool {
+        if outcome.action_may_destroy_sessions() {
+            return true;
+        }
+        let unresolved = outcome.unresolved_tabs();
+        if unresolved.is_empty() {
+            // A Cancel: the user stopped it themselves and nothing was touched.
+            return false;
+        }
+        let names = {
+            let s = state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            unresolved
+                .iter()
+                .map(|tab_id| {
+                    s.tab_display_name(*tab_id)
+                        .unwrap_or_else(|| "Query".to_string())
+                })
+                .collect::<Vec<_>>()
+        };
+        let message = format!(
+            "These tabs' DB sessions could not be resolved, so {action_description} did not happen:\n  {}\n\nTheir uncommitted work is still on their sessions. Resolve it and try again.",
+            names.join("\n  ")
+        );
+        crate::utils::logging::log_warning("app", &message);
+        crate::ui::alert_on_main(&message);
+        false
+    }
+
+    /// Every tab's session, resolved before an action that ends them all.
     fn resolve_pooled_sessions_before_retained_action(
         state: &Arc<Mutex<AppState>>,
         action: RetainedSessionPreflightAction,
@@ -7130,13 +7218,14 @@ impl MainWindow {
         resolution_context: &str,
         commit_button: &str,
         rollback_button: &str,
+        action_description: &str,
     ) -> bool {
         let tab_ids = state
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .query_tabs
             .tab_ids();
-        Self::resolve_pooled_sessions_for_tabs(
+        let outcome = Self::resolve_pooled_sessions_for_tabs(
             state,
             tab_ids,
             action,
@@ -7144,8 +7233,8 @@ impl MainWindow {
             resolution_context,
             commit_button,
             rollback_button,
-        )
-        .action_may_proceed()
+        );
+        Self::session_ending_action_may_proceed(state, &outcome, action_description)
     }
 
     fn resolve_pooled_sessions_before_runtime_disconnect(
@@ -7160,7 +7249,7 @@ impl MainWindow {
             .filter(|tab| tab.connection_binding.snapshot().connection_id() == Some(connection_id))
             .map(|tab| tab.tab_id)
             .collect::<Vec<_>>();
-        Self::resolve_pooled_sessions_for_tabs(
+        let outcome = Self::resolve_pooled_sessions_for_tabs(
             state,
             tab_ids,
             RetainedSessionPreflightAction::ConnectionTransition,
@@ -7168,8 +7257,8 @@ impl MainWindow {
             "disconnecting",
             "Commit and Disconnect",
             "Rollback and Disconnect",
-        )
-        .action_may_proceed()
+        );
+        Self::session_ending_action_may_proceed(state, &outcome, "the disconnect")
     }
 
     fn resolve_pooled_sessions_before_pool_resize(state: &Arc<Mutex<AppState>>) -> bool {
@@ -7180,6 +7269,7 @@ impl MainWindow {
             "changing connection pool size",
             "Commit and Continue",
             "Rollback and Continue",
+            "the connection pool change",
         )
     }
 
@@ -8637,11 +8727,21 @@ impl MainWindow {
         // `save` republishes the runtime config, so both writers read the new limits.
         crate::ui::query_history::apply_history_limit();
         crate::utils::logging::apply_log_limit();
-        if pool_size_changed {
-            state.release_all_resolved_pooled_db_sessions()?;
-        }
+        // Releasing the old pool's sessions can fail on a tab that still holds
+        // work. That is a fact about a SESSION, not about saving: the config is
+        // already written, and the settings the user just changed must still
+        // take effect. Returning it here instead reported "Failed to save
+        // settings" for settings that were saved, and left the new font and
+        // lazy-fetch values inert until the next restart.
+        let release_error = pool_size_changed
+            .then(|| state.release_all_resolved_pooled_db_sessions().err())
+            .flatten();
         Self::apply_lazy_fetch_settings(state);
         Self::apply_font_settings(state);
+        if let Some(message) = release_error {
+            crate::utils::logging::log_warning("settings", &message);
+            crate::ui::alert_on_main(&message);
+        }
         save_result
     }
 
@@ -9134,7 +9234,7 @@ impl MainWindow {
             "Commit and Close",
             "Rollback and Close",
         );
-        if !plan.action_may_proceed() {
+        if plan.user_cancelled() {
             return;
         }
         for tab_id in tab_ids {
@@ -12796,7 +12896,7 @@ impl MainWindow {
                         .map(|tab| tab.tab_id)
                         .collect::<Vec<_>>()
                 };
-                if !Self::resolve_pooled_sessions_for_tabs(
+                let plan = Self::resolve_pooled_sessions_for_tabs(
                     state,
                     disconnect_tab_ids,
                     RetainedSessionPreflightAction::ConnectionTransition,
@@ -12804,9 +12904,8 @@ impl MainWindow {
                     "disconnecting",
                     "Commit and Disconnect",
                     "Rollback and Disconnect",
-                )
-                .action_may_proceed()
-                {
+                );
+                if !Self::session_ending_action_may_proceed(state, &plan, "the disconnect") {
                     return true;
                 }
 
@@ -14836,7 +14935,7 @@ impl MainWindow {
                                         "Connected | {} ({})",
                                         info.name, info.db_type
                                     ));
-                                    s.sync_transaction_mode_controls_for_connected_db(info.db_type);
+                                    s.sync_transaction_mode_control_labels_for_db(info.db_type);
                                     s.sql_editor.focus();
                                     s.refresh_connection_dependent_controls();
                                     s.sync_transaction_mode_controls();
@@ -18286,21 +18385,37 @@ mod tests {
 
         // Everything the user asked for happened.
         let completed = PooledSessionPlanOutcome::Completed;
-        assert!(completed.action_may_proceed());
+        assert!(completed.action_may_destroy_sessions());
+        assert!(!completed.user_cancelled());
         assert!(completed.tab_was_resolved(tab_a));
 
         // A Cancel during the ASK phase touched nothing, so the action stops
         // and no tab may be treated as resolved.
         let cancelled = PooledSessionPlanOutcome::CancelledBeforeAnyChange;
-        assert!(!cancelled.action_may_proceed());
+        assert!(!cancelled.action_may_destroy_sessions());
+        assert!(cancelled.user_cancelled());
         assert!(!cancelled.tab_was_resolved(tab_a));
 
-        // A failure during the APPLY phase is the other answer: the tabs that
-        // succeeded really are resolved, so the action carries on — refusing
-        // would leave it half done — while the tab whose work is still on its
-        // session is left alone.
+        // A failure during the APPLY phase is the third answer: the tabs that
+        // succeeded really are resolved, and the one whose work is still on its
+        // session is named.
+        //
+        // INVERTED, with its reason: this used to answer "the action may
+        // proceed", on the argument that refusing would leave the action half
+        // done. But the actions asking this question — quitting, disconnecting,
+        // rebuilding the pool — END these sessions, so proceeding had the
+        // server roll back the very work the app had just told the user it
+        // could not commit. Refusing loses nothing: the resolved tabs got what
+        // the user asked for, and the action can be repeated. It is the same
+        // answer Close All has always given per tab by leaving the unresolved
+        // ones open.
         let unresolved = PooledSessionPlanOutcome::Unresolved(vec![tab_b]);
-        assert!(unresolved.action_may_proceed());
+        assert!(!unresolved.action_may_destroy_sessions());
+        assert!(
+            !unresolved.user_cancelled(),
+            "and it is not a Cancel, so Close All still closes the tabs it resolved"
+        );
+        assert_eq!(unresolved.unresolved_tabs(), &[tab_b]);
         assert!(unresolved.tab_was_resolved(tab_a));
         assert!(!unresolved.tab_was_resolved(tab_b));
     }

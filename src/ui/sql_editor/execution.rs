@@ -426,6 +426,14 @@ struct OracleTransactionBoundaryTracker {
     /// make the block's commit visible, so nothing a later readable statement
     /// does may clear it. Only learning the truth does.
     transaction_claim_is_a_guess: bool,
+    /// Whether the transaction the claim is about may be one that has never
+    /// written, and is therefore invisible to a probe that finds transactions
+    /// by their ID. Oracle assigns that ID on the first write.
+    ///
+    /// This is knowledge, not a guess: the app reads every `SET TRANSACTION` it
+    /// issues for a pinned tab and every one the user types, and it reads every
+    /// statement that writes.
+    open_transaction_may_be_invisible: bool,
 }
 
 impl OracleTransactionBoundaryTracker {
@@ -443,14 +451,13 @@ impl OracleTransactionBoundaryTracker {
     /// session default — one script, two answers. There is now one call per
     /// statement per loop and the order inside it is not a call-site's to get
     /// wrong.
-    fn transaction_open_before_statement(
+    fn begin_statement(
         &mut self,
-        statement: crate::db::StatementSessionEffects,
         mode: TransactionMode,
         tracked_transaction_open: bool,
         ask_server: impl FnOnce() -> bool,
-    ) -> bool {
-        let answer = if crate::db::oracle_transaction_mode_boundary_needs_server_answer(
+    ) -> OracleTransactionBoundaryStep {
+        let transaction_open = if crate::db::oracle_transaction_mode_boundary_needs_server_answer(
             mode,
             tracked_transaction_open,
             self.transaction_claim_is_a_guess,
@@ -463,31 +470,121 @@ impl OracleTransactionBoundaryTracker {
         } else {
             tracked_transaction_open
         };
-        self.note_statement(statement);
-        answer
+        OracleTransactionBoundaryStep { transaction_open }
     }
 
     /// Recorded through [`Self::transaction_open_before_statement`] only, so
     /// that "the decision reads the PREVIOUS statement" cannot be spelled two
-    /// ways. Monotone on purpose: see the field's own comment.
+    /// ways. The guess is monotone on purpose: see the field's own comment.
+    ///
+    /// The guess asks about the TRANSACTION, so it reads the transaction's own
+    /// opacity — the question the MySQL family has always asked with
+    /// `may_open_untracked_transaction`. It used to read
+    /// `may_leave_unknown_session_state`, which is the RESIDUE question: an
+    /// `ALTER SESSION SET NLS_DATE_FORMAT` leaves session state the pool setup
+    /// cannot restate, but it commits nothing and opens nothing, and treating
+    /// it as opacity about the transaction turned a transaction the app had
+    /// just opened itself into a guess for the server to overrule.
     fn note_statement(&mut self, effects: crate::db::StatementSessionEffects) {
-        self.transaction_claim_is_a_guess |= effects.may_leave_unknown_session_state();
+        self.transaction_claim_is_a_guess |= effects.may_open_untracked_transaction();
+        if effects.may_leave_uncommitted_work() && !effects.may_open_untracked_transaction() {
+            // A write the app can SEE gives the transaction its ID, so a probe
+            // can find it from here on. A block that "may leave work" is a
+            // maybe and not a write, which is why it does not count.
+            self.open_transaction_may_be_invisible = false;
+        }
+        if effects.clears_transaction_state() || effects.has_implicit_commit() {
+            self.open_transaction_may_be_invisible = false;
+        }
+        if effects.changes_transaction_mode() {
+            // The user's own `SET TRANSACTION` opens a transaction that has
+            // written nothing yet.
+            self.open_transaction_may_be_invisible = true;
+        }
     }
 
-    /// The app knows the transaction state again — it just stated the mode, or
-    /// a statement whose effect it can see resolved the transaction.
+    /// The app knows the transaction state again — a statement whose effect it
+    /// can see resolved the transaction, or the server was just asked.
     fn note_known_transaction_state(&mut self) {
         self.transaction_claim_is_a_guess = false;
     }
 
-    /// Whether the claim this batch is about to FILE rests on a statement the
-    /// app could not read. The batch end asks the server one last time when it
-    /// does, because a guess that survives the batch governs every later batch
-    /// on the tab: the pre-batch gate never states the pin over a session that
-    /// "may have uncommitted work", and nothing in a later batch would ask.
-    fn transaction_claim_is_a_guess(&self) -> bool {
-        self.transaction_claim_is_a_guess
+    /// A script `CONNECT`/`DISCONNECT` replaced the session this tracker was
+    /// following. Nothing it learned describes the new one.
+    fn note_new_session(&mut self) {
+        *self = Self::default();
     }
+
+    /// The app has just stated `mode` on this session, so it knows the
+    /// transaction state — and it knows a non-default mode opens a transaction
+    /// that has not written.
+    ///
+    /// The pinned case is exactly the one a write probe cannot answer about:
+    /// `SET TRANSACTION READ ONLY` opens a transaction that can never write.
+    fn note_transaction_mode_stated(&mut self, mode: TransactionMode) {
+        self.note_known_transaction_state();
+        if !mode.is_default() {
+            self.open_transaction_may_be_invisible = true;
+        }
+    }
+
+    /// What this batch knows about the claim it is about to FILE. The batch end
+    /// asks the server one last time when the claim is a guess, because a guess
+    /// that survives the batch governs every later batch on the tab: the
+    /// pre-batch gate never states the pin over a session that "may have
+    /// uncommitted work", and nothing in a later batch would ask.
+    fn transaction_claim(&self) -> crate::db::TransactionClaim {
+        crate::db::TransactionClaim {
+            is_a_guess: self.transaction_claim_is_a_guess,
+            may_be_invisible_to_a_write_probe: self.open_transaction_may_be_invisible,
+        }
+    }
+}
+
+/// The obligation that comes with asking an [`OracleTransactionBoundaryTracker`]
+/// whether a transaction is open: it has to be told what became of the
+/// statement it answered about.
+///
+/// A token rather than a second method, because the ORDER is what the defects
+/// here were made of. Deciding and recording were first two calls, which the
+/// two loops made in opposite orders — one read the opacity of the statement it
+/// was about to run instead of the one that had just run. Collapsing them into
+/// one call fixed that and created the next: a statement the read-only gate
+/// went on to REFUSE never reached the server, yet its opacity was already
+/// recorded, so the app's own open read-only transaction became a guess for a
+/// probe that cannot see one. A token only the decision can produce keeps both
+/// out of reach: recording cannot come first because only the decision makes a
+/// token, and recording a statement that never ran takes a deliberate
+/// [`Self::ran`].
+///
+/// Dropping the token means the same thing as [`Self::refused`] — a statement
+/// that leaves no trace records nothing — so the exits spell it out for the
+/// reader rather than to change what happens.
+#[must_use = "the decision is also the obligation to say whether the statement ran"]
+struct OracleTransactionBoundaryStep {
+    transaction_open: bool,
+}
+
+impl OracleTransactionBoundaryStep {
+    /// Whether a transaction was open on this session when the statement was
+    /// about to run.
+    fn transaction_open(&self) -> bool {
+        self.transaction_open
+    }
+
+    /// The statement reached the server: record what it leaves behind for the
+    /// next boundary decision.
+    fn ran(
+        self,
+        tracker: &mut OracleTransactionBoundaryTracker,
+        effects: crate::db::StatementSessionEffects,
+    ) {
+        tracker.note_statement(effects);
+    }
+
+    /// The statement was refused before it reached the server. It changed
+    /// nothing, so there is nothing to record.
+    fn refused(self) {}
 }
 
 impl OracleThinConnectionTransitionContext<'_> {
@@ -757,6 +854,11 @@ impl SessionScopeReport {
         log_context: &str,
     ) -> bool {
         let Some(scope) = assertion.unavailable_scope() else {
+            // The scope applied, so whatever was said before is no longer the
+            // state of things: a scope that comes back and is lost AGAIN is
+            // news, and latching on the name alone made the second loss silent
+            // — the user's last word on it was that it worked.
+            self.reported_scope.set(None);
             return false;
         };
         let previously_reported = self.reported_scope.take();
@@ -2424,14 +2526,11 @@ impl QueryExecutionCleanupGuard {
     /// answer to where the batch records its state.
     fn settle_oracle_transaction_claim_with_server(
         &mut self,
-        claim_is_a_guess: bool,
-        server_reports_transaction_open: Option<bool>,
+        claim: crate::db::TransactionClaim,
+        answer: crate::db::ServerTransactionAnswer,
     ) {
         let base = self.oracle_cleanup_prior_retained_state_for_interrupt();
-        let settled = base.with_transaction_claim_settled_by_server(
-            claim_is_a_guess,
-            server_reports_transaction_open,
-        );
+        let settled = base.with_transaction_claim_settled_by_server(claim, answer);
         // Nothing to settle: not a guess, no answer, or an answer that raises
         // rather than lowers. The forced flag below is only cleared on a real
         // lowering, so a lock-wait error that really did leave work — where the
@@ -2563,11 +2662,11 @@ impl QueryExecutionCleanupGuard {
     fn ensure_oracle_retained_option_change_allowed(
         &self,
         current_session_may_have_uncommitted_work: bool,
-        action: &str,
+        option: crate::db::TransactionOptionKind,
     ) -> Result<(), String> {
         SqlEditorWidget::ensure_oracle_retained_state_option_change_allowed(
             self.oracle_current_retained_state(current_session_may_have_uncommitted_work),
-            action,
+            option,
         )
     }
 
@@ -2576,10 +2675,10 @@ impl QueryExecutionCleanupGuard {
         statement_effects: crate::db::StatementSessionEffects,
         current_session_may_have_uncommitted_work: bool,
     ) -> Result<(), String> {
-        if let Some(action) = statement_effects.transaction_option_change_action() {
+        if let Some(option) = statement_effects.transaction_option_change_kind() {
             self.ensure_oracle_retained_option_change_allowed(
                 current_session_may_have_uncommitted_work,
-                action,
+                option,
             )?;
         }
         Ok(())
@@ -11218,7 +11317,7 @@ impl SqlEditorWidget {
                         );
                         let failure = match applied {
                             Ok(OracleTransactionModeApplied::Yes) => {
-                                oracle_transaction_boundary.note_known_transaction_state();
+                                oracle_transaction_boundary.note_transaction_mode_stated(transaction_mode_application.mode);
                                 None
                             }
                             // A transaction is already open on this session, so
@@ -12301,7 +12400,7 @@ impl SqlEditorWidget {
                                                 });
                                             cleanup.ensure_oracle_retained_option_change_allowed(
                                                 live_may_have_uncommitted_work,
-                                                "auto-commit",
+                                                crate::db::TransactionOptionKind::AutoCommit,
                                             )
                                         },
                                     );
@@ -12995,7 +13094,7 @@ impl SqlEditorWidget {
                                                 // tracker is part of the state
                                                 // this branch drops.
                                                 oracle_transaction_boundary
-                                                    .note_known_transaction_state();
+                                                    .note_new_session();
                                                 if !next_statement_opens_its_own_transaction {
                                                     Self::record_applied_oracle_transaction_mode_effects(
                                                         &mut cleanup,
@@ -13140,7 +13239,7 @@ impl SqlEditorWidget {
                                         // the question goes with it. The thin
                                         // DISCONNECT says the same.
                                         oracle_transaction_boundary
-                                            .note_known_transaction_state();
+                                            .note_new_session();
                                         let _ = sender
                                             .send(QueryProgress::ConnectionChanged { info: None });
                                         app::awake();
@@ -13298,6 +13397,23 @@ impl SqlEditorWidget {
                                             );
                                             SqlEditorWidget::note_batch_scope_change(
                                                 |scope| {
+                                                    // The batch that moved the
+                                                    // session is the one that
+                                                    // says where it now is —
+                                                    // the cell its own loop
+                                                    // reads AND the tab's
+                                                    // binding, which is what
+                                                    // the card and every later
+                                                    // acquisition read. The
+                                                    // thin loop has always done
+                                                    // both; leaving the binding
+                                                    // to the UI thread meant the
+                                                    // tab learned late, or (if
+                                                    // the notice was dropped)
+                                                    // not at all.
+                                                    binding_revision =
+                                                        connection_binding_for_worker
+                                                            .set_scope(Some(scope.to_string()));
                                                     store_batch_scope(&operation_scope, scope)
                                                 },
                                                 &sender,
@@ -13480,22 +13596,21 @@ impl SqlEditorWidget {
                             // the mode was attached to, and nothing else
                             // notices. Ask the server rather than run the rest
                             // of the batch at the session default while the
-                            // toolbar claims the pin. The same call records what
-                            // THIS statement leaves behind for the next
-                            // decision, which is why the thin loop can make the
-                            // identical call in the identical position.
-                            let transaction_open = oracle_transaction_boundary
-                                .transaction_open_before_statement(
-                                    statement_effects,
-                                    active_transaction_mode,
-                                    tracked_transaction_open,
-                                    || {
-                                        SqlEditorWidget::oracle_session_may_have_uncommitted_work(
-                                            conn.as_ref(),
-                                            &db_activity,
-                                        )
-                                    },
-                                );
+                            // toolbar claims the pin. The step this returns is
+                            // spent where this statement's fate is known, which
+                            // is why the thin loop can make the identical call
+                            // in the identical position.
+                            let boundary_step = oracle_transaction_boundary.begin_statement(
+                                active_transaction_mode,
+                                tracked_transaction_open,
+                                || {
+                                    SqlEditorWidget::oracle_session_may_have_uncommitted_work(
+                                        conn.as_ref(),
+                                        &db_activity,
+                                    )
+                                },
+                            );
+                            let transaction_open = boundary_step.transaction_open();
                             if !active_transaction_mode.is_default()
                                 && !transaction_open
                                 && !SqlEditorWidget::is_transaction_first_statement(&sql_text)
@@ -13515,7 +13630,7 @@ impl SqlEditorWidget {
                                     );
                                 let failure = match applied {
                                     Ok(OracleTransactionModeApplied::Yes) => {
-                                        oracle_transaction_boundary.note_known_transaction_state();
+                                        oracle_transaction_boundary.note_transaction_mode_stated(reapplication.mode);
                                         None
                                     }
                                     // The server says a transaction is still
@@ -13527,7 +13642,7 @@ impl SqlEditorWidget {
                                     // which is the model everywhere else; the
                                     // batch has no reason to stop.
                                     Ok(OracleTransactionModeApplied::TransactionStillOpen) => {
-                                        oracle_transaction_boundary.note_known_transaction_state();
+                                        oracle_transaction_boundary.note_transaction_mode_stated(reapplication.mode);
                                         None
                                     }
                                     Ok(OracleTransactionModeApplied::Failed(message)) => {
@@ -13552,6 +13667,7 @@ impl SqlEditorWidget {
                                     // continue-on-error must not let the rest of
                                     // the batch run under a mode different from
                                     // what the toolbar shows.
+                                    boundary_step.refused();
                                     break;
                                 }
                             }
@@ -13580,6 +13696,10 @@ impl SqlEditorWidget {
                                 if !continue_on_error {
                                     stop_execution = true;
                                 }
+                                // Refused here means it never reached the
+                                // server, so it left the transaction exactly as
+                                // it found it.
+                                boundary_step.refused();
                                 continue;
                             }
 
@@ -13588,7 +13708,7 @@ impl SqlEditorWidget {
                                     crate::db::DatabaseType::Oracle,
                                     &sql_text,
                                 );
-                            if statement_effects.transaction_option_change_action().is_some() {
+                            if statement_effects.transaction_option_change_kind().is_some() {
                                 let live_may_have_uncommitted_work =
                                     SqlEditorWidget::oracle_session_may_have_uncommitted_work(
                                         conn.as_ref(),
@@ -13617,9 +13737,18 @@ impl SqlEditorWidget {
                                     if !continue_on_error {
                                         stop_execution = true;
                                     }
+                                    boundary_step.refused();
                                     continue;
                                 }
                             }
+
+                            // Past every refusal: this statement is going to the
+                            // server, so what it leaves behind is what the next
+                            // boundary decision reads.
+                            boundary_step.ran(
+                                &mut oracle_transaction_boundary,
+                                statement_effects,
+                            );
 
                             if QueryExecutor::is_plain_commit(&sql_text) {
                                 let index = result_index;
@@ -15731,6 +15860,12 @@ impl SqlEditorWidget {
                                             result.message = notice.clone();
                                             SqlEditorWidget::note_batch_scope_change(
                                                 |scope| {
+                                                    // Both halves, like the thin
+                                                    // twin: the batch's own cell
+                                                    // and the tab's binding.
+                                                    binding_revision =
+                                                        connection_binding_for_worker
+                                                            .set_scope(Some(scope.to_string()));
                                                     store_batch_scope(&operation_scope, scope)
                                                 },
                                                 &sender,
@@ -15857,25 +15992,26 @@ impl SqlEditorWidget {
                 // reason to ask. So ask once here — the same closing question
                 // the thin batch puts to its wire flag, and the same question
                 // the MySQL family's batch-end probe has always asked.
-                if oracle_transaction_boundary.transaction_claim_is_a_guess() {
+                let claim = oracle_transaction_boundary.transaction_claim();
+                if claim.is_a_guess {
                     // An interrupted batch has no answer to settle with: the
                     // statement that was cancelled may still be on the server.
                     let interrupted = load_mutex_bool(&cancel_flag)
                         || cleanup.execution_metadata.timed_out
                         || cleanup.execution_metadata.has_connection_error;
-                    let server_reports_transaction_open = conn_opt
+                    let answer = conn_opt
                         .as_ref()
                         .filter(|_| !interrupted)
                         .map(|conn| {
-                            SqlEditorWidget::oracle_session_may_have_uncommitted_work(
-                                conn.as_ref(),
-                                &db_activity,
+                            crate::db::ServerTransactionAnswer::from_oracle_probe(
+                                SqlEditorWidget::oracle_session_may_have_uncommitted_work(
+                                    conn.as_ref(),
+                                    &db_activity,
+                                ),
                             )
-                        });
-                    cleanup.settle_oracle_transaction_claim_with_server(
-                        oracle_transaction_boundary.transaction_claim_is_a_guess(),
-                        server_reports_transaction_open,
-                    );
+                        })
+                        .unwrap_or_default();
+                    cleanup.settle_oracle_transaction_claim_with_server(claim, answer);
                 }
             })); // end catch_unwind
 
@@ -17525,6 +17661,24 @@ impl SqlEditorWidget {
         Self::oracle_session_may_state_transaction_mode(prior_retained_state)
     }
 
+    /// Apply the tab's transaction mode on a thin session for a LAZY FETCH,
+    /// recording each statement's effects the way both batch loops do.
+    ///
+    /// Two rules this shares with them rather than restating:
+    ///
+    /// Effects are recorded BEFORE the round trip. `SET TRANSACTION` opens a
+    /// transaction that carries no work of its own, so a cancel landing between
+    /// the server running it and the app reading the answer would otherwise
+    /// leave an open transaction nothing knows about — and every later batch on
+    /// the tab fails with ORA-01453. Recording first is true whatever the
+    /// outcome: it ran, or it was refused because a transaction was already
+    /// open, or it may have run.
+    ///
+    /// ORA-01453 is an ANSWER, not a failure. A transaction was already open,
+    /// so the pin belongs to the next one — which is what the model says
+    /// everywhere else. Failing the lazy SELECT for it made this the one Oracle
+    /// site that turned "applies from the next transaction" into an error the
+    /// user sees.
     fn apply_oracle_thin_transaction_mode_for_execution(
         conn: &mut OracleThinSession,
         prior_retained_state: RetainedSessionState,
@@ -17538,18 +17692,22 @@ impl SqlEditorWidget {
             crate::db::statement_session_post_processor_for(crate::db::DatabaseType::Oracle);
         let mut retained_state = prior_retained_state;
         for (statement, restores_session_default) in transaction_mode.statements()? {
-            Self::execute_oracle_thin_statement(conn, &statement, false)?;
-            if restores_session_default {
-                continue;
+            if !restores_session_default {
+                retained_state = Self::oracle_retained_state_after_statement_effects(
+                    retained_state,
+                    post_processor.effects_for_sql(&statement),
+                    false,
+                    false,
+                    false,
+                    false,
+                );
             }
-            retained_state = Self::oracle_retained_state_after_statement_effects(
-                retained_state,
-                post_processor.effects_for_sql(&statement),
-                false,
-                false,
-                false,
-                false,
-            );
+            if let Err(message) = Self::execute_oracle_thin_statement(conn, &statement, false) {
+                if crate::db::oracle_error_says_transaction_still_open(&message) {
+                    break;
+                }
+                return Err(message);
+            }
         }
         Ok(retained_state)
     }
@@ -18763,7 +18921,7 @@ impl SqlEditorWidget {
                                     Self::ensure_oracle_retained_option_change_allowed(
                                         retained_state,
                                         conn.transaction_in_progress(),
-                                        "auto-commit",
+                                        crate::db::TransactionOptionKind::AutoCommit,
                                     )
                                 },
                             );
@@ -19420,7 +19578,7 @@ impl SqlEditorWidget {
                                     // A CONNECT hands the tab a FRESH session:
                                     // the app knows no transaction is open on
                                     // it.
-                                    oracle_transaction_boundary.note_known_transaction_state();
+                                    oracle_transaction_boundary.note_new_session();
                                     continue_on_error = session
                                         .lock()
                                         .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -19506,7 +19664,7 @@ impl SqlEditorWidget {
                             // not a question to ask the NEW session. The rest of
                             // the batch's Oracle state is dropped right here, and
                             // the boundary tracker is part of it.
-                            oracle_transaction_boundary.note_known_transaction_state();
+                            oracle_transaction_boundary.note_new_session();
 
                             continue_on_error = session
                                 .lock()
@@ -19754,13 +19912,12 @@ impl SqlEditorWidget {
                     // twin makes the identical call in the identical position;
                     // only the answer is driver-specific (there it costs a round
                     // trip, here it is a flag the protocol already carries).
-                    let transaction_open = oracle_transaction_boundary
-                        .transaction_open_before_statement(
-                            statement_effects,
-                            active_transaction_mode,
-                            tracked_transaction_open,
-                            || conn.transaction_in_progress(),
-                        );
+                    let boundary_step = oracle_transaction_boundary.begin_statement(
+                        active_transaction_mode,
+                        tracked_transaction_open,
+                        || conn.transaction_in_progress(),
+                    );
+                    let transaction_open = boundary_step.transaction_open();
                     if transaction_mode_applied
                         && !active_transaction_mode.is_default()
                         && !transaction_open
@@ -19890,8 +20047,12 @@ impl SqlEditorWidget {
                             }
                         }
                         transaction_mode_applied = true;
-                        oracle_transaction_boundary.note_known_transaction_state();
+                        oracle_transaction_boundary
+                            .note_transaction_mode_stated(transaction_mode_application.mode);
                         if stop_execution {
+                            // The tab's own mode could not be stated, so the
+                            // user's statement never ran.
+                            boundary_step.refused();
                             break;
                         }
                     }
@@ -19925,6 +20086,9 @@ impl SqlEditorWidget {
                         if !continue_on_error {
                             stop_execution = true;
                         }
+                        // Refused here means it never reached the server, so it
+                        // left the transaction exactly as it found it.
+                        boundary_step.refused();
                         continue;
                     }
 
@@ -19960,9 +20124,15 @@ impl SqlEditorWidget {
                             if !continue_on_error {
                                 stop_execution = true;
                             }
+                            boundary_step.refused();
                             continue;
                         }
                     }
+
+                    // Past every refusal: this statement is going to the server,
+                    // so what it leaves behind is what the next boundary
+                    // decision reads.
+                    boundary_step.ran(&mut oracle_transaction_boundary, statement_effects);
 
                     let mut statement_error = None::<String>;
                     if let Some(action) = CloseSessionAction::from_plain_sql(&execution_sql) {
@@ -20571,11 +20741,13 @@ impl SqlEditorWidget {
             // back here describes a moment the app cannot place.
             let settling_answer = (!timed_out && !load_mutex_bool(cancel_flag))
                 .then_some(server_reports_transaction_open)
-                .flatten();
+                .flatten()
+                .map(crate::db::ServerTransactionAnswer::from_oracle_probe)
+                .unwrap_or_default();
             retained_state
                 .conservative_merge(live_state)
                 .with_transaction_claim_settled_by_server(
-                    oracle_transaction_boundary.transaction_claim_is_a_guess(),
+                    oracle_transaction_boundary.transaction_claim(),
                     settling_answer,
                 )
         };
@@ -22923,10 +23095,10 @@ impl SqlEditorWidget {
         prior_retained_state: RetainedSessionState,
         statement_effects: crate::db::StatementSessionEffects,
     ) -> Result<(), String> {
-        if let Some(action) = statement_effects.transaction_option_change_action() {
+        if let Some(option) = statement_effects.transaction_option_change_kind() {
             Self::ensure_mysql_retained_session_statement_option_change_allowed(
                 prior_retained_state,
-                action,
+                option,
             )?;
         }
         Ok(())
@@ -22934,12 +23106,12 @@ impl SqlEditorWidget {
 
     fn ensure_mysql_retained_session_statement_option_change_allowed(
         prior_retained_state: RetainedSessionState,
-        action: &str,
+        option: crate::db::TransactionOptionKind,
     ) -> Result<(), String> {
         Self::ensure_retained_session_option_change_allowed(
             crate::db::DatabaseType::MySQL,
             prior_retained_state,
-            action,
+            option,
         )
     }
 
@@ -22964,9 +23136,9 @@ impl SqlEditorWidget {
     pub(super) fn ensure_retained_session_option_change_allowed(
         db_type: crate::db::DatabaseType,
         prior_retained_state: RetainedSessionState,
-        action: &str,
+        option: crate::db::TransactionOptionKind,
     ) -> Result<(), String> {
-        if action == "transaction mode"
+        if option == crate::db::TransactionOptionKind::TransactionMode
             && db_type.can_replace_retained_transaction_mode(prior_retained_state)
         {
             return Ok(());
@@ -22974,7 +23146,7 @@ impl SqlEditorWidget {
 
         crate::db::DatabaseConnection::ensure_retained_session_option_change_allowed(
             prior_retained_state,
-            action,
+            option.label(),
         )
     }
 
@@ -22983,7 +23155,9 @@ impl SqlEditorWidget {
         batch_effects: &crate::db::MySqlBatchSessionEffects,
         statement_effects: crate::db::StatementSessionEffects,
     ) -> Result<(), String> {
-        if statement_effects.transaction_option_change_action() != Some("transaction mode") {
+        if statement_effects.transaction_option_change_kind()
+            != Some(crate::db::TransactionOptionKind::TransactionMode)
+        {
             return Ok(());
         }
 
@@ -22994,13 +23168,13 @@ impl SqlEditorWidget {
         batch_effects: &crate::db::MySqlBatchSessionEffects,
         statement_effects: crate::db::StatementSessionEffects,
     ) -> Result<(), String> {
-        let Some(action) = statement_effects.transaction_option_change_action() else {
+        let Some(option) = statement_effects.transaction_option_change_kind() else {
             return Ok(());
         };
 
         let current_state = batch_effects
             .retained_state_after_successful_batch(RetainedSessionState::default(), false);
-        Self::ensure_mysql_retained_session_statement_option_change_allowed(current_state, action)
+        Self::ensure_mysql_retained_session_statement_option_change_allowed(current_state, option)
     }
 
     fn oracle_retained_state_for_option_change(
@@ -23019,20 +23193,20 @@ impl SqlEditorWidget {
     fn ensure_oracle_retained_option_change_allowed(
         prior_retained_state: RetainedSessionState,
         live_may_have_uncommitted_work: bool,
-        action: &str,
+        option: crate::db::TransactionOptionKind,
     ) -> Result<(), String> {
         Self::ensure_oracle_retained_state_option_change_allowed(
             Self::oracle_retained_state_for_option_change(
                 prior_retained_state,
                 live_may_have_uncommitted_work,
             ),
-            action,
+            option,
         )
     }
 
     fn ensure_oracle_retained_state_option_change_allowed(
         retained_state: RetainedSessionState,
-        action: &str,
+        option: crate::db::TransactionOptionKind,
     ) -> Result<(), String> {
         if retained_state.transaction_state() == TransactionSessionState::Clean
             && !retained_state.may_hold_session_lock()
@@ -23042,7 +23216,7 @@ impl SqlEditorWidget {
         }
         crate::db::DatabaseConnection::ensure_retained_session_option_change_allowed(
             retained_state,
-            action,
+            option.label(),
         )
     }
 
@@ -23052,11 +23226,11 @@ impl SqlEditorWidget {
         statement_effects: crate::db::StatementSessionEffects,
         live_may_have_uncommitted_work: bool,
     ) -> Result<(), String> {
-        if let Some(action) = statement_effects.transaction_option_change_action() {
+        if let Some(option) = statement_effects.transaction_option_change_kind() {
             Self::ensure_oracle_retained_option_change_allowed(
                 prior_retained_state,
                 live_may_have_uncommitted_work,
-                action,
+                option,
             )?;
         }
         Ok(())
@@ -25106,7 +25280,7 @@ impl SqlEditorWidget {
 
         if let Err(err) = Self::ensure_mysql_retained_session_statement_option_change_allowed(
             prior_retained_state,
-            "transaction mode",
+            crate::db::TransactionOptionKind::TransactionMode,
         ) {
             Self::retain_mysql_pooled_session_if_current_with_state_and_scope(
                 shared_connection,
@@ -27504,6 +27678,22 @@ mod query_execution_cleanup_tests {
             ),
             "a different scope going missing is a different report"
         );
+
+        // And a scope that comes BACK resets what has been said about it: the
+        // user's last word was that it worked again, so losing it a second time
+        // is news. Latching on the name alone made that second loss silent.
+        let gone_b = crate::db::SessionScopeAssertion::unavailable(Some("SQ_B"));
+        assert!(!report.note(&gone_b, db_type, None, "test"));
+        assert!(!report.note(
+            &crate::db::SessionScopeAssertion::Applied,
+            db_type,
+            None,
+            "test",
+        ));
+        assert!(
+            report.note(&gone_b, db_type, None, "test"),
+            "losing a scope again after it worked is a new fact"
+        );
     }
 
     #[test]
@@ -27584,27 +27774,21 @@ mod query_execution_cleanup_tests {
         let mode = serializable_mode();
 
         let mut asked = 0usize;
-        let open = tracker.transaction_open_before_statement(
-            oracle_effects("BEGIN COMMIT; END;"),
-            mode,
-            true,
-            || {
-                asked += 1;
-                false
-            },
-        );
+        let step = tracker.begin_statement(mode, true, || {
+            asked += 1;
+            false
+        });
+        let open = step.transaction_open();
+        step.ran(&mut tracker, oracle_effects("BEGIN COMMIT; END;"));
         assert!(open, "nothing was opaque yet, so the tracked answer stands");
         assert_eq!(asked, 0, "and it costs no round trip");
 
-        let open = tracker.transaction_open_before_statement(
-            oracle_effects("SELECT 1 FROM DUAL"),
-            mode,
-            true,
-            || {
-                asked += 1;
-                false
-            },
-        );
+        let step = tracker.begin_statement(mode, true, || {
+            asked += 1;
+            false
+        });
+        let open = step.transaction_open();
+        step.ran(&mut tracker, oracle_effects("SELECT 1 FROM DUAL"));
         assert_eq!(
             asked, 1,
             "the statement after the block must ask the server, whatever the ledger claims"
@@ -27614,15 +27798,12 @@ mod query_execution_cleanup_tests {
             "and take the server's answer, so the pin is re-applied for the rest of the batch"
         );
 
-        let open = tracker.transaction_open_before_statement(
-            oracle_effects("SELECT 2 FROM DUAL"),
-            mode,
-            true,
-            || {
-                asked += 1;
-                false
-            },
-        );
+        let step = tracker.begin_statement(mode, true, || {
+            asked += 1;
+            false
+        });
+        let open = step.transaction_open();
+        step.ran(&mut tracker, oracle_effects("SELECT 2 FROM DUAL"));
         assert_eq!(
             asked, 1,
             "once answered, the app tracks forward again instead of asking every statement"
@@ -27639,33 +27820,23 @@ mod query_execution_cleanup_tests {
         let default_mode = crate::db::TransactionMode::default();
 
         // A tab with no pin never asks, so nothing clears the guess here.
-        tracker.transaction_open_before_statement(
-            oracle_effects("BEGIN COMMIT; END;"),
-            default_mode,
-            true,
-            || unreachable!("a default mode has no pin to re-apply"),
-        );
-        tracker.transaction_open_before_statement(
-            oracle_effects("SELECT 1 FROM DUAL"),
-            default_mode,
-            true,
-            || unreachable!("a default mode has no pin to re-apply"),
-        );
+        for sql in ["BEGIN COMMIT; END;", "SELECT 1 FROM DUAL"] {
+            let step = tracker.begin_statement(default_mode, true, || {
+                unreachable!("a default mode has no pin to re-apply")
+            });
+            step.ran(&mut tracker, oracle_effects(sql));
+        }
         assert!(
-            tracker.transaction_claim_is_a_guess(),
+            tracker.transaction_claim().is_a_guess,
             "a statement the app CAN read tells it nothing about one it could not"
         );
 
         let mut asked = false;
-        tracker.transaction_open_before_statement(
-            oracle_effects("SELECT 2 FROM DUAL"),
-            serializable_mode(),
-            true,
-            || {
-                asked = true;
-                false
-            },
-        );
+        let step = tracker.begin_statement(serializable_mode(), true, || {
+            asked = true;
+            false
+        });
+        step.ran(&mut tracker, oracle_effects("SELECT 2 FROM DUAL"));
         assert!(asked, "so the next pinned boundary still asks");
     }
 
@@ -27677,20 +27848,18 @@ mod query_execution_cleanup_tests {
         // asks — so a guess that survives the batch governs the tab until the
         // user commits or rolls back.
         let mut tracker = super::OracleTransactionBoundaryTracker::default();
-        tracker.transaction_open_before_statement(
-            oracle_effects("BEGIN COMMIT; END;"),
-            crate::db::TransactionMode::default(),
-            true,
-            || unreachable!("a default mode has no pin to re-apply"),
-        );
-        assert!(tracker.transaction_claim_is_a_guess());
+        let step = tracker.begin_statement(crate::db::TransactionMode::default(), true, || {
+            unreachable!("a default mode has no pin to re-apply")
+        });
+        step.ran(&mut tracker, oracle_effects("BEGIN COMMIT; END;"));
+        assert!(tracker.transaction_claim().is_a_guess);
 
         let filed =
             RetainedSessionState::from_transaction_state(TransactionSessionState::MaybeDirty)
                 .with_untracked_session_state();
         let settled = filed.with_transaction_claim_settled_by_server(
-            tracker.transaction_claim_is_a_guess(),
-            Some(false),
+            tracker.transaction_claim(),
+            crate::db::ServerTransactionAnswer::from_oracle_probe(false),
         );
         assert!(
             !settled.may_have_uncommitted_work(),
@@ -27704,6 +27873,135 @@ mod query_execution_cleanup_tests {
             settled.may_have_untracked_session_state(),
             "the block's session residue is not the transaction and stays"
         );
+    }
+
+    #[test]
+    fn a_statement_the_gate_refused_leaves_the_transaction_claim_alone() {
+        // A Read only pin REFUSES exactly the statements whose bodies the app
+        // cannot read (`CALL`, `BEGIN … END`), and a refused statement never
+        // reaches the server. Recording its opacity anyway is what let the
+        // batch end hand the app's own open read-only transaction to a probe
+        // that cannot see one.
+        let read_only = crate::db::TransactionMode::new(
+            crate::db::TransactionIsolation::Default,
+            crate::db::TransactionAccessMode::ReadOnly,
+        );
+        let mut tracker = super::OracleTransactionBoundaryTracker::default();
+        tracker.note_transaction_mode_stated(read_only);
+
+        let refused_sql = "CALL do_work()";
+        assert!(
+            SqlEditorWidget::transaction_mode_refusal_for_statement(
+                crate::db::DatabaseType::Oracle,
+                read_only,
+                refused_sql,
+            )
+            .is_some(),
+            "the gate must still refuse this, or the test proves nothing"
+        );
+
+        let step = tracker.begin_statement(read_only, true, || false);
+        step.refused();
+
+        assert!(
+            !tracker.transaction_claim().is_a_guess,
+            "a statement that never ran cannot have made the app's own claim a guess"
+        );
+    }
+
+    #[test]
+    fn residue_the_app_cannot_restate_is_not_a_guess_about_the_transaction() {
+        // `ALTER SESSION SET <parameter>` and `SET ROLE` leave session state the
+        // pool setup cannot restate, so they are unknown for the RESIDUE
+        // question. Their effect on the TRANSACTION is fully readable: neither
+        // commits, and neither opens one. Reading the residue question as the
+        // transaction question made a Read only tab's own open transaction a
+        // guess for a probe that cannot see it, and the tab was filed clean.
+        let default_mode = crate::db::TransactionMode::default();
+        for sql in ["ALTER SESSION SET NLS_DATE_FORMAT = 'YYYY'", "SET ROLE ALL"] {
+            let mut tracker = super::OracleTransactionBoundaryTracker::default();
+            let step = tracker.begin_statement(default_mode, true, || {
+                unreachable!("a default mode has no pin to re-apply")
+            });
+            step.ran(&mut tracker, oracle_effects(sql));
+            assert!(
+                !tracker.transaction_claim().is_a_guess,
+                "{sql} says nothing the app cannot read about the transaction"
+            );
+        }
+
+        // The statements whose BODY the app cannot read still make it a guess,
+        // on both families through the same predicate.
+        for sql in [
+            "BEGIN NULL; END;",
+            "CALL do_work()",
+            "DECLARE x NUMBER; BEGIN NULL; END;",
+        ] {
+            let mut tracker = super::OracleTransactionBoundaryTracker::default();
+            let step = tracker.begin_statement(default_mode, true, || {
+                unreachable!("a default mode has no pin to re-apply")
+            });
+            step.ran(&mut tracker, oracle_effects(sql));
+            assert!(
+                tracker.transaction_claim().is_a_guess,
+                "{sql} runs a body that may commit or open a transaction"
+            );
+        }
+    }
+
+    #[test]
+    fn a_read_only_pin_is_filed_as_the_open_transaction_it_is() {
+        // The whole chain the defect ran through: the app states the pin, which
+        // opens a read-only transaction; a statement the app cannot read leaves
+        // the claim a guess; the batch asks a probe that finds transactions by
+        // an ID Oracle only assigns on the first WRITE.
+        let read_only = crate::db::TransactionMode {
+            isolation: crate::db::TransactionIsolation::Default,
+            access_mode: crate::db::TransactionAccessMode::ReadOnly,
+        };
+        let mut tracker = super::OracleTransactionBoundaryTracker::default();
+        tracker.note_transaction_mode_stated(read_only);
+        let step = tracker.begin_statement(read_only, true, || false);
+        step.ran(&mut tracker, oracle_effects("BEGIN NULL; END;"));
+
+        let claim = tracker.transaction_claim();
+        assert!(claim.is_a_guess);
+        assert!(
+            claim.may_be_invisible_to_a_write_probe,
+            "the pin's own SET TRANSACTION READ ONLY opens a transaction that never writes"
+        );
+
+        let filed =
+            RetainedSessionState::from_transaction_state(TransactionSessionState::MaybeDirty);
+        let settled = filed.with_transaction_claim_settled_by_server(
+            claim,
+            crate::db::ServerTransactionAnswer::from_oracle_probe(false),
+        );
+        assert!(
+            settled.may_have_uncommitted_work(),
+            "so the tab keeps the transaction it really has, and can still end it"
+        );
+
+        // A write makes the transaction visible, which is what keeps the
+        // correction this rule exists for: a block that commits after a DML is
+        // still settled by the server's answer.
+        let mut wrote = super::OracleTransactionBoundaryTracker::default();
+        wrote.note_transaction_mode_stated(serializable_mode());
+        let step = wrote.begin_statement(serializable_mode(), true, || {
+            unreachable!("nothing is a guess yet")
+        });
+        step.ran(&mut wrote, oracle_effects("UPDATE t SET c = 1"));
+        let step = wrote.begin_statement(serializable_mode(), true, || false);
+        step.ran(&mut wrote, oracle_effects("BEGIN COMMIT; END;"));
+        let after_write = wrote.transaction_claim();
+        assert!(after_write.is_a_guess);
+        assert!(!after_write.may_be_invisible_to_a_write_probe);
+        assert!(!filed
+            .with_transaction_claim_settled_by_server(
+                after_write,
+                crate::db::ServerTransactionAnswer::from_oracle_probe(false),
+            )
+            .may_have_uncommitted_work());
     }
 
     #[test]
@@ -28353,7 +28651,7 @@ mod query_execution_cleanup_tests {
             SqlEditorWidget::ensure_oracle_retained_option_change_allowed(
                 clean_with_residue,
                 false,
-                "auto-commit",
+                crate::db::TransactionOptionKind::AutoCommit,
             )
             .is_ok(),
             "clean retained session residue is not uncommitted transaction work"
@@ -28371,7 +28669,7 @@ mod query_execution_cleanup_tests {
         let err = SqlEditorWidget::ensure_oracle_retained_option_change_allowed(
             clean_with_residue,
             true,
-            "auto-commit",
+            crate::db::TransactionOptionKind::AutoCommit,
         )
         .expect_err("live uncommitted work must block auto-commit changes");
 
@@ -28390,7 +28688,7 @@ mod query_execution_cleanup_tests {
         let err = SqlEditorWidget::ensure_oracle_retained_option_change_allowed(
             clean_with_lock,
             false,
-            "auto-commit",
+            crate::db::TransactionOptionKind::AutoCommit,
         )
         .expect_err("retained session locks must block auto-commit changes");
 
@@ -28492,7 +28790,10 @@ mod query_execution_cleanup_tests {
         );
         assert!(
             cleanup
-                .ensure_oracle_retained_option_change_allowed(false, "auto-commit")
+                .ensure_oracle_retained_option_change_allowed(
+                    false,
+                    crate::db::TransactionOptionKind::AutoCommit
+                )
                 .is_err(),
             "UI-applied SET TRANSACTION must block option changes until resolved"
         );

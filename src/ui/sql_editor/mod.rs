@@ -1696,7 +1696,7 @@ impl TransactionActionBackend for OracleTransactionActionBackend {
             if let Err(message) = SqlEditorWidget::ensure_retained_session_option_change_allowed(
                 DatabaseType::Oracle,
                 snapshot.retained_state(),
-                "transaction mode",
+                crate::db::TransactionOptionKind::TransactionMode,
             ) {
                 return RetainedSessionMutationOutcome::BlockedRequiresResolution(message);
             }

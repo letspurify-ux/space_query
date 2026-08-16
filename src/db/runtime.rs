@@ -846,17 +846,31 @@ impl TabConnectionBinding {
         state.revision
     }
 
+    /// Move the tab to another schema/database WITHOUT touching the binding
+    /// revision.
+    ///
+    /// The revision is an IDENTITY token: `bind_if_revision` and
+    /// `detach_if_revision` hold it to refuse a rebind of a tab that has moved
+    /// on, and the startup check holds it to ask whether the tab is still on
+    /// the connection it resolved. A scope change is not a change of identity —
+    /// the tab is on the same connection, in another schema — and every reader
+    /// that cares about the scope reads the scope: `ExecutionOrigin` carries it
+    /// as its own field, and the metadata-delivery check compares it
+    /// separately.
+    ///
+    /// Bumping it here meant a running batch's own `ALTER SESSION SET
+    /// CURRENT_SCHEMA` invalidated the revision that batch was holding, as soon
+    /// as the UI thread mirrored the change: a later script `CONNECT` in the
+    /// same script was then refused with "the query tab connection changed
+    /// while CONNECT was authenticating" — for a connection that had not
+    /// changed — and a later `DISCONNECT` silently refused to detach.
     pub fn set_scope(&self, scope: Option<String>) -> u64 {
         let mut state = self
             .inner
             .state
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let scope = normalize_scope(scope);
-        if state.scope != scope {
-            state.scope = scope;
-            state.revision = state.revision.wrapping_add(1);
-        }
+        state.scope = normalize_scope(scope);
         state.revision
     }
 }
@@ -1218,6 +1232,43 @@ mod tests {
             .define_vars
             .is_empty());
         assert_eq!(runtime.bound_tab_count(), 2);
+    }
+
+    #[test]
+    fn a_scope_change_is_not_a_change_of_binding_identity() {
+        // The revision answers "is this tab still bound to what I resolved?".
+        // A scope change is the same tab on the same connection in another
+        // schema, so it must leave the token alone: a running batch holds it
+        // across its own `ALTER SESSION SET CURRENT_SCHEMA`, and bumping it
+        // there made the batch's own later `CONNECT` refuse to bind.
+        let registry = ConnectionRegistry::new();
+        let runtime = registry.register_saved("saved", connection()).runtime;
+        let binding = TabConnectionBinding::bound(runtime.clone(), Some("alpha".to_string()));
+        let held = binding.snapshot().revision;
+
+        binding.set_scope(Some("beta".to_string()));
+        assert_eq!(binding.snapshot().scope.as_deref(), Some("beta"));
+        assert_eq!(
+            binding.snapshot().revision,
+            held,
+            "a scope change must not invalidate a revision a batch is holding"
+        );
+        assert!(
+            binding
+                .bind_if_revision(held, runtime.clone(), Some("beta".to_string()))
+                .is_ok(),
+            "so a script CONNECT after a scope change still binds"
+        );
+
+        // A rebind IS an identity change, and still bumps.
+        let after_bind = binding.snapshot().revision;
+        assert_ne!(after_bind, held);
+        assert!(
+            binding
+                .bind_if_revision(held, runtime, Some("beta".to_string()))
+                .is_err(),
+            "a stale token must still be refused"
+        );
     }
 
     #[test]

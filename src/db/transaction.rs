@@ -54,6 +54,105 @@ pub struct RetainedSessionState {
     lock_state: SessionLockState,
 }
 
+/// Which of the tab's two transaction options a change is about.
+///
+/// The rules that differ between them are selected by THIS, never by the noun
+/// the user reads: the noun is a message, and a message is not a decision.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TransactionOptionKind {
+    AutoCommit,
+    TransactionMode,
+}
+
+impl TransactionOptionKind {
+    /// The noun the user reads in a refusal.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::AutoCommit => "auto-commit",
+            Self::TransactionMode => "transaction mode",
+        }
+    }
+}
+
+/// What a batch knows about the transaction claim it is about to file for its
+/// tab, as the input to
+/// [`RetainedSessionState::with_transaction_claim_settled_by_server`].
+///
+/// Two facts, because settling needs both and only the batch has them: whether
+/// the claim is knowledge or a guess, and whether the transaction it is about
+/// could be one a server probe is unable to see.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct TransactionClaim {
+    /// The tracked answer rests on a statement whose body the app could not
+    /// read, so the app no longer knows whether the transaction is open.
+    pub is_a_guess: bool,
+    /// A transaction may be open that has never written. Oracle assigns a
+    /// transaction id only on the first write, so a `SET TRANSACTION READ
+    /// ONLY` — which is exactly what a tab pinned Read only makes the app
+    /// issue — opens a transaction no write probe can find.
+    pub may_be_invisible_to_a_write_probe: bool,
+}
+
+/// What a server probe actually saw when it was asked whether a transaction is
+/// open on a session.
+///
+/// `Option<bool>` could not express the difference that decides whether the
+/// answer settles anything. Oracle's `DBMS_TRANSACTION.LOCAL_TRANSACTION_ID`
+/// reports the transaction ID, which Oracle assigns on the first WRITE — so its
+/// "none" is an answer about write transactions and says nothing about a
+/// read-only one. Reading that "none" as "no transaction at all" filed a tab's
+/// open read-only transaction as clean: the tab then went on reading inside a
+/// snapshot it could not leave, and the toolbar stopped offering the
+/// Commit/Rollback that would have ended it.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ServerTransactionAnswer {
+    /// Nobody asked. An interrupted batch has no answer to settle with: the
+    /// statement that was cancelled may still be running on the server.
+    #[default]
+    Unanswered,
+    /// The server reports a transaction is open.
+    TransactionOpen,
+    /// The server reports none, and the probe can see every transaction this
+    /// session could be holding, written to or not.
+    NoTransaction,
+    /// The server reports no WRITE transaction. A transaction that has not
+    /// written yet is invisible to this probe, so it proves nothing about one.
+    NoWriteTransaction,
+}
+
+impl ServerTransactionAnswer {
+    /// Oracle's answer, from EITHER driver, so the two cannot disagree about
+    /// what their probes are worth.
+    ///
+    /// Never `NoTransaction` when nothing is found: Oracle assigns a
+    /// transaction ID on the first WRITE. OCI asks
+    /// `DBMS_TRANSACTION.LOCAL_TRANSACTION_ID` for that ID and the thin driver
+    /// reads the TTC status flag beside it, so neither is a witness for a
+    /// transaction that has only read — which is exactly the transaction a tab
+    /// pinned Read only makes the app open with `SET TRANSACTION READ ONLY`.
+    pub fn from_oracle_probe(transaction_open: bool) -> Self {
+        if transaction_open {
+            Self::TransactionOpen
+        } else {
+            Self::NoWriteTransaction
+        }
+    }
+
+    /// Whether this answer proves there is no transaction left to resolve, for
+    /// the claim being settled.
+    ///
+    /// The pairing is the whole point: a write-only probe settles an ordinary
+    /// claim (a transaction that wrote is one it can see) but settles nothing
+    /// about a claim the batch has flagged as possibly invisible.
+    pub fn proves_no_transaction_for(self, claim: TransactionClaim) -> bool {
+        match self {
+            Self::Unanswered | Self::TransactionOpen => false,
+            Self::NoTransaction => true,
+            Self::NoWriteTransaction => !claim.may_be_invisible_to_a_write_probe,
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct RetainedSessionCapabilities {
     pub can_commit_or_rollback: bool,
@@ -445,22 +544,25 @@ impl RetainedSessionState {
     /// server once, here, is what keeps a guess from governing the tab.
     ///
     /// Deliberately narrow:
-    /// - a claim the app READ is never lowered (`claim_is_a_guess == false`),
+    /// - a claim the app READ is never lowered (`claim.is_a_guess == false`),
     ///   which is the failed-statement rule this must not undo;
-    /// - no probe, no change (`None`) — an interrupted batch has no answer;
+    /// - no probe, no change ([`ServerTransactionAnswer::Unanswered`]) — an
+    ///   interrupted batch has no answer;
+    /// - an answer only settles what the probe can SEE. A probe that finds no
+    ///   WRITE transaction has said nothing about a transaction that never
+    ///   wrote, and `claim.may_be_invisible_to_a_write_probe` is how the batch
+    ///   says one may be open;
     /// - only `MaybeDirty` is lowered. `DecisionRequired`, `BlockedDirty` and
-    ///   `InvalidSession` are not transactions a probe can see: Oracle's
-    ///   `DBMS_TRANSACTION.LOCAL_TRANSACTION_ID` does not report a read-only
-    ///   transaction at all, so "no transaction" is never proof that there is
-    ///   nothing left to resolve;
+    ///   `InvalidSession` are decisions the user still owes, not transactions
+    ///   a probe can answer about;
     /// - residue and locks are untouched — they are not the transaction, and
     ///   they are why the session stays with its tab.
     pub(crate) fn with_transaction_claim_settled_by_server(
         self,
-        claim_is_a_guess: bool,
-        server_reports_transaction_open: Option<bool>,
+        claim: TransactionClaim,
+        answer: ServerTransactionAnswer,
     ) -> Self {
-        if !claim_is_a_guess || server_reports_transaction_open != Some(false) {
+        if !claim.is_a_guess || !answer.proves_no_transaction_for(claim) {
             return self;
         }
         if self.transaction_state != TransactionSessionState::MaybeDirty {
@@ -1061,14 +1163,19 @@ impl StatementSessionEffects {
         }
     }
 
-    pub(crate) fn transaction_option_change_action(self) -> Option<&'static str> {
+    /// Which transaction option this statement changes, if any.
+    ///
+    /// A VALUE and not the noun that goes in the message: the rules that differ
+    /// between the two options were being selected by comparing that noun, so
+    /// rewording a refusal would have silently changed which rule ran.
+    pub(crate) fn transaction_option_change_kind(self) -> Option<TransactionOptionKind> {
         if self.state_hint.changes_auto_commit {
-            Some("auto-commit")
+            Some(TransactionOptionKind::AutoCommit)
         } else if self.transaction.changes_transaction_mode
             || self.session_residue.sets_next_transaction_mode_override
             || self.session_residue.sets_transaction_mode_override
         {
-            Some("transaction mode")
+            Some(TransactionOptionKind::TransactionMode)
         } else {
             None
         }
@@ -1080,6 +1187,12 @@ impl StatementSessionEffects {
 
     pub(crate) fn clears_transaction_state(self) -> bool {
         self.transaction.clears_state
+    }
+
+    /// Whether this statement is a `SET TRANSACTION`-class statement — one that
+    /// states the mode of a transaction and, on Oracle, opens it.
+    pub(crate) fn changes_transaction_mode(self) -> bool {
+        self.transaction.changes_transaction_mode
     }
 
     pub(crate) fn may_leave_session_residue(self) -> bool {
@@ -1163,14 +1276,6 @@ impl StatementSessionEffects {
 
     pub(crate) fn may_leave_uncommitted_work(self) -> bool {
         self.transaction.may_leave_uncommitted_work
-    }
-
-    /// Whether the app cannot see what this statement did to the session -- a
-    /// PL/SQL block, `CALL`, `EXEC`. Everything the app tracks about such a
-    /// statement is a guess from here on, including whether the transaction it
-    /// was told about is still open.
-    pub(crate) fn may_leave_unknown_session_state(self) -> bool {
-        self.session_residue.may_leave_unknown_state
     }
 
     pub(crate) fn releases_physical_session(self) -> bool {
@@ -4522,23 +4627,40 @@ fn oracle_alter_session_set_target(sql: &str, words: &[String]) -> OracleAlterSe
     }
 }
 
+/// Whether this Oracle statement can change the transaction without saying so —
+/// the Oracle half of the question the MySQL family asks with
+/// [`mysql_statement_may_open_untracked_transaction_for_analysis`].
+///
+/// An anonymous block, a `CALL` or an `EXEC` runs a body the app cannot read,
+/// and that body may `COMMIT`, `ROLLBACK`, or open a transaction and return.
+///
+/// Deliberately NOT every statement whose SESSION state is opaque. `ALTER
+/// SESSION SET <parameter>` and `SET ROLE` leave residue the pool setup cannot
+/// restate, so they are unknown for the RESIDUE question — but their effect on
+/// the TRANSACTION is fully readable: neither commits, and neither opens one.
+/// Answering the transaction question with the residue one is what let an
+/// `ALTER SESSION SET NLS_DATE_FORMAT` turn a transaction the app had just
+/// opened itself into a guess.
+fn oracle_statement_may_open_untracked_transaction_for_words(words: &[String]) -> bool {
+    matches!(
+        words.first().map(String::as_str),
+        Some("BEGIN") | Some("DECLARE") | Some("CALL") | Some("EXEC") | Some("EXECUTE")
+    )
+}
+
 fn oracle_session_residue_effects(sql: &str, words: &[String]) -> StatementSessionResidueEffects {
     let alter_session = words.first().is_some_and(|word| word == "ALTER")
         && words.get(1).is_some_and(|word| word == "SESSION");
     if !alter_session {
+        let unknown_state = StatementSessionResidueEffects {
+            may_leave_unknown_state: true,
+            ..StatementSessionResidueEffects::default()
+        };
+        if oracle_statement_may_open_untracked_transaction_for_words(words) {
+            return unknown_state;
+        }
         return match words.first().map(String::as_str) {
-            Some("SET") if words.get(1).is_some_and(|word| word == "ROLE") => {
-                StatementSessionResidueEffects {
-                    may_leave_unknown_state: true,
-                    ..StatementSessionResidueEffects::default()
-                }
-            }
-            Some("BEGIN") | Some("DECLARE") | Some("CALL") | Some("EXEC") | Some("EXECUTE") => {
-                StatementSessionResidueEffects {
-                    may_leave_unknown_state: true,
-                    ..StatementSessionResidueEffects::default()
-                }
-            }
+            Some("SET") if words.get(1).is_some_and(|word| word == "ROLE") => unknown_state,
             _ => StatementSessionResidueEffects::default(),
         };
     }
@@ -4988,6 +5110,8 @@ impl StatementSessionPostProcessor for OracleStatementSessionPostProcessor {
                 changes_transaction_mode: oracle_set_transaction_statement_for_words(words),
                 may_leave_uncommitted_work:
                     oracle_statement_may_leave_uncommitted_work_for_analysis(sql, &analysis),
+                may_open_untracked_transaction:
+                    oracle_statement_may_open_untracked_transaction_for_words(words),
                 ..StatementTransactionEffects::default()
             },
             session_residue: oracle_session_residue_effects(sql, words),
@@ -5439,8 +5563,8 @@ mod tests {
 
         assert!(effects.skip_auto_commit());
         assert_eq!(
-            effects.transaction_option_change_action(),
-            Some("transaction mode")
+            effects.transaction_option_change_kind(),
+            Some(TransactionOptionKind::TransactionMode)
         );
 
         let retained = retained_session_state_after_statement(
@@ -5468,8 +5592,8 @@ mod tests {
         assert!(effects.opens_or_preserves_transaction_state());
         assert!(effects.skip_auto_commit());
         assert_eq!(
-            effects.transaction_option_change_action(),
-            Some("transaction mode")
+            effects.transaction_option_change_kind(),
+            Some(TransactionOptionKind::TransactionMode)
         );
 
         let retained = retained_session_state_after_statement(
@@ -5632,11 +5756,22 @@ mod tests {
     fn only_a_guess_is_settled_by_the_servers_answer() {
         let dirty =
             RetainedSessionState::from_transaction_state(TransactionSessionState::MaybeDirty);
+        let guess = TransactionClaim {
+            is_a_guess: true,
+            may_be_invisible_to_a_write_probe: false,
+        };
+        let knowledge = TransactionClaim {
+            is_a_guess: false,
+            may_be_invisible_to_a_write_probe: false,
+        };
 
         // What the fix is for: a claim the app could not read, and a server
         // that says there is no transaction.
         assert!(!dirty
-            .with_transaction_claim_settled_by_server(true, Some(false))
+            .with_transaction_claim_settled_by_server(
+                guess,
+                ServerTransactionAnswer::NoWriteTransaction
+            )
             .may_have_uncommitted_work());
 
         // A claim the app READ is knowledge, not a guess. Lowering it here
@@ -5644,25 +5779,30 @@ mod tests {
         // do — the server probe is the compensation for that rule, not a way
         // around it.
         assert!(dirty
-            .with_transaction_claim_settled_by_server(false, Some(false))
+            .with_transaction_claim_settled_by_server(
+                knowledge,
+                ServerTransactionAnswer::NoWriteTransaction
+            )
             .may_have_uncommitted_work());
 
         // No probe, no change: an interrupted batch has no answer to settle
         // with, and a statement it cancelled may still be on the server.
         assert!(dirty
-            .with_transaction_claim_settled_by_server(true, None)
+            .with_transaction_claim_settled_by_server(guess, ServerTransactionAnswer::Unanswered)
             .may_have_uncommitted_work());
 
         // The probe raising a claim is the pre-existing conservative merge;
         // this rule only ever lowers.
         assert!(dirty
-            .with_transaction_claim_settled_by_server(true, Some(true))
+            .with_transaction_claim_settled_by_server(
+                guess,
+                ServerTransactionAnswer::TransactionOpen
+            )
             .may_have_uncommitted_work());
 
-        // Nothing but MaybeDirty is lowered. Oracle's own probe
-        // (`DBMS_TRANSACTION.LOCAL_TRANSACTION_ID`) does not report a read-only
-        // transaction at all, so "no transaction" is never proof that there is
-        // nothing left for the user to decide.
+        // Nothing but MaybeDirty is lowered: `DecisionRequired`, `BlockedDirty`
+        // and `InvalidSession` are decisions the user still owes, and no probe
+        // answers those.
         for state in [
             TransactionSessionState::DecisionRequired,
             TransactionSessionState::BlockedDirty,
@@ -5671,7 +5811,10 @@ mod tests {
             let blocked = RetainedSessionState::from_transaction_state(state);
             assert_eq!(
                 blocked
-                    .with_transaction_claim_settled_by_server(true, Some(false))
+                    .with_transaction_claim_settled_by_server(
+                        guess,
+                        ServerTransactionAnswer::NoTransaction
+                    )
                     .transaction_state(),
                 state,
                 "a probe must not resolve a decision the user still owes"
@@ -5681,9 +5824,57 @@ mod tests {
         // Residue is not the transaction: it is why the session stays with its
         // tab, and settling the transaction must not release it.
         let with_residue = dirty.with_untracked_session_state();
-        let settled = with_residue.with_transaction_claim_settled_by_server(true, Some(false));
+        let settled = with_residue.with_transaction_claim_settled_by_server(
+            guess,
+            ServerTransactionAnswer::NoTransaction,
+        );
         assert!(!settled.may_have_uncommitted_work());
         assert!(settled.may_have_untracked_session_state());
+    }
+
+    #[test]
+    fn a_write_probe_settles_nothing_about_a_transaction_that_never_wrote() {
+        // Oracle assigns a transaction ID on the first WRITE, so a probe that
+        // looks for that ID cannot see the transaction `SET TRANSACTION READ
+        // ONLY` opens — which is the one a tab pinned Read only always has. It
+        // said "no transaction", the batch filed the session clean, and the tab
+        // went on reading inside a snapshot with no Commit or Rollback offered.
+        let dirty =
+            RetainedSessionState::from_transaction_state(TransactionSessionState::MaybeDirty);
+        let invisible = TransactionClaim {
+            is_a_guess: true,
+            may_be_invisible_to_a_write_probe: true,
+        };
+
+        assert!(
+            dirty
+                .with_transaction_claim_settled_by_server(
+                    invisible,
+                    ServerTransactionAnswer::NoWriteTransaction
+                )
+                .may_have_uncommitted_work(),
+            "a write-only probe must not settle a claim about a read-only transaction"
+        );
+
+        // A probe that CAN see one settles it, so the rule stays a statement
+        // about the probe rather than a blanket refusal.
+        assert!(!dirty
+            .with_transaction_claim_settled_by_server(
+                invisible,
+                ServerTransactionAnswer::NoTransaction
+            )
+            .may_have_uncommitted_work());
+
+        // Both Oracle drivers answer through one constructor, so they cannot
+        // disagree about what their probes are worth.
+        assert_eq!(
+            ServerTransactionAnswer::from_oracle_probe(false),
+            ServerTransactionAnswer::NoWriteTransaction
+        );
+        assert_eq!(
+            ServerTransactionAnswer::from_oracle_probe(true),
+            ServerTransactionAnswer::TransactionOpen
+        );
     }
 
     #[test]
@@ -6120,7 +6311,7 @@ mod tests {
 
         assert!(effects.session_residue.sets_user_variable);
         assert!(!effects.session_residue.sets_transaction_mode_override);
-        assert_eq!(effects.transaction_option_change_action(), None);
+        assert_eq!(effects.transaction_option_change_kind(), None);
     }
 
     #[test]
@@ -6354,7 +6545,7 @@ mod tests {
                 !effects.session_residue.sets_transaction_mode_override,
                 "{sql}"
             );
-            assert_eq!(effects.transaction_option_change_action(), None, "{sql}");
+            assert_eq!(effects.transaction_option_change_kind(), None, "{sql}");
         }
 
         for sql in [
@@ -6371,8 +6562,8 @@ mod tests {
                 "{sql}"
             );
             assert_eq!(
-                effects.transaction_option_change_action(),
-                Some("transaction mode"),
+                effects.transaction_option_change_kind(),
+                Some(TransactionOptionKind::TransactionMode),
                 "{sql}"
             );
         }
@@ -6961,8 +7152,8 @@ mod tests {
             assert_eq!(
                 post_processor
                     .effects_for_sql(sql)
-                    .transaction_option_change_action(),
-                Some("auto-commit"),
+                    .transaction_option_change_kind(),
+                Some(TransactionOptionKind::AutoCommit),
                 "{sql}"
             );
         }
@@ -6979,8 +7170,8 @@ mod tests {
             assert_eq!(
                 post_processor
                     .effects_for_sql(sql)
-                    .transaction_option_change_action(),
-                Some("transaction mode"),
+                    .transaction_option_change_kind(),
+                Some(TransactionOptionKind::TransactionMode),
                 "{sql}"
             );
         }
@@ -6994,7 +7185,7 @@ mod tests {
             assert_eq!(
                 post_processor
                     .effects_for_sql(sql)
-                    .transaction_option_change_action(),
+                    .transaction_option_change_kind(),
                 None,
                 "{sql}"
             );
@@ -7016,7 +7207,7 @@ mod tests {
         ] {
             let effects = post_processor.effects_for_sql(sql);
             assert_eq!(
-                effects.transaction_option_change_action(),
+                effects.transaction_option_change_kind(),
                 None,
                 "{sql} must not be treated as a current-session transaction option change"
             );
@@ -7051,8 +7242,8 @@ mod tests {
              transaction_isolation = 'SERIALIZABLE'",
         );
         assert_eq!(
-            mixed_transaction_mode.transaction_option_change_action(),
-            Some("transaction mode")
+            mixed_transaction_mode.transaction_option_change_kind(),
+            Some(TransactionOptionKind::TransactionMode)
         );
         let retained = retained_session_state_after_statement(
             post_processor,
@@ -8061,7 +8252,7 @@ mod tests {
         assert!(effects.has_implicit_commit());
         assert!(effects.state_hint.clears_session_state);
         assert!(!effects.may_leave_session_residue());
-        assert_eq!(effects.transaction_option_change_action(), None);
+        assert_eq!(effects.transaction_option_change_kind(), None);
 
         let prior =
             RetainedSessionState::from_transaction_state(TransactionSessionState::DecisionRequired);

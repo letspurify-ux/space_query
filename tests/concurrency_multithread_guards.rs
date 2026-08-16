@@ -2126,14 +2126,43 @@ fn a_scope_change_updates_the_originating_tab_without_releasing_sessions() {
         !content.contains("QueryProgress::DatabaseChanged"),
         "a scope change has one spelling; a second event carrying the connection's stored database would overwrite it"
     );
+    // Anchored on the handler's own shape. The variant is also named by the
+    // progress-currency filter, which says this notice is a FACT and not a
+    // report of progress, so it survives an abandoned operation — and that
+    // mention comes first in the file.
     let start = content
-        .find("QueryProgress::ScopeChangedNotice {")
+        .find("QueryProgress::ScopeChangedNotice {\n                    message,")
         .expect("ScopeChangedNotice handler should exist");
     let end = content[start..]
         .find("QueryProgress::StatementFinished")
         .map(|offset| start + offset)
         .expect("StatementFinished handler should follow ScopeChangedNotice");
     let handler = &content[start..end];
+
+    // The notice reports something that ALREADY happened on the tab's session,
+    // so the progress-currency filter must not drop it. Terminate enqueues
+    // `OperationAbandoned` from the UI thread while the worker enqueues this
+    // from its own: whichever won that race decided whether the tab's card kept
+    // naming a schema its session had already left, while the next statement's
+    // scope assertion moved the user's open transaction back to it.
+    let currency = content
+        .find("fn operation_progress_matches(")
+        .expect("the progress-currency filter should exist");
+    let currency_end = content[currency..]
+        .find("\n    fn ")
+        .map(|offset| currency + offset)
+        .and_then(|after_first| {
+            content[after_first + 1..]
+                .find("\n    fn ")
+                .map(|offset| after_first + 1 + offset)
+        })
+        .unwrap_or(content.len());
+    let currency_body = &content[currency..currency_end];
+    assert!(
+        currency_body.contains("QueryProgress::ScopeChangedNotice { .. } => return true,"),
+        "a scope change already happened on the session: the currency filter must let it \
+         through, or a terminate landing in the gap leaves the tab naming a scope it left"
+    );
 
     // Scope is TAB-scoped: a `USE` ran on ONE tab's session, so only that
     // tab's binding and browser card move — sibling tabs on the same
@@ -2213,7 +2242,7 @@ fn oracle_current_schema_change_updates_object_browser_scope_before_refresh() {
     let main_window = fs::read_to_string(&main_file)
         .unwrap_or_else(|err| panic!("failed to read source file {}: {err}", main_file.display()));
     let handler_start = main_window
-        .find("QueryProgress::ScopeChangedNotice")
+        .find("QueryProgress::ScopeChangedNotice {\n                    message,")
         .expect("ScopeChangedNotice handler should exist");
     let handler_end = main_window[handler_start..]
         .find("QueryProgress::StatementFinished")
@@ -3119,7 +3148,14 @@ fn transaction_mode_state_has_a_single_source_of_truth() {
     let sync_start = main_window
         .find("fn sync_transaction_mode_controls(")
         .expect("sync_transaction_mode_controls should exist");
-    let sync_body = slice_from(&main_window, sync_start, 3400);
+    // To the END of the function, not a fixed byte count: a clause that reaches
+    // its subject only while nothing above it grows tests the layout, not the
+    // rule.
+    let sync_end = main_window[sync_start..]
+        .find("\n    fn arm_transaction_mode_sync_retry")
+        .map(|offset| sync_start + offset)
+        .expect("the retry arm should follow the sync");
+    let sync_body = &main_window[sync_start..sync_end];
     assert!(
         sync_body.contains("record_displayed_transaction_mode("),
         "the toolbar sync must record the transaction mode it displayed"
@@ -3398,21 +3434,29 @@ fn transaction_mode_state_has_a_single_source_of_truth() {
     // answer is driver-specific (thin reads the wire flag it already has, OCI
     // pays for a probe).
     //
-    // Pinned as ONE call, not as two that a loop orders for itself. Deciding
-    // and recording used to be `needs_server_answer` plus `note_statement`, and
-    // the two loops ordered them oppositely: OCI recorded after its decision
-    // and thin before it, so thin read the opacity of the statement it was
-    // about to run instead of the one that had just run and never asked the
-    // server after a PL/SQL block. The previous version of this clause only
-    // checked that each loop CALLED the predicate, which both did -- pinning
-    // the call and not the operation is how that survived. `note_statement`
-    // must therefore not be reachable from either loop.
+    // Pinned as a DECISION that hands out the obligation to record, not as two
+    // calls a loop orders for itself. Deciding and recording were first
+    // `needs_server_answer` plus `note_statement`, ordered oppositely by the two
+    // loops, so thin read the opacity of the statement it was about to run
+    // instead of the one that had just run. Collapsing them into one call fixed
+    // that and created the next defect: the call sat BEFORE the read-only gate,
+    // so a statement that gate REFUSED — one that never reached the server —
+    // still recorded its opacity, and the app's own open read-only transaction
+    // became a guess for a probe that cannot see one.
+    //
+    // `begin_statement` answers with a token, and the token is spent where the
+    // statement's fate is known: `ran` past every refusal, `refused` (or a
+    // drop, which means the same) at each one. Recording cannot come first,
+    // because only the decision makes a token.
     let thin_body_flat = thin_body.split_whitespace().collect::<Vec<_>>().join(" ");
     assert!(
-        thin_body_flat.contains("oracle_transaction_boundary .transaction_open_before_statement(")
-            || thin_body_flat
-                .contains("oracle_transaction_boundary.transaction_open_before_statement("),
-        "the thin re-apply must decide and record through the one call that fixes their order"
+        thin_body_flat.contains("oracle_transaction_boundary.begin_statement(")
+            || thin_body_flat.contains("oracle_transaction_boundary .begin_statement("),
+        "the thin re-apply must decide through the call that hands out the record obligation"
+    );
+    assert!(
+        thin_body.contains("boundary_step.ran(") && thin_body.contains("boundary_step.refused()"),
+        "and the thin loop must spend that obligation: recorded once the statement is really          going to the server, discarded at every refusal"
     );
     assert!(
         thin_body.contains("conn.transaction_in_progress()"),
@@ -3439,25 +3483,44 @@ fn transaction_mode_state_has_a_single_source_of_truth() {
         .collect::<Vec<_>>()
         .join(" ");
     assert!(
-        oci_reapply_flat
-            .contains("oracle_transaction_boundary .transaction_open_before_statement(")
-            || oci_reapply_flat
-                .contains("oracle_transaction_boundary.transaction_open_before_statement("),
-        "the OCI re-apply must make the same single call as the thin loop"
+        oci_reapply_flat.contains("oracle_transaction_boundary.begin_statement(")
+            || oci_reapply_flat.contains("oracle_transaction_boundary .begin_statement("),
+        "the OCI re-apply must make the same call as the thin loop"
+    );
+    assert!(
+        oci_reapply_window.contains("boundary_step.transaction_open()"),
+        "and read its answer from the token rather than from a second question"
     );
     assert!(
         oci_reapply_window.contains("oracle_session_may_have_uncommitted_work("),
         "and answer it with the probe, which is what that answer costs on OCI"
     );
-    // The order the two loops used to spell for themselves now lives inside the
-    // tracker, so neither loop may record on its own.
+    // The order the two loops used to spell for themselves now lives in the
+    // token, so neither loop may record on its own.
     assert_eq!(
         execution
             .matches("oracle_transaction_boundary.note_statement(")
             .count(),
         0,
-        "recording what a statement leaves behind must not be reachable outside \
-         `transaction_open_before_statement`, which is what fixes its order"
+        "recording what a statement leaves behind must not be reachable outside the token, \
+         which is what fixes its order"
+    );
+    // Every refusal between the decision and the record must spend the token,
+    // and a Read only tab refuses exactly the statements whose bodies the app
+    // cannot read — which is why recording a refused one was the bug.
+    assert_eq!(
+        execution.matches("boundary_step.refused();").count(),
+        6,
+        "each refusal path between the boundary decision and the statement must say the \
+         statement never ran: three per Oracle loop (the mode could not be stated, the tab's \
+         mode refuses the statement, the tab's scope could not be asserted). A path that \
+         stops saying so is a statement recorded as having run when it never reached the \
+         server, which is the shape this whole clause exists for"
+    );
+    assert_eq!(
+        execution.matches("boundary_step.ran(").count(),
+        2,
+        "and exactly one place per Oracle loop records, past every refusal"
     );
     // The claim survives a statement the app CAN read: a plain SELECT after a
     // PL/SQL block does not make the block's commit visible, so a later
@@ -3470,6 +3533,19 @@ fn transaction_mode_state_has_a_single_source_of_truth() {
         tracker_body.contains("self.transaction_claim_is_a_guess |="),
         "a guess must be monotone: only learning the truth may clear it, never a \
          statement the app happens to be able to read"
+    );
+    // And the guess is about the TRANSACTION, so it reads the transaction's own
+    // opacity — the question the MySQL family has always asked. Reading the
+    // RESIDUE question instead made `ALTER SESSION SET NLS_DATE_FORMAT` and
+    // `SET ROLE`, which commit nothing and open nothing, turn a transaction the
+    // app had just opened itself into a guess for the server to overrule.
+    assert!(
+        tracker_body.contains("effects.may_open_untracked_transaction()"),
+        "the boundary guess must be keyed on transaction opacity, not on session residue"
+    );
+    assert!(
+        !tracker_body.contains("may_leave_unknown_session_state"),
+        "session residue the pool cannot restate is a different question"
     );
     // A refusal with ORA-01453 says the transaction is still open, which is an
     // answer and not a failure: the pin belongs to the next transaction, and
@@ -3495,20 +3571,48 @@ fn transaction_mode_state_has_a_single_source_of_truth() {
         .expect("the shared settling rule should exist");
     let settle_body = slice_from(&transaction, settle_start, 900);
     assert!(
-        settle_body
-            .contains("if !claim_is_a_guess || server_reports_transaction_open != Some(false)")
+        settle_body.contains("if !claim.is_a_guess || !answer.proves_no_transaction_for(claim)")
             && settle_body
                 .contains("if self.transaction_state != TransactionSessionState::MaybeDirty"),
-        "settling may lower only a GUESS, only on a server answer, and only from \
+        "settling may lower only a GUESS, only on an answer that PROVES it, and only from \
          MaybeDirty -- a claim the app read is knowledge, and a decision the user \
          owes is not a transaction the probe can see"
+    );
+    // The answer has to say what it could SEE. Oracle assigns a transaction ID
+    // on the first WRITE, so a probe that looks for that ID says nothing about
+    // a transaction that has only read — which is the transaction a tab pinned
+    // Read only makes the app open with `SET TRANSACTION READ ONLY`. Reading
+    // that "none" as "no transaction at all" filed the open read-only
+    // transaction as clean, and the tab went on reading inside a snapshot it
+    // had no offered way to leave.
+    let answer_start = transaction
+        .find("fn proves_no_transaction_for(")
+        .expect("the answer must say what it proves");
+    let answer_body = slice_from(&transaction, answer_start, 500);
+    assert!(
+        answer_body
+            .contains("Self::NoWriteTransaction => !claim.may_be_invisible_to_a_write_probe"),
+        "a probe that only finds write transactions must not settle a claim about one that \
+         never wrote"
+    );
+    assert!(
+        transaction.contains("pub fn from_oracle_probe(transaction_open: bool) -> Self")
+            && slice_from(
+                &transaction,
+                transaction
+                    .find("pub fn from_oracle_probe(")
+                    .expect("the Oracle probe answer should have one constructor"),
+                260,
+            )
+            .contains("Self::NoWriteTransaction"),
+        "and BOTH Oracle drivers must answer through the one constructor that says so"
     );
     // Both batch ends, pinned by where they are rather than by a count: the
     // thin batch reads its wire flag inline, and the OCI batch carries its
     // answer into the cleanup guard that files the session.
     assert!(
         thin_body.contains("with_transaction_claim_settled_by_server(")
-            && thin_body.contains("oracle_transaction_boundary.transaction_claim_is_a_guess()"),
+            && thin_body.contains("oracle_transaction_boundary.transaction_claim()"),
         "the thin batch must settle its closing claim with the wire flag"
     );
     let oci_settle = execution
@@ -4745,17 +4849,51 @@ fn a_tabs_read_only_pin_cannot_be_erased_from_its_browser_card() {
     let sync = main_window
         .find("fn sync_transaction_mode_controls(&mut self) {")
         .expect("the transaction-mode sync should exist");
-    let sync_body = slice_from(&main_window, sync, 4200);
+    // To the END of the function: a fixed byte count stops reaching its subject
+    // the moment anything above it grows, which tests the layout and not the
+    // rule.
+    let sync_end = main_window[sync..]
+        .find("\n    fn arm_transaction_mode_sync_retry")
+        .map(|offset| sync + offset)
+        .expect("the retry arm should follow the sync");
+    let sync_body = &main_window[sync..sync_end];
+    assert!(
+        sync_body.contains("set_tab_mode_refuses_writes("),
+        "the sync must tell the tab's card about the pin"
+    );
+    // Every statement of the tab half is resolved from the tab's own access
+    // mode. There are two: the normal path, and the arm where the connection
+    // cannot be read — a card is born allowing writes, so a pinned tab
+    // activated while a neighbour held the mutex offered Drop, Truncate and
+    // Import until the retry landed. That arm may only ever RAISE the refusal,
+    // because the connection's own read-only flag is the half it cannot read.
+    let sync_lines = sync_body.lines().collect::<Vec<_>>();
+    let tab_half_statements = sync_lines
+        .iter()
+        .enumerate()
+        .filter(|(_, line)| line.contains("set_tab_mode_refuses_writes("))
+        .map(|(index, _)| index)
+        .collect::<Vec<_>>();
+    assert_eq!(
+        tab_half_statements.len(),
+        2,
+        "the tab half is stated on the normal path and in the arm where the connection cannot \
+         be read; a third statement of it needs its own reason"
+    );
+    for index in tab_half_statements {
+        // Lines, not a byte window: this file's comments are partly Korean, so
+        // a byte offset can land mid-character and a fixed count can miss the
+        // line it was written to reach.
+        let neighbourhood =
+            sync_lines[index.saturating_sub(8)..(index + 8).min(sync_lines.len())].join("\n");
+        assert!(
+            neighbourhood.contains("TransactionAccessMode::ReadOnly"),
+            "with the tab's own access mode"
+        );
+    }
     let push = sync_body
         .find("set_tab_mode_refuses_writes(")
         .expect("the sync must tell the tab's card about the pin");
-    assert!(
-        sync_body[push..]
-            .lines()
-            .take(4)
-            .any(|line| line.contains("TransactionAccessMode::ReadOnly")),
-        "with the tab's own access mode"
-    );
     assert!(
         !sync_body[push..sync_body.len().min(push + 300)]
             .contains("active_connection_is_read_only"),
@@ -5937,7 +6075,7 @@ fn the_active_tabs_connection_view_has_one_writer_and_three_answers() {
     let unreadable = sync
         .find("self.transaction_control_state()")
         .expect("the sync should read the connection through one accessor");
-    let unreadable_arm = slice_from(sync, unreadable, 1400);
+    let unreadable_arm = slice_from(sync, unreadable, 2400);
     assert!(
         !unreadable_arm.contains("if !self.has_live_connection"),
         "the sync's `could not read the connection` arm must not decide from `has_live_connection`: \
@@ -5972,9 +6110,36 @@ fn the_active_tabs_connection_view_has_one_writer_and_three_answers() {
 #[test]
 fn the_transaction_option_gate_selects_its_rule_by_type_not_by_message() {
     let content = read_source("src/ui/main_window.rs");
+    // The type lives in the DB layer now, because the statement classifier
+    // answers with it too: `transaction_option_change_kind` used to answer with
+    // the noun, and the deepest gate — the one that decides whether the MySQL
+    // family may REPLACE a pending one-shot — compared that noun. One value,
+    // one decision, from the classifier through to the gate.
+    let transaction = read_source("src/db/transaction.rs");
     assert!(
-        content.contains("enum TransactionOptionKind"),
+        transaction.contains("pub enum TransactionOptionKind"),
         "the two per-tab transaction options should be a type"
+    );
+    assert!(
+        transaction.contains(
+            "pub(crate) fn transaction_option_change_kind(self) -> Option<TransactionOptionKind>"
+        ),
+        "and the classifier must answer with that type, not with the noun it prints"
+    );
+    let execution = read_source("src/ui/sql_editor/execution.rs");
+    let deepest_gate = execution
+        .find("pub(super) fn ensure_retained_session_option_change_allowed(")
+        .expect("the shared option-change gate should exist");
+    let deepest_gate_body = slice_from(&execution, deepest_gate, 700);
+    assert!(
+        deepest_gate_body.contains("option: crate::db::TransactionOptionKind")
+            && deepest_gate_body
+                .contains("option == crate::db::TransactionOptionKind::TransactionMode"),
+        "the gate that picks the MySQL replace rule must match on the type"
+    );
+    assert!(
+        !deepest_gate_body.contains(r#"action == ""#),
+        "and never on the noun it prints to the user"
     );
     let start = content
         .find("fn validate_transaction_option_change(")
@@ -6056,11 +6221,50 @@ fn a_session_ending_plan_tells_a_cancel_from_a_session_it_could_not_resolve() {
         .expect("Close All should exist");
     let close_all_body = slice_from(&content, close_all, 2600);
     assert!(
-        close_all_body.contains("plan.action_may_proceed()")
+        close_all_body.contains("plan.user_cancelled()")
             && close_all_body.contains("plan.tab_was_resolved(tab_id)"),
         "Close All must stop only for a CANCEL, and must leave a tab whose session could not be \
          resolved open rather than closing it over the work"
     );
+
+    // The actions with no per-tab granularity — quitting, disconnecting,
+    // rebuilding the pool — END every session in the plan, so an unresolved tab
+    // stops them too. They used to carry on, and the server rolled back the
+    // very work the app had just reported it could not commit. One gate, and it
+    // names the tabs.
+    let gate = content
+        .find("fn session_ending_action_may_proceed(")
+        .expect("the one gate for actions that destroy sessions should exist");
+    let gate_body = slice_from(&content, gate, 1600);
+    assert!(
+        gate_body.contains("outcome.action_may_destroy_sessions()")
+            && gate_body.contains("outcome.unresolved_tabs()"),
+        "the gate must refuse on an unresolved session and say which tabs they are"
+    );
+    // Counted over production code only: the unit test beside it asks the same
+    // question directly, which is its job.
+    let production = content
+        .split_once("\n#[cfg(test)]\nmod tests {")
+        .map(|(before, _)| before)
+        .unwrap_or(content.as_str());
+    assert_eq!(
+        production.matches("action_may_destroy_sessions()").count(),
+        1,
+        "the gate must be the ONLY caller of that question, so a fifth session-ending action \
+         cannot answer it for itself"
+    );
+    for caller in [
+        "fn resolve_pooled_sessions_before_retained_action(",
+        "fn resolve_pooled_sessions_before_runtime_disconnect(",
+    ] {
+        let start = content
+            .find(caller)
+            .unwrap_or_else(|| panic!("{caller} should exist"));
+        assert!(
+            slice_from(&content, start, 1400).contains("Self::session_ending_action_may_proceed("),
+            "{caller} must answer through the shared gate"
+        );
+    }
 }
 
 /// A scope the server no longer has is ANSWERED by every backend's assertion,
@@ -6150,5 +6354,129 @@ fn a_scope_the_server_lost_is_answered_by_every_backend_and_said_once() {
     assert!(
         execution.contains("SessionScopeReport::default().note("),
         "the Oracle Thin lazy SELECT is a statement of its tab too, and says the same thing"
+    );
+}
+
+/// What the screen says about a tab's transaction options must be able to heal
+/// itself, and must never claim more than the app can read.
+///
+/// Four separate places had the same shape: a value was shown, the connection
+/// became unreadable, and nothing brought the screen back to the truth — or the
+/// screen was painted from a default that no tab had asked for.
+#[test]
+fn the_transaction_option_indicators_settle_themselves() {
+    let main_window = read_source("src/ui/main_window.rs");
+
+    // (1) The auto-commit MENU ITEM heals on the status tick, like the label it
+    // has to agree with. Its own syncer answers "not yet" whenever the
+    // connection default has not been read for this tab's connection, and every
+    // other caller is an event: switching onto a tab whose connection was busy
+    // with a neighbour's query left the menu showing the PREVIOUS tab's value
+    // for as long as the user stayed there, while the status bar beside it told
+    // the truth. The menu is the control the user acts on.
+    let render = main_window
+        .find("fn render_status_bar(&mut self) -> bool {")
+        .expect("the status tick should exist");
+    let render_body = slice_from(&main_window, render, 2000);
+    assert!(
+        render_body.contains("self.sync_auto_commit_indicators();"),
+        "the status tick must settle the auto-commit menu item, not only the status label"
+    );
+
+    // (2) A connect states the isolation LABELS in the new database's
+    // vocabulary and nothing else. Painting "Default / Read write" and
+    // enabling the controls there claimed a mode for the active tab that the
+    // tab-aware sync had not resolved yet — and recorded nothing, so the
+    // screen/behaviour cross-check could not catch the disagreement.
+    let labels = main_window
+        .find("fn sync_transaction_mode_control_labels_for_db(")
+        .expect("the label sync should exist");
+    let labels_end = main_window[labels..]
+        .find("\n    /// Scope is tab-scoped")
+        .map(|offset| labels + offset)
+        .unwrap_or(main_window.len());
+    let labels_body = &main_window[labels..labels_end];
+    assert!(
+        !labels_body.contains(".activate()") && !labels_body.contains("set_value("),
+        "stating the labels for a database must not also claim a mode or enable the controls: \
+         the active tab's own sync owns both"
+    );
+
+    // (3) The toolbar reads the connection through the door that knows a
+    // transition is in flight. A raw `try_lock` succeeds during the long
+    // network phase of a connect or a pool rebuild, which is exactly the window
+    // the rest of the window treats as unreadable and re-arms for.
+    let control_state = main_window
+        .find("fn transaction_control_state(")
+        .expect("the toolbar's connection read should exist");
+    let control_state_body = slice_from(&main_window, control_state, 1400);
+    assert!(
+        control_state_body.contains("crate::db::try_lock_connection(&self.connection)"),
+        "the toolbar must read the connection through the door that honours a transition"
+    );
+    assert!(
+        !control_state_body.contains("self.connection\n            .try_lock()"),
+        "and never through a raw lock that cannot tell a transition from a free mutex"
+    );
+
+    // (4) A pool rebuild that could not release a session still applies the
+    // settings that were saved. The release failure is a fact about a SESSION;
+    // reporting it as "Failed to save settings" told the user their saved
+    // settings were lost and left the new font and lazy-fetch values inert.
+    let persist = main_window
+        .find("fn persist_settings(")
+        .expect("persist_settings should exist");
+    let persist_body = slice_from(&main_window, persist, 3000);
+    let release = persist_body
+        .find("release_all_resolved_pooled_db_sessions()")
+        .expect("a pool-size change must release the old pool's sessions");
+    assert!(
+        !persist_body[release..].contains("?;"),
+        "a session that could not be released must not abort the settings that were saved"
+    );
+    for applied in [
+        "Self::apply_lazy_fetch_settings(state);",
+        "Self::apply_font_settings(state);",
+    ] {
+        assert!(
+            persist_body[release..].contains(applied),
+            "{applied} must still run after a release failure"
+        );
+    }
+}
+
+/// The thin lazy fetch states the tab's transaction mode the way both batch
+/// loops do.
+///
+/// It was the one Oracle site that recorded a statement's effects AFTER the
+/// round trip and turned ORA-01453 into a failure the user sees.
+#[test]
+fn every_oracle_transaction_mode_application_records_before_it_asks() {
+    let execution = read_source("src/ui/sql_editor/execution.rs");
+    let lazy = execution
+        .find("fn apply_oracle_thin_transaction_mode_for_execution(")
+        .expect("the thin lazy-fetch mode application should exist");
+    let lazy_end = execution[lazy..]
+        .find("\n    fn oracle_thin_select_cells(")
+        .map(|offset| lazy + offset)
+        .expect("the next function should follow it");
+    let body = &execution[lazy..lazy_end];
+
+    let record = body
+        .find("oracle_retained_state_after_statement_effects(")
+        .expect("it must record what each mode statement leaves behind");
+    let send = body
+        .find("Self::execute_oracle_thin_statement(")
+        .expect("it must send the mode statements");
+    assert!(
+        record < send,
+        "effects must be recorded BEFORE the round trip: `SET TRANSACTION` opens a \
+         transaction that carries no work, so a cancel landing between the server running \
+         it and the app reading the answer leaves an open transaction nothing knows about"
+    );
+    assert!(
+        body.contains("oracle_error_says_transaction_still_open(&message)"),
+        "and ORA-01453 is an ANSWER — the pin applies from the next transaction — not a \
+         failure of the SELECT that asked for it"
     );
 }
